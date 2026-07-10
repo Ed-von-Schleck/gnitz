@@ -1,4 +1,5 @@
 use super::*;
+use crate::schema::make_index_schema;
 
 // ── test_index_creation_and_backfill ────────────────────────────────────
 

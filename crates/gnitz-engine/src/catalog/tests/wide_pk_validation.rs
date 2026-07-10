@@ -7,6 +7,7 @@
 
 use super::*;
 use crate::query::{DagEngine, RelationKind, StoreHandle};
+use crate::schema::make_index_schema;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, RecoverySource, Table};
 

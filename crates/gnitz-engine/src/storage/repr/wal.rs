@@ -6,13 +6,11 @@ use crate::foundation::codec::{align8, read_u32_le, read_u64_le, write_u32_le, w
 use crate::foundation::xxh;
 
 // Header layout: see `gnitz_wire::wal` — the one definition client and engine
-// share; all offsets below re-export it.
-pub const HEADER_SIZE: usize = gnitz_wire::WAL_HEADER_SIZE;
-pub const FORMAT_VERSION: u32 = gnitz_wire::WAL_FORMAT_VERSION;
-
+// share; the local renames below are brevity only.
 use gnitz_wire::{
-    WAL_OFF_CHECKSUM as OFF_CHECKSUM, WAL_OFF_COUNT as OFF_COUNT, WAL_OFF_NUM_REGIONS as OFF_NUM_REGIONS,
-    WAL_OFF_SIZE as OFF_SIZE, WAL_OFF_TID as OFF_TID, WAL_OFF_VERSION as OFF_VERSION,
+    WAL_FORMAT_VERSION as FORMAT_VERSION, WAL_HEADER_SIZE as HEADER_SIZE, WAL_OFF_CHECKSUM as OFF_CHECKSUM,
+    WAL_OFF_COUNT as OFF_COUNT, WAL_OFF_NUM_REGIONS as OFF_NUM_REGIONS, WAL_OFF_SIZE as OFF_SIZE,
+    WAL_OFF_TID as OFF_TID, WAL_OFF_VERSION as OFF_VERSION,
 };
 
 /// Compute the total byte size of a WAL block with the given regions.
@@ -24,6 +22,60 @@ pub(crate) fn block_size(region_sizes: &[u32]) -> usize {
         pos += sz as usize;
     }
     pos
+}
+
+/// Write the 32-byte WAL header (all fields) and the region directory into
+/// `block`, zero-filling inter-region align8 gaps, and return each region's
+/// absolute start position within the block. Shared by [`encode`] (which then
+/// copies prebuilt region bytes) and the SAL scatter writer
+/// (`write_scattered_data_block`), which carves the body and scatters rows
+/// directly — the one place the block framing is spelled out.
+///
+/// The caller stamps the body checksum afterwards via [`stamp_checksum`]
+/// (or leaves the zeroed checksum field for unchecksummed IPC paths).
+pub(crate) fn write_header_and_directory(
+    block: &mut [u8],
+    table_id: u32,
+    entry_count: u32,
+    region_sizes: &[u32],
+    total_size: usize,
+) -> [usize; MAX_WIRE_REGIONS] {
+    let num_regions = region_sizes.len();
+    // Sized to MAX_WIRE_REGIONS (= MAX_BATCH_REGIONS + 1) — the max region count
+    // including the trailing blob region (pk/weight/null_bmp + payload + blob).
+    debug_assert!(
+        num_regions <= MAX_WIRE_REGIONS,
+        "num_regions={num_regions} exceeds positions array capacity"
+    );
+    block[..HEADER_SIZE].fill(0);
+    let mut positions = [0usize; MAX_WIRE_REGIONS];
+    let mut pos = HEADER_SIZE + num_regions * 8;
+    for (i, &sz) in region_sizes.iter().enumerate() {
+        let aligned = align8(pos);
+        if aligned > pos {
+            block[pos..aligned].fill(0);
+        }
+        pos = aligned;
+        positions[i] = pos;
+        let dir_off = HEADER_SIZE + i * 8;
+        write_u32_le(block, dir_off, pos as u32);
+        write_u32_le(block, dir_off + 4, sz);
+        pos += sz as usize;
+    }
+    write_u32_le(block, OFF_TID, table_id);
+    write_u32_le(block, OFF_COUNT, entry_count);
+    write_u32_le(block, OFF_SIZE, total_size as u32);
+    write_u32_le(block, OFF_VERSION, FORMAT_VERSION);
+    write_u32_le(block, OFF_NUM_REGIONS, num_regions as u32);
+    positions
+}
+
+/// Stamp the XXH3 body checksum of a fully-written block into its header.
+pub(crate) fn stamp_checksum(block: &mut [u8], total_size: usize) {
+    if total_size > HEADER_SIZE {
+        let cs = xxh::checksum(&block[HEADER_SIZE..total_size]);
+        write_u64_le(block, OFF_CHECKSUM, cs);
+    }
 }
 
 /// Header fields of a validated WAL block, as returned by
@@ -62,7 +114,6 @@ pub fn encode(
 ) -> Result<usize, StorageError> {
     debug_assert_eq!(region_ptrs.len(), region_sizes.len());
     let num_regions = region_sizes.len();
-    let dir_size = num_regions * 8;
     let total_size = block_size(region_sizes);
 
     if out_offset + total_size > out_buf.len() {
@@ -70,29 +121,9 @@ pub fn encode(
     }
 
     let block = &mut out_buf[out_offset..out_offset + total_size];
-    block[..HEADER_SIZE].fill(0);
 
-    // Phase 1: compute per-region start positions and write directory.
-    // Sized to MAX_WIRE_REGIONS (= MAX_BATCH_REGIONS + 1) — the max region count
-    // including the trailing blob region (pk/weight/null_bmp + payload + blob).
-    debug_assert!(
-        num_regions <= MAX_WIRE_REGIONS,
-        "num_regions={num_regions} exceeds positions array capacity"
-    );
-    let mut positions = [0usize; MAX_WIRE_REGIONS];
-    let mut pos = HEADER_SIZE + dir_size;
-    for i in 0..num_regions {
-        let aligned = align8(pos);
-        if aligned > pos {
-            block[pos..aligned].fill(0);
-        }
-        pos = aligned;
-        positions[i] = pos;
-        let dir_off = HEADER_SIZE + i * 8;
-        write_u32_le(block, dir_off, pos as u32);
-        write_u32_le(block, dir_off + 4, region_sizes[i]);
-        pos += region_sizes[i] as usize;
-    }
+    // Phase 1: header + directory, returning per-region start positions.
+    let positions = write_header_and_directory(block, table_id, entry_count, region_sizes, total_size);
 
     // Phase 2: coalesce adjacent runs into single copies.
     // A run extends while consecutive regions are both source-adjacent (no gap
@@ -135,15 +166,8 @@ pub fn encode(
         i = j;
     }
 
-    write_u32_le(block, OFF_TID, table_id);
-    write_u32_le(block, OFF_COUNT, entry_count);
-    write_u32_le(block, OFF_SIZE, total_size as u32);
-    write_u32_le(block, OFF_VERSION, FORMAT_VERSION);
-    write_u32_le(block, OFF_NUM_REGIONS, num_regions as u32);
-
-    if checksum && total_size > HEADER_SIZE {
-        let cs = xxh::checksum(&block[HEADER_SIZE..total_size]);
-        write_u64_le(block, OFF_CHECKSUM, cs);
+    if checksum {
+        stamp_checksum(block, total_size);
     }
 
     Ok(out_offset + total_size)

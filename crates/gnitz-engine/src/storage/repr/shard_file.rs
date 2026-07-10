@@ -11,11 +11,11 @@ use libc::c_int;
 use super::super::error::StorageError;
 use super::batch::{strides_from_schema, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::layout::*;
-use super::merge::pack_pk_be;
 use super::xor8;
 use crate::foundation::codec::write_u64_le;
 use crate::foundation::posix_io::{fdatasync_eintr, fsync_eintr};
 use crate::foundation::xxh;
+use crate::schema::key::pack_pk_be;
 use crate::schema::{read_signed, read_unsigned, SchemaDescriptor, MAX_PK_BYTES};
 use gnitz_wire::{is_fixed_int, is_signed_int};
 use xorf::Xor8;
@@ -109,11 +109,16 @@ impl PkUniqueChecker {
 
 enum RegionEncoding {
     Raw,
-    Constant,
+    /// All elements identical; the on-disk image is the first `width` bytes of
+    /// the raw region.
+    Constant {
+        width: usize,
+    },
+    /// Exactly two distinct weight values. `buf` is the ready on-disk image
+    /// (`value_a` LE ‖ `value_b` LE ‖ bitvec), built by
+    /// `detect_weight_encoding` at detection time.
     TwoValue {
-        value_a: i64,
-        value_b: i64,
-        bitvec: Vec<u8>,
+        buf: Vec<u8>,
     },
     /// Frame-of-reference + byte-width truncation of an integer payload region.
     /// `buf` is the ready on-disk image (8-byte reference, then each row's
@@ -122,6 +127,20 @@ enum RegionEncoding {
     For {
         buf: Vec<u8>,
     },
+}
+
+impl RegionEncoding {
+    /// The on-disk bytes for this region given its raw source bytes: `Raw`
+    /// passes the source through, `Constant` its first element, and the
+    /// prebuilt variants their image. One resolution serves both the checksum
+    /// and the pwrite.
+    fn encoded_bytes<'a>(&'a self, src: &'a [u8]) -> &'a [u8] {
+        match self {
+            RegionEncoding::Raw => src,
+            RegionEncoding::Constant { width } => &src[..*width],
+            RegionEncoding::TwoValue { buf } | RegionEncoding::For { buf } => buf,
+        }
+    }
 }
 
 /// Detect whether a fixed-width region is all-constant.
@@ -141,7 +160,7 @@ fn detect_encoding(data: &[u8], element_width: usize) -> RegionEncoding {
             return RegionEncoding::Raw;
         }
     }
-    RegionEncoding::Constant
+    RegionEncoding::Constant { width: element_width }
 }
 
 /// Detect weight encoding: constant, two-value (bitvec), or raw.
@@ -149,11 +168,13 @@ fn detect_weight_encoding(data: &[u8]) -> RegionEncoding {
     debug_assert!(!data.is_empty() && data.len().is_multiple_of(8));
     let n = data.len() / 8;
     let first = i64::from_le_bytes(data[..8].try_into().unwrap());
-    // Single decode pass. The bitvec is allocated lazily at the first sighting
-    // of a second distinct value — every earlier row equals `first`, so its bit
-    // is already 0 — keeping the dominant all-equal (Constant) region
-    // allocation-free; a 3+-distinct region still aborts to Raw at the third
-    // value (paying at most one wasted bitvec allocation).
+    // Single decode pass building the on-disk image directly: `value_a` LE ‖
+    // `value_b` LE ‖ bitvec (bit i set ⇔ row i == value_b). The buffer is
+    // allocated lazily at the first sighting of a second distinct value —
+    // every earlier row equals `first`, so its bit is already 0 — keeping the
+    // dominant all-equal (Constant) region allocation-free; a 3+-distinct
+    // region still aborts to Raw at the third value (paying at most one wasted
+    // allocation).
     let mut second: Option<(i64, Vec<u8>)> = None;
     for i in 1..n {
         let v = i64::from_le_bytes(data[i * 8..(i + 1) * 8].try_into().unwrap());
@@ -162,26 +183,24 @@ fn detect_weight_encoding(data: &[u8]) -> RegionEncoding {
         }
         match &mut second {
             None => {
-                let mut bitvec = vec![0u8; n.div_ceil(8)];
-                bitvec[i / 8] |= 1 << (i % 8);
-                second = Some((v, bitvec));
+                let mut buf = vec![0u8; 16 + n.div_ceil(8)];
+                buf[..8].copy_from_slice(&first.to_le_bytes());
+                buf[8..16].copy_from_slice(&v.to_le_bytes());
+                buf[16 + i / 8] |= 1 << (i % 8);
+                second = Some((v, buf));
             }
-            Some((b, bitvec)) => {
+            Some((b, buf)) => {
                 if v != *b {
                     return RegionEncoding::Raw; // 3+ distinct values
                 }
-                bitvec[i / 8] |= 1 << (i % 8);
+                buf[16 + i / 8] |= 1 << (i % 8);
             }
         }
     }
 
     match second {
-        None => RegionEncoding::Constant,
-        Some((value_b, bitvec)) => RegionEncoding::TwoValue {
-            value_a: first,
-            value_b,
-            bitvec,
-        },
+        None => RegionEncoding::Constant { width: 8 },
+        Some((_, buf)) => RegionEncoding::TwoValue { buf },
     }
 }
 
@@ -361,15 +380,23 @@ fn build_xor8_from_pk_region(pk_ptr: *const u8, pk_sz: usize, stride: usize) -> 
         return None;
     }
     let pk_bytes = unsafe { std::slice::from_raw_parts(pk_ptr, pk_sz) };
-    // One fingerprint per row's OPK region (`stride` bytes); `xor8::fingerprint`
-    // owns the narrow/wide derivation that the probe side must match exactly.
-    let mut pks: Vec<u128> = pk_bytes.chunks_exact(stride).map(xor8::fingerprint).collect();
-    // The XOR filter's hypergraph peeling fails (hang/panic) on duplicate
-    // fingerprints. The PK region is sorted, so rows that share a PK but
-    // differ in payload (valid under (PK, payload) element identity) produce
-    // adjacent identical fingerprints; dedup collapses them in O(n).
-    pks.dedup();
-    xor8::build(&pks)
+    // One hashed key per distinct PK. The PK region is sorted, so rows that
+    // share a PK but differ in payload (valid under (PK, payload) element
+    // identity) are adjacent — skipping chunks byte-equal to their predecessor
+    // is an O(n) pre-shrink that keeps `build`'s sort at d distinct keys
+    // instead of n rows on duplicate-PK trace shards (MIN/MAX AggValueIndex).
+    // `xor8::fingerprint` owns the narrow/wide derivation the probe side must
+    // match exactly.
+    let mut keys: Vec<u64> = Vec::with_capacity(pk_sz / stride);
+    let mut prev: Option<&[u8]> = None;
+    for chunk in pk_bytes.chunks_exact(stride) {
+        if prev == Some(chunk) {
+            continue;
+        }
+        prev = Some(chunk);
+        keys.push(xxh::hash_u128(xor8::fingerprint(chunk)));
+    }
+    xor8::build(keys)
 }
 
 /// Per-call policy for the shard writers ([`write_shard_streaming`] /
@@ -478,7 +505,7 @@ fn write_shard_streaming_inner(
             detect_weight_encoding(src)
         } else {
             match (detect_encoding(src, width), for_signed) {
-                (RegionEncoding::Constant, _) => RegionEncoding::Constant,
+                (c @ RegionEncoding::Constant { .. }, _) => c,
                 (_, Some(signed)) => match encode_for_region(src, width, signed, n) {
                     Some((_, buf)) => RegionEncoding::For { buf },
                     None => RegionEncoding::Raw,
@@ -488,9 +515,7 @@ fn write_shard_streaming_inner(
         };
         let actual = match &enc {
             RegionEncoding::Raw => orig_sz,
-            RegionEncoding::Constant => width,
-            RegionEncoding::TwoValue { bitvec, .. } => 16 + bitvec.len(),
-            RegionEncoding::For { buf } => buf.len(),
+            _ => enc.encoded_bytes(src).len(),
         };
         encodings.push(enc);
         actual_sizes.push(actual);
@@ -526,43 +551,19 @@ fn write_shard_streaming_inner(
     };
 
     // --- Phase 4: build header + directory buffer ---
-    // For the (at most one) TwoValue region — only REG_WEIGHT can be TwoValue —
-    // precompute the on-disk bytes now so they serve both the checksum and the
-    // later write; FoR regions already carry their image in the variant.
-    let mut two_value_buf: Option<Vec<u8>> = None;
-
     let hdr_dir_size = HEADER_SIZE + dir_size;
     let mut hdr_buf = vec![0u8; hdr_dir_size];
 
     for i in 0..num_regions {
         let (src_ptr, orig_sz) = regions[i];
-        let cs = match &encodings[i] {
-            RegionEncoding::Raw => {
-                if actual_sizes[i] > 0 && !src_ptr.is_null() {
-                    xxh::checksum(unsafe { std::slice::from_raw_parts(src_ptr, orig_sz) })
-                } else {
-                    0
-                }
-            }
-            RegionEncoding::Constant => {
-                let elem_width = actual_sizes[i];
-                xxh::checksum(unsafe { std::slice::from_raw_parts(src_ptr, elem_width) })
-            }
-            RegionEncoding::TwoValue {
-                value_a,
-                value_b,
-                bitvec,
-            } => {
-                let mut buf = Vec::with_capacity(16 + bitvec.len());
-                buf.extend_from_slice(&value_a.to_le_bytes());
-                buf.extend_from_slice(&value_b.to_le_bytes());
-                buf.extend_from_slice(bitvec);
-                let cs = xxh::checksum(&buf);
-                debug_assert!(i == REG_WEIGHT && two_value_buf.is_none());
-                two_value_buf = Some(buf);
-                cs
-            }
-            RegionEncoding::For { buf } => xxh::checksum(buf),
+        // Empty/null regions short-circuit to checksum 0 — never form a slice
+        // from a null or zero-length region. Non-Raw encodings are only chosen
+        // for non-empty, non-null regions.
+        let cs = if actual_sizes[i] > 0 && !src_ptr.is_null() {
+            let src = unsafe { std::slice::from_raw_parts(src_ptr, orig_sz) };
+            xxh::checksum(encodings[i].encoded_bytes(src))
+        } else {
+            0
         };
 
         let d = dir_offset + i * DIR_ENTRY_SIZE;
@@ -571,7 +572,7 @@ fn write_shard_streaming_inner(
         write_u64_le(&mut hdr_buf, d + 16, cs);
         let encoding_byte = match &encodings[i] {
             RegionEncoding::Raw => ENCODING_RAW,
-            RegionEncoding::Constant => ENCODING_CONSTANT,
+            RegionEncoding::Constant { .. } => ENCODING_CONSTANT,
             RegionEncoding::TwoValue { .. } => ENCODING_TWO_VALUE,
             RegionEncoding::For { .. } => ENCODING_FOR,
         };
@@ -616,26 +617,11 @@ fn write_shard_streaming_inner(
         for i in 0..num_regions {
             let (src_ptr, orig_sz) = regions[i];
             let r_off = region_offsets[i] as libc::off_t;
-
-            match &encodings[i] {
-                RegionEncoding::Raw => {
-                    if actual_sizes[i] > 0 && !src_ptr.is_null() {
-                        let src = std::slice::from_raw_parts(src_ptr, orig_sz);
-                        crate::foundation::posix_io::pwrite_all_fd(fd.as_raw_fd(), src, r_off).map_err(|_| abort())?;
-                    }
-                }
-                RegionEncoding::Constant => {
-                    let elem_width = actual_sizes[i];
-                    let src = std::slice::from_raw_parts(src_ptr, elem_width);
-                    crate::foundation::posix_io::pwrite_all_fd(fd.as_raw_fd(), src, r_off).map_err(|_| abort())?;
-                }
-                RegionEncoding::TwoValue { .. } => {
-                    let buf = two_value_buf.as_ref().expect("TwoValue buf precomputed");
-                    crate::foundation::posix_io::pwrite_all_fd(fd.as_raw_fd(), buf, r_off).map_err(|_| abort())?;
-                }
-                RegionEncoding::For { buf } => {
-                    crate::foundation::posix_io::pwrite_all_fd(fd.as_raw_fd(), buf, r_off).map_err(|_| abort())?;
-                }
+            // Same empty/null short-circuit as the checksum pass.
+            if actual_sizes[i] > 0 && !src_ptr.is_null() {
+                let src = std::slice::from_raw_parts(src_ptr, orig_sz);
+                crate::foundation::posix_io::pwrite_all_fd(fd.as_raw_fd(), encodings[i].encoded_bytes(src), r_off)
+                    .map_err(|_| abort())?;
             }
         }
 

@@ -77,7 +77,7 @@ fn test_map_copy_and_emit() {
 #[test]
 fn test_empty_batch() {
     let schema = make_schema(0, &[8, 9]);
-    let batch = Batch::empty(1, 16);
+    let batch = Batch::empty_with_schema(&schema);
 
     let func = ScalarFunc::from_projection(&[1], &[type_code::I64], &schema, &schema);
     let result = func.evaluate_map_batch(&batch, &schema);

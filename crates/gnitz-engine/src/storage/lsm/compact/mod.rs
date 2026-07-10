@@ -19,14 +19,14 @@ pub use merge::{compact_shards, merge_and_route};
 mod tests {
     use super::super::batch::Batch;
     use super::super::batch::REG_PAYLOAD_START;
-    use super::super::columnar;
     use super::super::layout::{ENCODING_FOR, ENCODING_RAW};
-    use super::super::merge::{pack_pk_be, run_merge, BlobCacheGuard};
+    use super::super::merge::{run_merge, BlobCacheGuard};
     use super::super::shard_file::{region_dir, PkUniqueChecker, ShardWriteOpts};
     use super::super::shard_reader::MappedShard;
     use super::merge::{find_guard_for_key, open_shards};
     use super::*;
     use crate::foundation::codec::{read_i64_le, read_u32_le};
+    use crate::schema::key::pack_pk_be;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use std::ffi::CStr;
     use std::fs;
@@ -342,10 +342,7 @@ mod tests {
         // Two guards: [0, 100)  and [100, ∞). Guard keys live in the same
         // order-preserving pack_pk_be space as the router's sort key, so derive
         // them from the OPK bytes of the boundary values (not native u128s).
-        let guards: [u128; 2] = [
-            crate::storage::merge::pack_pk_be(&0u64.to_be_bytes()),
-            crate::storage::merge::pack_pk_be(&100u64.to_be_bytes()),
-        ];
+        let guards: [u128; 2] = [pack_pk_be(&0u64.to_be_bytes()), pack_pk_be(&100u64.to_be_bytes())];
         let guard_outputs = merge_and_route(&inputs, &cdir, &guards, &schema, 0, 1, 99, false).unwrap();
         assert_eq!(guard_outputs.len(), 2); // both guards should have rows
 
@@ -910,7 +907,7 @@ mod tests {
     fn assert_compare_pk_bytes_sorted(shard: &MappedShard) {
         for i in 1..shard.count {
             assert_ne!(
-                columnar::compare_pk_bytes(shard.get_pk_bytes(i - 1), shard.get_pk_bytes(i)),
+                crate::schema::key::compare_pk_bytes(shard.get_pk_bytes(i - 1), shard.get_pk_bytes(i)),
                 std::cmp::Ordering::Greater,
                 "merged shard not compare_pk_bytes-sorted at row {i}",
             );
@@ -1206,10 +1203,11 @@ mod tests {
         can_tag: bool,
     ) {
         let shards = open_shards(input_files, schema).unwrap();
+        let counts: Vec<usize> = shards.iter().map(|s| s.count).collect();
         let mut batch = Batch::with_schema(*schema, 1024);
         let mut blob_cache = BlobCacheGuard::acquire(schema, 1024);
         let mut checker = PkUniqueChecker::new();
-        run_merge(&shards, schema, |src, row, w| {
+        run_merge(&shards, &counts, schema, |src, row, w| {
             let pk_bytes = shards[src].get_pk_bytes(row);
             if can_tag {
                 checker.observe(pack_pk_be(pk_bytes), pk_bytes, w);
@@ -1366,11 +1364,12 @@ mod tests {
         can_tag: bool,
     ) -> Vec<Option<String>> {
         let shards = open_shards(input_files, schema).unwrap();
+        let counts: Vec<usize> = shards.iter().map(|s| s.count).collect();
         let n = guard_keys.len();
         let mut batches: Vec<Batch> = (0..n).map(|_| Batch::with_schema(*schema, 256)).collect();
         let mut blob_caches: Vec<BlobCacheGuard> = (0..n).map(|_| BlobCacheGuard::acquire(schema, 256)).collect();
         let mut checkers: Vec<PkUniqueChecker> = (0..n).map(|_| PkUniqueChecker::new()).collect();
-        run_merge(&shards, schema, |src, row, w| {
+        run_merge(&shards, &counts, schema, |src, row, w| {
             let pk = shards[src].get_pk_bytes(row);
             let prefix = pack_pk_be(pk);
             let g = find_guard_for_key(guard_keys, prefix);
@@ -1437,7 +1436,7 @@ mod tests {
         // router's sort key, so derive them from the boundary values' OPK bytes.
         let guard_keys: Vec<u128> = [0u64, 100, 200, 300]
             .iter()
-            .map(|&b| crate::storage::merge::pack_pk_be(&b.to_be_bytes()))
+            .map(|&b| crate::schema::key::pack_pk_be(&b.to_be_bytes()))
             .collect();
 
         let cdir = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();

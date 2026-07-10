@@ -91,7 +91,7 @@ mod tests {
         use std::rc::Rc;
 
         let schema = make_schema_u64_i64();
-        let empty = Rc::new(Batch::empty(1, 16));
+        let empty = Rc::new(Batch::empty_with_schema(&schema));
         let mut ch = ReadCursor::from_owned(&[empty], schema);
 
         let out = op_scan_trace(&mut ch, &schema, 10);

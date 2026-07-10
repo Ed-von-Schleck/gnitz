@@ -15,10 +15,11 @@ use std::ffi::CStr;
 
 use super::super::batch::write_to_batch;
 use super::super::error::StorageError;
-use super::super::merge::{pack_pk_be, run_merge, UnifiedSource};
+use super::super::merge::{run_merge, UnifiedSource};
 use super::super::scatter::scatter_unified_sources_with_weights;
 use super::super::shard_file::{PkUniqueChecker, ShardWriteOpts};
 use super::super::shard_reader::MappedShard;
+use crate::schema::key::pack_pk_be;
 use crate::schema::SchemaDescriptor;
 
 // ---------------------------------------------------------------------------
@@ -72,7 +73,8 @@ pub(super) fn compact_routed(
     assert!(!guard_keys.is_empty(), "compact_routed requires at least one guard");
 
     let shards = open_shards(input_files, schema)?;
-    let total_rows: usize = shards.iter().map(|s| s.count).sum(); // survivor upper bound
+    let counts: Vec<usize> = shards.iter().map(|s| s.count).collect();
+    let total_rows: usize = counts.iter().sum(); // survivor upper bound
     let total_blob: usize = shards.iter().map(|s| s.blob_len).sum();
 
     // Phase 1 — merge into survivors (sorted (PK, payload)), counting the rows
@@ -88,12 +90,12 @@ pub(super) fn compact_routed(
     if guard_keys.len() == 1 && !can_tag_pk_unique {
         // Single-guard, untagged (every view/scratch-table compaction): no
         // routing and no observation — the emit is a bare survivor push.
-        run_merge(&shards, schema, |src, row, w| {
+        run_merge(&shards, &counts, schema, |src, row, w| {
             survivors.push((src as u32, row as u32, w));
         });
         run_len[0] = survivors.len();
     } else {
-        run_merge(&shards, schema, |src, row, w| {
+        run_merge(&shards, &counts, schema, |src, row, w| {
             survivors.push((src as u32, row as u32, w));
             let pk = shards[src].get_pk_bytes(row);
             let prefix = pack_pk_be(pk);

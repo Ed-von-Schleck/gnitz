@@ -1,4 +1,5 @@
 use super::*;
+use crate::schema::make_index_schema;
 use crate::storage::PkBuf;
 
 /// Build the one-row IDX_TAB batch registering an index (`weight` +1) or

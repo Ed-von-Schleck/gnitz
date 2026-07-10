@@ -3239,7 +3239,7 @@ mod tests {
         };
         let unioned = op_union(single(g0), Some(&single(g1)), &merged);
         assert_eq!(unioned.count, 2, "Z-Set + keeps both rows before consolidation");
-        let empty = Rc::new(Batch::empty(1, 16));
+        let empty = Rc::new(Batch::empty_with_schema(&merged));
         let mut ch = ReadCursor::from_owned(std::slice::from_ref(&empty), merged);
         let (out, _) = op_distinct(unioned, &mut ch, &merged);
         assert_eq!(out.count, 1, "null-aware comparator coalesces the two NULL rows");

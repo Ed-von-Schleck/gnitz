@@ -5,8 +5,9 @@
 use std::rc::Rc;
 
 use super::super::batch::{write_to_batch, Batch, Layout};
-use super::super::merge::{self, pack_pk_be, SortedMemBatch};
+use super::super::merge::{self, SortedMemBatch};
 use super::{MemTable, INLINE_CONSOLIDATE_THRESHOLD};
+use crate::schema::key::pack_pk_be;
 use crate::schema::SchemaDescriptor;
 
 /// Merge N sorted MemBatch views into a single consolidated Batch.
@@ -58,12 +59,6 @@ pub(crate) fn consolidate_runs(runs: &[Rc<Batch>], schema: &SchemaDescriptor) ->
 /// sharing a 16-byte prefix collide to one slot, a tolerated false positive
 /// resolved by the run scan. The single owner of the PK bloom keying, shared by
 /// the memtable bloom and the per-run `in_memory_l0` blooms.
-/// Construct an empty bloom for `expected_n` keys — the one constructor the
-/// memtable's lazy build uses.
-pub(super) fn new_bloom(expected_n: u32) -> super::super::bloom::BloomFilter {
-    super::super::bloom::BloomFilter::new(expected_n)
-}
-
 pub(crate) fn bloom_add_batch(bloom: &mut super::super::bloom::BloomFilter, batch: &Batch) {
     for i in 0..batch.count {
         bloom.add(pack_pk_be(batch.get_pk_bytes(i)));

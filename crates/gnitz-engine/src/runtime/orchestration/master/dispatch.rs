@@ -1093,7 +1093,7 @@ impl MasterDispatcher {
         // separate pre-fanout catalog read could diverge across the
         // `sal_excl` await if a DDL interleaves, failing healthy replies.
         // Single-source a REPLICATED owner: a broadcast-and-merge would append
-        // each matching row `nw` times (`WeightFill::Copy`, no consolidation),
+        // each matching row `nw` times (weights copied verbatim, no consolidation),
         // handing the client `nw` duplicates of every row. Hashed owners keep
         // the fan-out (matches scatter by PK).
         let unicast = replicated_unicast(disp_ptr, target_id);
@@ -1139,7 +1139,7 @@ impl MasterDispatcher {
                 ));
             }
             let a = acc.get_or_insert_with(|| Batch::with_schema(expected, mb.count));
-            a.append_mem_batch_range(mb, 0, mb.count, crate::storage::WeightFill::Copy);
+            a.append_mem_batch(mb);
             Ok(())
         })
         .await?;
@@ -1473,7 +1473,7 @@ impl MasterDispatcher {
         };
         // The exact constructor the worker uses for its reply schema, so a
         // matching reply validates by construction.
-        let expected = crate::catalog::project_schema(&parent_schema, project);
+        let expected = crate::schema::project_schema(&parent_schema, project);
 
         // `_lease` held across the full drain below (see `dispatch_scan_fanout`).
         let (slots, req_ids, _lease) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, -1, |disp, rids, unicast| {

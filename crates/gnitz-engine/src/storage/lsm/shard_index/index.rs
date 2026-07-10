@@ -111,7 +111,7 @@ impl ShardIndex {
     /// production path. Wide PKs cannot fit a u128.
     #[cfg(test)]
     pub(crate) fn find_pk(&self, key: u128, visitor: &mut impl FnMut(Rc<MappedShard>, usize)) {
-        let (opk, stride) = super::super::columnar::opk_key(&self.schema, &key.to_le_bytes());
+        let (opk, stride) = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
         self.find_pk_bytes(&opk[..stride], visitor);
     }
 
@@ -125,7 +125,7 @@ impl ShardIndex {
                 visitor(arc, idx);
             }
         }
-        let route_key = super::super::merge::pack_pk_be(key);
+        let route_key = crate::schema::key::pack_pk_be(key);
         for level in &self.levels {
             if let Some(g_idx) = level.find_guard_idx(route_key) {
                 for e in &level.guards[g_idx].entries {
@@ -238,7 +238,7 @@ impl ShardIndex {
                 if e.is_empty() {
                     continue;
                 }
-                let pk = super::super::merge::pack_pk_be(e.pk_min.pk_bytes());
+                let pk = crate::schema::key::pack_pk_be(e.pk_min.pk_bytes());
                 if keys.last().copied() != Some(pk) {
                     keys.push(pk);
                 }

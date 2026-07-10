@@ -123,7 +123,7 @@ impl Table {
         let mut checker = PkUniqueChecker::new();
         for i in 0..run.count {
             let pk = run.get_pk_bytes(i);
-            checker.observe(super::super::merge::pack_pk_be(pk), pk, run.get_weight(i));
+            checker.observe(crate::schema::key::pack_pk_be(pk), pk, run.get_weight(i));
         }
         checker.flags()
     }

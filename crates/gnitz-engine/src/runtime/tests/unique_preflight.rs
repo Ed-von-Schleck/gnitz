@@ -10,7 +10,6 @@
 
 use rustc_hash::FxHashSet;
 
-use crate::catalog::make_index_schema;
 use crate::runtime::master::PreflightAccumulator;
 use crate::runtime::sal::{unique_preflight_wire_schema, SalMessageKind, FLAG_UNIQUE_PREFLIGHT};
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
@@ -19,6 +18,7 @@ use crate::runtime::wire::{
     self, peek_control_block, SchemaWithVersion, FLAG_CONTINUATION, FLAG_HAS_SCHEMA, FLAG_SCAN_LAST,
 };
 use crate::runtime::worker::send_unique_preflight_keys;
+use crate::schema::make_index_schema;
 use crate::schema::{type_code, IndexKeySpec, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, KeyProducer, PkBuf, SpillSort};
 

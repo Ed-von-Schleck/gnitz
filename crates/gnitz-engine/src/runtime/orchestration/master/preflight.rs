@@ -1070,7 +1070,7 @@ impl MasterDispatcher {
             // build, so the frame schema agrees by construction. `packed` is
             // the column list the worker resolves the seek by.
             (
-                crate::catalog::make_index_schema(col_indices, &owner_schema)?,
+                crate::schema::make_index_schema(col_indices, &owner_schema)?,
                 gnitz_wire::pack_pk_cols(col_indices),
             )
         };

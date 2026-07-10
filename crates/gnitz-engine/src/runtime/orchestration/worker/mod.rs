@@ -1378,7 +1378,7 @@ impl WorkerProcess {
         // construction. `make_index_schema` also bounds-checks the columns (a
         // protocol-level mismatch rather than a user error) and yields the
         // promoted per-column types/sizes for the span.
-        let idx_schema = crate::catalog::make_index_schema(col_indices, &schema)?;
+        let idx_schema = crate::schema::make_index_schema(col_indices, &schema)?;
         let spec = crate::schema::IndexKeySpec::new(col_indices, &schema, &idx_schema);
         let frame_schema = crate::runtime::sal::unique_preflight_wire_schema(&idx_schema, col_indices.len());
 
@@ -2926,7 +2926,7 @@ mod tests {
         let cols = vec![mk("id"), mk("a"), mk("b")];
         let tid = engine.create_table("public.tproj", &cols, &[0], true).unwrap();
         let table_schema = engine.get_schema_desc(tid).unwrap();
-        let projected = crate::catalog::project_schema(&table_schema, &[1]);
+        let projected = crate::schema::project_schema(&table_schema, &[1]);
         assert_ne!(projected.num_columns(), table_schema.num_columns());
 
         let (ptr, writer) = make_ring();

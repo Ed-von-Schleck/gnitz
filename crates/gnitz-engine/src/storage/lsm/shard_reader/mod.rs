@@ -885,9 +885,7 @@ mod tests {
         ];
         for key in &probes {
             let expected = (0..shard.count)
-                .find(|&i| {
-                    super::super::columnar::compare_pk_bytes(shard.get_pk_bytes(i), key) != std::cmp::Ordering::Less
-                })
+                .find(|&i| crate::schema::key::compare_pk_bytes(shard.get_pk_bytes(i), key) != std::cmp::Ordering::Less)
                 .unwrap_or(shard.count);
             let got = shard.find_lower_bound_bytes(key);
             assert_eq!(got, expected, "probe={key:?}");

@@ -62,7 +62,7 @@ impl Drop for PooledSendBuf {
     }
 }
 
-/// Recycle an Batch's data and blob buffers back to the pool.
+/// Recycle a Batch's data and blob buffers back to the pool.
 pub(crate) fn recycle(batch: Batch) {
     let (data, blob) = batch.into_buffers();
     recycle_buf(data);

@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::schema::make_index_schema;
+
 impl CatalogEngine {
     // -- Hook processing ---------------------------------------------------
     //

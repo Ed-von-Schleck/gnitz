@@ -10,12 +10,11 @@ use std::cmp::Ordering;
 use std::ffi::CString;
 use std::rc::Rc;
 
-use super::columnar::pk_bytes_eq;
-use super::compare_pk_bytes;
 use super::error::StorageError;
 use super::manifest::PkBuf;
 use super::shard_reader::MappedShard;
 use super::xor8;
+use crate::schema::key::{compare_pk_bytes, pk_bytes_eq};
 use crate::schema::SchemaDescriptor;
 
 mod index;
@@ -298,7 +297,7 @@ mod tests {
     /// `pack_pk_be` space (the same key the read router and the compaction
     /// merge use), so multi-guard levels route data keys correctly.
     fn gk(v: u64) -> u128 {
-        crate::storage::merge::pack_pk_be(&v.to_be_bytes())
+        crate::schema::key::pack_pk_be(&v.to_be_bytes())
     }
 
     /// Build and write a shard file with the given PK/value pairs.

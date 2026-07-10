@@ -88,11 +88,9 @@ pub(in crate::catalog) use utils::{
 #[cfg(test)]
 pub(in crate::catalog) use utils::{make_secondary_index_name, parse_qualified_name};
 pub(in crate::catalog) use write_path::CatalogDeltaSink;
-// `BatchBuilder` and the schema-shaping free fns hold no catalog state and live
-// in `storage`; re-export them so catalog's ddl/bootstrap/store callers compile
-// unchanged. (`index_meta_schema_desc`/`INDEX_META_COL_NAMES` have no catalog
-// consumer — `runtime::executor` imports those from `storage` directly.)
-pub(crate) use crate::storage::{make_index_schema, project_schema, BatchBuilder};
+// `BatchBuilder` holds no catalog state and lives in `storage`; re-export it
+// for catalog's ddl/bootstrap/store callers.
+pub(crate) use crate::storage::BatchBuilder;
 
 // ---------------------------------------------------------------------------
 // CatalogEngine

@@ -9,11 +9,12 @@ use std::ptr;
 use std::rc::Rc;
 
 use super::batch::Batch;
-use super::columnar::{compare_pk_ordering, pk_bytes_eq, ColumnarSource};
+use super::columnar::ColumnarSource;
 use super::heap::{drive_merge, HeapNode, LoserTree};
 use super::merge::UnifiedSource;
 use super::shard_reader::MappedShard;
 use super::with_row_cmp;
+use crate::schema::key::{compare_pk_ordering, pk_bytes_eq};
 use crate::schema::SchemaDescriptor;
 
 mod output;
@@ -249,7 +250,7 @@ impl ReadCursor {
     /// Galloping forward lower-bound seek, seeding each source's search at that
     /// source's live `position` (the stream owns its hint — there is no hint
     /// parameter). Lands on the identical row `seek_bytes(key)` would
-    /// (`gallop_lower_bound_bytes` == `find_lower_bound_bytes` for every hint),
+    /// (`gallop_opk` == `lower_bound_opk` for every hint),
     /// only cheaper when the boundary moves forward. Backward-capable: a
     /// non-monotone hint forfeits the speedup (the search falls back to a bounded
     /// `[0, position)` scan) but never correctness — so monotone consumers (the

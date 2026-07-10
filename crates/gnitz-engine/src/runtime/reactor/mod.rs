@@ -1039,8 +1039,8 @@ impl Reactor {
             .expect("FLAG_HAS_DATA set but no data batch — ring corrupt");
         let sch = schema.as_ref().expect("FLAG_HAS_DATA set but no schema — ring corrupt");
         let mut owned = crate::storage::Batch::with_schema(*sch, mb.count);
-        owned.append_mem_batch_range(&mb, 0, mb.count, crate::storage::WeightFill::Copy);
-        // The wire flags are ground truth. `append_mem_batch_range` leaves `owned`
+        owned.append_mem_batch(&mb);
+        // The wire flags are ground truth. `append_mem_batch` leaves `owned`
         // `Raw`; raise to the decoded claim, debug-verifying the data against it.
         owned.certify_layout(wire::layout_from_wire_flags(flags), sch);
         let control = zc.control;
@@ -1070,8 +1070,8 @@ impl Reactor {
                 .as_ref()
                 .expect("exchange FLAG_HAS_DATA without schema — ring corrupt");
             let mut owned = crate::storage::Batch::with_schema(*sch, mb.count);
-            owned.append_mem_batch_range(&mb, 0, mb.count, crate::storage::WeightFill::Copy);
-            // The wire flags are ground truth. `append_mem_batch_range` leaves
+            owned.append_mem_batch(&mb);
+            // The wire flags are ground truth. `append_mem_batch` leaves
             // `owned` `Raw`; raise to the decoded claim, debug-verifying the data.
             owned.certify_layout(wire::layout_from_wire_flags(flags), sch);
             let _ = mb; // release borrow from slot bytes before dropping slot

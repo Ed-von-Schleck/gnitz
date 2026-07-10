@@ -325,7 +325,7 @@ impl RegisterFile {
             let batch = if m.schema.num_columns() > 0 {
                 Batch::with_schema(m.schema, if m.kind == RegisterKind::Delta { 16 } else { 0 })
             } else {
-                Batch::empty(0, 16)
+                Batch::placeholder()
             };
             registers.push(Register {
                 kind: m.kind,

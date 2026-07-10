@@ -139,7 +139,7 @@ fn test_reduce_sum_retraction() {
     );
 
     // Empty trace_out
-    let empty_out = Rc::new(Batch::empty(3, 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     // Tick 1: insert 3 rows in group 10: val=100, val=200, val=300
@@ -603,7 +603,7 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
     ];
 
     // Tick 1: insert (pk1, grp=10, val=5) and (pk2, grp=10, val=NULL).
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
     let delta1 = {
         let mut b = Batch::with_schema(in_schema, 2);
@@ -963,7 +963,7 @@ fn reduce_trace_seek_wide_pk() {
     let group_by = [0u32, 1, 2];
 
     // Tick 1: two rows in one group (7,7,7) — val 100 and 200 → SUM = 300.
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
     let delta1 = {
         let mut b = Batch::with_schema(in_schema, 2);
@@ -1071,7 +1071,7 @@ fn reduce_trace_seek_compound_pk() {
     let group_by = [0u32, 1];
 
     // Tick 1: insert (1,5)->100 and (2,3)->200 (two distinct groups).
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
     let delta1 = {
         let mut b = Batch::with_schema(in_schema, 2);
@@ -1175,7 +1175,7 @@ fn reduce_trace_seek_signed_pk() {
     let group_by = [0u32];
 
     // Tick 1: insert key=-1 -> 200, key=2 -> 100.
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
     let delta1 = {
         let mut b = Batch::with_schema(in_schema, 2);
@@ -1263,7 +1263,7 @@ fn test_reduce_count() {
         &[0],
     );
 
-    let empty_out = Rc::new(Batch::empty(1, 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     // 3 rows: pk=1,2,3 all GROUP BY pk (single group using pk as group)
@@ -1432,7 +1432,7 @@ fn test_reduce_sum_i32() {
         &[0],
     );
 
-    let empty_out = Rc::new(Batch::empty(2, 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     // 3 rows with I32 values, group by PK
@@ -1480,7 +1480,7 @@ fn test_reduce_min_f32() {
         &[0],
     );
 
-    let empty_out = Rc::new(Batch::empty(1, 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     // Use a 2-col input schema: pk(U64), val(F32), GROUP BY pk. Rows in
@@ -1531,7 +1531,7 @@ fn test_reduce_max_i16() {
         &[0],
     );
 
-    let empty_out = Rc::new(Batch::empty(1, 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     // 3 rows with I16 values, all same PK, in (PK, payload) order so the
@@ -2080,7 +2080,7 @@ fn test_reduce_min_pk_col_compound_pk() {
         &[0, 1],
     );
 
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     // Two distinct compound PKs whose pk_col_0 and pk_col_1 disagree
@@ -2137,7 +2137,7 @@ fn test_reduce_min_pk_col_single_pk_u64() {
         &[0],
     );
 
-    let empty_out = Rc::new(Batch::empty(1, 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     // Input is PK-sorted from consolidation; the group_by_pk fast path
@@ -2188,7 +2188,7 @@ fn test_reduce_group_by_pk_permuted_preserves_pk_order() {
         &[0, 1],
     );
 
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     // Two PKs whose [0,1] and [1,0] orderings disagree: (1,2) vs (2,1).
@@ -2397,7 +2397,7 @@ fn test_op_reduce_compound_pk_group_by_subset_count() {
         &[0],
     );
 
-    let empty_out = Rc::new(Batch::empty(1, 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     // PK-sorted (pk0, pk1): (1,10), (1,20), (2,10).
@@ -2537,7 +2537,7 @@ fn test_reduce_min_u64_high_bit_set() {
     let in_schema = make_schema_u64pk_i64grp_u64val();
     let out_schema = make_out_schema_grp_u64agg();
 
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     // One group (grp=7). val=1, u64::MAX, and 2^63 — the unsigned MIN is 1.
@@ -2582,7 +2582,7 @@ fn test_reduce_max_u64_high_bit_set() {
     let in_schema = make_schema_u64pk_i64grp_u64val();
     let out_schema = make_out_schema_grp_u64agg();
 
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     // Same input as MIN test. Unsigned MAX is u64::MAX. Pre-fix signed
@@ -2627,7 +2627,7 @@ fn test_reduce_min_u64_incremental() {
     let out_schema = make_out_schema_grp_u64agg();
 
     // Tick 1: one row with val=1u64<<60 → MIN = 1u64<<60.
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     let delta1 = make_batch_u64pk_i64grp_u64val(&in_schema, &[(1, 1, 7, 1u64 << 60)]);
@@ -2639,7 +2639,7 @@ fn test_reduce_min_u64_incremental() {
         _pad: [0; 2],
     };
 
-    let empty_ti = Rc::new(Batch::empty(in_schema.num_payload_cols(), 16));
+    let empty_ti = Rc::new(Batch::empty_with_schema(&in_schema));
     let mut ti_ch = ReadCursor::from_owned(&[empty_ti], in_schema);
 
     let (out1, _) = op_reduce(
@@ -2711,7 +2711,7 @@ fn test_reduce_max_u64_incremental() {
     let out_schema = make_out_schema_grp_u64agg();
 
     // Tick 1: MAX over a single low value → MAX = 10.
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     let delta1 = make_batch_u64pk_i64grp_u64val(&in_schema, &[(1, 1, 7, 10)]);
@@ -2723,7 +2723,7 @@ fn test_reduce_max_u64_incremental() {
         _pad: [0; 2],
     };
 
-    let empty_ti = Rc::new(Batch::empty(in_schema.num_payload_cols(), 16));
+    let empty_ti = Rc::new(Batch::empty_with_schema(&in_schema));
     let mut ti_ch = ReadCursor::from_owned(&[empty_ti], in_schema);
 
     let (out1, _) = op_reduce(
@@ -2842,9 +2842,9 @@ fn test_reduce_min_u64_replay_via_trace_in() {
     };
 
     // Tick 1: single insertion. trace_in empty. MIN = u64::MAX.
-    let empty_ti = Rc::new(Batch::empty(in_schema.num_payload_cols(), 16));
+    let empty_ti = Rc::new(Batch::empty_with_schema(&in_schema));
     let mut ti_ch = ReadCursor::from_owned(&[empty_ti], in_schema);
-    let empty_to = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_to = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_to], out_schema);
 
     let delta1 = make_batch_u64pk_i64grp_u64val(&in_schema, &[(1, 1, 7, u64::MAX)]);
@@ -2917,7 +2917,7 @@ fn test_reduce_min_max_i64_boundary() {
 
     // MIN test.
     {
-        let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+        let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
         let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
         let delta = make_batch_u64pk_i64grp_i64val(
@@ -2953,7 +2953,7 @@ fn test_reduce_min_max_i64_boundary() {
 
     // MAX test.
     {
-        let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+        let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
         let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
         let delta = make_batch_u64pk_i64grp_i64val(
@@ -3074,7 +3074,7 @@ fn test_reduce_group_by_pk_unsorted_input_linear_sum() {
 
     let in_schema = make_schema_u64_i64();
     let out_schema = make_pk_sum_count_out_schema();
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     // Unsorted: pk=5 appears twice, separated by pk=3. The fast path
@@ -3127,7 +3127,7 @@ fn test_reduce_group_by_pk_unsorted_input_count() {
 
     let in_schema = make_schema_u64_i64();
     let out_schema = make_pk_sum_out_schema(); // pk + I64 agg
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     let delta = make_batch_raw_pk(&in_schema, &[(5, 1, 10), (3, 1, 20), (5, 1, 30)], |pk: u64| pk as u128);
@@ -3170,7 +3170,7 @@ fn test_reduce_group_by_pk_unsorted_sorted_input_equivalence() {
 
     let in_schema = make_schema_u64_i64();
     let out_schema = make_pk_sum_count_out_schema();
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     // Same data as the unsorted-sum test but pre-sorted. The
@@ -3218,7 +3218,7 @@ fn test_reduce_group_by_pk_unsorted_compound_pk_permuted() {
         ],
         &[0, 1],
     );
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     // Unsorted compound-PK delta: physical order is (2,1) then (1,2).
@@ -3284,7 +3284,7 @@ fn test_reduce_group_by_pk_unsorted_signed_pk() {
         ],
         &[0],
     );
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     // Unsorted signed-PK delta. A u128.cmp on the widened (zero-extended)
@@ -3539,7 +3539,7 @@ fn avi_two_groups_distinct_byte_form_keys() {
         b
     };
 
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
     let mut avi_ch = ReadCursor::from_owned(&[Rc::new(avi_batch)], avi_schema);
 
@@ -3770,7 +3770,7 @@ fn avi_non_power_of_two_stride_drives_cursor() {
             b
         };
 
-        let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+        let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
         let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
         let mut avi_ch = ReadCursor::from_owned(&[Rc::new(avi_batch)], avi_schema);
 
@@ -4069,7 +4069,7 @@ fn min_ignores_null_values() {
         b
     };
 
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     let agg = AggDescriptor {
@@ -4339,7 +4339,7 @@ fn avi_wide_two_u64_groups_match_reference() {
         bt
     };
 
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
     let mut avi_ch = ReadCursor::from_owned(&[Rc::new(avi_batch)], avi_schema);
 
@@ -4445,7 +4445,7 @@ fn avi_wide_single_u128_group_distinct() {
         b
     };
 
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
     let mut avi_ch = ReadCursor::from_owned(&[Rc::new(avi_batch)], avi_schema);
 
@@ -4564,7 +4564,7 @@ fn avi_wide_mixed_signed_unsigned_key() {
         b
     };
 
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
     let mut avi_ch = ReadCursor::from_owned(&[Rc::new(avi_batch)], avi_schema);
 
@@ -4677,7 +4677,7 @@ fn avi_wide_prefix_collision_distinct_groups() {
         b
     };
 
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
     let mut avi_ch = ReadCursor::from_owned(&[Rc::new(avi_batch)], avi_schema);
 
@@ -5146,7 +5146,7 @@ fn reduce_wide_compound_pk_group_by_pk_counts_per_pk() {
         b
     };
 
-    let to_batch = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let to_batch = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[to_batch], out_schema);
 
     let agg = AggDescriptor {
@@ -5437,7 +5437,7 @@ fn run_fallback_min_i64_grp(
 
     // --- Tick 1: empty trace_in, empty trace_out ---
     let delta1 = build_grp_val_delta(&in_schema, tick1_rows);
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch1 = ReadCursor::from_owned(&[empty_out], out_schema);
 
     let (out1, _) = op_reduce(
@@ -5626,7 +5626,7 @@ fn fallback_min_multi_col_group() {
         (4, 1, 2, 1, 50),
     ];
     let delta1 = make_batch(&tick1_rows);
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     let (out1, _) = op_reduce(
@@ -5651,7 +5651,7 @@ fn fallback_min_multi_col_group() {
     // trace_in so the replay is {10, 20, 5} and MIN = 5.
     let delta2_rows = [(5u64, 1, 1i64, 1i64, 5i64)];
     let ti_batch = Rc::new(make_batch(&tick1_rows));
-    let empty_out2 = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out2 = Rc::new(Batch::empty_with_schema(&out_schema));
     let delta2 = make_batch(&delta2_rows);
 
     let mut ti_ch = ReadCursor::from_owned(&[ti_batch], in_schema);
@@ -5743,7 +5743,7 @@ fn fallback_trace_rewind_at_most_once() {
     delta_b.set_layout_unchecked(Layout::Consolidated);
 
     let ti_rc = Rc::new(ti_b);
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut ti_ch = ReadCursor::from_owned(&[ti_rc], in_schema);
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
@@ -5978,7 +5978,7 @@ fn test_reduce_max_blob_group_retraction() {
     // Tick 1: blob_a → {10, 30}, blob_b → {20}. Empty trace.
     let tick1: &[(u64, i64, &[u8], i64)] = &[(1, 1, blob_a, 10), (2, 1, blob_a, 30), (3, 1, blob_b, 20)];
     let delta1 = make_batch_blob_grp_i64(&in_schema, tick1);
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch1 = ReadCursor::from_owned(&[empty_out], out_schema);
     let (out1, _) = op_reduce(
         &delta1,
@@ -6130,7 +6130,7 @@ fn global_seed_over_empty_emits_one_ground_row() {
     use std::rc::Rc;
 
     let out_schema = make_pk_sum_count_out_schema();
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     let (raw, _) = g_reduce(&g_delta(&[]), None, &mut to_ch, &out_schema, &[G_SUM, G_COUNT], true);
@@ -6155,7 +6155,7 @@ fn global_seed_idempotent_across_two_empty_pads() {
     use std::rc::Rc;
 
     let out_schema = make_pk_sum_count_out_schema();
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
     let (raw1, _) = g_reduce(&g_delta(&[]), None, &mut to_ch, &out_schema, &[G_SUM, G_COUNT], true);
     assert_eq!(raw1.count, 1, "first pad seeds the ground");
@@ -6175,7 +6175,7 @@ fn global_non_owner_empty_pad_emits_zero_rows() {
     use std::rc::Rc;
 
     let out_schema = make_pk_sum_count_out_schema();
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
     let (raw, _) = g_reduce(
         &g_delta(&[]),
@@ -6195,7 +6195,7 @@ fn global_create_over_nonempty_emits_computed_no_ground() {
     use std::rc::Rc;
 
     let out_schema = make_pk_sum_count_out_schema();
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
     let (raw, _) = g_reduce(
         &g_delta(&[(1, 1, 5), (2, 1, 10)]),
@@ -6219,7 +6219,7 @@ fn global_emptied_by_delete_emits_ground() {
     use std::rc::Rc;
 
     let out_schema = make_pk_sum_count_out_schema();
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
     let (raw1, _) = g_reduce(
         &g_delta(&[(1, 1, 5)]),
@@ -6260,7 +6260,7 @@ fn global_ground_to_computed_on_first_insert() {
 
     let out_schema = make_pk_sum_count_out_schema();
     // Tick 1: seed the ground over an empty source.
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
     let (ground, _) = g_reduce(&g_delta(&[]), None, &mut to_ch, &out_schema, &[G_SUM, G_COUNT], true);
     assert_eq!(ground.count, 1);
@@ -6294,7 +6294,7 @@ fn global_value_change_emits_no_ground() {
     use std::rc::Rc;
 
     let out_schema = make_pk_sum_count_out_schema();
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
     let (raw1, _) = g_reduce(
         &g_delta(&[(1, 1, 5)]),
@@ -6338,9 +6338,9 @@ fn global_mixed_count_min_emptied_emits_ground() {
     let aggs = [G_COUNT, G_MIN];
 
     // Tick 1: insert one row (trace_in empty). MIN is non-linear → replay path.
-    let empty_in = Rc::new(Batch::empty(in_schema.num_payload_cols(), 8));
+    let empty_in = Rc::new(Batch::empty_with_schema(&in_schema));
     let mut ti1 = ReadCursor::from_owned(&[empty_in], in_schema);
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
     let (raw1, _) = g_reduce(
         &g_delta(&[(1, 1, 5)]),
@@ -6401,9 +6401,9 @@ fn global_lone_min_retract_to_next_best() {
     let in_schema = g_src();
 
     // Tick 1: insert val=5 and val=3 → MIN=3.
-    let empty_in = Rc::new(Batch::empty(in_schema.num_payload_cols(), 8));
+    let empty_in = Rc::new(Batch::empty_with_schema(&in_schema));
     let mut ti1 = ReadCursor::from_owned(&[empty_in], in_schema);
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
     let (raw1, _) = g_reduce(
         &g_delta(&[(1, 1, 5), (2, 1, 3)]),
@@ -6505,7 +6505,7 @@ fn global_lone_min_avi_empty_prefix() {
 
     // Tick 1: delta val=50 is NOT the min; the AVI holds the true global min 10,
     // so a correct result can only come from the 0-byte-prefix index seek.
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
     let (raw1, _) = g_min_avi(&g_delta(&[(1, 1, 50)]), &mut to_ch, 10);
     let mb1 = raw1.as_mem_batch();
@@ -6799,7 +6799,7 @@ fn combine_sums_partial_counts_not_partial_rows() {
     use std::rc::Rc;
 
     let out_schema = combine_out_schema();
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     // Two workers' partials: counts 3 and 5.
@@ -6826,7 +6826,7 @@ fn combine_all_null_partials_render_zero_not_null() {
     use std::rc::Rc;
 
     let out_schema = combine_out_schema();
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     // Two non-empty workers, each with a NULL partial count → SumZero untouched.
@@ -6853,7 +6853,7 @@ fn combine_full_retraction_sheds_to_ground() {
     use std::rc::Rc;
 
     let out_schema = combine_out_schema();
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     let out1 = combine_reduce(&combine_partials(&[(1, Some(5))]), &mut to_ch, &out_schema);
@@ -7009,7 +7009,7 @@ fn reduce_multi_avi_foreign_group() {
     let avi_t = build_combined_avi(tmp.path(), &in_schema, &[1u32], &aggs, &[&delta]);
     let mut avi_ch = avi_t.open_cursor();
 
-    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
     let (out, _) = op_reduce(
@@ -7145,7 +7145,7 @@ fn reduce_multi_avi_linear_companion() {
 
     // Tick 1: insert g=7 {a=5, a=8, a=3}.
     let d1 = cg3_delta(&[(1, 1, 7, 5, false), (2, 1, 7, 8, false), (3, 1, 7, 3, false)]);
-    let empty = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to1 = ReadCursor::from_owned(&[empty], out_schema);
     let out1 = cg3_tick(tmp.path(), &[&d1], &d1, &aggs, &mut to1);
     assert_eq!(out1.count, 1);
@@ -7184,7 +7184,7 @@ fn reduce_multi_avi_emptied_with_companion() {
     let out_schema = cg3_out();
 
     let d1 = cg3_delta(&[(1, 1, 7, 5, false), (2, 1, 7, 8, false)]);
-    let empty = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to1 = ReadCursor::from_owned(&[empty], out_schema);
     let out1 = cg3_tick(tmp.path(), &[&d1], &d1, &aggs, &mut to1);
     assert_eq!(out1.count, 1);
@@ -7213,7 +7213,7 @@ fn reduce_multi_avi_all_null_emit() {
 
     // Group 7 with two rows, both a = NULL.
     let d1 = cg3_delta(&[(1, 1, 7, 0, true), (2, 1, 7, 0, true)]);
-    let empty = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to1 = ReadCursor::from_owned(&[empty], out_schema);
     let out1 = cg3_tick(tmp.path(), &[&d1], &d1, &aggs, &mut to1);
     assert_eq!(out1.count, 1, "all-NULL group with rows must still emit");
@@ -7242,7 +7242,7 @@ fn reduce_multi_avi_retract_to_all_null() {
 
     // Tick 1: g=7 = {a=5, a=NULL}. MIN=5, COUNT=2.
     let d1 = cg3_delta(&[(1, 1, 7, 5, false), (2, 1, 7, 0, true)]);
-    let empty = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to1 = ReadCursor::from_owned(&[empty], out_schema);
     let out1 = cg3_tick(tmp.path(), &[&d1], &d1, &aggs, &mut to1);
     assert_eq!(out1.count, 1);
@@ -7321,7 +7321,7 @@ fn reduce_multi_avi_same_col_min_max() {
     let tmp = tempfile::tempdir().unwrap();
     let avi_t = build_combined_avi(tmp.path(), &in_schema, &[1u32], &aggs, &[&delta]);
     let mut avi_ch = avi_t.open_cursor();
-    let empty = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to = ReadCursor::from_owned(&[empty], out_schema);
     let (out, _) = op_reduce(
         &delta,
@@ -7404,7 +7404,7 @@ fn reduce_multi_avi_compound_group_key() {
     let tmp = tempfile::tempdir().unwrap();
     let avi_t = build_combined_avi(tmp.path(), &in_schema, &[1u32, 2u32], &aggs, &[&delta]);
     let mut avi_ch = avi_t.open_cursor();
-    let empty = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to = ReadCursor::from_owned(&[empty], out_schema);
     let (out, _) = op_reduce(
         &delta,
@@ -7516,7 +7516,7 @@ fn reduce_multi_avi_global_emptied() {
 
     // Tick 1: insert {a=5,b=10},{a=3,b=20}. MIN=3, SUM=30, COUNT=2.
     let d1 = mk(&[(1, 1, 5, 10), (2, 1, 3, 20)]);
-    let empty = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let empty = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to1 = ReadCursor::from_owned(&[empty], out_schema);
     let out1 = run(&[&d1], &d1, &mut to1);
     assert_eq!(out1.count, 1);

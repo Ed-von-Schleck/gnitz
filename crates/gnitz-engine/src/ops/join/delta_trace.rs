@@ -26,13 +26,11 @@ pub fn op_join_delta_trace(
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
 ) -> Batch {
-    let out_npc = left_schema.num_payload_cols() + right_schema.num_payload_cols();
-
     let cs = Batch::consolidate_if_needed(delta, left_schema);
     let consolidated: &Batch = cs.as_ref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
-        return Batch::empty(out_npc, left_schema.pk_stride());
+        return Batch::empty_joined(left_schema, right_schema);
     }
 
     let delta_mb = consolidated.as_mem_batch();

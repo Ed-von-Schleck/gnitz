@@ -787,7 +787,7 @@ mod unique_filter_tests {
     /// Span-extraction spec for a unique index on `cols` of `schema`, promoted
     /// via `make_index_schema` exactly as production circuit registration does.
     fn test_spec(cols: &[u32], schema: &SchemaDescriptor) -> IndexKeySpec {
-        let idx_schema = crate::catalog::make_index_schema(cols, schema).unwrap();
+        let idx_schema = crate::schema::make_index_schema(cols, schema).unwrap();
         IndexKeySpec::new(cols, schema, &idx_schema)
     }
 

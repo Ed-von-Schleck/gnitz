@@ -119,7 +119,7 @@ pub fn build_schema_wire_block(
     target_tid: u32,
 ) -> Vec<u8> {
     let schema_batch = schema_to_batch(schema, col_names, hidden_mask);
-    let sz = schema_batch.wire_byte_size(target_tid);
+    let sz = schema_batch.wire_byte_size();
     let mut block = vec![0u8; sz];
     schema_batch.encode_to_wire(target_tid, &mut block, 0, true);
     block
@@ -469,7 +469,7 @@ pub fn wire_size(
     }
 
     if has_data {
-        total += data_batch.unwrap().wire_byte_size(0);
+        total += data_batch.unwrap().wire_byte_size();
     }
     total
 }

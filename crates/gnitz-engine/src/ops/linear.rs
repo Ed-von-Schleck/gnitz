@@ -121,7 +121,7 @@ pub fn op_map(
 /// Negate: flip the sign of every weight.
 pub fn op_negate(batch: &Batch) -> Batch {
     if batch.count == 0 {
-        return Batch::empty(batch.num_payload_cols(), batch.pk_stride());
+        return batch.empty_like();
     }
 
     // clone_batch copies all column regions and the blob verbatim — no
@@ -274,16 +274,10 @@ pub fn op_null_extend(batch: &Batch, in_schema: &SchemaDescriptor, right_schema:
 
     let in_npc = in_schema.num_payload_cols();
     let right_npc = right_schema.num_payload_cols();
-    let out_npc = in_npc + right_npc;
     let n = batch.count;
 
-    if n == 0 {
-        // Output PK region is identical to the input PK, so its stride is the
-        // input schema's PK stride (8 for U64, 16 for U128, etc.).
-        return Batch::empty(out_npc, in_schema.pk_stride());
-    }
-
-    // Build a merged schema for the output batch.
+    // Build the merged schema for the output batch (also the shape of the
+    // zero-row early return — output PK region is identical to the input PK).
     let mut out_columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
     let mut ci_out = 0;
     for ci in 0..in_schema.num_columns() {
@@ -295,6 +289,10 @@ pub fn op_null_extend(batch: &Batch, in_schema: &SchemaDescriptor, right_schema:
         ci_out += 1;
     }
     let out_schema = SchemaDescriptor::new(&out_columns[..ci_out], in_schema.pk_indices());
+
+    if n == 0 {
+        return Batch::empty_with_schema(&out_schema);
+    }
 
     let mut output = Batch::with_schema(out_schema, n);
     output.count = n;
@@ -633,7 +631,7 @@ mod tests {
     #[test]
     fn test_op_map_empty_batch() {
         let schema = make_schema_u64_i64();
-        let empty_batch = Batch::empty(1, 16);
+        let empty_batch = Batch::empty_with_schema(&schema);
 
         let func = ScalarFunc::from_projection(&[1], &[type_code::I64], &schema, &schema);
         let out = op_map(&empty_batch, &func, &schema, &schema, &[], &[], false, 0);

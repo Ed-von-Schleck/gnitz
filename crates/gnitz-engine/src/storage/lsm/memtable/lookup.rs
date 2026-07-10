@@ -3,9 +3,8 @@
 //! retract path.
 
 use super::super::batch::Batch;
-use super::super::columnar;
-use super::super::merge::pack_pk_be;
 use super::MemTable;
+use crate::schema::key::{pack_pk_be, pk_bytes_eq};
 
 /// Start index of the first exact-match candidate for OPK `key` in `run`.
 /// Returns `run.count` when `key` falls outside the run's `[min, max]` range
@@ -35,7 +34,7 @@ fn run_exact_match_start_bytes(run: &Batch, key: &[u8]) -> usize {
 /// lookup so callers never re-derive the bound check or the index step.
 pub(crate) fn run_pk_match_rows<'a>(run: &'a Batch, key: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
     let start = run_exact_match_start_bytes(run, key);
-    (start..run.count).take_while(move |&lo| columnar::pk_bytes_eq(run.get_pk_bytes(lo), key))
+    (start..run.count).take_while(move |&lo| pk_bytes_eq(run.get_pk_bytes(lo), key))
 }
 
 impl MemTable {
@@ -46,7 +45,7 @@ impl MemTable {
     /// doc); later upserts maintain it incrementally.
     pub fn may_contain_pk(&self, opk_key: &[u8]) -> bool {
         let bloom = self.bloom.get_or_init(|| {
-            let mut bloom = super::runs::new_bloom(self.bloom_capacity());
+            let mut bloom = super::super::bloom::BloomFilter::new(self.bloom_capacity());
             for run in &self.runs {
                 super::bloom_add_batch(&mut bloom, run);
             }

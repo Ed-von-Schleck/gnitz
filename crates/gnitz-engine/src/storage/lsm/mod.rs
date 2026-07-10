@@ -10,7 +10,7 @@
 //! single combined storage surface and re-exports the public items from these
 //! submodules. The repr (L2) siblings live under `storage/repr/`; this module
 //! aliases the repr submodules and the few storage-level helpers (`error`,
-//! `cstr`/`cstr_with_tmp_suffix`, `compare_pk_bytes`, the `with_*` dispatch
+//! `cstr`/`cstr_with_tmp_suffix`, the `with_*` dispatch
 //! macros) so the LSM files keep their `super::<mod>` paths unchanged after the
 //! move under `lsm/`.
 
@@ -31,9 +31,9 @@ pub(in crate::storage) mod shard_reader;
 
 // Aliases so the LSM submodules keep their `super::<mod>` / `super::super::<mod>`
 // paths after the move: the repr (L2) submodules plus the storage-level helpers
-// that stay above `lsm/`. The `with_*` macros and `compare_pk_bytes` are pulled
-// from `columnar`; `error` and the `cstr` helpers from the storage facade.
-use super::repr::columnar::{compare_pk_bytes, with_row_cmp};
+// that stay above `lsm/`. The `with_*` macros are pulled from `columnar`;
+// `error` and the `cstr` helpers from the storage facade.
+use super::repr::columnar::with_row_cmp;
 use super::repr::{batch, batch_pool, bloom, columnar, heap, layout, merge, scatter, shard_file, xor8};
 use super::{cstr, cstr_with_tmp_suffix, error};
 

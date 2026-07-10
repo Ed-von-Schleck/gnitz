@@ -1026,7 +1026,7 @@ mod tests {
         use crate::storage::batch_pool::acquire_buf;
         while acquire_buf().capacity() > 0 {}
 
-        let batch = Batch::empty(2, 16);
+        let batch = Batch::placeholder();
         assert_eq!(batch.data_capacity(), 0);
         drop(batch);
 

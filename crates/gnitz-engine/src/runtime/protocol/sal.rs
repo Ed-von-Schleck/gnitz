@@ -5,10 +5,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::foundation::codec::{align8, read_u32_raw, read_u64_raw, write_u32_le, write_u32_raw, write_u64_raw};
+use crate::foundation::codec::{align8, read_u32_raw, read_u64_raw, write_u32_raw, write_u64_raw};
 use crate::foundation::posix_io;
 use crate::foundation::syscall;
-use crate::foundation::xxh;
 use crate::runtime::wire::{
     build_schema_wire_block, encode_ctrl_block_direct, encode_wire_into, layout_to_wire_flags, wire_size,
     CTRL_BLOCK_SIZE_NO_BLOB, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, STATUS_OK,
@@ -711,44 +710,27 @@ fn write_scattered_data_block(
     table_id: u32,
     data_slot: &mut [u8],
 ) {
-    let pk_stride = schema.pk_stride() as usize;
-    let npc = schema.num_payload_cols();
-    let num_regions = 3 + npc + 1;
-    let header_dir_size = gnitz_wire::WAL_HEADER_SIZE + num_regions * 8;
     let total_size = data_slot.len();
 
-    // Write WAL header (zeroed first; checksum filled in after scatter).
-    data_slot[..gnitz_wire::WAL_HEADER_SIZE].fill(0);
-    write_u32_le(data_slot, gnitz_wire::WAL_OFF_TID, table_id);
-    write_u32_le(data_slot, gnitz_wire::WAL_OFF_COUNT, count as u32);
-    write_u32_le(data_slot, gnitz_wire::WAL_OFF_SIZE, total_size as u32);
-    write_u32_le(data_slot, gnitz_wire::WAL_OFF_VERSION, gnitz_wire::WAL_FORMAT_VERSION);
-    write_u32_le(data_slot, gnitz_wire::WAL_OFF_NUM_REGIONS, num_regions as u32);
-
-    // Write directory. All strides % 8 == 0 (schema_wire_safe), so no align8 padding.
-    let mut pos = header_dir_size;
-    write_u32_le(data_slot, gnitz_wire::WAL_HEADER_SIZE, pos as u32);
-    write_u32_le(data_slot, gnitz_wire::WAL_HEADER_SIZE + 4, (pk_stride * count) as u32);
-    pos += pk_stride * count;
-    write_u32_le(data_slot, gnitz_wire::WAL_HEADER_SIZE + 8, pos as u32);
-    write_u32_le(data_slot, gnitz_wire::WAL_HEADER_SIZE + 12, (8 * count) as u32);
-    pos += 8 * count;
-    write_u32_le(data_slot, gnitz_wire::WAL_HEADER_SIZE + 16, pos as u32);
-    write_u32_le(data_slot, gnitz_wire::WAL_HEADER_SIZE + 20, (8 * count) as u32);
-    pos += 8 * count;
-    for (pi, _ci, col) in schema.payload_columns() {
-        let stride = col.size() as usize;
-        let dir_off = gnitz_wire::WAL_HEADER_SIZE + (3 + pi) * 8;
-        write_u32_le(data_slot, dir_off, pos as u32);
-        write_u32_le(data_slot, dir_off + 4, (stride * count) as u32);
-        pos += stride * count;
+    // Region sizes in canonical order: pk, weight, null_bmp, payload…, blob(0).
+    // All strides % 8 == 0 (schema_wire_safe), so the shared header/directory
+    // writer's align8 padding never fires and the body is one contiguous run.
+    let mut sizes = [0u32; crate::storage::MAX_WIRE_REGIONS];
+    sizes[0] = (schema.pk_stride() as usize * count) as u32;
+    sizes[1] = (8 * count) as u32;
+    sizes[2] = (8 * count) as u32;
+    let mut nr = 3;
+    for (_pi, _ci, col) in schema.payload_columns() {
+        sizes[nr] = (col.size() as usize * count) as u32;
+        nr += 1;
     }
-    let blob_dir_off = gnitz_wire::WAL_HEADER_SIZE + (3 + npc) * 8;
-    write_u32_le(data_slot, blob_dir_off, pos as u32);
-    write_u32_le(data_slot, blob_dir_off + 4, 0u32);
+    sizes[nr] = 0; // blob: empty on this fast path
+    nr += 1;
+    crate::storage::wal_write_header_and_directory(data_slot, table_id, count as u32, &sizes[..nr], total_size);
 
     // The writer carves `rest` (body after header+directory) into per-region
     // slices: [pk | weight | null | col_0 | ...], each sized for `count` rows.
+    let header_dir_size = gnitz_wire::WAL_HEADER_SIZE + nr * 8;
     let (_, rest) = data_slot.split_at_mut(header_dir_size);
     let (pk, weight, null_bmp, col_slices) = carve_writer_slices(rest, schema, count);
     // No German-string columns on this fast path; DirectWriter still wants a blob
@@ -761,9 +743,7 @@ fn write_scattered_data_block(
         "non-string SAL fast path must not write blob bytes"
     );
 
-    // Compute and write the XXH3 checksum over the body (same as wal::encode).
-    let cs = xxh::checksum(&data_slot[gnitz_wire::WAL_HEADER_SIZE..total_size]);
-    data_slot[gnitz_wire::WAL_OFF_CHECKSUM..gnitz_wire::WAL_OFF_CHECKSUM + 8].copy_from_slice(&cs.to_le_bytes());
+    crate::storage::wal_stamp_checksum(data_slot, total_size);
 }
 
 // ---------------------------------------------------------------------------
@@ -974,7 +954,6 @@ impl SalWriter {
 
         if !wire_safe {
             // Fallback: reconstruct per-worker Batches and use existing path.
-            let npc = schema.num_payload_cols();
             let mb = input_batch.as_mem_batch();
             let sub_batches: Vec<Batch> = worker_indices
                 .iter()
@@ -982,7 +961,7 @@ impl SalWriter {
                     if !indices.is_empty() {
                         Batch::from_indexed_rows(&mb, indices, schema)
                     } else {
-                        Batch::empty(npc, 16)
+                        Batch::empty_with_schema(schema)
                     }
                 })
                 .collect();

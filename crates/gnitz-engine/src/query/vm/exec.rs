@@ -247,13 +247,11 @@ pub(crate) fn execute_epoch_multi(
                 out_reg,
             } => {
                 let schema = reg!(*in_a).schema;
-                let npc = reg!(*in_a).batch.num_payload_cols();
-                let stride = schema.pk_stride();
                 if *has_b && in_a == in_b {
                     // Self-union: Z + Z doubles every weight in-place. Reading
                     // batch_b after moving batch_a out would see an empty batch
                     // and produce +1 instead of +2.
-                    let mut batch = std::mem::replace(&mut reg_mut!(*in_a).batch, Batch::empty(npc, stride));
+                    let mut batch = reg_mut!(*in_a).batch.take();
                     for chunk in batch.weight_data_mut().chunks_exact_mut(8) {
                         let w = i64::from_le_bytes(chunk.try_into().unwrap());
                         chunk.copy_from_slice(&w.wrapping_mul(2).to_le_bytes());
@@ -261,7 +259,7 @@ pub(crate) fn execute_epoch_multi(
                     reg_mut!(*out_reg).batch = batch;
                 } else {
                     let batch_b = if *has_b { Some(&reg!(*in_b).batch) } else { None };
-                    let batch_a = std::mem::replace(&mut reg_mut!(*in_a).batch, Batch::empty(npc, stride));
+                    let batch_a = reg_mut!(*in_a).batch.take();
                     reg_mut!(*out_reg).batch = ops::op_union(batch_a, batch_b, &schema);
                 }
             }
@@ -276,9 +274,7 @@ pub(crate) fn execute_epoch_multi(
             } => {
                 if let Some(cursor) = cursor_mut!(*hist_reg) {
                     let schema = reg!(*in_reg).schema;
-                    let npc = reg!(*in_reg).batch.num_payload_cols();
-                    let stride = schema.pk_stride();
-                    let delta = std::mem::replace(&mut reg_mut!(*in_reg).batch, Batch::empty(npc, stride));
+                    let delta = reg_mut!(*in_reg).batch.take();
                     let (output, consolidated) = ops::op_weight_clamp(delta, cursor, &schema, *lo, *hi);
                     reg_mut!(*out_reg).batch = output;
                     // Ingest consolidated delta into history table
@@ -496,9 +492,7 @@ pub(crate) fn execute_epoch_multi(
     // 4. Extract output
     let out = &mut regfile.registers[output_reg as usize];
     if out.batch.count > 0 {
-        let npc = out.batch.num_payload_cols();
-        let stride = out.batch.pk_stride();
-        let result = std::mem::replace(&mut out.batch, Batch::empty(npc, stride));
+        let result = out.batch.take();
         Ok(Some(result))
     } else {
         Ok(None)

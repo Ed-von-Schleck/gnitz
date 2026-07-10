@@ -13,7 +13,7 @@ use std::ffi::CStr;
 
 use super::super::error::StorageError;
 use super::batch::{
-    pk_stride, Batch, MAX_BATCH_REGIONS, MAX_WIRE_REGIONS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
+    acquire_arena, compute_offsets, strides_from_schema, Batch, Fill, MAX_BATCH_REGIONS, MAX_WIRE_REGIONS, REG_PK,
 };
 use super::merge::MemBatch;
 use super::shard_file;
@@ -38,7 +38,7 @@ impl Batch {
     // ── Wire serialization (used by runtime::sal / runtime::wire) ───────────
 
     /// Byte count of the WAL-block encoding for this batch.
-    pub fn wire_byte_size(&self, _table_id: u32) -> usize {
+    pub fn wire_byte_size(&self) -> usize {
         let nr_wire = self.num_regions_total();
         let mut sizes = [0u32; MAX_WIRE_REGIONS];
         for (i, size) in sizes[..nr_wire].iter_mut().enumerate() {
@@ -51,8 +51,8 @@ impl Batch {
     /// Only valid for wire-safe schemas — all region strides are multiples of 8
     /// so there is no alignment padding and the result is linear in `count`.
     pub fn wire_byte_size_range(&self, count: usize) -> usize {
-        let nr_wire = self.num_regions_total();
-        let blob_idx = nr_wire - 1;
+        let blob_idx = self.num_regions as usize;
+        let nr_wire = blob_idx + 1;
         let mut sizes = [0u32; MAX_WIRE_REGIONS];
         for (i, size) in sizes[..blob_idx].iter_mut().enumerate() {
             *size = (count * self.region_stride(i) as usize) as u32;
@@ -98,8 +98,8 @@ impl Batch {
              carry no long strings; the heap would be silently dropped",
             self.blob.len(),
         );
-        let nr_wire = self.num_regions_total();
-        let blob_idx = nr_wire - 1;
+        let blob_idx = self.num_regions as usize;
+        let nr_wire = blob_idx + 1;
         let mut ptrs = [std::ptr::null::<u8>(); MAX_WIRE_REGIONS];
         let mut sizes = [0u32; MAX_WIRE_REGIONS];
         for i in 0..blob_idx {
@@ -150,8 +150,19 @@ impl Batch {
     /// Decode a WAL block from `data` using `schema` into an owned `Batch`.
     /// Returns (Batch, bytes_consumed). Does not set sorted/consolidated —
     /// caller derives those from wire header flags. One parse
-    /// (`decode_mem_batch_from_wal_block`) + one bulk region copy.
+    /// (`decode_mem_batch_from_wal_block`) + one bulk copy per region.
     /// Set `verify_checksum = false` for trusted IPC paths (W2M ring).
+    ///
+    /// The destination is always fresh, so the block's blob heap is copied
+    /// wholesale and the 16-byte German-string structs bulk-copy verbatim with
+    /// the payload regions — their heap offsets are absolute from blob start
+    /// and stay valid at base 0. No per-row string relocation. The relocation
+    /// also canonicalized hostile long-string structs, so the passthrough
+    /// validates every long string's heap extent first and rejects the frame
+    /// (like the region-size validations) instead of persisting corrupt
+    /// structs. Exchange ingest deliberately does NOT use this decode: its
+    /// frames can carry full unfiltered blobs from filter/map blob sharing,
+    /// and `append_mem_batch`'s relocation is the compaction point there.
     pub fn decode_from_wal_block(
         data: &[u8],
         schema: &SchemaDescriptor,
@@ -160,16 +171,73 @@ impl Batch {
         let (mb, bytes_consumed) = decode_mem_batch_inner(data, schema, verify_checksum)?;
         // Zero-row block: use the schema-correct empty batch so callers never
         // observe a stale stride (e.g. empty transaction boundaries in the SAL).
-        let mut batch = if mb.count == 0 {
-            Batch::empty_with_schema(schema)
-        } else {
-            let mut owned = Batch::with_schema(*schema, mb.count);
-            owned.append_mem_batch_range(&mb, 0, mb.count, super::batch::WeightFill::Copy);
-            owned
-        };
+        if mb.count == 0 {
+            return Ok((Batch::empty_with_schema(schema), bytes_consumed));
+        }
+        validate_string_heap_extents(&mb, schema)?;
+
+        let (strides, nr) = strides_from_schema(schema);
+        let nr_usize = nr as usize;
+        let (offsets, total) = compute_offsets(&strides, nr_usize, mb.count);
+        // Uninit arena sized for exactly `mb.count` rows: every live byte of
+        // every region is written by the bulk copies below; only inter-region
+        // align8 padding stays uninit, which no reader or re-encoder touches
+        // (`wal::encode`'s run coalescing breaks exactly where padding exists,
+        // and shard/wire/clone paths are all `count`-bounded).
+        let mut data_buf = acquire_arena(total, Fill::Uninit);
+        for r in 0..nr_usize {
+            let len = mb.count * strides[r] as usize;
+            if len == 0 {
+                continue;
+            }
+            // SAFETY: both extents are in bounds — the source region was
+            // validated to `count * stride` bytes, the destination sized by
+            // compute_offsets for `mb.count` rows; distinct allocations.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    mb.data.as_ptr().add(mb.offsets[r]),
+                    data_buf.as_mut_ptr().add(offsets[r]),
+                    len,
+                );
+            }
+        }
+        let mut blob = acquire_arena(mb.blob.len(), Fill::Reserve);
+        blob.extend_from_slice(mb.blob);
+
+        // SAFETY: `data_buf`/`offsets` were laid out by compute_offsets for
+        // `mb.count` rows of these strides and every region was filled above.
+        let mut batch = unsafe { Batch::from_prebuilt(data_buf, blob, strides, offsets, nr, mb.count) };
         batch.set_schema(*schema);
         Ok((batch, bytes_consumed))
     }
+}
+
+/// Trust-boundary guard for the blob-passthrough decode: every long-string
+/// struct's `[offset, offset + len)` must lie inside the block's blob heap.
+/// Without this, a hostile client push could ship an overrunning struct that
+/// fires `german_string_tail`'s debug_assert (a debug-build DoS) and persists
+/// corrupt structs — the per-row relocation used to canonicalize these to the
+/// empty string. Null cells are zeroed (length 0 → short) and skip themselves.
+fn validate_string_heap_extents(mb: &MemBatch<'_>, schema: &SchemaDescriptor) -> Result<(), &'static str> {
+    if !schema.has_german_string() {
+        return Ok(());
+    }
+    for (pi, _ci, col) in schema.payload_columns() {
+        if !gnitz_wire::is_german_string(col.type_code) {
+            continue;
+        }
+        for row in 0..mb.count {
+            let cell = mb.get_col_ptr(row, pi, 16);
+            let len = u32::from_le_bytes(cell[0..4].try_into().unwrap()) as usize;
+            if len > crate::schema::SHORT_STRING_THRESHOLD {
+                let off = u64::from_le_bytes(cell[8..16].try_into().unwrap()) as usize;
+                if off.saturating_add(len) > mb.blob.len() {
+                    return Err("data WAL long string overruns blob heap");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Decode a WAL data block into a `MemBatch<'a>` that borrows the buffer
@@ -193,8 +261,11 @@ fn decode_mem_batch_inner<'a>(
     schema: &SchemaDescriptor,
     verify_checksum: bool,
 ) -> Result<(MemBatch<'a>, usize), &'static str> {
-    let npc = schema.num_payload_cols();
-    let expected_regions = 3 + npc + 1; // pk, weight, null_bmp, payload…, blob
+    // The writer↔reader region contract: `strides` is each fixed region's
+    // per-row width, `nr` the trailing blob region's index — the same
+    // derivation the shard writer and `MappedShard::open` share.
+    let (strides, nr) = strides_from_schema(schema);
+    let nr = nr as usize;
 
     let mut wal_offsets = [0u64; MAX_WIRE_REGIONS];
     let mut sizes = [0u32; MAX_WIRE_REGIONS];
@@ -202,12 +273,11 @@ fn decode_mem_batch_inner<'a>(
     let header = wal::validate_and_parse(data, &mut wal_offsets, &mut sizes, verify_checksum)
         .map_err(|_| "data WAL block invalid")?;
 
-    if header.num_regions as usize != expected_regions {
+    if header.num_regions as usize != nr + 1 {
         return Err("data WAL block region count mismatch");
     }
 
     let n = header.entry_count as usize;
-    let pk_stride_val = pk_stride(schema);
 
     let mut offsets = [0usize; MAX_BATCH_REGIONS];
 
@@ -215,28 +285,19 @@ fn decode_mem_batch_inner<'a>(
     // every producer writes exact sizes, and stride-deriving consumers divide
     // size by count, so an inexact size is a corrupt or mis-schema'd block. `validate_and_parse` already bounded
     // `off + sz` to the block, so an exact-size region is also fully in-bounds.
-    let validate = |r: usize, row_stride: usize| -> Result<usize, &'static str> {
+    for (r, offset) in offsets.iter_mut().enumerate().take(nr) {
         if n == 0 {
-            return Ok(0);
+            continue; // offsets stay 0; regions are empty
         }
-        if sizes[r] as usize != n * row_stride {
+        if sizes[r] as usize != n * strides[r] as usize {
             return Err("data WAL region size mismatch");
         }
-        Ok(wal_offsets[r] as usize)
-    };
-
-    offsets[REG_PK] = validate(REG_PK, pk_stride_val as usize)?;
-    offsets[REG_WEIGHT] = validate(REG_WEIGHT, 8)?;
-    offsets[REG_NULL_BMP] = validate(REG_NULL_BMP, 8)?;
-
-    for (pi, _ci, col) in schema.payload_columns() {
-        let stride = col.size() as usize;
-        offsets[REG_PAYLOAD_START + pi] = validate(REG_PAYLOAD_START + pi, stride)?;
+        *offset = wal_offsets[r] as usize;
     }
 
     // The blob extent is bounded by `validate_and_parse` like every region;
     // a zero-size heap is an empty slice.
-    let blob_r = REG_PAYLOAD_START + npc;
+    let blob_r = nr;
     let blob = {
         let off = wal_offsets[blob_r] as usize;
         let sz = sizes[blob_r] as usize;
@@ -251,7 +312,7 @@ fn decode_mem_batch_inner<'a>(
         MemBatch {
             data,
             offsets,
-            pk_stride: pk_stride_val,
+            pk_stride: strides[REG_PK],
             blob,
             count: n,
         },
@@ -261,6 +322,7 @@ fn decode_mem_batch_inner<'a>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::batch::{REG_PAYLOAD_START, REG_WEIGHT};
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 
@@ -278,7 +340,7 @@ mod tests {
         b.extend_col(0, &7i64.to_le_bytes());
         b.count += 1;
 
-        let sz = b.wire_byte_size(1);
+        let sz = b.wire_byte_size();
         let mut buf = vec![0u8; sz];
         b.encode_to_wire(1, &mut buf, 0, false);
         // Corrupt the REG_PK (region 0) size directory entry: claim 24 bytes.
@@ -298,7 +360,7 @@ mod tests {
         b.extend_col(0, &7i64.to_le_bytes());
         b.count += 1;
 
-        let sz = b.wire_byte_size(1);
+        let sz = b.wire_byte_size();
         let mut buf = vec![0u8; sz];
         b.encode_to_wire(1, &mut buf, 0, false);
         // Corrupt the REG_WEIGHT (region 1) size: claim 4 bytes instead of 8.
@@ -318,7 +380,7 @@ mod tests {
         b.extend_col(0, &7i64.to_le_bytes());
         b.count += 1;
 
-        let sz = b.wire_byte_size(1);
+        let sz = b.wire_byte_size();
         let mut buf = vec![0u8; sz];
         b.encode_to_wire(1, &mut buf, 0, false);
         // Corrupt the REG_PK (region 0) OFFSET directory entry: point it past the
@@ -343,7 +405,7 @@ mod tests {
         b.extend_col(0, &7i64.to_le_bytes());
         b.count += 1;
 
-        let sz = b.wire_byte_size(1);
+        let sz = b.wire_byte_size();
         let mut buf = vec![0u8; sz];
         b.encode_to_wire(1, &mut buf, 0, false);
         // Fixed regions stay schema-valid; corrupt only the variable-length BLOB
@@ -371,7 +433,7 @@ mod tests {
         b.count += 1;
         // A non-empty heap on a wire-safe encode must fail loudly, not vanish.
         b.blob.push(0xAB);
-        let mut out = vec![0u8; b.wire_byte_size(1) + 16];
+        let mut out = vec![0u8; b.wire_byte_size() + 16];
         b.encode_range_to_wire(0, 1, 1, &mut out, 0, false);
     }
 }

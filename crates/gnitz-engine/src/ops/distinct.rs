@@ -144,7 +144,7 @@ mod tests {
         let schema = make_schema_u64_i64();
 
         // Empty trace → all positive deltas emit +1
-        let empty = Rc::new(Batch::empty(1, 16));
+        let empty = Rc::new(Batch::empty_with_schema(&schema));
         let mut ch = ReadCursor::from_owned(std::slice::from_ref(&empty), schema);
 
         // Delta: pk=1 w=+3, pk=2 w=+1
@@ -508,7 +508,7 @@ mod tests {
         use std::rc::Rc;
 
         let schema = make_schema_u64_i64();
-        let empty = Rc::new(Batch::empty(1, 16));
+        let empty = Rc::new(Batch::empty_with_schema(&schema));
         let mut ch = ReadCursor::from_owned(&[empty], schema);
 
         let delta = make_batch(&schema, &[(1, 1, 10)]);
@@ -532,7 +532,7 @@ mod tests {
         // Trace empty; delta has three wide-PK rows with distinct PKs.
         // All three must emit +1.
         let schema = wide_pk_3xu64_schema();
-        let empty = Rc::new(Batch::empty(1, schema.pk_stride()));
+        let empty = Rc::new(Batch::empty_with_schema(&schema));
         let mut ch = ReadCursor::from_owned(&[empty], schema);
 
         let delta = make_wide_batch(&schema, &[(1, 0, 0, 1, 10), (2, 0, 0, 1, 20), (3, 0, 0, 1, 30)]);

@@ -462,10 +462,3 @@ impl super::super::columnar::ColumnarSource for MappedShard {
         self.blob_slice()
     }
 }
-
-impl super::super::merge::MergeSource for MappedShard {
-    #[inline]
-    fn row_count(&self) -> usize {
-        self.count
-    }
-}

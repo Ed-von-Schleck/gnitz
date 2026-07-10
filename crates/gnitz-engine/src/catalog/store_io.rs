@@ -4,6 +4,7 @@
 //! delegate to `DagEngine`.
 
 use super::*;
+use crate::schema::project_schema;
 
 impl CatalogEngine {
     /// Ingest a user-table batch and return the effective delta (after unique_pk

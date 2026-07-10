@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::columnar::ColumnarSource;
 use super::merge::{self, MemBatch};
 use crate::foundation::codec::{align8, read_i64_le, read_u64_le};
-use crate::schema::{self, type_code, BlobCache, SchemaColumn, SchemaDescriptor};
+use crate::schema::{BlobCache, SchemaDescriptor};
 
 static BLOB_ID_CTR: AtomicU64 = AtomicU64::new(1);
 #[inline(always)]
@@ -38,9 +38,10 @@ pub(crate) const MAX_WIRE_REGIONS: usize = MAX_BATCH_REGIONS + 1; // = 69
 
 // ── Region indices into `offsets` / `strides` ───────────────────────────────
 //
-// Three fixed regions (PK is 16 bytes/row; weight and null_bmp are 8 bytes/row);
-// payload columns start at index 3 and continue for `num_payload_cols()` slots.
-// Use these constants instead of bare numeric literals.
+// Three fixed regions (PK is `pk_stride` bytes/row; weight and null_bmp are
+// 8 bytes/row); payload columns start at index 3 and continue for
+// `num_payload_cols()` slots. Use these constants instead of bare numeric
+// literals.
 pub(in crate::storage) const REG_PK: usize = 0;
 pub(in crate::storage) const REG_WEIGHT: usize = 1;
 pub(in crate::storage) const REG_NULL_BMP: usize = 2;
@@ -50,28 +51,74 @@ const FIXED_REGION_STRIDE: u8 = 8;
 pub(in crate::storage) const FIXED_REGION_BYTES: usize = FIXED_REGION_STRIDE as usize;
 
 /// How `append_mem_batch_range` writes the weight column (region[1]).
-pub(crate) enum WeightFill {
+enum WeightFill {
     /// Copy per-row weights verbatim from `src`.
     Copy,
     /// Write `-src` weight per row.
     Negate,
 }
 
-/// Allocate a zeroed buffer and request hugepage backing for large allocations.
+/// How [`acquire_arena`] initializes the returned buffer.
+pub(in crate::storage) enum Fill {
+    /// Every byte zeroed (`len == size`). Load-bearing for callers that leave
+    /// cells unwritten (scalar-func EMIT_NULL, null-extend) and read zeros back.
+    Zeroed,
+    /// `len == size`, contents uninitialized — the caller writes every live
+    /// byte before any read (accessors are `count`-bounded).
+    Uninit,
+    /// `len == 0`, `capacity >= size` — for growable arenas filled by append
+    /// (blob heaps).
+    Reserve,
+}
+
+/// The one arena-provisioning path for batch data/blob buffers.
 ///
-/// For sizes >= HUGEPAGE_THRESHOLD, calls `calloc` (via `vec!`) which for large
-/// allocations uses an internal `mmap`, returning demand-zero pages not yet faulted
-/// in. The subsequent `madvise(MADV_HUGEPAGE)` causes the kernel to allocate 2MB
-/// zero pages on first access instead of 4KB pages.
+/// Sizes `>= HUGEPAGE_THRESHOLD` bypass the pool entirely: a fresh allocation
+/// (for `Zeroed`, `vec![0u8; n]` = calloc, whose large-allocation `mmap` returns
+/// demand-zero pages not yet faulted in) plus `madvise(MADV_HUGEPAGE)` so the
+/// kernel backs first-touch with 2MB pages instead of 4KB ones. A pooled buffer
+/// would instead be memset'd and carry no hugepage advice.
 ///
-/// For sizes < HUGEPAGE_THRESHOLD, behaves identically to `vec![0u8; size]`.
-#[inline]
-fn alloc_large_zeroed(size: usize) -> Vec<u8> {
-    let v = vec![0u8; size];
-    if size >= HUGEPAGE_THRESHOLD {
-        crate::foundation::posix_io::madvise_hugepage(v.as_ptr() as *mut u8, size);
+/// Below the threshold the pool is tried first; an undersized pooled buffer is
+/// evicted rather than grown in place — `Vec::reserve` on a too-small buffer
+/// copies the old bytes forward before the tail is written, slower than a fresh
+/// allocation, and eviction converges the pool to larger sizes. Pooled buffers
+/// arrive with `len == 0` (`recycle_buf` clears), so `Zeroed`'s `resize(size, 0)`
+/// genuinely zeroes every byte.
+#[allow(clippy::uninit_vec)] // `Fill::Uninit` is the documented contract: callers write every live byte
+pub(in crate::storage) fn acquire_arena(size: usize, fill: Fill) -> Vec<u8> {
+    #[inline]
+    fn fresh(size: usize, fill: &Fill) -> Vec<u8> {
+        match fill {
+            Fill::Zeroed => vec![0u8; size],
+            Fill::Uninit => {
+                let mut v = Vec::with_capacity(size);
+                // SAFETY: u8 needs no init; callers write every `count`-bounded
+                // live byte before it is read (the `Uninit` contract above).
+                unsafe { v.set_len(size) };
+                v
+            }
+            Fill::Reserve => Vec::with_capacity(size),
+        }
     }
-    v
+
+    if size >= HUGEPAGE_THRESHOLD {
+        let mut v = fresh(size, &fill);
+        crate::foundation::posix_io::madvise_hugepage(v.as_mut_ptr(), v.capacity());
+        return v;
+    }
+    let mut buf = super::batch_pool::acquire_buf();
+    if buf.capacity() < size {
+        drop(buf); // evict the undersized buffer; pool converges to larger sizes
+        return fresh(size, &fill);
+    }
+    match fill {
+        Fill::Zeroed => buf.resize(size, 0),
+        // SAFETY: capacity checked above; see the `Uninit` contract.
+        Fill::Uninit => unsafe { buf.set_len(size) },
+        Fill::Reserve => {}
+    }
+    buf
 }
 
 /// Compute byte offsets for each region given strides and row capacity.
@@ -138,15 +185,10 @@ fn fill_payload_strides(schema: &SchemaDescriptor, strides: &mut [u8; MAX_BATCH_
     idx
 }
 
-/// Physical byte stride for the PK region: 8 for U64 PK, 16 for U128 PK.
-pub(super) fn pk_stride(schema: &SchemaDescriptor) -> u8 {
-    schema.pk_stride()
-}
-
 /// Build a strides array from a SchemaDescriptor.
 pub(in crate::storage) fn strides_from_schema(schema: &SchemaDescriptor) -> ([u8; MAX_BATCH_REGIONS], u8) {
     let mut strides = [0u8; MAX_BATCH_REGIONS];
-    strides[REG_PK] = pk_stride(schema);
+    strides[REG_PK] = schema.pk_stride();
     strides[REG_WEIGHT] = FIXED_REGION_STRIDE;
     strides[REG_NULL_BMP] = FIXED_REGION_STRIDE;
     let nr = fill_payload_strides(schema, &mut strides, REG_PAYLOAD_START);
@@ -167,7 +209,19 @@ pub(crate) fn carve_writer_slices<'a>(
     let (strides, nr) = strides_from_schema(schema);
     let nr = nr as usize;
     let (offsets, _total) = compute_offsets(&strides, nr, rows);
+    carve_at(data, &strides, nr, &offsets, rows)
+}
 
+/// The layout-taking core of [`carve_writer_slices`], for callers that already
+/// computed `(strides, nr, offsets)` for the same arena (`write_to_batch`).
+#[allow(clippy::type_complexity)]
+fn carve_at<'a>(
+    data: &'a mut [u8],
+    strides: &[u8; MAX_BATCH_REGIONS],
+    nr: usize,
+    offsets: &[usize; MAX_BATCH_REGIONS],
+    rows: usize,
+) -> (&'a mut [u8], &'a mut [u8], &'a mut [u8], Vec<&'a mut [u8]>) {
     // Walk regions in order, splitting off [alignment pad | region] for each.
     // `base` tracks the absolute offset of `rest[0]` within `data`, so
     // `offsets[r] - base` is the padding to discard before region `r`.
@@ -190,6 +244,37 @@ pub(crate) fn carve_writer_slices<'a>(
     let null_bmp = it.next().expect("REG_NULL_BMP");
     let col_slices: Vec<&mut [u8]> = it.collect();
     (pk, weight, null_bmp, col_slices)
+}
+
+/// Copy `count` rows of every region from `src` (regions at `src_offsets`)
+/// into `dst` (regions at `dst_offsets`), one bulk copy per region. Shared by
+/// the `reserve_rows` out-of-place grow and `clone_batch`.
+///
+/// # Safety
+/// `src` and `dst` are distinct allocations; for every region `i < nr`, both
+/// `src_offsets[i] + count * strides[i]` and `dst_offsets[i] + count *
+/// strides[i]` are in bounds (both sides sized by `compute_offsets` for at
+/// least `count` rows).
+unsafe fn copy_regions(
+    src: &[u8],
+    src_offsets: &[usize; MAX_BATCH_REGIONS],
+    dst: &mut [u8],
+    dst_offsets: &[usize; MAX_BATCH_REGIONS],
+    strides: &[u8; MAX_BATCH_REGIONS],
+    nr: usize,
+    count: usize,
+) {
+    for i in 0..nr {
+        let len = count * strides[i] as usize;
+        if len == 0 {
+            continue;
+        }
+        std::ptr::copy_nonoverlapping(
+            src.as_ptr().add(src_offsets[i]),
+            dst.as_mut_ptr().add(dst_offsets[i]),
+            len,
+        );
+    }
 }
 
 /// Cached row-layout guarantee. Ordered ladder `Raw < Sorted < Consolidated`,
@@ -228,7 +313,10 @@ pub struct Batch {
     // exceed 4 GB (see `compute_offsets`). In-memory only — never serialized.
     offsets: [usize; MAX_BATCH_REGIONS],
     strides: [u8; MAX_BATCH_REGIONS],
-    num_regions: u8,
+    /// Fixed-region count (pk, weight, null_bmp, payload…) — also the blob
+    /// region's index in the wire/shard layout. Storage-visible so the serde
+    /// side never re-derives it from the payload column count.
+    pub(in crate::storage) num_regions: u8,
     capacity: u32,
     pub count: usize,
     /// Cached row-layout claim (private; mutated only through the layout API).
@@ -246,58 +334,54 @@ pub struct Batch {
 impl Batch {
     // ── Constructors ────────────────────────────────────────────────────
 
-    /// Create an empty, zero-allocation placeholder batch with only the three
-    /// fixed regions (pk/weight/null_bmp) described.  Payload strides
-    /// remain zero, so the batch is NOT safe to populate via `extend_*` or
-    /// `append_batch` — use `empty_with_schema` or `with_schema` for that.
-    ///
-    /// Intended for zero-row return values and swap-placeholder slots.
-    pub fn empty(num_payload_cols: usize, pk_stride: u8) -> Self {
-        // Zero stride is accepted: `SchemaDescriptor::default()` has no PK
-        // columns and is a legitimate placeholder caller.
-        debug_assert!(
-            pk_stride as usize <= schema::MAX_PK_BYTES,
-            "pk_stride out of range: {pk_stride}",
-        );
-        let nr = REG_PAYLOAD_START + num_payload_cols;
-        let mut strides = [0u8; MAX_BATCH_REGIONS];
-        strides[REG_PK] = pk_stride;
-        strides[REG_WEIGHT] = FIXED_REGION_STRIDE;
-        strides[REG_NULL_BMP] = FIXED_REGION_STRIDE;
+    /// The one zero-allocation empty constructor: shape (strides / region
+    /// count / schema) supplied by the caller, everything else empty.
+    fn empty_from(strides: [u8; MAX_BATCH_REGIONS], num_regions: u8, schema: Option<SchemaDescriptor>) -> Self {
         Batch {
             data: Vec::new(),
             blob: Vec::new(),
             offsets: [0usize; MAX_BATCH_REGIONS],
             strides,
-            num_regions: nr as u8,
+            num_regions,
             capacity: 0,
             count: 0,
             layout: Layout::Raw,
-            schema: None,
+            schema,
             blob_id: next_blob_id(),
         }
     }
 
     /// Zero-allocation empty batch with strides pre-filled from `schema`.
     ///
-    /// Use this — not `empty(npc)` — when the caller intends to populate the
-    /// batch via `extend_*`, `append_batch`, or similar.  Strides and
-    /// `schema` are set up front so no one-shot realloc fires on the first
-    /// column write.
+    /// Use this when the caller intends to populate the batch via `extend_*`,
+    /// `append_batch`, or similar.  Strides and `schema` are set up front so
+    /// no one-shot realloc fires on the first column write.
     pub fn empty_with_schema(schema: &SchemaDescriptor) -> Self {
         let (strides, nr) = strides_from_schema(schema);
-        Batch {
-            data: Vec::new(),
-            blob: Vec::new(),
-            offsets: [0usize; MAX_BATCH_REGIONS],
-            strides,
-            num_regions: nr,
-            capacity: 0,
-            count: 0,
-            layout: Layout::Raw,
-            schema: Some(*schema),
-            blob_id: next_blob_id(),
-        }
+        Self::empty_from(strides, nr, Some(*schema))
+    }
+
+    /// Zero-allocation empty batch with this batch's exact shape (strides,
+    /// region count, schema) — honest for schema-less join-shaped batches too.
+    /// The empty return / swap-placeholder constructor.
+    pub fn empty_like(&self) -> Self {
+        Self::empty_from(self.strides, self.num_regions, self.schema)
+    }
+
+    /// Move this batch out, leaving an `empty_like` placeholder behind — the
+    /// VM register-swap idiom, with the slot's shape kept truthful.
+    pub fn take(&mut self) -> Self {
+        let empty = self.empty_like();
+        std::mem::replace(self, empty)
+    }
+
+    /// Zero-shape placeholder (no PK stride, no payload regions) for
+    /// pre-first-write register slots only — never populate or shape-read one.
+    pub fn placeholder() -> Self {
+        let mut strides = [0u8; MAX_BATCH_REGIONS];
+        strides[REG_WEIGHT] = FIXED_REGION_STRIDE;
+        strides[REG_NULL_BMP] = FIXED_REGION_STRIDE;
+        Self::empty_from(strides, REG_PAYLOAD_START as u8, None)
     }
 
     /// Zero-allocation empty batch whose payload columns are `left_schema`'s
@@ -311,23 +395,12 @@ impl Batch {
     /// (PK, payload) order (the Δ⋈Δ cogroup join) certifies it explicitly.
     pub fn empty_joined(left_schema: &SchemaDescriptor, right_schema: &SchemaDescriptor) -> Self {
         let mut strides = [0u8; MAX_BATCH_REGIONS];
-        strides[REG_PK] = pk_stride(left_schema);
+        strides[REG_PK] = left_schema.pk_stride();
         strides[REG_WEIGHT] = FIXED_REGION_STRIDE;
         strides[REG_NULL_BMP] = FIXED_REGION_STRIDE;
         let mid = fill_payload_strides(left_schema, &mut strides, REG_PAYLOAD_START);
         let out_idx = fill_payload_strides(right_schema, &mut strides, mid);
-        Batch {
-            data: Vec::new(),
-            blob: Vec::new(),
-            offsets: [0usize; MAX_BATCH_REGIONS],
-            strides,
-            num_regions: out_idx as u8,
-            capacity: 0,
-            count: 0,
-            layout: Layout::Raw,
-            schema: None,
-            blob_id: next_blob_id(),
-        }
+        Self::empty_from(strides, out_idx as u8, None)
     }
 
     /// Create an empty batch with schema, pre-allocated for `initial_capacity` rows.
@@ -338,24 +411,8 @@ impl Batch {
 
         // Invariant: `data` is fully zero-filled on return.  Some callers
         // (null-extend, scalar-func EMIT_NULL) leave payload columns unwritten
-        // and depend on that.  Undersized pool buffers are recycled rather
-        // than grown in place: Vec::reserve on a too-small buffer copies the
-        // old contents forward before zeroing, which is slower than a fresh
-        // zeroed allocation.
-        let data = if total_size >= HUGEPAGE_THRESHOLD {
-            let mut v = vec![0u8; total_size];
-            crate::foundation::posix_io::madvise_hugepage(v.as_mut_ptr(), total_size);
-            v
-        } else {
-            let mut buf = super::batch_pool::acquire_buf();
-            if buf.capacity() >= total_size {
-                buf.resize(total_size, 0);
-                buf
-            } else {
-                drop(buf); // evict the undersized buffer; pool converges to larger sizes
-                vec![0u8; total_size]
-            }
-        };
+        // and depend on that.
+        let data = acquire_arena(total_size, Fill::Zeroed);
 
         Batch {
             data,
@@ -565,7 +622,6 @@ impl Batch {
     }
 
     /// Ensure the data buffer has room for at least `n` more rows beyond `count`.
-    #[allow(clippy::uninit_vec, clippy::needless_range_loop)]
     pub(crate) fn reserve_rows(&mut self, n: usize) {
         if self.count + n <= self.capacity as usize {
             return;
@@ -579,47 +635,20 @@ impl Batch {
             // realloc, which copies ALL old bytes to a new allocation (copy #1),
             // then copy_within would shift regions to new offsets (copy #2).
             // Bypass that by scatter-copying directly into a fresh buffer.
-            let mut new_data = if new_total >= HUGEPAGE_THRESHOLD {
-                // Zeroing is not needed: the scatter-copy loop below fills
-                // every live byte, and all accessors are bounded by `count`.
-                // We still want THP backing for large buffers.
-                let mut v = Vec::with_capacity(new_total);
-                unsafe {
-                    v.set_len(new_total);
-                }
-                crate::foundation::posix_io::madvise_hugepage(v.as_ptr() as *mut u8, new_total);
-                v
-            } else {
-                let mut buf = super::batch_pool::acquire_buf();
-                if buf.capacity() >= new_total {
-                    unsafe {
-                        buf.set_len(new_total);
-                    }
-                    buf
-                } else {
-                    drop(buf); // evict the undersized buffer; pool converges to larger sizes
-                    let mut v = Vec::with_capacity(new_total);
-                    unsafe {
-                        v.set_len(new_total);
-                    }
-                    v
-                }
-            };
-
-            for i in 0..nr {
-                let len = self.count * self.strides[i] as usize;
-                if len == 0 {
-                    continue;
-                }
-                let old_off = self.offsets[i];
-                let new_off = new_offsets[i];
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        self.data.as_ptr().add(old_off),
-                        new_data.as_mut_ptr().add(new_off),
-                        len,
-                    );
-                }
+            // Zeroing is not needed (`Uninit`): `copy_regions` fills every live
+            // byte, and all accessors are bounded by `count`.
+            let mut new_data = acquire_arena(new_total, Fill::Uninit);
+            // SAFETY: distinct allocations; both sides sized per compute_offsets.
+            unsafe {
+                copy_regions(
+                    &self.data,
+                    &self.offsets,
+                    &mut new_data,
+                    &new_offsets,
+                    &self.strides,
+                    nr,
+                    self.count,
+                );
             }
 
             let old_data = std::mem::replace(&mut self.data, new_data);
@@ -680,16 +709,6 @@ impl Batch {
         self.extend_region(REG_PAYLOAD_START + pi, d);
     }
 
-    /// Append a 128-bit primary key at the current row position.
-    ///
-    /// Narrow strides (1/2/4) write the low `stride` bytes of the `pk`
-    /// argument verbatim. The contract is that the *caller* placed the
-    /// on-disk LE bytes in the low `stride` bytes — `extract_pk_value`,
-    /// `try_col_eq_literal`, and `try_extract_pk_in` all follow this rule
-    /// (signed integers via `(v as iN as uN) as u128`, narrow unsigned via
-    /// zero-extension). The high
-    /// `16 - stride` bytes are dropped on truncation, which is correct
-    /// under that contract for every PK type GnitzDB allows.
     /// Append a narrow PK from a `u128`, writing **right-aligned big-endian**
     /// bytes (the low `stride` bytes of `pk.to_be_bytes()`). For UNSIGNED PKs
     /// this is the correct OPK encoding (OPK == BE for unsigned), and
@@ -804,7 +823,7 @@ impl Batch {
     /// Preconditions:
     /// - `start <= end <= src.count`
     /// - `self` has the same schema (column count and strides) as `src`
-    pub(crate) fn append_mem_batch_range(&mut self, src: &MemBatch<'_>, start: usize, end: usize, fill: WeightFill) {
+    fn append_mem_batch_range(&mut self, src: &MemBatch<'_>, start: usize, end: usize, fill: WeightFill) {
         assert!(start <= end, "append_mem_batch_range: start ({start}) > end ({end})");
         assert!(
             end <= src.count,
@@ -988,7 +1007,8 @@ impl Batch {
     /// order every merge/consolidation path sorts by (§4). Shared by both verifiers.
     #[cfg(debug_assertions)]
     fn adjacent_pair_ord(&self, schema: &SchemaDescriptor, i: usize) -> std::cmp::Ordering {
-        use super::columnar::{compare_pk_bytes, compare_rows};
+        use super::columnar::compare_rows;
+        use crate::schema::key::compare_pk_bytes;
         compare_pk_bytes(self.get_pk_bytes(i), self.get_pk_bytes(i + 1))
             .then_with(|| compare_rows(schema, self, i, self, i + 1))
     }
@@ -1053,34 +1073,24 @@ impl Batch {
 
     /// Clone all buffers into a new independent Batch.
     /// 2 allocations (data + blob) instead of N+7.
-    #[allow(clippy::uninit_vec, clippy::needless_range_loop)]
     pub fn clone_batch(&self) -> Self {
         // Only clone the actually-used portion of data (count-based, not capacity-based).
         let nr = self.num_regions as usize;
         let (packed_offsets, packed_size) = compute_offsets(&self.strides, nr, self.count);
-        let mut new_data = super::batch_pool::acquire_buf();
-        new_data.clear();
-        new_data.reserve(packed_size);
-        // SAFETY: copy_nonoverlapping fills all `packed_size` bytes below;
-        // src and dst are non-overlapping (different allocations).
+        let mut new_data = acquire_arena(packed_size, Fill::Uninit);
+        // SAFETY: distinct allocations; `new_data` sized per compute_offsets.
         unsafe {
-            new_data.set_len(packed_size);
-            for i in 0..nr {
-                let stride = self.strides[i] as usize;
-                let len = self.count * stride;
-                let src_off = self.offsets[i];
-                let dst_off = packed_offsets[i];
-                if len > 0 {
-                    std::ptr::copy_nonoverlapping(
-                        self.data.as_ptr().add(src_off),
-                        new_data.as_mut_ptr().add(dst_off),
-                        len,
-                    );
-                }
-            }
+            copy_regions(
+                &self.data,
+                &self.offsets,
+                &mut new_data,
+                &packed_offsets,
+                &self.strides,
+                nr,
+                self.count,
+            );
         }
-        let mut new_blob = super::batch_pool::acquire_buf();
-        new_blob.clear();
+        let mut new_blob = acquire_arena(self.blob.len(), Fill::Reserve);
         new_blob.extend_from_slice(&self.blob);
         Batch {
             data: new_data,
@@ -1123,6 +1133,13 @@ impl Batch {
         super::columnar::gallop_opk(self.count, key, hint, self.pk_stride() as usize, |i| {
             self.get_pk_bytes(i)
         })
+    }
+
+    /// Append all of `src`, relocating German-string blob data into `self`'s
+    /// heap. The full-range decode/accumulate entry point (W2M ingest, the
+    /// master's index-scan merge).
+    pub fn append_mem_batch(&mut self, src: &MemBatch<'_>) {
+        self.append_mem_batch_range(src, 0, src.count, WeightFill::Copy);
     }
 
     /// Bulk-copy rows [start, end) from another Batch (same schema).
@@ -1339,9 +1356,9 @@ impl Batch {
         self.num_regions as usize + 1
     }
 
-    /// Get region pointer by index.
+    /// Get region pointer by index. `num_regions` is the blob region's index.
     pub fn region_ptr(&self, idx: usize) -> *const u8 {
-        let blob_idx = REG_PAYLOAD_START + self.num_payload_cols();
+        let blob_idx = self.num_regions as usize;
         if idx < blob_idx {
             self.data[self.offsets[idx]..].as_ptr()
         } else if idx == blob_idx {
@@ -1356,8 +1373,7 @@ impl Batch {
 
     /// Get region size by index.
     pub fn region_size(&self, idx: usize) -> usize {
-        let blob_idx = REG_PAYLOAD_START + self.num_payload_cols();
-        if idx < blob_idx {
+        if idx < self.num_regions as usize {
             self.count * self.strides[idx] as usize
         } else {
             self.blob.len()
@@ -1372,9 +1388,9 @@ impl Batch {
     }
 
     pub fn regions(&self) -> Vec<(*const u8, usize)> {
-        let npc = self.num_payload_cols();
-        let mut r = Vec::with_capacity(REG_PAYLOAD_START + npc + 1);
-        for i in 0..REG_PAYLOAD_START + npc {
+        let nr = self.num_regions as usize;
+        let mut r = Vec::with_capacity(nr + 1);
+        for i in 0..nr {
             let off = self.offsets[i];
             let len = self.count * self.strides[i] as usize;
             r.push((self.data[off..].as_ptr(), len));
@@ -1580,37 +1596,17 @@ pub fn write_to_batch(
     let nr = nr as usize;
 
     // Arena layout: [pk | weight | null | col_0 | ... | col_{N-1}]
-    // Sized for max_rows; blob is separate.
+    // Sized for max_rows; blob is separate. The zero-fill is load-bearing for
+    // writers that leave cells unwritten (see `with_schema`).
     let (offsets, arena_size) = compute_offsets(&strides, nr, max_rows);
-
-    // Match `with_schema`: a too-small pooled buffer is evicted rather than
-    // grown in place — `Vec::reserve` would copy old bytes forward before the
-    // tail is zeroed, slower than a fresh zeroed allocation.
-    let mut data = {
-        let mut buf = super::batch_pool::acquire_buf();
-        if buf.capacity() >= arena_size {
-            buf.resize(arena_size, 0);
-            buf
-        } else {
-            drop(buf); // evict the undersized buffer; pool converges to larger sizes
-            alloc_large_zeroed(arena_size)
-        }
-    };
+    let mut data = acquire_arena(arena_size, Fill::Zeroed);
     // DirectWriter grows blob length via `extend_from_slice`; reserve capacity
     // up front but do not zero-fill.
-    let mut blob = {
-        let mut buf = super::batch_pool::acquire_buf();
-        buf.clear();
-        buf.reserve(max_blob);
-        if max_blob >= HUGEPAGE_THRESHOLD {
-            crate::foundation::posix_io::madvise_hugepage(buf.as_mut_ptr(), buf.capacity());
-        }
-        buf
-    };
+    let mut blob = acquire_arena(max_blob, Fill::Reserve);
 
     let actual_rows;
     {
-        let (pk, weight, null_bmp, col_slices) = carve_writer_slices(&mut data, schema, max_rows);
+        let (pk, weight, null_bmp, col_slices) = carve_at(&mut data, &strides, nr, &offsets, max_rows);
         let mut writer = merge::DirectWriter::new(pk, weight, null_bmp, col_slices, &mut blob, *schema, max_rows);
         write_fn(&mut writer);
         actual_rows = writer.row_count();
@@ -1727,7 +1723,7 @@ impl BatchBuilder {
         self.batch.count += 1;
     }
 
-    /// Convenience: begin + put columns + end for a simple row.
+    /// Consume the builder, returning the built batch.
     pub(crate) fn finish(self) -> Batch {
         self.batch
     }
@@ -1744,101 +1740,6 @@ impl BatchBuilder {
     fn physical_col_idx(&self) -> usize {
         self.schema().payload_col_idx(self.curr_col)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Schema-shaping free functions
-//
-// Built purely from a `SchemaDescriptor` (no catalog state). Re-exported from
-// `catalog` so its callers compile unchanged; the runtime gather/preflight
-// paths also build the same descriptors.
-// ---------------------------------------------------------------------------
-
-/// Build a compound-PK index schema for a secondary index on `source_cols`
-/// of `source`, validating the column list along the way.
-///
-/// Layout: `(promoted_c0, promoted_c1, …, src_pk_0, src_pk_1, …)` — every
-/// indexed column promoted independently and packed in declared order, then the
-/// source PK columns, all in the PK with zero payload columns. The leading
-/// indexed-key region is `Σ promoted widths`; `seek_by_index` prefix-scans it
-/// (full or leading-prefix), then reads the source PK bytes directly out of the
-/// index PK suffix. The 1-element list is the single-column index.
-///
-/// Bounds-checks every column, promotes it (rejecting STRING/BLOB/float), and
-/// validates the index-schema PK limits — all **before** calling
-/// `SchemaDescriptor::new`: that constructor is a `const fn` whose `assert!`s
-/// fire in release and abort the master. An over-limit schema is reachable only
-/// for a *composite* index (a single-column index — including every FK
-/// auto-index — always fits, since `PK_LIST_MAX_COLS < MAX_PK_COLUMNS` reserves
-/// the prefix slot), via a raw `gnitz-core` client or a crafted/over-range
-/// persisted row replayed at boot, neither of which goes through the SQL
-/// planner's pre-check. Validating here converts the abort into a clean ingest
-/// `Err` for every path (defence in depth at the catalog trust boundary).
-pub(crate) fn make_index_schema(source_cols: &[u32], source: &SchemaDescriptor) -> Result<SchemaDescriptor, String> {
-    let mut col_types: Vec<u8> = Vec::with_capacity(source_cols.len());
-    for &c in source_cols {
-        if c as usize >= source.num_columns() {
-            return Err(format!(
-                "Index: column index {} out of bounds (columns={})",
-                c,
-                source.num_columns()
-            ));
-        }
-        col_types.push(source.columns[c as usize].type_code);
-    }
-    let src_pk = source.pk_indices();
-    // Shared with the SQL planner's CREATE INDEX pre-check, so the promotion
-    // rule and the arity/stride limits can never disagree across the layers.
-    let promoted = gnitz_wire::index_key_types(&col_types, src_pk.len(), source.pk_stride() as usize)?;
-    let n = promoted.len();
-    let arity = n + src_pk.len();
-    let mut cols: Vec<SchemaColumn> = Vec::with_capacity(arity);
-    let mut pk_indices: Vec<u32> = Vec::with_capacity(arity);
-    for (i, &t) in promoted.iter().enumerate() {
-        cols.push(SchemaColumn::new(t, 0));
-        pk_indices.push(i as u32);
-    }
-    for (j, &ci) in src_pk.iter().enumerate() {
-        cols.push(SchemaColumn::new(source.columns[ci as usize].type_code, 0));
-        pk_indices.push((n + j) as u32);
-    }
-    Ok(SchemaDescriptor::new(&cols, &pk_indices))
-}
-
-/// Wire schema for the GET_INDICES descriptor list: `(packed_cols PK, is_unique)`.
-/// The PK carries `pack_pk_cols(&col_indices)` — unique per circuit (circuits
-/// dedup by column list), so a valid PK. The server ships this block on the data
-/// path; the client decodes against the wire schema and reads columns by position.
-pub(crate) fn index_meta_schema_desc() -> SchemaDescriptor {
-    let u64c = SchemaColumn::new(type_code::U64, 0);
-    SchemaDescriptor::new(&[u64c, u64c], &[0]) // [packed_cols (PK), is_unique]
-}
-pub(crate) const INDEX_META_COL_NAMES: [&[u8]; 2] = [b"cols", b"is_unique"];
-
-/// Build the schema for a `gather_family` result: the PK columns of `schema`
-/// (in pk-list order, so the packed PK round-trips identically) followed by
-/// the projected columns in `project` order as payload. `project` must list
-/// only non-PK columns (PK members are resolved from the packed PK without a
-/// gather); a projected PK column would be emitted twice.
-///
-/// `pub(crate)`: the master's gather drain builds the same descriptor as the
-/// expected reply schema, so a projected reply with the wrong shape errors
-/// instead of mis-decoding.
-pub(crate) fn project_schema(schema: &SchemaDescriptor, project: &[u8]) -> SchemaDescriptor {
-    let mut cols: Vec<SchemaColumn> = Vec::with_capacity(schema.pk_indices().len() + project.len());
-    let mut pk_idx: Vec<u32> = Vec::with_capacity(schema.pk_indices().len());
-    for (_, _, col) in schema.pk_columns() {
-        pk_idx.push(cols.len() as u32);
-        cols.push(*col);
-    }
-    for &p in project {
-        debug_assert!(
-            !schema.is_pk_col(p as usize),
-            "project_schema: projected column {p} is a PK column"
-        );
-        cols.push(schema.columns[p as usize]);
-    }
-    SchemaDescriptor::new(&cols, &pk_idx)
 }
 
 #[cfg(test)]
@@ -1914,7 +1815,7 @@ mod tests {
     #[test]
     fn extend_pk_narrow_strides_round_trip() {
         // For each narrow stride, extend_pk writes the low `stride` bytes of
-        // the u128 argument verbatim; get_pk reads them back via widen_pk_le.
+        // the u128 argument verbatim; get_pk reads them back via widen_pk_be.
         // The (type, value, expected u128) triples mirror what
         // extract_pk_value writes for the corresponding PK type.
         let cases: &[(u8, u128)] = &[
@@ -2252,18 +2153,6 @@ mod tests {
     }
 
     #[test]
-    fn batch_empty_accepts_wide_strides() {
-        // Pin the loosened assertion: zero stride (the
-        // SchemaDescriptor::default() case) and compound strides up to
-        // MAX_PK_BYTES must construct without panicking.
-        for stride in [0u8, 8, 16, 24, 32, 64, 80] {
-            let b = Batch::empty(2, stride);
-            assert_eq!(b.strides[REG_PK], stride, "stride {stride}");
-            assert_eq!(b.count, 0);
-        }
-    }
-
-    #[test]
     fn find_lower_bound_bytes_narrow_opk() {
         // Narrow single-PK: find_lower_bound_bytes is now a raw memcmp search
         // over OPK bytes. For an unsigned U64 PK the OPK is big-endian, so the
@@ -2326,7 +2215,7 @@ mod tests {
         for key in probes {
             // Expected: first row where compare_pk_bytes(row, key) is not Less.
             let expected = (0..b.count)
-                .find(|&i| super::super::columnar::compare_pk_bytes(b.get_pk_bytes(i), key) != std::cmp::Ordering::Less)
+                .find(|&i| crate::schema::key::compare_pk_bytes(b.get_pk_bytes(i), key) != std::cmp::Ordering::Less)
                 .unwrap_or(b.count);
             let got = b.find_lower_bound_bytes(key);
             assert_eq!(got, expected, "probe={key:?}");

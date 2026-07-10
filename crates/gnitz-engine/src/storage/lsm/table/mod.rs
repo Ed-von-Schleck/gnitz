@@ -16,10 +16,10 @@ use super::columnar;
 use super::error::StorageError;
 use super::manifest::PreparedManifest;
 use super::memtable::{self, MemTable};
-use super::merge::pack_pk_be;
 use super::read_cursor::{self, ReadCursor};
 use super::shard_index::ShardIndex;
 use super::shard_reader::MappedShard;
+use crate::schema::key::pack_pk_be;
 use crate::schema::SchemaDescriptor;
 
 /// Fold `in_memory_l0` once it exceeds this many runs. Each fold re-merges the
@@ -493,7 +493,7 @@ impl Table {
     /// Check if a PK exists with positive net weight.
     #[cfg(test)] // production existence checks go through has_pk_bytes
     pub fn has_pk(&mut self, key: u128) -> bool {
-        let (opk, n) = columnar::opk_key(&self.schema, &key.to_le_bytes());
+        let (opk, n) = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
         self.has_pk_bytes(&opk[..n])
     }
 
@@ -531,7 +531,7 @@ impl Table {
     fn for_each_shard_pk_match(&self, key: &[u8], mut f: impl FnMut(&Rc<MappedShard>, usize)) {
         self.shard_index.find_pk_bytes(key, &mut |shard_rc, start_idx| {
             let mut idx = start_idx;
-            while idx < shard_rc.count && columnar::pk_bytes_eq(shard_rc.get_pk_bytes(idx), key) {
+            while idx < shard_rc.count && crate::schema::key::pk_bytes_eq(shard_rc.get_pk_bytes(idx), key) {
                 f(&shard_rc, idx);
                 idx += 1;
             }
@@ -545,7 +545,7 @@ impl Table {
     /// point has no production caller and is retained only for unit tests.
     #[cfg(test)]
     pub(crate) fn retract_pk(&mut self, key: u128) -> (i64, Option<RowRef>) {
-        let (opk, n) = columnar::opk_key(&self.schema, &key.to_le_bytes());
+        let (opk, n) = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
         self.retract_pk_bytes(&opk[..n])
     }
 
@@ -1278,7 +1278,7 @@ mod tests {
         // positive one in OPK byte order. Plain big-endian (no flip) would place
         // 0xFF.. (negatives) after 0x00.. (positives) and fail this.
         assert_eq!(
-            columnar::compare_pk_bytes(&key(-1, 0, 0), &key(1, 0, 0)),
+            crate::schema::key::compare_pk_bytes(&key(-1, 0, 0), &key(1, 0, 0)),
             std::cmp::Ordering::Less,
             "OPK must order a negative signed PK column before a positive one",
         );

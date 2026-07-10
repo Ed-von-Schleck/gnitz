@@ -26,16 +26,14 @@ pub(crate) fn fingerprint(opk: &[u8]) -> u128 {
     }
 }
 
-/// Build an Xor8 filter from a slice of u128 PKs. Deduplicates before building.
-/// Returns None if the input is empty.
+/// Build an Xor8 filter from `hash_u128(fingerprint)` keys (the derivation the
+/// probe side [`may_contain`] applies). Returns None if the input is empty.
 ///
-/// Duplicate PKs are deduplicated before building — shard files may contain
-/// retraction rows where the same PK appears with different payloads/weights.
-pub(crate) fn build(pks: &[u128]) -> Option<Xor8> {
-    if pks.is_empty() {
-        return None;
-    }
-    let mut keys: Vec<u64> = pks.iter().map(|&k| xxh::hash_u128(k)).collect();
+/// The XOR filter's hypergraph peeling fails (hang/panic) on duplicate keys,
+/// so the keys are sorted and deduplicated first — this also collapses
+/// cross-fingerprint hash collisions the caller's adjacent-duplicate pre-shrink
+/// cannot see.
+pub(crate) fn build(mut keys: Vec<u64>) -> Option<Xor8> {
     keys.sort_unstable();
     keys.dedup();
     if keys.is_empty() {
@@ -104,10 +102,16 @@ pub(crate) fn serialized_size(filter: &Xor8) -> usize {
 mod tests {
     use super::*;
 
+    /// Test-side wrapper matching the production derivation: hash each u128
+    /// fingerprint and build from the hashed keys.
+    fn build_u128(pks: &[u128]) -> Option<Xor8> {
+        build(pks.iter().map(|&k| xxh::hash_u128(k)).collect())
+    }
+
     #[test]
     fn build_and_query_no_false_negatives() {
         let pks: Vec<u128> = (0u128..1000).collect();
-        let filter = build(&pks).unwrap();
+        let filter = build_u128(&pks).unwrap();
         for &pk in &pks {
             assert!(may_contain(&filter, pk), "false negative for key {pk}");
         }
@@ -116,7 +120,7 @@ mod tests {
     #[test]
     fn false_positive_rate() {
         let pks: Vec<u128> = (0u128..2000).collect();
-        let filter = build(&pks).unwrap();
+        let filter = build_u128(&pks).unwrap();
         let mut fp = 0u32;
         for i in 10_000u128..20_000 {
             if may_contain(&filter, i) {
@@ -129,20 +133,20 @@ mod tests {
 
     #[test]
     fn small_set() {
-        let filter = build(&[100u128, 200]).unwrap();
+        let filter = build_u128(&[100u128, 200]).unwrap();
         assert!(may_contain(&filter, 100));
         assert!(may_contain(&filter, 200));
     }
 
     #[test]
     fn empty_returns_none() {
-        assert!(build(&[]).is_none());
+        assert!(build_u128(&[]).is_none());
     }
 
     #[test]
     fn serialize_deserialize_roundtrip() {
         let pks: Vec<u128> = (0u128..500).collect();
-        let filter = build(&pks).unwrap();
+        let filter = build_u128(&pks).unwrap();
         let bytes = serialize(&filter);
         let restored = deserialize(&bytes).unwrap();
 
@@ -171,7 +175,7 @@ mod tests {
 
     #[test]
     fn serialized_size_matches() {
-        let filter = build(&[1u128, 2, 3]).unwrap();
+        let filter = build_u128(&[1u128, 2, 3]).unwrap();
         let bytes = serialize(&filter);
         assert_eq!(bytes.len(), serialized_size(&filter));
     }
@@ -206,7 +210,7 @@ mod tests {
     #[test]
     fn build_crossing_u64_boundary() {
         let pks: [u128; 5] = [0, 1, u64::MAX as u128, (u64::MAX as u128) + 1, u128::MAX];
-        let filter = build(&pks).unwrap();
+        let filter = build_u128(&pks).unwrap();
         for &pk in &pks {
             assert!(may_contain(&filter, pk), "false negative for pk {pk:#034x}");
         }

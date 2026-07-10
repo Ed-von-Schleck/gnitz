@@ -9,6 +9,7 @@
 use std::num::NonZeroU64;
 
 use super::*;
+use crate::schema::make_index_schema;
 
 /// The only handle the DDL/imperative layer has on catalog state: submit one
 /// system-family delta. It cannot name a `sys_*` table, so DDL code physically

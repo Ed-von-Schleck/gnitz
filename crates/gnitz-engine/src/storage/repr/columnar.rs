@@ -1,7 +1,4 @@
 //! Shared columnar data access trait and generic row comparison.
-//!
-//! Replaces the duplicated `compare_rows` implementations in compact.rs,
-//! merge.rs, and read_cursor.rs with a single generic version.
 
 use std::cmp::Ordering;
 
@@ -118,16 +115,7 @@ pub(crate) fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], t
     }
 }
 
-// ---------------------------------------------------------------------------
-// PK key primitives — moved to `schema::key`
-// ---------------------------------------------------------------------------
-
-// `compare_pk_bytes`, `compare_pk_ordering`, and `opk_key` live in `schema::key`
-// now; re-exported so `columnar::*` / `crate::storage::*` call sites are
-// unchanged. (`encode_order_preserving_pk` moved there too but has no
-// storage-side caller, so it is not re-exported.)
 use crate::schema::key::PkSortKey; // the OPK register sort key, for the seek fast path below
-pub(crate) use crate::schema::key::{compare_pk_bytes, compare_pk_ordering, opk_key, pk_bytes_eq};
 
 // ---------------------------------------------------------------------------
 // Sorted-stream lower-bound search (stateless + galloping)
@@ -183,19 +171,14 @@ fn gallop_by(count: usize, hint: usize, lt: impl Fn(usize) -> bool) -> usize {
 /// load-bearing: a bare `Fn(usize) -> &[u8]` desugars to a higher-ranked bound the
 /// `|i| self.get_pk_bytes(i)` closures (result borrows `self`) cannot satisfy.
 #[inline]
-pub(crate) fn binary_lower_bound<'a>(lo: usize, hi: usize, key: &[u8], get: &impl Fn(usize) -> &'a [u8]) -> usize {
+fn binary_lower_bound<'a>(lo: usize, hi: usize, key: &[u8], get: &impl Fn(usize) -> &'a [u8]) -> usize {
     lower_bound_by(lo, hi, |i| get(i) < key)
 }
 
 /// Galloping byte-`memcmp` lower bound; see [`gallop_by`]. The seek fallback for PK
 /// strides past the register widths, and the byte oracle in tests.
 #[inline]
-pub(crate) fn gallop_lower_bound_bytes<'a>(
-    count: usize,
-    key: &[u8],
-    hint: usize,
-    get: impl Fn(usize) -> &'a [u8],
-) -> usize {
+fn gallop_lower_bound_bytes<'a>(count: usize, key: &[u8], hint: usize, get: impl Fn(usize) -> &'a [u8]) -> usize {
     gallop_by(count, hint, |i| get(i) < key)
 }
 
@@ -379,19 +362,6 @@ macro_rules! with_row_cmp {
     };
 }
 pub(crate) use with_row_cmp;
-
-// ---------------------------------------------------------------------------
-// Sort helpers
-// ---------------------------------------------------------------------------
-
-/// A `(pk, row-index)` pair used by the merge sort-consolidate path. Keeps the
-/// PK co-located with its index so the comparator reads from the element being
-/// positioned rather than a separate array.
-#[derive(Copy, Clone)]
-pub(crate) struct SortEntry {
-    pub(crate) pk: u128,
-    pub(crate) idx: u32,
-}
 
 // ===========================================================================
 // Tests

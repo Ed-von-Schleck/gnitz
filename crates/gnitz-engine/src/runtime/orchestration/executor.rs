@@ -36,9 +36,8 @@ use crate::runtime::reactor::{
 use crate::runtime::wire::{
     self as ipc, SchemaWithVersion, FLAG_GET_INDICES, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
 };
-use crate::schema::{validate_schema_match, SchemaDescriptor};
-use crate::storage::Batch;
-use crate::storage::{index_meta_schema_desc, BatchBuilder, INDEX_META_COL_NAMES};
+use crate::schema::{index_meta_schema_desc, validate_schema_match, SchemaDescriptor, INDEX_META_COL_NAMES};
+use crate::storage::{Batch, BatchBuilder};
 
 const TICK_COALESCE_ROWS: usize = 10_000;
 const TICK_DEADLINE_MS: u64 = 20;

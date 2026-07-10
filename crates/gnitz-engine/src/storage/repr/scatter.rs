@@ -54,16 +54,17 @@ fn scatter_col_first(batch: &MemBatch<'_>, indices: &[u32], writer: &mut DirectW
     let base = writer.count; // first output row for this scatter
 
     // Fused PK + weight + null_bmp gather: one pass over `indices` instead of three.
-    // PK stride dispatches to a const-N helper so the inner loop sees a literal width.
-    // Wider/compound strides fall through to a runtime-stride helper that trades
-    // the literal-width store for a memcpy per row.
+    // PK stride dispatches to a const-`PKS` helper so the inner loop sees a
+    // literal width (1/2/4/8/16). Wider/compound strides take the `PKS = 0`
+    // sentinel instantiation, which reads the stride at runtime — trading the
+    // literal-width store for a memcpy per row.
     match writer.pk_stride {
         1 => scatter_col_first_fixed::<1>(batch, indices, base, writer),
         2 => scatter_col_first_fixed::<2>(batch, indices, base, writer),
         4 => scatter_col_first_fixed::<4>(batch, indices, base, writer),
         8 => scatter_col_first_fixed::<8>(batch, indices, base, writer),
         16 => scatter_col_first_fixed::<16>(batch, indices, base, writer),
-        _ => scatter_col_first_dynamic(batch, indices, base, writer),
+        _ => scatter_col_first_fixed::<0>(batch, indices, base, writer),
     }
 
     let schema = writer.schema;
@@ -101,8 +102,11 @@ fn scatter_col_first(batch: &MemBatch<'_>, indices: &[u32], writer: &mut DirectW
 }
 
 // Fused PK + weight + null_bmp gather in one pass over `indices`, replacing three
-// separate gather_col calls. Caller invariant: every index < batch.count; writer
-// slices sized for at least (base + indices.len()) rows.
+// separate gather_col calls. `PKS = 0` is the runtime-stride sentinel for
+// compound widths outside the const dispatch (e.g. U64+U32 = 12); its
+// instantiation reads `writer.pk_stride` and compiles to the same body the
+// hand-written dynamic twin had. Caller invariant: every index < batch.count;
+// writer slices sized for at least (base + indices.len()) rows.
 #[inline(always)]
 fn scatter_col_first_fixed<const PKS: usize>(
     batch: &MemBatch<'_>,
@@ -111,37 +115,7 @@ fn scatter_col_first_fixed<const PKS: usize>(
     writer: &mut DirectWriter<'_>,
 ) {
     const FB: usize = FIXED_REGION_BYTES;
-    let pk_src = batch.pk();
-    let wt_src = batch.weight();
-    let nb_src = batch.null_bmp();
-    let pk_dst = &mut writer.pk[base * PKS..];
-    let wt_dst = &mut writer.weight[base * FB..];
-    let nb_dst = &mut writer.null_bmp[base * FB..];
-    debug_assert!(pk_dst.len() >= indices.len() * PKS);
-    debug_assert!(wt_dst.len() >= indices.len() * FB);
-    debug_assert!(nb_dst.len() >= indices.len() * FB);
-    for (out, &idx) in indices.iter().enumerate() {
-        let i = idx as usize;
-        debug_assert!((i + 1) * PKS <= pk_src.len());
-        debug_assert!((i + 1) * FB <= wt_src.len());
-        debug_assert!((i + 1) * FB <= nb_src.len());
-        unsafe {
-            std::ptr::copy_nonoverlapping(pk_src.as_ptr().add(i * PKS), pk_dst.as_mut_ptr().add(out * PKS), PKS);
-            std::ptr::copy_nonoverlapping(wt_src.as_ptr().add(i * FB), wt_dst.as_mut_ptr().add(out * FB), FB);
-            std::ptr::copy_nonoverlapping(nb_src.as_ptr().add(i * FB), nb_dst.as_mut_ptr().add(out * FB), FB);
-        }
-    }
-}
-
-// Runtime-stride fallback for compound PKs. Maintains the fused PK + weight +
-// null_bmp single-pass structure of `scatter_col_first_fixed`, but copies
-// `pks` bytes per PK via `copy_nonoverlapping` against a runtime-sized stride.
-// Trades the literal-width store optimisation for correctness on widths the
-// const-generic dispatch doesn't cover (e.g. compound strides like U64+U32 = 12).
-#[inline(always)]
-fn scatter_col_first_dynamic(batch: &MemBatch<'_>, indices: &[u32], base: usize, writer: &mut DirectWriter<'_>) {
-    const FB: usize = FIXED_REGION_BYTES;
-    let pks = writer.pk_stride as usize;
+    let pks = if PKS == 0 { writer.pk_stride as usize } else { PKS };
     let pk_src = batch.pk();
     let wt_src = batch.weight();
     let nb_src = batch.null_bmp();
@@ -240,7 +214,7 @@ pub fn scatter_multi_source(sources: &[Option<MemBatch<'_>>], rows: &[(u8, u32)]
         4 => scatter_mb_pk_wt_nbm::<4>(sources, rows, base, writer),
         8 => scatter_mb_pk_wt_nbm::<8>(sources, rows, base, writer),
         16 => scatter_mb_pk_wt_nbm::<16>(sources, rows, base, writer),
-        _ => scatter_mb_pk_dynamic(sources, rows, base, writer),
+        _ => scatter_mb_pk_wt_nbm::<0>(sources, rows, base, writer),
     }
 
     // One pass per column keeps destination writes sequential.
@@ -263,9 +237,12 @@ pub fn scatter_multi_source(sources: &[Option<MemBatch<'_>>], rows: &[(u8, u32)]
     writer.count += n;
 }
 
-// PK stride is `PKS` (literal 8 or 16); weight and null_bmp are always 8.
-// Hoisting the PK stride out of the row loop is what unlocks fixed-width
-// loads/stores instead of memcpy in the inner loop.
+// PK stride is the literal `PKS` (1/2/4/8/16) or, for the `PKS = 0` sentinel,
+// `writer.pk_stride` read at runtime (compound widths outside the const
+// dispatch); weight and null_bmp are always 8. Hoisting the PK stride out of
+// the row loop is what unlocks fixed-width loads/stores instead of memcpy in
+// the inner loop. All sources share the writer schema, so
+// `src.pk_stride == writer.pk_stride` per `debug_assert_eq!`.
 #[inline(always)]
 fn scatter_mb_pk_wt_nbm<const PKS: usize>(
     sources: &[Option<MemBatch<'_>>],
@@ -274,31 +251,7 @@ fn scatter_mb_pk_wt_nbm<const PKS: usize>(
     writer: &mut DirectWriter<'_>,
 ) {
     const FB: usize = FIXED_REGION_BYTES;
-    for (out, &(si, ri)) in rows.iter().enumerate() {
-        let src = unsafe { sources.get_unchecked(si as usize).as_ref().unwrap_unchecked() };
-        let row = ri as usize;
-        let dst_row = base + out;
-        let pk_off = src.offsets[super::batch::REG_PK] + row * PKS;
-        writer.pk[dst_row * PKS..][..PKS].copy_from_slice(&src.data[pk_off..pk_off + PKS]);
-        let w_off = src.offsets[super::batch::REG_WEIGHT] + row * FB;
-        writer.weight[dst_row * FB..][..FB].copy_from_slice(&src.data[w_off..w_off + FB]);
-        let n_off = src.offsets[super::batch::REG_NULL_BMP] + row * FB;
-        writer.null_bmp[dst_row * FB..][..FB].copy_from_slice(&src.data[n_off..n_off + FB]);
-    }
-}
-
-// Runtime-stride fallback for compound PKs in `scatter_multi_source`. All
-// sources share the writer schema, so `src.pk_stride == writer.pk_stride` per
-// `debug_assert_eq!`. Fused PK + weight + null_bmp loop preserved.
-#[inline(always)]
-fn scatter_mb_pk_dynamic(
-    sources: &[Option<MemBatch<'_>>],
-    rows: &[(u8, u32)],
-    base: usize,
-    writer: &mut DirectWriter<'_>,
-) {
-    const FB: usize = FIXED_REGION_BYTES;
-    let pks = writer.pk_stride as usize;
+    let pks = if PKS == 0 { writer.pk_stride as usize } else { PKS };
     for (out, &(si, ri)) in rows.iter().enumerate() {
         let src = unsafe { sources.get_unchecked(si as usize).as_ref().unwrap_unchecked() };
         debug_assert_eq!(src.pk_stride as usize, pks);
@@ -369,16 +322,17 @@ pub(crate) fn scatter_unified_sources_with_weights(
     let n = rows.len();
     let base = writer.count;
 
-    // Fused PK + weight + null_bmp pass. PK stride dispatches into a const-N
-    // helper so the inner loop sees a literal width (8 or 16) — without that,
-    // `copy_from_slice` lowers to memcpy.
+    // Fused PK + weight + null_bmp pass. PK stride dispatches into a
+    // const-`PKS` helper so the inner loop sees a literal width (1/2/4/8/16) —
+    // without that, `copy_from_slice` lowers to memcpy. Compound widths take
+    // the runtime-stride `PKS = 0` sentinel instantiation.
     match writer.pk_stride {
         1 => scatter_unified_pk_wt_nbm::<1>(sources, rows, base, writer),
         2 => scatter_unified_pk_wt_nbm::<2>(sources, rows, base, writer),
         4 => scatter_unified_pk_wt_nbm::<4>(sources, rows, base, writer),
         8 => scatter_unified_pk_wt_nbm::<8>(sources, rows, base, writer),
         16 => scatter_unified_pk_wt_nbm::<16>(sources, rows, base, writer),
-        _ => scatter_unified_pk_dynamic(sources, rows, base, writer),
+        _ => scatter_unified_pk_wt_nbm::<0>(sources, rows, base, writer),
     }
 
     let schema = writer.schema;
@@ -409,9 +363,11 @@ pub(crate) fn scatter_unified_sources_with_weights(
     writer.count += n;
 }
 
-// PK stride is `PKS` (literal 8 or 16) for the destination; source reads use
-// `src.pk.stride` so Constant PK regions (stride=0) read the same bytes for
-// every output row — identical to the existing null_bmp Constant behaviour.
+// PK stride is the literal `PKS` (1/2/4/8/16) — or `writer.pk_stride` read at
+// runtime for the compound-width `PKS = 0` sentinel — for the destination
+// only; source reads use `src.pk.stride` so Constant PK regions (stride=0)
+// read the same bytes for every output row — identical to the existing
+// null_bmp Constant behaviour. No source/dest stride conflation.
 // Raw pointer writes eliminate the redundant bounds checks that slice indexing
 // emits — `DirectWriter` pre-allocates exactly `count` rows per buffer.
 #[inline(always)]
@@ -422,38 +378,7 @@ fn scatter_unified_pk_wt_nbm<const PKS: usize>(
     writer: &mut DirectWriter<'_>,
 ) {
     const FB: usize = FIXED_REGION_BYTES;
-    let pk_dst = writer.pk.as_mut_ptr();
-    let wt_dst = writer.weight.as_mut_ptr();
-    let nbm_dst = writer.null_bmp.as_mut_ptr();
-    for (out, &(si, ri, w)) in rows.iter().enumerate() {
-        let src = unsafe { sources.get_unchecked(si as usize) };
-        let dst_row = base + out;
-        let pk_ptr = unsafe { src.pk.base.add(ri as usize * src.pk.stride) };
-        let nbm_ptr = unsafe { src.null_bmp.base.add(ri as usize * src.null_bmp.stride) };
-        let wb = w.to_le_bytes();
-        unsafe {
-            std::ptr::copy_nonoverlapping(pk_ptr, pk_dst.add(dst_row * PKS), PKS);
-            std::ptr::copy_nonoverlapping(wb.as_ptr(), wt_dst.add(dst_row * FB), FB);
-            std::ptr::copy_nonoverlapping(nbm_ptr, nbm_dst.add(dst_row * FB), FB);
-        }
-    }
-}
-
-// Runtime-stride fallback for compound PKs in
-// `scatter_unified_sources_with_weights`. Source reads use `src.pk.stride`
-// (per-source — handles the `stride==0` Constant region case); only the
-// destination copy width uses `writer.pk_stride`. No source/dest stride
-// conflation. Fused PK + weight + null_bmp loop preserved.
-// Raw pointer writes eliminate redundant bounds checks.
-#[inline(always)]
-fn scatter_unified_pk_dynamic(
-    sources: &[UnifiedSource],
-    rows: &[(u32, u32, i64)],
-    base: usize,
-    writer: &mut DirectWriter<'_>,
-) {
-    const FB: usize = FIXED_REGION_BYTES;
-    let pks = writer.pk_stride as usize;
+    let pks = if PKS == 0 { writer.pk_stride as usize } else { PKS };
     let pk_dst = writer.pk.as_mut_ptr();
     let wt_dst = writer.weight.as_mut_ptr();
     let nbm_dst = writer.null_bmp.as_mut_ptr();
@@ -645,7 +570,8 @@ mod tests {
     // -----------------------------------------------------------------------
     // Wide-stride scatter tests (compound PK, pk_stride = 24)
     //
-    // Exercises the dynamic-dispatch arm of each scatter helper. Builds source
+    // Exercises the runtime-stride `PKS = 0` sentinel arm of each scatter
+    // helper. Builds source
     // batches via `extend_pk_bytes` (the u128 path panics for stride 24) and a
     // bespoke `DirectWriter` sized for 24-byte PKs (the shared `run_scatter`
     // helper hardcodes 16).
@@ -669,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scatter_col_first_dynamic_wide_pk() {
+    fn test_scatter_col_first_sentinel_wide_pk() {
         let schema = wide_pk_3xu64_schema();
         // Three source rows with distinguishable PKs and payloads.
         let pk_a = [1u8; 24];
@@ -689,7 +615,7 @@ mod tests {
             let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, schema, 0);
             assert!(
                 writer.pk_stride != 8 && writer.pk_stride != 16,
-                "test must exercise dynamic dispatch arm",
+                "test must exercise the PKS = 0 sentinel arm",
             );
             scatter_copy(&mb, indices, &[], &mut writer);
             assert_eq!(writer.row_count(), 2);
@@ -703,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scatter_multi_source_dynamic_wide_pk() {
+    fn test_scatter_multi_source_sentinel_wide_pk() {
         let schema = wide_pk_3xu64_schema();
         let pk_a = [0xaau8; 24];
         let pk_b = [0xbbu8; 24];
@@ -727,7 +653,7 @@ mod tests {
             let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, schema, 0);
             assert!(
                 writer.pk_stride != 8 && writer.pk_stride != 16,
-                "test must exercise dynamic dispatch arm",
+                "test must exercise the PKS = 0 sentinel arm",
             );
             scatter_multi_source(&sources, rows, &mut writer);
             assert_eq!(writer.row_count(), 4);
@@ -743,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scatter_unified_sources_dynamic_wide_pk() {
+    fn test_scatter_unified_sources_sentinel_wide_pk() {
         let schema = wide_pk_3xu64_schema();
         let pk_a = [0x11u8; 24];
         let pk_b = [0x22u8; 24];
@@ -801,7 +727,7 @@ mod tests {
             let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, schema, 0);
             assert!(
                 writer.pk_stride != 8 && writer.pk_stride != 16,
-                "test must exercise dynamic dispatch arm",
+                "test must exercise the PKS = 0 sentinel arm",
             );
             scatter_unified_sources_with_weights(&sources, rows, &mut writer);
             assert_eq!(writer.row_count(), 3);
