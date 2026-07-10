@@ -239,18 +239,11 @@ fn span_to_natives(span: &PkBuf, idx_cols: &[SchemaColumn]) -> [u128; gnitz_wire
 /// children, as a projection list for `execute_gather_async`. A PK-target child
 /// reads its referenced value from the packed PK on the wire and needs no
 /// gather, so PK columns are excluded.
-fn collect_fk_projection(
-    cat: &CatalogEngine,
-    target_id: i64,
-    n_children: usize,
-    source_schema: &SchemaDescriptor,
-) -> Vec<u8> {
+fn collect_fk_projection(cat: &CatalogEngine, target_id: i64, source_schema: &SchemaDescriptor) -> Vec<u8> {
     let mut project: Vec<u8> = Vec::new();
-    for ci in 0..n_children {
-        if let Some((_, _, parent_col_idx)) = cat.get_fk_child_info(target_id, ci) {
-            if !source_schema.is_pk_col(parent_col_idx) && !project.contains(&(parent_col_idx as u8)) {
-                project.push(parent_col_idx as u8);
-            }
+    for r in cat.fk_children_of(target_id) {
+        if !source_schema.is_pk_col(r.parent_col_idx) && !project.contains(&(r.parent_col_idx as u8)) {
+            project.push(r.parent_col_idx as u8);
         }
     }
     project
@@ -285,8 +278,8 @@ impl MasterDispatcher {
         let (n_fk, n_children, n_circuits, has_unique, unique_pk, source_schema) = unsafe {
             let disp = &mut *disp_ptr;
             let cat = &mut *disp.catalog;
-            let n_fk = cat.get_fk_count(target_id);
-            let n_children = cat.get_fk_children_count(target_id);
+            let n_fk = cat.fk_constraints_of(target_id).len();
+            let n_children = cat.fk_children_of(target_id).len();
             let n_circuits = cat.get_index_circuit_count(target_id);
             let has_unique = cat.has_any_unique_index(target_id);
             let unique_pk = cat.table_has_unique_pk(target_id);
@@ -350,19 +343,16 @@ impl MasterDispatcher {
         let mut p1_checks: Vec<PipelinedCheck> = Vec::new();
         let mut p1_labels: Vec<P1Label> = Vec::new();
 
-        for fi in 0..n_fk {
-            let (fk_col_idx, parent_table_id, parent_col_idx, parent_schema) = unsafe {
-                let disp = &mut *disp_ptr;
-                let cat = &mut *disp.catalog;
-                let (fk_col_idx, parent_table_id, parent_col_idx) = match cat.get_fk_constraint(target_id, fi) {
-                    Some(c) => c,
-                    None => continue,
-                };
-                let parent_schema = cat
-                    .get_schema_desc(parent_table_id)
-                    .ok_or_else(|| format!("FK parent table {parent_table_id} schema not found"))?;
-                (fk_col_idx, parent_table_id, parent_col_idx, parent_schema)
-            };
+        // SAFETY (typed FK slices, here and in the two child loops below): the
+        // slice borrows the catalog's FK cache across this planning code and
+        // the awaits around it. That is sound not by borrowck but because the
+        // push read lock is held across the whole preflight (executor.rs), so
+        // no DDL can mutate the FK caches while the borrow is live — the same
+        // contract every raw `disp_ptr` deref here relies on.
+        for c in unsafe { (*(*disp_ptr).catalog).fk_constraints_of(target_id) } {
+            let (fk_col_idx, parent_table_id, parent_col_idx) = (c.fk_col_idx, c.target_table_id, c.target_col_idx);
+            let parent_schema = unsafe { (*(*disp_ptr).catalog).get_schema_desc(parent_table_id) }
+                .ok_or_else(|| format!("FK parent table {parent_table_id} schema not found"))?;
 
             // The FK column may itself be a PK column of the child table (e.g.
             // `id BIGINT PRIMARY KEY REFERENCES parent(pid)`); `locate` resolves
@@ -467,8 +457,7 @@ impl MasterDispatcher {
             if !removed_pks.is_empty() {
                 // Resolve every non-PK referenced parent column in ONE batched
                 // gather instead of one serial seek per (removed PK × child).
-                let project =
-                    unsafe { collect_fk_projection(&*(*disp_ptr).catalog, target_id, n_children, &source_schema) };
+                let project = unsafe { collect_fk_projection(&*(*disp_ptr).catalog, target_id, &source_schema) };
                 let gathered = if project.is_empty() {
                     GatherMap::default()
                 } else {
@@ -476,21 +465,15 @@ impl MasterDispatcher {
                         .await?
                 };
 
-                for ci in 0..n_children {
-                    let (child_tid, fk_col_idx, parent_col_idx, idx_schema) = unsafe {
-                        let cat = &mut *(*disp_ptr).catalog;
-                        let (child_tid, fk_col_idx, parent_col_idx) = match cat.get_fk_child_info(target_id, ci) {
-                            Some(info) => info,
-                            None => continue,
-                        };
-                        let idx_schema =
-                            cat.get_index_schema_by_cols(child_tid, &[fk_col_idx as u32])
-                                .ok_or_else(|| {
-                                    format!(
-                                "FK RESTRICT check failed: no index on child table {child_tid} col {fk_col_idx}")
-                                })?;
-                        (child_tid, fk_col_idx, parent_col_idx, idx_schema)
-                    };
+                for r in unsafe { (*(*disp_ptr).catalog).fk_children_of(target_id) } {
+                    let (child_tid, fk_col_idx, parent_col_idx) = (r.child_tid, r.fk_col_idx, r.parent_col_idx);
+                    let idx_schema =
+                        unsafe { (*(*disp_ptr).catalog).get_index_schema_by_cols(child_tid, &[fk_col_idx as u32]) }
+                            .ok_or_else(|| {
+                                format!(
+                                    "FK RESTRICT check failed: no index on child table {child_tid} col {fk_col_idx}"
+                                )
+                            })?;
 
                     // PK-column target → value is on the wire inside the packed
                     // PK; extract just that column. Non-PK UNIQUE target → the
@@ -637,8 +620,7 @@ impl MasterDispatcher {
             // batched gather, rather than one serial seek per (updated PK ×
             // child). UPDATE cannot change PK columns, so only non-PK
             // referenced columns participate.
-            let project =
-                unsafe { collect_fk_projection(&*(*disp_ptr).catalog, target_id, n_children, &source_schema) };
+            let project = unsafe { collect_fk_projection(&*(*disp_ptr).catalog, target_id, &source_schema) };
 
             if !project.is_empty() {
                 // Batch rows that are UPDATEs: positive weight and a PK that
@@ -664,22 +646,17 @@ impl MasterDispatcher {
                 let gathered =
                     Self::execute_gather_async(disp_ptr, reactor, sal_excl, target_id, updated, &project).await?;
 
-                for ci in 0..n_children {
-                    let (child_tid, fk_col_idx, parent_col_idx, idx_schema) = unsafe {
-                        let cat = &mut *(*disp_ptr).catalog;
-                        let (child_tid, fk_col_idx, parent_col_idx) = match cat.get_fk_child_info(target_id, ci) {
-                            Some(info) => info,
-                            None => continue,
-                        };
-                        // PK columns are immutable under UPDATE — nothing to enforce.
-                        if source_schema.is_pk_col(parent_col_idx) {
-                            continue;
-                        }
-                        let idx_schema = match cat.get_index_schema_by_cols(child_tid, &[fk_col_idx as u32]) {
-                            Some(s) => s,
-                            None => continue,
-                        };
-                        (child_tid, fk_col_idx, parent_col_idx, idx_schema)
+                for r in unsafe { (*(*disp_ptr).catalog).fk_children_of(target_id) } {
+                    let (child_tid, fk_col_idx, parent_col_idx) = (r.child_tid, r.fk_col_idx, r.parent_col_idx);
+                    // PK columns are immutable under UPDATE — nothing to enforce.
+                    if source_schema.is_pk_col(parent_col_idx) {
+                        continue;
+                    }
+                    let idx_schema = match unsafe {
+                        (*(*disp_ptr).catalog).get_index_schema_by_cols(child_tid, &[fk_col_idx as u32])
+                    } {
+                        Some(s) => s,
+                        None => continue,
                     };
 
                     // PK columns are skipped above (immutable under UPDATE), so

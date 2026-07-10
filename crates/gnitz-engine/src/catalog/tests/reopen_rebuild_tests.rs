@@ -50,7 +50,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
 
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), i64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.base", &cols, &[0], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
@@ -144,7 +144,7 @@ fn index_rebuilds_across_chunk_boundary_view_defers() {
 
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), i64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.base", &cols, &[0], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
     let mut next = 0usize;
@@ -227,7 +227,7 @@ fn backfill_all_indexes_rebuilds_exactly_once() {
     let dir = temp_dir("backfill_all_indexes_once");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.base", &cols, &[0], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);

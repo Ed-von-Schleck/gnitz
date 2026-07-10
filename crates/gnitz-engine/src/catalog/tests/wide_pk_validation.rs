@@ -80,7 +80,12 @@ fn setup_wide_unique(
     .unwrap();
 
     let bb = wide_val_batch(&schema, base_rows);
-    let idx_batch = DagEngine::batch_project_index(&bb, &[3], &schema, &idx_schema);
+    let idx_batch = DagEngine::batch_project_index(
+        &bb,
+        &crate::schema::IndexKeySpec::new(&[3], &schema, &idx_schema),
+        &schema,
+        &idx_schema,
+    );
     base.ingest_owned_batch(bb).unwrap();
     base.flush().unwrap();
     idx.ingest_owned_batch(idx_batch).unwrap();
@@ -272,7 +277,7 @@ fn seek_family_bytes_matches_seek_family_narrow() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     // Plain narrow U64-PK table created through the normal path.
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
 

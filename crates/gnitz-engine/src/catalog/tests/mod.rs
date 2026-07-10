@@ -11,6 +11,7 @@ mod wide_pk_validation;
 
 use super::sys_tables::*;
 use super::*;
+use crate::schema::type_code;
 
 use std::fs;
 
@@ -34,70 +35,11 @@ fn temp_dir(name: &str) -> String {
     path
 }
 
-fn u64_col_def(name: &str) -> ColumnDef {
+/// A plain non-nullable, non-FK, non-hidden column of the given type.
+fn col_def(name: &str, type_code: u8) -> ColumnDef {
     ColumnDef {
         name: name.into(),
-        type_code: type_code::U64,
-        is_nullable: false,
-        fk_table_id: 0,
-        fk_col_idx: 0,
-        is_hidden: false,
-    }
-}
-fn i64_col_def(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.into(),
-        type_code: type_code::I64,
-        is_nullable: false,
-        fk_table_id: 0,
-        fk_col_idx: 0,
-        is_hidden: false,
-    }
-}
-fn u8_col_def(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.into(),
-        type_code: type_code::U8,
-        is_nullable: false,
-        fk_table_id: 0,
-        fk_col_idx: 0,
-        is_hidden: false,
-    }
-}
-fn u16_col_def(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.into(),
-        type_code: type_code::U16,
-        is_nullable: false,
-        fk_table_id: 0,
-        fk_col_idx: 0,
-        is_hidden: false,
-    }
-}
-fn i32_col_def(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.into(),
-        type_code: type_code::I32,
-        is_nullable: false,
-        fk_table_id: 0,
-        fk_col_idx: 0,
-        is_hidden: false,
-    }
-}
-fn str_col_def(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.into(),
-        type_code: type_code::STRING,
-        is_nullable: false,
-        fk_table_id: 0,
-        fk_col_idx: 0,
-        is_hidden: false,
-    }
-}
-fn u128_col_def(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.into(),
-        type_code: type_code::U128,
+        type_code,
         is_nullable: false,
         fk_table_id: 0,
         fk_col_idx: 0,
@@ -128,7 +70,7 @@ fn build_table_tab_row(dir: &str, tid: i64, raw_pk_cols: u64, table_name: &str) 
 /// can build a row that passes precheck yet fails `hook_table_register`, e.g. a
 /// REPLICATED table with a non-default distribution prefix).
 fn build_table_tab_row_flags(dir: &str, tid: i64, raw_pk_cols: u64, table_name: &str, flags: u64) -> Batch {
-    let mut bb = BatchBuilder::new(table_tab_schema());
+    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
     bb.begin_row(tid as u128, 1);
     bb.put_u64(PUBLIC_SCHEMA_ID as u64);
     bb.put_string(table_name);
@@ -180,7 +122,7 @@ fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64) {
 /// column is read back by the appliers). The bare `0` pk_col_idx decodes back
 /// to a single-column PK `[0]`.
 fn build_view_tab_row(vid: i64, view_name: &str, sql: &str) -> Batch {
-    let mut bb = BatchBuilder::new(view_tab_schema());
+    let mut bb = BatchBuilder::new(SysFamily::View.schema());
     bb.begin_row(vid as u128, 1);
     bb.put_u64(PUBLIC_SCHEMA_ID as u64);
     bb.put_string(view_name);

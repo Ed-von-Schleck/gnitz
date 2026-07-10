@@ -16,24 +16,7 @@ use crate::runtime::w2m::{W2mReceiver, W2mWriter};
 use crate::runtime::w2m_ring::{self, W2M_REGION_SIZE};
 use crate::runtime::wire as ipc;
 use crate::runtime::worker::{buffer_pending_delta, WorkerProcess};
-use crate::storage::Batch;
-
-// ---------------------------------------------------------------------------
-// Partition assignment
-// ---------------------------------------------------------------------------
-
-const NUM_PARTITIONS: u32 = 256;
-
-fn partition_range(worker_id: u32, num_workers: u32) -> (u32, u32) {
-    let chunk = NUM_PARTITIONS / num_workers;
-    let start = worker_id * chunk;
-    let end = if worker_id == num_workers - 1 {
-        NUM_PARTITIONS
-    } else {
-        (worker_id + 1) * chunk
-    };
-    (start, end)
-}
+use crate::storage::{partition_range, Batch};
 
 // ---------------------------------------------------------------------------
 // SAL recovery (Design 2: LSN as the atomic unit)

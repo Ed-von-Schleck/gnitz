@@ -587,6 +587,40 @@ impl Batch {
     pub fn get_weight(&self, row: usize) -> i64 {
         read_i64_le(&self.data[self.offsets[REG_WEIGHT]..], row * 8)
     }
+    /// Read one row's value from a fixed 8-byte payload column, 0 when the
+    /// region is short (defensive against a truncated wire batch).
+    pub fn read_payload_u64(&self, row: usize, pi: usize) -> u64 {
+        let off = row * 8;
+        let col = self.col_data(pi);
+        if off + 8 > col.len() {
+            return 0;
+        }
+        u64::from_le_bytes(col[off..off + 8].try_into().unwrap_or([0; 8]))
+    }
+    /// Read one row's value from a German-string payload column; empty on a
+    /// short region or a malformed descriptor.
+    pub fn read_payload_string(&self, row: usize, pi: usize) -> String {
+        let off = row * 16;
+        let data = self.col_data(pi);
+        if off + 16 > data.len() {
+            return String::new();
+        }
+        let st: [u8; 16] = data[off..off + 16].try_into().unwrap_or([0; 16]);
+        let bytes = crate::schema::try_decode_german_string(&st, &self.blob).unwrap_or_default();
+        String::from_utf8(bytes).unwrap_or_default()
+    }
+    /// Apply `f` to every row's weight in place. Generic so the per-epoch
+    /// callers (negate, delta doubling) monomorphize to a tight loop. The
+    /// layout tag is untouched: callers pass sign-preserving-modulus maps
+    /// (negation, ×2) that cannot mint ghosts or fold duplicates.
+    #[inline]
+    pub fn map_weights(&mut self, f: impl Fn(i64) -> i64) {
+        let off = self.offsets[REG_WEIGHT];
+        for chunk in self.data[off..off + self.count * 8].chunks_exact_mut(8) {
+            let w = i64::from_le_bytes(chunk.try_into().unwrap());
+            chunk.copy_from_slice(&f(w).to_le_bytes());
+        }
+    }
     /// Overwrite a row's weight in place. Lowers the layout to a `Sorted`
     /// ceiling (never below): weight is not part of the sort key, so row order is
     /// preserved unconditionally, but the new weight may be zero (a ghost) or

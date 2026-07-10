@@ -1,8 +1,9 @@
-//! System table constants, schema definitions, and PK packing helpers.
+//! System table constants, the per-family descriptor table, and PK packing
+//! helpers.
 //!
 //! Pure data — no state, no CatalogEngine dependency.
 
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -31,7 +32,6 @@ pub(crate) const FIRST_USER_TABLE_ID: i64 = gnitz_wire::FIRST_USER_TABLE_ID as i
 pub(super) const FIRST_USER_INDEX_ID: i64 = 1;
 
 pub(super) const SYS_CATALOG_DIRNAME: &str = "_system_catalog";
-pub(super) const NUM_PARTITIONS: u32 = 256;
 
 pub(super) const SCHEMA_TAB_ID: i64 = gnitz_wire::SCHEMA_TAB as i64;
 pub(crate) const TABLE_TAB_ID: i64 = gnitz_wire::TABLE_TAB as i64;
@@ -113,59 +113,106 @@ pub(super) fn validate_pk_cols(col_defs: &[super::types::ColumnDef], pk: &PkColL
     Ok(())
 }
 
-pub(super) const VIEWTAB_COL_PK_COL_IDX: usize = 6;
-// Payload-column index (PK column 0 excluded) for the readers in
-// `apply_pk_col_of` / `hook_view_register`, mirroring the IDXTAB_PAY_* pattern.
-pub(crate) const VIEWTAB_PAY_PK_COL_IDX: usize = VIEWTAB_COL_PK_COL_IDX - 1;
+/// One admissibility check for a relation's column records + PK list, shared
+/// by the TABLE/VIEW precheck arms, both register hooks (the deliberate
+/// precheck/hook double-run — boot replay and worker ddl_sync skip precheck),
+/// and the test-only `ddl.rs::create_table`, so every layer rejects
+/// identically. Order is load-bearing: col-defs non-empty (the cross-family
+/// COL_TAB-before-TABLE/VIEW ordering contract) → [`validate_pk_cols`] →
+/// MAX_COLUMNS.
+pub(super) fn validate_relation_defs(
+    kind: &str,
+    id: i64,
+    name: &str,
+    col_defs: &[super::types::ColumnDef],
+    pk: &PkColList,
+) -> Result<(), String> {
+    if col_defs.is_empty() {
+        return Err(format!(
+            "catalog invariant violated: {kind} '{name}' (id={id}) registered \
+             before its column records. COL_TAB writes must precede \
+             TABLE_TAB/VIEW_TAB writes (see hooks.rs dispatch doc)."
+        ));
+    }
+    validate_pk_cols(col_defs, pk)?;
+    if col_defs.len() > crate::schema::MAX_COLUMNS {
+        return Err(format!(
+            "{kind} '{name}' (id={id}) has {} columns (max {})",
+            col_defs.len(),
+            crate::schema::MAX_COLUMNS
+        ));
+    }
+    Ok(())
+}
 
-pub(super) const COLTAB_COL_NAME: usize = 4;
-pub(super) const COLTAB_COL_TYPE_CODE: usize = 5;
-pub(super) const COLTAB_COL_IS_NULLABLE: usize = 6;
-pub(super) const COLTAB_COL_FK_TABLE_ID: usize = 7;
-pub(super) const COLTAB_COL_FK_COL_IDX: usize = 8;
-pub(super) const COLTAB_COL_IS_HIDDEN: usize = 10;
+// ---------------------------------------------------------------------------
+// Positional column constants — derived at compile time from the shared
+// gnitz-wire column slices, so a reshaped table re-derives every index.
+// `*_COL_*` are full-schema indices (cursor reads); `*_PAY_*` are payload
+// indices (batch reads, single leading PK column excluded).
+// ---------------------------------------------------------------------------
 
-pub(super) const IDXTAB_COL_OWNER_ID: usize = 1;
+use gnitz_wire::col_index_in;
+
+/// Payload-column index (single leading PK excluded) of `name` in `cols` —
+/// the layout `Batch::read_u64`-style decoders see. Valid only for the
+/// single-PK families (every family below has PK = column 0).
+const fn pay_index_in(cols: &[gnitz_wire::WireSysCol], name: &str) -> usize {
+    col_index_in(cols, name) - 1
+}
+
+pub(super) const SCHEMATAB_PAY_NAME: usize = pay_index_in(gnitz_wire::SCHEMA_TAB_COLS, "name");
+
+pub(super) const TABTAB_PAY_SCHEMA_ID: usize = pay_index_in(gnitz_wire::TABLE_TAB_COLS, "schema_id");
+pub(super) const TABTAB_PAY_NAME: usize = pay_index_in(gnitz_wire::TABLE_TAB_COLS, "name");
+pub(super) const TABTAB_PAY_PK_COL_IDX: usize = pay_index_in(gnitz_wire::TABLE_TAB_COLS, "pk_col_idx");
+pub(super) const TABTAB_PAY_FLAGS: usize = pay_index_in(gnitz_wire::TABLE_TAB_COLS, "flags");
+
+pub(super) const VIEWTAB_PAY_SCHEMA_ID: usize = pay_index_in(gnitz_wire::VIEW_TAB_COLS, "schema_id");
+pub(super) const VIEWTAB_PAY_NAME: usize = pay_index_in(gnitz_wire::VIEW_TAB_COLS, "name");
+pub(crate) const VIEWTAB_PAY_PK_COL_IDX: usize = pay_index_in(gnitz_wire::VIEW_TAB_COLS, "pk_col_idx");
+
+// `apply_entity_caches` / `apply_schema_of` decode TABLE_TAB and VIEW_TAB
+// batches through one code path (reading the TABTAB_PAY_* positions); the two
+// families must agree on the leading `(schema_id, name)` payload prefix.
+const _: () = {
+    assert!(TABTAB_PAY_SCHEMA_ID == VIEWTAB_PAY_SCHEMA_ID);
+    assert!(TABTAB_PAY_NAME == VIEWTAB_PAY_NAME);
+};
+
+pub(super) const COLTAB_COL_NAME: usize = col_index_in(gnitz_wire::COL_TAB_COLS, "name");
+pub(super) const COLTAB_COL_TYPE_CODE: usize = col_index_in(gnitz_wire::COL_TAB_COLS, "type_code");
+pub(super) const COLTAB_COL_IS_NULLABLE: usize = col_index_in(gnitz_wire::COL_TAB_COLS, "is_nullable");
+pub(super) const COLTAB_COL_FK_TABLE_ID: usize = col_index_in(gnitz_wire::COL_TAB_COLS, "fk_table_id");
+pub(super) const COLTAB_COL_FK_COL_IDX: usize = col_index_in(gnitz_wire::COL_TAB_COLS, "fk_col_idx");
+pub(super) const COLTAB_COL_IS_HIDDEN: usize = col_index_in(gnitz_wire::COL_TAB_COLS, "is_hidden");
+pub(super) const COLTAB_PAY_OWNER_ID: usize = pay_index_in(gnitz_wire::COL_TAB_COLS, "owner_id");
+pub(super) const COLTAB_PAY_COL_IDX: usize = pay_index_in(gnitz_wire::COL_TAB_COLS, "col_idx");
+pub(super) const COLTAB_PAY_FK_TABLE_ID: usize = pay_index_in(gnitz_wire::COL_TAB_COLS, "fk_table_id");
+pub(super) const COLTAB_PAY_FK_COL_IDX: usize = pay_index_in(gnitz_wire::COL_TAB_COLS, "fk_col_idx");
+
+pub(super) const IDXTAB_COL_OWNER_ID: usize = col_index_in(gnitz_wire::IDX_TAB_COLS, "owner_id");
 // Holds `pack_pk_cols(&col_indices)` for every row (single- and multi-column
 // indexes alike); decoded via `unpack_pk_cols`.
-pub(super) const IDXTAB_COL_SOURCE_COLS: usize = 3;
-pub(super) const IDXTAB_COL_NAME: usize = 4;
-pub(super) const IDXTAB_COL_IS_UNIQUE: usize = 5;
+pub(super) const IDXTAB_COL_SOURCE_COLS: usize = col_index_in(gnitz_wire::IDX_TAB_COLS, "source_col_idx");
+pub(super) const IDXTAB_COL_IS_UNIQUE: usize = col_index_in(gnitz_wire::IDX_TAB_COLS, "is_unique");
+pub(crate) const IDXTAB_PAY_OWNER_ID: usize = pay_index_in(gnitz_wire::IDX_TAB_COLS, "owner_id");
+pub(crate) const IDXTAB_PAY_SOURCE_COLS: usize = pay_index_in(gnitz_wire::IDX_TAB_COLS, "source_col_idx");
+pub(crate) const IDXTAB_PAY_NAME: usize = pay_index_in(gnitz_wire::IDX_TAB_COLS, "name");
+pub(crate) const IDXTAB_PAY_IS_UNIQUE: usize = pay_index_in(gnitz_wire::IDX_TAB_COLS, "is_unique");
 
-// Payload-column indices into an IDX_TAB *batch* — the layout seen by
-// `read_batch_u64`/`read_batch_string`, where the single-column PK `index_id`
-// (full-schema column 0) is excluded. Each is the matching IDXTAB_COL_*
-// full-schema index minus one.
-pub(crate) const IDXTAB_PAY_OWNER_ID: usize = IDXTAB_COL_OWNER_ID - 1;
-pub(crate) const IDXTAB_PAY_SOURCE_COLS: usize = IDXTAB_COL_SOURCE_COLS - 1;
-pub(crate) const IDXTAB_PAY_NAME: usize = IDXTAB_COL_NAME - 1;
-pub(crate) const IDXTAB_PAY_IS_UNIQUE: usize = IDXTAB_COL_IS_UNIQUE - 1;
-
-pub(super) const SEQTAB_COL_VALUE: usize = 1;
-/// Payload index of the `value` column — the sole non-PK column — for
-/// `read_batch_u64`, which indexes payload (not logical) columns. Mirrors the
-/// `*_PAY_* = *_COL_* - 1` pattern above.
-pub(super) const SEQTAB_PAY_VALUE: usize = SEQTAB_COL_VALUE - 1;
+pub(super) const SEQTAB_COL_VALUE: usize = col_index_in(gnitz_wire::SEQ_TAB_COLS, "next_val");
+pub(super) const SEQTAB_PAY_VALUE: usize = pay_index_in(gnitz_wire::SEQ_TAB_COLS, "next_val");
 
 // Default arena sizes for system tables and user tables
 pub(super) const SYS_TABLE_ARENA: u64 = 256 * 1024; // 256 KB
 
 // ---------------------------------------------------------------------------
-// Schema builder helpers
+// Schema derivation from the shared wire column slices
 // ---------------------------------------------------------------------------
 
-pub(super) const fn u64_col() -> SchemaColumn {
-    SchemaColumn::new(type_code::U64, 0)
-}
-pub(super) const fn str_col() -> SchemaColumn {
-    SchemaColumn::new(type_code::STRING, 0)
-}
 pub(super) const fn zero_col() -> SchemaColumn {
     SchemaColumn::new(0, 0)
-}
-
-pub(super) const fn make_schema(cols: &[SchemaColumn], pk_index: u32) -> SchemaDescriptor {
-    SchemaDescriptor::new(cols, &[pk_index])
 }
 
 /// Build a `SchemaDescriptor` from the wire-neutral column slice defined in
@@ -181,107 +228,17 @@ const fn from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_indices: &[u32]) -> 
     SchemaDescriptor::new(head, pk_indices)
 }
 
-// ---------------------------------------------------------------------------
-// System table schema definitions
-// ---------------------------------------------------------------------------
-
-pub(super) const fn schema_tab_schema() -> SchemaDescriptor {
-    make_schema(&[u64_col(), str_col()], 0)
-}
-pub(super) const fn table_tab_schema() -> SchemaDescriptor {
-    make_schema(
-        &[
-            u64_col(),
-            u64_col(),
-            str_col(),
-            str_col(),
-            u64_col(),
-            u64_col(),
-            u64_col(),
-        ],
-        0,
-    )
-}
-pub(super) const fn view_tab_schema() -> SchemaDescriptor {
-    // Trailing pk_col_idx (U64) carries the packed view-PK column list, mirroring
-    // TABLE_TAB. A bare `0` decodes as the single-column PK `[0]`.
-    make_schema(
-        &[
-            u64_col(),
-            u64_col(),
-            str_col(),
-            str_col(),
-            str_col(),
-            u64_col(),
-            u64_col(),
-        ],
-        0,
-    )
-}
-pub(super) const fn col_tab_schema() -> SchemaDescriptor {
-    // 11 columns (indices 0-10). The trailing u64s are the client's `is_serial`
-    // (index 9, stored verbatim, never read by the engine — no index constant)
-    // and `is_hidden` (index 10, echoed into reply schema blocks as
-    // `META_FLAG_HIDDEN` but never branched on).
-    make_schema(
-        &[
-            u64_col(),
-            u64_col(),
-            u64_col(),
-            u64_col(),
-            str_col(),
-            u64_col(),
-            u64_col(),
-            u64_col(),
-            u64_col(),
-            u64_col(),
-            u64_col(),
-        ],
-        0,
-    )
-}
-pub(super) const fn idx_tab_schema() -> SchemaDescriptor {
-    make_schema(
-        &[
-            u64_col(),
-            u64_col(),
-            u64_col(),
-            u64_col(),
-            str_col(),
-            u64_col(),
-            str_col(),
-        ],
-        0,
-    )
-}
-pub(super) const fn dep_tab_schema() -> SchemaDescriptor {
-    // Compound PK (view_id, dep_table_id); dep_view_id is the only payload.
-    SchemaDescriptor::new(&[u64_col(), u64_col(), u64_col()], &[0, 1])
-}
-pub(super) const fn seq_tab_schema() -> SchemaDescriptor {
-    make_schema(&[u64_col(), u64_col()], 0)
-}
-pub(super) const fn circuit_nodes_schema() -> SchemaDescriptor {
-    from_wire_cols(gnitz_wire::CIRCUIT_NODES_COLS, &[0, 1])
-}
-pub(super) const fn circuit_edges_schema() -> SchemaDescriptor {
-    from_wire_cols(gnitz_wire::CIRCUIT_EDGES_COLS, &[0, 1])
-}
-pub(super) const fn circuit_node_columns_schema() -> SchemaDescriptor {
-    from_wire_cols(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS, &[0, 1])
-}
-
-// Pre-computed statics — initialised once at program start, never reconstructed.
-static S_SCHEMA_TAB: SchemaDescriptor = schema_tab_schema();
-static S_TABLE_TAB: SchemaDescriptor = table_tab_schema();
-static S_VIEW_TAB: SchemaDescriptor = view_tab_schema();
-static S_COL_TAB: SchemaDescriptor = col_tab_schema();
-static S_IDX_TAB: SchemaDescriptor = idx_tab_schema();
-static S_DEP_TAB: SchemaDescriptor = dep_tab_schema();
-static S_SEQ_TAB: SchemaDescriptor = seq_tab_schema();
-static S_CIRCUIT_NODES: SchemaDescriptor = circuit_nodes_schema();
-static S_CIRCUIT_EDGES: SchemaDescriptor = circuit_edges_schema();
-static S_CIRCUIT_NODE_COLUMNS: SchemaDescriptor = circuit_node_columns_schema();
+// Pre-computed schema statics, one per family, indexed by `SysFamily`
+// discriminant — initialised at compile time, never reconstructed.
+static SCHEMAS: [SchemaDescriptor; SysFamily::COUNT] = {
+    let mut arr = [from_wire_cols(SYS_FAMILIES[0].cols, SYS_FAMILIES[0].pk_cols); SysFamily::COUNT];
+    let mut i = 1;
+    while i < SysFamily::COUNT {
+        arr[i] = from_wire_cols(SYS_FAMILIES[i].cols, SYS_FAMILIES[i].pk_cols);
+        i += 1;
+    }
+    arr
+};
 
 // ---------------------------------------------------------------------------
 // PK packing helpers
@@ -317,82 +274,123 @@ pub(super) fn pack_view_pk(view_id: i64, sub: u64) -> u128 {
 }
 
 // ---------------------------------------------------------------------------
-// System table subdirectory names
+// Per-family descriptor table
 // ---------------------------------------------------------------------------
 
-pub(super) struct SysTabInfo {
-    pub(super) id: i64,
-    pub(super) subdir: &'static str,
-    pub(super) name: &'static str,
+pub(crate) struct SysFamilyInfo {
+    pub(crate) id: i64,
+    /// The table's name AND its subdirectory under `_system_catalog/`.
+    pub(crate) name: &'static str,
+    /// The shared wire column slice the schema, the COL_TAB self-description
+    /// rows, and the client's `Schema` all derive from.
+    pub(crate) cols: &'static [gnitz_wire::WireSysCol],
+    pub(crate) pk_cols: &'static [u32],
+    /// Topological creation priority. Lower = earlier in the dependency chain
+    /// (created first, destroyed last). Orders the `DDL_TXN` handler's
+    /// ascending forward ingest (so every register/index hook sees its
+    /// dependencies already in the memtable) and rollback's descending negate.
+    /// Distinct for Table and View so their relative order is stable; 99 =
+    /// order-neutral (Sequence, matching the non-family default).
+    pub(crate) topo_priority: u8,
 }
 
-pub(super) const SYS_TAB_INFOS: &[SysTabInfo] = &[
-    SysTabInfo {
+/// One descriptor per system family, indexed by `SysFamily` discriminant
+/// (asserted below).
+pub(crate) const SYS_FAMILIES: [SysFamilyInfo; SysFamily::COUNT] = [
+    SysFamilyInfo {
         id: SCHEMA_TAB_ID,
-        subdir: "_schemas",
         name: "_schemas",
+        cols: gnitz_wire::SCHEMA_TAB_COLS,
+        pk_cols: &[0],
+        topo_priority: 0,
     },
-    SysTabInfo {
+    SysFamilyInfo {
         id: TABLE_TAB_ID,
-        subdir: "_tables",
         name: "_tables",
+        cols: gnitz_wire::TABLE_TAB_COLS,
+        pk_cols: &[0],
+        topo_priority: 6,
     },
-    SysTabInfo {
+    SysFamilyInfo {
         id: VIEW_TAB_ID,
-        subdir: "_views",
         name: "_views",
+        cols: gnitz_wire::VIEW_TAB_COLS,
+        pk_cols: &[0],
+        topo_priority: 7,
     },
-    SysTabInfo {
+    SysFamilyInfo {
         id: COL_TAB_ID,
-        subdir: "_columns",
         name: "_columns",
+        cols: gnitz_wire::COL_TAB_COLS,
+        pk_cols: &[0],
+        topo_priority: 1,
     },
-    SysTabInfo {
+    SysFamilyInfo {
         id: IDX_TAB_ID,
-        subdir: "_indices",
         name: "_indices",
+        cols: gnitz_wire::IDX_TAB_COLS,
+        pk_cols: &[0],
+        topo_priority: 8,
     },
-    SysTabInfo {
+    SysFamilyInfo {
         id: DEP_TAB_ID,
-        subdir: "_view_deps",
         name: "_view_deps",
+        cols: gnitz_wire::DEP_TAB_COLS,
+        pk_cols: &[0, 1],
+        topo_priority: 2,
     },
-    SysTabInfo {
+    SysFamilyInfo {
         id: SEQ_TAB_ID,
-        subdir: "_sequences",
         name: "_sequences",
+        cols: gnitz_wire::SEQ_TAB_COLS,
+        pk_cols: &[0],
+        topo_priority: 99,
     },
-    SysTabInfo {
+    SysFamilyInfo {
         id: CIRCUIT_NODES_TAB_ID,
-        subdir: "_circuit_nodes",
         name: "_circuit_nodes",
+        cols: gnitz_wire::CIRCUIT_NODES_COLS,
+        pk_cols: &[0, 1],
+        topo_priority: 3,
     },
-    SysTabInfo {
+    SysFamilyInfo {
         id: CIRCUIT_EDGES_TAB_ID,
-        subdir: "_circuit_edges",
         name: "_circuit_edges",
+        cols: gnitz_wire::CIRCUIT_EDGES_COLS,
+        pk_cols: &[0, 1],
+        topo_priority: 4,
     },
-    SysTabInfo {
+    SysFamilyInfo {
         id: CIRCUIT_NODE_COLUMNS_TAB_ID,
-        subdir: "_circuit_node_columns",
         name: "_circuit_node_columns",
+        cols: gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS,
+        pk_cols: &[0, 1],
+        topo_priority: 5,
     },
 ];
 
-pub(crate) fn sys_tab_schema(id: i64) -> SchemaDescriptor {
-    match id {
-        SCHEMA_TAB_ID => S_SCHEMA_TAB,
-        TABLE_TAB_ID => S_TABLE_TAB,
-        VIEW_TAB_ID => S_VIEW_TAB,
-        COL_TAB_ID => S_COL_TAB,
-        IDX_TAB_ID => S_IDX_TAB,
-        DEP_TAB_ID => S_DEP_TAB,
-        SEQ_TAB_ID => S_SEQ_TAB,
-        CIRCUIT_NODES_TAB_ID => S_CIRCUIT_NODES,
-        CIRCUIT_EDGES_TAB_ID => S_CIRCUIT_EDGES,
-        CIRCUIT_NODE_COLUMNS_TAB_ID => S_CIRCUIT_NODE_COLUMNS,
-        _ => unreachable!("Unknown system table ID: {}", id),
+// `SYS_FAMILIES[f.index()]` must describe family `f`: verify the array order
+// against `from_id` (the ground-truth id mapping) at compile time.
+const _: () = {
+    let mut i = 0;
+    while i < SysFamily::COUNT {
+        match SysFamily::from_id(SYS_FAMILIES[i].id) {
+            Some(f) => assert!(
+                f as usize == i,
+                "SYS_FAMILIES order must match SysFamily discriminant order"
+            ),
+            None => panic!("SYS_FAMILIES entry id is not a system family"),
+        }
+        i += 1;
     }
+};
+
+/// The fixed schema for system-family `id`. Panics on a non-family id; callers
+/// holding an untrusted id go through `sys_family_schema` / `SysFamily::from_id`.
+pub(crate) fn sys_tab_schema(id: i64) -> SchemaDescriptor {
+    SysFamily::from_id(id)
+        .unwrap_or_else(|| panic!("Unknown system table ID: {id}"))
+        .schema()
 }
 
 // ---------------------------------------------------------------------------
@@ -402,7 +400,8 @@ pub(crate) fn sys_tab_schema(id: i64) -> SchemaDescriptor {
 /// A catalog system-table family (every id below `FIRST_USER_TABLE_ID`). Used
 /// at the applier's mutation API in place of a bare `i64`, so the `fire_hooks`
 /// dispatch is an exhaustive `match` a newly-added family cannot silently skip.
-/// Convert to/from `i64` only at the storage edge.
+/// Convert to/from `i64` only at the storage edge. The discriminant indexes
+/// `SYS_FAMILIES`, `SCHEMAS`, and `CatalogEngine::sys_stores`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SysFamily {
     Schema,
@@ -418,20 +417,30 @@ pub(crate) enum SysFamily {
 }
 
 impl SysFamily {
+    pub(crate) const COUNT: usize = 10;
+
+    /// Discriminant index into the per-family arrays.
+    #[inline]
+    pub(crate) const fn index(self) -> usize {
+        self as usize
+    }
+
     /// The `*_TAB_ID` constant for this family.
+    #[inline]
     pub(crate) const fn id(self) -> i64 {
-        match self {
-            SysFamily::Schema => SCHEMA_TAB_ID,
-            SysFamily::Table => TABLE_TAB_ID,
-            SysFamily::View => VIEW_TAB_ID,
-            SysFamily::Column => COL_TAB_ID,
-            SysFamily::Index => IDX_TAB_ID,
-            SysFamily::ViewDep => DEP_TAB_ID,
-            SysFamily::Sequence => SEQ_TAB_ID,
-            SysFamily::CircuitNodes => CIRCUIT_NODES_TAB_ID,
-            SysFamily::CircuitEdges => CIRCUIT_EDGES_TAB_ID,
-            SysFamily::CircuitNodeColumns => CIRCUIT_NODE_COLUMNS_TAB_ID,
-        }
+        SYS_FAMILIES[self.index()].id
+    }
+
+    /// This family's descriptor entry.
+    #[inline]
+    pub(crate) fn info(self) -> &'static SysFamilyInfo {
+        &SYS_FAMILIES[self.index()]
+    }
+
+    /// This family's fixed schema.
+    #[inline]
+    pub(crate) fn schema(self) -> SchemaDescriptor {
+        SCHEMAS[self.index()]
     }
 
     /// Inverse of [`Self::id`]; `None` for any id that is not a system family.
@@ -488,10 +497,10 @@ mod tests {
         // from_wire_cols(&[0, 1]) must produce a 2-column PK whose stride is the
         // sum of the first two columns (U64 + U64 = 16 bytes).
         for schema in [
-            circuit_nodes_schema(),
-            circuit_edges_schema(),
-            circuit_node_columns_schema(),
-            dep_tab_schema(),
+            SysFamily::CircuitNodes.schema(),
+            SysFamily::CircuitEdges.schema(),
+            SysFamily::CircuitNodeColumns.schema(),
+            SysFamily::ViewDep.schema(),
         ] {
             assert_eq!(schema.pk_indices(), &[0, 1], "circuit/dep PK must be (col0, col1)");
             assert_eq!(schema.pk_stride(), 16, "two U64 PK columns pack to 16 bytes");

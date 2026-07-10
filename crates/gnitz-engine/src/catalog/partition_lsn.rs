@@ -5,26 +5,6 @@
 use super::*;
 use rustc_hash::FxHashSet;
 
-const SYS_TABLE_IDS: &[i64] = &[
-    SCHEMA_TAB_ID,
-    TABLE_TAB_ID,
-    VIEW_TAB_ID,
-    COL_TAB_ID,
-    IDX_TAB_ID,
-    DEP_TAB_ID,
-    SEQ_TAB_ID,
-    CIRCUIT_NODES_TAB_ID,
-    CIRCUIT_EDGES_TAB_ID,
-    CIRCUIT_NODE_COLUMNS_TAB_ID,
-];
-
-/// Path of one partition's manifest inside a partitioned store's directory —
-/// the single catalog-side spelling of the `part_{p}/manifest.bin` layout the
-/// resume verdict peeks and the rebuild reset unlinks.
-fn partition_manifest_path(dir: &str, p: u32) -> String {
-    format!("{dir}/part_{p}/manifest.bin")
-}
-
 impl CatalogEngine {
     // -- Partition management (for multi-worker fork) -------------------------
 
@@ -203,23 +183,10 @@ impl CatalogEngine {
     }
 
     /// Read `current_lsn` from a system table by id. Returns 0 for unknown
-    /// ids. Implemented without `&mut self` so recovery callers can hold
-    /// other shared state.
+    /// ids.
+    #[cfg(test)]
     fn sys_table_current_lsn(&self, table_id: i64) -> u64 {
-        let table: &Table = match table_id {
-            SCHEMA_TAB_ID => &self.sys_schemas,
-            TABLE_TAB_ID => &self.sys_tables,
-            VIEW_TAB_ID => &self.sys_views,
-            COL_TAB_ID => &self.sys_columns,
-            IDX_TAB_ID => &self.sys_indices,
-            DEP_TAB_ID => &self.sys_view_deps,
-            SEQ_TAB_ID => &self.sys_sequences,
-            CIRCUIT_NODES_TAB_ID => &self.sys_circuit_nodes,
-            CIRCUIT_EDGES_TAB_ID => &self.sys_circuit_edges,
-            CIRCUIT_NODE_COLUMNS_TAB_ID => &self.sys_circuit_node_columns,
-            _ => return 0,
-        };
-        table.current_lsn()
+        self.sys_table(table_id).map_or(0, |t| t.current_lsn())
     }
 
     /// Build a map of every known table id → max flushed LSN, covering
@@ -227,8 +194,8 @@ impl CatalogEngine {
     /// dedup filter for the unified two-pass walk.
     pub fn collect_all_flushed_lsns(&self) -> std::collections::HashMap<i64, u64> {
         let mut map = std::collections::HashMap::new();
-        for &tid in SYS_TABLE_IDS {
-            map.insert(tid, self.sys_table_current_lsn(tid));
+        for (info, table) in SYS_FAMILIES.iter().zip(&self.sys_stores) {
+            map.insert(info.id, table.current_lsn());
         }
         for (&tid, entry) in self.dag.tables.iter() {
             if tid >= FIRST_USER_TABLE_ID {
@@ -279,7 +246,6 @@ impl CatalogEngine {
             .collect();
 
         // Phase 1: local validity (topology + every output-partition manifest at g).
-        let chunk = NUM_PARTITIONS / launched_workers.max(1);
         let mut invalid: FxHashSet<i64> = FxHashSet::default();
         for &vid in &view_ids {
             let local_ok = topo_valid && {
@@ -290,7 +256,10 @@ impl CatalogEngine {
                     Err(_) => false,
                 };
                 if entry.handle.is_replicated() {
-                    (0..launched_workers).map(|w| w * chunk).all(at_g)
+                    // One child per worker, homed at its range start.
+                    (0..launched_workers)
+                        .map(|w| partition_range(w, launched_workers).0)
+                        .all(at_g)
                 } else {
                     (0..NUM_PARTITIONS).all(at_g)
                 }
@@ -338,8 +307,8 @@ impl CatalogEngine {
     /// zone, and a failed zone's pinned LSN is never reused.
     pub fn max_table_current_lsn(&self) -> u64 {
         let mut max_lsn = 0u64;
-        for &tid in SYS_TABLE_IDS {
-            max_lsn = max_lsn.max(self.sys_table_current_lsn(tid));
+        for table in &self.sys_stores {
+            max_lsn = max_lsn.max(table.current_lsn());
         }
         for entry in self.dag.tables.values() {
             max_lsn = max_lsn.max(entry.handle.current_lsn());

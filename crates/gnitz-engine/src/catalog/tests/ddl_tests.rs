@@ -43,16 +43,16 @@ fn test_bootstrap() {
     assert_eq!(engine.next_table_id, FIRST_USER_TABLE_ID);
     assert_eq!(engine.next_schema_id, FIRST_USER_SCHEMA_ID);
 
-    let schemas_before = count_records(&mut engine.sys_schemas);
-    let tables_before = count_records(&mut engine.sys_tables);
+    let schemas_before = count_records(engine.sys_store_mut(SysFamily::Schema));
+    let tables_before = count_records(engine.sys_store_mut(SysFamily::Table));
 
     engine.close();
     drop(engine); // Release WAL locks before re-open
 
     // Idempotent re-open: bootstrap must not duplicate records
     let mut engine2 = CatalogEngine::open(&dir).unwrap();
-    assert_eq!(count_records(&mut engine2.sys_schemas), schemas_before);
-    assert_eq!(count_records(&mut engine2.sys_tables), tables_before);
+    assert_eq!(count_records(engine2.sys_store_mut(SysFamily::Schema)), schemas_before);
+    assert_eq!(count_records(engine2.sys_store_mut(SysFamily::Table)), tables_before);
     engine2.close();
 
     let _ = fs::remove_dir_all(&dir);
@@ -65,28 +65,28 @@ fn test_ddl() {
     let dir = temp_dir("ddl");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let init_schemas = count_records(&mut engine.sys_schemas);
-    let init_tables = count_records(&mut engine.sys_tables);
-    let init_cols = count_records(&mut engine.sys_columns);
+    let init_schemas = count_records(engine.sys_store_mut(SysFamily::Schema));
+    let init_tables = count_records(engine.sys_store_mut(SysFamily::Table));
+    let init_cols = count_records(engine.sys_store_mut(SysFamily::Column));
 
     // Schema creation
     engine.create_schema("sales").unwrap();
     assert!(engine.has_schema("sales"));
-    assert_eq!(count_records(&mut engine.sys_schemas), init_schemas + 1);
+    assert_eq!(count_records(engine.sys_store_mut(SysFamily::Schema)), init_schemas + 1);
     assert!(engine.create_schema("sales").is_err()); // duplicate
 
     // Table creation
-    let cols = vec![u64_col_def("id"), str_col_def("name")];
+    let cols = vec![col_def("id", type_code::U64), col_def("name", type_code::STRING)];
     let tid = engine.create_table("sales.orders", &cols, &[0], true).unwrap();
     assert!(engine.has_id(tid));
-    assert_eq!(count_records(&mut engine.sys_tables), init_tables + 1);
-    assert_eq!(count_records(&mut engine.sys_columns), init_cols + 2);
+    assert_eq!(count_records(engine.sys_store_mut(SysFamily::Table)), init_tables + 1);
+    assert_eq!(count_records(engine.sys_store_mut(SysFamily::Column)), init_cols + 2);
 
     // Drop table (retractions)
     engine.drop_table("sales.orders").unwrap();
     assert!(!engine.has_id(tid));
-    assert_eq!(count_records(&mut engine.sys_tables), init_tables);
-    assert_eq!(count_records(&mut engine.sys_columns), init_cols);
+    assert_eq!(count_records(engine.sys_store_mut(SysFamily::Table)), init_tables);
+    assert_eq!(count_records(engine.sys_store_mut(SysFamily::Column)), init_cols);
 
     // System table drop should fail (identifier starts with '_')
     assert!(engine.drop_table("_system._columns").is_err());
@@ -106,7 +106,7 @@ fn test_ddl() {
 fn test_edge_cases() {
     let dir = temp_dir("edge_cases");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id")];
+    let cols = vec![col_def("id", type_code::U64)];
 
     // 1. Drop non-existent schema
     assert!(engine.drop_schema("nonexistent").is_err());
@@ -157,7 +157,7 @@ fn test_edge_cases() {
         .is_err());
 
     // 10. Too many columns (> MAX_COLUMNS = 65)
-    let many: Vec<ColumnDef> = (0..66).map(|i| u64_col_def(&format!("c{i}"))).collect();
+    let many: Vec<ColumnDef> = (0..66).map(|i| col_def(&format!("c{i}"), type_code::U64)).collect();
     assert!(engine.create_table("public.too_many", &many, &[0], true).is_err());
 
     // 11. Drop system schema
@@ -186,7 +186,7 @@ fn test_edge_cases() {
     let tid15 = engine
         .create_table(
             "public.u128t",
-            &[u128_col_def("uuid_pk"), str_col_def("data")],
+            &[col_def("uuid_pk", type_code::U128), col_def("data", type_code::STRING)],
             &[0],
             true,
         )
@@ -243,7 +243,9 @@ fn test_nonempty_schema_drop_rejected() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     engine.create_schema("s").unwrap();
-    let tid = engine.create_table("s.t", &[u64_col_def("id")], &[0], true).unwrap();
+    let tid = engine
+        .create_table("s.t", &[col_def("id", type_code::U64)], &[0], true)
+        .unwrap();
     let sid = engine.get_schema_id("s");
     assert!(!engine.schema_is_empty("s"), "precondition: schema has a member");
     assert!(engine.pending_dir_deletions.is_empty(), "precondition: no dir queued");
@@ -281,7 +283,7 @@ fn test_nonempty_schema_drop_rejected() {
 #[test]
 fn test_unique_pk_metadata() {
     let dir = temp_dir("unique_pk_meta");
-    let cols = vec![u64_col_def("id"), str_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::STRING)];
 
     {
         let mut engine = CatalogEngine::open(&dir).unwrap();
@@ -315,7 +317,7 @@ fn test_unique_pk_metadata() {
 #[test]
 fn test_restart_full() {
     let dir = temp_dir("restart_full");
-    let cols = vec![u64_col_def("id"), str_col_def("name")];
+    let cols = vec![col_def("id", type_code::U64), col_def("name", type_code::STRING)];
     let first_tid;
 
     {
@@ -356,7 +358,7 @@ fn test_restart_full() {
 }
 
 /// Regression: verify long strings (> 12 bytes, out-of-line blob) survive
-/// restart via copy_cursor_row_to_batch blob offset rewriting.
+/// restart via the cursor's copy_current_row_into blob offset rewriting.
 #[test]
 fn test_restart_long_strings() {
     let dir = temp_dir("restart_long_str");
@@ -366,7 +368,7 @@ fn test_restart_long_strings() {
     {
         let mut engine = CatalogEngine::open(&dir).unwrap();
         engine.create_schema("longtest").unwrap();
-        let cols = vec![u64_col_def("id"), str_col_def(long_name)];
+        let cols = vec![col_def("id", type_code::U64), col_def(long_name, type_code::STRING)];
         engine.create_table("longtest.tbl", &cols, &[0], true).unwrap();
         engine.close();
         drop(engine);
@@ -390,7 +392,7 @@ fn test_restart_long_strings() {
 fn test_edge_cases_extended() {
     let dir = temp_dir("edge_ext");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id")];
+    let cols = vec![col_def("id", type_code::U64)];
 
     // #16. Multiple dots in qualified name — second part contains dot
     assert!(engine.create_table("public.schema.tbl", &cols, &[0], true).is_err());
@@ -432,7 +434,7 @@ fn test_nullable_pk_rejected() {
             fk_col_idx: 0,
             is_hidden: false,
         },
-        str_col_def("name"),
+        col_def("name", type_code::STRING),
     ];
     let err = engine
         .create_table("public.bad_pk_null", &cols, &[0], true)
@@ -440,7 +442,7 @@ fn test_nullable_pk_rejected() {
     assert!(err.contains("nullable"), "expected nullable-PK error, got: {err}");
 
     // Sanity: same shape with is_nullable=false succeeds.
-    let cols_ok = vec![u64_col_def("id"), str_col_def("name")];
+    let cols_ok = vec![col_def("id", type_code::U64), col_def("name", type_code::STRING)];
     engine.create_table("public.ok_pk", &cols_ok, &[0], true).unwrap();
 
     engine.close();
@@ -461,8 +463,8 @@ fn test_hook_table_register_rejects_malformed_pk() {
 
     // Columns: [c0 U64 non-null, c1 STRING non-null, c2 U64 nullable, c3 F32 non-null].
     let col_defs = vec![
-        u64_col_def("c0"),
-        str_col_def("c1"),
+        col_def("c0", type_code::U64),
+        col_def("c1", type_code::STRING),
         ColumnDef {
             name: "c2".into(),
             type_code: type_code::U64,
@@ -523,7 +525,7 @@ fn test_pk_change_invalidates_col_name_cache() {
     let dir = temp_dir("pk_cache_inval");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("a"), u64_col_def("b")];
+    let cols = vec![col_def("a", type_code::U64), col_def("b", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
 
     // Populate the col-name cache.
@@ -535,18 +537,26 @@ fn test_pk_change_invalidates_col_name_cache() {
         engine.ingest_to_family(TABLE_TAB_ID, &batch).unwrap();
     };
 
+    // Invalidation is observed through the schema version: later hooks in the
+    // same ingest (hook_cascade_fk's read_column_defs) legitimately refill the
+    // cleared caches from fresh storage, so cache-entry absence is not the
+    // invariant — the bump a client's stale version is checked against is.
+    let v0 = engine.caches.get_schema_version(tid);
+
     // Identical retract/reinsert (same PK column 0): no invalidation.
     ingest_pk(&mut engine, pack_pk_cols(&[0]));
-    assert!(
-        engine.caches.col_names.contains_key(&tid),
-        "identical PK reinsert must not invalidate the col-name cache",
+    assert_eq!(
+        engine.caches.get_schema_version(tid),
+        v0,
+        "identical PK reinsert must not bump the schema version",
     );
 
     // PK column changes 0 → 1: invalidation.
     ingest_pk(&mut engine, pack_pk_cols(&[1]));
-    assert!(
-        !engine.caches.col_names.contains_key(&tid),
-        "PK column change must invalidate the col-name cache",
+    assert_ne!(
+        engine.caches.get_schema_version(tid),
+        v0,
+        "PK column change must invalidate (bump the schema version)",
     );
 
     // Drop and recreate with a different PK column; the reconstructed
@@ -572,7 +582,7 @@ fn test_apply_pk_col_of_round_trips_compound_list() {
     // Single-column PK: cache entry equals PkColList::single(idx).
     let single_tid: i64 = 9001;
     let batch_single = build_table_tab_row(&dir, single_tid, pack_pk_cols(&[2]), "t");
-    engine.apply_pk_col_of(TABLE_TAB_ID, &batch_single).unwrap();
+    engine.apply_pk_col_of(TABTAB_PAY_PK_COL_IDX, &batch_single).unwrap();
     assert_eq!(
         engine.caches.pk_col_of.get(&single_tid).copied(),
         Some(PkColList::single(2)),
@@ -582,7 +592,7 @@ fn test_apply_pk_col_of_round_trips_compound_list() {
     for (tid_offset, pk_cols) in [(0i64, vec![0u32, 1]), (1, vec![0u32, 3, 5]), (2, vec![1u32, 2, 7, 11])] {
         let tid: i64 = 9100 + tid_offset;
         let batch = build_table_tab_row(&dir, tid, pack_pk_cols(&pk_cols), "t");
-        engine.apply_pk_col_of(TABLE_TAB_ID, &batch).unwrap();
+        engine.apply_pk_col_of(TABTAB_PAY_PK_COL_IDX, &batch).unwrap();
         let stored = engine
             .caches
             .pk_col_of
@@ -611,13 +621,13 @@ fn test_drop_view_removes_directory() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     // A view needs a base table to reference.
-    let base_cols = vec![u64_col_def("id")];
+    let base_cols = vec![col_def("id", type_code::U64)];
     engine.create_table("public.base", &base_cols, &[0], true).unwrap();
 
     // Register a view via the raw system-table path (create_view was removed).
     // Column records must precede the VIEW_TAB row (hook invariant).
     let vid = engine.next_table_id;
-    let view_cols = vec![u64_col_def("id")];
+    let view_cols = vec![col_def("id", type_code::U64)];
     engine.write_column_records(vid, OWNER_KIND_VIEW, &view_cols).unwrap();
 
     let batch = build_view_tab_row(vid, "myview", "SELECT id FROM base");
@@ -667,17 +677,17 @@ fn test_drop_view_cascades_columns_and_view_deps() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let base_tid = engine
-        .create_table("public.base", &[u64_col_def("id")], &[0], true)
+        .create_table("public.base", &[col_def("id", type_code::U64)], &[0], true)
         .unwrap();
 
     // Baseline: system + base-table column rows; no view-dep rows yet.
-    let base_cols = count_records(&mut engine.sys_columns);
-    let base_deps = count_records(&mut engine.sys_view_deps);
+    let base_cols = count_records(engine.sys_store_mut(SysFamily::Column));
+    let base_deps = count_records(engine.sys_store_mut(SysFamily::ViewDep));
 
     // Register a view (column records precede the VIEW_TAB row) and a
     // dependency row on the base table.
     let vid = engine.next_table_id;
-    let view_cols = vec![u64_col_def("id")];
+    let view_cols = vec![col_def("id", type_code::U64)];
     engine.write_column_records(vid, OWNER_KIND_VIEW, &view_cols).unwrap();
 
     let batch = build_view_tab_row(vid, "depview", "SELECT id FROM base");
@@ -686,11 +696,11 @@ fn test_drop_view_cascades_columns_and_view_deps() {
     engine.write_view_deps(vid, &[base_tid]).unwrap();
 
     assert!(
-        count_records(&mut engine.sys_columns) > base_cols,
+        count_records(engine.sys_store_mut(SysFamily::Column)) > base_cols,
         "view column rows must be present before drop"
     );
     assert!(
-        count_records(&mut engine.sys_view_deps) > base_deps,
+        count_records(engine.sys_store_mut(SysFamily::ViewDep)) > base_deps,
         "view-dep row must be present before drop"
     );
 
@@ -699,12 +709,12 @@ fn test_drop_view_cascades_columns_and_view_deps() {
     engine.drain_pending_dir_deletions();
 
     assert_eq!(
-        count_records(&mut engine.sys_columns),
+        count_records(engine.sys_store_mut(SysFamily::Column)),
         base_cols,
         "sys_columns must return to baseline after drop_view (column cascade)"
     );
     assert_eq!(
-        count_records(&mut engine.sys_view_deps),
+        count_records(engine.sys_store_mut(SysFamily::ViewDep)),
         base_deps,
         "sys_view_deps must return to baseline after drop_view (dep cascade)"
     );
@@ -746,7 +756,7 @@ fn test_view_backfill_chunked_matches_unchunked() {
     let dir = temp_dir("view_backfill_chunked");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), str_col_def("name")];
+    let cols = vec![col_def("id", type_code::U64), col_def("name", type_code::STRING)];
     let tid = engine.create_table("public.base", &cols, &[0], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
 
@@ -811,7 +821,7 @@ fn drop_cascade_broadcasts_children_before_parents() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     // Table with one (non-unique) secondary index.
-    let cols = vec![u64_col_def("id"), i64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
     engine.create_index("public.t", &["val"], false).unwrap();
 
@@ -845,13 +855,13 @@ fn drop_cascade_broadcasts_children_before_parents() {
 }
 
 // ── table_retract_applies_qname_before_id ────────────────────────────
-// Within the SysFamily::Table arm of fire_hooks, apply_entity_by_qname
-// fires BEFORE apply_entity_by_id. That order is load-bearing on retract:
-// apply_entity_by_qname reconstructs the qualified name from entity_by_id
-// (still present) to remove the entity_by_qname entry. Reverse the two and
-// the -1 reads an already-removed entity_by_id, leaks a stale
-// entity_by_qname[qn] → old tid, and the recreate is then rejected by the
-// qname-uniqueness guard (or resolves to the wrong tid).
+// Within apply_entity_caches' retract arm, the qname is removed BEFORE the
+// entity_by_id entry. That order is load-bearing: the qualified name is
+// reconstructed from entity_by_id (still present) to remove the
+// entity_by_qname entry. Reverse the two and the -1 reads an
+// already-removed entity_by_id, leaks a stale entity_by_qname[qn] → old
+// tid, and the recreate is then rejected by the qname-uniqueness guard (or
+// resolves to the wrong tid).
 //
 // End-state cache assertions on a single create/drop miss this: both orders
 // leave the same caches. The teeth show only across a drop + same-name
@@ -861,7 +871,7 @@ fn table_retract_applies_qname_before_id() {
     let dir = temp_dir("table_retract_qname_before_id");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), i64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
 
     // Create, then drop, a table named `public.t`.
     let tid1 = engine.create_table("public.t", &cols, &[0], true).unwrap();

@@ -22,18 +22,24 @@ pub struct CachedSchemaWire {
 impl CatalogEngine {
     // -- FK / index metadata queries (for distributed validation) -------------
 
-    /// Number of FK constraints on a table.
-    pub fn get_fk_count(&self, table_id: i64) -> usize {
-        self.caches.fk_by_child.get(&table_id).map(|v| v.len()).unwrap_or(0)
-    }
-
-    /// Get FK constraint at index: (fk_col_idx, target_table_id, target_col_idx).
-    pub fn get_fk_constraint(&self, table_id: i64, idx: usize) -> Option<(usize, i64, usize)> {
+    /// All FK constraints on child table `table_id` (empty when none).
+    pub(crate) fn fk_constraints_of(&self, table_id: i64) -> &[FkConstraint] {
         self.caches
             .fk_by_child
             .get(&table_id)
-            .and_then(|v| v.get(idx))
-            .map(|c| (c.fk_col_idx, c.target_table_id, c.target_col_idx))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// All index circuits on a table (empty when none) — the one-pass
+    /// accessor for consumers that walk every circuit (e.g. the master's
+    /// unique-filter descriptors).
+    pub(crate) fn index_circuits(&self, table_id: i64) -> &[crate::query::IndexCircuitEntry] {
+        self.dag
+            .tables
+            .get(&table_id)
+            .map(|e| e.index_circuits.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Number of index circuits on a table.
@@ -67,10 +73,7 @@ impl CatalogEngine {
     /// Get index store handle for an exact column list (for worker has_pk via
     /// a unique index, single- or multi-column).
     pub(crate) fn get_index_store_handle(&self, table_id: i64, cols: &[u32]) -> *const Table {
-        self.dag
-            .tables
-            .get(&table_id)
-            .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_indices.as_slice() == cols))
+        self.index_circuit_for_cols(table_id, cols)
             .map(|ic| ic.table_mut() as *const Table)
             .unwrap_or(std::ptr::null())
     }
@@ -82,11 +85,6 @@ impl CatalogEngine {
             .get(&table_id)
             .and_then(|e| e.index_circuits.get(idx))
             .map(|ic| ic.index_schema)
-    }
-
-    /// Number of child tables that reference `parent_id` via FK.
-    pub fn get_fk_children_count(&self, parent_id: i64) -> usize {
-        self.caches.fk_by_parent.get(&parent_id).map(|v| v.len()).unwrap_or(0)
     }
 
     /// The secondary index circuit on `col_idx` of `table_id`, if one exists.
@@ -122,41 +120,21 @@ impl CatalogEngine {
         self.dag.tables.get(&table_id).map(|e| e.unique_pk()).unwrap_or(false)
     }
 
-    /// Get child info at index: (child_table_id, fk_col_idx, parent_col_idx).
-    pub fn get_fk_child_info(&self, parent_id: i64, idx: usize) -> Option<(i64, usize, usize)> {
-        self.caches
-            .fk_by_parent
-            .get(&parent_id)
-            .and_then(|v| v.get(idx))
-            .map(|r| (r.child_tid, r.fk_col_idx, r.parent_col_idx))
-    }
-
     /// Get the index schema for a specific column list's index on a table.
     pub fn get_index_schema_by_cols(&self, table_id: i64, cols: &[u32]) -> Option<SchemaDescriptor> {
-        self.dag
-            .tables
-            .get(&table_id)
-            .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_indices.as_slice() == cols))
-            .map(|ic| ic.index_schema)
+        self.index_circuit_for_cols(table_id, cols).map(|ic| ic.index_schema)
     }
 
     /// Get column names for a table/view. Cached after first lookup; the same
-    /// COL_TAB read fills the hidden-column bitmask cache.
-    pub fn get_column_names(&mut self, table_id: i64) -> Vec<String> {
+    /// COL_TAB read fills the column-def and hidden-column-bitmask caches.
+    /// Returns an `Rc` snapshot — callers routinely touch the catalog while
+    /// holding it, so a borrow would not do.
+    pub fn get_column_names(&mut self, table_id: i64) -> Rc<Vec<String>> {
         if let Some(names) = self.caches.col_names.get(&table_id) {
             return names.clone();
         }
-        let defs = self.read_column_defs(table_id);
-        let mut hidden: u128 = 0;
-        for (i, cd) in defs.iter().enumerate() {
-            if cd.is_hidden {
-                hidden |= 1 << i;
-            }
-        }
-        self.caches.col_hidden.insert(table_id, hidden);
-        let names: Vec<String> = defs.into_iter().map(|cd| cd.name).collect();
-        self.caches.col_names.insert(table_id, names.clone());
-        names
+        self.fill_column_caches(table_id);
+        self.caches.col_names.get(&table_id).expect("just filled").clone()
     }
 
     /// Hidden-column bitmask for a table/view (bit N ⇔ column N is a hidden key
@@ -165,19 +143,17 @@ impl CatalogEngine {
         if let Some(&mask) = self.caches.col_hidden.get(&table_id) {
             return mask;
         }
-        self.get_column_names(table_id);
+        self.fill_column_caches(table_id);
         self.caches.col_hidden.get(&table_id).copied().unwrap_or(0)
     }
 
-    /// Get column names as byte vectors. Backed by col_names cache; lazy-populated.
+    /// Get column names as byte vectors. Backed by the column caches; lazy-populated.
     pub fn get_col_names_bytes(&mut self, table_id: i64) -> Rc<Vec<Vec<u8>>> {
         if let Some(bytes) = self.caches.col_names_bytes.get(&table_id) {
             return bytes.clone();
         }
-        let names = self.get_column_names(table_id);
-        let bytes = Rc::new(names.iter().map(|n| n.as_bytes().to_vec()).collect::<Vec<_>>());
-        self.caches.col_names_bytes.insert(table_id, bytes.clone());
-        bytes
+        self.fill_column_caches(table_id);
+        self.caches.col_names_bytes.get(&table_id).expect("just filled").clone()
     }
 
     /// Return the cached encoded schema wire block, current schema version,
@@ -185,13 +161,12 @@ impl CatalogEngine {
     /// for `table_id`, or `None` if the block isn't yet cached. Wire props
     /// are paired with the block so they share invalidation.
     pub fn get_cached_schema_wire_block(&self, table_id: i64) -> Option<CachedSchemaWire> {
-        let (block, wire_safe, wire_row_fixed_stride) = self.caches.schema_wire_cache.get(&table_id)?.clone();
-        let version = self.caches.get_schema_version(table_id);
+        let entry = self.caches.schema_wire_cache.get(&table_id)?;
         Some(CachedSchemaWire {
-            block,
-            version,
-            wire_safe,
-            wire_row_fixed_stride,
+            block: entry.block.clone(),
+            version: self.caches.get_schema_version(table_id),
+            wire_safe: entry.wire_safe,
+            wire_row_fixed_stride: entry.wire_row_fixed_stride,
         })
     }
 
@@ -206,8 +181,8 @@ impl CatalogEngine {
     }
 
     /// Store an encoded schema wire block in the cache, along with its
-    /// derived wire properties. The two are written together so the
-    /// invalidation in `clear_col_cache_no_bump` keeps them consistent.
+    /// derived wire properties. Written together so the invalidation in
+    /// `clear_col_cache_no_bump` keeps them consistent.
     pub fn set_schema_wire_block(
         &mut self,
         table_id: i64,
@@ -215,35 +190,29 @@ impl CatalogEngine {
         wire_safe: bool,
         wire_row_fixed_stride: u32,
     ) {
-        self.caches
-            .schema_wire_cache
-            .insert(table_id, (block, wire_safe, wire_row_fixed_stride));
+        self.caches.schema_wire_cache.insert(
+            table_id,
+            crate::catalog::cache::SchemaWireEntry {
+                block,
+                wire_safe,
+                wire_row_fixed_stride,
+            },
+        );
     }
 
-    /// Return the full set of table IDs that must be locked together for a
-    /// write to `table_id`, sorted ascending to guarantee deadlock-free
-    /// acquisition. Includes `table_id` itself plus all FK parents (to
-    /// guard concurrent parent DELETE) and FK children (to guard concurrent
-    /// child INSERT during a parent DELETE). Returns an empty vec if this
-    /// table requires no lock at all.
-    pub fn fk_lock_set(&self, table_id: i64) -> Vec<i64> {
-        if !self.caches.needs_lock.contains(&table_id) {
-            return Vec::new();
-        }
-        let mut tids = vec![table_id];
-        if let Some(constraints) = self.caches.fk_by_child.get(&table_id) {
-            for c in constraints {
-                tids.push(c.target_table_id);
-            }
-        }
-        if let Some(children) = self.caches.fk_by_parent.get(&table_id) {
-            for r in children {
-                tids.push(r.child_tid);
-            }
-        }
-        tids.sort_unstable();
-        tids.dedup();
-        tids
+    /// The full set of table IDs that must be locked together for a write to
+    /// `table_id`, sorted ascending to guarantee deadlock-free acquisition:
+    /// `table_id` itself plus all FK parents (to guard concurrent parent
+    /// DELETE) and FK children (to guard concurrent child INSERT during a
+    /// parent DELETE). Empty if this table requires no lock at all.
+    /// Materialized at DDL time by `recompute_needs_lock`; the borrow is
+    /// sound on the push path because the caller holds the push read lock.
+    pub fn fk_lock_set(&self, table_id: i64) -> &[i64] {
+        self.caches
+            .needs_lock
+            .get(&table_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     // -- Store handle accessors -----------------------------------------------
@@ -262,13 +231,12 @@ impl CatalogEngine {
             .and_then(|e| e.handle.as_partitioned_mut())
     }
 
-    /// Get schema descriptor for a table.
+    /// Get schema descriptor for a table. Registry-uniform: system tables are
+    /// pre-registered before any caller can run, and an unknown id in the
+    /// system range (the 8-10 gap) resolves to a graceful `None` instead of a
+    /// panic.
     pub fn get_schema_desc(&self, table_id: i64) -> Option<SchemaDescriptor> {
-        if table_id > 0 && table_id < FIRST_USER_TABLE_ID {
-            Some(sys_tab_schema(table_id))
-        } else {
-            self.dag.tables.get(&table_id).map(|e| e.schema)
-        }
+        self.dag.tables.get(&table_id).map(|e| e.schema)
     }
 
     /// The on-disk directory of a user table (`{base_dir}/{schema}/{name}_{tid}`),

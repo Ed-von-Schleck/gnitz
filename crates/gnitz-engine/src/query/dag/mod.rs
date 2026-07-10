@@ -59,6 +59,12 @@ pub struct IndexCircuitEntry {
     pub index_id: i64,
     pub index_table: UnsafeCell<Box<Table>>,
     pub index_schema: SchemaDescriptor,
+    /// Full-arity span-encode plan, precomputed at registration (owner and
+    /// index schemas are immutable post-registration — no ALTER exists) so the
+    /// per-push consumers do no per-call spec rebuild. Deliberately does NOT
+    /// bake in `is_unique` (live promotion/demotion via
+    /// `set_index_circuit_uniqueness`); consumers filter on the live flag.
+    pub key_spec: crate::schema::IndexKeySpec,
     pub is_unique: bool,
 }
 
@@ -397,6 +403,7 @@ impl DagEngine {
                 index_id,
                 index_table: UnsafeCell::new(index_table),
                 index_schema,
+                key_spec: crate::schema::IndexKeySpec::new(col_indices, &entry.schema, &index_schema),
                 is_unique,
             });
         }
@@ -1094,7 +1101,7 @@ impl DagEngine {
         let index_batches: Vec<Batch> = entry
             .index_circuits
             .iter()
-            .map(|ic| Self::batch_project_index(source, ic.col_indices.as_slice(), schema, &ic.index_schema))
+            .map(|ic| Self::batch_project_index(source, &ic.key_spec, schema, &ic.index_schema))
             .collect();
 
         if let Err(e) = inject_ingest_apply_error("store", entry.handle.ingest_borrowed_batch(source)) {
@@ -2026,7 +2033,7 @@ impl DagEngine {
     /// by each source PK column laid out contiguously after it.
     pub(crate) fn batch_project_index(
         src: &Batch,
-        source_col_indices: &[u32],
+        spec: &crate::schema::IndexKeySpec,
         src_schema: &SchemaDescriptor,
         idx_schema: &SchemaDescriptor,
     ) -> Batch {
@@ -2044,10 +2051,9 @@ impl DagEngine {
 
         let mb = src.as_mem_batch();
 
-        // Per-column read/encode plan, hoisted once per call (this runs once
-        // per index circuit on every base-table push) so the row loop does no
+        // `spec` is the per-column read/encode plan — the registered circuit's
+        // precomputed `key_spec` on the per-push path — so the row loop does no
         // per-column method call or schema indexing.
-        let spec = crate::schema::IndexKeySpec::new(source_col_indices, src_schema, idx_schema);
         let idx_key_size = spec.key_size();
 
         for row in 0..src.count {
@@ -2222,7 +2228,12 @@ mod tests {
     #[test]
     fn test_add_remove_index_circuit() {
         let mut dag = DagEngine::new();
-        let schema = SchemaDescriptor::default();
+        // A real 3-column owner schema: registration precomputes the circuit's
+        // `key_spec` from it, which locates indexed column 2.
+        let schema = SchemaDescriptor::new(
+            &[crate::schema::SchemaColumn::new(crate::schema::type_code::U64, 0); 3],
+            &[0],
+        );
         let mut tbl = make_test_table("idx_parent");
         dag.register_table(
             50,
@@ -2268,7 +2279,12 @@ mod tests {
     #[test]
     fn test_flush_includes_index_circuits() {
         let mut dag = DagEngine::new();
-        let parent_schema = SchemaDescriptor::default();
+        // A real 2-column owner schema: registration precomputes the circuit's
+        // `key_spec` from it, which locates indexed column 1.
+        let parent_schema = SchemaDescriptor::new(
+            &[crate::schema::SchemaColumn::new(crate::schema::type_code::U64, 0); 2],
+            &[0],
+        );
         let mut tbl = make_test_table("flush_ic_parent");
         dag.register_table(
             70,

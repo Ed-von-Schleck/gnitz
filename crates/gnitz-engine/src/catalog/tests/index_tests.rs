@@ -8,7 +8,7 @@ fn test_index_creation_and_backfill() {
     let dir = temp_dir("index_backfill");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), i64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.tfanout", &cols, &[0], true).unwrap();
 
     // Ingest 5 rows
@@ -42,7 +42,7 @@ fn test_index_live_fanout() {
     let dir = temp_dir("idx_fanout");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), i64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.tfanout", &cols, &[0], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
 
@@ -85,7 +85,7 @@ fn test_system_table_flush_compacts_l0() {
     // assert the shard count stays bounded.
     let dir = temp_dir("sys_compact_l0");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let schema = idx_tab_schema();
+    let schema = SysFamily::Index.schema();
     let flushes = 40u64;
     for i in 0..flushes {
         let mut bb = BatchBuilder::new(schema);
@@ -97,10 +97,13 @@ fn test_system_table_flush_compacts_l0() {
         bb.put_u64(0); // is_unique
         bb.put_string(""); // cache_directory
         bb.end_row();
-        engine.sys_indices.ingest_borrowed_batch(&bb.finish()).unwrap();
+        engine
+            .sys_store_mut(SysFamily::Index)
+            .ingest_borrowed_batch(&bb.finish())
+            .unwrap();
         engine.flush_family(IDX_TAB_ID).unwrap();
     }
-    let shards = engine.sys_indices.all_shard_arcs().len();
+    let shards = engine.sys_store_mut(SysFamily::Index).all_shard_arcs().len();
     assert!(
         (shards as u64) < flushes / 2,
         "system catalog L0 must be compacted: {shards} shards after {flushes} flushes"
@@ -115,7 +118,7 @@ fn test_create_index_duplicate_rejected() {
     // than silently orphaning the first index circuit.
     let dir = temp_dir("idx_dup_create");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), i64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     engine.create_table("public.t", &cols, &[0], true).unwrap();
 
     let first = engine.create_index("public.t", &["val"], false);
@@ -140,7 +143,7 @@ fn test_unique_index_failure_no_broadcast_poisoning() {
     // failed before enqueue), so a broadcast −1 would orphan a row on workers.
     let dir = temp_dir("idx_broadcast_poison");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
 
@@ -192,7 +195,7 @@ fn test_unique_index_failure_no_broadcast_poisoning() {
 fn test_validate_unique_indices_duplicate_value() {
     let dir = temp_dir("catalog_uidx_dup");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["val"], true).unwrap(); // unique index on val
     let schema = engine.get_schema(tid).unwrap();
@@ -230,7 +233,7 @@ fn test_validate_unique_indices_duplicate_value() {
 fn test_validate_unique_indices_duplicate_after_backfill_all_rebuild() {
     let dir = temp_dir("catalog_uidx_dup_after_rebuild");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["val"], true).unwrap(); // unique index on val
     let schema = engine.get_schema(tid).unwrap();
@@ -263,7 +266,7 @@ fn test_validate_unique_indices_duplicate_after_backfill_all_rebuild() {
 fn test_validate_unique_indices_batch_internal_dup() {
     let dir = temp_dir("catalog_uidx_batch_dup");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["val"], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -291,7 +294,7 @@ fn test_validate_unique_indices_weight2_row_is_batch_dup() {
     // violation as two +1 rows of the value, which the in-batch check rejects.
     let dir = temp_dir("catalog_uidx_weight2");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["val"], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -322,7 +325,7 @@ fn test_validate_unique_indices_weight2_row_is_batch_dup() {
 fn test_validate_unique_indices_upsert_same_value_ok() {
     let dir = temp_dir("catalog_uidx_upsert_same");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap(); // unique_pk
     engine.create_index("public.t", &["val"], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -351,7 +354,7 @@ fn test_validate_unique_indices_upsert_same_value_ok() {
 fn test_validate_unique_indices_upsert_to_existing_value_fails() {
     let dir = temp_dir("catalog_uidx_upsert_conflict");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap(); // unique_pk
     engine.create_index("public.t", &["val"], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -384,7 +387,7 @@ fn test_validate_unique_indices_upsert_to_existing_value_fails() {
 fn test_validate_unique_indices_distinct_values_ok() {
     let dir = temp_dir("catalog_uidx_distinct");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["val"], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -422,7 +425,7 @@ fn test_validate_unique_indices_distinct_values_ok() {
 fn test_validate_unique_transfer_accepted() {
     let dir = temp_dir("catalog_uidx_transfer");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap(); // non-unique_pk
     engine.create_index("public.t", &["val"], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -454,7 +457,7 @@ fn test_validate_unique_transfer_accepted() {
 fn test_validate_unique_swap_accepted() {
     let dir = temp_dir("catalog_uidx_swap");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap(); // unique_pk
     engine.create_index("public.t", &["val"], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -495,7 +498,7 @@ fn test_validate_unique_swap_accepted() {
 fn test_validate_unique_bulk_shift_accepted() {
     let dir = temp_dir("catalog_uidx_bulk_shift");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap(); // unique_pk
     engine.create_index("public.t", &["val"], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -537,7 +540,7 @@ fn test_validate_unique_bulk_shift_accepted() {
 fn test_validate_unique_bulk_swap_accepted() {
     let dir = temp_dir("catalog_uidx_bulk_swap");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap(); // unique_pk
     engine.create_index("public.t", &["val"], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -572,7 +575,7 @@ fn test_validate_unique_bulk_swap_accepted() {
 fn test_validate_unique_genuine_duplicate_rejected() {
     let dir = temp_dir("catalog_uidx_genuine_dup");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["val"], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -602,7 +605,7 @@ fn test_validate_unique_genuine_duplicate_rejected() {
 fn test_validate_unique_holder_touched_value_not_retracted_rejected() {
     let dir = temp_dir("catalog_uidx_holder_touched");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap(); // non-unique_pk
     engine.create_index("public.t", &["val"], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -636,7 +639,7 @@ fn test_validate_unique_holder_touched_value_not_retracted_rejected() {
 fn test_validate_unique_forged_retraction_rejected() {
     let dir = temp_dir("catalog_uidx_forged_retraction");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["val"], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -671,7 +674,7 @@ fn test_validate_unique_forged_retraction_rejected() {
 fn test_validate_unique_forged_retraction_freed_by_upserted_holder_rejected() {
     let dir = temp_dir("catalog_uidx_forged_upserted");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap(); // unique_pk
     engine.create_index("public.t", &["val"], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -710,7 +713,7 @@ fn test_validate_unique_forged_retraction_freed_by_upserted_holder_rejected() {
 fn test_validate_unique_net_zero_pk_not_upsert_rejected() {
     let dir = temp_dir("catalog_uidx_net_zero");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap(); // unique_pk
     engine.create_index("public.t", &["val"], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -751,7 +754,7 @@ fn test_validate_unique_net_zero_pk_not_upsert_rejected() {
 fn test_validate_unique_two_insert_same_value_rejected_despite_retraction() {
     let dir = temp_dir("catalog_uidx_two_insert_dup");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["val"], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -782,7 +785,7 @@ fn test_validate_unique_two_insert_same_value_rejected_despite_retraction() {
 fn test_seek_by_index_found() {
     let dir = temp_dir("catalog_seekidx_found");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["val"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -815,7 +818,7 @@ fn test_seek_by_index_found() {
 fn test_seek_by_index_not_found() {
     let dir = temp_dir("catalog_seekidx_miss");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["val"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -841,7 +844,7 @@ fn test_seek_by_index_not_found() {
 fn test_seek_by_index_negative_i64() {
     let dir = temp_dir("catalog_seekidx_neg_i64");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), i64_col_def("score")];
+    let cols = vec![col_def("id", type_code::U64), col_def("score", type_code::I64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["score"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -887,7 +890,7 @@ fn test_seek_by_index_negative_i64() {
 fn test_seek_by_index_negative_i32() {
     let dir = temp_dir("catalog_seekidx_neg_i32");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), i32_col_def("score")];
+    let cols = vec![col_def("id", type_code::U64), col_def("score", type_code::I32)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["score"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -930,7 +933,7 @@ fn test_seek_by_index_negative_i32() {
 fn test_seek_by_index_u8_column() {
     let dir = temp_dir("catalog_seekidx_u8");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u8_col_def("tag")];
+    let cols = vec![col_def("id", type_code::U64), col_def("tag", type_code::U8)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["tag"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -961,7 +964,7 @@ fn test_seek_by_index_u8_column() {
 fn test_seek_by_index_u16_column() {
     let dir = temp_dir("catalog_seekidx_u16");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u16_col_def("port")];
+    let cols = vec![col_def("id", type_code::U64), col_def("port", type_code::U16)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["port"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -1033,7 +1036,7 @@ fn test_drop_table_cleans_up_indices() {
     let dir = temp_dir("drop_table_idx");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("pk"), i64_col_def("val")];
+    let cols = vec![col_def("pk", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.idx_tbl", &cols, &[0], true).unwrap();
     engine.create_index("public.idx_tbl", &["val"], true).unwrap();
 
@@ -1063,13 +1066,13 @@ fn test_drop_table_cascades_secondary_index() {
     let dir = temp_dir("drop_table_cascade_sec");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("pk"), i64_col_def("val")];
+    let cols = vec![col_def("pk", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.cascade_tbl", &cols, &[0], true).unwrap();
     engine.create_index("public.cascade_tbl", &["val"], false).unwrap();
 
     let idx_name = make_secondary_index_name("public", "cascade_tbl", "val");
     assert!(engine.caches.index_by_name.contains_key(idx_name.as_str()));
-    let idx_records_before = count_records(&mut engine.sys_indices);
+    let idx_records_before = count_records(engine.sys_store_mut(SysFamily::Index));
     assert!(idx_records_before >= 1);
 
     // Drop the table WITHOUT dropping the index first.
@@ -1081,7 +1084,7 @@ fn test_drop_table_cascades_secondary_index() {
     );
     assert!(!engine.dag.tables.contains_key(&tid));
     assert_eq!(
-        count_records(&mut engine.sys_indices),
+        count_records(engine.sys_store_mut(SysFamily::Index)),
         idx_records_before - 1,
         "sys_indices must retract exactly one record"
     );
@@ -1101,11 +1104,11 @@ fn test_drop_table_cascades_fk_index() {
     let dir = temp_dir("drop_table_cascade_fk");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let parent_cols = vec![u64_col_def("pk"), u64_col_def("name")];
+    let parent_cols = vec![col_def("pk", type_code::U64), col_def("name", type_code::U64)];
     let parent_tid = engine.create_table("public.parent", &parent_cols, &[0], true).unwrap();
 
     let child_cols = vec![
-        u64_col_def("pk"),
+        col_def("pk", type_code::U64),
         ColumnDef {
             name: "parent_ref".into(),
             type_code: type_code::U64,
@@ -1152,7 +1155,11 @@ fn test_drop_table_cascades_multiple_indices() {
     let dir = temp_dir("cascade_multi_idx");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), i64_col_def("val1"), i64_col_def("val2")];
+    let cols = vec![
+        col_def("id", type_code::U64),
+        col_def("val1", type_code::I64),
+        col_def("val2", type_code::I64),
+    ];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
 
     let idx1 = engine.create_index("public.t", &["val1"], false).unwrap();
@@ -1167,7 +1174,7 @@ fn test_drop_table_cascades_multiple_indices() {
     assert!(engine.caches.index_by_id.contains_key(&idx1));
     assert!(engine.caches.index_by_id.contains_key(&idx2));
 
-    let idx_count_before = count_records(&mut engine.sys_indices);
+    let idx_count_before = count_records(engine.sys_store_mut(SysFamily::Index));
     assert!(idx_count_before >= 2);
 
     // Drop the table — cascade must retract both indices
@@ -1192,7 +1199,7 @@ fn test_drop_table_cascades_multiple_indices() {
         "indices_by_owner for dropped table must be empty"
     );
     assert_eq!(
-        count_records(&mut engine.sys_indices),
+        count_records(engine.sys_store_mut(SysFamily::Index)),
         idx_count_before - 2,
         "sys_indices must retract exactly two records"
     );
@@ -1246,7 +1253,7 @@ fn test_compound_pk_secondary_index_seek() {
             fk_col_idx: 0,
             is_hidden: false,
         },
-        u64_col_def("val"),
+        col_def("val", type_code::U64),
     ];
     let tid = engine.create_table("public.cpk_t", &cols, &[0, 1], false).unwrap();
     engine.create_index("public.cpk_t", &["val"], false).unwrap();
@@ -1312,7 +1319,7 @@ fn test_compound_pk_secondary_index_retract() {
             fk_col_idx: 0,
             is_hidden: false,
         },
-        u64_col_def("val"),
+        col_def("val", type_code::U64),
     ];
     let tid = engine.create_table("public.cpk_r", &cols, &[0, 1], true).unwrap();
     engine.create_index("public.cpk_r", &["val"], false).unwrap();
@@ -1356,7 +1363,7 @@ fn test_create_unique_index_duplicate_rolls_back_cleanly() {
     let dir = temp_dir("unique_idx_rollback");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
 
@@ -1372,7 +1379,7 @@ fn test_create_unique_index_duplicate_rolls_back_cleanly() {
     engine.flush_family(tid).unwrap();
 
     let idx_name = make_secondary_index_name("public", "t", "val");
-    let idx_records_before = count_records(&mut engine.sys_indices);
+    let idx_records_before = count_records(engine.sys_store_mut(SysFamily::Index));
 
     // Attempt should fail because of duplicate values.
     let result = engine.create_index("public.t", &["val"], true);
@@ -1397,7 +1404,7 @@ fn test_create_unique_index_duplicate_rolls_back_cleanly() {
         "DAG must not retain a half-built index circuit"
     );
     assert_eq!(
-        count_records(&mut engine.sys_indices),
+        count_records(engine.sys_store_mut(SysFamily::Index)),
         idx_records_before,
         "sys_indices must net out to zero after rollback"
     );
@@ -1422,7 +1429,7 @@ fn test_seek_by_index_orphan_entry_terminates() {
     let dir = temp_dir("seek_by_index_orphan");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.orphan_t", &cols, &[0], false).unwrap();
     engine.create_index("public.orphan_t", &["val"], false).unwrap();
 
@@ -1476,7 +1483,7 @@ fn test_seek_by_index_orphan_entry_terminates() {
 fn index_version_bumps_on_create_and_drop_index() {
     let dir = temp_dir("index_version_create_drop");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), i64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
 
     // No index DDL yet → the base epoch (absent ⇒ 1), never 0.
@@ -1505,7 +1512,7 @@ fn index_version_bumps_on_create_and_drop_index() {
 fn index_version_bumps_on_unique_index() {
     let dir = temp_dir("index_version_unique");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     assert_eq!(engine.get_index_version(tid), 1);
     engine.create_index("public.t", &["val"], true).unwrap(); // UNIQUE
@@ -1523,10 +1530,10 @@ fn index_version_bumps_on_fk_auto_index() {
     // bump the child's epoch just like an explicit CREATE INDEX.
     let dir = temp_dir("index_version_fk_auto");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let parent_cols = vec![u64_col_def("pk"), u64_col_def("name")];
+    let parent_cols = vec![col_def("pk", type_code::U64), col_def("name", type_code::U64)];
     let parent_tid = engine.create_table("public.parent", &parent_cols, &[0], true).unwrap();
     let child_cols = vec![
-        u64_col_def("pk"),
+        col_def("pk", type_code::U64),
         ColumnDef {
             name: "parent_ref".into(),
             type_code: type_code::U64,
@@ -1550,13 +1557,13 @@ fn drop_table_purges_both_version_counters() {
     // Regression for the post-cascade purge. Dropping a table must remove BOTH
     // its index_version and schema_version entries. The drop cascade re-ingests
     // IDX_TAB / COL_TAB retractions whose appliers `or_insert` the counters
-    // straight back, so a removal in apply_entity_by_id (which fires *before*
+    // straight back, so a removal in apply_entity_caches (which fires *before*
     // the cascade) is immediately undone — leaking memory for a tid that is
     // never reused. The purge runs at the tail of the drop hook, after the
     // cascade, so both must end up absent.
     let dir = temp_dir("drop_purges_versions");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), i64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
     engine.create_index("public.t", &["val"], false).unwrap();
 
@@ -1598,7 +1605,11 @@ fn test_create_unique_index_on_string_blob_rejected() {
         fk_col_idx: 0,
         is_hidden: false,
     };
-    let cols = vec![u64_col_def("id"), str_col_def("name"), blob_col];
+    let cols = vec![
+        col_def("id", type_code::U64),
+        col_def("name", type_code::STRING),
+        blob_col,
+    ];
     engine.create_table("public.t", &cols, &[0], false).unwrap();
 
     // UNIQUE on STRING/BLOB hits the dedicated unique-index guard first, which
@@ -1664,9 +1675,9 @@ fn test_promote_unique_index_over_fk_column_empty() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let parent_tid = engine
-        .create_table("public.parent", &[u64_col_def("id")], &[0], true)
+        .create_table("public.parent", &[col_def("id", type_code::U64)], &[0], true)
         .unwrap();
-    let child_cols = vec![u64_col_def("cid"), fk_col_def("refc", parent_tid, 0)];
+    let child_cols = vec![col_def("cid", type_code::U64), fk_col_def("refc", parent_tid, 0)];
     let child_tid = engine.create_table("public.child", &child_cols, &[0], true).unwrap();
 
     // FK auto-index registered (non-unique) on col 1 at create time.
@@ -1707,9 +1718,9 @@ fn test_unique_index_over_fk_column_distinct_data_promotes() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let parent_tid = engine
-        .create_table("public.parent", &[u64_col_def("id")], &[0], true)
+        .create_table("public.parent", &[col_def("id", type_code::U64)], &[0], true)
         .unwrap();
-    let child_cols = vec![u64_col_def("cid"), fk_col_def("refc", parent_tid, 0)];
+    let child_cols = vec![col_def("cid", type_code::U64), fk_col_def("refc", parent_tid, 0)];
     let child_tid = engine.create_table("public.child", &child_cols, &[0], true).unwrap();
 
     // Seed DISTINCT refc values (ingest_to_family bypasses FK validation).
@@ -1740,9 +1751,9 @@ fn test_unique_index_over_fk_column_duplicate_data_rejected() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let parent_tid = engine
-        .create_table("public.parent", &[u64_col_def("id")], &[0], true)
+        .create_table("public.parent", &[col_def("id", type_code::U64)], &[0], true)
         .unwrap();
-    let child_cols = vec![u64_col_def("cid"), fk_col_def("refc", parent_tid, 0)];
+    let child_cols = vec![col_def("cid", type_code::U64), fk_col_def("refc", parent_tid, 0)];
     let child_tid = engine.create_table("public.child", &child_cols, &[0], true).unwrap();
 
     // Seed DUPLICATE refc values.
@@ -1757,11 +1768,11 @@ fn test_unique_index_over_fk_column_duplicate_data_rejected() {
     engine.ingest_to_family(child_tid, &bb.finish()).unwrap();
     engine.flush_family(child_tid).unwrap();
 
-    let before = count_records(&mut engine.sys_indices);
+    let before = count_records(engine.sys_store_mut(SysFamily::Index));
     let r = engine.create_index("public.child", &["refc"], true);
     assert!(r.is_err(), "unique index over duplicate FK data must fail");
     assert_eq!(
-        count_records(&mut engine.sys_indices),
+        count_records(engine.sys_store_mut(SysFamily::Index)),
         before,
         "the failed unique index row must net out of sys_indices"
     );
@@ -1780,9 +1791,9 @@ fn test_drop_unique_index_on_fk_column_demotes() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let parent_tid = engine
-        .create_table("public.parent", &[u64_col_def("id")], &[0], true)
+        .create_table("public.parent", &[col_def("id", type_code::U64)], &[0], true)
         .unwrap();
-    let child_cols = vec![u64_col_def("cid"), fk_col_def("refc", parent_tid, 0)];
+    let child_cols = vec![col_def("cid", type_code::U64), fk_col_def("refc", parent_tid, 0)];
     let child_tid = engine.create_table("public.child", &child_cols, &[0], true).unwrap();
 
     engine.create_index("public.child", &["refc"], true).unwrap();
@@ -1818,9 +1829,9 @@ fn test_drop_unique_index_on_fk_column_keeps_shared_directory() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let parent_tid = engine
-        .create_table("public.parent", &[u64_col_def("id")], &[0], true)
+        .create_table("public.parent", &[col_def("id", type_code::U64)], &[0], true)
         .unwrap();
-    let child_cols = vec![u64_col_def("cid"), fk_col_def("refc", parent_tid, 0)];
+    let child_cols = vec![col_def("cid", type_code::U64), fk_col_def("refc", parent_tid, 0)];
     let child_tid = engine.create_table("public.child", &child_cols, &[0], true).unwrap();
     engine.create_index("public.child", &["refc"], true).unwrap();
 
@@ -1858,7 +1869,7 @@ fn test_failed_create_index_leaves_no_directory() {
     let dir = temp_dir("failed_create_index_dir");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
@@ -1891,9 +1902,9 @@ fn test_drop_index_permitted_on_lone_pk_target() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let parent_tid = engine
-        .create_table("public.parent", &[u64_col_def("id")], &[0], true)
+        .create_table("public.parent", &[col_def("id", type_code::U64)], &[0], true)
         .unwrap();
-    let child_cols = vec![u64_col_def("cid"), fk_col_def("p", parent_tid, 0)];
+    let child_cols = vec![col_def("cid", type_code::U64), fk_col_def("p", parent_tid, 0)];
     engine.create_table("public.child", &child_cols, &[0], true).unwrap();
 
     // Redundant unique index on the parent's lone PK column.
@@ -1915,12 +1926,12 @@ fn test_drop_unique_index_on_non_pk_fk_target_blocked() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     // Parent (id PK, email) with a UNIQUE index on the non-PK `email` column.
-    let parent_cols = vec![u64_col_def("id"), u64_col_def("email")];
+    let parent_cols = vec![col_def("id", type_code::U64), col_def("email", type_code::U64)];
     let parent_tid = engine.create_table("public.parent", &parent_cols, &[0], true).unwrap();
     engine.create_index("public.parent", &["email"], true).unwrap();
 
     // Child references parent.email (col 1), legal because email is unique.
-    let child_cols = vec![u64_col_def("cid"), fk_col_def("e", parent_tid, 1)];
+    let child_cols = vec![col_def("cid", type_code::U64), fk_col_def("e", parent_tid, 1)];
     engine.create_table("public.child", &child_cols, &[0], true).unwrap();
 
     let idx = make_secondary_index_name("public", "parent", "email");
@@ -1951,7 +1962,7 @@ fn test_unique_index_duplicate_across_chunks_rejected() {
     let dir = temp_dir("unique_idx_dup_cross_chunk");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
 
@@ -1967,11 +1978,11 @@ fn test_unique_index_duplicate_across_chunks_rejected() {
     engine.flush_family(tid).unwrap();
 
     engine.ddl_scan_chunk_rows = 3;
-    let before = count_records(&mut engine.sys_indices);
+    let before = count_records(engine.sys_store_mut(SysFamily::Index));
     let r = engine.create_index("public.t", &["val"], true);
     assert!(r.is_err(), "cross-chunk duplicate must fail the unique backfill");
     assert_eq!(
-        count_records(&mut engine.sys_indices),
+        count_records(engine.sys_store_mut(SysFamily::Index)),
         before,
         "the failed unique index row must net out of sys_indices"
     );
@@ -1985,7 +1996,7 @@ fn test_unique_index_duplicate_within_chunk_rejected() {
     let dir = temp_dir("unique_idx_dup_within_chunk");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
 
@@ -2016,7 +2027,7 @@ fn test_unique_index_chunked_backfill_distinct_succeeds() {
     let dir = temp_dir("unique_idx_chunked_ok");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
 
@@ -2053,9 +2064,9 @@ fn test_promote_unique_duplicate_across_chunks_rejected() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let parent_tid = engine
-        .create_table("public.parent", &[u64_col_def("id")], &[0], true)
+        .create_table("public.parent", &[col_def("id", type_code::U64)], &[0], true)
         .unwrap();
-    let child_cols = vec![u64_col_def("cid"), fk_col_def("refc", parent_tid, 0)];
+    let child_cols = vec![col_def("cid", type_code::U64), fk_col_def("refc", parent_tid, 0)];
     let child_tid = engine.create_table("public.child", &child_cols, &[0], true).unwrap();
 
     // Duplicate refc=42 at pk 0 and pk 9; distinct in between (ingest_to_family
@@ -2094,7 +2105,7 @@ fn test_unique_index_weight2_row_rejected() {
     let dir = temp_dir("unique_idx_weight2");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
 
@@ -2107,12 +2118,12 @@ fn test_unique_index_weight2_row_rejected() {
     }
     engine.flush_family(tid).unwrap();
 
-    let before = count_records(&mut engine.sys_indices);
+    let before = count_records(engine.sys_store_mut(SysFamily::Index));
     let r = engine.create_index("public.t", &["val"], true);
     assert!(r.is_err(), "unique index over a weight-2 duplicate must fail");
     assert!(r.unwrap_err().contains("duplicate values"));
     assert_eq!(
-        count_records(&mut engine.sys_indices),
+        count_records(engine.sys_store_mut(SysFamily::Index)),
         before,
         "the failed unique index row must net out of sys_indices"
     );
@@ -2131,9 +2142,9 @@ fn test_promote_unique_weight2_row_rejected() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let parent_tid = engine
-        .create_table("public.parent", &[u64_col_def("id")], &[0], true)
+        .create_table("public.parent", &[col_def("id", type_code::U64)], &[0], true)
         .unwrap();
-    let child_cols = vec![u64_col_def("cid"), fk_col_def("refc", parent_tid, 0)];
+    let child_cols = vec![col_def("cid", type_code::U64), fk_col_def("refc", parent_tid, 0)];
     let child_tid = engine.create_table("public.child", &child_cols, &[0], false).unwrap();
 
     let schema = engine.get_schema(child_tid).unwrap();
@@ -2166,7 +2177,11 @@ fn test_promote_unique_weight2_row_rejected() {
 fn test_composite_index_full_key_seek() {
     let dir = temp_dir("composite_full_key");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("a"), u64_col_def("b")];
+    let cols = vec![
+        col_def("id", type_code::U64),
+        col_def("a", type_code::U64),
+        col_def("b", type_code::U64),
+    ];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["a", "b"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -2205,7 +2220,11 @@ fn test_composite_index_full_key_seek() {
 fn test_composite_index_leading_prefix_seek() {
     let dir = temp_dir("composite_prefix");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("a"), u64_col_def("b")];
+    let cols = vec![
+        col_def("id", type_code::U64),
+        col_def("a", type_code::U64),
+        col_def("b", type_code::U64),
+    ];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["a", "b"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -2244,7 +2263,12 @@ fn test_composite_index_signed_unsigned_u128_mix() {
     // a negative leading value and a wide trailing value.
     let dir = temp_dir("composite_mix");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), i32_col_def("a"), u64_col_def("b"), u128_col_def("c")];
+    let cols = vec![
+        col_def("id", type_code::U64),
+        col_def("a", type_code::I32),
+        col_def("b", type_code::U64),
+        col_def("c", type_code::U128),
+    ];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["a", "b", "c"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -2284,8 +2308,8 @@ fn test_composite_index_null_in_any_key_skipped() {
     let dir = temp_dir("composite_null");
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![
-        u64_col_def("id"),
-        u64_col_def("a"),
+        col_def("id", type_code::U64),
+        col_def("a", type_code::U64),
         ColumnDef {
             name: "b".into(),
             type_code: type_code::U64,
@@ -2327,7 +2351,11 @@ fn test_composite_index_drop_exact_list() {
     // (a, b) leaves the (a) index serving and removes only the (a, b) circuit.
     let dir = temp_dir("composite_drop");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("a"), u64_col_def("b")];
+    let cols = vec![
+        col_def("id", type_code::U64),
+        col_def("a", type_code::U64),
+        col_def("b", type_code::U64),
+    ];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["a"], false).unwrap();
     engine.create_index("public.t", &["a", "b"], false).unwrap();
@@ -2357,7 +2385,11 @@ fn test_composite_index_does_not_answer_single_column() {
     // (exact-list match) — only the full (a, b) list resolves.
     let dir = temp_dir("composite_single_miss");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("a"), u64_col_def("b")];
+    let cols = vec![
+        col_def("id", type_code::U64),
+        col_def("a", type_code::U64),
+        col_def("b", type_code::U64),
+    ];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["a", "b"], false).unwrap();
 
@@ -2378,7 +2410,11 @@ fn test_composite_unique_created_and_enforced() {
     // a duplicate (a, b) is rejected, two rows differing only in b are admitted.
     let dir = temp_dir("composite_unique_ok");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("a"), u64_col_def("b")];
+    let cols = vec![
+        col_def("id", type_code::U64),
+        col_def("a", type_code::U64),
+        col_def("b", type_code::U64),
+    ];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
 
     engine
@@ -2494,7 +2530,15 @@ fn test_seek_prefix_matches_projection() {
     bb.put_u32((-5i32) as u32);
     bb.put_u64(42);
     bb.end_row();
-    let projected = crate::query::DagEngine::batch_project_index(&bb.finish(), &[1, 2], &src, &idx);
+    let projected = {
+        let b = bb.finish();
+        crate::query::DagEngine::batch_project_index(
+            &b,
+            &crate::schema::IndexKeySpec::new(&[1, 2], &src, &idx),
+            &src,
+            &idx,
+        )
+    };
     assert_eq!(projected.count, 1);
 
     let key_size: usize = (0..2).map(|i| idx.columns[i].size() as usize).sum();
@@ -2535,7 +2579,10 @@ fn project_leading_span(src: SchemaDescriptor, idx: &SchemaDescriptor, native: u
         sz => unreachable!("unexpected column width {sz}"),
     }
     bb.end_row();
-    let projected = crate::query::DagEngine::batch_project_index(&bb.finish(), &[1], &src, idx);
+    let projected = {
+        let b = bb.finish();
+        crate::query::DagEngine::batch_project_index(&b, &crate::schema::IndexKeySpec::new(&[1], &src, idx), &src, idx)
+    };
     let key_size = idx.columns[0].size() as usize;
     projected.get_pk_bytes(0)[..key_size].to_vec()
 }
@@ -2633,7 +2680,15 @@ fn composite_index_signed_leading_unsigned_tiebreak_orders() {
         bb.put_u32(a as u32);
         bb.put_u64(b);
         bb.end_row();
-        let projected = crate::query::DagEngine::batch_project_index(&bb.finish(), &[1, 2], &src, &idx);
+        let projected = {
+            let b = bb.finish();
+            crate::query::DagEngine::batch_project_index(
+                &b,
+                &crate::schema::IndexKeySpec::new(&[1, 2], &src, &idx),
+                &src,
+                &idx,
+            )
+        };
         spans.push(projected.get_pk_bytes(0)[..key_size].to_vec());
     }
     for w in spans.windows(2) {
@@ -2680,7 +2735,7 @@ fn range_pks(engine: &mut CatalogEngine, tid: i64, cols: &[u32], eq: &[u128], st
 fn test_seek_by_index_range_unsigned_pure_range() {
     let dir = temp_dir("catalog_range_unsigned");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("x")];
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -2723,7 +2778,7 @@ fn test_seek_by_index_range_unsigned_pure_range() {
 fn test_seek_by_index_range_signed_between() {
     let dir = temp_dir("catalog_range_signed");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), i32_col_def("x")];
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I32)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -2766,7 +2821,11 @@ fn test_seek_by_index_range_signed_between() {
 fn test_seek_by_index_range_composite_eq_prefix() {
     let dir = temp_dir("catalog_range_composite");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("a"), u64_col_def("b")];
+    let cols = vec![
+        col_def("id", type_code::U64),
+        col_def("a", type_code::U64),
+        col_def("b", type_code::U64),
+    ];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["a", "b"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -2804,7 +2863,7 @@ fn test_seek_by_index_range_composite_eq_prefix() {
 fn test_seek_by_index_range_open_ended() {
     let dir = temp_dir("catalog_range_open");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("x")];
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -2837,7 +2896,7 @@ fn test_seek_by_index_range_open_ended() {
 fn test_seek_by_index_range_exclusive_lower_large_dup_group() {
     let dir = temp_dir("catalog_range_dupgroup");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("x")];
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -2880,7 +2939,7 @@ fn test_seek_by_index_range_exclusive_lower_large_dup_group() {
 fn test_seek_by_index_range_retraction() {
     let dir = temp_dir("catalog_range_retract");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("x")];
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -2916,7 +2975,7 @@ fn test_seek_by_index_range_retraction() {
 fn test_seek_by_index_range_multiplicity_preserved() {
     let dir = temp_dir("catalog_range_mult");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("x")];
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -2949,7 +3008,7 @@ fn test_seek_by_index_range_null_excluded() {
     let dir = temp_dir("catalog_range_null");
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![
-        u64_col_def("id"),
+        col_def("id", type_code::U64),
         ColumnDef {
             name: "x".into(),
             type_code: type_code::I64,
@@ -2993,7 +3052,7 @@ fn test_seek_by_index_range_null_excluded() {
 fn test_seek_by_index_range_no_range_column_errs() {
     let dir = temp_dir("catalog_range_arity");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("x")];
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["x"], false).unwrap();
 
@@ -3014,7 +3073,7 @@ fn test_seek_by_index_range_exclusive_lower_type_max() {
     // provably empty. `x >= u64::MAX` starts Before(MAX) and keeps the group.
     let dir = temp_dir("catalog_range_excl_lower_max");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("x")];
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -3049,7 +3108,7 @@ fn test_seek_by_index_range_inclusive_upper_type_max() {
     // the table end (every row, including the MAX one).
     let dir = temp_dir("catalog_range_incl_upper_max");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("x")];
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -3081,7 +3140,11 @@ fn test_seek_by_index_range_carry_ripples_into_eq_prefix() {
     // must never leak into an a==7 scan.
     let dir = temp_dir("catalog_range_carry_eq");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("a"), u64_col_def("b")];
+    let cols = vec![
+        col_def("id", type_code::U64),
+        col_def("a", type_code::U64),
+        col_def("b", type_code::U64),
+    ];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["a", "b"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -3151,7 +3214,7 @@ fn test_seek_by_index_range_multi_group_sorted_with_retraction() {
     // one group must drop that row at net weight 0.
     let dir = temp_dir("catalog_range_multigroup");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("x")];
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -3206,7 +3269,11 @@ fn test_seek_by_index_prefix_multi_group_sorted() {
     // leak in.
     let dir = temp_dir("catalog_prefix_multigroup");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("a"), u64_col_def("b")];
+    let cols = vec![
+        col_def("id", type_code::U64),
+        col_def("a", type_code::U64),
+        col_def("b", type_code::U64),
+    ];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["a", "b"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -3257,7 +3324,7 @@ fn test_seek_by_index_range_empty_interval_short_circuits() {
     // exercise this path.)
     let dir = temp_dir("catalog_range_empty_interval");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("x")];
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -3338,7 +3405,12 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     }
     // Rows were appended out of PK order; the batch is `Raw` (the constructor
     // default), so the ingest's `into_consolidated` sorts the shard.
-    let idx_batch = DagEngine::batch_project_index(&bb, &[3], &schema, &idx_schema);
+    let idx_batch = DagEngine::batch_project_index(
+        &bb,
+        &crate::schema::IndexKeySpec::new(&[3], &schema, &idx_schema),
+        &schema,
+        &idx_schema,
+    );
 
     let mut base = Box::new(
         Table::new(
@@ -3407,7 +3479,7 @@ fn test_seek_by_index_full_arity_nonunique_sort_skipped() {
     // skipping the sort is correct.
     let dir = temp_dir("catalog_full_arity_skip");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("x")];
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();

@@ -18,18 +18,6 @@ pub(crate) fn parse_qualified_name<'a>(name: &'a str, default_schema: &'a str) -
     }
 }
 
-// ---------------------------------------------------------------------------
-// Index key type promotion
-// ---------------------------------------------------------------------------
-
-/// Promote one base-table column type to its secondary-index leading-key type.
-/// Thin re-export of `gnitz_wire::index_key_type` (the single source of truth,
-/// shared with the SQL planner's CREATE INDEX limit pre-check) so the engine and
-/// the planner can never disagree on a column's promoted width.
-pub(crate) fn get_index_key_type(field_type_code: u8) -> Result<u8, String> {
-    gnitz_wire::index_key_type(field_type_code)
-}
-
 pub(crate) fn make_fk_index_name(schema_name: &str, table_name: &str, col_name: &str) -> String {
     format!("{schema_name}__{table_name}{FK_INDEX_INFIX}{col_name}")
 }

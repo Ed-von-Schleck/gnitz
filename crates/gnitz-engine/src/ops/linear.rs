@@ -127,13 +127,7 @@ pub fn op_negate(batch: &Batch) -> Batch {
     // clone_batch copies all column regions and the blob verbatim — no
     // per-string relocation is needed since we keep the same blob content.
     let mut output = batch.clone_batch();
-    // Negate weights in-place.
-    let weights = output.weight_data_mut();
-    for i in 0..batch.count {
-        let off = i * 8;
-        let w = i64::from_le_bytes(weights[off..off + 8].try_into().unwrap());
-        weights[off..off + 8].copy_from_slice(&w.wrapping_neg().to_le_bytes());
-    }
+    output.map_weights(i64::wrapping_neg);
 
     // clone_batch preserves sorted and consolidated; negating weights does not change element
     // identity, so both invariants survive as-is.

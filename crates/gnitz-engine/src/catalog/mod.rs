@@ -48,7 +48,7 @@ use std::fs;
 use std::rc::Rc;
 
 use crate::query::{DagEngine, RelationKind, StoreHandle};
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, PartitionedTable, ReadCursor, RecoverySource, Routing, Table};
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
@@ -79,11 +79,13 @@ pub(in crate::catalog) use gnitz_wire::FK_INDEX_INFIX;
 pub(in crate::catalog) use registry::raise_id_counter;
 pub(in crate::catalog) use sys_tables::SysFamily;
 pub(in crate::catalog) use sys_tables::{PUBLIC_SCHEMA_ID, SYSTEM_SCHEMA_ID};
+// Partition layout is owned by storage; the catalog only consumes it.
+pub(in crate::catalog) use crate::storage::{partition_manifest_path, partition_range, NUM_PARTITIONS};
 pub(in crate::catalog) use types::{FkConstraint, FkParentRef};
 pub(in crate::catalog) use utils::{
-    cursor_read_string, cursor_read_u64, ensure_dir, fsync_dir, get_index_key_type, index_dir, is_index_dir_name,
-    is_table_dir_name, make_fk_index_name, new_index_table, remove_stale_index_rank_dirs, retract_rows_by_view,
-    retract_rows_in_pk_range, retract_single_row, schema_dir, subdir_names, table_dir, view_dir,
+    cursor_read_string, cursor_read_u64, ensure_dir, fsync_dir, index_dir, is_index_dir_name, is_table_dir_name,
+    make_fk_index_name, new_index_table, remove_stale_index_rank_dirs, retract_rows_by_view, retract_rows_in_pk_range,
+    retract_single_row, schema_dir, subdir_names, table_dir, view_dir,
 };
 #[cfg(test)]
 pub(in crate::catalog) use utils::{make_secondary_index_name, parse_qualified_name};
@@ -138,16 +140,11 @@ pub struct CatalogEngine {
     pub(crate) invalid_views: rustc_hash::FxHashSet<i64>,
 
     // --- System tables (owned, single-partition, durable) ---
-    pub(crate) sys_schemas: Box<Table>,
-    pub(crate) sys_tables: Box<Table>,
-    pub(crate) sys_views: Box<Table>,
-    pub(crate) sys_columns: Box<Table>,
-    pub(crate) sys_indices: Box<Table>,
-    pub(crate) sys_view_deps: Box<Table>,
-    pub(crate) sys_sequences: Box<Table>,
-    pub(crate) sys_circuit_nodes: Box<Table>,
-    pub(crate) sys_circuit_edges: Box<Table>,
-    pub(crate) sys_circuit_node_columns: Box<Table>,
+    //
+    // One store per family, indexed by `SysFamily` discriminant (parallel to
+    // `SYS_FAMILIES`). The `Box` keeps each table's heap address stable, so the
+    // `Borrowed(*mut Table)` DAG registrations survive engine moves.
+    pub(crate) sys_stores: [Box<Table>; SysFamily::COUNT],
 
     // --- Pending broadcasts (ordered innermost → outermost) ---
     //

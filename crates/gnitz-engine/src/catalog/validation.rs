@@ -8,7 +8,6 @@ impl CatalogEngine {
     pub(crate) fn validate_fk_column(
         &self,
         col: &ColumnDef,
-        _col_idx: usize,
         self_table_id: i64,
         self_pk_index: u32,
         self_pk_type: u8,
@@ -57,8 +56,8 @@ impl CatalogEngine {
         // does the U64-vs-U64 case. Comparing the promoted child against the
         // parent's raw type_code would wrongly reject identical-type FKs once a
         // narrower signed column promotes to I64.
-        let promoted = get_index_key_type(col.type_code)?;
-        let target_promoted = get_index_key_type(target_type)?;
+        let promoted = gnitz_wire::index_key_type(col.type_code)?;
+        let target_promoted = gnitz_wire::index_key_type(target_type)?;
         if promoted != target_promoted {
             return Err(format!(
                 "FK type mismatch: promoted code {promoted} vs target {target_promoted}"
@@ -255,10 +254,11 @@ impl CatalogEngine {
             let col_list = gnitz_wire::PkColList::from_slice(unique_slice);
             let cols = col_list.as_slice();
 
-            // Per-circuit read/encode plan. A unique index may be on a PK
-            // column (a member of a compound PK), whose value lives in the
-            // packed PK, not a payload slot — the spec's `locate` resolves that.
-            let spec = crate::schema::IndexKeySpec::new(cols, &schema, &ic.index_schema);
+            // Per-circuit read/encode plan, precomputed at registration. A
+            // unique index may be on a PK column (a member of a compound PK),
+            // whose value lives in the packed PK, not a payload slot — the
+            // spec's locators resolve that.
+            let spec = ic.key_spec;
             let idx_key_size = spec.key_size();
             let idx_table = ic.table_mut();
             let mut cursor = idx_table.open_cursor();

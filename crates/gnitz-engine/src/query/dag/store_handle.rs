@@ -95,6 +95,16 @@ impl StoreHandle {
         }
     }
 
+    /// Materialize every positive-weight row. Borrowed delegates to
+    /// `Table::full_scan` (preserving its `Rc` snapshot cache exactly);
+    /// Partitioned materializes through the merged cursor.
+    pub fn full_scan(&self) -> std::rc::Rc<Batch> {
+        match self {
+            StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.full_scan(),
+            StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).open_cursor() }.materialize(),
+        }
+    }
+
     /// Dispatched `compact_if_needed` across all variants. Maintenance-only;
     /// readers that want an up-to-date L1 call this before `open_cursor`.
     pub fn compact_if_needed(&self) -> Result<(), StorageError> {

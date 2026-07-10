@@ -509,4 +509,122 @@ mod tests {
             }
         }
     }
+
+    // ── Master/worker routing symmetry over compound PKs ────────────────
+    //
+    // `compute_worker_indices` (the master-side scatter) and
+    // `partition_for_pk_bytes` + `worker_for_partition` (the worker-side
+    // route) must agree on every row, or a pushed row lands on a worker that
+    // never owns its partition.
+
+    fn u64_pk_col() -> SchemaColumn {
+        SchemaColumn::new(type_code::U64, 0)
+    }
+    fn u32_pk_col() -> SchemaColumn {
+        SchemaColumn::new(type_code::U32, 0)
+    }
+    fn i64_payload_col() -> SchemaColumn {
+        SchemaColumn::new(type_code::I64, 0)
+    }
+
+    fn make_batch_with_raw_pks(schema: &SchemaDescriptor, raw_pks: &[[u8; 16]]) -> Batch {
+        let mut b = Batch::with_schema(*schema, raw_pks.len().max(1));
+        for pk in raw_pks {
+            b.extend_pk_bytes(pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &0i64.to_le_bytes());
+            b.count += 1;
+        }
+        b
+    }
+
+    #[test]
+    fn routing_symmetry_master_worker() {
+        use crate::storage::partition_for_pk_bytes;
+
+        let schema = SchemaDescriptor::new(&[u64_pk_col(), u64_pk_col(), i64_payload_col()], &[0, 1]);
+        let raw_pks: Vec<[u8; 16]> = (0u64..100)
+            .map(|i| {
+                let mut pk = [0u8; 16];
+                pk[..8].copy_from_slice(&i.wrapping_mul(13).wrapping_add(7).to_le_bytes());
+                pk[8..16].copy_from_slice(&i.wrapping_mul(97).wrapping_add(11).to_le_bytes());
+                pk
+            })
+            .collect();
+        let batch = make_batch_with_raw_pks(&schema, &raw_pks);
+        let num_workers = 4;
+
+        let mut master_workers = vec![0usize; batch.count];
+        for (w, row_indices) in compute_worker_indices(&batch, schema.pk_indices(), &schema, num_workers)
+            .into_iter()
+            .enumerate()
+        {
+            for row_idx in row_indices {
+                master_workers[row_idx as usize] = w;
+            }
+        }
+
+        let worker_workers: Vec<usize> = (0..batch.count)
+            .map(|i| {
+                let p = partition_for_pk_bytes(batch.as_mem_batch().get_pk_bytes(i));
+                worker_for_partition(p, num_workers)
+            })
+            .collect();
+
+        assert_eq!(
+            master_workers, worker_workers,
+            "master and worker routing diverged for compound U64 PK",
+        );
+    }
+
+    #[test]
+    fn routing_symmetry_four_u32() {
+        use crate::storage::partition_for_pk_bytes;
+
+        let schema = SchemaDescriptor::new(
+            &[
+                u32_pk_col(),
+                u32_pk_col(),
+                u32_pk_col(),
+                u32_pk_col(),
+                i64_payload_col(),
+            ],
+            &[0, 1, 2, 3],
+        );
+        let raw_pks: Vec<[u8; 16]> = (0u32..100)
+            .map(|i| {
+                let mut pk = [0u8; 16];
+                pk[0..4].copy_from_slice(&i.to_le_bytes());
+                pk[4..8].copy_from_slice(&i.wrapping_mul(13).wrapping_add(7).to_le_bytes());
+                pk[8..12].copy_from_slice(&i.wrapping_mul(97).wrapping_add(11).to_le_bytes());
+                pk[12..16].copy_from_slice(&i.wrapping_mul(31).wrapping_add(3).to_le_bytes());
+                pk
+            })
+            .collect();
+        let b = make_batch_with_raw_pks(&schema, &raw_pks);
+        let num_workers = 4;
+
+        let mut master_workers = vec![0usize; b.count];
+        for (w, row_indices) in compute_worker_indices(&b, schema.pk_indices(), &schema, num_workers)
+            .into_iter()
+            .enumerate()
+        {
+            for row_idx in row_indices {
+                master_workers[row_idx as usize] = w;
+            }
+        }
+
+        let worker_workers: Vec<usize> = (0..b.count)
+            .map(|i| {
+                let p = partition_for_pk_bytes(b.as_mem_batch().get_pk_bytes(i));
+                worker_for_partition(p, num_workers)
+            })
+            .collect();
+
+        assert_eq!(
+            master_workers, worker_workers,
+            "master and worker routing diverged for compound 4xU32 PK",
+        );
+    }
 }

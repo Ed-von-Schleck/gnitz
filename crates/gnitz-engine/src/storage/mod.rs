@@ -23,7 +23,9 @@ mod data_roundtrip_proptest;
 pub use batch::{write_to_batch, Batch};
 pub use batch_wire::decode_mem_batch_from_wal_block;
 pub use error::StorageError;
-pub use lsm::partitioned_table::{partition_for_key, partition_for_pk_bytes, PartitionedTable, Routing};
+pub use lsm::partitioned_table::{
+    partition_for_key, partition_for_pk_bytes, partition_range, PartitionedTable, Routing, NUM_PARTITIONS,
+};
 
 pub use lsm::table::{FlushOutcome, FlushWork, RecoverySource, Table};
 pub use merge::MemBatch;
@@ -36,7 +38,7 @@ pub(crate) use columnar::{cmp_col_window, compare_rows, compare_rows_fixedint_no
 // The PK key primitives live in `schema::key`; out-of-storage callers keep the
 // storage facade.
 pub(crate) use crate::schema::key::{compare_pk_bytes, compare_pk_ordering, opk_key, pack_pk_be, pk_bytes_eq};
-pub(crate) use lsm::manifest::{peek_generation, PkBuf, STATE_FORMAT};
+pub(crate) use lsm::manifest::{partition_manifest_path, peek_generation, PkBuf, STATE_FORMAT};
 #[cfg(test)]
 pub(crate) use lsm::partitioned_table::partial_flush_lsn_fixture;
 #[cfg(test)]

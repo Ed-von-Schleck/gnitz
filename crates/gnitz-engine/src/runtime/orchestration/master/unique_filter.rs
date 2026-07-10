@@ -16,22 +16,19 @@ impl MasterDispatcher {
     fn unique_index_descriptors(&mut self, table_id: i64) -> Option<(SchemaDescriptor, Vec<UniqueIndexDesc>)> {
         let cat = unsafe { &mut *self.catalog };
         let schema = cat.get_schema_desc(table_id)?;
-        let n_circuits = cat.get_index_circuit_count(table_id);
 
-        let mut out: Vec<UniqueIndexDesc> = Vec::new();
-        for ci in 0..n_circuits {
-            let Some(cols) = cat.unique_index_circuit_cols(table_id, ci) else {
-                continue;
-            };
-            let idx_schema = match cat.get_index_circuit_schema(table_id, ci) {
-                Some(s) => s,
-                None => continue,
-            };
-            out.push(UniqueIndexDesc {
-                packed: gnitz_wire::pack_pk_cols(cols),
-                spec: IndexKeySpec::new(cols, &schema, &idx_schema),
-            });
-        }
+        // One pass over the circuit list; the span plan is the circuit's
+        // precomputed `key_spec`. Uniqueness is filtered on the LIVE flag —
+        // promotion/demotion flips it without rebuilding the spec.
+        let out: Vec<UniqueIndexDesc> = cat
+            .index_circuits(table_id)
+            .iter()
+            .filter(|ic| ic.is_unique)
+            .map(|ic| UniqueIndexDesc {
+                packed: gnitz_wire::pack_pk_cols(ic.col_indices.as_slice()),
+                spec: ic.key_spec,
+            })
+            .collect();
         if out.is_empty() {
             None
         } else {

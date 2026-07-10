@@ -54,6 +54,85 @@ pub const fn col_index_in(cols: &[WireSysCol], name: &str) -> usize {
     panic!("column not found")
 }
 
+// Every system table's column shape is defined once, here, and derived by
+// both sides: the engine builds its `SchemaDescriptor`s and the COL_TAB
+// self-description rows from these slices, the client builds its `Schema`s.
+// PK = column [0] unless noted otherwise.
+
+pub const SCHEMA_TAB_COLS: &[WireSysCol] = &[
+    col("schema_id", TypeCode::U64, false),
+    col("name", TypeCode::String, false),
+];
+
+pub const TABLE_TAB_COLS: &[WireSysCol] = &[
+    col("table_id", TypeCode::U64, false),
+    col("schema_id", TypeCode::U64, false),
+    col("name", TypeCode::String, false),
+    col("directory", TypeCode::String, false),
+    // Packed PK column list (`pack_pk_cols`); a bare index (flag bit clear)
+    // decodes as a single-column PK.
+    col("pk_col_idx", TypeCode::U64, false),
+    col("created_lsn", TypeCode::U64, false),
+    // See `pack_table_flags` for the bit layout.
+    col("flags", TypeCode::U64, false),
+];
+
+pub const VIEW_TAB_COLS: &[WireSysCol] = &[
+    col("view_id", TypeCode::U64, false),
+    col("schema_id", TypeCode::U64, false),
+    col("name", TypeCode::String, false),
+    col("sql_definition", TypeCode::String, false),
+    col("cache_directory", TypeCode::String, false),
+    col("created_lsn", TypeCode::U64, false),
+    // Packed view-PK column list (`pack_pk_cols`). A bare `0` (flag bit clear)
+    // decodes as the single-column PK `[0]`.
+    col("pk_col_idx", TypeCode::U64, false),
+];
+
+pub const COL_TAB_COLS: &[WireSysCol] = &[
+    col("column_id", TypeCode::U64, false),
+    col("owner_id", TypeCode::U64, false),
+    col("owner_kind", TypeCode::U64, false),
+    col("col_idx", TypeCode::U64, false),
+    col("name", TypeCode::String, false),
+    col("type_code", TypeCode::U64, false),
+    col("is_nullable", TypeCode::U64, false),
+    col("fk_table_id", TypeCode::U64, false),
+    col("fk_col_idx", TypeCode::U64, false),
+    // is_serial marker: 1 for a SERIAL PK column, else 0. Lets a connection
+    // that only fetched the schema distinguish an auto-assigned SERIAL PK from
+    // a user-supplied non-null integer PK. Stored verbatim by the engine.
+    col("is_serial", TypeCode::U64, false),
+    // is_hidden marker: 1 for a hidden key slot (synthetic view keys and
+    // unprojected passthrough PKs), else 0. Echoed into reply schema blocks as
+    // META_FLAG_HIDDEN; the engine never branches on it.
+    col("is_hidden", TypeCode::U64, false),
+];
+
+pub const IDX_TAB_COLS: &[WireSysCol] = &[
+    col("index_id", TypeCode::U64, false),
+    col("owner_id", TypeCode::U64, false),
+    col("owner_kind", TypeCode::U64, false),
+    // Holds `pack_pk_cols(&col_indices)` for every row (single- and
+    // multi-column indexes alike); decoded via `unpack_pk_cols`.
+    col("source_col_idx", TypeCode::U64, false),
+    col("name", TypeCode::String, false),
+    col("is_unique", TypeCode::U64, false),
+    col("cache_directory", TypeCode::String, false),
+];
+
+// PK = columns [0, 1]; dep_view_id is the only payload.
+pub const DEP_TAB_COLS: &[WireSysCol] = &[
+    col("view_id", TypeCode::U64, false),
+    col("dep_table_id", TypeCode::U64, false),
+    col("dep_view_id", TypeCode::U64, false),
+];
+
+pub const SEQ_TAB_COLS: &[WireSysCol] = &[
+    col("seq_id", TypeCode::U64, false),
+    col("next_val", TypeCode::U64, false),
+];
+
 // Circuit catalog tables use a real compound primary key `(view_id, sub)`
 // instead of hand-packing both halves into one U128 column. `sub` is the
 // per-view secondary key (node_id, an (dst_node,dst_port) pack, or a

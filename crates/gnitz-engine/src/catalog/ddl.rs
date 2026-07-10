@@ -6,7 +6,7 @@ use crate::storage::PkBuf;
 /// retracting a failed registration (−1). The single writer of the 6-column
 /// IDX_TAB row layout in the DDL emitters.
 fn idx_tab_row(index_id: i64, owner_id: i64, packed_cols: u64, name: &str, is_unique: bool, weight: i64) -> Batch {
-    let mut bb = BatchBuilder::new(idx_tab_schema());
+    let mut bb = BatchBuilder::new(SysFamily::Index.schema());
     bb.begin_row(index_id as u128, weight);
     bb.put_u64(owner_id as u64);
     bb.put_u64(OWNER_KIND_TABLE as u64);
@@ -50,7 +50,7 @@ impl CatalogEngine {
         let sid = self.allocate_schema_id();
 
         // Write schema record
-        let schema = schema_tab_schema();
+        let schema = SysFamily::Schema.schema();
         let mut bb = BatchBuilder::new(schema);
         bb.begin_row(sid as u128, 1);
         bb.put_string(name);
@@ -60,7 +60,6 @@ impl CatalogEngine {
         // Submit the schemas-family delta (triggers hook).
         self.submit(SysFamily::Schema, batch)?;
 
-        self.advance_sequence(SEQ_ID_SCHEMAS, sid - 1, sid);
         Ok(())
     }
 
@@ -88,7 +87,7 @@ impl CatalogEngine {
 
         // 2. Now the schema is guaranteed empty; emit the schema-drop
         //    delta exactly as before.
-        let schema = schema_tab_schema();
+        let schema = SysFamily::Schema.schema();
         let mut bb = BatchBuilder::new(schema);
         bb.begin_row(sid as u128, -1);
         bb.put_string(name);
@@ -190,15 +189,11 @@ impl CatalogEngine {
         if self.caches.entity_by_qname.contains_key(&qualified) {
             return Err("Table already exists".into());
         }
-        if col_defs.len() > crate::schema::MAX_COLUMNS {
-            return Err(format!("Maximum {} columns supported", crate::schema::MAX_COLUMNS));
-        }
-
         let raw_pk_cols = pack_pk_cols(pk_cols);
         let pk = unpack_pk_cols(raw_pk_cols);
-        validate_pk_cols(col_defs, &pk)?;
 
         let tid = self.allocate_table_id();
+        validate_relation_defs("table", tid, table_name, col_defs, &pk)?;
         let sid = self.get_schema_id(schema_name);
         // Index the validated copy, not the raw `pk_cols` argument:
         // `validate_pk_cols` ran against `pk`, so `pk.as_slice()[0]` is
@@ -208,10 +203,8 @@ impl CatalogEngine {
 
         // Validate FK columns. Compound-parent FK resolution is out of
         // scope; single-PK behaviour is preserved via the first PK column.
-        for (col_idx, cd) in col_defs.iter().enumerate() {
-            if cd.fk_table_id != 0 {
-                self.validate_fk_column(cd, col_idx, tid, first_pk, self_pk_type)?;
-            }
+        for cd in col_defs.iter().filter(|cd| cd.fk_table_id != 0) {
+            self.validate_fk_column(cd, tid, first_pk, self_pk_type)?;
         }
 
         let directory = table_dir(&self.base_dir, schema_name, table_name, tid);
@@ -225,7 +218,7 @@ impl CatalogEngine {
 
         // Write table record (triggers hook)
         {
-            let schema = table_tab_schema();
+            let schema = SysFamily::Table.schema();
             let mut bb = BatchBuilder::new(schema);
             bb.begin_row(tid as u128, 1);
             bb.put_u64(sid as u64);
@@ -239,7 +232,6 @@ impl CatalogEngine {
             self.submit(SysFamily::Table, batch)?;
         }
 
-        self.advance_sequence(SEQ_ID_TABLES, tid - 1, tid);
         Ok(tid)
     }
 
@@ -369,8 +361,6 @@ impl CatalogEngine {
                 return Err(e);
             }
         }
-
-        self.advance_sequence(SEQ_ID_INDICES, index_id - 1, index_id);
         Ok(index_id)
     }
 
@@ -503,6 +493,7 @@ impl CatalogEngine {
             cols: PkColList,
             index_id: i64,
             idx_schema: SchemaDescriptor,
+            key_spec: crate::schema::IndexKeySpec,
         }
         let worklist: Vec<(i64, String, Vec<IndexWork>)> = self
             .dag
@@ -517,6 +508,7 @@ impl CatalogEngine {
                         cols: ic.col_indices,
                         index_id: ic.index_id,
                         idx_schema: ic.index_schema,
+                        key_spec: ic.key_spec,
                     })
                     .collect();
                 (owner_id, entry.directory.clone(), works)
@@ -525,7 +517,8 @@ impl CatalogEngine {
 
         for (owner_id, owner_dir, works) in worklist {
             // Re-create and install every index table before opening the scan.
-            let mut targets: Vec<(PkColList, SchemaDescriptor, *mut Table)> = Vec::with_capacity(works.len());
+            let mut targets: Vec<(crate::schema::IndexKeySpec, SchemaDescriptor, *mut Table)> =
+                Vec::with_capacity(works.len());
             for w in &works {
                 let table = new_index_table(&index_dir(&owner_dir, w.index_id), w.index_id, w.idx_schema)
                     .map_err(|e| format!("index table re-create failed (owner {owner_id}): {e}"))?;
@@ -533,7 +526,7 @@ impl CatalogEngine {
                     .dag
                     .replace_index_table(owner_id, w.cols.as_slice(), Box::new(table))
                     .ok_or_else(|| format!("index circuit vanished during rebuild (owner {owner_id})"))?;
-                targets.push((w.cols, w.idx_schema, ptr));
+                targets.push((w.key_spec, w.idx_schema, ptr));
             }
 
             // One base-slice scan feeds all of the owner's indexes.
@@ -545,8 +538,8 @@ impl CatalogEngine {
                 continue;
             };
             while let Some(chunk) = handle.drain_chunk(chunk_rows) {
-                for (cols, idx_schema, table) in &targets {
-                    let projected = DagEngine::batch_project_index(&chunk, cols.as_slice(), &owner_schema, idx_schema);
+                for (key_spec, idx_schema, table) in &targets {
+                    let projected = DagEngine::batch_project_index(&chunk, key_spec, &owner_schema, idx_schema);
                     if projected.count == 0 {
                         continue;
                     }
@@ -591,6 +584,9 @@ impl CatalogEngine {
             None => return Ok(()),
         };
         let chunk_rows = self.ddl_scan_chunk_rows;
+        // Built here, not read off a circuit: the fresh-index path runs before
+        // `add_index_circuit` registers one.
+        let spec = crate::schema::IndexKeySpec::new(col_indices, &owner_schema, idx_schema);
         // The duplicate check applies to the full composite leading span.
         let idx_key_size = idx_schema.leading_key_size(col_indices.len());
         let mut seen: rustc_hash::FxHashSet<PkBuf> = rustc_hash::FxHashSet::default();
@@ -599,7 +595,7 @@ impl CatalogEngine {
             return Ok(());
         };
         while let Some(chunk) = handle.drain_chunk(chunk_rows) {
-            let projected = DagEngine::batch_project_index(&chunk, col_indices, &owner_schema, idx_schema);
+            let projected = DagEngine::batch_project_index(&chunk, &spec, &owner_schema, idx_schema);
             if projected.count == 0 {
                 continue;
             }
@@ -686,8 +682,6 @@ impl CatalogEngine {
                 self.rollback_index_registration(undo, index_id);
                 return Err(e);
             }
-
-            self.advance_sequence(SEQ_ID_INDICES, index_id - 1, index_id);
         }
         Ok(())
     }
@@ -696,7 +690,7 @@ impl CatalogEngine {
 
     #[cfg(test)]
     pub(crate) fn build_col_batch(&self, owner_id: i64, kind: i64, col_defs: &[ColumnDef], weight: i64) -> Batch {
-        let schema = col_tab_schema();
+        let schema = SysFamily::Column.schema();
         let mut bb = BatchBuilder::new(schema);
         for (i, cd) in col_defs.iter().enumerate() {
             let pk = pack_column_id(owner_id, i as i64);
@@ -729,7 +723,7 @@ impl CatalogEngine {
 
     #[cfg(test)]
     pub(crate) fn write_view_deps(&mut self, vid: i64, dep_ids: &[i64]) -> Result<(), String> {
-        let schema = dep_tab_schema();
+        let schema = SysFamily::ViewDep.schema();
         let mut bb = BatchBuilder::new(schema);
         for &dep_tid in dep_ids {
             // Compound PK (view_id, dep_table_id); dep_view_id is the only payload.

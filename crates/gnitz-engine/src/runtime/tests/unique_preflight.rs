@@ -447,7 +447,12 @@ fn index_key_spec_equals_projected_leading_span() {
     }
 
     // Reference: the projected index entry's leading idx_key_size bytes.
-    let projected = DagEngine::batch_project_index(&batch, &cols, &owner, &idx_schema);
+    let projected = DagEngine::batch_project_index(
+        &batch,
+        &IndexKeySpec::new(&cols, &owner, &idx_schema),
+        &owner,
+        &idx_schema,
+    );
     assert_eq!(projected.count, rows.len());
 
     let mb = batch.as_mem_batch();

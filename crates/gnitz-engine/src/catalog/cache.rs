@@ -6,6 +6,20 @@ use std::collections::hash_map::Entry;
 // CatalogCacheSet — all typed caches for one CatalogEngine
 // ---------------------------------------------------------------------------
 
+/// Cached schema wire data for one table: the encoded block plus the derived
+/// wire properties reused across SEEK/SCAN responses. All fields share one
+/// invalidation lifecycle (`clear_col_cache_no_bump` drops the entry whole).
+pub(crate) struct SchemaWireEntry {
+    pub(crate) block: Rc<Vec<u8>>,
+    /// True when every column has a fixed-width 8-aligned stride and no
+    /// German-string (STRING or BLOB) columns. Drives the `scatter_wire_group`
+    /// fast path.
+    pub(crate) wire_safe: bool,
+    /// Sum of pk_stride + 8 (weight) + 8 (null_bmp) + every payload column's
+    /// stride. Only meaningful when `wire_safe`.
+    pub(crate) wire_row_fixed_stride: u32,
+}
+
 #[derive(Default)]
 pub(crate) struct CatalogCacheSet {
     pub(crate) schema_by_name: FxHashMap<String, i64>,
@@ -16,17 +30,20 @@ pub(crate) struct CatalogCacheSet {
     pub(crate) tables_by_schema: FxHashMap<i64, FxHashSet<i64>>,
     pub(crate) views_by_schema: FxHashMap<i64, FxHashSet<i64>>,
     pub(crate) pk_col_of: FxHashMap<i64, PkColList>,
-    pub(crate) col_names: FxHashMap<i64, Vec<String>>,
+    /// Full decoded column definitions per table — the one COL_TAB read the
+    /// three views below (`col_names`, `col_names_bytes`, `col_hidden`) are
+    /// derived from at fill time (`fill_column_caches`).
+    pub(crate) col_defs: FxHashMap<i64, Rc<Vec<ColumnDef>>>,
+    pub(crate) col_names: FxHashMap<i64, Rc<Vec<String>>>,
     pub(crate) col_names_bytes: FxHashMap<i64, Rc<Vec<Vec<u8>>>>,
     /// Per-table hidden-column bitmask (bit N ⇔ column N is a hidden key slot;
     /// u128 covers MAX_COLUMNS = 65). Echoed into reply schema blocks as
     /// `META_FLAG_HIDDEN`; filled from COL_TAB alongside `col_names`.
     pub(crate) col_hidden: FxHashMap<i64, u128>,
-    /// Cached schema wire data per table: (encoded block, wire_safe, wire_row_fixed_stride).
-    /// Built from (SchemaDescriptor, col_names) and reused across SEEK/SCAN responses.
-    /// `wire_row_fixed_stride` is only meaningful when `wire_safe == true`.
-    /// Invalidated alongside col_names when DDL modifies the table schema.
-    pub(crate) schema_wire_cache: FxHashMap<i64, (Rc<Vec<u8>>, bool, u32)>,
+    /// Cached schema wire data per table. Built from (SchemaDescriptor,
+    /// col_names) and reused across SEEK/SCAN responses. Invalidated alongside
+    /// col_names when DDL modifies the table schema.
+    pub(crate) schema_wire_cache: FxHashMap<i64, SchemaWireEntry>,
     /// Monotonically increasing schema version per table (wraps 65535→1, never 0).
     /// Absent entries implicitly resolve to version 1 (base version).
     /// Version 0 is reserved as "client has no cached schema".
@@ -42,40 +59,36 @@ pub(crate) struct CatalogCacheSet {
     pub(crate) indices_by_owner: FxHashMap<i64, Vec<i64>>,
     pub(crate) fk_by_child: FxHashMap<i64, Vec<FkConstraint>>,
     pub(crate) fk_by_parent: FxHashMap<i64, Vec<FkParentRef>>,
-    pub(crate) needs_lock: FxHashSet<i64>,
+    /// Tables whose writes need the push lock, each with its materialized lock
+    /// set: the table itself plus all FK parents and children, sorted ascending
+    /// and deduped for deadlock-free acquisition. Recomputed by
+    /// `recompute_needs_lock` on every trigger (`apply_needs_lock` fires on
+    /// both FK endpoints, IDX_TAB, and TABLE_TAB deltas), so `fk_lock_set` is
+    /// a plain borrow on the push path.
+    pub(crate) needs_lock: FxHashMap<i64, Vec<i64>>,
 }
 
-/// Increment a schema version counter: wraps 65535 → 1, never 0.
-/// 0 is reserved as the client sentinel meaning "no cached schema".
-#[inline]
-fn bump_schema_version(v: u16) -> u16 {
-    if v == u16::MAX {
-        1
-    } else {
-        v + 1
-    }
-}
-
-/// Increment an index-metadata version counter: wraps 255 → 1, never 0.
-/// 0 is reserved as the client sentinel meaning "no cached index list".
-#[inline]
-fn bump_index_version(v: u8) -> u8 {
-    if v == u8::MAX {
-        1
-    } else {
-        v + 1
+/// Remove the first element matching `pred` from the Vec at `key`, dropping
+/// the map entry once the Vec empties — the shared retract shape of the
+/// Vec-valued caches (`indices_by_owner`, `fk_by_child`, `fk_by_parent`).
+fn remove_where<K: Eq + std::hash::Hash, V>(map: &mut FxHashMap<K, Vec<V>>, key: K, pred: impl Fn(&V) -> bool) {
+    if let Entry::Occupied(mut e) = map.entry(key) {
+        let items = e.get_mut();
+        if let Some(pos) = items.iter().position(&pred) {
+            items.swap_remove(pos);
+        }
+        if e.get().is_empty() {
+            e.remove();
+        }
     }
 }
 
 impl CatalogCacheSet {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    /// Remove the three derived column caches without bumping the schema version.
+    /// Remove the derived column caches without bumping the schema version.
     /// Use for table drop (no new schema to advertise) or as the inner step of
     /// `invalidate_col_names`.
     pub(crate) fn clear_col_cache_no_bump(&mut self, id: i64) {
+        self.col_defs.remove(&id);
         self.col_names.remove(&id);
         self.col_names_bytes.remove(&id);
         self.col_hidden.remove(&id);
@@ -86,9 +99,10 @@ impl CatalogCacheSet {
         self.clear_col_cache_no_bump(id);
         // Absent entries implicitly resolve to version 1 (the base sentinel);
         // first invalidation produces 2, so a client holding version 1 always
-        // sees a mismatch. Version 0 is reserved for "client has no cached schema".
+        // sees a mismatch. Version 0 is reserved for "client has no cached
+        // schema". The bump wraps 65535 → 1, never 0.
         let v = self.schema_version.entry(id).or_insert(1);
-        *v = bump_schema_version(*v);
+        *v = if *v == u16::MAX { 1 } else { *v + 1 };
     }
 
     /// Return the current schema version for `id`. Absent = version 1.
@@ -118,28 +132,16 @@ impl CatalogCacheSet {
 // ---------------------------------------------------------------------------
 
 impl CatalogEngine {
-    pub(crate) fn apply_schema_by_name(&mut self, batch: &Batch) -> Result<(), String> {
+    /// Maintain `schema_by_name` and `schema_by_id` from one pass over a
+    /// SCHEMA_TAB delta — the two caches share their lifecycle and key data.
+    pub(crate) fn apply_schema_caches(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let sid = batch.get_pk(i) as i64;
-            let name = self.read_batch_string(batch, i, 0);
+            let name = batch.read_payload_string(i, SCHEMATAB_PAY_NAME);
 
             if weight > 0 {
-                self.caches.schema_by_name.insert(name, sid);
-            } else {
-                self.caches.schema_by_name.remove(&name);
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn apply_schema_by_id(&mut self, batch: &Batch) -> Result<(), String> {
-        for i in 0..batch.count {
-            let weight = batch.get_weight(i);
-            let sid = batch.get_pk(i) as i64;
-
-            if weight > 0 {
-                let name = self.read_batch_string(batch, i, 0);
+                self.caches.schema_by_name.insert(name.clone(), sid);
                 self.caches.schema_by_id.insert(sid, name);
                 // Re-derive next_schema_id from the durable SCHEMA_TAB row so a
                 // crash-before-checkpoint never re-issues it (advance_sequence is
@@ -148,58 +150,45 @@ impl CatalogEngine {
                 // site — the role hook_{table,index}_register play for their ids.
                 raise_id_counter(&mut self.next_schema_id, sid);
             } else {
+                self.caches.schema_by_name.remove(&name);
                 self.caches.schema_by_id.remove(&sid);
             }
         }
         Ok(())
     }
 
-    pub(crate) fn apply_entity_by_qname(&mut self, batch: &Batch) -> Result<(), String> {
+    /// Maintain `entity_by_qname` and `entity_by_id` from one pass over a
+    /// TABLE_TAB or VIEW_TAB delta (the two families share the leading
+    /// `(schema_id, name)` payload prefix).
+    pub(crate) fn apply_entity_caches(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let tid = batch.get_pk(i) as i64;
 
             if weight > 0 {
-                let sid = self.read_batch_u64(batch, i, 0) as i64;
-                let name = self.read_batch_string(batch, i, 1);
-                let schema_name = self.caches.schema_by_id.get(&sid).map_or("", String::as_str);
+                let sid = batch.read_payload_u64(i, TABTAB_PAY_SCHEMA_ID) as i64;
+                let name = batch.read_payload_string(i, TABTAB_PAY_NAME);
+                let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
                 let qualified = format!("{schema_name}.{name}");
                 self.caches.entity_by_qname.insert(qualified, tid);
+                self.caches.entity_by_id.insert(tid, (schema_name, name));
             } else {
-                // entity_by_id is still present (ENTITY_BY_QNAME fires before ENTITY_BY_ID)
+                // Retract sequence (order is load-bearing): read the old name
+                // from entity_by_id → remove the qname → clear the per-table
+                // column caches → remove the id entry.
                 if let Some((sn, en)) = self.caches.entity_by_id.get(&tid) {
                     let qualified = format!("{sn}.{en}");
                     self.caches.entity_by_qname.remove(&qualified);
                 }
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn apply_entity_by_id(&mut self, batch: &Batch) -> Result<(), String> {
-        for i in 0..batch.count {
-            let weight = batch.get_weight(i);
-            let tid = batch.get_pk(i) as i64;
-
-            if weight > 0 {
-                let sid = self.read_batch_u64(batch, i, 0) as i64;
-                let name = self.read_batch_string(batch, i, 1);
-                let schema_name = self
-                    .caches
-                    .schema_by_id
-                    .get(&sid)
-                    .map_or_else(String::new, String::clone);
-                self.caches.entity_by_id.insert(tid, (schema_name, name));
-            } else {
-                // Table dropped: clear per-table cache entries without bumping the
-                // schema version (there is no new schema to advertise).
+                // Entity dropped: clear per-table cache entries without bumping
+                // the schema version (there is no new schema to advertise).
                 // `clear_col_cache_no_bump` is the only column-cache cleanup on
                 // the rollback path (`ctx.in_rollback()`) where
                 // `cascade_retract_columns` is skipped.
-                // The schema_version / index_version counters are NOT
-                // removed here: the column/index cascade fires AFTER this applier
-                // (apply_entity_by_id runs before hook_table_register) and would
-                // `or_insert` them straight back. They are purged post-cascade by
+                // The schema_version / index_version counters are NOT removed
+                // here: the column/index cascade fires AFTER this applier
+                // (it runs before hook_table_register) and would `or_insert`
+                // them straight back. They are purged post-cascade by
                 // `purge_table_versions` at the tail of the drop hook.
                 self.caches.clear_col_cache_no_bump(tid);
                 self.caches.entity_by_id.remove(&tid);
@@ -208,44 +197,38 @@ impl CatalogEngine {
         Ok(())
     }
 
-    pub(crate) fn apply_schema_of(&mut self, source_tid: i64, batch: &Batch) -> Result<(), String> {
-        let is_table = source_tid == TABLE_TAB_ID;
+    pub(crate) fn apply_schema_of(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
+        let is_table = family == SysFamily::Table;
 
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let tid = batch.get_pk(i) as i64;
-            let sid = self.read_batch_u64(batch, i, 0) as i64;
+            let sid = batch.read_payload_u64(i, TABTAB_PAY_SCHEMA_ID) as i64;
+            let members = if is_table {
+                &mut self.caches.tables_by_schema
+            } else {
+                &mut self.caches.views_by_schema
+            };
 
             if weight > 0 {
+                members.entry(sid).or_default().insert(tid);
                 self.caches.schema_of.insert(tid, sid);
-                if is_table {
-                    self.caches.tables_by_schema.entry(sid).or_default().insert(tid);
-                } else {
-                    self.caches.views_by_schema.entry(sid).or_default().insert(tid);
-                }
             } else {
-                self.caches.schema_of.remove(&tid);
-                if is_table {
-                    if let Entry::Occupied(mut e) = self.caches.tables_by_schema.entry(sid) {
-                        e.get_mut().remove(&tid);
-                        if e.get().is_empty() {
-                            e.remove();
-                        }
-                    }
-                } else if let Entry::Occupied(mut e) = self.caches.views_by_schema.entry(sid) {
+                if let Entry::Occupied(mut e) = members.entry(sid) {
                     e.get_mut().remove(&tid);
                     if e.get().is_empty() {
                         e.remove();
                     }
                 }
+                self.caches.schema_of.remove(&tid);
             }
         }
         Ok(())
     }
 
-    pub(crate) fn apply_pk_col_of(&mut self, source_tid: i64, batch: &Batch) -> Result<(), String> {
-        let is_table = source_tid == TABLE_TAB_ID;
-
+    /// `pk_pay_idx` is the payload index of the family's packed-PK column
+    /// (`TABTAB_PAY_PK_COL_IDX` / `VIEWTAB_PAY_PK_COL_IDX`).
+    pub(crate) fn apply_pk_col_of(&mut self, pk_pay_idx: usize, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let tid = batch.get_pk(i) as i64;
@@ -258,11 +241,7 @@ impl CatalogEngine {
                 // any other code can observe it. `PkColList::as_slice` is
                 // panic-free regardless. A view's PK is its persisted leading-k
                 // list (0..k for a compound-source projection, bare 0 otherwise).
-                let pk_list = if is_table {
-                    unpack_pk_cols(self.read_batch_u64(batch, i, 3))
-                } else {
-                    unpack_pk_cols(self.read_batch_u64(batch, i, VIEWTAB_PAY_PK_COL_IDX))
-                };
+                let pk_list = unpack_pk_cols(batch.read_payload_u64(i, pk_pay_idx));
                 // Invalidate only on a real change: retract-reinsert with an
                 // identical PK list would otherwise spuriously bump the version.
                 let old = self.caches.pk_col_of.insert(tid, pk_list);
@@ -278,7 +257,7 @@ impl CatalogEngine {
 
     pub(crate) fn apply_col_names_invalidate(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
-            let owner_id = self.read_batch_u64(batch, i, 0) as i64;
+            let owner_id = batch.read_payload_u64(i, COLTAB_PAY_OWNER_ID) as i64;
             self.caches.invalidate_col_names(owner_id);
         }
         Ok(())
@@ -288,7 +267,7 @@ impl CatalogEngine {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let idx_id = batch.get_pk(i) as i64;
-            let name = self.read_batch_string(batch, i, IDXTAB_PAY_NAME);
+            let name = batch.read_payload_string(i, IDXTAB_PAY_NAME);
 
             if weight > 0 {
                 self.caches.index_by_name.insert(name, idx_id);
@@ -303,23 +282,15 @@ impl CatalogEngine {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let idx_id = batch.get_pk(i) as i64;
-            let owner_id = self.read_batch_u64(batch, i, IDXTAB_PAY_OWNER_ID) as i64;
+            let owner_id = batch.read_payload_u64(i, IDXTAB_PAY_OWNER_ID) as i64;
 
             if weight > 0 {
-                let name = self.read_batch_string(batch, i, IDXTAB_PAY_NAME);
+                let name = batch.read_payload_string(i, IDXTAB_PAY_NAME);
                 self.caches.index_by_id.insert(idx_id, name);
                 self.caches.indices_by_owner.entry(owner_id).or_default().push(idx_id);
             } else {
                 self.caches.index_by_id.remove(&idx_id);
-                if let Entry::Occupied(mut e) = self.caches.indices_by_owner.entry(owner_id) {
-                    let ids = e.get_mut();
-                    if let Some(pos) = ids.iter().position(|&id| id == idx_id) {
-                        ids.swap_remove(pos);
-                    }
-                    if e.get().is_empty() {
-                        e.remove();
-                    }
-                }
+                remove_where(&mut self.caches.indices_by_owner, owner_id, |&id| id == idx_id);
             }
             // Bump unconditionally so DROP-then-recreate on the same column
             // changes the epoch even when the net (col_idx, is_unique) set looks
@@ -328,9 +299,10 @@ impl CatalogEngine {
             // within one DDL only ever costs a client a spurious re-fetch — it
             // is never incorrect, because the epoch is always validated against
             // a fresh fetch. The post-cascade purge (purge_table_versions)
-            // removes the entry an owner drop re-creates here.
+            // removes the entry an owner drop re-creates here. The bump wraps
+            // 255 → 1, never 0 (the client sentinel "no cached index list").
             let v = self.caches.index_version.entry(owner_id).or_insert(1);
-            *v = bump_index_version(*v);
+            *v = if *v == u8::MAX { 1 } else { *v + 1 };
         }
         Ok(())
     }
@@ -341,15 +313,15 @@ impl CatalogEngine {
     /// so decoding it once matters.
     pub(crate) fn apply_fk_constraints(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
-            let fk_table_id = self.read_batch_u64(batch, i, 6) as i64;
+            let fk_table_id = batch.read_payload_u64(i, COLTAB_PAY_FK_TABLE_ID) as i64;
             if fk_table_id == 0 {
                 continue;
             }
 
             let weight = batch.get_weight(i);
-            let owner_id = self.read_batch_u64(batch, i, 0) as i64;
-            let col_idx = self.read_batch_u64(batch, i, 2) as usize; // child col
-            let target_col_idx = self.read_batch_u64(batch, i, 7) as usize; // parent col (COL_TAB col 8)
+            let owner_id = batch.read_payload_u64(i, COLTAB_PAY_OWNER_ID) as i64;
+            let col_idx = batch.read_payload_u64(i, COLTAB_PAY_COL_IDX) as usize; // child col
+            let target_col_idx = batch.read_payload_u64(i, COLTAB_PAY_FK_COL_IDX) as usize; // parent col
 
             if weight > 0 {
                 let constraints = self.caches.fk_by_child.entry(owner_id).or_default();
@@ -372,58 +344,41 @@ impl CatalogEngine {
                     });
                 }
             } else {
-                if let Entry::Occupied(mut e) = self.caches.fk_by_child.entry(owner_id) {
-                    let constraints = e.get_mut();
-                    if let Some(pos) = constraints.iter().position(|c| c.fk_col_idx == col_idx) {
-                        constraints.swap_remove(pos);
-                    }
-                    if e.get().is_empty() {
-                        e.remove();
-                    }
-                }
-                if let Entry::Occupied(mut e) = self.caches.fk_by_parent.entry(fk_table_id) {
-                    let parents = e.get_mut();
-                    if let Some(pos) = parents
-                        .iter()
-                        .position(|r| r.child_tid == owner_id && r.fk_col_idx == col_idx)
-                    {
-                        parents.swap_remove(pos);
-                    }
-                    if e.get().is_empty() {
-                        e.remove();
-                    }
-                }
+                remove_where(&mut self.caches.fk_by_child, owner_id, |c| c.fk_col_idx == col_idx);
+                remove_where(&mut self.caches.fk_by_parent, fk_table_id, |r| {
+                    r.child_tid == owner_id && r.fk_col_idx == col_idx
+                });
             }
         }
         Ok(())
     }
 
-    pub(crate) fn apply_needs_lock(&mut self, source_tid: i64, batch: &Batch) -> Result<(), String> {
+    pub(crate) fn apply_needs_lock(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
         if batch.count == 0 {
             return Ok(());
         }
 
         let mut to_recompute = Vec::new();
 
-        match source_tid {
-            TABLE_TAB_ID => {
+        match family {
+            SysFamily::Table => {
                 to_recompute.reserve_exact(batch.count);
                 for i in 0..batch.count {
                     to_recompute.push(batch.get_pk(i) as i64);
                 }
             }
-            IDX_TAB_ID => {
+            SysFamily::Index => {
                 to_recompute.reserve_exact(batch.count);
                 for i in 0..batch.count {
-                    to_recompute.push(self.read_batch_u64(batch, i, 0) as i64);
+                    to_recompute.push(batch.read_payload_u64(i, IDXTAB_PAY_OWNER_ID) as i64);
                 }
             }
-            COL_TAB_ID => {
+            SysFamily::Column => {
                 to_recompute.reserve(batch.count * 2);
                 for i in 0..batch.count {
-                    let fk_table_id = self.read_batch_u64(batch, i, 6) as i64;
+                    let fk_table_id = batch.read_payload_u64(i, COLTAB_PAY_FK_TABLE_ID) as i64;
                     if fk_table_id != 0 {
-                        to_recompute.push(self.read_batch_u64(batch, i, 0) as i64);
+                        to_recompute.push(batch.read_payload_u64(i, COLTAB_PAY_OWNER_ID) as i64);
                         if self.dag.tables.contains_key(&fk_table_id) {
                             to_recompute.push(fk_table_id);
                         }
@@ -446,7 +401,8 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// Recompute and store needs_lock for `tid` from current cache + dag state.
+    /// Recompute needs_lock for `tid` from current cache + dag state, and
+    /// materialize its sorted lock set (see `CatalogCacheSet::needs_lock`).
     pub(crate) fn recompute_needs_lock(&mut self, tid: i64) {
         let fk_child_count = self.caches.fk_by_child.get(&tid).map_or(0, |v| v.len());
         let fk_parent_count = self.caches.fk_by_parent.get(&tid).map_or(0, |v| v.len());
@@ -456,7 +412,16 @@ impl CatalogEngine {
 
         let needs = fk_child_count > 0 || fk_parent_count > 0 || has_unique_index || unique_pk;
         if needs {
-            self.caches.needs_lock.insert(tid);
+            let mut tids = vec![tid];
+            if let Some(constraints) = self.caches.fk_by_child.get(&tid) {
+                tids.extend(constraints.iter().map(|c| c.target_table_id));
+            }
+            if let Some(children) = self.caches.fk_by_parent.get(&tid) {
+                tids.extend(children.iter().map(|r| r.child_tid));
+            }
+            tids.sort_unstable();
+            tids.dedup();
+            self.caches.needs_lock.insert(tid, tids);
         } else {
             self.caches.needs_lock.remove(&tid);
         }

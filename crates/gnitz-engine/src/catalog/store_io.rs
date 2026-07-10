@@ -20,55 +20,56 @@ impl CatalogEngine {
             .ok_or_else(|| format!("ingest failed for table_id={table_id}: not registered"))
     }
 
-    /// Scan all positive-weight rows from a table.
+    /// Scan all positive-weight rows from a table. Registry-uniform: system
+    /// tables are pre-registered `Borrowed` handles (whose `full_scan`
+    /// preserves the `Rc` snapshot cache), so one lookup serves every id —
+    /// the CIRCUIT_* tables are SQL-introspectable through it like any other.
     pub fn scan_family(&mut self, table_id: i64) -> Result<Rc<Batch>, String> {
-        let schema = self
-            .get_schema_desc(table_id)
+        let entry = self
+            .dag
+            .tables
+            .get(&table_id)
             .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
-        // The CIRCUIT_* tables are now SQL-introspectable: every operator's
-        // parameter shape is expressible in catalog schema.
-        if let Some(table) = self.sys_table_mut(table_id) {
-            return Ok(table.full_scan());
-        }
-        Ok(self.scan_store(table_id, &schema))
+        Ok(entry.handle.full_scan())
     }
 
     /// Point lookup by the wire seek pair. Decodes `(seek_pk, seek_pk_extra)` to
-    /// the OPK key at any PK width via `seek_opk_bytes`, then delegates to
-    /// [`seek_family_bytes`].
+    /// the OPK key at any PK width via `seek_opk_bytes`, then seeks — resolving
+    /// the registry entry once.
     pub fn seek_family(&mut self, table_id: i64, seek_pk: u128, seek_pk_extra: &[u8]) -> Result<Option<Batch>, String> {
-        let schema = self
-            .get_schema_desc(table_id)
+        let entry = self
+            .dag
+            .tables
+            .get(&table_id)
             .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
-        let (opk, stride) = crate::schema::seek_opk_bytes(&schema, seek_pk, seek_pk_extra)?;
-        self.seek_family_bytes(table_id, &opk[..stride])
+        let (opk, stride) = crate::schema::seek_opk_bytes(&entry.schema, seek_pk, seek_pk_extra)?;
+        Ok(Self::seek_entry_bytes(entry, &opk[..stride]))
+    }
+
+    /// Byte-keyed sibling of [`seek_family`] for callers that already hold the
+    /// OPK bytes — only the wide-PK tests seek through it directly.
+    /// Registry-uniform: system tables are pre-registered `Borrowed` handles,
+    /// so one lookup serves every id.
+    #[cfg(test)]
+    pub(crate) fn seek_family_bytes(&mut self, table_id: i64, pk: &[u8]) -> Result<Option<Batch>, String> {
+        let entry = self
+            .dag
+            .tables
+            .get(&table_id)
+            .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
+        Ok(Self::seek_entry_bytes(entry, pk))
     }
 
     /// The seek+materialise primitive: open the merged cursor, `seek_exact_live`
-    /// the OPK `pk` bytes, copy the row. Correct at any PK width — the delegate
-    /// target of [`seek_family`] (which encodes the wire pair to these bytes) and
-    /// the byte-keyed entry the wide-PK tests seek through directly.
-    pub fn seek_family_bytes(&mut self, table_id: i64, pk: &[u8]) -> Result<Option<Batch>, String> {
-        let schema = self
-            .get_schema_desc(table_id)
-            .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
-
-        let mut cursor = if table_id < FIRST_USER_TABLE_ID {
-            match self.sys_table_mut(table_id) {
-                Some(table) => table.open_cursor(),
-                None => return Ok(None),
-            }
-        } else {
-            self.dag.tables.get(&table_id).unwrap().handle.open_cursor()
-        };
-
+    /// the OPK `pk` bytes, copy the row. Correct at any PK width.
+    fn seek_entry_bytes(entry: &crate::query::TableEntry, pk: &[u8]) -> Option<Batch> {
+        let mut cursor = entry.handle.open_cursor();
         if !cursor.seek_exact_live(pk) {
-            return Ok(None);
+            return None;
         }
-
-        let mut batch = Batch::with_schema(schema, 1);
-        self.copy_cursor_row_to_batch(&cursor, &mut batch);
-        Ok(Some(batch))
+        let mut batch = Batch::with_schema(entry.schema, 1);
+        cursor.copy_current_row_into(&mut batch, cursor.current_weight);
+        Some(batch)
     }
 
     /// Batched point lookup. Open one cursor on `table_id` and seek each PK in
@@ -93,15 +94,15 @@ impl CatalogEngine {
         pks: &[crate::storage::PkBuf],
         project: &[u8],
     ) -> Result<Batch, String> {
-        let schema = self
+        let entry = self
             .dag
             .tables
             .get(&table_id)
-            .map(|e| e.schema)
             .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
+        let schema = entry.schema;
         let result_schema = project_schema(&schema, project);
         let mut out = Batch::with_schema(result_schema, pks.len());
-        let mut cursor = self.dag.tables.get(&table_id).unwrap().handle.open_cursor();
+        let mut cursor = entry.handle.open_cursor();
         for pk in pks {
             // Order is not required for correctness; `advance_to` is
             // backward-capable, so it matches `seek_exact_live` on any input and
@@ -111,6 +112,26 @@ impl CatalogEngine {
             }
         }
         Ok(out)
+    }
+
+    /// Resolve the `(table entry, index circuit)` pair for an index seek on
+    /// `(table_id, cols)`, with the shared unknown-table / no-index errors.
+    fn table_and_index(
+        &self,
+        table_id: i64,
+        cols: &[u32],
+    ) -> Result<(&crate::query::TableEntry, &crate::query::IndexCircuitEntry), String> {
+        let entry = self
+            .dag
+            .tables
+            .get(&table_id)
+            .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
+        let ic = entry
+            .index_circuits
+            .iter()
+            .find(|ic| ic.col_indices.as_slice() == cols)
+            .ok_or_else(|| format!("No index on cols {cols:?} for table {table_id}"))?;
+        Ok((entry, ic))
     }
 
     /// Index-assisted lookup: prefix-scan the index by `natives` — the native
@@ -130,17 +151,7 @@ impl CatalogEngine {
         col_indices: &[u32],
         natives: &[u128],
     ) -> Result<Option<Batch>, String> {
-        let entry = self
-            .dag
-            .tables
-            .get(&table_id)
-            .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
-
-        let ic = entry
-            .index_circuits
-            .iter()
-            .find(|ic| ic.col_indices.as_slice() == col_indices)
-            .ok_or_else(|| format!("No index on cols {col_indices:?} for table {table_id}"))?;
+        let (entry, ic) = self.table_and_index(table_id, col_indices)?;
 
         let src_schema = entry.schema;
         let src_pk_stride = src_schema.pk_stride() as usize;
@@ -276,16 +287,7 @@ impl CatalogEngine {
     ) -> Result<Option<Batch>, String> {
         use gnitz_wire::Cut;
 
-        let entry = self
-            .dag
-            .tables
-            .get(&table_id)
-            .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
-        let ic = entry
-            .index_circuits
-            .iter()
-            .find(|ic| ic.col_indices.as_slice() == col_indices)
-            .ok_or_else(|| format!("No index on cols {col_indices:?} for table {table_id}"))?;
+        let (entry, ic) = self.table_and_index(table_id, col_indices)?;
 
         // Precondition: the range column sits right after the equality prefix, so
         // `n_eq + 1` leading columns must exist. The worker validates this at the
@@ -395,40 +397,25 @@ impl CatalogEngine {
         }
     }
 
-    /// Worker DDL sync: ingest into system table + fire hooks. Workers receive
-    /// DDL deltas from master and update their registry; durability is
-    /// master-side (fsynced SAL + the master's own system-table flush). The
-    /// worker's inherited copy lives in RAM (memtable + `in_memory_l0`) and is
-    /// never flushed by the worker — only the master writes `_sys/` shards.
-    pub fn ddl_sync(&mut self, table_id: i64, batch: Batch) -> Result<(), String> {
+    /// Worker DDL sync: apply a master-broadcast system-table delta. Workers
+    /// update their registry from these; durability is master-side (fsynced
+    /// SAL + the master's own system-table flush). The worker's inherited copy
+    /// lives in RAM (memtable + `in_memory_l0`) and is never flushed by the
+    /// worker — only the master writes `_sys/` shards.
+    ///
+    /// Delegates to `apply_local` — the one ingest tail every path shares —
+    /// so hooks run AFTER the storage write here too; `hook_index_register`'s
+    /// DROP branch depends on the −1 row being applied before its remaining-
+    /// uniqueness rescan. Errors propagate into the worker's DdlSync-fatal
+    /// path (dispatch treats a DdlSync error as fatal: STATUS_ERROR + shutdown
+    /// and _exit, which the master's watchdog turns into a cluster abort) — a
+    /// swallowed failure here diverges this worker's catalog from the master.
+    pub fn ddl_sync(&mut self, table_id: i64, mut batch: Batch) -> Result<(), String> {
         let family = SysFamily::from_id(table_id).ok_or_else(|| "ddl_sync only for system tables".to_string())?;
-        // Fire hooks first (borrow only); the ingest below moves `batch`.
-        // Hooks have no observable ordering dependency on the storage write.
-        self.fire_hooks(family, &batch)?;
-        let table = self
-            .sys_table_mut(table_id)
-            .ok_or_else(|| format!("Unknown system table_id {table_id}"))?;
-        // Propagate into the worker's DdlSync-fatal path (dispatch treats a
-        // DdlSync error as fatal: STATUS_ERROR + shutdown + _exit, which the
-        // master's watchdog turns into a cluster abort). A swallowed
-        // storage failure here diverges this worker's catalog from the master.
-        table
-            .ingest_owned_batch(batch)
-            .map_err(|e| format!("ddl_sync: sys-table ingest failed (table_id={table_id}): {e}"))?;
-        Ok(())
+        self.apply_local(family, &mut batch, None)
     }
 
-    // -- Scan store -------------------------------------------------------
-
-    pub(crate) fn scan_store(&mut self, table_id: i64, schema: &SchemaDescriptor) -> Rc<Batch> {
-        let entry = match self.dag.tables.get(&table_id) {
-            Some(e) => e,
-            None => return Rc::new(Batch::empty_with_schema(schema)),
-        };
-        entry.handle.open_cursor().materialize()
-    }
-
-    /// Cursor-returning sibling of `scan_store` for callers that stream the
+    /// Cursor-returning sibling of `scan_family` for callers that stream the
     /// relation chunk-wise (`drain_chunk`) instead of materializing it whole.
     /// `None` when the table is unregistered — callers treat that as empty.
     /// User tables only; system tables keep `scan_family`.
@@ -455,6 +442,8 @@ fn copy_cursor_cols_to_batch(cursor: &ReadCursor, out: &mut Batch, src_schema: &
     out.extend_pk_bytes(cursor.current_pk_bytes());
     out.extend_weight(&1i64.to_le_bytes());
 
+    // One pass over the projection: the regions are independent append
+    // buffers, so the null word can be appended after the column data.
     let src_null = cursor.current_null_word;
     let mut proj_null = 0u64;
     for (k, &p) in project.iter().enumerate() {
@@ -467,10 +456,6 @@ fn copy_cursor_cols_to_batch(cursor: &ReadCursor, out: &mut Batch, src_schema: &
         if src_null & (1u64 << pi) != 0 {
             proj_null |= 1u64 << k;
         }
-    }
-    out.extend_null_bmp(&proj_null.to_le_bytes());
-
-    for (k, &p) in project.iter().enumerate() {
         let col_size = src_schema.columns[p as usize].size() as usize;
         let ptr = cursor.col_ptr(p as usize, col_size);
         if !ptr.is_null() {
@@ -480,6 +465,7 @@ fn copy_cursor_cols_to_batch(cursor: &ReadCursor, out: &mut Batch, src_schema: &
             out.fill_col_zero(k, col_size);
         }
     }
+    out.extend_null_bmp(&proj_null.to_le_bytes());
     out.count += 1;
 }
 

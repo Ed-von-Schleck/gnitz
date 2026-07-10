@@ -127,6 +127,23 @@ impl CatalogEngine {
         r
     }
 
+    /// Run `f` with `dir` pre-staged in `pending_dir_deletions`: on `Ok` the
+    /// staged entry is removed (the directory is live), on `Err` it stays
+    /// queued so compensation / the failed-DDL drain reclaims whatever `f`
+    /// created on disk. The one spelling of the stage-then-truncate
+    /// crash-cleanup idiom — forgetting the truncate is unrepresentable.
+    pub(super) fn with_staged_dir<T>(
+        &mut self,
+        dir: String,
+        f: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let cleanup_idx = self.pending_dir_deletions.len();
+        self.pending_dir_deletions.push(dir);
+        let r = f(self)?;
+        self.pending_dir_deletions.truncate(cleanup_idx);
+        Ok(r)
+    }
+
     /// Run `f` as part of an owner-drop index-retraction cascade: precheck's
     /// IDX_TAB FK-target guard is suppressed for its duration. Save/restore
     /// rather than blind reset so a nested cascade cannot re-enable the guard

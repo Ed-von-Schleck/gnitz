@@ -58,39 +58,33 @@ impl CatalogDeltaSink for CatalogEngine {
 }
 
 impl CatalogEngine {
-    // -- System table accessor -----------------------------------------------
+    // -- System table accessors ------------------------------------------------
+    //
+    // Ids are non-contiguous, so every id-keyed access routes through
+    // `SysFamily::from_id`; the by-family accessors are infallible.
 
-    /// Map a system table ID to a mutable reference. Returns None for unknown IDs.
+    /// This family's owned store.
+    pub(crate) fn sys_store(&self, family: SysFamily) -> &Table {
+        &self.sys_stores[family.index()]
+    }
+
+    pub(crate) fn sys_store_mut(&mut self, family: SysFamily) -> &mut Table {
+        &mut self.sys_stores[family.index()]
+    }
+
+    /// Raw pointer to this family's store — stable across engine moves (the
+    /// store is boxed), for the `Borrowed` DAG registrations.
+    pub(crate) fn sys_store_ptr(&mut self, family: SysFamily) -> *mut Table {
+        &mut *self.sys_stores[family.index()]
+    }
+
+    /// Map a system table ID to a reference. Returns None for unknown IDs.
     pub(crate) fn sys_table(&self, table_id: i64) -> Option<&Table> {
-        match table_id {
-            SCHEMA_TAB_ID => Some(&self.sys_schemas),
-            TABLE_TAB_ID => Some(&self.sys_tables),
-            VIEW_TAB_ID => Some(&self.sys_views),
-            COL_TAB_ID => Some(&self.sys_columns),
-            IDX_TAB_ID => Some(&self.sys_indices),
-            DEP_TAB_ID => Some(&self.sys_view_deps),
-            SEQ_TAB_ID => Some(&self.sys_sequences),
-            CIRCUIT_NODES_TAB_ID => Some(&self.sys_circuit_nodes),
-            CIRCUIT_EDGES_TAB_ID => Some(&self.sys_circuit_edges),
-            CIRCUIT_NODE_COLUMNS_TAB_ID => Some(&self.sys_circuit_node_columns),
-            _ => None,
-        }
+        SysFamily::from_id(table_id).map(|f| self.sys_store(f))
     }
 
     pub(crate) fn sys_table_mut(&mut self, table_id: i64) -> Option<&mut Table> {
-        match table_id {
-            SCHEMA_TAB_ID => Some(&mut self.sys_schemas),
-            TABLE_TAB_ID => Some(&mut self.sys_tables),
-            VIEW_TAB_ID => Some(&mut self.sys_views),
-            COL_TAB_ID => Some(&mut self.sys_columns),
-            IDX_TAB_ID => Some(&mut self.sys_indices),
-            DEP_TAB_ID => Some(&mut self.sys_view_deps),
-            SEQ_TAB_ID => Some(&mut self.sys_sequences),
-            CIRCUIT_NODES_TAB_ID => Some(&mut self.sys_circuit_nodes),
-            CIRCUIT_EDGES_TAB_ID => Some(&mut self.sys_circuit_edges),
-            CIRCUIT_NODE_COLUMNS_TAB_ID => Some(&mut self.sys_circuit_node_columns),
-            _ => None,
-        }
+        SysFamily::from_id(table_id).map(|f| &mut *self.sys_stores[f.index()])
     }
 
     /// Apply one delta to its family's storage and fire the reaction hooks —
@@ -102,7 +96,12 @@ impl CatalogEngine {
     /// (`ZoneLsnAllocator::reserve`), so even counters drifted by un-pinned
     /// auto-bump ingests sit strictly below the zone LSN pinning them. Does NOT
     /// broadcast.
-    fn apply_local(&mut self, family: SysFamily, batch: &mut Batch, pin_lsn: Option<NonZeroU64>) -> Result<(), String> {
+    pub(super) fn apply_local(
+        &mut self,
+        family: SysFamily,
+        batch: &mut Batch,
+        pin_lsn: Option<NonZeroU64>,
+    ) -> Result<(), String> {
         let id = family.id();
         let table = self
             .sys_table_mut(id)
@@ -140,15 +139,6 @@ impl CatalogEngine {
                 Ok(())
             }
         }
-    }
-
-    /// Precheck one system-family delta (the CREATE/DROP invariant guards) with
-    /// no mutation — the read-only half of [`CatalogDeltaSink::submit`]. Exposed
-    /// so the `DDL_TXN` handler can precheck a family, set its rollback marker,
-    /// then apply it, leaving the marker `None` iff the precheck failed (so a
-    /// precheck rejection reconstructs no ghost row on rollback).
-    pub(crate) fn precheck_family(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
-        self.precheck_sys_ingest(table_id, batch)
     }
 
     /// Apply one system-family delta to storage, fire its hooks, and enqueue it
@@ -230,7 +220,7 @@ impl CatalogEngine {
     /// bare compare would never match a packed row. Rows that have already netted
     /// to zero weight are skipped by the cursor.
     pub(crate) fn for_each_index_on_cols(&self, owner_id: i64, cols: &[u32], mut f: impl FnMut(i64, bool)) {
-        let mut cursor = self.sys_indices.open_cursor();
+        let mut cursor = self.sys_store(SysFamily::Index).open_cursor();
         while cursor.valid {
             if cursor.current_weight > 0 {
                 let row_owner = cursor_read_u64(&cursor, IDXTAB_COL_OWNER_ID) as i64;
@@ -245,12 +235,61 @@ impl CatalogEngine {
         }
     }
 
-    /// Validate a system-table write before any mutation (memtable or hooks).
-    /// Covers both positive-weight (CREATE) invariants and negative-weight (DROP)
-    /// integrity guards so that no invalid state is ever written.
-    fn precheck_sys_ingest(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
-        if table_id != SCHEMA_TAB_ID && table_id != TABLE_TAB_ID && table_id != VIEW_TAB_ID && table_id != IDX_TAB_ID {
-            return Ok(());
+    /// The shared IDX_TAB registration guards: a well-formed column list and a
+    /// base-table owner (returned for the callers' schema/context reads).
+    ///
+    /// Only base tables can own a secondary index: index projection runs only
+    /// on the base-table DML paths (`ingest_store_and_indices`); view deltas
+    /// land via the circuit-evaluation terminal-view moves, which never
+    /// project into `index_circuits`. An index on a view would backfill once
+    /// and then silently serve stale results. The SQL binder rejects this by
+    /// name resolution; the precheck rejects a raw wire push before the row is
+    /// persisted or broadcast, and `hook_index_register` re-checks for the
+    /// paths that skip precheck (boot replay, worker ddl_sync).
+    pub(crate) fn validate_index_registration(
+        &self,
+        owner_id: i64,
+        cols: &PkColList,
+    ) -> Result<&crate::query::TableEntry, String> {
+        if !cols.is_well_formed() {
+            return Err(format!(
+                "Index: column list count {} out of range 1..={}",
+                cols.decoded_count(),
+                gnitz_wire::PK_LIST_MAX_COLS
+            ));
+        }
+        let entry = self
+            .dag
+            .tables
+            .get(&owner_id)
+            .ok_or_else(|| format!("Index: owner table {owner_id} not found"))?;
+        if !entry.kind.is_base_table() {
+            return Err(format!("Index: owner {owner_id} is not a base table"));
+        }
+        Ok(entry)
+    }
+
+    /// Validate a system-table write before any mutation (memtable or hooks) —
+    /// the read-only half of [`CatalogDeltaSink::submit`]. Covers both
+    /// positive-weight (CREATE) invariants and negative-weight (DROP) integrity
+    /// guards so that no invalid state is ever written. Also called directly by
+    /// the `DDL_TXN` handler, which prechecks a family, sets its rollback
+    /// marker, then applies it — leaving the marker `None` iff the precheck
+    /// failed (so a precheck rejection reconstructs no ghost row on rollback).
+    pub(crate) fn precheck_family(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
+        // Exhaustive over `SysFamily` (like `fire_hooks`): a newly-added family
+        // must decide here whether it carries precheck guards.
+        match SysFamily::from_id(table_id) {
+            Some(SysFamily::Schema | SysFamily::Table | SysFamily::View | SysFamily::Index) => {}
+            Some(
+                SysFamily::Column
+                | SysFamily::ViewDep
+                | SysFamily::Sequence
+                | SysFamily::CircuitNodes
+                | SysFamily::CircuitEdges
+                | SysFamily::CircuitNodeColumns,
+            )
+            | None => return Ok(()),
         }
 
         // -- Positive-weight (CREATE) checks ----------------------------------
@@ -261,114 +300,53 @@ impl CatalogEngine {
 
             match table_id {
                 SCHEMA_TAB_ID => {
-                    let name = self.read_batch_string(batch, i, 0);
+                    let name = batch.read_payload_string(i, SCHEMATAB_PAY_NAME);
                     if self.caches.schema_by_name.contains_key(&name) {
                         return Err(format!("Schema already exists: {name}"));
                     }
                 }
                 TABLE_TAB_ID => {
                     let tid = batch.get_pk(i) as i64;
-                    let sid = self.read_batch_u64(batch, i, 0) as i64;
-                    let name = self.read_batch_string(batch, i, 1);
-                    let pk = unpack_pk_cols(self.read_batch_u64(batch, i, 3));
+                    let sid = batch.read_payload_u64(i, TABTAB_PAY_SCHEMA_ID) as i64;
+                    let name = batch.read_payload_string(i, TABTAB_PAY_NAME);
+                    let pk = unpack_pk_cols(batch.read_payload_u64(i, TABTAB_PAY_PK_COL_IDX));
 
                     // Collect ColumnDefs, rejecting any gap/duplicate in the
                     // column-index sequence (would mismap columns downstream).
                     let col_defs = self.scan_column_defs(tid, true)?;
-
-                    if col_defs.is_empty() {
-                        return Err(format!(
-                            "catalog invariant violated: table '{name}' (tid={tid}) registered \
-                             before its column records. COL_TAB writes must precede \
-                             TABLE_TAB writes (see hooks.rs dispatch doc)."
-                        ));
-                    }
-                    validate_pk_cols(&col_defs, &pk)?;
-                    if col_defs.len() > crate::schema::MAX_COLUMNS {
-                        return Err(format!(
-                            "table '{}' (tid={}) has {} columns (max {})",
-                            name,
-                            tid,
-                            col_defs.len(),
-                            crate::schema::MAX_COLUMNS
-                        ));
-                    }
+                    validate_relation_defs("table", tid, &name, &col_defs, &pk)?;
 
                     let first_pk = pk.as_slice()[0];
                     let self_pk_type = col_defs[first_pk as usize].type_code;
-                    for (col_idx, cd) in col_defs.iter().enumerate() {
-                        if cd.fk_table_id != 0 {
-                            self.validate_fk_column(cd, col_idx, tid, first_pk, self_pk_type)?;
-                        }
+                    for cd in col_defs.iter().filter(|cd| cd.fk_table_id != 0) {
+                        self.validate_fk_column(cd, tid, first_pk, self_pk_type)?;
                     }
 
                     self.precheck_qname_unique(sid, &name, tid)?;
                 }
                 VIEW_TAB_ID => {
                     let vid = batch.get_pk(i) as i64;
-                    let sid = self.read_batch_u64(batch, i, 0) as i64;
-                    let name = self.read_batch_string(batch, i, 1);
+                    let sid = batch.read_payload_u64(i, VIEWTAB_PAY_SCHEMA_ID) as i64;
+                    let name = batch.read_payload_string(i, VIEWTAB_PAY_NAME);
+                    let pk = unpack_pk_cols(batch.read_payload_u64(i, VIEWTAB_PAY_PK_COL_IDX));
 
-                    // Reject any gap/duplicate in the column-index sequence;
-                    // only the count is needed here.
-                    let col_count = self.scan_column_defs(vid, true)?.len();
-                    if col_count == 0 {
-                        return Err(format!(
-                            "catalog invariant violated: view '{name}' (vid={vid}) registered \
-                             before its column records. COL_TAB writes must precede \
-                             VIEW_TAB writes (see hooks.rs dispatch doc)."
-                        ));
-                    }
-                    // Reject an over-wide view here — before apply_entity_by_qname
-                    // mutates the caches — so a rejected DDL leaves clean state,
-                    // mirroring the TABLE_TAB precheck above. hook_view_register
-                    // carries the same guard as the build_schema_from_col_defs
-                    // assert backstop.
-                    if col_count > crate::schema::MAX_COLUMNS {
-                        return Err(format!(
-                            "view '{}' (vid={}) has {} columns (max {})",
-                            name,
-                            vid,
-                            col_count,
-                            crate::schema::MAX_COLUMNS
-                        ));
-                    }
+                    // Reject any gap/duplicate in the column-index sequence.
+                    // Rejecting here — before apply_entity_caches mutates the
+                    // caches — leaves clean state on a failed DDL, mirroring the
+                    // TABLE_TAB arm; hook_view_register re-runs the same
+                    // validator for the paths that skip precheck.
+                    let col_defs = self.scan_column_defs(vid, true)?;
+                    validate_relation_defs("view", vid, &name, &col_defs, &pk)?;
                     self.precheck_qname_unique(sid, &name, vid)?;
                 }
                 IDX_TAB_ID => {
-                    let owner_id = self.read_batch_u64(batch, i, 0) as i64;
+                    let owner_id = batch.read_payload_u64(i, IDXTAB_PAY_OWNER_ID) as i64;
                     // source_cols carries pack_pk_cols(&col_indices); decode and
                     // validate each column (a single-column index is the 1-element
                     // degenerate case).
-                    let cols = gnitz_wire::unpack_pk_cols(self.read_batch_u64(batch, i, 2));
-                    let index_name = self.read_batch_string(batch, i, 3);
-                    if !cols.is_well_formed() {
-                        return Err(format!(
-                            "Index: column list count {} out of range 1..={}",
-                            cols.decoded_count(),
-                            gnitz_wire::PK_LIST_MAX_COLS
-                        ));
-                    }
-
-                    let entry = self
-                        .dag
-                        .tables
-                        .get(&owner_id)
-                        .ok_or_else(|| format!("Index: owner table {owner_id} not found"))?;
-
-                    // Only base tables can own a secondary index: index
-                    // projection runs only on the base-table DML paths
-                    // (`ingest_store_and_indices`); view deltas land via the
-                    // circuit-evaluation terminal-view moves, which never
-                    // project into `index_circuits`. An index on a view would
-                    // backfill once and then silently serve stale results. The
-                    // SQL binder rejects this by name resolution; this precheck
-                    // rejects a raw wire push before the row is persisted or
-                    // broadcast, and `hook_index_register` re-checks for the
-                    // paths that skip precheck (boot replay, worker ddl_sync).
-                    if !entry.kind.is_base_table() {
-                        return Err(format!("Index: owner {owner_id} is not a base table"));
-                    }
+                    let cols = gnitz_wire::unpack_pk_cols(batch.read_payload_u64(i, IDXTAB_PAY_SOURCE_COLS));
+                    let index_name = batch.read_payload_string(i, IDXTAB_PAY_NAME);
+                    let entry = self.validate_index_registration(owner_id, &cols)?;
 
                     // Bounds, per-column eligibility (STRING/BLOB/float), and
                     // arity/stride limits, identical to what registration will
@@ -446,7 +424,7 @@ impl CatalogEngine {
                     }
                 }
                 let (owner_id, cols) = {
-                    let mut cursor = self.sys_indices.open_cursor();
+                    let mut cursor = self.sys_store(SysFamily::Index).open_cursor();
                     // sys_indices has a single U64 PK; OPK == big-endian.
                     cursor.seek_bytes(&(idx_id as u64).to_be_bytes());
                     if !cursor.valid || cursor.current_key_narrow() as u64 != idx_id as u64 {
@@ -722,35 +700,10 @@ impl CatalogEngine {
     // Stage-A compensation (DDL rollback)
     // -----------------------------------------------------------------------
 
-    /// Topological creation priority for the catalog family order. Lower =
-    /// earlier in the dependency chain (created first, destroyed last). Used both
-    /// to order the `DDL_TXN` handler's ascending forward ingest (so every
-    /// register/index hook sees its dependencies already in the memtable) and to
-    /// order rollback's descending negate. Priorities must be distinct for
-    /// TABLE_TAB and VIEW_TAB so the relative order is stable.
+    /// Topological creation priority for the catalog family order (see
+    /// `SysFamilyInfo::topo_priority`); 99 for a non-family tid.
     pub(crate) fn catalog_topo_priority(tid: i64) -> u8 {
-        match tid {
-            SCHEMA_TAB_ID => 0,
-            COL_TAB_ID => 1,
-            DEP_TAB_ID => 2,
-            CIRCUIT_NODES_TAB_ID => 3,
-            CIRCUIT_EDGES_TAB_ID => 4,
-            CIRCUIT_NODE_COLUMNS_TAB_ID => 5,
-            TABLE_TAB_ID => 6,
-            VIEW_TAB_ID => 7,
-            IDX_TAB_ID => 8,
-            _ => 99,
-        }
-    }
-
-    /// Negate every row's weight in-place.
-    pub(crate) fn negate_batch_in_place(batch: &mut Batch) {
-        for i in 0..batch.count {
-            let w = batch.get_weight(i);
-            let negated = (-w).to_le_bytes();
-            let off = i * 8;
-            batch.weight_data_mut()[off..off + 8].copy_from_slice(&negated);
-        }
+        SysFamily::from_id(tid).map_or(99, |f| f.info().topo_priority)
     }
 
     /// Compensate a failed `DDL_TXN` bundle: undo every in-memory mutation that
@@ -810,7 +763,7 @@ impl CatalogEngine {
         // calls back into `submit` also bypasses broadcasts.
         let result = self.with_rollback_compensation(|s| -> Result<(), String> {
             for (tid, mut batch) in rollback_list {
-                Self::negate_batch_in_place(&mut batch);
+                batch.map_weights(i64::wrapping_neg);
                 let family = SysFamily::from_id(tid).ok_or_else(|| format!("rollback: unknown system family {tid}"))?;
                 s.submit_local(family, batch)?;
             }

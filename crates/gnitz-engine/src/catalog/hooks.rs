@@ -43,46 +43,39 @@ impl CatalogEngine {
     //     before COL_TAB, but `read_column_defs` reads sys_columns storage
     //     directly (loaded at open time), not the cache, so the ordering
     //     holds.
-    //
-    // Retraction dependencies to be aware of:
-    //   * apply_entity_by_qname reads entity_by_id on retract → must fire before apply_entity_by_id.
-
     pub(crate) fn fire_hooks(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
         // Exhaustive over `SysFamily`: a newly-added family is a compile error
         // here, not a silently-skipped `_` arm. The no-op families
         // (Sequence/Circuit*) are named, not swallowed by a wildcard.
         match family {
             SysFamily::Schema => {
-                self.apply_schema_by_name(batch)?;
-                self.apply_schema_by_id(batch)?;
+                self.apply_schema_caches(batch)?;
                 self.hook_schema_dir(batch)?;
             }
             SysFamily::Table => {
-                self.apply_entity_by_qname(batch)?;
-                self.apply_entity_by_id(batch)?;
-                self.apply_schema_of(TABLE_TAB_ID, batch)?;
-                self.apply_pk_col_of(TABLE_TAB_ID, batch)?;
+                self.apply_entity_caches(batch)?;
+                self.apply_schema_of(SysFamily::Table, batch)?;
+                self.apply_pk_col_of(TABTAB_PAY_PK_COL_IDX, batch)?;
                 self.hook_table_register(batch)?;
-                self.apply_needs_lock(TABLE_TAB_ID, batch)?;
+                self.apply_needs_lock(SysFamily::Table, batch)?;
                 self.hook_cascade_fk(batch)?;
             }
             SysFamily::View => {
-                self.apply_entity_by_qname(batch)?;
-                self.apply_entity_by_id(batch)?;
-                self.apply_schema_of(VIEW_TAB_ID, batch)?;
-                self.apply_pk_col_of(VIEW_TAB_ID, batch)?;
+                self.apply_entity_caches(batch)?;
+                self.apply_schema_of(SysFamily::View, batch)?;
+                self.apply_pk_col_of(VIEWTAB_PAY_PK_COL_IDX, batch)?;
                 self.hook_view_register(batch)?;
             }
             SysFamily::Column => {
                 self.apply_col_names_invalidate(batch)?;
                 self.apply_fk_constraints(batch)?;
-                self.apply_needs_lock(COL_TAB_ID, batch)?;
+                self.apply_needs_lock(SysFamily::Column, batch)?;
             }
             SysFamily::Index => {
                 self.apply_index_by_name(batch)?;
                 self.apply_index_by_id(batch)?;
                 self.hook_index_register(batch)?;
-                self.apply_needs_lock(IDX_TAB_ID, batch)?;
+                self.apply_needs_lock(SysFamily::Index, batch)?;
             }
             SysFamily::ViewDep => {
                 self.dag.invalidate_dep_map();
@@ -110,7 +103,7 @@ impl CatalogEngine {
                 continue;
             }
             let seq_id = batch.get_pk(i) as i64;
-            let hw = self.read_batch_u64(batch, i, SEQTAB_PAY_VALUE) as i64;
+            let hw = batch.read_payload_u64(i, SEQTAB_PAY_VALUE) as i64;
             self.observe_user_sequence(seq_id, hw);
         }
         Ok(())
@@ -121,7 +114,7 @@ impl CatalogEngine {
     fn hook_schema_dir(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
-            let name = self.read_batch_string(batch, i, 0);
+            let name = batch.read_payload_string(i, SCHEMATAB_PAY_NAME);
             let path = schema_dir(&self.base_dir, &name);
             if weight > 0 {
                 // A prior DROP SCHEMA may have queued this exact (name-based)
@@ -129,14 +122,9 @@ impl CatalogEngine {
                 // cancel that, or the gating checkpoint would wipe the new
                 // schema and its tables.
                 self.cancel_gated_deletion(&path);
-                // Pre-stage for cleanup before ensure_dir so that if Stage-A
-                // fails after the directory is created, compensate_stage_a's
-                // drain_pending_dir_deletions removes it.
-                let cleanup_idx = self.pending_dir_deletions.len();
-                self.pending_dir_deletions.push(path.clone());
-                ensure_dir(&path)?;
-                // Success: remove the pre-staged entry.
-                self.pending_dir_deletions.truncate(cleanup_idx);
+                // Staged so that if Stage-A fails after the directory is
+                // created, compensate_stage_a's drain removes it.
+                self.with_staged_dir(path.clone(), |_| ensure_dir(&path))?;
                 fsync_dir(&path);
                 fsync_dir(&self.base_dir);
             } else {
@@ -153,12 +141,10 @@ impl CatalogEngine {
     /// (e.g.) ephemeral-but-Pk-tagged. Only user relations are built here
     /// (system catalog tables are plain single `Table`s built at bootstrap),
     /// so the partition count is always `NUM_PARTITIONS`.
-    /// The pre-stage/truncate crash-cleanup that wraps the call in
-    /// `hook_table_register`/`hook_view_register` (`pending_dir_deletions` push then
-    /// truncate) is deliberately left at each call site: this helper takes `&self`
-    /// and is pure construction, so callers own crash-cleanup. Hoisting it would need
-    /// `&mut self` and still would not unify with the index path, whose cleanup also
-    /// wraps `backfill_index`.
+    /// The `with_staged_dir` crash-cleanup wrapping the call in
+    /// `hook_table_register`/`hook_view_register` is deliberately left at each
+    /// call site: this helper takes `&self` and is pure construction, so
+    /// callers own crash-cleanup.
     pub(crate) fn build_partitioned_storage(
         &self,
         kind: RelationKind,
@@ -232,10 +218,10 @@ impl CatalogEngine {
                     continue;
                 }
 
-                let sid = self.read_batch_u64(batch, i, 0) as i64;
-                let name = self.read_batch_string(batch, i, 1);
-                let pk = unpack_pk_cols(self.read_batch_u64(batch, i, 3));
-                let flags = self.read_batch_u64(batch, i, 5);
+                let sid = batch.read_payload_u64(i, TABTAB_PAY_SCHEMA_ID) as i64;
+                let name = batch.read_payload_string(i, TABTAB_PAY_NAME);
+                let pk = unpack_pk_cols(batch.read_payload_u64(i, TABTAB_PAY_PK_COL_IDX));
+                let flags = batch.read_payload_u64(i, TABTAB_PAY_FLAGS);
                 let is_unique = gnitz_wire::table_flags_unique(flags);
                 // Distribution prefix length k (0 = default = full PK).
                 // `new_with_dist` clamps an out-of-range k, so a crafted flag
@@ -262,27 +248,7 @@ impl CatalogEngine {
                 }
 
                 let col_defs = self.read_column_defs(tid);
-                if col_defs.is_empty() {
-                    return Err(format!(
-                        "catalog invariant violated: table '{name}' (tid={tid}) registered \
-                         before its column records. COL_TAB writes must precede \
-                         TABLE_TAB writes (see hooks.rs dispatch doc).",
-                    ));
-                }
-
-                validate_pk_cols(&col_defs, &pk)?;
-
-                if col_defs.len() > crate::schema::MAX_COLUMNS {
-                    return Err(format!(
-                        "catalog invariant violated: table '{}' (tid={}) has {} column defs (max {}); \
-                         type_codes={:?}",
-                        name,
-                        tid,
-                        col_defs.len(),
-                        crate::schema::MAX_COLUMNS,
-                        col_defs.iter().map(|c| c.type_code).collect::<Vec<_>>(),
-                    ));
-                }
+                validate_relation_defs("table", tid, &name, &col_defs, &pk)?;
 
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
                 let directory = table_dir(&self.base_dir, &schema_name, &name, tid);
@@ -300,13 +266,11 @@ impl CatalogEngine {
                     tid,
                     NUM_PARTITIONS
                 );
-                // Pre-stage for cleanup so that if Stage-A fails after the table
-                // directory is created, compensate_stage_a's drain removes it.
-                let cleanup_idx = self.pending_dir_deletions.len();
-                self.pending_dir_deletions.push(directory.clone());
-                let pt = self.build_partitioned_storage(kind, &directory, &name, tid, tbl_schema, is_replicated)?;
-                // Success: remove the pre-staged entry.
-                self.pending_dir_deletions.truncate(cleanup_idx);
+                // Staged so that if Stage-A fails after the table directory
+                // is created, compensate_stage_a's drain removes it.
+                let pt = self.with_staged_dir(directory.clone(), |s| {
+                    s.build_partitioned_storage(kind, &directory, &name, tid, tbl_schema, is_replicated)
+                })?;
 
                 fsync_dir(&schema_dir(&self.base_dir, &schema_name));
                 self.dag.register_table(
@@ -363,7 +327,7 @@ impl CatalogEngine {
         // DROP INDEX, so the IDX_TAB integrity guard must not block them.
         self.with_cascade_drop(|s| {
             for idx_id in idx_ids {
-                let batch = retract_single_row(&s.sys_indices, &schema, idx_id as u128);
+                let batch = retract_single_row(s.sys_store(SysFamily::Index), &schema, idx_id as u128);
                 if batch.count > 0 {
                     s.submit(SysFamily::Index, batch)?;
                 }
@@ -375,7 +339,7 @@ impl CatalogEngine {
     fn cascade_retract_columns(&mut self, owner_id: i64) -> Result<(), String> {
         let schema = sys_tab_schema(COL_TAB_ID);
         let batch = retract_rows_in_pk_range(
-            &self.sys_columns,
+            self.sys_store(SysFamily::Column),
             &schema,
             pack_column_id(owner_id, 0) as u128,
             pack_column_id(owner_id + 1, 0) as u128,
@@ -398,41 +362,21 @@ impl CatalogEngine {
                     continue;
                 }
 
-                let sid = self.read_batch_u64(batch, i, 0) as i64;
-                let name = self.read_batch_string(batch, i, 1);
-
-                let col_defs = self.read_column_defs(vid);
-                if col_defs.is_empty() {
-                    return Err(format!(
-                        "catalog invariant violated: view '{name}' (vid={vid}) registered \
-                         before its column records. COL_TAB writes must precede \
-                         VIEW_TAB writes (see hooks.rs dispatch doc).",
-                    ));
-                }
+                let sid = batch.read_payload_u64(i, VIEWTAB_PAY_SCHEMA_ID) as i64;
+                let name = batch.read_payload_string(i, VIEWTAB_PAY_NAME);
 
                 // The view's physical PK is the persisted leading-k column list:
                 // a single synthetic hash column for join/set-op/distinct views,
                 // or the source PK passed through (0..k) for a plain projection
                 // over a compound-PK table. A bare `0` decodes back to `[0]`.
-                let pk = unpack_pk_cols(self.read_batch_u64(batch, i, VIEWTAB_PAY_PK_COL_IDX));
-                validate_pk_cols(&col_defs, &pk)?;
-
-                // Mirror hook_table_register: reject an over-wide schema cleanly
-                // rather than letting build_schema_from_col_defs' assert abort the
-                // catalog/worker process. Compound-PK plain projection makes this
-                // reachable — projection prepends the k source PK columns, so
-                // SELECT * over a wide compound-PK table can cross MAX_COLUMNS.
-                if col_defs.len() > crate::schema::MAX_COLUMNS {
-                    return Err(format!(
-                        "catalog invariant violated: view '{}' (vid={}) has {} column defs (max {}); \
-                         type_codes={:?}",
-                        name,
-                        vid,
-                        col_defs.len(),
-                        crate::schema::MAX_COLUMNS,
-                        col_defs.iter().map(|c| c.type_code).collect::<Vec<_>>()
-                    ));
-                }
+                // The over-wide rejection inside `validate_relation_defs` is
+                // genuinely reachable here: compound-PK plain projection
+                // prepends the k source PK columns, so SELECT * over a wide
+                // compound-PK table can cross MAX_COLUMNS — a clean error beats
+                // build_schema_from_col_defs' assert aborting the process.
+                let col_defs = self.read_column_defs(vid);
+                let pk = unpack_pk_cols(batch.read_payload_u64(i, VIEWTAB_PAY_PK_COL_IDX));
+                validate_relation_defs("view", vid, &name, &col_defs, &pk)?;
 
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
                 let directory = view_dir(&self.base_dir, &schema_name, &name, vid);
@@ -457,11 +401,9 @@ impl CatalogEngine {
                 let has_replicated_source = source_ids
                     .iter()
                     .any(|id| self.dag.tables.get(id).is_some_and(|e| e.schema.replicated()));
-                let cleanup_idx = self.pending_dir_deletions.len();
-                self.pending_dir_deletions.push(directory.clone());
-                let et =
-                    self.build_partitioned_storage(kind, &directory, &name, vid, view_schema, has_replicated_source)?;
-                self.pending_dir_deletions.truncate(cleanup_idx);
+                let et = self.with_staged_dir(directory.clone(), |s| {
+                    s.build_partitioned_storage(kind, &directory, &name, vid, view_schema, has_replicated_source)
+                })?;
 
                 let max_depth = source_ids
                     .iter()
@@ -557,18 +499,11 @@ impl CatalogEngine {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let idx_id = batch.get_pk(i) as i64;
-            let owner_id = self.read_batch_u64(batch, i, 0) as i64;
+            let owner_id = batch.read_payload_u64(i, IDXTAB_PAY_OWNER_ID) as i64;
             // source_cols carries pack_pk_cols(&col_indices); decode it (a
             // single-column index is the 1-element degenerate case).
-            let cols = gnitz_wire::unpack_pk_cols(self.read_batch_u64(batch, i, 2));
-            if !cols.is_well_formed() {
-                return Err(format!(
-                    "Index: column list count {} out of range 1..={}",
-                    cols.decoded_count(),
-                    gnitz_wire::PK_LIST_MAX_COLS
-                ));
-            }
-            let is_unique = self.read_batch_u64(batch, i, 4) != 0;
+            let cols = gnitz_wire::unpack_pk_cols(batch.read_payload_u64(i, IDXTAB_PAY_SOURCE_COLS));
+            let is_unique = batch.read_payload_u64(i, IDXTAB_PAY_IS_UNIQUE) != 0;
 
             if weight > 0 {
                 // Keep worker next_index_id in sync with master-assigned IDs so that
@@ -576,21 +511,24 @@ impl CatalogEngine {
                 // user index that was broadcast via IDX_TAB +1.
                 raise_id_counter(&mut self.next_index_id, idx_id);
 
+                // Boot replay and worker ddl_sync reach this hook without
+                // precheck_sys_ingest, so re-run the shared registration guards
+                // here (see `validate_index_registration`). Resolve the owner
+                // entry once for everything below.
+                let entry = self.validate_index_registration(owner_id, &cols)?;
+                let owner_schema = entry.schema;
+                let owner_dir = entry.directory.clone();
+
                 // One circuit per column list (dedup by ordered list). If an
                 // incumbent exists, don't build a second table — but a UNIQUE
                 // newcomer over a non-unique incumbent must promote it. Promotion
                 // is order-independent (the circuit is unique iff ANY index on the
                 // column list is unique), so replay reconstructs an identical
                 // result regardless of index_id ordering.
-                let incumbent_unique = self
-                    .dag
-                    .tables
-                    .get(&owner_id)
-                    .and_then(|e| {
-                        e.index_circuits
-                            .iter()
-                            .find(|ic| ic.col_indices.as_slice() == cols.as_slice())
-                    })
+                let incumbent_unique = entry
+                    .index_circuits
+                    .iter()
+                    .find(|ic| ic.col_indices.as_slice() == cols.as_slice())
                     .map(|ic| ic.is_unique);
                 if let Some(was_unique) = incumbent_unique {
                     if is_unique && !was_unique {
@@ -599,72 +537,50 @@ impl CatalogEngine {
                     continue;
                 }
 
-                let entry = self
-                    .dag
-                    .tables
-                    .get(&owner_id)
-                    .ok_or_else(|| format!("Index: owner table {owner_id} not found"))?;
-                // Boot replay and worker ddl_sync reach this hook without
-                // precheck_sys_ingest, so re-reject a non-base-table owner
-                // here: a persisted or broadcast IDX_TAB row naming a view
-                // would otherwise register a circuit that backfills once and
-                // then silently serves stale results (index projection runs
-                // only on the base-table DML paths).
-                if !entry.kind.is_base_table() {
-                    return Err(format!("Index: owner {owner_id} is not a base table"));
-                }
-                let owner_schema = entry.schema;
                 // make_index_schema bounds-checks and promotes every column
                 // (defence in depth at the catalog trust boundary; a crafted wire
                 // row could name an out-of-range or ineligible column).
                 let idx_schema = make_index_schema(cols.as_slice(), &owner_schema)?;
 
-                let owner_dir = self
-                    .dag
-                    .tables
-                    .get(&owner_id)
-                    .map(|e| e.directory.clone())
-                    .unwrap_or_default();
                 let idx_dir = index_dir(&owner_dir, idx_id);
 
-                // Pre-stage before Table::new so that if backfill_index fails the
-                // directory is in pending_dir_deletions for cleanup. Truncate only
-                // after ALL fallible operations succeed.
-                let cleanup_idx = self.pending_dir_deletions.len();
-                self.pending_dir_deletions.push(idx_dir.clone());
-
-                // Homed at THIS process's per-rank dir (workers) or the index
-                // dir itself (master/standalone). The parent `idx_dir` is what
-                // stays staged in pending_dir_deletions — recursive removal
-                // reclaims the rank subdirs too on a failed create or a DROP.
-                let idx_table = new_index_table(&idx_dir, idx_id, idx_schema)?;
-
-                let mut idx_table_box = Box::new(idx_table);
-                let idx_table_ptr = &mut *idx_table_box as *mut Table;
-                // The master never populates its index copies (they stay
-                // permanently empty; distributed HAS_PK/seek probes union the
-                // workers' slice-local copies). Workers and standalone backfill
-                // from their local base slice.
-                if !self.ctx.in_rollback() && !crate::foundation::worker_ctx::is_master() {
-                    self.backfill_index(
-                        owner_id,
-                        cols.as_slice(),
-                        idx_table_ptr,
-                        &idx_schema,
-                        is_unique && self.ctx.is_live(),
-                    )?;
-                }
-                self.dag
-                    .add_index_circuit(owner_id, cols.as_slice(), idx_id, idx_table_box, idx_schema, is_unique);
-
-                // Only truncate after all fallible steps succeed.
-                self.pending_dir_deletions.truncate(cleanup_idx);
+                // Staged before Table::new so that if backfill_index fails the
+                // directory is in pending_dir_deletions for cleanup; the stage
+                // clears only after ALL fallible steps succeed.
+                self.with_staged_dir(idx_dir.clone(), |s| {
+                    // Homed at THIS process's per-rank dir (workers) or the index
+                    // dir itself (master/standalone). The parent `idx_dir` is what
+                    // stays staged in pending_dir_deletions — recursive removal
+                    // reclaims the rank subdirs too on a failed create or a DROP.
+                    let mut idx_table_box = Box::new(new_index_table(&idx_dir, idx_id, idx_schema)?);
+                    let idx_table_ptr = &mut *idx_table_box as *mut Table;
+                    // The master never populates its index copies (they stay
+                    // permanently empty; distributed HAS_PK/seek probes union the
+                    // workers' slice-local copies). Workers and standalone backfill
+                    // from their local base slice.
+                    if !s.ctx.in_rollback() && !crate::foundation::worker_ctx::is_master() {
+                        s.backfill_index(
+                            owner_id,
+                            cols.as_slice(),
+                            idx_table_ptr,
+                            &idx_schema,
+                            is_unique && s.ctx.is_live(),
+                        )?;
+                    }
+                    s.dag
+                        .add_index_circuit(owner_id, cols.as_slice(), idx_id, idx_table_box, idx_schema, is_unique);
+                    Ok(())
+                })?;
             } else {
                 // DROP INDEX: determine what remains for this column list in
                 // sys_indices (the -1 row has already been applied to sys_indices
-                // by ingest_to_family before fire_hooks runs, so its net weight is
-                // 0 and the scan skips it).
-                let (has_any, remains_unique) = self.check_remaining_index_uniqueness(owner_id, cols.as_slice());
+                // before fire_hooks runs, so its net weight is 0 and the scan
+                // skips it).
+                let (mut has_any, mut remains_unique) = (false, false);
+                self.for_each_index_on_cols(owner_id, cols.as_slice(), |_row_id, is_uniq| {
+                    has_any = true;
+                    remains_unique |= is_uniq;
+                });
                 if has_any {
                     // Another index (e.g. the FK auto-index) still covers this
                     // column list. Demote the circuit rather than destroying it.
@@ -686,20 +602,6 @@ impl CatalogEngine {
             }
         }
         Ok(())
-    }
-
-    /// Scan sys_indices (after the -1 retraction has already been applied by
-    /// ingest_to_family before fire_hooks runs) to find any remaining index rows
-    /// on `owner_id` / `col_idx`. Returns `(has_any, remains_unique)` to drive
-    /// circuit demotion or deletion in `hook_index_register`'s retraction branch.
-    fn check_remaining_index_uniqueness(&self, owner_id: i64, cols: &[u32]) -> (bool, bool) {
-        let mut has_any = false;
-        let mut remains_unique = false;
-        self.for_each_index_on_cols(owner_id, cols, |_row_id, is_uniq| {
-            has_any = true;
-            remains_unique |= is_uniq;
-        });
-        (has_any, remains_unique)
     }
 
     fn hook_cascade_fk(&mut self, batch: &Batch) -> Result<(), String> {

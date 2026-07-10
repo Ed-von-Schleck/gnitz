@@ -16,12 +16,6 @@ pub(crate) struct ColumnDef {
     pub(crate) is_hidden: bool,
 }
 
-// `CircuitGraph` previously lived here as the DTO for the now-deleted
-// `engine.create_view(qname, &CircuitGraph, sql)` direct path. After the
-// circuit-graph schema redesign, views always reach the engine via the
-// wire path (`client.rs::create_view_with_circuit`) using the typed
-// `gnitz_core::Circuit` instead.
-
 // ---------------------------------------------------------------------------
 // FK constraint
 // ---------------------------------------------------------------------------

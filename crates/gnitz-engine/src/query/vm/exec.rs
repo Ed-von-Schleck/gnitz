@@ -252,10 +252,7 @@ pub(crate) fn execute_epoch_multi(
                     // batch_b after moving batch_a out would see an empty batch
                     // and produce +1 instead of +2.
                     let mut batch = reg_mut!(*in_a).batch.take();
-                    for chunk in batch.weight_data_mut().chunks_exact_mut(8) {
-                        let w = i64::from_le_bytes(chunk.try_into().unwrap());
-                        chunk.copy_from_slice(&w.wrapping_mul(2).to_le_bytes());
-                    }
+                    batch.map_weights(|w| w.wrapping_mul(2));
                     reg_mut!(*out_reg).batch = batch;
                 } else {
                     let batch_b = if *has_b { Some(&reg!(*in_b).batch) } else { None };

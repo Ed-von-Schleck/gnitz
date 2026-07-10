@@ -28,7 +28,7 @@ impl CatalogEngine {
     pub(crate) fn scan_column_defs(&self, owner_id: i64, check_contiguity: bool) -> Result<Vec<ColumnDef>, String> {
         let start_pk = pack_column_id(owner_id, 0);
         let end_pk = pack_column_id(owner_id + 1, 0);
-        let mut cursor = self.sys_columns.open_cursor();
+        let mut cursor = self.sys_store(SysFamily::Column).open_cursor();
         // sys_columns has a single U64 PK; OPK == big-endian.
         cursor.seek_bytes(&start_pk.to_be_bytes());
 
@@ -65,8 +65,36 @@ impl CatalogEngine {
         Ok(defs)
     }
 
-    pub(crate) fn read_column_defs(&self, owner_id: i64) -> Vec<ColumnDef> {
-        self.scan_column_defs(owner_id, false).unwrap()
+    /// Column definitions for `owner_id`, cached until the next COL_TAB delta
+    /// (`invalidate_col_names` fires on every path — live, replay, ddl_sync,
+    /// rollback). One COL_TAB scan also fills the three derived views
+    /// (`col_names`, `col_names_bytes`, `col_hidden`).
+    pub(crate) fn read_column_defs(&mut self, owner_id: i64) -> Rc<Vec<ColumnDef>> {
+        if let Some(defs) = self.caches.col_defs.get(&owner_id) {
+            return defs.clone();
+        }
+        self.fill_column_caches(owner_id)
+    }
+
+    /// Scan COL_TAB once for `owner_id` and fill the column-def cache plus its
+    /// three derived views. Uses the infallible non-checking scan — the
+    /// contiguity-checking form stays a direct storage scan at its precheck
+    /// call sites.
+    pub(crate) fn fill_column_caches(&mut self, owner_id: i64) -> Rc<Vec<ColumnDef>> {
+        let defs = Rc::new(self.scan_column_defs(owner_id, false).unwrap());
+        let mut hidden: u128 = 0;
+        for (i, cd) in defs.iter().enumerate() {
+            if cd.is_hidden {
+                hidden |= 1 << i;
+            }
+        }
+        let names: Vec<String> = defs.iter().map(|cd| cd.name.clone()).collect();
+        let bytes: Vec<Vec<u8>> = names.iter().map(|n| n.as_bytes().to_vec()).collect();
+        self.caches.col_hidden.insert(owner_id, hidden);
+        self.caches.col_names.insert(owner_id, Rc::new(names));
+        self.caches.col_names_bytes.insert(owner_id, Rc::new(bytes));
+        self.caches.col_defs.insert(owner_id, defs.clone());
+        defs
     }
 
     /// `dist_prefix_len` is the persisted distribution prefix length `k`
@@ -90,28 +118,6 @@ impl CatalogEngine {
             cols[i] = SchemaColumn::new(cd.type_code, if cd.is_nullable { 1 } else { 0 });
         }
         SchemaDescriptor::new_with_dist(&cols[..col_defs.len()], pk_cols, dist_prefix_len)
-    }
-
-    // -- Batch field readers -----------------------------------------------
-
-    pub(crate) fn read_batch_u64(&self, batch: &Batch, row: usize, payload_col: usize) -> u64 {
-        let off = row * 8;
-        let col = batch.col_data(payload_col);
-        if off + 8 > col.len() {
-            return 0;
-        }
-        u64::from_le_bytes(col[off..off + 8].try_into().unwrap_or([0; 8]))
-    }
-
-    pub(crate) fn read_batch_string(&self, batch: &Batch, row: usize, payload_col: usize) -> String {
-        let off = row * 16;
-        let data = batch.col_data(payload_col);
-        if off + 16 > data.len() {
-            return String::new();
-        }
-        let st: [u8; 16] = data[off..off + 16].try_into().unwrap_or([0; 16]);
-        let bytes = crate::schema::try_decode_german_string(&st, &batch.blob).unwrap_or_default();
-        String::from_utf8(bytes).unwrap_or_default()
     }
 
     // -- Registry query methods -----------------------------------------------
@@ -165,21 +171,31 @@ impl CatalogEngine {
         }
     }
 
+    // Each object-id allocation owns its durability half: the id is handed to
+    // memory AND durably advanced in `sys_sequences` as one operation, so no
+    // caller can take an id without the advance. A create that later fails
+    // burns the id (harmless — recovery maxes over positive rows; gaps are
+    // fine), and the unconditional advance keeps every retract matched: a
+    // skipped advance would leave the NEXT advance's retract unmatched — a
+    // net −1 ghost row violating base-table positivity.
     pub fn allocate_schema_id(&mut self) -> i64 {
         let sid = self.next_schema_id;
         self.next_schema_id += 1;
+        self.advance_sequence(SEQ_ID_SCHEMAS, sid - 1, sid);
         sid
     }
 
     pub fn allocate_table_id(&mut self) -> i64 {
         let tid = self.next_table_id;
         self.next_table_id += 1;
+        self.advance_sequence(SEQ_ID_TABLES, tid - 1, tid);
         tid
     }
 
     pub fn allocate_index_id(&mut self) -> i64 {
         let iid = self.next_index_id;
         self.next_index_id += 1;
+        self.advance_sequence(SEQ_ID_INDICES, iid - 1, iid);
         iid
     }
 
@@ -203,13 +219,13 @@ impl CatalogEngine {
 
     // -- Sequence management -----------------------------------------------
 
-    pub fn advance_sequence(&mut self, seq_id: i64, old_val: i64, new_val: i64) {
+    pub(crate) fn advance_sequence(&mut self, seq_id: i64, old_val: i64, new_val: i64) {
         let batch = build_seq_delta(seq_id, old_val, new_val);
         // The caller has already handed the allocated id to memory; un-allocating
         // is impossible, and replying an error while keeping the bump would
         // re-issue the id after restart. Fail-stop — same as the serial-range
         // sequence ingest in `executor.rs`.
-        if let Err(e) = self.sys_sequences.ingest_borrowed_batch(&batch) {
+        if let Err(e) = self.sys_store_mut(SysFamily::Sequence).ingest_borrowed_batch(&batch) {
             crate::gnitz_fatal_abort!(
                 "sys_sequences ingest (object id advance, seq_id={}) failed: {} \
                  — allocated id would be reissued after restart; aborting",
@@ -249,7 +265,7 @@ impl CatalogEngine {
         (
             hw + 1,
             build_seq_delta(seq_id, hw, new_hw),
-            self.sys_sequences.current_lsn(),
+            self.sys_store(SysFamily::Sequence).current_lsn(),
         )
     }
 
@@ -360,7 +376,7 @@ pub(super) fn raise_id_counter(counter: &mut i64, allocated: i64) {
 /// Shared by `advance_sequence` (ingests to the memtable) and
 /// `reserve_user_sequence` (returns it for the durable commit).
 fn build_seq_delta(seq_id: i64, old_val: i64, new_val: i64) -> Batch {
-    let schema = seq_tab_schema();
+    let schema = SysFamily::Sequence.schema();
     let mut bb = BatchBuilder::new(schema);
     // Retract old
     bb.begin_row(seq_id as u128, -1);

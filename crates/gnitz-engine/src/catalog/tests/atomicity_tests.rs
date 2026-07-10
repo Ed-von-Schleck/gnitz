@@ -6,7 +6,7 @@ use std::fs;
 // ---------------------------------------------------------------------------
 
 fn build_schema_tab_row(sid: i64, name: &str) -> Batch {
-    let mut bb = BatchBuilder::new(schema_tab_schema());
+    let mut bb = BatchBuilder::new(SysFamily::Schema.schema());
     bb.begin_row(sid as u128, 1);
     bb.put_string(name);
     bb.end_row();
@@ -14,7 +14,7 @@ fn build_schema_tab_row(sid: i64, name: &str) -> Batch {
 }
 
 fn build_idx_tab_row(idx_id: i64, owner_id: i64, source_col_idx: u64, name: &str, is_unique: bool) -> Batch {
-    let mut bb = BatchBuilder::new(idx_tab_schema());
+    let mut bb = BatchBuilder::new(SysFamily::Index.schema());
     bb.begin_row(idx_id as u128, 1);
     bb.put_u64(owner_id as u64);
     bb.put_u64(OWNER_KIND_TABLE as u64);
@@ -27,7 +27,7 @@ fn build_idx_tab_row(idx_id: i64, owner_id: i64, source_col_idx: u64, name: &str
 }
 
 fn write_col_at_index(engine: &mut CatalogEngine, owner_id: i64, col_idx: i64, cd: &ColumnDef) -> Result<(), String> {
-    let schema = col_tab_schema();
+    let schema = SysFamily::Column.schema();
     let mut bb = BatchBuilder::new(schema);
     let pk = pack_column_id(owner_id, col_idx);
     bb.begin_row(pk as u128, 1);
@@ -61,7 +61,7 @@ fn write_col_at_index(engine: &mut CatalogEngine, owner_id: i64, col_idx: i64, c
 fn test_table_tab_no_cols_leaves_clean_state() {
     let dir = temp_dir("atomicity_no_cols");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let init_rows = count_records(&mut engine.sys_tables);
+    let init_rows = count_records(engine.sys_store_mut(SysFamily::Table));
 
     let tid = engine.allocate_table_id();
     // No column records written — TABLE_TAB ingestion must fail.
@@ -83,7 +83,7 @@ fn test_table_tab_no_cols_leaves_clean_state() {
         "dag.tables must not contain bad table after rejected DDL"
     );
     assert_eq!(
-        count_records(&mut engine.sys_tables),
+        count_records(engine.sys_store_mut(SysFamily::Table)),
         init_rows,
         "sys_tables memtable must have no orphaned row (dirty before fix)"
     );
@@ -99,11 +99,11 @@ fn test_table_tab_invalid_pk_col_type_leaves_clean_state() {
     // apply_entity_by_qname has already dirtied the cache (pre-fix).
     let dir = temp_dir("atomicity_bad_pk_type");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let init_rows = count_records(&mut engine.sys_tables);
+    let init_rows = count_records(engine.sys_store_mut(SysFamily::Table));
 
     let tid = engine.allocate_table_id();
     // STRING column is not pk-eligible.
-    let cols = vec![str_col_def("label")];
+    let cols = vec![col_def("label", type_code::STRING)];
     engine.write_column_records(tid, OWNER_KIND_TABLE, &cols).unwrap();
 
     let batch = build_table_tab_row(&dir, tid, pack_pk_cols(&[0]), "badpktable");
@@ -126,7 +126,7 @@ fn test_table_tab_invalid_pk_col_type_leaves_clean_state() {
         "dag.tables must not contain bad table after rejected DDL"
     );
     assert_eq!(
-        count_records(&mut engine.sys_tables),
+        count_records(engine.sys_store_mut(SysFamily::Table)),
         init_rows,
         "sys_tables memtable must have no orphaned row (dirty before fix)"
     );
@@ -144,9 +144,9 @@ fn test_table_tab_dup_name_leaves_clean_state() {
     let dir = temp_dir("atomicity_dup_name");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let orig_tid = engine.create_table("public.dupname", &cols, &[0], false).unwrap();
-    let init_rows = count_records(&mut engine.sys_tables);
+    let init_rows = count_records(engine.sys_store_mut(SysFamily::Table));
 
     let new_tid = engine.allocate_table_id();
     engine.write_column_records(new_tid, OWNER_KIND_TABLE, &cols).unwrap();
@@ -168,7 +168,7 @@ fn test_table_tab_dup_name_leaves_clean_state() {
         "new_tid must not appear in dag.tables"
     );
     assert_eq!(
-        count_records(&mut engine.sys_tables),
+        count_records(engine.sys_store_mut(SysFamily::Table)),
         init_rows,
         "sys_tables must have no extra orphaned row (dirty before fix)"
     );
@@ -186,12 +186,12 @@ fn test_table_tab_col_contiguity_gap_rejected() {
     // and leaves no trace in the catalog.
     let dir = temp_dir("atomicity_col_gap");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let init_rows = count_records(&mut engine.sys_tables);
+    let init_rows = count_records(engine.sys_store_mut(SysFamily::Table));
 
     let tid = engine.allocate_table_id();
     // Insert columns at indices 0 and 2 — index 1 is absent (gap).
-    write_col_at_index(&mut engine, tid, 0, &u64_col_def("id")).unwrap();
-    write_col_at_index(&mut engine, tid, 2, &u64_col_def("gapped")).unwrap();
+    write_col_at_index(&mut engine, tid, 0, &col_def("id", type_code::U64)).unwrap();
+    write_col_at_index(&mut engine, tid, 2, &col_def("gapped", type_code::U64)).unwrap();
 
     let batch = build_table_tab_row(&dir, tid, pack_pk_cols(&[0]), "gaptable");
     let result = engine.ingest_to_family(TABLE_TAB_ID, &batch);
@@ -209,7 +209,7 @@ fn test_table_tab_col_contiguity_gap_rejected() {
         "dag.tables must not contain bad table after rejected DDL"
     );
     assert_eq!(
-        count_records(&mut engine.sys_tables),
+        count_records(engine.sys_store_mut(SysFamily::Table)),
         init_rows,
         "sys_tables memtable must have no orphaned row"
     );
@@ -225,7 +225,7 @@ fn test_view_tab_no_cols_leaves_clean_state() {
     // (pre-fix), leaving entity_by_qname dirty.
     let dir = temp_dir("atomicity_view_no_cols");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let init_rows = count_records(&mut engine.sys_views);
+    let init_rows = count_records(engine.sys_store_mut(SysFamily::View));
 
     let vid = engine.allocate_table_id();
     // No column records for vid.
@@ -246,7 +246,7 @@ fn test_view_tab_no_cols_leaves_clean_state() {
         "dag.tables must not contain bad view after rejected DDL"
     );
     assert_eq!(
-        count_records(&mut engine.sys_views),
+        count_records(engine.sys_store_mut(SysFamily::View)),
         init_rows,
         "sys_views memtable must have no orphaned row (dirty before fix)"
     );
@@ -266,12 +266,12 @@ fn test_view_tab_too_many_cols_rejected() {
     // create_view_chain.
     let dir = temp_dir("atomicity_view_too_many_cols");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let init_rows = count_records(&mut engine.sys_views);
+    let init_rows = count_records(engine.sys_store_mut(SysFamily::View));
 
     let vid = engine.allocate_table_id();
     // MAX_COLUMNS + 1 contiguous column records (col 0 is a valid U64 PK).
     for i in 0..(crate::schema::MAX_COLUMNS as i64 + 1) {
-        write_col_at_index(&mut engine, vid, i, &u64_col_def(&format!("c{i}"))).unwrap();
+        write_col_at_index(&mut engine, vid, i, &col_def(&format!("c{i}"), type_code::U64)).unwrap();
     }
     let batch = build_view_tab_row(vid, "wideview", "");
     let err = engine
@@ -291,7 +291,7 @@ fn test_view_tab_too_many_cols_rejected() {
         "dag.tables must not contain the rejected view"
     );
     assert_eq!(
-        count_records(&mut engine.sys_views),
+        count_records(engine.sys_store_mut(SysFamily::View)),
         init_rows,
         "sys_views memtable must have no orphaned row"
     );
@@ -307,7 +307,7 @@ fn test_idx_tab_bad_owner_leaves_clean_state() {
     // cache entry is inserted before the hook returns Err for missing owner.
     let dir = temp_dir("atomicity_idx_bad_owner");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let init_rows = count_records(&mut engine.sys_indices);
+    let init_rows = count_records(engine.sys_store_mut(SysFamily::Index));
 
     let nonexistent_owner = engine.allocate_table_id();
     let idx_id = engine.allocate_index_id();
@@ -324,7 +324,7 @@ fn test_idx_tab_bad_owner_leaves_clean_state() {
         "index_by_id must not contain bad index after rejected DDL"
     );
     assert_eq!(
-        count_records(&mut engine.sys_indices),
+        count_records(engine.sys_store_mut(SysFamily::Index)),
         init_rows,
         "sys_indices memtable must have no orphaned row (dirty before fix)"
     );
@@ -345,20 +345,20 @@ fn test_idx_tab_view_owner_rejected() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     engine
-        .create_table("public.base", &[u64_col_def("id")], &[0], true)
+        .create_table("public.base", &[col_def("id", type_code::U64)], &[0], true)
         .unwrap();
 
     // Register a view via the raw system-table path (no circuit needed — the
     // precheck must fire before any backfill).
     let vid = engine.allocate_table_id();
     engine
-        .write_column_records(vid, OWNER_KIND_VIEW, &[u64_col_def("id")])
+        .write_column_records(vid, OWNER_KIND_VIEW, &[col_def("id", type_code::U64)])
         .unwrap();
     let batch = build_view_tab_row(vid, "vowner", "");
     engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
     assert!(engine.dag.tables.contains_key(&vid), "view registered");
 
-    let init_rows = count_records(&mut engine.sys_indices);
+    let init_rows = count_records(engine.sys_store_mut(SysFamily::Index));
     let idx_id = engine.allocate_index_id();
     let batch = build_idx_tab_row(idx_id, vid, 0, "idx_on_view", false);
     let err = engine
@@ -378,7 +378,7 @@ fn test_idx_tab_view_owner_rejected() {
         "index_by_id must not contain the rejected index"
     );
     assert_eq!(
-        count_records(&mut engine.sys_indices),
+        count_records(engine.sys_store_mut(SysFamily::Index)),
         init_rows,
         "sys_indices must have no orphaned row"
     );
@@ -399,10 +399,14 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
     let dir = temp_dir("atomicity_idx_dup");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), i64_col_def("val"), i64_col_def("ts")];
+    let cols = vec![
+        col_def("id", type_code::U64),
+        col_def("val", type_code::I64),
+        col_def("ts", type_code::I64),
+    ];
     let tid = engine.create_table("public.idxtest", &cols, &[0], false).unwrap();
     let orig_idx_id = engine.create_index("public.idxtest", &["val"], false).unwrap();
-    let init_rows = count_records(&mut engine.sys_indices);
+    let init_rows = count_records(engine.sys_store_mut(SysFamily::Index));
 
     let orig_name = "public__idxtest__idx_val";
     let new_idx_id = engine.allocate_index_id();
@@ -424,7 +428,7 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
         "new_idx_id must not appear in index_by_id"
     );
     assert_eq!(
-        count_records(&mut engine.sys_indices),
+        count_records(engine.sys_store_mut(SysFamily::Index)),
         init_rows,
         "sys_indices must have no extra orphaned row (dirty before fix)"
     );
@@ -449,7 +453,7 @@ fn test_create_unique_index_backfill_fail_no_dir_leak() {
     let dir = temp_dir("atomicity_idx_dir_leak");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), i64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.leaktest", &cols, &[0], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
 
@@ -506,7 +510,7 @@ fn test_next_index_id_advances_on_index_register() {
     let dir = temp_dir("atomicity_idx_seq");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), i64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.seqsync", &cols, &[0], false).unwrap();
 
     // Register an index with an idx_id far ahead of the current counter,
@@ -575,7 +579,7 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
     // Table T (in schema `owner`) with a dependent view V → dep_map[T] = [V].
     engine.create_schema("owner").unwrap();
     let tid = engine
-        .create_table("owner.t", &[u64_col_def("id")], &[0], true)
+        .create_table("owner.t", &[col_def("id", type_code::U64)], &[0], true)
         .unwrap();
     let vid = engine.allocate_table_id();
     engine.write_view_deps(vid, &[tid]).unwrap();
@@ -632,11 +636,11 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
     let dir = temp_dir("ddl_txn_precheck_ghost");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     // Occupy the qualified name "public.dupname".
     engine.create_table("public.dupname", &cols, &[0], false).unwrap();
-    let cols_before = count_records(&mut engine.sys_columns);
-    let tables_before = count_records(&mut engine.sys_tables);
+    let cols_before = count_records(engine.sys_store_mut(SysFamily::Column));
+    let tables_before = count_records(engine.sys_store_mut(SysFamily::Table));
     // Discard any queue entries the setup left behind, exactly as `handle_ddl_txn`
     // does before ingesting a new bundle — so compensation drains only this
     // bundle's families.
@@ -659,12 +663,12 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
 
     // The durable property: no orphan COL_TAB, no ghost -1 TABLE_TAB.
     assert_eq!(
-        count_records(&mut engine.sys_columns),
+        count_records(engine.sys_store_mut(SysFamily::Column)),
         cols_before,
         "orphan COL_TAB rows must be negated to zero"
     );
     assert_eq!(
-        count_records(&mut engine.sys_tables),
+        count_records(engine.sys_store_mut(SysFamily::Table)),
         tables_before,
         "no ghost -1 TABLE_TAB row"
     );
@@ -688,9 +692,9 @@ fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
     let dir = temp_dir("ddl_txn_hook_rollback");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
-    let cols_before = count_records(&mut engine.sys_columns);
-    let tables_before = count_records(&mut engine.sys_tables);
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let cols_before = count_records(engine.sys_store_mut(SysFamily::Column));
+    let tables_before = count_records(engine.sys_store_mut(SysFamily::Table));
 
     let new_tid = engine.allocate_table_id();
     let col_batch = engine.build_col_batch(new_tid, OWNER_KIND_TABLE, &cols, 1);
@@ -713,12 +717,12 @@ fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
     engine.compensate_stage_a(marker.take());
 
     assert_eq!(
-        count_records(&mut engine.sys_tables),
+        count_records(engine.sys_store_mut(SysFamily::Table)),
         tables_before,
         "applied-not-enqueued TABLE_TAB row must net to zero"
     );
     assert_eq!(
-        count_records(&mut engine.sys_columns),
+        count_records(engine.sys_store_mut(SysFamily::Column)),
         cols_before,
         "drained COL_TAB rows must net to zero (negated exactly once)"
     );

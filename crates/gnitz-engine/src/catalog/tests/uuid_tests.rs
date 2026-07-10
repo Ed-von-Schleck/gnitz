@@ -41,7 +41,7 @@ fn test_uuid_non_pk_column() {
     let dir = temp_dir("uuid_non_pk");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), uuid_col_def("uid")];
+    let cols = vec![col_def("id", type_code::U64), uuid_col_def("uid")];
     let tid = engine.create_table("public.uuid_payload", &cols, &[0], true).unwrap();
     let s = engine.get_schema(tid).unwrap();
     assert_eq!(s.columns[1].type_code, type_code::UUID);
@@ -66,7 +66,7 @@ fn test_uuid_secondary_index() {
     let dir = temp_dir("uuid_idx");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), uuid_col_def("uid")];
+    let cols = vec![col_def("id", type_code::U64), uuid_col_def("uid")];
     let tid = engine.create_table("public.uuid_idxtab", &cols, &[0], true).unwrap();
     let s = engine.get_schema(tid).unwrap();
 
@@ -98,7 +98,7 @@ fn test_uuid_fk_valid_single() {
         .unwrap();
 
     let child_cols = vec![
-        u64_col_def("cid"),
+        col_def("cid", type_code::U64),
         ColumnDef {
             name: "uid_fk".into(),
             type_code: type_code::UUID,
@@ -140,7 +140,7 @@ fn test_uuid_fk_invalid_single() {
         .unwrap();
 
     let child_cols = vec![
-        u64_col_def("cid"),
+        col_def("cid", type_code::U64),
         ColumnDef {
             name: "uid_fk".into(),
             type_code: type_code::UUID,
@@ -177,7 +177,7 @@ fn test_uuid_fk_multiple_children_same_parent() {
         .unwrap();
 
     let child_cols = vec![
-        u64_col_def("cid"),
+        col_def("cid", type_code::U64),
         ColumnDef {
             name: "uid_fk".into(),
             type_code: type_code::UUID,
@@ -224,7 +224,7 @@ fn test_uuid_fk_multiple_children_mixed() {
         .unwrap();
 
     let child_cols = vec![
-        u64_col_def("cid"),
+        col_def("cid", type_code::U64),
         ColumnDef {
             name: "uid_fk".into(),
             type_code: type_code::UUID,
@@ -271,7 +271,7 @@ fn test_uuid_fk_parent_not_yet_ingested() {
         .unwrap();
 
     let child_cols = vec![
-        u64_col_def("cid"),
+        col_def("cid", type_code::U64),
         ColumnDef {
             name: "uid_fk".into(),
             type_code: type_code::UUID,
@@ -309,7 +309,7 @@ fn test_uuid_fk_nullable_column() {
         .unwrap();
 
     let child_cols = vec![
-        u64_col_def("cid"),
+        col_def("cid", type_code::U64),
         ColumnDef {
             name: "uid_fk".into(),
             type_code: type_code::UUID,
@@ -343,12 +343,12 @@ fn test_uuid_fk_u64pk_parent_rejected() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let parent_tid = engine
-        .create_table("public.u64par", &[u64_col_def("id")], &[0], true)
+        .create_table("public.u64par", &[col_def("id", type_code::U64)], &[0], true)
         .unwrap();
 
     // UUID FK child → U64 PK parent should fail DDL
     let child_cols = vec![
-        u64_col_def("cid"),
+        col_def("cid", type_code::U64),
         ColumnDef {
             name: "uid_fk".into(),
             type_code: type_code::UUID,
@@ -379,7 +379,7 @@ fn test_uuid_fk_u128_col_references_uuid_pk() {
 
     // U128 FK column → UUID PK parent should fail (different type codes)
     let child_cols = vec![
-        u64_col_def("cid"),
+        col_def("cid", type_code::U64),
         ColumnDef {
             name: "uid_fk".into(),
             type_code: type_code::U128,

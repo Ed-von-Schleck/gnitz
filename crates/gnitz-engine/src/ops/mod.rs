@@ -19,10 +19,6 @@ pub(crate) use exchange::{
     op_partition_filter, op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode, RouteMode,
 };
 pub(crate) use exchange::{with_broadcast_indices, with_worker_indices, worker_for_partition};
-// Only the test harness routes via the eager (cloning) variant now; the
-// production scatter paths all borrow via `with_worker_indices`.
-#[cfg(test)]
-pub(crate) use exchange::compute_worker_indices;
 pub(crate) use index::{op_integrate_with_indexes, AviDesc};
 // Facade for the AVI schema builder + AVI key layout, so out-of-ops callers
 // (compiler, master) reach `crate::ops::X`, not the internals.

@@ -40,7 +40,24 @@ pub enum Routing {
 }
 
 /// Scatter bucket count for `Routing::Hashed`; `mix` takes `(h >> 56)` ∈ 0..256.
-const NUM_PARTITIONS: usize = 256;
+/// The one partition-layout constant — catalog and runtime derive from it.
+pub const NUM_PARTITIONS: u32 = 256;
+
+/// Contiguous partition range `[start, end)` owned by `worker_id` of
+/// `num_workers`: equal chunks, with the last worker absorbing the remainder.
+/// The one spelling of worker→partition assignment, shared by the fork-time
+/// trim, the worker boot, and the boot resume verdict. The `.max(1)` guards a
+/// zero-workers call (start 0, full range).
+pub fn partition_range(worker_id: u32, num_workers: u32) -> (u32, u32) {
+    let chunk = NUM_PARTITIONS / num_workers.max(1);
+    let start = worker_id * chunk;
+    let end = if worker_id + 1 >= num_workers {
+        NUM_PARTITIONS
+    } else {
+        (worker_id + 1) * chunk
+    };
+    (start, end)
+}
 
 pub struct PartitionedTable {
     tables: Vec<Table>,
@@ -158,7 +175,7 @@ impl PartitionedTable {
     #[allow(clippy::needless_range_loop)]
     fn scatter_ingest(&mut self, batch: &Batch) -> Result<(), StorageError> {
         let mb = batch.as_mem_batch();
-        let np = NUM_PARTITIONS;
+        let np = NUM_PARTITIONS as usize;
 
         // Thread-local per-partition index pool, mirroring exchange.rs's
         // SCATTER_INDICES / WORKER_ROWS: clears (retaining capacity) per call

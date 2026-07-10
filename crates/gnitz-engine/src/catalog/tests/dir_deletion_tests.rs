@@ -10,7 +10,7 @@ use std::path::Path;
 fn defer_then_drain_gated_deletions() {
     let dir = temp_dir("defer_then_drain_gated");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id")];
+    let cols = vec![col_def("id", type_code::U64)];
 
     engine.create_schema("s").unwrap();
     let tid = engine.create_table("s.t", &cols, &[0], true).unwrap();
@@ -56,7 +56,7 @@ fn defer_then_drain_gated_deletions() {
 fn drop_then_recreate_schema_survives_gated_drain() {
     let dir = temp_dir("recreate_schema_trap");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id")];
+    let cols = vec![col_def("id", type_code::U64)];
 
     engine.create_schema("s").unwrap();
     engine.create_table("s.t", &cols, &[0], true).unwrap();
@@ -91,7 +91,7 @@ fn drop_then_recreate_schema_survives_gated_drain() {
 fn gc_reclaims_orphan_table_dir() {
     let dir = temp_dir("gc_orphan_table");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
 
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
@@ -127,7 +127,7 @@ fn gc_reclaims_orphan_table_dir() {
 fn gc_reclaims_orphan_view_dir() {
     let dir = temp_dir("gc_orphan_view");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id")];
+    let cols = vec![col_def("id", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
     let live_dir = format!("{dir}/public/t_{tid}");
 
@@ -149,7 +149,7 @@ fn gc_reclaims_orphan_view_dir() {
 fn gc_reclaims_orphan_index_dir() {
     let dir = temp_dir("gc_orphan_index");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
     let idx_id = engine.create_index("public.t", &["val"], false).unwrap();
 
@@ -180,7 +180,7 @@ fn gc_reclaims_orphan_index_dir() {
 fn gc_leaves_live_entities_untouched() {
     let dir = temp_dir("gc_live_untouched");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
 
     let t1 = engine.create_table("public.flushed", &cols, &[0], true).unwrap();
     let schema = engine.get_schema(t1).unwrap();
@@ -228,7 +228,7 @@ fn gc_leaves_live_entities_untouched() {
 fn gc_skips_non_table_shaped_entries() {
     let dir = temp_dir("gc_non_table_entries");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id")];
+    let cols = vec![col_def("id", type_code::U64)];
     engine.create_table("public.t", &cols, &[0], true).unwrap();
 
     let keep1 = format!("{dir}/public/notatable"); // no underscore
@@ -250,7 +250,7 @@ fn gc_skips_non_table_shaped_entries() {
 fn gc_is_idempotent() {
     let dir = temp_dir("gc_idempotent");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id")];
+    let cols = vec![col_def("id", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
     let live = format!("{dir}/public/t_{tid}");
 
@@ -318,7 +318,7 @@ fn gc_recreated_schema_survives_drain() {
          pending_dir_deletions (cancel_gated_deletion fix)"
     );
 
-    let cols = vec![u64_col_def("id")];
+    let cols = vec![col_def("id", type_code::U64)];
     let tid = engine.create_table("s.t", &cols, &[0], true).unwrap();
     let tbl = format!("{dir}/s/t_{tid}");
     assert!(Path::new(&tbl).exists());

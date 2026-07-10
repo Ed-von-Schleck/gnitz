@@ -10,7 +10,7 @@ use super::*;
 fn test_enforce_unique_pk() {
     let dir = temp_dir("enforce_upk");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap(); // unique_pk ⟹ Partitioned
     let schema = engine.get_schema(tid).unwrap();
 
@@ -83,7 +83,7 @@ fn test_orphaned_metadata_recovery() {
     // First open: inject an index record pointing to non-existent table 99999
     {
         let mut engine = CatalogEngine::open(&dir).unwrap();
-        let idx_schema = idx_tab_schema();
+        let idx_schema = SysFamily::Index.schema();
         let mut bb = BatchBuilder::new(idx_schema);
         bb.begin_row(888u128, 1);
         bb.put_u64(99999); // owner_id (non-existent)
@@ -93,8 +93,11 @@ fn test_orphaned_metadata_recovery() {
         bb.put_u64(0); // is_unique
         bb.put_string(""); // cache_dir
         bb.end_row();
-        engine.sys_indices.ingest_borrowed_batch(&bb.finish()).unwrap();
-        let _ = engine.sys_indices.flush();
+        engine
+            .sys_store_mut(SysFamily::Index)
+            .ingest_borrowed_batch(&bb.finish())
+            .unwrap();
+        let _ = engine.sys_store_mut(SysFamily::Index).flush();
         engine.close();
         drop(engine);
     }
@@ -165,7 +168,7 @@ fn test_user_sequence_durable_roundtrip() {
         engine.user_sequences.remove(&user_seq);
         engine.ingest_to_family(SEQ_TAB_ID, &delta).unwrap();
         assert_eq!(engine.user_sequences.get(&user_seq).copied(), Some(64));
-        let _ = engine.sys_sequences.flush();
+        let _ = engine.sys_store_mut(SysFamily::Sequence).flush();
         engine.close();
     }
     let mut engine = CatalogEngine::open(&dir).unwrap();
@@ -254,13 +257,16 @@ fn test_recover_ignores_sub_user_seq_id() {
     let stray = 7i64; // below FIRST_USER_TABLE_ID
     {
         let mut engine = CatalogEngine::open(&dir).unwrap();
-        let schema = seq_tab_schema();
+        let schema = SysFamily::Sequence.schema();
         let mut bb = BatchBuilder::new(schema);
         bb.begin_row(stray as u128, 1);
         bb.put_u64(999);
         bb.end_row();
-        engine.sys_sequences.ingest_borrowed_batch(&bb.finish()).unwrap();
-        let _ = engine.sys_sequences.flush();
+        engine
+            .sys_store_mut(SysFamily::Sequence)
+            .ingest_borrowed_batch(&bb.finish())
+            .unwrap();
+        let _ = engine.sys_store_mut(SysFamily::Sequence).flush();
         engine.close();
     }
     let mut engine = CatalogEngine::open(&dir).unwrap();
@@ -274,7 +280,7 @@ fn test_recover_ignores_sub_user_seq_id() {
 #[test]
 fn test_sequence_gap_recovery() {
     let dir = temp_dir("seq_gap");
-    let cols = vec![u64_col_def("id")];
+    let cols = vec![col_def("id", type_code::U64)];
 
     // First open: create a table, then inject a table record with high ID 250
     {
@@ -282,7 +288,7 @@ fn test_sequence_gap_recovery() {
         engine.create_table("public.t1", &cols, &[0], true).unwrap();
 
         // Inject table record for tid=250 directly into sys_tables
-        let tbl_schema = table_tab_schema();
+        let tbl_schema = SysFamily::Table.schema();
         let mut bb = BatchBuilder::new(tbl_schema);
         bb.begin_row(250u128, 1);
         bb.put_u64(PUBLIC_SCHEMA_ID as u64); // schema_id
@@ -292,10 +298,13 @@ fn test_sequence_gap_recovery() {
         bb.put_u64(0); // created_lsn
         bb.put_u64(0); // flags
         bb.end_row();
-        engine.sys_tables.ingest_borrowed_batch(&bb.finish()).unwrap();
+        engine
+            .sys_store_mut(SysFamily::Table)
+            .ingest_borrowed_batch(&bb.finish())
+            .unwrap();
 
         // Inject column record for tid=250
-        let col_schema = col_tab_schema();
+        let col_schema = SysFamily::Column.schema();
         let mut cbb = BatchBuilder::new(col_schema);
         let pk = pack_column_id(250, 0);
         cbb.begin_row(pk as u128, 1);
@@ -310,10 +319,13 @@ fn test_sequence_gap_recovery() {
         cbb.put_u64(0); // is_serial
         cbb.put_u64(0); // is_hidden
         cbb.end_row();
-        engine.sys_columns.ingest_borrowed_batch(&cbb.finish()).unwrap();
+        engine
+            .sys_store_mut(SysFamily::Column)
+            .ingest_borrowed_batch(&cbb.finish())
+            .unwrap();
 
-        let _ = engine.sys_tables.flush();
-        let _ = engine.sys_columns.flush();
+        let _ = engine.sys_store_mut(SysFamily::Table).flush();
+        let _ = engine.sys_store_mut(SysFamily::Column).flush();
         engine.close();
         drop(engine);
     }
@@ -335,7 +347,7 @@ fn test_sequence_gap_recovery() {
 fn test_ingest_scan_seek_family() {
     let dir = temp_dir("catalog_ingest_scan_seek");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
 
@@ -385,7 +397,7 @@ fn test_ingest_scan_seek_family() {
 fn seek_family_resolves_system_table_row() {
     let dir = temp_dir("catalog_seek_system_table");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
 
     // System-table point seek (narrow stride 8, empty extra).
@@ -410,7 +422,7 @@ fn seek_family_resolves_system_table_row() {
 fn test_ingest_unique_pk_partitioned() {
     let dir = temp_dir("catalog_unique_pk_partitioned");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
 
@@ -451,7 +463,7 @@ fn test_ddl_sync() {
     assert!(engine.has_schema("app"));
 
     // Simulate DDL sync: create batch mimicking a schema record
-    let schema = schema_tab_schema();
+    let schema = SysFamily::Schema.schema();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(100u128, 1); // sid=100
     bb.put_string("synced");
@@ -488,7 +500,7 @@ fn test_ddl_sync_zone_lsn_tracking() {
     // Zone 7: create a table. TABLE_TAB and COL_TAB pinned to lsn=7;
     // SCHEMA_TAB stays at 5 (untouched in this zone).
     engine.ctx.open_ddl_zone(zone(7));
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let _tid = engine.create_table("z.t", &cols, &[0], false).unwrap();
     assert_eq!(engine.get_max_flushed_lsn(TABLE_TAB_ID), 7);
     assert_eq!(engine.get_max_flushed_lsn(COL_TAB_ID), 7);
@@ -523,7 +535,7 @@ fn test_ddl_sync_zone_lsn_tracking() {
 fn test_partition_management() {
     let dir = temp_dir("catalog_partition_mgmt");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let _tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
 
     // These should not panic
@@ -542,12 +554,12 @@ fn test_fk_index_metadata_queries() {
     let dir = temp_dir("catalog_fk_idx_meta");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.parent", &cols, &[0], false).unwrap();
 
     // Create child table with FK to parent
     let child_cols = vec![
-        u64_col_def("id"),
+        col_def("id", type_code::U64),
         ColumnDef {
             name: "parent_id".into(),
             type_code: crate::schema::type_code::U64,
@@ -560,8 +572,8 @@ fn test_fk_index_metadata_queries() {
     let child_tid = engine.create_table("public.child", &child_cols, &[0], false).unwrap();
 
     // FK count
-    assert!(engine.get_fk_count(child_tid) > 0);
-    let (_col_idx, target_id, _parent_col) = engine.get_fk_constraint(child_tid, 0).unwrap();
+    assert!(!engine.fk_constraints_of(child_tid).is_empty());
+    let target_id = engine.fk_constraints_of(child_tid)[0].target_table_id;
     assert_eq!(target_id, tid);
 
     // Create an explicit index
@@ -586,7 +598,7 @@ fn test_iter_user_table_ids_and_lsn() {
     let dir = temp_dir("catalog_iter_lsn");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid1 = engine.create_table("public.t1", &cols, &[0], false).unwrap();
     let tid2 = engine.create_table("public.t2", &cols, &[0], false).unwrap();
 
@@ -636,11 +648,11 @@ fn test_get_column_names_cached() {
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
 
     let names1 = engine.get_column_names(tid);
-    assert_eq!(names1, vec!["pk", "alpha", "beta"]);
+    assert_eq!(*names1, vec!["pk", "alpha", "beta"]);
 
     // Second call should hit cache
     let names2 = engine.get_column_names(tid);
-    assert_eq!(names2, vec!["pk", "alpha", "beta"]);
+    assert_eq!(*names2, vec!["pk", "alpha", "beta"]);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -677,7 +689,7 @@ fn test_circuit_table_surface_introspectable() {
     // Inject a row directly into CIRCUIT_NODES so the store is non-empty.
     // Compound-PK layout: (view_id U64, sub U64) primary key, then payload
     // node_id U64, opcode U64, source_table U64?, expr_program BLOB?.
-    let schema = circuit_nodes_schema();
+    let schema = SysFamily::CircuitNodes.schema();
     let mut bb = BatchBuilder::new(schema);
     let pk = pack_view_pk(0, 42); // view_id=0, sub=node_id=42
     bb.begin_row(pk, 1);
@@ -707,13 +719,12 @@ fn test_circuit_table_surface_introspectable() {
 }
 
 #[test]
-fn test_read_batch_string_out_of_bounds_offset_returns_empty() {
-    // A registry batch whose STRING struct is a long string (len > 12) with a blob
-    // offset past the (empty) arena must read back empty, not abort: read_batch_string
-    // disposes of the decoder's None via unwrap_or_default. Reachable only via corrupt
-    // wire input — a correct client never emits an out-of-bounds offset.
-    let dir = temp_dir("read_batch_oob");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+fn test_read_payload_string_out_of_bounds_offset_returns_empty() {
+    // A batch whose STRING struct is a long string (len > 12) with a blob
+    // offset past the (empty) arena must read back empty, not abort:
+    // Batch::read_payload_string disposes of the decoder's None via
+    // unwrap_or_default. Reachable only via corrupt wire input — a correct
+    // client never emits an out-of-bounds offset.
 
     let schema = SchemaDescriptor::new(
         &[
@@ -733,8 +744,5 @@ fn test_read_batch_string_out_of_bounds_offset_returns_empty() {
     batch.count += 1;
 
     // payload_col 0 is the STRING column; the corrupt offset must decode to "".
-    assert_eq!(engine.read_batch_string(&batch, 0, 0), String::new());
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(batch.read_payload_string(0, 0), String::new());
 }

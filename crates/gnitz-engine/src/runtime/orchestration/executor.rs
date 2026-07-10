@@ -23,7 +23,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::catalog::{
     CatalogEngine, FIRST_USER_TABLE_ID, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB_ID,
-    SEQ_ID_INDICES, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID,
+    SEQ_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID,
 };
 use crate::foundation::posix_io::guard_panic;
 use crate::runtime::committer::{self, BarrierKind, CommitRequest};
@@ -830,19 +830,16 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>, bound_cli
     if target_id == 0 {
         if flags & FLAG_ALLOCATE_TABLE_ID != 0 {
             let new_id = shared.cat().allocate_table_id();
-            shared.cat().advance_sequence(SEQ_ID_TABLES, new_id - 1, new_id);
             send_alloc(peer, new_id, client_id).await;
             return;
         }
         if flags & FLAG_ALLOCATE_SCHEMA_ID != 0 {
             let new_id = shared.cat().allocate_schema_id();
-            shared.cat().advance_sequence(SEQ_ID_SCHEMAS, new_id - 1, new_id);
             send_alloc(peer, new_id, client_id).await;
             return;
         }
         if flags & FLAG_ALLOCATE_INDEX_ID != 0 {
             let new_id = shared.cat().allocate_index_id();
-            shared.cat().advance_sequence(SEQ_ID_INDICES, new_id - 1, new_id);
             send_alloc(peer, new_id, client_id).await;
             return;
         }
@@ -967,7 +964,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>, bound_cli
         // INSERT and parent DELETE: both attempt the same ordered set.
         let lock_set = shared.cat().fk_lock_set(target_id);
         let mut _tlocks = Vec::with_capacity(lock_set.len());
-        for &tid in &lock_set {
+        for &tid in lock_set {
             _tlocks.push(shared.table_lock(tid).lock().await);
         }
 
@@ -1603,11 +1600,9 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
     let mut filter_seeds: Vec<(i64, u64, FxHashSet<crate::storage::PkBuf>, bool)> = Vec::new();
     if let Some((_, idx_batch)) = families.iter().find(|(tid, _)| *tid == IDX_TAB_ID) {
         for i in 0..idx_batch.count {
-            if idx_batch.get_weight(i) > 0
-                && unsafe { (*cat_ptr_raw).read_batch_u64(idx_batch, i, IDXTAB_PAY_IS_UNIQUE) } != 0
-            {
-                let owner_id = unsafe { (*cat_ptr_raw).read_batch_u64(idx_batch, i, IDXTAB_PAY_OWNER_ID) } as i64;
-                let packed = unsafe { (*cat_ptr_raw).read_batch_u64(idx_batch, i, IDXTAB_PAY_SOURCE_COLS) };
+            if idx_batch.get_weight(i) > 0 && idx_batch.read_payload_u64(i, IDXTAB_PAY_IS_UNIQUE) != 0 {
+                let owner_id = idx_batch.read_payload_u64(i, IDXTAB_PAY_OWNER_ID) as i64;
+                let packed = idx_batch.read_payload_u64(i, IDXTAB_PAY_SOURCE_COLS);
                 let cols = gnitz_wire::unpack_pk_cols(packed);
                 if !cols.is_well_formed() {
                     continue;
@@ -1661,8 +1656,8 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
             (0..b.count)
                 .filter(|&i| b.get_weight(i) < 0)
                 .map(|i| {
-                    let owner_id = unsafe { (*cat_ptr_raw).read_batch_u64(b, i, IDXTAB_PAY_OWNER_ID) } as i64;
-                    let packed = unsafe { (*cat_ptr_raw).read_batch_u64(b, i, IDXTAB_PAY_SOURCE_COLS) };
+                    let owner_id = b.read_payload_u64(i, IDXTAB_PAY_OWNER_ID) as i64;
+                    let packed = b.read_payload_u64(i, IDXTAB_PAY_SOURCE_COLS);
                     (owner_id, packed)
                 })
                 .collect()

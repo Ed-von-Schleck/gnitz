@@ -320,6 +320,13 @@ pub fn entry_count(path: &std::ffi::CStr) -> Result<Option<usize>, StorageError>
 /// a `RederiveCheckpointed` table loads its shards only when its manifest
 /// generation equals the committed checkpoint generation, and erases them
 /// otherwise.
+/// Path of one partition's manifest inside a partitioned store's directory —
+/// the single spelling of the `part_{p}/manifest.bin` layout the boot resume
+/// verdict peeks and the rebuild reset unlinks.
+pub fn partition_manifest_path(dir: &str, p: u32) -> String {
+    format!("{dir}/part_{p}/manifest.bin")
+}
+
 pub fn peek_generation(path: &std::ffi::CStr) -> Result<Option<u64>, StorageError> {
     peek_header_u64(path, OFF_GENERATION)
 }
