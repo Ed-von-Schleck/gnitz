@@ -628,7 +628,7 @@ mod tests {
         let schema = make_schema_u64_i64();
         let empty_batch = Batch::empty_with_schema(&schema);
 
-        let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[(1, type_code::I64)]), &schema, &schema);
+        let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema);
         let out = op_map(&empty_batch, &func, &schema, &schema, &[], &[], false, 0);
         assert_eq!(out.count, 0);
     }
@@ -936,7 +936,7 @@ mod tests {
         let batch = make_batch(&schema, &[(1, 1, 200), (2, 1, 100), (3, 1, 300)]);
 
         // Projection plan: output keeps the same single payload column.
-        let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[(1, type_code::I64)]), &schema, &schema);
+        let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema);
 
         let out = op_map(
             &batch,

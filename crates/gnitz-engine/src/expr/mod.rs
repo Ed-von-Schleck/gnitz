@@ -16,6 +16,7 @@ pub use program::LogicalProgram;
 // (lib vs bin) reference different subsets, so the import is liberally exposed
 // under #[cfg(test)] with an allow for the unreferenced names in each build.
 // The resolved `Instr` never leaves this module.
+pub(crate) use program::ExprValidateErr;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use program::{CmpOp, LogicalInstr, StrOp};

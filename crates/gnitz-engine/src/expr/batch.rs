@@ -568,7 +568,10 @@ pub(in crate::expr) fn eval_batch(
                     (2, false) => load_int!(u16),
                     (1, true) => load_int!(i8),
                     (1, false) => load_int!(u8),
-                    _ => {}
+                    // Wide (16-byte) columns are rejected at compile
+                    // (`ExprValidateErr::ColTooWideForRegister` + the binder's
+                    // `is_wide_int` gate), so no LoadColInt ever resolves to one.
+                    _ => unreachable!("LoadPayloadInt: col_size {col_size} > 8; wide columns rejected at compile"),
                 }
                 fill_null_bits_pi(scratch, dst, mb.null_bmp(), morsel_start, m, pi);
                 maybe_pack_bool_bits(scratch, prog, dst, m);
@@ -604,6 +607,11 @@ pub(in crate::expr) fn eval_batch(
                 let dst = dst as usize;
                 let byte_offset = off as usize;
                 let col_size = crate::schema::type_size(tc) as usize;
+                // Wide (16-byte) PK columns are rejected at compile
+                // (`ExprValidateErr::ColTooWideForRegister` + the binder), so both
+                // branches below assume `col_size <= 8` (the signed branch's 8-byte
+                // scratch would otherwise panic-slice).
+                debug_assert!(col_size <= 8, "LoadPk: wide PK column rejected at compile");
                 let signed = crate::schema::is_signed_int(tc);
                 let base_d = dst * MORSEL;
                 if signed {

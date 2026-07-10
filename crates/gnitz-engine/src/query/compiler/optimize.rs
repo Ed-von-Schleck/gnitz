@@ -213,7 +213,14 @@ pub(super) fn opt_fold_reduce_map(
             Some(d) => d,
             None => continue,
         };
-        let prog = LogicalProgram::from_wire(&dep.code, dep.num_regs, 0, Vec::new());
+        // Empty const pool here (structural pre-pass); a const-using finalize
+        // returns `Err` (`StrColConst` vs the empty pool) → not folded → compiled
+        // normally through the Map path with its real pool, which also removes a
+        // latent crash (the empty pool used to be folded in and panic at eval).
+        let prog = match LogicalProgram::from_wire(&dep.code, dep.num_regs, 0, Vec::new()) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
         // Skip folding any clean block copy regardless of offset; the
         // authoritative identity-MAP elision below (with the schema-checked PK
         // offset) handles it. No register schema exists in this early pass, so we
@@ -260,20 +267,18 @@ pub(super) enum JoinNullFill {
     RightNullable,
 }
 
+/// `None` when the merged column count would overflow the fixed `[_; 65]` schema
+/// array — a crafted/corrupt `NullExtend` or `Join` node; the caller fails the
+/// compile rather than aborting.
 pub(super) fn merge_schemas_for_join(
     left: &SchemaDescriptor,
     right: &SchemaDescriptor,
     fill: JoinNullFill,
-) -> SchemaDescriptor {
+) -> Option<SchemaDescriptor> {
     let total = left.num_columns() + right.num_payload_cols();
-    assert!(
-        total <= crate::schema::MAX_COLUMNS,
-        "join output schema exceeds {}-column limit: {} + payload({}) = {}",
-        crate::schema::MAX_COLUMNS,
-        left.num_columns(),
-        right.num_payload_cols(),
-        total
-    );
+    if total > crate::schema::MAX_COLUMNS {
+        return None;
+    }
     let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
     let mut pk_idx = [0u32; crate::schema::MAX_PK_COLUMNS];
     let pk_len = copy_pk_columns_into(left, &mut cols, &mut pk_idx);
@@ -290,7 +295,7 @@ pub(super) fn merge_schemas_for_join(
         cols[n] = c;
         n += 1;
     }
-    SchemaDescriptor::new(&cols[..n], &pk_idx[..pk_len])
+    Some(SchemaDescriptor::new(&cols[..n], &pk_idx[..pk_len]))
 }
 
 pub(super) fn build_map_output_schema(input: &SchemaDescriptor, src_indices: &[i32]) -> SchemaDescriptor {

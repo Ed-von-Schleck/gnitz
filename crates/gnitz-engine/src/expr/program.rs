@@ -26,6 +26,23 @@ use gnitz_wire::{
 /// `bool_input_mask`, `chain_trigger_mask`) address registers by bit in a `u64`.
 pub(in crate::expr) const MAX_REGS: usize = u64::BITS as usize;
 
+/// Why a client-authored expr program was rejected at compile. `Debug` only — a
+/// diagnostic for the recovery log and test precision; no consumer branches on
+/// the variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExprValidateErr {
+    UnknownOpcode(u32),
+    TooManyRegs(u32),
+    ResultRegOutOfRange { result_reg: u32, num_regs: u32 },
+    RegOutOfRange { reg: u16, num_regs: u32 },
+    RegisterAliasing { dst: u16, a: u16, b: u16 },
+    ConstIdxOutOfRange { const_idx: u32, n: usize },
+    ColOutOfRange { col: u32, num_columns: usize },
+    ColNotPayload { col: u32 },
+    ColTooWideForRegister { col: u32, size: usize },
+    OutputIdxOutOfRange { out: u32, num_payload_cols: usize },
+}
+
 // ---------------------------------------------------------------------------
 // Typed instruction operands
 // ---------------------------------------------------------------------------
@@ -197,7 +214,6 @@ pub(crate) enum LogicalInstr {
     CopyCol {
         src_col: u32,
         out: u32,
-        tc: u8,
     },
     Emit {
         src: u16,
@@ -394,106 +410,55 @@ pub struct LogicalProgram {
 }
 
 impl LogicalProgram {
-    /// Build from typed instructions, validating the construction-time
-    /// invariants. Used by `from_wire` and the test builders.
+    /// Build from typed instructions. The compiler and test builders trust their
+    /// own construction, so a validation failure here is a compiler bug, not
+    /// client input — `validate` (structure only; no schema) panics rather than
+    /// returns. This preserves the all-profiles register-valid / alias-free
+    /// guarantee `reg3`/`reg4`'s raw split borrows depend on.
     pub(crate) fn new(instrs: Vec<LogicalInstr>, num_regs: u32, result_reg: u32, const_strings: Vec<Vec<u8>>) -> Self {
-        assert!(
-            num_regs as usize <= MAX_REGS,
-            "LogicalProgram: num_regs={num_regs} exceeds the {MAX_REGS}-register limit"
-        );
-        assert!(
-            num_regs == 0 || result_reg < num_regs,
-            "LogicalProgram: result_reg={result_reg} >= num_regs={num_regs}"
-        );
         gnitz_debug!(
             "expr_program: instrs={} regs={} consts={}",
             instrs.len(),
             num_regs,
             const_strings.len()
         );
-        use LogicalInstr as L;
-        for instr in &instrs {
-            match *instr {
-                // Binary ALU: SSA (dst must not alias a source — `reg3` borrows
-                // three distinct register slots) + bounds on dst, a, b.
-                L::IntAdd { dst, a, b }
-                | L::IntSub { dst, a, b }
-                | L::IntMul { dst, a, b }
-                | L::IntDiv { dst, a, b }
-                | L::IntMod { dst, a, b }
-                | L::FloatAdd { dst, a, b }
-                | L::FloatSub { dst, a, b }
-                | L::FloatMul { dst, a, b }
-                | L::FloatDiv { dst, a, b }
-                | L::Cmp { dst, a, b, .. }
-                | L::FCmp { dst, a, b, .. }
-                | L::BoolAnd { dst, a, b }
-                | L::BoolOr { dst, a, b } => {
-                    assert!(
-                        dst != a && dst != b,
-                        "LogicalProgram: register aliasing dst={dst} a={a} b={b}"
-                    );
-                    assert_reg(dst, num_regs);
-                    assert_reg(a, num_regs);
-                    assert_reg(b, num_regs);
-                }
-                // Ternary select: three register sources + dst. Anti-aliasing
-                // (dst distinct from every source) makes `reg4`'s raw split
-                // borrows sound — the same expr-VM SSA rule as the binary ALU
-                // above, extended to three sources. (Unrelated to the operator-DAG
-                // "destructive register ordering" invariant in
-                // `query/compiler/emit.rs`, which concerns batch registers.)
-                L::Select { dst, cond, a, b } => {
-                    assert!(
-                        dst != cond && dst != a && dst != b,
-                        "LogicalProgram: SELECT register aliasing dst={dst} cond={cond} a={a} b={b}"
-                    );
-                    assert_reg(dst, num_regs);
-                    assert_reg(cond, num_regs);
-                    assert_reg(a, num_regs);
-                    assert_reg(b, num_regs);
-                }
-                // Unary register readers that write dst: bounds dst, a.
-                L::IntNeg { dst, a } | L::FloatNeg { dst, a } | L::IntToFloat { dst, a } | L::BoolNot { dst, a } => {
-                    assert_reg(dst, num_regs);
-                    assert_reg(a, num_regs);
-                }
-                // EMIT reads a source register; no dst register.
-                L::Emit { src, .. } => assert_reg(src, num_regs),
-                // dst-writers whose other operands are column / const indices, or none.
-                L::LoadColInt { dst, .. }
-                | L::LoadColFloat { dst, .. }
-                | L::LoadConst { dst, .. }
-                | L::LoadNull { dst }
-                | L::IsNull { dst, .. }
-                | L::IsNotNull { dst, .. }
-                | L::StrColConst { dst, .. }
-                | L::StrColCol { dst, .. } => assert_reg(dst, num_regs),
-                // No register operands.
-                L::CopyCol { .. } | L::EmitNull { .. } => {}
-            }
-        }
-        LogicalProgram {
+        Self::assembled(instrs, num_regs, result_reg, const_strings)
+            .unwrap_or_else(|e| panic!("compiler-built LogicalProgram is invalid: {e:?}"))
+    }
+
+    /// Assemble the struct and run the structure-only `validate(None, None)` that
+    /// upholds the all-profiles register-valid / alias-free invariant `reg3`/`reg4`
+    /// rely on. Shared by `new` (which unwraps — a failure is a compiler bug) and
+    /// `from_wire` (which propagates — a failure is bad client input).
+    fn assembled(
+        instrs: Vec<LogicalInstr>,
+        num_regs: u32,
+        result_reg: u32,
+        const_strings: Vec<Vec<u8>>,
+    ) -> Result<Self, ExprValidateErr> {
+        let prog = LogicalProgram {
             instrs,
             num_regs,
             result_reg,
             const_strings,
-        }
+        };
+        prog.validate(None, None)?;
+        Ok(prog)
     }
 
-    /// A pure projection: `copies[i] = (src_col, tc)` copies logical input column
-    /// `src_col` (of source type `tc`) into dense output payload slot `i`. The
-    /// register-free (`num_regs == 0`) shape `ScalarFunc::from_map` lowers into
-    /// `col_moves` + `null_perm` and nothing else. `LogicalInstr` is test-only, so
-    /// this is the compiler's only way to build a program without a wire blob.
-    pub(crate) fn copy_cols(copies: &[(u32, u8)]) -> Self {
+    /// A pure projection: `copies[i] = src_col` copies logical input column
+    /// `src_col` into dense output payload slot `i`. The source type is derived in
+    /// `resolve` from the schema. The register-free (`num_regs == 0`) shape
+    /// `ScalarFunc::from_map` lowers into `col_moves` + `null_perm` and nothing
+    /// else. `LogicalInstr` is test-only, so this is the compiler's only way to
+    /// build a program without a wire blob.
+    pub(crate) fn copy_cols(copies: &[u32]) -> Self {
         let instrs = copies
             .iter()
             .enumerate()
-            .map(|(out, &(src_col, tc))| LogicalInstr::CopyCol {
+            .map(|(out, &src_col)| LogicalInstr::CopyCol {
                 src_col,
                 out: out as u32,
-                tc,
             })
             .collect();
         LogicalProgram::new(instrs, 0, 0, Vec::new())
@@ -501,8 +466,17 @@ impl LogicalProgram {
 
     /// Lower a wire expr blob (flat u32 quads `[op, dst, a1, a2]`) into the
     /// typed logical form. The single point that knows the wire encoding.
-    pub(crate) fn from_wire(code: &[u32], num_regs: u32, result_reg: u32, const_strings: Vec<Vec<u8>>) -> Self {
-        assert_eq!(
+    /// Client-controlled: an unknown opcode or a structurally-invalid program
+    /// (bad register, alias, const index) is rejected rather than panicked. The
+    /// structure-only `validate(None, None)` preserves the all-profiles
+    /// register-valid / alias-free invariant for every `from_wire` output.
+    pub(crate) fn from_wire(
+        code: &[u32],
+        num_regs: u32,
+        result_reg: u32,
+        const_strings: Vec<Vec<u8>>,
+    ) -> Result<Self, ExprValidateErr> {
+        debug_assert_eq!(
             code.len() % 4,
             0,
             "from_wire: code length {} is not a multiple of 4",
@@ -568,7 +542,6 @@ impl LogicalProgram {
                 EXPR_COPY_COL => LogicalInstr::CopyCol {
                     src_col: q[2],
                     out: q[3],
-                    tc: q[1] as u8,
                 },
                 EXPR_STR_COL_EQ_CONST => LogicalInstr::StrColConst {
                     op: StrOp::Eq,
@@ -607,10 +580,10 @@ impl LogicalProgram {
                     col_b: q[3],
                 },
                 EXPR_EMIT_NULL => LogicalInstr::EmitNull { out: q[2] },
-                _ => panic!("from_wire: unknown expr opcode {op}"),
+                _ => return Err(ExprValidateErr::UnknownOpcode(op)),
             });
         }
-        LogicalProgram::new(instrs, num_regs, result_reg, const_strings)
+        Self::assembled(instrs, num_regs, result_reg, const_strings)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -627,7 +600,7 @@ impl LogicalProgram {
             .iter()
             .enumerate()
             .map(|(i, instr)| match *instr {
-                LogicalInstr::CopyCol { src_col, out, .. } if out == i as u32 => Some(src_col),
+                LogicalInstr::CopyCol { src_col, out } if out == i as u32 => Some(src_col),
                 _ => None,
             })
             .collect()
@@ -756,20 +729,36 @@ impl LogicalProgram {
                 L::BoolAnd { dst, a, b } => instrs.push(I::BoolAnd { dst, a, b }),
                 L::BoolOr { dst, a, b } => instrs.push(I::BoolOr { dst, a, b }),
                 L::BoolNot { dst, a } => instrs.push(I::BoolNot { dst, a }),
-                L::IsNull { dst, col } => instrs.push(I::IsNull {
-                    dst,
-                    pi: schema.payload_mapping_byte(col as usize),
-                }),
-                L::IsNotNull { dst, col } => instrs.push(I::IsNotNull {
-                    dst,
-                    pi: schema.payload_mapping_byte(col as usize),
-                }),
+                L::IsNull { dst, col } => {
+                    debug_assert!(
+                        !schema.is_pk_col(col as usize),
+                        "resolve: IS_NULL references PK column {col} (payload-only opcode)"
+                    );
+                    instrs.push(I::IsNull {
+                        dst,
+                        pi: schema.payload_mapping_byte(col as usize),
+                    });
+                }
+                L::IsNotNull { dst, col } => {
+                    debug_assert!(
+                        !schema.is_pk_col(col as usize),
+                        "resolve: IS_NOT_NULL references PK column {col} (payload-only opcode)"
+                    );
+                    instrs.push(I::IsNotNull {
+                        dst,
+                        pi: schema.payload_mapping_byte(col as usize),
+                    });
+                }
                 L::StrColConst {
                     op,
                     dst,
                     col,
                     const_idx,
                 } => {
+                    debug_assert!(
+                        !schema.is_pk_col(col as usize),
+                        "resolve: STR_COL_CONST references PK column {col} (payload-only opcode)"
+                    );
                     instrs.push(I::StrColConst {
                         op,
                         dst,
@@ -778,6 +767,10 @@ impl LogicalProgram {
                     });
                 }
                 L::StrColCol { op, dst, col_a, col_b } => {
+                    debug_assert!(
+                        !schema.is_pk_col(col_a as usize) && !schema.is_pk_col(col_b as usize),
+                        "resolve: STR_COL_COL references a PK column (col_a={col_a}, col_b={col_b}; payload-only opcode)"
+                    );
                     instrs.push(I::StrColCol {
                         op,
                         dst,
@@ -785,8 +778,11 @@ impl LogicalProgram {
                         pi_b: schema.payload_mapping_byte(col_b as usize),
                     });
                 }
-                L::CopyCol { src_col, out, tc } => {
+                L::CopyCol { src_col, out } => {
+                    // The source type — dropped from the wire `CopyCol` — is exactly
+                    // the source column's own type; derive it here from the schema.
                     let ci = src_col as usize;
+                    let tc = schema.columns[ci].type_code;
                     let src = if schema.is_pk_col(ci) {
                         ColSrc::Pk {
                             off: schema.pk_byte_offset(ci),
@@ -829,14 +825,177 @@ impl LogicalProgram {
         prog.chain_trigger_mask = prog.and_chain_mask(is_filter);
         prog
     }
+
+    /// Validate every value a client-authored program controls that reaches a
+    /// panicking / OOB / truncating site, in one exhaustive `match self` (a new
+    /// opcode cannot silently bypass a bound). `in_schema` / `out_schema` are
+    /// `None` for the structure-only pass (register-file limits, SSA
+    /// anti-aliasing, const-pool index) `new`/`from_wire` run before any schema
+    /// exists; passing a schema additionally validates the column / output
+    /// operands the blob-derived resolve entries index. `None` schemas skip the
+    /// corresponding checks — a filter (no output plan) passes `out_schema =
+    /// None`, so output opcodes (eval no-ops there) are not checked.
+    pub(crate) fn validate(
+        &self,
+        in_schema: Option<&SchemaDescriptor>,
+        out_schema: Option<&SchemaDescriptor>,
+    ) -> Result<(), ExprValidateErr> {
+        use ExprValidateErr as E;
+        use LogicalInstr as L;
+        let num_regs = self.num_regs;
+        if num_regs as usize > MAX_REGS {
+            return Err(E::TooManyRegs(num_regs));
+        }
+        if num_regs != 0 && self.result_reg >= num_regs {
+            return Err(E::ResultRegOutOfRange {
+                result_reg: self.result_reg,
+                num_regs,
+            });
+        }
+        // Bound `out` against the output payload width (output opcodes only).
+        let check_out = |out: u32| -> Result<(), E> {
+            if let Some(os) = out_schema {
+                if out as usize >= os.num_payload_cols() {
+                    return Err(E::OutputIdxOutOfRange {
+                        out,
+                        num_payload_cols: os.num_payload_cols(),
+                    });
+                }
+            }
+            Ok(())
+        };
+        for instr in &self.instrs {
+            match *instr {
+                // Binary register ops (the 13 opcodes `reg3` splits): bound every
+                // register operand, then SSA anti-aliasing (dst ≠ a, dst ≠ b).
+                L::IntAdd { dst, a, b }
+                | L::IntSub { dst, a, b }
+                | L::IntMul { dst, a, b }
+                | L::IntDiv { dst, a, b }
+                | L::IntMod { dst, a, b }
+                | L::FloatAdd { dst, a, b }
+                | L::FloatSub { dst, a, b }
+                | L::FloatMul { dst, a, b }
+                | L::FloatDiv { dst, a, b }
+                | L::Cmp { dst, a, b, .. }
+                | L::FCmp { dst, a, b, .. }
+                | L::BoolAnd { dst, a, b }
+                | L::BoolOr { dst, a, b } => {
+                    check_reg(dst, num_regs)?;
+                    check_reg(a, num_regs)?;
+                    check_reg(b, num_regs)?;
+                    if dst == a || dst == b {
+                        return Err(E::RegisterAliasing { dst, a, b });
+                    }
+                }
+                // Ternary select (`reg4`'s raw split): dst distinct from every source.
+                L::Select { dst, cond, a, b } => {
+                    check_reg(dst, num_regs)?;
+                    check_reg(cond, num_regs)?;
+                    check_reg(a, num_regs)?;
+                    check_reg(b, num_regs)?;
+                    if dst == cond || dst == a || dst == b {
+                        return Err(E::RegisterAliasing { dst, a, b });
+                    }
+                }
+                // Unary register readers that write dst.
+                L::IntNeg { dst, a } | L::FloatNeg { dst, a } | L::IntToFloat { dst, a } | L::BoolNot { dst, a } => {
+                    check_reg(dst, num_regs)?;
+                    check_reg(a, num_regs)?;
+                }
+                // EMIT reads a source register and writes an output payload slot.
+                L::Emit { src, out } => {
+                    check_reg(src, num_regs)?;
+                    check_out(out)?;
+                }
+                // LoadColInt: bound the column, then reject a >8-byte source (the
+                // wide-register artefact C retires) — zero false positives, the
+                // binder register-loads no wide column.
+                L::LoadColInt { dst, col } => {
+                    check_reg(dst, num_regs)?;
+                    check_col_in_range(in_schema, col)?;
+                    if let Some(is) = in_schema {
+                        let size = crate::schema::type_size(is.columns[col as usize].type_code) as usize;
+                        if size > 8 {
+                            return Err(E::ColTooWideForRegister { col, size });
+                        }
+                    }
+                }
+                // Payload-only column readers: bound the column, then reject a PK
+                // column (the `pi = 255` sentinel these opcodes cannot route).
+                L::LoadColFloat { dst, col } | L::IsNull { dst, col } | L::IsNotNull { dst, col } => {
+                    check_reg(dst, num_regs)?;
+                    check_col_payload(in_schema, col)?;
+                }
+                L::StrColConst {
+                    dst, col, const_idx, ..
+                } => {
+                    check_reg(dst, num_regs)?;
+                    if const_idx as usize >= self.const_strings.len() {
+                        return Err(E::ConstIdxOutOfRange {
+                            const_idx,
+                            n: self.const_strings.len(),
+                        });
+                    }
+                    check_col_payload(in_schema, col)?;
+                }
+                L::StrColCol { dst, col_a, col_b, .. } => {
+                    check_reg(dst, num_regs)?;
+                    check_col_payload(in_schema, col_a)?;
+                    check_col_payload(in_schema, col_b)?;
+                }
+                // dst-writers whose other operands are data / none.
+                L::LoadConst { dst, .. } | L::LoadNull { dst } => check_reg(dst, num_regs)?,
+                // CopyCol: any (payload or PK) source column, one output payload slot.
+                L::CopyCol { src_col, out } => {
+                    check_col_in_range(in_schema, src_col)?;
+                    check_out(out)?;
+                }
+                L::EmitNull { out } => check_out(out)?,
+            }
+        }
+        Ok(())
+    }
 }
 
+/// A register operand is in range iff `< num_regs`.
 #[inline]
-fn assert_reg(r: u16, num_regs: u32) {
-    assert!(
-        (r as u32) < num_regs,
-        "LogicalProgram: register {r} out of range (num_regs={num_regs})"
-    );
+fn check_reg(r: u16, num_regs: u32) -> Result<(), ExprValidateErr> {
+    if (r as u32) < num_regs {
+        Ok(())
+    } else {
+        Err(ExprValidateErr::RegOutOfRange { reg: r, num_regs })
+    }
+}
+
+/// A column operand must index a real column (`< num_columns()`). The bound is
+/// `num_columns()`, not `MAX_COLUMNS`: the `[num_columns, 65)` zone reads a zeroed
+/// schema slot. Skipped when no `in_schema` is supplied (structure-only pass).
+#[inline]
+fn check_col_in_range(in_schema: Option<&SchemaDescriptor>, col: u32) -> Result<(), ExprValidateErr> {
+    if let Some(s) = in_schema {
+        if col as usize >= s.num_columns() {
+            return Err(ExprValidateErr::ColOutOfRange {
+                col,
+                num_columns: s.num_columns(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A payload-only column operand must be in range AND a payload (non-PK) column:
+/// routing a PK column to a payload-only opcode yields the `pi = 255` sentinel.
+/// Skipped when no `in_schema` is supplied (structure-only pass).
+#[inline]
+fn check_col_payload(in_schema: Option<&SchemaDescriptor>, col: u32) -> Result<(), ExprValidateErr> {
+    check_col_in_range(in_schema, col)?;
+    if let Some(s) = in_schema {
+        if s.is_pk_col(col as usize) {
+            return Err(ExprValidateErr::ColNotPayload { col });
+        }
+    }
+    Ok(())
 }
 
 /// True iff either operand register currently holds a U64 value — the single

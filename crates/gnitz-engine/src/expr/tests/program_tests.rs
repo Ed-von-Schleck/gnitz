@@ -947,12 +947,8 @@ fn test_zero_regs_program() {
     let batch = make_int_batch(&schema, &[(1, 1, 0, &[100])]);
     let mb = batch.as_mem_batch();
 
-    // One COPY_COL instruction: copy col 1 → payload 0, type I64=9
-    let instrs = vec![LogicalInstr::CopyCol {
-        src_col: 1,
-        out: 0,
-        tc: 9,
-    }];
+    // One COPY_COL instruction: copy col 1 → payload 0 (source type derived in resolve)
+    let instrs = vec![LogicalInstr::CopyCol { src_col: 1, out: 0 }];
     let prog = make_prog(&schema, instrs, 0, 0, vec![]);
     let (val, is_null) = eval_predicate(&prog, &mb, 0);
     // With num_regs=0, result should be (0, true) — sentinel
@@ -1496,7 +1492,7 @@ fn test_select_classification() {
 /// `dst` aliasing any of `cond`/`a`/`b` violates the SELECT anti-alias rule that
 /// makes `reg4`'s raw split borrows sound.
 #[test]
-#[should_panic(expected = "SELECT register aliasing")]
+#[should_panic(expected = "RegisterAliasing")]
 fn test_select_dst_alias_panics() {
     // `LogicalProgram::new` validates aliasing before any schema is consulted.
     let instrs = vec![
@@ -1736,4 +1732,176 @@ fn and_chain_map_program_no_mask() {
     ];
     let prog = LogicalProgram::new(instrs, 9, 8, vec![]).resolve(&schema, /* is_filter = */ false);
     assert_eq!(prog.chain_trigger_mask, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Expr-program validation (ExprValidateErr): one crafted input per vector.
+// Wire code is flat u32 quads `[opcode, w1, w2, w3]`; several opcodes read
+// `w2`/`w3` as full u32 (col / const_idx / out), not the loop's truncated u16.
+// ---------------------------------------------------------------------------
+
+/// `from_wire`'s `Ok` value (`LogicalProgram`) is not `Debug`/`PartialEq`, so
+/// extract the `Err` to compare the variant directly.
+fn wire_err(r: Result<LogicalProgram, ExprValidateErr>) -> ExprValidateErr {
+    match r {
+        Ok(_) => panic!("expected Err, got a valid program"),
+        Err(e) => e,
+    }
+}
+
+#[test]
+fn test_from_wire_rejects_unknown_opcode() {
+    // Valid opcodes are 1..=46; 0, 37/38/39, and every >= 47 are holes.
+    assert_eq!(
+        wire_err(LogicalProgram::from_wire(&[47, 0, 0, 0], 1, 0, vec![])),
+        ExprValidateErr::UnknownOpcode(47)
+    );
+    assert_eq!(
+        wire_err(LogicalProgram::from_wire(&[0, 0, 0, 0], 1, 0, vec![])),
+        ExprValidateErr::UnknownOpcode(0)
+    );
+    assert_eq!(
+        wire_err(LogicalProgram::from_wire(&[37, 0, 0, 0], 1, 0, vec![])),
+        ExprValidateErr::UnknownOpcode(37)
+    );
+    // A valid opcode lowers (control): LOAD_COL_INT dst0 col0.
+    assert!(LogicalProgram::from_wire(&[1, 0, 0, 0], 1, 0, vec![]).is_ok());
+}
+
+#[test]
+fn test_from_wire_rejects_bad_register_file() {
+    // num_regs over the 64-register limit.
+    assert_eq!(
+        wire_err(LogicalProgram::from_wire(&[], 65, 0, vec![])),
+        ExprValidateErr::TooManyRegs(65)
+    );
+    // result_reg out of range (>= num_regs).
+    assert_eq!(
+        wire_err(LogicalProgram::from_wire(&[], 3, 3, vec![])),
+        ExprValidateErr::ResultRegOutOfRange {
+            result_reg: 3,
+            num_regs: 3,
+        }
+    );
+}
+
+#[test]
+fn test_from_wire_rejects_out_of_range_register() {
+    // IntAdd dst0 a5 b1 with num_regs=2: operand `a=5` is out of range.
+    assert_eq!(
+        wire_err(LogicalProgram::from_wire(&[4, 0, 5, 1], 2, 0, vec![])),
+        ExprValidateErr::RegOutOfRange { reg: 5, num_regs: 2 }
+    );
+}
+
+#[test]
+fn test_from_wire_rejects_register_aliasing() {
+    // IntAdd dst0 a0 b1: dst aliases a source — breaks reg3's split borrows.
+    assert_eq!(
+        wire_err(LogicalProgram::from_wire(&[4, 0, 0, 1], 2, 0, vec![])),
+        ExprValidateErr::RegisterAliasing { dst: 0, a: 0, b: 1 }
+    );
+}
+
+#[test]
+fn test_from_wire_rejects_const_idx_out_of_range() {
+    // STR_COL_EQ_CONST (40) dst0 col0 const_idx9, pool of length 1.
+    assert_eq!(
+        wire_err(LogicalProgram::from_wire(&[40, 0, 0, 9], 1, 0, vec![b"x".to_vec()])),
+        ExprValidateErr::ConstIdxOutOfRange { const_idx: 9, n: 1 }
+    );
+}
+
+#[test]
+fn test_validate_rejects_out_of_range_column() {
+    // LOAD_COL_INT (1) col=200 against a 3-column schema.
+    let s3 = make_schema(0, &[8, 9, 9]);
+    let prog = LogicalProgram::from_wire(&[1, 0, 200, 0], 1, 0, vec![]).unwrap();
+    assert_eq!(
+        prog.validate(Some(&s3), None),
+        Err(ExprValidateErr::ColOutOfRange {
+            col: 200,
+            num_columns: 3,
+        })
+    );
+}
+
+#[test]
+fn test_validate_rejects_pk_column_for_payload_only_opcode() {
+    use crate::schema::type_code;
+    // Schema with a PK at column 0 (non-nullable) plus a payload string column.
+    let s_pk = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::STRING, 1),
+        ],
+        &[0],
+    );
+    // Each payload-only opcode that routes a PK column to the pi=255 sentinel.
+    let cases: &[(&[u32], Vec<Vec<u8>>)] = &[
+        (&[2, 0, 0, 0], vec![]),               // LOAD_COL_FLOAT col0
+        (&[30, 0, 0, 0], vec![]),              // IS_NULL col0
+        (&[40, 0, 0, 0], vec![b"x".to_vec()]), // STR_COL_EQ_CONST col0
+        (&[43, 0, 0, 1], vec![]),              // STR_COL_EQ_COL col_a=0
+    ];
+    for (code, consts) in cases {
+        let prog = LogicalProgram::from_wire(code, 1, 0, consts.clone()).unwrap();
+        assert_eq!(
+            prog.validate(Some(&s_pk), None),
+            Err(ExprValidateErr::ColNotPayload { col: 0 }),
+            "opcode {} must reject a PK source column",
+            code[0]
+        );
+    }
+}
+
+#[test]
+fn test_validate_rejects_wide_column_register_load() {
+    use crate::schema::type_code;
+    // LOAD_COL_INT on a 16-byte U128 column: rejected before it hits the
+    // wide-register eval artefact (Part C).
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U128, 1),
+        ],
+        &[0],
+    );
+    let prog = LogicalProgram::from_wire(&[1, 0, 1, 0], 1, 0, vec![]).unwrap();
+    assert_eq!(
+        prog.validate(Some(&schema), None),
+        Err(ExprValidateErr::ColTooWideForRegister { col: 1, size: 16 })
+    );
+}
+
+#[test]
+fn test_validate_output_index_map_vs_filter() {
+    use crate::schema::type_code;
+    // in: [U64 PK, I64]; out: [U64 PK, I64] — one output payload slot.
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let out_schema = in_schema;
+    // COPY_COL (34) src_col=0 out=200: rejected as a MAP (out_schema Some).
+    let prog = LogicalProgram::from_wire(&[34, 0, 0, 200], 0, 0, vec![]).unwrap();
+    assert_eq!(
+        prog.validate(Some(&in_schema), Some(&out_schema)),
+        Err(ExprValidateErr::OutputIdxOutOfRange {
+            out: 200,
+            num_payload_cols: 1,
+        })
+    );
+    // The same output opcode in a FILTER (out_schema None) is a harmless no-op.
+    assert_eq!(prog.validate(Some(&in_schema), None), Ok(()));
+}
+
+#[test]
+#[should_panic(expected = "RegisterAliasing")]
+fn test_new_panics_on_aliased_register() {
+    // A compiler-built (trusted) aliased-register program still panics from `new`.
+    let _ = LogicalProgram::new(vec![LogicalInstr::IntAdd { dst: 0, a: 0, b: 1 }], 2, 0, vec![]);
 }

@@ -340,13 +340,8 @@ fn linear_sum_only_new_all_null_group_present() {
     );
     // NullfillSum: grp → fin payload 0; sum(col 2) / (cnn(col 3) != 0) → fin
     // payload 1 (div-by-zero marks SUM NULL when the non-null count is 0).
-    let i64_tc = type_code::I64;
     let instrs = vec![
-        LogicalInstr::CopyCol {
-            src_col: 1,
-            out: 0,
-            tc: i64_tc,
-        },
+        LogicalInstr::CopyCol { src_col: 1, out: 0 },
         LogicalInstr::LoadColInt { dst: 0, col: 3 }, // r0 = cnn
         LogicalInstr::LoadConst { dst: 1, val: 0 },
         LogicalInstr::Cmp {
@@ -556,29 +551,20 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
     //   copy grp(col 1) → fin payload 0, count(col 2) → fin payload 1,
     //   emit sum-gate = sum(col 3) / (cnn(col 4) != 0) → fin payload 2.
     // div-by-zero (cnn == 0) marks the SUM NULL; div-by-1 (cnn > 0) is exact.
-    let i64_tc = type_code::I64;
     let instrs = vec![
-        LogicalInstr::CopyCol {
-            src_col: 1,
-            out: 0,
-            tc: i64_tc,
-        }, // grp   → fin payload 0
-        LogicalInstr::CopyCol {
-            src_col: 2,
-            out: 1,
-            tc: i64_tc,
-        }, // count → fin payload 1
-        LogicalInstr::LoadColInt { dst: 0, col: 4 }, // r0 = cnn (col 4)
-        LogicalInstr::LoadConst { dst: 1, val: 0 },  // r1 = 0
+        LogicalInstr::CopyCol { src_col: 1, out: 0 }, // grp   → fin payload 0
+        LogicalInstr::CopyCol { src_col: 2, out: 1 }, // count → fin payload 1
+        LogicalInstr::LoadColInt { dst: 0, col: 4 },  // r0 = cnn (col 4)
+        LogicalInstr::LoadConst { dst: 1, val: 0 },   // r1 = 0
         LogicalInstr::Cmp {
             op: CmpOp::Ne,
             dst: 2,
             a: 0,
             b: 1,
         }, // r2 = (cnn != 0) → 1/0
-        LogicalInstr::LoadColInt { dst: 3, col: 3 }, // r3 = sum (col 3)
-        LogicalInstr::IntDiv { dst: 4, a: 3, b: 2 }, // r4 = sum / gate (NULL when gate == 0)
-        LogicalInstr::Emit { src: 4, out: 2 },       // emit r4 → fin payload 2 (sum)
+        LogicalInstr::LoadColInt { dst: 3, col: 3 },  // r3 = sum (col 3)
+        LogicalInstr::IntDiv { dst: 4, a: 3, b: 2 },  // r4 = sum / gate (NULL when gate == 0)
+        LogicalInstr::Emit { src: 4, out: 2 },        // emit r4 → fin payload 2 (sum)
     ];
     let fin_func =
         crate::expr::ScalarFunc::from_map(LogicalProgram::new(instrs, 5, 0, vec![]), &out_schema, &fin_schema);

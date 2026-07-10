@@ -7,6 +7,28 @@ use super::*;
 // Expression + scalar function construction helpers
 // ---------------------------------------------------------------------------
 
+/// The one place the expr-program reject message lives; callers funnel a decode
+/// or `validate` `Err` through it (`.map_err(log_expr_reject)`). A rejected
+/// program is bad client input — a bad opcode / register / const index, or an
+/// out-of-range / PK-routed column.
+fn log_expr_reject(e: ExprValidateErr) {
+    gnitz_info!("expr program rejected: {e:?}");
+}
+
+/// Box `func`, keep it alive in `owned_funcs`, and return a raw pointer into the
+/// box. Valid for the box's lifetime — the heap `ScalarFunc` is stable across the
+/// `Vec`'s growth — which is what the VM's raw `*const ScalarFunc` handles rely on.
+/// The `Box` is load-bearing (pointer stability), so `vec_box` is intentional.
+#[allow(clippy::vec_box)]
+fn push_func(owned_funcs: &mut Vec<Box<ScalarFunc>>, func: ScalarFunc) -> *const ScalarFunc {
+    owned_funcs.push(Box::new(func));
+    &**owned_funcs.last().unwrap() as *const ScalarFunc
+}
+
+/// Decode + validate a client filter blob against `schema`, then build its
+/// predicate `ScalarFunc`. `None` (nothing pushed to `owned_funcs`) means the
+/// program was rejected — a bad opcode / register / const index (`from_wire`) or
+/// an out-of-range / PK-routed column (`validate`); the caller fails the compile.
 #[allow(clippy::vec_box)]
 pub(super) fn create_expr_predicate(
     code: &[u32],
@@ -15,55 +37,48 @@ pub(super) fn create_expr_predicate(
     const_strings: Vec<Vec<u8>>,
     schema: &SchemaDescriptor,
     owned_funcs: &mut Vec<Box<ScalarFunc>>,
-) -> *const ScalarFunc {
-    let prog = LogicalProgram::from_wire(code, num_regs, result_reg, const_strings);
-    let func = Box::new(ScalarFunc::from_predicate(prog, schema));
-    let ptr = &*func as *const ScalarFunc;
-    owned_funcs.push(func);
-    ptr
-}
-
-#[allow(clippy::vec_box)]
-pub(super) fn create_expr_map(
-    code: &[u32],
-    num_regs: u32,
-    const_strings: Vec<Vec<u8>>,
-    in_schema: &SchemaDescriptor,
-    out_schema: &SchemaDescriptor,
-    owned_funcs: &mut Vec<Box<ScalarFunc>>,
-) -> *const ScalarFunc {
-    let prog = LogicalProgram::from_wire(code, num_regs, 0, const_strings);
-    let func = Box::new(ScalarFunc::from_map(prog, in_schema, out_schema));
-    let ptr = &*func as *const ScalarFunc;
-    owned_funcs.push(func);
-    ptr
+) -> Option<*const ScalarFunc> {
+    let prog = LogicalProgram::from_wire(code, num_regs, result_reg, const_strings)
+        .and_then(|p| p.validate(Some(schema), None).map(|()| p))
+        .map_err(log_expr_reject)
+        .ok()?;
+    Some(push_func(owned_funcs, ScalarFunc::from_predicate(prog, schema)))
 }
 
 /// A MAP whose program is all-`CopyCol`: output payload `i` ← input column
-/// `src_indices[i]` (source type `src_types[i]`), widening into a promoted slot
-/// when the output column is wider.
+/// `src_indices[i]`, widening into a promoted slot when the output column is
+/// wider. The source type is derived per-column in `resolve` from `in_schema`.
 #[allow(clippy::vec_box, clippy::ptr_arg)]
 pub(super) fn create_universal_projection(
     src_indices: &[i32],
-    src_types: &[u8],
     in_schema: &SchemaDescriptor,
     out_schema: &SchemaDescriptor,
     owned_funcs: &mut Vec<Box<ScalarFunc>>,
 ) -> *const ScalarFunc {
-    let copies: Vec<(u32, u8)> = src_indices
-        .iter()
-        .zip(src_types)
-        .map(|(&ci, &tc)| (ci as u32, tc))
-        .collect();
+    let copies: Vec<u32> = src_indices.iter().map(|&ci| ci as u32).collect();
     let prog = LogicalProgram::copy_cols(&copies);
-    let func = Box::new(ScalarFunc::from_map(prog, in_schema, out_schema));
-    let ptr = &*func as *const ScalarFunc;
-    owned_funcs.push(func);
-    ptr
+    push_func(owned_funcs, ScalarFunc::from_map(prog, in_schema, out_schema))
 }
 
 pub(super) fn null_func_ptr() -> *const ScalarFunc {
     std::ptr::null()
+}
+
+/// True iff any raw wire column index in `cols` is out of range for `schema`.
+/// Bound is `num_columns()`, not `MAX_COLUMNS`, so the silent `[num_columns, 65)`
+/// zeroed-slot zone is rejected too. The recurring guard for a client-controlled
+/// column list that indexes (or slices) the fixed `[_; 65]` schema array.
+pub(super) fn oob_cols(cols: &[u16], schema: &SchemaDescriptor) -> bool {
+    cols.iter().any(|&c| c as usize >= schema.num_columns())
+}
+
+/// Remove every scratch directory created during a (failed) plan build, so a
+/// rejected compile leaks no inodes. On success the dirs are kept alive by the
+/// VM's owned tables instead. Shared by `build_plan` and `compile_view`.
+pub(super) fn cleanup_scratch_dirs(dirs: &[String]) {
+    for d in dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
 }
 
 /// Both inputs of a `Union` share a physical layout (equal type codes, sizes, and
@@ -158,7 +173,6 @@ pub(super) fn is_join_trace_side(loaded: &LoadedCircuit, nid: i32) -> bool {
 pub(super) struct EmitState {
     sink_reg_id: i32,
     input_delta_reg_id: i32,
-    emit_failed: bool,
     // Scratch directories created via `create_child_table` during this build.
     // On a compile failure they are removed (see `build_plan`/`compile_view`) so
     // probing unsupported queries can't permanently leak inodes; on success the
@@ -193,11 +207,11 @@ pub(super) fn emit_node(
     view_dir: &str,
     view_table_id: u32,
     view_id: u64,
-) {
+) -> Option<()> {
     let in_regs = compute_in_regs(loaded, nid, out_reg_of);
     let op = match loaded.nodes.get(&nid) {
         Some(op) => op,
-        None => return,
+        None => return Some(()),
     };
 
     match op {
@@ -249,27 +263,16 @@ pub(super) fn emit_node(
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
             let in_schema = reg_meta[in_reg as usize].schema;
             reg_meta[reg_id as usize] = RegisterMeta::delta(in_schema);
-            let func_ptr = if let Some(blob) = blob {
-                match gnitz_wire::decode_expr_blob(blob) {
-                    Some(dep) => create_expr_predicate(
-                        &dep.code,
-                        dep.num_regs,
-                        dep.result_reg,
-                        dep.const_strings,
-                        &in_schema,
-                        owned_funcs,
-                    ),
-                    // A present-but-corrupt blob is catalog corruption. Falling
-                    // back to null_func_ptr (pass-all) would silently turn a
-                    // WHERE into WHERE TRUE; abort the compile instead.
-                    None => {
-                        state.emit_failed = true;
-                        return;
-                    }
+            let func_ptr = match blob {
+                Some(blob) => {
+                    // A present-but-corrupt blob, or a rejected program, is catalog
+                    // corruption. Falling back to null_func_ptr (pass-all) would
+                    // silently turn a WHERE into WHERE TRUE; fail the compile instead.
+                    let dep = gnitz_wire::decode_expr_blob(blob)?;
+                    create_expr_predicate(&dep.code, dep.num_regs, dep.result_reg, dep.const_strings, &in_schema, owned_funcs)?
                 }
-            } else {
                 // Absent blob = no WHERE clause; pass-all is intentional.
-                null_func_ptr()
+                None => null_func_ptr(),
             };
             builder.add_filter(in_reg as u16, reg_id as u16, func_ptr);
         }
@@ -285,29 +288,30 @@ pub(super) fn emit_node(
                 } => {
                     // A corrupt MAP blob would otherwise be skipped, leaving the
                     // output register at the default empty schema and silently
-                    // producing wrong/empty downstream results. Abort the compile.
-                    let dep = match gnitz_wire::decode_expr_blob(program) {
-                        Some(d) => d,
-                        None => {
-                            state.emit_failed = true;
-                            return;
-                        }
-                    };
-                    // Identity MAP: if no reindex and schemas match, skip if sequential copy.
-                    if reindex_cols.is_empty() && in_reg_schema.same_physical_layout(&loaded.out_schema) {
-                        let prog = LogicalProgram::from_wire(&dep.code, dep.num_regs, 0, Vec::new());
-                        // Elide only when the block copy skips exactly the inherited
-                        // PK region (`base == pk_count`): the MAP carries the PK
-                        // region verbatim and copies payload columns 1:1.
-                        if prog.sequential_copy_base() == Some(in_reg_schema.pk_indices().len()) {
-                            out_reg_of.insert(nid, in_reg);
-                            return;
-                        }
+                    // producing wrong/empty downstream results. Decode + structurally
+                    // validate once, with the real const pool; a corrupt blob or an
+                    // invalid program fails the compile. The structural scans below
+                    // (`sequential_copy_base` / `payload_copy_srcs`) never touch the
+                    // const pool, so this one decode serves both them and `from_map`.
+                    let dep = gnitz_wire::decode_expr_blob(program)?;
+                    let prog = LogicalProgram::from_wire(&dep.code, dep.num_regs, 0, dep.const_strings)
+                        .map_err(log_expr_reject)
+                        .ok()?;
+                    // Identity MAP: elide only when there is no reindex, the schemas
+                    // match, and the block copy skips exactly the inherited PK region
+                    // (`base == pk_count`) — the MAP carries the PK region verbatim and
+                    // copies payload columns 1:1.
+                    if reindex_cols.is_empty()
+                        && in_reg_schema.same_physical_layout(&loaded.out_schema)
+                        && prog.sequential_copy_base() == Some(in_reg_schema.pk_indices().len())
+                    {
+                        out_reg_of.insert(nid, in_reg);
+                        return Some(());
                     }
                     // Folded MAP (absorbed into upstream REDUCE's finalize program).
                     if let Some(&reduce_nid) = rw.folded_maps.get(&nid) {
                         out_reg_of.insert(nid, *out_reg_of.get(&reduce_nid).unwrap_or(&0));
-                        return;
+                        return Some(());
                     }
                     // The reindex output schema prepends `pk_n` synthetic PK
                     // columns to the kept payload columns, written into a fixed
@@ -321,11 +325,8 @@ pub(super) fn emit_node(
                     // stride at 5 × 16 = 80 = MAX_PK_BYTES (ReindexPacker::new's
                     // assert is the tripwire).
                     let pk_n = reindex_cols.len();
-                    if pk_n > crate::schema::MAX_PK_COLUMNS
-                        || reindex_cols.iter().any(|&c| c as usize >= in_reg_schema.num_columns())
-                    {
-                        state.emit_failed = true;
-                        return;
+                    if pk_n > crate::schema::MAX_PK_COLUMNS || oob_cols(reindex_cols, &in_reg_schema) {
+                        return None;
                     }
                     // A carried target `t` must be exactly the promotion the planner
                     // derives for a key of this source type. Rather than re-deriving
@@ -351,49 +352,43 @@ pub(super) fn emit_node(
                         }
                     });
                     if promotion_invalid {
-                        state.emit_failed = true;
-                        return;
+                        return None;
                     }
                     let node_schema = if !reindex_cols.is_empty() {
                         // The output payload is exactly what the program copies: a
-                        // reindex program is one `COPY_COL(tc, src, out)` per kept
-                        // payload column with dense outs `0..n` (the planner's
+                        // reindex program is one `COPY_COL(src, out)` per kept payload
+                        // column with dense outs `0..n` (the planner's
                         // `build_reindex_program`), so the kept-column list is read
-                        // straight off the blob — the single source of truth, with no
-                        // separate wire list to drift out of sync. A program of any
-                        // other shape falls back to "all input columns" (the
-                        // pre-derivation structural assumption; the range-join
-                        // `nf_rekey` copies at an offset and lands here). An
-                        // out-of-range source column means a corrupt/forged catalog —
-                        // `columns[c]` would read a zeroed slot — so fail the compile.
-                        let prog = LogicalProgram::from_wire(&dep.code, dep.num_regs, 0, Vec::new());
+                        // straight off the decoded program — the single source of
+                        // truth. A program of any other shape falls back to "all input
+                        // columns" (the range-join `nf_rekey` copies at an offset and
+                        // lands here). An out-of-range source column means a
+                        // corrupt/forged catalog — `columns[c]` would read a zeroed
+                        // slot — so fail the compile.
                         let n_in = in_reg_schema.num_columns();
                         let payload_cols: Vec<u16> = match prog.payload_copy_srcs() {
                             Some(srcs) => {
                                 if srcs.iter().any(|&c| c as usize >= n_in) {
-                                    state.emit_failed = true;
-                                    return;
+                                    return None;
                                 }
                                 srcs.iter().map(|&c| c as u16).collect()
                             }
                             None => (0..n_in as u16).collect(),
                         };
                         if pk_n + payload_cols.len() > crate::schema::MAX_COLUMNS {
-                            state.emit_failed = true;
-                            return;
+                            return None;
                         }
                         reindex_output_schema(&in_reg_schema, reindex_cols, reindex_target_tcs, &payload_cols)
                     } else {
                         loaded.out_schema
                     };
-                    let fp = create_expr_map(
-                        &dep.code,
-                        dep.num_regs,
-                        dep.const_strings,
-                        &in_reg_schema,
-                        &node_schema,
-                        owned_funcs,
-                    );
+                    // Validate the decoded program against the resolved node schema,
+                    // then build its MAP `ScalarFunc` — the decode above is reused here
+                    // rather than re-lowering the blob a second time.
+                    prog.validate(Some(&in_reg_schema), Some(&node_schema))
+                        .map_err(log_expr_reject)
+                        .ok()?;
+                    let fp = push_func(owned_funcs, ScalarFunc::from_map(prog, &in_reg_schema, &node_schema));
                     reg_meta[reg_id as usize] = RegisterMeta::delta(node_schema);
                     let cols_u32: Vec<u32> = reindex_cols.iter().map(|&c| c as u32).collect();
                     builder.add_map(
@@ -425,11 +420,8 @@ pub(super) fn emit_node(
                     // ≤8-byte fixed-int domain the payload widen supports. A
                     // violation means a corrupt/forged catalog; fail the compile
                     // cleanly rather than truncate in `copy_column`.
-                    if 1 + proj_cols.len() > crate::schema::MAX_COLUMNS
-                        || proj_cols.iter().any(|&c| c as usize >= in_reg_schema.num_columns())
-                    {
-                        state.emit_failed = true;
-                        return;
+                    if 1 + proj_cols.len() > crate::schema::MAX_COLUMNS || oob_cols(proj_cols, &in_reg_schema) {
+                        return None;
                     }
                     let promotion_invalid = proj_cols.iter().enumerate().any(|(j, &c)| {
                         let t = target_tcs.get(j).copied().unwrap_or(0);
@@ -439,14 +431,9 @@ pub(super) fn emit_node(
                         }
                     });
                     if promotion_invalid {
-                        state.emit_failed = true;
-                        return;
+                        return None;
                     }
                     let src_indices: Vec<i32> = proj_cols.iter().map(|&c| c as i32).collect();
-                    let src_types: Vec<u8> = src_indices
-                        .iter()
-                        .map(|&i| in_reg_schema.columns[i as usize].type_code)
-                        .collect();
                     let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
                     cols[0] = SchemaColumn::new(type_code::U128, 0);
                     for (j, &i) in src_indices.iter().enumerate() {
@@ -462,13 +449,7 @@ pub(super) fn emit_node(
                         cols[1 + j] = SchemaColumn::new(out_tc, src.nullable);
                     }
                     let node_schema = SchemaDescriptor::new(&cols[..1 + src_indices.len()], &[0]);
-                    let fp = create_universal_projection(
-                        &src_indices,
-                        &src_types,
-                        &in_reg_schema,
-                        &node_schema,
-                        owned_funcs,
-                    );
+                    let fp = create_universal_projection(&src_indices, &in_reg_schema, &node_schema, owned_funcs);
                     reg_meta[reg_id as usize] = RegisterMeta::delta(node_schema);
                     builder.add_map(
                         in_reg as u16,
@@ -483,14 +464,12 @@ pub(super) fn emit_node(
                 }
 
                 gnitz_wire::MapKind::Projection(cols) => {
+                    if oob_cols(cols, &in_reg_schema) {
+                        return None;
+                    }
                     let src_indices: Vec<i32> = cols.iter().map(|&c| c as i32).collect();
-                    let src_types: Vec<u8> = src_indices
-                        .iter()
-                        .map(|&i| in_reg_schema.columns[i as usize].type_code)
-                        .collect();
                     let schema = build_map_output_schema(&in_reg_schema, &src_indices);
-                    let fp =
-                        create_universal_projection(&src_indices, &src_types, &in_reg_schema, &schema, owned_funcs);
+                    let fp = create_universal_projection(&src_indices, &in_reg_schema, &schema, owned_funcs);
                     reg_meta[reg_id as usize] = RegisterMeta::delta(schema);
                     builder.add_map(in_reg as u16, reg_id as u16, fp, schema, &[], &[], false, 0);
                 }
@@ -527,7 +506,7 @@ pub(super) fn emit_node(
             // it is never in `skip_nodes` — this check is simply false for it.
             if rw.skip_nodes.contains(&nid) {
                 out_reg_of.insert(nid, in_reg);
-                return;
+                return Some(());
             }
             // Set-membership clamp `[-1, 1]` for distinct; bag clamp `[0, i64::MAX]`
             // (negative part only) for positive_part. The two presets are the sole
@@ -538,13 +517,7 @@ pub(super) fn emit_node(
                 (-1, 1)
             };
             let child_name = format!("_hist_{view_id}_{nid}");
-            let hist_table = match create_child_table(state, view_dir, &child_name, in_reg_schema, view_table_id) {
-                Ok(t) => t,
-                Err(_) => {
-                    state.emit_failed = true;
-                    return;
-                }
-            };
+            let hist_table = create_child_table(state, view_dir, &child_name, in_reg_schema, view_table_id).ok()?;
             let table_idx = owned_tables.len();
             owned_tables.push(Box::new(hist_table));
             let hist_table_ptr = &*owned_tables[table_idx] as *const Table as *mut Table;
@@ -590,7 +563,7 @@ pub(super) fn emit_node(
                 view_dir,
                 view_table_id,
                 view_id,
-            );
+            )?;
         }
 
         gnitz_wire::OpNode::Join(kind) => {
@@ -601,16 +574,24 @@ pub(super) fn emit_node(
             let b_schema = reg_meta[b_reg as usize].schema;
             match kind {
                 gnitz_wire::JoinKind::DeltaTrace => {
-                    reg_meta[reg_id as usize] =
-                        RegisterMeta::delta(merge_schemas_for_join(&a_schema, &b_schema, JoinNullFill::None));
+                    let out_schema = merge_schemas_for_join(&a_schema, &b_schema, JoinNullFill::None)?;
+                    reg_meta[reg_id as usize] = RegisterMeta::delta(out_schema);
                     builder.add_join_dt(a_reg as u16, b_reg as u16, reg_id as u16, b_schema);
                 }
                 gnitz_wire::JoinKind::DeltaTraceRange { n_eq, rel } => {
+                    // The trace side's reindexed key is `[eq slots…, range slot]`, so
+                    // its PK arity is exactly `n_eq + 1` (ops/join/range.rs). A crafted
+                    // `n_eq` otherwise slices `columns[..n_eq]` out of range at runtime;
+                    // reject here, promoting the release-stripped `debug_assert` to a
+                    // compile-time guard (also closing the `dispatch.rs` slice).
+                    if *n_eq as usize + 1 != b_schema.pk_indices().len() {
+                        return None;
+                    }
                     // Same output layout as the equi delta-trace join; only the
                     // probe differs. `n_eq`/`rel` ride to the op so it can derive
                     // the eq-prefix / range-slot split and the cut direction.
-                    reg_meta[reg_id as usize] =
-                        RegisterMeta::delta(merge_schemas_for_join(&a_schema, &b_schema, JoinNullFill::None));
+                    let out_schema = merge_schemas_for_join(&a_schema, &b_schema, JoinNullFill::None)?;
+                    reg_meta[reg_id as usize] = RegisterMeta::delta(out_schema);
                     builder.add_join_dt_range(a_reg as u16, b_reg as u16, reg_id as u16, b_schema, *n_eq, *rel);
                 }
             }
@@ -626,25 +607,21 @@ pub(super) fn emit_node(
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
             let in_reg_schema = reg_meta[in_reg as usize].schema;
             let child_name = format!("_int_{view_id}_{nid}");
-            match create_child_table(state, view_dir, &child_name, in_reg_schema, view_table_id) {
-                Ok(t) => {
-                    let table_idx = owned_tables.len();
-                    owned_tables.push(Box::new(t));
-                    let table_ptr = &*owned_tables[table_idx] as *const Table as *mut Table;
-                    reg_meta[reg_id as usize] = RegisterMeta::trace(in_reg_schema);
-                    owned_trace_regs.push((reg_id as u16, table_idx));
-                    emit_simple_integrate(builder, in_reg as u16, table_ptr);
-                }
-                // Must fail the compile: emitting the view without the Integrate
-                // would compile a view that never persists its differential
-                // state, leaving its output permanently empty.
-                Err(_) => {
-                    state.emit_failed = true;
-                }
-            }
+            // Must fail the compile on a table-open error: emitting the view without
+            // the Integrate would compile a view that never persists its differential
+            // state, leaving its output permanently empty.
+            let t = create_child_table(state, view_dir, &child_name, in_reg_schema, view_table_id).ok()?;
+            let table_idx = owned_tables.len();
+            owned_tables.push(Box::new(t));
+            let table_ptr = &*owned_tables[table_idx] as *const Table as *mut Table;
+            reg_meta[reg_id as usize] = RegisterMeta::trace(in_reg_schema);
+            owned_trace_regs.push((reg_id as u16, table_idx));
+            emit_simple_integrate(builder, in_reg as u16, table_ptr);
         }
 
-        gnitz_wire::OpNode::ExchangeShard { .. } => {}
+        gnitz_wire::OpNode::ExchangeShard { .. } => {
+            unreachable!("ExchangeShard is excised from build_plan's node list in compile_view")
+        }
 
         gnitz_wire::OpNode::PartitionFilter => {
             // Pass-through schema; drops the rows this worker does not own before
@@ -678,19 +655,20 @@ pub(super) fn emit_node(
         gnitz_wire::OpNode::NullExtend { type_codes } => {
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
             let in_schema = reg_meta[in_reg as usize].schema;
-            assert!(
-                type_codes.len() < crate::schema::MAX_COLUMNS,
-                "NULL_EXTEND n_cols={} would overflow schema array (max {})",
-                type_codes.len(),
-                crate::schema::MAX_COLUMNS - 1,
-            );
+            // A crafted `type_codes` list would overflow the fixed `[_; 65]` schema
+            // array below (and `merge_schemas_for_join`'s output width). Reject
+            // rather than abort; the merge closes the additive `in + type_codes`
+            // overflow guard 4 alone cannot.
+            if type_codes.len() >= crate::schema::MAX_COLUMNS {
+                return None;
+            }
             let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
             cols[0] = SchemaColumn::new(type_code::U128, 0); // dummy PK
             for (i, &tc) in type_codes.iter().enumerate() {
                 cols[i + 1] = SchemaColumn::new(tc, 1);
             }
             let right = SchemaDescriptor::new(&cols[..type_codes.len() + 1], &[0]);
-            let out_schema = merge_schemas_for_join(&in_schema, &right, JoinNullFill::RightNullable);
+            let out_schema = merge_schemas_for_join(&in_schema, &right, JoinNullFill::RightNullable)?;
             reg_meta[reg_id as usize] = RegisterMeta::delta(out_schema);
             builder.add_null_extend(in_reg as u16, reg_id as u16, right);
         }
@@ -705,6 +683,7 @@ pub(super) fn emit_node(
             builder.add_clear_deltas();
         }
     }
+    Some(())
 }
 
 pub(super) fn compute_in_regs(loaded: &LoadedCircuit, nid: i32, out_reg_of: &HashMap<i32, i32>) -> HashMap<i32, i32> {
@@ -749,12 +728,25 @@ pub(super) fn emit_reduce(
     view_dir: &str,
     view_table_id: u32,
     view_id: u64,
-) {
+) -> Option<()> {
     let in_reg_id = in_regs.get(&PORT_IN).copied().unwrap_or(0);
     let in_reg_schema = reg_meta[in_reg_id as usize].schema;
 
     let gcols: Vec<i32> = group_cols.iter().map(|&c| c as i32).collect();
     let gcols_u32: Vec<u32> = group_cols.iter().map(|&c| c as u32).collect();
+
+    // Raw wire column indices below index the fixed `[_; 65]` schema array. Reject
+    // an out-of-range group column or aggregate column before `agg_descs` is built
+    // (which reads `columns[col_idx]`), so a crafted/corrupt node fails the compile
+    // rather than reading a zeroed slot or aborting at the first push.
+    if oob_cols(group_cols, &in_reg_schema) {
+        return None;
+    }
+    if let gnitz_wire::AggKind::Specs(specs) = agg {
+        if specs.iter().any(|&(_, c)| c as usize >= in_reg_schema.num_columns()) {
+            return None;
+        }
+    }
 
     let mut agg_descs: Vec<AggDescriptor> = Vec::new();
 
@@ -781,6 +773,22 @@ pub(super) fn emit_reduce(
         }
     }
 
+    // Every aggregate that decodes its column value needs an order-encodable
+    // (≤8-byte int/float) scalar. SUM/SUM_ZERO sum it — a 16-byte source would abort
+    // at the first push in `decode_signed` (`unreachable!`) and a string would
+    // silently mis-sum; MIN/MAX compare it via `encode_ordered`, which has no
+    // monotone key for STRING / U128 / UUID / BLOB. COUNT / COUNT_NON_NULL and the
+    // NULL placeholder never read the value. The SQL binder already rejects these,
+    // so this is the defensive guard for the low-level CircuitBuilder path that
+    // bypasses it: a failure fails the compile (→ `build_plan` returns `None`, so
+    // the view compiles to nothing) rather than panicking a worker at execution.
+    if agg_descs.iter().any(|ad| {
+        matches!(ad.agg_op, AggOp::Sum | AggOp::SumZero | AggOp::Min | AggOp::Max)
+            && !agg_value_idx_eligible(ad.col_type_code)
+    }) {
+        return None;
+    }
+
     // Validate the planner's shipped output-key kind against the input schema
     // before building the output schema. Everything downstream — the output
     // schema layout and `op_reduce`'s row keying — obeys `out_key`, so a kind
@@ -788,24 +796,13 @@ pub(super) fn emit_reduce(
     // reject the circuit instead (same failure class as the
     // MIN/MAX-eligibility guard below).
     if out_key != in_reg_schema.reduce_out_key(&gcols_u32) {
-        state.emit_failed = true;
-        return;
+        return None;
     }
     let reduce_out_schema = build_reduce_output_schema(&in_reg_schema, &gcols, &agg_descs, out_key);
 
-    let trace_table = match create_child_table(
-        state,
-        view_dir,
-        &format!("_reduce_{view_id}_{nid}"),
-        reduce_out_schema,
-        view_table_id,
-    ) {
-        Ok(t) => t,
-        Err(_) => {
-            state.emit_failed = true;
-            return;
-        }
-    };
+    let trace_table =
+        create_child_table(state, view_dir, &format!("_reduce_{view_id}_{nid}"), reduce_out_schema, view_table_id)
+            .ok()?;
     let trace_table_idx = owned_tables.len();
     owned_tables.push(Box::new(trace_table));
     let trace_table_ptr = &*owned_tables[trace_table_idx] as *const Table as *mut Table;
@@ -829,36 +826,19 @@ pub(super) fn emit_reduce(
     let all_linear = agg_descs.iter().all(|a| a.agg_op.is_linear());
     let has_value_indexed = agg_descs.iter().any(|a| a.agg_op.uses_value_index());
     // Serve every MIN/MAX aggregate (grouped or global) from one combined value
-    // index, keyed `group_cols ‖ ordinal ‖ av_encoded`, when every value-indexed
-    // aggregate is order-encodable and the group key is byte-form-eligible (the
-    // ordinal column is accounted for in `avi_group_key_eligible`'s budget). The
-    // empty global key is eligible, so a global MIN/MAX always resolves via the
-    // index; nothing value-indexed is left on the trace-scan fallback below.
+    // index, keyed `group_cols ‖ ordinal ‖ av_encoded`, when the group key is
+    // byte-form-eligible (the ordinal column is accounted for in
+    // `avi_group_key_eligible`'s budget). Every value-indexed aggregate is already
+    // order-encodable — the combined value-decode guard above rejected any that
+    // were not — so AVI use turns only on the group key. The empty global key is
+    // eligible, so a global MIN/MAX always resolves via the index; nothing
+    // value-indexed is left on the trace-scan fallback below.
     //
     // No nullable check on the aggregate columns: NULL aggregate values never
     // reach the AVI. The reduce accumulator skips NULL inputs (ops/reduce/agg.rs)
     // and AVI population skips a NULL aggregate value before encoding the index
     // key (ops/index.rs), whose value column is a non-nullable PK. Moving either
     // filter without revisiting this would write a zeroed key and corrupt MIN/MAX.
-    let all_value_indexed_eligible = agg_descs
-        .iter()
-        .filter(|a| a.agg_op.uses_value_index())
-        .all(|a| agg_value_idx_eligible(a.col_type_code));
-    // MIN/MAX require an order-encodable (≤8-byte int/float) aggregate column:
-    // both the accumulator and the AVI key on `encode_ordered`, which has no
-    // monotone key for a STRING / U128 / UUID / BLOB source. Fail the compile here
-    // (→ `build_plan` returns `None`, so the view compiles to nothing and produces
-    // no output) rather than letting the trace-scan fallback reach
-    // `encode_ordered`'s unreachable arm and panic the worker at execution. The
-    // SQL binder already rejects MIN/MAX over these types with a clear error; this
-    // is the defensive guard for the low-level CircuitBuilder path that bypasses
-    // the binder.
-    if has_value_indexed && !all_value_indexed_eligible {
-        state.emit_failed = true;
-        return;
-    }
-    // Past the guard above, every value-indexed aggregate is order-encodable, so
-    // AVI use turns only on the group key being byte-form-eligible.
     let use_avi = has_value_indexed && avi_group_key_eligible(&in_reg_schema, &gcols_u32);
 
     let mut tr_in_reg_id: i32 = -1;
@@ -869,13 +849,7 @@ pub(super) fn emit_reduce(
     if let Some(&existing) = in_regs.get(&PORT_TRACE) {
         tr_in_reg_id = existing;
     } else if !all_linear && !use_avi {
-        let tr_in = match create_child_table(state, view_dir, &tr_in_name, in_reg_schema, view_table_id) {
-            Ok(t) => t,
-            Err(_) => {
-                state.emit_failed = true;
-                return;
-            }
-        };
+        let tr_in = create_child_table(state, view_dir, &tr_in_name, in_reg_schema, view_table_id).ok()?;
         let idx = owned_tables.len();
         owned_tables.push(Box::new(tr_in));
         tr_in_table_ptr = &*owned_tables[idx] as *const Table as *mut Table;
@@ -934,10 +908,14 @@ pub(super) fn emit_reduce(
     // `owned_funcs`, which the reduce op holds a raw `*const ScalarFunc` into.
     let fin_func_ptr: *const ScalarFunc = if let Some(idx) = finalize_prog_idx {
         let logical = fin_logical[idx].take().expect("finalize prog consumed exactly once");
-        let func = Box::new(ScalarFunc::from_map(*logical, &reduce_out_schema, &loaded.out_schema));
-        let ptr = &*func as *const ScalarFunc;
-        owned_funcs.push(func);
-        ptr
+        // The finalize program is a client-derived MAP over the reduce output; its
+        // column/output operands must be validated against those schemas before it
+        // drives `from_map`, exactly as a MAP blob is validated in `emit_node`.
+        logical
+            .validate(Some(&reduce_out_schema), Some(&loaded.out_schema))
+            .map_err(log_expr_reject)
+            .ok()?;
+        push_func(owned_funcs, ScalarFunc::from_map(*logical, &reduce_out_schema, &loaded.out_schema))
     } else {
         std::ptr::null()
     };
@@ -999,6 +977,7 @@ pub(super) fn emit_reduce(
     }
 
     emit_simple_integrate(builder, raw_delta_id as u16, trace_table_ptr);
+    Some(())
 }
 
 #[allow(clippy::too_many_arguments, clippy::vec_box)]
@@ -1146,17 +1125,19 @@ pub(super) fn build_plan(
     let mut state = EmitState {
         sink_reg_id: -1,
         input_delta_reg_id: first_exchange_input_reg_id,
-        emit_failed: false,
         scratch_dirs: Vec::new(),
         all_sources_replicated,
     };
 
     for &nid in ordered {
-        if matches!(loaded.nodes.get(&nid), Some(gnitz_wire::OpNode::ExchangeShard { .. })) {
-            continue;
-        }
+        // `compile_view` excises every `ExchangeShard` from the `ordered` slice
+        // (its `emit_node` arm is `unreachable!`), so no skip is needed here. A
+        // node that fails to emit (corrupt/unsupported catalog) returns `None` and
+        // stops the build at once; the scratch dirs created so far are removed so a
+        // rejected compile leaks no inodes (on success they are handed to the caller
+        // in PlanBuildResult, kept alive by the VM's tables).
         let reg_id = *out_reg_of.get(&nid).unwrap();
-        emit_node(
+        if emit_node(
             loaded,
             rw,
             nid,
@@ -1175,21 +1156,12 @@ pub(super) fn build_plan(
             view_dir,
             view_table_id,
             view_id,
-        );
-    }
-
-    // On any post-emit failure, remove the scratch directories created during
-    // this build so a rejected compile leaks no inodes. On success the dirs are
-    // handed to the caller in PlanBuildResult (kept alive by the VM's tables).
-    let cleanup = |dirs: &[String]| {
-        for d in dirs {
-            let _ = std::fs::remove_dir_all(d);
+        )
+        .is_none()
+        {
+            cleanup_scratch_dirs(&state.scratch_dirs);
+            return None;
         }
-    };
-
-    if state.emit_failed {
-        cleanup(&state.scratch_dirs);
-        return None;
     }
 
     builder.add_halt();
@@ -1209,11 +1181,11 @@ pub(super) fn build_plan(
     }
 
     if input_delta_reg_id == -1 {
-        cleanup(&state.scratch_dirs);
+        cleanup_scratch_dirs(&state.scratch_dirs);
         return None;
     }
     if sink_reg == -1 {
-        cleanup(&state.scratch_dirs);
+        cleanup_scratch_dirs(&state.scratch_dirs);
         return None;
     }
 
@@ -1224,7 +1196,7 @@ pub(super) fn build_plan(
         // counts but mismatched types (e.g. I64 vs German-string) let the client
         // read a 16-byte string descriptor out of 8-byte integer storage.
         if sink_schema.num_columns() > 0 && !sink_schema.same_physical_layout(out_schema) {
-            cleanup(&state.scratch_dirs);
+            cleanup_scratch_dirs(&state.scratch_dirs);
             return None;
         }
     }

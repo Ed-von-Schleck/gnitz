@@ -681,7 +681,7 @@ mod tests {
 
         // MAP with ScalarFunc projection: reorder/select columns.
         let func = Box::new(crate::expr::ScalarFunc::from_map(
-            crate::expr::LogicalProgram::copy_cols(&[(2, type_code::I64)]),
+            crate::expr::LogicalProgram::copy_cols(&[2]),
             &in_schema,
             &out_schema,
         ));

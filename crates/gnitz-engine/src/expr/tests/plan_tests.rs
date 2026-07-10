@@ -34,7 +34,7 @@ fn test_projection_batch() {
     let out_schema = make_schema(0, &[8, 9, 9]);
     let batch = make_int_batch(&in_schema, &[(1, 1, 0, &[10, 20]), (2, 1, 0, &[30, 40])]);
 
-    let prog = LogicalProgram::copy_cols(&[(2, type_code::I64), (1, type_code::I64)]);
+    let prog = LogicalProgram::copy_cols(&[2, 1]);
     let func = ScalarFunc::from_map(prog, &in_schema, &out_schema);
     let result = func.evaluate_map_batch(&batch, &out_schema);
     assert_eq!(result.count, 2);
@@ -54,11 +54,7 @@ fn test_map_copy_and_emit() {
 
     use crate::expr::LogicalInstr;
     let instrs = vec![
-        LogicalInstr::CopyCol {
-            src_col: 1,
-            out: 0,
-            tc: type_code::I64,
-        },
+        LogicalInstr::CopyCol { src_col: 1, out: 0 },
         LogicalInstr::LoadColInt { dst: 0, col: 1 },
         LogicalInstr::LoadColInt { dst: 1, col: 2 },
         LogicalInstr::IntAdd { dst: 2, a: 0, b: 1 },
@@ -81,7 +77,7 @@ fn test_empty_batch() {
     let schema = make_schema(0, &[8, 9]);
     let batch = Batch::empty_with_schema(&schema);
 
-    let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[(1, type_code::I64)]), &schema, &schema);
+    let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema);
     let result = func.evaluate_map_batch(&batch, &schema);
     assert_eq!(result.count, 0);
 }
@@ -122,7 +118,7 @@ fn test_map_blob_passthrough_and_fallback() {
     {
         let batch = build(&in_schema);
         let out_schema = make_schema(0, &[type_code::U64, type_code::STRING, type_code::STRING]);
-        let prog = LogicalProgram::copy_cols(&[(2, type_code::STRING), (1, type_code::STRING)]);
+        let prog = LogicalProgram::copy_cols(&[2, 1]);
         let func = ScalarFunc::from_map(prog, &in_schema, &out_schema);
         let out = func.evaluate_map_batch(&batch, &out_schema);
         assert_eq!(out.count, 2);
@@ -138,7 +134,7 @@ fn test_map_blob_passthrough_and_fallback() {
     {
         let batch = build(&in_schema);
         let out_schema = make_schema(0, &[type_code::U64, type_code::STRING]);
-        let prog = LogicalProgram::copy_cols(&[(1, type_code::STRING)]);
+        let prog = LogicalProgram::copy_cols(&[1]);
         let func = ScalarFunc::from_map(prog, &in_schema, &out_schema);
         let out = func.evaluate_map_batch(&batch, &out_schema);
         assert_eq!(out.count, 2);
@@ -192,9 +188,9 @@ fn test_map_pk_copy_col_u128_and_signed_i64() {
     batch.count += 1;
 
     let prog = LogicalProgram::copy_cols(&[
-        (0, type_code::U128), // PK col 0 → payload 0
-        (1, type_code::I64),  // PK col 1 → payload 1
-        (2, type_code::I64),  // payload col 2 → payload 2
+        0, // PK col 0 (U128) → payload 0
+        1, // PK col 1 (I64) → payload 1
+        2, // payload col 2 (I64) → payload 2
     ]);
     let out = ScalarFunc::from_map(prog, &in_schema, &out_schema).evaluate_map_batch(&batch, &out_schema);
 
@@ -254,10 +250,10 @@ fn test_map_copy_col_widens_into_promoted_slot() {
     batch.count += 1;
 
     let prog = LogicalProgram::copy_cols(&[
-        (0, type_code::U16),
-        (1, type_code::I16),
-        (2, type_code::I8),
-        (3, type_code::U8),
+        0, // U16 PK  → zero-extend
+        1, // I16 PK  → sign-extend
+        2, // I8 payload → sign-extend
+        3, // U8 payload → zero-extend
     ]);
     let out = ScalarFunc::from_map(prog, &in_schema, &out_schema).evaluate_map_batch(&batch, &out_schema);
 

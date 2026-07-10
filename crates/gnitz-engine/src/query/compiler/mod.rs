@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::expr::{LogicalProgram, ScalarFunc};
+use crate::expr::{ExprValidateErr, LogicalProgram, ScalarFunc};
 use crate::foundation::worker_ctx::{num_workers, worker_rank};
 use crate::ops::{AggDescriptor, AggOp};
 use crate::query::vm::{ProgramBuilder, RegisterMeta, VmHandle};
@@ -48,6 +48,10 @@ pub(crate) enum CompileError {
     MissingExchangeInput,
     /// More than two exchange boundaries — not produced by any planner path.
     TooManyExchanges,
+    /// An `ExchangeShard` node's `shard_cols` name a column out of range for its
+    /// input schema (crafted/corrupt node); would abort at the first push in
+    /// `extract_group_key` (`schema.columns[c]`).
+    ShardColsOutOfBounds,
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +186,30 @@ struct PlanBuildResult {
     scratch_dirs: Vec<String>,
 }
 
+/// Validate an exchange-input sub-plan and return its output schema. The out_reg
+/// must index the plan's register file, and — when the exchange node is an
+/// `ExchangeShard` (which emits no instruction, so nothing else checks it) — its
+/// `shard_cols` must be in range for that schema. Both are consumed at runtime by
+/// `extract_group_key` (`schema.columns[c]`), so a crafted/corrupt node is
+/// rejected here rather than aborting at the first push. The caller removes the
+/// plan's scratch dirs on `Err`.
+fn finalize_side(
+    plan: &PlanBuildResult,
+    loaded: &LoadedCircuit,
+    ex_nid: i32,
+) -> Result<SchemaDescriptor, CompileError> {
+    if plan.out_reg < 0 || plan.out_reg as usize >= plan.vm.program.reg_meta.len() {
+        return Err(CompileError::OutRegOutOfBounds);
+    }
+    let schema = plan.vm.program.reg_meta[plan.out_reg as usize].schema;
+    if let Some(gnitz_wire::OpNode::ExchangeShard { shard_cols }) = loaded.nodes.get(&ex_nid) {
+        if oob_cols(shard_cols, &schema) {
+            return Err(CompileError::ShardColsOutOfBounds);
+        }
+    }
+    Ok(schema)
+}
+
 /// Compile a circuit for a single view.
 ///
 /// # Safety
@@ -302,13 +330,13 @@ pub(crate) unsafe fn compile_view(
             )
             .ok_or(CompileError::PlanBuildFailed)?;
 
-            if pre.out_reg < 0 || pre.out_reg as usize >= pre.vm.program.reg_meta.len() {
-                for d in &pre.scratch_dirs {
-                    let _ = std::fs::remove_dir_all(d);
+            let exchange_schema = match finalize_side(&pre, &loaded, ex_nid) {
+                Ok(s) => s,
+                Err(e) => {
+                    cleanup_scratch_dirs(&pre.scratch_dirs);
+                    return Err(e);
                 }
-                return Err(CompileError::OutRegOutOfBounds);
-            }
-            let exchange_schema = pre.vm.program.reg_meta[pre.out_reg as usize].schema;
+            };
             let side_a_source_id = single_source(&pre.source_reg_map);
 
             let post = match build_plan(
@@ -325,9 +353,7 @@ pub(crate) unsafe fn compile_view(
             ) {
                 Some(p) => p,
                 None => {
-                    for d in &pre.scratch_dirs {
-                        let _ = std::fs::remove_dir_all(d);
-                    }
+                    cleanup_scratch_dirs(&pre.scratch_dirs);
                     return Err(CompileError::PlanBuildFailed);
                 }
             };
@@ -395,12 +421,6 @@ pub(crate) unsafe fn compile_view(
             let post_nids: HashSet<i32> = post_ordered.iter().copied().collect();
             let rw_post = phase_rewrites(&rw, &post_nids);
 
-            let cleanup = |dirs: &[String]| {
-                for d in dirs {
-                    let _ = std::fs::remove_dir_all(d);
-                }
-            };
-
             let side_a = build_plan(
                 &loaded,
                 &rw_a,
@@ -414,11 +434,13 @@ pub(crate) unsafe fn compile_view(
                 Vec::new(),
             )
             .ok_or(CompileError::PlanBuildFailed)?;
-            if side_a.out_reg < 0 || side_a.out_reg as usize >= side_a.vm.program.reg_meta.len() {
-                cleanup(&side_a.scratch_dirs);
-                return Err(CompileError::OutRegOutOfBounds);
-            }
-            let schema_a = side_a.vm.program.reg_meta[side_a.out_reg as usize].schema;
+            let schema_a = match finalize_side(&side_a, &loaded, ea) {
+                Ok(s) => s,
+                Err(e) => {
+                    cleanup_scratch_dirs(&side_a.scratch_dirs);
+                    return Err(e);
+                }
+            };
             let side_a_source_id = single_source(&side_a.source_reg_map);
 
             let side_b = match build_plan(
@@ -435,16 +457,18 @@ pub(crate) unsafe fn compile_view(
             ) {
                 Some(p) => p,
                 None => {
-                    cleanup(&side_a.scratch_dirs);
+                    cleanup_scratch_dirs(&side_a.scratch_dirs);
                     return Err(CompileError::PlanBuildFailed);
                 }
             };
-            if side_b.out_reg < 0 || side_b.out_reg as usize >= side_b.vm.program.reg_meta.len() {
-                cleanup(&side_a.scratch_dirs);
-                cleanup(&side_b.scratch_dirs);
-                return Err(CompileError::OutRegOutOfBounds);
-            }
-            let schema_b = side_b.vm.program.reg_meta[side_b.out_reg as usize].schema;
+            let schema_b = match finalize_side(&side_b, &loaded, eb) {
+                Ok(s) => s,
+                Err(e) => {
+                    cleanup_scratch_dirs(&side_a.scratch_dirs);
+                    cleanup_scratch_dirs(&side_b.scratch_dirs);
+                    return Err(e);
+                }
+            };
             let side_b_source_id = single_source(&side_b.source_reg_map);
 
             let post = match build_plan(
@@ -461,8 +485,8 @@ pub(crate) unsafe fn compile_view(
             ) {
                 Some(p) => p,
                 None => {
-                    cleanup(&side_a.scratch_dirs);
-                    cleanup(&side_b.scratch_dirs);
+                    cleanup_scratch_dirs(&side_a.scratch_dirs);
+                    cleanup_scratch_dirs(&side_b.scratch_dirs);
                     return Err(CompileError::PlanBuildFailed);
                 }
             };
@@ -742,7 +766,7 @@ mod tests {
             ],
             &[0],
         );
-        let joined = merge_schemas_for_join(&left, &right, JoinNullFill::None);
+        let joined = merge_schemas_for_join(&left, &right, JoinNullFill::None).unwrap();
         assert_eq!(joined.num_columns(), 3); // PK + left_I64 + right_STRING
         assert_eq!(joined.columns[0].type_code, type_code::U128);
         assert_eq!(joined.columns[1].type_code, type_code::I64);
@@ -765,7 +789,7 @@ mod tests {
             ],
             &[0],
         );
-        let joined = merge_schemas_for_join(&left, &right, JoinNullFill::RightNullable);
+        let joined = merge_schemas_for_join(&left, &right, JoinNullFill::RightNullable).unwrap();
         assert_eq!(joined.num_columns(), 3);
         assert_eq!(joined.columns[2].nullable, 1); // right side nullable
     }
@@ -789,7 +813,7 @@ mod tests {
             ],
             &[0],
         );
-        let joined = merge_schemas_for_join(&left, &right, JoinNullFill::None);
+        let joined = merge_schemas_for_join(&left, &right, JoinNullFill::None).unwrap();
         // Two PK columns up front, then left payload (2), then right payload (1) = 5.
         assert_eq!(joined.num_columns(), 5);
         assert_eq!(joined.pk_indices(), &[0, 1]);
@@ -804,7 +828,7 @@ mod tests {
             ],
             &[0],
         );
-        let joined_single = merge_schemas_for_join(&left_single, &right, JoinNullFill::None);
+        let joined_single = merge_schemas_for_join(&left_single, &right, JoinNullFill::None).unwrap();
         assert_eq!(joined_single.pk_indices(), &[0]);
     }
 
@@ -874,7 +898,7 @@ mod tests {
         // below so LogicalProgram::new's register-bounds assert passes; this test
         // exercises sequential_copy_base, not register limits.
         let make = |instrs: Vec<LogicalInstr>| LogicalProgram::new(instrs, 16, 0, vec![]);
-        let copy = |src_col: u32, out: u32| LogicalInstr::CopyCol { src_col, out, tc: 9 };
+        let copy = |src_col: u32, out: u32| LogicalInstr::CopyCol { src_col, out };
         // src 1,2 → dst 0,1: base = 1.
         assert_eq!(make(vec![copy(1, 0), copy(2, 1)]).sequential_copy_base(), Some(1));
         // sources not sequential (2, then 1)
@@ -1951,8 +1975,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "join output schema exceeds")]
     fn test_merge_schemas_for_join_column_overflow() {
+        // A merged column count over MAX_COLUMNS returns None (compile rejected),
+        // rather than aborting on the old assert.
         use crate::schema::MAX_COLUMNS;
         let half = MAX_COLUMNS / 2 + 2;
         let make = |n: usize| {
@@ -1963,7 +1988,10 @@ mod tests {
             }
             SchemaDescriptor::new(&cols[..n], &[0])
         };
-        merge_schemas_for_join(&make(half), &make(half), JoinNullFill::None);
+        assert!(
+            merge_schemas_for_join(&make(half), &make(half), JoinNullFill::None).is_none(),
+            "an over-wide join output must be rejected (None), not aborted"
+        );
     }
 
     // ── helpers shared by join tests ─────────────────────────────────────
@@ -1976,6 +2004,143 @@ mod tests {
             ],
             &[0],
         )
+    }
+
+    // ── Part B: crafted raw-field guards reject at compile, never abort at run ──
+    //
+    // Each guard is proven by construction: the ONLY difference between the two
+    // builds is the crafted field, so a valid build's `Some` and the crafted
+    // build's `None` are both attributable solely to that field.
+
+    /// Build `ScanDelta(10) → mid → IntegrateSink` and report whether it compiles.
+    fn compiles_mid_node(in_schema: SchemaDescriptor, mid: gnitz_wire::OpNode, tag: &str) -> bool {
+        let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
+        std::fs::create_dir_all(&base).unwrap();
+        let view_dir = format!("{base}/pb_{tag}_{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&view_dir);
+        std::fs::create_dir_all(&view_dir).unwrap();
+        let mut nodes = HashMap::new();
+        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(10));
+        nodes.insert(1, mid);
+        nodes.insert(2, gnitz_wire::OpNode::IntegrateSink);
+        let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN)];
+        let loaded = make_loaded(nodes, edges);
+        let ext = [ExternalTable {
+            table_id: 10,
+            schema: in_schema,
+        }];
+        let ordered = loaded.ordered.clone();
+        let some = build_plan(
+            &loaded,
+            &empty_rw(),
+            &ordered,
+            &ext,
+            &view_dir,
+            0,
+            1,
+            Some(2),
+            &[],
+            vec![],
+        )
+        .is_some();
+        let _ = std::fs::remove_dir_all(&view_dir);
+        some
+    }
+
+    #[test]
+    fn test_reduce_group_cols_out_of_bounds_rejected() {
+        use gnitz_wire::{AggFunc, AggKind, OpNode, ReduceOutKey};
+        let reduce = |group: Vec<u16>| OpNode::Reduce {
+            group_cols: group,
+            agg: AggKind::Specs(vec![(AggFunc::Count, 0)]),
+            global_ground: false,
+            out_key: ReduceOutKey::PkPermutation,
+        };
+        assert!(compiles_mid_node(two_col_schema(), reduce(vec![0]), "grp_ok"));
+        assert!(!compiles_mid_node(two_col_schema(), reduce(vec![200]), "grp_oob"));
+    }
+
+    #[test]
+    fn test_reduce_agg_spec_col_out_of_bounds_rejected() {
+        use gnitz_wire::{AggFunc, AggKind, OpNode, ReduceOutKey};
+        let reduce = |col: u16| OpNode::Reduce {
+            group_cols: vec![0],
+            agg: AggKind::Specs(vec![(AggFunc::Count, col)]),
+            global_ground: false,
+            out_key: ReduceOutKey::PkPermutation,
+        };
+        assert!(compiles_mid_node(two_col_schema(), reduce(1), "aggcol_ok"));
+        assert!(!compiles_mid_node(two_col_schema(), reduce(200), "aggcol_oob"));
+    }
+
+    #[test]
+    fn test_reduce_sum_over_non_decodable_column_rejected() {
+        use gnitz_wire::{AggFunc, AggKind, OpNode, ReduceOutKey};
+        // col 0 = U64 PK + group key; col 1 = the SUM aggregate column.
+        let schema = |agg_tc: u8| {
+            SchemaDescriptor::new(
+                &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(agg_tc, 0)],
+                &[0],
+            )
+        };
+        let reduce = OpNode::Reduce {
+            group_cols: vec![0],
+            agg: AggKind::Specs(vec![(AggFunc::Sum, 1)]),
+            global_ground: false,
+            out_key: ReduceOutKey::PkPermutation,
+        };
+        // Control: SUM over an order-encodable I64 column compiles.
+        assert!(compiles_mid_node(schema(type_code::I64), reduce.clone(), "sum_i64"));
+        // SUM over a 16-byte column would abort at the first push in `decode_signed`.
+        assert!(!compiles_mid_node(schema(type_code::U128), reduce.clone(), "sum_u128"));
+        // SUM over a STRING column would silently mis-sum.
+        assert!(!compiles_mid_node(schema(type_code::STRING), reduce, "sum_str"));
+    }
+
+    #[test]
+    fn test_projection_col_out_of_bounds_rejected() {
+        use gnitz_wire::{MapKind, OpNode};
+        let proj = |cols: Vec<u16>| OpNode::Map(MapKind::Projection(cols));
+        assert!(compiles_mid_node(two_col_schema(), proj(vec![1]), "proj_ok"));
+        assert!(!compiles_mid_node(two_col_schema(), proj(vec![200]), "proj_oob"));
+    }
+
+    #[test]
+    fn test_null_extend_overflow_rejected() {
+        use gnitz_wire::OpNode;
+        // A short type_codes list null-extends cleanly.
+        assert!(compiles_mid_node(
+            two_col_schema(),
+            OpNode::NullExtend {
+                type_codes: vec![type_code::I64],
+            },
+            "nx_ok",
+        ));
+        // MAX_COLUMNS type_codes overflow the fixed `[_; 65]` schema array (guard 4).
+        assert!(!compiles_mid_node(
+            two_col_schema(),
+            OpNode::NullExtend {
+                type_codes: vec![type_code::I64; crate::schema::MAX_COLUMNS],
+            },
+            "nx_len",
+        ));
+        // A near-max-width input plus a short extension overflows the *merged*
+        // output width (guard 5, which guard 4 alone cannot catch): 64 + 2 > 65.
+        let wide = {
+            let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+            cols[0] = SchemaColumn::new(type_code::U64, 0);
+            for c in cols.iter_mut().take(64).skip(1) {
+                *c = SchemaColumn::new(type_code::I64, 0);
+            }
+            SchemaDescriptor::new(&cols[..64], &[0])
+        };
+        assert!(!compiles_mid_node(
+            wide,
+            OpNode::NullExtend {
+                type_codes: vec![type_code::I64, type_code::I64],
+            },
+            "nx_merge",
+        ));
     }
 
     fn make_loaded(nodes: HashMap<i32, gnitz_wire::OpNode>, edges: Vec<(i32, i32, i32)>) -> LoadedCircuit {
