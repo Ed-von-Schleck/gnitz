@@ -218,11 +218,8 @@ impl<T> AsyncMutex<T> {
         }
     }
 
-    pub fn lock<'a>(self: &'a Rc<Self>) -> LockFuture<'a, T> {
-        LockFuture {
-            mutex: Rc::clone(self),
-            _p: std::marker::PhantomData,
-        }
+    pub fn lock(self: &Rc<Self>) -> LockFuture<T> {
+        LockFuture { mutex: Rc::clone(self) }
     }
 
     fn release(&self) {
@@ -239,12 +236,11 @@ impl<T> AsyncMutex<T> {
     }
 }
 
-pub struct LockFuture<'a, T> {
+pub struct LockFuture<T> {
     mutex: Rc<AsyncMutex<T>>,
-    _p: std::marker::PhantomData<&'a ()>,
 }
 
-impl<'a, T: 'a> Future for LockFuture<'a, T> {
+impl<T> Future for LockFuture<T> {
     type Output = LockGuard<T>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<LockGuard<T>> {
         if !self.mutex.locked.get() {
@@ -309,18 +305,14 @@ impl AsyncRwLock {
         }
     }
 
-    pub fn read<'a>(self: &'a Rc<Self>) -> ReadFuture<'a> {
-        ReadFuture {
-            lock: Rc::clone(self),
-            _p: std::marker::PhantomData,
-        }
+    pub fn read(self: &Rc<Self>) -> ReadFuture {
+        ReadFuture { lock: Rc::clone(self) }
     }
 
-    pub fn write<'a>(self: &'a Rc<Self>) -> WriteFuture<'a> {
+    pub fn write(self: &Rc<Self>) -> WriteFuture {
         WriteFuture {
             lock: Rc::clone(self),
             parked: false,
-            _p: std::marker::PhantomData,
         }
     }
 
@@ -368,12 +360,11 @@ impl Default for AsyncRwLock {
     }
 }
 
-pub struct ReadFuture<'a> {
+pub struct ReadFuture {
     lock: Rc<AsyncRwLock>,
-    _p: std::marker::PhantomData<&'a ()>,
 }
 
-impl<'a> Future for ReadFuture<'a> {
+impl Future for ReadFuture {
     type Output = ReadGuard;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<ReadGuard> {
         let mut s = self.lock.inner.borrow_mut();
@@ -398,13 +389,12 @@ impl Drop for ReadGuard {
     }
 }
 
-pub struct WriteFuture<'a> {
+pub struct WriteFuture {
     lock: Rc<AsyncRwLock>,
     parked: bool,
-    _p: std::marker::PhantomData<&'a ()>,
 }
 
-impl<'a> Future for WriteFuture<'a> {
+impl Future for WriteFuture {
     type Output = WriteGuard;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<WriteGuard> {
         let was_parked = self.parked;
@@ -433,7 +423,7 @@ impl<'a> Future for WriteFuture<'a> {
     }
 }
 
-impl<'a> Drop for WriteFuture<'a> {
+impl Drop for WriteFuture {
     fn drop(&mut self) {
         if self.parked {
             let mut s = self.lock.inner.borrow_mut();
@@ -604,8 +594,10 @@ where
     A: Future,
     B: Future,
 {
-    let mut a = Box::pin(a);
-    let mut b = Box::pin(b);
+    // Stack-pinned (`pin!`), not `Box::pin`: select2 runs per client egress
+    // frame, so two heap allocations per call are worth avoiding.
+    let mut a = std::pin::pin!(a);
+    let mut b = std::pin::pin!(b);
     std::future::poll_fn(move |cx| {
         if let Poll::Ready(v) = a.as_mut().poll(cx) {
             return Poll::Ready(Either::A(v));

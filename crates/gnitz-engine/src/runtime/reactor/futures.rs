@@ -13,9 +13,6 @@ pub(super) struct TimerFuture {
     /// submitted. None means the future was never polled (no SQE in
     /// flight).
     timer_id: Option<u64>,
-    /// Shared with the timer_wakers entry; flipped to true on Drop so
-    /// dispatch_cqe silently discards the CQE without waking the task.
-    cancelled: Rc<Cell<bool>>,
     inner: Rc<ReactorShared>,
 }
 
@@ -24,7 +21,6 @@ impl TimerFuture {
         TimerFuture {
             deadline,
             timer_id: None,
-            cancelled: Rc::new(Cell::new(false)),
             inner,
         }
     }
@@ -40,7 +36,7 @@ impl Future for TimerFuture {
         if let Some(id) = self.timer_id {
             // Re-poll: update the waker in case it changed.
             if let Some(entry) = self.inner.timer_wakers.borrow_mut().get_mut(&id) {
-                entry.0 = cx.waker().clone();
+                *entry = cx.waker().clone();
             }
         } else {
             // First poll: submit the io_uring Timeout SQE and register the
@@ -50,10 +46,7 @@ impl Future for TimerFuture {
             self.inner.next_timer_id.set(id.wrapping_add(1));
             let ns = self.deadline.duration_since(now).as_nanos() as u64;
             self.inner.ring.borrow_mut().prep_timeout(ns, udata(KIND_TIMEOUT, id));
-            self.inner
-                .timer_wakers
-                .borrow_mut()
-                .insert(id, (cx.waker().clone(), Rc::clone(&self.cancelled)));
+            self.inner.timer_wakers.borrow_mut().insert(id, cx.waker().clone());
             self.timer_id = Some(id);
         }
         Poll::Pending
@@ -63,9 +56,9 @@ impl Future for TimerFuture {
 impl Drop for TimerFuture {
     fn drop(&mut self) {
         if let Some(id) = self.timer_id {
-            // Signal dispatch_cqe to discard the CQE without waking — covers
-            // a fire whose CQE already raced past the cancel below.
-            self.cancelled.set(true);
+            // Remove the waker entry so the racing CQE (fire or -ECANCELED)
+            // finds nothing to wake and is silently discarded.
+            self.inner.timer_wakers.borrow_mut().remove(&id);
             // Reclaim the kernel timer promptly instead of letting it run to
             // its deadline: deadline guards (e.g. the per-frame send-slot
             // eviction timer) drop their timer on every happy-path completion,
@@ -73,8 +66,8 @@ impl Drop for TimerFuture {
             // its waker entry, and its Timespec box behind for the full
             // window. The cancel's own CQE lands on the no-op
             // KIND_TIMEOUT_CANCEL sink; the Timeout's CQE (-ECANCELED) lands
-            // on KIND_TIMEOUT, whose handler sees `cancelled` and discards
-            // the wake. Same pattern as `UdpRecvFuture::drop`.
+            // on KIND_TIMEOUT, whose handler finds no waker entry and only
+            // releases the Timespec.
             self.inner
                 .ring
                 .borrow_mut()
@@ -292,7 +285,7 @@ impl Future for RecvFuture {
             // done with it, so the buffer stays accounted for its full residency.
             return Poll::Ready(Some(buf));
         }
-        if self.inner.recv_closed.borrow().get(&self.fd).copied().unwrap_or(false) {
+        if self.inner.recv_closed.borrow().contains(&self.fd) {
             return Poll::Ready(None);
         }
         self.inner.recv_waiters.borrow_mut().insert(self.fd, cx.waker().clone());
@@ -313,23 +306,20 @@ impl Drop for RecvFuture {
 pub(super) enum SendAlive {
     Pooled(Rc<crate::storage::batch_pool::PooledSendBuf>),
     Slot(Rc<W2mSlot>),
-    /// One-shot UDP SENDMSG op: keeps the msghdr/iovec/sockaddr/payload the
-    /// kernel reads alive until the CQE. `Rc`, not `Box`, because the op is
-    /// self-referential (msghdr points at sibling fields) and moving an `Rc`
-    /// handle never retags or relocates the pointee.
-    UdpOp(Rc<udp::UdpSendOp>),
     /// The backing memory lives `'static` (e.g. the precomputed HELLO
     /// ACK), so no liveness tracking is required — the kernel pointer
     /// remains valid for the lifetime of the process.
     Static,
 }
 
+// Manual impl (not derived): the variant fields exist purely to keep the
+// kernel-visible buffers alive, and the explicit match is their one read —
+// a derived Clone is ignored by dead-code analysis and would flag them.
 impl Clone for SendAlive {
     fn clone(&self) -> Self {
         match self {
             SendAlive::Pooled(rc) => SendAlive::Pooled(Rc::clone(rc)),
             SendAlive::Slot(rc) => SendAlive::Slot(Rc::clone(rc)),
-            SendAlive::UdpOp(rc) => SendAlive::UdpOp(Rc::clone(rc)),
             SendAlive::Static => SendAlive::Static,
         }
     }

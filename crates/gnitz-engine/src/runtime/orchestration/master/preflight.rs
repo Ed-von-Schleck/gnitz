@@ -1,9 +1,285 @@
-//! Distributed PK / unique-index preflight validation and violation
-//! formatting: the `validate_*` pipelines, the gather/merge key streams
-//! (`PreflightKeyStream` / `PreflightAccumulator` / `merge_index_scan`), and
-//! the error renderers.
+//! Distributed PK / FK / unique-index preflight validation and violation
+//! formatting: the check types (`PipelinedCheck` / `CheckPayload` /
+//! `P1Label` / `P2Label`), the pipelined executors
+//! (`execute_pipeline_async` / `execute_gather_async` + `GatherMap` and the
+//! check-batch builders/pool), the `validate_*` pipelines, the gather/merge
+//! key streams (`PreflightKeyStream` / `PreflightAccumulator` /
+//! `merge_index_scan`), and the error renderers.
 
 use super::*;
+
+use super::unique_filter::{UniqueFilter, UNIQUE_FILTER_CAP};
+
+// ---------------------------------------------------------------------------
+// Pipelined validation checks
+// ---------------------------------------------------------------------------
+
+/// How the check payload is routed to workers.
+#[allow(clippy::large_enum_variant)]
+pub(super) enum CheckPayload {
+    /// Replicate the same batch to every worker; each worker filters
+    /// its local partition.
+    Broadcast(Batch),
+    /// Pre-partitioned by the schema PK: source batch delivered via
+    /// `scatter_wire_group` without materializing intermediate per-worker
+    /// `Batch`es. `execute_pipeline_async` computes the per-worker routing
+    /// itself from `check.schema.pk_indices()` via `with_worker_indices`.
+    ScatterSource { source: Batch },
+}
+
+/// A single distributed has-pk check queued for pipelined execution
+/// (always dispatched under FLAG_HAS_PK). `col_hint` is
+/// `pack_pk_cols(&[col])` for an index check (the packed flag at bit 63 is
+/// always set, so it never collides with the PK sentinel) or 0 for a PK check.
+pub(super) struct PipelinedCheck {
+    pub(super) target_id: i64,
+    pub(super) col_hint: u64,
+    pub(super) payload: Option<CheckPayload>,
+    pub(super) schema: SchemaDescriptor,
+}
+
+/// Side table for interpreting Phase 1 results in `validate_all_distributed`.
+/// Each label lines up positionally with a `PipelinedCheck` submitted to
+/// the Phase 1 pipeline.
+pub(super) enum P1Label {
+    /// FK parent existence. `expected_count` is the number of distinct
+    /// non-null parent keys; anything less in the result set is a violation.
+    FkParent {
+        parent_table_id: i64,
+        expected_count: usize,
+    },
+    /// FK child restrict: a non-empty result set is a violation.
+    FkRestrict { child_tid: i64 },
+    /// UPSERT PK identification; the result set is captured as the
+    /// `existing_pks` feeding Phase 2 planning.
+    UpsertPkId,
+}
+
+/// Side table for interpreting Phase 2 results (unique-index checks).
+pub(super) enum P2Label {
+    /// Non-UPSERT values for one unique index: any hit is a violation.
+    /// `col_indices` is the index's full column list, for the composite-aware
+    /// error message.
+    NonUpsert { col_indices: PkColList },
+    /// UPSERT values for one unique index: hits must be verified via a per-holder
+    /// seek to confirm the holder is the same row. `col_indices` drives the seek
+    /// routing and the error; the index schema (PK stride and per-column
+    /// promoted types/widths for the span decode) is read from the positionally
+    /// paired `PipelinedCheck`, which the verify loop still holds.
+    Upsert {
+        col_indices: PkColList,
+        /// (index-value span, is_upsert) per pending verify. `is_upsert` is true
+        /// only for a genuine upsert target (net-positive committed PK); it gates
+        /// the implicit exemption so a fresh-PK row routed here by
+        /// `retracted_vals` cannot ride a holder's implicit retraction.
+        upsert_keys: Vec<(PkBuf, bool)>,
+        /// (source PK, value span) pairs retracted in this batch. At the verify a
+        /// different holder is exempt only when it is retracting the value here;
+        /// combined with the holder being an upserted PK (`existing_pks`), this
+        /// also admits a bulk shift.
+        retracted_pairs: FxHashSet<(PkBuf, PkBuf)>,
+    },
+    /// UPDATE retired a referenced UNIQUE value that is still present in a
+    /// child index: a non-empty result set is a RESTRICT violation.
+    FkRestrict { child_tid: i64 },
+}
+
+/// `pk → projected committed values` result of `execute_gather_async`. Rows
+/// live in one flat arena, `stride` values each, instead of one heap `Vec`
+/// per row — a large UPDATE/DELETE validation gathers tens of thousands of
+/// rows, and per-row allocations would dominate the merge.
+#[derive(Default)]
+pub(super) struct GatherMap {
+    stride: usize,
+    index: FxHashMap<PkBuf, u32>,
+    vals: Vec<Option<u128>>,
+}
+
+impl GatherMap {
+    fn new(stride: usize) -> Self {
+        GatherMap {
+            stride,
+            ..Default::default()
+        }
+    }
+
+    fn push_row(&mut self, pk: PkBuf, row: impl Iterator<Item = Option<u128>>) {
+        let idx = (self.vals.len() / self.stride) as u32;
+        self.vals.extend(row);
+        debug_assert!(
+            self.vals.len() == (idx as usize + 1) * self.stride,
+            "gather row arity must equal the projection stride"
+        );
+        self.index.insert(pk, idx);
+    }
+
+    /// The projected values for `pk`'s committed row, aligned to the gather's
+    /// `project` list; `None` when the committed row is absent. Zero-copy
+    /// lookup via `Borrow<[u8]>`.
+    fn get(&self, pk: &[u8]) -> Option<&[Option<u128>]> {
+        self.index.get(pk).map(|&i| {
+            let start = i as usize * self.stride;
+            &self.vals[start..start + self.stride]
+        })
+    }
+}
+
+fn format_uuid_hyphenated(v: u128) -> String {
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (v >> 96) as u32,
+        (v >> 80) as u16,
+        (v >> 64) as u16,
+        (v >> 48) as u16,
+        v & 0x0000_ffff_ffff_ffff
+    )
+}
+
+/// Render a PK from its raw OPK byte form for error messages.
+/// Compound PKs are formatted as comma-separated per-column values in
+/// declaration order; `pk_bytes` holds all PK columns concatenated as OPK
+/// (big-endian, sign-flipped for signed), so we slice and decode each column
+/// back to native before rendering. Works for wide PKs (`pk_stride > 16`)
+/// where a `u128` cannot encode the key.
+pub(super) fn format_pk_value_bytes(pk_bytes: &[u8], schema: &SchemaDescriptor) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut off = 0usize;
+    for &ci in schema.pk_indices() {
+        let col = schema.columns[ci as usize];
+        let size = col.size() as usize;
+        // pk_bytes are OPK; decode each column back to native LE before reading
+        // its scalar value. Reading OPK as native LE would render garbage for
+        // signed columns (flipped sign bit) and any multi-byte unsigned column.
+        let mut le = [0u8; 16];
+        gnitz_wire::decode_pk_column(&pk_bytes[off..off + size], col.type_code, &mut le[..size]);
+        let v = u128::from_le_bytes(le);
+        let s = match col.type_code {
+            crate::schema::type_code::U128 => format!("{v}"),
+            crate::schema::type_code::UUID => format_uuid_hyphenated(v),
+            crate::schema::type_code::I64 => format!("{}", v as u64 as i64),
+            crate::schema::type_code::I32 => format!("{}", v as u64 as i32),
+            crate::schema::type_code::I16 => format!("{}", v as u64 as i16),
+            crate::schema::type_code::I8 => format!("{}", v as u64 as i8),
+            _ => format!("{}", v as u64),
+        };
+        parts.push(s);
+        off += size;
+    }
+    parts.join(", ")
+}
+
+/// Shared scaffold for the check-batch builders: pool-reuse with a schema
+/// staleness guard, then one zero-payload row per key.
+///
+/// Schema staleness guard: a pooled batch built before a DDL change has
+/// the wrong column layout; populating it would silently corrupt rows or
+/// panic on column writes. When `pooled.schema != Some(schema)`, the
+/// pooled allocation is dropped and a fresh batch is allocated instead.
+///
+/// `push_pk` writes the per-row PK region (the only step that differs
+/// between the `u128` and `PkBuf` key forms).
+fn build_check_batch_with<K>(
+    schema: &SchemaDescriptor,
+    keys: &[K],
+    pooled: Option<Batch>,
+    mut push_pk: impl FnMut(&mut Batch, &K),
+) -> Batch {
+    let npc = schema.num_payload_cols();
+    let mut batch = match pooled {
+        Some(b) if b.schema.as_ref() == Some(schema) => {
+            let mut b = b;
+            b.clear();
+            b.reserve_rows(keys.len());
+            b
+        }
+        _ => Batch::with_schema(*schema, keys.len()),
+    };
+    let null_word: u64 = crate::ops::all_payload_null_mask(npc);
+    for key in keys {
+        batch.ensure_row_capacity();
+        push_pk(&mut batch, key);
+        batch.extend_weight(&1i64.to_le_bytes());
+        batch.extend_null_bmp(&null_word.to_le_bytes());
+        for (c, _ci, col) in schema.payload_columns() {
+            batch.fill_col_zero(c, col.size() as usize);
+        }
+        batch.count += 1;
+    }
+    batch
+}
+
+/// Build a constraint-check batch from narrow `u128` PK keys. `src_type` is the
+/// type of the column the keys came from (the child FK column, or the parent
+/// PK/indexed column): a signed source sign-extends from its native width before
+/// OPK-encoding at the leading promoted key column, byte-identical to the
+/// write-side `IndexKeySpec::write_span`. For a base-table schema (the FK parent
+/// fast-path) the key column does not promote, so `src_type == idx_key_type` and
+/// the encode is the identity path.
+pub(super) fn build_check_batch(
+    schema: &SchemaDescriptor,
+    keys: &[u128],
+    src_type: u8,
+    pooled: Option<Batch>,
+) -> Batch {
+    // The index PK composite is `(indexed-value, src_pk_cols)` and is OPK-at-
+    // rest. `keys` carry the indexed value (native u128); OPK-encode it into the
+    // leading promoted key column and leave the source-PK suffix zero — only the
+    // leading column is prefix-matched for the existence check. Narrow and wide
+    // composites share this layout (the suffix width differs, the leading does
+    // not), so there is no narrow/wide split.
+    let stride = schema.pk_stride() as usize;
+    // The leading key column is the index's column 0 for an index schema, but
+    // the PK column for a base-table schema (the FK parent fast-path passes the
+    // parent base table, whose lone PK may be declared at any column position).
+    // `pk_indices()[0]` resolves both: an index schema is laid out
+    // `(promoted_c0, src_pk…)`, so `pk_indices()[0] == 0 == columns[0]`.
+    let key_col = schema.pk_indices()[0] as usize;
+    let idx_key_type = schema.columns[key_col].type_code;
+    build_check_batch_with(schema, keys, pooled, |b, &k| {
+        let buf = crate::schema::index_opk_prefix(k, src_type, idx_key_type);
+        b.extend_pk_bytes(&buf[..stride]);
+    })
+}
+
+/// Build the UPSERT PK-identification check batch from `keys`, the distinct
+/// net-positive PK byte spans collected by the preflight aggregation. Writes
+/// each `PkBuf`'s OPK bytes verbatim into the PK region: the spans are already
+/// main-table PKs, so unlike the index builder `build_check_batch` no column-0
+/// re-encoding is applied. The sole PK (rather than index) check-batch builder.
+pub(super) fn build_check_batch_pkbuf(schema: &SchemaDescriptor, keys: &[PkBuf], pooled: Option<Batch>) -> Batch {
+    build_check_batch_with(schema, keys, pooled, |b, k| b.extend_pk_bytes(k.pk_bytes()))
+}
+
+/// Return `batch` to `disp.check_batch_pool[target_id]` and cap the pool depth.
+pub(super) fn recycle_check_batch(disp: &mut MasterDispatcher, target_id: i64, batch: Batch) {
+    const POOL_MAX_DEPTH: usize = 4;
+    const MAX_RETAIN_BYTES: usize = 512 * 1024;
+    // A single large validation batch (bulk load, large FK check) would pin its
+    // allocation in the pool indefinitely — Batch::clear() doesn't shrink.
+    if batch.total_bytes() > MAX_RETAIN_BYTES {
+        return; // let the allocator reclaim the oversized buffer
+    }
+    let pool = disp.check_batch_pool.entry(target_id).or_default();
+    pool.push(batch);
+    if pool.len() > POOL_MAX_DEPTH {
+        pool.remove(0);
+    }
+}
+
+/// Take each `Batch` out of `checks` via `Option::take` (no pool round-trip for
+/// a sentinel), push it into `disp.check_batch_pool[target_id]`, and cap the
+/// pool depth. Called after `execute_pipeline_async` to recycle allocations.
+pub(super) fn reclaim_check_batches(disp: &mut MasterDispatcher, checks: &mut [PipelinedCheck]) {
+    for check in checks.iter_mut() {
+        if let Some(payload) = check.payload.take() {
+            let batch = match payload {
+                CheckPayload::Broadcast(b) => b,
+                CheckPayload::ScatterSource { source } => source,
+            };
+            recycle_check_batch(disp, check.target_id, batch);
+        }
+    }
+}
 
 /// The `(view, slot)` drop-order contract in one place: `mb` is a zero-copy
 /// view into `slot`'s W2M ring bytes with its lifetime erased, so it is valid
@@ -58,7 +334,6 @@ impl PreflightKeyStream {
         // (version 0): the first frame's embedded schema block equals it by
         // construction (`send_unique_preflight_keys`), and continuation
         // frames carry no schema and resolve through the hint.
-        let ctrl_size = ctrl.block_size;
         let schema_hint = Some(SchemaWithVersion {
             descriptor: frame_schema,
             version: 0,
@@ -70,7 +345,7 @@ impl PreflightKeyStream {
         // lifetime erasure exists only because slot and view live in the same
         // struct.
         let bytes: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(slot.bytes()) };
-        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl_size, ctrl, schema_hint)
+        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, schema_hint)
             .map_err(|e| scan_decode_err(self.w, e))?;
         self.frame.mb = zc.data_batch;
         self.frame.slot = Some(slot);
@@ -399,7 +674,6 @@ impl MasterDispatcher {
                 });
                 p1_checks.push(PipelinedCheck {
                     target_id: parent_table_id,
-                    flags: FLAG_HAS_PK,
                     col_hint: 0,
                     payload: Some(CheckPayload::ScatterSource { source: check_batch }),
                     schema: parent_schema,
@@ -422,7 +696,6 @@ impl MasterDispatcher {
                 });
                 p1_checks.push(PipelinedCheck {
                     target_id: parent_table_id,
-                    flags: FLAG_HAS_PK,
                     col_hint: gnitz_wire::pack_pk_cols(&[parent_col_idx as u32]),
                     payload: Some(CheckPayload::Broadcast(check_batch)),
                     schema: idx_schema,
@@ -519,7 +792,6 @@ impl MasterDispatcher {
                     p1_labels.push(P1Label::FkRestrict { child_tid });
                     p1_checks.push(PipelinedCheck {
                         target_id: child_tid,
-                        flags: FLAG_HAS_PK,
                         col_hint: gnitz_wire::pack_pk_cols(&[fk_col_idx as u32]),
                         payload: Some(CheckPayload::Broadcast(check_batch)),
                         schema: idx_schema,
@@ -541,7 +813,6 @@ impl MasterDispatcher {
             p1_labels.push(P1Label::UpsertPkId);
             p1_checks.push(PipelinedCheck {
                 target_id,
-                flags: FLAG_HAS_PK,
                 col_hint: 0,
                 payload: Some(CheckPayload::ScatterSource { source: check_batch }),
                 schema: source_schema,
@@ -840,7 +1111,6 @@ impl MasterDispatcher {
                     p2_labels.push(P2Label::NonUpsert { col_indices });
                     p2_checks.push(PipelinedCheck {
                         target_id,
-                        flags: FLAG_HAS_PK,
                         col_hint: packed,
                         payload: Some(CheckPayload::Broadcast(chk_batch)),
                         schema: idx_schema,
@@ -860,7 +1130,6 @@ impl MasterDispatcher {
                 });
                 p2_checks.push(PipelinedCheck {
                     target_id,
-                    flags: FLAG_HAS_PK,
                     col_hint: packed,
                     payload: Some(CheckPayload::Broadcast(u_batch)),
                     schema: idx_schema,
@@ -875,7 +1144,6 @@ impl MasterDispatcher {
             p2_labels.push(P2Label::FkRestrict { child_tid });
             p2_checks.push(PipelinedCheck {
                 target_id: child_tid,
-                flags: FLAG_HAS_PK,
                 col_hint: gnitz_wire::pack_pk_cols(&[fk_col]),
                 payload: Some(CheckPayload::Broadcast(chk_batch)),
                 schema: idx_schema,
@@ -1071,10 +1339,8 @@ impl MasterDispatcher {
         let (slots, req_ids, _lease) =
             dispatch_scan_fanout(disp_ptr, reactor, sal_excl, unicast, |disp, req_ids, unicast| {
                 let (schema, col_names) = disp.get_schema_and_names(owner_id);
-                let lsn = disp.next_lsn();
                 disp.write_group_with_req_ids(
                     owner_id,
-                    lsn,
                     FLAG_UNIQUE_PREFLIGHT,
                     0,
                     &[],
@@ -1131,5 +1397,234 @@ impl MasterDispatcher {
         format!(
             "duplicate key value violates unique constraint \"{sn}_{tn}_pkey\": Batch contains multiple rows with key ({pk_names})=({key_str})",
         )
+    }
+}
+
+impl MasterDispatcher {
+    /// Async version of `execute_pipeline`. Writes each check with
+    /// per-worker req_ids, signals once, and joins all replies.
+    ///
+    /// `sal_excl` is held only for the synchronous write + signal phase;
+    /// see `dispatch_scan_fanout` for the rationale.
+    pub(super) async fn execute_pipeline_async(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
+        checks: &mut [PipelinedCheck],
+    ) -> Result<Vec<FxHashSet<PkBuf>>, String> {
+        let num_checks = checks.len();
+        if num_checks == 0 {
+            return Ok(Vec::new());
+        }
+
+        let (nw, all_req_ids): (usize, Vec<u64>) = {
+            let _guard = sal_excl.lock().await;
+            unsafe {
+                let disp = &mut *disp_ptr;
+                let nw = disp.num_workers;
+                let mut rids: Vec<u64> = Vec::with_capacity(num_checks * nw);
+                for _ in 0..(num_checks * nw) {
+                    rids.push(reactor.alloc_request_id());
+                }
+                for (idx, check) in checks.iter().enumerate() {
+                    let req_slice = &rids[idx * nw..(idx + 1) * nw];
+                    match check.payload.as_ref().expect("payload consumed") {
+                        CheckPayload::Broadcast(batch) => {
+                            let refs: Vec<Option<&Batch>> = (0..nw).map(|_| Some(batch)).collect();
+                            disp.write_group_with_req_ids(
+                                check.target_id,
+                                FLAG_HAS_PK,
+                                0,
+                                &refs,
+                                &check.schema,
+                                &[],
+                                0,
+                                check.col_hint,
+                                req_slice,
+                                -1,
+                                0,
+                                None,
+                                &[],
+                            )?;
+                        }
+                        CheckPayload::ScatterSource { source } => {
+                            // Routing is always by the schema PK; compute the
+                            // per-worker indices on the fly. No reentrancy: this
+                            // loop body has no `.await`, so the SCATTER_INDICES
+                            // borrow is released before the next iteration.
+                            let pk_cols = check.schema.pk_indices();
+                            with_worker_indices(source, pk_cols, &check.schema, nw, |worker_indices| {
+                                disp.sal.scatter_wire_group(
+                                    source,
+                                    worker_indices,
+                                    &check.schema,
+                                    None,
+                                    check.target_id as u32,
+                                    0,
+                                    FLAG_HAS_PK,
+                                    0,
+                                    0,
+                                    check.col_hint,
+                                    req_slice,
+                                    -1,
+                                    None,
+                                    None,
+                                )
+                            })?;
+                        }
+                    }
+                }
+                disp.signal_all();
+                (nw, rids)
+            }
+        };
+
+        let decoded_vec: Vec<DecodedWire> =
+            crate::runtime::reactor::join_all_unpin(all_req_ids.iter().map(|&id| reactor.await_reply(id))).await;
+
+        let mut results: Vec<FxHashSet<PkBuf>> = checks
+            .iter()
+            .map(|check| {
+                let cap = match check.payload.as_ref().expect("payload consumed") {
+                    CheckPayload::Broadcast(b) => b.count,
+                    CheckPayload::ScatterSource { source } => source.count,
+                };
+                FxHashSet::with_capacity_and_hasher(cap, Default::default())
+            })
+            .collect();
+
+        if let Some(err) = first_worker_error("pipeline", &decoded_vec) {
+            return Err(err);
+        }
+        for check_idx in 0..num_checks {
+            for w in 0..nw {
+                let decoded = &decoded_vec[check_idx * nw + w];
+                if let Some(ref batch) = decoded.data_batch {
+                    for j in 0..batch.count {
+                        if batch.get_weight(j) == 1 {
+                            results[check_idx].insert(PkBuf::from_bytes(batch.get_pk_bytes(j)));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Batched stored-row gather. Scatters `pks` to their owning workers (one
+    /// group, partitioned by the parent PK columns so each worker only reads
+    /// rows it stores), each worker reads the committed rows for its PKs and
+    /// replies with them projected to `project` (the referenced parent column
+    /// indices). Returns a `pk → projected values` map: each value is the
+    /// promoted index key, or `None` for a NULL referenced value; PKs whose
+    /// committed row is absent are omitted entirely. Each row's values are
+    /// aligned to `project`.
+    ///
+    /// This is the `O(num_workers)`-round-trip replacement for the per-row
+    /// serial single-key seek loop used by FK RESTRICT on non-PK UNIQUE
+    /// targets. It is a sibling of `execute_pipeline_async` (which returns only
+    /// existence) rather than a modification of it: the has-pk pipeline echoes
+    /// the caller's payload (`filter_by_pk`), so it structurally cannot return
+    /// a stored column the caller does not already hold.
+    ///
+    /// Replies arrive as reply trains (an oversized gather reply chunks; a
+    /// single-frame reply is a length-1 train), so the fan-out uses scan
+    /// request ids and the train drain. The expected projected schema guards
+    /// each train's first frame — a worker whose catalog lags a DDL would
+    /// otherwise hand back rows the master mis-decodes.
+    pub(super) async fn execute_gather_async(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
+        target_id: i64,
+        mut pks: Vec<PkBuf>,
+        project: &[u8],
+    ) -> Result<GatherMap, String> {
+        if pks.is_empty() {
+            return Ok(GatherMap::default());
+        }
+        // Sort so each worker's sublist reaches `gather_family` ascending:
+        // `removed`/updated PKs are extracted from an FxHashMap (arbitrary
+        // order) and `scatter_wire_group` preserves per-worker relative order,
+        // so a globally sorted input yields per-worker-sorted sublists.
+        pks.sort_unstable_by(|a, b| a.pk_bytes().cmp(b.pk_bytes()));
+        let col_mask = pack_gather_cols(project).ok_or("gather: more than 8 projected columns")?;
+
+        let parent_schema = unsafe {
+            (&*(*disp_ptr).catalog)
+                .get_schema_desc(target_id)
+                .ok_or_else(|| format!("gather: no schema for table {target_id}"))?
+        };
+        // The exact constructor the worker uses for its reply schema, so a
+        // matching reply validates by construction.
+        let expected = crate::schema::project_schema(&parent_schema, project);
+
+        // `_lease` held across the full drain below (see `dispatch_scan_fanout`).
+        let (slots, req_ids, _lease) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, -1, |disp, rids, unicast| {
+            let nw = disp.num_workers;
+            let pk_cols = parent_schema.pk_indices();
+            let pooled = disp.pool_pop_batch(target_id);
+            let batch = build_check_batch_pkbuf(&parent_schema, &pks, pooled);
+            with_worker_indices(&batch, pk_cols, &parent_schema, nw, |worker_indices| {
+                disp.sal.scatter_wire_group(
+                    &batch,
+                    worker_indices,
+                    &parent_schema,
+                    None,
+                    target_id as u32,
+                    0,
+                    FLAG_GATHER,
+                    /* wire_flags */ 0,
+                    /* seek_pk */ 0,
+                    /* seek_col_idx */ col_mask,
+                    rids,
+                    unicast,
+                    None,
+                    None,
+                )
+            })?;
+            // The scatter batch is fully consumed by the synchronous
+            // scatter_wire_group above; return it to the pool.
+            recycle_check_batch(disp, target_id, batch);
+            Ok(())
+        })
+        .await?;
+
+        // Precompute (type_code, col_size) per projected column from the parent
+        // schema; the reply's projected payload index k corresponds to project[k].
+        let proj_meta: Vec<(u8, usize)> = project
+            .iter()
+            .map(|&p| {
+                let col = parent_schema.columns[p as usize];
+                (col.type_code, col.size() as usize)
+            })
+            .collect();
+
+        let mut out = GatherMap::new(proj_meta.len());
+        drain_index_scan(slots, &req_ids, reactor, "gather", &expected, |b, _| {
+            // The column slices are invariant across a frame's rows; derive
+            // each once per frame instead of once per (row × column). The
+            // arity is hard-capped by `pack_gather_cols` (one u8 per u64 byte).
+            let mut col_slices: [&[u8]; 8] = [&[]; 8];
+            for (k, &(_, col_size)) in proj_meta.iter().enumerate() {
+                col_slices[k] = b.col_data(k, col_size);
+            }
+            for j in 0..b.count {
+                let null_word = b.get_null_word(j);
+                out.push_row(
+                    PkBuf::from_bytes(b.get_pk_bytes(j)),
+                    proj_meta.iter().enumerate().map(|(k, &(col_type, col_size))| {
+                        if null_word & (1u64 << k) != 0 {
+                            None
+                        } else {
+                            Some(payload_native_key(col_slices[k], j * col_size, col_size, col_type))
+                        }
+                    }),
+                );
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(out)
     }
 }

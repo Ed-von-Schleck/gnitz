@@ -1,8 +1,8 @@
 //! Single-threaded io_uring reactor.
 //!
 //! Provides `block_on`, `spawn`, `timer`, and a reply-routing API
-//! (`await_reply` / `register_reply_waker`). The reactor owns its own
-//! `IoUringRing`, separate from the executor's transport ring.
+//! (`await_reply`). The reactor owns its own `IoUringRing`, separate
+//! from the executor's transport ring.
 //!
 //! Design notes:
 //!
@@ -34,14 +34,13 @@ use std::time::Instant;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use self::ring::{Cqe, Ring, CQE_F_MORE};
-use self::uring::IoUringRing;
+use self::uring::{Cqe, IoUringRing, CQE_F_MORE};
 
 use crate::foundation::posix_io::FUTEX2_SIZE_U32;
 use crate::runtime::sal::MAX_WORKERS;
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::w2m_ring::FLAG_MASTER_PARKED;
-use crate::runtime::wire::{self, DecodedWire, FLAG_EXCHANGE, FLAG_HAS_DATA};
+use crate::runtime::wire::{self, DecodedWire, FLAG_EXCHANGE};
 
 /// High bit of `internal_req_id` (u32) marks scan-allocated request IDs.
 /// Regular IDs stay in [1, MAX_REGULAR_REQ_ID] (bit 31 clear).
@@ -58,10 +57,8 @@ mod conn;
 mod exchange;
 mod futures;
 pub mod io;
-mod ring;
 mod runloop;
 pub mod sync;
-mod udp;
 mod uring;
 
 #[cfg(test)]
@@ -79,7 +76,6 @@ pub use sync::{join_all_unpin, join_into, mpsc, oneshot, select2, AsyncMutex, As
 // CQE user_data encoding (high 8 bits = kind, low 56 bits = id)
 // ---------------------------------------------------------------------------
 
-pub const KIND_REPLY: u64 = 1;
 pub const KIND_TIMEOUT: u64 = 2;
 pub const KIND_FSYNC: u64 = 3;
 pub const KIND_FUTEX_WAITV: u64 = 4;
@@ -87,22 +83,12 @@ pub const KIND_ACCEPT: u64 = 5;
 pub const KIND_RECV: u64 = 6;
 pub const KIND_SEND: u64 = 7;
 pub const KIND_FUTEX_CANCEL: u64 = 8;
-/// One-shot RECVMSG on a UDP socket. (UDP *sends* need no kind of their
-/// own: their ids come from the stream-send counter and their CQEs land on
-/// `KIND_SEND`.)
-pub const KIND_UDP_RECV: u64 = 9;
-/// CQE tag for the `AsyncCancel` a dropped `UdpRecvFuture` submits against
-/// its RECVMSG. A dedicated tag (not `KIND_FUTEX_CANCEL`, whose handler sets
-/// `futex_waitv_cancelled`) so a UDP recv cancellation never disturbs the
-/// FUTEX_WAITV shutdown handshake. The dispatch arm is a pure no-op — the
-/// cancellation's *effect* is observed on the RECVMSG's own CQE.
-pub const KIND_UDP_CANCEL: u64 = 10;
 /// CQE tag for the `AsyncCancel` a dropped `TimerFuture` submits against its
 /// Timeout SQE, so a cancelled timer's kernel state is reclaimed immediately
 /// instead of at its deadline. The dispatch arm is a pure no-op — the
 /// cancellation's *effect* is the Timeout's own `-ECANCELED` CQE under
 /// `KIND_TIMEOUT`, discarded there via the `cancelled` flag.
-pub const KIND_TIMEOUT_CANCEL: u64 = 11;
+pub const KIND_TIMEOUT_CANCEL: u64 = 9;
 
 const KIND_SHIFT: u64 = 56;
 const ID_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
@@ -136,9 +122,8 @@ struct ReactorShared {
     /// fields in declaration order; dropping `ring` closes the io_uring fd,
     /// whose kernel-side teardown cancels all in-flight SQEs and drops the
     /// kernel's references to userspace buffers. Only then is it safe to free
-    /// the buffers those SQEs pointed at — `udp_recv_ops`,
-    /// `send_buffers_in_flight`, `conns`. Moving `ring` below any of them is a
-    /// use-after-free at shutdown.
+    /// the buffers those SQEs pointed at — `send_buffers_in_flight`, `conns`.
+    /// Moving `ring` below any of them is a use-after-free at shutdown.
     ring: RefCell<IoUringRing>,
     /// Live tasks keyed by a monotonically-increasing id. HashMap (not
     /// `slab::Slab`) because same-key reinsertion is load-bearing: a
@@ -184,12 +169,10 @@ struct ReactorShared {
     /// cancellation CQE for the FUTEX_WAITV SQE has arrived and the
     /// storage can be dropped.
     futex_waitv_cancelled: Cell<bool>,
-    /// Per-timer wakers keyed by timer_id. Each entry holds the waker to
-    /// fire when the io_uring Timeout CQE arrives and a cancellation flag
-    /// shared with the owning TimerFuture. If the future is dropped before
-    /// the CQE, the flag is set and dispatch_cqe silently discards it.
-    #[allow(clippy::type_complexity)]
-    timer_wakers: RefCell<FxHashMap<u64, (Waker, Rc<Cell<bool>>)>>,
+    /// Per-timer wakers keyed by timer_id: the waker to fire when the
+    /// io_uring Timeout CQE arrives. A TimerFuture dropped before the CQE
+    /// removes its entry, so the late CQE finds nothing to wake.
+    timer_wakers: RefCell<FxHashMap<u64, Waker>>,
     next_timer_id: Cell<u64>,
     #[cfg(test)]
     injected_cqes: RefCell<VecDeque<Cqe>>,
@@ -234,7 +217,7 @@ struct ReactorShared {
     /// Closed-fd sentinel: set to true when a recv CQE arrived with
     /// res<=0 or the connection was forcibly closed. A subsequent
     /// `recv()` returns `None`.
-    recv_closed: RefCell<FxHashMap<i32, bool>>,
+    recv_closed: RefCell<FxHashSet<i32>>,
     /// Send wakers keyed by send_id. `(send_id → fd)` lives separately
     /// so the CQE handler can decrement `Conn::send_inflight` even when
     /// no waker has been installed yet.
@@ -254,20 +237,6 @@ struct ReactorShared {
     /// come from different counters — a shared set would let a cancelled
     /// send id wrongly tombstone a live fsync of the same numeric value.
     cancelled_sends: RefCell<FxHashSet<u64>>,
-    /// In-flight UDP recv op storage, keyed by udata id. Removed (and freed)
-    /// unconditionally when the CQE drains — the kernel is done with the
-    /// pointers at that moment, awaiter alive or not. (UDP *send* ops need no
-    /// map: they ride `SendAlive::UdpOp` through the stream-send machinery.)
-    udp_recv_ops: RefCell<FxHashMap<u64, Box<udp::UdpRecvOp>>>,
-    udp_recv_wakers: RefCell<FxHashMap<u64, Waker>>,
-    parked_udp_recv: RefCell<FxHashMap<u64, Result<udp::UdpDatagram, i32>>>,
-    /// Recv ids whose future was dropped while its RECVMSG was still armed.
-    /// `UdpRecvFuture::drop` submits an `AsyncCancel` for the SQE (so it cannot
-    /// linger and consume a later datagram) and records the id here; the
-    /// `KIND_UDP_RECV` handler consults it and frees the op box + drops the
-    /// result — whether the CQE is the `-ECANCELED` from the cancel or a
-    /// datagram that raced it. Empty on the steady-state path.
-    cancelled_udp_recvs: RefCell<FxHashSet<u64>>,
     /// Shutdown flag. `block_until_shutdown` polls until this is set.
     shutdown: Cell<bool>,
     /// FLAG_EXCHANGE accumulator: when route_reply sees an exchange wire,
@@ -295,10 +264,6 @@ struct ReactorShared {
     /// Fds that have been marked closing via `close_fd`. `reap_closing_conns`
     /// iterates only this set (O(closing)) rather than all connections (O(all)).
     closing_fds: RefCell<FxHashSet<i32>>,
-    /// Scratch buffer for `reap_closing_conns` to avoid a per-tick `Vec<i32>`
-    /// allocation. Cleared on entry, repopulated from `closing_fds`, and
-    /// retained across ticks.
-    closing_scratch: RefCell<Vec<i32>>,
     /// Guards against spawning multiple concurrent EMFILE/ENFILE backoff tasks.
     /// Set before spawn, cleared when the timer fires and accept is re-armed.
     accept_backoff_armed: Cell<bool>,
@@ -415,21 +380,16 @@ impl Reactor {
             accept_waker: RefCell::new(None),
             recv_waiters: RefCell::new(FxHashMap::default()),
             pending_recv: RefCell::new(FxHashMap::default()),
-            recv_closed: RefCell::new(FxHashMap::default()),
+            recv_closed: RefCell::new(FxHashSet::default()),
             send_wakers: RefCell::new(FxHashMap::default()),
             send_fd_for_id: RefCell::new(FxHashMap::default()),
             send_buffers_in_flight: RefCell::new(FxHashMap::default()),
             parked_send_results: RefCell::new(FxHashMap::default()),
             cancelled_sends: RefCell::new(FxHashSet::default()),
-            udp_recv_ops: RefCell::new(FxHashMap::default()),
-            udp_recv_wakers: RefCell::new(FxHashMap::default()),
-            parked_udp_recv: RefCell::new(FxHashMap::default()),
-            cancelled_udp_recvs: RefCell::new(FxHashSet::default()),
             shutdown: Cell::new(false),
             exchange_acc: RefCell::new(ExchangeAccumulator::new(0)),
             relay_tx: RefCell::new(None),
             closing_fds: RefCell::new(FxHashSet::default()),
-            closing_scratch: RefCell::new(Vec::new()),
             scan_wakers: RefCell::new(FxHashMap::default()),
             scan_parked: RefCell::new(FxHashMap::default()),
             active_scans: RefCell::new(FxHashSet::default()),
@@ -553,8 +513,8 @@ impl Reactor {
         id as u64
     }
 
-    /// Future that completes at `deadline`. The reactor wakes the task
-    /// when its main loop sees that the soonest deadline has passed.
+    /// Future that completes at `deadline`, backed by an io_uring Timeout
+    /// SQE whose CQE wakes the task.
     pub fn timer(&self, deadline: Instant) -> impl Future<Output = ()> {
         TimerFuture::new(deadline, Rc::clone(&self.inner))
     }
@@ -606,10 +566,17 @@ impl Reactor {
             panic!("attach_w2m called twice");
         }
         *self.inner.futex_waitv_storage.borrow_mut() = Some(boxed);
-        // Drain-then-refresh loop: the same protocol used by the
-        // CQE dispatch path. Drain catches any messages published
-        // between init and attach; refresh snapshots expected values
-        // with MASTER_PARKED already set.
+        self.drain_refresh_and_arm(nw);
+    }
+
+    /// The lost-wake protocol in one place: drain every ring, refresh the
+    /// expected `reader_seq` values (with MASTER_PARKED published first so
+    /// the wake window stays closed), loop until no ring has unread data,
+    /// then re-arm the FUTEX_WAITV SQE. Arming with a stale expected value
+    /// would block on a wake that already happened — the classic lost-wake
+    /// race. Used by `attach_w2m` (catches messages published between init
+    /// and attach) and by the KIND_FUTEX_WAITV CQE handler on every wake.
+    fn drain_refresh_and_arm(&self, nw: usize) {
         loop {
             for w in 0..nw {
                 self.drain_w2m_for_worker(w);
@@ -638,13 +605,7 @@ impl Reactor {
             unsafe {
                 ring.prep_futex_waitv(ptr, nr, udata_val);
             }
-            if let Err(e) = ring.submit_and_wait_timeout(0, 0) {
-                crate::gnitz_error!(
-                    "reactor: FUTEX_WAITV SQE flush failed (errno={}); \
-                     SQE queued in SQ ring — will submit on next tick",
-                    e,
-                );
-            }
+            ring.flush_sqes("FUTEX_WAITV");
         }
         self.inner.futex_waitv_armed.set(true);
     }
@@ -734,19 +695,11 @@ impl Reactor {
     /// load-bearing for the `pre_write_pushes` Phase-A / tick-evaluation
     /// overlap.
     fn submit_fsync(&self, fd: i32) -> u64 {
-        // Fsync IDs share the reply counter; the KIND_FSYNC tag in udata
-        // prevents collisions with KIND_REPLY ids.
         let id = self.alloc_request_id();
         {
             let mut ring = self.inner.ring.borrow_mut();
             ring.prep_fsync(fd, udata(KIND_FSYNC, id));
-            if let Err(e) = ring.submit_and_wait_timeout(0, 0) {
-                crate::gnitz_error!(
-                    "reactor: fsync SQE flush failed (errno={}); \
-                     SQE queued — will submit on next tick",
-                    e,
-                );
-            }
+            ring.flush_sqes("fsync");
         }
         id
     }
@@ -788,13 +741,6 @@ impl Reactor {
         }
     }
 
-    /// Register `w` to fire when a CQE with `(KIND_REPLY, req_id)` arrives.
-    /// Replaces any waker previously registered for the same id.
-    #[allow(dead_code)]
-    pub(crate) fn register_reply_waker(&self, req_id: u64, w: Waker) {
-        self.inner.reply_wakers.borrow_mut().insert(req_id, w);
-    }
-
     /// True while at least one task is alive in the slab.
     #[cfg(test)]
     pub(super) fn has_pending_tasks(&self) -> bool {
@@ -811,27 +757,20 @@ impl Reactor {
         let kind = udata_kind(cqe.user_data);
         let id = udata_id(cqe.user_data);
         match kind {
-            KIND_REPLY => {
-                if let Some(w) = self.inner.reply_wakers.borrow_mut().remove(&id) {
+            KIND_TIMEOUT => {
+                // The kernel is done with the Timeout's Timespec once its CQE
+                // has been drained — recycle it. A cancelled timer's Drop
+                // already removed its waker entry, so the CQE is a no-op wake.
+                self.inner.ring.borrow_mut().release_timer_spec(cqe.user_data);
+                if let Some(w) = self.inner.timer_wakers.borrow_mut().remove(&id) {
                     w.wake();
                 }
             }
-            KIND_TIMEOUT => {
-                if let Some((w, cancelled)) = self.inner.timer_wakers.borrow_mut().remove(&id) {
-                    if !cancelled.get() {
-                        w.wake();
-                    }
-                }
-            }
             KIND_FUTEX_WAITV => {
-                // Wake index is not authoritative for FUTEX_WAITV:
-                // the kernel may wake us for any of the watched
-                // words. Drain every worker's ring, refresh expected
-                // values (with MASTER_PARKED published first so the
-                // wake window stays closed), and re-arm. The
-                // `refresh → drain` loop runs until no ring has
-                // unread data, guaranteeing we never arm with an
-                // already-stale expected value.
+                // Wake index is not authoritative for FUTEX_WAITV: the
+                // kernel may wake us for any of the watched words, so
+                // `drain_refresh_and_arm` drains every worker's ring
+                // before re-arming.
                 self.inner.futex_waitv_armed.set(false);
                 if !self.inner.shutdown.get() {
                     let nw = self
@@ -840,15 +779,7 @@ impl Reactor {
                         .get()
                         .expect("KIND_FUTEX_WAITV fired but w2m not attached")
                         .num_workers();
-                    loop {
-                        for w in 0..nw {
-                            self.drain_w2m_for_worker(w);
-                        }
-                        if !self.refresh_futex_waitv_vals() {
-                            break;
-                        }
-                    }
-                    self.arm_futex_waitv();
+                    self.drain_refresh_and_arm(nw);
                 }
             }
             KIND_FUTEX_CANCEL => {
@@ -917,11 +848,7 @@ impl Reactor {
             KIND_SEND => {
                 // Buffer / inflight / fd cleanup is unconditional — the kernel
                 // is done with the pointer regardless of whether the awaiter is
-                // still alive. UDP datagram sends land here too (same id
-                // counter, `SendAlive::UdpOp` keep-alive): for them the fd
-                // lookup is an absent-key no-op and the
-                // `send_buffers_in_flight` remove reclaims a dropped future's
-                // op box.
+                // still alive.
                 let fd = self.inner.send_fd_for_id.borrow_mut().remove(&id);
                 if let Some(fd) = fd {
                     if let Some(conn) = self.inner.conns.borrow_mut().get_mut(&fd) {
@@ -945,8 +872,7 @@ impl Reactor {
                     }
                 }
             }
-            KIND_UDP_RECV => self.handle_udp_recv_cqe(id, &cqe),
-            KIND_UDP_CANCEL | KIND_TIMEOUT_CANCEL => {
+            KIND_TIMEOUT_CANCEL => {
                 // The AsyncCancel's own CQE. The cancellation's *effect*
                 // arrives separately as the target op's -ECANCELED under its
                 // own kind (same split as the FUTEX_WAITV cancel pair).
@@ -955,12 +881,10 @@ impl Reactor {
         }
     }
 
-    /// Drain every unread W2M slot for worker `w` and route each reply.
-    ///
-    /// Peeks the control block first to choose the decode path:
-    /// - `FLAG_HAS_DATA` (non-exchange): zero-copy ingest into owned `Batch`.
-    /// - `FLAG_EXCHANGE`: decode from slot bytes, process synchronously.
-    /// - everything else (control-only): full decode via `park_owned`.
+    /// Drain every unread W2M slot for worker `w` and route each reply:
+    /// scan frames are intercepted raw; everything else — data, exchange,
+    /// control-only — funnels through one zero-copy decode into
+    /// `route_reply`, which demuxes FLAG_EXCHANGE into the accumulator.
     ///
     /// The RAII `W2mSlot` advances `consume_cursor` on drop so the worker
     /// can reuse the ring space immediately after decoding completes.
@@ -979,14 +903,8 @@ impl Reactor {
                 continue;
             }
             let ctrl = wire::peek_control_block(slot.bytes()).expect("W2M control block corrupt — ring corrupt");
-            let flags = ctrl.flags;
-            if flags & FLAG_HAS_DATA != 0 && flags & FLAG_EXCHANGE == 0 {
-                self.ingest_from_slot(w, slot, ctrl);
-            } else if flags & FLAG_EXCHANGE != 0 {
-                self.process_exchange_from_slot(w, slot, ctrl);
-            } else {
-                self.park_owned(w, slot, ctrl);
-            }
+            let decoded = self.decode_slot_owned(slot, ctrl);
+            self.route_reply(w, decoded);
         }
     }
 
@@ -1023,95 +941,33 @@ impl Reactor {
         }
     }
 
-    /// Zero-copy decode path for W2M slots with `FLAG_HAS_DATA`.
-    ///
-    /// Borrows ring bytes via `MemBatch`, allocates exactly one owned `Batch`
-    /// (ring → run, single `copy_from_slice`), then drops the slot so
-    /// `consume_cursor` advances before the awaiter wakes.
-    fn ingest_from_slot(&self, w: usize, slot: W2mSlot, ctrl: wire::DecodedControl) {
+    /// Decode one W2M slot into an owned `DecodedWire`, tolerating
+    /// control-only frames (`data_batch: None`). Zero-copy: borrows ring
+    /// bytes via `MemBatch`, allocates exactly one owned `Batch` when the
+    /// frame carries data (ring → run, single `copy_from_slice`), then
+    /// drops the slot so `consume_cursor` advances before any awaiter wakes.
+    fn decode_slot_owned(&self, slot: W2mSlot, ctrl: wire::DecodedControl) -> DecodedWire {
         let bytes = slot.bytes();
-        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl.block_size, ctrl, None)
+        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, None)
             .expect("W2M zero-copy decode failed — ring corrupt");
         let flags = zc.control.flags;
-        let schema = zc.schema;
-        let mb = zc
-            .data_batch
-            .expect("FLAG_HAS_DATA set but no data batch — ring corrupt");
-        let sch = schema.as_ref().expect("FLAG_HAS_DATA set but no schema — ring corrupt");
-        let mut owned = crate::storage::Batch::with_schema(*sch, mb.count);
-        owned.append_mem_batch(&mb);
-        // The wire flags are ground truth. `append_mem_batch` leaves `owned`
-        // `Raw`; raise to the decoded claim, debug-verifying the data against it.
-        owned.certify_layout(wire::layout_from_wire_flags(flags), sch);
-        let control = zc.control;
-        let _ = mb; // release borrows from slot before dropping the slot
-        drop(slot); // RAII: advance consume_cursor before waking awaiter
-        self.route_reply(
-            w,
-            DecodedWire {
-                control,
-                schema,
-                data_batch: Some(owned),
-            },
-        );
-    }
-
-    /// Zero-copy decode path for FLAG_EXCHANGE slots: mirrors `ingest_from_slot`
-    /// but feeds the result into `exchange_acc` instead of routing to an awaiter.
-    fn process_exchange_from_slot(&self, w: usize, slot: W2mSlot, ctrl: wire::DecodedControl) {
-        let bytes = slot.bytes();
-        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl.block_size, ctrl, None)
-            .expect("W2M exchange decode failed — ring corrupt");
-        let flags = zc.control.flags;
         let control = zc.control;
         let schema = zc.schema;
-        let data_batch = if let Some(mb) = zc.data_batch {
-            let sch = schema
-                .as_ref()
-                .expect("exchange FLAG_HAS_DATA without schema — ring corrupt");
+        let data_batch = zc.data_batch.map(|mb| {
+            let sch = schema.as_ref().expect("FLAG_HAS_DATA set but no schema — ring corrupt");
             let mut owned = crate::storage::Batch::with_schema(*sch, mb.count);
             owned.append_mem_batch(&mb);
             // The wire flags are ground truth. `append_mem_batch` leaves
             // `owned` `Raw`; raise to the decoded claim, debug-verifying the data.
             owned.certify_layout(wire::layout_from_wire_flags(flags), sch);
-            let _ = mb; // release borrow from slot bytes before dropping slot
-            Some(owned)
-        } else {
-            None
-        };
-        drop(slot); // advance consume_cursor before processing relay
-        let pending = self.inner.exchange_acc.borrow_mut().process(
-            w,
-            DecodedWire {
-                control,
-                schema,
-                data_batch,
-            },
-        );
-        self.dispatch_relay(pending);
-    }
-
-    fn dispatch_relay(&self, pending: Option<PendingRelay>) {
-        if let Some(relay) = pending {
-            if let Some(tx) = self.inner.relay_tx.borrow().as_ref() {
-                tx.send(relay);
-            } else {
-                crate::gnitz_warn!(
-                    "reactor: FLAG_EXCHANGE relay produced before relay_tx attached (view_id={})",
-                    relay.view_id,
-                );
-            }
+            owned
+        });
+        drop(slot); // RAII: advance consume_cursor before waking awaiter
+        DecodedWire {
+            control,
+            schema,
+            data_batch,
         }
-    }
-
-    /// Full-decode fallback: decode a W2M slot via the owned-batch path and
-    /// route the reply.  Drops the slot (advancing `consume_cursor`) before
-    /// waking any awaiter.
-    fn park_owned(&self, w: usize, slot: W2mSlot, ctrl: wire::DecodedControl) {
-        let decoded = wire::decode_wire_ipc_with_ctrl(slot.bytes(), ctrl.block_size, ctrl)
-            .expect("W2M decode failed — ring corrupt");
-        drop(slot);
-        self.route_reply(w, decoded);
     }
 
     /// Park `decoded` for its awaiter. FLAG_EXCHANGE replies are
@@ -1124,7 +980,16 @@ impl Reactor {
     fn route_reply(&self, w: usize, decoded: DecodedWire) {
         if decoded.control.flags & FLAG_EXCHANGE != 0 {
             let pending = self.inner.exchange_acc.borrow_mut().process(w, decoded);
-            self.dispatch_relay(pending);
+            if let Some(relay) = pending {
+                if let Some(tx) = self.inner.relay_tx.borrow().as_ref() {
+                    tx.send(relay);
+                } else {
+                    crate::gnitz_warn!(
+                        "reactor: FLAG_EXCHANGE relay produced before relay_tx attached (view_id={})",
+                        relay.view_id,
+                    );
+                }
+            }
             return;
         }
 
@@ -2042,24 +1907,6 @@ mod tests {
         assert_eq!(rc.get(), 0);
     }
 
-    /// `register_reply_waker` overrides any earlier registration for the
-    /// same id (the more recent caller wins), so a stale waker does not
-    /// fire by mistake.
-    #[test]
-    fn register_reply_waker_replaces() {
-        let r = make_reactor();
-
-        let w1 = make_waker(99);
-        let w2 = make_waker(100);
-        r.register_reply_waker(42, w1);
-        r.register_reply_waker(42, w2);
-        r.inject_cqe(KIND_REPLY, 42, 0);
-        r.drain_injected_cqes();
-        let q: Vec<usize> = r.inner.run_queue.borrow().queue.clone();
-        assert!(q.contains(&100), "second waker (key=100) must win");
-        assert!(!q.contains(&99), "first waker (key=99) must have been replaced");
-    }
-
     // -- helper futures used by the tests above --
 
     /// Future that returns Pending exactly once, then Ready.
@@ -2177,7 +2024,7 @@ mod tests {
         r.test_init_state(2);
 
         let waker = make_waker(0);
-        r.register_reply_waker(42, waker);
+        r.inner.reply_wakers.borrow_mut().insert(42, waker);
 
         r.test_route_reply(1, synthetic_decoded_wire(42));
 
@@ -2281,38 +2128,6 @@ mod tests {
             Some(0),
             "fsync CQE must be available without driving another tick — \
              submit_fsync should flush the SQE eagerly"
-        );
-    }
-
-    /// The KIND_REPLY / KIND_FSYNC tags in `user_data` are what keep
-    /// shared-id spaces from colliding.  With matching ids (42) but
-    /// different kinds, each dispatch path must land in its own map.
-    #[test]
-    fn fsync_and_reply_udata_kinds_do_not_collide() {
-        let r = make_reactor();
-        // Register a reply waker so KIND_REPLY's dispatch path has
-        // something to pop.
-        let waker = make_waker(7);
-        r.register_reply_waker(42, waker);
-
-        r.inject_cqe(KIND_REPLY, 42, 0);
-        r.inject_cqe(KIND_FSYNC, 42, -11);
-        r.drain_injected_cqes();
-
-        let q: Vec<usize> = r.inner.run_queue.borrow().queue.to_vec();
-        assert!(
-            q.contains(&7),
-            "KIND_REPLY dispatch must wake the reply waker for id=42"
-        );
-        assert!(
-            !r.inner.reply_wakers.borrow().contains_key(&42),
-            "reply waker must be consumed by KIND_REPLY dispatch"
-        );
-        let fsync_rc = r.inner.parked_fsync_results.borrow_mut().remove(&42);
-        assert_eq!(
-            fsync_rc,
-            Some(-11),
-            "KIND_FSYNC dispatch must park its own rc under the same id"
         );
     }
 
@@ -2427,7 +2242,7 @@ mod tests {
     fn register_conn_clears_stale_recv_closed_sentinel() {
         let r = make_reactor();
         // Pretend fd=99's previous incarnation closed.
-        r.inner.recv_closed.borrow_mut().insert(99, true);
+        r.inner.recv_closed.borrow_mut().insert(99);
         // Work around: register_conn submits a RECV SQE on the fd, which
         // would fail with EBADF if fd=99 isn't open. We skirt that by
         // opening a pipe and using the read end (a valid fd that won't
@@ -2437,12 +2252,12 @@ mod tests {
             assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
             let (read_end, write_end) = (fds[0], fds[1]);
             // Prime recv_closed under the pipe fd number.
-            r.inner.recv_closed.borrow_mut().insert(read_end, true);
+            r.inner.recv_closed.borrow_mut().insert(read_end);
 
             r.register_conn(read_end);
 
             assert!(
-                !r.inner.recv_closed.borrow().contains_key(&read_end),
+                !r.inner.recv_closed.borrow().contains(&read_end),
                 "register_conn must clear stale recv_closed so a new \
                  connection on a reused fd doesn't see phantom EOF"
             );
@@ -2812,7 +2627,7 @@ mod tests {
         let r = make_reactor();
         r.test_init_state(2);
         let waker = make_waker(0);
-        r.register_reply_waker(42, waker);
+        r.inner.reply_wakers.borrow_mut().insert(42, waker);
 
         let exch = synthetic_exchange_wire(/*view_id*/ 100, /*req_id*/ 42);
         r.test_route_reply(0, exch);
@@ -2839,8 +2654,8 @@ mod tests {
 
         let w0 = make_waker(0);
         let w1 = make_waker(1);
-        r.register_reply_waker(10, w0);
-        r.register_reply_waker(11, w1);
+        r.inner.reply_wakers.borrow_mut().insert(10, w0);
+        r.inner.reply_wakers.borrow_mut().insert(11, w1);
 
         r.test_route_reply(0, synthetic_exchange_wire(99, 10));
         assert!(
@@ -2879,7 +2694,7 @@ mod tests {
         // parked-waker pre-flight check.
         for w in 0..4 {
             let waker = make_waker(w);
-            r.register_reply_waker(100 + w as u64, waker);
+            r.inner.reply_wakers.borrow_mut().insert(100 + w as u64, waker);
         }
 
         // Interleave two rounds for the same view_id=100:
@@ -3420,7 +3235,7 @@ mod tests {
             "res<=0 recv CQE must insert fd into closing_fds"
         );
         assert!(
-            r.inner.recv_closed.borrow().get(&55).copied().unwrap_or(false),
+            r.inner.recv_closed.borrow().contains(&55),
             "res<=0 recv CQE must set recv_closed sentinel"
         );
     }
@@ -3766,30 +3581,21 @@ mod tests {
     /// Build a minimal W2M ring and write one scan slot with `req_id`.
     /// The returned `W2mReceiver` owns the `InFlightState` that the slot's Drop
     /// references — it must be kept alive until after the slot is dropped.
-    /// Caller must munmap the returned pointer after both receiver and slot drop.
+    /// The returned `SharedRegion` unmaps the ring on drop.
     unsafe fn make_scan_slot(
         req_id: u32,
     ) -> (
         crate::runtime::w2m::W2mSlot,
         crate::runtime::w2m::W2mReceiver,
-        *mut u8,
-        usize,
+        crate::test_support::SharedRegion,
     ) {
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use crate::runtime::w2m_ring;
         use crate::runtime::wire::{self as ipc, STATUS_OK};
 
         const CAPACITY: usize = 4096;
-        let ptr = libc::mmap(
-            std::ptr::null_mut(),
-            CAPACITY,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANONYMOUS | libc::MAP_SHARED,
-            -1,
-            0,
-        ) as *mut u8;
-        assert!(!ptr.is_null());
-        std::ptr::write_bytes(ptr, 0, CAPACITY);
+        let region = crate::test_support::SharedRegion::new(CAPACITY);
+        let ptr = region.ptr();
         w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
 
         let writer = W2mWriter::new(ptr, CAPACITY as u64);
@@ -3815,7 +3621,7 @@ mod tests {
             );
         });
         let slot = receiver.try_read_slot(0).expect("scan slot");
-        (slot, receiver, ptr, CAPACITY)
+        (slot, receiver, region)
     }
 
     #[test]
@@ -3825,7 +3631,7 @@ mod tests {
         // overwritten.
         let r = make_reactor();
         let req_id = r.alloc_scan_request_id() as u32;
-        let (slot, _recv, ptr, size) = unsafe { make_scan_slot(req_id) };
+        let (slot, _recv, _region) = unsafe { make_scan_slot(req_id) };
 
         let _lease = r.scan_lease(&[req_id]);
         r.test_route_scan_slot(slot);
@@ -3845,9 +3651,6 @@ mod tests {
         );
 
         r.inner.scan_parked.borrow_mut().remove(&req_id); // drop slot, advance consume_cursor
-        unsafe {
-            libc::munmap(ptr as *mut libc::c_void, size);
-        }
     }
 
     #[test]
@@ -3856,7 +3659,7 @@ mod tests {
         // first polled. The first poll must return Poll::Ready, not Poll::Pending.
         let r = make_reactor();
         let req_id = r.alloc_scan_request_id() as u32;
-        let (slot, _recv, ptr, size) = unsafe { make_scan_slot(req_id) };
+        let (slot, _recv, _region) = unsafe { make_scan_slot(req_id) };
 
         let _lease = r.scan_lease(&[req_id]);
         r.test_route_scan_slot(slot); // park before any poll
@@ -3868,10 +3671,7 @@ mod tests {
             "first poll must return the pre-parked slot"
         );
 
-        drop(result); // advance consume_cursor before munmap
-        unsafe {
-            libc::munmap(ptr as *mut libc::c_void, size);
-        }
+        drop(result); // advance consume_cursor before the region unmaps
     }
 
     #[test]
@@ -3880,7 +3680,7 @@ mod tests {
         use std::cell::Cell;
         let r = make_reactor();
         let req_id = r.alloc_scan_request_id() as u32;
-        let (slot, _recv, ptr, size) = unsafe { make_scan_slot(req_id) };
+        let (slot, _recv, _region) = unsafe { make_scan_slot(req_id) };
 
         let _lease = r.scan_lease(&[req_id]);
         let delivered: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -3903,9 +3703,6 @@ mod tests {
         r.poll_nonblocking(); // task woken → Poll::Ready
 
         assert!(delivered.get(), "slot must be delivered after route_scan_slot");
-        unsafe {
-            libc::munmap(ptr as *mut libc::c_void, size);
-        }
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -3917,24 +3714,19 @@ mod tests {
     /// `internal_req_id` but with distinct wire request_ids (100, 101, …) so the
     /// caller can verify arrival order. The returned `W2mReceiver` owns the
     /// `InFlightState` the slots reference; caller reads frames via
-    /// `receiver.try_read_slot(0)` and munmaps the pointer after both receiver
-    /// and all slots drop.
-    unsafe fn make_scan_ring(internal_req_id: u32, n: usize) -> (crate::runtime::w2m::W2mReceiver, *mut u8, usize) {
+    /// `receiver.try_read_slot(0)`; the returned `SharedRegion` unmaps the ring
+    /// on drop, after both receiver and all slots drop.
+    unsafe fn make_scan_ring(
+        internal_req_id: u32,
+        n: usize,
+    ) -> (crate::runtime::w2m::W2mReceiver, crate::test_support::SharedRegion) {
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use crate::runtime::w2m_ring;
         use crate::runtime::wire::{self as ipc, STATUS_OK};
 
         const CAPACITY: usize = 64 * 1024;
-        let ptr = libc::mmap(
-            std::ptr::null_mut(),
-            CAPACITY,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANONYMOUS | libc::MAP_SHARED,
-            -1,
-            0,
-        ) as *mut u8;
-        assert!(!ptr.is_null());
-        std::ptr::write_bytes(ptr, 0, CAPACITY);
+        let region = crate::test_support::SharedRegion::new(CAPACITY);
+        let ptr = region.ptr();
         w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
 
         let writer = W2mWriter::new(ptr, CAPACITY as u64);
@@ -3962,7 +3754,7 @@ mod tests {
                 );
             });
         }
-        (receiver, ptr, CAPACITY)
+        (receiver, region)
     }
 
     /// Failure mode 4: concurrently-streamed continuation frames for one
@@ -3972,7 +3764,7 @@ mod tests {
     fn scan_queue_retains_continuation_frames_in_order() {
         let r = make_reactor();
         let req_id = r.alloc_scan_request_id() as u32;
-        let (recv, ptr, size) = unsafe { make_scan_ring(req_id, 2) };
+        let (recv, _region) = unsafe { make_scan_ring(req_id, 2) };
         let _lease = r.scan_lease(&[req_id]);
 
         // Route two frames for the same req_id while no awaiter is registered.
@@ -4005,9 +3797,6 @@ mod tests {
 
         drop(_lease);
         drop(recv);
-        unsafe {
-            libc::munmap(ptr as *mut libc::c_void, size);
-        }
     }
 
     /// Dropping the `ScanLease` purges the parked queue (dropping each queued
@@ -4017,7 +3806,7 @@ mod tests {
         use std::sync::atomic::Ordering;
         let r = make_reactor();
         let req_id = r.alloc_scan_request_id() as u32;
-        let (recv, ptr, size) = unsafe { make_scan_ring(req_id, 1) };
+        let (recv, _region) = unsafe { make_scan_ring(req_id, 1) };
         let lease = r.scan_lease(&[req_id]);
 
         let s0 = recv.try_read_slot(0).expect("frame 0");
@@ -4039,9 +3828,6 @@ mod tests {
         assert!(cc_after > cc_before, "dropped queued slot must advance consume_cursor");
 
         drop(recv);
-        unsafe {
-            libc::munmap(ptr as *mut libc::c_void, size);
-        }
     }
 
     /// Failure mode 1: a frame whose scan has no live lease is discarded
@@ -4052,7 +3838,7 @@ mod tests {
         use std::sync::atomic::Ordering;
         let r = make_reactor();
         let req_id = r.alloc_scan_request_id() as u32;
-        let (recv, ptr, size) = unsafe { make_scan_ring(req_id, 1) };
+        let (recv, _region) = unsafe { make_scan_ring(req_id, 1) };
 
         // No lease held: route_scan_slot must drop the slot, not park it.
         let s0 = recv.try_read_slot(0).expect("frame 0");
@@ -4069,9 +3855,6 @@ mod tests {
         );
 
         drop(recv);
-        unsafe {
-            libc::munmap(ptr as *mut libc::c_void, size);
-        }
     }
 
     /// End-to-end Failure mode 1 guard: a worker streams more frames than the
@@ -4094,21 +3877,9 @@ mod tests {
         let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None, &[]);
         let msg_total = 8 + align8(sz) as u64;
         let capacity = W2M_HEADER_SIZE as u64 + 2 * msg_total + 8;
-        let size = capacity as usize;
-        let ptr = unsafe {
-            let p = libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANONYMOUS | libc::MAP_SHARED,
-                -1,
-                0,
-            ) as *mut u8;
-            assert!(!p.is_null());
-            std::ptr::write_bytes(p, 0, size);
-            w2m_ring::init_region_for_tests(p, capacity);
-            p
-        };
+        let region = crate::test_support::SharedRegion::new(capacity as usize);
+        let ptr = region.ptr();
+        unsafe { w2m_ring::init_region_for_tests(ptr, capacity) };
 
         let r = make_reactor();
         let req_id = r.alloc_scan_request_id() as u32;
@@ -4185,9 +3956,6 @@ mod tests {
         );
 
         drop(receiver);
-        unsafe {
-            libc::munmap(ptr as *mut libc::c_void, size);
-        }
     }
 
     // ─────────────────────────────────────────────────────────────────

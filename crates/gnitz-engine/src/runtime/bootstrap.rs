@@ -17,6 +17,24 @@ use crate::runtime::wire as ipc;
 use crate::runtime::worker::{buffer_pending_delta, WorkerProcess};
 use crate::storage::{partition_range, Batch};
 
+/// Boot-progress line on stdout (the server log). EINTR/partial-write safe;
+/// used instead of the log macros where the raw, untagged line is the
+/// documented boot output (e.g. the "GnitzDB ready" marker tests wait for).
+fn boot_log(msg: &str) {
+    let bytes = msg.as_bytes();
+    let mut off = 0;
+    while off < bytes.len() {
+        let rc = unsafe { libc::write(1, bytes[off..].as_ptr() as *const libc::c_void, bytes.len() - off) };
+        if rc > 0 {
+            off += rc as usize;
+        } else if rc < 0 && posix_io::errno() == libc::EINTR {
+            continue;
+        } else {
+            return;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SAL recovery (Design 2: LSN as the atomic unit)
 // ---------------------------------------------------------------------------
@@ -120,7 +138,7 @@ where
 }
 
 /// Master pre-fork system-table replay. Builds the system-table family
-/// map (Phase 5 will populate non-zero values), then walks the SAL via
+/// map from the flushed LSNs, then walks the SAL via
 /// `recover_sal`. The closure ingests every committed FLAG_DDL_SYNC
 /// batch addressed to a system table — orphan COL_TAB rows from a
 /// crashed DDL are skipped because their zone never closed.
@@ -144,10 +162,7 @@ fn recover_system_tables_from_sal(sal_ptr: *const u8, catalog: &mut CatalogEngin
     });
 
     if replayed > 0 {
-        let msg = format!("SAL system table recovery: replayed {replayed} entries\n");
-        unsafe {
-            libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
-        }
+        boot_log(&format!("SAL system table recovery: replayed {replayed} entries\n"));
     }
 }
 
@@ -231,10 +246,7 @@ fn recover_from_sal(sal_reader: &SalReader, catalog: &mut CatalogEngine) -> Hash
     });
 
     if replayed > 0 {
-        let msg = format!("SAL recovery: replayed {replayed} blocks\n");
-        unsafe {
-            libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
-        }
+        boot_log(&format!("SAL recovery: replayed {replayed} blocks\n"));
     }
     pending
 }
@@ -307,12 +319,7 @@ fn rebuild_invalid_views(catalog: &mut CatalogEngine, dispatcher: &mut MasterDis
     invalid.sort_by_key(|&vid| catalog.dag.tables.get(&vid).map(|e| e.depth).unwrap_or(0));
     // Resume-vs-rebuild marker (asserted by the "no backfill on clean restart"
     // E2E): 0 ⇒ every view resumed from its checkpoint.
-    {
-        let msg = format!("recovery: rebuilding {} invalid view(s)\n", invalid.len());
-        unsafe {
-            libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
-        }
-    }
+    boot_log(&format!("recovery: rebuilding {} invalid view(s)\n", invalid.len()));
     for vid in invalid {
         for src in catalog.dag.get_source_ids(vid) {
             dispatcher.fan_out_backfill(vid, src)?;
@@ -354,30 +361,33 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
     let catalog_ptr = Box::into_raw(Box::new(catalog));
 
     let nw = num_workers as usize;
-    {
-        let msg = format!("Starting {num_workers} workers\n");
-        unsafe {
-            libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
-        }
-        let msg = format!("Worker logs: {}/worker_N.log (N=0..{})\n", data_dir, num_workers - 1);
-        unsafe {
-            libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
-        }
-    }
+    boot_log(&format!("Starting {num_workers} workers\n"));
+    boot_log(&format!(
+        "Worker logs: {}/worker_N.log (N=0..{})\n",
+        data_dir,
+        num_workers - 1
+    ));
 
     // --- Shared Append-Only Log (file-backed, master→all workers) ---
-    let sal_path = format!("{data_dir}/wal.sal\0");
-    let sal_fd = unsafe {
-        libc::open(
-            sal_path.as_ptr() as *const libc::c_char,
-            libc::O_RDWR | libc::O_CREAT,
-            0o644,
-        )
+    // A fresh file reads all-zero through O_CREAT + fallocate, which is
+    // exactly the empty-SAL state recovery expects.
+    let sal_fd = {
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o644)
+            .open(format!("{data_dir}/wal.sal"))
+        {
+            Ok(f) => std::os::fd::IntoRawFd::into_raw_fd(f),
+            Err(e) => {
+                gnitz_error!("failed to open SAL file: {e}");
+                return 1;
+            }
+        }
     };
-    if sal_fd < 0 {
-        gnitz_error!("failed to open SAL file");
-        return 1;
-    }
     posix_io::try_set_nocow(sal_fd);
     // Check existing size and fallocate if needed
     if posix_io::fd_size(sal_fd).unwrap_or(0) < sal_mmap_size() {
@@ -392,32 +402,6 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
     // MADV_POPULATE_WRITE (Linux 5.14+) installs dirty PTEs and triggers
     // the filesystem mkwrite callback upfront, without dirtying page contents.
     posix_io::madvise_populate_write(sal_ptr, sal_mmap_size());
-
-    // --- V2 migration: clean break, sentinel marker file ---
-    //
-    // Design 2 changes the SAL semantics (LSN as the atomic unit, commit
-    // sentinels mark zone closure). A pre-V2 SAL has no sentinels, so
-    // every uncommitted-by-the-new-rules group would be skipped at
-    // recovery — which would silently drop unflushed work.
-    //
-    // Contract: upgrading to V2 requires a clean shutdown. On first boot
-    // under V2, any pre-V2 SAL contents are discarded and shard files
-    // (durable up to the last checkpoint) are authoritative. The marker
-    // is touched once so subsequent boots skip the wipe.
-    {
-        let v2_marker_path = format!("{data_dir}/wal.sal.v2");
-        if !std::path::Path::new(&v2_marker_path).exists() {
-            unsafe {
-                libc::memset(sal_ptr as *mut libc::c_void, 0, sal_mmap_size());
-            }
-            posix_io::madvise_populate_write(sal_ptr, sal_mmap_size());
-            if let Err(e) = std::fs::File::create(&v2_marker_path) {
-                gnitz_error!("failed to create wal.sal.v2 marker: {e}");
-                return 1;
-            }
-            gnitz_info!("First boot under V2: pre-V2 SAL discarded, shards are authoritative");
-        }
-    }
 
     // --- System table SAL recovery (before forking workers) ---
     {
@@ -473,7 +457,6 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
     // --- W2M regions (memfd-backed, one per worker→master) ---
     let mut w2m_ptrs: Vec<*mut u8> = Vec::with_capacity(nw);
     let mut w2m_fds: Vec<i32> = Vec::with_capacity(nw);
-    let mut w2m_sizes: Vec<u64> = Vec::with_capacity(nw);
     for w in 0..nw {
         let name = format!("w2m_{w}");
         let wfd = posix_io::memfd_create(name.as_bytes());
@@ -498,7 +481,6 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
         }
         w2m_ptrs.push(wptr);
         w2m_fds.push(wfd);
-        w2m_sizes.push(W2M_REGION_SIZE as u64);
     }
 
     // --- M2W eventfds (master→worker signaling; W2M uses futex now) ---
@@ -513,17 +495,9 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
     }
 
     // Log fd assignments
-    {
-        let msg = format!("SAL fd={sal_fd}\n");
-        unsafe {
-            libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
-        }
-        for w in 0..nw {
-            let msg = format!("W{} m2w_efd={} w2m_fd={}\n", w, m2w_efds[w], w2m_fds[w]);
-            unsafe {
-                libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
-            }
-        }
+    boot_log(&format!("SAL fd={sal_fd}\n"));
+    for w in 0..nw {
+        boot_log(&format!("W{} m2w_efd={} w2m_fd={}\n", w, m2w_efds[w], w2m_fds[w]));
     }
 
     let master_pid = unsafe { libc::getpid() };
@@ -556,17 +530,21 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
             crate::foundation::worker_ctx::set_worker_rank(w as u32, num_workers);
 
             // Redirect stdout/stderr to worker log file
-            let log_path = format!("{data_dir}/worker_{w}.log\0");
-            unsafe {
-                let log_fd = libc::open(
-                    log_path.as_ptr() as *const libc::c_char,
-                    libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
-                    0o644,
-                );
-                if log_fd >= 0 {
-                    libc::dup2(log_fd, 1);
-                    libc::dup2(log_fd, 2);
-                    libc::close(log_fd);
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                if let Ok(f) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o644)
+                    .open(format!("{data_dir}/worker_{w}.log"))
+                {
+                    let log_fd = std::os::fd::IntoRawFd::into_raw_fd(f);
+                    unsafe {
+                        libc::dup2(log_fd, 1);
+                        libc::dup2(log_fd, 2);
+                        libc::close(log_fd);
+                    }
                 }
             }
 
@@ -615,16 +593,13 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
 
             catalog.invalidate_all_plans();
 
-            let msg = format!(
+            boot_log(&format!(
                 "Worker {} (pid {}) partitions [{}, {})\n",
                 w,
                 unsafe { libc::getpid() },
                 part_start,
                 part_end,
-            );
-            unsafe {
-                libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
-            }
+            ));
 
             // Re-init logging with worker tag
             let wtag = format!("W{w}");
@@ -632,7 +607,6 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
 
             let mut worker = WorkerProcess::new(
                 w as u32,
-                nw,
                 master_pid,
                 catalog_ptr,
                 sal_reader,
@@ -674,7 +648,7 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
         let atomic = &*(sal_ptr as *const AtomicU64);
         atomic.store(0, Ordering::Release);
     }
-    dispatcher.reset_sal(0, 1);
+    dispatcher.reset_sal();
 
     inject_recovery_panic("reset");
 
@@ -716,10 +690,7 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
             return 1;
         }
     };
-    let msg = b"GnitzDB ready\n";
-    unsafe {
-        libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
-    }
+    boot_log("GnitzDB ready\n");
 
     ServerExecutor::run(catalog_ptr, dispatcher_ptr, server_fd)
 }
@@ -733,24 +704,7 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
 mod recovery_tests {
     use super::*;
     use crate::runtime::sal::{sal_write_group, SalReader, SalWriter, MAX_WORKERS};
-
-    unsafe fn alloc_mmap(size: usize) -> *mut u8 {
-        let ptr = libc::mmap(
-            std::ptr::null_mut(),
-            size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANONYMOUS | libc::MAP_SHARED,
-            -1,
-            0,
-        );
-        assert_ne!(ptr, libc::MAP_FAILED);
-        std::ptr::write_bytes(ptr as *mut u8, 0, size);
-        ptr as *mut u8
-    }
-
-    unsafe fn free_mmap(ptr: *mut u8, size: usize) {
-        libc::munmap(ptr as *mut libc::c_void, size);
-    }
+    use crate::test_support::SharedRegion;
 
     /// Write one DDL_SYNC-flagged group with a 1-byte payload per worker.
     /// Returns the new cursor.
@@ -764,22 +718,8 @@ mod recovery_tests {
         size: u64,
     ) -> u64 {
         let payload = [0u8; 64];
-        let ptrs: Vec<*const u8> = (0..nw).map(|_| payload.as_ptr()).collect();
-        let sizes: Vec<u32> = (0..nw).map(|_| payload.len() as u32).collect();
-        let res = sal_write_group(
-            ptr,
-            cursor,
-            nw,
-            target_id,
-            lsn,
-            FLAG_DDL_SYNC,
-            epoch,
-            size,
-            ptrs.as_ptr(),
-            sizes.as_ptr(),
-        );
-        assert_eq!(res.status, 0);
-        res.new_cursor
+        let payloads: Vec<&[u8]> = (0..nw).map(|_| payload.as_slice()).collect();
+        sal_write_group(ptr, cursor, target_id, lsn, FLAG_DDL_SYNC, epoch, size, &payloads).expect("group fits")
     }
 
     #[test]
@@ -791,7 +731,8 @@ mod recovery_tests {
         // here).
         unsafe {
             let size = 1 << 20;
-            let ptr = alloc_mmap(size);
+            let region = SharedRegion::new(size);
+            let ptr = region.ptr();
             let nw = 2u32;
 
             let mut cur = write_ddl_group(ptr, 0, nw, 100, 5, 1, size as u64);
@@ -813,7 +754,6 @@ mod recovery_tests {
             for &e in &efds {
                 libc::close(e);
             }
-            free_mmap(ptr, size);
         }
     }
 
@@ -824,7 +764,8 @@ mod recovery_tests {
         // would then apply each of the three groups.
         unsafe {
             let size = 1 << 20;
-            let ptr = alloc_mmap(size);
+            let region = SharedRegion::new(size);
+            let ptr = region.ptr();
             let nw = 3u32;
 
             let mut cur = write_ddl_group(ptr, 0, nw, 200, 9, 1, size as u64);
@@ -869,7 +810,6 @@ mod recovery_tests {
             for &e in &efds {
                 libc::close(e);
             }
-            free_mmap(ptr, size);
         }
     }
 
@@ -881,25 +821,13 @@ mod recovery_tests {
         // that branch is gone now that the committer emits sentinels.
         unsafe {
             let size = 1 << 20;
-            let ptr = alloc_mmap(size);
+            let region = SharedRegion::new(size);
+            let ptr = region.ptr();
             let nw = 1u32;
 
             let payload = [0u8; 32];
-            let ptrs = [payload.as_ptr()];
-            let sizes = [payload.len() as u32];
-            let res = sal_write_group(
-                ptr,
-                0,
-                nw,
-                50,
-                11,
-                FLAG_PUSH,
-                1,
-                size as u64,
-                ptrs.as_ptr(),
-                sizes.as_ptr(),
-            );
-            assert_eq!(res.status, 0);
+            sal_write_group(ptr, 0, 50, 11, FLAG_PUSH, 1, size as u64, &[&payload]).expect("group fits");
+            let _ = nw;
             // No sentinel — zone unclosed.
 
             let efd = posix_io::eventfd_create();
@@ -912,7 +840,6 @@ mod recovery_tests {
 
             let _ = MAX_WORKERS;
             libc::close(efd);
-            free_mmap(ptr, size);
         }
     }
 }

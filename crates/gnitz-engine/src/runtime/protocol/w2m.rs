@@ -360,41 +360,24 @@ mod tests {
     use super::*;
     use crate::foundation::codec::align8;
     use crate::runtime::w2m_ring::{self, W2mRingHeader, W2M_HEADER_SIZE};
+    use crate::test_support::SharedRegion;
     use std::sync::atomic::Ordering;
 
-    unsafe fn alloc_region(size: usize) -> *mut u8 {
-        let ptr = libc::mmap(
-            std::ptr::null_mut(),
-            size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANONYMOUS | libc::MAP_SHARED,
-            -1,
-            0,
-        );
-        assert_ne!(ptr, libc::MAP_FAILED);
-        std::ptr::write_bytes(ptr as *mut u8, 0, size);
-        ptr as *mut u8
-    }
-
-    unsafe fn free_region(ptr: *mut u8, size: usize) {
-        libc::munmap(ptr as *mut libc::c_void, size);
-    }
-
     /// Allocate a ring that holds at most `n_msgs` messages of `msg_sz` bytes.
-    unsafe fn make_ring(msg_sz: usize, n_msgs: usize) -> (*mut u8, usize, u64) {
+    unsafe fn make_ring(msg_sz: usize, n_msgs: usize) -> (SharedRegion, u64) {
         let msg_total = 8 + align8(msg_sz) as u64;
         let capacity = W2M_HEADER_SIZE as u64 + n_msgs as u64 * msg_total + 8;
-        let size = capacity as usize;
-        let ptr = alloc_region(size);
-        w2m_ring::init_region_for_tests(ptr, capacity);
-        (ptr, size, capacity)
+        let region = SharedRegion::new(capacity as usize);
+        w2m_ring::init_region_for_tests(region.ptr(), capacity);
+        (region, capacity)
     }
 
     /// Slots released in push order: consume_cursor advances one step at a time.
     #[test]
     fn test_w2m_slot_in_order_release() {
         unsafe {
-            let (ptr, size, capacity) = make_ring(64, 4);
+            let (region, capacity) = make_ring(64, 4);
+            let ptr = region.ptr();
             let writer = W2mWriter::new(ptr, capacity);
             let receiver = W2mReceiver::new(vec![ptr]);
             let hdr = receiver.header(0);
@@ -431,8 +414,6 @@ mod tests {
                 new_vrc_b,
                 "consume_cursor must advance to new_vrc_b after slot B drop",
             );
-
-            free_region(ptr, size);
         }
     }
 
@@ -441,7 +422,8 @@ mod tests {
     #[test]
     fn test_w2m_slot_out_of_order_release() {
         unsafe {
-            let (ptr, size, capacity) = make_ring(64, 4);
+            let (region, capacity) = make_ring(64, 4);
+            let ptr = region.ptr();
             let writer = W2mWriter::new(ptr, capacity);
             let receiver = W2mReceiver::new(vec![ptr]);
             let hdr = receiver.header(0);
@@ -474,8 +456,6 @@ mod tests {
                 new_vrc_b,
                 "consume_cursor must advance through both A and B on head release",
             );
-
-            free_region(ptr, size);
         }
     }
 
@@ -487,8 +467,8 @@ mod tests {
             let msg_total = 8 + align8(msg_sz) as u64;
             // Ring holds exactly 1 message.
             let capacity = W2M_HEADER_SIZE as u64 + msg_total + 8;
-            let size = capacity as usize;
-            let ptr = alloc_region(size);
+            let region = SharedRegion::new(capacity as usize);
+            let ptr = region.ptr();
             w2m_ring::init_region_for_tests(ptr, capacity);
 
             // Fill the ring (non-blocking direct call).
@@ -525,8 +505,6 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .expect("writer thread did not complete within 5 seconds");
             handle.join().expect("writer thread panicked");
-
-            free_region(ptr, size);
         }
     }
 
@@ -538,7 +516,8 @@ mod tests {
     #[test]
     fn release_retires_full_64_prefix_without_ub() {
         unsafe {
-            let (ptr, size, capacity) = make_ring(8, 64);
+            let (region, capacity) = make_ring(8, 64);
+            let ptr = region.ptr();
             let writer = W2mWriter::new(ptr, capacity);
             let receiver = W2mReceiver::new(vec![ptr]);
             let hdr = receiver.header(0);
@@ -571,8 +550,6 @@ mod tests {
                 last_vrc,
                 "head release must retire the full 64-slot prefix to the last new_vrc",
             );
-
-            free_region(ptr, size);
         }
     }
 
@@ -583,9 +560,9 @@ mod tests {
     #[test]
     fn test_wait_for_misses_publish_on_other_ring() {
         unsafe {
-            let rings: Vec<(*mut u8, usize, u64)> = (0..4).map(|_| make_ring(64, 4)).collect();
-            let receiver = W2mReceiver::new(rings.iter().map(|r| r.0).collect());
-            let (pub_ptr, pub_cap) = (rings[3].0 as usize, rings[3].2);
+            let rings: Vec<(SharedRegion, u64)> = (0..4).map(|_| make_ring(64, 4)).collect();
+            let receiver = W2mReceiver::new(rings.iter().map(|r| r.0.ptr()).collect());
+            let (pub_ptr, pub_cap) = (rings[3].0.ptr() as usize, rings[3].1);
             let handle = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 W2mWriter::new(pub_ptr as *mut u8, pub_cap).send_encoded(64, 0, |s| s[0] = 7);
@@ -599,9 +576,6 @@ mod tests {
                 "wait_for(0) must sleep the full ceiling, slept {elapsed}ms"
             );
             assert!(receiver.try_read_slot(3).is_some(), "ring 3 really did publish");
-            for (ptr, size, _) in rings {
-                free_region(ptr, size);
-            }
         }
     }
 
@@ -610,9 +584,9 @@ mod tests {
     #[test]
     fn test_wait_any_woken_by_publish_on_other_ring() {
         unsafe {
-            let rings: Vec<(*mut u8, usize, u64)> = (0..4).map(|_| make_ring(64, 4)).collect();
-            let receiver = W2mReceiver::new(rings.iter().map(|r| r.0).collect());
-            let (pub_ptr, pub_cap) = (rings[3].0 as usize, rings[3].2);
+            let rings: Vec<(SharedRegion, u64)> = (0..4).map(|_| make_ring(64, 4)).collect();
+            let receiver = W2mReceiver::new(rings.iter().map(|r| r.0.ptr()).collect());
+            let (pub_ptr, pub_cap) = (rings[3].0.ptr() as usize, rings[3].1);
             let handle = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 W2mWriter::new(pub_ptr as *mut u8, pub_cap).send_encoded(64, 0, |s| s[0] = 7);
@@ -626,9 +600,6 @@ mod tests {
                 "wait_any must be woken by ring 3's publish, slept {elapsed}ms"
             );
             assert!(receiver.try_read_slot(3).is_some(), "ring 3 really did publish");
-            for (ptr, size, _) in rings {
-                free_region(ptr, size);
-            }
         }
     }
 
@@ -637,8 +608,8 @@ mod tests {
     #[test]
     fn test_wait_any_times_out_with_no_publisher() {
         unsafe {
-            let rings: Vec<(*mut u8, usize, u64)> = (0..1).map(|_| make_ring(64, 4)).collect();
-            let receiver = W2mReceiver::new(rings.iter().map(|r| r.0).collect());
+            let rings: Vec<(SharedRegion, u64)> = (0..1).map(|_| make_ring(64, 4)).collect();
+            let receiver = W2mReceiver::new(rings.iter().map(|r| r.0.ptr()).collect());
             let start = std::time::Instant::now();
             let rc = receiver.wait_any(&[0], 200);
             let elapsed = start.elapsed().as_millis();
@@ -647,9 +618,6 @@ mod tests {
                 (150..1000).contains(&elapsed),
                 "wait_any should sleep ~200ms, slept {elapsed}ms"
             );
-            for (ptr, size, _) in rings {
-                free_region(ptr, size);
-            }
         }
     }
 }

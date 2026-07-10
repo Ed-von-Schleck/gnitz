@@ -303,7 +303,7 @@ fn seek_family_bytes_matches_seek_family_narrow() {
         // seek_family_bytes takes the at-rest OPK bytes; for an unsigned U64 PK
         // that is big-endian. seek_family takes the native u128 and OPK-encodes.
         let bytes = key.to_be_bytes();
-        let via_u128 = engine.seek_family(tid, key as u128, &[]).unwrap();
+        let via_u128 = engine.seek_family(tid, key as u128, &[]).unwrap().0;
         let via_bytes = engine.seek_family_bytes(tid, &bytes).unwrap();
         assert_eq!(
             via_u128.is_some(),

@@ -37,10 +37,6 @@ impl WorkerProcess {
         source_id: i64,
         tick_request_id: u64,
     ) -> Batch {
-        if let Some(stashed) = self.exchange.stash.remove(&view_id) {
-            return stashed;
-        }
-
         let schema = batch.schema;
         // During a backfill, stamp this chunk's pad bit onto the FLAG_EXCHANGE so
         // the master can AND it across workers and decide termination. Outside a

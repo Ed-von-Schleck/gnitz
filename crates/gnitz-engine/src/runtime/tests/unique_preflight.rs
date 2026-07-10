@@ -66,22 +66,12 @@ fn producer_of(keys: &[PkBuf]) -> KeyProducer {
 
 fn with_test_ring(f: impl FnOnce(&W2mWriter, &W2mReceiver)) {
     const CAP: usize = 1 << 20;
-    let region = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            CAP,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANONYMOUS | libc::MAP_SHARED,
-            -1,
-            0,
-        ) as *mut u8
-    };
-    assert!(!region.is_null());
-    unsafe { w2m_ring::init_region_for_tests(region, CAP as u64) };
-    let writer = W2mWriter::new(region, CAP as u64);
-    let receiver = W2mReceiver::new(vec![region]);
+    let region = crate::test_support::SharedRegion::new(CAP);
+    let ptr = region.ptr();
+    unsafe { w2m_ring::init_region_for_tests(ptr, CAP as u64) };
+    let writer = W2mWriter::new(ptr, CAP as u64);
+    let receiver = W2mReceiver::new(vec![ptr]);
     f(&writer, &receiver);
-    unsafe { libc::munmap(region as *mut libc::c_void, CAP) };
 }
 
 /// Drain every frame of one pre-flight train from the ring, asserting the
@@ -120,12 +110,11 @@ fn drain_train(receiver: &W2mReceiver, expected_req_id: u64) -> Vec<PkBuf> {
             );
         }
         let server_version = gnitz_wire::wire_flags_get_schema_version(ctrl.flags);
-        let ctrl_size = ctrl.block_size;
         let hint = saved_schema.as_ref().map(|(s, v)| SchemaWithVersion {
             descriptor: s,
             version: *v,
         });
-        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(slot.bytes(), ctrl_size, ctrl, hint).expect("frame decodes");
+        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(slot.bytes(), ctrl, hint).expect("frame decodes");
         if saved_schema.is_none() {
             let s = zc.schema.expect("first frame schema");
             // The reply schema's PK region IS the OPK leading-key span; every

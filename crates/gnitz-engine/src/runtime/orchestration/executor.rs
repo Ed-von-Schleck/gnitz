@@ -39,15 +39,13 @@ use crate::runtime::wire::{
 use crate::schema::{index_meta_schema_desc, validate_schema_match, SchemaDescriptor, INDEX_META_COL_NAMES};
 use crate::storage::{Batch, BatchBuilder};
 
-const TICK_COALESCE_ROWS: usize = 10_000;
+pub(crate) const TICK_COALESCE_ROWS: usize = 10_000;
 const TICK_DEADLINE_MS: u64 = 20;
 const WORKER_WATCH_MS: u64 = 100;
 
-const FLAG_ALLOCATE_TABLE_ID: u64 = 1;
-const FLAG_ALLOCATE_SCHEMA_ID: u64 = 2;
-const FLAG_SEEK: u64 = 128;
-const FLAG_SEEK_BY_INDEX: u64 = 256;
-const FLAG_ALLOCATE_INDEX_ID: u64 = 512;
+use gnitz_wire::{
+    FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_TABLE_ID, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
+};
 
 /// One tick request to `tick_loop_async`.
 pub enum TickTrigger {
@@ -105,7 +103,6 @@ pub struct Shared {
     /// Per-table row counter feeding the tick threshold.
     tick_rows: Rc<RefCell<FxHashMap<i64, usize>>>,
     tick_tids: Rc<RefCell<Vec<i64>>>,
-    t_last_push: Rc<Cell<Option<Instant>>>,
     table_locks: RefCell<FxHashMap<i64, Rc<AsyncMutex<()>>>>,
     /// Set true by the graceful-shutdown watcher before it sends the final
     /// Shutdown barrier, so `handle_message`'s push path rejects new pushes
@@ -135,26 +132,11 @@ impl Shared {
     /// DDL modifies the table.
     fn get_schema_wire_block(&self, target_id: i64) -> (Rc<Vec<u8>>, u16) {
         let cat = self.cat();
-        if let Some(cached) = cat.get_cached_schema_wire_block(target_id) {
-            return (cached.block, cached.version);
-        }
         let schema = cat
             .get_schema_desc(target_id)
             .unwrap_or_else(SchemaDescriptor::minimal_u64);
-        let col_names = cat.get_col_names_bytes(target_id);
-        let hidden = cat.get_col_hidden_mask(target_id);
-        let (name_refs, n) = ipc::col_names_as_refs(&col_names);
-        let names_slice = &name_refs[..n];
-        let block = Rc::new(ipc::build_schema_wire_block(
-            &schema,
-            names_slice,
-            hidden,
-            target_id as u32,
-        ));
-        let version = cat.get_schema_version(target_id);
-        let (wire_safe, wire_row_stride) = crate::runtime::sal::compute_wire_props(&schema);
-        cat.set_schema_wire_block(target_id, block.clone(), wire_safe, wire_row_stride);
-        (block, version)
+        let e = ipc::get_or_build_schema_wire_block(cat, target_id, &schema);
+        (e.block, e.version)
     }
 
     fn table_lock(&self, tid: i64) -> Rc<AsyncMutex<()>> {
@@ -183,7 +165,6 @@ impl Shared {
         let mut tids = self.tick_tids.borrow_mut();
         out.extend(tids.drain(..));
         self.tick_rows.borrow_mut().clear();
-        self.t_last_push.set(None);
     }
 }
 
@@ -221,7 +202,6 @@ impl ServerExecutor {
         let last_tick_lsn = Rc::new(Cell::new(initial_lsn));
         let tick_rows: Rc<RefCell<FxHashMap<i64, usize>>> = Rc::new(RefCell::new(FxHashMap::default()));
         let tick_tids: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
-        let t_last_push = Rc::new(Cell::new(None));
 
         let (committer_tx, committer_rx) = mpsc::unbounded::<CommitRequest>();
         let (tick_tx, tick_rx) = mpsc::unbounded::<TickTrigger>();
@@ -242,7 +222,6 @@ impl ServerExecutor {
             num_workers,
             tick_rows: Rc::clone(&tick_rows),
             tick_tids: Rc::clone(&tick_tids),
-            t_last_push: Rc::clone(&t_last_push),
             tick_tx: tick_tx.clone(),
         });
         let shared = Rc::new(Shared {
@@ -258,7 +237,6 @@ impl ServerExecutor {
             last_tick_lsn: Rc::clone(&last_tick_lsn),
             tick_rows: Rc::clone(&tick_rows),
             tick_tids: Rc::clone(&tick_tids),
-            t_last_push: Rc::clone(&t_last_push),
             table_locks: RefCell::new(FxHashMap::default()),
             draining: Rc::clone(&draining),
         });
@@ -602,8 +580,7 @@ async fn run_tick(
     let emit_err = guard_panic("tick", || unsafe {
         let disp = &mut *shared.dispatcher;
         for (i, &tid) in tids.iter().enumerate() {
-            let lsn = disp.next_lsn();
-            disp.write_tick_group(tid, lsn, &req_ids[i * nw..(i + 1) * nw])?;
+            disp.write_tick_group(tid, &req_ids[i * nw..(i + 1) * nw])?;
         }
         disp.signal_all();
         Ok(())
@@ -705,13 +682,12 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
 // ---------------------------------------------------------------------------
 
 async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>, bound_client_id: Option<u64>) {
-    // Routing fast path: read (target_id, client_id) directly from the
-    // control block's directory without allocating or running the full
-    // decode. The auth check below uses the same parse the schema-hint
-    // lookup uses; a forged directory cannot point one at an authorized
-    // id and the other at a different region.
-    let (peeked_target_id, peeked_client_id) = match ipc::peek_routing_header(data) {
-        Ok(v) => v,
+    // ONE control-block parse for the whole request: the routing/auth check,
+    // the schema-hint decision, and the full decode below all read this same
+    // parse, so a malicious client cannot forge a directory that points the
+    // auth check at one region and the decoder at another.
+    let ctrl = match ipc::peek_client_control(data) {
+        Ok(c) => c,
         Err(e) => {
             let msg = format!("decode error: {e}");
             send_error(peer, 0, 0, msg.as_bytes()).await;
@@ -719,12 +695,12 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>, bound_cli
         }
     };
     if let Some(bound) = bound_client_id {
-        if peeked_client_id != bound {
+        if ctrl.client_id != bound {
             // Reject before any heap-allocating decode path. A forged
             // client_id never reaches Batch::decode_from_wal_block.
             send_error(
                 peer,
-                peeked_target_id as i64,
+                ctrl.target_id as i64,
                 bound,
                 b"client_id not bound to this connection",
             )
@@ -735,49 +711,42 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>, bound_cli
 
     // Decode the frame. Schema-less PUSH frames (warm-cache path) have
     // FLAG_HAS_DATA but not FLAG_HAS_SCHEMA; they need a catalog hint.
-    let mut decoded = {
-        let ctrl = match ipc::peek_control_block(data) {
-            Ok(c) => c,
-            Err(e) => {
-                let msg = format!("decode error: {e}");
-                send_error(peer, 0, 0, msg.as_bytes()).await;
-                return;
-            }
-        };
+    let decoded = {
         let has_schema = (ctrl.flags & ipc::FLAG_HAS_SCHEMA) != 0;
         let has_data = (ctrl.flags & ipc::FLAG_HAS_DATA) != 0;
+        let (ctrl_target_id, ctrl_client_id) = (ctrl.target_id as i64, ctrl.client_id);
         if has_data && !has_schema {
             let client_version = ipc::wire_flags_get_schema_version(ctrl.flags);
             if client_version == 0 {
                 send_error(
                     peer,
-                    ctrl.target_id as i64,
-                    ctrl.client_id,
+                    ctrl_target_id,
+                    ctrl_client_id,
                     b"FLAG_HAS_DATA without FLAG_HAS_SCHEMA",
                 )
                 .await;
                 return;
             }
-            let server_version = shared.cat().get_schema_version(ctrl.target_id as i64);
+            let server_version = shared.cat().get_schema_version(ctrl_target_id);
             if client_version != server_version {
-                send_control_only(peer, ctrl.target_id as i64, ctrl.client_id, STATUS_SCHEMA_MISMATCH).await;
+                send_control_only(peer, ctrl_target_id, ctrl_client_id, STATUS_SCHEMA_MISMATCH).await;
                 return;
             }
-            let catalog_schema = shared.get_schema_desc(ctrl.target_id as i64);
+            let catalog_schema = shared.get_schema_desc(ctrl_target_id);
             let hint = SchemaWithVersion {
                 descriptor: &catalog_schema,
                 version: server_version,
             };
-            match ipc::decode_wire_with_hint(data, hint) {
+            match decode_client_wire(data, ctrl, Some(hint)) {
                 Ok(d) => d,
                 Err(e) => {
                     let msg = format!("decode error: {e}");
-                    send_error(peer, ctrl.target_id as i64, ctrl.client_id, msg.as_bytes()).await;
+                    send_error(peer, ctrl_target_id, ctrl_client_id, msg.as_bytes()).await;
                     return;
                 }
             }
         } else {
-            match ipc::decode_wire(data) {
+            match decode_client_wire(data, ctrl, None) {
                 Ok(d) => d,
                 Err(e) => {
                     let msg = format!("decode error: {e}");
@@ -787,15 +756,6 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>, bound_cli
             }
         }
     };
-
-    // Trust boundary: FLAG_BATCH_SORTED / FLAG_BATCH_CONSOLIDATED assert "already
-    // sorted/consolidated, skip the work." A client must never be trusted to claim
-    // that, so neutralize them on every client-decoded batch; downstream
-    // consolidation (the catalog DDL ingest and the commit path) then re-establishes
-    // the invariants. No-op for conforming clients, which never set these.
-    if let Some(b) = decoded.data_batch.as_mut() {
-        b.downgrade();
-    }
 
     let client_id = decoded.control.client_id;
     let target_id = decoded.control.target_id as i64;
@@ -828,18 +788,16 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>, bound_cli
 
     // ---------- ID allocations ----------
     if target_id == 0 {
-        if flags & FLAG_ALLOCATE_TABLE_ID != 0 {
-            let new_id = shared.cat().allocate_table_id();
-            send_alloc(peer, new_id, client_id).await;
-            return;
-        }
-        if flags & FLAG_ALLOCATE_SCHEMA_ID != 0 {
-            let new_id = shared.cat().allocate_schema_id();
-            send_alloc(peer, new_id, client_id).await;
-            return;
-        }
-        if flags & FLAG_ALLOCATE_INDEX_ID != 0 {
-            let new_id = shared.cat().allocate_index_id();
+        let alloc = if flags & FLAG_ALLOCATE_TABLE_ID != 0 {
+            Some(shared.cat().allocate_table_id())
+        } else if flags & FLAG_ALLOCATE_SCHEMA_ID != 0 {
+            Some(shared.cat().allocate_schema_id())
+        } else if flags & FLAG_ALLOCATE_INDEX_ID != 0 {
+            Some(shared.cat().allocate_index_id())
+        } else {
+            None
+        };
+        if let Some(new_id) = alloc {
             send_alloc(peer, new_id, client_id).await;
             return;
         }
@@ -940,7 +898,11 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>, bound_cli
     }
 
     // ---------- Schema validation on incoming data ----------
-    if has_batch {
+    // Only when the client actually shipped a schema block (cold push): on
+    // the warm schema-less path the decode hint substituted the catalog's
+    // own descriptor, so `decoded.schema` would just validate the catalog
+    // schema against itself — pure overhead on every warm INSERT.
+    if has_batch && flags & ipc::FLAG_HAS_SCHEMA != 0 {
         if let Some(ref wire_schema) = decoded.schema {
             let expected = shared.get_schema_desc(target_id);
             if let Err(e) = validate_schema_match(wire_schema, &expected) {
@@ -1040,9 +1002,7 @@ async fn handle_seek(
     seek_pk_extra: &[u8],
     client_version: u16,
 ) {
-    if !shared.cat().has_id(target_id) {
-        let msg = format!("table {target_id} not found");
-        send_error(peer, target_id, client_id, msg.as_bytes()).await;
+    if reject_unknown_table(shared, peer, client_id, target_id).await {
         return;
     }
     if target_id >= FIRST_USER_TABLE_ID {
@@ -1061,10 +1021,50 @@ async fn handle_seek(
         }
     } else {
         match unsafe { (*shared.catalog).seek_family(target_id, pk, seek_pk_extra) } {
-            Ok(batch) => send_ok_response(shared, peer, target_id, batch.as_ref(), client_id, pk, client_version).await,
+            Ok((batch, _)) => {
+                send_ok_response(shared, peer, target_id, batch.as_ref(), client_id, pk, client_version).await
+            }
             Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
         }
     }
+}
+
+/// Decode a CLIENT-supplied frame and neutralize any client-claimed batch
+/// layout flags. FLAG_BATCH_SORTED / FLAG_BATCH_CONSOLIDATED assert "already
+/// sorted/consolidated, skip the work" — a client must never be trusted to
+/// claim that, so every client-boundary decode goes through this (or its
+/// sibling `decode_client_batch`); downstream consolidation (the catalog DDL
+/// ingest and the commit path) re-establishes the invariants. No-op for
+/// conforming clients, which never set these.
+fn decode_client_wire(
+    data: &[u8],
+    ctrl: ipc::DecodedControl,
+    hint: Option<SchemaWithVersion<'_>>,
+) -> Result<ipc::DecodedWire, &'static str> {
+    let mut decoded = ipc::decode_wire_with_ctrl(data, ctrl, hint)?;
+    if let Some(b) = decoded.data_batch.as_mut() {
+        b.downgrade();
+    }
+    Ok(decoded)
+}
+
+/// `decode_client_wire`'s sibling for a raw WAL-block family batch inside a
+/// client FLAG_DDL_TXN bundle: decode + neutralize the layout claim.
+fn decode_client_batch(slice: &[u8], schema: &SchemaDescriptor) -> Result<Batch, &'static str> {
+    let (mut b, _) = Batch::decode_from_wal_block(slice, schema, false)?;
+    b.downgrade();
+    Ok(b)
+}
+
+/// Reject a request addressed to an unknown table id. Returns `true` when
+/// the error reply was sent and the caller must return.
+async fn reject_unknown_table(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64) -> bool {
+    if shared.cat().has_id(target_id) {
+        return false;
+    }
+    let msg = format!("table {target_id} not found");
+    send_error(peer, target_id, client_id, msg.as_bytes()).await;
+    true
 }
 
 /// Decode `seek_col_idx` (`pack_pk_cols(col_indices)` — the packed flag at bit
@@ -1098,9 +1098,7 @@ async fn handle_seek_by_index(
     seek_pk_extra: &[u8],
     client_version: u16,
 ) {
-    if !shared.cat().has_id(target_id) {
-        let msg = format!("table {target_id} not found");
-        send_error(peer, target_id, client_id, msg.as_bytes()).await;
+    if reject_unknown_table(shared, peer, client_id, target_id).await {
         return;
     }
     if target_id >= FIRST_USER_TABLE_ID {
@@ -1201,9 +1199,7 @@ async fn handle_seek_by_index_range(
     seek_pk_extra: &[u8],
     client_version: u16,
 ) {
-    if !shared.cat().has_id(target_id) {
-        let msg = format!("table {target_id} not found");
-        send_error(peer, target_id, client_id, msg.as_bytes()).await;
+    if reject_unknown_table(shared, peer, client_id, target_id).await {
         return;
     }
     if target_id < FIRST_USER_TABLE_ID {
@@ -1327,9 +1323,7 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id
         }
     }
     let _g = shared.catalog_rwlock.read().await;
-    if !shared.cat().has_id(target_id) {
-        let msg = format!("table {target_id} not found");
-        send_error(peer, target_id, client_id, msg.as_bytes()).await;
+    if reject_unknown_table(shared, peer, client_id, target_id).await {
         return;
     }
     // A replicated relation (a replicated base table, or a view all of whose
@@ -1370,30 +1364,21 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id
         client_version
     };
 
-    let result = if replicated {
-        MasterDispatcher::fan_out_scan_single_worker_async(
-            shared.dispatcher,
-            &shared.reactor,
-            &shared.sal_writer_excl,
-            target_id,
-            0,
-            client_id,
-            peer,
-            effective_client_version,
-        )
-        .await
-    } else {
-        MasterDispatcher::fan_out_scan_async(
-            shared.dispatcher,
-            &shared.reactor,
-            &shared.sal_writer_excl,
-            target_id,
-            client_id,
-            peer,
-            effective_client_version,
-        )
-        .await
-    };
+    // A replicated relation single-sources from worker 0 (its full copy
+    // lives on every worker; an all-worker fan-out would concatenate W
+    // identical copies).
+    let unicast = if replicated { 0 } else { -1 };
+    let result = MasterDispatcher::fan_out_scan_async(
+        shared.dispatcher,
+        &shared.reactor,
+        &shared.sal_writer_excl,
+        unicast,
+        target_id,
+        client_id,
+        peer,
+        effective_client_version,
+    )
+    .await;
     match result {
         Ok(true) => {
             let terminal = make_terminal_scan_frame(target_id, client_id, lsn);
@@ -1438,7 +1423,7 @@ async fn handle_system_scan(
     let _g = shared.catalog_rwlock.read().await;
     let cat_ptr = shared.catalog;
     match guard_panic("scan", || unsafe { (*cat_ptr).scan_family(target_id) }) {
-        Ok(b) => {
+        Ok((b, _)) => {
             let batch_ref = if b.count > 0 { Some(b) } else { None };
             send_ok_response(
                 shared,
@@ -1514,13 +1499,8 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
                 return;
             }
         };
-        match Batch::decode_from_wal_block(slice, &schema, false) {
-            Ok((mut b, _)) => {
-                // Trust boundary: neutralize any client-claimed sorted/consolidated
-                // flags; the catalog ingest re-establishes them.
-                b.downgrade();
-                families.push((tid, b));
-            }
+        match decode_client_batch(slice, &schema) {
+            Ok(b) => families.push((tid, b)),
             Err(e) => {
                 let msg = format!("DDL_TXN family {tid} decode error: {e}");
                 send_error(peer, 0, client_id, msg.as_bytes()).await;

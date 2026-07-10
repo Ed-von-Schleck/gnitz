@@ -1,6 +1,7 @@
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
 use crate::runtime::w2m_ring;
 use crate::runtime::wire::{encode_wire_into, wire_size, STATUS_OK};
+use crate::test_support::SharedRegion;
 
 #[test]
 fn test_w2m_concurrent_publish_consume_ordered() {
@@ -10,22 +11,13 @@ fn test_w2m_concurrent_publish_consume_ordered() {
     const CAP: usize = 8 * 1024;
     const N: u64 = 2_000;
 
-    let region = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            CAP,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANONYMOUS | libc::MAP_SHARED,
-            -1,
-            0,
-        ) as *mut u8
-    };
-    assert!(!region.is_null());
+    let region = SharedRegion::new(CAP);
+    let ptr = region.ptr();
     unsafe {
-        w2m_ring::init_region_for_tests(region, CAP as u64);
+        w2m_ring::init_region_for_tests(ptr, CAP as u64);
     }
 
-    let region_addr = region as usize;
+    let region_addr = ptr as usize;
     let done = Arc::new(AtomicBool::new(false));
     let done_w = Arc::clone(&done);
     let writer_thread = std::thread::spawn(move || {
@@ -55,7 +47,7 @@ fn test_w2m_concurrent_publish_consume_ordered() {
         done_w.store(true, Ordering::Release);
     });
 
-    let receiver = W2mReceiver::new(vec![region]);
+    let receiver = W2mReceiver::new(vec![ptr]);
     let mut next_expected: u64 = 1;
     let started = std::time::Instant::now();
     while next_expected <= N {
@@ -79,9 +71,6 @@ fn test_w2m_concurrent_publish_consume_ordered() {
     }
 
     writer_thread.join().expect("writer thread");
-    unsafe {
-        libc::munmap(region as *mut libc::c_void, CAP);
-    }
 }
 
 #[test]
@@ -93,22 +82,13 @@ fn test_w2m_concurrent_large_messages_ordered() {
     const N: u64 = 500;
     let pad: Vec<u8> = vec![b'x'; 4000];
 
-    let region = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            CAP,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANONYMOUS | libc::MAP_SHARED,
-            -1,
-            0,
-        ) as *mut u8
-    };
-    assert!(!region.is_null());
+    let region = SharedRegion::new(CAP);
+    let ptr = region.ptr();
     unsafe {
-        w2m_ring::init_region_for_tests(region, CAP as u64);
+        w2m_ring::init_region_for_tests(ptr, CAP as u64);
     }
 
-    let region_addr = region as usize;
+    let region_addr = ptr as usize;
     let done = Arc::new(AtomicBool::new(false));
     let done_w = Arc::clone(&done);
     let pad_w = pad.clone();
@@ -139,7 +119,7 @@ fn test_w2m_concurrent_large_messages_ordered() {
         done_w.store(true, Ordering::Release);
     });
 
-    let receiver = W2mReceiver::new(vec![region]);
+    let receiver = W2mReceiver::new(vec![ptr]);
     let mut next_expected: u64 = 1;
     let started = std::time::Instant::now();
     while next_expected <= N {
@@ -164,30 +144,18 @@ fn test_w2m_concurrent_large_messages_ordered() {
     }
 
     writer_thread.join().expect("writer thread");
-    unsafe {
-        libc::munmap(region as *mut libc::c_void, CAP);
-    }
 }
 
 #[test]
 fn test_w2m_writer_rejects_oversized() {
     const CAP: usize = 64 * 1024;
-    let region = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            CAP,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANONYMOUS | libc::MAP_SHARED,
-            -1,
-            0,
-        ) as *mut u8
-    };
-    assert!(!region.is_null());
+    let region = SharedRegion::new(CAP);
+    let ptr = region.ptr();
     unsafe {
-        w2m_ring::init_region_for_tests(region, CAP as u64);
+        w2m_ring::init_region_for_tests(ptr, CAP as u64);
     }
 
-    let region_addr = region as usize;
+    let region_addr = ptr as usize;
     let (tx, rx) = std::sync::mpsc::channel::<bool>();
     std::thread::spawn(move || {
         let writer = W2mWriter::new(region_addr as *mut u8, CAP as u64);
@@ -205,31 +173,18 @@ fn test_w2m_writer_rejects_oversized() {
              must panic instead of spinning on Full forever"
         ),
     }
-
-    unsafe {
-        libc::munmap(region as *mut libc::c_void, CAP);
-    }
 }
 
 #[test]
 fn test_w2m_control_only_reply_has_no_backing() {
     const CAP: usize = 64 * 1024;
-    let region = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            CAP,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANONYMOUS | libc::MAP_SHARED,
-            -1,
-            0,
-        ) as *mut u8
-    };
-    assert!(!region.is_null());
+    let region = SharedRegion::new(CAP);
+    let ptr = region.ptr();
     unsafe {
-        w2m_ring::init_region_for_tests(region, CAP as u64);
+        w2m_ring::init_region_for_tests(ptr, CAP as u64);
     }
 
-    let writer = W2mWriter::new(region, CAP as u64);
+    let writer = W2mWriter::new(ptr, CAP as u64);
     let sz = wire_size(STATUS_OK, b"", None, None, None, None, &[]);
     writer.send_encoded(sz, 42, |buf| {
         encode_wire_into(
@@ -251,12 +206,8 @@ fn test_w2m_control_only_reply_has_no_backing() {
         );
     });
 
-    let receiver = W2mReceiver::new(vec![region]);
+    let receiver = W2mReceiver::new(vec![ptr]);
     let decoded = receiver.try_read(0).expect("ACK must decode");
     assert_eq!(decoded.control.request_id, 42);
     assert!(decoded.data_batch.is_none(), "control-only ACK must have no data_batch");
-
-    unsafe {
-        libc::munmap(region as *mut libc::c_void, CAP);
-    }
 }

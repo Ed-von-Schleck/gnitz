@@ -1,5 +1,8 @@
 //! Wire protocol: IPC message codec, schema conversion, encode/decode.
 
+use std::rc::Rc;
+
+use crate::foundation::codec;
 use crate::schema::{encode_german_string, try_decode_german_string, type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{wal_block_size, Batch, MemBatch, MAX_WIRE_REGIONS};
 
@@ -7,21 +10,19 @@ use crate::storage::{wal_block_size, Batch, MemBatch, MAX_WIRE_REGIONS};
 // Constants re-exported from gnitz_wire
 // ---------------------------------------------------------------------------
 
-pub use gnitz_wire::{
-    wire_flags_get_conflict_mode, wire_flags_get_index_version, wire_flags_get_schema_version,
-    wire_flags_set_index_version, wire_flags_set_schema_version, WireConflictMode, FLAG_CONTINUATION, FLAG_EXCHANGE,
-    FLAG_GET_INDICES, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, IPC_CONTROL_TID, META_FLAG_IS_PK, META_FLAG_NULLABLE,
-    STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
-};
-
-pub const FLAG_BATCH_SORTED: u64 = 1 << 50;
-pub const FLAG_BATCH_CONSOLIDATED: u64 = 1 << 51;
 /// W2M-internal flag set on the last (or only) scan chunk from a worker.
 /// Not part of the public wire protocol; stripped before reaching clients.
 /// The master uses this to detect end-of-train without removing FLAG_CONTINUATION
 /// from the TCP frame (FLAG_CONTINUATION must stay set on all worker scan frames
 /// so the client's loop termination — "stop on no FLAG_CONTINUATION" — still works).
-pub(crate) const FLAG_SCAN_LAST: u64 = 1 << 53;
+pub(crate) use gnitz_wire::FLAG_SCAN_LAST;
+pub use gnitz_wire::{
+    wire_flags_get_conflict_mode, wire_flags_get_index_version, wire_flags_get_schema_version,
+    wire_flags_set_index_version, wire_flags_set_schema_version, WireConflictMode, FLAG_BATCH_CONSOLIDATED,
+    FLAG_BATCH_SORTED, FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_GET_INDICES, FLAG_HAS_DATA, FLAG_HAS_SCHEMA,
+    IPC_CONTROL_TID, META_FLAG_IS_PK, META_FLAG_NULLABLE, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK,
+    STATUS_SCHEMA_MISMATCH,
+};
 
 /// Map a batch's layout claim to its wire flag bits. Encode normalizes
 /// `Consolidated ⇒ both bits`; `layout_from_wire_flags` inverts losslessly. The
@@ -136,6 +137,35 @@ pub(crate) fn col_names_as_refs(names: &[Vec<u8>]) -> ([&[u8]; crate::schema::MA
     (refs, n)
 }
 
+/// Get-or-build the cached schema wire block for `tid`, returning the full
+/// cache entry (block, version, wire_safe, stride). On a miss the block is
+/// built from the catalog's column names + hidden mask and stored; it is
+/// invalidated alongside col_names whenever DDL modifies the table. The
+/// caller supplies the resolved `schema` — the call sites differ only in
+/// what they do when the table has no schema (panic / minimal fallback /
+/// one-off block), which stays with them.
+pub(crate) fn get_or_build_schema_wire_block(
+    cat: &mut crate::catalog::CatalogEngine,
+    tid: i64,
+    schema: &SchemaDescriptor,
+) -> crate::catalog::CachedSchemaWire {
+    if let Some(cached) = cat.get_cached_schema_wire_block(tid) {
+        return cached;
+    }
+    let col_names = cat.get_col_names_bytes(tid);
+    let hidden = cat.get_col_hidden_mask(tid);
+    let (name_refs, n) = col_names_as_refs(&col_names);
+    let block = Rc::new(build_schema_wire_block(schema, &name_refs[..n], hidden, tid as u32));
+    let (wire_safe, wire_row_fixed_stride) = crate::runtime::sal::compute_wire_props(schema);
+    cat.set_schema_wire_block(tid, block.clone(), wire_safe, wire_row_fixed_stride);
+    crate::catalog::CachedSchemaWire {
+        block,
+        version: cat.get_schema_version(tid),
+        wire_safe,
+        wire_row_fixed_stride,
+    }
+}
+
 /// `hidden_mask`: bit N set ⇔ column N is a hidden key slot (COL_TAB
 /// `is_hidden`), echoed as `META_FLAG_HIDDEN` so clients can suppress the
 /// column in presentation. Engine-internal blocks (SAL entries, nameless
@@ -194,8 +224,8 @@ pub(crate) fn batch_to_schema(batch: &Batch) -> Result<(SchemaDescriptor, Vec<Ve
     let mut pk_count: usize = 0;
     for (i, col) in cols.iter_mut().enumerate().take(batch.count) {
         let off8 = i * 8;
-        let type_code_val = u64::from_le_bytes(batch.col_data(0)[off8..off8 + 8].try_into().unwrap()) as u8;
-        let flags_val = u64::from_le_bytes(batch.col_data(1)[off8..off8 + 8].try_into().unwrap());
+        let type_code_val = codec::read_u64_le(batch.col_data(0), off8) as u8;
+        let flags_val = codec::read_u64_le(batch.col_data(1), off8);
         let off16 = i * 16;
         let mut st = [0u8; 16];
         st.copy_from_slice(&batch.col_data(2)[off16..off16 + 16]);
@@ -401,6 +431,39 @@ pub(crate) fn encode_ctrl_block_direct(
     CTRL_BLOCK_SIZE_NO_BLOB
 }
 
+/// Blob bytes a German string of length `len` spills into the shared blob
+/// region: 0 when it fits the 12-byte inline form, its full length otherwise.
+#[inline]
+fn german_spill_len(len: usize) -> usize {
+    if len > gnitz_wire::SHORT_STRING_THRESHOLD {
+        len
+    } else {
+        0
+    }
+}
+
+/// Encoded size of the schema wire block for `schema` + `col_names`, or the
+/// prebuilt block's length when one is supplied. Shared by `wire_size` and
+/// `wire_size_range` so the two size paths cannot drift.
+fn schema_block_wire_size(
+    schema: Option<&SchemaDescriptor>,
+    col_names: Option<&[&[u8]]>,
+    prebuilt_schema_block: Option<&[u8]>,
+) -> usize {
+    if let Some(prebuilt) = prebuilt_schema_block {
+        return prebuilt.len();
+    }
+    let s = schema.unwrap();
+    let ncols = s.num_columns();
+    let schema_blob: usize = col_names
+        .unwrap_or(&[])
+        .iter()
+        .take(ncols)
+        .map(|n| german_spill_len(n.len()))
+        .sum();
+    schema_wal_block_size(&META_SCHEMA_DESC, ncols, schema_blob)
+}
+
 #[inline]
 fn should_include_schema(
     schema: Option<&SchemaDescriptor>,
@@ -429,17 +492,7 @@ pub fn wire_size(
     let has_data = data_batch.map(|b| b.count > 0).unwrap_or(false);
     let has_schema = should_include_schema(schema, prebuilt_schema_block, has_data, status);
 
-    let err_blob = if error_msg.len() > gnitz_wire::SHORT_STRING_THRESHOLD {
-        error_msg.len()
-    } else {
-        0
-    };
-    let pk_extra_blob = if seek_pk_extra.len() > gnitz_wire::SHORT_STRING_THRESHOLD {
-        seek_pk_extra.len()
-    } else {
-        0
-    };
-    let ctrl_blob = err_blob + pk_extra_blob;
+    let ctrl_blob = german_spill_len(error_msg.len()) + german_spill_len(seek_pk_extra.len());
     let mut total = if ctrl_blob == 0 {
         CTRL_BLOCK_SIZE_NO_BLOB
     } else {
@@ -447,25 +500,7 @@ pub fn wire_size(
     };
 
     if has_schema {
-        if let Some(prebuilt) = prebuilt_schema_block {
-            total += prebuilt.len();
-        } else {
-            let s = schema.unwrap();
-            let names = col_names.unwrap_or(&[]);
-            let ncols = s.num_columns();
-            let schema_blob: usize = names
-                .iter()
-                .take(ncols)
-                .map(|n| {
-                    if n.len() > gnitz_wire::SHORT_STRING_THRESHOLD {
-                        n.len()
-                    } else {
-                        0
-                    }
-                })
-                .sum();
-            total += schema_wal_block_size(&META_SCHEMA_DESC, ncols, schema_blob);
-        }
+        total += schema_block_wire_size(schema, col_names, prebuilt_schema_block);
     }
 
     if has_data {
@@ -616,11 +651,7 @@ pub fn wire_size_range(
     let has_data = count > 0;
     let has_schema = should_include_schema(schema, prebuilt_schema_block, has_data, status);
 
-    let ctrl_blob = if error_msg.len() > gnitz_wire::SHORT_STRING_THRESHOLD {
-        error_msg.len()
-    } else {
-        0
-    };
+    let ctrl_blob = german_spill_len(error_msg.len());
     let mut total = if ctrl_blob == 0 {
         CTRL_BLOCK_SIZE_NO_BLOB
     } else {
@@ -628,25 +659,7 @@ pub fn wire_size_range(
     };
 
     if has_schema {
-        if let Some(prebuilt) = prebuilt_schema_block {
-            total += prebuilt.len();
-        } else {
-            let s = schema.unwrap();
-            let ncols = s.num_columns();
-            let schema_blob: usize = col_names
-                .unwrap_or(&[])
-                .iter()
-                .take(ncols)
-                .map(|n| {
-                    if n.len() > gnitz_wire::SHORT_STRING_THRESHOLD {
-                        n.len()
-                    } else {
-                        0
-                    }
-                })
-                .sum();
-            total += schema_wal_block_size(&META_SCHEMA_DESC, ncols, schema_blob);
-        }
+        total += schema_block_wire_size(schema, col_names, prebuilt_schema_block);
     }
 
     if has_data {
@@ -852,9 +865,31 @@ fn wal_dir_entry(data: &[u8], r: usize) -> (usize, usize) {
     const HEADER: usize = gnitz_wire::WAL_HEADER_SIZE;
     const DIR_ENTRY: usize = 8;
     let base = HEADER + r * DIR_ENTRY;
-    let off = u32::from_le_bytes(data[base..base + 4].try_into().unwrap()) as usize;
-    let sz = u32::from_le_bytes(data[base + 4..base + 8].try_into().unwrap()) as usize;
+    let off = codec::read_u32_le(data, base) as usize;
+    let sz = codec::read_u32_le(data, base + 4) as usize;
     (off, sz)
+}
+
+/// Bounds-checked read of a u64 from a fixed-width u64 region of a 1-row
+/// control block (exactly 8 bytes for 1 row).
+#[inline(always)]
+fn read_u64_region(data: &[u8], r: usize) -> Result<u64, &'static str> {
+    let (off, sz) = wal_dir_entry(data, r);
+    if sz < 8 || off.saturating_add(8) > data.len() {
+        return Err("control block region out of bounds");
+    }
+    Ok(codec::read_u64_le(data, off))
+}
+
+/// Bounds-checked read of a u128 from a fixed-width u128 region of a 1-row
+/// control block (exactly 16 bytes for 1 row).
+#[inline(always)]
+fn read_u128_region(data: &[u8], r: usize) -> Result<u128, &'static str> {
+    let (off, sz) = wal_dir_entry(data, r);
+    if sz < 16 || off.saturating_add(16) > data.len() {
+        return Err("control block u128 region out of bounds");
+    }
+    Ok(codec::read_u128_le(data, off))
 }
 
 /// Decode all control fields directly from the WAL block's directory without
@@ -870,41 +905,23 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
     }
 
     // Validate WAL version and region count without computing the checksum.
-    let version = u32::from_le_bytes(data[WAL_OFF_VERSION..WAL_OFF_VERSION + 4].try_into().unwrap());
+    let version = codec::read_u32_le(data, WAL_OFF_VERSION);
     if version != gnitz_wire::WAL_FORMAT_VERSION {
         return Err("control block wrong version");
     }
-    let num_regions = u32::from_le_bytes(data[WAL_OFF_NUM_REGIONS..WAL_OFF_NUM_REGIONS + 4].try_into().unwrap());
+    let num_regions = codec::read_u32_le(data, WAL_OFF_NUM_REGIONS);
     if num_regions as usize != ctrl::NUM_REGIONS {
         return Err("control block wrong region count");
     }
 
-    // Read a u64 from a fixed-width u64 region (exactly 8 bytes for 1 row).
-    let read_u64 = |r: usize| -> Result<u64, &'static str> {
-        let (off, sz) = wal_dir_entry(data, r);
-        if sz < 8 || off.saturating_add(8) > data.len() {
-            return Err("control block region out of bounds");
-        }
-        Ok(u64::from_le_bytes(data[off..off + 8].try_into().unwrap()))
-    };
-
-    // Read a u128 from a fixed-width u128 region (exactly 16 bytes for 1 row).
-    let read_u128 = |r: usize| -> Result<u128, &'static str> {
-        let (off, sz) = wal_dir_entry(data, r);
-        if sz < 16 || off.saturating_add(16) > data.len() {
-            return Err("control block u128 region out of bounds");
-        }
-        Ok(u128::from_le_bytes(data[off..off + 16].try_into().unwrap()))
-    };
-
-    let null_bmp = read_u64(ctrl::REGION_NULL_BMP)?;
-    let status = read_u64(ctrl::REGION_STATUS)? as u32;
-    let client_id = read_u64(ctrl::REGION_CLIENT_ID)?;
-    let target_id = read_u64(ctrl::REGION_TARGET_ID)?;
-    let flags = read_u64(ctrl::REGION_FLAGS)?;
-    let seek_pk = read_u128(ctrl::REGION_SEEK_PK)?;
-    let seek_col_idx = read_u64(ctrl::REGION_SEEK_COL_IDX)?;
-    let request_id = read_u64(ctrl::REGION_REQUEST_ID)?;
+    let null_bmp = read_u64_region(data, ctrl::REGION_NULL_BMP)?;
+    let status = read_u64_region(data, ctrl::REGION_STATUS)? as u32;
+    let client_id = read_u64_region(data, ctrl::REGION_CLIENT_ID)?;
+    let target_id = read_u64_region(data, ctrl::REGION_TARGET_ID)?;
+    let flags = read_u64_region(data, ctrl::REGION_FLAGS)?;
+    let seek_pk = read_u128_region(data, ctrl::REGION_SEEK_PK)?;
+    let seek_col_idx = read_u64_region(data, ctrl::REGION_SEEK_COL_IDX)?;
+    let request_id = read_u64_region(data, ctrl::REGION_REQUEST_ID)?;
 
     let error_is_null = (null_bmp & ctrl::NULL_BIT_ERROR_MSG) != 0;
     let seek_extra_is_null = (null_bmp & ctrl::NULL_BIT_SEEK_PK_EXTRA) != 0;
@@ -949,7 +966,7 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
         try_decode_german_string(&st, blob).ok_or("seek_pk_extra string offset out of bounds")?
     };
 
-    let block_size = u32::from_le_bytes(data[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].try_into().unwrap()) as usize;
+    let block_size = codec::read_u32_le(data, WAL_OFF_SIZE) as usize;
     Ok(DecodedControl {
         status,
         client_id,
@@ -974,26 +991,25 @@ fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescr
         return Err("schema block too small");
     }
 
-    let version = u32::from_le_bytes(data[WAL_OFF_VERSION..WAL_OFF_VERSION + 4].try_into().unwrap());
+    let version = codec::read_u32_le(data, WAL_OFF_VERSION);
     if version != gnitz_wire::WAL_FORMAT_VERSION {
         return Err("schema block wrong version");
     }
-    let total_size = u32::from_le_bytes(data[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].try_into().unwrap()) as usize;
+    let total_size = codec::read_u32_le(data, WAL_OFF_SIZE) as usize;
     if total_size > data.len() {
         return Err("schema block truncated");
     }
 
     if verify_checksum && total_size > HEADER {
-        let expected = u64::from_le_bytes(data[WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8].try_into().unwrap());
+        let expected = codec::read_u64_le(data, WAL_OFF_CHECKSUM);
         let actual = crate::foundation::xxh::checksum(&data[HEADER..total_size]);
         if actual != expected {
             return Err("schema block checksum mismatch");
         }
     }
 
-    let count = u32::from_le_bytes(data[WAL_OFF_COUNT..WAL_OFF_COUNT + 4].try_into().unwrap()) as usize;
-    let num_regions =
-        u32::from_le_bytes(data[WAL_OFF_NUM_REGIONS..WAL_OFF_NUM_REGIONS + 4].try_into().unwrap()) as usize;
+    let count = codec::read_u32_le(data, WAL_OFF_COUNT) as usize;
+    let num_regions = codec::read_u32_le(data, WAL_OFF_NUM_REGIONS) as usize;
 
     if count == 0 {
         return Err("empty schema block");
@@ -1053,8 +1069,8 @@ fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescr
 
     for (i, col) in cols[..count].iter_mut().enumerate() {
         let off8 = i * 8;
-        let tc = u64::from_le_bytes(type_data[off8..off8 + 8].try_into().unwrap()) as u8;
-        let fl = u64::from_le_bytes(flags_data[off8..off8 + 8].try_into().unwrap());
+        let tc = codec::read_u64_le(type_data, off8) as u8;
+        let fl = codec::read_u64_le(flags_data, off8);
         // Reject unknown type codes here so a crafted wire schema cannot
         // smuggle in a type_code the downstream cursors can't decode.
         if gnitz_wire::TypeCode::try_from_u8(tc).is_none() {
@@ -1095,35 +1111,27 @@ fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescr
     Ok(SchemaDescriptor::new(&cols[..count], &pk_indices[..pk_count]))
 }
 
-/// Read just the `(target_id, client_id)` routing tuple from a wire
-/// message. Two `wal_dir_entry` lookups + two u64 reads — no allocation,
-/// no checksum, no `decode_german_string`. This is the hot path used by
-/// the executor's schema-hint lookup and by the auth-bound client_id
-/// check; both share one parse so a malicious client cannot forge a
-/// directory that points the auth check at one offset and the full
-/// decoder at another.
-pub fn peek_routing_header(data: &[u8]) -> Result<(u64, u64), &'static str> {
-    use gnitz_wire::control as ctrl;
+/// Parse the control block of a CLIENT frame once, bounds-limited to the
+/// block's own `block_size` slice (exactly the slice the full decode would
+/// parse, so the routing/auth fields and the decode see one directory — a
+/// malicious client cannot forge a directory that points the auth check at
+/// one offset and the decoder at another).
+pub fn peek_client_control(data: &[u8]) -> Result<DecodedControl, &'static str> {
+    let ctrl = wal_block_slice_at(data, 0)?;
+    peek_control_block(ctrl)
+}
 
-    if data.len() < gnitz_wire::WAL_HEADER_SIZE {
-        return Err("IPC payload too small");
-    }
-    let dir_end = gnitz_wire::WAL_HEADER_SIZE + ctrl::NUM_REGIONS * 8;
-    if data.len() < dir_end {
-        return Err("control block too small");
-    }
-
-    let read_u64 = |r: usize| -> Result<u64, &'static str> {
-        let (off, sz) = wal_dir_entry(data, r);
-        if sz < 8 || off.saturating_add(8) > data.len() {
-            return Err("control block region out of bounds");
-        }
-        Ok(u64::from_le_bytes(data[off..off + 8].try_into().unwrap()))
-    };
-
-    let target_id = read_u64(ctrl::REGION_TARGET_ID)?;
-    let client_id = read_u64(ctrl::REGION_CLIENT_ID)?;
-    Ok((target_id, client_id))
+/// Client-boundary decode with a pre-parsed control block (the `handle_message`
+/// single-parse path). Full checksum verification on the schema/data blocks —
+/// the control block itself is never checksummed by design; its integrity is
+/// covered by the frame length + directory bounds checks in the peek.
+pub fn decode_wire_with_ctrl(
+    data: &[u8],
+    control: DecodedControl,
+    schema_hint: Option<SchemaWithVersion<'_>>,
+) -> Result<DecodedWire, &'static str> {
+    let ctrl_size = control.block_size;
+    decode_wire_body(data, ctrl_size, control, schema_hint, true)
 }
 
 /// Decode a full IPC wire message from raw bytes.
@@ -1150,7 +1158,7 @@ fn wal_block_slice_at(data: &[u8], off: usize) -> Result<&[u8], &'static str> {
     if off + gnitz_wire::WAL_HEADER_SIZE > data.len() {
         return Err("WAL block header truncated");
     }
-    let size = u32::from_le_bytes(data[off + WAL_OFF_SIZE..off + WAL_OFF_SIZE + 4].try_into().unwrap()) as usize;
+    let size = codec::read_u32_le(data, off + WAL_OFF_SIZE) as usize;
     if size < gnitz_wire::WAL_HEADER_SIZE || off + size > data.len() {
         return Err("WAL block truncated");
     }
@@ -1158,30 +1166,20 @@ fn wal_block_slice_at(data: &[u8], off: usize) -> Result<&[u8], &'static str> {
 }
 
 pub fn decode_ddl_txn(data: &[u8]) -> Result<Vec<(i64, &[u8])>, &'static str> {
-    if data.len() < gnitz_wire::WAL_HEADER_SIZE {
-        return Err("IPC payload too small");
-    }
-    let ctrl_size = u32::from_le_bytes(
-        data[WAL_OFF_SIZE..WAL_OFF_SIZE + 4]
-            .try_into()
-            .map_err(|_| "bad control size")?,
-    ) as usize;
-    if ctrl_size > data.len() {
-        return Err("control block truncated");
-    }
-    peek_control_block(&data[..ctrl_size])?;
+    let ctrl = wal_block_slice_at(data, 0)?;
+    peek_control_block(ctrl)?;
 
-    let mut off = ctrl_size;
+    let mut off = ctrl.len();
     if off + 4 > data.len() {
         return Err("DDL_TXN family count truncated");
     }
-    let count = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+    let count = codec::read_u32_le(data, off) as usize;
     off += 4;
 
     let mut families = Vec::with_capacity(count);
     for _ in 0..count {
         let block = wal_block_slice_at(data, off)?;
-        let tid = u32::from_le_bytes(block[WAL_OFF_TID..WAL_OFF_TID + 4].try_into().unwrap()) as i64;
+        let tid = codec::read_u32_le(block, WAL_OFF_TID) as i64;
         families.push((tid, block));
         off += block.len();
     }
@@ -1194,32 +1192,14 @@ pub fn decode_wire_ipc(data: &[u8]) -> Result<DecodedWire, &'static str> {
     decode_wire_impl(data, None, false)
 }
 
-/// Like `decode_wire` but supplies a catalog schema hint for schema-less
-/// external PUSH frames. The hint is used when `FLAG_HAS_DATA` is set but
-/// `FLAG_HAS_SCHEMA` is absent (warm-cache PUSH path). Checksum verification
-/// is still performed (verify_checksum = true).
-pub fn decode_wire_with_hint(data: &[u8], hint: SchemaWithVersion<'_>) -> Result<DecodedWire, &'static str> {
-    decode_wire_impl(data, Some(hint), true)
-}
-
 fn decode_wire_impl(
     data: &[u8],
     schema_hint: Option<SchemaWithVersion<'_>>,
     verify_checksum: bool,
 ) -> Result<DecodedWire, &'static str> {
-    if data.len() < gnitz_wire::WAL_HEADER_SIZE {
-        return Err("IPC payload too small");
-    }
-    let ctrl_size = u32::from_le_bytes(
-        data[WAL_OFF_SIZE..WAL_OFF_SIZE + 4]
-            .try_into()
-            .map_err(|_| "bad control size")?,
-    ) as usize;
-    if ctrl_size > data.len() {
-        return Err("control block truncated");
-    }
-    let control = peek_control_block(&data[..ctrl_size])?;
-    decode_wire_body(data, ctrl_size, control, schema_hint, verify_checksum)
+    let ctrl = wal_block_slice_at(data, 0)?;
+    let control = peek_control_block(ctrl)?;
+    decode_wire_body(data, ctrl.len(), control, schema_hint, verify_checksum)
 }
 
 /// Like `decode_wire_ipc` but supplies a versioned schema hint for W2M
@@ -1236,16 +1216,6 @@ pub(crate) fn decode_wire_ipc_with_schema<'a>(
     hint: SchemaWithVersion<'a>,
 ) -> Result<DecodedWire, &'static str> {
     decode_wire_impl(data, Some(hint), false)
-}
-
-/// Like `decode_wire_ipc` but reuses a pre-parsed control block, avoiding a
-/// redundant parse of the control WAL block.
-pub(crate) fn decode_wire_ipc_with_ctrl(
-    data: &[u8],
-    ctrl_size: usize,
-    control: DecodedControl,
-) -> Result<DecodedWire, &'static str> {
-    decode_wire_body(data, ctrl_size, control, None, false)
 }
 
 /// Resolve the schema for a continuation frame (`has_data && !has_schema`).
@@ -1328,15 +1298,15 @@ fn decode_wire_body(
 /// that borrows slices from `data`.  The caller must keep `data` live (i.e.
 /// hold the `W2mSlot`) until it is done reading from the `MemBatch`.
 ///
-/// Takes a pre-parsed `control` block (from `peek_control_block`) and its byte
-/// size so the caller can inspect flags before choosing a decode path without
+/// Takes a pre-parsed `control` block (from `peek_control_block`) so the
+/// caller can inspect flags before choosing a decode path without
 /// triggering a redundant parse.
 pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
     data: &'a [u8],
-    ctrl_size: usize,
     control: DecodedControl,
     schema_hint: Option<SchemaWithVersion<'_>>,
 ) -> Result<DecodedWireZeroCopy<'a>, &'static str> {
+    let ctrl_size = control.block_size;
     let flags = control.flags;
     let has_schema = (flags & FLAG_HAS_SCHEMA) != 0;
     let has_data = (flags & FLAG_HAS_DATA) != 0;
@@ -1773,7 +1743,7 @@ mod tests {
         let mut wire = build_schema_wire_block(&sd, &[b"c0".as_slice()], 0, 0);
         // Region 4 is the flags column; OR in NULLABLE on the PK (col 0).
         let (fl_off, _) = wal_dir_entry(&wire, 4);
-        let f = u64::from_le_bytes(wire[fl_off..fl_off + 8].try_into().unwrap()) | META_FLAG_NULLABLE;
+        let f = codec::read_u64_le(&wire, fl_off) | META_FLAG_NULLABLE;
         wire[fl_off..fl_off + 8].copy_from_slice(&f.to_le_bytes());
         // verify_checksum=false: the flags region is inside the checksummed body.
         match decode_schema_block(&wire, false) {

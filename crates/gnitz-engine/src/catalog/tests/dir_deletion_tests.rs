@@ -114,7 +114,7 @@ fn gc_reclaims_orphan_table_dir() {
     assert!(!Path::new(&ghost).exists(), "orphan table dir must be reclaimed");
     assert!(Path::new(&live_dir).exists(), "live table dir must survive");
     assert!(
-        engine.seek_family(tid, 1u128, &[]).unwrap().is_some(),
+        engine.seek_family(tid, 1u128, &[]).unwrap().0.is_some(),
         "live table must still read back after the sweep"
     );
 
@@ -214,7 +214,7 @@ fn gc_leaves_live_entities_untouched() {
     }
     assert!(engine.pending_dir_deletions.is_empty());
     assert_eq!(
-        engine.scan_family(t1).unwrap().count,
+        engine.scan_family(t1).unwrap().0.count,
         1,
         "flushed table must still read back after the sweep"
     );

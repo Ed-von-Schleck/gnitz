@@ -24,7 +24,7 @@ pub const MAX_WORKERS: usize = 64;
 /// The group's size and epoch live in the atomically-published u64 prefix
 /// preceding the header (`(epoch << 32) | payload_size`), not in the header.
 pub(crate) const GROUP_HEADER_SIZE: usize = 16 + 2 * MAX_WORKERS * 4;
-pub const SAL_MMAP_SIZE: usize = 1 << 30;
+pub(crate) const SAL_MMAP_SIZE: usize = 1 << 30;
 
 /// Floor for a `GNITZ_SAL_BYTES` override — must comfortably exceed one DDL zone
 /// plus the 2 MiB prefault-ahead window and the checkpoint headroom.
@@ -64,10 +64,8 @@ gnitz_wire::cast_consts! { pub u32;
     FLAG_HAS_PK, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
 }
 pub const FLAG_EXCHANGE_RELAY: u32 = 512;
-pub const FLAG_PRELOADED_EXCHANGE: u32 = 1024;
 pub const FLAG_BACKFILL: u32 = 2048;
 pub const FLAG_TICK: u32 = 4096;
-pub const FLAG_CHECKPOINT: u32 = 8192;
 pub const FLAG_FLUSH: u32 = 16384;
 /// Ephemeral-state flush round of the checkpoint sequence: flush every view's
 /// operator-trace tables and output stores (traces before outputs), stamping
@@ -195,9 +193,7 @@ pub(crate) fn unpack_gather_cols(packed: u64) -> impl Iterator<Item = u8> {
 /// into exactly one variant.
 ///
 /// `Scan` is the default when no kind-specific flag is set; the worker
-/// answers with a full table scan. `FLAG_CHECKPOINT` is intentionally
-/// absent — it is an ACK-only echo flag, never appears on a SAL group
-/// inbound to the worker. `FLAG_TXN_COMMIT` rides on top of
+/// answers with a full table scan. `FLAG_TXN_COMMIT` rides on top of
 /// `FLAG_DDL_SYNC` (zero-count sentinel); classification stops at
 /// `DdlSync` and the worker handles it as a no-op DDL_SYNC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,7 +203,6 @@ pub enum SalMessageKind {
     FlushEph,
     DdlSync,
     ExchangeRelay,
-    PreloadedExchange,
     Backfill,
     HasPk,
     Gather,
@@ -225,11 +220,11 @@ impl SalMessageKind {
     ///
     /// Priority order matches the worker's existing if-chain (see
     /// `worker::dispatch_inner`): SHUTDOWN > FLUSH > DDL_SYNC >
-    /// EXCHANGE_RELAY > PRELOADED_EXCHANGE > BACKFILL > HAS_PK >
-    /// GATHER > UNIQUE_PREFLIGHT > PUSH > TICK > SEEK_BY_INDEX_RANGE >
-    /// SEEK_BY_INDEX > SEEK > Scan. The first match wins. (Each kind owns a
-    /// distinct bit, so the relative order of the disjoint range/point/seek
-    /// arms is immaterial; it tracks the worker's if-chain for readability.)
+    /// EXCHANGE_RELAY > BACKFILL > HAS_PK > GATHER > UNIQUE_PREFLIGHT >
+    /// PUSH > TICK > SEEK_BY_INDEX_RANGE > SEEK_BY_INDEX > SEEK > Scan.
+    /// The first match wins. (Each kind owns a distinct bit, so the
+    /// relative order of the disjoint range/point/seek arms is
+    /// immaterial; it tracks the worker's if-chain for readability.)
     pub fn classify(flags: u32) -> SalMessageKind {
         if flags & FLAG_SHUTDOWN != 0 {
             return SalMessageKind::Shutdown;
@@ -245,9 +240,6 @@ impl SalMessageKind {
         }
         if flags & FLAG_EXCHANGE_RELAY != 0 {
             return SalMessageKind::ExchangeRelay;
-        }
-        if flags & FLAG_PRELOADED_EXCHANGE != 0 {
-            return SalMessageKind::PreloadedExchange;
         }
         if flags & FLAG_BACKFILL != 0 {
             return SalMessageKind::Backfill;
@@ -291,7 +283,6 @@ impl SalMessageKind {
                 | SalMessageKind::Flush
                 | SalMessageKind::FlushEph
                 | SalMessageKind::DdlSync
-                | SalMessageKind::PreloadedExchange
                 | SalMessageKind::Backfill
                 | SalMessageKind::HasPk
                 | SalMessageKind::Gather
@@ -299,28 +290,6 @@ impl SalMessageKind {
                 | SalMessageKind::Tick
         )
     }
-
-    /// All variants in classification priority order. Used by tests that
-    /// walk every kind to exercise the dispatcher's full match.
-    #[allow(dead_code)]
-    pub const ALL: [SalMessageKind; 16] = [
-        SalMessageKind::Shutdown,
-        SalMessageKind::Flush,
-        SalMessageKind::FlushEph,
-        SalMessageKind::DdlSync,
-        SalMessageKind::ExchangeRelay,
-        SalMessageKind::PreloadedExchange,
-        SalMessageKind::Backfill,
-        SalMessageKind::HasPk,
-        SalMessageKind::Gather,
-        SalMessageKind::UniquePreflight,
-        SalMessageKind::Push,
-        SalMessageKind::Tick,
-        SalMessageKind::SeekByIndex,
-        SalMessageKind::SeekByIndexRange,
-        SalMessageKind::Seek,
-        SalMessageKind::Scan,
-    ];
 }
 
 // ---------------------------------------------------------------------------
@@ -405,13 +374,6 @@ fn data_wire_block_size_cached(count: usize, npc: usize, stride: u32) -> usize {
 // ---------------------------------------------------------------------------
 // SAL write (master→workers)
 // ---------------------------------------------------------------------------
-
-/// Result from SAL write (used by tests via `sal_write_group`).
-#[cfg(test)]
-pub(crate) struct SalWriteResult {
-    pub status: i32,
-    pub new_cursor: u64,
-}
 
 /// Handle returned by `sal_begin_group`. Header and per-worker directory
 /// are already written; caller fills per-worker data, then calls `commit()`.
@@ -525,27 +487,27 @@ pub(crate) unsafe fn sal_begin_group(
 }
 
 /// Write a message group into the SAL for N workers (test helper).
+/// `payloads[w]` is worker w's slot; an empty slice means no data for w.
+/// Returns the new cursor, or `None` when the group doesn't fit.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sal_write_group(
     sal_ptr: *mut u8,
     write_cursor: u64,
-    num_workers: u32,
     target_id: u32,
     lsn: u64,
     flags: u32,
     epoch: u32,
     mmap_size: u64,
-    worker_ptrs: *const *const u8,
-    worker_sizes: *const u32,
-) -> SalWriteResult {
-    let nw = num_workers as usize;
+    payloads: &[&[u8]],
+) -> Option<u64> {
+    let nw = payloads.len();
     let mut sizes = [0u32; MAX_WORKERS];
-    for (w, slot) in sizes.iter_mut().enumerate().take(nw) {
-        *slot = *worker_sizes.add(w);
+    for (w, p) in payloads.iter().enumerate() {
+        sizes[w] = p.len() as u32;
     }
 
-    let group = match sal_begin_group(
+    let group = sal_begin_group(
         sal_ptr,
         write_cursor as usize,
         mmap_size as usize,
@@ -555,74 +517,42 @@ pub(crate) unsafe fn sal_write_group(
         flags,
         epoch,
         &sizes[..nw],
-    ) {
-        Some(g) => g,
-        None => {
-            return SalWriteResult {
-                status: -1,
-                new_cursor: write_cursor,
-            }
-        }
-    };
+    )?;
 
     let mut off = GROUP_HEADER_SIZE;
-    for (w, &sz_u32) in sizes.iter().enumerate().take(nw) {
-        let sz = sz_u32 as usize;
-        if sz > 0 {
-            let p = *worker_ptrs.add(w);
-            if !p.is_null() {
-                std::ptr::copy_nonoverlapping(p, group.data_ptr(off), sz);
-            }
-            off += align8(sz);
+    for p in payloads {
+        if !p.is_empty() {
+            std::ptr::copy_nonoverlapping(p.as_ptr(), group.data_ptr(off), p.len());
+            off += align8(p.len());
         }
     }
 
-    SalWriteResult {
-        status: 0,
-        new_cursor: group.commit(),
-    }
+    Some(group.commit())
 }
 
 // ---------------------------------------------------------------------------
 // SAL read (worker reads its data from a group)
 // ---------------------------------------------------------------------------
 
-pub(crate) const SAL_STATUS_HAS_DATA: i32 = 0;
-pub(crate) const SAL_STATUS_NO_DATA_FOR_WORKER: i32 = 1;
-pub(crate) const SAL_STATUS_NO_MESSAGE: i32 = -1;
-
 pub(crate) struct SalReadResult {
-    pub status: i32,
     pub advance: u64,
     pub lsn: u64,
     pub flags: u32,
     pub target_id: u32,
     pub epoch: u32,
-    pub _pad: u32,
+    /// This worker's payload slot; null/0 when the group carries no data
+    /// for this worker (control broadcast, other-worker unicast).
     pub data_ptr: *const u8,
     pub data_size: u32,
-    pub _pad2: u32,
 }
-
-const NO_MESSAGE_RESULT: SalReadResult = SalReadResult {
-    status: SAL_STATUS_NO_MESSAGE,
-    advance: 0,
-    lsn: 0,
-    flags: 0,
-    target_id: 0,
-    epoch: 0,
-    _pad: 0,
-    data_ptr: std::ptr::null(),
-    data_size: 0,
-    _pad2: 0,
-};
 
 /// Read a SAL group header and extract this worker's data pointer/size.
 ///
 /// The group's `(epoch << 32) | payload_size` prefix is Acquire-loaded first;
-/// `expected_epoch: Some(e)` returns `NO_MESSAGE` on any mismatch **before a
+/// `expected_epoch: Some(e)` returns `None` on any mismatch **before a
 /// single header byte is read** (live worker path). `None` skips the gate —
 /// only valid against a quiescent SAL (recovery walkers, no concurrent writer).
+/// Returns `None` when no message is present at the cursor.
 ///
 /// # Safety
 /// `sal_ptr` must be a valid mmap pointer. `read_cursor` must be within bounds.
@@ -631,7 +561,7 @@ pub(crate) unsafe fn sal_read_group_header(
     read_cursor: u64,
     worker_id: u32,
     expected_epoch: Option<u32>,
-) -> SalReadResult {
+) -> Option<SalReadResult> {
     let rc = read_cursor as usize;
     let wid = worker_id as usize;
 
@@ -639,7 +569,7 @@ pub(crate) unsafe fn sal_read_group_header(
     let payload_size = (word & 0xFFFF_FFFF) as usize;
     let epoch = (word >> 32) as u32;
     if payload_size == 0 {
-        return NO_MESSAGE_RESULT;
+        return None;
     }
     // The load-bearing gate: on an epoch mismatch, return before ANY plain
     // read of the header region. A stale slot at offset 0 after an epoch
@@ -647,7 +577,7 @@ pub(crate) unsafe fn sal_read_group_header(
     // are unreadable until the prefix proves the slot belongs to our epoch.
     if let Some(exp) = expected_epoch {
         if epoch != exp {
-            return NO_MESSAGE_RESULT;
+            return None;
         }
     }
 
@@ -660,42 +590,28 @@ pub(crate) unsafe fn sal_read_group_header(
     let my_offset = read_u32_raw(sal_ptr, hdr_off + 16 + wid * 4) as usize;
     let my_size = read_u32_raw(sal_ptr, hdr_off + 16 + MAX_WORKERS * 4 + wid * 4) as usize;
 
-    if my_size > 0 && my_offset > 0 {
+    let (data_ptr, data_size) = if my_size > 0 && my_offset > 0 {
         debug_assert!(
             my_offset + my_size <= payload_size,
             "SAL group header corrupt: my_offset={my_offset} my_size={my_size} payload_size={payload_size}"
         );
-        let data_size = if my_offset + my_size <= payload_size {
-            my_size as u32
+        if my_offset + my_size <= payload_size {
+            (sal_ptr.add(hdr_off + my_offset), my_size as u32)
         } else {
-            0
-        };
-        SalReadResult {
-            status: SAL_STATUS_HAS_DATA,
-            advance,
-            lsn,
-            flags,
-            target_id,
-            epoch,
-            _pad: 0,
-            data_ptr: sal_ptr.add(hdr_off + my_offset),
-            data_size,
-            _pad2: 0,
+            (std::ptr::null(), 0)
         }
     } else {
-        SalReadResult {
-            status: SAL_STATUS_NO_DATA_FOR_WORKER,
-            advance,
-            lsn,
-            flags,
-            target_id,
-            epoch,
-            _pad: 0,
-            data_ptr: std::ptr::null(),
-            data_size: 0,
-            _pad2: 0,
-        }
-    }
+        (std::ptr::null(), 0)
+    };
+    Some(SalReadResult {
+        advance,
+        lsn,
+        flags,
+        target_id,
+        epoch,
+        data_ptr,
+        data_size,
+    })
 }
 
 /// Write a WAL data block for `count` rows into `data_slot` by scattering
@@ -757,7 +673,6 @@ pub struct SalWriter {
     epoch: u32,
     checkpoint_threshold: u64,
     m2w_efds: Vec<i32>,
-    num_workers: usize,
     last_prefaulted: u64,
 }
 
@@ -765,7 +680,6 @@ unsafe impl Send for SalWriter {}
 
 impl SalWriter {
     pub fn new(ptr: *mut u8, fd: i32, mmap_size: u64, m2w_efds: Vec<i32>) -> Self {
-        let num_workers = m2w_efds.len();
         let checkpoint_threshold = std::env::var("GNITZ_CHECKPOINT_BYTES")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -778,7 +692,6 @@ impl SalWriter {
             epoch: 0,
             checkpoint_threshold,
             m2w_efds,
-            num_workers,
             last_prefaulted: 0,
         }
     }
@@ -825,7 +738,7 @@ impl SalWriter {
         seek_pk_extra: &[u8],
     ) -> Result<(), String> {
         self.prefault_ahead();
-        let nw = self.num_workers;
+        let nw = self.m2w_efds.len();
         assert_eq!(
             req_ids.len(),
             nw,
@@ -936,7 +849,7 @@ impl SalWriter {
         wire_props: Option<(bool, u32)>,
     ) -> Result<(), String> {
         self.prefault_ahead();
-        let nw = self.num_workers;
+        let nw = self.m2w_efds.len();
         assert_eq!(
             req_ids.len(),
             nw,
@@ -1102,7 +1015,7 @@ impl SalWriter {
         prebuilt_schema_block: Option<&[u8]>,
     ) -> Result<(), String> {
         self.prefault_ahead();
-        let nw = self.num_workers;
+        let nw = self.m2w_efds.len();
         debug_assert!(
             prebuilt_schema_block.is_none() || col_names_opt.is_none(),
             "write_broadcast_direct: prebuilt_schema_block and col_names_opt are mutually exclusive",
@@ -1180,7 +1093,7 @@ impl SalWriter {
     /// path: the FLAG_DDL_SYNC branch no-ops on a group with no batch.
     pub fn write_commit_sentinel(&mut self, lsn: u64) -> Result<(), String> {
         self.prefault_ahead();
-        let nw = self.num_workers;
+        let nw = self.m2w_efds.len();
         let worker_sizes = [0u32; MAX_WORKERS];
         let group = unsafe {
             sal_begin_group(
@@ -1201,7 +1114,7 @@ impl SalWriter {
     }
 
     pub fn signal_all(&self) {
-        for w in 0..self.num_workers {
+        for w in 0..self.m2w_efds.len() {
             posix_io::eventfd_signal(self.m2w_efds[w]);
         }
     }
@@ -1290,12 +1203,9 @@ impl SalReader {
     /// dereferenced). Pass `None` only for quiescent-SAL recovery walks.
     /// On success returns (message, new_cursor).
     pub fn try_read(&self, cursor: u64, expected_epoch: Option<u32>) -> Option<(SalMessage<'static>, u64)> {
-        let result = unsafe { sal_read_group_header(self.ptr, cursor, self.worker_id, expected_epoch) };
-        if result.advance == 0 {
-            return None;
-        }
+        let result = unsafe { sal_read_group_header(self.ptr, cursor, self.worker_id, expected_epoch) }?;
         let new_cursor = cursor + result.advance;
-        let wire_data = if result.status == SAL_STATUS_HAS_DATA && result.data_size > 0 && !result.data_ptr.is_null() {
+        let wire_data = if result.data_size > 0 && !result.data_ptr.is_null() {
             Some(unsafe { std::slice::from_raw_parts(result.data_ptr, result.data_size as usize) })
         } else {
             None

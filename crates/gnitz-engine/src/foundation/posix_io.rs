@@ -312,6 +312,7 @@ pub fn shutdown(fd: i32) -> i32 {
 /// SocketAddr → (sockaddr_storage, socklen_t). Zero-pads the storage and
 /// preserves the IPv6 flowinfo/scope_id so link-local destinations route
 /// (without a scope id the kernel rejects an `fe80::` send with EINVAL).
+#[allow(dead_code)] // TCP client-transport work will consume this
 pub fn sockaddr_from_addr(addr: &std::net::SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     match addr {
@@ -339,6 +340,7 @@ pub fn sockaddr_from_addr(addr: &std::net::SocketAddr) -> (libc::sockaddr_storag
 /// sockaddr_storage → SocketAddr, discriminated by `ss_family` alone.
 /// None for non-AF_INET/AF_INET6. Preserves IPv6 flowinfo/scope_id so a
 /// reply to a received `src` reaches a link-local peer.
+#[allow(dead_code)] // TCP client-transport work will consume this
 pub fn addr_from_sockaddr(ss: &libc::sockaddr_storage) -> Option<std::net::SocketAddr> {
     match ss.ss_family as libc::c_int {
         libc::AF_INET => {

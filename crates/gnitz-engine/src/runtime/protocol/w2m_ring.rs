@@ -620,26 +620,8 @@ pub unsafe fn try_consume(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::SharedRegion;
     use std::sync::atomic::Ordering;
-
-    /// Allocate a zero-initialized anonymous mmap region of `size` bytes.
-    unsafe fn alloc_region(size: usize) -> *mut u8 {
-        let ptr = libc::mmap(
-            std::ptr::null_mut(),
-            size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANONYMOUS | libc::MAP_SHARED,
-            -1,
-            0,
-        );
-        assert_ne!(ptr, libc::MAP_FAILED);
-        std::ptr::write_bytes(ptr as *mut u8, 0, size);
-        ptr as *mut u8
-    }
-
-    unsafe fn free_region(ptr: *mut u8, size: usize) {
-        libc::munmap(ptr as *mut libc::c_void, size);
-    }
 
     fn region_size_for_tests() -> usize {
         // Just enough to satisfy the capacity invariant.
@@ -663,7 +645,8 @@ mod tests {
     fn test_w2m_ring_round_trip() {
         unsafe {
             let size = region_size_for_tests();
-            let ptr = alloc_region(size);
+            let region = SharedRegion::new(size);
+            let ptr = region.ptr();
             init_region(ptr, size as u64);
             let hdr = W2mRingHeader::from_raw(ptr);
 
@@ -693,8 +676,6 @@ mod tests {
 
             // Subsequent consume with the new cursor sees empty.
             assert!(try_consume(hdr, ptr, new_rc).is_none());
-
-            free_region(ptr, size);
         }
     }
 
@@ -703,7 +684,8 @@ mod tests {
     fn test_w2m_ring_multiple_messages() {
         unsafe {
             let size = region_size_for_tests();
-            let ptr = alloc_region(size);
+            let region = SharedRegion::new(size);
+            let ptr = region.ptr();
             init_region(ptr, size as u64);
             let hdr = W2mRingHeader::from_raw(ptr);
 
@@ -726,8 +708,6 @@ mod tests {
                 rc = new_rc;
             }
             assert!(try_consume(hdr, ptr, rc).is_none());
-
-            free_region(ptr, size);
         }
     }
 
@@ -748,7 +728,8 @@ mod tests {
             // after a consume.
             let capacity = W2M_HEADER_SIZE as u64 + 2 * msg_total + 64;
             let size = capacity as usize;
-            let ptr = alloc_region(size);
+            let region = SharedRegion::new(size);
+            let ptr = region.ptr();
             init_region_raw(ptr, capacity);
             let hdr = W2mRingHeader::from_raw(ptr);
 
@@ -784,8 +765,6 @@ mod tests {
             assert_eq!(sz, msg_sz as u32);
             let d = std::slice::from_raw_parts(data_ptr, 1);
             assert_eq!(d[0], 0xCC);
-
-            free_region(ptr, size);
         }
     }
 
@@ -801,7 +780,8 @@ mod tests {
             // marker and a bit more).
             let capacity = W2M_HEADER_SIZE as u64 + 3 * big_total + 16;
             let size = capacity as usize;
-            let ptr = alloc_region(size);
+            let region = SharedRegion::new(size);
+            let ptr = region.ptr();
             init_region_raw(ptr, capacity);
             let hdr = W2mRingHeader::from_raw(ptr);
 
@@ -840,8 +820,6 @@ mod tests {
 
             let (_, sz_b, _, _) = try_consume(hdr, ptr, new_rc).expect("wrapped big via SKIP");
             assert_eq!(sz_b, big_sz as u32);
-
-            free_region(ptr, size);
         }
     }
 
@@ -855,7 +833,8 @@ mod tests {
             let msg_total = 8 + align8(msg_sz) as u64;
             let capacity = W2M_HEADER_SIZE as u64 + 2 * msg_total + 8;
             let size = capacity as usize;
-            let ptr = alloc_region(size);
+            let region = SharedRegion::new(size);
+            let ptr = region.ptr();
             init_region_raw(ptr, capacity);
             let hdr = W2mRingHeader::from_raw(ptr);
 
@@ -872,8 +851,6 @@ mod tests {
                 TryPublish::Full => {}
                 TryPublish::Ok(_) => panic!("undrained ring must return Full"),
             }
-
-            free_region(ptr, size);
         }
     }
 
@@ -882,7 +859,8 @@ mod tests {
     fn test_w2m_oversized_publish_rejected() {
         unsafe {
             let size = region_size_for_tests();
-            let ptr = alloc_region(size);
+            let region = SharedRegion::new(size);
+            let ptr = region.ptr();
             init_region(ptr, size as u64);
             let hdr = W2mRingHeader::from_raw(ptr);
 
@@ -890,8 +868,6 @@ mod tests {
                 TryPublish::Full => {}
                 TryPublish::Ok(_) => panic!("oversized publish must be rejected"),
             }
-
-            free_region(ptr, size);
         }
     }
 
@@ -902,7 +878,8 @@ mod tests {
     fn test_w2m_decode_wire_zero_copy() {
         unsafe {
             let size = region_size_for_tests();
-            let ptr = alloc_region(size);
+            let region = SharedRegion::new(size);
+            let ptr = region.ptr();
             init_region(ptr, size as u64);
             let hdr = W2mRingHeader::from_raw(ptr);
 
@@ -917,8 +894,6 @@ mod tests {
             let (data_ptr, _sz, _, _) = try_consume(hdr, ptr, W2M_HEADER_SIZE as u64).expect("message must be visible");
             let expected = ptr.add(W2M_HEADER_SIZE + 8) as *const u8;
             assert_eq!(data_ptr, expected, "data_ptr must be mmap-resident (zero copy)");
-
-            free_region(ptr, size);
         }
     }
 
@@ -933,7 +908,8 @@ mod tests {
             // Room for 3 messages + SKIP slack.
             let capacity = W2M_HEADER_SIZE as u64 + 3 * msg_total + 16;
             let size = capacity as usize;
-            let ptr = alloc_region(size);
+            let region = SharedRegion::new(size);
+            let ptr = region.ptr();
             init_region_raw(ptr, capacity);
             let hdr = W2mRingHeader::from_raw(ptr);
 
@@ -968,8 +944,6 @@ mod tests {
                 "at least one SKIP wrap must have occurred (got {})",
                 hdr.writer_wrap_count(),
             );
-
-            free_region(ptr, size);
         }
     }
 
@@ -995,7 +969,8 @@ mod tests {
             let msg_total = (8 + align8(msg_sz)) as u64;
             let capacity = W2M_HEADER_SIZE as u64 + 5 * msg_total + 16;
             let size = 4096; // one page is plenty for 600-ish bytes
-            let ptr = alloc_region(size);
+            let region = SharedRegion::new(size);
+            let ptr = region.ptr();
             init_region_raw(ptr, capacity);
             let hdr = W2mRingHeader::from_raw(ptr);
 
@@ -1054,8 +1029,6 @@ mod tests {
                 vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
                 "writer must not overwrite unread data after wrap",
             );
-
-            free_region(ptr, size);
         }
     }
 
@@ -1068,9 +1041,9 @@ mod tests {
         unsafe {
             // 7 bytes past the minimum valid capacity → not 8-aligned.
             let cap = (2 * MAX_W2M_MSG) as usize + W2M_HEADER_SIZE + 16 + 7;
-            let ptr = alloc_region(cap);
+            let region = SharedRegion::new(cap);
+            let ptr = region.ptr();
             init_region(ptr, cap as u64); // must panic
-            free_region(ptr, cap);
         }
     }
 
@@ -1081,9 +1054,9 @@ mod tests {
         unsafe {
             // Smallest unaligned capacity that satisfies the size lower bound.
             let cap = W2M_HEADER_SIZE + 16 + 1; // +1 makes it unaligned
-            let ptr = alloc_region(cap);
+            let region = SharedRegion::new(cap);
+            let ptr = region.ptr();
             init_region_for_tests(ptr, cap as u64); // must panic
-            free_region(ptr, cap);
         }
     }
 
@@ -1092,7 +1065,8 @@ mod tests {
     fn test_w2m_consume_one_helper() {
         unsafe {
             let size = region_size_for_tests();
-            let ptr = alloc_region(size);
+            let region = SharedRegion::new(size);
+            let ptr = region.ptr();
             init_region(ptr, size as u64);
             let hdr = W2mRingHeader::from_raw(ptr);
             match try_publish(hdr, ptr, 32, |slot| {
@@ -1105,7 +1079,6 @@ mod tests {
             assert_eq!(sz, 32);
             let data = std::slice::from_raw_parts(p, 32);
             assert!(data.iter().all(|&b| b == 0x77));
-            free_region(ptr, size);
         }
     }
 
@@ -1117,7 +1090,8 @@ mod tests {
             let msg_total = (8 + align8(msg_sz)) as u64;
             let capacity = W2M_HEADER_SIZE as u64 + 2 * msg_total + 8;
             let size = capacity as usize;
-            let ptr = alloc_region(size);
+            let region = SharedRegion::new(size);
+            let ptr = region.ptr();
             init_region_raw(ptr, capacity);
             let hdr = W2mRingHeader::from_raw(ptr);
 
@@ -1152,8 +1126,6 @@ mod tests {
                 TryPublish::Ok(_) => {}
                 TryPublish::Full => panic!("must have room after consume_cursor advance"),
             }
-
-            free_region(ptr, size);
         }
     }
 }

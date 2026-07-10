@@ -68,12 +68,9 @@ Baseline facts this plan builds on (all verified against the tree):
   (server-side accept limit), `MAX_FRAME_PAYLOAD_CLIENT = 256 MB`,
   `HELLO_PAYLOAD_LEN = 8`, `HELLO_ACK_PAYLOAD_LEN = 12`. `gnitz-wire`
   needs zero changes.
-- The reactor's UDP datagram ops (`runtime/reactor/udp.rs`, the
-  `KIND_UDP_RECV`/`KIND_UDP_CANCEL` kinds and `ReactorShared` UDP fields,
-  `Ring::prep_sendmsg`/`prep_recvmsg`, `posix_io::{udp_bind,
-  udp_local_addr}`) were built for the abandoned QUIC transport and have
-  no other consumer. **This plan deletes them** (no-legacy rule); the
-  sockaddr helpers (`sockaddr_from_addr`/`addr_from_sockaddr`) stay — TCP
+- The reactor's UDP datagram ops (built for the abandoned QUIC transport)
+  are already deleted by the runtime-module sweep. The sockaddr helpers
+  (`sockaddr_from_addr`/`addr_from_sockaddr`) were kept — TCP
   bind/local-addr reuse them.
 
 ## Committed decisions
@@ -114,18 +111,15 @@ webpki-roots = "1"
 (Effective toolchain floor becomes Rust 1.88 via rcgen 0.14.8. No
 quinn-proto, no `bytes`.)
 
-## Design — reactor additions & deletions
+## Design — reactor additions
 
-**Delete** (dead code once QUIC is abandoned): `runtime/reactor/udp.rs`
-(~446 lines incl. tests), `KIND_UDP_RECV`/`KIND_UDP_CANCEL` and their
-dispatch arms, the four `ReactorShared` UDP fields,
-`Ring::prep_sendmsg`/`prep_recvmsg`, `posix_io::{udp_bind, udp_local_addr}`
-and their unit tests. Keep `sockaddr_from_addr`/`addr_from_sockaddr` (TCP
-bind/local-addr reuse them). The `ReactorShared.ring`-first drop-order
-SAFETY INVARIANT comment names `udp_recv_ops` among the userspace buffers
-it protects; **retarget it** to the new `KIND_RAW_RECV` op/keep-alive
-map(s) (below), which — like every added field — are declared **below**
-`ring`, or ring teardown frees the buffers the kernel still points at.
+(The UDP datagram machinery this transport replaces is already gone —
+deleted by the runtime-module sweep; `sockaddr_from_addr`/
+`addr_from_sockaddr` were kept for the TCP bind/local-addr path.) The
+`ReactorShared.ring`-first drop-order SAFETY INVARIANT comment must
+**extend to** the new `KIND_RAW_RECV` op/keep-alive map(s) (below), which
+— like every added field — are declared **below** `ring`, or ring
+teardown frees the buffers the kernel still points at.
 
 **Add** three small primitives:
 
@@ -156,21 +150,20 @@ map(s) (below), which — like every added field — are declared **below**
   (≤ 0 = EOF/error); the buffer round-trips so the pump reuses one 64 KiB
   allocation forever. `recv_raw` gets its own completion kind
   `KIND_RAW_RECV` (+ a cancel kind) with per-fd park/waker/tombstone maps
-  mirroring the deleted UDP-recv machinery — it must NOT ride `KIND_RECV`,
+  — it must NOT ride `KIND_RECV`,
   whose handler silently drops CQEs for fds absent from `conns` (TLS fds
   never call `register_conn`). `Reactor::send_raw(fd, cipher: Rc<Vec<u8>>) -> i32`
   — sends the whole buffer, looping partial `OP_SEND` completions like the
   existing send path (which already loops partials), riding the existing
   `KIND_SEND`/send-waker routing (its absent-`conns`-key lookup is a
   benign no-op) with a new **`SendAlive::RcVec(Rc<Vec<u8>>)`** keep-alive
-  variant replacing the deleted `UdpOp`. It **must be `Rc`-wrapped, not an
+  variant. It **must be `Rc`-wrapped, not an
   owned `SendAlive::Vec(Vec<u8>)`**: `send_buf_inner` `.clone()`s the
   keep-alive on *every* partial-write chunk (`_alive: Some(alive.clone())`
   per re-submitted SQE), so an owned `Vec` would deep-copy the entire
   ciphertext buffer once per chunk — every existing variant is `Rc`/`Static`
-  precisely to keep that clone O(1). Both follow the UDP ops' drop discipline
-  (drop = AsyncCancel + tombstone); `prep_sendmsg`/`prep_recvmsg` deletion
-  hits both the `Ring` trait and the `IoUringRing` impl.
+  precisely to keep that clone O(1). Both follow the reactor's cancellation
+  drop discipline (drop = AsyncCancel + tombstone, as `TimerFuture` does).
 - **Inbound buffer allocation (shared with the fd path)**: the TLS pump
   charges and allocates inbound frames through the *same* accounting the fd
   handler uses — no new counter API, no `release_inbound_memory`. Factor the
@@ -926,14 +919,13 @@ exactly as today (12 ⇒ ACK, anything else ⇒ STATUS_ERROR control block).
    lines total): conn state, read pump (`feed_decrypted` over a reused
    `io::RecvState`), flusher, `TlsPeer` internals, TLS/cert building. No
    `frame.rs` — the deframer is reused, not rebuilt.
-2. `crates/gnitz-engine/src/runtime/reactor/`: delete `udp.rs` + UDP
-   kinds/fields/preps (−~450 lines); retarget the `ring`-first drop-order
-   SAFETY INVARIANT comment off `udp_recv_ops` onto the new raw-recv maps;
+2. `crates/gnitz-engine/src/runtime/reactor/`: extend the `ring`-first
+   drop-order SAFETY INVARIANT comment onto the new raw-recv maps;
    add `recv_raw`/`send_raw` (`KIND_RAW_RECV` machinery + `SendAlive::RcVec(Rc<Vec<u8>>)`,
    ~170), `alloc_inbound_buf` factored out of the `handle_recv_cqe`
    `HeaderDone` arm and shared with the TLS pump (~10), `client_send_timeout`
    made `pub(crate)`, and multi-listener accept incl. per-listener EMFILE
-   backoff (~50). `posix_io.rs`: delete `udp_bind`/`udp_local_addr`, add
+   backoff (~50). `posix_io.rs`: add
    `tcp_bind` (incl. `SO_REUSEADDR`), `tcp_local_addr`, and `set_keepalive`
    (~55); the existing `shutdown` (SHUT_RDWR) is reused as-is.
 3. `crates/gnitz-engine/src/runtime/orchestration/peer.rs` +
@@ -1064,7 +1056,7 @@ path).
 - [ ] 2. `gnitz-core`: TLS client transport (parsing, rustls config,
        SkipVerify, `StreamOwned` framed I/O) + unit tests. Compiles green;
        integration deferred to 3.
-- [ ] 3. `gnitz-engine`: delete the UDP reactor ops; add
+- [ ] 3. `gnitz-engine`: add
        `recv_raw`/`send_raw`, multi-listener accept, `tcp_bind`; deps,
        `runtime/tls`, `PeerInner::Tls`, executor/bootstrap/CLI wiring;
        harness TLS support; Rust integration tests 1–12. `make test` green.

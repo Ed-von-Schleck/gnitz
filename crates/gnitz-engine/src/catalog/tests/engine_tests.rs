@@ -23,7 +23,7 @@ fn test_enforce_unique_pk() {
     };
     let live = |engine: &mut CatalogEngine| -> usize {
         engine.flush_family(tid).unwrap();
-        engine.scan_family(tid).unwrap().count
+        engine.scan_family(tid).unwrap().0.count
     };
 
     // ST1: insert a new PK.
@@ -366,18 +366,18 @@ fn test_ingest_scan_seek_family() {
     engine.flush_family(tid).unwrap();
 
     // Scan
-    let scan_batch = engine.scan_family(tid).unwrap();
+    let scan_batch = engine.scan_family(tid).unwrap().0;
     assert_eq!(scan_batch.count, 3);
 
     // Seek existing
-    let found = engine.seek_family(tid, 2u128, &[]).unwrap();
+    let found = engine.seek_family(tid, 2u128, &[]).unwrap().0;
     assert!(found.is_some());
     let row = found.unwrap();
     assert_eq!(row.count, 1);
     assert_eq!(row.get_pk(0), 2);
 
     // Seek missing
-    let not_found = engine.seek_family(tid, 99u128, &[]).unwrap();
+    let not_found = engine.seek_family(tid, 99u128, &[]).unwrap().0;
     assert!(not_found.is_none());
 
     engine.close();
@@ -401,7 +401,7 @@ fn seek_family_resolves_system_table_row() {
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
 
     // System-table point seek (narrow stride 8, empty extra).
-    let found = engine.seek_family(TABLE_TAB_ID, tid as u128, &[]).unwrap();
+    let found = engine.seek_family(TABLE_TAB_ID, tid as u128, &[]).unwrap().0;
     assert!(
         found.is_some(),
         "seek_family must resolve the TABLE_TAB row for the created table",
@@ -409,7 +409,7 @@ fn seek_family_resolves_system_table_row() {
     assert_eq!(found.unwrap().count, 1);
 
     // A missing system-table key returns None — not an error, not a panic.
-    let missing = engine.seek_family(TABLE_TAB_ID, 9_999_999u128, &[]).unwrap();
+    let missing = engine.seek_family(TABLE_TAB_ID, 9_999_999u128, &[]).unwrap().0;
     assert!(missing.is_none(), "absent system-table key seeks to None");
 
     engine.close();
@@ -443,7 +443,7 @@ fn test_ingest_unique_pk_partitioned() {
     engine.flush_family(tid).unwrap();
 
     // Scan — should have exactly 1 row with val=200
-    let scan = engine.scan_family(tid).unwrap();
+    let scan = engine.scan_family(tid).unwrap().0;
     assert_eq!(scan.count, 1);
     assert_eq!(scan.get_pk(0), 1);
 
@@ -702,7 +702,7 @@ fn test_circuit_table_surface_introspectable() {
 
     // The new schema is SQL-introspectable — `SELECT * FROM CircuitNodes`
     // must return what we just inserted (full-scan path, used by SQL planner).
-    let scan = engine.scan_family(CIRCUIT_NODES_TAB_ID).unwrap();
+    let scan = engine.scan_family(CIRCUIT_NODES_TAB_ID).unwrap().0;
     assert_eq!(scan.count, 1, "scan_family must expose CircuitNodes rows");
 
     // Compound PK: seek by the 16-byte at-rest PK region. begin_row writes

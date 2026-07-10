@@ -501,8 +501,7 @@ def test_workers_reduce_incremental(client):
 def test_trivial_preplan_no_exchange(client):
     """
     4b+4c: Trivial non-co-partitioned pre-plan (GROUP BY grp, shard col != pk).
-    Master pre-sends FLAG_PRELOADED_EXCHANGE; worker uses stash instead of IPC round-trip.
-    Correct COUNT result verifies the preload mechanism works.
+    Correct COUNT result verifies the trivial pre-plan path works.
     """
     sn = "w" + _uid()
     client.create_schema(sn)

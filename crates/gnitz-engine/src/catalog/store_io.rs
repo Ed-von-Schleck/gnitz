@@ -24,26 +24,36 @@ impl CatalogEngine {
     /// tables are pre-registered `Borrowed` handles (whose `full_scan`
     /// preserves the `Rc` snapshot cache), so one lookup serves every id —
     /// the CIRCUIT_* tables are SQL-introspectable through it like any other.
-    pub fn scan_family(&mut self, table_id: i64) -> Result<Rc<Batch>, String> {
+    /// Returns the scan plus the table's schema descriptor — the entry is
+    /// already resolved here, so the reply path never re-resolves (and
+    /// re-copies) the descriptor.
+    pub fn scan_family(&mut self, table_id: i64) -> Result<(Rc<Batch>, SchemaDescriptor), String> {
         let entry = self
             .dag
             .tables
             .get(&table_id)
             .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
-        Ok(entry.handle.full_scan())
+        Ok((entry.handle.full_scan(), entry.schema))
     }
 
     /// Point lookup by the wire seek pair. Decodes `(seek_pk, seek_pk_extra)` to
     /// the OPK key at any PK width via `seek_opk_bytes`, then seeks — resolving
     /// the registry entry once.
-    pub fn seek_family(&mut self, table_id: i64, seek_pk: u128, seek_pk_extra: &[u8]) -> Result<Option<Batch>, String> {
+    /// Returns the hit (if any) plus the table's schema descriptor — a miss
+    /// still needs the schema for its STATUS_OK reply block.
+    pub fn seek_family(
+        &mut self,
+        table_id: i64,
+        seek_pk: u128,
+        seek_pk_extra: &[u8],
+    ) -> Result<(Option<Batch>, SchemaDescriptor), String> {
         let entry = self
             .dag
             .tables
             .get(&table_id)
             .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
         let (opk, stride) = crate::schema::seek_opk_bytes(&entry.schema, seek_pk, seek_pk_extra)?;
-        Ok(Self::seek_entry_bytes(entry, &opk[..stride]))
+        Ok((Self::seek_entry_bytes(entry, &opk[..stride]), entry.schema))
     }
 
     /// Byte-keyed sibling of [`seek_family`] for callers that already hold the
@@ -150,7 +160,7 @@ impl CatalogEngine {
         table_id: i64,
         col_indices: &[u32],
         natives: &[u128],
-    ) -> Result<Option<Batch>, String> {
+    ) -> Result<(Option<Batch>, SchemaDescriptor), String> {
         let (entry, ic) = self.table_and_index(table_id, col_indices)?;
 
         let src_schema = entry.schema;
@@ -206,7 +216,7 @@ impl CatalogEngine {
         if natives.len() < col_indices.len() {
             pks.sort_unstable();
         }
-        Ok(Self::resolve_source_pks(&entry.handle, src_schema, &pks))
+        Ok((Self::resolve_source_pks(&entry.handle, src_schema, &pks), src_schema))
     }
 
     /// Resolve already-collected source PKs against the base table into a result
@@ -284,7 +294,7 @@ impl CatalogEngine {
         table_id: i64,
         col_indices: &[u32],
         range: &gnitz_wire::RangeDescriptor,
-    ) -> Result<Option<Batch>, String> {
+    ) -> Result<(Option<Batch>, SchemaDescriptor), String> {
         use gnitz_wire::Cut;
 
         let (entry, ic) = self.table_and_index(table_id, col_indices)?;
@@ -343,10 +353,12 @@ impl CatalogEngine {
         // saturated interval, or an inverted range like `x > 5 AND x < 3` the
         // planner does not pre-reject): short-circuit before constructing any
         // cursor or running the O(log N) seek.
-        let Some(start) = start else { return Ok(None) };
+        let Some(start) = start else {
+            return Ok((None, src_schema));
+        };
         let end = end.as_ref().map(|e| &e[..idx_pk_stride]);
         if end.is_some_and(|e| &start[..idx_pk_stride] >= e) {
-            return Ok(None);
+            return Ok((None, src_schema));
         }
 
         // One index cursor for the walk; collect each positive match's source PK.
@@ -374,7 +386,7 @@ impl CatalogEngine {
         // A range spans many duplicate groups, so the collected source PKs
         // interleave across the base table — sort to recover the ascending sweep.
         pks.sort_unstable();
-        Ok(Self::resolve_source_pks(&entry.handle, src_schema, &pks))
+        Ok((Self::resolve_source_pks(&entry.handle, src_schema, &pks), src_schema))
     }
 
     /// Flush a table's WAL.

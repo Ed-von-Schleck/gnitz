@@ -32,8 +32,7 @@ pub const FLAG_CONTINUATION: u64 = 1 << 52;
 /// above the SAL mirror (bits 0-15) and the wire packed fields rather than in
 /// the request-flag run at 4..256 — all of bits 0-15 are already allocated.
 /// Bit 54 is the lowest free request bit (50/51/53 are the engine-internal
-/// FLAG_BATCH_SORTED / FLAG_BATCH_CONSOLIDATED / FLAG_SCAN_LAST defined in
-/// `runtime/wire.rs`).
+/// FLAG_BATCH_SORTED / FLAG_BATCH_CONSOLIDATED / FLAG_SCAN_LAST below).
 pub const FLAG_GET_INDICES: u64 = 1 << 54;
 
 /// SEEK_BY_INDEX_RANGE request flag. The client→master leg of an ordered
@@ -65,6 +64,22 @@ pub const FLAG_ALLOCATE_SERIAL_RANGE: u64 = 1 << 56;
 /// flag by the compile-time guard below.
 pub const FLAG_DDL_TXN: u64 = 1 << 57;
 
+/// ID-allocation request flags (client→master, answered master-locally,
+/// never written to the SAL). High client-only bits above FLAG_DDL_TXN.
+pub const FLAG_ALLOCATE_TABLE_ID: u64 = 1 << 58;
+pub const FLAG_ALLOCATE_SCHEMA_ID: u64 = 1 << 59;
+pub const FLAG_ALLOCATE_INDEX_ID: u64 = 1 << 60;
+
+/// Engine-internal batch-layout claims stamped on SAL / W2M frames
+/// (sorted / consolidated); never sent to clients. Defined here so the
+/// disjointness guard below covers them against every wire flag.
+pub const FLAG_BATCH_SORTED: u64 = 1 << 50;
+pub const FLAG_BATCH_CONSOLIDATED: u64 = 1 << 51;
+/// Engine-internal W2M flag set on the last (or only) scan chunk from a
+/// worker; stripped before reaching clients. See the engine's reply path
+/// for why FLAG_CONTINUATION cannot carry this meaning.
+pub const FLAG_SCAN_LAST: u64 = 1 << 53;
+
 // ---------------------------------------------------------------------------
 // Wire-level packed fields: bits 16-39 of wire_flags
 // ---------------------------------------------------------------------------
@@ -80,45 +95,37 @@ const WIRE_INDEX_VERSION_SHIFT: u32 = 40;
 const WIRE_INDEX_VERSION_MASK: u64 = 0xFF_u64 << WIRE_INDEX_VERSION_SHIFT;
 
 // Compile-time guard: SAL flags (bits 0-15) must stay clear of the wire-level
-// packed fields, those fields must not overlap each other, the packed fields
-// must not collide with the high boolean flags, and the GET_INDICES request
-// flag must avoid all of the above (catches a regression to a colliding bit at
-// compile time).
+// packed fields, those fields must not overlap each other, and every high
+// boolean flag (bits 48+, including the engine-internal ones) must be disjoint
+// from the SAL mirror, the packed fields, and each other (catches a regression
+// to a colliding bit at compile time).
 const _: () = {
     let packed = WIRE_CONFLICT_MODE_MASK | WIRE_SCHEMA_VERSION_MASK | WIRE_INDEX_VERSION_MASK;
     assert!(SAL_FLAGS_MASK & packed == 0);
     assert!(WIRE_CONFLICT_MODE_MASK & WIRE_SCHEMA_VERSION_MASK == 0);
     assert!(WIRE_SCHEMA_VERSION_MASK & WIRE_INDEX_VERSION_MASK == 0);
-    assert!(packed & (FLAG_HAS_SCHEMA | FLAG_HAS_DATA | FLAG_CONTINUATION) == 0);
-    assert!(FLAG_GET_INDICES & (SAL_FLAGS_MASK | packed | FLAG_HAS_SCHEMA | FLAG_HAS_DATA | FLAG_CONTINUATION) == 0);
-    assert!(
-        FLAG_SEEK_BY_INDEX_RANGE
-            & (SAL_FLAGS_MASK | packed | FLAG_HAS_SCHEMA | FLAG_HAS_DATA | FLAG_CONTINUATION | FLAG_GET_INDICES)
-            == 0
-    );
-    assert!(
-        FLAG_ALLOCATE_SERIAL_RANGE
-            & (SAL_FLAGS_MASK
-                | packed
-                | FLAG_HAS_SCHEMA
-                | FLAG_HAS_DATA
-                | FLAG_CONTINUATION
-                | FLAG_GET_INDICES
-                | FLAG_SEEK_BY_INDEX_RANGE)
-            == 0
-    );
-    assert!(
-        FLAG_DDL_TXN
-            & (SAL_FLAGS_MASK
-                | packed
-                | FLAG_HAS_SCHEMA
-                | FLAG_HAS_DATA
-                | FLAG_CONTINUATION
-                | FLAG_GET_INDICES
-                | FLAG_SEEK_BY_INDEX_RANGE
-                | FLAG_ALLOCATE_SERIAL_RANGE)
-            == 0
-    );
+    let high_flags = [
+        FLAG_HAS_SCHEMA,
+        FLAG_HAS_DATA,
+        FLAG_BATCH_SORTED,
+        FLAG_BATCH_CONSOLIDATED,
+        FLAG_CONTINUATION,
+        FLAG_SCAN_LAST,
+        FLAG_GET_INDICES,
+        FLAG_SEEK_BY_INDEX_RANGE,
+        FLAG_ALLOCATE_SERIAL_RANGE,
+        FLAG_DDL_TXN,
+        FLAG_ALLOCATE_TABLE_ID,
+        FLAG_ALLOCATE_SCHEMA_ID,
+        FLAG_ALLOCATE_INDEX_ID,
+    ];
+    let mut acc = SAL_FLAGS_MASK | packed;
+    let mut i = 0;
+    while i < high_flags.len() {
+        assert!(high_flags[i] & acc == 0, "wire flag bit collision");
+        acc |= high_flags[i];
+        i += 1;
+    }
 };
 
 #[inline]

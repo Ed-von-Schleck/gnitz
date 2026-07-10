@@ -1,6 +1,6 @@
 use crate::runtime::wire::{
     batch_to_schema, build_schema_wire_block, decode_wire, encode_ctrl_block_direct, encode_ctrl_block_ipc,
-    encode_wire, encode_wire_into, peek_control_block, peek_routing_header, schema_to_batch, wire_size,
+    encode_wire, encode_wire_into, peek_client_control, peek_control_block, schema_to_batch, wire_size,
     CTRL_BLOCK_SIZE_NO_BLOB, STATUS_ERROR, STATUS_OK,
 };
 use crate::schema::{encode_german_string, try_decode_german_string, type_code, SchemaColumn, SchemaDescriptor};
@@ -647,20 +647,20 @@ fn decode_control_block_all_fields_round_trip() {
 }
 
 #[test]
-fn peek_routing_header_on_valid_wire() {
+fn peek_client_control_on_valid_wire() {
     let wire = encode_wire(99, 0xCAFE_BABE, 0, 0u128, 0, 0, STATUS_OK, b"", None, None, None);
-    let (tid, cid) = peek_routing_header(&wire).unwrap();
-    assert_eq!(tid, 99);
-    assert_eq!(cid, 0xCAFE_BABE);
+    let ctrl = peek_client_control(&wire).unwrap();
+    assert_eq!(ctrl.target_id, 99);
+    assert_eq!(ctrl.client_id, 0xCAFE_BABE);
 }
 
 #[test]
-fn peek_routing_header_rejects_short_data() {
+fn peek_client_control_rejects_short_data() {
     // Any slice shorter than WAL_HEADER_SIZE must fail.
-    let result = peek_routing_header(&[0u8; 10]);
+    let result = peek_client_control(&[0u8; 10]);
     assert!(
         result.is_err(),
-        "peek_routing_header should reject slices < WAL_HEADER_SIZE"
+        "peek_client_control should reject slices < WAL_HEADER_SIZE"
     );
 }
 

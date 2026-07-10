@@ -12,7 +12,7 @@ use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::query::ExchangeCallback;
 use crate::runtime::sal::{
     schema_wire_safe, SalMessageKind, SalReader, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_STOP,
-    BACKFILL_PAD_BIT, FLAG_CHECKPOINT, FLAG_EXCHANGE,
+    BACKFILL_PAD_BIT, FLAG_EXCHANGE,
 };
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::w2m_ring;
@@ -20,24 +20,6 @@ use crate::runtime::wire::{self as ipc, FLAG_CONTINUATION, FLAG_SCAN_LAST, STATU
 use crate::schema::SchemaDescriptor;
 use crate::storage::Batch;
 use crate::storage::{BlobCacheGuard, FlushOutcome, FlushWork, PkBuf, StorageError, Table};
-
-// ---------------------------------------------------------------------------
-// PendingScan
-// ---------------------------------------------------------------------------
-
-/// State for one multi-chunk reply train (scan, or an oversized seek/gather
-/// reply) in progress. The worker emits one frame per `drain_sal` pass;
-/// `next_row == 0` means the first chunk still needs a schema block. Non-zero
-/// `next_row` is a pure-data continuation.
-struct PendingScan {
-    batch: Rc<Batch>,
-    next_row: usize,
-    request_id: u64,
-    client_id: u64,
-    target_id: u64,
-    prebuilt_schema: Option<Rc<Vec<u8>>>,
-    server_version: u16,
-}
 
 // ---------------------------------------------------------------------------
 // WorkerExchangeHandler
@@ -122,7 +104,6 @@ enum DispatchOutcome {
 }
 
 struct WorkerExchangeHandler {
-    stash: HashMap<i64, Batch>,
     deferred: Vec<DeferredDdl>,
     /// FLAG_TICK messages encountered inside `do_exchange_wait` while waiting
     /// for a FLAG_EXCHANGE_RELAY. Stashed here and replayed (via
@@ -153,34 +134,6 @@ struct WorkerExchangeHandler {
     backfill_signal: Option<BackfillRound>,
 }
 
-impl WorkerExchangeHandler {
-    /// Stash a `FLAG_PRELOADED_EXCHANGE` batch for `view_id`.
-    ///
-    /// **Invariant: at most one preloaded batch per `view_id` per epoch.**
-    /// The stash is keyed by `view_id` only — a second insert for the same
-    /// view (typical for joins where the master emits preloaded data per
-    /// input source) would silently overwrite the first. The debug assert
-    /// turns that latent bug into a panic in dev/test builds; the master
-    /// must batch all preloaded data for a view into a single SAL group
-    /// before any consumer (`do_exchange_wait`) drains it.
-    ///
-    /// As of this writing the master does not emit `FLAG_PRELOADED_EXCHANGE`
-    /// at all; this code path is dead and the assert documents the
-    /// constraint that any future emitter must respect. If multi-source
-    /// preloaded groups become a real protocol need, re-key `stash` to
-    /// `(view_id, source_id)` (mirroring `pending_relays`) and update both
-    /// `dispatch_top_level`'s prelude drain and `do_exchange_wait`'s stash
-    /// lookup.
-    fn stash_preloaded(&mut self, view_id: i64, batch: Batch) {
-        debug_assert!(
-            !self.stash.contains_key(&view_id),
-            "stash_preloaded: view_id={view_id} already has a preloaded batch — \
-             multi-source preloaded for the same view would silently overwrite",
-        );
-        self.stash.insert(view_id, batch);
-    }
-}
-
 /// Bridges the DAG's `ExchangeCallback` requirement to `WorkerProcess`.
 /// Holds a mutable reference to the worker so `do_exchange` can re-enter
 /// the worker's handlers (`handle_push`, `handle_tick`) inline when those
@@ -205,8 +158,6 @@ impl<'a> ExchangeCallback for WorkerExchangeCtx<'a> {
 
 pub struct WorkerProcess {
     worker_id: u32,
-    #[allow(dead_code)]
-    num_workers: usize,
     master_pid: i32,
     catalog: *mut CatalogEngine,
     sal_reader: SalReader,
@@ -263,6 +214,9 @@ mod exchange;
 mod fsync;
 mod reply;
 
+pub(crate) use reply::send_unique_preflight_keys;
+use reply::PendingScan;
+
 use fsync::uring_batch_fdatasync;
 
 /// Concurrent-fd budget for the barrier flush. Bounds both the per-table
@@ -314,11 +268,6 @@ enum ReplySchema<'a> {
 }
 
 impl<'a> ReplySchema<'a> {
-    /// The table's own schema, or `None` when the catalog has no such table.
-    fn table(s: Option<&'a SchemaDescriptor>) -> Self {
-        s.map_or(ReplySchema::None, ReplySchema::Table)
-    }
-
     fn descriptor(self) -> Option<&'a SchemaDescriptor> {
         match self {
             ReplySchema::None => None,
@@ -352,7 +301,6 @@ fn filter_by_pk_bytes(
 impl WorkerProcess {
     pub fn new(
         worker_id: u32,
-        num_workers: usize,
         master_pid: i32,
         catalog: *mut CatalogEngine,
         sal_reader: SalReader,
@@ -364,17 +312,15 @@ impl WorkerProcess {
         pending_deltas: HashMap<i64, Batch>,
     ) -> Self {
         // Worker rank/count (and role) are latched in the fork child before any
-        // catalog work — see `server_main`. Not set here: boot-compiled plans
+        // catalog work — see `server_main`, not here: boot-compiled plans
         // would otherwise carry rank 0 / num_workers 1.
         WorkerProcess {
             worker_id,
-            num_workers,
             master_pid,
             catalog,
             sal_reader,
             w2m_writer,
             exchange: WorkerExchangeHandler {
-                stash: HashMap::new(),
                 deferred: Vec::new(),
                 deferred_ticks: Vec::new(),
                 pending_relays: HashMap::new(),
@@ -458,7 +404,7 @@ impl WorkerProcess {
             self.emit_pending_scan_chunk();
         }
         while let Some((kind, target_id, wire)) = self.next_sal_message() {
-            match self.dispatch_top_level(kind, target_id, wire) {
+            match self.dispatch(DispatchContext::TopLevel, kind, target_id, wire) {
                 DispatchOutcome::Continue => {
                     // Replay ticks deferred during any exchange wait now that the
                     // outer tick's ACK has been sent. Pushes are handled inline in
@@ -475,89 +421,6 @@ impl WorkerProcess {
                     debug_assert!(false, "RelayMatched at top-level drain_sal");
                 }
             }
-        }
-    }
-
-    /// Emit one frame of the FRONT pending train; pops it off the queue when
-    /// its terminal chunk is sent. Called at the top of every `drain_sal` pass
-    /// while `pending_streams` is non-empty (see the field doc for why
-    /// emission is FIFO and confined to `drain_sal` / `run`). Unit tests set
-    /// a small `reply_frame_budget` to force multi-frame trains from small
-    /// batches.
-    fn emit_pending_scan_chunk(&mut self) {
-        let budget = self.reply_frame_budget;
-        let (batch, next_row, request_id, client_id, target_id, prebuilt_schema, server_version) = {
-            let ps = match self.pending_streams.front() {
-                Some(ps) => ps,
-                None => return,
-            };
-            (
-                Rc::clone(&ps.batch),
-                ps.next_row,
-                ps.request_id,
-                ps.client_id,
-                ps.target_id,
-                ps.prebuilt_schema.clone(),
-                ps.server_version,
-            )
-        };
-
-        let is_first = next_row == 0;
-        // prebuilt_opt drives the schema block: Some on the first chunk when the
-        // client needs the schema, None on continuations and schema-suppressed frames.
-        // encode_wire_into_range uses the prebuilt bytes directly; no schema arg needed.
-        let prebuilt_opt: Option<&[u8]> = if is_first {
-            prebuilt_schema.as_deref().map(Vec::as_slice)
-        } else {
-            None
-        };
-
-        let remaining = batch.count - next_row;
-        // Compute rows per chunk via linear interpolation (wire-safe schemas have
-        // constant per-row stride, so wire size is linear in count).
-        let sz_0 = ipc::wire_size_range(STATUS_OK, &[], None, None, &batch, 0, prebuilt_opt);
-        let sz_1 = ipc::wire_size_range(STATUS_OK, &[], None, None, &batch, 1, prebuilt_opt);
-        let per_row = sz_1.saturating_sub(sz_0);
-        let usable = budget.saturating_sub(sz_0);
-        let max_rows = match usable.checked_div(per_row) {
-            Some(rows) => rows.max(1).min(remaining),
-            None => remaining.max(1), // per_row == 0: constant wire size, send all
-        };
-        let has_more = next_row + max_rows < batch.count;
-        // FLAG_CONTINUATION is always set on worker scan frames so the client's
-        // loop termination ("stop on no FLAG_CONTINUATION") still works.
-        // FLAG_SCAN_LAST is the W2M-internal signal that this is the last chunk.
-        // server_version is always embedded so the master decode path can verify.
-        let flags: u64 = gnitz_wire::wire_flags_set_schema_version(
-            FLAG_CONTINUATION | if !has_more { FLAG_SCAN_LAST } else { 0 },
-            server_version,
-        );
-        // wire_size_range is linear in count for wire-safe schemas; avoid a third call.
-        let sz = sz_0 + per_row * max_rows;
-        self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
-            ipc::encode_wire_into_range(
-                buf,
-                0,
-                target_id,
-                client_id,
-                flags,
-                0,
-                STATUS_OK, // request_id=0 in payload; ring prefix carries the req_id
-                None,
-                &batch,
-                next_row,
-                max_rows,
-                prebuilt_opt,
-            );
-        });
-
-        if has_more {
-            self.pending_streams
-                .front_mut()
-                .expect("emit_pending_scan_chunk: front train vanished mid-emit")
-                .next_row = next_row + max_rows;
-        } else {
-            self.pending_streams.pop_front();
         }
     }
 
@@ -590,46 +453,6 @@ impl WorkerProcess {
         Some((msg.kind, msg.target_id as i64, msg.wire_data))
     }
 
-    /// Dispatch a SAL message at the top level — drains any preloaded
-    /// prelude groups before handing the underlying message to the
-    /// unified dispatcher.
-    fn dispatch_top_level(
-        &mut self,
-        mut kind: SalMessageKind,
-        mut target_id: i64,
-        mut wire: Option<&'static [u8]>,
-    ) -> DispatchOutcome {
-        // Drain a (possibly chained) preloaded-exchange prelude before
-        // processing the underlying message. Each preloaded group stashes
-        // a batch keyed by view_id; the next group at the same epoch
-        // becomes the message we actually dispatch.
-        while kind == SalMessageKind::PreloadedExchange {
-            let _ = self.dispatch(DispatchContext::TopLevel, kind, target_id, wire);
-            match self.next_sal_message() {
-                Some((k, t, w)) => {
-                    kind = k;
-                    target_id = t;
-                    wire = w;
-                }
-                None => return DispatchOutcome::Continue,
-            }
-        }
-        self.dispatch(DispatchContext::TopLevel, kind, target_id, wire)
-    }
-
-    /// Decode wire bytes for dispatch.
-    ///
-    /// At top-level we go through the per-target schema cache — the wire
-    /// for hot kinds (PUSH/TICK/SEEK) carries the same data schema for
-    /// every group with that `target_id`, so re-skipping the encoded
-    /// schema block on cache hit is a worthwhile optimization. DDL_SYNC
-    /// (catalog schema) and HAS_PK (index or parent-table schema) bypass
-    /// the cache: their schema blocks may differ from the cached
-    /// user-table schema for the same `target_id`.
-    ///
-    /// Inside an exchange wait we always do a full decode — same reason
-    /// as DDL_SYNC/HAS_PK — and the schema cache is intentionally
-    /// untouched there.
     /// The single source of truth for the inline-vs-defer matrix.
     /// Match exhaustiveness (`match (ctx, kind)`) means a new
     /// `SalMessageKind` variant cannot be added without explicitly
@@ -641,15 +464,17 @@ impl WorkerProcess {
     /// |-------------------|------------------------|---------------------------------------|
     /// | Shutdown          | inline                 | inline                                |
     /// | Flush             | inline (resets cursor) | inline (same)                         |
+    /// | FlushEph          | inline                 | inline                                |
     /// | DdlSync           | apply via cat().ddl_sync | defer to exchange.deferred          |
     /// | ExchangeRelay     | (unreachable, warn)    | match want_key OR park in pending_relays |
-    /// | PreloadedExchange | drained by dispatch_top_level prelude | stash by view_id    |
     /// | Backfill          | inline                 | inline                                |
     /// | HasPk             | inline                 | inline                                |
+    /// | Gather            | inline                 | inline                                |
     /// | UniquePreflight   | inline                 | inline                                |
     /// | Push              | inline (must)          | inline (must — sal_writer_excl deadlock) |
     /// | Tick              | inline + replay defer  | defer to exchange.deferred_ticks      |
     /// | SeekByIndex       | inline                 | inline                                |
+    /// | SeekByIndexRange  | inline                 | inline                                |
     /// | Seek              | inline                 | inline                                |
     /// | Scan              | inline                 | inline                                |
     ///
@@ -684,10 +509,6 @@ impl WorkerProcess {
     ///   drive the inline DAG with the wrong sharding columns. Mismatched
     ///   relays are parked in `pending_relays` and picked up by the next
     ///   nested wait that asks for the right pair.
-    ///
-    /// * **PreloadedExchange stash.** Keyed by `view_id` only on the
-    ///   stash side (`WorkerExchangeHandler::stash`). See `stash_preloaded`
-    ///   for the single-source-per-view invariant.
     fn dispatch(
         &mut self,
         ctx: DispatchContext,
@@ -785,24 +606,6 @@ impl WorkerProcess {
                 DispatchOutcome::Continue
             }
 
-            // ── PreloadedExchange: stash in both contexts ──────────────
-            // (At TopLevel, dispatch_top_level's prelude loop calls us
-            // for each chained preloaded group before the underlying
-            // message; the stash side-effect is the same in both
-            // contexts.)
-            (_, SalMessageKind::PreloadedExchange) => {
-                if let Some(data) = wire {
-                    if let Ok(decoded) = ipc::decode_wire(data) {
-                        if let Some(batch) = decoded.data_batch {
-                            self.exchange.stash_preloaded(target_id, batch);
-                        } else if let Some(s) = decoded.schema {
-                            self.exchange.stash_preloaded(target_id, Batch::with_schema(s, 0));
-                        }
-                    }
-                }
-                DispatchOutcome::Continue
-            }
-
             // ── All others: identical inline behavior in both contexts ─
             (_, SalMessageKind::Shutdown)
             | (_, SalMessageKind::Flush)
@@ -820,9 +623,8 @@ impl WorkerProcess {
     }
 
     /// Decode (with the context-appropriate schema cache policy) and
-    /// dispatch through `dispatch_inner`, mapping its `DispatchResult`
-    /// into a `DispatchOutcome`. Errors are sent on the W2M ring with
-    /// the inbound request_id so the master reactor can route the
+    /// dispatch through `dispatch_inner`. Errors are sent on the W2M ring
+    /// with the inbound request_id so the master reactor can route the
     /// failure back to the original caller.
     fn run_via_dispatch_inner(
         &mut self,
@@ -832,39 +634,37 @@ impl WorkerProcess {
     ) -> DispatchOutcome {
         let decoded = wire.and_then(|data| ipc::decode_wire(data).ok());
         let request_id = decoded.as_ref().map(|d| d.control.request_id).unwrap_or(0);
-        match self.dispatch_inner(kind, target_id, decoded, request_id) {
-            DispatchResult::Continue => DispatchOutcome::Continue,
-            DispatchResult::Error(msg) => {
-                self.send_error(&msg, request_id);
-                if kind == SalMessageKind::DdlSync {
-                    // DDL application failure on trusted master→worker IPC means
-                    // memory corruption or an engine bug; continuing would leave
-                    // this worker with a permanently stale catalog.
-                    self.fatal_shutdown(&format!("DdlSync application failed for tid={target_id}: {msg}"));
-                }
-                DispatchOutcome::Continue
+        if let Err(msg) = self.dispatch_inner(kind, target_id, decoded, request_id) {
+            self.send_error(&msg, request_id);
+            if kind == SalMessageKind::DdlSync {
+                // DDL application failure on trusted master→worker IPC means
+                // memory corruption or an engine bug; continuing would leave
+                // this worker with a permanently stale catalog.
+                self.fatal_shutdown(&format!("DdlSync application failed for tid={target_id}: {msg}"));
             }
         }
+        DispatchOutcome::Continue
     }
 
     fn dispatch_inner(
         &mut self,
         kind: SalMessageKind,
         target_id: i64,
-        decoded: Option<ipc::DecodedWire>,
+        mut decoded: Option<ipc::DecodedWire>,
         request_id: u64,
-    ) -> DispatchResult {
+    ) -> Result<(), String> {
         // Extract control fields before consuming decoded
         let seek_pk = decoded.as_ref().map(|d| d.control.seek_pk).unwrap_or(0);
         let seek_col_idx = decoded.as_ref().map(|d| d.control.seek_col_idx).unwrap_or(0);
         let client_id = decoded.as_ref().map(|d| d.control.client_id).unwrap_or(0);
         let ctrl_wire_flags = decoded.as_ref().map(|d| d.control.flags).unwrap_or(0);
         let client_version = gnitz_wire::wire_flags_get_schema_version(ctrl_wire_flags);
-        // Wide-PK seek key tail (bytes 16..stride); empty for narrow PKs. Must be
+        // Wide-PK seek key tail (bytes 16..stride); empty for narrow PKs. Taken
+        // (not cloned) — nothing reads the control block after this point — and
         // extracted before `decoded` is consumed by the `data_batch` take below.
         let seek_pk_extra: Vec<u8> = decoded
-            .as_ref()
-            .map(|d| d.control.seek_pk_extra.clone())
+            .as_mut()
+            .map(|d| std::mem::take(&mut d.control.seek_pk_extra))
             .unwrap_or_default();
 
         // Extract batch (consumes decoded)
@@ -876,10 +676,10 @@ impl WorkerProcess {
             SalMessageKind::Flush => {
                 self.advance_read_epoch();
                 match self.handle_flush_all() {
-                    Ok(()) => self.send_ack(0, FLAG_CHECKPOINT as u64, request_id),
+                    Ok(()) => self.send_ack(0, 0, request_id),
                     Err(msg) => self.send_error(&msg, request_id),
                 }
-                DispatchResult::Continue
+                Ok(())
             }
 
             // Ephemeral-state flush round: persist every view's operator-trace
@@ -888,18 +688,16 @@ impl WorkerProcess {
             SalMessageKind::FlushEph => {
                 self.advance_read_epoch();
                 match self.handle_flush_all_ephemeral() {
-                    Ok(()) => self.send_ack(0, FLAG_CHECKPOINT as u64, request_id),
+                    Ok(()) => self.send_ack(0, 0, request_id),
                     Err(msg) => self.send_error(&msg, request_id),
                 }
-                DispatchResult::Continue
+                Ok(())
             }
 
             SalMessageKind::DdlSync => {
                 if let Some(batch) = batch {
                     if batch.count > 0 {
-                        if let Err(msg) = self.cat().ddl_sync(target_id, batch) {
-                            return DispatchResult::Error(msg);
-                        }
+                        self.cat().ddl_sync(target_id, batch)?;
                         // Drop hooks queue the entity's directory, but the master
                         // (which shares this on-disk tree) physically removes it
                         // after the DDL zone is durable. Discard the worker's
@@ -917,25 +715,21 @@ impl WorkerProcess {
                         gnitz_debug!("W{} ddl_sync tid={}", self.worker_id, target_id);
                     }
                 }
-                DispatchResult::Continue
+                Ok(())
             }
 
             SalMessageKind::Backfill => {
                 // `target_id` is the source table; `seek_pk` carries the view to
                 // drive.
-                if let Err(msg) = self.handle_backfill(target_id, seek_pk as i64, request_id) {
-                    return DispatchResult::Error(msg);
-                }
+                self.handle_backfill(target_id, seek_pk as i64, request_id)?;
                 self.send_ack(target_id as u64, 0, request_id);
-                DispatchResult::Continue
+                Ok(())
             }
 
             SalMessageKind::HasPk => {
                 let lookup = HasPkLookup::from_wire(seek_col_idx);
-                if let Err(msg) = self.handle_has_pk(target_id, batch, lookup, request_id, client_id, seek_pk) {
-                    return DispatchResult::Error(msg);
-                }
-                DispatchResult::Continue
+                self.handle_has_pk(target_id, batch, lookup, request_id, client_id, seek_pk)?;
+                Ok(())
             }
 
             SalMessageKind::Gather => {
@@ -956,65 +750,48 @@ impl WorkerProcess {
                     Some(b) => (0..b.count).map(|i| PkBuf::from_bytes(b.get_pk_bytes(i))).collect(),
                     None => Vec::new(),
                 };
-                let gathered = self.cat().gather_family_bytes(target_id, &pks, &project);
-                match gathered {
-                    Ok(result) => {
-                        // The projected reply schema is synthetic — never the
-                        // table's cached block.
-                        let schema = result.schema;
-                        if let Some(err) = self.stream_batch_response(
-                            target_id as u64,
-                            Some(result),
-                            schema.as_ref().map_or(ReplySchema::None, ReplySchema::OneOff),
-                            request_id,
-                            client_id,
-                            0,
-                        ) {
-                            return DispatchResult::Error(err);
-                        }
-                    }
-                    Err(msg) => return DispatchResult::Error(msg),
-                }
-                DispatchResult::Continue
+                let result = self.cat().gather_family_bytes(target_id, &pks, &project)?;
+                // The projected reply schema is synthetic — never the
+                // table's cached block.
+                let schema = result.schema;
+                self.stream_batch_response(
+                    target_id as u64,
+                    Some(result),
+                    schema.as_ref().map_or(ReplySchema::None, ReplySchema::OneOff),
+                    request_id,
+                    client_id,
+                    0,
+                )
             }
 
             SalMessageKind::Push => {
                 if let Some(batch) = batch {
                     if batch.count > 0 {
-                        if let Err(msg) = self.handle_push(target_id, batch, request_id) {
-                            return DispatchResult::Error(msg);
-                        }
+                        self.handle_push(target_id, batch, request_id)?;
                     }
                 }
                 self.send_ack(target_id as u64, 0, request_id);
-                DispatchResult::Continue
+                Ok(())
             }
 
             SalMessageKind::Tick => {
-                if let Err(msg) = self.handle_tick(target_id, request_id) {
-                    return DispatchResult::Error(msg);
-                }
+                self.handle_tick(target_id, request_id)?;
                 self.send_ack(target_id as u64, 0, request_id);
-                DispatchResult::Continue
+                Ok(())
             }
 
             SalMessageKind::SeekByIndex => {
-                let cols = match self.validated_index_cols(target_id, seek_col_idx, "seek_by_index") {
-                    Ok(cols) => cols,
-                    Err(msg) => return DispatchResult::Error(msg),
-                };
+                let cols = self.validated_index_cols(target_id, seek_col_idx, "seek_by_index")?;
                 // Reassemble the K native values: slot 0 in seek_pk, slots 1..K in
                 // seek_pk_extra. A prefix seek supplies K < cols.len() values. Each
                 // extra slot is exactly 16 bytes; reject a misaligned payload at
                 // the trust boundary rather than silently dropping trailing bytes.
                 if !seek_pk_extra.len().is_multiple_of(16) {
-                    return DispatchResult::Error(
-                        "seek_by_index: seek_pk_extra length is not a multiple of 16".to_string(),
-                    );
+                    return Err("seek_by_index: seek_pk_extra length is not a multiple of 16".to_string());
                 }
                 let k = 1 + seek_pk_extra.len() / 16;
                 if k > cols.as_slice().len() {
-                    return DispatchResult::Error(format!(
+                    return Err(format!(
                         "seek_by_index: {k} key values exceed index arity {}",
                         cols.as_slice().len()
                     ));
@@ -1024,57 +801,36 @@ impl WorkerProcess {
                 for i in 1..k {
                     natives[i] = u128::from_le_bytes(seek_pk_extra[(i - 1) * 16..i * 16].try_into().unwrap());
                 }
-                match self.cat().seek_by_index(target_id, cols.as_slice(), &natives[..k]) {
-                    Ok(result) => {
-                        let schema = self.cat().get_schema_desc(target_id);
-                        if let Some(err) = self.stream_batch_response(
-                            target_id as u64,
-                            result,
-                            ReplySchema::table(schema.as_ref()),
-                            request_id,
-                            client_id,
-                            seek_pk,
-                        ) {
-                            return DispatchResult::Error(err);
-                        }
-                    }
-                    Err(msg) => return DispatchResult::Error(msg),
-                }
-                DispatchResult::Continue
+                let (result, schema) = self.cat().seek_by_index(target_id, cols.as_slice(), &natives[..k])?;
+                self.stream_batch_response(
+                    target_id as u64,
+                    result,
+                    ReplySchema::Table(&schema),
+                    request_id,
+                    client_id,
+                    seek_pk,
+                )
             }
 
             SalMessageKind::SeekByIndexRange => {
-                let cols = match self.validated_index_cols(target_id, seek_col_idx, "seek_by_index_range") {
-                    Ok(cols) => cols,
-                    Err(msg) => return DispatchResult::Error(msg),
-                };
+                let cols = self.validated_index_cols(target_id, seek_col_idx, "seek_by_index_range")?;
                 // Decode the range descriptor from seek_pk_extra. `decode`
                 // validates the exact length and arity cap at the trust boundary
                 // (mirroring the SeekByIndex `% 16` guard), so a malformed frame
                 // is rejected rather than mis-decoded; the arity check against
                 // the actual column list is the engine method's self-guard,
                 // whose Err surfaces through the same error path below.
-                let desc = match gnitz_wire::RangeDescriptor::decode(&seek_pk_extra) {
-                    Ok(desc) => desc,
-                    Err(e) => return DispatchResult::Error(format!("seek_by_index_range: {e}")),
-                };
-                match self.cat().seek_by_index_range(target_id, cols.as_slice(), &desc) {
-                    Ok(result) => {
-                        let schema = self.cat().get_schema_desc(target_id);
-                        if let Some(err) = self.stream_batch_response(
-                            target_id as u64,
-                            result,
-                            ReplySchema::table(schema.as_ref()),
-                            request_id,
-                            client_id,
-                            0,
-                        ) {
-                            return DispatchResult::Error(err);
-                        }
-                    }
-                    Err(msg) => return DispatchResult::Error(msg),
-                }
-                DispatchResult::Continue
+                let desc = gnitz_wire::RangeDescriptor::decode(&seek_pk_extra)
+                    .map_err(|e| format!("seek_by_index_range: {e}"))?;
+                let (result, schema) = self.cat().seek_by_index_range(target_id, cols.as_slice(), &desc)?;
+                self.stream_batch_response(
+                    target_id as u64,
+                    result,
+                    ReplySchema::Table(&schema),
+                    request_id,
+                    client_id,
+                    0,
+                )
             }
 
             SalMessageKind::Seek => {
@@ -1082,42 +838,28 @@ impl WorkerProcess {
                 // native bytes) + seek_pk_extra (the 16..stride suffix, empty for
                 // narrow PKs). `seek_family` decodes it through `seek_opk_bytes`
                 // at every width — user and system tables alike, no width fork.
-                let result = self.cat().seek_family(target_id, seek_pk, &seek_pk_extra);
-                match result {
-                    Ok(result) => {
-                        let schema = self.cat().get_schema_desc(target_id);
-                        self.send_response(
-                            target_id as u64,
-                            result.as_ref(),
-                            ReplySchema::table(schema.as_ref()),
-                            request_id,
-                            client_id,
-                            seek_pk,
-                        );
-                    }
-                    Err(msg) => return DispatchResult::Error(msg),
-                }
-                DispatchResult::Continue
+                let (result, schema) = self.cat().seek_family(target_id, seek_pk, &seek_pk_extra)?;
+                self.send_response(
+                    target_id as u64,
+                    result.as_ref(),
+                    ReplySchema::Table(&schema),
+                    request_id,
+                    client_id,
+                    seek_pk,
+                );
+                Ok(())
             }
 
             SalMessageKind::Scan => {
-                match self.cat().scan_family(target_id) {
-                    Ok(result) => {
-                        let schema = self.cat().get_schema_desc(target_id);
-                        if let Some(err) = self.send_scan_response(
-                            target_id as u64,
-                            result,
-                            ReplySchema::table(schema.as_ref()),
-                            request_id,
-                            client_id,
-                            client_version,
-                        ) {
-                            return DispatchResult::Error(err);
-                        }
-                    }
-                    Err(msg) => return DispatchResult::Error(msg),
-                }
-                DispatchResult::Continue
+                let (result, schema) = self.cat().scan_family(target_id)?;
+                self.send_scan_response(
+                    target_id as u64,
+                    result,
+                    ReplySchema::Table(&schema),
+                    request_id,
+                    client_id,
+                    client_version,
+                )
             }
 
             SalMessageKind::UniquePreflight => {
@@ -1129,29 +871,24 @@ impl WorkerProcess {
                 // the master's merge expects (send_error in run_via_dispatch_inner).
                 let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
                 if !cols.is_well_formed() {
-                    return DispatchResult::Error(format!(
-                        "unique pre-flight: invalid column list for table {target_id}"
-                    ));
+                    return Err(format!("unique pre-flight: invalid column list for table {target_id}"));
                 }
-                if let Err(msg) = self.handle_unique_preflight(target_id, cols.as_slice(), request_id) {
-                    return DispatchResult::Error(msg);
-                }
-                DispatchResult::Continue
+                self.handle_unique_preflight(target_id, cols.as_slice(), request_id)?;
+                Ok(())
             }
 
             // ExchangeRelay only ever arrives while the worker is blocked
             // inside `do_exchange_wait`; that loop consumes it directly
-            // and never returns through `dispatch_inner`. PreloadedExchange
-            // is drained by `dispatch_top_level` before reaching here.
-            // Either reaching dispatch_inner is a master-side bug.
-            SalMessageKind::ExchangeRelay | SalMessageKind::PreloadedExchange => {
+            // and never returns through `dispatch_inner`. Reaching
+            // dispatch_inner is a master-side bug.
+            SalMessageKind::ExchangeRelay => {
                 gnitz_warn!(
                     "W{} unexpected {:?} at top-level dispatch_inner tid={}",
                     self.worker_id,
                     kind,
                     target_id,
                 );
-                DispatchResult::Continue
+                Ok(())
             }
         }
     }
@@ -1174,10 +911,9 @@ impl WorkerProcess {
                 "W{}: FLAG_PUSH for system table_id={}; expected DDL_SYNC",
                 self.worker_id, target_id
             ));
-        } else {
-            let effective = self.cat().ingest_returning_effective(target_id, batch)?;
-            buffer_pending_delta(&mut self.pending_deltas, target_id, effective);
         }
+        let effective = self.cat().ingest_returning_effective(target_id, batch)?;
+        buffer_pending_delta(&mut self.pending_deltas, target_id, effective);
         gnitz_debug!("W{} push tid={} rows={}", self.worker_id, target_id, row_count);
         Ok(())
     }
@@ -1326,8 +1062,8 @@ impl WorkerProcess {
         // master writes them at `write_cursor == 0` in the bumped epoch) are
         // accepted and any pre-reset group parks via `next_sal_message`'s epoch
         // check. Deliberately NOT the FLAG_FLUSH arm — no `handle_flush_all`, no
-        // FLAG_CHECKPOINT ACK; the master's consumption proof is the next round's
-        // FLAG_EXCHANGE report, which a checkpoint ACK would be misread as a
+        // flush ACK; the master's consumption proof is the next round's
+        // FLAG_EXCHANGE report, which a flush ACK would be misread as a
         // terminal ACK that retires the worker.
         if decision == BACKFILL_DECISION_CHECKPOINT {
             self.advance_read_epoch();
@@ -1701,11 +1437,6 @@ impl WorkerProcess {
     }
 }
 
-enum DispatchResult {
-    Continue,
-    Error(String),
-}
-
 // ---------------------------------------------------------------------------
 // Unique pre-flight key stream
 // ---------------------------------------------------------------------------
@@ -1766,90 +1497,6 @@ fn unique_preflight_spill_bytes() -> usize {
         .unwrap_or(UNIQUE_PREFLIGHT_SPILL_BYTES)
 }
 
-/// Stream the sorted OPK leading-key spans lent by `keys` to the master as a
-/// train of continuation frames carrying the synthetic pre-flight frame schema
-/// (`frame_schema` = `unique_preflight_wire_schema`, whose PK region is exactly
-/// the span; each span is written into the PK region verbatim). Every frame is
-/// tagged `FLAG_CONTINUATION`; the terminal frame additionally `FLAG_SCAN_LAST`.
-/// An empty producer emits one empty terminal frame so the master's drain still
-/// sees the train end.
-///
-/// `keys` lends one span at a time so the whole set never has to exist in RAM
-/// at once, and its exact `remaining` count sizes each frame and marks the
-/// terminal one without lookahead. It is infallible: the fast path reads its
-/// own buffer, and the merge reads mapped spill memory (all fallible spill I/O
-/// ran in `SpillSort::finish` before the first frame), so there is no
-/// mid-stream read that could truncate the train under an I/O error.
-///
-/// Deliberately NOT `send_scan_response`: that path attaches the owner
-/// table's *cached* schema wire block, which would make the master decode
-/// these frames with the table's row stride, and its `pending_streams`
-/// chunking would require materialising all keys as one 32 B/row `Batch`. The
-/// synthetic schema's wire block is built one-off (the `ReplySchema::OneOff`
-/// pattern) and never written to the table-keyed schema-block cache, so the
-/// table's cached block is never poisoned. `send_encoded` blocks on a full ring
-/// until the master's merge drains it — acceptable backpressure: the worker has
-/// nothing else to do during the DDL window.
-pub(crate) fn send_unique_preflight_keys(
-    w2m_writer: &W2mWriter,
-    target_id: u64,
-    frame_schema: &SchemaDescriptor,
-    request_id: u64,
-    keys_per_frame: usize,
-    keys: &mut crate::storage::KeyProducer,
-) {
-    debug_assert!(keys_per_frame > 0, "keys_per_frame must be positive");
-    let schema_block = ipc::build_schema_wire_block(frame_schema, &[], 0, target_id as u32);
-
-    // Reusable chunk batch: filled, encoded, and cleared per frame, sized up
-    // front to exactly one frame's fill.
-    let mut chunk = Batch::with_schema(*frame_schema, keys.remaining().min(keys_per_frame));
-    let mut is_first = true;
-    loop {
-        chunk.clear();
-        let n = keys.remaining().min(keys_per_frame);
-        for _ in 0..n {
-            let k = keys.next().expect("producer lends `remaining` spans");
-            chunk.ensure_row_capacity();
-            // The span is already OPK; write the raw bytes into the PK region
-            // (len == pk_stride). The master reads them back verbatim via
-            // `mb.get_pk_bytes(row)` → `PkBuf` — the wire is byte-transparent.
-            chunk.extend_pk_bytes(k);
-            chunk.extend_weight(&1i64.to_le_bytes());
-            chunk.extend_null_bmp(&0u64.to_le_bytes());
-            chunk.count += 1;
-        }
-        let is_last = keys.remaining() == 0;
-        // Schema block only on the first frame; continuations decode against
-        // the master's saved schema hint (synthetic schema version is 0, so
-        // no wire_flags_set_schema_version is needed).
-        let prebuilt: Option<&[u8]> = if is_first { Some(&schema_block) } else { None };
-        let schema_for_encode = if is_first { Some(frame_schema) } else { None };
-        let flags = FLAG_CONTINUATION | if is_last { FLAG_SCAN_LAST } else { 0 };
-        let sz = ipc::wire_size_range(STATUS_OK, &[], schema_for_encode, None, &chunk, chunk.count, prebuilt);
-        w2m_writer.send_encoded(sz, request_id as u32, |buf| {
-            ipc::encode_wire_into_range(
-                buf,
-                0,
-                target_id,
-                0,
-                flags,
-                0,
-                STATUS_OK, // request_id 0 in payload; ring prefix carries the req_id
-                schema_for_encode,
-                &chunk,
-                0,
-                chunk.count,
-                prebuilt,
-            );
-        });
-        is_first = false;
-        if is_last {
-            break;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1868,42 +1515,12 @@ mod tests {
 
     fn make_handler() -> WorkerExchangeHandler {
         WorkerExchangeHandler {
-            stash: HashMap::new(),
             deferred: Vec::<DeferredDdl>::new(),
             deferred_ticks: Vec::new(),
             pending_relays: HashMap::new(),
             backfill_pad: None,
             backfill_signal: None,
         }
-    }
-
-    #[test]
-    fn test_exchange_handler_stash_and_retrieve() {
-        let mut handler = make_handler();
-        let schema = test_schema();
-        let batch = Batch::with_schema(schema, 0);
-        handler.stash_preloaded(42, batch);
-        assert!(handler.stash.contains_key(&42));
-        let retrieved = handler.stash.remove(&42);
-        assert!(retrieved.is_some());
-        assert!(!handler.stash.contains_key(&42));
-    }
-
-    /// Locks the single-source-per-view invariant on `stash_preloaded`.
-    /// A second insert for the same `view_id` while the slot is still
-    /// occupied is forbidden — see the doc comment on `stash_preloaded`.
-    /// (If the master ever needs to send preloaded data from multiple
-    /// sources for the same view, the stash must be re-keyed to
-    /// `(view_id, source_id)` to match `pending_relays`.)
-    #[test]
-    #[should_panic(expected = "already has a preloaded batch")]
-    fn test_exchange_handler_stash_rejects_double_insert() {
-        let mut handler = make_handler();
-        let schema = test_schema();
-        let batch1 = Batch::with_schema(schema, 0);
-        let batch2 = Batch::with_schema(schema, 0);
-        handler.stash_preloaded(42, batch1);
-        handler.stash_preloaded(42, batch2);
     }
 
     #[test]
@@ -2001,18 +1618,8 @@ mod tests {
         // Use the production-sized region — the mmap reservation is
         // lazy-populated, so the 1 GiB backing is cheap.
         let region_size = w2m_ring::W2M_REGION_SIZE;
-        let region_ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                region_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANONYMOUS | libc::MAP_SHARED,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(region_ptr, libc::MAP_FAILED);
-        let region_ptr = region_ptr as *mut u8;
+        let region = crate::test_support::SharedRegion::new(region_size);
+        let region_ptr = region.ptr();
         unsafe {
             w2m_ring::init_region(region_ptr, region_size as u64);
         }
@@ -2044,10 +1651,6 @@ mod tests {
             rc = new_rc;
         }
         assert_eq!(decoded_ids, vec![req_ack, req_resp, req_err]);
-
-        unsafe {
-            libc::munmap(region_ptr as *mut libc::c_void, region_size);
-        }
     }
 
     #[test]
@@ -2087,7 +1690,6 @@ mod tests {
     fn make_test_worker(catalog: *mut CatalogEngine, writer: W2mWriter) -> WorkerProcess {
         WorkerProcess {
             worker_id: 0,
-            num_workers: 1,
             master_pid: 0,
             catalog,
             sal_reader: unsafe { std::mem::zeroed() },
@@ -2102,9 +1704,9 @@ mod tests {
     }
 
     /// Build a worker that's safe for `dispatch` calls whose behavior
-    /// does not enter the catalog (Tick/DdlSync/ExchangeRelay/PreloadedExchange
-    /// inside an exchange wait, plus ExchangeRelay/PreloadedExchange at
-    /// top-level which warn-or-stash without touching the catalog).
+    /// does not enter the catalog (Tick/DdlSync/ExchangeRelay inside an
+    /// exchange wait, plus ExchangeRelay at top-level which warns
+    /// without touching the catalog).
     ///
     /// The W2M ring is unused by these arms; sal_reader is also unused
     /// because we drive `dispatch` directly.
@@ -2212,26 +1814,6 @@ mod tests {
         );
     }
 
-    /// PreloadedExchange returns Continue in both contexts and
-    /// (with a non-decoding empty wire) makes no state change.
-    /// The decoded-payload path is exercised by the existing
-    /// `test_exchange_handler_stash_*` tests.
-    #[test]
-    fn test_dispatch_matrix_preloaded_exchange_both_contexts() {
-        for ctx in [
-            DispatchContext::TopLevel,
-            DispatchContext::InsideExchangeWait {
-                want_key: (1, 1),
-                schema: Some(test_schema()),
-            },
-        ] {
-            let mut wp = make_worker_for_matrix();
-            let empty: &'static [u8] = &[];
-            let outcome = wp.dispatch(ctx, SalMessageKind::PreloadedExchange, 7, Some(empty));
-            assert!(matches!(outcome, DispatchOutcome::Continue));
-        }
-    }
-
     /// Walk every `SalMessageKind` and assert a *behavior contract*
     /// for the InsideExchangeWait context. Kinds that defer must NOT
     /// touch the catalog; kinds that go inline through `dispatch_inner`
@@ -2244,13 +1826,30 @@ mod tests {
     /// regression: routing a should-defer kind to the inline path.
     #[test]
     fn test_dispatch_matrix_walk_kinds_defer_decisions() {
+        // Every SalMessageKind, in classification priority order.
+        const ALL_KINDS: [SalMessageKind; 15] = [
+            SalMessageKind::Shutdown,
+            SalMessageKind::Flush,
+            SalMessageKind::FlushEph,
+            SalMessageKind::DdlSync,
+            SalMessageKind::ExchangeRelay,
+            SalMessageKind::Backfill,
+            SalMessageKind::HasPk,
+            SalMessageKind::Gather,
+            SalMessageKind::UniquePreflight,
+            SalMessageKind::Push,
+            SalMessageKind::Tick,
+            SalMessageKind::SeekByIndex,
+            SalMessageKind::SeekByIndexRange,
+            SalMessageKind::Seek,
+            SalMessageKind::Scan,
+        ];
         // Kinds the InsideExchangeWait context MUST defer.
         let must_defer = [SalMessageKind::Tick, SalMessageKind::DdlSync];
         // ExchangeRelay is its own special case (RelayMatched / park).
-        // PreloadedExchange stashes (no defer queue).
         // The rest go through dispatch_inner inline.
 
-        for kind in SalMessageKind::ALL {
+        for kind in ALL_KINDS {
             if !must_defer.contains(&kind) {
                 continue;
             }
@@ -2311,76 +1910,21 @@ mod tests {
         use crate::runtime::sal::{sal_write_group, SalReader, FLAG_DDL_SYNC, FLAG_PUSH};
 
         const SAL_SIZE: usize = 1 << 20;
-        let sal_ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                SAL_SIZE,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANONYMOUS | libc::MAP_SHARED,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(sal_ptr, libc::MAP_FAILED);
-        let sal_ptr = sal_ptr as *mut u8;
-        unsafe {
-            std::ptr::write_bytes(sal_ptr, 0, SAL_SIZE);
-        }
+        let sal_region = crate::test_support::SharedRegion::new(SAL_SIZE);
+        let sal_ptr = sal_region.ptr();
 
         // Single worker; each group puts a one-byte payload at slot 0.
-        let nw = 1u32;
         let payload = [0u8; 1];
-        let ptrs: Vec<*const u8> = vec![payload.as_ptr()];
-        let sizes: Vec<u32> = vec![1];
+        let payloads: [&[u8]; 1] = [&payload];
 
         // Group 1: epoch=1, FLAG_PUSH, target=42
-        let r1 = unsafe {
-            sal_write_group(
-                sal_ptr,
-                0,
-                nw,
-                42,
-                100,
-                FLAG_PUSH,
-                1,
-                SAL_SIZE as u64,
-                ptrs.as_ptr(),
-                sizes.as_ptr(),
-            )
-        };
-        assert_eq!(r1.status, 0);
+        let c1 = unsafe { sal_write_group(sal_ptr, 0, 42, 100, FLAG_PUSH, 1, SAL_SIZE as u64, &payloads) }
+            .expect("group fits");
         // Group 2: epoch=1, FLAG_DDL_SYNC, target=43
-        let r2 = unsafe {
-            sal_write_group(
-                sal_ptr,
-                r1.new_cursor,
-                nw,
-                43,
-                101,
-                FLAG_DDL_SYNC,
-                1,
-                SAL_SIZE as u64,
-                ptrs.as_ptr(),
-                sizes.as_ptr(),
-            )
-        };
-        assert_eq!(r2.status, 0);
+        let c2 = unsafe { sal_write_group(sal_ptr, c1, 43, 101, FLAG_DDL_SYNC, 1, SAL_SIZE as u64, &payloads) }
+            .expect("group fits");
         // Group 3: epoch=2 — must be skipped while expected_epoch==1.
-        let r3 = unsafe {
-            sal_write_group(
-                sal_ptr,
-                r2.new_cursor,
-                nw,
-                44,
-                102,
-                FLAG_PUSH,
-                2,
-                SAL_SIZE as u64,
-                ptrs.as_ptr(),
-                sizes.as_ptr(),
-            )
-        };
-        assert_eq!(r3.status, 0);
+        unsafe { sal_write_group(sal_ptr, c2, 44, 102, FLAG_PUSH, 2, SAL_SIZE as u64, &payloads) }.expect("group fits");
 
         let mut wp = make_test_worker(std::ptr::null_mut(), unsafe { std::mem::zeroed() });
         wp.sal_reader = SalReader::new(sal_ptr as *const u8, 0, SAL_SIZE, -1);
@@ -2425,31 +1969,19 @@ mod tests {
 
         // No more groups.
         assert!(wp.next_sal_message().is_none());
-
-        unsafe {
-            libc::munmap(sal_ptr as *mut libc::c_void, SAL_SIZE);
-        }
     }
 
     // -- pending stream chunking tests -----------------------------------------------
 
-    fn make_ring() -> (*mut u8, W2mWriter) {
+    fn make_ring() -> (crate::test_support::SharedRegion, W2mWriter) {
         let size = w2m_ring::W2M_REGION_SIZE;
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANONYMOUS | libc::MAP_SHARED,
-                -1,
-                0,
-            ) as *mut u8
-        };
-        assert_ne!(ptr, libc::MAP_FAILED as *mut u8);
+        let region = crate::test_support::SharedRegion::new(size);
+        let ptr = region.ptr();
         unsafe {
             w2m_ring::init_region(ptr, size as u64);
         }
-        (ptr, W2mWriter::new(ptr, size as u64))
+        let writer = W2mWriter::new(ptr, size as u64);
+        (region, writer)
     }
 
     fn make_n_row_batch(schema: SchemaDescriptor, n: usize) -> Batch {
@@ -2469,6 +2001,12 @@ mod tests {
         frame
     }
 
+    /// Per-row wire stride for a test batch, matching `enqueue_stream`.
+    fn row_stride(batch: &Batch) -> usize {
+        ipc::wire_size_range(STATUS_OK, &[], None, None, batch, 1, None)
+            - ipc::wire_size_range(STATUS_OK, &[], None, None, batch, 0, None)
+    }
+
     /// First (and only) PendingScan chunk — next_row == 0, so the prebuilt schema
     /// block must appear in the frame and decode_wire_ipc must succeed without a hint.
     #[test]
@@ -2477,9 +2015,11 @@ mod tests {
         let batch = make_n_row_batch(schema, 10);
         let schema_block = Rc::new(ipc::build_schema_wire_block(&schema, &[], 0, 1));
 
-        let (ptr, writer) = make_ring();
+        let (region, writer) = make_ring();
+        let ptr = region.ptr();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
         wp.pending_streams.push_back(PendingScan {
+            wire_row_stride: row_stride(&batch),
             batch: Rc::new(batch),
             next_row: 0,
             request_id: 7,
@@ -2513,10 +2053,6 @@ mod tests {
             0,
             "FLAG_CONTINUATION must always be set on worker scan frames"
         );
-
-        unsafe {
-            libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE);
-        }
     }
 
     /// Continuation chunk — next_row > 0, prebuilt_schema == None. The frame carries
@@ -2527,9 +2063,11 @@ mod tests {
         let schema = test_schema();
         let batch = make_n_row_batch(schema, 10);
 
-        let (ptr, writer) = make_ring();
+        let (region, writer) = make_ring();
+        let ptr = region.ptr();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
         wp.pending_streams.push_back(PendingScan {
+            wire_row_stride: row_stride(&batch),
             batch: Rc::new(batch),
             next_row: 5,
             request_id: 9,
@@ -2564,10 +2102,6 @@ mod tests {
             "FLAG_SCAN_LAST must be set on the last chunk"
         );
         assert_ne!(decoded.control.flags & FLAG_CONTINUATION, 0);
-
-        unsafe {
-            libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE);
-        }
     }
 
     /// send_scan_response with schema=None (avoids catalog) emits a single ring
@@ -2578,11 +2112,12 @@ mod tests {
         let schema = test_schema();
         let batch = make_n_row_batch(schema, 5);
 
-        let (ptr, writer) = make_ring();
+        let (region, writer) = make_ring();
+        let ptr = region.ptr();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
 
         let err = wp.send_scan_response(1, Rc::new(batch), ReplySchema::None, 3, 0, 0);
-        assert!(err.is_none(), "small wire-safe batch must not error");
+        assert!(err.is_ok(), "small wire-safe batch must not error");
         assert!(
             wp.pending_streams.is_empty(),
             "batch fits in one frame; send_scan_response must not enqueue a train"
@@ -2607,10 +2142,6 @@ mod tests {
         assert_eq!(b.count, 5);
         for i in 0..5usize {
             assert_eq!(b.get_pk(i), i as u128);
-        }
-
-        unsafe {
-            libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE);
         }
     }
 
@@ -2691,9 +2222,11 @@ mod tests {
         let sz_1 = ipc::wire_size_range(STATUS_OK, &[], None, None, &batch_a, 1, Some(block_a.as_slice()));
         let budget = sz_0 + (sz_1 - sz_0) * 4;
 
-        let (ptr, writer) = make_ring();
+        let (region, writer) = make_ring();
+        let ptr = region.ptr();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
         wp.pending_streams.push_back(PendingScan {
+            wire_row_stride: row_stride(&batch_a),
             batch: Rc::new(batch_a),
             next_row: 0,
             request_id: 11,
@@ -2703,6 +2236,7 @@ mod tests {
             server_version: 0,
         });
         wp.pending_streams.push_back(PendingScan {
+            wire_row_stride: row_stride(&batch_b),
             batch: Rc::new(batch_b),
             next_row: 0,
             request_id: 22,
@@ -2765,10 +2299,6 @@ mod tests {
             }
             assert_eq!(rows, total_rows, "the train's chunks cover all rows exactly once");
         }
-
-        unsafe {
-            libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE);
-        }
     }
 
     /// A fitting result through `stream_batch_response` must be byte-identical
@@ -2780,8 +2310,10 @@ mod tests {
         let schema = test_schema();
         let batch = make_n_row_batch(schema, 5);
 
-        let (ptr_ref, writer_ref) = make_ring();
-        let (ptr_new, writer_new) = make_ring();
+        let (region_ref, writer_ref) = make_ring();
+        let (region_new, writer_new) = make_ring();
+        let ptr_ref = region_ref.ptr();
+        let ptr_new = region_new.ptr();
         let mut wp_ref = make_test_worker(std::ptr::null_mut(), writer_ref);
         let mut wp_new = make_test_worker(std::ptr::null_mut(), writer_new);
 
@@ -2793,10 +2325,10 @@ mod tests {
 
         assert!(wp_new
             .stream_batch_response(8, Some(batch.clone()), ReplySchema::None, req, client, pk)
-            .is_none());
+            .is_ok());
         assert!(wp_new
             .stream_batch_response(8, None, ReplySchema::None, req + 1, client, 0)
-            .is_none());
+            .is_ok());
         assert!(wp_new.pending_streams.is_empty(), "fitting results never enqueue");
 
         let ref_frames = walk_frames(ptr_ref);
@@ -2806,11 +2338,6 @@ mod tests {
             ref_frames, new_frames,
             "single-frame stream_batch_response must be byte-identical to send_response"
         );
-
-        unsafe {
-            libc::munmap(ptr_ref as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE);
-            libc::munmap(ptr_new as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE);
-        }
     }
 
     /// An oversized wire-safe result (> MAX_W2M_MSG) enqueues a train instead
@@ -2821,10 +2348,11 @@ mod tests {
         let rows = (w2m_ring::MAX_W2M_MSG as usize / 32) + 4096;
         let batch = zero_batch(schema, rows);
 
-        let (ptr, writer) = make_ring();
+        let (region, writer) = make_ring();
+        let ptr = region.ptr();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
         let err = wp.stream_batch_response(3, Some(batch), ReplySchema::None, 5, 9, 0);
-        assert!(err.is_none(), "oversized wire-safe result must chunk, not error");
+        assert!(err.is_ok(), "oversized wire-safe result must chunk, not error");
         assert_eq!(wp.pending_streams.len(), 1);
         let ps = wp.pending_streams.front().unwrap();
         assert_eq!(ps.next_row, 0);
@@ -2834,10 +2362,6 @@ mod tests {
             walk_frames(ptr).is_empty(),
             "the train's first chunk is emitted by drain_sal, not at enqueue time"
         );
-
-        unsafe {
-            libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE);
-        }
     }
 
     fn worker_temp_dir(name: &str) -> String {
@@ -2886,11 +2410,11 @@ mod tests {
         let rows = (w2m_ring::MAX_W2M_MSG as usize / 40) + 4096;
         let batch = zero_batch(schema, rows);
 
-        let (ptr, writer) = make_ring();
+        let (_region, writer) = make_ring();
         let mut wp = make_test_worker(&mut engine as *mut CatalogEngine, writer);
         let err = wp
             .stream_batch_response(tid as u64, Some(batch), ReplySchema::Table(&schema), 5, 0, 0)
-            .expect("oversized STRING result must surface the clean error");
+            .expect_err("oversized STRING result must surface the clean error");
         assert!(
             err.contains("STRING-column chunking"),
             "error names the limitation: {err}"
@@ -2899,9 +2423,6 @@ mod tests {
 
         engine.close();
         let _ = std::fs::remove_dir_all(&dir);
-        unsafe {
-            libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE);
-        }
     }
 
     /// A projected (gather) reply schema must ride a ONE-OFF wire block: the
@@ -2929,14 +2450,15 @@ mod tests {
         let projected = crate::schema::project_schema(&table_schema, &[1]);
         assert_ne!(projected.num_columns(), table_schema.num_columns());
 
-        let (ptr, writer) = make_ring();
+        let (region, writer) = make_ring();
+        let ptr = region.ptr();
         let mut wp = make_test_worker(&mut engine as *mut CatalogEngine, writer);
 
         // Fitting projected reply: one frame carrying the projected schema.
         let small = zero_batch(projected, 2);
         assert!(wp
             .stream_batch_response(tid as u64, Some(small), ReplySchema::OneOff(&projected), 5, 0, 0)
-            .is_none());
+            .is_ok());
         let frames = walk_frames(ptr);
         assert_eq!(frames.len(), 1);
         let decoded = ipc::decode_wire_ipc(&frames[0].1).expect("decode projected reply");
@@ -2950,7 +2472,7 @@ mod tests {
         let big = zero_batch(projected, rows);
         assert!(wp
             .stream_batch_response(tid as u64, Some(big), ReplySchema::OneOff(&projected), 6, 0, 0)
-            .is_none());
+            .is_ok());
         assert_eq!(wp.pending_streams.len(), 1);
         let expected_block = ipc::build_schema_wire_block(&projected, &[], 0, tid as u32);
         let ps = wp.pending_streams.front().unwrap();
@@ -2968,8 +2490,5 @@ mod tests {
 
         engine.close();
         let _ = std::fs::remove_dir_all(&dir);
-        unsafe {
-            libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE);
-        }
     }
 }

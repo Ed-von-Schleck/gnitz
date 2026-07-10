@@ -135,11 +135,8 @@ impl Reactor {
         }
     }
 
-    /// Look at all CQEs pending in the ring. For each:
-    ///   - KIND_REPLY: wake the registered reply waker (if any).
-    ///   - KIND_TIMEOUT: wake the registered timer waker (if not cancelled).
-    ///   - KIND_FSYNC: wake the fsync waker and park `res`.
-    ///   - KIND_POLL_EVENTFD: drain the associated W2M ring and re-arm.
+    /// Drain all CQEs pending in the ring and route each through
+    /// `dispatch_cqe` (timer / fsync / futex / accept / recv / send).
     pub(super) fn drain_cqes_into_wakers(&self) {
         let mut buf = [Cqe::default(); 64];
         loop {

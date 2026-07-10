@@ -1,27 +1,9 @@
 use crate::foundation::posix_io;
 use crate::runtime::sal::{
     atomic_load_u64, sal_begin_group, sal_read_group_header, sal_write_group, SalReader, SalWriter, FLAG_DDL_SYNC,
-    FLAG_TXN_COMMIT, GROUP_HEADER_SIZE, MAX_WORKERS, SAL_STATUS_HAS_DATA, SAL_STATUS_NO_DATA_FOR_WORKER,
-    SAL_STATUS_NO_MESSAGE,
+    FLAG_TXN_COMMIT, GROUP_HEADER_SIZE, MAX_WORKERS,
 };
-
-unsafe fn alloc_mmap(size: usize) -> *mut u8 {
-    let ptr = libc::mmap(
-        std::ptr::null_mut(),
-        size,
-        libc::PROT_READ | libc::PROT_WRITE,
-        libc::MAP_ANONYMOUS | libc::MAP_SHARED,
-        -1,
-        0,
-    );
-    assert_ne!(ptr, libc::MAP_FAILED);
-    std::ptr::write_bytes(ptr as *mut u8, 0, size);
-    ptr as *mut u8
-}
-
-unsafe fn free_mmap(ptr: *mut u8, size: usize) {
-    libc::munmap(ptr as *mut libc::c_void, size);
-}
+use crate::test_support::SharedRegion;
 
 fn make_test_data(val: u8, len: usize) -> Vec<u8> {
     vec![val; len]
@@ -31,7 +13,8 @@ fn make_test_data(val: u8, len: usize) -> Vec<u8> {
 fn test_sal_round_trip() {
     unsafe {
         let size = 1 << 20;
-        let ptr = alloc_mmap(size);
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
 
         let nw = 4u32;
         let bufs: Vec<Vec<u8>> = vec![
@@ -41,39 +24,26 @@ fn test_sal_round_trip() {
             make_test_data(0xCC, 50),
         ];
 
-        let mut ptrs: Vec<*const u8> = Vec::new();
-        let mut sizes: Vec<u32> = Vec::new();
-        for b in &bufs {
-            if b.is_empty() {
-                ptrs.push(std::ptr::null());
-                sizes.push(0);
-            } else {
-                ptrs.push(b.as_ptr());
-                sizes.push(b.len() as u32);
-            }
-        }
-
-        let res = sal_write_group(ptr, 0, nw, 42, 100, 0, 1, size as u64, ptrs.as_ptr(), sizes.as_ptr());
-        assert_eq!(res.status, 0);
-        assert!(res.new_cursor > 0);
+        let payloads: Vec<&[u8]> = bufs.iter().map(|b| b.as_slice()).collect();
+        let new_cursor = sal_write_group(ptr, 0, 42, 100, 0, 1, size as u64, &payloads).expect("group fits");
+        assert!(new_cursor > 0);
+        let _ = nw;
 
         for w in 0..4u32 {
-            let rr = sal_read_group_header(ptr, 0, w, None);
+            let rr = sal_read_group_header(ptr, 0, w, None).expect("group present");
             assert_eq!(rr.lsn, 100);
             assert_eq!(rr.target_id, 42);
             assert_eq!(rr.epoch, 1);
-            assert_eq!(rr.advance, res.new_cursor);
+            assert_eq!(rr.advance, new_cursor);
 
             if bufs[w as usize].is_empty() {
-                assert_eq!(rr.status, SAL_STATUS_NO_DATA_FOR_WORKER);
+                assert!(rr.data_ptr.is_null(), "no data slot for worker {w}");
             } else {
-                assert_eq!(rr.status, SAL_STATUS_HAS_DATA);
+                assert!(!rr.data_ptr.is_null());
                 let data = std::slice::from_raw_parts(rr.data_ptr, rr.data_size as usize);
                 assert_eq!(data, bufs[w as usize].as_slice());
             }
         }
-
-        free_mmap(ptr, size);
     }
 }
 
@@ -81,29 +51,25 @@ fn test_sal_round_trip() {
 fn test_sal_unicast_isolation() {
     unsafe {
         let size = 1 << 20;
-        let ptr = alloc_mmap(size);
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
         let nw = 4u32;
 
         let buf = make_test_data(0xDD, 128);
-        let mut ptrs = [std::ptr::null(); 4];
-        let mut sizes = [0u32; 4];
-        ptrs[2] = buf.as_ptr();
-        sizes[2] = buf.len() as u32;
+        let payloads: [&[u8]; 4] = [&[], &[], &buf, &[]];
 
-        let res = sal_write_group(ptr, 0, nw, 10, 1, 0, 1, size as u64, ptrs.as_ptr(), sizes.as_ptr());
-        assert_eq!(res.status, 0);
+        sal_write_group(ptr, 0, 10, 1, 0, 1, size as u64, &payloads).expect("group fits");
+        let _ = nw;
 
         for w in [0u32, 1, 3] {
-            let rr = sal_read_group_header(ptr, 0, w, None);
-            assert_eq!(rr.status, SAL_STATUS_NO_DATA_FOR_WORKER);
+            let rr = sal_read_group_header(ptr, 0, w, None).expect("group present");
+            assert!(rr.data_ptr.is_null(), "no data slot for worker {w}");
             assert!(rr.advance > 0);
         }
-        let rr = sal_read_group_header(ptr, 0, 2, None);
-        assert_eq!(rr.status, SAL_STATUS_HAS_DATA);
+        let rr = sal_read_group_header(ptr, 0, 2, None).expect("group present");
+        assert!(!rr.data_ptr.is_null());
         let data = std::slice::from_raw_parts(rr.data_ptr, rr.data_size as usize);
         assert_eq!(data, buf.as_slice());
-
-        free_mmap(ptr, size);
     }
 }
 
@@ -111,45 +77,29 @@ fn test_sal_unicast_isolation() {
 fn test_sal_multiple_groups() {
     unsafe {
         let size = 1 << 20;
-        let ptr = alloc_mmap(size);
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
         let nw = 2u32;
 
         let mut cursor = 0u64;
         for g in 0..3u64 {
             let buf = make_test_data((g + 1) as u8, 64);
-            let ptrs = [buf.as_ptr(), std::ptr::null()];
-            let sizes = [buf.len() as u32, 0u32];
-
-            let res = sal_write_group(
-                ptr,
-                cursor,
-                nw,
-                g as u32,
-                g * 10,
-                0,
-                1,
-                size as u64,
-                ptrs.as_ptr(),
-                sizes.as_ptr(),
-            );
-            assert_eq!(res.status, 0);
-            cursor = res.new_cursor;
+            let payloads: [&[u8]; 2] = [&buf, &[]];
+            cursor = sal_write_group(ptr, cursor, g as u32, g * 10, 0, 1, size as u64, &payloads).expect("group fits");
         }
+        let _ = nw;
 
         let mut rc = 0u64;
         for g in 0..3u64 {
-            let rr = sal_read_group_header(ptr, rc, 0, None);
-            assert_eq!(rr.status, SAL_STATUS_HAS_DATA);
+            let rr = sal_read_group_header(ptr, rc, 0, None).expect("group present");
+            assert!(!rr.data_ptr.is_null());
             assert_eq!(rr.lsn, g * 10);
             assert_eq!(rr.target_id, g as u32);
             let data = std::slice::from_raw_parts(rr.data_ptr, rr.data_size as usize);
             assert_eq!(data, vec![(g + 1) as u8; 64].as_slice());
             rc += rr.advance;
         }
-        let rr = sal_read_group_header(ptr, rc, 0, None);
-        assert_eq!(rr.status, SAL_STATUS_NO_MESSAGE);
-
-        free_mmap(ptr, size);
+        assert!(sal_read_group_header(ptr, rc, 0, None).is_none());
     }
 }
 
@@ -157,19 +107,14 @@ fn test_sal_multiple_groups() {
 fn test_sal_epoch_write_read() {
     unsafe {
         let size = 1 << 20;
-        let ptr = alloc_mmap(size);
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
 
         let buf = make_test_data(0x11, 32);
-        let ptrs = [buf.as_ptr()];
-        let sizes = [buf.len() as u32];
+        sal_write_group(ptr, 0, 0, 0, 0, 42, size as u64, &[&buf]).expect("group fits");
 
-        let res = sal_write_group(ptr, 0, 1, 0, 0, 0, 42, size as u64, ptrs.as_ptr(), sizes.as_ptr());
-        assert_eq!(res.status, 0);
-
-        let rr = sal_read_group_header(ptr, 0, 0, None);
+        let rr = sal_read_group_header(ptr, 0, 0, None).expect("group present");
         assert_eq!(rr.epoch, 42);
-
-        free_mmap(ptr, size);
     }
 }
 
@@ -177,16 +122,14 @@ fn test_sal_epoch_write_read() {
 fn test_sal_full_error() {
     unsafe {
         let size = 256;
-        let ptr = alloc_mmap(size);
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
 
         let buf = make_test_data(0xFF, 100);
-        let ptrs = [buf.as_ptr()];
-        let sizes = [buf.len() as u32];
-
-        let res = sal_write_group(ptr, 0, 1, 0, 0, 0, 1, size as u64, ptrs.as_ptr(), sizes.as_ptr());
-        assert_eq!(res.status, -1);
-
-        free_mmap(ptr, size);
+        assert!(
+            sal_write_group(ptr, 0, 0, 0, 0, 1, size as u64, &[&buf]).is_none(),
+            "group larger than the mmap must be rejected"
+        );
     }
 }
 
@@ -194,16 +137,15 @@ fn test_sal_full_error() {
 fn test_sal_cross_process() {
     unsafe {
         let size = 1 << 20;
-        let ptr = alloc_mmap(size);
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
         let efd = posix_io::eventfd_create();
         assert!(efd >= 0);
 
         let pid = libc::fork();
         if pid == 0 {
             let buf = make_test_data(0x77, 128);
-            let ptrs = [buf.as_ptr()];
-            let sizes = [buf.len() as u32];
-            sal_write_group(ptr, 0, 1, 99, 555, 0, 1, size as u64, ptrs.as_ptr(), sizes.as_ptr());
+            sal_write_group(ptr, 0, 99, 555, 0, 1, size as u64, &[&buf]).expect("group fits");
             posix_io::eventfd_signal(efd);
             libc::_exit(0);
         }
@@ -211,8 +153,8 @@ fn test_sal_cross_process() {
         let r = posix_io::eventfd_wait(efd, 5000);
         assert!(r > 0, "eventfd timed out");
 
-        let rr = sal_read_group_header(ptr, 0, 0, None);
-        assert_eq!(rr.status, SAL_STATUS_HAS_DATA);
+        let rr = sal_read_group_header(ptr, 0, 0, None).expect("group present");
+        assert!(!rr.data_ptr.is_null());
         assert_eq!(rr.lsn, 555);
         assert_eq!(rr.target_id, 99);
         let data = std::slice::from_raw_parts(rr.data_ptr, rr.data_size as usize);
@@ -220,7 +162,6 @@ fn test_sal_cross_process() {
 
         let mut status = 0i32;
         libc::waitpid(pid, &mut status, 0);
-        free_mmap(ptr, size);
         libc::close(efd);
     }
 }
@@ -229,27 +170,20 @@ fn test_sal_cross_process() {
 fn test_sal_checkpoint_reset() {
     unsafe {
         let size = 1 << 20;
-        let ptr = alloc_mmap(size);
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
 
         let buf1 = make_test_data(0x11, 32);
-        let ptrs = [buf1.as_ptr()];
-        let sizes = [buf1.len() as u32];
-        let res = sal_write_group(ptr, 0, 1, 0, 0, 0, 1, size as u64, ptrs.as_ptr(), sizes.as_ptr());
-        assert_eq!(res.status, 0);
+        sal_write_group(ptr, 0, 0, 0, 0, 1, size as u64, &[&buf1]).expect("group fits");
 
         std::ptr::write_bytes(ptr, 0, size);
         let buf2 = make_test_data(0x22, 32);
-        let ptrs2 = [buf2.as_ptr()];
-        let sizes2 = [buf2.len() as u32];
-        let res2 = sal_write_group(ptr, 0, 1, 0, 0, 0, 2, size as u64, ptrs2.as_ptr(), sizes2.as_ptr());
-        assert_eq!(res2.status, 0);
+        sal_write_group(ptr, 0, 0, 0, 0, 2, size as u64, &[&buf2]).expect("group fits");
 
-        let rr = sal_read_group_header(ptr, 0, 0, None);
+        let rr = sal_read_group_header(ptr, 0, 0, None).expect("group present");
         assert_eq!(rr.epoch, 2);
         let data = std::slice::from_raw_parts(rr.data_ptr, rr.data_size as usize);
         assert_eq!(data, vec![0x22u8; 32].as_slice());
-
-        free_mmap(ptr, size);
     }
 }
 
@@ -257,7 +191,8 @@ fn test_sal_checkpoint_reset() {
 fn sal_begin_group_rejects_too_many_workers() {
     unsafe {
         let size = 1 << 20;
-        let ptr = alloc_mmap(size);
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
         let sizes = [0u32; MAX_WORKERS + 1];
         // num_workers = MAX_WORKERS + 1 must return None.
         let result = sal_begin_group(ptr, 0, size, MAX_WORKERS + 1, 0, 0, 0, 1, &sizes[..MAX_WORKERS + 1]);
@@ -265,7 +200,6 @@ fn sal_begin_group_rejects_too_many_workers() {
             result.is_none(),
             "sal_begin_group must reject num_workers > MAX_WORKERS"
         );
-        free_mmap(ptr, size);
     }
 }
 
@@ -273,7 +207,8 @@ fn sal_begin_group_rejects_too_many_workers() {
 fn sal_begin_group_rejects_cursor_overflow() {
     unsafe {
         let size = 512usize;
-        let ptr = alloc_mmap(size);
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
         // Push the cursor so close to the end that the group header won't fit.
         let sizes = [0u32; 1];
         let result = sal_begin_group(ptr, size - 1, size, 1, 0, 0, 0, 1, &sizes[..1]);
@@ -281,7 +216,6 @@ fn sal_begin_group_rejects_cursor_overflow() {
             result.is_none(),
             "sal_begin_group must reject when cursor + total > mmap_size"
         );
-        free_mmap(ptr, size);
     }
 }
 
@@ -289,33 +223,17 @@ fn sal_begin_group_rejects_cursor_overflow() {
 fn test_sal_epoch_fence() {
     unsafe {
         let size = 1 << 20;
-        let ptr = alloc_mmap(size);
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
 
         let buf = make_test_data(0x33, 32);
-        let ptrs = [buf.as_ptr()];
-        let sizes = [buf.len() as u32];
+        let c1 = sal_write_group(ptr, 0, 0, 0, 0, 5, size as u64, &[&buf]).expect("group fits");
+        sal_write_group(ptr, c1, 0, 0, 0, 6, size as u64, &[&buf]).expect("group fits");
 
-        let res1 = sal_write_group(ptr, 0, 1, 0, 0, 0, 5, size as u64, ptrs.as_ptr(), sizes.as_ptr());
-        let res2 = sal_write_group(
-            ptr,
-            res1.new_cursor,
-            1,
-            0,
-            0,
-            0,
-            6,
-            size as u64,
-            ptrs.as_ptr(),
-            sizes.as_ptr(),
-        );
-        assert_eq!(res2.status, 0);
-
-        let rr1 = sal_read_group_header(ptr, 0, 0, None);
+        let rr1 = sal_read_group_header(ptr, 0, 0, None).expect("group present");
         assert_eq!(rr1.epoch, 5);
-        let rr2 = sal_read_group_header(ptr, rr1.advance, 0, None);
+        let rr2 = sal_read_group_header(ptr, rr1.advance, 0, None).expect("group present");
         assert_eq!(rr2.epoch, 6);
-
-        free_mmap(ptr, size);
     }
 }
 
@@ -326,28 +244,16 @@ fn test_commit_sentinel_round_trip() {
     // group must be the only one with FLAG_TXN_COMMIT set.
     unsafe {
         let size = 1 << 20;
-        let ptr = alloc_mmap(size);
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
         let nw = 2u32;
 
         // Two normal groups at the same LSN.
         let buf = make_test_data(0xAA, 32);
-        let ptrs = [buf.as_ptr(), buf.as_ptr()];
-        let sizes = [buf.len() as u32, buf.len() as u32];
-        let r1 = sal_write_group(ptr, 0, nw, 100, 7, 0, 1, size as u64, ptrs.as_ptr(), sizes.as_ptr());
-        assert_eq!(r1.status, 0);
-        let r2 = sal_write_group(
-            ptr,
-            r1.new_cursor,
-            nw,
-            101,
-            7,
-            0,
-            1,
-            size as u64,
-            ptrs.as_ptr(),
-            sizes.as_ptr(),
-        );
-        assert_eq!(r2.status, 0);
+        let payloads: [&[u8]; 2] = [&buf, &buf];
+        let c1 = sal_write_group(ptr, 0, 100, 7, 0, 1, size as u64, &payloads).expect("group fits");
+        let c2 = sal_write_group(ptr, c1, 101, 7, 0, 1, size as u64, &payloads).expect("group fits");
+        let _ = nw;
 
         // Sentinel via SalWriter at the same LSN. m2w_efds empty so
         // signal_all is a no-op (we never call it here anyway, but its
@@ -356,23 +262,11 @@ fn test_commit_sentinel_round_trip() {
         let efd2 = posix_io::eventfd_create();
         assert!(efd1 >= 0 && efd2 >= 0);
         let mut writer = SalWriter::new(ptr, -1, size as u64, vec![efd1, efd2]);
-        writer.reset(r2.new_cursor, 1);
+        writer.reset(c2, 1);
         writer.write_commit_sentinel(7).unwrap();
 
         // Trailing group at the next LSN.
-        let r4 = sal_write_group(
-            ptr,
-            writer.cursor(),
-            nw,
-            102,
-            8,
-            0,
-            1,
-            size as u64,
-            ptrs.as_ptr(),
-            sizes.as_ptr(),
-        );
-        assert_eq!(r4.status, 0);
+        sal_write_group(ptr, writer.cursor(), 102, 8, 0, 1, size as u64, &payloads).expect("group fits");
 
         // Walk the SAL via SalReader (worker 0 perspective).
         let reader = SalReader::new(ptr as *const u8, 0, size, efd1);
@@ -393,7 +287,6 @@ fn test_commit_sentinel_round_trip() {
 
         libc::close(efd1);
         libc::close(efd2);
-        free_mmap(ptr, size);
     }
 }
 
@@ -403,7 +296,8 @@ fn test_commit_sentinel_zero_payload() {
     // a header-only group and must not be misread as a DDL_SYNC batch.
     unsafe {
         let size = 1 << 20;
-        let ptr = alloc_mmap(size);
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
 
         let efd1 = posix_io::eventfd_create();
         let efd2 = posix_io::eventfd_create();
@@ -428,7 +322,6 @@ fn test_commit_sentinel_zero_payload() {
         libc::close(efd2);
         libc::close(efd3);
         libc::close(efd4);
-        free_mmap(ptr, size);
     }
 }
 
@@ -440,45 +333,21 @@ fn test_batched_push_shares_zone_lsn() {
     use crate::runtime::sal::FLAG_PUSH;
     unsafe {
         let size = 1 << 20;
-        let ptr = alloc_mmap(size);
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
         let nw = 2u32;
         let zone_lsn = 42u64;
 
         let payload = make_test_data(0xDD, 64);
-        let ptrs: Vec<*const u8> = (0..nw).map(|_| payload.as_ptr()).collect();
-        let sizes: Vec<u32> = (0..nw).map(|_| payload.len() as u32).collect();
+        let payloads: Vec<&[u8]> = (0..nw).map(|_| payload.as_slice()).collect();
         // Two push groups at the same LSN.
-        let r1 = sal_write_group(
-            ptr,
-            0,
-            nw,
-            1000,
-            zone_lsn,
-            FLAG_PUSH,
-            1,
-            size as u64,
-            ptrs.as_ptr(),
-            sizes.as_ptr(),
-        );
-        assert_eq!(r1.status, 0);
-        let r2 = sal_write_group(
-            ptr,
-            r1.new_cursor,
-            nw,
-            1001,
-            zone_lsn,
-            FLAG_PUSH,
-            1,
-            size as u64,
-            ptrs.as_ptr(),
-            sizes.as_ptr(),
-        );
-        assert_eq!(r2.status, 0);
+        let c1 = sal_write_group(ptr, 0, 1000, zone_lsn, FLAG_PUSH, 1, size as u64, &payloads).expect("group fits");
+        let c2 = sal_write_group(ptr, c1, 1001, zone_lsn, FLAG_PUSH, 1, size as u64, &payloads).expect("group fits");
 
         // Closing sentinel.
         let efds: Vec<i32> = (0..nw).map(|_| posix_io::eventfd_create()).collect();
         let mut writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
-        writer.reset(r2.new_cursor, 1);
+        writer.reset(c2, 1);
         writer.write_commit_sentinel(zone_lsn).unwrap();
 
         let reader = SalReader::new(ptr as *const u8, 0, size, efds[0]);
@@ -513,7 +382,6 @@ fn test_batched_push_shares_zone_lsn() {
         for &e in &efds {
             libc::close(e);
         }
-        free_mmap(ptr, size);
     }
 }
 
@@ -525,7 +393,8 @@ fn test_zone_two_groups_one_sentinel() {
     // the sentinel must carry FLAG_TXN_COMMIT.
     unsafe {
         let size = 1 << 20;
-        let ptr = alloc_mmap(size);
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
         let nw = 4u32;
 
         let buf_col = make_test_data(0xC0, 64);
@@ -533,38 +402,12 @@ fn test_zone_two_groups_one_sentinel() {
         let zone_lsn = 17u64;
 
         // Group 1: COL_TAB rows.
-        let ptrs_col: Vec<*const u8> = (0..nw).map(|_| buf_col.as_ptr()).collect();
-        let sizes_col: Vec<u32> = (0..nw).map(|_| buf_col.len() as u32).collect();
-        let r1 = sal_write_group(
-            ptr,
-            0,
-            nw,
-            200,
-            zone_lsn,
-            0,
-            1,
-            size as u64,
-            ptrs_col.as_ptr(),
-            sizes_col.as_ptr(),
-        );
-        assert_eq!(r1.status, 0);
+        let payloads_col: Vec<&[u8]> = (0..nw).map(|_| buf_col.as_slice()).collect();
+        let c1 = sal_write_group(ptr, 0, 200, zone_lsn, 0, 1, size as u64, &payloads_col).expect("group fits");
 
         // Group 2: TABLE_TAB row, same LSN.
-        let ptrs_tab: Vec<*const u8> = (0..nw).map(|_| buf_tab.as_ptr()).collect();
-        let sizes_tab: Vec<u32> = (0..nw).map(|_| buf_tab.len() as u32).collect();
-        let r2 = sal_write_group(
-            ptr,
-            r1.new_cursor,
-            nw,
-            201,
-            zone_lsn,
-            0,
-            1,
-            size as u64,
-            ptrs_tab.as_ptr(),
-            sizes_tab.as_ptr(),
-        );
-        assert_eq!(r2.status, 0);
+        let payloads_tab: Vec<&[u8]> = (0..nw).map(|_| buf_tab.as_slice()).collect();
+        let c2 = sal_write_group(ptr, c1, 201, zone_lsn, 0, 1, size as u64, &payloads_tab).expect("group fits");
 
         // Sentinel.
         let efds: Vec<i32> = (0..nw).map(|_| posix_io::eventfd_create()).collect();
@@ -572,7 +415,7 @@ fn test_zone_two_groups_one_sentinel() {
             assert!(e >= 0);
         }
         let mut writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
-        writer.reset(r2.new_cursor, 1);
+        writer.reset(c2, 1);
         writer.write_commit_sentinel(zone_lsn).unwrap();
 
         // Walk on every worker's perspective; assert zone shape.
@@ -595,7 +438,6 @@ fn test_zone_two_groups_one_sentinel() {
         for &e in &efds {
             libc::close(e);
         }
-        free_mmap(ptr, size);
     }
 }
 
@@ -607,40 +449,23 @@ fn test_two_groups_same_lsn() {
     // top of this: multiple groups + a sentinel, all sharing one LSN.
     unsafe {
         let size = 1 << 20;
-        let ptr = alloc_mmap(size);
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
         let nw = 1u32;
 
         let buf1 = make_test_data(0x10, 32);
-        let ptrs1 = [buf1.as_ptr()];
-        let sizes1 = [buf1.len() as u32];
-        let res1 = sal_write_group(ptr, 0, nw, 7, 42, 0, 1, size as u64, ptrs1.as_ptr(), sizes1.as_ptr());
-        assert_eq!(res1.status, 0);
+        let c1 = sal_write_group(ptr, 0, 7, 42, 0, 1, size as u64, &[&buf1]).expect("group fits");
+        let _ = nw;
 
         let buf2 = make_test_data(0x20, 32);
-        let ptrs2 = [buf2.as_ptr()];
-        let sizes2 = [buf2.len() as u32];
-        let res2 = sal_write_group(
-            ptr,
-            res1.new_cursor,
-            nw,
-            8,
-            42,
-            0,
-            1,
-            size as u64,
-            ptrs2.as_ptr(),
-            sizes2.as_ptr(),
-        );
-        assert_eq!(res2.status, 0);
+        sal_write_group(ptr, c1, 8, 42, 0, 1, size as u64, &[&buf2]).expect("group fits");
 
-        let rr1 = sal_read_group_header(ptr, 0, 0, None);
-        let rr2 = sal_read_group_header(ptr, rr1.advance, 0, None);
+        let rr1 = sal_read_group_header(ptr, 0, 0, None).expect("group present");
+        let rr2 = sal_read_group_header(ptr, rr1.advance, 0, None).expect("group present");
         assert_eq!(rr1.lsn, 42);
         assert_eq!(rr2.lsn, 42);
         assert_eq!(rr1.target_id, 7);
         assert_eq!(rr2.target_id, 8);
-
-        free_mmap(ptr, size);
     }
 }
 
@@ -648,7 +473,8 @@ fn test_two_groups_same_lsn() {
 fn test_sal_cross_process_checkpoint() {
     unsafe {
         let size = 1 << 20;
-        let ptr = alloc_mmap(size);
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
         let efd = posix_io::eventfd_create();
         let efd2 = posix_io::eventfd_create();
         assert!(efd >= 0 && efd2 >= 0);
@@ -656,36 +482,31 @@ fn test_sal_cross_process_checkpoint() {
         let pid = libc::fork();
         if pid == 0 {
             let buf = make_test_data(0xAA, 64);
-            let ptrs = [buf.as_ptr()];
-            let sizes = [buf.len() as u32];
-            sal_write_group(ptr, 0, 1, 0, 10, 0, 1, size as u64, ptrs.as_ptr(), sizes.as_ptr());
+            sal_write_group(ptr, 0, 0, 10, 0, 1, size as u64, &[&buf]).expect("group fits");
             posix_io::eventfd_signal(efd);
 
             posix_io::eventfd_wait(efd2, 5000);
 
             std::ptr::write_bytes(ptr, 0, size);
             let buf2 = make_test_data(0xBB, 64);
-            let ptrs2 = [buf2.as_ptr()];
-            let sizes2 = [buf2.len() as u32];
-            sal_write_group(ptr, 0, 1, 0, 20, 0, 2, size as u64, ptrs2.as_ptr(), sizes2.as_ptr());
+            sal_write_group(ptr, 0, 0, 20, 0, 2, size as u64, &[&buf2]).expect("group fits");
             posix_io::eventfd_signal(efd);
             libc::_exit(0);
         }
 
         posix_io::eventfd_wait(efd, 5000);
-        let rr1 = sal_read_group_header(ptr, 0, 0, None);
+        let rr1 = sal_read_group_header(ptr, 0, 0, None).expect("group present");
         assert_eq!(rr1.epoch, 1);
         assert_eq!(rr1.lsn, 10);
         posix_io::eventfd_signal(efd2);
 
         posix_io::eventfd_wait(efd, 5000);
-        let rr2 = sal_read_group_header(ptr, 0, 0, None);
+        let rr2 = sal_read_group_header(ptr, 0, 0, None).expect("group present");
         assert_eq!(rr2.epoch, 2);
         assert_eq!(rr2.lsn, 20);
 
         let mut status = 0i32;
         libc::waitpid(pid, &mut status, 0);
-        free_mmap(ptr, size);
         libc::close(efd);
         libc::close(efd2);
     }
@@ -699,13 +520,11 @@ fn test_sal_prefix_epoch_gate() {
     // or absent expectation reads the group normally.
     unsafe {
         let size = 1 << 20;
-        let ptr = alloc_mmap(size);
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
 
         let buf = make_test_data(0x5A, 48);
-        let ptrs = [buf.as_ptr()];
-        let sizes = [buf.len() as u32];
-        let res = sal_write_group(ptr, 0, 1, 7, 11, 0, 1, size as u64, ptrs.as_ptr(), sizes.as_ptr());
-        assert_eq!(res.status, 0);
+        let new_cursor = sal_write_group(ptr, 0, 7, 11, 0, 1, size as u64, &[&buf]).expect("group fits");
 
         let reader = SalReader::new(ptr as *const u8, 0, size, -1);
 
@@ -720,15 +539,13 @@ fn test_sal_prefix_epoch_gate() {
         assert_eq!(msg.epoch, 1);
         assert_eq!(msg.lsn, 11);
         assert_eq!(msg.target_id, 7);
-        assert_eq!(cursor, res.new_cursor);
+        assert_eq!(cursor, new_cursor);
 
         // Ungated recovery read: consumable without knowing the epoch.
         let (msg, _) = reader
             .try_read(0, None)
             .expect("recovery walk reads without an expectation");
         assert_eq!(msg.epoch, 1);
-
-        free_mmap(ptr, size);
     }
 }
 
@@ -739,49 +556,32 @@ fn test_sal_prefix_packing_boundaries() {
     // with epoch u32::MAX, and a multi-MiB group with epoch 1.
     unsafe {
         let size = 8 << 20;
-        let ptr = alloc_mmap(size);
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
 
         // Header-only group (no worker data), epoch u32::MAX.
-        let ptrs0 = [std::ptr::null::<u8>()];
-        let sizes0 = [0u32];
-        let res = sal_write_group(
-            ptr,
-            0,
-            1,
-            0,
-            0,
-            0,
-            u32::MAX,
-            size as u64,
-            ptrs0.as_ptr(),
-            sizes0.as_ptr(),
-        );
-        assert_eq!(res.status, 0);
+        let empty: [&[u8]; 1] = [&[]];
+        let new_cursor = sal_write_group(ptr, 0, 0, 0, 0, u32::MAX, size as u64, &empty).expect("group fits");
         let word = atomic_load_u64(ptr);
         assert_eq!((word >> 32) as u32, u32::MAX);
         assert_eq!((word & 0xFFFF_FFFF) as usize, GROUP_HEADER_SIZE);
-        let rr = sal_read_group_header(ptr, 0, 0, None);
+        let rr = sal_read_group_header(ptr, 0, 0, None).expect("group present");
         assert_eq!(rr.epoch, u32::MAX);
         assert_eq!(rr.advance, (8 + GROUP_HEADER_SIZE) as u64);
-        assert_eq!(res.new_cursor, rr.advance);
+        assert_eq!(new_cursor, rr.advance);
 
         // Multi-MiB group, epoch 1.
         std::ptr::write_bytes(ptr, 0, size);
         let big = make_test_data(0xEE, 3 << 20);
-        let ptrs = [big.as_ptr()];
-        let sizes = [big.len() as u32];
-        let res = sal_write_group(ptr, 0, 1, 0, 0, 0, 1, size as u64, ptrs.as_ptr(), sizes.as_ptr());
-        assert_eq!(res.status, 0);
+        sal_write_group(ptr, 0, 0, 0, 0, 1, size as u64, &[&big]).expect("group fits");
         let expected_payload = GROUP_HEADER_SIZE + (3 << 20); // 3 MiB is already 8-aligned
         let word = atomic_load_u64(ptr);
         assert_eq!((word >> 32) as u32, 1);
         assert_eq!((word & 0xFFFF_FFFF) as usize, expected_payload);
-        let rr = sal_read_group_header(ptr, 0, 0, Some(1));
-        assert_eq!(rr.status, SAL_STATUS_HAS_DATA);
+        let rr = sal_read_group_header(ptr, 0, 0, Some(1)).expect("group present");
+        assert!(!rr.data_ptr.is_null());
         assert_eq!(rr.epoch, 1);
         assert_eq!(rr.advance, (8 + expected_payload) as u64);
         assert_eq!(rr.data_size as usize, 3 << 20);
-
-        free_mmap(ptr, size);
     }
 }

@@ -100,14 +100,7 @@ impl Reactor {
         {
             let mut ring = self.inner.ring.borrow_mut();
             ring.prep_recv(fd, hdr_ptr, 4, udata(KIND_RECV, fd as u32 as u64));
-            if let Err(e) = ring.submit_and_wait_timeout(0, 0) {
-                crate::gnitz_error!(
-                    "reactor: recv SQE flush failed for fd={} (errno={}); \
-                     SQE queued — will submit on next tick",
-                    fd,
-                    e,
-                );
-            }
+            ring.flush_sqes("recv");
         }
         conn.recv_armed = true;
     }
@@ -201,14 +194,7 @@ impl Reactor {
             {
                 let mut ring = self.inner.ring.borrow_mut();
                 ring.prep_send(fd, cur_ptr, remaining, udata(KIND_SEND, send_id));
-                if let Err(e) = ring.submit_and_wait_timeout(0, 0) {
-                    crate::gnitz_error!(
-                        "reactor: send SQE flush failed for send_id={} (errno={}); \
-                         SQE queued — will submit on next tick",
-                        send_id,
-                        e,
-                    );
-                }
+                ring.flush_sqes("send");
             }
             let rc = SendFuture {
                 send_id,
@@ -252,7 +238,7 @@ impl Reactor {
     fn begin_recv_close(&self, conn: &mut io::Conn, fd: i32) {
         conn.closing = true;
         self.inner.closing_fds.borrow_mut().insert(fd);
-        self.inner.recv_closed.borrow_mut().insert(fd, true);
+        self.inner.recv_closed.borrow_mut().insert(fd);
         if let Some(w) = self.inner.recv_waiters.borrow_mut().remove(&fd) {
             w.wake();
         }
@@ -350,13 +336,11 @@ impl Reactor {
         if self.inner.closing_fds.borrow().is_empty() {
             return;
         }
-        // Take ownership of the scratch (leaves a zero-cap Vec sentinel so
-        // the borrow of `closing_scratch` ends immediately) and refill it.
-        // The body re-borrows `closing_fds` and `conns`, which would deadlock
-        // if we held the scratch borrow live.
-        let mut closing = std::mem::take(&mut *self.inner.closing_scratch.borrow_mut());
-        closing.clear();
-        closing.extend(self.inner.closing_fds.borrow().iter().copied());
+        // Copy the fd set into a local before the loop: the body re-borrows
+        // `closing_fds` and `conns`, which would panic the RefCell if we
+        // iterated the set borrow live. The alloc only happens on a
+        // non-empty reap (rare — the `is_empty` gate above).
+        let closing: Vec<i32> = self.inner.closing_fds.borrow().iter().copied().collect();
         for &fd in &closing {
             let ready = {
                 let conns = self.inner.conns.borrow();
@@ -380,7 +364,5 @@ impl Reactor {
                 libc::close(fd);
             }
         }
-        // Return the scratch Vec to the cell so its capacity is retained.
-        *self.inner.closing_scratch.borrow_mut() = closing;
     }
 }

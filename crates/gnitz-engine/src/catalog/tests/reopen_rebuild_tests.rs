@@ -246,7 +246,7 @@ fn backfill_all_indexes_rebuilds_exactly_once() {
     // (a doubled rebuild would sum to 2N with an identical row set).
     let assert_index_intact = |engine: &mut CatalogEngine| {
         for i in 0..N as u64 {
-            let hit = engine.seek_by_index(tid, &[1], &[(i * 10) as u128]).unwrap();
+            let hit = engine.seek_by_index(tid, &[1], &[(i * 10) as u128]).unwrap().0;
             let row = hit.unwrap_or_else(|| panic!("val {} must resolve by index", i * 10));
             assert_eq!(row.count, 1, "one source row per distinct val");
             assert_eq!(row.get_pk(0), i as u128, "val {} must resolve to PK {}", i * 10, i);

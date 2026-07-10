@@ -24,7 +24,7 @@
 //!   catalog mutation, by `relay_loop` to reclaim SAL space, and by the
 //!   graceful-shutdown watchdog (see `BarrierKind`).
 
-use super::executor::TickTrigger;
+use super::executor::{TickTrigger, TICK_COALESCE_ROWS};
 use super::guard_panic;
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{first_worker_error_opt, MasterDispatcher};
@@ -33,12 +33,10 @@ use crate::runtime::sal::{FLAG_FLUSH, FLAG_FLUSH_EPH};
 use crate::runtime::wire::{DecodedWire, WireConflictMode};
 use crate::storage::Batch;
 use rustc_hash::FxHashMap;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Instant;
 
 const MAX_PENDING_ROWS: usize = 100_000;
-const TICK_COALESCE_ROWS: usize = 10_000;
 
 /// One request to the committer.
 #[allow(clippy::large_enum_variant)]
@@ -107,7 +105,6 @@ pub struct Shared {
     pub num_workers: usize,
     pub tick_rows: Rc<RefCell<FxHashMap<i64, usize>>>,
     pub tick_tids: Rc<RefCell<Vec<i64>>>,
-    pub t_last_push: Rc<Cell<Option<Instant>>>,
     /// Tick-trigger sender: fires the auto-tick after large commits, and drives
     /// the checkpoint sequence's drain (`Drain`) and quiesce (`Quiesce`)
     /// between its base and ephemeral rounds.
@@ -152,12 +149,10 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
             None => return,
         };
 
-        let (pushes, barriers) = start_batch(first);
-
         // Drain any additional requests already queued — no timer wait.
         // Pipelined clients still get batched; serial clients don't pay
         // a latency tax.
-        let (pushes, barriers) = debounce_drain(&mut rx, pushes, barriers);
+        let (pushes, barriers) = debounce_drain(&mut rx, first);
 
         // Checkpoint decision for the whole batch, barrier-only batches
         // included: relay_loop's low-space barrier arrives precisely to
@@ -202,12 +197,19 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
 /// senders to signal once the batch (and any checkpoint sequence) completes.
 type PendingBatch = (Vec<PendingPush>, Vec<(BarrierKind, oneshot::Sender<()>)>);
 
-/// Sort one incoming request into `pushes` or `barriers`.
-fn start_batch(req: CommitRequest) -> PendingBatch {
+/// Sort `first` into `pushes`/`barriers`, then drain additional requests
+/// without waiting: if the channel has items ready, pull them all;
+/// otherwise return immediately. The 1ms debounce timer is a worst-case
+/// cost paid only by serial single-request clients, so we skip it
+/// entirely and rely on pipelined clients to enqueue fast enough that
+/// `try_recv` sees a non-empty queue.
+fn debounce_drain(rx: &mut mpsc::Receiver<CommitRequest>, first: CommitRequest) -> PendingBatch {
     let mut pushes = Vec::new();
     let mut barriers = Vec::new();
-    match req {
+    let mut row_count: usize = 0;
+    match first {
         CommitRequest::Push { tid, batch, mode, done } => {
+            row_count = batch.count;
             pushes.push(PendingPush {
                 tid,
                 batch: Some(batch),
@@ -217,23 +219,6 @@ fn start_batch(req: CommitRequest) -> PendingBatch {
         }
         CommitRequest::Barrier { kind, done } => barriers.push((kind, done)),
     }
-    (pushes, barriers)
-}
-
-/// Drain additional requests without waiting: if the channel has items
-/// ready, pull them all; otherwise return immediately. The 1ms debounce
-/// timer is a worst-case cost paid only by serial single-request
-/// clients, so we skip it entirely and rely on pipelined clients to
-/// enqueue fast enough that `try_recv` sees a non-empty queue.
-fn debounce_drain(
-    rx: &mut mpsc::Receiver<CommitRequest>,
-    mut pushes: Vec<PendingPush>,
-    mut barriers: Vec<(BarrierKind, oneshot::Sender<()>)>,
-) -> PendingBatch {
-    let mut row_count: usize = pushes
-        .iter()
-        .map(|p| p.batch.as_ref().expect("batch present in debounce_drain").count)
-        .sum();
     while row_count < MAX_PENDING_ROWS {
         match rx.try_recv() {
             Some(CommitRequest::Push { tid, batch, mode, done }) => {
@@ -270,8 +255,8 @@ fn debounce_drain(
 /// skipped, and the reset then orphans them permanently while their writers wait
 /// for ACKs that never arrive.
 ///
-/// `ephemeral_gen: None` — base/reclaim round: `FLAG_FLUSH` at a fresh
-/// `next_lsn`, then the full `checkpoint_post_ack` (system-table flush +
+/// `ephemeral_gen: None` — base/reclaim round: `FLAG_FLUSH` (lsn 0, unused),
+/// then the full `checkpoint_post_ack` (system-table flush +
 /// gated-deletion drain + reset). `Some(gen)` — ephemeral round:
 /// `FLAG_FLUSH_EPH` carrying the generation in the group header's `lsn` field
 /// (workers read it to stamp view manifests), then a bare reset — only command
@@ -290,9 +275,11 @@ async fn flush_round(
 
     {
         let disp = shared.disp();
+        // FlushEph's lsn IS the checkpoint generation — workers latch it via
+        // `set_committed_generation`. The base round's lsn is unread; pass 0.
         let (lsn, flags) = match ephemeral_gen {
             Some(gen) => (gen, FLAG_FLUSH_EPH),
-            None => (disp.next_lsn(), FLAG_FLUSH),
+            None => (0, FLAG_FLUSH),
         };
         disp.write_checkpoint_group(lsn, flags, &req_ids)?;
         disp.signal_all();
@@ -455,15 +442,15 @@ async fn commit_pushes(
     // Sort by (tid, mode) so runs are homogeneous.
     pushes.sort_by_key(|p| (p.tid, p.mode.as_u8()));
 
+    /// One homogeneous (tid, mode) run of `pushes`. Groups tile `pushes`
+    /// contiguously in order, `len` pushes each.
     struct GroupInfo {
-        start: usize,
-        end: usize,
+        len: usize,
         tid: i64,
-        mode_u8: u8,
+        mode: WireConflictMode,
         req_ids: Vec<u64>,
         merged: Option<Batch>,
         write_err: Option<String>,
-        lsn: u64,
     }
 
     let nw = shared.num_workers;
@@ -478,7 +465,6 @@ async fn commit_pushes(
         while run_start < n {
             let tid = pushes[run_start].tid;
             let mode = pushes[run_start].mode;
-            let mode_u8 = mode.as_u8();
             let mut run_end = run_start + 1;
             while run_end < n && pushes[run_end].tid == tid && pushes[run_end].mode == mode {
                 run_end += 1;
@@ -501,7 +487,7 @@ async fn commit_pushes(
                     Ok(pushes[run_start].batch.take().expect("PendingPush.batch already taken"))
                 } else {
                     let schema = shared.disp().schema_desc_for(tid);
-                    let mut m = match merge_pool.remove(&(tid, mode_u8)) {
+                    let mut m = match merge_pool.remove(&(tid, mode.as_u8())) {
                         Some(pooled) if pooled.schema.as_ref() == Some(&schema) => pooled,
                         _ => Batch::with_schema(schema, total_rows.max(1)),
                     };
@@ -523,14 +509,12 @@ async fn commit_pushes(
                     })
                     .unwrap_or_else(|_| Batch::empty_with_schema(&crate::schema::SchemaDescriptor::minimal_u64()));
                     groups.push(GroupInfo {
-                        start: run_start,
-                        end: run_end,
+                        len: run_end - run_start,
                         tid,
-                        mode_u8,
+                        mode,
                         req_ids,
                         merged: Some(placeholder),
                         write_err: Some(panic_msg),
-                        lsn: 0,
                     });
                     run_start = run_end;
                     continue;
@@ -538,14 +522,12 @@ async fn commit_pushes(
             };
 
             groups.push(GroupInfo {
-                start: run_start,
-                end: run_end,
+                len: run_end - run_start,
                 tid,
-                mode_u8,
+                mode,
                 req_ids,
                 merged: Some(merged),
                 write_err: None,
-                lsn: 0,
             });
             run_start = run_end;
         }
@@ -573,24 +555,23 @@ async fn commit_pushes(
             if g.write_err.is_some() {
                 continue;
             }
-            let mode = pushes[g.start].mode;
             let merged = g.merged.as_ref().expect("merged set in Phase A");
             let err = guard_panic("commit_write", || {
                 Ok(shared
                     .disp()
-                    .write_commit_group(g.tid, zone_lsn, merged, mode, &g.req_ids)
+                    .write_commit_group(g.tid, zone_lsn, merged, g.mode, &g.req_ids)
                     .err())
             })
             .unwrap_or_else(Some);
             g.write_err = err;
-            g.lsn = zone_lsn;
         }
 
         let any_written = groups.iter().any(|g| g.write_err.is_none());
         if !any_written {
+            let mut pushes = pushes.into_iter();
             for g in &groups {
                 let e = g.write_err.as_ref().unwrap();
-                for p in pushes.drain(..g.end - g.start) {
+                for p in pushes.by_ref().take(g.len) {
                     let _ = p.done.send(Err(e.clone()));
                 }
             }
@@ -690,7 +671,6 @@ async fn commit_pushes(
                     *entry += g.merged.as_ref().expect("merged set in Phase A").count;
                 }
             }
-            shared.t_last_push.set(Some(Instant::now()));
         }
         if shared
             .tick_rows
@@ -749,16 +729,17 @@ async fn commit_pushes(
     // the schema-staleness guard above will discard them on a DDL change.
     for g in groups.iter_mut() {
         if let Some(b) = g.merged.take() {
-            merge_pool.insert((g.tid, g.mode_u8), b);
+            merge_pool.insert((g.tid, g.mode.as_u8()), b);
         }
     }
 
     // Now send responses in original order.
+    let mut pushes = pushes.into_iter();
     for g in &groups {
-        for p in pushes.drain(..g.end - g.start) {
+        for p in pushes.by_ref().take(g.len) {
             let result = match &g.write_err {
                 Some(e) => Err(e.clone()),
-                None => Ok(g.lsn),
+                None => Ok(zone_lsn),
             };
             let _ = p.done.send(result);
         }
