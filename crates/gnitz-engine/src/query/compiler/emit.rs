@@ -250,7 +250,7 @@ pub(super) fn emit_node(
             let in_schema = reg_meta[in_reg as usize].schema;
             reg_meta[reg_id as usize] = RegisterMeta::delta(in_schema);
             let func_ptr = if let Some(blob) = blob {
-                match decode_expr_blob(blob) {
+                match gnitz_wire::decode_expr_blob(blob) {
                     Some(dep) => create_expr_predicate(
                         &dep.code,
                         dep.num_regs,
@@ -286,7 +286,7 @@ pub(super) fn emit_node(
                     // A corrupt MAP blob would otherwise be skipped, leaving the
                     // output register at the default empty schema and silently
                     // producing wrong/empty downstream results. Abort the compile.
-                    let dep = match decode_expr_blob(program) {
+                    let dep = match gnitz_wire::decode_expr_blob(program) {
                         Some(d) => d,
                         None => {
                             state.emit_failed = true;

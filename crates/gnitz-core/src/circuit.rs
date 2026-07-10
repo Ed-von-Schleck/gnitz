@@ -567,12 +567,6 @@ impl CircuitBuilder {
         nid
     }
 
-    /// **Deprecated no-op.** Const strings are now embedded directly in the
-    /// `ExprProgram` blob; the compiler reads them via `ExprProgram::decode`.
-    /// Retained as an empty stub so SQL planner / Python / C API call sites
-    /// continue to compile during the rewrite.
-    pub fn add_const_string(&mut self, _node_id: NodeId, _index: u32, _value: String) {}
-
     /// Sink — primary INTEGRATE that writes to view storage.
     pub fn sink(&mut self, input: NodeId) -> NodeId {
         let nid = self.alloc_node(OpNode::IntegrateSink);

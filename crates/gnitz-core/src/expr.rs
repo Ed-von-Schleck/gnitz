@@ -18,142 +18,11 @@ pub struct ExprProgram {
     pub const_strings: Vec<String>,
 }
 
-/// Wire-format magic for serialised `ExprProgram` blobs: ASCII "EXPR".
-pub const EXPR_BLOB_MAGIC: u32 = 0x5258_5045; // "EXPR" little-endian
-/// Current wire-format version for `ExprProgram` blobs.
-pub const EXPR_BLOB_VERSION: u8 = 1;
-const EXPR_BLOB_HEADER_SIZE: usize = 16;
-
-/// Errors returned by [`ExprProgram::decode`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExprDecodeErr {
-    /// Magic bytes did not match `EXPR_BLOB_MAGIC` ("EXPR").
-    BadMagic,
-    /// Version byte was not `EXPR_BLOB_VERSION`.
-    BadVersion(u8),
-    /// A reserved byte was non-zero (forwards-incompatibility guard).
-    NonZeroReserved,
-    /// Code length was not a multiple of 4 (every instruction is 4 u32 words).
-    UnalignedCode(u32),
-    /// The blob ended before the declared regions could be read in full.
-    Truncated,
-}
-
-impl std::fmt::Display for ExprDecodeErr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ExprDecodeErr::BadMagic => write!(f, "ExprProgram magic mismatch"),
-            ExprDecodeErr::BadVersion(v) => write!(f, "ExprProgram unknown version {v}"),
-            ExprDecodeErr::NonZeroReserved => write!(f, "ExprProgram reserved bytes must be zero"),
-            ExprDecodeErr::UnalignedCode(n) => write!(f, "ExprProgram code length {n} not a multiple of 4"),
-            ExprDecodeErr::Truncated => write!(f, "ExprProgram blob truncated"),
-        }
-    }
-}
-
-impl std::error::Error for ExprDecodeErr {}
-
 impl ExprProgram {
-    /// Serialise to a self-contained byte sequence suitable for storage in a
-    /// BLOB column. Format (all little-endian):
-    ///
-    /// ```text
-    /// 0   4   magic "EXPR" (u32)
-    /// 4   1   version (u8)
-    /// 5   1   reserved (must be 0)
-    /// 6   2   num_regs (u16)
-    /// 8   2   result_reg (u16)
-    /// 10  2   reserved (must be 0)
-    /// 12  4   code word count N (u32; multiple of 4)
-    /// 16  4N  code words (u32 each)
-    /// ..  4   string count S (u32)
-    /// ..  S × { 4-byte length L, L bytes UTF-8 }
-    /// ```
+    /// Serialise to a self-contained byte sequence (magic "EXPR"), suitable for a BLOB column.
     pub fn encode(&self) -> Vec<u8> {
-        debug_assert!(
-            self.code.len().is_multiple_of(4),
-            "code length {} not 4-aligned",
-            self.code.len()
-        );
-        let mut buf = Vec::with_capacity(
-            EXPR_BLOB_HEADER_SIZE
-                + self.code.len() * 4
-                + 4
-                + self.const_strings.iter().map(|s| 4 + s.len()).sum::<usize>(),
-        );
-        buf.extend_from_slice(&EXPR_BLOB_MAGIC.to_le_bytes());
-        buf.push(EXPR_BLOB_VERSION);
-        buf.push(0); // reserved
-        buf.extend_from_slice(&(self.num_regs as u16).to_le_bytes());
-        buf.extend_from_slice(&(self.result_reg as u16).to_le_bytes());
-        buf.extend_from_slice(&[0, 0]); // reserved
-        buf.extend_from_slice(&(self.code.len() as u32).to_le_bytes());
-        for &word in &self.code {
-            buf.extend_from_slice(&word.to_le_bytes());
-        }
-        buf.extend_from_slice(&(self.const_strings.len() as u32).to_le_bytes());
-        for s in &self.const_strings {
-            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
-            buf.extend_from_slice(s.as_bytes());
-        }
-        buf
-    }
-
-    /// Inverse of [`ExprProgram::encode`]. Validates magic, version, reserved
-    /// fields, code-length alignment, and length consistency.
-    pub fn decode(blob: &[u8]) -> Result<Self, ExprDecodeErr> {
-        if blob.len() < EXPR_BLOB_HEADER_SIZE {
-            return Err(ExprDecodeErr::Truncated);
-        }
-        let magic = u32::from_le_bytes(blob[0..4].try_into().unwrap());
-        if magic != EXPR_BLOB_MAGIC {
-            return Err(ExprDecodeErr::BadMagic);
-        }
-        let version = blob[4];
-        if version != EXPR_BLOB_VERSION {
-            return Err(ExprDecodeErr::BadVersion(version));
-        }
-        if blob[5] != 0 || blob[10] != 0 || blob[11] != 0 {
-            return Err(ExprDecodeErr::NonZeroReserved);
-        }
-        let num_regs = u16::from_le_bytes(blob[6..8].try_into().unwrap()) as u32;
-        let result_reg = u16::from_le_bytes(blob[8..10].try_into().unwrap()) as u32;
-        let n = u32::from_le_bytes(blob[12..16].try_into().unwrap());
-        if n % 4 != 0 {
-            return Err(ExprDecodeErr::UnalignedCode(n));
-        }
-        let code_bytes = (n as usize) * 4;
-        let code_end = EXPR_BLOB_HEADER_SIZE + code_bytes;
-        if blob.len() < code_end + 4 {
-            return Err(ExprDecodeErr::Truncated);
-        }
-        let mut code = Vec::with_capacity(n as usize);
-        for i in 0..n as usize {
-            let off = EXPR_BLOB_HEADER_SIZE + i * 4;
-            code.push(u32::from_le_bytes(blob[off..off + 4].try_into().unwrap()));
-        }
-        let s_count = u32::from_le_bytes(blob[code_end..code_end + 4].try_into().unwrap());
-        let mut cur = code_end + 4;
-        let mut const_strings = Vec::with_capacity(s_count as usize);
-        for _ in 0..s_count {
-            if blob.len() < cur + 4 {
-                return Err(ExprDecodeErr::Truncated);
-            }
-            let l = u32::from_le_bytes(blob[cur..cur + 4].try_into().unwrap()) as usize;
-            cur += 4;
-            if blob.len() < cur + l {
-                return Err(ExprDecodeErr::Truncated);
-            }
-            let s = std::string::String::from_utf8_lossy(&blob[cur..cur + l]).into_owned();
-            cur += l;
-            const_strings.push(s);
-        }
-        Ok(ExprProgram {
-            num_regs,
-            result_reg,
-            code,
-            const_strings,
-        })
+        let strs: Vec<&[u8]> = self.const_strings.iter().map(String::as_bytes).collect();
+        gnitz_wire::encode_expr_blob(self.num_regs, self.result_reg, &self.code, &strs)
     }
 }
 
@@ -210,10 +79,9 @@ impl ExprBuilder {
         self.unary_op(EXPR_LOAD_COL_FLOAT, col_idx as u32)
     }
 
-    /// Full i64 constant. Low 32 bits in arg1, high 32 bits in arg2.
-    /// Reconstructed as: `(a2 << 32) | (a1 & 0xFFFFFFFF)`.
     pub fn load_const(&mut self, value: i64) -> u32 {
-        self.binary_op(EXPR_LOAD_CONST, value as u32, (value >> 32) as u32)
+        let (a1, a2) = gnitz_wire::encode_load_const(value);
+        self.binary_op(EXPR_LOAD_CONST, a1, a2)
     }
 
     // --- Integer arithmetic ---
@@ -348,15 +216,9 @@ impl ExprBuilder {
 
     // --- Conditional ---
 
-    /// Conditional select (SQL CASE blend): result takes `a`'s value + null bit
-    /// where `cond` is non-NULL and truthy, else `b`'s. Packs the three source
-    /// registers into two operand words — `cond` alone in `a1`, `a | (b << 16)`
-    /// in `a2` — the only two-register packing in the encoding (documented on
-    /// `EXPR_SELECT`; the engine decode mirrors this split). Registers cap at 64
-    /// (< 2^16), so the pack never overflows.
     pub fn select(&mut self, cond: u32, a: u32, b: u32) -> u32 {
         let dst = self.alloc_reg();
-        self.emit(EXPR_SELECT, dst, cond, (a & 0xFFFF) | (b << 16));
+        self.emit(EXPR_SELECT, dst, cond, gnitz_wire::encode_select_operands(a, b));
         dst
     }
 
@@ -426,66 +288,27 @@ impl ExprBuilder {
 }
 
 #[cfg(test)]
-mod expr_blob_tests {
+mod tests {
     use super::*;
 
     #[test]
-    fn round_trip_empty_program() {
-        let p = ExprProgram {
-            num_regs: 0,
-            result_reg: 0,
-            code: vec![],
-            const_strings: vec![],
-        };
-        let enc = p.encode();
-        let dec = ExprProgram::decode(&enc).unwrap();
-        assert_eq!(p, dec);
-    }
+    fn encode_round_trips_through_wire_decoder() {
+        let mut b = ExprBuilder::new();
+        let c = b.load_const(1_234_567_890_123);
+        let col = b.load_col_int(0);
+        let cond = b.cmp_gt(col, c);
+        let s_idx = b.add_const_string("längre sträng".to_string());
+        let _ = b.str_col_eq_const(1, s_idx);
+        let _ = b.add_const_string(String::new());
+        let sel = b.select(cond, col, c);
+        let prog = b.build(sel);
 
-    #[test]
-    fn round_trip_program_with_strings() {
-        let p = ExprProgram {
-            num_regs: 5,
-            result_reg: 4,
-            code: vec![1, 2, 3, 4, 5, 6, 7, 8],
-            const_strings: vec!["alpha".into(), "".into(), "längre sträng".into()],
-        };
-        let enc = p.encode();
-        let dec = ExprProgram::decode(&enc).unwrap();
-        assert_eq!(p, dec);
-    }
-
-    #[test]
-    fn rejects_bad_magic() {
-        let mut bad = ExprProgram {
-            num_regs: 0,
-            result_reg: 0,
-            code: vec![],
-            const_strings: vec![],
-        }
-        .encode();
-        bad[0] = 0;
-        assert_eq!(ExprProgram::decode(&bad), Err(ExprDecodeErr::BadMagic));
-    }
-
-    #[test]
-    fn rejects_unaligned_code_length() {
-        // Manually craft a header with a non-multiple-of-4 code length.
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&EXPR_BLOB_MAGIC.to_le_bytes());
-        buf.push(EXPR_BLOB_VERSION);
-        buf.push(0);
-        buf.extend_from_slice(&0u16.to_le_bytes()); // num_regs
-        buf.extend_from_slice(&0u16.to_le_bytes()); // result_reg
-        buf.extend_from_slice(&[0, 0]); // reserved
-        buf.extend_from_slice(&3u32.to_le_bytes()); // n=3 — not multiple of 4
-        buf.extend_from_slice(&0u32.to_le_bytes());
-        buf.extend_from_slice(&0u32.to_le_bytes());
-        buf.extend_from_slice(&0u32.to_le_bytes());
-        buf.extend_from_slice(&0u32.to_le_bytes()); // string count
-        assert!(matches!(
-            ExprProgram::decode(&buf),
-            Err(ExprDecodeErr::UnalignedCode(3))
-        ));
+        let blob = prog.encode();
+        let dec = gnitz_wire::decode_expr_blob(&blob).unwrap();
+        assert_eq!(dec.num_regs, prog.num_regs);
+        assert_eq!(dec.result_reg, prog.result_reg);
+        assert_eq!(dec.code, prog.code);
+        let expected: Vec<Vec<u8>> = prog.const_strings.iter().map(|s| s.as_bytes().to_vec()).collect();
+        assert_eq!(dec.const_strings, expected);
     }
 }

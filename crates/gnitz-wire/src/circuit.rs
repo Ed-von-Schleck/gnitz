@@ -275,9 +275,8 @@ pub enum MapKind {
     HashRow(Vec<u16>, Vec<u8>, u8),
 }
 
-/// Typed operator-node payload. Expression blobs are stored as raw `Vec<u8>`;
-/// each crate decodes them independently (gnitz-core uses `ExprProgram::decode`;
-/// gnitz-engine uses its own `decode_expr_blob`).
+/// Typed operator-node payload. Expression blobs are stored as raw `Vec<u8>` and decoded
+/// with `gnitz_wire::decode_expr_blob`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpNode {
     /// `OPCODE_SCAN_DELTA = 11`. Delta input; carries the source `table_id`.

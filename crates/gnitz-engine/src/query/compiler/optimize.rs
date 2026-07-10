@@ -209,7 +209,7 @@ pub(super) fn opt_fold_reduce_map(
         if consumers.len() != 1 {
             continue;
         }
-        let dep = match decode_expr_blob(blob) {
+        let dep = match gnitz_wire::decode_expr_blob(blob) {
             Some(d) => d,
             None => continue,
         };

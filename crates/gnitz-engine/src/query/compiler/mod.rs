@@ -161,77 +161,6 @@ pub(crate) struct CompileOutput {
     pub side_b: Option<SideBPlan>,
 }
 
-/// Decoded `ExprProgram` blob (inline copy of the gnitz-core wire shape so the
-/// engine doesn't take a dependency on the client crate).
-struct DecodedExprProgram {
-    num_regs: u32,
-    result_reg: u32,
-    code: Vec<u32>,
-    const_strings: Vec<Vec<u8>>,
-}
-
-const EXPR_BLOB_MAGIC: u32 = 0x5258_5045; // "EXPR" little-endian
-const EXPR_BLOB_VERSION: u8 = 1;
-const EXPR_BLOB_HEADER_SIZE: usize = 16;
-
-fn decode_expr_blob(blob: &[u8]) -> Option<DecodedExprProgram> {
-    if blob.len() < EXPR_BLOB_HEADER_SIZE {
-        return None;
-    }
-    if u32::from_le_bytes(blob[0..4].try_into().unwrap()) != EXPR_BLOB_MAGIC {
-        return None;
-    }
-    if blob[4] != EXPR_BLOB_VERSION {
-        return None;
-    }
-    if blob[5] != 0 || blob[10] != 0 || blob[11] != 0 {
-        return None;
-    }
-    let num_regs = u16::from_le_bytes(blob[6..8].try_into().unwrap()) as u32;
-    let result_reg = u16::from_le_bytes(blob[8..10].try_into().unwrap()) as u32;
-    let n = u32::from_le_bytes(blob[12..16].try_into().unwrap());
-    if n % 4 != 0 {
-        return None;
-    }
-    let code_bytes = (n as usize) * 4;
-    let code_end = EXPR_BLOB_HEADER_SIZE + code_bytes;
-    if blob.len() < code_end + 4 {
-        return None;
-    }
-    let mut code = Vec::with_capacity(n as usize);
-    for i in 0..n as usize {
-        let off = EXPR_BLOB_HEADER_SIZE + i * 4;
-        code.push(u32::from_le_bytes(blob[off..off + 4].try_into().unwrap()));
-    }
-    let s_count = u32::from_le_bytes(blob[code_end..code_end + 4].try_into().unwrap());
-    let mut cur = code_end + 4;
-    // Each string needs at least a 4-byte length prefix. Bound s_count before
-    // reserving so a corrupt blob with a huge count can't trigger an OOM in
-    // Vec::with_capacity before the per-string length checks run.
-    if (s_count as usize) > blob.len().saturating_sub(cur) / 4 {
-        return None;
-    }
-    let mut const_strings = Vec::with_capacity(s_count as usize);
-    for _ in 0..s_count {
-        if blob.len() < cur + 4 {
-            return None;
-        }
-        let l = u32::from_le_bytes(blob[cur..cur + 4].try_into().unwrap()) as usize;
-        cur += 4;
-        if blob.len() < cur + l {
-            return None;
-        }
-        const_strings.push(blob[cur..cur + l].to_vec());
-        cur += l;
-    }
-    Some(DecodedExprProgram {
-        num_regs,
-        result_reg,
-        code,
-        const_strings,
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Build a single plan (pre or post exchange)
 // ---------------------------------------------------------------------------
@@ -1169,33 +1098,6 @@ mod tests {
             result.is_none(),
             "build_plan must return None when child table creation fails"
         );
-    }
-
-    #[test]
-    fn test_decode_expr_blob_rejects_huge_s_count() {
-        // Minimal valid header (16 bytes): [0..4] magic, [4] version, [5] 0,
-        // [6..8] num_regs, [8..10] result_reg, [10]=0, [11]=0, [12..16] n=0.
-        // s_count = u32::MAX with no string bytes must return None, not OOM.
-        let mut header = [0u8; 16];
-        header[0..4].copy_from_slice(&EXPR_BLOB_MAGIC.to_le_bytes());
-        header[4] = EXPR_BLOB_VERSION;
-        // n = 0 at [12..16]
-        let mut b = header.to_vec();
-        b.extend_from_slice(&u32::MAX.to_le_bytes()); // s_count
-        assert!(decode_expr_blob(&b).is_none(), "huge s_count must be rejected");
-
-        // s_count = 1 but no string length prefix bytes remaining → None.
-        let mut b2 = header.to_vec();
-        b2.extend_from_slice(&1u32.to_le_bytes());
-        assert!(
-            decode_expr_blob(&b2).is_none(),
-            "s_count with too few bytes must be rejected"
-        );
-
-        // Sanity: s_count = 0 with a valid header decodes successfully.
-        let mut b3 = header.to_vec();
-        b3.extend_from_slice(&0u32.to_le_bytes());
-        assert!(decode_expr_blob(&b3).is_some(), "valid empty program must decode");
     }
 
     #[test]

@@ -19,7 +19,7 @@ pub use connection::{
     VIEW_TAB,
 };
 pub use error::ClientError;
-pub use expr::{ExprBuilder, ExprDecodeErr, ExprProgram, EXPR_BLOB_MAGIC, EXPR_BLOB_VERSION};
+pub use expr::{ExprBuilder, ExprProgram};
 pub use gnitz_wire::{
     index_key_types, pack_table_flags, table_flags_dist_prefix, validate_dist_prefix, validate_user_identifier, Cut,
     PkColList, RangeDescriptor, FK_INDEX_INFIX,

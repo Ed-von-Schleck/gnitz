@@ -9,23 +9,17 @@
 
 use crate::foundation::codec::read_u32_le;
 use crate::schema::{german_string_tail, SchemaDescriptor};
-// Wire opcodes (1–46) the client emits, brought in as engine-local `u32`
-// constants for the `from_wire` lowering match. gnitz-wire exposes its raw opcode
-// constants only through `cast_consts!`, so this is the single access point.
-gnitz_wire::cast_consts! { u32;
-    EXPR_LOAD_COL_INT, EXPR_LOAD_COL_FLOAT, EXPR_LOAD_CONST,
-    EXPR_INT_ADD, EXPR_INT_SUB, EXPR_INT_MUL, EXPR_INT_DIV, EXPR_INT_MOD, EXPR_INT_NEG,
-    EXPR_FLOAT_ADD, EXPR_FLOAT_SUB, EXPR_FLOAT_MUL, EXPR_FLOAT_DIV, EXPR_FLOAT_NEG,
-    EXPR_CMP_EQ, EXPR_CMP_NE, EXPR_CMP_GT, EXPR_CMP_GE, EXPR_CMP_LT, EXPR_CMP_LE,
-    EXPR_FCMP_EQ, EXPR_FCMP_NE, EXPR_FCMP_GT, EXPR_FCMP_GE, EXPR_FCMP_LT, EXPR_FCMP_LE,
-    EXPR_BOOL_AND, EXPR_BOOL_OR, EXPR_BOOL_NOT,
-    EXPR_IS_NULL, EXPR_IS_NOT_NULL,
-    EXPR_EMIT, EXPR_INT_TO_FLOAT, EXPR_COPY_COL,
-    EXPR_SELECT, EXPR_LOAD_NULL,
-    EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LT_CONST, EXPR_STR_COL_LE_CONST,
-    EXPR_STR_COL_EQ_COL, EXPR_STR_COL_LT_COL, EXPR_STR_COL_LE_COL,
-    EXPR_EMIT_NULL,
-}
+// Wire opcodes (1–46) the client emits, matched as arms in `from_wire`. They are
+// `pub const … : u32` in gnitz-wire, so a plain `use` binds them for pattern use.
+use gnitz_wire::{
+    EXPR_BOOL_AND, EXPR_BOOL_NOT, EXPR_BOOL_OR, EXPR_CMP_EQ, EXPR_CMP_GE, EXPR_CMP_GT, EXPR_CMP_LE, EXPR_CMP_LT,
+    EXPR_CMP_NE, EXPR_COPY_COL, EXPR_EMIT, EXPR_EMIT_NULL, EXPR_FCMP_EQ, EXPR_FCMP_GE, EXPR_FCMP_GT, EXPR_FCMP_LE,
+    EXPR_FCMP_LT, EXPR_FCMP_NE, EXPR_FLOAT_ADD, EXPR_FLOAT_DIV, EXPR_FLOAT_MUL, EXPR_FLOAT_NEG, EXPR_FLOAT_SUB,
+    EXPR_INT_ADD, EXPR_INT_DIV, EXPR_INT_MOD, EXPR_INT_MUL, EXPR_INT_NEG, EXPR_INT_SUB, EXPR_INT_TO_FLOAT,
+    EXPR_IS_NOT_NULL, EXPR_IS_NULL, EXPR_LOAD_COL_FLOAT, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST, EXPR_LOAD_NULL,
+    EXPR_SELECT, EXPR_STR_COL_EQ_COL, EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LE_COL, EXPR_STR_COL_LE_CONST,
+    EXPR_STR_COL_LT_COL, EXPR_STR_COL_LT_CONST,
+};
 
 /// The register file is capped at 64: the BOOL_AND/BOOL_OR 3VL paths, the
 /// null-bit propagation, and every register-indexed mask (`bit_only_mask`,
@@ -527,10 +521,9 @@ impl LogicalProgram {
             instrs.push(match op {
                 EXPR_LOAD_COL_INT => LogicalInstr::LoadColInt { dst, col: q[2] },
                 EXPR_LOAD_COL_FLOAT => LogicalInstr::LoadColFloat { dst, col: q[2] },
-                // 64-bit constant split low/high across the two operand words.
                 EXPR_LOAD_CONST => LogicalInstr::LoadConst {
                     dst,
-                    val: ((q[3] as i64) << 32) | (q[2] as i64 & 0xFFFF_FFFF),
+                    val: gnitz_wire::decode_load_const(q[2], q[3]),
                 },
                 EXPR_INT_ADD => LogicalInstr::IntAdd { dst, a, b },
                 EXPR_INT_SUB => LogicalInstr::IntSub { dst, a, b },
@@ -562,18 +555,15 @@ impl LogicalProgram {
                 EXPR_IS_NOT_NULL => LogicalInstr::IsNotNull { dst, col: q[2] },
                 EXPR_EMIT => LogicalInstr::Emit { src: a, out: q[3] },
                 EXPR_INT_TO_FLOAT => LogicalInstr::IntToFloat { dst, a },
-                // SELECT packs three register sources into two words: `cond` in
-                // `q[2]`, `a`/`b` as the low/high 16 bits of `q[3]`. This is the
-                // only two-register packing in the wire encoding (LOAD_CONST above
-                // packs a 64-bit *value*, not registers). Bind under FRESH names —
-                // reusing the loop-level `a = q[2]`/`b = q[3]` would silently swap
-                // the operands (see the `EXPR_SELECT` doc in gnitz-wire).
-                EXPR_SELECT => LogicalInstr::Select {
-                    dst,
-                    cond: q[2] as u16,
-                    a: (q[3] & 0xFFFF) as u16,
-                    b: (q[3] >> 16) as u16,
-                },
+                EXPR_SELECT => {
+                    let (sa, sb) = gnitz_wire::decode_select_operands(q[3]);
+                    LogicalInstr::Select {
+                        dst,
+                        cond: q[2] as u16,
+                        a: sa,
+                        b: sb,
+                    }
+                }
                 EXPR_LOAD_NULL => LogicalInstr::LoadNull { dst },
                 EXPR_COPY_COL => LogicalInstr::CopyCol {
                     src_col: q[2],
