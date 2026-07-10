@@ -624,10 +624,11 @@ mod tests {
 
     #[test]
     fn test_op_map_empty_batch() {
+        use crate::expr::LogicalProgram;
         let schema = make_schema_u64_i64();
         let empty_batch = Batch::empty_with_schema(&schema);
 
-        let func = ScalarFunc::from_projection(&[1], &[type_code::I64], &schema, &schema);
+        let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[(1, type_code::I64)]), &schema, &schema);
         let out = op_map(&empty_batch, &func, &schema, &schema, &[], &[], false, 0);
         assert_eq!(out.count, 0);
     }
@@ -922,6 +923,7 @@ mod tests {
 
     #[test]
     fn test_op_map_with_reindex_promotes_payload_to_pk() {
+        use crate::expr::LogicalProgram;
         // op_map with reindex_col >= 0 rewrites the output PK by reading the
         // referenced column through the reindex packer. Verifies (1) every row's
         // output PK matches the source column value, (2) the resulting
@@ -934,7 +936,7 @@ mod tests {
         let batch = make_batch(&schema, &[(1, 1, 200), (2, 1, 100), (3, 1, 300)]);
 
         // Projection plan: output keeps the same single payload column.
-        let func = ScalarFunc::from_projection(&[1], &[type_code::I64], &schema, &schema);
+        let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[(1, type_code::I64)]), &schema, &schema);
 
         let out = op_map(
             &batch,

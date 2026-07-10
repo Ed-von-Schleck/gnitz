@@ -113,6 +113,9 @@ pub(crate) enum Instr {
         // The combined AVI cursor is created fresh from its table each tick;
         // `None` means the operator has no value index (all-linear or fallback).
         avi: Option<ReduceAvi>,
+        /// Post-reduce finalize MAP: an index into `Program::funcs`, exactly like
+        /// `Instr::Map`'s. `None` when the reduce emits its raw output directly.
+        /// Paired with `finalize_schema_idx` — both Some or both None.
         finalize_func_idx: Option<u16>,
         finalize_schema_idx: Option<u16>,
         // Global-aggregate ground machinery (see `op_reduce`). `global_ground` is
@@ -146,11 +149,10 @@ pub(crate) struct ReduceAvi {
 
 /// Opaque handle owning a compiled program and its register file.
 ///
-/// When produced by the Rust compiler (`compile_view`), `owned_tables`,
-/// `owned_funcs`, and `owned_expr_progs` hold heap resources that
-/// `program.tables` / `program.funcs` / `program.expr_progs` borrow via
-/// raw pointers.  Rust drop order (declaration order) ensures `program`
-/// drops before the owned vecs, so dangling pointers are never chased.
+/// When produced by the Rust compiler (`compile_view`), `owned_tables` and
+/// `owned_funcs` hold heap resources that `program.tables` / `program.funcs`
+/// borrow via raw pointers.  Rust drop order (declaration order) ensures
+/// `program` drops before the owned vecs, so dangling pointers are never chased.
 ///
 /// The compile-time assertions below are machine-checked: reordering any
 /// owned vec before `program` produces a compile error, not a use-after-free.
@@ -166,14 +168,11 @@ pub(crate) struct VmHandle {
     /// Child tables created during compilation (history, reduce-in, AVI).
     /// `program.tables` may point into these.  Dropped AFTER `program`.
     pub owned_tables: Vec<Box<Table>>,
-    /// Scalar functions created during compilation.
+    /// Scalar functions created during compilation — filters, maps, projections,
+    /// and the post-reduce finalize maps.
     /// `program.funcs` may point into these.  Dropped AFTER `program`.
     #[allow(dead_code)]
     pub owned_funcs: Vec<Box<ScalarFunc>>,
-    /// Expression programs created during compilation.
-    /// `program.expr_progs` may point into these.  Dropped AFTER `program`.
-    #[allow(dead_code)]
-    pub owned_expr_progs: Vec<Box<crate::expr::ResolvedProgram>>,
     /// Trace registers backed by owned tables: `(reg_id, index into owned_tables)`.
     /// `execute_epoch` creates cursors from these before dispatch.
     pub owned_trace_regs: Vec<(u16, usize)>,
@@ -183,7 +182,6 @@ pub(crate) struct VmHandle {
 // Rust's declaration-order drop visits `program` before any vec it borrows.
 const _: () = assert!(std::mem::offset_of!(VmHandle, program) < std::mem::offset_of!(VmHandle, owned_tables));
 const _: () = assert!(std::mem::offset_of!(VmHandle, program) < std::mem::offset_of!(VmHandle, owned_funcs));
-const _: () = assert!(std::mem::offset_of!(VmHandle, program) < std::mem::offset_of!(VmHandle, owned_expr_progs));
 // Cursor destructors dereference their owning `Table`; cursors MUST drop first.
 const _: () =
     assert!(std::mem::offset_of!(VmHandle, owned_cursor_handles) < std::mem::offset_of!(VmHandle, owned_tables));
@@ -290,12 +288,11 @@ pub(crate) struct Program {
     /// Parallel to `reindex_cols` (same offsets): per-column carried promotion
     /// target tc (`0` = derive from source).
     pub reindex_target_tcs: Vec<u8>,
-    pub expr_progs: Vec<*const crate::expr::ResolvedProgram>,
 }
 
 // SAFETY: Program is only accessed from a single thread (the worker thread
-// that owns the plan).  Raw pointers into ScalarFunc,
-// Table, and ExprProgram are stable for the lifetime of the plan.
+// that owns the plan).  Raw pointers into ScalarFunc and Table are stable for
+// the lifetime of the plan.
 unsafe impl Send for Program {}
 
 // ---------------------------------------------------------------------------
@@ -683,9 +680,8 @@ mod tests {
         let out_schema = make_schema(&[type_code::I64]);
 
         // MAP with ScalarFunc projection: reorder/select columns.
-        let func = Box::new(crate::expr::ScalarFunc::from_projection(
-            &[2],
-            &[type_code::I64],
+        let func = Box::new(crate::expr::ScalarFunc::from_map(
+            crate::expr::LogicalProgram::copy_cols(&[(2, type_code::I64)]),
             &in_schema,
             &out_schema,
         ));

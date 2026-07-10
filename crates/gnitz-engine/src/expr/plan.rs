@@ -170,12 +170,6 @@ impl NullPerm {
         NullPerm { pairs, constant }
     }
 
-    /// Build from a projection: output payload i ← src column at payload byte.
-    fn from_projection(src_pi_bytes: &[u8]) -> Self {
-        let dst_payloads: Vec<u32> = (0..src_pi_bytes.len() as u32).collect();
-        Self::from_col_pairs(src_pi_bytes, &dst_payloads, &[])
-    }
-
     #[inline]
     fn apply(&self, in_null: u64) -> u64 {
         let mut out: u64 = self.constant;
@@ -223,24 +217,18 @@ struct ColMove {
     pk_byte_offset: u8,
 }
 
-struct InterpretedFilter {
-    prog: ResolvedProgram,
-    /// Precomputed `prog.is_strictly_non_nullable(in_schema)`.
-    no_nulls: bool,
-}
-
 struct InterpretedCompute {
     prog: ResolvedProgram,
     emit_payloads: Vec<usize>,
     emit_regs: Vec<usize>,
     /// Output byte width per EMIT target, parallel to `emit_payloads`.
     emit_strides: Vec<u8>,
-    /// Precomputed `prog.is_strictly_non_nullable(in_schema)`.
-    no_nulls: bool,
 }
 
 pub struct ScalarFunc {
-    filter: Option<InterpretedFilter>,
+    /// The predicate program; `None` for a map/projection. `prog.no_nulls` carries
+    /// the nullability verdict against the schema it was resolved against.
+    filter: Option<ResolvedProgram>,
     col_moves: Vec<ColMove>,
     null_perm: NullPerm,
     compute: Option<InterpretedCompute>,
@@ -253,10 +241,8 @@ pub struct ScalarFunc {
 impl ScalarFunc {
     /// Filter via interpreted expression.
     pub fn from_predicate(logical: LogicalProgram, schema: &SchemaDescriptor) -> Self {
-        let prog = logical.resolve(schema, /* is_filter = */ true);
-        let no_nulls = prog.is_strictly_non_nullable(schema);
         ScalarFunc {
-            filter: Some(InterpretedFilter { prog, no_nulls }),
+            filter: Some(logical.resolve(schema, /* is_filter = */ true)),
             col_moves: Vec::new(),
             null_perm: NullPerm::default(),
             compute: None,
@@ -265,51 +251,10 @@ impl ScalarFunc {
         }
     }
 
-    /// Projection plan from source indices.
-    pub fn from_projection(
-        src_indices: &[u32],
-        src_types: &[u8],
-        in_schema: &SchemaDescriptor,
-        out_schema: &SchemaDescriptor,
-    ) -> Self {
-        let src_pi_bytes: Vec<u8> = src_indices
-            .iter()
-            .map(|&ci| in_schema.payload_mapping_byte(ci as usize))
-            .collect();
-        let col_moves: Vec<ColMove> = src_indices
-            .iter()
-            .zip(src_pi_bytes.iter())
-            .zip(src_types.iter())
-            .enumerate()
-            .map(|(i, ((&ci, &src_pi), &tc))| {
-                let pk_byte_offset = if src_pi == PAYLOAD_MAPPING_PK_SENTINEL {
-                    in_schema.pk_byte_offset(ci as usize)
-                } else {
-                    0u8
-                };
-                let out_ci = out_schema.payload_col_idx(i);
-                ColMove {
-                    src_pi,
-                    dst_payload: i,
-                    type_code: tc,
-                    stride: out_schema.columns[out_ci].size(),
-                    pk_byte_offset,
-                }
-            })
-            .collect();
-        let null_perm = NullPerm::from_projection(&src_pi_bytes);
-        let blob_passthrough = compute_blob_passthrough(in_schema, &col_moves);
-        ScalarFunc {
-            filter: None,
-            col_moves,
-            null_perm,
-            compute: None,
-            blob_passthrough,
-            scratch: RefCell::new(EvalScratch::new()),
-        }
-    }
-
-    /// Map plan from a logical expression program.
+    /// Map plan from a logical expression program. A pure projection is the
+    /// special case where every instruction is a `CopyCol` (see
+    /// [`LogicalProgram::copy_cols`]): `compute` is `None` and the plan reduces to
+    /// `col_moves` + `null_perm`.
     pub fn from_map(logical: LogicalProgram, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> Self {
         let prog = logical.resolve(in_schema, /* is_filter = */ false);
         // One pass over the typed output classification — `ColSrc` carries the
@@ -365,13 +310,11 @@ impl ScalarFunc {
                 .collect();
             debug_assert_eq!(emit_strides.len(), emit_regs.len());
             debug_assert_eq!(emit_strides.len(), emit_payloads.len());
-            let no_nulls = prog.is_strictly_non_nullable(in_schema);
             Some(InterpretedCompute {
                 prog,
                 emit_payloads,
                 emit_regs,
                 emit_strides,
-                no_nulls,
             })
         };
 
@@ -392,21 +335,22 @@ impl ScalarFunc {
     /// since the unpack to `regs` is skipped in that case).
     #[cfg(test)]
     pub(crate) fn evaluate_predicate(&self, batch: &MemBatch, row: usize) -> bool {
-        let Some(InterpretedFilter { prog, no_nulls }) = &self.filter else {
+        let Some(prog) = &self.filter else {
             return true;
         };
+        let no_nulls = prog.no_nulls;
         let mut scratch = self.scratch.borrow_mut();
-        scratch.ensure_capacity(prog.num_regs as usize, *no_nulls, 1);
+        scratch.ensure_capacity(prog.num_regs as usize, no_nulls, 1);
         eval_batch(prog, batch, row, 1, &mut scratch);
         if prog.num_regs == 0 {
             return false;
         }
         let r = prog.result_reg as usize;
-        let is_null = !*no_nulls && (scratch.null_bits[r * NULL_WORDS_PER_REG] & 1) != 0;
+        let is_null = !no_nulls && (scratch.null_bits[r * NULL_WORDS_PER_REG] & 1) != 0;
         if is_null {
             return false;
         }
-        if !*no_nulls && prog.is_bit_only(r) {
+        if !no_nulls && prog.is_bit_only(r) {
             (scratch.bool_bits[r * NULL_WORDS_PER_REG] & 1) != 0
         } else {
             scratch.regs[r * MORSEL] != 0
@@ -418,13 +362,13 @@ impl ScalarFunc {
     /// the whole range in one call. The bitmap stays inside `scratch` — no
     /// per-call `Vec<u64>` allocation.
     pub fn run_filter<F: FnMut(usize, usize)>(&self, mb: &MemBatch, n: usize, mut append_range: F) {
-        let Some(InterpretedFilter { prog, no_nulls }) = &self.filter else {
+        let Some(prog) = &self.filter else {
             if n > 0 {
                 append_range(0, n);
             }
             return;
         };
-        let no_nulls = *no_nulls;
+        let no_nulls = prog.no_nulls;
         let num_regs = prog.num_regs as usize;
         let result_reg = prog.result_reg as usize;
 
@@ -553,10 +497,9 @@ impl ScalarFunc {
             emit_payloads,
             emit_regs,
             emit_strides,
-            no_nulls,
         }) = &self.compute
         {
-            let no_nulls = *no_nulls;
+            let no_nulls = prog.no_nulls;
             let num_regs = prog.num_regs as usize;
 
             let in_mb = in_batch.as_mem_batch();
@@ -624,58 +567,6 @@ impl ScalarFunc {
         // `output` came from `with_schema` (`Raw`) and only raw region writes
         // above, so it stays `Raw` — `op_map` keeps it that way.
         output
-    }
-}
-
-// ---------------------------------------------------------------------------
-// FinalizeContext — hoisted state for the per-row finalize evaluator
-// ---------------------------------------------------------------------------
-
-/// Per-program state for the REDUCE finalize expression. One instance is
-/// constructed before the group loop and reused across every emitted row.
-///
-/// Everything that is constant across rows — the scratch register file, the
-/// `no_nulls` flag, the EMIT-instruction → source-register map, and the
-/// instruction-order column classification used by the caller — is computed
-/// once and survives for the lifetime of the context.
-pub(crate) struct FinalizeContext {
-    scratch: EvalScratch,
-    no_nulls: bool,
-    /// Classification of every output-producing instruction in program order.
-    /// Indexed by destination payload column at the call site.
-    out_cols: Vec<OutputColKind>,
-}
-
-impl FinalizeContext {
-    pub fn new(prog: &ResolvedProgram, in_schema: &SchemaDescriptor) -> Self {
-        let no_nulls = prog.is_strictly_non_nullable(in_schema);
-        let mut scratch = EvalScratch::new();
-        scratch.ensure_capacity(prog.num_regs as usize, no_nulls, 1);
-        let out_cols = prog.classify_output_cols();
-        FinalizeContext {
-            scratch,
-            no_nulls,
-            out_cols,
-        }
-    }
-
-    /// Classification of each output-producing instruction (in program order).
-    pub fn out_cols(&self) -> &[OutputColKind] {
-        &self.out_cols
-    }
-
-    /// Evaluate `prog` over a single row of `mb` into the cached scratch.
-    /// The result of each EMIT can subsequently be read with `read_emit`.
-    pub fn eval_row(&mut self, prog: &ResolvedProgram, mb: &MemBatch, row: usize) {
-        eval_batch(prog, mb, row, 1, &mut self.scratch);
-    }
-
-    /// Read the value and null flag for the EMIT whose source is register `reg`.
-    /// Must be called after `eval_row`.
-    pub fn read_emit(&self, reg: usize) -> (i64, bool) {
-        let val = self.scratch.regs[reg * MORSEL];
-        let is_null = !self.no_nulls && (self.scratch.null_bits[reg * NULL_WORDS_PER_REG] & 1) != 0;
-        (val, is_null)
     }
 }
 

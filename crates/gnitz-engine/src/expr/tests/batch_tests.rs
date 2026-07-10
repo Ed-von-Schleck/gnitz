@@ -593,10 +593,7 @@ fn select_no_nulls_fast_arm() {
         },
     ];
     let prog = LogicalProgram::new(instrs, 4, 3, vec![]).resolve(&schema, false);
-    assert!(
-        prog.is_strictly_non_nullable(&schema),
-        "NOT NULL branches must select the no_nulls fast arm"
-    );
+    assert!(prog.no_nulls, "NOT NULL branches must select the no_nulls fast arm");
 
     let n = 130usize; // crosses a 64-bit word and the MORSEL boundary isn't hit, but words are
     let batch = build_n_col_batch(

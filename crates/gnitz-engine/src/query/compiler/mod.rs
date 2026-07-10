@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::expr::{LogicalProgram, ResolvedProgram, ScalarFunc};
+use crate::expr::{LogicalProgram, ScalarFunc};
 use crate::foundation::worker_ctx::{num_workers, worker_rank};
 use crate::ops::{AggDescriptor, AggOp};
 use crate::query::vm::{ProgramBuilder, RegisterMeta, VmHandle};
@@ -91,7 +91,7 @@ struct Annotation {
 /// Optimization rewrite decisions.
 struct Rewrites {
     skip_nodes: HashSet<i32>,
-    fold_finalize: HashMap<i32, usize>, // reduce_nid → index into owned_expr_progs
+    fold_finalize: HashMap<i32, usize>, // reduce_nid → index into the fold-program list
     folded_maps: HashMap<i32, i32>,     // map_nid → reduce_nid
 }
 
@@ -277,14 +277,14 @@ pub(crate) unsafe fn compile_view(
 
     let ann = annotate(&loaded, ext_tables);
 
-    let mut owned_expr_progs_for_rw: Vec<Box<LogicalProgram>> = Vec::new();
+    let mut fold_progs: Vec<Box<LogicalProgram>> = Vec::new();
     let mut rw = Rewrites {
         skip_nodes: HashSet::new(),
         fold_finalize: HashMap::new(),
         folded_maps: HashMap::new(),
     };
     opt_distinct(&loaded, &ann, &mut rw);
-    opt_fold_reduce_map(&loaded, &mut rw, &mut owned_expr_progs_for_rw);
+    opt_fold_reduce_map(&loaded, &mut rw, &mut fold_progs);
 
     let exchange_nids: Vec<i32> = loaded
         .ordered
@@ -315,7 +315,7 @@ pub(crate) unsafe fn compile_view(
                 view_id,
                 None,
                 &[],
-                owned_expr_progs_for_rw,
+                fold_progs,
             )
             .ok_or(CompileError::NoExchangeBuildFailed)?;
 
@@ -357,7 +357,7 @@ pub(crate) unsafe fn compile_view(
             }
 
             let pre_nids: HashSet<i32> = pre_ordered.iter().copied().collect();
-            let (rw_pre, pre_progs, rw_post, post_progs) = split_fold_programs(rw, owned_expr_progs_for_rw, &pre_nids);
+            let (rw_pre, pre_progs, rw_post, post_progs) = split_fold_programs(rw, fold_progs, &pre_nids);
 
             let pre = build_plan(
                 &loaded,

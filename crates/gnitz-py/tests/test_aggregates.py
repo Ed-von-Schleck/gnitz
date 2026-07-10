@@ -3544,3 +3544,165 @@ class TestCombinedValueIndex:
             check("reinsert-lower")
         finally:
             client.drop_schema(sn)
+
+
+class TestFinalizeMapShapes:
+    """The post-reduce finalize (AVG, nullable-SUM) is a columnar MAP over the raw
+    reduce output. Two of its column shapes are exercised nowhere else:
+
+      * a **German-string group column** copied through the finalize MAP — short
+        (inline) and long (heap-backed) values must survive the blob relocate /
+        passthrough, not just the raw reduce emit;
+      * a **compound synthetic `_group_pk`** (multi-column GROUP BY) under a
+        finalize, whose PK region the MAP inherits verbatim.
+
+    Both are checked against the from-scratch oracle across insert, retraction,
+    and group-emptying ticks."""
+
+    def test_string_group_by_avg_and_nullable_sum(self, client):
+        """GROUP BY a TEXT column with AVG + a SUM over a NULLABLE column. The
+        finalize MAP copies the string group column (relocating its blob heap) and
+        computes AVG / nullfill-SUM in the same pass. Mixes short inline strings
+        with strings past the 12-byte German-string inline limit so both the inline
+        and heap-backed cells cross the finalize."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  s TEXT NOT NULL,"
+                "  x BIGINT NOT NULL,"
+                "  y BIGINT"          # nullable → NullfillSum finalize
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT s, AVG(x) AS avg_x, SUM(y) AS sum_y "
+                "FROM t GROUP BY s",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            project = ["s", "avg_x", "sum_y"]
+            t_state = {}
+
+            def check(ctx):
+                base = oracle.oracle_filter_project(t_state, None, ["s", "x", "y"])
+                exp, cols = oracle.oracle_groupby_aggregate(
+                    base, ["s", "x", "y"], ["s"],
+                    [("avg_x", "AVG", "x"), ("sum_y", "SUM", "y")])
+                assert cols == project
+                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
+
+            # "ab" is inline (≤12 bytes); the other two exceed it and live on the
+            # blob heap. Group "long-heap-backed-key-2" is all-NULL in y → SUM NULL.
+            short, long1, long2 = "ab", "long-heap-backed-key-1", "long-heap-backed-key-2"
+            rows = [
+                {"pk": 1, "s": short, "x": 2, "y": 10},
+                {"pk": 2, "s": short, "x": 5, "y": None},
+                {"pk": 3, "s": long1, "x": 7, "y": 3},
+                {"pk": 4, "s": long1, "x": 8, "y": 4},
+                {"pk": 5, "s": long2, "x": 9, "y": None},
+            ]
+            client.execute_sql(
+                "INSERT INTO t VALUES "
+                + ", ".join(
+                    f"({r['pk']}, '{r['s']}', {r['x']}, "
+                    f"{'NULL' if r['y'] is None else r['y']})"
+                    for r in rows
+                ),
+                schema_name=sn,
+            )
+            oracle.apply_insert(t_state, "pk", rows)
+            check("after-insert")
+
+            # Retract one row of the inline group: AVG(x) 3.5 → 2.0, SUM(y) stays 10.
+            client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [2])
+            check("after-retract-inline-group")
+
+            # Retract the last non-NULL y of long1 → its SUM(y) must become NULL,
+            # while AVG(x) recomputes over the survivor.
+            client.execute_sql("DELETE FROM t WHERE pk = 3", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [3])
+            check("after-retract-last-nonnull-y")
+
+            # Empty the all-NULL heap-backed group entirely → it must vanish.
+            client.execute_sql("DELETE FROM t WHERE pk = 5", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [5])
+            check("after-empty-long2")
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_multi_col_group_by_avg(self, client):
+        """GROUP BY a, b with AVG: the compound group key folds into a synthetic
+        `_group_pk` the finalize MAP inherits verbatim, and both group-exemplar
+        columns are copied through it into payload slots."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  a BIGINT NOT NULL,"
+                "  b BIGINT NOT NULL,"
+                "  val BIGINT NOT NULL"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a, b, COUNT(*) AS n, AVG(val) AS av "
+                "FROM t GROUP BY a, b",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            project = ["a", "b", "n", "av"]
+            t_state = {}
+
+            def check(ctx):
+                base = oracle.oracle_filter_project(t_state, None, ["a", "b", "val"])
+                exp, cols = oracle.oracle_groupby_aggregate(
+                    base, ["a", "b", "val"], ["a", "b"],
+                    [("n", "COUNT", None), ("av", "AVG", "val")])
+                assert cols == project
+                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
+
+            # 12 distinct (a, b) keys, 2 rows each → AVG is an exact .0 or .5.
+            rows = []
+            pk = 0
+            for a in range(3):
+                for b in range(4):
+                    for k in range(2):
+                        pk += 1
+                        rows.append({"pk": pk, "a": a, "b": b, "val": a * 10 + b + k})
+            client.execute_sql(
+                "INSERT INTO t VALUES "
+                + ", ".join(f"({r['pk']}, {r['a']}, {r['b']}, {r['val']})" for r in rows),
+                schema_name=sn,
+            )
+            oracle.apply_insert(t_state, "pk", rows)
+            check("after-insert")
+
+            # Retract one row of (a=1, b=2): its AVG shifts, others unchanged.
+            target = next(r for r in rows if r["a"] == 1 and r["b"] == 2)
+            client.execute_sql(
+                f"DELETE FROM t WHERE pk = {target['pk']}", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [target["pk"]])
+            check("after-retract-one")
+
+            # Empty (a=0, b=0) entirely → that group must vanish.
+            gone = [r["pk"] for r in rows if r["a"] == 0 and r["b"] == 0]
+            client.execute_sql(
+                f"DELETE FROM t WHERE pk IN ({', '.join(str(p) for p in gone)})",
+                schema_name=sn,
+            )
+            oracle.apply_delete(t_state, "pk", gone)
+            check("after-empty-group")
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)

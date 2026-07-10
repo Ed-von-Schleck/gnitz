@@ -188,7 +188,7 @@ const MAX_FOLD_FINALIZE_INSTRS: usize = 15;
 pub(super) fn opt_fold_reduce_map(
     loaded: &LoadedCircuit,
     rw: &mut Rewrites,
-    owned_expr_progs: &mut Vec<Box<LogicalProgram>>,
+    fold_progs: &mut Vec<Box<LogicalProgram>>,
 ) {
     for (&nid, op) in &loaded.nodes {
         let blob = match op {
@@ -222,8 +222,8 @@ pub(super) fn opt_fold_reduce_map(
             continue;
         }
         if prog.len() <= MAX_FOLD_FINALIZE_INSTRS {
-            let idx = owned_expr_progs.len();
-            owned_expr_progs.push(Box::new(prog));
+            let idx = fold_progs.len();
+            fold_progs.push(Box::new(prog));
             rw.fold_finalize.insert(reduce_nid, idx);
             rw.folded_maps.insert(nid, reduce_nid);
         }

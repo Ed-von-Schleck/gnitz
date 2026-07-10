@@ -10,7 +10,7 @@ use crate::test_support::make_schema_i64pk_i64;
 
 use super::super::util::{extract_group_key, ieee_order_bits_f32, ieee_order_bits_f32_reverse};
 use super::agg::{apply_agg_from_value_index, Accumulator, AggDescriptor, AggOp};
-use super::emit::{emit_finalized_row, emit_global_ground, emit_reduce_row};
+use super::emit::{emit_global_ground, emit_reduce_row};
 use super::op_reduce::cursor_matches_group;
 use super::sort::{argsort_delta, build_sort_descs, compare_by_group_cols};
 use crate::storage::ReadCursor;
@@ -28,7 +28,7 @@ fn op_reduce(
     group_by_cols: &[u32],
     agg_descs: &[AggDescriptor],
     avi_cursor: Option<&mut ReadCursor>,
-    finalize_prog: Option<&crate::expr::ResolvedProgram>,
+    finalize_func: Option<&crate::expr::ScalarFunc>,
     finalize_out_schema: Option<&SchemaDescriptor>,
     global_ground: bool,
     i_am_owner: bool,
@@ -43,7 +43,7 @@ fn op_reduce(
         agg_descs,
         input_schema.reduce_out_key(group_by_cols),
         avi_cursor,
-        finalize_prog,
+        finalize_func,
         finalize_out_schema,
         global_ground,
         i_am_owner,
@@ -359,7 +359,8 @@ fn linear_sum_only_new_all_null_group_present() {
         LogicalInstr::IntDiv { dst: 4, a: 3, b: 2 }, // r4 = sum / gate
         LogicalInstr::Emit { src: 4, out: 1 },       // emit r4 → fin payload 1 (sum)
     ];
-    let fin_prog = LogicalProgram::new(instrs, 5, 0, vec![]).resolve(&out_schema, false);
+    let fin_func =
+        crate::expr::ScalarFunc::from_map(LogicalProgram::new(instrs, 5, 0, vec![]), &out_schema, &fin_schema);
 
     let aggs = [
         AggDescriptor {
@@ -405,7 +406,7 @@ fn linear_sum_only_new_all_null_group_present() {
         &[1u32],
         &aggs,
         None,
-        Some(&fin_prog),
+        Some(&fin_func),
         Some(&fin_schema),
         false,
         false,
@@ -579,7 +580,8 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
         LogicalInstr::IntDiv { dst: 4, a: 3, b: 2 }, // r4 = sum / gate (NULL when gate == 0)
         LogicalInstr::Emit { src: 4, out: 2 },       // emit r4 → fin payload 2 (sum)
     ];
-    let fin_prog = LogicalProgram::new(instrs, 5, 0, vec![]).resolve(&out_schema, false);
+    let fin_func =
+        crate::expr::ScalarFunc::from_map(LogicalProgram::new(instrs, 5, 0, vec![]), &out_schema, &fin_schema);
 
     let aggs = [
         AggDescriptor {
@@ -633,7 +635,7 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
         &[1u32],
         &aggs,
         None,
-        Some(&fin_prog),
+        Some(&fin_func),
         Some(&fin_schema),
         false,
         false,
@@ -676,7 +678,7 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
         &[1u32],
         &aggs,
         None,
-        Some(&fin_prog),
+        Some(&fin_func),
         Some(&fin_schema),
         false,
         false,
@@ -1889,81 +1891,6 @@ fn test_argsort_delta_nullable_no_packed_sort() {
     assert_eq!(null_positions.len(), 2, "expected 2 NULL rows");
     // NULLS FIRST: both nulls at positions 0 and 1.
     assert_eq!(null_positions, vec![0, 1]);
-}
-
-// -----------------------------------------------------------------------
-// emit_finalized_row: U128 PK projected through CopyCol must not panic
-// when the destination column size is 16 bytes.
-// -----------------------------------------------------------------------
-
-#[test]
-fn test_emit_finalized_row_u128_pk_copy_col() {
-    use crate::expr::{LogicalInstr, LogicalProgram};
-
-    // Raw output schema: U128 pk | I64 cnt
-    let raw_schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 1),
-        ],
-        &[0],
-    );
-
-    // Finalized schema: U128 pk_out | U128 pk_copy | I64 cnt
-    let fin_schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 1),
-        ],
-        &[0],
-    );
-
-    // Two COPY_COL instructions: copy col 0 (PK) and col 1 (cnt). `out` is the
-    // dense finalized payload index (PK copy → payload 0 = fin col 1, cnt →
-    // payload 1 = fin col 2); classify_output_cols carries it through verbatim.
-    let instrs = vec![
-        LogicalInstr::CopyCol {
-            src_col: 0,
-            out: 0,
-            tc: 0,
-        }, // copy raw col 0 (PK) → fin col 1
-        LogicalInstr::CopyCol {
-            src_col: 1,
-            out: 1,
-            tc: 0,
-        }, // copy raw col 1 (cnt) → fin col 2
-    ];
-    let prog = LogicalProgram::new(instrs, 0, 0, vec![]).resolve(&raw_schema, false);
-
-    // Build raw_output with one row: pk = a wide U128, cnt = 42
-    let pk: u128 = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210u128;
-    let mut raw_output = Batch::with_schema(raw_schema, 1);
-    raw_output.extend_pk(pk);
-    raw_output.extend_weight(&1i64.to_le_bytes());
-    raw_output.extend_null_bmp(&0u64.to_le_bytes());
-    raw_output.extend_col(0, &42i64.to_le_bytes());
-    raw_output.count += 1;
-
-    let mut fin_output = Batch::with_schema(fin_schema, 1);
-    // Must not panic on the 16-byte PK slice. Pre-fix: `pk as u64` produced
-    // 8 bytes and `[..cs]` with cs=16 panicked.
-    let mut ctx = crate::expr::FinalizeContext::new(&prog, &raw_schema);
-    emit_finalized_row(
-        &mut fin_output,
-        &raw_output,
-        0,
-        1,
-        &prog,
-        &raw_schema,
-        &fin_schema,
-        &mut ctx,
-    );
-
-    assert_eq!(fin_output.count, 1);
-    // The PK copy lands in finalized payload column 0 (fin col 1, since fin col 0 is PK).
-    let copied = u128::from_le_bytes(fin_output.col_data(0)[..16].try_into().unwrap());
-    assert_eq!(copied, pk, "U128 PK must round-trip through emit_finalized_row");
 }
 
 // -----------------------------------------------------------------------
@@ -6680,10 +6607,6 @@ fn emit_global_ground_renders_count_family_zero_null_clear() {
         &in_schema,
         &out_schema,
         &[], // no group-by columns
-        None,
-        None,
-        None,
-        None,
     );
 
     assert_eq!(raw_output.count, 1, "ground row emitted");

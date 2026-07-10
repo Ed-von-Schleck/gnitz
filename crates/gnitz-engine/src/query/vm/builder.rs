@@ -21,7 +21,6 @@ pub(crate) struct ProgramBuilder {
     /// Parallel to `reindex_cols`: per-column carried promotion target tc
     /// (`0` = derive from source). Sliced alongside `reindex_cols` for `op_map`.
     reindex_target_tcs: Vec<u8>,
-    expr_progs: Vec<*const crate::expr::ResolvedProgram>,
 }
 
 // SAFETY: Same justification as Program — single-thread access, stable pointers.
@@ -38,7 +37,6 @@ impl ProgramBuilder {
             group_cols: Vec::new(),
             reindex_cols: Vec::new(),
             reindex_target_tcs: Vec::new(),
-            expr_progs: Vec::new(),
         }
     }
 
@@ -76,20 +74,6 @@ impl ProgramBuilder {
         let idx = self.schemas.len() as u16;
         self.schemas.push(desc);
         idx
-    }
-
-    fn expr_idx(&mut self, ptr: *const crate::expr::ResolvedProgram) -> Option<u16> {
-        if ptr.is_null() {
-            return None;
-        }
-        for (i, &e) in self.expr_progs.iter().enumerate() {
-            if e == ptr {
-                return Some(i as u16);
-            }
-        }
-        let idx = self.expr_progs.len() as u16;
-        self.expr_progs.push(ptr);
-        Some(idx)
     }
 
     fn add_agg_descs(&mut self, descs: &[AggDescriptor]) -> (u32, u16) {
@@ -299,8 +283,8 @@ impl ProgramBuilder {
         // The combined value index table (null if no AVI). `for_max`/type per
         // aggregate are read from `agg_descs` by ordinal on the read side.
         avi_table: *mut Table,
-        // Finalize
-        finalize_prog: *const crate::expr::ResolvedProgram,
+        // Post-reduce finalize MAP (null if the reduce has none).
+        finalize_func: *const ScalarFunc,
         finalize_schema: *const SchemaDescriptor,
         // Global-aggregate ground machinery
         global_ground: bool,
@@ -314,7 +298,7 @@ impl ProgramBuilder {
             table_idx: self.table_idx(avi_table) as u16,
         });
 
-        let finalize_func_idx = self.expr_idx(finalize_prog);
+        let finalize_func_idx = (!finalize_func.is_null()).then(|| self.func_idx(finalize_func));
         let finalize_schema_idx = if !finalize_schema.is_null() {
             Some(self.schema_idx(unsafe { *finalize_schema }))
         } else {
@@ -348,18 +332,17 @@ impl ProgramBuilder {
     /// Used by test code — production code uses `build_with_owned`.
     #[cfg(test)]
     pub(crate) fn build(self, reg_meta: &[RegisterMeta]) -> Box<VmHandle> {
-        self.build_with_owned(reg_meta.to_vec(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        self.build_with_owned(reg_meta.to_vec(), Vec::new(), Vec::new(), Vec::new())
     }
 
-    /// Consume the builder, producing a VmHandle that owns child tables,
-    /// scalar functions, and expression programs created by the compiler.
+    /// Consume the builder, producing a VmHandle that owns the child tables and
+    /// scalar functions created by the compiler.
     #[allow(clippy::vec_box)]
     pub fn build_with_owned(
         self,
         reg_meta: Vec<RegisterMeta>,
         owned_tables: Vec<Box<Table>>,
         owned_funcs: Vec<Box<ScalarFunc>>,
-        owned_expr_progs: Vec<Box<crate::expr::ResolvedProgram>>,
         owned_trace_regs: Vec<(u16, usize)>,
     ) -> Box<VmHandle> {
         let regfile = RegisterFile::new(&reg_meta);
@@ -374,7 +357,6 @@ impl ProgramBuilder {
             group_cols: self.group_cols,
             reindex_cols: self.reindex_cols,
             reindex_target_tcs: self.reindex_target_tcs,
-            expr_progs: self.expr_progs,
         };
 
         let num_owned = owned_trace_regs.len();
@@ -383,7 +365,6 @@ impl ProgramBuilder {
             regfile,
             owned_tables,
             owned_funcs,
-            owned_expr_progs,
             owned_trace_regs,
             owned_cursor_handles: Vec::with_capacity(num_owned),
         })

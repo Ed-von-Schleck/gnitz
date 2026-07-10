@@ -157,7 +157,7 @@ fn null_or2(s: &mut EvalScratch, dst: usize, a: usize, b: usize, m: usize) {
 }
 
 /// Propagate unary null: dst_null = src_null (word-at-a-time).
-fn null_or1(s: &mut EvalScratch, dst: usize, src: usize, m: usize) {
+fn null_copy1(s: &mut EvalScratch, dst: usize, src: usize, m: usize) {
     if s.no_nulls {
         return;
     }
@@ -498,6 +498,29 @@ pub(in crate::expr) fn eval_batch(
             maybe_pack_bool_bits(scratch, prog, $d, m);
         }};
     }
+    // IntDiv / IntMod: one `div_like!` body each, differing only in the i64 op
+    // (`wrapping_div` / `wrapping_rem`) and the u64 reinterpret. `signed` branches
+    // OUTSIDE the row loop — each arm expands to its own whole loop, exactly as
+    // the four hand-written bodies did. A zero divisor is substituted with 1 and
+    // the row marked NULL, so `wrapping_*` never divides by zero and `i64::MIN /
+    // -1` wraps rather than trapping.
+    macro_rules! divmod {
+        ($a:expr, $b:expr, $d:expr, $signed:expr, $op:ident) => {{
+            if $signed {
+                div_like!($a, $b, $d, |x, y| {
+                    let is_zero = y == 0;
+                    let dd = if is_zero { 1 } else { y };
+                    (x.$op(dd), is_zero)
+                })
+            } else {
+                div_like!($a, $b, $d, |x, y| {
+                    let is_zero = y == 0;
+                    let dd = if is_zero { 1u64 } else { y as u64 };
+                    (((x as u64).$op(dd)) as i64, is_zero)
+                })
+            }
+        }};
+    }
 
     for instr in &prog.instrs {
         match *instr {
@@ -575,16 +598,13 @@ pub(in crate::expr) fn eval_batch(
 
             // PK-region integer load. `signed` selects the decode; the unsigned
             // and signed branches delegate to `widen_pk_be` / `read_signed`.
-            Instr::LoadPk {
-                dst,
-                off,
-                size,
-                tc,
-                signed,
-            } => {
+            // Width and signedness are `const fn`s of `tc`; derive them once per
+            // instruction, outside the row loop.
+            Instr::LoadPk { dst, off, tc } => {
                 let dst = dst as usize;
                 let byte_offset = off as usize;
-                let col_size = size as usize;
+                let col_size = crate::schema::type_size(tc) as usize;
+                let signed = crate::schema::is_signed_int(tc);
                 let base_d = dst * MORSEL;
                 if signed {
                     // Decode the OPK column back to native LE (un-flips the sign
@@ -630,38 +650,8 @@ pub(in crate::expr) fn eval_batch(
             Instr::IntMul { dst, a, b } => bin_op!(a, b, dst as usize, |x, y| x.wrapping_mul(y)),
             // `signed: false` reinterprets operands as u64 so the quotient is
             // correct for dividends >= 2^63. Zero divisor marks NULL.
-            Instr::IntDiv { dst, a, b, signed } => {
-                let d = dst as usize;
-                if signed {
-                    div_like!(a, b, d, |a, b| {
-                        let is_zero = b == 0;
-                        let dd = if is_zero { 1 } else { b };
-                        (a.wrapping_div(dd), is_zero)
-                    })
-                } else {
-                    div_like!(a, b, d, |a, b| {
-                        let is_zero = b == 0;
-                        let dd = if is_zero { 1u64 } else { b as u64 };
-                        (((a as u64) / dd) as i64, is_zero)
-                    })
-                }
-            }
-            Instr::IntMod { dst, a, b, signed } => {
-                let d = dst as usize;
-                if signed {
-                    div_like!(a, b, d, |a, b| {
-                        let is_zero = b == 0;
-                        let dd = if is_zero { 1 } else { b };
-                        (a.wrapping_rem(dd), is_zero)
-                    })
-                } else {
-                    div_like!(a, b, d, |a, b| {
-                        let is_zero = b == 0;
-                        let dd = if is_zero { 1u64 } else { b as u64 };
-                        (((a as u64) % dd) as i64, is_zero)
-                    })
-                }
-            }
+            Instr::IntDiv { dst, a, b, signed } => divmod!(a, b, dst as usize, signed, wrapping_div),
+            Instr::IntMod { dst, a, b, signed } => divmod!(a, b, dst as usize, signed, wrapping_rem),
             Instr::IntNeg { dst, a } => {
                 let dst = dst as usize;
                 let ai = a as usize;
@@ -670,7 +660,7 @@ pub(in crate::expr) fn eval_batch(
                 for i in 0..m {
                     scratch.regs[base_d + i] = scratch.regs[base_a + i].wrapping_neg();
                 }
-                null_or1(scratch, dst, ai, m);
+                null_copy1(scratch, dst, ai, m);
                 maybe_pack_bool_bits(scratch, prog, dst, m);
             }
 
@@ -701,7 +691,7 @@ pub(in crate::expr) fn eval_batch(
                 for i in 0..m {
                     scratch.regs[base_d + i] = encode_f64(-decode_f64(scratch.regs[base_a + i]));
                 }
-                null_or1(scratch, dst, ai, m);
+                null_copy1(scratch, dst, ai, m);
                 maybe_pack_bool_bits(scratch, prog, dst, m);
             }
 
@@ -818,7 +808,7 @@ pub(in crate::expr) fn eval_batch(
                     for i in 0..m {
                         scratch.regs[base_d + i] = (scratch.regs[base_a + i] == 0) as i64;
                     }
-                    null_or1(scratch, dst, ai, m);
+                    null_copy1(scratch, dst, ai, m);
                 } else {
                     let words = m.div_ceil(64);
                     let base_a = ai * NULL_WORDS_PER_REG;
@@ -863,7 +853,7 @@ pub(in crate::expr) fn eval_batch(
                         scratch.regs[base_d + i] = encode_f64(scratch.regs[base_a + i] as u64 as f64);
                     }
                 }
-                null_or1(scratch, dst, ai, m);
+                null_copy1(scratch, dst, ai, m);
                 maybe_pack_bool_bits(scratch, prog, dst, m);
             }
 

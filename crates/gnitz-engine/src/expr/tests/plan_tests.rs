@@ -1,4 +1,5 @@
 use super::super::plan::ScalarFunc;
+use super::super::program::LogicalProgram;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 use crate::storage::Batch;
 
@@ -33,7 +34,8 @@ fn test_projection_batch() {
     let out_schema = make_schema(0, &[8, 9, 9]);
     let batch = make_int_batch(&in_schema, &[(1, 1, 0, &[10, 20]), (2, 1, 0, &[30, 40])]);
 
-    let func = ScalarFunc::from_projection(&[2, 1], &[type_code::I64, type_code::I64], &in_schema, &out_schema);
+    let prog = LogicalProgram::copy_cols(&[(2, type_code::I64), (1, type_code::I64)]);
+    let func = ScalarFunc::from_map(prog, &in_schema, &out_schema);
     let result = func.evaluate_map_batch(&batch, &out_schema);
     assert_eq!(result.count, 2);
 
@@ -79,7 +81,7 @@ fn test_empty_batch() {
     let schema = make_schema(0, &[8, 9]);
     let batch = Batch::empty_with_schema(&schema);
 
-    let func = ScalarFunc::from_projection(&[1], &[type_code::I64], &schema, &schema);
+    let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[(1, type_code::I64)]), &schema, &schema);
     let result = func.evaluate_map_batch(&batch, &schema);
     assert_eq!(result.count, 0);
 }
@@ -120,12 +122,8 @@ fn test_map_blob_passthrough_and_fallback() {
     {
         let batch = build(&in_schema);
         let out_schema = make_schema(0, &[type_code::U64, type_code::STRING, type_code::STRING]);
-        let func = ScalarFunc::from_projection(
-            &[2, 1],
-            &[type_code::STRING, type_code::STRING],
-            &in_schema,
-            &out_schema,
-        );
+        let prog = LogicalProgram::copy_cols(&[(2, type_code::STRING), (1, type_code::STRING)]);
+        let func = ScalarFunc::from_map(prog, &in_schema, &out_schema);
         let out = func.evaluate_map_batch(&batch, &out_schema);
         assert_eq!(out.count, 2);
         assert_eq!(read_gs(&out, 0, 0), b"long-string-one-xyz"); // s2 → out payload 0
@@ -140,7 +138,8 @@ fn test_map_blob_passthrough_and_fallback() {
     {
         let batch = build(&in_schema);
         let out_schema = make_schema(0, &[type_code::U64, type_code::STRING]);
-        let func = ScalarFunc::from_projection(&[1], &[type_code::STRING], &in_schema, &out_schema);
+        let prog = LogicalProgram::copy_cols(&[(1, type_code::STRING)]);
+        let func = ScalarFunc::from_map(prog, &in_schema, &out_schema);
         let out = func.evaluate_map_batch(&batch, &out_schema);
         assert_eq!(out.count, 2);
         assert_eq!(read_gs(&out, 0, 0), b"ab");
@@ -152,4 +151,120 @@ fn test_map_blob_passthrough_and_fallback() {
             batch.blob.len(),
         );
     }
+}
+
+/// PK-source `CopyCol` through `from_map`: a compound PK's columns projected into
+/// payload slots must decode out of the OPK region back to native LE — verbatim
+/// for the U128 column, sign-flip-undone for the signed I64 column. `copy_column`
+/// reads the source column's own width at its own `tc`, so a program carrying the
+/// real source type codes round-trips both.
+#[test]
+fn test_map_pk_copy_col_u128_and_signed_i64() {
+    // PK = (U128 c0, I64 c1); payload = I64 c2.
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0, 1],
+    );
+    // Out: same compound PK, then both PK columns copied into payload slots plus
+    // the payload passthrough.
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::U128, 0), // payload 0 ← PK col 0
+            SchemaColumn::new(type_code::I64, 0),  // payload 1 ← PK col 1
+            SchemaColumn::new(type_code::I64, 0),  // payload 2 ← payload col 2
+        ],
+        &[0, 1],
+    );
+
+    let pk0: u128 = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210;
+    let pk1: i64 = -5; // negative: exercises the OPK sign-bit flip on decode
+    let mut batch = Batch::with_schema(in_schema, 1);
+    batch.extend_pk_opk(&in_schema, &[pk0, pk1 as u64 as u128]);
+    batch.extend_weight(&1i64.to_le_bytes());
+    batch.extend_null_bmp(&0u64.to_le_bytes());
+    batch.extend_col(0, &42i64.to_le_bytes());
+    batch.count += 1;
+
+    let prog = LogicalProgram::copy_cols(&[
+        (0, type_code::U128), // PK col 0 → payload 0
+        (1, type_code::I64),  // PK col 1 → payload 1
+        (2, type_code::I64),  // payload col 2 → payload 2
+    ]);
+    let out = ScalarFunc::from_map(prog, &in_schema, &out_schema).evaluate_map_batch(&batch, &out_schema);
+
+    assert_eq!(out.count, 1);
+    assert_eq!(out.pk_data(), batch.pk_data(), "PK region copied verbatim");
+    assert_eq!(out.get_weight(0), 1);
+    assert_eq!(
+        u128::from_le_bytes(out.col_data(0)[..16].try_into().unwrap()),
+        pk0,
+        "U128 PK column must round-trip through copy_column",
+    );
+    assert_eq!(
+        i64::from_le_bytes(out.col_data(1)[..8].try_into().unwrap()),
+        pk1,
+        "signed I64 PK column must un-flip the OPK sign bit",
+    );
+    assert_eq!(i64::from_le_bytes(out.col_data(2)[..8].try_into().unwrap()), 42);
+    assert_eq!(out.get_null_word(0), 0, "no copied column is null");
+}
+
+/// Cross-width widen through `from_map` (the shape a cross-width set-op UNION
+/// produces): a narrow source column copied into a wider promoted output slot
+/// sign/zero-extends per the SOURCE column's signedness — from the payload region
+/// and from the PK region alike.
+#[test]
+fn test_map_copy_col_widens_into_promoted_slot() {
+    // PK = (U16 c0, I16 c1); payload = I8 c2 (negative), U8 c3.
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U16, 0),
+            SchemaColumn::new(type_code::I16, 0),
+            SchemaColumn::new(type_code::I8, 0),
+            SchemaColumn::new(type_code::U8, 0),
+        ],
+        &[0, 1],
+    );
+    // Every copied column lands in an I64 slot — 4 distinct narrow→wide widens.
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U16, 0),
+            SchemaColumn::new(type_code::I16, 0),
+            SchemaColumn::new(type_code::I64, 0), // ← U16 PK  (zero-extend)
+            SchemaColumn::new(type_code::I64, 0), // ← I16 PK  (sign-extend)
+            SchemaColumn::new(type_code::I64, 0), // ← I8 payload (sign-extend)
+            SchemaColumn::new(type_code::I64, 0), // ← U8 payload (zero-extend)
+        ],
+        &[0, 1],
+    );
+
+    let (c0, c1, c2, c3): (u16, i16, i8, u8) = (0xBEEF, -300, -7, 0xFE);
+    let mut batch = Batch::with_schema(in_schema, 1);
+    batch.extend_pk_opk(&in_schema, &[c0 as u128, c1 as u16 as u128]);
+    batch.extend_weight(&1i64.to_le_bytes());
+    batch.extend_null_bmp(&0u64.to_le_bytes());
+    batch.extend_col(0, &c2.to_le_bytes());
+    batch.extend_col(1, &c3.to_le_bytes());
+    batch.count += 1;
+
+    let prog = LogicalProgram::copy_cols(&[
+        (0, type_code::U16),
+        (1, type_code::I16),
+        (2, type_code::I8),
+        (3, type_code::U8),
+    ]);
+    let out = ScalarFunc::from_map(prog, &in_schema, &out_schema).evaluate_map_batch(&batch, &out_schema);
+
+    assert_eq!(out.count, 1);
+    let widened = |pi: usize| i64::from_le_bytes(out.col_data(pi)[..8].try_into().unwrap());
+    assert_eq!(widened(0), c0 as i64, "U16 PK zero-extends");
+    assert_eq!(widened(1), c1 as i64, "I16 PK sign-extends");
+    assert_eq!(widened(2), c2 as i64, "I8 payload sign-extends");
+    assert_eq!(widened(3), c3 as i64, "U8 payload zero-extends");
 }

@@ -1,4 +1,4 @@
-//! Output row emitters: raw reduce rows, finalized rows, the global-aggregate ground row.
+//! Output row emitters: raw reduce rows and the global-aggregate ground row.
 
 use crate::schema::{ColumnLocator, SchemaDescriptor};
 use crate::storage::{Batch, MemBatch};
@@ -112,7 +112,6 @@ pub(super) fn emit_reduce_row(
 /// `n==0` seed), and cannot drift from a computed row. Emitted at weight +1; the
 /// caller nets it to one row (the `has_old` retraction in `n>0`, the
 /// `!trace_out_has_V0` guard in `n==0`).
-#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_global_ground(
     raw_output: &mut Batch,
     out_pk_bytes: &[u8],
@@ -120,10 +119,6 @@ pub(super) fn emit_global_ground(
     input_schema: &SchemaDescriptor,
     output_schema: &SchemaDescriptor,
     group_by_cols: &[u32],
-    finalize_prog: Option<&crate::expr::ResolvedProgram>,
-    finalize_out_schema: Option<&SchemaDescriptor>,
-    fin_output: Option<&mut Batch>,
-    fin_ctx: Option<&mut crate::expr::FinalizeContext>,
 ) {
     let num_aggs = agg_descs.len();
 
@@ -164,115 +159,4 @@ pub(super) fn emit_global_ground(
         /* use_natural_pk = */ false,
         num_aggs,
     );
-
-    if let (Some(prog), Some(fin_schema), Some(fin_out), Some(ctx)) =
-        (finalize_prog, finalize_out_schema, fin_output, fin_ctx)
-    {
-        emit_finalized_row(
-            fin_out,
-            raw_output,
-            raw_output.count - 1,
-            1,
-            prog,
-            output_schema,
-            fin_schema,
-            ctx,
-        );
-    }
-}
-
-/// Emit a finalized row by evaluating the finalize ExprProgram on the raw output.
-///
-/// Handles COPY_COL (copy column from raw→finalized), EMIT (computed value),
-/// and EMIT_NULL (null column) instructions. Per-row state (scratch register
-/// file, classification, EMIT→register map, no_nulls) lives in `ctx`, which
-/// the caller builds once before the group loop.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn emit_finalized_row(
-    fin_output: &mut Batch,
-    raw_output: &Batch,
-    raw_row: usize,
-    weight: i64,
-    prog: &crate::expr::ResolvedProgram,
-    raw_schema: &SchemaDescriptor,
-    fin_schema: &SchemaDescriptor,
-    ctx: &mut crate::expr::FinalizeContext,
-) {
-    use crate::expr::{ColSrc, OutputColKind};
-
-    let raw_mb = raw_output.as_mem_batch();
-    let null_word = raw_mb.get_null_word(raw_row);
-
-    ctx.eval_row(prog, &raw_mb, raw_row);
-    let out_cols = ctx.out_cols();
-
-    // The raw reduce-output PK is already materialised and the finalize output
-    // carries it verbatim (same PK columns/stride), so copy its OPK bytes directly.
-    fin_output.extend_pk_bytes(raw_mb.get_pk_bytes(raw_row));
-    fin_output.extend_weight(&weight.to_le_bytes());
-
-    let mut fin_null_mask: u64 = 0;
-
-    for (fpi, _ci, col) in fin_schema.payload_columns() {
-        let cs = col.size() as usize;
-
-        if fpi < out_cols.len() {
-            let kind = out_cols[fpi];
-            // The finalize program emits in dense destination order, so the
-            // bytecode-order `out_cols[fpi]` is the instruction producing payload
-            // column `fpi`. `out_payload` is therefore redundant here (we index by
-            // `fpi`); this assert pins that load-bearing invariant once.
-            debug_assert_eq!(
-                kind.out_payload(),
-                fpi,
-                "finalize out_cols not in dense destination order"
-            );
-            match kind {
-                OutputColKind::CopyCol { src, .. } => match src {
-                    ColSrc::Pk { off } => {
-                        // PK source: decode the addressed OPK column back to native
-                        // LE (raw copy is wrong for signed / big-endian columns).
-                        // The fin column type equals the source PK column type for a
-                        // verbatim copy. A single PK column is decoded, never the
-                        // whole compound region.
-                        let opk = raw_mb.get_pk_bytes(raw_row);
-                        let off = off as usize;
-                        let le = gnitz_wire::decode_pk_column_owned(&opk[off..off + cs], col.type_code);
-                        fin_output.extend_col(fpi, &le[..cs]);
-                    }
-                    ColSrc::Payload(pi) => {
-                        let src_pi = pi as usize;
-                        let src_ci = raw_schema.payload_col_idx(src_pi);
-                        if (null_word >> src_pi) & 1 != 0 {
-                            fin_null_mask |= 1u64 << fpi;
-                            fin_output.fill_col_zero(fpi, cs);
-                        } else if gnitz_wire::is_german_string(raw_schema.columns[src_ci].type_code) {
-                            write_string_from_batch(fin_output, fpi, &raw_mb, raw_row, src_pi);
-                        } else {
-                            let src = raw_mb.get_col_ptr(raw_row, src_pi, cs);
-                            fin_output.extend_col(fpi, src);
-                        }
-                    }
-                },
-                OutputColKind::Emit { reg, .. } => {
-                    let (val, is_null) = ctx.read_emit(reg);
-                    if is_null {
-                        fin_null_mask |= 1u64 << fpi;
-                        fin_output.fill_col_zero(fpi, cs);
-                    } else {
-                        fin_output.extend_col(fpi, &val.to_le_bytes()[..cs]);
-                    }
-                }
-                OutputColKind::EmitNull { .. } => {
-                    fin_null_mask |= 1u64 << fpi;
-                    fin_output.fill_col_zero(fpi, cs);
-                }
-            }
-        } else {
-            fin_output.fill_col_zero(fpi, cs);
-        }
-    }
-
-    fin_output.extend_null_bmp(&fin_null_mask.to_le_bytes());
-    fin_output.count += 1;
 }

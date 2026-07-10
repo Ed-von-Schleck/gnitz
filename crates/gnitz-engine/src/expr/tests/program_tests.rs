@@ -1055,15 +1055,9 @@ fn test_is_strictly_non_nullable_str_col() {
             const_idx: 0,
         }];
         let prog = make_prog(&nullable_schema, instrs.clone(), 1, 0, vec![b"x".to_vec()]);
-        assert!(
-            !prog.is_strictly_non_nullable(&nullable_schema),
-            "{_name}: nullable col1 must yield no_nulls=false"
-        );
+        assert!(!prog.no_nulls, "{_name}: nullable col1 must yield no_nulls=false");
         let prog = make_prog(&nonnull_schema, instrs, 1, 0, vec![b"x".to_vec()]);
-        assert!(
-            prog.is_strictly_non_nullable(&nonnull_schema),
-            "{_name}: non-nullable col1 must yield no_nulls=true"
-        );
+        assert!(prog.no_nulls, "{_name}: non-nullable col1 must yield no_nulls=true");
     }
 
     // STR_COL_*_COL — both operands matter
@@ -1075,15 +1069,9 @@ fn test_is_strictly_non_nullable_str_col() {
             col_b: 2,
         }];
         let prog = make_prog(&nullable_schema, instrs.clone(), 1, 0, vec![]);
-        assert!(
-            !prog.is_strictly_non_nullable(&nullable_schema),
-            "{_name}: nullable operands must yield no_nulls=false"
-        );
+        assert!(!prog.no_nulls, "{_name}: nullable operands must yield no_nulls=false");
         let prog = make_prog(&nonnull_schema, instrs, 1, 0, vec![]);
-        assert!(
-            prog.is_strictly_non_nullable(&nonnull_schema),
-            "{_name}: non-nullable operands must yield no_nulls=true"
-        );
+        assert!(prog.no_nulls, "{_name}: non-nullable operands must yield no_nulls=true");
     }
 }
 
@@ -1407,10 +1395,7 @@ fn test_load_null_forces_nullable_path() {
         },
     ];
     let prog = make_prog(&nonnull_schema, instrs, 3, 2, vec![]);
-    assert!(
-        !prog.is_strictly_non_nullable(&nonnull_schema),
-        "LoadNull must force the nullable path"
-    );
+    assert!(!prog.no_nulls, "LoadNull must force the nullable path");
 }
 
 /// A Select over only NOT NULL branches (no LoadNull) stays strictly-non-nullable:
@@ -1440,7 +1425,7 @@ fn test_select_non_nullable_when_branches_non_nullable() {
     ];
     let prog = make_prog(&nonnull_schema, instrs, 4, 3, vec![]);
     assert!(
-        prog.is_strictly_non_nullable(&nonnull_schema),
+        prog.no_nulls,
         "Select over NOT NULL branches must stay strictly-non-nullable"
     );
 }

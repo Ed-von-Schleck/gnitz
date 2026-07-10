@@ -10,8 +10,32 @@ use super::super::util::{
 use super::agg::{
     apply_agg_from_value_index, fold_old_aggs, read_old_minmax_encoded, Accumulator, AggDescriptor, AggOp,
 };
-use super::emit::{emit_finalized_row, emit_global_ground, emit_reduce_row};
+use super::emit::{emit_global_ground, emit_reduce_row};
 use super::sort::{argsort_delta, argsort_pk_canonical, build_sort_descs, compare_by_group_cols, SortDesc};
+
+/// The finalize output is exactly `map(raw_output)`: one row per raw row, in the
+/// same order, PK and weight verbatim. Every raw row — the `-1` retraction copied
+/// off `trace_out`, the `+1` computed row, the `+1` global ground row — carries
+/// the weight the finalized row must carry, so the map's verbatim weight copy is
+/// the whole story. `func.is_some() ⟺ fin_schema.is_some()` (the compiler builds
+/// both from the same `finalize_prog_idx`), so the `zip` covers both or neither.
+fn finalize_map(
+    raw_output: &Batch,
+    raw_schema: &SchemaDescriptor,
+    func: Option<&crate::expr::ScalarFunc>,
+    fin_schema: Option<&SchemaDescriptor>,
+) -> Option<Batch> {
+    let (func, fin_schema) = func.zip(fin_schema)?;
+    // The finalize output inherits the reduce output's PK region verbatim, so the
+    // strides match and `evaluate_map_batch` bulk-copies it. Were they to diverge
+    // it would silently leave the PK zeroed rather than panic — keep it loud.
+    debug_assert_eq!(
+        fin_schema.pk_stride(),
+        raw_schema.pk_stride(),
+        "finalize output PK stride must equal the reduce output's",
+    );
+    Some(func.evaluate_map_batch(raw_output, fin_schema))
+}
 
 /// Upper bound on the per-group delta rows the AVI probe-skip path pre-steps into
 /// a MIN/MAX accumulator. Pre-stepping is O(positive delta rows); the probe it
@@ -136,7 +160,9 @@ pub fn op_reduce(
     // serving every MIN/MAX aggregate. `None` for all-linear reduces and the
     // single-scan fallback. `for_max`/type per aggregate come from `agg_descs`.
     avi_cursor: Option<&mut ReadCursor>,
-    finalize_prog: Option<&crate::expr::ResolvedProgram>,
+    // Post-reduce finalize (AVG, nullable-SUM, …): a plain columnar MAP over the
+    // raw reduce output, applied once per emitted batch by `finalize_map`.
+    finalize_func: Option<&crate::expr::ScalarFunc>,
     finalize_out_schema: Option<&SchemaDescriptor>,
     // Global-aggregate ground machinery. `global_ground` is the planner's
     // SQL-intent discriminator (true only for the user's ungrouped scalar
@@ -187,10 +213,6 @@ pub fn op_reduce(
             let has_v0 = trace_out_cursor.valid && trace_out_cursor.current_pk_eq(out_pk_bytes);
             if !has_v0 {
                 let mut raw_output = Batch::with_schema(*output_schema, 1);
-                let mut fin_output = finalize_out_schema.map(|fs| Batch::with_schema(*fs, 1));
-                // The seed runs before the loop's accs / FinalizeContext setup, so
-                // build a fresh finalize context here.
-                let mut fin_ctx = finalize_prog.map(|p| crate::expr::FinalizeContext::new(p, output_schema));
                 emit_global_ground(
                     &mut raw_output,
                     out_pk_bytes,
@@ -198,16 +220,14 @@ pub fn op_reduce(
                     input_schema,
                     output_schema,
                     group_by_cols,
-                    finalize_prog,
-                    finalize_out_schema,
-                    fin_output.as_mut(),
-                    fin_ctx.as_mut(),
                 );
+                let fin_output = finalize_map(&raw_output, output_schema, finalize_func, finalize_out_schema);
                 return (raw_output, fin_output);
             }
         }
-        let empty_fin = finalize_out_schema.map(Batch::empty_with_schema);
-        return (Batch::empty_with_schema(output_schema), empty_fin);
+        let raw_output = Batch::empty_with_schema(output_schema);
+        let fin_output = finalize_map(&raw_output, output_schema, finalize_func, finalize_out_schema);
+        return (raw_output, fin_output);
     }
 
     // group_by_pk: GROUP BY is a permutation of the source PK columns.
@@ -266,11 +286,6 @@ pub fn op_reduce(
     let use_natural_pk = out_key != ReduceOutKey::SyntheticFold;
 
     let mut raw_output = Batch::with_schema(*output_schema, 32);
-    let mut fin_output = finalize_out_schema.map(|fs| Batch::with_schema(*fs, 32));
-    // One FinalizeContext per finalize program: hoists EvalScratch sizing,
-    // out_cols classification, EMIT→register map, and the no_nulls flag out
-    // of the (potentially 100k+ iteration) group loop.
-    let mut fin_ctx = finalize_prog.map(|p| crate::expr::FinalizeContext::new(p, output_schema));
 
     let mut accs: Vec<Accumulator> = agg_descs.iter().map(|d| Accumulator::new(d, input_schema)).collect();
     // Output width of each trailing agg column (loop-invariant across the
@@ -572,20 +587,6 @@ pub fn op_reduce(
             // blobs) by construction, so it consolidates against the row it cancels
             // with zero per-column reconstruction and no null plumbing.
             trace_out_cursor.copy_current_row_into(&mut raw_output, -1);
-            if let (Some(prog), Some(fin_schema), Some(ref mut fin_out), Some(ctx)) =
-                (finalize_prog, finalize_out_schema, &mut fin_output, fin_ctx.as_mut())
-            {
-                emit_finalized_row(
-                    fin_out,
-                    &raw_output,
-                    raw_output.count - 1,
-                    -1,
-                    prog,
-                    output_schema,
-                    fin_schema,
-                    ctx,
-                );
-            }
         }
 
         // New value calculation
@@ -739,20 +740,6 @@ pub fn op_reduce(
                 use_natural_pk,
                 num_aggs,
             );
-            if let (Some(prog), Some(fin_schema), Some(ref mut fin_out), Some(ctx)) =
-                (finalize_prog, finalize_out_schema, &mut fin_output, fin_ctx.as_mut())
-            {
-                emit_finalized_row(
-                    fin_out,
-                    &raw_output,
-                    raw_output.count - 1,
-                    1,
-                    prog,
-                    output_schema,
-                    fin_schema,
-                    ctx,
-                );
-            }
         } else if global_ground {
             // The emission gate shed the computed row (this group emptied, or a
             // lone all-NULL MIN/MAX). For the user's ungrouped scalar aggregate
@@ -769,15 +756,13 @@ pub fn op_reduce(
                 input_schema,
                 output_schema,
                 group_by_cols,
-                finalize_prog,
-                finalize_out_schema,
-                fin_output.as_mut(),
-                fin_ctx.as_mut(),
             );
         }
 
         num_groups += 1;
     }
+
+    let fin_output = finalize_map(&raw_output, output_schema, finalize_func, finalize_out_schema);
 
     gnitz_debug!(
         "op_reduce: in={} groups={} out={} fin={}",

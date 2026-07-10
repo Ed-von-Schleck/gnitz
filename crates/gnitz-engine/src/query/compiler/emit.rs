@@ -39,6 +39,9 @@ pub(super) fn create_expr_map(
     ptr
 }
 
+/// A MAP whose program is all-`CopyCol`: output payload `i` ← input column
+/// `src_indices[i]` (source type `src_types[i]`), widening into a promoted slot
+/// when the output column is wider.
 #[allow(clippy::vec_box, clippy::ptr_arg)]
 pub(super) fn create_universal_projection(
     src_indices: &[i32],
@@ -47,8 +50,13 @@ pub(super) fn create_universal_projection(
     out_schema: &SchemaDescriptor,
     owned_funcs: &mut Vec<Box<ScalarFunc>>,
 ) -> *const ScalarFunc {
-    let indices: Vec<u32> = src_indices.iter().map(|&i| i as u32).collect();
-    let func = Box::new(ScalarFunc::from_projection(&indices, src_types, in_schema, out_schema));
+    let copies: Vec<(u32, u8)> = src_indices
+        .iter()
+        .zip(src_types)
+        .map(|(&ci, &tc)| (ci as u32, tc))
+        .collect();
+    let prog = LogicalProgram::copy_cols(&copies);
+    let func = Box::new(ScalarFunc::from_map(prog, in_schema, out_schema));
     let ptr = &*func as *const ScalarFunc;
     owned_funcs.push(func);
     ptr
@@ -75,21 +83,6 @@ pub(super) fn union_nullability_merge(a: &SchemaDescriptor, b: &SchemaDescriptor
         *col = SchemaColumn::new(ac.type_code, ac.nullable | bc.nullable);
     }
     SchemaDescriptor::new(&cols[..a.num_columns()], a.pk_indices())
-}
-
-/// Folded-finalize programs threaded through plan emission. `logical` holds the
-/// unresolved programs indexed by `fold_finalize` idx — each is `.take()`n and
-/// resolved exactly once against its reduce node's output schema. `resolved` is
-/// the kept-alive store the reduce ops hold raw `*const ResolvedProgram` into;
-/// it is moved into the VM at the end of `build_plan`.
-// `Box` is load-bearing, not incidental: the reduce ops hold raw
-// `*const ResolvedProgram` into `resolved`, so each program's heap address must
-// stay stable as the vec grows (a bare `Vec<ResolvedProgram>` would move
-// elements on reallocation and dangle those pointers).
-#[allow(clippy::vec_box)]
-pub(super) struct FinalizePrograms {
-    pub(super) logical: Vec<Option<Box<LogicalProgram>>>,
-    pub(super) resolved: Vec<Box<ResolvedProgram>>,
 }
 
 /// Path of a per-worker scratch directory under `view_dir`. Rank-stamped because
@@ -190,7 +183,7 @@ pub(super) fn emit_node(
     // Owned resources
     owned_tables: &mut Vec<Box<Table>>,
     owned_funcs: &mut Vec<Box<ScalarFunc>>,
-    fin_progs: &mut FinalizePrograms,
+    fin_logical: &mut [Option<Box<LogicalProgram>>],
     owned_trace_regs: &mut Vec<(u16, usize)>,
     // External tables
     ext_tables: &[ExternalTable],
@@ -421,8 +414,8 @@ pub(super) fn emit_node(
                     // to a hash of those payload columns (reindex_hash path).
                     // `target_tcs[j] != 0` promotes payload column j to that
                     // ≤8-byte integer type (cross-width set-op coercion): the node
-                    // schema declares the wider slot and `from_projection` widens the
-                    // source into it, so both set-op sides hash one physical layout.
+                    // schema declares the wider slot and `create_universal_projection`
+                    // widens the source into it, so both set-op sides hash one physical layout.
                     //
                     // Same trust-boundary guards as the Expression reindex arm above:
                     // an out-of-range column would read a zeroed schema slot (a
@@ -591,7 +584,8 @@ pub(super) fn emit_node(
                 out_reg_of,
                 reg_meta,
                 owned_tables,
-                fin_progs,
+                owned_funcs,
+                fin_logical,
                 owned_trace_regs,
                 view_dir,
                 view_table_id,
@@ -749,7 +743,8 @@ pub(super) fn emit_reduce(
     out_reg_of: &mut HashMap<i32, i32>,
     reg_meta: &mut Vec<RegisterMeta>,
     owned_tables: &mut Vec<Box<Table>>,
-    fin_progs: &mut FinalizePrograms,
+    owned_funcs: &mut Vec<Box<ScalarFunc>>,
+    fin_logical: &mut [Option<Box<LogicalProgram>>],
     owned_trace_regs: &mut Vec<(u16, usize)>,
     view_dir: &str,
     view_table_id: u32,
@@ -933,18 +928,16 @@ pub(super) fn emit_reduce(
         );
     }
 
-    let fin_prog_ptr: *const ResolvedProgram = if let Some(idx) = finalize_prog_idx {
-        // Finalize prog reads from the raw reduce output: take the unresolved
-        // logical program (each idx is resolved exactly once) and resolve its
-        // column operands against reduce_out_schema in map context. The resolved
-        // program is kept alive in `fin_progs.resolved` for the reduce op's
-        // raw pointer.
-        let logical = fin_progs.logical[idx]
-            .take()
-            .expect("finalize prog resolved exactly once");
-        let resolved = logical.resolve(&reduce_out_schema, /* is_filter = */ false);
-        fin_progs.resolved.push(Box::new(resolved));
-        &**fin_progs.resolved.last().unwrap() as *const ResolvedProgram
+    // Finalize is a MAP from the raw reduce output to the view's output schema:
+    // take the unresolved logical program (each idx is consumed exactly once) and
+    // build the same `ScalarFunc` any other MAP node gets. It is kept alive in
+    // `owned_funcs`, which the reduce op holds a raw `*const ScalarFunc` into.
+    let fin_func_ptr: *const ScalarFunc = if let Some(idx) = finalize_prog_idx {
+        let logical = fin_logical[idx].take().expect("finalize prog consumed exactly once");
+        let func = Box::new(ScalarFunc::from_map(*logical, &reduce_out_schema, &loaded.out_schema));
+        let ptr = &*func as *const ScalarFunc;
+        owned_funcs.push(func);
+        ptr
     } else {
         std::ptr::null()
     };
@@ -992,7 +985,7 @@ pub(super) fn emit_reduce(
         reduce_out_schema,
         out_key,
         avi_table_ptr,
-        fin_prog_ptr,
+        fin_func_ptr,
         fin_schema_ptr,
         global_ground,
         i_am_owner,
@@ -1019,7 +1012,7 @@ pub(super) fn build_plan(
     view_id: u64,
     output_node_id: Option<i32>,
     exchange_inputs: &[(i32, SchemaDescriptor)],
-    pre_built_expr_progs: Vec<Box<LogicalProgram>>,
+    pre_built_fold_progs: Vec<Box<LogicalProgram>>,
 ) -> Option<PlanBuildResult> {
     let mut out_reg_of: HashMap<i32, i32> = HashMap::new();
     let mut next_reg: i32 = 0;
@@ -1119,13 +1112,9 @@ pub(super) fn build_plan(
 
     let mut owned_tables: Vec<Box<Table>> = Vec::new();
     let mut owned_funcs: Vec<Box<ScalarFunc>> = Vec::new();
-    // Folded-finalize programs: the pre-built logical programs go in `logical`
-    // (taken + resolved once each during emission); `resolved` is filled as the
-    // reduce nodes are emitted and handed to the VM to keep alive.
-    let mut fin_progs = FinalizePrograms {
-        logical: pre_built_expr_progs.into_iter().map(Some).collect(),
-        resolved: Vec::new(),
-    };
+    // Folded-finalize programs, indexed by `fold_finalize` idx. Each is `.take()`n
+    // exactly once during emission and turned into a `ScalarFunc` in `owned_funcs`.
+    let mut fin_logical: Vec<Option<Box<LogicalProgram>>> = pre_built_fold_progs.into_iter().map(Some).collect();
     let mut owned_trace_regs: Vec<(u16, usize)> = Vec::new();
     let mut ext_trace_regs: Vec<(u16, i64)> = Vec::new();
     let mut source_reg_map: HashMap<i64, i32> = HashMap::new();
@@ -1178,7 +1167,7 @@ pub(super) fn build_plan(
             &mut reg_meta,
             &mut owned_tables,
             &mut owned_funcs,
-            &mut fin_progs,
+            &mut fin_logical,
             &mut owned_trace_regs,
             ext_tables,
             &mut ext_trace_regs,
@@ -1246,13 +1235,7 @@ pub(super) fn build_plan(
     let num_regs = reg_meta.len();
     debug_assert!(num_regs <= u16::MAX as usize);
 
-    let vm = builder.build_with_owned(
-        reg_meta,
-        owned_tables,
-        owned_funcs,
-        fin_progs.resolved,
-        owned_trace_regs,
-    );
+    let vm = builder.build_with_owned(reg_meta, owned_tables, owned_funcs, owned_trace_regs);
 
     Some(PlanBuildResult {
         vm,
@@ -1301,7 +1284,7 @@ pub(super) fn exchange_input_node(loaded: &LoadedCircuit, ex_nid: i32) -> Option
 
 /// `Rewrites` restricted to the nodes of one plan phase. Set-op / distinct
 /// views carry no fold rewrites, so only `skip_nodes` need partitioning;
-/// `fold_finalize`/`folded_maps` index `owned_expr_progs` and are left empty.
+/// `fold_finalize`/`folded_maps` index the fold-program list and are left empty.
 pub(super) fn phase_rewrites(rw: &Rewrites, nids: &HashSet<i32>) -> Rewrites {
     Rewrites {
         skip_nodes: rw.skip_nodes.iter().filter(|n| nids.contains(n)).copied().collect(),

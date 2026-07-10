@@ -443,9 +443,9 @@ pub(crate) fn execute_epoch_multi(
                     aggs.len()
                 );
 
-                let fin_prog = finalize_func_idx
+                let fin_func = finalize_func_idx
                     .as_ref()
-                    .map(|idx| unsafe { &*program.expr_progs[*idx as usize] });
+                    .map(|idx| unsafe { &*program.funcs[*idx as usize] });
                 let fin_schema = finalize_schema_idx.as_ref().map(|idx| &program.schemas[*idx as usize]);
 
                 let ti_opt: Option<&mut ReadCursor> = if !ti_cursor_ptr.is_null() {
@@ -465,7 +465,7 @@ pub(crate) fn execute_epoch_multi(
                     aggs,
                     *out_key,
                     avi_opt,
-                    fin_prog,
+                    fin_func,
                     fin_schema,
                     *global_ground,
                     *i_am_owner,
