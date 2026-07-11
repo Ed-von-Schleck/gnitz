@@ -38,14 +38,16 @@ pub const MAX_FRAME_PAYLOAD_CLIENT: usize = 256 * 1024 * 1024; // 256 MB
 /// such a block is far larger than the 8/12-byte HELLO/ACK frames.
 pub const HELLO_MAGIC: u32 = u32::from_le_bytes(*b"GNTZ");
 
+/// ALPN protocol both sides of the TLS transport pin; a mismatch fails the
+/// handshake. One definition — a silent client/engine drift would brick
+/// every TLS connect.
+pub const ALPN_GNITZ: &[u8] = b"gnitz/1";
+
 /// HELLO payload length in bytes (excluding the 4-byte length prefix).
 pub const HELLO_PAYLOAD_LEN: u32 = 8;
 
 /// ACK payload length in bytes (excluding the 4-byte length prefix).
 pub const HELLO_ACK_PAYLOAD_LEN: u32 = 12;
-
-/// Total wire size of a HELLO frame (length prefix + payload).
-pub const HELLO_FRAME_SIZE: usize = 4 + HELLO_PAYLOAD_LEN as usize;
 
 /// Total wire size of an ACK frame (length prefix + payload).
 pub const HELLO_ACK_FRAME_SIZE: usize = 4 + HELLO_ACK_PAYLOAD_LEN as usize;
@@ -54,15 +56,14 @@ pub const HELLO_ACK_FRAME_SIZE: usize = 4 + HELLO_ACK_PAYLOAD_LEN as usize;
 /// version/auth failures use a `STATUS_ERROR` control block, not the ACK.
 pub const HELLO_STATUS_OK: u16 = 0;
 
-/// Build a HELLO frame ready to ship over the wire (length prefix + payload).
-pub const fn encode_hello_frame(version: u16, flags: u16) -> [u8; HELLO_FRAME_SIZE] {
-    let len = HELLO_PAYLOAD_LEN.to_le_bytes();
+/// Build a HELLO payload (the bytes after the length prefix). Every sender
+/// frames it through its transport's standard framed send, which derives
+/// the identical 4-byte prefix.
+pub const fn encode_hello_payload(version: u16, flags: u16) -> [u8; HELLO_PAYLOAD_LEN as usize] {
     let mag = HELLO_MAGIC.to_le_bytes();
     let ver = version.to_le_bytes();
     let flg = flags.to_le_bytes();
-    [
-        len[0], len[1], len[2], len[3], mag[0], mag[1], mag[2], mag[3], ver[0], ver[1], flg[0], flg[1],
-    ]
+    [mag[0], mag[1], mag[2], mag[3], ver[0], ver[1], flg[0], flg[1]]
 }
 
 /// Parsed HELLO payload (the 8 bytes following the length prefix).
@@ -136,25 +137,22 @@ mod hello_tests {
     }
 
     #[test]
-    fn hello_frame_layout_is_stable() {
-        // Length prefix must be exactly HELLO_PAYLOAD_LEN, magic must
-        // sit at offsets 4..8, version at 8..10, flags at 10..12.
-        let frame = encode_hello_frame(0x1234, 0x0001);
-        assert_eq!(frame.len(), HELLO_FRAME_SIZE);
-        let prefix = u32::from_le_bytes(frame[0..4].try_into().unwrap());
-        assert_eq!(prefix, HELLO_PAYLOAD_LEN);
-        let magic = u32::from_le_bytes(frame[4..8].try_into().unwrap());
+    fn hello_payload_layout_is_stable() {
+        // Magic must sit at offsets 0..4, version at 4..6, flags at 6..8.
+        let payload = encode_hello_payload(0x1234, 0x0001);
+        assert_eq!(payload.len(), HELLO_PAYLOAD_LEN as usize);
+        let magic = u32::from_le_bytes(payload[0..4].try_into().unwrap());
         assert_eq!(magic, HELLO_MAGIC);
-        let version = u16::from_le_bytes(frame[8..10].try_into().unwrap());
+        let version = u16::from_le_bytes(payload[4..6].try_into().unwrap());
         assert_eq!(version, 0x1234);
-        let flags = u16::from_le_bytes(frame[10..12].try_into().unwrap());
+        let flags = u16::from_le_bytes(payload[6..8].try_into().unwrap());
         assert_eq!(flags, 0x0001);
     }
 
     #[test]
     fn hello_payload_decode_roundtrip() {
-        let frame = encode_hello_frame(7, 0xCAFE);
-        let h = decode_hello_payload(&frame[4..]).unwrap();
+        let payload = encode_hello_payload(7, 0xCAFE);
+        let h = decode_hello_payload(&payload).unwrap();
         assert_eq!(h.magic, HELLO_MAGIC);
         assert_eq!(h.version, 7);
         assert_eq!(h.flags, 0xCAFE);

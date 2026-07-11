@@ -61,6 +61,8 @@ mod runloop;
 pub mod sync;
 mod uring;
 
+pub(crate) use conn::client_send_timeout;
+
 #[cfg(test)]
 use futures::SendFuture;
 pub(crate) use futures::{FsyncFuture, ReplyFuture, ScanLease};
@@ -83,12 +85,17 @@ pub const KIND_ACCEPT: u64 = 5;
 pub const KIND_RECV: u64 = 6;
 pub const KIND_SEND: u64 = 7;
 pub const KIND_FUTEX_CANCEL: u64 = 8;
-/// CQE tag for the `AsyncCancel` a dropped `TimerFuture` submits against its
-/// Timeout SQE, so a cancelled timer's kernel state is reclaimed immediately
-/// instead of at its deadline. The dispatch arm is a pure no-op — the
-/// cancellation's *effect* is the Timeout's own `-ECANCELED` CQE under
-/// `KIND_TIMEOUT`, discarded there via the `cancelled` flag.
-pub const KIND_TIMEOUT_CANCEL: u64 = 9;
+/// CQE tag for the `AsyncCancel` a dropped `TimerFuture` or `RawRecvFuture`
+/// submits against its target SQE, so the cancelled op's kernel state is
+/// reclaimed promptly. The dispatch arm is a pure no-op sink — the
+/// cancellation's *effect* is the target op's own `-ECANCELED` CQE under
+/// its own kind (`KIND_TIMEOUT` / `KIND_RAW_RECV`).
+pub const KIND_CANCEL_SINK: u64 = 9;
+/// One-shot raw recv into a caller-owned buffer (`Reactor::recv_raw`) — the
+/// TLS read pump's undeframed byte source. Deliberately NOT `KIND_RECV`:
+/// that handler silently drops CQEs for fds absent from `conns`, and TLS
+/// fds never call `register_conn`.
+pub const KIND_RAW_RECV: u64 = 10;
 
 const KIND_SHIFT: u64 = 56;
 const ID_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
@@ -122,8 +129,12 @@ struct ReactorShared {
     /// fields in declaration order; dropping `ring` closes the io_uring fd,
     /// whose kernel-side teardown cancels all in-flight SQEs and drops the
     /// kernel's references to userspace buffers. Only then is it safe to free
-    /// the buffers those SQEs pointed at — `send_buffers_in_flight`, `conns`.
+    /// the buffers those SQEs pointed at — `send_buffers_in_flight`, `conns`,
+    /// and the raw-recv maps (`raw_recv_buffers_in_flight`, `parked_raw_recv`).
     /// Moving `ring` below any of them is a use-after-free at shutdown.
+    /// The raw-recv maps must additionally sit BELOW `tasks`: a
+    /// `RawRecvFuture::Drop` running during `tasks`'s own field-drop touches
+    /// them, so they must still be alive then.
     ring: RefCell<IoUringRing>,
     /// Live tasks keyed by a monotonically-increasing id. HashMap (not
     /// `slab::Slab`) because same-key reinsertion is load-bearing: a
@@ -196,12 +207,11 @@ struct ReactorShared {
     /// Ceiling for `total_inbound_bytes`, resolved once at startup by
     /// `resolve_inbound_cap`. A plain load on the recv hot path.
     global_cap: Cell<usize>,
-    /// Listen socket fd; set by `attach_server_fd`. The reactor submits a
-    /// single `AcceptMulti` SQE on attach and re-arms on cancellation.
-    server_fd: Cell<i32>,
-    /// Accept queue: fds delivered by the kernel but not yet claimed by
-    /// an `accept().await` caller. The accept loop task drains this.
-    accept_queue: RefCell<VecDeque<i32>>,
+    /// Accept queue: `(conn_fd, listener_fd)` pairs delivered by the kernel
+    /// but not yet claimed by an `accept().await` caller. The listener fd
+    /// rides the multishot-accept SQE's udata `id` field, so the accept
+    /// loop can route AF_UNIX vs TLS connections without reactor state.
+    accept_queue: RefCell<VecDeque<(i32, i32)>>,
     accept_waker: RefCell<Option<Waker>>,
     /// Recv waiters per fd: set when a task has called `recv(fd)` and is
     /// awaiting a complete message. Only one waiter per fd — per-connection
@@ -237,6 +247,20 @@ struct ReactorShared {
     /// come from different counters — a shared set would let a cancelled
     /// send id wrongly tombstone a live fsync of the same numeric value.
     cancelled_sends: RefCell<FxHashSet<u64>>,
+    /// Raw-recv (`Reactor::recv_raw`) park state, keyed by the shared
+    /// send-id counter. Declared below `ring` AND below `tasks` (see the
+    /// drop-order SAFETY INVARIANT on `ring`): a `RawRecvFuture::Drop`
+    /// firing during `tasks`'s field-drop must still find these alive.
+    raw_recv_wakers: RefCell<FxHashMap<u64, Waker>>,
+    /// Raw-recv results (byte count / errno) parked before the waker
+    /// re-polled, same pattern as `parked_send_results`.
+    parked_raw_recv: RefCell<FxHashMap<u64, i32>>,
+    /// Recv buffers whose `RawRecvFuture` was dropped before the CQE: the
+    /// kernel may still write into them, so `Drop` parks the `Vec` here and
+    /// the late `KIND_RAW_RECV` CQE frees it. An entry here is also the
+    /// orphan marker (the tombstone `cancelled_sends` needs separately):
+    /// buffer present ⇔ the future is gone ⇔ the result is discarded.
+    raw_recv_buffers_in_flight: RefCell<FxHashMap<u64, Vec<u8>>>,
     /// Shutdown flag. `block_until_shutdown` polls until this is set.
     shutdown: Cell<bool>,
     /// FLAG_EXCHANGE accumulator: when route_reply sees an exchange wire,
@@ -264,9 +288,14 @@ struct ReactorShared {
     /// Fds that have been marked closing via `close_fd`. `reap_closing_conns`
     /// iterates only this set (O(closing)) rather than all connections (O(all)).
     closing_fds: RefCell<FxHashSet<i32>>,
-    /// Guards against spawning multiple concurrent EMFILE/ENFILE backoff tasks.
-    /// Set before spawn, cleared when the timer fires and accept is re-armed.
-    accept_backoff_armed: Cell<bool>,
+    /// Listeners whose multishot accept cancelled on fd exhaustion and await
+    /// the backoff re-arm. A set, not a single flag: fd exhaustion is
+    /// global, so BOTH listeners' accepts can cancel in the same window —
+    /// with one flag the second CQE would be dropped and that listener
+    /// would stay permanently deaf. One 50 ms backoff task runs while the
+    /// set is non-empty (spawned on the 0→1 transition) and drains it,
+    /// re-arming every listed listener.
+    accept_rearm_pending: RefCell<FxHashSet<i32>>,
 }
 
 /// Shared, clonable handle to the reactor. All futures created by the
@@ -375,7 +404,6 @@ impl Reactor {
             conns: RefCell::new(FxHashMap::default()),
             total_inbound_bytes: Rc::new(Cell::new(0)),
             global_cap: Cell::new(resolve_inbound_cap()),
-            server_fd: Cell::new(-1),
             accept_queue: RefCell::new(VecDeque::new()),
             accept_waker: RefCell::new(None),
             recv_waiters: RefCell::new(FxHashMap::default()),
@@ -386,6 +414,9 @@ impl Reactor {
             send_buffers_in_flight: RefCell::new(FxHashMap::default()),
             parked_send_results: RefCell::new(FxHashMap::default()),
             cancelled_sends: RefCell::new(FxHashSet::default()),
+            raw_recv_wakers: RefCell::new(FxHashMap::default()),
+            parked_raw_recv: RefCell::new(FxHashMap::default()),
+            raw_recv_buffers_in_flight: RefCell::new(FxHashMap::default()),
             shutdown: Cell::new(false),
             exchange_acc: RefCell::new(ExchangeAccumulator::new(0)),
             relay_tx: RefCell::new(None),
@@ -393,7 +424,7 @@ impl Reactor {
             scan_wakers: RefCell::new(FxHashMap::default()),
             scan_parked: RefCell::new(FxHashMap::default()),
             active_scans: RefCell::new(FxHashSet::default()),
-            accept_backoff_armed: Cell::new(false),
+            accept_rearm_pending: RefCell::new(FxHashSet::default()),
         });
         // Publish the run-queue pointer for the waker vtable. ReactorShared
         // lives behind Rc with a stable address, so the pointer is valid
@@ -810,34 +841,46 @@ impl Reactor {
                 }
             }
             KIND_ACCEPT => {
+                // The listener fd rides the SQE's udata id — the accepted-fd
+                // path routes on it and the re-arm targets it specifically.
+                let listener = id as i32;
                 if cqe.res >= 0 {
-                    self.inner.accept_queue.borrow_mut().push_back(cqe.res);
+                    self.inner.accept_queue.borrow_mut().push_back((cqe.res, listener));
                     if let Some(w) = self.inner.accept_waker.borrow_mut().take() {
                         w.wake();
                     }
                 }
-                if cqe.flags & CQE_F_MORE == 0 {
+                if cqe.flags & CQE_F_MORE == 0 && listener >= 0 {
                     // Multishot cancelled — re-arm, but back off ~50ms on fd
                     // exhaustion so reap_closing_conns can free FDs first.
-                    let sfd = self.inner.server_fd.get();
-                    if sfd >= 0 {
-                        if cqe.res == -libc::EMFILE || cqe.res == -libc::ENFILE {
-                            if !self.inner.accept_backoff_armed.get() {
-                                self.inner.accept_backoff_armed.set(true);
-                                let inner = Rc::clone(&self.inner);
-                                self.spawn(async move {
-                                    let deadline = Instant::now() + std::time::Duration::from_millis(50);
-                                    TimerFuture::new(deadline, Rc::clone(&inner)).await;
-                                    inner.accept_backoff_armed.set(false);
-                                    let current_sfd = inner.server_fd.get();
-                                    if current_sfd >= 0 {
-                                        inner.ring.borrow_mut().prep_accept(current_sfd, udata(KIND_ACCEPT, 0));
-                                    }
-                                });
-                            }
-                        } else {
-                            self.inner.ring.borrow_mut().prep_accept(sfd, udata(KIND_ACCEPT, 0));
+                    // fd exhaustion is global: both listeners' accepts can
+                    // cancel in the same window, so the pending set records
+                    // every cancelled listener and the single backoff timer
+                    // re-arms them all.
+                    if cqe.res == -libc::EMFILE || cqe.res == -libc::ENFILE {
+                        // One backoff task runs while the pending set is
+                        // non-empty: spawn only on the 0→1 transition.
+                        let first = {
+                            let mut pending = self.inner.accept_rearm_pending.borrow_mut();
+                            pending.insert(listener) && pending.len() == 1
+                        };
+                        if first {
+                            let inner = Rc::clone(&self.inner);
+                            self.spawn(async move {
+                                let deadline = Instant::now() + std::time::Duration::from_millis(50);
+                                TimerFuture::new(deadline, Rc::clone(&inner)).await;
+                                let pending: Vec<i32> = inner.accept_rearm_pending.borrow_mut().drain().collect();
+                                let mut ring = inner.ring.borrow_mut();
+                                for lfd in pending {
+                                    ring.prep_accept(lfd, udata(KIND_ACCEPT, lfd as u32 as u64));
+                                }
+                            });
                         }
+                    } else {
+                        self.inner
+                            .ring
+                            .borrow_mut()
+                            .prep_accept(listener, udata(KIND_ACCEPT, listener as u32 as u64));
                     }
                 }
             }
@@ -872,7 +915,19 @@ impl Reactor {
                     }
                 }
             }
-            KIND_TIMEOUT_CANCEL => {
+            KIND_RAW_RECV => {
+                // An orphaned buffer is present exactly when the future was
+                // dropped pre-CQE: the kernel is done with the pointer now,
+                // so freeing it is safe — and its presence doubles as the
+                // "discard the result" marker.
+                if self.inner.raw_recv_buffers_in_flight.borrow_mut().remove(&id).is_none() {
+                    self.inner.parked_raw_recv.borrow_mut().insert(id, cqe.res);
+                    if let Some(w) = self.inner.raw_recv_wakers.borrow_mut().remove(&id) {
+                        w.wake();
+                    }
+                }
+            }
+            KIND_CANCEL_SINK => {
                 // The AsyncCancel's own CQE. The cancellation's *effect*
                 // arrives separately as the target op's -ECANCELED under its
                 // own kind (same split as the FUTEX_WAITV cancel pair).
@@ -3455,14 +3510,34 @@ mod tests {
     // KIND_ACCEPT CQE dispatch.
     // ─────────────────────────────────────────────────────────────────
 
+    /// udata id that decodes to listener fd -1 (`id as i32`), so the
+    /// CQE_F_MORE==0 re-arm path is guarded off in tests that inject
+    /// accept CQEs without a real listener.
+    const NO_LISTENER: u64 = 0xFFFF_FFFF;
+
     #[test]
-    fn dispatch_accept_queues_fd_when_res_non_negative() {
+    fn dispatch_accept_queues_fd_and_listener_when_res_non_negative() {
         let r = make_reactor();
-        // flags=0 → CQE_F_MORE not set → re-arm attempted; server_fd=-1 guards it.
-        r.inject_cqe(KIND_ACCEPT, 0, 7);
+        // flags=0 → CQE_F_MORE not set → re-arm attempted; listener=-1 guards it.
+        r.inject_cqe(KIND_ACCEPT, NO_LISTENER, 7);
         r.drain_injected_cqes();
-        let q: Vec<i32> = r.inner.accept_queue.borrow().iter().copied().collect();
-        assert_eq!(q, vec![7], "KIND_ACCEPT res>=0 must push the fd to accept_queue");
+        let q: Vec<(i32, i32)> = r.inner.accept_queue.borrow().iter().copied().collect();
+        assert_eq!(
+            q,
+            vec![(7, -1)],
+            "KIND_ACCEPT res>=0 must push (conn_fd, listener_fd) to accept_queue"
+        );
+    }
+
+    #[test]
+    fn dispatch_accept_routes_listener_fd_from_udata() {
+        let r = make_reactor();
+        // A second listener's fd rides the udata id and must round-trip
+        // into the queued pair — the accept loop's unix-vs-tls routing key.
+        r.inject_cqe(KIND_ACCEPT, 33, 9);
+        r.drain_injected_cqes();
+        let q: Vec<(i32, i32)> = r.inner.accept_queue.borrow().iter().copied().collect();
+        assert_eq!(q, vec![(9, 33)], "listener fd must round-trip through the udata id");
     }
 
     #[test]
@@ -3471,7 +3546,7 @@ mod tests {
         let waker = make_waker(42);
         *r.inner.accept_waker.borrow_mut() = Some(waker);
 
-        r.inject_cqe(KIND_ACCEPT, 0, 5);
+        r.inject_cqe(KIND_ACCEPT, NO_LISTENER, 5);
         r.drain_injected_cqes();
 
         let q: Vec<usize> = r.inner.run_queue.borrow().queue.clone();
@@ -3485,7 +3560,7 @@ mod tests {
     #[test]
     fn dispatch_accept_ignores_error_result() {
         let r = make_reactor();
-        r.inject_cqe(KIND_ACCEPT, 0, -libc::ECONNABORTED);
+        r.inject_cqe(KIND_ACCEPT, NO_LISTENER, -libc::ECONNABORTED);
         r.drain_injected_cqes();
         assert!(
             r.inner.accept_queue.borrow().is_empty(),

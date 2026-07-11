@@ -1,18 +1,20 @@
 //! Transport-neutral client-connection handle.
 //!
 //! The dispatch layer (connection loop, request handlers, scan-train
-//! forwarders) talks to a `Peer`, not a raw fd, so a transport whose client
-//! connections are not file descriptors (a userspace QUIC endpoint reading
-//! and writing stream buffers over one UDP socket) can slot in without
-//! touching a handler. The handle is an enum, not a trait: connection
-//! transports are a closed set, enum dispatch keeps the async methods plain
-//! (no boxed futures, no dyn), and the orchestration layer sits above both
-//! the reactor and any future transport engine, so the layering stays intact
-//! (the reactor keeps its fd-based API and learns nothing about peers).
+//! forwarders) talks to a `Peer`, not a raw fd, so the two connection
+//! transports — AF_UNIX stream fds serviced by the reactor's framing, and
+//! TLS-over-TCP sessions whose framing runs on decrypted plaintext in
+//! `runtime::tls` — slot in without touching a handler. The handle is an
+//! enum, not a trait: connection transports are a closed set, enum dispatch
+//! keeps the async methods plain (no boxed futures, no dyn), and the
+//! orchestration layer sits above both the reactor and the TLS engine, so
+//! the layering stays intact (the reactor keeps its fd-based API and learns
+//! nothing about peers).
 
 use std::rc::Rc;
 
 use crate::runtime::reactor::{Reactor, RecvBuf};
+use crate::runtime::tls::TlsShared;
 use crate::runtime::w2m::W2mSlot;
 use crate::storage::batch_pool::PooledSendBuf;
 
@@ -25,6 +27,8 @@ pub struct Peer {
 enum PeerInner {
     /// AF_UNIX stream connection serviced by the reactor's fd machinery.
     Unix { fd: i32, reactor: Rc<Reactor> },
+    /// TLS 1.3 over TCP; framing and record I/O live in `runtime::tls`.
+    Tls(Rc<TlsShared>),
 }
 
 impl Peer {
@@ -34,34 +38,50 @@ impl Peer {
         }
     }
 
+    pub fn tls(conn: Rc<TlsShared>) -> Peer {
+        Peer {
+            inner: PeerInner::Tls(conn),
+        }
+    }
+
     /// Next complete inbound frame payload (owned, freed on drop on every
     /// exit path including task cancellation), or `None` on disconnect.
     pub async fn recv(&self) -> Option<RecvBuf> {
         match &self.inner {
             PeerInner::Unix { fd, reactor } => reactor.recv(*fd).await,
+            PeerInner::Tls(conn) => conn.recv().await,
         }
     }
 
     pub async fn send_buffer(&self, buf: PooledSendBuf) -> i32 {
         match &self.inner {
             PeerInner::Unix { fd, reactor } => reactor.send_buffer(*fd, buf).await,
+            PeerInner::Tls(conn) => conn.send_buffer(buf).await,
         }
     }
 
-    /// Forward a worker W2M ring slot to the client zero-copy, under the
-    /// reactor's per-frame egress deadline: a client that stalls the send is
-    /// shut down so the held ring slot frees (see [`Reactor::send_slot`]).
-    /// Returns the send rc (`< 0` — disconnect or eviction — means the client
-    /// is gone).
+    /// Forward a worker W2M ring slot to the client under the per-frame
+    /// egress deadline: a client that stalls the send is shut down so the
+    /// held ring slot frees (see [`Reactor::send_slot`]; the TLS side's
+    /// deadline lives in `TlsShared::send_guarded`). Returns the send rc
+    /// (`< 0` — disconnect or eviction — means the client is gone).
     pub async fn send_slot(&self, slot: W2mSlot) -> i32 {
         match &self.inner {
             PeerInner::Unix { fd, reactor } => reactor.send_slot(*fd, slot).await,
+            PeerInner::Tls(conn) => conn.send_slot(slot).await,
         }
     }
 
+    /// Send the precomputed OK HELLO ACK frame. The ACK's contents (status,
+    /// advertised server frame limit) are protocol policy decided once here,
+    /// for every transport; the backends differ only in how they ship the
+    /// `'static` bytes.
     pub async fn send_hello_ack(&self) -> i32 {
+        const OK_ACK: [u8; gnitz_wire::HELLO_ACK_FRAME_SIZE] =
+            gnitz_wire::encode_hello_ack(gnitz_wire::HELLO_STATUS_OK, gnitz_wire::MAX_FRAME_PAYLOAD_SERVER as u32);
         match &self.inner {
-            PeerInner::Unix { fd, reactor } => reactor.send_hello_ack(*fd).await,
+            PeerInner::Unix { fd, reactor } => reactor.send_static(*fd, &OK_ACK).await,
+            PeerInner::Tls(conn) => conn.send_guarded(&OK_ACK).await,
         }
     }
 
@@ -89,12 +109,14 @@ impl Peer {
     pub fn set_max_payload_len(&self, limit: usize) {
         match &self.inner {
             PeerInner::Unix { fd, reactor } => reactor.set_max_payload_len(*fd, limit),
+            PeerInner::Tls(conn) => conn.set_max_payload_len(limit),
         }
     }
 
     pub fn close(&self) {
         match &self.inner {
             PeerInner::Unix { fd, reactor } => reactor.close_fd(*fd),
+            PeerInner::Tls(conn) => conn.close(),
         }
     }
 }

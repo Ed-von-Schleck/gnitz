@@ -1,17 +1,20 @@
 //! Reactor client-connection framing: accept / register / recv / the
 //! `send_*` family / `close_fd`, plus `handle_recv_cqe` and conn reaping.
 
-use super::futures::{AcceptFuture, RecvFuture, SendAlive, SendFuture};
+use super::futures::{AcceptFuture, RawRecvFuture, RecvFuture, SendAlive, SendFuture};
 use super::*;
 
-/// Per-frame wall-clock deadline for zero-copy ring-slot client egress, read
-/// once from `GNITZ_CLIENT_SEND_TIMEOUT_MS` (default 30 s). The deadline is
-/// per-frame, so a client making steady progress across a large train is never
-/// penalised — only one that makes zero progress for the full window (a stalled
-/// or maliciously zero-window peer) is evicted. Generous by default so ordinary
-/// transient congestion never sheds a healthy client; e2e tests shrink it to
-/// bound the freeze window they assert on.
-fn client_send_timeout() -> std::time::Duration {
+/// Per-frame wall-clock deadline for client egress, read once from
+/// `GNITZ_CLIENT_SEND_TIMEOUT_MS` (default 30 s). Applied to zero-copy
+/// ring-slot sends on the fd path and to EVERY client-bound TLS send (the
+/// TLS `send_mutex` is held across sends, so an unbounded send would wedge
+/// the whole connection). The deadline is per-frame, so a client making
+/// steady progress across a large train is never penalised — only one that
+/// makes zero progress for the full window (a stalled or maliciously
+/// zero-window peer) is evicted. Generous by default so ordinary transient
+/// congestion never sheds a healthy client; e2e tests shrink it to bound
+/// the freeze window they assert on.
+pub(crate) fn client_send_timeout() -> std::time::Duration {
     static TIMEOUT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *TIMEOUT.get_or_init(|| {
         let ms = std::env::var("GNITZ_CLIENT_SEND_TIMEOUT_MS")
@@ -23,9 +26,9 @@ fn client_send_timeout() -> std::time::Duration {
 }
 
 impl Reactor {
-    /// Allocate a per-send id distinct from reply / fsync id space.
-    /// `pub(super)` so `reactor::udp` allocates its op ids from the same
-    /// counter (shared counter ⇒ no collisions in the shared send maps).
+    /// Allocate a per-send id distinct from reply / fsync id space. Also
+    /// allocates `recv_raw` op ids (shared counter, disjoint park maps —
+    /// no collisions either way).
     pub(super) fn alloc_send_id(&self) -> u64 {
         let id = self.inner.next_send_id.get();
         let next = match id.checked_add(1) {
@@ -36,27 +39,87 @@ impl Reactor {
         id
     }
 
-    /// Attach the listen socket fd and arm a multishot-accept SQE.
-    pub fn attach_server_fd(&self, server_fd: i32) {
-        self.inner.server_fd.set(server_fd);
-        {
-            let mut ring = self.inner.ring.borrow_mut();
-            ring.prep_accept(server_fd, udata(KIND_ACCEPT, 0));
-            if let Err(e) = ring.submit_and_wait_timeout(0, 0) {
-                crate::gnitz_fatal_abort!(
-                    "reactor: accept SQE flush failed (errno={}) — no connections can be accepted",
-                    e,
-                );
-            }
+    /// Attach a listen socket fd and arm its multishot-accept SQE. Callable
+    /// once per listener (AF_UNIX + optional TLS); the listener fd rides the
+    /// SQE's udata `id` field so each accepted connection resolves as
+    /// `(conn_fd, listener_fd)`.
+    pub fn attach_listener(&self, listener_fd: i32) {
+        let mut ring = self.inner.ring.borrow_mut();
+        ring.prep_accept(listener_fd, udata(KIND_ACCEPT, listener_fd as u32 as u64));
+        if let Err(e) = ring.submit_and_wait_timeout(0, 0) {
+            crate::gnitz_fatal_abort!(
+                "reactor: accept SQE flush failed (errno={}) — no connections can be accepted",
+                e,
+            );
         }
     }
 
-    /// Future resolving to the next newly-accepted fd. Called by the
-    /// accept-loop task.
+    /// Future resolving to the next newly-accepted `(conn_fd, listener_fd)`
+    /// pair. Called by the accept-loop task.
     pub fn accept(&self) -> AcceptFuture {
         AcceptFuture {
             inner: Rc::clone(&self.inner),
         }
+    }
+
+    /// One-shot raw recv into the caller's buffer, resolving with
+    /// `(buffer, byte_count)` (≤ 0 = EOF/error). The buffer round-trips so
+    /// the caller (the TLS read pump) reuses one allocation forever. The
+    /// socket bytes are undeframed — under TLS they are ciphertext, so the
+    /// fd path's `RecvState` machinery cannot run here; the pump deframes
+    /// the decrypted plaintext itself.
+    pub fn recv_raw(&self, fd: i32, mut buf: Vec<u8>) -> RawRecvFuture {
+        let id = self.alloc_send_id();
+        // No eager flush: like the fd path's steady-state recv re-arm, the
+        // queued SQE ships with the runloop's own submit when the caller
+        // parks — same tick, one fewer io_uring_enter per inbound chunk.
+        self.inner
+            .ring
+            .borrow_mut()
+            .prep_recv(fd, buf.as_mut_ptr(), buf.len() as u32, udata(KIND_RAW_RECV, id));
+        RawRecvFuture {
+            id,
+            buf: Some(buf),
+            inner: Rc::clone(&self.inner),
+        }
+    }
+
+    /// Send the whole `cipher` buffer, looping partial `OP_SEND` completions
+    /// like the fd send path. `Rc`-wrapped (not owned): `send_buf_inner`
+    /// clones the keep-alive per partial-write chunk, so an owned `Vec`
+    /// would deep-copy the ciphertext once per chunk.
+    pub async fn send_raw(&self, fd: i32, cipher: Rc<Vec<u8>>) -> i32 {
+        let (ptr, len) = (cipher.as_ptr(), cipher.len());
+        self.send_buf_inner(fd, ptr, len, SendAlive::RcVec(cipher)).await
+    }
+
+    /// Charge and allocate one inbound frame payload buffer against the
+    /// global inbound-memory cap — the single accounting point shared by the
+    /// fd recv path (`handle_recv_cqe`) and the TLS pump. Charges
+    /// `frame_weight(plen)` at header-parse time, *before* any payload byte
+    /// arrives, so a declared-but-dribbled frame can never accumulate
+    /// uncounted bytes; `None` = cap breach or malloc failure, refused
+    /// before allocation. Intentionally silent: the caller logs (it knows
+    /// the fd).
+    pub(crate) fn alloc_inbound_buf(&self, plen: usize) -> Option<io::RecvBuf> {
+        let w = io::frame_weight(plen);
+        if self.inner.total_inbound_bytes.get() + w > self.inner.global_cap.get() {
+            return None; // refuse before malloc — no overshoot
+        }
+        // SAFETY: plen > 0 (zero-length frames are the close sentinel,
+        // rejected before this call); null is checked below.
+        let pbuf = unsafe { libc::malloc(plen) as *mut u8 };
+        if pbuf.is_null() {
+            return None;
+        }
+        // RecvBuf::new charges frame_weight(plen); its Drop refunds.
+        Some(io::RecvBuf::new(pbuf, plen, Rc::clone(&self.inner.total_inbound_bytes)))
+    }
+
+    /// Held bytes under the global inbound cap (test observability).
+    #[cfg(test)]
+    pub(crate) fn total_inbound_bytes(&self) -> usize {
+        self.inner.total_inbound_bytes.get()
     }
 
     /// Elevate `fd`'s per-connection payload ceiling. Called after the
@@ -169,13 +232,11 @@ impl Reactor {
         }
     }
 
-    /// Send the precomputed OK HELLO ACK frame. The bytes are a `'static`
-    /// const, so no per-connection allocation or liveness tracking is
-    /// required.
-    pub async fn send_hello_ack(&self, fd: i32) -> i32 {
-        const OK_ACK: [u8; gnitz_wire::HELLO_ACK_FRAME_SIZE] =
-            gnitz_wire::encode_hello_ack(gnitz_wire::HELLO_STATUS_OK, gnitz_wire::MAX_FRAME_PAYLOAD_SERVER as u32);
-        self.send_buf_inner(fd, OK_ACK.as_ptr(), OK_ACK.len(), SendAlive::Static)
+    /// Send a `'static` byte buffer (e.g. the precomputed HELLO ACK): no
+    /// per-connection allocation or liveness tracking is required — the
+    /// kernel pointer remains valid for the lifetime of the process.
+    pub async fn send_static(&self, fd: i32, bytes: &'static [u8]) -> i32 {
+        self.send_buf_inner(fd, bytes.as_ptr(), bytes.len(), SendAlive::Static)
             .await
     }
 
@@ -272,27 +333,22 @@ impl Reactor {
                     self.begin_recv_close(conn, fd);
                     return;
                 }
-                let w = io::frame_weight(plen);
-                if self.inner.total_inbound_bytes.get() + w > self.inner.global_cap.get() {
+                // `alloc_inbound_buf` charges `frame_weight(plen)` (refunded
+                // by the RecvBuf's `Drop`), refusing before malloc on a cap
+                // breach.
+                let Some(rbuf) = self.alloc_inbound_buf(plen) else {
                     crate::gnitz_warn!(
                         "reactor: inbound cap would be exceeded, closing fd={} (held={} B + {} B, cap={} B)",
                         fd,
                         self.inner.total_inbound_bytes.get(),
-                        w,
+                        io::frame_weight(plen),
                         self.inner.global_cap.get(),
                     );
                     self.begin_recv_close(conn, fd);
-                    return; // refuse before malloc — no overshoot
-                }
-                let pbuf = unsafe { libc::malloc(plen) as *mut u8 };
-                if pbuf.is_null() {
-                    self.begin_recv_close(conn, fd);
                     return;
-                }
-                // `RecvBuf::new` charges `frame_weight(plen)` to the global
-                // counter; the matching refund is in its `Drop`.
-                conn.recv_state
-                    .start_payload(io::RecvBuf::new(pbuf, plen, Rc::clone(&self.inner.total_inbound_bytes)));
+                };
+                let pbuf = rbuf.ptr;
+                conn.recv_state.start_payload(rbuf);
                 self.inner
                     .ring
                     .borrow_mut()

@@ -332,6 +332,14 @@ fn rebuild_invalid_views(catalog: &mut CatalogEngine, dispatcher: &mut MasterDis
 // Server main entry point
 // ---------------------------------------------------------------------------
 
+/// TLS listener request from the CLI: the address to bind and optional
+/// operator cert/key PEM paths (a self-signed dev cert is minted when
+/// absent).
+pub struct TlsCli {
+    pub listen: std::net::SocketAddr,
+    pub cert_key: Option<(String, String)>,
+}
+
 /// Single entry point for the entire server bootstrap.
 ///
 /// 1. Raises fd limit
@@ -340,7 +348,13 @@ fn rebuild_invalid_views(catalog: &mut CatalogEngine, dispatcher: &mut MasterDis
 ///    creates dispatcher, runs executor
 ///
 /// Returns 0 on clean exit, non-zero on error.
-pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_level: u32) -> i32 {
+pub fn server_main(
+    data_dir: &str,
+    socket_path: &str,
+    num_workers: u32,
+    log_level: u32,
+    tls_cli: Option<TlsCli>,
+) -> i32 {
     // Latch the Master role before any catalog work: the pre-fork replay hooks
     // in CatalogEngine::open must see Master so they skip the index backfill
     // their forked children rebuild slice-local.
@@ -690,9 +704,58 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
             return 1;
         }
     };
+
+    // Optional TLS listener — after the worker fork (same position as
+    // `server_create`), so no fd inheritance. TLS was explicitly requested
+    // via --tls-listen, so any setup failure aborts boot loudly (silently
+    // continuing AF_UNIX-only would be surprising).
+    let tls_init = match tls_cli {
+        Some(cli) => match setup_tls_listener(data_dir, &cli) {
+            Ok(init) => Some(init),
+            Err(e) => {
+                gnitz_error!("{e}");
+                return 1;
+            }
+        },
+        None => None,
+    };
     boot_log("GnitzDB ready\n");
 
-    ServerExecutor::run(catalog_ptr, dispatcher_ptr, server_fd)
+    ServerExecutor::run(catalog_ptr, dispatcher_ptr, server_fd, tls_init)
+}
+
+/// Build the rustls server config (minting + persisting the public dev cert
+/// when no PEM pair is given), bind the TCP listener, and publish the bound
+/// address to `<data_dir>/tls_endpoint` (atomically: tmp + rename, so
+/// existence implies complete content).
+fn setup_tls_listener(data_dir: &str, cli: &TlsCli) -> Result<(i32, std::sync::Arc<rustls::ServerConfig>), String> {
+    let cert_key = cli.cert_key.as_ref().map(|(c, k)| (c.as_str(), k.as_str()));
+    let (config, dev_pem) = crate::runtime::tls::config::server_crypto(cert_key)?;
+    if let Some(pem) = dev_pem {
+        let path = format!("{data_dir}/tls_dev_cert.pem");
+        std::fs::write(&path, pem).map_err(|e| format!("failed to write {path}: {e}"))?;
+        gnitz_info!(
+            "TLS: minted a self-signed dev certificate (identity is ephemeral, regenerated every boot); \
+             public PEM at {path}"
+        );
+    }
+    let listen_fd =
+        posix_io::tcp_bind(&cli.listen).map_err(|e| format!("failed to bind TLS listener {}: {e}", cli.listen))?;
+    let bound = posix_io::tcp_local_addr(listen_fd).unwrap_or(cli.listen);
+    let endpoint_path = format!("{data_dir}/tls_endpoint");
+    let tmp_path = format!("{endpoint_path}.tmp");
+    std::fs::write(&tmp_path, format!("{bound}\n")).map_err(|e| format!("failed to write {tmp_path}: {e}"))?;
+    std::fs::rename(&tmp_path, &endpoint_path).map_err(|e| format!("failed to publish {endpoint_path}: {e}"))?;
+    gnitz_info!("Listening on tls://{}", bound);
+    if !bound.ip().is_loopback() {
+        gnitz_warn!(
+            "TLS listener bound to NON-LOOPBACK address {} with NO AUTHENTICATION: anyone who can \
+             reach this port gets full DDL/DML/scan access. Do not expose this listener beyond a \
+             trusted network.",
+            bound,
+        );
+    }
+    Ok((listen_fd, config))
 }
 
 // ---------------------------------------------------------------------------

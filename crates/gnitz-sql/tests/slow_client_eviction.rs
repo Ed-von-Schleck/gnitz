@@ -22,7 +22,9 @@
 
 use std::os::fd::RawFd;
 
-use gnitz_core::{connect, hello_handshake, send_message, ColData, GnitzClient, PkColumn, PkTuple, Schema, ZSetBatch};
+use gnitz_core::{
+    hello_handshake, send_message, ClientTransport, ColData, GnitzClient, PkColumn, PkTuple, Schema, ZSetBatch,
+};
 use gnitz_test_harness::ServerHandle;
 
 mod common;
@@ -112,12 +114,12 @@ fn slow_scan_client_is_evicted_after_deadline() {
     }
 
     // Slow client A: a raw connection that issues the scan then never reads.
-    let fd = connect(&srv.sock_path).expect("connect");
-    set_tiny_rcvbuf(fd);
-    hello_handshake(fd).expect("hello");
+    let mut slow = ClientTransport::connect(&srv.sock_path).expect("connect");
+    set_tiny_rcvbuf(slow.as_raw_fd());
+    hello_handshake(&mut slow).expect("hello");
     // The scan request is just an empty control frame addressed to the table id.
     send_message(
-        fd,
+        &mut slow,
         table_id,
         /*client_id*/ 0xB0BA,
         /*flags*/ 0,
@@ -131,8 +133,8 @@ fn slow_scan_client_is_evicted_after_deadline() {
     // The server must evict A once the per-frame deadline elapses; allow a few
     // deadlines of slack. Pre-fix the master's send parks forever, A is never
     // evicted, and this poll times out with no HUP → the assert fails.
-    let evicted = peer_hung_up_within(fd, 8000);
-    unsafe { libc::close(fd) };
+    let evicted = peer_hung_up_within(slow.as_raw_fd(), 8000);
+    drop(slow);
     assert!(
         evicted,
         "server did not evict the stalled scan client within the deadline window"

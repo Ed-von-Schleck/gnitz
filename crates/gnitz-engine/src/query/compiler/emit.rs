@@ -269,7 +269,14 @@ pub(super) fn emit_node(
                     // corruption. Falling back to null_func_ptr (pass-all) would
                     // silently turn a WHERE into WHERE TRUE; fail the compile instead.
                     let dep = gnitz_wire::decode_expr_blob(blob)?;
-                    create_expr_predicate(&dep.code, dep.num_regs, dep.result_reg, dep.const_strings, &in_schema, owned_funcs)?
+                    create_expr_predicate(
+                        &dep.code,
+                        dep.num_regs,
+                        dep.result_reg,
+                        dep.const_strings,
+                        &in_schema,
+                        owned_funcs,
+                    )?
                 }
                 // Absent blob = no WHERE clause; pass-all is intentional.
                 None => null_func_ptr(),
@@ -800,9 +807,14 @@ pub(super) fn emit_reduce(
     }
     let reduce_out_schema = build_reduce_output_schema(&in_reg_schema, &gcols, &agg_descs, out_key);
 
-    let trace_table =
-        create_child_table(state, view_dir, &format!("_reduce_{view_id}_{nid}"), reduce_out_schema, view_table_id)
-            .ok()?;
+    let trace_table = create_child_table(
+        state,
+        view_dir,
+        &format!("_reduce_{view_id}_{nid}"),
+        reduce_out_schema,
+        view_table_id,
+    )
+    .ok()?;
     let trace_table_idx = owned_tables.len();
     owned_tables.push(Box::new(trace_table));
     let trace_table_ptr = &*owned_tables[trace_table_idx] as *const Table as *mut Table;
@@ -915,7 +927,10 @@ pub(super) fn emit_reduce(
             .validate(Some(&reduce_out_schema), Some(&loaded.out_schema))
             .map_err(log_expr_reject)
             .ok()?;
-        push_func(owned_funcs, ScalarFunc::from_map(*logical, &reduce_out_schema, &loaded.out_schema))
+        push_func(
+            owned_funcs,
+            ScalarFunc::from_map(*logical, &reduce_out_schema, &loaded.out_schema),
+        )
     } else {
         std::ptr::null()
     };

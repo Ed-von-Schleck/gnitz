@@ -4,7 +4,11 @@
 //! - any raw pointer argument must either be null or point to a valid object
 //!   of the documented type, produced by a prior `gnitz_*` call;
 //! - the pointed-to object must not be aliased by another concurrent
-//!   `gnitz_*` call from a different thread (handles are not thread-safe);
+//!   `gnitz_*` call from a different thread (handles are not thread-safe).
+//!   A handle may be *moved* between threads, but concurrent use of one
+//!   connection was always undefined behavior — and on a `tls://` target it
+//!   is a data race on the TLS session state machine, not benign fd
+//!   interleaving, so it corrupts the record stream;
 //! - C string pointers must be non-null and terminate before the first
 //!   character outside the caller's allocation;
 //! - buffer pointers paired with a length must address at least that many

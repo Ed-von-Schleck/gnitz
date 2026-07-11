@@ -21,9 +21,7 @@ pub use message::{
     decode_control_block, encode_control_block, encode_ddl_txn, encode_message, parse_response, recv_message,
     send_message, send_message_noschema, send_message_with_extra, Message,
 };
-pub use transport::{
-    close_fd, connect, connect_unix, hello_handshake, recv_framed, send_framed, send_framed_batch, send_framed_iov,
-};
+pub use transport::{hello_handshake, ClientTransport, TransportWaker};
 pub use types::{
     meta_schema, BatchAppender, ColData, ColumnDef, FixedInt, PkColumn, PkTuple, Schema, TypeCode, ZSetBatch,
     MAX_PK_BYTES, MAX_PK_COLUMNS, PK_LIST_MAX_COLS,

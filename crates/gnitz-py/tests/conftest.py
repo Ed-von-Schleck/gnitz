@@ -36,6 +36,11 @@ class _Server:
         self._binary = binary
         self._base_dir = tempfile.mkdtemp(dir=_TMP_DIR, prefix="gnitz_py_")
         self.sock_path = os.path.join(self._base_dir, "gnitz.sock")
+        # One free TCP port, allocated once and passed on EVERY spawn
+        # (including restarts): the TLS address must be as stable across
+        # restarts as the socket path, so fixtures holding a target string
+        # survive a server restart.
+        self.tls_port = _probe_free_port()
         self.proc = None
         self._stderr_f = None
         self._data_dir: str | None = None
@@ -43,7 +48,31 @@ class _Server:
     # ── public ────────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        self._spawn()
+        # Bounded retry with a fresh port: the pre-allocated port can be
+        # stolen between the probe and the bind. A port stolen *between
+        # restarts* still fails fast — the stable-target requirement forbids
+        # re-porting mid-session.
+        for attempt in range(3):
+            try:
+                self._spawn()
+                return
+            except RuntimeError:
+                if attempt == 2:
+                    raise
+                self.tls_port = _probe_free_port()
+
+    @property
+    def tls_target(self) -> str:
+        """TLS connect string for the always-on TLS listener."""
+        return f"tls://127.0.0.1:{self.tls_port}?insecure"
+
+    @property
+    def target(self) -> str:
+        """Connect string for clients: the socket path, or the TLS address
+        when GNITZ_TRANSPORT=tls (the full-suite transport sweep)."""
+        if os.environ.get("GNITZ_TRANSPORT") == "tls":
+            return self.tls_target
+        return self.sock_path
 
     def is_alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -89,7 +118,8 @@ class _Server:
         data_dir = os.path.join(self._data_dir, "data")
         if os.path.exists(self.sock_path):
             os.unlink(self.sock_path)
-        cmd = [self._binary, data_dir, self.sock_path]
+        cmd = [self._binary, data_dir, self.sock_path,
+               f"--tls-listen=127.0.0.1:{self.tls_port}"]
         if w := os.environ.get("GNITZ_WORKERS"):
             cmd += [f"--workers={w}"]
         if ll := os.environ.get("GNITZ_LOG_LEVEL"):
@@ -100,9 +130,23 @@ class _Server:
         # interrupted run (Ctrl-C / SIGKILL / crash) can't orphan the server.
         self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=self._stderr_f,
                                      preexec_fn=server_preexec)
+        # Readiness = socket file + TLS endpoint published (the endpoint file
+        # is rename-published after the TCP bind, just before "GnitzDB ready").
+        tls_endpoint = os.path.join(data_dir, "tls_endpoint")
         for _ in range(100):
-            if os.path.exists(self.sock_path):
+            if os.path.exists(self.sock_path) and os.path.exists(tls_endpoint):
                 break
+            # Fail fast on a dead process (e.g. the pre-allocated port was
+            # stolen) instead of blind-waiting the full 10 s and cascading a
+            # generic error through the session.
+            if self.proc.poll() is not None:
+                self._stderr_f.close()
+                self._stderr_f = None
+                tail = _log_tail()
+                raise RuntimeError(
+                    f"Server exited during startup (rc={self.proc.returncode}).\n"
+                    f"stderr tail:\n{tail}"
+                )
             time.sleep(0.1)
         else:
             self.proc.kill()
@@ -110,6 +154,26 @@ class _Server:
             self._stderr_f.close()
             self._stderr_f = None
             raise RuntimeError("Server did not start within 10 s")
+
+
+def _probe_free_port() -> int:
+    """Bind 127.0.0.1:0, read the assigned port back, close."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _log_tail(max_bytes: int = 8192) -> str:
+    """Last few KB of the shared server log, for fail-fast diagnostics."""
+    try:
+        with open(_LOG_PATH, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            return f.read().decode(errors="replace")
+    except OSError:
+        return "<no server log>"
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
@@ -137,17 +201,18 @@ def _srv():
 @pytest.fixture(scope="session")
 def server(_srv):
     """
-    Socket path of the session server.  Stable across restarts — the socket
-    lives in a fixed base directory so this value never changes.
-    Preserved for backward compatibility with test files that accept `server`.
+    Connect target of the session server (socket path, or the TLS address
+    under GNITZ_TRANSPORT=tls).  Stable across restarts — the socket lives
+    in a fixed base directory and the TLS port is pinned per session, so
+    this value never changes.
     """
-    return _srv.sock_path
+    return _srv.target
 
 
 @pytest.fixture
 def client(_srv):
     """Per-test connection.  Always resolves through _srv so it follows restarts."""
-    with gnitz.connect(_srv.sock_path) as conn:
+    with gnitz.connect(_srv.target) as conn:
         yield conn
 
 
@@ -167,7 +232,7 @@ def _seamed_server(monkeypatch, env: dict[str, str]):
     s = _Server(binary)
     try:
         s.start()
-        with gnitz.connect(s.sock_path) as conn:
+        with gnitz.connect(s.target) as conn:
             yield conn
     finally:
         s.teardown()
@@ -249,7 +314,7 @@ def relay_lowspace_server(monkeypatch):
     s = _Server(_server_binary())
     try:
         s.start()
-        yield s.sock_path, s.proc
+        yield s.target, s.proc
     finally:
         s.teardown()
 

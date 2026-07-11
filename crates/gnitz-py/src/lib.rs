@@ -2127,41 +2127,15 @@ const IO_BATCH_MAX: usize = 1024;
 
 static TRANSPORT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
-/// dup() of the connection's socket fd. The I/O thread owns the original
-/// sock_fd; `DupFd` is an independent reference whose `shutdown` wakes any
-/// in-flight `recv_framed` on the shared open file description, even after
-/// the I/O thread has closed sock_fd (the integer may already be recycled).
-struct DupFd(std::os::unix::io::RawFd);
-
-impl Drop for DupFd {
-    fn drop(&mut self) {
-        unsafe {
-            libc::shutdown(self.0, libc::SHUT_RDWR);
-        }
-        gnitz_core::close_fd(self.0);
-    }
-}
-
-/// Sole owner of the connection's `sock_fd` from `connect` until the I/O
-/// thread exits, closing it on drop. This covers the setup error paths in
-/// `PyAsyncTransport::new` (handshake/dup failure → early return drops the
-/// guard) and any unwind through `async_io_loop` (e.g. a poisoned
-/// `schema_cache` lock or an `.unwrap()` while resolving futures). Unlike
-/// [`DupFd`] it only closes — it never `shutdown`s, because the
-/// wake-on-shutdown is the Python-side `DupFd`'s job and this fd's owner never
-/// shuts the socket down.
-struct SocketGuard(std::os::unix::io::RawFd);
-
-impl Drop for SocketGuard {
-    fn drop(&mut self) {
-        gnitz_core::close_fd(self.0);
-    }
-}
-
 #[pyclass(name = "AsyncTransport")]
 struct PyAsyncTransport {
     tx: Option<std::sync::mpsc::SyncSender<IoRequest>>,
-    dup_fd: Option<DupFd>,
+    /// dup'd fd of the connection's stream socket. The I/O thread owns the
+    /// transport; the waker's `shutdown` (fired on drop) wakes any in-flight
+    /// `recv_framed` on the shared open file description, even after the
+    /// I/O thread has dropped the transport (the integer may already be
+    /// recycled).
+    waker: Option<gnitz_core::TransportWaker>,
     event_loop: Py<PyAny>,
     client_id: u64,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -2207,23 +2181,19 @@ impl PyAsyncTransport {
         set_result_fn: PyObject,
         set_exception_fn: PyObject,
     ) -> PyResult<Self> {
-        // Own the fd from birth so every early return below closes it via RAII
-        // rather than a manual `close_fd`; on success the guard is moved into
-        // the I/O thread, which closes it when it exits.
-        let sock = SocketGuard(to_py_err(gnitz_core::connect(socket_path))?);
-        let sock_fd = sock.0;
-        // HELLO handshake on the calling thread — captures the negotiated
+        // The transport owns the connection from birth, so every early
+        // return below closes it via RAII; on success it moves into the
+        // I/O thread, which closes it when it exits. Connect + HELLO run
+        // synchronously on the calling thread — captures the negotiated
         // payload limit before the I/O thread starts queueing reads. Drop
         // the GIL across the blocking syscalls so other Python threads
         // can progress if the server is slow to respond.
-        let max_payload_len = to_py_err(py.allow_threads(|| gnitz_core::hello_handshake(sock_fd)))? as usize;
-
-        let raw_dup = unsafe { libc::dup(sock_fd) };
-        if raw_dup < 0 {
-            let err = std::io::Error::last_os_error();
-            return Err(GnitzError::new_err(format!("dup socket fd: {err}")));
-        }
-        let dup_fd = DupFd(raw_dup);
+        let (transport, max_payload_len) = to_py_err(py.allow_threads(|| {
+            let mut t = gnitz_core::ClientTransport::connect(socket_path)?;
+            let limit = gnitz_core::hello_handshake(&mut t)?;
+            Ok::<_, gnitz_core::ProtocolError>((t, limit as usize))
+        }))?;
+        let waker = to_py_err(transport.waker())?;
 
         let seq = TRANSPORT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64;
         let client_id = (std::process::id() as u64) << 32 | seq;
@@ -2235,12 +2205,12 @@ impl PyAsyncTransport {
         let schema_cache: SchemaCache = Arc::new(Mutex::new(LruCache::new(ASYNC_SCHEMA_CACHE_CAP)));
         let cache_ref = Arc::clone(&schema_cache);
         let handle = std::thread::spawn(move || {
-            async_io_loop(sock, max_payload_len, rx, loop_ref, sr_fn, se_fn, cache_ref);
+            async_io_loop(transport, max_payload_len, rx, loop_ref, sr_fn, se_fn, cache_ref);
         });
 
         Ok(PyAsyncTransport {
             tx: Some(tx),
-            dup_fd: Some(dup_fd),
+            waker: Some(waker),
             event_loop,
             client_id,
             thread: Some(handle),
@@ -2314,9 +2284,9 @@ impl PyAsyncTransport {
 
     fn close(&mut self, py: Python<'_>) {
         self.tx.take();
-        // DupFd::drop shuts down + closes the dup'd fd; the shutdown wakes
-        // any in-flight recv_framed on the I/O thread.
-        self.dup_fd.take();
+        // TransportWaker::drop shuts down + closes the dup'd fd; the
+        // shutdown wakes any in-flight recv_framed on the I/O thread.
+        self.waker.take();
         if let Some(h) = self.thread.take() {
             // Release the GIL so the I/O thread can finish any in-progress
             // with_gil block before the join returns.
@@ -2331,10 +2301,10 @@ impl Drop for PyAsyncTransport {
     fn drop(&mut self) {
         // Do NOT join: Drop may be called from GC while holding the GIL, and
         // the I/O thread acquires the GIL to resolve futures — joining would
-        // deadlock. DupFd::drop still fires the shutdown so the I/O thread
-        // can exit promptly on its own.
+        // deadlock. TransportWaker::drop still fires the shutdown so the I/O
+        // thread can exit promptly on its own.
         self.tx.take();
-        self.dup_fd.take();
+        self.waker.take();
     }
 }
 
@@ -2344,7 +2314,7 @@ impl Drop for PyAsyncTransport {
 /// server errors (transport stays up), and `Err(...)` for transport/protocol
 /// failures (caller should tear down the connection).
 fn recv_scan_response(
-    sock_fd: std::os::unix::io::RawFd,
+    transport: &mut gnitz_core::ClientTransport,
     max_payload_len: usize,
     hint: Option<(Arc<Schema>, u16)>,
 ) -> ScanReadResult {
@@ -2352,7 +2322,7 @@ fn recv_scan_response(
     let mut schema_version: u16 = hint.map_or(0, |(_, v)| v);
     let mut data: Option<ZSetBatch> = None;
     let lsn: u64 = loop {
-        let buf = gnitz_core::recv_framed(sock_fd, max_payload_len).map_err(|e| e.to_string())?;
+        let buf = transport.recv_framed(max_payload_len).map_err(|e| e.to_string())?;
         let hint_ref = schema.as_ref().map(|s| (s.as_ref(), schema_version));
         let msg = gnitz_core::parse_response(&buf, hint_ref).map_err(|e| e.to_string())?;
         if msg.status != 0 {
@@ -2400,7 +2370,7 @@ enum LoopResult {
 }
 
 fn async_io_loop(
-    sock: SocketGuard,
+    mut transport: gnitz_core::ClientTransport,
     max_payload_len: usize,
     rx: std::sync::mpsc::Receiver<IoRequest>,
     loop_ref: Py<PyAny>,
@@ -2410,10 +2380,9 @@ fn async_io_loop(
 ) {
     use std::collections::VecDeque;
 
-    // `sock` owns the fd for the whole loop: the two early returns and the
-    // normal `break` all fall through to its drop, which closes it — so an
-    // unwind through this loop cannot leak it either.
-    let sock_fd = sock.0;
+    // `transport` owns the connection for the whole loop: the two early
+    // returns and the normal `break` all fall through to its drop, which
+    // closes it — so an unwind through this loop cannot leak it either.
 
     let mut pending_futures: VecDeque<Py<PyAny>> = VecDeque::with_capacity(IO_BATCH_MAX);
 
@@ -2459,7 +2428,7 @@ fn async_io_loop(
         }
 
         // Send the whole batch as one writev sequence.
-        if let Err(e) = gnitz_core::send_framed_batch(sock_fd, &payloads) {
+        if let Err(e) = transport.send_framed_batch(&payloads) {
             Python::with_gil(|py| {
                 let exc = GnitzError::new_err(e.to_string())
                     .into_pyobject(py)
@@ -2483,7 +2452,7 @@ fn async_io_loop(
             let r: Result<LoopResult, String> = match kind {
                 ResponseKind::Scan { include_hidden } => {
                     let hint = hints[i].take();
-                    match recv_scan_response(sock_fd, max_payload_len, hint) {
+                    match recv_scan_response(&mut transport, max_payload_len, hint) {
                         Ok(Ok((schema, schema_version, batch, lsn))) => Ok(LoopResult::Scan(Box::new(ScanData {
                             schema,
                             schema_version,
@@ -2496,7 +2465,8 @@ fn async_io_loop(
                         Err(e) => Err(e),
                     }
                 }
-                ResponseKind::Push => gnitz_core::recv_framed(sock_fd, max_payload_len)
+                ResponseKind::Push => transport
+                    .recv_framed(max_payload_len)
                     .map_err(|e| e.to_string())
                     .and_then(|buf| gnitz_core::parse_response(&buf, None).map_err(|e| e.to_string()))
                     .map(|m| LoopResult::Push(Box::new(m))),

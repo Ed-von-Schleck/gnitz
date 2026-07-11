@@ -10,7 +10,7 @@ use std::rc::Rc;
 /// Equals the HELLO payload size in bytes; any first frame larger than
 /// this is rejected before allocation. The handshake elevates the
 /// limit to the negotiated value via `Reactor::set_max_payload_len`.
-pub(super) const HELLO_PRE_HANDSHAKE_LEN: usize = gnitz_wire::HELLO_PAYLOAD_LEN as usize;
+pub(crate) const HELLO_PRE_HANDSHAKE_LEN: usize = gnitz_wire::HELLO_PAYLOAD_LEN as usize;
 
 /// Lower/upper bounds on the global inbound-memory cap (see
 /// `resolve_inbound_cap`). The floor guarantees even a tiny memory budget
@@ -49,7 +49,7 @@ pub struct RecvBuf {
 impl RecvBuf {
     /// Take ownership of a freshly-malloc'd `len`-byte payload buffer and charge
     /// its `frame_weight` to `counter`. The matching refund is in `Drop`.
-    pub(super) fn new(ptr: *mut u8, len: usize, counter: Rc<Cell<usize>>) -> Self {
+    pub(crate) fn new(ptr: *mut u8, len: usize, counter: Rc<Cell<usize>>) -> Self {
         counter.set(counter.get() + frame_weight(len));
         RecvBuf { ptr, len, counter }
     }
@@ -74,27 +74,27 @@ pub(super) enum RecvPhase {
     Payload { buf: RecvBuf, pos: usize },
 }
 
-pub(super) enum RecvAdvance {
+pub(crate) enum RecvAdvance {
     NeedMore,
     HeaderDone,
     MessageDone,
     Disconnect,
 }
 
-pub(super) struct RecvState {
+pub(crate) struct RecvState {
     pub(super) hdr_buf: [u8; 4],
     pub(super) phase: RecvPhase,
 }
 
 impl RecvState {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         RecvState {
             hdr_buf: [0; 4],
             phase: RecvPhase::Header { pos: 0 },
         }
     }
 
-    pub(super) fn advance(&mut self, bytes_received: usize) -> RecvAdvance {
+    pub(crate) fn advance(&mut self, bytes_received: usize) -> RecvAdvance {
         match &mut self.phase {
             RecvPhase::Header { pos } => {
                 *pos += bytes_received;
@@ -117,7 +117,7 @@ impl RecvState {
         }
     }
 
-    pub(super) fn remaining(&mut self) -> (*mut u8, u32) {
+    pub(crate) fn remaining(&mut self) -> (*mut u8, u32) {
         match &mut self.phase {
             RecvPhase::Header { pos } => {
                 let ptr = unsafe { self.hdr_buf.as_mut_ptr().add(*pos) };
@@ -130,15 +130,15 @@ impl RecvState {
         }
     }
 
-    pub(super) fn payload_len(&self) -> usize {
+    pub(crate) fn payload_len(&self) -> usize {
         u32::from_le_bytes(self.hdr_buf) as usize
     }
 
-    pub(super) fn start_payload(&mut self, buf: RecvBuf) {
+    pub(crate) fn start_payload(&mut self, buf: RecvBuf) {
         self.phase = RecvPhase::Payload { buf, pos: 0 };
     }
 
-    pub(super) fn take_message(&mut self) -> RecvBuf {
+    pub(crate) fn take_message(&mut self) -> RecvBuf {
         match std::mem::replace(&mut self.phase, RecvPhase::Header { pos: 0 }) {
             RecvPhase::Payload { buf, .. } => buf,
             _ => unreachable!("take_message called outside Payload phase"),
@@ -172,7 +172,7 @@ pub(super) struct Conn {
 }
 
 impl Conn {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Conn {
             recv_state: RecvState::new(),
             recv_armed: false,

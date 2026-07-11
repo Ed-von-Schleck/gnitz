@@ -1,4 +1,3 @@
-use std::os::unix::io::RawFd;
 use std::sync::OnceLock;
 
 use super::codec::{batch_to_schema, schema_to_batch};
@@ -8,7 +7,7 @@ use super::header::{
     STATUS_OK, STATUS_SCHEMA_MISMATCH,
 };
 use super::header::{IPC_CONTROL_TID, WAL_BLOCK_HEADER_SIZE};
-use super::transport::{recv_framed, send_framed};
+use super::transport::ClientTransport;
 use super::types::{meta_schema, ColData, PkColumn, PkTuple, Schema, ZSetBatch};
 use super::wal_block::{decode_wal_block, encode_wal_block, VerifyChecksum};
 use crate::types::schema_from_wire_cols;
@@ -282,7 +281,7 @@ pub fn encode_ddl_txn(client_id: u64, families: &[(u64, &Schema, ZSetBatch)]) ->
 
 #[allow(clippy::too_many_arguments)]
 pub fn send_message(
-    sock_fd: RawFd,
+    t: &mut ClientTransport,
     target_id: u64,
     client_id: u64,
     flags: u64,
@@ -292,7 +291,7 @@ pub fn send_message(
     data_batch: Option<&ZSetBatch>,
 ) -> Result<(), ProtocolError> {
     let payload = encode_message(target_id, client_id, flags, seek_pk, seek_col_idx, schema, data_batch)?;
-    send_framed(sock_fd, &payload)
+    t.send_framed(&payload)
 }
 
 /// Control-only frame carrying an **explicit, arbitrary-length** `seek_pk_extra`
@@ -304,7 +303,7 @@ pub fn send_message(
 /// `encode_control_block`, whose BLOB column is already arbitrary-length.
 /// `seek_pk` is fixed at 0 (unused by the range seek). No schema/data block.
 pub fn send_message_with_extra(
-    sock_fd: RawFd,
+    t: &mut ClientTransport,
     target_id: u64,
     client_id: u64,
     flags: u64,
@@ -321,7 +320,7 @@ pub fn send_message_with_extra(
         request_id: 0,
     };
     let payload = encode_control_block(&ctrl_hdr, "", seek_pk_extra)?;
-    send_framed(sock_fd, &payload)
+    t.send_framed(&payload)
 }
 
 /// Like `send_message` but omits the schema block from the wire frame.
@@ -330,7 +329,7 @@ pub fn send_message_with_extra(
 /// `flags`). Used by warm-cache PUSH paths where the server already knows the
 /// schema (version embedded in `flags` bits 24-39).
 pub fn send_message_noschema(
-    sock_fd: RawFd,
+    t: &mut ClientTransport,
     target_id: u64,
     client_id: u64,
     flags: u64,
@@ -361,7 +360,7 @@ pub fn send_message_noschema(
     if let Some(db) = data_block {
         out.extend_from_slice(&db);
     }
-    send_framed(sock_fd, &out)
+    t.send_framed(&out)
 }
 
 /// Parse a wire payload (without 4-byte frame header) into a `Message`.
@@ -481,11 +480,11 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
 }
 
 pub fn recv_message(
-    sock_fd: RawFd,
+    t: &mut ClientTransport,
     schema_hint: Option<(&Schema, u16)>,
     max_payload_len: usize,
 ) -> Result<Message, ProtocolError> {
-    let buf = recv_framed(sock_fd, max_payload_len)?;
+    let buf = t.recv_framed(max_payload_len)?;
     parse_response(&buf, schema_hint)
 }
 
@@ -503,6 +502,12 @@ mod tests {
             libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr());
         }
         (fds[0], fds[1])
+    }
+
+    /// Both ends of a socketpair as transports; drop closes the fds.
+    fn make_transport_pair() -> (ClientTransport, ClientTransport) {
+        let (a, b) = make_socketpair();
+        (ClientTransport::from_unix_fd(a), ClientTransport::from_unix_fd(b))
     }
 
     // ── control block roundtrip ─────────────────────────────────────────────
@@ -589,9 +594,9 @@ mod tests {
         };
 
         let empty_batch = ZSetBatch::new(&schema);
-        let (a, b) = make_socketpair();
+        let (mut a, mut b) = make_transport_pair();
         send_message(
-            a,
+            &mut a,
             0,
             0,
             FLAG_PUSH,
@@ -601,15 +606,11 @@ mod tests {
             Some(&empty_batch),
         )
         .unwrap();
-        let msg = recv_message(b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
+        let msg = recv_message(&mut b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
 
         // Schema was sent, data was not (empty batch)
         assert!(msg.schema_batch.is_some());
         assert!(msg.data_batch.is_none());
-        unsafe {
-            libc::close(a);
-            libc::close(b);
-        }
     }
 
     #[test]
@@ -651,9 +652,9 @@ mod tests {
             ],
         };
 
-        let (a, b) = make_socketpair();
-        send_message(a, 0, 0, FLAG_PUSH, &PkTuple::EMPTY, 0, Some(&schema), Some(&batch)).unwrap();
-        let msg = recv_message(b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
+        let (mut a, mut b) = make_transport_pair();
+        send_message(&mut a, 0, 0, FLAG_PUSH, &PkTuple::EMPTY, 0, Some(&schema), Some(&batch)).unwrap();
+        let msg = recv_message(&mut b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
 
         let data = msg.data_batch.unwrap();
         assert_eq!(data.pks, pks);
@@ -666,11 +667,6 @@ mod tests {
         match &data.columns[2] {
             ColData::Fixed(got) => assert_eq!(got, &f64_bytes),
             _ => panic!("expected Fixed at col 2"),
-        }
-
-        unsafe {
-            libc::close(a);
-            libc::close(b);
         }
     }
 
@@ -713,9 +709,9 @@ mod tests {
             ],
         };
 
-        let (a, b) = make_socketpair();
-        send_message(a, 0, 0, FLAG_PUSH, &PkTuple::EMPTY, 0, Some(&schema), Some(&batch)).unwrap();
-        let msg = recv_message(b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
+        let (mut a, mut b) = make_transport_pair();
+        send_message(&mut a, 0, 0, FLAG_PUSH, &PkTuple::EMPTY, 0, Some(&schema), Some(&batch)).unwrap();
+        let msg = recv_message(&mut b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
 
         let data = msg.data_batch.unwrap();
         assert_eq!(data.nulls, nulls);
@@ -728,25 +724,16 @@ mod tests {
             ColData::Strings(got) => assert_eq!(got, &col2),
             _ => panic!("expected Strings at col 2"),
         }
-
-        unsafe {
-            libc::close(a);
-            libc::close(b);
-        }
     }
 
     #[test]
     fn test_message_no_schema_no_data() {
         // Control-only message (scan/alloc style)
-        let (a, b) = make_socketpair();
-        send_message(a, 0, 0, FLAG_PUSH, &PkTuple::EMPTY, 0, None, None).unwrap();
-        let msg = recv_message(b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
+        let (mut a, mut b) = make_transport_pair();
+        send_message(&mut a, 0, 0, FLAG_PUSH, &PkTuple::EMPTY, 0, None, None).unwrap();
+        let msg = recv_message(&mut b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
         assert!(msg.schema_batch.is_none());
         assert!(msg.data_batch.is_none());
-        unsafe {
-            libc::close(a);
-            libc::close(b);
-        }
     }
 
     #[test]
@@ -755,9 +742,9 @@ mod tests {
         // fields into the flat Message struct: target_id, client_id, seek_pk,
         // seek_col_idx.
         let seek_pk = 0xAAAA_BBBB_CCCC_DDDD_u128 | (0x1111_2222_3333_4444_u128 << 64);
-        let (a, b) = make_socketpair();
+        let (mut a, mut b) = make_transport_pair();
         send_message(
-            a,
+            &mut a,
             0xDEAD_BEEF_1234_5678, // target_id
             0xCAFE_BABE_0000_0001, // client_id
             FLAG_PUSH,             // flags
@@ -767,34 +754,26 @@ mod tests {
             None,
         )
         .unwrap();
-        let msg = recv_message(b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
+        let msg = recv_message(&mut b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
         assert_eq!(msg.target_id, 0xDEAD_BEEF_1234_5678);
         assert_eq!(msg.client_id, 0xCAFE_BABE_0000_0001);
         assert_eq!(msg.seek_pk, seek_pk);
         assert_eq!(msg.seek_col_idx, 7);
-        unsafe {
-            libc::close(a);
-            libc::close(b);
-        }
     }
 
     #[test]
     fn test_message_error_response() {
         // STATUS_ERROR response: schema and data should be None; error_text populated
-        let (a, b) = make_socketpair();
+        let (mut a, mut b) = make_transport_pair();
         let err_hdr = Header {
             status: STATUS_ERROR,
             ..Header::default()
         };
         let encoded = encode_control_block(&err_hdr, "something broke", &[]).unwrap();
-        crate::protocol::transport::send_framed(a, &encoded).unwrap();
-        let msg = recv_message(b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
+        a.send_framed(&encoded).unwrap();
+        let msg = recv_message(&mut b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
         assert_eq!(msg.status, STATUS_ERROR);
         assert!(msg.error_text.is_some());
-        unsafe {
-            libc::close(a);
-            libc::close(b);
-        }
     }
 
     // ── encode_message + parse_response roundtrips (no sockets) ─────────
@@ -910,13 +889,13 @@ mod tests {
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(val_bytes)],
         };
 
-        let (a, b) = make_socketpair();
+        let (mut a, mut b) = make_transport_pair();
         // Embed version=1 in flags; no schema block in the frame.
         let flags = wire_flags_set_schema_version(0, 1);
-        send_message_noschema(a, 42, 0, flags, &schema, &batch).unwrap();
+        send_message_noschema(&mut a, 42, 0, flags, &schema, &batch).unwrap();
 
         // Parse with a matching hint (same schema, version 1).
-        let msg = recv_message(b, Some((&schema, 1)), gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
+        let msg = recv_message(&mut b, Some((&schema, 1)), gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
 
         // Fix 1: schema must be None — the hint was not physically in the frame.
         assert!(msg.schema.is_none(), "schema must be None for hint-only frame");
@@ -924,10 +903,5 @@ mod tests {
         let data = msg.data_batch.expect("data_batch must be Some");
         assert_eq!(data.pks, vec![1u128]);
         assert_eq!(data.weights, vec![1i64]);
-
-        unsafe {
-            libc::close(a);
-            libc::close(b);
-        }
     }
 }

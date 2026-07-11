@@ -15,6 +15,11 @@ libc = "0.2"
 io-uring = "0.7"
 slab = "0.4"
 rustc-hash = "2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# default-features = false pins the ring backend explicitly: rcgen's default
+# crypto backend must NOT be aws-lc-rs (it needs a C/cmake toolchain and would
+# break the "no C++ toolchain" promise). "pem" is required for Certificate::pem().
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 
 [dev-dependencies]
 tempfile = "3"

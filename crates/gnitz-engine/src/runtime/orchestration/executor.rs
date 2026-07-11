@@ -22,6 +22,9 @@ use crate::storage::batch_pool::PooledSendBuf;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::guard_panic;
+use crate::foundation::posix_io;
+use crate::runtime::tls::TlsShared;
+
 use crate::catalog::{
     CatalogEngine, FIRST_USER_TABLE_ID, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB_ID,
     SEQ_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID,
@@ -175,7 +178,14 @@ impl Shared {
 pub struct ServerExecutor;
 
 impl ServerExecutor {
-    pub fn run(catalog: *mut CatalogEngine, dispatcher: *mut MasterDispatcher, server_fd: i32) -> i32 {
+    /// `tls` is the optional TLS listener bootstrap from `server_main`:
+    /// the bound TCP listen fd and the rustls server configuration.
+    pub fn run(
+        catalog: *mut CatalogEngine,
+        dispatcher: *mut MasterDispatcher,
+        server_fd: i32,
+        tls: Option<(i32, std::sync::Arc<rustls::ServerConfig>)>,
+    ) -> i32 {
         let reactor = match Reactor::new(256) {
             Ok(r) => Rc::new(r),
             Err(e) => {
@@ -191,7 +201,14 @@ impl ServerExecutor {
         // the reactor-parked CREATE-VIEW backfill can drive a synchronous
         // collect (the reactor's `OnceCell` slot is stable for its lifetime).
         unsafe { &mut *dispatcher }.set_w2m_receiver_ptr(reactor.w2m_receiver());
-        reactor.attach_server_fd(server_fd);
+        reactor.attach_listener(server_fd);
+        if let Some((tls_fd, _)) = &tls {
+            reactor.attach_listener(*tls_fd);
+        }
+        let accept_ctx = AcceptCtx {
+            unix_fd: server_fd,
+            tls,
+        };
 
         let sal_writer_excl = Rc::new(AsyncMutex::new(()));
         // Seed the zone-LSN allocator above every table's current_lsn so each
@@ -246,7 +263,7 @@ impl ServerExecutor {
         install_shutdown_signal_handlers();
 
         reactor.spawn(committer::run(committer_rx, committer_shared));
-        reactor.spawn(accept_loop(Rc::clone(&shared)));
+        reactor.spawn(accept_loop(Rc::clone(&shared), accept_ctx));
         reactor.spawn(tick_loop_async(Rc::clone(&shared), tick_rx));
         reactor.spawn(relay_loop(Rc::clone(&shared), relay_rx));
         reactor.spawn(watchdog(Rc::clone(&shared)));
@@ -260,16 +277,50 @@ impl ServerExecutor {
 // Accept loop
 // ---------------------------------------------------------------------------
 
-async fn accept_loop(shared: Rc<Shared>) {
+/// Accept-routing inputs: which listener fd is which, plus the rustls
+/// config for TLS-accepted connections. Carried explicitly — the reactor
+/// no longer records a listener fd (the udata round-trip replaced it).
+struct AcceptCtx {
+    unix_fd: i32,
+    tls: Option<(i32, std::sync::Arc<rustls::ServerConfig>)>,
+}
+
+async fn accept_loop(shared: Rc<Shared>, ctx: AcceptCtx) {
     loop {
-        let fd = shared.reactor.accept().await;
+        let (fd, listener) = shared.reactor.accept().await;
         if fd < 0 {
             continue;
         }
-        shared.reactor.register_conn(fd);
-        let peer = Peer::unix(fd, Rc::clone(&shared.reactor));
-        let s = Rc::clone(&shared);
-        shared.reactor.spawn(connection_loop(peer, s));
+        if listener == ctx.unix_fd {
+            shared.reactor.register_conn(fd);
+            let peer = Peer::unix(fd, Rc::clone(&shared.reactor));
+            let s = Rc::clone(&shared);
+            shared.reactor.spawn(connection_loop(peer, s));
+            continue;
+        }
+        match &ctx.tls {
+            Some((tls_fd, cfg)) if listener == *tls_fd => {
+                posix_io::set_nodelay(fd);
+                posix_io::set_keepalive(fd);
+                match TlsShared::start(Rc::clone(&shared.reactor), fd, std::sync::Arc::clone(cfg)) {
+                    Ok(conn) => {
+                        let peer = Peer::tls(conn);
+                        let s = Rc::clone(&shared);
+                        shared.reactor.spawn(connection_loop(peer, s));
+                    }
+                    Err(e) => {
+                        gnitz_warn!("tls: session init failed for fd={fd}: {e}");
+                        // SAFETY: freshly-accepted fd we own; no SQE references it.
+                        unsafe { libc::close(fd) };
+                    }
+                }
+            }
+            _ => {
+                gnitz_warn!("accept from unknown listener fd={listener}; closing conn fd={fd}");
+                // SAFETY: freshly-accepted fd we own; no SQE references it.
+                unsafe { libc::close(fd) };
+            }
+        }
     }
 }
 

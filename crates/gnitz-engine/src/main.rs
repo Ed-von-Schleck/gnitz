@@ -30,9 +30,21 @@ Arguments:
   <socket_path>   Path for the Unix domain socket to listen on
 
 Options:
-  --workers=N        Number of worker processes (default: 1, single-process)
-  --log-level=LEVEL  Set log verbosity: quiet, normal, verbose (default: quiet)
-  --help, -h         Show this help message and exit
+  --workers=N          Number of worker processes (default: 1, single-process)
+  --log-level=LEVEL    Set log verbosity: quiet, normal, verbose (default: quiet)
+  --tls-listen=IP:PORT Additionally listen for TLS 1.3 clients on this TCP
+                       address (port 0 = ephemeral). The bound address is
+                       written to <data_dir>/tls_endpoint.
+                       WARNING: the TLS listener is fully UNAUTHENTICATED —
+                       anyone who can connect gets full DDL/DML/scan access.
+                       TLS provides confidentiality and server authentication
+                       only; bind loopback unless the network is trusted.
+  --tls-cert=PEM       Server certificate chain (requires --tls-key and
+                       --tls-listen). Without cert+key a self-signed dev
+                       certificate for localhost/127.0.0.1/::1 is minted and
+                       its public PEM written to <data_dir>/tls_dev_cert.pem.
+  --tls-key=PEM        Server private key (see --tls-cert)
+  --help, -h           Show this help message and exit
 
 Environment:
   GNITZ_LOG_LEVEL          Same as --log-level; CLI flag takes precedence
@@ -73,6 +85,9 @@ fn main() {
     let mut data_dir = String::new();
     let mut socket_path = String::new();
     let mut num_workers: u32 = 1;
+    let mut tls_listen: Option<std::net::SocketAddr> = None;
+    let mut tls_cert: Option<String> = None;
+    let mut tls_key: Option<String> = None;
     let mut pos = 0;
 
     let mut i = 1;
@@ -91,6 +106,18 @@ fn main() {
                     process::exit(1);
                 }
             }
+        } else if let Some(val) = arg.strip_prefix("--tls-listen=") {
+            match val.parse::<std::net::SocketAddr>() {
+                Ok(a) => tls_listen = Some(a),
+                Err(_) => {
+                    eprintln!("Error: invalid --tls-listen address {val:?} (expected IP:PORT)");
+                    process::exit(1);
+                }
+            }
+        } else if let Some(val) = arg.strip_prefix("--tls-cert=") {
+            tls_cert = Some(val.to_string());
+        } else if let Some(val) = arg.strip_prefix("--tls-key=") {
+            tls_key = Some(val.to_string());
         } else if pos == 0 {
             data_dir = arg.clone();
             pos += 1;
@@ -107,8 +134,25 @@ fn main() {
         process::exit(1);
     }
 
+    let tls_cli = match (tls_listen, tls_cert, tls_key) {
+        (None, None, None) => None,
+        (None, _, _) => {
+            eprintln!("Error: --tls-cert/--tls-key require --tls-listen");
+            process::exit(1);
+        }
+        (Some(listen), None, None) => Some(runtime::TlsCli { listen, cert_key: None }),
+        (Some(listen), Some(cert), Some(key)) => Some(runtime::TlsCli {
+            listen,
+            cert_key: Some((cert, key)),
+        }),
+        (Some(_), _, _) => {
+            eprintln!("Error: --tls-cert and --tls-key must be given together");
+            process::exit(1);
+        }
+    };
+
     foundation::log::init(level, b"M");
-    let rc = runtime::server_main(&data_dir, &socket_path, num_workers, level);
+    let rc = runtime::server_main(&data_dir, &socket_path, num_workers, level, tls_cli);
     process::exit(rc);
 }
 

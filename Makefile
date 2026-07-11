@@ -20,7 +20,7 @@ K          ?=                                # pytest -k expression
 
 .PHONY: all help \
         test rust-engine-test fmt fmt-check clippy check verify \
-        server release-server pyext pyext-release e2e e2e-release release-test \
+        server release-server pyext pyext-release e2e e2e-tls e2e-release release-test \
         clean distclean \
         bench bench-full bench-sweep bench-perf bench-perf-dwarf bench-profile profiling-server
 
@@ -34,8 +34,8 @@ help: ## Show this help
 # Tests & quality gates
 # ---------------------------------------------------------------------------
 
-test: server ## Run all Rust workspace tests incl. gnitz-sql integration (gnitz-py excluded — pyo3 extension can't link a test harness)
-	cd crates && cargo test --workspace --exclude gnitz-py --features gnitz-sql/integration $(T)
+test: server ## Run all Rust workspace tests incl. gnitz-sql/gnitz-core integration (gnitz-py excluded — pyo3 extension can't link a test harness)
+	cd crates && cargo test --workspace --exclude gnitz-py --features gnitz-sql/integration --features gnitz-core/integration $(T)
 
 rust-engine-test: ## Run only the gnitz-engine tests (faster inner loop)
 	cd crates && cargo test -p gnitz-engine $(T)
@@ -47,7 +47,7 @@ fmt-check: ## Check formatting without writing (CI gate)
 	cd crates && cargo fmt --all --check
 
 clippy: ## Lint the workspace incl. integration tests; warnings are errors
-	cd crates && cargo clippy --workspace --all-targets --features gnitz-sql/integration -- -D warnings
+	cd crates && cargo clippy --workspace --all-targets --features gnitz-sql/integration --features gnitz-core/integration -- -D warnings
 
 check: ## Fast type-check without producing binaries
 	cd crates && cargo check --workspace
@@ -75,6 +75,11 @@ pyext-release: ## Build & install the Python extension (release) into the uv ven
 e2e: WORKERS = 4
 e2e: server pyext ## Run the Python E2E suite (debug server, W=4; override WORKERS=/K=)
 	cd crates/gnitz-py && GNITZ_WORKERS=$(WORKERS) uv run pytest tests/ -v $(if $(K),-k '$(K)')
+
+e2e-tls: WORKERS = 4
+e2e-tls: server pyext ## Run the full E2E suite over TLS (on-demand transport shakeout)
+	cd crates/gnitz-py && GNITZ_TRANSPORT=tls GNITZ_WORKERS=$(WORKERS) \
+		uv run pytest tests/ -v $(if $(K),-k '$(K)')
 
 e2e-release: WORKERS = 4
 e2e-release: release-server pyext ## Run the E2E suite against the release server

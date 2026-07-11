@@ -14,11 +14,12 @@ mod bootstrap;
 mod orchestration;
 mod protocol;
 mod reactor;
+mod tls;
 
 use orchestration::{committer, executor, lsn, master, peer, worker};
 use protocol::{sal, w2m, w2m_ring, wire};
 
-pub use bootstrap::server_main;
+pub use bootstrap::{server_main, TlsCli};
 pub(crate) use protocol::sal::MAX_WORKERS;
 
 #[cfg(test)]

@@ -1,13 +1,12 @@
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use crate::error::ClientError;
 use crate::protocol::{
-    connect as proto_connect, encode_ddl_txn, hello_handshake, recv_message, send_framed, send_message,
-    send_message_noschema, send_message_with_extra, wire_flags_get_index_version, wire_flags_get_schema_version,
-    wire_flags_set_conflict_mode, wire_flags_set_index_version, wire_flags_set_schema_version, Message, PkTuple,
-    Schema, WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE,
+    encode_ddl_txn, hello_handshake, recv_message, send_message, send_message_noschema, send_message_with_extra,
+    wire_flags_get_index_version, wire_flags_get_schema_version, wire_flags_set_conflict_mode,
+    wire_flags_set_index_version, wire_flags_set_schema_version, ClientTransport, Message, PkTuple, Schema,
+    WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE,
     FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_GET_INDICES, FLAG_PUSH, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
     FLAG_SEEK_BY_INDEX_RANGE, STATUS_ERROR, STATUS_NO_INDEX, STATUS_SCHEMA_MISMATCH,
 };
@@ -55,7 +54,7 @@ fn check_response(msg: Message) -> Result<Message, ClientError> {
 }
 
 pub struct Connection {
-    sock: OwnedFd,
+    transport: ClientTransport,
     pub client_id: u64,
     /// Server-negotiated per-connection frame payload ceiling. Set during
     /// `connect()` from the HELLO ACK; subsequent `recv_message` calls
@@ -65,23 +64,23 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub fn connect(socket_path: &str) -> Result<Self, ClientError> {
-        let fd = proto_connect(socket_path)?;
-        // SAFETY: proto_connect returns a valid, exclusively-owned file descriptor.
-        let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+    /// `target` is an AF_UNIX socket path or a `tls://HOST:PORT[?PARAM]`
+    /// address (see `ClientTransport::connect`).
+    pub fn connect(target: &str) -> Result<Self, ClientError> {
+        let mut transport = ClientTransport::connect(target)?;
         // Run the HELLO handshake before any data flows. The server
         // accepts the first frame at an 8-byte limit, so this must
         // happen before `send_message` would emit a control block.
-        let limit = hello_handshake(sock.as_raw_fd())?;
+        let limit = hello_handshake(&mut transport)?;
         Ok(Connection {
-            sock,
+            transport,
             client_id: new_client_id(),
             max_payload_len: limit as usize,
         })
     }
 
     pub fn close(self) {
-        // OwnedFd is dropped here, which closes the fd.
+        // The transport is dropped here, which closes the connection.
     }
 
     pub fn alloc_table_id(&mut self) -> Result<u64, ClientError> {
@@ -149,8 +148,8 @@ impl Connection {
             batch.validate(schema).map_err(ClientError::ServerError)?;
         }
         let payload = encode_ddl_txn(self.client_id, families)?;
-        send_framed(self.sock.as_raw_fd(), &payload)?;
-        let msg = check_response(recv_message(self.sock.as_raw_fd(), None, self.max_payload_len)?)?;
+        self.transport.send_framed(&payload)?;
+        let msg = check_response(recv_message(&mut self.transport, None, self.max_payload_len)?)?;
         Ok(msg.seek_pk as u64)
     }
 
@@ -160,7 +159,7 @@ impl Connection {
         // Send the scan request then collect streaming worker frames
         // (each tagged FLAG_CONTINUATION) until the terminal frame arrives.
         send_message(
-            self.sock.as_raw_fd(),
+            &mut self.transport,
             target_id,
             self.client_id,
             flags,
@@ -249,7 +248,7 @@ impl Connection {
     ) -> Result<(Option<ZSetBatch>, u8), ClientError> {
         let flags = wire_flags_set_index_version(FLAG_GET_INDICES, cached_epoch);
         send_message(
-            self.sock.as_raw_fd(),
+            &mut self.transport,
             table_id,
             self.client_id,
             flags,
@@ -258,7 +257,7 @@ impl Connection {
             None,
             None,
         )?;
-        let msg = check_response(recv_message(self.sock.as_raw_fd(), None, self.max_payload_len)?)?;
+        let msg = check_response(recv_message(&mut self.transport, None, self.max_payload_len)?)?;
         Ok((msg.data_batch, wire_flags_get_index_version(msg.flags)))
     }
 
@@ -273,7 +272,7 @@ impl Connection {
             // `get` (not `peek`) so a frequently-accessed schema refreshes its
             // LRU recency and isn't evicted under memory pressure.
             let hint = cache.get(&target_id).map(|(s, v)| (s.as_ref(), *v));
-            recv_message(self.sock.as_raw_fd(), hint, self.max_payload_len)?
+            recv_message(&mut self.transport, hint, self.max_payload_len)?
         };
         // schema_batch is Some only when the schema block was physically in the frame;
         // schema is always Some when schema_batch is (invariant in parse_response).
@@ -294,7 +293,7 @@ impl Connection {
         data: Option<&ZSetBatch>,
     ) -> Result<Message, ClientError> {
         send_message(
-            self.sock.as_raw_fd(),
+            &mut self.transport,
             target_id,
             self.client_id,
             flags,
@@ -304,7 +303,7 @@ impl Connection {
             data,
         )?;
         // Alloc roundtrips carry no schema blocks; recv_message without a hint is sufficient.
-        let msg = recv_message(self.sock.as_raw_fd(), None, self.max_payload_len)?;
+        let msg = recv_message(&mut self.transport, None, self.max_payload_len)?;
         check_response(msg)
     }
 
@@ -342,11 +341,11 @@ impl Connection {
         if let Some(cached_version) = warm_version {
             // Warm path: omit schema block, embed cached version.
             let flags = wire_flags_set_schema_version(base_flags, cached_version);
-            send_message_noschema(self.sock.as_raw_fd(), target_id, self.client_id, flags, schema, batch)?;
+            send_message_noschema(&mut self.transport, target_id, self.client_id, flags, schema, batch)?;
         } else {
             // Cold path: include schema block, version = 0.
             send_message(
-                self.sock.as_raw_fd(),
+                &mut self.transport,
                 target_id,
                 self.client_id,
                 base_flags,
@@ -361,7 +360,7 @@ impl Connection {
                 // Stale cache: evict and retry with full schema.
                 cache.pop(&target_id);
                 send_message(
-                    self.sock.as_raw_fd(),
+                    &mut self.transport,
                     target_id,
                     self.client_id,
                     base_flags,
@@ -410,7 +409,7 @@ impl Connection {
         let pk = PkTuple::from_bytes(&buf[..key_vals.len() * 16]);
         let seek_col_idx = gnitz_wire::pack_pk_cols(col_indices);
         send_message(
-            self.sock.as_raw_fd(),
+            &mut self.transport,
             table_id,
             self.client_id,
             flags,
@@ -439,7 +438,7 @@ impl Connection {
         let flags = wire_flags_set_schema_version(FLAG_SEEK_BY_INDEX_RANGE, cached_version);
         let seek_col_idx = gnitz_wire::pack_pk_cols(col_indices);
         send_message_with_extra(
-            self.sock.as_raw_fd(),
+            &mut self.transport,
             table_id,
             self.client_id,
             flags,
@@ -458,16 +457,7 @@ impl Connection {
     ) -> Result<Message, ClientError> {
         let cached_version = cache.peek(&target_id).map(|(_, v)| *v).unwrap_or(0);
         let flags = wire_flags_set_schema_version(FLAG_SEEK, cached_version);
-        send_message(
-            self.sock.as_raw_fd(),
-            target_id,
-            self.client_id,
-            flags,
-            pk,
-            0,
-            None,
-            None,
-        )?;
+        send_message(&mut self.transport, target_id, self.client_id, flags, pk, 0, None, None)?;
         let msg = self.recv_message_cached_inner(target_id, cache)?;
         check_response(msg)
     }

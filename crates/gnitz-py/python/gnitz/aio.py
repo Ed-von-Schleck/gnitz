@@ -8,6 +8,16 @@ Usage::
         lsn = await conn.push(table_id, batch)
         result = await conn.scan(table_id)
 
+The target may also be a TLS address: ``tls://HOST:PORT`` with an optional
+single param — ``?insecure`` (skip certificate verification; dev/test) or
+``?ca=PATH`` (PEM root override). Anything without the ``tls://`` prefix is
+an AF_UNIX socket path.
+
+Known limitation: connect + HELLO run synchronously on the calling
+(asyncio-loop) thread, so a ``tls://`` connect to a slow or unreachable
+remote host blocks the loop for up to the 10 s connect timeout. Harmless
+for loopback.
+
 Pipeline (batch many pushes, one round-trip)::
 
     async with conn.pipeline() as pipe:

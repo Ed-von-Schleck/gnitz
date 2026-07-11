@@ -65,13 +65,13 @@ impl Drop for TimerFuture {
             // and without the cancel each one would leave an armed Timeout,
             // its waker entry, and its Timespec box behind for the full
             // window. The cancel's own CQE lands on the no-op
-            // KIND_TIMEOUT_CANCEL sink; the Timeout's CQE (-ECANCELED) lands
+            // KIND_CANCEL_SINK; the Timeout's CQE (-ECANCELED) lands
             // on KIND_TIMEOUT, whose handler finds no waker entry and only
             // releases the Timespec.
             self.inner
                 .ring
                 .borrow_mut()
-                .prep_async_cancel(udata(KIND_TIMEOUT, id), udata(KIND_TIMEOUT_CANCEL, 0));
+                .prep_async_cancel(udata(KIND_TIMEOUT, id), udata(KIND_CANCEL_SINK, 0));
         }
     }
 }
@@ -246,10 +246,10 @@ pub struct AcceptFuture {
 }
 
 impl Future for AcceptFuture {
-    type Output = i32;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<i32> {
-        if let Some(fd) = self.inner.accept_queue.borrow_mut().pop_front() {
-            return Poll::Ready(fd);
+    type Output = (i32, i32);
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<(i32, i32)> {
+        if let Some(pair) = self.inner.accept_queue.borrow_mut().pop_front() {
+            return Poll::Ready(pair);
         }
         *self.inner.accept_waker.borrow_mut() = Some(cx.waker().clone());
         Poll::Pending
@@ -306,6 +306,10 @@ impl Drop for RecvFuture {
 pub(super) enum SendAlive {
     Pooled(Rc<crate::storage::batch_pool::PooledSendBuf>),
     Slot(Rc<W2mSlot>),
+    /// TLS ciphertext (`Reactor::send_raw`). `Rc`-wrapped so the per-chunk
+    /// keep-alive clone in `send_buf_inner` stays O(1) — an owned `Vec`
+    /// would deep-copy the whole buffer once per partial-write chunk.
+    RcVec(Rc<Vec<u8>>),
     /// The backing memory lives `'static` (e.g. the precomputed HELLO
     /// ACK), so no liveness tracking is required — the kernel pointer
     /// remains valid for the lifetime of the process.
@@ -320,6 +324,7 @@ impl Clone for SendAlive {
         match self {
             SendAlive::Pooled(rc) => SendAlive::Pooled(Rc::clone(rc)),
             SendAlive::Slot(rc) => SendAlive::Slot(Rc::clone(rc)),
+            SendAlive::RcVec(rc) => SendAlive::RcVec(Rc::clone(rc)),
             SendAlive::Static => SendAlive::Static,
         }
     }
@@ -371,6 +376,62 @@ impl Drop for SendFuture {
             self.inner.send_wakers.borrow_mut().remove(&self.send_id);
             self.inner.cancelled_sends.borrow_mut().insert(self.send_id);
         }
+    }
+}
+
+/// One-shot raw recv (`Reactor::recv_raw`): owns the caller's buffer while
+/// the kernel writes into it; resolves to `(buffer, byte_count)` so the
+/// caller reuses one allocation forever. Cancellation mirrors `SendFuture`
+/// (not `TimerFuture`, which parks no buffer): because this future both
+/// parks a result and owns memory the kernel is writing into, its `Drop`
+/// moves the in-flight `Vec` into `raw_recv_buffers_in_flight` so a late
+/// kernel write lands in live memory — the buffer's presence there is also
+/// what tells the late `KIND_RAW_RECV` handler to discard the orphaned
+/// result. It also submits an `AsyncCancel` (like `TimerFuture`) so an
+/// idle connection's parked recv is reclaimed promptly rather than at
+/// socket death.
+pub struct RawRecvFuture {
+    pub(super) id: u64,
+    /// `Some` until resolved. The `Vec`'s heap allocation is what the SQE
+    /// points at; moving the future moves only the (ptr, len, cap) triple.
+    pub(super) buf: Option<Vec<u8>>,
+    pub(super) inner: Rc<ReactorShared>,
+}
+
+impl Future for RawRecvFuture {
+    type Output = (Vec<u8>, i32);
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let parked = self.inner.parked_raw_recv.borrow_mut().remove(&self.id);
+        if let Some(res) = parked {
+            let buf = self.buf.take().expect("RawRecvFuture polled after completion");
+            return Poll::Ready((buf, res));
+        }
+        let id = self.id;
+        self.inner.raw_recv_wakers.borrow_mut().insert(id, cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+impl Drop for RawRecvFuture {
+    fn drop(&mut self) {
+        // Resolved: poll took the buffer and consumed the parked result.
+        let Some(buf) = self.buf.take() else { return };
+        self.inner.raw_recv_wakers.borrow_mut().remove(&self.id);
+        // CQE arrived after the last poll but before this drop: the kernel
+        // is done with the buffer — reclaim the orphaned result and let the
+        // buffer drop normally.
+        if self.inner.parked_raw_recv.borrow_mut().remove(&self.id).is_some() {
+            return;
+        }
+        // CQE still pending: park the buffer where the late kernel write
+        // stays valid (doubling as the orphan marker for the late CQE), and
+        // ask the kernel to cancel the recv promptly (its -ECANCELED CQE
+        // frees the parked buffer).
+        self.inner.raw_recv_buffers_in_flight.borrow_mut().insert(self.id, buf);
+        self.inner
+            .ring
+            .borrow_mut()
+            .prep_async_cancel(udata(KIND_RAW_RECV, self.id), udata(KIND_CANCEL_SINK, 0));
     }
 }
 

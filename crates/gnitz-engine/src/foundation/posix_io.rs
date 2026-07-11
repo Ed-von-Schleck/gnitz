@@ -229,16 +229,32 @@ pub fn madvise_willneed(ptr: *mut u8, size: usize) {
     }
 }
 
+/// Capture errno BEFORE the cleanup close() can clobber it. Shared error
+/// path of the listener constructors.
+fn close_with_errno(fd: c_int) -> std::io::Error {
+    let err = std::io::Error::last_os_error();
+    unsafe { libc::close(fd) };
+    err
+}
+
+/// Shared listener tail: listen(1024) + O_NONBLOCK. Closes `fd` on error.
+fn listen_nonblock(fd: c_int) -> std::io::Result<()> {
+    unsafe {
+        if libc::listen(fd, 1024) < 0 {
+            return Err(close_with_errno(fd));
+        }
+        let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(close_with_errno(fd));
+        }
+    }
+    Ok(())
+}
+
 /// Create a Unix domain SOCK_STREAM server socket: socket + bind + listen.
 /// Sets the listen socket to non-blocking.
 /// Unlinks any existing socket at `path` before binding.
 pub fn server_create(path: &str) -> std::io::Result<OwnedFd> {
-    let close_with_errno = |fd: c_int| -> std::io::Error {
-        // Capture errno BEFORE the cleanup close() can clobber it.
-        let err = std::io::Error::last_os_error();
-        unsafe { libc::close(fd) };
-        err
-    };
     unsafe {
         let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
         if fd < 0 {
@@ -249,7 +265,6 @@ pub fn server_create(path: &str) -> std::io::Result<OwnedFd> {
         addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
         let path_bytes = path.as_bytes();
         // Reject paths that would not fit with the null terminator.
-        // Consistent with the client-side check in gnitz-core/src/protocol/transport.rs.
         if path_bytes.len() >= addr.sun_path.len() {
             libc::close(fd);
             return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
@@ -269,15 +284,7 @@ pub fn server_create(path: &str) -> std::io::Result<OwnedFd> {
         {
             return Err(close_with_errno(fd));
         }
-        if libc::listen(fd, 1024) < 0 {
-            return Err(close_with_errno(fd));
-        }
-
-        // Set non-blocking for the listen socket.
-        let flags = libc::fcntl(fd, libc::F_GETFL, 0);
-        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-            return Err(close_with_errno(fd));
-        }
+        listen_nonblock(fd)?;
 
         // SAFETY: fresh descriptor from `socket`; the `OwnedFd` is the sole closer.
         Ok(OwnedFd::from_raw_fd(fd))
@@ -309,10 +316,83 @@ pub fn shutdown(fd: i32) -> i32 {
     }
 }
 
+/// Create a TCP SOCK_STREAM listen socket on `addr`: socket + SO_REUSEADDR +
+/// bind + listen(1024) (same backlog as `server_create`) + O_NONBLOCK.
+pub fn tcp_bind(addr: &std::net::SocketAddr) -> std::io::Result<i32> {
+    let family = match addr {
+        std::net::SocketAddr::V4(_) => libc::AF_INET,
+        std::net::SocketAddr::V6(_) => libc::AF_INET6,
+    };
+    unsafe {
+        let fd = libc::socket(family, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let on: c_int = 1;
+        if libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &on as *const _ as *const libc::c_void,
+            std::mem::size_of::<c_int>() as libc::socklen_t,
+        ) < 0
+        {
+            return Err(close_with_errno(fd));
+        }
+        let (ss, len) = sockaddr_from_addr(addr);
+        if libc::bind(fd, &ss as *const _ as *const libc::sockaddr, len) < 0 {
+            return Err(close_with_errno(fd));
+        }
+        listen_nonblock(fd)?;
+        Ok(fd)
+    }
+}
+
+/// The socket's bound local address (getsockname) — port-0 discovery.
+pub fn tcp_local_addr(fd: i32) -> Option<std::net::SocketAddr> {
+    let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let rc = unsafe { libc::getsockname(fd, &mut ss as *mut _ as *mut libc::sockaddr, &mut len) };
+    if rc < 0 {
+        return None;
+    }
+    addr_from_sockaddr(&ss)
+}
+
+/// Bare `SO_KEEPALIVE` (no interval tuning): a silently half-open TCP
+/// connection is reaped by the kernel default probing (~2 h) instead of
+/// parking a recv forever.
+pub fn set_keepalive(fd: i32) {
+    let on: c_int = 1;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            &on as *const _ as *const libc::c_void,
+            std::mem::size_of::<c_int>() as libc::socklen_t,
+        );
+    }
+}
+
+/// `TCP_NODELAY`: small control frames must not pay Nagle's 40 ms batching
+/// delay (AF_UNIX has no Nagle, so this restores latency parity).
+pub fn set_nodelay(fd: i32) {
+    let on: c_int = 1;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY,
+            &on as *const _ as *const libc::c_void,
+            std::mem::size_of::<c_int>() as libc::socklen_t,
+        );
+    }
+}
+
 /// SocketAddr → (sockaddr_storage, socklen_t). Zero-pads the storage and
 /// preserves the IPv6 flowinfo/scope_id so link-local destinations route
 /// (without a scope id the kernel rejects an `fe80::` send with EINVAL).
-#[allow(dead_code)] // TCP client-transport work will consume this
 pub fn sockaddr_from_addr(addr: &std::net::SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     match addr {
@@ -340,7 +420,6 @@ pub fn sockaddr_from_addr(addr: &std::net::SocketAddr) -> (libc::sockaddr_storag
 /// sockaddr_storage → SocketAddr, discriminated by `ss_family` alone.
 /// None for non-AF_INET/AF_INET6. Preserves IPv6 flowinfo/scope_id so a
 /// reply to a received `src` reaches a link-local peer.
-#[allow(dead_code)] // TCP client-transport work will consume this
 pub fn addr_from_sockaddr(ss: &libc::sockaddr_storage) -> Option<std::net::SocketAddr> {
     match ss.ss_family as libc::c_int {
         libc::AF_INET => {

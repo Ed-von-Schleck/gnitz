@@ -1,25 +1,139 @@
-//! AF-agnostic framing primitives.
+//! Client transport: AF-agnostic framing over a per-transport byte stream.
 //!
 //! The 4-byte LE length prefix used by every framed message is built and
-//! parsed here. Per-transport connect logic lives in sibling modules
-//! (`unix.rs` for AF_UNIX, future `tcp.rs` for TCP). QUIC streams cannot
-//! be passed to `writev` via `RawFd`, so QUIC support requires a separate
-//! `AsyncRead`/`AsyncWrite`-based path that is out of scope here.
+//! parsed here. [`ClientTransport`] dispatches between the transports: an
+//! AF_UNIX stream socket (raw-fd `writev`/`recv` framing below) and TLS 1.3
+//! over TCP (`tls.rs`, framing over
+//! `rustls::StreamOwned<ClientConnection, TcpStream>`).
 
 use std::cell::RefCell;
 use std::mem::MaybeUninit;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::sync::OnceLock;
 
 use super::error::ProtocolError;
 
-pub mod unix;
-pub use unix::connect_unix;
+pub mod tls;
 
-/// Backwards-compatible alias for AF_UNIX clients written before the
-/// transport split.
-pub fn connect(socket_path: &str) -> Result<RawFd, ProtocolError> {
-    unix::connect_unix(socket_path)
+/// One connected client transport. All framed I/O goes through these
+/// methods; the wire bytes are identical across transports ("ZSets over the
+/// wire" rides verbatim inside the TLS stream). The inner enum is private:
+/// construction goes through `connect`, so a `ClientTransport` is always a
+/// fully-handshaken connection, and rustls types stay out of the public API.
+pub struct ClientTransport(Inner);
+
+enum Inner {
+    Unix(OwnedFd),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>>),
+}
+
+// The sync API surfaces (C handle movable across threads, #[pyclass])
+// require the transport to be Send. Concurrent use of one connection is
+// still undefined behaviour by the C contract.
+const fn assert_send<T: Send>() {}
+const _: () = assert_send::<ClientTransport>();
+
+impl ClientTransport {
+    /// Connect to `target`: a literal `tls://HOST:PORT[?insecure|?ca=PATH]`
+    /// prefix selects TLS; anything else (including any path containing
+    /// `:`) is an AF_UNIX socket path — the prefix is the sole
+    /// discriminator.
+    pub fn connect(target: &str) -> Result<Self, ProtocolError> {
+        if let Some(rest) = target.strip_prefix("tls://") {
+            return tls::connect_tls(rest);
+        }
+        let stream = std::os::unix::net::UnixStream::connect(target).map_err(ProtocolError::IoError)?;
+        Ok(ClientTransport(Inner::Unix(stream.into())))
+    }
+
+    /// Wrap an already-connected AF_UNIX stream fd, taking ownership of it
+    /// (the transport closes it on drop).
+    #[cfg(test)]
+    pub(crate) fn from_unix_fd(fd: RawFd) -> Self {
+        use std::os::fd::FromRawFd;
+        // SAFETY: the caller transfers exclusive ownership of a valid fd.
+        ClientTransport(Inner::Unix(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    /// The underlying stream socket fd (AF_UNIX socket, or the TcpStream
+    /// under `StreamOwned`). For socket-option tweaks in tests and for
+    /// `waker()`; never used for framed I/O on the TLS variant.
+    pub fn as_raw_fd(&self) -> RawFd {
+        match &self.0 {
+            Inner::Unix(fd) => fd.as_raw_fd(),
+            Inner::Tls(s) => s.sock.as_raw_fd(),
+        }
+    }
+
+    /// Send a length-prefixed frame: [u32 LE payload_length][payload].
+    pub fn send_framed(&mut self, data: &[u8]) -> Result<(), ProtocolError> {
+        self.send_framed_iov(&[data])
+    }
+
+    /// Send multiple buffers as a single logical frame (one length prefix
+    /// over the concatenation).
+    pub fn send_framed_iov(&mut self, bufs: &[&[u8]]) -> Result<(), ProtocolError> {
+        match &mut self.0 {
+            Inner::Unix(fd) => send_framed_iov(fd.as_raw_fd(), bufs),
+            Inner::Tls(s) => tls::send_framed_iov(s, bufs),
+        }
+    }
+
+    /// Send many length-prefixed frames back-to-back.
+    pub fn send_framed_batch<F: AsRef<[u8]>>(&mut self, frames: &[F]) -> Result<(), ProtocolError> {
+        match &mut self.0 {
+            Inner::Unix(fd) => send_framed_batch(fd.as_raw_fd(), frames),
+            Inner::Tls(s) => tls::send_framed_batch(s, frames),
+        }
+    }
+
+    /// Receive one length-prefixed frame, enforcing `max_payload_len` and
+    /// rejecting the zero-length close sentinel.
+    pub fn recv_framed(&mut self, max_payload_len: usize) -> Result<Vec<u8>, ProtocolError> {
+        match &mut self.0 {
+            Inner::Unix(fd) => recv_framed(fd.as_raw_fd(), max_payload_len),
+            Inner::Tls(s) => tls::recv_framed(s, max_payload_len),
+        }
+    }
+
+    /// The connection is validated (HELLO ACK in hand): drop any
+    /// connect/handshake deadline so established connections block forever
+    /// on reads — the kernel `recv` is the wait, on every transport.
+    fn mark_established(&mut self) -> Result<(), ProtocolError> {
+        match &self.0 {
+            Inner::Unix(_) => Ok(()),
+            Inner::Tls(s) => s.sock.set_read_timeout(None).map_err(ProtocolError::IoError),
+        }
+    }
+
+    /// Handle that unblocks a `recv_framed` parked in another thread.
+    pub fn waker(&self) -> Result<TransportWaker, ProtocolError> {
+        // SAFETY: dup of a valid fd we own.
+        let raw = unsafe { libc::dup(self.as_raw_fd()) };
+        if raw < 0 {
+            return Err(ProtocolError::IoError(std::io::Error::last_os_error()));
+        }
+        Ok(TransportWaker(raw))
+    }
+}
+
+/// One shape for both transports: a dup'd fd of the underlying stream
+/// socket (the AF_UNIX socket, or the TcpStream under `StreamOwned`).
+/// Dropping the waker is the wake: `shutdown(SHUT_RDWR)` unblocks a
+/// kernel-parked read even after the I/O thread has closed its own fd (the
+/// integer may already be recycled; the dup keeps the open file description
+/// alive), then the dup itself is closed.
+pub struct TransportWaker(RawFd);
+
+impl Drop for TransportWaker {
+    fn drop(&mut self) {
+        // SAFETY: shutdown + close on a kernel-managed dup'd fd we own.
+        unsafe {
+            libc::shutdown(self.0, libc::SHUT_RDWR);
+            libc::close(self.0);
+        }
+    }
 }
 
 /// Read exactly `buf.len()` bytes into possibly-uninitialised storage,
@@ -63,46 +177,6 @@ fn recv_exact(sock_fd: RawFd, buf: &mut [u8]) -> Result<(), ProtocolError> {
     // `MaybeUninit` and then back is sound.
     let uninit = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut MaybeUninit<u8>, buf.len()) };
     recv_exact_uninit(sock_fd, uninit)
-}
-
-/// Send a length-prefixed frame: [u32 LE payload_length][payload bytes].
-/// Uses writev to send the header and payload in a single syscall.
-pub fn send_framed(sock_fd: RawFd, data: &[u8]) -> Result<(), ProtocolError> {
-    send_framed_iov(sock_fd, &[data])
-}
-
-/// Drain `data` via repeated `send` calls, retrying on EINTR and handling
-/// partial writes. Used by paths that ship pre-framed bytes (e.g. HELLO),
-/// where re-deriving a length prefix via `send_framed` would duplicate
-/// work already done by the encoder.
-fn send_all_bytes(sock_fd: RawFd, data: &[u8]) -> Result<(), ProtocolError> {
-    let mut sent = 0usize;
-    while sent < data.len() {
-        // SAFETY: pointer/len come from a valid &[u8] sub-slice.
-        let n = unsafe {
-            libc::send(
-                sock_fd,
-                data[sent..].as_ptr() as *const libc::c_void,
-                data.len() - sent,
-                0,
-            )
-        };
-        if n < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(ProtocolError::IoError(e));
-        }
-        if n == 0 {
-            return Err(ProtocolError::IoError(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "send returned 0",
-            )));
-        }
-        sent += n as usize;
-    }
-    Ok(())
 }
 
 /// Maximum number of payload slices `send_framed_iov` accepts. The +1
@@ -193,12 +267,32 @@ fn writev_all(sock_fd: RawFd, iovecs: &mut [libc::iovec]) -> Result<(), Protocol
     Ok(())
 }
 
+/// Decode and validate a received 4-byte LE length prefix against the
+/// per-connection ceiling, rejecting the zero-length close sentinel.
+/// Single enforcement point shared by every framed-recv path — the recv
+/// mirror of `frame_len_prefix`.
+pub(crate) fn parse_frame_len(hdr: [u8; 4], max_payload_len: usize) -> Result<usize, ProtocolError> {
+    let payload_len = u32::from_le_bytes(hdr) as usize;
+    if payload_len == 0 {
+        return Err(ProtocolError::IoError(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "zero-length close sentinel",
+        )));
+    }
+    if payload_len > max_payload_len {
+        return Err(ProtocolError::DecodeError(format!(
+            "payload length {payload_len} exceeds maximum {max_payload_len} bytes"
+        )));
+    }
+    Ok(payload_len)
+}
+
 /// Encode the 4-byte LE length prefix for a frame, rejecting the two
 /// lengths that would corrupt the wire stream: zero (collides with the
 /// `recv_framed` close sentinel) and anything above `u32::MAX` (would
 /// silently truncate the prefix). Single enforcement point shared by every
 /// framed-send path.
-fn frame_len_prefix(len: usize) -> Result<[u8; 4], ProtocolError> {
+pub(crate) fn frame_len_prefix(len: usize) -> Result<[u8; 4], ProtocolError> {
     if len == 0 {
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -224,7 +318,7 @@ fn frame_len_prefix(len: usize) -> Result<[u8; 4], ProtocolError> {
 /// Rejects empty frames (total length 0) so this path can never emit the
 /// 4-byte `[0,0,0,0]` header that `recv_framed` treats as the close
 /// sentinel.
-pub fn send_framed_iov(sock_fd: RawFd, bufs: &[&[u8]]) -> Result<(), ProtocolError> {
+pub(crate) fn send_framed_iov(sock_fd: RawFd, bufs: &[&[u8]]) -> Result<(), ProtocolError> {
     assert!(
         bufs.len() <= MAX_PAYLOAD_SLICES,
         "send_framed_iov: {} payload slices exceeds the {}-slot stack iovec array",
@@ -286,7 +380,7 @@ fn shrink_to_cap<T>(v: &mut Vec<T>, cap: usize) {
 /// Empty frames are rejected (would collide with the protocol close
 /// sentinel). Frames whose length does not fit in `u32` are rejected
 /// (would silently truncate the wire prefix).
-pub fn send_framed_batch<F: AsRef<[u8]>>(sock_fd: RawFd, frames: &[F]) -> Result<(), ProtocolError> {
+pub(crate) fn send_framed_batch<F: AsRef<[u8]>>(sock_fd: RawFd, frames: &[F]) -> Result<(), ProtocolError> {
     if frames.is_empty() {
         return Ok(());
     }
@@ -344,21 +438,10 @@ pub fn send_framed_batch<F: AsRef<[u8]>>(sock_fd: RawFd, frames: &[F]) -> Result
 /// `Connection::recv_framed`); pre-handshake or unbounded callers may
 /// pass `gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT` for the historical
 /// default.
-pub fn recv_framed(sock_fd: RawFd, max_payload_len: usize) -> Result<Vec<u8>, ProtocolError> {
+pub(crate) fn recv_framed(sock_fd: RawFd, max_payload_len: usize) -> Result<Vec<u8>, ProtocolError> {
     let mut hdr = [0u8; 4];
     recv_exact(sock_fd, &mut hdr)?;
-    let payload_len = u32::from_le_bytes(hdr) as usize;
-    if payload_len == 0 {
-        return Err(ProtocolError::IoError(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "zero-length close sentinel",
-        )));
-    }
-    if payload_len > max_payload_len {
-        return Err(ProtocolError::DecodeError(format!(
-            "payload length {payload_len} exceeds maximum {max_payload_len} bytes"
-        )));
-    }
+    let payload_len = parse_frame_len(hdr, max_payload_len)?;
     let mut buf: Vec<u8> = Vec::with_capacity(payload_len);
     {
         let spare = buf.spare_capacity_mut();
@@ -372,40 +455,24 @@ pub fn recv_framed(sock_fd: RawFd, max_payload_len: usize) -> Result<Vec<u8>, Pr
     Ok(buf)
 }
 
-pub fn close_fd(fd: RawFd) {
-    unsafe {
-        libc::close(fd);
-    }
-}
-
 /// Send the HELLO frame and parse the server's ACK. Returns the
 /// server-negotiated per-connection frame payload limit in bytes.
 ///
 /// On version mismatch / auth failure the server replies with a
 /// length-prefixed STATUS_ERROR control block (≥ 248 bytes) and closes
-/// the fd; this function detects that path via the length prefix
-/// (`!= HELLO_ACK_PAYLOAD_LEN`) and surfaces the embedded error string.
-pub fn hello_handshake(sock_fd: RawFd) -> Result<u32, ProtocolError> {
-    let frame = gnitz_wire::encode_hello_frame(
+/// the connection; this function detects that path via the payload
+/// length (`!= HELLO_ACK_PAYLOAD_LEN`) and surfaces the embedded error
+/// string.
+pub fn hello_handshake(t: &mut ClientTransport) -> Result<u32, ProtocolError> {
+    let payload = gnitz_wire::encode_hello_payload(
         gnitz_wire::WAL_FORMAT_VERSION as u16,
         0, // auth method = none
     );
-    send_all_bytes(sock_fd, &frame)?;
+    t.send_framed(&payload)?;
 
-    // Inspect the response length prefix. ACK ⇒ 12, control block ⇒ ≥ 248.
-    let mut hdr = [0u8; 4];
-    recv_exact(sock_fd, &mut hdr)?;
-    let payload_len = u32::from_le_bytes(hdr) as usize;
-    if payload_len == 0 {
-        return Err(ProtocolError::IoError(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "server closed mid-handshake",
-        )));
-    }
-
-    if payload_len == gnitz_wire::HELLO_ACK_PAYLOAD_LEN as usize {
-        let mut buf = [0u8; gnitz_wire::HELLO_ACK_PAYLOAD_LEN as usize];
-        recv_exact(sock_fd, &mut buf)?;
+    // ACK ⇒ 12 bytes, STATUS_ERROR control block ⇒ ≥ 248.
+    let buf = t.recv_framed(gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT)?;
+    if buf.len() == gnitz_wire::HELLO_ACK_PAYLOAD_LEN as usize {
         let ack = gnitz_wire::decode_hello_ack(&buf).map_err(|e| ProtocolError::DecodeError(e.into()))?;
         if ack.magic != gnitz_wire::HELLO_MAGIC {
             return Err(ProtocolError::DecodeError("HELLO ACK magic mismatch".into()));
@@ -416,6 +483,7 @@ pub fn hello_handshake(sock_fd: RawFd) -> Result<u32, ProtocolError> {
                 ack.status,
             )));
         }
+        t.mark_established()?;
         // Clamp the server-supplied limit to the client's hard ceiling. The
         // negotiated bound is `min(server_limit, MAX_FRAME_PAYLOAD_CLIENT)`,
         // so a compromised or buggy server cannot raise the client's own
@@ -424,24 +492,8 @@ pub fn hello_handshake(sock_fd: RawFd) -> Result<u32, ProtocolError> {
         return Ok(ack.limit_bytes.min(gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT as u32));
     }
 
-    // Not an ACK — the server is sending a STATUS_ERROR control block.
-    // Read the rest of the frame and surface the embedded error.
-    if payload_len > gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT {
-        return Err(ProtocolError::DecodeError(format!(
-            "HELLO error frame payload {} exceeds client max {}",
-            payload_len,
-            gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT,
-        )));
-    }
-    let mut buf: Vec<u8> = Vec::with_capacity(payload_len);
-    {
-        let spare = buf.spare_capacity_mut();
-        recv_exact_uninit(sock_fd, &mut spare[..payload_len])?;
-    }
-    // SAFETY: recv_exact_uninit wrote exactly `payload_len` bytes.
-    unsafe {
-        buf.set_len(payload_len);
-    }
+    // Not an ACK — the server sent a STATUS_ERROR control block. Surface
+    // the embedded error.
     let msg = super::message::parse_response(&buf, None)?;
     let err = msg.error_text.unwrap_or_else(|| "HELLO rejected".into());
     Err(ProtocolError::DecodeError(err))
@@ -466,7 +518,7 @@ mod tests {
     fn test_transport_loopback() {
         let (a, b) = make_socketpair();
         let data: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
-        send_framed(a, &data).unwrap();
+        send_framed_iov(a, &[&data]).unwrap();
         let received = recv_framed(b, TEST_LIMIT).unwrap();
         assert_eq!(&received[..], &data[..]);
         unsafe {
@@ -479,7 +531,7 @@ mod tests {
     fn test_transport_medium() {
         let (a, b) = make_socketpair();
         let data: Vec<u8> = (0u8..=255).cycle().take(64 * 1024).collect();
-        send_framed(a, &data).unwrap();
+        send_framed_iov(a, &[&data]).unwrap();
         let received = recv_framed(b, TEST_LIMIT).unwrap();
         assert_eq!(&received[..], &data[..]);
         unsafe {
@@ -572,7 +624,7 @@ mod tests {
     fn test_writev_interop_with_send_framed() {
         let (a, b) = make_socketpair();
         let data: Vec<u8> = vec![42u8; 8192];
-        send_framed(a, &data).unwrap();
+        send_framed_iov(a, &[&data]).unwrap();
         let received = recv_framed(b, TEST_LIMIT).unwrap();
         assert_eq!(received, data);
         unsafe {
@@ -631,7 +683,7 @@ mod tests {
         // Inherited via send_framed_iov rejection: send_framed(fd, &[]) must
         // not silently close the peer.
         let (a, b) = make_socketpair();
-        let r = send_framed(a, &[]);
+        let r = send_framed_iov(a, &[&[][..]]);
         assert!(matches!(r, Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::InvalidInput));
         unsafe {
             libc::close(a);
@@ -726,10 +778,10 @@ mod tests {
         unsafe {
             libc::send(b, ack.as_ptr() as *const libc::c_void, ack.len(), 0);
         }
-        let limit = hello_handshake(a).unwrap();
+        let mut t = ClientTransport::from_unix_fd(a);
+        let limit = hello_handshake(&mut t).unwrap();
         assert_eq!(limit as usize, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT);
         unsafe {
-            libc::close(a);
             libc::close(b);
         }
     }
@@ -743,10 +795,10 @@ mod tests {
         unsafe {
             libc::send(b, ack.as_ptr() as *const libc::c_void, ack.len(), 0);
         }
-        let limit = hello_handshake(a).unwrap();
+        let mut t = ClientTransport::from_unix_fd(a);
+        let limit = hello_handshake(&mut t).unwrap();
         assert_eq!(limit, small);
         unsafe {
-            libc::close(a);
             libc::close(b);
         }
     }
@@ -783,5 +835,63 @@ mod tests {
         }
         let got = reader.join().unwrap();
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_client_transport_unix_roundtrip() {
+        // The enum's Unix arm must be byte-identical to the free functions.
+        let (a, b) = make_socketpair();
+        let mut t = ClientTransport::from_unix_fd(a);
+        let data: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        t.send_framed(&data).unwrap();
+        let received = recv_framed(b, TEST_LIMIT).unwrap();
+        assert_eq!(received, data);
+        send_framed_iov(b, &[&data]).unwrap();
+        let echoed = t.recv_framed(TEST_LIMIT).unwrap();
+        assert_eq!(echoed, data);
+        unsafe {
+            libc::close(b);
+        }
+    }
+
+    #[test]
+    fn test_transport_waker_unblocks_parked_recv() {
+        // A recv_framed parked in another thread must return with an error
+        // once the waker is dropped (shutdown on the shared description).
+        let (a, b) = make_socketpair();
+        let t = ClientTransport::from_unix_fd(a);
+        let waker = t.waker().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut t = t;
+            t.recv_framed(TEST_LIMIT)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(waker);
+        let r = handle.join().unwrap();
+        assert!(r.is_err(), "parked recv must be unblocked with an error");
+        unsafe {
+            libc::close(b);
+        }
+    }
+
+    #[test]
+    fn test_connect_rejects_malformed_tls_targets() {
+        // The tls:// prefix is the sole discriminator; these must not be
+        // treated as socket paths, and must fail with a parse error.
+        for bad in [
+            "tls://",                  // no host
+            "tls://127.0.0.1",         // no port
+            "tls://h:1?insecure&ca=x", // unknown/multiple params
+            "tls://h:1?bogus",         // unknown param
+            "tls://h:1?insecure?ca=x", // second param
+            "tls://[::1:443?insecure", // unterminated bracket
+            "tls://h:notaport",        // bad port
+        ] {
+            let err = ClientTransport::connect(bad).err();
+            assert!(
+                matches!(err, Some(ProtocolError::DecodeError(_))),
+                "{bad} must be rejected with a parse error, got {err:?}",
+            );
+        }
     }
 }

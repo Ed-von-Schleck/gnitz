@@ -3,11 +3,18 @@ name = "gnitz-core"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+integration = []
+
 [dependencies]
 gnitz-wire  = { path = "../gnitz-wire" }
 libc        = "0.2"
 lru         = "0.12"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# default-features = false pins the ring backend explicitly (aws-lc-rs
+# needs a C/cmake toolchain).
+rustls       = { version = "0.23", default-features = false, features = ["ring", "std"] }
+webpki-roots = "1"
 
 [dev-dependencies]
 gnitz-test-harness = { path = "../gnitz-test-harness" }
