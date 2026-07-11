@@ -5,7 +5,7 @@
 //! `ON CONFLICT DO UPDATE`.
 
 use crate::ast_util::{extract_name, extract_table_factor_name};
-use crate::bind::{bind_single_table, Binder};
+use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_column_value, ColumnValue};
 use crate::codec::nullmap::null_word_set;
 use crate::dml::plan::{classify_access, collect_index_seek_candidates, seek_pk_multi, AccessPath};
@@ -69,10 +69,7 @@ pub(crate) fn resolve_set_target(
     clause: &str,
 ) -> Result<usize, GnitzSqlError> {
     let col_name = extract_assignment_col_name(assignment, clause)?;
-    let col_idx = schema
-        .columns
-        .iter()
-        .position(|c| c.name.eq_ignore_ascii_case(&col_name))
+    let col_idx = find_unique_column(&schema.columns, &col_name)?
         .ok_or_else(|| GnitzSqlError::Bind(format!("column '{col_name}' not found in {clause}")))?;
     if schema.is_pk_col(col_idx) {
         return Err(GnitzSqlError::Unsupported(format!(

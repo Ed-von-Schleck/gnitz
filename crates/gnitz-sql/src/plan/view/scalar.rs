@@ -22,7 +22,9 @@
 //! one row per correlation key, a `global_ground` reduce exactly one row total —
 //! so no runtime "subquery returned more than one row" path is ever needed.
 
-use crate::ast_util::{extract_table_name_and_alias, flatten_conjuncts, projection_item_expr};
+use crate::ast_util::{
+    extract_table_name_and_alias, flatten_conjuncts, fn_name_is, function_positional_args, projection_item_expr,
+};
 use crate::bind::{bind_single_table, build_alias_map, Binder};
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BoundExpr};
@@ -30,7 +32,7 @@ use crate::plan::lp::lower_linear;
 use crate::plan::validate::{
     reject_unhonored_query_clauses, reject_unhonored_select_clauses, HonoredClauses, HonoredQueryClauses,
 };
-use crate::plan::view::exists::{and_into, count_side_refs};
+use crate::plan::view::exists::{and_into, fold_and, resolve_single_plain_from, split_correlation_conjuncts};
 use crate::plan::view::predicates::extract_join_predicates;
 use crate::plan::view::{group_by, join, simple, EmitPieces, ViewChain};
 use gnitz_core::{GnitzClient, Schema, TypeCode};
@@ -209,14 +211,14 @@ impl LoweredSub<'_> {
     }
 }
 
-/// Mutable accumulators for the H join chain being synthesized.
+/// Mutable accumulators for the H join chain being synthesized. The number of
+/// join steps (`joins.len()`) doubles as the running synthetic-name counter:
+/// every subquery occurrence pushes exactly one join step.
 struct Acc {
     /// Synthesized join steps for `H`.
     joins: Vec<Join>,
     /// Extra `H` projection items — one per correlated subquery's aggregate column.
     agg_proj: Vec<SelectItem>,
-    /// Running synthetic-name counter (one per subquery occurrence).
-    counter: usize,
     /// Names already taken (outer columns + minted synthetics), so a fresh name
     /// never collides with a user column or another subquery's column.
     taken: HashSet<String>,
@@ -225,14 +227,7 @@ struct Acc {
 impl Acc {
     /// A minted name distinct from every taken name (append `_N` on collision).
     fn fresh(&mut self, base: &str) -> String {
-        let mut name = base.to_string();
-        let mut n = 0u32;
-        while self.taken.contains(&name.to_ascii_lowercase()) {
-            n += 1;
-            name = format!("{base}_{n}");
-        }
-        self.taken.insert(name.to_ascii_lowercase());
-        name
+        fresh_alias(&mut self.taken, base)
     }
 }
 
@@ -277,7 +272,6 @@ pub(crate) fn emit_scalar_subquery_pieces(
     let mut acc = Acc {
         joins: Vec::new(),
         agg_proj: Vec::new(),
-        counter: 0,
         taken,
     };
 
@@ -290,12 +284,8 @@ pub(crate) fn emit_scalar_subquery_pieces(
         let mut conjuncts = Vec::new();
         flatten_conjuncts(sel, &mut conjuncts);
         for &c in &conjuncts {
-            if let Some((col_expr, op)) = peel_scalar_comparison(c) {
+            if let Some((col_expr, op, q)) = peel_scalar_comparison(c) {
                 // Resolve the subquery to decide correlated vs uncorrelated.
-                let q = match right_subquery(c, &col_expr) {
-                    Some(q) => q,
-                    None => unreachable!("peel_scalar_comparison implies a subquery operand"),
-                };
                 let lowered = lower_subquery(client, binder, q, &outer)?;
                 if !lowered.is_correlated() {
                     build_uncorrelated_join(client, binder, chain, &mut acc, &lowered, &col_expr, op, &outer)?;
@@ -349,7 +339,7 @@ pub(crate) fn emit_scalar_subquery_pieces(
     // the outer table with the folded constants substituted.
     let mut final_select = select.clone();
     final_select.group_by = GroupByExpr::Expressions(Vec::new(), Vec::new());
-    final_select.selection = fold_conjuncts(rewritten_conjuncts);
+    final_select.selection = fold_and(rewritten_conjuncts);
     final_select.projection = final_proj;
     let over_h = !acc.joins.is_empty();
     if !over_h {
@@ -442,16 +432,13 @@ fn resolve_and_split<'a>(
         ));
     }
     // The inner FROM must be one plain base relation (no joins / derived table).
-    if inner_select.from.len() != 1
-        || !inner_select.from[0].joins.is_empty()
-        || matches!(&inner_select.from[0].relation, TableFactor::Derived { .. })
-    {
-        return Err(GnitzSqlError::Unsupported(
-            "a scalar/quantifier subquery's FROM must be a single base table without JOINs; compose via views".into(),
-        ));
-    }
-    let (inner_name, inner_alias) = extract_table_name_and_alias(&inner_select.from[0].relation, "subquery")?;
-    let (inner_tid, inner_schema) = binder.resolve(client, &inner_name)?;
+    let (inner_tid, inner_schema, inner_alias) = resolve_single_plain_from(
+        client,
+        binder,
+        &inner_select.from,
+        "a scalar/quantifier subquery's FROM must be a single base table without JOINs; compose via views",
+        "subquery",
+    )?;
     if outer.alias.eq_ignore_ascii_case(&inner_alias) {
         return Err(GnitzSqlError::Bind(format!(
             "relation alias '{inner_alias}' is used by both the view FROM and its subquery; rename one"
@@ -479,27 +466,13 @@ fn resolve_and_split<'a>(
         (&outer.alias, outer.tid, &outer.schema),
         (&inner_alias, inner_tid, &inner_schema),
     ]);
-    let mut inner_conjuncts: Vec<&Expr> = Vec::new();
-    if let Some(w) = &inner_select.selection {
-        flatten_conjuncts(w, &mut inner_conjuncts);
-    }
-    let mut inner_local: Vec<&Expr> = Vec::new();
-    let mut corr_acc: Option<Expr> = None;
-    for &c in &inner_conjuncts {
-        let (mut o_refs, mut i_refs) = (0usize, 0usize);
-        count_side_refs(c, &alias_map, outer_n, &mut o_refs, &mut i_refs)?;
-        if o_refs == 0 {
-            inner_local.push(c);
-        } else if i_refs == 0 {
-            return Err(GnitzSqlError::Unsupported(
-                "a subquery WHERE conjunct references only the outer relation; \
-                 move it into the view's own WHERE"
-                    .into(),
-            ));
-        } else {
-            and_into(&mut corr_acc, c.clone());
-        }
-    }
+    let (inner_local, corr_acc) = split_correlation_conjuncts(
+        inner_select.selection.as_ref(),
+        &alias_map,
+        outer_n,
+        "a subquery WHERE conjunct references only the outer relation; \
+         move it into the view's own WHERE",
+    )?;
 
     // Correlation must be equality-only (a range correlation with aggregation is
     // rejected). Extract the equi key pairs via the join-ON vocabulary.
@@ -610,9 +583,8 @@ fn build_correlated_join(
     sub: &LoweredSub<'_>,
     outer: &OuterCtx,
 ) -> Result<String, GnitzSqlError> {
-    let i = acc.counter;
-    acc.counter += 1;
-    let seg_alias = fresh_alias(&mut acc.taken, &format!("x4sq{i}"));
+    let i = acc.joins.len();
+    let seg_alias = acc.fresh(&format!("x4sq{i}"));
     let agg_name = acc.fresh(&format!("x4agg{i}"));
 
     // A float correlation (GROUP BY) column would surface as the reduce's
@@ -655,7 +627,7 @@ fn build_correlated_join(
             relation: sub.inner_from.clone(),
             joins: Vec::new(),
         }],
-        selection: fold_refs(&sub.inner_local),
+        selection: fold_and(sub.inner_local.iter().map(|&e| e.clone())),
         group_by: GroupByExpr::Expressions(group_by, Vec::new()),
         ..blank_select()
     };
@@ -693,9 +665,8 @@ fn build_uncorrelated_join(
     op: BinaryOperator,
     outer: &OuterCtx,
 ) -> Result<(), GnitzSqlError> {
-    let i = acc.counter;
-    acc.counter += 1;
-    let seg_alias = fresh_alias(&mut acc.taken, &format!("x4sq{i}"));
+    let i = acc.joins.len();
+    let seg_alias = acc.fresh(&format!("x4sq{i}"));
     let agg_name = acc.fresh(&format!("x4agg{i}"));
 
     // Item 4: both operands are join keys → reject a float aggregate or float outer
@@ -735,7 +706,7 @@ fn build_uncorrelated_join(
             relation: sub.inner_from.clone(),
             joins: Vec::new(),
         }],
-        selection: fold_refs(&sub.inner_local),
+        selection: fold_and(sub.inner_local.iter().map(|&e| e.clone())),
         group_by: GroupByExpr::Expressions(Vec::new(), Vec::new()),
         ..blank_select()
     };
@@ -993,10 +964,10 @@ fn rewrite_coalesce(
     f: &sqlparser::ast::Function,
     outer: &OuterCtx,
 ) -> Result<Expr, GnitzSqlError> {
-    let args = function_positional_args(f)?;
+    let args = function_positional_args(f, "COALESCE")?;
     // First operand that is a COUNT scalar subquery (never NULL).
     let mut cut = args.len();
-    for (j, a) in args.iter().enumerate() {
+    for (j, &a) in args.iter().enumerate() {
         if let Expr::Subquery(q) = a {
             if subquery_is_count(client, binder, q, outer)? {
                 cut = j + 1;
@@ -1006,7 +977,7 @@ fn rewrite_coalesce(
     }
     let kept = &args[..cut.min(args.len())];
     let mut new_args: Vec<Expr> = Vec::with_capacity(kept.len());
-    for a in kept {
+    for &a in kept {
         new_args.push(rewrite_expr(client, binder, chain, acc, a, outer)?);
     }
     Ok(coalesce_call(new_args))
@@ -1023,14 +994,15 @@ fn rewrite_function(
     f: &sqlparser::ast::Function,
     outer: &OuterCtx,
 ) -> Result<Expr, GnitzSqlError> {
-    let args = match function_positional_args(f) {
+    let args = match function_positional_args(f, "function") {
         Ok(a) => a,
-        // A non-positional function (e.g. `*`, named args) can't hold a scalar
-        // subquery we handle; pass it through and let the binder reject it.
+        // A non-positional or qualified function (`*`, named args, FILTER/OVER)
+        // can't hold a scalar subquery we handle; pass it through and let the
+        // binder reject it with its precise message.
         Err(_) => return Ok(Expr::Function(f.clone())),
     };
     let mut new_args = Vec::with_capacity(args.len());
-    for a in &args {
+    for a in args {
         new_args.push(rewrite_expr(client, binder, chain, acc, a, outer)?);
     }
     let mut f = f.clone();
@@ -1048,10 +1020,10 @@ fn rewrite_function(
 // ── AST helpers ──────────────────────────────────────────────────────────────
 
 /// Peel a scalar comparison conjunct `col OP (subquery)` / `(subquery) OP col`
-/// into `(outer_col_expr, canonical_op)` where the op is oriented `col OP sub`.
-/// Returns `None` unless one side is a bare subquery and the other a column ref
-/// and OP ∈ {=, <, <=, >, >=}.
-fn peel_scalar_comparison(c: &Expr) -> Option<(Expr, BinaryOperator)> {
+/// into `(outer_col_expr, canonical_op, subquery)` where the op is oriented
+/// `col OP sub`. Returns `None` unless one side is a bare subquery and the
+/// other a column ref and OP ∈ {=, <, <=, >, >=}.
+fn peel_scalar_comparison(c: &Expr) -> Option<(Expr, BinaryOperator, &Query)> {
     let Expr::BinaryOp { left, op, right } = c else {
         return None;
     };
@@ -1060,8 +1032,8 @@ fn peel_scalar_comparison(c: &Expr) -> Option<(Expr, BinaryOperator)> {
     }
     let is_col = |e: &Expr| matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_));
     match (left.as_ref(), right.as_ref()) {
-        (l, Expr::Subquery(_)) if is_col(l) => Some((l.clone(), op.clone())),
-        (Expr::Subquery(_), r) if is_col(r) => Some((r.clone(), converse_binop(op))),
+        (l, Expr::Subquery(q)) if is_col(l) => Some((l.clone(), op.clone(), q)),
+        (Expr::Subquery(q), r) if is_col(r) => Some((r.clone(), converse_binop(op), q)),
         _ => None,
     }
 }
@@ -1087,18 +1059,6 @@ fn peel_range_any(c: &Expr) -> Option<(&Expr, BinaryOperator, &Query)> {
     }
     match right.as_ref() {
         Expr::Subquery(q) => Some((left, compare_op.clone(), q)),
-        _ => None,
-    }
-}
-
-/// The subquery operand of a comparison conjunct whose other operand is `col`.
-fn right_subquery<'a>(c: &'a Expr, _col: &Expr) -> Option<&'a Query> {
-    let Expr::BinaryOp { left, right, .. } = c else {
-        return None;
-    };
-    match (left.as_ref(), right.as_ref()) {
-        (_, Expr::Subquery(q)) => Some(q),
-        (Expr::Subquery(q), _) => Some(q),
         _ => None,
     }
 }
@@ -1209,22 +1169,6 @@ fn qualified_wildcard_prefix(kind: &sqlparser::ast::SelectItemQualifiedWildcardK
     }
 }
 
-fn fold_conjuncts(conjuncts: Vec<Expr>) -> Option<Expr> {
-    let mut acc: Option<Expr> = None;
-    for c in conjuncts {
-        and_into(&mut acc, c);
-    }
-    acc
-}
-
-fn fold_refs(conjuncts: &[&Expr]) -> Option<Expr> {
-    let mut acc: Option<Expr> = None;
-    for &c in conjuncts {
-        and_into(&mut acc, c.clone());
-    }
-    acc
-}
-
 fn fresh_alias(taken: &mut HashSet<String>, base: &str) -> String {
     let mut name = base.to_string();
     let mut n = 0u32;
@@ -1295,35 +1239,11 @@ fn or_expr(a: Expr, b: Expr) -> Expr {
     }
 }
 
-/// `MAX(arg)` / `MIN(arg)` as an aggregate call — the synthesized aggregate for a
-/// range quantifier's `Gᵢ`.
-fn agg_call(func: AggFunc, arg: Expr) -> Expr {
-    let name = match func {
-        AggFunc::Max => "max",
-        AggFunc::Min => "min",
-        _ => unreachable!("only MIN/MAX are synthesized for range quantifiers"),
-    };
+/// A plain positional call `name(args…)` — the one construction site for every
+/// synthesized function node.
+fn fn_call(name: &str, args: Vec<Expr>) -> Expr {
     Expr::Function(sqlparser::ast::Function {
         name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))]),
-        uses_odbc_syntax: false,
-        parameters: sqlparser::ast::FunctionArguments::None,
-        args: sqlparser::ast::FunctionArguments::List(sqlparser::ast::FunctionArgumentList {
-            duplicate_treatment: None,
-            args: vec![sqlparser::ast::FunctionArg::Unnamed(
-                sqlparser::ast::FunctionArgExpr::Expr(arg),
-            )],
-            clauses: Vec::new(),
-        }),
-        filter: None,
-        null_treatment: None,
-        over: None,
-        within_group: Vec::new(),
-    })
-}
-
-fn coalesce_call(args: Vec<Expr>) -> Expr {
-    Expr::Function(sqlparser::ast::Function {
-        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("coalesce"))]),
         uses_odbc_syntax: false,
         parameters: sqlparser::ast::FunctionArguments::None,
         args: sqlparser::ast::FunctionArguments::List(sqlparser::ast::FunctionArgumentList {
@@ -1341,30 +1261,19 @@ fn coalesce_call(args: Vec<Expr>) -> Expr {
     })
 }
 
-fn fn_name_is(f: &sqlparser::ast::Function, name: &str) -> bool {
-    matches!(f.name.0.as_slice(), [part]
-        if part.as_ident().is_some_and(|i| i.value.eq_ignore_ascii_case(name)))
+/// `MAX(arg)` / `MIN(arg)` as an aggregate call — the synthesized aggregate for a
+/// range quantifier's `Gᵢ`.
+fn agg_call(func: AggFunc, arg: Expr) -> Expr {
+    let name = match func {
+        AggFunc::Max => "max",
+        AggFunc::Min => "min",
+        _ => unreachable!("only MIN/MAX are synthesized for range quantifiers"),
+    };
+    fn_call(name, vec![arg])
 }
 
-fn function_positional_args(f: &sqlparser::ast::Function) -> Result<Vec<Expr>, GnitzSqlError> {
-    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
-    let FunctionArguments::List(list) = &f.args else {
-        return Err(GnitzSqlError::Unsupported(
-            "function requires a positional argument list".into(),
-        ));
-    };
-    if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
-        return Err(GnitzSqlError::Unsupported("unsupported function qualifiers".into()));
-    }
-    list.args
-        .iter()
-        .map(|a| match a {
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e.clone()),
-            _ => Err(GnitzSqlError::Unsupported(
-                "function expects plain positional arguments".into(),
-            )),
-        })
-        .collect()
+fn coalesce_call(args: Vec<Expr>) -> Expr {
+    fn_call("coalesce", args)
 }
 
 /// A `Select` with every field defaulted (empty FROM/projection, no clauses) —

@@ -1,4 +1,5 @@
 use crate::error::GnitzSqlError;
+use crate::ir::AggFunc;
 
 /// Extract the last identifier name from an ObjectName.
 pub(crate) fn extract_name(name: &sqlparser::ast::ObjectName, context: &str) -> Result<String, GnitzSqlError> {
@@ -30,16 +31,45 @@ pub(crate) fn group_by_is_present(group_by: &sqlparser::ast::GroupByExpr) -> boo
     }
 }
 
-/// True for the aggregate function names the binder's `bind_function` accepts
-/// (`count`, `sum`, `min`, `max`, `avg`), matched case-insensitively. Kept in
-/// sync with that binder match by hand: an aggregate added there must be added
-/// here too, or a no-`GROUP BY` use of it would misroute to the scalar `Simple`
-/// builder and report the less-specific lowering error.
-pub(crate) fn is_aggregate_func_name(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "count" | "sum" | "min" | "max" | "avg"
-    )
+/// The bare name of an unqualified single-part function call, or `None` for a
+/// qualified (`schema.fn`) name.
+pub(crate) fn single_fn_name(f: &sqlparser::ast::Function) -> Option<&str> {
+    match f.name.0.as_slice() {
+        [part] => part.as_ident().map(|i| i.value.as_str()),
+        _ => None,
+    }
+}
+
+/// Case-insensitive match on an unqualified single-part function name — no
+/// allocation, unlike `f.name.to_string()`.
+pub(crate) fn fn_name_is(f: &sqlparser::ast::Function, name: &str) -> bool {
+    single_fn_name(f).is_some_and(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// The `AggFunc` a function name denotes (`count`, `sum`, `min`, `max`, `avg`),
+/// matched case-insensitively without allocating; `None` for any other name.
+/// The single name→aggregate map: the binder's `bind_function` dispatches the
+/// argument shape from it (COUNT(*) vs COUNT(x)), and the dispatch walkers use
+/// it to detect an aggregate — an aggregate added here reaches them all at once.
+pub(crate) fn agg_func_from_name(name: &str) -> Option<AggFunc> {
+    const NAMES: [(&str, AggFunc); 5] = [
+        ("count", AggFunc::Count),
+        ("sum", AggFunc::Sum),
+        ("min", AggFunc::Min),
+        ("max", AggFunc::Max),
+        ("avg", AggFunc::Avg),
+    ];
+    NAMES
+        .into_iter()
+        .find_map(|(n, f)| name.eq_ignore_ascii_case(n).then_some(f))
+}
+
+/// True when a SELECT body is grouped: it carries a GROUP BY or an aggregate in
+/// its projection — the one disjunction behind every "route this body to the
+/// grouped builder / reject the grouped shape" test (the view-shape classifier,
+/// the hidden-body router, and the EXISTS guard).
+pub(crate) fn body_is_grouped(select: &sqlparser::ast::Select) -> bool {
+    group_by_is_present(&select.group_by) || projection_has_aggregate(select)
 }
 
 /// True when any SELECT projection item contains an aggregate function call —
@@ -64,7 +94,7 @@ pub(crate) fn projection_has_aggregate(select: &sqlparser::ast::Select) -> bool 
 /// still a grouped shape) — any of its operands.
 fn expr_has_aggregate(e: &sqlparser::ast::Expr) -> bool {
     if let sqlparser::ast::Expr::Function(f) = e {
-        if is_aggregate_func_name(&f.name.to_string()) {
+        if single_fn_name(f).and_then(agg_func_from_name).is_some() {
             return true;
         }
     }
@@ -257,6 +287,71 @@ pub(crate) fn extract_table_name_and_alias(
         _ => name.clone(),
     };
     Ok((name, alias))
+}
+
+/// Reject any qualifier on a function call the binder does not implement.
+/// Both aggregate-binding sites (`SingleTable::bind_function` and HAVING's
+/// `having_agg_func`) and the COALESCE/NULLIF desugar read only the argument
+/// list; every other `Function` field would otherwise be silently dropped,
+/// computing the plain call. `on` names the rejecting context ("aggregates",
+/// "COALESCE", …) in the message.
+pub(crate) fn reject_unsupported_fn_qualifiers(func: &sqlparser::ast::Function, on: &str) -> Result<(), GnitzSqlError> {
+    use sqlparser::ast::{DuplicateTreatment, FunctionArguments};
+    // Colon form ("{what}: not supported …") sidesteps subject-verb number
+    // agreement and matches the binder's existing message style
+    // (e.g. "{name}: not supported on {:?} columns").
+    let unsupported = |what: &str| Err(GnitzSqlError::Unsupported(format!("{what}: not supported on {on}")));
+    if func.filter.is_some() {
+        return unsupported("FILTER (WHERE …)");
+    }
+    if func.over.is_some() {
+        return unsupported("window functions (OVER)");
+    }
+    if !func.within_group.is_empty() {
+        return unsupported("WITHIN GROUP (ORDER BY …)");
+    }
+    if func.null_treatment.is_some() {
+        return unsupported("IGNORE/RESPECT NULLS");
+    }
+    if !matches!(func.parameters, FunctionArguments::None) {
+        return unsupported("parametric (ClickHouse) calls");
+    }
+    if let FunctionArguments::List(list) = &func.args {
+        if matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct)) {
+            return unsupported("DISTINCT");
+        }
+        if !list.clauses.is_empty() {
+            return unsupported("in-argument clauses (ORDER BY / LIMIT / SEPARATOR)");
+        }
+    }
+    Ok(())
+}
+
+/// Plain positional argument exprs of a function call, or a clean `Unsupported`
+/// for `*`, named args, DISTINCT, or any qualifier (FILTER/OVER/…) — the shared
+/// qualifier inventory (`reject_unsupported_fn_qualifiers`). Backs the
+/// COALESCE/NULLIF structural desugar and the scalar-subquery rewriters, which
+/// need bare operand exprs.
+pub(crate) fn function_positional_args<'f>(
+    f: &'f sqlparser::ast::Function,
+    name: &str,
+) -> Result<Vec<&'f sqlparser::ast::Expr>, GnitzSqlError> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    reject_unsupported_fn_qualifiers(f, name)?;
+    let FunctionArguments::List(list) = &f.args else {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "{name}: requires a parenthesized argument list"
+        )));
+    };
+    list.args
+        .iter()
+        .map(|arg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e),
+            _ => Err(GnitzSqlError::Unsupported(format!(
+                "{name}: expects plain positional arguments (no `*`, named args)"
+            ))),
+        })
+        .collect()
 }
 
 /// Bare column name of a single-relation reference: a plain `Identifier`, or a

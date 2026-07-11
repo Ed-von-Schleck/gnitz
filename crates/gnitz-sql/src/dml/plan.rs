@@ -5,7 +5,7 @@
 //! analysis and fetching — no row mutation lives here. `select` and `mutate`
 //! sink into this module; it never references either.
 
-use crate::ast_util::flatten_conjuncts;
+use crate::ast_util::{flatten_conjuncts, single_relation_col_name};
 use crate::bind::find_unique_column;
 use crate::codec::pk_codec::{
     extract_sql_literal, parse_literal_i128, parse_pk_literal_packed, parse_uuid_str, SqlLiteral,
@@ -64,27 +64,16 @@ pub(crate) fn classify_access<'e>(selection: Option<&'e Expr>, schema: &Schema) 
 // ---------------------------------------------------------------------------
 
 pub(crate) fn extract_limit(query: &sqlparser::ast::Query) -> Option<usize> {
-    match &query.limit_clause {
-        Some(LimitClause::LimitOffset {
-            limit: Some(Expr::Value(vws)),
-            ..
-        }) => {
-            if let Value::Number(n, _) = &vws.value {
-                n.parse::<usize>().ok()
-            } else {
-                None
-            }
-        }
-        Some(LimitClause::OffsetCommaLimit {
-            limit: Expr::Value(vws),
-            ..
-        }) => {
-            if let Value::Number(n, _) = &vws.value {
-                n.parse::<usize>().ok()
-            } else {
-                None
-            }
-        }
+    let limit = match &query.limit_clause {
+        Some(LimitClause::LimitOffset { limit: Some(e), .. }) => e,
+        Some(LimitClause::OffsetCommaLimit { limit: e, .. }) => e,
+        _ => return None,
+    };
+    match limit {
+        Expr::Value(vws) => match &vws.value {
+            Value::Number(n, _) => n.parse::<usize>().ok(),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -145,18 +134,21 @@ pub(crate) fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize,
     else {
         return None;
     };
-    // The column may sit on either side; the literal is whatever
+    // The column — bare or qualified (`t.pk`), the crate-wide single-relation
+    // convention — may sit on either side; the literal is whatever
     // `extract_sql_literal` accepts (numbers, optionally negated, or a
     // single-quoted string — but never a double-quoted identifier).
-    let (col_id, lit) = match (left.as_ref(), right.as_ref()) {
-        (Expr::Identifier(id), r) => (id, extract_sql_literal(r)?),
-        (l, Expr::Identifier(id)) => (id, extract_sql_literal(l)?),
-        _ => return None,
+    let (col_name, lit) = if let (Some(n), Some(l)) = (single_relation_col_name(left), extract_sql_literal(right)) {
+        (n, l)
+    } else if let (Some(n), Some(l)) = (single_relation_col_name(right), extract_sql_literal(left)) {
+        (n, l)
+    } else {
+        return None;
     };
     // Ambiguous (a dup-named `SELECT *` view) OR absent → None → fast path
     // declined; the WHERE then falls through to a bind that raises the precise
     // error rather than seeking the wrong column.
-    let col_idx = find_unique_column(&schema.columns, &col_id.value).ok().flatten()?;
+    let col_idx = find_unique_column(&schema.columns, col_name).ok().flatten()?;
     let col_tc = schema.columns[col_idx].type_code;
 
     // UUID: accept a single-quoted UUID string or a non-negated numeric u128
@@ -198,10 +190,8 @@ pub(crate) fn try_extract_pk_in(expr: &Expr, schema: &Schema) -> Option<Vec<u128
         if *negated {
             return None;
         }
-        let col_name = match col_expr.as_ref() {
-            Expr::Identifier(id) => &id.value,
-            _ => return None,
-        };
+        // Bare or qualified (`t.pk`) — the single-relation convention.
+        let col_name = single_relation_col_name(col_expr)?;
         let pk_idx = schema.pk_indices()[0];
         // Resolve through the visibility-aware chokepoint: a hidden PK (a view
         // keyed by a synthetic `_join_pk`/`_group_pk`) is not name-resolvable, so
@@ -472,13 +462,16 @@ fn try_col_range_literal(expr: &Expr, schema: &Schema) -> Option<(usize, RangeEn
     let Expr::BinaryOp { left, op, right } = expr else {
         return None;
     };
-    // Which side is the column, which is the literal, and is the operator flipped
-    // (`lit OP col` ≡ `col FLIP(OP) lit`)?
-    let (col_id, lit, flipped) = match (left.as_ref(), right.as_ref()) {
-        (Expr::Identifier(id), r) => (id, extract_sql_literal(r)?, false),
-        (l, Expr::Identifier(id)) => (id, extract_sql_literal(l)?, true),
-        _ => return None,
-    };
+    // Which side is the column (bare or qualified `t.x`), which is the literal,
+    // and is the operator flipped (`lit OP col` ≡ `col FLIP(OP) lit`)?
+    let (col_name, lit, flipped) =
+        if let (Some(n), Some(l)) = (single_relation_col_name(left), extract_sql_literal(right)) {
+            (n, l, false)
+        } else if let (Some(n), Some(l)) = (single_relation_col_name(right), extract_sql_literal(left)) {
+            (n, l, true)
+        } else {
+            return None;
+        };
     use BinaryOperator as B;
     let (side, mk): (RangeSide, fn(u128) -> Cut) = match (op, flipped) {
         (B::Gt, false) | (B::Lt, true) => (RangeSide::Start, Cut::After), // col > lit / lit < col
@@ -487,7 +480,7 @@ fn try_col_range_literal(expr: &Expr, schema: &Schema) -> Option<(usize, RangeEn
         (B::LtEq, false) | (B::GtEq, true) => (RangeSide::End, Cut::After), // col <= lit / lit >= col
         _ => return None,
     };
-    let col_idx = find_unique_column(&schema.columns, &col_id.value).ok().flatten()?;
+    let col_idx = find_unique_column(&schema.columns, col_name).ok().flatten()?;
     let tc = schema.columns[col_idx].type_code;
     let SqlLiteral::Number(n_str, negated) = lit else {
         return None;
@@ -530,8 +523,9 @@ fn try_col_between(expr: &Expr, schema: &Schema) -> Option<(usize, [RangeEnd; 2]
     else {
         return None;
     };
-    let Expr::Identifier(id) = be.as_ref() else { return None };
-    let col = find_unique_column(&schema.columns, &id.value).ok().flatten()?;
+    // Bare or qualified (`t.x`) — the single-relation convention.
+    let name = single_relation_col_name(be)?;
+    let col = find_unique_column(&schema.columns, name).ok().flatten()?;
     let tc = schema.columns[col].type_code;
     Some((
         col,
@@ -1086,6 +1080,54 @@ mod tests {
     #[test]
     fn pk_parity_u32_max() {
         check_pk_parity(TypeCode::U32, num_expr("4294967295"), 4294967295u128);
+    }
+
+    // ------------------------------------------------------------------
+    // Qualified single-relation references take the same fast paths
+    // ------------------------------------------------------------------
+
+    /// Every WHERE fast-path recognizer accepts a qualified (`t.col`) reference
+    /// like the bare form — the crate-wide single-relation convention. The
+    /// qualifier value itself is ignored (`bogus.col` binds `col`), matching the
+    /// binder's established leniency (`single_relation_col_name`); this test
+    /// pins that chosen policy.
+    #[test]
+    fn qualified_refs_take_fast_paths() {
+        let schema = pk_schema(TypeCode::U64); // (id U64 pk, v)
+
+        // `t.v = 5` and the flipped `5 = t.v` → equality fast path.
+        assert_eq!(try_col_eq_literal(&parse_expr_sql("t.v = 5"), &schema), Some((1, 5)));
+        assert_eq!(try_col_eq_literal(&parse_expr_sql("5 = t.v"), &schema), Some((1, 5)));
+        // Wrong qualifier is ignored — binds the bare name (chosen leniency).
+        assert_eq!(
+            try_col_eq_literal(&parse_expr_sql("bogus.v = 5"), &schema),
+            Some((1, 5))
+        );
+
+        // `t.id = 1` binds the full PK → point seek.
+        let seek_expr = parse_expr_sql("t.id = 1");
+        let (pk, residual) = try_extract_pk_seek_residual(&seek_expr, &schema).expect("PK binds");
+        assert_eq!(pk.as_bytes(), &1u64.to_le_bytes()[..]);
+        assert!(residual.is_empty());
+
+        // `t.id IN (1, 2)` → multi-seek fast path.
+        assert_eq!(
+            try_extract_pk_in(&parse_expr_sql("t.id IN (1, 2)"), &schema),
+            Some(vec![1, 2])
+        );
+
+        // `t.v > 5` / flipped `5 < t.v` → range end.
+        let (c, e) = try_col_range_literal(&parse_expr_sql("t.v > 5"), &schema).unwrap();
+        assert_eq!(c, 1);
+        assert!(e.side == RangeSide::Start && e.cut == Cut::After(5));
+        let (_, e) = try_col_range_literal(&parse_expr_sql("5 < t.v"), &schema).unwrap();
+        assert!(e.side == RangeSide::Start && e.cut == Cut::After(5));
+
+        // `t.v BETWEEN 1 AND 5` → both inclusive ends.
+        let (c, [lo, hi]) = try_col_between(&parse_expr_sql("t.v BETWEEN 1 AND 5"), &schema).unwrap();
+        assert_eq!(c, 1);
+        assert!(lo.side == RangeSide::Start && lo.cut == Cut::Before(1));
+        assert!(hi.side == RangeSide::End && hi.cut == Cut::After(5));
     }
 
     // ------------------------------------------------------------------

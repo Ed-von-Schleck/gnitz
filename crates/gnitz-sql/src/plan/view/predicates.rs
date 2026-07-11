@@ -11,7 +11,7 @@ use crate::error::GnitzSqlError;
 use crate::ir::{BinOp, BoundExpr};
 use crate::lower::compile_bound_expr_to_program;
 use crate::plan::validate::reject_float_key;
-use gnitz_core::{ColumnDef, ExprBuilder, RangeRel, Schema, TypeCode};
+use gnitz_core::{CircuitBuilder, ColumnDef, ExprBuilder, NodeId, RangeRel, Schema, TypeCode};
 use sqlparser::ast::{BinaryOperator, Expr};
 
 #[cfg(test)]
@@ -76,6 +76,28 @@ pub(crate) fn multi_null_filter_prog(
         expr = BoundExpr::BinOp(Box::new(expr), op, Box::new(leaf(c)));
     }
     compile_bound_expr_to_program(&expr, schema)
+}
+
+/// NULL-key gate: when any of `cols` is nullable, filter NULL-keyed rows out of
+/// `node` (SQL 3VL — a NULL key matches nothing); a NOT NULL key leaves the
+/// node untouched (no filter operator, byte-identical circuit). Returns the
+/// gated node AND the nullability fact — the callers reuse the fact for their
+/// `a_all`/`b_all` reindex-node reuse and NULL-key-branch decisions, so the two
+/// derivations cannot drift (a drift would be a silent weight bug in the
+/// null-fill).
+pub(crate) fn null_gate(
+    cb: &mut CircuitBuilder,
+    node: NodeId,
+    cols: &[usize],
+    schema: &Schema,
+) -> Result<(NodeId, bool), GnitzSqlError> {
+    let nullable = cols.iter().any(|&c| schema.columns[c].is_nullable);
+    let gated = if nullable {
+        cb.filter(node, Some(multi_null_filter_prog(cols, schema, false)?))
+    } else {
+        node
+    };
+    Ok((gated, nullable))
 }
 
 /// Build a reindex ExprProgram that copies all columns as payload — the unpruned
@@ -251,22 +273,25 @@ pub(crate) fn extract_join_predicates(
     right_schema: &Schema,
     alias_map: &AliasMap,
 ) -> Result<JoinPredicates, GnitzSqlError> {
-    let mut left_cols = Vec::new();
-    let mut right_cols = Vec::new();
-    let mut target_tcs = Vec::new();
-    let mut range: Option<RangeConjunct> = None;
-    let mut residual: Vec<Expr> = Vec::new();
-    collect_join_predicates(
-        on_expr,
+    let mut collector = PredicateCollector {
         left_schema,
         right_schema,
         alias_map,
-        &mut left_cols,
-        &mut right_cols,
-        &mut target_tcs,
-        &mut range,
-        &mut residual,
-    )?;
+        left_cols: Vec::new(),
+        right_cols: Vec::new(),
+        target_tcs: Vec::new(),
+        range: None,
+        residual: Vec::new(),
+    };
+    collector.collect(on_expr)?;
+    let PredicateCollector {
+        left_cols,
+        right_cols,
+        target_tcs,
+        range,
+        residual,
+        ..
+    } = collector;
     if left_cols.is_empty() && range.is_none() {
         // A residual cannot stand alone: a residual-only ON (`ON a.r <> b.s`) would
         // be an incremental cross-join, which the engine cannot build. Residuals
@@ -300,130 +325,114 @@ pub(crate) fn extract_join_predicates(
     Ok((left_cols, right_cols, target_tcs, range, residual))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn collect_join_predicates(
-    expr: &Expr,
-    left_schema: &Schema,
-    right_schema: &Schema,
-    alias_map: &AliasMap,
-    left_cols: &mut Vec<usize>,
-    right_cols: &mut Vec<usize>,
-    target_tcs: &mut Vec<TypeCode>,
-    range: &mut Option<RangeConjunct>,
-    residual: &mut Vec<Expr>,
-) -> Result<(), GnitzSqlError> {
-    match expr {
-        // Parentheses: `ON (a.x = b.x) AND a.y = b.y`, `ON (a.x = b.x AND a.y = b.y)`.
-        // sqlparser wraps a parenthesized sub-expression in Expr::Nested; unwrap it
-        // so grouping never changes which predicates are extracted. This mirrors the
-        // WHERE binder (`binder.rs` Expr::Nested arm) and the HAVING path, both of
-        // which already unwrap Nested.
-        Expr::Nested(inner) => {
-            collect_join_predicates(
-                inner,
-                left_schema,
-                right_schema,
-                alias_map,
-                left_cols,
-                right_cols,
-                target_tcs,
-                range,
-                residual,
-            )?;
-        }
-        Expr::BinaryOp { left, op, right } => match op {
-            BinaryOperator::And => {
-                collect_join_predicates(
-                    left,
-                    left_schema,
-                    right_schema,
-                    alias_map,
-                    left_cols,
-                    right_cols,
-                    target_tcs,
-                    range,
-                    residual,
-                )?;
-                collect_join_predicates(
-                    right,
-                    left_schema,
-                    right_schema,
-                    alias_map,
-                    left_cols,
-                    right_cols,
-                    target_tcs,
-                    range,
-                    residual,
-                )?;
+/// The ON-clause classification state: the two side schemas + alias map it
+/// resolves against, and the accumulators `collect` fills — equality-prefix
+/// pairs (with their per-pair common type), the one physical range conjunct,
+/// and the residual list. Accumulator push order is load-bearing: the eq-pair
+/// order determines reindex slot order and thereby the circuit shape.
+struct PredicateCollector<'a> {
+    left_schema: &'a Schema,
+    right_schema: &'a Schema,
+    alias_map: &'a AliasMap,
+    left_cols: Vec<usize>,
+    right_cols: Vec<usize>,
+    target_tcs: Vec<TypeCode>,
+    range: Option<RangeConjunct>,
+    residual: Vec<Expr>,
+}
+
+impl PredicateCollector<'_> {
+    fn collect(&mut self, expr: &Expr) -> Result<(), GnitzSqlError> {
+        match expr {
+            // Parentheses: `ON (a.x = b.x) AND a.y = b.y`, `ON (a.x = b.x AND a.y = b.y)`.
+            // sqlparser wraps a parenthesized sub-expression in Expr::Nested; unwrap it
+            // so grouping never changes which predicates are extracted. This mirrors the
+            // WHERE binder (`binder.rs` Expr::Nested arm) and the HAVING path, both of
+            // which already unwrap Nested.
+            Expr::Nested(inner) => {
+                self.collect(inner)?;
             }
-            _ => {
-                // Classify a non-AND conjunct. It is consumed as an equi key pair or
-                // the one physical range conjunct ONLY when both operands resolve to
-                // columns of different tables; everything else — a literal operand, a
-                // same-table pair, an arithmetic operand, a second range, `<>`, an
-                // OR/IS NULL group — falls through to the residual. The residual binder
-                // re-resolves and surfaces any genuine "column not found".
-                let left_n = left_schema.columns.len();
-                let cross = match (
-                    resolve_join_col_ref(left, alias_map),
-                    resolve_join_col_ref(right, alias_map),
-                ) {
-                    (Ok(l), Ok(r)) => cross_table_pair(l, r, left_n),
-                    _ => None, // a literal/expression operand, or unresolved
-                };
-                match (op, cross) {
-                    // Cross-table column equality → equijoin key pair, validated as
-                    // today. A mixed/incompatible pair still errors via
-                    // validate_join_key_pair — it is NOT demoted to a residual (§3).
-                    (BinaryOperator::Eq, Some((li, ri, _swapped))) => {
-                        // Drop an exact-duplicate pair (`a.x = b.x AND a.x = b.x`, or
-                        // the same pair sides-swapped): byte-identical key slots,
-                        // keeping them only widens the synthetic PK and can spuriously
-                        // trip the arity cap. A pair sharing one column but not the
-                        // other (`a.x = b.x AND a.x = b.y`) is distinct and kept.
-                        if left_cols
-                            .iter()
-                            .zip(right_cols.iter())
-                            .any(|(&pl, &pr)| pl == li && pr == ri)
-                        {
-                            return Ok(());
-                        }
-                        // Push T only on the same path that pushes (li, ri) — after
-                        // the dup early-return — so the three vectors stay parallel.
-                        let t = validate_join_key_pair(&left_schema.columns[li], &right_schema.columns[ri])?;
-                        left_cols.push(li);
-                        right_cols.push(ri);
-                        target_tcs.push(t);
-                    }
-                    // Cross-table column ordering comparison, range slot still free →
-                    // the one physical range conjunct, canonicalized to `left_col OP
-                    // right_col` (converse on a right-table-first operand). A
-                    // non-order-preserving pair (string/blob/float) is rejected by
-                    // validate_range_join_key_pair — it never silently becomes a
-                    // residual. A *second* ordering comparison (range already set)
-                    // fails this guard and falls through to the residual.
-                    (_, Some((li, ri, swapped))) if sql_binop_to_range_rel(op).is_some() && range.is_none() => {
-                        let rel = sql_binop_to_range_rel(op).expect("range rel present");
-                        let canon_op = if swapped { converse_rel(rel) } else { rel };
-                        let t = validate_range_join_key_pair(&left_schema.columns[li], &right_schema.columns[ri])?;
-                        *range = Some(RangeConjunct {
-                            left_col: li,
-                            right_col: ri,
-                            op: canon_op,
-                            tc: t,
-                        });
-                    }
-                    // Anything else (2nd range, `<>`, col-vs-literal, same-table,
-                    // arithmetic operand) → residual.
-                    _ => residual.push(expr.clone()),
+            Expr::BinaryOp { left, op, right } => match op {
+                BinaryOperator::And => {
+                    self.collect(left)?;
+                    self.collect(right)?;
                 }
-            }
-        },
-        // A non-binary, non-Nested top-level conjunct (IS [NOT] NULL, an OR group, a
-        // function, …) → residual.
-        _ => residual.push(expr.clone()),
+                _ => {
+                    // Classify a non-AND conjunct. It is consumed as an equi key pair or
+                    // the one physical range conjunct ONLY when both operands resolve to
+                    // columns of different tables; everything else — a literal operand, a
+                    // same-table pair, an arithmetic operand, a second range, `<>`, an
+                    // OR/IS NULL group — falls through to the residual. The residual binder
+                    // re-resolves and surfaces any genuine "column not found".
+                    let left_n = self.left_schema.columns.len();
+                    let cross = match (
+                        resolve_join_col_ref(left, self.alias_map),
+                        resolve_join_col_ref(right, self.alias_map),
+                    ) {
+                        (Ok(l), Ok(r)) => cross_table_pair(l, r, left_n),
+                        _ => None, // a literal/expression operand, or unresolved
+                    };
+                    match (op, cross) {
+                        // Cross-table column equality → equijoin key pair, validated as
+                        // today. A mixed/incompatible pair still errors via
+                        // validate_join_key_pair — it is NOT demoted to a residual (§3).
+                        (BinaryOperator::Eq, Some((li, ri, _swapped))) => {
+                            // Drop an exact-duplicate pair (`a.x = b.x AND a.x = b.x`, or
+                            // the same pair sides-swapped): byte-identical key slots,
+                            // keeping them only widens the synthetic PK and can spuriously
+                            // trip the arity cap. A pair sharing one column but not the
+                            // other (`a.x = b.x AND a.x = b.y`) is distinct and kept.
+                            if self
+                                .left_cols
+                                .iter()
+                                .zip(self.right_cols.iter())
+                                .any(|(&pl, &pr)| pl == li && pr == ri)
+                            {
+                                return Ok(());
+                            }
+                            // Push T only on the same path that pushes (li, ri) — after
+                            // the dup early-return — so the three vectors stay parallel.
+                            let t =
+                                validate_join_key_pair(&self.left_schema.columns[li], &self.right_schema.columns[ri])?;
+                            self.left_cols.push(li);
+                            self.right_cols.push(ri);
+                            self.target_tcs.push(t);
+                        }
+                        // Cross-table column ordering comparison, range slot still free →
+                        // the one physical range conjunct, canonicalized to `left_col OP
+                        // right_col` (converse on a right-table-first operand). A
+                        // non-order-preserving pair (string/blob/float) is rejected by
+                        // validate_range_join_key_pair — it never silently becomes a
+                        // residual. A *second* ordering comparison (range already set)
+                        // fails this guard and falls through to the residual.
+                        (_, Some((li, ri, swapped)))
+                            if sql_binop_to_range_rel(op).is_some() && self.range.is_none() =>
+                        {
+                            let rel = sql_binop_to_range_rel(op).expect("range rel present");
+                            let canon_op = if swapped { converse_rel(rel) } else { rel };
+                            let t = validate_range_join_key_pair(
+                                &self.left_schema.columns[li],
+                                &self.right_schema.columns[ri],
+                            )?;
+                            self.range = Some(RangeConjunct {
+                                left_col: li,
+                                right_col: ri,
+                                op: canon_op,
+                                tc: t,
+                            });
+                        }
+                        // Anything else (2nd range, `<>`, col-vs-literal, same-table,
+                        // arithmetic operand) → residual.
+                        _ => self.residual.push(expr.clone()),
+                    }
+                }
+            },
+            // A non-binary, non-Nested top-level conjunct (IS [NOT] NULL, an OR group, a
+            // function, …) → residual.
+            _ => self.residual.push(expr.clone()),
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Resolve a column reference in a JOIN ON clause to a global column index.

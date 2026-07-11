@@ -154,30 +154,23 @@ fn resolve_set_projection(
                     out_cols.push(col.clone());
                 }
             }
-            SelectItem::UnnamedExpr(expr) => match bind_single_table(expr, source_schema)? {
-                BoundExpr::ColRef(ci) => {
-                    indices.push(ci);
-                    out_cols.push(source_schema.columns[ci].clone());
-                }
-                _ => {
-                    return Err(GnitzSqlError::Unsupported(format!(
-                        "{context}: computed expressions are not supported"
-                    )))
-                }
-            },
-            SelectItem::ExprWithAlias { expr, alias } => match bind_single_table(expr, source_schema)? {
-                BoundExpr::ColRef(ci) => {
-                    indices.push(ci);
-                    let mut col = source_schema.columns[ci].clone();
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                // Resolve the column once; an alias only renames the output column.
+                let ci = match bind_single_table(expr, source_schema)? {
+                    BoundExpr::ColRef(ci) => ci,
+                    _ => {
+                        return Err(GnitzSqlError::Unsupported(format!(
+                            "{context}: computed expressions are not supported"
+                        )))
+                    }
+                };
+                indices.push(ci);
+                let mut col = source_schema.columns[ci].clone();
+                if let SelectItem::ExprWithAlias { alias, .. } = item {
                     col.name = alias.value.clone();
-                    out_cols.push(col);
                 }
-                _ => {
-                    return Err(GnitzSqlError::Unsupported(format!(
-                        "{context}: computed expressions are not supported"
-                    )))
-                }
-            },
+                out_cols.push(col);
+            }
             _ => {
                 return Err(GnitzSqlError::Unsupported(format!(
                     "{context}: unsupported SELECT item"

@@ -874,3 +874,55 @@ fn having_wildcard_agg_returns_error_not_panic() {
         "CREATE VIEW vc AS SELECT id, COUNT(*) FROM t GROUP BY id HAVING COUNT(*) > 0",
     );
 }
+
+// ── Qualified GROUP BY references (single-relation convention) ──────────────
+//
+// `GROUP BY t.g` binds like `GROUP BY g`: the qualifier carries no
+// disambiguating information over the single grouped source, matching HAVING
+// and the projection. The qualifier VALUE is ignored (`GROUP BY bogus.g` binds
+// `g`) — the crate-wide single-relation policy (`single_relation_col_name`),
+// pinned here as chosen behavior.
+
+#[test]
+fn group_by_accepts_qualified_column() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT NOT NULL, x BIGINT NOT NULL)",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW v AS SELECT g, SUM(x) AS sx FROM t GROUP BY t.g",
+    );
+    // Wrong qualifier is ignored — binds the bare name (chosen leniency).
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW v2 AS SELECT g, SUM(x) AS sx FROM t GROUP BY bogus.g",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "INSERT INTO t (id, g, x) VALUES (1, 5, 10), (2, 5, 20), (3, 7, 1)",
+    );
+    for view in ["v", "v2"] {
+        assert_eq!(
+            payload_rows(&mut client, &sn, view, &["g", "sx"]),
+            vec![vec![5, 30], vec![7, 1]],
+            "{view}: qualified GROUP BY groups like the bare form"
+        );
+    }
+    // A genuinely unknown column still errors, qualified or not.
+    assert!(try_exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW v3 AS SELECT g, SUM(x) FROM t GROUP BY t.nope"
+    )
+    .is_err());
+}

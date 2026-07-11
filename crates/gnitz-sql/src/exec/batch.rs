@@ -1,9 +1,9 @@
-use crate::ast_util::is_wildcard_projection;
+use crate::ast_util::{is_wildcard_projection, single_relation_col_name};
 use crate::bind::find_unique_column;
 use crate::codec::nullmap::{null_word_get, null_word_set};
 use crate::error::GnitzSqlError;
 use gnitz_core::{ColData, PkColumn, Schema, ZSetBatch};
-use sqlparser::ast::{Expr, SelectItem};
+use sqlparser::ast::SelectItem;
 
 pub(crate) fn copy_batch_row(src: &ZSetBatch, i: usize, dst: &mut ZSetBatch, schema: &Schema) {
     dst.pks.push_from(&src.pks, i);
@@ -27,23 +27,35 @@ pub(crate) fn apply_projection(
         return Ok((schema.clone(), b));
     }
 
-    // Extract named columns; dedup preserving first-occurrence order
+    // One output column per projection item (`SELECT a, a` yields two columns —
+    // the convention every other surface follows): the source column index and
+    // its output `ColumnDef` (alias applied). A reference is bare or qualified
+    // (`t.a`), the crate-wide single-relation convention; a mixed-in wildcard
+    // expands to every source column.
     let mut col_indices: Vec<usize> = Vec::new();
+    let mut out_defs: Vec<gnitz_core::ColumnDef> = Vec::new();
     for item in projection {
         match item {
-            SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
-                let idx = find_unique_column(&schema.columns, &ident.value)?
-                    .ok_or_else(|| GnitzSqlError::Bind(format!("column '{}' not found in projection", ident.value)))?;
-                if !col_indices.contains(&idx) {
-                    col_indices.push(idx);
+            SelectItem::Wildcard(_) => {
+                for (i, c) in schema.columns.iter().enumerate() {
+                    col_indices.push(i);
+                    out_defs.push(c.clone());
                 }
             }
-            SelectItem::Wildcard(_) => {
-                for i in 0..schema.columns.len() {
-                    if !col_indices.contains(&i) {
-                        col_indices.push(i);
-                    }
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                let name = single_relation_col_name(e).ok_or_else(|| {
+                    GnitzSqlError::Unsupported(
+                        "only simple column references supported in SELECT projection".to_string(),
+                    )
+                })?;
+                let idx = find_unique_column(&schema.columns, name)?
+                    .ok_or_else(|| GnitzSqlError::Bind(format!("column '{name}' not found in projection")))?;
+                col_indices.push(idx);
+                let mut def = schema.columns[idx].clone();
+                if let SelectItem::ExprWithAlias { alias, .. } = item {
+                    def.name = alias.value.clone();
                 }
+                out_defs.push(def);
             }
             _ => {
                 return Err(GnitzSqlError::Unsupported(
@@ -53,13 +65,14 @@ pub(crate) fn apply_projection(
         }
     }
 
-    // Identity fast-path: every source column projected in source order.
-    // Checked before allocating new_cols/new_schema — on the common case
-    // (named projection that names every column) those allocations would
+    // Identity fast-path: every source column projected once, in source order,
+    // under its own name. Checked before allocating new_schema — on the common
+    // case (named projection that names every column) those allocations would
     // be dead. The identity case projects every column, so PK columns are
     // included and the no-PK-projected guard below is satisfied implicitly.
-    let is_identity =
-        col_indices.len() == schema.columns.len() && col_indices.iter().enumerate().all(|(i, &ci)| ci == i);
+    let is_identity = col_indices.len() == schema.columns.len()
+        && col_indices.iter().enumerate().all(|(i, &ci)| ci == i)
+        && out_defs.iter().zip(&schema.columns).all(|(d, c)| d.name == c.name);
     if is_identity {
         let b = batch.unwrap_or_else(|| ZSetBatch::new(schema));
         return Ok((schema.clone(), b));
@@ -79,9 +92,8 @@ pub(crate) fn apply_projection(
         ));
     }
 
-    let new_cols: Vec<gnitz_core::ColumnDef> = col_indices.iter().map(|&i| schema.columns[i].clone()).collect();
     let new_schema = Schema {
-        columns: new_cols,
+        columns: out_defs,
         pk_cols: new_pk_cols,
     };
 
@@ -110,14 +122,11 @@ pub(crate) fn apply_projection(
     if pk_preserved {
         new_batch.pks = src_pks;
     } else {
-        // Single-PK source can't reach here: if the lone PK is projected
-        // then pk_preserved is true; if not, new_pk_cols is empty and we
-        // returned the no-PK-projected error above. So the source PK
-        // column is always compound (Bytes).
-        let src_bytes = match &src_pks {
-            PkColumn::Bytes { buf, .. } => buf.as_slice(),
-            _ => unreachable!("non-preserved PK rebuild requires compound source"),
-        };
+        // A subset / reordered / duplicated PK projection re-packs the region
+        // row by row. `get_tuple` reads any source variant into a uniform byte
+        // view (a duplicated lone PK — `SELECT pk, pk` — has a scalar source but
+        // a two-slot Bytes destination), and this path is cold: the common
+        // full-projection case took `pk_preserved` above.
         let src_stride = schema.pk_stride();
 
         // Per-PK (col_off, stride) is invariant across rows — hoist.
@@ -137,9 +146,9 @@ pub(crate) fn apply_projection(
             PkColumn::Bytes { buf, .. } => {
                 buf.reserve(row_count * new_schema.pk_stride());
                 for i in 0..row_count {
-                    let row_off = i * src_stride;
+                    let row = src_pks.get_tuple(i, src_stride as u8);
                     for &(col_off, stride) in &pk_mappings {
-                        buf.extend_from_slice(&src_bytes[row_off + col_off..row_off + col_off + stride]);
+                        buf.extend_from_slice(&row.buf[col_off..col_off + stride]);
                     }
                 }
             }
@@ -148,9 +157,9 @@ pub(crate) fn apply_projection(
                 let (col_off, stride) = pk_mappings[0];
                 v.reserve(row_count);
                 for i in 0..row_count {
-                    let row_off = i * src_stride;
+                    let row = src_pks.get_tuple(i, src_stride as u8);
                     let mut b = [0u8; 8];
-                    b[..stride].copy_from_slice(&src_bytes[row_off + col_off..row_off + col_off + stride]);
+                    b[..stride].copy_from_slice(&row.buf[col_off..col_off + stride]);
                     v.push(u64::from_le_bytes(b));
                 }
             }
@@ -158,9 +167,9 @@ pub(crate) fn apply_projection(
                 let (col_off, stride) = pk_mappings[0];
                 v.reserve(row_count);
                 for i in 0..row_count {
-                    let row_off = i * src_stride;
+                    let row = src_pks.get_tuple(i, src_stride as u8);
                     let mut b = [0u8; 16];
-                    b[..stride].copy_from_slice(&src_bytes[row_off + col_off..row_off + col_off + stride]);
+                    b[..stride].copy_from_slice(&row.buf[col_off..col_off + stride]);
                     v.push(u128::from_le_bytes(b));
                 }
             }
@@ -200,10 +209,19 @@ pub(crate) fn apply_projection(
     // 5. Payload columns: strictly payload→payload. `src_columns` is owned,
     //    so swap whole vectors instead of cloning per element — avoids
     //    per-row Option<String>/Option<Vec<u8>> allocations on string/blob
-    //    result sets.
-    for (_, new_ci, _) in new_schema.payload_columns() {
-        let old_ci = col_indices[new_ci];
-        let src_col = std::mem::replace(&mut src_columns[old_ci], ColData::Fixed(Vec::new()));
+    //    result sets. A source column projected more than once is cloned for
+    //    every occurrence but its last, which still takes the move.
+    let payload_maps: Vec<(usize, usize)> = new_schema
+        .payload_columns()
+        .map(|(_, new_ci, _)| (new_ci, col_indices[new_ci]))
+        .collect();
+    for (pos, &(new_ci, old_ci)) in payload_maps.iter().enumerate() {
+        let used_later = payload_maps[pos + 1..].iter().any(|&(_, o)| o == old_ci);
+        let src_col = if used_later {
+            src_columns[old_ci].clone()
+        } else {
+            std::mem::replace(&mut src_columns[old_ci], ColData::Fixed(Vec::new()))
+        };
         match (src_col, &mut new_batch.columns[new_ci]) {
             (ColData::Fixed(s), ColData::Fixed(d)) => *d = s,
             (ColData::Strings(s), ColData::Strings(d)) => *d = s,

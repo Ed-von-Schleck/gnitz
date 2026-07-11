@@ -3,9 +3,8 @@
 //! `plan/view` that knows about all the others.
 
 use crate::ast_util::{
-    collect_column_refs, collect_projection_column_refs, count_subqueries, extract_name, extract_relation_name,
-    extract_table_factor_name, flatten_conjuncts, group_by_is_present, is_wildcard_projection,
-    projection_has_aggregate, projection_item_expr,
+    body_is_grouped, collect_column_refs, collect_projection_column_refs, count_subqueries, extract_name,
+    extract_relation_name, extract_table_factor_name, flatten_conjuncts, is_wildcard_projection, projection_item_expr,
 };
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;
@@ -263,13 +262,11 @@ impl<'a> ViewShape<'a> {
         // classifies as GroupBy (its input resolution compiles the join to a
         // hidden view and the reduce runs over it).
         if !select.from[0].joins.is_empty() {
-            return Ok(
-                if group_by_is_present(&select.group_by) || projection_has_aggregate(select) {
-                    ViewShape::GroupBy(select)
-                } else {
-                    ViewShape::Join(select)
-                },
-            );
+            return Ok(if body_is_grouped(select) {
+                ViewShape::GroupBy(select)
+            } else {
+                ViewShape::Join(select)
+            });
         }
         // Exactly one `[NOT] EXISTS` / `[NOT] IN (SELECT …)` per view is
         // supported, anywhere in the WHERE or the projection. Two or more →
@@ -326,7 +323,7 @@ impl<'a> ViewShape<'a> {
         // synthetic-PK branch and the strict projection validator both already
         // handle the empty group set. A `MIN(x)+1` is detected too and rejected
         // by that validator, not by `Simple`'s lowering.
-        if group_by_is_present(&select.group_by) || projection_has_aggregate(select) {
+        if body_is_grouped(select) {
             return Ok(ViewShape::GroupBy(select));
         }
         // A scalar aggregate subquery / ANY / ALL in the WHERE or projection routes
@@ -355,7 +352,7 @@ fn is_compilable_hidden_body(s: &Select) -> bool {
         return true;
     }
     // A single-table body compiles when it carries a WHERE, a GROUP BY, or an aggregate.
-    s.selection.is_some() || group_by_is_present(&s.group_by) || projection_has_aggregate(s)
+    s.selection.is_some() || body_is_grouped(s)
 }
 
 /// Apply positional column aliases (`WITH d(a, b) AS …` / `(subquery) AS d(a, b)`)
@@ -535,7 +532,7 @@ fn compile_hidden_body(
     // view when its FROM is a JOIN; a plain JOIN body plans as a join chain
     // (synthetic PK, but it composes as a first-class relation — no `vis`);
     // everything else is a filter/map.
-    let grouped = group_by_is_present(&select.group_by) || projection_has_aggregate(select);
+    let grouped = body_is_grouped(select);
     let is_plain_join = !from.joins.is_empty() && !grouped;
     chain.add_segment(client, |client, chain, vid| {
         let (circuit, mut cols, pk) = if grouped {

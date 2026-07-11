@@ -5,7 +5,7 @@
 //! `DO UPDATE SET` assignment behaves exactly like an `UPDATE ... SET`.
 
 use crate::ast_util::extract_name;
-use crate::bind::{bind_single_table, Binder};
+use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_value_to_col, ColumnValue};
 use crate::codec::nullmap::null_word_set;
 use crate::codec::pk_codec::{extract_pk_value, is_null_expr};
@@ -14,7 +14,7 @@ use crate::error::GnitzSqlError;
 use crate::exec::batch::{apply_projection, copy_batch_row};
 use crate::ir::BoundExpr;
 use crate::SqlResult;
-use gnitz_core::{FixedInt, GnitzClient, PkTuple, Schema, WireConflictMode, ZSetBatch};
+use gnitz_core::{ColData, FixedInt, GnitzClient, PkColumn, PkTuple, Schema, WireConflictMode, ZSetBatch};
 use sqlparser::ast::{
     Assignment, ConflictTarget, Expr, Ident, OnConflict, OnConflictAction, OnInsert, Query, SelectItem, SetExpr,
     Statement, TableObject, Values,
@@ -146,9 +146,25 @@ pub(crate) fn execute_insert(
         }
     };
 
-    // Build the incoming batch from VALUES rows.
+    // Build the incoming batch from VALUES rows, reserving each buffer for the
+    // known row count up front.
     let mut batch = ZSetBatch::new(&schema);
     let n = rows.len();
+    match &mut batch.pks {
+        PkColumn::U64s(v) => v.reserve(n),
+        PkColumn::U128s(v) => v.reserve(n),
+        PkColumn::Bytes { buf, .. } => buf.reserve(n * schema.pk_stride()),
+    }
+    batch.weights.reserve(n);
+    batch.nulls.reserve(n);
+    for (_pi, ci, col_def) in schema.payload_columns() {
+        match &mut batch.columns[ci] {
+            ColData::Fixed(b) => b.reserve(n * col_def.type_code.wire_stride()),
+            ColData::Strings(v) => v.reserve(n),
+            ColData::Bytes(v) => v.reserve(n),
+            ColData::U128s(v) => v.reserve(n),
+        }
+    }
 
     // A SERIAL PK is the table's lone single-column PK (enforced at CREATE), so
     // the user omits it: arity excludes it, the PK is drawn from the sequence and
@@ -284,10 +300,7 @@ fn bind_do_update_rhs(expr: &Expr, schema: &Schema) -> Result<BoundUpdateExpr, G
     if let Expr::CompoundIdentifier(parts) = expr {
         if parts.len() == 2 && parts[0].value.eq_ignore_ascii_case("EXCLUDED") {
             let col_name = parts[1].value.as_str();
-            let col_idx = schema
-                .columns
-                .iter()
-                .position(|c| c.name.eq_ignore_ascii_case(col_name))
+            let col_idx = find_unique_column(&schema.columns, col_name)?
                 .ok_or_else(|| GnitzSqlError::Bind(format!("EXCLUDED.{col_name}: column not found")))?;
             return Ok(BoundUpdateExpr::Excluded(BoundExpr::ColRef(col_idx)));
         }
@@ -307,14 +320,16 @@ fn bind_do_update_rhs(expr: &Expr, schema: &Schema) -> Result<BoundUpdateExpr, G
     Ok(BoundUpdateExpr::Existing(bound))
 }
 
-/// Returns true if `expr` contains any `EXCLUDED.<col>` compound identifier.
+/// Returns true if `expr` contains any `EXCLUDED.<col>` compound identifier —
+/// walking the shared `expr_operands` node set (CASE, BETWEEN, IN lists,
+/// function arguments included), so a reference the binder would reach cannot
+/// hide from this guard and silently bind to the *existing* row's column.
 fn expr_contains_excluded(expr: &Expr) -> bool {
     match expr {
         Expr::CompoundIdentifier(parts) => parts.len() == 2 && parts[0].value.eq_ignore_ascii_case("EXCLUDED"),
-        Expr::BinaryOp { left, right, .. } => expr_contains_excluded(left) || expr_contains_excluded(right),
-        Expr::UnaryOp { expr: inner, .. } => expr_contains_excluded(inner),
-        Expr::Nested(inner) => expr_contains_excluded(inner),
-        _ => false,
+        _ => crate::ast_util::expr_operands(expr)
+            .into_iter()
+            .any(expr_contains_excluded),
     }
 }
 
@@ -556,5 +571,40 @@ mod tests {
     fn insert_wrong_name_is_rejected() {
         let err = validate_insert_column_list(&idents(&["pk", "nope"]), &two_col(TypeCode::I64)).unwrap_err();
         assert!(matches!(err, GnitzSqlError::Unsupported(_)), "got {err:?}");
+    }
+
+    fn parse(src: &str) -> Expr {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+        Parser::new(&GenericDialect {})
+            .try_with_sql(src)
+            .unwrap()
+            .parse_expr()
+            .unwrap()
+    }
+
+    /// An `EXCLUDED.col` reference anywhere the binder can reach — inside CASE,
+    /// BETWEEN, function arguments, IN lists — must be detected, so the compound
+    /// RHS is rejected rather than the qualifier being silently dropped and the
+    /// reference bound to the existing row's column.
+    #[test]
+    fn excluded_detected_in_every_operand_position() {
+        for src in [
+            "EXCLUDED.a",
+            "val + EXCLUDED.a",
+            "-EXCLUDED.a",
+            "(EXCLUDED.a)",
+            "COALESCE(EXCLUDED.a, 0)",
+            "CASE WHEN EXCLUDED.a > 0 THEN 1 ELSE 0 END",
+            "CASE val WHEN 1 THEN EXCLUDED.a END",
+            "val BETWEEN EXCLUDED.a AND 10",
+            "val IN (1, EXCLUDED.a)",
+            "EXCLUDED.a IS NULL",
+        ] {
+            assert!(expr_contains_excluded(&parse(src)), "must detect EXCLUDED in {src}");
+        }
+        for src in ["val + 1", "COALESCE(val, 0)", "t.a", "CASE WHEN val > 0 THEN 1 END"] {
+            assert!(!expr_contains_excluded(&parse(src)), "false positive on {src}");
+        }
     }
 }

@@ -206,19 +206,16 @@ pub(crate) fn emit_group_by_pieces(
     };
     let mut group_col_indices: Vec<usize> = Vec::new();
     for ge in group_exprs {
-        match ge {
-            Expr::Identifier(id) => {
-                let idx = find_unique_column(&source_schema.columns, &id.value)?
-                    .ok_or_else(|| GnitzSqlError::Bind(format!("GROUP BY column '{}' not found", id.value)))?;
-                reject_float_key(&source_schema.columns[idx], "GROUP BY")?;
-                group_col_indices.push(idx);
-            }
-            _ => {
-                return Err(GnitzSqlError::Unsupported(
-                    "GROUP BY: only simple column references supported".to_string(),
-                ))
-            }
-        }
+        // Bare or qualified (`t.g`) single-relation reference — the qualifier
+        // carries no disambiguating information over the single grouped source,
+        // matching HAVING and the projection (`bind_single_table`).
+        let name = single_relation_col_name(ge).ok_or_else(|| {
+            GnitzSqlError::Unsupported("GROUP BY: only simple column references supported".to_string())
+        })?;
+        let idx = find_unique_column(&source_schema.columns, name)?
+            .ok_or_else(|| GnitzSqlError::Bind(format!("GROUP BY column '{name}' not found")))?;
+        reject_float_key(&source_schema.columns[idx], "GROUP BY")?;
+        group_col_indices.push(idx);
     }
 
     // An empty group set is the user's ungrouped (global) scalar aggregate —
@@ -690,14 +687,7 @@ fn having_agg_func(
 /// COUNT(*) ignores arg_col (it has none); every other form matches the source
 /// column too, so `MAX(c2)` never binds to `SUM(c1)`.
 fn agg_mapping_matches(m: &AggMapping, agg_func: AggFunc, arg_col: Option<usize>) -> bool {
-    match agg_func {
-        AggFunc::Avg => m.agg_func == AggFunc::Avg && m.arg_col == arg_col,
-        AggFunc::Count => m.agg_func == AggFunc::Count,
-        AggFunc::CountNonNull => m.agg_func == AggFunc::CountNonNull && m.arg_col == arg_col,
-        AggFunc::Sum => m.agg_func == AggFunc::Sum && m.arg_col == arg_col,
-        AggFunc::Min => m.agg_func == AggFunc::Min && m.arg_col == arg_col,
-        AggFunc::Max => m.agg_func == AggFunc::Max && m.arg_col == arg_col,
-    }
+    m.agg_func == agg_func && (matches!(agg_func, AggFunc::Count) || m.arg_col == arg_col)
 }
 
 /// Push the engine `agg_specs` for one aggregate and return whether it is an

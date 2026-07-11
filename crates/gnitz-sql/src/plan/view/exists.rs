@@ -32,8 +32,8 @@
 //! exchange (`[_src_pk × pa, outer cols…]`).
 
 use crate::ast_util::{
-    expr_operands, extract_table_name_and_alias, find_subquery, flatten_conjuncts, group_by_is_present,
-    is_wildcard_projection, projection_has_aggregate, projection_item_expr,
+    body_is_grouped, expr_operands, extract_table_name_and_alias, find_subquery, flatten_conjuncts,
+    is_wildcard_projection, projection_item_expr,
 };
 use crate::bind::{
     bind_single_table, bind_single_table_mark, build_alias_map, resolve_qualified_column, resolve_unqualified_column,
@@ -48,12 +48,11 @@ use crate::plan::validate::{
     reject_unhonored_select_clauses, HonoredClauses, HonoredQueryClauses,
 };
 use crate::plan::view::join::{
-    build_join_view_projection, build_pure_range_threshold, normalize_to_ab, side_target_tcs,
+    band_union_schema, build_join_view_projection, build_pure_range_threshold, emit_equi_join_terms,
+    is_identity_projection, join_pk_coldefs, normalize_to_ab, range_gate_reindex_prologue, range_slots,
+    side_target_tcs, union_null_key_rows, EquiSide, EquiTerms, RangeSlots,
 };
-use crate::plan::view::predicates::{
-    and_fold_compile, build_reindex_program, converse_rel, extract_join_predicates, multi_null_filter_prog,
-    RangeConjunct,
-};
+use crate::plan::view::predicates::{and_fold_compile, build_reindex_program, extract_join_predicates, RangeConjunct};
 use crate::plan::view::EmitPieces;
 use gnitz_core::{CircuitBuilder, ColumnDef, FixedInt, GnitzClient, NodeId, Schema, TypeCode};
 use sqlparser::ast::{BinaryOperator, Expr, Ident, Select, SelectItem, SetExpr};
@@ -71,6 +70,7 @@ pub(crate) fn emit_exists_pieces(
     local_conjuncts: &[&Expr],
     binder: &mut Binder<'_>,
 ) -> Result<EmitPieces, GnitzSqlError> {
+    let outer = resolve_exists_outer(client, select, binder)?;
     let (ctx, range) = resolve_correlation(
         client,
         select,
@@ -79,6 +79,7 @@ pub(crate) fn emit_exists_pieces(
         local_conjuncts,
         /* is_mark = */ false,
         binder,
+        outer,
     )?;
     emit_correlated(view_id, ctx, range, /* is_mark = */ false)
 }
@@ -102,6 +103,7 @@ pub(crate) fn emit_mark_pieces(
         .chain(select.projection.iter().filter_map(projection_item_expr))
         .find_map(find_subquery)
         .ok_or_else(|| GnitzSqlError::Plan("mark builder dispatched with no EXISTS/IN subquery".into()))?;
+    let outer = resolve_exists_outer(client, select, binder)?;
     // No outer local pre-filter: the whole WHERE is applied post-mark, per branch.
     let (ctx, range) = resolve_correlation(
         client,
@@ -111,25 +113,25 @@ pub(crate) fn emit_mark_pieces(
         &[],
         /* is_mark = */ true,
         binder,
+        outer,
     )?;
     emit_correlated(view_id, ctx, range, /* is_mark = */ true)
 }
 
-/// Shared front half: resolve the outer/inner relations, extract the correlation
-/// predicates + inner pre-filter, and compile the outer local pre-filter.
-#[allow(clippy::too_many_arguments)]
-fn resolve_correlation<'a>(
+/// The resolved outer relation of an EXISTS/IN view — `(tid, schema, alias)`.
+type ResolvedOuter = (u64, Rc<Schema>, String);
+
+/// Validate the outer SELECT's envelope and resolve its FROM relation. Hoisted
+/// out of `resolve_correlation` so a caller can substitute a different outer
+/// (the shared correlation core takes the pre-resolved triple as a parameter).
+fn resolve_exists_outer(
     client: &mut GnitzClient,
-    select: &'a Select,
-    subq: &Expr,
-    outer_not: bool,
-    local_conjuncts: &[&Expr],
-    is_mark: bool,
+    select: &Select,
     binder: &mut Binder<'_>,
-) -> Result<(ExistsCtx<'a>, Option<RangeConjunct>), GnitzSqlError> {
+) -> Result<ResolvedOuter, GnitzSqlError> {
     // GROUP BY / aggregates cannot host the subquery in one circuit; a targeted
     // message beats the generic clause guard's.
-    if group_by_is_present(&select.group_by) || projection_has_aggregate(select) {
+    if body_is_grouped(select) {
         return Err(GnitzSqlError::Unsupported(
             "EXISTS/IN subqueries are not supported together with GROUP BY/aggregates; \
              put the subquery in an inner view"
@@ -148,10 +150,26 @@ fn resolve_correlation<'a>(
         },
         "CREATE VIEW EXISTS/IN",
     )?;
-
-    // ── Outer relation ────────────────────────────────────────────────────────
     let (outer_name, outer_alias) = extract_table_name_and_alias(&select.from[0].relation, "CREATE VIEW EXISTS/IN")?;
     let (outer_tid, outer_schema) = binder.resolve(client, &outer_name)?;
+    Ok((outer_tid, outer_schema, outer_alias))
+}
+
+/// Shared front half: resolve the inner relation against the pre-resolved
+/// `outer`, extract the correlation predicates + inner pre-filter, and compile
+/// the outer local pre-filter.
+#[allow(clippy::too_many_arguments)]
+fn resolve_correlation<'a>(
+    client: &mut GnitzClient,
+    select: &'a Select,
+    subq: &Expr,
+    outer_not: bool,
+    local_conjuncts: &[&Expr],
+    is_mark: bool,
+    binder: &mut Binder<'_>,
+    outer: ResolvedOuter,
+) -> Result<(ExistsCtx<'a>, Option<RangeConjunct>), GnitzSqlError> {
+    let (outer_tid, outer_schema, outer_alias) = outer;
 
     // ── Subquery envelope ────────────────────────────────────────────────────
     // For IN, `in_operand` carries the outer operand expression.
@@ -199,22 +217,13 @@ fn resolve_correlation<'a>(
         },
         "EXISTS/IN subquery",
     )?;
-    // The subquery FROM must be one plain relation. A derived table is rejected
-    // explicitly: the front door pre-compiles derived tables only in the view's
-    // top-level FROM, so the lenient alias extractor would mis-resolve one here.
-    if inner_select.from.len() != 1
-        || !inner_select.from[0].joins.is_empty()
-        || matches!(
-            &inner_select.from[0].relation,
-            sqlparser::ast::TableFactor::Derived { .. }
-        )
-    {
-        return Err(GnitzSqlError::Unsupported(
-            "EXISTS/IN subquery: only a single FROM table without JOINs is supported; compose via views".into(),
-        ));
-    }
-    let (inner_name, inner_alias) = extract_table_name_and_alias(&inner_select.from[0].relation, "EXISTS/IN subquery")?;
-    let (inner_tid, inner_schema) = binder.resolve(client, &inner_name)?;
+    let (inner_tid, inner_schema, inner_alias) = resolve_single_plain_from(
+        client,
+        binder,
+        &inner_select.from,
+        "EXISTS/IN subquery: only a single FROM table without JOINs is supported; compose via views",
+        "EXISTS/IN subquery",
+    )?;
 
     // The 2-term DBSP join formula assumes the two input deltas are never
     // simultaneously active — the same-source shape would drop the bilinear
@@ -243,31 +252,13 @@ fn resolve_correlation<'a>(
     ]);
 
     // ── Inner WHERE: split conjuncts by side ─────────────────────────────────
-    // outer == 0            → inner pre-filter (constant conjuncts included);
-    // outer > 0, inner == 0 → reject (hoisting would be semantically wrong for
-    //                         NOT EXISTS, so no silent rewrite);
-    // both sides            → correlation predicate.
-    let mut inner_conjuncts: Vec<&Expr> = Vec::new();
-    if let Some(w) = &inner_select.selection {
-        flatten_conjuncts(w, &mut inner_conjuncts);
-    }
-    let mut prefilter: Vec<&Expr> = Vec::new();
-    let mut corr_acc: Option<Expr> = None;
-    for &c in &inner_conjuncts {
-        let (mut outer_refs, mut inner_refs) = (0usize, 0usize);
-        count_side_refs(c, &alias_map, outer_n, &mut outer_refs, &mut inner_refs)?;
-        if outer_refs == 0 {
-            prefilter.push(c);
-        } else if inner_refs == 0 {
-            return Err(GnitzSqlError::Unsupported(
-                "EXISTS/IN subquery WHERE conjunct references only the outer relation; \
-                 hoist it into the view's own WHERE clause"
-                    .into(),
-            ));
-        } else {
-            and_into(&mut corr_acc, c.clone());
-        }
-    }
+    let (prefilter, mut corr_acc) = split_correlation_conjuncts(
+        inner_select.selection.as_ref(),
+        &alias_map,
+        outer_n,
+        "EXISTS/IN subquery WHERE conjunct references only the outer relation; \
+         hoist it into the view's own WHERE clause",
+    )?;
     let prefilter_prog = and_fold_compile(
         prefilter.iter().copied(),
         |e| bind_single_table(e, &inner_schema),
@@ -518,48 +509,36 @@ fn emit_equi_exists(view_id: u64, ctx: ExistsCtx<'_>, is_mark: bool) -> Result<E
 
     let left_target_tcs = side_target_tcs(&ctx.left_cols, &ctx.outer_schema, &ctx.target_tcs);
     let right_target_tcs = side_target_tcs(&ctx.right_cols, &ctx.inner_schema, &ctx.target_tcs);
-    // A NULL equi key matches nothing (SQL 3VL): gate NULL keys out of the
-    // match on both sides. The unfiltered `a_local` still reaches `a_all`, so a
-    // NULL-keyed outer row is never in `π_A(inner)` and lands in ν at full
-    // multiplicity — anti includes it (no match exists), semi cancels it to 0.
-    let left_key_nullable = ctx.left_cols.iter().any(|&c| ctx.outer_schema.columns[c].is_nullable);
-    let right_key_nullable = ctx.right_cols.iter().any(|&c| ctx.inner_schema.columns[c].is_nullable);
 
     let (mut cb, a_local, b_local) = ctx.open_circuit(view_id);
 
-    let b_match = if right_key_nullable {
-        cb.filter(
-            b_local,
-            Some(multi_null_filter_prog(&ctx.right_cols, &ctx.inner_schema, false)?),
-        )
-    } else {
-        b_local
-    };
-    let reindex_b = cb.map_reindex(
-        b_match,
-        &ctx.right_cols,
-        &right_target_tcs,
-        build_reindex_program(&ctx.inner_schema),
-    );
-    let a_match = if left_key_nullable {
-        cb.filter(
-            a_local,
-            Some(multi_null_filter_prog(&ctx.left_cols, &ctx.outer_schema, false)?),
-        )
-    } else {
-        a_local
-    };
-    let reindex_a = cb.map_reindex(
-        a_match,
-        &ctx.left_cols,
-        &left_target_tcs,
-        build_reindex_program(&ctx.outer_schema),
-    );
-
-    let trace_a = cb.integrate_trace(reindex_a);
-    let trace_b = cb.integrate_trace(reindex_b);
-    let join_ab = cb.join_with_trace_node(reindex_a, trace_b); // [k pk, A, B]
-    let join_ba = cb.join_with_trace_node(reindex_b, trace_a); // [k pk, B, A]
+    // The symmetric 2-term join over the NULL-gated sides (SQL 3VL: a NULL equi
+    // key matches nothing). The unfiltered `a_local` still reaches `a_all`, so a
+    // NULL-keyed outer row is never in `π_A(inner)` and lands in ν at full
+    // multiplicity — anti includes it (no match exists), semi cancels it to 0.
+    let EquiTerms {
+        reindex_a,
+        a_nullable: left_key_nullable,
+        join_ab, // [k pk, A, B]
+        join_ba, // [k pk, B, A]
+        ..
+    } = emit_equi_join_terms(
+        &mut cb,
+        EquiSide {
+            input: a_local,
+            cols: &ctx.left_cols,
+            target_tcs: &left_target_tcs,
+            schema: &ctx.outer_schema,
+            keep: &(0..a_n).collect::<Vec<_>>(),
+        },
+        EquiSide {
+            input: b_local,
+            cols: &ctx.right_cols,
+            target_tcs: &right_target_tcs,
+            schema: &ctx.inner_schema,
+            keep: &(0..b_n).collect::<Vec<_>>(),
+        },
+    )?;
 
     // π_A(inner): project each term straight to [_join_pk × k, A] — B's columns
     // are never carried (no normalize_to_ab).
@@ -581,18 +560,9 @@ fn emit_equi_exists(view_id: u64, ctx: ExistsCtx<'_>, is_mark: bool) -> Result<E
         reindex_a
     };
     // View PK = the k synthetic `_join_pk` columns (the pairs' promoted types,
-    // non-nullable); payload = the user projection over the outer relation only.
-    let mut out_pk_cols: Vec<ColumnDef> = Vec::with_capacity(k);
-    for (i, &t) in ctx.target_tcs.iter().enumerate() {
-        let name = if k == 1 {
-            "_join_pk".to_string()
-        } else {
-            format!("_join_pk_{i}")
-        };
-        // Hidden: the synthetic correlation key is a physical PK column, not a
-        // presentation column — `SELECT *` shows the outer projection only.
-        out_pk_cols.push(ColumnDef::new(name, t, false).hidden());
-    }
+    // non-nullable, hidden); payload = the user projection over the outer
+    // relation only.
+    let out_pk_cols = join_pk_coldefs(&ctx.target_tcs);
     if is_mark {
         // Both branches over one shared ν, keyed [_join_pk, A].
         let (matched, unmatched) = semi_and_anti(&mut cb, a_all, pi_a);
@@ -619,70 +589,32 @@ fn emit_range_exists(
     let pa = ctx.outer_schema.pk_cols.len();
     let zero_a = vec![0u8; pa];
 
-    // Reindex columns and per-slot common type: eq pairs first, range slot last.
-    let left_reindex_cols: Vec<usize> = ctx
-        .left_cols
-        .iter()
-        .copied()
-        .chain(std::iter::once(range.left_col))
-        .collect();
-    let right_reindex_cols: Vec<usize> = ctx
-        .right_cols
-        .iter()
-        .copied()
-        .chain(std::iter::once(range.right_col))
-        .collect();
-    let all_tcs: Vec<TypeCode> = ctx
-        .target_tcs
-        .iter()
-        .copied()
-        .chain(std::iter::once(range.tc))
-        .collect();
-    let left_target_tcs = side_target_tcs(&left_reindex_cols, &ctx.outer_schema, &all_tcs);
-    let right_target_tcs = side_target_tcs(&right_reindex_cols, &ctx.inner_schema, &all_tcs);
-    let rel_ab = converse_rel(range.op);
-    let rel_ba = range.op;
-
-    // NULL exclusion (SQL 3VL) over ALL key cols (eq + range): the match drops
-    // NULL-key rows on both sides; `a_local` (NULL keys included) still feeds
-    // `a_all` / the anti NULL-key branch, so those rows count as unmatched.
-    let left_key_nullable = left_reindex_cols
-        .iter()
-        .any(|&c| ctx.outer_schema.columns[c].is_nullable);
-    let right_key_nullable = right_reindex_cols
-        .iter()
-        .any(|&c| ctx.inner_schema.columns[c].is_nullable);
+    // Reindex-slot layout (eq pairs first, range slot last) and the §3 term
+    // relations, shared with the range join builder.
+    let slots = range_slots(
+        &ctx.left_cols,
+        &ctx.right_cols,
+        &ctx.target_tcs,
+        &range,
+        &ctx.outer_schema,
+        &ctx.inner_schema,
+    );
 
     let (mut cb, a_local, b_local) = ctx.open_circuit(view_id);
 
-    let input_a = if left_key_nullable {
-        cb.filter(
-            a_local,
-            Some(multi_null_filter_prog(&left_reindex_cols, &ctx.outer_schema, false)?),
-        )
-    } else {
-        a_local
-    };
-    let input_b = if right_key_nullable {
-        cb.filter(
-            b_local,
-            Some(multi_null_filter_prog(&right_reindex_cols, &ctx.inner_schema, false)?),
-        )
-    } else {
-        b_local
-    };
-    let reindex_a = cb.map_reindex(
-        input_a,
-        &left_reindex_cols,
-        &left_target_tcs,
-        build_reindex_program(&ctx.outer_schema),
-    );
-    let reindex_b = cb.map_reindex(
-        input_b,
-        &right_reindex_cols,
-        &right_target_tcs,
-        build_reindex_program(&ctx.inner_schema),
-    );
+    // NULL exclusion + both reindexes (the shared range prologue, SQL 3VL over
+    // ALL key cols — eq + range): the match drops NULL-key rows on both sides;
+    // `a_local` (NULL keys included) still feeds `a_all` / the anti NULL-key
+    // branch, so those rows count as unmatched.
+    let (reindex_a, reindex_b, left_key_nullable) =
+        range_gate_reindex_prologue(&mut cb, a_local, b_local, &slots, &ctx.outer_schema, &ctx.inner_schema)?;
+    let RangeSlots {
+        left_reindex_cols,
+        all_tcs,
+        rel_ab,
+        rel_ba,
+        ..
+    } = slots;
 
     // Per correlation shape, compute the branch node(s): `(primary, None)` for
     // the filter view, or the `(matched, Some(unmatched))` pair for the mark view.
@@ -719,21 +651,8 @@ fn emit_range_exists(
             if left_key_nullable {
                 // NULL-range-key rows never reach `int_a`/`trace_a` (3VL) and
                 // never match the threshold: their own branch off the
-                // NULL-gate-unfiltered `a_local`, re-keyed to a.pk and routed
-                // ONCE by a local partition_filter (broadcast would emit W×
-                // copies the output shard would sum).
-                let anull = cb.filter(
-                    a_local,
-                    Some(multi_null_filter_prog(&left_reindex_cols, &ctx.outer_schema, true)?),
-                );
-                let anull_keyed = cb.map_reindex(
-                    anull,
-                    &ctx.outer_schema.pk_cols,
-                    &zero_a,
-                    build_reindex_program(&ctx.outer_schema),
-                );
-                let anull_owned = cb.partition_filter(anull_keyed);
-                Ok(cb.union(nf_match, anull_owned))
+                // NULL-gate-unfiltered `a_local` (`union_null_key_rows`).
+                union_null_key_rows(cb, nf_match, a_local, &left_reindex_cols, &ctx.outer_schema)
             } else {
                 Ok(nf_match)
             }
@@ -762,16 +681,7 @@ fn emit_range_exists(
         // π_A(inner) keyed by the outer source PK: a reindex Map's output is
         // [new-PK, <every input col>], so re-key `merged` by A's PK columns
         // (sitting at k + pk within the union layout), then project the A region.
-        let mut union_cols: Vec<ColumnDef> = Vec::with_capacity(k + a_n + b_n);
-        for (i, &t) in all_tcs.iter().enumerate() {
-            union_cols.push(ColumnDef::new(format!("_join_pk_{i}"), t, false));
-        }
-        union_cols.extend(ctx.outer_schema.columns.iter().cloned());
-        union_cols.extend(ctx.inner_schema.columns.iter().cloned());
-        let union_schema = Schema {
-            columns: union_cols,
-            pk_cols: (0..k).collect(),
-        };
+        let union_schema = band_union_schema(&all_tcs, &ctx.outer_schema, &ctx.inner_schema);
         let a_pk_in_union: Vec<usize> = ctx.outer_schema.pk_cols.iter().map(|&p| k + p).collect();
         let rekey_a = cb.map_reindex(merged, &a_pk_in_union, &zero_a, build_reindex_program(&union_schema));
         let proj_a = cb.map(rekey_a, &(pa + k..pa + k + a_n).collect::<Vec<_>>()); // π_A(inner), [a.pk…, A]
@@ -838,7 +748,7 @@ fn finish_exists_pieces(
         |i| ctx.outer_schema.columns[i].clone(),
         "EXISTS view",
     )?;
-    let is_identity = final_projection.len() == a_n && final_projection.iter().enumerate().all(|(i, &p)| p == i + npk);
+    let is_identity = is_identity_projection(&final_projection, a_n, npk);
     let mut sink_input = if is_identity {
         sink_pre
     } else {
@@ -971,6 +881,78 @@ fn build_mark_projection(
         out_cols.push(col);
     }
     Ok((items, out_cols))
+}
+
+/// Resolve a subquery's single plain FROM to `(tid, schema, alias)`: exactly
+/// one relation, no JOINs, no derived table (the front door pre-compiles
+/// derived tables only in the view's top-level FROM, so the lenient alias
+/// extractor would mis-resolve one here). `shape_err` is the caller's full
+/// unsupported-shape sentence; `ctx` names the surface in the name-extraction
+/// error. Alias-clash checks stay in the callers (they interpolate different
+/// relation names). Shared by the EXISTS/IN and scalar-subquery builders.
+pub(crate) fn resolve_single_plain_from(
+    client: &mut GnitzClient,
+    binder: &mut Binder<'_>,
+    from: &[sqlparser::ast::TableWithJoins],
+    shape_err: &str,
+    ctx: &str,
+) -> Result<(u64, Rc<Schema>, String), GnitzSqlError> {
+    if from.len() != 1
+        || !from[0].joins.is_empty()
+        || matches!(&from[0].relation, sqlparser::ast::TableFactor::Derived { .. })
+    {
+        return Err(GnitzSqlError::Unsupported(shape_err.into()));
+    }
+    let (name, alias) = extract_table_name_and_alias(&from[0].relation, ctx)?;
+    let (tid, schema) = binder.resolve(client, &name)?;
+    Ok((tid, schema, alias))
+}
+
+/// Split a subquery's WHERE conjuncts by which relation they reference,
+/// resolved through the two-relation `alias_map` (outer at offset 0, width
+/// `outer_n`):
+///   outer == 0            → inner pre-filter (constant conjuncts included);
+///   outer > 0, inner == 0 → reject with the caller's `hoist_err` (hoisting
+///                           would be semantically wrong for NOT EXISTS, so no
+///                           silent rewrite);
+///   both sides            → AND-folded into the correlation accumulator.
+/// Returns `(prefilters, correlation)`. Shared by the EXISTS/IN and
+/// scalar-subquery builders; everything downstream of the split (the IN-pair
+/// injection, envelope checks, classification policy) stays in the callers.
+pub(crate) fn split_correlation_conjuncts<'e>(
+    selection: Option<&'e Expr>,
+    alias_map: &AliasMap,
+    outer_n: usize,
+    hoist_err: &str,
+) -> Result<(Vec<&'e Expr>, Option<Expr>), GnitzSqlError> {
+    let mut conjuncts: Vec<&Expr> = Vec::new();
+    if let Some(w) = selection {
+        flatten_conjuncts(w, &mut conjuncts);
+    }
+    let mut prefilters: Vec<&Expr> = Vec::new();
+    let mut corr_acc: Option<Expr> = None;
+    for &c in &conjuncts {
+        let (mut outer_refs, mut inner_refs) = (0usize, 0usize);
+        count_side_refs(c, alias_map, outer_n, &mut outer_refs, &mut inner_refs)?;
+        if outer_refs == 0 {
+            prefilters.push(c);
+        } else if inner_refs == 0 {
+            return Err(GnitzSqlError::Unsupported(hoist_err.into()));
+        } else {
+            and_into(&mut corr_acc, c.clone());
+        }
+    }
+    Ok((prefilters, corr_acc))
+}
+
+/// AND-fold a conjunct list into one expression tree, left to right; `None`
+/// for an empty list.
+pub(crate) fn fold_and(conjuncts: impl IntoIterator<Item = Expr>) -> Option<Expr> {
+    let mut acc: Option<Expr> = None;
+    for c in conjuncts {
+        and_into(&mut acc, c);
+    }
+    acc
 }
 
 /// AND a conjunct into the accumulating correlation tree.

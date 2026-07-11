@@ -1,12 +1,14 @@
 use super::resolve::find_unique_column;
-use crate::ast_util::single_relation_col_name;
+use crate::ast_util::{
+    agg_func_from_name, fn_name_is, function_positional_args, reject_unsupported_fn_qualifiers, single_fn_name,
+    single_relation_col_name,
+};
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BinOp, BoundExpr, UnaryOp};
 use crate::types::is_min_max_orderable;
 use gnitz_core::Schema;
 use sqlparser::ast::{
-    BinaryOperator, CaseWhen, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
-    UnaryOperator, Value,
+    BinaryOperator, CaseWhen, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, UnaryOperator, Value,
 };
 
 /// Bind an expression against a single-relation schema (WHERE, projections,
@@ -265,35 +267,6 @@ fn bind_literal(v: &Value) -> Result<BoundExpr, GnitzSqlError> {
     }
 }
 
-/// Case-insensitive match on an unqualified single-part function name — no
-/// allocation, unlike `f.name.to_string()`.
-fn fn_name_is(f: &Function, name: &str) -> bool {
-    matches!(f.name.0.as_slice(), [part]
-        if part.as_ident().is_some_and(|i| i.value.eq_ignore_ascii_case(name)))
-}
-
-/// Plain positional argument exprs of a function call, or a clean `Unsupported`
-/// for `*`, named args, DISTINCT, or any qualifier (FILTER/OVER/…) — the shared
-/// qualifier inventory (`reject_unsupported_fn_qualifiers`). Backs the
-/// COALESCE/NULLIF structural desugar, which need bare operand exprs.
-fn function_positional_args<'f>(f: &'f Function, name: &str) -> Result<Vec<&'f Expr>, GnitzSqlError> {
-    reject_unsupported_fn_qualifiers(f, name)?;
-    let FunctionArguments::List(list) = &f.args else {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "{name}: requires a parenthesized argument list"
-        )));
-    };
-    list.args
-        .iter()
-        .map(|arg| match arg {
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e),
-            _ => Err(GnitzSqlError::Unsupported(format!(
-                "{name}: expects plain positional arguments (no `*`, named args)"
-            ))),
-        })
-        .collect()
-}
-
 /// `COALESCE(args…)` desugars right-to-left into CASE: the first non-NULL operand
 /// is the result. Total over arity via explicit base cases; a literal operand is
 /// folded at the AST level so it never reaches `bind_null_test` (which resolves a
@@ -379,52 +352,23 @@ impl SingleTable<'_> {
     }
 }
 
-/// Reject any qualifier on an aggregate call that the binder does not implement.
-/// Both aggregate-binding sites (`SingleTable::bind_function` and HAVING's
-/// `having_agg_func`) and the COALESCE/NULLIF desugar read only the argument
-/// list; every other `Function` field would otherwise be silently dropped,
-/// computing the plain call. `on` names the rejecting context ("aggregates",
-/// "COALESCE", …) in the message.
-pub(crate) fn reject_unsupported_fn_qualifiers(func: &Function, on: &str) -> Result<(), GnitzSqlError> {
-    // Colon form ("{what}: not supported …") sidesteps subject-verb number
-    // agreement and matches the binder's existing message style
-    // (e.g. "{name}: not supported on {:?} columns").
-    let unsupported = |what: &str| Err(GnitzSqlError::Unsupported(format!("{what}: not supported on {on}")));
-    if func.filter.is_some() {
-        return unsupported("FILTER (WHERE …)");
-    }
-    if func.over.is_some() {
-        return unsupported("window functions (OVER)");
-    }
-    if !func.within_group.is_empty() {
-        return unsupported("WITHIN GROUP (ORDER BY …)");
-    }
-    if func.null_treatment.is_some() {
-        return unsupported("IGNORE/RESPECT NULLS");
-    }
-    if !matches!(func.parameters, FunctionArguments::None) {
-        return unsupported("parametric (ClickHouse) calls");
-    }
-    if let FunctionArguments::List(list) = &func.args {
-        if matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct)) {
-            return unsupported("DISTINCT");
-        }
-        if !list.clauses.is_empty() {
-            return unsupported("in-argument clauses (ORDER BY / LIMIT / SEPARATOR)");
-        }
-    }
-    Ok(())
-}
-
 impl LeafBinder for SingleTable<'_> {
     fn bind_column(&self, e: &Expr) -> Result<BoundExpr, GnitzSqlError> {
         Ok(BoundExpr::ColRef(self.idx(e)?))
     }
     fn bind_function(&self, func: &Function) -> Result<BoundExpr, GnitzSqlError> {
         reject_unsupported_fn_qualifiers(func, "aggregates")?;
-        let name = func.name.to_string().to_ascii_lowercase();
-        match name.as_str() {
-            "count" => {
+        // The one name→aggregate map (`agg_func_from_name`) — no allocation on
+        // the hit path; the argument shape then picks the COUNT variant and
+        // validates arity.
+        let Some(agg_func) = single_fn_name(func).and_then(agg_func_from_name) else {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "function '{}' not supported",
+                func.name.to_string().to_ascii_lowercase()
+            )));
+        };
+        match agg_func {
+            AggFunc::Count | AggFunc::CountNonNull => {
                 if let FunctionArguments::List(list) = &func.args {
                     if list.args.len() == 1 {
                         match &list.args[0] {
@@ -449,13 +393,13 @@ impl LeafBinder for SingleTable<'_> {
                     "COUNT: unsupported argument form".to_string(),
                 ))
             }
-            "sum" | "min" | "max" | "avg" => {
-                let agg_func = match name.as_str() {
-                    "sum" => AggFunc::Sum,
-                    "min" => AggFunc::Min,
-                    "max" => AggFunc::Max,
-                    "avg" => AggFunc::Avg,
-                    _ => unreachable!(),
+            AggFunc::Sum | AggFunc::Min | AggFunc::Max | AggFunc::Avg => {
+                let name = match agg_func {
+                    AggFunc::Sum => "sum",
+                    AggFunc::Min => "min",
+                    AggFunc::Max => "max",
+                    AggFunc::Avg => "avg",
+                    AggFunc::Count | AggFunc::CountNonNull => unreachable!(),
                 };
                 if let FunctionArguments::List(list) = &func.args {
                     if list.args.len() == 1 {
@@ -489,7 +433,6 @@ impl LeafBinder for SingleTable<'_> {
                     "{name}: requires exactly one column argument"
                 )))
             }
-            _ => Err(GnitzSqlError::Unsupported(format!("function '{name}' not supported"))),
         }
     }
     fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<BoundExpr, GnitzSqlError> {

@@ -52,15 +52,12 @@ fn resolve_fk_target_inline(
         ));
     }
     let ref_col_idx: usize = if let Some(ident) = referred_columns.first() {
-        current_cols
-            .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
-            .ok_or_else(|| {
-                GnitzSqlError::Bind(format!(
-                    "FK references column '{}' not found in table '{}'",
-                    ident.value, ref_table,
-                ))
-            })?
+        find_unique_column(current_cols, &ident.value)?.ok_or_else(|| {
+            GnitzSqlError::Bind(format!(
+                "FK references column '{}' not found in table '{}'",
+                ident.value, ref_table,
+            ))
+        })?
     } else if current_pk_cols.len() == 1 {
         current_pk_cols[0] as usize
     } else {
@@ -122,16 +119,12 @@ fn resolve_fk_target(
     // Referenced parent column. An omitted column list defaults to the PK and
     // is only well-defined for a single-column PK.
     let ref_col_idx: usize = if let Some(ident) = referred_columns.first() {
-        ref_schema
-            .columns
-            .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
-            .ok_or_else(|| {
-                GnitzSqlError::Bind(format!(
-                    "FK references column '{}' not found in table '{}'",
-                    ident.value, ref_table,
-                ))
-            })?
+        find_unique_column(&ref_schema.columns, &ident.value)?.ok_or_else(|| {
+            GnitzSqlError::Bind(format!(
+                "FK references column '{}' not found in table '{}'",
+                ident.value, ref_table,
+            ))
+        })?
     } else if ref_schema.pk_count() == 1 {
         ref_schema.pk_index_single()
     } else {
@@ -346,14 +339,11 @@ pub(crate) fn execute_create_table(
                 ));
             }
             let local_col_name = &columns[0].value;
-            let col_idx = cols
-                .iter()
-                .position(|c| c.name.eq_ignore_ascii_case(local_col_name))
-                .ok_or_else(|| {
-                    GnitzSqlError::Bind(format!(
-                        "FOREIGN KEY column '{local_col_name}' not found in table definition"
-                    ))
-                })?;
+            let col_idx = find_unique_column(&cols, local_col_name)?.ok_or_else(|| {
+                GnitzSqlError::Bind(format!(
+                    "FOREIGN KEY column '{local_col_name}' not found in table definition"
+                ))
+            })?;
             let (tid, idx, parent_pk_type) = resolve_fk_target(
                 client,
                 schema_name,
@@ -387,12 +377,9 @@ pub(crate) fn execute_create_table(
             let mut col_indices: Vec<u32> = Vec::with_capacity(columns.len());
             for col_ident in columns {
                 let col_name = &col_ident.value;
-                let idx = cols
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                    .ok_or_else(|| {
-                        GnitzSqlError::Bind(format!("UNIQUE column '{col_name}' not found in table definition"))
-                    })?;
+                let idx = find_unique_column(&cols, col_name)?.ok_or_else(|| {
+                    GnitzSqlError::Bind(format!("UNIQUE column '{col_name}' not found in table definition"))
+                })?;
                 if col_indices.contains(&(idx as u32)) {
                     return Err(GnitzSqlError::Plan(format!(
                         "duplicate column '{col_name}' in UNIQUE constraint"

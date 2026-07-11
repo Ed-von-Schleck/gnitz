@@ -515,3 +515,59 @@ fn test_projection_compound_pk_subset_omits_col() {
         "c values correct; d omitted; no panic from PK indices in the cols slice"
     );
 }
+
+// ── Direct-SELECT projection joins the crate-wide conventions ───────────────
+//
+// A direct SELECT's projection accepts qualified references (`t.a`) and
+// aliases (`a AS x`) like every view surface, and emits one output column per
+// projection item — `SELECT a, a` returns two columns (the old silent dedup
+// returned one, a convention no other surface followed).
+
+fn select_rows(client: &mut GnitzClient, sn: &str, sql: &str) -> (gnitz_core::Schema, gnitz_core::ZSetBatch) {
+    let mut p = SqlPlanner::new(client, sn);
+    match p.execute(sql).unwrap().pop().unwrap() {
+        gnitz_sql::SqlResult::Rows { schema, batch } => (schema, batch),
+        other => panic!("expected Rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_direct_select_qualified_alias_and_duplicate_items() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT NOT NULL)",
+    );
+    exec(&mut client, &sn, "INSERT INTO t (id, a) VALUES (1, 10), (2, 20)");
+
+    // Qualified references resolve like bare ones.
+    let (s, b) = select_rows(&mut client, &sn, "SELECT t.id, t.a FROM t");
+    assert_eq!(names(&s), vec!["id", "a"]);
+    assert_eq!(b.len(), 2);
+
+    // An alias renames the output column.
+    let (s, _) = select_rows(&mut client, &sn, "SELECT id, a AS x FROM t");
+    assert_eq!(names(&s), vec!["id", "x"]);
+
+    // One output column per projection item: `a, a` yields two `a` columns
+    // carrying identical data.
+    let (s, b) = select_rows(&mut client, &sn, "SELECT id, a, a FROM t");
+    assert_eq!(names(&s), vec!["id", "a", "a"]);
+    assert_eq!(b.len(), 2);
+    for r in 0..b.len() {
+        assert_eq!(
+            i64_at(&b, 1, r),
+            i64_at(&b, 2, r),
+            "duplicated projection items carry identical data"
+        );
+    }
+
+    // A qualified PK equality takes the point-seek path (was a hard error).
+    let (_, b) = select_rows(&mut client, &sn, "SELECT * FROM t WHERE t.id = 1");
+    assert_eq!(b.len(), 1);
+}
