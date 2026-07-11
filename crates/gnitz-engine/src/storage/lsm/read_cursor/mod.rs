@@ -471,6 +471,19 @@ impl ReadCursor {
         self.walk_to_positive_with_prefix(prefix)
     }
 
+    /// Visit every positive-weight row whose PK begins with `prefix`, invoking
+    /// `f(&*self)` at each (the callback reads the committed `current_*` row
+    /// state; it must not re-enter the cursor). The seek/advance/walk loop the
+    /// system-table readers (circuit load, view-row retraction) share.
+    pub fn for_each_positive_with_prefix<F: FnMut(&ReadCursor)>(&mut self, prefix: &[u8], mut f: F) {
+        let mut hit = self.seek_first_positive_with_prefix(prefix);
+        while hit {
+            f(&*self);
+            self.advance();
+            hit = self.walk_to_positive_with_prefix(prefix);
+        }
+    }
+
     /// Walk forward from the current position (no seek) to the next row whose
     /// PK begins with `prefix` and whose weight is `> 0`. Returns `false` once
     /// the prefix range ends or the cursor exhausts. The seek-less companion to

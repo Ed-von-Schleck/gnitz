@@ -47,86 +47,73 @@ pub(crate) fn load_circuit(
     let mut nodes: HashMap<i32, gnitz_wire::OpNode> = HashMap::new();
     let mut edges: Vec<(i32, i32, i32)> = Vec::new();
 
+    // The circuit tables share a compound `(view_id, sub)` PK; the OPK image of
+    // the leading unsigned view_id column is its big-endian bytes.
+    let prefix = view_id.to_be_bytes();
+
     // Phase 1: read CircuitNodeColumns, sorted by (kind, position) per node.
     let mut cols_by_node: HashMap<i32, Vec<gnitz_wire::CircuitNodeColumn>> = HashMap::new();
-    {
-        let prefix = view_id.to_be_bytes();
-        let mut ch = open_system_cursor(sys_node_cols)?;
-        let mut hit = ch.seek_first_positive_with_prefix(&prefix);
-        while hit {
-            let node_id = ch.read_i64(NODECOL_COL_NODE_ID) as i32;
-            let kind = ch.read_i64(NODECOL_COL_KIND) as u64;
-            let position = ch.read_i64(NODECOL_COL_POSITION) as u16;
-            let v1 = ch.read_i64(NODECOL_COL_VALUE1) as u64;
-            let v2 = ch.read_i64(NODECOL_COL_VALUE2) as u64;
-            cols_by_node
-                .entry(node_id)
-                .or_default()
-                .push(gnitz_wire::CircuitNodeColumn {
-                    kind,
-                    position,
-                    value1: v1,
-                    value2: v2,
-                });
-            ch.advance();
-            hit = ch.walk_to_positive_with_prefix(&prefix);
-        }
-    }
+    open_system_cursor(sys_node_cols)?.for_each_positive_with_prefix(&prefix, |ch| {
+        cols_by_node
+            .entry(ch.read_i64(NODECOL_COL_NODE_ID) as i32)
+            .or_default()
+            .push(gnitz_wire::CircuitNodeColumn {
+                kind: ch.read_i64(NODECOL_COL_KIND) as u64,
+                position: ch.read_i64(NODECOL_COL_POSITION) as u16,
+                value1: ch.read_i64(NODECOL_COL_VALUE1) as u64,
+                value2: ch.read_i64(NODECOL_COL_VALUE2) as u64,
+            });
+    });
     // Sort each node's cols by (kind, position) so decode_op_node sees ordered slices.
     for v in cols_by_node.values_mut() {
         v.sort_by_key(|c| (c.kind, c.position));
     }
 
-    // Phase 2: read CircuitNodes; call decode_op_node for each.
-    {
-        let prefix = view_id.to_be_bytes();
-        let mut ch = open_system_cursor(sys_nodes)?;
-        let mut hit = ch.seek_first_positive_with_prefix(&prefix);
-        while hit {
-            let node_id = ch.read_i64(NODES_COL_NODE_ID) as i32;
-            let opcode = ch.read_i64(NODES_COL_OPCODE_NEW) as u64;
+    // Phase 2: read CircuitNodes; call decode_op_node for each. A node that
+    // fails to decode must abort the whole load: silently skipping it leaves
+    // any edge referencing it dangling, which yields an invalid topological
+    // order or silent output corruption.
+    let mut decode_failed = false;
+    open_system_cursor(sys_nodes)?.for_each_positive_with_prefix(&prefix, |ch| {
+        let node_id = ch.read_i64(NODES_COL_NODE_ID) as i32;
+        let opcode = ch.read_i64(NODES_COL_OPCODE_NEW) as u64;
 
-            let src_tab: Option<u64> = if ch.col_is_null(NODES_COL_SOURCE_TABLE) {
+        let src_tab: Option<u64> = if ch.col_is_null(NODES_COL_SOURCE_TABLE) {
+            None
+        } else {
+            Some(ch.read_i64(NODES_COL_SOURCE_TABLE) as u64)
+        };
+        let expr_blob: Option<Vec<u8>> = if ch.col_is_null(NODES_COL_EXPR_PROGRAM) {
+            None
+        } else {
+            let b = ch.read_german_bytes(NODES_COL_EXPR_PROGRAM);
+            if b.is_empty() {
                 None
             } else {
-                Some(ch.read_i64(NODES_COL_SOURCE_TABLE) as u64)
-            };
-            let expr_blob: Option<Vec<u8>> = if ch.col_is_null(NODES_COL_EXPR_PROGRAM) {
-                None
-            } else {
-                let b = ch.read_german_bytes(NODES_COL_EXPR_PROGRAM);
-                if b.is_empty() {
-                    None
-                } else {
-                    Some(b)
-                }
-            };
+                Some(b)
+            }
+        };
 
-            let cols = cols_by_node.get(&node_id).map(|v| v.as_slice()).unwrap_or(&[]);
-            // A node that fails to decode must abort the whole load: silently
-            // skipping it leaves any edge referencing it dangling, which yields
-            // an invalid topological order or silent output corruption.
-            let op = gnitz_wire::decode_op_node(opcode, src_tab, expr_blob, cols).ok()?;
-            nodes.insert(node_id, op);
-            ch.advance();
-            hit = ch.walk_to_positive_with_prefix(&prefix);
+        let cols = cols_by_node.get(&node_id).map(|v| v.as_slice()).unwrap_or(&[]);
+        match gnitz_wire::decode_op_node(opcode, src_tab, expr_blob, cols) {
+            Ok(op) => {
+                nodes.insert(node_id, op);
+            }
+            Err(_) => decode_failed = true,
         }
+    });
+    if decode_failed {
+        return None;
     }
 
     // Phase 3: read CircuitEdges.
-    {
-        let prefix = view_id.to_be_bytes();
-        let mut ch = open_system_cursor(sys_edges)?;
-        let mut hit = ch.seek_first_positive_with_prefix(&prefix);
-        while hit {
-            let dst = ch.read_i64(EDGES_COL_DST_NODE) as i32;
-            let port = ch.read_i64(EDGES_COL_DST_PORT) as i32;
-            let src = ch.read_i64(EDGES_COL_SRC_NODE) as i32;
-            edges.push((src, dst, port));
-            ch.advance();
-            hit = ch.walk_to_positive_with_prefix(&prefix);
-        }
-    }
+    open_system_cursor(sys_edges)?.for_each_positive_with_prefix(&prefix, |ch| {
+        edges.push((
+            ch.read_i64(EDGES_COL_SRC_NODE) as i32,
+            ch.read_i64(EDGES_COL_DST_NODE) as i32,
+            ch.read_i64(EDGES_COL_DST_PORT) as i32,
+        ));
+    });
 
     // Every edge must reference nodes that exist in the circuit. A dangling
     // endpoint (node failed to decode, or a partial schema flush) would create
@@ -143,7 +130,7 @@ pub(crate) fn load_circuit(
         out_schema,
         nodes,
         edges,
-        ..LoadedCircuit::empty()
+        ..Default::default()
     })
 }
 
@@ -157,13 +144,11 @@ pub(crate) fn topo_sort(loaded: &mut LoadedCircuit) -> Result<(), CompileError> 
         in_degree.insert(nid, 0);
         loaded.outgoing.entry(nid).or_default();
         loaded.incoming.entry(nid).or_default();
-        loaded.consumers.entry(nid).or_default();
     }
 
     for &(src, dst, port) in &loaded.edges {
         loaded.outgoing.entry(src).or_default().push((dst, port));
         loaded.incoming.entry(dst).or_default().push((src, port));
-        loaded.consumers.entry(src).or_default().push(dst);
         *in_degree.entry(dst).or_insert(0) += 1;
     }
 

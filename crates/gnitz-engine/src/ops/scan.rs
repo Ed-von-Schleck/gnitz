@@ -7,19 +7,15 @@ use crate::storage::{Batch, ReadCursor};
 // Scan trace (source operator)
 // ---------------------------------------------------------------------------
 
-/// Scan rows from a ReadCursor into an Batch.
+/// Scan every row from a ReadCursor into a Batch.
 ///
 /// Skips zero-weight rows (defense-in-depth: individual shard entries may carry
 /// non-zero weights that cancel at merge level).
-/// The cursor is left at the next unscanned position.
-///
-/// `chunk_limit <= 0` means scan everything until cursor exhaustion.
-pub fn op_scan_trace(cursor: &mut ReadCursor, schema: &SchemaDescriptor, chunk_limit: i32) -> Batch {
-    let limit = if chunk_limit > 0 { chunk_limit as usize } else { 0 };
+pub fn op_scan_trace(cursor: &mut ReadCursor, schema: &SchemaDescriptor) -> Batch {
     // `drain_to_batch` certifies its output `Consolidated`; an empty scan yields an
     // empty batch (structurally consolidated).
     cursor
-        .drain_to_batch(limit)
+        .drain_to_batch(0)
         .unwrap_or_else(|| Batch::empty_with_schema(schema))
 }
 
@@ -58,31 +54,23 @@ mod tests {
     }
 
     #[test]
-    fn test_op_scan_trace_chunked() {
+    fn test_op_scan_trace_all() {
         use crate::storage::ReadCursor;
         use std::rc::Rc;
 
         let schema = make_schema_u64_i64();
-        // 5 rows in trace
         let trace = Rc::new(make_batch(
             &schema,
             &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40), (5, 1, 50)],
         ));
         let mut ch = ReadCursor::from_owned(&[trace], schema);
 
-        // First scan: chunk_limit=3 → get 3 rows
-        let out1 = op_scan_trace(&mut ch, &schema, 3);
-        assert_eq!(out1.count, 3);
-        assert_eq!(out1.get_pk(0), 1);
-        assert_eq!(out1.get_pk(2), 3);
-        assert!(out1.is_sorted());
-        assert!(out1.is_consolidated());
-
-        // Second scan: remaining 2 rows
-        let out2 = op_scan_trace(&mut ch, &schema, 3);
-        assert_eq!(out2.count, 2);
-        assert_eq!(out2.get_pk(0), 4);
-        assert_eq!(out2.get_pk(1), 5);
+        let out = op_scan_trace(&mut ch, &schema);
+        assert_eq!(out.count, 5);
+        assert_eq!(out.get_pk(0), 1);
+        assert_eq!(out.get_pk(4), 5);
+        assert!(out.is_sorted());
+        assert!(out.is_consolidated());
     }
 
     #[test]
@@ -94,7 +82,7 @@ mod tests {
         let empty = Rc::new(Batch::empty_with_schema(&schema));
         let mut ch = ReadCursor::from_owned(&[empty], schema);
 
-        let out = op_scan_trace(&mut ch, &schema, 10);
+        let out = op_scan_trace(&mut ch, &schema);
         assert_eq!(out.count, 0);
     }
 }

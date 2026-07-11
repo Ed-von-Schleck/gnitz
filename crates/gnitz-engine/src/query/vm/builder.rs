@@ -1,14 +1,15 @@
-//! `ProgramBuilder` — constructs a `Program` via incremental `add_*()` calls.
+//! `ProgramBuilder` — the interning pools behind a `Program`, plus `push`.
+//!
+//! Emission constructs `Instr` literals directly (there is deliberately no
+//! per-opcode constructor mirror); the builder's job is interning the shared
+//! resources those instructions index — funcs, tables, schemas, and the
+//! agg/group/reindex column pools — and assembling the final `Program`.
 
 use super::*;
 use crate::expr::ScalarFunc;
 use crate::ops::AggDescriptor;
 use crate::schema::SchemaDescriptor;
 use crate::storage::Table;
-
-// ---------------------------------------------------------------------------
-// ProgramBuilder — constructs a Program via incremental add_*() calls.
-// ---------------------------------------------------------------------------
 
 pub(crate) struct ProgramBuilder {
     instructions: Vec<Instr>,
@@ -40,9 +41,19 @@ impl ProgramBuilder {
         }
     }
 
-    // ── Resource dedup (linear scan, small N) ────────────────────────────
+    pub fn push(&mut self, instr: Instr) {
+        self.instructions.push(instr);
+    }
 
-    fn func_idx(&mut self, ptr: *const ScalarFunc) -> u16 {
+    /// The instructions pushed so far — read by `build_plan`'s post-emission
+    /// destructive-register ordering check.
+    pub fn instructions(&self) -> &[Instr] {
+        &self.instructions
+    }
+
+    // ── Resource interning (linear scan, small N) ────────────────────────
+
+    pub fn func_idx(&mut self, ptr: *const ScalarFunc) -> u16 {
         for (i, &f) in self.funcs.iter().enumerate() {
             if f == ptr {
                 return i as u16;
@@ -53,7 +64,7 @@ impl ProgramBuilder {
         idx
     }
 
-    fn table_idx(&mut self, ptr: *mut Table) -> i32 {
+    pub fn table_idx(&mut self, ptr: *mut Table) -> i32 {
         if ptr.is_null() {
             return -1;
         }
@@ -67,7 +78,7 @@ impl ProgramBuilder {
         idx
     }
 
-    fn schema_idx(&mut self, desc: SchemaDescriptor) -> u16 {
+    pub fn schema_idx(&mut self, desc: SchemaDescriptor) -> u16 {
         if let Some(i) = self.schemas.iter().position(|s| s == &desc) {
             return i as u16;
         }
@@ -76,19 +87,19 @@ impl ProgramBuilder {
         idx
     }
 
-    fn add_agg_descs(&mut self, descs: &[AggDescriptor]) -> (u32, u16) {
+    pub fn add_agg_descs(&mut self, descs: &[AggDescriptor]) -> (u32, u16) {
         let offset = self.agg_descs.len() as u32;
         self.agg_descs.extend_from_slice(descs);
         (offset, descs.len() as u16)
     }
 
-    fn add_group_cols(&mut self, cols: &[u32]) -> (u32, u16) {
+    pub fn add_group_cols(&mut self, cols: &[u32]) -> (u32, u16) {
         let offset = self.group_cols.len() as u32;
         self.group_cols.extend_from_slice(cols);
         (offset, cols.len() as u16)
     }
 
-    fn add_reindex_cols(&mut self, cols: &[u32], target_tcs: &[u8]) -> (u32, u16) {
+    pub fn add_reindex_cols(&mut self, cols: &[u32], target_tcs: &[u8]) -> (u32, u16) {
         let offset = self.reindex_cols.len() as u32;
         // This is the only mutator of either pool, so they enter in lockstep.
         debug_assert_eq!(
@@ -103,226 +114,6 @@ impl ProgramBuilder {
         self.reindex_target_tcs.extend_from_slice(target_tcs);
         self.reindex_target_tcs.resize(self.reindex_cols.len(), 0);
         (offset, cols.len() as u16)
-    }
-
-    // ── Instruction methods ──────────────────────────────────────────────
-
-    pub fn add_halt(&mut self) {
-        self.instructions.push(Instr::Halt);
-    }
-
-    pub fn add_clear_deltas(&mut self) {
-        self.instructions.push(Instr::ClearDeltas);
-    }
-
-    pub fn add_scan_trace(&mut self, trace_reg: u16, out_reg: u16, chunk_limit: i32) {
-        self.instructions.push(Instr::ScanTrace {
-            trace_reg,
-            out_reg,
-            chunk_limit,
-        });
-    }
-
-    pub fn add_seek_trace(&mut self, trace_reg: u16, key_reg: u16) {
-        self.instructions.push(Instr::SeekTrace { trace_reg, key_reg });
-    }
-
-    pub fn add_filter(&mut self, in_reg: u16, out_reg: u16, func_ptr: *const ScalarFunc) {
-        let func_idx = self.func_idx(func_ptr);
-        self.instructions.push(Instr::Filter {
-            in_reg,
-            out_reg,
-            func_idx,
-        });
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn add_map(
-        &mut self,
-        in_reg: u16,
-        out_reg: u16,
-        func_ptr: *const ScalarFunc,
-        out_schema: SchemaDescriptor,
-        reindex_cols: &[u32],
-        reindex_target_tcs: &[u8],
-        reindex_hash: bool,
-        branch_id: u8,
-    ) {
-        let func_idx = self.func_idx(func_ptr);
-        let out_schema_idx = self.schema_idx(out_schema);
-        let (reindex_off, reindex_cnt) = self.add_reindex_cols(reindex_cols, reindex_target_tcs);
-        self.instructions.push(Instr::Map {
-            in_reg,
-            out_reg,
-            func_idx,
-            out_schema_idx,
-            reindex_off,
-            reindex_cnt,
-            reindex_hash,
-            branch_id,
-        });
-    }
-
-    pub fn add_negate(&mut self, in_reg: u16, out_reg: u16) {
-        self.instructions.push(Instr::Negate { in_reg, out_reg });
-    }
-
-    pub fn add_union(&mut self, in_a: u16, in_b: u16, has_b: bool, out_reg: u16) {
-        self.instructions.push(Instr::Union {
-            in_a,
-            in_b,
-            has_b,
-            out_reg,
-        });
-    }
-
-    /// `(lo, hi) = (-1, 1)` ⇒ `distinct` (set membership); `(0, i64::MAX)` ⇒
-    /// `positive_part` (bag multiplicity). Both compile to the one `WeightClamp`
-    /// instruction / exec arm.
-    pub fn add_weight_clamp(
-        &mut self,
-        in_reg: u16,
-        hist_reg: u16,
-        out_reg: u16,
-        hist_table: *mut Table,
-        lo: i64,
-        hi: i64,
-    ) {
-        let hist_table_idx = self.table_idx(hist_table) as i16;
-        self.instructions.push(Instr::WeightClamp {
-            in_reg,
-            hist_reg,
-            out_reg,
-            hist_table_idx,
-            lo,
-            hi,
-        });
-    }
-
-    pub fn add_join_dt(&mut self, delta_reg: u16, trace_reg: u16, out_reg: u16, right_schema: SchemaDescriptor) {
-        let right_schema_idx = self.schema_idx(right_schema);
-        self.instructions.push(Instr::JoinDT {
-            delta_reg,
-            trace_reg,
-            out_reg,
-            right_schema_idx,
-        });
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn add_join_dt_range(
-        &mut self,
-        delta_reg: u16,
-        trace_reg: u16,
-        out_reg: u16,
-        right_schema: SchemaDescriptor,
-        n_eq: u8,
-        rel: gnitz_wire::RangeRel,
-    ) {
-        let right_schema_idx = self.schema_idx(right_schema);
-        self.instructions.push(Instr::JoinDTRange {
-            delta_reg,
-            trace_reg,
-            out_reg,
-            right_schema_idx,
-            n_eq,
-            rel,
-        });
-    }
-
-    pub fn add_partition_filter(&mut self, in_reg: u16, out_reg: u16, worker_id: u32, num_workers: u32) {
-        self.instructions.push(Instr::PartitionFilter {
-            in_reg,
-            out_reg,
-            worker_id,
-            num_workers,
-        });
-    }
-
-    pub fn add_null_extend(&mut self, in_reg: u16, out_reg: u16, right_schema: SchemaDescriptor) {
-        let right_schema_idx = self.schema_idx(right_schema);
-        self.instructions.push(Instr::NullExtend {
-            in_reg,
-            out_reg,
-            right_schema_idx,
-        });
-    }
-
-    /// `avi_aggs` is the value-indexed subset of the reduce's descriptors in
-    /// `agg_descs` order (ordinal = position); empty (with a null `avi_table`)
-    /// when the integrate populates no value index.
-    pub fn add_integrate(
-        &mut self,
-        in_reg: u16,
-        target_table: *mut Table,
-        avi_table: *mut Table,
-        avi_group_cols: &[u32],
-        avi_aggs: &[AggDescriptor],
-    ) {
-        let table_idx = self.table_idx(target_table);
-        let avi = (!avi_table.is_null()).then(|| IntegrateAvi {
-            table_idx: self.table_idx(avi_table) as u16,
-            group_by_cols: avi_group_cols.to_vec(),
-            aggs: avi_aggs.to_vec(),
-        });
-        self.instructions.push(Instr::Integrate { in_reg, table_idx, avi });
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn add_reduce(
-        &mut self,
-        in_reg: u16,
-        trace_in_reg: Option<u16>,
-        trace_out_reg: u16,
-        out_reg: u16,
-        fin_out_reg: Option<u16>,
-        agg_descs: &[AggDescriptor],
-        group_cols: &[u32],
-        output_schema: SchemaDescriptor,
-        out_key: gnitz_wire::ReduceOutKey,
-        // The combined value index table (null if no AVI). `for_max`/type per
-        // aggregate are read from `agg_descs` by ordinal on the read side.
-        avi_table: *mut Table,
-        // Post-reduce finalize MAP (null if the reduce has none).
-        finalize_func: *const ScalarFunc,
-        finalize_schema: *const SchemaDescriptor,
-        // Global-aggregate ground machinery
-        global_ground: bool,
-        i_am_owner: bool,
-    ) {
-        let (agg_off, agg_cnt) = self.add_agg_descs(agg_descs);
-        let (gc_off, gc_cnt) = self.add_group_cols(group_cols);
-        let output_schema_idx = self.schema_idx(output_schema);
-
-        let avi = (!avi_table.is_null()).then(|| ReduceAvi {
-            table_idx: self.table_idx(avi_table) as u16,
-        });
-
-        let finalize_func_idx = (!finalize_func.is_null()).then(|| self.func_idx(finalize_func));
-        let finalize_schema_idx = if !finalize_schema.is_null() {
-            Some(self.schema_idx(unsafe { *finalize_schema }))
-        } else {
-            None
-        };
-
-        self.instructions.push(Instr::Reduce {
-            in_reg,
-            trace_in_reg,
-            trace_out_reg,
-            out_reg,
-            fin_out_reg,
-            agg_descs_offset: agg_off,
-            agg_descs_count: agg_cnt,
-            group_cols_offset: gc_off,
-            group_cols_count: gc_cnt,
-            output_schema_idx,
-            out_key,
-            avi,
-            finalize_func_idx,
-            finalize_schema_idx,
-            global_ground,
-            i_am_owner,
-        });
     }
 
     // ── Build ────────────────────────────────────────────────────────────
@@ -340,11 +131,16 @@ impl ProgramBuilder {
     #[allow(clippy::vec_box)]
     pub fn build_with_owned(
         self,
-        reg_meta: Vec<RegisterMeta>,
+        mut reg_meta: Vec<RegisterMeta>,
         owned_tables: Vec<Box<Table>>,
         owned_funcs: Vec<Box<ScalarFunc>>,
         owned_trace_regs: Vec<(u16, usize)>,
     ) -> Box<VmHandle> {
+        // Bake ownership into the metas so the per-epoch `bind_cursors` does no
+        // per-register scan of the owned list.
+        for &(reg_id, _) in &owned_trace_regs {
+            reg_meta[reg_id as usize].is_owned = true;
+        }
         let regfile = RegisterFile::new(&reg_meta);
 
         let program = Program {

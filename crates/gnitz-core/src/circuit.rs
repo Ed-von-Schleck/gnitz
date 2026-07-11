@@ -1,6 +1,6 @@
 use crate::expr::ExprProgram;
 
-pub use gnitz_wire::{AggFunc, AggKind, JoinKind, MapKind, OpNode, RangeRel, ReduceOutKey};
+pub use gnitz_wire::{agg_output_type, AggFunc, AggKind, JoinKind, MapKind, OpNode, RangeRel, ReduceOutKey};
 
 pub type NodeId = u64;
 pub type Port = u8;
@@ -209,8 +209,6 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
             (OPCODE_NULL_EXTEND, None, None),
             encode_col_list(NODE_COL_KIND_NULL_EXT, type_codes),
         ),
-        OpNode::SeekTrace => ((OPCODE_SEEK_TRACE, None, None), Vec::new()),
-        OpNode::ClearDeltas => ((OPCODE_CLEAR_DELTAS, None, None), Vec::new()),
         OpNode::PartitionFilter => ((OPCODE_PARTITION_FILTER, None, None), Vec::new()),
     }
 }

@@ -527,7 +527,7 @@ impl MasterDispatcher {
         // pairs; a GROUP BY / set-op scatter carries plain shard cols (no
         // promotion). Split the pairs into a column list + a parallel target-tc
         // list for the scatter packer.
-        let (shard_cols, target_tcs, is_join): (Vec<i32>, Vec<u8>, bool) = if source_id > 0 {
+        let (shard_cols, target_tcs, is_join): (std::rc::Rc<[i32]>, Vec<u8>, bool) = if source_id > 0 {
             let pairs = cat.dag.get_join_shard_cols(view_id, source_id);
             if pairs.is_empty() {
                 (cat.dag.get_shard_cols(view_id), Vec::new(), false)

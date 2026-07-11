@@ -229,12 +229,8 @@ pub(crate) fn retract_rows_by_view(table: &Table, schema: &SchemaDescriptor, vie
     // The (view_id, sub) PK is OPK-at-rest; the leading view_id column (U64) is
     // big-endian, so the prefix must be OPK (BE), not native LE.
     let prefix = view_id.to_be_bytes();
-    let mut cursor = table.open_cursor();
-    let mut hit = cursor.seek_first_positive_with_prefix(&prefix);
-    while hit {
-        cursor.copy_current_row_into(&mut batch, -1);
-        cursor.advance();
-        hit = cursor.walk_to_positive_with_prefix(&prefix);
-    }
+    table
+        .open_cursor()
+        .for_each_positive_with_prefix(&prefix, |cursor| cursor.copy_current_row_into(&mut batch, -1));
     batch
 }

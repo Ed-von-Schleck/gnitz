@@ -611,8 +611,8 @@ impl Batch {
     }
     /// Apply `f` to every row's weight in place. Generic so the per-epoch
     /// callers (negate, delta doubling) monomorphize to a tight loop. The
-    /// layout tag is untouched: callers pass sign-preserving-modulus maps
-    /// (negation, ×2) that cannot mint ghosts or fold duplicates.
+    /// layout tag is untouched: callers pass sign-preserving maps (negation,
+    /// ×2, non-zero clamping) that cannot mint ghosts or fold duplicates.
     #[inline]
     pub fn map_weights(&mut self, f: impl Fn(i64) -> i64) {
         let off = self.offsets[REG_WEIGHT];
@@ -620,23 +620,6 @@ impl Batch {
             let w = i64::from_le_bytes(chunk.try_into().unwrap());
             chunk.copy_from_slice(&f(w).to_le_bytes());
         }
-    }
-    /// Overwrite a row's weight in place. Lowers the layout to a `Sorted`
-    /// ceiling (never below): weight is not part of the sort key, so row order is
-    /// preserved unconditionally, but the new weight may be zero (a ghost) or
-    /// equal an adjacent element's weight (an unfolded duplicate), so the
-    /// `Consolidated` guarantee no longer holds.
-    #[inline]
-    pub fn set_weight(&mut self, row: usize, w: i64) {
-        debug_assert!(
-            row < self.count,
-            "set_weight: row {} out of bounds ({})",
-            row,
-            self.count
-        );
-        let off = self.offsets[REG_WEIGHT] + row * 8;
-        self.data[off..off + 8].copy_from_slice(&w.to_le_bytes());
-        self.layout = self.layout.min(Layout::Sorted);
     }
     #[inline]
     pub fn get_null_word(&self, row: usize) -> u64 {
@@ -2524,8 +2507,8 @@ mod tests {
     }
 
     // Layout lifecycle: constructors default `Raw`; `extend_*` never raises;
-    // `certify_layout` raises; `set_weight` lowers `Consolidated` to a `Sorted`
-    // ceiling; any append downgrades to `Raw`; `clear()` resets to `Raw`.
+    // `certify_layout` raises; any append downgrades to `Raw`; `clear()`
+    // resets to `Raw`.
     #[test]
     fn layout_lifecycle_default_raise_and_lower() {
         let schema = single_col_pk_schema(type_code::U64);
@@ -2538,11 +2521,6 @@ mod tests {
         // Genuinely (PK, payload)-sorted, ghost-free → certify Consolidated.
         b.certify_layout(Layout::Consolidated, &schema);
         assert!(b.is_sorted() && b.is_consolidated());
-
-        // set_weight keeps order but may introduce a ghost/duplicate → Sorted ceiling.
-        b.set_weight(0, 7);
-        assert_eq!(b.layout(), Layout::Sorted);
-        assert!(b.is_sorted() && !b.is_consolidated());
 
         // Any append downgrades all the way to Raw (the W2M-class fail-safe).
         let mut src = Batch::with_schema(schema, 1);

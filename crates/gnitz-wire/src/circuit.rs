@@ -10,26 +10,15 @@ pub const OPCODE_MAP: u64 = 2;
 pub const OPCODE_NEGATE: u64 = 3;
 pub const OPCODE_UNION: u64 = 4;
 pub const OPCODE_JOIN_DELTA_TRACE: u64 = 5;
-// 6 is a retired opcode (the removed fused inner ΔA⋈ΔB join); left a hole.
 pub const OPCODE_INTEGRATE: u64 = 7;
-// 8 is a retired opcode (the removed Delay z⁻¹ — every z⁻¹ is realized through a
-//    trace cursor snapshotted at tick start, never a live operator); left a hole.
 pub const OPCODE_REDUCE: u64 = 9;
 pub const OPCODE_DISTINCT: u64 = 10;
 /// Delta input source for a base table. The table id lives in the node row's
 /// `source_table` column.
 pub const OPCODE_SCAN_DELTA: u64 = 11;
-pub const OPCODE_SEEK_TRACE: u64 = 12;
-pub const OPCODE_CLEAR_DELTAS: u64 = 15;
-// 16 is a retired opcode (the removed anti-join delta-trace, last used by the
-//    decomposed equi LEFT-JOIN null-fill before it became positive_part); left a hole.
-// 17 is a retired opcode (the removed fused anti ΔA⋈ΔB join); left a hole.
-// 18, 19 are retired opcodes (the removed SemiJoin delta-trace / delta-delta); left a hole.
 pub const OPCODE_EXCHANGE_SHARD: u64 = 20;
 pub const OPCODE_EXCHANGE_GATHER: u64 = 21;
-// 22 is a retired opcode (the removed fused LEFT-outer join); left a hole.
 pub const OPCODE_NULL_EXTEND: u64 = 23;
-// 24 is a retired opcode (the removed GatherReduce placeholder); left a hole.
 /// Discriminates IntegrateTrace from IntegrateSink (OPCODE_INTEGRATE=7)
 /// without a nullable column.
 pub const OPCODE_INTEGRATE_TRACE: u64 = 25;
@@ -37,7 +26,6 @@ pub const OPCODE_INTEGRATE_TRACE: u64 = 25;
 pub const OPCODE_MAP_PROJ: u64 = 26;
 /// MAP sub-variant: expression program (compute) with optional PK reindex.
 pub const OPCODE_MAP_EXPR: u64 = 27;
-// 28 is a retired opcode (the removed key-only MAP sub-variant); left a hole.
 /// MAP sub-variant: copy all columns to payload, set PK = hash of full row.
 pub const OPCODE_MAP_HASH_ROW: u64 = 29;
 /// Read-only trace source for join trace ports; never participates in cascade.
@@ -133,6 +121,58 @@ impl AggFunc {
     }
     pub fn as_u64(self) -> u64 {
         self as u64
+    }
+}
+
+/// Output type code of an aggregate over a source column of type `src_tc` —
+/// THE shared planner/engine typing rule (a mismatch would silently scramble a
+/// view's output column positions, widths, and types).
+///   COUNT, COUNT_NON_NULL → I64 (SUM_ZERO sums integer count/sum columns and
+///   likewise produces I64)
+///   SUM on float → F64, else I64  (SUM can overflow the source width)
+///   MIN/MAX on float → F64; on a ≤8-byte integer → that source type; else I64
+///
+/// MIN/MAX *select* an existing row, so a ≤8-byte integer extremum is itself a
+/// value of the source type T and is always representable in it — `MIN(INT)` is
+/// `INT`, `MAX(SMALLINT UNSIGNED)` is `SMALLINT UNSIGNED`, etc. Those keep their
+/// own type: the engine's row emitters serialize the accumulator at the output
+/// column width, so a narrow column writes the correct low bytes, and the
+/// width-gated trace read-back reconstructs the 8-byte accumulator from that
+/// width. Any non-float, non-≤8-byte-integer source (STRING / 16-byte types)
+/// falls to the `I64` arm, but only as a total-function default: a MIN/MAX over
+/// such a source is rejected at compile — by the SQL binder upstream, and by
+/// the engine's order-encodability guard on the low-level circuit API that
+/// bypasses the binder — so that arm never reaches execution. SUM over a U64
+/// source is typed **U64**: the engine's i64 `wrapping_add` accumulator's bit
+/// pattern already *is* the true sum mod 2^64, same 8-byte width, so the label
+/// is the only choice — and U64 lets a downstream unsigned compare re-seed
+/// correctly (like MIN/MAX preserving their source type). A narrow unsigned
+/// source (U8/U16/U32) still widens to I64 (its sum stays < 2^63, so signed
+/// order is correct). AVG is planner-lowered (SUM/COUNT + finalize divide)
+/// before the wire and never reaches this rule.
+pub const fn agg_output_type(func: AggFunc, src_tc: u8) -> u8 {
+    use crate::types::type_code;
+    let is_float = src_tc == type_code::F32 || src_tc == type_code::F64;
+    match func {
+        AggFunc::Count | AggFunc::CountNonNull | AggFunc::SumZero => type_code::I64,
+        AggFunc::Sum => {
+            if is_float {
+                type_code::F64
+            } else if src_tc == type_code::U64 {
+                type_code::U64
+            } else {
+                type_code::I64
+            }
+        }
+        AggFunc::Min | AggFunc::Max => {
+            if is_float {
+                type_code::F64
+            } else if crate::types::is_fixed_int(src_tc) {
+                src_tc
+            } else {
+                type_code::I64
+            }
+        }
     }
 }
 
@@ -323,10 +363,6 @@ pub enum OpNode {
     NullExtend {
         type_codes: Vec<u8>,
     },
-    /// `OPCODE_SEEK_TRACE = 12`. Server-internal.
-    SeekTrace,
-    /// `OPCODE_CLEAR_DELTAS = 15`. Server-internal.
-    ClearDeltas,
     /// `OPCODE_PARTITION_FILTER = 33`. Keep only rows whose packed-PK partition is
     /// owned by this worker (**pure** range-join broadcast input; a band join
     /// scatters by its eq prefix and omits this node). Worker identity is a
@@ -500,8 +536,6 @@ pub fn decode_op_node(
         OPCODE_NULL_EXTEND => OpNode::NullExtend {
             type_codes: collect_typecodes(NODE_COL_KIND_NULL_EXT),
         },
-        OPCODE_SEEK_TRACE => OpNode::SeekTrace,
-        OPCODE_CLEAR_DELTAS => OpNode::ClearDeltas,
         OPCODE_PARTITION_FILTER => OpNode::PartitionFilter,
         _ => return Err(format!("unknown opcode {opcode}")),
     })

@@ -1,10 +1,16 @@
 //! Annotation + optimization passes and the schema-construction helpers:
-//! `annotate`, `opt_*`, co-partition analysis, and join/reduce/map output schemas.
+//! co-partition analysis, distinct elision, the reduce-finalize fold, and the
+//! join/reduce/map output schemas.
 
 use super::*;
 use gnitz_wire::ReduceOutKey;
 
-pub(super) fn compute_join_shard_map(loaded: &LoadedCircuit) -> HashMap<i64, Vec<(i32, u8)>> {
+/// The first (usually sole) node feeding `nid`, if any.
+pub(super) fn first_input(loaded: &LoadedCircuit, nid: i32) -> Option<i32> {
+    loaded.incoming.get(&nid).and_then(|v| v.first()).map(|&(src, _)| src)
+}
+
+pub(crate) fn compute_join_shard_map(loaded: &LoadedCircuit) -> JoinShardMap {
     let mut join_shard_map = HashMap::new();
     for (&nid, op) in &loaded.nodes {
         if let gnitz_wire::OpNode::ScanDelta(tid) = op {
@@ -17,10 +23,7 @@ pub(super) fn compute_join_shard_map(loaded: &LoadedCircuit) -> HashMap<i64, Vec
     join_shard_map
 }
 
-pub(super) fn compute_co_partitioned(
-    join_shard_map: &HashMap<i64, Vec<(i32, u8)>>,
-    ext_tables: &[ExternalTable],
-) -> HashSet<i64> {
+pub(super) fn compute_co_partitioned(join_shard_map: &JoinShardMap, ext_tables: &ExtTables) -> HashSet<i64> {
     // Replication skip, computed once for the whole join: if ANY participating
     // source is replicated, EVERY participant skips its exchange. This deliberately
     // does NOT widen `shard_cols_match_dist_key` (the pure prefix predicate also
@@ -36,10 +39,10 @@ pub(super) fn compute_co_partitioned(
     //     distributed by the join key, so one fact can join many replicated dims.
     let any_replicated = ext_tables
         .iter()
-        .any(|t| t.schema.replicated() && join_shard_map.contains_key(&t.table_id));
+        .any(|(tid, schema)| schema.replicated() && join_shard_map.contains_key(tid));
     let mut co_partitioned = HashSet::new();
     for (&tid, cols) in join_shard_map {
-        let Some(ext) = ext_tables.iter().find(|t| t.table_id == tid) else {
+        let Some(ext_schema) = ext_tables.get(&tid) else {
             continue;
         };
 
@@ -62,121 +65,92 @@ pub(super) fn compute_co_partitioned(
         // super-prefix skip could route the two join sides at mismatched
         // widths and silently drop matches (see `shard_cols_match_dist_key`).
         let col_indices: Vec<i32> = cols.iter().map(|&(c, _)| c).collect();
-        if ext.schema.shard_cols_match_dist_key(&col_indices) {
+        if ext_schema.shard_cols_match_dist_key(&col_indices) {
             co_partitioned.insert(tid);
         }
     }
     co_partitioned
 }
 
-pub(super) fn propagate_distinct(loaded: &LoadedCircuit, ann: &mut Annotation) {
-    for &nid in &loaded.ordered {
-        match loaded.nodes.get(&nid) {
-            Some(gnitz_wire::OpNode::Reduce { .. }) | Some(gnitz_wire::OpNode::Distinct) => {
-                ann.is_distinct_at.insert(nid);
-            }
-            Some(gnitz_wire::OpNode::Filter(_)) => {
-                let in_nids = loaded.incoming.get(&nid).cloned().unwrap_or_default();
-                if !in_nids.is_empty() && ann.is_distinct_at.contains(&in_nids[0].0) {
-                    ann.is_distinct_at.insert(nid);
-                }
-            }
-            Some(gnitz_wire::OpNode::Map(mk)) => {
-                // A reindex (equijoin pre-index or full-row HashRow) rewrites the
-                // PK, so upstream distinctness no longer holds at this node.
-                let has_reindex = match mk {
-                    gnitz_wire::MapKind::Expression { reindex_cols, .. } => !reindex_cols.is_empty(),
-                    gnitz_wire::MapKind::HashRow(..) => true,
-                    _ => false,
-                };
-                if !has_reindex {
-                    let in_nids = loaded.incoming.get(&nid).cloned().unwrap_or_default();
-                    if !in_nids.is_empty() && ann.is_distinct_at.contains(&in_nids[0].0) {
-                        ann.is_distinct_at.insert(nid);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-pub(super) fn annotate(loaded: &LoadedCircuit, ext_tables: &[ExternalTable]) -> Annotation {
+/// The circuit's join-routing annotations: the all-sources join-shard map
+/// (source tid → reindex `(col, promotion tc)` pairs) and the co-partition set —
+/// the sources whose deltas may skip the join scatter because their native
+/// distribution already aligns with the join key (or a replicated partner makes
+/// the exchange unnecessary).
+pub(super) fn annotate(loaded: &LoadedCircuit, ext_tables: &ExtTables) -> (JoinShardMap, HashSet<i64>) {
     let join_shard_map = compute_join_shard_map(loaded);
     let co_partitioned = compute_co_partitioned(&join_shard_map, ext_tables);
-    let mut ann = Annotation {
-        co_partitioned,
-        is_distinct_at: HashSet::new(),
+    (join_shard_map, co_partitioned)
+}
+
+/// True iff the view's output `ExchangeShard` is a no-op (every row already on
+/// the worker owning its distribution key) and the output IPC can be skipped:
+/// the shard reads a scan — through any Filter chain — whose distribution
+/// prefix (`pk_indices[..k]`) is exactly the shard key. For a default full-PK
+/// table that is the strict full-PK case; for a `CLUSTER BY prefix` table it
+/// also lets a (possibly filtered) `GROUP BY prefix` / reduce run locally —
+/// every row for a group value already lives on one worker — since this
+/// governs every single-source `ExchangeShard` view, not just joins.
+pub(super) fn compute_skips_exchange(loaded: &LoadedCircuit, ext_tables: &ExtTables) -> bool {
+    let Some((enid, shard_cols)) = loaded.nodes.iter().find_map(|(&nid, op)| match op {
+        gnitz_wire::OpNode::ExchangeShard { shard_cols } => {
+            Some((nid, shard_cols.iter().map(|&c| c as i32).collect::<Vec<_>>()))
+        }
+        _ => None,
+    }) else {
+        return false;
     };
-    propagate_distinct(loaded, &mut ann);
-    ann
+    let Some(tid) = scan_tid_through_filters(loaded, enid) else {
+        return false;
+    };
+    ext_tables
+        .get(&tid)
+        .is_some_and(|schema| schema.shard_cols_match_dist_key(&shard_cols))
 }
 
 // ---------------------------------------------------------------------------
 // Optimization passes
 // ---------------------------------------------------------------------------
 
-/// Split fold programs and rewrite state between pre- and post-exchange plans.
-///
-/// `opt_fold_reduce_map` records programs for ALL REDUCE nodes in the graph.
-/// When the graph is split at EXCHANGE_SHARD, only the programs for REDUCE
-/// nodes in each plan half are valid for that half. This function partitions
-/// `progs` and re-indexes `fold_finalize` so each plan half gets zero-based
-/// indices into its own program slice.
-#[allow(clippy::vec_box)]
-pub(super) fn split_fold_programs(
-    rw: Rewrites,
-    progs: Vec<Box<LogicalProgram>>,
-    pre_nids: &HashSet<i32>,
-) -> (Rewrites, Vec<Box<LogicalProgram>>, Rewrites, Vec<Box<LogicalProgram>>) {
-    // Invert fold_finalize: old program index → reduce_nid
-    let mut idx_to_nid: HashMap<usize, i32> = HashMap::new();
-    for (&nid, &idx) in &rw.fold_finalize {
-        idx_to_nid.insert(idx, nid);
-    }
-
-    let mut pre_progs: Vec<Box<LogicalProgram>> = Vec::new();
-    let mut post_progs: Vec<Box<LogicalProgram>> = Vec::new();
-    let mut pre_fold: HashMap<i32, usize> = HashMap::new();
-    let mut post_fold: HashMap<i32, usize> = HashMap::new();
-
-    for (old_idx, prog) in progs.into_iter().enumerate() {
-        if let Some(&nid) = idx_to_nid.get(&old_idx) {
-            if pre_nids.contains(&nid) {
-                let new_idx = pre_progs.len();
-                pre_progs.push(prog);
-                pre_fold.insert(nid, new_idx);
-            } else {
-                let new_idx = post_progs.len();
-                post_progs.push(prog);
-                post_fold.insert(nid, new_idx);
+/// Distinct nodes elided because their input is already distinct. One forward
+/// pass along the topological order, maintaining the set of nodes whose output
+/// is known distinct: a Reduce or Distinct establishes it; a Filter preserves
+/// it; a Map preserves it unless it re-keys the PK (an equijoin pre-index
+/// reindex or a full-row HashRow), which invalidates upstream distinctness.
+pub(super) fn compute_skip_nodes(loaded: &LoadedCircuit) -> HashSet<i32> {
+    let mut distinct_at: HashSet<i32> = HashSet::new();
+    let mut skip = HashSet::new();
+    for &nid in &loaded.ordered {
+        let input_distinct = first_input(loaded, nid).is_some_and(|src| distinct_at.contains(&src));
+        match loaded.nodes.get(&nid) {
+            Some(gnitz_wire::OpNode::Reduce { .. }) => {
+                distinct_at.insert(nid);
             }
+            Some(gnitz_wire::OpNode::Distinct) => {
+                if input_distinct {
+                    skip.insert(nid);
+                }
+                distinct_at.insert(nid);
+            }
+            Some(gnitz_wire::OpNode::Filter(_)) => {
+                if input_distinct {
+                    distinct_at.insert(nid);
+                }
+            }
+            Some(gnitz_wire::OpNode::Map(mk)) => {
+                let has_reindex = match mk {
+                    gnitz_wire::MapKind::Expression { reindex_cols, .. } => !reindex_cols.is_empty(),
+                    gnitz_wire::MapKind::HashRow(..) => true,
+                    _ => false,
+                };
+                if !has_reindex && input_distinct {
+                    distinct_at.insert(nid);
+                }
+            }
+            _ => {}
         }
     }
-
-    let rw_pre = Rewrites {
-        skip_nodes: rw.skip_nodes.clone(),
-        fold_finalize: pre_fold,
-        folded_maps: rw.folded_maps.clone(),
-    };
-    let rw_post = Rewrites {
-        skip_nodes: rw.skip_nodes,
-        fold_finalize: post_fold,
-        folded_maps: rw.folded_maps,
-    };
-
-    (rw_pre, pre_progs, rw_post, post_progs)
-}
-
-pub(super) fn opt_distinct(loaded: &LoadedCircuit, ann: &Annotation, rw: &mut Rewrites) {
-    for (&nid, op) in &loaded.nodes {
-        if matches!(op, gnitz_wire::OpNode::Distinct) {
-            let in_nids = loaded.incoming.get(&nid).cloned().unwrap_or_default();
-            if !in_nids.is_empty() && ann.is_distinct_at.contains(&in_nids[0].0) {
-                rw.skip_nodes.insert(nid);
-            }
-        }
-    }
+    skip
 }
 
 /// Fold budget: inline a finalize MAP into its reduce node only when its program
@@ -184,57 +158,44 @@ pub(super) fn opt_distinct(loaded: &LoadedCircuit, ann: &Annotation, rw: &mut Re
 /// so a reduce op never carries an unbounded inline program.
 const MAX_FOLD_FINALIZE_INSTRS: usize = 15;
 
-#[allow(clippy::vec_box, clippy::ptr_arg)]
-pub(super) fn opt_fold_reduce_map(
-    loaded: &LoadedCircuit,
-    rw: &mut Rewrites,
-    fold_progs: &mut Vec<Box<LogicalProgram>>,
-) {
-    for (&nid, op) in &loaded.nodes {
-        let blob = match op {
-            gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
-                program, reindex_cols, ..
-            }) if reindex_cols.is_empty() => program,
-            _ => continue,
-        };
-        let in_nids = loaded.incoming.get(&nid).cloned().unwrap_or_default();
-        if in_nids.len() != 1 {
-            continue;
-        }
-        let reduce_nid = in_nids[0].0;
-        if !matches!(loaded.nodes.get(&reduce_nid), Some(gnitz_wire::OpNode::Reduce { .. })) {
-            continue;
-        }
-        let consumers = loaded.consumers.get(&reduce_nid).cloned().unwrap_or_default();
-        if consumers.len() != 1 {
-            continue;
-        }
-        let dep = match gnitz_wire::decode_expr_blob(blob) {
-            Some(d) => d,
-            None => continue,
-        };
-        // Empty const pool here (structural pre-pass); a const-using finalize
-        // returns `Err` (`StrColConst` vs the empty pool) → not folded → compiled
-        // normally through the Map path with its real pool, which also removes a
-        // latent crash (the empty pool used to be folded in and panic at eval).
-        let prog = match LogicalProgram::from_wire(&dep.code, dep.num_regs, 0, Vec::new()) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        // Skip folding any clean block copy regardless of offset; the
-        // authoritative identity-MAP elision below (with the schema-checked PK
-        // offset) handles it. No register schema exists in this early pass, so we
-        // cannot supply the PK count here.
-        if prog.sequential_copy_base().is_some() {
-            continue;
-        }
-        if prog.len() <= MAX_FOLD_FINALIZE_INSTRS {
-            let idx = fold_progs.len();
-            fold_progs.push(Box::new(prog));
-            rw.fold_finalize.insert(reduce_nid, idx);
-            rw.folded_maps.insert(nid, reduce_nid);
-        }
+/// The sole consuming MAP of `reduce_nid` when it is fold-eligible, with its
+/// decoded finalize program. Consulted by `emit_reduce`, which absorbs the MAP
+/// into the reduce's finalize slot (saving one intermediate batch
+/// materialization per tick) and marks the MAP node folded.
+///
+/// Eligibility: the reduce has exactly one outgoing edge, to a reindex-free
+/// `Map(Expression)` whose only input is the reduce, and whose program is small
+/// enough and neither const-using nor a plain block copy.
+pub(super) fn reduce_finalize_fold(loaded: &LoadedCircuit, reduce_nid: i32) -> Option<(i32, LogicalProgram)> {
+    let outs = loaded.outgoing.get(&reduce_nid)?;
+    if outs.len() != 1 {
+        return None;
     }
+    let map_nid = outs[0].0;
+    let blob = match loaded.nodes.get(&map_nid) {
+        Some(gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
+            program, reindex_cols, ..
+        })) if reindex_cols.is_empty() => program,
+        _ => return None,
+    };
+    if loaded.incoming.get(&map_nid).map(|v| v.len()).unwrap_or(0) != 1 {
+        return None;
+    }
+    let dep = gnitz_wire::decode_expr_blob(blob)?;
+    // Empty const pool (structural check): a const-using finalize returns `Err`
+    // (`StrColConst` vs the empty pool) → not folded → compiled normally through
+    // the Map path with its real pool, which also removes a latent crash (the
+    // empty pool used to be folded in and panic at eval).
+    let prog = LogicalProgram::from_wire(&dep.code, dep.num_regs, 0, Vec::new()).ok()?;
+    // Skip folding any clean block copy regardless of offset; the authoritative
+    // identity-MAP elision (with the schema-checked PK offset) handles it.
+    if prog.sequential_copy_base().is_some() {
+        return None;
+    }
+    if prog.len() > MAX_FOLD_FINALIZE_INSTRS {
+        return None;
+    }
+    Some((map_nid, prog))
 }
 
 // ---------------------------------------------------------------------------
@@ -364,55 +325,19 @@ pub(super) fn reindex_output_schema(
     SchemaDescriptor::new(&cols[..pk_n + payload_n], &pk_idx)
 }
 
-/// Determine the output type for an aggregate function.
-///   COUNT, COUNT_NON_NULL → I64
-///   SUM on float → F64, else I64  (SUM can overflow the source width)
-///   MIN/MAX on float → F64; on a ≤8-byte integer → that source type; else I64
-///
-/// MIN/MAX *select* an existing row, so a ≤8-byte integer extremum is itself a
-/// value of the source type T and is always representable in it — `MIN(INT)` is
-/// `INT`, `MAX(SMALLINT UNSIGNED)` is `SMALLINT UNSIGNED`, etc. Those keep their
-/// own type: the row emitters serialize the accumulator at the output column
-/// width, so a narrow column writes the correct low bytes, and the width-gated
-/// trace read-back (`readback_agg_bits`) reconstructs the 8-byte accumulator
-/// from that width. The old U64 special case folds into this rule — the source
-/// type simply *is* `U64`. Any non-float, non-≤8-byte-integer source (STRING /
-/// 16-byte types) falls to the `I64` arm, but only as a total-function default
-/// for the output schema this builds: a MIN/MAX over such a source is rejected at
-/// compile — by the SQL binder upstream, and by `emit_reduce`'s order-encodability
-/// guard on the low-level circuit API that bypasses the binder — so that schema is
-/// discarded (`build_plan` returns `None`) and the `I64` arm never reaches
-/// execution. The accumulator order-encodes via `encode_ordered`, which has no key
-/// for these types at all. SUM over a U64 source is typed **U64**: the i64
-/// `wrapping_add` accumulator's bit pattern already *is* the true sum mod 2^64,
-/// same 8-byte width, so the label is the only choice — and U64 lets a downstream
-/// unsigned compare re-seed correctly (like MIN/MAX preserving their source type).
-/// A narrow unsigned source (U8/U16/U32) still widens to I64 (its sum stays
-/// < 2^63, so signed order is correct). Mirrored by the SQL planner's
-/// `agg_result_type`.
+/// Engine adapter over the single shared typing rule
+/// (`gnitz_wire::agg_output_type`); `AggOp::Null` — the grouped no-aggregate
+/// placeholder, which never leaves the engine — types I64 like COUNT.
 pub(super) const fn agg_output_type(agg_op: AggOp, col_type_code: TypeCode) -> u8 {
-    match agg_op {
-        // SumZero sums integer count/sum columns; like COUNT it produces I64.
-        AggOp::Count | AggOp::CountNonNull | AggOp::Null | AggOp::SumZero => type_code::I64,
-        AggOp::Sum => {
-            if col_type_code.is_float() {
-                type_code::F64
-            } else if col_type_code as u8 == type_code::U64 {
-                type_code::U64
-            } else {
-                type_code::I64
-            }
-        }
-        AggOp::Min | AggOp::Max => {
-            if col_type_code.is_float() {
-                type_code::F64
-            } else if is_fixed_int(col_type_code as u8) {
-                col_type_code as u8
-            } else {
-                type_code::I64
-            }
-        }
-    }
+    let func = match agg_op {
+        AggOp::Count | AggOp::Null => gnitz_wire::AggFunc::Count,
+        AggOp::CountNonNull => gnitz_wire::AggFunc::CountNonNull,
+        AggOp::SumZero => gnitz_wire::AggFunc::SumZero,
+        AggOp::Sum => gnitz_wire::AggFunc::Sum,
+        AggOp::Min => gnitz_wire::AggFunc::Min,
+        AggOp::Max => gnitz_wire::AggFunc::Max,
+    };
+    gnitz_wire::agg_output_type(func, col_type_code as u8)
 }
 
 /// Build the reduce output schema by **obeying** the planner's shipped
@@ -421,7 +346,7 @@ pub(super) const fn agg_output_type(agg_op: AggOp, col_type_code: TypeCode) -> u
 /// three arms are byte-identical to what the planner laid out.
 pub(super) fn build_reduce_output_schema(
     input: &SchemaDescriptor,
-    group_cols: &[i32],
+    group_cols: &[u32],
     agg_descs: &[AggDescriptor],
     out_key: ReduceOutKey,
 ) -> SchemaDescriptor {

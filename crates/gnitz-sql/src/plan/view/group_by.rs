@@ -77,34 +77,24 @@ struct AggSpec {
     out_type: TypeCode,
 }
 
-/// Mirror the engine's `agg_output_type`: COUNT/COUNT_NON_NULL → I64, AVG → F64,
-/// float SUM/MIN/MAX → F64. SUM over a **U64** column is typed U64 (the i64
-/// accumulator's bit pattern already *is* the correct unsigned sum mod 2^64, same
-/// 8-byte width — so U64 is the only correct label, and it re-seeds a downstream
-/// unsigned compare); a narrow unsigned (U8/U16/U32) or signed source widens to
-/// I64 (its sum stays < 2^63, so signed order is correct). MIN/MAX over a
-/// non-float column *preserve the source type* (the extremum is one of the input
-/// rows, so it is representable in that type — incl. U64). The binder restricts MIN/MAX inputs to ≤8-byte
-/// integers and floats, so the source type returned here is always ≤8 bytes —
-/// the engine's I64 fallback for STRING / 16-byte MIN/MAX sources is reachable
-/// only via the low-level circuit API, never from SQL. A planner/compiler
-/// mismatch silently scrambles the view's output column positions, widths, and
-/// types.
+/// The aggregate output type, via the single shared planner/engine rule
+/// (`gnitz_wire::agg_output_type`). AVG is planner-lowered (SUM/COUNT + a
+/// finalize divide) before the wire and always produces F64. A source-less
+/// aggregate (COUNT) passes I64, which the rule maps to its own default arms.
 pub(crate) fn agg_result_type(func: AggFunc, src_col: Option<usize>, schema: &Schema) -> TypeCode {
-    match func {
-        AggFunc::Count | AggFunc::CountNonNull => TypeCode::I64,
-        AggFunc::Avg => TypeCode::F64,
-        AggFunc::Sum => match src_col {
-            Some(c) if schema.columns[c].type_code.is_float() => TypeCode::F64,
-            Some(c) if schema.columns[c].type_code == TypeCode::U64 => TypeCode::U64,
-            _ => TypeCode::I64,
-        },
-        AggFunc::Min | AggFunc::Max => match src_col {
-            Some(c) if schema.columns[c].type_code.is_float() => TypeCode::F64,
-            Some(c) => schema.columns[c].type_code, // preserve the source type (incl. U64)
-            None => TypeCode::I64,
-        },
-    }
+    let wire_func = match func {
+        AggFunc::Avg => return TypeCode::F64,
+        AggFunc::Count => gnitz_core::AggFunc::Count,
+        AggFunc::CountNonNull => gnitz_core::AggFunc::CountNonNull,
+        AggFunc::Sum => gnitz_core::AggFunc::Sum,
+        AggFunc::Min => gnitz_core::AggFunc::Min,
+        AggFunc::Max => gnitz_core::AggFunc::Max,
+    };
+    let src_tc = match src_col {
+        Some(c) => schema.columns[c].type_code as u8,
+        None => TypeCode::I64 as u8,
+    };
+    TypeCode::from_validated_u8(gnitz_core::agg_output_type(wire_func, src_tc))
 }
 
 /// Whether an `AggShape::Direct` aggregate's output column can be NULL at

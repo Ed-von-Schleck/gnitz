@@ -29,13 +29,16 @@ fn fatal_on_tick_ingest_err(op: &str, table_idx: i32, r: Result<(), crate::stora
     }
 }
 
-/// Execute one epoch of a compiled program.
+/// Execute one epoch of a compiled program with a single input register —
+/// a test-only convenience over `execute_epoch_multi` (production seeds
+/// through the multi entry point).
 ///
 /// The input_batch is moved into `input_reg`.  After execution, the output
 /// batch (if any) is extracted from `output_reg` and returned.
 ///
 /// Returns `Ok(Some(batch))` if output was produced, `Ok(None)` if empty,
 /// or `Err(rc)` on error.
+#[cfg(test)]
 pub(crate) fn execute_epoch(
     program: &Program,
     regfile: &mut RegisterFile,
@@ -43,15 +46,13 @@ pub(crate) fn execute_epoch(
     input_reg: u16,
     output_reg: u16,
     cursor_handles: &[*mut ReadCursor],
-    owned_trace_reg_ids: &[(u16, usize)],
-) -> Result<Option<Batch>, i32> {
+) -> Result<Option<Batch>, VmError> {
     execute_epoch_multi(
         program,
         regfile,
         std::iter::once((input_reg, input_batch)),
         output_reg,
         cursor_handles,
-        owned_trace_reg_ids,
     )
 }
 
@@ -69,8 +70,7 @@ pub(crate) fn execute_epoch_multi(
     inputs: impl IntoIterator<Item = (u16, Batch)>,
     output_reg: u16,
     cursor_handles: &[*mut ReadCursor],
-    owned_trace_reg_ids: &[(u16, usize)],
-) -> Result<Option<Batch>, i32> {
+) -> Result<Option<Batch>, VmError> {
     gnitz_debug!(
         "vm: execute_epoch output_reg={} instrs={}",
         output_reg,
@@ -78,10 +78,10 @@ pub(crate) fn execute_epoch_multi(
     );
 
     // 1. Clear delta batches (cursor refresh already done by caller)
-    regfile.clear_deltas();
+    regfile.clear_deltas(&program.reg_meta);
 
     // 2. Bind cursors and seed input batches
-    regfile.bind_cursors(cursor_handles, owned_trace_reg_ids);
+    regfile.bind_cursors(&program.reg_meta, cursor_handles);
     for (input_reg, input_batch) in inputs {
         if input_batch.count > 0 {
             // Only assert when the batch is non-empty: an empty batch is a
@@ -147,30 +147,11 @@ pub(crate) fn execute_epoch_multi(
         match instr {
             Instr::Halt => break,
 
-            Instr::ClearDeltas => {
-                regfile.clear_deltas();
-            }
-
-            Instr::ScanTrace {
-                trace_reg,
-                out_reg,
-                chunk_limit,
-            } => {
-                let schema = reg!(*trace_reg).schema;
+            Instr::ScanTrace { trace_reg, out_reg } => {
+                let schema = &program.reg_meta[*trace_reg as usize].schema;
                 if let Some(cursor) = cursor_mut!(*trace_reg) {
-                    let result = ops::op_scan_trace(cursor, &schema, *chunk_limit);
+                    let result = ops::op_scan_trace(cursor, schema);
                     reg_mut!(*out_reg).batch = result;
-                }
-            }
-
-            Instr::SeekTrace { trace_reg, key_reg } => {
-                let kb = &reg!(*key_reg).batch;
-                if kb.count > 0 {
-                    // The key batch's PK region is already OPK at rest; seek by
-                    // its bytes directly (no native-value round-trip).
-                    if let Some(cursor) = cursor_mut!(*trace_reg) {
-                        cursor.seek_bytes(kb.get_pk_bytes(0));
-                    }
                 }
             }
 
@@ -181,17 +162,12 @@ pub(crate) fn execute_epoch_multi(
             } => {
                 debug_assert_ne!(*in_reg, *out_reg, "Filter: in_reg and out_reg must be distinct");
                 let func_ptr = program.funcs[*func_idx as usize];
-                let in_batch = &reg!(*in_reg).batch;
-                let schema = reg!(*in_reg).schema;
-                let result = if func_ptr.is_null() {
-                    // NullPredicate: clone — in_reg may be read by multiple instructions.
-                    let mut out = in_batch.clone_batch();
-                    out.set_schema(schema);
-                    out
-                } else {
-                    let func = unsafe { &*func_ptr };
-                    ops::op_filter(in_batch, func, &schema)
-                };
+                // A predicate-less Filter (no WHERE clause) is elided at emit
+                // time by register aliasing; every emitted Filter carries a func.
+                debug_assert!(!func_ptr.is_null(), "Filter: null predicate must be elided at emit");
+                let func = unsafe { &*func_ptr };
+                let schema = &program.reg_meta[*in_reg as usize].schema;
+                let result = ops::op_filter(&reg!(*in_reg).batch, func, schema);
                 reg_mut!(*out_reg).batch = result;
             }
 
@@ -207,30 +183,26 @@ pub(crate) fn execute_epoch_multi(
             } => {
                 debug_assert_ne!(*in_reg, *out_reg, "Map: in_reg and out_reg must be distinct");
                 let func_ptr = program.funcs[*func_idx as usize];
-                let in_schema = reg!(*in_reg).schema;
+                // Identity MAPs are elided at emit time by register aliasing;
+                // every emitted Map carries a func.
+                debug_assert!(!func_ptr.is_null(), "Map: identity map must be elided at emit");
+                let func = unsafe { &*func_ptr };
+                let in_schema = &program.reg_meta[*in_reg as usize].schema;
                 let out_schema = &program.schemas[*out_schema_idx as usize];
-                let result = if func_ptr.is_null() {
-                    // Identity MAP: no transformation — copy batch with updated schema.
-                    let mut out = reg!(*in_reg).batch.clone_batch();
-                    out.set_schema(*out_schema);
-                    out
-                } else {
-                    let func = unsafe { &*func_ptr };
-                    let off = *reindex_off as usize;
-                    let n = *reindex_cnt as usize;
-                    let reindex_cols = &program.reindex_cols[off..off + n];
-                    let target_tcs = &program.reindex_target_tcs[off..off + n];
-                    ops::op_map(
-                        &reg!(*in_reg).batch,
-                        func,
-                        &in_schema,
-                        out_schema,
-                        reindex_cols,
-                        target_tcs,
-                        *reindex_hash,
-                        *branch_id,
-                    )
-                };
+                let off = *reindex_off as usize;
+                let n = *reindex_cnt as usize;
+                let reindex_cols = &program.reindex_cols[off..off + n];
+                let target_tcs = &program.reindex_target_tcs[off..off + n];
+                let result = ops::op_map(
+                    &reg!(*in_reg).batch,
+                    func,
+                    in_schema,
+                    out_schema,
+                    reindex_cols,
+                    target_tcs,
+                    *reindex_hash,
+                    *branch_id,
+                );
                 reg_mut!(*out_reg).batch = result;
             }
 
@@ -246,7 +218,7 @@ pub(crate) fn execute_epoch_multi(
                 has_b,
                 out_reg,
             } => {
-                let schema = reg!(*in_a).schema;
+                let schema = &program.reg_meta[*in_a as usize].schema;
                 if *has_b && in_a == in_b {
                     // Self-union: Z + Z doubles every weight in-place. Reading
                     // batch_b after moving batch_a out would see an empty batch
@@ -257,7 +229,7 @@ pub(crate) fn execute_epoch_multi(
                 } else {
                     let batch_b = if *has_b { Some(&reg!(*in_b).batch) } else { None };
                     let batch_a = reg_mut!(*in_a).batch.take();
-                    reg_mut!(*out_reg).batch = ops::op_union(batch_a, batch_b, &schema);
+                    reg_mut!(*out_reg).batch = ops::op_union(batch_a, batch_b, schema);
                 }
             }
 
@@ -270,9 +242,9 @@ pub(crate) fn execute_epoch_multi(
                 hi,
             } => {
                 if let Some(cursor) = cursor_mut!(*hist_reg) {
-                    let schema = reg!(*in_reg).schema;
+                    let schema = &program.reg_meta[*in_reg as usize].schema;
                     let delta = reg_mut!(*in_reg).batch.take();
-                    let (output, consolidated) = ops::op_weight_clamp(delta, cursor, &schema, *lo, *hi);
+                    let (output, consolidated) = ops::op_weight_clamp(delta, cursor, schema, *lo, *hi);
                     reg_mut!(*out_reg).batch = output;
                     // Ingest consolidated delta into history table
                     if *hist_table_idx >= 0 {
@@ -291,10 +263,10 @@ pub(crate) fn execute_epoch_multi(
                 out_reg,
                 right_schema_idx,
             } => {
-                let left_schema = reg!(*delta_reg).schema;
+                let left_schema = &program.reg_meta[*delta_reg as usize].schema;
                 let right_schema = &program.schemas[*right_schema_idx as usize];
                 if let Some(cursor) = cursor_mut!(*trace_reg) {
-                    let result = ops::op_join_delta_trace(&reg!(*delta_reg).batch, cursor, &left_schema, right_schema);
+                    let result = ops::op_join_delta_trace(&reg!(*delta_reg).batch, cursor, left_schema, right_schema);
                     reg_mut!(*out_reg).batch = result;
                 }
             }
@@ -307,13 +279,13 @@ pub(crate) fn execute_epoch_multi(
                 n_eq,
                 rel,
             } => {
-                let left_schema = reg!(*delta_reg).schema;
+                let left_schema = &program.reg_meta[*delta_reg as usize].schema;
                 let right_schema = &program.schemas[*right_schema_idx as usize];
                 if let Some(cursor) = cursor_mut!(*trace_reg) {
                     let result = ops::op_join_delta_trace_range(
                         &reg!(*delta_reg).batch,
                         cursor,
-                        &left_schema,
+                        left_schema,
                         right_schema,
                         *n_eq as usize,
                         *rel,
@@ -330,8 +302,8 @@ pub(crate) fn execute_epoch_multi(
                 worker_id,
                 num_workers,
             } => {
-                let schema = reg!(*in_reg).schema;
-                let result = ops::op_partition_filter(&reg!(*in_reg).batch, &schema, *worker_id, *num_workers);
+                let schema = &program.reg_meta[*in_reg as usize].schema;
+                let result = ops::op_partition_filter(&reg!(*in_reg).batch, schema, *worker_id, *num_workers);
                 reg_mut!(*out_reg).batch = result;
             }
 
@@ -340,14 +312,14 @@ pub(crate) fn execute_epoch_multi(
                 out_reg,
                 right_schema_idx,
             } => {
-                let in_schema = reg!(*in_reg).schema;
+                let in_schema = &program.reg_meta[*in_reg as usize].schema;
                 let right_schema = &program.schemas[*right_schema_idx as usize];
-                let result = ops::op_null_extend(&reg!(*in_reg).batch, &in_schema, right_schema);
+                let result = ops::op_null_extend(&reg!(*in_reg).batch, in_schema, right_schema);
                 reg_mut!(*out_reg).batch = result;
             }
 
             Instr::Integrate { in_reg, table_idx, avi } => {
-                let schema = reg!(*in_reg).schema;
+                let schema = &program.reg_meta[*in_reg as usize].schema;
 
                 let target_ptr = if *table_idx >= 0 {
                     program.tables[*table_idx as usize]
@@ -362,8 +334,10 @@ pub(crate) fn execute_epoch_multi(
 
                 let avi_desc = avi.as_ref().map(|a| AviDesc {
                     table: program.tables[a.table_idx as usize],
-                    group_by_cols: &a.group_by_cols,
-                    aggs: &a.aggs,
+                    group_by_cols: &program.group_cols
+                        [a.group_cols_offset as usize..(a.group_cols_offset as usize + a.group_cols_count as usize)],
+                    aggs: &program.agg_descs
+                        [a.agg_descs_offset as usize..(a.agg_descs_offset as usize + a.agg_descs_count as usize)],
                 });
 
                 gnitz_debug!(
@@ -372,7 +346,7 @@ pub(crate) fn execute_epoch_multi(
                     target.is_some(),
                     avi_desc.is_some()
                 );
-                let res = ops::op_integrate_with_indexes(&reg!(*in_reg).batch, target, &schema, avi_desc.as_ref());
+                let res = ops::op_integrate_with_indexes(&reg!(*in_reg).batch, target, schema, avi_desc.as_ref());
                 fatal_on_tick_ingest_err("integrate", *table_idx, res);
             }
 
@@ -388,13 +362,12 @@ pub(crate) fn execute_epoch_multi(
                 group_cols_count,
                 output_schema_idx,
                 out_key,
-                avi,
-                finalize_func_idx,
-                finalize_schema_idx,
+                avi_table_idx,
+                finalize,
                 global_ground,
                 i_am_owner,
             } => {
-                let in_schema = reg!(*in_reg).schema;
+                let in_schema = &program.reg_meta[*in_reg as usize].schema;
                 let out_schema = &program.schemas[*output_schema_idx as usize];
                 let aggs = &program.agg_descs
                     [*agg_descs_offset as usize..(*agg_descs_offset as usize + *agg_descs_count as usize)];
@@ -407,7 +380,7 @@ pub(crate) fn execute_epoch_multi(
                         .map(|c| c as *mut ReadCursor)
                         .unwrap_or(std::ptr::null_mut());
                     if ptr.is_null() {
-                        return Err(-11);
+                        return Err(VmError::TraceInCursorUnbound);
                     }
                     ptr
                 } else {
@@ -419,15 +392,15 @@ pub(crate) fn execute_epoch_multi(
                     .map(|c| c as *mut ReadCursor)
                     .unwrap_or(std::ptr::null_mut());
                 if to_cursor_ptr.is_null() {
-                    return Err(-10);
+                    return Err(VmError::TraceOutCursorUnbound);
                 }
 
                 // Combined AVI cursor — created fresh from the value-index table
                 // (not a register). Must be created AFTER INTEGRATE populates the
                 // table, so the prefix seek returns the post-delta extreme.
                 // Operator-state read; compact first (see refresh_owned_cursors).
-                let mut avi_cursor_handle: Option<Box<ReadCursor>> = if let Some(avi) = avi {
-                    let avi_ptr = program.tables[avi.table_idx as usize];
+                let mut avi_cursor_handle: Option<Box<ReadCursor>> = if let Some(idx) = avi_table_idx {
+                    let avi_ptr = program.tables[*idx as usize];
                     let avi_table = unsafe { &mut *avi_ptr };
                     let _ = avi_table.compact_if_needed();
                     Some(Box::new(avi_table.open_cursor()))
@@ -443,10 +416,8 @@ pub(crate) fn execute_epoch_multi(
                     aggs.len()
                 );
 
-                let fin_func = finalize_func_idx
-                    .as_ref()
-                    .map(|idx| unsafe { &*program.funcs[*idx as usize] });
-                let fin_schema = finalize_schema_idx.as_ref().map(|idx| &program.schemas[*idx as usize]);
+                let fin_func = finalize.map(|f| unsafe { &*program.funcs[f.func_idx as usize] });
+                let fin_schema = finalize.map(|f| &program.schemas[f.schema_idx as usize]);
 
                 let ti_opt: Option<&mut ReadCursor> = if !ti_cursor_ptr.is_null() {
                     Some(unsafe { &mut *ti_cursor_ptr })
@@ -459,7 +430,7 @@ pub(crate) fn execute_epoch_multi(
                     &reg!(*in_reg).batch,
                     ti_opt,
                     unsafe { &mut *to_cursor_ptr },
-                    &in_schema,
+                    in_schema,
                     out_schema,
                     gcols,
                     aggs,
