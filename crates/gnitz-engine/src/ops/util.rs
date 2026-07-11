@@ -3,36 +3,7 @@
 use xxhash_rust::xxh3::Xxh3Default;
 
 use crate::schema::{type_code, ColumnLocator, SchemaDescriptor, TypeCode};
-use crate::storage::{Batch, MemBatch, ReadCursor};
-
-/// Compare two equal-width column windows of type `tc` — the `ops`-side adapter over
-/// storage's single-homed [`crate::storage::cmp_col_window`], which dispatches German
-/// strings (STRING/BLOB) to content comparison and every fixed-width type to its
-/// little-endian comparator. `tc as u8` is the raw type code (`TypeCode` is
-/// `#[repr(u8)]`); the group-by and payload comparators route through here so the
-/// `ops` side keeps thinking in `TypeCode`.
-#[inline]
-pub(super) fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], tc: TypeCode) -> std::cmp::Ordering {
-    crate::storage::cmp_col_window(a, a_blob, b, b_blob, tc as u8)
-}
-
-// ---------------------------------------------------------------------------
-// String relocation helpers
-// ---------------------------------------------------------------------------
-
-/// Copy a German String from a MemBatch into the output Batch at
-/// payload column `out_pi` (current row position).
-pub(super) fn write_string_from_batch(
-    output: &mut Batch,
-    out_pi: usize,
-    batch: &MemBatch,
-    row: usize,
-    payload_col: usize,
-) {
-    let src = batch.get_col_ptr(row, payload_col, 16);
-    let cell = crate::schema::relocate_german_string_vec(src, batch.blob, &mut output.blob, None);
-    output.extend_col(out_pi, &cell);
-}
+use crate::storage::{ColumnarSource, MemBatch, ReadCursor};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -63,51 +34,6 @@ pub(crate) fn all_payload_null_mask(npc: usize) -> u64 {
     } else {
         u64::MAX
     }
-}
-
-/// Compare a cursor's current payload to a batch row's payload, returning their ordering.
-///
-/// Iterates payload columns in schema order (skipping pk_index). Null ordering:
-/// null < non-null, null == null. Type dispatch follows `compare_by_group_cols`.
-pub(super) fn compare_cursor_payload_to_batch_row(
-    cursor: &ReadCursor,
-    batch: &MemBatch,
-    row: usize,
-    schema: &SchemaDescriptor,
-) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-
-    let cursor_blob_slice: &[u8] = cursor.blob_slice();
-
-    for (pi, ci, col) in schema.payload_columns() {
-        let cs = col.size() as usize;
-
-        let cursor_null = (cursor.current_null_word >> pi) & 1 != 0;
-        let batch_null = (batch.get_null_word(row) >> pi) & 1 != 0;
-
-        let ord = match (cursor_null, batch_null) {
-            (true, true) => Ordering::Equal,
-            (true, false) => Ordering::Less,
-            (false, true) => Ordering::Greater,
-            (false, false) => {
-                let c_ptr = cursor.col_ptr(ci, cs);
-                let c_bytes = unsafe { std::slice::from_raw_parts(c_ptr, cs) };
-                let b_bytes = batch.get_col_ptr(row, pi, cs);
-                cmp_col_window(
-                    c_bytes,
-                    cursor_blob_slice,
-                    b_bytes,
-                    batch.blob,
-                    TypeCode::from_validated_u8(col.type_code),
-                )
-            }
-        };
-
-        if ord != Ordering::Equal {
-            return ord;
-        }
-    }
-    Ordering::Equal
 }
 
 // ---------------------------------------------------------------------------
@@ -291,89 +217,10 @@ pub(super) fn hash_german_string_content(hasher: &mut Xxh3Default, struct_bytes:
     hasher.update(content);
 }
 
-/// Minimal row accessor shared by `extract_group_key` over a `MemBatch` row and
-/// over a `ReadCursor`'s current row, so the group-key hash has ONE
-/// implementation. The two must hash byte-identically — a divergence would
-/// silently merge or split groups in the non-linear REDUCE fallback (wrong
-/// MIN/MAX). Pinned by `extract_group_key_cursor_matches_batch`.
-///
-/// `c_idx` is a LOGICAL column index. The `MemBatch` impl maps it to a payload
-/// slot via the passed schema; the `ReadCursor` impl maps it via the cursor's
-/// own (identical) schema — the trace-in cursor is built with the input schema,
-/// so both resolve the same physical layout.
-trait GroupKeyRow {
-    /// OPK (big-endian) PK byte window for the row.
-    fn pk_bytes(&self) -> &[u8];
-    /// Null bitmap word for the row.
-    fn null_word(&self) -> u64;
-    /// Raw little-endian bytes of non-PK logical column `c_idx` (`cs` wide), or
-    /// `None` if the backing pointer is null (treated as an absent value).
-    fn payload_bytes(&self, schema: &SchemaDescriptor, c_idx: usize, cs: usize) -> Option<&[u8]>;
-    /// Blob arena backing this row's German strings.
-    fn blob(&self) -> &[u8];
-}
-
-struct BatchRow<'a, 'b> {
-    mb: &'b MemBatch<'a>,
-    row: usize,
-}
-
-impl GroupKeyRow for BatchRow<'_, '_> {
-    #[inline]
-    fn pk_bytes(&self) -> &[u8] {
-        self.mb.get_pk_bytes(self.row)
-    }
-    #[inline]
-    fn null_word(&self) -> u64 {
-        self.mb.get_null_word(self.row)
-    }
-    #[inline]
-    fn payload_bytes(&self, schema: &SchemaDescriptor, c_idx: usize, cs: usize) -> Option<&[u8]> {
-        // MemBatch get_col_ptr is infallible (panics OOB) — always Some, so the
-        // batch path keeps its original non-null assumption and behaviour.
-        let pi = schema
-            .try_payload_idx(c_idx)
-            .expect("group-key column is non-PK by construction");
-        Some(self.mb.get_col_ptr(self.row, pi, cs))
-    }
-    #[inline]
-    fn blob(&self) -> &[u8] {
-        self.mb.blob
-    }
-}
-
-impl GroupKeyRow for ReadCursor {
-    #[inline]
-    fn pk_bytes(&self) -> &[u8] {
-        self.current_pk_bytes()
-    }
-    #[inline]
-    fn null_word(&self) -> u64 {
-        self.current_null_word
-    }
-    #[inline]
-    fn payload_bytes(&self, _schema: &SchemaDescriptor, c_idx: usize, cs: usize) -> Option<&[u8]> {
-        // col_ptr maps logical→payload internally and returns null for PK /
-        // unpositioned cursors. The caller has already excluded PK columns and
-        // scans only under `valid`, so null is an invariant violation — treat it
-        // as an absent value rather than dereferencing it (UB).
-        let p = self.col_ptr(c_idx, cs);
-        if p.is_null() {
-            None
-        } else {
-            Some(unsafe { std::slice::from_raw_parts(p, cs) })
-        }
-    }
-    #[inline]
-    fn blob(&self) -> &[u8] {
-        self.blob_slice()
-    }
-}
-
 /// Extract 128-bit group key from a batch row.
 #[inline]
 pub(super) fn extract_group_key(mb: &MemBatch, row: usize, schema: &SchemaDescriptor, group_by_cols: &[u32]) -> u128 {
-    extract_group_key_row(&BatchRow { mb, row }, schema, group_by_cols)
+    extract_group_key_row(mb, row, schema, group_by_cols)
 }
 
 /// The 128-bit group key of the **empty** group-column set — the constant `V₀` a
@@ -393,11 +240,14 @@ pub(crate) fn global_group_key() -> u128 {
 }
 
 /// Extract 128-bit group key from a `ReadCursor`'s current row. Hashes
-/// byte-identically to [`extract_group_key`] for the same logical row, so a
-/// trace row routes to the delta group it belongs to.
+/// byte-identically to [`extract_group_key`] for the same logical row (both
+/// route through the one `extract_group_key_row` body over `ColumnarSource`),
+/// so a trace row routes to the delta group it belongs to. Pinned by
+/// `extract_group_key_cursor_matches_batch`.
 #[inline]
 pub(super) fn extract_group_key_cursor(cursor: &ReadCursor, schema: &SchemaDescriptor, group_by_cols: &[u32]) -> u128 {
-    extract_group_key_row(cursor, schema, group_by_cols)
+    let (src, row) = cursor.current_row_source();
+    extract_group_key_row(src, row, schema, group_by_cols)
 }
 
 /// Which canonical (order-preserving) fast-path arm [`extract_group_key_row`]
@@ -433,8 +283,18 @@ pub(super) fn single_col_canonical_group_key(
     (col.nullable == 0 && crate::schema::is_routable_int(col.type_code)).then_some(CanonicalKeyArm::Payload)
 }
 
+/// The one group-key hash body, generic over any [`ColumnarSource`] row — a
+/// `MemBatch` row and a `ReadCursor`'s current row hash byte-identically, so a
+/// trace row routes to the delta group it belongs to. A divergence would
+/// silently merge or split groups in the non-linear REDUCE fallback (wrong
+/// MIN/MAX).
 #[inline]
-fn extract_group_key_row<R: GroupKeyRow>(row: &R, schema: &SchemaDescriptor, group_by_cols: &[u32]) -> u128 {
+fn extract_group_key_row<R: ColumnarSource>(
+    src: &R,
+    row: usize,
+    schema: &SchemaDescriptor,
+    group_by_cols: &[u32],
+) -> u128 {
     // Canonical single-column fast path, dispatched by the shared
     // `single_col_canonical_group_key` classifier (see its doc).
     //
@@ -459,15 +319,13 @@ fn extract_group_key_row<R: GroupKeyRow>(row: &R, schema: &SchemaDescriptor, gro
         match arm {
             CanonicalKeyArm::Pk => {
                 let off = schema.pk_byte_offset(c_idx) as usize;
-                return crate::schema::pk_route_key(row.pk_bytes(), off, cs);
+                return crate::schema::pk_route_key(src.get_pk_bytes(row), off, cs);
             }
             CanonicalKeyArm::Payload => {
-                // `payload_bytes == None` (a cursor-impl invariant violation
-                // only, never on the `MemBatch` path) falls through to the
-                // fold's NULL-marker hash.
-                if let Some(b) = row.payload_bytes(schema, c_idx, cs) {
-                    return crate::schema::payload_route_key(b, 0, cs, col.type_code);
-                }
+                let pi = schema
+                    .try_payload_idx(c_idx)
+                    .expect("Payload arm: non-PK by classification");
+                return crate::schema::payload_route_key(src.get_col_ptr(row, pi, cs), 0, cs, col.type_code);
             }
         }
     }
@@ -479,7 +337,7 @@ fn extract_group_key_row<R: GroupKeyRow>(row: &R, schema: &SchemaDescriptor, gro
     // itself: every column emits exactly one null marker before its content, so
     // (a, b) ≠ (b, a) and (NULL, v) ≠ (v, NULL) without an explicit index byte,
     // and STRING content is length-prefixed so "ab"+"c" can't alias "a"+"bc".
-    let null_word = row.null_word();
+    let null_word = src.get_null_word(row);
     // Function-local streaming hasher: `Xxh3Default::new()` only copies the
     // initial accumulator (the 256-byte buffer is `MaybeUninit`), so it is as
     // cheap as `reset()` — no thread-local or per-row reuse needed.
@@ -493,7 +351,7 @@ fn extract_group_key_row<R: GroupKeyRow>(row: &R, schema: &SchemaDescriptor, gro
             // join's other side.
             let off = schema.pk_byte_offset(c_idx) as usize;
             let cs = schema.columns[c_idx].size() as usize;
-            let key = crate::schema::pk_route_key(row.pk_bytes(), off, cs);
+            let key = crate::schema::pk_route_key(src.get_pk_bytes(row), off, cs);
             hasher.update(&[1u8]); // non-null marker
             hasher.update(&key.to_le_bytes());
             continue;
@@ -502,27 +360,20 @@ fn extract_group_key_row<R: GroupKeyRow>(row: &R, schema: &SchemaDescriptor, gro
             .try_payload_idx(c_idx)
             .expect("non-PK: PK columns handled in the branch above");
         let is_null = schema.columns[c_idx].nullable != 0 && (null_word >> pi) & 1 != 0;
+        if is_null {
+            hasher.update(&[0u8]); // null marker
+            continue;
+        }
         // `size()` is already 16 for STRING/BLOB/U128/UUID (all share the wide
         // 16-byte layout), so no per-type width fixup is needed here.
         let cs = schema.columns[c_idx].size() as usize;
-        // A null payload bit OR a missing backing slot (cursor invariant
-        // violation, never on the batch path) both hash as a bare NULL marker
-        // — no deref.
-        let bytes = if is_null {
-            None
-        } else {
-            row.payload_bytes(schema, c_idx, cs)
-        };
-        let Some(b) = bytes else {
-            hasher.update(&[0u8]);
-            continue;
-        }; // null marker
+        let b = src.get_col_ptr(row, pi, cs);
         hasher.update(&[1u8]); // non-null marker
         if gnitz_wire::is_german_string(tc) {
             // STRING and BLOB both hash length-prefixed content via the shared
             // helper (matching reindex_hash_row); load-bearing for BLOB grouping
             // keys (Fix C), not only STRING.
-            hash_german_string_content(&mut hasher, b, row.blob());
+            hash_german_string_content(&mut hasher, b, src.blob_slice());
         } else if tc == type_code::U128 || tc == type_code::UUID {
             hasher.update(&b[..16]);
         } else {

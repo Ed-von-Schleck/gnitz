@@ -180,64 +180,37 @@ pub(super) fn scatter_is_pk_routed(col_indices: &[u32], target_tcs: &[u8], schem
     col_indices == schema.pk_indices() && !key_is_promoted(target_tcs)
 }
 
-fn fill_worker_indices(
-    batch: &Batch,
-    col_indices: &[u32],
-    schema: &SchemaDescriptor,
-    num_workers: usize,
-    out: &mut Vec<Vec<u32>>,
-) {
+/// Write-side table-key scatter fill: `partition_for_pk` hashes the table's
+/// **distribution prefix**, exactly as `PartitionedTable` ingest/probe do, so a
+/// row's DML scatter lands on the worker that owns its partition. The
+/// join-relay scatters route by the *join* key over a derived schema and call
+/// `partition_for_pk_bytes` directly (see `op_repartition_batches_mode`) — a
+/// different hash domain with no promotion concept.
+fn fill_worker_indices(batch: &Batch, schema: &SchemaDescriptor, num_workers: usize, out: &mut Vec<Vec<u32>>) {
     let mb = batch.as_mem_batch();
     let w_map = build_w_map(num_workers);
     if out.len() < num_workers {
         out.resize_with(num_workers, Vec::new);
     }
     out[..num_workers].iter_mut().for_each(Vec::clear);
-    // Strict sequence equality: route by PK bytes only when `col_indices` is
-    // exactly `pk_indices()` in order. Set equality (`group_cols_eq_pk`) would
-    // accept a permuted compound PK and disagree with `partition_for_pk_bytes`,
-    // which always hashes the OPK bytes in schema order — silently dropping
-    // join rows. `partition_for_pk_bytes` is the universal PK router at every
-    // width (it calls `widen_pk_be`), so narrow PKs take it too.
-    let is_pk_routing = col_indices == schema.pk_indices();
-    if is_pk_routing {
-        // Write-side table-key scatter: `partition_for_pk` hashes the table's
-        // distribution prefix, exactly as `PartitionedTable` ingest/probe do, so a
-        // row's DML scatter lands on the worker that owns its partition. The
-        // join-relay scatters route by the *join* key over a derived schema and
-        // call `partition_for_pk_bytes` directly (see `op_repartition_batches_mode`).
-        for i in 0..batch.count {
-            let partition = schema.partition_for_pk(mb.get_pk_bytes(i));
-            out[w_map[partition]].push(i as u32);
-        }
-    } else {
-        // Always a group/seek-style scatter (no `RouteMode` reaches here): route
-        // by the null-distinct group fold directly.
-        for i in 0..batch.count {
-            let partition = partition_for_key(extract_group_key(&mb, i, schema, col_indices));
-            out[w_map[partition]].push(i as u32);
-        }
+    for i in 0..batch.count {
+        let partition = schema.partition_for_pk(mb.get_pk_bytes(i));
+        out[w_map[partition]].push(i as u32);
     }
 }
 
-/// Compute per-worker row indices into the TLS pool and call `f` with a
-/// borrowed view, avoiding the clone done by `compute_worker_indices`.
+/// Compute per-worker row indices (by the table's distribution prefix, see
+/// [`fill_worker_indices`]) into the TLS pool and call `f` with a borrowed view.
 ///
-/// `f` must not call `compute_worker_indices` or `with_worker_indices` —
-/// the `SCATTER_INDICES` `RefCell` is already mutably borrowed.
-pub fn with_worker_indices<F, R>(
-    batch: &Batch,
-    col_indices: &[u32],
-    schema: &SchemaDescriptor,
-    num_workers: usize,
-    f: F,
-) -> R
+/// `f` must not call `with_worker_indices` — the `SCATTER_INDICES` `RefCell` is
+/// already mutably borrowed.
+pub fn with_worker_indices<F, R>(batch: &Batch, schema: &SchemaDescriptor, num_workers: usize, f: F) -> R
 where
     F: FnOnce(&[Vec<u32>]) -> R,
 {
     SCATTER_INDICES.with(|pool| {
         let mut worker_indices = pool.borrow_mut();
-        fill_worker_indices(batch, col_indices, schema, num_workers, &mut worker_indices);
+        fill_worker_indices(batch, schema, num_workers, &mut worker_indices);
         f(&worker_indices[..num_workers])
     })
 }
@@ -272,24 +245,6 @@ where
     })
 }
 
-/// Compute per-worker row-index lists for `batch` without building sub-batches.
-/// Returns `worker_indices[w]` = row indices from `batch` destined for worker `w`.
-/// Use `with_worker_indices` instead when the caller can borrow the routing table
-/// for the duration of the scatter.
-#[cfg(test)]
-pub(crate) fn compute_worker_indices(
-    batch: &Batch,
-    col_indices: &[u32],
-    schema: &SchemaDescriptor,
-    num_workers: usize,
-) -> Vec<Vec<u32>> {
-    SCATTER_INDICES.with(|pool| {
-        let mut worker_indices = pool.borrow_mut();
-        fill_worker_indices(batch, col_indices, schema, num_workers, &mut worker_indices);
-        worker_indices[..num_workers].to_vec()
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -298,32 +253,7 @@ pub(crate) fn compute_worker_indices(
 mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-    use crate::storage::Layout;
-
-    fn make_schema_u64_i64() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        )
-    }
-
-    fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
-        let n = rows.len();
-        let mut b = Batch::with_schema(*schema, n.max(1));
-
-        for &(pk, w, val) in rows {
-            b.extend_pk(pk as u128);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &val.to_le_bytes());
-            b.count += 1;
-        }
-        b.certify_layout(Layout::Consolidated, schema);
-        b
-    }
+    use crate::test_support::{make_batch, make_schema_u64_i64};
 
     #[test]
     fn test_partition_filter_partitions_rows_by_owner() {
@@ -512,10 +442,12 @@ mod tests {
 
     // ── Master/worker routing symmetry over compound PKs ────────────────
     //
-    // `compute_worker_indices` (the master-side scatter) and
+    // `with_worker_indices` (the master-side scatter, keyed by the table's
+    // distribution prefix `schema.partition_for_pk`) and
     // `partition_for_pk_bytes` + `worker_for_partition` (the worker-side
     // route) must agree on every row, or a pushed row lands on a worker that
-    // never owns its partition.
+    // never owns its partition. (These schemas' distribution prefix is the
+    // whole PK, so the two hash domains coincide here by construction.)
 
     fn u64_pk_col() -> SchemaColumn {
         SchemaColumn::new(type_code::U64, 0)
@@ -556,14 +488,13 @@ mod tests {
         let num_workers = 4;
 
         let mut master_workers = vec![0usize; batch.count];
-        for (w, row_indices) in compute_worker_indices(&batch, schema.pk_indices(), &schema, num_workers)
-            .into_iter()
-            .enumerate()
-        {
-            for row_idx in row_indices {
-                master_workers[row_idx as usize] = w;
+        with_worker_indices(&batch, &schema, num_workers, |worker_indices| {
+            for (w, row_indices) in worker_indices.iter().enumerate() {
+                for &row_idx in row_indices {
+                    master_workers[row_idx as usize] = w;
+                }
             }
-        }
+        });
 
         let worker_workers: Vec<usize> = (0..batch.count)
             .map(|i| {
@@ -606,14 +537,13 @@ mod tests {
         let num_workers = 4;
 
         let mut master_workers = vec![0usize; b.count];
-        for (w, row_indices) in compute_worker_indices(&b, schema.pk_indices(), &schema, num_workers)
-            .into_iter()
-            .enumerate()
-        {
-            for row_idx in row_indices {
-                master_workers[row_idx as usize] = w;
+        with_worker_indices(&b, &schema, num_workers, |worker_indices| {
+            for (w, row_indices) in worker_indices.iter().enumerate() {
+                for &row_idx in row_indices {
+                    master_workers[row_idx as usize] = w;
+                }
             }
-        }
+        });
 
         let worker_workers: Vec<usize> = (0..b.count)
             .map(|i| {

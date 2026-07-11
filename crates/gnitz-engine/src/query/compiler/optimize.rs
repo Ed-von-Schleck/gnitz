@@ -220,22 +220,11 @@ pub(super) fn copy_pk_columns_into(
     k
 }
 
-/// Whether a join merges the right side's payload columns as-is or marks them
-/// nullable (outer-join null-fill).
-#[derive(Clone, Copy)]
-pub(super) enum JoinNullFill {
-    None,
-    RightNullable,
-}
-
 /// `None` when the merged column count would overflow the fixed `[_; 65]` schema
-/// array — a crafted/corrupt `NullExtend` or `Join` node; the caller fails the
-/// compile rather than aborting.
-pub(super) fn merge_schemas_for_join(
-    left: &SchemaDescriptor,
-    right: &SchemaDescriptor,
-    fill: JoinNullFill,
-) -> Option<SchemaDescriptor> {
+/// array — a crafted/corrupt `Join` node; the caller fails the compile rather
+/// than aborting. (The outer-join null-fill columns are built by the `NullExtend`
+/// emit arm, which appends its `type_codes` as nullable columns directly.)
+pub(super) fn merge_schemas_for_join(left: &SchemaDescriptor, right: &SchemaDescriptor) -> Option<SchemaDescriptor> {
     let total = left.num_columns() + right.num_payload_cols();
     if total > crate::schema::MAX_COLUMNS {
         return None;
@@ -249,11 +238,7 @@ pub(super) fn merge_schemas_for_join(
         n += 1;
     }
     for (_, _, c) in right.payload_columns() {
-        let mut c = *c;
-        if matches!(fill, JoinNullFill::RightNullable) {
-            c.nullable = 1;
-        }
-        cols[n] = c;
+        cols[n] = *c;
         n += 1;
     }
     Some(SchemaDescriptor::new(&cols[..n], &pk_idx[..pk_len]))

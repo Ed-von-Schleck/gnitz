@@ -6,7 +6,7 @@
 //! streams** by equal PK, hand each `(key, left-group, right-group)` to the
 //! operator. These skeletons own that control flow; the operator callback owns
 //! the row copy. The skip step galloping-seeks from the live position
-//! (`SortedKeyStream::advance_to`), so K ascending probes over an N-row source
+//! (`advance_to`), so K ascending probes over an N-row source
 //! cost `O(K · log gap)`, not `O(K · log N)` or a linear `O(K + N)` scan.
 
 use std::cmp::Ordering;
@@ -14,40 +14,22 @@ use std::ops::Range;
 
 use crate::storage::{pk_bytes_eq, Batch, ReadCursor};
 
-/// A sorted OPK-byte stream with a galloping forward skip. `ReadCursor`
-/// implements it via `advance_to` (seeding each source at its live position); a
-/// [`BatchCursor`] implements it via `Batch::advance_to` over the batch rows —
-/// so the symmetric set-union merge co-groups two delta batches through the same
-/// skeleton the delta-trace joins use against a trace. The skeletons own the
-/// control flow with just these two
-/// operations; the per-group walk that reads weights/payloads is the operator
-/// callback's concern, done through the concrete cursor's own accessors.
-pub(crate) trait SortedKeyStream {
-    /// Current row's OPK bytes; `None` when exhausted.
-    fn key(&self) -> Option<&[u8]>;
-    /// Galloping forward lower-bound skip to the first row with `key() >= key`.
-    fn advance_to(&mut self, key: &[u8]);
-}
-
-impl SortedKeyStream for ReadCursor {
-    #[inline]
-    fn key(&self) -> Option<&[u8]> {
-        if self.valid {
-            Some(self.current_pk_bytes())
-        } else {
-            None
-        }
+/// First row index past the equal-PK group beginning at `start`. Requires
+/// `start < batch.count`.
+#[inline]
+pub(crate) fn pk_group_end(batch: &Batch, start: usize) -> usize {
+    let k = batch.get_pk_bytes(start);
+    let mut j = start + 1;
+    while j < batch.count && pk_bytes_eq(batch.get_pk_bytes(j), k) {
+        j += 1;
     }
-    #[inline]
-    fn advance_to(&mut self, key: &[u8]) {
-        ReadCursor::advance_to(self, key);
-    }
+    j
 }
 
 /// A random-access cursor over a sorted `&Batch`, advanced by row index. Beyond
-/// the [`SortedKeyStream`] skip it exposes its `pos` and equal-PK group extent
-/// (`group_end`/`seek`), which the DD-join callbacks and [`cogroup_union`] use to
-/// bracket and bulk-advance both sides.
+/// the galloping skip it exposes its `pos` and equal-PK group extent
+/// (`group_end`/`seek`), which [`cogroup_union`] uses to bracket and
+/// bulk-advance both sides.
 pub(crate) struct BatchCursor<'a> {
     batch: &'a Batch,
     pub(crate) pos: usize,
@@ -69,26 +51,22 @@ impl<'a> BatchCursor<'a> {
     /// `pos < batch.count`.
     #[inline]
     pub(crate) fn group_end(&self) -> usize {
-        let k = self.batch.get_pk_bytes(self.pos);
-        let mut j = self.pos + 1;
-        while j < self.batch.count && pk_bytes_eq(self.batch.get_pk_bytes(j), k) {
-            j += 1;
-        }
-        j
+        pk_group_end(self.batch, self.pos)
     }
-}
 
-impl SortedKeyStream for BatchCursor<'_> {
+    /// Current row's OPK bytes; `None` when exhausted.
     #[inline]
-    fn key(&self) -> Option<&[u8]> {
+    pub(crate) fn key(&self) -> Option<&[u8]> {
         if self.pos < self.batch.count {
             Some(self.batch.get_pk_bytes(self.pos))
         } else {
             None
         }
     }
+
+    /// Galloping forward lower-bound skip to the first row with `key() >= key`.
     #[inline]
-    fn advance_to(&mut self, key: &[u8]) {
+    pub(crate) fn advance_to(&mut self, key: &[u8]) {
         self.pos = self.batch.advance_to(key, self.pos);
     }
 }
@@ -106,17 +84,18 @@ impl SortedKeyStream for BatchCursor<'_> {
 /// group's `advance_to`.
 ///
 /// **Callback contract.** `on_match` reads its match group by walking the
-/// forward-only `m` with the concrete cursor's own step (`while m.key() ==
-/// Some(key) { … step }`) and must walk the *whole* group to emit correctly. Loop
+/// forward-only `m` with the cursor's own step (`while m.valid &&
+/// m.current_pk_eq(key) { … m.advance() }`) and must walk the *whole* group to
+/// emit correctly. Loop
 /// *progress* is robust either way: the skeleton re-establishes the match
 /// position with `advance_to` at the next delta key (an under-walk forfeits rows
 /// the callback should have read; an over-walk merely sends the following
 /// `advance_to` down its bounded-backward branch, still correct).
 #[inline]
-pub(crate) fn cogroup_intersection<M: SortedKeyStream>(
+pub(crate) fn cogroup_intersection(
     delta: &Batch,
-    m: &mut M,
-    mut on_match: impl FnMut(&[u8], Range<usize>, &mut M),
+    m: &mut ReadCursor,
+    mut on_match: impl FnMut(&[u8], Range<usize>, &mut ReadCursor),
 ) {
     let n = delta.count;
     if n == 0 {
@@ -124,17 +103,13 @@ pub(crate) fn cogroup_intersection<M: SortedKeyStream>(
     }
     m.advance_to(delta.get_pk_bytes(0));
     let mut i = 0;
-    while i < n {
-        let Some(mk) = m.key() else { break };
+    while i < n && m.valid {
         let dk = delta.get_pk_bytes(i);
-        match dk.cmp(mk) {
-            Ordering::Less => i = delta.advance_to(mk, i), // skip delta
-            Ordering::Greater => m.advance_to(dk),         // skip match side
+        match dk.cmp(m.current_pk_bytes()) {
+            Ordering::Less => i = delta.advance_to(m.current_pk_bytes(), i), // skip delta
+            Ordering::Greater => m.advance_to(dk),                           // skip match side
             Ordering::Equal => {
-                let mut j = i + 1;
-                while j < n && pk_bytes_eq(delta.get_pk_bytes(j), dk) {
-                    j += 1;
-                } // delta group
+                let j = pk_group_end(delta, i); // delta group
                 on_match(dk, i..j, m); // walks match group
                 i = j;
             }
@@ -150,19 +125,16 @@ pub(crate) fn cogroup_intersection<M: SortedKeyStream>(
 /// forward-only `m` over the match group (possibly empty) and must walk the
 /// whole group; loop progress is robust to under/over-walk.
 #[inline]
-pub(crate) fn cogroup_left<M: SortedKeyStream>(
+pub(crate) fn cogroup_left(
     delta: &Batch,
-    m: &mut M,
-    mut on_group: impl FnMut(&[u8], Range<usize>, &mut M),
+    m: &mut ReadCursor,
+    mut on_group: impl FnMut(&[u8], Range<usize>, &mut ReadCursor),
 ) {
     let n = delta.count;
     let mut i = 0;
     while i < n {
         let dk = delta.get_pk_bytes(i);
-        let mut j = i + 1;
-        while j < n && pk_bytes_eq(delta.get_pk_bytes(j), dk) {
-            j += 1;
-        }
+        let j = pk_group_end(delta, i);
         m.advance_to(dk); // galloping skip; group may be empty
         on_group(dk, i..j, m);
         i = j;
@@ -269,16 +241,6 @@ mod tests {
         gnitz_wire::widen_pk_be(key, key.len()) as u64
     }
 
-    /// Concrete single-step for each match-stream impl, passed to the run
-    /// helpers as a `fn` pointer (the trait owns only `key`/`advance_to`; the
-    /// in-group walk is the consumer's concern).
-    fn step_rc(m: &mut ReadCursor) {
-        m.advance();
-    }
-    fn step_bc(m: &mut BatchCursor) {
-        m.pos += 1;
-    }
-
     /// Naive intersection reference: for every delta PK group, if the match
     /// batch has the same PK, emit (pk, delta-range, match-PKs).
     fn naive_intersection(delta: &Batch, m: &Batch) -> Vec<Triple> {
@@ -312,27 +274,27 @@ mod tests {
         out
     }
 
-    /// Run the intersection skeleton over `M`, recording each triple's key, delta
-    /// range, and walked match PKs. `step` is the concrete single-step for `M`.
-    fn run_intersection<M: SortedKeyStream>(delta: &Batch, m: &mut M, step: fn(&mut M)) -> Vec<Triple> {
+    /// Run the intersection skeleton, recording each triple's key, delta range,
+    /// and walked match PKs.
+    fn run_intersection(delta: &Batch, m: &mut ReadCursor) -> Vec<Triple> {
         let mut out = Vec::new();
         cogroup_intersection(delta, m, |key, range, m| {
             let mut rows = Vec::new();
-            while m.key() == Some(key) {
-                rows.push((pk_of(m.key().unwrap()), 0));
-                step(m);
+            while m.valid && m.current_pk_eq(key) {
+                rows.push((pk_of(m.current_pk_bytes()), 0));
+                m.advance();
             }
             out.push((pk_of(key), range, rows));
         });
         out
     }
-    fn run_left<M: SortedKeyStream>(delta: &Batch, m: &mut M, step: fn(&mut M)) -> Vec<Triple> {
+    fn run_left(delta: &Batch, m: &mut ReadCursor) -> Vec<Triple> {
         let mut out = Vec::new();
         cogroup_left(delta, m, |key, range, m| {
             let mut rows = Vec::new();
-            while m.key() == Some(key) {
-                rows.push((pk_of(m.key().unwrap()), 0));
-                step(m);
+            while m.valid && m.current_pk_eq(key) {
+                rows.push((pk_of(m.current_pk_bytes()), 0));
+                m.advance();
             }
             out.push((pk_of(key), range, rows));
         });
@@ -347,8 +309,7 @@ mod tests {
     }
 
     /// The skeleton's triples must match the naive reference (keys, delta ranges,
-    /// and walked match PKs) for both M = BatchCursor and M = ReadCursor, over a
-    /// range of shapes.
+    /// and walked match PKs) over a range of shapes.
     #[test]
     fn intersection_matches_reference_all_shapes() {
         let s = schema();
@@ -380,14 +341,8 @@ mod tests {
             let mb = make_batch(mi);
             let want = strip(&naive_intersection(&delta, &mb));
 
-            // M = BatchCursor
-            let mut bc = BatchCursor::new(&mb);
-            let got_bc = strip(&run_intersection(&delta, &mut bc, step_bc));
-            assert_eq!(got_bc, want, "BatchCursor delta={di:?} match={mi:?}");
-
-            // M = ReadCursor (single source)
             let mut ch = ReadCursor::from_owned(std::slice::from_ref(&mb), s);
-            let got_rc = strip(&run_intersection(&delta, &mut ch, step_rc));
+            let got_rc = strip(&run_intersection(&delta, &mut ch));
             assert_eq!(got_rc, want, "ReadCursor delta={di:?} match={mi:?}");
         }
     }
@@ -411,12 +366,8 @@ mod tests {
             let mb = make_batch(mi);
             let want = strip(&naive_left(&delta, &mb));
 
-            let mut bc = BatchCursor::new(&mb);
-            let got_bc = strip(&run_left(&delta, &mut bc, step_bc));
-            assert_eq!(got_bc, want, "BatchCursor delta={di:?} match={mi:?}");
-
             let mut ch = ReadCursor::from_owned(std::slice::from_ref(&mb), s);
-            let got_rc = strip(&run_left(&delta, &mut ch, step_rc));
+            let got_rc = strip(&run_left(&delta, &mut ch));
             assert_eq!(got_rc, want, "ReadCursor delta={di:?} match={mi:?}");
         }
     }
@@ -438,7 +389,7 @@ mod tests {
         let want = strip(&naive_intersection(&delta, &live));
 
         let mut ch = ReadCursor::from_owned(&[Rc::clone(&src_a), Rc::clone(&src_b)], s);
-        let got = strip(&run_intersection(&delta, &mut ch, step_rc));
+        let got = strip(&run_intersection(&delta, &mut ch));
         assert_eq!(got, want, "ghost group pk=3 must be skipped");
     }
 
@@ -458,7 +409,7 @@ mod tests {
         ch.advance_to(&(4u128).to_be_bytes()[8..]);
         assert!(ch.valid && ch.current_key_narrow() == 4, "precondition: stale at pk=4");
 
-        let got = strip(&run_intersection(&delta, &mut ch, step_rc));
+        let got = strip(&run_intersection(&delta, &mut ch));
         assert_eq!(got, want, "stale cursor must be reset by self-positioning");
     }
 

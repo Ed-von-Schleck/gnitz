@@ -4,41 +4,14 @@
 
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, MemBatch, ReadCursor};
-use gnitz_wire::is_german_string;
 
-use super::super::util::{merge_null_words, write_string_from_batch};
-
-// ---------------------------------------------------------------------------
-// Join row writer helpers
-// ---------------------------------------------------------------------------
-
-/// Copy left-side payload columns from a MemBatch into the output.
-/// Shared by all join row writers (inner, outer, DD).
-#[inline]
-fn write_left_payload(
-    output: &mut Batch,
-    left_batch: &MemBatch,
-    left_row: usize,
-    left_null: u64,
-    left_schema: &SchemaDescriptor,
-) {
-    for (pi, _ci, col) in left_schema.payload_columns() {
-        let cs = col.size() as usize;
-        let is_null = (left_null >> pi) & 1 != 0;
-        if is_null {
-            output.fill_col_zero(pi, cs);
-        } else if is_german_string(col.type_code) {
-            write_string_from_batch(output, pi, left_batch, left_row, pi);
-        } else {
-            output.extend_col(pi, left_batch.get_col_ptr(left_row, pi, cs));
-        }
-    }
-}
+use super::super::util::merge_null_words;
 
 /// Write one composite join output row: [left_PK, left_payload..., right_payload...].
 ///
 /// Left columns come from the delta MemBatch. Right columns come from the
-/// cursor's current row, accessed via `col_ptr()` / `blob_ptr()`.
+/// cursor's current row — both halves through the shared, monomorphic
+/// `Batch::append_payload_cols` body (German-string blob relocation included).
 #[inline]
 pub(super) fn write_join_row(
     output: &mut Batch,
@@ -59,38 +32,9 @@ pub(super) fn write_join_row(
     output.extend_weight(&weight.to_le_bytes());
     output.extend_null_bmp(&null_word.to_le_bytes());
 
-    write_left_payload(output, left_batch, left_row, left_null, left_schema);
-
-    // Right payload columns (from cursor public API)
-    let right_blob = right_cursor.blob_slice(); // &[u8], bounds carried
-    for (rpi, ci, col) in right_schema.payload_columns() {
-        let cs = col.size() as usize;
-        let is_null = (right_null >> rpi) & 1 != 0;
-        let out_pi = left_npc + rpi;
-        if is_null {
-            output.fill_col_zero(out_pi, cs);
-        } else if is_german_string(col.type_code) {
-            let ptr = right_cursor.col_ptr(ci, 16);
-            if ptr.is_null() {
-                output.fill_col_zero(out_pi, 16);
-            } else {
-                // SAFETY: ptr is a valid col_ptr (non-null checked above) to a
-                // 16-byte German-string struct; relocate_german_string_vec
-                // bounds-checks the blob offset against right_blob.
-                let src = unsafe { std::slice::from_raw_parts(ptr, 16) };
-                let dest = crate::schema::relocate_german_string_vec(src, right_blob, &mut output.blob, None);
-                output.extend_col(out_pi, &dest);
-            }
-        } else {
-            let ptr = right_cursor.col_ptr(ci, cs);
-            if ptr.is_null() {
-                output.fill_col_zero(out_pi, cs);
-            } else {
-                let src = unsafe { std::slice::from_raw_parts(ptr, cs) };
-                output.extend_col(out_pi, src);
-            }
-        }
-    }
+    output.append_payload_cols(0, left_schema, left_batch, left_row, left_null, None);
+    let (right_src, right_row) = right_cursor.current_row_source();
+    output.append_payload_cols(left_npc, right_schema, right_src, right_row, right_null, None);
 
     output.count += 1;
 }

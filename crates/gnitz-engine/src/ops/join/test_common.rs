@@ -3,31 +3,22 @@
 //! `super::super::test_common::*`.
 
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use crate::storage::{Batch, Layout};
+use crate::storage::Batch;
 
-pub(super) fn make_schema_u64_i64() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    )
-}
+pub(super) use crate::test_support::{
+    make_batch, make_batch_i64pk as make_signed_batch, make_schema_i64pk_i64 as make_schema_signed, make_schema_u64_i64,
+};
 
-pub(super) fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
-    let n = rows.len();
-    let mut b = Batch::with_schema(*schema, n.max(1));
-
-    for &(pk, w, val) in rows {
-        b.extend_pk(pk as u128);
-        b.extend_weight(&w.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &val.to_le_bytes());
-        b.count += 1;
+/// The compiler-built join output schema (`reg_meta`): left columns followed by
+/// the right side's payload columns, keyed by the left PK — what `emit.rs`'s
+/// `merge_schemas_for_join` bakes and `exec.rs` passes to the join ops. Test
+/// schemas are PK-leading, so the plain concatenation matches.
+pub(super) fn join_out_schema(left: &SchemaDescriptor, right: &SchemaDescriptor) -> SchemaDescriptor {
+    let mut cols: Vec<SchemaColumn> = (0..left.num_columns()).map(|ci| left.columns[ci]).collect();
+    for (_, _, col) in right.payload_columns() {
+        cols.push(*col);
     }
-    b.certify_layout(Layout::Consolidated, schema);
-    b
+    SchemaDescriptor::new(&cols, left.pk_indices())
 }
 
 pub(super) fn make_schema_compound() -> SchemaDescriptor {
@@ -39,32 +30,6 @@ pub(super) fn make_schema_compound() -> SchemaDescriptor {
         ],
         &[0, 1],
     )
-}
-
-pub(super) fn make_schema_signed() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    )
-}
-
-pub(super) fn make_signed_batch(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> Batch {
-    let mut b = Batch::with_schema(*schema, rows.len().max(1));
-    for &(pk, w, val) in rows {
-        // Signed PK at rest is OPK (big-endian, sign-bit flipped) so the
-        // join's compare_pk_bytes merge orders it correctly; the raw
-        // `extend_pk` would store non-order-preserving native bytes.
-        b.extend_pk_opk(schema, &[(pk as u64) as u128]);
-        b.extend_weight(&w.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &val.to_le_bytes());
-        b.count += 1;
-    }
-    b.certify_layout(Layout::Consolidated, schema);
-    b
 }
 
 // -----------------------------------------------------------------------

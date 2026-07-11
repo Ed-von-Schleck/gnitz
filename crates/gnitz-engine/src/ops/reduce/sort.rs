@@ -3,34 +3,39 @@
 use std::cmp::Ordering;
 
 use crate::schema::{key::PkSortKey, SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL};
-use crate::storage::{compare_pk_bytes, Batch, MemBatch};
-
-use super::super::util::cmp_col_window;
+use crate::storage::{cmp_col_window, compare_pk_bytes, Batch, ColumnarSource, MemBatch};
 
 /// Pre-computed per-column sort descriptor to avoid repeated schema lookups.
 ///
-/// Five bytes per entry, no padding (all fields are u8-sized).
-/// A stack array of MAX_COLUMNS = 65 entries is 325 bytes — well within five cache lines.
+/// Four bytes per entry, no padding (all fields are u8-sized).
+/// A stack array of MAX_COLUMNS = 65 entries is 260 bytes — well within five cache lines.
 #[derive(Clone, Copy)]
-pub(super) struct SortDesc {
-    pub(super) pi: u8,
-    pub(super) cs: u8,
-    pub(super) tc: TypeCode,
-    pub(super) c_idx: u8,
+pub(crate) struct SortDesc {
+    pub(crate) pi: u8,
+    pub(crate) cs: u8,
+    pub(crate) tc: TypeCode,
     /// Byte offset of the addressed PK column within the row's PK region.
     /// Meaningful only when `pi == PAYLOAD_MAPPING_PK_SENTINEL`; zero otherwise.
-    pub(super) pk_off: u8,
+    pub(crate) pk_off: u8,
 }
 
-/// Compare two rows by group columns using pre-computed SortDesc array.
-pub(super) fn compare_by_group_cols(mb: &MemBatch, row_a: usize, row_b: usize, descs: &[SortDesc]) -> Ordering {
-    let a_null_word = mb.get_null_word(row_a);
-    let b_null_word = mb.get_null_word(row_b);
+/// Compare two rows by group columns using a pre-computed SortDesc array.
+/// Generic over two [`ColumnarSource`]s, so an intra-batch argsort compare and
+/// the trace-cursor-vs-exemplar group-membership test share this one body.
+pub(super) fn compare_by_group_cols<A: ColumnarSource, B: ColumnarSource>(
+    src_a: &A,
+    row_a: usize,
+    src_b: &B,
+    row_b: usize,
+    descs: &[SortDesc],
+) -> Ordering {
+    let a_null_word = src_a.get_null_word(row_a);
+    let b_null_word = src_b.get_null_word(row_b);
 
     for desc in descs {
         if desc.pi == PAYLOAD_MAPPING_PK_SENTINEL {
             // Isolate the addressed PK column's byte window. Comparing the
-            // whole PK region (the previous `mb.get_pk(row)` widen) splits
+            // whole PK region (the previous `get_pk(row)` widen) splits
             // compound-PK groups that share the addressed column but differ
             // in other PK columns.
             // PK region holds OPK bytes, which are order-preserving — compare
@@ -38,8 +43,8 @@ pub(super) fn compare_by_group_cols(mb: &MemBatch, row_a: usize, row_b: usize, d
             // big-endian/sign-flipped OPK bytes.)
             let off = desc.pk_off as usize;
             let cs = desc.cs as usize;
-            let a = &mb.get_pk_bytes(row_a)[off..off + cs];
-            let b = &mb.get_pk_bytes(row_b)[off..off + cs];
+            let a = &src_a.get_pk_bytes(row_a)[off..off + cs];
+            let b = &src_b.get_pk_bytes(row_b)[off..off + cs];
             let ord = a.cmp(b);
             if ord != Ordering::Equal {
                 return ord;
@@ -63,11 +68,12 @@ pub(super) fn compare_by_group_cols(mb: &MemBatch, row_a: usize, row_b: usize, d
 
         // SortDesc.cs is already tc.stride() = 16 for STRING/BLOB (build_sort_descs),
         // so a single `cs`-wide read feeds both the German-string content compare
-        // and the fixed-width path; mb.blob backs both rows' string tails.
+        // and the fixed-width path; each source's blob arena backs its own row's
+        // string tail.
         let cs = desc.cs as usize;
-        let a = mb.get_col_ptr(row_a, pi, cs);
-        let b = mb.get_col_ptr(row_b, pi, cs);
-        let ord = cmp_col_window(a, mb.blob, b, mb.blob, desc.tc);
+        let a = src_a.get_col_ptr(row_a, pi, cs);
+        let b = src_b.get_col_ptr(row_b, pi, cs);
+        let ord = cmp_col_window(a, src_a.blob_slice(), b, src_b.blob_slice(), desc.tc as u8);
         if ord != Ordering::Equal {
             return ord;
         }
@@ -85,7 +91,6 @@ pub(super) fn build_sort_descs(
         pi: 0,
         cs: 0,
         tc: TypeCode::U64,
-        c_idx: 0,
         pk_off: 0,
     }; crate::schema::MAX_COLUMNS];
     for (i, &c_idx_u32) in group_by_cols.iter().enumerate() {
@@ -101,15 +106,20 @@ pub(super) fn build_sort_descs(
             pi,
             cs: tc.stride(),
             tc,
-            c_idx: c_idx as u8,
             pk_off,
         };
     }
     (arr, group_by_cols.len())
 }
 
-/// Argsort delta batch by group columns.
-pub(super) fn argsort_delta(batch: &Batch, schema: &SchemaDescriptor, group_by_cols: &[u32]) -> Vec<u32> {
+/// Argsort delta batch by group columns. `descs` is the pre-built descriptor
+/// slice for `group_by_cols` (the reduce plan's baked `sort_descs`).
+pub(super) fn argsort_delta(
+    batch: &Batch,
+    schema: &SchemaDescriptor,
+    group_by_cols: &[u32],
+    descs: &[SortDesc],
+) -> Vec<u32> {
     let mb = batch.as_mem_batch();
     let n = batch.count;
     if n <= 1 {
@@ -153,9 +163,7 @@ pub(super) fn argsort_delta(batch: &Batch, schema: &SchemaDescriptor, group_by_c
     }
 
     let mut indices: Vec<u32> = (0..n as u32).collect();
-    let (sort_descs, len) = build_sort_descs(schema, group_by_cols);
-    let descs = &sort_descs[..len];
-    indices.sort_unstable_by(|&a, &b| compare_by_group_cols(&mb, a as usize, b as usize, descs));
+    indices.sort_unstable_by(|&a, &b| compare_by_group_cols(&mb, a as usize, &mb, b as usize, descs));
     indices
 }
 

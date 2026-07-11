@@ -384,25 +384,6 @@ impl Batch {
         Self::empty_from(strides, REG_PAYLOAD_START as u8, None)
     }
 
-    /// Zero-allocation empty batch whose payload columns are `left_schema`'s
-    /// non-PK columns followed by `right_schema`'s non-PK columns.  Used for
-    /// join outputs ([left_PK, left_payload..., right_payload...]), which
-    /// have no single `SchemaDescriptor` in the engine.
-    ///
-    /// Layout defaults to `Raw` (like `write_to_batch`): join emission appends
-    /// cartesian/trace-major rows that are neither ordered nor folded, and the
-    /// `extend_*` appenders never raise the layout. A producer that emits in
-    /// (PK, payload) order (the Δ⋈Δ cogroup join) certifies it explicitly.
-    pub fn empty_joined(left_schema: &SchemaDescriptor, right_schema: &SchemaDescriptor) -> Self {
-        let mut strides = [0u8; MAX_BATCH_REGIONS];
-        strides[REG_PK] = left_schema.pk_stride();
-        strides[REG_WEIGHT] = FIXED_REGION_STRIDE;
-        strides[REG_NULL_BMP] = FIXED_REGION_STRIDE;
-        let mid = fill_payload_strides(left_schema, &mut strides, REG_PAYLOAD_START);
-        let out_idx = fill_payload_strides(right_schema, &mut strides, mid);
-        Self::empty_from(strides, out_idx as u8, None)
-    }
-
     /// Create an empty batch with schema, pre-allocated for `initial_capacity` rows.
     pub fn with_schema(schema: SchemaDescriptor, initial_capacity: usize) -> Self {
         let cap = initial_capacity.max(1);
@@ -695,7 +676,7 @@ impl Batch {
 
     /// Write data into region `r` at the current row position.
     /// Auto-grows capacity if needed.  Strides must be set at construction —
-    /// use `empty_with_schema`, `empty_joined`, or `with_schema`.
+    /// use `empty_with_schema` or `with_schema`.
     #[inline]
     fn extend_region(&mut self, r: usize, src: &[u8]) {
         debug_assert_eq!(
@@ -1473,7 +1454,7 @@ impl Batch {
         weight: i64,
         source: &S,
         row: usize,
-        mut blob_cache: Option<&mut BlobCache>,
+        blob_cache: Option<&mut BlobCache>,
     ) {
         let schema = self.schema.expect("append_row_from_source requires schema");
 
@@ -1481,29 +1462,51 @@ impl Batch {
         let null_word = source.get_null_word(row);
         self.extend_null_bmp(&null_word.to_le_bytes());
 
-        let src_blob = source.blob_slice();
+        self.append_payload_cols(0, &schema, source, row, null_word, blob_cache);
+
+        self.count += 1;
+        self.downgrade();
+    }
+
+    /// Append the payload columns described by `schema` from `src[row]` into
+    /// this batch's payload slots starting at `out_pi_base`, relocating German
+    /// strings into `self.blob`. `null_word` is the **source-side** null word
+    /// (bit `pi` per source payload slot); a null column zero-fills its slot.
+    /// Shared by the whole-row appender above (`out_pi_base == 0`, `schema` =
+    /// the batch's own) and the join row writer, which appends the left half at
+    /// base 0 and the right half at the left payload count. Does not bump
+    /// `count` or touch the layout. `#[inline]` — no per-row cross-file call
+    /// boundary.
+    #[inline]
+    pub(crate) fn append_payload_cols<S: ColumnarSource>(
+        &mut self,
+        out_pi_base: usize,
+        schema: &SchemaDescriptor,
+        src: &S,
+        row: usize,
+        null_word: u64,
+        mut blob_cache: Option<&mut BlobCache>,
+    ) {
+        let src_blob = src.blob_slice();
         for (pi, _ci, col) in schema.payload_columns() {
             let cs = col.size() as usize;
             let is_null = (null_word >> pi) & 1 != 0;
 
             if is_null {
-                self.fill_col_zero(pi, cs);
+                self.fill_col_zero(out_pi_base + pi, cs);
             } else if gnitz_wire::is_german_string(col.type_code) {
-                let src_struct = source.get_col_ptr(row, pi, cs);
+                let src_struct = src.get_col_ptr(row, pi, cs);
                 let dest = crate::schema::relocate_german_string_vec(
                     src_struct,
                     src_blob,
                     &mut self.blob,
                     blob_cache.as_deref_mut(),
                 );
-                self.extend_col(pi, &dest);
+                self.extend_col(out_pi_base + pi, &dest);
             } else {
-                self.extend_col(pi, source.get_col_ptr(row, pi, cs));
+                self.extend_col(out_pi_base + pi, src.get_col_ptr(row, pi, cs));
             }
         }
-
-        self.count += 1;
-        self.downgrade();
     }
 
     /// Consume this batch, consolidating it if needed. The returned batch is
@@ -2402,20 +2405,6 @@ mod tests {
         let out_len = u32::from_le_bytes(out[0..4].try_into().unwrap());
         assert_eq!(out_len, 0, "OOB long string must relocate to empty");
         assert!(dst_blob.is_empty(), "no bytes should be copied on overrun");
-    }
-
-    #[test]
-    #[should_panic(expected = "exceeds the batch region limit")]
-    fn empty_joined_wide_combined_payload_panics() {
-        // Each side: 1 U64 PK + 64 U64 payload columns (MAX_COLUMNS = 65). A join
-        // carries both sides' payloads (128) through the intermediate batch,
-        // overflowing the 65 payload-region slots — a named assert, not a bare OOB.
-        let mut cols = vec![SchemaColumn::new(type_code::U64, 0)];
-        for _ in 0..64 {
-            cols.push(SchemaColumn::new(type_code::U64, 0));
-        }
-        let schema = SchemaDescriptor::new(&cols, &[0]);
-        let _ = Batch::empty_joined(&schema, &schema);
     }
 
     // ── Consumer skip-point flag verifiers (debug_verify_sorted /

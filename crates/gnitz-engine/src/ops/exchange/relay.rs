@@ -1,6 +1,5 @@
-//! Exchange relay/scatter: `op_repartition_batch(es_mode)`,
-//! `op_relay_scatter_consolidated(_mode)`, `op_relay_scatter`,
-//! `op_relay_broadcast`.
+//! Exchange relay/scatter: `op_repartition_batches_mode`,
+//! `op_relay_scatter_consolidated(_mode)`, `op_relay_broadcast`.
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -9,15 +8,14 @@ use crate::schema::SchemaDescriptor;
 use crate::storage::{compare_pk_ordering, pack_pk_be, scatter_multi_source, write_to_batch, Batch, Layout, MemBatch};
 
 use super::router::{build_w_map, RouteMode, ScatterKey};
-// The `ReindexPacker`, `scatter_is_pk_routed`, and the rest below are reached
-// only from the `#[cfg(test)]` scatter helpers / co-partition tests; production
-// relay paths build their own worker-row scratch (`WORKER_ROWS`), route through
-// one hoisted `ScatterKey`, and settle PK ties with the canonical
+// Reached only from the `#[cfg(test)]` co-partition tests; production relay
+// paths build their own worker-row scratch (`WORKER_ROWS`), route through one
+// hoisted `ScatterKey`, and settle PK ties with the canonical
 // `compare_pk_ordering`.
 #[cfg(test)]
 use super::super::reindex::ReindexPacker;
 #[cfg(test)]
-use super::router::{compute_worker_indices, scatter_is_pk_routed, worker_for_partition};
+use super::router::worker_for_partition;
 #[cfg(test)]
 use crate::storage::{compare_pk_bytes, partition_for_key, partition_for_pk_bytes};
 
@@ -35,48 +33,32 @@ fn mem_batch_blob_cap(mem_batches: &[Option<MemBatch>]) -> usize {
         .max(1)
 }
 
-#[cfg(test)]
-pub(super) fn op_repartition_batch(
-    batch: &Batch,
-    col_indices: &[u32],
+/// Materialize per-worker `(source, row)` index lists into per-worker batches:
+/// blob capacity prorated by each worker's row share of `total_blob`, rows
+/// copied via `scatter_multi_source`. Outputs are left `Raw` — each caller owns
+/// its layout gate. The two production gates differ in both condition and
+/// operation (`is_pk_routing && single source → inherit_layout(src)` vs
+/// `single_source → certify_layout(Consolidated)`); merging them would falsely
+/// certify Consolidated and silently corrupt non-linear reduce weights.
+fn worker_rows_to_batches(
     schema: &SchemaDescriptor,
-    num_workers: usize,
+    mem_batches: &[Option<MemBatch>],
+    worker_rows: &[Vec<(u8, u32)>],
+    total_blob: usize,
 ) -> Vec<Batch> {
-    gnitz_debug!(
-        "op_repartition_batch: count={} num_workers={}",
-        batch.count,
-        num_workers
-    );
-    let worker_indices = compute_worker_indices(batch, col_indices, schema, num_workers);
-    let mb = batch.as_mem_batch();
-    // Single source by definition; mirror the production single-source rule.
-    // `compute_worker_indices` does not return the routing decision, so recompute
-    // `is_pk_routing` here through the shared gate (empty `target_tcs`: this helper
-    // takes none, and `key_is_promoted(&[]) == false`, so it can't drift from the
-    // production scatters). It gates layout propagation here, not routing — the
-    // helper routes via `compute_worker_indices`.
-    let is_pk_routing = scatter_is_pk_routed(col_indices, &[], schema);
-    let mut out: Vec<Batch> = worker_indices
-        .into_iter()
-        .map(|indices| {
-            if !indices.is_empty() {
-                Batch::from_indexed_rows(&mb, &indices, schema)
-            } else {
-                Batch::empty_with_schema(schema)
+    let total_rows: usize = worker_rows.iter().map(|v| v.len()).sum();
+    worker_rows
+        .iter()
+        .map(|rows| {
+            if rows.is_empty() {
+                return Batch::empty_with_schema(schema);
             }
+            let blob_cap = (total_blob * rows.len() / total_rows).max(1);
+            write_to_batch(schema, rows.len(), blob_cap, |writer| {
+                scatter_multi_source(mem_batches, rows, writer);
+            })
         })
-        .collect();
-    if is_pk_routing {
-        // Each per-worker PK-routed sub-batch is an in-order, distinct subset of
-        // the single source, so it carries the source's layout faithfully — the
-        // same `inherit_layout` propagation `op_repartition_batches_mode` uses.
-        for b in out.iter_mut() {
-            if b.count > 0 {
-                b.inherit_layout(batch);
-            }
-        }
-    }
-    out
+        .collect()
 }
 
 pub(crate) fn op_repartition_batches_mode(
@@ -135,18 +117,7 @@ pub(crate) fn op_repartition_batches_mode(
             }
         }
 
-        let total_rows: usize = worker_rows[..num_workers].iter().map(|v| v.len()).sum();
-        let mut out: Vec<Batch> = (0..num_workers)
-            .map(|w| {
-                if worker_rows[w].is_empty() {
-                    return Batch::empty_with_schema(schema);
-                }
-                let blob_cap = (total_blob * worker_rows[w].len() / total_rows).max(1);
-                write_to_batch(schema, worker_rows[w].len(), blob_cap, |writer| {
-                    scatter_multi_source(&mem_batches, &worker_rows[w], writer);
-                })
-            })
-            .collect();
+        let mut out = worker_rows_to_batches(schema, &mem_batches, &worker_rows[..num_workers], total_blob);
 
         // PK-routed, single-source repartition preserves source order and
         // distinctness per worker (a PK group never splits across workers, so a
@@ -380,26 +351,19 @@ pub(crate) fn op_relay_scatter_consolidated_mode(
             mode,
         );
 
-        let total_rows: usize = worker_rows[..num_workers].iter().map(|v| v.len()).sum();
-        (0..num_workers)
-            .map(|w| {
-                if worker_rows[w].is_empty() {
-                    return Batch::empty_with_schema(schema);
-                }
-                let blob_cap = (total_blob * worker_rows[w].len() / total_rows).max(1);
-                let mut b = write_to_batch(schema, worker_rows[w].len(), blob_cap, |writer| {
-                    scatter_multi_source(&mem_batches, &worker_rows[w], writer);
-                });
-                // One contributing source ⇒ each worker's PK-routed slice is an
-                // in-order, distinct subset of a consolidated source: certify it.
-                // Multiple sources merge by PK only (not (PK, payload)), so the
-                // output is not even `Sorted` — leave it `Raw`; the consumer re-folds.
-                if single_source {
+        let mut out = worker_rows_to_batches(schema, &mem_batches, &worker_rows[..num_workers], total_blob);
+        // One contributing source ⇒ each worker's PK-routed slice is an
+        // in-order, distinct subset of a consolidated source: certify it.
+        // Multiple sources merge by PK only (not (PK, payload)), so the
+        // output is not even `Sorted` — leave it `Raw`; the consumer re-folds.
+        if single_source {
+            for b in out.iter_mut() {
+                if b.count > 0 {
                     b.certify_layout(Layout::Consolidated, schema);
                 }
-                b
-            })
-            .collect()
+            }
+        }
+        out
     })
 }
 
@@ -435,17 +399,6 @@ pub(crate) fn op_relay_broadcast(
     out
 }
 
-/// Scatter non-consolidated batches across workers by hashing each row.
-#[cfg(test)]
-pub(super) fn op_relay_scatter(
-    sources: &[Option<&Batch>],
-    col_indices: &[u32],
-    schema: &SchemaDescriptor,
-    num_workers: usize,
-) -> Vec<Batch> {
-    op_repartition_batches_mode(sources, col_indices, &[], schema, num_workers, RouteMode::GroupKey)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -454,7 +407,7 @@ pub(super) fn op_relay_scatter(
 mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-    use crate::test_support::{make_wide_batch, opk_pk, wide_pk_3xu64_schema};
+    use crate::test_support::{make_batch, make_schema_u64_i64, make_wide_batch, opk_pk, wide_pk_3xu64_schema};
 
     #[test]
     #[should_panic(expected = "source index must fit in u8")]
@@ -464,16 +417,6 @@ mod tests {
         let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
         let sources: Vec<Option<&Batch>> = vec![None; 257];
         let _ = op_repartition_batches_mode(&sources, &[0], &[], &schema, 4, RouteMode::GroupKey);
-    }
-
-    fn make_schema_u64_i64() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        )
     }
 
     fn make_schema_u128_i64() -> SchemaDescriptor {
@@ -494,21 +437,6 @@ mod tests {
             ],
             &[0],
         )
-    }
-
-    fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
-        let n = rows.len();
-        let mut b = Batch::with_schema(*schema, n.max(1));
-
-        for &(pk, w, val) in rows {
-            b.extend_pk(pk as u128);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &val.to_le_bytes());
-            b.count += 1;
-        }
-        b.certify_layout(Layout::Consolidated, schema);
-        b
     }
 
     fn make_batch_str(schema: &SchemaDescriptor, rows: &[(u64, i64, &str)]) -> Batch {
@@ -824,7 +752,8 @@ mod tests {
             b.count += 1;
         }
 
-        let sub_batches = op_repartition_batch(&b, &[0u32], &schema, num_workers);
+        let sub_batches =
+            op_repartition_batches_mode(&[Some(&b)], &[0u32], &[], &schema, num_workers, RouteMode::GroupKey);
         assert_eq!(total_rows(&sub_batches), pk_vals.len());
 
         for &pk in pk_vals {
@@ -856,7 +785,8 @@ mod tests {
             b.count += 1;
         }
 
-        let sub_batches = op_repartition_batch(&b, &[0u32], &schema, num_workers);
+        let sub_batches =
+            op_repartition_batches_mode(&[Some(&b)], &[0u32], &[], &schema, num_workers, RouteMode::GroupKey);
         assert_eq!(total_rows(&sub_batches), n);
 
         for &pk in pks {
@@ -882,7 +812,8 @@ mod tests {
             b.count += 1;
         }
 
-        let sub_batches = op_repartition_batch(&b, &[1u32], &schema, num_workers);
+        let sub_batches =
+            op_repartition_batches_mode(&[Some(&b)], &[1u32], &[], &schema, num_workers, RouteMode::GroupKey);
         assert_eq!(total_rows(&sub_batches), 4);
         let non_empty = sub_batches.iter().filter(|sb| sb.count > 0).count();
         assert_eq!(non_empty, 1, "all rows with same group key must go to one worker");
@@ -895,7 +826,8 @@ mod tests {
 
         // Short string "hello" (≤ 12 bytes): two rows must go to same worker
         let b = make_batch_str(&schema, &[(1, 1, "hello"), (2, 1, "hello"), (3, 1, "world")]);
-        let sub_batches = op_repartition_batch(&b, &[1u32], &schema, num_workers);
+        let sub_batches =
+            op_repartition_batches_mode(&[Some(&b)], &[1u32], &[], &schema, num_workers, RouteMode::GroupKey);
         assert_eq!(total_rows(&sub_batches), 3);
 
         let mut worker_of_1 = None;
@@ -913,7 +845,7 @@ mod tests {
         // Long string (> 12 bytes): two rows must go to same worker
         let long_str = "this is a longer string for heap";
         let b2 = make_batch_str(&schema, &[(10, 1, long_str), (11, 1, long_str)]);
-        let sub2 = op_repartition_batch(&b2, &[1u32], &schema, num_workers);
+        let sub2 = op_repartition_batches_mode(&[Some(&b2)], &[1u32], &[], &schema, num_workers, RouteMode::GroupKey);
         assert_eq!(total_rows(&sub2), 2);
 
         let mut worker_of_10 = None;
@@ -936,14 +868,14 @@ mod tests {
         assert!(b.is_sorted() && b.is_consolidated());
 
         // PK routing (col 0 == pk_indices()): single source ⇒ flags propagate.
-        let pk_routed = op_repartition_batch(&b, &[0u32], &schema, 4);
+        let pk_routed = op_repartition_batches_mode(&[Some(&b)], &[0u32], &[], &schema, 4, RouteMode::GroupKey);
         for sb in pk_routed.iter().filter(|s| s.count > 0) {
             assert!(sb.is_sorted(), "PK-routed sub-batch must inherit sorted");
             assert!(sb.is_consolidated(), "PK-routed sub-batch must inherit consolidated");
         }
 
         // Non-PK routing (col 1): hash distribution destroys PK order ⇒ no flags.
-        let hash_routed = op_repartition_batch(&b, &[1u32], &schema, 4);
+        let hash_routed = op_repartition_batches_mode(&[Some(&b)], &[1u32], &[], &schema, 4, RouteMode::GroupKey);
         for sb in hash_routed.iter().filter(|s| s.count > 0) {
             assert!(!sb.is_sorted(), "non-PK-routed sub-batch must not claim sorted");
             assert!(
@@ -990,7 +922,7 @@ mod tests {
         b.set_layout_unchecked(Layout::Sorted);
         assert!(b.is_sorted() && !b.is_consolidated());
 
-        let out = op_repartition_batch(&b, &[0u32], &schema, 4);
+        let out = op_repartition_batches_mode(&[Some(&b)], &[0u32], &[], &schema, 4, RouteMode::GroupKey);
         for sb in out.iter().filter(|s| s.count > 0) {
             assert!(sb.is_sorted(), "PK-routed sub-batch inherits sorted");
             assert!(!sb.is_consolidated(), "must not invent consolidated");
@@ -1047,7 +979,7 @@ mod tests {
         let b1 = make_batch(&schema, &[(2, 1, 20)]);
 
         let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
-        let result = op_relay_scatter(&sources, &[0u32], &schema, num_workers);
+        let result = op_repartition_batches_mode(&sources, &[0u32], &[], &schema, num_workers, RouteMode::GroupKey);
 
         assert_eq!(total_rows(&result), 2);
         for sb in &result {
@@ -1068,14 +1000,14 @@ mod tests {
         assert!(b.is_sorted() && b.is_consolidated());
 
         // PK spec: sub-batches must inherit sorted + consolidated
-        for sb in &op_repartition_batch(&b, &[0u32], &schema, num_workers) {
+        for sb in &op_repartition_batches_mode(&[Some(&b)], &[0u32], &[], &schema, num_workers, RouteMode::GroupKey) {
             if sb.count > 0 {
                 assert!(sb.is_sorted(), "PK spec sub-batch must inherit sorted");
                 assert!(sb.is_consolidated(), "PK spec sub-batch must inherit consolidated");
             }
         }
         // Non-PK spec: must NOT inherit
-        for sb in &op_repartition_batch(&b, &[1u32], &schema, num_workers) {
+        for sb in &op_repartition_batches_mode(&[Some(&b)], &[1u32], &[], &schema, num_workers, RouteMode::GroupKey) {
             if sb.count > 0 {
                 assert!(!sb.is_sorted(), "non-PK spec sub-batch must not inherit sorted");
                 assert!(
@@ -1092,7 +1024,7 @@ mod tests {
         let rows: Vec<(u64, i64, i64)> = (1u64..=100).map(|i| (i, 1, i as i64 * 10)).collect();
         let b = make_batch(&schema, &rows);
 
-        let sub_batches = op_repartition_batch(&b, &[0u32], &schema, 4);
+        let sub_batches = op_repartition_batches_mode(&[Some(&b)], &[0u32], &[], &schema, 4, RouteMode::GroupKey);
         assert_eq!(total_rows(&sub_batches), 100, "total rows must equal input count");
     }
 
@@ -1112,7 +1044,8 @@ mod tests {
             b.count += 1;
         }
 
-        let sub_batches = op_repartition_batch(&b, &[1u32], &schema, num_workers);
+        let sub_batches =
+            op_repartition_batches_mode(&[Some(&b)], &[1u32], &[], &schema, num_workers, RouteMode::GroupKey);
         assert_eq!(total_rows(&sub_batches), vals.len());
 
         for &v in &vals {

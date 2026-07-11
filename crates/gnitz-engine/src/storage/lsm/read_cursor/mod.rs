@@ -385,6 +385,18 @@ impl ReadCursor {
         self.sources[self.current_entry_idx].get_pk_bytes(self.current_row)
     }
 
+    /// The current row as a `(source, row)` pair for the shared `ColumnarSource`
+    /// kernels (`compare_rows`, group-key extraction, row copies). Resolves the
+    /// (entry, row) pair once per row; the returned source is the current row's
+    /// **own** entry, so its blob arena backs the row's German strings. The
+    /// opaque `impl ColumnarSource` keeps `CursorSource` private to lsm; every
+    /// use is monomorphic. Callers must gate on `valid` first.
+    #[inline]
+    pub(crate) fn current_row_source(&self) -> (&impl ColumnarSource, usize) {
+        debug_assert!(self.valid, "current_row_source on an invalid cursor");
+        (&self.sources[self.current_entry_idx], self.current_row)
+    }
+
     /// The current row's PK as its native scalar value (right-aligned BE via
     /// `widen_pk_be`). Only narrow (`pk_stride ≤ 16`) relations have a scalar PK;
     /// the catalog sys-table readers (all narrow) call this. Decoded on demand

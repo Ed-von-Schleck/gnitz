@@ -6,18 +6,20 @@ use crate::schema::{
     encode_german_string, type_code, SchemaColumn, SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL,
 };
 use crate::storage::{Batch, Layout};
-use crate::test_support::make_schema_i64pk_i64;
+use crate::test_support::{make_schema_i64pk_i64, make_schema_u64_i64, opk_pk_i64};
 
 use super::super::util::{extract_group_key, ieee_order_bits_f32, ieee_order_bits_f32_reverse};
 use super::agg::{apply_agg_from_value_index, Accumulator, AggDescriptor, AggOp};
 use super::emit::{emit_global_ground, emit_reduce_row};
 use super::op_reduce::cursor_matches_group;
+use super::plan::ReducePlan;
 use super::sort::{argsort_delta, build_sort_descs, compare_by_group_cols};
 use crate::storage::ReadCursor;
 
-/// Shim over [`super::op_reduce::op_reduce`] deriving `out_key` from the input
-/// schema — exactly the one kind compile-time validation admits for a given
-/// (schema, group cols), so the many call sites below need not repeat it.
+/// Shim over [`super::op_reduce::op_reduce`] baking a [`ReducePlan`] per call —
+/// deriving `out_key` from the input schema (exactly the one kind compile-time
+/// validation admits for a given (schema, group cols)) and `has_avi` from the
+/// passed cursor, so the many call sites below need not repeat it.
 #[allow(clippy::too_many_arguments)]
 fn op_reduce(
     delta: &Batch,
@@ -33,42 +35,53 @@ fn op_reduce(
     global_ground: bool,
     i_am_owner: bool,
 ) -> (Batch, Option<Batch>) {
+    let plan = make_plan(
+        input_schema,
+        output_schema,
+        group_by_cols,
+        agg_descs,
+        avi_cursor.is_some(),
+        global_ground,
+        i_am_owner,
+    );
     super::op_reduce::op_reduce(
         delta,
         trace_in_cursor,
         trace_out_cursor,
+        avi_cursor,
+        &plan,
+        finalize_func,
+        finalize_out_schema,
+    )
+}
+
+/// Bake a [`ReducePlan`] the way the compiler's `emit_reduce` does, with
+/// `out_key` derived from the input schema.
+#[allow(clippy::too_many_arguments)]
+fn make_plan(
+    input_schema: &SchemaDescriptor,
+    output_schema: &SchemaDescriptor,
+    group_by_cols: &[u32],
+    agg_descs: &[AggDescriptor],
+    has_avi: bool,
+    global_ground: bool,
+    i_am_owner: bool,
+) -> ReducePlan {
+    ReducePlan::new(
         input_schema,
         output_schema,
         group_by_cols,
         agg_descs,
         input_schema.reduce_out_key(group_by_cols),
-        avi_cursor,
-        finalize_func,
-        finalize_out_schema,
+        has_avi,
         global_ground,
         i_am_owner,
     )
 }
 
-/// Decode a single signed I64 PK column from its OPK (big-endian, sign-flipped)
-/// bytes back to the native value — the inverse of `extend_pk_opk` for an I64 PK.
-#[allow(dead_code)]
-fn opk_pk_i64(opk_bytes: &[u8]) -> i64 {
-    let mut le = [0u8; 8];
-    gnitz_wire::decode_pk_column(&opk_bytes[..8], type_code::I64, &mut le);
-    i64::from_le_bytes(le)
-}
-
-fn make_schema_u64_i64() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    )
-}
-
+/// Local variant of `test_support::make_batch`: stamps the layout with
+/// `set_layout_unchecked` (no debug verify) so reduce tests can hand the
+/// operator deliberately unordered-but-claimed-consolidated inputs.
 fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
     let n = rows.len();
     let mut b = Batch::with_schema(*schema, n.max(1));
@@ -362,19 +375,16 @@ fn linear_sum_only_new_all_null_group_present() {
             col_idx: 2,
             agg_op: AggOp::Sum,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 2,
             agg_op: AggOp::CountNonNull,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 0,
             agg_op: AggOp::Count,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
     ];
 
@@ -451,7 +461,6 @@ fn count_star_only_emptied_group_eliminated() {
         col_idx: 0,
         agg_op: AggOp::Count,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     }];
 
     let reduce = |delta: &Batch, to: &mut crate::storage::ReadCursor| {
@@ -574,19 +583,16 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
             col_idx: 0,
             agg_op: AggOp::Count,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 2,
             agg_op: AggOp::Sum,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 2,
             agg_op: AggOp::CountNonNull,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
     ];
 
@@ -734,13 +740,11 @@ fn null_min_retraction_re_emits_null() {
             col_idx: 2,
             agg_op: AggOp::Count,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 2,
             agg_op: AggOp::Min,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
     ];
     let min_null_bit = 1u64 << 2;
@@ -852,13 +856,11 @@ fn null_sum_fold_stays_null() {
             col_idx: 2,
             agg_op: AggOp::Count,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 2,
             agg_op: AggOp::Sum,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
     ];
     let sum_null_bit = 1u64 << 2;
@@ -1261,7 +1263,6 @@ fn test_reduce_count() {
         col_idx: 0,
         agg_op: AggOp::Count,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
 
     // GROUP BY pk → each row is its own group
@@ -1291,7 +1292,10 @@ fn test_reduce_count() {
 fn test_argsort_delta_f32_group() {
     let schema = make_schema_u64_f32();
     let batch = make_batch_f32(&schema, &[(1, 1, 2.0f32), (2, 1, -1.0f32), (3, 1, 0.5f32)]);
-    let indices = argsort_delta(&batch, &schema, &[1]);
+    let indices = {
+        let (ds, dl) = build_sort_descs(&schema, &[1]);
+        argsort_delta(&batch, &schema, &[1], &ds[..dl])
+    };
     // Sorted order by F32: -1.0 < 0.5 < 2.0
     assert_eq!(indices.len(), 3);
     let mb = batch.as_mem_batch();
@@ -1312,9 +1316,9 @@ fn test_compare_by_group_cols_f32_negative() {
     let mb = batch.as_mem_batch();
     let (descs_arr, descs_len) = build_sort_descs(&schema, &[1]);
     let descs = &descs_arr[..descs_len];
-    let ord = compare_by_group_cols(&mb, 0, 1, descs);
+    let ord = compare_by_group_cols(&mb, 0, &mb, 1, descs);
     assert_eq!(ord, std::cmp::Ordering::Less);
-    let ord2 = compare_by_group_cols(&mb, 1, 0, descs);
+    let ord2 = compare_by_group_cols(&mb, 1, &mb, 0, descs);
     assert_eq!(ord2, std::cmp::Ordering::Greater);
 }
 
@@ -1479,7 +1483,6 @@ fn test_reduce_min_f32() {
         col_idx: 1,
         agg_op: AggOp::Min,
         col_type_code: TypeCode::F32,
-        _pad: [0; 2],
     };
 
     // GROUP BY pk → all 3 rows in same group
@@ -1530,7 +1533,6 @@ fn test_reduce_max_i16() {
         col_idx: 1,
         agg_op: AggOp::Max,
         col_type_code: TypeCode::I16,
-        _pad: [0; 2],
     };
 
     let (out, _) = op_reduce(
@@ -1620,21 +1622,21 @@ fn test_compare_by_group_cols_uuid_non_pk() {
     let descs = &descs_arr[..descs_len];
 
     // uuid_lo < uuid_hi (compare by the 128-bit value)
-    let ord = compare_by_group_cols(&mb, 0, 1, descs);
+    let ord = compare_by_group_cols(&mb, 0, &mb, 1, descs);
     assert_eq!(
         ord,
         std::cmp::Ordering::Less,
         "uuid_lo row must compare less than uuid_hi row"
     );
 
-    let ord2 = compare_by_group_cols(&mb, 1, 0, descs);
+    let ord2 = compare_by_group_cols(&mb, 1, &mb, 0, descs);
     assert_eq!(
         ord2,
         std::cmp::Ordering::Greater,
         "uuid_hi row must compare greater than uuid_lo row"
     );
 
-    let ord3 = compare_by_group_cols(&mb, 0, 0, descs);
+    let ord3 = compare_by_group_cols(&mb, 0, &mb, 0, descs);
     assert_eq!(ord3, std::cmp::Ordering::Equal, "same row must compare equal to itself");
 }
 
@@ -1647,7 +1649,10 @@ fn test_argsort_delta_uuid_group() {
     let uuid_b: u128 = 0x0000_0000_0000_0000_0000_0000_0000_0002u128;
     // uuid_b < uuid_a (lower high byte)
     let batch = build_batch_u64_uuid(&schema, &[(1, uuid_a), (2, uuid_b)]);
-    let indices = argsort_delta(&batch, &schema, &[1]);
+    let indices = {
+        let (ds, dl) = build_sort_descs(&schema, &[1]);
+        argsort_delta(&batch, &schema, &[1], &ds[..dl])
+    };
     assert_eq!(indices.len(), 2);
     // Row with uuid_b (row 1) should sort before row with uuid_a (row 0)
     assert_eq!(indices[0], 1, "uuid_b (smaller) must sort first");
@@ -1769,9 +1774,12 @@ fn test_compare_by_group_cols_includes_pk() {
     // First desc covers PK — must use the sentinel.
     assert_eq!(descs[0].pi, PAYLOAD_MAPPING_PK_SENTINEL);
 
-    assert_eq!(compare_by_group_cols(&mb, 0, 1, descs), std::cmp::Ordering::Less);
-    assert_eq!(compare_by_group_cols(&mb, 1, 0, descs), std::cmp::Ordering::Greater);
-    assert_eq!(compare_by_group_cols(&mb, 0, 0, descs), std::cmp::Ordering::Equal);
+    assert_eq!(compare_by_group_cols(&mb, 0, &mb, 1, descs), std::cmp::Ordering::Less);
+    assert_eq!(
+        compare_by_group_cols(&mb, 1, &mb, 0, descs),
+        std::cmp::Ordering::Greater
+    );
+    assert_eq!(compare_by_group_cols(&mb, 0, &mb, 0, descs), std::cmp::Ordering::Equal);
 }
 
 #[test]
@@ -1780,7 +1788,10 @@ fn test_argsort_delta_pk_in_group() {
     // and use the sentinel branch — must not panic.
     let schema = make_schema_pk0_u64_i64();
     let batch = build_pk_other(&schema, &[(20, 100), (10, 200), (10, 100)]);
-    let indices = argsort_delta(&batch, &schema, &[0, 1]);
+    let indices = {
+        let (ds, dl) = build_sort_descs(&schema, &[0, 1]);
+        argsort_delta(&batch, &schema, &[0, 1], &ds[..dl])
+    };
     assert_eq!(indices.len(), 3);
     // Sorted by (pk, other): (10,100), (10,200), (20,100)
     let mb = batch.as_mem_batch();
@@ -1851,10 +1862,13 @@ fn test_compare_by_group_cols_nulls_first() {
     let descs = &descs_arr[..descs_len];
 
     // NULL < 7 (NULLS FIRST)
-    assert_eq!(compare_by_group_cols(&mb, 1, 0, descs), std::cmp::Ordering::Less);
-    assert_eq!(compare_by_group_cols(&mb, 0, 1, descs), std::cmp::Ordering::Greater);
+    assert_eq!(compare_by_group_cols(&mb, 1, &mb, 0, descs), std::cmp::Ordering::Less);
+    assert_eq!(
+        compare_by_group_cols(&mb, 0, &mb, 1, descs),
+        std::cmp::Ordering::Greater
+    );
     // NULL == NULL → equal (same group)
-    assert_eq!(compare_by_group_cols(&mb, 1, 2, descs), std::cmp::Ordering::Equal);
+    assert_eq!(compare_by_group_cols(&mb, 1, &mb, 2, descs), std::cmp::Ordering::Equal);
 }
 
 #[test]
@@ -1864,7 +1878,10 @@ fn test_argsort_delta_nullable_no_packed_sort() {
     // route through compare_by_group_cols where NULL < non-NULL.
     let schema = make_schema_pk_nullable_i64();
     let batch = build_pk_null_i64(&schema, &[(1, Some(0)), (2, None), (3, Some(5)), (4, None)]);
-    let indices = argsort_delta(&batch, &schema, &[1]);
+    let indices = {
+        let (ds, dl) = build_sort_descs(&schema, &[1]);
+        argsort_delta(&batch, &schema, &[1], &ds[..dl])
+    };
     let mb = batch.as_mem_batch();
     // NULLs must be adjacent (single group), not interleaved with 0s.
     let null_word_at = |i: u32| mb.get_null_word(i as usize) & 1 != 0;
@@ -1942,22 +1959,19 @@ fn test_emit_reduce_row_compound_pk_bytes() {
         col_idx: 2,
         agg_op: AggOp::Count,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
     let accs: Vec<Accumulator> = vec![Accumulator::new(&agg, &in_schema)];
     // Natural-PK grouping passes the source row's PK bytes; they're copied verbatim.
-    emit_reduce_row(
-        &mut output,
-        &mb,
-        0,
-        mb.get_pk_bytes(0),
-        &accs,
+    let plan = make_plan(
         &in_schema,
         &out_schema,
         &[0u32, 1u32],
-        true, /* use_natural_pk */
-        1,
+        std::slice::from_ref(&agg),
+        false,
+        false,
+        false,
     );
+    emit_reduce_row(&mut output, &mb, 0, mb.get_pk_bytes(0), &accs, &plan);
 
     assert_eq!(output.count, 1);
     // Source PK region is OPK (big-endian); the verbatim copy preserves it.
@@ -2005,7 +2019,6 @@ fn test_reduce_min_pk_col_compound_pk() {
         col_idx: 1,
         agg_op: AggOp::Min,
         col_type_code: TypeCode::U64,
-        _pad: [0; 2],
     };
 
     let (out, _) = op_reduce(
@@ -2061,7 +2074,6 @@ fn test_reduce_min_pk_col_single_pk_u64() {
         col_idx: 0,
         agg_op: AggOp::Min,
         col_type_code: TypeCode::U64,
-        _pad: [0; 2],
     };
     let (out, _) = op_reduce(
         &delta,
@@ -2112,7 +2124,6 @@ fn test_reduce_group_by_pk_permuted_preserves_pk_order() {
         col_idx: 2,
         agg_op: AggOp::Count,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
 
     // group_by_cols permuted to [1, 0] — a valid set permutation of pk_indices.
@@ -2175,13 +2186,16 @@ fn test_compare_by_group_cols_pk_sentinel_compound_subset() {
 
     // Same pk_col_0 (10), different pk_col_1 → Equal under GROUP BY pk_col_0.
     assert_eq!(
-        compare_by_group_cols(&mb, 0, 1, descs),
+        compare_by_group_cols(&mb, 0, &mb, 1, descs),
         std::cmp::Ordering::Equal,
         "rows with same pk_col_0 must form one group regardless of pk_col_1",
     );
     // Different pk_col_0 → ordering follows pk_col_0.
-    assert_eq!(compare_by_group_cols(&mb, 0, 2, descs), std::cmp::Ordering::Less);
-    assert_eq!(compare_by_group_cols(&mb, 2, 0, descs), std::cmp::Ordering::Greater);
+    assert_eq!(compare_by_group_cols(&mb, 0, &mb, 2, descs), std::cmp::Ordering::Less);
+    assert_eq!(
+        compare_by_group_cols(&mb, 2, &mb, 0, descs),
+        std::cmp::Ordering::Greater
+    );
 }
 
 /// compare_by_group_cols on PK-sentinel with `GROUP BY pk_col_1`
@@ -2198,9 +2212,9 @@ fn test_compare_by_group_cols_pk_sentinel_compound_pk_col_1() {
     assert_eq!(descs[0].pk_off, 8, "pk_col_1 byte offset within PK region");
 
     // Same pk_col_1 (50), different pk_col_0 → Equal.
-    assert_eq!(compare_by_group_cols(&mb, 0, 1, descs), std::cmp::Ordering::Equal);
+    assert_eq!(compare_by_group_cols(&mb, 0, &mb, 1, descs), std::cmp::Ordering::Equal);
     // Different pk_col_1 → ordering follows pk_col_1.
-    assert_eq!(compare_by_group_cols(&mb, 0, 2, descs), std::cmp::Ordering::Less);
+    assert_eq!(compare_by_group_cols(&mb, 0, &mb, 2, descs), std::cmp::Ordering::Less);
 }
 
 /// Single-PK U64 with `GROUP BY pk` must be bit-identical to the prior
@@ -2217,9 +2231,12 @@ fn test_compare_by_group_cols_pk_sentinel_single_pk_bit_identical() {
     assert_eq!(descs[0].pk_off, 0);
     assert_eq!(descs[0].cs, 8);
 
-    assert_eq!(compare_by_group_cols(&mb, 0, 1, descs), std::cmp::Ordering::Less);
-    assert_eq!(compare_by_group_cols(&mb, 1, 0, descs), std::cmp::Ordering::Greater);
-    assert_eq!(compare_by_group_cols(&mb, 0, 2, descs), std::cmp::Ordering::Equal);
+    assert_eq!(compare_by_group_cols(&mb, 0, &mb, 1, descs), std::cmp::Ordering::Less);
+    assert_eq!(
+        compare_by_group_cols(&mb, 1, &mb, 0, descs),
+        std::cmp::Ordering::Greater
+    );
+    assert_eq!(compare_by_group_cols(&mb, 0, &mb, 2, descs), std::cmp::Ordering::Equal);
 }
 
 /// cursor_matches_group on a PK-sentinel SortDesc with compound PK must
@@ -2320,7 +2337,6 @@ fn test_op_reduce_compound_pk_group_by_subset_count() {
         col_idx: 2,
         agg_op: AggOp::Count,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
 
     let (out, _) = op_reduce(
@@ -2465,7 +2481,6 @@ fn test_reduce_min_u64_high_bit_set() {
         col_idx: 2,
         agg_op: AggOp::Min,
         col_type_code: TypeCode::U64,
-        _pad: [0; 2],
     };
 
     let (out, _) = op_reduce(
@@ -2509,7 +2524,6 @@ fn test_reduce_max_u64_high_bit_set() {
         col_idx: 2,
         agg_op: AggOp::Max,
         col_type_code: TypeCode::U64,
-        _pad: [0; 2],
     };
 
     let (out, _) = op_reduce(
@@ -2549,7 +2563,6 @@ fn test_reduce_min_u64_incremental() {
         col_idx: 2,
         agg_op: AggOp::Min,
         col_type_code: TypeCode::U64,
-        _pad: [0; 2],
     };
 
     let empty_ti = Rc::new(Batch::empty_with_schema(&in_schema));
@@ -2633,7 +2646,6 @@ fn test_reduce_max_u64_incremental() {
         col_idx: 2,
         agg_op: AggOp::Max,
         col_type_code: TypeCode::U64,
-        _pad: [0; 2],
     };
 
     let empty_ti = Rc::new(Batch::empty_with_schema(&in_schema));
@@ -2704,7 +2716,6 @@ fn test_avi_seed_u64_high_bit() {
         col_idx: 1,
         agg_op: AggOp::Min,
         col_type_code: TypeCode::U64,
-        _pad: [0; 2],
     };
     let mut acc = Accumulator::new(&desc, &in_schema);
 
@@ -2751,7 +2762,6 @@ fn test_reduce_min_u64_replay_via_trace_in() {
         col_idx: 2,
         agg_op: AggOp::Min,
         col_type_code: TypeCode::U64,
-        _pad: [0; 2],
     };
 
     // Tick 1: single insertion. trace_in empty. MIN = u64::MAX.
@@ -2842,7 +2852,6 @@ fn test_reduce_min_max_i64_boundary() {
             col_idx: 2,
             agg_op: AggOp::Min,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         };
 
         let (out, _) = op_reduce(
@@ -2878,7 +2887,6 @@ fn test_reduce_min_max_i64_boundary() {
             col_idx: 2,
             agg_op: AggOp::Max,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         };
 
         let (out, _) = op_reduce(
@@ -2969,13 +2977,11 @@ fn sum_count_aggs(sum_col: u32, sum_tc: TypeCode) -> [AggDescriptor; 2] {
             col_idx: sum_col,
             agg_op: AggOp::Sum,
             col_type_code: sum_tc,
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 0,
             agg_op: AggOp::Count,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
     ]
 }
@@ -3049,7 +3055,6 @@ fn test_reduce_group_by_pk_unsorted_input_count() {
         col_idx: 1,
         agg_op: AggOp::Count,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
 
     let (out, _) = op_reduce(
@@ -3143,7 +3148,6 @@ fn test_reduce_group_by_pk_unsorted_compound_pk_permuted() {
         col_idx: 2,
         agg_op: AggOp::Count,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
 
     // Permuted GROUP BY: [1, 0]. PkPermutation still holds.
@@ -3348,7 +3352,6 @@ fn test_reduce_min_group_by_pk_retracts_extreme() {
         col_idx: 1,
         agg_op: AggOp::Min,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
 
     let (out, _) = op_reduce(
@@ -3460,7 +3463,6 @@ fn avi_two_groups_distinct_byte_form_keys() {
         col_idx: 3,
         agg_op: AggOp::Min,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
 
     let (out, _) = op_reduce(
@@ -3584,7 +3586,6 @@ fn avi_retraction_returns_next_extremum() {
         col_idx: 2,
         agg_op: AggOp::Min,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
 
     let (out, _) = op_reduce(
@@ -3691,7 +3692,6 @@ fn avi_non_power_of_two_stride_drives_cursor() {
             col_idx: 2,
             agg_op: AggOp::Min,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         };
 
         let (out, _) = op_reduce(
@@ -3792,7 +3792,6 @@ fn trace_scan_retraction_recomputes_min() {
         col_idx: 2,
         agg_op: AggOp::Min,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
 
     let (out, _) = op_reduce(
@@ -3903,7 +3902,6 @@ fn min_tie_retract_one_copy_keeps_min() {
         col_idx: 2,
         agg_op: AggOp::Min,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
 
     let (out, _) = op_reduce(
@@ -3989,7 +3987,6 @@ fn min_ignores_null_values() {
         col_idx: 2,
         agg_op: AggOp::Min,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
 
     let (out, _) = op_reduce(
@@ -4102,7 +4099,6 @@ fn avi_multi_col_retraction_returns_next_extremum() {
         col_idx: 3,
         agg_op: AggOp::Min,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
 
     let (out, _) = op_reduce(
@@ -4260,7 +4256,6 @@ fn avi_wide_two_u64_groups_match_reference() {
         col_idx: 3,
         agg_op: AggOp::Min,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
 
     let (out, _) = op_reduce(
@@ -4366,7 +4361,6 @@ fn avi_wide_single_u128_group_distinct() {
         col_idx: 2,
         agg_op: AggOp::Min,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
 
     let (out, _) = op_reduce(
@@ -4485,7 +4479,6 @@ fn avi_wide_mixed_signed_unsigned_key() {
         col_idx: 3,
         agg_op: AggOp::Min,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
 
     let (out, _) = op_reduce(
@@ -4598,7 +4591,6 @@ fn avi_wide_prefix_collision_distinct_groups() {
         col_idx: 4,
         agg_op: AggOp::Min,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
 
     let (out, _) = op_reduce(
@@ -4719,7 +4711,6 @@ fn avi_wide_retraction_returns_next_extremum() {
         col_idx: 3,
         agg_op: AggOp::Min,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
 
     let (out, _) = op_reduce(
@@ -4790,7 +4781,6 @@ fn count_accumulator_over_uuid_pk_does_not_panic() {
         col_idx: 0,
         agg_op: AggOp::Count,
         col_type_code: TypeCode::UUID,
-        _pad: [0; 2],
     };
     let mut acc = Accumulator::new(&desc, &schema);
     let mb = b.as_mem_batch();
@@ -4835,7 +4825,6 @@ fn avi_read_extreme(
         col_idx,
         agg_op: if for_max { AggOp::Max } else { AggOp::Min },
         col_type_code: tc_enum,
-        _pad: [0; 2],
     };
     let aggs = [agg];
     let avi = AviDesc {
@@ -5066,7 +5055,6 @@ fn reduce_wide_compound_pk_group_by_pk_counts_per_pk() {
         col_idx: 0,
         agg_op: AggOp::Count,
         col_type_code: TypeCode::U128,
-        _pad: [0; 2],
     };
 
     let (out, _) = op_reduce(
@@ -5345,7 +5333,6 @@ fn run_fallback_min_i64_grp(
         col_idx: 2,
         agg_op: AggOp::Min,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
 
     // --- Tick 1: empty trace_in, empty trace_out ---
@@ -5509,7 +5496,6 @@ fn fallback_min_multi_col_group() {
         col_idx: 3,
         agg_op: AggOp::Min,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
 
     let pi_c1 = in_schema.try_payload_idx(1).unwrap();
@@ -5624,7 +5610,6 @@ fn fallback_trace_rewind_at_most_once() {
         col_idx: 2,
         agg_op: AggOp::Min,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
 
     let pi_grp = in_schema.try_payload_idx(1).unwrap();
@@ -5839,13 +5824,16 @@ fn test_compare_by_group_cols_blob_no_panic() {
     let descs = &descs_arr[..descs_len];
 
     assert_eq!(
-        compare_by_group_cols(&mb, 0, 1, descs),
+        compare_by_group_cols(&mb, 0, &mb, 1, descs),
         std::cmp::Ordering::Less,
         "blob_a < blob_b by content tail"
     );
-    assert_eq!(compare_by_group_cols(&mb, 1, 0, descs), std::cmp::Ordering::Greater);
     assert_eq!(
-        compare_by_group_cols(&mb, 0, 0, descs),
+        compare_by_group_cols(&mb, 1, &mb, 0, descs),
+        std::cmp::Ordering::Greater
+    );
+    assert_eq!(
+        compare_by_group_cols(&mb, 0, &mb, 0, descs),
         std::cmp::Ordering::Equal,
         "same blob compares equal"
     );
@@ -5881,7 +5869,6 @@ fn test_reduce_max_blob_group_retraction() {
         col_idx: 2,
         agg_op: AggOp::Max,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
 
     let blob_a: &[u8] = b"PREFIX_AAAAAAAAAA"; // 17 bytes (long)
@@ -5981,19 +5968,16 @@ const G_COUNT: AggDescriptor = AggDescriptor {
     col_idx: 0,
     agg_op: AggOp::Count,
     col_type_code: TypeCode::U64,
-    _pad: [0; 2],
 };
 const G_SUM: AggDescriptor = AggDescriptor {
     col_idx: 1,
     agg_op: AggOp::Sum,
     col_type_code: TypeCode::I64,
-    _pad: [0; 2],
 };
 const G_MIN: AggDescriptor = AggDescriptor {
     col_idx: 1,
     agg_op: AggOp::Min,
     col_type_code: TypeCode::I64,
-    _pad: [0; 2],
 };
 
 /// Output `[_group_pk:U128, count:I64, min:I64(nullable)]` — the mixed
@@ -6462,7 +6446,6 @@ fn sumzero_folds_like_sum_and_empty_renders_zero() {
         col_idx: 1,
         agg_op: AggOp::SumZero,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
     let mut acc = Accumulator::new(&desc, &schema);
 
@@ -6496,7 +6479,6 @@ fn count_non_null_all_null_group_renders_zero_null_clear() {
         col_idx: 1,
         agg_op: AggOp::CountNonNull,
         col_type_code: TypeCode::I64,
-        _pad: [0; 2],
     };
     let mut acc = Accumulator::new(&desc, &in_schema);
 
@@ -6527,18 +6509,16 @@ fn count_non_null_all_null_group_renders_zero_null_clear() {
     );
     let mut output = Batch::with_schema(out_schema, 1);
     let accs = vec![acc];
-    emit_reduce_row(
-        &mut output,
-        &mb,
-        0,
-        mb.get_pk_bytes(0),
-        &accs,
+    let plan = make_plan(
         &in_schema,
         &out_schema,
         &[0u32],
-        true, /* use_natural_pk */
-        1,
+        std::slice::from_ref(&desc),
+        false,
+        false,
+        false,
     );
+    emit_reduce_row(&mut output, &mb, 0, mb.get_pk_bytes(0), &accs, &plan);
 
     assert_eq!(output.count, 1);
     let out_mb = output.as_mem_batch();
@@ -6575,25 +6555,17 @@ fn emit_global_ground_renders_count_family_zero_null_clear() {
             col_idx: 0,
             agg_op: AggOp::Count,
             col_type_code: TypeCode::U64,
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 1,
             agg_op: AggOp::CountNonNull,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
     ];
     let mut raw_output = Batch::with_schema(out_schema, 1);
     let v0 = [0u8; 16]; // U128 ground PK (V₀)
-    emit_global_ground(
-        &mut raw_output,
-        &v0,
-        &descs,
-        &in_schema,
-        &out_schema,
-        &[], // no group-by columns
-    );
+    let plan = make_plan(&in_schema, &out_schema, &[], &descs, false, true, true);
+    emit_global_ground(&mut raw_output, &v0, &plan);
 
     assert_eq!(raw_output.count, 1, "ground row emitted");
     let out_mb = raw_output.as_mem_batch();
@@ -6670,13 +6642,11 @@ const C_SUMZERO: AggDescriptor = AggDescriptor {
     col_idx: 1,
     agg_op: AggOp::SumZero,
     col_type_code: TypeCode::I64,
-    _pad: [0; 2],
 };
 const C_COUNT_PARTIALS: AggDescriptor = AggDescriptor {
     col_idx: 0,
     agg_op: AggOp::Count,
     col_type_code: TypeCode::U128,
-    _pad: [0; 2],
 };
 
 /// The phase-3 combine `op_reduce` over hand-built partials (empty group cols →
@@ -6890,19 +6860,16 @@ fn reduce_multi_avi_foreign_group() {
             col_idx: 2,
             agg_op: AggOp::Min,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 3,
             agg_op: AggOp::Max,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 0,
             agg_op: AggOp::Count,
             col_type_code: TypeCode::U64,
-            _pad: [0; 2],
         },
     ];
 
@@ -7003,13 +6970,11 @@ const CG3_MIN: AggDescriptor = AggDescriptor {
     col_idx: 2,
     agg_op: AggOp::Min,
     col_type_code: TypeCode::I64,
-    _pad: [0; 2],
 };
 const CG3_COUNT: AggDescriptor = AggDescriptor {
     col_idx: 0,
     agg_op: AggOp::Count,
     col_type_code: TypeCode::U64,
-    _pad: [0; 2],
 };
 
 /// Helper: run one combined-index reduce tick over `cg3_src()` (MIN + COUNT).
@@ -7215,13 +7180,11 @@ fn reduce_multi_avi_same_col_min_max() {
             col_idx: 2,
             agg_op: AggOp::Min,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 2,
             agg_op: AggOp::Max,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
         CG3_COUNT,
     ];
@@ -7287,13 +7250,11 @@ fn reduce_multi_avi_compound_group_key() {
             col_idx: 3,
             agg_op: AggOp::Min,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 0,
             agg_op: AggOp::Count,
             col_type_code: TypeCode::U64,
-            _pad: [0; 2],
         },
     ];
     let delta = {
@@ -7374,19 +7335,16 @@ fn reduce_multi_avi_global_emptied() {
             col_idx: 1,
             agg_op: AggOp::Min,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 2,
             agg_op: AggOp::Sum,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 0,
             agg_op: AggOp::Count,
             col_type_code: TypeCode::U64,
-            _pad: [0; 2],
         },
     ];
     let mk = |rows: &[(u64, i64, i64, i64)]| {
@@ -8025,19 +7983,16 @@ fn mm_aggs() -> [AggDescriptor; 3] {
             col_idx: 2,
             agg_op: AggOp::Min,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 2,
             agg_op: AggOp::Max,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 0,
             agg_op: AggOp::Count,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
     ]
 }
@@ -8352,19 +8307,16 @@ fn avi_skip_mixed_int_min_float_max() {
             col_idx: 2,
             agg_op: AggOp::Min,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 3,
             agg_op: AggOp::Max,
             col_type_code: TypeCode::F64,
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 0,
             agg_op: AggOp::Count,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
     ];
     let build = |rows: &[(u64, i64, i64, f64, i64)]| -> Batch {
@@ -8431,19 +8383,16 @@ fn check_float_minmax_matches_reference(val_tc: TypeCode, epochs_rows: &[Vec<(u6
             col_idx: 2,
             agg_op: AggOp::Min,
             col_type_code: val_tc,
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 2,
             agg_op: AggOp::Max,
             col_type_code: val_tc,
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 0,
             agg_op: AggOp::Count,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
     ];
     let build = |rows: &[(u64, i64, f64, i64)]| -> Batch {
@@ -8529,13 +8478,11 @@ fn check_pk_source_max(b_signed: bool) {
             col_idx: 1,
             agg_op: AggOp::Max,
             col_type_code: TypeCode::from_validated_u8(b_tc),
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 0,
             agg_op: AggOp::Count,
             col_type_code: TypeCode::U64,
-            _pad: [0; 2],
         },
     ];
     let build = |rows: &[(u64, i64, i64)]| -> Batch {
@@ -8616,19 +8563,16 @@ fn avi_skip_global_aggregate() {
             col_idx: 1,
             agg_op: AggOp::Min,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 1,
             agg_op: AggOp::Max,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
         AggDescriptor {
             col_idx: 0,
             agg_op: AggOp::Count,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         },
     ];
     let build = |rows: &[(u64, i64, i64)]| -> Batch {

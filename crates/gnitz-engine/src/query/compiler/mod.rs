@@ -225,15 +225,10 @@ impl PlanBuildResult {
     /// (`build_plan` bounds `reg_meta` below `u16::MAX`, so the casts are exact).
     fn into_sub_plan(mut self) -> SubPlan {
         self.scratch.defuse();
-        let can_emit_on_empty = self.vm.program.instructions.iter().any(|i| {
-            matches!(
-                i,
-                Instr::ScanTrace { .. }
-                    | Instr::Reduce {
-                        global_ground: true,
-                        ..
-                    }
-            )
+        let can_emit_on_empty = self.vm.program.instructions.iter().any(|i| match i {
+            Instr::ScanTrace { .. } => true,
+            Instr::Reduce { plan_idx, .. } => self.vm.program.reduce_plans[*plan_idx as usize].global_ground,
+            _ => false,
         });
         SubPlan {
             in_reg: self.in_reg as u16,
@@ -592,32 +587,11 @@ mod tests {
             ],
             &[0],
         );
-        let joined = merge_schemas_for_join(&left, &right, JoinNullFill::None).unwrap();
+        let joined = merge_schemas_for_join(&left, &right).unwrap();
         assert_eq!(joined.num_columns(), 3); // PK + left_I64 + right_STRING
         assert_eq!(joined.columns[0].type_code, type_code::U128);
         assert_eq!(joined.columns[1].type_code, type_code::I64);
         assert_eq!(joined.columns[2].type_code, type_code::STRING);
-    }
-
-    #[test]
-    fn test_merge_schemas_for_join_outer() {
-        let left = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U128, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        );
-        let right = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U128, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        );
-        let joined = merge_schemas_for_join(&left, &right, JoinNullFill::RightNullable).unwrap();
-        assert_eq!(joined.num_columns(), 3);
-        assert_eq!(joined.columns[2].nullable, 1); // right side nullable
     }
 
     #[test]
@@ -639,7 +613,7 @@ mod tests {
             ],
             &[0],
         );
-        let joined = merge_schemas_for_join(&left, &right, JoinNullFill::None).unwrap();
+        let joined = merge_schemas_for_join(&left, &right).unwrap();
         // Two PK columns up front, then left payload (2), then right payload (1) = 5.
         assert_eq!(joined.num_columns(), 5);
         assert_eq!(joined.pk_indices(), &[0, 1]);
@@ -654,7 +628,7 @@ mod tests {
             ],
             &[0],
         );
-        let joined_single = merge_schemas_for_join(&left_single, &right, JoinNullFill::None).unwrap();
+        let joined_single = merge_schemas_for_join(&left_single, &right).unwrap();
         assert_eq!(joined_single.pk_indices(), &[0]);
     }
 
@@ -783,7 +757,6 @@ mod tests {
             col_idx: 2,
             agg_op: AggOp::Sum,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         }];
         let out = build_reduce_output_schema(&input, &[1], &aggs, gnitz_wire::ReduceOutKey::SingleNaturalCol);
         // Natural PK (single U64 group col) → [U64_PK, I64_agg]
@@ -807,7 +780,6 @@ mod tests {
             col_idx: 2,
             agg_op: AggOp::Count,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         }];
         // group_cols = [1, 0] — permuted; the set still equals pk_indices.
         let out = build_reduce_output_schema(&input, &[1, 0], &aggs, gnitz_wire::ReduceOutKey::PkPermutation);
@@ -834,7 +806,6 @@ mod tests {
             col_idx: 1,
             agg_op: AggOp::Sum,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         }];
         let out = build_reduce_output_schema(&input, &[0], &aggs, gnitz_wire::ReduceOutKey::PkPermutation);
         assert_eq!(out.num_columns(), 2);
@@ -857,7 +828,6 @@ mod tests {
             col_idx: 2,
             agg_op: AggOp::Count,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         }];
         let out = build_reduce_output_schema(&input, &[1], &aggs, gnitz_wire::ReduceOutKey::SyntheticFold);
         // Synthetic PK (STRING group col) → [U128_hash, STRING_group, I64_count]
@@ -1696,7 +1666,7 @@ mod tests {
             SchemaDescriptor::new(&cols[..n], &[0])
         };
         assert!(
-            merge_schemas_for_join(&make(half), &make(half), JoinNullFill::None).is_none(),
+            merge_schemas_for_join(&make(half), &make(half)).is_none(),
             "an over-wide join output must be rejected (None), not aborted"
         );
     }

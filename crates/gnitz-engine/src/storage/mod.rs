@@ -34,7 +34,9 @@ pub use scatter::{scatter_copy, scatter_multi_source};
 // ── Crate-internal: operator hot-path types (not official surface) ───────────
 pub(crate) use batch::carve_writer_slices;
 pub(crate) use batch::{BatchBuilder, Layout, MAX_WIRE_REGIONS};
-pub(crate) use columnar::{cmp_col_window, compare_rows, compare_rows_fixedint_nonnull, with_payload_cmp};
+pub(crate) use columnar::{
+    cmp_col_window, compare_rows, compare_rows_fixedint_nonnull, with_payload_cmp, ColumnarSource,
+};
 // The PK key primitives live in `schema::key`; out-of-storage callers keep the
 // storage facade.
 pub(crate) use crate::schema::key::{compare_pk_bytes, compare_pk_ordering, opk_key, pack_pk_be, pk_bytes_eq};

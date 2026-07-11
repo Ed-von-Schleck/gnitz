@@ -1,10 +1,9 @@
 //! DBSP distinct operator.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{scatter_copy, write_to_batch, Batch, Layout, ReadCursor};
+use crate::storage::{compare_rows, scatter_copy, write_to_batch, Batch, Layout, ReadCursor};
 
 use super::cogroup::cogroup_left;
-use super::util::compare_cursor_payload_to_batch_row;
 
 // ---------------------------------------------------------------------------
 // Distinct
@@ -62,7 +61,8 @@ pub fn op_weight_clamp(
                 if !m.valid || !m.current_pk_eq(key) {
                     break 0;
                 }
-                match compare_cursor_payload_to_batch_row(m, &consolidated_mb, i, schema) {
+                let (src, row) = m.current_row_source();
+                match compare_rows(schema, src, row, &consolidated_mb, i) {
                     std::cmp::Ordering::Less => {
                         m.advance();
                     }
@@ -110,31 +110,10 @@ mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::{Batch, Layout};
-    use crate::test_support::{make_wide_batch, wide_pk_3xu64_schema};
-
-    fn make_schema_u64_i64() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        )
-    }
-
-    fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
-        let n = rows.len();
-        let mut b = Batch::with_schema(*schema, n.max(1));
-        for &(pk, w, val) in rows {
-            b.extend_pk(pk as u128);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &val.to_le_bytes());
-            b.count += 1;
-        }
-        b.certify_layout(Layout::Consolidated, schema);
-        b
-    }
+    use crate::test_support::{
+        make_batch, make_batch_i64pk as make_signed_batch, make_schema_i64pk_i64 as make_schema_signed,
+        make_schema_u64_i64, make_wide_batch, opk_pk, opk_pk_i64, wide_pk_3xu64_schema,
+    };
 
     #[test]
     fn test_op_distinct_boundary() {
@@ -394,19 +373,10 @@ mod tests {
         )
     }
 
-    /// Pack a compound `(U64, U64)` PK into its 16-byte region: col0 then col1,
-    /// each little-endian — the layout storage stores and orders by.
-    fn compound_pk_bytes(c0: u64, c1: u64) -> [u8; 16] {
-        let mut b = [0u8; 16];
-        b[0..8].copy_from_slice(&c0.to_le_bytes());
-        b[8..16].copy_from_slice(&c1.to_le_bytes());
-        b
-    }
-
     fn make_compound_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, i64, i64)]) -> Batch {
         let mut b = Batch::with_schema(*schema, rows.len().max(1));
         for &(c0, c1, w, val) in rows {
-            b.extend_pk_bytes(&compound_pk_bytes(c0, c1));
+            b.extend_pk_bytes(&opk_pk(schema, &[c0 as u128, c1 as u128]));
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());
@@ -443,31 +413,8 @@ mod tests {
         let delta2 = make_compound_batch(&schema, &[(2, 3, 1, 999)]);
         let (out2, _) = op_distinct(delta2, &mut ch2, &schema);
         assert_eq!(out2.count, 1, "compound: a new payload at an existing PK emits +1");
-        assert_eq!(out2.get_pk_bytes(0), &compound_pk_bytes(2, 3));
+        assert_eq!(out2.get_pk_bytes(0), opk_pk(&schema, &[2, 3]).as_slice());
         assert_eq!(out2.get_weight(0), 1);
-    }
-
-    fn make_schema_signed() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::I64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        )
-    }
-
-    fn make_signed_batch(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> Batch {
-        let mut b = Batch::with_schema(*schema, rows.len().max(1));
-        for &(pk, w, val) in rows {
-            b.extend_pk_opk(schema, &[(pk as u64) as u128]);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &val.to_le_bytes());
-            b.count += 1;
-        }
-        b.certify_layout(Layout::Consolidated, schema);
-        b
     }
 
     /// Signed single-column PK: negatives sort first in storage but last in raw
@@ -496,9 +443,7 @@ mod tests {
         let delta2 = make_signed_batch(&schema, &[(-1, -1, 10)]);
         let (out2, _) = op_distinct(delta2, &mut ch2, &schema);
         assert_eq!(out2.count, 1, "signed: fully retracting an element emits -1");
-        let mut le = [0u8; 8];
-        gnitz_wire::decode_pk_column(&out2.get_pk_bytes(0)[..8], type_code::I64, &mut le);
-        assert_eq!(i64::from_le_bytes(le), -1);
+        assert_eq!(opk_pk_i64(out2.get_pk_bytes(0)), -1);
         assert_eq!(out2.get_weight(0), -1);
     }
 

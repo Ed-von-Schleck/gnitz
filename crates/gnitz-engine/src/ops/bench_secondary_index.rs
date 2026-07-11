@@ -211,7 +211,6 @@ fn secondary_index_bench_avi_decomposition() {
                 col_idx: 2,
                 agg_op: AggOp::Min,
                 col_type_code: TypeCode::I64,
-                _pad: [0; 2],
             }],
         };
         op_integrate_with_indexes(&input, None, &schema, Some(&avi)).unwrap();

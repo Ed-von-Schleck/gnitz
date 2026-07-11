@@ -176,10 +176,7 @@ pub(crate) fn execute_epoch_multi(
                 out_reg,
                 func_idx,
                 out_schema_idx,
-                reindex_off,
-                reindex_cnt,
-                reindex_hash,
-                branch_id,
+                reindex,
             } => {
                 debug_assert_ne!(*in_reg, *out_reg, "Map: in_reg and out_reg must be distinct");
                 let func_ptr = program.funcs[*func_idx as usize];
@@ -189,20 +186,18 @@ pub(crate) fn execute_epoch_multi(
                 let func = unsafe { &*func_ptr };
                 let in_schema = &program.reg_meta[*in_reg as usize].schema;
                 let out_schema = &program.schemas[*out_schema_idx as usize];
-                let off = *reindex_off as usize;
-                let n = *reindex_cnt as usize;
-                let reindex_cols = &program.reindex_cols[off..off + n];
-                let target_tcs = &program.reindex_target_tcs[off..off + n];
-                let result = ops::op_map(
-                    &reg!(*in_reg).batch,
-                    func,
-                    in_schema,
-                    out_schema,
-                    reindex_cols,
-                    target_tcs,
-                    *reindex_hash,
-                    *branch_id,
-                );
+                let reindex = match *reindex {
+                    ReindexOperand::None => ops::ReindexSpec::None,
+                    ReindexOperand::HashRow { branch_id } => ops::ReindexSpec::HashRow { branch_id },
+                    ReindexOperand::Pack { off, cnt } => {
+                        let (off, cnt) = (off as usize, cnt as usize);
+                        ops::ReindexSpec::Pack {
+                            cols: &program.reindex_cols[off..off + cnt],
+                            target_tcs: &program.reindex_target_tcs[off..off + cnt],
+                        }
+                    }
+                };
+                let result = ops::op_map(&reg!(*in_reg).batch, func, in_schema, out_schema, reindex);
                 reg_mut!(*out_reg).batch = result;
             }
 
@@ -265,8 +260,15 @@ pub(crate) fn execute_epoch_multi(
             } => {
                 let left_schema = &program.reg_meta[*delta_reg as usize].schema;
                 let right_schema = &program.schemas[*right_schema_idx as usize];
+                let out_schema = &program.reg_meta[*out_reg as usize].schema;
                 if let Some(cursor) = cursor_mut!(*trace_reg) {
-                    let result = ops::op_join_delta_trace(&reg!(*delta_reg).batch, cursor, left_schema, right_schema);
+                    let result = ops::op_join_delta_trace(
+                        &reg!(*delta_reg).batch,
+                        cursor,
+                        left_schema,
+                        right_schema,
+                        out_schema,
+                    );
                     reg_mut!(*out_reg).batch = result;
                 }
             }
@@ -281,12 +283,14 @@ pub(crate) fn execute_epoch_multi(
             } => {
                 let left_schema = &program.reg_meta[*delta_reg as usize].schema;
                 let right_schema = &program.schemas[*right_schema_idx as usize];
+                let out_schema = &program.reg_meta[*out_reg as usize].schema;
                 if let Some(cursor) = cursor_mut!(*trace_reg) {
                     let result = ops::op_join_delta_trace_range(
                         &reg!(*delta_reg).batch,
                         cursor,
                         left_schema,
                         right_schema,
+                        out_schema,
                         *n_eq as usize,
                         *rel,
                     );
@@ -307,14 +311,10 @@ pub(crate) fn execute_epoch_multi(
                 reg_mut!(*out_reg).batch = result;
             }
 
-            Instr::NullExtend {
-                in_reg,
-                out_reg,
-                right_schema_idx,
-            } => {
+            Instr::NullExtend { in_reg, out_reg } => {
                 let in_schema = &program.reg_meta[*in_reg as usize].schema;
-                let right_schema = &program.schemas[*right_schema_idx as usize];
-                let result = ops::op_null_extend(&reg!(*in_reg).batch, in_schema, right_schema);
+                let out_schema = &program.reg_meta[*out_reg as usize].schema;
+                let result = ops::op_null_extend(&reg!(*in_reg).batch, in_schema, out_schema);
                 reg_mut!(*out_reg).batch = result;
             }
 
@@ -356,23 +356,11 @@ pub(crate) fn execute_epoch_multi(
                 trace_out_reg,
                 out_reg,
                 fin_out_reg,
-                agg_descs_offset,
-                agg_descs_count,
-                group_cols_offset,
-                group_cols_count,
-                output_schema_idx,
-                out_key,
+                plan_idx,
                 avi_table_idx,
                 finalize,
-                global_ground,
-                i_am_owner,
             } => {
-                let in_schema = &program.reg_meta[*in_reg as usize].schema;
-                let out_schema = &program.schemas[*output_schema_idx as usize];
-                let aggs = &program.agg_descs
-                    [*agg_descs_offset as usize..(*agg_descs_offset as usize + *agg_descs_count as usize)];
-                let gcols = &program.group_cols
-                    [*group_cols_offset as usize..(*group_cols_offset as usize + *group_cols_count as usize)];
+                let plan = &program.reduce_plans[*plan_idx as usize];
 
                 // trace_in cursor (from register file)
                 let ti_cursor_ptr: *mut ReadCursor = if let Some(tr) = trace_in_reg {
@@ -413,7 +401,7 @@ pub(crate) fn execute_epoch_multi(
                     reg!(*in_reg).batch.count,
                     !ti_cursor_ptr.is_null(),
                     avi_cursor_handle.is_some(),
-                    aggs.len()
+                    plan.agg_descs.len()
                 );
 
                 let fin_func = finalize.map(|f| unsafe { &*program.funcs[f.func_idx as usize] });
@@ -430,16 +418,10 @@ pub(crate) fn execute_epoch_multi(
                     &reg!(*in_reg).batch,
                     ti_opt,
                     unsafe { &mut *to_cursor_ptr },
-                    in_schema,
-                    out_schema,
-                    gcols,
-                    aggs,
-                    *out_key,
                     avi_opt,
+                    plan,
                     fin_func,
                     fin_schema,
-                    *global_ground,
-                    *i_am_owner,
                 );
 
                 // Drop temporary cursor handle (returned to pool)

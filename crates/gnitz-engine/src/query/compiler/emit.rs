@@ -2,7 +2,7 @@
 //! constructors, and `build_plan` (one plan, pre or post exchange).
 
 use super::*;
-use crate::query::vm::{reads_reg, Instr, IntegrateAvi};
+use crate::query::vm::{reads_reg, Instr, IntegrateAvi, ReindexOperand};
 
 // ---------------------------------------------------------------------------
 // Expression + scalar function construction helpers
@@ -454,19 +454,23 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
                         .map_err(expr_reject("map: program/schema mismatch"))?;
                     let fp = ctx.push_func(ScalarFunc::from_map(prog, &in_reg_schema, &node_schema));
                     ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(node_schema);
-                    let cols_u32: Vec<u32> = reindex_cols.iter().map(|&c| c as u32).collect();
                     let func_idx = ctx.builder.func_idx(fp);
                     let out_schema_idx = ctx.builder.schema_idx(node_schema);
-                    let (reindex_off, reindex_cnt) = ctx.builder.add_reindex_cols(&cols_u32, reindex_target_tcs);
+                    // An Expression map without reindex columns is a plain
+                    // columnar map — the bulk PK copy stands.
+                    let reindex = if reindex_cols.is_empty() {
+                        ReindexOperand::None
+                    } else {
+                        let cols_u32: Vec<u32> = reindex_cols.iter().map(|&c| c as u32).collect();
+                        let (off, cnt) = ctx.builder.add_reindex_cols(&cols_u32, reindex_target_tcs);
+                        ReindexOperand::Pack { off, cnt }
+                    };
                     ctx.builder.push(Instr::Map {
                         in_reg: in_reg as u16,
                         out_reg: reg_id as u16,
                         func_idx,
                         out_schema_idx,
-                        reindex_off,
-                        reindex_cnt,
-                        reindex_hash: false,
-                        branch_id: 0,
+                        reindex,
                     });
                 }
 
@@ -520,16 +524,12 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
                     ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(node_schema);
                     let func_idx = ctx.builder.func_idx(fp);
                     let out_schema_idx = ctx.builder.schema_idx(node_schema);
-                    let (reindex_off, reindex_cnt) = ctx.builder.add_reindex_cols(&[], &[]);
                     ctx.builder.push(Instr::Map {
                         in_reg: in_reg as u16,
                         out_reg: reg_id as u16,
                         func_idx,
                         out_schema_idx,
-                        reindex_off,
-                        reindex_cnt,
-                        reindex_hash: true,
-                        branch_id: *branch_id,
+                        reindex: ReindexOperand::HashRow { branch_id: *branch_id },
                     });
                 }
 
@@ -543,16 +543,12 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
                     ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(schema);
                     let func_idx = ctx.builder.func_idx(fp);
                     let out_schema_idx = ctx.builder.schema_idx(schema);
-                    let (reindex_off, reindex_cnt) = ctx.builder.add_reindex_cols(&[], &[]);
                     ctx.builder.push(Instr::Map {
                         in_reg: in_reg as u16,
                         out_reg: reg_id as u16,
                         func_idx,
                         out_schema_idx,
-                        reindex_off,
-                        reindex_cnt,
-                        reindex_hash: false,
-                        branch_id: 0,
+                        reindex: ReindexOperand::None,
                     });
                 }
             }
@@ -638,7 +634,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
             let b_schema = ctx.reg_meta[b_reg as usize].schema;
             match kind {
                 gnitz_wire::JoinKind::DeltaTrace => {
-                    let out_schema = merge_schemas_for_join(&a_schema, &b_schema, JoinNullFill::None)
+                    let out_schema = merge_schemas_for_join(&a_schema, &b_schema)
                         .ok_or(CompileError::Rejected("join: merged schema exceeds MAX_COLUMNS"))?;
                     ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(out_schema);
                     let right_schema_idx = ctx.builder.schema_idx(b_schema);
@@ -663,7 +659,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
                     // Same output layout as the equi delta-trace join; only the
                     // probe differs. `n_eq`/`rel` ride to the op so it can derive
                     // the eq-prefix / range-slot split and the cut direction.
-                    let out_schema = merge_schemas_for_join(&a_schema, &b_schema, JoinNullFill::None)
+                    let out_schema = merge_schemas_for_join(&a_schema, &b_schema)
                         .ok_or(CompileError::Rejected("join: merged schema exceeds MAX_COLUMNS"))?;
                     ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(out_schema);
                     let right_schema_idx = ctx.builder.schema_idx(b_schema);
@@ -737,27 +733,31 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
         gnitz_wire::OpNode::NullExtend { type_codes } => {
             let in_reg = in_reg(&in_regs, PORT_IN, "null-extend: missing input port")?;
             let in_schema = ctx.reg_meta[in_reg as usize].schema;
-            // A crafted `type_codes` list would overflow the fixed `[_; 65]` schema
-            // array below (and `merge_schemas_for_join`'s output width). Reject
-            // rather than abort; the merge closes the additive `in + type_codes`
-            // overflow guard 4 alone cannot.
-            if type_codes.len() >= crate::schema::MAX_COLUMNS {
-                return Err(CompileError::Rejected("null-extend: too many columns"));
+            // The output schema — input columns followed by the null-fill columns
+            // (nullable), keyed by the input PK — is built here once and homed in
+            // `reg_meta`; the op derives its appended-column count from it. A
+            // crafted `type_codes` list would overflow the fixed `[_; 65]` schema
+            // array; reject rather than abort.
+            if in_schema.num_columns() + type_codes.len() > crate::schema::MAX_COLUMNS {
+                return Err(CompileError::Rejected("null-extend: merged schema exceeds MAX_COLUMNS"));
             }
             let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-            cols[0] = SchemaColumn::new(type_code::U128, 0); // dummy PK
-            for (i, &tc) in type_codes.iter().enumerate() {
-                cols[i + 1] = SchemaColumn::new(tc, 1);
+            let mut pk_idx = [0u32; crate::schema::MAX_PK_COLUMNS];
+            let pk_len = copy_pk_columns_into(&in_schema, &mut cols, &mut pk_idx);
+            let mut n = pk_len;
+            for (_, _, c) in in_schema.payload_columns() {
+                cols[n] = *c;
+                n += 1;
             }
-            let right = SchemaDescriptor::new(&cols[..type_codes.len() + 1], &[0]);
-            let out_schema = merge_schemas_for_join(&in_schema, &right, JoinNullFill::RightNullable)
-                .ok_or(CompileError::Rejected("null-extend: merged schema exceeds MAX_COLUMNS"))?;
+            for &tc in type_codes {
+                cols[n] = SchemaColumn::new(tc, 1);
+                n += 1;
+            }
+            let out_schema = SchemaDescriptor::new(&cols[..n], &pk_idx[..pk_len]);
             ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(out_schema);
-            let right_schema_idx = ctx.builder.schema_idx(right);
             ctx.builder.push(Instr::NullExtend {
                 in_reg: in_reg as u16,
                 out_reg: reg_id as u16,
-                right_schema_idx,
             });
         }
     }
@@ -818,7 +818,6 @@ pub(super) fn emit_reduce(
                 col_idx: 0,
                 agg_op: AggOp::Null,
                 col_type_code: TypeCode::U64,
-                _pad: [0; 2],
             });
         }
         gnitz_wire::AggKind::Specs(specs) => {
@@ -829,7 +828,6 @@ pub(super) fn emit_reduce(
                     col_idx: col_idx as u32,
                     agg_op,
                     col_type_code,
-                    _pad: [0; 2],
                 });
             }
         }
@@ -1004,14 +1002,24 @@ pub(super) fn emit_reduce(
                 )
     };
 
-    let (agg_descs_offset, agg_descs_count) = ctx.builder.add_agg_descs(&agg_descs);
-    let (group_cols_offset, group_cols_count) = ctx.builder.add_group_cols(&gcols_u32);
-    let output_schema_idx = ctx.builder.schema_idx(reduce_out_schema);
     let avi_table_idx = (!avi_table_ptr.is_null()).then(|| ctx.builder.table_idx(avi_table_ptr) as u16);
     let finalize = (!fin_func_ptr.is_null()).then(|| crate::query::vm::FinalizeIdx {
         func_idx: ctx.builder.func_idx(fin_func_ptr),
         schema_idx: ctx.builder.schema_idx(loaded.out_schema),
     });
+
+    // Bake the reduce plan — the one construction site for everything the
+    // operator would otherwise re-derive per epoch from the instruction operands.
+    let plan_idx = ctx.builder.add_reduce_plan(crate::ops::ReducePlan::new(
+        &in_reg_schema,
+        &reduce_out_schema,
+        &gcols_u32,
+        &agg_descs,
+        out_key,
+        avi_table_idx.is_some(),
+        global_ground,
+        i_am_owner,
+    ));
 
     ctx.builder.push(Instr::Reduce {
         in_reg: in_reg_id as u16,
@@ -1019,16 +1027,9 @@ pub(super) fn emit_reduce(
         trace_out_reg: reg_id as u16,
         out_reg: raw_delta_id as u16,
         fin_out_reg: (fin_delta_id >= 0).then_some(fin_delta_id as u16),
-        agg_descs_offset,
-        agg_descs_count,
-        group_cols_offset,
-        group_cols_count,
-        output_schema_idx,
-        out_key,
+        plan_idx,
         avi_table_idx,
         finalize,
-        global_ground,
-        i_am_owner,
     });
 
     // The trace_in integrate (non-linear, non-AVI fallback) carries no value

@@ -29,22 +29,6 @@ pub enum AggOp {
     SumZero = 6,
 }
 
-impl TryFrom<u8> for AggOp {
-    type Error = u8;
-    fn try_from(v: u8) -> Result<Self, Self::Error> {
-        match v {
-            0 => Ok(AggOp::Null),
-            1 => Ok(AggOp::Count),
-            2 => Ok(AggOp::Sum),
-            3 => Ok(AggOp::Min),
-            4 => Ok(AggOp::Max),
-            5 => Ok(AggOp::CountNonNull),
-            6 => Ok(AggOp::SumZero),
-            other => Err(other),
-        }
-    }
-}
-
 impl From<gnitz_wire::AggFunc> for AggOp {
     fn from(f: gnitz_wire::AggFunc) -> Self {
         match f {
@@ -90,7 +74,6 @@ pub struct AggDescriptor {
     pub col_idx: u32,
     pub agg_op: AggOp,
     pub col_type_code: TypeCode,
-    pub _pad: [u8; 2],
 }
 
 const _: () = assert!(std::mem::size_of::<AggOp>() == 1);
@@ -325,15 +308,18 @@ impl Accumulator {
 /// MIN/MAX on String before the operator sees it.
 #[inline]
 fn decode_signed(bytes: &[u8], tc: TypeCode) -> i64 {
+    use crate::schema::{read_signed, read_unsigned, type_size};
     match tc {
-        TypeCode::I8 => bytes[0] as i8 as i64,
-        TypeCode::U8 => bytes[0] as i64,
-        TypeCode::I16 => i16::from_le_bytes(bytes[..2].try_into().unwrap()) as i64,
-        TypeCode::U16 => u16::from_le_bytes(bytes[..2].try_into().unwrap()) as i64,
-        TypeCode::I32 => i32::from_le_bytes(bytes[..4].try_into().unwrap()) as i64,
-        TypeCode::U32 => u32::from_le_bytes(bytes[..4].try_into().unwrap()) as i64,
-        TypeCode::I64 | TypeCode::U64 => i64::from_le_bytes(bytes[..8].try_into().unwrap()),
-        TypeCode::String => i64::from_le_bytes(bytes[..8].try_into().unwrap()),
+        // Unsigned sources zero-extend (U8 0xFF → 255, never sign-extend);
+        // U64 reinterprets the bit pattern per the doc caveat above.
+        TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 => {
+            read_unsigned(bytes, type_size(tc as u8) as usize) as i64
+        }
+        TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
+            read_signed(bytes, type_size(tc as u8) as usize)
+        }
+        // 8-byte prefix of the 16-byte German String struct as the compare key.
+        TypeCode::String => read_signed(&bytes[..8], 8),
         TypeCode::F32 | TypeCode::F64 | TypeCode::U128 | TypeCode::UUID | TypeCode::Blob | TypeCode::I128 => {
             unreachable!("decode_signed: non-integer/string type")
         }
@@ -522,7 +508,6 @@ mod tests {
             col_idx: 1,
             agg_op,
             col_type_code: TypeCode::F64,
-            _pad: [0; 2],
         };
         Accumulator::new(&desc, &schema)
     }

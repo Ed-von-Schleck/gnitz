@@ -6,7 +6,7 @@
 use std::cmp::Ordering;
 
 use crate::expr::ScalarFunc;
-use crate::schema::{SchemaColumn, SchemaDescriptor};
+use crate::schema::SchemaDescriptor;
 use crate::storage::{with_payload_cmp, Batch, Layout, MemBatch};
 
 use super::cogroup::{cogroup_union, BatchCursor};
@@ -57,31 +57,30 @@ pub fn op_filter(batch: &Batch, func: &ScalarFunc, schema: &SchemaDescriptor) ->
     output
 }
 
-/// Map: transform batch via scalar function, then stamp the output PK region.
-///
-/// `reindex_hash` and a non-empty `reindex_cols` are mutually exclusive — each
-/// selects what overwrites `evaluate_map_batch`'s bulk PK copy:
-/// - `reindex_hash`: set each PK to a hash of the full output row (all payload
-///   columns) for EXCEPT/INTERSECT/DISTINCT full-row set identity.
-/// - non-empty `reindex_cols`: pack the listed source columns' OPK bytes
-///   contiguously into the output PK (the `_join_pk` for an equijoin /
-///   GROUP BY repartition).
-/// - neither: plain batch map — the bulk PK copy stands.
-#[allow(clippy::too_many_arguments)]
+/// What overwrites `evaluate_map_batch`'s bulk PK copy after a MAP — see
+/// [`op_map`]. The stored instruction operand is `query::vm::ReindexOperand`
+/// (`Pack` there keeps a side-table range); the exec dispatch resolves it to
+/// this borrowed form.
+pub enum ReindexSpec<'a> {
+    /// Plain batch map — the bulk PK copy stands.
+    None,
+    /// Set each PK to a hash of the full output row (all payload columns) for
+    /// EXCEPT/INTERSECT/DISTINCT full-row set identity.
+    HashRow { branch_id: u8 },
+    /// Pack the listed source columns' OPK bytes contiguously into the output
+    /// PK (the `_join_pk` for an equijoin / GROUP BY repartition).
+    Pack { cols: &'a [u32], target_tcs: &'a [u8] },
+}
+
+/// Map: transform batch via scalar function, then stamp the output PK region
+/// per `reindex` (see [`ReindexSpec`]).
 pub fn op_map(
     batch: &Batch,
     func: &ScalarFunc,
     in_schema: &SchemaDescriptor,
     out_schema: &SchemaDescriptor,
-    reindex_cols: &[u32],
-    target_tcs: &[u8],
-    reindex_hash: bool,
-    branch_id: u8,
+    reindex: ReindexSpec<'_>,
 ) -> Batch {
-    debug_assert!(
-        !reindex_hash || reindex_cols.is_empty(),
-        "op_map: reindex_hash and reindex_cols are mutually exclusive",
-    );
     if batch.count == 0 {
         return Batch::empty_with_schema(out_schema);
     }
@@ -91,16 +90,18 @@ pub fn op_map(
         output.count, batch.count,
         "MAP output row count must equal input row count",
     );
-    if reindex_hash {
+    match reindex {
         // Set each PK to a hash of the full output row so rows with identical
         // content collide and distinct content does not (EXCEPT/INTERSECT/
         // DISTINCT full-row set identity).
-        reindex_hash_row(out_schema, &mut output, branch_id);
-    } else if !reindex_cols.is_empty() {
+        ReindexSpec::HashRow { branch_id } => reindex_hash_row(out_schema, &mut output, branch_id),
         // Pack each reindex column's OPK bytes contiguously into the output PK.
         // The SAME packer routes the exchange scatter (via `ScatterKey`), so the
         // reindexed `_join_pk` and the delta scatter co-partition byte-for-byte.
-        ReindexPacker::new(in_schema, reindex_cols, target_tcs).promote_into(&batch.as_mem_batch(), &mut output);
+        ReindexSpec::Pack { cols, target_tcs } => {
+            ReindexPacker::new(in_schema, cols, target_tcs).promote_into(&batch.as_mem_batch(), &mut output)
+        }
+        ReindexSpec::None => {}
     }
 
     // `evaluate_map_batch` returns `Raw`, and every path keeps it there: a
@@ -108,13 +109,7 @@ pub fn op_map(
     // projection stays `Raw` because a payload-reordering projection over a
     // duplicate-PK input can break (PK, payload) order (the D1 fail-safe — only
     // `into_consolidated` would trust `sorted`, and it re-sorts a `Raw` batch).
-    gnitz_debug!(
-        "op_map: in={} out={} reindex_hash={} reindex_cols={}",
-        batch.count,
-        output.count,
-        reindex_hash,
-        reindex_cols.len(),
-    );
+    gnitz_debug!("op_map: in={} out={}", batch.count, output.count);
     output
 }
 
@@ -256,39 +251,29 @@ where
 
 /// Null-extend: copy input batch and append N null-filled payload columns.
 /// Used by the LEFT JOIN null-fill to extend the unmatched preserved rows
-/// (ν = positive_part(A − π_A(inner))) with NULL right columns.
-pub fn op_null_extend(batch: &Batch, in_schema: &SchemaDescriptor, right_schema: &SchemaDescriptor) -> Batch {
-    assert!(
-        in_schema.num_columns() + right_schema.num_payload_cols() <= crate::schema::MAX_COLUMNS,
-        "op_null_extend: combined column count {} + {} exceeds MAX_COLUMNS={}",
-        in_schema.num_columns(),
-        right_schema.num_payload_cols(),
-        crate::schema::MAX_COLUMNS,
+/// (ν = positive_part(A − π_A(inner))) with NULL right columns. The output
+/// schema is the compiler-built register schema (`reg_meta`) — the single home
+/// for the merged shape; the appended column count is derived from it.
+/// (Combined-width overflow is compile-rejected at emit, so no runtime guard.)
+pub fn op_null_extend(batch: &Batch, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> Batch {
+    debug_assert_eq!(
+        out_schema.pk_stride(),
+        in_schema.pk_stride(),
+        "op_null_extend: output PK region must mirror the input's",
     );
-
     let in_npc = in_schema.num_payload_cols();
-    let right_npc = right_schema.num_payload_cols();
+    debug_assert!(
+        out_schema.num_payload_cols() >= in_npc,
+        "op_null_extend: output schema narrower than input",
+    );
+    let right_npc = out_schema.num_payload_cols() - in_npc;
     let n = batch.count;
 
-    // Build the merged schema for the output batch (also the shape of the
-    // zero-row early return — output PK region is identical to the input PK).
-    let mut out_columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-    let mut ci_out = 0;
-    for ci in 0..in_schema.num_columns() {
-        out_columns[ci_out] = in_schema.columns[ci];
-        ci_out += 1;
-    }
-    for (_rpi, _ci, col) in right_schema.payload_columns() {
-        out_columns[ci_out] = *col;
-        ci_out += 1;
-    }
-    let out_schema = SchemaDescriptor::new(&out_columns[..ci_out], in_schema.pk_indices());
-
     if n == 0 {
-        return Batch::empty_with_schema(&out_schema);
+        return Batch::empty_with_schema(out_schema);
     }
 
-    let mut output = Batch::with_schema(out_schema, n);
+    let mut output = Batch::with_schema(*out_schema, n);
     output.count = n;
 
     // Propagate the input blob so long (> 12 byte) STRING/BLOB values whose
@@ -340,33 +325,10 @@ mod tests {
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::{Batch, Layout};
     use crate::test_support::{
-        make_batch_i64pk, make_schema_i64pk_i64, make_schema_pk_u64_payload_blob, make_schema_pk_u64_payload_string,
-        make_wide_batch, wide_pk_3xu64_schema,
+        make_batch, make_batch_i64pk, make_schema_i64pk_i64, make_schema_pk_u64_payload_blob,
+        make_schema_pk_u64_payload_string, make_schema_u64_i64, make_wide_batch, read_german_string,
+        wide_pk_3xu64_schema,
     };
-
-    fn make_schema_u64_i64() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        )
-    }
-
-    fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
-        let n = rows.len();
-        let mut b = Batch::with_schema(*schema, n.max(1));
-        for &(pk, w, val) in rows {
-            b.extend_pk(pk as u128);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &val.to_le_bytes());
-            b.count += 1;
-        }
-        b.certify_layout(Layout::Consolidated, schema);
-        b
-    }
 
     fn get_payload_i64(b: &Batch, row: usize) -> i64 {
         crate::foundation::codec::read_i64_le(b.col_data(0), row * 8)
@@ -481,21 +443,8 @@ mod tests {
     }
 
     /// Read a STRING/BLOB payload column's value back out as a `String`.
-    /// Mirrors join.rs's `read_str_payload`; short (≤12 byte) values live inline
-    /// in the 16-byte German-string struct, long ones in the blob heap.
     fn read_str_col(batch: &Batch, col: usize, row: usize) -> String {
-        let off = row * 16;
-        let gs = &batch.col_data(col)[off..off + 16];
-        let length = u32::from_le_bytes(gs[0..4].try_into().unwrap()) as usize;
-        if length == 0 {
-            return String::new();
-        }
-        if length <= crate::schema::SHORT_STRING_THRESHOLD {
-            String::from_utf8_lossy(&gs[4..4 + length]).to_string()
-        } else {
-            let blob_off = u64::from_le_bytes(gs[8..16].try_into().unwrap()) as usize;
-            String::from_utf8_lossy(&batch.blob[blob_off..blob_off + length]).to_string()
-        }
+        String::from_utf8_lossy(&read_german_string(batch, col, row)).to_string()
     }
 
     /// Build a `Batch` for a `(U64 pk, STRING payload)` schema from
@@ -629,7 +578,7 @@ mod tests {
         let empty_batch = Batch::empty_with_schema(&schema);
 
         let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema);
-        let out = op_map(&empty_batch, &func, &schema, &schema, &[], &[], false, 0);
+        let out = op_map(&empty_batch, &func, &schema, &schema, ReindexSpec::None);
         assert_eq!(out.count, 0);
     }
 
@@ -724,8 +673,21 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // op_null_extend blob propagation + combined-column guard
+    // op_null_extend blob propagation
     // -----------------------------------------------------------------------
+
+    /// The compiler-built null-extend output schema (`reg_meta`): input columns
+    /// followed by the right side's payload columns marked nullable, keyed by
+    /// the input PK — what `emit.rs` bakes and `exec.rs` passes to the op.
+    fn null_extend_out_schema(in_schema: &SchemaDescriptor, right_schema: &SchemaDescriptor) -> SchemaDescriptor {
+        let mut cols: Vec<SchemaColumn> = (0..in_schema.num_columns()).map(|ci| in_schema.columns[ci]).collect();
+        for (_, _, col) in right_schema.payload_columns() {
+            let mut c = *col;
+            c.nullable = 1;
+            cols.push(c);
+        }
+        SchemaDescriptor::new(&cols, in_schema.pk_indices())
+    }
 
     #[test]
     fn test_op_null_extend_blob_propagation() {
@@ -744,47 +706,16 @@ mod tests {
 
         // Right side: a single I64 payload column.
         let right_schema = make_schema_u64_i64();
-        let out = op_null_extend(&b, &in_schema, &right_schema);
+        let out = op_null_extend(&b, &in_schema, &null_extend_out_schema(&in_schema, &right_schema));
 
         assert!(!out.blob.is_empty(), "output blob must be propagated");
 
         // Resolve the long string from the output's STRING column (col 0).
-        let struct_bytes = out.col_data(0);
-        let length = u32::from_le_bytes(struct_bytes[0..4].try_into().unwrap()) as usize;
-        let off = u64::from_le_bytes(struct_bytes[8..16].try_into().unwrap()) as usize;
-        let resolved = crate::schema::long_string_bytes(&out.blob, off, length);
-        assert_eq!(resolved, long_str, "long string must resolve to the original");
-    }
-
-    #[test]
-    #[should_panic(expected = "op_null_extend: combined column count")]
-    fn test_op_null_extend_combined_column_guard() {
-        // Regression: op_null_extend wrote in_schema.num_columns() +
-        // right_schema.num_payload_cols() entries into a [_; MAX_COLUMNS]
-        // stack array with no bounds check. Combined > MAX_COLUMNS must
-        // panic with a clear message, not a generic index-out-of-bounds.
-        let mut in_cols = vec![SchemaColumn::new(type_code::U64, 0)];
-        for _ in 0..40 {
-            in_cols.push(SchemaColumn::new(type_code::I64, 0));
-        }
-        let in_schema = SchemaDescriptor::new(&in_cols, &[0]);
-
-        let mut right_cols = vec![SchemaColumn::new(type_code::U64, 0)];
-        for _ in 0..40 {
-            right_cols.push(SchemaColumn::new(type_code::I64, 0));
-        }
-        let right_schema = SchemaDescriptor::new(&right_cols, &[0]);
-
-        // 41 + 40 = 81 > MAX_COLUMNS (65).
-        let mut b = Batch::with_schema(in_schema, 1);
-        b.extend_pk(1u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        for pi in 0..in_schema.num_payload_cols() {
-            b.extend_col(pi, &0i64.to_le_bytes());
-        }
-        b.count += 1;
-        let _ = op_null_extend(&b, &in_schema, &right_schema);
+        assert_eq!(
+            read_german_string(&out, 0, 0),
+            long_str,
+            "long string must resolve to the original"
+        );
     }
 
     #[test]
@@ -807,11 +738,11 @@ mod tests {
         let out = op_filter(&b, &func, &schema);
         assert_eq!(out.count, 1);
         assert!(!out.blob.is_empty(), "BLOB filter output must carry the blob buffer");
-        let struct_bytes = out.col_data(0);
-        let length = u32::from_le_bytes(struct_bytes[0..4].try_into().unwrap()) as usize;
-        let off = u64::from_le_bytes(struct_bytes[8..16].try_into().unwrap()) as usize;
-        let resolved = crate::schema::long_string_bytes(&out.blob, off, length);
-        assert_eq!(resolved, long_blob, "long BLOB must resolve to the original bytes");
+        assert_eq!(
+            read_german_string(&out, 0, 0),
+            long_blob,
+            "long BLOB must resolve to the original bytes"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -859,7 +790,7 @@ mod tests {
         let in_schema = make_schema_u64_i64();
         let right_schema = make_schema_u64_i64();
         let empty = make_batch(&in_schema, &[]);
-        let out = op_null_extend(&empty, &in_schema, &right_schema);
+        let out = op_null_extend(&empty, &in_schema, &null_extend_out_schema(&in_schema, &right_schema));
         assert_eq!(out.count, 0);
         assert_eq!(
             out.pk_stride(),
@@ -898,7 +829,7 @@ mod tests {
         b.count += 1;
 
         // Must not panic.
-        let out = op_null_extend(&b, &in_schema, &right_schema);
+        let out = op_null_extend(&b, &in_schema, &null_extend_out_schema(&in_schema, &right_schema));
         assert_eq!(out.count, 1);
         let in_null = u64::from_le_bytes(b.null_bmp_data()[0..8].try_into().unwrap());
         let out_null = u64::from_le_bytes(out.null_bmp_data()[0..8].try_into().unwrap());
@@ -943,10 +874,10 @@ mod tests {
             &func,
             &schema,
             &schema,
-            /* reindex_cols = */ &[1],
-            &[],
-            false,
-            0,
+            ReindexSpec::Pack {
+                cols: &[1],
+                target_tcs: &[],
+            },
         );
         assert_eq!(out.count, 3);
         // Each output row's PK is the sign-aware OPK image of its source payload

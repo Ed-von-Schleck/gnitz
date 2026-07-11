@@ -1448,12 +1448,11 @@ impl MasterDispatcher {
                             )?;
                         }
                         CheckPayload::ScatterSource { source } => {
-                            // Routing is always by the schema PK; compute the
+                            // Routing is always by the schema PK; compute
                             // per-worker indices on the fly. No reentrancy: this
                             // loop body has no `.await`, so the SCATTER_INDICES
                             // borrow is released before the next iteration.
-                            let pk_cols = check.schema.pk_indices();
-                            with_worker_indices(source, pk_cols, &check.schema, nw, |worker_indices| {
+                            with_worker_indices(source, &check.schema, nw, |worker_indices| {
                                 disp.sal.scatter_wire_group(
                                     source,
                                     worker_indices,
@@ -1562,10 +1561,9 @@ impl MasterDispatcher {
         // `_lease` held across the full drain below (see `dispatch_scan_fanout`).
         let (slots, req_ids, _lease) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, -1, |disp, rids, unicast| {
             let nw = disp.num_workers;
-            let pk_cols = parent_schema.pk_indices();
             let pooled = disp.pool_pop_batch(target_id);
             let batch = build_check_batch_pkbuf(&parent_schema, &pks, pooled);
-            with_worker_indices(&batch, pk_cols, &parent_schema, nw, |worker_indices| {
+            with_worker_indices(&batch, &parent_schema, nw, |worker_indices| {
                 disp.sal.scatter_wire_group(
                     &batch,
                     worker_indices,

@@ -47,10 +47,7 @@ pub(crate) enum Instr {
         out_reg: u16,
         func_idx: u16,
         out_schema_idx: u16,
-        reindex_off: u32,
-        reindex_cnt: u16,
-        reindex_hash: bool,
-        branch_id: u8,
+        reindex: ReindexOperand,
     },
     Negate {
         in_reg: u16,
@@ -97,7 +94,6 @@ pub(crate) enum Instr {
     NullExtend {
         in_reg: u16,
         out_reg: u16,
-        right_schema_idx: u16,
     },
     Integrate {
         in_reg: u16,
@@ -110,28 +106,28 @@ pub(crate) enum Instr {
         trace_out_reg: u16,
         out_reg: u16,
         fin_out_reg: Option<u16>,
-        agg_descs_offset: u32,
-        agg_descs_count: u16,
-        group_cols_offset: u32,
-        group_cols_count: u16,
-        output_schema_idx: u16,
-        // The compile-validated output-key kind (see `ReduceOutKey`); baked at
-        // emit time like `global_ground`/`i_am_owner` so the runtime never
-        // re-derives it from the schema.
-        out_key: gnitz_wire::ReduceOutKey,
+        /// Index into `Program::reduce_plans` — the baked `ops::ReducePlan`
+        /// carrying the schemas, group columns, aggregate descriptors, and every
+        /// derived gate (linearity, key kind, emission roles, ground flags).
+        plan_idx: u16,
         // The combined AVI cursor is created fresh from its table each tick;
         // `None` means the operator has no value index (all-linear or fallback).
         avi_table_idx: Option<u16>,
         /// Post-reduce finalize MAP; `None` when the reduce emits its raw
         /// output directly.
         finalize: Option<FinalizeIdx>,
-        // Global-aggregate ground machinery (see `op_reduce`). `global_ground` is
-        // the planner's SQL-intent discriminator; `i_am_owner` is baked per-worker
-        // at emit time (`replicated || worker_rank() == owner(V₀)`). Both default
-        // off for every grouped reduce.
-        global_ground: bool,
-        i_am_owner: bool,
     },
+}
+
+/// Stored form of [`crate::ops::ReindexSpec`] — the `Instr::Map` PK-restamp
+/// operand. `Pack` keeps a side-table range into `Program::reindex_cols` /
+/// `reindex_target_tcs` (no inline Vecs); the exec dispatch resolves it to the
+/// borrowed ops enum.
+#[derive(Clone, Copy)]
+pub(crate) enum ReindexOperand {
+    None,
+    HashRow { branch_id: u8 },
+    Pack { off: u32, cnt: u16 },
 }
 
 /// True iff `instr` reads the batch of register `r`. The instruction set's own
@@ -334,6 +330,8 @@ pub(crate) struct Program {
     /// Parallel to `reindex_cols` (same offsets): per-column carried promotion
     /// target tc (`0` = derive from source).
     pub reindex_target_tcs: Vec<u8>,
+    /// Baked per-`Instr::Reduce` plans (see `ops::ReducePlan`).
+    pub reduce_plans: Vec<crate::ops::ReducePlan>,
 }
 
 // SAFETY: Program is only accessed from a single thread (the worker thread
@@ -485,28 +483,29 @@ mod tests {
         out_reg: u16,
         aggs: &[AggDescriptor],
         gcols: &[u32],
+        in_schema: SchemaDescriptor,
         out_schema: SchemaDescriptor,
         out_key: gnitz_wire::ReduceOutKey,
     ) {
-        let (agg_descs_offset, agg_descs_count) = b.add_agg_descs(aggs);
-        let (group_cols_offset, group_cols_count) = b.add_group_cols(gcols);
-        let output_schema_idx = b.schema_idx(out_schema);
+        let plan_idx = b.add_reduce_plan(crate::ops::ReducePlan::new(
+            &in_schema,
+            &out_schema,
+            gcols,
+            aggs,
+            out_key,
+            false,
+            false,
+            false,
+        ));
         b.push(Instr::Reduce {
             in_reg,
             trace_in_reg,
             trace_out_reg,
             out_reg,
             fin_out_reg: None,
-            agg_descs_offset,
-            agg_descs_count,
-            group_cols_offset,
-            group_cols_count,
-            output_schema_idx,
-            out_key,
+            plan_idx,
             avi_table_idx: None,
             finalize: None,
-            global_ground: false,
-            i_am_owner: false,
         });
     }
 
@@ -822,10 +821,7 @@ mod tests {
             out_reg: 1,
             func_idx,
             out_schema_idx,
-            reindex_off: 0,
-            reindex_cnt: 0,
-            reindex_hash: false,
-            branch_id: 0,
+            reindex: ReindexOperand::None,
         });
         builder.push(Instr::Halt);
 
@@ -1175,13 +1171,11 @@ mod tests {
                 col_idx: 2,
                 agg_op: AggOp::Sum,
                 col_type_code: TypeCode::I64,
-                _pad: [0; 2],
             },
             AggDescriptor {
                 col_idx: 0,
                 agg_op: AggOp::Count,
                 col_type_code: TypeCode::I64,
-                _pad: [0; 2],
             },
         ];
         let group_cols = [1u32]; // schema col 1 = payload col 0 (group key)
@@ -1202,6 +1196,7 @@ mod tests {
             2,
             &agg_descs,
             &group_cols,
+            in_schema,
             out_schema,
             in_schema.reduce_out_key(&group_cols),
         );
@@ -1285,7 +1280,6 @@ mod tests {
             col_idx: 2,
             agg_op: AggOp::Min,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         }];
         let group_cols = [1u32];
 
@@ -1298,6 +1292,7 @@ mod tests {
             2,
             &agg_descs,
             &group_cols,
+            in_schema,
             out_schema,
             in_schema.reduce_out_key(&group_cols),
         );
@@ -1332,7 +1327,6 @@ mod tests {
             col_idx: 2,
             agg_op: AggOp::Sum,
             col_type_code: TypeCode::I64,
-            _pad: [0; 2],
         }];
         let group_cols = [1u32];
 
@@ -1345,6 +1339,7 @@ mod tests {
             2,
             &agg_descs,
             &group_cols,
+            in_schema,
             out_schema,
             in_schema.reduce_out_key(&group_cols),
         );
@@ -1525,13 +1520,11 @@ mod tests {
                 col_idx: 1, // schema col index for the val column
                 agg_op: AggOp::Count,
                 col_type_code: TypeCode::I64,
-                _pad: [0; 2],
             },
             AggDescriptor {
                 col_idx: 1, // schema col index for the val column
                 agg_op: AggOp::Sum,
                 col_type_code: TypeCode::I64,
-                _pad: [0; 2],
             },
         ];
         // GROUP BY col 0 (= pk, schema col index 0)
@@ -1548,6 +1541,7 @@ mod tests {
             2,
             &agg_descs,
             &group_cols,
+            in_schema,
             out_schema,
             in_schema.reduce_out_key(&group_cols),
         );
@@ -1638,13 +1632,11 @@ mod tests {
                 col_idx: 1,
                 agg_op: AggOp::Sum,
                 col_type_code: TypeCode::I64,
-                _pad: [0; 2],
             },
             AggDescriptor {
                 col_idx: 0,
                 agg_op: AggOp::Count,
                 col_type_code: TypeCode::I64,
-                _pad: [0; 2],
             },
         ];
         // GROUP BY col 0 (pk)
@@ -1659,6 +1651,7 @@ mod tests {
             3,
             &agg_descs,
             &group_cols,
+            in_schema,
             out_schema,
             in_schema.reduce_out_key(&group_cols),
         );

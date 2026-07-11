@@ -116,6 +116,60 @@ pub(crate) fn german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
     gs
 }
 
+/// The canonical narrow test schema: U64 pk + a single I64 payload column.
+pub(crate) fn make_schema_u64_i64() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    )
+}
+
+/// Build a batch over [`make_schema_u64_i64`]-shaped schemas from native
+/// `(pk, weight, payload)` tuples and certify it `Consolidated`. **Rows must
+/// arrive pre-sorted by (PK, payload) with no net-zero duplicates** — the
+/// certification is a claim the caller makes, and `certify_layout` only
+/// debug-verifies it; a lying claim would let a consumer skip-point silently
+/// mis-fold weights.
+pub(crate) fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
+    let mut b = Batch::with_schema(*schema, rows.len().max(1));
+    for &(pk, w, val) in rows {
+        b.extend_pk(pk as u128);
+        b.extend_weight(&w.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &val.to_le_bytes());
+        b.count += 1;
+    }
+    b.certify_layout(Layout::Consolidated, schema);
+    b
+}
+
+/// Decode a single signed I64 PK column from its OPK (big-endian, sign-flipped)
+/// bytes back to the native value — the inverse of `extend_pk_opk` for an I64 PK.
+pub(crate) fn opk_pk_i64(opk_bytes: &[u8]) -> i64 {
+    let mut le = [0u8; 8];
+    gnitz_wire::decode_pk_column(&opk_bytes[..8], type_code::I64, &mut le);
+    i64::from_le_bytes(le)
+}
+
+/// Read a German-string payload cell (16-byte struct at payload `col`, `row`)
+/// back to its content bytes — the test-side readback inverse of
+/// [`german_string`]. Short (≤12 byte) values live inline in the struct, long
+/// ones in the blob heap.
+pub(crate) fn read_german_string(batch: &Batch, col: usize, row: usize) -> Vec<u8> {
+    let off = row * 16;
+    let gs = &batch.col_data(col)[off..off + 16];
+    let length = u32::from_le_bytes(gs[0..4].try_into().unwrap()) as usize;
+    if length <= crate::schema::SHORT_STRING_THRESHOLD {
+        gs[4..4 + length].to_vec()
+    } else {
+        let blob_off = u64::from_le_bytes(gs[8..16].try_into().unwrap()) as usize;
+        batch.blob[blob_off..blob_off + length].to_vec()
+    }
+}
+
 /// I64 pk + I64 payload schema — the signed-PK exercise of the order-preserving
 /// key (negatives sort before positives only because the encoder sign-flips).
 pub(crate) fn make_schema_i64pk_i64() -> SchemaDescriptor {

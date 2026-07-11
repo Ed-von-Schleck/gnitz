@@ -15,6 +15,10 @@ use super::rowwrite::write_join_row;
 
 /// Join delta rows against trace. Output schema: [left_PK, left_payload..., right_payload...].
 ///
+/// `out_schema` is the compiler-built merged register schema (`reg_meta`) — the
+/// single home for the output shape; its PK region mirrors the left input's and
+/// its payload is left-then-right, asserted below.
+///
 /// `cogroup_intersection` on the join key: the match (trace) side is forward-only,
 /// so each trace group is walked once and producted against the whole
 /// (random-access) delta group `[i, j)` — trace-major emission. Galloping skips
@@ -25,16 +29,27 @@ pub fn op_join_delta_trace(
     cursor: &mut ReadCursor,
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
+    out_schema: &SchemaDescriptor,
 ) -> Batch {
+    debug_assert_eq!(
+        out_schema.pk_stride(),
+        left_schema.pk_stride(),
+        "join output PK region must mirror the left input's",
+    );
+    debug_assert_eq!(
+        out_schema.num_payload_cols(),
+        left_schema.num_payload_cols() + right_schema.num_payload_cols(),
+        "join output payload must be left-then-right",
+    );
     let cs = Batch::consolidate_if_needed(delta, left_schema);
     let consolidated: &Batch = cs.as_ref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
-        return Batch::empty_joined(left_schema, right_schema);
+        return Batch::empty_with_schema(out_schema);
     }
 
     let delta_mb = consolidated.as_mem_batch();
-    let mut output = Batch::empty_joined(left_schema, right_schema);
+    let mut output = Batch::empty_with_schema(out_schema);
 
     cogroup_intersection(consolidated, cursor, |key, range, m| {
         m.for_each_pk_group_row(key, |c| {
@@ -49,8 +64,8 @@ pub fn op_join_delta_trace(
     });
 
     // Trace-major cartesian emission is PK-sorted but NOT (PK, payload)-sorted
-    // (left payloads interleave across trace entries) and is unfolded; `empty_joined`
-    // leaves both flags clear, downstream re-sorts and consolidates.
+    // (left payloads interleave across trace entries) and is unfolded; the empty
+    // constructor leaves both flags clear, downstream re-sorts and consolidates.
     output
 }
 
@@ -83,7 +98,13 @@ mod tests {
         // Delta (left): keys 1 and 2.
         let delta = make_i32_batch(&left_schema, &[(1, 1, 10), (2, 1, 20)]);
 
-        let out = op_join_delta_trace(&delta, &mut ch, &left_schema, &right_schema);
+        let out = op_join_delta_trace(
+            &delta,
+            &mut ch,
+            &left_schema,
+            &right_schema,
+            &join_out_schema(&left_schema, &right_schema),
+        );
         assert_eq!(out.count, 2, "both I32 keys must join (smallest key not dropped)");
         assert_eq!(out.get_pk(0) as i32, 1);
         assert_eq!(out.get_pk(1) as i32, 2);
@@ -104,7 +125,7 @@ mod tests {
         // Delta: PK=1 with three left payloads.
         let delta = make_batch(&schema, &[(1, 1, 10), (1, 1, 20), (1, 1, 30)]);
 
-        let out = op_join_delta_trace(&delta, &mut ch, &schema, &schema);
+        let out = op_join_delta_trace(&delta, &mut ch, &schema, &schema, &join_out_schema(&schema, &schema));
         assert_eq!(out.count, 6, "3 left × 2 right = 6 join outputs");
 
         // col 0 = left payload, col 1 = right payload (all PKs equal). The sorted
@@ -150,7 +171,7 @@ mod tests {
         delta.count += 1;
         delta.certify_layout(Layout::Sorted, &schema);
 
-        let out = op_join_delta_trace(&delta, &mut ch, &schema, &schema);
+        let out = op_join_delta_trace(&delta, &mut ch, &schema, &schema, &join_out_schema(&schema, &schema));
         // 2 delta rows × 1 trace row = 2 output rows
         assert_eq!(out.count, 2, "multiset delta: expected 2 join outputs");
         assert_eq!(out.get_weight(0), 1);
@@ -183,7 +204,7 @@ mod tests {
             ],
         );
 
-        let out = op_join_delta_trace(&delta, &mut ch, &schema, &schema);
+        let out = op_join_delta_trace(&delta, &mut ch, &schema, &schema, &join_out_schema(&schema, &schema));
         // Only Row A matches (delta row 0 × trace row 0). Row B has no trace entry.
         assert_eq!(out.count, 1, "prefix-collision: only matching PK should produce output");
         assert_eq!(out.get_pk_bytes(0), wide_pk_bytes(&schema, 1, 1, 2).as_slice());

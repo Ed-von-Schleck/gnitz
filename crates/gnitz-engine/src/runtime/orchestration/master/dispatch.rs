@@ -1296,7 +1296,6 @@ impl MasterDispatcher {
     ) -> Result<(), String> {
         let (schema, schema_block, wire_safe, wire_row_stride) = self.cached_schema_block(target_id);
         let nw = self.num_workers;
-        let pk_col = schema.pk_indices();
         let wire_flags = wire_flags_set_conflict_mode(0, mode);
         // Identical scatter for both routings; only the per-worker index fill
         // differs (full broadcast vs PK-partitioned). One `scatter_wire_group`
@@ -1327,7 +1326,7 @@ impl MasterDispatcher {
             // uniqueness against its identical full copy.
             with_broadcast_indices(batch, nw, scatter)
         } else {
-            with_worker_indices(batch, pk_col, &schema, nw, scatter)
+            with_worker_indices(batch, &schema, nw, scatter)
         }
     }
 

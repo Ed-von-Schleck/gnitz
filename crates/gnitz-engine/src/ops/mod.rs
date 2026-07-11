@@ -24,7 +24,7 @@ pub(crate) use index::{op_integrate_with_indexes, AviDesc};
 // (compiler, master) reach `crate::ops::X`, not the internals.
 pub(crate) use index::make_avi_schema;
 pub(crate) use join::{op_join_delta_trace, op_join_delta_trace_range};
-pub(crate) use linear::{op_filter, op_map, op_negate, op_null_extend, op_union};
-pub(crate) use reduce::{op_reduce, AggDescriptor, AggOp};
+pub(crate) use linear::{op_filter, op_map, op_negate, op_null_extend, op_union, ReindexSpec};
+pub(crate) use reduce::{op_reduce, AggDescriptor, AggOp, ReducePlan};
 pub(crate) use scan::op_scan_trace;
 pub(crate) use util::{all_payload_null_mask, global_group_key, AVI_AV_BYTES};

@@ -34,14 +34,25 @@ pub fn op_join_delta_trace_range(
     cursor: &mut ReadCursor,
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
+    out_schema: &SchemaDescriptor,
     n_eq: usize,
     rel: RangeRel,
 ) -> Batch {
+    debug_assert_eq!(
+        out_schema.pk_stride(),
+        left_schema.pk_stride(),
+        "range join output PK region must mirror the left input's",
+    );
+    debug_assert_eq!(
+        out_schema.num_payload_cols(),
+        left_schema.num_payload_cols() + right_schema.num_payload_cols(),
+        "range join output payload must be left-then-right",
+    );
     let cs = Batch::consolidate_if_needed(delta, left_schema);
     let consolidated: &Batch = cs.as_ref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
-        return Batch::empty_joined(left_schema, right_schema);
+        return Batch::empty_with_schema(out_schema);
     }
 
     // Trace PK = [eq slots…, range slot]. Both sides pack at the same common type,
@@ -64,9 +75,9 @@ pub fn op_join_delta_trace_range(
     cursor.rewind();
     let trace_len = cursor.estimated_length();
     if n > trace_len {
-        range_merge_walk(consolidated, cursor, left_schema, right_schema, n_eq, rel)
+        range_merge_walk(consolidated, cursor, left_schema, right_schema, out_schema, n_eq, rel)
     } else {
-        range_per_row_seek(consolidated, cursor, left_schema, right_schema, n_eq, rel)
+        range_per_row_seek(consolidated, cursor, left_schema, right_schema, out_schema, n_eq, rel)
     }
 }
 
@@ -81,6 +92,7 @@ fn range_per_row_seek(
     cursor: &mut ReadCursor,
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
+    out_schema: &SchemaDescriptor,
     n_eq: usize,
     rel: RangeRel,
 ) -> Batch {
@@ -88,7 +100,7 @@ fn range_per_row_seek(
     let n = consolidated.count;
 
     let delta_mb = consolidated.as_mem_batch();
-    let mut output = Batch::empty_joined(left_schema, right_schema);
+    let mut output = Batch::empty_with_schema(out_schema);
 
     for i in 0..n {
         let pk_i = consolidated.get_pk_bytes(i);
@@ -118,9 +130,9 @@ fn range_per_row_seek(
     }
 
     // Probe order is delta-major with arbitrary trace payload runs per row — not
-    // (PK, payload)-sorted, and the cartesian emission is unfolded. `empty_joined`
-    // leaves both flags clear so no consumer trusts it as either; the re-key +
-    // output exchange + consolidation downstream restore order.
+    // (PK, payload)-sorted, and the cartesian emission is unfolded. The empty
+    // constructor leaves both flags clear so no consumer trusts it as either; the
+    // re-key + output exchange + consolidation downstream restore order.
     output
 }
 
@@ -138,6 +150,7 @@ fn range_merge_walk(
     cursor: &mut ReadCursor,
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
+    out_schema: &SchemaDescriptor,
     n_eq: usize,
     rel: RangeRel,
 ) -> Batch {
@@ -145,7 +158,7 @@ fn range_merge_walk(
     // `MemBatch::get_pk_bytes` returns `&'a` tied to the batch data (not a `&self`
     // borrow), so `e` is held freely across grouping while `delta_mb` is read again.
     let delta_mb = consolidated.as_mem_batch();
-    let mut output = Batch::empty_joined(left_schema, right_schema);
+    let mut output = Batch::empty_with_schema(out_schema);
     let m = consolidated.count;
 
     let mut lo = 0; // start of the current delta eq group
@@ -225,8 +238,8 @@ fn range_merge_walk(
     }
 
     // Trace-major with delta runs per trace row — not (PK, payload)-sorted and
-    // unfolded; `empty_joined` leaves both flags clear, downstream re-sorts and
-    // consolidates.
+    // unfolded; the empty constructor leaves both flags clear, downstream
+    // re-sorts and consolidates.
     output
 }
 
@@ -271,7 +284,15 @@ mod tests {
         for (rel, want) in cases {
             let mut ch = trace_cursor(make_batch(&schema, &[(10, 1, 110), (20, 1, 120), (30, 1, 130)]), schema);
             let delta = make_batch(&schema, &[(20, 1, 200)]);
-            let out = op_join_delta_trace_range(&delta, &mut ch, &schema, &schema, 0, rel);
+            let out = op_join_delta_trace_range(
+                &delta,
+                &mut ch,
+                &schema,
+                &schema,
+                &join_out_schema(&schema, &schema),
+                0,
+                rel,
+            );
             let got: Vec<i64> = range_out_pairs(&out).into_iter().map(|(p, _)| p).collect();
             assert_eq!(got, want, "rel {rel:?}");
             // The left PK (delta range key x) and left payload survive on every row.
@@ -294,7 +315,15 @@ mod tests {
         let mut ch = trace_cursor(trace, schema);
         let delta = make_band_batch(&schema, &[(1, 15, 1, 200)]);
         // rel Lt: {y < 15 within k=1} = {10}. k=2,y=5 excluded by the group edge.
-        let out = op_join_delta_trace_range(&delta, &mut ch, &schema, &schema, 1, RangeRel::Lt);
+        let out = op_join_delta_trace_range(
+            &delta,
+            &mut ch,
+            &schema,
+            &schema,
+            &join_out_schema(&schema, &schema),
+            1,
+            RangeRel::Lt,
+        );
         let got: Vec<i64> = range_out_pairs(&out).into_iter().map(|(p, _)| p).collect();
         assert_eq!(got, vec![110]);
     }
@@ -309,7 +338,15 @@ mod tests {
         let mut ch = trace_cursor(trace, schema);
         let delta = make_band_batch(&schema, &[(1, u64::MAX, 1, 9)]);
         // y <= u64::MAX within k=1 → both k=1 rows; k=2 excluded.
-        let out = op_join_delta_trace_range(&delta, &mut ch, &schema, &schema, 1, RangeRel::Le);
+        let out = op_join_delta_trace_range(
+            &delta,
+            &mut ch,
+            &schema,
+            &schema,
+            &join_out_schema(&schema, &schema),
+            1,
+            RangeRel::Le,
+        );
         let mut got: Vec<i64> = range_out_pairs(&out).into_iter().map(|(p, _)| p).collect();
         got.sort_unstable();
         assert_eq!(got, vec![100, 199]);
@@ -325,7 +362,15 @@ mod tests {
         // Two delta rows in ascending (PK) order (10, 30). Processing 30 after 10
         // forces a backward seek to 0x00 for the second probe.
         let delta = make_batch(&schema, &[(10, 1, 100), (30, 1, 300)]);
-        let out = op_join_delta_trace_range(&delta, &mut ch, &schema, &schema, 0, RangeRel::Lt);
+        let out = op_join_delta_trace_range(
+            &delta,
+            &mut ch,
+            &schema,
+            &schema,
+            &join_out_schema(&schema, &schema),
+            0,
+            RangeRel::Lt,
+        );
         // x=10 → {y<10}={105}; x=30 → {y<30}={105,115,125}. 4 rows total.
         let mut pairs: Vec<(u64, i64)> = (0..out.count)
             .map(|r| (out.get_pk(r) as u64, read_i64_le(out.col_data(1), r * 8)))
@@ -348,8 +393,24 @@ mod tests {
             make_signed_batch(&schema, &[(-100, 1, 1), (0, 1, 2), (50, 1, 3)]),
             schema,
         );
-        let out_gt = op_join_delta_trace_range(&delta, &mut ch, &schema, &schema, 0, RangeRel::Gt);
-        let out_lt = op_join_delta_trace_range(&delta, &mut ch2, &schema, &schema, 0, RangeRel::Lt);
+        let out_gt = op_join_delta_trace_range(
+            &delta,
+            &mut ch,
+            &schema,
+            &schema,
+            &join_out_schema(&schema, &schema),
+            0,
+            RangeRel::Gt,
+        );
+        let out_lt = op_join_delta_trace_range(
+            &delta,
+            &mut ch2,
+            &schema,
+            &schema,
+            &join_out_schema(&schema, &schema),
+            0,
+            RangeRel::Lt,
+        );
         assert_eq!(
             range_out_pairs(&out_gt).into_iter().map(|(p, _)| p).collect::<Vec<_>>(),
             vec![3]
@@ -379,7 +440,15 @@ mod tests {
         // Delta retraction: x=40, w=-1, so all matches negate.
         let delta = make_batch(&schema, &[(40, -1, 400)]);
         // rel Lt: {y < 40} = all three, but y=20's product is -1*0 = 0 (skipped).
-        let out = op_join_delta_trace_range(&delta, &mut ch, &schema, &schema, 0, RangeRel::Lt);
+        let out = op_join_delta_trace_range(
+            &delta,
+            &mut ch,
+            &schema,
+            &schema,
+            &join_out_schema(&schema, &schema),
+            0,
+            RangeRel::Lt,
+        );
         let mut got = range_out_pairs(&out);
         got.sort_unstable();
         // y=10: -1*2 = -2; y=30: -1*1 = -1; y=20 skipped.
@@ -393,7 +462,15 @@ mod tests {
         let schema = make_schema_u64_i64();
         let mut ch = trace_cursor(make_batch(&schema, &[(10, 1, 110)]), schema);
         let delta = make_batch(&schema, &[(u64::MAX, 1, 1)]);
-        let out = op_join_delta_trace_range(&delta, &mut ch, &schema, &schema, 0, RangeRel::Gt);
+        let out = op_join_delta_trace_range(
+            &delta,
+            &mut ch,
+            &schema,
+            &schema,
+            &join_out_schema(&schema, &schema),
+            0,
+            RangeRel::Gt,
+        );
         assert_eq!(out.count, 0);
     }
 
@@ -403,7 +480,15 @@ mod tests {
         let schema = make_schema_u64_i64();
         let mut ch = trace_cursor(make_batch(&schema, &[(10, 1, 110)]), schema);
         let delta = make_batch(&schema, &[]);
-        let out = op_join_delta_trace_range(&delta, &mut ch, &schema, &schema, 0, RangeRel::Le);
+        let out = op_join_delta_trace_range(
+            &delta,
+            &mut ch,
+            &schema,
+            &schema,
+            &join_out_schema(&schema, &schema),
+            0,
+            RangeRel::Le,
+        );
         assert_eq!(out.count, 0);
     }
 
@@ -562,7 +647,15 @@ mod tests {
         let delta = make_batch(&schema, &[(10, 1, 1), (20, 1, 2)]);
         // Through the public selector: n=2 > trace_len=0 → merge path, empty out.
         let mut ch = trace_cursor(make_batch(&schema, &[]), schema);
-        let out = op_join_delta_trace_range(&delta, &mut ch, &schema, &schema, 0, RangeRel::Le);
+        let out = op_join_delta_trace_range(
+            &delta,
+            &mut ch,
+            &schema,
+            &schema,
+            &join_out_schema(&schema, &schema),
+            0,
+            RangeRel::Le,
+        );
         assert_eq!(out.count, 0);
     }
 
@@ -604,10 +697,26 @@ mod tests {
             let delta = make_batch(&schema, &delta_rows);
             // Oracle: force the per-row path directly.
             let mut ch_oracle = trace_cursor(make_batch(&schema, &trace_rows), schema);
-            let oracle = range_per_row_seek(&delta, &mut ch_oracle, &schema, &schema, 0, RangeRel::Lt);
+            let oracle = range_per_row_seek(
+                &delta,
+                &mut ch_oracle,
+                &schema,
+                &schema,
+                &join_out_schema(&schema, &schema),
+                0,
+                RangeRel::Lt,
+            );
             // Subject: the public selector.
             let mut ch = trace_cursor(make_batch(&schema, &trace_rows), schema);
-            let out = op_join_delta_trace_range(&delta, &mut ch, &schema, &schema, 0, RangeRel::Lt);
+            let out = op_join_delta_trace_range(
+                &delta,
+                &mut ch,
+                &schema,
+                &schema,
+                &join_out_schema(&schema, &schema),
+                0,
+                RangeRel::Lt,
+            );
             assert_eq!(range_multiset(&oracle), range_multiset(&out));
         }
     }
@@ -747,9 +856,25 @@ mod tests {
         trace: Batch,
     ) -> usize {
         let mut ch = trace_cursor(trace, schema);
-        let oracle = range_per_row_seek(delta, &mut ch, &schema, &schema, n_eq, rel);
+        let oracle = range_per_row_seek(
+            delta,
+            &mut ch,
+            &schema,
+            &schema,
+            &join_out_schema(&schema, &schema),
+            n_eq,
+            rel,
+        );
         ch.rewind();
-        let merged = range_merge_walk(delta, &mut ch, &schema, &schema, n_eq, rel);
+        let merged = range_merge_walk(
+            delta,
+            &mut ch,
+            &schema,
+            &schema,
+            &join_out_schema(&schema, &schema),
+            n_eq,
+            rel,
+        );
         // The merge emits trace-major with delta runs — unsorted and unfolded — so
         // it leaves the layout tag clear for the downstream re-sort. Assert on the
         // tag, not `is_sorted()`: an empty merge has no rows and so is structurally

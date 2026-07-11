@@ -1,17 +1,13 @@
 //! Incremental REDUCE operator: δ_out = Agg(history + δ_in) − Agg(history).
 
-use crate::schema::{ReduceOutKey, SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL};
+use crate::schema::SchemaDescriptor;
 use crate::storage::{pk_bytes_eq, scatter_copy, Batch, DrainGuard, MemBatch, ReadCursor};
 
-use super::super::util::{
-    cmp_col_window, extract_group_key, extract_group_key_cursor, global_group_key, single_col_canonical_group_key,
-    GroupKeyExtractor,
-};
-use super::agg::{
-    apply_agg_from_value_index, fold_old_aggs, read_old_minmax_encoded, Accumulator, AggDescriptor, AggOp,
-};
+use super::super::util::{extract_group_key, extract_group_key_cursor, global_group_key, GroupKeyExtractor};
+use super::agg::{apply_agg_from_value_index, fold_old_aggs, read_old_minmax_encoded, Accumulator, AggOp};
 use super::emit::{emit_global_ground, emit_reduce_row};
-use super::sort::{argsort_delta, argsort_pk_canonical, build_sort_descs, compare_by_group_cols, SortDesc};
+use super::plan::ReducePlan;
+use super::sort::{argsort_delta, argsort_pk_canonical, compare_by_group_cols, SortDesc};
 
 /// The finalize output is exactly `map(raw_output)`: one row per raw row, in the
 /// same order, PK and weight verbatim. Every raw row — the `-1` retraction copied
@@ -79,104 +75,108 @@ fn fill_cleared_batch(
     // non-linear MIN/MAX aggregates).
 }
 
+/// Walk one group's delta rows — visit positions `start..` in group-visit
+/// order, mapped to batch rows by `row_of` — stepping the linear (and, on the
+/// AVI pre-step path, MIN/MAX) accumulators. Returns the first position past
+/// the group and whether any row's weight was ≤ 0. Generic over the row mapper
+/// so the pre-sorted natural-PK path instantiates a direct positional walk
+/// (no per-row indirection or `Option` branch) while the argsort paths keep
+/// their indexed walk — byte-identical bodies, dispatched once per group.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn walk_group_rows(
+    row_of: impl Fn(usize) -> usize,
+    mb: &MemBatch,
+    n: usize,
+    start: usize,
+    group_start_idx: usize,
+    group_pk_bytes: &[u8],
+    group_by_pk: bool,
+    group_descs: &[SortDesc],
+    track_nonlinear: bool,
+    accs: &mut [Accumulator],
+) -> (usize, bool) {
+    // Per group: has any consolidated delta row weight ≤ 0? A retraction is
+    // the only thing that can make a MIN/MAX extreme recede, so an all-insert
+    // group can skip the AVI probe and fold `combine(old, pos)` instead.
+    let mut saw_negative = false;
+    let mut idx = start;
+    while idx < n {
+        let curr_idx = row_of(idx);
+        if group_by_pk {
+            // Full PK byte-window compare: exact at every width, unlike the
+            // lossy u128 get_pk for pk_stride > 16.
+            if !pk_bytes_eq(mb.get_pk_bytes(curr_idx), group_pk_bytes) {
+                break;
+            }
+        } else if compare_by_group_cols(mb, curr_idx, mb, group_start_idx, group_descs) != std::cmp::Ordering::Equal {
+            break;
+        }
+
+        let w = mb.get_weight(curr_idx);
+        if w <= 0 {
+            saw_negative = true;
+        }
+        // Pre-step the delta's inserts into the MIN/MAX accumulators so each
+        // holds `pos` (the extreme over the group's positive-weight, non-NULL
+        // delta rows) for the skip path; the probe path overwrites it. Gated
+        // once per row (independent of which accumulator): only on the AVI
+        // path, only for positive rows, only while the group stays all-insert
+        // and under the pre-step cap — beyond it the group force-probes and the
+        // partial `pos` is discarded. A mixed-in float MIN/MAX pre-stepped here
+        // is likewise discarded by its unconditional probe below.
+        let prestep_nonlinear = track_nonlinear && w > 0 && !saw_negative && (idx - start) < SKIP_TRACK_CAP;
+        for acc in accs.iter_mut() {
+            if acc.is_linear() || prestep_nonlinear {
+                acc.step_from_batch(mb, curr_idx, w);
+            }
+        }
+        idx += 1;
+    }
+    (idx, saw_negative)
+}
+
 /// Check if a cursor's current row matches the group columns of an exemplar row.
+/// Group membership is an equality test, but byte-equality and typed equality
+/// coincide for every fixed-width type (and BLOB/STRING compare by content), so
+/// the shared group comparator is exactly right here.
 pub(super) fn cursor_matches_group(
     cursor: &ReadCursor,
     exemplar_mb: &MemBatch,
     exemplar_row: usize,
     descs: &[SortDesc],
 ) -> bool {
-    let cursor_null_word = cursor.current_null_word;
-    let exemplar_null_word = exemplar_mb.get_null_word(exemplar_row);
-
-    // Hoisted once: the cursor's blob arena backs any German-string group column.
-    let cursor_blob_slice: &[u8] = cursor.blob_slice();
-
-    for desc in descs {
-        if desc.pi == PAYLOAD_MAPPING_PK_SENTINEL {
-            // Raw byte equality suffices here (no order, no signed
-            // dispatch): rows with identical bytes at this PK-column window
-            // are equal regardless of type.
-            let off = desc.pk_off as usize;
-            let cs = desc.cs as usize;
-            let cursor_bytes = &cursor.current_pk_bytes()[off..off + cs];
-            let exemplar_bytes = &exemplar_mb.get_pk_bytes(exemplar_row)[off..off + cs];
-            if cursor_bytes != exemplar_bytes {
-                return false;
-            }
-            continue;
-        }
-
-        let pi = desc.pi as usize;
-        let cs = desc.cs as usize;
-
-        let cursor_is_null = (cursor_null_word >> pi) & 1 != 0;
-        let exemplar_is_null = (exemplar_null_word >> pi) & 1 != 0;
-        if cursor_is_null != exemplar_is_null {
-            return false;
-        }
-        if cursor_is_null {
-            continue;
-        }
-
-        let Some(cursor_bytes) = cursor.col_bytes(desc.c_idx as usize, cs) else {
-            return false;
-        };
-        let exemplar_bytes = exemplar_mb.get_col_ptr(exemplar_row, pi, cs);
-
-        // Group membership is an equality test, but byte-equality and typed
-        // equality coincide for every fixed-width type (and BLOB/STRING must
-        // compare by content), so the shared comparator is exactly right here.
-        if cmp_col_window(
-            cursor_bytes,
-            cursor_blob_slice,
-            exemplar_bytes,
-            exemplar_mb.blob,
-            desc.tc,
-        ) != std::cmp::Ordering::Equal
-        {
-            return false;
-        }
-    }
-    true
+    let (src, row) = cursor.current_row_source();
+    compare_by_group_cols(src, row, exemplar_mb, exemplar_row, descs) == std::cmp::Ordering::Equal
 }
 
 /// Incremental DBSP REDUCE: δ_out = Agg(history + δ_in) - Agg(history).
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+///
+/// Everything that is a pure function of compile-time facts — schemas, group
+/// columns, aggregate descriptors, linearity, key kind, the emission role
+/// table, the global-ground flags — arrives baked in `plan` (one construction
+/// site, `ReducePlan::new`).
 pub fn op_reduce(
     delta: &Batch,
     trace_in_cursor: Option<&mut ReadCursor>,
     trace_out_cursor: &mut ReadCursor,
-    input_schema: &SchemaDescriptor,
-    output_schema: &SchemaDescriptor,
-    group_by_cols: &[u32],
-    agg_descs: &[AggDescriptor],
-    // How the output is keyed. Compile-validated against the input schema
-    // (`emit_reduce`) and baked into the instruction, so the runtime obeys it
-    // rather than re-deriving it from the schema; `output_schema` was built
-    // from the same kind.
-    out_key: ReduceOutKey,
     // The one combined-index cursor — keyed `group_cols ‖ ordinal ‖ av_encoded`,
     // serving every MIN/MAX aggregate. `None` for all-linear reduces and the
-    // single-scan fallback. `for_max`/type per aggregate come from `agg_descs`.
+    // single-scan fallback. `for_max`/type per aggregate come from the plan's
+    // `agg_descs`.
     avi_cursor: Option<&mut ReadCursor>,
+    plan: &ReducePlan,
     // Post-reduce finalize (AVG, nullable-SUM, …): a plain columnar MAP over the
     // raw reduce output, applied once per emitted batch by `finalize_map`.
     finalize_func: Option<&crate::expr::ScalarFunc>,
     finalize_out_schema: Option<&SchemaDescriptor>,
-    // Global-aggregate ground machinery. `global_ground` is the planner's
-    // SQL-intent discriminator (true only for the user's ungrouped scalar
-    // aggregate); `i_am_owner` is the per-worker fact that this worker owns
-    // partition `partition_for_key(V₀)` (always true for a replicated reduce).
-    // Both false for every grouped reduce, which is then byte-for-byte unchanged.
-    global_ground: bool,
-    i_am_owner: bool,
 ) -> (Batch, Option<Batch>) {
-    let num_aggs = agg_descs.len();
-    let num_out_cols = output_schema.num_columns();
-
-    // Linearity check
-    let all_linear = agg_descs.iter().all(|d| d.agg_op.is_linear());
+    let input_schema = &plan.input_schema;
+    let output_schema = &plan.output_schema;
+    let group_by_cols = &plan.group_by_cols[..];
+    let agg_descs = &plan.agg_descs[..];
+    let all_linear = plan.all_linear;
+    let global_ground = plan.global_ground;
 
     // Consolidate only for non-linear aggregates; linear aggregates work on raw delta.
     // Fast path (linear or already consolidated): borrow delta directly — no allocation.
@@ -200,7 +200,7 @@ pub fn op_reduce(
         //     own output within the epoch and `refresh_owned_cursors` rebuilds the
         //     cursor each epoch, so a prior pad's seed is visible here and never
         //     re-seeded → no weight-2 ground is constructible.
-        if global_ground && i_am_owner {
+        if global_ground && plan.i_am_owner {
             // V₀ batch-free: `extract_group_key` reads the (empty) delta's
             // `null_word` unconditionally and would panic on the empty slice.
             let v0 = global_group_key();
@@ -213,14 +213,7 @@ pub fn op_reduce(
             let has_v0 = trace_out_cursor.valid && trace_out_cursor.current_pk_eq(out_pk_bytes);
             if !has_v0 {
                 let mut raw_output = Batch::with_schema(*output_schema, 1);
-                emit_global_ground(
-                    &mut raw_output,
-                    out_pk_bytes,
-                    agg_descs,
-                    input_schema,
-                    output_schema,
-                    group_by_cols,
-                );
+                emit_global_ground(&mut raw_output, out_pk_bytes, plan);
                 let fin_output = finalize_map(&raw_output, output_schema, finalize_func, finalize_out_schema);
                 return (raw_output, fin_output);
             }
@@ -242,83 +235,48 @@ pub fn op_reduce(
     // must argsort by canonical PK order to avoid splitting one PK into
     // multiple groups. Output's pk_indices is in source pk-list order
     // regardless of group_by_cols permutation.
-    let group_by_pk = out_key == ReduceOutKey::PkPermutation;
-
-    // Monotone probe eligibility: natural-PK grouping and canonical
-    // single-column group keys both visit groups in ascending output-PK order
-    // (argsort by compare_by_group_cols == canonical byte order), so the
-    // trace_out retraction probe can gallop from the live position instead of
-    // paying an absolute full-height seek + loser-tree rebuild per group.
-    let monotone_out_pk = group_by_pk || single_col_canonical_group_key(input_schema, group_by_cols).is_some();
-
-    // Pre-compute sort descriptors for group comparisons (non-pk path).
-    let (sort_descs, sort_descs_len) = if group_by_pk {
-        (
-            [SortDesc {
-                pi: 0,
-                cs: 0,
-                tc: TypeCode::U64,
-                c_idx: 0,
-                pk_off: 0,
-            }; crate::schema::MAX_COLUMNS],
-            0,
-        )
-    } else {
-        build_sort_descs(input_schema, group_by_cols)
-    };
-    let group_descs = &sort_descs[..sort_descs_len];
+    let group_by_pk = plan.group_by_pk;
+    let monotone_out_pk = plan.monotone_out_pk;
+    // Group-comparator descriptors (empty on the natural-PK path).
+    let group_descs = &plan.sort_descs[..];
 
     let mb = working.as_mem_batch();
 
     // Argsort. group_by_pk keeps the sorted/consolidated output mark; only the
-    // iteration order changes when the input is unsorted.
-    let sorted_indices: Vec<u32> = if group_by_pk && working.sorted_verified(input_schema) {
-        (0..n as u32).collect()
+    // iteration order changes when the input is unsorted. A pre-sorted
+    // natural-PK input needs no order at all (`None` — visit positions
+    // directly, skipping the identity-Vec allocation), EXCEPT when the non-AVI
+    // non-linear replay branch runs: it consumes `sorted_indices` slices for
+    // `scatter_copy`, and it IS reachable on the identity path (natural-PK
+    // MIN/MAX without an AVI), so that shape materializes the identity order.
+    let need_replay_order = !all_linear && avi_cursor.is_none();
+    let sorted_indices: Option<Vec<u32>> = if group_by_pk && working.sorted_verified(input_schema) {
+        need_replay_order.then(|| (0..n as u32).collect())
     } else if group_by_pk {
-        argsort_pk_canonical(&mb)
+        Some(argsort_pk_canonical(&mb))
     } else {
-        argsort_delta(working, input_schema, group_by_cols)
+        Some(argsort_delta(working, input_schema, group_by_cols, group_descs))
     };
-
-    // Output mapping: either natural kind keys the emitted row by the group
-    // value itself. Independent of the stride-gated fast-path eligibility
-    // above (compound natural-PK at stride > 16 still emits natural PKs).
-    let use_natural_pk = out_key != ReduceOutKey::SyntheticFold;
 
     let mut raw_output = Batch::with_schema(*output_schema, 32);
 
     let mut accs: Vec<Accumulator> = agg_descs.iter().map(|d| Accumulator::new(d, input_schema)).collect();
-    // Output width of each trailing agg column (loop-invariant across the
-    // 100k+-group loop below). MIN/MAX now emit at the source type's width, so a
-    // narrow column is < 8 bytes; the trace read-back uses this as both the
-    // per-row offset stride and the slice length before `readback_agg_bits`
-    // rebuilds the 8-byte accumulator (width-gated, so a float MIN/MAX widened
-    // to F64 is read verbatim).
-    let agg_col_widths: Vec<usize> = (0..num_aggs)
-        .map(|k| output_schema.columns[num_out_cols - num_aggs + k].size() as usize)
-        .collect();
+    // Output width of each trailing agg column — the trace read-back offset
+    // stride and slice length before `readback_agg_bits` rebuilds the 8-byte
+    // accumulator (width-gated, so a float MIN/MAX widened to F64 is read
+    // verbatim).
+    let agg_col_widths = &plan.agg_col_widths[..];
     // First aggregate column's logical index (the aggregates are the trailing
-    // output columns, so this holds at any PK arity). Loop-invariant — hoisted
-    // out of the group loop alongside `agg_col_widths`. Each aggregate's null bit
+    // output columns, so this holds at any PK arity). Each aggregate's null bit
     // is resolved from this logical index via `ReadCursor::col_is_null`.
-    let cbase = num_out_cols - num_aggs;
+    let cbase = plan.cbase;
 
     // We need mutable access to optional cursors. Take ownership via Option::take pattern.
     // The caller passes these as Option<&mut ReadCursor>, but we need to use them
     // multiple times in the loop. They're already &mut so we can use them directly.
     let mut trace_in = trace_in_cursor;
     let mut avi = avi_cursor;
-    // Loop-invariant: MIN/MAX accumulators are pre-stepped during the group walk
-    // only on the AVI path, and only when some value-indexed aggregate can actually
-    // use the skip path. A float MIN/MAX always probes (its output is F64-widened,
-    // not byte-exact to the source), so an all-float set of extremes never benefits
-    // — gating it out here skips the per-row pre-step that its probe would discard.
-    // The non-AVI replay path handles MIN/MAX itself (it resets and re-steps every
-    // accumulator from the merged replay), so pre-stepping there would be wasted.
-    let track_nonlinear = avi.is_some()
-        && agg_descs
-            .iter()
-            .any(|d| d.agg_op.uses_value_index() && !d.col_type_code.is_float());
+    let track_nonlinear = plan.track_nonlinear;
 
     // AVI group-key gatherer: built once so the per-group lookup gathers the
     // full byte-form group key (the prefix, plus the per-aggregate ordinal
@@ -339,16 +297,19 @@ pub fn op_reduce(
     type FallbackScan = (Vec<(u32, u32, i64)>, Vec<(u32, u32)>);
     let fallback_state: Option<FallbackScan> = if !all_linear && avi.is_none() && !group_by_pk {
         trace_in.as_deref_mut().map(|ti_cursor| {
+            // This pre-pass is gated `!group_by_pk`, so the argsort order is
+            // always materialized here.
+            let order = sorted_indices.as_deref().expect("non-PK grouping always argsorts");
             // Pass 1: one exemplar row per distinct delta group, in group order.
             let mut group_exemplars = Vec::with_capacity(n);
             let mut tmp_idx = 0usize;
             while tmp_idx < n {
-                let exemplar = sorted_indices[tmp_idx] as usize;
+                let exemplar = order[tmp_idx] as usize;
                 group_exemplars.push(exemplar);
                 tmp_idx += 1;
                 while tmp_idx < n {
-                    let curr = sorted_indices[tmp_idx] as usize;
-                    if compare_by_group_cols(&mb, curr, exemplar, group_descs) != std::cmp::Ordering::Equal {
+                    let curr = order[tmp_idx] as usize;
+                    if compare_by_group_cols(&mb, curr, &mb, exemplar, group_descs) != std::cmp::Ordering::Equal {
                         break;
                     }
                     tmp_idx += 1;
@@ -454,21 +415,10 @@ pub fn op_reduce(
     };
 
     // A group exists iff its net cardinality (row weight) is positive; the unique
-    // AggOp::Count accumulator carries that signal. The SQL planner gives every
-    // grouped or global scalar reduce exactly one NULL-blind COUNT — a user
-    // COUNT(*) or an appended companion — so it gates on cardinality and sheds
-    // emptied / all-NULL groups correctly. All three disjuncts are load-bearing:
-    // `!group_by_cols.is_empty()` covers a grouped non-linear reduce (whose
-    // folded linear companion would otherwise emit a phantom row at count 0),
-    // `global_ground` covers a global non-linear reduce (same hazard, empty
-    // gcols), `all_linear` covers the two-phase local partial. `.flatten()`
-    // degrades a genuinely count-less reduce — the range-join threshold reduce
-    // (`global_ground=false`, empty gcols, no COUNT) and low-level CircuitBuilder
-    // reduces — to the `any_nonzero` touched-ness test below (it must not seed a
-    // ground row).
-    let cardinality_idx: Option<usize> = (all_linear || !group_by_cols.is_empty() || global_ground)
-        .then(|| agg_descs.iter().position(|d| d.agg_op == AggOp::Count))
-        .flatten();
+    // AggOp::Count accumulator carries that signal (baked by `ReducePlan::new`,
+    // where the planner's companion-COUNT promise is local; `None` degrades a
+    // genuinely count-less reduce to the touched-ness test below).
+    let cardinality_idx: Option<usize> = plan.cardinality_idx.map(|i| i as usize);
 
     let mut idx = 0usize;
     let mut num_groups = 0usize;
@@ -480,7 +430,10 @@ pub fn op_reduce(
     let mut prev_out_pk: Vec<u8> = Vec::new();
     while idx < n {
         let group_start_pos = idx;
-        let group_start_idx = sorted_indices[group_start_pos] as usize;
+        let group_start_idx = match &sorted_indices {
+            Some(order) => order[group_start_pos] as usize,
+            None => group_start_pos,
+        };
 
         // The input row's PK bytes: keys the MIN/MAX history (trace_in) seeks,
         // which read by the *source* PK, and the group-membership compare.
@@ -522,47 +475,38 @@ pub fn op_reduce(
             out_pk_bytes.clone_into(&mut prev_out_pk);
         }
 
-        // Step linear accumulators over delta rows in this group
+        // Step accumulators over the group's delta rows (the Some/None dispatch
+        // is per group; each arm is a monomorphic walk with no per-row branch).
         for acc in accs.iter_mut() {
             acc.reset();
         }
-        // Per group: has any consolidated delta row weight ≤ 0? A retraction is
-        // the only thing that can make a MIN/MAX extreme recede, so an all-insert
-        // group can skip the AVI probe and fold `combine(old, pos)` instead.
-        let mut saw_negative = false;
-        while idx < n {
-            let curr_idx = sorted_indices[idx] as usize;
-            if group_by_pk {
-                // Full PK byte-window compare: exact at every width, unlike the
-                // lossy u128 get_pk for pk_stride > 16.
-                if !pk_bytes_eq(mb.get_pk_bytes(curr_idx), group_pk_bytes) {
-                    break;
-                }
-            } else if compare_by_group_cols(&mb, curr_idx, group_start_idx, group_descs) != std::cmp::Ordering::Equal {
-                break;
-            }
-
-            let w = mb.get_weight(curr_idx);
-            if w <= 0 {
-                saw_negative = true;
-            }
-            // Pre-step the delta's inserts into the MIN/MAX accumulators so each
-            // holds `pos` (the extreme over the group's positive-weight, non-NULL
-            // delta rows) for the skip path; the probe path overwrites it. Gated
-            // once per row (independent of which accumulator): only on the AVI
-            // path, only for positive rows, only while the group stays all-insert
-            // and under the pre-step cap — beyond it the group force-probes and the
-            // partial `pos` is discarded. A mixed-in float MIN/MAX pre-stepped here
-            // is likewise discarded by its unconditional probe below.
-            let prestep_nonlinear =
-                track_nonlinear && w > 0 && !saw_negative && (idx - group_start_pos) < SKIP_TRACK_CAP;
-            for acc in accs.iter_mut() {
-                if acc.is_linear() || prestep_nonlinear {
-                    acc.step_from_batch(&mb, curr_idx, w);
-                }
-            }
-            idx += 1;
-        }
+        let (group_end, saw_negative) = match &sorted_indices {
+            Some(order) => walk_group_rows(
+                |i| order[i] as usize,
+                &mb,
+                n,
+                group_start_pos,
+                group_start_idx,
+                group_pk_bytes,
+                group_by_pk,
+                group_descs,
+                track_nonlinear,
+                &mut accs,
+            ),
+            None => walk_group_rows(
+                |i| i,
+                &mb,
+                n,
+                group_start_pos,
+                group_start_idx,
+                group_pk_bytes,
+                group_by_pk,
+                group_descs,
+                track_nonlinear,
+                &mut accs,
+            ),
+        };
+        idx = group_end;
         // A group longer than the cap force-probes below. The pre-step gate and
         // this share the per-group row span (`idx - group_start_pos`): pre-step
         // covers positions `0..SKIP_TRACK_CAP`, and a longer group is `capped`, so
@@ -593,7 +537,7 @@ pub fn op_reduce(
         if all_linear && has_old {
             // new = old + delta: fold the old aggregates straight off the
             // still-positioned trace cursor into the accumulators.
-            fold_old_aggs(&mut accs, trace_out_cursor, agg_descs, &agg_col_widths, cbase);
+            fold_old_aggs(&mut accs, trace_out_cursor, agg_descs, agg_col_widths, cbase);
         } else if !all_linear {
             if let (Some(ref mut avi_c), Some(extractor)) = (&mut avi, &avi_extractor) {
                 // Combined-index path. Fold the linear companions (SUM / the
@@ -602,7 +546,7 @@ pub fn op_reduce(
                 // group). `fold_old_aggs` skips the non-linear accumulators; the
                 // index owns each MIN/MAX and overwrites it below.
                 if has_old {
-                    fold_old_aggs(&mut accs, trace_out_cursor, agg_descs, &agg_col_widths, cbase);
+                    fold_old_aggs(&mut accs, trace_out_cursor, agg_descs, agg_col_widths, cbase);
                 }
                 // Gather the group key once into a buffer with one spare trailing
                 // byte for the per-aggregate ordinal; then for each non-linear
@@ -655,7 +599,11 @@ pub fn op_reduce(
                 let replay = replay.as_mut().unwrap();
                 replay.clear();
 
-                let delta_indices: &[u32] = &sorted_indices[group_start_pos..idx];
+                // The replay branch runs iff `need_replay_order`, which forced
+                // the order to be materialized (identity Vec on the pre-sorted
+                // natural-PK path).
+                let delta_indices: &[u32] =
+                    &sorted_indices.as_deref().expect("replay path materializes the order")[group_start_pos..idx];
 
                 let mut trace_rows = DrainGuard::new();
 
@@ -728,18 +676,7 @@ pub fn op_reduce(
             None => accs.iter().any(|a| !a.is_untouched()),
         };
         if should_emit {
-            emit_reduce_row(
-                &mut raw_output,
-                &mb,
-                group_start_idx,
-                out_pk_bytes,
-                &accs,
-                input_schema,
-                output_schema,
-                group_by_cols,
-                use_natural_pk,
-                num_aggs,
-            );
+            emit_reduce_row(&mut raw_output, &mb, group_start_idx, out_pk_bytes, &accs, plan);
         } else if global_ground {
             // The emission gate shed the computed row (this group emptied, or a
             // lone all-NULL MIN/MAX). For the user's ungrouped scalar aggregate
@@ -749,14 +686,7 @@ pub fn op_reduce(
             // at trace_out@V₀ at weight −1, so computed→ground, ground→computed,
             // and value-change ticks all net to one row. (Grouped reduces have
             // `global_ground = false` and correctly emit nothing here.)
-            emit_global_ground(
-                &mut raw_output,
-                out_pk_bytes,
-                agg_descs,
-                input_schema,
-                output_schema,
-                group_by_cols,
-            );
+            emit_global_ground(&mut raw_output, out_pk_bytes, plan);
         }
 
         num_groups += 1;
