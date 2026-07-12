@@ -27,6 +27,9 @@ pub struct AviDesc<'a> {
     pub(crate) table: *mut crate::storage::Table,
     pub(crate) group_by_cols: &'a [u32],
     pub(crate) aggs: &'a [AggDescriptor],
+    /// The baked composite-key gatherer (`Program::avi_extractors`), resolved
+    /// once at compile — the population loop re-derives nothing per tick.
+    pub(crate) extractor: &'a super::util::GroupKeyExtractor,
 }
 
 /// AVI index schema: the group-by columns (native fixed-width types, in GROUP
@@ -118,7 +121,7 @@ pub fn op_integrate_with_indexes(
             .map(|d| input_schema.locate(d.col_idx as usize))
             .collect();
 
-        let extractor = super::util::GroupKeyExtractor::new(input_schema, avi_desc.group_by_cols);
+        let extractor = avi_desc.extractor;
         let n = extractor.stride;
         let mut key = [0u8; crate::schema::MAX_PK_BYTES];
         let mut pk_scratch = [0u8; 16];

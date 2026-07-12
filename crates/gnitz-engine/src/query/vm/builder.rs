@@ -23,6 +23,7 @@ pub(crate) struct ProgramBuilder {
     /// (`0` = derive from source). Sliced alongside `reindex_cols` for `op_map`.
     reindex_target_tcs: Vec<u8>,
     reduce_plans: Vec<crate::ops::ReducePlan>,
+    avi_extractors: Vec<crate::ops::GroupKeyExtractor>,
 }
 
 // SAFETY: Same justification as Program — single-thread access, stable pointers.
@@ -40,6 +41,7 @@ impl ProgramBuilder {
             reindex_cols: Vec::new(),
             reindex_target_tcs: Vec::new(),
             reduce_plans: Vec::new(),
+            avi_extractors: Vec::new(),
         }
     }
 
@@ -108,6 +110,14 @@ impl ProgramBuilder {
         idx
     }
 
+    /// Store a baked AVI write-side group-key extractor, returning its
+    /// `IntegrateAvi::extractor_idx`.
+    pub fn add_avi_extractor(&mut self, extractor: crate::ops::GroupKeyExtractor) -> u16 {
+        let idx = self.avi_extractors.len() as u16;
+        self.avi_extractors.push(extractor);
+        idx
+    }
+
     pub fn add_reindex_cols(&mut self, cols: &[u32], target_tcs: &[u8]) -> (u32, u16) {
         let offset = self.reindex_cols.len() as u32;
         // This is the only mutator of either pool, so they enter in lockstep.
@@ -163,6 +173,7 @@ impl ProgramBuilder {
             reindex_cols: self.reindex_cols,
             reindex_target_tcs: self.reindex_target_tcs,
             reduce_plans: self.reduce_plans,
+            avi_extractors: self.avi_extractors,
         };
 
         let num_owned = owned_trace_regs.len();

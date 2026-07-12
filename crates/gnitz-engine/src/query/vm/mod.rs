@@ -46,7 +46,6 @@ pub(crate) enum Instr {
         in_reg: u16,
         out_reg: u16,
         func_idx: u16,
-        out_schema_idx: u16,
         reindex: ReindexOperand,
     },
     Negate {
@@ -105,7 +104,6 @@ pub(crate) enum Instr {
         trace_in_reg: Option<u16>,
         trace_out_reg: u16,
         out_reg: u16,
-        fin_out_reg: Option<u16>,
         /// Index into `Program::reduce_plans` — the baked `ops::ReducePlan`
         /// carrying the schemas, group columns, aggregate descriptors, and every
         /// derived gate (linearity, key kind, emission roles, ground flags).
@@ -113,9 +111,6 @@ pub(crate) enum Instr {
         // The combined AVI cursor is created fresh from its table each tick;
         // `None` means the operator has no value index (all-linear or fallback).
         avi_table_idx: Option<u16>,
-        /// Post-reduce finalize MAP; `None` when the reduce emits its raw
-        /// output directly.
-        finalize: Option<FinalizeIdx>,
     },
 }
 
@@ -151,15 +146,6 @@ pub(crate) fn reads_reg(instr: &Instr, r: u16) -> bool {
     }
 }
 
-/// Post-reduce finalize MAP: indexes into `Program::funcs` / `Program::schemas`,
-/// exactly like `Instr::Map`'s — one pair, so the "both present or neither"
-/// invariant is structural.
-#[derive(Clone, Copy)]
-pub(crate) struct FinalizeIdx {
-    pub func_idx: u16,
-    pub schema_idx: u16,
-}
-
 /// Combined-AVI descriptor embedded in an Integrate instruction. One table
 /// serves every MIN/MAX aggregate of the reduce; `aggs` (an `agg_descs`-pool
 /// slice) is the value-indexed subset of the reduce's descriptors in descriptor
@@ -174,6 +160,9 @@ pub(crate) struct IntegrateAvi {
     pub group_cols_count: u16,
     pub agg_descs_offset: u32,
     pub agg_descs_count: u16,
+    /// Index into `Program::avi_extractors` — the baked group-key gatherer the
+    /// population loop reads each row's composite key prefix through.
+    pub extractor_idx: u16,
 }
 
 /// Opaque handle owning a compiled program and its register file.
@@ -332,6 +321,9 @@ pub(crate) struct Program {
     pub reindex_target_tcs: Vec<u8>,
     /// Baked per-`Instr::Reduce` plans (see `ops::ReducePlan`).
     pub reduce_plans: Vec<crate::ops::ReducePlan>,
+    /// Baked AVI write-side group-key extractors, indexed by
+    /// `IntegrateAvi::extractor_idx`.
+    pub avi_extractors: Vec<crate::ops::GroupKeyExtractor>,
 }
 
 // SAFETY: Program is only accessed from a single thread (the worker thread
@@ -473,7 +465,7 @@ mod tests {
         });
     }
 
-    /// A reduce with no AVI and no finalize — the shape every test reduce uses.
+    /// A reduce with no AVI — the shape every test reduce uses.
     #[allow(clippy::too_many_arguments)]
     fn push_reduce(
         b: &mut ProgramBuilder,
@@ -502,10 +494,8 @@ mod tests {
             trace_in_reg,
             trace_out_reg,
             out_reg,
-            fin_out_reg: None,
             plan_idx,
             avi_table_idx: None,
-            finalize: None,
         });
     }
 
@@ -815,12 +805,10 @@ mod tests {
 
         let mut builder = ProgramBuilder::new();
         let func_idx = builder.func_idx(func_ptr);
-        let out_schema_idx = builder.schema_idx(out_schema);
         builder.push(Instr::Map {
             in_reg: 0,
             out_reg: 1,
             func_idx,
-            out_schema_idx,
             reindex: ReindexOperand::None,
         });
         builder.push(Instr::Halt);

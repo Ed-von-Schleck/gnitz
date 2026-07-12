@@ -2,19 +2,25 @@
 //! file rather than a shared `common.rs` so the tests file stays self-contained.
 
 use crate::foundation::codec::{read_i64_le, read_u64_le};
-use crate::schema::{
-    encode_german_string, type_code, SchemaColumn, SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL,
-};
+use crate::schema::{encode_german_string, type_code, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{Batch, Layout};
 use crate::test_support::{make_schema_i64pk_i64, make_schema_u64_i64, opk_pk_i64};
 
+use super::super::util::GroupKeyExtractor;
 use super::super::util::{extract_group_key, ieee_order_bits_f32, ieee_order_bits_f32_reverse};
 use super::agg::{apply_agg_from_value_index, Accumulator, AggDescriptor, AggOp};
 use super::emit::{emit_global_ground, emit_reduce_row};
 use super::op_reduce::cursor_matches_group;
 use super::plan::ReducePlan;
-use super::sort::{argsort_delta, build_sort_descs, compare_by_group_cols};
+use super::sort::{argsort_delta, compare_by_group_cols, packed_sort_spec};
+use crate::schema::ColumnLocator;
 use crate::storage::ReadCursor;
+
+/// Resolve `cols` to the baked group-column locators — what `ReducePlan::new`
+/// stores in `sort_descs`.
+fn locate_cols(schema: &SchemaDescriptor, cols: &[u32]) -> Vec<ColumnLocator> {
+    cols.iter().map(|&c| schema.locate(c as usize)).collect()
+}
 
 /// Shim over [`super::op_reduce::op_reduce`] baking a [`ReducePlan`] per call —
 /// deriving `out_key` from the input schema (exactly the one kind compile-time
@@ -30,11 +36,9 @@ fn op_reduce(
     group_by_cols: &[u32],
     agg_descs: &[AggDescriptor],
     avi_cursor: Option<&mut ReadCursor>,
-    finalize_func: Option<&crate::expr::ScalarFunc>,
-    finalize_out_schema: Option<&SchemaDescriptor>,
     global_ground: bool,
     i_am_owner: bool,
-) -> (Batch, Option<Batch>) {
+) -> Batch {
     let plan = make_plan(
         input_schema,
         output_schema,
@@ -44,15 +48,7 @@ fn op_reduce(
         global_ground,
         i_am_owner,
     );
-    super::op_reduce::op_reduce(
-        delta,
-        trace_in_cursor,
-        trace_out_cursor,
-        avi_cursor,
-        &plan,
-        finalize_func,
-        finalize_out_schema,
-    )
+    super::op_reduce::op_reduce(delta, trace_in_cursor, trace_out_cursor, avi_cursor, &plan)
 }
 
 /// Bake a [`ReducePlan`] the way the compiler's `emit_reduce` does, with
@@ -172,7 +168,7 @@ fn test_reduce_sum_retraction() {
 
     let aggs = sum_count_aggs(2, TypeCode::I64);
 
-    let (out1, _) = op_reduce(
+    let out1 = op_reduce(
         &delta1,
         None,
         &mut to_ch,
@@ -180,8 +176,6 @@ fn test_reduce_sum_retraction() {
         &out_schema,
         &[1u32],
         &aggs,
-        None,
-        None,
         None,
         false,
         false,
@@ -208,7 +202,7 @@ fn test_reduce_sum_retraction() {
         b
     };
 
-    let (out2, _) = op_reduce(
+    let out2 = op_reduce(
         &delta2,
         None,
         &mut to_ch2,
@@ -216,8 +210,6 @@ fn test_reduce_sum_retraction() {
         &out_schema,
         &[1u32],
         &aggs,
-        None,
-        None,
         None,
         false,
         false,
@@ -269,12 +261,9 @@ fn linear_sum_only_emptied_group_eliminated() {
             &[1u32],
             &aggs,
             None,
-            None,
-            None,
             false,
             false,
         )
-        .0
     };
 
     // Tick 1: insert (pk1, grp=10, val=5) → group exists (sum=5, count=1).
@@ -402,7 +391,7 @@ fn linear_sum_only_new_all_null_group_present() {
         b.set_layout_unchecked(Layout::Consolidated);
         b
     };
-    let (raw, fin) = op_reduce(
+    let raw = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -411,12 +400,10 @@ fn linear_sum_only_new_all_null_group_present() {
         &[1u32],
         &aggs,
         None,
-        Some(&fin_func),
-        Some(&fin_schema),
         false,
         false,
     );
-    let fin = fin.expect("finalize output present");
+    let fin = fin_func.evaluate_map_batch(&raw);
     assert_eq!(
         raw.count, 1,
         "new all-NULL group is present (cardinality 1), not dropped"
@@ -473,12 +460,9 @@ fn count_star_only_emptied_group_eliminated() {
             &[1u32],
             &aggs,
             None,
-            None,
-            None,
             false,
             false,
         )
-        .0
     };
 
     let row = |pk: u128, w: i64| {
@@ -618,7 +602,7 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
         b
     };
 
-    let (raw1, fin1) = op_reduce(
+    let raw1 = op_reduce(
         &delta1,
         None,
         &mut to_ch,
@@ -627,12 +611,10 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
         &[1u32],
         &aggs,
         None,
-        Some(&fin_func),
-        Some(&fin_schema),
         false,
         false,
     );
-    let fin1 = fin1.expect("finalize output present");
+    let fin1 = fin_func.evaluate_map_batch(&raw1);
     // One group: count=2, sum=5 (non-null while a contributor remains), cnn=1.
     assert_eq!(raw1.count, 1);
     assert_eq!(fin1.count, 1);
@@ -661,7 +643,7 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
         b
     };
 
-    let (_raw2, fin2) = op_reduce(
+    let _raw2 = op_reduce(
         &delta2,
         None,
         &mut to_ch2,
@@ -670,12 +652,10 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
         &[1u32],
         &aggs,
         None,
-        Some(&fin_func),
-        Some(&fin_schema),
         false,
         false,
     );
-    let fin2 = fin2.expect("finalize output present");
+    let fin2 = fin_func.evaluate_map_batch(&_raw2);
     // Retract the old aggregate (w=-1) and insert the new one (w=+1).
     assert_eq!(fin2.count, 2);
 
@@ -763,7 +743,7 @@ fn null_min_retraction_re_emits_null() {
         b.set_layout_unchecked(Layout::Consolidated);
         b
     };
-    let (out1, _) = op_reduce(
+    let out1 = op_reduce(
         &delta1,
         None,
         &mut to_ch,
@@ -771,8 +751,6 @@ fn null_min_retraction_re_emits_null() {
         &out_schema,
         &[1u32],
         &aggs,
-        None,
-        None,
         None,
         false,
         false,
@@ -797,7 +775,7 @@ fn null_min_retraction_re_emits_null() {
         b.set_layout_unchecked(Layout::Consolidated);
         b
     };
-    let (out2, _) = op_reduce(
+    let out2 = op_reduce(
         &delta2,
         None,
         &mut to_ch2,
@@ -805,8 +783,6 @@ fn null_min_retraction_re_emits_null() {
         &out_schema,
         &[1u32],
         &aggs,
-        None,
-        None,
         None,
         false,
         false,
@@ -878,7 +854,7 @@ fn null_sum_fold_stays_null() {
 
     let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
-    let (out1, _) = op_reduce(
+    let out1 = op_reduce(
         &null_row(1),
         None,
         &mut to_ch,
@@ -886,8 +862,6 @@ fn null_sum_fold_stays_null() {
         &out_schema,
         &[1u32],
         &aggs,
-        None,
-        None,
         None,
         false,
         false,
@@ -899,7 +873,7 @@ fn null_sum_fold_stays_null() {
 
     let prev = Rc::new(out1);
     let mut to_ch2 = ReadCursor::from_owned(&[prev], out_schema);
-    let (out2, _) = op_reduce(
+    let out2 = op_reduce(
         &null_row(2),
         None,
         &mut to_ch2,
@@ -907,8 +881,6 @@ fn null_sum_fold_stays_null() {
         &out_schema,
         &[1u32],
         &aggs,
-        None,
-        None,
         None,
         false,
         false,
@@ -967,7 +939,7 @@ fn reduce_trace_seek_wide_pk() {
         b.set_layout_unchecked(Layout::Consolidated);
         b
     };
-    let (out1, _) = op_reduce(
+    let out1 = op_reduce(
         &delta1,
         None,
         &mut to_ch,
@@ -975,8 +947,6 @@ fn reduce_trace_seek_wide_pk() {
         &out_schema,
         &group_by,
         &aggs,
-        None,
-        None,
         None,
         false,
         false,
@@ -999,7 +969,7 @@ fn reduce_trace_seek_wide_pk() {
         b.set_layout_unchecked(Layout::Consolidated);
         b
     };
-    let (out2, _) = op_reduce(
+    let out2 = op_reduce(
         &delta2,
         None,
         &mut to_ch2,
@@ -1007,8 +977,6 @@ fn reduce_trace_seek_wide_pk() {
         &out_schema,
         &group_by,
         &aggs,
-        None,
-        None,
         None,
         false,
         false,
@@ -1075,7 +1043,7 @@ fn reduce_trace_seek_compound_pk() {
         b.set_layout_unchecked(Layout::Consolidated);
         b
     };
-    let (out1, _) = op_reduce(
+    let out1 = op_reduce(
         &delta1,
         None,
         &mut to_ch,
@@ -1083,8 +1051,6 @@ fn reduce_trace_seek_compound_pk() {
         &out_schema,
         &group_by,
         &aggs,
-        None,
-        None,
         None,
         false,
         false,
@@ -1109,7 +1075,7 @@ fn reduce_trace_seek_compound_pk() {
         b.set_layout_unchecked(Layout::Consolidated);
         b
     };
-    let (out2, _) = op_reduce(
+    let out2 = op_reduce(
         &delta2,
         None,
         &mut to_ch2,
@@ -1117,8 +1083,6 @@ fn reduce_trace_seek_compound_pk() {
         &out_schema,
         &group_by,
         &aggs,
-        None,
-        None,
         None,
         false,
         false,
@@ -1179,7 +1143,7 @@ fn reduce_trace_seek_signed_pk() {
         b.set_layout_unchecked(Layout::Consolidated);
         b
     };
-    let (out1, _) = op_reduce(
+    let out1 = op_reduce(
         &delta1,
         None,
         &mut to_ch,
@@ -1187,8 +1151,6 @@ fn reduce_trace_seek_signed_pk() {
         &out_schema,
         &group_by,
         &aggs,
-        None,
-        None,
         None,
         false,
         false,
@@ -1210,7 +1172,7 @@ fn reduce_trace_seek_signed_pk() {
         b.set_layout_unchecked(Layout::Consolidated);
         b
     };
-    let (out2, _) = op_reduce(
+    let out2 = op_reduce(
         &delta2,
         None,
         &mut to_ch2,
@@ -1218,8 +1180,6 @@ fn reduce_trace_seek_signed_pk() {
         &out_schema,
         &group_by,
         &aggs,
-        None,
-        None,
         None,
         false,
         false,
@@ -1266,7 +1226,7 @@ fn test_reduce_count() {
     };
 
     // GROUP BY pk → each row is its own group
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -1274,8 +1234,6 @@ fn test_reduce_count() {
         &out_schema,
         &[0u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -1292,10 +1250,7 @@ fn test_reduce_count() {
 fn test_argsort_delta_f32_group() {
     let schema = make_schema_u64_f32();
     let batch = make_batch_f32(&schema, &[(1, 1, 2.0f32), (2, 1, -1.0f32), (3, 1, 0.5f32)]);
-    let indices = {
-        let (ds, dl) = build_sort_descs(&schema, &[1]);
-        argsort_delta(&batch, &schema, &[1], &ds[..dl])
-    };
+    let indices = argsort_delta(&batch, packed_sort_spec(&schema, &[1]), &locate_cols(&schema, &[1]));
     // Sorted order by F32: -1.0 < 0.5 < 2.0
     assert_eq!(indices.len(), 3);
     let mb = batch.as_mem_batch();
@@ -1314,8 +1269,8 @@ fn test_compare_by_group_cols_f32_negative() {
     let schema = make_schema_u64_f32();
     let batch = make_batch_f32(&schema, &[(1, 1, -5.0f32), (2, 1, 3.0f32)]);
     let mb = batch.as_mem_batch();
-    let (descs_arr, descs_len) = build_sort_descs(&schema, &[1]);
-    let descs = &descs_arr[..descs_len];
+    let descs_v = locate_cols(&schema, &[1]);
+    let descs = &descs_v[..];
     let ord = compare_by_group_cols(&mb, 0, &mb, 1, descs);
     assert_eq!(ord, std::cmp::Ordering::Less);
     let ord2 = compare_by_group_cols(&mb, 1, &mb, 0, descs);
@@ -1433,7 +1388,7 @@ fn test_reduce_sum_i32() {
     let aggs = sum_count_aggs(1, TypeCode::I32);
 
     // GROUP BY pk → each row is its own group
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -1441,8 +1396,6 @@ fn test_reduce_sum_i32() {
         &out_schema,
         &[0u32],
         &aggs,
-        None,
-        None,
         None,
         false,
         false,
@@ -1486,7 +1439,7 @@ fn test_reduce_min_f32() {
     };
 
     // GROUP BY pk → all 3 rows in same group
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -1494,8 +1447,6 @@ fn test_reduce_min_f32() {
         &out_schema,
         &[0u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -1535,7 +1486,7 @@ fn test_reduce_max_i16() {
         col_type_code: TypeCode::I16,
     };
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -1543,8 +1494,6 @@ fn test_reduce_max_i16() {
         &out_schema,
         &[0u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -1618,8 +1567,8 @@ fn test_compare_by_group_cols_uuid_non_pk() {
     let uuid_hi: u128 = 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFFu128;
     let batch = build_batch_u64_uuid(&schema, &[(1, uuid_lo), (2, uuid_hi)]);
     let mb = batch.as_mem_batch();
-    let (descs_arr, descs_len) = build_sort_descs(&schema, &[1]);
-    let descs = &descs_arr[..descs_len];
+    let descs_v = locate_cols(&schema, &[1]);
+    let descs = &descs_v[..];
 
     // uuid_lo < uuid_hi (compare by the 128-bit value)
     let ord = compare_by_group_cols(&mb, 0, &mb, 1, descs);
@@ -1649,10 +1598,7 @@ fn test_argsort_delta_uuid_group() {
     let uuid_b: u128 = 0x0000_0000_0000_0000_0000_0000_0000_0002u128;
     // uuid_b < uuid_a (lower high byte)
     let batch = build_batch_u64_uuid(&schema, &[(1, uuid_a), (2, uuid_b)]);
-    let indices = {
-        let (ds, dl) = build_sort_descs(&schema, &[1]);
-        argsort_delta(&batch, &schema, &[1], &ds[..dl])
-    };
+    let indices = argsort_delta(&batch, packed_sort_spec(&schema, &[1]), &locate_cols(&schema, &[1]));
     assert_eq!(indices.len(), 2);
     // Row with uuid_b (row 1) should sort before row with uuid_a (row 0)
     assert_eq!(indices[0], 1, "uuid_b (smaller) must sort first");
@@ -1769,10 +1715,10 @@ fn test_compare_by_group_cols_includes_pk() {
     let batch = build_pk_other(&schema, &[(10, 100), (20, 100)]);
     let mb = batch.as_mem_batch();
 
-    let (descs_arr, descs_len) = build_sort_descs(&schema, &[0, 1]);
-    let descs = &descs_arr[..descs_len];
-    // First desc covers PK — must use the sentinel.
-    assert_eq!(descs[0].pi, PAYLOAD_MAPPING_PK_SENTINEL);
+    let descs_v = locate_cols(&schema, &[0, 1]);
+    let descs = &descs_v[..];
+    // First locator covers PK — must resolve to the Pk variant.
+    assert!(matches!(descs[0], ColumnLocator::Pk { .. }));
 
     assert_eq!(compare_by_group_cols(&mb, 0, &mb, 1, descs), std::cmp::Ordering::Less);
     assert_eq!(
@@ -1788,10 +1734,11 @@ fn test_argsort_delta_pk_in_group() {
     // and use the sentinel branch — must not panic.
     let schema = make_schema_pk0_u64_i64();
     let batch = build_pk_other(&schema, &[(20, 100), (10, 200), (10, 100)]);
-    let indices = {
-        let (ds, dl) = build_sort_descs(&schema, &[0, 1]);
-        argsort_delta(&batch, &schema, &[0, 1], &ds[..dl])
-    };
+    let indices = argsort_delta(
+        &batch,
+        packed_sort_spec(&schema, &[0, 1]),
+        &locate_cols(&schema, &[0, 1]),
+    );
     assert_eq!(indices.len(), 3);
     // Sorted by (pk, other): (10,100), (10,200), (20,100)
     let mb = batch.as_mem_batch();
@@ -1858,8 +1805,8 @@ fn test_compare_by_group_cols_nulls_first() {
     let schema = make_schema_pk_nullable_i64();
     let batch = build_pk_null_i64(&schema, &[(1, Some(7)), (2, None), (3, None)]);
     let mb = batch.as_mem_batch();
-    let (descs_arr, descs_len) = build_sort_descs(&schema, &[1]);
-    let descs = &descs_arr[..descs_len];
+    let descs_v = locate_cols(&schema, &[1]);
+    let descs = &descs_v[..];
 
     // NULL < 7 (NULLS FIRST)
     assert_eq!(compare_by_group_cols(&mb, 1, &mb, 0, descs), std::cmp::Ordering::Less);
@@ -1878,10 +1825,7 @@ fn test_argsort_delta_nullable_no_packed_sort() {
     // route through compare_by_group_cols where NULL < non-NULL.
     let schema = make_schema_pk_nullable_i64();
     let batch = build_pk_null_i64(&schema, &[(1, Some(0)), (2, None), (3, Some(5)), (4, None)]);
-    let indices = {
-        let (ds, dl) = build_sort_descs(&schema, &[1]);
-        argsort_delta(&batch, &schema, &[1], &ds[..dl])
-    };
+    let indices = argsort_delta(&batch, packed_sort_spec(&schema, &[1]), &locate_cols(&schema, &[1]));
     let mb = batch.as_mem_batch();
     // NULLs must be adjacent (single group), not interleaved with 0s.
     let null_word_at = |i: u32| mb.get_null_word(i as usize) & 1 != 0;
@@ -1960,7 +1904,7 @@ fn test_emit_reduce_row_compound_pk_bytes() {
         agg_op: AggOp::Count,
         col_type_code: TypeCode::I64,
     };
-    let accs: Vec<Accumulator> = vec![Accumulator::new(&agg, &in_schema)];
+    let accs: Vec<Accumulator> = vec![Accumulator::new(&agg, in_schema.locate(2))];
     // Natural-PK grouping passes the source row's PK bytes; they're copied verbatim.
     let plan = make_plan(
         &in_schema,
@@ -2021,7 +1965,7 @@ fn test_reduce_min_pk_col_compound_pk() {
         col_type_code: TypeCode::U64,
     };
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -2029,8 +1973,6 @@ fn test_reduce_min_pk_col_compound_pk() {
         &out_schema,
         &[0u32, 1u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -2075,7 +2017,7 @@ fn test_reduce_min_pk_col_single_pk_u64() {
         agg_op: AggOp::Min,
         col_type_code: TypeCode::U64,
     };
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -2083,8 +2025,6 @@ fn test_reduce_min_pk_col_single_pk_u64() {
         &out_schema,
         &[0u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -2127,7 +2067,7 @@ fn test_reduce_group_by_pk_permuted_preserves_pk_order() {
     };
 
     // group_by_cols permuted to [1, 0] — a valid set permutation of pk_indices.
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -2135,8 +2075,6 @@ fn test_reduce_group_by_pk_permuted_preserves_pk_order() {
         &out_schema,
         &[1u32, 0u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -2176,13 +2114,12 @@ fn test_compare_by_group_cols_pk_sentinel_compound_subset() {
     let batch = make_batch_compound_2xu64(&schema, &[(10, 7, 1, 100), (10, 9, 1, 200), (20, 7, 1, 300)]);
     let mb = batch.as_mem_batch();
 
-    let (descs_arr, descs_len) = build_sort_descs(&schema, &[0u32]);
-    let descs = &descs_arr[..descs_len];
-    assert_eq!(
-        descs[0].pi, PAYLOAD_MAPPING_PK_SENTINEL,
-        "subset group on PK col 0 must produce a PK-sentinel SortDesc"
+    let descs_v = locate_cols(&schema, &[0u32]);
+    let descs = &descs_v[..];
+    assert!(
+        matches!(descs[0], ColumnLocator::Pk { byte_off: 0, .. }),
+        "subset group on PK col 0 must resolve to a Pk locator at byte offset 0"
     );
-    assert_eq!(descs[0].pk_off, 0, "pk_col_0 byte offset within PK region");
 
     // Same pk_col_0 (10), different pk_col_1 → Equal under GROUP BY pk_col_0.
     assert_eq!(
@@ -2206,10 +2143,12 @@ fn test_compare_by_group_cols_pk_sentinel_compound_pk_col_1() {
     let batch = make_batch_compound_2xu64(&schema, &[(1, 50, 1, 100), (2, 50, 1, 200), (3, 60, 1, 300)]);
     let mb = batch.as_mem_batch();
 
-    let (descs_arr, descs_len) = build_sort_descs(&schema, &[1u32]);
-    let descs = &descs_arr[..descs_len];
-    assert_eq!(descs[0].pi, PAYLOAD_MAPPING_PK_SENTINEL);
-    assert_eq!(descs[0].pk_off, 8, "pk_col_1 byte offset within PK region");
+    let descs_v = locate_cols(&schema, &[1u32]);
+    let descs = &descs_v[..];
+    assert!(
+        matches!(descs[0], ColumnLocator::Pk { byte_off: 8, .. }),
+        "pk_col_1 byte offset within PK region"
+    );
 
     // Same pk_col_1 (50), different pk_col_0 → Equal.
     assert_eq!(compare_by_group_cols(&mb, 0, &mb, 1, descs), std::cmp::Ordering::Equal);
@@ -2218,18 +2157,23 @@ fn test_compare_by_group_cols_pk_sentinel_compound_pk_col_1() {
 }
 
 /// Single-PK U64 with `GROUP BY pk` must be bit-identical to the prior
-/// whole-region widen path — pk_off = 0, cs = pk_stride = 8.
+/// whole-region widen path — byte offset 0, size = pk_stride = 8.
 #[test]
 fn test_compare_by_group_cols_pk_sentinel_single_pk_bit_identical() {
     let schema = make_schema_u64_i64();
     let batch = build_pk_other(&schema, &[(10, 100), (20, 100), (10, 200)]);
     let mb = batch.as_mem_batch();
 
-    let (descs_arr, descs_len) = build_sort_descs(&schema, &[0u32]);
-    let descs = &descs_arr[..descs_len];
-    assert_eq!(descs[0].pi, PAYLOAD_MAPPING_PK_SENTINEL);
-    assert_eq!(descs[0].pk_off, 0);
-    assert_eq!(descs[0].cs, 8);
+    let descs_v = locate_cols(&schema, &[0u32]);
+    let descs = &descs_v[..];
+    assert!(matches!(
+        descs[0],
+        ColumnLocator::Pk {
+            byte_off: 0,
+            size: 8,
+            ..
+        }
+    ));
 
     assert_eq!(compare_by_group_cols(&mb, 0, &mb, 1, descs), std::cmp::Ordering::Less);
     assert_eq!(
@@ -2239,7 +2183,7 @@ fn test_compare_by_group_cols_pk_sentinel_single_pk_bit_identical() {
     assert_eq!(compare_by_group_cols(&mb, 0, &mb, 2, descs), std::cmp::Ordering::Equal);
 }
 
-/// cursor_matches_group on a PK-sentinel SortDesc with compound PK must
+/// cursor_matches_group on a Pk-locator group column with compound PK must
 /// match rows that share the addressed PK column but differ elsewhere.
 #[test]
 fn test_cursor_matches_group_pk_sentinel_compound_subset() {
@@ -2258,8 +2202,8 @@ fn test_cursor_matches_group_pk_sentinel_compound_subset() {
     cursor.rewind();
     assert!(cursor.valid, "cursor must be positioned on the single row");
 
-    let (descs_arr, descs_len) = build_sort_descs(&schema, &[0u32]);
-    let descs = &descs_arr[..descs_len];
+    let descs_v = locate_cols(&schema, &[0u32]);
+    let descs = &descs_v[..];
 
     // Row 0 (pk0=10) shares pk_col_0 with the cursor → match.
     assert!(
@@ -2339,7 +2283,7 @@ fn test_op_reduce_compound_pk_group_by_subset_count() {
         col_type_code: TypeCode::I64,
     };
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -2347,8 +2291,6 @@ fn test_op_reduce_compound_pk_group_by_subset_count() {
         &out_schema,
         &[0u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -2483,7 +2425,7 @@ fn test_reduce_min_u64_high_bit_set() {
         col_type_code: TypeCode::U64,
     };
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -2491,8 +2433,6 @@ fn test_reduce_min_u64_high_bit_set() {
         &out_schema,
         &[1u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -2526,7 +2466,7 @@ fn test_reduce_max_u64_high_bit_set() {
         col_type_code: TypeCode::U64,
     };
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -2534,8 +2474,6 @@ fn test_reduce_max_u64_high_bit_set() {
         &out_schema,
         &[1u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -2568,7 +2506,7 @@ fn test_reduce_min_u64_incremental() {
     let empty_ti = Rc::new(Batch::empty_with_schema(&in_schema));
     let mut ti_ch = ReadCursor::from_owned(&[empty_ti], in_schema);
 
-    let (out1, _) = op_reduce(
+    let out1 = op_reduce(
         &delta1,
         Some(&mut ti_ch),
         &mut to_ch,
@@ -2576,8 +2514,6 @@ fn test_reduce_min_u64_incremental() {
         &out_schema,
         &[1u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -2601,7 +2537,7 @@ fn test_reduce_min_u64_incremental() {
 
     let delta2 = make_batch_u64pk_i64grp_u64val(&in_schema, &[(2, 1, 7, 1u64 << 63)]);
 
-    let (out2, _) = op_reduce(
+    let out2 = op_reduce(
         &delta2,
         Some(&mut ti_ch2),
         &mut to_ch2,
@@ -2609,8 +2545,6 @@ fn test_reduce_min_u64_incremental() {
         &out_schema,
         &[1u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -2651,7 +2585,7 @@ fn test_reduce_max_u64_incremental() {
     let empty_ti = Rc::new(Batch::empty_with_schema(&in_schema));
     let mut ti_ch = ReadCursor::from_owned(&[empty_ti], in_schema);
 
-    let (out1, _) = op_reduce(
+    let out1 = op_reduce(
         &delta1,
         Some(&mut ti_ch),
         &mut to_ch,
@@ -2659,8 +2593,6 @@ fn test_reduce_max_u64_incremental() {
         &out_schema,
         &[1u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -2679,7 +2611,7 @@ fn test_reduce_max_u64_incremental() {
 
     let delta2 = make_batch_u64pk_i64grp_u64val(&in_schema, &[(2, 1, 7, u64::MAX)]);
 
-    let (out2, _) = op_reduce(
+    let out2 = op_reduce(
         &delta2,
         Some(&mut ti_ch2),
         &mut to_ch2,
@@ -2687,8 +2619,6 @@ fn test_reduce_max_u64_incremental() {
         &out_schema,
         &[1u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -2717,7 +2647,7 @@ fn test_avi_seed_u64_high_bit() {
         agg_op: AggOp::Min,
         col_type_code: TypeCode::U64,
     };
-    let mut acc = Accumulator::new(&desc, &in_schema);
+    let mut acc = Accumulator::new(&desc, in_schema.locate(1));
 
     // AVI seeds the accumulator with 1u64<<63 (high bit set).
     acc.seed_from_raw_bits(1u64 << 63);
@@ -2772,7 +2702,7 @@ fn test_reduce_min_u64_replay_via_trace_in() {
 
     let delta1 = make_batch_u64pk_i64grp_u64val(&in_schema, &[(1, 1, 7, u64::MAX)]);
 
-    let (out1, _) = op_reduce(
+    let out1 = op_reduce(
         &delta1,
         Some(&mut ti_ch),
         &mut to_ch,
@@ -2780,8 +2710,6 @@ fn test_reduce_min_u64_replay_via_trace_in() {
         &out_schema,
         &[1u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -2803,7 +2731,7 @@ fn test_reduce_min_u64_replay_via_trace_in() {
 
     let delta2 = make_batch_u64pk_i64grp_u64val(&in_schema, &[(2, 1, 7, 5u64)]);
 
-    let (out2, _) = op_reduce(
+    let out2 = op_reduce(
         &delta2,
         Some(&mut ti_ch2),
         &mut to_ch2,
@@ -2811,8 +2739,6 @@ fn test_reduce_min_u64_replay_via_trace_in() {
         &out_schema,
         &[1u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -2854,7 +2780,7 @@ fn test_reduce_min_max_i64_boundary() {
             col_type_code: TypeCode::I64,
         };
 
-        let (out, _) = op_reduce(
+        let out = op_reduce(
             &delta,
             None,
             &mut to_ch,
@@ -2862,8 +2788,6 @@ fn test_reduce_min_max_i64_boundary() {
             &out_schema,
             &[1u32],
             &[agg],
-            None,
-            None,
             None,
             false,
             false,
@@ -2889,7 +2813,7 @@ fn test_reduce_min_max_i64_boundary() {
             col_type_code: TypeCode::I64,
         };
 
-        let (out, _) = op_reduce(
+        let out = op_reduce(
             &delta,
             None,
             &mut to_ch,
@@ -2897,8 +2821,6 @@ fn test_reduce_min_max_i64_boundary() {
             &out_schema,
             &[1u32],
             &[agg],
-            None,
-            None,
             None,
             false,
             false,
@@ -3003,7 +2925,7 @@ fn test_reduce_group_by_pk_unsorted_input_linear_sum() {
 
     let aggs = sum_count_aggs(1, TypeCode::I64);
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -3011,8 +2933,6 @@ fn test_reduce_group_by_pk_unsorted_input_linear_sum() {
         &out_schema,
         &[0u32],
         &aggs,
-        None,
-        None,
         None,
         false,
         false,
@@ -3057,7 +2977,7 @@ fn test_reduce_group_by_pk_unsorted_input_count() {
         col_type_code: TypeCode::I64,
     };
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -3065,8 +2985,6 @@ fn test_reduce_group_by_pk_unsorted_input_count() {
         &out_schema,
         &[0u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -3098,7 +3016,7 @@ fn test_reduce_group_by_pk_unsorted_sorted_input_equivalence() {
 
     let aggs = sum_count_aggs(1, TypeCode::I64);
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -3106,8 +3024,6 @@ fn test_reduce_group_by_pk_unsorted_sorted_input_equivalence() {
         &out_schema,
         &[0u32],
         &aggs,
-        None,
-        None,
         None,
         false,
         false,
@@ -3151,7 +3067,7 @@ fn test_reduce_group_by_pk_unsorted_compound_pk_permuted() {
     };
 
     // Permuted GROUP BY: [1, 0]. PkPermutation still holds.
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -3159,8 +3075,6 @@ fn test_reduce_group_by_pk_unsorted_compound_pk_permuted() {
         &out_schema,
         &[1u32, 0u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -3213,7 +3127,7 @@ fn test_reduce_group_by_pk_unsorted_signed_pk() {
 
     let aggs = sum_count_aggs(1, TypeCode::I64);
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -3221,8 +3135,6 @@ fn test_reduce_group_by_pk_unsorted_signed_pk() {
         &out_schema,
         &[0u32],
         &aggs,
-        None,
-        None,
         None,
         false,
         false,
@@ -3275,7 +3187,7 @@ fn test_reduce_group_by_pk_unsorted_with_retraction() {
 
     let aggs = sum_count_aggs(1, TypeCode::I64);
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -3283,8 +3195,6 @@ fn test_reduce_group_by_pk_unsorted_with_retraction() {
         &out_schema,
         &[0u32],
         &aggs,
-        None,
-        None,
         None,
         false,
         false,
@@ -3354,7 +3264,7 @@ fn test_reduce_min_group_by_pk_retracts_extreme() {
         col_type_code: TypeCode::I64,
     };
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         Some(&mut ti_ch),
         &mut to_ch,
@@ -3362,8 +3272,6 @@ fn test_reduce_min_group_by_pk_retracts_extreme() {
         &out_schema,
         &[0u32], // GROUP BY PK col 0 → group_by_pk replay path
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -3465,7 +3373,7 @@ fn avi_two_groups_distinct_byte_form_keys() {
         col_type_code: TypeCode::I64,
     };
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -3474,8 +3382,6 @@ fn avi_two_groups_distinct_byte_form_keys() {
         &[1u32, 2u32],
         &[agg],
         Some(&mut avi_ch),
-        None,
-        None,
         false,
         false,
     );
@@ -3588,7 +3494,7 @@ fn avi_retraction_returns_next_extremum() {
         col_type_code: TypeCode::I64,
     };
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -3597,8 +3503,6 @@ fn avi_retraction_returns_next_extremum() {
         &[1u32],
         &[agg],
         Some(&mut avi_ch),
-        None,
-        None,
         false,
         false,
     );
@@ -3694,7 +3598,7 @@ fn avi_non_power_of_two_stride_drives_cursor() {
             col_type_code: TypeCode::I64,
         };
 
-        let (out, _) = op_reduce(
+        let out = op_reduce(
             &delta,
             None,
             &mut to_ch,
@@ -3703,8 +3607,6 @@ fn avi_non_power_of_two_stride_drives_cursor() {
             &[1u32],
             &[agg],
             Some(&mut avi_ch),
-            None,
-            None,
             false,
             false,
         );
@@ -3794,7 +3696,7 @@ fn trace_scan_retraction_recomputes_min() {
         col_type_code: TypeCode::I64,
     };
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         Some(&mut ti_ch),
         &mut to_ch,
@@ -3802,8 +3704,6 @@ fn trace_scan_retraction_recomputes_min() {
         &out_schema,
         &[1u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -3904,7 +3804,7 @@ fn min_tie_retract_one_copy_keeps_min() {
         col_type_code: TypeCode::I64,
     };
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         Some(&mut ti_ch),
         &mut to_ch,
@@ -3912,8 +3812,6 @@ fn min_tie_retract_one_copy_keeps_min() {
         &out_schema,
         &[1u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -3989,7 +3887,7 @@ fn min_ignores_null_values() {
         col_type_code: TypeCode::I64,
     };
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -3997,8 +3895,6 @@ fn min_ignores_null_values() {
         &out_schema,
         &[1u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -4101,7 +3997,7 @@ fn avi_multi_col_retraction_returns_next_extremum() {
         col_type_code: TypeCode::I64,
     };
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -4110,8 +4006,6 @@ fn avi_multi_col_retraction_returns_next_extremum() {
         &[1u32, 2u32],
         &[agg],
         Some(&mut avi_ch),
-        None,
-        None,
         false,
         false,
     );
@@ -4258,7 +4152,7 @@ fn avi_wide_two_u64_groups_match_reference() {
         col_type_code: TypeCode::I64,
     };
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -4267,8 +4161,6 @@ fn avi_wide_two_u64_groups_match_reference() {
         &[1u32, 2u32],
         &[agg],
         Some(&mut avi_ch),
-        None,
-        None,
         false,
         false,
     );
@@ -4363,7 +4255,7 @@ fn avi_wide_single_u128_group_distinct() {
         col_type_code: TypeCode::I64,
     };
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -4372,8 +4264,6 @@ fn avi_wide_single_u128_group_distinct() {
         &[1u32],
         &[agg],
         Some(&mut avi_ch),
-        None,
-        None,
         false,
         false,
     );
@@ -4481,7 +4371,7 @@ fn avi_wide_mixed_signed_unsigned_key() {
         col_type_code: TypeCode::I64,
     };
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -4490,8 +4380,6 @@ fn avi_wide_mixed_signed_unsigned_key() {
         &[1u32, 2u32],
         &[agg],
         Some(&mut avi_ch),
-        None,
-        None,
         false,
         false,
     );
@@ -4593,7 +4481,7 @@ fn avi_wide_prefix_collision_distinct_groups() {
         col_type_code: TypeCode::I64,
     };
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -4602,8 +4490,6 @@ fn avi_wide_prefix_collision_distinct_groups() {
         &[1u32, 2u32, 3u32],
         &[agg],
         Some(&mut avi_ch),
-        None,
-        None,
         false,
         false,
     );
@@ -4713,7 +4599,7 @@ fn avi_wide_retraction_returns_next_extremum() {
         col_type_code: TypeCode::I64,
     };
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -4722,8 +4608,6 @@ fn avi_wide_retraction_returns_next_extremum() {
         &[1u32, 2u32],
         &[agg],
         Some(&mut avi_ch),
-        None,
-        None,
         false,
         false,
     );
@@ -4782,7 +4666,7 @@ fn count_accumulator_over_uuid_pk_does_not_panic() {
         agg_op: AggOp::Count,
         col_type_code: TypeCode::UUID,
     };
-    let mut acc = Accumulator::new(&desc, &schema);
+    let mut acc = Accumulator::new(&desc, schema.locate(0));
     let mb = b.as_mem_batch();
     acc.step_from_batch(&mb, 0, 1);
     acc.step_from_batch(&mb, 1, 1);
@@ -4827,10 +4711,12 @@ fn avi_read_extreme(
         col_type_code: tc_enum,
     };
     let aggs = [agg];
+    let extractor = GroupKeyExtractor::new(in_schema, group_by);
     let avi = AviDesc {
         table: &mut avi_t as *mut Table,
         group_by_cols: group_by,
         aggs: &aggs,
+        extractor: &extractor,
     };
     // Each op_integrate_with_indexes call is a separate AVI ingest; the cursor's
     // two-tier consolidation sums weights across ingests, so a retracted extreme
@@ -4840,11 +4726,10 @@ fn avi_read_extreme(
     }
 
     let mut ch = avi_t.open_cursor();
-    let extractor = GroupKeyExtractor::new(in_schema, group_by);
     let mut gk = [0u8; crate::schema::MAX_PK_BYTES];
     extractor.gather(&deltas[0].as_mem_batch(), 0, &mut gk);
     gk[extractor.stride] = 0; // ordinal 0 (single aggregate)
-    let mut acc = Accumulator::new(&agg, in_schema);
+    let mut acc = Accumulator::new(&agg, in_schema.locate(col_idx as usize));
     assert!(
         apply_agg_from_value_index(&mut ch, &gk[..extractor.stride + 1], for_max, &mut acc),
         "AVI seek must find the probed group",
@@ -5057,7 +4942,7 @@ fn reduce_wide_compound_pk_group_by_pk_counts_per_pk() {
         col_type_code: TypeCode::U128,
     };
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -5065,8 +4950,6 @@ fn reduce_wide_compound_pk_group_by_pk_counts_per_pk() {
         &out_schema,
         &[0u32, 1u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -5104,12 +4987,13 @@ fn reduce_wide_compound_pk_group_by_pk_counts_per_pk() {
 // trace is scanned at most once per tick (REWIND_CALLS ≤ 1).
 // -----------------------------------------------------------------------
 
-/// Verifies that `extract_group_key_cursor` and `extract_group_key` return
-/// identical 128-bit keys for every row in a sorted batch, for the given
-/// group columns. A divergence would silently merge or split groups (wrong
-/// MIN/MAX results).
+/// Verifies that the baked `GroupKeyCols` keyer (batch-row and cursor forms —
+/// the fallback pre-pass's production path) and the schema-walking
+/// `extract_group_key` return identical 128-bit keys for every row in a sorted
+/// batch, for the given group columns. A divergence would silently merge or
+/// split groups (wrong MIN/MAX results).
 fn assert_group_key_cursor_matches_batch(b: &Batch, schema: &SchemaDescriptor, group_by_cols: &[u32]) {
-    use super::super::util::{extract_group_key, extract_group_key_cursor};
+    use super::super::util::{extract_group_key, GroupKeyCols};
     use crate::storage::ReadCursor;
     use std::rc::Rc;
 
@@ -5126,11 +5010,17 @@ fn assert_group_key_cursor_matches_batch(b: &Batch, schema: &SchemaDescriptor, g
     let mb = rc.as_mem_batch();
     let mut ch = ReadCursor::from_owned(&[Rc::clone(&rc)], *schema);
     let cursor = &mut ch;
+    let keyer = GroupKeyCols::new(schema, group_by_cols);
 
     for row in 0..b.count {
         assert!(cursor.valid, "cursor must be valid at row {row}");
         let batch_key = extract_group_key(&mb, row, schema, group_by_cols);
-        let cursor_key = extract_group_key_cursor(cursor, schema, group_by_cols);
+        let baked_key = keyer.key_row(&mb, row);
+        let cursor_key = keyer.key_cursor(cursor);
+        assert_eq!(
+            batch_key, baked_key,
+            "group key mismatch at row {row}: ad-hoc={batch_key:#034x} baked={baked_key:#034x}",
+        );
         assert_eq!(
             batch_key, cursor_key,
             "group key mismatch at row {row}: batch={batch_key:#034x} cursor={cursor_key:#034x}",
@@ -5340,7 +5230,7 @@ fn run_fallback_min_i64_grp(
     let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch1 = ReadCursor::from_owned(&[empty_out], out_schema);
 
-    let (out1, _) = op_reduce(
+    let out1 = op_reduce(
         &delta1,
         None,
         &mut to_ch1,
@@ -5348,8 +5238,6 @@ fn run_fallback_min_i64_grp(
         &out_schema,
         &[1u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -5367,7 +5255,7 @@ fn run_fallback_min_i64_grp(
     let mut ti_ch2 = ReadCursor::from_owned(&[ti_batch], in_schema);
     let mut to_ch2 = ReadCursor::from_owned(&[to_batch], out_schema);
 
-    let (out2, _) = op_reduce(
+    let out2 = op_reduce(
         &delta2,
         Some(&mut ti_ch2),
         &mut to_ch2,
@@ -5375,8 +5263,6 @@ fn run_fallback_min_i64_grp(
         &out_schema,
         &[1u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -5528,7 +5414,7 @@ fn fallback_min_multi_col_group() {
     let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
-    let (out1, _) = op_reduce(
+    let out1 = op_reduce(
         &delta1,
         None,
         &mut to_ch,
@@ -5536,8 +5422,6 @@ fn fallback_min_multi_col_group() {
         &out_schema,
         &[1u32, 2u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -5556,7 +5440,7 @@ fn fallback_min_multi_col_group() {
     let mut ti_ch = ReadCursor::from_owned(&[ti_batch], in_schema);
     let mut to_ch2 = ReadCursor::from_owned(&[empty_out2], out_schema);
 
-    let (out2, _) = op_reduce(
+    let out2 = op_reduce(
         &delta2,
         Some(&mut ti_ch),
         &mut to_ch2,
@@ -5564,8 +5448,6 @@ fn fallback_min_multi_col_group() {
         &out_schema,
         &[1u32, 2u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -5648,7 +5530,7 @@ fn fallback_trace_rewind_at_most_once() {
     // Reset the per-thread rewind counter before the call.
     REWIND_CALLS.with(|c| c.set(0));
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta_b,
         Some(&mut ti_ch),
         &mut to_ch,
@@ -5656,8 +5538,6 @@ fn fallback_trace_rewind_at_most_once() {
         &out_schema,
         &[1u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -5820,8 +5700,8 @@ fn test_compare_by_group_cols_blob_no_panic() {
     assert_eq!(&blob_a[..4], &blob_b[..4]);
     let batch = make_batch_blob_grp_i64(&schema, &[(1, 1, blob_a, 10), (2, 1, blob_b, 20)]);
     let mb = batch.as_mem_batch();
-    let (descs_arr, descs_len) = build_sort_descs(&schema, &[1]);
-    let descs = &descs_arr[..descs_len];
+    let descs_v = locate_cols(&schema, &[1]);
+    let descs = &descs_v[..];
 
     assert_eq!(
         compare_by_group_cols(&mb, 0, &mb, 1, descs),
@@ -5880,7 +5760,7 @@ fn test_reduce_max_blob_group_retraction() {
     let delta1 = make_batch_blob_grp_i64(&in_schema, tick1);
     let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch1 = ReadCursor::from_owned(&[empty_out], out_schema);
-    let (out1, _) = op_reduce(
+    let out1 = op_reduce(
         &delta1,
         None,
         &mut to_ch1,
@@ -5888,8 +5768,6 @@ fn test_reduce_max_blob_group_retraction() {
         &out_schema,
         &[1u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -5914,7 +5792,7 @@ fn test_reduce_max_blob_group_retraction() {
     let delta2 = make_batch_blob_grp_i64(&in_schema, &[(2, -1, blob_a, 30)]);
     let mut ti_ch2 = ReadCursor::from_owned(&[ti_batch], in_schema);
     let mut to_ch2 = ReadCursor::from_owned(&[to_batch], out_schema);
-    let (out2, _) = op_reduce(
+    let out2 = op_reduce(
         &delta2,
         Some(&mut ti_ch2),
         &mut to_ch2,
@@ -5922,8 +5800,6 @@ fn test_reduce_max_blob_group_retraction() {
         &out_schema,
         &[1u32],
         &[agg],
-        None,
-        None,
         None,
         false,
         false,
@@ -6002,7 +5878,7 @@ fn g_reduce(
     out_schema: &SchemaDescriptor,
     aggs: &[AggDescriptor],
     i_am_owner: bool,
-) -> (Batch, Option<Batch>) {
+) -> Batch {
     let in_schema = g_src();
     op_reduce(
         delta,
@@ -6012,8 +5888,6 @@ fn g_reduce(
         out_schema,
         &[], // empty group cols ⇒ one global group at V₀
         aggs,
-        None,
-        None,
         None,
         true, // global_ground
         i_am_owner,
@@ -6030,7 +5904,7 @@ fn global_seed_over_empty_emits_one_ground_row() {
     let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
-    let (raw, _) = g_reduce(&g_delta(&[]), None, &mut to_ch, &out_schema, &[G_SUM, G_COUNT], true);
+    let raw = g_reduce(&g_delta(&[]), None, &mut to_ch, &out_schema, &[G_SUM, G_COUNT], true);
 
     assert_eq!(raw.count, 1, "empty-source global aggregate must emit one ground row");
     assert_eq!(raw.get_weight(0), 1, "ground row weight +1");
@@ -6054,13 +5928,13 @@ fn global_seed_idempotent_across_two_empty_pads() {
     let out_schema = make_pk_sum_count_out_schema();
     let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
-    let (raw1, _) = g_reduce(&g_delta(&[]), None, &mut to_ch, &out_schema, &[G_SUM, G_COUNT], true);
+    let raw1 = g_reduce(&g_delta(&[]), None, &mut to_ch, &out_schema, &[G_SUM, G_COUNT], true);
     assert_eq!(raw1.count, 1, "first pad seeds the ground");
 
     // Second pad: trace_out now holds the V₀ ground from the first pad.
     let prev = Rc::new(raw1);
     let mut to_ch2 = ReadCursor::from_owned(&[prev], out_schema);
-    let (raw2, _) = g_reduce(&g_delta(&[]), None, &mut to_ch2, &out_schema, &[G_SUM, G_COUNT], true);
+    let raw2 = g_reduce(&g_delta(&[]), None, &mut to_ch2, &out_schema, &[G_SUM, G_COUNT], true);
     assert_eq!(raw2.count, 0, "second pad must NOT re-seed (V₀ already in trace_out)");
 }
 
@@ -6074,7 +5948,7 @@ fn global_non_owner_empty_pad_emits_zero_rows() {
     let out_schema = make_pk_sum_count_out_schema();
     let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
-    let (raw, _) = g_reduce(
+    let raw = g_reduce(
         &g_delta(&[]),
         None,
         &mut to_ch,
@@ -6094,7 +5968,7 @@ fn global_create_over_nonempty_emits_computed_no_ground() {
     let out_schema = make_pk_sum_count_out_schema();
     let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
-    let (raw, _) = g_reduce(
+    let raw = g_reduce(
         &g_delta(&[(1, 1, 5), (2, 1, 10)]),
         None,
         &mut to_ch,
@@ -6118,7 +5992,7 @@ fn global_emptied_by_delete_emits_ground() {
     let out_schema = make_pk_sum_count_out_schema();
     let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
-    let (raw1, _) = g_reduce(
+    let raw1 = g_reduce(
         &g_delta(&[(1, 1, 5)]),
         None,
         &mut to_ch,
@@ -6131,7 +6005,7 @@ fn global_emptied_by_delete_emits_ground() {
     // Retract the only row → cardinality 0.
     let prev = Rc::new(raw1);
     let mut to_ch2 = ReadCursor::from_owned(&[prev], out_schema);
-    let (raw2, _) = g_reduce(
+    let raw2 = g_reduce(
         &g_delta(&[(1, -1, 5)]),
         None,
         &mut to_ch2,
@@ -6159,13 +6033,13 @@ fn global_ground_to_computed_on_first_insert() {
     // Tick 1: seed the ground over an empty source.
     let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
-    let (ground, _) = g_reduce(&g_delta(&[]), None, &mut to_ch, &out_schema, &[G_SUM, G_COUNT], true);
+    let ground = g_reduce(&g_delta(&[]), None, &mut to_ch, &out_schema, &[G_SUM, G_COUNT], true);
     assert_eq!(ground.count, 1);
 
     // Tick 2: insert a row; trace_out holds the ground.
     let prev = Rc::new(ground);
     let mut to_ch2 = ReadCursor::from_owned(&[prev], out_schema);
-    let (raw2, _) = g_reduce(
+    let raw2 = g_reduce(
         &g_delta(&[(1, 1, 7)]),
         None,
         &mut to_ch2,
@@ -6193,7 +6067,7 @@ fn global_value_change_emits_no_ground() {
     let out_schema = make_pk_sum_count_out_schema();
     let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
-    let (raw1, _) = g_reduce(
+    let raw1 = g_reduce(
         &g_delta(&[(1, 1, 5)]),
         None,
         &mut to_ch,
@@ -6206,7 +6080,7 @@ fn global_value_change_emits_no_ground() {
     // Change pk1's value 5 → 8 (retract old, insert new) — cardinality stays 1.
     let prev = Rc::new(raw1);
     let mut to_ch2 = ReadCursor::from_owned(&[prev], out_schema);
-    let (raw2, _) = g_reduce(
+    let raw2 = g_reduce(
         &g_delta(&[(1, -1, 5), (1, 1, 8)]),
         None,
         &mut to_ch2,
@@ -6239,7 +6113,7 @@ fn global_mixed_count_min_emptied_emits_ground() {
     let mut ti1 = ReadCursor::from_owned(&[empty_in], in_schema);
     let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
-    let (raw1, _) = g_reduce(
+    let raw1 = g_reduce(
         &g_delta(&[(1, 1, 5)]),
         Some(&mut ti1),
         &mut to_ch,
@@ -6264,7 +6138,7 @@ fn global_mixed_count_min_emptied_emits_ground() {
     let mut ti2 = ReadCursor::from_owned(&[hist], in_schema);
     let prev = Rc::new(raw1);
     let mut to_ch2 = ReadCursor::from_owned(&[prev], out_schema);
-    let (raw2, _) = g_reduce(
+    let raw2 = g_reduce(
         &g_delta(&[(1, -1, 5)]),
         Some(&mut ti2),
         &mut to_ch2,
@@ -6302,7 +6176,7 @@ fn global_lone_min_retract_to_next_best() {
     let mut ti1 = ReadCursor::from_owned(&[empty_in], in_schema);
     let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
-    let (raw1, _) = g_reduce(
+    let raw1 = g_reduce(
         &g_delta(&[(1, 1, 5), (2, 1, 3)]),
         Some(&mut ti1),
         &mut to_ch,
@@ -6328,7 +6202,7 @@ fn global_lone_min_retract_to_next_best() {
     let mut ti2 = ReadCursor::from_owned(&[hist], in_schema);
     let prev = Rc::new(raw1);
     let mut to_ch2 = ReadCursor::from_owned(&[prev], out_schema);
-    let (raw2, _) = g_reduce(
+    let raw2 = g_reduce(
         &g_delta(&[(2, -1, 3)]),
         Some(&mut ti2),
         &mut to_ch2,
@@ -6393,8 +6267,6 @@ fn global_lone_min_avi_empty_prefix() {
             &[], // empty group cols
             &[G_MIN],
             Some(&mut avi_ch),
-            None,
-            None,
             true,
             true,
         )
@@ -6404,7 +6276,7 @@ fn global_lone_min_avi_empty_prefix() {
     // so a correct result can only come from the 0-byte-prefix index seek.
     let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
-    let (raw1, _) = g_min_avi(&g_delta(&[(1, 1, 50)]), &mut to_ch, 10);
+    let raw1 = g_min_avi(&g_delta(&[(1, 1, 50)]), &mut to_ch, 10);
     let mb1 = raw1.as_mem_batch();
     let p1 = (0..raw1.count).find(|&i| mb1.get_weight(i) == 1).expect("a +1 row");
     assert_eq!(
@@ -6416,7 +6288,7 @@ fn global_lone_min_avi_empty_prefix() {
     // Tick 2: a retraction re-evaluates the group; the AVI post-state is 20.
     let prev = Rc::new(raw1);
     let mut to_ch2 = ReadCursor::from_owned(&[prev], out_schema);
-    let (raw2, _) = g_min_avi(&g_delta(&[(2, -1, 10)]), &mut to_ch2, 20);
+    let raw2 = g_min_avi(&g_delta(&[(2, -1, 10)]), &mut to_ch2, 20);
     let mb2 = raw2.as_mem_batch();
     let p2 = (0..raw2.count).find(|&i| mb2.get_weight(i) == 1).expect("a +1 row");
     assert_eq!(
@@ -6447,7 +6319,7 @@ fn sumzero_folds_like_sum_and_empty_renders_zero() {
         agg_op: AggOp::SumZero,
         col_type_code: TypeCode::I64,
     };
-    let mut acc = Accumulator::new(&desc, &schema);
+    let mut acc = Accumulator::new(&desc, schema.locate(1));
 
     // Fresh: untouched, and renders 0 (Count's identity) rather than NULL (Sum's).
     assert!(acc.is_untouched(), "fresh SumZero is untouched");
@@ -6480,7 +6352,7 @@ fn count_non_null_all_null_group_renders_zero_null_clear() {
         agg_op: AggOp::CountNonNull,
         col_type_code: TypeCode::I64,
     };
-    let mut acc = Accumulator::new(&desc, &in_schema);
+    let mut acc = Accumulator::new(&desc, in_schema.locate(1));
 
     // Two rows whose payload column (payload slot 0) is NULL.
     let mut batch = Batch::with_schema(g_src(), 2);
@@ -6662,12 +6534,9 @@ fn combine_reduce(delta: &Batch, trace_out: &mut crate::storage::ReadCursor, out
         &[], // empty group cols ⇒ one global group at V₀
         &[C_SUMZERO, C_COUNT_PARTIALS],
         None,
-        None,
-        None,
         true, // global_ground
         true, // i_am_owner (V₀'s owner)
     )
-    .0
 }
 
 /// The combine sums the partial *count values* (3 + 5 = 8), not the number of
@@ -6793,10 +6662,12 @@ fn build_combined_avi(
         .filter(|d| d.agg_op.uses_value_index())
         .copied()
         .collect();
+    let extractor = super::super::util::GroupKeyExtractor::new(in_schema, group_cols);
     let avi = AviDesc {
         table: &mut t as *mut crate::storage::Table,
         group_by_cols: group_cols,
         aggs: &vi_aggs,
+        extractor: &extractor,
     };
     for d in deltas {
         op_integrate_with_indexes(d, None, in_schema, Some(&avi)).unwrap();
@@ -6888,7 +6759,7 @@ fn reduce_multi_avi_foreign_group() {
     let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to_ch = ReadCursor::from_owned(&[empty_out], out_schema);
 
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to_ch,
@@ -6897,8 +6768,6 @@ fn reduce_multi_avi_foreign_group() {
         &[1u32],
         &aggs,
         Some(&mut avi_ch),
-        None,
-        None,
         false,
         false,
     );
@@ -6999,12 +6868,9 @@ fn cg3_tick(
         &[1u32],
         aggs,
         Some(&mut avi_ch),
-        None,
-        None,
         false,
         false,
     )
-    .0
 }
 
 /// Linear companion folded alongside the indexed MIN: COUNT = old + Σdelta, MIN
@@ -7195,7 +7061,7 @@ fn reduce_multi_avi_same_col_min_max() {
     let mut avi_ch = avi_t.open_cursor();
     let empty = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to = ReadCursor::from_owned(&[empty], out_schema);
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to,
@@ -7204,8 +7070,6 @@ fn reduce_multi_avi_same_col_min_max() {
         &[1u32],
         &aggs,
         Some(&mut avi_ch),
-        None,
-        None,
         false,
         false,
     );
@@ -7276,7 +7140,7 @@ fn reduce_multi_avi_compound_group_key() {
     let mut avi_ch = avi_t.open_cursor();
     let empty = Rc::new(Batch::empty_with_schema(&out_schema));
     let mut to = ReadCursor::from_owned(&[empty], out_schema);
-    let (out, _) = op_reduce(
+    let out = op_reduce(
         &delta,
         None,
         &mut to,
@@ -7285,8 +7149,6 @@ fn reduce_multi_avi_compound_group_key() {
         &[1u32, 2u32],
         &aggs,
         Some(&mut avi_ch),
-        None,
-        None,
         false,
         false,
     );
@@ -7373,12 +7235,9 @@ fn reduce_multi_avi_global_emptied() {
             &[],
             &aggs,
             Some(&mut avi_ch),
-            None,
-            None,
             true,
             true,
         )
-        .0
     };
 
     // Tick 1: insert {a=5,b=10},{a=3,b=20}. MIN=3, SUM=30, COUNT=2.
@@ -7513,10 +7372,9 @@ fn run_reduce_trace_epochs(
         max_sources = max_sources.max(sources);
         let out = {
             let mut ch = trace.open_cursor();
-            let (out, _) = op_reduce(
-                d, None, &mut ch, in_schema, out_schema, group_by, aggs, None, None, None, false, false,
-            );
-            out
+            op_reduce(
+                d, None, &mut ch, in_schema, out_schema, group_by, aggs, None, false, false,
+            )
         };
         trace.ingest_owned_batch(out).unwrap();
         if flush_after_first && i == 0 {
@@ -7886,6 +7744,7 @@ fn run_minmax_epochs(
     // compiler feeds the integrate instruction and the reduce read side.
     let vi_aggs: Vec<AggDescriptor> = aggs.iter().filter(|d| d.agg_op.uses_value_index()).copied().collect();
 
+    let avi_extractor = GroupKeyExtractor::new(in_schema, group_by);
     let mut states = Vec::with_capacity(epochs.len());
     for d in epochs {
         // AVI Integrate precedes Reduce: post-delta `I(input)` before the read.
@@ -7894,6 +7753,7 @@ fn run_minmax_epochs(
                 table: t as *mut Table,
                 group_by_cols: group_by,
                 aggs: &vi_aggs,
+                extractor: &avi_extractor,
             };
             op_integrate_with_indexes(d, None, in_schema, Some(&avi)).unwrap();
         }
@@ -7911,12 +7771,9 @@ fn run_minmax_epochs(
                         group_by,
                         aggs,
                         Some(&mut avi_ch),
-                        None,
-                        None,
                         global_ground,
                         global_ground,
                     )
-                    .0
                 }
                 (None, Some(ti)) => {
                     let mut ti_ch = ti.open_cursor();
@@ -7929,12 +7786,9 @@ fn run_minmax_epochs(
                         group_by,
                         aggs,
                         None,
-                        None,
-                        None,
                         global_ground,
                         global_ground,
                     )
-                    .0
                 }
                 _ => unreachable!("exactly one of avi / trace_in is live"),
             }

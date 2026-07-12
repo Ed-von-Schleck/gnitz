@@ -2,163 +2,132 @@
 
 use std::cmp::Ordering;
 
-use crate::schema::{key::PkSortKey, SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL};
+use crate::schema::{key::PkSortKey, ColumnLocator, SchemaDescriptor, TypeCode};
 use crate::storage::{cmp_col_window, compare_pk_bytes, Batch, ColumnarSource, MemBatch};
 
-/// Pre-computed per-column sort descriptor to avoid repeated schema lookups.
-///
-/// Four bytes per entry, no padding (all fields are u8-sized).
-/// A stack array of MAX_COLUMNS = 65 entries is 260 bytes — well within five cache lines.
-#[derive(Clone, Copy)]
-pub(crate) struct SortDesc {
-    pub(crate) pi: u8,
-    pub(crate) cs: u8,
-    pub(crate) tc: TypeCode,
-    /// Byte offset of the addressed PK column within the row's PK region.
-    /// Meaningful only when `pi == PAYLOAD_MAPPING_PK_SENTINEL`; zero otherwise.
-    pub(crate) pk_off: u8,
-}
-
-/// Compare two rows by group columns using a pre-computed SortDesc array.
-/// Generic over two [`ColumnarSource`]s, so an intra-batch argsort compare and
-/// the trace-cursor-vs-exemplar group-membership test share this one body.
+/// Compare two rows by group columns through pre-resolved [`ColumnLocator`]s
+/// (the reduce plan's baked `sort_descs`). Generic over two
+/// [`ColumnarSource`]s, so an intra-batch argsort compare and the
+/// trace-cursor-vs-exemplar group-membership test share this one body.
 pub(super) fn compare_by_group_cols<A: ColumnarSource, B: ColumnarSource>(
     src_a: &A,
     row_a: usize,
     src_b: &B,
     row_b: usize,
-    descs: &[SortDesc],
+    descs: &[ColumnLocator],
 ) -> Ordering {
     let a_null_word = src_a.get_null_word(row_a);
     let b_null_word = src_b.get_null_word(row_b);
 
-    for desc in descs {
-        if desc.pi == PAYLOAD_MAPPING_PK_SENTINEL {
-            // Isolate the addressed PK column's byte window. Comparing the
-            // whole PK region (the previous `get_pk(row)` widen) splits
-            // compound-PK groups that share the addressed column but differ
-            // in other PK columns.
-            // PK region holds OPK bytes, which are order-preserving — compare
-            // them raw. (A `cmp_typed_le` LE decode would invert order for
-            // big-endian/sign-flipped OPK bytes.)
-            let off = desc.pk_off as usize;
-            let cs = desc.cs as usize;
-            let a = &src_a.get_pk_bytes(row_a)[off..off + cs];
-            let b = &src_b.get_pk_bytes(row_b)[off..off + cs];
-            let ord = a.cmp(b);
-            if ord != Ordering::Equal {
-                return ord;
+    for loc in descs {
+        match *loc {
+            ColumnLocator::Pk { byte_off, size, .. } => {
+                // Isolate the addressed PK column's byte window. Comparing the
+                // whole PK region (the previous `get_pk(row)` widen) splits
+                // compound-PK groups that share the addressed column but differ
+                // in other PK columns.
+                // PK region holds OPK bytes, which are order-preserving — compare
+                // them raw. (A `cmp_typed_le` LE decode would invert order for
+                // big-endian/sign-flipped OPK bytes.)
+                let off = byte_off as usize;
+                let cs = size as usize;
+                let a = &src_a.get_pk_bytes(row_a)[off..off + cs];
+                let b = &src_b.get_pk_bytes(row_b)[off..off + cs];
+                let ord = a.cmp(b);
+                if ord != Ordering::Equal {
+                    return ord;
+                }
             }
-            continue;
-        }
+            ColumnLocator::Payload { slot, size, type_code } => {
+                let pi = slot as usize;
 
-        let pi = desc.pi as usize;
+                // NULL is never set on non-nullable columns, so the bit is always 0
+                // there and this branch is harmless. NULLs sort before non-NULLs
+                // (NULLS FIRST), so all NULLs are adjacent and form a single group.
+                let a_is_null = (a_null_word >> pi) & 1 != 0;
+                let b_is_null = (b_null_word >> pi) & 1 != 0;
+                match (a_is_null, b_is_null) {
+                    (true, true) => continue,
+                    (true, false) => return Ordering::Less,
+                    (false, true) => return Ordering::Greater,
+                    (false, false) => {}
+                }
 
-        // NULL is never set on non-nullable columns, so the bit is always 0
-        // there and this branch is harmless. NULLs sort before non-NULLs
-        // (NULLS FIRST), so all NULLs are adjacent and form a single group.
-        let a_is_null = (a_null_word >> pi) & 1 != 0;
-        let b_is_null = (b_null_word >> pi) & 1 != 0;
-        match (a_is_null, b_is_null) {
-            (true, true) => continue,
-            (true, false) => return Ordering::Less,
-            (false, true) => return Ordering::Greater,
-            (false, false) => {}
-        }
-
-        // SortDesc.cs is already tc.stride() = 16 for STRING/BLOB (build_sort_descs),
-        // so a single `cs`-wide read feeds both the German-string content compare
-        // and the fixed-width path; each source's blob arena backs its own row's
-        // string tail.
-        let cs = desc.cs as usize;
-        let a = src_a.get_col_ptr(row_a, pi, cs);
-        let b = src_b.get_col_ptr(row_b, pi, cs);
-        let ord = cmp_col_window(a, src_a.blob_slice(), b, src_b.blob_slice(), desc.tc as u8);
-        if ord != Ordering::Equal {
-            return ord;
+                // The locator's `size` is already 16 for STRING/BLOB, so a single
+                // `cs`-wide read feeds both the German-string content compare
+                // and the fixed-width path; each source's blob arena backs its
+                // own row's string tail.
+                let cs = size as usize;
+                let a = src_a.get_col_ptr(row_a, pi, cs);
+                let b = src_b.get_col_ptr(row_b, pi, cs);
+                let ord = cmp_col_window(a, src_a.blob_slice(), b, src_b.blob_slice(), type_code);
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
         }
     }
     Ordering::Equal
 }
 
-/// Build the SortDesc array for a given schema and group_by_cols slice.
-/// Returns (array, length); only `&array[..length]` is valid.
-pub(super) fn build_sort_descs(
-    schema: &SchemaDescriptor,
-    group_by_cols: &[u32],
-) -> ([SortDesc; crate::schema::MAX_COLUMNS], usize) {
-    let mut arr = [SortDesc {
-        pi: 0,
-        cs: 0,
-        tc: TypeCode::U64,
-        pk_off: 0,
-    }; crate::schema::MAX_COLUMNS];
-    for (i, &c_idx_u32) in group_by_cols.iter().enumerate() {
-        let c_idx = c_idx_u32 as usize;
-        let tc = TypeCode::from_validated_u8(schema.columns[c_idx].type_code);
-        let pi = schema.payload_mapping_byte(c_idx);
-        let pk_off = if pi == PAYLOAD_MAPPING_PK_SENTINEL {
-            schema.pk_byte_offset(c_idx)
-        } else {
-            0
-        };
-        arr[i] = SortDesc {
-            pi,
-            cs: tc.stride(),
-            tc,
-            pk_off,
-        };
+/// The packed-sort fast-path spec for [`argsort_delta`]: `Some((payload slot,
+/// tc))` iff the group key is a single non-nullable, non-PK column of a
+/// packable int type. NULL stores as zero bytes — it would interleave with
+/// integer 0 — so a nullable column falls through to the comparator path.
+/// Baked once into the reduce plan (`ReducePlan::packed_sort`).
+pub(super) fn packed_sort_spec(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> Option<(u8, TypeCode)> {
+    let [c] = group_by_cols else {
+        return None;
+    };
+    let ci = *c as usize;
+    let tc = TypeCode::from_validated_u8(schema.columns[ci].type_code);
+    match schema.locate(ci) {
+        ColumnLocator::Payload { slot, .. }
+            if schema.columns[ci].nullable == 0
+                && matches!(tc, TypeCode::I64 | TypeCode::U64 | TypeCode::I32 | TypeCode::U32) =>
+        {
+            Some((slot, tc))
+        }
+        _ => None,
     }
-    (arr, group_by_cols.len())
 }
 
-/// Argsort delta batch by group columns. `descs` is the pre-built descriptor
-/// slice for `group_by_cols` (the reduce plan's baked `sort_descs`).
-pub(super) fn argsort_delta(
-    batch: &Batch,
-    schema: &SchemaDescriptor,
-    group_by_cols: &[u32],
-    descs: &[SortDesc],
-) -> Vec<u32> {
+/// Argsort `0..n` by a per-row key, materialised ONCE into a dense `Vec` and
+/// compared by reference — never re-invoking `key` (or re-copying a 32-byte
+/// `[u128; 2]` key, as `sort_unstable_by_key` would) per comparison.
+fn argsort_by_key<K: Ord>(n: usize, key: impl Fn(usize) -> K) -> Vec<u32> {
+    let keys: Vec<K> = (0..n).map(key).collect();
+    let mut indices: Vec<u32> = (0..n as u32).collect();
+    indices.sort_unstable_by(|&a, &b| keys[a as usize].cmp(&keys[b as usize]));
+    indices
+}
+
+/// Argsort delta batch by group columns. `packed` is the plan's baked
+/// [`packed_sort_spec`] (dense typed keys, no per-row comparator dispatch);
+/// `descs` the pre-resolved locator slice for the comparator path (the reduce
+/// plan's baked `sort_descs`).
+pub(super) fn argsort_delta(batch: &Batch, packed: Option<(u8, TypeCode)>, descs: &[ColumnLocator]) -> Vec<u32> {
     let mb = batch.as_mem_batch();
     let n = batch.count;
     if n <= 1 {
         return (0..n as u32).collect();
     }
 
-    // packed_sort fast path: non-nullable single non-PK col of a packable
-    // int type. Reads via `try_payload_idx` (PK-guarded) and stores keys in a
-    // dense Vec so the comparator skips the per-call TypeCode dispatch.
-    // NULL stores as zero bytes — would interleave with integer 0, so
-    // nullable falls through to compare_by_group_cols below.
-    if group_by_cols.len() == 1
-        && !schema.is_pk_col(group_by_cols[0] as usize)
-        && schema.columns[group_by_cols[0] as usize].nullable == 0
-    {
-        let ci = group_by_cols[0] as usize;
-        let tc = TypeCode::from_validated_u8(schema.columns[ci].type_code);
-        let pi = schema
-            .try_payload_idx(ci)
-            .expect("non-PK: guarded by !is_pk_col on the fast-path entry above");
+    if let Some((pi, tc)) = packed {
+        let pi = pi as usize;
         macro_rules! packed_sort {
-            ($T:ty, $stride:expr) => {{
-                let keys: Vec<$T> = (0..n)
-                    .map(|i| {
-                        let ptr = mb.get_col_ptr(i, pi, $stride);
-                        <$T>::from_le_bytes(ptr.try_into().unwrap())
-                    })
-                    .collect();
-                let mut indices: Vec<u32> = (0..n as u32).collect();
-                indices.sort_unstable_by_key(|&i| keys[i as usize]);
-                return indices;
-            }};
+            ($T:ty, $stride:expr) => {
+                return argsort_by_key(n, |i| {
+                    <$T>::from_le_bytes(mb.get_col_ptr(i, pi, $stride).try_into().unwrap())
+                })
+            };
         }
         match tc {
             TypeCode::I64 => packed_sort!(i64, 8),
             TypeCode::U64 => packed_sort!(u64, 8),
             TypeCode::I32 => packed_sort!(i32, 4),
             TypeCode::U32 => packed_sort!(u32, 4),
-            _ => {}
+            _ => unreachable!("packed_sort_spec admits only packable int types"),
         }
     }
 
@@ -167,37 +136,30 @@ pub(super) fn argsort_delta(
     indices
 }
 
-/// Sort `indices` by a width-matched `PkSortKey` (materialised once per row). The
-/// key is the whole OPK image, so the compare is exact; rows sharing a PK keep
-/// arbitrary relative order (the reduce groups them regardless). Keys are read by
-/// reference (not `sort_unstable_by_key`, which would re-copy the 32-byte
-/// `[u128; 2]` key per comparison).
-fn sort_indices_keyed<K: PkSortKey>(mb: &MemBatch, indices: &mut [u32]) {
-    let keys: Vec<K> = (0..mb.count).map(|i| K::from_opk(mb.get_pk_bytes(i))).collect();
-    indices.sort_unstable_by(|&a, &b| keys[a as usize].cmp(&keys[b as usize]));
-}
-
-/// Sort `indices` into canonical PK order. `pk_stride` selects the width-matched
-/// key — `u64`/`u128`/`[u128; 2]` for strides ≤8/≤16/≤32 (the cutoffs are the key
-/// widths) — each the full OPK image, so a plain key compare is exact for unsigned,
-/// signed, and compound PKs alike. PKs too wide to pack (`> 32` B — exotic 3–5
-/// wide-column composites) byte-walk the OPK regions via `compare_pk_bytes`. Rows
-/// sharing a PK keep arbitrary relative order (the reduce groups them regardless).
-fn sort_indices_by_pk(mb: &MemBatch, indices: &mut [u32]) {
-    match mb.pk_stride as usize {
-        0..=8 => sort_indices_keyed::<u64>(mb, indices),
-        9..=16 => sort_indices_keyed::<u128>(mb, indices),
-        17..=32 => sort_indices_keyed::<[u128; 2]>(mb, indices),
-        _ => indices
-            .sort_unstable_by(|&a, &b| compare_pk_bytes(mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize))),
-    }
+/// Argsort into canonical PK order via a width-matched `PkSortKey`. The key is
+/// the whole OPK image, so the compare is exact; rows sharing a PK keep
+/// arbitrary relative order (the reduce groups them regardless).
+fn sort_indices_keyed<K: PkSortKey>(mb: &MemBatch) -> Vec<u32> {
+    argsort_by_key(mb.count, |i| K::from_opk(mb.get_pk_bytes(i)))
 }
 
 /// Argsort indices into canonical PK order (`compare_pk_bytes` order).
+/// `pk_stride` selects the width-matched key — `u64`/`u128`/`[u128; 2]` for
+/// strides ≤8/≤16/≤32 (the cutoffs are the key widths) — each the full OPK
+/// image, so a plain key compare is exact for unsigned, signed, and compound
+/// PKs alike. PKs too wide to pack (`> 32` B — exotic 3–5 wide-column
+/// composites) byte-walk the OPK regions via `compare_pk_bytes`.
 pub(super) fn argsort_pk_canonical(mb: &MemBatch) -> Vec<u32> {
-    let mut idx: Vec<u32> = (0..mb.count as u32).collect();
-    sort_indices_by_pk(mb, &mut idx);
-    idx
+    match mb.pk_stride as usize {
+        0..=8 => sort_indices_keyed::<u64>(mb),
+        9..=16 => sort_indices_keyed::<u128>(mb),
+        17..=32 => sort_indices_keyed::<[u128; 2]>(mb),
+        _ => {
+            let mut idx: Vec<u32> = (0..mb.count as u32).collect();
+            idx.sort_unstable_by(|&a, &b| compare_pk_bytes(mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize)));
+            idx
+        }
+    }
 }
 
 #[cfg(test)]

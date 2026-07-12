@@ -7,8 +7,7 @@
 //! type: a missing or mis-routed opcode is a compile error, not a silent
 //! miscompute.
 
-use crate::foundation::codec::read_u32_le;
-use crate::schema::{german_string_tail, SchemaDescriptor};
+use crate::schema::{encode_german_string, ColumnLocator, SchemaDescriptor};
 // Wire opcodes (1–46) the client emits, matched as arms in `from_wire`. They are
 // `pub const … : u32` in gnitz-wire, so a plain `use` binds them for pattern use.
 use gnitz_wire::{
@@ -64,15 +63,6 @@ pub(crate) enum StrOp {
     Eq,
     Lt,
     Le,
-}
-
-/// Source of a `CopyCol`: a dense payload column, or a single column within the
-/// OPK PK region addressed by its byte offset. Replaces the old negative
-/// `-(off)-1` sentinel packed into the operand slot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::expr) enum ColSrc {
-    Payload(u8),
-    Pk { off: u8 },
 }
 
 // ---------------------------------------------------------------------------
@@ -233,13 +223,18 @@ pub(crate) enum LogicalInstr {
 /// `Cmp`/`IntDiv`/`IntMod`/`IntToFloat`, reinterpreting the i64 register as u64.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::expr) enum Instr {
+    /// Payload integer load. Width and signedness are `const fn`s of `tc`
+    /// (`type_size` / `is_signed_int`), recomputed once per instruction in the
+    /// eval arm rather than carried here — the same convention as `LoadPk`.
     LoadPayloadInt {
         dst: u16,
         pi: u8,
+        tc: u8,
     },
     LoadPayloadFloat {
         dst: u16,
         pi: u8,
+        tc: u8,
     },
     /// PK-region integer load: the addressed OPK column at byte `off`. Its width
     /// and signedness are `const fn`s of `tc` (`type_size` / `is_signed_int` —
@@ -373,10 +368,12 @@ pub(in crate::expr) enum Instr {
         pi_a: u8,
         pi_b: u8,
     },
+    /// Verbatim column copy into output payload slot `out`. `src` carries the
+    /// PK-vs-payload distinction plus width/type — the one resolved-column
+    /// record (`schema::ColumnLocator`) shared with the reduce/index paths.
     CopyCol {
         out: u32,
-        src: ColSrc,
-        tc: u8,
+        src: ColumnLocator,
     },
     Emit {
         src: u16,
@@ -385,17 +382,6 @@ pub(in crate::expr) enum Instr {
     EmitNull {
         out: u32,
     },
-}
-
-/// Classification of each output-producing instruction, in program order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::expr) enum OutputColKind {
-    /// Column copied verbatim from the input batch.
-    CopyCol { src: ColSrc, out_payload: u32, tc: u8 },
-    /// Computed register written to an output payload column.
-    Emit { reg: usize, out_payload: usize },
-    /// Always-NULL output column.
-    EmitNull { out_payload: u32 },
 }
 
 // ---------------------------------------------------------------------------
@@ -586,10 +572,6 @@ impl LogicalProgram {
         Self::assembled(instrs, num_regs, result_reg, const_strings)
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.instrs.len()
-    }
-
     /// If every instruction is `CopyCol` writing dense payload outputs
     /// `out = [0, 1, 2, …]` (in instruction order), return the copies' source
     /// columns — the program's payload copy list, from which `emit_node` derives
@@ -638,20 +620,21 @@ impl LogicalProgram {
         for li in self.instrs {
             match li {
                 L::LoadColInt { dst, col } => {
-                    let ci = col as usize;
-                    let tc = schema.columns[ci].type_code;
-                    if schema.is_pk_col(ci) {
-                        instrs.push(I::LoadPk {
+                    let tc = schema.columns[col as usize].type_code;
+                    instrs.push(match schema.locate(col as usize) {
+                        ColumnLocator::Pk {
+                            byte_off, type_code, ..
+                        } => I::LoadPk {
                             dst,
-                            off: schema.pk_byte_offset(ci),
-                            tc,
-                        });
-                    } else {
-                        instrs.push(I::LoadPayloadInt {
+                            off: byte_off,
+                            tc: type_code,
+                        },
+                        ColumnLocator::Payload { slot, type_code, .. } => I::LoadPayloadInt {
                             dst,
-                            pi: schema.payload_mapping_byte(ci),
-                        });
-                    }
+                            pi: slot,
+                            tc: type_code,
+                        },
+                    });
                     reg_tc[dst as usize] = tc;
                 }
                 L::LoadColFloat { dst, col } => {
@@ -663,6 +646,7 @@ impl LogicalProgram {
                     instrs.push(I::LoadPayloadFloat {
                         dst,
                         pi: schema.payload_mapping_byte(ci),
+                        tc: schema.columns[ci].type_code,
                     });
                     reg_tc[dst as usize] = 0;
                 }
@@ -779,38 +763,33 @@ impl LogicalProgram {
                     });
                 }
                 L::CopyCol { src_col, out } => {
-                    // The source type — dropped from the wire `CopyCol` — is exactly
-                    // the source column's own type; derive it here from the schema.
-                    let ci = src_col as usize;
-                    let tc = schema.columns[ci].type_code;
-                    let src = if schema.is_pk_col(ci) {
-                        ColSrc::Pk {
-                            off: schema.pk_byte_offset(ci),
-                        }
-                    } else {
-                        ColSrc::Payload(schema.payload_mapping_byte(ci))
-                    };
-                    instrs.push(I::CopyCol { out, src, tc });
+                    // The source's location, width, and type — dropped from the wire
+                    // `CopyCol` — resolve to the one canonical record.
+                    instrs.push(I::CopyCol {
+                        out,
+                        src: schema.locate(src_col as usize),
+                    });
                 }
                 L::Emit { src, out } => instrs.push(I::Emit { src, out }),
                 L::EmitNull { out } => instrs.push(I::EmitNull { out }),
             }
         }
-        let payload_col_info: Vec<(u8, u8)> = schema
-            .payload_columns()
-            .map(|(_, _, col)| (col.size(), col.type_code))
+        // Encode each string constant once into a 16-byte German-string cell
+        // over one shared const blob, so the str-vs-const eval arm compares it
+        // through the engine-wide `compare_german_strings` — no per-morsel
+        // re-derivation and no parallel prefix/length tables.
+        let mut const_blob: Vec<u8> = Vec::new();
+        let const_cells: Vec<[u8; 16]> = self
+            .const_strings
+            .iter()
+            .map(|s| encode_german_string(s, &mut const_blob))
             .collect();
-        // Precompute each string constant's compare key once (see field docs).
-        let const_prefixes: Vec<u32> = self.const_strings.iter().map(|s| compute_prefix(s)).collect();
-        let const_lengths: Vec<u32> = self.const_strings.iter().map(|s| s.len() as u32).collect();
         let mut prog = ResolvedProgram {
             instrs,
             num_regs: self.num_regs,
             result_reg: self.result_reg,
-            const_strings: self.const_strings,
-            const_prefixes,
-            const_lengths,
-            payload_col_info,
+            const_cells,
+            const_blob,
             no_nulls: false,
             bit_only_mask: 0,
             bool_input_mask: 0,
@@ -1023,13 +1002,11 @@ pub(in crate::expr) struct ResolvedProgram {
     pub(in crate::expr) instrs: Vec<Instr>,
     pub(in crate::expr) num_regs: u32,
     pub(in crate::expr) result_reg: u32,
-    pub(in crate::expr) const_strings: Vec<Vec<u8>>,
-    /// Per-constant precomputed 4-byte BE prefix and byte length, indexed by
-    /// `const_idx` — hoisted out of the per-morsel `col <op> 'const'` compare loop.
-    pub(in crate::expr) const_prefixes: Vec<u32>,
-    pub(in crate::expr) const_lengths: Vec<u32>,
-    /// (size, type_code) for each physical payload column, in payload order.
-    pub(in crate::expr) payload_col_info: Vec<(u8, u8)>,
+    /// Per-constant 16-byte German-string cell (indexed by `const_idx`) over
+    /// the one shared `const_blob` — encoded once at resolve, compared by the
+    /// engine-wide `compare_german_strings`.
+    pub(in crate::expr) const_cells: Vec<[u8; 16]>,
+    pub(in crate::expr) const_blob: Vec<u8>,
     /// True iff no instruction can produce a NULL against the schema this program
     /// was resolved against, so the evaluator skips null-bit tracking entirely.
     /// Resolved once — the answer is only meaningful for that one schema, since
@@ -1239,33 +1216,19 @@ impl ResolvedProgram {
             }
         }
         let mut bit_only = bool_produced & !non_bool_read;
-        if !is_filter && self.num_regs > 0 {
-            bit_only &= !(1u64 << self.result_reg as usize);
-        }
-        (bit_only, bool_input)
-    }
-
-    /// Classify each output-producing instruction, in program order.
-    pub(in crate::expr) fn classify_output_cols(&self) -> Vec<OutputColKind> {
-        use Instr::*;
-        let mut out_cols = Vec::new();
-        for instr in &self.instrs {
-            match *instr {
-                CopyCol { src, out, tc } => out_cols.push(OutputColKind::CopyCol {
-                    src,
-                    out_payload: out,
-                    tc,
-                }),
-                Emit { src, out } => out_cols.push(OutputColKind::Emit {
-                    reg: src as usize,
-                    out_payload: out as usize,
-                }),
-                EmitNull { out } => out_cols.push(OutputColKind::EmitNull { out_payload: out }),
-                // Subset-select: only the three output variants matter here.
-                _ => {}
+        if self.num_regs > 0 {
+            if is_filter {
+                // `run_filter`'s nullable arm consumes the result as packed bits
+                // (a word-level `bool_bits & !null_bits` merge), so the result
+                // producer must populate `bool_bits` whatever opcode it is —
+                // marking it a bool input routes every non-bool producer through
+                // `maybe_pack_bool_bits`.
+                bool_input |= 1u64 << self.result_reg as usize;
+            } else {
+                bit_only &= !(1u64 << self.result_reg as usize);
             }
         }
-        out_cols
+        (bit_only, bool_input)
     }
 
     /// Returns true if no instruction in this program can produce a NULL result
@@ -1326,49 +1289,5 @@ impl ResolvedProgram {
             }
         }
         true
-    }
-}
-
-// ---------------------------------------------------------------------------
-// String comparison helpers (column vs constant)
-// ---------------------------------------------------------------------------
-
-/// 4-byte prefix of `s` as big-endian u32 for ordered comparison. Short strings
-/// zero-pad on the right so integer `<`/`>` matches lexicographic byte order.
-pub(in crate::expr) fn compute_prefix(s: &[u8]) -> u32 {
-    let mut buf = [0u8; 4];
-    let n = s.len().min(4);
-    buf[..n].copy_from_slice(&s[..n]);
-    u32::from_be_bytes(buf)
-}
-
-/// Compare a German String column value against a constant byte string.
-pub(in crate::expr) fn compare_col_string_vs_const(
-    struct_bytes: &[u8],
-    blob: &[u8],
-    const_bytes: &[u8],
-    const_prefix: u32,
-    const_len: u32,
-) -> std::cmp::Ordering {
-    let col_len = read_u32_le(struct_bytes, 0) as usize;
-    let c_len = const_len as usize;
-    let min_len = col_len.min(c_len);
-
-    // Single big-endian integer comparison of the 4-byte prefix. Both sides
-    // zero-pad bytes beyond their length, so no masking is needed.
-    let col_pfx = u32::from_be_bytes(struct_bytes[4..8].try_into().unwrap());
-    if col_pfx != const_prefix {
-        return col_pfx.cmp(&const_prefix);
-    }
-
-    if min_len <= 4 {
-        return col_len.cmp(&c_len);
-    }
-
-    // Bulk suffix comparison — vectorised memcmp via [u8]::cmp.
-    let col_tail = german_string_tail(struct_bytes, blob, col_len, min_len);
-    match col_tail.cmp(&const_bytes[4..min_len]) {
-        std::cmp::Ordering::Equal => col_len.cmp(&c_len),
-        ord => ord,
     }
 }

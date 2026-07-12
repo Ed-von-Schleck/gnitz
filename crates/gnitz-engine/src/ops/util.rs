@@ -41,17 +41,19 @@ pub(crate) fn all_payload_null_mask(npc: usize) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Precomputed gatherer for the byte-form AVI composite group key. Resolves
-/// each group column's layout once; `gather` then concatenates raw bytes per
-/// row. Callers must have passed `query::compiler::avi_group_key_eligible`
-/// (fixed-width, non-nullable columns), so it never sees STRING/BLOB or a NULL.
-pub(super) struct GroupKeyExtractor {
+/// each group column's layout once — baked into the reduce plan (read side)
+/// and the compiled program (`Program::avi_extractors`, write side); `gather`
+/// then concatenates raw bytes per row. Callers must have passed
+/// `query::compiler::avi_group_key_eligible` (fixed-width, non-nullable
+/// columns), so it never sees STRING/BLOB or a NULL.
+pub(crate) struct GroupKeyExtractor {
     cols: Vec<ColumnLocator>,
     /// Total group-key width in bytes (the group stride).
     pub(super) stride: usize,
 }
 
 impl GroupKeyExtractor {
-    pub(super) fn new(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> Self {
+    pub(crate) fn new(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> Self {
         let mut cols = Vec::with_capacity(group_by_cols.len());
         let mut stride = 0;
         for &c in group_by_cols {
@@ -239,17 +241,6 @@ pub(crate) fn global_group_key() -> u128 {
     Xxh3Default::new().digest128()
 }
 
-/// Extract 128-bit group key from a `ReadCursor`'s current row. Hashes
-/// byte-identically to [`extract_group_key`] for the same logical row (both
-/// route through the one `extract_group_key_row` body over `ColumnarSource`),
-/// so a trace row routes to the delta group it belongs to. Pinned by
-/// `extract_group_key_cursor_matches_batch`.
-#[inline]
-pub(super) fn extract_group_key_cursor(cursor: &ReadCursor, schema: &SchemaDescriptor, group_by_cols: &[u32]) -> u128 {
-    let (src, row) = cursor.current_row_source();
-    extract_group_key_row(src, row, schema, group_by_cols)
-}
-
 /// Which canonical (order-preserving) fast-path arm [`extract_group_key_row`]
 /// emits the group key of `group_by_cols` through, or `None` for the XXH3
 /// fold (multi-column, nullable, or non-routable type). `op_reduce` upgrades
@@ -283,11 +274,87 @@ pub(super) fn single_col_canonical_group_key(
     (col.nullable == 0 && crate::schema::is_routable_int(col.type_code)).then_some(CanonicalKeyArm::Payload)
 }
 
+/// Execute the canonical single-column fast-path arm through a resolved
+/// locator. Shared by the schema-walking [`extract_group_key_row`] and the
+/// baked [`GroupKeyCols::key_row`], so the two produce identical keys by
+/// construction.
+///
+/// Pk arm: the addressed column's canonical key (native for unsigned,
+/// sign-flipped for signed) via `pk_route_key` — identical to
+/// `partition_for_pk_bytes` and `mb.get_pk(row)`, so a join key routes the
+/// same whether it is a (sub-)PK column here or a single PK / payload FK on
+/// the join's other side. For a single-PK schema this equals `mb.get_pk(row)`.
+///
+/// Payload arm: a value routes to the same partition whether it is the PK on
+/// one side of a join (OPK bytes, widened) or a payload FK column on the
+/// other: `payload_route_key` OPK-encodes+widens to the canonical value
+/// (sign-flipped for signed), matching the PK side.
+#[inline]
+fn canonical_group_key<R: ColumnarSource>(src: &R, row: usize, arm: CanonicalKeyArm, loc: ColumnLocator) -> u128 {
+    match (arm, loc) {
+        (CanonicalKeyArm::Pk, ColumnLocator::Pk { byte_off, size, .. }) => {
+            crate::schema::pk_route_key(src.get_pk_bytes(row), byte_off as usize, size as usize)
+        }
+        (CanonicalKeyArm::Payload, ColumnLocator::Payload { slot, size, type_code }) => {
+            let cs = size as usize;
+            crate::schema::payload_route_key(src.get_col_ptr(row, slot as usize, cs), 0, cs, type_code)
+        }
+        _ => unreachable!("canonical arm / locator variant mismatch"),
+    }
+}
+
+/// Hash one group column into the fold-path digest. The single per-column
+/// body shared by the schema-walking [`extract_group_key_row`] and the baked
+/// [`GroupKeyCols::key_row`] — a divergence would silently merge or split
+/// groups in the non-linear REDUCE fallback (wrong MIN/MAX).
+#[inline]
+fn hash_group_col<R: ColumnarSource>(
+    hasher: &mut Xxh3Default,
+    src: &R,
+    row: usize,
+    null_word: u64,
+    loc: ColumnLocator,
+    nullable: bool,
+) {
+    match loc {
+        ColumnLocator::Pk { byte_off, size, .. } => {
+            // PK columns are non-nullable; canonical OPK-derived route key, so
+            // a PK sub-column hashes like the same value as a payload FK on a
+            // join's other side.
+            let key = crate::schema::pk_route_key(src.get_pk_bytes(row), byte_off as usize, size as usize);
+            hasher.update(&[1u8]); // non-null marker
+            hasher.update(&key.to_le_bytes());
+        }
+        ColumnLocator::Payload { slot, size, type_code } => {
+            if nullable && (null_word >> slot) & 1 != 0 {
+                hasher.update(&[0u8]); // null marker
+                return;
+            }
+            // `size` is already 16 for STRING/BLOB/U128/UUID (all share the wide
+            // 16-byte layout), so no per-type width fixup is needed here.
+            let cs = size as usize;
+            let b = src.get_col_ptr(row, slot as usize, cs);
+            hasher.update(&[1u8]); // non-null marker
+            if gnitz_wire::is_german_string(type_code) {
+                // STRING and BLOB both hash length-prefixed content via the shared
+                // helper (matching reindex_hash_row); load-bearing for BLOB grouping
+                // keys (Fix C), not only STRING.
+                hash_german_string_content(hasher, b, src.blob_slice());
+            } else if type_code == type_code::U128 || type_code == type_code::UUID {
+                hasher.update(&b[..16]);
+            } else {
+                // Canonical (sign-flipped/widened) value: a payload FK hashes like
+                // the same value stored as a PK column (matches the Pk arm).
+                let key = crate::schema::payload_route_key(b, 0, cs, type_code);
+                hasher.update(&key.to_le_bytes());
+            }
+        }
+    }
+}
+
 /// The one group-key hash body, generic over any [`ColumnarSource`] row — a
 /// `MemBatch` row and a `ReadCursor`'s current row hash byte-identically, so a
-/// trace row routes to the delta group it belongs to. A divergence would
-/// silently merge or split groups in the non-linear REDUCE fallback (wrong
-/// MIN/MAX).
+/// trace row routes to the delta group it belongs to.
 #[inline]
 fn extract_group_key_row<R: ColumnarSource>(
     src: &R,
@@ -296,38 +363,12 @@ fn extract_group_key_row<R: ColumnarSource>(
     group_by_cols: &[u32],
 ) -> u128 {
     // Canonical single-column fast path, dispatched by the shared
-    // `single_col_canonical_group_key` classifier (see its doc).
-    //
-    // Pk arm: the addressed column's canonical key (native for unsigned,
-    // sign-flipped for signed) via `pk_route_key` — identical to
-    // `partition_for_pk_bytes` and `mb.get_pk(row)`, so a join key routes the
-    // same whether it is a (sub-)PK column here or a single PK / payload FK on
-    // the join's other side. For a single-PK schema this equals
-    // `mb.get_pk(row)`.
-    //
-    // Payload arm: a value routes to the same partition whether it is the PK on
-    // one side of a join (OPK bytes, widened) or a payload FK column on the
-    // other: `payload_route_key` OPK-encodes+widens to the canonical value
-    // (sign-flipped for signed), matching the PK side. Nullable columns (the
-    // hash loop handles NULL distinctly) and STRING/BLOB/F32/F64 fall through
-    // to the hash loop — a zero-extended content prefix is not a valid routing
-    // key for them.
+    // `single_col_canonical_group_key` classifier (see its doc). Nullable
+    // columns (the hash loop handles NULL distinctly) and STRING/BLOB/F32/F64
+    // fall through to the hash loop — a zero-extended content prefix is not a
+    // valid routing key for them.
     if let Some(arm) = single_col_canonical_group_key(schema, group_by_cols) {
-        let c_idx = group_by_cols[0] as usize;
-        let col = &schema.columns[c_idx];
-        let cs = col.size() as usize;
-        match arm {
-            CanonicalKeyArm::Pk => {
-                let off = schema.pk_byte_offset(c_idx) as usize;
-                return crate::schema::pk_route_key(src.get_pk_bytes(row), off, cs);
-            }
-            CanonicalKeyArm::Payload => {
-                let pi = schema
-                    .try_payload_idx(c_idx)
-                    .expect("Payload arm: non-PK by classification");
-                return crate::schema::payload_route_key(src.get_col_ptr(row, pi, cs), 0, cs, col.type_code);
-            }
-        }
+        return canonical_group_key(src, row, arm, schema.locate(group_by_cols[0] as usize));
     }
 
     // Fold path: multi-column GROUP BY, a single STRING/BLOB column, or a single
@@ -344,46 +385,64 @@ fn extract_group_key_row<R: ColumnarSource>(
     let mut hasher = Xxh3Default::new();
     for &c_idx_u32 in group_by_cols {
         let c_idx = c_idx_u32 as usize;
-        let tc = schema.columns[c_idx].type_code;
-        if schema.is_pk_col(c_idx) {
-            // PK columns are non-nullable; canonical OPK-derived route key, so
-            // a PK sub-column hashes like the same value as a payload FK on a
-            // join's other side.
-            let off = schema.pk_byte_offset(c_idx) as usize;
-            let cs = schema.columns[c_idx].size() as usize;
-            let key = crate::schema::pk_route_key(src.get_pk_bytes(row), off, cs);
-            hasher.update(&[1u8]); // non-null marker
-            hasher.update(&key.to_le_bytes());
-            continue;
-        }
-        let pi = schema
-            .try_payload_idx(c_idx)
-            .expect("non-PK: PK columns handled in the branch above");
-        let is_null = schema.columns[c_idx].nullable != 0 && (null_word >> pi) & 1 != 0;
-        if is_null {
-            hasher.update(&[0u8]); // null marker
-            continue;
-        }
-        // `size()` is already 16 for STRING/BLOB/U128/UUID (all share the wide
-        // 16-byte layout), so no per-type width fixup is needed here.
-        let cs = schema.columns[c_idx].size() as usize;
-        let b = src.get_col_ptr(row, pi, cs);
-        hasher.update(&[1u8]); // non-null marker
-        if gnitz_wire::is_german_string(tc) {
-            // STRING and BLOB both hash length-prefixed content via the shared
-            // helper (matching reindex_hash_row); load-bearing for BLOB grouping
-            // keys (Fix C), not only STRING.
-            hash_german_string_content(&mut hasher, b, src.blob_slice());
-        } else if tc == type_code::U128 || tc == type_code::UUID {
-            hasher.update(&b[..16]);
-        } else {
-            // Canonical (sign-flipped/widened) value: a payload FK hashes like
-            // the same value stored as a PK column (matches the is_pk_col arm).
-            let key = crate::schema::payload_route_key(b, 0, cs, tc);
-            hasher.update(&key.to_le_bytes());
-        }
+        hash_group_col(
+            &mut hasher,
+            src,
+            row,
+            null_word,
+            schema.locate(c_idx),
+            schema.columns[c_idx].nullable != 0,
+        );
     }
     hasher.digest128()
+}
+
+/// The baked form of [`extract_group_key_row`]: per-column locators and
+/// nullability (the one schema fact a locator does not carry) resolved once at
+/// plan-bake time, for per-row hot loops (the non-linear REDUCE fallback's
+/// per-trace-row routing). Consumes the same shared per-column bodies
+/// (`canonical_group_key` / `hash_group_col`) as the schema-walking form, so a
+/// baked key and an ad-hoc key are byte-identical by construction.
+pub(super) struct GroupKeyCols {
+    canonical: Option<CanonicalKeyArm>,
+    cols: Vec<(ColumnLocator, bool)>,
+}
+
+impl GroupKeyCols {
+    pub(super) fn new(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> Self {
+        GroupKeyCols {
+            canonical: single_col_canonical_group_key(schema, group_by_cols),
+            cols: group_by_cols
+                .iter()
+                .map(|&c| {
+                    let ci = c as usize;
+                    (schema.locate(ci), schema.columns[ci].nullable != 0)
+                })
+                .collect(),
+        }
+    }
+
+    /// The 128-bit group key of `row` — equals `extract_group_key` over the
+    /// same (schema, group_by_cols) this was baked from.
+    #[inline]
+    pub(super) fn key_row<R: ColumnarSource>(&self, src: &R, row: usize) -> u128 {
+        if let Some(arm) = self.canonical {
+            return canonical_group_key(src, row, arm, self.cols[0].0);
+        }
+        let null_word = src.get_null_word(row);
+        let mut hasher = Xxh3Default::new();
+        for &(loc, nullable) in &self.cols {
+            hash_group_col(&mut hasher, src, row, null_word, loc, nullable);
+        }
+        hasher.digest128()
+    }
+
+    /// [`Self::key_row`] over a `ReadCursor`'s current row.
+    #[inline]
+    pub(super) fn key_cursor(&self, cursor: &ReadCursor) -> u128 {
+        let (src, row) = cursor.current_row_source();
+        self.key_row(src, row)
+    }
 }
 
 #[cfg(test)]

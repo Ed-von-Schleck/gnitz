@@ -1,6 +1,6 @@
 //! Annotation + optimization passes and the schema-construction helpers:
-//! co-partition analysis, distinct elision, the reduce-finalize fold, and the
-//! join/reduce/map output schemas.
+//! co-partition analysis, distinct elision, and the join/reduce/map output
+//! schemas.
 
 use super::*;
 use gnitz_wire::ReduceOutKey;
@@ -151,51 +151,6 @@ pub(super) fn compute_skip_nodes(loaded: &LoadedCircuit) -> HashSet<i32> {
         }
     }
     skip
-}
-
-/// Fold budget: inline a finalize MAP into its reduce node only when its program
-/// is at most this many instructions; larger finalize MAPs stay a separate node
-/// so a reduce op never carries an unbounded inline program.
-const MAX_FOLD_FINALIZE_INSTRS: usize = 15;
-
-/// The sole consuming MAP of `reduce_nid` when it is fold-eligible, with its
-/// decoded finalize program. Consulted by `emit_reduce`, which absorbs the MAP
-/// into the reduce's finalize slot (saving one intermediate batch
-/// materialization per tick) and marks the MAP node folded.
-///
-/// Eligibility: the reduce has exactly one outgoing edge, to a reindex-free
-/// `Map(Expression)` whose only input is the reduce, and whose program is small
-/// enough and neither const-using nor a plain block copy.
-pub(super) fn reduce_finalize_fold(loaded: &LoadedCircuit, reduce_nid: i32) -> Option<(i32, LogicalProgram)> {
-    let outs = loaded.outgoing.get(&reduce_nid)?;
-    if outs.len() != 1 {
-        return None;
-    }
-    let map_nid = outs[0].0;
-    let blob = match loaded.nodes.get(&map_nid) {
-        Some(gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
-            program, reindex_cols, ..
-        })) if reindex_cols.is_empty() => program,
-        _ => return None,
-    };
-    if loaded.incoming.get(&map_nid).map(|v| v.len()).unwrap_or(0) != 1 {
-        return None;
-    }
-    let dep = gnitz_wire::decode_expr_blob(blob)?;
-    // Empty const pool (structural check): a const-using finalize returns `Err`
-    // (`StrColConst` vs the empty pool) → not folded → compiled normally through
-    // the Map path with its real pool, which also removes a latent crash (the
-    // empty pool used to be folded in and panic at eval).
-    let prog = LogicalProgram::from_wire(&dep.code, dep.num_regs, 0, Vec::new()).ok()?;
-    // Skip folding any clean block copy regardless of offset; the authoritative
-    // identity-MAP elision (with the schema-checked PK offset) handles it.
-    if prog.sequential_copy_base().is_some() {
-        return None;
-    }
-    if prog.len() > MAX_FOLD_FINALIZE_INSTRS {
-        return None;
-    }
-    Some((map_nid, prog))
 }
 
 // ---------------------------------------------------------------------------

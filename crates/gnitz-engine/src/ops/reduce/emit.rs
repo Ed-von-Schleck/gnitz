@@ -49,10 +49,11 @@ pub(super) fn emit_reduce_row(
 
     for (out_pi, role) in plan.out_roles.iter().enumerate() {
         match *role {
-            OutColRole::Agg { k, cs } => {
-                emit_agg_col(output, &accs[k as usize], out_pi, cs as usize, &mut null_word);
+            OutColRole::Agg { k } => {
+                let cs = plan.agg_col_widths[k as usize];
+                emit_agg_col(output, &accs[k as usize], out_pi, cs, &mut null_word);
             }
-            OutColRole::Exemplar { loc, tc, cs } => match loc {
+            OutColRole::Exemplar(loc) => match loc {
                 ColumnLocator::Pk { .. } => {
                     // PK lives in the OPK region; decode the addressed column
                     // back to native LE before copying into the payload region
@@ -61,11 +62,11 @@ pub(super) fn emit_reduce_row(
                     let mut scratch = [0u8; 16];
                     output.extend_col(out_pi, loc.native_le_bytes(input_mb, exemplar_row, &mut scratch));
                 }
-                ColumnLocator::Payload { slot, .. } => {
+                ColumnLocator::Payload { slot, size, type_code } => {
                     if loc.is_null(input_mb, exemplar_row) {
                         null_word |= 1u64 << out_pi;
-                        output.fill_col_zero(out_pi, cs as usize);
-                    } else if gnitz_wire::is_german_string(tc) {
+                        output.fill_col_zero(out_pi, size as usize);
+                    } else if gnitz_wire::is_german_string(type_code) {
                         let src = input_mb.get_col_ptr(exemplar_row, slot as usize, 16);
                         let cell =
                             crate::schema::relocate_german_string_vec(src, input_mb.blob, &mut output.blob, None);
@@ -116,7 +117,8 @@ pub(super) fn emit_global_ground(raw_output: &mut Batch, out_pk_bytes: &[u8], pl
     let accs: Vec<Accumulator> = plan
         .agg_descs
         .iter()
-        .map(|d| Accumulator::new(d, &plan.input_schema))
+        .zip(&plan.agg_locs)
+        .map(|(d, &loc)| Accumulator::new(d, loc))
         .collect();
 
     // No source row exists (the seed runs over an empty delta), and none is read:

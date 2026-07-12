@@ -73,19 +73,23 @@ pub enum ReindexSpec<'a> {
 }
 
 /// Map: transform batch via scalar function, then stamp the output PK region
-/// per `reindex` (see [`ReindexSpec`]).
-pub fn op_map(
-    batch: &Batch,
-    func: &ScalarFunc,
-    in_schema: &SchemaDescriptor,
-    out_schema: &SchemaDescriptor,
-    reindex: ReindexSpec<'_>,
-) -> Batch {
-    if batch.count == 0 {
-        return Batch::empty_with_schema(out_schema);
-    }
+/// per `reindex` (see [`ReindexSpec`]). The output schema lives in the func
+/// (`ScalarFunc::Map.out_schema`); `in_schema` feeds the reindex packer.
+pub fn op_map(batch: &Batch, func: &ScalarFunc, in_schema: &SchemaDescriptor, reindex: ReindexSpec<'_>) -> Batch {
+    // A reindex-free MAP inherits the input PK region verbatim through
+    // `evaluate_map_batch`'s bulk copy; a stride mismatch there silently leaves
+    // every output PK zeroed (wrong retraction keys → weight corruption), so
+    // keep it loud. Reindex maps legitimately differ — the packer / row hash
+    // overwrites the PK region below.
+    debug_assert!(
+        !matches!(reindex, ReindexSpec::None) || func.map_out_schema().pk_stride() == in_schema.pk_stride(),
+        "reindex-free MAP output PK stride must equal the input's",
+    );
 
-    let mut output = func.evaluate_map_batch(batch, out_schema);
+    let mut output = func.evaluate_map_batch(batch);
+    if batch.count == 0 {
+        return output;
+    }
     debug_assert_eq!(
         output.count, batch.count,
         "MAP output row count must equal input row count",
@@ -94,7 +98,7 @@ pub fn op_map(
         // Set each PK to a hash of the full output row so rows with identical
         // content collide and distinct content does not (EXCEPT/INTERSECT/
         // DISTINCT full-row set identity).
-        ReindexSpec::HashRow { branch_id } => reindex_hash_row(out_schema, &mut output, branch_id),
+        ReindexSpec::HashRow { branch_id } => reindex_hash_row(func.map_out_schema(), &mut output, branch_id),
         // Pack each reindex column's OPK bytes contiguously into the output PK.
         // The SAME packer routes the exchange scatter (via `ScatterKey`), so the
         // reindexed `_join_pk` and the delta scatter co-partition byte-for-byte.
@@ -578,7 +582,7 @@ mod tests {
         let empty_batch = Batch::empty_with_schema(&schema);
 
         let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema);
-        let out = op_map(&empty_batch, &func, &schema, &schema, ReindexSpec::None);
+        let out = op_map(&empty_batch, &func, &schema, ReindexSpec::None);
         assert_eq!(out.count, 0);
     }
 
@@ -872,7 +876,6 @@ mod tests {
         let out = op_map(
             &batch,
             &func,
-            &schema,
             &schema,
             ReindexSpec::Pack {
                 cols: &[1],

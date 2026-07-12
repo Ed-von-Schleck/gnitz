@@ -101,7 +101,7 @@ pub(crate) fn seek_opk_bytes(
     Ok(key::opk_key(schema, &le[..stride]))
 }
 
-/// Sentinel for any dense payload-index slot (e.g. `SortDesc::pi`,
+/// Sentinel for any dense payload-index slot (e.g.
 /// `SchemaDescriptor::payload_mapping[ci]`) that needs to express
 /// "this slot refers to a PK column, not a payload column". Using
 /// `u8::MAX` (not 0) keeps the sentinel unambiguous against a real
@@ -171,10 +171,9 @@ pub struct SchemaDescriptor {
     /// replicated sources tracks its distribution at the circuit level, not here.
     /// Mutually exclusive with a non-default `dist_prefix_len` (DDL-enforced).
     replicated: bool,
-    /// payload_mapping[ci] = dense payload index, or PAYLOAD_MAPPING_PK_SENTINEL.
-    /// Same encoding as `SortDesc::pi` in `ops/reduce.rs`: PK columns hold the
-    /// sentinel, payload columns hold their dense payload slot. Lets call
-    /// sites that need this byte read it directly via
+    /// payload_mapping[ci] = dense payload index, or PAYLOAD_MAPPING_PK_SENTINEL:
+    /// PK columns hold the sentinel, payload columns hold their dense payload
+    /// slot. Lets call sites that need this byte read it directly via
     /// `payload_mapping_byte(ci)` instead of re-deriving it from a branch on
     /// `is_pk_col` + `payload_idx`.
     payload_mapping: [u8; MAX_COLUMNS],
@@ -541,9 +540,8 @@ impl SchemaDescriptor {
 
     /// Raw `payload_mapping[ci]` byte — equals `PAYLOAD_MAPPING_PK_SENTINEL`
     /// for PK columns, the dense payload index otherwise. Lets call sites
-    /// that already encode "pk → sentinel else payload_idx as u8" in their
-    /// own slot (e.g. `SortDesc::pi`) read the precomputed byte directly
-    /// without a branch.
+    /// that encode "pk → sentinel else payload_idx as u8" read the
+    /// precomputed byte directly without a branch.
     #[inline]
     pub(crate) fn payload_mapping_byte(&self, ci: usize) -> u8 {
         self.payload_mapping[ci]
@@ -1329,17 +1327,22 @@ pub(crate) fn german_string_tail<'a>(s: &'a [u8], blob: &'a [u8], length: usize,
     }
 }
 
-#[inline]
+#[inline(always)]
 pub(crate) fn compare_german_strings(a: &[u8], blob_a: &[u8], b: &[u8], blob_b: &[u8]) -> std::cmp::Ordering {
     let len_a = read_u32_le(a, 0) as usize;
     let len_b = read_u32_le(b, 0) as usize;
     let min_len = len_a.min(len_b);
-    let prefix_cmp = min_len.min(4);
 
-    // Bulk prefix comparison — single 32-bit compare for the common case.
-    let ord = a[4..4 + prefix_cmp].cmp(&b[4..4 + prefix_cmp]);
-    if ord != std::cmp::Ordering::Equal {
-        return ord;
+    // Fixed 4-byte prefix comparison — one register compare, no runtime-length
+    // memcmp. Valid because every cell zero-pads the prefix bytes beyond its
+    // length (`encode_german_string` starts from a zeroed struct): the first
+    // differing padded byte is either a real content difference or a longer
+    // string's non-zero byte against the shorter's zero pad, and both order
+    // exactly as the truncated-compare-then-length-tiebreak below would.
+    let pfx_a = u32::from_be_bytes(a[4..8].try_into().unwrap());
+    let pfx_b = u32::from_be_bytes(b[4..8].try_into().unwrap());
+    if pfx_a != pfx_b {
+        return pfx_a.cmp(&pfx_b);
     }
     if min_len <= 4 {
         return len_a.cmp(&len_b);
@@ -1702,6 +1705,30 @@ mod tests {
         assert_eq!(long_string_bytes(&blob, 4, usize::MAX), &[] as &[u8]);
         // Exact fit is in bounds.
         assert_eq!(long_string_bytes(&blob, 0, 8), &blob[..]);
+    }
+
+    /// Pins the zero-padded-cell invariant the fixed 4-byte u32 prefix compare
+    /// relies on: with `min_len < 4`, two cells differing only past `min_len`
+    /// must order by length (the shorter's prefix pad bytes are zero, the
+    /// longer's content byte is what makes the u32s differ) — exactly the
+    /// truncated-compare-then-length-tiebreak result.
+    #[test]
+    fn test_compare_german_strings_short_prefix_zero_padding() {
+        use std::cmp::Ordering;
+        let mut blob = Vec::new();
+        let cell = |s: &str, blob: &mut Vec<u8>| encode_german_string(s.as_bytes(), blob);
+        let a = cell("ab", &mut blob); // min_len 2 < 4
+        let b = cell("abc", &mut blob); // differs only at byte 2 (past min_len)
+        assert_eq!(compare_german_strings(&a, &blob, &b, &blob), Ordering::Less);
+        assert_eq!(compare_german_strings(&b, &blob, &a, &blob), Ordering::Greater);
+        // Embedded NUL past min_len aliases the shorter cell's zero padding in
+        // the u32 image; the length tiebreak must still order them.
+        let c = cell("ab\0", &mut blob);
+        assert_eq!(compare_german_strings(&a, &blob, &c, &blob), Ordering::Less);
+        assert_eq!(compare_german_strings(&c, &blob, &a, &blob), Ordering::Greater);
+        // And equal content stays Equal.
+        let a2 = cell("ab", &mut blob);
+        assert_eq!(compare_german_strings(&a, &blob, &a2, &blob), Ordering::Equal);
     }
 
     // The german_string_tail / compare_german_strings overrun fallback is

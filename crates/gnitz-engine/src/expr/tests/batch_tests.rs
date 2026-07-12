@@ -33,7 +33,7 @@ fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
 
 #[test]
 fn test_scratch_reg3() {
-    let mut s = EvalScratch::new();
+    let mut s = EvalScratch::default();
     s.ensure_capacity(3, true, MORSEL);
     let m = 4;
     // Fill regs 0 and 1 with known values
@@ -55,7 +55,7 @@ fn test_scratch_reg3() {
 
 #[test]
 fn test_scratch_null_words3() {
-    let mut s = EvalScratch::new();
+    let mut s = EvalScratch::default();
     s.ensure_capacity(3, false, MORSEL);
     let words = 1;
     s.null_bits[0 * NULL_WORDS_PER_REG] = 0b1010;
@@ -81,7 +81,7 @@ fn test_eval_batch_add() {
         LogicalInstr::IntAdd { dst: 2, a: 0, b: 1 },
     ];
     let prog = LogicalProgram::new(instrs, 3, 2, vec![]).resolve(&schema, false);
-    let mut scratch = EvalScratch::new();
+    let mut scratch = EvalScratch::default();
     scratch.ensure_capacity(3, true, 3);
     eval_batch(&prog, &mb, 0, 3, &mut scratch);
 
@@ -115,7 +115,7 @@ fn test_eval_batch_matches_eval_predicate() {
     let batch = make_batch(&schema, rows);
     let mb = batch.as_mem_batch();
 
-    let mut scratch = EvalScratch::new();
+    let mut scratch = EvalScratch::default();
     scratch.ensure_capacity(3, true, 4);
     eval_batch(&prog, &mb, 0, 4, &mut scratch);
 
@@ -260,7 +260,7 @@ fn golden_int_div_zero_divisor_single_row() {
     ];
     let prog = LogicalProgram::new(instrs, 3, 2, vec![]).resolve(&schema, false);
 
-    let mut scratch = EvalScratch::new();
+    let mut scratch = EvalScratch::default();
     scratch.ensure_capacity(3, false, 1);
     eval_batch(&prog, &mb, 0, 1, &mut scratch);
     let is_null = (scratch.null_bits[2 * NULL_WORDS_PER_REG] & 1) != 0;
@@ -300,7 +300,7 @@ fn golden_float_div_zero_divisor_single_row() {
     ];
     let prog = LogicalProgram::new(instrs, 3, 2, vec![]).resolve(&schema, false);
 
-    let mut scratch = EvalScratch::new();
+    let mut scratch = EvalScratch::default();
     scratch.ensure_capacity(3, false, 1);
     eval_batch(&prog, &mb, 0, 1, &mut scratch);
     let is_null = (scratch.null_bits[2 * NULL_WORDS_PER_REG] & 1) != 0;
@@ -343,7 +343,7 @@ fn run_bool_combinator(schema: &SchemaDescriptor, batch: &Batch, op: fn(u16, u16
     ];
     let prog = LogicalProgram::new(instrs, 3, 2, vec![]).resolve(schema, false);
     let mb = batch.as_mem_batch();
-    let mut scratch = EvalScratch::new();
+    let mut scratch = EvalScratch::default();
     scratch.ensure_capacity(3, false, 1);
     eval_batch(&prog, &mb, 0, 1, &mut scratch);
     let val = scratch.regs[2 * MORSEL];
@@ -399,7 +399,7 @@ fn golden_int_neg_null_source_single_row() {
         LogicalInstr::IntNeg { dst: 1, a: 0 },
     ];
     let prog = LogicalProgram::new(instrs, 2, 1, vec![]).resolve(&schema, false);
-    let mut scratch = EvalScratch::new();
+    let mut scratch = EvalScratch::default();
     scratch.ensure_capacity(2, false, 1);
     eval_batch(&prog, &mb, 0, 1, &mut scratch);
     assert!(
@@ -418,7 +418,7 @@ fn golden_bool_not_null_source_single_row() {
         LogicalInstr::BoolNot { dst: 1, a: 0 },
     ];
     let prog = LogicalProgram::new(instrs, 2, 1, vec![]).resolve(&schema, false);
-    let mut scratch = EvalScratch::new();
+    let mut scratch = EvalScratch::default();
     scratch.ensure_capacity(2, false, 1);
     eval_batch(&prog, &mb, 0, 1, &mut scratch);
     assert!(
@@ -544,7 +544,7 @@ fn select_boundary_sweep() {
         );
         let mb = batch.as_mem_batch();
 
-        let mut scratch = EvalScratch::new();
+        let mut scratch = EvalScratch::default();
         for morsel_start in (0..n).step_by(MORSEL) {
             let m = MORSEL.min(n - morsel_start);
             scratch.ensure_capacity(4, false, m);
@@ -608,7 +608,7 @@ fn select_no_nulls_fast_arm() {
         |_, _| false,
     );
     let mb = batch.as_mem_batch();
-    let mut scratch = EvalScratch::new();
+    let mut scratch = EvalScratch::default();
     scratch.ensure_capacity(4, true, n);
     eval_batch(&prog, &mb, 0, n, &mut scratch);
     for row in 0..n {
@@ -841,7 +841,7 @@ fn bit_only_demotion_when_bool_feeds_arithmetic() {
         "bool reg fed into arithmetic must NOT be bit_only",
     );
 
-    let mut scratch = EvalScratch::new();
+    let mut scratch = EvalScratch::default();
     scratch.ensure_capacity(8, false, 1);
     eval_batch(&prog, &mb, 0, 1, &mut scratch);
     // r5 lives in regs as 0/1; r7 = r5 + 0 = 1.
@@ -894,13 +894,15 @@ fn classifier_pure_conjunction_filter() {
         bit_only, expected_bit_only,
         "expected r2/r4/r5 bit_only; got mask {bit_only:#010b}"
     );
-    // r2 and r4 are read by BOOL_AND.
-    assert_eq!(bool_input, (1 << 2) | (1 << 4));
+    // r2 and r4 are read by BOOL_AND; r5 (result_reg) is force-marked a bool
+    // input so `run_filter`'s nullable word merge always finds it packed.
+    assert_eq!(bool_input, (1 << 2) | (1 << 4) | (1 << 5));
 }
 
-/// Classifier: a filter whose `result_reg` is produced by `Instr::LoadPayloadInt`
-/// (not a bool producer) must NOT be in `bit_only_mask`. The fast-path
-/// must therefore fall back to the per-row scan over `regs`.
+/// A filter whose `result_reg` is produced by `Instr::LoadPayloadInt` (not a
+/// bool producer): the classifier marks it a bool input, so the producer packs
+/// truthiness (`regs != 0` — negative ints included) into `bool_bits` and the
+/// nullable word merge yields the same rows the per-row scan did.
 #[test]
 fn classifier_filter_result_reg_non_bool_falls_back() {
     use crate::expr::ScalarFunc;
@@ -929,7 +931,7 @@ fn classifier_filter_result_reg_non_bool_falls_back() {
     assert_eq!(
         passed,
         vec![true, false, false, true],
-        "filter on non-bool result_reg must use scalar fallback"
+        "non-bool result_reg: packed truthiness must match per-row semantics"
     );
 }
 
@@ -1310,7 +1312,7 @@ fn bench_chain(label: &str, prog_on: &ResolvedProgram, prog_off: &ResolvedProgra
     use std::hint::black_box;
     use std::time::Instant;
 
-    let mut scratch = EvalScratch::new();
+    let mut scratch = EvalScratch::default();
     scratch.ensure_capacity(prog_on.num_regs as usize, false, MORSEL);
 
     // Warm up and confirm the skip does not change the result.
@@ -1448,5 +1450,77 @@ fn and_chain_skip_bench() {
         prog_off.chain_trigger_mask = 0;
         let mb = batch.as_mem_batch();
         bench_chain(label, &prog_on, &prog_off, &mb, N);
+    }
+}
+
+/// Regression guard for the shared German-string comparator on the
+/// `col <op> 'const'` filter loop — ~1M rows, non-nullable STRING, mixed
+/// short/long cells. `#[ignore]`; run release:
+///   cargo test -p gnitz-engine --release str_const_filter_bench \
+///       -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+fn str_const_filter_bench() {
+    use crate::expr::{LogicalInstr, LogicalProgram, ScalarFunc, StrOp};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+    use crate::storage::Batch;
+
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::STRING, 0),
+        ],
+        &[0],
+    );
+    let n = 1_000_000usize;
+    let mut batch = Batch::with_schema(schema, n);
+    for row in 0..n {
+        batch.extend_pk(row as u128 + 1);
+        batch.extend_weight(&1i64.to_le_bytes());
+        batch.extend_null_bmp(&0u64.to_le_bytes());
+        // ~1/16 rows match; every 7th row is a long (heap-backed) string.
+        let s = if row % 16 == 0 {
+            "match_target".to_string()
+        } else if row % 7 == 0 {
+            format!("long_string_variant_number_{row}")
+        } else {
+            format!("k{}", row % 97)
+        };
+        let gs = crate::test_support::german_string(s.as_bytes(), &mut batch.blob);
+        batch.extend_col(0, &gs);
+        batch.count += 1;
+    }
+    let mb = batch.as_mem_batch();
+
+    for (name, op) in [("eq", StrOp::Eq), ("lt", StrOp::Lt)] {
+        let instrs = vec![LogicalInstr::StrColConst {
+            op,
+            dst: 0,
+            col: 1,
+            const_idx: 0,
+        }];
+        let func = ScalarFunc::from_predicate(
+            LogicalProgram::new(instrs, 1, 0, vec![b"match_target".to_vec()]),
+            &schema,
+        );
+
+        // Warm-up, then report the FASTEST of many timed passes — the minimum
+        // is robust against thermal throttling and scheduler noise, unlike a
+        // mean over the whole run.
+        let mut hits = 0usize;
+        func.run_filter(&mb, n, |s, e| hits += e - s);
+        const PASSES: usize = 30;
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..PASSES {
+            let t = std::time::Instant::now();
+            let mut h = 0usize;
+            func.run_filter(&mb, n, |s, e| h += e - s);
+            std::hint::black_box(h);
+            best = best.min(t.elapsed());
+        }
+        let mrps = n as f64 / best.as_secs_f64() / 1e6;
+        println!(
+            "str_const_filter {name}: {n} rows, best of {PASSES} passes = {best:?} = {mrps:.1} M rows/s (hits={hits})"
+        );
     }
 }

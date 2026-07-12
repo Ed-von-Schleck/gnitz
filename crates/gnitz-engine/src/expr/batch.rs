@@ -7,7 +7,7 @@
 
 use std::cmp::Ordering;
 
-use super::program::{compare_col_string_vs_const, CmpOp, Instr, ResolvedProgram, StrOp};
+use super::program::{CmpOp, Instr, ResolvedProgram, StrOp};
 use crate::foundation::codec::read_u64_le;
 use crate::schema::{compare_german_strings, PAYLOAD_MAPPING_PK_SENTINEL};
 use crate::storage::MemBatch;
@@ -19,6 +19,7 @@ pub(in crate::expr) const NULL_WORDS_PER_REG: usize = MORSEL / 64; // 4
 // EvalScratch — the SoA register file for batch evaluation
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
 pub(in crate::expr) struct EvalScratch {
     /// Register buffers, register-major layout: regs[reg * MORSEL + row].
     pub(in crate::expr) regs: Vec<i64>,
@@ -35,16 +36,6 @@ pub(in crate::expr) struct EvalScratch {
 }
 
 impl EvalScratch {
-    pub(in crate::expr) fn new() -> Self {
-        EvalScratch {
-            regs: Vec::new(),
-            null_bits: Vec::new(),
-            bool_bits: Vec::new(),
-            filter_bits: Vec::new(),
-            no_nulls: false,
-        }
-    }
-
     /// Ensure the scratch buffer can hold `num_regs` registers and `(n+63)/64`
     /// filter words.  Does not shrink.
     pub(in crate::expr) fn ensure_capacity(&mut self, num_regs: usize, no_nulls: bool, n: usize) {
@@ -172,8 +163,11 @@ fn null_copy1(s: &mut EvalScratch, dst: usize, src: usize, m: usize) {
     }
 }
 
-/// Fill null bits for a physical payload column `pi` into register `di`.
-fn fill_null_bits_pi(s: &mut EvalScratch, di: usize, null_bmp: &[u8], morsel_start: usize, m: usize, pi: usize) {
+/// Fill null bits into register `di` for the payload columns selected by
+/// `mask` (bit N = payload slot N): a row is null iff any masked column is
+/// null. A single-column caller passes `1 << pi`; the two-operand string
+/// compare passes both columns' bits in one pass.
+fn fill_null_bits_mask(s: &mut EvalScratch, di: usize, null_bmp: &[u8], morsel_start: usize, m: usize, mask: u64) {
     if s.no_nulls {
         return;
     }
@@ -185,7 +179,7 @@ fn fill_null_bits_pi(s: &mut EvalScratch, di: usize, null_bmp: &[u8], morsel_sta
         let mut word: u64 = 0;
         for i in lo..hi {
             let row_null = read_u64_le(null_bmp, (morsel_start + i) * 8);
-            if (row_null >> pi) & 1 != 0 {
+            if row_null & mask != 0 {
                 word |= 1u64 << (i - lo);
             }
         }
@@ -323,6 +317,38 @@ fn zero_null_rows(scratch: &mut EvalScratch, dst: usize, m: usize) {
 // String comparison helpers — shared by *_CONST and *_COL match arms
 // ---------------------------------------------------------------------------
 
+/// The one string-compare kernel: operand A is payload column cell data
+/// (`col_a` over `blob_a`), operand B comes from `b_of(row)` — a per-row
+/// column cell (col-vs-col) or the resolved const cell (col-vs-const). Rows
+/// whose `null_mask` columns are null get their result cleared in a post-pass;
+/// the compare itself runs unconditionally (a valid but irrelevant value),
+/// keeping the loop branch-free.
+#[allow(clippy::too_many_arguments)]
+fn eval_str_cmp<'x>(
+    scratch: &mut EvalScratch,
+    mb: &MemBatch,
+    prog: &ResolvedProgram,
+    dst: usize,
+    morsel_start: usize,
+    m: usize,
+    null_mask: u64,
+    col_a: &[u8],
+    blob_a: &[u8],
+    b_of: impl Fn(usize) -> (&'x [u8], &'x [u8]),
+    pred: impl Fn(Ordering) -> bool,
+) {
+    fill_null_bits_mask(scratch, dst, mb.null_bmp(), morsel_start, m, null_mask);
+    let base_d = dst * MORSEL;
+    for i in 0..m {
+        let row = morsel_start + i;
+        let s1 = &col_a[row * 16..row * 16 + 16];
+        let (s2, blob_b) = b_of(row);
+        scratch.regs[base_d + i] = pred(compare_german_strings(s1, blob_a, s2, blob_b)) as i64;
+    }
+    zero_null_rows(scratch, dst, m);
+    maybe_pack_bool_bits(scratch, prog, dst, m);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn eval_str_col_vs_const(
     scratch: &mut EvalScratch,
@@ -340,28 +366,20 @@ fn eval_str_col_vs_const(
         "eval_str_col_vs_const: PK column is never a string",
     );
     let pi = pi_byte as usize;
-    fill_null_bits_pi(scratch, dst, mb.null_bmp(), morsel_start, m, pi);
-    let col_data = mb.col_data(pi, 16);
-    let blob = mb.blob;
-    let const_bytes = &prog.const_strings[const_idx];
-    let const_prefix = prog.const_prefixes[const_idx];
-    let const_len = prog.const_lengths[const_idx];
-    let base_d = dst * MORSEL;
-    // Compute results unconditionally (null rows produce a valid but irrelevant value).
-    // Keeping the comparison out of a branch-per-row allows LLVM to vectorize this loop.
-    for i in 0..m {
-        let off = (morsel_start + i) * 16;
-        let s = &col_data[off..off + 16];
-        scratch.regs[base_d + i] = pred(compare_col_string_vs_const(
-            s,
-            blob,
-            const_bytes,
-            const_prefix,
-            const_len,
-        )) as i64;
-    }
-    zero_null_rows(scratch, dst, m);
-    maybe_pack_bool_bits(scratch, prog, dst, m);
+    let cell = &prog.const_cells[const_idx];
+    eval_str_cmp(
+        scratch,
+        mb,
+        prog,
+        dst,
+        morsel_start,
+        m,
+        1u64 << pi,
+        mb.col_data(pi, 16),
+        mb.blob,
+        |_| (&cell[..], &prog.const_blob[..]),
+        pred,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -380,40 +398,24 @@ fn eval_str_col_vs_col(
         pi_byte_a != PAYLOAD_MAPPING_PK_SENTINEL && pi_byte_b != PAYLOAD_MAPPING_PK_SENTINEL,
         "eval_str_col_vs_col: PK column is never a string",
     );
-    // Result is null where either operand column is null; fold both columns'
-    // null bits into dst in one pass over the null bitmap.
+    // Result is null where either operand column is null (one masked pass).
     let pi_a = pi_byte_a as usize;
     let pi_b = pi_byte_b as usize;
-    if !scratch.no_nulls {
-        let words = m.div_ceil(64);
-        let base = dst * NULL_WORDS_PER_REG;
-        let null_bmp = mb.null_bmp();
-        for w in 0..words {
-            let lo = w * 64;
-            let hi = (lo + 64).min(m);
-            let mut word: u64 = 0;
-            for i in lo..hi {
-                let row_null = read_u64_le(null_bmp, (morsel_start + i) * 8);
-                if ((row_null >> pi_a) | (row_null >> pi_b)) & 1 != 0 {
-                    word |= 1u64 << (i - lo);
-                }
-            }
-            scratch.null_bits[base + w] = word;
-        }
-    }
-    let col_a = mb.col_data(pi_a, 16);
     let col_b = mb.col_data(pi_b, 16);
     let blob = mb.blob;
-    let base_d = dst * MORSEL;
-    // Compute results unconditionally; null rows produce a valid but irrelevant value.
-    for i in 0..m {
-        let row = morsel_start + i;
-        let s1 = &col_a[row * 16..row * 16 + 16];
-        let s2 = &col_b[row * 16..row * 16 + 16];
-        scratch.regs[base_d + i] = pred(compare_german_strings(s1, blob, s2, blob)) as i64;
-    }
-    zero_null_rows(scratch, dst, m);
-    maybe_pack_bool_bits(scratch, prog, dst, m);
+    eval_str_cmp(
+        scratch,
+        mb,
+        prog,
+        dst,
+        morsel_start,
+        m,
+        (1u64 << pi_a) | (1u64 << pi_b),
+        mb.col_data(pi_a, 16),
+        blob,
+        move |row| (&col_b[row * 16..row * 16 + 16], blob),
+        pred,
+    );
 }
 
 /// Reinterpret a register's raw i64 bits as the `f64` they encode, and back.
@@ -532,12 +534,13 @@ pub(in crate::expr) fn eval_batch(
             // ----------------------------------------------------------------
             // Load operations
             // ----------------------------------------------------------------
-            Instr::LoadPayloadInt { dst, pi } => {
+            Instr::LoadPayloadInt { dst, pi, tc } => {
                 let dst = dst as usize;
                 let pi = pi as usize;
-                let (size_u8, col_tc) = prog.payload_col_info[pi];
-                let col_size = size_u8 as usize;
-                let is_signed = crate::schema::is_signed_int(col_tc);
+                // Width and signedness are `const fn`s of `tc`; derive them once
+                // per instruction, outside the row loop (as `LoadPk` does).
+                let col_size = crate::schema::type_size(tc) as usize;
+                let is_signed = crate::schema::is_signed_int(tc);
                 let col_data = mb.col_data(pi, col_size);
                 let dst_reg = scratch.reg_mut(dst, m);
                 // Widen `m` rows of a `SZ`-byte little-endian column into i64 registers.
@@ -573,14 +576,14 @@ pub(in crate::expr) fn eval_batch(
                     // `is_wide_int` gate), so no LoadColInt ever resolves to one.
                     _ => unreachable!("LoadPayloadInt: col_size {col_size} > 8; wide columns rejected at compile"),
                 }
-                fill_null_bits_pi(scratch, dst, mb.null_bmp(), morsel_start, m, pi);
+                fill_null_bits_mask(scratch, dst, mb.null_bmp(), morsel_start, m, 1u64 << pi);
                 maybe_pack_bool_bits(scratch, prog, dst, m);
             }
 
-            Instr::LoadPayloadFloat { dst, pi } => {
+            Instr::LoadPayloadFloat { dst, pi, tc } => {
                 let dst = dst as usize;
                 let pi = pi as usize;
-                let col_size = prog.payload_col_info[pi].0 as usize;
+                let col_size = crate::schema::type_size(tc) as usize;
                 let col_data = mb.col_data(pi, col_size);
                 let dst_reg = scratch.reg_mut(dst, m);
                 if col_size == 4 {
@@ -595,7 +598,7 @@ pub(in crate::expr) fn eval_batch(
                         dst_reg[i] = i64::from_le_bytes(c.try_into().unwrap());
                     }
                 }
-                fill_null_bits_pi(scratch, dst, mb.null_bmp(), morsel_start, m, pi);
+                fill_null_bits_mask(scratch, dst, mb.null_bmp(), morsel_start, m, 1u64 << pi);
                 maybe_pack_bool_bits(scratch, prog, dst, m);
             }
 

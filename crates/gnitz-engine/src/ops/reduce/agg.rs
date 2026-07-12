@@ -1,6 +1,6 @@
 //! Aggregate opcodes, descriptors, accumulator state, and AVI lookup.
 
-use crate::schema::{ColumnLocator, SchemaDescriptor, TypeCode};
+use crate::schema::{ColumnLocator, TypeCode};
 use crate::storage::{MemBatch, ReadCursor};
 
 // ---------------------------------------------------------------------------
@@ -9,10 +9,10 @@ use crate::storage::{MemBatch, ReadCursor};
 
 /// Aggregate function selector.
 ///
-/// `#[repr(u8)]` keeps `AggDescriptor` at its required 8-byte C layout, and
-/// lets the compiler enforce exhaustive matching instead of the previous bare
-/// `u8` with private named constants.  `Null` (0) is the NullAggregate
-/// sentinel emitted by the compiler when no aggregation is configured.
+/// A typed enum so the compiler enforces exhaustive matching instead of the
+/// previous bare `u8` with private named constants. `Null` (0) is the
+/// NullAggregate sentinel emitted by the compiler when no aggregation is
+/// configured.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AggOp {
@@ -67,19 +67,14 @@ impl AggOp {
     }
 }
 
-/// Descriptor for one aggregate function.
-#[repr(C)]
+/// Descriptor for one aggregate function. Plain data — never transmuted or
+/// serialized (the wire ships `AggKind::Specs`; consumers are field reads).
 #[derive(Clone, Copy)]
 pub struct AggDescriptor {
     pub col_idx: u32,
     pub agg_op: AggOp,
     pub col_type_code: TypeCode,
 }
-
-const _: () = assert!(std::mem::size_of::<AggOp>() == 1);
-const _: () = assert!(std::mem::size_of::<TypeCode>() == 1);
-const _: () = assert!(std::mem::size_of::<AggDescriptor>() == 8);
-const _: () = assert!(std::mem::align_of::<AggDescriptor>() == 4);
 
 /// Accumulator: internal state for one aggregate column.
 ///
@@ -95,13 +90,16 @@ pub(super) struct Accumulator {
 }
 
 impl Accumulator {
-    pub(super) fn new(desc: &AggDescriptor, schema: &SchemaDescriptor) -> Self {
+    /// `loc` is the pre-resolved locator of `desc.col_idx` (the plan's baked
+    /// `agg_locs` entry) — accumulators are rebuilt per epoch, the `locate()`
+    /// walk is not.
+    pub(super) fn new(desc: &AggDescriptor, loc: ColumnLocator) -> Self {
         Accumulator {
             acc: 0,
             has_value: false,
             agg_op: desc.agg_op,
             col_type_code: desc.col_type_code,
-            loc: schema.locate(desc.col_idx as usize),
+            loc,
         }
     }
 
@@ -205,16 +203,14 @@ impl Accumulator {
         let tc = self.col_type_code;
         let cs = self.loc.size();
         // SUM accumulates into an i64/u64 slot via decode_signed/decode_float;
-        // MIN/MAX order-encode via encode_ordered, which handles only the
-        // order-encodable ≤8-byte int/float types — a non-encodable MIN/MAX source
-        // (STRING, U128/UUID/BLOB) is rejected when the reduce circuit is compiled
-        // (`compiler::emit_reduce`) and never reaches here. STRING stays exempt from
-        // this assert for SUM: decode_signed handles a 16-byte STRING slot via an
-        // 8-byte prefix compare, so an engine-level SUM caller can reach here with
-        // one. Every other column addressed here is ≤ 8 bytes.
+        // MIN/MAX order-encode via encode_ordered. Both handle only the
+        // order-encodable ≤8-byte int/float types — any wider or non-numeric
+        // source (STRING, U128/UUID/BLOB, I128) is rejected when the reduce
+        // circuit is compiled (`compiler::emit_reduce`, for SQL and raw
+        // CircuitBuilder circuits alike) and never reaches here.
         debug_assert!(
-            cs <= 8 || tc == TypeCode::String,
-            "SUM/MIN/MAX over a >8-byte non-STRING column must be rejected by the planner",
+            cs <= 8,
+            "SUM/MIN/MAX over a >8-byte column must be rejected by the planner",
         );
 
         // `native_le_bytes` OPK-decodes a PK-source column back to native
@@ -301,28 +297,22 @@ impl Accumulator {
 /// before comparing, otherwise values with the high bit set order
 /// incorrectly. SUM treats the slot as a bit container; wrap-around is
 /// unaffected by signedness.
-///
-/// STRING columns use the first 8 bytes of the 16-byte German String
-/// struct as the compare key (caller passes the full 16-byte slice for
-/// the row). This produces wrong orderings — the binder must reject
-/// MIN/MAX on String before the operator sees it.
 #[inline]
 fn decode_signed(bytes: &[u8], tc: TypeCode) -> i64 {
-    use crate::schema::{read_signed, read_unsigned, type_size};
-    match tc {
+    use crate::schema::{is_fixed_int, is_signed_int, read_signed, read_unsigned, type_size};
+    let tc = tc as u8;
+    // Explicit non-int rejection, not a bare if/else: a mis-dispatched float
+    // must trip here, never silently round-trip through `read_unsigned`.
+    if !is_fixed_int(tc) {
+        unreachable!("decode_signed: non-integer type {tc} (planner-rejected)");
+    }
+    let size = type_size(tc) as usize;
+    if is_signed_int(tc) {
+        read_signed(bytes, size)
+    } else {
         // Unsigned sources zero-extend (U8 0xFF → 255, never sign-extend);
         // U64 reinterprets the bit pattern per the doc caveat above.
-        TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 => {
-            read_unsigned(bytes, type_size(tc as u8) as usize) as i64
-        }
-        TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
-            read_signed(bytes, type_size(tc as u8) as usize)
-        }
-        // 8-byte prefix of the 16-byte German String struct as the compare key.
-        TypeCode::String => read_signed(&bytes[..8], 8),
-        TypeCode::F32 | TypeCode::F64 | TypeCode::U128 | TypeCode::UUID | TypeCode::Blob | TypeCode::I128 => {
-            unreachable!("decode_signed: non-integer/string type")
-        }
+        read_unsigned(bytes, size) as i64
     }
 }
 
@@ -509,7 +499,7 @@ mod tests {
             agg_op,
             col_type_code: TypeCode::F64,
         };
-        Accumulator::new(&desc, &schema)
+        Accumulator::new(&desc, schema.locate(1))
     }
 
     // Item 19: a NaN seen first must not poison MIN. A subsequent finite value

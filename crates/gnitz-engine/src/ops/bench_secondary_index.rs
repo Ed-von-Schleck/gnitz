@@ -204,6 +204,7 @@ fn secondary_index_bench_avi_decomposition() {
         )
         .unwrap();
         id += 1;
+        let extractor = GroupKeyExtractor::new(&schema, &group_by_cols);
         let avi = AviDesc {
             table: &mut t as *mut Table,
             group_by_cols: &group_by_cols,
@@ -212,6 +213,7 @@ fn secondary_index_bench_avi_decomposition() {
                 agg_op: AggOp::Min,
                 col_type_code: TypeCode::I64,
             }],
+            extractor: &extractor,
         };
         op_integrate_with_indexes(&input, None, &schema, Some(&avi)).unwrap();
         std::hint::black_box(&t);

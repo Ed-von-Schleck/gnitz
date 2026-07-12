@@ -175,7 +175,6 @@ pub(crate) fn execute_epoch_multi(
                 in_reg,
                 out_reg,
                 func_idx,
-                out_schema_idx,
                 reindex,
             } => {
                 debug_assert_ne!(*in_reg, *out_reg, "Map: in_reg and out_reg must be distinct");
@@ -185,7 +184,6 @@ pub(crate) fn execute_epoch_multi(
                 debug_assert!(!func_ptr.is_null(), "Map: identity map must be elided at emit");
                 let func = unsafe { &*func_ptr };
                 let in_schema = &program.reg_meta[*in_reg as usize].schema;
-                let out_schema = &program.schemas[*out_schema_idx as usize];
                 let reindex = match *reindex {
                     ReindexOperand::None => ops::ReindexSpec::None,
                     ReindexOperand::HashRow { branch_id } => ops::ReindexSpec::HashRow { branch_id },
@@ -197,7 +195,7 @@ pub(crate) fn execute_epoch_multi(
                         }
                     }
                 };
-                let result = ops::op_map(&reg!(*in_reg).batch, func, in_schema, out_schema, reindex);
+                let result = ops::op_map(&reg!(*in_reg).batch, func, in_schema, reindex);
                 reg_mut!(*out_reg).batch = result;
             }
 
@@ -338,6 +336,7 @@ pub(crate) fn execute_epoch_multi(
                         [a.group_cols_offset as usize..(a.group_cols_offset as usize + a.group_cols_count as usize)],
                     aggs: &program.agg_descs
                         [a.agg_descs_offset as usize..(a.agg_descs_offset as usize + a.agg_descs_count as usize)],
+                    extractor: &program.avi_extractors[a.extractor_idx as usize],
                 });
 
                 gnitz_debug!(
@@ -355,10 +354,8 @@ pub(crate) fn execute_epoch_multi(
                 trace_in_reg,
                 trace_out_reg,
                 out_reg,
-                fin_out_reg,
                 plan_idx,
                 avi_table_idx,
-                finalize,
             } => {
                 let plan = &program.reduce_plans[*plan_idx as usize];
 
@@ -404,9 +401,6 @@ pub(crate) fn execute_epoch_multi(
                     plan.agg_descs.len()
                 );
 
-                let fin_func = finalize.map(|f| unsafe { &*program.funcs[f.func_idx as usize] });
-                let fin_schema = finalize.map(|f| &program.schemas[f.schema_idx as usize]);
-
                 let ti_opt: Option<&mut ReadCursor> = if !ti_cursor_ptr.is_null() {
                     Some(unsafe { &mut *ti_cursor_ptr })
                 } else {
@@ -414,25 +408,18 @@ pub(crate) fn execute_epoch_multi(
                 };
                 let avi_opt: Option<&mut ReadCursor> = avi_cursor_handle.as_deref_mut();
 
-                let (raw_out, fin_out) = ops::op_reduce(
+                let raw_out = ops::op_reduce(
                     &reg!(*in_reg).batch,
                     ti_opt,
                     unsafe { &mut *to_cursor_ptr },
                     avi_opt,
                     plan,
-                    fin_func,
-                    fin_schema,
                 );
 
                 // Drop temporary cursor handle (returned to pool)
                 drop(avi_cursor_handle);
 
                 reg_mut!(*out_reg).batch = raw_out;
-                if let Some(fin_batch) = fin_out {
-                    if let Some(fr) = fin_out_reg {
-                        reg_mut!(*fr).batch = fin_batch;
-                    }
-                }
             }
         }
     }

@@ -133,9 +133,6 @@ pub(super) struct EmitCtx<'a> {
     pub source_reg_map: HashMap<i64, i32>,
     pub sink_reg_id: i32,
     pub scratch: ScratchGuard,
-    /// Registers of finalize-folded MAP nodes: map_nid → the finalize output
-    /// register, filled by `emit_reduce` when it absorbs its sole consuming Map.
-    pub folded_map_regs: HashMap<i32, i32>,
 }
 
 impl EmitCtx<'_> {
@@ -342,12 +339,6 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
         }
 
         gnitz_wire::OpNode::Map(mk) => {
-            // Finalize-folded MAP (absorbed into its upstream REDUCE, which
-            // already emitted the finalize program into this register).
-            if let Some(&fin_reg) = ctx.folded_map_regs.get(&nid) {
-                ctx.out_reg_of.insert(nid, fin_reg);
-                return Ok(());
-            }
             let in_reg = in_reg(&in_regs, PORT_IN, "map: missing input port")?;
             let in_reg_schema = ctx.reg_meta[in_reg as usize].schema;
             match mk {
@@ -455,7 +446,6 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
                     let fp = ctx.push_func(ScalarFunc::from_map(prog, &in_reg_schema, &node_schema));
                     ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(node_schema);
                     let func_idx = ctx.builder.func_idx(fp);
-                    let out_schema_idx = ctx.builder.schema_idx(node_schema);
                     // An Expression map without reindex columns is a plain
                     // columnar map — the bulk PK copy stands.
                     let reindex = if reindex_cols.is_empty() {
@@ -469,7 +459,6 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
                         in_reg: in_reg as u16,
                         out_reg: reg_id as u16,
                         func_idx,
-                        out_schema_idx,
                         reindex,
                     });
                 }
@@ -523,12 +512,10 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
                     let fp = ctx.create_universal_projection(&src_indices, &in_reg_schema, &node_schema);
                     ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(node_schema);
                     let func_idx = ctx.builder.func_idx(fp);
-                    let out_schema_idx = ctx.builder.schema_idx(node_schema);
                     ctx.builder.push(Instr::Map {
                         in_reg: in_reg as u16,
                         out_reg: reg_id as u16,
                         func_idx,
-                        out_schema_idx,
                         reindex: ReindexOperand::HashRow { branch_id: *branch_id },
                     });
                 }
@@ -542,12 +529,10 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
                     let fp = ctx.create_universal_projection(&src_indices, &in_reg_schema, &schema);
                     ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(schema);
                     let func_idx = ctx.builder.func_idx(fp);
-                    let out_schema_idx = ctx.builder.schema_idx(schema);
                     ctx.builder.push(Instr::Map {
                         in_reg: in_reg as u16,
                         out_reg: reg_id as u16,
                         func_idx,
-                        out_schema_idx,
                         reindex: ReindexOperand::None,
                     });
                 }
@@ -869,19 +854,7 @@ pub(super) fn emit_reduce(
     )?;
 
     let raw_delta_id = ctx.push_delta_reg(reduce_out_schema);
-
-    // Finalize fold: absorb this reduce's sole consuming eligible MAP into the
-    // reduce's finalize program, saving one intermediate batch materialization
-    // per tick. Derived here — where the consumer, blob, and schemas are all in
-    // scope — instead of a separate rewrite pass threaded through the phase split.
-    let fold = reduce_finalize_fold(loaded, nid);
-    let mut fin_delta_id: i32 = -1;
-    if fold.is_some() {
-        fin_delta_id = ctx.push_delta_reg(loaded.out_schema);
-        ctx.out_reg_of.insert(nid, fin_delta_id);
-    } else {
-        ctx.out_reg_of.insert(nid, raw_delta_id);
-    }
+    ctx.out_reg_of.insert(nid, raw_delta_id);
 
     let all_linear = agg_descs.iter().all(|a| a.agg_op.is_linear());
     let has_value_indexed = agg_descs.iter().any(|a| a.agg_op.uses_value_index());
@@ -947,12 +920,16 @@ pub(super) fn emit_reduce(
     if !avi_table_ptr.is_null() {
         let (group_cols_offset, group_cols_count) = ctx.builder.add_group_cols(&gcols_u32);
         let (agg_descs_offset, agg_descs_count) = ctx.builder.add_agg_descs(&avi_aggs);
+        let extractor_idx = ctx
+            .builder
+            .add_avi_extractor(crate::ops::GroupKeyExtractor::new(&in_reg_schema, &gcols_u32));
         let avi = IntegrateAvi {
             table_idx: ctx.builder.table_idx(avi_table_ptr) as u16,
             group_cols_offset,
             group_cols_count,
             agg_descs_offset,
             agg_descs_count,
+            extractor_idx,
         };
         ctx.builder.push(Instr::Integrate {
             in_reg: in_reg_id as u16,
@@ -960,20 +937,6 @@ pub(super) fn emit_reduce(
             avi: Some(avi),
         });
     }
-
-    // Finalize is a MAP from the raw reduce output to the view's output schema:
-    // validate the folded logical program against those schemas (exactly as a MAP
-    // blob is validated in `emit_node`), then build the same `ScalarFunc` any
-    // other MAP node gets. It is kept alive in `owned_funcs`, which the reduce op
-    // holds a raw `*const ScalarFunc` into.
-    let fin_func_ptr: *const ScalarFunc = if let Some((map_nid, prog)) = fold {
-        prog.validate(Some(&reduce_out_schema), Some(&loaded.out_schema))
-            .map_err(expr_reject("reduce finalize: program/schema mismatch"))?;
-        ctx.folded_map_regs.insert(map_nid, fin_delta_id);
-        ctx.push_func(ScalarFunc::from_map(prog, &reduce_out_schema, &loaded.out_schema))
-    } else {
-        std::ptr::null()
-    };
 
     // Bake worker ownership of the global-aggregate seed exactly as the
     // `PartitionFilter` arm bakes `(worker_rank(), num_workers())`. A reduce whose
@@ -1003,10 +966,6 @@ pub(super) fn emit_reduce(
     };
 
     let avi_table_idx = (!avi_table_ptr.is_null()).then(|| ctx.builder.table_idx(avi_table_ptr) as u16);
-    let finalize = (!fin_func_ptr.is_null()).then(|| crate::query::vm::FinalizeIdx {
-        func_idx: ctx.builder.func_idx(fin_func_ptr),
-        schema_idx: ctx.builder.schema_idx(loaded.out_schema),
-    });
 
     // Bake the reduce plan — the one construction site for everything the
     // operator would otherwise re-derive per epoch from the instruction operands.
@@ -1026,10 +985,8 @@ pub(super) fn emit_reduce(
         trace_in_reg: (tr_in_reg_id >= 0).then_some(tr_in_reg_id as u16),
         trace_out_reg: reg_id as u16,
         out_reg: raw_delta_id as u16,
-        fin_out_reg: (fin_delta_id >= 0).then_some(fin_delta_id as u16),
         plan_idx,
         avi_table_idx,
-        finalize,
     });
 
     // The trace_in integrate (non-linear, non-AVI fallback) carries no value
@@ -1076,13 +1033,13 @@ pub(super) fn build_plan(
 
     // Register ids are u16 instruction fields. `reg_meta` is sized to the base
     // register per node plus the exchange seeds here; the emitters push the extras
-    // on demand — ScanTrace/Distinct push 1, Reduce up to 3
-    // (raw_delta + finalize + trace-in). Each node pushes at most 3, so reserving
-    // `next_reg + 3 * ordered.len()` holds the whole program in a single
+    // on demand — ScanTrace/Distinct push 1, Reduce up to 2
+    // (raw_delta + trace-in). Each node pushes at most 2, so reserving
+    // `next_reg + 2 * ordered.len()` holds the whole program in a single
     // allocation, and that same bound — rejected here before the emit loop creates
     // any scratch tables — guarantees the final `reg_meta.len()` can never exceed
     // u16, so no register id truncates when cast.
-    let reg_cap = next_reg as usize + 3 * ordered.len();
+    let reg_cap = next_reg as usize + 2 * ordered.len();
     if reg_cap > u16::MAX as usize {
         return Err(CompileError::Rejected("register count exceeds u16::MAX"));
     }
@@ -1131,7 +1088,6 @@ pub(super) fn build_plan(
         source_reg_map: HashMap::new(),
         sink_reg_id: -1,
         scratch: ScratchGuard::new(),
-        folded_map_regs: HashMap::new(),
     };
 
     for &nid in ordered {
@@ -1153,7 +1109,7 @@ pub(super) fn build_plan(
     // readers run in instruction order, so a destructively-consumed register is
     // correct only when the destructive read is the LAST read of that register.
     // Checked over the EMITTED instructions with resolved registers, so register
-    // aliasing from elided nodes — identity/folded MAPs, `Filter(None)`
+    // aliasing from elided nodes — identity MAPs, `Filter(None)`
     // pass-throughs, skipped Distincts, ExchangeGather — is seen through rather
     // than reasoned about via graph edges. (A self-union reads in_a == in_b in
     // one instruction; the exec arm handles that before the take.)

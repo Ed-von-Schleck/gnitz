@@ -194,27 +194,49 @@ fn gallop_lower_bound_bytes<'a>(count: usize, key: &[u8], hint: usize, get: impl
 // wider PKs fall back to the byte search.
 // ---------------------------------------------------------------------------
 
+/// Shared stride→register-width dispatch for the two OPK seek entry points
+/// below: load the probe and each row key through the width-matched
+/// `PkSortKey` and hand the resulting `lt` predicate to the given search;
+/// strides past the register widths take the byte-`memcmp` fallback. A local
+/// macro by design — the schema/key layer does not export a cross-layer
+/// dispatch, and the two searches (stateless vs. galloping) stay separate
+/// algorithms behind one width dispatch.
+macro_rules! opk_width_dispatch {
+    ($stride:expr, $key:expr, $get:expr, |$lt:ident| $search:expr, $bytes_fallback:expr) => {
+        match $stride {
+            0..=8 => {
+                let p = u64::from_opk($key);
+                let $lt = |i: usize| u64::from_opk($get(i)) < p;
+                $search
+            }
+            9..=16 => {
+                let p = u128::from_opk($key);
+                let $lt = |i: usize| u128::from_opk($get(i)) < p;
+                $search
+            }
+            17..=32 => {
+                let p = <[u128; 2]>::from_opk($key);
+                let $lt = |i: usize| <[u128; 2]>::from_opk($get(i)) < p;
+                $search
+            }
+            _ => $bytes_fallback,
+        }
+    };
+}
+
 /// Stride-dispatched OPK lower bound — the seek-path entry point. `stride` is the
 /// stored key width (`pk_stride`); `key` is exactly `stride` OPK bytes (a full key,
 /// or a prefix the caller already zero-padded to `stride`).
 #[inline]
 pub(crate) fn lower_bound_opk<'a>(count: usize, key: &[u8], stride: usize, get: impl Fn(usize) -> &'a [u8]) -> usize {
     debug_assert_eq!(key.len(), stride, "seek probe width must equal pk_stride");
-    match stride {
-        0..=8 => {
-            let p = u64::from_opk(key);
-            lower_bound_by(0, count, |i| u64::from_opk(get(i)) < p)
-        }
-        9..=16 => {
-            let p = u128::from_opk(key);
-            lower_bound_by(0, count, |i| u128::from_opk(get(i)) < p)
-        }
-        17..=32 => {
-            let p = <[u128; 2]>::from_opk(key);
-            lower_bound_by(0, count, |i| <[u128; 2]>::from_opk(get(i)) < p)
-        }
-        _ => binary_lower_bound(0, count, key, &get),
-    }
+    opk_width_dispatch!(
+        stride,
+        key,
+        get,
+        |lt| lower_bound_by(0, count, lt),
+        binary_lower_bound(0, count, key, &get)
+    )
 }
 
 /// Stride-dispatched galloping lower bound; see [`lower_bound_opk`]. Same dispatch,
@@ -228,21 +250,13 @@ pub(crate) fn gallop_opk<'a>(
     get: impl Fn(usize) -> &'a [u8],
 ) -> usize {
     debug_assert_eq!(key.len(), stride, "seek probe width must equal pk_stride");
-    match stride {
-        0..=8 => {
-            let p = u64::from_opk(key);
-            gallop_by(count, hint, |i| u64::from_opk(get(i)) < p)
-        }
-        9..=16 => {
-            let p = u128::from_opk(key);
-            gallop_by(count, hint, |i| u128::from_opk(get(i)) < p)
-        }
-        17..=32 => {
-            let p = <[u128; 2]>::from_opk(key);
-            gallop_by(count, hint, |i| <[u128; 2]>::from_opk(get(i)) < p)
-        }
-        _ => gallop_lower_bound_bytes(count, key, hint, get),
-    }
+    opk_width_dispatch!(
+        stride,
+        key,
+        get,
+        |lt| gallop_by(count, hint, lt),
+        gallop_lower_bound_bytes(count, key, hint, get)
+    )
 }
 
 // ---------------------------------------------------------------------------

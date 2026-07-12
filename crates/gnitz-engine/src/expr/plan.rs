@@ -8,20 +8,19 @@
 use std::cell::RefCell;
 
 use super::batch::{eval_batch, EvalScratch, MORSEL, NULL_WORDS_PER_REG};
-use super::program::{ColSrc, LogicalProgram, OutputColKind, ResolvedProgram};
-use crate::schema::{SchemaDescriptor, PAYLOAD_MAPPING_PK_SENTINEL};
+use super::program::{Instr, LogicalProgram, ResolvedProgram};
+use crate::schema::{ColumnLocator, SchemaDescriptor};
 use crate::storage::{Batch, MemBatch};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Copy a single column from `in_batch` to `output`. `cm.src_pi` holds the
-/// resolved payload byte: `SENTINEL` indicates the PK column, otherwise it is
-/// the dense payload index in the input batch. The source is read at its own
-/// type's width; when the destination slot (`cm.stride`, from the output
-/// schema) is wider — a promoted integer column — the copy sign/zero-extends
-/// the value into it.
+/// Copy a single column from `in_batch` to `output`. `cm.src` is the resolved
+/// source locator (PK byte window or dense payload slot). The source is read
+/// at its own type's width; when the destination slot (`cm.stride`, from the
+/// output schema) is wider — a promoted integer column — the copy
+/// sign/zero-extends the value into it.
 ///
 /// `blob_cache` doubles as the STRING/BLOB mode switch. `Some`: each cell is
 /// relocated into `output.blob` (else its heap offset dangles once the source
@@ -41,75 +40,85 @@ fn copy_column(
 ) {
     let n = in_batch.count;
     let stride = cm.stride as usize; // destination write width
-    let src_stride = crate::schema::type_size(cm.type_code) as usize; // source read width
 
-    if cm.src_pi == PAYLOAD_MAPPING_PK_SENTINEL {
-        // PK region holds OPK bytes; decode the addressed column back to native
-        // LE before writing it into the payload. A raw byte copy would be wrong
-        // for signed (sign-flipped) and big-endian-encoded columns.
-        let dst = output.col_data_mut(cm.dst_payload);
-        let pk_off = cm.pk_byte_offset as usize;
-        let mut le = [0u8; crate::schema::MAX_PK_BYTES];
-        for row in 0..n {
-            let opk = in_batch.get_pk_bytes(row);
-            // Read the source column's OWN width from the OPK region (not the wider
-            // destination stride, which would over-read into the next PK column),
-            // decode to native LE, then widen if the output slot is wider.
-            gnitz_wire::decode_pk_column(&opk[pk_off..pk_off + src_stride], cm.type_code, &mut le[..src_stride]);
-            let out = &mut dst[row * stride..row * stride + stride];
-            if src_stride == stride {
-                out.copy_from_slice(&le[..stride]);
-            } else {
-                gnitz_wire::widen_native_le(&le[..src_stride], cm.type_code, out);
+    // Destructure the locator ONCE before the row loops: the per-row bodies
+    // below stay free of locator dispatch (and of `native_le_bytes`'s
+    // by-value [u8; 16] materialization).
+    match cm.src {
+        ColumnLocator::Pk {
+            byte_off,
+            size,
+            type_code,
+        } => {
+            // PK region holds OPK bytes; decode the addressed column back to native
+            // LE before writing it into the payload. A raw byte copy would be wrong
+            // for signed (sign-flipped) and big-endian-encoded columns.
+            let dst = output.col_data_mut(cm.dst_payload);
+            let pk_off = byte_off as usize;
+            let src_stride = size as usize;
+            let mut le = [0u8; crate::schema::MAX_PK_BYTES];
+            for row in 0..n {
+                let opk = in_batch.get_pk_bytes(row);
+                // Read the source column's OWN width from the OPK region (not the wider
+                // destination stride, which would over-read into the next PK column),
+                // decode to native LE, then widen if the output slot is wider.
+                gnitz_wire::decode_pk_column(&opk[pk_off..pk_off + src_stride], type_code, &mut le[..src_stride]);
+                let out = &mut dst[row * stride..row * stride + stride];
+                if src_stride == stride {
+                    out.copy_from_slice(&le[..stride]);
+                } else {
+                    gnitz_wire::widen_native_le(&le[..src_stride], type_code, out);
+                }
             }
         }
-    } else if gnitz_wire::is_german_string(cm.type_code) && blob_cache.is_some() {
-        // STRING and BLOB share the 16-byte German-string struct: a long
-        // (out-of-line) value's heap-offset field points into the source batch's
-        // blob region. Relocate each cell's bytes into the output blob; the
-        // shared BlobCache deduplicates identical spans across all columns/rows
-        // of this MAP.
-        let in_pi = cm.src_pi as usize;
-        let src_col = in_batch.col_data(in_pi);
-        for row in 0..n {
-            let off = row * stride;
-            let cell = crate::schema::relocate_german_string_vec(
-                &src_col[off..off + stride],
-                &in_batch.blob,
-                &mut output.blob,
-                blob_cache.as_deref_mut(),
-            );
-            output.col_data_mut(cm.dst_payload)[off..off + 16].copy_from_slice(&cell);
-        }
-    } else {
-        let in_pi = cm.src_pi as usize;
-        if src_stride == stride {
-            debug_assert!(
-                n * stride <= in_batch.col_data(in_pi).len(),
-                "copy_column: n*stride ({}*{}={}) > in_batch.col_data({}).len()={} \
-                 (batch count={}, payload cols={})",
-                n,
-                stride,
-                n * stride,
-                in_pi,
-                in_batch.col_data(in_pi).len(),
-                in_batch.count,
-                in_batch.num_payload_cols(),
-            );
-            output
-                .col_data_mut(cm.dst_payload)
-                .copy_from_slice(&in_batch.col_data(in_pi)[..n * stride]);
-        } else {
-            // Wider destination slot (a promoted integer column): sign/zero-extend
-            // the narrower source into it, one row at a time.
-            let src = in_batch.col_data(in_pi);
-            let dst = output.col_data_mut(cm.dst_payload);
-            for row in 0..n {
-                gnitz_wire::widen_native_le(
-                    &src[row * src_stride..row * src_stride + src_stride],
-                    cm.type_code,
-                    &mut dst[row * stride..row * stride + stride],
+        ColumnLocator::Payload { slot, size, type_code } => {
+            let in_pi = slot as usize;
+            let src_stride = size as usize; // source read width
+            if gnitz_wire::is_german_string(type_code) && blob_cache.is_some() {
+                // STRING and BLOB share the 16-byte German-string struct: a long
+                // (out-of-line) value's heap-offset field points into the source batch's
+                // blob region. Relocate each cell's bytes into the output blob; the
+                // shared BlobCache deduplicates identical spans across all columns/rows
+                // of this MAP.
+                let src_col = in_batch.col_data(in_pi);
+                for row in 0..n {
+                    let off = row * stride;
+                    let cell = crate::schema::relocate_german_string_vec(
+                        &src_col[off..off + stride],
+                        &in_batch.blob,
+                        &mut output.blob,
+                        blob_cache.as_deref_mut(),
+                    );
+                    output.col_data_mut(cm.dst_payload)[off..off + 16].copy_from_slice(&cell);
+                }
+            } else if src_stride == stride {
+                debug_assert!(
+                    n * stride <= in_batch.col_data(in_pi).len(),
+                    "copy_column: n*stride ({}*{}={}) > in_batch.col_data({}).len()={} \
+                     (batch count={}, payload cols={})",
+                    n,
+                    stride,
+                    n * stride,
+                    in_pi,
+                    in_batch.col_data(in_pi).len(),
+                    in_batch.count,
+                    in_batch.num_payload_cols(),
                 );
+                output
+                    .col_data_mut(cm.dst_payload)
+                    .copy_from_slice(&in_batch.col_data(in_pi)[..n * stride]);
+            } else {
+                // Wider destination slot (a promoted integer column): sign/zero-extend
+                // the narrower source into it, one row at a time.
+                let src = in_batch.col_data(in_pi);
+                let dst = output.col_data_mut(cm.dst_payload);
+                for row in 0..n {
+                    gnitz_wire::widen_native_le(
+                        &src[row * src_stride..row * src_stride + src_stride],
+                        type_code,
+                        &mut dst[row * stride..row * stride + stride],
+                    );
+                }
             }
         }
     }
@@ -126,7 +135,10 @@ fn copy_column(
 /// column (though a filter's row subset, like a relocate's forgone dedup, can
 /// still carry more blob bytes than a from-scratch relocate would).
 fn compute_blob_passthrough(in_schema: &SchemaDescriptor, col_moves: &[ColMove]) -> bool {
-    if !col_moves.iter().any(|cm| gnitz_wire::is_german_string(cm.type_code)) {
+    if !col_moves
+        .iter()
+        .any(|cm| gnitz_wire::is_german_string(cm.src.type_code()))
+    {
         return false;
     }
     // Each input German-string column (never a PK, so it has a dense payload
@@ -135,7 +147,9 @@ fn compute_blob_passthrough(in_schema: &SchemaDescriptor, col_moves: &[ColMove])
         .filter(|&ci| gnitz_wire::is_german_string(in_schema.columns[ci].type_code))
         .all(|ci| {
             let pi = in_schema.payload_mapping_byte(ci);
-            col_moves.iter().any(|cm| cm.src_pi == pi)
+            col_moves
+                .iter()
+                .any(|cm| matches!(cm.src, ColumnLocator::Payload { slot, .. } if slot == pi))
         })
 }
 
@@ -151,18 +165,16 @@ struct NullPerm {
 }
 
 impl NullPerm {
-    /// Build from (src_pi_byte, dst_payload) pairs. `src_pi_bytes` holds
-    /// resolved payload bytes — `SENTINEL` for the PK column (skipped here,
-    /// since the PK has no null bit), otherwise the dense payload index.
-    fn from_col_pairs(src_pi_bytes: &[u8], dst_payloads: &[u32], null_payloads: &[u32]) -> Self {
-        let mut pairs = Vec::new();
-        for k in 0..src_pi_bytes.len() {
-            let src = src_pi_bytes[k];
-            if src == PAYLOAD_MAPPING_PK_SENTINEL {
-                continue;
-            }
-            pairs.push((src, dst_payloads[k] as u8));
-        }
+    /// Build from the column moves (a PK source is skipped — the PK has no
+    /// null bit) and the always-NULL output payload positions.
+    fn new(col_moves: &[ColMove], null_payloads: &[u32]) -> Self {
+        let pairs = col_moves
+            .iter()
+            .filter_map(|cm| match cm.src {
+                ColumnLocator::Pk { .. } => None,
+                ColumnLocator::Payload { slot, .. } => Some((slot, cm.dst_payload as u8)),
+            })
+            .collect();
         let mut constant: u64 = 0;
         for &null_pl in null_payloads {
             constant |= 1u64 << null_pl;
@@ -183,6 +195,19 @@ impl NullPerm {
     /// `out.len()` must be `n * 8`.
     fn apply_column_into(&self, in_null_bmp: &[u8], out: &mut [u8], n: usize) {
         debug_assert_eq!(out.len(), n * 8);
+        if self.pairs.is_empty() {
+            // Pure-compute map: nothing to permute. The output null region is
+            // zeroed on every construction path (fresh alloc, `recycle_buf`
+            // clear, `resize(size, 0)` re-zero), so an all-zero permutation is
+            // a no-op and a constant-only one fills the word without reading
+            // the input bitmap at all.
+            if self.constant != 0 {
+                for row in 0..n {
+                    out[row * 8..row * 8 + 8].copy_from_slice(&self.constant.to_le_bytes());
+                }
+            }
+            return;
+        }
         for row in 0..n {
             let off = row * 8;
             let in_null = u64::from_le_bytes(in_null_bmp[off..off + 8].try_into().unwrap());
@@ -196,59 +221,72 @@ impl NullPerm {
 // ---------------------------------------------------------------------------
 
 struct ColMove {
-    /// Resolved payload byte for the source: `SENTINEL` for the PK column,
-    /// otherwise the dense payload index in the input batch.
-    src_pi: u8,
+    /// Resolved source column: PK byte window or dense payload slot, plus the
+    /// SOURCE type code and width. The type dispatches the string path, decodes
+    /// the OPK bytes of a PK source column, and (when widening) drives the
+    /// extension signedness: value-preserving widening always extends per the
+    /// source's signedness, even when the destination's sign class differs
+    /// (e.g. U32 promoted into an I64 slot).
+    src: ColumnLocator,
     /// Dense payload index in the output batch.
     dst_payload: usize,
-    /// SOURCE type code of the column — dispatches the string path, decodes the
-    /// OPK bytes of a PK source column, determines the source read width, and
-    /// (when widening) drives the extension signedness: value-preserving
-    /// widening always extends per the source's signedness, even when the
-    /// destination's sign class differs (e.g. U32 promoted into an I64 slot).
-    type_code: u8,
     /// Destination write width, taken from the output schema. Wider than the
     /// source column's own width only for a promoted integer column (currently
     /// produced by cross-width set-ops), where the copy sign/zero-extends the
     /// source into the slot.
     stride: u8,
-    /// Byte offset of this column within the OPK PK region. Valid only when
-    /// `src_pi == PAYLOAD_MAPPING_PK_SENTINEL`; 0 for single-column PKs.
-    pk_byte_offset: u8,
+}
+
+/// One EMIT target: computed register `reg` → output payload column `payload`
+/// at write width `stride` (from the output schema).
+struct EmitCol {
+    payload: usize,
+    reg: usize,
+    stride: u8,
 }
 
 struct InterpretedCompute {
     prog: ResolvedProgram,
-    emit_payloads: Vec<usize>,
-    emit_regs: Vec<usize>,
-    /// Output byte width per EMIT target, parallel to `emit_payloads`.
-    emit_strides: Vec<u8>,
+    emits: Vec<EmitCol>,
 }
 
-pub struct ScalarFunc {
-    /// The predicate program; `None` for a map/projection. `prog.no_nulls` carries
-    /// the nullability verdict against the schema it was resolved against.
-    filter: Option<ResolvedProgram>,
-    col_moves: Vec<ColMove>,
-    null_perm: NullPerm,
-    compute: Option<InterpretedCompute>,
-    /// Precomputed [`compute_blob_passthrough`]: skip per-cell string relocation
-    /// and share the input blob when no string column is dropped.
-    blob_passthrough: bool,
-    scratch: RefCell<EvalScratch>,
+/// A compiled scalar function. The role is fixed at construction — the
+/// compiler/VM dispatch is per-node, so a func is only ever driven through the
+/// entry point matching its variant. Newtype over the private enum so the
+/// variant fields keep the module's internal visibility.
+pub struct ScalarFunc(Repr);
+
+enum Repr {
+    /// Filter predicate. `prog.no_nulls` carries the nullability verdict
+    /// against the schema it was resolved against.
+    Predicate {
+        prog: ResolvedProgram,
+        scratch: RefCell<EvalScratch>,
+    },
+    /// Map/projection: columnar moves + null permutation + optional per-row
+    /// compute kernel, with the owned output schema.
+    Map {
+        col_moves: Vec<ColMove>,
+        null_perm: NullPerm,
+        compute: Option<InterpretedCompute>,
+        /// Precomputed [`compute_blob_passthrough`]: skip per-cell string
+        /// relocation and share the input blob when no string column is dropped.
+        blob_passthrough: bool,
+        /// Boxed: the descriptor is by far the largest field and would bloat
+        /// every `Repr` (clippy: large_enum_variant); one indirection per
+        /// batch is free.
+        out_schema: Box<SchemaDescriptor>,
+        scratch: RefCell<EvalScratch>,
+    },
 }
 
 impl ScalarFunc {
     /// Filter via interpreted expression.
     pub fn from_predicate(logical: LogicalProgram, schema: &SchemaDescriptor) -> Self {
-        ScalarFunc {
-            filter: Some(logical.resolve(schema, /* is_filter = */ true)),
-            col_moves: Vec::new(),
-            null_perm: NullPerm::default(),
-            compute: None,
-            blob_passthrough: false, // a predicate copies no columns
-            scratch: RefCell::new(EvalScratch::new()),
-        }
+        ScalarFunc(Repr::Predicate {
+            prog: logical.resolve(schema, /* is_filter = */ true),
+            scratch: RefCell::new(EvalScratch::default()),
+        })
     }
 
     /// Map plan from a logical expression program. A pure projection is the
@@ -257,75 +295,57 @@ impl ScalarFunc {
     /// `col_moves` + `null_perm`.
     pub fn from_map(logical: LogicalProgram, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> Self {
         let prog = logical.resolve(in_schema, /* is_filter = */ false);
-        // One pass over the typed output classification — `ColSrc` carries the
-        // PK-vs-payload distinction, so there is no negative-sentinel decode and
-        // no parallel-`Vec` bytecode re-walk.
-        let out_cols = prog.classify_output_cols();
+        // One pass over the resolved instructions — `CopyCol`'s locator carries
+        // the PK-vs-payload distinction, so there is no negative-sentinel decode
+        // and no parallel-`Vec` bytecode re-walk.
+        let out_stride = |payload: usize| out_schema.columns[out_schema.payload_col_idx(payload)].size();
         let mut col_moves: Vec<ColMove> = Vec::new();
         let mut null_payloads: Vec<u32> = Vec::new();
-        let mut emit_payloads: Vec<usize> = Vec::new();
-        let mut emit_regs: Vec<usize> = Vec::new();
-        for k in &out_cols {
-            match *k {
-                OutputColKind::CopyCol { src, out_payload, tc } => {
-                    let (src_pi, pk_byte_offset) = match src {
-                        ColSrc::Pk { off } => (PAYLOAD_MAPPING_PK_SENTINEL, off),
-                        ColSrc::Payload(pi) => (pi, 0u8),
-                    };
-                    let out_ci = out_schema.payload_col_idx(out_payload as usize);
-                    col_moves.push(ColMove {
-                        src_pi,
-                        dst_payload: out_payload as usize,
-                        type_code: tc,
-                        stride: out_schema.columns[out_ci].size(),
-                        pk_byte_offset,
-                    });
-                }
-                OutputColKind::Emit { reg, out_payload } => {
-                    emit_regs.push(reg);
-                    emit_payloads.push(out_payload);
-                }
-                OutputColKind::EmitNull { out_payload } => null_payloads.push(out_payload),
+        let mut emits: Vec<EmitCol> = Vec::new();
+        for instr in &prog.instrs {
+            match *instr {
+                Instr::CopyCol { src, out } => col_moves.push(ColMove {
+                    src,
+                    dst_payload: out as usize,
+                    stride: out_stride(out as usize),
+                }),
+                Instr::Emit { src, out } => emits.push(EmitCol {
+                    payload: out as usize,
+                    reg: src as usize,
+                    stride: out_stride(out as usize),
+                }),
+                Instr::EmitNull { out } => null_payloads.push(out),
+                _ => {}
             }
         }
 
         // Null permutation: copied columns carry their source null bit (PK
-        // sentinels are skipped inside `from_col_pairs`); EMIT_NULL columns are
-        // unconditionally null. Both derive from the same walk.
-        let null_src: Vec<u8> = col_moves.iter().map(|c| c.src_pi).collect();
-        let null_dst: Vec<u32> = col_moves.iter().map(|c| c.dst_payload as u32).collect();
-        let null_perm = NullPerm::from_col_pairs(&null_src, &null_dst, &null_payloads);
+        // sources are skipped inside `NullPerm::new` — the PK has no null bit);
+        // EMIT_NULL columns are unconditionally null.
+        let null_perm = NullPerm::new(&col_moves, &null_payloads);
 
         // Compute is needed iff the program emits a computed register: every
         // compute instruction exists only to feed an EMIT.
-        let compute = if emit_regs.is_empty() {
-            None
-        } else {
-            let emit_strides: Vec<u8> = emit_payloads
-                .iter()
-                .map(|&p| {
-                    let out_ci = out_schema.payload_col_idx(p);
-                    out_schema.columns[out_ci].size()
-                })
-                .collect();
-            debug_assert_eq!(emit_strides.len(), emit_regs.len());
-            debug_assert_eq!(emit_strides.len(), emit_payloads.len());
-            Some(InterpretedCompute {
-                prog,
-                emit_payloads,
-                emit_regs,
-                emit_strides,
-            })
-        };
+        let compute = (!emits.is_empty()).then_some(InterpretedCompute { prog, emits });
 
         let blob_passthrough = compute_blob_passthrough(in_schema, &col_moves);
-        ScalarFunc {
-            filter: None,
+        ScalarFunc(Repr::Map {
             col_moves,
             null_perm,
             compute,
             blob_passthrough,
-            scratch: RefCell::new(EvalScratch::new()),
+            out_schema: Box::new(*out_schema),
+            scratch: RefCell::new(EvalScratch::default()),
+        })
+    }
+
+    /// The map's owned output schema. Callers that construct or stamp the
+    /// output batch outside `evaluate_map_batch` (op_map's reindex arms) read
+    /// it here instead of carrying a parallel schema operand.
+    pub fn map_out_schema(&self) -> &SchemaDescriptor {
+        match &self.0 {
+            Repr::Map { out_schema, .. } => out_schema,
+            Repr::Predicate { .. } => unreachable!("predicate ScalarFunc has no output schema"),
         }
     }
 
@@ -335,11 +355,11 @@ impl ScalarFunc {
     /// since the unpack to `regs` is skipped in that case).
     #[cfg(test)]
     pub(crate) fn evaluate_predicate(&self, batch: &MemBatch, row: usize) -> bool {
-        let Some(prog) = &self.filter else {
-            return true;
+        let Repr::Predicate { prog, scratch } = &self.0 else {
+            unreachable!("evaluate_predicate on a Map ScalarFunc");
         };
         let no_nulls = prog.no_nulls;
-        let mut scratch = self.scratch.borrow_mut();
+        let mut scratch = scratch.borrow_mut();
         scratch.ensure_capacity(prog.num_regs as usize, no_nulls, 1);
         eval_batch(prog, batch, row, 1, &mut scratch);
         if prog.num_regs == 0 {
@@ -358,36 +378,29 @@ impl ScalarFunc {
     }
 
     /// Run the filter over all `n` rows of `mb`, invoking `append_range` for
-    /// each maximal contiguous run of passing rows. The no-filter case passes
-    /// the whole range in one call. The bitmap stays inside `scratch` — no
-    /// per-call `Vec<u64>` allocation.
+    /// each maximal contiguous run of passing rows. The bitmap stays inside
+    /// `scratch` — no per-call `Vec<u64>` allocation.
     pub fn run_filter<F: FnMut(usize, usize)>(&self, mb: &MemBatch, n: usize, mut append_range: F) {
-        let Some(prog) = &self.filter else {
-            if n > 0 {
-                append_range(0, n);
-            }
-            return;
+        let Repr::Predicate { prog, scratch } = &self.0 else {
+            unreachable!("run_filter on a Map ScalarFunc (the VM dispatch is per-node)");
         };
         let no_nulls = prog.no_nulls;
         let num_regs = prog.num_regs as usize;
         let result_reg = prog.result_reg as usize;
 
-        let mut scratch = self.scratch.borrow_mut();
+        let mut scratch = scratch.borrow_mut();
         scratch.ensure_capacity(num_regs, no_nulls, n);
 
         let words = n.div_ceil(64);
 
-        // Fast-path gate: result_reg must be bit_only (i.e. produced by a
-        // boolean op so `bool_bits[result_reg]` is fresh) AND we must be on
-        // the nullable arm (in `no_nulls` mode bool_bits is unallocated).
-        // Predicates like `WHERE int_col` produce result_reg from
-        // `Instr::LoadPayloadInt` — not a bool producer — so the per-row scan over
-        // `regs` is the only correct path for them.
-        let use_fast_path = !no_nulls && prog.is_bit_only(result_reg);
-
-        // Slow path uses `|=` and needs zeroed words; fast path overwrites
-        // every word, so the fill is a wasted pass there.
-        if !use_fast_path {
+        // `no_nulls` mode allocates no `bool_bits` (capacity 0), so its arm
+        // scans `regs` per row and needs zeroed words for the `|=`. On the
+        // nullable arm the result register is ALWAYS packed —
+        // `classify_registers` marks a filter's result as a bool input, so
+        // every producer (boolean ops natively, value producers through
+        // `maybe_pack_bool_bits`) populates `bool_bits[result_reg]` — and the
+        // word-level merge overwrites every word.
+        if no_nulls {
             scratch.filter_bits[..words].fill(0);
         }
 
@@ -395,7 +408,15 @@ impl ScalarFunc {
             let m = MORSEL.min(n - morsel_start);
             eval_batch(prog, mb, morsel_start, m, &mut scratch);
 
-            if use_fast_path {
+            if no_nulls {
+                let base_r = result_reg * MORSEL;
+                for i in 0..m {
+                    let abs = morsel_start + i;
+                    if scratch.regs[base_r + i] != 0 {
+                        scratch.filter_bits[abs / 64] |= 1u64 << (abs % 64);
+                    }
+                }
+            } else {
                 // Word-level merge: filter bit = truthy & !null. morsel_start
                 // is 64-aligned (MORSEL=256), so each morsel maps onto a
                 // contiguous run of `filter_bits` words.
@@ -420,33 +441,33 @@ impl ScalarFunc {
                     let mask = (1u64 << tail_bits) - 1;
                     scratch.filter_bits[filter_word_base + w] = (vw & !nw) & mask;
                 }
-            } else {
-                let base_r = result_reg * MORSEL;
-                let base_null = result_reg * NULL_WORDS_PER_REG;
-                for i in 0..m {
-                    let abs = morsel_start + i;
-                    let is_null = !no_nulls && (scratch.null_bits[base_null + i / 64] >> (i % 64)) & 1 != 0;
-                    if !is_null && scratch.regs[base_r + i] != 0 {
-                        scratch.filter_bits[abs / 64] |= 1u64 << (abs % 64);
-                    }
-                }
             }
         }
 
         scan_filter_bits(&scratch.filter_bits[..words], n, &mut append_range);
     }
 
-    /// Execute map: system column clone → col_moves → NullPerm → compute.
-    /// `out_schema` is still required here because constructing the output
-    /// batch (`Batch::with_schema`) needs the full schema. All per-column
-    /// stride information is baked into the `ScalarFunc`.
-    pub fn evaluate_map_batch(&self, in_batch: &Batch, out_schema: &SchemaDescriptor) -> Batch {
+    /// Execute map: system column clone → col_moves → NullPerm → compute. The
+    /// output schema and all per-column stride information are baked into the
+    /// `ScalarFunc`.
+    pub fn evaluate_map_batch(&self, in_batch: &Batch) -> Batch {
+        let Repr::Map {
+            col_moves,
+            null_perm,
+            compute,
+            blob_passthrough,
+            out_schema,
+            scratch,
+        } = &self.0
+        else {
+            unreachable!("evaluate_map_batch on a Predicate ScalarFunc (the VM dispatch is per-node)");
+        };
         let n = in_batch.count;
         if n == 0 {
             return Batch::empty_with_schema(out_schema);
         }
 
-        let mut output = Batch::with_schema(*out_schema, n);
+        let mut output = Batch::with_schema(**out_schema, n);
         output.count = n;
 
         // PK copy: bulk when strides match. When they differ (reindex maps,
@@ -468,7 +489,7 @@ impl ScalarFunc {
         // `get_mut()` is None and the relocate path is never reached), and one
         // upfront `reserve` (dedup keeps the output blob ≤ the input's) covers
         // every ColMove without per-column realloc.
-        let mut blob_cache = if self.blob_passthrough {
+        let mut blob_cache = if *blob_passthrough {
             output.share_blob_from(in_batch);
             crate::storage::BlobCacheGuard::empty()
         } else {
@@ -478,7 +499,7 @@ impl ScalarFunc {
             }
             cache
         };
-        for cm in &self.col_moves {
+        for cm in col_moves {
             copy_column(in_batch, &mut output, cm, blob_cache.get_mut());
         }
 
@@ -488,22 +509,16 @@ impl ScalarFunc {
         // Split-borrow: `in_batch` and `output` are distinct allocations.
         {
             let in_nb = in_batch.null_bmp_data();
-            self.null_perm.apply_column_into(in_nb, output.null_bmp_data_mut(), n);
+            null_perm.apply_column_into(in_nb, output.null_bmp_data_mut(), n);
         }
 
         // Compute kernel
-        if let Some(InterpretedCompute {
-            prog,
-            emit_payloads,
-            emit_regs,
-            emit_strides,
-        }) = &self.compute
-        {
+        if let Some(InterpretedCompute { prog, emits }) = compute {
             let no_nulls = prog.no_nulls;
             let num_regs = prog.num_regs as usize;
 
             let in_mb = in_batch.as_mem_batch();
-            let mut scratch = self.scratch.borrow_mut();
+            let mut scratch = scratch.borrow_mut();
             scratch.ensure_capacity(num_regs, no_nulls, n);
 
             for morsel_start in (0..n).step_by(MORSEL) {
@@ -516,20 +531,33 @@ impl ScalarFunc {
                 // `Vec<u8>` holding every region, so a pointer into the null
                 // region derived once and held across a `col_data_mut` reborrow
                 // would be invalidated by it.
-                for ((&out_payload, &reg), &stride_u8) in
-                    emit_payloads.iter().zip(emit_regs.iter()).zip(emit_strides.iter())
-                {
-                    let stride = stride_u8 as usize;
-                    let base_r = reg * MORSEL;
-                    let base_null_r = reg * NULL_WORDS_PER_REG;
+                for e in emits {
+                    let out_payload = e.payload;
+                    let stride = e.stride as usize;
+                    let base_r = e.reg * MORSEL;
+                    let base_null_r = e.reg * NULL_WORDS_PER_REG;
 
                     {
                         let dst8 = output.col_data_mut(out_payload);
-                        for i in 0..m {
-                            let is_null = !no_nulls && (scratch.null_bits[base_null_r + i / 64] >> (i % 64)) & 1 != 0;
-                            let val = if is_null { 0i64 } else { scratch.regs[base_r + i] };
-                            let off = (morsel_start + i) * stride;
-                            dst8[off..off + stride].copy_from_slice(&val.to_le_bytes()[..stride]);
+                        if stride == 8 {
+                            // Monomorphic fast arm: computed outputs are
+                            // overwhelmingly 8-byte, and a constant-width store
+                            // lets the loop vectorize.
+                            for i in 0..m {
+                                let is_null =
+                                    !no_nulls && (scratch.null_bits[base_null_r + i / 64] >> (i % 64)) & 1 != 0;
+                                let val = if is_null { 0i64 } else { scratch.regs[base_r + i] };
+                                let off = (morsel_start + i) * 8;
+                                dst8[off..off + 8].copy_from_slice(&val.to_le_bytes());
+                            }
+                        } else {
+                            for i in 0..m {
+                                let is_null =
+                                    !no_nulls && (scratch.null_bits[base_null_r + i / 64] >> (i % 64)) & 1 != 0;
+                                let val = if is_null { 0i64 } else { scratch.regs[base_r + i] };
+                                let off = (morsel_start + i) * stride;
+                                dst8[off..off + stride].copy_from_slice(&val.to_le_bytes()[..stride]);
+                            }
                         }
                     }
 

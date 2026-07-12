@@ -23,7 +23,7 @@ pub(super) fn eval_predicate_via_batch(prog: &ResolvedProgram, mb: &MemBatch, ro
     if prog.num_regs == 0 {
         return (0, true);
     }
-    let mut scratch = EvalScratch::new();
+    let mut scratch = EvalScratch::default();
     scratch.ensure_capacity(prog.num_regs as usize, false, 1);
     eval_batch(prog, mb, row, 1, &mut scratch);
     let r = prog.result_reg as usize;
@@ -41,7 +41,7 @@ pub(super) fn eval_with_emit_via_batch(
     mb: &MemBatch,
     row: usize,
 ) -> (i64, bool, u64, Vec<i64>) {
-    let mut scratch = EvalScratch::new();
+    let mut scratch = EvalScratch::default();
     scratch.ensure_capacity(prog.num_regs.max(1) as usize, false, 1);
     eval_batch(prog, mb, row, 1, &mut scratch);
 

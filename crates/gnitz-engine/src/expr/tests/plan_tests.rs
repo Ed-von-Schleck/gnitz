@@ -36,7 +36,7 @@ fn test_projection_batch() {
 
     let prog = LogicalProgram::copy_cols(&[2, 1]);
     let func = ScalarFunc::from_map(prog, &in_schema, &out_schema);
-    let result = func.evaluate_map_batch(&batch, &out_schema);
+    let result = func.evaluate_map_batch(&batch);
     assert_eq!(result.count, 2);
 
     let r0_col0 = i64::from_le_bytes(result.col_data(0)[0..8].try_into().unwrap());
@@ -63,7 +63,7 @@ fn test_map_copy_and_emit() {
     let prog = crate::expr::LogicalProgram::new(instrs, 3, 2, vec![]);
 
     let func = ScalarFunc::from_map(prog, &in_schema, &out_schema);
-    let result = func.evaluate_map_batch(&batch, &out_schema);
+    let result = func.evaluate_map_batch(&batch);
     assert_eq!(result.count, 1);
 
     let v0 = i64::from_le_bytes(result.col_data(0)[0..8].try_into().unwrap());
@@ -78,7 +78,7 @@ fn test_empty_batch() {
     let batch = Batch::empty_with_schema(&schema);
 
     let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema);
-    let result = func.evaluate_map_batch(&batch, &schema);
+    let result = func.evaluate_map_batch(&batch);
     assert_eq!(result.count, 0);
 }
 
@@ -120,7 +120,7 @@ fn test_map_blob_passthrough_and_fallback() {
         let out_schema = make_schema(0, &[type_code::U64, type_code::STRING, type_code::STRING]);
         let prog = LogicalProgram::copy_cols(&[2, 1]);
         let func = ScalarFunc::from_map(prog, &in_schema, &out_schema);
-        let out = func.evaluate_map_batch(&batch, &out_schema);
+        let out = func.evaluate_map_batch(&batch);
         assert_eq!(out.count, 2);
         assert_eq!(read_gs(&out, 0, 0), b"long-string-one-xyz"); // s2 → out payload 0
         assert_eq!(read_gs(&out, 1, 0), b"ab"); // s1 → out payload 1
@@ -136,7 +136,7 @@ fn test_map_blob_passthrough_and_fallback() {
         let out_schema = make_schema(0, &[type_code::U64, type_code::STRING]);
         let prog = LogicalProgram::copy_cols(&[1]);
         let func = ScalarFunc::from_map(prog, &in_schema, &out_schema);
-        let out = func.evaluate_map_batch(&batch, &out_schema);
+        let out = func.evaluate_map_batch(&batch);
         assert_eq!(out.count, 2);
         assert_eq!(read_gs(&out, 0, 0), b"ab");
         assert_eq!(read_gs(&out, 0, 1), b"cd");
@@ -192,7 +192,7 @@ fn test_map_pk_copy_col_u128_and_signed_i64() {
         1, // PK col 1 (I64) → payload 1
         2, // payload col 2 (I64) → payload 2
     ]);
-    let out = ScalarFunc::from_map(prog, &in_schema, &out_schema).evaluate_map_batch(&batch, &out_schema);
+    let out = ScalarFunc::from_map(prog, &in_schema, &out_schema).evaluate_map_batch(&batch);
 
     assert_eq!(out.count, 1);
     assert_eq!(out.pk_data(), batch.pk_data(), "PK region copied verbatim");
@@ -255,7 +255,7 @@ fn test_map_copy_col_widens_into_promoted_slot() {
         2, // I8 payload → sign-extend
         3, // U8 payload → zero-extend
     ]);
-    let out = ScalarFunc::from_map(prog, &in_schema, &out_schema).evaluate_map_batch(&batch, &out_schema);
+    let out = ScalarFunc::from_map(prog, &in_schema, &out_schema).evaluate_map_batch(&batch);
 
     assert_eq!(out.count, 1);
     let widened = |pi: usize| i64::from_le_bytes(out.col_data(pi)[..8].try_into().unwrap());

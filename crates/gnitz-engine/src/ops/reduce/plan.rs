@@ -4,21 +4,23 @@
 //! coherence the old 13-parameter `op_reduce` signature spread across the
 //! instruction operands; the per-epoch call re-derives nothing.
 
-use crate::schema::{ColumnLocator, ReduceOutKey, SchemaDescriptor};
+use crate::schema::{ColumnLocator, ReduceOutKey, SchemaDescriptor, TypeCode};
 
+use super::super::util::{GroupKeyCols, GroupKeyExtractor};
 use super::agg::{AggDescriptor, AggOp};
-use super::sort::{build_sort_descs, SortDesc};
+use super::sort::packed_sort_spec;
 
 /// Role of one reduce-output payload column, resolved at plan build so the
 /// per-emitted-group loop does no `locate()` walk or bounds re-derivation.
 #[derive(Clone, Copy)]
 pub(super) enum OutColRole {
-    /// Trailing aggregate column: `accs[k]`, emitted at output width `cs`.
-    Agg { k: u8, cs: u8 },
-    /// Group-exemplar column, read from the input exemplar row through a
-    /// pre-resolved locator. `tc` is the column's type code (German-string
-    /// dispatch), `cs` its width.
-    Exemplar { loc: ColumnLocator, tc: u8, cs: u8 },
+    /// Trailing aggregate column: `accs[k]`, emitted at width
+    /// `agg_col_widths[k]`.
+    Agg { k: u8 },
+    /// Group-exemplar column — a verbatim copy of the input group column read
+    /// through its pre-resolved locator, so the locator's own type code and
+    /// width are the emit dispatch and copy width.
+    Exemplar(ColumnLocator),
 }
 
 /// The baked per-instruction reduce plan. Input facts (schemas, group columns,
@@ -51,9 +53,20 @@ pub struct ReducePlan {
     /// count-less reduce (the range-join threshold reduce, low-level
     /// CircuitBuilder reduces) degrades to the touched-ness test.
     pub(crate) cardinality_idx: Option<u8>,
-    /// Group-column comparator descriptors; empty on the natural-PK path
+    /// Group-column comparator locators; empty on the natural-PK path
     /// (membership is the full PK byte window there).
-    pub(crate) sort_descs: Vec<SortDesc>,
+    pub(crate) sort_descs: Vec<ColumnLocator>,
+    /// `argsort_delta`'s packed-sort fast-path spec (see `packed_sort_spec`).
+    pub(super) packed_sort: Option<(u8, TypeCode)>,
+    /// Per-aggregate source-column locator, parallel to `agg_descs` — the
+    /// accumulators are rebuilt per epoch, but the `locate()` walk is not.
+    pub(super) agg_locs: Vec<ColumnLocator>,
+    /// AVI group-key gatherer for the combined-index read path; `Some` iff the
+    /// instruction carries a value-index table.
+    pub(super) avi_extractor: Option<GroupKeyExtractor>,
+    /// Baked group-key hasher for the non-linear no-index fallback's
+    /// per-trace-row routing; `Some` exactly on that path.
+    pub(super) fallback_keys: Option<GroupKeyCols>,
     /// Output width of each trailing agg column — the trace read-back stride.
     pub(crate) agg_col_widths: Vec<usize>,
     /// First aggregate column's logical index (aggregates are the trailing
@@ -104,12 +117,19 @@ impl ReducePlan {
             .flatten()
             .map(|i| i as u8);
 
-        let sort_descs: Vec<SortDesc> = if group_by_pk {
+        let sort_descs: Vec<ColumnLocator> = if group_by_pk {
             Vec::new()
         } else {
-            let (arr, len) = build_sort_descs(input_schema, group_by_cols);
-            arr[..len].to_vec()
+            group_by_cols.iter().map(|&c| input_schema.locate(c as usize)).collect()
         };
+        let packed_sort = packed_sort_spec(input_schema, group_by_cols);
+        let agg_locs: Vec<ColumnLocator> = agg_descs
+            .iter()
+            .map(|d| input_schema.locate(d.col_idx as usize))
+            .collect();
+        let avi_extractor = has_avi.then(|| GroupKeyExtractor::new(input_schema, group_by_cols));
+        let fallback_keys =
+            (!all_linear && !has_avi && !group_by_pk).then(|| GroupKeyCols::new(input_schema, group_by_cols));
 
         let agg_col_widths: Vec<usize> = (0..num_aggs)
             .map(|k| output_schema.columns[cbase + k].size() as usize)
@@ -121,13 +141,9 @@ impl ReducePlan {
         // per group column — anything else is unconstructible.
         let out_roles: Vec<OutColRole> = output_schema
             .payload_columns()
-            .map(|(_pi, ci, col)| {
-                let cs = col.size();
+            .map(|(_pi, ci, _col)| {
                 if ci >= cbase {
-                    OutColRole::Agg {
-                        k: (ci - cbase) as u8,
-                        cs,
-                    }
+                    OutColRole::Agg { k: (ci - cbase) as u8 }
                 } else if use_natural_pk {
                     unreachable!("natural-PK reduce output has no group-exemplar columns");
                 } else {
@@ -138,12 +154,7 @@ impl ReducePlan {
                         grp_idx < group_by_cols.len(),
                         "reduce output schema exemplar column without a group column",
                     );
-                    let src_ci = group_by_cols[grp_idx] as usize;
-                    OutColRole::Exemplar {
-                        loc: input_schema.locate(src_ci),
-                        tc: col.type_code,
-                        cs,
-                    }
+                    OutColRole::Exemplar(input_schema.locate(group_by_cols[grp_idx] as usize))
                 }
             })
             .collect();
@@ -161,6 +172,10 @@ impl ReducePlan {
             track_nonlinear,
             cardinality_idx,
             sort_descs,
+            packed_sort,
+            agg_locs,
+            avi_extractor,
+            fallback_keys,
             agg_col_widths,
             cbase,
             out_roles,
