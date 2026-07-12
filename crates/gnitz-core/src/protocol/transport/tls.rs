@@ -14,7 +14,7 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConnection, StreamOwned};
 
 use super::super::error::ProtocolError;
-use super::{frame_len_prefix, parse_frame_len, ClientTransport, Inner};
+use super::{frame_len_prefix, parse_frame_len, ClientTransport, FrameSegments, Inner};
 
 /// Connect + TLS-handshake + HELLO-exchange deadline. Cleared to `None`
 /// (block forever) by `hello_handshake` after the ACK.
@@ -336,22 +336,27 @@ pub(super) fn send_framed_iov(s: &mut TlsStream, bufs: &[&[u8]]) -> Result<(), P
 
 /// Send many length-prefixed frames as one vectored write sequence, flushed
 /// once at the end (plus intermediate flushes whenever rustls's buffer
-/// fills), so small frames coalesce into full records.
-pub(super) fn send_framed_batch<F: AsRef<[u8]>>(s: &mut TlsStream, frames: &[F]) -> Result<(), ProtocolError> {
+/// fills), so small frames coalesce into full records. Each frame may carry
+/// up to `FRAME_SEGMENTS` byte segments under one length prefix.
+pub(super) fn send_framed_batch<F: FrameSegments>(s: &mut TlsStream, frames: &[F]) -> Result<(), ProtocolError> {
     if frames.is_empty() {
         return Ok(());
     }
     let mut total = 0usize;
     let mut prefixes = Vec::with_capacity(frames.len());
     for f in frames {
-        let len = f.as_ref().len();
+        let len: usize = f.segments().iter().map(|seg| seg.len()).sum();
         prefixes.push(frame_len_prefix(len)?);
         total += 4 + len;
     }
-    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(2 * frames.len());
+    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity((1 + super::FRAME_SEGMENTS) * frames.len());
     for (f, prefix) in frames.iter().zip(&prefixes) {
         slices.push(IoSlice::new(prefix));
-        slices.push(IoSlice::new(f.as_ref()));
+        for seg in f.segments() {
+            if !seg.is_empty() {
+                slices.push(IoSlice::new(seg));
+            }
+        }
     }
     write_all_vectored(s, &mut slices, total)?;
     flush_tls(s)

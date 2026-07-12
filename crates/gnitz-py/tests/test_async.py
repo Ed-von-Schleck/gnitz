@@ -509,7 +509,7 @@ def test_api_parity_async_has_all_dml():
 
 def test_api_parity_sync_has_all_dml():
     """Connection must expose every DML method that AsyncConnection does."""
-    missing = _DML_METHODS - set(dir(gnitz.Connection))
+    missing = _DML_METHODS - set(dir(gnitz.GnitzClient))
     assert not missing, f"Connection missing DML methods: {missing}"
 
 

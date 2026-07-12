@@ -124,17 +124,6 @@ impl GatherMap {
     }
 }
 
-fn format_uuid_hyphenated(v: u128) -> String {
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        (v >> 96) as u32,
-        (v >> 80) as u16,
-        (v >> 64) as u16,
-        (v >> 48) as u16,
-        v & 0x0000_ffff_ffff_ffff
-    )
-}
-
 /// Render a PK from its raw OPK byte form for error messages.
 /// Compound PKs are formatted as comma-separated per-column values in
 /// declaration order; `pk_bytes` holds all PK columns concatenated as OPK
@@ -155,7 +144,7 @@ pub(super) fn format_pk_value_bytes(pk_bytes: &[u8], schema: &SchemaDescriptor) 
         let v = u128::from_le_bytes(le);
         let s = match col.type_code {
             crate::schema::type_code::U128 => format!("{v}"),
-            crate::schema::type_code::UUID => format_uuid_hyphenated(v),
+            crate::schema::type_code::UUID => gnitz_wire::format_uuid(v),
             crate::schema::type_code::I64 => format!("{}", v as u64 as i64),
             crate::schema::type_code::I32 => format!("{}", v as u64 as i32),
             crate::schema::type_code::I16 => format!("{}", v as u64 as i16),

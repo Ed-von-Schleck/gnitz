@@ -375,10 +375,10 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
             assert_eq!(ack.status, 0, "push ACK must be OK");
         }
         let mut rows = 0usize;
-        let mut schema_seen: Option<(Schema, u16)> = None;
+        let mut schema_seen: Option<(std::sync::Arc<Schema>, u16)> = None;
         loop {
             let buf = t.recv_framed(gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
-            let hint = schema_seen.as_ref().map(|(s, v)| (s, *v));
+            let hint = schema_seen.as_ref().map(|(s, v)| (s.as_ref(), *v));
             let msg = parse_response(&buf, hint).unwrap();
             assert_eq!(msg.status, 0, "scan frame must be OK");
             let flags = msg.flags;

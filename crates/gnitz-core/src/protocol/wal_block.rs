@@ -1,18 +1,8 @@
-// gnitz-core/src/protocol/wal_block.rs — WAL-block encode/decode (Python wal_columnar.py port)
+//! WAL-block encode/decode for the client wire codec.
 
 use super::error::ProtocolError;
 use super::types::{ColData, PkColumn, Schema, TypeCode, ZSetBatch};
 use xxhash_rust::xxh3::xxh3_64;
-
-/// Whether `decode_wal_block` should verify the xxh3 checksum.
-/// Use `Yes` for WAL recovery and roundtrip tests.
-/// Use `No` for trusted Unix-socket response paths where OS delivery already
-/// guarantees integrity.
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub enum VerifyChecksum {
-    Yes,
-    No,
-}
 
 use gnitz_wire::{
     align8, WAL_FORMAT_VERSION, WAL_HEADER_SIZE as WAL_BLOCK_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT,
@@ -112,14 +102,72 @@ fn append_pk_region(buf: &mut Vec<u8>, pks: &PkColumn, pk_stride: usize, schema:
     }
 }
 
+/// `&str` / `String` convenience wrappers over the wire German-string codec,
+/// used only by the round-trip tests (production STRING columns flow through
+/// `encode_german_col` / `decode_german_col`).
+#[cfg(test)]
 fn encode_german_string(s: &str, blob: &mut Vec<u8>) -> [u8; 16] {
     gnitz_wire::encode_german_string(s.as_bytes(), blob)
 }
 
+#[cfg(test)]
 fn decode_german_string(st: [u8; 16], blob: &[u8]) -> Result<String, ProtocolError> {
     let bytes = gnitz_wire::try_decode_german_string(&st, blob)
         .ok_or_else(|| ProtocolError::DecodeError("German String blob arena out of bounds".into()))?;
     String::from_utf8(bytes).map_err(|e| ProtocolError::DecodeError(format!("utf8 in German String: {e}")))
+}
+
+/// Encode a STRING/BLOB column region: one 16-byte German-string struct per
+/// row (a zeroed struct for null or `None` cells), spilling long values into
+/// `blob`. Shared by the STRING and BLOB encode arms — both are byte-oriented
+/// German strings, differing only in the source cell type.
+fn encode_german_col<'a>(
+    count: usize,
+    nulls: &[u64],
+    payload_idx: usize,
+    cells: impl Iterator<Item = Option<&'a [u8]>>,
+    blob: &mut Vec<u8>,
+) -> Vec<u8> {
+    let mut col_bytes = Vec::with_capacity(count * 16);
+    for (row, val) in cells.enumerate() {
+        let is_null = (nulls[row] & (1u64 << payload_idx)) != 0;
+        if let (false, Some(b)) = (is_null, val) {
+            col_bytes.extend_from_slice(&gnitz_wire::encode_german_string(b, blob));
+        } else {
+            col_bytes.extend_from_slice(&[0u8; 16]);
+        }
+    }
+    col_bytes
+}
+
+/// Decode a STRING/BLOB column region into per-row raw-byte cells: `None` for
+/// a null row, else the German string resolved against `blob`. Shared by the
+/// STRING and BLOB decode arms (STRING then UTF-8-validates each cell).
+/// `reg_off` is the region's directory offset; the caller has validated the
+/// region is `count * 16` bytes and in-bounds, so the per-row struct extent
+/// needs no re-check.
+fn decode_german_col(
+    data: &[u8],
+    reg_off: usize,
+    blob: &[u8],
+    nulls: &[u64],
+    payload_idx: usize,
+    count: usize,
+) -> Result<Vec<Option<Vec<u8>>>, ProtocolError> {
+    let mut vals: Vec<Option<Vec<u8>>> = Vec::with_capacity(count);
+    for (row, &null_word) in nulls.iter().enumerate().take(count) {
+        if (null_word & (1u64 << payload_idx)) != 0 {
+            vals.push(None);
+            continue;
+        }
+        let struct_start = reg_off + row * 16;
+        let mut st = [0u8; 16];
+        st.copy_from_slice(&data[struct_start..struct_start + 16]);
+        vals.push(Some(gnitz_wire::try_decode_german_string(&st, blob).ok_or_else(
+            || ProtocolError::DecodeError("German String blob arena out of bounds".into()),
+        )?));
+    }
+    Ok(vals)
 }
 
 // ── Region read helpers ───────────────────────────────────────────────────────
@@ -174,51 +222,49 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
 
     for (payload_idx, ci, col) in schema.payload_columns() {
         match col.type_code {
+            // STRING and BLOB share the 16-byte German-string encoding; the only
+            // difference is the source cell type (`&str` vs `&[u8]`), both viewed
+            // as bytes here.
             TypeCode::String => {
                 let strings = match &batch.columns[ci] {
                     ColData::Strings(v) => v,
                     _ => panic!("encode_wal_block: expected Strings for String column {ci}"),
                 };
-                let mut col_bytes = Vec::with_capacity(count * 16);
-                for (row, val) in strings.iter().enumerate() {
-                    let is_null = (batch.nulls[row] & (1u64 << payload_idx)) != 0;
-                    if let (false, Some(s)) = (is_null, val.as_deref()) {
-                        col_bytes.extend_from_slice(&encode_german_string(s, &mut blob));
-                    } else {
-                        col_bytes.extend_from_slice(&[0u8; 16]);
-                    }
-                }
-                col_regions.push(ColRegion::Prebuilt(col_bytes));
+                let cells = strings.iter().map(|v| v.as_deref().map(str::as_bytes));
+                col_regions.push(ColRegion::Prebuilt(encode_german_col(
+                    count,
+                    &batch.nulls,
+                    payload_idx,
+                    cells,
+                    &mut blob,
+                )));
             }
             TypeCode::Blob => {
                 let bytes_col = match &batch.columns[ci] {
                     ColData::Bytes(v) => v,
                     _ => panic!("encode_wal_block: expected Bytes for BLOB column {ci}"),
                 };
-                let mut col_bytes = Vec::with_capacity(count * 16);
-                for (row, val) in bytes_col.iter().enumerate() {
-                    let is_null = (batch.nulls[row] & (1u64 << payload_idx)) != 0;
-                    if let (false, Some(b)) = (is_null, val.as_deref()) {
-                        col_bytes.extend_from_slice(&gnitz_wire::encode_german_string(b, &mut blob));
-                    } else {
-                        col_bytes.extend_from_slice(&[0u8; 16]);
-                    }
-                }
-                col_regions.push(ColRegion::Prebuilt(col_bytes));
+                let cells = bytes_col.iter().map(|v| v.as_deref());
+                col_regions.push(ColRegion::Prebuilt(encode_german_col(
+                    count,
+                    &batch.nulls,
+                    payload_idx,
+                    cells,
+                    &mut blob,
+                )));
             }
             TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => {
                 let vals = match &batch.columns[ci] {
                     ColData::U128s(v) => v,
                     _ => panic!("encode_wal_block: expected U128s for U128/UUID/I128 column {ci}"),
                 };
-                let mut col_bytes = Vec::with_capacity(count * 16);
-                for &v in vals {
-                    let lo = (v & 0xFFFF_FFFF_FFFF_FFFF) as u64;
-                    let hi = (v >> 64) as u64;
-                    col_bytes.extend_from_slice(&lo.to_le_bytes());
-                    col_bytes.extend_from_slice(&hi.to_le_bytes());
-                }
-                col_regions.push(ColRegion::Prebuilt(col_bytes));
+                // Native u128 LE layout is byte-identical to the wire form
+                // (same precedent as `append_64bit_region`); bulk-copy rather
+                // than splitting each value into lo/hi halves.
+                // SAFETY: `vals` is `vals.len()` u128s = `vals.len()*16` bytes;
+                // the region is consumed as opaque bytes, not typed values.
+                let src = unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 16) };
+                col_regions.push(ColRegion::Prebuilt(src.to_vec()));
             }
             _ => {
                 let stride = col.type_code.wire_stride();
@@ -298,10 +344,27 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
 
 /// Decode a WAL block from `data`, expecting columns described by `schema`.
 /// Returns `(ZSetBatch, table_id)`.
-pub fn decode_wal_block(
+///
+/// Skips checksum verification — the production form: every client decode
+/// runs over a trusted stream (OS-delivered Unix socket bytes or a TLS
+/// record layer) where transport integrity is already guaranteed. Use
+/// [`decode_wal_block_verified`] where the checksum itself is under test.
+pub fn decode_wal_block(data: &[u8], schema: &Schema) -> Result<(ZSetBatch, u32), ProtocolError> {
+    decode_wal_block_impl(data, schema, false)
+}
+
+/// Like [`decode_wal_block`] but verifies the block's XXH3 body checksum.
+/// Kept `pub` for the cross-codec round-trip tests (here and in the engine's
+/// wire tests, which use gnitz-core as a dev-dependency) — the only coverage
+/// that client-encoded checksums are correct.
+pub fn decode_wal_block_verified(data: &[u8], schema: &Schema) -> Result<(ZSetBatch, u32), ProtocolError> {
+    decode_wal_block_impl(data, schema, true)
+}
+
+fn decode_wal_block_impl(
     data: &[u8],
     schema: &Schema,
-    verify_checksum: VerifyChecksum,
+    verify_checksum: bool,
 ) -> Result<(ZSetBatch, u32), ProtocolError> {
     if data.len() < WAL_BLOCK_HEADER_SIZE {
         return Err(ProtocolError::DecodeError(format!(
@@ -331,7 +394,7 @@ pub fn decode_wal_block(
             data.len()
         )));
     }
-    if verify_checksum == VerifyChecksum::Yes && total_size > WAL_BLOCK_HEADER_SIZE {
+    if verify_checksum && total_size > WAL_BLOCK_HEADER_SIZE {
         let actual = xxh3_64(&data[WAL_BLOCK_HEADER_SIZE..total_size]);
         if actual != exp_checksum {
             return Err(ProtocolError::DecodeError("WAL checksum mismatch".into()));
@@ -421,15 +484,15 @@ pub fn decode_wal_block(
             buf: decoded,
         }
     } else if pk_stride <= 8 {
-        // Narrow single-column PK: OPK → native LE via decode_pk_column.
+        // Narrow single-column PK: OPK → native LE via decode_pk_column. The
+        // per-row extent is dominated by the `pk_sz == count * pk_stride` check
+        // above plus the directory's `pk_off + pk_sz <= total_size`, so no
+        // per-row bounds check is needed.
         let pk_tc = schema.columns[schema.pk_indices()[0]].type_code as u8;
         let mut v = Vec::with_capacity(count);
         let mut pk_buf = [0u8; 8];
         for i in 0..count {
             let base = pk_off + i * pk_stride;
-            if base + pk_stride > total_size {
-                return Err(ProtocolError::DecodeError("pk region out of bounds".into()));
-            }
             gnitz_wire::decode_pk_column(&data[base..base + pk_stride], pk_tc, &mut pk_buf[..pk_stride]);
             pk_buf[pk_stride..].fill(0);
             v.push(u64::from_le_bytes(pk_buf));
@@ -438,15 +501,13 @@ pub fn decode_wal_block(
     } else {
         // Lone 16-byte PK: U128/UUID (unsigned) or I128 (signed). decode_pk_column
         // reverses both — a plain byte-swap for the unsigned types (identical to the
-        // prior from_be_bytes) and a byte-swap plus sign-flip for I128.
+        // prior from_be_bytes) and a byte-swap plus sign-flip for I128. Per-row
+        // extent dominated by the region-size + directory checks (as above).
         let pk_tc = schema.columns[schema.pk_indices()[0]].type_code as u8;
         let mut v = Vec::with_capacity(count);
         let mut le = [0u8; 16];
         for i in 0..count {
             let base = pk_off + i * 16;
-            if base + 16 > total_size {
-                return Err(ProtocolError::DecodeError("pk region out of bounds".into()));
-            }
             gnitz_wire::decode_pk_column(&data[base..base + 16], pk_tc, &mut le);
             v.push(u128::from_le_bytes(le));
         }
@@ -476,77 +537,49 @@ pub fn decode_wal_block(
         let (reg_off, reg_sz) = dir[region_idx];
         region_idx += 1;
 
+        // STRING/BLOB/U128 regions are all 16 bytes/row; validate that once.
+        let check_16b = |label: &str| -> Result<(), ProtocolError> {
+            let expected_sz = count * 16;
+            if reg_sz != expected_sz {
+                return Err(ProtocolError::DecodeError(format!(
+                    "{label} column {ci} region size mismatch: expected {expected_sz}, got {reg_sz}"
+                )));
+            }
+            Ok(())
+        };
         match col.type_code {
             TypeCode::String => {
-                let expected_sz = count * 16;
-                if reg_sz != expected_sz {
-                    return Err(ProtocolError::DecodeError(format!(
-                        "String column {ci} region size mismatch: expected {expected_sz}, got {reg_sz}"
-                    )));
-                }
+                check_16b("String")?;
+                // Raw German-string cells, then UTF-8-validate each into a String.
+                let raw = decode_german_col(data, reg_off, blob, &nulls, payload_idx, count)?;
                 let mut vals: Vec<Option<String>> = Vec::with_capacity(count);
-                for (row, &null_word) in nulls.iter().enumerate().take(count) {
-                    let is_null = (null_word & (1u64 << payload_idx)) != 0;
-                    if is_null {
-                        vals.push(None);
-                        continue;
-                    }
-                    let struct_start = reg_off + row * 16;
-                    if struct_start + 16 > data.len() {
-                        return Err(ProtocolError::DecodeError(format!(
-                            "German String struct out of bounds at row {row}, col {ci}"
-                        )));
-                    }
-                    let mut st = [0u8; 16];
-                    st.copy_from_slice(&data[struct_start..struct_start + 16]);
-                    vals.push(Some(decode_german_string(st, blob)?));
+                for cell in raw {
+                    vals.push(match cell {
+                        None => None,
+                        Some(bytes) => Some(
+                            String::from_utf8(bytes)
+                                .map_err(|e| ProtocolError::DecodeError(format!("utf8 in German String: {e}")))?,
+                        ),
+                    });
                 }
                 columns.push(ColData::Strings(vals));
             }
             TypeCode::Blob => {
-                let expected_sz = count * 16;
-                if reg_sz != expected_sz {
-                    return Err(ProtocolError::DecodeError(format!(
-                        "Blob column {ci} region size mismatch: expected {expected_sz}, got {reg_sz}"
-                    )));
-                }
-                let mut vals: Vec<Option<Vec<u8>>> = Vec::with_capacity(count);
-                for (row, &null_word) in nulls.iter().enumerate().take(count) {
-                    let is_null = (null_word & (1u64 << payload_idx)) != 0;
-                    if is_null {
-                        vals.push(None);
-                        continue;
-                    }
-                    let struct_start = reg_off + row * 16;
-                    if struct_start + 16 > data.len() {
-                        return Err(ProtocolError::DecodeError(format!(
-                            "Blob German struct out of bounds at row {row}, col {ci}"
-                        )));
-                    }
-                    let mut st = [0u8; 16];
-                    st.copy_from_slice(&data[struct_start..struct_start + 16]);
-                    vals.push(Some(gnitz_wire::try_decode_german_string(&st, blob).ok_or_else(
-                        || ProtocolError::DecodeError("BLOB blob arena out of bounds".into()),
-                    )?));
-                }
+                check_16b("Blob")?;
+                let vals = decode_german_col(data, reg_off, blob, &nulls, payload_idx, count)?;
                 columns.push(ColData::Bytes(vals));
             }
             TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => {
-                let expected_sz = count * 16;
-                if reg_sz != expected_sz {
-                    return Err(ProtocolError::DecodeError(format!(
-                        "U128/UUID/I128 column {ci} region size mismatch: expected {expected_sz}, got {reg_sz}"
-                    )));
-                }
-                let mut vals: Vec<u128> = Vec::with_capacity(count);
-                for row in 0..count {
-                    let base = reg_off + row * 16;
-                    if base + 16 > data.len() {
-                        return Err(ProtocolError::DecodeError("U128/UUID out of bounds".into()));
-                    }
-                    let lo = u64::from_le_bytes(data[base..base + 8].try_into().unwrap());
-                    let hi = u64::from_le_bytes(data[base + 8..base + 16].try_into().unwrap());
-                    vals.push(lo as u128 | ((hi as u128) << 64));
+                check_16b("U128/UUID/I128")?;
+                // Native u128 LE layout is byte-identical to the region; the
+                // extent is dominated by the size + directory checks, so bulk-
+                // copy the whole region rather than reading each row.
+                let mut vals: Vec<u128> = vec![0u128; count];
+                // SAFETY: `reg_off + count*16 <= total_size <= data.len()`
+                // (region-size check + directory bound); `vals` has room for
+                // `count*16` bytes. Distinct, non-overlapping regions.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data[reg_off..].as_ptr(), vals.as_mut_ptr() as *mut u8, count * 16);
                 }
                 columns.push(ColData::U128s(vals));
             }
@@ -579,33 +612,20 @@ pub fn decode_wal_block(
     ))
 }
 
-/// Recompute and write the WAL block checksum in-place.
-/// Used by tests that need to corrupt block content and fix the checksum.
-pub fn recompute_block_checksum(block: &mut [u8]) {
-    if block.len() <= WAL_BLOCK_HEADER_SIZE {
-        return;
-    }
-    let total_size = u32::from_le_bytes(block[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].try_into().unwrap()) as usize;
-    let end = total_size.min(block.len());
-    let checksum = xxh3_64(&block[WAL_BLOCK_HEADER_SIZE..end]);
-    block[WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8].copy_from_slice(&checksum.to_le_bytes());
-}
-
-/// Return the `(offset, size)` of a region from a block's directory.
-/// Used by tests to locate regions for corruption.
-pub fn get_region_offset_size(block: &[u8], region_idx: usize) -> (usize, usize) {
-    let base = WAL_BLOCK_HEADER_SIZE + region_idx * 8;
-    let off = u32::from_le_bytes(block[base..base + 4].try_into().unwrap()) as usize;
-    let sz = u32::from_le_bytes(block[base + 4..base + 8].try_into().unwrap()) as usize;
-    (off, sz)
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::types::{ColData, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
+
+    /// Return the `(offset, size)` of a region from a block's directory.
+    fn get_region_offset_size(block: &[u8], region_idx: usize) -> (usize, usize) {
+        let base = WAL_BLOCK_HEADER_SIZE + region_idx * 8;
+        let off = u32::from_le_bytes(block[base..base + 4].try_into().unwrap()) as usize;
+        let sz = u32::from_le_bytes(block[base + 4..base + 8].try_into().unwrap()) as usize;
+        (off, sz)
+    }
 
     fn u64_schema() -> Schema {
         Schema {
@@ -758,10 +778,10 @@ mod tests {
         };
 
         let encoded = encode_wal_block(&schema, 42, &batch);
-        let (decoded, tid) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
 
         assert_eq!(tid, 42);
-        assert_eq!(decoded.pks, pks);
+        assert_eq!(decoded.pks.to_vec_u128(), pks);
         assert!(
             matches!(decoded.pks, PkColumn::U64s(_)),
             "U64 schema must decode to PkColumn::U64s (no variant drift)"
@@ -796,7 +816,7 @@ mod tests {
         };
 
         let encoded = encode_wal_block(&schema, 0, &batch);
-        let (decoded, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, _) = decode_wal_block_verified(&encoded, &schema).unwrap();
 
         assert_eq!(decoded.nulls, nulls);
         match &decoded.columns[1] {
@@ -819,7 +839,7 @@ mod tests {
         };
 
         let encoded = encode_wal_block(&schema, 1, &batch);
-        let (decoded, tid) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
         assert_eq!(tid, 1);
         assert!(
             matches!(decoded.pks, PkColumn::U128s(_)),
@@ -878,7 +898,7 @@ mod tests {
         };
 
         let encoded = encode_wal_block(&schema, 3, &batch);
-        let (decoded, tid) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
         assert_eq!(tid, 3);
 
         // (a) No PK-variant drift: a lone 16-byte PK stays U128s.
@@ -910,7 +930,7 @@ mod tests {
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(vec![])],
         };
         let encoded = encode_wal_block(&schema, 7, &empty);
-        let (decoded, tid) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
         assert_eq!(tid, 7);
         assert_eq!(decoded.len(), 0);
     }
@@ -927,7 +947,7 @@ mod tests {
         let mut encoded = encode_wal_block(&schema, 0, &batch);
         // Flip a byte in the body (after header)
         encoded[WAL_BLOCK_HEADER_SIZE] ^= 0xFF;
-        let res = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes);
+        let res = decode_wal_block_verified(&encoded, &schema);
         assert!(matches!(res, Err(ProtocolError::DecodeError(ref s)) if s.contains("checksum")));
     }
 
@@ -944,7 +964,7 @@ mod tests {
         // Set format_version = 1.
         encoded[WAL_OFF_VERSION..WAL_OFF_VERSION + 4].copy_from_slice(&1u32.to_le_bytes());
         // Note: checksum covers only the body, so changing header bytes does NOT invalidate it
-        let res = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes);
+        let res = decode_wal_block_verified(&encoded, &schema);
         assert!(matches!(res, Err(ProtocolError::DecodeError(ref s)) if s.contains("version")));
     }
 
@@ -971,8 +991,8 @@ mod tests {
         let expected_first = 1u64.to_be_bytes();
         assert_eq!(&encoded[pk_off..pk_off + 8], &expected_first);
 
-        let (decoded, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
-        assert_eq!(decoded.pks, pks);
+        let (decoded, _) = decode_wal_block_verified(&encoded, &schema).unwrap();
+        assert_eq!(decoded.pks.to_vec_u128(), pks);
         assert!(
             matches!(decoded.pks, PkColumn::U64s(_)),
             "U64 schema must decode to PkColumn::U64s (no variant drift)"
@@ -995,8 +1015,8 @@ mod tests {
         let (_, pk_sz) = get_region_offset_size(&encoded, 0);
         assert_eq!(pk_sz, n * 16, "U128 PK region must be 16B/row");
 
-        let (decoded, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
-        assert_eq!(decoded.pks, pks);
+        let (decoded, _) = decode_wal_block_verified(&encoded, &schema).unwrap();
+        assert_eq!(decoded.pks.to_vec_u128(), pks);
         assert!(
             matches!(decoded.pks, PkColumn::U128s(_)),
             "U128 schema must decode to PkColumn::U128s (no variant drift)"
@@ -1016,9 +1036,9 @@ mod tests {
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(vec![0u8; n * 8])],
         };
         let encoded = encode_wal_block(&schema, 5, &batch);
-        let (decoded, tid) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
         assert_eq!(tid, 5);
-        assert_eq!(decoded.pks, pks);
+        assert_eq!(decoded.pks.to_vec_u128(), pks);
         assert_eq!(decoded.weights, weights, "negative weight must survive encode/decode");
     }
 
@@ -1034,7 +1054,7 @@ mod tests {
             a.add_row((u32::MAX as u128) + 1, -1).i64_val(300);
         }
         let encoded = encode_wal_block(&schema, 7, &batch);
-        let (decoded, tid) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
         assert_eq!(tid, 7);
         assert_eq!(decoded.pks.len(), 3);
         assert_eq!(decoded.pks.get(0), 1u128);
@@ -1059,7 +1079,7 @@ mod tests {
             }
         }
         let encoded = encode_wal_block(&schema, 9, &batch);
-        let (decoded, tid) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
         assert_eq!(tid, 9);
         assert_eq!(decoded.pks.len(), pks.len());
         for (i, &expected) in pks.iter().enumerate() {
@@ -1072,34 +1092,17 @@ mod tests {
     }
 
     #[test]
-    fn test_xxh3_matches_python_server() {
-        // Body bytes captured from a live Python server FLAG_ALLOCATE_SCHEMA_ID response.
-        // Python computes checksum 0x741C9E0BA1D8A9FD using XXH3_64bits (gnitz_xxh3_64 C FFI).
-        // This test verifies Rust twox_hash::xxh3 produces the same value.
-        let _body_hex = concat!(
-            "9800000008000000a000000008000000a800000008000000",
-            "b000000008000000b800000008000000c000000008000000",
-            "c800000008000000d000000008000000d800000008000000",
-            "e000000008000000e800000008000000f0000000100000",
-            "0000100000000000000000000000000000000000000000000",
-            "1000000000000008000000000000000000000000000000001",
-            "00000000000000030000000000000000000000000000000000",
-            "000000000000000000000000000000000000000000000000000000000000000000000000000"
-        );
-        // Use the raw hex instead
+    fn test_xxh3_pins_known_vector() {
+        // A pinned XXH3-64 test vector: `xxh3_64` of these 208 body bytes must
+        // equal this constant. Guards against a silent hash-library or
+        // parameterization swap that would break wire-checksum interop.
         let body_hex = "9800000008000000a000000008000000a800000008000000b000000008000000b800000008000000c000000008000000c800000008000000d000000008000000d800000008000000e000000008000000e800000008000000f00000001000000000010000000000000000000000000000000000000000000001000000000000008000000000000000000000000000000001000000000000000300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
         let body: Vec<u8> = (0..body_hex.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&body_hex[i..i + 2], 16).unwrap())
             .collect();
         assert_eq!(body.len(), 208);
-        let computed = xxh3_64(&body);
-        eprintln!("Rust xxh3_64(body) = 0x{computed:016X}");
-        eprintln!("Expected           = 0x741C9E0BA1D8A9FD");
-        assert_eq!(
-            computed, 0x741C9E0BA1D8A9FD_u64,
-            "Rust and Python xxh3_64 disagree for same bytes!"
-        );
+        assert_eq!(xxh3_64(&body), 0x741C9E0BA1D8A9FD_u64, "xxh3_64 test vector drifted");
     }
 
     // ── wide compound-PK roundtrips ────────────────────────────────────────
@@ -1175,7 +1178,7 @@ mod tests {
         let (_, pk_sz) = get_region_offset_size(&encoded, 0);
         assert_eq!(pk_sz, n * 24, "wide PK region must be 24B/row");
 
-        let (decoded, tid) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
         assert_eq!(tid, 77);
         assert_eq!(decoded.weights, weights);
         assert_eq!(decoded.nulls, nulls);
@@ -1246,7 +1249,7 @@ mod tests {
         let (_, pk_sz) = get_region_offset_size(&encoded, 0);
         assert_eq!(pk_sz, n * 64, "wide PK region must be 64B/row");
 
-        let (decoded, tid) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
         assert_eq!(tid, 3);
         match &decoded.pks {
             PkColumn::Bytes { stride, buf } => {
@@ -1279,7 +1282,7 @@ mod tests {
         };
         let mut a = mk(1, 11);
         let b = mk(2, 22);
-        a.extend_from(&b);
+        a.extend_from_owned(b);
 
         assert_eq!(a.pks.len(), 2);
         let mut expected = Vec::new();

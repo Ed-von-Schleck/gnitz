@@ -469,15 +469,10 @@ impl SchemaDescriptor {
         is_signed_int(tc)
     }
 
-    /// The single PK column index. Use only at boundaries that have not yet
-    /// been generalized (format encoders, catalog serialization, SQL parser
-    /// path, wire/client BatchAppender). Asserts pk_count == 1.
-    ///
-    /// Hard `assert!` (not `debug_assert!`): this is the release-active
-    /// canary for the day a compound PK reaches a boundary that has not
-    /// yet been generalised — a `debug_assert!` would compile out in
-    /// release and let the silent truncation to the first PK column ship
-    /// to production.
+    /// The single PK column index. Asserts pk_count == 1. Production callers
+    /// are gone (the control-block codec moved to `gnitz_wire`); kept for the
+    /// schema tests that pin single-PK behavior.
+    #[cfg(test)]
     #[inline]
     #[track_caller]
     pub(crate) const fn pk_index_single(&self) -> u32 {

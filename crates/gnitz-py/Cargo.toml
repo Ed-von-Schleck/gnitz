@@ -14,5 +14,5 @@ default     = []
 pyo3           = { version = "0.23", features = ["extension-module", "abi3-py310"] }
 gnitz-core     = { path = "../gnitz-core" }
 gnitz-sql      = { path = "../gnitz-sql" }
+gnitz-wire     = { path = "../gnitz-wire" }
 libc           = "0.2"
-lru            = "0.12"

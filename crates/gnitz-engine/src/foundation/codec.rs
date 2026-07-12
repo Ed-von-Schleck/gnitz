@@ -18,11 +18,6 @@ pub fn read_i64_le(buf: &[u8], off: usize) -> i64 {
 }
 
 #[inline]
-pub fn read_u128_le(buf: &[u8], off: usize) -> u128 {
-    u128::from_le_bytes(buf[off..off + 16].try_into().unwrap())
-}
-
-#[inline]
 pub fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
     buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
 }

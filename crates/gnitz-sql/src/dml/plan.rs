@@ -1029,7 +1029,7 @@ mod tests {
         // 1. extract_pk_value (INSERT row).
         let row = vec![literal.clone(), num_expr("0")];
         let got_insert = extract_pk_value(&row, &schema).unwrap_or_else(|e| panic!("extract_pk_value({pk_tc:?}): {e}"));
-        assert_eq!(got_insert.to_u128().unwrap(), expected, "extract_pk_value");
+        assert_eq!(got_insert.split_wire().0, expected, "extract_pk_value");
 
         // 2. try_col_eq_literal (WHERE pk = literal).
         let where_expr = eq_expr("id", literal.clone());

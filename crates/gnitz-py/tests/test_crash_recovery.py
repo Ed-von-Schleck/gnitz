@@ -423,9 +423,9 @@ def test_ddl_crash_unique_index_foldin_rolls_back():
 
 def _index_on_col(conn, owner_tid, col_idx):
     """True if a live IdxTab row indexes column `col_idx` of table `owner_tid`."""
-    from gnitz.core import IDX_TAB, unpack_pk_cols
+    from gnitz import IDX_TAB, unpack_pk_cols
 
-    _, batch_obj, _ = conn._client.scan(IDX_TAB)
+    batch_obj = conn.scan(IDX_TAB).batch
     if batch_obj is None:
         return False
     for i in range(len(batch_obj.pks)):

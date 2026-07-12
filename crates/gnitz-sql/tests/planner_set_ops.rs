@@ -1,8 +1,9 @@
 #![cfg(feature = "integration")]
 
-use gnitz_core::{GnitzClient, OPCODE_JOIN_DELTA_TRACE, OPCODE_POSITIVE_PART};
+use gnitz_core::GnitzClient;
 use gnitz_sql::{GnitzSqlError, SqlPlanner};
 use gnitz_test_harness::ServerHandle;
+use gnitz_wire::{OPCODE_JOIN_DELTA_TRACE, OPCODE_POSITIVE_PART};
 
 mod common;
 use common::*;

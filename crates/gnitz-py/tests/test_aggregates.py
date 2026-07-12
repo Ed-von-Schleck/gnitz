@@ -2024,7 +2024,7 @@ class TestAdaptiveMinMaxOutputType:
                 "FROM t GROUP BY k",
                 schema_name=sn,
             )
-            vid, vschema = client.resolve_table_id(sn, "v")
+            vid, vschema = client.resolve_table(sn, "v")
 
             # The view's MIN/MAX columns must carry the SOURCE type, not BIGINT.
             assert self._col_type(vschema, "lo") == py_tc, (
@@ -2078,7 +2078,7 @@ class TestAdaptiveMinMaxOutputType:
                 "FROM t GROUP BY k",
                 schema_name=sn,
             )
-            vid, vschema = client.resolve_table_id(sn, "v")
+            vid, vschema = client.resolve_table(sn, "v")
             assert self._col_type(vschema, "lo") == gnitz.TypeCode.F64, (
                 f"F32 MIN must widen to F64, got {self._col_type(vschema, 'lo')}")
             assert self._col_type(vschema, "hi") == gnitz.TypeCode.F64
@@ -2143,7 +2143,7 @@ class TestAdaptiveMinMaxOutputType:
                 f"CREATE VIEW v AS SELECT k, {agg}(v) AS m FROM t GROUP BY k",
                 schema_name=sn,
             )
-            vid, vschema = client.resolve_table_id(sn, "v")
+            vid, vschema = client.resolve_table(sn, "v")
             assert self._col_type(vschema, "m") == py_tc
 
             # Group 1 is retracted from; group 2 is an untouched control (so a
@@ -2194,7 +2194,7 @@ class TestAdaptiveMinMaxOutputType:
                 "HAVING MAX(v) > 1000",
                 schema_name=sn,
             )
-            vid, vschema = client.resolve_table_id(sn, "v")
+            vid, vschema = client.resolve_table(sn, "v")
             assert self._col_type(vschema, "m") == gnitz.TypeCode.I16, (
                 f"projected MAX must be SMALLINT/I16, got {self._col_type(vschema, 'm')}")
 

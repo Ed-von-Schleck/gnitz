@@ -80,8 +80,11 @@ impl ClientTransport {
         }
     }
 
-    /// Send many length-prefixed frames back-to-back.
-    pub fn send_framed_batch<F: AsRef<[u8]>>(&mut self, frames: &[F]) -> Result<(), ProtocolError> {
+    /// Send many length-prefixed frames back-to-back. Each frame may consist
+    /// of up to [`FRAME_SEGMENTS`] byte segments (one length prefix over their
+    /// concatenation), so callers can ship pre-split message blocks without
+    /// flattening.
+    pub fn send_framed_batch<F: FrameSegments>(&mut self, frames: &[F]) -> Result<(), ProtocolError> {
         match &mut self.0 {
             Inner::Unix(fd) => send_framed_batch(fd.as_raw_fd(), frames),
             Inner::Tls(s) => tls::send_framed_batch(s, frames),
@@ -177,6 +180,35 @@ fn recv_exact(sock_fd: RawFd, buf: &mut [u8]) -> Result<(), ProtocolError> {
     // `MaybeUninit` and then back is sound.
     let uninit = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut MaybeUninit<u8>, buf.len()) };
     recv_exact_uninit(sock_fd, uninit)
+}
+
+/// Maximum number of byte segments one `send_framed_batch` frame may carry:
+/// control + schema + data blocks.
+pub const FRAME_SEGMENTS: usize = 3;
+
+/// A frame for [`ClientTransport::send_framed_batch`]: up to
+/// [`FRAME_SEGMENTS`] byte segments sent under ONE length prefix (computed
+/// over their concatenation). Zero-length segments are skipped.
+pub trait FrameSegments {
+    fn segments(&self) -> [&[u8]; FRAME_SEGMENTS];
+}
+
+impl FrameSegments for Vec<u8> {
+    fn segments(&self) -> [&[u8]; FRAME_SEGMENTS] {
+        [self, &[], &[]]
+    }
+}
+
+impl FrameSegments for &[u8] {
+    fn segments(&self) -> [&[u8]; FRAME_SEGMENTS] {
+        [self, &[], &[]]
+    }
+}
+
+impl<T: FrameSegments> FrameSegments for &T {
+    fn segments(&self) -> [&[u8]; FRAME_SEGMENTS] {
+        (**self).segments()
+    }
 }
 
 /// Maximum number of payload slices `send_framed_iov` accepts. The +1
@@ -360,9 +392,9 @@ thread_local! {
 /// IO_BATCH_MAX=1024 working set so steady-state callers never reallocate,
 /// while still bounding the worst-case footprint after a one-off large
 /// batch. `lens` holds 4 bytes per frame (4 KiB at the cap); `iovs` holds
-/// `libc::iovec` — 16 bytes on 64-bit Unix (32 KiB at the cap).
+/// `libc::iovec` — 16 bytes on 64-bit Unix (64 KiB at the cap).
 const SCRATCH_LENS_CAP: usize = 4 * 1024; // 1024 frames × 4 bytes
-const SCRATCH_IOVS_CAP: usize = 2 * 1024; // 1024 frames × 2 iovecs
+const SCRATCH_IOVS_CAP: usize = (1 + FRAME_SEGMENTS) * 1024; // 1024 frames × (prefix + segments)
 
 /// Reclaim scratch capacity that overshot `cap` after a one-off large
 /// batch, leaving steady-state buffers (within the working set) untouched
@@ -375,12 +407,13 @@ fn shrink_to_cap<T>(v: &mut Vec<T>, cap: usize) {
 }
 
 /// Send many length-prefixed frames as a single writev sequence.
-/// Each frame contributes two iovecs (4-byte LE length + payload).
+/// Each frame contributes one 4-byte LE length iovec plus one iovec per
+/// non-empty segment (the prefix covers the segments' concatenation).
 ///
 /// Empty frames are rejected (would collide with the protocol close
 /// sentinel). Frames whose length does not fit in `u32` are rejected
 /// (would silently truncate the wire prefix).
-pub(crate) fn send_framed_batch<F: AsRef<[u8]>>(sock_fd: RawFd, frames: &[F]) -> Result<(), ProtocolError> {
+pub(crate) fn send_framed_batch<F: FrameSegments>(sock_fd: RawFd, frames: &[F]) -> Result<(), ProtocolError> {
     if frames.is_empty() {
         return Ok(());
     }
@@ -390,7 +423,7 @@ pub(crate) fn send_framed_batch<F: AsRef<[u8]>>(sock_fd: RawFd, frames: &[F]) ->
         let (lens, iovs) = &mut *guard;
         lens.clear();
         iovs.clear();
-        iovs.reserve(2 * frames.len());
+        iovs.reserve((1 + FRAME_SEGMENTS) * frames.len());
 
         // Pass 1: validate and fill the length-prefix buffer. After this
         // resize+copy_from_slice loop returns, `lens` is no longer mutated,
@@ -398,7 +431,8 @@ pub(crate) fn send_framed_batch<F: AsRef<[u8]>>(sock_fd: RawFd, frames: &[F]) ->
         // Stacked and Tree Borrows.
         lens.resize(4 * frames.len(), 0u8);
         for (i, f) in frames.iter().enumerate() {
-            let prefix = frame_len_prefix(f.as_ref().len())?;
+            let total: usize = f.segments().iter().map(|s| s.len()).sum();
+            let prefix = frame_len_prefix(total)?;
             let off = i * 4;
             lens[off..off + 4].copy_from_slice(&prefix);
         }
@@ -408,17 +442,20 @@ pub(crate) fn send_framed_batch<F: AsRef<[u8]>>(sock_fd: RawFd, frames: &[F]) ->
         // `lens` mutably.
         let lens_ptr = lens.as_ptr();
         for (i, f) in frames.iter().enumerate() {
-            let bytes = f.as_ref();
             iovs.push(libc::iovec {
                 // SAFETY: i*4 + 4 ≤ lens.len() per the resize above; `lens`
                 // outlives writev_all because `guard` is held across it.
                 iov_base: unsafe { lens_ptr.add(i * 4) } as *mut libc::c_void,
                 iov_len: 4,
             });
-            iovs.push(libc::iovec {
-                iov_base: bytes.as_ptr() as *mut libc::c_void,
-                iov_len: bytes.len(),
-            });
+            for seg in f.segments() {
+                if !seg.is_empty() {
+                    iovs.push(libc::iovec {
+                        iov_base: seg.as_ptr() as *mut libc::c_void,
+                        iov_len: seg.len(),
+                    });
+                }
+            }
         }
 
         let res = writev_all(sock_fd, &mut iovs[..]);

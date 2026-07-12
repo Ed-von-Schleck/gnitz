@@ -19,9 +19,9 @@ use crate::plan::view::predicates::{
 };
 use crate::plan::view::{EmitPieces, ViewChain};
 use gnitz_core::{
-    CircuitBuilder, ColumnDef, ExprBuilder, FixedInt, GnitzClient, RangeRel, ReduceOutKey, Schema, TypeCode, AGG_MAX,
-    AGG_MIN,
+    CircuitBuilder, ColumnDef, ExprBuilder, FixedInt, GnitzClient, RangeRel, ReduceOutKey, Schema, TypeCode,
 };
+use gnitz_wire::{AGG_MAX, AGG_MIN};
 use sqlparser::ast::{Expr, Ident, JoinConstraint, JoinOperator, SelectItem};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;

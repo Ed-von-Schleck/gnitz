@@ -1,7 +1,7 @@
 use crate::runtime::wire::{
-    batch_to_schema, build_schema_wire_block, decode_wire, encode_ctrl_block_direct, encode_ctrl_block_ipc,
-    encode_wire, encode_wire_into, peek_client_control, peek_control_block, schema_to_batch, wire_size,
-    CTRL_BLOCK_SIZE_NO_BLOB, STATUS_ERROR, STATUS_OK,
+    batch_to_schema, build_schema_wire_block, decode_wire, encode_ctrl_block_direct, encode_wire, encode_wire_into,
+    peek_client_control, peek_control_block, schema_to_batch, wire_size, CTRL_BLOCK_SIZE_NO_BLOB, STATUS_ERROR,
+    STATUS_OK,
 };
 use crate::schema::{encode_german_string, try_decode_german_string, type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, Layout};
@@ -719,14 +719,14 @@ fn decode_wire_truncated_data_block_returns_err() {
     assert!(result.is_err(), "decode_wire should reject truncated data block");
 }
 
-/// Encoding the same control fields with `encode_ctrl_block_direct` and
-/// `encode_ctrl_block_ipc` must produce byte-identical output. Uses distinct
-/// non-zero values for every variable field so a swapped offset would corrupt
-/// the bytes detectably; uses `offset = 64` so that writes accidentally
-/// indexing through `out[offset + OFF_X..]` rather than the sub-slice would
-/// also be caught.
+/// The ctrl-block round-trip through the shared `gnitz_wire::control` codec:
+/// every variable field distinct and non-zero so a swapped offset corrupts the
+/// bytes detectably; `offset = 64` so writes accidentally indexing through
+/// `out[offset + OFF_X..]` rather than the sub-slice are also caught. Runs
+/// with and without the engine's checksum stamp — `peek_control_block` never
+/// verifies the checksum, so both frames must decode identically.
 #[test]
-fn encode_ctrl_block_direct_matches_ipc() {
+fn encode_ctrl_block_direct_roundtrips() {
     const OFFSET: usize = 64;
     let target_id: u64 = 0x1111_2222_3333_4444;
     let client_id: u64 = 0x5555_6666_7777_8888;
@@ -737,11 +737,9 @@ fn encode_ctrl_block_direct_matches_ipc() {
     let status: u32 = 0xDEAD_BEEF;
 
     for &checksum in &[false, true] {
-        let mut buf_direct = vec![0u8; OFFSET + CTRL_BLOCK_SIZE_NO_BLOB];
-        let mut buf_ipc = vec![0u8; OFFSET + CTRL_BLOCK_SIZE_NO_BLOB];
-
-        let n_direct = encode_ctrl_block_direct(
-            &mut buf_direct,
+        let mut buf = vec![0u8; OFFSET + CTRL_BLOCK_SIZE_NO_BLOB];
+        let n = encode_ctrl_block_direct(
+            &mut buf,
             OFFSET,
             target_id,
             client_id,
@@ -754,27 +752,19 @@ fn encode_ctrl_block_direct_matches_ipc() {
             &[],
             checksum,
         );
-        let n_ipc = encode_ctrl_block_ipc(
-            &mut buf_ipc,
-            OFFSET,
-            target_id,
-            client_id,
-            wire_flags,
-            seek_pk,
-            seek_col_idx,
-            request_id,
-            status,
-            b"",
-            b"",
-            checksum,
-        );
-
-        assert_eq!(n_direct, n_ipc, "byte counts differ (checksum={checksum})");
         assert_eq!(
-            n_direct, CTRL_BLOCK_SIZE_NO_BLOB,
-            "direct encoder size mismatch (checksum={checksum})"
+            n, CTRL_BLOCK_SIZE_NO_BLOB,
+            "encoder size mismatch (checksum={checksum})"
         );
-        assert_eq!(buf_direct, buf_ipc, "encoded ctrl blocks differ (checksum={checksum})");
+        let dec = peek_control_block(&buf[OFFSET..OFFSET + n]).expect("decode");
+        assert_eq!(dec.target_id, target_id);
+        assert_eq!(dec.client_id, client_id);
+        assert_eq!(dec.flags, wire_flags);
+        assert_eq!(dec.seek_pk, seek_pk);
+        assert_eq!(dec.seek_col_idx, seek_col_idx);
+        assert_eq!(dec.request_id, request_id);
+        assert_eq!(dec.status, status);
+        assert_eq!(dec.block_size, n);
     }
 }
 
@@ -891,18 +881,15 @@ fn continuation_frame_decoded_with_schema_hint() {
     assert!(err.is_err(), "version mismatch must return Err");
 }
 
-/// `encode_ctrl_block_direct` falls back to `encode_ctrl_block_ipc` when an
-/// error message is present; verify byte-identical output on that path too.
+/// The blob fallback path (an error message present) round-trips through the
+/// shared codec at a non-zero offset.
 #[test]
-fn encode_ctrl_block_direct_error_path_matches_ipc() {
+fn encode_ctrl_block_direct_error_path_roundtrips() {
     const OFFSET: usize = 32;
     let err = b"something went wrong";
-    let total = OFFSET + 1024;
-    let mut buf_direct = vec![0u8; total];
-    let mut buf_ipc = vec![0u8; total];
-
-    let n_direct = encode_ctrl_block_direct(
-        &mut buf_direct,
+    let mut buf = vec![0u8; OFFSET + 1024];
+    let n = encode_ctrl_block_direct(
+        &mut buf,
         OFFSET,
         7,
         11,
@@ -915,22 +902,10 @@ fn encode_ctrl_block_direct_error_path_matches_ipc() {
         &[],
         true,
     );
-    let n_ipc = encode_ctrl_block_ipc(
-        &mut buf_ipc,
-        OFFSET,
-        7,
-        11,
-        13,
-        17u128,
-        19,
-        23,
-        STATUS_ERROR,
-        err,
-        b"",
-        true,
-    );
-    assert_eq!(n_direct, n_ipc);
-    assert_eq!(buf_direct[..OFFSET + n_direct], buf_ipc[..OFFSET + n_ipc]);
+    let dec = peek_control_block(&buf[OFFSET..OFFSET + n]).expect("decode");
+    assert_eq!(dec.status, STATUS_ERROR);
+    assert_eq!(dec.error_msg, err);
+    assert_eq!(dec.block_size, n);
 }
 
 /// Round-trip the new `seek_pk_extra` blob through encode + decode.
@@ -945,7 +920,7 @@ fn ctrl_block_seek_pk_extra_roundtrip() {
     // Case 1: both empty — the empty seek_pk_extra path the direct/IPC
     // equivalence test already covers, asserted here from the decoder side.
     let mut buf = vec![0u8; 1024];
-    let n = encode_ctrl_block_ipc(
+    let n = encode_ctrl_block_direct(
         &mut buf, 0, /*target*/ 1, /*client*/ 2, /*flags*/ 3, /*seek_pk*/ 4u128,
         /*seek_col_idx*/ 5, /*request_id*/ 6, STATUS_OK, b"", b"", true,
     );
@@ -957,7 +932,7 @@ fn ctrl_block_seek_pk_extra_roundtrip() {
     // Case 2: seek_pk_extra short (≤12 bytes, inline; no blob spill).
     let short = b"abcd"; // 4 bytes, fits inline
     let mut buf = vec![0u8; 1024];
-    let n = encode_ctrl_block_ipc(&mut buf, 0, 1, 2, 3, 4u128, 5, 6, STATUS_OK, b"", short, true);
+    let n = encode_ctrl_block_direct(&mut buf, 0, 1, 2, 3, 4u128, 5, 6, STATUS_OK, b"", short, true);
     let dec = peek_control_block(&buf[..n]).expect("decode short");
     assert_eq!(dec.error_msg, Vec::<u8>::new());
     assert_eq!(dec.seek_pk_extra, short);
@@ -968,7 +943,7 @@ fn ctrl_block_seek_pk_extra_roundtrip() {
     let err = b"this error message is definitely longer than twelve bytes";
     let extra = b"and so is this wide-pk-extra blob payload past 12B";
     let mut buf = vec![0u8; 1024];
-    let n = encode_ctrl_block_ipc(&mut buf, 0, 1, 2, 3, 4u128, 5, 6, STATUS_ERROR, err, extra, true);
+    let n = encode_ctrl_block_direct(&mut buf, 0, 1, 2, 3, 4u128, 5, 6, STATUS_ERROR, err, extra, true);
     let dec = peek_control_block(&buf[..n]).expect("decode long");
     assert_eq!(dec.error_msg, err);
     assert_eq!(dec.seek_pk_extra, extra);

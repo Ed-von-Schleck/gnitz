@@ -1,4 +1,4 @@
-use crate::connection::{Connection, ScanResult, COL_TAB, DEP_TAB, IDX_TAB, SCHEMA_TAB, TABLE_TAB, VIEW_TAB};
+use crate::connection::{ScanResult, Session, COL_TAB, DEP_TAB, IDX_TAB, SCHEMA_TAB, TABLE_TAB, VIEW_TAB};
 use crate::error::ClientError;
 use crate::protocol::types::type_code_from_u64;
 use crate::protocol::{
@@ -13,9 +13,9 @@ const SCHEMA_CACHE_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::new(64)
 use crate::circuit::Circuit;
 use crate::types::{
     circuit_edges_schema, circuit_node_columns_schema, circuit_nodes_schema, col_tab_schema, dep_tab_schema,
-    idx_tab_schema, schema_tab_schema, table_tab_schema, view_tab_schema, CIRCUIT_EDGES_TAB, CIRCUIT_NODES_TAB,
-    CIRCUIT_NODE_COLUMNS_TAB, OWNER_KIND_TABLE, OWNER_KIND_VIEW,
+    idx_tab_schema, schema_tab_schema, table_tab_schema, view_tab_schema,
 };
+use gnitz_wire::{CIRCUIT_EDGES_TAB, CIRCUIT_NODES_TAB, CIRCUIT_NODE_COLUMNS_TAB, OWNER_KIND_TABLE, OWNER_KIND_VIEW};
 
 // --- Module-private helpers ---
 
@@ -105,17 +105,7 @@ fn decode_pk_cols(packed: u64) -> Result<Vec<usize>, ClientError> {
 }
 
 fn pack_col_id(owner_id: u64, col_idx: usize) -> Result<u64, ClientError> {
-    if col_idx >= 512 {
-        return Err(ClientError::ServerError(format!(
-            "column index {col_idx} exceeds maximum 511"
-        )));
-    }
-    if owner_id > (u64::MAX >> 9) {
-        return Err(ClientError::ServerError(format!(
-            "owner_id {owner_id} exceeds 55-bit maximum for column ID packing"
-        )));
-    }
-    Ok((owner_id << 9) | col_idx as u64)
+    gnitz_wire::pack_col_id(owner_id, col_idx as u64).map_err(ClientError::ServerError)
 }
 
 // --- Internal record types ---
@@ -217,20 +207,58 @@ pub struct PlannedView {
 }
 
 pub struct GnitzClient {
-    conn: Connection,
-    schema_cache: LruCache<u64, (Arc<Schema>, u16)>,
+    session: Session,
     index_cache: LruCache<u64, (Arc<Vec<IndexMeta>>, u8)>,
     serial_cache: HashMap<u64, SerialRange>,
+    /// Statement-scoped catalog snapshot: while `Some`, the first read of each
+    /// system table caches its scan batch here and later reads within the same
+    /// statement reuse it (see `begin_catalog_snapshot`). `None` outside a
+    /// statement — reads scan the wire directly.
+    catalog_snapshot: Option<HashMap<u64, Option<ZSetBatch>>>,
 }
 
 impl GnitzClient {
     pub fn connect(socket_path: &str) -> Result<Self, ClientError> {
         Ok(GnitzClient {
-            conn: Connection::connect(socket_path)?,
-            schema_cache: LruCache::new(SCHEMA_CACHE_CAP),
+            session: Session::connect(socket_path)?,
             index_cache: LruCache::new(SCHEMA_CACHE_CAP),
             serial_cache: HashMap::new(),
+            catalog_snapshot: None,
         })
+    }
+
+    /// Begin a statement-scoped catalog snapshot: subsequent catalog reads
+    /// (`lookup_schema_id`, `lookup_table_record`, `load_owner_schema`, the
+    /// view-branch `VIEW_TAB` scan, `table_replicated`) scan each system table
+    /// over the wire at most once and reuse it for the rest of the statement.
+    /// The SQL planner brackets each statement with begin/end; nothing else
+    /// should hold a snapshot across a catalog write.
+    pub fn begin_catalog_snapshot(&mut self) {
+        self.catalog_snapshot = Some(HashMap::new());
+    }
+
+    /// End the current catalog snapshot (drop the cached batches). The next
+    /// statement begins a fresh one, so a DDL write in this statement is
+    /// visible to the next — there is no cross-statement state to invalidate.
+    pub fn end_catalog_snapshot(&mut self) {
+        self.catalog_snapshot = None;
+    }
+
+    /// Scan a system table, served from the statement snapshot when one is
+    /// active (caching the batch on the first read). The clone on a snapshot
+    /// hit is a local memcpy — cheap against the wire scan + server work it
+    /// replaces.
+    fn scan_catalog(&mut self, tab: u64) -> Result<Option<ZSetBatch>, ClientError> {
+        if let Some(snap) = &self.catalog_snapshot {
+            if let Some(cached) = snap.get(&tab) {
+                return Ok(cached.clone());
+            }
+        }
+        let (_, batch, _) = self.session.scan(tab)?;
+        if let Some(snap) = &mut self.catalog_snapshot {
+            snap.insert(tab, batch.clone());
+        }
+        Ok(batch)
     }
 
     /// Draw the next SERIAL id for `table_id` from the per-connection range
@@ -245,7 +273,7 @@ impl GnitzClient {
                 return Ok(id);
             }
         }
-        let base = self.conn.alloc_serial_range(table_id, SERIAL_RANGE_SIZE)?;
+        let base = self.session.alloc_serial_range(table_id, SERIAL_RANGE_SIZE)?;
         self.serial_cache.insert(
             table_id,
             SerialRange {
@@ -257,25 +285,25 @@ impl GnitzClient {
     }
 
     pub fn close(self) {
-        self.conn.close();
+        self.session.close();
     }
 
     // --- Raw ops ---
 
     pub fn alloc_table_id(&mut self) -> Result<u64, ClientError> {
-        self.conn.alloc_table_id()
+        self.session.alloc_table_id()
     }
 
     pub fn alloc_schema_id(&mut self) -> Result<u64, ClientError> {
-        self.conn.alloc_schema_id()
+        self.session.alloc_schema_id()
     }
 
     pub fn alloc_index_id(&mut self) -> Result<u64, ClientError> {
-        self.conn.alloc_index_id()
+        self.session.alloc_index_id()
     }
 
     pub fn push(&mut self, table_id: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, ClientError> {
-        self.conn.push(table_id, schema, batch, &mut self.schema_cache)
+        self.session.push(table_id, schema, batch)
     }
 
     /// Push with an explicit `WireConflictMode`. SQL `INSERT` uses
@@ -289,16 +317,15 @@ impl GnitzClient {
         batch: &ZSetBatch,
         mode: WireConflictMode,
     ) -> Result<u64, ClientError> {
-        self.conn
-            .push_with_mode(table_id, schema, batch, mode, &mut self.schema_cache)
+        self.session.push_with_mode(table_id, schema, batch, mode)
     }
 
     pub fn scan(&mut self, table_id: u64) -> ScanResult {
-        self.conn.scan(table_id, &mut self.schema_cache)
+        self.session.scan(table_id)
     }
 
     pub fn seek(&mut self, table_id: u64, pk: &PkTuple) -> ScanResult {
-        self.conn.seek(table_id, pk, &mut self.schema_cache)
+        self.session.seek(table_id, pk)
     }
 
     /// Seek a secondary index by `col_indices` (the index's FULL declared column
@@ -323,8 +350,7 @@ impl GnitzClient {
                 col_indices.len()
             )));
         }
-        self.conn
-            .seek_by_index(table_id, col_indices, key_vals, &mut self.schema_cache)
+        self.session.seek_by_index(table_id, col_indices, key_vals)
     }
 
     /// Ordered range scan over a secondary index: the leading
@@ -355,8 +381,7 @@ impl GnitzClient {
                 col_indices.len()
             )));
         }
-        self.conn
-            .seek_by_index_range(table_id, col_indices, desc, &mut self.schema_cache)
+        self.session.seek_by_index_range(table_id, col_indices, desc)
     }
 
     /// The secondary-index descriptor for `col_idx` of `table_id`, served from a
@@ -399,7 +424,7 @@ impl GnitzClient {
     /// `PK_LIST_PACKED_FLAG` at bit 63).
     fn refresh_indices(&mut self, table_id: u64) -> Result<Arc<Vec<IndexMeta>>, ClientError> {
         let cached_epoch = self.index_cache.peek(&table_id).map(|(_, e)| *e).unwrap_or(0);
-        let (batch, epoch) = self.conn.fetch_indices(table_id, cached_epoch)?;
+        let (batch, epoch) = self.session.fetch_indices(table_id, cached_epoch)?;
         if epoch == cached_epoch && cached_epoch != 0 {
             // Unchanged: the server only sends the no-data reply with a returned
             // epoch equal to a non-zero cached epoch, so the entry is present.
@@ -479,13 +504,13 @@ impl GnitzClient {
             .u64_val(is_unique as u64)
             .str_val("");
 
-        self.conn.push_ddl_txn(&[(IDX_TAB, idx_schema, batch)])?;
+        self.session.push_ddl_txn(&[(IDX_TAB, idx_schema, batch)])?;
         Ok(index_id)
     }
 
     pub fn drop_index_by_name(&mut self, index_name: &str) -> Result<(), ClientError> {
         let index_name = canon_name(index_name);
-        let (_, idx_batch, _) = self.conn.scan(IDX_TAB, &mut self.schema_cache)?;
+        let (_, idx_batch, _) = self.session.scan(IDX_TAB)?;
         let idx_batch = idx_batch.ok_or_else(|| ClientError::ServerError(format!("index '{index_name}' not found")))?;
         for i in idx_batch.live_rows() {
             let name = col_str(&idx_batch.columns[4], i)?.unwrap_or("");
@@ -510,7 +535,7 @@ impl GnitzClient {
                 .str_val(&index_name)
                 .u64_val(is_unique)
                 .str_val(&cache_dir);
-            self.conn.push_ddl_txn(&[(IDX_TAB, idx_schema, batch)])?;
+            self.session.push_ddl_txn(&[(IDX_TAB, idx_schema, batch)])?;
             return Ok(());
         }
         Err(ClientError::ServerError(format!("index '{index_name}' not found")))
@@ -524,7 +549,7 @@ impl GnitzClient {
     /// column 4, the packed source columns are column 3 — the same slots
     /// `create_index` writes and `drop_index_by_name` reads.
     pub fn index_name_cols(&mut self) -> Result<Vec<(String, gnitz_wire::PkColList)>, ClientError> {
-        let (_, idx_batch, _) = self.conn.scan(IDX_TAB, &mut self.schema_cache)?;
+        let (_, idx_batch, _) = self.session.scan(IDX_TAB)?;
         let Some(idx_batch) = idx_batch else {
             return Ok(Vec::new());
         };
@@ -553,7 +578,7 @@ impl GnitzClient {
             nulls: vec![0; count],
             columns: ZSetBatch::filler_columns(schema, count),
         };
-        self.conn.push(table_id, schema, &batch, &mut self.schema_cache)?;
+        self.session.push(table_id, schema, &batch)?;
         Ok(())
     }
 
@@ -565,13 +590,13 @@ impl GnitzClient {
         // this client entry point is the sole enforcement for schema names.
         crate::validate_user_identifier(name).map_err(ClientError::ServerError)?;
         let name = canon_name(name);
-        let new_sid = self.conn.alloc_schema_id()?;
+        let new_sid = self.session.alloc_schema_id()?;
         let schema = schema_tab_schema();
         let mut batch = ZSetBatch::new(schema);
         BatchAppender::new(&mut batch, schema)
             .add_row(new_sid as u128, 1)
             .str_val(&name);
-        self.conn.push_ddl_txn(&[(SCHEMA_TAB, schema, batch)])?;
+        self.session.push_ddl_txn(&[(SCHEMA_TAB, schema, batch)])?;
         Ok(new_sid)
     }
 
@@ -632,13 +657,13 @@ impl GnitzClient {
         // its owning user view's drop cascade, so draining them directly would
         // only burn RESTRICTed round-trips (owner still live) or target an
         // already-cascaded name.
-        let (_, vdata, _) = self.conn.scan(VIEW_TAB, &mut self.schema_cache)?;
+        let (_, vdata, _) = self.session.scan(VIEW_TAB)?;
         let mut views = vdata.map_or(Ok(Vec::new()), |b| collect_schema_member_names(&b, schema_id))?;
         views.retain(|n| !is_hidden_view_name(n));
         self.drain_drops(views, |c, m| c.drop_view(&name, m))?;
 
         // Then tables — the drain retries to resolve intra-schema FK chains.
-        let (_, tdata, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
+        let (_, tdata, _) = self.session.scan(TABLE_TAB)?;
         let tables = tdata.map_or(Ok(Vec::new()), |b| collect_schema_member_names(&b, schema_id))?;
         self.drain_drops(tables, |c, m| c.drop_table(&name, m))?;
 
@@ -648,7 +673,7 @@ impl GnitzClient {
         BatchAppender::new(&mut batch, schema)
             .add_row(schema_id as u128, -1)
             .str_val(&name);
-        self.conn.push_ddl_txn(&[(SCHEMA_TAB, schema, batch)])?;
+        self.session.push_ddl_txn(&[(SCHEMA_TAB, schema, batch)])?;
         Ok(())
     }
 
@@ -700,7 +725,7 @@ impl GnitzClient {
             )));
         }
 
-        let new_tid = self.conn.alloc_table_id()?;
+        let new_tid = self.session.alloc_table_id()?;
         let schema_id = self.lookup_schema_id(&schema_name)?;
 
         // Encode the PK list using the shared wire packer so the engine
@@ -741,7 +766,7 @@ impl GnitzClient {
             for &c in spec.col_indices {
                 validate_index_col_type(columns[c as usize].type_code)?;
             }
-            index_ids.push(self.conn.alloc_index_id()?);
+            index_ids.push(self.session.alloc_index_id()?);
         }
         let mut families: Vec<(u64, &Schema, ZSetBatch)> = vec![col_family, (TABLE_TAB, tbl_schema, tb)];
         if !unique_indexes.is_empty() {
@@ -761,7 +786,7 @@ impl GnitzClient {
             }
             families.push((IDX_TAB, idx_schema, idx_batch));
         }
-        self.conn.push_ddl_txn(&families)?;
+        self.session.push_ddl_txn(&families)?;
 
         Ok(new_tid)
     }
@@ -784,7 +809,7 @@ impl GnitzClient {
             .u64_val(record.pk_col_idx)
             .u64_val(record.created_lsn)
             .u64_val(record.flags);
-        self.conn.push_ddl_txn(&[(TABLE_TAB, tbl_schema, tb)])?;
+        self.session.push_ddl_txn(&[(TABLE_TAB, tbl_schema, tb)])?;
 
         Ok(())
     }
@@ -800,7 +825,7 @@ impl GnitzClient {
         // typed builder so the row materialisation matches the new layout
         // bit-for-bit (no separate CircuitSources row, no PARAM_TABLE_ID,
         // single dependency entry).
-        let vid = self.conn.alloc_table_id()?;
+        let vid = self.session.alloc_table_id()?;
 
         let mut cb = crate::circuit::CircuitBuilder::new(vid, source_table_id);
         let scan = cb.input_delta();
@@ -885,7 +910,7 @@ impl GnitzClient {
         let mut vids: Vec<u64> = Vec::with_capacity(views.len());
         for pv in &views {
             let vid = if pv.circuit.view_id == 0 {
-                self.conn.alloc_table_id()?
+                self.session.alloc_table_id()?
             } else {
                 pv.circuit.view_id
             };
@@ -1027,7 +1052,7 @@ impl GnitzClient {
         }
         families.push((VIEW_TAB, view_s, view_batch));
 
-        self.conn.push_ddl_txn(&families)?;
+        self.session.push_ddl_txn(&families)?;
 
         Ok(vids)
     }
@@ -1043,7 +1068,7 @@ impl GnitzClient {
         let view_name = canon_name(view_name);
         let schema_id = self.lookup_schema_id(&schema_name)?;
 
-        let (_, view_batch, _) = self.conn.scan(VIEW_TAB, &mut self.schema_cache)?;
+        let (_, view_batch, _) = self.session.scan(VIEW_TAB)?;
         let view_batch = view_batch
             .ok_or_else(|| ClientError::ServerError(format!("View '{schema_name}.{view_name}' not found")))?;
         let vr = find_view_record(&view_batch, schema_id, &view_name)?
@@ -1066,7 +1091,7 @@ impl GnitzClient {
                 append_view_row(&mut a, -1, rec);
             }
         }
-        self.conn.push_ddl_txn(&[(VIEW_TAB, view_s, vb)])?;
+        self.session.push_ddl_txn(&[(VIEW_TAB, view_s, vb)])?;
 
         Ok(())
     }
@@ -1095,7 +1120,7 @@ impl GnitzClient {
             return Ok((record.tid, schema));
         }
 
-        let (_, view_batch, _) = self.conn.scan(VIEW_TAB, &mut self.schema_cache)?;
+        let view_batch = self.scan_catalog(VIEW_TAB)?;
         let view_batch = view_batch
             .ok_or_else(|| ClientError::ServerError(format!("Table or view '{schema_name}.{name}' not found")))?;
         let record = find_view_record(&view_batch, schema_id, &name)?
@@ -1115,7 +1140,7 @@ impl GnitzClient {
     /// (every worker holds the full copy, so a sharded reduce would
     /// N-fold-multiply the aggregate — see the replicated-tables design).
     pub fn table_replicated(&mut self, tid: u64) -> Result<bool, ClientError> {
-        let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
+        let tbl_batch = self.scan_catalog(TABLE_TAB)?;
         let Some(tbl_batch) = tbl_batch else {
             return Ok(false);
         };
@@ -1134,7 +1159,7 @@ impl GnitzClient {
     /// missing row — or an entirely empty SCHEMA_TAB — is the one
     /// schema-qualified "not found" error every DDL/resolve path reports.
     fn lookup_schema_id(&mut self, schema_name: &str) -> Result<u64, ClientError> {
-        let (_, batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
+        let batch = self.scan_catalog(SCHEMA_TAB)?;
         match &batch {
             Some(b) => find_schema_id(b, schema_name)?,
             None => None,
@@ -1147,7 +1172,7 @@ impl GnitzClient {
     /// decode error on a corrupt batch, which must surface rather than be
     /// masked as a miss.
     fn lookup_table_record(&mut self, schema_id: u64, table_name: &str) -> Result<Option<TableRecord>, ClientError> {
-        let (_, batch, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
+        let batch = self.scan_catalog(TABLE_TAB)?;
         match &batch {
             Some(b) => find_table_record(b, schema_id, table_name),
             None => Ok(None),
@@ -1158,7 +1183,7 @@ impl GnitzClient {
     /// its validated `Schema`. Called only on a resolved owner, so miss paths
     /// never pay the COL_TAB scan.
     fn load_owner_schema(&mut self, owner_id: u64, owner_kind: u64, pk_col_idx: u64) -> Result<Schema, ClientError> {
-        let (_, col_batch, _) = self.conn.scan(COL_TAB, &mut self.schema_cache)?;
+        let col_batch = self.scan_catalog(COL_TAB)?;
         let col_batch = col_batch.ok_or_else(|| ClientError::ServerError("COL_TAB is empty".to_string()))?;
         let columns = extract_col_entries(&col_batch, owner_id, owner_kind)?;
         assemble_schema(columns, pk_col_idx)

@@ -3,13 +3,13 @@
 //! Circuit-shape and rejection tests for `[NOT] EXISTS` / `[NOT] IN (SELECT …)`
 //! view compilation (the semi/anti-join builder).
 
-use gnitz_core::{
+use gnitz_sql::{GnitzSqlError, SqlPlanner};
+use gnitz_test_harness::ServerHandle;
+use gnitz_wire::{
     OPCODE_DISTINCT, OPCODE_EXCHANGE_SHARD, OPCODE_FILTER, OPCODE_JOIN_DELTA_TRACE, OPCODE_JOIN_DELTA_TRACE_RANGE,
     OPCODE_MAP_EXPR, OPCODE_NEGATE, OPCODE_NULL_EXTEND, OPCODE_PARTITION_FILTER, OPCODE_POSITIVE_PART, OPCODE_REDUCE,
     OPCODE_UNION,
 };
-use gnitz_sql::{GnitzSqlError, SqlPlanner};
-use gnitz_test_harness::ServerHandle;
 
 mod common;
 use common::*;

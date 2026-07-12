@@ -11,26 +11,6 @@
 #[cfg(not(target_endian = "little"))]
 compile_error!("GnitzDB requires a little-endian target; the wire format is LE-only.");
 
-/// Re-declare gnitz-wire constants as a different integer type.
-///
-/// ```ignore
-/// gnitz_wire::cast_consts! { i32;
-///     OPCODE_FILTER, OPCODE_MAP, OPCODE_NEGATE,
-/// }
-/// // expands to:
-/// // const OPCODE_FILTER: i32 = gnitz_wire::OPCODE_FILTER as i32;
-/// // const OPCODE_MAP: i32 = gnitz_wire::OPCODE_MAP as i32;
-/// // ...
-/// ```
-///
-/// Use `pub` visibility with: `gnitz_wire::cast_consts! { pub i64; ... }`
-#[macro_export]
-macro_rules! cast_consts {
-    ($vis:vis $ty:ty; $($name:ident),+ $(,)?) => {
-        $($vis const $name: $ty = $crate::$name as $ty;)+
-    };
-}
-
 mod catalog;
 mod circuit;
 mod expr;
@@ -40,6 +20,7 @@ mod handshake;
 mod pk;
 mod range;
 mod types;
+mod uuid;
 mod wal;
 
 pub mod control;
@@ -53,6 +34,7 @@ pub use handshake::*;
 pub use pk::*;
 pub use range::*;
 pub use types::*;
+pub use uuid::*;
 pub use wal::*;
 
 // ---------------------------------------------------------------------------

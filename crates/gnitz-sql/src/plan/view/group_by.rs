@@ -13,10 +13,8 @@ use crate::plan::validate::{
 };
 use crate::plan::view::EmitPieces;
 use crate::types::{is_integer_type, is_min_max_orderable, is_wide_int};
-use gnitz_core::{
-    CircuitBuilder, ColumnDef, ExprBuilder, GnitzClient, ReduceOutKey, Schema, TypeCode, AGG_COUNT, AGG_COUNT_NON_NULL,
-    AGG_MAX, AGG_MIN, AGG_SUM, AGG_SUM_ZERO,
-};
+use gnitz_core::{CircuitBuilder, ColumnDef, ExprBuilder, GnitzClient, ReduceOutKey, Schema, TypeCode};
+use gnitz_wire::{AGG_COUNT, AGG_COUNT_NON_NULL, AGG_MAX, AGG_MIN, AGG_SUM, AGG_SUM_ZERO};
 use sqlparser::ast::{Expr, GroupByExpr, SelectItem};
 
 /// Tracks how a user-level aggregate maps to reduce agg_specs.

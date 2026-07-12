@@ -2,19 +2,24 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use crate::error::ClientError;
+use crate::protocol::message::{encode_message_noschema_parts, encode_message_parts, MessageParts};
 use crate::protocol::{
-    encode_ddl_txn, hello_handshake, recv_message, send_message, send_message_noschema, send_message_with_extra,
-    wire_flags_get_index_version, wire_flags_get_schema_version, wire_flags_set_conflict_mode,
-    wire_flags_set_index_version, wire_flags_set_schema_version, ClientTransport, Message, PkTuple, Schema,
-    WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE,
-    FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_GET_INDICES, FLAG_PUSH, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
-    FLAG_SEEK_BY_INDEX_RANGE, STATUS_ERROR, STATUS_NO_INDEX, STATUS_SCHEMA_MISMATCH,
+    encode_ddl_txn, hello_handshake, recv_message, send_message, send_message_with_extra, wire_flags_get_index_version,
+    wire_flags_get_schema_version, wire_flags_set_conflict_mode, wire_flags_set_index_version,
+    wire_flags_set_schema_version, ClientTransport, Message, PkTuple, ProtocolError, Schema, WireConflictMode,
+    ZSetBatch, FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID,
+    FLAG_CONTINUATION, FLAG_GET_INDICES, FLAG_PUSH, FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_SEEK_BY_INDEX_RANGE,
+    STATUS_ERROR, STATUS_NO_INDEX, STATUS_SCHEMA_MISMATCH,
 };
 use lru::LruCache;
 
 pub use gnitz_wire::{
     COL_TAB, DEP_TAB, FIRST_USER_SCHEMA_ID, FIRST_USER_TABLE_ID, IDX_TAB, SCHEMA_TAB, SEQ_TAB, TABLE_TAB, VIEW_TAB,
 };
+
+/// Per-connection schema LRU capacity. Sized to comfortably hold a session's
+/// working set of tables/views without unbounded growth.
+const SCHEMA_CACHE_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::new(64).unwrap();
 
 /// `(schema, data_batch, lsn)` returned by a `scan`/`seek`/`seek_by_index`:
 /// the (cached) `Schema`, the materialised `ZSetBatch` if any rows came back,
@@ -53,7 +58,14 @@ fn check_response(msg: Message) -> Result<Message, ClientError> {
     Ok(msg)
 }
 
-pub struct Connection {
+/// A protocol session: the transport plus all per-connection protocol state
+/// (client id, negotiated frame ceiling, the schema LRU, and the warm/cold
+/// packing, continuation reassembly, cache absorption, and status→error
+/// policy that read/write it). Exactly one owner of that state — the sync
+/// [`crate::GnitzClient`] holds one; the gnitz-py async I/O thread holds its
+/// own. Because the session owns the cache, no `LruCache` is threaded as a
+/// parameter and no cache lock is shared across threads.
+pub struct Session {
     transport: ClientTransport,
     pub client_id: u64,
     /// Server-negotiated per-connection frame payload ceiling. Set during
@@ -61,9 +73,10 @@ pub struct Connection {
     /// pass this value through so a compromised server cannot force the
     /// client to allocate up to the historical 256 MB ceiling.
     max_payload_len: usize,
+    schema_cache: LruCache<u64, (Arc<Schema>, u16)>,
 }
 
-impl Connection {
+impl Session {
     /// `target` is an AF_UNIX socket path or a `tls://HOST:PORT[?PARAM]`
     /// address (see `ClientTransport::connect`).
     pub fn connect(target: &str) -> Result<Self, ClientError> {
@@ -72,15 +85,30 @@ impl Connection {
         // accepts the first frame at an 8-byte limit, so this must
         // happen before `send_message` would emit a control block.
         let limit = hello_handshake(&mut transport)?;
-        Ok(Connection {
+        Ok(Session::from_transport(transport, new_client_id(), limit as usize))
+    }
+
+    /// Wrap an already-connected, already-handshaken transport. Used by the
+    /// gnitz-py async I/O thread, which connects + handshakes on the calling
+    /// thread (to capture the negotiated limit and dup the waker fd) and then
+    /// moves the raw transport onto its I/O thread to build the session there.
+    pub fn from_transport(transport: ClientTransport, client_id: u64, max_payload_len: usize) -> Self {
+        Session {
             transport,
-            client_id: new_client_id(),
-            max_payload_len: limit as usize,
-        })
+            client_id,
+            max_payload_len,
+            schema_cache: LruCache::new(SCHEMA_CACHE_CAP),
+        }
     }
 
     pub fn close(self) {
         // The transport is dropped here, which closes the connection.
+    }
+
+    /// Handle that unblocks a blocking recv parked in another thread (the
+    /// async I/O loop's teardown wake). Delegates to the transport.
+    pub fn waker(&self) -> Result<crate::protocol::TransportWaker, ProtocolError> {
+        self.transport.waker()
     }
 
     pub fn alloc_table_id(&mut self) -> Result<u64, ClientError> {
@@ -110,14 +138,8 @@ impl Connection {
 
     /// Default push: silent-upsert (`WireConflictMode::Update`).
     /// Callers that need SQL-standard rejection use `push_with_mode`.
-    pub fn push(
-        &mut self,
-        target_id: u64,
-        schema: &Schema,
-        batch: &ZSetBatch,
-        cache: &mut LruCache<u64, (Arc<Schema>, u16)>,
-    ) -> Result<u64, ClientError> {
-        self.push_with_mode(target_id, schema, batch, WireConflictMode::Update, cache)
+    pub fn push(&mut self, target_id: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, ClientError> {
+        self.push_with_mode(target_id, schema, batch, WireConflictMode::Update)
     }
 
     pub fn push_with_mode(
@@ -126,10 +148,9 @@ impl Connection {
         schema: &Schema,
         batch: &ZSetBatch,
         mode: WireConflictMode,
-        cache: &mut LruCache<u64, (Arc<Schema>, u16)>,
     ) -> Result<u64, ClientError> {
         batch.validate(schema).map_err(ClientError::ServerError)?;
-        let msg = self.roundtrip_push(target_id, schema, batch, mode, cache)?;
+        let msg = self.roundtrip_push(target_id, schema, batch, mode)?;
         Ok(msg.seek_pk as u64)
     }
 
@@ -153,90 +174,80 @@ impl Connection {
         Ok(msg.seek_pk as u64)
     }
 
-    pub fn scan(&mut self, target_id: u64, cache: &mut LruCache<u64, (Arc<Schema>, u16)>) -> ScanResult {
-        let cached_version = cache.peek(&target_id).map(|(_, v)| *v).unwrap_or(0);
-        let flags = wire_flags_set_schema_version(0, cached_version);
-        // Send the scan request then collect streaming worker frames
-        // (each tagged FLAG_CONTINUATION) until the terminal frame arrives.
+    pub fn scan(&mut self, target_id: u64) -> ScanResult {
+        let parts = self.pack_scan(target_id);
+        self.transport.send_framed_iov(&parts.segments())?;
+        self.recv_scan(target_id)
+    }
+
+    pub fn seek(&mut self, target_id: u64, pk: &PkTuple) -> ScanResult {
+        let flags = self.versioned_flags(target_id, FLAG_SEEK);
+        send_message(&mut self.transport, target_id, self.client_id, flags, pk, 0, None, None)?;
+        let msg = self.recv_checked(target_id)?;
+        self.recover_schema(target_id, msg)
+    }
+
+    pub fn seek_by_index(&mut self, table_id: u64, col_indices: &[u32], key_vals: &[u128]) -> ScanResult {
+        // Embed the cached schema version so the server can omit the schema
+        // block on a warm-cache hit (matching push/scan).
+        let flags = self.versioned_flags(table_id, FLAG_SEEK_BY_INDEX);
+        // Pack the K = key_vals.len() native values as 16-byte LE slots into a
+        // PkTuple (stride K×16 ≤ 64 ≤ MAX_PK_BYTES); send_message's split_wire
+        // routes slot 0 → seek_pk and slots 1..K → seek_pk_extra. K=1 is
+        // byte-identical to the legacy single-value frame. seek_col_idx carries
+        // pack_pk_cols(col_indices). Arity is validated upstream in
+        // GnitzClient::seek_by_index (the one choke point for every binding).
+        let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
+        for (i, &v) in key_vals.iter().enumerate() {
+            buf[i * 16..i * 16 + 16].copy_from_slice(&v.to_le_bytes());
+        }
+        let pk = PkTuple::from_bytes(&buf[..key_vals.len() * 16]);
+        let seek_col_idx = gnitz_wire::pack_pk_cols(col_indices);
         send_message(
             &mut self.transport,
-            target_id,
+            table_id,
             self.client_id,
             flags,
-            &PkTuple::EMPTY,
-            0,
+            &pk,
+            seek_col_idx,
             None,
             None,
         )?;
-        let mut schema: Option<Arc<Schema>> = None;
-        let mut data: Option<ZSetBatch> = None;
-        let lsn: u64 = loop {
-            let msg = check_response(self.recv_message_cached_inner(target_id, cache)?)?;
-            let is_continuation = (msg.flags & FLAG_CONTINUATION) != 0;
-            schema = schema.or(msg.schema.map(Arc::new));
-            if let Some(batch) = msg.data_batch {
-                match data.as_mut() {
-                    Some(acc) => acc.extend_from_owned(batch),
-                    None => data = Some(batch),
-                }
-            }
-            if !is_continuation {
-                break msg.seek_pk as u64;
-            }
-        };
-        // Warm-cache responses omit the schema block. Recover once from the LRU cache.
-        if schema.is_none() {
-            schema = cache.get(&target_id).map(|(s, _)| Arc::clone(s));
-        }
-        Ok((schema, data, lsn))
-    }
-
-    pub fn seek(&mut self, target_id: u64, pk: &PkTuple, cache: &mut LruCache<u64, (Arc<Schema>, u16)>) -> ScanResult {
-        let msg = self.roundtrip_seek(target_id, pk, cache)?;
-        let schema = msg
-            .schema
-            .map(Arc::new)
-            .or_else(|| cache.get(&target_id).map(|(s, _)| Arc::clone(s)));
-        Ok((schema, msg.data_batch, msg.seek_pk as u64))
-    }
-
-    pub fn seek_by_index(
-        &mut self,
-        table_id: u64,
-        col_indices: &[u32],
-        key_vals: &[u128],
-        cache: &mut LruCache<u64, (Arc<Schema>, u16)>,
-    ) -> ScanResult {
-        let msg = self.roundtrip_seek_by_index(table_id, col_indices, key_vals, cache)?;
-        let schema = msg
-            .schema
-            .map(Arc::new)
-            .or_else(|| cache.get(&table_id).map(|(s, _)| Arc::clone(s)));
-        Ok((schema, msg.data_batch, msg.seek_pk as u64))
+        let msg = self.recv_checked(table_id)?;
+        self.recover_schema(table_id, msg)
     }
 
     /// Ordered range scan over a secondary index, described by `desc` (the
     /// equality-pinned leading values plus the half-open cut interval on the
     /// next index column). Arity is validated upstream in
     /// `GnitzClient::seek_by_index_range`, the single choke point.
+    ///
+    /// The encoded `RangeDescriptor` rides the **explicit** `seek_pk_extra`
+    /// blob (up to 82 bytes at max index arity — over the 64-byte `PkTuple`
+    /// cap), so it goes through `send_message_with_extra`, not `send_message`.
     pub fn seek_by_index_range(
         &mut self,
         table_id: u64,
         col_indices: &[u32],
         desc: &gnitz_wire::RangeDescriptor,
-        cache: &mut LruCache<u64, (Arc<Schema>, u16)>,
     ) -> ScanResult {
-        let msg = self.roundtrip_seek_by_index_range(table_id, col_indices, desc, cache)?;
-        let schema = msg
-            .schema
-            .map(Arc::new)
-            .or_else(|| cache.get(&table_id).map(|(s, _)| Arc::clone(s)));
-        Ok((schema, msg.data_batch, msg.seek_pk as u64))
+        let flags = self.versioned_flags(table_id, FLAG_SEEK_BY_INDEX_RANGE);
+        let seek_col_idx = gnitz_wire::pack_pk_cols(col_indices);
+        send_message_with_extra(
+            &mut self.transport,
+            table_id,
+            self.client_id,
+            flags,
+            seek_col_idx,
+            &desc.encode(),
+        )?;
+        let msg = self.recv_checked(table_id)?;
+        self.recover_schema(table_id, msg)
     }
 
     /// Pure transport for GET_INDICES: send the cached index epoch and receive
     /// the server's reply on a dedicated path — `recv_message(fd, None, ..)`,
-    /// never `recv_message_cached_inner` — so the per-table `schema_cache` is
+    /// never the cache-aware recv — so the per-table `schema_cache` is
     /// untouched. The reply is schema-bearing only when the list changed; the
     /// "unchanged" reply carries no data and needs no schema. Returns the raw
     /// `(data_batch, server_epoch)` and leaves the `IndexMeta` decode to
@@ -261,27 +272,109 @@ impl Connection {
         Ok((msg.data_batch, wire_flags_get_index_version(msg.flags)))
     }
 
+    // ── Async-shared protocol surface ──────────────────────────────────────
+    //
+    // Build/receive helpers the gnitz-py async I/O loop drives directly: it
+    // packs a batch of requests, ships them with one `send_batch`, then reads
+    // the responses back through these same continuation-reassembly and
+    // cache-absorption paths the sync methods use.
+
+    /// Pack a scan request (control-only) with the cached schema version, so
+    /// the server may omit the schema block on a warm hit. The matching
+    /// [`Self::recv_scan`] resolves the schema from the cache the session
+    /// owns, so no hint is threaded back.
+    pub fn pack_scan(&self, target_id: u64) -> MessageParts {
+        let flags = self.versioned_flags(target_id, 0);
+        encode_message_parts(target_id, self.client_id, flags, &PkTuple::EMPTY, 0, None, None)
+    }
+
+    /// Pack a point-seek request with the cached schema version.
+    pub fn pack_seek(&self, target_id: u64, pk: &PkTuple) -> MessageParts {
+        let flags = self.versioned_flags(target_id, FLAG_SEEK);
+        encode_message_parts(target_id, self.client_id, flags, pk, 0, None, None)
+    }
+
+    /// Ship many pre-encoded frames as one vectored write sequence.
+    pub fn send_batch(&mut self, parts: &[MessageParts]) -> Result<(), ProtocolError> {
+        self.transport.send_framed_batch(parts)
+    }
+
+    /// Receive a streaming scan/seek response: reassemble continuation frames,
+    /// absorb any schema block into the cache, and recover the schema from the
+    /// cache if the response was schema-less. Same body as the sync `scan`.
+    pub fn recv_scan(&mut self, target_id: u64) -> ScanResult {
+        let mut schema: Option<Arc<Schema>> = None;
+        let mut data: Option<ZSetBatch> = None;
+        let lsn: u64 = loop {
+            let msg = check_response(self.recv_cached(target_id)?)?;
+            let is_continuation = (msg.flags & FLAG_CONTINUATION) != 0;
+            schema = schema.or(msg.schema);
+            if let Some(batch) = msg.data_batch {
+                match data.as_mut() {
+                    Some(acc) => acc.extend_from_owned(batch),
+                    None => data = Some(batch),
+                }
+            }
+            if !is_continuation {
+                break msg.seek_pk as u64;
+            }
+        };
+        // Warm-cache responses omit the schema block. Recover once from the LRU.
+        if schema.is_none() {
+            schema = self.schema_cache.get(&target_id).map(|(s, _)| Arc::clone(s));
+        }
+        Ok((schema, data, lsn))
+    }
+
+    /// Receive a single push ACK, absorbing any schema block it carries into
+    /// the cache (matching the sync push path). The caller inspects the status.
+    pub fn recv_push_ack(&mut self, target_id: u64) -> Result<Message, ClientError> {
+        self.recv_cached(target_id)
+    }
+
+    /// The cached schema version for `target_id` OR'd into the flag word, so a
+    /// warm-cache request lets the server omit the schema block.
+    fn versioned_flags(&self, target_id: u64, base: u64) -> u64 {
+        let cached_version = self.schema_cache.peek(&target_id).map(|(_, v)| *v).unwrap_or(0);
+        wire_flags_set_schema_version(base, cached_version)
+    }
+
+    /// Recover the schema for a single-frame seek response and assemble the
+    /// `ScanResult`: prefer the in-frame schema, else fall back to the cache.
+    /// Shared tail of `seek` / `seek_by_index` / `seek_by_index_range`.
+    fn recover_schema(&mut self, target_id: u64, msg: Message) -> ScanResult {
+        let schema = msg
+            .schema
+            .or_else(|| self.schema_cache.get(&target_id).map(|(s, _)| Arc::clone(s)));
+        Ok((schema, msg.data_batch, msg.seek_pk as u64))
+    }
+
     /// Receive one framed message, using the LRU cache to decode continuation
-    /// frames that arrive without a schema block.
-    fn recv_message_cached_inner(
-        &mut self,
-        target_id: u64,
-        cache: &mut LruCache<u64, (Arc<Schema>, u16)>,
-    ) -> Result<Message, ClientError> {
+    /// frames that arrive without a schema block, and caching any schema block
+    /// the frame does carry.
+    fn recv_cached(&mut self, target_id: u64) -> Result<Message, ClientError> {
         let msg = {
             // `get` (not `peek`) so a frequently-accessed schema refreshes its
             // LRU recency and isn't evicted under memory pressure.
-            let hint = cache.get(&target_id).map(|(s, v)| (s.as_ref(), *v));
+            let hint = self.schema_cache.get(&target_id).map(|(s, v)| (s.as_ref(), *v));
             recv_message(&mut self.transport, hint, self.max_payload_len)?
         };
-        // schema_batch is Some only when the schema block was physically in the frame;
-        // schema is always Some when schema_batch is (invariant in parse_response).
-        if msg.schema_batch.is_some() {
+        // `msg.schema` is `Some` exactly when the schema block was physically
+        // in the frame. Absorb it as an `Arc` clone (refcount bump, no deep
+        // copy) — this is the authoritative schema with the server's real
+        // column names.
+        if let Some(s) = msg.schema.as_ref() {
             let version = wire_flags_get_schema_version(msg.flags);
-            let s = msg.schema.as_ref().unwrap();
-            cache.put(target_id, (Arc::new(s.clone()), version));
+            self.schema_cache.put(target_id, (Arc::clone(s), version));
         }
         Ok(msg)
+    }
+
+    /// Shared tail of the single-frame seek roundtrips: cache-aware recv then
+    /// status→error mapping.
+    fn recv_checked(&mut self, target_id: u64) -> Result<Message, ClientError> {
+        let msg = self.recv_cached(target_id)?;
+        check_response(msg)
     }
 
     fn roundtrip(
@@ -328,24 +421,23 @@ impl Connection {
         schema: &Schema,
         batch: &ZSetBatch,
         mode: WireConflictMode,
-        cache: &mut LruCache<u64, (Arc<Schema>, u16)>,
     ) -> Result<Message, ClientError> {
         // FLAG_PUSH marks the frame as a push independent of data presence, so
         // an empty batch (a legitimate empty Z-set delta) is ACKed as a no-op
         // push instead of being mistaken for a scan request.
         let base_flags = wire_flags_set_conflict_mode(FLAG_PUSH, mode);
-        let warm_version: Option<u16> = match cache.peek(&target_id) {
+        let warm_version: Option<u16> = match self.schema_cache.peek(&target_id) {
             Some((cached_schema, v)) if *v != 0 && schema.types_match(cached_schema.as_ref()) => Some(*v),
             _ => None,
         };
-        if let Some(cached_version) = warm_version {
+        let parts = match warm_version {
             // Warm path: omit schema block, embed cached version.
-            let flags = wire_flags_set_schema_version(base_flags, cached_version);
-            send_message_noschema(&mut self.transport, target_id, self.client_id, flags, schema, batch)?;
-        } else {
+            Some(cached_version) => {
+                let flags = wire_flags_set_schema_version(base_flags, cached_version);
+                encode_message_noschema_parts(target_id, self.client_id, flags, schema, batch)
+            }
             // Cold path: include schema block, version = 0.
-            send_message(
-                &mut self.transport,
+            None => encode_message_parts(
                 target_id,
                 self.client_id,
                 base_flags,
@@ -353,14 +445,14 @@ impl Connection {
                 0,
                 Some(schema),
                 Some(batch),
-            )?;
-        }
-        let ack = match check_response(self.recv_message_cached_inner(target_id, cache)?) {
+            ),
+        };
+        self.transport.send_framed_iov(&parts.segments())?;
+        let ack = match self.recv_checked(target_id) {
             Err(ClientError::SchemaMismatch) => {
                 // Stale cache: evict and retry with full schema.
-                cache.pop(&target_id);
-                send_message(
-                    &mut self.transport,
+                self.schema_cache.pop(&target_id);
+                let parts = encode_message_parts(
                     target_id,
                     self.client_id,
                     base_flags,
@@ -368,98 +460,22 @@ impl Connection {
                     0,
                     Some(schema),
                     Some(batch),
-                )?;
-                check_response(self.recv_message_cached_inner(target_id, cache)?)?
+                );
+                self.transport.send_framed_iov(&parts.segments())?;
+                self.recv_checked(target_id)?
             }
             Ok(msg) => msg,
             Err(e) => return Err(e),
         };
         // No manual cache write here. Whenever the server changed the schema
         // version it also included the schema block in the ACK
-        // (wire_should_include_schema), and recv_message_cached_inner already
-        // cached that authoritative schema (with the server's real column
-        // names). A schema.clone() here would clobber it with the caller's
-        // copy — dropping the server's column names, and on schema evolution
-        // pairing the OLD schema with the NEW version. On the pure warm path
-        // the version is unchanged: nothing to do.
+        // (wire_should_include_schema), and recv_cached already cached that
+        // authoritative schema (with the server's real column names). A
+        // schema.clone() here would clobber it with the caller's copy —
+        // dropping the server's column names, and on schema evolution pairing
+        // the OLD schema with the NEW version. On the pure warm path the
+        // version is unchanged: nothing to do.
         Ok(ack)
-    }
-
-    fn roundtrip_seek_by_index(
-        &mut self,
-        table_id: u64,
-        col_indices: &[u32],
-        key_vals: &[u128],
-        cache: &mut LruCache<u64, (Arc<Schema>, u16)>,
-    ) -> Result<Message, ClientError> {
-        // Embed the cached schema version so the server can omit the schema
-        // block on a warm-cache hit (matching roundtrip_push/scan).
-        let cached_version = cache.peek(&table_id).map(|(_, v)| *v).unwrap_or(0);
-        let flags = wire_flags_set_schema_version(FLAG_SEEK_BY_INDEX, cached_version);
-        // Pack the K = key_vals.len() native values as 16-byte LE slots into a
-        // PkTuple (stride K×16 ≤ 64 ≤ MAX_PK_BYTES); send_message's split_wire
-        // routes slot 0 → seek_pk and slots 1..K → seek_pk_extra. K=1 is
-        // byte-identical to the legacy single-value frame. seek_col_idx carries
-        // pack_pk_cols(col_indices). Arity is validated upstream in
-        // GnitzClient::seek_by_index (the one choke point for every binding).
-        let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
-        for (i, &v) in key_vals.iter().enumerate() {
-            buf[i * 16..i * 16 + 16].copy_from_slice(&v.to_le_bytes());
-        }
-        let pk = PkTuple::from_bytes(&buf[..key_vals.len() * 16]);
-        let seek_col_idx = gnitz_wire::pack_pk_cols(col_indices);
-        send_message(
-            &mut self.transport,
-            table_id,
-            self.client_id,
-            flags,
-            &pk,
-            seek_col_idx,
-            None,
-            None,
-        )?;
-        let msg = self.recv_message_cached_inner(table_id, cache)?;
-        check_response(msg)
-    }
-
-    /// Send a SEEK_BY_INDEX_RANGE frame. The encoded `RangeDescriptor` rides
-    /// the **explicit** `seek_pk_extra` blob (up to 82 bytes at max index
-    /// arity — over the 64-byte `PkTuple` cap), so it goes through
-    /// `send_message_with_extra`, not `send_message`. Native cut values ship
-    /// verbatim; the worker is the sole OPK encoder.
-    fn roundtrip_seek_by_index_range(
-        &mut self,
-        table_id: u64,
-        col_indices: &[u32],
-        desc: &gnitz_wire::RangeDescriptor,
-        cache: &mut LruCache<u64, (Arc<Schema>, u16)>,
-    ) -> Result<Message, ClientError> {
-        let cached_version = cache.peek(&table_id).map(|(_, v)| *v).unwrap_or(0);
-        let flags = wire_flags_set_schema_version(FLAG_SEEK_BY_INDEX_RANGE, cached_version);
-        let seek_col_idx = gnitz_wire::pack_pk_cols(col_indices);
-        send_message_with_extra(
-            &mut self.transport,
-            table_id,
-            self.client_id,
-            flags,
-            seek_col_idx,
-            &desc.encode(),
-        )?;
-        let msg = self.recv_message_cached_inner(table_id, cache)?;
-        check_response(msg)
-    }
-
-    fn roundtrip_seek(
-        &mut self,
-        target_id: u64,
-        pk: &PkTuple,
-        cache: &mut LruCache<u64, (Arc<Schema>, u16)>,
-    ) -> Result<Message, ClientError> {
-        let cached_version = cache.peek(&target_id).map(|(_, v)| *v).unwrap_or(0);
-        let flags = wire_flags_set_schema_version(FLAG_SEEK, cached_version);
-        send_message(&mut self.transport, target_id, self.client_id, flags, pk, 0, None, None)?;
-        let msg = self.recv_message_cached_inner(target_id, cache)?;
-        check_response(msg)
     }
 }
 
@@ -494,13 +510,10 @@ mod tests {
         Message {
             status: STATUS_ERROR,
             target_id: 0,
-            client_id: 0,
             flags: 0,
             seek_pk: 0,
             seek_col_idx: 0,
-            request_id: 0,
             schema: None,
-            schema_batch: None,
             data_batch: None,
             error_text,
         }

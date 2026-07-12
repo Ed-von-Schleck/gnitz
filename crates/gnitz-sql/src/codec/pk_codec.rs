@@ -11,20 +11,7 @@ use gnitz_core::{FixedInt, PkTuple, Schema, TypeCode};
 use sqlparser::ast::{Expr, UnaryOperator, Value};
 
 pub(crate) fn parse_uuid_str(s: &str) -> Result<u128, GnitzSqlError> {
-    let s = s.trim();
-    let hex: String = if s.len() == 36
-        && s.as_bytes()[8] == b'-'
-        && s.as_bytes()[13] == b'-'
-        && s.as_bytes()[18] == b'-'
-        && s.as_bytes()[23] == b'-'
-    {
-        format!("{}{}{}{}{}", &s[..8], &s[9..13], &s[14..18], &s[19..23], &s[24..])
-    } else if s.len() == 32 {
-        s.to_string()
-    } else {
-        return Err(GnitzSqlError::Bind(format!("invalid UUID literal: {s:?}")));
-    };
-    u128::from_str_radix(&hex, 16).map_err(|_| GnitzSqlError::Bind(format!("invalid UUID literal: {s:?}")))
+    gnitz_wire::parse_uuid(s).ok_or_else(|| GnitzSqlError::Bind(format!("invalid UUID literal: {s:?}")))
 }
 
 /// Parse a numeric SQL literal as `i128`, applying `negated` (the literal sat
@@ -219,7 +206,7 @@ mod tests {
         let row = vec![uuid_str_expr("550e8400-e29b-41d4-a716-446655440000")];
         let pk = extract_pk_value(&row, &schema).unwrap();
         // UUID PK has stride 16; the parsed u128 lives in the low 16 bytes.
-        assert_eq!(pk.to_u128().unwrap(), 0x550e8400_e29b_41d4_a716_446655440000_u128);
+        assert_eq!(pk.split_wire().0, 0x550e8400_e29b_41d4_a716_446655440000_u128);
     }
 
     #[test]

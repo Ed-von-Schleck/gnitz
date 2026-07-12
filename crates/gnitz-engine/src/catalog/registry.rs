@@ -41,8 +41,7 @@ impl CatalogEngine {
             }
             if cursor.current_weight > 0 {
                 if check_contiguity {
-                    // pack_column_id layout: owner_id << 9 | col_idx (lower 9 bits).
-                    let actual = (pk & 0x1FF) as i64;
+                    let actual = gnitz_wire::unpack_col_id(pk).1 as i64;
                     if actual != expected {
                         return Err(format!(
                             "entity (owner_id={owner_id}): column records are non-contiguous; \

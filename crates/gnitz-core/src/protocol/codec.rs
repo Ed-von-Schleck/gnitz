@@ -109,8 +109,8 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::types::{meta_schema, ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
-    use crate::protocol::wal_block::{decode_wal_block, encode_wal_block, VerifyChecksum};
+    use crate::protocol::types::{meta_schema, ColData, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
+    use crate::protocol::wal_block::{decode_wal_block_verified, encode_wal_block};
 
     // ── type_code_from_u64 error paths ──────────────────────────────────────
 
@@ -176,7 +176,9 @@ mod tests {
     fn test_batch_to_schema_col_idx_out_of_order() {
         use crate::protocol::error::ProtocolError;
         let mut batch = make_meta_batch(2);
-        batch.pks.swap(0, 1); // [1, 0] instead of [0, 1]
+        if let PkColumn::U64s(v) = &mut batch.pks {
+            v.swap(0, 1); // [1, 0] instead of [0, 1]
+        }
         let res = batch_to_schema(&batch);
         assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
     }
@@ -185,7 +187,9 @@ mod tests {
     fn test_batch_to_schema_col_idx_gap() {
         use crate::protocol::error::ProtocolError;
         let mut batch = make_meta_batch(2);
-        batch.pks.set_u128(1, 5); // gap: [0, 5]
+        if let PkColumn::U64s(v) = &mut batch.pks {
+            v[1] = 5; // gap: [0, 5]
+        }
         let res = batch_to_schema(&batch);
         assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
     }
@@ -194,7 +198,9 @@ mod tests {
     fn test_batch_to_schema_col_idx_duplicate() {
         use crate::protocol::error::ProtocolError;
         let mut batch = make_meta_batch(2);
-        batch.pks.set_u128(1, 0); // duplicate: [0, 0]
+        if let PkColumn::U64s(v) = &mut batch.pks {
+            v[1] = 0; // duplicate: [0, 0]
+        }
         let res = batch_to_schema(&batch);
         assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
     }
@@ -266,7 +272,7 @@ mod tests {
         let ms = meta_schema();
         let meta_batch = schema_to_batch(&original);
         let encoded = encode_wal_block(ms, 0, &meta_batch);
-        let (decoded_batch, _) = decode_wal_block(&encoded, ms, VerifyChecksum::Yes).unwrap();
+        let (decoded_batch, _) = decode_wal_block_verified(&encoded, ms).unwrap();
         let reconstructed = batch_to_schema(&decoded_batch).unwrap();
 
         assert_eq!(original, reconstructed, "schema mismatch after meta roundtrip");

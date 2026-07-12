@@ -75,17 +75,6 @@ impl TypeCode {
         }
     }
 
-    /// Byte stride of this type in a column payload.
-    pub const fn stride(&self) -> u8 {
-        match self {
-            TypeCode::U8 | TypeCode::I8 => 1,
-            TypeCode::U16 | TypeCode::I16 => 2,
-            TypeCode::F32 | TypeCode::U32 | TypeCode::I32 => 4,
-            TypeCode::F64 | TypeCode::U64 | TypeCode::I64 => 8,
-            TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob | TypeCode::I128 => 16,
-        }
-    }
-
     pub const fn is_float(&self) -> bool {
         matches!(self, TypeCode::F32 | TypeCode::F64)
     }
@@ -145,10 +134,17 @@ impl TypeCode {
         matches!(self, TypeCode::U64 | TypeCode::U128 | TypeCode::UUID)
     }
 
-    /// Wire stride in bytes. Alias for `stride()` returning `usize`.
+    /// Byte stride (width) of this type in a column payload. The single width
+    /// table for the enum; the free [`wire_stride`] delegates here.
     #[inline]
-    pub fn wire_stride(self) -> usize {
-        self.stride() as usize
+    pub const fn wire_stride(self) -> usize {
+        match self {
+            TypeCode::U8 | TypeCode::I8 => 1,
+            TypeCode::U16 | TypeCode::I16 => 2,
+            TypeCode::F32 | TypeCode::U32 | TypeCode::I32 => 4,
+            TypeCode::F64 | TypeCode::U64 | TypeCode::I64 => 8,
+            TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob | TypeCode::I128 => 16,
+        }
     }
 
     /// Output PK type for an equijoin synthetic reindex key built from a key
@@ -497,15 +493,15 @@ pub const fn is_routable_int(tc: u8) -> bool {
 /// engine `compare_rows` and the trailing-slot fill depend on it).
 pub const fn wire_stride(tc: u8) -> usize {
     match TypeCode::try_from_u8(tc) {
-        Some(t) => t.stride() as usize,
+        Some(t) => t.wire_stride(),
         None => 8,
     }
 }
 
 // Pin the discriminant↔code round-trip so a `try_from_u8` typo (e.g. mapping a
 // code to the wrong-discriminant variant) can no longer silently mis-stride a
-// column via `wire_stride`. Width can no longer drift from `stride()` because
-// that match is now the only width table.
+// column via `wire_stride`. Width can no longer drift because
+// `TypeCode::wire_stride` is now the only width table.
 const _: () = {
     let mut v: u16 = 0; // u16 so `v += 1` cannot overflow at 255
     while v <= 255 {

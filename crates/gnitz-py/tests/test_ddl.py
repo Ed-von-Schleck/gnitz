@@ -58,7 +58,7 @@ def test_create_table_long_name(client):
             gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
     tid = client.create_table(sn, long_name, cols)
     assert tid > 0
-    resolved_tid, _ = client.resolve_table_id(sn, long_name)
+    resolved_tid, _ = client.resolve_table(sn, long_name)
     assert resolved_tid == tid
     client.drop_table(sn, long_name)
     client.drop_schema(sn)
@@ -70,7 +70,7 @@ def test_resolve_table_id(client):
     cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
             gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
     tid = client.create_table(sn, "t", cols)
-    resolved_tid, schema = client.resolve_table_id(sn, "t")
+    resolved_tid, schema = client.resolve_table(sn, "t")
     assert resolved_tid == tid
     assert len(schema.columns) == 2
     assert schema.pk_index == 0

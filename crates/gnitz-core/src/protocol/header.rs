@@ -28,10 +28,3 @@ pub struct Header {
     ///   u64::MAX — broadcast reply
     pub request_id: u64,
 }
-
-impl Header {
-    pub fn set_seek_by_index(&mut self, col_idx: u64, key: u128) {
-        self.seek_col_idx = col_idx;
-        self.seek_pk = key;
-    }
-}

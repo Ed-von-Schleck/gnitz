@@ -244,8 +244,11 @@ static SCHEMAS: [SchemaDescriptor; SysFamily::COUNT] = {
 // PK packing helpers
 // ---------------------------------------------------------------------------
 
+/// Delegates to the shared `gnitz_wire::pack_col_id` codec. Catalog callers
+/// pass DDL-validated ids, so an out-of-range value here is catalog
+/// corruption — abort rather than alias another column's record.
 pub(super) fn pack_column_id(owner_id: i64, col_idx: i64) -> u64 {
-    ((owner_id as u64) << 9) | (col_idx as u64)
+    gnitz_wire::pack_col_id(owner_id as u64, col_idx as u64).expect("catalog col-id packing out of range")
 }
 
 /// Pack a circuit/dep compound PK `(view_id, sub)` into a `u128` whose

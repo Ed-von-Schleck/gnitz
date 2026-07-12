@@ -7,9 +7,10 @@
 //! server: schema names only need to be unique within one server. A single
 //! shared `make_planner` therefore serves every test file.
 
-use gnitz_core::{ColData, GnitzClient, PkColumn, Schema, ZSetBatch, CIRCUIT_NODES_TAB, OPCODE_FILTER};
+use gnitz_core::{ColData, GnitzClient, PkColumn, Schema, ZSetBatch};
 use gnitz_sql::{GnitzSqlError, SqlPlanner, SqlResult};
 use gnitz_test_harness::ServerHandle;
+use gnitz_wire::{CIRCUIT_NODES_TAB, OPCODE_FILTER};
 
 /// Returns (client, schema_name) with a unique schema already created.
 /// The schema name is unique per call so parallel tests don't collide.

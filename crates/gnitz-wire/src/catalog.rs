@@ -190,6 +190,38 @@ pub const OWNER_KIND_TABLE: u64 = 0;
 pub const OWNER_KIND_VIEW: u64 = 1;
 
 // ---------------------------------------------------------------------------
+// COL_TAB primary-key packing
+// ---------------------------------------------------------------------------
+
+/// Bit width of the column-index field in a packed COL_TAB PK.
+pub const COL_ID_IDX_BITS: u32 = 9;
+
+/// Pack an owner (table/view) id and column index into the COL_TAB PK word:
+/// `(owner_id << 9) | col_idx`. Rejects a column index that overflows its
+/// 9-bit field or an owner id that overflows the remaining 55 bits — either
+/// would silently alias another column's record.
+pub fn pack_col_id(owner_id: u64, col_idx: u64) -> Result<u64, String> {
+    if col_idx >= (1 << COL_ID_IDX_BITS) {
+        return Err(format!(
+            "column index {col_idx} exceeds maximum {}",
+            (1u64 << COL_ID_IDX_BITS) - 1
+        ));
+    }
+    if owner_id > (u64::MAX >> COL_ID_IDX_BITS) {
+        return Err(format!(
+            "owner_id {owner_id} exceeds {}-bit maximum for column ID packing",
+            64 - COL_ID_IDX_BITS
+        ));
+    }
+    Ok((owner_id << COL_ID_IDX_BITS) | col_idx)
+}
+
+/// Inverse of [`pack_col_id`]: `(owner_id, col_idx)`.
+pub const fn unpack_col_id(packed: u64) -> (u64, u64) {
+    (packed >> COL_ID_IDX_BITS, packed & ((1 << COL_ID_IDX_BITS) - 1))
+}
+
+// ---------------------------------------------------------------------------
 // Identifier validation (shared between the SQL planner and the engine)
 // ---------------------------------------------------------------------------
 
@@ -456,17 +488,17 @@ pub fn unpack_pk_cols(packed: u64) -> PkColList {
 
 /// Bit 0: the table's PK is unique (DML-enforced upsert / dedup). Set for every
 /// SQL-created table.
-pub const TABLE_FLAG_UNIQUE_PK: u64 = 1;
+const TABLE_FLAG_UNIQUE_PK: u64 = 1;
 /// Bit 1: the table is **replicated** — every worker holds an identical full
 /// copy (writes broadcast, reads single-source). Mutually exclusive with a
 /// non-default `dist_prefix_len` (enforced at DDL, not by this packing).
-pub const TABLE_FLAG_REPLICATED: u64 = 1 << 1;
+const TABLE_FLAG_REPLICATED: u64 = 1 << 1;
 /// Bit position of the distribution-prefix-length byte in `TABLE_TAB.flags`.
-pub const TABLE_FLAG_DIST_SHIFT: u32 = 8;
+const TABLE_FLAG_DIST_SHIFT: u32 = 8;
 /// Mask for the distribution-prefix-length byte (one byte: 0..=255). An
 /// explicit prefix is `1..=PK_LIST_MAX_COLS`, well within the byte; the full
 /// byte is deliberate headroom.
-pub const TABLE_FLAG_DIST_MASK: u64 = 0xFF;
+const TABLE_FLAG_DIST_MASK: u64 = 0xFF;
 
 /// Pack the persisted `TABLE_TAB.flags` u64 from its logical fields. With
 /// `replicated == false` and `dist_prefix_len == 0` (the default = full PK) this

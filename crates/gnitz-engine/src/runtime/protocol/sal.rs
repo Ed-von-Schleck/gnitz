@@ -58,11 +58,15 @@ pub fn sal_mmap_size() -> usize {
 
 const PAGE_SIZE: u64 = 4096;
 
-// SAL group header flags (u32)
-gnitz_wire::cast_consts! { pub u32;
-    FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_PUSH,
-    FLAG_HAS_PK, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
-}
+// SAL group header flags (u32): the shared `gnitz_wire` flag bits re-declared
+// as `u32` (the SAL group header's flag width).
+pub const FLAG_SHUTDOWN: u32 = gnitz_wire::FLAG_SHUTDOWN as u32;
+pub const FLAG_DDL_SYNC: u32 = gnitz_wire::FLAG_DDL_SYNC as u32;
+pub const FLAG_EXCHANGE: u32 = gnitz_wire::FLAG_EXCHANGE as u32;
+pub const FLAG_PUSH: u32 = gnitz_wire::FLAG_PUSH as u32;
+pub const FLAG_HAS_PK: u32 = gnitz_wire::FLAG_HAS_PK as u32;
+pub const FLAG_SEEK: u32 = gnitz_wire::FLAG_SEEK as u32;
+pub const FLAG_SEEK_BY_INDEX: u32 = gnitz_wire::FLAG_SEEK_BY_INDEX as u32;
 pub const FLAG_EXCHANGE_RELAY: u32 = 512;
 pub const FLAG_BACKFILL: u32 = 2048;
 pub const FLAG_TICK: u32 = 4096;

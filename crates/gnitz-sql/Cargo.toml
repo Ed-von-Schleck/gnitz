@@ -9,8 +9,8 @@ integration = []
 [dependencies]
 sqlparser  = "0.56"
 gnitz-core = { path = "../gnitz-core" }
+gnitz-wire = { path = "../gnitz-wire" }
 
 [dev-dependencies]
 gnitz-test-harness = { path = "../gnitz-test-harness" }
-gnitz-wire = { path = "../gnitz-wire" }
 libc = "0.2"

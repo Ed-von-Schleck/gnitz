@@ -1,201 +1,125 @@
-use std::sync::OnceLock;
-
 use super::codec::{batch_to_schema, schema_to_batch};
 use super::error::ProtocolError;
+use super::header::WAL_BLOCK_HEADER_SIZE;
 use super::header::{
     wire_flags_get_schema_version, Header, FLAG_DDL_TXN, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, STATUS_ERROR, STATUS_NO_INDEX,
     STATUS_OK, STATUS_SCHEMA_MISMATCH,
 };
-use super::header::{IPC_CONTROL_TID, WAL_BLOCK_HEADER_SIZE};
 use super::transport::ClientTransport;
-use super::types::{meta_schema, ColData, PkColumn, PkTuple, Schema, ZSetBatch};
-use super::wal_block::{decode_wal_block, encode_wal_block, VerifyChecksum};
-use crate::types::schema_from_wire_cols;
+use super::types::{meta_schema, PkTuple, Schema, ZSetBatch};
+use super::wal_block::{decode_wal_block, encode_wal_block};
+use xxhash_rust::xxh3::xxh3_64;
 
 pub struct Message {
     pub status: u32,
     pub target_id: u64,
-    pub client_id: u64,
     pub flags: u64,
     pub seek_pk: u128,
     pub seek_col_idx: u64,
-    pub request_id: u64,
-    pub schema: Option<Schema>, // derived from schema_batch or hint (avoids re-deriving)
-    pub schema_batch: Option<ZSetBatch>, // Some only when schema block was physically in frame
+    /// The schema, `Some` iff a schema block was physically in the frame (an
+    /// `Arc` so a cache absorb is a refcount bump, not a deep copy). On a
+    /// hint-only continuation frame it is `None` — the caller supplied the
+    /// schema out of band.
+    pub schema: Option<std::sync::Arc<Schema>>,
     pub data_batch: Option<ZSetBatch>,
     pub error_text: Option<String>, // Some(_) when status == STATUS_ERROR
 }
 
-// ── CONTROL_SCHEMA ────────────────────────────────────────────────────────────
+// ── Control block ─────────────────────────────────────────────────────────────
 //
-// Schema layout (column indices, payload indices, region indices, null-bit
-// positions) lives in `gnitz_wire::control`. This module builds the schema
-// using those indices so the client and the server can never disagree on
-// the wire format.
-
-fn control_schema() -> &'static Schema {
-    static INSTANCE: OnceLock<Schema> = OnceLock::new();
-    INSTANCE
-        .get_or_init(|| schema_from_wire_cols(gnitz_wire::control::CONTROL_COLS, &[gnitz_wire::control::COL_MSG_IDX]))
-}
+// The control-block wire codec (layout, template encoder, directory-driven
+// decoder) lives in `gnitz_wire::control` — the one implementation both the
+// client and the engine run. The wrappers here adapt it to the client types:
+// `Header` in/out, UTF-8 validated error text, and the checksum stamp every
+// client TCP frame carries.
 
 /// Encode a `Header` + optional error message + optional wide-PK extra bytes
 /// into a control WAL block. When `error_msg` is empty the error_msg column
-/// is NULL; when `seek_pk_extra` is empty the seek_pk_extra column is NULL
-/// (byte-identical to today's frame).
-pub fn encode_control_block(header: &Header, error_msg: &str, seek_pk_extra: &[u8]) -> Result<Vec<u8>, ProtocolError> {
-    use gnitz_wire::control as ctrl;
-    let cs = control_schema();
-
-    let has_error = !error_msg.is_empty();
-    let has_seek_extra = !seek_pk_extra.is_empty();
-    let nulls_val: u64 = (if has_error { 0 } else { ctrl::NULL_BIT_ERROR_MSG })
-        | (if has_seek_extra {
-            0
-        } else {
-            ctrl::NULL_BIT_SEEK_PK_EXTRA
-        });
-
-    let mut columns: [Option<ColData>; ctrl::NUM_COLUMNS] = std::array::from_fn(|_| None);
-    columns[ctrl::COL_MSG_IDX] = Some(ColData::Fixed(vec![]));
-    columns[ctrl::COL_STATUS] = Some(ColData::Fixed((header.status as u64).to_le_bytes().to_vec()));
-    columns[ctrl::COL_CLIENT_ID] = Some(ColData::Fixed(header.client_id.to_le_bytes().to_vec()));
-    columns[ctrl::COL_TARGET_ID] = Some(ColData::Fixed(header.target_id.to_le_bytes().to_vec()));
-    columns[ctrl::COL_FLAGS] = Some(ColData::Fixed(header.flags.to_le_bytes().to_vec()));
-    columns[ctrl::COL_SEEK_PK] = Some(ColData::U128s(vec![header.seek_pk]));
-    columns[ctrl::COL_SEEK_COL_IDX] = Some(ColData::Fixed(header.seek_col_idx.to_le_bytes().to_vec()));
-    columns[ctrl::COL_REQUEST_ID] = Some(ColData::Fixed(header.request_id.to_le_bytes().to_vec()));
-    columns[ctrl::COL_ERROR_MSG] = Some(ColData::Strings(vec![if has_error {
-        Some(error_msg.to_string())
-    } else {
-        None
-    }]));
-    columns[ctrl::COL_SEEK_PK_EXTRA] = Some(ColData::Bytes(vec![if has_seek_extra {
-        Some(seek_pk_extra.to_vec())
-    } else {
-        None
-    }]));
-    let columns: Vec<ColData> = columns.into_iter().map(|c| c.unwrap()).collect();
-
-    let batch = ZSetBatch {
-        pks: PkColumn::U64s(vec![0u64]),
-        weights: vec![1i64],
-        nulls: vec![nulls_val],
-        columns,
-    };
-
-    Ok(encode_wal_block(cs, IPC_CONTROL_TID, &batch))
+/// is NULL; when `seek_pk_extra` is empty the seek_pk_extra column is NULL.
+pub fn encode_control_block(header: &Header, error_msg: &str, seek_pk_extra: &[u8]) -> Vec<u8> {
+    let total = gnitz_wire::control::ctrl_block_size(error_msg.len(), seek_pk_extra.len());
+    let mut buf = vec![0u8; total];
+    gnitz_wire::control::encode_ctrl_block(
+        &mut buf,
+        0,
+        header.target_id,
+        header.client_id,
+        header.flags,
+        header.seek_pk,
+        header.seek_col_idx,
+        header.request_id,
+        header.status,
+        error_msg.as_bytes(),
+        seek_pk_extra,
+    );
+    // Client frames carry a body checksum, matching `encode_wal_block`.
+    let checksum = xxh3_64(&buf[WAL_BLOCK_HEADER_SIZE..]);
+    buf[gnitz_wire::WAL_OFF_CHECKSUM..gnitz_wire::WAL_OFF_CHECKSUM + 8].copy_from_slice(&checksum.to_le_bytes());
+    buf
 }
 
 /// Decode a control WAL block, returning `(Header, error_msg, seek_pk_extra)`.
 /// `error_msg` is empty when the null bit for error_msg is set;
 /// `seek_pk_extra` is empty when the null bit for seek_pk_extra is set.
 pub fn decode_control_block(data: &[u8]) -> Result<(Header, String, Vec<u8>), ProtocolError> {
-    use gnitz_wire::control as ctrl;
-    let cs = control_schema();
-    let (batch, tid) = decode_wal_block(data, cs, VerifyChecksum::No)?;
-
-    if tid != IPC_CONTROL_TID {
-        return Err(ProtocolError::DecodeError(format!(
-            "expected control TID 0x{IPC_CONTROL_TID:08X}, got 0x{tid:08X}"
-        )));
-    }
-    if batch.len() != 1 {
-        return Err(ProtocolError::DecodeError(format!(
-            "control block must have 1 row, got {}",
-            batch.len()
-        )));
-    }
-
-    fn read_u64_col(batch: &ZSetBatch, ci: usize) -> Result<u64, ProtocolError> {
-        match &batch.columns[ci] {
-            ColData::Fixed(v) if v.len() == 8 => Ok(u64::from_le_bytes(v[0..8].try_into().unwrap())),
-            ColData::Fixed(v) => Err(ProtocolError::DecodeError(format!(
-                "control block col {} Fixed len {} != 8",
-                ci,
-                v.len()
-            ))),
-            _ => Err(ProtocolError::DecodeError(format!(
-                "control block col {ci} is not Fixed"
-            ))),
-        }
-    }
-
-    fn read_u128_col(batch: &ZSetBatch, ci: usize) -> Result<u128, ProtocolError> {
-        match &batch.columns[ci] {
-            ColData::U128s(v) if v.len() == 1 => Ok(v[0]),
-            ColData::U128s(v) => Err(ProtocolError::DecodeError(format!(
-                "control block col {} U128s len {} != 1",
-                ci,
-                v.len()
-            ))),
-            _ => Err(ProtocolError::DecodeError(format!(
-                "control block col {ci} is not U128s"
-            ))),
-        }
-    }
-
-    let status = read_u64_col(&batch, ctrl::COL_STATUS)? as u32;
-    let client_id = read_u64_col(&batch, ctrl::COL_CLIENT_ID)?;
-    let target_id = read_u64_col(&batch, ctrl::COL_TARGET_ID)?;
-    let flags = read_u64_col(&batch, ctrl::COL_FLAGS)?;
-    let seek_pk = read_u128_col(&batch, ctrl::COL_SEEK_PK)?;
-    let seek_col_idx = read_u64_col(&batch, ctrl::COL_SEEK_COL_IDX)?;
-    let request_id = read_u64_col(&batch, ctrl::COL_REQUEST_ID)?;
-
-    let is_null = (batch.nulls[0] & ctrl::NULL_BIT_ERROR_MSG) != 0;
-    let error_msg = if is_null {
-        String::new()
-    } else {
-        match &batch.columns[ctrl::COL_ERROR_MSG] {
-            ColData::Strings(v) => match v.first() {
-                Some(Some(s)) => s.clone(),
-                _ => String::new(),
-            },
-            _ => {
-                return Err(ProtocolError::DecodeError(
-                    "control block error_msg column is not Strings".into(),
-                ))
-            }
-        }
-    };
-
-    let sx_is_null = (batch.nulls[0] & ctrl::NULL_BIT_SEEK_PK_EXTRA) != 0;
-    let seek_pk_extra: Vec<u8> = if sx_is_null {
-        Vec::new()
-    } else {
-        match &batch.columns[ctrl::COL_SEEK_PK_EXTRA] {
-            ColData::Bytes(v) => v.first().cloned().flatten().unwrap_or_default(),
-            _ => {
-                return Err(ProtocolError::DecodeError(
-                    "control block seek_pk_extra column is not Bytes".into(),
-                ))
-            }
-        }
-    };
-
+    let dc = gnitz_wire::control::peek_control_block(data).map_err(|e| ProtocolError::DecodeError(e.into()))?;
+    let error_msg =
+        String::from_utf8(dc.error_msg).map_err(|e| ProtocolError::DecodeError(format!("utf8 in error_msg: {e}")))?;
     let header = Header {
-        status,
-        target_id,
-        client_id,
-        flags,
-        seek_pk,
-        seek_col_idx,
-        request_id,
+        status: dc.status,
+        target_id: dc.target_id,
+        client_id: dc.client_id,
+        flags: dc.flags,
+        seek_pk: dc.seek_pk,
+        seek_col_idx: dc.seek_col_idx,
+        request_id: dc.request_id,
     };
-    Ok((header, error_msg, seek_pk_extra))
+    Ok((header, error_msg, dc.seek_pk_extra))
 }
 
-/// Encode a request/response into wire bytes (without the 4-byte frame header).
-/// The returned `Vec<u8>` contains concatenated WAL blocks: control + optional
-/// schema + optional data.  Pass to `send_framed()` to add framing and send.
+/// An encoded wire message as its constituent WAL blocks — control, optional
+/// schema, data (empty when no data block) — kept separate so send paths can
+/// hand them to a vectored write (one length prefix over the concatenation)
+/// instead of flattening into one contiguous buffer.
+pub struct MessageParts {
+    pub ctrl: Vec<u8>,
+    pub schema: Option<Vec<u8>>,
+    pub data: Vec<u8>,
+}
+
+impl MessageParts {
+    /// The blocks in wire order, for a vectored send. Empty segments are
+    /// skipped by the transport.
+    pub fn segments(&self) -> [&[u8]; 3] {
+        [&self.ctrl, self.schema.as_deref().unwrap_or(&[]), &self.data]
+    }
+
+    /// Flatten into one contiguous payload, for callers that need owned bytes.
+    pub fn to_vec(&self) -> Vec<u8> {
+        let [a, b, c] = self.segments();
+        let mut out = Vec::with_capacity(a.len() + b.len() + c.len());
+        out.extend_from_slice(a);
+        out.extend_from_slice(b);
+        out.extend_from_slice(c);
+        out
+    }
+}
+
+impl super::transport::FrameSegments for MessageParts {
+    fn segments(&self) -> [&[u8]; 3] {
+        MessageParts::segments(self)
+    }
+}
+
+/// Encode a request/response into its wire blocks (without the 4-byte frame
+/// header): control + optional schema + optional data. Pure function — pass
+/// the parts to `send_framed_iov` / `send_framed_batch` for framing.
 ///
 /// `seek_pk` carries the seek key for `FLAG_SEEK` / `FLAG_SEEK_BY_INDEX` frames;
 /// pass `&PkTuple::EMPTY` for non-seek frames. The wire-level
 /// `(seek_pk: u128, seek_pk_extra: BLOB)` split is performed here via
 /// `PkTuple::split_wire`, so callers never handle it.
-#[allow(clippy::too_many_arguments)]
-pub fn encode_message(
+pub fn encode_message_parts(
     target_id: u64,
     client_id: u64,
     flags: u64,
@@ -203,7 +127,7 @@ pub fn encode_message(
     seek_col_idx: u64,
     schema: Option<&Schema>,
     data_batch: Option<&ZSetBatch>,
-) -> Result<Vec<u8>, ProtocolError> {
+) -> MessageParts {
     let has_data = data_batch.map(|b| !b.is_empty()).unwrap_or(false);
     let has_schema = schema.is_some();
 
@@ -225,28 +149,72 @@ pub fn encode_message(
         seek_col_idx,
         request_id: 0,
     };
-    let ctrl_block = encode_control_block(&ctrl_hdr, "", seek_pk_extra)?;
-    let schema_block = if has_schema {
-        let ms = meta_schema();
-        let owned = schema_to_batch(schema.unwrap());
-        Some(encode_wal_block(ms, target_id as u32, &owned))
+    let ctrl = encode_control_block(&ctrl_hdr, "", seek_pk_extra);
+    let schema_block = schema.map(|s| encode_wal_block(meta_schema(), target_id as u32, &schema_to_batch(s)));
+    let data = if has_data {
+        encode_wal_block(schema.unwrap(), target_id as u32, data_batch.unwrap())
     } else {
-        None
+        Vec::new()
     };
-    let data_block = if has_data {
-        Some(encode_wal_block(schema.unwrap(), target_id as u32, data_batch.unwrap()))
-    } else {
-        None
-    };
+    MessageParts {
+        ctrl,
+        schema: schema_block,
+        data,
+    }
+}
 
-    let mut out = ctrl_block;
-    if let Some(sb) = schema_block {
-        out.extend_from_slice(&sb);
+/// Like [`encode_message_parts`] but omits the schema block from the frame.
+/// The data block is still encoded using `data_schema`; the server
+/// reconstructs the schema from its catalog (guided by the schema version in
+/// `flags`). Used by warm-cache PUSH paths where the server already knows
+/// the schema (version embedded in `flags` bits 24-39).
+pub fn encode_message_noschema_parts(
+    target_id: u64,
+    client_id: u64,
+    flags: u64,
+    data_schema: &Schema,
+    data_batch: &ZSetBatch,
+) -> MessageParts {
+    let has_data = !data_batch.is_empty();
+    let mut flags_out = flags;
+    if has_data {
+        flags_out |= FLAG_HAS_DATA;
     }
-    if let Some(db) = data_block {
-        out.extend_from_slice(&db);
+    let ctrl_hdr = Header {
+        status: STATUS_OK,
+        target_id,
+        client_id,
+        flags: flags_out,
+        seek_pk: 0,
+        seek_col_idx: 0,
+        request_id: 0,
+    };
+    let ctrl = encode_control_block(&ctrl_hdr, "", &[]);
+    let data = if has_data {
+        encode_wal_block(data_schema, target_id as u32, data_batch)
+    } else {
+        Vec::new()
+    };
+    MessageParts {
+        ctrl,
+        schema: None,
+        data,
     }
-    Ok(out)
+}
+
+/// Flattened form of [`encode_message_parts`], for callers that need one
+/// contiguous payload buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_message(
+    target_id: u64,
+    client_id: u64,
+    flags: u64,
+    seek_pk: &PkTuple,
+    seek_col_idx: u64,
+    schema: Option<&Schema>,
+    data_batch: Option<&ZSetBatch>,
+) -> Vec<u8> {
+    encode_message_parts(target_id, client_id, flags, seek_pk, seek_col_idx, schema, data_batch).to_vec()
 }
 
 /// Encode an atomic DDL transaction frame (`FLAG_DDL_TXN`) into wire bytes
@@ -270,7 +238,7 @@ pub fn encode_ddl_txn(client_id: u64, families: &[(u64, &Schema, ZSetBatch)]) ->
         seek_col_idx: 0,
         request_id: 0,
     };
-    let mut out = encode_control_block(&ctrl_hdr, "", &[])?;
+    let mut out = encode_control_block(&ctrl_hdr, "", &[]);
     out.extend_from_slice(&(families.len() as u32).to_le_bytes());
     for (tid, schema, batch) in families {
         let block = encode_wal_block(schema, *tid as u32, batch);
@@ -290,8 +258,8 @@ pub fn send_message(
     schema: Option<&Schema>,
     data_batch: Option<&ZSetBatch>,
 ) -> Result<(), ProtocolError> {
-    let payload = encode_message(target_id, client_id, flags, seek_pk, seek_col_idx, schema, data_batch)?;
-    t.send_framed(&payload)
+    let parts = encode_message_parts(target_id, client_id, flags, seek_pk, seek_col_idx, schema, data_batch);
+    t.send_framed_iov(&parts.segments())
 }
 
 /// Control-only frame carrying an **explicit, arbitrary-length** `seek_pk_extra`
@@ -319,7 +287,7 @@ pub fn send_message_with_extra(
         seek_col_idx,
         request_id: 0,
     };
-    let payload = encode_control_block(&ctrl_hdr, "", seek_pk_extra)?;
+    let payload = encode_control_block(&ctrl_hdr, "", seek_pk_extra);
     t.send_framed(&payload)
 }
 
@@ -336,31 +304,8 @@ pub fn send_message_noschema(
     data_schema: &Schema,
     data_batch: &ZSetBatch,
 ) -> Result<(), ProtocolError> {
-    let has_data = !data_batch.is_empty();
-    let mut flags_out = flags;
-    if has_data {
-        flags_out |= FLAG_HAS_DATA;
-    }
-    let ctrl_hdr = Header {
-        status: STATUS_OK,
-        target_id,
-        client_id,
-        flags: flags_out,
-        seek_pk: 0,
-        seek_col_idx: 0,
-        request_id: 0,
-    };
-    let ctrl_block = encode_control_block(&ctrl_hdr, "", &[])?;
-    let data_block = if has_data {
-        Some(encode_wal_block(data_schema, target_id as u32, data_batch))
-    } else {
-        None
-    };
-    let mut out = ctrl_block;
-    if let Some(db) = data_block {
-        out.extend_from_slice(&db);
-    }
-    t.send_framed(&out)
+    let parts = encode_message_noschema_parts(target_id, client_id, flags, data_schema, data_batch);
+    t.send_framed_iov(&parts.segments())
 }
 
 /// Parse a wire payload (without 4-byte frame header) into a `Message`.
@@ -393,7 +338,6 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
 
     let mut off = ctrl_size;
     let mut wire_schema: Option<Schema> = None;
-    let mut schema_batch: Option<ZSetBatch> = None;
 
     if has_schema {
         if off + WAL_BLOCK_HEADER_SIZE > buf.len() {
@@ -408,9 +352,8 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
             return Err(ProtocolError::DecodeError("schema block truncated".into()));
         }
         let ms = meta_schema();
-        let (sbatch, _) = decode_wal_block(&buf[off..off + sz], ms, VerifyChecksum::No)?;
+        let (sbatch, _) = decode_wal_block(&buf[off..off + sz], ms)?;
         wire_schema = Some(batch_to_schema(&sbatch)?);
-        schema_batch = Some(sbatch);
         off += sz;
     } else if has_data {
         match schema_hint {
@@ -449,31 +392,28 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
         if off + sz > buf.len() {
             return Err(ProtocolError::DecodeError("data block truncated".into()));
         }
-        let (batch, _) = decode_wal_block(&buf[off..off + sz], eff, VerifyChecksum::No)?;
+        let (batch, _) = decode_wal_block(&buf[off..off + sz], eff)?;
         Some(batch)
     } else {
         None
     };
 
-    let (schema, schema_batch, data_batch, error_text) = if ctrl_header.status == STATUS_ERROR {
-        (None, None, None, Some(error_msg))
+    let (schema, data_batch, error_text) = if ctrl_header.status == STATUS_ERROR {
+        (None, None, Some(error_msg))
     } else if ctrl_header.status == STATUS_SCHEMA_MISMATCH || ctrl_header.status == STATUS_NO_INDEX {
         // Control-only frame: no schema, no data, no error text.
-        (None, None, None, None)
+        (None, None, None)
     } else {
-        (wire_schema, schema_batch, data_batch, None)
+        (wire_schema.map(std::sync::Arc::new), data_batch, None)
     };
 
     Ok(Message {
         status: ctrl_header.status,
         target_id: ctrl_header.target_id,
-        client_id: ctrl_header.client_id,
         flags: ctrl_header.flags,
         seek_pk: ctrl_header.seek_pk,
         seek_col_idx: ctrl_header.seek_col_idx,
-        request_id: ctrl_header.request_id,
         schema,
-        schema_batch,
         data_batch,
         error_text,
     })
@@ -524,7 +464,7 @@ mod tests {
             request_id: 0xCAFE_BABE_DEAD_F00D,
         };
 
-        let encoded = encode_control_block(&h, "test error", &[]).unwrap();
+        let encoded = encode_control_block(&h, "test error", &[]);
         let (decoded, err, _) = decode_control_block(&encoded).unwrap();
 
         assert_eq!(decoded.status, h.status);
@@ -540,7 +480,7 @@ mod tests {
     #[test]
     fn test_message_control_null_error_msg() {
         let h = Header::default();
-        let encoded = encode_control_block(&h, "", &[]).unwrap();
+        let encoded = encode_control_block(&h, "", &[]);
         let (_, err, _) = decode_control_block(&encoded).unwrap();
         assert_eq!(err, "");
     }
@@ -552,13 +492,13 @@ mod tests {
     fn ctrl_block_seek_pk_extra_roundtrip() {
         let h = Header::default();
         let extra: Vec<u8> = (0..32u8).collect();
-        let encoded = encode_control_block(&h, "", &extra).unwrap();
+        let encoded = encode_control_block(&h, "", &extra);
         let (_, err, decoded_extra) = decode_control_block(&encoded).unwrap();
         assert_eq!(err, "");
         assert_eq!(decoded_extra, extra);
 
         // Empty seek_pk_extra → identical to today's frame (null bit set).
-        let encoded2 = encode_control_block(&h, "", &[]).unwrap();
+        let encoded2 = encode_control_block(&h, "", &[]);
         let (_, _, decoded_extra2) = decode_control_block(&encoded2).unwrap();
         assert!(decoded_extra2.is_empty());
     }
@@ -574,7 +514,7 @@ mod tests {
                 request_id: req_id,
                 ..Header::default()
             };
-            let encoded = encode_control_block(&h, "", &[]).unwrap();
+            let encoded = encode_control_block(&h, "", &[]);
             let (decoded, _, _) = decode_control_block(&encoded).unwrap();
             assert_eq!(decoded.request_id, req_id);
         }
@@ -609,7 +549,7 @@ mod tests {
         let msg = recv_message(&mut b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
 
         // Schema was sent, data was not (empty batch)
-        assert!(msg.schema_batch.is_some());
+        assert!(msg.schema.is_some());
         assert!(msg.data_batch.is_none());
     }
 
@@ -657,7 +597,7 @@ mod tests {
         let msg = recv_message(&mut b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
 
         let data = msg.data_batch.unwrap();
-        assert_eq!(data.pks, pks);
+        assert_eq!(data.pks.to_vec_u128(), pks);
         assert_eq!(data.weights, weights);
 
         match &data.columns[1] {
@@ -732,7 +672,7 @@ mod tests {
         let (mut a, mut b) = make_transport_pair();
         send_message(&mut a, 0, 0, FLAG_PUSH, &PkTuple::EMPTY, 0, None, None).unwrap();
         let msg = recv_message(&mut b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
-        assert!(msg.schema_batch.is_none());
+        assert!(msg.schema.is_none());
         assert!(msg.data_batch.is_none());
     }
 
@@ -756,7 +696,6 @@ mod tests {
         .unwrap();
         let msg = recv_message(&mut b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
         assert_eq!(msg.target_id, 0xDEAD_BEEF_1234_5678);
-        assert_eq!(msg.client_id, 0xCAFE_BABE_0000_0001);
         assert_eq!(msg.seek_pk, seek_pk);
         assert_eq!(msg.seek_col_idx, 7);
     }
@@ -769,7 +708,7 @@ mod tests {
             status: STATUS_ERROR,
             ..Header::default()
         };
-        let encoded = encode_control_block(&err_hdr, "something broke", &[]).unwrap();
+        let encoded = encode_control_block(&err_hdr, "something broke", &[]);
         a.send_framed(&encoded).unwrap();
         let msg = recv_message(&mut b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
         assert_eq!(msg.status, STATUS_ERROR);
@@ -789,11 +728,9 @@ mod tests {
             7,
             None,
             None,
-        )
-        .unwrap();
+        );
         let msg = parse_response(&payload, None).unwrap();
         assert_eq!(msg.target_id, 0xDEAD);
-        assert_eq!(msg.client_id, 0xBEEF);
         assert_eq!(msg.seek_pk, seek_pk);
         assert_eq!(msg.seek_col_idx, 7);
         assert!(msg.schema.is_none());
@@ -821,12 +758,12 @@ mod tests {
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(val_bytes)],
         };
 
-        let payload = encode_message(42, 1, 0, &PkTuple::EMPTY, 0, Some(&schema), Some(&batch)).unwrap();
+        let payload = encode_message(42, 1, 0, &PkTuple::EMPTY, 0, Some(&schema), Some(&batch));
         let msg = parse_response(&payload, None).unwrap();
         assert_eq!(msg.target_id, 42);
         assert!(msg.schema.is_some());
         let data = msg.data_batch.unwrap();
-        assert_eq!(data.pks, vec![1u128, 2u128, 3u128]);
+        assert_eq!(data.pks.to_vec_u128(), vec![1u128, 2u128, 3u128]);
         assert_eq!(data.weights, vec![1, 1, 1]);
     }
 
@@ -838,7 +775,7 @@ mod tests {
         };
         let empty = ZSetBatch::new(&schema);
 
-        let payload = encode_message(10, 1, 0, &PkTuple::EMPTY, 0, Some(&schema), Some(&empty)).unwrap();
+        let payload = encode_message(10, 1, 0, &PkTuple::EMPTY, 0, Some(&schema), Some(&empty));
         let msg = parse_response(&payload, None).unwrap();
         // Schema sent, but no data (empty batch)
         assert!(msg.schema.is_some());
@@ -852,7 +789,7 @@ mod tests {
     #[test]
     fn encode_message_wide_pk_seek_emits_extra() {
         let pk = PkTuple::from_bytes(&(0..24u8).collect::<Vec<_>>());
-        let payload = encode_message(7, 1, FLAG_SEEK, &pk, 0, None, None).unwrap();
+        let payload = encode_message(7, 1, FLAG_SEEK, &pk, 0, None, None);
 
         let ctrl_size = u32::from_le_bytes(
             payload[gnitz_wire::WAL_OFF_SIZE..gnitz_wire::WAL_OFF_SIZE + 4]
@@ -901,7 +838,7 @@ mod tests {
         assert!(msg.schema.is_none(), "schema must be None for hint-only frame");
         // Data must still decode correctly.
         let data = msg.data_batch.expect("data_batch must be Some");
-        assert_eq!(data.pks, vec![1u128]);
+        assert_eq!(data.pks.to_vec_u128(), vec![1u128]);
         assert_eq!(data.weights, vec![1i64]);
     }
 }

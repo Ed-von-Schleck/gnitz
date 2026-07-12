@@ -172,9 +172,3 @@ class Pipeline:
         fut = self._conn._transport.scan(target_id, include_hidden)
         self._futures.append(fut)
         return fut
-
-    def seek(self, table_id, pk=0, include_hidden=False):
-        """Queue a seek.  Does not ``await`` — sends immediately."""
-        fut = self._conn._transport.seek(table_id, pk, include_hidden)
-        self._futures.append(fut)
-        return fut

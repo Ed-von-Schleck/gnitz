@@ -1,6 +1,8 @@
 use crate::expr::ExprProgram;
 
-pub use gnitz_wire::{agg_output_type, AggFunc, AggKind, JoinKind, MapKind, OpNode, RangeRel, ReduceOutKey};
+pub use gnitz_wire::{
+    agg_output_type, AggFunc, AggKind, JoinKind, MapKind, NodeColumnPayload, NodeFields, OpNode, RangeRel, ReduceOutKey,
+};
 
 pub type NodeId = u64;
 pub type Port = u8;
@@ -14,18 +16,8 @@ pub struct Circuit {
     pub edges: std::collections::BTreeMap<(NodeId, Port), NodeId>,
 }
 
-/// `(opcode, source_table, expr_program_blob)` — the fields of a `nodes`
-/// system-table row excluding the node id (which is added by the caller).
-/// Reused by both `CircuitRows::nodes` and `encode_op_node`. The reindex column
-/// list is stored in `CircuitNodeColumns` under `NODE_COL_KIND_REINDEX`.
-pub type NodeFields = (u64, Option<TableId>, Option<Vec<u8>>);
-
 /// One full row of the `nodes` system table: node id + [`NodeFields`].
 pub type NodeRow = (NodeId, u64, Option<TableId>, Option<Vec<u8>>);
-
-/// One row of the `node_columns` system table:
-/// `(kind, position, value1, value2)` — the node_id is prepended by the caller.
-pub type NodeColumnPayload = (u64, u16, u64, u64);
 
 /// Three-table row bundle materialised from a `Circuit` for a single catalog
 /// write. Each `Vec` is one logical row in the corresponding system table.
@@ -67,7 +59,7 @@ impl Circuit {
     pub fn into_rows(self) -> CircuitRows {
         let mut rows = CircuitRows::default();
         for (nid, op) in self.nodes {
-            let ((opcode, src_tab, expr_blob), kind_rows) = encode_op_node(op);
+            let ((opcode, src_tab, expr_blob), kind_rows) = gnitz_wire::encode_op_node(op);
             rows.nodes.push((nid, opcode, src_tab, expr_blob));
             for (kind, pos, v1, v2) in kind_rows {
                 rows.node_columns.push((nid, kind, pos, v1, v2));
@@ -82,6 +74,11 @@ impl Circuit {
     /// Inverse of [`Circuit::into_rows`]. Reconstructs from the three system
     /// tables. Returns `Err(String)` if the rows describe a malformed graph
     /// (unknown opcode, contradicting node-column kind, etc.).
+    ///
+    /// Test-only: the engine decodes circuits through its own path; the client
+    /// only ever *encodes* (`into_rows`). Kept to exercise the
+    /// `encode_op_node`↔`decode_op_node` round-trip at the graph level.
+    #[cfg(test)]
     pub fn from_rows(view_id: u64, rows: CircuitRows) -> Result<Self, String> {
         // Group node-column rows by node_id so each node sees the relevant slice.
         use std::collections::BTreeMap;
@@ -112,104 +109,6 @@ impl Circuit {
             edges.insert((dst, port), src);
         }
         Ok(Circuit { view_id, nodes, edges })
-    }
-}
-
-fn encode_col_list<I, T>(kind: u64, iter: I) -> Vec<(u64, u16, u64, u64)>
-where
-    I: IntoIterator<Item = T>,
-    T: Into<u64>,
-{
-    iter.into_iter()
-        .enumerate()
-        .map(|(i, v)| (kind, i as u16, v.into(), 0u64))
-        .collect()
-}
-
-/// Like [`encode_col_list`], but carries a per-column promoted target type code
-/// in `value2` (0 = keep/derive from the source type). `.get(i)...unwrap_or(0)`
-/// degrades a short/absent `target_tcs` to "no promotion" instead of panicking.
-fn encode_col_list_with_tcs(kind: u64, cols: &[u16], target_tcs: &[u8]) -> Vec<(u64, u16, u64, u64)> {
-    cols.iter()
-        .enumerate()
-        .map(|(i, &col)| {
-            let v2 = target_tcs.get(i).copied().unwrap_or(0) as u64;
-            (kind, i as u16, col as u64, v2)
-        })
-        .collect()
-}
-
-fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
-    use gnitz_wire::*;
-    match op {
-        OpNode::ScanDelta(tid) => ((OPCODE_SCAN_DELTA, Some(tid), None), Vec::new()),
-        OpNode::ScanTrace(tid) => ((OPCODE_SCAN_TRACE_TABLE, Some(tid), None), Vec::new()),
-        OpNode::Filter(blob) => ((OPCODE_FILTER, None, blob), Vec::new()),
-        OpNode::Map(MapKind::Projection(cols)) => {
-            ((OPCODE_MAP_PROJ, None, None), encode_col_list(NODE_COL_KIND_PROJ, cols))
-        }
-        OpNode::Map(MapKind::Expression {
-            program,
-            reindex_cols,
-            reindex_target_tcs,
-        }) => {
-            let kind_rows = encode_col_list_with_tcs(NODE_COL_KIND_REINDEX, &reindex_cols, &reindex_target_tcs);
-            ((OPCODE_MAP_EXPR, None, Some(program)), kind_rows)
-        }
-        OpNode::Map(MapKind::HashRow(cols, target_tcs, branch_id)) => {
-            let mut kind_rows = encode_col_list_with_tcs(NODE_COL_KIND_PROJ, &cols, &target_tcs);
-            kind_rows.push((NODE_COL_KIND_BRANCH_ID, 0, branch_id as u64, 0));
-            ((OPCODE_MAP_HASH_ROW, None, None), kind_rows)
-        }
-        OpNode::Negate => ((OPCODE_NEGATE, None, None), Vec::new()),
-        OpNode::Union => ((OPCODE_UNION, None, None), Vec::new()),
-        OpNode::Distinct => ((OPCODE_DISTINCT, None, None), Vec::new()),
-        OpNode::PositivePart => ((OPCODE_POSITIVE_PART, None, None), Vec::new()),
-        OpNode::Reduce {
-            group_cols,
-            agg,
-            global_ground,
-            out_key,
-        } => {
-            let mut kind_rows = Vec::with_capacity(group_cols.len() + 4);
-            for (i, c) in group_cols.iter().enumerate() {
-                kind_rows.push((NODE_COL_KIND_GROUP, i as u16, *c as u64, 0));
-            }
-            if let AggKind::Specs(specs) = agg {
-                for (i, (func, col)) in specs.into_iter().enumerate() {
-                    kind_rows.push((NODE_COL_KIND_AGG_SPEC, i as u16, func.as_u64(), col as u64));
-                }
-            }
-            // Only the user's global scalar aggregate carries the row; an
-            // ordinary grouped / range-join reduce omits it (decodes to `false`),
-            // keeping every existing reduce circuit byte-identical on the wire.
-            if global_ground {
-                kind_rows.push((NODE_COL_KIND_GLOBAL_GROUND, 0, 1, 0));
-            }
-            // Sparse-default param row (the GLOBAL_GROUND idiom above): present
-            // iff not `SyntheticFold`; an absent row decodes to the default.
-            if out_key != ReduceOutKey::SyntheticFold {
-                kind_rows.push((NODE_COL_KIND_REDUCE_OUT_KEY, 0, out_key.as_u64(), 0));
-            }
-            ((OPCODE_REDUCE, None, None), kind_rows)
-        }
-        OpNode::Join(JoinKind::DeltaTrace) => ((OPCODE_JOIN_DELTA_TRACE, None, None), Vec::new()),
-        OpNode::Join(JoinKind::DeltaTraceRange { n_eq, rel }) => (
-            (OPCODE_JOIN_DELTA_TRACE_RANGE, None, None),
-            vec![(NODE_COL_KIND_RANGE_JOIN, 0, n_eq as u64, rel.as_u64())],
-        ),
-        OpNode::IntegrateSink => ((OPCODE_INTEGRATE, None, None), Vec::new()),
-        OpNode::IntegrateTrace => ((OPCODE_INTEGRATE_TRACE, None, None), Vec::new()),
-        OpNode::ExchangeShard { shard_cols } => (
-            (OPCODE_EXCHANGE_SHARD, None, None),
-            encode_col_list(NODE_COL_KIND_SHARD, shard_cols),
-        ),
-        OpNode::ExchangeGather => ((OPCODE_EXCHANGE_GATHER, None, None), Vec::new()),
-        OpNode::NullExtend { type_codes } => (
-            (OPCODE_NULL_EXTEND, None, None),
-            encode_col_list(NODE_COL_KIND_NULL_EXT, type_codes),
-        ),
-        OpNode::PartitionFilter => ((OPCODE_PARTITION_FILTER, None, None), Vec::new()),
     }
 }
 

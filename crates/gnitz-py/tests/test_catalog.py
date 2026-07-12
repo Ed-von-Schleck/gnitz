@@ -107,9 +107,9 @@ class TestSchemaDDL:
             client.drop_schema(s1)
 
         # s1.t survives (member intact), s1 still exists, and s2.v is untouched.
-        rtid, _ = client.resolve_table_id(s1, "t")
+        rtid, _ = client.resolve_table(s1, "t")
         assert rtid == tid
-        client.resolve_table_id(s2, "v")
+        client.resolve_table(s2, "v")
 
         # Clean up in dependency order: external view first, then both schemas.
         client.drop_view(s2, "v")
@@ -144,7 +144,7 @@ class TestTableDDL:
         tn = "t" + _uid()
         try:
             tid = client.create_table(sn, tn, cols)
-            resolved_tid, schema = client.resolve_table_id(sn, tn)
+            resolved_tid, schema = client.resolve_table(sn, tn)
             assert resolved_tid == tid
             assert len(schema.columns) == len(cols)
         finally:
@@ -165,7 +165,7 @@ class TestTableDDL:
         tn = "t" + _uid()
         try:
             client.create_table(sn, tn, cols)
-            _, schema = client.resolve_table_id(sn, tn)
+            _, schema = client.resolve_table(sn, tn)
             assert schema.pk_index == 1
         finally:
             try:
@@ -184,7 +184,7 @@ class TestTableDDL:
         tn = "t" + _uid()
         try:
             client.create_table(sn, tn, cols)
-            _, schema = client.resolve_table_id(sn, tn)
+            _, schema = client.resolve_table(sn, tn)
             assert len(schema.columns) == 64
         finally:
             try:

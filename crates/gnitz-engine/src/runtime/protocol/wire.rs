@@ -3,7 +3,7 @@
 use std::rc::Rc;
 
 use crate::foundation::codec;
-use crate::schema::{encode_german_string, try_decode_german_string, type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{encode_german_string, type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{wal_block_size, Batch, MemBatch, MAX_WIRE_REGIONS};
 
 // ---------------------------------------------------------------------------
@@ -20,8 +20,7 @@ pub use gnitz_wire::{
     wire_flags_get_conflict_mode, wire_flags_get_index_version, wire_flags_get_schema_version,
     wire_flags_set_index_version, wire_flags_set_schema_version, WireConflictMode, FLAG_BATCH_CONSOLIDATED,
     FLAG_BATCH_SORTED, FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_GET_INDICES, FLAG_HAS_DATA, FLAG_HAS_SCHEMA,
-    IPC_CONTROL_TID, META_FLAG_IS_PK, META_FLAG_NULLABLE, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK,
-    STATUS_SCHEMA_MISMATCH,
+    META_FLAG_IS_PK, META_FLAG_NULLABLE, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
 };
 
 /// Map a batch's layout claim to its wire flag bits. Encode normalizes
@@ -60,7 +59,6 @@ use gnitz_wire::{WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_T
 // Internal schema descriptors for the wire control and schema blocks
 // ---------------------------------------------------------------------------
 
-const ZERO_COL: SchemaColumn = SchemaColumn::new(0, 0);
 const U64_COL: SchemaColumn = SchemaColumn::new(type_code::U64, 0);
 const STR_COL: SchemaColumn = SchemaColumn::new(type_code::STRING, 0);
 
@@ -71,17 +69,6 @@ const _: () = assert!(
     META_SCHEMA_DESC.num_columns() == 4,
     "META_SCHEMA layout changed; update schema_to_batch and decode_schema_block",
 );
-
-pub(crate) const CONTROL_SCHEMA_DESC: SchemaDescriptor = {
-    let mut cols = [ZERO_COL; gnitz_wire::control::NUM_COLUMNS];
-    let mut i = 0;
-    while i < gnitz_wire::control::NUM_COLUMNS {
-        let c = &gnitz_wire::control::CONTROL_COLS[i];
-        cols[i] = SchemaColumn::new(c.type_code as u8, c.nullable as u8);
-        i += 1;
-    }
-    SchemaDescriptor::new(&cols, &[gnitz_wire::control::COL_MSG_IDX as u32])
-};
 
 // ---------------------------------------------------------------------------
 // WAL block sizing (block framing arithmetic is single-homed in `wal::block_size`)
@@ -258,131 +245,16 @@ pub(crate) fn batch_to_schema(batch: &Batch) -> Result<(SchemaDescriptor, Vec<Ve
 // Encode
 // ---------------------------------------------------------------------------
 
-/// Encode only the ctrl WAL block (no schema, no data) into `out[offset..]`
-/// with checksums skipped. Caller pre-computes `wire_flags` (including
-/// `FLAG_HAS_SCHEMA`, `FLAG_HAS_DATA`, sorted/consolidated bits, etc.) so
-/// this helper can be called after the data block is already written.
-/// Returns bytes written.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_ctrl_block_ipc(
-    out: &mut [u8],
-    offset: usize,
-    target_id: u64,
-    client_id: u64,
-    wire_flags: u64,
-    seek_pk: u128,
-    seek_col_idx: u64,
-    request_id: u64,
-    status: u32,
-    error_msg: &[u8],
-    seek_pk_extra: &[u8],
-    checksum: bool,
-) -> usize {
-    use gnitz_wire::control as ctrl;
-    let cs = CONTROL_SCHEMA_DESC;
-    let mut b = Batch::with_schema(cs, 1);
-    let has_error = !error_msg.is_empty();
-    let has_seek_extra = !seek_pk_extra.is_empty();
-    let null_word: u64 = (if has_error { 0 } else { ctrl::NULL_BIT_ERROR_MSG })
-        | (if has_seek_extra {
-            0
-        } else {
-            ctrl::NULL_BIT_SEEK_PK_EXTRA
-        });
-    b.extend_pk(0u128);
-    b.extend_weight(&1i64.to_le_bytes());
-    b.extend_null_bmp(&null_word.to_le_bytes());
-    b.extend_col(ctrl::PAYLOAD_STATUS, &(status as u64).to_le_bytes());
-    b.extend_col(ctrl::PAYLOAD_CLIENT_ID, &client_id.to_le_bytes());
-    b.extend_col(ctrl::PAYLOAD_TARGET_ID, &target_id.to_le_bytes());
-    b.extend_col(ctrl::PAYLOAD_FLAGS, &wire_flags.to_le_bytes());
-    b.extend_col(ctrl::PAYLOAD_SEEK_PK, &seek_pk.to_le_bytes());
-    b.extend_col(ctrl::PAYLOAD_SEEK_COL_IDX, &seek_col_idx.to_le_bytes());
-    b.extend_col(ctrl::PAYLOAD_REQUEST_ID, &request_id.to_le_bytes());
-    let error_st = if has_error {
-        encode_german_string(error_msg, &mut b.blob)
-    } else {
-        [0u8; 16]
-    };
-    b.extend_col(ctrl::PAYLOAD_ERROR_MSG, &error_st);
-    let seek_extra_st = if has_seek_extra {
-        encode_german_string(seek_pk_extra, &mut b.blob)
-    } else {
-        [0u8; 16]
-    };
-    b.extend_col(ctrl::PAYLOAD_SEEK_PK_EXTRA, &seek_extra_st);
-    b.count = 1;
-    b.encode_to_wire(IPC_CONTROL_TID, out, offset, checksum)
-}
+pub(crate) const CTRL_BLOCK_SIZE_NO_BLOB: usize = gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
 
-// ---------------------------------------------------------------------------
-// Direct ctrl-block encoder (no Batch allocation on the no-error fast path)
-// ---------------------------------------------------------------------------
-//
-// Walks `CONTROL_SCHEMA_DESC` once to derive each region's offset within the
-// ctrl WAL block. Mirrors `wal::encode`'s phase-1 directory walk: directory
-// immediately follows the WAL header, each region is `align8`-padded before
-// its data. The const-time assertion enforces that every region size is a
-// multiple of 8 (so the implicit `align8` is a no-op); a future schema change
-// that introduces an unaligned column fails at compile time.
-const fn ctrl_region_offset(target_region: usize) -> usize {
-    use gnitz_wire::control::NUM_REGIONS;
-    let schema = &CONTROL_SCHEMA_DESC;
-    let pk_idx = schema.pk_index_single() as usize;
-
-    let mut sizes = [0usize; NUM_REGIONS];
-    sizes[0] = schema.pk_stride() as usize; // pk
-    sizes[1] = 8; // weight
-    sizes[2] = 8; // null_bmp
-    let mut pi = 0usize;
-    let mut ci = 0usize;
-    while ci < schema.num_columns() {
-        if ci == pk_idx {
-            ci += 1;
-            continue;
-        }
-        sizes[3 + pi] = schema.columns[ci].size() as usize;
-        pi += 1;
-        ci += 1;
-    }
-    sizes[NUM_REGIONS - 1] = 0; // blob (no-blob path)
-
-    let mut pos = gnitz_wire::WAL_HEADER_SIZE + NUM_REGIONS * 8;
-    let mut r = 0;
-    while r < target_region {
-        assert!(
-            sizes[r] % 8 == 0,
-            "ctrl_region_offset assumes every region size is 8-aligned"
-        );
-        pos += sizes[r];
-        r += 1;
-    }
-    pos
-}
-
-pub(crate) const CTRL_BLOCK_SIZE_NO_BLOB: usize = ctrl_region_offset(gnitz_wire::control::NUM_REGIONS);
-
-const OFF_STATUS: usize = ctrl_region_offset(gnitz_wire::control::REGION_STATUS);
-const OFF_CLIENT_ID: usize = ctrl_region_offset(gnitz_wire::control::REGION_CLIENT_ID);
-const OFF_TARGET_ID: usize = ctrl_region_offset(gnitz_wire::control::REGION_TARGET_ID);
-const OFF_FLAGS: usize = ctrl_region_offset(gnitz_wire::control::REGION_FLAGS);
-const OFF_SEEK_PK: usize = ctrl_region_offset(gnitz_wire::control::REGION_SEEK_PK);
-const OFF_SEEK_COL_IDX: usize = ctrl_region_offset(gnitz_wire::control::REGION_SEEK_COL_IDX);
-const OFF_REQUEST_ID: usize = ctrl_region_offset(gnitz_wire::control::REGION_REQUEST_ID);
-
-static CTRL_BLOCK_TEMPLATE: std::sync::LazyLock<[u8; CTRL_BLOCK_SIZE_NO_BLOB]> = std::sync::LazyLock::new(|| {
-    let mut arr = [0u8; CTRL_BLOCK_SIZE_NO_BLOB];
-    let n = encode_ctrl_block_ipc(&mut arr, 0, 0, 0, 0, 0, 0, 0, 0, b"", b"", false);
-    assert_eq!(n, CTRL_BLOCK_SIZE_NO_BLOB, "ctrl block template size mismatch");
-    arr
-});
-
-/// Direct ctrl-block encoder. On the no-error fast path
-/// (`error_msg.is_empty()`), copies the pre-encoded template and patches the 7
-/// variable fields, avoiding the `Batch` pool allocation and `encode_to_wire`
-/// overhead. Falls back to `encode_ctrl_block_ipc` when an error message is
-/// present (the blob region is variable-size, so the template approach does
-/// not apply).
+/// Encode only the ctrl WAL block (no schema, no data) into `out[offset..]`.
+/// Caller pre-computes `wire_flags` (including `FLAG_HAS_SCHEMA`,
+/// `FLAG_HAS_DATA`, sorted/consolidated bits, etc.) so this helper can be
+/// called after the data block is already written. Returns bytes written.
+///
+/// Thin wrapper over the shared `gnitz_wire::control::encode_ctrl_block`
+/// codec (template-and-patch fast path, German-string blob fallback), which
+/// leaves the checksum field 0 — stamped here for checksummed frames.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(crate) fn encode_ctrl_block_direct(
@@ -399,36 +271,24 @@ pub(crate) fn encode_ctrl_block_direct(
     seek_pk_extra: &[u8],
     checksum: bool,
 ) -> usize {
-    if !error_msg.is_empty() || !seek_pk_extra.is_empty() {
-        return encode_ctrl_block_ipc(
-            out,
-            offset,
-            target_id,
-            client_id,
-            wire_flags,
-            seek_pk,
-            seek_col_idx,
-            request_id,
-            status,
-            error_msg,
-            seek_pk_extra,
-            checksum,
-        );
-    }
-    let buf = &mut out[offset..offset + CTRL_BLOCK_SIZE_NO_BLOB];
-    buf.copy_from_slice(&*CTRL_BLOCK_TEMPLATE);
-    buf[OFF_STATUS..OFF_STATUS + 8].copy_from_slice(&(status as u64).to_le_bytes());
-    buf[OFF_CLIENT_ID..OFF_CLIENT_ID + 8].copy_from_slice(&client_id.to_le_bytes());
-    buf[OFF_TARGET_ID..OFF_TARGET_ID + 8].copy_from_slice(&target_id.to_le_bytes());
-    buf[OFF_FLAGS..OFF_FLAGS + 8].copy_from_slice(&wire_flags.to_le_bytes());
-    buf[OFF_SEEK_PK..OFF_SEEK_PK + 16].copy_from_slice(&seek_pk.to_le_bytes());
-    buf[OFF_SEEK_COL_IDX..OFF_SEEK_COL_IDX + 8].copy_from_slice(&seek_col_idx.to_le_bytes());
-    buf[OFF_REQUEST_ID..OFF_REQUEST_ID + 8].copy_from_slice(&request_id.to_le_bytes());
+    let n = gnitz_wire::control::encode_ctrl_block(
+        out,
+        offset,
+        target_id,
+        client_id,
+        wire_flags,
+        seek_pk,
+        seek_col_idx,
+        request_id,
+        status,
+        error_msg,
+        seek_pk_extra,
+    );
     if checksum {
-        let cs = crate::foundation::xxh::checksum(&buf[gnitz_wire::WAL_HEADER_SIZE..]);
-        buf[WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8].copy_from_slice(&cs.to_le_bytes());
+        let cs = crate::foundation::xxh::checksum(&out[offset + gnitz_wire::WAL_HEADER_SIZE..offset + n]);
+        out[offset + WAL_OFF_CHECKSUM..offset + WAL_OFF_CHECKSUM + 8].copy_from_slice(&cs.to_le_bytes());
     }
-    CTRL_BLOCK_SIZE_NO_BLOB
+    n
 }
 
 /// Blob bytes a German string of length `len` spills into the shared blob
@@ -492,12 +352,7 @@ pub fn wire_size(
     let has_data = data_batch.map(|b| b.count > 0).unwrap_or(false);
     let has_schema = should_include_schema(schema, prebuilt_schema_block, has_data, status);
 
-    let ctrl_blob = german_spill_len(error_msg.len()) + german_spill_len(seek_pk_extra.len());
-    let mut total = if ctrl_blob == 0 {
-        CTRL_BLOCK_SIZE_NO_BLOB
-    } else {
-        schema_wal_block_size(&CONTROL_SCHEMA_DESC, 1, ctrl_blob)
-    };
+    let mut total = gnitz_wire::control::ctrl_block_size(error_msg.len(), seek_pk_extra.len());
 
     if has_schema {
         total += schema_block_wire_size(schema, col_names, prebuilt_schema_block);
@@ -651,12 +506,7 @@ pub fn wire_size_range(
     let has_data = count > 0;
     let has_schema = should_include_schema(schema, prebuilt_schema_block, has_data, status);
 
-    let ctrl_blob = german_spill_len(error_msg.len());
-    let mut total = if ctrl_blob == 0 {
-        CTRL_BLOCK_SIZE_NO_BLOB
-    } else {
-        schema_wal_block_size(&CONTROL_SCHEMA_DESC, 1, ctrl_blob)
-    };
+    let mut total = gnitz_wire::control::ctrl_block_size(error_msg.len(), 0);
 
     if has_schema {
         total += schema_block_wire_size(schema, col_names, prebuilt_schema_block);
@@ -814,25 +664,9 @@ fn encode_wire_into_impl(
 // Decode
 // ---------------------------------------------------------------------------
 
-/// Decoded control fields from a wire message.
-pub struct DecodedControl {
-    pub status: u32,
-    pub client_id: u64,
-    pub target_id: u64,
-    pub flags: u64,
-    pub seek_pk: u128,
-    pub seek_col_idx: u64,
-    pub request_id: u64,
-    pub error_msg: Vec<u8>,
-    /// PK region bytes `16..` for a wide PK; empty for `pk_stride <= 16`.
-    /// Read by the worker SEEK dispatch to reconstruct the full wide-PK key.
-    pub seek_pk_extra: Vec<u8>,
-    /// Total byte length of this control WAL block (read from the WAL size
-    /// field at offset WAL_OFF_SIZE). Callers that need to advance past the
-    /// ctrl block to find the schema/data blocks use this directly instead of
-    /// re-reading the WAL header.
-    pub block_size: usize,
-}
+/// Decoded control fields + directory-driven control-block decoder — the
+/// shared codec both ends run.
+pub use gnitz_wire::control::{peek_control_block, DecodedControl};
 
 /// Full decoded wire message.
 pub struct DecodedWire {
@@ -868,117 +702,6 @@ fn wal_dir_entry(data: &[u8], r: usize) -> (usize, usize) {
     let off = codec::read_u32_le(data, base) as usize;
     let sz = codec::read_u32_le(data, base + 4) as usize;
     (off, sz)
-}
-
-/// Bounds-checked read of a u64 from a fixed-width u64 region of a 1-row
-/// control block (exactly 8 bytes for 1 row).
-#[inline(always)]
-fn read_u64_region(data: &[u8], r: usize) -> Result<u64, &'static str> {
-    let (off, sz) = wal_dir_entry(data, r);
-    if sz < 8 || off.saturating_add(8) > data.len() {
-        return Err("control block region out of bounds");
-    }
-    Ok(codec::read_u64_le(data, off))
-}
-
-/// Bounds-checked read of a u128 from a fixed-width u128 region of a 1-row
-/// control block (exactly 16 bytes for 1 row).
-#[inline(always)]
-fn read_u128_region(data: &[u8], r: usize) -> Result<u128, &'static str> {
-    let (off, sz) = wal_dir_entry(data, r);
-    if sz < 16 || off.saturating_add(16) > data.len() {
-        return Err("control block u128 region out of bounds");
-    }
-    Ok(codec::read_u128_le(data, off))
-}
-
-/// Decode all control fields directly from the WAL block's directory without
-/// allocating a `Batch`. Each directory entry stores (data_offset: u32,
-/// data_size: u32) at `HEADER_SIZE + region * 8`. For a 1-row control block
-/// every u64 region is exactly 8 bytes, so we can index the fields directly.
-pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
-    use gnitz_wire::control as ctrl;
-
-    let dir_end = gnitz_wire::WAL_HEADER_SIZE + ctrl::NUM_REGIONS * 8;
-    if data.len() < dir_end {
-        return Err("control block too small");
-    }
-
-    // Validate WAL version and region count without computing the checksum.
-    let version = codec::read_u32_le(data, WAL_OFF_VERSION);
-    if version != gnitz_wire::WAL_FORMAT_VERSION {
-        return Err("control block wrong version");
-    }
-    let num_regions = codec::read_u32_le(data, WAL_OFF_NUM_REGIONS);
-    if num_regions as usize != ctrl::NUM_REGIONS {
-        return Err("control block wrong region count");
-    }
-
-    let null_bmp = read_u64_region(data, ctrl::REGION_NULL_BMP)?;
-    let status = read_u64_region(data, ctrl::REGION_STATUS)? as u32;
-    let client_id = read_u64_region(data, ctrl::REGION_CLIENT_ID)?;
-    let target_id = read_u64_region(data, ctrl::REGION_TARGET_ID)?;
-    let flags = read_u64_region(data, ctrl::REGION_FLAGS)?;
-    let seek_pk = read_u128_region(data, ctrl::REGION_SEEK_PK)?;
-    let seek_col_idx = read_u64_region(data, ctrl::REGION_SEEK_COL_IDX)?;
-    let request_id = read_u64_region(data, ctrl::REGION_REQUEST_ID)?;
-
-    let error_is_null = (null_bmp & ctrl::NULL_BIT_ERROR_MSG) != 0;
-    let seek_extra_is_null = (null_bmp & ctrl::NULL_BIT_SEEK_PK_EXTRA) != 0;
-
-    // error_msg and seek_pk_extra each own a 16-byte German-string struct in
-    // their own fixed region but spill overflow (>12B) into the shared blob
-    // region. Resolve that directory entry once, and only if at least one is
-    // non-null. When both are null (the universal case until a wide-PK send
-    // path exists) skip the lookup entirely, preserving the hot-path fast case.
-    let blob: &[u8] = if !error_is_null || !seek_extra_is_null {
-        let (blob_off, blob_sz) = wal_dir_entry(data, ctrl::REGION_BLOB);
-        if blob_sz > 0 && blob_off.saturating_add(blob_sz) <= data.len() {
-            &data[blob_off..blob_off + blob_sz]
-        } else {
-            &[]
-        }
-    } else {
-        &[]
-    };
-
-    let error_msg = if error_is_null {
-        Vec::new()
-    } else {
-        let (err_off, err_sz) = wal_dir_entry(data, ctrl::REGION_ERROR_MSG);
-        if err_sz < 16 || err_off.saturating_add(16) > data.len() {
-            return Err("error_msg region out of bounds");
-        }
-        let mut st = [0u8; 16];
-        st.copy_from_slice(&data[err_off..err_off + 16]);
-        try_decode_german_string(&st, blob).ok_or("error_msg string offset out of bounds")?
-    };
-
-    let seek_pk_extra = if seek_extra_is_null {
-        Vec::new()
-    } else {
-        let (sx_off, sx_sz) = wal_dir_entry(data, ctrl::REGION_SEEK_PK_EXTRA);
-        if sx_sz < 16 || sx_off.saturating_add(16) > data.len() {
-            return Err("seek_pk_extra region out of bounds");
-        }
-        let mut st = [0u8; 16];
-        st.copy_from_slice(&data[sx_off..sx_off + 16]);
-        try_decode_german_string(&st, blob).ok_or("seek_pk_extra string offset out of bounds")?
-    };
-
-    let block_size = codec::read_u32_le(data, WAL_OFF_SIZE) as usize;
-    Ok(DecodedControl {
-        status,
-        client_id,
-        target_id,
-        flags,
-        seek_pk,
-        seek_col_idx,
-        request_id,
-        error_msg,
-        seek_pk_extra,
-        block_size,
-    })
 }
 
 fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescriptor, &'static str> {
@@ -1375,7 +1098,7 @@ mod tests {
             {
                 let mut a = BatchAppender::new(&mut b, s);
                 for i in 0..n {
-                    a.add_row(((oid << 9) | i as u64) as u128, 1)
+                    a.add_row(gnitz_wire::pack_col_id(oid, i as u64).unwrap() as u128, 1)
                         .u64_val(oid)
                         .u64_val(kind)
                         .u64_val(i as u64)
@@ -1654,7 +1377,7 @@ mod tests {
             use gnitz_core::protocol::codec::{schema_to_batch, batch_to_schema};
             use gnitz_core::protocol::types::meta_schema;
             use gnitz_core::protocol::wal_block::{
-                encode_wal_block, decode_wal_block, VerifyChecksum,
+                decode_wal_block_verified, encode_wal_block,
             };
 
             let original = &original;
@@ -1663,7 +1386,7 @@ mod tests {
             let batch = schema_to_batch(&client);
             let encoded = encode_wal_block(ms, 0, &batch);
             let (decoded_batch, _) =
-                decode_wal_block(&encoded, ms, VerifyChecksum::Yes).unwrap();
+                decode_wal_block_verified(&encoded, ms).unwrap();
             let reconstructed = batch_to_schema(&decoded_batch).unwrap();
             prop_assert_eq!(client, reconstructed);
         }
@@ -1673,7 +1396,7 @@ mod tests {
         fn schema_cross_codec_engine_to_client(original in arb_schema(gnitz_wire::PK_LIST_MAX_COLS)) {
             use gnitz_core::protocol::codec::batch_to_schema;
             use gnitz_core::protocol::types::meta_schema;
-            use gnitz_core::protocol::wal_block::{decode_wal_block, VerifyChecksum};
+            use gnitz_core::protocol::wal_block::decode_wal_block_verified;
 
             let original = &original;
             let names: Vec<Vec<u8>> = (0..original.num_columns())
@@ -1684,7 +1407,7 @@ mod tests {
 
             let ms = meta_schema();
             let (decoded_batch, _) =
-                decode_wal_block(&wire, ms, VerifyChecksum::Yes)
+                decode_wal_block_verified(&wire, ms)
                     .expect("client failed to decode engine-encoded WAL block");
             let client_schema = batch_to_schema(&decoded_batch)
                 .expect("client failed to parse meta batch");
@@ -1824,31 +1547,14 @@ mod tests {
         );
     }
 
-    /// A control block whose error_msg German-string struct points past the
-    /// blob must surface an error, not panic, when peeked.
-    #[test]
-    fn peek_control_block_rejects_oob_error_msg_offset() {
-        use gnitz_wire::control as ctrl;
-        let long_msg = b"this error message exceeds twelve bytes so it spills into the blob";
-        let mut buf = vec![0u8; 512];
-        let written = encode_ctrl_block_ipc(&mut buf, 0, 1, 2, 0, 0, 0, 0, 1, long_msg, b"", true);
-        buf.truncate(written);
-        // Corrupt the long-string blob offset (struct bytes [8..16]) to overflow.
-        let (err_off, _) = wal_dir_entry(&buf, ctrl::REGION_ERROR_MSG);
-        buf[err_off + 8..err_off + 16].copy_from_slice(&u64::MAX.to_le_bytes());
-        match peek_control_block(&buf) {
-            Err("error_msg string offset out of bounds") => {}
-            Err(other) => panic!("wrong error: {other}"),
-            Ok(_) => panic!("OOB error_msg offset must be rejected"),
-        }
-    }
-
-    /// Byte-level cross-crate consistency check: the engine encoder
-    /// (`encode_ctrl_block_ipc`) and the client encoder
-    /// (`gnitz_core::protocol::message::encode_control_block`) must produce
-    /// identical bytes for the same logical message.  Any drift in column
-    /// ordering between `CONTROL_SCHEMA_DESC` and `control_schema()` would
-    /// cause silent corruption on the other side of the wire.
+    /// Byte-level cross-crate consistency check: the engine wrapper
+    /// (`encode_ctrl_block_direct`, checksum stamped via `foundation::xxh`)
+    /// and the client wrapper
+    /// (`gnitz_core::protocol::message::encode_control_block`, checksum
+    /// stamped via `xxhash-rust`) must produce identical bytes for the same
+    /// logical message — pinning that the two wrappers over the shared
+    /// `gnitz_wire::control` codec (and their two XXH3 implementations)
+    /// cannot drift.
     #[test]
     fn test_ctrl_block_client_server_byte_equality() {
         use gnitz_core::protocol::header::Header;
@@ -1891,10 +1597,10 @@ mod tests {
                 seek_col_idx,
                 request_id,
             };
-            let client_bytes = encode_control_block(&header, error_msg, &[]).expect("encode_control_block failed");
+            let client_bytes = encode_control_block(&header, error_msg, &[]);
 
             let mut engine_buf = vec![0u8; client_bytes.len() + 64];
-            let written = encode_ctrl_block_ipc(
+            let written = encode_ctrl_block_direct(
                 &mut engine_buf,
                 0,
                 target_id,

@@ -1,47 +1,6 @@
 use crate::protocol::{ColumnDef, Schema};
 use std::sync::OnceLock;
 
-pub use gnitz_wire::{
-    // Aggregates
-    AGG_COUNT,
-    AGG_COUNT_NON_NULL,
-    AGG_MAX,
-    AGG_MIN,
-    AGG_SUM,
-    AGG_SUM_ZERO,
-    CIRCUIT_EDGES_TAB,
-    // System table IDs
-    CIRCUIT_NODES_TAB,
-    CIRCUIT_NODE_COLUMNS_TAB,
-    // Opcodes
-    OPCODE_DISTINCT,
-    OPCODE_EXCHANGE_GATHER,
-    OPCODE_EXCHANGE_SHARD,
-    OPCODE_FILTER,
-    OPCODE_INTEGRATE,
-    OPCODE_INTEGRATE_TRACE,
-    OPCODE_JOIN_DELTA_TRACE,
-    OPCODE_JOIN_DELTA_TRACE_RANGE,
-    OPCODE_MAP,
-    OPCODE_MAP_EXPR,
-    OPCODE_MAP_PROJ,
-    OPCODE_NEGATE,
-    OPCODE_NULL_EXTEND,
-    OPCODE_PARTITION_FILTER,
-    OPCODE_POSITIVE_PART,
-    OPCODE_REDUCE,
-    OPCODE_SCAN_DELTA,
-    OPCODE_UNION,
-    // Owner kinds
-    OWNER_KIND_TABLE,
-    OWNER_KIND_VIEW,
-    // Ports
-    PORT_IN,
-    PORT_IN_A,
-    PORT_IN_B,
-    PORT_TRACE,
-};
-
 // --- Schema constructor functions ---
 //
 // Every system-table schema is derived from the shared `gnitz-wire` column

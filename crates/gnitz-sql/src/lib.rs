@@ -45,13 +45,23 @@ impl<'a> SqlPlanner<'a> {
     }
 
     /// Parse `sql` and execute each statement, returning one `SqlResult` per statement.
+    ///
+    /// Each statement's catalog reads run against a **statement-scoped
+    /// snapshot**: the first read of each system table scans it over the wire
+    /// once, and every later read within the same statement's planning is
+    /// served from that in-memory copy (one relation resolution otherwise costs
+    /// 3-4 full-system-table wire scans, repeated per relation). The snapshot is
+    /// dropped at the end of each statement — one statement, one snapshot, no
+    /// cross-statement state — so the next statement sees this one's DDL writes.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<SqlResult>, GnitzSqlError> {
         let dialect = GenericDialect {};
         let stmts = Parser::parse_sql(&dialect, sql)?;
         let mut results = Vec::with_capacity(stmts.len());
         for stmt in &stmts {
-            let r = dispatch::execute_statement(self.client, &self.schema_name, stmt)?;
-            results.push(r);
+            self.client.begin_catalog_snapshot();
+            let r = dispatch::execute_statement(self.client, &self.schema_name, stmt);
+            self.client.end_catalog_snapshot();
+            results.push(r?);
         }
         Ok(results)
     }

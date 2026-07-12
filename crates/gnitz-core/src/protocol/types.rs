@@ -382,28 +382,6 @@ impl PkColumn {
             }
         }
     }
-    pub fn set_u128(&mut self, i: usize, pk: u128) {
-        match self {
-            PkColumn::U64s(v) => v[i] = pk as u64,
-            PkColumn::U128s(v) => v[i] = pk,
-            PkColumn::Bytes { .. } => panic!("wide PK has no u128 projection"),
-        }
-    }
-    pub fn swap(&mut self, i: usize, j: usize) {
-        match self {
-            PkColumn::U64s(v) => v.swap(i, j),
-            PkColumn::U128s(v) => v.swap(i, j),
-            PkColumn::Bytes { stride, buf } => {
-                if i == j {
-                    return;
-                }
-                let s = *stride as usize;
-                let (lo, hi) = if i < j { (i, j) } else { (j, i) };
-                let (left, right) = buf.split_at_mut(hi * s);
-                left[lo * s..lo * s + s].swap_with_slice(&mut right[..s]);
-            }
-        }
-    }
     pub fn clear(&mut self) {
         match self {
             PkColumn::U64s(v) => v.clear(),
@@ -418,6 +396,10 @@ impl PkColumn {
             PkColumn::Bytes { stride, buf } => buf.truncate(len * *stride as usize),
         }
     }
+    /// Project the PK column to a `Vec<u128>` (widening U64s). Panics for a
+    /// wide compound PK, which has no scalar projection. Test-only: the sole
+    /// surviving comparison form for `assert_eq!(pks.to_vec_u128(), expected)`.
+    #[cfg(test)]
     pub fn to_vec_u128(&self) -> Vec<u128> {
         match self {
             PkColumn::U64s(v) => v.iter().map(|&x| x as u128).collect(),
@@ -492,14 +474,6 @@ impl PkColumn {
             }
         }
     }
-
-    /// One-row column matching `schema`'s PK layout, initialized with
-    /// `pk`'s bytes.
-    pub fn one_row(schema: &Schema, pk: &PkTuple) -> Self {
-        let mut col = Self::empty_for_schema(schema);
-        col.push_tuple(pk);
-        col
-    }
 }
 
 /// SQL→client carrier for one row's PK. Carries `(stride, bytes)` so callers
@@ -570,16 +544,6 @@ impl PkTuple {
         &self.buf[..self.stride as usize]
     }
 
-    /// The PK's value as a `u128`, or `None` for a wide PK (stride > 16) that
-    /// has no scalar projection and must use the byte path (`split_wire`).
-    pub fn to_u128(&self) -> Option<u128> {
-        (self.stride as usize <= 16).then(|| {
-            let mut b = [0u8; 16];
-            b[..self.stride as usize].copy_from_slice(self.as_bytes());
-            u128::from_le_bytes(b)
-        })
-    }
-
     /// Split the tuple into the wire form `(seek_pk: u128, seek_pk_extra: &[u8])`.
     /// For narrow PKs (stride ≤ 16) `extra` is empty and the frame is byte-
     /// identical to the pre-compound-PK path.
@@ -614,19 +578,6 @@ impl std::fmt::Debug for PkTuple {
             .field("stride", &self.stride)
             .field("bytes", &self.as_bytes())
             .finish()
-    }
-}
-
-impl PartialEq<Vec<u128>> for PkColumn {
-    fn eq(&self, other: &Vec<u128>) -> bool {
-        if self.len() != other.len() {
-            return false;
-        }
-        match self {
-            PkColumn::U64s(v) => v.iter().zip(other).all(|(&a, &b)| a as u128 == b),
-            PkColumn::U128s(v) => v.as_slice() == other.as_slice(),
-            PkColumn::Bytes { .. } => panic!("cannot compare wide PK against Vec<u128>"),
-        }
     }
 }
 
@@ -742,40 +693,10 @@ impl ZSetBatch {
         (0..self.len()).filter(move |&i| self.weights[i] > 0)
     }
 
-    /// Append all rows from `other` into `self`. Panics if column layouts differ.
-    pub fn extend_from(&mut self, other: &ZSetBatch) {
-        assert_eq!(
-            self.columns.len(),
-            other.columns.len(),
-            "extend_from: column count mismatch (self {}, other {})",
-            self.columns.len(),
-            other.columns.len(),
-        );
-        match (&mut self.pks, &other.pks) {
-            (PkColumn::U64s(a), PkColumn::U64s(b)) => a.extend_from_slice(b),
-            (PkColumn::U128s(a), PkColumn::U128s(b)) => a.extend_from_slice(b),
-            (PkColumn::Bytes { stride: sa, buf: a }, PkColumn::Bytes { stride: sb, buf: b }) => {
-                assert_eq!(sa, sb, "extend_from: wide PK stride mismatch");
-                a.extend_from_slice(b);
-            }
-            _ => panic!("extend_from: pk column type mismatch"),
-        }
-        self.weights.extend_from_slice(&other.weights);
-        self.nulls.extend_from_slice(&other.nulls);
-        for (a, b) in self.columns.iter_mut().zip(other.columns.iter()) {
-            match (a, b) {
-                (ColData::Fixed(a), ColData::Fixed(b)) => a.extend_from_slice(b),
-                (ColData::Strings(a), ColData::Strings(b)) => a.extend(b.iter().cloned()),
-                (ColData::Bytes(a), ColData::Bytes(b)) => a.extend(b.iter().cloned()),
-                (ColData::U128s(a), ColData::U128s(b)) => a.extend_from_slice(b),
-                _ => panic!("extend_from: column type mismatch"),
-            }
-        }
-    }
-
-    /// Like `extend_from` but consumes `other`, moving its String/Bytes buffers
-    /// instead of deep-cloning each value. O(n) pointer copies, zero heap
-    /// allocation for string/bytes content. Used in scan continuation loops.
+    /// Append all rows from `other` into `self`, consuming it and moving its
+    /// String/Bytes buffers instead of deep-cloning each value. O(n) pointer
+    /// copies, zero heap allocation for string/bytes content. Panics if column
+    /// layouts differ. Used in scan continuation loops.
     pub fn extend_from_owned(&mut self, mut other: ZSetBatch) {
         assert_eq!(
             self.columns.len(),
@@ -1618,13 +1539,13 @@ mod tests {
         };
         let mut a = ZSetBatch::new(&schema1);
         let b = ZSetBatch::new(&schema2);
-        a.extend_from(&b);
+        a.extend_from_owned(b);
     }
 
-    /// `extend_from_owned` (move) must produce byte-identical results to
-    /// `extend_from` (clone) for schemas with String and Bytes columns.
+    /// `extend_from_owned` (move) concatenates rows across String and Bytes
+    /// columns, preserving values and moving the heap buffers.
     #[test]
-    fn test_extend_from_owned_matches_extend_from() {
+    fn test_extend_from_owned_concatenates() {
         let schema = Schema {
             columns: vec![
                 ColumnDef::new("pk", TypeCode::U64, false),
@@ -1645,16 +1566,25 @@ mod tests {
             z
         };
 
-        // Reference path: clone-based extend_from.
-        let mut acc_ref = build(1);
-        acc_ref.extend_from(&build(10));
+        let mut acc = build(1);
+        acc.extend_from_owned(build(10));
 
-        // Move-based extend_from_owned over identically-built inputs.
-        let mut acc_owned = build(1);
-        acc_owned.extend_from_owned(build(10));
-
-        assert_eq!(acc_ref, acc_owned, "extend_from_owned must match extend_from");
-        assert_eq!(acc_owned.len(), 4);
+        assert_eq!(acc.len(), 4);
+        // Values from both halves survive in order.
+        assert_eq!(acc.pks.to_vec_u128(), vec![1u128, 2, 10, 11]);
+        assert_eq!(acc.weights, vec![1, -1, 1, -1]);
+        match &acc.columns[1] {
+            ColData::Strings(v) => assert_eq!(
+                v,
+                &[
+                    Some("hello world is long enough".to_string()),
+                    Some("short".to_string()),
+                    Some("hello world is long enough".to_string()),
+                    Some("short".to_string()),
+                ]
+            ),
+            _ => panic!("expected Strings"),
+        }
     }
 
     #[test]
@@ -1724,7 +1654,7 @@ mod tests {
             a.add_row(3u128, -1).u64_val(30);
         }
         assert_eq!(batch.len(), 3);
-        assert_eq!(batch.pks, vec![1u128, 2u128, 3u128]);
+        assert_eq!(batch.pks.to_vec_u128(), vec![1u128, 2u128, 3u128]);
         assert_eq!(batch.weights, vec![1, 1, -1]);
         if let ColData::Fixed(buf) = &batch.columns[1] {
             assert_eq!(buf.len(), 24);
@@ -1972,24 +1902,6 @@ mod tests {
         assert!(batch.validate(&schema).is_ok());
     }
 
-    // --- Site B: PkTuple::to_u128 ---
-
-    #[test]
-    fn pk_tuple_to_u128_narrow() {
-        let uuid_bytes: [u8; 16] = [
-            0x00, 0x44, 0x44, 0x55, 0x16, 0xa7, 0xd4, 0x41, 0x9b, 0xe2, 0x00, 0x84, 0x0e, 0x55, 0x0e, 0x55,
-        ];
-        let t = PkTuple::from_bytes(&uuid_bytes);
-        assert_eq!(t.to_u128(), Some(u128::from_le_bytes(uuid_bytes)));
-    }
-
-    #[test]
-    fn pk_tuple_to_u128_wide_returns_none() {
-        // stride 24 = three U64 PKs; no scalar projection.
-        let t = PkTuple::from_bytes(&[0u8; 24]);
-        assert_eq!(t.to_u128(), None);
-    }
-
     // --- Site C: PkTuple::from_bytes ---
 
     #[test]
@@ -2035,7 +1947,7 @@ mod tests {
 
     #[test]
     fn str_null_self_sufficiency_round_trips_as_null() {
-        use crate::protocol::wal_block::{decode_wal_block, encode_wal_block, VerifyChecksum};
+        use crate::protocol::wal_block::{decode_wal_block_verified, encode_wal_block};
         let schema = nullable_str_blob_schema();
         let mut batch = ZSetBatch::new(&schema);
         {
@@ -2044,7 +1956,7 @@ mod tests {
             a.add_row(42, 1).str_null().bytes_null();
         }
         let encoded = encode_wal_block(&schema, 1, &batch);
-        let (decoded, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, _) = decode_wal_block_verified(&encoded, &schema).unwrap();
         assert_eq!(decoded.nulls[0], batch.nulls[0], "null bitmap round-trips");
         // The read side gates on the bitmap, so both columns must decode as NULL.
         assert_eq!(
