@@ -87,10 +87,11 @@ no committer commit-path logic.
   does the same with the sorted lock union. These lock holds are the
   race-free window in which a precondition check and the commit are one
   atomic step.
-- **Wire real estate:** `1 << 58` is allocated to `FLAG_PUSH_TXN` by the
-  transaction-frame work this plan extends (in the live tree the top bit
-  is `FLAG_DDL_TXN = 1 << 57`); `1 << 59` is free (`gnitz-wire/src/flags.rs:11-62`,
-  disjointness guard `flags.rs:83-118`). Status codes 0-3 are used
+- **Wire real estate:** `1 << 61` is allocated to `FLAG_PUSH_TXN` by the
+  transaction-frame work this plan extends (the taken high bits are
+  `FLAG_DDL_TXN = 1 << 57` and `FLAG_ALLOCATE_{TABLE,SCHEMA,INDEX}_ID = 1 << 58
+  .. 1 << 60`, `gnitz-wire/src/flags.rs:65-71`); the next free high bit is
+  `1 << 62` (disjointness guard `flags.rs:97-129`). Status codes 0-3 are used
   (`STATUS_OK/ERROR/SCHEMA_MISMATCH/NO_INDEX`, `flags.rs:191-200`); 4 is
   free. Client errors flatten into one `GnitzError` exception in Python
   today (`gnitz-py/src/lib.rs:24-33`); `ClientError` is the only
@@ -182,9 +183,9 @@ counter", `catalog/partition_lsn.rs:334-349`). Committed fix, two parts:
 
 ## Wire changes
 
-- `pub const FLAG_GET_LSN: u64 = 1 << 59;` — a master-only watermark
+- `pub const FLAG_GET_LSN: u64 = 1 << 62;` — a master-only watermark
   read, added to the compile-time disjointness guard
-  (`flags.rs:83-118`). Request: header-only frame (`target_id = 0`),
+  (`flags.rs:97-129`). Request: header-only frame (`target_id = 0`),
   mirroring `alloc_table_id`'s shape (`connection.rs:87-89`). Reply:
   standard ACK with `seek_pk = lsn_alloc.published()`. No locks, no
   fanout, no catalog access; handled in the executor's `target_id == 0`
