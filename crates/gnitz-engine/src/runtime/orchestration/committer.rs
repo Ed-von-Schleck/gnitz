@@ -27,13 +27,13 @@
 use super::executor::{TickTrigger, TICK_COALESCE_ROWS};
 use super::guard_panic;
 use crate::runtime::lsn::ZoneLsnAllocator;
-use crate::runtime::master::{first_worker_error_opt, MasterDispatcher};
+use crate::runtime::master::{first_worker_error_opt, MasterDispatcher, TxnFamily, TxnFit};
 use crate::runtime::reactor::{join_into, mpsc, oneshot, select2, AsyncMutex, Either, Reactor, ReplyFuture};
 use crate::runtime::sal::{FLAG_FLUSH, FLAG_FLUSH_EPH};
 use crate::runtime::wire::{DecodedWire, WireConflictMode};
 use crate::storage::Batch;
 use rustc_hash::FxHashMap;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 const MAX_PENDING_ROWS: usize = 100_000;
@@ -49,12 +49,25 @@ pub enum CommitRequest {
         mode: WireConflictMode,
         done: oneshot::Sender<Result<u64, String>>,
     },
+    /// An atomic user-table transaction: N families emitted as N `FLAG_PUSH`
+    /// groups inside one zone under one sentinel, with a single `done` for the
+    /// whole bundle. Validated and lock-guarded by the executor before it
+    /// reaches here.
+    Txn(PendingTxn),
     /// Drain any in-flight batch and signal via `done`. `kind` decides how
     /// the barrier interacts with a checkpoint sequence (see `BarrierKind`).
     Barrier {
         kind: BarrierKind,
         done: oneshot::Sender<()>,
     },
+}
+
+/// One buffered atomic transaction awaiting commit: its families in frame order
+/// and one `done` resolving `Ok(zone_lsn)` for the whole bundle (or the first
+/// family error on a pre-sentinel abort).
+pub struct PendingTxn {
+    pub families: Vec<TxnFamily>,
+    pub done: oneshot::Sender<Result<u64, String>>,
 }
 
 /// Who issued a `CommitRequest::Barrier`, and therefore how the committer
@@ -103,6 +116,13 @@ pub struct Shared {
     /// executor so SCAN/SEEK responses report the same LSN commits publish.
     pub lsn_alloc: Rc<ZoneLsnAllocator>,
     pub num_workers: usize,
+    /// One-shot "checkpoint before the next batch" request, set by `commit_pushes`
+    /// when a transaction is rejected because it doesn't fit the SAL's remaining
+    /// space (transient overflow) yet the cursor is below the checkpoint
+    /// threshold. Consumed with `take()` in `run`'s checkpoint decision, so the
+    /// client's retry finds a reclaimed SAL and fits — even on an otherwise-idle
+    /// server where `sal_needs_checkpoint()` would stay false.
+    pub force_checkpoint: Cell<bool>,
     pub tick_rows: Rc<RefCell<FxHashMap<i64, usize>>>,
     pub tick_tids: Rc<RefCell<Vec<i64>>>,
     /// Tick-trigger sender: fires the auto-tick after large commits, and drives
@@ -152,7 +172,7 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
         // Drain any additional requests already queued — no timer wait.
         // Pipelined clients still get batched; serial clients don't pay
         // a latency tax.
-        let (pushes, barriers) = debounce_drain(&mut rx, first);
+        let (pushes, txns, barriers) = debounce_drain(&mut rx, first);
 
         // Checkpoint decision for the whole batch, barrier-only batches
         // included: relay_loop's low-space barrier arrives precisely to
@@ -165,23 +185,29 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
         // workers.
         let has_barriers = !barriers.is_empty();
         let forced = barriers.iter().any(|(k, _)| *k == BarrierKind::Shutdown);
-        let checkpoint =
-            forced || shared.disp().sal_needs_checkpoint() || (has_barriers && !shared.disp().sal_has_relay_space());
+        // Consume the one-shot force_checkpoint unconditionally (a transaction
+        // that didn't fit the SAL's remaining space set it), so the retry finds
+        // a reclaimed SAL even when `sal_needs_checkpoint()` is still false.
+        let force_ckpt = shared.force_checkpoint.take();
+        let checkpoint = forced
+            || force_ckpt
+            || shared.disp().sal_needs_checkpoint()
+            || (has_barriers && !shared.disp().sal_has_relay_space());
 
-        let (pushes, barriers) = if checkpoint {
+        let (pushes, txns, barriers) = if checkpoint {
             // The full three-step sequence: gen bump → base round → drain →
             // ephemeral round. It signals the reclaim barriers right after
             // step 1 (so relay_loop unparks before the drain), defers the
-            // DDL/Shutdown barriers to the end, and holds pushes through the
+            // DDL/Shutdown barriers to the end, and holds pushes/txns through the
             // sequence — folding any that arrive mid-drain into the returned
             // batch.
-            run_checkpoint_sequence(&mut rx, &shared, &mut fut_slots, &mut ack_slots, barriers, pushes).await
+            run_checkpoint_sequence(&mut rx, &shared, &mut fut_slots, &mut ack_slots, barriers, pushes, txns).await
         } else {
-            (pushes, barriers)
+            (pushes, txns, barriers)
         };
 
-        if !pushes.is_empty() {
-            commit_pushes(&shared, pushes, &mut fut_slots, &mut ack_slots, &mut merge_pool).await;
+        if !pushes.is_empty() || !txns.is_empty() {
+            commit_pushes(&shared, pushes, txns, &mut fut_slots, &mut ack_slots, &mut merge_pool).await;
         }
 
         if has_barriers {
@@ -193,9 +219,14 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
     }
 }
 
-/// One debounced committer batch: the pushes to group-commit plus the barrier
-/// senders to signal once the batch (and any checkpoint sequence) completes.
-type PendingBatch = (Vec<PendingPush>, Vec<(BarrierKind, oneshot::Sender<()>)>);
+/// One debounced committer batch: the single pushes to group-commit, the atomic
+/// transactions to commit, plus the barrier senders to signal once the batch
+/// (and any checkpoint sequence) completes.
+type PendingBatch = (
+    Vec<PendingPush>,
+    Vec<PendingTxn>,
+    Vec<(BarrierKind, oneshot::Sender<()>)>,
+);
 
 /// Sort `first` into `pushes`/`barriers`, then drain additional requests
 /// without waiting: if the channel has items ready, pull them all;
@@ -205,6 +236,7 @@ type PendingBatch = (Vec<PendingPush>, Vec<(BarrierKind, oneshot::Sender<()>)>);
 /// `try_recv` sees a non-empty queue.
 fn debounce_drain(rx: &mut mpsc::Receiver<CommitRequest>, first: CommitRequest) -> PendingBatch {
     let mut pushes = Vec::new();
+    let mut txns: Vec<PendingTxn> = Vec::new();
     let mut barriers = Vec::new();
     let mut row_count: usize = 0;
     match first {
@@ -216,6 +248,12 @@ fn debounce_drain(rx: &mut mpsc::Receiver<CommitRequest>, first: CommitRequest) 
                 mode,
                 done,
             });
+        }
+        // A transaction is one indivisible entry — its whole family set rides
+        // this batch; its row count is the sum of every family's rows.
+        CommitRequest::Txn(txn) => {
+            row_count = txn.families.iter().map(|f| f.batch.count).sum();
+            txns.push(txn);
         }
         CommitRequest::Barrier { kind, done } => barriers.push((kind, done)),
     }
@@ -230,6 +268,10 @@ fn debounce_drain(rx: &mut mpsc::Receiver<CommitRequest>, first: CommitRequest) 
                     done,
                 });
             }
+            Some(CommitRequest::Txn(txn)) => {
+                row_count += txn.families.iter().map(|f| f.batch.count).sum::<usize>();
+                txns.push(txn);
+            }
             Some(CommitRequest::Barrier { kind, done }) => {
                 // Stop at the first barrier: requests queued after it are
                 // logically younger than whatever issued the barrier (a DDL, or a
@@ -243,7 +285,7 @@ fn debounce_drain(rx: &mut mpsc::Receiver<CommitRequest>, first: CommitRequest) 
             None => break,
         }
     }
-    (pushes, barriers)
+    (pushes, txns, barriers)
 }
 
 /// Emit one broadcast flush group and reset the SAL, holding `sal_writer_excl`
@@ -306,6 +348,7 @@ async fn flush_round(
 /// quiesce → ephemeral round. Signals the reclaim barriers right after step 1
 /// and returns the held pushes (folded with any that arrived mid-drain) plus
 /// the deferred DDL/Shutdown barriers for the caller to commit and signal.
+#[allow(clippy::too_many_arguments)]
 async fn run_checkpoint_sequence(
     rx: &mut mpsc::Receiver<CommitRequest>,
     shared: &Rc<Shared>,
@@ -313,6 +356,7 @@ async fn run_checkpoint_sequence(
     ack_slots: &mut Vec<Option<DecodedWire>>,
     barriers: Vec<(BarrierKind, oneshot::Sender<()>)>,
     mut held_pushes: Vec<PendingPush>,
+    mut held_txns: Vec<PendingTxn>,
 ) -> PendingBatch {
     // Step 0: gen bump. From this instant every existing rederived manifest is
     // stale; a crash below rebuilds views instead of silently staleifying them.
@@ -346,6 +390,7 @@ async fn run_checkpoint_sequence(
         done_rx,
         rx,
         &mut held_pushes,
+        &mut held_txns,
         &mut deferred,
         shared,
         fut_slots,
@@ -364,6 +409,7 @@ async fn run_checkpoint_sequence(
         acked_rx,
         rx,
         &mut held_pushes,
+        &mut held_txns,
         &mut deferred,
         shared,
         fut_slots,
@@ -378,7 +424,7 @@ async fn run_checkpoint_sequence(
     }
     let _ = release_tx.send(()); // resume the tick loop
 
-    (held_pushes, deferred)
+    (held_pushes, held_txns, deferred)
 }
 
 /// Await `target_rx` (a Drain `done` or Quiesce `acked`) while keeping the
@@ -387,10 +433,12 @@ async fn run_checkpoint_sequence(
 /// barriers are deferred to sequence end, and pushes are held for the folded
 /// commit. The target is re-polled after each serviced request, so no wakeup
 /// is lost.
+#[allow(clippy::too_many_arguments)]
 async fn await_servicing(
     target_rx: oneshot::Receiver<()>,
     rx: &mut mpsc::Receiver<CommitRequest>,
     held_pushes: &mut Vec<PendingPush>,
+    held_txns: &mut Vec<PendingTxn>,
     deferred: &mut Vec<(BarrierKind, oneshot::Sender<()>)>,
     shared: &Rc<Shared>,
     fut_slots: &mut Vec<ReplyFuture>,
@@ -423,6 +471,7 @@ async fn await_servicing(
                     done,
                 });
             }
+            Either::B(Some(CommitRequest::Txn(txn))) => held_txns.push(txn),
         }
     }
 }
@@ -432,9 +481,52 @@ async fn await_servicing(
 /// releases the lock, THEN awaits worker ACKs (Phase C) and the fsync
 /// CQE (Phase D). LSN assignment and `done.send` happen after worker
 /// ACKs; unique-index filter update happens after fsync.
+/// One homogeneous (tid, mode) SAL group: a merged run of single pushes, or one
+/// transaction family.
+struct GroupInfo {
+    tid: i64,
+    mode: WireConflictMode,
+    req_ids: Vec<u64>,
+    merged: Option<Batch>,
+    write_err: Option<String>,
+}
+
+/// One client-visible commit unit — the span of `groups` it emits and the `done`
+/// senders that share its verdict. A merged single-push run is one group with N
+/// dones (one per coalesced client request); a transaction is N groups (one per
+/// family, in frame order) with one done. Units tile `groups` contiguously in
+/// emission order, so iterating units visits groups in group order.
+struct CommitUnit {
+    groups: std::ops::Range<usize>,
+    dones: Vec<oneshot::Sender<Result<u64, String>>>,
+    /// Whether a worker-ACK error may downgrade this unit's verdict. Single
+    /// pushes degrade gracefully per group, so they do. A transaction is emitted
+    /// fail-stop under a pre-checked fit and its contract is "Err ⇒ nothing
+    /// committed", so once the zone's sentinel is durable a worker error must
+    /// never turn its `Ok` into an `Err` (any real apply error already fail-stops
+    /// the worker; the only graceful one — "table not registered" — is excluded
+    /// by the catalog read lock held through the ACK).
+    downgrade_on_worker_err: bool,
+}
+
+impl CommitUnit {
+    /// Resolve every `done` of this unit exactly once: `Ok(zone_lsn)` iff all of
+    /// its groups committed, else the first group error.
+    fn resolve(self, groups: &[GroupInfo], zone_lsn: u64) {
+        let result = match groups[self.groups].iter().find_map(|g| g.write_err.clone()) {
+            Some(e) => Err(e),
+            None => Ok(zone_lsn),
+        };
+        for done in self.dones {
+            let _ = done.send(result.clone());
+        }
+    }
+}
+
 async fn commit_pushes(
     shared: &Rc<Shared>,
     mut pushes: Vec<PendingPush>,
+    txns: Vec<PendingTxn>,
     fut_slots: &mut Vec<ReplyFuture>,
     ack_slots: &mut Vec<Option<DecodedWire>>,
     merge_pool: &mut FxHashMap<(i64, u8), Batch>,
@@ -442,95 +534,94 @@ async fn commit_pushes(
     // Sort by (tid, mode) so runs are homogeneous.
     pushes.sort_by_key(|p| (p.tid, p.mode.as_u8()));
 
-    /// One homogeneous (tid, mode) run of `pushes`. Groups tile `pushes`
-    /// contiguously in order, `len` pushes each.
-    struct GroupInfo {
-        len: usize,
-        tid: i64,
-        mode: WireConflictMode,
-        req_ids: Vec<u64>,
-        merged: Option<Batch>,
-        write_err: Option<String>,
-    }
-
     let nw = shared.num_workers;
-    let n = pushes.len();
     let mut groups: Vec<GroupInfo> = Vec::new();
+    let mut units: Vec<CommitUnit> = Vec::with_capacity(txns.len());
+    let alloc_req_ids = || -> Vec<u64> { (0..nw).map(|_| shared.reactor.alloc_request_id()).collect() };
 
     // ------------------------------------------------------------------
     // Phase A (no lock): build merged batches + req_id allocations.
+    // Transaction units come FIRST (transactions-first emission), each family its
+    // own group in frame order; then the merged single-push units.
     // ------------------------------------------------------------------
-    {
-        let mut run_start = 0;
-        while run_start < n {
-            let tid = pushes[run_start].tid;
-            let mode = pushes[run_start].mode;
-            let mut run_end = run_start + 1;
-            while run_end < n && pushes[run_end].tid == tid && pushes[run_end].mode == mode {
-                run_end += 1;
-            }
-
-            let total_rows: usize = pushes[run_start..run_end]
-                .iter()
-                .map(|p| p.batch.as_ref().map(|b| b.count).unwrap_or(0))
-                .sum();
-            let req_ids: Vec<u64> = (0..nw).map(|_| shared.reactor.alloc_request_id()).collect();
-            let single_push = run_end - run_start == 1;
-
-            // Single-push: take ownership of the client's batch (no merge).
-            // Multi-push: pop a pooled merged batch (or alloc fresh) and
-            // refill it. DDL between bursts can change the schema, so
-            // mismatched pool entries are dropped and reallocated — without
-            // this, append_batch writes rows under the wrong column layout.
-            let merged = match guard_panic("commit_merge", || {
-                if single_push {
-                    Ok(pushes[run_start].batch.take().expect("PendingPush.batch already taken"))
-                } else {
-                    let schema = shared.disp().schema_desc_for(tid);
-                    let mut m = match merge_pool.remove(&(tid, mode.as_u8())) {
-                        Some(pooled) if pooled.schema.as_ref() == Some(&schema) => pooled,
-                        _ => Batch::with_schema(schema, total_rows.max(1)),
-                    };
-                    m.clear();
-                    for p in pushes[run_start..run_end].iter() {
-                        let pb = p
-                            .batch
-                            .as_ref()
-                            .expect("PendingPush.batch is missing in multi-push run");
-                        m.append_batch(pb, 0, pb.count);
-                    }
-                    Ok(m)
-                }
-            }) {
-                Ok(m) => m,
-                Err(panic_msg) => {
-                    let placeholder = guard_panic("commit_fallback_schema", || {
-                        Ok(Batch::empty_with_schema(&shared.disp().schema_desc_for(tid)))
-                    })
-                    .unwrap_or_else(|_| Batch::empty_with_schema(&crate::schema::SchemaDescriptor::minimal_u64()));
-                    groups.push(GroupInfo {
-                        len: run_end - run_start,
-                        tid,
-                        mode,
-                        req_ids,
-                        merged: Some(placeholder),
-                        write_err: Some(panic_msg),
-                    });
-                    run_start = run_end;
-                    continue;
-                }
-            };
-
+    for txn in txns {
+        let gstart = groups.len();
+        for fam in txn.families {
             groups.push(GroupInfo {
-                len: run_end - run_start,
-                tid,
-                mode,
-                req_ids,
-                merged: Some(merged),
+                tid: fam.tid,
+                mode: fam.mode,
+                req_ids: alloc_req_ids(),
+                merged: Some(fam.batch),
                 write_err: None,
             });
-            run_start = run_end;
         }
+        units.push(CommitUnit {
+            groups: gstart..groups.len(),
+            dones: vec![txn.done],
+            downgrade_on_worker_err: false,
+        });
+    }
+
+    // Single-push runs: walk the sorted pushes, draining each maximal (tid, mode)
+    // run into one merged group.
+    let mut remaining = pushes.into_iter().peekable();
+    while let Some(first) = remaining.next() {
+        let (tid, mode) = (first.tid, first.mode);
+        let mut run: Vec<PendingPush> = vec![first];
+        while remaining.peek().is_some_and(|p| p.tid == tid && p.mode == mode) {
+            run.push(remaining.next().unwrap());
+        }
+        let total_rows: usize = run.iter().map(|p| p.batch.as_ref().map(|b| b.count).unwrap_or(0)).sum();
+
+        // Single-push: take ownership of the client's batch (no merge).
+        // Multi-push: pop a pooled merged batch (or alloc fresh) and
+        // refill it. DDL between bursts can change the schema, so
+        // mismatched pool entries are dropped and reallocated — without
+        // this, append_batch writes rows under the wrong column layout.
+        let built = guard_panic("commit_merge", || {
+            if run.len() == 1 {
+                Ok(run[0].batch.take().expect("PendingPush.batch already taken"))
+            } else {
+                let schema = shared.disp().schema_desc_for(tid);
+                let mut m = match merge_pool.remove(&(tid, mode.as_u8())) {
+                    Some(pooled) if pooled.schema.as_ref() == Some(&schema) => pooled,
+                    _ => Batch::with_schema(schema, total_rows.max(1)),
+                };
+                m.clear();
+                for p in run.iter() {
+                    let pb = p
+                        .batch
+                        .as_ref()
+                        .expect("PendingPush.batch is missing in multi-push run");
+                    m.append_batch(pb, 0, pb.count);
+                }
+                Ok(m)
+            }
+        });
+        let (merged, write_err) = match built {
+            Ok(m) => (m, None),
+            Err(panic_msg) => {
+                let placeholder = guard_panic("commit_fallback_schema", || {
+                    Ok(Batch::empty_with_schema(&shared.disp().schema_desc_for(tid)))
+                })
+                .unwrap_or_else(|_| Batch::empty_with_schema(&crate::schema::SchemaDescriptor::minimal_u64()));
+                (placeholder, Some(panic_msg))
+            }
+        };
+
+        let gstart = groups.len();
+        groups.push(GroupInfo {
+            tid,
+            mode,
+            req_ids: alloc_req_ids(),
+            merged: Some(merged),
+            write_err,
+        });
+        units.push(CommitUnit {
+            groups: gstart..groups.len(),
+            dones: run.drain(..).map(|p| p.done).collect(),
+            downgrade_on_worker_err: true,
+        });
     }
 
     // ------------------------------------------------------------------
@@ -551,29 +642,69 @@ async fn commit_pushes(
         // user-table push pins no system-family counter, so the floor is 0.
         let zone_lsn = shared.lsn_alloc.reserve(0);
 
-        for g in groups.iter_mut() {
-            if g.write_err.is_some() {
+        // Emit every unit into the zone, in unit order (transactions first).
+        for unit in &units {
+            let span = unit.groups.clone();
+            if unit.downgrade_on_worker_err {
+                // A single-push group degrades gracefully: a failed
+                // `sal_begin_group` writes zero bytes and simply skips it.
+                let g = &mut groups[span.start];
+                if g.write_err.is_none() {
+                    g.write_err = write_group(shared, g, zone_lsn);
+                }
                 continue;
             }
-            let merged = g.merged.as_ref().expect("merged set in Phase A");
-            let err = guard_panic("commit_write", || {
-                Ok(shared
-                    .disp()
-                    .write_commit_group(g.tid, zone_lsn, merged, g.mode, &g.req_ids)
-                    .err())
-            })
-            .unwrap_or_else(Some);
-            g.write_err = err;
+
+            // A transaction is fit-checked as a whole against the live SAL, then
+            // emitted fail-stop: once one family has hit the SAL, a later family
+            // failing is a "can't happen" logic fault (the fit check guarantees
+            // every family fits) that must crash the node rather than tear a
+            // committed zone. A failure on the FIRST family (nothing committed
+            // yet) fails the transaction cleanly.
+            let families: Vec<(i64, &Batch)> = groups[span.clone()]
+                .iter()
+                .map(|g| (g.tid, g.merged.as_ref().expect("merged set in Phase A")))
+                .collect();
+            let fail = match shared.disp().txn_fit(&families) {
+                TxnFit::Terminal => Some("transaction exceeds SAL capacity".to_string()),
+                TxnFit::Transient => {
+                    // Force a checkpoint before the next batch so the client's
+                    // retry finds a reclaimed SAL.
+                    shared.force_checkpoint.set(true);
+                    Some("transaction exceeds SAL space".to_string())
+                }
+                TxnFit::Fits => {
+                    let mut committed_a_family = false;
+                    let mut first_fail = None;
+                    for gi in span.clone() {
+                        let g = &mut groups[gi];
+                        match write_group(shared, g, zone_lsn) {
+                            None => committed_a_family = true,
+                            Some(e) if committed_a_family => crate::gnitz_fatal_abort!(
+                                "txn family emission failed after an earlier family committed to the SAL: {}",
+                                e
+                            ),
+                            Some(e) => {
+                                first_fail = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    first_fail
+                }
+            };
+            if let Some(e) = fail {
+                for g in groups[span].iter_mut() {
+                    g.write_err.get_or_insert_with(|| e.clone());
+                }
+            }
         }
 
         let any_written = groups.iter().any(|g| g.write_err.is_none());
         if !any_written {
-            let mut pushes = pushes.into_iter();
-            for g in &groups {
-                let e = g.write_err.as_ref().unwrap();
-                for p in pushes.by_ref().take(g.len) {
-                    let _ = p.done.send(Err(e.clone()));
-                }
+            // No group wrote → no sentinel; every unit resolves to its first error.
+            for unit in units {
+                unit.resolve(&groups, zone_lsn);
             }
             return;
         }
@@ -629,15 +760,20 @@ async fn commit_pushes(
     {
         join_into(fut_slots, ack_slots).await;
 
+        // Units tile `groups` in emission order, so this visits groups in the same
+        // order `fut_slots` was built in and the ACK cursor stays aligned.
         let mut cursor = 0usize;
-        for g in groups.iter_mut() {
-            if g.write_err.is_some() {
-                continue;
+        for unit in &units {
+            for gi in unit.groups.clone() {
+                if groups[gi].write_err.is_some() {
+                    continue;
+                }
+                let worker_err = first_worker_error_opt("commit", &ack_slots[cursor..cursor + nw]);
+                cursor += nw;
+                if unit.downgrade_on_worker_err {
+                    groups[gi].write_err = worker_err;
+                }
             }
-            if let Some(e) = first_worker_error_opt("commit", &ack_slots[cursor..cursor + nw]) {
-                g.write_err = Some(e);
-            }
-            cursor += nw;
         }
         // Drop DecodedWire heap fields (data_batch, error_msg) before the
         // committer parks waiting for the next request. Capacity stays
@@ -733,15 +869,23 @@ async fn commit_pushes(
         }
     }
 
-    // Now send responses in original order.
-    let mut pushes = pushes.into_iter();
-    for g in &groups {
-        for p in pushes.by_ref().take(g.len) {
-            let result = match &g.write_err {
-                Some(e) => Err(e.clone()),
-                None => Ok(zone_lsn),
-            };
-            let _ = p.done.send(result);
-        }
+    // Now send responses. A single-push unit resolves each coalesced client's
+    // `done` from its one group; a transaction's single `done` resolves `Ok` iff
+    // every family group committed.
+    for unit in units {
+        unit.resolve(&groups, zone_lsn);
     }
+}
+
+/// Emit one group into the open zone, returning the write error if any. Wrapped
+/// in `guard_panic` so a malformed batch fails the group instead of the node.
+fn write_group(shared: &Rc<Shared>, g: &GroupInfo, zone_lsn: u64) -> Option<String> {
+    let merged = g.merged.as_ref().expect("merged set in Phase A");
+    guard_panic("commit_write", || {
+        Ok(shared
+            .disp()
+            .write_commit_group(g.tid, zone_lsn, merged, g.mode, &g.req_ids)
+            .err())
+    })
+    .unwrap_or_else(Some)
 }

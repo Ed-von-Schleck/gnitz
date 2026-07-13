@@ -5,8 +5,10 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 
 use gnitz_core::protocol::types::type_code_from_u64;
-use gnitz_core::{Circuit, CircuitBuilder, ExprBuilder, ExprProgram, GnitzClient};
-use gnitz_core::{ColData, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch, MAX_COLUMNS, MAX_PK_BYTES};
+use gnitz_core::{Circuit, CircuitBuilder, ExprBuilder, ExprProgram, GnitzClient, TxnBuffer};
+use gnitz_core::{
+    ColData, ColumnDef, PkColumn, Schema, TypeCode, WireConflictMode, ZSetBatch, MAX_COLUMNS, MAX_PK_BYTES,
+};
 use gnitz_sql::{SqlPlanner, SqlResult};
 
 /// The `(schema, data_batch, lsn)` a sync scan/seek/push resolves to.
@@ -217,6 +219,20 @@ fn py_schema_to_rust(py: Python<'_>, s: &PySchema) -> PyResult<Schema> {
         columns: cols,
         pk_cols: s.pk_indices.clone(),
     })
+}
+
+/// Resolve a Python schema plus a list of PK values (each an int or bytes) into
+/// the Rust `(Schema, PkColumn)` the delete paths need. Shared by
+/// `PyGnitzClient::delete` and `PyTxn::delete`.
+fn py_pks_to_column(py: Python<'_>, schema: &PySchema, pks: &[Bound<'_, PyAny>]) -> PyResult<(Schema, PkColumn)> {
+    let rust_schema = py_schema_to_rust(py, schema)?;
+    let stride = rust_schema.pk_stride();
+    let mut pk_col = PkColumn::empty_for_schema(&rust_schema);
+    for pk_val in pks {
+        let t = pk_tuple_from_py_with_stride(pk_val, stride)?;
+        pk_col.push_tuple(&t);
+    }
+    Ok((rust_schema, pk_col))
 }
 
 /// Resolve a Python "schema-ish" argument to a `Bound<PySchema>`: a `Struct`
@@ -1495,15 +1511,34 @@ impl PyGnitzClient {
         schema: PyRef<'_, PySchema>,
         pks: Vec<Bound<'_, PyAny>>,
     ) -> PyResult<()> {
-        let rust_schema = py_schema_to_rust(py, &schema)?;
-        let stride = rust_schema.pk_stride();
-        let mut pk_col = gnitz_core::PkColumn::empty_for_schema(&rust_schema);
-        for pk_val in &pks {
-            let t = pk_tuple_from_py_with_stride(pk_val, stride)?;
-            pk_col.push_tuple(&t);
-        }
+        let (rust_schema, pk_col) = py_pks_to_column(py, &schema, &pks)?;
         let c = client!(self);
         to_py_err(py.allow_threads(|| c.delete(target_id, &rust_schema, pk_col)))
+    }
+
+    /// Open an atomic write-batch transaction as a context manager. Buffer
+    /// writes with `txn.push` / `txn.delete`; a clean `with`-block exit commits
+    /// the whole bundle atomically under one durable zone LSN, while an
+    /// exception discards it (rollback — nothing was sent).
+    ///
+    /// ```python
+    /// with client.transaction() as txn:
+    ///     txn.push(orders_tid, orders_batch)
+    ///     txn.delete(carts_tid, cart_schema, [pk])
+    /// ```
+    pub fn transaction(slf: Bound<'_, PyGnitzClient>) -> PyResult<PyTxn> {
+        let buf = {
+            let mut this = slf.borrow_mut();
+            let c = this
+                .inner
+                .as_mut()
+                .ok_or_else(|| GnitzError::new_err("client already closed"))?;
+            c.begin()
+        };
+        Ok(PyTxn {
+            buf: Some(buf),
+            client: slf.unbind(),
+        })
     }
 
     // ----- Views -----
@@ -1693,6 +1728,91 @@ macro_rules! expr_builder {
             .as_mut()
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("ExprBuilder already consumed"))?
     };
+}
+
+fn parse_conflict_mode(mode: &str) -> PyResult<WireConflictMode> {
+    match mode {
+        "update" => Ok(WireConflictMode::Update),
+        "error" => Ok(WireConflictMode::Error),
+        other => Err(GnitzError::new_err(format!(
+            "invalid conflict mode '{other}', expected 'update' or 'error'"
+        ))),
+    }
+}
+
+/// Atomic write-batch transaction context manager. Owns a `TxnBuffer` and a
+/// reference back to its client so the `with`-block exit can commit or discard
+/// the whole bundle. Buffering is entirely local; nothing reaches the server
+/// until commit.
+#[pyclass(name = "Txn")]
+pub struct PyTxn {
+    buf: Option<TxnBuffer>,
+    client: Py<PyGnitzClient>,
+}
+
+#[pymethods]
+impl PyTxn {
+    fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    /// Buffer a push of `batch` into `target_id` under conflict mode `mode`
+    /// (`"update"` — the default — or `"error"`).
+    #[pyo3(signature = (target_id, batch, mode = "update"))]
+    pub fn push(&mut self, target_id: u64, batch: PyRef<'_, PyZSetBatch>, mode: &str) -> PyResult<()> {
+        let m = parse_conflict_mode(mode)?;
+        self.buf_mut()?
+            .push_with_mode(target_id, batch.schema.as_ref(), &batch.batch, m);
+        Ok(())
+    }
+
+    /// Buffer a delete of `pks` from `target_id` (same PK forms as
+    /// `GnitzClient.delete`).
+    pub fn delete(
+        &mut self,
+        py: Python<'_>,
+        target_id: u64,
+        schema: PyRef<'_, PySchema>,
+        pks: Vec<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let (rust_schema, pk_col) = py_pks_to_column(py, &schema, &pks)?;
+        self.buf_mut()?.delete(target_id, &rust_schema, pk_col);
+        Ok(())
+    }
+
+    /// Commit the bundle on a clean exit; discard it (rollback) if the block
+    /// raised. Returns `False` so an in-block exception is never suppressed.
+    fn __exit__(
+        &mut self,
+        py: Python<'_>,
+        exc_type: PyObject,
+        _exc_val: PyObject,
+        _exc_tb: PyObject,
+    ) -> PyResult<bool> {
+        let buffer = match self.buf.take() {
+            Some(b) => b,
+            None => return Ok(false),
+        };
+        if exc_type.is_none(py) {
+            let client = self.client.bind(py);
+            let mut cref = client.borrow_mut();
+            let c = cref
+                .inner
+                .as_mut()
+                .ok_or_else(|| GnitzError::new_err("client already closed"))?;
+            to_py_err(c.commit_txn(buffer))?;
+        }
+        // On exception `buffer` drops here → rollback (nothing was ever sent).
+        Ok(false)
+    }
+}
+
+impl PyTxn {
+    fn buf_mut(&mut self) -> PyResult<&mut TxnBuffer> {
+        self.buf
+            .as_mut()
+            .ok_or_else(|| GnitzError::new_err("transaction already committed or discarded"))
+    }
 }
 
 #[pyclass(name = "ExprBuilder")]
@@ -2334,6 +2454,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyScanResult>()?;
     m.add_class::<PyRowIterator>()?;
     m.add_class::<PyGnitzClient>()?;
+    m.add_class::<PyTxn>()?;
     m.add_class::<PyExprBuilder>()?;
     m.add_class::<PyExprProgram>()?;
     m.add_class::<PyCircuitBuilder>()?;

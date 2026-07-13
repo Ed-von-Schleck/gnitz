@@ -88,8 +88,10 @@ mod index_router;
 mod preflight;
 mod unique_filter;
 
+pub(crate) use dispatch::TxnFit;
 #[cfg(test)]
 pub(crate) use preflight::PreflightAccumulator;
+pub(crate) use preflight::TxnFamily;
 use unique_filter::UniqueFilter;
 
 // ---------------------------------------------------------------------------

@@ -2,8 +2,8 @@ use super::codec::{batch_to_schema, schema_to_batch};
 use super::error::ProtocolError;
 use super::header::WAL_BLOCK_HEADER_SIZE;
 use super::header::{
-    wire_flags_get_schema_version, Header, FLAG_DDL_TXN, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, STATUS_ERROR, STATUS_NO_INDEX,
-    STATUS_OK, STATUS_SCHEMA_MISMATCH,
+    wire_flags_get_schema_version, Header, WireConflictMode, FLAG_DDL_TXN, FLAG_HAS_DATA, FLAG_HAS_SCHEMA,
+    FLAG_PUSH_TXN, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
 };
 use super::transport::ClientTransport;
 use super::types::{meta_schema, PkTuple, Schema, ZSetBatch};
@@ -150,7 +150,7 @@ pub fn encode_message_parts(
         request_id: 0,
     };
     let ctrl = encode_control_block(&ctrl_hdr, "", seek_pk_extra);
-    let schema_block = schema.map(|s| encode_wal_block(meta_schema(), target_id as u32, &schema_to_batch(s)));
+    let schema_block = schema.map(|s| encode_schema_block(s, target_id as u32));
     let data = if has_data {
         encode_wal_block(schema.unwrap(), target_id as u32, data_batch.unwrap())
     } else {
@@ -217,6 +217,48 @@ pub fn encode_message(
     encode_message_parts(target_id, client_id, flags, seek_pk, seek_col_idx, schema, data_batch).to_vec()
 }
 
+/// Encode the client's meta-schema WAL block for `schema` under table id `tid`
+/// — the exact bytes a schema-bearing push embeds (the `encode_wal_block(
+/// meta_schema(), tid, &schema_to_batch(s))` expression `encode_message_parts`
+/// uses). Shared by the plain-push encoder and the always-schema-bearing
+/// `FLAG_PUSH_TXN` per-family block.
+pub fn encode_schema_block(schema: &Schema, tid: u32) -> Vec<u8> {
+    encode_wal_block(meta_schema(), tid, &schema_to_batch(schema))
+}
+
+/// Encode an atomic user-table push transaction frame (`FLAG_PUSH_TXN`) into
+/// wire bytes (without the 4-byte frame header). Bundles N user-table families
+/// into one durable SAL zone — the client-facing analogue of `encode_ddl_txn`,
+/// which is exclusive to system families.
+///
+/// Layout: the reused control block (`target_id = 0`, `flags = FLAG_PUSH_TXN`),
+/// then `u32` family count, then per family — a `u8` conflict mode, the family's
+/// meta-schema block (**always present**, via `encode_schema_block`), and the
+/// data WAL block (via `encode_wal_block`). Both per-family blocks self-size via
+/// their WAL header (`table_id` at WAL_OFF_TID, total size at WAL_OFF_SIZE), so
+/// the engine decoder walks the list by header with no redundant length
+/// prefixes; the schema block lets the master validate each family against its
+/// catalog with no warm-cache version, exactly as the DDL_TXN frame does.
+pub fn encode_push_txn(client_id: u64, families: &[(u64, &Schema, &ZSetBatch, WireConflictMode)]) -> Vec<u8> {
+    let ctrl_hdr = Header {
+        status: STATUS_OK,
+        target_id: 0,
+        client_id,
+        flags: FLAG_PUSH_TXN,
+        seek_pk: 0,
+        seek_col_idx: 0,
+        request_id: 0,
+    };
+    let mut out = encode_control_block(&ctrl_hdr, "", &[]);
+    out.extend_from_slice(&(families.len() as u32).to_le_bytes());
+    for (tid, schema, batch, mode) in families {
+        out.push(mode.as_u8());
+        out.extend_from_slice(&encode_schema_block(schema, *tid as u32));
+        out.extend_from_slice(&encode_wal_block(schema, *tid as u32, batch));
+    }
+    out
+}
+
 /// Encode an atomic DDL transaction frame (`FLAG_DDL_TXN`) into wire bytes
 /// (without the 4-byte frame header). Every system-table write — a `CREATE`'s N
 /// family batches, a `DROP`/`CREATE INDEX`/`CREATE SCHEMA`'s single batch — is
@@ -228,7 +270,7 @@ pub fn encode_message(
 /// block embeds its own `table_id` (WAL offset 8) and total size (WAL offset
 /// 16), so the server decoder walks the list by header alone with no schema in
 /// hand and defers schema resolution to the catalog layer.
-pub fn encode_ddl_txn(client_id: u64, families: &[(u64, &Schema, ZSetBatch)]) -> Result<Vec<u8>, ProtocolError> {
+pub fn encode_ddl_txn(client_id: u64, families: &[(u64, &Schema, ZSetBatch)]) -> Vec<u8> {
     let ctrl_hdr = Header {
         status: STATUS_OK,
         target_id: 0,
@@ -241,10 +283,9 @@ pub fn encode_ddl_txn(client_id: u64, families: &[(u64, &Schema, ZSetBatch)]) ->
     let mut out = encode_control_block(&ctrl_hdr, "", &[]);
     out.extend_from_slice(&(families.len() as u32).to_le_bytes());
     for (tid, schema, batch) in families {
-        let block = encode_wal_block(schema, *tid as u32, batch);
-        out.extend_from_slice(&block);
+        out.extend_from_slice(&encode_wal_block(schema, *tid as u32, batch));
     }
-    Ok(out)
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -432,9 +473,89 @@ pub fn recv_message(
 mod tests {
     use super::*;
     use crate::protocol::header::wire_flags_set_schema_version;
-    use crate::protocol::header::{Header, FLAG_PUSH, FLAG_SEEK, STATUS_ERROR};
-    use crate::protocol::types::{ColData, ColumnDef, PkColumn, PkTuple, Schema, TypeCode, ZSetBatch};
+    use crate::protocol::header::{Header, FLAG_PUSH, FLAG_PUSH_TXN, FLAG_SEEK, STATUS_ERROR};
+    use crate::protocol::types::{BatchAppender, ColData, ColumnDef, PkColumn, PkTuple, Schema, TypeCode, ZSetBatch};
+    use crate::protocol::WireConflictMode;
     use std::os::unix::io::RawFd;
+
+    // ── FLAG_PUSH_TXN frame encode + engine-style walk ─────────────────────
+
+    fn u32_at(buf: &[u8], off: usize) -> usize {
+        u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize
+    }
+
+    /// Encode a multi-family `FLAG_PUSH_TXN` frame (both modes, repeated tid, a
+    /// delete family) and walk it exactly as the engine decoder does: control
+    /// block, `u32` count, then per family a mode byte, a self-sized schema
+    /// block, and a self-sized data block. There is no client-side decoder, so
+    /// this is the encode-side half of the roundtrip.
+    #[test]
+    fn push_txn_frame_roundtrip() {
+        let schema = Schema {
+            columns: vec![
+                ColumnDef::new("pk", TypeCode::U64, false),
+                ColumnDef::new("val", TypeCode::I64, false),
+            ],
+            pk_cols: vec![0],
+        };
+        let mut b0 = ZSetBatch::new(&schema);
+        {
+            let mut a = BatchAppender::new(&mut b0, &schema);
+            a.add_row(1, 1).i64_val(10);
+            a.add_row(2, 1).i64_val(20);
+        }
+        let mut b1 = ZSetBatch::new(&schema);
+        BatchAppender::new(&mut b1, &schema).add_row(3, 1).i64_val(30);
+        let b2 = ZSetBatch {
+            pks: PkColumn::U64s(vec![4]),
+            weights: vec![-1],
+            nulls: vec![0],
+            columns: ZSetBatch::filler_columns(&schema, 1),
+        };
+
+        let families: Vec<(u64, &Schema, &ZSetBatch, WireConflictMode)> = vec![
+            (16, &schema, &b0, WireConflictMode::Update),
+            (17, &schema, &b1, WireConflictMode::Error),
+            (16, &schema, &b2, WireConflictMode::Update),
+        ];
+        let payload = encode_push_txn(0xABCD, &families);
+
+        let ctrl_size = u32_at(&payload, gnitz_wire::WAL_OFF_SIZE);
+        let (hdr, _, _) = decode_control_block(&payload[..ctrl_size]).unwrap();
+        assert_eq!(hdr.flags, FLAG_PUSH_TXN);
+        assert_eq!(hdr.target_id, 0);
+        assert_eq!(hdr.client_id, 0xABCD);
+
+        let mut off = ctrl_size;
+        let count = u32_at(&payload, off);
+        off += 4;
+        assert_eq!(count, 3);
+
+        let ms = meta_schema();
+        let expected = [
+            (16u64, WireConflictMode::Update, 2usize),
+            (17, WireConflictMode::Error, 1),
+            (16, WireConflictMode::Update, 1),
+        ];
+        for (exp_tid, exp_mode, exp_rows) in expected {
+            let mode = WireConflictMode::from_u8(payload[off]);
+            off += 1;
+            assert_eq!(mode, exp_mode);
+            // Schema block: tid at WAL_OFF_TID (0), size at WAL_OFF_SIZE.
+            let stid = u32_at(&payload, off) as u64;
+            assert_eq!(stid, exp_tid);
+            let ssz = u32_at(&payload, off + gnitz_wire::WAL_OFF_SIZE);
+            let (sbatch, _) = decode_wal_block(&payload[off..off + ssz], ms).unwrap();
+            let decoded_schema = batch_to_schema(&sbatch).unwrap();
+            off += ssz;
+            // Data block under the decoded schema.
+            let dsz = u32_at(&payload, off + gnitz_wire::WAL_OFF_SIZE);
+            let (dbatch, _) = decode_wal_block(&payload[off..off + dsz], &decoded_schema).unwrap();
+            off += dsz;
+            assert_eq!(dbatch.len(), exp_rows);
+        }
+        assert_eq!(off, payload.len(), "frame fully consumed");
+    }
 
     fn make_socketpair() -> (RawFd, RawFd) {
         let mut fds = [0i32; 2];

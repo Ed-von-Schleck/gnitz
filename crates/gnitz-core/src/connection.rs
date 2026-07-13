@@ -4,12 +4,12 @@ use std::sync::Arc;
 use crate::error::ClientError;
 use crate::protocol::message::{encode_message_noschema_parts, encode_message_parts, MessageParts};
 use crate::protocol::{
-    encode_ddl_txn, hello_handshake, recv_message, send_message, send_message_with_extra, wire_flags_get_index_version,
-    wire_flags_get_schema_version, wire_flags_set_conflict_mode, wire_flags_set_index_version,
-    wire_flags_set_schema_version, ClientTransport, Message, PkTuple, ProtocolError, Schema, WireConflictMode,
-    ZSetBatch, FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID,
-    FLAG_CONTINUATION, FLAG_GET_INDICES, FLAG_PUSH, FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_SEEK_BY_INDEX_RANGE,
-    STATUS_ERROR, STATUS_NO_INDEX, STATUS_SCHEMA_MISMATCH,
+    encode_ddl_txn, encode_push_txn, hello_handshake, recv_message, send_message, send_message_with_extra,
+    wire_flags_get_index_version, wire_flags_get_schema_version, wire_flags_set_conflict_mode,
+    wire_flags_set_index_version, wire_flags_set_schema_version, ClientTransport, Message, PkTuple, ProtocolError,
+    Schema, WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE,
+    FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_GET_INDICES, FLAG_PUSH, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
+    FLAG_SEEK_BY_INDEX_RANGE, STATUS_ERROR, STATUS_NO_INDEX, STATUS_SCHEMA_MISMATCH,
 };
 use lru::LruCache;
 
@@ -168,10 +168,41 @@ impl Session {
         for (_, schema, batch) in families {
             batch.validate(schema).map_err(ClientError::ServerError)?;
         }
-        let payload = encode_ddl_txn(self.client_id, families)?;
-        self.transport.send_framed(&payload)?;
+        let payload = encode_ddl_txn(self.client_id, families);
+        self.send_txn_frame(&payload)
+    }
+
+    /// Send a pre-encoded transaction frame and receive its uncorrelated
+    /// zone-LSN ACK (`seek_pk`). Shared by `push_ddl_txn` and `push_txn`.
+    fn send_txn_frame(&mut self, payload: &[u8]) -> Result<u64, ClientError> {
+        self.transport.send_framed(payload)?;
         let msg = check_response(recv_message(&mut self.transport, None, self.max_payload_len)?)?;
         Ok(msg.seek_pk as u64)
+    }
+
+    /// Send an atomic **user-table** push transaction (`FLAG_PUSH_TXN`): a bundle
+    /// of user-table families — each carrying its conflict mode and its schema
+    /// block — that the server validates as a unit under the union of the
+    /// involved table locks and commits under one durable SAL zone. Returns the
+    /// zone LSN (echoed in the ACK's `seek_pk`, as `push` does).
+    ///
+    /// The reply is received uncorrelated, exactly as `push_ddl_txn` does. Each
+    /// family's batch is validated client-side before encoding, and the encoded
+    /// frame is bounds-checked against the server ingress cap so an oversized
+    /// bundle fails locally rather than being truncated on the wire.
+    pub fn push_txn(&mut self, families: &[(u64, &Schema, &ZSetBatch, WireConflictMode)]) -> Result<u64, ClientError> {
+        for (_, schema, batch, _) in families {
+            batch.validate(schema).map_err(ClientError::ServerError)?;
+        }
+        let payload = encode_push_txn(self.client_id, families);
+        if payload.len() > gnitz_wire::MAX_FRAME_PAYLOAD_SERVER {
+            return Err(ClientError::ServerError(format!(
+                "transaction frame is {} bytes, exceeding the {}-byte server ingress cap; split the transaction",
+                payload.len(),
+                gnitz_wire::MAX_FRAME_PAYLOAD_SERVER
+            )));
+        }
+        self.send_txn_frame(&payload)
     }
 
     pub fn scan(&mut self, target_id: u64) -> ScanResult {

@@ -29,9 +29,9 @@ use crate::catalog::{
     CatalogEngine, FIRST_USER_TABLE_ID, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB_ID,
     SEQ_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID,
 };
-use crate::runtime::committer::{self, BarrierKind, CommitRequest};
+use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingTxn};
 use crate::runtime::lsn::ZoneLsnAllocator;
-use crate::runtime::master::{first_worker_error_opt, MasterDispatcher};
+use crate::runtime::master::{first_worker_error_opt, MasterDispatcher, TxnFamily};
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{
     join_into, mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either, FsyncFuture, PendingRelay, Reactor, ReplyFuture,
@@ -243,6 +243,7 @@ impl ServerExecutor {
             sal_writer_excl: Rc::clone(&sal_writer_excl),
             lsn_alloc: Rc::clone(&lsn_alloc),
             num_workers,
+            force_checkpoint: Cell::new(false),
             tick_rows: Rc::clone(&tick_rows),
             tick_tids: Rc::clone(&tick_tids),
             tick_tx: tick_tx.clone(),
@@ -866,6 +867,15 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
         return;
     }
 
+    // ---------- Atomic user-table transaction ----------
+    // Placed after FLAG_DDL_TXN and before the `target_id == 0` alloc block so it
+    // cannot collide with alloc RPCs or empty-batch scans; it carries
+    // `target_id = 0`. Like DDL_TXN it re-decodes the bundle from the raw frame.
+    if flags & gnitz_wire::FLAG_PUSH_TXN != 0 {
+        handle_push_txn(shared, peer, client_id, data).await;
+        return;
+    }
+
     // ---------- SERIAL range reservation ----------
     // Carries `target_id = seq_id (= table_id) ≠ 0` and the range `count` in
     // `seek_col_idx`, so it precedes the `target_id == 0` catalog-id block.
@@ -1118,6 +1128,110 @@ async fn handle_seek(
             Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
         }
     }
+}
+
+/// Handle an atomic user-table transaction (`FLAG_PUSH_TXN`): decode + validate
+/// the bundle as a unit under the union of the involved table locks, then emit
+/// it as N `FLAG_PUSH` groups inside one zone under one sentinel. Mirrors the
+/// plain-push arm's lock order (catalog read lock, then the per-table lock union
+/// ascending) and its late `draining` check; both locks are held through the
+/// committer ACK. Every rejection is pre-SAL, so an `Err` reply means "nothing
+/// committed".
+async fn handle_push_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: &[u8]) {
+    match push_txn_body(shared, data).await {
+        // Standard single-frame ACK, seek_pk = zone LSN (uncorrelated, as
+        // push_ddl_txn's reply is).
+        Ok(lsn) => {
+            let buf = encode_response_buffer(0, client_id, None, STATUS_OK, b"", None, lsn as u128, 0);
+            peer.send_buffer_or_close(buf).await;
+        }
+        Err(e) => send_error(peer, 0, client_id, e.as_bytes()).await,
+    }
+}
+
+/// The body of `handle_push_txn`: every rejection is a plain `Err`, so the one
+/// caller above owns the single reply path. Returns the durable zone LSN.
+async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<u64, String> {
+    // 1. Decode + frame-local shape rules (no catalog access).
+    let raw = ipc::decode_push_txn(data).map_err(|e| format!("decode error: {e}"))?;
+    if raw.is_empty() {
+        return Err("TXN: empty family bundle".to_string());
+    }
+
+    // 2. Catalog read lock (excludes a concurrent DROP/DDL), then the
+    //    catalog-dependent shape rules + per-family batch decode.
+    let _cat = shared.catalog_rwlock.read().await;
+    let mut families: Vec<TxnFamily> = Vec::with_capacity(raw.len());
+    for fam in &raw {
+        let tid = fam.tid;
+        if tid < FIRST_USER_TABLE_ID {
+            return Err(format!("TXN: {tid} is not a user table"));
+        }
+        // Same existence + writability gate the plain-push arm applies, so a view
+        // target is rejected identically.
+        if let Some(e) = push_target_error(shared, tid) {
+            return Err(e);
+        }
+        if !shared.cat().table_has_unique_pk(tid) {
+            return Err(format!("TXN: table {tid} is not unique_pk"));
+        }
+        let catalog_schema = shared.get_schema_desc(tid);
+        // The schema block is always present; validate it against the catalog
+        // per family (a concurrent DDL between buffer time and commit surfaces as
+        // a clean error the application re-runs).
+        let wire_schema = ipc::decode_schema_block(fam.schema_block, false)
+            .map_err(|e| format!("TXN family {tid} schema decode error: {e}"))?;
+        validate_schema_match(&wire_schema, &catalog_schema)?;
+        let batch = decode_client_batch(fam.wal_block, &catalog_schema)
+            .map_err(|e| format!("TXN family {tid} decode error: {e}"))?;
+        if batch.count == 0 {
+            return Err(format!("TXN: empty batch for table {tid}"));
+        }
+        families.push(TxnFamily {
+            tid,
+            mode: ipc::WireConflictMode::from_u8(fam.mode),
+            batch,
+        });
+    }
+
+    // 3. Acquire the per-table lock union ⋃ fk_lock_set(tid), sorted ascending
+    //    and DEDUPED — a repeated tid would re-lock a non-reentrant mutex the
+    //    same task already holds and hang forever.
+    let mut union: Vec<i64> = Vec::new();
+    for fam in &families {
+        union.extend_from_slice(shared.cat().fk_lock_set(fam.tid));
+    }
+    union.sort_unstable();
+    union.dedup();
+    let mut _tlocks = Vec::with_capacity(union.len());
+    for tid in union {
+        _tlocks.push(shared.table_lock(tid).lock().await);
+    }
+
+    // 4. Distributed bundle validation (the four rules).
+    MasterDispatcher::validate_txn_distributed_async(
+        shared.dispatcher,
+        &shared.reactor,
+        &shared.sal_writer_excl,
+        &families,
+    )
+    .await?;
+
+    // 5. Drain check immediately before the committer send. INVARIANT: there must
+    //    be NO `.await` between this check and `committer_tx.send` — on the
+    //    single-threaded reactor that gap is atomic, which guarantees a
+    //    transaction that observed `draining == false` enqueues before the
+    //    watchdog's Shutdown barrier.
+    if shared.draining.get() {
+        return Err("server shutting down".to_string());
+    }
+
+    // 6. Route through the committer and wait for the zone ACK.
+    let (tx, rx) = oneshot::channel::<Result<u64, String>>();
+    shared
+        .committer_tx
+        .send(CommitRequest::Txn(PendingTxn { families, done: tx }));
+    rx.await.map_err(|_| "committer shut down".to_string())?
 }
 
 /// Decode a CLIENT-supplied frame and neutralize any client-claimed batch
@@ -1965,20 +2079,28 @@ async fn send_error(peer: &Peer, target_id: i64, client_id: u64, error_msg: &[u8
 /// on `FIRST_USER_TABLE_ID`). Caller holds the catalog read lock. Returns
 /// `true` iff an error frame was sent and the caller must return.
 async fn push_target_rejected(shared: &Shared, peer: &Peer, target_id: i64, client_id: u64) -> bool {
-    // `kind` is `Copy`; `.map` ends the `dag.tables` borrow before the
-    // awaits below.
+    match push_target_error(shared, target_id) {
+        Some(msg) => {
+            send_error(peer, target_id, client_id, msg.as_bytes()).await;
+            true
+        }
+        None => false,
+    }
+}
+
+/// The reason `target_id` cannot receive a push (absent, or not a base table),
+/// or `None` if it can. The shared existence + writability gate behind both the
+/// plain-push arm (via `push_target_rejected`) and the per-family check in
+/// `push_txn_body`, which owns its own reply path.
+fn push_target_error(shared: &Shared, target_id: i64) -> Option<String> {
+    // `kind` is `Copy`; `.map` ends the `dag.tables` borrow before the caller's
+    // awaits.
     match shared.cat().dag.tables.get(&target_id).map(|e| e.kind) {
-        None => {
-            let msg = format!("table {target_id} not found");
-            send_error(peer, target_id, client_id, msg.as_bytes()).await;
-            true
-        }
-        Some(kind) if !kind.is_base_table() => {
-            let msg = format!("table {target_id} is not writable: pushes must target a base table");
-            send_error(peer, target_id, client_id, msg.as_bytes()).await;
-            true
-        }
-        _ => false,
+        None => Some(format!("table {target_id} not found")),
+        Some(kind) if !kind.is_base_table() => Some(format!(
+            "table {target_id} is not writable: pushes must target a base table"
+        )),
+        _ => None,
     }
 }
 

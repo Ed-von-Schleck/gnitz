@@ -70,6 +70,15 @@ pub const FLAG_ALLOCATE_TABLE_ID: u64 = 1 << 58;
 pub const FLAG_ALLOCATE_SCHEMA_ID: u64 = 1 << 59;
 pub const FLAG_ALLOCATE_INDEX_ID: u64 = 1 << 60;
 
+/// PUSH_TXN request flag. The client→master frame carrying an atomic bundle of
+/// **user-table** family batches for one durable write zone (the client-facing
+/// analogue of `FLAG_DDL_TXN`, which is exclusive to system families). Purely a
+/// wire-level decode hint consumed at `handle_message` routing; it is NEVER
+/// written to the SAL — each family is emitted under its own `FLAG_PUSH` group
+/// inside one zone closed by the engine-internal `FLAG_TXN_COMMIT` sentinel. Bit
+/// 61, the next free high client-only bit above `FLAG_ALLOCATE_INDEX_ID`.
+pub const FLAG_PUSH_TXN: u64 = 1 << 61;
+
 /// Engine-internal batch-layout claims stamped on SAL / W2M frames
 /// (sorted / consolidated); never sent to clients. Defined here so the
 /// disjointness guard below covers them against every wire flag.
@@ -118,6 +127,7 @@ const _: () = {
         FLAG_ALLOCATE_TABLE_ID,
         FLAG_ALLOCATE_SCHEMA_ID,
         FLAG_ALLOCATE_INDEX_ID,
+        FLAG_PUSH_TXN,
     ];
     let mut acc = SAL_FLAGS_MASK | packed;
     let mut i = 0;

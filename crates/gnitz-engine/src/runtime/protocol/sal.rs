@@ -26,6 +26,31 @@ pub const MAX_WORKERS: usize = 64;
 pub(crate) const GROUP_HEADER_SIZE: usize = 16 + 2 * MAX_WORKERS * 4;
 pub(crate) const SAL_MMAP_SIZE: usize = 1 << 30;
 
+/// The SAL slot size for one worker's share of a **wire-safe** group: the
+/// control block, the schema block, and — only if the worker gets rows — the
+/// columnar data block. The single formula behind both `scatter_wire_group`'s
+/// emission and `wire_group_footprint`'s fit check, which must agree
+/// byte-for-byte: the committer fail-stops (aborts the node) if a transaction
+/// family fails to fit after an earlier family already hit the SAL.
+fn wire_safe_slot_size(count_w: usize, npc: usize, wire_row_stride: u32, schema_block_len: usize) -> usize {
+    let data_sz = if count_w > 0 {
+        data_wire_block_size_cached(count_w, npc, wire_row_stride)
+    } else {
+        0
+    };
+    CTRL_BLOCK_SIZE_NO_BLOB + schema_block_len + data_sz
+}
+
+/// The exact SAL footprint of a zone-closing `FLAG_TXN_COMMIT` sentinel — an
+/// all-zero-worker group (`8 + GROUP_HEADER_SIZE` bytes, no per-worker slots).
+/// `sal_begin_group` reserves this much headroom for **every non-sentinel
+/// group**, so the sentinel — written last, after all family groups and any
+/// zone-sharing single pushes — is guaranteed to fit. This makes `commit_zone`'s
+/// space-abort unreachable: a data group at the boundary degrades to a graceful
+/// `sal_begin_group` failure (`write_err` + skip) instead of aborting the node.
+/// Negligible (~536 B) against the 1 GiB SAL.
+pub(crate) const SENTINEL_SIZE: usize = 8 + GROUP_HEADER_SIZE;
+
 /// Floor for a `GNITZ_SAL_BYTES` override — must comfortably exceed one DDL zone
 /// plus the 2 MiB prefault-ahead window and the checkpoint headroom.
 const MIN_SAL_BYTES: usize = 16 << 20;
@@ -454,7 +479,16 @@ pub(crate) unsafe fn sal_begin_group(
         }
     }
     let total = 8 + payload_size;
-    if write_cursor + total > mmap_size {
+    // Global sentinel reservation: every non-sentinel group must leave
+    // SENTINEL_SIZE headroom so the zone-closing FLAG_TXN_COMMIT sentinel always
+    // fits at the end of the zone. Only the sentinel group itself may consume
+    // that reserve (it fits in exactly SENTINEL_SIZE bytes).
+    let effective_max = if flags & FLAG_TXN_COMMIT != 0 {
+        mmap_size
+    } else {
+        mmap_size.saturating_sub(SENTINEL_SIZE)
+    };
+    if write_cursor + total > effective_max {
         return None;
     }
 
@@ -819,6 +853,52 @@ impl SalWriter {
         Ok(())
     }
 
+    /// The exact number of SAL bytes a `scatter_wire_group` (or its
+    /// `write_group_direct` fallback) emission of `input_batch` partitioned by
+    /// `worker_indices` will consume: `8 + GROUP_HEADER_SIZE + Σ_w align8(slot_w)`,
+    /// where every one of the `num_workers` slots is emitted (a zero-row worker
+    /// still gets a schema-only `ctrl + schema_block` slot). Byte-exact by
+    /// construction — each slot is sized through the identical formula the
+    /// matching emission path uses (the wire-safe closed form, or `Batch`'s wire
+    /// size over a materialized per-worker sub-batch for string/blob schemas), so
+    /// the committer's per-transaction fit check cannot drift from what emission
+    /// writes. `schema_block_len` is the prebuilt schema block length (paid per
+    /// slot, hence once per worker for a replicated family); `wire_props` is
+    /// `(wire_safe, wire_row_stride)` as from `cached_schema_block`.
+    ///
+    /// The sentinel is **not** included — it is globally reserved by
+    /// `sal_begin_group` (`SENTINEL_SIZE`), not counted per group.
+    pub(crate) fn wire_group_footprint(
+        &self,
+        input_batch: &Batch,
+        worker_indices: &[Vec<u32>],
+        schema: &SchemaDescriptor,
+        schema_block_len: usize,
+        wire_props: (bool, u32),
+    ) -> usize {
+        let nw = self.m2w_efds.len();
+        let (wire_safe, wire_row_stride) = wire_props;
+        let mut total = 8 + GROUP_HEADER_SIZE;
+        if wire_safe {
+            let npc = schema.num_payload_cols();
+            for wi in worker_indices.iter().take(nw) {
+                total += align8(wire_safe_slot_size(wi.len(), npc, wire_row_stride, schema_block_len));
+            }
+        } else {
+            let mb = input_batch.as_mem_batch();
+            for wi in worker_indices.iter().take(nw) {
+                let slot = if wi.is_empty() {
+                    CTRL_BLOCK_SIZE_NO_BLOB + schema_block_len
+                } else {
+                    let sub = Batch::from_indexed_rows(&mb, wi, schema);
+                    CTRL_BLOCK_SIZE_NO_BLOB + schema_block_len + sub.wire_byte_size()
+                };
+                total += align8(slot);
+            }
+        }
+        total
+    }
+
     /// Scatter rows from `input_batch` directly into per-worker SAL slots using
     /// pre-computed `worker_indices`. Eliminates the two-copy path
     /// (scatter→intermediate Batch, then Batch→SAL slot) for schemas where
@@ -918,19 +998,13 @@ impl SalWriter {
         // ctrl block size for the no-error fast path is a compile-time constant.
         let ctrl_size = CTRL_BLOCK_SIZE_NO_BLOB;
         let npc = schema.num_payload_cols();
-
         let mut worker_sizes = [0u32; MAX_WORKERS];
         for w in 0..nw {
             if unicast_worker >= 0 && w != unicast_worker as usize {
                 continue;
             }
-            let count_w = worker_indices[w].len();
-            let data_sz = if count_w > 0 {
-                data_wire_block_size_cached(count_w, npc, wire_row_stride)
-            } else {
-                0
-            };
-            worker_sizes[w] = (ctrl_size + schema_block.len() + data_sz) as u32;
+            worker_sizes[w] =
+                wire_safe_slot_size(worker_indices[w].len(), npc, wire_row_stride, schema_block.len()) as u32;
         }
 
         let group = unsafe {

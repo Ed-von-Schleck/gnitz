@@ -216,18 +216,23 @@ pub(super) fn build_check_batch(
     // leading column is prefix-matched for the existence check. Narrow and wide
     // composites share this layout (the suffix width differs, the leading does
     // not), so there is no narrow/wide split.
-    let stride = schema.pk_stride() as usize;
-    // The leading key column is the index's column 0 for an index schema, but
-    // the PK column for a base-table schema (the FK parent fast-path passes the
-    // parent base table, whose lone PK may be declared at any column position).
-    // `pk_indices()[0]` resolves both: an index schema is laid out
-    // `(promoted_c0, src_pk…)`, so `pk_indices()[0] == 0 == columns[0]`.
-    let key_col = schema.pk_indices()[0] as usize;
-    let idx_key_type = schema.columns[key_col].type_code;
+    let (stride, idx_key_type) = opk_leading_key(schema);
     build_check_batch_with(schema, keys, pooled, |b, &k| {
         let buf = crate::schema::index_opk_prefix(k, src_type, idx_key_type);
         b.extend_pk_bytes(&buf[..stride]);
     })
+}
+
+/// The `(stride, leading-key type)` an OPK leading-key span for `schema` encodes
+/// at. The leading key column is the index's column 0 for an index schema, but
+/// the PK column for a base-table schema (the FK parent fast-path passes the
+/// parent base table, whose lone PK may be declared at any column position).
+/// `pk_indices()[0]` resolves both: an index schema is laid out
+/// `(promoted_c0, src_pk…)`, so `pk_indices()[0] == 0 == columns[0]`.
+fn opk_leading_key(schema: &SchemaDescriptor) -> (usize, u8) {
+    let stride = schema.pk_stride() as usize;
+    let key_col = schema.pk_indices()[0] as usize;
+    (stride, schema.columns[key_col].type_code)
 }
 
 /// Build the UPSERT PK-identification check batch from `keys`, the distinct
@@ -513,6 +518,226 @@ fn collect_fk_projection(cat: &CatalogEngine, target_id: i64, source_schema: &Sc
     project
 }
 
+/// Cap on distinct RESTRICT exemption-fetch values per transaction (Rule F2
+/// step 3). Beyond it the transaction is rejected, keeping a delete-heavy bundle
+/// from turning validation into an unbounded master-side materialization under
+/// the held table locks.
+const TXN_RESTRICT_FETCH_LIMIT: usize = 1024;
+
+/// One decoded, shape-validated transaction family: the target `tid`, its
+/// conflict `mode`, and the decoded batch. The family schema is resolved from
+/// the catalog by tid (every family of a tid shares one schema, checked at shape
+/// time). The executor decodes into these, the validator borrows them, and the
+/// committer takes them by value and emits each as one `FLAG_PUSH` group.
+pub struct TxnFamily {
+    pub tid: i64,
+    pub mode: WireConflictMode,
+    pub batch: Batch,
+}
+
+/// Per-PK last operation in a table's whole-bundle fold. `Inserted` names the
+/// surviving row by `(family index into the bundle's family list, row index)`.
+#[derive(Clone, Copy)]
+enum FoldOp {
+    Inserted(u32, u32),
+    Deleted,
+}
+
+/// One table's fold: the last op per PK.
+type Overlay = FxHashMap<PkBuf, FoldOp>;
+
+/// The `(retired, added)` referenced-value sets of one bundled FK parent column
+/// (see `parent_retired_added`).
+type ParentDelta = (FxHashSet<u128>, FxHashSet<u128>);
+
+/// `(parent tid, referenced col)` → its delta. Resolved once per key and shared
+/// by rules F1 and F2, which both turn on it.
+type ParentDeltas = FxHashMap<(i64, usize), ParentDelta>;
+
+/// Fold family `fi`'s rows into `overlay` — last op per PK wins (`w > 0` ⇒
+/// `Inserted`, `w < 0` ⇒ `Deleted`, `w == 0` rows skipped). Applied over a
+/// table's families in frame order it yields the post-transaction fold; applied
+/// over a prefix of them it yields the state an Error family is checked against.
+fn fold_family(overlay: &mut Overlay, fi: usize, b: &Batch) {
+    for row in 0..b.count {
+        let w = b.get_weight(row);
+        if w == 0 {
+            continue;
+        }
+        overlay.insert(
+            PkBuf::from_bytes(b.get_pk_bytes(row)),
+            if w > 0 {
+                FoldOp::Inserted(fi as u32, row as u32)
+            } else {
+                FoldOp::Deleted
+            },
+        );
+    }
+}
+
+/// Per-PK `(net weight, positive-occurrence count)` over one batch, keyed by the
+/// row's borrowed OPK bytes (zero-allocation, width-universal, sized to
+/// `batch.count`). A `+w` row counts as `w` insertions of the PK — Error-mode
+/// duplicate rejection treats it like the `w` separate `+1` rows it encodes — so
+/// the occurrence count saturates at 2 (any value `> 1` is a within-batch
+/// duplicate). Shared by the plain-push validator and the transaction PK check;
+/// the borrowed keys never outlive the caller's synchronous prelude.
+fn pk_net_weight_and_dup_count(batch: &Batch) -> FxHashMap<&[u8], (i64, u32)> {
+    let mut net: FxHashMap<&[u8], (i64, u32)> = FxHashMap::with_capacity_and_hasher(batch.count, Default::default());
+    for i in 0..batch.count {
+        let w = batch.get_weight(i);
+        if w == 0 {
+            continue;
+        }
+        let e = net.entry(batch.get_pk_bytes(i)).or_insert((0, 0));
+        e.0 += w;
+        if w > 0 {
+            e.1 += if w > 1 { 2 } else { 1 };
+        }
+    }
+    net
+}
+
+fn schema_of(disp_ptr: *mut MasterDispatcher, tid: i64) -> Result<SchemaDescriptor, String> {
+    unsafe { (*(*disp_ptr).catalog).get_schema_desc(tid) }.ok_or_else(|| format!("TXN: no schema for table {tid}"))
+}
+
+fn restrict_err(disp_ptr: *mut MasterDispatcher, parent_tid: i64, child_tid: i64) -> String {
+    let (sn, tn, csn, ctn) = unsafe {
+        let disp = &mut *disp_ptr;
+        let (s, t) = disp.get_qualified_name_owned(parent_tid);
+        let (cs, ct) = disp.get_qualified_name_owned(child_tid);
+        (s, t, cs, ct)
+    };
+    format!("Foreign Key violation: cannot delete from '{sn}.{tn}', row still referenced by '{csn}.{ctn}'")
+}
+
+/// A decoded transaction bundle plus everything its rules share: the per-table
+/// family lists in frame order, each table's catalog schema, and the
+/// whole-bundle fold. Built once; every rule reads it instead of re-walking the
+/// families.
+struct TxnBundle<'a> {
+    families: &'a [TxnFamily],
+    /// The bundle's tids, in first-appearance order.
+    order: Vec<i64>,
+    /// tid → indices into `families`, in frame order.
+    by_tid: FxHashMap<i64, Vec<usize>>,
+    schemas: FxHashMap<i64, SchemaDescriptor>,
+    overlays: FxHashMap<i64, Overlay>,
+    /// tid → the rows that survive the whole bundle (`(pk, family, row)`), the
+    /// `Inserted` projection of `overlays`. Precomputed once so the FK and
+    /// unique-index rules — F1 walks it per constraint — never rebuild it.
+    surviving: FxHashMap<i64, Vec<(PkBuf, u32, u32)>>,
+}
+
+impl<'a> TxnBundle<'a> {
+    fn new(disp_ptr: *mut MasterDispatcher, families: &'a [TxnFamily]) -> Result<Self, String> {
+        let mut order: Vec<i64> = Vec::new();
+        let mut by_tid: FxHashMap<i64, Vec<usize>> = FxHashMap::default();
+        for (fi, fam) in families.iter().enumerate() {
+            by_tid
+                .entry(fam.tid)
+                .or_insert_with(|| {
+                    order.push(fam.tid);
+                    Vec::new()
+                })
+                .push(fi);
+        }
+        let mut schemas = FxHashMap::default();
+        let mut overlays = FxHashMap::default();
+        let mut surviving = FxHashMap::default();
+        for &tid in &order {
+            schemas.insert(tid, schema_of(disp_ptr, tid)?);
+            let mut overlay = Overlay::default();
+            for &fi in &by_tid[&tid] {
+                fold_family(&mut overlay, fi, &families[fi].batch);
+            }
+            let survivors: Vec<(PkBuf, u32, u32)> = overlay
+                .iter()
+                .filter_map(|(pk, op)| match op {
+                    FoldOp::Inserted(f, r) => Some((*pk, *f, *r)),
+                    FoldOp::Deleted => None,
+                })
+                .collect();
+            overlays.insert(tid, overlay);
+            surviving.insert(tid, survivors);
+        }
+        Ok(TxnBundle {
+            families,
+            order,
+            by_tid,
+            schemas,
+            overlays,
+            surviving,
+        })
+    }
+
+    fn has(&self, tid: i64) -> bool {
+        self.overlays.contains_key(&tid)
+    }
+
+    fn schema(&self, tid: i64) -> &SchemaDescriptor {
+        &self.schemas[&tid]
+    }
+
+    fn overlay(&self, tid: i64) -> &Overlay {
+        &self.overlays[&tid]
+    }
+
+    fn batch(&self, fam: u32) -> &Batch {
+        &self.families[fam as usize].batch
+    }
+
+    fn family_indices(&self, tid: i64) -> &[usize] {
+        &self.by_tid[&tid]
+    }
+
+    fn families_of(&self, tid: i64) -> impl Iterator<Item = &TxnFamily> {
+        self.by_tid[&tid].iter().map(|&fi| &self.families[fi])
+    }
+
+    /// The rows of `tid` that survive the whole bundle: `(pk, family, row)`.
+    /// Precomputed in `new`.
+    fn surviving(&self, tid: i64) -> &[(PkBuf, u32, u32)] {
+        &self.surviving[&tid]
+    }
+}
+
+/// One planned FK probe: the committed-occupancy check is sent to `probe_tid` on
+/// column `col` under `schema`/`src_type` for the given `values`, and a violation
+/// names the counterpart table `report_tid`. Shared by the F1 existence check
+/// (probe = parent, report = child) and the F2 RESTRICT check (probe = child,
+/// report = parent).
+struct FkProbePlan {
+    probe_tid: i64,
+    report_tid: i64,
+    col: usize,
+    schema: SchemaDescriptor,
+    src_type: u8,
+    values: Vec<u128>,
+}
+
+/// One planned unique-secondary-index check: the circuit's columns and index
+/// schema, the key encoder, and the `(span, surviving holder PK)` claims to
+/// verify against the committed occupancy the pipelined probe returns.
+struct UniquePlan {
+    tid: i64,
+    col_indices: PkColList,
+    idx_schema: SchemaDescriptor,
+    spec: IndexKeySpec,
+    stride: usize,
+    span_holders: Vec<(PkBuf, PkBuf)>,
+}
+
+/// Encode a native value `v` (from a column of type `src_type`) into the OPK
+/// leading-key image of `schema`'s primary key — byte-identical to what
+/// `build_check_batch` writes, so a membership test against the pipeline
+/// found-set (which echoes matched probe keys) compares identical byte images.
+fn enc_key(schema: &SchemaDescriptor, v: u128, src_type: u8) -> PkBuf {
+    let (stride, idx_key_type) = opk_leading_key(schema);
+    PkBuf::from_bytes(&crate::schema::index_opk_prefix(v, src_type, idx_key_type)[..stride])
+}
+
 impl MasterDispatcher {
     // -----------------------------------------------------------------------
     //
@@ -563,31 +788,11 @@ impl MasterDispatcher {
         // enforcement); zero-allocation over `batch`'s pages.
         let mb = batch.as_mem_batch();
 
-        // PK net-weight aggregation, width-universal: one map keyed by each
-        // row's OPK bytes borrowed from the batch PK region — a 16-byte fat
-        // pointer at any stride, constructing nothing per row. Sized to
-        // `batch.count` and dropped at the end of this block, so the borrow
-        // never escapes the synchronous prelude (the first `.await` is well
-        // past it). Mirrors `enforce_unique_pk`'s in-batch `&[u8]` maps. The
-        // collected net-positive byte spans feed the UPSERT PK-identification
-        // check below.
+        // Net-positive PK byte spans feed the UPSERT PK-identification check
+        // below; the borrowed keys never escape this synchronous prelude.
         let mut pk_keys: Vec<PkBuf> = Vec::new();
         if has_unique || needs_pk_rejection {
-            let mut net: FxHashMap<&[u8], (i64, u32)> =
-                FxHashMap::with_capacity_and_hasher(batch.count, Default::default());
-            for i in 0..batch.count {
-                let w = batch.get_weight(i);
-                if w == 0 {
-                    continue;
-                }
-                let e = net.entry(batch.get_pk_bytes(i)).or_insert((0, 0));
-                e.0 += w;
-                // A +w row is w insertions of the PK; Error mode must reject it
-                // like the w separate +1 rows it encodes.
-                if w > 0 {
-                    e.1 += if w > 1 { 2 } else { 1 };
-                }
-            }
+            let net = pk_net_weight_and_dup_count(batch);
             if needs_pk_rejection {
                 for (&pk, &(_, pos_count)) in net.iter() {
                     if pos_count > 1 {
@@ -1241,6 +1446,609 @@ impl MasterDispatcher {
         }
 
         Ok(())
+    }
+    /// Validate an atomic user-table transaction bundle against its
+    /// post-transaction state (the simulated fold of all families), except
+    /// Error-mode PK existence which is cumulative in frame order. The whole
+    /// transaction passes or one violation aborts it — all pre-SAL. The three
+    /// rule checks reuse the plain-push distributed probe primitives
+    /// (`execute_pipeline_async`, `seek_unique_holder`, `execute_gather_async`,
+    /// `fan_out_seek_by_index_collect_async`), fed fold-derived keys instead of a
+    /// single batch's raw rows, and — like the plain-push validator — each plans
+    /// every one of its probes first and issues them as ONE pipelined burst.
+    /// Committed state is stable across every probe because the caller holds the
+    /// involved tables' locks and the catalog read lock through the ACK.
+    /// Fire one pipelined probe burst and recycle the check batches back to the
+    /// pool. `execute_pipeline_async` already returns an empty result for an empty
+    /// `checks`, so callers need no length guard. The paired reclaim is centralized
+    /// here so no probe site can forget it (a leaked pooled batch).
+    async fn execute_and_reclaim(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
+        checks: &mut [PipelinedCheck],
+    ) -> Result<Vec<FxHashSet<PkBuf>>, String> {
+        let results = Self::execute_pipeline_async(disp_ptr, reactor, sal_excl, checks).await?;
+        unsafe { reclaim_check_batches(&mut *disp_ptr, checks) };
+        Ok(results)
+    }
+
+    pub async fn validate_txn_distributed_async(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
+        families: &[TxnFamily],
+    ) -> Result<(), String> {
+        let bundle = TxnBundle::new(disp_ptr, families)?;
+        Self::txn_check_pk(disp_ptr, reactor, sal_excl, &bundle).await?;
+        Self::txn_check_unique_indices(disp_ptr, reactor, sal_excl, &bundle).await?;
+        Self::txn_check_foreign_keys(disp_ptr, reactor, sal_excl, &bundle).await
+    }
+
+    /// Rule U-PK: Error-mode PK existence, cumulative in frame order. One
+    /// committed-existence probe per Error-bearing table, all issued in one
+    /// burst; then each table's families are walked in frame order and each
+    /// Error family checked against the running prefix fold before being folded
+    /// into it.
+    async fn txn_check_pk(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
+        b: &TxnBundle<'_>,
+    ) -> Result<(), String> {
+        let mut tids: Vec<i64> = Vec::new();
+        let mut checks: Vec<PipelinedCheck> = Vec::new();
+        for &tid in &b.order {
+            if !b.families_of(tid).any(|f| matches!(f.mode, WireConflictMode::Error)) {
+                continue;
+            }
+            // Candidate PKs to probe committed: any PK inserted positively by an
+            // Error family (a superset of each family's net-positive set). With
+            // none, no Error family can carry a net-positive PK, so the whole
+            // table's walk is vacuous.
+            let mut candidate: FxHashSet<PkBuf> = FxHashSet::default();
+            for fam in b.families_of(tid).filter(|f| matches!(f.mode, WireConflictMode::Error)) {
+                for row in 0..fam.batch.count {
+                    if fam.batch.get_weight(row) > 0 {
+                        candidate.insert(PkBuf::from_bytes(fam.batch.get_pk_bytes(row)));
+                    }
+                }
+            }
+            if candidate.is_empty() {
+                continue;
+            }
+            let schema = *b.schema(tid);
+            let keys: Vec<PkBuf> = candidate.into_iter().collect();
+            let pooled = unsafe { (*disp_ptr).pool_pop_batch(tid) };
+            tids.push(tid);
+            checks.push(PipelinedCheck {
+                target_id: tid,
+                col_hint: 0,
+                payload: Some(CheckPayload::ScatterSource {
+                    source: build_check_batch_pkbuf(&schema, &keys, pooled),
+                }),
+                schema,
+            });
+        }
+        let mut results = Self::execute_and_reclaim(disp_ptr, reactor, sal_excl, &mut checks).await?;
+
+        for (i, &tid) in tids.iter().enumerate() {
+            let committed = std::mem::take(&mut results[i]);
+            let schema = *b.schema(tid);
+            let mut prefix: Overlay = Overlay::default();
+            for &fi in b.family_indices(tid) {
+                let batch = &b.families[fi].batch;
+                if matches!(b.families[fi].mode, WireConflictMode::Error) {
+                    // Error-family PK existence, checked against the running prefix
+                    // fold then committed state. A +w row is w insertions (see
+                    // `pk_net_weight_and_dup_count`), so `pos > 1` is an in-family
+                    // duplicate.
+                    let net = pk_net_weight_and_dup_count(batch);
+                    for (&pk, &(net_w, pos)) in &net {
+                        let key_str = || format_pk_value_bytes(pk, &schema);
+                        if pos > 1 {
+                            return Err(unsafe { (*disp_ptr).batch_dup_pk_err(tid, &schema, &key_str()) });
+                        }
+                        if net_w <= 0 {
+                            continue;
+                        }
+                        let pkbuf = PkBuf::from_bytes(pk);
+                        let exists = match prefix.get(&pkbuf) {
+                            Some(FoldOp::Inserted(..)) => true,
+                            Some(FoldOp::Deleted) => false,
+                            None => committed.contains(&pkbuf),
+                        };
+                        if exists {
+                            let (pk_names, sn, tn) = unsafe { (*disp_ptr).pk_violation_context(tid, &schema) };
+                            return Err(format!(
+                                "duplicate key value violates unique constraint \"{sn}_{tn}_pkey\": Key ({pk_names})=({}) already exists",
+                                key_str(),
+                            ));
+                        }
+                    }
+                }
+                fold_family(&mut prefix, fi, batch);
+            }
+        }
+        Ok(())
+    }
+
+    /// Rule U-SEC: unique secondary indexes, post-transaction. Every
+    /// (table, unique circuit)'s surviving spans are planned up front and their
+    /// committed-occupancy probes issued in one burst; the per-span committed-
+    /// holder seeks then fan out concurrently rather than one round trip each.
+    async fn txn_check_unique_indices(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
+        b: &TxnBundle<'_>,
+    ) -> Result<(), String> {
+        let mut plans: Vec<UniquePlan> = Vec::new();
+        let mut checks: Vec<PipelinedCheck> = Vec::new();
+        for &tid in &b.order {
+            let (n_circuits, has_unique) = unsafe {
+                let cat = &*(*disp_ptr).catalog;
+                (cat.get_index_circuit_count(tid), cat.has_any_unique_index(tid))
+            };
+            if n_circuits == 0 || !has_unique {
+                continue;
+            }
+            let source_schema = *b.schema(tid);
+            let surviving = b.surviving(tid);
+            if surviving.is_empty() {
+                continue;
+            }
+            for ci in 0..n_circuits {
+                let (col_indices, idx_schema) = unsafe {
+                    let cat = &mut *(*disp_ptr).catalog;
+                    let cols = match cat.unique_index_circuit_cols(tid, ci) {
+                        Some(c) => PkColList::from_slice(c),
+                        None => continue,
+                    };
+                    let idx_schema = match cat.get_index_circuit_schema(tid, ci) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    (cols, idx_schema)
+                };
+                let cols = col_indices.as_slice();
+                let spec = IndexKeySpec::new(cols, &source_schema, &idx_schema);
+                let stride = idx_schema.pk_stride() as usize;
+
+                // Surviving (span, holder PK) pairs; reject an in-bundle duplicate
+                // (two survivors, same span, different PK) on the way.
+                let mut by_span: FxHashMap<PkBuf, PkBuf> = FxHashMap::default();
+                let mut span_holders: Vec<(PkBuf, PkBuf)> = Vec::new();
+                let mut keybuf = PkBuf::empty(0);
+                for (pk, fam, row) in surviving {
+                    let mb = b.batch(*fam).as_mem_batch();
+                    if !spec.key_bytes(&mb, *row as usize, &mut keybuf) {
+                        continue; // NULL in an indexed column ⇒ unindexed
+                    }
+                    match by_span.get(&keybuf) {
+                        Some(other) if other != pk => {
+                            return Err(unsafe { (*disp_ptr).unique_violation_err(tid, cols, true) });
+                        }
+                        Some(_) => {}
+                        None => {
+                            by_span.insert(keybuf, *pk);
+                        }
+                    }
+                    span_holders.push((keybuf, *pk));
+                }
+                if by_span.is_empty() {
+                    continue;
+                }
+
+                let spans: Vec<PkBuf> = by_span.keys().cloned().collect();
+                let pooled = unsafe { (*disp_ptr).pool_pop_batch(tid) };
+                let chk = build_check_batch_with(&idx_schema, &spans, pooled, |bat, k| {
+                    bat.extend_pk_bytes(k.padded(stride))
+                });
+                checks.push(PipelinedCheck {
+                    target_id: tid,
+                    col_hint: gnitz_wire::pack_pk_cols(cols),
+                    payload: Some(CheckPayload::Broadcast(chk)),
+                    schema: idx_schema,
+                });
+                plans.push(UniquePlan {
+                    tid,
+                    col_indices,
+                    idx_schema,
+                    spec,
+                    stride,
+                    span_holders,
+                });
+            }
+        }
+        let results = Self::execute_and_reclaim(disp_ptr, reactor, sal_excl, &mut checks).await?;
+
+        // Every occupied surviving span needs its committed holder. Fan the seeks
+        // out across all plans before collecting, so they overlap on the wire
+        // instead of costing one round trip each.
+        let mut pending: Vec<(usize, PkBuf, PkBuf)> = Vec::new();
+        let mut futs = Vec::new();
+        for (pi, plan) in plans.iter().enumerate() {
+            let idx_cols = &plan.idx_schema.columns[..plan.col_indices.as_slice().len()];
+            for (span, holder_pk) in &plan.span_holders {
+                if !results[pi].contains(span.padded(plan.stride)) {
+                    continue;
+                }
+                pending.push((pi, *span, *holder_pk));
+                // async fn futures are !Unpin; box-pin for join_all_unpin.
+                futs.push(Box::pin(Self::seek_unique_holder(
+                    disp_ptr,
+                    reactor,
+                    sal_excl,
+                    plan.tid,
+                    plan.col_indices,
+                    span_to_natives(span, idx_cols),
+                )));
+            }
+        }
+        let holders = crate::runtime::reactor::join_all_unpin(futs).await;
+
+        // A committed holder is acceptable only if the bundle retires it: either
+        // it is the surviving row that claims the span, or its own surviving state
+        // is absent / no longer holds that span.
+        for ((pi, span, holder_pk), holder_result) in pending.into_iter().zip(holders) {
+            let Some(h) = holder_result? else { continue };
+            if h == holder_pk {
+                continue;
+            }
+            let plan = &plans[pi];
+            let retired = match b.overlay(plan.tid).get(&h) {
+                None => false,
+                Some(FoldOp::Deleted) => true,
+                Some(FoldOp::Inserted(hf, hr)) => {
+                    let hmb = b.batch(*hf).as_mem_batch();
+                    let mut hspan = PkBuf::empty(0);
+                    !plan.spec.key_bytes(&hmb, *hr as usize, &mut hspan) || hspan != span
+                }
+            };
+            if !retired {
+                return Err(unsafe { (*disp_ptr).unique_violation_err(plan.tid, plan.col_indices.as_slice(), false) });
+            }
+        }
+        Ok(())
+    }
+
+    /// Rules F1 (FK existence) and F2 (FK RESTRICT), post-transaction.
+    ///
+    /// Both rules turn on the `(retired, added)` referenced-value sets of a
+    /// bundled parent, so those are resolved once per `(parent tid, referenced
+    /// col)` and shared. F1's parent-existence probes then issue in one burst,
+    /// F2's child-reference probes in a second, and F2's per-value exemption
+    /// fetches fan out concurrently.
+    async fn txn_check_foreign_keys(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
+        b: &TxnBundle<'_>,
+    ) -> Result<(), String> {
+        // (child tid, fk col, parent tid, parent col) for every FK whose child is
+        // bundled; (parent tid, child tid, fk col, referenced col) for every FK
+        // whose parent is bundled.
+        let mut constraints: Vec<(i64, usize, i64, usize)> = Vec::new();
+        let mut children: Vec<(i64, i64, usize, usize)> = Vec::new();
+        for &tid in &b.order {
+            unsafe {
+                let cat = &*(*disp_ptr).catalog;
+                constraints.extend(
+                    cat.fk_constraints_of(tid)
+                        .iter()
+                        .map(|c| (tid, c.fk_col_idx, c.target_table_id, c.target_col_idx)),
+                );
+                children.extend(
+                    cat.fk_children_of(tid)
+                        .iter()
+                        .map(|r| (tid, r.child_tid, r.fk_col_idx, r.parent_col_idx)),
+                );
+            }
+        }
+        if constraints.is_empty() && children.is_empty() {
+            return Ok(());
+        }
+
+        // Resolve `(retired, added)` once per bundled (parent tid, referenced col).
+        // Two FKs onto the same parent column would otherwise redo the identical
+        // overlay walk and committed-value gather.
+        let mut needed: Vec<(i64, usize)> = constraints
+            .iter()
+            .filter(|(_, _, ptid, _)| b.has(*ptid))
+            .map(|&(_, _, ptid, pcol)| (ptid, pcol))
+            .chain(children.iter().map(|&(ptid, _, _, pcol)| (ptid, pcol)))
+            .collect();
+        needed.sort_unstable();
+        needed.dedup();
+        // Fan the per-parent gathers out concurrently — they run under the full
+        // lock union, so overlapping their reply waits (as the U-SEC holder seeks
+        // and F2 exemption fetches already do) beats one sequential round trip
+        // per parent column.
+        let futs: Vec<_> = needed
+            .iter()
+            .map(|&(ptid, pcol)| Box::pin(Self::parent_retired_added(disp_ptr, reactor, sal_excl, b, ptid, pcol)))
+            .collect();
+        let resolved = crate::runtime::reactor::join_all_unpin(futs).await;
+        let mut deltas: ParentDeltas = ParentDeltas::default();
+        for (&(ptid, pcol), d) in needed.iter().zip(resolved) {
+            deltas.insert((ptid, pcol), d?);
+        }
+
+        Self::txn_check_fk_existence(disp_ptr, reactor, sal_excl, b, &constraints, &deltas).await?;
+        Self::txn_check_fk_restrict(disp_ptr, reactor, sal_excl, b, &children, &deltas).await
+    }
+
+    /// Rule F1: every surviving row's FK value must reference a row that exists
+    /// after the transaction — present in committed state and not retired by the
+    /// bundle, or added by it.
+    async fn txn_check_fk_existence(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
+        b: &TxnBundle<'_>,
+        constraints: &[(i64, usize, i64, usize)],
+        deltas: &ParentDeltas,
+    ) -> Result<(), String> {
+        let mut plans: Vec<FkProbePlan> = Vec::new();
+        let mut checks: Vec<PipelinedCheck> = Vec::new();
+        for &(tid, fk_col, parent_tid, parent_col) in constraints {
+            let source_schema = b.schema(tid);
+            let loc = source_schema.locate(fk_col);
+
+            // The distinct non-NULL FK values of this table's surviving rows.
+            let mut seen: FxHashSet<u128> = FxHashSet::default();
+            let mut values: Vec<u128> = Vec::new();
+            for (_pk, fam, row) in b.surviving(tid) {
+                let mb = b.batch(*fam).as_mem_batch();
+                if loc.is_null(&mb, *row as usize) {
+                    continue;
+                }
+                let v = loc.native_key(&mb, *row as usize);
+                if seen.insert(v) {
+                    values.push(v);
+                }
+            }
+            if values.is_empty() {
+                continue;
+            }
+
+            // PK fast-path only when the referenced column *is* the parent's lone
+            // PK; otherwise probe the parent's UNIQUE index by broadcast, since
+            // index entries are distributed independently of the PK.
+            let parent_schema = schema_of(disp_ptr, parent_tid)?;
+            let ppk = parent_schema.pk_indices();
+            let src_type = loc.type_code();
+            let (probe_schema, col_hint, broadcast) = if ppk.len() == 1 && ppk[0] as usize == parent_col {
+                (parent_schema, 0u64, false)
+            } else {
+                let idx_schema =
+                    unsafe { (*(*disp_ptr).catalog).get_index_schema_by_cols(parent_tid, &[parent_col as u32]) }
+                        .ok_or_else(|| {
+                            format!("TXN FK check: no unique index on parent {parent_tid} col {parent_col}")
+                        })?;
+                (idx_schema, gnitz_wire::pack_pk_cols(&[parent_col as u32]), true)
+            };
+            let pooled = unsafe { (*disp_ptr).pool_pop_batch(parent_tid) };
+            let chk = build_check_batch(&probe_schema, &values, src_type, pooled);
+            checks.push(PipelinedCheck {
+                target_id: parent_tid,
+                col_hint,
+                payload: Some(if broadcast {
+                    CheckPayload::Broadcast(chk)
+                } else {
+                    CheckPayload::ScatterSource { source: chk }
+                }),
+                schema: probe_schema,
+            });
+            plans.push(FkProbePlan {
+                probe_tid: parent_tid,
+                report_tid: tid,
+                col: parent_col,
+                schema: probe_schema,
+                src_type,
+                values,
+            });
+        }
+        let results = Self::execute_and_reclaim(disp_ptr, reactor, sal_excl, &mut checks).await?;
+
+        // A non-bundled parent has no delta (the degenerate plain-push case).
+        let no_delta: ParentDelta = (FxHashSet::default(), FxHashSet::default());
+        for (i, plan) in plans.iter().enumerate() {
+            let (retired, added) = deltas.get(&(plan.probe_tid, plan.col)).unwrap_or(&no_delta);
+            for v in &plan.values {
+                let in_committed = results[i].contains(&enc_key(&plan.schema, *v, plan.src_type));
+                if (in_committed && !retired.contains(v)) || added.contains(v) {
+                    continue;
+                }
+                let (sn, tn, tsn, ttn) = unsafe {
+                    let disp = &mut *disp_ptr;
+                    let (s, t) = disp.get_qualified_name_owned(plan.report_tid);
+                    let (ts, tt) = disp.get_qualified_name_owned(plan.probe_tid);
+                    (s, t, ts, tt)
+                };
+                return Err(format!(
+                    "Foreign Key violation in '{sn}.{tn}': value not found in target '{tsn}.{ttn}'"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Rule F2: a referenced value the bundle removes and does not re-add must
+    /// have no surviving child row referencing it. `exists_after(v)` for
+    /// `v ∈ retired` reduces to `added.contains(v)` (the committed term is masked
+    /// by `v ∈ retired`), so the checked set is `retired ∖ added`.
+    async fn txn_check_fk_restrict(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
+        b: &TxnBundle<'_>,
+        children: &[(i64, i64, usize, usize)],
+        deltas: &ParentDeltas,
+    ) -> Result<(), String> {
+        let mut plans: Vec<FkProbePlan> = Vec::new();
+        let mut checks: Vec<PipelinedCheck> = Vec::new();
+        for &(tid, child_tid, fk_col, ref_col) in children {
+            let (retired, added) = &deltas[&(tid, ref_col)];
+            let v_check: Vec<u128> = retired.iter().copied().filter(|v| !added.contains(v)).collect();
+            if v_check.is_empty() {
+                continue;
+            }
+            let idx_schema = unsafe { (*(*disp_ptr).catalog).get_index_schema_by_cols(child_tid, &[fk_col as u32]) }
+                .ok_or_else(|| format!("TXN RESTRICT: no index on child {child_tid} col {fk_col}"))?;
+            let src_type = b.schema(tid).columns[ref_col].type_code;
+            let pooled = unsafe { (*disp_ptr).pool_pop_batch(child_tid) };
+            let chk = build_check_batch(&idx_schema, &v_check, src_type, pooled);
+            checks.push(PipelinedCheck {
+                target_id: child_tid,
+                col_hint: gnitz_wire::pack_pk_cols(&[fk_col as u32]),
+                payload: Some(CheckPayload::Broadcast(chk)),
+                schema: idx_schema,
+            });
+            plans.push(FkProbePlan {
+                probe_tid: child_tid,
+                report_tid: tid,
+                col: fk_col,
+                schema: idx_schema,
+                src_type,
+                values: v_check,
+            });
+        }
+        let results = Self::execute_and_reclaim(disp_ptr, reactor, sal_excl, &mut checks).await?;
+
+        // A committed child reference is fatal unless the bundle also touches the
+        // child table and every referencing child row is retired or re-pointed —
+        // which needs the child rows themselves. Collect those fetches first, then
+        // fan them out.
+        let mut fetches: Vec<(usize, u128)> = Vec::new();
+        for (i, plan) in plans.iter().enumerate() {
+            for v in &plan.values {
+                if !results[i].contains(&enc_key(&plan.schema, *v, plan.src_type)) {
+                    continue; // no committed children reference v
+                }
+                if !b.has(plan.probe_tid) {
+                    // Untouched committed children exist and no bundled child
+                    // family can exempt them.
+                    return Err(restrict_err(disp_ptr, plan.report_tid, plan.probe_tid));
+                }
+                fetches.push((i, *v));
+            }
+        }
+        if fetches.is_empty() {
+            return Ok(());
+        }
+        if fetches.len() > TXN_RESTRICT_FETCH_LIMIT {
+            return Err("TXN: RESTRICT exemption fetch limit exceeded; split the transaction".to_string());
+        }
+        let futs: Vec<_> = fetches
+            .iter()
+            .map(|&(i, v)| {
+                let plan = &plans[i];
+                Box::pin(Self::fan_out_seek_by_index_collect_async(
+                    disp_ptr,
+                    reactor,
+                    sal_excl,
+                    plan.probe_tid,
+                    gnitz_wire::pack_pk_cols(&[plan.col as u32]),
+                    v,
+                    &[],
+                ))
+            })
+            .collect();
+        let fetched = crate::runtime::reactor::join_all_unpin(futs).await;
+
+        for (&(i, v), rows) in fetches.iter().zip(fetched) {
+            let plan = &plans[i];
+            let rows = rows.map_err(|_| {
+                "TXN: RESTRICT exemption fetch for a hot FK value exceeds the reply cap; split the transaction"
+                    .to_string()
+            })?;
+            let Some(rows) = rows else { continue };
+            let child_loc = b.schema(plan.probe_tid).locate(plan.col);
+            let child_overlay = b.overlay(plan.probe_tid);
+            for j in 0..rows.count {
+                let cpk = PkBuf::from_bytes(rows.get_pk_bytes(j));
+                let still_refs = match child_overlay.get(&cpk) {
+                    None => true, // untouched committed child still references v
+                    Some(FoldOp::Deleted) => false,
+                    Some(FoldOp::Inserted(cf, cr)) => {
+                        let smb = b.batch(*cf).as_mem_batch();
+                        !child_loc.is_null(&smb, *cr as usize) && child_loc.native_key(&smb, *cr as usize) == v
+                    }
+                };
+                if still_refs {
+                    return Err(restrict_err(disp_ptr, plan.report_tid, plan.probe_tid));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The `(retired, added)` referenced-column value sets of bundled FK parent
+    /// `parent_tid` for column `ref_col`: `added` are the surviving parent rows'
+    /// (non-NULL) values; `retired` are the old committed values of touched PKs
+    /// whose surviving state is absent or holds a different value. The old values
+    /// come from the packed PK (a PK column) or one batched `execute_gather_async`
+    /// (a non-PK referenced column). NULL values are unindexed and excluded.
+    async fn parent_retired_added(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
+        b: &TxnBundle<'_>,
+        parent_tid: i64,
+        ref_col: usize,
+    ) -> Result<ParentDelta, String> {
+        let parent_schema = b.schema(parent_tid);
+        let overlay = b.overlay(parent_tid);
+
+        // Old committed value per touched PK (non-NULL only).
+        let mut old_of: FxHashMap<PkBuf, u128> = FxHashMap::default();
+        if parent_schema.is_pk_col(ref_col) {
+            let col_type = parent_schema.columns[ref_col].type_code;
+            let col_size = parent_schema.columns[ref_col].size() as usize;
+            let off = parent_schema.pk_byte_offset(ref_col) as usize;
+            for p in overlay.keys() {
+                old_of.insert(*p, pk_native_key(p.pk_bytes(), off, col_size, col_type));
+            }
+        } else {
+            let gathered = Self::execute_gather_async(
+                disp_ptr,
+                reactor,
+                sal_excl,
+                parent_tid,
+                overlay.keys().copied().collect(),
+                &[ref_col as u8],
+            )
+            .await?;
+            for p in overlay.keys() {
+                if let Some(Some(v)) = gathered.get(p.pk_bytes()).map(|row| row[0]) {
+                    old_of.insert(*p, v);
+                }
+            }
+        }
+
+        let loc = parent_schema.locate(ref_col);
+        let mut added: FxHashSet<u128> = FxHashSet::default();
+        let mut retired: FxHashSet<u128> = FxHashSet::default();
+        for (p, op) in overlay {
+            let surviving_val: Option<u128> = match op {
+                FoldOp::Inserted(f, r) => {
+                    let mb = b.batch(*f).as_mem_batch();
+                    (!loc.is_null(&mb, *r as usize)).then(|| loc.native_key(&mb, *r as usize))
+                }
+                FoldOp::Deleted => None,
+            };
+            if let Some(sv) = surviving_val {
+                added.insert(sv);
+            }
+            if let Some(&ov) = old_of.get(p) {
+                if surviving_val != Some(ov) {
+                    retired.insert(ov);
+                }
+            }
+        }
+        Ok((retired, added))
     }
 
     /// Pre-flight global uniqueness check for CREATE UNIQUE INDEX, distributed:

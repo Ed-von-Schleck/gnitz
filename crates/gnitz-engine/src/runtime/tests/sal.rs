@@ -585,3 +585,112 @@ fn test_sal_prefix_packing_boundaries() {
         assert_eq!(rr.data_size as usize, 3 << 20);
     }
 }
+
+// ---------------------------------------------------------------------------
+// wire_group_footprint exactness (load-bearing: the committer's per-transaction
+// fit check and Phase-B fail-stop depend on it equaling the bytes emission
+// actually consumes).
+// ---------------------------------------------------------------------------
+
+/// Emit `batch` (partitioned or broadcast) through `scatter_wire_group` and
+/// assert the cursor advance equals `wire_group_footprint`'s prediction.
+unsafe fn assert_footprint_exact(
+    schema: &crate::schema::SchemaDescriptor,
+    batch: &crate::storage::Batch,
+    broadcast: bool,
+    nw: usize,
+) {
+    use crate::ops::{with_broadcast_indices, with_worker_indices};
+    use crate::runtime::sal::{compute_wire_props, FLAG_PUSH};
+    use crate::runtime::wire::build_schema_wire_block;
+
+    let size = 1 << 20;
+    let region = SharedRegion::new(size);
+    let ptr = region.ptr();
+    let efds: Vec<i32> = (0..nw).map(|_| posix_io::eventfd_create()).collect();
+    let mut writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
+    writer.reset(0, 1); // epoch >= 1 for sal_begin_group's debug_assert
+
+    let target_id = 16u32;
+    let block = build_schema_wire_block(schema, &[], 0, target_id);
+    let props = compute_wire_props(schema);
+    let req_ids: Vec<u64> = (0..nw as u64).map(|i| i + 1).collect();
+
+    let emit = |wi: &[Vec<u32>]| {
+        let predicted = writer.wire_group_footprint(batch, wi, schema, block.len(), props);
+        let before = writer.cursor();
+        writer
+            .scatter_wire_group(
+                batch,
+                wi,
+                schema,
+                None,
+                target_id,
+                7,
+                FLAG_PUSH,
+                0,
+                0,
+                0,
+                &req_ids,
+                -1,
+                Some(block.as_slice()),
+                Some(props),
+            )
+            .expect("group fits");
+        let actual = (writer.cursor() - before) as usize;
+        assert_eq!(predicted, actual, "wire_group_footprint must equal emitted bytes");
+    };
+    if broadcast {
+        with_broadcast_indices(batch, nw, emit);
+    } else {
+        with_worker_indices(batch, schema, nw, emit);
+    }
+    for &e in &efds {
+        libc::close(e);
+    }
+}
+
+#[test]
+fn test_wire_group_footprint_wire_safe_partitioned_and_empty_slots() {
+    // A small partitioned batch over 4 workers leaves some worker slots empty
+    // (schema-only), exercising the count-0 branch of the closed form.
+    use crate::test_support::{make_batch, make_schema_u64_i64};
+    let schema = make_schema_u64_i64();
+    let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40), (5, 1, 50)]);
+    unsafe { assert_footprint_exact(&schema, &batch, false, 4) };
+}
+
+#[test]
+fn test_wire_group_footprint_wire_safe_broadcast() {
+    // Broadcast fills every worker slot with all rows (replicated family shape),
+    // and the schema block is paid once per worker.
+    use crate::test_support::{make_batch, make_schema_u64_i64};
+    let schema = make_schema_u64_i64();
+    let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
+    unsafe { assert_footprint_exact(&schema, &batch, true, 4) };
+}
+
+#[test]
+fn test_wire_group_footprint_non_wire_safe_shared_span_dedup() {
+    // A string (non-wire-safe) batch whose two rows reference the SAME source
+    // span: the per-worker sub-batch's BlobCache copies the span once, so
+    // measuring the materialized sub-batch (not a naive per-row sum) is the only
+    // byte-exact computation. Broadcast so both rows land in one slot.
+    use crate::storage::Batch;
+    use crate::test_support::{german_string, make_schema_pk_u64_payload_string};
+    let schema = make_schema_pk_u64_payload_string();
+    let mut blob: Vec<u8> = Vec::new();
+    let span = b"a long shared string span well over twelve bytes";
+    let gs = german_string(span, &mut blob); // appended once → shared offset
+
+    let mut batch = Batch::with_schema(schema, 2);
+    for pk in [1u128, 2u128] {
+        batch.extend_pk(pk);
+        batch.extend_weight(&1i64.to_le_bytes());
+        batch.extend_null_bmp(&0u64.to_le_bytes());
+        batch.extend_col(0, &gs); // both rows reference the same source span
+        batch.count += 1;
+    }
+    batch.blob = blob;
+    unsafe { assert_footprint_exact(&schema, &batch, true, 3) };
+}

@@ -4,6 +4,18 @@
 
 use super::index_router::index_route_key;
 use super::*;
+use crate::runtime::sal::SENTINEL_SIZE;
+
+/// The verdict of `MasterDispatcher::txn_fit`.
+pub(crate) enum TxnFit {
+    /// The zone fits the SAL's remaining space — emit it.
+    Fits,
+    /// It fits an empty SAL but not the current remainder: a checkpoint reclaims
+    /// enough space, so the client's retry can succeed.
+    Transient,
+    /// It exceeds the SAL outright — no checkpoint can help; retrying is futile.
+    Terminal,
+}
 
 /// Timeout for the synchronous `W2mReceiver::wait_for` fallback in the two
 /// reactor-driven-but-sometimes-parked collect loops below.
@@ -1280,6 +1292,49 @@ impl MasterDispatcher {
         // All workers reaped: no process can race a removal. Reclaim any dirs
         // still gated (dropped entities whose gating checkpoint never arrived).
         unsafe { &mut *self.catalog }.drain_checkpoint_gated_deletions();
+    }
+
+    /// Whether a transaction's family groups fit the SAL, and if not, whether a
+    /// checkpoint could make them fit. The committer's whole space question in
+    /// one call — it never sees the cursor, the mmap size, or `SENTINEL_SIZE`
+    /// (the sentinel is globally reserved by `sal_begin_group`, so the effective
+    /// capacity is `mmap_size - SENTINEL_SIZE`).
+    pub(crate) fn txn_fit(&mut self, families: &[(i64, &Batch)]) -> TxnFit {
+        let footprint = self.txn_zone_footprint(families);
+        let capacity = (self.sal.mmap_size() as usize).saturating_sub(SENTINEL_SIZE);
+        if footprint > capacity {
+            return TxnFit::Terminal;
+        }
+        if footprint > capacity.saturating_sub(self.sal.cursor() as usize) {
+            return TxnFit::Transient;
+        }
+        TxnFit::Fits
+    }
+
+    /// The exact SAL footprint (bytes) of a transaction's family groups — the sum
+    /// over families of each family group's `wire_group_footprint`, partitioned
+    /// the way `write_commit_group` will emit it (broadcast for a replicated
+    /// schema, else PK-partitioned). Side-effect-free: it skips
+    /// `record_index_routing`, which belongs only to real emission.
+    fn txn_zone_footprint(&mut self, families: &[(i64, &Batch)]) -> usize {
+        let nw = self.num_workers;
+        let mut total = 0usize;
+        for &(tid, batch) in families {
+            let (schema, block, wire_safe, wire_row_stride) = self.cached_schema_block(tid);
+            let props = (wire_safe, wire_row_stride);
+            let block_len = block.len();
+            let sal = &self.sal;
+            total += if schema.replicated() {
+                with_broadcast_indices(batch, nw, |wi| {
+                    sal.wire_group_footprint(batch, wi, &schema, block_len, props)
+                })
+            } else {
+                with_worker_indices(batch, &schema, nw, |wi| {
+                    sal.wire_group_footprint(batch, wi, &schema, block_len, props)
+                })
+            };
+        }
+        total
     }
 
     /// Commit N push batches as a single SAL group write. Called from

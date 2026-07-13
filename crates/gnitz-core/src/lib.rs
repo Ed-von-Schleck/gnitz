@@ -13,7 +13,9 @@ pub use circuit::{
     agg_output_type, AggFunc, AggKind, Circuit, CircuitBuilder, CircuitRows, JoinKind, MapKind, NodeId, OpNode, Port,
     RangeRel, ReduceOutKey, TableId,
 };
-pub use client::{hidden_view_name, GnitzClient, IndexMeta, InlineUniqueIndex, PlannedView, MAX_CHAIN_SEGMENTS};
+pub use client::{
+    hidden_view_name, GnitzClient, IndexMeta, InlineUniqueIndex, PlannedView, TxnBuffer, MAX_CHAIN_SEGMENTS,
+};
 pub use connection::{
     ScanResult, Session, COL_TAB, DEP_TAB, FIRST_USER_SCHEMA_ID, FIRST_USER_TABLE_ID, IDX_TAB, SCHEMA_TAB, SEQ_TAB,
     TABLE_TAB, VIEW_TAB,

@@ -108,6 +108,20 @@ fn pack_col_id(owner_id: u64, col_idx: usize) -> Result<u64, ClientError> {
     gnitz_wire::pack_col_id(owner_id, col_idx as u64).map_err(ClientError::ServerError)
 }
 
+/// Build the `-1` retraction batch for `pks`: the server's `retract_pk` matches
+/// by PK alone, so the payload columns are inert filler (built directly, not via
+/// `BatchAppender`, whose `add_row` takes a single scalar PK). Shared by
+/// `GnitzClient::delete` and `TxnBuffer::delete`.
+fn retraction_batch(schema: &Schema, pks: PkColumn) -> ZSetBatch {
+    let count = pks.len();
+    ZSetBatch {
+        pks,
+        weights: vec![-1; count],
+        nulls: vec![0; count],
+        columns: ZSetBatch::filler_columns(schema, count),
+    }
+}
+
 // --- Internal record types ---
 
 struct TableRecord {
@@ -565,21 +579,36 @@ impl GnitzClient {
     }
 
     pub fn delete(&mut self, table_id: u64, schema: &Schema, pks: PkColumn) -> Result<(), ClientError> {
-        let count = pks.len();
-        if count == 0 {
+        if pks.is_empty() {
             return Ok(());
         }
-        // Retraction rows: the server's `retract_pk` matches by PK alone, so the
-        // payload columns are inert filler. Built directly (not via
-        // BatchAppender, whose `add_row` takes a single scalar PK value).
-        let batch = ZSetBatch {
-            pks,
-            weights: vec![-1; count],
-            nulls: vec![0; count],
-            columns: ZSetBatch::filler_columns(schema, count),
-        };
+        let batch = retraction_batch(schema, pks);
         self.session.push(table_id, schema, &batch)?;
         Ok(())
+    }
+
+    /// Open an empty [`TxnBuffer`]. Buffer writes locally, then `commit_txn`
+    /// ships the whole bundle as one atomic user-table transaction. The buffer
+    /// is owned (no borrow of the client), so the client stays usable between
+    /// buffering calls; dropping the buffer without committing is rollback —
+    /// nothing was ever sent.
+    pub fn begin(&mut self) -> TxnBuffer {
+        TxnBuffer::new()
+    }
+
+    /// Commit `buf` as one atomic `FLAG_PUSH_TXN` transaction — all families
+    /// land together under one durable zone LSN, or none do. Returns the zone
+    /// LSN. An **empty** buffer is `Ok(0)` with no wire roundtrip.
+    pub fn commit_txn(&mut self, buf: TxnBuffer) -> Result<u64, ClientError> {
+        if buf.families.is_empty() {
+            return Ok(0);
+        }
+        let fam_refs: Vec<(u64, &Schema, &ZSetBatch, WireConflictMode)> = buf
+            .families
+            .iter()
+            .map(|(tid, schema, batch, mode)| (*tid, schema, batch, *mode))
+            .collect();
+        self.session.push_txn(&fam_refs)
     }
 
     // --- DDL ---
@@ -1190,6 +1219,79 @@ impl GnitzClient {
     }
 }
 
+// --- TxnBuffer: client-side atomic write-batch transaction ---
+
+/// A locally-buffered atomic user-table transaction. `push`/`delete` append to
+/// the target tid's **last** family when its conflict mode matches, else open a
+/// new family (run-splitting), so per-table op order is preserved end to end:
+/// buffer call order = family frame order = the engine's validation-fold and
+/// worker-application order. Cross-tid interleaving is unconstrained (FK
+/// validation is post-transaction, order-free).
+///
+/// The buffer is owned — it holds no borrow of the client, so the same object
+/// backs the Python binding — and `GnitzClient::commit_txn` ships it as one
+/// `FLAG_PUSH_TXN` frame. Dropping it uncommitted is rollback.
+pub struct TxnBuffer {
+    /// (tid, schema, batch, mode) in creation order; per tid, maximal same-mode
+    /// runs of the caller's op sequence.
+    families: Vec<(u64, Schema, ZSetBatch, WireConflictMode)>,
+    /// tid → index in `families` of that tid's most recently opened family, so
+    /// a matching-mode append extends it rather than opening a new family.
+    last_family_of: HashMap<u64, usize>,
+}
+
+impl TxnBuffer {
+    fn new() -> Self {
+        TxnBuffer {
+            families: Vec::new(),
+            last_family_of: HashMap::new(),
+        }
+    }
+
+    /// Buffer an upsert (`WireConflictMode::Update`) of `batch` into `tid`.
+    pub fn push(&mut self, tid: u64, schema: &Schema, batch: &ZSetBatch) {
+        self.push_with_mode(tid, schema, batch, WireConflictMode::Update);
+    }
+
+    /// Buffer a push with an explicit conflict mode. `Error` mode rejects the
+    /// whole transaction if any of these rows' PKs already exist (checked
+    /// cumulatively in frame order against committed state and earlier families).
+    pub fn push_with_mode(&mut self, tid: u64, schema: &Schema, batch: &ZSetBatch, mode: WireConflictMode) {
+        self.append(tid, schema, batch.clone(), mode);
+    }
+
+    /// Buffer a delete of `pks` from `tid` — `-1` rows with inert filler
+    /// payload, exactly as `GnitzClient::delete` builds them. Deletes buffer
+    /// into the tid's Update family (mode `Update`), so the "delete k; insert k"
+    /// replace idiom emits an Update family `[D(k)]` then an Error family
+    /// `[I(k)]` in order.
+    pub fn delete(&mut self, tid: u64, schema: &Schema, pks: PkColumn) {
+        if pks.is_empty() {
+            return;
+        }
+        let batch = retraction_batch(schema, pks);
+        self.append(tid, schema, batch, WireConflictMode::Update);
+    }
+
+    /// Append one op's `batch` to `tid`'s current run, or open a new family when
+    /// the mode differs (or `tid` has no family yet). Empty batches contribute
+    /// nothing and open no family.
+    fn append(&mut self, tid: u64, schema: &Schema, batch: ZSetBatch, mode: WireConflictMode) {
+        if batch.is_empty() {
+            return;
+        }
+        if let Some(&idx) = self.last_family_of.get(&tid) {
+            if self.families[idx].3 == mode {
+                self.families[idx].2.extend_from_owned(batch);
+                return;
+            }
+        }
+        let idx = self.families.len();
+        self.families.push((tid, schema.clone(), batch, mode));
+        self.last_family_of.insert(tid, idx);
+    }
+}
+
 fn extract_col_entries(col_batch: &ZSetBatch, owner_id: u64, owner_kind: u64) -> Result<Vec<ColumnDef>, ClientError> {
     // Keyed by COL_TAB `col_idx` so the returned columns are in schema order
     // regardless of storage/scan order.
@@ -1411,6 +1513,81 @@ fn build_col_tab_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn kv_schema() -> Schema {
+        Schema {
+            columns: vec![
+                ColumnDef::new("pk", TypeCode::U64, false),
+                ColumnDef::new("val", TypeCode::I64, false),
+            ],
+            pk_cols: vec![0],
+        }
+    }
+
+    fn ins(schema: &Schema, pk: u64, val: i64) -> ZSetBatch {
+        let mut b = ZSetBatch::new(schema);
+        BatchAppender::new(&mut b, schema).add_row(pk as u128, 1).i64_val(val);
+        b
+    }
+
+    #[test]
+    fn begin_yields_empty_buffer_and_empty_push_opens_no_family() {
+        let s = kv_schema();
+        let mut buf = TxnBuffer::new();
+        assert!(buf.families.is_empty());
+        buf.push(16, &s, &ZSetBatch::new(&s));
+        assert!(buf.families.is_empty(), "an empty push opens no family");
+    }
+
+    #[test]
+    fn run_splitting_merges_same_mode_and_splits_on_mode_change() {
+        let s = kv_schema();
+        let mut buf = TxnBuffer::new();
+        let tid = 16u64;
+        buf.push(tid, &s, &ins(&s, 1, 10));
+        buf.push(tid, &s, &ins(&s, 2, 20));
+        assert_eq!(buf.families.len(), 1, "same-mode pushes coalesce");
+        assert_eq!(buf.families[0].2.len(), 2);
+        assert_eq!(buf.families[0].3, WireConflictMode::Update);
+        buf.push_with_mode(tid, &s, &ins(&s, 3, 30), WireConflictMode::Error);
+        assert_eq!(buf.families.len(), 2, "mode change opens a new family");
+        assert_eq!(buf.families[1].3, WireConflictMode::Error);
+        buf.push(tid, &s, &ins(&s, 4, 40));
+        assert_eq!(
+            buf.families.len(),
+            3,
+            "back to Update opens a third family in call order"
+        );
+        assert_eq!(buf.families[2].3, WireConflictMode::Update);
+    }
+
+    #[test]
+    fn delete_buffers_into_update_family_before_error_reinsert() {
+        // "delete k; insert_error k" → Update family [D(k)] then Error family [I(k)].
+        let s = kv_schema();
+        let mut buf = TxnBuffer::new();
+        let tid = 16u64;
+        buf.delete(tid, &s, PkColumn::U64s(vec![7]));
+        buf.push_with_mode(tid, &s, &ins(&s, 7, 70), WireConflictMode::Error);
+        assert_eq!(buf.families.len(), 2);
+        assert_eq!(buf.families[0].3, WireConflictMode::Update);
+        assert_eq!(buf.families[0].2.weights, vec![-1]);
+        assert_eq!(buf.families[1].3, WireConflictMode::Error);
+        assert_eq!(buf.families[1].2.weights, vec![1]);
+    }
+
+    #[test]
+    fn cross_tid_ops_coalesce_per_tid() {
+        // push(A), push(B), push(A) → A one family (2 rows), B one family.
+        let s = kv_schema();
+        let mut buf = TxnBuffer::new();
+        buf.push(16, &s, &ins(&s, 1, 1));
+        buf.push(17, &s, &ins(&s, 1, 1));
+        buf.push(16, &s, &ins(&s, 2, 2));
+        assert_eq!(buf.families.len(), 2);
+        assert_eq!(buf.families[0].0, 16);
+        assert_eq!(buf.families[0].2.len(), 2);
+        assert_eq!(buf.families[1].0, 17);
+    }
 
     #[test]
     fn pack_col_id_rejects_col_idx_too_large() {

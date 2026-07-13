@@ -704,7 +704,7 @@ fn wal_dir_entry(data: &[u8], r: usize) -> (usize, usize) {
     (off, sz)
 }
 
-fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescriptor, &'static str> {
+pub(crate) fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescriptor, &'static str> {
     // Parse directly from WAL block bytes; no Batch allocation needed.
     // META_SCHEMA_DESC layout: pk(reg 0), weight(1), null_bmp(2),
     //   type_code/U64(3), flags/U64(4), name/STR(5), blob(6).
@@ -888,23 +888,74 @@ fn wal_block_slice_at(data: &[u8], off: usize) -> Result<&[u8], &'static str> {
     Ok(&data[off..off + size])
 }
 
-pub fn decode_ddl_txn(data: &[u8]) -> Result<Vec<(i64, &[u8])>, &'static str> {
+/// Walk a transaction frame's shared prologue — control block, then the `u32`
+/// family count — returning `(count, offset of the first family, capacity hint)`.
+/// The hint bounds `count` by what the remaining bytes can physically hold
+/// (`min_family_bytes` is the least a single family can encode to), so a hostile
+/// count cannot force a giant pre-allocation on an ingress-capped frame.
+fn txn_frame_prologue(data: &[u8], min_family_bytes: usize) -> Result<(usize, usize, usize), &'static str> {
     let ctrl = wal_block_slice_at(data, 0)?;
     peek_control_block(ctrl)?;
-
-    let mut off = ctrl.len();
+    let off = ctrl.len();
     if off + 4 > data.len() {
-        return Err("DDL_TXN family count truncated");
+        return Err("TXN family count truncated");
     }
     let count = codec::read_u32_le(data, off) as usize;
-    off += 4;
+    let off = off + 4;
+    let max_families = data.len().saturating_sub(off) / min_family_bytes + 1;
+    Ok((count, off, count.min(max_families)))
+}
 
-    let mut families = Vec::with_capacity(count);
+pub fn decode_ddl_txn(data: &[u8]) -> Result<Vec<(i64, &[u8])>, &'static str> {
+    let (count, mut off, cap) = txn_frame_prologue(data, gnitz_wire::WAL_HEADER_SIZE)?;
+    let mut families = Vec::with_capacity(cap);
     for _ in 0..count {
         let block = wal_block_slice_at(data, off)?;
         let tid = codec::read_u32_le(block, WAL_OFF_TID) as i64;
         families.push((tid, block));
         off += block.len();
+    }
+    Ok(families)
+}
+
+/// One decoded `FLAG_PUSH_TXN` family: the target `tid` (read from the data
+/// block's `WAL_OFF_TID`), the conflict `mode` byte, and the borrowed schema and
+/// data WAL-block slices — same lifetime discipline as `decode_ddl_txn`'s
+/// `(i64, &[u8])`. The master validates the schema block against its catalog and
+/// decodes the data block via `Batch::decode_from_wal_block`.
+pub struct TxnFamilyWire<'a> {
+    pub tid: i64,
+    pub mode: u8,
+    pub schema_block: &'a [u8],
+    pub wal_block: &'a [u8],
+}
+
+/// Decode a `FLAG_PUSH_TXN` frame into its per-family list, in send order — the
+/// user-table analogue of `decode_ddl_txn`. The frame is: control block, `u32`
+/// family count, then per family a `u8` conflict mode, a self-sized meta-schema
+/// WAL block, and a self-sized data WAL block, each walked by header. Truncation
+/// at any field rejects the whole frame.
+pub fn decode_push_txn(data: &[u8]) -> Result<Vec<TxnFamilyWire<'_>>, &'static str> {
+    // A family is at least a mode byte plus two WAL headers (schema + data).
+    let (count, mut off, cap) = txn_frame_prologue(data, 1 + 2 * gnitz_wire::WAL_HEADER_SIZE)?;
+    let mut families = Vec::with_capacity(cap);
+    for _ in 0..count {
+        if off + 1 > data.len() {
+            return Err("PUSH_TXN family mode truncated");
+        }
+        let mode = data[off];
+        off += 1;
+        let schema_block = wal_block_slice_at(data, off)?;
+        off += schema_block.len();
+        let wal_block = wal_block_slice_at(data, off)?;
+        let tid = codec::read_u32_le(wal_block, WAL_OFF_TID) as i64;
+        off += wal_block.len();
+        families.push(TxnFamilyWire {
+            tid,
+            mode,
+            schema_block,
+            wal_block,
+        });
     }
     Ok(families)
 }
@@ -1145,7 +1196,7 @@ mod tests {
         // circuit/dep families whose engine `get_pk` returns the packed narrow key
         // rather than the client's low/high u128 layout.
         let verify = |families: &[(u64, &'static Schema, ZSetBatch)], check_pk: &[bool]| {
-            let payload = gnitz_core::protocol::encode_ddl_txn(0xABCD, families).expect("encode_ddl_txn");
+            let payload = gnitz_core::protocol::encode_ddl_txn(0xABCD, families);
             let decoded = decode_ddl_txn(&payload).expect("decode_ddl_txn");
             assert_eq!(decoded.len(), families.len(), "family count");
             for (fi, ((exp_tid, _s, exp_batch), (got_tid, slice))) in families.iter().zip(&decoded).enumerate() {
