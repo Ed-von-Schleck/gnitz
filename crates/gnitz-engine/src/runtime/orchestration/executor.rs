@@ -23,7 +23,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::guard_panic;
 use crate::foundation::posix_io;
-use crate::runtime::tls::TlsShared;
+use crate::runtime::tls::{ConnCountGuard, TlsShared};
 
 use crate::catalog::{
     CatalogEngine, FIRST_USER_TABLE_ID, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB_ID,
@@ -179,12 +179,13 @@ pub struct ServerExecutor;
 
 impl ServerExecutor {
     /// `tls` is the optional TLS listener bootstrap from `server_main`:
-    /// the bound TCP listen fd and the rustls server configuration.
+    /// the bound TCP listen fd, the rustls server configuration, and the
+    /// global live-connection cap.
     pub fn run(
         catalog: *mut CatalogEngine,
         dispatcher: *mut MasterDispatcher,
         server_fd: i32,
-        tls: Option<(i32, std::sync::Arc<rustls::ServerConfig>)>,
+        tls: Option<TlsListener>,
     ) -> i32 {
         let reactor = match Reactor::new(256) {
             Ok(r) => Rc::new(r),
@@ -202,12 +203,17 @@ impl ServerExecutor {
         // collect (the reactor's `OnceCell` slot is stable for its lifetime).
         unsafe { &mut *dispatcher }.set_w2m_receiver_ptr(reactor.w2m_receiver());
         reactor.attach_listener(server_fd);
-        if let Some((tls_fd, _)) = &tls {
-            reactor.attach_listener(*tls_fd);
+        if let Some(tl) = &tls {
+            reactor.attach_listener(tl.fd);
         }
+        // Reactor-thread live-TLS-connection counter, incremented by an RAII
+        // guard stored in each session's `TlsShared` and decremented on its
+        // drop. Single-threaded, so no atomics.
+        let tls_conn_count = Rc::new(Cell::new(0u32));
         let accept_ctx = AcceptCtx {
             unix_fd: server_fd,
             tls,
+            tls_conn_count,
         };
 
         let sal_writer_excl = Rc::new(AsyncMutex::new(()));
@@ -277,12 +283,22 @@ impl ServerExecutor {
 // Accept loop
 // ---------------------------------------------------------------------------
 
-/// Accept-routing inputs: which listener fd is which, plus the rustls
-/// config for TLS-accepted connections. Carried explicitly — the reactor
-/// no longer records a listener fd (the udata round-trip replaced it).
+/// TLS listener runtime inputs, produced by `bootstrap::setup_tls_listener`
+/// and threaded into `ServerExecutor::run` (hence `pub(crate)`): the bound
+/// listen fd, the rustls config, and the global live-connection cap.
+pub(crate) struct TlsListener {
+    pub fd: i32,
+    pub cfg: std::sync::Arc<rustls::ServerConfig>,
+    pub max_conns: u32,
+}
+
+/// Accept-routing inputs: which listener fd is which, the TLS listener, and
+/// the reactor-thread live-TLS-connection counter. Carried explicitly — the
+/// reactor no longer records a listener fd (the udata round-trip replaced it).
 struct AcceptCtx {
     unix_fd: i32,
-    tls: Option<(i32, std::sync::Arc<rustls::ServerConfig>)>,
+    tls: Option<TlsListener>,
+    tls_conn_count: Rc<Cell<u32>>,
 }
 
 async fn accept_loop(shared: Rc<Shared>, ctx: AcceptCtx) {
@@ -295,20 +311,41 @@ async fn accept_loop(shared: Rc<Shared>, ctx: AcceptCtx) {
             shared.reactor.register_conn(fd);
             let peer = Peer::unix(fd, Rc::clone(&shared.reactor));
             let s = Rc::clone(&shared);
-            shared.reactor.spawn(connection_loop(peer, s));
+            // AF_UNIX (loopback) has no pre-auth deadline: the mature
+            // local path is behaviourally unchanged.
+            shared.reactor.spawn(connection_loop(peer, s, None));
             continue;
         }
         match &ctx.tls {
-            Some((tls_fd, cfg)) if listener == *tls_fd => {
+            Some(tl) if listener == tl.fd => {
+                // Global connection cap: close the freshly-accepted fd before
+                // any TLS work when the live count is at the cap. No TOCTOU —
+                // on the single-threaded reactor there is no `.await` between
+                // this check and `ConnCountGuard::new`, only synchronous
+                // socket-option/`start` calls, so the count cannot go stale.
+                if ctx.tls_conn_count.get() >= tl.max_conns {
+                    gnitz_warn!("tls: connection cap {} reached; closing fd={fd}", tl.max_conns);
+                    // SAFETY: freshly-accepted fd we own; no SQE references it.
+                    unsafe { libc::close(fd) };
+                    continue;
+                }
                 posix_io::set_nodelay(fd);
                 posix_io::set_keepalive(fd);
-                match TlsShared::start(Rc::clone(&shared.reactor), fd, std::sync::Arc::clone(cfg)) {
+                let guard = ConnCountGuard::new(Rc::clone(&ctx.tls_conn_count));
+                match TlsShared::start(Rc::clone(&shared.reactor), fd, std::sync::Arc::clone(&tl.cfg), guard) {
                     Ok(conn) => {
                         let peer = Peer::tls(conn);
                         let s = Rc::clone(&shared);
-                        shared.reactor.spawn(connection_loop(peer, s));
+                        // Pre-auth first-frame deadline: HELLO must arrive
+                        // within this window of accept, else the connection
+                        // is torn down (covers a stalled handshake and a
+                        // completed-handshake-no-HELLO squat alike).
+                        let deadline = Instant::now() + tls_hello_timeout();
+                        shared.reactor.spawn(connection_loop(peer, s, Some(deadline)));
                     }
                     Err(e) => {
+                        // `guard` was moved into `start`; on the error path it
+                        // already dropped (decrementing) inside `start`'s frame.
                         gnitz_warn!("tls: session init failed for fd={fd}: {e}");
                         // SAFETY: freshly-accepted fd we own; no SQE references it.
                         unsafe { libc::close(fd) };
@@ -324,34 +361,55 @@ async fn accept_loop(shared: Rc<Shared>, ctx: AcceptCtx) {
     }
 }
 
+/// Pre-auth first-frame deadline (`GNITZ_TLS_HELLO_TIMEOUT_MS`, default
+/// 15 000 ms). Comfortably exceeds the client's ~10 s post-connect
+/// handshake+HELLO budget, so legitimate slow-link clients are not reaped.
+fn tls_hello_timeout() -> std::time::Duration {
+    static T: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::time::Duration::from_millis(
+            std::env::var("GNITZ_TLS_HELLO_TIMEOUT_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(15_000),
+        )
+    })
+}
+
 enum HelloOutcome {
-    /// Connection accepted; optionally bound to an authenticated client_id.
-    Pass(Option<u64>),
+    /// Connection accepted.
+    Pass,
     /// Caller must close the connection.
     Reject,
 }
 
-async fn connection_loop(peer: Peer, shared: Rc<Shared>) {
-    let bound_client_id = match peer.recv().await {
-        Some(buf) => match run_hello_handshake(&peer, buf.as_slice()).await {
-            HelloOutcome::Pass(b) => b,
-            HelloOutcome::Reject => {
-                peer.close();
-                return;
-            }
+/// `first_frame_deadline` bounds the arrival of the first (HELLO) frame:
+/// `Some` for TLS (pre-auth reap), `None` for AF_UNIX (unchanged). Only the
+/// first recv is raced against the deadline; everything after HELLO uses a
+/// plain `peer.recv().await`.
+async fn connection_loop(peer: Peer, shared: Rc<Shared>, first_frame_deadline: Option<Instant>) {
+    // No HELLO in time (`Either::B`) → `None`, funnelling into the single close
+    // site below. `select2` drops the losing recv (clears its waker) and the
+    // losing timer (cancels its SQE), so the happy path leaves no timer behind.
+    let first = match first_frame_deadline {
+        Some(deadline) => match select2(peer.recv(), shared.reactor.timer(deadline)).await {
+            Either::A(opt) => opt,
+            Either::B(()) => None,
         },
-        None => {
-            peer.close();
-            return;
-        }
+        None => peer.recv().await,
     };
+    let Some(buf) = first else {
+        peer.close();
+        return;
+    };
+    if let HelloOutcome::Reject = run_hello_handshake(&peer, buf.as_slice()).await {
+        peer.close();
+        return;
+    }
 
     loop {
-        let buf = match peer.recv().await {
-            Some(v) => v,
-            None => break,
-        };
-        handle_message(&peer, buf.as_slice(), &shared, bound_client_id).await;
+        let Some(buf) = peer.recv().await else { break };
+        handle_message(&peer, buf.as_slice(), &shared).await;
     }
     peer.close();
 }
@@ -381,17 +439,13 @@ async fn run_hello_handshake(peer: &Peer, data: &[u8]) -> HelloOutcome {
         return HelloOutcome::Reject;
     }
 
-    // Auth method bits live in `hello.flags`. Only "none" (flags=0) is
-    // wired today; future auth hooks would set `bound_client_id` here.
-    let bound_client_id: Option<u64> = None;
-
     peer.set_max_payload_len(gnitz_wire::MAX_FRAME_PAYLOAD_SERVER);
 
     let rc = peer.send_hello_ack().await;
     if rc < 0 {
         return HelloOutcome::Reject;
     }
-    HelloOutcome::Pass(bound_client_id)
+    HelloOutcome::Pass
 }
 
 // ---------------------------------------------------------------------------
@@ -732,11 +786,11 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
 // Message dispatch
 // ---------------------------------------------------------------------------
 
-async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>, bound_client_id: Option<u64>) {
-    // ONE control-block parse for the whole request: the routing/auth check,
-    // the schema-hint decision, and the full decode below all read this same
-    // parse, so a malicious client cannot forge a directory that points the
-    // auth check at one region and the decoder at another.
+async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
+    // ONE control-block parse for the whole request: the schema-hint decision
+    // and the full decode below both read this same parse, so a malicious
+    // client cannot forge a directory that points one at one region and the
+    // other at another.
     let ctrl = match ipc::peek_client_control(data) {
         Ok(c) => c,
         Err(e) => {
@@ -745,20 +799,6 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>, bound_cli
             return;
         }
     };
-    if let Some(bound) = bound_client_id {
-        if ctrl.client_id != bound {
-            // Reject before any heap-allocating decode path. A forged
-            // client_id never reaches Batch::decode_from_wal_block.
-            send_error(
-                peer,
-                ctrl.target_id as i64,
-                bound,
-                b"client_id not bound to this connection",
-            )
-            .await;
-            return;
-        }
-    }
 
     // Decode the frame. Schema-less PUSH frames (warm-cache path) have
     // FLAG_HAS_DATA but not FLAG_HAS_SCHEMA; they need a catalog hint.

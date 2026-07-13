@@ -5,3 +5,6 @@ edition = "2021"
 
 [dependencies]
 tempfile = "3"
+# default-features = false pins the ring backend (no C/cmake toolchain), matching
+# the engine — used by `start_mtls` to mint a client CA + a CA-signed leaf.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }

@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::foundation::posix_io;
 use crate::query::RelationKind;
-use crate::runtime::executor::ServerExecutor;
+use crate::runtime::executor::{ServerExecutor, TlsListener};
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::sal::{sal_mmap_size, SalReader, SalWriter, FLAG_DDL_SYNC, FLAG_PUSH, FLAG_TXN_COMMIT};
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
@@ -332,12 +332,16 @@ fn rebuild_invalid_views(catalog: &mut CatalogEngine, dispatcher: &mut MasterDis
 // Server main entry point
 // ---------------------------------------------------------------------------
 
-/// TLS listener request from the CLI: the address to bind and optional
-/// operator cert/key PEM paths (a self-signed dev cert is minted when
-/// absent).
+/// TLS listener request from the CLI: the address to bind, optional operator
+/// cert/key PEM paths (a self-signed dev cert is minted when absent), the
+/// optional client-auth CA (enables required mTLS), the
+/// `--allow-unauthenticated` escape hatch, and the global connection cap.
 pub struct TlsCli {
     pub listen: std::net::SocketAddr,
     pub cert_key: Option<(String, String)>,
+    pub client_ca: Option<String>,
+    pub allow_unauthenticated: bool,
+    pub max_conns: u32,
 }
 
 /// Single entry point for the entire server bootstrap.
@@ -728,9 +732,25 @@ pub fn server_main(
 /// when no PEM pair is given), bind the TCP listener, and publish the bound
 /// address to `<data_dir>/tls_endpoint` (atomically: tmp + rename, so
 /// existence implies complete content).
-fn setup_tls_listener(data_dir: &str, cli: &TlsCli) -> Result<(i32, std::sync::Arc<rustls::ServerConfig>), String> {
+///
+/// **Bind refusal:** a non-loopback bind with neither `--tls-client-ca` nor
+/// `--allow-unauthenticated` aborts boot — an unauthenticated public bind is
+/// impossible by accident. `--allow-unauthenticated` is the single, loud
+/// escape hatch; the CA enables required mTLS.
+fn setup_tls_listener(data_dir: &str, cli: &TlsCli) -> Result<TlsListener, String> {
+    // `is_loopback()` is the conservative test: `0.0.0.0`/`::` (bind-all),
+    // IPv4-mapped `::ffff:127.0.0.1`, and any specific LAN/link-local IP are
+    // all non-loopback → refused unless a CA or the escape hatch is present.
+    if !cli.listen.ip().is_loopback() && cli.client_ca.is_none() && !cli.allow_unauthenticated {
+        return Err(format!(
+            "refusing to bind a non-loopback TLS listener {} without client authentication; \
+             pass --tls-client-ca=PEM or --allow-unauthenticated",
+            cli.listen,
+        ));
+    }
+
     let cert_key = cli.cert_key.as_ref().map(|(c, k)| (c.as_str(), k.as_str()));
-    let (config, dev_pem) = crate::runtime::tls::config::server_crypto(cert_key)?;
+    let (config, dev_pem) = crate::runtime::tls::config::server_crypto(cert_key, cli.client_ca.as_deref())?;
     if let Some(pem) = dev_pem {
         let path = format!("{data_dir}/tls_dev_cert.pem");
         std::fs::write(&path, pem).map_err(|e| format!("failed to write {path}: {e}"))?;
@@ -747,15 +767,21 @@ fn setup_tls_listener(data_dir: &str, cli: &TlsCli) -> Result<(i32, std::sync::A
     std::fs::write(&tmp_path, format!("{bound}\n")).map_err(|e| format!("failed to write {tmp_path}: {e}"))?;
     std::fs::rename(&tmp_path, &endpoint_path).map_err(|e| format!("failed to publish {endpoint_path}: {e}"))?;
     gnitz_info!("Listening on tls://{}", bound);
-    if !bound.ip().is_loopback() {
+    // A deliberately-unauthenticated non-loopback bind (escape hatch, no CA)
+    // stays loud. With a CA the listener is authenticated — no warning.
+    if !bound.ip().is_loopback() && cli.client_ca.is_none() {
         gnitz_warn!(
-            "TLS listener bound to NON-LOOPBACK address {} with NO AUTHENTICATION: anyone who can \
-             reach this port gets full DDL/DML/scan access. Do not expose this listener beyond a \
-             trusted network.",
+            "TLS listener bound to NON-LOOPBACK address {} with --allow-unauthenticated and NO client \
+             authentication: anyone who can reach this port gets full DDL/DML/scan access. Prefer \
+             --tls-client-ca=PEM (required mTLS). Note: even a loopback bind trusts every local UID.",
             bound,
         );
     }
-    Ok((listen_fd, config))
+    Ok(TlsListener {
+        fd: listen_fd,
+        cfg: config,
+        max_conns: cli.max_conns,
+    })
 }
 
 // ---------------------------------------------------------------------------

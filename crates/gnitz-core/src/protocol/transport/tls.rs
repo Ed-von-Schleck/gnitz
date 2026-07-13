@@ -37,34 +37,85 @@ enum Verify {
     Insecure,
 }
 
-/// Parsed `HOST:PORT[?PARAM]` (the part after the `tls://` prefix).
+/// Parsed `HOST:PORT[?QUERY]` (the part after the `tls://` prefix).
 struct Target {
     host: String,
     port: u16,
     verify: Verify,
+    /// `?cert=PATH&key=PATH`: the client's own cert chain + private key for
+    /// mTLS. Both-or-neither.
+    client_auth: Option<(String, String)>,
 }
 
 /// Parse the target grammar: split on the **first** `?`; the left is
-/// `HOST:PORT` (bracketed IPv6 supported), the right is at most one param
-/// — `insecure` or `ca=PATH` (taken literally to end-of-string), mutually
-/// exclusive. Anything else is a connect-time error.
+/// `HOST:PORT` (bracketed IPv6 supported), the right is an `&`-separated
+/// query of `insecure` | `ca=PATH` | `cert=PATH` | `key=PATH` params (each
+/// `PATH` taken literally to the next `&`, so it may contain `=` but not
+/// `&`). Verification mode: at most one of `insecure` / `ca=` (both →
+/// error); neither → default webpki roots. Client auth: `cert=` and `key=`
+/// are both-or-neither. A duplicate of any param, an unrecognised param, an
+/// empty `PATH`, or an empty query element (a stray `&`, or a bare trailing
+/// `?` whose whole query is one empty element) is a connect-time error.
 fn parse_target(rest: &str) -> Result<Target, ProtocolError> {
-    let (hostport, param) = match rest.split_once('?') {
-        Some((hp, p)) => (hp, Some(p)),
+    let (hostport, query) = match rest.split_once('?') {
+        Some((hp, q)) => (hp, Some(q)),
         None => (rest, None),
     };
-    let verify = match param {
-        None => Verify::Default,
-        Some("insecure") => Verify::Insecure,
-        Some(p) => match p.strip_prefix("ca=") {
-            Some(path) if !path.is_empty() => Verify::Ca(path.to_string()),
-            _ => {
-                return Err(decode_err(format!(
-                    "tls target param {p:?} not recognised (expected `insecure` or `ca=PATH`)"
-                )))
-            }
-        },
+
+    let mut seen_insecure = false;
+    let mut ca: Option<String> = None;
+    let mut cert: Option<String> = None;
+    let mut key: Option<String> = None;
+    // Accept exactly one non-empty value for a `name=PATH` param.
+    let take = |slot: &mut Option<String>, name: &str, path: &str| -> Result<(), ProtocolError> {
+        if path.is_empty() {
+            return Err(decode_err(format!("tls target: empty `{name}=` path")));
+        }
+        if slot.is_some() {
+            return Err(decode_err(format!("tls target: duplicate `{name}=`")));
+        }
+        *slot = Some(path.to_string());
+        Ok(())
     };
+    if let Some(q) = query {
+        // One empty element rejects a stray `&` and a bare trailing `?` (whose
+        // whole query splits to a single empty element) alike.
+        for elem in q.split('&') {
+            if elem.is_empty() {
+                return Err(decode_err("tls target: empty query element (stray `&` or bare `?`)"));
+            } else if elem == "insecure" {
+                if seen_insecure {
+                    return Err(decode_err("tls target: duplicate `insecure`"));
+                }
+                seen_insecure = true;
+            } else if let Some(path) = elem.strip_prefix("ca=") {
+                take(&mut ca, "ca", path)?;
+            } else if let Some(path) = elem.strip_prefix("cert=") {
+                take(&mut cert, "cert", path)?;
+            } else if let Some(path) = elem.strip_prefix("key=") {
+                take(&mut key, "key", path)?;
+            } else {
+                return Err(decode_err(format!(
+                    "tls target param {elem:?} not recognised \
+                     (expected `insecure`, `ca=PATH`, `cert=PATH`, or `key=PATH`)"
+                )));
+            }
+        }
+    }
+
+    let verify = match (seen_insecure, ca) {
+        (true, Some(_)) => return Err(decode_err("tls target: `insecure` and `ca=` are mutually exclusive")),
+        (true, None) => Verify::Insecure,
+        (false, Some(path)) => Verify::Ca(path),
+        (false, None) => Verify::Default,
+    };
+    let client_auth = match (cert, key) {
+        (Some(c), Some(k)) => Some((c, k)),
+        (None, None) => None,
+        (Some(_), None) => return Err(decode_err("tls target: `cert=` requires `key=`")),
+        (None, Some(_)) => return Err(decode_err("tls target: `key=` requires `cert=`")),
+    };
+
     let (host, port_str) = if let Some(bracketed) = hostport.strip_prefix('[') {
         // Bracketed IPv6: [::1]:PORT. Strip the brackets — ServerName and
         // (host, port) resolution both take the bare address.
@@ -90,6 +141,7 @@ fn parse_target(rest: &str) -> Result<Target, ProtocolError> {
         host: host.to_string(),
         port,
         verify,
+        client_auth,
     })
 }
 
@@ -149,8 +201,8 @@ fn cached_config(
     if let Some(cfg) = cell.get() {
         return Ok(Arc::clone(cfg));
     }
-    let mut cfg = build()?;
-    cfg.alpn_protocols = vec![ALPN_GNITZ.to_vec()];
+    // The `build` closure sets ALPN (via `finish`), so there is nothing to add.
+    let cfg = build()?;
     Ok(Arc::clone(cell.get_or_init(|| Arc::new(cfg))))
 }
 
@@ -160,39 +212,89 @@ fn config_builder() -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls
         .map_err(|e| decode_err(format!("tls config: {e}")))
 }
 
-/// Resolve the immutable `ClientConfig` for a verification mode. The
-/// `Default` and `Insecure` configs are pure values (the webpki root store
-/// alone is ~150 anchors), so they are built once per process and shared —
-/// connection-churny callers (one connection per test) skip the rebuild.
-/// `?ca=PATH` reads a file, so it stays per-connect.
-fn build_client_config(verify: &Verify) -> Result<Arc<rustls::ClientConfig>, ProtocolError> {
+/// Resolve the immutable `ClientConfig` for a verification mode + optional
+/// client-auth cert. The `Default` and `Insecure` configs with NO client
+/// cert are pure values (the webpki root store alone is ~150 anchors), so
+/// they are built once per process and shared — connection-churny callers
+/// (one connection per test) skip the rebuild. `?ca=PATH` reads a file and a
+/// client cert is per-connection, so those stay per-connect (a per-connection
+/// cert must never be baked into a shared process-global config).
+///
+/// `client_auth` is taken by reference: a by-value `Option<(String, String)>`
+/// would be moved by the `match` below and break the `finish` closure's reads.
+fn build_client_config(
+    verify: &Verify,
+    client_auth: Option<&(String, String)>,
+) -> Result<Arc<rustls::ClientConfig>, ProtocolError> {
     static DEFAULT_CFG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
     static INSECURE_CFG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
-    match verify {
-        Verify::Default => cached_config(&DEFAULT_CFG, || {
-            let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            Ok(config_builder()?.with_root_certificates(roots).with_no_client_auth())
-        }),
-        Verify::Insecure => cached_config(&INSECURE_CFG, || {
-            let provider = Arc::new(rustls::crypto::ring::default_provider());
-            Ok(config_builder()?
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(SkipVerify(provider)))
-                .with_no_client_auth())
-        }),
-        Verify::Ca(path) => {
-            use rustls::pki_types::pem::PemObject;
-            let certs =
-                CertificateDer::pem_file_iter(path).map_err(|e| decode_err(format!("tls ca bundle {path:?}: {e}")))?;
-            let mut store = rustls::RootCertStore::empty();
-            let (added, _skipped) = store.add_parsable_certificates(certs.filter_map(Result::ok));
-            if added == 0 {
-                return Err(decode_err(format!("tls ca bundle {path:?}: no usable certificates")));
+
+    // Installs client auth (or not) and always sets ALPN. Reached from the
+    // `WantsClientCert` state that BOTH `.with_root_certificates(roots)` and
+    // `.dangerous().with_custom_certificate_verifier(..)` return.
+    let finish = |b: rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert>|
+     -> Result<rustls::ClientConfig, ProtocolError> {
+        let mut cfg = match client_auth {
+            Some((cert, key)) => {
+                use rustls::pki_types::pem::PemObject;
+                let chain = CertificateDer::pem_file_iter(cert)
+                    .map_err(|e| decode_err(format!("tls client cert {cert:?}: {e}")))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| decode_err(format!("tls client cert {cert:?}: {e}")))?;
+                if chain.is_empty() {
+                    return Err(decode_err(format!("tls client cert {cert:?}: empty")));
+                }
+                let key_der = rustls::pki_types::PrivateKeyDer::from_pem_file(key)
+                    .map_err(|e| decode_err(format!("tls client key {key:?}: {e}")))?;
+                b.with_client_auth_cert(chain, key_der)
+                    .map_err(|e| decode_err(format!("tls client cert/key rejected: {e}")))?
             }
-            let mut cfg = config_builder()?.with_root_certificates(store).with_no_client_auth();
-            cfg.alpn_protocols = vec![ALPN_GNITZ.to_vec()];
-            Ok(Arc::new(cfg))
-        }
+            None => b.with_no_client_auth(),
+        };
+        cfg.alpn_protocols = vec![ALPN_GNITZ.to_vec()];
+        Ok(cfg)
+    };
+
+    // Verify-mode-specific builder, up to the shared `WantsClientCert` state
+    // that both `.with_root_certificates` and the dangerous verifier setter
+    // return — so each verifier is constructed exactly once.
+    let verifier_stage = |v: &Verify| -> Result<
+        rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert>,
+        ProtocolError,
+    > {
+        Ok(match v {
+            Verify::Default => config_builder()?.with_root_certificates(rustls::RootCertStore::from_iter(
+                webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+            )),
+            Verify::Insecure => config_builder()?
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(SkipVerify(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                )))),
+            Verify::Ca(path) => {
+                use rustls::pki_types::pem::PemObject;
+                let mut store = rustls::RootCertStore::empty();
+                let (added, _skipped) = store.add_parsable_certificates(
+                    CertificateDer::pem_file_iter(path)
+                        .map_err(|e| decode_err(format!("tls ca bundle {path:?}: {e}")))?
+                        .filter_map(Result::ok),
+                );
+                if added == 0 {
+                    return Err(decode_err(format!("tls ca bundle {path:?}: no usable certificates")));
+                }
+                config_builder()?.with_root_certificates(store)
+            }
+        })
+    };
+
+    // Share the immutable Default/Insecure configs only when there is no
+    // per-connection client cert; `?ca=PATH` and any client-auth config are
+    // built fresh (a per-connection cert must never be baked into a shared
+    // process-global config).
+    match (verify, client_auth) {
+        (Verify::Default, None) => cached_config(&DEFAULT_CFG, || finish(verifier_stage(verify)?)),
+        (Verify::Insecure, None) => cached_config(&INSECURE_CFG, || finish(verifier_stage(verify)?)),
+        _ => Ok(Arc::new(finish(verifier_stage(verify)?)?)),
     }
 }
 
@@ -222,6 +324,26 @@ fn set_keepalive(stream: &TcpStream) {
 /// surfaces here as a `ProtocolError` carrying the rustls alert text).
 pub(super) fn connect_tls(rest: &str) -> Result<ClientTransport, ProtocolError> {
     let target = parse_target(rest)?;
+
+    // `?insecure` fail-closed: refuse to drop server authentication against a
+    // non-loopback host unless explicitly overridden. Evaluated before any
+    // socket work. `is_loopback_host` tests the literal host string, so a
+    // remote name that merely *resolves* to a loopback IP cannot flip this
+    // (DNS-rebinding safe).
+    if matches!(target.verify, Verify::Insecure) && !is_loopback_host(&target.host) {
+        if std::env::var("GNITZ_TLS_INSECURE").as_deref() != Ok("1") {
+            return Err(decode_err(
+                "refusing ?insecure against a non-loopback host; set GNITZ_TLS_INSECURE=1 to override",
+            ));
+        }
+        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+        WARN_ONCE.call_once(|| {
+            eprintln!(
+                "gnitz: WARNING: server certificate verification disabled by GNITZ_TLS_INSECURE=1 \
+                 for a non-loopback host — the connection is open to man-in-the-middle interception"
+            );
+        });
+    }
 
     // Resolve and try every returned address in turn (first-address-only
     // would hang the full timeout then fail when `localhost` resolves to
@@ -254,20 +376,7 @@ pub(super) fn connect_tls(rest: &str) -> Result<ClientTransport, ProtocolError> 
         .set_read_timeout(Some(CONNECT_TIMEOUT))
         .map_err(ProtocolError::IoError)?;
 
-    if matches!(target.verify, Verify::Insecure) && !is_loopback_host(&target.host) {
-        // One-time warning: `?insecure` drops server authentication,
-        // acceptable only for dev/test loopback use.
-        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
-        WARN_ONCE.call_once(|| {
-            eprintln!(
-                "gnitz: WARNING: tls://{}:… with ?insecure skips server certificate \
-                 verification on a non-loopback host — the connection is open to \
-                 man-in-the-middle interception",
-                target.host,
-            );
-        });
-    }
-    let cfg = build_client_config(&target.verify)?;
+    let cfg = build_client_config(&target.verify, target.client_auth.as_ref())?;
     // `ClientConnection::new` needs ServerName<'static>: the owned
     // TryFrom<String> conversion (accepts a DNS name or an IP literal —
     // the un-bracketed host).
@@ -395,29 +504,72 @@ mod tests {
         let t = parse_target("db.example.com:5433").unwrap();
         assert_eq!((t.host.as_str(), t.port), ("db.example.com", 5433));
         assert!(matches!(t.verify, Verify::Default));
+        assert!(t.client_auth.is_none());
 
         let t = parse_target("127.0.0.1:1?insecure").unwrap();
         assert_eq!((t.host.as_str(), t.port), ("127.0.0.1", 1));
         assert!(matches!(t.verify, Verify::Insecure));
+        assert!(t.client_auth.is_none());
 
         let t = parse_target("[::1]:65535?ca=/some/dir/cert.pem").unwrap();
         assert_eq!((t.host.as_str(), t.port), ("::1", 65535));
         assert!(matches!(t.verify, Verify::Ca(ref p) if p == "/some/dir/cert.pem"));
+        assert!(t.client_auth.is_none());
+
+        // Client auth: cert+key, default verification.
+        let t = parse_target("h:5?cert=/c&key=/k").unwrap();
+        assert_eq!(
+            t.client_auth.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
+            Some(("/c", "/k"))
+        );
+        assert!(matches!(t.verify, Verify::Default));
+
+        // Client auth + explicit CA.
+        let t = parse_target("h:5?ca=/x&cert=/c&key=/k").unwrap();
+        assert!(matches!(t.verify, Verify::Ca(ref p) if p == "/x"));
+        assert_eq!(
+            t.client_auth.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
+            Some(("/c", "/k"))
+        );
+
+        // Client auth + insecure.
+        let t = parse_target("h:5?insecure&cert=/c&key=/k").unwrap();
+        assert!(matches!(t.verify, Verify::Insecure));
+        assert_eq!(
+            t.client_auth.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
+            Some(("/c", "/k"))
+        );
+
+        // A `PATH` may contain `=` (taken literally to the next `&`).
+        let t = parse_target("h:5?cert=/p=q&key=/k").unwrap();
+        assert_eq!(
+            t.client_auth.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
+            Some(("/p=q", "/k"))
+        );
     }
 
     #[test]
     fn parse_target_rejects_malformed() {
         for bad in [
-            "",                 // empty
-            "hostonly",         // no port
-            ":443",             // empty host
-            "h:0x1f",           // non-numeric port
-            "h:99999",          // port out of u16 range
-            "h:443?ca=",        // empty CA path
-            "h:443?insecure=1", // unknown param
-            "h:443?Insecure",   // params are case-sensitive
-            "[::1]443",         // missing `:` after bracket
-            "[::1:443",         // unterminated bracket
+            "",                        // empty
+            "hostonly",                // no port
+            ":443",                    // empty host
+            "h:0x1f",                  // non-numeric port
+            "h:99999",                 // port out of u16 range
+            "h:443?",                  // empty query (bare trailing `?`)
+            "h:443?ca=",               // empty CA path
+            "h:443?insecure=1",        // unknown param
+            "h:443?Insecure",          // params are case-sensitive
+            "[::1]443",                // missing `:` after bracket
+            "[::1:443",                // unterminated bracket
+            "h:443?cert=/c",           // cert without key
+            "h:443?key=/k",            // key without cert
+            "h:443?insecure&ca=/x",    // insecure + ca mutually exclusive
+            "h:443?cert=/c&cert=/d",   // duplicate cert
+            "h:443?ca=/x&ca=/y",       // duplicate ca
+            "h:443?insecure&insecure", // duplicate insecure
+            "h:443?insecure&",         // trailing `&` (empty element)
+            "h:443?&insecure",         // leading `&` (empty element)
         ] {
             assert!(
                 parse_target(bad).is_err(),

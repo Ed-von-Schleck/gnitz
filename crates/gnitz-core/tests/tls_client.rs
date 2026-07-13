@@ -520,3 +520,192 @@ fn stalled_scan_client_is_evicted_by_send_deadline() {
         assert_eq!(batch.map(|b| b.len()), Some(200_000));
     });
 }
+
+// ── 12. mTLS roundtrip (CA-signed client cert) ─────────────────────────────
+
+#[test]
+fn mtls_roundtrip_push_and_scan() {
+    let Some(srv) = ServerHandle::start_mtls(4) else { return };
+    // `mtls_target()` presents the CA-signed client leaf + verifies the dev
+    // server cert. A required-mTLS server accepts it, so the full data path
+    // works end to end.
+    let (mut client, _sn, tid, schema) = client_with_table(&srv.mtls_target());
+    client.push(tid, &schema, &make_batch(&schema, 0, 500)).unwrap();
+    let (_, batch, _) = client.scan(tid).unwrap();
+    assert_eq!(
+        batch.map(|b| b.len()),
+        Some(500),
+        "authenticated client's rows must round-trip"
+    );
+}
+
+// ── 13. no client cert vs a required-mTLS server ───────────────────────────
+
+#[test]
+fn mtls_server_rejects_client_without_cert() {
+    let Some(srv) = ServerHandle::start_mtls(1) else { return };
+    // `tls_ca_target()` verifies the server but presents NO client cert. The
+    // rejection may surface at the TLS handshake or at the first framed
+    // exchange (a TLS 1.3 client finishes 0.5-RTT before the server validates
+    // its cert), so drive a full connect (handshake + HELLO) and require it
+    // to fail.
+    assert!(
+        GnitzClient::connect(&srv.tls_ca_target()).is_err(),
+        "an mTLS-required server must reject a client presenting no certificate"
+    );
+}
+
+// ── 14. client cert from an untrusted CA ───────────────────────────────────
+
+#[test]
+fn mtls_server_rejects_untrusted_client_cert() {
+    let Some(srv) = ServerHandle::start_mtls(1) else { return };
+    let Some(other) = ServerHandle::start_mtls(1) else {
+        return;
+    };
+    // Present `other`'s leaf (signed by other's CA) against `srv`, which trusts
+    // only its OWN client CA. Reuse the existing wrong-CA target-splicing
+    // pattern: srv's endpoint + srv's dev cert (?ca=) + other's leaf.
+    let (foreign_cert, foreign_key) = other.mtls_client_cert_key();
+    let srv_ca_target = srv.tls_ca_target(); // tls://IP:PORT?ca=<srv dev cert>
+    let (host_port, srv_ca_param) = srv_ca_target.split_once('?').unwrap();
+    let target = format!(
+        "{host_port}?{srv_ca_param}&cert={}&key={}",
+        foreign_cert.display(),
+        foreign_key.display()
+    );
+    assert!(
+        GnitzClient::connect(&target).is_err(),
+        "a client cert from an untrusted CA must be rejected"
+    );
+}
+
+// ── 15. non-loopback bind refusal + escape hatch ───────────────────────────
+
+#[test]
+fn non_loopback_bind_refused_without_client_auth() {
+    // `0.0.0.0` is non-loopback AND bindable everywhere. With neither a client
+    // CA nor the escape hatch, boot must abort with the refusal message.
+    // `boot_expecting_exit` waits for the process to exit (the AF_UNIX socket
+    // is already listening when the refusal fires, so a readiness probe would
+    // race it).
+    let Some((exited_zero, stderr)) = ServerHandle::boot_expecting_exit(1, &["--tls-listen=0.0.0.0:0"]) else {
+        return;
+    };
+    assert!(
+        !exited_zero,
+        "a non-loopback bind without client auth must exit non-zero"
+    );
+    assert!(
+        stderr.to_lowercase().contains("refusing to bind"),
+        "boot stderr must carry the bind refusal, got: {stderr}"
+    );
+
+    // The escape hatch permits the very same bind (server boots and stays up).
+    let booted = ServerHandle::try_start_tls(1, &["--tls-listen=0.0.0.0:0", "--allow-unauthenticated"])
+        .expect("server binary present")
+        .expect("--allow-unauthenticated must permit a non-loopback bind");
+    drop(booted); // clean shutdown
+}
+
+// ── 16. global connection cap ──────────────────────────────────────────────
+
+#[test]
+fn global_connection_cap_closes_excess() {
+    let Some(result) = ServerHandle::try_start_tls(1, &["--tls-listen=127.0.0.1:0", "--tls-max-conns=2"]) else {
+        return;
+    };
+    let srv = result.expect("a server with --tls-max-conns must boot");
+    let target = srv.tls_target();
+
+    // Hold two connections — each completes HELLO, so each counts against the
+    // cap for its whole lifetime.
+    let _c1 = GnitzClient::connect(&target).expect("1st connection under the cap");
+    let c2 = GnitzClient::connect(&target).expect("2nd connection under the cap");
+
+    // The 3rd is closed immediately (fd closed before any TLS work), so its
+    // handshake cannot complete.
+    assert!(
+        ClientTransport::connect(&target).is_err(),
+        "a connection accepted past the cap must be closed"
+    );
+
+    // Free a slot; a fresh connect then succeeds. Retry: the server-side
+    // decrement lands after the close cascade completes.
+    drop(c2);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut reconnected = false;
+    while Instant::now() < deadline {
+        if GnitzClient::connect(&target).is_ok() {
+            reconnected = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(reconnected, "a cap slot must free after a connection closes");
+}
+
+// ── 17. pre-auth first-frame deadline ──────────────────────────────────────
+
+#[test]
+fn first_frame_deadline_reaps_silent_connections() {
+    use std::io::Read;
+    use std::net::TcpStream;
+
+    let Some(srv) = ServerHandle::start_tls_with_env(4, &[("GNITZ_TLS_HELLO_TIMEOUT_MS", "500")]) else {
+        return;
+    };
+    // Raw loopback IP:PORT (strip the `tls://` scheme and `?insecure`).
+    let addr = {
+        let t = srv.tls_target();
+        t.strip_prefix("tls://").unwrap().split_once('?').unwrap().0.to_string()
+    };
+
+    // A raw TCP connection that sends NO bytes never starts the TLS handshake,
+    // so its first frame never deframes. The 500 ms deadline must close it —
+    // well before our 3 s read timeout (which, absent the deadline, is the
+    // only thing that would ever return).
+    let mut sock = TcpStream::connect(&addr).expect("tcp connect");
+    sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let t0 = Instant::now();
+    let mut buf = [0u8; 1];
+    // At the deadline the server runs `peer.close()`, which makes rustls emit a
+    // (plaintext, pre-handshake) close alert and then shut the socket down.
+    // So the read unblocks with EOF (`Ok(0)`), the alert byte (`Ok(n>0)`), or
+    // an RST (`Err`) — ALL of which mean the server reaped us at the deadline.
+    // Only a WouldBlock/TimedOut means the server never acted (no deadline).
+    match sock.read(&mut buf) {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+            panic!("server did not reap the silent connection within 3 s")
+        }
+        _ => {}
+    }
+    let elapsed = t0.elapsed();
+    assert!(
+        (Duration::from_millis(300)..Duration::from_secs(3)).contains(&elapsed),
+        "the close must land near the 500 ms deadline, took {elapsed:?}"
+    );
+
+    // A normal client (HELLO well within 500 ms) is unaffected.
+    let mut client = GnitzClient::connect(&srv.tls_target()).expect("a normal client must connect");
+    client.alloc_table_id().unwrap();
+}
+
+// ── 18. client `?insecure` fail-closed against a non-loopback host ─────────
+
+#[test]
+fn insecure_non_loopback_is_fail_closed() {
+    // Pure client-side: the refusal fires before any socket work, so no server
+    // is needed. Skip if the override happens to be set in this process env.
+    if std::env::var("GNITZ_TLS_INSECURE").as_deref() == Ok("1") {
+        return;
+    }
+    let err = ClientTransport::connect("tls://example.com:9?insecure")
+        .err()
+        .expect("non-loopback ?insecure must be refused without GNITZ_TLS_INSECURE=1");
+    assert!(
+        err.to_string().to_lowercase().contains("non-loopback"),
+        "expected a fail-closed refusal before any connect, got: {err}"
+    );
+    // Loopback `?insecure` stays allowed — covered by every tls_target() test.
+}

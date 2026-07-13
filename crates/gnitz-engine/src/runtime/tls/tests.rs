@@ -12,7 +12,7 @@ use super::*;
 /// PEM — no skip-verifier.
 fn handshaken_pair() -> (rustls::ClientConnection, rustls::ServerConnection) {
     use rustls::pki_types::pem::PemObject;
-    let (server_cfg, dev_pem) = config::server_crypto(None).unwrap();
+    let (server_cfg, dev_pem) = config::server_crypto(None, None).unwrap();
     let pem = dev_pem.expect("dev mint returns the public PEM");
     let mut roots = rustls::RootCertStore::empty();
     let certs = rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes());
@@ -237,5 +237,90 @@ fn dirty_drop_reclaims_inbound_counter() {
         reactor.total_inbound_bytes(),
         base,
         "dropping the TlsConn with unread frames must refund the counter in full"
+    );
+}
+
+/// mTLS handshake: a server built with a client-cert verifier and a client
+/// presenting a CA-signed leaf must complete the handshake, and the server
+/// must observe the client's cert chain. This is the in-memory analogue of
+/// the required-mTLS `--tls-client-ca` path.
+#[test]
+fn mtls_handshake_presents_client_cert() {
+    use rustls::pki_types::pem::PemObject;
+    use std::io::Write;
+
+    // Client CA + a leaf signed by it (rcgen 0.14 Issuer API). Default
+    // validity (1975–4096) never expires; an empty key-usage set emits no KU
+    // extension, so webpki imposes no CA key-usage constraint.
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let mut ca_params = rcgen::CertificateParams::new(vec!["gnitz-client-ca".to_string()]).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let ca_pem = ca_cert.pem();
+
+    let leaf_key = rcgen::KeyPair::generate().unwrap();
+    let leaf_params = rcgen::CertificateParams::new(vec!["gnitz-client".to_string()]).unwrap();
+    let issuer = rcgen::Issuer::new(ca_params, ca_key);
+    let leaf_cert = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+
+    // Server: required mTLS against the client CA (fed as a PEM file path).
+    let dir = tempfile::tempdir().unwrap();
+    let ca_path = dir.path().join("client_ca.pem");
+    std::fs::File::create(&ca_path)
+        .unwrap()
+        .write_all(ca_pem.as_bytes())
+        .unwrap();
+    let (server_cfg, dev_pem) = config::server_crypto(None, Some(ca_path.to_str().unwrap())).unwrap();
+    let dev_pem = dev_pem.expect("dev server cert minted");
+
+    // Client: verify the dev server cert AND present the CA-signed leaf.
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add_parsable_certificates(
+        rustls::pki_types::CertificateDer::pem_slice_iter(dev_pem.as_bytes()).filter_map(Result::ok),
+    );
+    let leaf_chain = vec![leaf_cert.der().clone()];
+    let leaf_key_der = rustls::pki_types::PrivateKeyDer::from_pem_slice(leaf_key.serialize_pem().as_bytes()).unwrap();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut client_cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(leaf_chain, leaf_key_der)
+        .unwrap();
+    client_cfg.alpn_protocols = vec![gnitz_wire::ALPN_GNITZ.to_vec()];
+    // 0-RTT lock (client side): early data stays off (rustls default).
+    assert!(!client_cfg.enable_early_data, "client 0-RTT early data must be off");
+
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let mut client = rustls::ClientConnection::new(Arc::new(client_cfg), server_name).unwrap();
+    let mut server = rustls::ServerConnection::new(server_cfg).unwrap();
+
+    while client.is_handshaking() || server.is_handshaking() {
+        let mut c2s = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut c2s).unwrap();
+        }
+        let mut s: &[u8] = &c2s;
+        while !s.is_empty() {
+            server.read_tls(&mut s).unwrap();
+            server.process_new_packets().unwrap();
+        }
+        let mut s2c = Vec::new();
+        while server.wants_write() {
+            server.write_tls(&mut s2c).unwrap();
+        }
+        let mut c: &[u8] = &s2c;
+        while !c.is_empty() {
+            client.read_tls(&mut c).unwrap();
+            client.process_new_packets().unwrap();
+        }
+    }
+    assert!(
+        !client.is_handshaking() && !server.is_handshaking(),
+        "mTLS handshake must complete on both sides"
+    );
+    assert!(
+        server.peer_certificates().is_some(),
+        "server must observe the authenticated client cert chain"
     );
 }

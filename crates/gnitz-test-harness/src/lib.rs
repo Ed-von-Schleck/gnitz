@@ -26,6 +26,12 @@ pub struct ServerHandle {
     data_dir: PathBuf,
     workers: usize,
     tls: bool,
+    /// mTLS client cert/key PEM paths (minted by `start_mtls`), for
+    /// [`Self::mtls_target`]. `None` for non-mTLS servers.
+    mtls_client: Option<(PathBuf, PathBuf)>,
+    /// `--tls-client-ca` PEM path, if this server requires mTLS. Stored so
+    /// [`Self::restart`] replays the flag on respawn.
+    client_ca: Option<PathBuf>,
 }
 
 impl ServerHandle {
@@ -43,7 +49,7 @@ impl ServerHandle {
     /// race a sibling test through the process-global env under parallel
     /// `cargo test`.
     pub fn start_with_env(workers: usize, extra_env: &[(&str, &str)]) -> Option<Self> {
-        Self::start_inner(workers, extra_env, None)
+        Self::start_inner(workers, extra_env, None, false)
     }
 
     /// Start with a TLS listener on `127.0.0.1:0` (ephemeral port — safe
@@ -57,57 +63,159 @@ impl ServerHandle {
 
     /// [`Self::start_tls`] with extra server-side environment variables.
     pub fn start_tls_with_env(workers: usize, extra_env: &[(&str, &str)]) -> Option<Self> {
-        Self::start_inner(workers, extra_env, Some("127.0.0.1:0"))
+        Self::start_inner(workers, extra_env, Some("127.0.0.1:0"), false)
     }
 
     /// [`Self::start_tls`] on the IPv6 loopback (`[::1]:0`) — exercises
     /// bracketed-target parsing and the dev cert's `::1` IP SAN.
     pub fn start_tls_v6(workers: usize) -> Option<Self> {
-        Self::start_inner(workers, &[], Some("[::1]:0"))
+        Self::start_inner(workers, &[], Some("[::1]:0"), false)
     }
 
-    fn start_inner(workers: usize, extra_env: &[(&str, &str)], tls_listen: Option<&str>) -> Option<Self> {
-        let bin = env::var("GNITZ_SERVER_BIN")
-            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../gnitz-server").to_string());
-        if !PathBuf::from(&bin).is_file() {
-            return None;
+    /// Start with a TLS listener requiring **mTLS**: a client CA and a
+    /// CA-signed leaf are minted, the server boots with
+    /// `--tls-client-ca=<ca.pem>`, and [`Self::mtls_target`] presents the
+    /// leaf. Ephemeral loopback port.
+    pub fn start_mtls(workers: usize) -> Option<Self> {
+        Self::start_mtls_with_env(workers, &[])
+    }
+
+    /// [`Self::start_mtls`] with extra server-side environment variables.
+    pub fn start_mtls_with_env(workers: usize, extra_env: &[(&str, &str)]) -> Option<Self> {
+        Self::start_inner(workers, extra_env, Some("127.0.0.1:0"), true)
+    }
+
+    /// Spawn a server with a **raw** TLS argv (no client-CA minting), returning
+    /// the ready handle on success or the early-exit stderr tail on failure.
+    /// For tests that assert on a boot *refusal* (the non-loopback bind guard)
+    /// or that need custom TLS flags — an explicit listen address,
+    /// `--tls-max-conns=N`, `--allow-unauthenticated`. `None` if the server
+    /// binary is absent.
+    pub fn try_start_tls(workers: usize, tls_args: &[&str]) -> Option<Result<Self, String>> {
+        let scaffold = boot_scaffold()?;
+        let owned: Vec<String> = tls_args.iter().map(|s| s.to_string()).collect();
+        let has_listen = owned.iter().any(|a| a.starts_with("--tls-listen="));
+        Some(
+            match spawn_and_wait_ready(
+                &scaffold.bin,
+                &scaffold.data_dir,
+                &scaffold.sock_path,
+                &scaffold.stderr_path,
+                workers,
+                &[],
+                &owned,
+            ) {
+                Ok(process) => Ok(Self::assemble(process, scaffold, workers, has_listen, None, None)),
+                // On the failure path `scaffold` (with its tmpdir) drops here, cleaning up.
+                Err(msg) => Err(msg),
+            },
+        )
+    }
+
+    /// Spawn a server with a raw TLS argv and wait for it to EXIT during boot
+    /// — for asserting a boot *abort* (e.g. the non-loopback bind refusal).
+    /// Returns `(exited_zero, stderr_tail)`; panics if the server does NOT
+    /// exit within the startup budget (an unexpected successful boot). `None`
+    /// if the server binary is absent.
+    ///
+    /// This does NOT use the readiness probe: `server_create` binds+listens
+    /// the AF_UNIX socket BEFORE `setup_tls_listener` runs, so a probe connect
+    /// can succeed in the window before a refusal aborts — waiting on the
+    /// process itself is race-free.
+    pub fn boot_expecting_exit(workers: usize, tls_args: &[&str]) -> Option<(bool, String)> {
+        let scaffold = boot_scaffold()?;
+        let owned: Vec<String> = tls_args.iter().map(|s| s.to_string()).collect();
+        let mut proc = configure_command(
+            &scaffold.bin,
+            &scaffold.data_dir,
+            &scaffold.sock_path,
+            &scaffold.stderr_path,
+            workers,
+            &[],
+            &owned,
+        )
+        .spawn()
+        .expect("failed to spawn server");
+        match poll_with_backoff(|| proc.try_wait().ok().flatten()) {
+            Some(status) => Some((status.success(), read_stderr_tail(&scaffold.stderr_path))),
+            None => {
+                proc.kill().ok();
+                proc.wait().ok();
+                panic!(
+                    "server did not exit within {STARTUP_TIMEOUT:?}; expected a boot abort\nstderr tail:\n{}",
+                    read_stderr_tail(&scaffold.stderr_path)
+                );
+            }
+        }
+    }
+
+    fn start_inner(workers: usize, extra_env: &[(&str, &str)], tls_listen: Option<&str>, mtls: bool) -> Option<Self> {
+        let scaffold = boot_scaffold()?;
+
+        // Build the TLS argv. mTLS additionally mints a client CA + a
+        // CA-signed leaf into the tmpdir and enables `--tls-client-ca`.
+        let mut tls_args: Vec<String> = Vec::new();
+        let mut mtls_client: Option<(PathBuf, PathBuf)> = None;
+        let mut client_ca: Option<PathBuf> = None;
+        if let Some(addr) = tls_listen {
+            tls_args.push(format!("--tls-listen={addr}"));
+            if mtls {
+                let (ca, leaf_cert, leaf_key) = mint_client_ca_and_leaf(scaffold.tmpdir.path());
+                tls_args.push(format!("--tls-client-ca={}", ca.display()));
+                client_ca = Some(ca);
+                mtls_client = Some((leaf_cert, leaf_key));
+            }
         }
 
-        let tmpdir = tempfile::Builder::new()
-            .prefix("gnitz_test_")
-            .tempdir()
-            .expect("failed to create tempdir");
-        let data_dir = tmpdir.path().join("data");
-        let sock_path = tmpdir.path().join("gnitz.sock");
-        let stderr_path = tmpdir.path().join("server_stderr.log");
-
-        let tls_arg = tls_listen.map(|addr| format!("--tls-listen={addr}"));
         let process = match spawn_and_wait_ready(
-            &bin,
-            &data_dir,
-            Path::new(&sock_path),
-            &stderr_path,
+            &scaffold.bin,
+            &scaffold.data_dir,
+            &scaffold.sock_path,
+            &scaffold.stderr_path,
             workers,
             extra_env,
-            tls_arg.as_deref(),
+            &tls_args,
         ) {
             Ok(p) => p,
             Err(msg) => {
-                let kept = tmpdir.keep();
+                let kept = scaffold.tmpdir.keep();
                 panic!("{msg}\nartifacts preserved at: {}", kept.display());
             }
         };
 
-        Some(ServerHandle {
+        Some(Self::assemble(
             process,
-            sock_path: sock_path.to_str().unwrap().to_string(),
-            stderr_path,
-            tmpdir: Some(tmpdir),
-            bin,
-            data_dir,
+            scaffold,
             workers,
-            tls: tls_listen.is_some(),
-        })
+            tls_listen.is_some(),
+            mtls_client,
+            client_ca,
+        ))
+    }
+
+    /// Assemble a handle from a spawned child and its [`BootScaffold`] (taking
+    /// ownership of the tmpdir), recording the TLS/mTLS metadata the spawn
+    /// paths differ on. Called only on a successful spawn.
+    fn assemble(
+        process: Child,
+        scaffold: BootScaffold,
+        workers: usize,
+        tls: bool,
+        mtls_client: Option<(PathBuf, PathBuf)>,
+        client_ca: Option<PathBuf>,
+    ) -> Self {
+        ServerHandle {
+            process,
+            sock_path: scaffold.sock_path.to_str().unwrap().to_string(),
+            stderr_path: scaffold.stderr_path,
+            tmpdir: Some(scaffold.tmpdir),
+            bin: scaffold.bin,
+            data_dir: scaffold.data_dir,
+            workers,
+            tls,
+            mtls_client,
+            client_ca,
+        }
     }
 
     /// The bound TLS endpoint (`IP:PORT`), read from the atomically-published
@@ -144,6 +252,32 @@ impl ServerHandle {
         format!("tls://{}?ca={}", self.tls_endpoint(), self.tls_ca_path().display())
     }
 
+    /// The minted client leaf `(cert_pem, key_pem)` paths for a
+    /// [`Self::start_mtls`] server — for building a cross-server "untrusted
+    /// client cert" target (one server's leaf against another's CA).
+    pub fn mtls_client_cert_key(&self) -> (PathBuf, PathBuf) {
+        self.mtls_client
+            .clone()
+            .expect("mtls_client_cert_key requires a start_mtls server")
+    }
+
+    /// `tls://IP:PORT?cert=<leaf>&key=<leafkey>&ca=<server dev cert>` — the
+    /// full mTLS target: presents the CA-signed client leaf and verifies the
+    /// server's minted dev certificate. Requires a [`Self::start_mtls`] server.
+    pub fn mtls_target(&self) -> String {
+        let (cert, key) = self
+            .mtls_client
+            .as_ref()
+            .expect("mtls_target requires a start_mtls server");
+        format!(
+            "tls://{}?cert={}&key={}&ca={}",
+            self.tls_endpoint(),
+            cert.display(),
+            key.display(),
+            self.tls_ca_path().display(),
+        )
+    }
+
     /// Kill the server and respawn it on the same data dir, same socket
     /// path, and the SAME TLS port (read back from `tls_endpoint` before the
     /// kill), so clients holding the old target can observe fail-fast errors
@@ -156,7 +290,10 @@ impl ServerHandle {
         // the NEW boot's publish (same content, but existence must imply the
         // new listener is bound).
         fs::remove_file(self.data_dir.join("tls_endpoint")).ok();
-        let tls_arg = format!("--tls-listen={endpoint}");
+        let mut tls_args = vec![format!("--tls-listen={endpoint}")];
+        if let Some(ca) = &self.client_ca {
+            tls_args.push(format!("--tls-client-ca={}", ca.display()));
+        }
         self.process = spawn_and_wait_ready(
             &self.bin,
             &self.data_dir,
@@ -164,7 +301,7 @@ impl ServerHandle {
             &self.stderr_path,
             self.workers,
             &[],
-            Some(&tls_arg),
+            &tls_args,
         )
         // ServerHandle::Drop preserves the tmpdir during the unwind.
         .unwrap_or_else(|msg| panic!("restart failed: {msg}"));
@@ -177,19 +314,83 @@ impl ServerHandle {
     }
 }
 
-/// Spawn the server and block until a probe connect on the AF_UNIX socket
-/// succeeds. `Err` (with the stderr tail embedded) on early exit or timeout;
-/// the caller decides how to preserve artifacts.
+/// A resolved server binary + a fresh tmpdir with the standard
+/// `data` / socket / stderr layout. Produced once by [`boot_scaffold`] and
+/// consumed by [`ServerHandle::assemble`] on a successful spawn (which takes
+/// ownership of the tmpdir); otherwise dropped, cleaning up.
+struct BootScaffold {
+    bin: String,
+    tmpdir: TempDir,
+    data_dir: PathBuf,
+    sock_path: PathBuf,
+    stderr_path: PathBuf,
+}
+
+/// Resolve the server binary (`None` when absent, so tests skip) and mint a
+/// fresh tmpdir with the standard data/socket/stderr layout — the single
+/// source of the spawn preamble every `ServerHandle` entry point shares.
+fn boot_scaffold() -> Option<BootScaffold> {
+    let bin = env::var("GNITZ_SERVER_BIN")
+        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../gnitz-server").to_string());
+    if !PathBuf::from(&bin).is_file() {
+        return None;
+    }
+    let tmpdir = tempfile::Builder::new()
+        .prefix("gnitz_test_")
+        .tempdir()
+        .expect("failed to create tempdir");
+    let data_dir = tmpdir.path().join("data");
+    let sock_path = tmpdir.path().join("gnitz.sock");
+    let stderr_path = tmpdir.path().join("server_stderr.log");
+    Some(BootScaffold {
+        bin,
+        tmpdir,
+        data_dir,
+        sock_path,
+        stderr_path,
+    })
+}
+
+/// Mint a self-signed client CA and a leaf certificate signed by it, writing
+/// all three PEMs (CA public cert, leaf cert, leaf private key) into `dir`.
+/// Returns `(ca_cert, leaf_cert, leaf_key)` paths. The CA has cA=TRUE and no
+/// key-usage extension (so webpki imposes no CA key-usage constraint); the
+/// leaf has no EKU (still authenticates — the documented residual). Default
+/// rcgen validity (1975–4096) never expires.
+fn mint_client_ca_and_leaf(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let ca_key = rcgen::KeyPair::generate().expect("mint: ca key");
+    let mut ca_params = rcgen::CertificateParams::new(vec!["gnitz-client-ca".to_string()]).expect("mint: ca params");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_cert = ca_params.self_signed(&ca_key).expect("mint: self-sign ca");
+
+    let leaf_key = rcgen::KeyPair::generate().expect("mint: leaf key");
+    let leaf_params = rcgen::CertificateParams::new(vec!["gnitz-client".to_string()]).expect("mint: leaf params");
+    let issuer = rcgen::Issuer::new(ca_params, ca_key);
+    let leaf_cert = leaf_params.signed_by(&leaf_key, &issuer).expect("mint: sign leaf");
+
+    let ca_path = dir.join("client_ca.pem");
+    let leaf_cert_path = dir.join("client_leaf.pem");
+    let leaf_key_path = dir.join("client_leaf_key.pem");
+    fs::write(&ca_path, ca_cert.pem()).expect("mint: write ca pem");
+    fs::write(&leaf_cert_path, leaf_cert.pem()).expect("mint: write leaf pem");
+    fs::write(&leaf_key_path, leaf_key.serialize_pem()).expect("mint: write leaf key pem");
+    (ca_path, leaf_cert_path, leaf_key_path)
+}
+
+/// Build (but do not spawn) the server `Command`: positional args, captured
+/// stderr, the small-SAL cap, extra env, worker count, and TLS argv. Shared by
+/// [`spawn_and_wait_ready`] (readiness probe) and [`ServerHandle::boot_expecting_exit`]
+/// (wait-for-exit).
 #[allow(clippy::too_many_arguments)]
-fn spawn_and_wait_ready(
+fn configure_command(
     bin: &str,
     data_dir: &Path,
     sock_path: &Path,
     stderr_path: &Path,
     workers: usize,
     extra_env: &[(&str, &str)],
-    tls_arg: Option<&str>,
-) -> Result<Child, String> {
+    tls_args: &[String],
+) -> Command {
     // Append on restart so the first boot's stderr survives for post-mortem.
     let stderr_file = fs::OpenOptions::new()
         .create(true)
@@ -217,10 +418,28 @@ fn spawn_and_wait_ready(
     if workers > 1 {
         cmd.arg(format!("--workers={workers}"));
     }
-    if let Some(tls) = tls_arg {
+    for tls in tls_args {
         cmd.arg(tls);
     }
-    let mut proc = cmd.spawn().expect("failed to spawn server");
+    cmd
+}
+
+/// Spawn the server and block until a probe connect on the AF_UNIX socket
+/// succeeds. `Err` (with the stderr tail embedded) on early exit or timeout;
+/// the caller decides how to preserve artifacts.
+#[allow(clippy::too_many_arguments)]
+fn spawn_and_wait_ready(
+    bin: &str,
+    data_dir: &Path,
+    sock_path: &Path,
+    stderr_path: &Path,
+    workers: usize,
+    extra_env: &[(&str, &str)],
+    tls_args: &[String],
+) -> Result<Child, String> {
+    let mut proc = configure_command(bin, data_dir, sock_path, stderr_path, workers, extra_env, tls_args)
+        .spawn()
+        .expect("failed to spawn server");
 
     // Readiness is "a client connect succeeds", NOT "the socket file
     // exists". `server_create` creates the AF_UNIX file at `bind()` but

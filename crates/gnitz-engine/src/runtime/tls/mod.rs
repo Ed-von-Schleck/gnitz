@@ -27,7 +27,7 @@
 
 pub(crate) mod config;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io::{ErrorKind, Read, Write};
@@ -114,12 +114,34 @@ impl TlsConn {
     }
 }
 
+/// Live-TLS-connection counter guard: `new` increments, `Drop` decrements.
+/// Stored in `TlsShared`, so the count tracks the session lifetime exactly
+/// (a session-init failure drops it inside `start`; a live session drops it
+/// at full teardown, when the last `Rc<TlsShared>` drops).
+pub(crate) struct ConnCountGuard(Rc<Cell<u32>>);
+
+impl ConnCountGuard {
+    pub(crate) fn new(c: Rc<Cell<u32>>) -> Self {
+        c.set(c.get() + 1);
+        Self(c)
+    }
+}
+
+impl Drop for ConnCountGuard {
+    fn drop(&mut self) {
+        debug_assert!(self.0.get() > 0, "tls conn count underflow");
+        self.0.set(self.0.get() - 1);
+    }
+}
+
 /// Shared handle to one TLS connection, held by the `Peer`, the read pump,
 /// and the flusher.
 pub(crate) struct TlsShared {
     reactor: Rc<Reactor>,
     fd: i32,
     state: RefCell<TlsConn>,
+    /// Decrements the reactor-thread live-connection counter on teardown.
+    _conn_guard: ConnCountGuard,
     /// Serializes ciphertext extraction + its `send_raw` across the flusher
     /// and every `send_bytes` sender — the ≤1-`OP_SEND`-in-flight /
     /// record-order invariant. Teardown never *acquires* it (lock-free
@@ -145,12 +167,17 @@ impl TlsShared {
         reactor: Rc<Reactor>,
         fd: i32,
         cfg: Arc<rustls::ServerConfig>,
+        conn_guard: ConnCountGuard,
     ) -> Result<Rc<TlsShared>, rustls::Error> {
+        // `ServerConnection::new` runs first: on failure the moved-in
+        // `conn_guard` drops here (decrement) as this frame unwinds; on
+        // success it lives in the returned `TlsShared`.
         let sess = rustls::ServerConnection::new(cfg)?;
         let (flush_tx, flush_rx) = mpsc::unbounded::<()>();
         let conn = Rc::new(TlsShared {
             reactor: Rc::clone(&reactor),
             fd,
+            _conn_guard: conn_guard,
             state: RefCell::new(TlsConn {
                 sess,
                 recv_state: io::RecvState::new(),

@@ -34,16 +34,29 @@ Options:
   --log-level=LEVEL    Set log verbosity: quiet, normal, verbose (default: quiet)
   --tls-listen=IP:PORT Additionally listen for TLS 1.3 clients on this TCP
                        address (port 0 = ephemeral). The bound address is
-                       written to <data_dir>/tls_endpoint.
-                       WARNING: the TLS listener is fully UNAUTHENTICATED —
-                       anyone who can connect gets full DDL/DML/scan access.
-                       TLS provides confidentiality and server authentication
-                       only; bind loopback unless the network is trusted.
+                       written to <data_dir>/tls_endpoint. A NON-LOOPBACK bind
+                       REQUIRES --tls-client-ca or --allow-unauthenticated —
+                       boot aborts otherwise. A loopback bind is turnkey.
   --tls-cert=PEM       Server certificate chain (requires --tls-key and
                        --tls-listen). Without cert+key a self-signed dev
                        certificate for localhost/127.0.0.1/::1 is minted and
                        its public PEM written to <data_dir>/tls_dev_cert.pem.
   --tls-key=PEM        Server private key (see --tls-cert)
+  --tls-client-ca=PEM  Enable REQUIRED mTLS: clients must present an X.509
+                       certificate chaining to this CA (chain) to complete the
+                       handshake. Use a DEDICATED client-auth CA — any leaf the
+                       CA signs authenticates (a leaf with no clientAuth EKU is
+                       still accepted). No CRL/OCSP: revoke by rotating the CA,
+                       which invalidates all clients at once.
+  --allow-unauthenticated
+                       Escape hatch: permit a non-loopback bind with NO client
+                       authentication — anyone who can reach the port gets full
+                       DDL/DML/scan access. Prefer --tls-client-ca. Note: even a
+                       loopback bind trusts every local UID (like the always-on
+                       AF_UNIX socket), gated only by network reachability and
+                       filesystem permissions.
+  --tls-max-conns=N    Global cap on concurrent TLS connections (default 256).
+                       A connection accepted past the cap is closed immediately.
   --help, -h           Show this help message and exit
 
 Environment:
@@ -88,6 +101,11 @@ fn main() {
     let mut tls_listen: Option<std::net::SocketAddr> = None;
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
+    let mut tls_client_ca: Option<String> = None;
+    let mut allow_unauthenticated = false;
+    // `Option` so "unset" is distinguishable from an explicit value; defaulted
+    // to 256 at construction.
+    let mut tls_max_conns: Option<u32> = None;
     let mut pos = 0;
 
     let mut i = 1;
@@ -118,6 +136,18 @@ fn main() {
             tls_cert = Some(val.to_string());
         } else if let Some(val) = arg.strip_prefix("--tls-key=") {
             tls_key = Some(val.to_string());
+        } else if let Some(val) = arg.strip_prefix("--tls-client-ca=") {
+            tls_client_ca = Some(val.to_string());
+        } else if arg == "--allow-unauthenticated" {
+            allow_unauthenticated = true;
+        } else if let Some(val) = arg.strip_prefix("--tls-max-conns=") {
+            match val.parse::<u32>() {
+                Ok(n) if n >= 1 => tls_max_conns = Some(n),
+                _ => {
+                    eprintln!("Error: --tls-max-conns must be a positive integer (got {val:?})");
+                    process::exit(1);
+                }
+            }
         } else if pos == 0 {
             data_dir = arg.clone();
             pos += 1;
@@ -134,20 +164,35 @@ fn main() {
         process::exit(1);
     }
 
-    let tls_cli = match (tls_listen, tls_cert, tls_key) {
-        (None, None, None) => None,
-        (None, _, _) => {
-            eprintln!("Error: --tls-cert/--tls-key require --tls-listen");
-            process::exit(1);
+    let tls_cli = match tls_listen {
+        None => {
+            if tls_cert.is_some()
+                || tls_key.is_some()
+                || tls_client_ca.is_some()
+                || allow_unauthenticated
+                || tls_max_conns.is_some()
+            {
+                eprintln!("Error: --tls-* flags require --tls-listen");
+                process::exit(1);
+            }
+            None
         }
-        (Some(listen), None, None) => Some(runtime::TlsCli { listen, cert_key: None }),
-        (Some(listen), Some(cert), Some(key)) => Some(runtime::TlsCli {
-            listen,
-            cert_key: Some((cert, key)),
-        }),
-        (Some(_), _, _) => {
-            eprintln!("Error: --tls-cert and --tls-key must be given together");
-            process::exit(1);
+        Some(listen) => {
+            let cert_key = match (tls_cert, tls_key) {
+                (None, None) => None,
+                (Some(cert), Some(key)) => Some((cert, key)),
+                _ => {
+                    eprintln!("Error: --tls-cert and --tls-key must be given together");
+                    process::exit(1);
+                }
+            };
+            Some(runtime::TlsCli {
+                listen,
+                cert_key,
+                client_ca: tls_client_ca,
+                allow_unauthenticated,
+                max_conns: tls_max_conns.unwrap_or(256),
+            })
         }
     };
 
