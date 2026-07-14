@@ -297,13 +297,14 @@ fn debounce_drain(rx: &mut mpsc::Receiver<CommitRequest>, first: CommitRequest) 
 /// skipped, and the reset then orphans them permanently while their writers wait
 /// for ACKs that never arrive.
 ///
-/// `ephemeral_gen: None` — base/reclaim round: `FLAG_FLUSH` (lsn 0, unused),
-/// then the full `checkpoint_post_ack` (system-table flush +
-/// gated-deletion drain + reset). `Some(gen)` — ephemeral round:
-/// `FLAG_FLUSH_EPH` carrying the generation in the group header's `lsn` field
-/// (workers read it to stamp view manifests), then a bare reset — only command
-/// groups sit in the SAL since the base round's reset, and gated deletions
-/// already drained there.
+/// `ephemeral_gen: None` — base/reclaim round: `FLAG_FLUSH` (lsn 0, unused).
+/// `Some(gen)` — ephemeral round: `FLAG_FLUSH_EPH` carrying the generation in
+/// the group header's `lsn` field (workers read it to stamp view manifests).
+/// Both rounds finalize identically via `checkpoint_post_ack` (system-table
+/// flush + gated-deletion drain + reset): a `commit_serial_range_durable`
+/// advance can land in the `sys_sequences` MemTable during the drain window
+/// after the base round's reset, so the ephemeral reset must flush the system
+/// tables first or that advance is discarded on a crash.
 async fn flush_round(
     shared: &Rc<Shared>,
     ephemeral_gen: Option<u64>,
@@ -335,13 +336,8 @@ async fn flush_round(
     if let Some(e) = err {
         return Err(e);
     }
-    match ephemeral_gen {
-        None => guard_panic("checkpoint_post_ack", || shared.disp().checkpoint_post_ack()),
-        Some(_) => {
-            shared.disp().checkpoint_reset_only();
-            Ok(())
-        }
-    }
+    // Both rounds finalize the same way: flush system tables, then reset the SAL.
+    guard_panic("checkpoint_post_ack", || shared.disp().checkpoint_post_ack())
 }
 
 /// The full steady-state checkpoint sequence: gen bump → base round → drain →

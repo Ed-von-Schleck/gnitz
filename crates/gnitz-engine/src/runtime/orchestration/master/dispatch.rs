@@ -1407,6 +1407,15 @@ impl MasterDispatcher {
     /// sync path (`do_checkpoint`) and the async committer after it
     /// collects FLAG_FLUSH ACKs.
     ///
+    /// Finalizes **both** checkpoint rounds — base and ephemeral. The ephemeral
+    /// round must flush too: a `commit_serial_range_durable` advance can land in
+    /// the `sys_sequences` MemTable during the drain window (after the base
+    /// round's reset), so this flush is its only durability event before the
+    /// ephemeral reset makes the SAL tail useless for recovery. The
+    /// gated-deletion drain is a no-op in the ephemeral position (DDL is
+    /// barrier-deferred through the whole checkpoint, so nothing enqueues after
+    /// the base round drained).
+    ///
     /// Returns the flush error WITHOUT resetting the SAL when the system-table
     /// flush fails: the SAL entries about to be discarded are that data's only
     /// durable copy, so resetting on a swallowed failure destroys it — the same
@@ -1422,16 +1431,6 @@ impl MasterDispatcher {
         self.sal.checkpoint_reset();
         gnitz_info!("SAL checkpoint epoch={}", self.sal.epoch());
         Ok(())
-    }
-
-    /// Reset the SAL cursor + advance the epoch, without the system-table flush
-    /// or gated-deletion drain of `checkpoint_post_ack`. Used by the ephemeral
-    /// checkpoint round: since the base round's reset, only command groups (tick
-    /// / relay) were written, so nothing durable is discarded and gated deletions
-    /// already drained in the base round.
-    pub(crate) fn checkpoint_reset_only(&mut self) {
-        self.sal.checkpoint_reset();
-        gnitz_info!("SAL checkpoint (ephemeral) epoch={}", self.sal.epoch());
     }
 
     /// Bump the committed checkpoint generation (step 0 of the sequence).
@@ -1454,11 +1453,11 @@ impl MasterDispatcher {
         // Base round (FLAG_FLUSH → ACKs → flush system tables + reset).
         self.do_checkpoint()?;
         // Ephemeral round: workers persist view trace/output state stamped `gen`,
-        // then a bare SAL reset (only the base round's own command groups sit in
-        // the SAL since its reset).
+        // then the same finalize as the base round (flush system tables + reset).
+        // A guaranteed no-op flush here — no writes since `do_checkpoint` and no
+        // socket open — but it keeps a single reset-with-flush finalizer.
         self.sync_flush_round(gen, FLAG_FLUSH_EPH)?;
-        self.checkpoint_reset_only();
-        Ok(())
+        self.checkpoint_post_ack()
     }
 
     /// Accessor for the committer. True when the SAL write cursor has
@@ -1693,5 +1692,74 @@ mod worker_liveness_tests {
             "error identifies the backfill path: {err}"
         );
         drop(disp);
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_finalize_tests {
+    use super::*;
+    use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_TAB_ID};
+    use crate::runtime::sal::SalWriter;
+    use crate::runtime::w2m::W2mReceiver;
+    use crate::test_support::SharedRegion;
+
+    const SAL_SIZE: usize = 4096;
+
+    fn finalize_temp_dir(name: &str) -> String {
+        crate::foundation::posix_io::raise_fd_limit_for_tests();
+        let path = std::env::temp_dir()
+            .join(format!("gnitz_checkpoint_finalize_test_{name}"))
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let _ = std::fs::remove_dir_all(&path);
+        path
+    }
+
+    /// The checkpoint finalizer must flush system tables before resetting the SAL:
+    /// a `commit_serial_range_durable` advance can land in the `sys_sequences`
+    /// MemTable during the drain window (bypassing the committer barrier and the SAL
+    /// reset that already ran in the base round), so the finalizer is its only
+    /// durability event before the ephemeral reset makes the SAL log useless for
+    /// recovery. Strip the flush and a crash right after (no `close()`) loses it.
+    #[test]
+    fn checkpoint_post_ack_flushes_memtable_only_sequence_advance() {
+        let dir = finalize_temp_dir("seq_survives_reset");
+        let user_seq = FIRST_USER_TABLE_ID + 3;
+        {
+            let mut engine = CatalogEngine::open(&dir).unwrap();
+
+            // Reserve + ingest straight into the catalog — no SAL involved, so the
+            // advance lands ONLY in the sys_sequences MemTable (mirrors
+            // test_user_sequence_durable_roundtrip's setup).
+            let (base, delta, _lsn) = engine.reserve_user_sequence(user_seq, 64);
+            assert_eq!(base, 1);
+            engine.ingest_to_family(SEQ_TAB_ID, &delta).unwrap();
+            assert_eq!(engine.user_sequences.get(&user_seq).copied(), Some(64));
+
+            // A fake but real, writable SAL region: checkpoint_reset() stores 0 at
+            // the base pointer, so it must not be null.
+            let sal_region = SharedRegion::new(SAL_SIZE);
+            let sal_writer = SalWriter::new(sal_region.ptr(), -1, SAL_SIZE as u64, Vec::new());
+            let catalog_ptr = &mut engine as *mut CatalogEngine;
+            let mut disp = MasterDispatcher::new(0, Vec::new(), catalog_ptr, sal_writer, W2mReceiver::new(Vec::new()));
+
+            // The finalizer under guard: must durably flush sys_sequences before the
+            // reset. (Pre-fix, the ephemeral round called a bare-reset variant.)
+            disp.checkpoint_post_ack().unwrap();
+            drop(disp);
+
+            // Crash semantics: no engine.close(). No Drop impl, so only flushed data survives.
+            drop(engine);
+        }
+
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        assert_eq!(
+            engine.user_sequences.get(&user_seq).copied(),
+            Some(64),
+            "sys_sequences high-water must survive a crash right after the checkpoint finalize"
+        );
+        engine.close();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
