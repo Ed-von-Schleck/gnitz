@@ -10,8 +10,9 @@ use crate::codec::colwrite::{append_value_to_col, ColumnValue};
 use crate::codec::nullmap::null_word_set;
 use crate::codec::pk_codec::{extract_pk_value, is_null_expr};
 use crate::dml::mutate::{build_merged_row, eval_set_expr, resolve_set_target};
+use crate::dml::overlay::effective_row;
 use crate::error::GnitzSqlError;
-use crate::exec::batch::{apply_projection, copy_batch_row};
+use crate::exec::batch::{copy_batch_row, project, resolve_projection};
 use crate::ir::BoundExpr;
 use crate::SqlResult;
 use gnitz_core::{ColData, FixedInt, GnitzClient, PkColumn, PkTuple, Schema, WireConflictMode, ZSetBatch};
@@ -236,26 +237,34 @@ pub(crate) fn execute_insert(
 
     match plan {
         ConflictPlan::Error => {
-            // SQL-standard INSERT: server rejects on any PK conflict.
+            // SQL-standard INSERT: the server rejects on any PK conflict (at COMMIT
+            // in a transaction — the engine's per-family duplicate check).
+            //
+            // RETURNING (plain-INSERT path only): the assigned SERIAL ids are
+            // already stamped into the batch's PK region, so the reply is a
+            // projection of the batch we just built — no round-trip. `resolve` runs
+            // BEFORE the write, so a bad RETURNING list writes nothing (it used to
+            // commit the row and then fail); `project` afterwards is infallible and
+            // consumes the batch, so nothing is copied.
+            let proj = returning.map(|items| resolve_projection(items, &schema)).transpose()?;
             client.push_with_mode(tid, &schema, &batch, WireConflictMode::Error)?;
-            // RETURNING (plain-INSERT path only): project the just-built batch —
-            // the assigned SERIAL ids are already stamped into its PK region, so
-            // this needs no round-trip. `apply_projection` accepts column
-            // references and `*`, and requires ≥1 PK column (so `RETURNING id` /
-            // `RETURNING *` work; a non-PK-only list is rejected).
-            if let Some(items) = returning {
-                let (proj_schema, proj_batch) = apply_projection(items, &schema, Some(batch))?;
-                return Ok(SqlResult::Rows {
-                    schema: proj_schema,
-                    batch: proj_batch,
-                });
+            match proj {
+                Some(proj) => {
+                    let (proj_schema, proj_batch) = project(proj, &schema, Some(batch));
+                    Ok(SqlResult::Rows {
+                        schema: proj_schema,
+                        batch: proj_batch,
+                    })
+                }
+                None => Ok(SqlResult::RowsAffected { count: n }),
             }
-            Ok(SqlResult::RowsAffected { count: n })
         }
         ConflictPlan::DoNothingPk => {
-            // Client-side filter: drop any row whose PK already exists
-            // in the store. De-duplicate intra-batch (first-wins) before
-            // pushing.
+            // Client-side filter: drop any row whose PK already exists — buffered
+            // or committed (see `effective_row`). Resolving against the buffer is
+            // what stops two DO NOTHING inserts of one new PK from buffering two
+            // `+1` Error rows and tripping the commit-time per-family duplicate
+            // check. De-duplicate intra-batch (first-wins) before pushing.
             let (filtered, surviving_count) = client_side_filter_do_nothing(client, tid, &schema, &batch)?;
             if surviving_count > 0 {
                 client.push_with_mode(tid, &schema, &filtered, WireConflictMode::Error)?;
@@ -333,8 +342,8 @@ fn expr_contains_excluded(expr: &Expr) -> bool {
     }
 }
 
-/// Drop incoming rows whose PK already exists in the store. Returns
-/// the filtered ZSetBatch plus the surviving-row count.
+/// Drop incoming rows whose PK already exists. Returns the filtered ZSetBatch
+/// plus the surviving-row count.
 ///
 /// Intra-batch duplicate PKs keep only the first occurrence.
 fn client_side_filter_do_nothing(
@@ -353,10 +362,9 @@ fn client_side_filter_do_nothing(
         if !seen_pks.insert(pk) {
             continue;
         }
-        // Existing-store check.
-        let (_sch, found, _lsn) = client.seek(tid, &pk)?;
-        let exists = matches!(found, Some(b) if !b.pks.is_empty());
-        if exists {
+        // A PK the transaction buffered as live conflicts; one it buffered as
+        // deleted does not; an untouched PK falls through to the committed store.
+        if effective_row(client, tid, schema, &pk)?.is_some() {
             continue;
         }
         surviving_indices.push(i);
@@ -407,17 +415,20 @@ fn client_side_merge_do_update(
             ));
         }
 
-        let (_sch, existing_opt, _lsn) = client.seek(tid, &pk)?;
-        let existing = existing_opt.filter(|b| !b.pks.is_empty());
+        // The effective existing row — a row the transaction buffered is both the
+        // merge's carry source AND `eval_do_update_rhs`'s evaluation base, so
+        // `SET x = x + 1` reads the buffered `x`; a buffered delete is no
+        // conflict, and an untouched PK falls through to the committed store.
+        let existing = effective_row(client, tid, schema, &pk)?;
 
-        match existing {
+        match &existing {
             None => {
                 copy_batch_row(batch, i, &mut out, schema);
             }
-            Some(existing_batch) => {
-                build_merged_row(batch, i, &existing_batch, 0, schema, &mut out, |ci| {
+            Some(ex) => {
+                build_merged_row(batch, i, ex, 0, schema, &mut out, |ci| {
                     asn_by_col[ci]
-                        .map(|rhs| eval_do_update_rhs(rhs, &existing_batch, batch, i, schema))
+                        .map(|rhs| eval_do_update_rhs(rhs, ex, batch, i, schema))
                         .transpose()
                 })?;
             }

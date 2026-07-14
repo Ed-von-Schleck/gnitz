@@ -8,13 +8,14 @@ use crate::ast_util::{extract_name, extract_table_factor_name};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_column_value, ColumnValue};
 use crate::codec::nullmap::null_word_set;
+use crate::dml::overlay::{buffered_all, buffered_keys, overlay_batch, Net};
 use crate::dml::plan::{classify_access, collect_index_seek_candidates, seek_pk_multi, AccessPath};
 use crate::error::GnitzSqlError;
 use crate::exec::eval::eval_expr;
 use crate::exec::residual::{bind_residuals, matching_indices};
 use crate::ir::BoundExpr;
 use crate::SqlResult;
-use gnitz_core::{ClientError, ColData, GnitzClient, PkColumn, Schema, WireConflictMode, ZSetBatch};
+use gnitz_core::{ClientError, ColData, GnitzClient, PkColumn, PkTuple, Schema, WireConflictMode, ZSetBatch};
 use sqlparser::ast::{Assignment, AssignmentTarget, Expr, FromTable, Statement};
 use std::sync::Arc;
 
@@ -156,102 +157,120 @@ fn write_set_rows(
 // ---------------------------------------------------------------------------
 
 /// The rows a single-table UPDATE/DELETE `WHERE` (or its absence) resolves to.
-/// `batch`/`schema` are the seek/scan reply; `matched` indexes the rows that
-/// passed the residual/predicate. UPDATE writes a SET batch from `matched`;
-/// DELETE collects their PKs.
+/// `batch` is the effective state (the fetched seek/scan reply, overlaid with the
+/// open transaction's buffered writes — see `overlay`); `matched` indexes the
+/// rows that passed the residual/predicate. UPDATE writes a SET batch from
+/// `matched`; DELETE collects their PKs.
 struct ResolvedRows {
     /// Schema returned with the fetched batch (the wire reply overrides the
     /// catalog schema for column metadata), if any.
     schema: Option<Arc<Schema>>,
-    /// The fetched seek/scan batch; `None` when no data was returned.
-    batch: Option<ZSetBatch>,
+    /// The effective rows.
+    batch: ZSetBatch,
     /// Indices into `batch` that passed the residual/predicate.
     matched: Vec<usize>,
 }
 
-/// Resolve `selection` to the matching rows of `table_id`, walking the shared
+/// Resolve `selection` to the matching rows of `tid`, walking the shared
 /// UPDATE/DELETE access-path ladder: PK point-seek → secondary-index equality
 /// seek (first existing index wins) → predicate full scan; or a full scan of
-/// every row when there is no `WHERE`. Residuals/predicates are applied per row
-/// and only matching indices are returned. The index-seek stage reproduces the
-/// current first-candidate short-circuit: a seek that hits an existing index but
-/// matches no rows is terminal — it does NOT fall through to the predicate scan.
+/// every row when there is no `WHERE`.
+///
+/// Each arm fetches the committed rows, then overlays the open transaction's own
+/// buffered writes ([`overlay_batch`]) before the predicate derives `matched` —
+/// so a buffered payload that fails a WHERE the committed payload passed matches
+/// nothing, and a transaction-born row is discovered. **In autocommit every net
+/// map is empty, the overlay is the identity, and this is exactly the plain
+/// committed ladder.** The seek arms overlay only the keys they seeked: their
+/// residual does not constrain the PK, so an unrelated buffered row must not
+/// enter their effective batch.
 fn resolve_where_rows(
     client: &mut GnitzClient,
-    table_id: u64,
+    tid: u64,
     schema: &Schema,
     selection: Option<&Expr>,
 ) -> Result<ResolvedRows, GnitzSqlError> {
     match classify_access(selection, schema) {
         AccessPath::ScanAll => {
-            let (schema_opt, batch_opt, _) = client.scan(table_id)?;
-            let matched = (0..batch_opt.as_ref().map_or(0, |b| b.pks.len())).collect();
-            Ok(ResolvedRows {
-                schema: schema_opt,
-                batch: batch_opt,
-                matched,
-            })
+            let (schema_opt, committed, _) = client.scan(tid)?;
+            let net = buffered_all(client, tid);
+            resolve(schema, schema_opt, committed, &net, &[])
         }
         AccessPath::PkSeek { pk, residual } => {
-            let (schema_opt, batch_opt, _) = client.seek(table_id, &pk)?;
-            resolve_residual_rows(schema, schema_opt, batch_opt, &residual)
+            let (schema_opt, committed, _) = client.seek(tid, &pk)?;
+            let net = buffered_keys(client, tid, std::slice::from_ref(&pk));
+            resolve(schema, schema_opt, committed, &net, &residual)
         }
         AccessPath::PkMultiSeek { pks } => {
             // `pk IN (…)`: the concatenated seek replies ARE the matching rows —
             // no residual; an absent key contributes none, so the count reports
             // rows actually touched.
-            let (schema_opt, batch_opt) = seek_pk_multi(client, table_id, schema, &pks, None)?;
-            let matched = (0..batch_opt.as_ref().map_or(0, |b| b.pks.len())).collect();
-            Ok(ResolvedRows {
-                schema: schema_opt,
-                batch: batch_opt,
-                matched,
-            })
+            let (schema_opt, committed) = seek_pk_multi(client, tid, schema, &pks, None)?;
+            let stride = schema.pk_stride() as u8;
+            let keys: Vec<PkTuple> = pks.iter().map(|&k| PkTuple::from_u128(stride, k)).collect();
+            let net = buffered_keys(client, tid, &keys);
+            resolve(schema, schema_opt, committed, &net, &[])
         }
         AccessPath::Filtered { where_expr } => {
-            // Secondary-index equality seek: the first index that exists serves
-            // the query — a hit with no matching rows is terminal. Only an
-            // all-NoIndex sweep reaches the predicate scan below.
-            let candidates = collect_index_seek_candidates(where_expr, schema, || client.table_indexes(table_id))
-                .map_err(GnitzSqlError::Exec)?;
-            for (col_indices, key_vals, residual) in candidates {
-                match client.seek_by_index(table_id, col_indices.as_slice(), &key_vals) {
-                    Ok((schema_opt, batch_opt, _)) => {
-                        return resolve_residual_rows(schema, schema_opt, batch_opt, &residual);
-                    }
-                    Err(ClientError::NoIndex) => continue,
-                    Err(e) => return Err(GnitzSqlError::Exec(e)),
-                }
-            }
-
-            // Predicate full scan: no index served the WHERE. Bind the whole
-            // predicate as a one-element residual and filter the scan through it.
-            let (schema_opt, batch_opt, _) = client.scan(table_id)?;
-            resolve_residual_rows(schema, schema_opt, batch_opt, &[where_expr])
+            let (schema_opt, committed, residual) = fetch_filtered(client, tid, schema, where_expr)?;
+            let net = buffered_all(client, tid);
+            // Committed rows already satisfy the winning index's equality prefix,
+            // so its reduced `residual` decides them — and it is the only form the
+            // row evaluator can always handle (an indexed STRING/U128 equality is
+            // seekable but not evaluable). Buffered rows are unindexed, so once the
+            // transaction has touched this table every row must face the FULL
+            // predicate instead.
+            let preds: Vec<&Expr> = if net.is_empty() { residual } else { vec![where_expr] };
+            resolve(schema, schema_opt, committed, &net, &preds)
         }
     }
 }
 
-/// Bind `residual` against the catalog `schema`, apply it per row of a fetched
-/// seek batch against the reply schema, and return the passing indices. An empty
-/// residual passes every row; an absent batch matches nothing.
-fn resolve_residual_rows(
+/// The ladder's shared tail: overlay the buffered writes onto the committed
+/// batch, bind `residual` against the catalog schema, and match it per effective
+/// row. An empty residual passes every row.
+fn resolve(
     schema: &Schema,
     schema_opt: Option<Arc<Schema>>,
-    batch_opt: Option<ZSetBatch>,
+    committed: Option<ZSetBatch>,
+    net: &Net,
     residual: &[&Expr],
 ) -> Result<ResolvedRows, GnitzSqlError> {
-    let actual_schema = schema_opt.as_deref().unwrap_or(schema);
+    let actual = schema_opt.as_deref().unwrap_or(schema);
+    let batch = overlay_batch(committed, net, actual);
     let preds = bind_residuals(residual, schema)?;
-    let matched = match &batch_opt {
-        Some(batch) => matching_indices(&preds, batch, actual_schema)?,
-        None => Vec::new(),
-    };
+    let matched = matching_indices(&preds, &batch, actual)?;
     Ok(ResolvedRows {
         schema: schema_opt,
-        batch: batch_opt,
+        batch,
         matched,
     })
+}
+
+/// Fetch the committed candidates for a `Filtered` WHERE: the first existing
+/// index's equality seek (with the reduced residual left over from consuming its
+/// key columns), else the full scan (residual = the whole predicate). The first
+/// index that exists serves the query — a hit with no matching rows is terminal,
+/// it does NOT fall through to the scan.
+type FilteredFetch<'a> = (Option<Arc<Schema>>, Option<ZSetBatch>, Vec<&'a Expr>);
+
+fn fetch_filtered<'a>(
+    client: &mut GnitzClient,
+    tid: u64,
+    schema: &Schema,
+    where_expr: &'a Expr,
+) -> Result<FilteredFetch<'a>, GnitzSqlError> {
+    let candidates =
+        collect_index_seek_candidates(where_expr, schema, || client.table_indexes(tid)).map_err(GnitzSqlError::Exec)?;
+    for (col_indices, key_vals, residual) in candidates {
+        match client.seek_by_index(tid, col_indices.as_slice(), &key_vals) {
+            Ok((schema_opt, batch_opt, _)) => return Ok((schema_opt, batch_opt, residual)),
+            Err(ClientError::NoIndex) => continue,
+            Err(e) => return Err(GnitzSqlError::Exec(e)),
+        }
+    }
+    let (schema_opt, batch_opt, _) = client.scan(tid)?;
+    Ok((schema_opt, batch_opt, vec![where_expr]))
 }
 
 // ---------------------------------------------------------------------------
@@ -290,12 +309,16 @@ pub(crate) fn execute_update(
     let resolved = resolve_where_rows(client, table_id, &schema, selection.as_ref())?;
     let actual_schema = resolved.schema.as_deref().unwrap_or(&*schema);
     let count = resolved.matched.len();
-    if let Some(batch) = &resolved.batch {
+    if count > 0 {
         let mut updates = ZSetBatch::new(actual_schema);
-        write_set_rows(batch, &resolved.matched, &assignments, actual_schema, &mut updates)?;
-        if count > 0 {
-            client.push_with_mode(table_id, actual_schema, &updates, WireConflictMode::Update)?;
-        }
+        write_set_rows(
+            &resolved.batch,
+            &resolved.matched,
+            &assignments,
+            actual_schema,
+            &mut updates,
+        )?;
+        client.push_with_mode(table_id, actual_schema, &updates, WireConflictMode::Update)?;
     }
     Ok(SqlResult::RowsAffected { count })
 }
@@ -331,20 +354,19 @@ pub(crate) fn execute_delete(
     let actual_schema = resolved.schema.as_deref().unwrap_or(&*schema);
     let count = resolved.matched.len();
     if count > 0 {
-        if let Some(batch) = resolved.batch {
-            // Whole batch matched (the common no-WHERE `DELETE FROM t`): move the
-            // PK region wholesale rather than copying it row by row.
-            let pks = if count == batch.pks.len() {
-                batch.pks
-            } else {
-                let mut out_pks = PkColumn::empty_for_schema(actual_schema);
-                for &i in &resolved.matched {
-                    out_pks.push_from(&batch.pks, i);
-                }
-                out_pks
-            };
-            client.delete(table_id, actual_schema, pks)?;
-        }
+        let batch = resolved.batch;
+        // Whole batch matched (the common no-WHERE `DELETE FROM t`): move the
+        // PK region wholesale rather than copying it row by row.
+        let pks = if count == batch.pks.len() {
+            batch.pks
+        } else {
+            let mut out_pks = PkColumn::empty_for_schema(actual_schema);
+            for &i in &resolved.matched {
+                out_pks.push_from(&batch.pks, i);
+            }
+            out_pks
+        };
+        client.delete(table_id, actual_schema, pks)?;
     }
     Ok(SqlResult::RowsAffected { count })
 }

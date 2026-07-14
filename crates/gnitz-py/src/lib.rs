@@ -5,7 +5,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 
 use gnitz_core::protocol::types::type_code_from_u64;
-use gnitz_core::{Circuit, CircuitBuilder, ExprBuilder, ExprProgram, GnitzClient, TxnBuffer};
+use gnitz_core::{Circuit, CircuitBuilder, ExprBuilder, ExprProgram, GnitzClient};
 use gnitz_core::{
     ColData, ColumnDef, PkColumn, Schema, TypeCode, WireConflictMode, ZSetBatch, MAX_COLUMNS, MAX_PK_BYTES,
 };
@@ -1527,16 +1527,16 @@ impl PyGnitzClient {
     ///     txn.delete(carts_tid, cart_schema, [pk])
     /// ```
     pub fn transaction(slf: Bound<'_, PyGnitzClient>) -> PyResult<PyTxn> {
-        let buf = {
+        {
             let mut this = slf.borrow_mut();
             let c = this
                 .inner
                 .as_mut()
                 .ok_or_else(|| GnitzError::new_err("client already closed"))?;
-            c.begin()
-        };
+            to_py_err(c.txn_begin())?;
+        }
         Ok(PyTxn {
-            buf: Some(buf),
+            open: true,
             client: slf.unbind(),
         })
     }
@@ -1710,6 +1710,16 @@ impl PyGnitzClient {
                     )?;
                     d.set_item("rows", scan_result)?;
                 }
+                SqlResult::TransactionStarted => {
+                    d.set_item("type", "TransactionStarted")?;
+                }
+                SqlResult::TransactionCommitted { lsn } => {
+                    d.set_item("type", "TransactionCommitted")?;
+                    d.set_item("lsn", lsn)?;
+                }
+                SqlResult::TransactionRolledBack => {
+                    d.set_item("type", "TransactionRolledBack")?;
+                }
             }
             py_list.append(d)?;
         }
@@ -1740,13 +1750,15 @@ fn parse_conflict_mode(mode: &str) -> PyResult<WireConflictMode> {
     }
 }
 
-/// Atomic write-batch transaction context manager. Owns a `TxnBuffer` and a
-/// reference back to its client so the `with`-block exit can commit or discard
-/// the whole bundle. Buffering is entirely local; nothing reaches the server
-/// until commit.
+/// Atomic write-batch transaction context manager: an RAII handle on the
+/// client's open transaction. `push`/`delete` are the client's own write methods
+/// — they buffer because a transaction is open, exactly as a SQL `INSERT` between
+/// `BEGIN` and `COMMIT` does. Nothing reaches the server until the `with`-block
+/// exits cleanly.
 #[pyclass(name = "Txn")]
 pub struct PyTxn {
-    buf: Option<TxnBuffer>,
+    /// False once `__exit__` has committed or discarded the transaction.
+    open: bool,
     client: Py<PyGnitzClient>,
 }
 
@@ -1759,11 +1771,12 @@ impl PyTxn {
     /// Buffer a push of `batch` into `target_id` under conflict mode `mode`
     /// (`"update"` — the default — or `"error"`).
     #[pyo3(signature = (target_id, batch, mode = "update"))]
-    pub fn push(&mut self, target_id: u64, batch: PyRef<'_, PyZSetBatch>, mode: &str) -> PyResult<()> {
+    pub fn push(&mut self, py: Python<'_>, target_id: u64, batch: PyRef<'_, PyZSetBatch>, mode: &str) -> PyResult<()> {
         let m = parse_conflict_mode(mode)?;
-        self.buf_mut()?
-            .push_with_mode(target_id, batch.schema.as_ref(), &batch.batch, m);
-        Ok(())
+        self.with_client(py, |c| {
+            c.push_with_mode(target_id, batch.schema.as_ref(), &batch.batch, m)
+                .map(|_| ())
+        })
     }
 
     /// Buffer a delete of `pks` from `target_id` (same PK forms as
@@ -1776,8 +1789,7 @@ impl PyTxn {
         pks: Vec<Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let (rust_schema, pk_col) = py_pks_to_column(py, &schema, &pks)?;
-        self.buf_mut()?.delete(target_id, &rust_schema, pk_col);
-        Ok(())
+        self.with_client(py, |c| c.delete(target_id, &rust_schema, pk_col))
     }
 
     /// Commit the bundle on a clean exit; discard it (rollback) if the block
@@ -1789,29 +1801,42 @@ impl PyTxn {
         _exc_val: PyObject,
         _exc_tb: PyObject,
     ) -> PyResult<bool> {
-        let buffer = match self.buf.take() {
-            Some(b) => b,
-            None => return Ok(false),
-        };
-        if exc_type.is_none(py) {
-            let client = self.client.bind(py);
-            let mut cref = client.borrow_mut();
-            let c = cref
-                .inner
-                .as_mut()
-                .ok_or_else(|| GnitzError::new_err("client already closed"))?;
-            to_py_err(c.commit_txn(buffer))?;
+        if !self.open {
+            return Ok(false);
         }
-        // On exception `buffer` drops here → rollback (nothing was ever sent).
+        let clean = exc_type.is_none(py);
+        let r = self.with_client(py, |c| {
+            if clean {
+                c.txn_commit().map(|_| ())
+            } else {
+                c.txn_rollback()
+            }
+        });
+        // Consumed either way — a failed COMMIT has already closed it client-side.
+        self.open = false;
+        r?;
         Ok(false)
     }
 }
 
 impl PyTxn {
-    fn buf_mut(&mut self) -> PyResult<&mut TxnBuffer> {
-        self.buf
+    /// Run `f` against the transaction's client. Errors if the transaction is
+    /// already closed, or the client is.
+    fn with_client(
+        &self,
+        py: Python<'_>,
+        f: impl FnOnce(&mut GnitzClient) -> Result<(), gnitz_core::ClientError>,
+    ) -> PyResult<()> {
+        if !self.open {
+            return Err(GnitzError::new_err("transaction already committed or discarded"));
+        }
+        let client = self.client.bind(py);
+        let mut cref = client.borrow_mut();
+        let c = cref
+            .inner
             .as_mut()
-            .ok_or_else(|| GnitzError::new_err("transaction already committed or discarded"))
+            .ok_or_else(|| GnitzError::new_err("client already closed"))?;
+        to_py_err(f(c))
     }
 }
 

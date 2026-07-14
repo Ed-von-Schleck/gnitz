@@ -1345,6 +1345,11 @@ pub unsafe extern "C" fn gnitz_execute_sql(
                         SqlResult::RowsAffected { count } => count as u64,
                         SqlResult::Dropped => 0,
                         SqlResult::Rows { .. } => 0,
+                        // A raw C caller cannot disambiguate the three transaction
+                        // results via `out_id` alone — acceptable and consistent
+                        // with `Dropped`/`Rows` both mapping to 0.
+                        SqlResult::TransactionCommitted { lsn } => lsn,
+                        SqlResult::TransactionStarted | SqlResult::TransactionRolledBack => 0,
                     };
                 } else {
                     *out_id = 0;

@@ -501,6 +501,99 @@ pub(crate) fn reject_unhonored_delete_clauses(
     Ok(())
 }
 
+/// Reject every `START TRANSACTION` / `BEGIN` clause the SQL transaction surface
+/// does not honor. `transaction` (the BEGIN/START keyword kind), `begin`, and
+/// `has_end_keyword` are inert phrasing. Rejected: `modes` (`READ ONLY` /
+/// `ISOLATION LEVEL ...` — gnitz has one fixed isolation: atomicity + constraint
+/// consistency), `modifier` (`BEGIN DEFERRED` / `BEGIN TRY`), and `statements` /
+/// `exception_statements` (a `BEGIN ... END` procedural block or its exception
+/// clause — gnitz has no such block).
+///
+/// Exhaustive destructure (no `..`): a future `sqlparser` field stops the build
+/// until it is classified honored-or-rejected — a silent-drop-on-upgrade becomes
+/// a build break.
+pub(crate) fn reject_unhonored_start_transaction_clauses(
+    stmt: &sqlparser::ast::Statement,
+    context: &str,
+) -> Result<(), GnitzSqlError> {
+    let sqlparser::ast::Statement::StartTransaction {
+        modes,
+        begin: _,
+        transaction: _,
+        modifier,
+        statements,
+        exception_statements,
+        has_end_keyword: _,
+    } = stmt
+    else {
+        return Err(GnitzSqlError::Bind("not a START TRANSACTION statement".to_string()));
+    };
+    let reject = |clause: &str| unsupported_clause(context, clause);
+    if !modes.is_empty() {
+        return Err(reject("transaction modes (READ ONLY / ISOLATION LEVEL)"));
+    }
+    if modifier.is_some() {
+        return Err(reject("a BEGIN modifier (DEFERRED / TRY / CATCH)"));
+    }
+    if !statements.is_empty() {
+        return Err(reject("a BEGIN ... END block"));
+    }
+    if exception_statements.is_some() {
+        return Err(reject("an EXCEPTION clause"));
+    }
+    Ok(())
+}
+
+/// Reject every `COMMIT` / `END` clause the SQL transaction surface does not
+/// honor. `end` is inert (`END` is a `COMMIT` spelling). Rejected: `chain`
+/// (`AND CHAIN` — gnitz opens no immediate successor transaction) and `modifier`
+/// (`COMMIT TRY` / `CATCH`).
+///
+/// Exhaustive destructure (no `..`): a future `sqlparser` field stops the build.
+pub(crate) fn reject_unhonored_commit_clauses(
+    stmt: &sqlparser::ast::Statement,
+    context: &str,
+) -> Result<(), GnitzSqlError> {
+    let sqlparser::ast::Statement::Commit {
+        chain,
+        end: _,
+        modifier,
+    } = stmt
+    else {
+        return Err(GnitzSqlError::Bind("not a COMMIT statement".to_string()));
+    };
+    let reject = |clause: &str| unsupported_clause(context, clause);
+    if *chain {
+        return Err(reject("AND CHAIN"));
+    }
+    if modifier.is_some() {
+        return Err(reject("a COMMIT modifier (TRY / CATCH)"));
+    }
+    Ok(())
+}
+
+/// Reject every `ROLLBACK` clause the SQL transaction surface does not honor.
+/// Rejected: `chain` (`AND CHAIN`) and `savepoint` (`ROLLBACK TO SAVEPOINT x` —
+/// gnitz has no savepoints).
+///
+/// Exhaustive destructure (no `..`): a future `sqlparser` field stops the build.
+pub(crate) fn reject_unhonored_rollback_clauses(
+    stmt: &sqlparser::ast::Statement,
+    context: &str,
+) -> Result<(), GnitzSqlError> {
+    let sqlparser::ast::Statement::Rollback { chain, savepoint } = stmt else {
+        return Err(GnitzSqlError::Bind("not a ROLLBACK statement".to_string()));
+    };
+    let reject = |clause: &str| unsupported_clause(context, clause);
+    if *chain {
+        return Err(reject("AND CHAIN"));
+    }
+    if savepoint.is_some() {
+        return Err(reject("TO SAVEPOINT"));
+    }
+    Ok(())
+}
+
 /// Reject every `CREATE TABLE` envelope clause `execute_create_table` does not consume. `name`,
 /// `columns`, `constraints`, `cluster_by`, `with_options` are consumed (column/constraint contents
 /// are further guarded by [`reject_unhonored_column_options`] / [`reject_unhonored_table_constraints`]).
@@ -770,5 +863,49 @@ mod tests {
         // Ordinary names — including an internal `_` — are accepted.
         assert!(validate_user_name("orders").is_ok());
         assert!(validate_user_name("my_view2").is_ok());
+    }
+
+    fn first_stmt(sql: &str) -> sqlparser::ast::Statement {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+        Parser::parse_sql(&GenericDialect {}, sql)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn transaction_control_rejected_clause_matrix() {
+        // BEGIN / START TRANSACTION: bare forms are honored; transaction modes,
+        // a BEGIN modifier, and a BEGIN..END block are rejected.
+        let begin_ok = ["BEGIN", "START TRANSACTION"];
+        for sql in begin_ok {
+            assert!(
+                reject_unhonored_start_transaction_clauses(&first_stmt(sql), "BEGIN").is_ok(),
+                "{sql} should be honored"
+            );
+        }
+        let begin_bad = [
+            "BEGIN READ ONLY",
+            "START TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            "BEGIN DEFERRED",
+        ];
+        for sql in begin_bad {
+            assert!(
+                reject_unhonored_start_transaction_clauses(&first_stmt(sql), "BEGIN").is_err(),
+                "{sql} should be rejected"
+            );
+        }
+
+        // COMMIT / END: bare forms honored; AND CHAIN rejected.
+        assert!(reject_unhonored_commit_clauses(&first_stmt("COMMIT"), "COMMIT").is_ok());
+        assert!(reject_unhonored_commit_clauses(&first_stmt("END"), "COMMIT").is_ok());
+        assert!(reject_unhonored_commit_clauses(&first_stmt("COMMIT AND CHAIN"), "COMMIT").is_err());
+
+        // ROLLBACK: bare honored; AND CHAIN and TO SAVEPOINT rejected.
+        assert!(reject_unhonored_rollback_clauses(&first_stmt("ROLLBACK"), "ROLLBACK").is_ok());
+        assert!(reject_unhonored_rollback_clauses(&first_stmt("ROLLBACK AND CHAIN"), "ROLLBACK").is_err());
+        assert!(reject_unhonored_rollback_clauses(&first_stmt("ROLLBACK TO SAVEPOINT sp"), "ROLLBACK").is_err());
     }
 }

@@ -229,6 +229,20 @@ pub struct GnitzClient {
     /// statement reuse it (see `begin_catalog_snapshot`). `None` outside a
     /// statement — reads scan the wire directly.
     catalog_snapshot: Option<HashMap<u64, Option<ZSetBatch>>>,
+    /// Open transaction, if any. `Some` between `txn_begin` and its
+    /// `txn_commit`/`txn_rollback`: **every** user-table write on this client
+    /// (`push`, `push_with_mode`, `delete` — and so every SQL DML statement, C
+    /// and Python binary push alike) buffers here instead of going to the wire,
+    /// and the SQL overlay consults it for read-your-own-writes. `None` is
+    /// autocommit. The buffer keys families by resolved tid, so a `schema_name`
+    /// change between `execute_sql` calls cannot corrupt it. Dropping the client
+    /// with an open transaction discards `txn` by plain `Drop` — identical to
+    /// ROLLBACK, nothing was ever sent.
+    ///
+    /// Catalog writes never route here: DDL has its own atomic commit and is
+    /// rejected inside a transaction at the client's `push_ddl` choke point (and,
+    /// earlier and friendlier, by the SQL front end).
+    txn: Option<TxnBuffer>,
 }
 
 impl GnitzClient {
@@ -238,6 +252,7 @@ impl GnitzClient {
             index_cache: LruCache::new(SCHEMA_CACHE_CAP),
             serial_cache: HashMap::new(),
             catalog_snapshot: None,
+            txn: None,
         })
     }
 
@@ -317,13 +332,16 @@ impl GnitzClient {
     }
 
     pub fn push(&mut self, table_id: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, ClientError> {
-        self.session.push(table_id, schema, batch)
+        self.push_with_mode(table_id, schema, batch, WireConflictMode::Update)
     }
 
-    /// Push with an explicit `WireConflictMode`. SQL `INSERT` uses
-    /// `Error` to get SQL-standard rejection semantics; all other
-    /// callers pass `Update` (or use the plain `push` which defaults
-    /// to `Update` for backward compatibility).
+    /// Push with an explicit `WireConflictMode`. SQL `INSERT` uses `Error` to get
+    /// SQL-standard rejection semantics; all other callers pass `Update` (or use
+    /// the plain `push`, which defaults to `Update`).
+    ///
+    /// Inside an open transaction the batch is buffered instead of sent, and the
+    /// returned LSN is `0` — nothing is durable until `txn_commit`, which returns
+    /// the one zone LSN covering the whole bundle.
     pub fn push_with_mode(
         &mut self,
         table_id: u64,
@@ -331,6 +349,10 @@ impl GnitzClient {
         batch: &ZSetBatch,
         mode: WireConflictMode,
     ) -> Result<u64, ClientError> {
+        if let Some(txn) = &mut self.txn {
+            txn.push_with_mode(table_id, schema, batch, mode);
+            return Ok(0);
+        }
         self.session.push_with_mode(table_id, schema, batch, mode)
     }
 
@@ -518,7 +540,7 @@ impl GnitzClient {
             .u64_val(is_unique as u64)
             .str_val("");
 
-        self.session.push_ddl_txn(&[(IDX_TAB, idx_schema, batch)])?;
+        self.push_ddl(&[(IDX_TAB, idx_schema, batch)])?;
         Ok(index_id)
     }
 
@@ -549,7 +571,7 @@ impl GnitzClient {
                 .str_val(&index_name)
                 .u64_val(is_unique)
                 .str_val(&cache_dir);
-            self.session.push_ddl_txn(&[(IDX_TAB, idx_schema, batch)])?;
+            self.push_ddl(&[(IDX_TAB, idx_schema, batch)])?;
             return Ok(());
         }
         Err(ClientError::ServerError(format!("index '{index_name}' not found")))
@@ -578,28 +600,61 @@ impl GnitzClient {
         Ok(out)
     }
 
+    /// Delete `pks` from `table_id` (retraction rows). Buffered like any other
+    /// write while a transaction is open.
     pub fn delete(&mut self, table_id: u64, schema: &Schema, pks: PkColumn) -> Result<(), ClientError> {
         if pks.is_empty() {
             return Ok(());
         }
         let batch = retraction_batch(schema, pks);
-        self.session.push(table_id, schema, &batch)?;
+        self.push_with_mode(table_id, schema, &batch, WireConflictMode::Update)?;
         Ok(())
     }
 
-    /// Open an empty [`TxnBuffer`]. Buffer writes locally, then `commit_txn`
-    /// ships the whole bundle as one atomic user-table transaction. The buffer
-    /// is owned (no borrow of the client), so the client stays usable between
-    /// buffering calls; dropping the buffer without committing is rollback —
-    /// nothing was ever sent.
-    pub fn begin(&mut self) -> TxnBuffer {
-        TxnBuffer::new()
+    // --- Transactions (BEGIN / COMMIT / ROLLBACK) ---
+    //
+    // One transaction per client: `txn_begin` opens the buffer every write path
+    // then routes into, `txn_commit` ships it as one atomic frame, `txn_rollback`
+    // discards it. All state-machine errors are raised here; the SQL dispatch
+    // arms and the Python context manager only translate them.
+
+    /// True while a transaction is open.
+    pub fn txn_active(&self) -> bool {
+        self.txn.is_some()
     }
 
-    /// Commit `buf` as one atomic `FLAG_PUSH_TXN` transaction — all families
-    /// land together under one durable zone LSN, or none do. Returns the zone
-    /// LSN. An **empty** buffer is `Ok(0)` with no wire roundtrip.
-    pub fn commit_txn(&mut self, buf: TxnBuffer) -> Result<u64, ClientError> {
+    /// Open a transaction. Errors if one is already open.
+    pub fn txn_begin(&mut self) -> Result<(), ClientError> {
+        if self.txn.is_some() {
+            return Err(ClientError::ServerError("transaction already open".into()));
+        }
+        self.txn = Some(TxnBuffer::default());
+        Ok(())
+    }
+
+    /// Discard the open transaction (ROLLBACK): drop the buffer, sending
+    /// nothing. Errors if no transaction is open.
+    pub fn txn_rollback(&mut self) -> Result<(), ClientError> {
+        self.txn
+            .take()
+            .map(|_| ())
+            .ok_or_else(|| ClientError::ServerError("no transaction open".into()))
+    }
+
+    /// Commit the open transaction as one atomic `FLAG_PUSH_TXN` frame — all
+    /// families land together under one durable zone LSN, or none do. Returns
+    /// that LSN (0 for an empty transaction, which needs no wire roundtrip).
+    /// Errors if no transaction is open.
+    ///
+    /// The buffer is taken OUT before the fallible send, so an engine-side
+    /// failure leaves the transaction already closed ("COMMIT consumes the
+    /// transaction") — the SQL planner's opened-this-call rollback then finds
+    /// nothing open, so there is no double path.
+    pub fn txn_commit(&mut self) -> Result<u64, ClientError> {
+        let buf = self
+            .txn
+            .take()
+            .ok_or_else(|| ClientError::ServerError("no transaction open".into()))?;
         if buf.families.is_empty() {
             return Ok(0);
         }
@@ -611,7 +666,28 @@ impl GnitzClient {
         self.session.push_txn(&fam_refs)
     }
 
+    /// The open transaction's buffer, for the SQL overlay's read-your-own-writes
+    /// lookups. `None` in autocommit.
+    pub fn txn_buffer(&self) -> Option<&TxnBuffer> {
+        self.txn.as_ref()
+    }
+
     // --- DDL ---
+
+    /// Catalog write choke point. DDL commits atomically on its own and never
+    /// joins an open transaction's buffered user-table writes — a batch buffered
+    /// under the old schema would guarantee a commit-time mismatch. Reject it here
+    /// at the state owner, mirroring `push_with_mode`'s single branch for data
+    /// writes; the SQL front end's own rejection is then a friendlier early error,
+    /// not the sole enforcement.
+    fn push_ddl(&mut self, families: &[(u64, &Schema, ZSetBatch)]) -> Result<u64, ClientError> {
+        if self.txn.is_some() {
+            return Err(ClientError::ServerError(
+                "DDL is not allowed inside a transaction".into(),
+            ));
+        }
+        self.session.push_ddl_txn(families)
+    }
 
     pub fn create_schema(&mut self, name: &str) -> Result<u64, ClientError> {
         // Reject the empty string, a leading `_` (reserved system prefix), and
@@ -625,7 +701,7 @@ impl GnitzClient {
         BatchAppender::new(&mut batch, schema)
             .add_row(new_sid as u128, 1)
             .str_val(&name);
-        self.session.push_ddl_txn(&[(SCHEMA_TAB, schema, batch)])?;
+        self.push_ddl(&[(SCHEMA_TAB, schema, batch)])?;
         Ok(new_sid)
     }
 
@@ -702,7 +778,7 @@ impl GnitzClient {
         BatchAppender::new(&mut batch, schema)
             .add_row(schema_id as u128, -1)
             .str_val(&name);
-        self.session.push_ddl_txn(&[(SCHEMA_TAB, schema, batch)])?;
+        self.push_ddl(&[(SCHEMA_TAB, schema, batch)])?;
         Ok(())
     }
 
@@ -815,7 +891,7 @@ impl GnitzClient {
             }
             families.push((IDX_TAB, idx_schema, idx_batch));
         }
-        self.session.push_ddl_txn(&families)?;
+        self.push_ddl(&families)?;
 
         Ok(new_tid)
     }
@@ -838,7 +914,7 @@ impl GnitzClient {
             .u64_val(record.pk_col_idx)
             .u64_val(record.created_lsn)
             .u64_val(record.flags);
-        self.session.push_ddl_txn(&[(TABLE_TAB, tbl_schema, tb)])?;
+        self.push_ddl(&[(TABLE_TAB, tbl_schema, tb)])?;
 
         Ok(())
     }
@@ -1081,7 +1157,7 @@ impl GnitzClient {
         }
         families.push((VIEW_TAB, view_s, view_batch));
 
-        self.session.push_ddl_txn(&families)?;
+        self.push_ddl(&families)?;
 
         Ok(vids)
     }
@@ -1120,7 +1196,7 @@ impl GnitzClient {
                 append_view_row(&mut a, -1, rec);
             }
         }
-        self.session.push_ddl_txn(&[(VIEW_TAB, view_s, vb)])?;
+        self.push_ddl(&[(VIEW_TAB, view_s, vb)])?;
 
         Ok(())
     }
@@ -1219,18 +1295,23 @@ impl GnitzClient {
     }
 }
 
-// --- TxnBuffer: client-side atomic write-batch transaction ---
+// --- TxnBuffer: the locally-buffered atomic write-batch transaction ---
 
-/// A locally-buffered atomic user-table transaction. `push`/`delete` append to
-/// the target tid's **last** family when its conflict mode matches, else open a
-/// new family (run-splitting), so per-table op order is preserved end to end:
-/// buffer call order = family frame order = the engine's validation-fold and
+/// The write side of an open transaction. `push`/`delete` append to the target
+/// tid's **last** family when its conflict mode matches, else open a new family
+/// (run-splitting), so per-table op order is preserved end to end: buffer call
+/// order = family frame order = the engine's validation-fold and
 /// worker-application order. Cross-tid interleaving is unconstrained (FK
 /// validation is post-transaction, order-free).
 ///
-/// The buffer is owned — it holds no borrow of the client, so the same object
-/// backs the Python binding — and `GnitzClient::commit_txn` ships it as one
-/// `FLAG_PUSH_TXN` frame. Dropping it uncommitted is rollback.
+/// It also indexes each buffered row by PK (`last_op_of`) as it arrives, so the
+/// SQL overlay's read-your-own-writes lookups are O(1) point reads rather than a
+/// re-fold of the whole buffer per statement.
+///
+/// Owned by [`GnitzClient::txn`]; every client write path routes into it while
+/// it is open, and `txn_commit` ships it as one `FLAG_PUSH_TXN` frame. Dropping
+/// it is rollback — nothing was ever sent.
+#[derive(Default)]
 pub struct TxnBuffer {
     /// (tid, schema, batch, mode) in creation order; per tid, maximal same-mode
     /// runs of the caller's op sequence.
@@ -1238,16 +1319,14 @@ pub struct TxnBuffer {
     /// tid → index in `families` of that tid's most recently opened family, so
     /// a matching-mode append extends it rather than opening a new family.
     last_family_of: HashMap<u64, usize>,
+    /// tid → PK → `(family index, row index)` of the LAST op buffered on that
+    /// PK. Row indices are stable: `append` only ever extends a family batch or
+    /// pushes a new one. Weight-0 rows are not indexed — they are inert, exactly
+    /// as the engine's fold treats them.
+    last_op_of: HashMap<u64, HashMap<PkTuple, (usize, usize)>>,
 }
 
 impl TxnBuffer {
-    fn new() -> Self {
-        TxnBuffer {
-            families: Vec::new(),
-            last_family_of: HashMap::new(),
-        }
-    }
-
     /// Buffer an upsert (`WireConflictMode::Update`) of `batch` into `tid`.
     pub fn push(&mut self, tid: u64, schema: &Schema, batch: &ZSetBatch) {
         self.push_with_mode(tid, schema, batch, WireConflictMode::Update);
@@ -1280,15 +1359,49 @@ impl TxnBuffer {
         if batch.is_empty() {
             return;
         }
-        if let Some(&idx) = self.last_family_of.get(&tid) {
-            if self.families[idx].3 == mode {
-                self.families[idx].2.extend_from_owned(batch);
-                return;
+        let stride = schema.pk_stride() as u8;
+        let extend = self
+            .last_family_of
+            .get(&tid)
+            .is_some_and(|&idx| self.families[idx].3 == mode);
+        let (fam, base) = if extend {
+            let idx = self.last_family_of[&tid];
+            (idx, self.families[idx].2.len())
+        } else {
+            (self.families.len(), 0)
+        };
+
+        let index = self.last_op_of.entry(tid).or_default();
+        for i in 0..batch.len() {
+            if batch.weights[i] != 0 {
+                index.insert(batch.pks.get_tuple(i, stride), (fam, base + i));
             }
         }
-        let idx = self.families.len();
-        self.families.push((tid, schema.clone(), batch, mode));
-        self.last_family_of.insert(tid, idx);
+
+        if extend {
+            self.families[fam].2.extend_from_owned(batch);
+        } else {
+            self.families.push((tid, schema.clone(), batch, mode));
+            self.last_family_of.insert(tid, fam);
+        }
+    }
+
+    /// The last op buffered on `pk` in `tid`, as `(batch, row)` — or `None` if
+    /// the transaction has not touched that PK. The row's **weight sign** is the
+    /// net effect (positive: live row with that payload; negative: deleted),
+    /// mirroring the engine's `fold_family`.
+    pub fn last_op(&self, tid: u64, pk: &PkTuple) -> Option<(&ZSetBatch, usize)> {
+        let &(fam, row) = self.last_op_of.get(&tid)?.get(pk)?;
+        Some((&self.families[fam].2, row))
+    }
+
+    /// Every PK the transaction has touched in `tid`, with its last op.
+    pub fn last_ops(&self, tid: u64) -> impl Iterator<Item = (PkTuple, &ZSetBatch, usize)> + '_ {
+        self.last_op_of
+            .get(&tid)
+            .into_iter()
+            .flatten()
+            .map(move |(pk, &(fam, row))| (*pk, &self.families[fam].2, row))
     }
 }
 
@@ -1530,9 +1643,9 @@ mod tests {
     }
 
     #[test]
-    fn begin_yields_empty_buffer_and_empty_push_opens_no_family() {
+    fn empty_push_opens_no_family() {
         let s = kv_schema();
-        let mut buf = TxnBuffer::new();
+        let mut buf = TxnBuffer::default();
         assert!(buf.families.is_empty());
         buf.push(16, &s, &ZSetBatch::new(&s));
         assert!(buf.families.is_empty(), "an empty push opens no family");
@@ -1541,7 +1654,7 @@ mod tests {
     #[test]
     fn run_splitting_merges_same_mode_and_splits_on_mode_change() {
         let s = kv_schema();
-        let mut buf = TxnBuffer::new();
+        let mut buf = TxnBuffer::default();
         let tid = 16u64;
         buf.push(tid, &s, &ins(&s, 1, 10));
         buf.push(tid, &s, &ins(&s, 2, 20));
@@ -1564,7 +1677,7 @@ mod tests {
     fn delete_buffers_into_update_family_before_error_reinsert() {
         // "delete k; insert_error k" → Update family [D(k)] then Error family [I(k)].
         let s = kv_schema();
-        let mut buf = TxnBuffer::new();
+        let mut buf = TxnBuffer::default();
         let tid = 16u64;
         buf.delete(tid, &s, PkColumn::U64s(vec![7]));
         buf.push_with_mode(tid, &s, &ins(&s, 7, 70), WireConflictMode::Error);
@@ -1579,7 +1692,7 @@ mod tests {
     fn cross_tid_ops_coalesce_per_tid() {
         // push(A), push(B), push(A) → A one family (2 rows), B one family.
         let s = kv_schema();
-        let mut buf = TxnBuffer::new();
+        let mut buf = TxnBuffer::default();
         buf.push(16, &s, &ins(&s, 1, 1));
         buf.push(17, &s, &ins(&s, 1, 1));
         buf.push(16, &s, &ins(&s, 2, 2));
@@ -1587,6 +1700,30 @@ mod tests {
         assert_eq!(buf.families[0].0, 16);
         assert_eq!(buf.families[0].2.len(), 2);
         assert_eq!(buf.families[1].0, 17);
+    }
+
+    #[test]
+    fn last_op_indexes_rows_across_family_extension_and_split() {
+        // The PK index must survive both append shapes: extending an existing
+        // family (row index = base + i) and opening a new one (base = 0).
+        let s = kv_schema();
+        let mut buf = TxnBuffer::default();
+        let tid = 16u64;
+        buf.push(tid, &s, &ins(&s, 1, 10)); // new family 0, row 0
+        buf.push(tid, &s, &ins(&s, 2, 20)); // extends family 0, row 1
+        buf.push_with_mode(tid, &s, &ins(&s, 3, 30), WireConflictMode::Error); // family 1, row 0
+        buf.delete(tid, &s, PkColumn::U64s(vec![1])); // family 2, row 0 — supersedes pk=1
+
+        let val = |pk: u64| {
+            let (b, row) = buf.last_op(tid, &PkTuple::from_u128(8, pk as u128)).unwrap();
+            (b.weights[row], row)
+        };
+        assert_eq!(val(1), (-1, 0), "pk=1's last op is the delete");
+        assert_eq!(val(2), (1, 1), "pk=2 is row 1 of the extended family");
+        assert_eq!(val(3), (1, 0), "pk=3 is row 0 of the mode-split family");
+        assert!(buf.last_op(tid, &PkTuple::from_u128(8, 9)).is_none(), "untouched PK");
+        assert!(buf.last_op(17, &PkTuple::from_u128(8, 1)).is_none(), "other tid");
+        assert_eq!(buf.last_ops(tid).count(), 3);
     }
 
     #[test]

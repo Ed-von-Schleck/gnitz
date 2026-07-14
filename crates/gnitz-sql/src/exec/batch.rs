@@ -15,16 +15,28 @@ pub(crate) fn copy_batch_row(src: &ZSetBatch, i: usize, dst: &mut ZSetBatch, sch
     }
 }
 
+/// A resolved projection: the output schema and, per output column, its source
+/// column index. `None` is the passthrough — a wildcard, or a named projection
+/// that reproduces the source schema exactly — where the source batch IS the
+/// result.
+pub(crate) type Projection = Option<(Schema, Vec<usize>)>;
+
+/// Resolve `projection` against `schema`. This is the whole fallible half of
+/// projecting — it never looks at a batch — so a caller that must not act on an
+/// invalid projection (INSERT ... RETURNING, which writes in between) can resolve
+/// first and [`project`] after, with no batch copy.
 pub(crate) fn apply_projection(
     projection: &[SelectItem],
     schema: &Schema,
     batch: Option<ZSetBatch>,
 ) -> Result<(Schema, ZSetBatch), GnitzSqlError> {
-    let is_wildcard = is_wildcard_projection(projection);
+    let resolved = resolve_projection(projection, schema)?;
+    Ok(project(resolved, schema, batch))
+}
 
-    if is_wildcard {
-        let b = batch.unwrap_or_else(|| ZSetBatch::new(schema));
-        return Ok((schema.clone(), b));
+pub(crate) fn resolve_projection(projection: &[SelectItem], schema: &Schema) -> Result<Projection, GnitzSqlError> {
+    if is_wildcard_projection(projection) {
+        return Ok(None);
     }
 
     // One output column per projection item (`SELECT a, a` yields two columns —
@@ -74,8 +86,7 @@ pub(crate) fn apply_projection(
         && col_indices.iter().enumerate().all(|(i, &ci)| ci == i)
         && out_defs.iter().zip(&schema.columns).all(|(d, c)| d.name == c.name);
     if is_identity {
-        let b = batch.unwrap_or_else(|| ZSetBatch::new(schema));
-        return Ok((schema.clone(), b));
+        return Ok(None);
     }
 
     // 1. Build new PK column set; every projected source-PK becomes a new PK.
@@ -92,9 +103,21 @@ pub(crate) fn apply_projection(
         ));
     }
 
-    let new_schema = Schema {
-        columns: out_defs,
-        pk_cols: new_pk_cols,
+    Ok(Some((
+        Schema {
+            columns: out_defs,
+            pk_cols: new_pk_cols,
+        },
+        col_indices,
+    )))
+}
+
+/// Apply a resolved projection to `batch` (absent = an empty batch). Infallible:
+/// every rejection happened in [`resolve_projection`]. The passthrough hands the
+/// source batch straight back — no copy.
+pub(crate) fn project(resolved: Projection, schema: &Schema, batch: Option<ZSetBatch>) -> (Schema, ZSetBatch) {
+    let Some((new_schema, col_indices)) = resolved else {
+        return (schema.clone(), batch.unwrap_or_else(|| ZSetBatch::new(schema)));
     };
 
     let src_batch = batch.unwrap_or_else(|| ZSetBatch::new(schema));
@@ -231,7 +254,7 @@ pub(crate) fn apply_projection(
         }
     }
 
-    Ok((new_schema, new_batch))
+    (new_schema, new_batch)
 }
 
 pub(crate) fn apply_limit(mut batch: ZSetBatch, schema: &Schema, limit: usize) -> ZSetBatch {

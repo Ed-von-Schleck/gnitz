@@ -22,12 +22,32 @@ use sqlparser::parser::Parser;
 /// Result of executing a single SQL statement.
 #[derive(Debug)]
 pub enum SqlResult {
-    TableCreated { table_id: u64 },
-    ViewCreated { view_id: u64 },
-    IndexCreated { index_id: u64 },
+    TableCreated {
+        table_id: u64,
+    },
+    ViewCreated {
+        view_id: u64,
+    },
+    IndexCreated {
+        index_id: u64,
+    },
     Dropped,
-    RowsAffected { count: usize },
-    Rows { schema: Schema, batch: ZSetBatch },
+    RowsAffected {
+        count: usize,
+    },
+    Rows {
+        schema: Schema,
+        batch: ZSetBatch,
+    },
+    /// `BEGIN` / `START TRANSACTION`: a client-side transaction buffer opened.
+    TransactionStarted,
+    /// `COMMIT`: the buffer shipped as one atomic frame. `lsn` is the zone LSN
+    /// (0 for an empty commit).
+    TransactionCommitted {
+        lsn: u64,
+    },
+    /// `ROLLBACK`: the buffer discarded, nothing sent.
+    TransactionRolledBack,
 }
 
 /// High-level SQL execution planner.
@@ -56,12 +76,28 @@ impl<'a> SqlPlanner<'a> {
     pub fn execute(&mut self, sql: &str) -> Result<Vec<SqlResult>, GnitzSqlError> {
         let dialect = GenericDialect {};
         let stmts = Parser::parse_sql(&dialect, sql)?;
+        // If THIS call opens a transaction (was inactive at entry) and then errors
+        // with the transaction still open, roll it back before returning —
+        // otherwise the stranded open buffer would silently swallow the caller's
+        // subsequent autocommit statements. A transaction opened by an *earlier*
+        // call is left open (the caller owns its lifecycle). On a COMMIT failure
+        // `txn_commit` already took the buffer out, so `txn_active()` is false
+        // here — no double-rollback.
+        let txn_was_active = self.client.txn_active();
         let mut results = Vec::with_capacity(stmts.len());
         for stmt in &stmts {
             self.client.begin_catalog_snapshot();
             let r = dispatch::execute_statement(self.client, &self.schema_name, stmt);
             self.client.end_catalog_snapshot();
-            results.push(r?);
+            match r {
+                Ok(res) => results.push(res),
+                Err(e) => {
+                    if !txn_was_active && self.client.txn_active() {
+                        let _ = self.client.txn_rollback();
+                    }
+                    return Err(e);
+                }
+            }
         }
         Ok(results)
     }
