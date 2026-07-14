@@ -3,335 +3,501 @@
 ## Problem
 
 Reading two relations consistently is impossible today. Each SCAN is an
-independent request: `handle_scan` drains pending ticks, fans one relation
-out to the workers, and streams the reply
-(`runtime/orchestration/executor.rs:1279-1394`). Scanning `t1` then `t2`
-is two point-in-time reads at two different instants — a write committed
-between them (or concurrently) is visible in the later read and absent
-from the earlier one. A client cannot take a snapshot of `orders` and
-`inventory` that reflects one logical moment, and an atomic multi-table
-commit (one SAL zone) can be observed *torn across two scans* even though
-it was never torn in the store.
+independent request: `handle_scan` (`runtime/orchestration/executor.rs:1614`)
+drains pending ticks, fans one relation out to the workers, and streams the
+reply. Scanning `t1` then `t2` is two point-in-time reads at two different
+instants — a write committed between them (or concurrently) is visible in the
+later read and absent from the earlier one. A client cannot take a snapshot of
+`orders` and `inventory` that reflects one logical moment, and an atomic
+multi-table commit (one SAL zone, `FLAG_PUSH_TXN`) can be observed *torn across
+two scans* even though it was never torn in the store. This is the read-side
+completion of the atomic multi-table *write* story shipped in the txn series.
 
-The engine's architecture makes the fix almost free:
+The engine's architecture makes the *snapshot* nearly free; the reply path costs
+a small worker tweak (below):
 
 - **Every scan snapshot is taken at one serial point.** The worker is
-  single-threaded; dispatching a scan group calls `scan_family`, which
-  materializes the partition's full committed state into an immutable
-  `Rc<Batch>` at that dispatch instant; chunks then stream from the
-  frozen batch across `drain_sal` passes while later SAL messages mutate
-  only the live store (`worker/mod.rs:451-562, 1103-1110`). Dispatch of
-  subsequent groups is not delayed by pending chunk emission
-  (`worker/mod.rs:451-459` — one chunk of the front train per pass,
-  other dispatch proceeds), so two consecutive groups snapshot at
-  effectively adjacent serial points with nothing between them.
-- **Every SAL writer serializes on one lock.** Scan fanouts, the
-  committer's commit zones (groups + sentinel written under one hold),
-  tick emission, relays, and DDL broadcasts all write under
-  `sal_writer_excl` (`dispatch_scan_fanout`, `master/mod.rs:400-452`;
-  committer Phase B, `committer.rs:564-629`). Consequently, N scan
-  groups written **under a single lock hold** occupy consecutive SAL
-  positions: no push group, no tick group, and — critically — no *part*
-  of a commit zone can land between them. Each worker therefore
-  snapshots all N relations at the same SAL cut, and a multi-table
-  atomic commit is either entirely before the cut (visible in every
-  snapshot) or entirely after (visible in none).
+  single-threaded; dispatching a `Scan` group runs its `dispatch_inner` arm
+  (`worker/mod.rs:853-863`), which calls `Catalog::scan_family`
+  (`catalog/store_io.rs:30-37`) → `StoreHandle::full_scan`
+  (`query/dag/store_handle.rs:101-106`), materializing the partition's full
+  committed state into an immutable `Rc<Batch>` **at that dispatch instant**.
+  Chunks then stream from that frozen `Rc` across later `drain_sal` passes
+  (`worker/reply.rs` `emit_pending_scan_chunk`, 350-426) while subsequent SAL
+  messages mutate only the live store. `drain_sal` (`worker/mod.rs:396-406`)
+  dispatches *every* currently-available SAL message in one pass — a second
+  `Scan` group's `scan_family` snapshot is taken back-to-back with the first,
+  gated only by the first group's cheap dispatch, never on its chunk stream
+  draining.
+- **Every SAL writer serializes on one lock.** `sal_writer_excl`
+  (`Rc<AsyncMutex<()>>`, created `executor.rs:262`, field `executor.rs:98`) is
+  acquired by the committer, tick emission, relays, DDL broadcasts, and every
+  fan-out op. Each critical section holds it with **no `.await` inside**
+  (`dispatch_scan_fanout` `master/mod.rs:210-221`; committer Phase B
+  `committer.rs:633-737`), and the reactor is single-threaded and cooperative —
+  so a section that writes several SAL groups under one hold cannot be
+  preempted, and the groups land at consecutive SAL positions (`write_cursor`
+  advances per group, `sal.rs:812/852`, protected solely by this lock). N scan
+  groups written under one hold occupy consecutive SAL positions: no push group,
+  no tick group, and no *part* of a commit zone can land between them. Each
+  worker snapshots all N relations at the same SAL cut, and a multi-table atomic
+  commit is either entirely before the cut (visible in every snapshot) or
+  entirely after (visible in none).
 
-This plan adds the client-addressable version: **SCAN_MULTI**, one frame
-naming N relations, answered by N standard scan reply trains taken at one
-cut.
+The existing multi-group precedent is `commit_pushes` (`committer.rs:522`, lock
+block 633-737), which writes N family groups + a sentinel under one hold, then
+collects their reply futures after releasing the lock. This plan adds the
+read-side sibling: **SCAN_MULTI**, one frame naming N relations, answered by N
+standard scan reply trains taken at one cut.
+
+## Design rationale: what is and isn't new
+
+- **No new serialization lock.** `sal_writer_excl` already serializes every SAL
+  writer; holding it across N scan-group writes both forces the one cut and, as
+  a side effect of mutual exclusion, prevents two concurrent multi-scans from
+  interleaving submits.
+- **No MVCC / read-at-LSN alternative** exists and none can: destructive
+  consolidation (§2) keeps no history, so the only point-in-time coherence the
+  engine offers is "now, at this worker's SAL position" — exactly what N
+  consecutive SAL positions capture. An **OCC alternative** (read each relation,
+  re-read `commit_lsn_of` / `published()`, retry on advance — `executor.rs:190`)
+  is rejected: it gives only detection+retry, not a snapshot, and **livelocks**
+  under the headline workload (a tight atomic-commit loop). Structural
+  one-cut is the only mechanism that delivers torn-commit *impossibility*.
+- **One small worker change is required** (not "zero worker changes"): a
+  multi-scan's relations must reach each worker's reply ring in **request
+  order**, which the immediate-emit fast path for small relations violates (see
+  *Reply path*). A per-group flag routes them through the existing FIFO
+  `pending_streams` instead. Everything else on the master and client reuses the
+  single-scan reply path verbatim.
 
 ## Semantics (committed)
 
-- **Instant consistency (one SAL cut).** All N relation snapshots are
-  taken at the same SAL cut (the scan groups' consecutive SAL position,
-  which every worker observes identically), and the state at the cut is
-  the same deterministic function of the SAL prefix on every worker.
-  Base tables reflect the exact prefix (Push dispatches inline in every
-  worker context, `worker/mod.rs:650, 814`). A view may additionally lag
-  the prefix by *deferred* ticks (a tick that arrives inside an exchange
-  wait is deferred and replayed after the wait,
-  `worker/mod.rs:651, 706-713`) — deterministically and identically on
-  every worker, since the defer decision follows the shared log
-  position. Atomic commits are never torn across the result set.
-- **Derivation freshness is the same as today's scans, minus one
-  documented window.** `handle_scan`'s tick-drain loop runs once, before
-  the fanout, exactly as for a single scan (`executor.rs:1295-1310`). A
-  push that commits between the drain's completion and the scan groups'
-  SAL write is included in base-table snapshots but its view effects are
-  not (its tick has not run) — so a SCAN_MULTI covering a base table and
-  a view over it can show the base ahead of the view by exactly the
-  writes of that window (and, per the previous bullet, by any deferred
-  ticks). This is not a regression: a single view scan today has the
-  same freshness (the view simply reflects the drain point); the
-  multi-scan makes the base-vs-view lag *observable in one result set*.
-  Instant consistency is unaffected — both snapshots sit at the same
-  cut; the lag is in the DBSP derivation, not the read. The drain cannot
-  be moved under the writer lock (`run_tick` needs `sal_writer_excl` per
-  tick — holding it across the drain would deadlock), so this window is
-  inherent and documented.
-- **Per-relation results are byte-identical in shape to N single
-  scans**: same chunk trains, same schema-negotiation behavior, same
-  terminal frames carrying `last_tick_lsn`. A SCAN_MULTI of one relation
-  is exactly a scan.
+- **Instant consistency (one SAL cut).** All N snapshots are taken at the same
+  SAL cut (the scan groups' consecutive SAL position, observed identically by
+  every worker), and the state at the cut is the same deterministic function of
+  the SAL prefix on every worker. Base tables reflect the exact prefix (Push
+  dispatches inline in every worker context, `worker/mod.rs:609-621`, applying
+  via `handle_push` → `ingest_returning_effective`, `worker/mod.rs:898-919`).
+  Atomic commits are never torn across the result set.
+- **View freshness = today's single-view scans, with a per-worker deferred-tick
+  skew.** The tick-drain loop runs once before the fanout
+  (`handle_scan`, `executor.rs:1630-1645`). A view may lag the cut by (a) the
+  window between the drain and the scan-group write (a push in that window is in
+  base snapshots but its tick has not run — same as a single view scan today,
+  which reflects the drain point), and (b) *deferred* ticks: a `Tick` arriving
+  while a worker is inside `do_exchange_wait` is deferred and replayed at top
+  level (`worker/mod.rs:526-534`; `worker/exchange.rs:109-124`), whereas `Scan`
+  dispatches inline in both contexts (`worker/mod.rs:479,621`). So during a
+  worker's exchange-wait window one worker can snapshot a view at its
+  pre-deferred-tick state while another snapshots post-tick — a per-worker skew
+  of at most one tick, **pre-existing for single-relation view scans** and not a
+  torn *base-table* commit. Instant consistency of base tables is unaffected;
+  the multi-scan merely makes any base-vs-view derivation lag observable in one
+  result set. This window is inherent (the drain cannot move under the writer
+  lock — `run_tick` needs it per tick — so holding it across the drain would
+  deadlock) and documented.
+- **Per-relation results are byte-identical in shape to N single scans**: same
+  chunk trains, same schema-negotiation, same terminal frame carrying
+  `last_tick_lsn`. A SCAN_MULTI of one relation is exactly a scan.
 
 ## Wire format
 
-New request flag. In the live tree the top allocated bit is
-`FLAG_DDL_TXN = 1 << 57`; bits 58 and 59 are claimed by the
-transaction-frame and watermark work that precedes this plan in the
-series, so SCAN_MULTI takes the next one (the compile-time disjointness
-guard `flags.rs:83-118` gains the constant):
+New request flag. The disjointness guard (the `high_flags` array literal,
+`gnitz-wire/src/flags.rs:116-131`, inside the `const _: () = {…}` block 111-139)
+must gain the constant. Bits 57–61 are already allocated (`FLAG_DDL_TXN`=57,
+`FLAG_ALLOCATE_TABLE_ID`=58, `FLAG_ALLOCATE_SCHEMA_ID`=59,
+`FLAG_ALLOCATE_INDEX_ID`=60, `FLAG_PUSH_TXN`=61); bit 63 is the sign bit, left
+clear; so SCAN_MULTI takes **bit 62**:
 
 ```rust
-pub const FLAG_SCAN_MULTI: u64 = 1 << 60;
+/// SCAN_MULTI request flag. Client→master frame naming N relations to snapshot
+/// at one SAL cut. Wire-level routing hint consumed at `handle_message`; never
+/// written to the SAL. Bit 62 — the next free high client-only bit above
+/// `FLAG_PUSH_TXN` (61); 63 is the sign bit, left clear.
+pub const FLAG_SCAN_MULTI: u64 = 1 << 62;
 ```
 
-Request frame: control block (`target_id = 0`, `flags` carrying
-`FLAG_SCAN_MULTI` and the schema-version bits of relation 0 — per-relation
-versions ride the count section):
+Add `FLAG_SCAN_MULTI` to the `high_flags` array so the compile-time guard covers
+it.
+
+Request frame: control block (`target_id = 0`, `flags` carrying `FLAG_SCAN_MULTI`;
+the control block's schema-version bits 24–39 are unused and written zero —
+per-relation versions ride the count section), followed by a trailing body:
 
 ```
-control block
-u32 relation_count       LE, 1 ..= 64
+u32 relation_count       LE, 1 ..= 16
 per relation:
   u64 tid                LE
   u16 schema_version     LE (the client's cached version, 0 = none)
 ```
 
-Shape rules, checked before any group is written: `1 <= count <= 64`
-(`SCAN_MULTI: too many relations` above), every tid a user relation
-(`tid >= FIRST_USER_TABLE_ID`, `has_id`; base tables **and views** are
-legal — both are scannable relations; system tables are master-resident
-and stay on the plain scan path), no duplicate tids
-(`SCAN_MULTI: duplicate relation {tid}`).
+Encode/decode follow the existing transaction-frame idiom in
+`runtime/protocol/wire.rs:892-991` (`txn_frame_prologue` / `decode_push_txn` —
+control-block prologue, then `codec::read_u32_le` count, then a bounds-checked
+per-record loop). `codec` has `read_u32_le`/`read_u64_le` but **no
+`read_u16_le`** — read the `schema_version` with `u16::from_le_bytes`. Decode
+lives in a new `decode_scan_multi(data) -> Result<Vec<(u64,u16)>, _>` there;
+routing is a new arm in `handle_message` (`executor.rs:838`), sibling to the
+`FLAG_PUSH_TXN` (922-925) and `FLAG_DDL_TXN` (913-916) arms.
 
-Reply: **interleaved trains, demuxed by `target_id`.** Every scan reply
-frame already carries its relation's tid in the header, so the master
-forwards frames in *arrival* order and the client demuxes:
+Shape rules, checked before any group is written: `1 <= count <= 16`; every tid a
+user relation (`tid >= FIRST_USER_TABLE_ID` and `shared.cat().has_id(tid)` under
+the catalog read lock — base tables **and** views are legal; system tables stay
+on the plain path); no duplicate tids. `16` is a product / master-state limit
+(N `ScanLease`s + N trains of bookkeeping), not a per-frame ring-safety bound —
+see *Reply-path safety*.
 
-- first, one preliminary schema-only frame per cache-missing relation
-  (all emitted up front — negotiation bytes and versions captured once,
-  under the catalog read lock, before the fanout; the per-relation
-  section's `schema_version` is the authoritative version field, the
-  control block's version bits are unused and zero);
-- then worker chunk frames (`FLAG_CONTINUATION`) of any relation in any
-  interleaving — chunk order within a relation is irrelevant (batches
-  concatenate, exactly as a single scan concatenates its N workers'
-  trains today, `connection.rs:174-186`);
-- one terminal frame per relation (`make_terminal_scan_frame`, that
-  relation's tid + the shared `last_tick_lsn`,
-  `executor.rs:1391-1394`), emitted when the master has drained all of
-  that relation's worker trains. The request completes at the Nth
-  terminal.
+Reply: **N sequential trains, one relation fully before the next**, each shaped
+exactly as a single scan's reply and drained by the master in request order:
 
-Arrival-order forwarding plus a **hybrid queue policy** is what keeps
-the reply path inside a hard engine invariant: a queued/parked
-`W2mSlot` pins its ring space and an in-flight entry until dropped
-(`reactor/mod.rs:993-1020`), and the W2M in-flight accounting is
-hard-capped at `W2M_MAX_IN_FLIGHT = 64` per ring — no capacity check on
-`take()`, a release-build `assert!` on `release()`
-(`runtime/protocol/w2m.rs:102-168`). Neither request-ordered parking
-nor naive arrival-order queuing respects that cap: while the master
-awaits a slow client's socket, the reactor keeps draining every worker
-ring (`runloop.rs:81`), a worker emits its N trains gated only by ring
-*bytes* (`w2m_ring.rs:447`), and a batch under the reply budget is one
-frame of exactly its own size (`reply.rs:270-276`) — so frame *count*
-per ring is unbounded by bytes alone, and 64 relations put the count at
-the cap: silent `InFlightState` clobber, then abort. The committed
-policy in `route_scan_slot` for multi-scan group ids:
+- an optional preliminary schema-only frame (master→client, `FLAG_CONTINUATION`
+  + the relation's `server_version`, only when
+  `wire_should_include_schema(client_version, server_version)` — the same gate
+  and captured bytes as `handle_scan`, `executor.rs:1658-1686`);
+- then that relation's worker chunk frames (`FLAG_CONTINUATION`), forwarded
+  verbatim, drained from the workers in ascending worker order;
+- then one terminal frame (`make_terminal_scan_frame`, `executor.rs:1715-1718` —
+  the relation's tid + the shared `last_tick_lsn`, flags = 0), master→client.
 
-- a frame `≤ SCAN_MULTI_COPY_THRESHOLD` is **copied** into the group
-  queue as owned bytes and its slot released immediately;
-- a larger frame's slot is **held** in the queue.
+Terminal and preliminary schema frames are sent master→client directly
+(`peer.send_buffer`), not through the W2M ring, so they consume no ring slots.
+The client reads the N trains positionally (train `i` = relation `i` in request
+order), reusing the single-scan receive loop N times.
 
-The threshold is derived from the ring, not from the reply budget:
-`SCAN_MULTI_COPY_THRESHOLD = W2M_REGION_SIZE / 32` (32 MiB at the 1 GiB
-ring, `w2m_ring.rs:72`). That makes the held-count bound an arithmetic
-identity independent of every tunable: held slots pin their ring bytes,
-each held frame exceeds `ring/32`, so **fewer than 32 can be
-ring-resident simultaneously** — including under a shrunken debug
-`GNITZ_REPLY_FRAME_BUDGET`, where frames simply fall below the
-threshold and take the copy branch (a budget below the threshold holds
-nothing at all). The copy branch's cost is one memcpy of ≤ 32 MiB per
-mid-sized frame, acceptable on a deliberate bulk-snapshot op and
-bounded in aggregate by the scan's result size (the same order the
-client buffers anyway).
+## Worker change: FIFO reply ordering for multi-scan groups
 
-Two guards make the bound global rather than per-request:
+`send_scan_response` (`worker/reply.rs`) has **three** emit paths, two of which
+emit *immediately* during the dispatch pass and one of which queues:
 
-- **one multi-scan at a time**: `handle_scan_multi` serializes on a
-  master-side `AsyncMutex` (a concurrent second multi-scan would sum
-  its held slots onto the same rings; serializing a bulk snapshot op
-  is the honest cost of the hard cap), keeping total multi-scan-held
-  slots per ring `< 32` with ≥ 32 slots of headroom for control
-  traffic and single scans;
-- a **per-ring held counter** on the reactor (incremented when the
-  group branch of `route_scan_slot` enqueues a held slot for that
-  worker's ring, decremented on release), with a
-  `debug_assert!(held < 48)` at the enqueue site in
-  `reactor/mod.rs`'s `route_scan_slot` — the group-branch analogue of
-  the per-id assert at `reactor/mod.rs:1014`, which cannot see
-  cross-relation aggregation. Debug builds may override the threshold
-  (`GNITZ_SCAN_MULTI_COPY_THRESHOLD`, via the existing
-  `debug_env_usize` mechanism) so tests can drive the held branch
-  cheaply.
+- **non-wire-safe** (any German-string/TEXT column, `is_wire_safe` false via
+  `schema_wire_safe`, `protocol/sal.rs:363-368`): builds one frame with the
+  blob-capable `encode_wire_into` and `send_encoded`s it **immediately**, then
+  returns (`reply.rs:243-275`);
+- **wire-safe single-frame** (fits the budget): emits immediately (`reply.rs:284-291`);
+- **wire-safe multi-chunk**: queues in `pending_streams` (FIFO, one chunk per
+  later `drain_sal` pass via `emit_pending_scan_chunk`, the columnar
+  `encode_wire_into_range`).
 
-## Master handler
+For a multi-scan these paths **reorder** relations on the ring:
+`[rel0(large-wire-safe), rel1(tiny)]` emits rel1 first (immediate) and rel0's
+chunks later, so ring order ≠ request order. Draining in request order then pins
+the front on frames drained last → the worker blocks in `send_encoded` on a full
+ring while the master waits for rel0's later chunks → **deadlock** (the exact
+hazard `worker/mod.rs:173-183` documents). TEXT relations make this the common
+case, not a corner: a non-wire-safe relation *always* emits before any queued
+wire-safe relation, so it wedges whenever a wire-safe relation the master must
+drain after it is large enough to fill a ring.
 
-`handle_scan_multi` in `runtime/orchestration/executor.rs`:
+Fix: route **every** multi-scan relation through `pending_streams` so ring order
+= request order, and extend the queue to carry the non-wire-safe case:
 
-1. Decode; enforce shape rules (catalog read lock for `has_id`).
-2. Run the tick-drain loop once (verbatim the `handle_scan` loop,
-   `executor.rs:1295-1310`; same lock-ordering caveat — the catalog read
-   lock is taken only after the drain, BF-1).
-3. Under the catalog read lock, resolve per relation: replicated shape
-   (`replicated_unicast`, `master/mod.rs:371-378` — worker-0 unicast for
-   replicated relations, broadcast otherwise) and schema version /
-   preliminary-frame decision.
-4. **One fanout, one lock hold**: a new
-   `dispatch_scan_multi_fanout(disp_ptr, reactor, sal_excl, shapes)`
-   generalizing `dispatch_scan_fanout` (`master/mod.rs:405-460`):
-   allocate per-relation request-id sets (a broadcast relation gets `nw`
-   ids, a unicast relation one mirrored id, exactly as today); register
-   every id into **one multiplexed scan group** (below) before any
-   await; then, under **one** `sal_excl.lock().await` hold, write all N
-   scan groups back-to-back (each group encoded exactly as the
-   single-scan submit closure writes it today — no SAL format change; a
-   unicast group carries only worker 0's slot; all workers already skip
-   groups with no slot for them, `worker/mod.rs:698-701`) and signal
-   once (`signal_all`). The lock releases before any await.
-5. **Multiplexed forwarding, arrival order.** The reactor gains a
-   grouped registration: a `ScanGroupLease` owning an arbitrary id set
-   (Vec-backed — the existing `ScanLease` stores at most `MAX_WORKERS`
-   ids inline in a fixed array, `reactor/futures.rs:166-183`, and
-   cannot hold N×nw ids) plus an arrival queue: `route_scan_slot`
-   delivers any member id's frame into the group's queue under the
-   hybrid copy/hold policy (wire-format section) instead of the per-id
-   parking. The handler loop pops the next entry (owned bytes or held
-   slot), parses its train header (`parse_train_header`,
-   `master/mod.rs:462-489`), forwards the frame to the client, and
-   releases any held slot; per-relation bookkeeping decides when to
-   emit that relation's terminal frame. The bookkeeping lives on the
-   `ScanGroupLease`: an `id → relation index` map (keyed by the slot's
-   request id) and a per-relation `trains_remaining` counter
-   initialized to the relation's id-set size (nw for broadcast, 1 for
-   unicast), decremented on each `FLAG_SCAN_LAST` (a single-frame
-   no-continuation reply counts as a length-1 train,
-   `master/mod.rs:485-496`; every worker train ends in exactly one
-   `FLAG_SCAN_LAST`, zero-row replies included, `reply.rs:240,275`).
-   Lease drop
-   deregisters all ids and discards queued and future slots — a
-   mid-stream client death cancels the whole multi-scan. A worker fault
-   frame or decode error on any relation terminates the whole request
-   with a single `send_error` after the lease drop — the client
-   discards partial results.
+- Make `PendingScan` an enum (or add a discriminant) with a **non-wire-safe
+  single-frame** variant holding the frozen `Rc<Batch>` + `request_id`,
+  `client_id`, `target_id`, `prebuilt_schema`, `server_version` (exactly what the
+  immediate branch consumes — the `SchemaDescriptor` is not load-bearing once a
+  prebuilt block is present, so it need not be stored, matching how the wire-safe
+  pending path already drops it). `emit_pending_scan_chunk` dispatches on the
+  variant: non-wire-safe → `encode_wire_into` (blob-capable), single frame,
+  always pop; wire-safe → the existing chunk logic. Flags are byte-identical to
+  the immediate branch: `wire_flags_set_schema_version(0, server_version) |
+  FLAG_CONTINUATION | FLAG_SCAN_LAST`, schema block emitted iff `prebuilt_schema`
+  is `Some`. Keep the `wire_sz > MAX_W2M_MSG` reject (`reply.rs:247-253`) in
+  `send_scan_response` **before** enqueue — `emit_pending_scan_chunk` returns no
+  `Result`, so an oversized (>256 MiB) TEXT partition must error at enqueue time,
+  not emit time. Only the encode moves to emit time.
+- The wire-safe single-frame case reuses the existing chunked path
+  (`enqueue_stream`): a one-row result is a one-chunk train — its single chunk is
+  already a ≤budget frame with those exact flags, so nothing new is exercised
+  (`reply.rs:390-398`). This is the battle-tested path every large single scan
+  already uses; that is why the change is low-risk, not because the reply path is
+  fragile.
 
-Worker: **zero changes.** Each of the N groups is an ordinary scan group
-dispatched through the existing `SalMessageKind::Scan` arm; snapshots at
-dispatch, FIFO chunk trains, per-request-id reply routing all behave
-identically.
+Gate all three on a `force_fifo: bool`. Its signal is a scan-group flag
+`FLAG_SCAN_FIFO_REPLY`. The wire-flag space is full (bits 48–62 all allocated,
+63 is the sign bit), so `FLAG_SCAN_FIFO_REPLY` **reuses bit 62** —
+`FLAG_SCAN_MULTI`'s value — which is safe by frame direction: bit 62 on a
+client→master frame is the SCAN_MULTI *request* (consumed at `handle_message`,
+never propagated into a SAL group), and on a master→worker scan group it is the
+FIFO-reply *directive*. It is **not** added to the `high_flags` disjointness
+guard (that would trip the collision assert). `dispatch_scan_multi_fanout` sets
+it on every group's `wire_flags`; the full u64 survives to the worker
+(`encode_ctrl_block` stores all 8 bytes, `control.rs:254` → read back as
+`ctrl_wire_flags`, `worker/mod.rs:660`), so the `Scan` dispatch arm
+(`worker/mod.rs:853-863`) threads `force_fifo = ctrl_wire_flags & FLAG_SCAN_FIFO_REPLY
+!= 0` into `send_scan_response`. Single scans (flag clear) keep all three paths,
+including the immediate-emit jump-ahead latency benefit. The dispatch matrix is
+untouched — only the reply emission path changes.
+
+Schema-skip via `effective_client_version` is preserved on the FIFO path: the
+first chunk emits the schema block iff `wire_should_include_schema(client_version,
+server_version)` (`reply.rs:230`), which is false when the master already
+captured the schema (`effective = server_version`), so no duplicate schema.
+
+With this, each worker streams a multi-scan's relations in strict request order
+(rel0's whole train, then rel1's, …), exactly as it already streams one relation
+across `drain_sal` passes.
+
+## Master handler: `handle_scan_multi`
+
+New async handler in `executor.rs`, routed from the `FLAG_SCAN_MULTI` arm of
+`handle_message`.
+
+**Phase 0 — decode + drain.** Decode via `decode_scan_multi`; enforce the
+count/dup shape rules (tid legality is checked in Phase 1 under the catalog
+lock). Run the tick-drain loop once, verbatim from `handle_scan`
+(`executor.rs:1630-1645`); the catalog read lock is acquired only *after* the
+drain (BF-1, `executor.rs:1625-1629`). Capture `let lsn =
+shared.last_tick_lsn.get();` after the drain — the shared LSN stamped into every
+terminal.
+
+**Phase 1 — capture shapes + schemas + write N groups.** Take the catalog read
+lock. For each relation resolve, from the catalog snapshot (so all N are
+consistent with the cut even if a DDL commits during the later drain):
+
+- tid legality (`has_id`, `>= FIRST_USER_TABLE_ID`) → `SCAN_MULTI: {tid} is not a
+  user relation` / `table {tid} not found`;
+- fan-out shape via `replicated_unicast(disp_ptr, tid)` (`master/mod.rs:140-147`):
+  `0` (worker-0 unicast) for a replicated relation, `-1` (broadcast) otherwise;
+- schema negotiation: `server_version = cat().get_schema_version(tid)`,
+  `include_schema = wire_should_include_schema(client_version_i, server_version)`;
+  if including, capture the schema wire block (`get_schema_wire_block`,
+  `executor.rs:155`) for the Phase-2 preliminary frame and set that relation's
+  `effective_client_version = server_version` (so its workers omit their schema
+  blocks); else `effective_client_version = client_version_i`.
+
+Then, nested inside the catalog read lock (the catalog-read ⊃ `sal_writer_excl`
+order `handle_scan` establishes; every SAL writer takes catalog-then-SAL or SAL
+alone, so no inversion — `executor.rs:2277` documents it), call a new
+`dispatch_scan_multi_fanout`. This is **new code (~50 lines)**, not a
+generalization of `dispatch_scan_fanout` (which locks per call, `master/mod.rs:211`,
+so calling it N times reopens the lock and destroys the one cut). It follows
+`commit_pushes`'s "N groups under one hold" shape: for each relation allocate its
+request-id set (`nw` ids for broadcast, one for unicast — the private
+`alloc_scan_request_id`/`SCAN_REQ_ID_FLAG` machinery, `reactor/mod.rs:537/50`,
+is reached the same way `dispatch_scan_fanout` reaches it) and register it into
+its own `ScanLease` (`reactor.scan_lease(&ids)`, `reactor/mod.rs:580`) *before*
+any await; then under **one** `sal_excl.lock().await` hold write all N scan
+groups back-to-back via `write_group_with_req_ids` (`master/dispatch.rs:110-149`)
+— each with `wire_flags = wire_flags_set_schema_version(0, effective_client_version_i)
+| FLAG_SCAN_FIFO_REPLY`, the captured schema block, its `unicast`, and its
+req_ids — then `signal_all()` once; the lock releases at block end before any
+await. Return a `Vec` of per-relation `(first_slots, req_ids, ScanLease)`
+(N leases — `ScanLease`'s inline `[u32; MAX_WORKERS]` holds one fan-out's ids,
+`reactor/futures.rs:159-163`). Release the catalog read lock after this block:
+Phase 2 touches no catalog state, the snapshot is worker-frozen, and the schemas
+are captured, so releasing early avoids blocking DDL for the whole bulk read.
+
+**Phase 2 — sequential per-relation drain (no locks).** For each relation `i` in
+request order:
+
+1. If `include_schema_i`, send its preliminary schema frame (`peer.send_buffer`,
+   `FLAG_CONTINUATION` + `server_version_i` + captured block); on a negative rc,
+   drop the leases and return.
+2. For each worker slot of relation `i` in ascending worker order, call
+   `drain_scan_train(reactor, peer, slot, req_id, worker)`
+   (`master/dispatch.rs:1498-1522`), exactly as `fan_out_scan_async` does
+   (1166-1173). **This fn is currently a private free fn in `mod dispatch`;
+   make it `pub(crate)` so `handle_scan_multi` can call it.** A `false` return
+   (client disconnect) or `Err` (worker fault / malformed train) drops all
+   leases (discarding undrained frames at the ring boundary so no worker wedges)
+   and terminates the request — on a fault, one `send_error` after the lease
+   drop; the client discards partial results.
+3. Send relation `i`'s terminal (`make_terminal_scan_frame(tid_i, client_id, lsn)`,
+   `peer.send_buffer_or_close`).
+
+All leases are held for the whole of Phase 2 (a `Vec<ScanLease>`); dropping them
+on return deregisters every id and discards queued/future slots, cancelling the
+multi-scan on client death.
+
+Because the worker streams multi-scan relations in request order (the FIFO flag),
+draining relation `i` before `i+1` matches ring order: relation `i`'s frames are
+at the front of each ring and released in order as the master forwards them, so
+`consume_cursor` advances and no train wedges. This is the FIFO invariant's
+supported usage — the master drains one request's train at a time.
+
+## Reply-path safety: the shared per-ring in-flight budget
+
+With request-order draining the design is deadlock-free (above). The remaining
+concern is the per-ring W2M in-flight cap. Each parked (drained-but-unforwarded)
+scan frame pins one entry in the ring's single `InFlightState` (`w2m.rs:109-119`,
+one per worker, shared by **all** req_ids on that ring), hard-capped at
+`W2M_MAX_IN_FLIGHT = 64` (`w2m.rs:107`): `take()` (`w2m.rs:134`) has **no
+capacity check** (a 65th slot wraps the queue index, clobbering slot 0), and
+`release()` advances only the consecutive completed prefix (`w2m.rs:154`,
+`trailing_ones`) under a release-build `assert!(bit < 64)` (`w2m.rs:146`) that
+**aborts the process** on overflow. Non-scan replies (exchange/ACK) release
+immediately (`decode_slot_owned`), so the front is pinned by the oldest
+un-forwarded *scan* frame and every slot opened behind it counts.
+
+The real per-ring invariant is therefore **Σ over that ring's relations of
+per-worker frame count `< 64`** — not "one frame per relation." A `count <= 16`
+cap does **not** bound that sum directly: a single large relation chunks into
+many frames. What bounds it in production is **byte-backpressure**: at the 256
+MiB reply budget (`MAX_W2M_MSG`, `w2m_ring.rs:77`) the 1 GiB ring
+(`w2m_ring.rs:72`) holds ~4 frames, and FIFO emission means only the *one*
+relation currently mid-chunk is large — so per ring the sum is ≤ (≤4 for that
+relation) + (one frame each for ≤15 already-emitted tiny relations) ≈ 19 < 64.
+Tiny single-frame relations never trigger byte-backpressure (`try_reserve` is
+byte-only, `w2m_ring.rs:442-449`), so the `count` cap is what bounds *their*
+contribution.
+
+`N <= 16` is thus a **product / master-state limit** (the master holds N
+`ScanLease`s and N trains of bookkeeping; 16 covers realistic consistent
+snapshots — a handful of related tables), and *incidentally* keeps a single
+multi-scan's parked-frame contribution equivalent to ≤16 concurrent single scans,
+so a multi-scan cannot overflow the ring on its own (16 < 64). It is **not** a
+correctness bound on the frame sum; that safety is byte-backpressure of large
+chunks. A test that shrinks `GNITZ_REPLY_FRAME_BUDGET` (to force chunking without
+a huge table) **defeats byte-backpressure** and must therefore keep the total
+frame sum per ring under 64 (a `big` relation of ~60 per-worker small frames +
+tiny siblings would overflow) — see Tests.
+
+A **reactor drain gate is explicitly rejected.** `drain_w2m_for_worker`
+(`reactor/mod.rs:946-964`) is the single FIFO drain for *all* reply kinds, and
+`read_cursor` is strictly monotonic. Gating it on in-flight depth would leave an
+exchange-output frame (`FLAG_EXCHANGE` → `exchange_acc`, `reactor/mod.rs:1036`)
+parked *behind* scan frames unreachable — the exchange round never completes, a
+worker spins in `do_exchange_wait`, and view maintenance freezes cluster-wide
+until client eviction. Today the reactor reads *past* parked scan frames
+(advancing `read_cursor` independently of `consume_cursor`) and routes exchange
+immediately; a gate would convert overflow into a routine cluster stall. Copying
+frames out is likewise rejected: a copied frame released behind a still-parked
+one cannot advance `consume_cursor`, so it does not bound in-flight, and copy-all
+regresses single-scan throughput. Because parked multi-scan frames are tiny
+(bytes), they do not byte-backpressure the ring, so concurrent exchange/ACK
+traffic is read past them normally — no new priority inversion beyond the
+byte-backpressure a single scan already produces.
+
+> **Pre-existing latent overflow (independent of this feature).** The
+> `InFlightState` abort is reachable **today** via single scans — e.g. 64
+> concurrent stalled clients scanning replicated tiny tables (all single-sourced
+> from worker 0), or one scan with a shrunk reply budget parking >64 small
+> frames. Its correct fix cannot gate the shared drain (exchange starvation,
+> above); the sound fix is to let `InFlightState` **grow past 64** (its 64-slot
+> `u64` bitmap is the only reason it aborts; in-flight is ultimately byte-bounded
+> by the ring). That is a small, localized `w2m.rs` change worth landing **first**
+> on its own merits, and it removes the ring-frame-sum constraint on `N`
+> entirely, leaving `N`'s cap a pure product limit. This plan is production-safe
+> standalone (byte-backpressure + the `count` cap); the growth fix makes it robust
+> under any reply budget and retires the CREATE-UNIQUE-INDEX preflight frame-size
+> workaround (`worker/mod.rs:1460-1472`) that exists only to keep a full ring
+> under 64 frames.
+
+Worker: no changes beyond the `FLAG_SCAN_FIFO_REPLY` reply-path branches above.
+Each group is an ordinary `Scan` group; snapshot-at-dispatch, per-request-id
+routing, and unicast-slot skipping (`worker/mod.rs:519-522`) are unchanged.
 
 ## Client API
 
+`gnitz-core` has no `Connection` type — the session object is `Session`
+(`connection.rs:76`, re-exported as `Session`), and `GnitzClient` (`client.rs`)
+delegates to `self.session`.
+
 ```rust
-impl Connection {
-    // gnitz-core/src/connection.rs, beside scan()
-    pub fn scan_multi(&mut self, tids: &[u64], cache: &mut LruCache<...>)
-        -> Result<Vec<(Option<Arc<Schema>>, Option<ZSetBatch>, u64)>, ClientError>
-}
-impl GnitzClient {
-    pub fn scan_many(&mut self, tids: &[u64]) -> Result<Vec<ScanTriple>, ClientError>
-}
+// gnitz-core/src/connection.rs, beside Session::scan (228-232)
+pub type MultiScanResult =
+    Result<Vec<(Option<Arc<Schema>>, Option<ZSetBatch>, u64)>, ClientError>;
+
+impl Session   { pub fn scan_multi(&mut self, tids: &[u64]) -> MultiScanResult }
+impl GnitzClient { pub fn scan_many(&mut self, tids: &[u64]) -> MultiScanResult }
 ```
 
-`scan_multi` sends the frame, then runs one receive loop that demuxes by
-each frame's `target_id`: schema frames and continuation chunks
-accumulate into the matching relation's slot (batch concatenation via
-`extend_from_owned`, as the single-scan loop does,
-`connection.rs:174-186`); a frame without `FLAG_CONTINUATION` is that
-relation's terminal (LSN in `seek_pk`); the loop ends at the Nth
-terminal. Results are returned in request order regardless of arrival
-interleaving. The returned LSNs update `last_seen_lsn` as any scan reply
-does.
+`scan_multi` encodes the SCAN_MULTI frame (one `schema_version` per tid via
+`self.schema_cache.peek(&tid)`, the `Session` field at `connection.rs:84`,
+mirroring `versioned_flags`, `connection.rs:388-391`), sends it, then runs the
+single-scan receive loop (`recv_scan`, `connection.rs:356-378`) **N times in
+request order**: each call accumulates that relation's schema (first frame
+carrying one) and batches (`extend_from_owned`) until a frame without
+`FLAG_CONTINUATION`, whose `seek_pk` is the relation's LSN, and updates
+`schema_cache` exactly as `scan` does. Results are returned in request order. No
+`target_id` demux is needed — trains arrive sequentially. Do **not** touch
+`last_seen_lsn`: `scan` never updates it (only push/txn paths do, via `track_lsn`,
+`client.rs:283`); `scan_multi` matches `scan`. The tuple matches the existing
+`ScanResult` inner shape (`connection.rs:27`); there is no `ScanTriple` type and
+no external `cache` parameter.
 
-Python: `client.scan_many([tid, ...])` returning a list of result sets,
-same row decoding as `scan`. The SQL layer does not consume SCAN_MULTI
-(a SQL `SELECT` targets one relation; joins are views), so this is a
-client-API feature; SQL integration is deliberately absent.
+Python: `client.scan_many([tid, ...])` returning a list of result sets, same row
+decoding as `scan` (sync binding beside `gnitz-py/src/lib.rs:1655-1661`; async
+beside `2252-2255`). The SQL layer does not consume SCAN_MULTI (a `SELECT`
+targets one relation; joins are views), so SQL integration is deliberately
+absent.
 
 ## Error cases
 
 | Case | Outcome |
 |------|---------|
-| empty list / count > 64 | `SCAN_MULTI: empty relation list` / `SCAN_MULTI: too many relations` |
+| empty list / count > 16 | `SCAN_MULTI: empty relation list` / `SCAN_MULTI: too many relations` |
 | duplicate tid | `SCAN_MULTI: duplicate relation {tid}` |
-| system tid / unknown tid | `SCAN_MULTI: {tid} is not a user relation` / `table {tid} not found` |
-| worker fault / decode error mid-stream | single `send_error` frame; lease drop discards undrained trains; client discards partial results |
+| system tid | `SCAN_MULTI: {tid} is not a user relation` |
+| unknown tid | `table {tid} not found` |
+| worker fault / decode error mid-stream | single `send_error`; all leases dropped (discards undrained trains); client discards partial results |
 
-All shape errors are checked before any group is written (nothing to
-clean up); mid-stream errors follow the existing single-scan fault
-contract (`parse_train_header`, `master/mod.rs:462-489`).
+Shape/tid errors are checked before any group is written. Mid-stream faults
+follow the single-scan contract (`parse_train_header`, `master/mod.rs:254-266`;
+`drain_scan_train` returns `Err`/`false`).
 
 ## What explicitly does not change
 
-- Single-relation scan, seek, and their handlers; the worker; the SAL
-  group encodings; tick semantics; the committer.
-- The plain scan's freshness contract — SCAN_MULTI inherits it verbatim,
-  window and all.
+- Single-relation scan/seek and their handlers; the SAL group encodings; tick
+  semantics; the committer; the worker dispatch matrix.
+- `drain_scan_train` (beyond `pub(crate)`), `recv_scan`, `make_terminal_scan_frame`,
+  `ScanLease`, `route_scan_slot`, the reactor drain — all reused verbatim.
+- The single-scan immediate-emit fast path (multi-scan opts out via the group
+  flag; single scans keep it).
+- The plain scan's freshness contract — SCAN_MULTI inherits it, window and all.
 
 ## Tests
 
-**Rust unit (gnitz-core):** frame codec (1, N, 64 relations; version
-bytes); shape-rule rejections; the demux receive loop against a mocked
-interleaved frame sequence.
+**Rust unit (gnitz-core):** SCAN_MULTI frame codec (1, N, 16 relations; version
+bytes; control-block version bits zero); shape-rule rejections; the N-times
+positional receive loop against a mocked sequence of N single-scan reply trains,
+asserting each train's schema/batch/LSN lands in the matching request-order slot.
 
-**Rust engine (reactor):** the group branch of `route_scan_slot` —
-copy/hold split at the threshold, held-counter increment/decrement,
-`debug_assert` firing point; `ScanGroupLease` drop discards queued
-owned frames and held slots and deregisters all ids.
+**Rust engine:** `dispatch_scan_multi_fanout` writes N groups under one
+`sal_writer_excl` hold at consecutive `write_cursor` positions (a concurrent
+committer submit lands wholly before or after); `FLAG_SCAN_FIFO_REPLY` forces
+`send_scan_response` through `pending_streams` for **both** a one-row wire-safe
+batch **and** a one-row non-wire-safe (TEXT) batch (assert each is queued, not
+immediately emitted, and the non-wire-safe one emits via the blob-capable
+encoder with `FLAG_CONTINUATION | FLAG_SCAN_LAST`).
 
 **E2E (pytest, `GNITZ_WORKERS=4`):**
-- **Torn-commit impossibility (the headline test):** one client commits
-  atomic two-table transactions `{A: k→v_i, B: k→v_i}` in a tight loop
-  (each pair in one commit); a second client hammers
-  `scan_many([A, B])`; every result set must satisfy
-  `A.v == B.v` — never a torn pair. Run long enough to cross checkpoint
-  boundaries.
-- Sequential-scan skew is real (control test): the same workload
-  observed via two *single* scans does exhibit torn pairs (asserting the
-  feature is actually load-bearing, not vacuous).
-- Mixed shapes: one replicated relation + one hash-partitioned relation
-  in a single `scan_many`; snapshot consistency holds (replicated read
-  from worker 0's cut equals the partitioned cut).
-- View + base: `scan_many([t, v])` where `v` derives from `t`, quiescent
-  writer → base and view agree; under concurrent writes the documented
-  window is tolerated (test asserts only instant-consistency invariants,
-  e.g. the view never shows a row whose base row is absent *in the same
-  result set* for an insert-only workload).
-- Single-relation `scan_many([t])` equals `scan(t)` byte-for-byte
-  (schema, rows, lsn).
-- Error paths: empty list, 65 relations, duplicate, system tid, unknown
-  tid; server healthy after each.
-- Schema negotiation: cold cache (preliminary frames per relation), warm
-  cache, and a stale version on one of N relations (only that relation
-  re-negotiates); the schema bytes are the step-3 capture even when a
-  concurrent DDL commits mid-stream (versions in the prelim and worker
-  frames agree).
-- **Maximum accepted width under load**: a 64-relation `scan_many` of
-  small tables at `GNITZ_WORKERS=4` with a concurrent pusher; asserts
-  completion and per-relation correctness.
-- **Slow-reader stress (the in-flight-cap test)**: a 64-relation
-  `scan_many` read by a deliberately stalling client while a pusher
-  runs, with the debug threshold override set *below* the debug reply
-  budget so frames land in the **held** branch (e.g. threshold 16 KiB,
-  budget 64 KiB) — the exact shape that overflows `W2M_MAX_IN_FLIGHT`
-  without the ring-derived bound; asserts completion, correctness,
-  per-ring held count staying under the assert ceiling, and server
-  health. A second variant with the threshold *above* the budget pins
-  the all-copy degenerate case (zero held slots).
-- Concurrent `scan_many` from two clients serialize (both complete
-  correctly; the second's start is delayed, not rejected).
-- Cancellation: client disconnects mid-stream; server stays healthy
-  (group lease discards queued and future trains); subsequent scans
-  work.
+- **Torn-commit impossibility (headline):** one client commits atomic two-table
+  transactions `{A: k→v_i, B: k→v_i}` in a tight `FLAG_PUSH_TXN` loop; a second
+  hammers `scan_many([A, B])`; every result set satisfies `A.v == B.v`. Run
+  across checkpoint boundaries.
+- **Sequential-scan skew is real (control):** the same workload via two *single*
+  scans does exhibit torn pairs (proves the feature is load-bearing).
+- **FIFO-ordering regression (the deadlock guard):** `scan_many([big, s1..s8])`
+  where `big` is a wire-safe table forced to chunk and `s1..s8` are tiny — the
+  shape that deadlocks without the `FLAG_SCAN_FIFO_REPLY` change; assert
+  completion and correctness, and the reordered `scan_many([s1..s8, big])`. Add a
+  **non-wire-safe variant** `scan_many([big, dim_text])` where `dim_text` has a
+  TEXT column (the mainline case Finding 1 identifies — the non-wire-safe reply
+  must FIFO too). If a shrunk `GNITZ_REPLY_FRAME_BUDGET` is used to force chunking
+  without a huge table, keep `big`'s per-worker frame count small enough that the
+  total parked frame sum per ring stays < 64 (else the pre-existing `InFlightState`
+  overflow, not the ordering, aborts the run).
+- **Mixed shapes:** one replicated + one hash-partitioned relation in one
+  `scan_many`; snapshot consistency holds (worker-0 replicated read == the
+  partitioned cut).
+- **View + base:** `scan_many([t, v])`, `v` derived from `t`; quiescent writer →
+  agree; under concurrent inserts assert only the instant-consistency invariant
+  (the view never shows a row whose base row is absent in the same result set,
+  insert-only).
+- **`scan_many([t]) == scan(t)`** byte-for-byte (schema, rows, lsn).
+- **Error paths:** empty, 17 relations, duplicate, system tid, unknown tid;
+  server healthy after each.
+- **Schema negotiation** (one parametrized test over cold / warm / stale-on-one-of-N):
+  a prelim frame is sent iff a relation's cached version misses; only the stale
+  relation re-negotiates; schema bytes are the Phase-1 capture even when a DDL
+  commits mid-drain.
+- **Slow-reader:** `scan_many` of 16 tiny tables read by a stalling client while a
+  pusher runs; assert completion after the reader resumes, correctness, and
+  server health; the never-resuming variant asserts eviction plus a healthy
+  server and unaffected other clients. (The >64-parked-frames in-flight-under-stall
+  stress belongs to the pre-existing overflow's own coverage, not here.)
+- **Concurrent `scan_many` from two clients:** both complete correctly (serialized
+  only at the one-cut submit, not the drain).
+- **Cancellation:** client disconnects mid-stream; server healthy; later scans work.
