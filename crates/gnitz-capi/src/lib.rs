@@ -26,7 +26,16 @@ use std::os::raw::{c_char, c_int, c_void};
 use gnitz_core::protocol::types::type_code_from_u64;
 use gnitz_core::{CircuitBuilder, ExprBuilder, GnitzClient};
 use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
-use gnitz_sql::SqlPlanner;
+use gnitz_sql::{GnitzSqlError, SqlPlanner};
+
+// ---------------------------------------------------------------------------
+// Error codes
+// ---------------------------------------------------------------------------
+
+/// A user-table transaction failed its OCC precondition (a read table was written
+/// concurrently). Returned by `gnitz_execute_sql` in place of the generic `-1`, so
+/// a C caller can retry. Check `gnitz_last_error` for the message.
+pub const GNITZ_ERR_TXN_CONFLICT: c_int = -2;
 
 // ---------------------------------------------------------------------------
 // TypeCode constants — cbindgen emits these as #define macros
@@ -1357,10 +1366,23 @@ pub unsafe extern "C" fn gnitz_execute_sql(
             }
             0
         }
+        // An OCC conflict returns the dedicated GNITZ_ERR_TXN_CONFLICT so a C
+        // caller can retry; every other error keeps the generic -1. The message
+        // (which names the table for an autocommit conflict) is in gnitz_last_error.
         Err(e) => {
+            let code = sql_error_code(&e);
             set_error(e);
-            -1
+            code
         }
+    }
+}
+
+/// C return code for a SQL execution error: a retryable OCC conflict gets the
+/// dedicated `GNITZ_ERR_TXN_CONFLICT`; every other error keeps the generic `-1`.
+fn sql_error_code(e: &GnitzSqlError) -> c_int {
+    match e {
+        GnitzSqlError::Conflict { .. } => GNITZ_ERR_TXN_CONFLICT,
+        _ => -1,
     }
 }
 
@@ -1480,6 +1502,24 @@ mod tests {
     use super::*;
     use gnitz_core::TypeCode;
     use std::ffi::CString;
+
+    #[test]
+    fn conflict_maps_to_dedicated_return_code() {
+        // An OCC conflict (either autocommit-with-table or transaction) maps to
+        // GNITZ_ERR_TXN_CONFLICT; every other SQL error keeps the generic -1.
+        assert_eq!(
+            sql_error_code(&GnitzSqlError::Conflict {
+                table: Some("t".into())
+            }),
+            GNITZ_ERR_TXN_CONFLICT
+        );
+        assert_eq!(
+            sql_error_code(&GnitzSqlError::Conflict { table: None }),
+            GNITZ_ERR_TXN_CONFLICT
+        );
+        assert_eq!(sql_error_code(&GnitzSqlError::Bind("nope".into())), -1);
+        assert_eq!(GNITZ_ERR_TXN_CONFLICT, -2);
+    }
 
     #[test]
     fn test_set_string_alignment_ok() {

@@ -72,17 +72,22 @@ impl Peer {
         }
     }
 
-    /// Send the precomputed OK HELLO ACK frame. The ACK's contents (status,
-    /// advertised server frame limit) are protocol policy decided once here,
-    /// for every transport; the backends differ only in how they ship the
-    /// `'static` bytes.
-    pub async fn send_hello_ack(&self) -> i32 {
-        const OK_ACK: [u8; gnitz_wire::HELLO_ACK_FRAME_SIZE] =
-            gnitz_wire::encode_hello_ack(gnitz_wire::HELLO_STATUS_OK, gnitz_wire::MAX_FRAME_PAYLOAD_SERVER as u32);
-        match &self.inner {
-            PeerInner::Unix { fd, reactor } => reactor.send_static(*fd, &OK_ACK).await,
-            PeerInner::Tls(conn) => conn.send_guarded(&OK_ACK).await,
-        }
+    /// Send the OK HELLO ACK frame, seeding the client's OCC basis with
+    /// `published_lsn` (the durability watermark at connect). The ACK's contents
+    /// (status, advertised server frame limit) are protocol policy decided once
+    /// here, for every transport. `published_lsn` is a runtime value, so the frame
+    /// is no longer a compile-time `const` shipped by a zero-copy `'static` send:
+    /// it is copied into a pooled send buffer and dispatched through the shared
+    /// `send_buffer` path (per-connection, so the extra copy is off any hot path).
+    pub async fn send_hello_ack(&self, published_lsn: u64) -> i32 {
+        let ack = gnitz_wire::encode_hello_ack(
+            gnitz_wire::HELLO_STATUS_OK,
+            gnitz_wire::MAX_FRAME_PAYLOAD_SERVER as u32,
+            published_lsn,
+        );
+        let mut buf = crate::storage::batch_pool::acquire_buf();
+        buf.extend_from_slice(&ack);
+        self.send_buffer(PooledSendBuf(buf)).await
     }
 
     /// Terminal reply send: close the connection on transport failure. Once

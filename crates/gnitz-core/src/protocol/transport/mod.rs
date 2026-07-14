@@ -493,14 +493,16 @@ pub(crate) fn recv_framed(sock_fd: RawFd, max_payload_len: usize) -> Result<Vec<
 }
 
 /// Send the HELLO frame and parse the server's ACK. Returns the
-/// server-negotiated per-connection frame payload limit in bytes.
+/// server-negotiated per-connection frame payload limit in bytes and the
+/// server's durability watermark at connect (`published_lsn`), which seeds the
+/// client's OCC basis.
 ///
 /// On version mismatch / auth failure the server replies with a
 /// length-prefixed STATUS_ERROR control block (≥ 248 bytes) and closes
 /// the connection; this function detects that path via the payload
 /// length (`!= HELLO_ACK_PAYLOAD_LEN`) and surfaces the embedded error
 /// string.
-pub fn hello_handshake(t: &mut ClientTransport) -> Result<u32, ProtocolError> {
+pub fn hello_handshake(t: &mut ClientTransport) -> Result<(u32, u64), ProtocolError> {
     let payload = gnitz_wire::encode_hello_payload(
         gnitz_wire::WAL_FORMAT_VERSION as u16,
         0, // auth method = none
@@ -526,7 +528,10 @@ pub fn hello_handshake(t: &mut ClientTransport) -> Result<u32, ProtocolError> {
         // so a compromised or buggy server cannot raise the client's own
         // allocation bound above its hard maximum (honoring the doc-comment
         // on `Connection::max_payload_len`).
-        return Ok(ack.limit_bytes.min(gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT as u32));
+        return Ok((
+            ack.limit_bytes.min(gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT as u32),
+            ack.published_lsn,
+        ));
     }
 
     // Not an ACK — the server sent a STATUS_ERROR control block. Surface
@@ -811,12 +816,12 @@ mod tests {
         let (a, b) = make_socketpair();
         // Pre-stage the ACK frame on `b` so the handshake on `a` can read it
         // after sending its HELLO (which lands harmlessly in `a`'s recv buffer).
-        let ack = gnitz_wire::encode_hello_ack(gnitz_wire::HELLO_STATUS_OK, u32::MAX);
+        let ack = gnitz_wire::encode_hello_ack(gnitz_wire::HELLO_STATUS_OK, u32::MAX, 0);
         unsafe {
             libc::send(b, ack.as_ptr() as *const libc::c_void, ack.len(), 0);
         }
         let mut t = ClientTransport::from_unix_fd(a);
-        let limit = hello_handshake(&mut t).unwrap();
+        let (limit, _lsn) = hello_handshake(&mut t).unwrap();
         assert_eq!(limit as usize, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT);
         unsafe {
             libc::close(b);
@@ -828,13 +833,14 @@ mod tests {
         // A server limit below the client ceiling passes through unchanged.
         let (a, b) = make_socketpair();
         let small: u32 = 16 * 1024 * 1024;
-        let ack = gnitz_wire::encode_hello_ack(gnitz_wire::HELLO_STATUS_OK, small);
+        let ack = gnitz_wire::encode_hello_ack(gnitz_wire::HELLO_STATUS_OK, small, 7);
         unsafe {
             libc::send(b, ack.as_ptr() as *const libc::c_void, ack.len(), 0);
         }
         let mut t = ClientTransport::from_unix_fd(a);
-        let limit = hello_handshake(&mut t).unwrap();
+        let (limit, lsn) = hello_handshake(&mut t).unwrap();
         assert_eq!(limit, small);
+        assert_eq!(lsn, 7, "the ACK's published_lsn seeds the client basis");
         unsafe {
             libc::close(b);
         }

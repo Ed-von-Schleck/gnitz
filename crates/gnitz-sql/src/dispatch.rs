@@ -11,7 +11,7 @@ use crate::plan::validate::{
 };
 use crate::SqlResult;
 use crate::{dml, plan};
-use gnitz_core::GnitzClient;
+use gnitz_core::{ClientError, GnitzClient};
 use sqlparser::ast::Statement;
 
 /// Inside a transaction, only DML and transaction control may run. Everything
@@ -62,8 +62,15 @@ pub(crate) fn execute_statement(
         }
         Statement::Commit { .. } => {
             reject_unhonored_commit_clauses(stmt, "COMMIT")?;
-            let lsn = client.txn_commit()?;
-            Ok(SqlResult::TransactionCommitted { lsn })
+            // A COMMIT-time OCC conflict is not auto-retried — the buffered reads
+            // are stale by definition. `txn_commit` already took the buffer out
+            // (transaction closed), so surfacing `Conflict` leaves nothing open;
+            // the application re-runs the whole transaction from BEGIN.
+            match client.txn_commit() {
+                Ok(lsn) => Ok(SqlResult::TransactionCommitted { lsn }),
+                Err(ClientError::TxnConflict { .. }) => Err(GnitzSqlError::Conflict { table: None }),
+                Err(e) => Err(GnitzSqlError::Exec(e)),
+            }
         }
         Statement::Rollback { .. } => {
             reject_unhonored_rollback_clauses(stmt, "ROLLBACK")?;

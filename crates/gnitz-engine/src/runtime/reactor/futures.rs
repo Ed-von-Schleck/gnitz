@@ -310,10 +310,6 @@ pub(super) enum SendAlive {
     /// keep-alive clone in `send_buf_inner` stays O(1) — an owned `Vec`
     /// would deep-copy the whole buffer once per partial-write chunk.
     RcVec(Rc<Vec<u8>>),
-    /// The backing memory lives `'static` (e.g. the precomputed HELLO
-    /// ACK), so no liveness tracking is required — the kernel pointer
-    /// remains valid for the lifetime of the process.
-    Static,
 }
 
 // Manual impl (not derived): the variant fields exist purely to keep the
@@ -325,7 +321,6 @@ impl Clone for SendAlive {
             SendAlive::Pooled(rc) => SendAlive::Pooled(Rc::clone(rc)),
             SendAlive::Slot(rc) => SendAlive::Slot(Rc::clone(rc)),
             SendAlive::RcVec(rc) => SendAlive::RcVec(Rc::clone(rc)),
-            SendAlive::Static => SendAlive::Static,
         }
     }
 }

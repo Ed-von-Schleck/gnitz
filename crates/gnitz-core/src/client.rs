@@ -111,8 +111,9 @@ fn pack_col_id(owner_id: u64, col_idx: usize) -> Result<u64, ClientError> {
 /// Build the `-1` retraction batch for `pks`: the server's `retract_pk` matches
 /// by PK alone, so the payload columns are inert filler (built directly, not via
 /// `BatchAppender`, whose `add_row` takes a single scalar PK). Shared by
-/// `GnitzClient::delete` and `TxnBuffer::delete`.
-fn retraction_batch(schema: &Schema, pks: PkColumn) -> ZSetBatch {
+/// `GnitzClient::delete`, `TxnBuffer::delete`, and the SQL layer's DELETE RMW
+/// retry closure (which needs the batch without an immediate push).
+pub fn retraction_batch(schema: &Schema, pks: PkColumn) -> ZSetBatch {
     let count = pks.len();
     ZSetBatch {
         pks,
@@ -243,17 +244,49 @@ pub struct GnitzClient {
     /// rejected inside a transaction at the client's `push_ddl` choke point (and,
     /// earlier and friendlier, by the SQL front end).
     txn: Option<TxnBuffer>,
+    /// The client's OCC basis: the running maximum over server-issued watermarks
+    /// the connection has observed — seeded from the HELLO ACK at connect, then
+    /// advanced by every push / `txn_commit` ACK and every `STATUS_TXN_CONFLICT`
+    /// fresh basis. Always `≤ published()` at receipt, so it is a sound
+    /// (conservative) basis: underusing it costs at most a self-healing retry,
+    /// never a false pass. Autocommit RMW statements read it as their basis;
+    /// `BEGIN` snapshots it once for the whole transaction.
+    last_seen_lsn: u64,
 }
 
 impl GnitzClient {
     pub fn connect(socket_path: &str) -> Result<Self, ClientError> {
+        // Seed the OCC basis from the HELLO ACK watermark. A restart yields a
+        // fresh GnitzClient re-seeded from the new ACK, so a basis never spans it.
+        let (session, last_seen_lsn) = Session::connect(socket_path)?;
         Ok(GnitzClient {
-            session: Session::connect(socket_path)?,
+            session,
             index_cache: LruCache::new(SCHEMA_CACHE_CAP),
             serial_cache: HashMap::new(),
             catalog_snapshot: None,
             txn: None,
+            last_seen_lsn,
         })
+    }
+
+    /// The client's current OCC basis (running max of observed watermarks).
+    /// Exposed read-only for tests and the SQL layer's autocommit/BEGIN basis.
+    pub fn last_seen_lsn(&self) -> u64 {
+        self.last_seen_lsn
+    }
+
+    /// Advance `last_seen_lsn` from a commit reply: `Ok(lsn)` and a
+    /// `TxnConflict { fresh_basis }` both carry a server watermark `≤ published()`.
+    /// Threaded through every push / txn_commit / commit_rmw return so the basis
+    /// tracks the freshest value the connection has seen. Returns the result
+    /// unchanged.
+    fn track_lsn(&mut self, r: Result<u64, ClientError>) -> Result<u64, ClientError> {
+        match &r {
+            Ok(lsn) => self.last_seen_lsn = self.last_seen_lsn.max(*lsn),
+            Err(ClientError::TxnConflict { fresh_basis }) => self.last_seen_lsn = self.last_seen_lsn.max(*fresh_basis),
+            _ => {}
+        }
+        r
     }
 
     /// Begin a statement-scoped catalog snapshot: subsequent catalog reads
@@ -353,7 +386,40 @@ impl GnitzClient {
             txn.push_with_mode(table_id, schema, batch, mode);
             return Ok(0);
         }
-        self.session.push_with_mode(table_id, schema, batch, mode)
+        let r = self.session.push_with_mode(table_id, schema, batch, mode);
+        self.track_lsn(r)
+    }
+
+    /// Autocommit read-modify-write commit: ship a one-family, one-precondition
+    /// `FLAG_PUSH_TXN` frame asserting `table_id` has not been written since
+    /// `basis`. Returns the zone LSN on success; a `ClientError::TxnConflict`
+    /// (whose `fresh_basis` the caller adopts and re-reads with) means the table
+    /// was written since `basis`. Autocommit only — the SQL driver calls this
+    /// only when no transaction is open. Both outcomes advance `last_seen_lsn`.
+    pub fn commit_rmw(
+        &mut self,
+        table_id: u64,
+        schema: &Schema,
+        batch: &ZSetBatch,
+        mode: WireConflictMode,
+        basis: u64,
+    ) -> Result<u64, ClientError> {
+        let r = self
+            .session
+            .push_txn(&[(table_id, schema, batch, mode)], &[(table_id, basis)]);
+        self.track_lsn(r)
+    }
+
+    /// Buffer an RMW write into the open transaction AND record `table_id` in the
+    /// transaction's read-set, so `COMMIT` ships an OCC precondition for it. Used
+    /// by UPDATE / DELETE / INSERT ... ON CONFLICT, which read `table_id` before
+    /// writing. A blind INSERT uses plain `push_with_mode` and records nothing (a
+    /// blind write cannot lose an update). No-op outside a transaction.
+    pub fn txn_push_rmw(&mut self, table_id: u64, schema: &Schema, batch: &ZSetBatch, mode: WireConflictMode) {
+        if let Some(txn) = &mut self.txn {
+            txn.push_with_mode(table_id, schema, batch, mode);
+            txn.record_read(table_id);
+        }
     }
 
     pub fn scan(&mut self, table_id: u64) -> ScanResult {
@@ -623,12 +689,19 @@ impl GnitzClient {
         self.txn.is_some()
     }
 
-    /// Open a transaction. Errors if one is already open.
+    /// Open a transaction. Errors if one is already open. Snapshots the current
+    /// `last_seen_lsn` as the transaction-wide OCC basis — one value for every
+    /// read-set table (sound because `last_seen ≤ published() ≤` any later read's
+    /// snapshot; strictly conservative, and it avoids the unsound footgun of
+    /// raising a table's basis on a later scan).
     pub fn txn_begin(&mut self) -> Result<(), ClientError> {
         if self.txn.is_some() {
             return Err(ClientError::ServerError("transaction already open".into()));
         }
-        self.txn = Some(TxnBuffer::default());
+        self.txn = Some(TxnBuffer {
+            basis: self.last_seen_lsn,
+            ..Default::default()
+        });
         Ok(())
     }
 
@@ -663,7 +736,13 @@ impl GnitzClient {
             .iter()
             .map(|(tid, schema, batch, mode)| (*tid, schema, batch, *mode))
             .collect();
-        self.session.push_txn(&fam_refs)
+        // One precondition per read-set tid at the transaction-wide basis. The
+        // read-set is deduped and a subset of the buffered-write (family) tids, so
+        // every precondition tid is a family tid — the engine's `preconditions ⊆
+        // families` rule holds by construction.
+        let preconditions: Vec<(u64, u64)> = buf.read_set.iter().map(|&t| (t, buf.basis)).collect();
+        let r = self.session.push_txn(&fam_refs, &preconditions);
+        self.track_lsn(r)
     }
 
     /// The open transaction's buffer, for the SQL overlay's read-your-own-writes
@@ -1324,6 +1403,14 @@ pub struct TxnBuffer {
     /// pushes a new one. Weight-0 rows are not indexed — they are inert, exactly
     /// as the engine's fold treats them.
     last_op_of: HashMap<u64, HashMap<PkTuple, (usize, usize)>>,
+    /// The transaction-wide OCC basis, snapshotted from `last_seen_lsn` at BEGIN.
+    /// `COMMIT` ships one precondition `(tid, basis)` per read-set tid.
+    basis: u64,
+    /// The tids whose rows a buffered statement read before writing (UPDATE /
+    /// DELETE / INSERT ... ON CONFLICT that resolved `count > 0`). Deduped, and a
+    /// subset of the buffered-write (family) tids by construction — see
+    /// `record_read`. SELECT-only and blind-INSERT tids are deliberately absent.
+    read_set: Vec<u64>,
 }
 
 impl TxnBuffer {
@@ -1350,6 +1437,16 @@ impl TxnBuffer {
         }
         let batch = retraction_batch(schema, pks);
         self.append(tid, schema, batch, WireConflictMode::Update);
+    }
+
+    /// Record `tid` in the read-set (deduped). Called only when an RMW statement
+    /// buffered a write for `tid`, so the read-set stays a subset of the family
+    /// tids. The linear `contains` is cheap — the read-set holds one entry per
+    /// distinct table the transaction RMW'd, not per statement.
+    fn record_read(&mut self, tid: u64) {
+        if !self.read_set.contains(&tid) {
+            self.read_set.push(tid);
+        }
     }
 
     /// Append one op's `batch` to `tid`'s current run, or open a new family when

@@ -9,7 +9,7 @@ use gnitz_core::{Circuit, CircuitBuilder, ExprBuilder, ExprProgram, GnitzClient}
 use gnitz_core::{
     ColData, ColumnDef, PkColumn, Schema, TypeCode, WireConflictMode, ZSetBatch, MAX_COLUMNS, MAX_PK_BYTES,
 };
-use gnitz_sql::{SqlPlanner, SqlResult};
+use gnitz_sql::{GnitzSqlError, SqlPlanner, SqlResult};
 
 /// The `(schema, data_batch, lsn)` a sync scan/seek/push resolves to.
 type ClientResponse = Result<(Option<Arc<Schema>>, Option<ZSetBatch>, u64), gnitz_core::ClientError>;
@@ -19,6 +19,11 @@ type ClientResponse = Result<(Option<Arc<Schema>>, Option<ZSetBatch>, u64), gnit
 // ---------------------------------------------------------------------------
 
 pyo3::create_exception!(_native, GnitzError, pyo3::exceptions::PyException);
+// A user-table transaction failed its OCC precondition (STATUS_TXN_CONFLICT): a
+// table it read was written concurrently. A subtype of GnitzError, so existing
+// `except GnitzError` handlers still catch it, while applications that want to
+// retry can `except GnitzConflictError`.
+pyo3::create_exception!(_native, GnitzConflictError, GnitzError);
 
 /// Map any `Display` error into a `GnitzError` PyErr. The orphan rule blocks
 /// `impl From<ClientError> for PyErr`, so this free helper carries the
@@ -27,6 +32,32 @@ pyo3::create_exception!(_native, GnitzError, pyo3::exceptions::PyException);
 /// their explicit construction.
 fn to_py_err<T, E: std::fmt::Display>(res: Result<T, E>) -> PyResult<T> {
     res.map_err(|e| GnitzError::new_err(e.to_string()))
+}
+
+/// Map a SQL execution error to a Python exception. An OCC conflict
+/// (`GnitzSqlError::Conflict`) routes to the dedicated, retryable
+/// `GnitzConflictError`; everything else falls back to the generic `GnitzError`.
+/// The `Conflict` Display already synthesizes the user-facing message (naming the
+/// table for an autocommit statement), so `to_string` carries it verbatim.
+fn sql_err_to_py(e: GnitzSqlError) -> PyErr {
+    let msg = e.to_string();
+    match e {
+        GnitzSqlError::Conflict { .. } => GnitzConflictError::new_err(msg),
+        _ => GnitzError::new_err(msg),
+    }
+}
+
+/// Map a client error to a Python exception, routing a `TxnConflict` to the
+/// dedicated retryable `GnitzConflictError` (everything else → `GnitzError`).
+/// The `execute_sql` surface converts conflicts one layer up via `sql_err_to_py`;
+/// this is the analogue for the raw `client.transaction()` commit path, whose
+/// shared buffer can carry an SQL RMW read-set and so can lose the race at COMMIT.
+fn client_err_to_py(e: gnitz_core::ClientError) -> PyErr {
+    let msg = e.to_string();
+    match e {
+        gnitz_core::ClientError::TxnConflict { .. } => GnitzConflictError::new_err(msg),
+        _ => GnitzError::new_err(msg),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1425,6 +1456,16 @@ impl PyGnitzClient {
         to_py_err(GnitzClient::connect(socket_path)).map(|c| PyGnitzClient { inner: Some(c) })
     }
 
+    /// The client's current OCC basis (the running max of observed server
+    /// watermarks, seeded from the HELLO ACK at connect). Read-only, for tests.
+    #[getter]
+    fn last_seen_lsn(&self) -> PyResult<u64> {
+        self.inner
+            .as_ref()
+            .map(|c| c.last_seen_lsn())
+            .ok_or_else(|| GnitzError::new_err("client already closed"))
+    }
+
     pub fn close(&mut self) {
         if let Some(c) = self.inner.take() {
             c.close();
@@ -1671,7 +1712,9 @@ impl PyGnitzClient {
     pub fn execute_sql(&mut self, py: Python<'_>, sql: &str, schema_name: &str) -> PyResult<PyObject> {
         // Plan + execute (all wire I/O, no Python) with the GIL released.
         let client_ref = client!(self);
-        let results = to_py_err(py.allow_threads(|| SqlPlanner::new(client_ref, schema_name).execute(sql)))?;
+        let results = py
+            .allow_threads(|| SqlPlanner::new(client_ref, schema_name).execute(sql))
+            .map_err(sql_err_to_py)?;
 
         let py_list = PyList::empty(py);
         for r in results {
@@ -1836,7 +1879,7 @@ impl PyTxn {
             .inner
             .as_mut()
             .ok_or_else(|| GnitzError::new_err("client already closed"))?;
-        to_py_err(f(c))
+        f(c).map_err(client_err_to_py)
     }
 }
 
@@ -2166,9 +2209,11 @@ impl PyAsyncTransport {
         // payload limit before the I/O thread starts queueing reads. Drop
         // the GIL across the blocking syscalls so other Python threads
         // can progress if the server is slow to respond.
+        // The async transport builds a bare `Session`, not a `GnitzClient`, so it
+        // tracks no OCC basis — the HELLO ACK's `published_lsn` is discarded here.
         let (transport, max_payload_len) = to_py_err(py.allow_threads(|| {
             let mut t = gnitz_core::ClientTransport::connect(socket_path)?;
-            let limit = gnitz_core::hello_handshake(&mut t)?;
+            let (limit, _published_lsn) = gnitz_core::hello_handshake(&mut t)?;
             Ok::<_, gnitz_core::ProtocolError>((t, limit as usize))
         }))?;
         let waker = to_py_err(transport.waker())?;
@@ -2486,6 +2531,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCircuit>()?;
     m.add_class::<PyAsyncTransport>()?;
     m.add("GnitzError", m.py().get_type::<GnitzError>())?;
+    m.add("GnitzConflictError", m.py().get_type::<GnitzConflictError>())?;
     // System-table IDs — single-sourced from gnitz_wire (delegating codec, not
     // a re-typed copy). `_types.py`'s TypeCode IntEnum stays literal (verified
     // in sync with wire; drift is self-detecting E2E).

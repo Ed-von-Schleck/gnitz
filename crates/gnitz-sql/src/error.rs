@@ -7,6 +7,15 @@ pub enum GnitzSqlError {
     Plan(String),
     Exec(gnitz_core::ClientError),
     Unsupported(String),
+    /// An OCC precondition failed (a read table was written concurrently) and the
+    /// statement could not commit lose-update-free. `table` names the conflicting
+    /// table for an autocommit RMW statement; `None` for a `BEGIN`/`COMMIT`
+    /// transaction (the conflict spans statements). The language bindings map this
+    /// to a dedicated retryable error (Python `GnitzConflictError`, C
+    /// `GNITZ_ERR_TXN_CONFLICT`), distinct from a generic `Exec` failure.
+    Conflict {
+        table: Option<String>,
+    },
 }
 
 impl fmt::Display for GnitzSqlError {
@@ -17,6 +26,12 @@ impl fmt::Display for GnitzSqlError {
             GnitzSqlError::Plan(s) => write!(f, "plan error: {s}"),
             GnitzSqlError::Exec(e) => write!(f, "exec error: {e}"),
             GnitzSqlError::Unsupported(s) => write!(f, "unsupported: {s}"),
+            GnitzSqlError::Conflict { table: Some(t) } => {
+                write!(f, "transaction conflict on table '{t}'; retry the statement")
+            }
+            GnitzSqlError::Conflict { table: None } => {
+                write!(f, "transaction conflict; retry the transaction")
+            }
         }
     }
 }

@@ -15,6 +15,8 @@ typedef struct GnitzCircuitBuilder GnitzCircuitBuilder;
 typedef struct GnitzCircuit        GnitzCircuit;
 
 
+#define GNITZ_ERR_TXN_CONFLICT -2
+
 #define GNITZ_TYPE_U8 1
 
 #define GNITZ_TYPE_I8 2

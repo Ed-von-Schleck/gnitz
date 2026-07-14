@@ -21,6 +21,7 @@ pub use gnitz_wire::{
     wire_flags_set_index_version, wire_flags_set_schema_version, WireConflictMode, FLAG_BATCH_CONSOLIDATED,
     FLAG_BATCH_SORTED, FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_GET_INDICES, FLAG_HAS_DATA, FLAG_HAS_SCHEMA,
     META_FLAG_IS_PK, META_FLAG_NULLABLE, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
+    STATUS_TXN_CONFLICT,
 };
 
 /// Map a batch's layout claim to its wire flag bits. Encode normalizes
@@ -930,12 +931,22 @@ pub struct TxnFamilyWire<'a> {
     pub wal_block: &'a [u8],
 }
 
-/// Decode a `FLAG_PUSH_TXN` frame into its per-family list, in send order — the
-/// user-table analogue of `decode_ddl_txn`. The frame is: control block, `u32`
-/// family count, then per family a `u8` conflict mode, a self-sized meta-schema
-/// WAL block, and a self-sized data WAL block, each walked by header. Truncation
-/// at any field rejects the whole frame.
-pub fn decode_push_txn(data: &[u8]) -> Result<Vec<TxnFamilyWire<'_>>, &'static str> {
+/// The two lists a `FLAG_PUSH_TXN` frame decodes to: its per-family write bundle
+/// and its OCC preconditions (each `(tid, basis_lsn)`). Named to keep
+/// `decode_push_txn`'s signature legible (and clear of `clippy::type_complexity`).
+pub type DecodedPushTxn<'a> = (Vec<TxnFamilyWire<'a>>, Vec<(i64, u64)>);
+
+/// Decode a `FLAG_PUSH_TXN` frame into its per-family list plus its OCC
+/// precondition list, in send order — the user-table analogue of
+/// `decode_ddl_txn`. The frame is: control block, `u32` family count, then per
+/// family a `u8` conflict mode, a self-sized meta-schema WAL block, and a
+/// self-sized data WAL block; then — appended after the last family — a `u32`
+/// precondition count and that many `[u64 tid][u64 basis_lsn]` pairs (all LE).
+/// The precondition section is always present (a zero count still encodes its
+/// 4-byte length). Truncation at any field rejects the whole frame. The section
+/// is appended *after* the families (not before `family_count`) so the shared
+/// `txn_frame_prologue` and `decode_ddl_txn` are untouched.
+pub fn decode_push_txn(data: &[u8]) -> Result<DecodedPushTxn<'_>, &'static str> {
     // A family is at least a mode byte plus two WAL headers (schema + data).
     let (count, mut off, cap) = txn_frame_prologue(data, 1 + 2 * gnitz_wire::WAL_HEADER_SIZE)?;
     let mut families = Vec::with_capacity(cap);
@@ -957,7 +968,26 @@ pub fn decode_push_txn(data: &[u8]) -> Result<Vec<TxnFamilyWire<'_>>, &'static s
             wal_block,
         });
     }
-    Ok(families)
+    // Precondition section: `u32` count, then count × `[u64 tid][u64 basis]`.
+    if off + 4 > data.len() {
+        return Err("PUSH_TXN precondition count truncated");
+    }
+    let pre_count = codec::read_u32_le(data, off) as usize;
+    off += 4;
+    // Bound the count by the bytes physically remaining (16 per precondition) so
+    // a hostile count cannot force a giant pre-allocation, and the reads below
+    // stay in bounds.
+    if pre_count > data.len().saturating_sub(off) / 16 {
+        return Err("PUSH_TXN precondition section truncated");
+    }
+    let mut preconditions = Vec::with_capacity(pre_count);
+    for _ in 0..pre_count {
+        let tid = codec::read_u64_le(data, off) as i64;
+        let basis = codec::read_u64_le(data, off + 8);
+        off += 16;
+        preconditions.push((tid, basis));
+    }
+    Ok((families, preconditions))
 }
 
 /// Like `decode_wire` but skips WAL block checksum verification.  Use for

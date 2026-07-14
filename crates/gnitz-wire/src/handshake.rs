@@ -23,14 +23,16 @@ pub const MAX_FRAME_PAYLOAD_CLIENT: usize = 256 * 1024 * 1024; // 256 MB
 //   HELLO  (client → server, total wire size 12 bytes)
 //     [length=8 LE u32][magic: u32 LE][version: u16 LE][flags: u16 LE]
 //
-//   ACK    (server → client on success, total wire size 16 bytes)
-//     [length=12 LE u32][magic: u32 LE][status: u16 LE][_pad: u16 LE]
-//     [limit_bytes: u32 LE]
+//   ACK    (server → client on success, total wire size 24 bytes)
+//     [length=20 LE u32][magic: u32 LE][status: u16 LE][_pad: u16 LE]
+//     [limit_bytes: u32 LE][published_lsn: u64 LE]
 //
-// On version mismatch / auth failure the server replies with a standard
-// length-prefixed STATUS_ERROR control block and closes the fd. The length
-// prefix alone discriminates: 8 ⇒ HELLO, 12 ⇒ ACK, anything else ⇒ control
-// block. Magic checks remain as defence-in-depth.
+// The trailing `published_lsn` seeds the client's OCC basis (the durability
+// watermark at connect), so every connection starts with a basis and needs no
+// separate watermark read. On version mismatch / auth failure the server
+// replies with a standard length-prefixed STATUS_ERROR control block and closes
+// the fd. The length prefix alone discriminates: 8 ⇒ HELLO, 20 ⇒ ACK, anything
+// else ⇒ control block. Magic checks remain as defence-in-depth.
 
 /// Magic value carried in HELLO and ACK frames. ASCII "GNTZ" interpreted
 /// as a little-endian u32. Defence-in-depth on top of the length-prefix
@@ -47,7 +49,7 @@ pub const ALPN_GNITZ: &[u8] = b"gnitz/1";
 pub const HELLO_PAYLOAD_LEN: u32 = 8;
 
 /// ACK payload length in bytes (excluding the 4-byte length prefix).
-pub const HELLO_ACK_PAYLOAD_LEN: u32 = 12;
+pub const HELLO_ACK_PAYLOAD_LEN: u32 = 20;
 
 /// Total wire size of an ACK frame (length prefix + payload).
 pub const HELLO_ACK_FRAME_SIZE: usize = 4 + HELLO_ACK_PAYLOAD_LEN as usize;
@@ -87,23 +89,29 @@ pub fn decode_hello_payload(payload: &[u8]) -> Result<HelloHeader, &'static str>
 }
 
 /// Build an ACK frame ready to ship over the wire (length prefix + payload).
-pub const fn encode_hello_ack(status: u16, limit_bytes: u32) -> [u8; HELLO_ACK_FRAME_SIZE] {
+/// `published_lsn` is the server's durability watermark at connect, seeding the
+/// client's OCC basis. Still a `const fn` — callers pass a runtime `published_lsn`
+/// and materialise the array on the stack.
+pub const fn encode_hello_ack(status: u16, limit_bytes: u32, published_lsn: u64) -> [u8; HELLO_ACK_FRAME_SIZE] {
     let len = HELLO_ACK_PAYLOAD_LEN.to_le_bytes();
     let mag = HELLO_MAGIC.to_le_bytes();
     let st = status.to_le_bytes();
     let lim = limit_bytes.to_le_bytes();
+    let lsn = published_lsn.to_le_bytes();
     [
         len[0], len[1], len[2], len[3], mag[0], mag[1], mag[2], mag[3], st[0], st[1], 0, 0, // _pad
-        lim[0], lim[1], lim[2], lim[3],
+        lim[0], lim[1], lim[2], lim[3], lsn[0], lsn[1], lsn[2], lsn[3], lsn[4], lsn[5], lsn[6], lsn[7],
     ]
 }
 
-/// Parsed ACK payload (the 12 bytes following the length prefix).
+/// Parsed ACK payload (the 20 bytes following the length prefix).
 #[derive(Debug, Clone, Copy)]
 pub struct HelloAck {
     pub magic: u32,
     pub status: u16,
     pub limit_bytes: u32,
+    /// Server durability watermark at connect — the client's initial OCC basis.
+    pub published_lsn: u64,
 }
 
 /// Decode an ACK payload. The caller must have already consumed the
@@ -116,10 +124,12 @@ pub fn decode_hello_ack(payload: &[u8]) -> Result<HelloAck, &'static str> {
     let status = u16::from_le_bytes(payload[4..6].try_into().unwrap());
     // bytes [6..8] are reserved padding
     let limit_bytes = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+    let published_lsn = u64::from_le_bytes(payload[12..20].try_into().unwrap());
     Ok(HelloAck {
         magic,
         status,
         limit_bytes,
+        published_lsn,
     })
 }
 
@@ -169,7 +179,7 @@ mod hello_tests {
 
     #[test]
     fn ack_frame_layout_is_stable() {
-        let ack = encode_hello_ack(HELLO_STATUS_OK, 16 * 1024 * 1024);
+        let ack = encode_hello_ack(HELLO_STATUS_OK, 16 * 1024 * 1024, 0x0102_0304_0506_0708);
         assert_eq!(ack.len(), HELLO_ACK_FRAME_SIZE);
         let prefix = u32::from_le_bytes(ack[0..4].try_into().unwrap());
         assert_eq!(prefix, HELLO_ACK_PAYLOAD_LEN);
@@ -180,17 +190,20 @@ mod hello_tests {
         // [10..12] are reserved padding.
         let limit = u32::from_le_bytes(ack[12..16].try_into().unwrap());
         assert_eq!(limit, 16 * 1024 * 1024);
+        let published_lsn = u64::from_le_bytes(ack[16..24].try_into().unwrap());
+        assert_eq!(published_lsn, 0x0102_0304_0506_0708);
     }
 
     #[test]
     fn ack_decode_roundtrip() {
         // Raw non-zero status (not HELLO_STATUS_OK=0) so the round-trip proves
         // status is read from its own offset, distinct from the zero `_pad`.
-        let ack = encode_hello_ack(1, 64 * 1024 * 1024);
+        let ack = encode_hello_ack(1, 64 * 1024 * 1024, 42);
         let parsed = decode_hello_ack(&ack[4..]).unwrap();
         assert_eq!(parsed.magic, HELLO_MAGIC);
         assert_eq!(parsed.status, 1);
         assert_eq!(parsed.limit_bytes, 64 * 1024 * 1024);
+        assert_eq!(parsed.published_lsn, 42);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::runtime::wire::{
-    batch_to_schema, build_schema_wire_block, decode_wire, encode_ctrl_block_direct, encode_wire, encode_wire_into,
-    peek_client_control, peek_control_block, schema_to_batch, wire_size, CTRL_BLOCK_SIZE_NO_BLOB, STATUS_ERROR,
-    STATUS_OK,
+    batch_to_schema, build_schema_wire_block, decode_ddl_txn, decode_push_txn, decode_wire, encode_ctrl_block_direct,
+    encode_wire, encode_wire_into, peek_client_control, peek_control_block, schema_to_batch, wire_size,
+    CTRL_BLOCK_SIZE_NO_BLOB, STATUS_ERROR, STATUS_OK,
 };
 use crate::schema::{encode_german_string, try_decode_german_string, type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, Layout};
@@ -948,4 +948,113 @@ fn ctrl_block_seek_pk_extra_roundtrip() {
     assert_eq!(dec.error_msg, err);
     assert_eq!(dec.seek_pk_extra, extra);
     assert_eq!(dec.status, STATUS_ERROR);
+}
+
+// ---------------------------------------------------------------------------
+// PUSH_TXN / DDL_TXN frame decode: precondition section appended after families
+// ---------------------------------------------------------------------------
+//
+// These decode the *client* encoder's output (`gnitz_core::protocol::encode_*`)
+// rather than a hand-assembled frame, so a cross-crate wire-layout drift fails
+// here — the same client-encode → engine-decode discipline as the sibling
+// `ddl_txn_roundtrip_client_to_server`.
+
+use gnitz_core::protocol::types::{BatchAppender, Schema, ZSetBatch};
+use gnitz_core::{ColumnDef, TypeCode, WireConflictMode};
+
+/// A minimal client-side `(id U64 PK, val U64)` schema.
+fn core_schema() -> Schema {
+    Schema {
+        columns: vec![
+            ColumnDef::new("id", TypeCode::U64, false),
+            ColumnDef::new("val", TypeCode::U64, false),
+        ],
+        pk_cols: vec![0],
+    }
+}
+
+/// A one-row batch for `core_schema` — inert filler; the decode tests inspect
+/// only each family's tid/mode, never its payload.
+fn core_batch(schema: &Schema) -> ZSetBatch {
+    let mut batch = ZSetBatch::new(schema);
+    BatchAppender::new(&mut batch, schema).add_row(1, 1).u64_val(42);
+    batch
+}
+
+/// A real `FLAG_PUSH_TXN` frame built by the client encoder from `(tid, mode)`
+/// families and `(tid, basis)` preconditions.
+fn push_txn_frame(families: &[(u64, WireConflictMode)], preconditions: &[(u64, u64)]) -> Vec<u8> {
+    let schema = core_schema();
+    let batch = core_batch(&schema);
+    let fams: Vec<(u64, &Schema, &ZSetBatch, WireConflictMode)> = families
+        .iter()
+        .map(|&(tid, mode)| (tid, &schema, &batch, mode))
+        .collect();
+    gnitz_core::protocol::encode_push_txn(0xABCD, &fams, preconditions)
+}
+
+#[test]
+fn decode_push_txn_zero_preconditions() {
+    let frame = push_txn_frame(&[(5, WireConflictMode::Update)], &[]);
+    let (fams, pre) = decode_push_txn(&frame).unwrap();
+    assert_eq!(fams.len(), 1);
+    assert_eq!(fams[0].tid, 5);
+    assert!(pre.is_empty(), "a zero count still self-delimits; no preconditions");
+}
+
+#[test]
+fn decode_push_txn_one_precondition() {
+    let frame = push_txn_frame(&[(5, WireConflictMode::Update)], &[(5, 99)]);
+    let (fams, pre) = decode_push_txn(&frame).unwrap();
+    assert_eq!(fams.len(), 1);
+    assert_eq!(pre, vec![(5, 99)]);
+}
+
+#[test]
+fn decode_push_txn_n_preconditions_after_multiple_families() {
+    let frame = push_txn_frame(
+        &[(5, WireConflictMode::Update), (6, WireConflictMode::Error)],
+        &[(5, 10), (6, 20), (5, 30)],
+    );
+    let (fams, pre) = decode_push_txn(&frame).unwrap();
+    assert_eq!(fams.len(), 2);
+    assert_eq!(fams[0].tid, 5);
+    assert_eq!(fams[1].tid, 6);
+    assert_eq!(
+        fams[1].mode,
+        WireConflictMode::Error.as_u8(),
+        "mode byte walks with the family"
+    );
+    assert_eq!(pre, vec![(5, 10), (6, 20), (5, 30)]);
+}
+
+#[test]
+fn decode_push_txn_truncated_precondition_count_errs() {
+    let mut frame = push_txn_frame(&[(5, WireConflictMode::Update)], &[]);
+    frame.truncate(frame.len() - 2); // chop into the 4-byte count
+    assert!(decode_push_txn(&frame).is_err(), "a truncated count is a decode error");
+}
+
+#[test]
+fn decode_push_txn_truncated_precondition_body_errs() {
+    let mut frame = push_txn_frame(&[(5, WireConflictMode::Update)], &[(5, 99)]);
+    frame.truncate(frame.len() - 4); // count says 1 but the pair is short
+    assert!(decode_push_txn(&frame).is_err(), "a truncated body is a decode error");
+}
+
+#[test]
+fn decode_ddl_txn_is_unaffected_by_the_appended_section() {
+    // A DDL frame is control block + family count + data blocks (no mode byte,
+    // no schema block, no precondition section). decode_ddl_txn shares only the
+    // prologue with decode_push_txn, so it must still walk families cleanly.
+    let schema = core_schema();
+    let fams = vec![
+        (5u64, &schema, core_batch(&schema)),
+        (6u64, &schema, core_batch(&schema)),
+    ];
+    let payload = gnitz_core::protocol::encode_ddl_txn(0xABCD, &fams);
+    let decoded = decode_ddl_txn(&payload).unwrap();
+    assert_eq!(decoded.len(), 2);
+    assert_eq!(decoded[0].0, 5);
+    assert_eq!(decoded[1].0, 6);
 }

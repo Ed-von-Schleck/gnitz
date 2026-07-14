@@ -9,7 +9,7 @@ use crate::protocol::{
     wire_flags_set_index_version, wire_flags_set_schema_version, ClientTransport, Message, PkTuple, ProtocolError,
     Schema, WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE,
     FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_GET_INDICES, FLAG_PUSH, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
-    FLAG_SEEK_BY_INDEX_RANGE, STATUS_ERROR, STATUS_NO_INDEX, STATUS_SCHEMA_MISMATCH,
+    FLAG_SEEK_BY_INDEX_RANGE, STATUS_ERROR, STATUS_NO_INDEX, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
 };
 use lru::LruCache;
 
@@ -43,6 +43,14 @@ fn check_response(msg: Message) -> Result<Message, ClientError> {
     }
     if msg.status == STATUS_NO_INDEX {
         return Err(ClientError::NoIndex);
+    }
+    if msg.status == STATUS_TXN_CONFLICT {
+        // Control-only frame: the fresh basis rides in `seek_pk`. Left as a
+        // structured error so the SQL layer can retry (autocommit) or surface
+        // it (BEGIN/COMMIT); the human-readable text is synthesized upstream.
+        return Err(ClientError::TxnConflict {
+            fresh_basis: msg.seek_pk as u64,
+        });
     }
     if msg.status == STATUS_ERROR {
         // Fall back to the default text on an empty string, not only on None:
@@ -78,14 +86,17 @@ pub struct Session {
 
 impl Session {
     /// `target` is an AF_UNIX socket path or a `tls://HOST:PORT[?PARAM]`
-    /// address (see `ClientTransport::connect`).
-    pub fn connect(target: &str) -> Result<Self, ClientError> {
+    /// address (see `ClientTransport::connect`). Returns the session paired with
+    /// the server durability watermark from the HELLO ACK, which
+    /// `GnitzClient::connect` adopts as the seed for its OCC basis.
+    pub fn connect(target: &str) -> Result<(Self, u64), ClientError> {
         let mut transport = ClientTransport::connect(target)?;
         // Run the HELLO handshake before any data flows. The server
         // accepts the first frame at an 8-byte limit, so this must
         // happen before `send_message` would emit a control block.
-        let limit = hello_handshake(&mut transport)?;
-        Ok(Session::from_transport(transport, new_client_id(), limit as usize))
+        let (limit, published_lsn) = hello_handshake(&mut transport)?;
+        let session = Session::from_transport(transport, new_client_id(), limit as usize);
+        Ok((session, published_lsn))
     }
 
     /// Wrap an already-connected, already-handshaken transport. Used by the
@@ -190,11 +201,20 @@ impl Session {
     /// family's batch is validated client-side before encoding, and the encoded
     /// frame is bounds-checked against the server ingress cap so an oversized
     /// bundle fails locally rather than being truncated on the wire.
-    pub fn push_txn(&mut self, families: &[(u64, &Schema, &ZSetBatch, WireConflictMode)]) -> Result<u64, ClientError> {
+    ///
+    /// `preconditions` carries the OCC `(tid, basis)` assertions ("`tid` not
+    /// written since `basis`"); the server rejects the whole transaction with
+    /// `ClientError::TxnConflict` if any fails. Every precondition tid must be a
+    /// family tid (the engine rejects otherwise). Pass an empty slice for none.
+    pub fn push_txn(
+        &mut self,
+        families: &[(u64, &Schema, &ZSetBatch, WireConflictMode)],
+        preconditions: &[(u64, u64)],
+    ) -> Result<u64, ClientError> {
         for (_, schema, batch, _) in families {
             batch.validate(schema).map_err(ClientError::ServerError)?;
         }
-        let payload = encode_push_txn(self.client_id, families);
+        let payload = encode_push_txn(self.client_id, families, preconditions);
         if payload.len() > gnitz_wire::MAX_FRAME_PAYLOAD_SERVER {
             return Err(ClientError::ServerError(format!(
                 "transaction frame is {} bytes, exceeding the {}-byte server ingress cap; split the transaction",

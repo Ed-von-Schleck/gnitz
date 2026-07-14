@@ -14,7 +14,8 @@ pub use circuit::{
     RangeRel, ReduceOutKey, TableId,
 };
 pub use client::{
-    hidden_view_name, GnitzClient, IndexMeta, InlineUniqueIndex, PlannedView, TxnBuffer, MAX_CHAIN_SEGMENTS,
+    hidden_view_name, retraction_batch, GnitzClient, IndexMeta, InlineUniqueIndex, PlannedView, TxnBuffer,
+    MAX_CHAIN_SEGMENTS,
 };
 pub use connection::{
     ScanResult, Session, COL_TAB, DEP_TAB, FIRST_USER_SCHEMA_ID, FIRST_USER_TABLE_ID, IDX_TAB, SCHEMA_TAB, SEQ_TAB,

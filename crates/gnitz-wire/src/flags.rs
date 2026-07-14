@@ -218,6 +218,13 @@ pub const STATUS_SCHEMA_MISMATCH: u32 = 2;
 /// (no schema/data/error payload); the SQL planner uses it to fall back to a
 /// scan or a CREATE INDEX hint without a prior catalog probe.
 pub const STATUS_NO_INDEX: u32 = 3;
+/// A user-table TXN failed an OCC precondition: some table it declared a basis
+/// for was written since that basis. Control-only frame carrying the fresh basis
+/// (`published()`) in `seek_pk` and an empty message; the client synthesizes any
+/// human-readable text from the tid it sent and either retries (autocommit RMW)
+/// or surfaces the conflict (BEGIN/COMMIT). Cleanly retryable — nothing validated,
+/// nothing written.
+pub const STATUS_TXN_CONFLICT: u32 = 4;
 
 pub const META_FLAG_NULLABLE: u64 = 1;
 pub const META_FLAG_IS_PK: u64 = 2;

@@ -232,14 +232,6 @@ impl Reactor {
         }
     }
 
-    /// Send a `'static` byte buffer (e.g. the precomputed HELLO ACK): no
-    /// per-connection allocation or liveness tracking is required — the
-    /// kernel pointer remains valid for the lifetime of the process.
-    pub async fn send_static(&self, fd: i32, bytes: &'static [u8]) -> i32 {
-        self.send_buf_inner(fd, bytes.as_ptr(), bytes.len(), SendAlive::Static)
-            .await
-    }
-
     /// Common send loop. `alive` keeps the backing memory valid until the CQE fires.
     async fn send_buf_inner(&self, fd: i32, ptr: *const u8, len: usize, alive: SendAlive) -> i32 {
         let mut sent: usize = 0;

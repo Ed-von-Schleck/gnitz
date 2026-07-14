@@ -10,12 +10,15 @@ use crate::codec::colwrite::{append_column_value, ColumnValue};
 use crate::codec::nullmap::null_word_set;
 use crate::dml::overlay::{buffered_all, buffered_keys, overlay_batch, Net};
 use crate::dml::plan::{classify_access, collect_index_seek_candidates, seek_pk_multi, AccessPath};
+use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
 use crate::error::GnitzSqlError;
 use crate::exec::eval::eval_expr;
 use crate::exec::residual::{bind_residuals, matching_indices};
 use crate::ir::BoundExpr;
 use crate::SqlResult;
-use gnitz_core::{ClientError, ColData, GnitzClient, PkColumn, PkTuple, Schema, WireConflictMode, ZSetBatch};
+use gnitz_core::{
+    retraction_batch, ClientError, ColData, GnitzClient, PkColumn, PkTuple, Schema, WireConflictMode, ZSetBatch,
+};
 use sqlparser::ast::{Assignment, AssignmentTarget, Expr, FromTable, Statement};
 use std::sync::Arc;
 
@@ -306,20 +309,33 @@ pub(crate) fn execute_update(
         assignments.push((col_idx, bound_val));
     }
 
-    let resolved = resolve_where_rows(client, table_id, &schema, selection.as_ref())?;
-    let actual_schema = resolved.schema.as_deref().unwrap_or(&*schema);
-    let count = resolved.matched.len();
-    if count > 0 {
-        let mut updates = ZSetBatch::new(actual_schema);
-        write_set_rows(
-            &resolved.batch,
-            &resolved.matched,
-            &assignments,
-            actual_schema,
-            &mut updates,
-        )?;
-        client.push_with_mode(table_id, actual_schema, &updates, WireConflictMode::Update)?;
-    }
+    // Read the target rows and build the SET batch under the RMW driver: an
+    // autocommit UPDATE commits it lose-update-free via a one-precondition TXN
+    // frame with bounded retry; inside a transaction it buffers and records the
+    // read-set. The build re-runs per retry so a conflict re-reads fresh state.
+    let count = commit_rmw_or_buffer(client, &table_name, table_id, |client| {
+        let resolved = resolve_where_rows(client, table_id, &schema, selection.as_ref())?;
+        let actual_schema = resolved.schema.as_deref().unwrap_or(&*schema);
+        let count = resolved.matched.len();
+        let write = if count > 0 {
+            let mut updates = ZSetBatch::new(actual_schema);
+            write_set_rows(
+                &resolved.batch,
+                &resolved.matched,
+                &assignments,
+                actual_schema,
+                &mut updates,
+            )?;
+            Some(RmwWrite {
+                schema: actual_schema.clone(),
+                batch: updates,
+                mode: WireConflictMode::Update,
+            })
+        } else {
+            None
+        };
+        Ok(RmwBuild { count, write })
+    })?;
     Ok(SqlResult::RowsAffected { count })
 }
 
@@ -350,24 +366,36 @@ pub(crate) fn execute_delete(
 
     let (table_id, schema) = binder.resolve_base_table(client, &table_name)?;
 
-    let resolved = resolve_where_rows(client, table_id, &schema, del.selection.as_ref())?;
-    let actual_schema = resolved.schema.as_deref().unwrap_or(&*schema);
-    let count = resolved.matched.len();
-    if count > 0 {
-        let batch = resolved.batch;
-        // Whole batch matched (the common no-WHERE `DELETE FROM t`): move the
-        // PK region wholesale rather than copying it row by row.
-        let pks = if count == batch.pks.len() {
-            batch.pks
+    // Resolve the target PKs and build the retraction batch under the RMW driver
+    // (autocommit: one-precondition TXN frame with bounded retry; in a
+    // transaction: buffer + record the read-set). The build re-runs per retry.
+    let count = commit_rmw_or_buffer(client, &table_name, table_id, |client| {
+        let resolved = resolve_where_rows(client, table_id, &schema, del.selection.as_ref())?;
+        let actual_schema = resolved.schema.as_deref().unwrap_or(&*schema);
+        let count = resolved.matched.len();
+        let write = if count > 0 {
+            let batch = resolved.batch;
+            // Whole batch matched (the common no-WHERE `DELETE FROM t`): move the
+            // PK region wholesale rather than copying it row by row.
+            let pks = if count == batch.pks.len() {
+                batch.pks
+            } else {
+                let mut out_pks = PkColumn::empty_for_schema(actual_schema);
+                for &i in &resolved.matched {
+                    out_pks.push_from(&batch.pks, i);
+                }
+                out_pks
+            };
+            Some(RmwWrite {
+                schema: actual_schema.clone(),
+                batch: retraction_batch(actual_schema, pks),
+                mode: WireConflictMode::Update,
+            })
         } else {
-            let mut out_pks = PkColumn::empty_for_schema(actual_schema);
-            for &i in &resolved.matched {
-                out_pks.push_from(&batch.pks, i);
-            }
-            out_pks
+            None
         };
-        client.delete(table_id, actual_schema, pks)?;
-    }
+        Ok(RmwBuild { count, write })
+    })?;
     Ok(SqlResult::RowsAffected { count })
 }
 

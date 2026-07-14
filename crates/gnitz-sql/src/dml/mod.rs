@@ -14,6 +14,7 @@ mod insert;
 mod mutate;
 mod overlay;
 mod plan;
+mod rmw;
 mod select;
 
 pub(crate) use insert::execute_insert;

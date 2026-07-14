@@ -234,12 +234,21 @@ pub fn encode_schema_block(schema: &Schema, tid: u32) -> Vec<u8> {
 /// Layout: the reused control block (`target_id = 0`, `flags = FLAG_PUSH_TXN`),
 /// then `u32` family count, then per family — a `u8` conflict mode, the family's
 /// meta-schema block (**always present**, via `encode_schema_block`), and the
-/// data WAL block (via `encode_wal_block`). Both per-family blocks self-size via
-/// their WAL header (`table_id` at WAL_OFF_TID, total size at WAL_OFF_SIZE), so
-/// the engine decoder walks the list by header with no redundant length
-/// prefixes; the schema block lets the master validate each family against its
-/// catalog with no warm-cache version, exactly as the DDL_TXN frame does.
-pub fn encode_push_txn(client_id: u64, families: &[(u64, &Schema, &ZSetBatch, WireConflictMode)]) -> Vec<u8> {
+/// data WAL block (via `encode_wal_block`); then, appended after the last family,
+/// the OCC precondition section: a `u32` count and that many `[u64 tid][u64
+/// basis]` pairs (all LE). Both per-family blocks self-size via their WAL header
+/// (`table_id` at WAL_OFF_TID, total size at WAL_OFF_SIZE), so the engine decoder
+/// walks the list by header with no redundant length prefixes, then reads the
+/// precondition section from the trailing offset; the schema block lets the
+/// master validate each family against its catalog with no warm-cache version,
+/// exactly as the DDL_TXN frame does. A `preconditions` slice of `(tid, basis)`
+/// asserts "no commit has written `tid` with a zone LSN greater than `basis`";
+/// an empty slice appends a zero count (four bytes).
+pub fn encode_push_txn(
+    client_id: u64,
+    families: &[(u64, &Schema, &ZSetBatch, WireConflictMode)],
+    preconditions: &[(u64, u64)],
+) -> Vec<u8> {
     let ctrl_hdr = Header {
         status: STATUS_OK,
         target_id: 0,
@@ -255,6 +264,11 @@ pub fn encode_push_txn(client_id: u64, families: &[(u64, &Schema, &ZSetBatch, Wi
         out.push(mode.as_u8());
         out.extend_from_slice(&encode_schema_block(schema, *tid as u32));
         out.extend_from_slice(&encode_wal_block(schema, *tid as u32, batch));
+    }
+    out.extend_from_slice(&(preconditions.len() as u32).to_le_bytes());
+    for (tid, basis) in preconditions {
+        out.extend_from_slice(&tid.to_le_bytes());
+        out.extend_from_slice(&basis.to_le_bytes());
     }
     out
 }
@@ -518,7 +532,8 @@ mod tests {
             (17, &schema, &b1, WireConflictMode::Error),
             (16, &schema, &b2, WireConflictMode::Update),
         ];
-        let payload = encode_push_txn(0xABCD, &families);
+        let preconditions: Vec<(u64, u64)> = vec![(16, 42), (17, 42)];
+        let payload = encode_push_txn(0xABCD, &families, &preconditions);
 
         let ctrl_size = u32_at(&payload, gnitz_wire::WAL_OFF_SIZE);
         let (hdr, _, _) = decode_control_block(&payload[..ctrl_size]).unwrap();
@@ -554,6 +569,18 @@ mod tests {
             off += dsz;
             assert_eq!(dbatch.len(), exp_rows);
         }
+        // Precondition section: u32 count, then [u64 tid][u64 basis] pairs.
+        let pre_count = u32_at(&payload, off) as usize;
+        off += 4;
+        assert_eq!(pre_count, 2);
+        let mut got_pre = Vec::new();
+        for _ in 0..pre_count {
+            let tid = u64::from_le_bytes(payload[off..off + 8].try_into().unwrap());
+            let basis = u64::from_le_bytes(payload[off + 8..off + 16].try_into().unwrap());
+            off += 16;
+            got_pre.push((tid, basis));
+        }
+        assert_eq!(got_pre, vec![(16, 42), (17, 42)]);
         assert_eq!(off, payload.len(), "frame fully consumed");
     }
 

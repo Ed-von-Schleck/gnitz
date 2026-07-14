@@ -111,6 +111,25 @@ pub struct Shared {
     /// Shutdown barrier, so `handle_message`'s push path rejects new pushes
     /// — none may commit after the final checkpoint's view flush.
     draining: Rc<Cell<bool>>,
+    /// OCC per-table commit-LSN map: `tid → zone LSN of its last committed
+    /// write this boot`. Bumped under the writer's table lock immediately after
+    /// a successful commit ACK (push arm and `push_txn_body`, `Ok` path only), and
+    /// read under the same lock by `push_txn_body`'s precondition check. A missing
+    /// entry reads as `boot_seed`. Single-threaded reactor — a plain `RefCell`,
+    /// and no borrow is ever held across an `.await`.
+    table_commit_lsn: RefCell<FxHashMap<i64, u64>>,
+    /// The default for a `table_commit_lsn` miss (a table not written this boot),
+    /// seeded to `max_table_current_lsn()` — the same value `lsn_alloc.published()`
+    /// starts at, so `boot_seed == published()` at boot. Soundness of the miss
+    /// default does NOT rest on `boot_seed` dominating every pre-crash durable zone
+    /// (a per-table counter can lag a global zone LSN across a crash-with-tail).
+    /// It rests on OCC bases never surviving a restart: `last_seen_lsn` is
+    /// per-connection, seeded from the HELLO ACK's `published()` and never
+    /// persisted, so a restart severs every client and each re-seeds from the new
+    /// `published()` (≥ boot_seed). Within a boot every live basis is ≥ boot_seed
+    /// and every commit's zone strictly exceeds it, so a miss reading boot_seed can
+    /// never false-pass.
+    boot_seed: u64,
 }
 
 impl Shared {
@@ -150,6 +169,30 @@ impl Shared {
         let l = Rc::new(AsyncMutex::new(()));
         locks.insert(tid, Rc::clone(&l));
         l
+    }
+
+    /// OCC: record `lsn` as the last-committed-write watermark for each of `tids`,
+    /// under the caller's already-held table lock(s). The single writer of
+    /// `table_commit_lsn` — both commit paths (the plain-push arm and
+    /// `push_txn_body`) funnel through here, so a third write path can't silently
+    /// omit the bump. Call on the commit `Ok` path only.
+    fn record_commit_lsn(&self, tids: impl IntoIterator<Item = i64>, lsn: u64) {
+        let mut map = self.table_commit_lsn.borrow_mut();
+        for tid in tids {
+            map.insert(tid, lsn);
+        }
+    }
+
+    /// OCC: the zone LSN of `tid`'s last committed write this boot, or `boot_seed`
+    /// for a table not written this boot (which can never conflict — every live
+    /// basis is ≥ `boot_seed`). The single reader, so the miss default lives in
+    /// one place; read under the precondition check's table lock.
+    fn commit_lsn_of(&self, tid: i64) -> u64 {
+        self.table_commit_lsn
+            .borrow()
+            .get(&tid)
+            .copied()
+            .unwrap_or(self.boot_seed)
     }
 
     /// True iff some pending tid has crossed the row coalesce threshold.
@@ -263,6 +306,8 @@ impl ServerExecutor {
             tick_tids: Rc::clone(&tick_tids),
             table_locks: RefCell::new(FxHashMap::default()),
             draining: Rc::clone(&draining),
+            table_commit_lsn: RefCell::new(FxHashMap::default()),
+            boot_seed: initial_lsn,
         });
 
         // Catch SIGTERM/SIGINT so the watchdog can drive a final checkpoint
@@ -403,7 +448,7 @@ async fn connection_loop(peer: Peer, shared: Rc<Shared>, first_frame_deadline: O
         peer.close();
         return;
     };
-    if let HelloOutcome::Reject = run_hello_handshake(&peer, buf.as_slice()).await {
+    if let HelloOutcome::Reject = run_hello_handshake(&peer, &shared, buf.as_slice()).await {
         peer.close();
         return;
     }
@@ -418,7 +463,7 @@ async fn connection_loop(peer: Peer, shared: Rc<Shared>, first_frame_deadline: O
 /// Validate a HELLO frame, elevate the connection's payload limit, and
 /// reply with the symmetric ACK. See `Reactor::set_max_payload_len` for
 /// why the limit must be raised before any `.await` here.
-async fn run_hello_handshake(peer: &Peer, data: &[u8]) -> HelloOutcome {
+async fn run_hello_handshake(peer: &Peer, shared: &Rc<Shared>, data: &[u8]) -> HelloOutcome {
     // `decode_hello_payload` validates the 8-byte length; the magic
     // check below is defence-in-depth on top of the pre-handshake recv
     // ceiling that already excludes non-HELLO first frames.
@@ -442,7 +487,10 @@ async fn run_hello_handshake(peer: &Peer, data: &[u8]) -> HelloOutcome {
 
     peer.set_max_payload_len(gnitz_wire::MAX_FRAME_PAYLOAD_SERVER);
 
-    let rc = peer.send_hello_ack().await;
+    // Seed the client's OCC basis with the durability watermark now. This runs
+    // before the connection message loop, so `published()` is `≤` any later read
+    // the client issues — a sound (conservative) basis.
+    let rc = peer.send_hello_ack(shared.lsn_alloc.published()).await;
     if rc < 0 {
         return HelloOutcome::Reject;
     }
@@ -1074,6 +1122,12 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
         let commit_result = rx.await;
         match commit_result {
             Ok(Ok(lsn)) => {
+                // Record the commit LSN for OCC while the table lock is still
+                // held (a concurrent precondition check reads it under the same
+                // lock, so the bump lands before any conflicting txn can pass).
+                // Bump on the `Ok` path only: an `Err` reply is pre-SAL or
+                // fail-stop, so no live-visible durable change to record.
+                shared.record_commit_lsn([target_id], lsn);
                 send_ok_response(shared, peer, target_id, None, client_id, lsn as u128, client_version).await;
             }
             Ok(Err(e)) => {
@@ -1130,19 +1184,46 @@ async fn handle_seek(
     }
 }
 
+/// The two success shapes of `push_txn_body`. `Committed` carries the durable
+/// zone LSN; `Conflict` carries a fresh basis (`published()`) the client adopts
+/// for its retry. `push_txn_body` cannot send the reply itself (`peer` /
+/// `client_id` are not in its scope), so it returns the outcome and
+/// `handle_push_txn` renders it.
+enum PushTxnOutcome {
+    Committed(u64),
+    Conflict(u64),
+}
+
 /// Handle an atomic user-table transaction (`FLAG_PUSH_TXN`): decode + validate
-/// the bundle as a unit under the union of the involved table locks, then emit
-/// it as N `FLAG_PUSH` groups inside one zone under one sentinel. Mirrors the
-/// plain-push arm's lock order (catalog read lock, then the per-table lock union
-/// ascending) and its late `draining` check; both locks are held through the
-/// committer ACK. Every rejection is pre-SAL, so an `Err` reply means "nothing
-/// committed".
+/// the bundle as a unit under the union of the involved table locks, run the OCC
+/// precondition check under those locks, then emit it as N `FLAG_PUSH` groups
+/// inside one zone under one sentinel. Mirrors the plain-push arm's lock order
+/// (catalog read lock, then the per-table lock union ascending) and its late
+/// `draining` check; both locks are held through the committer ACK. Every
+/// rejection is pre-SAL, so an `Err` reply — and a `Conflict` outcome — mean
+/// "nothing committed".
 async fn handle_push_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: &[u8]) {
     match push_txn_body(shared, data).await {
         // Standard single-frame ACK, seek_pk = zone LSN (uncorrelated, as
         // push_ddl_txn's reply is).
-        Ok(lsn) => {
+        Ok(PushTxnOutcome::Committed(lsn)) => {
             let buf = encode_response_buffer(0, client_id, None, STATUS_OK, b"", None, lsn as u128, 0);
+            peer.send_buffer_or_close(buf).await;
+        }
+        // OCC precondition failed: a control-only STATUS_TXN_CONFLICT frame whose
+        // `seek_pk` carries the fresh basis. Empty message — the client
+        // synthesizes any human-readable text from the tid it sent.
+        Ok(PushTxnOutcome::Conflict(fresh_basis)) => {
+            let buf = encode_response_buffer(
+                0,
+                client_id,
+                None,
+                ipc::STATUS_TXN_CONFLICT,
+                b"",
+                None,
+                fresh_basis as u128,
+                0,
+            );
             peer.send_buffer_or_close(buf).await;
         }
         Err(e) => send_error(peer, 0, client_id, e.as_bytes()).await,
@@ -1150,10 +1231,13 @@ async fn handle_push_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
 }
 
 /// The body of `handle_push_txn`: every rejection is a plain `Err`, so the one
-/// caller above owns the single reply path. Returns the durable zone LSN.
-async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<u64, String> {
-    // 1. Decode + frame-local shape rules (no catalog access).
-    let raw = ipc::decode_push_txn(data).map_err(|e| format!("decode error: {e}"))?;
+/// caller above owns the single reply path. Returns `Committed(zone_lsn)` on a
+/// durable commit or `Conflict(fresh_basis)` when the OCC precondition check
+/// fails.
+async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcome, String> {
+    // 1. Decode + frame-local shape rules (no catalog access). The frame carries
+    //    the families and the OCC preconditions (each `(tid, basis)`).
+    let (raw, preconditions) = ipc::decode_push_txn(data).map_err(|e| format!("decode error: {e}"))?;
     if raw.is_empty() {
         return Err("TXN: empty family bundle".to_string());
     }
@@ -1193,6 +1277,9 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<u64, String> 
             batch,
         });
     }
+    // Capture the family tids BEFORE `families` is moved into the commit request,
+    // for the precondition-membership check and the post-commit map bump.
+    let family_tids: Vec<i64> = families.iter().map(|f| f.tid).collect();
 
     // 3. Acquire the per-table lock union ⋃ fk_lock_set(tid), sorted ascending
     //    and DEDUPED — a repeated tid would re-lock a non-reentrant mutex the
@@ -1206,6 +1293,23 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<u64, String> 
     let mut _tlocks = Vec::with_capacity(union.len());
     for tid in union {
         _tlocks.push(shared.table_lock(tid).lock().await);
+    }
+
+    // 3b. OCC precondition check, under the just-acquired lock union and BEFORE
+    //     validation. A precondition asserts "table `tid` has not been written
+    //     since `basis`". The lock union already covers every precondition tid
+    //     (preconditions ⊆ families, enforced here), so no lock-set extension.
+    //     Every writer to a family table holds that same lock through its commit
+    //     ACK and bumps the map before releasing, so a passing check + this
+    //     commit are one atomic step. Reading the map borrow ends at each
+    //     statement; no borrow crosses an `.await`.
+    for &(tid, basis) in &preconditions {
+        if !family_tids.contains(&tid) {
+            return Err(format!("TXN: precondition on {tid}: not a written table"));
+        }
+        if shared.commit_lsn_of(tid) > basis {
+            return Ok(PushTxnOutcome::Conflict(shared.lsn_alloc.published()));
+        }
     }
 
     // 4. Distributed bundle validation (the four rules).
@@ -1226,12 +1330,24 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<u64, String> 
         return Err("server shutting down".to_string());
     }
 
-    // 6. Route through the committer and wait for the zone ACK.
+    // 6. Route through the committer and wait for the zone ACK. `families` is
+    //    moved here; `family_tids` was captured above for the bump.
     let (tx, rx) = oneshot::channel::<Result<u64, String>>();
     shared
         .committer_tx
         .send(CommitRequest::Txn(PendingTxn { families, done: tx }));
-    rx.await.map_err(|_| "committer shut down".to_string())?
+    // Double `?`: the outer unwraps a channel cancel, the inner a committer
+    // `Err` — so the bump below is reached ONLY on a successful commit.
+    let lsn = rx.await.map_err(|_| "committer shut down".to_string())??;
+
+    // 7. Record the commit LSN for every family tid while the table locks are
+    //    still held (`_tlocks` in scope), so a later same-tid txn cannot pass its
+    //    precondition against a pre-this-commit basis. Bump on `Ok` only. The
+    //    reply is sent by `handle_push_txn` after the locks drop, which is fine:
+    //    OCC needs only the bump under the lock, and a later same-tid txn cannot
+    //    acquire the lock until this one releases (after the bump).
+    shared.record_commit_lsn(family_tids.iter().copied(), lsn);
+    Ok(PushTxnOutcome::Committed(lsn))
 }
 
 /// Decode a CLIENT-supplied frame and neutralize any client-claimed batch

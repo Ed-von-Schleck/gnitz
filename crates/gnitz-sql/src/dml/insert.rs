@@ -11,6 +11,7 @@ use crate::codec::nullmap::null_word_set;
 use crate::codec::pk_codec::{extract_pk_value, is_null_expr};
 use crate::dml::mutate::{build_merged_row, eval_set_expr, resolve_set_target};
 use crate::dml::overlay::effective_row;
+use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
 use crate::error::GnitzSqlError;
 use crate::exec::batch::{copy_batch_row, project, resolve_projection};
 use crate::ir::BoundExpr;
@@ -264,23 +265,39 @@ pub(crate) fn execute_insert(
             // or committed (see `effective_row`). Resolving against the buffer is
             // what stops two DO NOTHING inserts of one new PK from buffering two
             // `+1` Error rows and tripping the commit-time per-family duplicate
-            // check. De-duplicate intra-batch (first-wins) before pushing.
-            let (filtered, surviving_count) = client_side_filter_do_nothing(client, tid, &schema, &batch)?;
-            if surviving_count > 0 {
-                client.push_with_mode(tid, &schema, &filtered, WireConflictMode::Error)?;
-            }
-            Ok(SqlResult::RowsAffected { count: surviving_count })
+            // check. De-duplicate intra-batch (first-wins) before pushing. The
+            // filter re-runs per RMW retry against fresh committed state; the
+            // incoming VALUES batch (already built, ids drawn) is reused as-is.
+            let count = commit_rmw_or_buffer(client, &table_name_str, tid, |client| {
+                let (filtered, surviving_count) = client_side_filter_do_nothing(client, tid, &schema, &batch)?;
+                let write = (surviving_count > 0).then(|| RmwWrite {
+                    schema: (*schema).clone(),
+                    batch: filtered,
+                    mode: WireConflictMode::Error,
+                });
+                Ok(RmwBuild {
+                    count: surviving_count,
+                    write,
+                })
+            })?;
+            Ok(SqlResult::RowsAffected { count })
         }
         ConflictPlan::DoUpdatePk { assignments } => {
-            let merged = client_side_merge_do_update(client, tid, &schema, &batch, &assignments)?;
-            if !merged.pks.is_empty() {
-                // Use Update mode: merged batch contains both +1 (new
-                // merged rows, which may UPSERT) and untouched +1 rows
-                // for non-conflicting inserts. Workers handle the
-                // retract-and-insert via enforce_unique_pk.
-                client.push_with_mode(tid, &schema, &merged, WireConflictMode::Update)?;
-            }
-            Ok(SqlResult::RowsAffected { count: n })
+            // Merge each incoming row against the effective existing row (buffered
+            // or committed), re-running per RMW retry so `SET x = x + 1` reads the
+            // freshest `x`. Update mode: the merged batch carries both +1 merged
+            // rows (which may UPSERT) and untouched +1 rows for non-conflicting
+            // inserts; workers do the retract-and-insert via enforce_unique_pk.
+            let count = commit_rmw_or_buffer(client, &table_name_str, tid, |client| {
+                let merged = client_side_merge_do_update(client, tid, &schema, &batch, &assignments)?;
+                let write = (!merged.pks.is_empty()).then(|| RmwWrite {
+                    schema: (*schema).clone(),
+                    batch: merged,
+                    mode: WireConflictMode::Update,
+                });
+                Ok(RmwBuild { count: n, write })
+            })?;
+            Ok(SqlResult::RowsAffected { count })
         }
     }
 }
