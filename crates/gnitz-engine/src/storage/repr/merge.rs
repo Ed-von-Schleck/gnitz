@@ -37,6 +37,33 @@ pub(crate) struct ColPtr {
     pub stride: usize,
 }
 
+impl ColPtr {
+    /// Raw pointer to row `i`'s value: `base + i*stride`. A `stride == 0`
+    /// (Constant) region yields `base` for every row.
+    ///
+    /// # Safety
+    /// The caller must keep the backing region alive for the borrow and pass an
+    /// in-bounds `i`. For shard/`MemBatch` regions this holds because open-time
+    /// validation guarantees `offset + count*stride <= len` (the same invariant
+    /// `to_unified` / `mem_batch_to_unified` already rely on).
+    #[inline(always)]
+    pub(crate) unsafe fn row_ptr(self, i: usize) -> *const u8 {
+        self.base.add(i * self.stride)
+    }
+
+    /// Row `i` as a `len`-byte slice over the backing region; a `stride == 0`
+    /// (Constant) region reads its first `len` bytes for every row. Same
+    /// aliasing/in-bounds contract as [`row_ptr`](Self::row_ptr).
+    ///
+    /// # Safety
+    /// See [`row_ptr`](Self::row_ptr); additionally `len` must not exceed the
+    /// region's element width.
+    #[inline(always)]
+    pub(crate) unsafe fn row<'a>(self, i: usize, len: usize) -> &'a [u8] {
+        std::slice::from_raw_parts(self.row_ptr(i), len)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct UnifiedSource {
     pub pk: ColPtr,

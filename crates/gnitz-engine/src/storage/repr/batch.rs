@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::columnar::ColumnarSource;
-use super::merge::{self, MemBatch};
+use super::merge::{self, ColPtr, MemBatch};
 use crate::foundation::codec::{align8, read_i64_le, read_u64_le};
 use crate::schema::{BlobCache, SchemaDescriptor};
 
@@ -1112,6 +1112,19 @@ impl Batch {
         (data, blob)
     }
 
+    /// The PK region as a uniform [`ColPtr`] view (always Raw for an owned
+    /// `Batch`): the single addressing source for the OPK seeks via
+    /// [`ColPtr::row`], hoisting the `data`/offset/stride reload out of the
+    /// per-probe closure. The base aliases `self.data`; keep `self` alive while
+    /// the view is read (the seek closures run synchronously within the call).
+    #[inline]
+    fn pk_col_ptr(&self) -> ColPtr {
+        ColPtr {
+            base: unsafe { self.data.as_ptr().add(self.offsets[REG_PK]) },
+            stride: self.strides[REG_PK] as usize,
+        }
+    }
+
     /// Binary search for the first row whose OPK bytes are `>= key`. After the
     /// OPK-at-rest flip this is a raw `memcmp` search with no schema dependency,
     /// correct for compound, signed, and wide (`pk_stride > 16`) PKs alike.
@@ -1119,7 +1132,9 @@ impl Batch {
     /// `key` must be exactly `pk_stride` OPK bytes — identical width to the
     /// stored regions it is compared against.
     pub fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
-        super::columnar::lower_bound_opk(self.count, key, self.pk_stride() as usize, |i| self.get_pk_bytes(i))
+        let stride = self.pk_stride() as usize;
+        let cp = self.pk_col_ptr();
+        super::columnar::lower_bound_opk(self.count, key, stride, |i| unsafe { cp.row(i, stride) })
     }
 
     /// Galloping forward lower bound seeded at `hint` (the caller's live
@@ -1128,9 +1143,9 @@ impl Batch {
     /// sorted-stream co-group merge, whose probe keys ascend, so the boundary
     /// only moves forward. `key` must be exactly `pk_stride` OPK bytes.
     pub fn advance_to(&self, key: &[u8], hint: usize) -> usize {
-        super::columnar::gallop_opk(self.count, key, hint, self.pk_stride() as usize, |i| {
-            self.get_pk_bytes(i)
-        })
+        let stride = self.pk_stride() as usize;
+        let cp = self.pk_col_ptr();
+        super::columnar::gallop_opk(self.count, key, hint, stride, |i| unsafe { cp.row(i, stride) })
     }
 
     /// Append all of `src`, relocating German-string blob data into `self`'s

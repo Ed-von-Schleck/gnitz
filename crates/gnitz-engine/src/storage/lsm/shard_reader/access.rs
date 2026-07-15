@@ -14,6 +14,27 @@ use crate::foundation::codec::{read_i64_le, read_u64_le};
 use crate::schema::key::PkBuf;
 use crate::schema::{SchemaDescriptor, MAX_COLUMNS};
 
+impl ScalarRegion {
+    /// This region as a uniform `(base, stride)` [`ColPtr`]: `Raw` points into
+    /// `data_ptr` at its mmap offset with the given `stride`; `Constant` points
+    /// at its inline value with `stride: 0`, so `base.add(i*stride) == base`
+    /// reads the same bytes for every row with no per-row branch. The one
+    /// Raw/Constant→`ColPtr` conversion behind `pk_col_ptr` and `to_unified`.
+    #[inline]
+    fn to_col_ptr(&self, data_ptr: *const u8, stride: usize) -> ColPtr {
+        match self {
+            ScalarRegion::Raw { offset, .. } => ColPtr {
+                base: unsafe { data_ptr.add(*offset) },
+                stride,
+            },
+            ScalarRegion::Constant { value, .. } => ColPtr {
+                base: value.as_ptr(),
+                stride: 0,
+            },
+        }
+    }
+}
+
 impl MappedShard {
     #[inline]
     pub(crate) fn data(&self) -> &[u8] {
@@ -228,20 +249,35 @@ impl MappedShard {
         lo
     }
 
+    /// The PK region as a uniform [`ColPtr`] view — the single addressing source
+    /// for the OPK seeks below (via [`ColPtr::row`]) and `to_unified`'s PK
+    /// column. The `Constant` arm's `stride: 0` lets the seek closures read every
+    /// probe through one branchless accessor, hoisting the Raw/Constant match out
+    /// of the search loop. The base aliases `self`; keep `self` alive while the
+    /// view is read (the seek closures run synchronously within the call).
+    #[inline]
+    fn pk_col_ptr(&self) -> ColPtr {
+        self.pk.to_col_ptr(self.data().as_ptr(), self.pk_stride as usize)
+    }
+
     /// First row whose OPK bytes are `>= key`. After the OPK-at-rest flip this
     /// is a raw `memcmp` binary search — correct at every PK width with no
     /// schema dependency. `key` must be exactly `pk_stride` OPK bytes.
     pub fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
-        super::super::columnar::lower_bound_opk(self.count, key, self.pk_stride as usize, |i| self.get_pk_bytes(i))
+        let stride = self.pk_stride as usize;
+        let cp = self.pk_col_ptr();
+        super::super::columnar::lower_bound_opk(self.count, key, stride, |i| unsafe { cp.row(i, stride) })
     }
 
     /// Galloping forward lower bound seeded at `hint` (the caller's live
     /// position): `O(log gap)` when the boundary is just ahead, `O(1)` when it
     /// IS the hint, never worse than `find_lower_bound_bytes`. Byte-identical
-    /// body to `Batch::advance_to` — same `count`/`get_pk_bytes` contract. `key`
-    /// must be exactly `pk_stride` OPK bytes.
+    /// body to `Batch::advance_to` — same `count`/`pk_col_ptr` seek contract.
+    /// `key` must be exactly `pk_stride` OPK bytes.
     pub fn advance_to(&self, key: &[u8], hint: usize) -> usize {
-        super::super::columnar::gallop_opk(self.count, key, hint, self.pk_stride as usize, |i| self.get_pk_bytes(i))
+        let stride = self.pk_stride as usize;
+        let cp = self.pk_col_ptr();
+        super::super::columnar::gallop_opk(self.count, key, hint, stride, |i| unsafe { cp.row(i, stride) })
     }
 
     /// Test-only u128 oracle (exact-match point lookup) cross-checking the
@@ -378,32 +414,10 @@ impl MappedShard {
     /// by the read-cursor drain (shard-vs-`MemBatch` polymorphism) and shard
     /// compaction.
     pub(crate) fn to_unified(&self, schema: &SchemaDescriptor) -> UnifiedSource {
-        let pk_stride = self.pk_stride as usize;
         let data_ptr = self.data().as_ptr();
 
-        let pk = match &self.pk {
-            ScalarRegion::Raw { offset, .. } => ColPtr {
-                base: unsafe { data_ptr.add(*offset) },
-                stride: pk_stride,
-            },
-            // stride=0: base.add(ri * 0) == base for every row, reads the
-            // constant value identically to a null_bmp Constant.
-            ScalarRegion::Constant { value, .. } => ColPtr {
-                base: value.as_ptr(),
-                stride: 0,
-            },
-        };
-
-        let null_bmp = match &self.null_bmp {
-            ScalarRegion::Raw { offset, .. } => ColPtr {
-                base: unsafe { data_ptr.add(*offset) },
-                stride: FIXED_REGION_BYTES,
-            },
-            ScalarRegion::Constant { value, .. } => ColPtr {
-                base: value.as_ptr(),
-                stride: 0,
-            },
-        };
+        let pk = self.pk.to_col_ptr(data_ptr, self.pk_stride as usize);
+        let null_bmp = self.null_bmp.to_col_ptr(data_ptr, FIXED_REGION_BYTES);
 
         let mut cols = [ColPtr {
             base: ptr::null(),
@@ -412,14 +426,7 @@ impl MappedShard {
         for (pi, _ci, col) in schema.payload_columns() {
             let cs = col.size() as usize;
             cols[pi] = match &self.col_regions[pi] {
-                PayloadRegion::Scalar(ScalarRegion::Raw { offset, .. }) => ColPtr {
-                    base: unsafe { data_ptr.add(*offset) },
-                    stride: cs,
-                },
-                PayloadRegion::Scalar(ScalarRegion::Constant { value, .. }) => ColPtr {
-                    base: value.as_ptr(),
-                    stride: 0,
-                },
+                PayloadRegion::Scalar(s) => s.to_col_ptr(data_ptr, cs),
                 // Decoded image (`cs == elem_width`), stable for the shard's
                 // lifetime; the caller already keeps `self` alive for the view.
                 PayloadRegion::Packed(p) => ColPtr {

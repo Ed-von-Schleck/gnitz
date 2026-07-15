@@ -342,9 +342,7 @@ pub(crate) fn scatter_unified_sources_with_weights(
             // Blob relocation is per-row regardless; no way to batch.
             for (out, &(si, ri, _)) in rows.iter().enumerate() {
                 let src = unsafe { sources.get_unchecked(si as usize) };
-                let cp = src.cols[pi];
-                let p = unsafe { cp.base.add(ri as usize * cp.stride) };
-                let src_struct = unsafe { std::slice::from_raw_parts(p, 16) };
+                let src_struct = unsafe { src.cols[pi].row(ri as usize, 16) };
                 // Guard against null blob_ptr (source with no string data):
                 // from_raw_parts on a null pointer is UB even when len==0.
                 let src_blob: &[u8] = if src.blob_ptr.is_null() {
@@ -385,8 +383,8 @@ fn scatter_unified_pk_wt_nbm<const PKS: usize>(
     for (out, &(si, ri, w)) in rows.iter().enumerate() {
         let src = unsafe { sources.get_unchecked(si as usize) };
         let dst_row = base + out;
-        let pk_ptr = unsafe { src.pk.base.add(ri as usize * src.pk.stride) };
-        let nbm_ptr = unsafe { src.null_bmp.base.add(ri as usize * src.null_bmp.stride) };
+        let pk_ptr = unsafe { src.pk.row_ptr(ri as usize) };
+        let nbm_ptr = unsafe { src.null_bmp.row_ptr(ri as usize) };
         let wb = w.to_le_bytes();
         unsafe {
             std::ptr::copy_nonoverlapping(pk_ptr, pk_dst.add(dst_row * pks), pks);
@@ -413,9 +411,7 @@ fn gather_unified_col_dispatch(
         _ => {
             for (out, &(si, ri, _)) in rows.iter().enumerate() {
                 let src = unsafe { sources.get_unchecked(si as usize) };
-                let cp = src.cols[pi];
-                let p = unsafe { cp.base.add(ri as usize * cp.stride) };
-                dst[out * cs..][..cs].copy_from_slice(unsafe { std::slice::from_raw_parts(p, cs) });
+                dst[out * cs..][..cs].copy_from_slice(unsafe { src.cols[pi].row(ri as usize, cs) });
             }
         }
     }
@@ -428,8 +424,7 @@ fn gather_unified_col_dispatch(
 fn gather_unified_col<const N: usize>(sources: &[UnifiedSource], rows: &[(u32, u32, i64)], pi: usize, dst: &mut [u8]) {
     for (out, &(si, ri, _)) in rows.iter().enumerate() {
         let src = unsafe { sources.get_unchecked(si as usize) };
-        let cp = src.cols[pi];
-        let ptr = unsafe { cp.base.add(ri as usize * cp.stride) };
+        let ptr = unsafe { src.cols[pi].row_ptr(ri as usize) };
         unsafe { std::ptr::copy_nonoverlapping(ptr, dst.as_mut_ptr().add(out * N), N) };
     }
 }
