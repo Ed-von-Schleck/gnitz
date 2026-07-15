@@ -22,7 +22,8 @@ K          ?=                                # pytest -k expression
         test rust-engine-test fmt fmt-check clippy check verify \
         server release-server pyext pyext-release e2e e2e-tls e2e-release release-test \
         clean distclean \
-        bench bench-full bench-sweep bench-perf bench-perf-dwarf bench-profile profiling-server
+        bench bench-full bench-features bench-txn bench-sweep bench-sweep-dwarf \
+        bench-perf bench-perf-dwarf bench-profile profiling-server profiling-server-dwarf
 
 all: test
 
@@ -116,6 +117,12 @@ bench-full: WORKERS = 4
 bench-full: FULL    = 1
 bench-full: bench ## Full benchmark mode, 4 workers
 
+bench-features: release-server pyext-release ## Full features tier (per-feature maintenance cost), 4 workers
+	cd crates/gnitz-py && uv run python ../../benchmarks/run.py --full --workers=4 -k features
+
+bench-txn: release-server pyext-release ## Full transaction/HTAP/serving tiers, 4 workers
+	cd crates/gnitz-py && uv run python ../../benchmarks/run.py --full --workers=4 -k "txn or htap or serving"
+
 bench-sweep: release-server pyext-release ## Sweep workers×clients over {1,2,4}
 	cd crates/gnitz-py && uv run python ../../benchmarks/run.py --full --workers=1,2,4 --clients=1,2,4
 
@@ -138,3 +145,17 @@ bench-profile: profiling-server pyext-release ## Profile incremental view mainte
 	cd crates/gnitz-py && GNITZ_SERVER_BIN=$(abspath gnitz-server-profiling) \
 		uv run python ../../benchmarks/run.py --full --workers=4 --perf -k view_maintenance
 	cd crates/gnitz-py && uv run python ../../benchmarks/report.py
+
+profiling-server-dwarf: ## Build release server with DWARF unwind tables + line info -> ./gnitz-server-profiling-dwarf
+	cd crates && RUSTFLAGS="-C force-unwind-tables=yes -C debuginfo=1" CARGO_TARGET_DIR=target/profiling-dwarf \
+		cargo build --release -p gnitz-engine --bin gnitz-server
+	cp crates/target/profiling-dwarf/release/gnitz-server gnitz-server-profiling-dwarf
+
+# The flagship profiling command: full-scale sweep across every worker×client
+# combination under perf DWARF call-graph recording + perf stat. Uses the
+# DWARF-capable server build (.eh_frame unwind tables), and writes a per-combo
+# perf.data + flamegraph plus a combined report.
+bench-sweep-dwarf: profiling-server-dwarf pyext-release ## Full sweep workers×clients {1,2,4} under perf DWARF profiling + report
+	cd crates/gnitz-py && GNITZ_SERVER_BIN=$(abspath gnitz-server-profiling-dwarf) \
+		uv run python ../../benchmarks/run.py --full --workers=1,2,4 --clients=1,2,4 --perf-dwarf --perf-stat
+	cd crates/gnitz-py && uv run python ../../benchmarks/report.py --all

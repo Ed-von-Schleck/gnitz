@@ -13,7 +13,6 @@ functions) from the results directory produced by benchmarks/run.py.
 
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
@@ -23,64 +22,19 @@ from pathlib import Path
 RESULTS_ROOT = Path(__file__).parent / "results"
 
 # ---------------------------------------------------------------------------
-# Benchmark grouping
+# Benchmark grouping — by category tier (micro / features / txn / combined)
 # ---------------------------------------------------------------------------
 
-# Each entry: (label, predicate on benchmark dict)
-GROUPS = [
-    (
-        "OLAP / view workloads",
-        lambda b: b["rows_per_sec"] > 500
-        and b["p50_ms"] > 30
-        and not _is_slow(b)
-        and not _is_incremental(b)
-        and not _is_fk(b)
-        and b["name"] not in ("test_full_scan", "test_pk_seek", "test_index_seek"),
-    ),
-    (
-        "Incremental view overhead",
-        lambda b: _is_incremental(b) and b["rows_per_sec"] > 0,
-    ),
-    (
-        "FK overhead",
-        lambda b: _is_fk(b) and b["rows_per_sec"] > 0,
-    ),
-    (
-        "Read paths",
-        lambda b: b["name"] in ("test_full_scan", "test_pk_seek", "test_index_seek", "test_limit"),
-    ),
-    (
-        "Point DML",
-        lambda b: b["name"]
-        in (
-            "test_insert_values[1]",
-            "test_insert_values[10]",
-            "test_delete_pk",
-            "test_update_pk_seek",
-        ),
-    ),
-    (
-        "Slow paths",
-        lambda b: _is_slow(b) and b["rows_per_sec"] > 0,
-    ),
+TIERS = [
+    ("micro", "micro — SQL client-path latency"),
+    ("features", "features — per-feature incremental-maintenance cost"),
+    ("txn", "txn — transactions"),
+    ("combined", "combined — realistic end-to-end"),
 ]
 
 
-def _is_slow(b):
-    return b["name"] in (
-        "test_delete_scan",
-        "test_update_index_seek",
-        "test_update_full_scan",
-        "test_insert_bulk_throughput",
-    )
-
-
-def _is_incremental(b):
-    return b["name"].startswith("test_incremental_cost")
-
-
-def _is_fk(b):
-    return "fk" in b["name"]
+def _tier(b):
+    return (b.get("category") or "").split("/")[0]
 
 
 # ---------------------------------------------------------------------------
@@ -199,26 +153,76 @@ def report_metadata(meta: dict, file=None):
 
 
 def report_throughput(benchmarks: list[dict], file=None):
-    for label, predicate in GROUPS:
-        matched = [b for b in benchmarks if b["rows_per_sec"] > 0 and predicate(b)]
+    """One throughput/latency table per category tier."""
+    for tier, label in TIERS:
+        matched = [b for b in benchmarks if _tier(b) == tier]
         if not matched:
             continue
-        matched.sort(key=lambda b: -b["rows_per_sec"])
+        matched.sort(key=lambda b: (-b["rows_per_sec"], b["p50_ms"]))
         rows = []
         for b in matched:
-            name = b["name"]
-            rps = f"{b['rows_per_sec']:,.0f}"
-            p50 = f"{b['p50_ms']:.1f}"
-            p90 = f"{b['p90_ms']:.1f}"
-            p99 = f"{b['p99_ms']:.1f}"
-            iters = str(b["iterations"])
-            rows.append((name, rps, p50, p90, p99, iters))
+            rps = f"{b['rows_per_sec']:,.0f}" if b["rows_per_sec"] else "-"
+            rows.append((
+                b["name"], rps,
+                f"{b['p50_ms']:.2f}", f"{b['p90_ms']:.2f}", f"{b['p99_ms']:.2f}",
+                str(b["iterations"]),
+            ))
         print_table(
             label,
             ["benchmark", "rows/s", "p50ms", "p90ms", "p99ms", "iters"],
             rows,
             file=file,
         )
+
+
+def report_transactions(benchmarks: list[dict], file=None):
+    """Transactions table: txns/s, conflicts, retries next to commit p50/p99."""
+    matched = [b for b in benchmarks if "txns_per_sec" in (b.get("extra") or {})]
+    if not matched:
+        return
+    matched.sort(key=lambda b: -(b["extra"].get("txns_per_sec") or 0))
+    rows = []
+    for b in matched:
+        e = b["extra"]
+        rows.append((
+            b["name"], f"{e.get('txns_per_sec', 0):,.0f}",
+            str(e.get("conflicts", "-")), str(e.get("retries", "-")),
+            f"{b['p50_ms']:.2f}", f"{b['p99_ms']:.2f}", str(b.get("num_clients", 1)),
+        ))
+    print_table(
+        "Transactions",
+        ["benchmark", "txns/s", "conflicts", "retries", "p50ms", "p99ms", "clients"],
+        rows,
+        file=file,
+    )
+
+
+def report_htap_serving(benchmarks: list[dict], file=None):
+    """HTAP / serving table: torn_reads / staleness + reader p99."""
+    def _has(b):
+        e = b.get("extra") or {}
+        return "torn_reads" in e or "staleness" in e
+
+    matched = [b for b in benchmarks if _has(b)]
+    if not matched:
+        return
+    rows = []
+    for b in matched:
+        e = b["extra"]
+        integrity = e.get("torn_reads", e.get("staleness", "-"))
+        reader_p99 = e.get("reader_p99_ms", e.get("seek_p99_ms", b["p99_ms"]))
+        writer_tps = e.get("writer_txns_per_sec", e.get("writer_pushes_per_sec", "-"))
+        rows.append((
+            b["name"], str(integrity), f"{reader_p99:.2f}" if isinstance(reader_p99, (int, float)) else str(reader_p99),
+            f"{writer_tps:,.0f}" if isinstance(writer_tps, (int, float)) else str(writer_tps),
+            str(e.get("reader_ops", "-")),
+        ))
+    print_table(
+        "HTAP / Serving",
+        ["benchmark", "torn/stale", "reader p99ms", "writer/s", "reader ops"],
+        rows,
+        file=file,
+    )
 
 
 def report_perf(perf_data: Path, top_n: int = 15, file=None):
@@ -269,7 +273,10 @@ def report_one(subdir: Path, file=None):
         data = json.load(f)
 
     report_metadata(data, file=file)
-    report_throughput(data.get("benchmarks", []), file=file)
+    benchmarks = data.get("benchmarks", [])
+    report_throughput(benchmarks, file=file)
+    report_transactions(benchmarks, file=file)
+    report_htap_serving(benchmarks, file=file)
 
     perf_data = subdir / "perf.data"
     if perf_data.exists():

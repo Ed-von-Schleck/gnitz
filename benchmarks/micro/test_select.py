@@ -1,6 +1,5 @@
 """SELECT throughput benchmarks: full scan, PK seek, index seek, LIMIT."""
 
-import pytest
 
 from helpers.datagen import bulk_load
 import gnitz

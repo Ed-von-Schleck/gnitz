@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import csv
 import datetime
+import itertools
 import multiprocessing
 import os
 import shutil
@@ -15,15 +16,46 @@ from pathlib import Path
 import pytest
 
 import gnitz
-from helpers.timing import get_all_results
+from helpers.datagen import SCALES
+from helpers.timing import BenchTimer, get_all_results, record_result
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Per-tier schema-name prefix, keyed by the test file's parent directory (tier).
+_TIER_PREFIX = {"micro": "bench", "combined": "comb", "features": "feat", "txn": "txn"}
+_schema_counter = itertools.count()
 
 
 @pytest.fixture
 def client(socket_path):
     with gnitz.connect(socket_path) as conn:
         yield conn
+
+
+@pytest.fixture
+def schema_name(client, request):
+    # Leaking state across the session-scoped server silently breaks later tests
+    # with stale tick rows, so let drop_schema raise instead of swallowing:
+    # server-side cascade already handles non-empty schemas.
+    tier = request.path.parent.name
+    sn = f"{_TIER_PREFIX.get(tier, tier)}_{next(_schema_counter)}_{os.getpid()}"
+    client.create_schema(sn)
+    yield sn
+    client.drop_schema(sn)
+
+
+@pytest.fixture
+def bench_timer(request, scale_mode):
+    tier = request.path.parent.name
+    module = request.node.module.__name__.rsplit(".", 1)[-1]
+    timer = BenchTimer(request.node.name, f"{tier}/{module}")
+    yield timer
+    record_result(timer.result())
+
+
+@pytest.fixture
+def scale(scale_mode):
+    return SCALES[scale_mode]
 
 
 def pytest_addoption(parser):
@@ -72,7 +104,7 @@ def server(request, results_dir):
         elif debug_bin.is_file():
             binary = str(debug_bin)
     if not binary or not os.path.isfile(binary):
-        pytest.skip(f"Server binary not found (looked for gnitz-server-release)")
+        pytest.skip("Server binary not found (looked for gnitz-server-release)")
 
     tmpdir = Path(
         __import__("tempfile").mkdtemp(
@@ -117,9 +149,7 @@ def server(request, results_dir):
         perf_recorder.stop()
         perf_recorder.flamegraph()
     if perf_stat:
-        hw_counters = perf_stat.stop()
-        # Store for result writing
-        request.config._perf_stat = hw_counters
+        perf_stat.stop()
 
     proc.kill()
     proc.wait()
@@ -170,6 +200,16 @@ def _check_server_alive(_server_proc):
         pytest.skip(
             f"server exited (code={rc}) — a prior test likely crashed it"
         )
+
+
+@pytest.fixture(autouse=True)
+def _skip_if_not_multiworker(request):
+    """Skip a @pytest.mark.multiworker test unless run with >= 4 workers — its
+    OCC window / atomic-commit lock union / scan_many one-cut fan-out are
+    distributed paths that only exist at W >= 4."""
+    if request.node.get_closest_marker("multiworker") and \
+            request.config.getoption("--workers") < 4:
+        pytest.skip("requires --workers >= 4 (distributed OCC / scan_many paths)")
 
 
 @pytest.fixture(scope="session")
@@ -233,6 +273,7 @@ def write_results(results_dir, request):
                 "p90_ms": r.p90_ms,
                 "p99_ms": r.p99_ms,
                 "num_clients": r.num_clients,
+                "extra": r.extra,
             }
             for r in results
         ],
@@ -245,17 +286,23 @@ def write_results(results_dir, request):
         writer = csv.writer(f)
         writer.writerow([
             "name", "category", "elapsed_s", "rows", "rows_per_sec",
-            "iterations", "p50_ms", "p90_ms", "p99_ms", "num_clients",
+            "iterations", "p50_ms", "p90_ms", "p99_ms", "num_clients", "extra",
         ])
         for r in results:
             writer.writerow([
                 r.name, r.category, r.elapsed_s, r.rows, r.rows_per_sec,
                 r.iterations, r.p50_ms, r.p90_ms, r.p99_ms, r.num_clients,
+                json.dumps(r.extra),
             ])
 
 
 def pytest_configure(config):
     """Set multiprocessing start method for Linux fork-based parallelism."""
+    config.addinivalue_line(
+        "markers",
+        "multiworker: bench is meaningful only at --workers >= 4 (distributed "
+        "OCC / atomic-commit / scan_many paths)",
+    )
     try:
         multiprocessing.set_start_method("fork")
     except RuntimeError:

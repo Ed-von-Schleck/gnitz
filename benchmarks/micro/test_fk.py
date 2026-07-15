@@ -1,8 +1,6 @@
 """FK validation overhead benchmark: FK-checked inserts vs plain inserts."""
 
-import pytest
 
-from helpers.datagen import DataGen
 
 
 def test_fk_insert_overhead(client, schema_name, bench_timer, scale):

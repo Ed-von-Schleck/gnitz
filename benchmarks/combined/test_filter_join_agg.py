@@ -1,7 +1,6 @@
 """Combined benchmark: filter -> join -> agg (3-hop view pipeline)."""
 
 import random
-import pytest
 
 import gnitz
 from helpers.datagen import DataGen

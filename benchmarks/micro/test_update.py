@@ -1,6 +1,5 @@
 """UPDATE benchmarks: PK seek, index seek, full scan."""
 
-import pytest
 
 import gnitz
 from helpers.datagen import DataGen, bulk_load
@@ -36,7 +35,7 @@ def test_update_pk_seek(client, schema_name, bench_timer, scale):
 
 
 def test_update_index_seek(client, schema_name, bench_timer, scale):
-    pks = _setup(client, schema_name, scale["rows"], with_index=True)
+    _setup(client, schema_name, scale["rows"], with_index=True)
     for i in range(scale["write_iters"]):
         bench_timer.measure(
             client.execute_sql,

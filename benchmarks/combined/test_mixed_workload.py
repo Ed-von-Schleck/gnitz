@@ -5,7 +5,6 @@ import pytest
 
 import gnitz
 from helpers.datagen import DataGen, SCALES
-from helpers.timing import run_parallel
 
 
 def _writer_fn(conn, schema_name, scale_mode, writer_id):
@@ -103,7 +102,4 @@ def test_mixed_workload(client, socket_path, schema_name, bench_timer,
         role, dt = queue.get_nowait()
         latencies.append(dt * 1000.0)
 
-    # Record aggregated result
-    bench_timer._latencies.extend(latencies)
-    bench_timer._rows = n_writers * scale["write_iters"] * 100
-    bench_timer._iterations = len(latencies) + bench_timer._warmup + 1
+    bench_timer.add_latencies(latencies, rows=n_writers * scale["write_iters"] * 100)

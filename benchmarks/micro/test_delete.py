@@ -1,6 +1,5 @@
 """DELETE benchmarks: PK seek, scan-based."""
 
-import pytest
 
 import gnitz
 from helpers.datagen import bulk_load

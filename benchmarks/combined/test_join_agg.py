@@ -1,7 +1,6 @@
 """Combined benchmark: JOIN -> GROUP BY -> HAVING via view-on-view."""
 
 import random
-import pytest
 
 import gnitz
 from helpers.datagen import DataGen

@@ -140,6 +140,7 @@ cython_debug/
 /gnitz-server
 /gnitz-server-release
 /gnitz-server-profiling
+/gnitz-server-profiling-dwarf
 
 # IDE specific files
 .vscode/

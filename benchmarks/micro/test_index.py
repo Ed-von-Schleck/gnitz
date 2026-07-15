@@ -1,6 +1,5 @@
 """Index benchmarks: CREATE INDEX cost, indexed vs non-indexed INSERT."""
 
-import pytest
 
 import gnitz
 from helpers.datagen import DataGen, bulk_load

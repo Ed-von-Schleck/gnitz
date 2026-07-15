@@ -1,7 +1,6 @@
 """Combined benchmark: deep view pipeline (5 views)."""
 
 import random
-import pytest
 
 import gnitz
 from helpers.datagen import DataGen

@@ -1,7 +1,6 @@
 """Combined benchmark: chained joins via view-on-view (A join B join C)."""
 
 import random
-import pytest
 
 import gnitz
 from helpers.datagen import DataGen
