@@ -196,11 +196,11 @@ pub struct WorkerProcess {
     /// Per-frame wire budget for chunked reply trains (`send_scan_response`,
     /// `stream_batch_response`, `emit_pending_scan_chunk`): `MAX_W2M_MSG` in
     /// production. Debug builds may shrink it via `GNITZ_REPLY_FRAME_BUDGET`
-    /// (read once at construction) so e2e tests exercise multi-frame trains
-    /// with small tables. Any override must keep each worker's whole train
-    /// under `W2M_MAX_IN_FLIGHT` (64) frames — the master parks a full train
-    /// per ring while draining another worker — so reply sizes in such tests
-    /// must stay below 64 × budget.
+    /// (read once at construction) so e2e tests exercise multi-frame trains with
+    /// small tables. The master parks a full train per ring while draining
+    /// another worker, but `InFlightState` grows to track it, so the train length
+    /// an override produces is bounded only by the ring's byte capacity — there
+    /// is no per-train frame-count ceiling.
     ///
     /// This budgets only the chunk split point; single-frame paths that cannot
     /// chunk (non-wire-safe STRING replies) check the hard `MAX_W2M_MSG` ring
@@ -216,6 +216,8 @@ mod reply;
 
 pub(crate) use reply::send_unique_preflight_keys;
 use reply::PendingScan;
+#[cfg(test)]
+use reply::PendingScanKind;
 
 use fsync::uring_batch_fdatasync;
 
@@ -852,6 +854,11 @@ impl WorkerProcess {
 
             SalMessageKind::Scan => {
                 let (result, schema) = self.cat().scan_family(target_id)?;
+                // A multi-scan group carries FLAG_SCAN_FIFO_REPLY in its control
+                // block: route this relation's reply through `pending_streams`
+                // so ring order equals request order (the master drains a
+                // multi-scan's relations one train at a time, in request order).
+                let force_fifo = ctrl_wire_flags & gnitz_wire::FLAG_SCAN_FIFO_REPLY != 0;
                 self.send_scan_response(
                     target_id as u64,
                     result,
@@ -859,6 +866,7 @@ impl WorkerProcess {
                     request_id,
                     client_id,
                     client_version,
+                    force_fifo,
                 )
             }
 
@@ -1442,39 +1450,22 @@ impl WorkerProcess {
 // ---------------------------------------------------------------------------
 
 /// Keys per W2M frame for the unique pre-flight stream. The per-key wire size is
-/// `idx_key_size + 16` (the OPK leading-key span + 8 B weight + 8 B null word).
-/// The span is variable-width now: a single ≤8-byte column promotes to an 8-byte
-/// (U64/I64) span — `PREFLIGHT_MIN_KEY_BYTES` below — so the *narrowest* frame is
-/// the binding case, where the most frames fit in a ring. A composite span can reach
-/// `MAX_PK_BYTES` (80 B) → ~96 B/key, still far under `MAX_W2M_MSG` (256 MiB) at
-/// this key count.
+/// `idx_key_size + 16` (the OPK leading-key span + 8 B weight + 8 B null word): a
+/// single ≤8-byte column promotes to an 8-byte (U64/I64) span → 24 B/key; a
+/// composite span can reach `MAX_PK_BYTES` (80 B) → ~96 B/key, so a full frame is
+/// ~24–96 MiB — comfortably under `MAX_W2M_MSG` (256 MiB) at this key count.
 ///
-/// The reactor parks a still-streaming worker's frames per req_id while the
-/// master's merge drains a different worker, and every parked frame holds one of
-/// the worker's `W2M_MAX_IN_FLIGHT` `InFlightState` slots — so the *minimum*
-/// frame size must keep `W2M_REGION_SIZE / frame_bytes` below that bound. The old
-/// fixed `U128` reply column made every frame 32 B/key; the variable span can be
-/// narrower, so the count is raised so the narrowest frame still clears the bound.
+/// The count is a pure throughput/memory knob: larger frames amortize the
+/// per-frame wire and park/drain overhead over more keys. It has no correctness
+/// floor — the W2M ring back-pressures a slow client by bytes, and
+/// `InFlightState` grows to track however many frames a ring holds, so any frame
+/// size is safe.
 const UNIQUE_PREFLIGHT_KEYS_PER_FRAME: usize = 1 << 20;
 
-const _: () = {
-    // Smallest possible per-key wire size: an 8-byte promoted span (the narrowest
-    // a unique index key can be — every ≤8-byte integer promotes to an 8-byte
-    // U64/I64 key) + 8 B weight + 8 B null word — the binding case for the
-    // in-flight-slot bound.
-    const PREFLIGHT_MIN_KEY_BYTES: usize = 8 + 8 + 8;
-    assert!(
-        w2m_ring::W2M_REGION_SIZE / (PREFLIGHT_MIN_KEY_BYTES * UNIQUE_PREFLIGHT_KEYS_PER_FRAME + 8)
-            < crate::runtime::w2m::W2M_MAX_IN_FLIGHT,
-        "unique pre-flight frames must be large enough that a full W2M ring holds \
-         fewer frames than the in-flight slots InFlightState can track",
-    );
-};
-
-/// Frame size for the unique pre-flight stream. Debug builds may shrink it
-/// via GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME so tests exercise multi-frame
-/// trains with small tables; such tests must keep the per-worker frame count
-/// under the `W2M_MAX_IN_FLIGHT` limit (see UNIQUE_PREFLIGHT_KEYS_PER_FRAME).
+/// Frame size for the unique pre-flight stream. Debug builds may shrink it via
+/// GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME so tests exercise multi-frame trains
+/// with small tables; any value is safe now that `InFlightState` grows with the
+/// parked depth (see UNIQUE_PREFLIGHT_KEYS_PER_FRAME).
 fn unique_preflight_keys_per_frame() -> usize {
     debug_env_usize("GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME")
         .filter(|&n| n > 0)
@@ -2018,15 +2009,18 @@ mod tests {
         let (region, writer) = make_ring();
         let ptr = region.ptr();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
+        let wire_row_stride = row_stride(&batch);
         wp.pending_streams.push_back(PendingScan {
-            wire_row_stride: row_stride(&batch),
             batch: Rc::new(batch),
-            next_row: 0,
             request_id: 7,
             client_id: 42,
             target_id: 1,
             prebuilt_schema: Some(schema_block),
             server_version: 0,
+            kind: PendingScanKind::WireSafe {
+                next_row: 0,
+                wire_row_stride,
+            },
         });
 
         wp.emit_pending_scan_chunk();
@@ -2066,15 +2060,18 @@ mod tests {
         let (region, writer) = make_ring();
         let ptr = region.ptr();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
+        let wire_row_stride = row_stride(&batch);
         wp.pending_streams.push_back(PendingScan {
-            wire_row_stride: row_stride(&batch),
             batch: Rc::new(batch),
-            next_row: 5,
             request_id: 9,
             client_id: 0,
             target_id: 1,
             prebuilt_schema: None,
             server_version: 0,
+            kind: PendingScanKind::WireSafe {
+                next_row: 5,
+                wire_row_stride,
+            },
         });
 
         wp.emit_pending_scan_chunk();
@@ -2116,7 +2113,7 @@ mod tests {
         let ptr = region.ptr();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
 
-        let err = wp.send_scan_response(1, Rc::new(batch), ReplySchema::None, 3, 0, 0);
+        let err = wp.send_scan_response(1, Rc::new(batch), ReplySchema::None, 3, 0, 0, false);
         assert!(err.is_ok(), "small wire-safe batch must not error");
         assert!(
             wp.pending_streams.is_empty(),
@@ -2143,6 +2140,109 @@ mod tests {
         for i in 0..5usize {
             assert_eq!(b.get_pk(i), i as u128);
         }
+    }
+
+    /// FLAG_SCAN_FIFO_REPLY (force_fifo=true) routes even an immediate-emit-
+    /// eligible wire-safe reply through `pending_streams`, so a multi-scan's
+    /// relations reach the ring in request order. Without the flag the identical
+    /// reply emits inline (test_send_scan_response_single_frame). Its lone chunk
+    /// is byte-shaped exactly like the single-frame path.
+    #[test]
+    fn test_force_fifo_queues_wire_safe_single_frame() {
+        let schema = test_schema();
+        let batch = make_n_row_batch(schema, 5);
+        let (region, writer) = make_ring();
+        let ptr = region.ptr();
+        let mut wp = make_test_worker(std::ptr::null_mut(), writer);
+
+        wp.send_scan_response(1, Rc::new(batch), ReplySchema::None, 3, 0, 0, true)
+            .unwrap();
+        assert_eq!(wp.pending_streams.len(), 1, "force_fifo must enqueue, not emit");
+        assert!(
+            matches!(
+                wp.pending_streams.front().map(|p| &p.kind),
+                Some(PendingScanKind::WireSafe { .. })
+            ),
+            "wire-safe reply queues as the WireSafe variant"
+        );
+        assert!(walk_frames(ptr).is_empty(), "nothing is emitted at enqueue time");
+
+        wp.emit_pending_scan_chunk();
+        assert!(wp.pending_streams.is_empty(), "a one-chunk train pops after one emit");
+        let frames = walk_frames(ptr);
+        assert_eq!(frames.len(), 1);
+        let ctrl = ipc::peek_control_block(&frames[0].1).unwrap();
+        assert_ne!(ctrl.flags & FLAG_SCAN_LAST, 0);
+        assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
+    }
+
+    /// The non-wire-safe (STRING/TEXT) reply must FIFO too: under force_fifo it
+    /// queues as `PendingScan::NonWireSafe` (not immediately emitted), and
+    /// `emit_pending_scan_chunk` emits its one blob-capable frame with
+    /// FLAG_CONTINUATION | FLAG_SCAN_LAST, then pops. This is the mainline case a
+    /// TEXT dimension table hits.
+    #[test]
+    fn test_force_fifo_queues_non_wire_safe_single_frame() {
+        use crate::catalog::ColumnDef;
+        use crate::schema::type_code;
+
+        let dir = worker_temp_dir("force_fifo_text");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let cols = vec![
+            ColumnDef {
+                name: "id".into(),
+                type_code: type_code::U64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+                is_hidden: false,
+            },
+            ColumnDef {
+                name: "s".into(),
+                type_code: type_code::STRING,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+                is_hidden: false,
+            },
+        ];
+        let tid = engine.create_table("public.tfifo", &cols, &[0], true).unwrap();
+        let schema = engine.get_schema_desc(tid).unwrap();
+        assert!(!schema_wire_safe(&schema), "STRING schema must be non-wire-safe");
+
+        let (region, writer) = make_ring();
+        let ptr = region.ptr();
+        let mut wp = make_test_worker(&mut engine as *mut CatalogEngine, writer);
+
+        // One all-zero TEXT row (empty inline string), well under MAX_W2M_MSG.
+        let batch = zero_batch(schema, 1);
+        wp.send_scan_response(tid as u64, Rc::new(batch), ReplySchema::Table(&schema), 5, 0, 0, true)
+            .unwrap();
+        assert_eq!(wp.pending_streams.len(), 1);
+        assert!(
+            matches!(
+                wp.pending_streams.front().map(|p| &p.kind),
+                Some(PendingScanKind::NonWireSafe)
+            ),
+            "TEXT reply must queue as the NonWireSafe variant under force_fifo"
+        );
+        assert!(walk_frames(ptr).is_empty(), "nothing is emitted at enqueue time");
+
+        wp.emit_pending_scan_chunk();
+        assert!(wp.pending_streams.is_empty(), "the single blob frame pops the train");
+        let frames = walk_frames(ptr);
+        assert_eq!(frames.len(), 1);
+        let ctrl = ipc::peek_control_block(&frames[0].1).unwrap();
+        assert_eq!(ctrl.status, STATUS_OK);
+        assert_ne!(ctrl.flags & FLAG_SCAN_LAST, 0);
+        assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
+        // Decodes via the blob-capable path; the first frame carries the schema block.
+        let decoded = ipc::decode_wire_ipc(&frames[0].1).expect("non-wire-safe frame decodes standalone");
+        assert!(decoded.schema.is_some(), "the frame carries the schema block");
+        assert_eq!(decoded.data_batch.map(|b| b.count).unwrap_or(0), 1);
+
+        engine.close();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// STRING-column schemas are not wire-safe: send_scan_response sends them as a
@@ -2225,25 +2325,31 @@ mod tests {
         let (region, writer) = make_ring();
         let ptr = region.ptr();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
+        let stride_a = row_stride(&batch_a);
         wp.pending_streams.push_back(PendingScan {
-            wire_row_stride: row_stride(&batch_a),
             batch: Rc::new(batch_a),
-            next_row: 0,
             request_id: 11,
             client_id: 0,
             target_id: 1,
             prebuilt_schema: Some(block_a),
             server_version: 0,
+            kind: PendingScanKind::WireSafe {
+                next_row: 0,
+                wire_row_stride: stride_a,
+            },
         });
+        let stride_b = row_stride(&batch_b);
         wp.pending_streams.push_back(PendingScan {
-            wire_row_stride: row_stride(&batch_b),
             batch: Rc::new(batch_b),
-            next_row: 0,
             request_id: 22,
             client_id: 0,
             target_id: 2,
             prebuilt_schema: Some(block_b),
             server_version: 0,
+            kind: PendingScanKind::WireSafe {
+                next_row: 0,
+                wire_row_stride: stride_b,
+            },
         });
 
         // One chunk per pass, as drain_sal drives it.
@@ -2355,7 +2461,10 @@ mod tests {
         assert!(err.is_ok(), "oversized wire-safe result must chunk, not error");
         assert_eq!(wp.pending_streams.len(), 1);
         let ps = wp.pending_streams.front().unwrap();
-        assert_eq!(ps.next_row, 0);
+        let PendingScanKind::WireSafe { next_row, .. } = &ps.kind else {
+            panic!("oversized wire-safe result must enqueue a WireSafe train");
+        };
+        assert_eq!(*next_row, 0);
         assert_eq!(ps.request_id, 5);
         assert_eq!(ps.client_id, 9);
         assert!(
@@ -2476,6 +2585,10 @@ mod tests {
         assert_eq!(wp.pending_streams.len(), 1);
         let expected_block = ipc::build_schema_wire_block(&projected, &[], 0, tid as u32);
         let ps = wp.pending_streams.front().unwrap();
+        assert!(
+            matches!(ps.kind, PendingScanKind::WireSafe { .. }),
+            "oversized projected reply must enqueue a WireSafe train"
+        );
         assert_eq!(
             ps.prebuilt_schema.as_deref().map(Vec::as_slice),
             Some(expected_block.as_slice()),

@@ -86,6 +86,58 @@ async def test_push_and_scan(aconn, table):
 
 
 @pytest.mark.asyncio
+async def test_scan_many_async(aconn, sync):
+    """Async scan_many resolves to a list of per-relation results in request
+    order, snapshotted at one SAL cut."""
+    sn = "am" + _uid()
+    sync.create_schema(sn)
+    a = sync.create_table(sn, "a", PK_VAL_COLS)
+    b = sync.create_table(sn, "b", PK_VAL_COLS)
+    try:
+        await aconn.push(a, _batch(PK_VAL_COLS, [{"pk": 1, "val": 10}, {"pk": 2, "val": 20}]))
+        await aconn.push(b, _batch(PK_VAL_COLS, [{"pk": 5, "val": 50}]))
+
+        results = await aconn.scan_many([a, b])
+        assert isinstance(results, list) and len(results) == 2
+        assert sorted((r.pk, r.val) for r in results[0] if r.weight > 0) == [(1, 10), (2, 20)]
+        assert sorted((r.pk, r.val) for r in results[1] if r.weight > 0) == [(5, 50)]
+
+        # A one-relation async scan_many matches an async scan.
+        one = await aconn.scan_many([a])
+        assert len(one) == 1
+        assert sorted((r.pk, r.val) for r in one[0] if r.weight > 0) == [(1, 10), (2, 20)]
+    finally:
+        sync.drop_schema(sn)
+
+
+@pytest.mark.asyncio
+async def test_scan_many_malformed_list_does_not_desync(aconn, sync):
+    """A malformed async scan_many is rejected client-side (before any frame is
+    sent) and leaves the connection fully usable. The empty case is the headline:
+    without local validation it sends a count=0 frame whose single server error
+    frame the N=0 read loop never consumes, desyncing every later request."""
+    sn = "am" + _uid()
+    sync.create_schema(sn)
+    a = sync.create_table(sn, "a", PK_VAL_COLS)
+    b = sync.create_table(sn, "b", PK_VAL_COLS)
+    try:
+        await aconn.push(a, _batch(PK_VAL_COLS, [{"pk": 1, "val": 10}]))
+        await aconn.push(b, _batch(PK_VAL_COLS, [{"pk": 5, "val": 50}]))
+
+        # Empty / over-cap / duplicate all raise locally, and after each the
+        # SAME connection still serves a valid scan_many correctly (the desync
+        # guard: a stale unread error frame would corrupt this follow-up read).
+        for bad in ([], list(range(a, a + 17)), [a, a]):
+            with pytest.raises(gnitz.GnitzError):
+                await aconn.scan_many(bad)
+            ok = await aconn.scan_many([a, b])
+            assert sorted((r.pk, r.val) for r in ok[0] if r.weight > 0) == [(1, 10)]
+            assert sorted((r.pk, r.val) for r in ok[1] if r.weight > 0) == [(5, 50)]
+    finally:
+        sync.drop_schema(sn)
+
+
+@pytest.mark.asyncio
 async def test_push_many_rows(aconn, table):
     """Push 200 rows and scan back — mirrors test_push_scan_multiworker."""
     tid, cols, _ = table

@@ -3,7 +3,7 @@ use super::error::ProtocolError;
 use super::header::WAL_BLOCK_HEADER_SIZE;
 use super::header::{
     wire_flags_get_schema_version, Header, WireConflictMode, FLAG_DDL_TXN, FLAG_HAS_DATA, FLAG_HAS_SCHEMA,
-    FLAG_PUSH_TXN, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
+    FLAG_PUSH_TXN, FLAG_SCAN_MULTI, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
 };
 use super::transport::ClientTransport;
 use super::types::{meta_schema, PkTuple, Schema, ZSetBatch};
@@ -226,6 +226,27 @@ pub fn encode_schema_block(schema: &Schema, tid: u32) -> Vec<u8> {
     encode_wal_block(meta_schema(), tid, &schema_to_batch(schema))
 }
 
+/// Encode the shared prologue of a transaction-shaped request frame: the reused
+/// control block (`target_id = 0`, all seek fields zero, the given `flags`)
+/// followed by the `u32` item count. The encode-side mirror of the decoder's
+/// `txn_frame_prologue`, shared by `encode_push_txn` / `encode_ddl_txn` /
+/// `encode_scan_multi` so the control-block + count layout lives in one place;
+/// the caller appends its own per-item body.
+fn encode_txn_frame_prologue(client_id: u64, flags: u64, count: usize) -> Vec<u8> {
+    let ctrl_hdr = Header {
+        status: STATUS_OK,
+        target_id: 0,
+        client_id,
+        flags,
+        seek_pk: 0,
+        seek_col_idx: 0,
+        request_id: 0,
+    };
+    let mut out = encode_control_block(&ctrl_hdr, "", &[]);
+    out.extend_from_slice(&(count as u32).to_le_bytes());
+    out
+}
+
 /// Encode an atomic user-table push transaction frame (`FLAG_PUSH_TXN`) into
 /// wire bytes (without the 4-byte frame header). Bundles N user-table families
 /// into one durable SAL zone — the client-facing analogue of `encode_ddl_txn`,
@@ -249,17 +270,7 @@ pub fn encode_push_txn(
     families: &[(u64, &Schema, &ZSetBatch, WireConflictMode)],
     preconditions: &[(u64, u64)],
 ) -> Vec<u8> {
-    let ctrl_hdr = Header {
-        status: STATUS_OK,
-        target_id: 0,
-        client_id,
-        flags: FLAG_PUSH_TXN,
-        seek_pk: 0,
-        seek_col_idx: 0,
-        request_id: 0,
-    };
-    let mut out = encode_control_block(&ctrl_hdr, "", &[]);
-    out.extend_from_slice(&(families.len() as u32).to_le_bytes());
+    let mut out = encode_txn_frame_prologue(client_id, FLAG_PUSH_TXN, families.len());
     for (tid, schema, batch, mode) in families {
         out.push(mode.as_u8());
         out.extend_from_slice(&encode_schema_block(schema, *tid as u32));
@@ -269,6 +280,23 @@ pub fn encode_push_txn(
     for (tid, basis) in preconditions {
         out.extend_from_slice(&tid.to_le_bytes());
         out.extend_from_slice(&basis.to_le_bytes());
+    }
+    out
+}
+
+/// Encode a `FLAG_SCAN_MULTI` request frame into wire bytes (without the 4-byte
+/// frame header): a consistent snapshot of N relations at one server-side SAL
+/// cut. Layout mirrors the txn frames — the reused control block
+/// (`target_id = 0`, `flags = FLAG_SCAN_MULTI`, schema-version bits left zero;
+/// per-relation versions ride the body), then a `u32` relation count, then per
+/// relation a `u64` tid and the client's `u16` cached schema version (`0` =
+/// none, so the server sends that relation's schema block). The server answers
+/// with N reply trains in this exact order; the caller reads them positionally.
+pub fn encode_scan_multi(client_id: u64, relations: &[(u64, u16)]) -> Vec<u8> {
+    let mut out = encode_txn_frame_prologue(client_id, FLAG_SCAN_MULTI, relations.len());
+    for (tid, version) in relations {
+        out.extend_from_slice(&tid.to_le_bytes());
+        out.extend_from_slice(&version.to_le_bytes());
     }
     out
 }
@@ -285,17 +313,7 @@ pub fn encode_push_txn(
 /// 16), so the server decoder walks the list by header alone with no schema in
 /// hand and defers schema resolution to the catalog layer.
 pub fn encode_ddl_txn(client_id: u64, families: &[(u64, &Schema, ZSetBatch)]) -> Vec<u8> {
-    let ctrl_hdr = Header {
-        status: STATUS_OK,
-        target_id: 0,
-        client_id,
-        flags: FLAG_DDL_TXN,
-        seek_pk: 0,
-        seek_col_idx: 0,
-        request_id: 0,
-    };
-    let mut out = encode_control_block(&ctrl_hdr, "", &[]);
-    out.extend_from_slice(&(families.len() as u32).to_le_bytes());
+    let mut out = encode_txn_frame_prologue(client_id, FLAG_DDL_TXN, families.len());
     for (tid, schema, batch) in families {
         out.extend_from_slice(&encode_wal_block(schema, *tid as u32, batch));
     }
@@ -582,6 +600,49 @@ mod tests {
         }
         assert_eq!(got_pre, vec![(16, 42), (17, 42)]);
         assert_eq!(off, payload.len(), "frame fully consumed");
+    }
+
+    /// Encode a `FLAG_SCAN_MULTI` frame (1, N, and 16 relations) and walk it
+    /// exactly as the engine decoder does: control block (target 0, only the
+    /// routing flag, zero schema-version bits — per-relation versions ride the
+    /// body), then `u32` count, then per relation a `u64` tid and a `u16` cached
+    /// schema version. There is no client-side decoder, so this is the
+    /// encode-side half of the roundtrip.
+    #[test]
+    fn scan_multi_frame_roundtrip() {
+        let cases: Vec<Vec<(u64, u16)>> = vec![
+            vec![(7, 0)],
+            vec![(7, 0), (8, 3), (9, u16::MAX)],
+            (0..16u64).map(|i| (100 + i, i as u16)).collect(),
+        ];
+        for relations in cases {
+            let payload = encode_scan_multi(0xABCD, &relations);
+
+            let ctrl_size = u32_at(&payload, gnitz_wire::WAL_OFF_SIZE);
+            let (hdr, _, _) = decode_control_block(&payload[..ctrl_size]).unwrap();
+            assert_eq!(hdr.flags, FLAG_SCAN_MULTI, "only the routing flag is set");
+            assert_eq!(
+                wire_flags_get_schema_version(hdr.flags),
+                0,
+                "control-block version bits stay zero"
+            );
+            assert_eq!(hdr.target_id, 0);
+            assert_eq!(hdr.client_id, 0xABCD);
+
+            let mut off = ctrl_size;
+            let count = u32_at(&payload, off);
+            off += 4;
+            assert_eq!(count, relations.len());
+            let mut got = Vec::new();
+            for _ in 0..count {
+                let tid = u64::from_le_bytes(payload[off..off + 8].try_into().unwrap());
+                let ver = u16::from_le_bytes(payload[off + 8..off + 10].try_into().unwrap());
+                off += 10;
+                got.push((tid, ver));
+            }
+            assert_eq!(got, relations);
+            assert_eq!(off, payload.len(), "frame fully consumed");
+        }
     }
 
     fn make_socketpair() -> (RawFd, RawFd) {

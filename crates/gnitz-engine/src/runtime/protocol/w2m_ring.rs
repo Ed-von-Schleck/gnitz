@@ -76,6 +76,23 @@ pub const W2M_REGION_SIZE: usize = 1 << 30;
 /// an unambiguous SKIP-marker sentinel in the size prefix.
 pub const MAX_W2M_MSG: u64 = 1 << 28;
 
+/// Bytes of the per-slot 8-byte prefix that carry the client length prefix
+/// (`sz as u32 LE`), stamped by `try_reserve` in the high half of the packed
+/// prefix so they sit immediately before the payload. The master forwards a slot
+/// to a client zero-copy by extending the payload slice back over these bytes
+/// (`ptr - SLOT_LEN_PREFIX_BYTES` in `W2mReceiver::try_read_slot`). The
+/// pack/unpack shift [`SLOT_LEN_PREFIX_SHIFT`] derives from this width, so this
+/// single constant governs both the producer's bit-packing and the consumer's
+/// byte slice — a prefix-layout change touches only here.
+pub const SLOT_LEN_PREFIX_BYTES: usize = 4;
+
+/// Bit shift of the `sz` field within the 8-byte slot prefix: `sz` occupies the
+/// high `SLOT_LEN_PREFIX_BYTES` bytes and `internal_req_id` the low
+/// `8 - SLOT_LEN_PREFIX_BYTES`, so `try_reserve` packs `sz << SHIFT` and
+/// `try_consume` reads `prefix >> SHIFT`. Derived from the byte width so the two
+/// can never drift.
+const SLOT_LEN_PREFIX_SHIFT: u32 = (8 - SLOT_LEN_PREFIX_BYTES as u32) * 8;
+
 /// Writer set this bit in `waiter_flags` while parked on `writer_seq`.
 /// Reader reads it before skipping a `FUTEX_WAKE` on publish.
 pub const FLAG_WRITER_PARKED: u32 = 1 << 0;
@@ -221,7 +238,10 @@ impl W2mRingHeader {
     pub fn arm_master_park(&self) -> (u32, bool) {
         self.waiter_flags().fetch_or(FLAG_MASTER_PARKED, Ordering::AcqRel);
         let expected = self.reader_seq().load(Ordering::Acquire);
-        let has_unread = self.write_cursor().load(Ordering::Acquire) != self.read_cursor().load(Ordering::Acquire);
+        // `write_cursor` is peer-written (the worker publishes it) and must stay
+        // `Acquire`; `read_cursor` is master-owned, so reading back our own last
+        // advance is a `Relaxed` load.
+        let has_unread = self.write_cursor().load(Ordering::Acquire) != self.read_cursor().load(Ordering::Relaxed);
         (expected, has_unread)
     }
 
@@ -441,14 +461,18 @@ pub(crate) unsafe fn try_reserve(
 
     let total = (8 + align8(sz)) as u64;
     let cap = hdr.capacity;
-    let vwc = hdr.write_cursor.load(Ordering::Acquire);
+    // `write_cursor` is producer-owned (this thread is its sole writer), so the
+    // load only reads back our own last commit — `Relaxed` suffices. The
+    // peer-written `consume_cursor` stays `Acquire` to observe the master's
+    // release of ring space.
+    let vwc = hdr.write_cursor.load(Ordering::Relaxed);
     let vcc = hdr.consume_cursor().load(Ordering::Acquire);
 
     if !room_for(vwc, vcc, total, cap) {
         return TryReserve::Full;
     }
 
-    let prefix = (internal_req_id as u64) | ((sz as u64) << 32);
+    let prefix = (internal_req_id as u64) | ((sz as u64) << SLOT_LEN_PREFIX_SHIFT);
     let phys_wc = phys(vwc, cap);
     let room_to_end = cap - phys_wc;
 
@@ -514,7 +538,9 @@ pub(crate) unsafe fn has_room(hdr: &W2mRingHeader, sz: usize) -> bool {
     }
     let total = (8 + align8(sz)) as u64;
     let cap = hdr.capacity;
-    let vwc = hdr.write_cursor.load(Ordering::Acquire);
+    // Producer-owned cursor (see `try_reserve`): `Relaxed` reads back our own
+    // last commit; the peer-written `consume_cursor` stays `Acquire`.
+    let vwc = hdr.write_cursor.load(Ordering::Relaxed);
     let vcc = hdr.consume_cursor().load(Ordering::Acquire);
     room_for(vwc, vcc, total, cap)
 }
@@ -590,8 +616,8 @@ pub unsafe fn try_consume(
     } else {
         raw_prefix
     };
-    // Low 32 bits: internal_req_id; high 32 bits: sz.
-    let size = (raw_prefix >> 32) as u32;
+    // Low 32 bits: internal_req_id; high 32 bits: sz (see SLOT_LEN_PREFIX_SHIFT).
+    let size = (raw_prefix >> SLOT_LEN_PREFIX_SHIFT) as u32;
     let req_id = raw_prefix as u32;
     if size == 0 {
         // Stale zero or torn read from a pre-wrap region the reader

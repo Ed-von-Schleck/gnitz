@@ -4,8 +4,8 @@ use std::sync::Arc;
 use crate::error::ClientError;
 use crate::protocol::message::{encode_message_noschema_parts, encode_message_parts, MessageParts};
 use crate::protocol::{
-    encode_ddl_txn, encode_push_txn, hello_handshake, recv_message, send_message, send_message_with_extra,
-    wire_flags_get_index_version, wire_flags_get_schema_version, wire_flags_set_conflict_mode,
+    encode_ddl_txn, encode_push_txn, encode_scan_multi, hello_handshake, recv_message, send_message,
+    send_message_with_extra, wire_flags_get_index_version, wire_flags_get_schema_version, wire_flags_set_conflict_mode,
     wire_flags_set_index_version, wire_flags_set_schema_version, ClientTransport, Message, PkTuple, ProtocolError,
     Schema, WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE,
     FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_GET_INDICES, FLAG_PUSH, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
@@ -25,6 +25,12 @@ const SCHEMA_CACHE_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::new(64)
 /// the (cached) `Schema`, the materialised `ZSetBatch` if any rows came back,
 /// and the server LSN at which the read was served.
 pub type ScanResult = Result<(Option<Arc<Schema>>, Option<ZSetBatch>, u64), ClientError>;
+
+/// The N per-relation results of a `scan_multi`, in request order. Each tuple is
+/// shaped exactly like a single [`ScanResult`]'s inner triple `(schema,
+/// data_batch, lsn)`. Every relation was snapshotted at the same server-side SAL
+/// cut, so an atomic multi-table commit is never torn across the result set.
+pub type MultiScanResult = Result<Vec<(Option<Arc<Schema>>, Option<ZSetBatch>, u64)>, ClientError>;
 
 /// Generate a session-unique client ID.
 ///
@@ -231,6 +237,34 @@ impl Session {
         self.recv_scan(target_id)
     }
 
+    /// Consistent multi-relation scan: snapshot every relation in `tids` at one
+    /// server-side SAL cut and return their results in request order. An atomic
+    /// multi-table commit (a `push_txn`) is either visible in every result or in
+    /// none — never torn across the set. `scan_multi(&[t]) == scan(t)`.
+    ///
+    /// Sends one SCAN_MULTI frame stamped with each relation's cached schema
+    /// version (so warm relations omit their schema block), then reads the N
+    /// reply trains positionally — the same continuation-reassembly and
+    /// cache-absorption `recv_scan` uses, run once per relation in request
+    /// order. Like `scan`, it does not advance any commit watermark. A duplicate
+    /// tid or a list outside `1..=SCAN_MULTI_MAX_RELATIONS` is rejected locally
+    /// (via [`gnitz_wire::validate_scan_multi_tids`], the same check the server
+    /// and the async path run) before the frame is sent; other shape/tid errors
+    /// surface from the server as `ClientError::ServerError`.
+    pub fn scan_multi(&mut self, tids: &[u64]) -> MultiScanResult {
+        gnitz_wire::validate_scan_multi_tids(tids).map_err(ClientError::ServerError)?;
+        let payload = self.encode_scan_multi_frame(tids);
+        self.transport.send_framed(&payload)?;
+        // Read the N trains positionally: train i == relation i in request order.
+        // `recv_scan` absorbs each relation's schema block into the cache and
+        // returns its (schema, batch, lsn) — reused verbatim, N times.
+        let mut results = Vec::with_capacity(tids.len());
+        for &tid in tids {
+            results.push(self.recv_scan(tid)?);
+        }
+        Ok(results)
+    }
+
     pub fn seek(&mut self, target_id: u64, pk: &PkTuple) -> ScanResult {
         let flags = self.versioned_flags(target_id, FLAG_SEEK);
         send_message(&mut self.transport, target_id, self.client_id, flags, pk, 0, None, None)?;
@@ -345,6 +379,22 @@ impl Session {
         encode_message_parts(target_id, self.client_id, flags, pk, 0, None, None)
     }
 
+    /// Pack a SCAN_MULTI request (control-only), stamping each relation with its
+    /// cached schema version. The whole self-contained frame body rides the
+    /// `ctrl` segment; the matching receiver reads N `recv_scan` trains in
+    /// request order. Performs NO shape validation of its own: the async driver
+    /// validates one level up (`PyAsyncTransport::scan_many` calls
+    /// [`gnitz_wire::validate_scan_multi_tids`] before enqueue), so by the time
+    /// this is reached `tids` is already a non-empty, duplicate-free list within
+    /// `1..=SCAN_MULTI_MAX_RELATIONS`.
+    pub fn pack_scan_multi(&self, tids: &[u64]) -> MessageParts {
+        MessageParts {
+            ctrl: self.encode_scan_multi_frame(tids),
+            schema: None,
+            data: Vec::new(),
+        }
+    }
+
     /// Ship many pre-encoded frames as one vectored write sequence.
     pub fn send_batch(&mut self, parts: &[MessageParts]) -> Result<(), ProtocolError> {
         self.transport.send_framed_batch(parts)
@@ -383,11 +433,25 @@ impl Session {
         self.recv_cached(target_id)
     }
 
+    /// The client's cached schema version for `tid` (`0` = no cached schema, so
+    /// the server sends the block). `peek` leaves LRU recency untouched — a
+    /// version probe is not an access.
+    fn cached_schema_version(&self, tid: u64) -> u16 {
+        self.schema_cache.peek(&tid).map(|(_, v)| *v).unwrap_or(0)
+    }
+
+    /// Build a SCAN_MULTI request frame, stamping each tid with its cached schema
+    /// version. Shared by the sync `scan_multi` (which sends it) and the async
+    /// `pack_scan_multi` (which wraps it as the control segment).
+    fn encode_scan_multi_frame(&self, tids: &[u64]) -> Vec<u8> {
+        let relations: Vec<(u64, u16)> = tids.iter().map(|&tid| (tid, self.cached_schema_version(tid))).collect();
+        encode_scan_multi(self.client_id, &relations)
+    }
+
     /// The cached schema version for `target_id` OR'd into the flag word, so a
     /// warm-cache request lets the server omit the schema block.
     fn versioned_flags(&self, target_id: u64, base: u64) -> u64 {
-        let cached_version = self.schema_cache.peek(&target_id).map(|(_, v)| *v).unwrap_or(0);
-        wire_flags_set_schema_version(base, cached_version)
+        wire_flags_set_schema_version(base, self.cached_schema_version(target_id))
     }
 
     /// Recover the schema for a single-frame seek response and assemble the

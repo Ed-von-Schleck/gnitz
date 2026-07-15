@@ -79,6 +79,67 @@ pub const FLAG_ALLOCATE_INDEX_ID: u64 = 1 << 60;
 /// 61, the next free high client-only bit above `FLAG_ALLOCATE_INDEX_ID`.
 pub const FLAG_PUSH_TXN: u64 = 1 << 61;
 
+/// SCAN_MULTI request flag. Client→master frame naming N relations to snapshot
+/// at one SAL cut. Wire-level routing hint consumed at `handle_message`; never
+/// written to the SAL. Bit 62 — the next free high client-only bit above
+/// `FLAG_PUSH_TXN` (61); 63 is the sign bit, left clear.
+pub const FLAG_SCAN_MULTI: u64 = 1 << 62;
+
+/// Maximum relations in one SCAN_MULTI request. A product / master-state limit
+/// (the master holds N `ScanLease`s and N reply trains of bookkeeping); a
+/// handful of related tables covers realistic consistent snapshots. Shared by
+/// the client encoder's shape check and the engine's decode/handler so both
+/// sides agree on the ceiling.
+pub const SCAN_MULTI_MAX_RELATIONS: usize = 16;
+
+/// Validate a `scan_multi` / `scan_many` relation list against the SCAN_MULTI
+/// wire-shape rules: non-empty, at most `SCAN_MULTI_MAX_RELATIONS`, no duplicate
+/// tid. The single source of truth for these checks, shared by every entry point
+/// — the sync `Session::scan_multi`, the async `PyAsyncTransport::scan_many`, and
+/// the server's authoritative `scan_multi_body` — so all three reject an identical
+/// set with identical wording.
+///
+/// The empty check is load-bearing on the client, not cosmetic: an empty list
+/// encodes a count=0 frame whose single server error frame the positional N-train
+/// read loop (N=0) never consumes, leaving it unread and desyncing the
+/// connection. Over-cap / duplicate are non-empty, so their round-tripped error
+/// frame is always consumed by the first `recv_scan`; validating them
+/// client-side is a fast-fail nicety. The O(n²) duplicate scan is over n ≤ 16.
+pub fn validate_scan_multi_tids(tids: &[u64]) -> Result<(), String> {
+    if tids.is_empty() {
+        return Err("SCAN_MULTI: empty relation list".to_string());
+    }
+    if tids.len() > SCAN_MULTI_MAX_RELATIONS {
+        return Err(format!(
+            "SCAN_MULTI: too many relations ({}, max {SCAN_MULTI_MAX_RELATIONS})",
+            tids.len()
+        ));
+    }
+    for (i, &tid) in tids.iter().enumerate() {
+        if tids[..i].contains(&tid) {
+            return Err(format!("SCAN_MULTI: duplicate relation {tid}"));
+        }
+    }
+    Ok(())
+}
+
+/// FIFO-reply directive on a master→worker scan group. Set by
+/// `dispatch_scan_multi_fanout` on every group of a multi-scan so the worker
+/// routes that relation's reply through `pending_streams` (strict FIFO ring
+/// order) instead of the immediate-emit fast path — the multi-scan drain
+/// requires ring order to equal request order.
+///
+/// **Deliberately aliases `FLAG_SCAN_MULTI`** (defined as its value so the two
+/// can never silently drift apart); disambiguated purely by frame direction. Bit
+/// 62 on a *client→master* frame is the SCAN_MULTI request (consumed at
+/// `handle_message`, never propagated into a SAL group); on a *master→worker scan
+/// group* it is this FIFO directive. The full u64 survives into the group's
+/// control block, so the worker reads it back as an ordinary wire flag. It is
+/// therefore deliberately **not** added to the `high_flags` disjointness guard
+/// below (doing so would trip the collision assert against `FLAG_SCAN_MULTI`,
+/// which the guard already covers).
+pub const FLAG_SCAN_FIFO_REPLY: u64 = FLAG_SCAN_MULTI;
+
 /// Engine-internal batch-layout claims stamped on SAL / W2M frames
 /// (sorted / consolidated); never sent to clients. Defined here so the
 /// disjointness guard below covers them against every wire flag.
@@ -128,6 +189,7 @@ const _: () = {
         FLAG_ALLOCATE_SCHEMA_ID,
         FLAG_ALLOCATE_INDEX_ID,
         FLAG_PUSH_TXN,
+        FLAG_SCAN_MULTI,
     ];
     let mut acc = SAL_FLAGS_MASK | packed;
     let mut i = 0;
@@ -244,3 +306,38 @@ pub const META_FLAG_HIDDEN: u64 = 4;
 /// with `a` at column 1 and `b` at column 2 must decode to `[2, 1]`).
 pub const META_FLAG_PK_POS_SHIFT: u32 = 8;
 pub const META_FLAG_PK_POS_MASK: u64 = 0xFF << META_FLAG_PK_POS_SHIFT;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_scan_multi_tids_accepts_valid_lists() {
+        assert!(validate_scan_multi_tids(&[7]).is_ok());
+        let full: Vec<u64> = (0..SCAN_MULTI_MAX_RELATIONS as u64).collect();
+        assert!(validate_scan_multi_tids(&full).is_ok(), "a full-cap list is valid");
+    }
+
+    #[test]
+    fn validate_scan_multi_tids_rejects_empty() {
+        assert_eq!(
+            validate_scan_multi_tids(&[]).unwrap_err(),
+            "SCAN_MULTI: empty relation list"
+        );
+    }
+
+    #[test]
+    fn validate_scan_multi_tids_rejects_over_cap() {
+        let over: Vec<u64> = (0..=SCAN_MULTI_MAX_RELATIONS as u64).collect();
+        let err = validate_scan_multi_tids(&over).unwrap_err();
+        assert!(err.starts_with("SCAN_MULTI: too many relations"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_scan_multi_tids_rejects_duplicate() {
+        assert_eq!(
+            validate_scan_multi_tids(&[7, 8, 7]).unwrap_err(),
+            "SCAN_MULTI: duplicate relation 7"
+        );
+    }
+}

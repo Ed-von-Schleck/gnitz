@@ -312,22 +312,7 @@ impl MasterDispatcher {
         // frame at the ring boundary.
         let (slots, req_ids, _lease) =
             dispatch_scan_fanout(disp_ptr, reactor, sal_excl, unicast, |disp, req_ids, unicast| {
-                let (schema, block, _safe, _stride) = disp.cached_schema_block(table_id);
-                disp.write_group_with_req_ids(
-                    table_id,
-                    0,
-                    0,
-                    &[],
-                    &schema,
-                    &[],
-                    0,
-                    0,
-                    req_ids,
-                    unicast,
-                    0,
-                    Some(block.as_slice()),
-                    &[],
-                )
+                disp.write_one_scan_group(table_id, 0, req_ids, unicast, 0)
             })
             .await?;
 

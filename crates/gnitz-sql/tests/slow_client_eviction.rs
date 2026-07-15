@@ -180,8 +180,8 @@ fn healthy_scan_is_not_evicted_under_short_deadline() {
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
     );
     let (table_id, schema) = client.resolve_table_id(&sn, "t").unwrap();
-    // Keep each worker's train under the 64-frame in-flight bound (64 × 16 KiB =
-    // 1 MiB): 8000 rows across 4 workers ≈ 100 KB/worker ≈ a handful of frames.
+    // 8000 rows across 4 workers ≈ 100 KB/worker ≈ a handful of 16 KiB frames —
+    // enough to make the train multi-frame without a large table.
     push_block(&mut client, table_id, &schema, 0, 8000);
 
     // The high-level client drains the whole multi-frame train at a normal pace.

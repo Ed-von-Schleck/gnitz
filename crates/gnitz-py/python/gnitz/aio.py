@@ -103,6 +103,14 @@ class AsyncConnection:
         """Scan a table/view.  Returns a ``ScanResult``."""
         return await self._transport.scan(target_id, include_hidden)
 
+    async def scan_many(self, target_ids, include_hidden=False):
+        """Consistent snapshot of N relations at one server-side SAL cut.
+
+        Returns a ``list`` of ``ScanResult`` in request order.  An atomic
+        multi-table transaction is never observed torn across the list.
+        """
+        return await self._transport.scan_many(target_ids, include_hidden)
+
     async def seek(self, table_id, pk=0, include_hidden=False):
         """Point-lookup by primary key.  Returns a ``ScanResult``."""
         return await self._transport.seek(table_id, pk, include_hidden)
@@ -170,5 +178,14 @@ class Pipeline:
     def scan(self, target_id, include_hidden=False):
         """Queue a scan.  Does not ``await`` — sends immediately."""
         fut = self._conn._transport.scan(target_id, include_hidden)
+        self._futures.append(fut)
+        return fut
+
+    def scan_many(self, target_ids, include_hidden=False):
+        """Queue a consistent multi-relation scan.  Does not ``await``.
+
+        Resolves to a ``list`` of ``ScanResult`` in request order.
+        """
+        fut = self._conn._transport.scan_many(target_ids, include_hidden)
         self._futures.append(fut)
         return fut

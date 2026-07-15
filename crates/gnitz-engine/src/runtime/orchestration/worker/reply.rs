@@ -7,23 +7,39 @@ use super::*;
 // PendingScan
 // ---------------------------------------------------------------------------
 
-/// State for one multi-chunk reply train (scan, or an oversized seek/gather
-/// reply) in progress. The worker emits one frame per `drain_sal` pass;
-/// `next_row == 0` means the first chunk still needs a schema block. Non-zero
-/// `next_row` is a pure-data continuation.
+/// One reply train queued in `pending_streams`, emitted one frame per
+/// `drain_sal` pass in strict FIFO order. The common fields carry the reply's
+/// routing/schema identity; `kind` selects the emission shape. `prebuilt_schema`
+/// present ⇒ the first frame carries that block; absent ⇒ no schema is written
+/// (the `SchemaDescriptor` is deliberately not stored — a prebuilt block
+/// supersedes it, and with it omitted no schema is written at all).
 pub(super) struct PendingScan {
     pub(super) batch: Rc<Batch>,
-    pub(super) next_row: usize,
     pub(super) request_id: u64,
     pub(super) client_id: u64,
     pub(super) target_id: u64,
     pub(super) prebuilt_schema: Option<Rc<Vec<u8>>>,
     pub(super) server_version: u16,
-    /// Per-row wire stride of `batch` (wire-safe schemas only — constant per
-    /// row), computed once at enqueue so each chunk emission recomputes only
-    /// the frame base (the first chunk carries the schema block,
-    /// continuations don't).
-    pub(super) wire_row_stride: usize,
+    pub(super) kind: PendingScanKind,
+}
+
+/// The two emission shapes of a `PendingScan`:
+///
+/// * `WireSafe` — a fixed-width columnar train (empty blob region) emitted via
+///   `encode_wire_into_range`, chunked across frames when it exceeds
+///   `reply_frame_budget`. `next_row` tracks emission progress (`0` ⇒ the first
+///   chunk still owes the schema block; non-zero ⇒ a pure-data continuation);
+///   `wire_row_stride` is the constant per-row wire size, computed once at
+///   enqueue so each chunk recomputes only the frame base. This is the only
+///   shape a plain scan or an oversized seek/gather reply produces.
+/// * `NonWireSafe` — a STRING/German-string (blob-bearing) result that cannot
+///   chunk: exactly one frame via the blob-capable `encode_wire_into`. Reached
+///   only on the multi-scan FIFO path (`force_fifo`), where even an
+///   immediate-emit-eligible reply must queue so ring order equals request
+///   order; the plain scan path still emits such a reply inline.
+pub(super) enum PendingScanKind {
+    WireSafe { next_row: usize, wire_row_stride: usize },
+    NonWireSafe,
 }
 
 impl WorkerProcess {
@@ -213,6 +229,7 @@ impl WorkerProcess {
     /// is emitted at the top of the next `drain_sal` pass. For non-wire-safe
     /// (STRING-column) schemas, a single frame is sent; returns an error message
     /// if the batch exceeds `MAX_W2M_MSG`.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn send_scan_response(
         &mut self,
         target_id: u64,
@@ -221,6 +238,7 @@ impl WorkerProcess {
         request_id: u64,
         client_id: u64,
         client_version: u16,
+        force_fifo: bool,
     ) -> Result<(), String> {
         let tid_key = target_id as i64;
         // Obtain prebuilt schema block + server version. include_schema controls
@@ -242,8 +260,11 @@ impl WorkerProcess {
 
         if !is_wire_safe {
             // STRING-column tables: no chunking. Check size; error if too big.
+            // Sized with descriptor=None to match `emit_non_wire_safe` exactly (a
+            // prebuilt block, present whenever a schema is emitted, supersedes the
+            // descriptor, so this equals sizing with `schema_for_encode`).
             let prebuilt = prebuilt_rc.as_deref().map(Vec::as_slice);
-            let wire_sz = ipc::wire_size(STATUS_OK, &[], schema_for_encode, None, Some(&*batch), prebuilt, &[]);
+            let wire_sz = ipc::wire_size(STATUS_OK, &[], None, None, Some(&*batch), prebuilt, &[]);
             if wire_sz > w2m_ring::MAX_W2M_MSG as usize {
                 return Err(format!(
                     "scan: batch wire_size={wire_sz} > MAX_W2M_MSG={}; \
@@ -251,26 +272,24 @@ impl WorkerProcess {
                     w2m_ring::MAX_W2M_MSG
                 ));
             }
-            let flags = schema_version_flags | FLAG_CONTINUATION | FLAG_SCAN_LAST;
-            self.w2m_writer.send_encoded(wire_sz, request_id as u32, |buf| {
-                ipc::encode_wire_into(
-                    buf,
-                    0,
-                    target_id,
+            if force_fifo {
+                // Multi-scan: queue the single blob frame so this relation
+                // reaches the ring in request order (the FIFO reply contract).
+                // The oversize reject above stays at enqueue time —
+                // `emit_pending_scan_chunk` is infallible, so only the encode is
+                // deferred; the emit recomputes `wire_sz` identically.
+                self.pending_streams.push_back(PendingScan {
+                    batch,
+                    request_id,
                     client_id,
-                    flags,
-                    0u128,
-                    0,
-                    0,
-                    STATUS_OK,
-                    &[],
-                    schema_for_encode,
-                    None,
-                    Some(&*batch),
-                    prebuilt,
-                    &[],
-                );
-            });
+                    target_id,
+                    prebuilt_schema: prebuilt_rc,
+                    server_version,
+                    kind: PendingScanKind::NonWireSafe,
+                });
+                return Ok(());
+            }
+            self.emit_non_wire_safe(target_id, &batch, request_id, client_id, prebuilt, server_version);
             return Ok(());
         }
 
@@ -281,10 +300,12 @@ impl WorkerProcess {
             ipc::wire_size_range(STATUS_OK, &[], schema_for_encode, None, &batch, total_rows, prebuilt)
         };
 
-        if total_sz <= self.reply_frame_budget {
+        if !force_fifo && total_sz <= self.reply_frame_budget {
             // Single-frame response: FLAG_CONTINUATION keeps the client reading
             // (terminal frame signals scan end); FLAG_SCAN_LAST tells master this
-            // worker's chunk train is done.
+            // worker's chunk train is done. Skipped under `force_fifo`: a
+            // multi-scan queues even a one-frame reply so ring order equals
+            // request order.
             let prebuilt = prebuilt_rc.as_deref().map(Vec::as_slice);
             let flags = schema_version_flags | FLAG_CONTINUATION | FLAG_SCAN_LAST;
             self.w2m_writer.send_encoded(total_sz, request_id as u32, |buf| {
@@ -304,8 +325,11 @@ impl WorkerProcess {
                 );
             });
         } else {
-            // Multi-chunk: enqueue the train; its first chunk is emitted on the
-            // next drain_sal pass, after any earlier queued train fully drains.
+            // Enqueue the train; its first chunk is emitted on the next
+            // drain_sal pass, after any earlier queued train fully drains. This
+            // covers both a genuinely multi-chunk reply and the `force_fifo`
+            // single-frame case — a one-chunk train whose lone chunk is the same
+            // ≤budget frame the immediate path would send.
             self.enqueue_stream(batch, request_id, client_id, target_id, prebuilt_rc, server_version);
         }
 
@@ -331,13 +355,15 @@ impl WorkerProcess {
             - ipc::wire_size_range(STATUS_OK, &[], None, None, &batch, 0, None);
         self.pending_streams.push_back(PendingScan {
             batch,
-            next_row: 0,
             request_id,
             client_id,
             target_id,
             prebuilt_schema,
             server_version,
-            wire_row_stride,
+            kind: PendingScanKind::WireSafe {
+                next_row: 0,
+                wire_row_stride,
+            },
         });
     }
 
@@ -346,23 +372,102 @@ impl WorkerProcess {
     /// while `pending_streams` is non-empty (see the field doc for why
     /// emission is FIFO and confined to `drain_sal` / `run`). Unit tests set
     /// a small `reply_frame_budget` to force multi-frame trains from small
-    /// batches.
+    /// batches. Dispatches on the front train's shape: a `WireSafe` train emits
+    /// its next columnar chunk; a `NonWireSafe` train emits its one blob frame
+    /// and always pops.
     pub(super) fn emit_pending_scan_chunk(&mut self) {
+        match self.pending_streams.front().map(|p| &p.kind) {
+            None => (),
+            Some(PendingScanKind::WireSafe { .. }) => self.emit_wire_safe_chunk(),
+            Some(PendingScanKind::NonWireSafe) => self.emit_non_wire_safe_frame(),
+        }
+    }
+
+    /// Emit one non-wire-safe (STRING/blob) scan reply as a single terminal
+    /// frame (`FLAG_CONTINUATION | FLAG_SCAN_LAST`, schema block iff `prebuilt`
+    /// is `Some`) via the blob-capable `encode_wire_into`. The descriptor is
+    /// always `None`: a prebuilt block, present whenever a schema is emitted,
+    /// supersedes it. Shared by the immediate branch of `send_scan_response` and
+    /// the queued `emit_non_wire_safe_frame` (multi-scan FIFO) so the two produce
+    /// byte-identical frames. Callers enforce the `MAX_W2M_MSG` limit first.
+    fn emit_non_wire_safe(
+        &mut self,
+        target_id: u64,
+        batch: &Batch,
+        request_id: u64,
+        client_id: u64,
+        prebuilt: Option<&[u8]>,
+        server_version: u16,
+    ) {
+        let flags = gnitz_wire::wire_flags_set_schema_version(FLAG_CONTINUATION | FLAG_SCAN_LAST, server_version);
+        let wire_sz = ipc::wire_size(STATUS_OK, &[], None, None, Some(batch), prebuilt, &[]);
+        self.w2m_writer.send_encoded(wire_sz, request_id as u32, |buf| {
+            ipc::encode_wire_into(
+                buf,
+                0,
+                target_id,
+                client_id,
+                flags,
+                0u128,
+                0,
+                0,
+                STATUS_OK,
+                &[],
+                None,
+                None,
+                Some(batch),
+                prebuilt,
+                &[],
+            );
+        });
+    }
+
+    /// Emit the single blob frame of a `NonWireSafe` front train and pop it. The
+    /// oversize reject already fired at enqueue, so `emit_non_wire_safe`'s
+    /// internal sizing call here is pure.
+    fn emit_non_wire_safe_frame(&mut self) {
+        // This train always emits exactly one frame and always pops, so pop it
+        // up front and move its fields straight into the emit — no clone needed.
+        let Some(p) = self.pending_streams.pop_front() else {
+            return;
+        };
+        self.emit_non_wire_safe(
+            p.target_id,
+            &p.batch,
+            p.request_id,
+            p.client_id,
+            p.prebuilt_schema.as_deref().map(Vec::as_slice),
+            p.server_version,
+        );
+    }
+
+    /// Emit the next columnar chunk of a `WireSafe` front train, updating its
+    /// `next_row` or popping it on the terminal chunk.
+    fn emit_wire_safe_chunk(&mut self) {
         let budget = self.reply_frame_budget;
         let (batch, next_row, request_id, client_id, target_id, prebuilt_schema, server_version, per_row) = {
-            let ps = match self.pending_streams.front() {
-                Some(ps) => ps,
-                None => return,
+            let Some(p) = self.pending_streams.front() else {
+                return;
+            };
+            let PendingScanKind::WireSafe {
+                next_row,
+                wire_row_stride,
+            } = &p.kind
+            else {
+                // `emit_pending_scan_chunk` only routes a WireSafe front here, and
+                // nothing mutates the queue in between — same invariant the
+                // has-more branch below asserts with `unreachable!`.
+                unreachable!("emit_wire_safe_chunk: front train is not WireSafe");
             };
             (
-                Rc::clone(&ps.batch),
-                ps.next_row,
-                ps.request_id,
-                ps.client_id,
-                ps.target_id,
-                ps.prebuilt_schema.clone(),
-                ps.server_version,
-                ps.wire_row_stride,
+                Rc::clone(&p.batch),
+                *next_row,
+                p.request_id,
+                p.client_id,
+                p.target_id,
+                p.prebuilt_schema.clone(),
+                p.server_version,
+                *wire_row_stride,
             )
         };
 
@@ -416,10 +521,10 @@ impl WorkerProcess {
         });
 
         if has_more {
-            self.pending_streams
-                .front_mut()
-                .expect("emit_pending_scan_chunk: front train vanished mid-emit")
-                .next_row = next_row + max_rows;
+            match self.pending_streams.front_mut().map(|p| &mut p.kind) {
+                Some(PendingScanKind::WireSafe { next_row: nr, .. }) => *nr = next_row + max_rows,
+                _ => unreachable!("emit_wire_safe_chunk: front train changed shape mid-emit"),
+            }
         } else {
             self.pending_streams.pop_front();
         }

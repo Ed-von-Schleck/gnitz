@@ -146,6 +146,40 @@ pub(crate) fn replicated_unicast(disp_ptr: *mut MasterDispatcher, target_id: i64
     }
 }
 
+/// Allocate a scan group's per-worker request ids and register them into a
+/// fresh `ScanLease`, the setup both `dispatch_scan_fanout` and
+/// `dispatch_scan_multi_fanout` need before their SAL write. `unicast >= 0`
+/// (single-source) allocates ONE id mirrored across the array — only that
+/// worker's slot is written and replies; `unicast < 0` (broadcast) allocates
+/// `nw` distinct ids. The lease is registered BEFORE any await, so a cancelled
+/// drain still deregisters the ids and `route_scan_slot` discards late frames.
+/// The returned lease MUST be bound to a named local held to the end of the
+/// caller's drain scope (never a bare `_`, which would drop it immediately and
+/// re-open the wedge).
+fn alloc_scan_req_ids_and_lease(
+    reactor: &crate::runtime::reactor::Reactor,
+    nw: usize,
+    unicast: i32,
+) -> ([u64; crate::runtime::sal::MAX_WORKERS], ScanLease) {
+    let mut req_ids = [0u64; crate::runtime::sal::MAX_WORKERS];
+    if unicast >= 0 {
+        // Single-source: one id mirrored across every slot; only worker
+        // `unicast`'s slot is written and replies, so the lease holds that one id.
+        let id = reactor.alloc_scan_request_id();
+        req_ids[..nw].fill(id);
+        (req_ids, reactor.scan_lease(&[id as u32]))
+    } else {
+        // Broadcast: a distinct id per worker, each registered in the lease.
+        let mut scan_ids = [0u32; crate::runtime::sal::MAX_WORKERS];
+        for (r, s) in req_ids[..nw].iter_mut().zip(&mut scan_ids[..nw]) {
+            let id = reactor.alloc_scan_request_id();
+            *r = id;
+            *s = id as u32;
+        }
+        (req_ids, reactor.scan_lease(&scan_ids[..nw]))
+    }
+}
+
 /// Fan a scan/seek group out to the workers under `submit` and await their
 /// raw `W2mSlot` replies, returned so the caller can forward or merge them
 /// without an intermediate decode/copy.
@@ -183,29 +217,7 @@ where
 {
     let nw = unsafe { (*disp_ptr).num_workers };
     let single = unicast >= 0;
-    let mut req_ids = [0u64; crate::runtime::sal::MAX_WORKERS];
-    if single {
-        let id = reactor.alloc_scan_request_id();
-        for slot in req_ids[..nw].iter_mut() {
-            *slot = id;
-        }
-    } else {
-        for id in req_ids[..nw].iter_mut() {
-            *id = reactor.alloc_scan_request_id();
-        }
-    }
-
-    // Register the ids active BEFORE any await so a cancelled first-frame await
-    // still deregisters them and route_scan_slot discards late frames. The
-    // returned lease MUST be bound to a named local held to end of the caller's
-    // drain scope (never a bare `_`, which would drop it immediately and
-    // re-open the wedge). A single-source dispatch has just the one active id.
-    let n_active = if single { 1 } else { nw };
-    let mut scan_ids = [0u32; crate::runtime::sal::MAX_WORKERS];
-    for (d, &s) in scan_ids[..n_active].iter_mut().zip(&req_ids[..n_active]) {
-        *d = s as u32;
-    }
-    let lease = reactor.scan_lease(&scan_ids[..n_active]);
+    let (req_ids, lease) = alloc_scan_req_ids_and_lease(reactor, nw, unicast);
 
     {
         let _guard = sal_excl.lock().await;
@@ -219,13 +231,84 @@ where
             }
         }
     }
-    let slots = if single {
-        vec![reactor.await_scan_slot(req_ids[0] as u32).await]
-    } else {
-        crate::runtime::reactor::join_all_unpin(req_ids[..nw].iter().map(|&id| reactor.await_scan_slot(id as u32)))
-            .await
-    };
+    let slots = dispatch::await_scan_slots(reactor, unicast, &req_ids, nw).await;
     Ok((slots, req_ids, lease))
+}
+
+/// One relation's dispatch handle from `dispatch_scan_multi_fanout`: its
+/// per-worker request ids, its unicast routing (`>= 0` = single worker index,
+/// `-1` = broadcast), and the live `ScanLease` keeping those ids registered
+/// until the master finishes draining the relation. The caller holds every
+/// dispatch (hence every lease) for the whole of the sequential drain; dropping
+/// them deregisters the ids and discards any queued/future frames, cancelling
+/// the multi-scan on client death.
+pub(crate) struct MultiScanDispatch {
+    pub(crate) req_ids: [u64; crate::runtime::sal::MAX_WORKERS],
+    pub(crate) unicast: i32,
+    // Held only for its RAII effect (the `_` name silences the never-read lint);
+    // its drop deregisters the relation's scan ids.
+    _lease: ScanLease,
+}
+
+/// One SAL cut across N relations: write all N scan groups back-to-back under a
+/// single `sal_writer_excl` hold, then return each relation's dispatch handle.
+/// The read-side sibling of `commit_pushes`'s "N groups under one hold" — the
+/// mutual exclusion both forces the one cut (no push / tick / commit-zone group
+/// can land between the scan groups, so every worker snapshots all N relations
+/// at the same SAL position) and, as a side effect, serialises two concurrent
+/// multi-scans.
+///
+/// Deliberately NOT a loop over `dispatch_scan_fanout`: that re-locks per call,
+/// so N calls would reopen the lock N times and destroy the one cut. This awaits
+/// nothing — the lock is held only for the synchronous write + signal, and the
+/// caller drains each relation's reply train sequentially in request order (the
+/// `FLAG_SCAN_FIFO_REPLY` contract). Every group carries that flag so workers
+/// queue the reply in request order.
+///
+/// `relations` gives, per relation in request order, `(tid, unicast,
+/// effective_client_version)`; returns one `MultiScanDispatch` per relation in
+/// the same order. Each relation's ids are registered into their own lease
+/// BEFORE the lock (and before any await), so a cancelled drain still
+/// deregisters them and `route_scan_slot` discards late frames.
+pub(crate) async fn dispatch_scan_multi_fanout(
+    disp_ptr: *mut MasterDispatcher,
+    reactor: &crate::runtime::reactor::Reactor,
+    sal_excl: &Rc<AsyncMutex<()>>,
+    client_id: u64,
+    relations: &[(i64, i32, u16)],
+) -> Result<Vec<MultiScanDispatch>, String> {
+    let nw = unsafe { (*disp_ptr).num_workers };
+    // Allocate ids + register every relation's lease BEFORE the lock (no await
+    // between here and the write). A broadcast relation gets one id per worker;
+    // a unicast one gets a single id mirrored across the array (only its
+    // worker's slot is written and replies).
+    let mut dispatches: Vec<MultiScanDispatch> = Vec::with_capacity(relations.len());
+    for &(_tid, unicast, _ver) in relations {
+        let (req_ids, lease) = alloc_scan_req_ids_and_lease(reactor, nw, unicast);
+        dispatches.push(MultiScanDispatch {
+            req_ids,
+            unicast,
+            _lease: lease,
+        });
+    }
+
+    // One hold: write every scan group at a consecutive `write_cursor` position,
+    // then signal once. The reactor is single-threaded and each write has no
+    // `.await`, so the groups land contiguously — the single cut. The lock
+    // releases at block end, before the caller's first await.
+    {
+        let _guard = sal_excl.lock().await;
+        unsafe {
+            let disp = &mut *disp_ptr;
+            for (&(tid, unicast, eff_ver), d) in relations.iter().zip(&dispatches) {
+                let wire_flags =
+                    gnitz_wire::wire_flags_set_schema_version(0, eff_ver) | gnitz_wire::FLAG_SCAN_FIFO_REPLY;
+                disp.write_one_scan_group(tid, wire_flags, &d.req_ids[..nw], unicast, client_id)?;
+            }
+            disp.signal_all();
+        }
+    }
+    Ok(dispatches)
 }
 
 /// Parse one frame header of worker `w`'s continuation train. Returns the

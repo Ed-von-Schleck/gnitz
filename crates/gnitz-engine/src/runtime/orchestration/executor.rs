@@ -31,7 +31,9 @@ use crate::catalog::{
 };
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingTxn};
 use crate::runtime::lsn::ZoneLsnAllocator;
-use crate::runtime::master::{first_worker_error_opt, MasterDispatcher, TxnFamily};
+use crate::runtime::master::{
+    dispatch_scan_multi_fanout, first_worker_error_opt, replicated_unicast, MasterDispatcher, TxnFamily,
+};
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{
     join_into, mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either, FsyncFuture, PendingRelay, Reactor, ReplyFuture,
@@ -924,6 +926,16 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
         return;
     }
 
+    // ---------- Consistent multi-relation scan ----------
+    // Client→master frame naming N relations to snapshot at one SAL cut. Like
+    // DDL_TXN / PUSH_TXN it carries `target_id = 0` and re-decodes its body from
+    // the raw frame (the generic decode above sees no data block); placed in the
+    // same pre-alloc-block run. Never written to the SAL.
+    if flags & gnitz_wire::FLAG_SCAN_MULTI != 0 {
+        handle_scan_multi(shared, peer, client_id, data).await;
+        return;
+    }
+
     // ---------- SERIAL range reservation ----------
     // Carries `target_id = seq_id (= table_id) ≠ 0` and the range `count` in
     // `seek_col_idx`, so it precedes the `target_id == 0` catalog-id block.
@@ -1611,22 +1623,21 @@ async fn handle_get_indices(shared: &Rc<Shared>, peer: &Peer, client_id: u64, ta
     peer.send_buffer_or_close(buf).await;
 }
 
-async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64, client_version: u16) {
-    // Drain pending ticks before reading: views derive from source-table
-    // pushes through the DAG (IV.2). Send a Drain trigger unconditionally
-    // — even when `tick_tids` is observed empty — so any in-flight
-    // auto-tick has time to complete. The tick loop processes triggers
-    // serially, so awaiting our Drain's `done` guarantees serialization
-    // behind a concurrent Auto. Without this, a large push fires Auto
-    // asynchronously, drains `tick_tids`, but the scan reads before the
-    // tick body finishes — the view appears empty until the next scan
-    // triggers another drain.
-    //
-    // The catalog lock is intentionally acquired AFTER the drain: the drain
-    // parks at rx.await, and AsyncRwLock is writer-preferring. Holding a
-    // read lock here while parked would block concurrent DDL writers and
-    // prevent tick_loop_async from acquiring its own read lock, causing a
-    // three-way deadlock (BF-1).
+/// Drain all pending view ticks before a read. Views derive from source-table
+/// pushes through the DAG (IV.2), so a scan must first flush any in-flight
+/// auto-tick: send a `Drain` trigger unconditionally — even when `tick_tids`
+/// looks empty — and await its ack, repeating until nothing new queued during
+/// the wait (the re-check keeps a push that arrives mid-drain from slipping
+/// past). The tick loop processes triggers serially, so awaiting `done`
+/// serializes behind a concurrent Auto; without it a large push fires Auto
+/// asynchronously and the scan could read before the tick body finishes,
+/// leaving the view apparently empty until the next scan.
+///
+/// MUST be called BEFORE taking the catalog read lock: the drain parks at
+/// `rx.await`, and the writer-preferring `AsyncRwLock` held across that park
+/// would block DDL writers and `tick_loop_async`'s own read lock — a three-way
+/// deadlock (BF-1).
+async fn drain_pending_ticks(shared: &Rc<Shared>) {
     loop {
         let snapshot: Vec<i64> = shared.tick_tids.borrow().clone();
         let was_empty = snapshot.is_empty();
@@ -1636,59 +1647,68 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id
             done: tx,
         });
         let _ = rx.await;
-        // After the drain ack: if there were no tids queued AND none
-        // appeared during the wait, we're done. Re-check before
-        // breaking so a new push during the drain doesn't slip past.
         if was_empty && shared.tick_tids.borrow().is_empty() {
             break;
         }
     }
+}
+
+/// A scan's captured preliminary schema frame content: `(wire block,
+/// server_version)`, present only on a schema-cache miss (the client's cached
+/// version is stale, so the master emits the block once and the workers omit it).
+type PrelimSchema = Option<(Rc<Vec<u8>>, u16)>;
+
+/// Resolve a scan's per-relation schema negotiation: compare the client's cached
+/// `client_version` against the server's. On a miss, capture the wire schema
+/// block so the master can send ONE preliminary schema frame (via
+/// [`build_prelim_schema_frame`]) instead of N per-worker copies, and bump the
+/// effective client version to the server's so the workers omit their own block.
+/// Returns `(prelim, effective_client_version)`: `prelim` is
+/// `Some((block, server_version))` on a miss, `None` on a warm-cache hit. Shared
+/// by `handle_scan` (emits inline) and `scan_multi_body` (captures, emits in the
+/// deferred one-cut Phase 2).
+fn negotiate_scan_schema(shared: &Rc<Shared>, tid: i64, client_version: u16) -> (PrelimSchema, u16) {
+    let server_version = shared.cat().get_schema_version(tid);
+    if gnitz_wire::wire_should_include_schema(client_version, server_version) {
+        let (block, _) = shared.get_schema_wire_block(tid);
+        (Some((block, server_version)), server_version)
+    } else {
+        (None, client_version)
+    }
+}
+
+/// Build the preliminary schema-only frame — carrying `FLAG_CONTINUATION`, the
+/// `server_version`, and the captured wire block — that precedes a scan's data
+/// frames on a schema-cache miss. The caller chooses when to send it: inline for
+/// a single scan, deferred to the one-cut Phase 2 for a multi-scan.
+fn build_prelim_schema_frame(tid: i64, client_id: u64, server_version: u16, block: &[u8]) -> PooledSendBuf {
+    let prelim_flags = ipc::wire_flags_set_schema_version(ipc::FLAG_CONTINUATION, server_version);
+    encode_response_buffer(tid, client_id, None, STATUS_OK, b"", Some(block), 0, prelim_flags)
+}
+
+async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64, client_version: u16) {
+    drain_pending_ticks(shared).await;
     let _g = shared.catalog_rwlock.read().await;
     if reject_unknown_table(shared, peer, client_id, target_id).await {
         return;
     }
-    // A replicated relation (a replicated base table, or a view all of whose
-    // sources are replicated) holds an identical full copy on every worker;
-    // gathering all workers would return N copies, so read just one (worker 0,
-    // which always exists and — replicated tables are exempt from the bootstrap
-    // trim — holds the full copy at partition 0).
-    let replicated = shared.cat().relation_output_is_replicated(target_id);
     let lsn = shared.last_tick_lsn.get();
 
-    // On a cache miss, master sends a preliminary schema-only frame before
-    // dispatching workers. This eliminates N-1 redundant schema blocks
-    // (one per worker) from the client's perspective.
-    let server_version = shared.cat().get_schema_version(target_id);
-    let include_schema = gnitz_wire::wire_should_include_schema(client_version, server_version);
-    let effective_client_version = if include_schema {
-        let (schema_block, _) = shared.get_schema_wire_block(target_id);
-        // Emit preliminary schema frame first, then tell workers to skip schema.
-        let prelim_flags = ipc::wire_flags_set_schema_version(ipc::FLAG_CONTINUATION, server_version);
-        let prelim = encode_response_buffer(
-            target_id,
-            client_id,
-            None,
-            STATUS_OK,
-            b"",
-            Some(schema_block.as_slice()),
-            0,
-            prelim_flags,
-        );
-        let rc = peer.send_buffer(prelim).await;
-        if rc < 0 {
+    // On a schema-cache miss, master sends one preliminary schema-only frame
+    // before dispatching workers, eliminating the N per-worker schema blocks.
+    let (prelim, effective_client_version) = negotiate_scan_schema(shared, target_id, client_version);
+    if let Some((block, server_version)) = prelim {
+        let frame = build_prelim_schema_frame(target_id, client_id, server_version, block.as_slice());
+        if peer.send_buffer(frame).await < 0 {
             peer.close();
             return;
         }
-        // Embed server_version as client_version so workers omit their schema blocks.
-        server_version
-    } else {
-        client_version
-    };
+    }
 
-    // A replicated relation single-sources from worker 0 (its full copy
-    // lives on every worker; an all-worker fan-out would concatenate W
-    // identical copies).
-    let unicast = if replicated { 0 } else { -1 };
+    // `0` (worker-0 unicast) for a replicated relation — its full copy lives on
+    // every worker, so a broadcast would concatenate W identical copies — else
+    // `-1` (broadcast).
+    let unicast = replicated_unicast(shared.dispatcher, target_id);
     let result = MasterDispatcher::fan_out_scan_async(
         shared.dispatcher,
         &shared.reactor,
@@ -1715,6 +1735,124 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id
 fn make_terminal_scan_frame(target_id: i64, client_id: u64, lsn: u64) -> PooledSendBuf {
     // Terminal scan frame: no schema block, no data. Client ignores schema version here.
     encode_response_buffer(target_id, client_id, None, STATUS_OK, b"", None, lsn as u128, 0)
+}
+
+/// One relation's Phase-1 capture for `scan_multi_body`: its tid and the
+/// preliminary schema frame to emit in Phase 2, as `(wire block, server_version)`
+/// — `Some` iff the client's cached version missed, in which case the workers
+/// were told (via `effective_client_version = server_version`) to omit their own
+/// schema blocks. Exactly the `negotiate_scan_schema` `prelim` result, carried to
+/// the deferred emit.
+struct ScanMultiRelPlan {
+    tid: i64,
+    prelim: PrelimSchema,
+}
+
+/// SCAN_MULTI: snapshot N relations at one SAL cut and stream N reply trains in
+/// request order. The read-side completion of the atomic multi-table write
+/// story: an atomic commit is either wholly before the cut (visible in every
+/// train) or wholly after (visible in none), never torn across the result set.
+async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: &[u8]) {
+    match scan_multi_body(shared, peer, client_id, data).await {
+        // Phase 2 already streamed every train and terminal.
+        Ok(true) => {}
+        // Client disconnected mid-stream: leases dropped in the body, close the peer.
+        Ok(false) => peer.close(),
+        // Shape/tid rejection (before any group is written) or a worker fault
+        // mid-stream (leases already dropped in the body): one error frame. The
+        // client discards any partial results it read.
+        Err(e) => send_error(peer, 0, client_id, e.as_bytes()).await,
+    }
+}
+
+/// Body of `handle_scan_multi`. `Ok(true)` once every relation's train and
+/// terminal have been sent; `Ok(false)` on client disconnect; `Err(msg)` on a
+/// shape/tid rejection or a mid-stream worker fault. All `ScanLease`s live in
+/// the `dispatches` vec and drop on return, so any error/disconnect return
+/// deregisters every id and discards undrained frames at the ring boundary.
+async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: &[u8]) -> Result<bool, String> {
+    // ── Phase 0: decode + frame-local shape rules ──────────────────────────
+    // The count/duplicate shape rules are the shared client/server validator
+    // (`gnitz_wire::validate_scan_multi_tids`); this is the authoritative check —
+    // a client may skip its own copy. tid legality is resolved in Phase 1 under
+    // the catalog lock.
+    let relations = ipc::decode_scan_multi(data).map_err(|e| format!("decode error: {e}"))?;
+    let tids: Vec<u64> = relations.iter().map(|(tid, _)| *tid).collect();
+    gnitz_wire::validate_scan_multi_tids(&tids)?;
+
+    // Drain pending ticks once (before the catalog lock — BF-1), as `handle_scan`
+    // does.
+    drain_pending_ticks(shared).await;
+    // The shared LSN stamped into every terminal — captured after the drain.
+    let lsn = shared.last_tick_lsn.get();
+
+    // ── Phase 1: catalog lock — resolve shapes + schemas, dispatch one cut ──
+    // Resolve every relation from the same catalog snapshot (so all N are
+    // consistent with the cut even if a DDL commits during the later drain),
+    // then write all N groups under one `sal_writer_excl` hold. The
+    // catalog-read ⊃ `sal_writer_excl` order matches every other SAL writer, so
+    // no lock inversion.
+    let (dispatches, plans) = {
+        let _cat = shared.catalog_rwlock.read().await;
+        let mut plans: Vec<ScanMultiRelPlan> = Vec::with_capacity(relations.len());
+        let mut fanout: Vec<(i64, i32, u16)> = Vec::with_capacity(relations.len());
+        for &(tid_u, client_ver) in &relations {
+            let tid = tid_u as i64;
+            // Base tables AND views are legal; system tables stay on the plain
+            // path. `has_id` covers both under the catalog read lock.
+            if tid < FIRST_USER_TABLE_ID {
+                return Err(format!("SCAN_MULTI: {tid} is not a user relation"));
+            }
+            if !shared.cat().has_id(tid) {
+                return Err(format!("table {tid} not found"));
+            }
+            // `0` (worker-0 unicast) for a replicated relation, `-1` (broadcast)
+            // otherwise — the same policy `handle_scan` applies per relation.
+            let unicast = replicated_unicast(shared.dispatcher, tid);
+            // Capture (not emit) each relation's preliminary schema frame here so
+            // Phase 2 can send it after the one-cut dispatch, in request order.
+            let (prelim, effective_client_version) = negotiate_scan_schema(shared, tid, client_ver);
+            plans.push(ScanMultiRelPlan { tid, prelim });
+            fanout.push((tid, unicast, effective_client_version));
+        }
+        let dispatches = dispatch_scan_multi_fanout(
+            shared.dispatcher,
+            &shared.reactor,
+            &shared.sal_writer_excl,
+            client_id,
+            &fanout,
+        )
+        .await?;
+        // Release the catalog read lock here: Phase 2 touches no catalog state
+        // (the snapshot is worker-frozen and the schemas are captured), so
+        // holding it across the whole bulk read would needlessly block DDL.
+        (dispatches, plans)
+    };
+
+    // ── Phase 2: sequential per-relation drain (no locks; holds all leases) ──
+    let nw = shared.disp().num_workers();
+    for (plan, d) in plans.iter().zip(&dispatches) {
+        // Preliminary schema-only frame first, when captured in Phase 1.
+        if let Some((block, server_version)) = plan.prelim.as_ref() {
+            let frame = build_prelim_schema_frame(plan.tid, client_id, *server_version, block.as_slice());
+            if peer.send_buffer(frame).await < 0 {
+                return Ok(false);
+            }
+        }
+        // Drain this relation's train (all workers, ascending) before the next —
+        // the FIFO reply contract makes request order == ring order.
+        match MasterDispatcher::await_and_drain_scan_relation(&shared.reactor, peer, d.unicast, &d.req_ids, nw).await {
+            Ok(true) => {}
+            Ok(false) => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        // Terminal frame for this relation (tid + the shared LSN).
+        let terminal = make_terminal_scan_frame(plan.tid, client_id, lsn);
+        if peer.send_buffer(terminal).await < 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// System-table read path: an empty-batch SCAN of a catalog family. Every

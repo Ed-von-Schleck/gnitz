@@ -1415,7 +1415,18 @@ impl PyRowIterator {
 
 /// Shared helper: wrap a (Option<Arc<Schema>>, Option<ZSetBatch>, u64) into a lazy PyScanResult.
 fn response_to_lazy(py: Python<'_>, result: ClientResponse, include_hidden: bool) -> PyResult<Py<PyScanResult>> {
-    let (opt_schema, opt_batch, view_lsn) = to_py_err(result)?;
+    triple_to_lazy(py, to_py_err(result)?, include_hidden)
+}
+
+/// Build a lazy `PyScanResult` from one already-unwrapped `(schema, batch, lsn)`
+/// triple. Shared by the single-relation `response_to_lazy` and the
+/// multi-relation `scan_many`, which maps it over each relation's result.
+fn triple_to_lazy(
+    py: Python<'_>,
+    triple: (Option<Arc<Schema>>, Option<ZSetBatch>, u64),
+    include_hidden: bool,
+) -> PyResult<Py<PyScanResult>> {
+    let (opt_schema, opt_batch, view_lsn) = triple;
     let data = match opt_schema {
         Some(s) => {
             let b = opt_batch.unwrap_or_else(|| ZSetBatch::new(s.as_ref()));
@@ -1432,6 +1443,13 @@ fn response_to_lazy(py: Python<'_>, result: ClientResponse, include_hidden: bool
             cached_batch: None,
         },
     )
+}
+
+/// `triple_to_lazy` for a decoded async-loop [`ScanData`] — destructures it and
+/// builds the lazy `PyScanResult`. Shared by the single-`Scan` and the
+/// per-relation `ScanMulti` result dispatch.
+fn scandata_to_lazy(py: Python<'_>, sd: ScanData) -> PyResult<Py<PyScanResult>> {
+    triple_to_lazy(py, (sd.schema, sd.batch, sd.lsn), sd.include_hidden)
 }
 
 /// Macro to mutably borrow the live inner client or raise GnitzError.
@@ -1658,6 +1676,26 @@ impl PyGnitzClient {
         let c = client!(self);
         let result = py.allow_threads(|| c.scan(target_id));
         response_to_lazy(py, result, include_hidden)
+    }
+
+    /// scan_many(target_ids, include_hidden=False) -> list[ScanResult]
+    ///
+    /// Consistent snapshot of N relations at one server-side SAL cut, returned
+    /// in request order. An atomic multi-table transaction is never observed
+    /// torn across the result list. Same row decoding as `scan`.
+    #[pyo3(signature = (target_ids, include_hidden = false))]
+    pub fn scan_many(
+        &mut self,
+        py: Python<'_>,
+        target_ids: Vec<u64>,
+        include_hidden: bool,
+    ) -> PyResult<Vec<Py<PyScanResult>>> {
+        let c = client!(self);
+        let results = to_py_err(py.allow_threads(|| c.scan_many(&target_ids)))?;
+        results
+            .into_iter()
+            .map(|triple| triple_to_lazy(py, triple, include_hidden))
+            .collect()
     }
 
     /// seek(table_id, pk=0, include_hidden=False) -> ScanResult.
@@ -2138,6 +2176,8 @@ enum IoOp {
     Scan,
     /// Point seek by PK; resolves with PyScanResult.
     Seek(gnitz_core::PkTuple),
+    /// Consistent multi-relation scan; resolves with list[PyScanResult].
+    ScanMulti(Vec<u64>),
 }
 
 struct IoRequest {
@@ -2254,6 +2294,22 @@ impl PyAsyncTransport {
         self.enqueue(py, IoOp::Scan, target_id, include_hidden)
     }
 
+    /// scan_many(target_ids, include_hidden=False) -> awaitable[list[ScanResult]]
+    ///
+    /// Consistent snapshot of N relations at one server-side SAL cut, resolved
+    /// as a list in request order. `target_id` is unused for this op (the tids
+    /// ride the frame body).
+    #[pyo3(signature = (target_ids, include_hidden = false))]
+    fn scan_many(&self, py: Python<'_>, target_ids: Vec<u64>, include_hidden: bool) -> PyResult<PyObject> {
+        // Reject a malformed list locally, before enqueue — the same shared check
+        // the sync `Session::scan_multi` and the server run. An empty list would
+        // otherwise send a count=0 frame whose single server error frame the
+        // positional N-train read loop (N=0) never consumes, desyncing the
+        // connection; over-cap / duplicate are fast-fail.
+        to_py_err(gnitz_wire::validate_scan_multi_tids(&target_ids))?;
+        self.enqueue(py, IoOp::ScanMulti(target_ids), 0, include_hidden)
+    }
+
     #[pyo3(signature = (target_id, pk, include_hidden = false))]
     fn seek(&self, py: Python<'_>, target_id: u64, pk: Bound<'_, PyAny>, include_hidden: bool) -> PyResult<PyObject> {
         let t = pk_tuple_from_py(&pk)?;
@@ -2307,12 +2363,41 @@ enum LoopResult {
     PushError(String),
     Scan(Box<ScanData>),
     ScanError(String),
+    /// One `scan_many`'s N per-relation results, in request order.
+    ScanMulti(Vec<ScanData>),
 }
 
 /// How to receive a given request's response, paired with its future.
 enum RecvKind {
     Push { target_id: u64 },
     Scan { target_id: u64, include_hidden: bool },
+    ScanMulti { target_ids: Vec<u64>, include_hidden: bool },
+}
+
+/// Receive one relation's scan reply and shape it into a `ScanData`. Shared by
+/// the single-`Scan` and per-relation `ScanMulti` recv arms of `async_io_loop`.
+fn recv_scan_data(
+    session: &mut gnitz_core::Session,
+    tid: u64,
+    include_hidden: bool,
+) -> Result<ScanData, gnitz_core::ClientError> {
+    session.recv_scan(tid).map(|(schema, batch, lsn)| ScanData {
+        schema,
+        batch,
+        lsn,
+        include_hidden,
+    })
+}
+
+/// Classify a scan recv error into the loop's result contract: a transport /
+/// protocol failure stops the whole batch (`Err`), any other (server-level)
+/// error resolves just that one future as a `ScanError`. Shared by the `Scan`
+/// and `ScanMulti` recv arms.
+fn classify_scan_err(e: gnitz_core::ClientError) -> Result<LoopResult, String> {
+    match e {
+        gnitz_core::ClientError::Protocol(e) => Err(e.to_string()),
+        e => Ok(LoopResult::ScanError(e.to_string())),
+    }
 }
 
 fn async_io_loop(
@@ -2370,6 +2455,13 @@ fn async_io_loop(
                         include_hidden: req.include_hidden,
                     },
                 ),
+                IoOp::ScanMulti(tids) => (
+                    session.pack_scan_multi(&tids),
+                    RecvKind::ScanMulti {
+                        target_ids: tids,
+                        include_hidden: req.include_hidden,
+                    },
+                ),
             };
             parts.push(p);
             kinds.push(rk);
@@ -2421,16 +2513,29 @@ fn async_io_loop(
                 RecvKind::Scan {
                     target_id,
                     include_hidden,
-                } => match session.recv_scan(target_id) {
-                    Ok((schema, batch, lsn)) => Ok(LoopResult::Scan(Box::new(ScanData {
-                        schema,
-                        batch,
-                        lsn,
-                        include_hidden,
-                    }))),
-                    Err(gnitz_core::ClientError::Protocol(e)) => Err(e.to_string()),
-                    Err(e) => Ok(LoopResult::ScanError(e.to_string())),
+                } => match recv_scan_data(&mut session, target_id, include_hidden) {
+                    Ok(sd) => Ok(LoopResult::Scan(Box::new(sd))),
+                    Err(e) => classify_scan_err(e),
                 },
+                RecvKind::ScanMulti {
+                    ref target_ids,
+                    include_hidden,
+                } => {
+                    // Read the N reply trains positionally, in request order. A
+                    // server-side shape/tid rejection arrives as one STATUS_ERROR
+                    // train that fails the whole scan_many; a transport/protocol
+                    // failure stops the batch (as the single scan does). `collect`
+                    // short-circuits on the first error, so `recv_scan` is not
+                    // called for tids past a failure — matching a per-tid `break`.
+                    match target_ids
+                        .iter()
+                        .map(|&tid| recv_scan_data(&mut session, tid, include_hidden))
+                        .collect::<Result<Vec<ScanData>, _>>()
+                    {
+                        Ok(datas) => Ok(LoopResult::ScanMulti(datas)),
+                        Err(e) => classify_scan_err(e),
+                    }
+                }
             };
             match r {
                 Ok(res) => results.push(res),
@@ -2458,31 +2563,18 @@ fn async_io_loop(
                         let _ = loop_ref.call_method1(py, "call_soon_threadsafe", (&se_fn, &fut, exc));
                     }
                     LoopResult::Scan(sd) => {
-                        let ScanData {
-                            schema,
-                            batch,
-                            lsn,
-                            include_hidden,
-                        } = *sd;
-                        let data = match schema {
-                            Some(s) => {
-                                let b = batch.unwrap_or_else(|| ZSetBatch::new(s.as_ref()));
-                                Some(make_shared_batch_data(py, s, b, include_hidden).unwrap())
-                            }
-                            None => None,
-                        };
-                        let py_val = Py::new(
-                            py,
-                            PyScanResult {
-                                data,
-                                lsn,
-                                cached_schema: None,
-                                cached_batch: None,
-                            },
-                        )
-                        .unwrap()
-                        .into_any();
+                        let py_val = scandata_to_lazy(py, *sd).unwrap().into_any();
                         let _ = loop_ref.call_method1(py, "call_soon_threadsafe", (&sr_fn, &fut, py_val));
+                    }
+                    LoopResult::ScanMulti(datas) => {
+                        // One PyScanResult per relation, in request order → a
+                        // Python list, resolving the single scan_many future.
+                        let items: Vec<PyObject> = datas
+                            .into_iter()
+                            .map(|sd| scandata_to_lazy(py, sd).unwrap().into_any())
+                            .collect();
+                        let py_list = PyList::new(py, items).unwrap().into_any().unbind();
+                        let _ = loop_ref.call_method1(py, "call_soon_threadsafe", (&sr_fn, &fut, py_list));
                     }
                 }
             }

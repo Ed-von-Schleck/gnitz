@@ -1,7 +1,7 @@
 use crate::runtime::wire::{
-    batch_to_schema, build_schema_wire_block, decode_ddl_txn, decode_push_txn, decode_wire, encode_ctrl_block_direct,
-    encode_wire, encode_wire_into, peek_client_control, peek_control_block, schema_to_batch, wire_size,
-    CTRL_BLOCK_SIZE_NO_BLOB, STATUS_ERROR, STATUS_OK,
+    batch_to_schema, build_schema_wire_block, decode_ddl_txn, decode_push_txn, decode_scan_multi, decode_wire,
+    encode_ctrl_block_direct, encode_wire, encode_wire_into, peek_client_control, peek_control_block, schema_to_batch,
+    wire_size, CTRL_BLOCK_SIZE_NO_BLOB, STATUS_ERROR, STATUS_OK,
 };
 use crate::schema::{encode_german_string, try_decode_german_string, type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, Layout};
@@ -1040,6 +1040,58 @@ fn decode_push_txn_truncated_precondition_body_errs() {
     let mut frame = push_txn_frame(&[(5, WireConflictMode::Update)], &[(5, 99)]);
     frame.truncate(frame.len() - 4); // count says 1 but the pair is short
     assert!(decode_push_txn(&frame).is_err(), "a truncated body is a decode error");
+}
+
+/// A real `FLAG_SCAN_MULTI` frame built by the client encoder from
+/// `(tid, cached_schema_version)` relations.
+fn scan_multi_frame(relations: &[(u64, u16)]) -> Vec<u8> {
+    gnitz_core::protocol::encode_scan_multi(0xABCD, relations)
+}
+
+#[test]
+fn decode_scan_multi_one_relation_zero_ctrl_version() {
+    let frame = scan_multi_frame(&[(7, 0)]);
+    let rels = decode_scan_multi(&frame).unwrap();
+    assert_eq!(rels, vec![(7, 0)]);
+    // Control block carries FLAG_SCAN_MULTI, target 0, and ZERO schema-version
+    // bits — per-relation versions ride the body, not the control block.
+    let ctrl = peek_client_control(&frame).unwrap();
+    assert_ne!(ctrl.flags & gnitz_wire::FLAG_SCAN_MULTI, 0);
+    assert_eq!(ctrl.target_id, 0);
+    assert_eq!(gnitz_wire::wire_flags_get_schema_version(ctrl.flags), 0);
+}
+
+#[test]
+fn decode_scan_multi_preserves_order_and_versions() {
+    let frame = scan_multi_frame(&[(7, 0), (8, 3), (9, u16::MAX)]);
+    assert_eq!(decode_scan_multi(&frame).unwrap(), vec![(7, 0), (8, 3), (9, u16::MAX)]);
+}
+
+#[test]
+fn decode_scan_multi_sixteen_relations() {
+    let relations: Vec<(u64, u16)> = (0..16u64).map(|i| (100 + i, i as u16)).collect();
+    let frame = scan_multi_frame(&relations);
+    assert_eq!(decode_scan_multi(&frame).unwrap(), relations);
+}
+
+#[test]
+fn decode_scan_multi_truncated_count_errs() {
+    let mut frame = scan_multi_frame(&[(7, 0)]);
+    frame.truncate(frame.len() - 12); // chop through the record and into the count
+    assert!(
+        decode_scan_multi(&frame).is_err(),
+        "a truncated count/record is a decode error"
+    );
+}
+
+#[test]
+fn decode_scan_multi_truncated_record_errs() {
+    let mut frame = scan_multi_frame(&[(7, 0), (8, 1)]);
+    frame.truncate(frame.len() - 3); // count says 2 but the last record is short
+    assert!(
+        decode_scan_multi(&frame).is_err(),
+        "a truncated record is a decode error"
+    );
 }
 
 #[test]

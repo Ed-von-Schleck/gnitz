@@ -2438,8 +2438,8 @@ class TestChunkedReplyTrains:
                 "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
                 "x BIGINT NOT NULL, y BIGINT NOT NULL)", schema_name=sn)
             # ~100 KB of matching base rows per worker per value: each worker's
-            # reply spans several 16 KiB frames (well under the 64-frame
-            # in-flight bound documented on the fixture).
+            # reply spans several 16 KiB frames (byte-back-pressured by the ring,
+            # not capped by any frame count — see the fixture).
             n = 20_000
             _insert_rows(client, sn, [(i, i % 2, i * 7) for i in range(n)], chunk=1000)
             client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)

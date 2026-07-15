@@ -1,6 +1,7 @@
 //! W2M (worker→master) SPSC ring: write side (W2mWriter) and read side (W2mReceiver).
 
 use std::cell::UnsafeCell;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::foundation::posix_io;
@@ -99,23 +100,36 @@ impl W2mWriter {
 // InFlightState — tracks outstanding slots and drives consume_cursor forward
 // ---------------------------------------------------------------------------
 
-/// Maximum simultaneously in-flight (parked, un-released) W2M slots per
-/// worker ring — the capacity of `InFlightState`'s queue and its `completed`
-/// bitmap (a u64, so this cannot exceed 64). Every continuation-frame sender
-/// must keep one ring's worth of frames below this bound; the reactor's
-/// scan-queue debug_assert catches violations.
+/// Initial capacity hint for a per-worker ring's in-flight queue, and the soft
+/// high-water threshold at which the master warns once. The queue is a growable
+/// `VecDeque`, so this no longer bounds correctness: the real backpressure is the
+/// ring's byte capacity (`W2M_REGION_SIZE`), which blocks the worker's
+/// `send_encoded` once the ring fills. Crossing this many simultaneously-parked
+/// slots on one ring means a client is draining unusually slowly — `take` logs
+/// one warning so the condition is observable.
 pub(crate) const W2M_MAX_IN_FLIGHT: usize = 64;
+
+/// Capacity above which a fully-drained queue is shrunk back to hand the heap it
+/// grew for a burst back to the allocator. A stalled client can park a ring's
+/// worth of tiny frames (millions of entries) before eviction retires them;
+/// without this the peak capacity would be retained for the process lifetime.
+/// 1024 entries (16 KiB) is far above the steady-state depth (a few), so the
+/// shrink fires only after a genuine burst, never on the hot path.
+const INFLIGHT_SHRINK_THRESHOLD: usize = 1024;
 
 struct InFlightState {
     hdr: &'static W2mRingHeader,
-    /// Index of the slot at the front of the queue (oldest in-flight).
+    /// Absolute index of the slot at the front of the queue (oldest in-flight).
+    /// A slot's `push_idx` minus `front_idx` is its position in `queue`.
     front_idx: u64,
-    /// new_vrc for each in-flight slot, stored at push_idx % W2M_MAX_IN_FLIGHT.
-    queue: [u64; W2M_MAX_IN_FLIGHT],
-    /// Number of in-flight slots; next push_idx = front_idx + len.
-    len: u8,
-    /// Bit i is set when the slot at position (front_idx + i) has been released.
-    completed: u64,
+    /// One entry per in-flight slot, front = oldest: the slot's post-read vrc
+    /// paired with a "released" flag set once the slot is dropped. Retirement
+    /// pops the front-consecutive released prefix and advances `consume_cursor`
+    /// to the last popped vrc. Grows with the parked depth; the ring's byte
+    /// capacity is the backpressure that ultimately bounds it.
+    queue: VecDeque<(u64, bool)>,
+    /// One-shot latch for the high-water warning (see `W2M_MAX_IN_FLIGHT`).
+    warned: bool,
 }
 
 impl InFlightState {
@@ -123,49 +137,47 @@ impl InFlightState {
         InFlightState {
             hdr,
             front_idx: 0,
-            queue: [0u64; W2M_MAX_IN_FLIGHT],
-            len: 0,
-            completed: 0,
+            queue: VecDeque::with_capacity(W2M_MAX_IN_FLIGHT),
+            warned: false,
         }
     }
 
     /// Register a new in-flight slot with the given post-read new_vrc.
     /// Returns the slot's push_idx (used for release).
     fn take(&mut self, new_vrc: u64) -> u64 {
-        let idx = self.front_idx + self.len as u64;
-        self.queue[(idx % W2M_MAX_IN_FLIGHT as u64) as usize] = new_vrc;
-        self.len += 1;
-        idx
+        let push_idx = self.front_idx + self.queue.len() as u64;
+        self.queue.push_back((new_vrc, false));
+        if !self.warned && self.queue.len() > W2M_MAX_IN_FLIGHT {
+            self.warned = true;
+            crate::gnitz_warn!(
+                "w2m: {} reply slots simultaneously in-flight on one ring (soft \
+                 threshold {}); a slow client is parking frames — backpressure is \
+                 the ring's {} MiB byte capacity",
+                self.queue.len(),
+                W2M_MAX_IN_FLIGHT,
+                w2m_ring::W2M_REGION_SIZE >> 20,
+            );
+        }
+        push_idx
     }
 
-    /// Mark the slot identified by push_idx as released.
-    /// Advances consume_cursor through the completed prefix and wakes the
-    /// writer if it advanced.
+    /// Mark the slot identified by push_idx as released. Advances consume_cursor
+    /// through the front-consecutive released prefix and wakes the writer if it
+    /// advanced. A stale or double `push_idx` (below `front_idx`, or past the
+    /// queue tail) indexes out of bounds and panics.
     fn release(&mut self, push_idx: u64) {
-        let bit = push_idx - self.front_idx;
-        assert!(
-            bit < W2M_MAX_IN_FLIGHT as u64,
-            "w2m in-flight bitmap overflow: {} slots simultaneously in-flight (max {})",
-            bit + 1,
-            W2M_MAX_IN_FLIGHT,
-        );
-        self.completed |= 1u64 << bit;
+        let pos = (push_idx - self.front_idx) as usize;
+        self.queue[pos].1 = true;
 
-        let n = self.completed.trailing_ones() as u64;
-        if n > 0 {
-            let last_vrc = self.queue[((self.front_idx + n - 1) % W2M_MAX_IN_FLIGHT as u64) as usize];
-            // At full capacity (all 64 slots completed) n == 64, and
-            // `>>= 64` is a shift-by-width: a debug-build panic, and on
-            // release x86_64 a mask to `>> 0` that leaves `completed` full of
-            // stale ones, corrupting the next release. Zero it explicitly.
-            if n == 64 {
-                self.completed = 0;
-            } else {
-                self.completed >>= n;
-            }
-            self.front_idx += n;
-            self.len -= n as u8;
-            self.hdr.advance_consume_cursor(last_vrc);
+        let mut last_vrc = None;
+        while self.queue.front().is_some_and(|&(_, released)| released) {
+            let (vrc, _) = self.queue.pop_front().expect("front just checked present");
+            self.front_idx += 1;
+            last_vrc = Some(vrc);
+        }
+
+        if let Some(vrc) = last_vrc {
+            self.hdr.advance_consume_cursor(vrc);
             self.hdr.writer_seq().fetch_add(1, Ordering::Release);
             if self.hdr.waiter_flags().load(Ordering::Acquire) & FLAG_WRITER_PARKED != 0 {
                 let rc = posix_io::futex_wake_u32(self.hdr.writer_seq() as *const AtomicU32, 1);
@@ -176,6 +188,11 @@ impl InFlightState {
                         posix_io::errno(),
                     );
                 }
+            }
+            // A burst that has fully drained can leave a large heap buffer
+            // behind (VecDeque never shrinks on its own); reclaim it.
+            if self.queue.is_empty() && self.queue.capacity() > INFLIGHT_SHRINK_THRESHOLD {
+                self.queue.shrink_to_fit();
             }
         }
     }
@@ -198,10 +215,12 @@ pub struct W2mSlot {
     /// `try_reserve`. Used by the master to route scan responses without
     /// decoding the wire frame.
     pub(crate) internal_req_id: u32,
-    /// Raw pointer into `W2mReceiver::in_flight[worker]`.
-    /// Valid for the slot's lifetime: W2mReceiver outlives all slots
-    /// (slots borrow from its mmaps), and the master thread is the
-    /// sole accessor of both.
+    /// Raw pointer into `W2mReceiver::rings[worker].in_flight`.
+    /// Valid for the slot's lifetime: `rings` is built once in
+    /// `W2mReceiver::new` and never re-pushed, so the `UnsafeCell`'s address is
+    /// stable; W2mReceiver outlives all slots (its field is declared last in
+    /// `ReactorShared` so it drops after every slot holder — `scan_parked` and
+    /// `send_buffers_in_flight`); and the master thread is the sole accessor.
     state: *mut InFlightState,
 }
 
@@ -225,31 +244,42 @@ impl Drop for W2mSlot {
 // W2mReceiver
 // ---------------------------------------------------------------------------
 
+/// One worker's W2M ring on the master side: the mmap base pointer plus the
+/// master's in-flight bookkeeping for that ring. Bundled (rather than two
+/// parallel `Vec`s) so a ring's pointer and its `InFlightState` share one index
+/// and one bounds check, and can never drift apart.
+struct WorkerRing {
+    region_ptr: *mut u8,
+    in_flight: UnsafeCell<InFlightState>,
+}
+
 /// Master's read side of W2M.
 pub struct W2mReceiver {
-    region_ptrs: Vec<*mut u8>,
-    in_flight: Vec<UnsafeCell<InFlightState>>,
+    rings: Vec<WorkerRing>,
 }
 
 unsafe impl Send for W2mReceiver {}
 
 impl W2mReceiver {
     pub fn new(region_ptrs: Vec<*mut u8>) -> Self {
-        let in_flight = region_ptrs
-            .iter()
-            .map(|&p| {
+        let rings = region_ptrs
+            .into_iter()
+            .map(|p| {
                 let hdr = unsafe { W2mRingHeader::from_raw(p as *const u8) };
-                UnsafeCell::new(InFlightState::new(hdr))
+                WorkerRing {
+                    region_ptr: p,
+                    in_flight: UnsafeCell::new(InFlightState::new(hdr)),
+                }
             })
             .collect();
-        W2mReceiver { region_ptrs, in_flight }
+        W2mReceiver { rings }
     }
 
     /// # Safety
     /// `worker` must be < `num_workers`.
     #[inline]
     pub unsafe fn header(&self, worker: usize) -> &'static W2mRingHeader {
-        W2mRingHeader::from_raw(self.region_ptrs[worker] as *const u8)
+        W2mRingHeader::from_raw(self.rings[worker].region_ptr as *const u8)
     }
 
     /// Take a slot from the ring without advancing `consume_cursor`.
@@ -258,19 +288,31 @@ impl W2mReceiver {
     /// following slot. `consume_cursor` advances only when the returned
     /// `W2mSlot` is dropped, signalling the writer that space is free.
     pub fn try_read_slot(&self, worker: usize) -> Option<W2mSlot> {
-        let hdr = unsafe { self.header(worker) };
-        let cursor = hdr.read_cursor().load(Ordering::Acquire);
-        let (ptr, sz, new_vrc, req_id) =
-            unsafe { w2m_ring::try_consume(hdr, self.region_ptrs[worker] as *const u8, cursor)? };
+        let ring = &self.rings[worker];
+        let hdr = unsafe { W2mRingHeader::from_raw(ring.region_ptr as *const u8) };
+        // `read_cursor` is master-owned (the master is its sole writer, via
+        // `advance_read_cursor`), so this load only reads back the master's own
+        // last store — `Relaxed` suffices. The peer-written `write_cursor`
+        // loaded inside `try_consume` stays `Acquire` to see the worker's
+        // payload.
+        let cursor = hdr.read_cursor().load(Ordering::Relaxed);
+        let (ptr, sz, new_vrc, req_id) = unsafe { w2m_ring::try_consume(hdr, ring.region_ptr as *const u8, cursor)? };
 
         hdr.advance_read_cursor(new_vrc);
 
         let bytes = unsafe { std::slice::from_raw_parts(ptr, sz as usize) };
-        // The 4 bytes at ptr-4 hold `sz as u32 LE` (the client length prefix).
-        // Together with the payload they form the exact framed buffer that
-        // `send_buffer` expects, avoiding a re-encode on the scan egress path.
-        let frame = unsafe { std::slice::from_raw_parts(ptr.sub(4), sz as usize + 4) };
-        let state = self.in_flight[worker].get();
+        // The `SLOT_LEN_PREFIX_BYTES` bytes at `ptr - SLOT_LEN_PREFIX_BYTES` hold
+        // `sz as u32 LE` (the client length prefix, the low half of the slot
+        // prefix `try_reserve` stamped). Together with the payload they form the
+        // exact framed buffer `send_buffer` expects, avoiding a re-encode on the
+        // scan egress path.
+        let frame = unsafe {
+            std::slice::from_raw_parts(
+                ptr.sub(w2m_ring::SLOT_LEN_PREFIX_BYTES),
+                sz as usize + w2m_ring::SLOT_LEN_PREFIX_BYTES,
+            )
+        };
+        let state = ring.in_flight.get();
         let push_idx = unsafe { (*state).take(new_vrc) };
 
         Some(W2mSlot {
@@ -347,7 +389,7 @@ impl W2mReceiver {
     }
 
     pub fn num_workers(&self) -> usize {
-        self.region_ptrs.len()
+        self.rings.len()
     }
 }
 
@@ -508,13 +550,14 @@ mod tests {
         }
     }
 
-    /// Fix F: releasing a full 64-slot in-flight prefix in one go drives
-    /// `trailing_ones()` to 64, so the bare `self.completed >>= 64` would be a
-    /// shift-by-width (debug panic / release UB). Release every slot EXCEPT the
-    /// head first (nothing retires), then the head — completing all 64 bits at
-    /// once — and assert it advances cleanly to the last slot's new_vrc.
+    /// Releasing every slot EXCEPT the head first (nothing retires while the
+    /// front stays in-flight), then the head, must retire the whole
+    /// front-consecutive prefix in a single drain and land `consume_cursor` on
+    /// the last slot's new_vrc. (Formerly a regression pin for a `>>= 64`
+    /// shift-by-width in the fixed-bitmap `release`; the `VecDeque` retirement
+    /// has no width edge, but the full-prefix drain is still worth guarding.)
     #[test]
-    fn release_retires_full_64_prefix_without_ub() {
+    fn release_retires_full_64_prefix_in_one_drain() {
         unsafe {
             let (region, capacity) = make_ring(8, 64);
             let ptr = region.ptr();
@@ -542,13 +585,122 @@ mod tests {
                 "no prefix may retire until the head releases",
             );
 
-            // Release the head: all 64 bits set ⇒ trailing_ones() == 64 ⇒
-            // `completed >>= 64` without the Fix F guard is UB.
+            // Release the head: the whole 64-slot prefix is now front-consecutive
+            // complete, so one drain pops all of it.
             drop(head);
             assert_eq!(
                 hdr.consume_cursor().load(Ordering::Acquire),
                 last_vrc,
                 "head release must retire the full 64-slot prefix to the last new_vrc",
+            );
+        }
+    }
+
+    unsafe fn in_flight_cap(recv: &W2mReceiver, w: usize) -> usize {
+        (*recv.rings[w].in_flight.get()).queue.capacity()
+    }
+    unsafe fn in_flight_len(recv: &W2mReceiver, w: usize) -> usize {
+        (*recv.rings[w].in_flight.get()).queue.len()
+    }
+
+    /// The fixed 64-slot bitmap clobbered slot 0 on the 65th concurrent `take`
+    /// and aborted the process on the next `release` (`assert!(bit < 64)`). The
+    /// growable queue must sail past 64: take 200 slots (all in-flight at once),
+    /// release them in a deterministic scramble, and assert `consume_cursor`
+    /// always sits at the new_vrc of the longest front-consecutive released
+    /// prefix — landing on the last slot's new_vrc once all are released, no panic.
+    #[test]
+    fn release_past_64_in_flight_out_of_order() {
+        unsafe {
+            const N: usize = 200;
+            let (region, capacity) = make_ring(8, N);
+            let ptr = region.ptr();
+            let writer = W2mWriter::new(ptr, capacity);
+            let receiver = W2mReceiver::new(vec![ptr]);
+            let hdr = receiver.header(0);
+
+            for i in 0..N {
+                writer.send_encoded(8, 0, |s| s[0] = i as u8);
+            }
+            // Read all N slots up front (none released) → N simultaneously
+            // in-flight, far past the old 64 ceiling. `vrcs[i]` is slot i's
+            // new_vrc, where consume_cursor must land once 0..=i have all retired.
+            let mut slots: Vec<Option<W2mSlot>> = Vec::with_capacity(N);
+            let mut vrcs = Vec::with_capacity(N);
+            for _ in 0..N {
+                slots.push(Some(receiver.try_read_slot(0).expect("slot")));
+                vrcs.push(hdr.read_cursor().load(Ordering::Acquire));
+            }
+            assert_eq!(in_flight_len(&receiver, 0), N, "all N slots tracked in-flight");
+            assert_eq!(
+                hdr.consume_cursor().load(Ordering::Acquire),
+                W2M_HEADER_SIZE as u64,
+                "consume_cursor must not advance while every slot is in-flight",
+            );
+
+            // Deterministic scramble (73 is coprime to 200, so this is a
+            // permutation): release order is out of push order, exercising the
+            // partial-prefix retirement at depth > 64.
+            let order: Vec<usize> = {
+                let mut o: Vec<usize> = (0..N).collect();
+                o.sort_by_key(|&i| (i * 73 + 11) % N);
+                o
+            };
+            let mut released = [false; N];
+            for &idx in &order {
+                slots[idx] = None; // drop → release(push_idx = idx)
+                released[idx] = true;
+                let mut p = 0;
+                while p < N && released[p] {
+                    p += 1;
+                }
+                let expected_cc = if p == 0 { W2M_HEADER_SIZE as u64 } else { vrcs[p - 1] };
+                assert_eq!(
+                    hdr.consume_cursor().load(Ordering::Acquire),
+                    expected_cc,
+                    "consume_cursor must track the front-consecutive released prefix (p={p})",
+                );
+            }
+            assert_eq!(
+                hdr.consume_cursor().load(Ordering::Acquire),
+                vrcs[N - 1],
+                "all released → consume_cursor at the last slot's new_vrc",
+            );
+            assert_eq!(in_flight_len(&receiver, 0), 0, "queue fully drained");
+        }
+    }
+
+    /// A burst grows the in-flight queue well past its initial capacity; once it
+    /// fully drains, `release` hands the grown buffer back to the allocator so a
+    /// single stalled-client burst does not permanently retain the peak.
+    #[test]
+    fn release_shrinks_queue_after_burst_drains() {
+        unsafe {
+            const N: usize = 4096; // comfortably above INFLIGHT_SHRINK_THRESHOLD
+            let (region, capacity) = make_ring(8, N);
+            let ptr = region.ptr();
+            let writer = W2mWriter::new(ptr, capacity);
+            let receiver = W2mReceiver::new(vec![ptr]);
+
+            for i in 0..N {
+                writer.send_encoded(8, 0, |s| s[0] = i as u8);
+            }
+            let mut slots: Vec<W2mSlot> = (0..N).map(|_| receiver.try_read_slot(0).expect("slot")).collect();
+            assert!(
+                in_flight_cap(&receiver, 0) >= N,
+                "queue must grow to hold the whole burst",
+            );
+
+            // Drain front-first: each release retires the front, the final one
+            // empties the queue and trips the shrink.
+            for s in slots.drain(..) {
+                drop(s);
+            }
+            assert_eq!(in_flight_len(&receiver, 0), 0, "queue fully drained");
+            assert!(
+                in_flight_cap(&receiver, 0) <= INFLIGHT_SHRINK_THRESHOLD,
+                "drained queue must be shrunk back to/below the threshold, got cap {}",
+                in_flight_cap(&receiver, 0),
             );
         }
     }

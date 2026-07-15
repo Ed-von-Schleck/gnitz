@@ -256,8 +256,8 @@ def race_server(monkeypatch):
 def unique_preflight_frame_server(monkeypatch):
     """Server whose CREATE UNIQUE INDEX pre-flight streams tiny (7-key) frames
     so a small table already produces multi-frame continuation trains per
-    worker. Tests using it must keep per-worker frame counts well under the
-    64-slot W2M in-flight limit (a few hundred rows is fine)."""
+    worker. Any per-worker frame count is safe: `InFlightState` grows with the
+    parked depth, so the W2M ring back-pressures by bytes, not a frame count."""
     yield from _seamed_server(
         monkeypatch, {"GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME": "7"})
 
@@ -266,10 +266,10 @@ def unique_preflight_frame_server(monkeypatch):
 def reply_frame_budget_server(monkeypatch):
     """Server whose workers chunk reply trains past a tiny 16 KiB frame budget
     (debug-only seam), so modest tables already produce multi-frame seek /
-    range / gather / scan reply trains per worker. Tests using it must keep
-    each worker's total reply under 64 x budget = 1 MiB (the W2M in-flight
-    slot bound — the master parks a full train per ring while draining
-    another worker)."""
+    range / gather / scan reply trains per worker. Any reply size is safe: the
+    master parks a full train per ring while draining another worker, but
+    `InFlightState` grows to track it, so the ring back-pressures by bytes, not
+    a frame count."""
     yield from _seamed_server(
         monkeypatch, {"GNITZ_REPLY_FRAME_BUDGET": str(16 * 1024)})
 

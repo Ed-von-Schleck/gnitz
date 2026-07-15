@@ -148,6 +148,38 @@ impl MasterDispatcher {
         )
     }
 
+    /// Write one scan group's control block at the current SAL write cursor: no
+    /// data, `sal_flags = 0`, the caller's `wire_flags` (schema-version bits, plus
+    /// `FLAG_SCAN_FIFO_REPLY` for a multi-scan), and the relation's cached schema
+    /// block. The one home for the scan-group `write_group_with_req_ids` shape,
+    /// shared by the single-scan fan-out (`fan_out_scan_async`) and the multi-scan
+    /// one-cut writer (`dispatch_scan_multi_fanout`).
+    pub(super) fn write_one_scan_group(
+        &mut self,
+        target_id: i64,
+        wire_flags: u64,
+        req_ids: &[u64],
+        unicast_worker: i32,
+        client_id: u64,
+    ) -> Result<(), String> {
+        let (schema, block, _safe, _stride) = self.cached_schema_block(target_id);
+        self.write_group_with_req_ids(
+            target_id,
+            0,
+            wire_flags,
+            &[],
+            &schema,
+            &[],
+            0,
+            0,
+            req_ids,
+            unicast_worker,
+            client_id,
+            Some(block.as_slice()),
+            &[],
+        )
+    }
+
     /// Encode batch once directly into SAL mmap, replicate to all workers.
     /// `lsn` is supplied by the caller: a DDL zone LSN (`broadcast_ddl`), the
     /// checkpoint generation (FlushEph round), or 0 for command-only groups.
@@ -1134,44 +1166,47 @@ impl MasterDispatcher {
         // gate discards — not parks — late frames.
         let (slots, req_ids, _lease) =
             dispatch_scan_fanout(disp_ptr, reactor, sal_excl, unicast, |disp, req_ids, unicast| {
-                let (schema, block, _safe, _stride) = disp.cached_schema_block(target_id);
                 // Embed client_version in wire_flags bits 24-39 so workers can
                 // decide whether to include the schema block in their response.
                 let wire_flags = gnitz_wire::wire_flags_set_schema_version(0, client_version);
-                disp.write_group_with_req_ids(
-                    target_id,
-                    0,
-                    wire_flags,
-                    &[],
-                    &schema,
-                    &[],
-                    0,
-                    0,
-                    req_ids,
-                    unicast,
-                    client_id,
-                    Some(block.as_slice()),
-                    &[],
-                )
+                disp.write_one_scan_group(target_id, wire_flags, req_ids, unicast, client_id)
             })
             .await?;
 
-        // Return on the FIRST worker fault, decode error, or client
-        // disconnect: `_lease` drops on return and `route_scan_slot` discards
-        // every undrained frame at the ring boundary, advancing
+        // `forward_scan_slots` returns on the FIRST worker fault, decode error,
+        // or client disconnect: `_lease` drops on return and `route_scan_slot`
+        // discards every undrained frame at the ring boundary, advancing
         // `consume_cursor`, so a still-streaming worker cannot wedge in
-        // `send_encoded` — draining the doomed trains would be pure waste. On
-        // a fault the client sees its data frames followed by a STATUS_ERROR
-        // frame, which `recv_scan_response` handles mid-stream.
-        for (i, slot) in slots.into_iter().enumerate() {
-            // Under unicast, `dispatch_scan_fanout` returns one slot whose
-            // worker is `unicast`, not slot index 0.
-            let w = if unicast >= 0 { unicast as usize } else { i };
-            if !drain_scan_train(reactor, peer, slot, req_ids[i] as u32, w).await? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        // `send_encoded` — draining the doomed trains would be pure waste. On a
+        // fault the client sees its data frames followed by a STATUS_ERROR frame,
+        // which `recv_scan_response` handles mid-stream.
+        forward_scan_slots(reactor, peer, slots, &req_ids, unicast).await
+    }
+
+    /// Await + forward one already-dispatched scan relation: the await+drain
+    /// half of `fan_out_scan_async`, factored out for the multi-scan path
+    /// (`handle_scan_multi`), which writes every relation's group up front under
+    /// one SAL cut via `dispatch_scan_multi_fanout` and then drains each relation
+    /// here, in request order. Awaits every worker's first reply frame (join_all
+    /// across workers for a broadcast, the single slot for a unicast), then
+    /// forwards each worker's train to the client in ascending worker order.
+    ///
+    /// `Ok(false)` on client disconnect, `Err` on a worker fault / malformed
+    /// train. The caller holds the relation's `ScanLease` for the whole call, so
+    /// a `false`/`Err` return drops it and discards the undrained remainder at
+    /// the ring boundary. Draining relation `i` fully before relation `i+1` is
+    /// the FIFO invariant's supported usage: with `FLAG_SCAN_FIFO_REPLY`, each
+    /// worker streams the relations in request order, so relation `i`'s frames
+    /// sit at the front of every ring with a live consumer.
+    pub(crate) async fn await_and_drain_scan_relation(
+        reactor: &crate::runtime::reactor::Reactor,
+        peer: &Peer,
+        unicast: i32,
+        req_ids: &[u64],
+        nw: usize,
+    ) -> Result<bool, String> {
+        let slots = await_scan_slots(reactor, unicast, req_ids, nw).await;
+        forward_scan_slots(reactor, peer, slots, req_ids, unicast).await
     }
 
     /// Broadcast a DDL batch to every worker. `lsn` is the caller's zone
@@ -1488,12 +1523,52 @@ impl MasterDispatcher {
     }
 }
 
+/// Await each dispatched worker's first reply slot for a scan group: the single
+/// slot under unicast (`unicast >= 0`, keyed on `req_ids[0]`), or all `nw` in
+/// worker order under broadcast. The one owner of the unicast/broadcast await
+/// shape, shared by `dispatch_scan_fanout`, `fan_out_scan_async`, and
+/// `await_and_drain_scan_relation`.
+pub(crate) async fn await_scan_slots(
+    reactor: &crate::runtime::reactor::Reactor,
+    unicast: i32,
+    req_ids: &[u64],
+    nw: usize,
+) -> Vec<W2mSlot> {
+    if unicast >= 0 {
+        vec![reactor.await_scan_slot(req_ids[0] as u32).await]
+    } else {
+        crate::runtime::reactor::join_all_unpin(req_ids[..nw].iter().map(|&id| reactor.await_scan_slot(id as u32)))
+            .await
+    }
+}
+
+/// Forward each already-awaited worker scan train to the client in ascending
+/// worker order via `drain_scan_train`. Under unicast the single slot belongs to
+/// worker `unicast`, not slot 0. `Ok(false)` on client disconnect, `Err` on a
+/// worker fault / malformed train. Shared by `fan_out_scan_async` and
+/// `await_and_drain_scan_relation`.
+async fn forward_scan_slots(
+    reactor: &crate::runtime::reactor::Reactor,
+    peer: &Peer,
+    slots: Vec<W2mSlot>,
+    req_ids: &[u64],
+    unicast: i32,
+) -> Result<bool, String> {
+    for (i, slot) in slots.into_iter().enumerate() {
+        let w = if unicast >= 0 { unicast as usize } else { i };
+        if !drain_scan_train(reactor, peer, slot, req_ids[i] as u32, w).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Forward one worker's SCAN continuation train to the client: send each frame
 /// to `peer` (dropping it before awaiting the next, per the W2M ring contract)
 /// and loop until the train header reports no more frames. `slot` is the first,
 /// already-awaited frame. Returns `Ok(false)` if the client disconnects
 /// mid-stream and `Err` on a malformed train header. Called by
-/// `fan_out_scan_async`, once per drained train (one per worker, or a single
+/// `forward_scan_slots`, once per drained train (one per worker, or a single
 /// one under unicast).
 async fn drain_scan_train(
     reactor: &crate::runtime::reactor::Reactor,

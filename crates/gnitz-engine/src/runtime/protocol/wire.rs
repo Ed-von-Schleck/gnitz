@@ -990,6 +990,38 @@ pub fn decode_push_txn(data: &[u8]) -> Result<DecodedPushTxn<'_>, &'static str> 
     Ok((families, preconditions))
 }
 
+/// Decode a `FLAG_SCAN_MULTI` frame into its per-relation `(tid,
+/// client_schema_version)` list, in request order. The frame is: control block,
+/// then a `u32` relation count, then per relation a `u64` tid and a `u16` cached
+/// schema version (all LE). The control block is validated (version, region
+/// count) but not returned — `handle_message`'s peek already holds the routing
+/// header. Truncation at any field rejects the whole frame; the count/duplicate/
+/// tid-legality shape rules are the handler's (`handle_scan_multi`), so a
+/// well-formed but empty or over-cap list decodes cleanly and is rejected there
+/// with a specific message.
+///
+/// `codec` has `read_u32_le`/`read_u64_le` but no `read_u16_le`, so the version
+/// is read with `u16::from_le_bytes`. Shares the control-block + `u32` count
+/// prologue with `decode_ddl_txn`/`decode_push_txn` via `txn_frame_prologue`; the
+/// explicit 10-byte-record bound below then rejects a hostile count before
+/// allocating (the per-record reads would otherwise panic on a short slice).
+pub fn decode_scan_multi(data: &[u8]) -> Result<Vec<(u64, u16)>, &'static str> {
+    // A relation record is exactly 10 bytes (u64 tid + u16 version).
+    const RECORD_BYTES: usize = 10;
+    let (count, mut off, _cap) = txn_frame_prologue(data, RECORD_BYTES)?;
+    if count > data.len().saturating_sub(off) / RECORD_BYTES {
+        return Err("SCAN_MULTI relation section truncated");
+    }
+    let mut relations = Vec::with_capacity(count);
+    for _ in 0..count {
+        let tid = codec::read_u64_le(data, off);
+        let version = u16::from_le_bytes([data[off + 8], data[off + 9]]);
+        off += RECORD_BYTES;
+        relations.push((tid, version));
+    }
+    Ok(relations)
+}
+
 /// Like `decode_wire` but skips WAL block checksum verification.  Use for
 /// trusted intra-process IPC (W2M ring).
 pub fn decode_wire_ipc(data: &[u8]) -> Result<DecodedWire, &'static str> {

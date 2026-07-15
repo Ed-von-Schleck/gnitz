@@ -1,4 +1,6 @@
-use crate::connection::{ScanResult, Session, COL_TAB, DEP_TAB, IDX_TAB, SCHEMA_TAB, TABLE_TAB, VIEW_TAB};
+use crate::connection::{
+    MultiScanResult, ScanResult, Session, COL_TAB, DEP_TAB, IDX_TAB, SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
+};
 use crate::error::ClientError;
 use crate::protocol::types::type_code_from_u64;
 use crate::protocol::{
@@ -424,6 +426,13 @@ impl GnitzClient {
 
     pub fn scan(&mut self, table_id: u64) -> ScanResult {
         self.session.scan(table_id)
+    }
+
+    /// Consistent snapshot of N relations at one server-side SAL cut, returned
+    /// in request order. An atomic multi-table `push_txn` is never observed torn
+    /// across the result set. Like `scan`, it leaves `last_seen_lsn` untouched.
+    pub fn scan_many(&mut self, table_ids: &[u64]) -> MultiScanResult {
+        self.session.scan_multi(table_ids)
     }
 
     pub fn seek(&mut self, table_id: u64, pk: &PkTuple) -> ScanResult {

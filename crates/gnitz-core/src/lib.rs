@@ -18,8 +18,8 @@ pub use client::{
     MAX_CHAIN_SEGMENTS,
 };
 pub use connection::{
-    ScanResult, Session, COL_TAB, DEP_TAB, FIRST_USER_SCHEMA_ID, FIRST_USER_TABLE_ID, IDX_TAB, SCHEMA_TAB, SEQ_TAB,
-    TABLE_TAB, VIEW_TAB,
+    MultiScanResult, ScanResult, Session, COL_TAB, DEP_TAB, FIRST_USER_SCHEMA_ID, FIRST_USER_TABLE_ID, IDX_TAB,
+    SCHEMA_TAB, SEQ_TAB, TABLE_TAB, VIEW_TAB,
 };
 pub use error::ClientError;
 pub use expr::{ExprBuilder, ExprProgram};

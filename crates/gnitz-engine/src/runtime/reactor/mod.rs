@@ -164,7 +164,6 @@ struct ReactorShared {
     /// late result instead. Empty on the steady-state path (cancellation
     /// is rare), so the handler's `is_empty()` check skips the hash.
     cancelled_fsyncs: RefCell<FxHashSet<u64>>,
-    w2m: OnceCell<W2mReceiver>,
     /// Pointer-stable storage for the reactor's persistent
     /// `FUTEX_WAITV` SQE. The kernel dereferences this array
     /// asynchronously, so it must outlive the SQE. A single SQE covers
@@ -296,6 +295,16 @@ struct ReactorShared {
     /// set is non-empty (spawned on the 0→1 transition) and drains it,
     /// re-arming every listed listener.
     accept_rearm_pending: RefCell<FxHashSet<i32>>,
+    /// SAFETY INVARIANT: `w2m` MUST be the LAST declared field. A `W2mSlot`
+    /// holds a raw `*mut InFlightState` into this `W2mReceiver`, and its `Drop`
+    /// calls `release()` through that pointer. Slots outlive their originating
+    /// stack frame in two places that drop LATER than most fields —
+    /// `scan_parked` (parked continuation frames) and `send_buffers_in_flight`
+    /// (a `SendAlive::Slot` keep-alive orphaned when its `SendFuture` is dropped
+    /// pre-CQE). Declaring `w2m` last guarantees the `W2mReceiver` outlives every
+    /// slot holder, so every teardown `release()` writes into live memory.
+    /// Moving `w2m` above any slot holder is a use-after-free at shutdown.
+    w2m: OnceCell<W2mReceiver>,
 }
 
 /// Shared, clonable handle to the reactor. All futures created by the
@@ -712,8 +721,11 @@ impl Reactor {
             // Unread-data check: if write_cursor has advanced past
             // read_cursor, a publish is pending that we haven't
             // drained. Signal the caller to drain before arming.
+            // `write_cursor` is peer-written (the worker publishes it) and stays
+            // `Acquire`; `read_cursor` is master-owned, so reading back our own
+            // last advance is `Relaxed`.
             let wc = hdr.write_cursor().load(std::sync::atomic::Ordering::Acquire);
-            let rc = hdr.read_cursor().load(std::sync::atomic::Ordering::Acquire);
+            let rc = hdr.read_cursor().load(std::sync::atomic::Ordering::Relaxed);
             if wc != rc {
                 pending = true;
             }
@@ -976,20 +988,11 @@ impl Reactor {
         // slot would drop (and lose) all but the last.
         let mut parked = self.inner.scan_parked.borrow_mut();
         let q = parked.entry(req_id).or_default();
-        // One req_id maps to exactly one worker (`dispatch_scan_fanout`
-        // allocates a distinct id per worker), so a queued frame is one of that
-        // worker's in-flight (parked, un-dropped) W2M slots. Depth is bounded
-        // by how many frames fit in one ring; every continuation sender must
-        // keep that below `W2M_MAX_IN_FLIGHT` (enforced by frame sizing or
-        // static asserts at the senders). The debug_assert turns a frame-size
-        // change that breaks the bound into a test failure rather than a
-        // silent InFlightState overwrite.
-        debug_assert!(
-            q.len() < crate::runtime::w2m::W2M_MAX_IN_FLIGHT,
-            "scan queue depth {} for req_id {} — W2M in-flight would overflow",
-            q.len(),
-            req_id,
-        );
+        // One req_id maps to exactly one worker (`dispatch_scan_fanout` allocates
+        // a distinct id per worker), so every queued frame is one of that
+        // worker's parked, un-dropped W2M slots. Depth is bounded by how many
+        // frames fit in one ring by bytes — `InFlightState`'s queue grows to
+        // match, so there is no fixed ceiling to assert against.
         q.push_back(slot);
         if let Some(waker) = self.inner.scan_wakers.borrow_mut().remove(&req_id) {
             waker.wake();
@@ -3869,6 +3872,40 @@ mod tests {
             r.inner.scan_parked.borrow().is_empty(),
             "queue emptied after both frames consumed"
         );
+
+        drop(_lease);
+        drop(recv);
+    }
+
+    /// The per-ring in-flight tracker is dynamic: routing more continuation
+    /// frames for one req_id than the old fixed 64-slot ceiling must queue them
+    /// all and deliver them in order — the fixed `InFlightState` aborted on the
+    /// 65th, and `route_scan_slot`'s old `debug_assert` fired at 64.
+    #[test]
+    fn scan_queue_exceeds_legacy_64_slot_ceiling() {
+        let r = make_reactor();
+        let req_id = r.alloc_scan_request_id() as u32;
+        const N: usize = 100; // > 64
+        let (recv, _region) = unsafe { make_scan_ring(req_id, N) };
+        let _lease = r.scan_lease(&[req_id]);
+
+        for _ in 0..N {
+            let s = recv.try_read_slot(0).expect("frame");
+            r.test_route_scan_slot(s);
+        }
+        assert_eq!(
+            r.inner.scan_parked.borrow().get(&req_id).map(|q| q.len()),
+            Some(N),
+            "all {N} frames queued past the legacy 64 ceiling — none dropped or aborted"
+        );
+
+        for i in 0..N {
+            let f = r.block_on(r.await_scan_slot(req_id));
+            let rid = wire::peek_control_block(f.bytes()).unwrap().request_id;
+            assert_eq!(rid, 100 + i as u64, "frame {i} delivered in arrival order");
+            drop(f);
+        }
+        assert!(r.inner.scan_parked.borrow().is_empty(), "queue emptied after drain");
 
         drop(_lease);
         drop(recv);
