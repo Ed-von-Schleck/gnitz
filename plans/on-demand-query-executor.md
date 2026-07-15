@@ -7,361 +7,379 @@ gnitz has **two query engines that share nothing**:
 - **Ad-hoc SELECT** (`crates/gnitz-sql/src/dml/select.rs`) — a thin, client-resident
   keyseek engine: an access-path ladder (PK seek → `pk IN` multi-seek → ordered
   range index → equality index → hard error, `select.rs:103-178`), gather the whole
-  reply into one client `ZSetBatch`, then project/limit client-side. It has **no
+  reply into one client `ZSetBatch`, project/limit client-side. It has **no
   relational operator**. Joins, GROUP BY, DISTINCT, aggregation, set-ops, and every
-  non-indexed WHERE are rejected with "belongs in a CREATE VIEW". Its residual
-  filter is **i64-only** (`exec/eval.rs`) — it cannot even filter a `TEXT`/`F64`
-  column that *is* indexed. There is no ORDER BY, OFFSET, or deterministic LIMIT.
-- **CREATE VIEW** (`crates/gnitz-sql/src/plan/view/`) — the full DBSP compiler:
-  every relational shape, compiled to a circuit, registered, materialized,
-  maintained incrementally, checkpointed, recovered.
+  non-indexed WHERE are rejected with "belongs in a CREATE VIEW". Its residual filter
+  is **i64-only** (`exec/eval.rs`) — it cannot filter a `TEXT`/`F64` column even when
+  that column *is* indexed. There is no ORDER BY, OFFSET, or deterministic LIMIT.
+- **CREATE VIEW** (`crates/gnitz-sql/src/plan/view/`) — the full DBSP compiler: every
+  relational shape, compiled to a circuit, registered, materialized, maintained
+  incrementally, checkpointed, recovered.
 
-Every relational capability therefore has to be built **twice** (once as a client
-keyseek wart, once as an engine circuit) or forced into a **persistent, maintained
-view** even when the user wants a one-shot answer. The thin path grows a new wart
-every time someone wants something ad-hoc.
+Every relational capability is therefore built **twice** (a client keyseek wart and
+an engine circuit) or forced into a **persistent, maintained view** even for a
+one-shot answer.
 
-This plan collapses the two into **one on-demand executor**. A SELECT is compiled
-by the **existing view planner** into the same circuit a CREATE VIEW builds, shipped
-to the engine as a **transient** (non-durable, unregistered) circuit, run **once**
-over the committed base snapshot, its result **streamed** back, and all state
-**discarded**. This is sound in the engine's own theory (CLAUDE.md §3): every
-operator is "first a scalar function on Z-Sets, then lifted" to the incremental
-form; the engine today only instantiates the lifted form. The scalar form — run the
-operator DAG once over the base Z-sets — *is* an ad-hoc query, and it is already
-latent in every `ops/` kernel and realized daily by `backfill_view`.
+The fix is to **unify the compute, not the dispatch**. The relational *compute* —
+join, reduce, distinct, set-ops — already exists once, in the operator kernels and
+the view compiler. What ad-hoc SELECT lacks is a way to *run that compute once and
+discard it*. So: compile a SELECT with the **existing view planner** into the same
+circuit a CREATE VIEW builds, run it **once** over the committed base snapshot as a
+**transient** (unregistered, non-durable, unmaintained) circuit, stream the result,
+discard all state. This is sound in the engine's own theory (CLAUDE.md §3): every
+operator is "first a scalar function on Z-Sets, then lifted"; the engine today only
+instantiates the lifted (incremental) form. The scalar form — run the DAG once over
+the base Z-sets — *is* an ad-hoc query, already realized by `backfill_view`.
 
-The payoff: ad-hoc SELECT gains the **entire** relational surface (joins, GROUP BY,
+**Crucially, the dispatch stays split.** A point/index read is one unicast seek with
+zero allocations; a circuit is a compile + trace-table allocation + epoch drive.
+Forcing the cheap read through the expensive machine is a pure regression. So the
+**thin keyseek path is kept, unchanged**, for exactly the reads it serves cheapest;
+the executor picks up only the shapes the thin path *rejects today* — by turning its
+two `return Err`s into **fall-through**, not by replacing it.
+
+Payoff: ad-hoc SELECT gains the full relational surface (joins, GROUP BY,
 aggregation, DISTINCT, set-ops, subqueries), a **server-side, fully-typed** WHERE
-(dissolving the i64-only and non-indexed-error limits at once), and — at the serving
-edge — ORDER BY / OFFSET / deterministic LIMIT. The thin keyseek engine is **deleted**.
+(dissolving the i64-only and non-indexed-error limits), and — at the serving edge —
+ORDER BY / OFFSET / deterministic LIMIT. No point-lookup regression; no engine
+deleted.
 
-## 2. What is reused vs. genuinely new
+## 2. The lifecycle model (the unifying frame)
 
-The compute core is **already decoupled** from the view lifecycle, so the bulk of
-this is reuse:
+A view today is *literally* "compile + register + `backfill_view` once + then keep
+ticking." An ad-hoc query is that same sequence **truncated before maintenance**:
+compile, register (in-memory only), run once, drop. The two are not parallel engines
+— the query is a **prefix of the view lifecycle**.
 
-**Reused verbatim** — the operator kernels (`ops/`), the VM, the free compiler
-`compile_view` (`query/compiler/mod.rs:299`), the id-parametric backfill drivers
-`backfill_view` (`catalog/ddl.rs:386`), `execute_multi_worker_step<E>` /
-`backfill_view_step_multi_worker<E>` (`query/dag/exec.rs:305,375`), the exchange
-transport (`ExchangeCallback::do_exchange`, `query/dag/mod.rs:204`; the master
-`ExchangeAccumulator`, `reactor/exchange.rs:24`), `worker_for_partition`
-(`ops/exchange/router.rs:30`) and the seek/scan fan-outs, the per-node circuit codec
-`encode_op_node`/`decode_op_node` (`gnitz-wire/src/circuit.rs:445,524`),
-`Circuit::into_rows` (`gnitz-core/src/circuit.rs:59`) and the `encode_ddl_txn` family
-framing (`gnitz-core/src/protocol/message.rs:313`), the streamed-reply path
-`stream_batch_response` + `ReplySchema::OneOff` (`worker/reply.rs`), the `ScanLease`
-RAII, and `DagEngine::unregister_table` (`query/dag/mod.rs:265`, which already frees
-the RAM traces + compiled plan + scratch dirs through existing `Drop` impls).
+`RelationKind` (`query/dag/mod.rs:84`) is already a "property-bundle" enum ("Bundles
+every per-kind property that used to be set independently") with three variants:
+`View` / `BaseTable` / `SystemCatalog`. The plan needs a **fourth**, because a
+transient can be none of them: `View` is checkpointed/maintained, `BaseTable` is
+`unique_pk`-tagged with base-only DML/index paths, `SystemCatalog` is neither. This
+variant is not optional decoration — `TableEntry.kind` is non-nullable and
+`register_table` is **uncallable** without it.
 
-**Genuinely new** (the whole delta of this plan):
-1. A **transient circuit transport**: a non-durable `FLAG_RUN_TRANSIENT` frame +
-   `SalMessageKind::RunTransient`, carrying the `CircuitRows` triple + output schema,
-   routed to an **in-memory** `LoadedCircuit` instead of the sys-table ingest.
-2. An **in-memory `LoadedCircuit` builder** + a `compile_loaded` split of
-   `compile_view`, so a circuit compiles without a sys-table read.
-3. **Transient-id registration/teardown**: an in-memory `tables`/`cache`/`meta` entry
-   for the request's duration, and a redirect of the one view-bound relay coupling
-   (`load_meta_circuit` → in-memory plan).
-4. **Bounded circuit sources**: the access-path ladder emits key bounds that a
-   circuit `scan` source opens as a bounded cursor (a new `drain_range_to_batch`),
-   so point/index reads do not regress to full scans.
-5. The **client-side result sink**: ORDER BY / OFFSET / deterministic LIMIT over the
-   streamed result batch.
-6. **Deletion** of the thin keyseek path once (4) lands.
+Add **`RelationKind::OneShot`**: ephemeral (Rederive traces), **not** maintained (no
+dep edges), **not** checkpointed, **not** durably named. Replace the scattered
+`kind == View` predicates that today conflate several axes with **positive lifecycle
+accessors** — `lifecycle.checkpointed()`, `lifecycle.maintained()`,
+`lifecycle.durable()`, `lifecycle.drains_ticks()`. This is required for correctness,
+not tidiness:
 
-## 3. Decided semantics
+- **Checkpoint exclusion (a real bug in the naive design).**
+  `collect_ephemeral_flush_tables` (`query/dag/ingest.rs:253`) has **two** halves: the
+  *trace* half iterates `self.cache.values_mut()` with **no `kind` filter**; only the
+  *output* half filters `kind != View`. A transient's compiled plan **must** live in
+  `cache[tid]` to run, so a `kind != View` guard alone would still let a checkpoint
+  fire mid-query and flush the transient's operator traces. Both halves must gate on
+  `lifecycle.checkpointed() == false`. A positive accessor is robust by construction;
+  the negative `kind != View` form is one forgotten guard from a checkpoint leak.
+- **Freshness / recovery** likewise dispatch off `is_view()` today (`dag/mod.rs:131`,
+  `RecoverySource`); a OneShot wants "yes freshness-drain, no checkpoint, no recover",
+  a combination only per-axis accessors express cleanly.
 
-### 3.1 Visibility
+A later **`CachedPlan`** preset (keep the compiled plan, drop the state) is the
+natural home for plan-caching — see §9. It is a lifecycle bit-flip, not a fifth
+special case.
 
-The executor reads the **committed base snapshot on the workers, with view-scan
-freshness**: it drains pending DAG ticks before reading (`drain_then_lock`,
-`executor.rs:1730`), so the result reflects **every base commit ACKed before the
-read began**; the catalog read lock excludes concurrent DDL; there is no MVCC. It
-does **not** reflect the calling transaction's own uncommitted buffered writes.
+## 3. Routing — thin path unchanged, executor by fall-through
 
-This is **byte-for-byte today's direct-SELECT visibility**: `execute_select` reads
-through raw `client.scan`/`seek` with **no overlay** (`select.rs` imports none), and
-buffered txn writes are never sent until COMMIT (`client.rs:1399`). The
-read-your-own-writes overlay (`dml/overlay.rs`) is DML-only and **base-PK-keyed** —
-it is fundamentally incompatible with circuit execution, which dissolves base-PK
-identity through joins/aggregates, so it cannot be re-applied to a circuit result.
-The existing SELECT-vs-DML asymmetry (UPDATE/DELETE read-your-writes; SELECT does
-not) is preserved exactly. Read-your-own-writes for ad-hoc SELECT is a **non-goal**.
+`execute_select` keeps the existing access-path ladder verbatim. The **only** change
+is that the two points where it `return Err` today instead **fall through** to the
+executor:
 
-### 3.2 Result model (entry-based, weight passthrough)
+- `select.rs:172` "WHERE on non-indexed column not supported" → run as a circuit
+  (server-side `op_filter` over a full source scan; §5).
+- an indexed seek whose residual is non-i64 (string/float/u128 — `exec/eval.rs`
+  rejects it) → run as a circuit.
 
-The streamed result is a consolidated Z-set: one entry per `(PK, payload)`, the
-weight surfaced as a per-row attribute (`Row.weight`), never expanded — the
-established contract (`gnitz-py/src/lib.rs:1388`; `apply_limit` counts entries). The
-circuit's output PK for shapes without a natural key is a hidden synthetic slot
-(`_group_pk`/`_join_pk`/`_set_pk`), stripped from presentation by `visible_columns()`
-— identical to a view scan. `DISTINCT` and aggregation now collapse multiplicity
-**server-side inside the circuit** (the `distinct`/`reduce` operators), so a
-`SELECT DISTINCT` returns true distinct rows — the projection PK-requirement that
-blocked client-side DISTINCT does not apply (the circuit carries its own output key).
+And the up-front rejections that make a query "not a single-table keyseek" —
+`JOINs not supported` (`select.rs:93`), DISTINCT/GROUP BY/HAVING routed to CREATE
+VIEW (`select.rs:56`), multi-table FROM — **route to the executor** instead of
+erroring. The router is therefore **not a new classifier**: the thin path serves what
+its ladder resolves; everything it would have rejected goes to the executor. This
+sidesteps the "dynamic serviceability" instability (an index dropped between calls
+just changes which side of the existing ladder a query lands on, exactly as today).
 
-### 3.3 The sink: ORDER BY / OFFSET / LIMIT
-
-A Z-set has no order; by DBSP theory ordering is not a homomorphism and is inherently
-a **serving-edge** operation. The sink runs **client-side over the streamed result
-batch** (see §7), supporting `ORDER BY <col|position> [ASC|DESC] [NULLS FIRST|LAST]`
-(multi-key), `OFFSET`, and `LIMIT` (deterministic top-N when ordered). Cost is
-**O(result)**: for a filtered/aggregated query the result is small; an *unfiltered*
-`SELECT * FROM t ORDER BY x` streams the whole relation to the client and sorts it in
-RAM. A server-side ordered/bounded sink (a master-side top-N heap) is a **non-goal**
-of this plan — the client-side sink's typed comparator is exactly the comparator such
-a sink would need, so it is forward-compatible.
+Behaviors the thin path keeps that the executor does **not** need to replicate,
+because the thin path still serves them: the `pk IN (…)` fetch-cap early-stop
+(`seek_pk_multi` `row_cap`, `dml/plan.rs:231`), point-seek unicast, i64 residuals.
+One user-visible change: `SELECT non_pk_col FROM t` (dropping all PK columns) is
+rejected by the thin path today (`exec/batch.rs:100`, "projection must include a
+PRIMARY KEY column"); it now falls through to the executor, which gives the result
+its own hidden output key and **succeeds** — a capability gain (tested for parity of
+the *other* thin-path errors, §12).
 
 ## 4. Request lifecycle
 
 ```
 CLIENT (gnitz-sql / gnitz-core)
   execute_select(query):
-    circuit = compile_query_to_circuit(query)      // reuse the view planner, no registration
-    bounds  = access_path_bounds(query.where)      // PK/index selection → source bounds (Stage B)
-    rows    = client.run_query(circuit, bounds)     // FLAG_RUN_TRANSIENT; streams result batch
-    result  = sink(rows, order_by, offset, limit)   // client-side ORDER BY/OFFSET/LIMIT
-    return Rows{ schema, batch: result }
+    if thin_ladder_resolves(query): serve via thin path (unchanged) + client sink (§8)
+    else:
+      circuit, out_schema = compile_query_to_circuit(query)   // reuse the view planner
+      rows = client.run_query(circuit, out_schema)            // FLAG_RUN_TRANSIENT; streamed result
+      return sink(rows, order_by, offset, limit)              // §8
 
-MASTER (runtime/orchestration)
+MASTER
   decode transient frame -> CircuitRows + out_schema
-  tid = fresh transient id
-  register in-memory: tables[tid] = { scratch view_dir, out_schema }, plan = compile_loaded(...)
-  RAII drop_guard = { on any exit: unregister_table(tid) + worker transient-drop }
-  distribute (reuse existing policy, §6):
-     point-seek  -> unicast owner
-     scan/replicated -> broadcast
-     sharded (join/groupby/setop) -> broadcast + fan_out_backfill exchange loop, keyed on tid
-  for source_id in circuit.sources:
-     drive backfill_view_step_multi_worker(tid, source_id, bounded_delta, exchange)
-  scan the accumulated transient output store, stream to client (ScanLease-scoped)
+  tid = allocate_oneshot_id()                                 // reserved server range (§5)
+  register_transient_plan(tid, compile_loaded(...), out_schema, RelationKind::OneShot)
+  synthesize + inject ViewMeta[tid] (shard_cols/join_shard_map/range_n_eq/needs_exchange/has_join)  // §10
+  guard = TransientGuard(tid)                                 // drives the ephemeral teardown protocol (§11)
+  for source_id in circuit.sources:                           // enumerate the circuit, NOT the (empty) DepTab
+     drive one-shot epochs over source_id (broadcast; exchange loop if sharded, §10)
+  if shape is Single/linear: stream the terminal epoch batch directly       // no output store
+  else:                     scan the accumulated RAM output store, stream    // join/agg/distinct/setop
+  // guard drop -> ephemeral drop-transient broadcast + master free (§11)
 
 WORKER
-  dispatch_inner(RunTransient, tid, block, req_id):   // new arm, Gather/Scan template
+  dispatch_inner(RunTransient, tid, block, req_id):    // new arm, Gather/Scan template
      build LoadedCircuit from block; compile_loaded under tid (scratch dir)
-     drive its shard's epoch(s) over the bounded local source cursor
-     accumulate output delta into the unregistered RAM output store
+     run this shard's epoch(s) over the local source cursor(s); exchange via do_exchange if sharded
      stream_batch_response(result, ReplySchema::OneOff(out_schema), req_id, client_id)
+  dispatch_inner(DropTransient, tid, ...):             // new arm: free tables[tid]/cache[tid]/meta[tid] + scratch
 ```
 
-## 5. Component changes
+## 5. Component changes — the executor
 
-### 5.1 gnitz-sql — compile the query, ship it, apply the sink
+Reused verbatim: the operator kernels (`ops/`), the VM, the compiler internals after
+`load_circuit` (`topo_sort`/`annotate`/`build_plan`), the exchange transport
+(`ExchangeCallback::do_exchange`, `query/dag/mod.rs:204`; `ExchangeAccumulator`), the
+per-node circuit codec (`encode_op_node`/`decode_op_node`, `gnitz-wire/src/circuit.rs`),
+`Circuit::into_rows` (`gnitz-core/src/circuit.rs:59`) + the `encode_ddl_txn` family
+framing (`gnitz-core/src/protocol/message.rs:313`), the streamed-reply path
+(`stream_batch_response` + `ReplySchema::OneOff`), and `unregister_table`
+(`query/dag/mod.rs:265`).
 
-- **Factor `compile_query_to_circuit`** out of the CREATE VIEW path. Today
-  `plan::execute_create_view` drives the view planner (`plan/view/dispatch.rs`) on the
-  query and then registers a view. Split the "query → `Circuit` + output `Schema`"
-  half into a standalone function that both CREATE VIEW and `execute_select` call.
-  The planner already handles the full relational surface — **no new SQL planning
-  code**; `execute_select` stops rejecting joins/GROUP BY/DISTINCT/non-indexed WHERE.
-- **`execute_select` becomes**: honor `ORDER BY`/`OFFSET`/`LIMIT` on the envelope
-  (§5.5), compile the query to a circuit, derive source bounds from the WHERE
-  access-path ladder (Stage B; the existing `collect_index_range_candidates` /
-  `collect_index_seek_candidates` / `try_extract_pk_*` in `dml/plan.rs`), call
-  `client.run_query`, apply the client-side sink, return `SqlResult::Rows`.
-- **Delete the thin keyseek engine** once bounded sources land (Stage B): the WHERE
-  ladder in `dml/select.rs` collapses to "emit source bounds"; `exec/eval.rs`
-  (i64-only interpreter), `exec/residual.rs`, and the client-side residual filter are
-  removed — WHERE is now a **server-side, fully-typed** `op_filter`
-  (`ops/linear.rs:21`, evaluates float/string/int/null via a compiled `ScalarFunc`).
-- **The sink** lives in a new `exec/order.rs` (§7).
+- **gnitz-sql** — factor `compile_query_to_circuit` out of the CREATE VIEW path
+  (`plan::execute_create_view` already drives the view planner on the query, then
+  registers; split the "query → `Circuit` + output `Schema`" half so both callers
+  share it). `execute_select` gains the §3 fall-through + the §8 sink. **No new SQL
+  planning** — the view planner already handles the full relational surface.
+- **gnitz-core** — `GnitzClient::run_query(circuit_rows, out_schema)`: encode a
+  **`FLAG_RUN_TRANSIENT`** frame (the `encode_ddl_txn` family-block layout carrying
+  the 3 circuit families + the output-schema column family, tagged with a
+  server-allocated `tid` + `client_id`/`request_id`; **no** VIEW_TAB/COL_TAB/DEP rows,
+  no fsync), reassemble the streamed reply as `recv_scan` does.
+- **gnitz-wire** — add the `FLAG_RUN_TRANSIENT` and `FLAG_DROP_TRANSIENT` flag bits.
+- **gnitz-engine**:
+  - `SalMessageKind::RunTransient` + `DropTransient` (`runtime/protocol/sal.rs:229`):
+    `classify` arms, `ALL_KINDS` entries, top-level `dispatch` arms, and worker
+    `dispatch_inner` arms (`worker/mod.rs:675`) modeled on the `Gather` handler
+    (`mod.rs:737`).
+  - **In-memory `LoadedCircuit` builder + `compile_loaded` split.** `load_circuit`
+    (`compiler/load.rs:40`) is the only sys-table-reading step in `compile_view`;
+    split it out and add `compile_loaded(loaded, view_dir, view_schema, ext_tables)
+    -> Result<CompileOutput>` (the body from `mod.rs:310`). A builder constructs
+    `LoadedCircuit` from the delivered `CircuitRows` directly (same `decode_op_node`,
+    same `(kind, position)` node-column sort, same edge-validity check), mapping the
+    client's `u64` node ids to the engine's `i32` keys (client ids are small and
+    sequential — no truncation risk).
+  - **`register_transient_plan(tid, CompileOutput, out_schema, OneShot)`** — a new
+    inserter that seeds `cache[tid]` + `tables[tid]` (scratch `view_dir` + out schema)
+    directly, because `ensure_compiled` (the only cache inserter today) reads sys
+    tables and returns `None` for a transient.
+  - **Server-allocated OneShot ids** from a reserved range distinct from the durable
+    table-id space, so concurrent transients get distinct `tid` **and** scratch
+    `view_dir` (scratch tables are named `_{hist,int,reduce}_{tid}_{nid}`,
+    `emit.rs:590` — a collision corrupts a concurrent query).
+  - **A one-shot driver** (not `backfill_view` verbatim — it derives sources from the
+    DepTab, which is empty for an unregistered transient): enumerate the compiled
+    circuit's `ScanDelta`/`ScanTrace` source ids directly, drain each source
+    chunk-wise, drive its epochs to completion (single-source-per-epoch, seeding each
+    join input's trace across epochs — §10), then stream.
+  - **Stream-direct vs accumulate.** A `Single`/linear shape's terminal epoch output
+    is already the complete result in one batch — stream it via `stream_batch_response`
+    with no output store. A multi-source/non-linear shape (join/reduce/distinct/set-op)
+    accumulates deltas into an unregistered RAM output `Table` (`tables[tid]`, which
+    carries the circuit's hidden output key — `_join_pk`/`_group_pk`), scanned once via
+    `scan_family(tid)`.
 
-### 5.2 gnitz-core — `run_query` client API + transient frame
+## 6. Visibility & consistency
 
-- Reuse `Circuit::into_rows() -> CircuitRows` (`circuit.rs:59`) to get the
-  `(nodes, edges, node_columns)` row triple the client already builds for CREATE VIEW.
-- New `GnitzClient::run_query(circuit_rows, out_schema, bounds) -> ScanResult`:
-  encode a **`FLAG_RUN_TRANSIENT`** frame — structurally the `encode_ddl_txn`
-  family-block layout (`protocol/message.rs:313`) carrying **only** the 3 circuit
-  families + the output-schema column family (no VIEW_TAB/COL_TAB/DEP rows), tagged
-  with a client-chosen transient id + `client_id`/`request_id` — then reassemble the
-  streamed reply exactly as `recv_scan` does (`connection.rs:400`).
+The executor reads the **committed base snapshot on the workers, with view-scan
+freshness** (drain pending ticks before reading, `executor.rs:1730`; catalog read
+lock excludes concurrent DDL; no MVCC). It does **not** reflect the calling
+transaction's own uncommitted buffered writes. This is **byte-for-byte today's direct
+SELECT visibility**: `execute_select` reads through raw `client.scan`/`seek` with **no
+overlay**; the read-your-own-writes overlay (`dml/overlay.rs`) is DML-only and
+base-PK-keyed — fundamentally incompatible with circuit execution, which dissolves
+base-PK identity through joins/aggregates. The existing SELECT-vs-DML asymmetry is
+preserved exactly; read-your-own-writes for ad-hoc SELECT is a **non-goal**.
 
-### 5.3 gnitz-wire — the transient flag + source bounds
+## 7. Result model
 
-- Add the **`FLAG_RUN_TRANSIENT`** flag bit.
-- **Source bounds on the circuit node** (Stage B): today `OpNode::ScanDelta(TableId)`
-  / `ScanTrace(TableId)` carry only a table id (`circuit.rs:322`). Extend them with an
-  optional bound descriptor (a PK point / PK range / index selection — reuse the
-  existing `RangeDescriptor` / `pack_pk_cols` the wire already defines), threaded
-  through `encode_op_node`/`decode_op_node`.
+One entry per `(PK, payload)`, weight surfaced as a per-row attribute, never expanded
+(`gnitz-py/src/lib.rs:1388`; `apply_limit` counts entries). Shapes without a natural
+key carry a hidden synthetic slot (`_group_pk`/`_join_pk`/`_set_pk`), stripped by
+`visible_columns()` — identical to a view scan. DISTINCT and aggregation collapse
+multiplicity **server-side inside the circuit**, so `SELECT DISTINCT` returns true
+distinct rows (the projection-PK limitation that blocks client-side DISTINCT does not
+apply — the circuit owns the output key).
 
-### 5.4 gnitz-engine — the transient executor
+## 8. The sink — ORDER BY / OFFSET / LIMIT (`exec/order.rs`)
 
-- **`SalMessageKind::RunTransient`** (`runtime/protocol/sal.rs:229`): a `classify`
-  arm for `FLAG_RUN_TRANSIENT`, an `ALL_KINDS` entry, a top-level `dispatch` arm →
-  `run_via_dispatch_inner`, and a worker `dispatch_inner` arm (`worker/mod.rs:675`)
-  modeled on the `Gather` handler (`mod.rs:737`) — a synthetic-schema, client-routed
-  streamed reply.
-- **In-memory `LoadedCircuit` builder + `compile_loaded` split.** `load_circuit`
-  (`compiler/load.rs:40`) is the *only* sys-table-reading step in `compile_view`;
-  everything after (`topo_sort`, `annotate`, `build_plan`) works on the in-memory
-  `LoadedCircuit` (`compiler/mod.rs:73`). Split `compile_view` into `load_circuit(...)`
-  + `compile_loaded(loaded, view_dir, view_schema, ext_tables) -> Result<CompileOutput>`
-  (the body from `mod.rs:310`). Add a builder that constructs `LoadedCircuit` from the
-  delivered `CircuitRows` directly — same `decode_op_node` per node, same
-  `(kind, position)` node-column sort, same edge-validity check `load_circuit`
-  performs — mapping the client's `u64` node ids to the engine's `i32` keys. The
-  transient path calls `compile_loaded` with a scratch `view_dir` and the transient id
-  for scratch-table naming; **no sys-table read, no fsync**.
-- **Transient-id registration & teardown.** Register `tid` in the DAG in-memory for
-  the request only: a `tables[tid]` entry with a scratch `view_dir` + the output
-  schema, and the compiled plan in `cache[tid]`. Its operator traces are `Rederive`
-  `Table`s (RAM-first: no manifest/fsync/shard files until a 4 MiB/partition ceiling,
-  `table/mod.rs:281,41`). Because the ephemeral checkpoint sweep enumerates only
-  `self.cache` + `self.tables(kind==View)` (`query/dag/ingest.rs:253-267`), and a
-  transient id is `kind != View`, it is **provably invisible to checkpoints**.
-  Teardown = `drop_transient(tid) ≡ unregister_table(tid)` (`dag/mod.rs:265`: drops the
-  RAM store + `CompileOutput` + meta) wrapped in a **RAII guard scoped to the in-flight
-  request future**, alongside the existing `ScanLease`. Every exit path — success,
-  client disconnect (`Ok(false)`), worker fault (`Err`), `GNITZ_CLIENT_SEND_TIMEOUT_MS`
-  eviction — drops it **exactly once**; workers drop their per-rank scratch on the same
-  signal.
-- **Redirect the one view-bound coupling.** The master relay `prepare_relay`
-  (`master/dispatch.rs:554`) resolves re-scatter columns via `get_shard_cols(view_id)`
-  / `get_join_shard_cols` → `view_meta(view_id)` → `load_meta_circuit(view_id)`, a
-  sys-table read. For a transient id, `view_meta`/`get_shard_cols` must resolve from
-  the **in-memory transient plan** (already in `cache[tid]`) instead. This is the only
-  place the exchange transport is not already id-opaque.
+Client-side over the returned batch (thin-path result or streamed executor result). A
+typed multi-column comparator over the `ZSetBatch` matching the engine's
+`compare_rows` order: signed ints signed-order, unsigned magnitude, `F32`/`F64`
+`total_cmp`, `STRING`/`BLOB` byte-wise (== the engine's german-string content order),
+`U128`/`UUID` unsigned, `I128` signed. Null placement absolute (default NULLS LAST for
+ASC / FIRST for DESC; explicit honored), not flipped by DESC. Keys resolve as a column
+reference or a **1-based visible-output position**. Pipeline: stable-sort a row-index
+permutation, slice `[offset, offset+limit)`, materialize via `copy_batch_row`; a plain
+`SELECT` with no order/offset/effective-limit is a zero-copy passthrough. Envelope
+honoring: add `order_by: bool` to `HonoredQueryClauses` (`plan/validate.rs:276`), gate
+the ORDER BY reject on it (`true` only at the `dml/select.rs` site; `false` at the
+other six), remove the OFFSET reject, add `extract_offset`.
 
-### 5.5 Honoring the envelope clauses
-
-`ORDER BY`/`OFFSET`/`LIMIT` are honored only for direct SELECT. Add `order_by: bool`
-to `HonoredQueryClauses` (`plan/validate.rs:276`) and gate the guard's ORDER BY reject
-(`validate.rs:323`) on it; set `order_by: true` at the `dml/select.rs` call site and
-`false` at the other six construction sites (`validate.rs:426`, `view/scalar.rs:400`,
-`view/dispatch.rs:41,418,629`, `view/exists.rs:180`) — CREATE VIEW/CTE/subquery/INSERT
-keep rejecting ORDER BY. Remove the OFFSET rejection in `select.rs:72-77`; add
-`extract_offset` mirroring `extract_limit` (`dml/plan.rs:66`); `LIMIT ALL` already
-parses as `limit: None`.
-
-## 6. Bounded sources & server-side filter (Stage B — the fusion)
-
-The read/operator layer is already built for this. `op_scan_trace` is
-`cursor.drain_to_batch(0)` — it drains a cursor it was **handed** (`ops/scan.rs:14`),
-with zero "whole table" knowledge; `execute_epoch` accepts any input batch. So a
-bounded source is: hand the source a **bounded cursor** instead of a full one.
-
-- **Emit bounds at plan time.** The access-path ladder already exists in
-  `gnitz-sql` (`collect_index_range_candidates`/`collect_index_seek_candidates`/
-  `try_extract_pk_seek_residual`, `dml/plan.rs`). It currently emits client seek calls;
-  it instead emits a **source bound** onto the circuit's `ScanDelta`/`ScanTrace` node
-  (§5.3). PK fully bound → point/range bound (unicast, §6 distribution); indexed
-  prefix → index selection; otherwise → no bound (full scan) with the predicate
-  compiled into the circuit's `op_filter`.
-- **Open a bounded cursor.** Add `ReadCursor::drain_range_to_batch(start, end)` — a
-  mechanical extraction of the already-open-coded walk in `seek_by_index_range`
-  (`catalog/store_io.rs:365-389`: `seek_bytes(start)` … `while valid && cur_pk < end`).
-  The source-open site (`open_store_cursor`) uses it when the node carries a bound.
-- **Non-indexed WHERE = server-side typed filter.** A predicate with no serving index
-  compiles into `op_filter` (`ops/linear.rs:21`) over a full source scan. The compiled
-  `ScalarFunc` predicate evaluates **all** types (`EXPR_FCMP_*`, `EXPR_STR_COL_*`, int
-  arithmetic/compare, `IS NULL`, `AND/OR/NOT`; `expr/program.rs:13`). This dissolves
-  **both** thin-path limits — the i64-only residual and the non-indexed hard error —
-  in one move: any WHERE runs server-side over any column type.
-
-Distribution (reuse existing policy, keyed on the transient id): PK point-bound →
-`fan_out_seek`-style unicast to `worker_for_partition` (`ops/exchange/router.rs:30`);
-scan/replicated → `fan_out_scan` broadcast; sharded (join / GROUP BY / set-op / range
-join) → `fan_out_backfill` broadcast + the exchange relay loop
-(`master/dispatch.rs:777`), driven by `execute_multi_worker_step` whose 6 arms pick
-replicated/range-join/exchanged/join-scatter/single **from the compiled plan**
-(`query/dag/exec.rs:305`) — no new distribution logic.
-
-## 7. The sink — ORDER BY / OFFSET / LIMIT (`exec/order.rs`)
-
-Client-side over the streamed result batch. A typed multi-column comparator over the
-`ZSetBatch` (`ColData` `Fixed`/`Strings`/`Bytes`/`U128s`, `PkColumn`, null bitmap),
-matching the engine's `compare_rows` order so client order equals the order the engine
-would impose: signed ints signed-order, unsigned magnitude, `F32`/`F64` `total_cmp`,
-`STRING`/`BLOB` byte-wise (== the engine's german-string content order), `U128`/`UUID`
-unsigned, `I128` signed. Null placement is absolute (default NULLS LAST for ASC / FIRST
-for DESC, `nulls_first = asc == false`; explicit honored), not flipped by DESC. Keys
-resolve as a column reference (against the result schema) or a **1-based visible-output
-position**. Pipeline: stable-sort a row-index permutation, slice `[offset, offset+limit)`,
-materialize via `copy_batch_row`; a plain `SELECT` with no order/offset/effective-limit
-is a zero-copy passthrough.
-
-Two correctness requirements (from adversarial review of the sink):
-1. **Positional ORDER BY is visible-column-aware.** `ORDER BY n` maps to the *n*-th
+Two correctness requirements (from adversarial review):
+1. **Positional ORDER BY is visible-column-aware** — `ORDER BY n` maps to the *n*-th
    **visible** output column (skip `META_FLAG_HIDDEN`), because a circuit result over a
-   hidden-PK shape (`_group_pk`, etc.) carries a hidden column at index 0 and `SELECT *`
-   is the queryable form — mirror `apply_hidden_column_aliases`
-   (`view/dispatch.rs:360`) / `visible_columns()` (`gnitz-py/src/lib.rs:944`). Naive
-   physical `pos-1` sorts by the hidden key silently.
-2. **No worker-count determinism claim.** A scan is per-worker sorted runs concatenated
-   in rank order, hash-partitioned — not a global merge — so a **stable** sort's
-   tie-break differs W=1 vs W=4. Ties are unspecified by SQL; do not claim otherwise,
-   and make tests assert a total order over unique keys or per-tie-group set-equality.
+   hidden-PK shape carries a hidden column at index 0 and `SELECT *` is the queryable
+   form. Mirror `visible_columns()` / `apply_hidden_column_aliases`
+   (`view/dispatch.rs:360`). Naive physical `pos-1` sorts by the hidden key silently.
+2. **No worker-count determinism claim** — a scan is per-worker sorted runs
+   concatenated in rank order, hash-partitioned, not a global merge; a stable sort's
+   tie-break differs W=1 vs W=4. Ties are unspecified by SQL; tests assert a total
+   order over unique keys or per-tie-group set-equality.
 
-## 8. Deleting the thin path
-
-Once §6 lands, `Statement::Query` routes entirely through the executor and these are
-**removed** (pre-alpha, no legacy): the `dml/select.rs` access-path ladder and its
-non-indexed hard error; `exec/eval.rs` (the i64-only `InterpBackend`); `exec/residual.rs`
-and `residual_filtered`; the client-side projection-PK requirement's role in SELECT
-(the circuit owns the output key). What remains in `dml/select.rs` is thin: compile,
-derive bounds, `run_query`, sink. UPDATE/DELETE keep their own committed+overlay ladder
-(`dml/mutate.rs`) — unchanged; the overlay is DML-only.
+**Honest cost.** The sink is **O(result)**, client-side. For filtered/aggregated
+queries the result is small. For an *unfiltered* `SELECT * FROM t ORDER BY x` the
+result is the whole relation, streamed to the client and sorted in RAM; a string/blob
+result must additionally fit one `MAX_W2M_MSG` frame (`worker/reply.rs:268` — the
+existing view-scan limit, inherited). The real fix for both is a **server-side
+ordered/bounded/paged result sink** (a master-side top-N heap-merge across workers) —
+the deeper missing primitive that view scans need too. It is a **non-goal of this
+plan** (a separate, larger effort); the client-side comparator here is exactly the
+comparator that sink would need, so it is forward-compatible.
 
 ## 9. Non-goals
 
-- **Read-your-own-writes for buffered txn writes in ad-hoc SELECT** (§3.1) — incompatible
-  with circuit execution; would need server-side delta injection, a separate feature.
-- **A server-side ordered/bounded sink** (master top-N heap) — the sink is client-side,
-  O(result); the comparator is forward-compatible with a future server sink.
-- **STRING/BLOB result chunking** — a string/blob-bearing result must fit one
-  `MAX_W2M_MSG` frame (`worker/reply.rs:268` — the existing view-scan limit; inherited,
-  not new). Fixed-width results chunk freely.
-- **Standing/incremental queries** — `CREATE VIEW` remains the way to register a
-  maintained view; the executor is one-shot.
-- **Caching compiled transient circuits** — each query compiles fresh (a plan cache
-  keyed by query shape is a separate optimization, not required for correctness).
+- **Deleting the thin keyseek path** — kept permanently; it serves point/index reads
+  optimally and the executor has no cheaper equivalent. Unify compute, not dispatch.
+- **Bounded circuit sources** — with seeks on the thin path, the executor always
+  full-scans its base sources (correct: a non-indexed filter has no index to bound,
+  and relational shapes read whole sources anyway) and always broadcasts/replicated,
+  never unicasts (which avoids the point-bound-into-exchange deadlock: a unicast into a
+  join/GROUP-BY circuit would block one worker in `do_exchange_wait` on a relay the
+  other workers never join). A source-bound optimization for mixed
+  indexed+non-indexed predicates is possible later, gated on a benchmark — not
+  load-bearing.
+- **A server-side ordered/bounded/paged result sink** (§8) — the real deeper primitive
+  for large ordered reads; separate larger effort.
+- **Plan caching** — each query compiles fresh. The natural home is a future
+  `CachedPlan` lifecycle preset (§2): keep the compiled plan across identical queries,
+  drop the state. A lifecycle bit-flip, out of scope here.
+- **Read-your-own-writes for buffered txn writes in ad-hoc SELECT** (§6).
+- **STRING/BLOB result chunking** — one-frame limit inherited from the view-scan path.
+- **Standing/incremental queries** — `CREATE VIEW` remains the maintained preset.
 
-## 10. Testing
+## 10. Distributed correctness (the substantial piece)
 
-- **Rust unit** (`exec/order.rs`): the comparator across every type incl. negatives,
-  U64 high-bit, `-0.0/NaN` (`total_cmp`), strings, `U128`/`UUID`/`I128`; ASC/DESC; NULLS
-  default + explicit not flipped by DESC; multi-key; visible-position resolution over a
-  schema with a hidden col; offset/limit slicing incl. past-end and passthrough.
-- **Engine unit** (`gnitz-engine`): `compile_loaded` over an in-memory `LoadedCircuit`
-  equals `compile_view` over the sys-table form for the same circuit; `drain_range_to_batch`
-  equals the `seek_by_index_range` walk; transient-id register→run→`unregister_table`
-  leaves `tables`/`cache`/`meta` empty and removes scratch dirs.
-- **Integration** (`crates/gnitz-sql/tests/`, `feature=integration`): ad-hoc `SELECT`
-  with a join, a GROUP BY + HAVING, a DISTINCT, a set-op, a scalar subquery, a
-  non-indexed `WHERE` on a string and a float column — each returns the same rows as the
-  equivalent CREATE VIEW then scan; ORDER BY/OFFSET/LIMIT shape the result; a point-seek
-  `WHERE pk=5` unicasts (assert via worker logs) and does not full-scan.
-- **E2E** (`crates/gnitz-py/tests/test_adhoc_query.py`, `GNITZ_WORKERS=4`): the above
-  under multi-worker, proving exchange-backed sharded one-shots; a transient circuit
-  leaves no manifest/checkpoint artifact (assert data dir unchanged after the query);
-  client disconnect mid-stream frees transient state (assert no leaked scratch dirs).
-- **`make verify` then `make e2e WORKERS=4`.**
+Multi-epoch one-shot joins are correct and are exactly the live CREATE-VIEW
+distributed backfill: `fan_out_backfill` is synchronous (`collect_acks_and_relay`
+blocks to completion, `master/dispatch.rs:354`), so the master drives source A's
+epochs fully — seeding `I(A)` via the join's IntegrateTrace — then source B, whose
+`dB ⋈ z⁻¹(I(A))` yields the full join, accumulated into `tables[tid]`. Streaming
+happens after the loop, so there is no barrier problem, and single-source-per-epoch
+keeps the symmetric 2-term DBSP form valid. The `execute_multi_worker_step` driver
+(`query/dag/exec.rs:305`) picks replicated / range-join / exchanged / join-scatter /
+single arms **from the compiled plan** — id-parametric, reused for the transient id.
 
-## 11. Sequencing
+The real work is the **relay's meta resolution**, which the naive design understates.
+`prepare_relay` (`master/dispatch.rs:554`) resolves re-scatter columns via
+`get_shard_cols(view_id)` / `get_join_shard_cols` / `view_range_join_n_eq` — all
+funnelling through `view_meta` → `load_meta_circuit` → `load_circuit` **by view_id
+prefix over the sys tables** (`meta.rs:241`, `load.rs:40`). A transient has no sys-table
+rows, so this returns `LoadedCircuit::default()` and every getter yields the "nothing
+special" answer: empty `shard_cols` (→ every row scatters to one partition: a serial
+parallelism cliff, and for GROUP BY/equi-join only *accidentally* correct) and
+`range_join_n_eq = None` instead of `Some(0)` (→ the master skips the
+`op_relay_broadcast` a pure-range join needs → **missing join rows**). And
+`shard_cols` is **not** in `CompileOutput` (`compiler/mod.rs:171` carries `shape`,
+`join_shard_map`, `range_join_n_eq`, … but `shard_cols` is only a local in
+`finalize_side`). So the fix is:
 
-- [ ] **Stage A — transient executor core (single-source / replicated; W=1 covers all
-  shapes).** `FLAG_RUN_TRANSIENT` + `SalMessageKind::RunTransient` + worker
-  `dispatch_inner` arm; `Circuit::into_rows` reuse + `run_query` client API + transient
-  frame codec; in-memory `LoadedCircuit` builder + `compile_loaded` split;
-  transient-id register/teardown RAII; accumulate into an unregistered RAM store + stream
-  via `ReplySchema::OneOff`. Full-scan sources only. Route to the executor the queries the
-  thin path cannot serve (non-indexed WHERE, aggregates, single-table GROUP BY/DISTINCT);
-  keep the thin path for point/index seeks meanwhile. Server-side typed `op_filter` for
-  non-indexed WHERE.
-- [ ] **Sink — ORDER BY / OFFSET / deterministic LIMIT** (`exec/order.rs`) with the two
-  §7 correctness requirements; `HonoredQueryClauses.order_by` + `extract_offset` (§5.5).
-  Lands on top of Stage A over the streamed result.
-- [ ] **Stage B — bounded sources + delete the thin path.** Source-bound descriptor on
-  `ScanDelta`/`ScanTrace` (wire + compiler); `ReadCursor::drain_range_to_batch`;
-  access-path ladder emits bounds; point-bound unicast distribution. Then route **all**
-  `Statement::Query` through the executor and **delete** the thin keyseek engine
-  (`exec/eval.rs`, `exec/residual.rs`, the `select.rs` ladder + non-indexed error).
-- [ ] **Stage C — distributed sharded one-shots.** Reuse `fan_out_backfill` +
-  `execute_multi_worker_step` exchange loop for joins / GROUP BY / set-ops / range joins
-  at W>1, keyed on the transient id; redirect `view_meta`/`get_shard_cols` to the
-  in-memory transient plan (the sole view-bound relay coupling).
-- [ ] **`make verify` and `make e2e WORKERS=4`** green after each stage.
+- Thread `shard_cols` (+ `needs_exchange`, `has_join`) into `CompileOutput`.
+- **Synthesize a `ViewMeta` for the transient and inject it into `self.meta[tid]`** at
+  `register_transient_plan` time, and make `view_meta`/`get_shard_cols`/`get_join_shard_cols`/
+  `view_range_join_n_eq` **lifecycle-opaque** — read `meta[tid]`/`cache[tid]` for any
+  lifecycle instead of `load_meta_circuit`'s sys-table read.
+- Make `get_schema_and_names` (also called by `prepare_relay`, `dispatch.rs:655`)
+  lifecycle-opaque: `get_col_names_bytes` (`metadata.rs:151`) lazily reads COL_TAB,
+  which a transient lacks — serve names from the injected out-schema instead.
+
+This is the largest single component. It is *not* "redirect one coupling"; it is a
+`ViewMeta` reconstruction spanning four meta getters plus the schema/names path.
+
+## 11. Teardown & crash-safety
+
+`unregister_table` (`query/dag/mod.rs:265`) is a **master-local** in-memory map
+removal; its only driver today is the durable, fsynced catalog DROP hook applied
+per-worker. A Rust RAII `Drop` on the request future **cannot** perform worker teardown
+(`Drop` can't await, so it can't broadcast-and-collect). So teardown is a real
+**ephemeral protocol**:
+
+- A `TransientGuard(tid)` owned by the in-flight request future fires on **every** exit
+  — success, client disconnect (`Ok(false)`), worker fault (`Err`),
+  `GNITZ_CLIENT_SEND_TIMEOUT_MS` eviction — and emits a non-durable **`FLAG_DROP_TRANSIENT`**
+  broadcast; each worker's `DropTransient` arm frees `tables[tid]`/`cache[tid]`/`meta[tid]`
+  + its per-rank scratch dirs; the master frees its own maps. Exactly-once per exit path.
+- **Worker fault** is fail-stop (the watchdog reaps the cluster, `exec.rs:257`), which
+  *bypasses* the guard, so the transient's scratch dirs (never in any manifest/sys
+  table) would orphan on disk across a restart. Reap them with a **boot-time GC of the
+  reserved OneShot scratch-dir prefix** (the ids come from a reserved range, so the
+  prefix is recognizable), alongside the existing `gc_orphan_directories`.
+
+## 12. Testing
+
+- **Rust unit** (`exec/order.rs`): comparator across every type incl. negatives, U64
+  high-bit, `-0.0`/NaN (`total_cmp`), strings, `U128`/`UUID`/`I128`; ASC/DESC; NULLS
+  default + explicit not flipped by DESC; multi-key; visible-position over a
+  hidden-column schema; offset/limit slicing incl. past-end and passthrough.
+- **Engine unit**: `compile_loaded` over an in-memory `LoadedCircuit` == `compile_view`
+  over the sys-table form for the same circuit; `register_transient_plan` →
+  run → `DropTransient` leaves `tables`/`cache`/`meta` empty and removes scratch dirs;
+  the synthesized `ViewMeta` for a pure-range-join transient yields `range_n_eq =
+  Some(0)` and non-empty `shard_cols`.
+- **Integration** (`crates/gnitz-sql/tests/`, `feature=integration`): each of a join,
+  GROUP BY + HAVING, DISTINCT, set-op, scalar subquery, and a non-indexed WHERE on a
+  string and a float column returns the **same rows and weights** as the equivalent
+  CREATE VIEW then scan; ORDER BY/OFFSET/LIMIT shape the result; `WHERE pk=5` still
+  serves via the thin path (assert no transient id is allocated); the thin-path errors
+  that remain (e.g. ambiguous column in a `SELECT *`) keep their exact messages.
+- **E2E** (`crates/gnitz-py/tests/test_adhoc_query.py`, `GNITZ_WORKERS=4`) — the
+  correctness gate, since single-worker hides the shuffle: every shuffle shape
+  (join/GROUP BY/DISTINCT/set-op) is **weight-correct at W=4** (the `SELECT k,
+  COUNT(*) FROM t GROUP BY k` split-count failure is the specific regression to guard);
+  a transient leaves **no** manifest/checkpoint artifact even when a checkpoint is
+  forced mid-query (asserts the §2 positive-accessor exclusion); client disconnect
+  mid-stream leaves no leaked `tables[tid]`/scratch dirs (asserts §11).
+- **`make verify`** then **`make e2e WORKERS=4`** green after each stage.
+
+## 13. Sequencing
+
+Ordered so **no stage ever routes a shape to a path that cannot serve it correctly at
+W>1**, and the thin path is never removed.
+
+- [ ] **Stage 1 — executor core, non-shuffle shapes (+ the sink).** The `OneShot`
+  lifecycle (4th `RelationKind` + positive `checkpointed()`/`maintained()`/`durable()`
+  accessors, fixing the checkpoint-sweep exclusion in *both* halves); `FLAG_RUN_TRANSIENT`
+  + `FLAG_DROP_TRANSIENT` + their `SalMessageKind`s and worker arms; `Circuit::into_rows`
+  reuse + `run_query` + transient frame codec; in-memory `LoadedCircuit` builder +
+  `compile_loaded` split + `register_transient_plan` + server-allocated OneShot ids; the
+  one-shot driver enumerating `circuit.sources`; **stream-direct** for `Single`/linear
+  shapes; the `TransientGuard` + `DropTransient` teardown protocol + boot-time orphan GC.
+  Route (via §3 fall-through) single-source filter/project + non-indexed / non-i64-residual
+  WHERE + `SELECT non_pk`. Server-side typed `op_filter`. Ship the client-side sink
+  (§8) — it applies to thin-path and executor results alike. **W>1-correct** (single
+  source needs no exchange; broadcast+gather). Keep the thin path.
+- [ ] **Stage 2 — distributed shuffle.** Thread `shard_cols`/`needs_exchange`/`has_join`
+  into `CompileOutput`; synthesize + inject `ViewMeta[tid]`; make
+  `view_meta`/`get_shard_cols`/`get_join_shard_cols`/`view_range_join_n_eq`/
+  `get_schema_and_names` lifecycle-opaque (§10); reuse `execute_multi_worker_step` + the
+  relay loop for the accumulate-then-scan shapes. Now route joins / GROUP BY / DISTINCT /
+  aggregate / set-op / subqueries to the executor. **W>1-correct** for every shape.
+- [ ] **`make verify` and `make e2e WORKERS=4`** green after each stage, with the W=4
+  weight-correctness and checkpoint/leak assertions of §12 as the gate.
