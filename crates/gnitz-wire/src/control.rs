@@ -24,9 +24,9 @@
 
 use crate::catalog::col;
 use crate::{
-    encode_german_string, try_decode_german_string, TypeCode, WireSysCol, IPC_CONTROL_TID, SHORT_STRING_THRESHOLD,
-    WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID,
-    WAL_OFF_VERSION,
+    encode_german_string, read_u32_le, read_u64_le, try_decode_german_string, TypeCode, WireSysCol, IPC_CONTROL_TID,
+    SHORT_STRING_THRESHOLD, WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE,
+    WAL_OFF_TID, WAL_OFF_VERSION,
 };
 
 pub const CONTROL_COLS: &[WireSysCol] = &[
@@ -299,16 +299,6 @@ pub struct DecodedControl {
     /// ctrl block to find the schema/data blocks use this directly instead of
     /// re-reading the WAL header.
     pub block_size: usize,
-}
-
-#[inline(always)]
-fn read_u32_le(data: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(data[off..off + 4].try_into().unwrap())
-}
-
-#[inline(always)]
-fn read_u64_le(data: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(data[off..off + 8].try_into().unwrap())
 }
 
 /// Read the (data_offset, data_size) directory entry for region `r` from a

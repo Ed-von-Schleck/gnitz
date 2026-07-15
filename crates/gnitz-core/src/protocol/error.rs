@@ -24,3 +24,12 @@ impl From<std::io::Error> for ProtocolError {
         ProtocolError::IoError(e)
     }
 }
+
+impl From<gnitz_wire::WalError> for ProtocolError {
+    /// A malformed WAL block surfaces as a `DecodeError`, matching the crate's
+    /// pervasive string-based decode errors (and the substring asserts over
+    /// them). `WalError`'s `Display` authors the wording once.
+    fn from(e: gnitz_wire::WalError) -> Self {
+        ProtocolError::DecodeError(format!("WAL {e}"))
+    }
+}

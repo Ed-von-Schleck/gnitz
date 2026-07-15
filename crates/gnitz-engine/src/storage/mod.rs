@@ -40,6 +40,10 @@ pub(crate) use columnar::{
 // The PK key primitives live in `schema::key`; out-of-storage callers keep the
 // storage facade.
 pub(crate) use crate::schema::key::{compare_pk_bytes, compare_pk_ordering, opk_key, pack_pk_be, pk_bytes_eq};
+pub(crate) use gnitz_wire::wal::{
+    block_size as wal_block_size, stamp_checksum as wal_stamp_checksum,
+    write_header_and_directory as wal_write_header_and_directory,
+};
 pub(crate) use lsm::manifest::{partition_manifest_path, peek_generation, PkBuf, STATE_FORMAT};
 #[cfg(test)]
 pub(crate) use lsm::partitioned_table::partial_flush_lsn_fixture;
@@ -49,10 +53,6 @@ pub(crate) use lsm::read_cursor::{DrainGuard, ReadCursor, DDL_SCAN_CHUNK_ROWS};
 pub(crate) use lsm::spill::{KeyProducer, SpillSort};
 pub(crate) use merge::{BlobCacheGuard, DirectWriter};
 pub(crate) use range_key::{increment_key_in_place, range_cut_points};
-pub(crate) use repr::wal::{
-    block_size as wal_block_size, stamp_checksum as wal_stamp_checksum,
-    write_header_and_directory as wal_write_header_and_directory,
-};
 
 /// Convert a path string to a `CString`, mapping an interior NUL to
 /// `InvalidPath` — the one conversion every storage path takes.

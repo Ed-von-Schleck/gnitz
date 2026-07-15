@@ -54,7 +54,7 @@ pub(crate) fn layout_from_wire_flags(flags: u64) -> crate::storage::Layout {
 // WAL block header field offsets (matches storage/lsm/wal.rs; duplicated here to
 // avoid cross-module coupling between runtime and storage internals).
 pub(crate) use gnitz_wire::WAL_OFF_SIZE;
-use gnitz_wire::{WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_TID, WAL_OFF_VERSION};
+use gnitz_wire::WAL_OFF_TID;
 
 // ---------------------------------------------------------------------------
 // Internal schema descriptors for the wire control and schema blocks
@@ -286,8 +286,7 @@ pub(crate) fn encode_ctrl_block_direct(
         seek_pk_extra,
     );
     if checksum {
-        let cs = crate::foundation::xxh::checksum(&out[offset + gnitz_wire::WAL_HEADER_SIZE..offset + n]);
-        out[offset + WAL_OFF_CHECKSUM..offset + WAL_OFF_CHECKSUM + 8].copy_from_slice(&cs.to_le_bytes());
+        gnitz_wire::wal::stamp_checksum(&mut out[offset..offset + n], n);
     }
     n
 }
@@ -694,8 +693,11 @@ pub struct SchemaWithVersion<'a> {
 
 /// Read the (data_offset, data_size) directory entry for region `r` from a
 /// WAL block.  Panics on slice errors — callers must validate `data.len()`
-/// covers the full directory before calling.
-#[inline(always)]
+/// covers the full directory before calling. Test-only: production decoders go
+/// through `gnitz_wire::wal::validate_and_parse`, which returns the whole
+/// directory bounds-checked; the malformed-schema tests use this to locate the
+/// region byte they patch.
+#[cfg(test)]
 fn wal_dir_entry(data: &[u8], r: usize) -> (usize, usize) {
     const HEADER: usize = gnitz_wire::WAL_HEADER_SIZE;
     const DIR_ENTRY: usize = 8;
@@ -709,31 +711,28 @@ pub(crate) fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<
     // Parse directly from WAL block bytes; no Batch allocation needed.
     // META_SCHEMA_DESC layout: pk(reg 0), weight(1), null_bmp(2),
     //   type_code/U64(3), flags/U64(4), name/STR(5), blob(6).
-    const HEADER: usize = gnitz_wire::WAL_HEADER_SIZE;
-
-    if data.len() < HEADER {
-        return Err("schema block too small");
-    }
-
-    let version = codec::read_u32_le(data, WAL_OFF_VERSION);
-    if version != gnitz_wire::WAL_FORMAT_VERSION {
-        return Err("schema block wrong version");
-    }
-    let total_size = codec::read_u32_le(data, WAL_OFF_SIZE) as usize;
-    if total_size > data.len() {
-        return Err("schema block truncated");
-    }
-
-    if verify_checksum && total_size > HEADER {
-        let expected = codec::read_u64_le(data, WAL_OFF_CHECKSUM);
-        let actual = crate::foundation::xxh::checksum(&data[HEADER..total_size]);
-        if actual != expected {
-            return Err("schema block checksum mismatch");
+    //
+    // Format validity — header size, version, `total_size` in-bounds, body
+    // checksum, region count ≤ cap, and every region's extent within the block —
+    // is the shared framer's job, the same front door the batch decoders use.
+    // This decoder adds only the schema-conformance checks on top; the parsed
+    // directory lands in `offs`/`sizes` with every extent already bounded.
+    let mut offs = [0u64; gnitz_wire::MAX_WIRE_REGIONS];
+    let mut sizes = [0u32; gnitz_wire::MAX_WIRE_REGIONS];
+    let header = gnitz_wire::wal::validate_and_parse(data, &mut offs, &mut sizes, verify_checksum).map_err(|e| {
+        match e {
+            gnitz_wire::WalError::InvalidVersion => "schema block wrong version",
+            gnitz_wire::WalError::ChecksumMismatch => "schema block checksum mismatch",
+            // Region count exceeds the directory cap — a forged over-long header.
+            gnitz_wire::WalError::InvalidShard => "schema block directory overflows buffer",
+            // Truncated / BufferTooSmall: shorter than its header, directory, or
+            // a declared region requires.
+            _ => "schema block truncated",
         }
-    }
+    })?;
 
-    let count = codec::read_u32_le(data, WAL_OFF_COUNT) as usize;
-    let num_regions = codec::read_u32_le(data, WAL_OFF_NUM_REGIONS) as usize;
+    let count = header.entry_count as usize;
+    let num_regions = header.num_regions as usize;
 
     if count == 0 {
         return Err("empty schema block");
@@ -745,22 +744,17 @@ pub(crate) fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<
         return Err("schema block region count mismatch");
     }
 
-    // The directory table is `num_regions` × 8 bytes immediately after the
-    // header; every `wal_dir_entry` call below indexes into it. Reject any
-    // frame too short to hold it before reading a single entry.
-    if HEADER.saturating_add(num_regions.saturating_mul(8)) > data.len() {
-        return Err("schema block directory overflows buffer");
-    }
-
     // Region 0 is the PK (col_idx). Validate that col_idx values are
     // exactly [0, 1, ..., count-1] — every malformed-schema test relies
     // on this ordering, and downstream consumers index columns by the
     // physical row position, so an out-of-order/gap/duplicate col_idx
     // would silently re-route columns to the wrong type. The col_idx is
     // an unsigned U64 PK column stored OPK (big-endian) at rest, so decode
-    // it big-endian to recover the native index.
-    let (pk_off, pk_sz) = wal_dir_entry(data, 0);
-    if pk_sz < count * 8 || pk_off.saturating_add(pk_sz) > data.len() {
+    // it big-endian to recover the native index. `validate_and_parse` already
+    // bounded each region's extent to the block, so only the schema-level
+    // "big enough for `count` columns" check remains.
+    let (pk_off, pk_sz) = (offs[0] as usize, sizes[0] as usize);
+    if pk_sz < count * 8 {
         return Err("schema col_idx region OOB");
     }
     let pk_data = &data[pk_off..pk_off + count * 8];
@@ -771,13 +765,13 @@ pub(crate) fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<
         }
     }
 
-    let (tc_off, tc_sz) = wal_dir_entry(data, 3);
-    let (fl_off, fl_sz) = wal_dir_entry(data, 4);
+    let (tc_off, tc_sz) = (offs[3] as usize, sizes[3] as usize);
+    let (fl_off, fl_sz) = (offs[4] as usize, sizes[4] as usize);
 
-    if tc_sz < count * 8 || tc_off.saturating_add(tc_sz) > data.len() {
+    if tc_sz < count * 8 {
         return Err("schema type_code region OOB");
     }
-    if fl_sz < count * 8 || fl_off.saturating_add(fl_sz) > data.len() {
+    if fl_sz < count * 8 {
         return Err("schema flags region OOB");
     }
 
@@ -1598,7 +1592,8 @@ mod tests {
         let mut wire = build_schema_wire_block(&sd, &[b"c0".as_slice()], 0, 0);
         // num_regions lives in the header (outside the checksummed body), so a
         // huge value still passes the checksum and trips the directory guard.
-        wire[WAL_OFF_NUM_REGIONS..WAL_OFF_NUM_REGIONS + 4].copy_from_slice(&100_000u32.to_le_bytes());
+        wire[gnitz_wire::WAL_OFF_NUM_REGIONS..gnitz_wire::WAL_OFF_NUM_REGIONS + 4]
+            .copy_from_slice(&100_000u32.to_le_bytes());
         match decode_schema_block(&wire, true) {
             Err("schema block directory overflows buffer") => {}
             Err(other) => panic!("wrong error: {other}"),

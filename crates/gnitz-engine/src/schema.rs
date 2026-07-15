@@ -73,8 +73,9 @@ pub(crate) const NARROW_PK_MAX_BYTES: usize = 16;
 /// The shared seek-key encoder for the master partition router
 /// (`fan_out_seek_async`) and the worker SEEK handler (`seek_family`) at every
 /// PK width. The seek frame carries the key as native LE column bytes (it
-/// bypasses `append_pk_region`, so the bytes are not yet OPK): the low ≤16 ride
-/// in `low`, a wide PK's `16..stride` suffix in `extra` (empty for narrow PKs).
+/// bypasses the client's `build_pk_region`, so the bytes are not yet OPK): the
+/// low ≤16 ride in `low`, a wide PK's `16..stride` suffix in `extra` (empty for
+/// narrow PKs).
 /// Errors if `extra` is shorter than the wide suffix `stride - 16`.
 pub(crate) fn seek_opk_bytes(
     schema: &SchemaDescriptor,

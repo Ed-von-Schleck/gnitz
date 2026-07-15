@@ -17,8 +17,8 @@ use super::batch::{
 };
 use super::merge::MemBatch;
 use super::shard_file;
-use super::wal;
 use crate::schema::SchemaDescriptor;
+use gnitz_wire::wal;
 
 impl Batch {
     /// Write this batch as a shard file directly to disk. `schema` is passed
@@ -75,11 +75,12 @@ impl Batch {
         offset: usize,
         checksum: bool,
     ) -> usize {
-        // Release-active: this bounds the `unsafe` region_ptr().add(start_row *
-        // stride) below. A debug-only check would strip in release and let a
-        // bad range form an out-of-bounds pointer (UB) instead of aborting.
-        // `saturating_add` (not `+`) so an overflowing range fails the bound
-        // rather than wrapping to a small value that slips past it.
+        // Release-active: this bounds the per-region sub-slice `[start_row *
+        // stride..(start_row + count) * stride]` below. A debug-only check would
+        // strip in release and let a bad range index out of the region (a panic,
+        // or on an overflow a wrong slice). `saturating_add` (not `+`) so an
+        // overflowing range fails the bound rather than wrapping to a small
+        // value that slips past it.
         let end = start_row.saturating_add(count);
         assert!(
             end <= self.count,
@@ -100,50 +101,29 @@ impl Batch {
         );
         let blob_idx = self.num_regions as usize;
         let nr_wire = blob_idx + 1;
-        let mut ptrs = [std::ptr::null::<u8>(); MAX_WIRE_REGIONS];
-        let mut sizes = [0u32; MAX_WIRE_REGIONS];
-        for i in 0..blob_idx {
+        let mut regions: [&[u8]; MAX_WIRE_REGIONS] = [&[]; MAX_WIRE_REGIONS];
+        for (i, region) in regions[..blob_idx].iter_mut().enumerate() {
             let stride = self.region_stride(i) as usize;
-            // SAFETY: start_row * stride is within the allocated region (the
-            // assert above guarantees start_row + count <= self.count).
-            ptrs[i] = unsafe { self.region_ptr(i).add(start_row * stride) };
-            sizes[i] = (count * stride) as u32;
+            // Sub-range [start_row, start_row + count) of region `i`; the assert
+            // above bounds (start_row + count) <= self.count, so the slice is in
+            // the region's `self.count * stride` bytes.
+            *region = &self.region_slice(i)[start_row * stride..(start_row + count) * stride];
         }
-        // blob: null ptr with 0 bytes — no long strings in wire-safe schemas
-        ptrs[blob_idx] = std::ptr::null();
-        sizes[blob_idx] = 0;
-        let new_offset = wal::encode(
-            out,
-            offset,
-            table_id,
-            count as u32,
-            &ptrs[..nr_wire],
-            &sizes[..nr_wire],
-            checksum,
-        )
-        .expect("WAL encode failed: buffer too small");
+        // blob region stays empty (&[]) — wire-safe schemas carry no long strings.
+        let new_offset = wal::encode(out, offset, table_id, count as u32, &regions[..nr_wire], checksum)
+            .expect("WAL encode failed: buffer too small");
         new_offset - offset
     }
 
     /// Encode self into WAL wire format at out[offset..]. Returns bytes written.
     pub fn encode_to_wire(&self, table_id: u32, out: &mut [u8], offset: usize, checksum: bool) -> usize {
         let nr_wire = self.num_regions_total();
-        let mut ptrs = [std::ptr::null::<u8>(); MAX_WIRE_REGIONS];
-        let mut sizes = [0u32; MAX_WIRE_REGIONS];
-        for i in 0..nr_wire {
-            ptrs[i] = self.region_ptr(i);
-            sizes[i] = self.region_size(i) as u32;
+        let mut regions: [&[u8]; MAX_WIRE_REGIONS] = [&[]; MAX_WIRE_REGIONS];
+        for (i, region) in regions[..nr_wire].iter_mut().enumerate() {
+            *region = self.region_slice(i);
         }
-        let new_offset = wal::encode(
-            out,
-            offset,
-            table_id,
-            self.count as u32,
-            &ptrs[..nr_wire],
-            &sizes[..nr_wire],
-            checksum,
-        )
-        .expect("WAL encode failed: buffer too small");
+        let new_offset = wal::encode(out, offset, table_id, self.count as u32, &regions[..nr_wire], checksum)
+            .expect("WAL encode failed: buffer too small");
         new_offset - offset
     }
 
@@ -182,8 +162,8 @@ impl Batch {
         // Uninit arena sized for exactly `mb.count` rows: every live byte of
         // every region is written by the bulk copies below; only inter-region
         // align8 padding stays uninit, which no reader or re-encoder touches
-        // (`wal::encode`'s run coalescing breaks exactly where padding exists,
-        // and shard/wire/clone paths are all `count`-bounded).
+        // (`wal::encode` copies each region's `count * stride` bytes and skips
+        // the padding, and shard/wire/clone paths are all `count`-bounded).
         let mut data_buf = acquire_arena(total, Fill::Uninit);
         for r in 0..nr_usize {
             let len = mb.count * strides[r] as usize;

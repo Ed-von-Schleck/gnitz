@@ -349,7 +349,7 @@ mod tests {
         assert_eq!(batch.num_regions_total(), 5);
         assert_eq!(batch.region_size(0), 8); // pk: 1 row * 8 bytes (U64 PK)
         assert_eq!(batch.region_size(3), 8); // col0: 1 row * 8 bytes
-        assert!(!batch.region_ptr(0).is_null());
+        assert!(!batch.region_slice(0).is_empty());
     }
 
     #[test]

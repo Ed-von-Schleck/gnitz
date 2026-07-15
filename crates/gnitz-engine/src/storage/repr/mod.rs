@@ -4,8 +4,10 @@
 //! (`columnar`), sort-merge consolidation (`merge`), exchange repartition
 //! (`scatter`), the fused k-way merge kernel (`heap`), range-key helpers
 //! (`range_key`), the PK-probe filters (`bloom`, `xor8`), and the pure byte
-//! codecs of the on-disk formats: the WAL block (`wal`), the shard image
-//! (`shard_file`), and the shard-format constants (`layout`).
+//! codecs of the on-disk formats: the shard image (`shard_file`) and the
+//! shard-format constants (`layout`). The low-level WAL-block framer lives in
+//! `gnitz_wire::wal` (the one definition client and engine share); `batch_wire`
+//! and the SAL scatter writer call it.
 //!
 //! `repr/` has **no outward facade of its own** — `storage/mod.rs` curates the
 //! single combined storage surface and reaches into these submodules, re-exporting
@@ -24,5 +26,4 @@ pub(super) mod merge;
 pub(super) mod range_key;
 pub(super) mod scatter;
 pub(super) mod shard_file;
-pub(super) mod wal;
 pub(super) mod xor8;

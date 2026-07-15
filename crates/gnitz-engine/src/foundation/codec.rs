@@ -1,33 +1,18 @@
 //! Little-endian byte codec: fixed-width integer pack/unpack (aligned and
 //! unaligned) and 8-byte alignment. The genuine cross-layer leaf — every
 //! wire/shard/mmap path reads and writes through it.
+//!
+//! `align8` and the aligned `read_/write_u{32,64}_le` primitives are owned by
+//! `gnitz_wire` (the crate that defines the wire format, and whose WAL framer
+//! needs them) and re-exported here; the engine's 15+ `codec::read_u32_le`
+//! callers are unchanged.
 
-#[inline]
-pub fn read_u32_le(buf: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
-}
-
-#[inline]
-pub fn read_u64_le(buf: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
-}
+pub use gnitz_wire::{align8, read_u32_le, read_u64_le, write_u64_le};
 
 #[inline]
 pub fn read_i64_le(buf: &[u8], off: usize) -> i64 {
     i64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
 }
-
-#[inline]
-pub fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
-    buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
-}
-
-#[inline]
-pub fn write_u64_le(buf: &mut [u8], off: usize, val: u64) {
-    buf[off..off + 8].copy_from_slice(&val.to_le_bytes());
-}
-
-pub use gnitz_wire::align8;
 
 // The four `*_raw` accessors below do unaligned `u32`/`u64` reads and writes at
 // `base + offset` bytes for the SAL and W2M mmap paths, where the offset is

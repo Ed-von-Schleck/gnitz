@@ -29,12 +29,12 @@ pub(crate) const MAX_BATCH_REGIONS: usize = 68;
 
 /// Max regions **including** the trailing blob region — the bound for the
 /// WAL/wire region-directory arrays (ptrs / sizes / offsets / positions).
-/// `MAX_BATCH_REGIONS` is the in-memory offsets/strides capacity (pk, weight,
-/// null_bmp, payload; no blob); the wire encoders enumerate one more region
-/// (the blob heap), so the directory needs one extra slot.  `+ 1` (rather than
-/// the tight wire max of 68) keeps the round-to-4 padding already baked into
-/// `MAX_BATCH_REGIONS`.
-pub(crate) const MAX_WIRE_REGIONS: usize = MAX_BATCH_REGIONS + 1; // = 69
+/// Owned by `gnitz_wire::wal` (the framer's directory cap); the engine ties its
+/// in-memory offsets/strides capacity (`MAX_BATCH_REGIONS`, no blob) to it: the
+/// wire encoders enumerate one more region (the blob heap), so the directory
+/// needs exactly one extra slot.
+pub(crate) use gnitz_wire::MAX_WIRE_REGIONS;
+const _: () = assert!(MAX_WIRE_REGIONS == MAX_BATCH_REGIONS + 1); // = 69
 
 // ── Region indices into `offsets` / `strides` ───────────────────────────────
 //
@@ -139,7 +139,7 @@ pub(in crate::storage) fn compute_offsets(
     // join, a bulk full-scan/merge) can have a cumulative offset > 4 GB even
     // though each individual region is still capped at 4 GB by the u32 wire
     // region sizes. A `u32` store silently truncated the per-region offset, so
-    // `region_ptr` aliased an earlier region — silent corruption. Not a wire
+    // `region_slice` aliased an earlier region — silent corruption. Not a wire
     // change: the WAL/exchange encoding serializes region *sizes* and recomputes
     // offsets via this fn on receive, so offsets never cross a process boundary.
     let mut offsets = [0usize; MAX_BATCH_REGIONS];
@@ -1354,27 +1354,30 @@ impl Batch {
         self.num_regions as usize + 1
     }
 
-    /// Get region pointer by index. `num_regions` is the blob region's index.
-    pub fn region_ptr(&self, idx: usize) -> *const u8 {
-        let blob_idx = self.num_regions as usize;
-        if idx < blob_idx {
-            self.data[self.offsets[idx]..].as_ptr()
-        } else if idx == blob_idx {
-            self.blob.as_ptr()
-        } else {
-            panic!(
-                "region_ptr: index {idx} out of range (num_regions_total = {})",
-                blob_idx + 1
-            );
-        }
-    }
-
     /// Get region size by index.
     pub fn region_size(&self, idx: usize) -> usize {
         if idx < self.num_regions as usize {
             self.count * self.strides[idx] as usize
         } else {
             self.blob.len()
+        }
+    }
+
+    /// Safe `&[u8]` view of region `idx` (`region_size(idx)` bytes), for callers
+    /// that frame the batch into a byte buffer (`batch_wire`'s wire encoders) —
+    /// the region copy stays bounds-checked, no raw pointers.
+    pub fn region_slice(&self, idx: usize) -> &[u8] {
+        let blob_idx = self.num_regions as usize;
+        if idx < blob_idx {
+            let off = self.offsets[idx];
+            &self.data[off..off + self.count * self.strides[idx] as usize]
+        } else if idx == blob_idx {
+            &self.blob
+        } else {
+            panic!(
+                "region_slice: index {idx} out of range (num_regions_total = {})",
+                blob_idx + 1
+            );
         }
     }
 

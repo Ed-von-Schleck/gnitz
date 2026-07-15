@@ -2,59 +2,28 @@
 
 use super::error::ProtocolError;
 use super::types::{ColData, PkColumn, Schema, TypeCode, ZSetBatch};
-use xxhash_rust::xxh3::xxh3_64;
-
-use gnitz_wire::{
-    align8, WAL_FORMAT_VERSION, WAL_HEADER_SIZE as WAL_BLOCK_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT,
-    WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID, WAL_OFF_VERSION,
-};
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
-/// Append `data` to `buf` at an 8-byte-aligned offset.  Returns `(offset, len)`.
-fn append_region(buf: &mut Vec<u8>, data: &[u8]) -> (u32, u32) {
-    let aligned = align8(buf.len());
-    buf.resize(aligned, 0);
-    let off = aligned as u32;
-    buf.extend_from_slice(data);
-    (off, data.len() as u32)
-}
-
-/// Serialize a `&[T]` (T = u64 or i64) directly into `buf` at 8-byte alignment via bulk memcpy.
-/// Correct on little-endian (x86_64) — native layout matches to_le_bytes() output.
-fn append_64bit_region<T: Copy>(buf: &mut Vec<u8>, vals: &[T]) -> (u32, u32) {
-    debug_assert_eq!(std::mem::size_of::<T>(), 8);
-    let aligned = align8(buf.len());
-    let sz = vals.len() * 8;
-    buf.resize(aligned, 0);
-    // SAFETY: T is 8 bytes (asserted above); reinterpreting as &[u8] is valid
-    // because the output is consumed as opaque bytes, not as typed values.
-    let src = unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, sz) };
-    buf.extend_from_slice(src);
-    (aligned as u32, sz as u32)
-}
-
-/// Serialize a `PkColumn` into `buf` at 8-byte alignment, encoding the PK
-/// region as **order-preserving big-endian** (OPK) at rest. The in-memory
-/// `PkColumn` holds native LE values; this is the single client-side encode
-/// point (the server stores the region verbatim and `decode_wal_block` does the
-/// inverse). `schema` supplies per-column type codes for signed sign-flipping.
-fn append_pk_region(buf: &mut Vec<u8>, pks: &PkColumn, pk_stride: usize, schema: &Schema) -> (u32, u32) {
+/// Build the PK region as a standalone `Vec<u8>`, encoding it as
+/// **order-preserving big-endian** (OPK) at rest. The in-memory `PkColumn`
+/// holds native LE values; this is the single client-side encode point (the
+/// server stores the region verbatim and `decode_wal_block` does the inverse).
+/// `schema` supplies per-column type codes for signed sign-flipping. The
+/// framer ([`gnitz_wire::wal::encode`]) places the region at its aligned
+/// offset, so this returns just the tightly-packed region bytes.
+fn build_pk_region(pks: &PkColumn, pk_stride: usize, schema: &Schema) -> Vec<u8> {
     match pks {
         PkColumn::U64s(v) => {
             debug_assert!(pk_stride <= 8, "U64s pk_stride must be <= 8");
             let pk_tc = schema.columns[schema.pk_indices()[0]].type_code as u8;
-            let aligned = align8(buf.len());
-            let total = v.len() * pk_stride;
-            // Pre-size the destination and OPK-encode each PK directly into it,
-            // avoiding a per-row stack temp + extend_from_slice copy.
-            buf.resize(aligned + total, 0);
-            let mut w = aligned;
+            let mut out = vec![0u8; v.len() * pk_stride];
+            let mut w = 0;
             for &x in v {
-                gnitz_wire::encode_pk_column(&x.to_le_bytes()[..pk_stride], pk_tc, &mut buf[w..w + pk_stride]);
+                gnitz_wire::encode_pk_column(&x.to_le_bytes()[..pk_stride], pk_tc, &mut out[w..w + pk_stride]);
                 w += pk_stride;
             }
-            (aligned as u32, total as u32)
+            out
         }
         PkColumn::U128s(v) => {
             debug_assert_eq!(pk_stride, 16, "U128s requires pk_stride == 16");
@@ -63,41 +32,35 @@ fn append_pk_region(buf: &mut Vec<u8>, pks: &PkColumn, pk_stride: usize, schema:
             // via encode_pk_column so the flip is applied for I128; for the unsigned
             // types it is byte-identical to the prior `x.to_be_bytes()`.
             let pk_tc = schema.columns[schema.pk_indices()[0]].type_code as u8;
-            let aligned = align8(buf.len());
-            let total = v.len() * 16;
-            buf.resize(aligned + total, 0);
-            let mut w = aligned;
+            let mut out = vec![0u8; v.len() * 16];
+            let mut w = 0;
             for &x in v {
-                gnitz_wire::encode_pk_column(&x.to_le_bytes(), pk_tc, &mut buf[w..w + 16]);
+                gnitz_wire::encode_pk_column(&x.to_le_bytes(), pk_tc, &mut out[w..w + 16]);
                 w += 16;
             }
-            (aligned as u32, total as u32)
+            out
         }
         // Wide compound PK: encode each column of each row to OPK in pk-list order.
         PkColumn::Bytes { buf: pk_buf, stride } => {
             let row_stride = *stride as usize;
             let row_count = pk_buf.len().checked_div(row_stride).unwrap_or(0);
-            let aligned = align8(buf.len());
-            // Pre-size the destination and OPK-encode each column directly into
-            // it; `src` borrows the separate `pk_buf` Vec, so the immutable read
-            // and mutable write don't alias.
-            buf.resize(aligned + pk_buf.len(), 0);
+            let mut out = vec![0u8; pk_buf.len()];
             // Collect (col_size, type_code) once; avoids schema re-iteration per row.
             let col_info: Vec<(usize, u8)> = schema.pk_col_codes().collect();
             for row in 0..row_count {
                 let src = &pk_buf[row * row_stride..(row + 1) * row_stride];
-                let dst_base = aligned + row * row_stride;
+                let dst_base = row * row_stride;
                 let mut off = 0;
                 for &(cs, tc) in &col_info {
                     gnitz_wire::encode_pk_column(
                         &src[off..off + cs],
                         tc,
-                        &mut buf[dst_base + off..dst_base + off + cs],
+                        &mut out[dst_base + off..dst_base + off + cs],
                     );
                     off += cs;
                 }
             }
-            (aligned as u32, pk_buf.len() as u32)
+            out
         }
     }
 }
@@ -209,7 +172,7 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
     let num_regions = 3 + num_non_pk + 1;
 
     // --- Pre-build String/U128 column region data (needs blob arena) ---
-    // Fixed columns are appended directly to buf later (no clone).
+    // Fixed columns are borrowed from batch.columns directly (no clone).
     let mut blob: Vec<u8> = Vec::new();
 
     // ColRegion::Prebuilt holds String/U128 temp Vecs; ColRegion::FixedRef marks
@@ -259,8 +222,8 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
                     _ => panic!("encode_wal_block: expected U128s for U128/UUID/I128 column {ci}"),
                 };
                 // Native u128 LE layout is byte-identical to the wire form
-                // (same precedent as `append_64bit_region`); bulk-copy rather
-                // than splitting each value into lo/hi halves.
+                // (same precedent as the weight/null reinterpret below);
+                // bulk-copy rather than splitting each value into lo/hi halves.
                 // SAFETY: `vals` is `vals.len()` u128s = `vals.len()*16` bytes;
                 // the region is consumed as opaque bytes, not typed values.
                 let src = unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 16) };
@@ -285,61 +248,42 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
         }
     }
 
-    // --- Assemble buffer: header + directory + aligned regions ---
-    let dir_start = WAL_BLOCK_HEADER_SIZE;
-    let dir_size = num_regions * 8;
-    let mut buf: Vec<u8> = vec![0u8; dir_start + dir_size];
-    let mut dir_entries: Vec<(u32, u32)> = Vec::with_capacity(num_regions);
+    // --- Collect region byte slices in canonical order, then frame once ---
+    //
+    // The blob heap is complete (grown by the column loop above), so every
+    // region buffer is now final and can be borrowed. `gnitz_wire::wal::encode`
+    // takes `&[&[u8]]`, so the borrow checker enforces exactly this ordering
+    // (allocate/grow to completion, then collect slices, then encode).
+    let pk_region = build_pk_region(&batch.pks, schema.pk_stride(), schema);
+    // SAFETY: reinterpret the i64/u64 Vecs as opaque LE bytes (their full
+    // length, so never over-reads); they are consumed as bytes, not typed
+    // values (little-endian target, asserted crate-wide).
+    let weight_bytes =
+        unsafe { std::slice::from_raw_parts(batch.weights.as_ptr() as *const u8, batch.weights.len() * 8) };
+    let null_bytes = unsafe { std::slice::from_raw_parts(batch.nulls.as_ptr() as *const u8, batch.nulls.len() * 8) };
 
-    // System regions — write directly into buf, no temp Vecs
-    dir_entries.push(append_pk_region(&mut buf, &batch.pks, schema.pk_stride(), schema));
-    dir_entries.push(append_64bit_region(&mut buf, &batch.weights));
-    dir_entries.push(append_64bit_region(&mut buf, &batch.nulls));
-
-    // Non-PK column regions
+    let mut regions: Vec<&[u8]> = Vec::with_capacity(num_regions);
+    regions.push(&pk_region);
+    regions.push(weight_bytes);
+    regions.push(null_bytes);
     for cr in &col_regions {
-        match cr {
-            ColRegion::Prebuilt(data) => {
-                dir_entries.push(append_region(&mut buf, data));
-            }
-            ColRegion::FixedRef(ci) => {
-                let fixed = match &batch.columns[*ci] {
-                    ColData::Fixed(v) => v,
-                    _ => unreachable!(),
-                };
-                dir_entries.push(append_region(&mut buf, fixed));
-            }
-        }
+        regions.push(match cr {
+            ColRegion::Prebuilt(data) => data.as_slice(),
+            ColRegion::FixedRef(ci) => match &batch.columns[*ci] {
+                ColData::Fixed(v) => v.as_slice(),
+                _ => unreachable!(),
+            },
+        });
     }
+    regions.push(&blob); // blob arena is always the last region
+    debug_assert_eq!(regions.len(), num_regions);
 
-    // blob arena (always last region)
-    dir_entries.push(append_region(&mut buf, &blob));
-
-    let total_size = buf.len();
-
-    // Write directory entries
-    for (i, &(off, sz)) in dir_entries.iter().enumerate() {
-        let base = dir_start + i * 8;
-        buf[base..base + 4].copy_from_slice(&off.to_le_bytes());
-        buf[base + 4..base + 8].copy_from_slice(&sz.to_le_bytes());
-    }
-
-    // Backfill header (checksum filled below).
-    buf[WAL_OFF_TID..WAL_OFF_TID + 4].copy_from_slice(&table_id.to_le_bytes());
-    buf[WAL_OFF_COUNT..WAL_OFF_COUNT + 4].copy_from_slice(&(count as u32).to_le_bytes());
-    buf[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].copy_from_slice(&(total_size as u32).to_le_bytes());
-    buf[WAL_OFF_VERSION..WAL_OFF_VERSION + 4].copy_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
-    buf[WAL_OFF_NUM_REGIONS..WAL_OFF_NUM_REGIONS + 4].copy_from_slice(&(num_regions as u32).to_le_bytes());
-
-    // Compute and write checksum over the body.
-    let checksum = if total_size > WAL_BLOCK_HEADER_SIZE {
-        xxh3_64(&buf[WAL_BLOCK_HEADER_SIZE..])
-    } else {
-        0
-    };
-    buf[WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8].copy_from_slice(&checksum.to_le_bytes());
-
-    buf
+    // Size the output to exactly one block, then frame in place. checksum =
+    // true: client frames always carry a body checksum. The buffer is pre-sized
+    // to `block_size_of(&regions)`, so encode never returns BufferTooSmall.
+    let mut out = vec![0u8; gnitz_wire::wal::block_size_of(&regions)];
+    gnitz_wire::wal::encode(&mut out, 0, table_id, count as u32, &regions, true).expect("WAL encode: pre-sized buffer");
+    out
 }
 
 /// Decode a WAL block from `data`, expecting columns described by `schema`.
@@ -366,42 +310,16 @@ fn decode_wal_block_impl(
     schema: &Schema,
     verify_checksum: bool,
 ) -> Result<(ZSetBatch, u32), ProtocolError> {
-    if data.len() < WAL_BLOCK_HEADER_SIZE {
-        return Err(ProtocolError::DecodeError(format!(
-            "WAL block too small: {} < {}",
-            data.len(),
-            WAL_BLOCK_HEADER_SIZE
-        )));
-    }
+    // Shared framer validates format: version, `total_size` in-bounds, body
+    // checksum, region count ≤ cap, and every region's [off, off+sz) extent
+    // within the block. On success `dir` can index each region unchecked.
+    let mut region_offsets = [0u64; gnitz_wire::MAX_WIRE_REGIONS];
+    let mut region_sizes = [0u32; gnitz_wire::MAX_WIRE_REGIONS];
+    let header = gnitz_wire::wal::validate_and_parse(data, &mut region_offsets, &mut region_sizes, verify_checksum)?;
+    let table_id = header.table_id;
+    let num_regions = header.num_regions as usize;
 
-    let table_id = u32::from_le_bytes(data[WAL_OFF_TID..WAL_OFF_TID + 4].try_into().unwrap());
-    let entry_count = u32::from_le_bytes(data[WAL_OFF_COUNT..WAL_OFF_COUNT + 4].try_into().unwrap()) as usize;
-    let total_size = u32::from_le_bytes(data[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].try_into().unwrap()) as usize;
-    let format_ver = u32::from_le_bytes(data[WAL_OFF_VERSION..WAL_OFF_VERSION + 4].try_into().unwrap());
-    let exp_checksum = u64::from_le_bytes(data[WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8].try_into().unwrap());
-    let num_regions =
-        u32::from_le_bytes(data[WAL_OFF_NUM_REGIONS..WAL_OFF_NUM_REGIONS + 4].try_into().unwrap()) as usize;
-
-    if format_ver != WAL_FORMAT_VERSION {
-        return Err(ProtocolError::DecodeError(format!(
-            "unsupported WAL format version: expected {WAL_FORMAT_VERSION}, got {format_ver}"
-        )));
-    }
-    if total_size > data.len() {
-        return Err(ProtocolError::DecodeError(format!(
-            "WAL block total_size {} exceeds data len {}",
-            total_size,
-            data.len()
-        )));
-    }
-    if verify_checksum && total_size > WAL_BLOCK_HEADER_SIZE {
-        let actual = xxh3_64(&data[WAL_BLOCK_HEADER_SIZE..total_size]);
-        if actual != exp_checksum {
-            return Err(ProtocolError::DecodeError("WAL checksum mismatch".into()));
-        }
-    }
-
-    // Validate num_regions
+    // Client's half of the split: schema conformance.
     let expected_num_regions = 3 + schema.num_payload_cols() + 1;
     if num_regions != expected_num_regions {
         return Err(ProtocolError::DecodeError(format!(
@@ -410,26 +328,11 @@ fn decode_wal_block_impl(
     }
     let pk_stride = schema.pk_stride();
 
-    // Parse directory
-    let dir_start = WAL_BLOCK_HEADER_SIZE;
-    let dir_bytes = num_regions * 8;
-    if dir_start + dir_bytes > total_size {
-        return Err(ProtocolError::DecodeError("WAL directory out of bounds".into()));
-    }
-    let mut dir: Vec<(usize, usize)> = Vec::with_capacity(num_regions);
-    for i in 0..num_regions {
-        let base = dir_start + i * 8;
-        let off = u32::from_le_bytes(data[base..base + 4].try_into().unwrap()) as usize;
-        let sz = u32::from_le_bytes(data[base + 4..base + 8].try_into().unwrap()) as usize;
-        if off > total_size || off + sz > total_size {
-            return Err(ProtocolError::DecodeError(format!(
-                "WAL region {i} out of bounds (off={off}, sz={sz}, total={total_size})"
-            )));
-        }
-        dir.push((off, sz));
-    }
+    let dir: Vec<(usize, usize)> = (0..num_regions)
+        .map(|r| (region_offsets[r] as usize, region_sizes[r] as usize))
+        .collect();
 
-    let count = entry_count;
+    let count = header.entry_count as usize;
 
     if count == 0 {
         return Ok((ZSetBatch::new(schema), table_id));
@@ -456,7 +359,7 @@ fn decode_wal_block_impl(
     // decodes to a numeric variant.
     // The PK region at rest is OPK (order-preserving big-endian). Decode each
     // variant back to the native LE values the in-memory `PkColumn` holds, so a
-    // subsequent `append_pk_region` (which OPK-encodes assuming LE input) does
+    // subsequent `build_pk_region` (which OPK-encodes assuming LE input) does
     // not double-encode.
     let pks: PkColumn = if schema.pk_count() >= 2 {
         // `stride` is a u8: reject (rather than silently truncate) any wire
@@ -618,6 +521,10 @@ fn decode_wal_block_impl(
 mod tests {
     use super::*;
     use crate::protocol::types::{ColData, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
+    use gnitz_wire::{
+        WAL_FORMAT_VERSION, WAL_HEADER_SIZE as WAL_BLOCK_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT,
+        WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID, WAL_OFF_VERSION,
+    };
 
     /// Return the `(offset, size)` of a region from a block's directory.
     fn get_region_offset_size(block: &[u8], region_idx: usize) -> (usize, usize) {
@@ -1093,16 +1000,21 @@ mod tests {
 
     #[test]
     fn test_xxh3_pins_known_vector() {
-        // A pinned XXH3-64 test vector: `xxh3_64` of these 208 body bytes must
-        // equal this constant. Guards against a silent hash-library or
-        // parameterization swap that would break wire-checksum interop.
+        // A pinned XXH3-64 test vector: `gnitz_wire::checksum` (the one the client
+        // now stamps every frame with) of these 208 body bytes must equal this
+        // constant. Guards against a silent hash-library or parameterization swap
+        // that would break wire-checksum interop.
         let body_hex = "9800000008000000a000000008000000a800000008000000b000000008000000b800000008000000c000000008000000c800000008000000d000000008000000d800000008000000e000000008000000e800000008000000f00000001000000000010000000000000000000000000000000000000000000001000000000000008000000000000000000000000000000001000000000000000300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
         let body: Vec<u8> = (0..body_hex.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&body_hex[i..i + 2], 16).unwrap())
             .collect();
         assert_eq!(body.len(), 208);
-        assert_eq!(xxh3_64(&body), 0x741C9E0BA1D8A9FD_u64, "xxh3_64 test vector drifted");
+        assert_eq!(
+            gnitz_wire::checksum(&body),
+            0x741C9E0BA1D8A9FD_u64,
+            "xxh3_64 test vector drifted"
+        );
     }
 
     // ── wide compound-PK roundtrips ────────────────────────────────────────

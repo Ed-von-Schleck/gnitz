@@ -1,15 +1,14 @@
 use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
 
+/// XXH3-64 body checksum. Owned by `gnitz_wire` (the crate that defines the WAL
+/// format and computes its checksum); re-exported here so the engine's many
+/// non-WAL callers keep `xxh::checksum` without a second identical wrapper.
+pub use gnitz_wire::checksum;
+
 /// Hash a 128-bit key to a 64-bit hash via XXH3-64.
 #[inline]
 pub fn hash_u128(pk: u128) -> u64 {
     xxh3_64(&pk.to_le_bytes())
-}
-
-/// Compute XXH3-64 checksum over arbitrary bytes (no seed).
-#[inline]
-pub fn checksum(data: &[u8]) -> u64 {
-    xxh3_64(data)
 }
 
 /// XXH3-128 over arbitrary bytes (no seed). Full 128-bit image — use where a
