@@ -11,13 +11,13 @@ Marked multiworker: the atomic-commit lock union and OCC window are distributed.
 
 from __future__ import annotations
 
-import multiprocessing
 import time
 
 import pytest
 
 import gnitz
 from helpers.datagen import TXN_SIZES
+from helpers.timing import run_pool
 
 pytestmark = pytest.mark.multiworker
 
@@ -69,16 +69,7 @@ def test_atomic_multitable(client, socket_path, schema_name, bench_timer, scale_
                        "l_qty BIGINT NOT NULL, PRIMARY KEY (l_order, l_line))", schema_name=sn)
 
     ops, k = sz["ops"], sz["K_lines"]
-    barrier = multiprocessing.Barrier(POOL)
-    queue: multiprocessing.Queue = multiprocessing.Queue()
-    procs = [multiprocessing.Process(target=_atomic_worker,
-                                     args=(socket_path, sn, k, ops, w, barrier, queue))
-             for w in range(POOL)]
-    for p in procs:
-        p.start()
-    parts = [queue.get() for _ in range(POOL)]
-    for p in procs:
-        p.join(timeout=300)
+    parts = run_pool([(_atomic_worker, (socket_path, sn, k, ops, w)) for w in range(POOL)])
 
     commits = sum(p["commits"] for p in parts)
     lat = [x for p in parts for x in p["latencies_ms"]]

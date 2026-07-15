@@ -206,6 +206,7 @@ impl ShardIndex {
 mod tests {
     use super::super::shard_file;
     use super::*;
+    use crate::foundation::codec::as_le_bytes;
     use crate::foundation::posix_io::raise_fd_limit_for_tests;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 
@@ -271,12 +272,12 @@ mod tests {
         let nulls = vec![0u64; n];
         let blob: Vec<u8> = Vec::new();
 
-        let regions: Vec<(*const u8, usize)> = vec![
-            (pk_bytes.as_ptr(), pk_bytes.len()),
-            (weights.as_ptr() as *const u8, n * 8),
-            (nulls.as_ptr() as *const u8, n * 8),
-            (values.as_ptr() as *const u8, n * 8),
-            (blob.as_ptr(), 0),
+        let regions: Vec<&[u8]> = vec![
+            &pk_bytes,
+            as_le_bytes(&weights),
+            as_le_bytes(&nulls),
+            as_le_bytes(values),
+            &blob,
         ];
 
         let path = dir.join(name);
@@ -309,12 +310,12 @@ mod tests {
         let nulls = vec![0u64; n];
         let blob: Vec<u8> = Vec::new();
 
-        let regions: Vec<(*const u8, usize)> = vec![
-            (pk_bytes.as_ptr(), pk_bytes.len()),
-            (weights.as_ptr() as *const u8, n * 8),
-            (nulls.as_ptr() as *const u8, n * 8),
-            (values.as_ptr() as *const u8, n * 8),
-            (blob.as_ptr(), 0),
+        let regions: Vec<&[u8]> = vec![
+            &pk_bytes,
+            as_le_bytes(&weights),
+            as_le_bytes(&nulls),
+            as_le_bytes(values),
+            &blob,
         ];
 
         let path = dir.join(name);

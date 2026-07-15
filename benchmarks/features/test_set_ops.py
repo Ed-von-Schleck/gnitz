@@ -11,13 +11,9 @@ from __future__ import annotations
 
 import pytest
 
-from helpers.datagen import FEATURE_SIZES, push_stream, seed_stream, stream_and_assert
+from helpers.datagen import feature_sz, push_stream, seed_stream, stream_and_assert
 
 VMOD = 500  # value domain: t1[1..dim] and t2[1..dim] share (pk, val) → overlap
-
-
-def _sz(scale_mode):
-    return FEATURE_SIZES[scale_mode]
 
 
 _base_seed, _stream_build = seed_stream(
@@ -55,7 +51,7 @@ def _run(client, sn, bench_timer, view_sql, streamed_table, sz, *, allow_empty=F
 def test_setop_stream_t1(client, schema_name, bench_timer, scale_mode, op, keyword, empty):
     """Stream deltas into t1 (the additive / left side of the operator)."""
     view = f"CREATE VIEW v AS SELECT * FROM t1 {keyword} SELECT * FROM t2"
-    _run(client, schema_name, bench_timer, view, "t1", _sz(scale_mode), allow_empty=empty)
+    _run(client, schema_name, bench_timer, view, "t1", feature_sz(scale_mode), allow_empty=empty)
 
 
 @pytest.mark.parametrize("op,keyword", [
@@ -66,4 +62,4 @@ def test_setop_stream_t2(client, schema_name, bench_timer, scale_mode, op, keywo
     """Stream deltas into t2 (the subtrahend side — drives the clamp differently).
     Streamed t2 rows are t2-only, so the EXCEPT view stays non-empty (t1's base)."""
     view = f"CREATE VIEW v AS SELECT * FROM t1 {keyword} SELECT * FROM t2"
-    _run(client, schema_name, bench_timer, view, "t2", _sz(scale_mode))
+    _run(client, schema_name, bench_timer, view, "t2", feature_sz(scale_mode))

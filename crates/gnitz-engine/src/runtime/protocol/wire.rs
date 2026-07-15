@@ -691,22 +691,6 @@ pub struct SchemaWithVersion<'a> {
     pub version: u16,
 }
 
-/// Read the (data_offset, data_size) directory entry for region `r` from a
-/// WAL block.  Panics on slice errors — callers must validate `data.len()`
-/// covers the full directory before calling. Test-only: production decoders go
-/// through `gnitz_wire::wal::validate_and_parse`, which returns the whole
-/// directory bounds-checked; the malformed-schema tests use this to locate the
-/// region byte they patch.
-#[cfg(test)]
-fn wal_dir_entry(data: &[u8], r: usize) -> (usize, usize) {
-    const HEADER: usize = gnitz_wire::WAL_HEADER_SIZE;
-    const DIR_ENTRY: usize = 8;
-    let base = HEADER + r * DIR_ENTRY;
-    let off = codec::read_u32_le(data, base) as usize;
-    let sz = codec::read_u32_le(data, base + 4) as usize;
-    (off, sz)
-}
-
 pub(crate) fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescriptor, &'static str> {
     // Parse directly from WAL block bytes; no Batch allocation needed.
     // META_SCHEMA_DESC layout: pk(reg 0), weight(1), null_bmp(2),
@@ -1552,7 +1536,7 @@ mod tests {
         let cols = [SchemaColumn::new(type_code::U64, 0)];
         let sd = SchemaDescriptor::new(&cols, &[0]);
         let mut wire = build_schema_wire_block(&sd, &[b"c0".as_slice()], 0, 0);
-        let (tc_off, _) = wal_dir_entry(&wire, 3);
+        let (tc_off, _) = gnitz_wire::wal::dir_entry(&wire, 3);
         wire[tc_off..tc_off + 8].copy_from_slice(&(type_code::F64 as u64).to_le_bytes());
         // verify_checksum=false: the type_code region is inside the checksummed body.
         match decode_schema_block(&wire, false) {
@@ -1572,7 +1556,7 @@ mod tests {
         let sd = SchemaDescriptor::new(&cols, &[0]);
         let mut wire = build_schema_wire_block(&sd, &[b"c0".as_slice()], 0, 0);
         // Region 4 is the flags column; OR in NULLABLE on the PK (col 0).
-        let (fl_off, _) = wal_dir_entry(&wire, 4);
+        let (fl_off, _) = gnitz_wire::wal::dir_entry(&wire, 4);
         let f = codec::read_u64_le(&wire, fl_off) | META_FLAG_NULLABLE;
         wire[fl_off..fl_off + 8].copy_from_slice(&f.to_le_bytes());
         // verify_checksum=false: the flags region is inside the checksummed body.
@@ -1584,7 +1568,7 @@ mod tests {
     }
 
     /// A schema header claiming more regions than the buffer can hold must be
-    /// rejected before any `wal_dir_entry` indexes past the end.
+    /// rejected before any `dir_entry` indexes past the end.
     #[test]
     fn decode_schema_block_rejects_directory_overflow() {
         let cols = [SchemaColumn::new(type_code::U64, 0)];

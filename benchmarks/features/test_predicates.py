@@ -9,16 +9,12 @@ from __future__ import annotations
 
 import random
 
-from helpers.datagen import (FEATURE_SIZES, NATIONS, SHIPMODES, push_stream,
+from helpers.datagen import (NATIONS, SHIPMODES, feature_sz, push_stream,
                              seed_stream, stream_and_assert)
 
 _E_DDL = ("CREATE TABLE e (pk BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL, "
           "mode TEXT NOT NULL, d BIGINT NOT NULL, disc DOUBLE NOT NULL, "
           "note TEXT, v BIGINT NOT NULL)")
-
-
-def _sz(scale_mode):
-    return FEATURE_SIZES[scale_mode]
 
 
 def _e_row(batch, pk, w):
@@ -43,23 +39,23 @@ def _run(client, sn, bench_timer, view_ddl, sz):
 def test_string_eq(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer,
          "CREATE VIEW v AS SELECT pk AS id, v FROM e WHERE name = 'GERMANY'",
-         _sz(scale_mode))
+         feature_sz(scale_mode))
 
 
 def test_string_in_list(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer,
          "CREATE VIEW v AS SELECT pk AS id, v FROM e WHERE mode IN ('AIR', 'SHIP', 'MAIL')",
-         _sz(scale_mode))
+         feature_sz(scale_mode))
 
 
 def test_between_float(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer,
          "CREATE VIEW v AS SELECT pk AS id FROM e "
          "WHERE d BETWEEN 100 AND 200 AND disc BETWEEN 0.05 AND 0.07",
-         _sz(scale_mode))
+         feature_sz(scale_mode))
 
 
 def test_is_not_null(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer,
          "CREATE VIEW v AS SELECT pk AS id, v FROM e WHERE note IS NOT NULL",
-         _sz(scale_mode))
+         feature_sz(scale_mode))

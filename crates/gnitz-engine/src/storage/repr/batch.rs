@@ -1388,16 +1388,11 @@ impl Batch {
         self.strides[idx]
     }
 
-    pub fn regions(&self) -> Vec<(*const u8, usize)> {
-        let nr = self.num_regions as usize;
-        let mut r = Vec::with_capacity(nr + 1);
-        for i in 0..nr {
-            let off = self.offsets[i];
-            let len = self.count * self.strides[i] as usize;
-            r.push((self.data[off..].as_ptr(), len));
-        }
-        r.push((self.blob.as_ptr(), self.blob.len()));
-        r
+    /// All regions as bounds-checked byte slices in canonical order (pk, weight,
+    /// null, payload…, blob) — the safe region view the shard writer consumes.
+    /// Mapping [`Batch::region_slice`] over every region, blob included.
+    pub fn regions(&self) -> Vec<&[u8]> {
+        (0..self.num_regions_total()).map(|i| self.region_slice(i)).collect()
     }
 
     /// Append a single row from any ColumnarSource with blob deduplication.

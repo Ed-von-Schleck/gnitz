@@ -1,4 +1,5 @@
 use super::*;
+use crate::foundation::codec::as_le_bytes;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::Layout;
 use crate::test_support::wide_pk_3xu64_schema;
@@ -969,12 +970,12 @@ fn write_test_shard(
     let nulls = vec![0u64; rows.len()];
     let vals: Vec<i64> = rows.iter().map(|&(_, _, v)| v).collect();
     let blob: Vec<u8> = Vec::new();
-    let regions: Vec<(*const u8, usize)> = vec![
-        (pks.as_ptr(), pks.len()),
-        (weights.as_ptr() as *const u8, weights.len() * 8),
-        (nulls.as_ptr() as *const u8, nulls.len() * 8),
-        (vals.as_ptr() as *const u8, vals.len() * 8),
-        (blob.as_ptr(), blob.len()),
+    let regions: Vec<&[u8]> = vec![
+        &pks,
+        as_le_bytes(&weights),
+        as_le_bytes(&nulls),
+        as_le_bytes(&vals),
+        &blob,
     ];
     let path = dir.path().join(format!("rc_{flag}_{idx}.db"));
     let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
@@ -1008,12 +1009,12 @@ fn write_test_shard_u64(
     let nulls = vec![0u64; rows.len()];
     let vals: Vec<i64> = rows.iter().map(|&(_, _, v)| v).collect();
     let blob: Vec<u8> = Vec::new();
-    let regions: Vec<(*const u8, usize)> = vec![
-        (pks.as_ptr(), pks.len()),
-        (weights.as_ptr() as *const u8, weights.len() * 8),
-        (nulls.as_ptr() as *const u8, nulls.len() * 8),
-        (vals.as_ptr() as *const u8, vals.len() * 8),
-        (blob.as_ptr(), blob.len()),
+    let regions: Vec<&[u8]> = vec![
+        &pks,
+        as_le_bytes(&weights),
+        as_le_bytes(&nulls),
+        as_le_bytes(&vals),
+        &blob,
     ];
     let path = dir.path().join(format!("rc8_{flag}_{idx}.db"));
     let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();

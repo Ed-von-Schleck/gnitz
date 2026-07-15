@@ -301,20 +301,11 @@ pub struct DecodedControl {
     pub block_size: usize,
 }
 
-/// Read the (data_offset, data_size) directory entry for region `r` from a
-/// WAL block. Panics on slice errors — callers must validate `data.len()`
-/// covers the full directory before calling.
-#[inline(always)]
-fn wal_dir_entry(data: &[u8], r: usize) -> (usize, usize) {
-    let base = WAL_HEADER_SIZE + r * 8;
-    (read_u32_le(data, base) as usize, read_u32_le(data, base + 4) as usize)
-}
-
 /// Bounds-checked read of a u64 from a fixed-width u64 region of a 1-row
 /// control block (exactly 8 bytes for 1 row).
 #[inline(always)]
 fn read_u64_region(data: &[u8], r: usize) -> Result<u64, &'static str> {
-    let (off, sz) = wal_dir_entry(data, r);
+    let (off, sz) = crate::wal::dir_entry(data, r);
     if sz < 8 || off.saturating_add(8) > data.len() {
         return Err("control block region out of bounds");
     }
@@ -325,7 +316,7 @@ fn read_u64_region(data: &[u8], r: usize) -> Result<u64, &'static str> {
 /// control block (exactly 16 bytes for 1 row).
 #[inline(always)]
 fn read_u128_region(data: &[u8], r: usize) -> Result<u128, &'static str> {
-    let (off, sz) = wal_dir_entry(data, r);
+    let (off, sz) = crate::wal::dir_entry(data, r);
     if sz < 16 || off.saturating_add(16) > data.len() {
         return Err("control block u128 region out of bounds");
     }
@@ -374,7 +365,7 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
     // non-null. When both are null (the universal case) skip the lookup
     // entirely, preserving the hot-path fast case.
     let blob: &[u8] = if !error_is_null || !seek_extra_is_null {
-        let (blob_off, blob_sz) = wal_dir_entry(data, REGION_BLOB);
+        let (blob_off, blob_sz) = crate::wal::dir_entry(data, REGION_BLOB);
         if blob_sz > 0 && blob_off.saturating_add(blob_sz) <= data.len() {
             &data[blob_off..blob_off + blob_sz]
         } else {
@@ -385,7 +376,7 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
     };
 
     let read_german = |region: usize, err: &'static str, oob: &'static str| -> Result<Vec<u8>, &'static str> {
-        let (off, sz) = wal_dir_entry(data, region);
+        let (off, sz) = crate::wal::dir_entry(data, region);
         if sz < 16 || off.saturating_add(16) > data.len() {
             return Err(err);
         }
@@ -483,7 +474,7 @@ mod tests {
         let mut buf = vec![0u8; ctrl_block_size(long_msg.len(), 0)];
         let n = encode_ctrl_block(&mut buf, 0, 1, 2, 0, 0, 0, 0, 1, long_msg, b"");
         buf.truncate(n);
-        let (err_off, _) = wal_dir_entry(&buf, REGION_ERROR_MSG);
+        let (err_off, _) = crate::wal::dir_entry(&buf, REGION_ERROR_MSG);
         buf[err_off + 8..err_off + 16].copy_from_slice(&u64::MAX.to_le_bytes());
         match peek_control_block(&buf) {
             Err("error_msg string offset out of bounds") => {}

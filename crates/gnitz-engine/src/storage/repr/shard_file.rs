@@ -375,11 +375,10 @@ pub(crate) fn region_dir(image: &[u8], i: usize) -> (usize, u8) {
     (read_u64_le(image, d + 8) as usize, image[d + 24])
 }
 
-fn build_xor8_from_pk_region(pk_ptr: *const u8, pk_sz: usize, stride: usize) -> Option<Xor8> {
-    if pk_ptr.is_null() || pk_sz == 0 || stride == 0 {
+fn build_xor8_from_pk_region(pk_bytes: &[u8], stride: usize) -> Option<Xor8> {
+    if pk_bytes.is_empty() || stride == 0 {
         return None;
     }
-    let pk_bytes = unsafe { std::slice::from_raw_parts(pk_ptr, pk_sz) };
     // One hashed key per distinct PK. The PK region is sorted, so rows that
     // share a PK but differ in payload (valid under (PK, payload) element
     // identity) are adjacent — skipping chunks byte-equal to their predecessor
@@ -387,7 +386,7 @@ fn build_xor8_from_pk_region(pk_ptr: *const u8, pk_sz: usize, stride: usize) -> 
     // instead of n rows on duplicate-PK trace shards (MIN/MAX AggValueIndex).
     // `xor8::fingerprint` owns the narrow/wide derivation the probe side must
     // match exactly.
-    let mut keys: Vec<u64> = Vec::with_capacity(pk_sz / stride);
+    let mut keys: Vec<u64> = Vec::with_capacity(pk_bytes.len() / stride);
     let mut prev: Option<&[u8]> = None;
     for chunk in pk_bytes.chunks_exact(stride) {
         if prev == Some(chunk) {
@@ -421,7 +420,7 @@ pub fn write_shard_streaming(
     dirfd: c_int,
     basename: &CStr,
     row_count: u32,
-    regions: &[(*const u8, usize)],
+    regions: &[&[u8]],
     schema: &SchemaDescriptor,
     opts: ShardWriteOpts,
 ) -> Result<(), StorageError> {
@@ -457,7 +456,7 @@ fn write_shard_streaming_inner(
     dirfd: c_int,
     basename: &CStr,
     row_count: u32,
-    regions: &[(*const u8, usize)],
+    regions: &[&[u8]],
     schema: &SchemaDescriptor,
     opts: ShardWriteOpts,
 ) -> Result<(OwnedFd, std::ffi::CString), StorageError> {
@@ -476,10 +475,11 @@ fn write_shard_streaming_inner(
     let mut actual_sizes: Vec<usize> = Vec::with_capacity(num_regions);
 
     for i in 0..num_regions {
-        let (src_ptr, orig_sz) = regions[i];
-        // The blob region is variable-length (always Raw); null/empty regions
-        // never reach `from_raw_parts`.
-        if n == 0 || orig_sz == 0 || src_ptr.is_null() || i >= nr {
+        let src = regions[i];
+        let orig_sz = src.len();
+        // The blob region is variable-length (always Raw); empty regions never
+        // reach the encoders.
+        if n == 0 || orig_sz == 0 || i >= nr {
             encodings.push(RegionEncoding::Raw);
             actual_sizes.push(orig_sz);
             continue;
@@ -491,7 +491,6 @@ fn write_shard_streaming_inner(
             n * width,
             "region {i}: schema width {width} × {n} rows != region size {orig_sz}"
         );
-        let src = unsafe { std::slice::from_raw_parts(src_ptr, orig_sz) };
         // FoR eligibility: only fixed-int payload regions, only when the caller
         // opted in (compaction outputs). `Some(signed)` when eligible.
         let for_signed = (opts.pack_ints && i >= REG_PAYLOAD_START)
@@ -523,8 +522,7 @@ fn write_shard_streaming_inner(
 
     // --- Phase 2: XOR8 filter built from pk region (pk_stride bytes/row, zero-extended to u128) ---
     let xor8_filter = if row_count > 0 {
-        let (pk_ptr, pk_sz) = regions[REG_PK];
-        build_xor8_from_pk_region(pk_ptr, pk_sz, schema.pk_stride() as usize)
+        build_xor8_from_pk_region(regions[REG_PK], schema.pk_stride() as usize)
     } else {
         None
     };
@@ -555,12 +553,10 @@ fn write_shard_streaming_inner(
     let mut hdr_buf = vec![0u8; hdr_dir_size];
 
     for i in 0..num_regions {
-        let (src_ptr, orig_sz) = regions[i];
-        // Empty/null regions short-circuit to checksum 0 — never form a slice
-        // from a null or zero-length region. Non-Raw encodings are only chosen
-        // for non-empty, non-null regions.
-        let cs = if actual_sizes[i] > 0 && !src_ptr.is_null() {
-            let src = unsafe { std::slice::from_raw_parts(src_ptr, orig_sz) };
+        let src = regions[i];
+        // Empty regions short-circuit to checksum 0 — never encode an empty
+        // region. Non-Raw encodings are only chosen for non-empty regions.
+        let cs = if actual_sizes[i] > 0 && !src.is_empty() {
             xxh::checksum(encodings[i].encoded_bytes(src))
         } else {
             0
@@ -606,11 +602,10 @@ fn write_shard_streaming_inner(
         crate::foundation::posix_io::pwrite_all_fd(fd.as_raw_fd(), &hdr_buf, 0).map_err(|_| abort())?;
 
         for i in 0..num_regions {
-            let (src_ptr, orig_sz) = regions[i];
+            let src = regions[i];
             let r_off = region_offsets[i] as libc::off_t;
-            // Same empty/null short-circuit as the checksum pass.
-            if actual_sizes[i] > 0 && !src_ptr.is_null() {
-                let src = std::slice::from_raw_parts(src_ptr, orig_sz);
+            // Same empty short-circuit as the checksum pass.
+            if actual_sizes[i] > 0 && !src.is_empty() {
                 crate::foundation::posix_io::pwrite_all_fd(fd.as_raw_fd(), encodings[i].encoded_bytes(src), r_off)
                     .map_err(|_| abort())?;
             }
@@ -628,7 +623,7 @@ fn write_shard_streaming_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::foundation::codec::read_u64_le;
+    use crate::foundation::codec::{as_le_bytes, read_u64_le};
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
     use crate::storage::lsm::shard_reader::MappedShard;
 
@@ -656,13 +651,7 @@ mod tests {
         let val_bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
         let blob: Vec<u8> = vec![];
 
-        let regions: Vec<(*const u8, usize)> = vec![
-            (pk_bytes.as_ptr(), pk_bytes.len()),
-            (weight_bytes.as_ptr(), weight_bytes.len()),
-            (null_bytes.as_ptr(), null_bytes.len()),
-            (val_bytes.as_ptr(), val_bytes.len()),
-            (blob.as_ptr(), blob.len()),
-        ];
+        let regions: Vec<&[u8]> = vec![&pk_bytes, &weight_bytes, &null_bytes, &val_bytes, &blob];
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("build_image.db");
@@ -691,12 +680,7 @@ mod tests {
         let path = dir.path().join("empty.db");
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
 
-        let regions: Vec<(*const u8, usize)> = vec![
-            (std::ptr::null(), 0),
-            (std::ptr::null(), 0),
-            (std::ptr::null(), 0),
-            (std::ptr::null(), 0),
-        ];
+        let regions: Vec<&[u8]> = vec![&[], &[], &[], &[]];
 
         // All-PK single-column schema (num_payload_cols = 0) → 4 regions.
         let schema = make_schema_desc(1, 0);
@@ -723,12 +707,12 @@ mod tests {
         let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_be_bytes()).collect();
         let blob: Vec<u8> = vec![];
 
-        let regions: Vec<(*const u8, usize)> = vec![
-            (pk_bytes.as_ptr(), pk_bytes.len()),
-            (weights.as_ptr() as *const u8, weights.len() * 8),
-            (nulls.as_ptr() as *const u8, nulls.len() * 8),
-            (vals.as_ptr() as *const u8, vals.len() * 8),
-            (blob.as_ptr(), 0),
+        let regions: Vec<&[u8]> = vec![
+            &pk_bytes,
+            as_le_bytes(&weights),
+            as_le_bytes(&nulls),
+            as_le_bytes(&vals),
+            &blob,
         ];
 
         let schema = make_schema_desc(2, 0);
@@ -768,12 +752,12 @@ mod tests {
         assert_eq!(pk_bytes.len(), n as usize * 8, "U64 PK region must be 8B/row");
         let blob: Vec<u8> = vec![];
 
-        let regions: Vec<(*const u8, usize)> = vec![
-            (pk_bytes.as_ptr(), pk_bytes.len()),
-            (weights.as_ptr() as *const u8, weights.len() * 8),
-            (nulls.as_ptr() as *const u8, nulls.len() * 8),
-            (vals.as_ptr() as *const u8, vals.len() * 8),
-            (blob.as_ptr(), 0),
+        let regions: Vec<&[u8]> = vec![
+            &pk_bytes,
+            as_le_bytes(&weights),
+            as_le_bytes(&nulls),
+            as_le_bytes(&vals),
+            &blob,
         ];
 
         let schema = make_schema_desc(2, 0);
@@ -810,12 +794,12 @@ mod tests {
         let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_be_bytes()).collect();
         let blob: Vec<u8> = vec![];
 
-        let regions: Vec<(*const u8, usize)> = vec![
-            (pk_bytes.as_ptr(), pk_bytes.len()),
-            (weights.as_ptr() as *const u8, weights.len() * 8),
-            (nulls.as_ptr() as *const u8, nulls.len() * 8),
-            (vals.as_ptr() as *const u8, vals.len() * 8),
-            (blob.as_ptr(), 0),
+        let regions: Vec<&[u8]> = vec![
+            &pk_bytes,
+            as_le_bytes(&weights),
+            as_le_bytes(&nulls),
+            as_le_bytes(&vals),
+            &blob,
         ];
 
         let dir = tempfile::tempdir().unwrap();
@@ -856,12 +840,12 @@ mod tests {
         let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_be_bytes()).collect();
         let blob: Vec<u8> = vec![];
 
-        let regions: Vec<(*const u8, usize)> = vec![
-            (pk_bytes.as_ptr(), pk_bytes.len()),
-            (weights.as_ptr() as *const u8, weights.len() * 8),
-            (nulls.as_ptr() as *const u8, nulls.len() * 8),
-            (vals.as_ptr() as *const u8, vals.len() * 8),
-            (blob.as_ptr(), 0),
+        let regions: Vec<&[u8]> = vec![
+            &pk_bytes,
+            as_le_bytes(&weights),
+            as_le_bytes(&nulls),
+            as_le_bytes(&vals),
+            &blob,
         ];
 
         let schema = make_schema_desc(2, 0);
@@ -887,13 +871,12 @@ mod tests {
     #[test]
     fn encoding_selection_pins_all_roles() {
         let dir = tempfile::tempdir().unwrap();
-        let write_and_read =
-            |schema: &SchemaDescriptor, n: u32, regions: &[(*const u8, usize)], name: &str| -> Vec<u8> {
-                let path = dir.path().join(name);
-                let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-                write_shard_streaming(libc::AT_FDCWD, &cpath, n, regions, schema, ShardWriteOpts::default()).unwrap();
-                std::fs::read(&path).unwrap()
-            };
+        let write_and_read = |schema: &SchemaDescriptor, n: u32, regions: &[&[u8]], name: &str| -> Vec<u8> {
+            let path = dir.path().join(name);
+            let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            write_shard_streaming(libc::AT_FDCWD, &cpath, n, regions, schema, ShardWriteOpts::default()).unwrap();
+            std::fs::read(&path).unwrap()
+        };
 
         // --- Shard A (Constant-heavy): constant PK, all-1 weight, all-0 nulls,
         // one constant + one varying payload column, non-empty blob. ---
@@ -912,13 +895,13 @@ mod tests {
         let const_col: Vec<i64> = vec![42; n_a];
         let vary_col: Vec<i64> = (0..n_a as i64).collect();
         let blob_a: Vec<u8> = vec![0xAA, 0xBB, 0xCC];
-        let regions_a: Vec<(*const u8, usize)> = vec![
-            (pk_a.as_ptr(), pk_a.len()),
-            (w_a.as_ptr() as *const u8, w_a.len() * 8),
-            (null_a.as_ptr() as *const u8, null_a.len() * 8),
-            (const_col.as_ptr() as *const u8, const_col.len() * 8),
-            (vary_col.as_ptr() as *const u8, vary_col.len() * 8),
-            (blob_a.as_ptr(), blob_a.len()),
+        let regions_a: Vec<&[u8]> = vec![
+            &pk_a,
+            as_le_bytes(&w_a),
+            as_le_bytes(&null_a),
+            as_le_bytes(&const_col),
+            as_le_bytes(&vary_col),
+            &blob_a,
         ];
         let img_a = write_and_read(&schema_a, n_a as u32, &regions_a, "pin_a.db");
         assert_eq!(region_dir(&img_a, 0), (8, ENCODING_CONSTANT), "A pk constant");
@@ -948,12 +931,12 @@ mod tests {
         let null_b: Vec<u64> = vec![1, 0, 1, 0]; // col-0 null bit set on rows 0,2
         let pay_b: Vec<i64> = vec![10, 20, 30, 40];
         let blob_b: Vec<u8> = vec![];
-        let regions_b: Vec<(*const u8, usize)> = vec![
-            (pk_b.as_ptr(), pk_b.len()),
-            (w_b.as_ptr() as *const u8, w_b.len() * 8),
-            (null_b.as_ptr() as *const u8, null_b.len() * 8),
-            (pay_b.as_ptr() as *const u8, pay_b.len() * 8),
-            (blob_b.as_ptr(), 0),
+        let regions_b: Vec<&[u8]> = vec![
+            &pk_b,
+            as_le_bytes(&w_b),
+            as_le_bytes(&null_b),
+            as_le_bytes(&pay_b),
+            &blob_b,
         ];
         let img_b = write_and_read(&schema_b, n_b as u32, &regions_b, "pin_b.db");
         assert_eq!(region_dir(&img_b, 0), (n_b * 8, ENCODING_RAW), "B pk distinct → raw");
@@ -978,12 +961,12 @@ mod tests {
         let null_c: Vec<u64> = vec![0; n_c];
         let pay_c: Vec<i64> = vec![5, 6, 7];
         let blob_c: Vec<u8> = vec![];
-        let regions_c: Vec<(*const u8, usize)> = vec![
-            (pk_c.as_ptr(), pk_c.len()),
-            (w_c.as_ptr() as *const u8, w_c.len() * 8),
-            (null_c.as_ptr() as *const u8, null_c.len() * 8),
-            (pay_c.as_ptr() as *const u8, pay_c.len() * 8),
-            (blob_c.as_ptr(), 0),
+        let regions_c: Vec<&[u8]> = vec![
+            &pk_c,
+            as_le_bytes(&w_c),
+            as_le_bytes(&null_c),
+            as_le_bytes(&pay_c),
+            &blob_c,
         ];
         let img_c = write_and_read(&schema_c, n_c as u32, &regions_c, "pin_c.db");
         assert_eq!(
@@ -1000,8 +983,7 @@ mod tests {
             .map(|r| (0..stride).map(|b| r.wrapping_add(b as u8)).collect())
             .collect();
         let pk_bytes: Vec<u8> = rows.iter().flatten().copied().collect();
-        let f = build_xor8_from_pk_region(pk_bytes.as_ptr(), pk_bytes.len(), stride)
-            .expect("wide compound region must build a filter");
+        let f = build_xor8_from_pk_region(&pk_bytes, stride).expect("wide compound region must build a filter");
         for row in &rows {
             assert!(
                 xor8::may_contain(&f, crate::foundation::xxh::checksum(row) as u128),
@@ -1017,8 +999,7 @@ mod tests {
             .map(|r| (0..stride).map(|b| r.wrapping_mul(7).wrapping_add(b as u8)).collect())
             .collect();
         let pk_bytes: Vec<u8> = rows.iter().flatten().copied().collect();
-        let f = build_xor8_from_pk_region(pk_bytes.as_ptr(), pk_bytes.len(), stride)
-            .expect("narrow compound region must build a filter");
+        let f = build_xor8_from_pk_region(&pk_bytes, stride).expect("narrow compound region must build a filter");
         for row in &rows {
             // Builder fingerprint for stride <= 16 is widen_pk_be(OPK bytes);
             // the probe must derive the same value.
@@ -1034,7 +1015,7 @@ mod tests {
         let pks64: Vec<u64> = vec![10, 20, 30, 40];
         // OPK at rest: U64 region is big-endian.
         let b64: Vec<u8> = pks64.iter().flat_map(|p| p.to_be_bytes()).collect();
-        let f64 = build_xor8_from_pk_region(b64.as_ptr(), b64.len(), 8).expect("8-byte region must build a filter");
+        let f64 = build_xor8_from_pk_region(&b64, 8).expect("8-byte region must build a filter");
         for p in &pks64 {
             assert!(xor8::may_contain(&f64, *p as u128));
         }
@@ -1042,8 +1023,7 @@ mod tests {
         let pks128: Vec<u128> = vec![1, 1 << 64, u128::MAX, 12345];
         // OPK at rest: U128 region is big-endian.
         let b128: Vec<u8> = pks128.iter().flat_map(|p| p.to_be_bytes()).collect();
-        let f128 =
-            build_xor8_from_pk_region(b128.as_ptr(), b128.len(), 16).expect("16-byte region must build a filter");
+        let f128 = build_xor8_from_pk_region(&b128, 16).expect("16-byte region must build a filter");
         for p in &pks128 {
             assert!(xor8::may_contain(&f128, *p));
         }

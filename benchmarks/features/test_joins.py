@@ -13,7 +13,7 @@ for stream_deltas. Both draw from the same value distribution.
 
 from __future__ import annotations
 
-from helpers.datagen import (FEATURE_SIZES, push_stream, stream_and_assert,
+from helpers.datagen import (feature_sz, push_stream, stream_and_assert,
                              stream_factory, zipf_choice)
 
 SKEW_S = 1.1
@@ -22,10 +22,6 @@ RANGE_DIM = 64               # small dim for pure-range joins (bounds fan-out)
 # dim rows), so cap the fact base/delta to keep the materialized view bounded.
 RANGE_BASE_CAP = 30_000
 RANGE_DELTA_CAP = 500
-
-
-def _sz(scale_mode):
-    return FEATURE_SIZES[scale_mode]
 
 
 def _seed(client, sn, name, build, count):
@@ -71,19 +67,19 @@ def _equi_shape(client, sn, bench_timer, sz, view_name, view_sql):
 
 
 def test_right(client, schema_name, bench_timer, scale_mode):
-    _equi_shape(client, schema_name, bench_timer, _sz(scale_mode), "v_right",
+    _equi_shape(client, schema_name, bench_timer, feature_sz(scale_mode), "v_right",
                 "CREATE VIEW v_right AS SELECT a.k AS k, a.av AS av, b.bv AS bv "
                 "FROM a RIGHT JOIN b ON a.k = b.k")
 
 
 def test_full(client, schema_name, bench_timer, scale_mode):
-    _equi_shape(client, schema_name, bench_timer, _sz(scale_mode), "v_full",
+    _equi_shape(client, schema_name, bench_timer, feature_sz(scale_mode), "v_full",
                 "CREATE VIEW v_full AS SELECT a.k AS k, a.av AS av, b.bv AS bv "
                 "FROM a FULL JOIN b ON a.k = b.k")
 
 
 def test_residual(client, schema_name, bench_timer, scale_mode):
-    _equi_shape(client, schema_name, bench_timer, _sz(scale_mode), "v_resid",
+    _equi_shape(client, schema_name, bench_timer, feature_sz(scale_mode), "v_resid",
                 "CREATE VIEW v_resid AS SELECT a.k AS k, a.av AS av, b.bv AS bv "
                 "FROM a JOIN b ON a.k = b.k AND a.av <> b.bv")
 
@@ -93,7 +89,7 @@ def test_residual(client, schema_name, bench_timer, scale_mode):
 # ---------------------------------------------------------------------------
 
 def test_multiway3(client, schema_name, bench_timer, scale_mode):
-    sn, sz = schema_name, _sz(scale_mode)
+    sn, sz = schema_name, feature_sz(scale_mode)
     _make_ab(client, sn)
     client.execute_sql("CREATE TABLE d (pk BIGINT NOT NULL PRIMARY KEY, "
                        "k BIGINT NOT NULL, dv BIGINT NOT NULL)", schema_name=sn)
@@ -113,7 +109,7 @@ def test_multiway3(client, schema_name, bench_timer, scale_mode):
 # ---------------------------------------------------------------------------
 
 def test_self(client, schema_name, bench_timer, scale_mode):
-    sn, sz = schema_name, _sz(scale_mode)
+    sn, sz = schema_name, feature_sz(scale_mode)
     dim = sz["dim"]
     client.execute_sql("CREATE TABLE emp (id BIGINT NOT NULL PRIMARY KEY, "
                        "mgr BIGINT NOT NULL, sal BIGINT NOT NULL)", schema_name=sn)
@@ -135,7 +131,7 @@ def test_self(client, schema_name, bench_timer, scale_mode):
 # ---------------------------------------------------------------------------
 
 def test_band(client, schema_name, bench_timer, scale_mode):
-    sn, sz = schema_name, _sz(scale_mode)
+    sn, sz = schema_name, feature_sz(scale_mode)
     dim = sz["dim"]
     client.execute_sql("CREATE TABLE ba (pk BIGINT NOT NULL PRIMARY KEY, "
                        "k BIGINT NOT NULL, lo BIGINT NOT NULL)", schema_name=sn)
@@ -172,7 +168,7 @@ def _range_factory():
 
 
 def _range_sz(scale_mode):
-    sz = dict(_sz(scale_mode))
+    sz = dict(feature_sz(scale_mode))
     sz["base"] = min(sz["base"], RANGE_BASE_CAP)
     sz["delta"] = min(sz["delta"], RANGE_DELTA_CAP)
     return sz
@@ -203,7 +199,7 @@ def test_range_left(client, schema_name, bench_timer, scale_mode):
 # ---------------------------------------------------------------------------
 
 def test_compound_key(client, schema_name, bench_timer, scale_mode):
-    sn, sz = schema_name, _sz(scale_mode)
+    sn, sz = schema_name, feature_sz(scale_mode)
     dim = sz["dim"]
     half = max(1, dim // 2)
     client.execute_sql("CREATE TABLE ca (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, "

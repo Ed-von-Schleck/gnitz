@@ -8,14 +8,10 @@ Zipfian (hot parents). SQL is verbatim from the plan's Appendix A.
 
 from __future__ import annotations
 
-from helpers.datagen import (FEATURE_SIZES, push_stream, stream_and_assert,
+from helpers.datagen import (feature_sz, push_stream, stream_and_assert,
                              stream_factory, zipf_choice)
 
 SKEW_S = 1.1
-
-
-def _sz(scale_mode):
-    return FEATURE_SIZES[scale_mode]
 
 
 def _p_seed(batch, k):
@@ -48,27 +44,27 @@ def test_scalar_proj(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer, [
         "CREATE VIEW v AS SELECT p.id AS id, "
         "(SELECT COUNT(*) FROM ch WHERE ch.pid = p.id) AS cnt FROM p",
-    ], "v", _sz(scale_mode))
+    ], "v", feature_sz(scale_mode))
 
 
 def test_scalar_where_corr(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer, [
         "CREATE VIEW v AS SELECT p.id AS id FROM p "
         "WHERE (SELECT COUNT(*) FROM ch WHERE ch.pid = p.id) >= 2",
-    ], "v", _sz(scale_mode))
+    ], "v", feature_sz(scale_mode))
 
 
 def test_scalar_where_uncorr(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer, [
         "CREATE VIEW v AS SELECT o.id AS id FROM ch o WHERE o.v < (SELECT MAX(ci.v) FROM ch ci)",
-    ], "v", _sz(scale_mode))
+    ], "v", feature_sz(scale_mode))
 
 
 def test_exists(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer, [
         "CREATE VIEW v AS SELECT p.id AS id, p.region AS region FROM p "
         "WHERE EXISTS (SELECT 1 FROM ch WHERE ch.pid = p.id)",
-    ], "v", _sz(scale_mode))
+    ], "v", feature_sz(scale_mode))
 
 
 def test_exists_group(client, schema_name, bench_timer, scale_mode):
@@ -76,30 +72,30 @@ def test_exists_group(client, schema_name, bench_timer, scale_mode):
         "CREATE VIEW vx AS SELECT p.id AS id, p.region AS region FROM p "
         "WHERE EXISTS (SELECT 1 FROM ch WHERE ch.pid = p.id)",
         "CREATE VIEW vg AS SELECT region, COUNT(*) AS cnt FROM vx GROUP BY region",
-    ], "vg", _sz(scale_mode))
+    ], "vg", feature_sz(scale_mode))
 
 
 def test_in_sub(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer, [
         "CREATE VIEW v AS SELECT p.id AS id FROM p WHERE p.id IN (SELECT ch.pid FROM ch)",
-    ], "v", _sz(scale_mode))
+    ], "v", feature_sz(scale_mode))
 
 
 def test_any(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer, [
         "CREATE VIEW v AS SELECT o.id AS id FROM ch o WHERE o.v < ANY (SELECT ci.v FROM ch ci)",
-    ], "v", _sz(scale_mode))
+    ], "v", feature_sz(scale_mode))
 
 
 def test_derived(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer, [
         "CREATE VIEW v AS SELECT d.id AS id, ch.v AS v FROM "
         "(SELECT id, region FROM p WHERE region > 0) d JOIN ch ON d.id = ch.pid",
-    ], "v", _sz(scale_mode))
+    ], "v", feature_sz(scale_mode))
 
 
 def test_cte(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer, [
         "CREATE VIEW v AS WITH big AS (SELECT id, region FROM p WHERE region > 0) "
         "SELECT big.id AS id, ch.v AS v FROM big JOIN ch ON big.id = ch.pid",
-    ], "v", _sz(scale_mode))
+    ], "v", feature_sz(scale_mode))

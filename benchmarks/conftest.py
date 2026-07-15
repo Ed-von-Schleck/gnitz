@@ -22,7 +22,7 @@ from helpers.timing import BenchTimer, get_all_results, record_result
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Per-tier schema-name prefix, keyed by the test file's parent directory (tier).
-_TIER_PREFIX = {"micro": "bench", "combined": "comb", "features": "feat", "txn": "txn"}
+_TIER_PREFIX = {"micro": "bench", "combined": "comb", "features": "feat"}
 _schema_counter = itertools.count()
 
 

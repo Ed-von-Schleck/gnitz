@@ -10,14 +10,10 @@ from __future__ import annotations
 
 import random
 
-from helpers.datagen import (FEATURE_SIZES, NATIONS, push_stream, seed_stream,
+from helpers.datagen import (NATIONS, feature_sz, push_stream, seed_stream,
                              stream_and_assert)
 
 NGROUP = 200
-
-
-def _sz(scale_mode):
-    return FEATURE_SIZES[scale_mode]
 
 
 def _run(client, sn, bench_timer, table, ddl, view_ddl, read_view, row_fn, sz):
@@ -36,7 +32,7 @@ def test_string_key(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer, "t",
          "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g TEXT NOT NULL, v BIGINT NOT NULL)",
          "CREATE VIEW v AS SELECT g, SUM(v) AS s, COUNT(*) AS n FROM t GROUP BY g",
-         "v", row, _sz(scale_mode))
+         "v", row, feature_sz(scale_mode))
 
 
 def test_float_payload(client, schema_name, bench_timer, scale_mode):
@@ -46,7 +42,7 @@ def test_float_payload(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer, "t",
          "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, f DOUBLE NOT NULL)",
          "CREATE VIEW v AS SELECT g, SUM(f) AS s, AVG(f) AS a FROM t GROUP BY g",
-         "v", row, _sz(scale_mode))
+         "v", row, feature_sz(scale_mode))
 
 
 def test_compound_pk_base(client, schema_name, bench_timer, scale_mode):
@@ -57,7 +53,7 @@ def test_compound_pk_base(client, schema_name, bench_timer, scale_mode):
          "CREATE TABLE li (l_order BIGINT NOT NULL, l_line BIGINT NOT NULL, "
          "l_ship BIGINT NOT NULL, l_qty BIGINT NOT NULL, PRIMARY KEY (l_order, l_line))",
          "CREATE VIEW v AS SELECT l_ship, SUM(l_qty) AS s, COUNT(*) AS n FROM li GROUP BY l_ship",
-         "v", row, _sz(scale_mode))
+         "v", row, feature_sz(scale_mode))
 
 
 def test_narrow_ints(client, schema_name, bench_timer, scale_mode):
@@ -69,7 +65,7 @@ def test_narrow_ints(client, schema_name, bench_timer, scale_mode):
          "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
          "a SMALLINT NOT NULL, bb INT NOT NULL, c INT UNSIGNED NOT NULL)",
          "CREATE VIEW v AS SELECT g, SUM(a) AS sa, SUM(bb) AS sb, SUM(c) AS sc FROM t GROUP BY g",
-         "v", row, _sz(scale_mode))
+         "v", row, feature_sz(scale_mode))
 
 
 def test_u128_uuid_key(client, schema_name, bench_timer, scale_mode):
@@ -79,4 +75,4 @@ def test_u128_uuid_key(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer, "t",
          "CREATE TABLE t (pk DECIMAL(38,0) NOT NULL PRIMARY KEY, uid UUID NOT NULL, v BIGINT NOT NULL)",
          "CREATE VIEW v AS SELECT pk, uid, v FROM t",
-         "v", row, _sz(scale_mode))
+         "v", row, feature_sz(scale_mode))

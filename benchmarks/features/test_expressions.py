@@ -9,14 +9,10 @@ from __future__ import annotations
 
 import random
 
-from helpers.datagen import FEATURE_SIZES, push_stream, seed_stream, stream_and_assert
+from helpers.datagen import feature_sz, push_stream, seed_stream, stream_and_assert
 
 _E_DDL = ("CREATE TABLE e (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, "
           "b BIGINT, price BIGINT NOT NULL, disc DOUBLE NOT NULL)")
-
-
-def _sz(scale_mode):
-    return FEATURE_SIZES[scale_mode]
 
 
 def _e_row(batch, pk, w):
@@ -41,23 +37,23 @@ def test_case(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer,
          "CREATE VIEW v AS SELECT pk AS id, "
          "CASE WHEN a > 10 THEN 1 WHEN a > 5 THEN 2 ELSE 0 END AS hi FROM e",
-         _sz(scale_mode))
+         feature_sz(scale_mode))
 
 
 def test_simple_case(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer,
          "CREATE VIEW v AS SELECT pk AS id, "
          "CASE a WHEN 1 THEN 111 WHEN 2 THEN 222 ELSE 999 END AS m FROM e",
-         _sz(scale_mode))
+         feature_sz(scale_mode))
 
 
 def test_coalesce_nullif(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer,
          "CREATE VIEW v AS SELECT pk AS id, COALESCE(b, 0) AS bz, NULLIF(a, 0) AS an FROM e",
-         _sz(scale_mode))
+         feature_sz(scale_mode))
 
 
 def test_mixed_arith(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer,
          "CREATE VIEW v AS SELECT pk AS id, price * (1 - disc) AS net FROM e",
-         _sz(scale_mode))
+         feature_sz(scale_mode))

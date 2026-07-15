@@ -328,9 +328,9 @@ fn decode_wal_block_impl(
     }
     let pk_stride = schema.pk_stride();
 
-    let dir: Vec<(usize, usize)> = (0..num_regions)
-        .map(|r| (region_offsets[r] as usize, region_sizes[r] as usize))
-        .collect();
+    // Index the framer-filled offset/size arrays directly — no per-decode heap
+    // Vec (the engine's `decode_mem_batch_inner`/`decode_schema_block` do the same).
+    let dir = |r: usize| (region_offsets[r] as usize, region_sizes[r] as usize);
 
     let count = header.entry_count as usize;
 
@@ -341,11 +341,11 @@ fn decode_wal_block_impl(
     // Read system regions
     let mut region_idx = 0;
 
-    let (pk_off, pk_sz) = dir[region_idx];
+    let (pk_off, pk_sz) = dir(region_idx);
     region_idx += 1;
-    let (wt_off, wt_sz) = dir[region_idx];
+    let (wt_off, wt_sz) = dir(region_idx);
     region_idx += 1;
-    let (null_off, null_sz) = dir[region_idx];
+    let (null_off, null_sz) = dir(region_idx);
     region_idx += 1;
 
     let expected_pk_sz = count * pk_stride;
@@ -420,7 +420,7 @@ fn decode_wal_block_impl(
     let nulls: Vec<u64> = read_64bit_region(data, null_off, null_sz, count, "nulls")?;
 
     // Blob region (always last)
-    let (blob_off, blob_sz) = dir[num_regions - 1];
+    let (blob_off, blob_sz) = dir(num_regions - 1);
     let blob = if blob_sz > 0 {
         &data[blob_off..blob_off + blob_sz]
     } else {
@@ -437,7 +437,7 @@ fn decode_wal_block_impl(
         }
 
         let payload_idx = schema.payload_idx(ci);
-        let (reg_off, reg_sz) = dir[region_idx];
+        let (reg_off, reg_sz) = dir(region_idx);
         region_idx += 1;
 
         // STRING/BLOB/U128 regions are all 16 bytes/row; validate that once.
@@ -528,10 +528,7 @@ mod tests {
 
     /// Return the `(offset, size)` of a region from a block's directory.
     fn get_region_offset_size(block: &[u8], region_idx: usize) -> (usize, usize) {
-        let base = WAL_BLOCK_HEADER_SIZE + region_idx * 8;
-        let off = u32::from_le_bytes(block[base..base + 4].try_into().unwrap()) as usize;
-        let sz = u32::from_le_bytes(block[base + 4..base + 8].try_into().unwrap()) as usize;
-        (off, sz)
+        gnitz_wire::wal::dir_entry(block, region_idx)
     }
 
     fn u64_schema() -> Schema {

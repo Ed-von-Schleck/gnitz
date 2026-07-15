@@ -11,7 +11,7 @@ use xorf::Xor8;
 
 use super::shard_file::DecodedRegion;
 #[cfg(test)]
-use crate::foundation::codec::{read_i64_le, read_u64_le, write_u64_le};
+use crate::foundation::codec::{as_le_bytes, read_i64_le, read_u64_le, write_u64_le};
 
 mod access;
 mod open;
@@ -144,12 +144,12 @@ mod tests {
         let null_bm: Vec<u64> = vec![0; pks.len()];
         let blob: Vec<u8> = Vec::new();
 
-        let regions: Vec<(*const u8, usize)> = vec![
-            (pk_bytes.as_ptr(), pk_bytes.len()),
-            (wts.as_ptr() as *const u8, wts.len() * 8),
-            (null_bm.as_ptr() as *const u8, null_bm.len() * 8),
-            (vals.as_ptr() as *const u8, vals.len() * 8),
-            (blob.as_ptr(), blob.len()),
+        let regions: Vec<&[u8]> = vec![
+            &pk_bytes,
+            as_le_bytes(wts),
+            as_le_bytes(&null_bm),
+            as_le_bytes(vals),
+            &blob,
         ];
 
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
@@ -697,12 +697,12 @@ mod tests {
         let null_bm: Vec<u64> = vec![0; pks.len()];
         let blob: Vec<u8> = Vec::new();
 
-        let regions: Vec<(*const u8, usize)> = vec![
-            (pk_bytes.as_ptr(), pk_bytes.len()),
-            (weights.as_ptr() as *const u8, weights.len() * 8),
-            (null_bm.as_ptr() as *const u8, null_bm.len() * 8),
-            (vals.as_ptr() as *const u8, vals.len() * 8),
-            (blob.as_ptr(), blob.len()),
+        let regions: Vec<&[u8]> = vec![
+            &pk_bytes,
+            as_le_bytes(&weights),
+            as_le_bytes(&null_bm),
+            as_le_bytes(vals),
+            &blob,
         ];
 
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
@@ -851,12 +851,7 @@ mod tests {
         let empty: Vec<u8> = Vec::new();
 
         // 4 regions: pk, weight, null_bmp, blob (num_payload_cols = 0).
-        let regions: Vec<(*const u8, usize)> = vec![
-            (pk_bytes.as_ptr(), pk_bytes.len()),
-            (weights.as_ptr() as *const u8, weights.len() * 8),
-            (null_bm.as_ptr() as *const u8, null_bm.len() * 8),
-            (empty.as_ptr(), 0),
-        ];
+        let regions: Vec<&[u8]> = vec![&pk_bytes, as_le_bytes(&weights), as_le_bytes(&null_bm), &empty];
         let path = dir.path().join("wide_pk.db");
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
         super::super::shard_file::write_shard_streaming(
@@ -924,12 +919,7 @@ mod tests {
         let null_bm: Vec<u64> = vec![0; count as usize];
         let empty: Vec<u8> = Vec::new();
         // 4 regions: pk, weight, null_bmp, blob (num_payload_cols = 0).
-        let regions: Vec<(*const u8, usize)> = vec![
-            (pk_bytes.as_ptr(), pk_bytes.len()),
-            (weights.as_ptr() as *const u8, weights.len() * 8),
-            (null_bm.as_ptr() as *const u8, null_bm.len() * 8),
-            (empty.as_ptr(), 0),
-        ];
+        let regions: Vec<&[u8]> = vec![&pk_bytes, as_le_bytes(&weights), as_le_bytes(&null_bm), &empty];
         let path = dir.path().join("wide_const.db");
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
         super::super::shard_file::write_shard_streaming(
@@ -1036,11 +1026,9 @@ mod tests {
         // payload region against the control.
         let pb = packed.to_owned_batch(&schema);
         let rb = raw.to_owned_batch(&schema);
-        let (pp, ps) = pb.regions()[REG_PAYLOAD_START];
-        let (rp, rs) = rb.regions()[REG_PAYLOAD_START];
-        assert_eq!(ps, rs);
-        let pbytes = unsafe { std::slice::from_raw_parts(pp, ps) };
-        let rbytes = unsafe { std::slice::from_raw_parts(rp, rs) };
+        let pbytes = pb.regions()[REG_PAYLOAD_START];
+        let rbytes = rb.regions()[REG_PAYLOAD_START];
+        assert_eq!(pbytes.len(), rbytes.len());
         assert_eq!(pbytes, rbytes, "to_owned_batch payload region byte-identical");
 
         // Surface 4 (to_unified): read the payload ColPtr per row.
@@ -1158,12 +1146,12 @@ mod tests {
             let nulls = vec![0u64; n as usize];
             let vals: Vec<u32> = (0..n).map(|i| i % 50000).collect();
             let blob: Vec<u8> = Vec::new();
-            let regions: Vec<(*const u8, usize)> = vec![
-                (pks.as_ptr(), pks.len()),
-                (weights.as_ptr() as *const u8, weights.len() * 8),
-                (nulls.as_ptr() as *const u8, nulls.len() * 8),
-                (vals.as_ptr() as *const u8, vals.len() * 4),
-                (blob.as_ptr(), 0),
+            let regions: Vec<&[u8]> = vec![
+                &pks,
+                as_le_bytes(&weights),
+                as_le_bytes(&nulls),
+                as_le_bytes(&vals),
+                &blob,
             ];
             let path = dir.path().join(name);
             let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();

@@ -119,6 +119,19 @@ pub fn stamp_checksum(block: &mut [u8], total_size: usize) {
     }
 }
 
+/// Read the `(offset, size)` directory entry for region `r`, both relative to
+/// block start. Unchecked — panics on a slice error, so the caller must already
+/// know the block covers its full directory: production decoders reach the
+/// directory through [`validate_and_parse`] (which bounds every entry), and the
+/// remaining callers are the 1-row control-block reader (each region size-guarded
+/// on use) and the malformed-block tests that patch a directory byte. The one
+/// place the entry layout (`WAL_HEADER_SIZE + r*8`, offset then size) is spelled out.
+#[inline]
+pub fn dir_entry(block: &[u8], r: usize) -> (usize, usize) {
+    let base = WAL_HEADER_SIZE + r * 8;
+    (read_u32_le(block, base) as usize, read_u32_le(block, base + 4) as usize)
+}
+
 /// Header fields of a validated WAL block, as returned by
 /// [`validate_and_parse`].
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]

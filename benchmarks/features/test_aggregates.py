@@ -9,17 +9,13 @@ from __future__ import annotations
 
 import random
 
-from helpers.datagen import (FEATURE_SIZES, SHIPMODES, STATUS, push_stream,
+from helpers.datagen import (SHIPMODES, STATUS, feature_sz, push_stream,
                              seed_stream, stream_and_assert)
 
 _E_DDL = ("CREATE TABLE e (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL, "
           "g1 BIGINT NOT NULL, g2 BIGINT NOT NULL, flag TEXT NOT NULL, "
           "flag2 TEXT NOT NULL, g BIGINT NOT NULL, price BIGINT NOT NULL, "
           "disc DOUBLE NOT NULL)")
-
-
-def _sz(scale_mode):
-    return FEATURE_SIZES[scale_mode]
 
 
 def _e_row(batch, pk, w):
@@ -46,25 +42,25 @@ def _run(client, sn, bench_timer, view_ddls, read_view, sz):
 def test_global(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer, [
         "CREATE VIEW v AS SELECT SUM(v) AS s, COUNT(*) AS n, MIN(v) AS mn, MAX(v) AS mx FROM e",
-    ], "v", _sz(scale_mode))
+    ], "v", feature_sz(scale_mode))
 
 
 def test_multi_group(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer, [
         "CREATE VIEW v AS SELECT g1, g2, SUM(v) AS s FROM e GROUP BY g1, g2",
-    ], "v", _sz(scale_mode))
+    ], "v", feature_sz(scale_mode))
 
 
 def test_group_string(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer, [
         "CREATE VIEW v AS SELECT flag, SUM(v) AS s, COUNT(*) AS n FROM e GROUP BY flag",
-    ], "v", _sz(scale_mode))
+    ], "v", feature_sz(scale_mode))
 
 
 def test_group_two_string(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer, [
         "CREATE VIEW v AS SELECT flag, flag2, SUM(v) AS s FROM e GROUP BY flag, flag2",
-    ], "v", _sz(scale_mode))
+    ], "v", feature_sz(scale_mode))
 
 
 def test_sum_inner_expr(client, schema_name, bench_timer, scale_mode):
@@ -73,4 +69,4 @@ def test_sum_inner_expr(client, schema_name, bench_timer, scale_mode):
     _run(client, schema_name, bench_timer, [
         "CREATE VIEW vb AS SELECT pk AS id, g, price * (1 - disc) AS net FROM e",
         "CREATE VIEW vg AS SELECT g, SUM(net) AS rev FROM vb GROUP BY g",
-    ], "vg", _sz(scale_mode))
+    ], "vg", feature_sz(scale_mode))

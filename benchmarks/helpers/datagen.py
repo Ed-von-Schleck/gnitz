@@ -35,6 +35,11 @@ FEATURE_SIZES = {
     "full": {"dim": 200_000, "base": 1_000_000, "delta": 4_000, "iters": 50},
 }
 
+
+def feature_sz(scale_mode):
+    """The feature-tier row count for the active scale (`quick`/`full`)."""
+    return FEATURE_SIZES[scale_mode]
+
 # TPC-H-subset sizing (combined/test_tpch.py). `sf` scales the base; `delta` is
 # the streamed rows/iter; `skew_s` is the Zipfian exponent on hot FKs.
 TPCH_SIZES = {

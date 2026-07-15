@@ -86,6 +86,29 @@ class BenchTimer:
         )
 
 
+def run_pool(specs, *, timeout: float = 300.0) -> list[dict]:
+    """Fork one process per `(worker_fn, args)` spec behind a shared barrier,
+    then drain every worker's result before joining.
+
+    Each `worker_fn` is invoked as `worker_fn(*args, barrier, queue)`: it should
+    `barrier.wait()` to sync the start, do its work, and `queue.put(result_dict)`
+    exactly once. Draining before join is required — a child blocks on `put()`
+    once the pipe fills, so joining first can deadlock on large result payloads.
+
+    Returns the per-worker result dicts (order not significant); the caller
+    aggregates them.
+    """
+    barrier = multiprocessing.Barrier(len(specs))
+    queue: multiprocessing.Queue = multiprocessing.Queue()
+    procs = [multiprocessing.Process(target=fn, args=(*args, barrier, queue)) for fn, args in specs]
+    for p in procs:
+        p.start()
+    parts = [queue.get() for _ in specs]
+    for p in procs:
+        p.join(timeout=timeout)
+    return parts
+
+
 def _rmw_worker(socket_path, sql, schema_name, ops, retry, barrier, queue):
     """Child: run `ops` autocommit RMW statements, counting commits/conflicts."""
     import gnitz
@@ -133,22 +156,9 @@ def run_contended_rmw(
 
     Returns {commits, retries, conflicts, latencies_ms, elapsed_s}.
     """
-    barrier = multiprocessing.Barrier(n_clients)
-    queue: multiprocessing.Queue = multiprocessing.Queue()
-    procs = [
-        multiprocessing.Process(
-            target=_rmw_worker,
-            args=(socket_path, sql, schema_name, ops_per_client, retry, barrier, queue),
-        )
-        for _ in range(n_clients)
-    ]
-    for p in procs:
-        p.start()
-    # Drain before join: a child blocks on put() if the pipe fills, so joining
-    # first could deadlock on large latency lists.
-    parts = [queue.get() for _ in range(n_clients)]
-    for p in procs:
-        p.join(timeout=300)
+    parts = run_pool(
+        [(_rmw_worker, (socket_path, sql, schema_name, ops_per_client, retry)) for _ in range(n_clients)]
+    )
     return {
         "commits": sum(r["commits"] for r in parts),
         "retries": sum(r["retries"] for r in parts),

@@ -9,14 +9,10 @@ just-ACKed write (RYOW freshness) and its drain lands in the measured tail.
 
 from __future__ import annotations
 
-from helpers.datagen import FEATURE_SIZES, push_one, push_stream
+from helpers.datagen import feature_sz, push_one, push_stream
 
 NGROUP = 1000
 READS = {"quick": 500, "full": 5000}
-
-
-def _sz(scale_mode):
-    return FEATURE_SIZES[scale_mode]
 
 
 def _reads(scale_mode):
@@ -28,7 +24,7 @@ def _reads(scale_mode):
 # ---------------------------------------------------------------------------
 
 def test_view_scan(client, schema_name, bench_timer, scale_mode):
-    sn, sz = schema_name, _sz(scale_mode)
+    sn, sz = schema_name, feature_sz(scale_mode)
     client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
                        "g BIGINT NOT NULL, v BIGINT NOT NULL)", schema_name=sn)
     client.execute_sql("CREATE VIEW v AS SELECT g, SUM(v) AS s FROM t GROUP BY g",
@@ -47,7 +43,7 @@ def test_view_scan(client, schema_name, bench_timer, scale_mode):
 # ---------------------------------------------------------------------------
 
 def test_view_seek_natural(client, schema_name, bench_timer, scale_mode):
-    sn, sz = schema_name, _sz(scale_mode)
+    sn, sz = schema_name, feature_sz(scale_mode)
     client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
                        "cust BIGINT UNSIGNED NOT NULL, amt BIGINT NOT NULL)", schema_name=sn)
     # Group column `cust` is single non-nullable U64 → natural PK, seek-addressable.
@@ -72,7 +68,7 @@ def test_view_seek_natural(client, schema_name, bench_timer, scale_mode):
 # ---------------------------------------------------------------------------
 
 def test_view_passthrough_seek(client, schema_name, bench_timer, scale_mode):
-    sn, sz = schema_name, _sz(scale_mode)
+    sn, sz = schema_name, feature_sz(scale_mode)
     client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
                        schema_name=sn)
     client.execute_sql("CREATE VIEW v AS SELECT * FROM t WHERE v >= 0", schema_name=sn)
@@ -93,7 +89,7 @@ def test_view_passthrough_seek(client, schema_name, bench_timer, scale_mode):
 # ---------------------------------------------------------------------------
 
 def test_seek_by_index(client, schema_name, bench_timer, scale_mode):
-    sn, sz = schema_name, _sz(scale_mode)
+    sn, sz = schema_name, feature_sz(scale_mode)
     client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
                        "val BIGINT NOT NULL, payload BIGINT NOT NULL)", schema_name=sn)
     tid, schema = client.resolve_table(sn, "t")
@@ -128,8 +124,8 @@ def _scan_many_n(client, sn, bench_timer, sz, reads, nviews):
 
 
 def test_scan_many_2(client, schema_name, bench_timer, scale_mode):
-    _scan_many_n(client, schema_name, bench_timer, _sz(scale_mode), _reads(scale_mode), 2)
+    _scan_many_n(client, schema_name, bench_timer, feature_sz(scale_mode), _reads(scale_mode), 2)
 
 
 def test_scan_many_8(client, schema_name, bench_timer, scale_mode):
-    _scan_many_n(client, schema_name, bench_timer, _sz(scale_mode), _reads(scale_mode), 8)
+    _scan_many_n(client, schema_name, bench_timer, feature_sz(scale_mode), _reads(scale_mode), 8)
