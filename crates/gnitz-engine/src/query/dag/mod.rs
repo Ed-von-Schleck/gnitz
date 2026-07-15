@@ -127,6 +127,14 @@ impl RelationKind {
     pub fn is_base_table(self) -> bool {
         matches!(self, RelationKind::BaseTable { .. })
     }
+
+    /// True iff this is a materialised view. Gates the read-your-writes drain: a
+    /// view derives from source pushes through the DAG, so a read must flush
+    /// pending ticks first; base tables and the system catalog never do.
+    #[inline]
+    pub fn is_view(self) -> bool {
+        matches!(self, RelationKind::View)
+    }
 }
 
 // ---------------------------------------------------------------------------

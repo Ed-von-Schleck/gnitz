@@ -382,11 +382,12 @@ impl Session {
     /// Pack a SCAN_MULTI request (control-only), stamping each relation with its
     /// cached schema version. The whole self-contained frame body rides the
     /// `ctrl` segment; the matching receiver reads N `recv_scan` trains in
-    /// request order. Performs NO shape validation of its own: the async driver
+    /// request order. Performs no shape validation of its own: the async driver
     /// validates one level up (`PyAsyncTransport::scan_many` calls
     /// [`gnitz_wire::validate_scan_multi_tids`] before enqueue), so by the time
     /// this is reached `tids` is already a non-empty, duplicate-free list within
-    /// `1..=SCAN_MULTI_MAX_RELATIONS`.
+    /// `1..=SCAN_MULTI_MAX_RELATIONS`. The shared `encode_scan_multi_frame`
+    /// debug-asserts that same contract for every encode route.
     pub fn pack_scan_multi(&self, tids: &[u64]) -> MessageParts {
         MessageParts {
             ctrl: self.encode_scan_multi_frame(tids),
@@ -444,6 +445,15 @@ impl Session {
     /// version. Shared by the sync `scan_multi` (which sends it) and the async
     /// `pack_scan_multi` (which wraps it as the control segment).
     fn encode_scan_multi_frame(&self, tids: &[u64]) -> Vec<u8> {
+        // The one choke point both encode routes funnel through, so the wire-shape
+        // contract is debug-asserted here. The load-bearing case is the empty list:
+        // it encodes a count=0 frame whose lone server error frame the N=0 read
+        // loop never consumes, permanently shifting every later read on this
+        // connection by one frame.
+        debug_assert!(
+            gnitz_wire::validate_scan_multi_tids(tids).is_ok(),
+            "encode_scan_multi_frame: {tids:?} violates the SCAN_MULTI wire shape and would desync the connection"
+        );
         let relations: Vec<(u64, u16)> = tids.iter().map(|&tid| (tid, self.cached_schema_version(tid))).collect();
         encode_scan_multi(self.client_id, &relations)
     }

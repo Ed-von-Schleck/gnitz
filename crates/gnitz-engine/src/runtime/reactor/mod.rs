@@ -72,7 +72,7 @@ pub use exchange::{ExchangeAccumulator, PendingRelay};
 pub use io::RecvBuf;
 #[cfg(test)]
 pub use sync::join2;
-pub use sync::{join_all_unpin, join_into, mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either};
+pub use sync::{join_all_unpin, join_into, mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either, ReadGuard};
 
 // ---------------------------------------------------------------------------
 // CQE user_data encoding (high 8 bits = kind, low 56 bits = id)

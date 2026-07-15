@@ -36,7 +36,8 @@ use crate::runtime::master::{
 };
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{
-    join_into, mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either, FsyncFuture, PendingRelay, Reactor, ReplyFuture,
+    join_into, mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either, FsyncFuture, PendingRelay, Reactor, ReadGuard,
+    ReplyFuture,
 };
 use crate::runtime::wire::{
     self as ipc, SchemaWithVersion, FLAG_GET_INDICES, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
@@ -969,7 +970,9 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
 
     // ---------- SELECTs (SEEK / SEEK_BY_INDEX / SCAN) ----------
     if flags & FLAG_SEEK != 0 {
-        let _g = shared.catalog_rwlock.read().await;
+        // No dispatch-level read lock: `handle_seek` owns its locking so a view
+        // seek can release it to drain pending ticks (BF-1). The other seek arms
+        // are base-table-only and keep their dispatch lock.
         handle_seek(
             shared,
             peer,
@@ -1160,6 +1163,12 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
     // Fallthrough: ignore (should not happen).
 }
 
+/// Serve a `FLAG_SEEK` point lookup (the dispatch arm releases the read lock
+/// before calling, so this owns its own locking). A base-table or system seek is
+/// the RMW hot path: base state is fresh at push-apply time, so it classifies and
+/// serves under one read lock and never drains. A view seek instead drops the
+/// lock, drains pending ticks with NO lock held (BF-1), then re-locks and
+/// re-checks — giving it the same read-your-writes freshness a view scan has.
 async fn handle_seek(
     shared: &Rc<Shared>,
     peer: &Peer,
@@ -1169,10 +1178,55 @@ async fn handle_seek(
     seek_pk_extra: &[u8],
     client_version: u16,
 ) {
-    if reject_unknown_table(shared, peer, client_id, target_id).await {
-        return;
+    // Base table / system: classify and serve under one read lock (`cat()`
+    // aliases the catalog; the lock excludes a concurrent DDL writer). Only a
+    // view needs the drop-drain-reacquire dance, so the hot path locks once.
+    // `is_some_and` ends the `dag.tables` borrow before any await.
+    {
+        let _g = shared.catalog_rwlock.read().await;
+        if reject_unknown_table(shared, peer, client_id, target_id).await {
+            return;
+        }
+        let is_view = shared
+            .cat()
+            .dag
+            .tables
+            .get(&target_id)
+            .is_some_and(|e| e.kind.is_view());
+        if !is_view {
+            serve_seek(shared, peer, client_id, target_id, pk, seek_pk_extra, client_version).await;
+            return;
+        }
     }
-    if target_id >= FIRST_USER_TABLE_ID {
+
+    // View: drain with NO catalog lock held (BF-1), then re-lock and re-check
+    // existence — a DDL may have dropped the view during the drain.
+    let Some(_g) = drain_then_lock(shared, peer, client_id, target_id).await else {
+        return;
+    };
+    serve_seek(shared, peer, client_id, target_id, pk, seek_pk_extra, client_version).await;
+}
+
+/// Serve a point lookup with the catalog read lock already held: a system tid
+/// reads the catalog directly; a user tid (base table or view) fans out to the
+/// owning worker by PK hash. SEEK unicasts to one worker, so no replicated fork.
+async fn serve_seek(
+    shared: &Rc<Shared>,
+    peer: &Peer,
+    client_id: u64,
+    target_id: i64,
+    pk: u128,
+    seek_pk_extra: &[u8],
+    client_version: u16,
+) {
+    if target_id < FIRST_USER_TABLE_ID {
+        match unsafe { (*shared.catalog).seek_family(target_id, pk, seek_pk_extra) } {
+            Ok((batch, _)) => {
+                send_ok_response(shared, peer, target_id, batch.as_ref(), client_id, pk, client_version).await
+            }
+            Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
+        }
+    } else {
         match MasterDispatcher::fan_out_seek_async(
             shared.dispatcher,
             &shared.reactor,
@@ -1184,13 +1238,6 @@ async fn handle_seek(
         .await
         {
             Ok(slot) => peer.send_slot_or_close(slot).await,
-            Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
-        }
-    } else {
-        match unsafe { (*shared.catalog).seek_family(target_id, pk, seek_pk_extra) } {
-            Ok((batch, _)) => {
-                send_ok_response(shared, peer, target_id, batch.as_ref(), client_id, pk, client_version).await
-            }
             Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
         }
     }
@@ -1623,21 +1670,43 @@ async fn handle_get_indices(shared: &Rc<Shared>, peer: &Peer, client_id: u64, ta
     peer.send_buffer_or_close(buf).await;
 }
 
-/// Drain all pending view ticks before a read. Views derive from source-table
-/// pushes through the DAG (IV.2), so a scan must first flush any in-flight
-/// auto-tick: send a `Drain` trigger unconditionally — even when `tick_tids`
+/// Drain every pending view tick before a read, returning with NO catalog lock
+/// held. Views derive from source-table pushes through the DAG (IV.2), so a read
+/// must first flush any in-flight auto-tick.
+///
+/// Fast path: if `last_tick_lsn >= lsn_alloc.published()`, every published —
+/// hence every ACKed — commit is already reflected in all views, so return
+/// without a drain. Sound because `run_tick` snapshots `published()` into
+/// `last_tick_lsn` before any `.await`, atomically with the tid set it drains,
+/// while the committer bumps `tick_tids` before it publishes the zone LSN before
+/// it ACKs the push. So `last_tick_lsn >= L` ⇒ L's tid was in some completed
+/// tick's drained set ⇒ L is reflected. The test can under-report (one extra
+/// drain) but never over-report (a stale read). Cross-client causality holds:
+/// any un-ticked published commit forces `last_tick_lsn < published()`, so the
+/// full drain runs — including serializing behind an in-flight auto-tick, which
+/// has not yet advanced `last_tick_lsn`.
+///
+/// Slow path: send a `Drain` trigger unconditionally — even when `tick_tids`
 /// looks empty — and await its ack, repeating until nothing new queued during
 /// the wait (the re-check keeps a push that arrives mid-drain from slipping
-/// past). The tick loop processes triggers serially, so awaiting `done`
-/// serializes behind a concurrent Auto; without it a large push fires Auto
-/// asynchronously and the scan could read before the tick body finishes,
-/// leaving the view apparently empty until the next scan.
+/// past; the tick loop drains the live `tick_tids` and unions each Drain
+/// trigger's snapshot on top). The tick loop processes triggers serially, so
+/// awaiting `done` serializes behind a concurrent Auto; without it a large push
+/// fires Auto asynchronously and the read could observe the view before the tick
+/// body finishes, leaving it apparently empty until the next read.
 ///
 /// MUST be called BEFORE taking the catalog read lock: the drain parks at
 /// `rx.await`, and the writer-preferring `AsyncRwLock` held across that park
 /// would block DDL writers and `tick_loop_async`'s own read lock — a three-way
-/// deadlock (BF-1).
+/// deadlock (BF-1). Under an unbounded concurrent write storm the loop can
+/// iterate for the storm's duration (each pass sees `tick_tids` non-empty); the
+/// caller's own ACKed writes are covered after pass 1. View seeks confine this
+/// to views — base-table seeks never call it.
 async fn drain_pending_ticks(shared: &Rc<Shared>) {
+    // Fast path: views already reflect every ACKed commit (see above).
+    if shared.last_tick_lsn.get() >= shared.lsn_alloc.published() {
+        return;
+    }
     loop {
         let snapshot: Vec<i64> = shared.tick_tids.borrow().clone();
         let was_empty = snapshot.is_empty();
@@ -1651,6 +1720,20 @@ async fn drain_pending_ticks(shared: &Rc<Shared>) {
             break;
         }
     }
+}
+
+/// Drain pending view ticks, then take the catalog read lock and re-check the
+/// target still exists (a DDL may have dropped it during the drain). Returns the
+/// held guard, or `None` if the target was rejected (error already sent). Encodes
+/// the BF-1 ordering — drain BEFORE the lock — in one place; shared by
+/// `handle_scan` and `handle_seek`'s view path.
+async fn drain_then_lock(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64) -> Option<ReadGuard> {
+    drain_pending_ticks(shared).await;
+    let g = shared.catalog_rwlock.read().await;
+    if reject_unknown_table(shared, peer, client_id, target_id).await {
+        return None;
+    }
+    Some(g)
 }
 
 /// A scan's captured preliminary schema frame content: `(wire block,
@@ -1687,11 +1770,9 @@ fn build_prelim_schema_frame(tid: i64, client_id: u64, server_version: u16, bloc
 }
 
 async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64, client_version: u16) {
-    drain_pending_ticks(shared).await;
-    let _g = shared.catalog_rwlock.read().await;
-    if reject_unknown_table(shared, peer, client_id, target_id).await {
+    let Some(_g) = drain_then_lock(shared, peer, client_id, target_id).await else {
         return;
-    }
+    };
     let lsn = shared.last_tick_lsn.get();
 
     // On a schema-cache miss, master sends one preliminary schema-only frame
