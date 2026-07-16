@@ -234,7 +234,7 @@ impl CatalogEngine {
     /// manifest per launched worker; a hashed store spreads over all 256 partitions.
     pub fn compute_invalid_views(&mut self, launched_workers: u32) -> FxHashSet<i64> {
         let g = crate::foundation::worker_ctx::committed_generation();
-        let topo_value = ((launched_workers as u64) << 32) | crate::storage::STATE_FORMAT as u64;
+        let topo_value = crate::storage::topology_word(launched_workers);
         let topo_valid = self.recorded_topology == topo_value;
 
         let view_ids: Vec<i64> = self

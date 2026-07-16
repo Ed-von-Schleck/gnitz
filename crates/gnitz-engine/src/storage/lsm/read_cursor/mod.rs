@@ -773,7 +773,7 @@ impl ReadCursor {
         let row = self.current_row;
 
         match src {
-            CursorSource::Shard(s) => s.col_ptr_by_logical(row, col_idx, col_size),
+            CursorSource::Shard(s) => s.col_ptr_by_logical(row, col_idx, col_size, &self.schema),
             CursorSource::Batch(b) => {
                 // Map logical → payload index. A PK column has no payload slot
                 // (the `is_pk_col` early-return above already covers it, but the

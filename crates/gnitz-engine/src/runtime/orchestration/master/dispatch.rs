@@ -54,11 +54,11 @@ impl MasterDispatcher {
         }
     }
 
-    /// Boot-time SAL reset: cursor 0, epoch 1 (the first live epoch —
-    /// epoch 0 is the empty-slot sentinel prefix). Sole caller is
-    /// `server_main` after all workers finish recovery.
+    /// Boot-time SAL reset: sentinel prefix cleared, cursor 0, epoch 1 (the
+    /// first live epoch — epoch 0 is the empty-slot sentinel prefix). Sole
+    /// caller is `server_main` after all workers finish recovery.
     pub fn reset_sal(&mut self) {
-        self.sal.reset(0, 1);
+        self.sal.boot_reset();
     }
 
     pub(super) fn get_schema_and_names(&mut self, target_id: i64) -> (SchemaDescriptor, Rc<Vec<Vec<u8>>>) {
@@ -83,7 +83,7 @@ impl MasterDispatcher {
             .get_schema_desc(target_id)
             .unwrap_or_else(|| panic!("master: no schema for target_id={target_id}"));
         let e = crate::runtime::wire::get_or_build_schema_wire_block(cat, target_id, &schema);
-        (schema, e.block, e.wire_safe, e.wire_row_fixed_stride)
+        (schema, e.entry.block, e.entry.wire_safe, e.entry.wire_row_fixed_stride)
     }
 
     pub(super) fn pool_pop_batch(&mut self, id: i64) -> Option<Batch> {
@@ -196,8 +196,6 @@ impl MasterDispatcher {
         schema: &SchemaDescriptor,
         col_names: &[Vec<u8>],
         seek_pk: u128,
-        seek_col_idx: u64,
-        request_id: u64,
         prebuilt_schema_block: Option<&[u8]>,
     ) -> Result<(), String> {
         let (name_refs, n) = col_names_as_refs(col_names);
@@ -211,44 +209,26 @@ impl MasterDispatcher {
             target_id as u32,
             lsn,
             sal_flags,
-            0,
             batch,
             schema,
             col_names_opt,
             seek_pk,
-            seek_col_idx,
-            request_id,
             prebuilt_schema_block,
         )
     }
 
-    /// Encode once, write to all workers, signal (no fdatasync).
+    /// Control-only broadcast: write to all workers, signal (no fdatasync).
     /// `lsn` as in `write_broadcast`.
-    #[allow(clippy::too_many_arguments)]
     fn send_broadcast(
         &mut self,
         target_id: i64,
         lsn: u64,
         flags: u32,
-        batch: Option<&Batch>,
         schema: &SchemaDescriptor,
         col_names: &[Vec<u8>],
         seek_pk: u128,
-        seek_col_idx: u64,
-        request_id: u64,
     ) -> Result<(), String> {
-        self.write_broadcast(
-            target_id,
-            lsn,
-            flags,
-            batch,
-            schema,
-            col_names,
-            seek_pk,
-            seek_col_idx,
-            request_id,
-            None,
-        )?;
+        self.write_broadcast(target_id, lsn, flags, None, schema, col_names, seek_pk, None)?;
         self.signal_all();
         Ok(())
     }
@@ -473,7 +453,7 @@ impl MasterDispatcher {
     /// latch it via `set_committed_generation`); the base round passes 0.
     fn sync_flush_round(&mut self, lsn: u64, flags: u32) -> Result<(), String> {
         let schema = SchemaDescriptor::minimal_u64();
-        self.send_broadcast(0, lsn, flags, None, &schema, &[], 0, 0, 0)?;
+        self.send_broadcast(0, lsn, flags, &schema, &[], 0)?;
         self.collect_acks()
     }
 
@@ -601,10 +581,10 @@ impl MasterDispatcher {
             None
         };
 
-        let dest_batches = if range_n_eq == Some(0) {
+        let dest = if range_n_eq == Some(0) {
             // Pure range join: broadcast the full delta to every worker.
             let sources: Vec<Option<&Batch>> = payloads.iter().map(|o| o.as_ref()).collect();
-            op_relay_broadcast(&sources, &schema, self.num_workers)
+            RelayDest::Broadcast(Box::new(op_relay_broadcast(&sources, &schema)))
         } else {
             // Scatter. Band join (range_n_eq == Some(n_eq ≥ 1)): route by the eq
             // prefix shard_cols[..n_eq]. Equi-join: full shard cols. Both
@@ -636,7 +616,7 @@ impl MasterDispatcher {
                     Some(_) => None,
                 })
                 .collect();
-            match consolidated_sources {
+            RelayDest::PerWorker(match consolidated_sources {
                 Some(sources) => op_relay_scatter_consolidated_mode(
                     &sources,
                     &col_indices,
@@ -649,7 +629,7 @@ impl MasterDispatcher {
                     let sources: Vec<Option<&Batch>> = payloads.iter().map(|o| o.as_ref()).collect();
                     op_repartition_batches_mode(&sources, &col_indices, route_tcs, &schema, self.num_workers, mode)
                 }
-            }
+            })
         };
 
         let (_, name_bytes) = self.get_schema_and_names(view_id);
@@ -657,7 +637,7 @@ impl MasterDispatcher {
         Ok(RelayPrepared {
             view_id,
             source_id,
-            dest_batches,
+            dest,
             schema,
             name_bytes,
         })
@@ -680,14 +660,19 @@ impl MasterDispatcher {
         let RelayPrepared {
             view_id,
             source_id,
-            dest_batches,
+            dest,
             schema,
             name_bytes,
         } = prep;
-        let refs: Vec<Option<&Batch>> = dest_batches
-            .iter()
-            .map(|b| if b.count > 0 { Some(b) } else { None })
-            .collect();
+        let refs: Vec<Option<&Batch>> = match &dest {
+            RelayDest::PerWorker(batches) => batches
+                .iter()
+                .map(|b| if b.count > 0 { Some(b) } else { None })
+                .collect(),
+            // One shared batch, referenced by every worker slot — the SAL
+            // group write re-encodes per slot regardless.
+            RelayDest::Broadcast(b) => vec![if b.count > 0 { Some(b) } else { None }; self.num_workers],
+        };
         // Echo `source_id` back via `seek_pk` so the worker's `do_exchange_wait`
         // can match on (view_id, source_id). Without this, a multi-source view
         // (join over 2+ tables) can deliver the wrong source's relay to a
@@ -777,17 +762,7 @@ impl MasterDispatcher {
     pub fn fan_out_backfill(&mut self, view_id: i64, source_id: i64) -> Result<(), String> {
         self.maybe_checkpoint()?;
         let (schema, col_names) = self.get_schema_and_names(source_id);
-        self.send_broadcast(
-            source_id,
-            0,
-            FLAG_BACKFILL,
-            None,
-            &schema,
-            &col_names,
-            view_id as u128,
-            0,
-            0,
-        )?;
+        self.send_broadcast(source_id, 0, FLAG_BACKFILL, &schema, &col_names, view_id as u128)?;
         self.collect_acks_and_relay(true)
     }
 
@@ -1222,8 +1197,6 @@ impl MasterDispatcher {
             &schema,
             &[],
             0,
-            0,
-            0,
             Some(schema_block.as_slice()),
         )?;
         self.signal_all();
@@ -1314,7 +1287,7 @@ impl MasterDispatcher {
     /// worker processes.
     pub fn shutdown_workers(&mut self) {
         let schema = SchemaDescriptor::minimal_u64();
-        let _ = self.send_broadcast(0, 0, FLAG_SHUTDOWN, None, &schema, &[], 0, 0, 0);
+        let _ = self.send_broadcast(0, 0, FLAG_SHUTDOWN, &schema, &[], 0);
         for w in 0..self.num_workers {
             let pid = self.worker_pids[w];
             if pid > 0 {
@@ -1397,15 +1370,12 @@ impl MasterDispatcher {
                 batch,
                 worker_indices,
                 &schema,
-                None,
                 target_id as u32,
                 lsn,
                 FLAG_PUSH,
                 wire_flags,
                 0,
-                0,
                 req_ids,
-                -1,
                 Some(schema_block.as_slice()),
                 Some((wire_safe, wire_row_stride)),
             )

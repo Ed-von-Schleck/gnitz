@@ -43,7 +43,7 @@ pub(super) fn reindex_hash_row(out_schema: &SchemaDescriptor, output: &mut Batch
             hasher.update(&[branch_id]);
             let null_word = mb.get_null_word(row);
             for (pi, _ci, col) in out_schema.payload_columns() {
-                let is_null = (null_word >> pi) & 1 != 0;
+                let is_null = crate::schema::null_bit(null_word, pi);
                 hasher.update(&[is_null as u8]);
                 if is_null {
                     continue;
@@ -526,23 +526,16 @@ mod tests {
         b.extend_pk(1u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
-        let mut gs0 = [0u8; 16];
-        gs0[0..4].copy_from_slice(&3u32.to_le_bytes());
-        gs0[4..7].copy_from_slice(b"foo");
+        let gs0 = crate::test_support::german_string(b"foo", &mut b.blob);
         b.extend_col(0, &gs0);
         b.count += 1;
 
         // Row 1: long string (15 bytes > SHORT_STRING_THRESHOLD=12), heap-allocated.
         let long_str: &[u8] = b"hello-world-xyz";
-        let heap_off = b.blob.len() as u64;
-        b.blob.extend_from_slice(long_str);
         b.extend_pk(2u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
-        let mut gs1 = [0u8; 16];
-        gs1[0..4].copy_from_slice(&(long_str.len() as u32).to_le_bytes());
-        gs1[4..8].copy_from_slice(&long_str[..4]); // prefix
-        gs1[8..16].copy_from_slice(&heap_off.to_le_bytes());
+        let gs1 = crate::test_support::german_string(long_str, &mut b.blob);
         b.extend_col(0, &gs1);
         b.count += 1;
 

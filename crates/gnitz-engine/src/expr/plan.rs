@@ -160,14 +160,12 @@ fn compute_blob_passthrough(in_schema: &SchemaDescriptor, col_moves: &[ColMove])
 #[derive(Default)]
 struct NullPerm {
     pairs: Vec<(u8, u8)>,
-    /// Bitmask of always-null payload positions (from EMIT_NULL).
-    constant: u64,
 }
 
 impl NullPerm {
     /// Build from the column moves (a PK source is skipped — the PK has no
-    /// null bit) and the always-NULL output payload positions.
-    fn new(col_moves: &[ColMove], null_payloads: &[u32]) -> Self {
+    /// null bit).
+    fn new(col_moves: &[ColMove]) -> Self {
         let pairs = col_moves
             .iter()
             .filter_map(|cm| match cm.src {
@@ -175,16 +173,12 @@ impl NullPerm {
                 ColumnLocator::Payload { slot, .. } => Some((slot, cm.dst_payload as u8)),
             })
             .collect();
-        let mut constant: u64 = 0;
-        for &null_pl in null_payloads {
-            constant |= 1u64 << null_pl;
-        }
-        NullPerm { pairs, constant }
+        NullPerm { pairs }
     }
 
     #[inline]
     fn apply(&self, in_null: u64) -> u64 {
-        let mut out: u64 = self.constant;
+        let mut out: u64 = 0;
         for &(src, dst) in &self.pairs {
             out |= ((in_null >> src) & 1) << dst;
         }
@@ -199,18 +193,12 @@ impl NullPerm {
             // Pure-compute map: nothing to permute. The output null region is
             // zeroed on every construction path (fresh alloc, `recycle_buf`
             // clear, `resize(size, 0)` re-zero), so an all-zero permutation is
-            // a no-op and a constant-only one fills the word without reading
-            // the input bitmap at all.
-            if self.constant != 0 {
-                for row in 0..n {
-                    out[row * 8..row * 8 + 8].copy_from_slice(&self.constant.to_le_bytes());
-                }
-            }
+            // a no-op.
             return;
         }
         for row in 0..n {
             let off = row * 8;
-            let in_null = u64::from_le_bytes(in_null_bmp[off..off + 8].try_into().unwrap());
+            let in_null = crate::foundation::codec::read_u64_le(in_null_bmp, off);
             out[off..off + 8].copy_from_slice(&self.apply(in_null).to_le_bytes());
         }
     }
@@ -300,7 +288,6 @@ impl ScalarFunc {
         // and no parallel-`Vec` bytecode re-walk.
         let out_stride = |payload: usize| out_schema.columns[out_schema.payload_col_idx(payload)].size();
         let mut col_moves: Vec<ColMove> = Vec::new();
-        let mut null_payloads: Vec<u32> = Vec::new();
         let mut emits: Vec<EmitCol> = Vec::new();
         for instr in &prog.instrs {
             match *instr {
@@ -314,15 +301,13 @@ impl ScalarFunc {
                     reg: src as usize,
                     stride: out_stride(out as usize),
                 }),
-                Instr::EmitNull { out } => null_payloads.push(out),
                 _ => {}
             }
         }
 
         // Null permutation: copied columns carry their source null bit (PK
-        // sources are skipped inside `NullPerm::new` — the PK has no null bit);
-        // EMIT_NULL columns are unconditionally null.
-        let null_perm = NullPerm::new(&col_moves, &null_payloads);
+        // sources are skipped inside `NullPerm::new` — the PK has no null bit).
+        let null_perm = NullPerm::new(&col_moves);
 
         // Compute is needed iff the program emits a computed register: every
         // compute instruction exists only to feed an EMIT.
@@ -502,8 +487,6 @@ impl ScalarFunc {
         for cm in col_moves {
             copy_column(in_batch, &mut output, cm, blob_cache.get_mut());
         }
-
-        // EMIT_NULL columns — already zero-filled by with_schema
 
         // Null bitmap (columnar) — written directly into the output buffer.
         // Split-borrow: `in_batch` and `output` are distinct allocations.

@@ -7,7 +7,7 @@ use crate::schema::SchemaDescriptor;
 use crate::storage::{partition_for_key, partition_for_pk_bytes, Batch, MemBatch};
 
 use super::super::reindex::ReindexPacker;
-use super::super::util::extract_group_key;
+use super::super::util::GroupKeyCols;
 
 // Thread-local pool: reuse Vec<Vec<u32>> index scratch across calls so
 // steady-state repartition/scatter ops allocate nothing for routing tables.
@@ -55,11 +55,12 @@ pub(crate) fn op_partition_filter(batch: &Batch, schema: &SchemaDescriptor, work
     let wid = worker_id as usize;
     let mb = batch.as_mem_batch();
 
-    // Keep just this worker's partitions, routed by the same `worker_for_partition`
-    // the equality scatter uses — no 256-entry table needed for a single worker.
+    // Keep just this worker's partitions, routed by the same partition→worker
+    // map the equality scatter uses (division hoisted out of the row loop).
+    let w_map = build_w_map(nw);
     let mut indices: Vec<u32> = Vec::with_capacity(n / nw + 1);
     for i in 0..n {
-        if worker_for_partition(partition_for_pk_bytes(mb.get_pk_bytes(i)), nw) == wid {
+        if w_map[partition_for_pk_bytes(mb.get_pk_bytes(i))] == wid {
             indices.push(i as u32);
         }
     }
@@ -96,31 +97,30 @@ pub(crate) enum RouteMode {
 ///   `buf` is the pack scratch; `pack_into` fully overwrites the `out_stride`
 ///   prefix it reads, so no inter-row clear is needed.
 /// - `Fold`: a `GroupKey` (GROUP BY / set-op) scatter routes by the
-///   null-distinct group fold `extract_group_key`, which `op_reduce` also uses
-///   for the group's output PK — the two must agree or the result is
-///   mis-gathered. `extract_group_key` keeps NULL distinct because a NULL group
-///   and a 0 group must not collide on one output PK; scatter routing has no
-///   such requirement, but local grouping (`compare_by_group_cols`) still
-///   separates co-located groups.
+///   null-distinct group fold — the baked [`GroupKeyCols`], byte-identical to
+///   `extract_group_key`, which `op_reduce` also uses for the group's output
+///   PK — the two must agree or the result is mis-gathered. The fold keeps
+///   NULL distinct because a NULL group and a 0 group must not collide on one
+///   output PK; scatter routing has no such requirement, but local grouping
+///   (`compare_by_group_cols`) still separates co-located groups.
 // One `ScatterKey` is built per scatter (a stack local) and read per row, so
 // the `ReindexPacker` and its scratch stay inline — boxing would add a heap
 // alloc and a per-row pointer chase for no benefit.
 #[allow(clippy::large_enum_variant)]
-pub(super) enum ScatterKey<'a> {
+pub(super) enum ScatterKey {
     PkBytes,
     Packed {
         packer: ReindexPacker,
         buf: [u8; gnitz_wire::MAX_PK_BYTES],
     },
     Fold {
-        cols: &'a [u32],
-        schema: &'a SchemaDescriptor,
+        keys: GroupKeyCols,
     },
 }
 
-impl<'a> ScatterKey<'a> {
+impl ScatterKey {
     #[inline]
-    pub(super) fn new(mode: RouteMode, cols: &'a [u32], tcs: &[u8], schema: &'a SchemaDescriptor) -> Self {
+    pub(super) fn new(mode: RouteMode, cols: &[u32], tcs: &[u8], schema: &SchemaDescriptor) -> Self {
         if scatter_is_pk_routed(cols, tcs, schema) {
             ScatterKey::PkBytes
         } else {
@@ -129,7 +129,9 @@ impl<'a> ScatterKey<'a> {
                     packer: ReindexPacker::new(schema, cols, tcs),
                     buf: [0u8; gnitz_wire::MAX_PK_BYTES],
                 },
-                RouteMode::GroupKey => ScatterKey::Fold { cols, schema },
+                RouteMode::GroupKey => ScatterKey::Fold {
+                    keys: GroupKeyCols::new(schema, cols),
+                },
             }
         }
     }
@@ -151,7 +153,7 @@ impl<'a> ScatterKey<'a> {
                 packer.pack_into(&mut buf[..packer.out_stride], mb, row);
                 partition_for_pk_bytes(&buf[..packer.out_stride])
             }
-            ScatterKey::Fold { cols, schema } => partition_for_key(extract_group_key(mb, row, schema, cols)),
+            ScatterKey::Fold { keys } => partition_for_key(keys.key_row(mb, row)),
         }
     }
 }
@@ -252,6 +254,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ops::util::extract_group_key;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::{make_batch, make_schema_u64_i64};
 

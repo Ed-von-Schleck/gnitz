@@ -157,7 +157,7 @@ class TestSchema:
     def test_string_pk_rejected(self):
         cols = [ColumnDef("s", TypeCode.STRING, primary_key=True),
                 ColumnDef("v", TypeCode.I64)]
-        with pytest.raises(ValueError, match="cannot be a PK"):
+        with pytest.raises(ValueError, match="PK-eligible"):
             Schema(cols)
 
     def test_nullable_pk_rejected(self):

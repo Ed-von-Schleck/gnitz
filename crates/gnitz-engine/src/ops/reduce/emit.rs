@@ -19,7 +19,7 @@ fn emit_agg_col(output: &mut Batch, acc: &Accumulator, out_pi: usize, cs: usize,
         // family / SumZero) leaves the null bit clear so it renders a concrete
         // `0`; SUM/MIN/MAX flag NULL.
         if !acc.empty_renders_zero() {
-            *null_word |= 1u64 << out_pi;
+            crate::schema::set_null_bit(null_word, out_pi);
         }
         output.fill_col_zero(out_pi, cs);
     } else {
@@ -62,18 +62,13 @@ pub(super) fn emit_reduce_row(
                     let mut scratch = [0u8; 16];
                     output.extend_col(out_pi, loc.native_le_bytes(input_mb, exemplar_row, &mut scratch));
                 }
-                ColumnLocator::Payload { slot, size, type_code } => {
-                    if loc.is_null(input_mb, exemplar_row) {
-                        null_word |= 1u64 << out_pi;
-                        output.fill_col_zero(out_pi, size as usize);
-                    } else if gnitz_wire::is_german_string(type_code) {
-                        let src = input_mb.get_col_ptr(exemplar_row, slot as usize, 16);
-                        let cell =
-                            crate::schema::relocate_german_string_vec(src, input_mb.blob, &mut output.blob, None);
-                        output.extend_col(out_pi, &cell);
-                    } else {
-                        output.extend_col(out_pi, loc.bytes(input_mb, exemplar_row));
+                ColumnLocator::Payload { size, type_code, .. } => {
+                    let is_null = loc.is_null(input_mb, exemplar_row);
+                    if is_null {
+                        crate::schema::set_null_bit(&mut null_word, out_pi);
                     }
+                    let cell = (!is_null).then(|| loc.bytes(input_mb, exemplar_row));
+                    output.append_payload_cell(out_pi, type_code, size as usize, cell, input_mb.blob, None);
                 }
             },
         }

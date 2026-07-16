@@ -20,6 +20,65 @@ use super::shard_file;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::wal;
 
+/// True when every column has a fixed-width 8-aligned stride and no German-string
+/// (STRING or BLOB) columns. Batches satisfying this can be scatter-encoded
+/// directly into SAL slots without intermediate per-worker Batch allocations,
+/// and their wire size is linear in the row count (no alignment padding).
+/// BLOB shares STRING's 16-byte struct with out-of-line heap bytes, so it must
+/// be excluded too.
+pub fn schema_wire_safe(schema: &SchemaDescriptor) -> bool {
+    (0..schema.num_columns()).all(|ci| {
+        let c = &schema.columns[ci];
+        !gnitz_wire::is_german_string(c.type_code) && c.size().is_multiple_of(8)
+    })
+}
+
+/// Compute `(wire_safe, wire_row_fixed_stride)` for `schema`. The stride is
+/// only meaningful when `wire_safe` is true: it's the byte cost of one row in
+/// a wire data block (`pk_stride + weight + null_bmp + payload strides`, all
+/// already 8-aligned because `schema_wire_safe` rejects non-8-aligned columns).
+/// Callers cache the result to skip the per-call column iteration.
+pub fn compute_wire_props(schema: &SchemaDescriptor) -> (bool, u32) {
+    if !schema_wire_safe(schema) {
+        return (false, 0);
+    }
+    let (strides, nr) = strides_from_schema(schema);
+    (true, strides[..nr as usize].iter().map(|&s| s as u32).sum())
+}
+
+/// Region byte sizes of the WAL wire block for `count` rows of `schema`, in
+/// canonical order (pk, weight, null_bmp, payload…, blob = `blob_size`), plus
+/// the region count. The schema-level face of the writer↔reader region
+/// contract (`strides_from_schema`) for callers that size or frame a block
+/// without holding a `Batch`.
+pub fn wire_region_sizes(
+    schema: &SchemaDescriptor,
+    count: usize,
+    blob_size: usize,
+) -> ([u32; MAX_WIRE_REGIONS], usize) {
+    let (strides, nr) = strides_from_schema(schema);
+    let nr = nr as usize;
+    let mut sizes = [0u32; MAX_WIRE_REGIONS];
+    for (size, &stride) in sizes[..nr].iter_mut().zip(&strides[..nr]) {
+        *size = (count * stride as usize) as u32;
+    }
+    sizes[nr] = blob_size as u32;
+    (sizes, nr + 1)
+}
+
+/// Total WAL-block byte size for `count` rows of `schema` carrying `blob_size`
+/// heap bytes — `wire_region_sizes` fed through the shared block framer.
+pub fn wire_block_size(schema: &SchemaDescriptor, count: usize, blob_size: usize) -> usize {
+    let (sizes, nr) = wire_region_sizes(schema, count, blob_size);
+    wal::block_size(&sizes[..nr])
+}
+
+/// Header + directory bytes of a wire block for `schema` — the fixed prefix
+/// preceding the first region (a zero-row, zero-blob block is exactly this).
+pub fn wire_header_dir_size(schema: &SchemaDescriptor) -> usize {
+    wire_block_size(schema, 0, 0)
+}
+
 impl Batch {
     /// Write this batch as a shard file directly to disk. `schema` is passed
     /// explicitly (not read from `Batch.schema`, which is `Option` and absent
@@ -208,9 +267,9 @@ fn validate_string_heap_extents(mb: &MemBatch<'_>, schema: &SchemaDescriptor) ->
         }
         for row in 0..mb.count {
             let cell = mb.get_col_ptr(row, pi, 16);
-            let len = u32::from_le_bytes(cell[0..4].try_into().unwrap()) as usize;
+            let len = crate::foundation::codec::read_u32_le(cell, 0) as usize;
             if len > crate::schema::SHORT_STRING_THRESHOLD {
-                let off = u64::from_le_bytes(cell[8..16].try_into().unwrap()) as usize;
+                let off = crate::foundation::codec::read_u64_le(cell, 8) as usize;
                 if off.saturating_add(len) > mb.blob.len() {
                     return Err("data WAL long string overruns blob heap");
                 }

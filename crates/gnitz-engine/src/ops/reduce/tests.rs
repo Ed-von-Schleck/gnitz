@@ -6,7 +6,6 @@ use crate::schema::{encode_german_string, type_code, SchemaColumn, SchemaDescrip
 use crate::storage::{Batch, Layout};
 use crate::test_support::{make_schema_i64pk_i64, make_schema_u64_i64, opk_pk_i64};
 
-use super::super::util::GroupKeyExtractor;
 use super::super::util::{extract_group_key, ieee_order_bits_f32, ieee_order_bits_f32_reverse};
 use super::agg::{apply_agg_from_value_index, Accumulator, AggDescriptor, AggOp};
 use super::emit::{emit_global_ground, emit_reduce_row};
@@ -4689,8 +4688,7 @@ fn avi_read_extreme(
     deltas: &[&Batch],
     for_max: bool,
 ) -> i64 {
-    use super::super::util::GroupKeyExtractor;
-    use crate::ops::index::{make_avi_schema, op_integrate_with_indexes, AviDesc};
+    use crate::ops::index::{make_avi_schema, op_integrate_with_indexes, AviBake, AviDesc};
     use crate::storage::Table;
 
     // The aggregate's type is the source column's type.
@@ -4711,27 +4709,25 @@ fn avi_read_extreme(
         col_type_code: tc_enum,
     };
     let aggs = [agg];
-    let extractor = GroupKeyExtractor::new(in_schema, group_by);
+    let bake = AviBake::new(in_schema, group_by, &aggs);
     let avi = AviDesc {
         table: &mut avi_t as *mut Table,
-        group_by_cols: group_by,
-        aggs: &aggs,
-        extractor: &extractor,
+        bake: &bake,
     };
     // Each op_integrate_with_indexes call is a separate AVI ingest; the cursor's
     // two-tier consolidation sums weights across ingests, so a retracted extreme
     // (net-zero) is skipped by seek_first_positive_with_prefix.
     for d in deltas {
-        op_integrate_with_indexes(d, None, in_schema, Some(&avi)).unwrap();
+        op_integrate_with_indexes(d, None, Some(&avi)).unwrap();
     }
 
     let mut ch = avi_t.open_cursor();
     let mut gk = [0u8; crate::schema::MAX_PK_BYTES];
-    extractor.gather(&deltas[0].as_mem_batch(), 0, &mut gk);
-    gk[extractor.stride] = 0; // ordinal 0 (single aggregate)
+    bake.extractor.gather(&deltas[0].as_mem_batch(), 0, &mut gk);
+    gk[bake.extractor.stride] = 0; // ordinal 0 (single aggregate)
     let mut acc = Accumulator::new(&agg, in_schema.locate(col_idx as usize));
     assert!(
-        apply_agg_from_value_index(&mut ch, &gk[..extractor.stride + 1], for_max, &mut acc),
+        apply_agg_from_value_index(&mut ch, &gk[..bake.extractor.stride + 1], for_max, &mut acc),
         "AVI seek must find the probed group",
     );
     acc.get_value_bits() as i64
@@ -6662,15 +6658,13 @@ fn build_combined_avi(
         .filter(|d| d.agg_op.uses_value_index())
         .copied()
         .collect();
-    let extractor = super::super::util::GroupKeyExtractor::new(in_schema, group_cols);
+    let bake = crate::ops::index::AviBake::new(in_schema, group_cols, &vi_aggs);
     let avi = AviDesc {
         table: &mut t as *mut crate::storage::Table,
-        group_by_cols: group_cols,
-        aggs: &vi_aggs,
-        extractor: &extractor,
+        bake: &bake,
     };
     for d in deltas {
-        op_integrate_with_indexes(d, None, in_schema, Some(&avi)).unwrap();
+        op_integrate_with_indexes(d, None, Some(&avi)).unwrap();
     }
     t
 }
@@ -7577,7 +7571,7 @@ fn reduce_nullable_group_stays_absolute_seek() {
 // Pin the shared classifier: the two canonical single-column arms (a PK
 // column, a non-nullable routable-int payload), and the hash fold (None) for
 // nullable / STRING / float / multi-column / empty group sets.
-// `extract_group_key_row` dispatches its fast path on the arm and `op_reduce`
+// `extract_group_key` dispatches its fast path on the arm and `op_reduce`
 // keys its monotone probe on `is_some()`, so a drift here is a correctness
 // bug, not a perf one.
 #[test]
@@ -7729,7 +7723,7 @@ fn run_minmax_epochs(
     use_avi: bool,
     global_ground: bool,
 ) -> Vec<std::rc::Rc<Batch>> {
-    use crate::ops::index::{make_avi_schema, op_integrate_with_indexes, AviDesc};
+    use crate::ops::index::{make_avi_schema, op_integrate_with_indexes, AviBake, AviDesc};
     use crate::storage::{RecoverySource, Table};
 
     let tmp = tempfile::tempdir().unwrap();
@@ -7744,18 +7738,16 @@ fn run_minmax_epochs(
     // compiler feeds the integrate instruction and the reduce read side.
     let vi_aggs: Vec<AggDescriptor> = aggs.iter().filter(|d| d.agg_op.uses_value_index()).copied().collect();
 
-    let avi_extractor = GroupKeyExtractor::new(in_schema, group_by);
+    let avi_bake = AviBake::new(in_schema, group_by, &vi_aggs);
     let mut states = Vec::with_capacity(epochs.len());
     for d in epochs {
         // AVI Integrate precedes Reduce: post-delta `I(input)` before the read.
         if let Some(t) = avi_t.as_mut() {
             let avi = AviDesc {
                 table: t as *mut Table,
-                group_by_cols: group_by,
-                aggs: &vi_aggs,
-                extractor: &avi_extractor,
+                bake: &avi_bake,
             };
-            op_integrate_with_indexes(d, None, in_schema, Some(&avi)).unwrap();
+            op_integrate_with_indexes(d, None, Some(&avi)).unwrap();
         }
         let out = {
             let mut to_ch = trace_out.open_cursor();
@@ -7796,7 +7788,7 @@ fn run_minmax_epochs(
         // Reference path: integrate the input into `trace_in` AFTER the reduce so
         // the cursor read above saw the pre-delta integral.
         if let Some(ti) = trace_in.as_mut() {
-            op_integrate_with_indexes(d, Some(ti), in_schema, None).unwrap();
+            op_integrate_with_indexes(d, Some(ti), None).unwrap();
         }
         trace_out.ingest_owned_batch(out).unwrap();
         states.push(trace_out.full_scan());

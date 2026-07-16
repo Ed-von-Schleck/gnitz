@@ -16,6 +16,8 @@ use super::shard_reader::MappedShard;
 use super::table::{self, RecoverySource, Table};
 #[cfg(test)]
 use super::table::{FlushOutcome, FlushWork};
+#[cfg(test)]
+use crate::schema::key::{partition_for_key, partition_for_pk_bytes};
 use crate::schema::SchemaDescriptor;
 
 thread_local! {
@@ -217,15 +219,17 @@ impl PartitionedTable {
     // ------------------------------------------------------------------
 
     /// Gather every live partition's read sources — memtable `snapshot_runs`,
-    /// RAM-tier `in_memory_runs`, and `all_shard_arcs` — into one
-    /// (snapshots, shards) pair for `create_read_cursor`.
+    /// RAM-tier `in_memory_runs`, and `all_shard_arcs_iter` — into one
+    /// (snapshots, shards) pair for `create_read_cursor`. The snapshot
+    /// accumulator is pre-seeded with the known memtable-run count; the shard
+    /// iterator extends without a throwaway per-partition `Vec`.
     fn gather_runs(tables: &[Table]) -> (Vec<Rc<Batch>>, Vec<Rc<MappedShard>>) {
-        let mut snapshots: Vec<Rc<Batch>> = Vec::new();
+        let mut snapshots: Vec<Rc<Batch>> = Vec::with_capacity(tables.iter().map(|t| t.snapshot_runs().len()).sum());
         let mut shards: Vec<Rc<MappedShard>> = Vec::new();
         for table in tables {
             snapshots.extend(table.snapshot_runs().iter().cloned());
             snapshots.extend(table.in_memory_runs());
-            shards.extend(table.all_shard_arcs());
+            shards.extend(table.all_shard_arcs_iter());
         }
         (snapshots, shards)
     }
@@ -400,15 +404,6 @@ impl PartitionedTable {
 }
 
 // ---------------------------------------------------------------------------
-// Hash routing
-// ---------------------------------------------------------------------------
-
-// `partition_for_key` / `partition_for_pk_bytes` (and the private `mix` hash)
-// moved to `schema::key`; re-exported so `partitioned_table::*` and
-// `crate::storage::*` routing call sites are unchanged.
-pub use crate::schema::key::{partition_for_key, partition_for_pk_bytes};
-
-// ---------------------------------------------------------------------------
 // Shared test fixture
 // ---------------------------------------------------------------------------
 
@@ -538,32 +533,12 @@ mod tests {
     use super::*;
     use crate::foundation::posix_io::raise_fd_limit_for_tests;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-    use crate::test_support::wide_pk_3xu64_schema;
+    use crate::test_support::{make_batch_raw, make_schema_u64_i64, wide_pk_3xu64_schema};
     use std::os::fd::AsRawFd;
 
-    fn make_schema() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        )
-    }
-
-    /// Build an unsorted owned `Batch` of (pk, weight, val_i64) rows
-    /// matching `make_schema` (U64 PK + I64 payload).
+    /// Unsorted `Raw` rows for the U64+I64 schema.
     fn make_batch(rows: &[(u64, i64, i64)]) -> Batch {
-        let schema = make_schema();
-        let mut batch = Batch::with_schema(schema, rows.len().max(1));
-        for &(pk, w, val) in rows {
-            batch.extend_pk(pk as u128);
-            batch.extend_weight(&w.to_le_bytes());
-            batch.extend_null_bmp(&0u64.to_le_bytes());
-            batch.extend_col(0, &val.to_le_bytes());
-            batch.count += 1;
-        }
-        batch
+        make_batch_raw(&make_schema_u64_i64(), rows)
     }
 
     #[test]
@@ -571,7 +546,7 @@ mod tests {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("sp_test");
-        let schema = make_schema();
+        let schema = make_schema_u64_i64();
         let mut pt = PartitionedTable::new(
             tdir.to_str().unwrap(),
             schema,
@@ -597,7 +572,7 @@ mod tests {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("mp_test");
-        let schema = make_schema();
+        let schema = make_schema_u64_i64();
         let mut pt = PartitionedTable::new(
             tdir.to_str().unwrap(),
             schema,
@@ -623,7 +598,7 @@ mod tests {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("mc_test");
-        let schema = make_schema();
+        let schema = make_schema_u64_i64();
         let mut pt = PartitionedTable::new(
             tdir.to_str().unwrap(),
             schema,
@@ -648,7 +623,7 @@ mod tests {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("rt_test");
-        let schema = make_schema();
+        let schema = make_schema_u64_i64();
         let mut pt = PartitionedTable::new(
             tdir.to_str().unwrap(),
             schema,
@@ -885,7 +860,7 @@ mod tests {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("cpo_test");
-        let schema = make_schema();
+        let schema = make_schema_u64_i64();
         let mut pt = PartitionedTable::new(
             tdir.to_str().unwrap(),
             schema,
@@ -946,7 +921,7 @@ mod tests {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("pt_durable_flush");
-        let schema = make_schema();
+        let schema = make_schema_u64_i64();
         let mut pt = PartitionedTable::new(
             tdir.to_str().unwrap(),
             schema,
@@ -985,7 +960,7 @@ mod tests {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("pt_nondurable_flush");
-        let schema = make_schema();
+        let schema = make_schema_u64_i64();
         let mut pt = PartitionedTable::new(
             tdir.to_str().unwrap(),
             schema,
@@ -1020,7 +995,7 @@ mod tests {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("pt_ccc_inmem");
-        let schema = make_schema();
+        let schema = make_schema_u64_i64();
         let mut pt = PartitionedTable::new(
             tdir.to_str().unwrap(),
             schema,
@@ -1108,7 +1083,7 @@ mod tests {
     fn durable_hashed(dir: &std::path::Path, name: &str, table_id: u32) -> PartitionedTable {
         PartitionedTable::new(
             dir.join(name).to_str().unwrap(),
-            make_schema(),
+            make_schema_u64_i64(),
             table_id,
             Routing::Hashed,
             RecoverySource::SalReplay,

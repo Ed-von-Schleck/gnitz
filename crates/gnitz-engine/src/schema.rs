@@ -648,6 +648,19 @@ impl SchemaDescriptor {
     }
 }
 
+/// Read payload slot `pi`'s bit from a row's null-bitmap word (the §6 contract:
+/// bit N = dense payload slot N is NULL).
+#[inline]
+pub(crate) fn null_bit(word: u64, pi: usize) -> bool {
+    (word >> pi) & 1 != 0
+}
+
+/// Set payload slot `pi`'s bit in a row's null-bitmap word.
+#[inline]
+pub(crate) fn set_null_bit(word: &mut u64, pi: usize) {
+    *word |= 1u64 << pi;
+}
+
 /// The three per-row region reads a [`ColumnLocator`]/[`IndexKeySpec`] needs from
 /// a physical batch, abstracted so schema (L1) does not name `storage::MemBatch`
 /// (L2) — the up-edge that would re-form the `schema ↔ storage` cycle. The sole
@@ -826,6 +839,9 @@ impl SchemaDescriptor {
 #[derive(Clone, Copy)]
 pub(crate) struct IndexKeySpec {
     n: u8,
+    /// Span width in bytes — the sum of the promoted column widths, precomputed
+    /// so the per-row `key_bytes` path does no re-summation.
+    key_size: u8,
     locators: [ColumnLocator; gnitz_wire::PK_LIST_MAX_COLS],
     idx_cols: [SchemaColumn; gnitz_wire::PK_LIST_MAX_COLS],
 }
@@ -847,8 +863,22 @@ impl IndexKeySpec {
         }
         IndexKeySpec {
             n: cols.len() as u8,
+            key_size: idx_schema.leading_key_size(cols.len()) as u8,
             locators,
             idx_cols,
+        }
+    }
+
+    /// The spec over the leading `k` columns only — the read/encode plan a
+    /// leading-prefix seek needs, derived from a full-arity baked spec instead
+    /// of rebuilding one from the schemas.
+    #[inline]
+    pub(crate) fn prefix(&self, k: usize) -> IndexKeySpec {
+        debug_assert!(k >= 1 && k <= self.n as usize);
+        IndexKeySpec {
+            n: k as u8,
+            key_size: self.idx_cols[..k].iter().map(|c| c.size()).sum(),
+            ..*self
         }
     }
 
@@ -861,7 +891,7 @@ impl IndexKeySpec {
     /// Span width (`idx_key_size`); see `SchemaDescriptor::leading_key_size`.
     #[inline]
     pub(crate) fn key_size(&self) -> usize {
-        self.idx_cols().iter().map(|c| c.size() as usize).sum()
+        self.key_size as usize
     }
 
     /// Write one row's OPK leading-key span into `dst[..key_size()]`. Returns

@@ -625,6 +625,58 @@ impl ColData {
             }
         }
     }
+
+    /// Consuming variant of [`Self::push_row_from`] for a source batch the
+    /// caller owns and drops afterwards: a `Strings`/`Bytes` cell is *moved*
+    /// (`Option::take`) instead of deep-cloned, leaving `None` behind.
+    /// Correct only when each source row is taken at most once; fixed-width
+    /// variants copy exactly as `push_row_from`.
+    pub fn take_row_into(&mut self, idx: usize, fixed_stride: usize, dst: &mut ColData) {
+        match self {
+            ColData::Strings(s) => {
+                let ColData::Strings(d) = dst else { variant_mismatch() };
+                d.push(s[idx].take());
+            }
+            ColData::Bytes(s) => {
+                let ColData::Bytes(d) = dst else { variant_mismatch() };
+                d.push(s[idx].take());
+            }
+            ColData::Fixed(_) | ColData::U128s(_) => self.push_row_from(idx, fixed_stride, dst),
+        }
+    }
+
+    /// Append a SQL NULL cell for a column of wire type `tc`. The single NULL
+    /// encoding across all four variants: fixed-width columns get zero filler
+    /// (the null bitmap is the NULL source of truth, §6), German strings a
+    /// `None` cell.
+    pub fn push_null(&mut self, tc: TypeCode) {
+        match self {
+            ColData::Fixed(buf) => buf.extend(std::iter::repeat_n(0u8, tc.wire_stride())),
+            ColData::Strings(v) => v.push(None),
+            ColData::Bytes(v) => v.push(None),
+            ColData::U128s(v) => v.push(0u128),
+        }
+    }
+}
+
+/// True iff payload null-bit `pi` is set in `word` (the column is NULL). The
+/// null word packs one bit per *payload* column: bit `pi` is the `pi`-th non-PK
+/// column in schema order (`Schema::payload_idx`, §6). These two accessors are
+/// the single read/write convention for the bitmap.
+#[inline]
+pub fn null_word_get(word: u64, pi: usize) -> bool {
+    (word >> pi) & 1 == 1
+}
+
+/// Set (`is_null == true`) or clear (`is_null == false`) payload null-bit `pi`
+/// in `word`.
+#[inline]
+pub fn null_word_set(word: &mut u64, pi: usize, is_null: bool) {
+    if is_null {
+        *word |= 1u64 << pi;
+    } else {
+        *word &= !(1u64 << pi);
+    }
 }
 
 #[cold]
@@ -684,6 +736,15 @@ impl ZSetBatch {
 
     pub fn is_empty(&self) -> bool {
         self.pks.is_empty()
+    }
+
+    /// Whether column `ci` is SQL NULL at `row`: a PK column is never NULL;
+    /// a payload column reads its bit from the null bitmap — the single NULL
+    /// source across every `ColData` variant (a `Fixed`/`U128s` NULL is
+    /// zero-filled filler with no per-value sentinel).
+    #[inline]
+    pub fn is_null(&self, schema: &Schema, row: usize, ci: usize) -> bool {
+        !schema.is_pk_col(ci) && null_word_get(self.nulls[row], schema.payload_idx(ci))
     }
 
     /// Indices of the live rows — those with positive weight. A `ZSetBatch`
@@ -838,7 +899,7 @@ impl ZSetBatch {
         let mut not_null_mask: u64 = 0;
         for (pi, _ci, col_def) in schema.payload_columns() {
             if !col_def.is_nullable {
-                not_null_mask |= 1u64 << pi;
+                null_word_set(&mut not_null_mask, pi, true);
             }
         }
         if not_null_mask != 0 {
@@ -861,15 +922,20 @@ pub struct BatchAppender<'a> {
     schema: &'a Schema,
     cursor: usize,
     row_active: bool,
+    /// Payload cursor → schema column index (the N-th non-PK column), computed
+    /// once so `col_index` is an array read rather than a per-value scan.
+    payload_to_ci: Vec<usize>,
 }
 
 impl<'a> BatchAppender<'a> {
     pub fn new(batch: &'a mut ZSetBatch, schema: &'a Schema) -> Self {
+        let payload_to_ci: Vec<usize> = (0..schema.num_columns()).filter(|&ci| !schema.is_pk_col(ci)).collect();
         BatchAppender {
             batch,
             schema,
             cursor: 0,
             row_active: false,
+            payload_to_ci,
         }
     }
 
@@ -963,11 +1029,12 @@ impl<'a> BatchAppender<'a> {
     /// self-sufficient — no out-of-band `null_mask` call required.
     fn mark_current_null(&mut self, ci: usize) {
         let pi = self.schema.payload_idx(ci);
-        *self
+        let word = self
             .batch
             .nulls
             .last_mut()
-            .expect("BatchAppender: mark_current_null called before add_row") |= 1u64 << pi;
+            .expect("BatchAppender: mark_current_null called before add_row");
+        null_word_set(word, pi, true);
     }
 
     /// Append a SQL NULL to the next Strings column.
@@ -1016,60 +1083,40 @@ impl<'a> BatchAppender<'a> {
         self
     }
 
-    /// Append a zero/empty value for the current column based on its schema type.
-    pub fn zero_val(&mut self) -> &mut Self {
-        let ci = self.col_index();
-        let tc = self.schema.columns[ci].type_code;
-        match &mut self.batch.columns[ci] {
-            ColData::Fixed(buf) => {
-                let stride = tc.wire_stride();
-                buf.extend(std::iter::repeat_n(0u8, stride));
-            }
-            ColData::Strings(v) => {
-                v.push(Some(std::string::String::new()));
-            }
-            ColData::Bytes(v) => {
-                v.push(Some(Vec::new()));
-            }
-            ColData::U128s(v) => {
-                v.push(0);
-            }
-        }
-        self.cursor += 1;
-        self
-    }
-
     /// Map the payload cursor to the actual schema column index, skipping every
     /// PK column. Supports compound PKs (e.g. the catalog circuit tables whose
     /// PK is (view_id, sub)): payload value N targets the N-th non-PK column.
     fn col_index(&self) -> usize {
-        // Hard assert (not debug-only) + bounded `for`: in release an
-        // unbounded `loop` past `num_columns()` returns an OOB index that
-        // panics at the `columns[ci]` call site. A misbehaving caller gets a
-        // clear panic here instead.
+        // Hard assert (not debug-only): a misbehaving caller gets a clear panic
+        // here instead of an OOB index panicking at the `columns[ci]` call site.
         assert!(
-            self.cursor < self.schema.num_payload_cols(),
+            self.cursor < self.payload_to_ci.len(),
             "BatchAppender: payload cursor {} exceeds {} payload columns",
             self.cursor,
-            self.schema.num_payload_cols(),
+            self.payload_to_ci.len(),
         );
-        let pk_cols = self.schema.pk_indices();
-        let mut seen_payload = 0;
-        for ci in 0..self.schema.num_columns() {
-            if !pk_cols.contains(&ci) {
-                if seen_payload == self.cursor {
-                    return ci;
-                }
-                seen_payload += 1;
-            }
-        }
-        panic!("BatchAppender: col_index resolution failed (cursor {})", self.cursor);
+        self.payload_to_ci[self.cursor]
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn null_word_get_set_roundtrip() {
+        let mut w = 0u64;
+        assert!(!null_word_get(w, 3));
+        null_word_set(&mut w, 3, true);
+        assert!(null_word_get(w, 3));
+        assert_eq!(w, 0b1000);
+        // Clearing leaves the other bits untouched.
+        null_word_set(&mut w, 5, true);
+        null_word_set(&mut w, 3, false);
+        assert!(!null_word_get(w, 3));
+        assert!(null_word_get(w, 5));
+        assert_eq!(w, 0b100000);
+    }
 
     #[test]
     fn validate_parts_enforces_full_rule_set() {

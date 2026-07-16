@@ -29,7 +29,7 @@ use crate::{
     WAL_OFF_TID, WAL_OFF_VERSION,
 };
 
-pub const CONTROL_COLS: &[WireSysCol] = &[
+const CONTROL_COLS: &[WireSysCol] = &[
     col("msg_idx", TypeCode::U64, false),
     col("status", TypeCode::U64, false),
     col("client_id", TypeCode::U64, false),
@@ -42,22 +42,22 @@ pub const CONTROL_COLS: &[WireSysCol] = &[
     col("seek_pk_extra", TypeCode::Blob, true),
 ];
 
-pub const NUM_COLUMNS: usize = CONTROL_COLS.len();
+const NUM_COLUMNS: usize = CONTROL_COLS.len();
 
 const fn col_index(name: &str) -> usize {
     crate::col_index_in(CONTROL_COLS, name)
 }
 
-pub const COL_MSG_IDX: usize = col_index("msg_idx");
-pub const COL_STATUS: usize = col_index("status");
-pub const COL_CLIENT_ID: usize = col_index("client_id");
-pub const COL_TARGET_ID: usize = col_index("target_id");
-pub const COL_FLAGS: usize = col_index("flags");
-pub const COL_SEEK_PK: usize = col_index("seek_pk");
-pub const COL_SEEK_COL_IDX: usize = col_index("seek_col_idx");
-pub const COL_REQUEST_ID: usize = col_index("request_id");
-pub const COL_ERROR_MSG: usize = col_index("error_msg");
-pub const COL_SEEK_PK_EXTRA: usize = col_index("seek_pk_extra");
+const COL_MSG_IDX: usize = col_index("msg_idx");
+const COL_STATUS: usize = col_index("status");
+const COL_CLIENT_ID: usize = col_index("client_id");
+const COL_TARGET_ID: usize = col_index("target_id");
+const COL_FLAGS: usize = col_index("flags");
+const COL_SEEK_PK: usize = col_index("seek_pk");
+const COL_SEEK_COL_IDX: usize = col_index("seek_col_idx");
+const COL_REQUEST_ID: usize = col_index("request_id");
+const COL_ERROR_MSG: usize = col_index("error_msg");
+const COL_SEEK_PK_EXTRA: usize = col_index("seek_pk_extra");
 
 const fn payload_index(col_idx: usize) -> usize {
     assert!(col_idx != COL_MSG_IDX, "PK column has no payload index");
@@ -65,42 +65,42 @@ const fn payload_index(col_idx: usize) -> usize {
     col_idx - 1
 }
 
-pub const PAYLOAD_STATUS: usize = payload_index(COL_STATUS);
-pub const PAYLOAD_CLIENT_ID: usize = payload_index(COL_CLIENT_ID);
-pub const PAYLOAD_TARGET_ID: usize = payload_index(COL_TARGET_ID);
-pub const PAYLOAD_FLAGS: usize = payload_index(COL_FLAGS);
-pub const PAYLOAD_SEEK_PK: usize = payload_index(COL_SEEK_PK);
-pub const PAYLOAD_SEEK_COL_IDX: usize = payload_index(COL_SEEK_COL_IDX);
-pub const PAYLOAD_REQUEST_ID: usize = payload_index(COL_REQUEST_ID);
-pub const PAYLOAD_ERROR_MSG: usize = payload_index(COL_ERROR_MSG);
-pub const PAYLOAD_SEEK_PK_EXTRA: usize = payload_index(COL_SEEK_PK_EXTRA);
+const PAYLOAD_STATUS: usize = payload_index(COL_STATUS);
+const PAYLOAD_CLIENT_ID: usize = payload_index(COL_CLIENT_ID);
+const PAYLOAD_TARGET_ID: usize = payload_index(COL_TARGET_ID);
+const PAYLOAD_FLAGS: usize = payload_index(COL_FLAGS);
+const PAYLOAD_SEEK_PK: usize = payload_index(COL_SEEK_PK);
+const PAYLOAD_SEEK_COL_IDX: usize = payload_index(COL_SEEK_COL_IDX);
+const PAYLOAD_REQUEST_ID: usize = payload_index(COL_REQUEST_ID);
+const PAYLOAD_ERROR_MSG: usize = payload_index(COL_ERROR_MSG);
+const PAYLOAD_SEEK_PK_EXTRA: usize = payload_index(COL_SEEK_PK_EXTRA);
 
 /// Null-bit position for `error_msg` in the row null bitmap.
 /// Equals the payload index of the column.
-pub const NULL_BIT_ERROR_MSG: u64 = 1u64 << PAYLOAD_ERROR_MSG;
+const NULL_BIT_ERROR_MSG: u64 = 1u64 << PAYLOAD_ERROR_MSG;
 
 /// Null-bit position for `seek_pk_extra` in the row null bitmap.
 /// Equals the payload index of the column.
-pub const NULL_BIT_SEEK_PK_EXTRA: u64 = 1u64 << PAYLOAD_SEEK_PK_EXTRA;
+const NULL_BIT_SEEK_PK_EXTRA: u64 = 1u64 << PAYLOAD_SEEK_PK_EXTRA;
 
 /// WAL region count for a CONTROL_SCHEMA block (V3 format):
 /// 3 fixed regions (pk 16B, weight, null_bmp) + (NUM_COLUMNS - 1) payload columns
 /// + 1 blob region.
-pub const NUM_REGIONS: usize = 3 + (NUM_COLUMNS - 1) + 1;
+const NUM_REGIONS: usize = 3 + (NUM_COLUMNS - 1) + 1;
 
 // Region indices. V3 format: 3 system regions (pk=0, weight=1, null_bmp=2)
 // followed by payload columns in schema order, then blob last.
-pub const REGION_NULL_BMP: usize = 2;
-pub const REGION_STATUS: usize = 3 + PAYLOAD_STATUS;
-pub const REGION_CLIENT_ID: usize = 3 + PAYLOAD_CLIENT_ID;
-pub const REGION_TARGET_ID: usize = 3 + PAYLOAD_TARGET_ID;
-pub const REGION_FLAGS: usize = 3 + PAYLOAD_FLAGS;
-pub const REGION_SEEK_PK: usize = 3 + PAYLOAD_SEEK_PK;
-pub const REGION_SEEK_COL_IDX: usize = 3 + PAYLOAD_SEEK_COL_IDX;
-pub const REGION_REQUEST_ID: usize = 3 + PAYLOAD_REQUEST_ID;
-pub const REGION_ERROR_MSG: usize = 3 + PAYLOAD_ERROR_MSG;
-pub const REGION_SEEK_PK_EXTRA: usize = 3 + PAYLOAD_SEEK_PK_EXTRA;
-pub const REGION_BLOB: usize = NUM_REGIONS - 1;
+const REGION_NULL_BMP: usize = 2;
+const REGION_STATUS: usize = 3 + PAYLOAD_STATUS;
+const REGION_CLIENT_ID: usize = 3 + PAYLOAD_CLIENT_ID;
+const REGION_TARGET_ID: usize = 3 + PAYLOAD_TARGET_ID;
+const REGION_FLAGS: usize = 3 + PAYLOAD_FLAGS;
+const REGION_SEEK_PK: usize = 3 + PAYLOAD_SEEK_PK;
+const REGION_SEEK_COL_IDX: usize = 3 + PAYLOAD_SEEK_COL_IDX;
+const REGION_REQUEST_ID: usize = 3 + PAYLOAD_REQUEST_ID;
+const REGION_ERROR_MSG: usize = 3 + PAYLOAD_ERROR_MSG;
+const REGION_SEEK_PK_EXTRA: usize = 3 + PAYLOAD_SEEK_PK_EXTRA;
+const REGION_BLOB: usize = NUM_REGIONS - 1;
 
 // ---------------------------------------------------------------------------
 // Control-block codec — the one encoder/decoder both ends run.
@@ -130,7 +130,7 @@ const fn ctrl_region_size(r: usize) -> usize {
 /// every region size is a multiple of 8 (so the implicit `align8` is a no-op);
 /// a future schema change introducing an unaligned column fails at compile
 /// time.
-pub const fn ctrl_region_offset(target_region: usize) -> usize {
+const fn ctrl_region_offset(target_region: usize) -> usize {
     let mut pos = WAL_HEADER_SIZE + NUM_REGIONS * 8;
     let mut r = 0;
     while r < target_region {
@@ -163,7 +163,7 @@ const OFF_SEEK_PK_EXTRA: usize = ctrl_region_offset(REGION_SEEK_PK_EXTRA);
 
 /// Blob bytes a German string of length `len` spills into the shared blob
 /// region: 0 when it fits the 12-byte inline form, its full length otherwise.
-const fn german_spill_len(len: usize) -> usize {
+pub const fn german_spill_len(len: usize) -> usize {
     if len > SHORT_STRING_THRESHOLD {
         len
     } else {

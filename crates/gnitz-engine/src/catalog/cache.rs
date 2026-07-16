@@ -9,6 +9,7 @@ use std::collections::hash_map::Entry;
 /// Cached schema wire data for one table: the encoded block plus the derived
 /// wire properties reused across SEEK/SCAN responses. All fields share one
 /// invalidation lifecycle (`clear_col_cache_no_bump` drops the entry whole).
+#[derive(Clone)]
 pub(crate) struct SchemaWireEntry {
     pub(crate) block: Rc<Vec<u8>>,
     /// True when every column has a fixed-width 8-aligned stride and no

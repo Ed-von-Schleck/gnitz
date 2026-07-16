@@ -601,8 +601,9 @@ unsafe fn assert_footprint_exact(
     nw: usize,
 ) {
     use crate::ops::{with_broadcast_indices, with_worker_indices};
-    use crate::runtime::sal::{compute_wire_props, FLAG_PUSH};
+    use crate::runtime::sal::FLAG_PUSH;
     use crate::runtime::wire::build_schema_wire_block;
+    use crate::storage::compute_wire_props;
 
     let size = 1 << 20;
     let region = SharedRegion::new(size);
@@ -624,15 +625,12 @@ unsafe fn assert_footprint_exact(
                 batch,
                 wi,
                 schema,
-                None,
                 target_id,
                 7,
                 FLAG_PUSH,
                 0,
                 0,
-                0,
                 &req_ids,
-                -1,
                 Some(block.as_slice()),
                 Some(props),
             )

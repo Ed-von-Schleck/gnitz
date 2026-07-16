@@ -210,14 +210,10 @@ impl MappedShard {
             debug_assert!(!ghost, "shard contains weight-0 rows; every writer consolidates");
         }
 
-        let mut col_to_payload = Vec::with_capacity(num_cols);
         let mut col_regions = Vec::with_capacity(nr - REG_PAYLOAD_START);
         let mut reg_idx = REG_PAYLOAD_START;
         for ci in 0..num_cols {
-            if schema.is_pk_col(ci) {
-                col_to_payload.push(usize::MAX);
-            } else {
-                col_to_payload.push(col_regions.len());
+            if !schema.is_pk_col(ci) {
                 col_regions.push(build_payload_region(&entries[reg_idx], strides[reg_idx] as usize)?);
                 reg_idx += 1;
             }
@@ -251,7 +247,6 @@ impl MappedShard {
             col_regions,
             blob_off,
             blob_len,
-            col_to_payload,
             xor8_filter,
             pk_stride,
             is_pk_unique,

@@ -1,7 +1,7 @@
 //! WAL-block encode/decode for the client wire codec.
 
 use super::error::ProtocolError;
-use super::types::{ColData, PkColumn, Schema, TypeCode, ZSetBatch};
+use super::types::{null_word_get, ColData, PkColumn, Schema, TypeCode, ZSetBatch};
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
@@ -93,7 +93,7 @@ fn encode_german_col<'a>(
 ) -> Vec<u8> {
     let mut col_bytes = Vec::with_capacity(count * 16);
     for (row, val) in cells.enumerate() {
-        let is_null = (nulls[row] & (1u64 << payload_idx)) != 0;
+        let is_null = null_word_get(nulls[row], payload_idx);
         if let (false, Some(b)) = (is_null, val) {
             col_bytes.extend_from_slice(&gnitz_wire::encode_german_string(b, blob));
         } else {
@@ -119,7 +119,7 @@ fn decode_german_col(
 ) -> Result<Vec<Option<Vec<u8>>>, ProtocolError> {
     let mut vals: Vec<Option<Vec<u8>>> = Vec::with_capacity(count);
     for (row, &null_word) in nulls.iter().enumerate().take(count) {
-        if (null_word & (1u64 << payload_idx)) != 0 {
+        if null_word_get(null_word, payload_idx) {
             vals.push(None);
             continue;
         }
@@ -175,11 +175,12 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
     // Fixed columns are borrowed from batch.columns directly (no clone).
     let mut blob: Vec<u8> = Vec::new();
 
-    // ColRegion::Prebuilt holds String/U128 temp Vecs; ColRegion::FixedRef marks
+    // ColRegion::Prebuilt holds String/Blob temp Vecs; FixedRef and U128Ref mark
     // columns that will borrow from batch.columns directly.
     enum ColRegion {
         Prebuilt(Vec<u8>),
         FixedRef(usize), // schema column index → borrow batch.columns[ci]
+        U128Ref(usize),  // schema column index → reinterpret batch.columns[ci]'s u128s as bytes
     }
     let mut col_regions: Vec<ColRegion> = Vec::with_capacity(num_non_pk);
 
@@ -217,17 +218,14 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
                 )));
             }
             TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => {
-                let vals = match &batch.columns[ci] {
-                    ColData::U128s(v) => v,
+                // Native u128 LE layout is byte-identical to the wire form, so
+                // the region borrows the column directly at collection time
+                // (the same reinterpret as the weight/null regions below) —
+                // no per-column copy.
+                match &batch.columns[ci] {
+                    ColData::U128s(_) => col_regions.push(ColRegion::U128Ref(ci)),
                     _ => panic!("encode_wal_block: expected U128s for U128/UUID/I128 column {ci}"),
-                };
-                // Native u128 LE layout is byte-identical to the wire form
-                // (same precedent as the weight/null reinterpret below);
-                // bulk-copy rather than splitting each value into lo/hi halves.
-                // SAFETY: `vals` is `vals.len()` u128s = `vals.len()*16` bytes;
-                // the region is consumed as opaque bytes, not typed values.
-                let src = unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 16) };
-                col_regions.push(ColRegion::Prebuilt(src.to_vec()));
+                }
             }
             _ => {
                 let stride = col.type_code.wire_stride();
@@ -271,6 +269,14 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
             ColRegion::Prebuilt(data) => data.as_slice(),
             ColRegion::FixedRef(ci) => match &batch.columns[*ci] {
                 ColData::Fixed(v) => v.as_slice(),
+                _ => unreachable!(),
+            },
+            ColRegion::U128Ref(ci) => match &batch.columns[*ci] {
+                // SAFETY: `v` is `v.len()` u128s = `v.len()*16` initialized
+                // bytes, borrowed from `batch` (which outlives `regions`); the
+                // region is consumed as opaque bytes, not typed values
+                // (little-endian target, asserted crate-wide).
+                ColData::U128s(v) => unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 16) },
                 _ => unreachable!(),
             },
         });

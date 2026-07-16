@@ -454,9 +454,16 @@ impl Table {
         self.in_memory_l0.iter().map(|r| Rc::clone(&r.batch))
     }
 
-    /// Get all shard Rcs (for PartitionedTable cursor gathering).
+    /// Get all shard Rcs (production callers use `all_shard_arcs_iter`).
+    #[cfg(test)]
     pub(crate) fn all_shard_arcs(&self) -> Vec<Rc<MappedShard>> {
         self.shard_index.all_shard_arcs()
+    }
+
+    /// All shard Rcs as a lazy iterator (for PartitionedTable cursor
+    /// gathering) — callers `extend` without a per-partition `Vec`.
+    pub(crate) fn all_shard_arcs_iter(&self) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
+        self.shard_index.all_shard_arcs_iter()
     }
 
     /// Test helper: returns true when the memtable has no rows.
@@ -717,33 +724,12 @@ fn erase_stale_shards(dir: &str, table_id: u32) {
 mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-    use crate::test_support::{opk_pk, wide_pk_3xu64_schema, wide_row};
+    use crate::test_support::{make_batch_raw, make_schema_u64_i64, opk_pk, wide_pk_3xu64_schema, wide_row};
 
-    fn make_u64_i64_schema() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        )
-    }
-
-    /// Build an unsorted owned `Batch` of (pk, weight, val_i64) rows for the
-    /// 2-column `make_u64_i64_schema` (U64 PK + I64 payload). Rows land in
-    /// the order given; a freshly-built batch is `Raw` so the ingest path
-    /// runs the canonical sort+fold.
+    /// Unsorted `Raw` rows for the U64+I64 schema; the ingest path runs the
+    /// canonical sort+fold.
     fn make_batch(rows: &[(u64, i64, i64)]) -> Batch {
-        let schema = make_u64_i64_schema();
-        let mut batch = Batch::with_schema(schema, rows.len().max(1));
-        for &(pk, w, val) in rows {
-            batch.extend_pk(pk as u128);
-            batch.extend_weight(&w.to_le_bytes());
-            batch.extend_null_bmp(&0u64.to_le_bytes());
-            batch.extend_col(0, &val.to_le_bytes());
-            batch.count += 1;
-        }
-        batch
+        make_batch_raw(&make_schema_u64_i64(), rows)
     }
 
     /// `Table::new(...)` with the per-test boilerplate folded away.
@@ -815,7 +801,7 @@ mod tests {
     fn table_ephemeral_lifecycle() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("eph_test");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
 
         let mut t = new_table(&tdir, schema, 100, 1 << 20, RecoverySource::Rederive);
 
@@ -838,7 +824,7 @@ mod tests {
     fn table_persistent_lifecycle() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("pers_test");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
 
         let mut t = new_table(&tdir, schema, 200, 1 << 20, RecoverySource::SalReplay);
 
@@ -859,7 +845,7 @@ mod tests {
     fn table_cursor_iteration() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("cursor_test");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
 
         let mut t = new_table(&tdir, schema, 300, 1 << 20, RecoverySource::Rederive);
 
@@ -876,7 +862,7 @@ mod tests {
     fn table_retract_pk() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("retract_test");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
 
         let mut t = new_table(&tdir, schema, 400, 1 << 20, RecoverySource::Rederive);
 
@@ -900,7 +886,7 @@ mod tests {
     fn table_compact() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("compact_test");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
 
         // Durable: each flush writes a real `shard_*` so `run_compact` (L0→L1)
         // is exercised. Under non-durable flush these tiny rows would stay in
@@ -929,7 +915,7 @@ mod tests {
     fn test_retract_pk_after_update() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("retract_update_test");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
 
         let mut t = new_table(&tdir, schema, 600, 1 << 20, RecoverySource::Rederive);
 
@@ -961,7 +947,7 @@ mod tests {
     fn test_ingest_owned_batch_unsorted() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("ingest_owned_unsorted_test");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
 
         let mut t = new_table(&tdir, schema, 700, 1 << 20, RecoverySource::Rederive);
 
@@ -991,7 +977,7 @@ mod tests {
     fn test_ingest_owned_batch_pre_flushes_when_overflowing() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("pre_flush_test");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
 
         // Very small arena: 40 bytes. A 3-row batch (~120 bytes) will exceed it.
         let mut t = new_table(&tdir, schema, 900, 40, RecoverySource::Rederive);
@@ -1026,7 +1012,7 @@ mod tests {
     fn test_memtable_overflow_auto_flush() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("overflow_auto_flush");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
 
         // arena = 128 bytes → should_flush threshold = 96.
         // Each row is 32 bytes (PK 8 + weight 8 + null_bmp 8 + col 8).
@@ -1061,7 +1047,7 @@ mod tests {
     fn test_retract_pk_shard_fallback_multiple_payloads() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("retract_shard_fallback");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
 
         // Durable: `retract_pk` is base-table-only (base tables are durable), so
         // the flushed rows must land in a real shard for the shard-fallback path
@@ -1100,7 +1086,7 @@ mod tests {
     fn flush_prepare_drop_cleans_tmp_files() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("drop_clean_test");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
 
         let mut t = new_table(&tdir, schema, 1100, 1 << 20, RecoverySource::SalReplay);
 
@@ -1141,7 +1127,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("corrupted_manifest_test");
         std::fs::create_dir_all(&tdir).unwrap();
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
 
         // Write a corrupted manifest (wrong magic).
         let manifest_path = tdir.join("manifest.bin");
@@ -1163,7 +1149,7 @@ mod tests {
     fn flush_prepare_non_durable_done_inline() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("done_inline_test");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
 
         let mut t = new_table(&tdir, schema, 1200, 1 << 20, RecoverySource::Rederive);
 
@@ -1330,7 +1316,7 @@ mod tests {
     fn nondurable_flush_writes_no_file() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("no_file_test");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut t = new_table(&tdir, schema, 100, 1 << 20, RecoverySource::Rederive);
 
         t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200), (30, 1, 300)]))
@@ -1360,7 +1346,7 @@ mod tests {
     fn nondurable_cross_flush_fold_nets_to_zero() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("cross_fold_test");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut t = new_table(&tdir, schema, 100, 1 << 20, RecoverySource::Rederive);
 
         // 6 alternating +1 / -1 flushes on (k=7, v=70): each lands in its own
@@ -1389,7 +1375,7 @@ mod tests {
     fn nondurable_run_count_stays_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("run_bound_test");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut t = new_table(&tdir, schema, 100, 1 << 20, RecoverySource::Rederive);
 
         let n = INMEM_COMPACT_THRESHOLD as u64 + 4;
@@ -1413,7 +1399,7 @@ mod tests {
     fn nondurable_ceiling_spill_to_disk() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("ceiling_spill_test");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut t = new_table(&tdir, schema, 100, 1 << 20, RecoverySource::Rederive);
         t.set_inmem_ceiling_for_test(100); // < one flush (~10 rows × 32 B)
 
@@ -1440,7 +1426,7 @@ mod tests {
     fn nondurable_repeated_spill_stays_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("repeated_spill_test");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut t = new_table(&tdir, schema, 100, 1 << 20, RecoverySource::Rederive);
         t.set_inmem_ceiling_for_test(100);
 
@@ -1473,7 +1459,7 @@ mod tests {
     fn nondurable_has_pk_over_in_memory_runs() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("has_pk_inmem_test");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut t = new_table(&tdir, schema, 100, 1 << 20, RecoverySource::Rederive);
 
         t.ingest_owned_batch(make_batch(&[(5, 1, 50)])).unwrap();
@@ -1493,7 +1479,7 @@ mod tests {
     fn nondurable_mixed_disk_and_heap_read() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("mixed_read_test");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut t = new_table(&tdir, schema, 100, 1 << 20, RecoverySource::Rederive);
 
         // Force keys 0..10 to disk.
@@ -1545,7 +1531,7 @@ mod tests {
     fn inmem_retract_multiple_payloads() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("inmem_retract_payloads");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut t = new_table(&tdir, schema, 5001, 1 << 20, RecoverySource::Rederive);
 
         // Run 1: INSERT (PK=10, +1, val=100).
@@ -1689,7 +1675,7 @@ mod tests {
     fn inmem_cross_tier_netting() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("inmem_cross_tier");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut t = new_table(&tdir, schema, 5004, 1 << 20, RecoverySource::Rederive);
 
         // RAM run: two payloads for PK=5 (val=50, val=60), each +1.
@@ -1721,7 +1707,7 @@ mod tests {
     fn retract_groups_across_all_three_tiers() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("retract_three_tier");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         // Durable: shard tier participation requires SalReplay persistence.
         let mut t = new_table(&tdir, schema, 5014, 1 << 20, RecoverySource::SalReplay);
 
@@ -1760,7 +1746,7 @@ mod tests {
     fn inmem_fold_rebuilds_run_bloom() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("inmem_fold_bloom");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut t = new_table(&tdir, schema, 5005, 1 << 20, RecoverySource::Rederive);
 
         // One key per flush past the fold threshold; the folded run's bloom is
@@ -1803,7 +1789,7 @@ mod tests {
     fn barrier_flush_folds_populated_l0_not_empty() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("barrier_fold_l0");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         // Small arena (128 B, threshold 96): an 8-row batch (256 B) overflows the
         // memtable into in_memory_l0, leaving the memtable empty.
         let mut t = new_table(&tdir, schema, 7100, 128, RecoverySource::SalReplay);
@@ -1840,7 +1826,7 @@ mod tests {
     fn salreplay_spill_unified_naming_and_lsn() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("salreplay_spill");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         // Small arena forces memtable overflow → flush_to_ram; tiny ceiling forces
         // the folded L0 to spill.
         let mut t = new_table(&tdir, schema, 7200, 128, RecoverySource::SalReplay);
@@ -1899,7 +1885,7 @@ mod tests {
     /// spill.
     #[test]
     fn salreplay_barrier_and_spill_carry_pk_unique_tag() {
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
 
         // Barrier shard: live memtable + populated L0, base-table tagging on.
         {
@@ -1954,7 +1940,7 @@ mod tests {
     fn current_lsn_bumps_on_every_ingest_including_rederive() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("lsn_bump_rederive");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut t = new_table(&tdir, schema, 7400, 1 << 20, RecoverySource::Rederive);
 
         assert_eq!(t.current_lsn, 1, "fresh Rederive table starts at LSN 1");
@@ -1971,7 +1957,7 @@ mod tests {
     fn salreplay_overflow_into_l0_retract() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("salreplay_l0_retract");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         // Small arena so an 8-row ingest overflows the memtable into in_memory_l0.
         let mut t = new_table(&tdir, schema, 7500, 128, RecoverySource::SalReplay);
         t.enable_pk_unique_tagging();
@@ -2011,7 +1997,7 @@ mod tests {
     fn lone_spill_survives_checkpoint_barrier() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("lone_spill_ckpt");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut t = new_table(&tdir, schema, 7600, 128, RecoverySource::SalReplay);
         t.set_inmem_ceiling_for_test(100);
 
@@ -2044,7 +2030,7 @@ mod tests {
     fn deferred_cleanup_crash_sim_reopens_from_old_manifest() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("deferred_cleanup_crash");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut t = new_table(&tdir, schema, 7700, 128, RecoverySource::SalReplay);
         t.set_inmem_ceiling_for_test(100);
 
@@ -2083,7 +2069,7 @@ mod tests {
     fn compact_then_quiet_barrier_publishes_compacted_index() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("compact_then_quiet");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut t = new_table(&tdir, schema, 7800, 128, RecoverySource::SalReplay);
         t.set_inmem_ceiling_for_test(100);
 
@@ -2116,16 +2102,13 @@ mod tests {
     /// republish re-stamps a newer one.
     #[test]
     fn generation_preserved_by_compaction_republish() {
-        use super::super::manifest::{read_file, ManifestEntryRaw};
+        use super::super::manifest::read_file;
 
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("gen_republish");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let manifest_path = std::ffi::CString::new(tdir.join("manifest.bin").to_str().unwrap()).unwrap();
-        let read_generation = |path: &std::ffi::CStr| -> u64 {
-            let mut out = vec![ManifestEntryRaw::default(); 64];
-            read_file(path, &mut out).unwrap().1.generation
-        };
+        let read_generation = |path: &std::ffi::CStr| -> u64 { read_file(path).unwrap().unwrap().1.generation };
 
         // Publish at generation G1 with a compaction pending.
         let mut t = new_table(&tdir, schema, 7900, 128, RecoverySource::SalReplay);
@@ -2160,7 +2143,7 @@ mod tests {
     fn rederive_checkpointed_conditional_load() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("cond_load");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let manifest_path = tdir.join("manifest.bin");
 
         // Publish a durable shard + manifest stamped at generation 7.
@@ -2213,7 +2196,7 @@ mod tests {
     /// `Pending` with an empty sweep and no new shard.
     #[test]
     fn barrier_gate_matrix() {
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
 
         // Arm 1 — clean tier gates to Empty.
         {
@@ -2286,7 +2269,7 @@ mod tests {
     fn rederive_compaction_drains_deletions_immediately() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("rederive_immediate_drain");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut t = new_table(&tdir, schema, 8000, 128, RecoverySource::Rederive);
         t.set_inmem_ceiling_for_test(100);
 
@@ -2316,7 +2299,7 @@ mod tests {
     fn salreplay_flush_drains_deferred_compaction() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("salreplay_flush_drain");
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut t = new_table(&tdir, schema, 8100, 128, RecoverySource::SalReplay);
         t.set_inmem_ceiling_for_test(100);
 

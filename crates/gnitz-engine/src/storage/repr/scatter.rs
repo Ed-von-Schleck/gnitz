@@ -439,32 +439,10 @@ mod tests {
     use super::super::merge::ColPtr;
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
-    use crate::test_support::wide_pk_3xu64_schema;
-
-    // Trivial schema/batch builders shared with `merge`'s test module, duplicated
-    // test-side per the refactor's no-forked-OPK-logic rule: these only call the
-    // public batch/schema constructors, so no key encoding is re-derived here.
-    fn make_schema_i64() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U128, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        )
-    }
+    use crate::test_support::{make_schema_u128_i64, wide_pk_3xu64_schema};
 
     fn make_batch_i64(rows: &[(u128, i64, i64)]) -> Batch {
-        let schema = make_schema_i64();
-        let mut b = Batch::with_schema(schema, rows.len().max(1));
-        for &(pk, w, val) in rows {
-            b.extend_pk(pk);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &val.to_le_bytes());
-            b.count += 1;
-        }
-        b
+        crate::test_support::make_batch_u128_raw(&make_schema_u128_i64(), rows)
     }
 
     fn read_pk_packed(out_pk: &[u8], i: usize, stride: usize) -> u128 {
@@ -533,7 +511,7 @@ mod tests {
 
     #[test]
     fn test_scatter_basic() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         let b = make_batch_i64(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
 
         // Pick rows 2 and 0 (out of order)
@@ -545,7 +523,7 @@ mod tests {
 
     #[test]
     fn test_scatter_empty_indices() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         let b = make_batch_i64(&[(1, 1, 10)]);
 
         let result = run_scatter(&b, &[], &[], &schema);
@@ -554,7 +532,7 @@ mod tests {
 
     #[test]
     fn test_scatter_with_explicit_weights() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         let b = make_batch_i64(&[(1, 1, 10), (2, 1, 20)]);
 
         // Override weights: row 1 gets w=5, row 0 gets w=-1
@@ -774,7 +752,7 @@ mod tests {
     /// Build a stride-16 `(U128 pk, I64 payload)` batch from raw 16-byte PK
     /// patterns.
     fn make_batch_pk16(rows: &[([u8; 16], i64, i64)]) -> Batch {
-        let schema = make_schema_i64(); // U128 pk + I64 payload → stride 16
+        let schema = make_schema_u128_i64(); // U128 pk + I64 payload → stride 16
         let mut b = Batch::empty_with_schema(&schema);
         b.reserve_rows(rows.len().max(1));
         for (pk, w, val) in rows {
@@ -830,7 +808,7 @@ mod tests {
 
     #[test]
     fn test_scatter_multi_source_const_pk16() {
-        let schema = make_schema_i64(); // U128 pk → stride 16
+        let schema = make_schema_u128_i64(); // U128 pk → stride 16
         let pk_a = [0xa1u8; 16];
         let pk_b = [0xb2u8; 16];
         let pk_c = [0xc3u8; 16];
@@ -937,7 +915,7 @@ mod tests {
 
     #[test]
     fn test_scatter_unified_sources_const_pk16() {
-        let schema = make_schema_i64(); // U128 pk → stride 16
+        let schema = make_schema_u128_i64(); // U128 pk → stride 16
         let pk_a = [0xa1u8; 16];
         let pk_b = [0xb2u8; 16];
         let pk_c = [0xc3u8; 16];

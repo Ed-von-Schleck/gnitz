@@ -44,8 +44,8 @@ pub(super) fn compare_by_group_cols<A: ColumnarSource, B: ColumnarSource>(
                 // NULL is never set on non-nullable columns, so the bit is always 0
                 // there and this branch is harmless. NULLs sort before non-NULLs
                 // (NULLS FIRST), so all NULLs are adjacent and form a single group.
-                let a_is_null = (a_null_word >> pi) & 1 != 0;
-                let b_is_null = (b_null_word >> pi) & 1 != 0;
+                let a_is_null = crate::schema::null_bit(a_null_word, pi);
+                let b_is_null = crate::schema::null_bit(b_null_word, pi);
                 match (a_is_null, b_is_null) {
                     (true, true) => continue,
                     (true, false) => return Ordering::Less,

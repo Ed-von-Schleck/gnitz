@@ -42,9 +42,17 @@ use index_router::PartitionRouter;
 pub(crate) struct RelayPrepared {
     view_id: i64,
     source_id: i64,
-    dest_batches: Vec<Batch>,
+    dest: RelayDest,
     schema: SchemaDescriptor,
     name_bytes: Rc<Vec<Vec<u8>>>,
+}
+
+/// The relay's destination payloads: one batch per worker (scatter), or a
+/// single batch referenced by every worker slot (broadcast — the SAL encode
+/// re-encodes per slot regardless, so no per-worker copy is materialized).
+pub(crate) enum RelayDest {
+    PerWorker(Vec<Batch>),
+    Broadcast(Box<Batch>),
 }
 
 // ---------------------------------------------------------------------------

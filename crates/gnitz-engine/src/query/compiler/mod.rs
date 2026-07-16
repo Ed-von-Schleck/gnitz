@@ -900,7 +900,7 @@ mod tests {
         // is the aggregate column's type. The order-encodable I64 agg compiles (Some),
         // proving the circuit shape and view_dir are otherwise valid, so the STRING
         // agg's None is attributable solely to the guard.
-        use gnitz_wire::{AggFunc, AggKind, OpNode, ReduceOutKey};
+        use gnitz_wire::{AggFunc, OpNode, ReduceOutKey};
         let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
         std::fs::create_dir_all(&base).unwrap();
 
@@ -919,7 +919,7 @@ mod tests {
                 1,
                 OpNode::Reduce {
                     group_cols: vec![0],
-                    agg: AggKind::Specs(vec![(AggFunc::Max, 1)]),
+                    agg: vec![(AggFunc::Max, 1)],
                     global_ground: false,
                     // group_cols = [0] = the single U64 PK ⇒ PkPermutation.
                     out_key: ReduceOutKey::PkPermutation,
@@ -952,7 +952,7 @@ mod tests {
     /// kinds: the three matching kinds compile, the six cross pairings reject.
     #[test]
     fn reduce_out_key_validation_rejects_mismatch() {
-        use gnitz_wire::{AggFunc, AggKind, OpNode, ReduceOutKey};
+        use gnitz_wire::{AggFunc, OpNode, ReduceOutKey};
         let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
         std::fs::create_dir_all(&base).unwrap();
 
@@ -968,7 +968,7 @@ mod tests {
                     group_cols: group,
                     // A linear COUNT keeps the MIN/MAX-eligibility guard out of the
                     // picture, isolating the out_key validation.
-                    agg: AggKind::Specs(vec![(AggFunc::Count, 0)]),
+                    agg: vec![(AggFunc::Count, 0)],
                     global_ground: false,
                     out_key,
                 },
@@ -1711,10 +1711,10 @@ mod tests {
 
     #[test]
     fn test_reduce_group_cols_out_of_bounds_rejected() {
-        use gnitz_wire::{AggFunc, AggKind, OpNode, ReduceOutKey};
+        use gnitz_wire::{AggFunc, OpNode, ReduceOutKey};
         let reduce = |group: Vec<u16>| OpNode::Reduce {
             group_cols: group,
-            agg: AggKind::Specs(vec![(AggFunc::Count, 0)]),
+            agg: vec![(AggFunc::Count, 0)],
             global_ground: false,
             out_key: ReduceOutKey::PkPermutation,
         };
@@ -1724,10 +1724,10 @@ mod tests {
 
     #[test]
     fn test_reduce_agg_spec_col_out_of_bounds_rejected() {
-        use gnitz_wire::{AggFunc, AggKind, OpNode, ReduceOutKey};
+        use gnitz_wire::{AggFunc, OpNode, ReduceOutKey};
         let reduce = |col: u16| OpNode::Reduce {
             group_cols: vec![0],
-            agg: AggKind::Specs(vec![(AggFunc::Count, col)]),
+            agg: vec![(AggFunc::Count, col)],
             global_ground: false,
             out_key: ReduceOutKey::PkPermutation,
         };
@@ -1737,7 +1737,7 @@ mod tests {
 
     #[test]
     fn test_reduce_sum_over_non_decodable_column_rejected() {
-        use gnitz_wire::{AggFunc, AggKind, OpNode, ReduceOutKey};
+        use gnitz_wire::{AggFunc, OpNode, ReduceOutKey};
         // col 0 = U64 PK + group key; col 1 = the SUM aggregate column.
         let schema = |agg_tc: u8| {
             SchemaDescriptor::new(
@@ -1747,7 +1747,7 @@ mod tests {
         };
         let reduce = OpNode::Reduce {
             group_cols: vec![0],
-            agg: AggKind::Specs(vec![(AggFunc::Sum, 1)]),
+            agg: vec![(AggFunc::Sum, 1)],
             global_ground: false,
             out_key: ReduceOutKey::PkPermutation,
         };
@@ -2051,9 +2051,8 @@ mod tests {
     fn test_join_emitted_before_integrate_sink() {
         // ScanDelta(10) --PORT_IN_A--> Join(DeltaTrace)(2) --PORT_IN--> IntegrateSink(3)
         // ScanTrace(20) --PORT_TRACE-> Join(DeltaTrace)(2)
-        // The `Join → IntegrateSink` edge makes the join a topological predecessor
-        // of the sink Integrate, so its JoinDT instruction must precede the
-        // sink Integrate (which writes this epoch's output delta into view storage).
+        // IntegrateSink emits no instruction — it only resolves the sink
+        // register — so the compiled program is the JoinDT alone.
         let schema = two_col_schema();
         let mut nodes = HashMap::new();
         nodes.insert(0, gnitz_wire::OpNode::ScanDelta(10));
@@ -2081,7 +2080,9 @@ mod tests {
         )
         .expect("build_plan must succeed for the ScanDelta→Join(DT)←ScanTrace→sink circuit");
 
-        // Exactly one JoinDT and one Integrate (the sink) are emitted.
+        // Exactly one JoinDT and NO Integrate: the IntegrateSink node emits no
+        // instruction (the sink register's batch is what the epoch extracts),
+        // so the only ordering constraint left is that the join runs at all.
         let n_join = plan
             .vm
             .program
@@ -2097,19 +2098,19 @@ mod tests {
             .filter(|i| matches!(i, crate::query::vm::Instr::Integrate { .. }))
             .count();
         assert_eq!(n_join, 1, "expected exactly one JoinDT instruction, got {n_join}");
-        assert_eq!(
-            n_int, 1,
-            "expected exactly one (sink) Integrate instruction, got {n_int}"
-        );
+        assert_eq!(n_int, 0, "the sink Integrate emits no instruction, got {n_int}");
 
+        // The sink resolves to the join's output register.
         let jpos = first_instr_pos(&plan, |i| matches!(i, crate::query::vm::Instr::JoinDT { .. }));
-        let ipos = first_instr_pos(&plan, |i| matches!(i, crate::query::vm::Instr::Integrate { .. }));
-        assert!(
-            jpos < ipos,
-            "JoinDT (program pos {jpos}) must be emitted before the sink Integrate \
-             (program pos {ipos}): the join reads z⁻¹(I) — trace state before this \
-             epoch's delta is integrated — and instruction order is what enforces it",
-        );
+        match &plan.vm.program.instructions[jpos] {
+            crate::query::vm::Instr::JoinDT { out_reg, .. } => {
+                assert_eq!(
+                    *out_reg as i32, plan.out_reg,
+                    "sink register must resolve to the join's output register",
+                );
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]
@@ -2120,10 +2121,10 @@ mod tests {
         // ScanDelta(10) --PORT_IN_A--> Join(DeltaTrace)(2) ─┬─PORT_IN─► IntegrateTrace(3)
         // ScanTrace(20) --PORT_TRACE-> Join(DeltaTrace)(2)  └─PORT_IN─► IntegrateSink(4)
         //
-        // Both Integrate* nodes are strict topological successors of the join, so
-        // its JoinDT instruction must precede BOTH Integrate instructions — i.e.
-        // it must precede the FIRST one. (IntegrateTrace writes a real trace table;
-        // IntegrateSink writes view storage with a null target.)
+        // The IntegrateTrace node is a strict topological successor of the join,
+        // so its JoinDT instruction must precede the Integrate instruction.
+        // (IntegrateTrace writes a real trace table; IntegrateSink emits no
+        // instruction — it only resolves the sink register.)
         let schema = two_col_schema();
         let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
         std::fs::create_dir_all(&base).unwrap();
@@ -2160,8 +2161,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&view_dir);
         let plan = result.expect("build_plan must succeed for the join→IntegrateTrace+sink circuit");
 
-        // Two Integrate instructions are emitted (the trace and the sink); the JoinDT
-        // must precede the first of them.
+        // One Integrate instruction is emitted (the trace; the sink emits none);
+        // the JoinDT must precede it.
         let n_int = plan
             .vm
             .program
@@ -2169,10 +2170,7 @@ mod tests {
             .iter()
             .filter(|i| matches!(i, crate::query::vm::Instr::Integrate { .. }))
             .count();
-        assert_eq!(
-            n_int, 2,
-            "expected two Integrate instructions (trace + sink), got {n_int}"
-        );
+        assert_eq!(n_int, 1, "expected one Integrate instruction (the trace), got {n_int}");
 
         let jpos = first_instr_pos(&plan, |i| matches!(i, crate::query::vm::Instr::JoinDT { .. }));
         let first_ipos = first_instr_pos(&plan, |i| matches!(i, crate::query::vm::Instr::Integrate { .. }));
@@ -2283,7 +2281,7 @@ mod tests {
 
     #[test]
     fn test_circuit_range_join_n_eq_discriminator() {
-        use gnitz_wire::{AggKind, JoinKind, MapKind, OpNode, ReduceOutKey};
+        use gnitz_wire::{AggFunc, JoinKind, MapKind, OpNode, ReduceOutKey};
         let dummy_blob = dummy_expr_blob();
 
         // A GROUP BY view: ScanDelta → Map(reindex) → ExchangeShard → Reduce →
@@ -2306,10 +2304,10 @@ mod tests {
             3,
             OpNode::Reduce {
                 group_cols: vec![1],
-                agg: AggKind::Null,
-                global_ground: false,
                 // Only exercises range-join classification, never the reduce
-                // output schema/validation; the kind is immaterial here.
+                // output schema/validation; the spec is immaterial here.
+                agg: vec![(AggFunc::Count, 0)],
+                global_ground: false,
                 out_key: ReduceOutKey::SyntheticFold,
             },
         );
@@ -2922,7 +2920,7 @@ mod tests {
             bat.certify_layout(Layout::Consolidated, &merged);
             bat
         };
-        let unioned = op_union(single(g0), Some(&single(g1)), &merged);
+        let unioned = op_union(single(g0), &single(g1), &merged);
         assert_eq!(unioned.count, 2, "Z-Set + keeps both rows before consolidation");
         let empty = Rc::new(Batch::empty_with_schema(&merged));
         let mut ch = ReadCursor::from_owned(std::slice::from_ref(&empty), merged);

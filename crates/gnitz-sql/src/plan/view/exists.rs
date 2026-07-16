@@ -44,8 +44,8 @@ use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use crate::lower::compile_filter_program;
 use crate::plan::validate::{
-    reject_column_overflow, reject_duplicate_column_names, reject_unhonored_query_clauses,
-    reject_unhonored_select_clauses, HonoredClauses, HonoredQueryClauses,
+    plain_select_body, reject_column_overflow, reject_duplicate_column_names, reject_unhonored_select_clauses,
+    HonoredClauses,
 };
 use crate::plan::view::join::{
     band_union_schema, build_join_view_projection, build_pure_range_threshold, emit_equi_join_terms,
@@ -55,7 +55,7 @@ use crate::plan::view::join::{
 use crate::plan::view::predicates::{and_fold_compile, build_reindex_program, extract_join_predicates, RangeConjunct};
 use crate::plan::view::EmitPieces;
 use gnitz_core::{CircuitBuilder, ColumnDef, FixedInt, GnitzClient, NodeId, Schema, TypeCode};
-use sqlparser::ast::{BinaryOperator, Expr, Ident, Select, SelectItem, SetExpr};
+use sqlparser::ast::{BinaryOperator, Expr, Ident, Select, SelectItem};
 use std::rc::Rc;
 
 /// Emit an EXISTS/IN semi/anti-join *filter* view's pieces for a pre-allocated
@@ -188,23 +188,7 @@ fn resolve_correlation<'a>(
             )))
         }
     };
-    reject_unhonored_query_clauses(
-        subquery,
-        HonoredQueryClauses {
-            with: false,
-            limit: false,
-        },
-        ctx,
-    )?;
-    let body = subquery.body.as_ref();
-    let inner_select = match body {
-        SetExpr::Select(s) => s.as_ref(),
-        _ => {
-            return Err(GnitzSqlError::Unsupported(
-                "EXISTS/IN subquery: only a plain SELECT body is supported; compose via views".into(),
-            ))
-        }
-    };
+    let inner_select = plain_select_body(subquery, ctx)?;
     // `NOT (EXISTS …)` folds into the node's own flag, so it behaves like
     // `NOT EXISTS …` (and a double negation cancels).
     let negated = node_negated ^ outer_not;
@@ -236,11 +220,7 @@ fn resolve_correlation<'a>(
                 .into(),
         ));
     }
-    if outer_alias.eq_ignore_ascii_case(&inner_alias) {
-        return Err(GnitzSqlError::Bind(format!(
-            "relation alias '{outer_alias}' is used by both the view FROM and its subquery; rename one"
-        )));
-    }
+    reject_alias_collision(&outer_alias, &inner_alias)?;
 
     // Two-relation alias map for correlation extraction (outer at offset 0,
     // inner after it) and an outer-only map for the user projection — the inner
@@ -890,6 +870,18 @@ fn build_mark_projection(
         out_cols.push(col);
     }
     Ok((items, out_cols))
+}
+
+/// Reject the same alias naming both the view's FROM relation and its
+/// subquery's — one flat two-relation scope cannot disambiguate them. Shared by
+/// the EXISTS/IN and scalar-subquery builders.
+pub(crate) fn reject_alias_collision(outer_alias: &str, inner_alias: &str) -> Result<(), GnitzSqlError> {
+    if outer_alias.eq_ignore_ascii_case(inner_alias) {
+        return Err(GnitzSqlError::Bind(format!(
+            "relation alias '{outer_alias}' is used by both the view FROM and its subquery; rename one"
+        )));
+    }
+    Ok(())
 }
 
 /// Resolve a subquery's single plain FROM to `(tid, schema, alias)`: exactly

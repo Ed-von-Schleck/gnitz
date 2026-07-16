@@ -102,8 +102,14 @@ impl ShardIndex {
         self.pending_deletions.extend(inputs);
     }
 
+    /// Every live shard's `Rc`, yielded lazily — callers `extend` without an
+    /// intermediate `Vec` (the per-partition cursor gather).
+    pub fn all_shard_arcs_iter(&self) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
+        self.all_entries().map(|e| Rc::clone(&e.shard))
+    }
+
     pub fn all_shard_arcs(&self) -> Vec<Rc<MappedShard>> {
-        self.all_entries().map(|e| Rc::clone(&e.shard)).collect()
+        self.all_shard_arcs_iter().collect()
     }
 
     /// Test-only u128 oracle: OPK-encodes a **native** PK value (handling
@@ -208,7 +214,7 @@ impl ShardIndex {
         if !self.levels.is_empty() {
             let l1_count = self.levels[0].total_file_count();
             if l1_count > L1_TARGET_FILES {
-                self.compact_guard_vertical(1)?;
+                self.compact_guard_vertical()?;
             }
         }
 
@@ -326,11 +332,15 @@ impl ShardIndex {
         Ok(())
     }
 
-    pub(super) fn compact_guard_vertical(&mut self, src_level_num: usize) -> Result<(), StorageError> {
-        if !(1..MAX_LEVELS).contains(&src_level_num) {
-            return Ok(());
-        }
-        let src_idx = src_level_num - 1;
+    /// L1→L2 vertical compaction: fold the worst (most-filed) L1 guard,
+    /// together with the L2 guards its key range overlaps, down into L2.
+    /// Deliberately not generic over the source level — L2 is the deepest
+    /// vertical destination (`MAX_LEVELS` = 3), and an L2→L3 fold would
+    /// serialize `level = 3`, which `load_manifest` rejects.
+    pub(super) fn compact_guard_vertical(&mut self) -> Result<(), StorageError> {
+        const SRC_IDX: usize = 0; // L1
+        const DEST_IDX: usize = 1; // L2
+        let src_idx = SRC_IDX;
 
         let worst_idx = {
             let src = &self.levels[src_idx];
@@ -356,8 +366,8 @@ impl ShardIndex {
         };
 
         let compact_seq = self.next_compact_seq();
-        let dest_idx = src_level_num;
-        self.ensure_level(src_level_num + 1);
+        let dest_idx = DEST_IDX;
+        self.ensure_level(DEST_IDX + 1);
 
         let mut all_input_files: Vec<String> = self.levels[src_idx].guards[worst_idx]
             .entries
@@ -402,7 +412,7 @@ impl ShardIndex {
             &guard_keys,
             &self.schema,
             self.table_id,
-            src_level_num as u32 + 1,
+            DEST_IDX as u32 + 1,
             compact_seq,
             self.can_tag_pk_unique,
         )?;
@@ -420,9 +430,8 @@ impl ShardIndex {
             self.levels[dest_idx].get_or_create_guard(gk).entries.push(entry);
         }
 
-        if Self::level_num(dest_idx) == MAX_LEVELS - 1 {
-            self.compact_overfull_guards(dest_idx, LMAX_FILE_THRESHOLD)?;
-        }
+        // L2 is Lmax − 1 (MAX_LEVELS = 3), so its guards fold to one file.
+        self.compact_overfull_guards(dest_idx, LMAX_FILE_THRESHOLD)?;
 
         Ok(())
     }

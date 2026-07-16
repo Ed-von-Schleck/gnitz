@@ -42,6 +42,14 @@ const ENTRY_SIZE: usize = 160;
 /// always correct because it re-derives.
 pub const STATE_FORMAT: u32 = 2;
 
+/// The durable topology word recorded in `_sequences` (`SEQ_ID_TOPOLOGY`):
+/// `(worker_count << 32) | STATE_FORMAT`. The single packer shared by the
+/// boot-time recorder and the resume-verdict validator, so the two can never
+/// drift on the encoding.
+pub fn topology_word(worker_count: u32) -> u64 {
+    ((worker_count as u64) << 32) | STATE_FORMAT as u64
+}
+
 // Header offsets.
 const OFF_ENTRY_COUNT: usize = 16;
 const OFF_COMPACT_SEQ: usize = 24;
@@ -61,12 +69,8 @@ const _: () = assert!(
     "entry field widths do not sum to ENTRY_SIZE",
 );
 
-// `PkBuf` — the width-tagged PK byte buffer — lives in `schema::key`; the
-// shard index reaches it through this re-export.
-pub(crate) use crate::schema::key::PkBuf;
-
 /// On-disk manifest entry.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct ManifestEntryRaw {
     pub max_lsn: u64,
     pub filename: [u8; 128],
@@ -144,13 +148,12 @@ pub fn serialize(
     Ok(total)
 }
 
-/// Parse a manifest buffer into `out_entries` (which must hold at least the
-/// header's entry count). Returns the entry count and header on success.
+/// Parse a manifest buffer into an exact-count entry `Vec` plus the header.
 ///
 /// Current version only. There is no on-disk data to migrate in dev and the
 /// test suite is green at session start, so any other version is a hard
 /// `InvalidVersion` — no per-version field gating, no shims.
-pub fn parse(buf: &[u8], out_entries: &mut [ManifestEntryRaw]) -> Result<(usize, ManifestHeader), StorageError> {
+pub fn parse(buf: &[u8]) -> Result<(Vec<ManifestEntryRaw>, ManifestHeader), StorageError> {
     if buf.len() < HEADER_SIZE {
         return Err(StorageError::Truncated);
     }
@@ -176,23 +179,21 @@ pub fn parse(buf: &[u8], out_entries: &mut [ManifestEntryRaw]) -> Result<(usize,
     if buf.len() < expected_data {
         return Err(StorageError::Truncated);
     }
-    if out_entries.len() < count {
-        return Err(StorageError::BufferTooSmall);
-    }
 
-    for (i, out_entry) in out_entries.iter_mut().enumerate().take(count) {
+    let mut entries = Vec::with_capacity(count);
+    for i in 0..count {
         let off = HEADER_SIZE + i * ENTRY_SIZE;
         let mut filename = [0u8; 128];
         filename.copy_from_slice(&buf[off + OFF_FILENAME..off + OFF_FILENAME + 128]);
-        *out_entry = ManifestEntryRaw {
+        entries.push(ManifestEntryRaw {
             max_lsn: read_u64_le(buf, off + OFF_MAX_LSN),
             filename,
             level: read_u64_le(buf, off + OFF_LEVEL),
             guard_key: u128::from_le_bytes(buf[off + OFF_GUARD_KEY..off + OFF_GUARD_KEY + 16].try_into().unwrap()),
-        };
+        });
     }
 
-    Ok((count, header))
+    Ok((entries, header))
 }
 
 /// Returns the buffer size needed to serialize `count` entries.
@@ -204,17 +205,17 @@ pub const fn serialized_size(count: usize) -> usize {
 // File I/O (read + atomic write)
 // ---------------------------------------------------------------------------
 
-/// Read a manifest file from disk, parse it, write entries into `out_entries`.
-///
-/// Returns the entry count and header on success.
-pub fn read_file(
-    path: &std::ffi::CStr,
-    out_entries: &mut [ManifestEntryRaw],
-) -> Result<(usize, ManifestHeader), StorageError> {
+/// Read and parse a manifest file in one open. Returns `Ok(None)` when the
+/// file does not exist yet (first-time table boot ⇒ empty manifest); any other
+/// read failure is `Err(Io)`.
+pub fn read_file(path: &std::ffi::CStr) -> Result<Option<(Vec<ManifestEntryRaw>, ManifestHeader)>, StorageError> {
     use std::os::unix::ffi::OsStrExt;
-    let buf = std::fs::read(std::path::Path::new(std::ffi::OsStr::from_bytes(path.to_bytes())))
-        .map_err(|_| StorageError::Io)?;
-    parse(&buf, out_entries)
+    let buf = match std::fs::read(std::path::Path::new(std::ffi::OsStr::from_bytes(path.to_bytes()))) {
+        Ok(buf) => buf,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(StorageError::Io),
+    };
+    parse(&buf).map(Some)
 }
 
 /// Open .tmp manifest at "<path>.tmp", serialize entries into it, and return
@@ -313,12 +314,6 @@ fn peek_header_u64(path: &std::ffi::CStr, off: usize) -> Result<Option<u64>, Sto
     Ok(Some(read_u64_le(&hdr, off)))
 }
 
-/// Read just the entry count from a manifest file header. `Ok(None)` when the
-/// file does not exist yet — load_manifest treats this as the empty manifest.
-pub fn entry_count(path: &std::ffi::CStr) -> Result<Option<usize>, StorageError> {
-    Ok(peek_header_u64(path, OFF_ENTRY_COUNT)?.map(|n| n as usize))
-}
-
 /// Read just the checkpoint generation from a manifest file header. `Ok(None)`
 /// when the file does not exist yet. Used by the conditional view-state reload:
 /// a `RederiveCheckpointed` table loads its shards only when its manifest
@@ -351,47 +346,6 @@ mod tests {
     }
 
     #[test]
-    fn pkbuf_eq_hash_compare_only_len_window() {
-        use std::collections::HashSet;
-        // Same meaningful bytes, different tail → equal and same hash.
-        let mut a = PkBuf::from_bytes(&7u64.to_le_bytes());
-        let b = PkBuf::from_bytes(&7u64.to_le_bytes());
-        a.bytes[8] = 0xAB; // tail garbage past len; eq/hash must ignore it
-        assert!(a == b);
-        let mut set: HashSet<PkBuf> = HashSet::new();
-        set.insert(b);
-        assert!(set.contains(&a), "tail bytes must not affect membership");
-    }
-
-    #[test]
-    fn pkbuf_borrow_heterogeneous_lookup() {
-        use std::collections::HashSet;
-        let mut set: HashSet<PkBuf> = HashSet::new();
-        set.insert(PkBuf::from_bytes(&123u64.to_le_bytes()));
-        // Raw &[u8] lookup via Borrow<[u8]> — no PkBuf construction.
-        assert!(set.contains(&123u64.to_le_bytes()[..]));
-        assert!(!set.contains(&124u64.to_le_bytes()[..]));
-    }
-
-    #[test]
-    fn pkbuf_wide_differs_past_byte_16() {
-        // Two 24-byte keys identical in the first 16 bytes but differing in the
-        // last 8 must be distinct — the failure mode of any u128-truncating key.
-        let mut x = Vec::new();
-        x.extend_from_slice(&1u64.to_le_bytes());
-        x.extend_from_slice(&2u64.to_le_bytes());
-        x.extend_from_slice(&3u64.to_le_bytes());
-        let mut y = x.clone();
-        y[16..24].copy_from_slice(&999u64.to_le_bytes());
-        let px = PkBuf::from_bytes(&x);
-        let py = PkBuf::from_bytes(&y);
-        assert!(px != py);
-        let mut set = std::collections::HashSet::new();
-        set.insert(px);
-        assert!(!set.contains(&py));
-    }
-
-    #[test]
     fn parse_rejects_count_overflow() {
         // A corrupt header whose count * ENTRY_SIZE overflows usize must be
         // rejected, not wrap past the length check.
@@ -399,8 +353,7 @@ mod tests {
         write_u64_le(&mut buf, 0, MAGIC);
         write_u64_le(&mut buf, 8, VERSION);
         write_u64_le(&mut buf, 16, u64::MAX); // count
-        let mut out = [ManifestEntryRaw::default(); 1];
-        let r = parse(&buf, &mut out);
+        let r = parse(&buf);
         assert!(matches!(r, Err(StorageError::Truncated)));
     }
 
@@ -428,9 +381,8 @@ mod tests {
         let written = serialize(&mut buf, &entries, hdr(7, 3)).unwrap();
         assert_eq!(written, buf.len());
 
-        let mut out = vec![ManifestEntryRaw::default(); n];
-        let (count, header) = parse(&buf, &mut out).unwrap();
-        assert_eq!(count, n);
+        let (out, header) = parse(&buf).unwrap();
+        assert_eq!(out.len(), n);
         assert_eq!(header, hdr(7, 3), "header must round-trip through serialize/parse");
 
         for i in 0..n {
@@ -452,9 +404,8 @@ mod tests {
         let mut buf = vec![0u8; serialized_size(1)];
         serialize(&mut buf, &entries, header).unwrap();
 
-        let mut out = vec![ManifestEntryRaw::default(); 1];
-        let (count, got) = parse(&buf, &mut out).unwrap();
-        assert_eq!(count, 1);
+        let (out, got) = parse(&buf).unwrap();
+        assert_eq!(out.len(), 1);
         assert_eq!(got, header, "generation must round-trip through serialize/parse");
     }
 
@@ -466,18 +417,7 @@ mod tests {
         write_u64_le(&mut buf, 8, VERSION - 1);
         write_u64_le(&mut buf, 16, 0);
 
-        let mut out = vec![ManifestEntryRaw::default(); 1];
-        assert_eq!(parse(&buf, &mut out), Err(StorageError::InvalidVersion));
-    }
-
-    #[test]
-    fn undersized_out_entries_rejected() {
-        let entries = vec![make_entry(1, "a.db"), make_entry(2, "b.db")];
-        let mut buf = vec![0u8; serialized_size(2)];
-        serialize(&mut buf, &entries, hdr(0, 0)).unwrap();
-
-        let mut out = vec![ManifestEntryRaw::default(); 1];
-        assert_eq!(parse(&buf, &mut out), Err(StorageError::BufferTooSmall));
+        assert_eq!(parse(&buf).unwrap_err(), StorageError::InvalidVersion);
     }
 
     #[test]
@@ -485,13 +425,12 @@ mod tests {
         let mut buf = vec![0u8; HEADER_SIZE];
         write_u64_le(&mut buf, 0, 0xDEADBEEF);
 
-        let mut out = vec![ManifestEntryRaw::default(); 1];
-        assert_eq!(parse(&buf, &mut out), Err(StorageError::InvalidMagic));
+        assert_eq!(parse(&buf).unwrap_err(), StorageError::InvalidMagic);
     }
 
     #[test]
     fn truncated() {
-        assert_eq!(parse(&[0u8; 10], &mut []), Err(StorageError::Truncated));
+        assert_eq!(parse(&[0u8; 10]).unwrap_err(), StorageError::Truncated);
     }
 
     #[test]
@@ -510,8 +449,8 @@ mod tests {
         let written = serialize(&mut buf, &[], hdr(42, 0)).unwrap();
         assert_eq!(written, HEADER_SIZE);
 
-        let (count, header) = parse(&buf, &mut []).unwrap();
-        assert_eq!(count, 0);
+        let (out, header) = parse(&buf).unwrap();
+        assert!(out.is_empty());
         assert_eq!(header.compact_seq, 42);
     }
 
@@ -521,8 +460,7 @@ mod tests {
         let mut buf = vec![0u8; serialized_size(1)];
         serialize(&mut buf, &[e], hdr(0, 0)).unwrap();
 
-        let mut out = vec![ManifestEntryRaw::default(); 1];
-        parse(&buf, &mut out).unwrap();
+        let (out, _) = parse(&buf).unwrap();
 
         // Extract filename
         let end = out[0].filename.iter().position(|&b| b == 0).unwrap_or(128);
@@ -555,9 +493,8 @@ mod tests {
         write_manifest(&cpath, &entries, hdr(5, 2));
         assert!(path.exists());
 
-        let mut out = vec![ManifestEntryRaw::default(); 8];
-        let (count, header) = read_file(&cpath, &mut out).unwrap();
-        assert_eq!(count, 3);
+        let (out, header) = read_file(&cpath).unwrap().unwrap();
+        assert_eq!(out.len(), 3);
         assert_eq!(
             header,
             hdr(5, 2),
@@ -576,9 +513,10 @@ mod tests {
         let path = dir.path().join("DOES_NOT_EXIST");
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
 
-        let mut out = vec![ManifestEntryRaw::default(); 1];
-        let rc = read_file(&cpath, &mut out);
-        assert_eq!(rc, Err(StorageError::Io));
+        assert!(
+            read_file(&cpath).unwrap().is_none(),
+            "missing manifest file reads as the empty manifest"
+        );
     }
 
     #[test]
@@ -589,9 +527,8 @@ mod tests {
 
         write_manifest(&cpath, &[], hdr(42, 0));
 
-        let mut out = vec![ManifestEntryRaw::default(); 1];
-        let (count, header) = read_file(&cpath, &mut out).unwrap();
-        assert_eq!(count, 0);
+        let (out, header) = read_file(&cpath).unwrap().unwrap();
+        assert!(out.is_empty());
         assert_eq!(header.compact_seq, 42);
     }
 

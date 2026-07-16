@@ -1,7 +1,6 @@
 //! DBSP VM: executes compiled circuit programs entirely in Rust.
 
 use crate::expr::ScalarFunc;
-use crate::ops::AggDescriptor;
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, ReadCursor, Table};
 
@@ -55,7 +54,6 @@ pub(crate) enum Instr {
     Union {
         in_a: u16,
         in_b: u16,
-        has_b: bool,
         out_reg: u16,
     },
     /// Shared instruction for `distinct` and `positive_part`: per consolidated
@@ -66,7 +64,7 @@ pub(crate) enum Instr {
         in_reg: u16,
         hist_reg: u16,
         out_reg: u16,
-        hist_table_idx: i16,
+        hist_table_idx: u16,
         lo: i64,
         hi: i64,
     },
@@ -74,13 +72,11 @@ pub(crate) enum Instr {
         delta_reg: u16,
         trace_reg: u16,
         out_reg: u16,
-        right_schema_idx: u16,
     },
     JoinDTRange {
         delta_reg: u16,
         trace_reg: u16,
         out_reg: u16,
-        right_schema_idx: u16,
         n_eq: u8,
         rel: gnitz_wire::RangeRel,
     },
@@ -140,29 +136,25 @@ pub(crate) fn reads_reg(instr: &Instr, r: u16) -> bool {
         | Instr::WeightClamp { in_reg, .. }
         | Instr::Integrate { in_reg, .. }
         | Instr::Reduce { in_reg, .. } => *in_reg == r,
-        Instr::Union { in_a, in_b, has_b, .. } => *in_a == r || (*has_b && *in_b == r),
+        Instr::Union { in_a, in_b, .. } => *in_a == r || *in_b == r,
         Instr::JoinDT { delta_reg, .. } | Instr::JoinDTRange { delta_reg, .. } => *delta_reg == r,
         Instr::ScanTrace { .. } | Instr::Halt => false,
     }
 }
 
 /// Combined-AVI descriptor embedded in an Integrate instruction. One table
-/// serves every MIN/MAX aggregate of the reduce; `aggs` (an `agg_descs`-pool
-/// slice) is the value-indexed subset of the reduce's descriptors in descriptor
-/// order (ordinal = position), and `group_cols` (a `group_cols`-pool slice) is
-/// the group key the index is partitioned by. The population derives
-/// `for_max`/type from each descriptor, matching the read side. (The Reduce
-/// read side needs only the table — `avi_table_idx` — to open a cursor against;
-/// it reads per-aggregate `for_max`/type from its own `agg_descs` by ordinal.)
+/// serves every MIN/MAX aggregate of the reduce; the baked resources — the
+/// composite index schema, the group-key gatherer, and the value-indexed
+/// subset of the reduce's descriptors (ordinal = position) with their resolved
+/// column locators — live in `Program::avi_bakes`. The population derives
+/// `for_max`/type from each baked descriptor, matching the read side. (The
+/// Reduce read side needs only the table — `avi_table_idx` — to open a cursor
+/// against; it reads per-aggregate `for_max`/type from its own `agg_descs` by
+/// ordinal.)
 pub(crate) struct IntegrateAvi {
     pub table_idx: u16,
-    pub group_cols_offset: u32,
-    pub group_cols_count: u16,
-    pub agg_descs_offset: u32,
-    pub agg_descs_count: u16,
-    /// Index into `Program::avi_extractors` — the baked group-key gatherer the
-    /// population loop reads each row's composite key prefix through.
-    pub extractor_idx: u16,
+    /// Index into `Program::avi_bakes`.
+    pub bake_idx: u16,
 }
 
 /// Opaque handle owning a compiled program and its register file.
@@ -312,18 +304,14 @@ pub(crate) struct Program {
     /// Shared resource arrays — referenced by index from instructions.
     pub funcs: Vec<*const ScalarFunc>,
     pub tables: Vec<*mut Table>,
-    pub schemas: Vec<SchemaDescriptor>,
-    pub agg_descs: Vec<AggDescriptor>,
-    pub group_cols: Vec<u32>,
     pub reindex_cols: Vec<u32>,
     /// Parallel to `reindex_cols` (same offsets): per-column carried promotion
     /// target tc (`0` = derive from source).
     pub reindex_target_tcs: Vec<u8>,
     /// Baked per-`Instr::Reduce` plans (see `ops::ReducePlan`).
     pub reduce_plans: Vec<crate::ops::ReducePlan>,
-    /// Baked AVI write-side group-key extractors, indexed by
-    /// `IntegrateAvi::extractor_idx`.
-    pub avi_extractors: Vec<crate::ops::GroupKeyExtractor>,
+    /// Baked AVI write-side resources, indexed by `IntegrateAvi::bake_idx`.
+    pub avi_bakes: Vec<crate::ops::AviBake>,
 }
 
 // SAFETY: Program is only accessed from a single thread (the worker thread
@@ -620,11 +608,10 @@ mod tests {
         let schema = schema_1i64();
 
         let mut builder = ProgramBuilder::new();
-        // pass-through (a has_b=false Union is the identity op)
+        // pass-through (a union with an empty register is the identity op)
         builder.push(Instr::Union {
             in_a: 0,
-            in_b: 0,
-            has_b: false,
+            in_b: 2,
             out_reg: 1,
         });
         builder.push(Instr::Halt);
@@ -632,9 +619,9 @@ mod tests {
         // Consolidated empty batch (ghost elimination already applied)
         let input = make_batch(schema, &[]);
 
-        let reg_meta = [RegisterMeta::delta(schema); 2];
+        let reg_meta = [RegisterMeta::delta(schema); 3];
         let vm = builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 2];
+        let cursors = vec![std::ptr::null_mut(); 3];
         let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1, &cursors).unwrap();
 
         assert!(result.is_none());
@@ -645,20 +632,19 @@ mod tests {
         let schema = schema_1i64();
 
         let mut builder = ProgramBuilder::new();
-        // pass-through (a has_b=false Union is the identity op)
+        // pass-through (a union with an empty register is the identity op)
         builder.push(Instr::Union {
             in_a: 0,
-            in_b: 0,
-            has_b: false,
+            in_b: 2,
             out_reg: 1,
         });
         builder.push(Instr::Halt);
 
         let input = make_batch(schema, &[]);
 
-        let reg_meta = [RegisterMeta::delta(schema); 2];
+        let reg_meta = [RegisterMeta::delta(schema); 3];
         let vm = builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 2];
+        let cursors = vec![std::ptr::null_mut(); 3];
         let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1, &cursors).unwrap();
 
         assert!(result.is_none());
@@ -666,30 +652,35 @@ mod tests {
 
     #[test]
     fn test_union_operator() {
-        // Union combines two batches; here just union reg 0 with has_b=false
-        // (single input mode).
+        // Union both input registers: reg 0 carries the seeded batch, reg 2 is
+        // seeded with a second batch.
         let schema = schema_1i64();
 
         let mut builder = ProgramBuilder::new();
-        // Union with has_b=false: effectively a pass-through (copies batch_a only)
         builder.push(Instr::Union {
             in_a: 0,
-            in_b: 0,
-            has_b: false,
+            in_b: 2,
             out_reg: 1,
         });
         builder.push(Instr::Halt);
 
         let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 1, 20)]);
+        let input_b = make_batch(schema, &[(3u128, 1, 30)]);
 
-        let reg_meta = [RegisterMeta::delta(schema); 2];
+        let reg_meta = [RegisterMeta::delta(schema); 3];
         let vm = builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 2];
-        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1, &cursors)
-            .unwrap()
-            .unwrap();
+        let cursors = vec![std::ptr::null_mut(); 3];
+        let result = execute_epoch_multi(
+            &vm.program,
+            &mut { vm.regfile },
+            [(0u16, input), (2u16, input_b)],
+            1,
+            &cursors,
+        )
+        .unwrap()
+        .unwrap();
 
-        assert_eq!(result.count, 2);
+        assert_eq!(result.count, 3);
     }
 
     // Item 7: Union with in_a == in_b is Z + Z and must double every weight.
@@ -702,7 +693,6 @@ mod tests {
         builder.push(Instr::Union {
             in_a: 0,
             in_b: 0,
-            has_b: true,
             out_reg: 1,
         });
         builder.push(Instr::Halt);
@@ -727,20 +717,19 @@ mod tests {
         let schema = schema_1i64();
 
         let mut builder = ProgramBuilder::new();
-        // pass-through (a has_b=false Union is the identity op)
+        // pass-through (a union with an empty register is the identity op)
         builder.push(Instr::Union {
             in_a: 0,
-            in_b: 0,
-            has_b: false,
+            in_b: 2,
             out_reg: 1,
         });
         builder.push(Instr::Halt);
 
         let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 1, 20)]);
 
-        let reg_meta = [RegisterMeta::delta(schema); 2];
+        let reg_meta = [RegisterMeta::delta(schema); 3];
         let vm = builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 2];
+        let cursors = vec![std::ptr::null_mut(); 3];
         let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1, &cursors)
             .unwrap()
             .unwrap();
@@ -757,18 +746,17 @@ mod tests {
         let schema = schema_1i64();
 
         let mut builder = ProgramBuilder::new();
-        // pass-through (a has_b=false Union is the identity op)
+        // pass-through (a union with an empty register is the identity op)
         builder.push(Instr::Union {
             in_a: 0,
-            in_b: 0,
-            has_b: false,
+            in_b: 2,
             out_reg: 1,
         });
         builder.push(Instr::Halt);
 
-        let reg_meta = [RegisterMeta::delta(schema); 2];
+        let reg_meta = [RegisterMeta::delta(schema); 3];
         let mut vm = *builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 2];
+        let cursors = vec![std::ptr::null_mut(); 3];
 
         // Tick 1
         let input1 = make_batch(schema, &[(1u128, 1, 10)]);
@@ -854,7 +842,7 @@ mod tests {
 
         let mut builder = ProgramBuilder::new();
         // reg 0 = input delta, reg 1 = history trace, reg 2 = output delta
-        let hist_table_idx = builder.table_idx(table_ptr) as i16;
+        let hist_table_idx = builder.table_idx(table_ptr) as u16;
         builder.push(Instr::WeightClamp {
             in_reg: 0,
             hist_reg: 1,
@@ -951,12 +939,10 @@ mod tests {
 
         let mut builder = ProgramBuilder::new();
         // reg 0 = left delta, reg 1 = right trace, reg 2 = output
-        let right_schema_idx = builder.schema_idx(right_schema);
         builder.push(Instr::JoinDT {
             delta_reg: 0,
             trace_reg: 1,
             out_reg: 2,
-            right_schema_idx,
         });
         builder.push(Instr::Halt);
 
@@ -1015,12 +1001,10 @@ mod tests {
         let ch = Box::into_raw(Box::new(cursor));
 
         let mut builder = ProgramBuilder::new();
-        let right_schema_idx = builder.schema_idx(right_schema);
         builder.push(Instr::JoinDT {
             delta_reg: 0,
             trace_reg: 1,
             out_reg: 2,
-            right_schema_idx,
         });
         builder.push(Instr::Halt);
 
@@ -1088,11 +1072,10 @@ mod tests {
         let schema = schema_1i64();
 
         let mut builder = ProgramBuilder::new();
-        // pass-through (a has_b=false Union is the identity op)
+        // pass-through (a union with an empty register is the identity op)
         builder.push(Instr::Union {
             in_a: 0,
-            in_b: 0,
-            has_b: false,
+            in_b: 2,
             out_reg: 1,
         });
         builder.push(Instr::Halt);
@@ -1100,9 +1083,9 @@ mod tests {
         // Already-consolidated input: weights were summed before VM entry
         let input = make_batch(schema, &[(1u128, 5, 42)]);
 
-        let reg_meta = [RegisterMeta::delta(schema); 2];
+        let reg_meta = [RegisterMeta::delta(schema); 3];
         let vm = builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 2];
+        let cursors = vec![std::ptr::null_mut(); 3];
         let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1, &cursors)
             .unwrap()
             .unwrap();
@@ -1701,21 +1684,17 @@ mod tests {
 
         // reg 0 = input delta (kind 0), reg 1 = external trace (kind 1), reg 2 = output delta
         let mut builder = ProgramBuilder::new();
-        let hist_table_idx = builder.table_idx(std::ptr::null_mut()) as i16;
-        builder.push(Instr::WeightClamp {
-            in_reg: 0,
-            hist_reg: 1,
+        builder.push(Instr::JoinDT {
+            delta_reg: 0,
+            trace_reg: 1,
             out_reg: 2,
-            hist_table_idx,
-            lo: -1,
-            hi: 1,
         });
         builder.push(Instr::Halt);
 
         let reg_meta = [
             RegisterMeta::delta(schema),
             RegisterMeta::trace(schema),
-            RegisterMeta::delta(schema),
+            RegisterMeta::delta(make_schema(&[type_code::I64, type_code::I64])),
         ];
         let mut vm = *builder.build(&reg_meta);
 

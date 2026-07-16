@@ -8,8 +8,6 @@
 
 use std::cell::Cell;
 
-use super::batch::Batch;
-
 const MAX_POOLED: usize = 64;
 /// Buffers larger than this are dropped on recycle rather than pooled.
 /// Matches `HUGEPAGE_THRESHOLD` in batch.rs: data buffers already bypass the
@@ -60,13 +58,6 @@ impl Drop for PooledSendBuf {
     fn drop(&mut self) {
         recycle_buf(std::mem::take(&mut self.0));
     }
-}
-
-/// Recycle a Batch's data and blob buffers back to the pool.
-pub(crate) fn recycle(batch: Batch) {
-    let (data, blob) = batch.into_buffers();
-    recycle_buf(data);
-    recycle_buf(blob);
 }
 
 #[cfg(test)]

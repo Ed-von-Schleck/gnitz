@@ -59,12 +59,8 @@ impl DagEngine {
     /// 1. unique_pk enforcement (retract existing, dedup intra-batch)
     /// 2. store.ingest_batch
     /// 3. index projection
-    pub fn ingest_to_family(&mut self, table_id: i64, batch: Batch) -> i32 {
-        if self.ingest_returning_effective(table_id, batch).is_some() {
-            0
-        } else {
-            -1
-        }
+    pub fn ingest_to_family(&mut self, table_id: i64, batch: Batch) {
+        self.ingest_returning_effective(table_id, batch);
     }
 
     /// Ingest a borrowed batch (no clone) for the common non-unique-PK path.
@@ -76,7 +72,8 @@ impl DagEngine {
         };
 
         if entry.unique_pk() {
-            return self.ingest_to_family(table_id, batch.clone_batch());
+            self.ingest_to_family(table_id, batch.clone_batch());
+            return 0;
         }
 
         if batch.count == 0 {

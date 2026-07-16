@@ -31,17 +31,6 @@ fn encode_numeric(buf: &mut Vec<u8>, fi: FixedInt, value: i64) {
     buf.extend_from_slice(&packed.to_le_bytes()[..width]);
 }
 
-/// Append a NULL for column `col` of wire type `tc`. The NULL encoding is
-/// uniform across all four `ColData` variants, so INSERT and UPDATE share it.
-pub(crate) fn append_null(col: &mut ColData, tc: TypeCode) {
-    match col {
-        ColData::Fixed(buf) => buf.extend(std::iter::repeat_n(0u8, tc.wire_stride())),
-        ColData::Strings(v) => v.push(None),
-        ColData::Bytes(v) => v.push(None),
-        ColData::U128s(v) => v.push(0u128),
-    }
-}
-
 pub(crate) fn append_value_to_col(col: &mut ColData, tc: TypeCode, val_expr: &Expr) -> Result<(), GnitzSqlError> {
     // sqlparser parses negative number literals as UnaryOp(Minus, Number(...)).
     // Unwrap here so the rest of the function sees a plain Value::Number.
@@ -57,7 +46,7 @@ pub(crate) fn append_value_to_col(col: &mut ColData, tc: TypeCode, val_expr: &Ex
         Expr::Value(vws) => {
             match &vws.value {
                 Value::Null => {
-                    append_null(col, tc);
+                    col.push_null(tc);
                     Ok(())
                 }
                 Value::Number(n, _) => {
@@ -135,7 +124,7 @@ pub(crate) fn append_value_to_col(col: &mut ColData, tc: TypeCode, val_expr: &Ex
 
 pub(crate) fn append_column_value(col: &mut ColData, cv: ColumnValue, tc: TypeCode) -> Result<(), GnitzSqlError> {
     match cv {
-        ColumnValue::Null => append_null(col, tc),
+        ColumnValue::Null => col.push_null(tc),
         ColumnValue::Int(i) => match col {
             ColData::Fixed(buf) => {
                 // Wrap-cast to the column's width (`i as u8`/`as i16`/…), the

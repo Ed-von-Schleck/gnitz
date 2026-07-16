@@ -52,16 +52,14 @@ use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, PartitionedTable, ReadCursor, RecoverySource, Routing, Table};
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
-pub(crate) use sys_tables::{
-    FIRST_USER_TABLE_ID, SEQ_ID_CHECKPOINT_GEN, SEQ_ID_INDICES, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_TOPOLOGY,
-    SEQ_TAB_ID,
-};
+pub(crate) use sys_tables::{FIRST_USER_TABLE_ID, SEQ_TAB_ID};
 pub(crate) use sys_tables::{IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS};
 pub(crate) use sys_tables::{IDX_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID};
 // The fixed system-table schema for a family tid. The production DDL decode
 // reaches it through the `CatalogEngine::sys_family_schema` instance method
 // (preserving the layering); the crate-wide handle exists for the cross-crate
 // wire roundtrip test, which decodes a client-encoded bundle against it.
+pub(crate) use cache::SchemaWireEntry;
 pub(crate) use metadata::CachedSchemaWire;
 pub(crate) use sys_tables::sys_tab_schema;
 pub(crate) use types::ColumnDef;

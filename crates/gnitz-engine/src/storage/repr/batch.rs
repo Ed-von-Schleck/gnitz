@@ -606,6 +606,12 @@ impl Batch {
     pub fn get_null_word(&self, row: usize) -> u64 {
         read_u64_le(&self.data[self.offsets[REG_NULL_BMP]..], row * 8)
     }
+    /// Overwrite `row`'s null-bitmap word (bit N = payload slot N is NULL).
+    #[inline]
+    pub fn set_null_word(&mut self, row: usize, word: u64) {
+        let off = self.offsets[REG_NULL_BMP] + row * 8;
+        self.data[off..off + 8].copy_from_slice(&word.to_le_bytes());
+    }
     #[inline]
     pub fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
         let off = self.offsets[REG_PAYLOAD_START + payload_col] + row * col_size;
@@ -1104,14 +1110,6 @@ impl Batch {
         }
     }
 
-    /// Decompose into owned buffers (for pool recycling).
-    /// Takes the buffers out, leaving zero-capacity vecs that Drop will ignore.
-    pub(crate) fn into_buffers(mut self) -> (Vec<u8>, Vec<u8>) {
-        let data = std::mem::take(&mut self.data);
-        let blob = std::mem::take(&mut self.blob);
-        (data, blob)
-    }
-
     /// The PK region as a uniform [`ColPtr`] view (always Raw for an owned
     /// `Batch`): the single addressing source for the OPK seeks via
     /// [`ColPtr::row`], hoisting the `data`/offset/stride reload out of the
@@ -1253,22 +1251,17 @@ impl Batch {
         // `pi` is the dense payload index; it equals `enumerate`'s counter.
         for (pi, (ptr, &sz)) in col_ptrs.iter().zip(col_sizes.iter()).enumerate() {
             let ci = schema.map_or(pi, |s| s.payload_col_idx(pi));
-
-            let is_string =
-                schema.is_some_and(|s| ci < s.num_columns() && gnitz_wire::is_german_string(s.columns[ci].type_code));
-            let is_null = (null_word >> pi) & 1 != 0;
+            let type_code = schema.map_or(0, |s| {
+                if ci < s.num_columns() {
+                    s.columns[ci].type_code
+                } else {
+                    0
+                }
+            });
+            let is_null = crate::schema::null_bit(null_word, pi);
             let col_size = sz as usize;
-
-            if is_null {
-                self.fill_col_zero(pi, col_size);
-            } else if is_string && col_size == 16 {
-                let src = std::slice::from_raw_parts(*ptr, 16);
-                let dest = crate::schema::relocate_german_string_vec(src, blob_src, &mut self.blob, None);
-                self.extend_col(pi, &dest);
-            } else {
-                let src = std::slice::from_raw_parts(*ptr, col_size);
-                self.extend_col(pi, src);
-            }
+            let cell = (!is_null).then(|| std::slice::from_raw_parts(*ptr, col_size));
+            self.append_payload_cell(pi, type_code, col_size, cell, blob_src, None);
         }
 
         self.count += 1;
@@ -1300,10 +1293,10 @@ impl Batch {
 
         for (pi, _ci, col) in schema.payload_columns() {
             let col_size = col.size() as usize;
-            let is_null = (null_word >> pi) & 1 != 0;
+            let is_null = crate::schema::null_bit(null_word, pi);
 
             if is_null {
-                self.fill_col_zero(pi, col_size);
+                self.append_payload_cell(pi, col.type_code, col_size, None, &[], None);
             } else {
                 match col.type_code {
                     crate::schema::type_code::STRING | crate::schema::type_code::BLOB => {
@@ -1503,22 +1496,43 @@ impl Batch {
         let src_blob = src.blob_slice();
         for (pi, _ci, col) in schema.payload_columns() {
             let cs = col.size() as usize;
-            let is_null = (null_word >> pi) & 1 != 0;
+            let is_null = crate::schema::null_bit(null_word, pi);
+            let cell = (!is_null).then(|| src.get_col_ptr(row, pi, cs));
+            self.append_payload_cell(
+                out_pi_base + pi,
+                col.type_code,
+                cs,
+                cell,
+                src_blob,
+                blob_cache.as_deref_mut(),
+            );
+        }
+    }
 
-            if is_null {
-                self.fill_col_zero(out_pi_base + pi, cs);
-            } else if gnitz_wire::is_german_string(col.type_code) {
-                let src_struct = src.get_col_ptr(row, pi, cs);
-                let dest = crate::schema::relocate_german_string_vec(
-                    src_struct,
-                    src_blob,
-                    &mut self.blob,
-                    blob_cache.as_deref_mut(),
-                );
-                self.extend_col(out_pi_base + pi, &dest);
-            } else {
-                self.extend_col(out_pi_base + pi, src.get_col_ptr(row, pi, cs));
+    /// Append one payload cell into output slot `out_pi` — the single
+    /// null/German-string/plain copy body every payload-cell writer shares.
+    /// `src_cell` is the source cell's at-rest bytes (`size` wide; the 16-byte
+    /// struct for STRING/BLOB), or `None` for a NULL cell (zero-fills the
+    /// slot). STRING/BLOB structs are relocated into `self.blob` against
+    /// `src_blob`; everything else copies verbatim. Does not bump `count`,
+    /// touch the null word, or change the layout.
+    #[inline]
+    pub(crate) fn append_payload_cell(
+        &mut self,
+        out_pi: usize,
+        type_code: u8,
+        size: usize,
+        src_cell: Option<&[u8]>,
+        src_blob: &[u8],
+        blob_cache: Option<&mut BlobCache>,
+    ) {
+        match src_cell {
+            None => self.fill_col_zero(out_pi, size),
+            Some(cell) if gnitz_wire::is_german_string(type_code) => {
+                let dest = crate::schema::relocate_german_string_vec(cell, src_blob, &mut self.blob, blob_cache);
+                self.extend_col(out_pi, &dest);
             }
+            Some(cell) => self.extend_col(out_pi, cell),
         }
     }
 
@@ -1563,10 +1577,15 @@ impl Batch {
         if batch.consolidated_verified(schema) {
             return None;
         }
+        let already_sorted = batch.sorted_verified(schema);
         let mb = batch.as_mem_batch();
         let blob_cap = mb.blob.len().max(1);
         let mut result = write_to_batch(schema, batch.count, blob_cap, |writer| {
-            merge::sort_and_consolidate(&mb, schema, writer);
+            if already_sorted {
+                merge::fold_sorted(&mb, schema, writer);
+            } else {
+                merge::sort_and_consolidate(&mb, schema, writer);
+            }
         });
         result.certify_layout(Layout::Consolidated, schema);
         Some(result)

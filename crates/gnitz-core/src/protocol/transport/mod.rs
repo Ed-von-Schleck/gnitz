@@ -503,10 +503,7 @@ pub(crate) fn recv_framed(sock_fd: RawFd, max_payload_len: usize) -> Result<Vec<
 /// length (`!= HELLO_ACK_PAYLOAD_LEN`) and surfaces the embedded error
 /// string.
 pub fn hello_handshake(t: &mut ClientTransport) -> Result<(u32, u64), ProtocolError> {
-    let payload = gnitz_wire::encode_hello_payload(
-        gnitz_wire::WAL_FORMAT_VERSION as u16,
-        0, // auth method = none
-    );
+    let payload = gnitz_wire::encode_hello_payload(gnitz_wire::WAL_FORMAT_VERSION as u16);
     t.send_framed(&payload)?;
 
     // ACK ⇒ 12 bytes, STATUS_ERROR control block ⇒ ≥ 248.

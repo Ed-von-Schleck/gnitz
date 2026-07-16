@@ -116,7 +116,7 @@ impl WorkerProcess {
             let ticks: Vec<(i64, u64)> = std::mem::take(&mut self.exchange.deferred_ticks);
             for (target_id, req_id) in ticks {
                 match self.handle_tick(target_id, req_id) {
-                    Ok(()) => self.send_ack(target_id as u64, 0, req_id),
+                    Ok(()) => self.send_ack(target_id as u64, req_id),
                     Err(e) => self.send_error(&e, req_id),
                 }
             }

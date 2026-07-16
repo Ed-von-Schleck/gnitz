@@ -1,7 +1,7 @@
 use crate::expr::ExprProgram;
 
 pub use gnitz_wire::{
-    agg_output_type, AggFunc, AggKind, JoinKind, MapKind, NodeColumnPayload, NodeFields, OpNode, RangeRel, ReduceOutKey,
+    agg_output_type, AggFunc, JoinKind, MapKind, NodeColumnPayload, NodeFields, OpNode, RangeRel, ReduceOutKey,
 };
 
 pub type NodeId = u64;
@@ -335,7 +335,8 @@ impl CircuitBuilder {
     /// the node, and wire `input` to `PORT_IN`. The caller decides the
     /// partitioning of `input` — `reduce`/`reduce_multi` shard first;
     /// `reduce_multi_local` passes a deliberately pre-replicated input straight
-    /// through. Empty `agg_specs` ⇒ `AggKind::Null` (group-only distinct-reduce).
+    /// through. `agg_specs` must not be empty (the engine rejects a spec-less
+    /// REDUCE at decode).
     fn reduce_node(
         &mut self,
         input: NodeId,
@@ -356,11 +357,7 @@ impl CircuitBuilder {
             .collect();
         let nid = self.alloc_node(OpNode::Reduce {
             group_cols: group,
-            agg: if specs.is_empty() {
-                AggKind::Null
-            } else {
-                AggKind::Specs(specs)
-            },
+            agg: specs,
             global_ground,
             out_key,
         });
@@ -435,14 +432,6 @@ impl CircuitBuilder {
     pub fn shard(&mut self, input: NodeId, shard_cols: &[usize]) -> NodeId {
         let cols: Vec<u16> = shard_cols.iter().map(|&c| c as u16).collect();
         let nid = self.alloc_node(OpNode::ExchangeShard { shard_cols: cols });
-        self.connect(input, nid, gnitz_wire::PORT_IN);
-        nid
-    }
-
-    /// Exchange gather: collects results from all workers (no worker_id —
-    /// the legacy parameter was dead state).
-    pub fn gather(&mut self, input: NodeId) -> NodeId {
-        let nid = self.alloc_node(OpNode::ExchangeGather);
         self.connect(input, nid, gnitz_wire::PORT_IN);
         nid
     }
@@ -625,7 +614,7 @@ mod tests {
     /// ordinary grouped reduce (so existing reduce circuits are byte-identical).
     #[test]
     fn reduce_global_ground_roundtrips() {
-        use gnitz_wire::{AggKind, NODE_COL_KIND_GLOBAL_GROUND};
+        use gnitz_wire::NODE_COL_KIND_GLOBAL_GROUND;
         for ground in [false, true] {
             let mut cb = CircuitBuilder::new(3, 100);
             let input = cb.input_delta();
@@ -652,7 +641,7 @@ mod tests {
             match decoded.nodes.get(&red) {
                 Some(OpNode::Reduce { global_ground, agg, .. }) => {
                     assert_eq!(*global_ground, ground);
-                    assert!(matches!(agg, AggKind::Specs(_)));
+                    assert!(!agg.is_empty());
                 }
                 other => panic!("expected Reduce, got {other:?}"),
             }

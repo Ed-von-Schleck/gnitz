@@ -1,4 +1,4 @@
-use super::batch::copy_batch_row;
+use super::batch::copy_batch_row_owned;
 use super::eval::eval_pred_row;
 use crate::bind::bind_single_table;
 use crate::error::GnitzSqlError;
@@ -76,7 +76,7 @@ fn apply_residual_filter(
         return Ok(result);
     }
     let (schema_opt, batch_opt) = result;
-    let batch = match batch_opt {
+    let mut batch = match batch_opt {
         None => return Ok((schema_opt, None)),
         Some(b) => b,
     };
@@ -87,9 +87,11 @@ fn apply_residual_filter(
         // Every row passed — return the fetched batch unmoved, no per-row clone.
         return Ok((schema_opt, Some(batch)));
     }
+    // The fetched batch is owned and dropped here, and each row survives at
+    // most once — move String/Blob cells out instead of cloning them.
     let mut new_batch = ZSetBatch::new(actual_schema);
     for &i in &matched {
-        copy_batch_row(&batch, i, &mut new_batch, actual_schema);
+        copy_batch_row_owned(&mut batch, i, &mut new_batch, actual_schema);
     }
     Ok((schema_opt, Some(new_batch)))
 }

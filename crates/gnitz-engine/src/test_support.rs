@@ -99,21 +99,11 @@ pub(crate) fn wide_row(schema: &SchemaDescriptor, pk: &[u8], w: i64, val: i64) -
     b
 }
 
-/// Encode `s` as a 16-byte German-string struct: length header, ≤12-byte
-/// content stored inline, longer content appended to `blob` with the 4-byte
-/// prefix and heap offset in the struct. The one test-side encoder of the
-/// at-rest STRING/BLOB layout, so no test re-derives it by hand.
+/// Encode `s` as a 16-byte German-string struct — the production encoder,
+/// re-exported under the test-side name so no test re-derives the at-rest
+/// STRING/BLOB layout by hand.
 pub(crate) fn german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
-    let mut gs = [0u8; 16];
-    gs[0..4].copy_from_slice(&(s.len() as u32).to_le_bytes());
-    if s.len() <= crate::schema::SHORT_STRING_THRESHOLD {
-        gs[4..4 + s.len()].copy_from_slice(s);
-    } else {
-        gs[4..8].copy_from_slice(&s[..4]);
-        gs[8..16].copy_from_slice(&(blob.len() as u64).to_le_bytes());
-        blob.extend_from_slice(s);
-    }
-    gs
+    crate::schema::encode_german_string(s, blob)
 }
 
 /// The canonical narrow test schema: U64 pk + a single I64 payload column.
@@ -134,6 +124,15 @@ pub(crate) fn make_schema_u64_i64() -> SchemaDescriptor {
 /// debug-verifies it; a lying claim would let a consumer skip-point silently
 /// mis-fold weights.
 pub(crate) fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
+    let mut b = make_batch_raw(schema, rows);
+    b.certify_layout(Layout::Consolidated, schema);
+    b
+}
+
+/// [`make_batch`] without the `Consolidated` certification: the batch stays
+/// honestly `Raw`, for tests whose rows are unsorted or that exercise the
+/// sort/fold paths themselves.
+pub(crate) fn make_batch_raw(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
     let mut b = Batch::with_schema(*schema, rows.len().max(1));
     for &(pk, w, val) in rows {
         b.extend_pk(pk as u128);
@@ -142,8 +141,33 @@ pub(crate) fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) ->
         b.extend_col(0, &val.to_le_bytes());
         b.count += 1;
     }
-    b.certify_layout(Layout::Consolidated, schema);
     b
+}
+
+/// [`make_batch_raw`] over [`make_schema_u128_i64`]-shaped schemas — native
+/// u128 PKs, rows left `Raw` in the order given.
+pub(crate) fn make_batch_u128_raw(schema: &SchemaDescriptor, rows: &[(u128, i64, i64)]) -> Batch {
+    let mut b = Batch::with_schema(*schema, rows.len().max(1));
+    for &(pk, w, val) in rows {
+        b.extend_pk(pk);
+        b.extend_weight(&w.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &val.to_le_bytes());
+        b.count += 1;
+    }
+    b
+}
+
+/// U128 pk + a single I64 payload column — the 16-byte-PK sibling of
+/// [`make_schema_u64_i64`].
+pub(crate) fn make_schema_u128_i64() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    )
 }
 
 /// Decode a single signed I64 PK column from its OPK (big-endian, sign-flipped)
@@ -156,18 +180,11 @@ pub(crate) fn opk_pk_i64(opk_bytes: &[u8]) -> i64 {
 
 /// Read a German-string payload cell (16-byte struct at payload `col`, `row`)
 /// back to its content bytes — the test-side readback inverse of
-/// [`german_string`]. Short (≤12 byte) values live inline in the struct, long
-/// ones in the blob heap.
+/// [`german_string`], via the production decoder.
 pub(crate) fn read_german_string(batch: &Batch, col: usize, row: usize) -> Vec<u8> {
     let off = row * 16;
-    let gs = &batch.col_data(col)[off..off + 16];
-    let length = u32::from_le_bytes(gs[0..4].try_into().unwrap()) as usize;
-    if length <= crate::schema::SHORT_STRING_THRESHOLD {
-        gs[4..4 + length].to_vec()
-    } else {
-        let blob_off = u64::from_le_bytes(gs[8..16].try_into().unwrap()) as usize;
-        batch.blob[blob_off..blob_off + length].to_vec()
-    }
+    let gs: &[u8; 16] = batch.col_data(col)[off..off + 16].try_into().unwrap();
+    gnitz_wire::try_decode_german_string(gs, &batch.blob).unwrap()
 }
 
 /// I64 pk + I64 payload schema — the signed-PK exercise of the order-preserving

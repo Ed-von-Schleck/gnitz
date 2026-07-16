@@ -10,8 +10,8 @@ use crate::ast_util::{
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;
 use crate::plan::validate::{
-    reject_unhonored_query_clauses, reject_unhonored_select_clauses, unsupported_clause, validate_user_name,
-    HonoredClauses, HonoredQueryClauses,
+    plain_select_body, reject_unhonored_query_clauses, reject_unhonored_select_clauses, unsupported_clause,
+    validate_user_name, HonoredClauses, HonoredQueryClauses,
 };
 use crate::plan::view::{exists, group_by, join, scalar, set_op, simple, ViewChain};
 use crate::SqlResult;
@@ -40,7 +40,7 @@ pub(crate) fn execute_create_view(
         query,
         HonoredQueryClauses {
             with: true,
-            limit: false,
+            ..HonoredQueryClauses::NONE
         },
         "CREATE VIEW",
     )?;
@@ -414,19 +414,8 @@ fn inline_ctes(
             return Err(unsupported_clause(&ctx, "a trailing FROM"));
         }
         // Reject the `Query`-envelope clauses a CTE body cannot honor (a nested `WITH`,
-        // LIMIT/OFFSET, FETCH, FOR UPDATE/SHARE, SETTINGS, …) before the body match.
-        reject_unhonored_query_clauses(
-            &cte.query,
-            HonoredQueryClauses {
-                with: false,
-                limit: false,
-            },
-            &ctx,
-        )?;
-        let cte_select = match cte.query.body.as_ref() {
-            SetExpr::Select(s) => s,
-            _ => return Err(GnitzSqlError::Unsupported(format!("{ctx}: only SELECT supported"))),
-        };
+        // LIMIT/OFFSET, FETCH, FOR UPDATE/SHARE, SETTINGS, …) and unwrap the SELECT body.
+        let cte_select = plain_select_body(&cte.query, &ctx)?;
         if is_compilable_hidden_body(cte_select) {
             // A later CTE may reference an earlier one, so register immediately.
             let resolved = compile_hidden_body(client, binder, cte_select, &cte.alias.columns, &ctx, chain)?;
@@ -635,22 +624,7 @@ fn compile_derived_tables(
                 "{ctx}: TABLESAMPLE is not supported"
             )));
         }
-        reject_unhonored_query_clauses(
-            subquery,
-            HonoredQueryClauses {
-                with: false,
-                limit: false,
-            },
-            &ctx,
-        )?;
-        let sub_select = match subquery.body.as_ref() {
-            SetExpr::Select(s) => s,
-            _ => {
-                return Err(GnitzSqlError::Unsupported(format!(
-                    "{ctx}: only a SELECT subquery is supported"
-                )))
-            }
-        };
+        let sub_select = plain_select_body(subquery, &ctx)?;
         // A JOIN, single-table filter/projection, or GROUP BY / aggregate subquery is
         // chained; a multi-FROM or DISTINCT derived table is not supported.
         if sub_select.from.len() != 1 || sub_select.distinct.is_some() {

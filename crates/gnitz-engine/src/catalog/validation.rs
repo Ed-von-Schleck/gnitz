@@ -77,11 +77,7 @@ impl CatalogEngine {
             _ => return Ok(()),
         };
 
-        let entry = self
-            .dag
-            .tables
-            .get(&table_id)
-            .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
+        let entry = self.table_entry(table_id)?;
         let schema = entry.schema;
         let mb = batch.as_mem_batch();
 
@@ -169,11 +165,7 @@ impl CatalogEngine {
     /// handling: the old index entry will be retracted by enforce_unique_pk,
     /// so we only reject if the NEW value collides with a DIFFERENT row's entry.
     pub(crate) fn validate_unique_indices(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
-        let entry = self
-            .dag
-            .tables
-            .get(&table_id)
-            .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
+        let entry = self.table_entry(table_id)?;
 
         // Quick check: any unique index circuits?
         let has_unique = entry.index_circuits.iter().any(|ic| ic.is_unique);

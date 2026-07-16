@@ -120,14 +120,7 @@ impl CatalogEngine {
             let mut bb = BatchBuilder::new(SysFamily::Table.schema());
             for info in &SYS_FAMILIES {
                 let dir = format!("{}/{}", sys_dir, info.name);
-                bb.begin_row(info.id as u128, 1);
-                bb.put_u64(SYSTEM_SCHEMA_ID as u64); // schema_id
-                bb.put_string(info.name); // name
-                bb.put_string(&dir); // directory
-                bb.put_u64(0); // pk_col_idx
-                bb.put_u64(0); // created_lsn
-                bb.put_u64(0); // flags
-                bb.end_row();
+                push_table_tab_row(&mut bb, info.id, SYSTEM_SCHEMA_ID, info.name, &dir, 0, 0);
             }
             let batch = bb.finish();
             self.sys_store_mut(SysFamily::Table)
@@ -137,24 +130,25 @@ impl CatalogEngine {
 
         // 3. Column records for all system tables — the COL_TAB self-description,
         // derived from the same gnitz-wire slices the schemas are built from, so
-        // the introspectable shape can never drift from the physical one.
+        // the introspectable shape can never drift from the physical one. System
+        // columns carry no FK and are never SERIAL or hidden.
         {
             let mut bb = BatchBuilder::new(SysFamily::Column.schema());
             for info in &SYS_FAMILIES {
                 for (i, c) in info.cols.iter().enumerate() {
-                    let pk = pack_column_id(info.id, i as i64);
-                    bb.begin_row(pk as u128, 1);
-                    bb.put_u64(info.id as u64); // owner_id
-                    bb.put_u64(OWNER_KIND_TABLE as u64); // owner_kind
-                    bb.put_u64(i as u64); // col_idx
-                    bb.put_string(c.name); // name
-                    bb.put_u64(c.type_code as u64); // type_code
-                    bb.put_u64(c.nullable as u64); // is_nullable
-                    bb.put_u64(0); // fk_table_id
-                    bb.put_u64(0); // fk_col_idx
-                    bb.put_u64(0); // is_serial (system columns are never SERIAL)
-                    bb.put_u64(0); // is_hidden (system columns are never hidden)
-                    bb.end_row();
+                    push_col_tab_row(
+                        &mut bb,
+                        info.id,
+                        OWNER_KIND_TABLE,
+                        i as i64,
+                        c.name,
+                        c.type_code as u8,
+                        c.nullable,
+                        0,
+                        0,
+                        false,
+                        1,
+                    );
                 }
             }
             let batch = bb.finish();

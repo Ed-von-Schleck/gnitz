@@ -95,8 +95,6 @@ impl ReducePlan {
         let num_out_cols = output_schema.num_columns();
         let cbase = num_out_cols - num_aggs;
 
-        // `AggOp::Null` is neither linear nor value-indexed (verbatim from the
-        // per-epoch computation this bakes).
         let all_linear = agg_descs.iter().all(|d| d.agg_op.is_linear());
         let group_by_pk = out_key == ReduceOutKey::PkPermutation;
         let monotone_out_pk =

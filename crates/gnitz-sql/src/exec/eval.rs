@@ -1,8 +1,9 @@
-use crate::codec::nullmap::null_word_get;
 use crate::error::GnitzSqlError;
+use crate::exec::batch::pk_col_window;
 use crate::ir::{BinOp, BoundExpr, UnaryOp};
 use crate::lower::{lower_bound_expr, BoundExprBackend};
-use gnitz_core::{ColData, FixedInt, PkColumn, Schema, TypeCode, ZSetBatch};
+use gnitz_core::null_word_get;
+use gnitz_core::{ColData, FixedInt, Schema, TypeCode, ZSetBatch};
 
 /// Decode the native LE bytes of a PK column into an i64. U128/UUID don't fit
 /// through the i64 return shape and are rejected.
@@ -44,19 +45,8 @@ impl BoundExprBackend for InterpBackend<'_> {
         // column's declared signedness. U128/UUID don't fit through the
         // i64 return shape — reject explicitly.
         if schema.is_pk_col(c) {
-            let stride = col_def.type_code.wire_stride();
-            match &batch.pks {
-                PkColumn::Bytes { stride: s, buf } => {
-                    let s = *s as usize;
-                    let off = schema.pk_byte_offset(c);
-                    let slice = &buf[i * s + off..i * s + off + stride];
-                    return decode_pk_bytes_to_i64(col_def.type_code, slice).map(Some);
-                }
-                _ => {
-                    let bytes = batch.pks.get(i).to_le_bytes();
-                    return decode_pk_bytes_to_i64(col_def.type_code, &bytes[..stride]).map(Some);
-                }
-            }
+            let window = pk_col_window(batch, schema, c, i);
+            return decode_pk_bytes_to_i64(col_def.type_code, window.as_slice()).map(Some);
         }
         // Payload column: check the null bitmap first.
         let payload_idx = schema.payload_idx(c);

@@ -30,10 +30,10 @@ use crate::bind::{bind_single_table, build_alias_map, Binder};
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BoundExpr};
 use crate::plan::lp::lower_linear;
-use crate::plan::validate::{
-    reject_unhonored_query_clauses, reject_unhonored_select_clauses, HonoredClauses, HonoredQueryClauses,
+use crate::plan::validate::{plain_select_body, reject_unhonored_select_clauses, HonoredClauses};
+use crate::plan::view::exists::{
+    and_into, fold_and, reject_alias_collision, resolve_single_plain_from, split_correlation_conjuncts,
 };
-use crate::plan::view::exists::{and_into, fold_and, resolve_single_plain_from, split_correlation_conjuncts};
 use crate::plan::view::predicates::extract_join_predicates;
 use crate::plan::view::{group_by, join, simple, EmitPieces, ViewChain};
 use gnitz_core::{GnitzClient, Schema, TypeCode};
@@ -395,22 +395,7 @@ fn resolve_and_split<'a>(
     q: &'a Query,
     outer: &OuterCtx,
 ) -> Result<SubSplit<'a>, GnitzSqlError> {
-    reject_unhonored_query_clauses(
-        q,
-        HonoredQueryClauses {
-            with: false,
-            limit: false,
-        },
-        "subquery",
-    )?;
-    let inner_select = match q.body.as_ref() {
-        SetExpr::Select(s) => s.as_ref(),
-        _ => {
-            return Err(GnitzSqlError::Unsupported(
-                "a subquery must be a plain SELECT; compose via views".into(),
-            ))
-        }
-    };
+    let inner_select = plain_select_body(q, "subquery")?;
     reject_unhonored_select_clauses(
         inner_select,
         HonoredClauses {
@@ -439,11 +424,7 @@ fn resolve_and_split<'a>(
         "a scalar/quantifier subquery's FROM must be a single base table without JOINs; compose via views",
         "subquery",
     )?;
-    if outer.alias.eq_ignore_ascii_case(&inner_alias) {
-        return Err(GnitzSqlError::Bind(format!(
-            "relation alias '{inner_alias}' is used by both the view FROM and its subquery; rename one"
-        )));
-    }
+    reject_alias_collision(&outer.alias, &inner_alias)?;
     // NOTE: `outer.tid == inner_tid` (a self-correlated subquery) is *supported* —
     // `Gᵢ` is a distinct reduce segment (a distinct source id), so `H = outer ⋈ Gᵢ`
     // is the shared-source-branches shape (distinct dependency edges → separate

@@ -10,13 +10,10 @@ use crate::storage::{MemBatch, ReadCursor};
 /// Aggregate function selector.
 ///
 /// A typed enum so the compiler enforces exhaustive matching instead of the
-/// previous bare `u8` with private named constants. `Null` (0) is the
-/// NullAggregate sentinel emitted by the compiler when no aggregation is
-/// configured.
+/// previous bare `u8` with private named constants.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AggOp {
-    Null = 0,
     Count = 1,
     Sum = 2,
     Min = 3,
@@ -60,15 +57,14 @@ impl AggOp {
     /// for "which aggregates the value index serves, and in what ordinal order":
     /// the index write side (`op_integrate_with_indexes`) and the reduce read
     /// side (`op_reduce`) both select and order their entries by this predicate
-    /// over `agg_descs`, so the two agree by construction. Note it is *not* the
-    /// negation of `is_linear`: `Null` is neither linear nor value-indexed.
+    /// over `agg_descs`, so the two agree by construction.
     pub fn uses_value_index(self) -> bool {
         matches!(self, AggOp::Min | AggOp::Max)
     }
 }
 
 /// Descriptor for one aggregate function. Plain data — never transmuted or
-/// serialized (the wire ships `AggKind::Specs`; consumers are field reads).
+/// serialized (the wire ships `(AggFunc, u16)` specs; consumers are field reads).
 #[derive(Clone, Copy)]
 pub struct AggDescriptor {
     pub col_idx: u32,
@@ -81,10 +77,11 @@ pub struct AggDescriptor {
 /// Field order: largest alignment first to minimise padding.
 pub(super) struct Accumulator {
     acc: i64,
-    col_type_code: TypeCode,
     agg_op: AggOp,
     /// Where the aggregated column's value lives in a row (PK byte offset or
     /// dense payload slot). Resolved once; the per-row read goes through it.
+    /// Also carries the column's type code — the single source for the
+    /// accumulator's decode/encode dispatch.
     loc: ColumnLocator,
     has_value: bool,
 }
@@ -98,9 +95,13 @@ impl Accumulator {
             acc: 0,
             has_value: false,
             agg_op: desc.agg_op,
-            col_type_code: desc.col_type_code,
             loc,
         }
+    }
+
+    #[inline]
+    fn col_type_code(&self) -> TypeCode {
+        TypeCode::from_validated_u8(self.loc.type_code())
     }
 
     pub(super) fn reset(&mut self) {
@@ -136,7 +137,7 @@ impl Accumulator {
         // MIN/MAX hold the MIN-oriented order-preserving encoding; decode back to
         // native value bits for emit. Linear aggregates store the value verbatim.
         if self.agg_op.uses_value_index() {
-            super::super::util::decode_ordered(self.acc as u64, self.col_type_code, false)
+            super::super::util::decode_ordered(self.acc as u64, self.col_type_code(), false)
         } else {
             self.acc as u64
         }
@@ -173,7 +174,7 @@ impl Accumulator {
     }
 
     fn is_float(&self) -> bool {
-        self.col_type_code.is_float()
+        self.col_type_code().is_float()
     }
 
     /// Step: incorporate one input row into the accumulator.
@@ -200,7 +201,7 @@ impl Accumulator {
             return;
         }
 
-        let tc = self.col_type_code;
+        let tc = self.col_type_code();
         let cs = self.loc.size();
         // SUM accumulates into an i64/u64 slot via decode_signed/decode_float;
         // MIN/MAX order-encode via encode_ordered. Both handle only the
@@ -250,8 +251,6 @@ impl Accumulator {
                     self.acc = enc as i64;
                 }
             }
-            // Count and CountNonNull return early above; Null is a no-op sentinel.
-            AggOp::Null => {}
             AggOp::Count | AggOp::CountNonNull => unreachable!("handled by early return above"),
         }
     }
@@ -278,7 +277,7 @@ impl Accumulator {
                 }
                 self.has_value = true;
             }
-            AggOp::Min | AggOp::Max | AggOp::Null => {
+            AggOp::Min | AggOp::Max => {
                 unreachable!("fold_old_aggs folds only linear aggregates")
             }
         }

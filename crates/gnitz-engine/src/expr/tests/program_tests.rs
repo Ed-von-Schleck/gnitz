@@ -309,9 +309,7 @@ fn test_string_eq_const() {
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());
     // German string struct for "hello" (5 bytes, inline)
-    let mut gs = [0u8; 16];
-    gs[0..4].copy_from_slice(&5u32.to_le_bytes()); // length = 5
-    gs[4..9].copy_from_slice(b"hello"); // prefix(4) + suffix(1) inline
+    let gs = crate::test_support::german_string(b"hello", &mut batch.blob);
     batch.extend_col(0, &gs);
     batch.count = 1;
 
@@ -765,9 +763,7 @@ fn test_string_lt_le_const() {
     batch.extend_pk(1u128);
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());
-    let mut gs = [0u8; 16];
-    gs[0..4].copy_from_slice(&5u32.to_le_bytes());
-    gs[4..9].copy_from_slice(b"hello");
+    let gs = crate::test_support::german_string(b"hello", &mut batch.blob);
     batch.extend_col(0, &gs);
     batch.count = 1;
     let mb = batch.as_mem_batch();
@@ -828,13 +824,9 @@ fn test_string_col_eq_col() {
     batch.extend_pk(1u128);
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());
-    let mut gs_a = [0u8; 16];
-    gs_a[0..4].copy_from_slice(&3u32.to_le_bytes());
-    gs_a[4..7].copy_from_slice(b"abc");
+    let gs_a = crate::test_support::german_string(b"abc", &mut batch.blob);
     batch.extend_col(0, &gs_a);
-    let mut gs_b = [0u8; 16];
-    gs_b[0..4].copy_from_slice(&3u32.to_le_bytes());
-    gs_b[4..7].copy_from_slice(b"abc");
+    let gs_b = crate::test_support::german_string(b"abc", &mut batch.blob);
     batch.extend_col(1, &gs_b);
     batch.count += 1;
 
@@ -843,9 +835,7 @@ fn test_string_col_eq_col() {
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());
     batch.extend_col(0, &gs_a);
-    let mut gs_c = [0u8; 16];
-    gs_c[0..4].copy_from_slice(&3u32.to_le_bytes());
-    gs_c[4..7].copy_from_slice(b"xyz");
+    let gs_c = crate::test_support::german_string(b"xyz", &mut batch.blob);
     batch.extend_col(1, &gs_c);
     batch.count += 1;
 
@@ -916,28 +906,6 @@ fn test_complex_predicate() {
     let mb2 = batch2.as_mem_batch();
     let (val, _) = eval_predicate(&prog, &mb2, 0);
     assert_eq!(val, 0);
-}
-
-#[test]
-fn test_emit_null_opcode() {
-    // Schema: pk(U64), val(I64)
-    let schema = make_schema(0, &[8, 9]);
-    let batch = make_int_batch(&schema, &[(1, 1, 0, &[10])]);
-    let mb = batch.as_mem_batch();
-
-    // EMIT_NULL is handled at batch level, skipped by eval_batch.
-    // Verify the program still evaluates and the result register holds
-    // the loaded value.
-    let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col1
-        LogicalInstr::EmitNull { out: 0 },           // emit null — batch-level, no-op here
-    ];
-    let prog = make_prog(&schema, instrs, 1, 0, vec![]);
-
-    let (val, _, mask, _) = eval_with_emit_via_batch(&prog, &mb, 0);
-    // No EMIT instructions ⇒ empty emit list, no null mask bits set.
-    assert_eq!(mask, 0);
-    assert_eq!(val, 10);
 }
 
 #[test]

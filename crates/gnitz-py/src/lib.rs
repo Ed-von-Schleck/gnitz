@@ -5,10 +5,11 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 
 use gnitz_core::protocol::types::type_code_from_u64;
-use gnitz_core::{Circuit, CircuitBuilder, ExprBuilder, ExprProgram, GnitzClient};
 use gnitz_core::{
-    ColData, ColumnDef, PkColumn, Schema, TypeCode, WireConflictMode, ZSetBatch, MAX_COLUMNS, MAX_PK_BYTES,
+    null_word_get, null_word_set, ColData, ColumnDef, PkColumn, Schema, TypeCode, WireConflictMode, ZSetBatch,
+    MAX_PK_BYTES,
 };
+use gnitz_core::{Circuit, CircuitBuilder, ExprBuilder, ExprProgram, GnitzClient};
 use gnitz_sql::{GnitzSqlError, SqlPlanner, SqlResult};
 
 /// The `(schema, data_batch, lsn)` a sync scan/seek/push resolves to.
@@ -141,10 +142,10 @@ impl PySchema {
     #[pyo3(signature = (columns, pk_index = None, pk_indices = None))]
     pub fn new(columns: Bound<'_, PyList>, pk_index: Option<usize>, pk_indices: Option<Vec<usize>>) -> PyResult<Self> {
         let ncols = columns.len();
-        if ncols == 0 || ncols > MAX_COLUMNS {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Schema must have 1 to {MAX_COLUMNS} columns"
-            )));
+        if ncols == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Schema must have at least 1 column",
+            ));
         }
         let list = match (pk_index, pk_indices) {
             (Some(_), Some(_)) => {
@@ -169,40 +170,15 @@ impl PySchema {
                 }
             }
         };
-        Schema::validate_pk_cols(&list, ncols).map_err(pyo3::exceptions::PyValueError::new_err)?;
-        // Reject nullable and PK-ineligible PK columns; validate total stride.
-        let mut total_stride: usize = 0;
-        for &ci in &list {
-            let item = columns.get_item(ci)?;
-            let col: PyRef<'_, PyColumnDef> = item.extract()?;
-            if col.is_nullable {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "column {:?} is nullable, which is not allowed for PK columns",
-                    col.name
-                )));
-            }
-            let tc = type_code_from_u64(col.type_code as u64)
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-            if !tc.is_pk_eligible() {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "column {:?} has type {:?} which cannot be a PK column",
-                    col.name, tc
-                )));
-            }
-            total_stride += tc.wire_stride();
+        // Convert once, then validate through the shared rule set —
+        // `Schema::validate_parts` covers the MAX_COLUMNS cap, the structural
+        // PK rules, and per-PK-column nullability/eligibility.
+        let mut cols = Vec::with_capacity(ncols);
+        for item in columns.iter() {
+            let c: PyRef<'_, PyColumnDef> = item.extract()?;
+            cols.push(py_col_to_rust(&c)?);
         }
-        if total_stride > MAX_PK_BYTES {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "total PK stride {total_stride} exceeds maximum {MAX_PK_BYTES} bytes"
-            )));
-        }
-        // ZSetBatch.nulls stores one u64 per row; null bits map to payload column indices.
-        let payload_count = ncols - list.len();
-        if payload_count > 64 {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "schema has {payload_count} payload columns; null bitmap supports at most 64"
-            )));
-        }
+        Schema::validate_parts(&list, &cols).map_err(pyo3::exceptions::PyValueError::new_err)?;
         Ok(PySchema {
             columns: columns.unbind(),
             pk_indices: list,
@@ -524,16 +500,8 @@ impl PyZSetBatch {
                 self.schema.columns[ci].name,
             )));
         }
-        *nulls |= 1u64 << payload_idx;
-        match &mut self.batch.columns[ci] {
-            ColData::Fixed(buf) => {
-                let stride = self.schema.columns[ci].type_code.wire_stride();
-                buf.extend(std::iter::repeat_n(0u8, stride));
-            }
-            ColData::Strings(v) => v.push(None),
-            ColData::Bytes(v) => v.push(None),
-            ColData::U128s(v) => v.push(0),
-        }
+        null_word_set(nulls, payload_idx, true);
+        self.batch.columns[ci].push_null(self.schema.columns[ci].type_code);
         Ok(())
     }
 
@@ -789,13 +757,18 @@ fn pk_column_to_pylist(py: Python<'_>, schema: &Schema, pks: &PkColumn) -> PyRes
     }
 }
 
-/// Decode the PK column `col_idx` for row `row` into a Python value, given
-/// its already-extracted `PkTuple` bytes for that row. Handles UUID
-/// stringification, U128 widening, and the narrow integer case uniformly.
-fn pk_value_from_tuple(py: Python<'_>, schema: &Schema, col_idx: usize, t: &gnitz_core::PkTuple) -> PyObject {
-    let tc = schema.columns[col_idx].type_code;
-    let offset = schema.pk_byte_offset(col_idx);
-    let stride = tc.wire_stride();
+/// Decode one PK column into a Python value, given its already-extracted
+/// `PkTuple` bytes for that row and the column's precomputed layout (type code,
+/// byte offset within the tuple, wire stride — hoisted by the callers so the
+/// per-row loop does no schema lookups). Handles UUID stringification, U128
+/// widening, and the narrow integer case uniformly.
+fn pk_value_from_tuple(
+    py: Python<'_>,
+    tc: TypeCode,
+    offset: usize,
+    stride: usize,
+    t: &gnitz_core::PkTuple,
+) -> PyObject {
     let bytes = &t.buf[offset..offset + stride];
     match tc {
         TypeCode::UUID => {
@@ -883,16 +856,48 @@ fn u128_value_to_py(py: Python<'_>, x: u128, tc: TypeCode) -> PyResult<PyObject>
     })
 }
 
+/// Decode one payload cell into a Python object, null bit first: a set bit is
+/// `None` regardless of the stored value. Per-`ColData` decode — Fixed →
+/// [`read_fixed_le`], Strings → str, Bytes → bytes, U128s → [`u128_value_to_py`]
+/// — shared by the row build and the `scalars` column loop. `tc` and `stride`
+/// are the column's type code and wire stride, precomputed by the caller
+/// (`stride` is read only for the Fixed arm).
+fn cell_to_py(
+    py: Python<'_>,
+    col: &ColData,
+    row: usize,
+    is_null: bool,
+    tc: TypeCode,
+    stride: usize,
+) -> PyResult<PyObject> {
+    if is_null {
+        return Ok(py.None());
+    }
+    Ok(match col {
+        ColData::Fixed(buf) => read_fixed_le(py, tc, &buf[row * stride..(row + 1) * stride]),
+        ColData::Strings(v) => match &v[row] {
+            Some(s) => s.into_pyobject(py)?.into_any().unbind(),
+            None => py.None(),
+        },
+        ColData::Bytes(v) => match &v[row] {
+            Some(b) => pyo3::types::PyBytes::new(py, b).into_any().unbind(),
+            None => py.None(),
+        },
+        ColData::U128s(v) => u128_value_to_py(py, v[row], tc)?,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Lazy batch infrastructure (Phase 2)
 // ---------------------------------------------------------------------------
 
-/// Per-column decode metadata, every field a pure function of the `Schema`.
-/// Computed once via [`ColLayout::for_schema`] and reused across every row of a
-/// batch, hoisting the schema lookups out of the per-row build loop. Naming the
-/// bundle (rather than scattering parallel `Vec`s) keeps it the single place
-/// the derivation lives — and the obvious place to memoize per cached schema if
-/// the per-batch recompute ever shows up in a profile.
+/// Per-column decode metadata, every field a pure function of the `Schema` and
+/// the presented column set. Computed once via [`ColLayout::for_schema`] and
+/// reused across every row of a batch, hoisting the schema lookups out of the
+/// per-row build loop. Naming the bundle (rather than scattering parallel
+/// `Vec`s) keeps it the single place the derivation lives — and the obvious
+/// place to memoize per cached schema if the per-batch recompute ever shows up
+/// in a profile.
 #[derive(Default)]
 struct ColLayout {
     /// `schema.is_pk_col(ci)`, per column.
@@ -901,18 +906,32 @@ struct ColLayout {
     payload_idx: Vec<usize>,
     /// `type_code.wire_stride()`, per column.
     wire_stride: Vec<usize>,
+    /// `schema.pk_byte_offset(ci)` for PK cols; 0 for non-PK cols (unused).
+    pk_byte_offset: Vec<usize>,
+    /// `schema.pk_stride()`, the packed PK tuple width.
+    pk_stride: u8,
+    /// Whether any presented column is a PK column — when false, the per-row
+    /// build skips the PK tuple extraction entirely.
+    has_presented_pk: bool,
 }
 
 impl ColLayout {
-    fn for_schema(s: &Schema) -> Self {
+    fn for_schema(s: &Schema, present_cols: &[usize]) -> Self {
         let is_pk: Vec<bool> = (0..s.columns.len()).map(|ci| s.is_pk_col(ci)).collect();
         let payload_idx: Vec<usize> = (0..s.columns.len())
             .map(|ci| if is_pk[ci] { 0 } else { s.payload_idx(ci) })
             .collect();
+        let pk_byte_offset: Vec<usize> = (0..s.columns.len())
+            .map(|ci| if is_pk[ci] { s.pk_byte_offset(ci) } else { 0 })
+            .collect();
+        let has_presented_pk = present_cols.iter().any(|&ci| is_pk[ci]);
         ColLayout {
             is_pk,
             payload_idx,
             wire_stride: s.columns.iter().map(|c| c.type_code.wire_stride()).collect(),
+            pk_byte_offset,
+            pk_stride: s.pk_stride() as u8,
+            has_presented_pk,
         }
     }
 }
@@ -958,7 +977,7 @@ fn make_shared_batch_data(
     let layout = if b.is_empty() {
         ColLayout::default()
     } else {
-        ColLayout::for_schema(s.as_ref())
+        ColLayout::for_schema(s.as_ref(), &present_cols)
     };
     Ok(Arc::new(SharedBatchData {
         schema: s,
@@ -977,40 +996,30 @@ fn build_row_values_into(py: Python<'_>, data: &SharedBatchData, row: usize, out
     let schema: &Schema = &data.schema;
     let batch = &data.batch;
     let null_word = batch.nulls[row];
-    let pk_stride = schema.pk_stride() as u8;
-    let pk_tuple = batch.pks.get_tuple(row, pk_stride);
 
     let layout = &data.layout;
+    let pk_tuple = layout
+        .has_presented_pk
+        .then(|| batch.pks.get_tuple(row, layout.pk_stride));
     for &ci in &data.present_cols {
         if layout.is_pk[ci] {
-            out.push(pk_value_from_tuple(py, schema, ci, &pk_tuple));
+            out.push(pk_value_from_tuple(
+                py,
+                schema.columns[ci].type_code,
+                layout.pk_byte_offset[ci],
+                layout.wire_stride[ci],
+                pk_tuple.as_ref().expect("has_presented_pk covers every PK column"),
+            ));
         } else {
-            let p_idx = layout.payload_idx[ci];
-            if null_word & (1u64 << p_idx) != 0 {
-                out.push(py.None());
-            } else {
-                match &batch.columns[ci] {
-                    ColData::Fixed(buf) => {
-                        let stride = layout.wire_stride[ci];
-                        out.push(read_fixed_le(
-                            py,
-                            schema.columns[ci].type_code,
-                            &buf[row * stride..(row + 1) * stride],
-                        ));
-                    }
-                    ColData::Strings(v) => match &v[row] {
-                        Some(s) => out.push(s.into_pyobject(py)?.into_any().unbind()),
-                        None => out.push(py.None()),
-                    },
-                    ColData::Bytes(v) => match &v[row] {
-                        Some(b) => out.push(pyo3::types::PyBytes::new(py, b).into_any().unbind()),
-                        None => out.push(py.None()),
-                    },
-                    ColData::U128s(v) => {
-                        out.push(u128_value_to_py(py, v[row], schema.columns[ci].type_code)?);
-                    }
-                }
-            }
+            let is_null = null_word_get(null_word, layout.payload_idx[ci]);
+            out.push(cell_to_py(
+                py,
+                &batch.columns[ci],
+                row,
+                is_null,
+                schema.columns[ci].type_code,
+                layout.wire_stride[ci],
+            )?);
         }
     }
     Ok(())
@@ -1285,85 +1294,31 @@ impl PyScanResult {
             .ok_or_else(|| pyo3::exceptions::PyIndexError::new_err("column index out of range"))?;
         let n = data.batch.len();
 
-        // Specialize by column kind. Use get_tuple so compound-PK
-        // (PkColumn::Bytes) batches work too.
+        let tc = data.schema.columns[col_idx].type_code;
+        let stride = tc.wire_stride();
+
+        // Specialize by column kind, with the per-column layout hoisted out of
+        // the row loop. Use get_tuple so compound-PK (PkColumn::Bytes) batches
+        // work too.
         if data.schema.is_pk_col(col_idx) {
             let pk_stride = data.schema.pk_stride() as u8;
+            let offset = data.schema.pk_byte_offset(col_idx);
             let items: Vec<PyObject> = (0..data.batch.pks.len())
                 .map(|i| {
                     let t = data.batch.pks.get_tuple(i, pk_stride);
-                    pk_value_from_tuple(py, &data.schema, col_idx, &t)
+                    pk_value_from_tuple(py, tc, offset, stride, &t)
                 })
                 .collect();
             return Ok(PyList::new(py, items)?.unbind());
         }
 
-        let payload_idx = data.schema.payload_idx(col_idx);
         let nulls = &data.batch.nulls;
-        let null_bit = 1u64 << payload_idx;
-
-        match &data.batch.columns[col_idx] {
-            ColData::Fixed(buf) => {
-                let tc = data.schema.columns[col_idx].type_code;
-                let stride = tc.wire_stride();
-                let items: Vec<PyObject> = (0..n)
-                    .map(|i| {
-                        if nulls[i] & null_bit != 0 {
-                            py.None()
-                        } else {
-                            read_fixed_le(py, tc, &buf[i * stride..(i + 1) * stride])
-                        }
-                    })
-                    .collect();
-                Ok(PyList::new(py, items)?.unbind())
-            }
-            ColData::Strings(v) => {
-                let items: Vec<PyObject> = v
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| {
-                        if nulls[i] & null_bit != 0 {
-                            return Ok(py.None());
-                        }
-                        match s {
-                            Some(s) => Ok(s.into_pyobject(py)?.into_any().unbind()),
-                            None => Ok(py.None()),
-                        }
-                    })
-                    .collect::<PyResult<_>>()?;
-                Ok(PyList::new(py, items)?.unbind())
-            }
-            ColData::Bytes(v) => {
-                let items: Vec<PyObject> = v
-                    .iter()
-                    .enumerate()
-                    .map(|(i, b)| {
-                        if nulls[i] & null_bit != 0 {
-                            return Ok::<PyObject, PyErr>(py.None());
-                        }
-                        match b {
-                            Some(b) => Ok(pyo3::types::PyBytes::new(py, b).into_any().unbind()),
-                            None => Ok(py.None()),
-                        }
-                    })
-                    .collect::<PyResult<_>>()?;
-                Ok(PyList::new(py, items)?.unbind())
-            }
-            ColData::U128s(v) => {
-                let tc = data.schema.columns[col_idx].type_code;
-                let items: Vec<PyObject> = v
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &x)| {
-                        if nulls[i] & null_bit != 0 {
-                            return Ok(py.None());
-                        }
-                        u128_value_to_py(py, x, tc)
-                    })
-                    .collect::<PyResult<_>>()?;
-                Ok(PyList::new(py, items)?.unbind())
-            }
-        }
+        let pi = data.schema.payload_idx(col_idx);
+        let col = &data.batch.columns[col_idx];
+        let items: Vec<PyObject> = (0..n)
+            .map(|i| cell_to_py(py, col, i, null_word_get(nulls[i], pi), tc, stride))
+            .collect::<PyResult<_>>()?;
+        Ok(PyList::new(py, items)?.unbind())
     }
 }
 
@@ -1656,18 +1611,6 @@ impl PyGnitzClient {
         let py_schema = rust_schema_to_py(py, &schema)?.into_any();
         let tid_obj = tid.into_pyobject(py)?.into_any().unbind();
         Ok(PyTuple::new(py, [tid_obj, py_schema])?.into_any().unbind())
-    }
-
-    /// allocate_table_id() — name matches py_client API
-    pub fn allocate_table_id(&mut self, py: Python<'_>) -> PyResult<u64> {
-        let c = client!(self);
-        to_py_err(py.allow_threads(|| c.alloc_table_id()))
-    }
-
-    /// allocate_schema_id()
-    pub fn allocate_schema_id(&mut self, py: Python<'_>) -> PyResult<u64> {
-        let c = client!(self);
-        to_py_err(py.allow_threads(|| c.alloc_schema_id()))
     }
 
     /// scan(target_id, include_hidden=False) -> ScanResult
@@ -2081,7 +2024,7 @@ impl PyCircuit {
 // ---------------------------------------------------------------------------
 // Shared DML encode helpers — single source of truth for argument mapping.
 // Both PyGnitzClient (sync, via send_message) and PyAsyncTransport (async)
-// use encode_message() with these same patterns.
+// use encode_message_parts() with these same patterns.
 // ---------------------------------------------------------------------------
 
 fn encode_push_payload(client_id: u64, target_id: u64, schema: &Schema, batch: &ZSetBatch) -> gnitz_core::MessageParts {

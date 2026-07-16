@@ -12,7 +12,7 @@ use crate::runtime::wire::{
     CTRL_BLOCK_SIZE_NO_BLOB, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, STATUS_OK,
 };
 use crate::schema::SchemaDescriptor;
-use crate::storage::{carve_writer_slices, scatter_copy, Batch, DirectWriter};
+use crate::storage::{carve_writer_slices, scatter_copy, wire_header_dir_size, wire_region_sizes, Batch, DirectWriter};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -32,9 +32,14 @@ pub(crate) const SAL_MMAP_SIZE: usize = 1 << 30;
 /// emission and `wire_group_footprint`'s fit check, which must agree
 /// byte-for-byte: the committer fail-stops (aborts the node) if a transaction
 /// family fails to fit after an earlier family already hit the SAL.
-fn wire_safe_slot_size(count_w: usize, npc: usize, wire_row_stride: u32, schema_block_len: usize) -> usize {
+fn wire_safe_slot_size(
+    schema: &SchemaDescriptor,
+    count_w: usize,
+    wire_row_stride: u32,
+    schema_block_len: usize,
+) -> usize {
     let data_sz = if count_w > 0 {
-        data_wire_block_size_cached(count_w, npc, wire_row_stride)
+        data_wire_block_size_cached(schema, count_w, wire_row_stride)
     } else {
         0
     };
@@ -354,50 +359,14 @@ unsafe fn sal_write_sentinel(sal_ptr: *mut u8, offset: usize, mmap_size: usize) 
 // Scatter-to-wire helpers
 // ---------------------------------------------------------------------------
 
-/// True when every column has a fixed-width 8-aligned stride and no German-string
-/// (STRING or BLOB) columns. Batches satisfying this can be scatter-encoded
-/// directly into SAL slots without intermediate per-worker Batch allocations.
-/// BLOB shares STRING's 16-byte struct with out-of-line heap bytes, so it must
-/// be excluded too — the fast path hands `scatter_copy` a 0-cap blob arena and
-/// asserts no blob bytes are written.
-pub(crate) fn schema_wire_safe(schema: &SchemaDescriptor) -> bool {
-    (0..schema.num_columns()).all(|ci| {
-        let c = &schema.columns[ci];
-        !gnitz_wire::is_german_string(c.type_code) && c.size().is_multiple_of(8)
-    })
-}
-
-/// Compute `(wire_safe, wire_row_fixed_stride)` for `schema`. The stride is
-/// only meaningful when `wire_safe` is true: it's the byte cost of one row
-/// in the SAL data block (`pk_stride + weight + null_bmp + payload strides`,
-/// all already 8-aligned because `wire_safe` rejects non-8-aligned columns).
-/// Caching the result lets `scatter_wire_group` skip the per-call iteration.
-pub fn compute_wire_props(schema: &SchemaDescriptor) -> (bool, u32) {
-    let safe = schema_wire_safe(schema);
-    if !safe {
-        return (false, 0);
-    }
-    let pk_stride = schema.pk_stride() as u32;
-    let mut stride = pk_stride + 8 + 8;
-    for (_pi, _ci, col) in schema.payload_columns() {
-        stride += col.size() as u32;
-    }
-    (true, stride)
-}
-
-/// Header + directory size for a wire-safe data block of `npc` payload columns.
+/// Compute the byte size of the data WAL block for `count` rows on `schema`
+/// with a precomputed `wire_row_fixed_stride` (see
+/// `crate::storage::compute_wire_props`). Only correct when the schema is
+/// `wire_safe` (caller's responsibility) — no alignment padding, so the size
+/// is the fixed header/directory prefix plus `count` linear rows.
 #[inline]
-fn data_wire_header_dir_size(npc: usize) -> usize {
-    let num_regions = 3 + npc + 1;
-    gnitz_wire::WAL_HEADER_SIZE + num_regions * 8
-}
-
-/// Compute the byte size of the data WAL block for `count` rows on a schema
-/// with `npc` payload columns and a precomputed `wire_row_fixed_stride`.
-/// Only correct when the schema is `wire_safe` (caller's responsibility).
-#[inline]
-fn data_wire_block_size_cached(count: usize, npc: usize, stride: u32) -> usize {
-    data_wire_header_dir_size(npc) + count * stride as usize
+fn data_wire_block_size_cached(schema: &SchemaDescriptor, count: usize, stride: u32) -> usize {
+    wire_header_dir_size(schema) + count * stride as usize
 }
 
 // ---------------------------------------------------------------------------
@@ -668,23 +637,12 @@ fn write_scattered_data_block(
     // Region sizes in canonical order: pk, weight, null_bmp, payload…, blob(0).
     // All strides % 8 == 0 (schema_wire_safe), so the shared header/directory
     // writer's align8 padding never fires and the body is one contiguous run.
-    let mut sizes = [0u32; crate::storage::MAX_WIRE_REGIONS];
-    sizes[0] = (schema.pk_stride() as usize * count) as u32;
-    sizes[1] = (8 * count) as u32;
-    sizes[2] = (8 * count) as u32;
-    let mut nr = 3;
-    for (_pi, _ci, col) in schema.payload_columns() {
-        sizes[nr] = (col.size() as usize * count) as u32;
-        nr += 1;
-    }
-    sizes[nr] = 0; // blob: empty on this fast path
-    nr += 1;
+    let (sizes, nr) = wire_region_sizes(schema, count, 0);
     crate::storage::wal_write_header_and_directory(data_slot, table_id, count as u32, &sizes[..nr], total_size);
 
     // The writer carves `rest` (body after header+directory) into per-region
     // slices: [pk | weight | null | col_0 | ...], each sized for `count` rows.
-    let header_dir_size = gnitz_wire::WAL_HEADER_SIZE + nr * 8;
-    let (_, rest) = data_slot.split_at_mut(header_dir_size);
+    let (_, rest) = data_slot.split_at_mut(wire_header_dir_size(schema));
     let (pk, weight, null_bmp, col_slices) = carve_writer_slices(rest, schema, count);
     // No German-string columns on this fast path; DirectWriter still wants a blob
     // arena, so hand it a 0-cap stack-local that scatter_copy must not grow.
@@ -696,7 +654,7 @@ fn write_scattered_data_block(
         "non-string SAL fast path must not write blob bytes"
     );
 
-    crate::storage::wal_stamp_checksum(data_slot, total_size);
+    gnitz_wire::wal::stamp_checksum(data_slot, total_size);
 }
 
 // ---------------------------------------------------------------------------
@@ -880,9 +838,8 @@ impl SalWriter {
         let (wire_safe, wire_row_stride) = wire_props;
         let mut total = 8 + GROUP_HEADER_SIZE;
         if wire_safe {
-            let npc = schema.num_payload_cols();
             for wi in worker_indices.iter().take(nw) {
-                total += align8(wire_safe_slot_size(wi.len(), npc, wire_row_stride, schema_block_len));
+                total += align8(wire_safe_slot_size(schema, wi.len(), wire_row_stride, schema_block_len));
             }
         } else {
             let mb = input_batch.as_mem_batch();
@@ -908,8 +865,7 @@ impl SalWriter {
     /// Does NOT sync/signal. `lsn` is supplied by the caller.
     ///
     /// `prebuilt_schema_block`: when `Some`, the bytes are copied into each
-    /// slot's schema region instead of building one from `schema` + names.
-    /// Mutually exclusive with `col_names_opt`; passing both is a bug.
+    /// slot's schema region instead of building a nameless one from `schema`.
     /// `wire_props`: `(wire_safe, wire_row_fixed_stride)` derived from the
     /// schema. When `Some`, the values are reused directly so the function
     /// avoids the per-call column iteration; when `None`, they're computed
@@ -920,15 +876,12 @@ impl SalWriter {
         input_batch: &Batch,
         worker_indices: &[Vec<u32>],
         schema: &SchemaDescriptor,
-        col_names_opt: Option<&[&[u8]]>,
         target_id: u32,
         lsn: u64,
         sal_flags: u32,
         wire_flags: u64,
-        seek_pk: u128,
         seek_col_idx: u64,
         req_ids: &[u64],
-        unicast_worker: i32,
         prebuilt_schema_block: Option<&[u8]>,
         wire_props: Option<(bool, u32)>,
     ) -> Result<(), String> {
@@ -941,12 +894,8 @@ impl SalWriter {
             req_ids.len(),
             nw
         );
-        debug_assert!(
-            prebuilt_schema_block.is_none() || col_names_opt.is_none(),
-            "scatter_wire_group: prebuilt_schema_block and col_names_opt are mutually exclusive",
-        );
 
-        let (wire_safe, wire_row_stride) = wire_props.unwrap_or_else(|| compute_wire_props(schema));
+        let (wire_safe, wire_row_stride) = wire_props.unwrap_or_else(|| crate::storage::compute_wire_props(schema));
 
         if !wire_safe {
             // Fallback: reconstruct per-worker Batches and use existing path.
@@ -972,11 +921,11 @@ impl SalWriter {
                 wire_flags,
                 &refs,
                 schema,
-                col_names_opt,
-                seek_pk,
+                None,
+                0,
                 seek_col_idx,
                 req_ids,
-                unicast_worker,
+                -1,
                 0,
                 prebuilt_schema_block,
                 &[],
@@ -985,26 +934,21 @@ impl SalWriter {
 
         // Fast path: scatter directly into SAL slots. The schema block is
         // either supplied prebuilt (cached at the caller) or built once here
-        // and reused across all worker slots.
+        // (nameless) and reused across all worker slots.
         let owned_block: Vec<u8>;
         let schema_block: &[u8] = match prebuilt_schema_block {
             Some(b) => b,
             None => {
-                let col_names = col_names_opt.unwrap_or(&[]);
-                owned_block = build_schema_wire_block(schema, col_names, 0, target_id);
+                owned_block = build_schema_wire_block(schema, &[], 0, target_id);
                 &owned_block
             }
         };
         // ctrl block size for the no-error fast path is a compile-time constant.
         let ctrl_size = CTRL_BLOCK_SIZE_NO_BLOB;
-        let npc = schema.num_payload_cols();
         let mut worker_sizes = [0u32; MAX_WORKERS];
         for w in 0..nw {
-            if unicast_worker >= 0 && w != unicast_worker as usize {
-                continue;
-            }
             worker_sizes[w] =
-                wire_safe_slot_size(worker_indices[w].len(), npc, wire_row_stride, schema_block.len()) as u32;
+                wire_safe_slot_size(schema, worker_indices[w].len(), wire_row_stride, schema_block.len()) as u32;
         }
 
         let group = unsafe {
@@ -1039,7 +983,7 @@ impl SalWriter {
             // b. Data block when there are rows for this worker.
             if count_w > 0 {
                 let data_start = ctrl_size + schema_block.len();
-                let data_sz = data_wire_block_size_cached(count_w, npc, wire_row_stride);
+                let data_sz = data_wire_block_size_cached(schema, count_w, wire_row_stride);
                 let data_slot = &mut slot[data_start..data_start + data_sz];
                 write_scattered_data_block(&mb, &worker_indices[w], schema, count_w, target_id, data_slot);
             }
@@ -1055,7 +999,7 @@ impl SalWriter {
                 target_id as u64,
                 0,
                 full_wire_flags,
-                seek_pk,
+                0,
                 seek_col_idx,
                 req_ids[w],
                 STATUS_OK,
@@ -1083,13 +1027,10 @@ impl SalWriter {
         target_id: u32,
         lsn: u64,
         sal_flags: u32,
-        wire_flags: u64,
         batch: Option<&Batch>,
         schema: &SchemaDescriptor,
         col_names_opt: Option<&[&[u8]]>,
         seek_pk: u128,
-        seek_col_idx: u64,
-        request_id: u64,
         prebuilt_schema_block: Option<&[u8]>,
     ) -> Result<(), String> {
         self.prefault_ahead();
@@ -1136,10 +1077,10 @@ impl SalWriter {
                 0,
                 target_id as u64,
                 0,
-                wire_flags,
+                0,
                 seek_pk,
-                seek_col_idx,
-                request_id,
+                0,
+                0,
                 STATUS_OK,
                 b"",
                 Some(schema),
@@ -1214,6 +1155,21 @@ impl SalWriter {
         }
     }
 
+    /// Boot-time reset after all workers finish recovery: clear the slot-0
+    /// sentinel prefix (readers at cursor 0 then see "no message") and rewind
+    /// to cursor 0, epoch 1 — the first live epoch; epoch 0 is the empty-slot
+    /// sentinel prefix. The mmap-prefix store lives here, next to
+    /// `checkpoint_reset`, so the SAL slot layout never leaks to callers.
+    pub fn boot_reset(&mut self) {
+        self.write_cursor = 0;
+        self.epoch = 1;
+        self.last_prefaulted = 0;
+        unsafe {
+            atomic_store_u64(self.ptr, 0);
+        }
+    }
+
+    #[cfg(test)]
     pub fn reset(&mut self, cursor: u64, epoch: u32) {
         self.write_cursor = cursor;
         self.epoch = epoch;

@@ -11,14 +11,13 @@ use std::rc::Rc;
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::query::ExchangeCallback;
 use crate::runtime::sal::{
-    schema_wire_safe, SalMessageKind, SalReader, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_STOP,
-    BACKFILL_PAD_BIT, FLAG_EXCHANGE,
+    SalMessageKind, SalReader, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_STOP, BACKFILL_PAD_BIT, FLAG_EXCHANGE,
 };
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::w2m_ring;
 use crate::runtime::wire::{self as ipc, FLAG_CONTINUATION, FLAG_SCAN_LAST, STATUS_ERROR, STATUS_OK};
 use crate::schema::SchemaDescriptor;
-use crate::storage::Batch;
+use crate::storage::{schema_wire_safe, Batch};
 use crate::storage::{BlobCacheGuard, FlushOutcome, FlushWork, PkBuf, StorageError, Table};
 
 // ---------------------------------------------------------------------------
@@ -371,7 +370,7 @@ impl WorkerProcess {
             return 1;
         }
         // Startup ACK is unsolicited; request_id=0 is the reserved untagged slot.
-        self.send_ack(0, 0, 0);
+        self.send_ack(0, 0);
 
         loop {
             // Skip the SAL wait while a chunked reply train is in progress: the
@@ -527,9 +526,11 @@ impl WorkerProcess {
             // ── Tick: inline at top-level, defer inside exchange wait ──
             (DispatchContext::TopLevel, SalMessageKind::Tick) => self.run_via_dispatch_inner(kind, target_id, wire),
             (DispatchContext::InsideExchangeWait { .. }, SalMessageKind::Tick) => {
+                // Only the request id is needed; peek it from the control block
+                // instead of running a full checksum-verifying frame decode.
                 let req_id = wire
-                    .and_then(|d| ipc::decode_wire(d).ok())
-                    .map(|d| d.control.request_id)
+                    .and_then(|d| ipc::peek_client_control(d).ok())
+                    .map(|c| c.request_id)
                     .unwrap_or(0);
                 self.exchange.deferred_ticks.push((target_id, req_id));
                 DispatchOutcome::Continue
@@ -678,7 +679,7 @@ impl WorkerProcess {
             SalMessageKind::Flush => {
                 self.advance_read_epoch();
                 match self.handle_flush_all() {
-                    Ok(()) => self.send_ack(0, 0, request_id),
+                    Ok(()) => self.send_ack(0, request_id),
                     Err(msg) => self.send_error(&msg, request_id),
                 }
                 Ok(())
@@ -690,7 +691,7 @@ impl WorkerProcess {
             SalMessageKind::FlushEph => {
                 self.advance_read_epoch();
                 match self.handle_flush_all_ephemeral() {
-                    Ok(()) => self.send_ack(0, 0, request_id),
+                    Ok(()) => self.send_ack(0, request_id),
                     Err(msg) => self.send_error(&msg, request_id),
                 }
                 Ok(())
@@ -724,7 +725,7 @@ impl WorkerProcess {
                 // `target_id` is the source table; `seek_pk` carries the view to
                 // drive.
                 self.handle_backfill(target_id, seek_pk as i64, request_id)?;
-                self.send_ack(target_id as u64, 0, request_id);
+                self.send_ack(target_id as u64, request_id);
                 Ok(())
             }
 
@@ -772,13 +773,13 @@ impl WorkerProcess {
                         self.handle_push(target_id, batch, request_id)?;
                     }
                 }
-                self.send_ack(target_id as u64, 0, request_id);
+                self.send_ack(target_id as u64, request_id);
                 Ok(())
             }
 
             SalMessageKind::Tick => {
                 self.handle_tick(target_id, request_id)?;
-                self.send_ack(target_id as u64, 0, request_id);
+                self.send_ack(target_id as u64, request_id);
                 Ok(())
             }
 
@@ -1622,7 +1623,7 @@ mod tests {
         let req_ack: u64 = 42;
         let req_resp: u64 = 0xCAFE_BABE_DEAD_BEEF;
         let req_err: u64 = u64::MAX;
-        wp.send_ack(7, 0, req_ack);
+        wp.send_ack(7, req_ack);
         // Pass ReplySchema::None: send_response consults the catalog only
         // when a schema is present, and this test uses a null catalog pointer.
         // The id round-trip is the assertion of interest.

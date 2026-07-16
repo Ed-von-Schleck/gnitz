@@ -7,18 +7,16 @@
 use crate::ast_util::{extract_name, extract_table_factor_name};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_column_value, ColumnValue};
-use crate::codec::nullmap::null_word_set;
 use crate::dml::overlay::{buffered_all, buffered_keys, overlay_batch, Net};
-use crate::dml::plan::{classify_access, collect_index_seek_candidates, seek_pk_multi, AccessPath};
+use crate::dml::plan::{classify_access, collect_index_seek_candidates, first_index_hit, seek_pk_multi, AccessPath};
 use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
 use crate::error::GnitzSqlError;
 use crate::exec::eval::eval_expr;
 use crate::exec::residual::{bind_residuals, matching_indices};
 use crate::ir::BoundExpr;
 use crate::SqlResult;
-use gnitz_core::{
-    retraction_batch, ClientError, ColData, GnitzClient, PkColumn, PkTuple, Schema, WireConflictMode, ZSetBatch,
-};
+use gnitz_core::null_word_set;
+use gnitz_core::{retraction_batch, ColData, GnitzClient, PkColumn, PkTuple, Schema, WireConflictMode, ZSetBatch};
 use sqlparser::ast::{Assignment, AssignmentTarget, Expr, FromTable};
 use std::sync::Arc;
 
@@ -265,12 +263,10 @@ fn fetch_filtered<'a>(
 ) -> Result<FilteredFetch<'a>, GnitzSqlError> {
     let candidates =
         collect_index_seek_candidates(where_expr, schema, || client.table_indexes(tid)).map_err(GnitzSqlError::Exec)?;
-    for (col_indices, key_vals, residual) in candidates {
-        match client.seek_by_index(tid, col_indices.as_slice(), &key_vals) {
-            Ok((schema_opt, batch_opt, _)) => return Ok((schema_opt, batch_opt, residual)),
-            Err(ClientError::NoIndex) => continue,
-            Err(e) => return Err(GnitzSqlError::Exec(e)),
-        }
+    if let Some(((_, _, residual), (schema_opt, batch_opt, _))) = first_index_hit(candidates, |(cols, vals, _)| {
+        client.seek_by_index(tid, cols.as_slice(), vals)
+    })? {
+        return Ok((schema_opt, batch_opt, residual));
     }
     let (schema_opt, batch_opt, _) = client.scan(tid)?;
     Ok((schema_opt, batch_opt, vec![where_expr]))

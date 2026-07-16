@@ -16,7 +16,6 @@ pub const OPCODE_DISTINCT: u64 = 10;
 /// `source_table` column.
 pub const OPCODE_SCAN_DELTA: u64 = 11;
 pub const OPCODE_EXCHANGE_SHARD: u64 = 20;
-pub const OPCODE_EXCHANGE_GATHER: u64 = 21;
 pub const OPCODE_NULL_EXTEND: u64 = 23;
 /// Discriminates IntegrateTrace from IntegrateSink (OPCODE_INTEGRATE=7)
 /// without a nullable column.
@@ -175,13 +174,6 @@ pub const fn agg_output_type(func: AggFunc, src_tc: u8) -> u8 {
     }
 }
 
-/// REDUCE aggregation kind.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AggKind {
-    Null,
-    Specs(Vec<(AggFunc, u16)>),
-}
-
 /// The relation a **trace** slot must satisfy versus the **delta** slot in a
 /// range-join probe (`{ trace_slot REL delta_slot }`). Canonicalized from the ON
 /// clause's `L.x OP R.y`: term AB's rel is the converse of OP, term BA's rel is
@@ -336,7 +328,10 @@ pub enum OpNode {
     PositivePart,
     Reduce {
         group_cols: Vec<u16>,
-        agg: AggKind,
+        /// Aggregate specs `(func, source column)`. Never empty: a spec-less
+        /// REDUCE is rejected at decode (every producer ships at least one —
+        /// the SQL planner injects a companion COUNT for group-only reduces).
+        agg: Vec<(AggFunc, u16)>,
         /// True only for the user's ungrouped (global) scalar aggregate — the
         /// reduce that must emit exactly one row over an empty/fully-retracted
         /// source (COUNT(*)=0, SUM/MIN/MAX/AVG=NULL). A **SQL-intent
@@ -357,8 +352,6 @@ pub enum OpNode {
     ExchangeShard {
         shard_cols: Vec<u16>,
     },
-    /// `OPCODE_EXCHANGE_GATHER = 21`. Register pass-through; no VM instruction emitted.
-    ExchangeGather,
     NullExtend {
         type_codes: Vec<u8>,
     },
@@ -477,10 +470,8 @@ pub fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
             for (i, c) in group_cols.iter().enumerate() {
                 kind_rows.push((NODE_COL_KIND_GROUP, i as u16, *c as u64, 0));
             }
-            if let AggKind::Specs(specs) = agg {
-                for (i, (func, col)) in specs.into_iter().enumerate() {
-                    kind_rows.push((NODE_COL_KIND_AGG_SPEC, i as u16, func.as_u64(), col as u64));
-                }
+            for (i, (func, col)) in agg.into_iter().enumerate() {
+                kind_rows.push((NODE_COL_KIND_AGG_SPEC, i as u16, func.as_u64(), col as u64));
             }
             // Only the user's global scalar aggregate carries the row; an
             // ordinary grouped / range-join reduce omits it (decodes to `false`),
@@ -506,7 +497,6 @@ pub fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
             (OPCODE_EXCHANGE_SHARD, None, None),
             encode_col_list(NODE_COL_KIND_SHARD, shard_cols),
         ),
-        OpNode::ExchangeGather => ((OPCODE_EXCHANGE_GATHER, None, None), Vec::new()),
         OpNode::NullExtend { type_codes } => (
             (OPCODE_NULL_EXTEND, None, None),
             encode_col_list(NODE_COL_KIND_NULL_EXT, type_codes),
@@ -593,12 +583,10 @@ pub fn decode_op_node(
         OPCODE_POSITIVE_PART => OpNode::PositivePart,
         OPCODE_REDUCE => {
             let group_cols = collect_cols(NODE_COL_KIND_GROUP);
-            let specs = collect_aggs()?;
-            let agg = if specs.is_empty() {
-                AggKind::Null
-            } else {
-                AggKind::Specs(specs)
-            };
+            let agg = collect_aggs()?;
+            if agg.is_empty() {
+                return Err("REDUCE node carries no aggregate spec".to_string());
+            }
             // Absent row ⇒ `false` (the ordinary grouped / range-join reduce); a
             // present row carries the global-aggregate intent in value1. One param
             // row, exactly like NODE_COL_KIND_RANGE_JOIN.
@@ -641,7 +629,6 @@ pub fn decode_op_node(
         OPCODE_EXCHANGE_SHARD => OpNode::ExchangeShard {
             shard_cols: collect_cols(NODE_COL_KIND_SHARD),
         },
-        OPCODE_EXCHANGE_GATHER => OpNode::ExchangeGather,
         OPCODE_NULL_EXTEND => OpNode::NullExtend {
             type_codes: collect_typecodes(NODE_COL_KIND_NULL_EXT),
         },

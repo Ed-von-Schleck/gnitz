@@ -7,6 +7,15 @@ use super::*;
 use crate::schema::project_schema;
 
 impl CatalogEngine {
+    /// The registry entry for `table_id`, or the shared "Unknown table_id"
+    /// error every hard-resolving store path reports.
+    pub(crate) fn table_entry(&self, table_id: i64) -> Result<&crate::query::TableEntry, String> {
+        self.dag
+            .tables
+            .get(&table_id)
+            .ok_or_else(|| format!("Unknown table_id {table_id}"))
+    }
+
     /// Ingest a user-table batch and return the effective delta (after unique_pk
     /// dedup).  Used by multi-worker push where the worker needs the effective
     /// batch for later DAG evaluation but does NOT evaluate immediately.
@@ -28,11 +37,7 @@ impl CatalogEngine {
     /// already resolved here, so the reply path never re-resolves (and
     /// re-copies) the descriptor.
     pub fn scan_family(&mut self, table_id: i64) -> Result<(Rc<Batch>, SchemaDescriptor), String> {
-        let entry = self
-            .dag
-            .tables
-            .get(&table_id)
-            .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
+        let entry = self.table_entry(table_id)?;
         Ok((entry.handle.full_scan(), entry.schema))
     }
 
@@ -47,11 +52,7 @@ impl CatalogEngine {
         seek_pk: u128,
         seek_pk_extra: &[u8],
     ) -> Result<(Option<Batch>, SchemaDescriptor), String> {
-        let entry = self
-            .dag
-            .tables
-            .get(&table_id)
-            .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
+        let entry = self.table_entry(table_id)?;
         let (opk, stride) = crate::schema::seek_opk_bytes(&entry.schema, seek_pk, seek_pk_extra)?;
         Ok((Self::seek_entry_bytes(entry, &opk[..stride]), entry.schema))
     }
@@ -62,11 +63,7 @@ impl CatalogEngine {
     /// so one lookup serves every id.
     #[cfg(test)]
     pub(crate) fn seek_family_bytes(&mut self, table_id: i64, pk: &[u8]) -> Result<Option<Batch>, String> {
-        let entry = self
-            .dag
-            .tables
-            .get(&table_id)
-            .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
+        let entry = self.table_entry(table_id)?;
         Ok(Self::seek_entry_bytes(entry, pk))
     }
 
@@ -104,13 +101,23 @@ impl CatalogEngine {
         pks: &[crate::storage::PkBuf],
         project: &[u8],
     ) -> Result<Batch, String> {
-        let entry = self
-            .dag
-            .tables
-            .get(&table_id)
-            .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
+        let entry = self.table_entry(table_id)?;
         let schema = entry.schema;
         let result_schema = project_schema(&schema, project);
+        // Resolve the fixed projection once — `(col_idx, payload_slot, size)`
+        // per projected column — instead of re-deriving payload index and
+        // column size per row per column inside the seek loop. The projection
+        // is master-built and excludes PK columns (`collect_fk_projection`
+        // skips `is_pk_col`; `project_schema` asserts it one frame up), so
+        // every projected column has a payload slot.
+        let proj: Vec<(usize, usize, usize)> = project
+            .iter()
+            .map(|&p| {
+                let ci = p as usize;
+                let pi = schema.try_payload_idx(ci).expect("FK projection excludes PK columns");
+                (ci, pi, schema.columns[ci].size() as usize)
+            })
+            .collect();
         let mut out = Batch::with_schema(result_schema, pks.len());
         let mut cursor = entry.handle.open_cursor();
         for pk in pks {
@@ -118,7 +125,7 @@ impl CatalogEngine {
             // backward-capable, so it matches `seek_exact_live` on any input and
             // additionally fast-paths the (common) ascending-`pks` caller.
             if cursor.advance_to_exact_live(pk.pk_bytes()) {
-                copy_cursor_cols_to_batch(&cursor, &mut out, &schema, project);
+                copy_cursor_cols_to_batch(&cursor, &mut out, &proj);
             }
         }
         Ok(out)
@@ -131,11 +138,7 @@ impl CatalogEngine {
         table_id: i64,
         cols: &[u32],
     ) -> Result<(&crate::query::TableEntry, &crate::query::IndexCircuitEntry), String> {
-        let entry = self
-            .dag
-            .tables
-            .get(&table_id)
-            .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
+        let entry = self.table_entry(table_id)?;
         let ic = entry
             .index_circuits
             .iter()
@@ -167,12 +170,13 @@ impl CatalogEngine {
         let src_pk_stride = src_schema.pk_stride() as usize;
         let idx_key_size = ic.index_schema.leading_key_size(col_indices.len());
 
-        // OPK-encode the supplied natives into a leading-key prefix. The spec
-        // pairs each source column (the sign-extension width) with its promoted
-        // index column; the index PK region is OPK-at-rest, so the prefix is
+        // OPK-encode the supplied natives into a leading-key prefix through the
+        // circuit's baked spec, cut to the supplied arity. The spec pairs each
+        // source column (the sign-extension width) with its promoted index
+        // column; the index PK region is OPK-at-rest, so the prefix is
         // order-preserving and matches stored entries (`batch_project_index`
         // encodes through the same spec).
-        let spec = crate::schema::IndexKeySpec::new(&col_indices[..natives.len()], &src_schema, &ic.index_schema);
+        let spec = ic.key_spec.prefix(natives.len());
         let (opk, prefix_len) = spec.seek_prefix(natives);
         let opk_prefix = &opk[..prefix_len];
 
@@ -324,14 +328,14 @@ impl CatalogEngine {
         let prefix_len = ic.index_schema.leading_key_size(n_eq + 1); // eq prefix + range slot
 
         // Every cut key is `pad(group(v))` or its successor for a full
-        // (n_eq + 1)-column group key, so one IndexKeySpec over the equality
-        // prefix PLUS the range column encodes both cuts through the same path
-        // the write side uses (`write_span`/`batch_project_index` —
+        // (n_eq + 1)-column group key, so the circuit's baked spec cut to the
+        // equality prefix PLUS the range column encodes both cuts through the
+        // same path the write side uses (`write_span`/`batch_project_index` —
         // byte-identical by construction). Stack scratch throughout: MAX_PK_BYTES
         // bounds every index schema's pk_stride (asserted in
         // SchemaDescriptor::new), and `seek_prefix` leaves the bytes past
         // `prefix_len` zero, so `group(v)` IS `pad(group(v))`.
-        let spec = crate::schema::IndexKeySpec::new(&col_indices[..=n_eq], &src_schema, &ic.index_schema);
+        let spec = ic.key_spec.prefix(n_eq + 1);
         let mut natives = [0u128; gnitz_wire::PK_LIST_MAX_COLS];
         natives[..n_eq].copy_from_slice(eq_natives);
         // Cut → byte key, `None` = `+∞`. `After` steps to the byte successor of
@@ -442,11 +446,12 @@ impl CatalogEngine {
 
 /// Projecting sibling of `copy_cursor_row_with_weight`: append the cursor's
 /// current row to `out` (which has the `project_schema` layout) with weight 1,
-/// copying only the columns named in `project`. The projected payload column
-/// at position `k` corresponds to source column `project[k]`; the projected
-/// null bit `k` mirrors the source row's null bit for that column. Projected
+/// copying only the columns in `proj` — the caller-resolved
+/// `(col_idx, payload_slot, size)` triple per projected column. The projected
+/// payload column at position `k` corresponds to `proj[k]`; the projected null
+/// bit `k` mirrors the source row's null bit for that column. Projected
 /// columns are scalar, so no blob relocation is required.
-fn copy_cursor_cols_to_batch(cursor: &ReadCursor, out: &mut Batch, src_schema: &SchemaDescriptor, project: &[u8]) {
+fn copy_cursor_cols_to_batch(cursor: &ReadCursor, out: &mut Batch, proj: &[(usize, usize, usize)]) {
     // `current_pk_bytes()` is the verbatim OPK PK region for any width, and the
     // read cursor always tracks it regardless of stride. For narrow PKs it
     // equals `widen_pk_be(current_pk_bytes) == current_key_narrow()`; for wide
@@ -458,18 +463,11 @@ fn copy_cursor_cols_to_batch(cursor: &ReadCursor, out: &mut Batch, src_schema: &
     // buffers, so the null word can be appended after the column data.
     let src_null = cursor.current_null_word;
     let mut proj_null = 0u64;
-    for (k, &p) in project.iter().enumerate() {
-        // The projection is master-built and excludes PK columns
-        // (`collect_fk_projection` skips `is_pk_col`; `project_schema` asserts
-        // it one frame up), so every projected column has a payload slot.
-        let pi = src_schema
-            .try_payload_idx(p as usize)
-            .expect("FK projection excludes PK columns");
+    for (k, &(ci, pi, col_size)) in proj.iter().enumerate() {
         if src_null & (1u64 << pi) != 0 {
             proj_null |= 1u64 << k;
         }
-        let col_size = src_schema.columns[p as usize].size() as usize;
-        let ptr = cursor.col_ptr(p as usize, col_size);
+        let ptr = cursor.col_ptr(ci, col_size);
         if !ptr.is_null() {
             let data = unsafe { std::slice::from_raw_parts(ptr, col_size) };
             out.extend_col(k, data);

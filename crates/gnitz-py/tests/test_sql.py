@@ -226,9 +226,11 @@ class TestSqlSelect:
             # HAVING: predicate silently dropped today.
             with pytest.raises(gnitz.GnitzError, match="HAVING is not supported"):
                 client.execute_sql("SELECT pk FROM t HAVING pk > 0", schema_name=sn)
-            # OFFSET: skip silently ignored today (returns the first LIMIT rows).
-            with pytest.raises(gnitz.GnitzError, match="OFFSET is not supported"):
-                client.execute_sql("SELECT * FROM t LIMIT 2 OFFSET 1", schema_name=sn)
+            # OFFSET and ORDER BY are now honored by the client-side sink (see
+            # test_order_by.py); only the ClickHouse `LIMIT … BY` per-group form
+            # stays rejected on the LIMIT envelope.
+            with pytest.raises(gnitz.GnitzError, match=r"LIMIT \.\.\. BY is not supported"):
+                client.execute_sql("SELECT * FROM t LIMIT 2 BY val", schema_name=sn)
             # FETCH: silently dropped today.
             with pytest.raises(gnitz.GnitzError, match="FETCH is not supported"):
                 client.execute_sql("SELECT * FROM t FETCH FIRST 2 ROWS ONLY", schema_name=sn)
@@ -266,6 +268,11 @@ class TestSqlSelect:
             assert len(res[0]["rows"]) == 5
             res2 = client.execute_sql("SELECT * FROM t LIMIT 2", schema_name=sn)
             assert len(res2[0]["rows"]) == 2
+            # ORDER BY + OFFSET are honored end-to-end now.
+            res3 = client.execute_sql("SELECT * FROM t ORDER BY val DESC LIMIT 2", schema_name=sn)
+            assert [r.pk for r in res3[0]["rows"]] == [5, 4]
+            res4 = client.execute_sql("SELECT * FROM t ORDER BY val LIMIT 2 OFFSET 1", schema_name=sn)
+            assert [r.pk for r in res4[0]["rows"]] == [2, 3]
             client.execute_sql("DROP TABLE t", schema_name=sn)
         finally:
             client.drop_schema(sn)

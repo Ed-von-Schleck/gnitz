@@ -161,7 +161,7 @@ impl Shared {
             .get_schema_desc(target_id)
             .unwrap_or_else(SchemaDescriptor::minimal_u64);
         let e = ipc::get_or_build_schema_wire_block(cat, target_id, &schema);
-        (e.block, e.version)
+        (e.entry.block, e.version)
     }
 
     fn table_lock(&self, tid: i64) -> Rc<AsyncMutex<()>> {

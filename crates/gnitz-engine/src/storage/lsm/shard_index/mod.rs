@@ -11,9 +11,9 @@ use std::ffi::CString;
 use std::rc::Rc;
 
 use super::error::StorageError;
-use super::manifest::PkBuf;
 use super::shard_reader::MappedShard;
 use super::xor8;
+use crate::schema::key::PkBuf;
 use crate::schema::key::{compare_pk_bytes, pk_bytes_eq};
 use crate::schema::SchemaDescriptor;
 
@@ -209,18 +209,7 @@ mod tests {
     use crate::foundation::codec::as_le_bytes;
     use crate::foundation::posix_io::raise_fd_limit_for_tests;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-
-    fn test_schema() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                // col 0 = PK (U64)
-                SchemaColumn::new(type_code::U64, 0),
-                // col 1 = payload (I64)
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        )
-    }
+    use crate::test_support::make_schema_u64_i64;
 
     /// Synthetic 2-column compound PK schema: (U64, U64) PK + I64
     /// payload. 16-byte PK region, but the column-aware comparison
@@ -325,7 +314,7 @@ mod tests {
             &cpath,
             n as u32,
             &regions,
-            &test_schema(),
+            &make_schema_u64_i64(),
             shard_file::ShardWriteOpts::default(),
         )
         .unwrap();
@@ -346,7 +335,7 @@ mod tests {
     fn test_add_shard_and_find_pk() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
-        let schema = test_schema();
+        let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
 
         let path1 = write_test_shard(dir.path(), "s1.db", &[10, 20, 30], &[100, 200, 300]);
@@ -374,7 +363,7 @@ mod tests {
     fn test_manifest_roundtrip_with_levels() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
-        let schema = test_schema();
+        let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
 
         // Add enough shards to trigger compaction to L1
@@ -417,7 +406,7 @@ mod tests {
     fn test_run_compact_l0_to_l1() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
-        let schema = test_schema();
+        let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
 
         // Add > L0_COMPACT_THRESHOLD shards
@@ -451,7 +440,7 @@ mod tests {
     fn test_compact_guards_if_needed() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
-        let schema = test_schema();
+        let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
 
         // Manually populate L1 with > GUARD_FILE_THRESHOLD entries in one guard
@@ -485,7 +474,7 @@ mod tests {
     fn test_compact_guard_vertical_failure_leaves_index_unchanged() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
-        let schema = test_schema();
+        let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
         idx.ensure_level(1);
 
@@ -511,7 +500,7 @@ mod tests {
         let pre_guard_count = idx.levels[0].guards.len();
         let pre_entries = idx.levels[0].guards[0].entries.len();
 
-        let result = idx.compact_guard_vertical(1);
+        let result = idx.compact_guard_vertical();
         assert!(result.is_err(), "expected Err when output path is blocked");
         assert_eq!(
             idx.pending_deletions.len(),
@@ -537,7 +526,7 @@ mod tests {
         // an L0→L1 compaction.
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
-        let schema = test_schema();
+        let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
 
         // L1 already has a guard at key 100 (keys 100, 200).
@@ -602,7 +591,7 @@ mod tests {
     fn test_try_cleanup() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
-        let schema = test_schema();
+        let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
 
         // Create real files
@@ -632,7 +621,7 @@ mod tests {
     fn test_unsynced_tracking_mark_prune_clear() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
-        let schema = test_schema();
+        let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
 
         assert!(!idx.has_unsynced());
@@ -668,7 +657,7 @@ mod tests {
     fn test_max_lsn() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
-        let schema = test_schema();
+        let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
 
         assert_eq!(idx.max_lsn(), 0);
@@ -691,7 +680,7 @@ mod tests {
     fn test_run_compact_fails_on_long_path_l0_intact() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
-        let schema = test_schema();
+        let schema = make_schema_u64_i64();
 
         // Build an output dir long enough that output filenames exceed 255 bytes.
         // Filename overhead: "/shard_42_N_L1_GN.db" ≈ 20 bytes, so out_dir >= 236 bytes.
@@ -744,7 +733,7 @@ mod tests {
     fn test_compact_guard_vertical_routing_gap() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
-        let schema = test_schema();
+        let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
 
         // Build L1 (levels[0]) and L2 (levels[1])
@@ -773,8 +762,8 @@ mod tests {
             idx.levels[1].get_or_create_guard(200).entries.push(entry);
         }
 
-        // Compact L1 → L2 (src_level_num=1)
-        idx.compact_guard_vertical(1).unwrap();
+        // Compact L1 → L2
+        idx.compact_guard_vertical().unwrap();
 
         // All source keys (100-180) must be findable — they should not be lost
         // to the routing gap below L2's guard at 200.
@@ -790,66 +779,6 @@ mod tests {
         assert!(found_250, "destination key 250 lost after vertical compaction");
     }
 
-    /// L2→L3 vertical compaction (the deepest vertical path under MAX_LEVELS=3)
-    /// must keep below-destination-first-guard keys findable through the unified
-    /// saturating reader — the same routing-gap guarantee as L1→L2, one level
-    /// down, where it previously had no coverage.
-    #[test]
-    fn test_compact_guard_vertical_routing_gap_l2_to_l3() {
-        raise_fd_limit_for_tests();
-        let dir = tempfile::tempdir().unwrap();
-        let schema = test_schema();
-        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
-
-        // L1/L2/L3 = levels[0]/[1]/[2].
-        idx.ensure_level(3);
-
-        // L2 guard at key=100: 5 shards (worst guard — worst_count > 1) with keys
-        // in [100, 180].
-        let src_pks: Vec<u64> = vec![100, 120, 140, 160, 180];
-        for (i, &pk) in src_pks.iter().enumerate() {
-            let name = format!("l2_src_{i}.db");
-            let path = write_test_shard(dir.path(), &name, &[pk], &[pk as i64 * 10]);
-            let entry = ShardEntry::open(&path, &schema, 100).unwrap();
-            idx.levels[1].get_or_create_guard(100).entries.push(entry);
-        }
-
-        // L2 guard at key=500: 1 shard (so worst_guard picks key=100).
-        {
-            let path = write_test_shard(dir.path(), "l2_high.db", &[500], &[5000]);
-            let entry = ShardEntry::open(&path, &schema, 50).unwrap();
-            idx.levels[1].get_or_create_guard(500).entries.push(entry);
-        }
-
-        // L3 guard at key=200: 1 shard with key=250. Its first guard is above the
-        // source range, so the source keys land below it.
-        {
-            let path = write_test_shard(dir.path(), "l3_dest.db", &[250], &[2500]);
-            let entry = ShardEntry::open(&path, &schema, 80).unwrap();
-            idx.levels[2].get_or_create_guard(200).entries.push(entry);
-        }
-
-        idx.compact_guard_vertical(2).unwrap();
-
-        // The compaction actually ran (worst guard moved out of L2).
-        assert!(
-            !idx.levels[1].guards.iter().any(|g| g.guard_key == 100),
-            "L2 worst guard should be compacted into L3"
-        );
-
-        // Every source key (below L3's first guard 200) stays findable.
-        for &pk in &src_pks {
-            let mut found = false;
-            idx.find_pk(pk as u128, &mut |_, _| found = true);
-            assert!(found, "key {pk} lost after L2->L3 vertical compaction (routing gap)");
-        }
-
-        // The destination key 250 is also still present.
-        let mut found_250 = false;
-        idx.find_pk(250, &mut |_, _| found_250 = true);
-        assert!(found_250, "destination key 250 lost after L2->L3 vertical compaction");
-    }
-
     /// Regression: two vertical compactions that select different worst guards
     /// routing to *disjoint* destination guards, both topping at the same
     /// `max_lsn`, must emit distinct output basenames. Without the per-call
@@ -861,7 +790,7 @@ mod tests {
     fn test_vertical_disjoint_guards_no_name_collision() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
-        let schema = test_schema();
+        let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
         idx.ensure_level(2);
 
@@ -900,8 +829,8 @@ mod tests {
 
         // Call 1 folds L1 guard 100 → L2 guard 100; call 2 folds L1 guard 5000 →
         // L2 guard 5000 (disjoint destinations, both topping at max_lsn=100).
-        idx.compact_guard_vertical(1).unwrap();
-        idx.compact_guard_vertical(1).unwrap();
+        idx.compact_guard_vertical().unwrap();
+        idx.compact_guard_vertical().unwrap();
 
         // Both destination guards reference distinct, existing files.
         let files: Vec<String> = idx.levels[1]
@@ -937,7 +866,7 @@ mod tests {
     fn test_vertical_same_guard_recompaction_try_cleanup_keeps_live() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
-        let schema = test_schema();
+        let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
         idx.ensure_level(2);
 
@@ -957,7 +886,7 @@ mod tests {
                 .entries
                 .push(ShardEntry::open(&p, &schema, 100).unwrap());
         }
-        idx.compact_guard_vertical(1).unwrap();
+        idx.compact_guard_vertical().unwrap();
 
         // Re-add L1 guard gk(100) with two more entries (keys 120, 130) and
         // re-compact into the same destination guard.
@@ -968,7 +897,7 @@ mod tests {
                 .entries
                 .push(ShardEntry::open(&p, &schema, 100).unwrap());
         }
-        idx.compact_guard_vertical(1).unwrap();
+        idx.compact_guard_vertical().unwrap();
 
         // Flush the queued deletions (the consumed inputs). The live L2 shard must
         // NOT be among them.
@@ -998,7 +927,7 @@ mod tests {
     fn test_gc_orphans_removes_stale_shard() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
-        let schema = test_schema();
+        let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
 
         // Write a live shard and add it to the index.
@@ -1019,7 +948,7 @@ mod tests {
     fn test_gc_orphans_ignores_other_table_id() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
-        let schema = test_schema();
+        let schema = make_schema_u64_i64();
         let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
 
         // Files belonging to a different table must not be touched.
@@ -1041,7 +970,7 @@ mod tests {
     fn test_gc_orphans_removes_manifest_tmp() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
-        let schema = test_schema();
+        let schema = make_schema_u64_i64();
         let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
 
         let tmp_path = dir.path().join("manifest.bin.tmp");
@@ -1056,7 +985,7 @@ mod tests {
     fn test_gc_orphans_removes_tmp_suffix_orphans() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
-        let schema = test_schema();
+        let schema = make_schema_u64_i64();
         let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
 
         let shard_tmp = dir.path().join("shard_42_5.db.tmp");
@@ -1074,7 +1003,7 @@ mod tests {
     fn test_gc_orphans_empty_index_removes_stray() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
-        let schema = test_schema();
+        let schema = make_schema_u64_i64();
         // Empty index — no load_manifest call.
         let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
 
@@ -1092,7 +1021,7 @@ mod tests {
     fn test_single_pk_probe_and_sort_golden() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
-        let schema = test_schema();
+        let schema = make_schema_u64_i64();
 
         let p_lo = write_test_shard(dir.path(), "lo.db", &[10, 20], &[1, 2]);
         let p_hi = write_test_shard(dir.path(), "hi.db", &[30, 40], &[3, 4]);
@@ -1134,7 +1063,7 @@ mod tests {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
 
-        let single = test_schema();
+        let single = make_schema_u64_i64();
         let p = write_test_shard(dir.path(), "e_single.db", &[], &[]);
         let e = ShardEntry::open(&p, &single, 0).unwrap();
         assert!(e.is_empty());

@@ -204,8 +204,6 @@ uint64_t gnitz_circuit_shard(GnitzCircuitBuilder *cb,
                              const size_t *shard_cols,
                              size_t n_shard_cols);
 
-uint64_t gnitz_circuit_gather(GnitzCircuitBuilder *cb, uint64_t input);
-
 uint64_t gnitz_circuit_sink(GnitzCircuitBuilder *cb, uint64_t input);
 
 GnitzCircuit *gnitz_circuit_build(GnitzCircuitBuilder *cb);
@@ -235,7 +233,5 @@ int gnitz_batch_is_null(const GnitzBatch *batch, size_t col_idx, size_t row);
 double gnitz_batch_get_f64(const GnitzBatch *batch, size_t col_idx, size_t row);
 
 GnitzBatch *gnitz_execute_sql_query(GnitzConn *conn, const char *sql, const char *schema);
-
-void gnitz_free_string(char *s);
 
 #endif  /* GNITZ_H */

@@ -21,7 +21,7 @@ pub const MAX_FRAME_PAYLOAD_CLIENT: usize = 256 * 1024 * 1024; // 256 MB
 // Layout (length-prefixed; both sides use the standard 4-byte LE u32 prefix):
 //
 //   HELLO  (client → server, total wire size 12 bytes)
-//     [length=8 LE u32][magic: u32 LE][version: u16 LE][flags: u16 LE]
+//     [length=8 LE u32][magic: u32 LE][version: u16 LE][_pad: u16 LE]
 //
 //   ACK    (server → client on success, total wire size 24 bytes)
 //     [length=20 LE u32][magic: u32 LE][status: u16 LE][_pad: u16 LE]
@@ -61,11 +61,10 @@ pub const HELLO_STATUS_OK: u16 = 0;
 /// Build a HELLO payload (the bytes after the length prefix). Every sender
 /// frames it through its transport's standard framed send, which derives
 /// the identical 4-byte prefix.
-pub const fn encode_hello_payload(version: u16, flags: u16) -> [u8; HELLO_PAYLOAD_LEN as usize] {
+pub const fn encode_hello_payload(version: u16) -> [u8; HELLO_PAYLOAD_LEN as usize] {
     let mag = HELLO_MAGIC.to_le_bytes();
     let ver = version.to_le_bytes();
-    let flg = flags.to_le_bytes();
-    [mag[0], mag[1], mag[2], mag[3], ver[0], ver[1], flg[0], flg[1]]
+    [mag[0], mag[1], mag[2], mag[3], ver[0], ver[1], 0, 0] // _pad
 }
 
 /// Parsed HELLO payload (the 8 bytes following the length prefix).
@@ -73,7 +72,6 @@ pub const fn encode_hello_payload(version: u16, flags: u16) -> [u8; HELLO_PAYLOA
 pub struct HelloHeader {
     pub magic: u32,
     pub version: u16,
-    pub flags: u16,
 }
 
 /// Decode a HELLO payload. The caller must have already consumed the
@@ -84,8 +82,8 @@ pub fn decode_hello_payload(payload: &[u8]) -> Result<HelloHeader, &'static str>
     }
     let magic = u32::from_le_bytes(payload[0..4].try_into().unwrap());
     let version = u16::from_le_bytes(payload[4..6].try_into().unwrap());
-    let flags = u16::from_le_bytes(payload[6..8].try_into().unwrap());
-    Ok(HelloHeader { magic, version, flags })
+    // bytes [6..8] are reserved padding
+    Ok(HelloHeader { magic, version })
 }
 
 /// Build an ACK frame ready to ship over the wire (length prefix + payload).
@@ -148,24 +146,23 @@ mod hello_tests {
 
     #[test]
     fn hello_payload_layout_is_stable() {
-        // Magic must sit at offsets 0..4, version at 4..6, flags at 6..8.
-        let payload = encode_hello_payload(0x1234, 0x0001);
+        // Magic must sit at offsets 0..4, version at 4..6, reserved zero
+        // padding at 6..8.
+        let payload = encode_hello_payload(0x1234);
         assert_eq!(payload.len(), HELLO_PAYLOAD_LEN as usize);
         let magic = u32::from_le_bytes(payload[0..4].try_into().unwrap());
         assert_eq!(magic, HELLO_MAGIC);
         let version = u16::from_le_bytes(payload[4..6].try_into().unwrap());
         assert_eq!(version, 0x1234);
-        let flags = u16::from_le_bytes(payload[6..8].try_into().unwrap());
-        assert_eq!(flags, 0x0001);
+        assert_eq!(&payload[6..8], &[0, 0]);
     }
 
     #[test]
     fn hello_payload_decode_roundtrip() {
-        let payload = encode_hello_payload(7, 0xCAFE);
+        let payload = encode_hello_payload(7);
         let h = decode_hello_payload(&payload).unwrap();
         assert_eq!(h.magic, HELLO_MAGIC);
         assert_eq!(h.version, 7);
-        assert_eq!(h.flags, 0xCAFE);
     }
 
     #[test]

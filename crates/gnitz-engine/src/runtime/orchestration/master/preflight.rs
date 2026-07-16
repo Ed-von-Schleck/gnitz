@@ -1185,7 +1185,7 @@ impl MasterDispatcher {
         let mut keybuf = PkBuf::empty(0);
 
         for ci in 0..n_circuits {
-            let (col_indices, idx_schema) = unsafe {
+            let (col_indices, idx_schema, spec) = unsafe {
                 let disp = &mut *disp_ptr;
                 let cat = &mut *disp.catalog;
                 let cols = match cat.unique_index_circuit_cols(target_id, ci) {
@@ -1197,15 +1197,15 @@ impl MasterDispatcher {
                     None => continue,
                 };
                 // Own the list (PkColList is Copy) so it survives the catalog
-                // borrow and feeds the P2Label / error formatters.
-                (PkColList::from_slice(cols), idx_schema)
+                // borrow and feeds the P2Label / error formatters. The span
+                // plan is the circuit's baked `key_spec` (registration built it
+                // from the same owner/index schemas): `key_bytes` builds the
+                // OPK leading-key span — null-correct (skip on any NULL) and
+                // equality-correct at any width.
+                let spec = cat.index_circuits(target_id)[ci].key_spec;
+                (PkColList::from_slice(cols), idx_schema, spec)
             };
             let cols = col_indices.as_slice();
-
-            // Per-circuit read/encode plan: `key_bytes` builds the OPK
-            // leading-key span — null-correct (skip on any NULL) and
-            // equality-correct at any width.
-            let spec = IndexKeySpec::new(cols, &source_schema, &idx_schema);
             // The (table, this) filter-map key AND the worker's index-store hint —
             // a single-column hint cannot locate a composite index.
             let packed = gnitz_wire::pack_pk_cols(cols);
@@ -1593,13 +1593,12 @@ impl MasterDispatcher {
             if n_circuits == 0 || !has_unique {
                 continue;
             }
-            let source_schema = *b.schema(tid);
             let surviving = b.surviving(tid);
             if surviving.is_empty() {
                 continue;
             }
             for ci in 0..n_circuits {
-                let (col_indices, idx_schema) = unsafe {
+                let (col_indices, idx_schema, spec) = unsafe {
                     let cat = &mut *(*disp_ptr).catalog;
                     let cols = match cat.unique_index_circuit_cols(tid, ci) {
                         Some(c) => PkColList::from_slice(c),
@@ -1609,10 +1608,11 @@ impl MasterDispatcher {
                         Some(s) => s,
                         None => continue,
                     };
-                    (cols, idx_schema)
+                    // The circuit's baked span plan (registration built it from
+                    // the same owner/index schemas).
+                    (cols, idx_schema, cat.index_circuits(tid)[ci].key_spec)
                 };
                 let cols = col_indices.as_slice();
-                let spec = IndexKeySpec::new(cols, &source_schema, &idx_schema);
                 let stride = idx_schema.pk_stride() as usize;
 
                 // Surviving (span, holder PK) pairs; reject an in-bundle duplicate
@@ -2254,15 +2254,12 @@ impl MasterDispatcher {
                                     source,
                                     worker_indices,
                                     &check.schema,
-                                    None,
                                     check.target_id as u32,
                                     0,
                                     FLAG_HAS_PK,
                                     0,
-                                    0,
                                     check.col_hint,
                                     req_slice,
-                                    -1,
                                     None,
                                     None,
                                 )
@@ -2356,7 +2353,7 @@ impl MasterDispatcher {
         let expected = crate::schema::project_schema(&parent_schema, project);
 
         // `_lease` held across the full drain below (see `dispatch_scan_fanout`).
-        let (slots, req_ids, _lease) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, -1, |disp, rids, unicast| {
+        let (slots, req_ids, _lease) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, -1, |disp, rids, _unicast| {
             let nw = disp.num_workers;
             let pooled = disp.pool_pop_batch(target_id);
             let batch = build_check_batch_pkbuf(&parent_schema, &pks, pooled);
@@ -2365,15 +2362,12 @@ impl MasterDispatcher {
                     &batch,
                     worker_indices,
                     &parent_schema,
-                    None,
                     target_id as u32,
                     0,
                     FLAG_GATHER,
                     /* wire_flags */ 0,
-                    /* seek_pk */ 0,
                     /* seek_col_idx */ col_mask,
                     rids,
-                    unicast,
                     None,
                     None,
                 )

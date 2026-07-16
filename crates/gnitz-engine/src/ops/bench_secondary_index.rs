@@ -21,7 +21,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::index::{make_avi_schema, op_integrate_with_indexes, AviDesc};
+use super::index::{make_avi_schema, op_integrate_with_indexes, AviBake, AviDesc};
 use super::util::{encode_ordered, GroupKeyExtractor, AVI_AV_BYTES};
 use super::{AggDescriptor, AggOp};
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
@@ -204,18 +204,20 @@ fn secondary_index_bench_avi_decomposition() {
         )
         .unwrap();
         id += 1;
-        let extractor = GroupKeyExtractor::new(&schema, &group_by_cols);
-        let avi = AviDesc {
-            table: &mut t as *mut Table,
-            group_by_cols: &group_by_cols,
-            aggs: &[AggDescriptor {
+        let bake = AviBake::new(
+            &schema,
+            &group_by_cols,
+            &[AggDescriptor {
                 col_idx: 2,
                 agg_op: AggOp::Min,
                 col_type_code: TypeCode::I64,
             }],
-            extractor: &extractor,
+        );
+        let avi = AviDesc {
+            table: &mut t as *mut Table,
+            bake: &bake,
         };
-        op_integrate_with_indexes(&input, None, &schema, Some(&avi)).unwrap();
+        op_integrate_with_indexes(&input, None, Some(&avi)).unwrap();
         std::hint::black_box(&t);
     });
 

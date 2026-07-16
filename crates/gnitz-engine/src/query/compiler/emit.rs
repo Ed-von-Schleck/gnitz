@@ -384,30 +384,12 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
                     if pk_n > crate::schema::MAX_PK_COLUMNS || oob_cols(reindex_cols, &in_reg_schema) {
                         return Err(CompileError::Rejected("map: reindex columns out of range"));
                     }
-                    // A carried target `t` must be exactly the promotion the planner
-                    // derives for a key of this source type. Rather than re-deriving
-                    // the sign/width ladder by hand (and drifting from the planner),
-                    // validate against the single shared rule: `t` is a value-
-                    // preserving promotion of `src` iff `join_key_common_type` maps
-                    // the pair `(src, t)` back to `t`. The promotion is idempotent —
-                    // promoting a source against its own carried target is a no-op —
-                    // so this is exactly the planner's `carried_reindex_tc` contract
-                    // read back (a `#[test]` pins the idempotency). It also screens
-                    // PK-ineligible targets for free, since the function only ever
-                    // yields PK-eligible types. A mismatch means a corrupt/forged
-                    // catalog, so abort the compile cleanly rather than panic in
-                    // encode_pk_column_promoted (a narrowing target would slice
-                    // scratch[src_width..target_width] with src_width > target_width).
-                    // Runs after the in-bounds column check above, so columns[c] is
-                    // always in range here.
-                    let promotion_invalid = reindex_cols.iter().enumerate().any(|(i, &c)| {
-                        let t = reindex_target_tcs.get(i).copied().unwrap_or(0);
-                        t != 0 && {
-                            let src = in_reg_schema.columns[c as usize].type_code;
-                            gnitz_wire::join_key_common_type(src, t) != Some(t)
-                        }
-                    });
-                    if promotion_invalid {
+                    // A mismatched carried promotion target would panic in
+                    // encode_pk_column_promoted (a narrowing target slices
+                    // scratch[src_width..target_width] with src_width > target_width);
+                    // see `reindex_promotion_invalid`. Runs after the in-bounds
+                    // column check above, so columns[c] is always in range here.
+                    if reindex_promotion_invalid(reindex_cols, reindex_target_tcs, &in_reg_schema, false) {
                         return Err(CompileError::Rejected("map: invalid reindex promotion target"));
                     }
                     let node_schema = if !reindex_cols.is_empty() {
@@ -466,49 +448,25 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
                 gnitz_wire::MapKind::HashRow(proj_cols, target_tcs, branch_id) => {
                     // Keep the listed columns as payload (positions 0..k), like a
                     // Projection, but prepend a synthetic U128 PK that op_map sets
-                    // to a hash of those payload columns (reindex_hash path).
-                    // `target_tcs[j] != 0` promotes payload column j to that
-                    // ≤8-byte integer type (cross-width set-op coercion): the node
-                    // schema declares the wider slot and `create_universal_projection`
-                    // widens the source into it, so both set-op sides hash one physical layout.
+                    // to a hash of those payload columns (reindex_hash path): the
+                    // node schema declares the (possibly promoted) slot and
+                    // `create_universal_projection` widens the source into it, so
+                    // both set-op sides hash one physical layout.
                     //
                     // Same trust-boundary guards as the Expression reindex arm above:
                     // an out-of-range column would read a zeroed schema slot (a
-                    // silently wrong hash), and a carried target must be exactly the
-                    // planner's value-preserving promotion of its source —
-                    // `join_key_common_type(src, t) == Some(t)` — restricted to the
-                    // ≤8-byte fixed-int domain the payload widen supports. A
-                    // violation means a corrupt/forged catalog; fail the compile
-                    // cleanly rather than truncate in `copy_column`.
+                    // silently wrong hash), and the shared `reindex_promotion_invalid`
+                    // (restricted to the ≤8-byte fixed-int domain the payload widen
+                    // supports) rejects a corrupt/forged carried target cleanly
+                    // rather than truncating in `copy_column`.
                     if 1 + proj_cols.len() > crate::schema::MAX_COLUMNS || oob_cols(proj_cols, &in_reg_schema) {
                         return Err(CompileError::Rejected("hash-row map: columns out of range"));
                     }
-                    let promotion_invalid = proj_cols.iter().enumerate().any(|(j, &c)| {
-                        let t = target_tcs.get(j).copied().unwrap_or(0);
-                        t != 0 && {
-                            let src = in_reg_schema.columns[c as usize].type_code;
-                            !gnitz_wire::is_fixed_int(t) || gnitz_wire::join_key_common_type(src, t) != Some(t)
-                        }
-                    });
-                    if promotion_invalid {
+                    if reindex_promotion_invalid(proj_cols, target_tcs, &in_reg_schema, true) {
                         return Err(CompileError::Rejected("hash-row map: invalid promotion target"));
                     }
                     let src_indices: Vec<i32> = proj_cols.iter().map(|&c| c as i32).collect();
-                    let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-                    cols[0] = SchemaColumn::new(type_code::U128, 0);
-                    for (j, &i) in src_indices.iter().enumerate() {
-                        let src = in_reg_schema.columns[i as usize];
-                        let tgt = target_tcs.get(j).copied().unwrap_or(0);
-                        let out_tc = if tgt != 0 { tgt } else { src.type_code };
-                        // `new` re-derives size/signedness for the promoted type;
-                        // keep THIS SIDE's nullability. Per-side, not the
-                        // operator-merged view nullability: an INTERSECT/EXCEPT leaf
-                        // is `distinct`-ed on its own before the tuple-tightening
-                        // combine, so its row comparator must classify by what this
-                        // side can actually emit.
-                        cols[1 + j] = SchemaColumn::new(out_tc, src.nullable);
-                    }
-                    let node_schema = SchemaDescriptor::new(&cols[..1 + src_indices.len()], &[0]);
+                    let node_schema = hashrow_output_schema(&in_reg_schema, proj_cols, target_tcs);
                     let fp = ctx.create_universal_projection(&src_indices, &in_reg_schema, &node_schema);
                     ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(node_schema);
                     let func_idx = ctx.builder.func_idx(fp);
@@ -550,21 +508,13 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
 
         gnitz_wire::OpNode::Union => {
             let in_a = in_reg(&in_regs, PORT_IN_A, "union: missing left input port")?;
-            let has_b = in_regs.contains_key(&PORT_IN_B);
-            let in_b = in_regs.get(&PORT_IN_B).copied().unwrap_or(0);
+            let in_b = in_reg(&in_regs, PORT_IN_B, "union: missing right input port")?;
             let a_schema = ctx.reg_meta[in_a as usize].schema;
-            let out_schema = if has_b {
-                union_nullability_merge(&a_schema, &ctx.reg_meta[in_b as usize].schema)
-            } else {
-                // O(1) identity pass-through (op_union returns PORT_IN_A unchanged); no B
-                // schema to merge.
-                a_schema
-            };
+            let out_schema = union_nullability_merge(&a_schema, &ctx.reg_meta[in_b as usize].schema);
             ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(out_schema);
             ctx.builder.push(Instr::Union {
                 in_a: in_a as u16,
                 in_b: in_b as u16,
-                has_b,
                 out_reg: reg_id as u16,
             });
         }
@@ -591,7 +541,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
             let hist_table_ptr = ctx.add_owned_trace_table(&child_name, in_reg_schema, Some(reg_id))?;
             let out_delta_id = ctx.push_delta_reg(in_reg_schema);
             ctx.out_reg_of.insert(nid, out_delta_id);
-            let hist_table_idx = ctx.builder.table_idx(hist_table_ptr) as i16;
+            let hist_table_idx = ctx.builder.table_idx(hist_table_ptr) as u16;
             ctx.builder.push(Instr::WeightClamp {
                 in_reg: in_reg as u16,
                 hist_reg: reg_id as u16,
@@ -622,12 +572,10 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
                     let out_schema = merge_schemas_for_join(&a_schema, &b_schema)
                         .ok_or(CompileError::Rejected("join: merged schema exceeds MAX_COLUMNS"))?;
                     ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(out_schema);
-                    let right_schema_idx = ctx.builder.schema_idx(b_schema);
                     ctx.builder.push(Instr::JoinDT {
                         delta_reg: a_reg as u16,
                         trace_reg: b_reg as u16,
                         out_reg: reg_id as u16,
-                        right_schema_idx,
                     });
                 }
                 gnitz_wire::JoinKind::DeltaTraceRange { n_eq, rel } => {
@@ -647,12 +595,10 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
                     let out_schema = merge_schemas_for_join(&a_schema, &b_schema)
                         .ok_or(CompileError::Rejected("join: merged schema exceeds MAX_COLUMNS"))?;
                     ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(out_schema);
-                    let right_schema_idx = ctx.builder.schema_idx(b_schema);
                     ctx.builder.push(Instr::JoinDTRange {
                         delta_reg: a_reg as u16,
                         trace_reg: b_reg as u16,
                         out_reg: reg_id as u16,
-                        right_schema_idx,
                         n_eq: *n_eq,
                         rel: *rel,
                     });
@@ -661,9 +607,10 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
         }
 
         gnitz_wire::OpNode::IntegrateSink => {
+            // Emits no instruction: the sink register's batch is what
+            // `execute_epoch_multi` extracts at epoch end.
             let in_reg = in_reg(&in_regs, PORT_IN, "integrate-sink: missing input port")?;
             ctx.sink_reg_id = in_reg;
-            ctx.push_integrate(in_reg as u16, std::ptr::null_mut());
         }
 
         gnitz_wire::OpNode::IntegrateTrace => {
@@ -703,16 +650,6 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
                 worker_id,
                 num_workers,
             });
-        }
-
-        gnitz_wire::OpNode::ExchangeGather => {
-            if let Some(&in_reg) = in_regs.get(&PORT_IN) {
-                ctx.reg_meta[reg_id as usize] = ctx.reg_meta[in_reg as usize];
-                // ExchangeGather is a logical passthrough: the exchange mechanism
-                // injects gathered data directly into the exchange-input register.
-                // Redirect downstream reads to that register; reg_id is never written.
-                ctx.out_reg_of.insert(nid, in_reg);
-            }
         }
 
         gnitz_wire::OpNode::NullExtend { type_codes } => {
@@ -771,7 +708,7 @@ pub(super) fn emit_reduce(
     nid: i32,
     reg_id: i32,
     group_cols: &[u16],
-    agg: &gnitz_wire::AggKind,
+    agg: &[(gnitz_wire::AggFunc, u16)],
     global_ground: bool,
     out_key: gnitz_wire::ReduceOutKey,
     in_regs: &HashMap<i32, i32>,
@@ -789,41 +726,28 @@ pub(super) fn emit_reduce(
     if oob_cols(group_cols, &in_reg_schema) {
         return Err(CompileError::Rejected("reduce: group columns out of range"));
     }
-    if let gnitz_wire::AggKind::Specs(specs) = agg {
-        if specs.iter().any(|&(_, c)| c as usize >= in_reg_schema.num_columns()) {
-            return Err(CompileError::Rejected("reduce: aggregate column out of range"));
-        }
+    if agg.is_empty() {
+        return Err(CompileError::Rejected("reduce: no aggregate spec"));
+    }
+    if agg.iter().any(|&(_, c)| c as usize >= in_reg_schema.num_columns()) {
+        return Err(CompileError::Rejected("reduce: aggregate column out of range"));
     }
 
-    let mut agg_descs: Vec<AggDescriptor> = Vec::new();
-
-    match agg {
-        gnitz_wire::AggKind::Null => {
-            agg_descs.push(AggDescriptor {
-                col_idx: 0,
-                agg_op: AggOp::Null,
-                col_type_code: TypeCode::U64,
-            });
-        }
-        gnitz_wire::AggKind::Specs(specs) => {
-            for &(ref func, col_idx) in specs {
-                let agg_op = AggOp::from(*func);
-                let col_type_code = TypeCode::from_validated_u8(in_reg_schema.columns[col_idx as usize].type_code);
-                agg_descs.push(AggDescriptor {
-                    col_idx: col_idx as u32,
-                    agg_op,
-                    col_type_code,
-                });
-            }
-        }
-    }
+    let agg_descs: Vec<AggDescriptor> = agg
+        .iter()
+        .map(|&(func, col_idx)| AggDescriptor {
+            col_idx: col_idx as u32,
+            agg_op: AggOp::from(func),
+            col_type_code: TypeCode::from_validated_u8(in_reg_schema.columns[col_idx as usize].type_code),
+        })
+        .collect();
 
     // Every aggregate that decodes its column value needs an order-encodable
     // (≤8-byte int/float) scalar. SUM/SUM_ZERO sum it — a 16-byte source would abort
     // at the first push in `decode_signed` (`unreachable!`) and a string would
     // silently mis-sum; MIN/MAX compare it via `encode_ordered`, which has no
-    // monotone key for STRING / U128 / UUID / BLOB. COUNT / COUNT_NON_NULL and the
-    // NULL placeholder never read the value. The SQL binder already rejects these,
+    // monotone key for STRING / U128 / UUID / BLOB. COUNT / COUNT_NON_NULL never
+    // read the value. The SQL binder already rejects these,
     // so this is the defensive guard for the low-level CircuitBuilder path that
     // bypasses it: a failure fails the compile (so the view compiles to nothing)
     // rather than panicking a worker at execution.
@@ -918,18 +842,12 @@ pub(super) fn emit_reduce(
     // returns the post-delta extreme directly. (The trace_in integrate below runs
     // after the reduce and carries no index.)
     if !avi_table_ptr.is_null() {
-        let (group_cols_offset, group_cols_count) = ctx.builder.add_group_cols(&gcols_u32);
-        let (agg_descs_offset, agg_descs_count) = ctx.builder.add_agg_descs(&avi_aggs);
-        let extractor_idx = ctx
+        let bake_idx = ctx
             .builder
-            .add_avi_extractor(crate::ops::GroupKeyExtractor::new(&in_reg_schema, &gcols_u32));
+            .add_avi_bake(crate::ops::AviBake::new(&in_reg_schema, &gcols_u32, &avi_aggs));
         let avi = IntegrateAvi {
             table_idx: ctx.builder.table_idx(avi_table_ptr) as u16,
-            group_cols_offset,
-            group_cols_count,
-            agg_descs_offset,
-            agg_descs_count,
-            extractor_idx,
+            bake_idx,
         };
         ctx.builder.push(Instr::Integrate {
             in_reg: in_reg_id as u16,
@@ -1103,35 +1021,6 @@ pub(super) fn build_plan(
 
     ctx.builder.push(Instr::Halt);
 
-    // Destructive-register ordering invariant. `Union` and `WeightClamp`
-    // (distinct / positive_part) empty their input register in place
-    // (`Batch::take`, to avoid allocation). Every register has one writer and its
-    // readers run in instruction order, so a destructively-consumed register is
-    // correct only when the destructive read is the LAST read of that register.
-    // Checked over the EMITTED instructions with resolved registers, so register
-    // aliasing from elided nodes — identity MAPs, `Filter(None)`
-    // pass-throughs, skipped Distincts, ExchangeGather — is seen through rather
-    // than reasoned about via graph edges. (A self-union reads in_a == in_b in
-    // one instruction; the exec arm handles that before the take.)
-    let instrs = ctx.builder.instructions();
-    for (i, instr) in instrs.iter().enumerate() {
-        let dtor_reg = match instr {
-            Instr::Union { in_a, .. } => *in_a,
-            Instr::WeightClamp { in_reg, .. } => *in_reg,
-            _ => continue,
-        };
-        if instrs[i + 1..].iter().any(|later| reads_reg(later, dtor_reg)) {
-            gnitz_warn!(
-                "build_plan: instruction {i} destructively consumes register {dtor_reg}, \
-                 but a later instruction still reads it; every other reader of a \
-                 destructively-consumed register must precede it"
-            );
-            return Err(CompileError::Rejected(
-                "destructive register read is not the last reader",
-            ));
-        }
-    }
-
     let mut input_delta_reg_id = first_exchange_input_reg_id;
     if input_delta_reg_id == -1 && !ctx.source_reg_map.is_empty() {
         input_delta_reg_id = *ctx.source_reg_map.values().next().unwrap();
@@ -1151,6 +1040,38 @@ pub(super) fn build_plan(
     }
     if sink_reg == -1 {
         return Err(CompileError::Rejected("plan has no output register"));
+    }
+
+    // Destructive-register ordering invariant. `Union` and `WeightClamp`
+    // (distinct / positive_part) empty their input register in place
+    // (`Batch::take`, to avoid allocation). Every register has one writer and its
+    // readers run in instruction order, so a destructively-consumed register is
+    // correct only when the destructive read is the LAST read of that register.
+    // Checked over the EMITTED instructions with resolved registers, so register
+    // aliasing from elided nodes — identity MAPs, `Filter(None)`
+    // pass-throughs, skipped Distincts — is seen through rather
+    // than reasoned about via graph edges. (A self-union reads in_a == in_b in
+    // one instruction; the exec arm handles that before the take.) The resolved
+    // sink register is read once more at epoch end (the output extraction), so
+    // it counts as one trailing reader of every instruction.
+    let instrs = ctx.builder.instructions();
+    for (i, instr) in instrs.iter().enumerate() {
+        let dtor_reg = match instr {
+            Instr::Union { in_a, .. } => *in_a,
+            Instr::WeightClamp { in_reg, .. } => *in_reg,
+            _ => continue,
+        };
+        if dtor_reg as i32 == sink_reg || instrs[i + 1..].iter().any(|later| reads_reg(later, dtor_reg)) {
+            gnitz_warn!(
+                "build_plan: instruction {i} destructively consumes register {dtor_reg}, \
+                 but a later instruction (or the epoch-end sink extraction) still reads \
+                 it; every other reader of a destructively-consumed register must \
+                 precede it"
+            );
+            return Err(CompileError::Rejected(
+                "destructive register read is not the last reader",
+            ));
+        }
     }
 
     if output_node_id.is_none() {

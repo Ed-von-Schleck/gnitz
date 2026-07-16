@@ -218,10 +218,7 @@ impl CatalogEngine {
                     continue;
                 }
 
-                let sid = batch.read_payload_u64(i, TABTAB_PAY_SCHEMA_ID) as i64;
-                let name = batch.read_payload_string(i, TABTAB_PAY_NAME);
-                let pk = unpack_pk_cols(batch.read_payload_u64(i, TABTAB_PAY_PK_COL_IDX));
-                let flags = batch.read_payload_u64(i, TABTAB_PAY_FLAGS);
+                let (sid, name, pk, flags) = read_table_tab_row(batch, i);
                 let is_unique = gnitz_wire::table_flags_unique(flags);
                 // Distribution prefix length k (0 = default = full PK).
                 // `new_with_dist` clamps an out-of-range k, so a crafted flag
@@ -362,20 +359,17 @@ impl CatalogEngine {
                     continue;
                 }
 
-                let sid = batch.read_payload_u64(i, VIEWTAB_PAY_SCHEMA_ID) as i64;
-                let name = batch.read_payload_string(i, VIEWTAB_PAY_NAME);
-
                 // The view's physical PK is the persisted leading-k column list:
                 // a single synthetic hash column for join/set-op/distinct views,
                 // or the source PK passed through (0..k) for a plain projection
-                // over a compound-PK table. A bare `0` decodes back to `[0]`.
+                // over a compound-PK table.
                 // The over-wide rejection inside `validate_relation_defs` is
                 // genuinely reachable here: compound-PK plain projection
                 // prepends the k source PK columns, so SELECT * over a wide
                 // compound-PK table can cross MAX_COLUMNS — a clean error beats
                 // build_schema_from_col_defs' assert aborting the process.
+                let (sid, name, pk) = read_view_tab_row(batch, i);
                 let col_defs = self.read_column_defs(vid);
-                let pk = unpack_pk_cols(batch.read_payload_u64(i, VIEWTAB_PAY_PK_COL_IDX));
                 validate_relation_defs("view", vid, &name, &col_defs, &pk)?;
 
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
@@ -499,11 +493,7 @@ impl CatalogEngine {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let idx_id = batch.get_pk(i) as i64;
-            let owner_id = batch.read_payload_u64(i, IDXTAB_PAY_OWNER_ID) as i64;
-            // source_cols carries pack_pk_cols(&col_indices); decode it (a
-            // single-column index is the 1-element degenerate case).
-            let cols = gnitz_wire::unpack_pk_cols(batch.read_payload_u64(i, IDXTAB_PAY_SOURCE_COLS));
-            let is_unique = batch.read_payload_u64(i, IDXTAB_PAY_IS_UNIQUE) != 0;
+            let (owner_id, cols, is_unique) = read_idx_tab_row(batch, i);
 
             if weight > 0 {
                 // Keep worker next_index_id in sync with master-assigned IDs so that

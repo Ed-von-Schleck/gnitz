@@ -4,7 +4,8 @@ use std::rc::Rc;
 
 use crate::foundation::codec;
 use crate::schema::{encode_german_string, type_code, SchemaColumn, SchemaDescriptor};
-use crate::storage::{wal_block_size, Batch, MemBatch, MAX_WIRE_REGIONS};
+use crate::storage::{Batch, MemBatch, MAX_WIRE_REGIONS};
+use gnitz_wire::control::german_spill_len;
 
 // ---------------------------------------------------------------------------
 // Constants re-exported from gnitz_wire
@@ -72,26 +73,6 @@ const _: () = assert!(
 );
 
 // ---------------------------------------------------------------------------
-// WAL block sizing (block framing arithmetic is single-homed in `wal::block_size`)
-// ---------------------------------------------------------------------------
-
-fn schema_wal_block_size(schema: &SchemaDescriptor, row_count: usize, blob_size: usize) -> usize {
-    let pk_stride = schema.pk_stride() as usize;
-    let num_payload = schema.num_payload_cols();
-    // V4 wire format: 3 fixed regions (pk pk_stride*B, weight 8B, null_bmp 8B) + payload + blob
-    let num_regions = 3 + num_payload + 1;
-    let mut sizes = [0u32; MAX_WIRE_REGIONS];
-    sizes[0] = (pk_stride * row_count) as u32; // pk: pk_stride bytes per row
-    sizes[1] = (8 * row_count) as u32; // weight
-    sizes[2] = (8 * row_count) as u32; // null_bmp
-    for (pi, _ci, col) in schema.payload_columns() {
-        sizes[3 + pi] = (col.size() as usize * row_count) as u32;
-    }
-    sizes[3 + num_payload] = blob_size as u32;
-    wal_block_size(&sizes[..num_regions])
-}
-
-// ---------------------------------------------------------------------------
 // Schema ↔ batch conversion
 // ---------------------------------------------------------------------------
 
@@ -144,13 +125,16 @@ pub(crate) fn get_or_build_schema_wire_block(
     let hidden = cat.get_col_hidden_mask(tid);
     let (name_refs, n) = col_names_as_refs(&col_names);
     let block = Rc::new(build_schema_wire_block(schema, &name_refs[..n], hidden, tid as u32));
-    let (wire_safe, wire_row_fixed_stride) = crate::runtime::sal::compute_wire_props(schema);
-    cat.set_schema_wire_block(tid, block.clone(), wire_safe, wire_row_fixed_stride);
-    crate::catalog::CachedSchemaWire {
+    let (wire_safe, wire_row_fixed_stride) = crate::storage::compute_wire_props(schema);
+    let entry = crate::catalog::SchemaWireEntry {
         block,
-        version: cat.get_schema_version(tid),
         wire_safe,
         wire_row_fixed_stride,
+    };
+    cat.set_schema_wire_block(tid, entry.clone());
+    crate::catalog::CachedSchemaWire {
+        entry,
+        version: cat.get_schema_version(tid),
     }
 }
 
@@ -291,17 +275,6 @@ pub(crate) fn encode_ctrl_block_direct(
     n
 }
 
-/// Blob bytes a German string of length `len` spills into the shared blob
-/// region: 0 when it fits the 12-byte inline form, its full length otherwise.
-#[inline]
-fn german_spill_len(len: usize) -> usize {
-    if len > gnitz_wire::SHORT_STRING_THRESHOLD {
-        len
-    } else {
-        0
-    }
-}
-
 /// Encoded size of the schema wire block for `schema` + `col_names`, or the
 /// prebuilt block's length when one is supplied. Shared by `wire_size` and
 /// `wire_size_range` so the two size paths cannot drift.
@@ -321,7 +294,7 @@ fn schema_block_wire_size(
         .take(ncols)
         .map(|n| german_spill_len(n.len()))
         .sum();
-    schema_wal_block_size(&META_SCHEMA_DESC, ncols, schema_blob)
+    crate::storage::wire_block_size(&META_SCHEMA_DESC, ncols, schema_blob)
 }
 
 #[inline]
@@ -441,7 +414,7 @@ pub fn encode_wire_into(
         error_msg,
         schema,
         col_names,
-        data_batch,
+        WireData::Whole(data_batch),
         prebuilt_schema_block,
         seek_pk_extra,
         true,
@@ -482,7 +455,7 @@ pub fn encode_wire_into_ipc(
         error_msg,
         schema,
         col_names,
-        data_batch,
+        WireData::Whole(data_batch),
         prebuilt_schema_block,
         seek_pk_extra,
         false,
@@ -521,7 +494,9 @@ pub fn wire_size_range(
 /// Encode a wire message that carries only rows `[start_row, start_row+count)`
 /// from `data_batch`. No checksums (IPC fast path). For the first chunk pass
 /// `schema`/`prebuilt_schema_block`; pass `None` for both on continuations.
-/// The `sorted`/`consolidated` flags are propagated from `data_batch`.
+/// The `sorted`/`consolidated` flags are propagated from `data_batch`. The
+/// payload's `request_id` is always 0 — reply routing rides the W2M slot's
+/// ring prefix, never this field.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_wire_into_range(
     out: &mut [u8],
@@ -529,7 +504,6 @@ pub fn encode_wire_into_range(
     target_id: u64,
     client_id: u64,
     flags: u64,
-    request_id: u64,
     status: u32,
     schema: Option<&SchemaDescriptor>,
     data_batch: &Batch,
@@ -537,55 +511,57 @@ pub fn encode_wire_into_range(
     count: usize,
     prebuilt_schema_block: Option<&[u8]>,
 ) -> usize {
-    let has_data = count > 0;
-    let has_schema = should_include_schema(schema, prebuilt_schema_block, has_data, status);
-
-    let mut wire_flags = flags;
-    if has_schema {
-        wire_flags |= FLAG_HAS_SCHEMA;
-    }
-    if has_data {
-        wire_flags |= FLAG_HAS_DATA;
-        // Maps `b.layout()` with no re-verify: a non-`Raw` tag was certified
-        // (debug-verified) at its producer, so the shipped claim is
-        // verified-by-construction.
-        wire_flags |= layout_to_wire_flags(data_batch.layout());
-    }
-
-    let written = encode_ctrl_block_direct(
+    encode_wire_into_impl(
         out,
         offset,
         target_id,
         client_id,
-        wire_flags,
+        flags,
         0u128,
         0,
-        request_id,
+        0,
         status,
         &[],
+        schema,
+        None,
+        WireData::Range {
+            batch: data_batch,
+            start_row,
+            count,
+        },
+        prebuilt_schema_block,
         &[],
         false,
-    );
-    let mut pos = offset + written;
+    )
+}
 
-    if has_schema {
-        if let Some(prebuilt) = prebuilt_schema_block {
-            let end = pos + prebuilt.len();
-            out[pos..end].copy_from_slice(prebuilt);
-            pos = end;
-        } else if let Some(s) = schema {
-            let schema_batch = schema_to_batch(s, &[], 0);
-            let w = schema_batch.encode_to_wire(target_id as u32, out, pos, false);
-            pos += w;
+/// The data payload of one encoded wire message: a whole (optional) batch, or
+/// a row range of one — the only axis on which the full and range encoders
+/// differ, folded into one body so the flag assembly, ctrl-block emit, and
+/// schema-block emit cannot drift.
+enum WireData<'a> {
+    Whole(Option<&'a Batch>),
+    Range {
+        batch: &'a Batch,
+        start_row: usize,
+        count: usize,
+    },
+}
+
+impl WireData<'_> {
+    fn row_count(&self) -> usize {
+        match *self {
+            WireData::Whole(b) => b.map(|b| b.count).unwrap_or(0),
+            WireData::Range { count, .. } => count,
         }
     }
 
-    if has_data {
-        let w = data_batch.encode_range_to_wire(start_row, count, target_id as u32, out, pos, false);
-        pos += w;
+    fn layout_batch(&self) -> Option<&Batch> {
+        match *self {
+            WireData::Whole(b) => b,
+            WireData::Range { batch, .. } => Some(batch),
+        }
     }
-
-    pos - offset
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -602,12 +578,12 @@ fn encode_wire_into_impl(
     error_msg: &[u8],
     schema: Option<&SchemaDescriptor>,
     col_names: Option<&[&[u8]]>,
-    data_batch: Option<&Batch>,
+    data: WireData<'_>,
     prebuilt_schema_block: Option<&[u8]>,
     seek_pk_extra: &[u8],
     checksum: bool,
 ) -> usize {
-    let has_data = data_batch.map(|b| b.count > 0).unwrap_or(false);
+    let has_data = data.row_count() > 0;
     let has_schema = should_include_schema(schema, prebuilt_schema_block, has_data, status);
 
     let mut wire_flags = flags;
@@ -616,8 +592,10 @@ fn encode_wire_into_impl(
     }
     if has_data {
         wire_flags |= FLAG_HAS_DATA;
-        // See `encode_data_response_block`: maps `b.layout()`, verified-by-construction.
-        wire_flags |= layout_to_wire_flags(data_batch.unwrap().layout());
+        // Maps `b.layout()` with no re-verify: a non-`Raw` tag was certified
+        // (debug-verified) at its producer, so the shipped claim is
+        // verified-by-construction.
+        wire_flags |= layout_to_wire_flags(data.layout_batch().unwrap().layout());
     }
 
     let written = encode_ctrl_block_direct(
@@ -653,7 +631,14 @@ fn encode_wire_into_impl(
     }
 
     if has_data {
-        let written = data_batch.unwrap().encode_to_wire(target_id as u32, out, pos, checksum);
+        let written = match data {
+            WireData::Whole(b) => b.unwrap().encode_to_wire(target_id as u32, out, pos, checksum),
+            WireData::Range {
+                batch,
+                start_row,
+                count,
+            } => batch.encode_range_to_wire(start_row, count, target_id as u32, out, pos, checksum),
+        };
         pos += written;
     }
 
@@ -701,8 +686,8 @@ pub(crate) fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<
     // is the shared framer's job, the same front door the batch decoders use.
     // This decoder adds only the schema-conformance checks on top; the parsed
     // directory lands in `offs`/`sizes` with every extent already bounded.
-    let mut offs = [0u64; gnitz_wire::MAX_WIRE_REGIONS];
-    let mut sizes = [0u32; gnitz_wire::MAX_WIRE_REGIONS];
+    let mut offs = [0u64; MAX_WIRE_REGIONS];
+    let mut sizes = [0u32; MAX_WIRE_REGIONS];
     let header = gnitz_wire::wal::validate_and_parse(data, &mut offs, &mut sizes, verify_checksum).map_err(|e| {
         match e {
             gnitz_wire::WalError::InvalidVersion => "schema block wrong version",

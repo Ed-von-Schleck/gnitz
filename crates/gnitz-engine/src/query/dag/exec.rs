@@ -229,14 +229,18 @@ impl DagEngine {
         }
     }
 
-    /// Force a real sort+weight-merge of a post-exchange batch. The exchange
-    /// relay concatenates rows from all workers (and a HashRow reindex scrambles
-    /// PK order), so the result is not globally sorted — but its `sorted` /
-    /// `consolidated` flags are not reliably cleared by the relay path. Clearing
-    /// them here guarantees `into_consolidated` actually sorts, which the
-    /// downstream merge-walk join/distinct operators depend on.
-    fn consolidate_exchanged(mut batch: Batch, schema: &SchemaDescriptor) -> Batch {
-        batch.downgrade();
+    /// Sort+weight-merge a post-exchange batch for the post phase's merge-walk
+    /// join/distinct operators (the mandatory consolidation). Every relay leg
+    /// stamps its layout claim truthfully, so `into_consolidated` can trust the
+    /// flags: the scatter/repartition/broadcast ops certify only what they can
+    /// prove (a multi-worker concatenation ships `Raw`), the wire encoders
+    /// derive the `FLAG_BATCH_*` bits from the batch's own layout
+    /// (`encode_wire_into_impl`) and the decode re-certifies the claim against
+    /// the data (debug-verified), and the identity/skip-exchange legs pass the
+    /// VM's own claims through under the same `exchange_schema` descriptor they
+    /// were certified with. A `Raw` claim is re-sorted here; a verified
+    /// Sorted/Consolidated claim folds or passes through.
+    fn consolidate_exchanged(batch: Batch, schema: &SchemaDescriptor) -> Batch {
         batch.into_consolidated(schema)
     }
 
@@ -380,7 +384,6 @@ impl DagEngine {
         exchange: &mut E,
     ) -> bool {
         if !self.tables.contains_key(&view_id) {
-            crate::storage::batch_pool::recycle(delta);
             return false;
         }
         match self.execute_multi_worker_step(view_id, delta, source_id, exchange) {
@@ -388,11 +391,7 @@ impl DagEngine {
                 self.ingest_to_family(view_id, out);
                 true
             }
-            Some(out) => {
-                crate::storage::batch_pool::recycle(out);
-                false
-            }
-            None => false,
+            _ => false,
         }
     }
 
@@ -405,16 +404,11 @@ impl DagEngine {
     /// empty placeholder so collective exchange rounds stay in lockstep across
     /// workers — onto each downstream edge, until the queue drains. Every
     /// modified view trace is flushed exactly once after the DAG settles.
-    pub fn evaluate_dag_multi_worker<E: ExchangeCallback>(
-        &mut self,
-        source_id: i64,
-        delta: Batch,
-        exchange: &mut E,
-    ) -> i32 {
+    pub fn evaluate_dag_multi_worker<E: ExchangeCallback>(&mut self, source_id: i64, delta: Batch, exchange: &mut E) {
         self.get_dep_map();
         let view_ids: Vec<i64> = self.dep.forward.get(&source_id).cloned().unwrap_or_default();
         if view_ids.is_empty() {
-            return 0;
+            return;
         }
 
         let (mut pending, mut pending_pos) = self.build_pending(&view_ids, source_id, delta);
@@ -428,7 +422,6 @@ impl DagEngine {
 
             // The table may have been dropped between queueing and now.
             if !self.tables.contains_key(&view_id) {
-                crate::storage::batch_pool::recycle(input);
                 continue;
             }
 
@@ -462,17 +455,12 @@ impl DagEngine {
                 src_schema,
                 delta,
             );
-            if let Some(batch) = out_delta {
-                crate::storage::batch_pool::recycle(batch);
-            }
         }
 
         // Flush each modified view trace exactly once after the full DAG settles.
         for vid in dirty_views {
             self.flush_view_or_abort(vid);
         }
-
-        0
     }
 
     /// Seed the initial pending list for a DAG traversal.
@@ -505,9 +493,6 @@ impl DagEngine {
                     batch: b,
                 });
             }
-        }
-        if let Some(d) = delta_opt {
-            crate::storage::batch_pool::recycle(d);
         }
         let mut pending_pos: FxHashMap<(i64, i64), usize> = FxHashMap::default();
         Self::resort_pending(&mut pending, &mut pending_pos);
@@ -559,7 +544,7 @@ impl DagEngine {
                 if let (true, Some(d)) = (existing_idx < pending.len(), delta) {
                     let existing = pending[existing_idx].batch.take();
                     let schema = existing.schema.unwrap_or(src_schema);
-                    let merged = ops::op_union(existing, Some(d), &schema);
+                    let merged = ops::op_union(existing, d, &schema);
                     pending[existing_idx].batch = merged;
                 }
             } else {

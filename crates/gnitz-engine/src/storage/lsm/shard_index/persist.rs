@@ -56,17 +56,14 @@ impl ShardIndex {
         let cpath = super::super::cstr(path)?;
         // Missing manifest file ⇒ first-time table boot, treat as empty.
         // Other read errors propagate.
-        let cap = match manifest::entry_count(&cpath)? {
-            Some(n) => n.max(1),
-            None => return Ok(()),
+        let Some((entries, header)) = manifest::read_file(&cpath)? else {
+            return Ok(());
         };
-        let mut entries = vec![ManifestEntryRaw::default(); cap];
-        let (count, header) = manifest::read_file(&cpath, &mut entries)?;
         // Compaction output names must never reuse a value baked into a live,
         // manifest-referenced shard across a restart.
         self.compact_seq = header.compact_seq;
 
-        for raw in entries.iter().take(count) {
+        for raw in &entries {
             // The manifest stores the basename; the shard lives in this table's
             // directory (`entry_to_raw`). Re-prepend it to recover the path.
             let filename = format!("{}/{}", self.output_dir, raw.filename_str());

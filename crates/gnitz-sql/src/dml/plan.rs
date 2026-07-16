@@ -5,14 +5,14 @@
 //! analysis and fetching — no row mutation lives here. `select` and `mutate`
 //! sink into this module; it never references either.
 
-use crate::ast_util::{flatten_conjuncts, single_relation_col_name};
+use crate::ast_util::{expr_usize_literal, flatten_conjuncts, single_relation_col_name};
 use crate::bind::find_unique_column;
 use crate::codec::pk_codec::{
     extract_sql_literal, parse_literal_i128, parse_pk_literal_packed, parse_uuid_str, SqlLiteral,
 };
 use crate::error::GnitzSqlError;
 use gnitz_core::{ClientError, Cut, FixedInt, GnitzClient, PkTuple, RangeDescriptor, Schema, TypeCode, ZSetBatch};
-use sqlparser::ast::{BinaryOperator, Expr, LimitClause, Value};
+use sqlparser::ast::{BinaryOperator, Expr, LimitClause};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -63,19 +63,28 @@ pub(crate) fn classify_access<'e>(selection: Option<&'e Expr>, schema: &Schema) 
 // LIMIT
 // ---------------------------------------------------------------------------
 
-pub(crate) fn extract_limit(query: &sqlparser::ast::Query) -> Option<usize> {
+/// The `LIMIT n` value, or `None` when absent. A non-integer-literal LIMIT
+/// (`LIMIT 1+1`, `LIMIT 'x'`) is a clean error — silently degrading it would
+/// return every row, violating the unhonored-clause contract.
+pub(crate) fn extract_limit(query: &sqlparser::ast::Query) -> Result<Option<usize>, GnitzSqlError> {
     let limit = match &query.limit_clause {
         Some(LimitClause::LimitOffset { limit: Some(e), .. }) => e,
         Some(LimitClause::OffsetCommaLimit { limit: e, .. }) => e,
-        _ => return None,
+        _ => return Ok(None),
     };
-    match limit {
-        Expr::Value(vws) => match &vws.value {
-            Value::Number(n, _) => n.parse::<usize>().ok(),
-            _ => None,
-        },
-        _ => None,
-    }
+    expr_usize_literal(limit, "LIMIT").map(Some)
+}
+
+/// The `OFFSET n` value (both `LIMIT … OFFSET n` and the MySQL `LIMIT off, lim`
+/// form), or `0` when absent. Mirrors [`extract_limit`]: a non-integer-literal
+/// value errors rather than silently skipping nothing.
+pub(crate) fn extract_offset(query: &sqlparser::ast::Query) -> Result<usize, GnitzSqlError> {
+    let offset = match &query.limit_clause {
+        Some(LimitClause::LimitOffset { offset: Some(o), .. }) => &o.value,
+        Some(LimitClause::OffsetCommaLimit { offset, .. }) => offset,
+        _ => return Ok(0),
+    };
+    expr_usize_literal(offset, "OFFSET")
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +272,25 @@ pub(crate) fn seek_pk_multi(
         }
     }
     Ok((reply_schema, out))
+}
+
+/// Try each index candidate's seek in order, treating `ClientError::NoIndex` as
+/// "try the next candidate". Returns the first hit's `(candidate, reply)` — a
+/// hit with no matching rows is still terminal — or `None` when no candidate's
+/// index exists. The shared loop skeleton of the SELECT range/equality ladders
+/// and the UPDATE/DELETE filtered fetch.
+pub(crate) fn first_index_hit<C, T>(
+    candidates: Vec<C>,
+    mut seek: impl FnMut(&C) -> Result<T, ClientError>,
+) -> Result<Option<(C, T)>, GnitzSqlError> {
+    for cand in candidates {
+        match seek(&cand) {
+            Ok(res) => return Ok(Some((cand, res))),
+            Err(ClientError::NoIndex) => continue,
+            Err(e) => return Err(GnitzSqlError::Exec(e)),
+        }
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -740,6 +768,63 @@ mod tests {
             .unwrap()
             .parse_expr()
             .unwrap()
+    }
+
+    // ------------------------------------------------------------------
+    // extract_limit / extract_offset — non-literal forms are clean errors
+    // ------------------------------------------------------------------
+
+    fn parse_query_sql(src: &str) -> sqlparser::ast::Query {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+        match Parser::parse_sql(&GenericDialect {}, src)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+        {
+            sqlparser::ast::Statement::Query(q) => *q,
+            _ => panic!("not a query"),
+        }
+    }
+
+    #[test]
+    fn extract_limit_offset_literals_and_errors() {
+        let q = parse_query_sql("SELECT * FROM t LIMIT 3 OFFSET 2");
+        assert_eq!(extract_limit(&q).unwrap(), Some(3));
+        assert_eq!(extract_offset(&q).unwrap(), 2);
+        // MySQL `LIMIT off, lim`.
+        let q = parse_query_sql("SELECT * FROM t LIMIT 2, 3");
+        assert_eq!(extract_limit(&q).unwrap(), Some(3));
+        assert_eq!(extract_offset(&q).unwrap(), 2);
+        // Absent → None / 0.
+        let q = parse_query_sql("SELECT * FROM t");
+        assert_eq!(extract_limit(&q).unwrap(), None);
+        assert_eq!(extract_offset(&q).unwrap(), 0);
+        // A non-integer-literal errors instead of silently degrading:
+        // `LIMIT 1+1` must not return every row, `OFFSET 'x'` must not skip 0.
+        for sql in [
+            "SELECT * FROM t LIMIT 1+1",
+            "SELECT * FROM t LIMIT 'x'",
+            "SELECT * FROM t LIMIT -1",
+        ] {
+            assert!(
+                matches!(extract_limit(&parse_query_sql(sql)), Err(GnitzSqlError::Unsupported(_))),
+                "{sql} must error"
+            );
+        }
+        for sql in [
+            "SELECT * FROM t LIMIT 1 OFFSET 1+1",
+            "SELECT * FROM t LIMIT 1 OFFSET 'x'",
+        ] {
+            assert!(
+                matches!(
+                    extract_offset(&parse_query_sql(sql)),
+                    Err(GnitzSqlError::Unsupported(_))
+                ),
+                "{sql} must error"
+            );
+        }
     }
 
     // ------------------------------------------------------------------

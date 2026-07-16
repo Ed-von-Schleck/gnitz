@@ -7,7 +7,6 @@
 use crate::ast_util::{extract_name, object_name_ident};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_value_to_col, ColumnValue};
-use crate::codec::nullmap::null_word_set;
 use crate::codec::pk_codec::{extract_pk_value, is_null_expr};
 use crate::dml::mutate::{build_merged_row, eval_set_expr, resolve_set_target};
 use crate::dml::overlay::effective_row;
@@ -16,6 +15,7 @@ use crate::error::GnitzSqlError;
 use crate::exec::batch::{copy_batch_row, project, resolve_projection};
 use crate::ir::BoundExpr;
 use crate::SqlResult;
+use gnitz_core::null_word_set;
 use gnitz_core::{ColData, FixedInt, GnitzClient, PkColumn, PkTuple, Schema, WireConflictMode, ZSetBatch};
 use sqlparser::ast::{
     Assignment, ConflictTarget, Expr, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Parens, Query,

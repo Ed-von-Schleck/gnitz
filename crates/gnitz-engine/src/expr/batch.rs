@@ -529,7 +529,7 @@ pub(in crate::expr) fn eval_batch(
             // ----------------------------------------------------------------
             // Output instructions — materialized at batch level, not here
             // ----------------------------------------------------------------
-            Instr::CopyCol { .. } | Instr::EmitNull { .. } | Instr::Emit { .. } => {}
+            Instr::CopyCol { .. } | Instr::Emit { .. } => {}
 
             // ----------------------------------------------------------------
             // Load operations

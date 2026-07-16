@@ -56,6 +56,25 @@ pub const GNITZ_TYPE_U128: u32 = 12;
 pub const GNITZ_TYPE_UUID: u32 = 13;
 pub const GNITZ_TYPE_BLOB: u32 = 14;
 
+// cbindgen needs literal values, so the constants above duplicate the wire
+// type codes; this pin makes any drift a compile error.
+const _: () = {
+    assert!(GNITZ_TYPE_U8 == TypeCode::U8 as u32);
+    assert!(GNITZ_TYPE_I8 == TypeCode::I8 as u32);
+    assert!(GNITZ_TYPE_U16 == TypeCode::U16 as u32);
+    assert!(GNITZ_TYPE_I16 == TypeCode::I16 as u32);
+    assert!(GNITZ_TYPE_U32 == TypeCode::U32 as u32);
+    assert!(GNITZ_TYPE_I32 == TypeCode::I32 as u32);
+    assert!(GNITZ_TYPE_F32 == TypeCode::F32 as u32);
+    assert!(GNITZ_TYPE_U64 == TypeCode::U64 as u32);
+    assert!(GNITZ_TYPE_I64 == TypeCode::I64 as u32);
+    assert!(GNITZ_TYPE_F64 == TypeCode::F64 as u32);
+    assert!(GNITZ_TYPE_STRING == TypeCode::String as u32);
+    assert!(GNITZ_TYPE_U128 == TypeCode::U128 as u32);
+    assert!(GNITZ_TYPE_UUID == TypeCode::UUID as u32);
+    assert!(GNITZ_TYPE_BLOB == TypeCode::Blob as u32);
+};
+
 // ---------------------------------------------------------------------------
 // Opaque handle types
 // cbindgen is told to exclude these struct bodies; forward declarations are
@@ -554,15 +573,9 @@ pub unsafe extern "C" fn gnitz_batch_get_i64(batch: *const GnitzBatch, col_idx: 
                 return 0;
             }
             let slice = &buf[start..start + stride];
-            match tc {
-                TypeCode::U8 => slice[0] as u64 as i64,
-                TypeCode::I8 => slice[0] as i8 as i64,
-                TypeCode::U16 => u16::from_le_bytes(slice.try_into().unwrap()) as u64 as i64,
-                TypeCode::I16 => i16::from_le_bytes(slice.try_into().unwrap()) as i64,
-                TypeCode::U32 => u32::from_le_bytes(slice.try_into().unwrap()) as u64 as i64,
-                TypeCode::I32 => i32::from_le_bytes(slice.try_into().unwrap()) as i64,
-                TypeCode::U64 | TypeCode::I64 => i64::from_le_bytes(slice.try_into().unwrap()),
-                _ => {
+            match gnitz_core::FixedInt::from_type_code(tc) {
+                Some(fi) => fi.decode_le_i64(slice),
+                None => {
                     set_error("unsupported integer column type");
                     0
                 }
@@ -1166,12 +1179,6 @@ pub unsafe extern "C" fn gnitz_circuit_shard(
     cb_ref.0.shard(input, cols)
 }
 
-/// Exchange gather. Collects results from all workers.
-#[no_mangle]
-pub unsafe extern "C" fn gnitz_circuit_gather(cb: *mut GnitzCircuitBuilder, input: u64) -> u64 {
-    check_ptr_mut!(cb, 0).0.gather(input)
-}
-
 /// Add the integrate (sink) node.
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_circuit_sink(cb: *mut GnitzCircuitBuilder, input: u64) -> u64 {
@@ -1400,11 +1407,7 @@ pub unsafe extern "C" fn gnitz_batch_is_null(batch: *const GnitzBatch, col_idx: 
         set_error("row index out of range");
         return 1;
     }
-    if b.schema.is_pk_col(col_idx) {
-        return 0;
-    }
-    let payload_idx = b.schema.payload_idx(col_idx);
-    if b.batch.nulls[row] & (1u64 << payload_idx) != 0 {
+    if b.batch.is_null(&b.schema, row, col_idx) {
         1
     } else {
         0
@@ -1478,21 +1481,6 @@ pub unsafe extern "C" fn gnitz_execute_sql_query(
         Err(e) => {
             set_error(e);
             std::ptr::null_mut()
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Utility
-// ---------------------------------------------------------------------------
-
-/// Free a C string allocated by the Rust library (forward-compatibility).
-/// Safe to call with NULL.
-#[no_mangle]
-pub unsafe extern "C" fn gnitz_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            drop(CString::from_raw(s));
         }
     }
 }

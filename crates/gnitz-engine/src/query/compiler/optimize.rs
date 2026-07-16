@@ -214,6 +214,60 @@ pub(super) fn build_map_output_schema(input: &SchemaDescriptor, src_indices: &[i
     SchemaDescriptor::new(&cols[..n], &pk_idx[..pk_len])
 }
 
+/// True iff any carried cross-width promotion target in `target_tcs` is invalid
+/// for its source column in `cols`. A carried target `t` must be exactly the
+/// promotion the planner derives for a key of this source type: rather than
+/// re-deriving the sign/width ladder by hand (and drifting from the planner),
+/// validate against the single shared rule — `t` is a value-preserving
+/// promotion of `src` iff `join_key_common_type` maps the pair `(src, t)` back
+/// to `t`. The promotion is idempotent — promoting a source against its own
+/// carried target is a no-op — so this is exactly the planner's
+/// `carried_reindex_tc` contract read back (a `#[test]` pins the idempotency).
+/// It also screens PK-ineligible targets for free, since the function only
+/// ever yields PK-eligible types. `fixed_int_only` additionally restricts
+/// targets to the ≤8-byte fixed-int domain (the HashRow payload widen is the
+/// only copy path that supports it). A violation means a corrupt/forged
+/// catalog; callers abort the compile cleanly rather than panic/truncate in
+/// the copy kernels. Callers must have range-checked `cols` first.
+pub(super) fn reindex_promotion_invalid(
+    cols: &[u16],
+    target_tcs: &[u8],
+    schema: &SchemaDescriptor,
+    fixed_int_only: bool,
+) -> bool {
+    cols.iter().enumerate().any(|(i, &c)| {
+        let t = target_tcs.get(i).copied().unwrap_or(0);
+        t != 0 && {
+            let src = schema.columns[c as usize].type_code;
+            (fixed_int_only && !gnitz_wire::is_fixed_int(t)) || gnitz_wire::join_key_common_type(src, t) != Some(t)
+        }
+    })
+}
+
+/// Output schema of a HashRow (set-op full-row identity) Map: a synthetic U128
+/// PK at slot 0, then the projected payload columns. `target_tcs[j] != 0`
+/// promotes payload column `j` to that ≤8-byte integer type (cross-width
+/// set-op coercion) — `new` re-derives size/signedness for the promoted type —
+/// keeping THIS SIDE's nullability. Per-side, not the operator-merged view
+/// nullability: an INTERSECT/EXCEPT leaf is `distinct`-ed on its own before
+/// the tuple-tightening combine, so its row comparator must classify by what
+/// this side can actually emit.
+pub(super) fn hashrow_output_schema(
+    in_schema: &SchemaDescriptor,
+    proj_cols: &[u16],
+    target_tcs: &[u8],
+) -> SchemaDescriptor {
+    let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+    cols[0] = SchemaColumn::new(type_code::U128, 0);
+    for (j, &c) in proj_cols.iter().enumerate() {
+        let src = in_schema.columns[c as usize];
+        let tgt = target_tcs.get(j).copied().unwrap_or(0);
+        let out_tc = if tgt != 0 { tgt } else { src.type_code };
+        cols[1 + j] = SchemaColumn::new(out_tc, src.nullable);
+    }
+    SchemaDescriptor::new(&cols[..1 + proj_cols.len()], &[0])
+}
+
 /// Build the full output schema of a reindex Map: the synthetic PK column(s)
 /// derived from `reindex_cols` (in key order), followed by the kept payload
 /// columns. Each PK slot's width is `gnitz_wire::resolve_reindex_type` — the
@@ -266,11 +320,10 @@ pub(super) fn reindex_output_schema(
 }
 
 /// Engine adapter over the single shared typing rule
-/// (`gnitz_wire::agg_output_type`); `AggOp::Null` — the grouped no-aggregate
-/// placeholder, which never leaves the engine — types I64 like COUNT.
+/// (`gnitz_wire::agg_output_type`).
 pub(super) const fn agg_output_type(agg_op: AggOp, col_type_code: TypeCode) -> u8 {
     let func = match agg_op {
-        AggOp::Count | AggOp::Null => gnitz_wire::AggFunc::Count,
+        AggOp::Count => gnitz_wire::AggFunc::Count,
         AggOp::CountNonNull => gnitz_wire::AggFunc::CountNonNull,
         AggOp::SumZero => gnitz_wire::AggFunc::SumZero,
         AggOp::Sum => gnitz_wire::AggFunc::Sum,

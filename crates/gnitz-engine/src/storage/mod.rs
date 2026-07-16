@@ -20,12 +20,11 @@ use repr::{batch, batch_wire, columnar, merge, range_key, scatter};
 mod data_roundtrip_proptest;
 
 // ── Public API ──────────────────────────────────────────────────────────────
+pub use crate::schema::key::{partition_for_key, partition_for_pk_bytes};
 pub use batch::{write_to_batch, Batch};
 pub use batch_wire::decode_mem_batch_from_wal_block;
 pub use error::StorageError;
-pub use lsm::partitioned_table::{
-    partition_for_key, partition_for_pk_bytes, partition_range, PartitionedTable, Routing, NUM_PARTITIONS,
-};
+pub use lsm::partitioned_table::{partition_range, PartitionedTable, Routing, NUM_PARTITIONS};
 
 pub use lsm::table::{FlushOutcome, FlushWork, RecoverySource, Table};
 pub use merge::MemBatch;
@@ -34,17 +33,18 @@ pub use scatter::{scatter_copy, scatter_multi_source};
 // ── Crate-internal: operator hot-path types (not official surface) ───────────
 pub(crate) use batch::carve_writer_slices;
 pub(crate) use batch::{BatchBuilder, Layout, MAX_WIRE_REGIONS};
+pub(crate) use batch_wire::{
+    compute_wire_props, schema_wire_safe, wire_block_size, wire_header_dir_size, wire_region_sizes,
+};
 pub(crate) use columnar::{
     cmp_col_window, compare_rows, compare_rows_fixedint_nonnull, with_payload_cmp, ColumnarSource,
 };
 // The PK key primitives live in `schema::key`; out-of-storage callers keep the
 // storage facade.
+pub(crate) use crate::schema::key::PkBuf;
 pub(crate) use crate::schema::key::{compare_pk_bytes, compare_pk_ordering, opk_key, pack_pk_be, pk_bytes_eq};
-pub(crate) use gnitz_wire::wal::{
-    block_size as wal_block_size, stamp_checksum as wal_stamp_checksum,
-    write_header_and_directory as wal_write_header_and_directory,
-};
-pub(crate) use lsm::manifest::{partition_manifest_path, peek_generation, PkBuf, STATE_FORMAT};
+pub(crate) use gnitz_wire::wal::write_header_and_directory as wal_write_header_and_directory;
+pub(crate) use lsm::manifest::{partition_manifest_path, peek_generation, topology_word};
 #[cfg(test)]
 pub(crate) use lsm::partitioned_table::partial_flush_lsn_fixture;
 #[cfg(test)]

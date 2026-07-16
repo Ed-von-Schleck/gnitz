@@ -163,17 +163,24 @@ impl MappedShard {
         }
     }
 
-    /// Get a raw pointer to a column value, indexed by *logical* column index.
+    /// Get a raw pointer to a column value, indexed by *logical* column index
+    /// against `schema` (the shard's own schema — `SchemaDescriptor` already
+    /// caches the logical→payload mapping, so the shard carries none).
     /// For the PK column, returns a pointer into the pk region (16 bytes).
     /// Returns null for out-of-range column indices.
     #[inline]
-    pub fn col_ptr_by_logical(&self, row: usize, col_idx: usize, col_size: usize) -> *const u8 {
-        if col_idx >= self.col_to_payload.len() {
+    pub fn col_ptr_by_logical(
+        &self,
+        row: usize,
+        col_idx: usize,
+        col_size: usize,
+        schema: &crate::schema::SchemaDescriptor,
+    ) -> *const u8 {
+        if col_idx >= schema.num_columns() {
             return ptr::null();
         }
-        let payload_idx = self.col_to_payload[col_idx];
         let base = self.mmap.as_ptr();
-        if payload_idx == usize::MAX {
+        let Some(payload_idx) = schema.try_payload_idx(col_idx) else {
             // PK column (pk_stride bytes)
             match &self.pk {
                 ScalarRegion::Raw { offset, .. } => {
@@ -188,7 +195,7 @@ impl MappedShard {
                     return unsafe { base.add(*offset) };
                 }
             }
-        }
+        };
         if payload_idx >= self.col_regions.len() {
             return ptr::null();
         }

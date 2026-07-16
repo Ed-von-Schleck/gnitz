@@ -231,7 +231,7 @@ pub struct GnitzClient {
     /// system table caches its scan batch here and later reads within the same
     /// statement reuse it (see `begin_catalog_snapshot`). `None` outside a
     /// statement — reads scan the wire directly.
-    catalog_snapshot: Option<HashMap<u64, Option<ZSetBatch>>>,
+    catalog_snapshot: Option<HashMap<u64, Option<Arc<ZSetBatch>>>>,
     /// Open transaction, if any. `Some` between `txn_begin` and its
     /// `txn_commit`/`txn_rollback`: **every** user-table write on this client
     /// (`push`, `push_with_mode`, `delete` — and so every SQL DML statement, C
@@ -309,16 +309,16 @@ impl GnitzClient {
     }
 
     /// Scan a system table, served from the statement snapshot when one is
-    /// active (caching the batch on the first read). The clone on a snapshot
-    /// hit is a local memcpy — cheap against the wire scan + server work it
-    /// replaces.
-    fn scan_catalog(&mut self, tab: u64) -> Result<Option<ZSetBatch>, ClientError> {
+    /// active (caching the batch on the first read). The batch is shared via
+    /// `Arc`, so a snapshot hit is a refcount bump, never a batch copy.
+    fn scan_catalog(&mut self, tab: u64) -> Result<Option<Arc<ZSetBatch>>, ClientError> {
         if let Some(snap) = &self.catalog_snapshot {
             if let Some(cached) = snap.get(&tab) {
                 return Ok(cached.clone());
             }
         }
         let (_, batch, _) = self.session.scan(tab)?;
+        let batch = batch.map(Arc::new);
         if let Some(snap) = &mut self.catalog_snapshot {
             snap.insert(tab, batch.clone());
         }

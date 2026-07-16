@@ -45,7 +45,7 @@ pub(super) enum PendingScanKind {
 impl WorkerProcess {
     // ── W2M response helpers ───────────────────────────────────────────
 
-    pub(super) fn send_ack(&self, target_id: u64, flags: u64, request_id: u64) {
+    pub(super) fn send_ack(&self, target_id: u64, request_id: u64) {
         let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None, &[]);
         self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
             ipc::encode_wire_into_ipc(
@@ -53,7 +53,7 @@ impl WorkerProcess {
                 0,
                 target_id,
                 0,
-                flags,
+                0,
                 0u128,
                 0,
                 request_id,
@@ -82,7 +82,7 @@ impl WorkerProcess {
             }
             ReplySchema::Table(s) => {
                 let e = ipc::get_or_build_schema_wire_block(self.cat(), tid_key, s);
-                (Some(e.block), e.version, e.wire_safe)
+                (Some(e.entry.block), e.version, e.entry.wire_safe)
             }
         }
     }
@@ -315,7 +315,6 @@ impl WorkerProcess {
                     target_id,
                     client_id,
                     flags,
-                    0,
                     STATUS_OK,
                     schema_for_encode,
                     &batch,
@@ -510,8 +509,7 @@ impl WorkerProcess {
                 target_id,
                 client_id,
                 flags,
-                0,
-                STATUS_OK, // request_id=0 in payload; ring prefix carries the req_id
+                STATUS_OK,
                 None,
                 &batch,
                 next_row,
@@ -623,8 +621,7 @@ pub(crate) fn send_unique_preflight_keys(
                 target_id,
                 0,
                 flags,
-                0,
-                STATUS_OK, // request_id 0 in payload; ring prefix carries the req_id
+                STATUS_OK,
                 schema_for_encode,
                 &chunk,
                 0,

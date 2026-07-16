@@ -218,16 +218,8 @@ impl CatalogEngine {
 
         // Write table record (triggers hook)
         {
-            let schema = SysFamily::Table.schema();
-            let mut bb = BatchBuilder::new(schema);
-            bb.begin_row(tid as u128, 1);
-            bb.put_u64(sid as u64);
-            bb.put_string(table_name);
-            bb.put_string(&directory);
-            bb.put_u64(raw_pk_cols);
-            bb.put_u64(0); // created_lsn
-            bb.put_u64(flags);
-            bb.end_row();
+            let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+            push_table_tab_row(&mut bb, tid, sid, table_name, &directory, raw_pk_cols, flags);
             let batch = bb.finish();
             self.submit(SysFamily::Table, batch)?;
         }
@@ -466,7 +458,18 @@ impl CatalogEngine {
             unsafe { &*idx_table }.recovery_source() == RecoverySource::Rederive,
             "backfill_index into durable storage (owner {owner_id}): would double-count",
         );
-        self.stream_index_projection(owner_id, col_indices, Some(idx_table), idx_schema, check_dups)
+        let Some(owner_schema) = self.dag.tables.get(&owner_id).map(|e| e.schema) else {
+            return Ok(());
+        };
+        // Built here, not read off a circuit: the fresh-index path runs before
+        // `add_index_circuit` registers one.
+        let target = IndexProjectionTarget {
+            cols: PkColList::from_slice(col_indices),
+            spec: crate::schema::IndexKeySpec::new(col_indices, &owner_schema, idx_schema),
+            idx_schema: *idx_schema,
+            table: Some(idx_table),
+        };
+        self.stream_index_projection(owner_id, &[target], check_dups)
     }
 
     /// Worker-boot index rebuild: for every registered index circuit, re-create
@@ -516,9 +519,9 @@ impl CatalogEngine {
             .collect();
 
         for (owner_id, owner_dir, works) in worklist {
-            // Re-create and install every index table before opening the scan.
-            let mut targets: Vec<(crate::schema::IndexKeySpec, SchemaDescriptor, *mut Table)> =
-                Vec::with_capacity(works.len());
+            // Re-create and install every index table before opening the scan;
+            // one base-slice scan then feeds all of the owner's indexes.
+            let mut targets: Vec<IndexProjectionTarget> = Vec::with_capacity(works.len());
             for w in &works {
                 let table = new_index_table(&index_dir(&owner_dir, w.index_id), w.index_id, w.idx_schema)
                     .map_err(|e| format!("index table re-create failed (owner {owner_id}): {e}"))?;
@@ -526,37 +529,25 @@ impl CatalogEngine {
                     .dag
                     .replace_index_table(owner_id, w.cols.as_slice(), Box::new(table))
                     .ok_or_else(|| format!("index circuit vanished during rebuild (owner {owner_id})"))?;
-                targets.push((w.key_spec, w.idx_schema, ptr));
+                targets.push(IndexProjectionTarget {
+                    cols: w.cols,
+                    spec: w.key_spec,
+                    idx_schema: w.idx_schema,
+                    table: Some(ptr),
+                });
             }
-
-            // One base-slice scan feeds all of the owner's indexes.
-            let Some(owner_schema) = self.dag.tables.get(&owner_id).map(|e| e.schema) else {
-                continue;
-            };
-            let chunk_rows = self.ddl_scan_chunk_rows;
-            let Some(mut handle) = self.open_store_cursor(owner_id) else {
-                continue;
-            };
-            while let Some(chunk) = handle.drain_chunk(chunk_rows) {
-                for (key_spec, idx_schema, table) in &targets {
-                    let projected = DagEngine::batch_project_index(&chunk, key_spec, &owner_schema, idx_schema);
-                    if projected.count == 0 {
-                        continue;
-                    }
-                    unsafe { &mut **table }
-                        .ingest_owned_batch(projected)
-                        .map_err(|e| format!("index rebuild: ingest failed (owner {owner_id}): {e}"))?;
-                }
-            }
+            self.stream_index_projection(owner_id, &targets, false)?;
         }
         Ok(())
     }
 
-    /// Shared streaming pass for `backfill_index` and `promote_index_to_unique`:
-    /// scan `owner_id` chunk-wise, project each chunk into the index layout,
-    /// reject duplicate keys when `check_dups`, and (backfill only) ingest each
-    /// projected chunk into `idx_table`. Peak memory is O(chunk × row_width)
-    /// plus, when checking, the cross-chunk `seen` set (32 B per scanned key).
+    /// Shared streaming pass for `backfill_index`, `promote_index_to_unique`,
+    /// and the boot rebuild (`backfill_all_indexes`): scan `owner_id`
+    /// chunk-wise, project each chunk into every target's index layout, reject
+    /// duplicate keys when `check_dups`, and ingest each projected chunk into
+    /// the target's table when one is supplied. Peak memory is
+    /// O(chunk × row_width) plus, when checking, the per-target cross-chunk
+    /// `seen` set (32 B per scanned key).
     ///
     /// `check_dups` is a caller policy (hoisted out of this function): the live
     /// CREATE-INDEX/promote paths pass `is_unique && ctx.is_live()` / `true`; the
@@ -566,7 +557,7 @@ impl CatalogEngine {
     /// duplicate; it only avoids an O(rows × 32 B) `seen` set. A slice-local
     /// rebuild also cannot false-positive (a global duplicate may legitimately
     /// straddle two workers' slices), so the boot skip is doubly justified. The
-    /// ingest is unconditional — it IS the ephemeral index rebuild.
+    /// ingest is unconditional — it IS the ephemeral index rebuild/backfill.
     ///
     /// On a duplicate found mid-stream the partially-ingested index table is
     /// discarded whole: it is ephemeral, registered nowhere, and its directory
@@ -574,9 +565,7 @@ impl CatalogEngine {
     fn stream_index_projection(
         &mut self,
         owner_id: i64,
-        col_indices: &[u32],
-        idx_table: Option<*mut Table>,
-        idx_schema: &SchemaDescriptor,
+        targets: &[IndexProjectionTarget],
         check_dups: bool,
     ) -> Result<(), String> {
         let owner_schema = match self.dag.tables.get(&owner_id) {
@@ -584,28 +573,30 @@ impl CatalogEngine {
             None => return Ok(()),
         };
         let chunk_rows = self.ddl_scan_chunk_rows;
-        // Built here, not read off a circuit: the fresh-index path runs before
-        // `add_index_circuit` registers one.
-        let spec = crate::schema::IndexKeySpec::new(col_indices, &owner_schema, idx_schema);
-        // The duplicate check applies to the full composite leading span.
-        let idx_key_size = idx_schema.leading_key_size(col_indices.len());
-        let mut seen: rustc_hash::FxHashSet<PkBuf> = rustc_hash::FxHashSet::default();
+        let mut seen: Vec<rustc_hash::FxHashSet<PkBuf>> = if check_dups {
+            targets.iter().map(|_| rustc_hash::FxHashSet::default()).collect()
+        } else {
+            Vec::new()
+        };
 
         let Some(mut handle) = self.open_store_cursor(owner_id) else {
             return Ok(());
         };
         while let Some(chunk) = handle.drain_chunk(chunk_rows) {
-            let projected = DagEngine::batch_project_index(&chunk, &spec, &owner_schema, idx_schema);
-            if projected.count == 0 {
-                continue;
-            }
-            if check_dups && projected_chunk_has_dup_keys(&projected, idx_key_size, &mut seen) {
-                return Err(self.unique_create_dup_err(owner_id, col_indices));
-            }
-            if let Some(table) = idx_table {
-                unsafe { &mut *table }
-                    .ingest_owned_batch(projected)
-                    .map_err(|e| format!("index backfill: ingest failed (owner {owner_id}): {e}"))?;
+            for (ti, t) in targets.iter().enumerate() {
+                let projected = DagEngine::batch_project_index(&chunk, &t.spec, &owner_schema, &t.idx_schema);
+                if projected.count == 0 {
+                    continue;
+                }
+                // The duplicate check applies to the full composite leading span.
+                if check_dups && projected_chunk_has_dup_keys(&projected, t.spec.key_size(), &mut seen[ti]) {
+                    return Err(self.unique_create_dup_err(owner_id, t.cols.as_slice()));
+                }
+                if let Some(table) = t.table {
+                    unsafe { &mut *table }
+                        .ingest_owned_batch(projected)
+                        .map_err(|e| format!("index backfill: ingest failed (owner {owner_id}): {e}"))?;
+                }
             }
         }
         Ok(())
@@ -630,7 +621,13 @@ impl CatalogEngine {
                 .map(|e| e.schema)
                 .ok_or_else(|| format!("Index promote: owner table {owner_id} not found"))?;
             let idx_schema = make_index_schema(col_indices, &owner_schema)?;
-            self.stream_index_projection(owner_id, col_indices, None, &idx_schema, true)?;
+            let target = IndexProjectionTarget {
+                cols: PkColList::from_slice(col_indices),
+                spec: crate::schema::IndexKeySpec::new(col_indices, &owner_schema, &idx_schema),
+                idx_schema,
+                table: None,
+            };
+            self.stream_index_projection(owner_id, &[target], true)?;
         }
         self.dag.set_index_circuit_uniqueness(owner_id, col_indices, true);
         Ok(())
@@ -690,22 +687,21 @@ impl CatalogEngine {
 
     #[cfg(test)]
     pub(crate) fn build_col_batch(&self, owner_id: i64, kind: i64, col_defs: &[ColumnDef], weight: i64) -> Batch {
-        let schema = SysFamily::Column.schema();
-        let mut bb = BatchBuilder::new(schema);
+        let mut bb = BatchBuilder::new(SysFamily::Column.schema());
         for (i, cd) in col_defs.iter().enumerate() {
-            let pk = pack_column_id(owner_id, i as i64);
-            bb.begin_row(pk as u128, weight);
-            bb.put_u64(owner_id as u64);
-            bb.put_u64(kind as u64);
-            bb.put_u64(i as u64);
-            bb.put_string(&cd.name);
-            bb.put_u64(cd.type_code as u64);
-            bb.put_u64(if cd.is_nullable { 1 } else { 0 });
-            bb.put_u64(cd.fk_table_id as u64);
-            bb.put_u64(cd.fk_col_idx as u64);
-            bb.put_u64(0); // is_serial (engine ColumnDef has no SERIAL marker)
-            bb.put_u64(if cd.is_hidden { 1 } else { 0 });
-            bb.end_row();
+            push_col_tab_row(
+                &mut bb,
+                owner_id,
+                kind,
+                i as i64,
+                &cd.name,
+                cd.type_code,
+                cd.is_nullable,
+                cd.fk_table_id,
+                cd.fk_col_idx as i64,
+                cd.is_hidden,
+                weight,
+            );
         }
         bb.finish()
     }
@@ -737,6 +733,18 @@ impl CatalogEngine {
         }
         Ok(())
     }
+}
+
+/// One index target of a `stream_index_projection` pass: the source column
+/// list (for the duplicate-violation message), the span encode plan, the
+/// index layout to project into, and — for the backfill/rebuild callers —
+/// the index table each projected chunk is ingested into (`None` = check-only,
+/// the promote path).
+struct IndexProjectionTarget {
+    cols: PkColList,
+    spec: crate::schema::IndexKeySpec,
+    idx_schema: SchemaDescriptor,
+    table: Option<*mut Table>,
 }
 
 /// True if a positive-weight row in a projected index chunk shares its leading

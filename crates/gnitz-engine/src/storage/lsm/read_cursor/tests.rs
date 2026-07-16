@@ -2,17 +2,7 @@ use super::*;
 use crate::foundation::codec::as_le_bytes;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::Layout;
-use crate::test_support::wide_pk_3xu64_schema;
-
-fn make_schema_i64() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    )
-}
+use crate::test_support::{make_schema_u128_i64, wide_pk_3xu64_schema};
 
 /// `(U64 PK | I64 payload)` — stride-8, the dominant single-PK table shape.
 /// Used by the stride-8 drive bench, which exercises `pack_pk_be`'s 8-byte
@@ -31,7 +21,7 @@ fn make_schema_u64() -> SchemaDescriptor {
 /// inputs and have at most one row per (PK, payload), so we mark the
 /// batch as sorted+consolidated.
 fn make_batch(rows: &[(u128, i64, i64)]) -> Rc<Batch> {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let mut b = Batch::with_schema(schema, rows.len().max(1));
     for &(pk, w, val) in rows {
         b.extend_pk(pk);
@@ -59,14 +49,14 @@ fn scan_all(cursor: &mut ReadCursor) -> Vec<(u64, u64, i64)> {
 
 #[test]
 fn test_empty_cursor() {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let cursor = create_read_cursor(&[], &[], schema);
     assert!(!cursor.valid);
 }
 
 #[test]
 fn test_single_batch_scan() {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let batch = make_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
     let mut cursor = create_read_cursor(&[batch], &[], schema);
     let rows = scan_all(&mut cursor);
@@ -78,7 +68,7 @@ fn test_single_batch_scan() {
 
 #[test]
 fn test_two_batch_merge() {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let b1 = make_batch(&[(1, 1, 10), (3, 1, 30)]);
     let b2 = make_batch(&[(2, 1, 20), (4, 1, 40)]);
     let mut cursor = create_read_cursor(&[b1, b2], &[], schema);
@@ -92,7 +82,7 @@ fn test_two_batch_merge() {
 
 #[test]
 fn test_ghost_elimination_across_sources() {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     // Batch 1: pk=5 val=50 w=+1, pk=10 val=100 w=+1
     let b1 = make_batch(&[(5, 1, 50), (10, 1, 100)]);
     // Batch 2: pk=5 val=50 w=-1 (retraction)
@@ -106,7 +96,7 @@ fn test_ghost_elimination_across_sources() {
 
 #[test]
 fn test_seek() {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let batch = make_batch(&[(1, 1, 10), (5, 1, 50), (10, 1, 100)]);
     let mut cursor = create_read_cursor(&[batch], &[], schema);
 
@@ -227,7 +217,7 @@ fn test_seek_signed_pk_lands_on_negative_row() {
 
 #[test]
 fn test_same_pk_different_payload_ordering() {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     // Two entries with same PK but different payloads
     let b1 = make_batch(&[(5, 1, 200)]);
     let b2 = make_batch(&[(5, 1, 100)]);
@@ -273,7 +263,7 @@ fn scan_all_with_val(cursor: &mut ReadCursor) -> Vec<(u64, i64, i64)> {
 /// row cannot hide behind a matching PK/weight.
 #[test]
 fn test_cursor_same_pk_nonadjacent_payload_fold() {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let b1 = make_batch(&[(5, 1, 100)]);
     let b2 = make_batch(&[(5, 1, 200)]);
     let b3 = make_batch(&[(5, -1, 100)]);
@@ -289,7 +279,7 @@ fn test_cursor_same_pk_nonadjacent_payload_fold() {
 
 #[test]
 fn test_weight_accumulation_across_sources() {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     // Same (PK, payload) in two batches: weights should sum
     let b1 = make_batch(&[(5, 3, 50)]);
     let b2 = make_batch(&[(5, 7, 50)]);
@@ -301,7 +291,7 @@ fn test_weight_accumulation_across_sources() {
 
 #[test]
 fn test_drain_single_source_full() {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let batch = make_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
     let mut cursor = create_read_cursor(&[batch], &[], schema);
 
@@ -316,7 +306,7 @@ fn test_drain_single_source_full() {
 
 #[test]
 fn test_drain_single_source_with_limit() {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let batch = make_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
     let mut cursor = create_read_cursor(&[batch], &[], schema);
 
@@ -337,7 +327,7 @@ fn test_drain_single_source_with_limit() {
 
 #[test]
 fn test_drain_multi_source_returns_none() {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let b1 = make_batch(&[(1, 1, 10)]);
     let b2 = make_batch(&[(2, 1, 20)]);
     let mut cursor = create_read_cursor(&[b1, b2], &[], schema);
@@ -348,7 +338,7 @@ fn test_drain_multi_source_returns_none() {
 fn test_col_ptr_pk_returns_null() {
     // PK (logical col 0, pk_index=0) must always return null — callers read
     // the PK through current_key_narrow()/current_pk_bytes() instead.
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let batch = make_batch(&[(42, 1, 99)]);
     let cursor = create_read_cursor(&[batch], &[], schema);
     assert!(cursor.valid);
@@ -361,7 +351,7 @@ fn test_col_ptr_pk_returns_null() {
 fn test_col_ptr_payload_returns_valid_pointer() {
     // Payload col at logical index 1 must return a non-null pointer with
     // the correct value.
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let batch = make_batch(&[(7, 1, 1234)]);
     let cursor = create_read_cursor(&[batch], &[], schema);
     assert!(cursor.valid);
@@ -373,7 +363,7 @@ fn test_col_ptr_payload_returns_valid_pointer() {
 
 #[test]
 fn test_col_ptr_invalid_cursor_returns_null() {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let cursor = create_read_cursor(&[], &[], schema);
     assert!(!cursor.valid);
     assert!(cursor.col_ptr(1, 8).is_null());
@@ -381,7 +371,7 @@ fn test_col_ptr_invalid_cursor_returns_null() {
 
 #[test]
 fn test_estimated_length_reflects_remaining() {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let batch = make_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
     let mut cursor = create_read_cursor(&[batch], &[], schema);
     assert_eq!(cursor.estimated_length(), 3);
@@ -395,7 +385,7 @@ fn test_estimated_length_reflects_remaining() {
 
 #[test]
 fn test_current_key() {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let expected = (0xBEEFu128 << 64) | 0xDEADu128;
     let batch = make_batch(&[(expected, 1, 0)]);
     let cursor = create_read_cursor(&[batch], &[], schema);
@@ -410,7 +400,7 @@ fn test_current_key() {
 fn test_scatter_constant_pk_shard() {
     crate::foundation::posix_io::raise_fd_limit_for_tests();
     let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
 
     // A single-row shard Constant-encodes its PK region at rest, which used to
     // fall back to the row-major scatter; the column-major path now handles it.
@@ -430,7 +420,7 @@ fn seek_bytes_lands_on_lower_bound_narrow() {
     // Narrow single-PK (U128, stride 16): seek_bytes lands on the first row
     // whose PK >= the (OPK) key — the lower bound. OPK for a U128 PK is the
     // value's big-endian bytes.
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let keys: &[u128] = &[10, 20, 30, 40];
     let batch = make_batch(&[(10u128, 1, 100), (20, 1, 200), (30, 1, 300), (40, 1, 400)]);
     let probes: &[u128] = &[0u128, 5, 10, 15, 20, 25, 30, 35, 40, 41];
@@ -482,7 +472,7 @@ fn assert_advance_to_matches_seek_oracle(schema: SchemaDescriptor, sources: &[Rc
 /// the `Equal` rebuild fallback on the same cursor.
 #[test]
 fn advance_to_lands_like_seek_bytes_monotone() {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let b0 = make_batch(&[(10u128, 1, 100), (30, 1, 300), (50, 1, 500), (70, 1, 700)]);
     let b1 = make_batch(&[(20u128, 1, 200), (40, 1, 400), (60, 1, 600)]);
     // Monotone ascending: below-min, present, absent-between, above-max.
@@ -499,7 +489,7 @@ fn advance_to_lands_like_seek_bytes_monotone() {
 /// last live source (the `pop_top` branch).
 #[test]
 fn advance_to_forward_skips_ahead_source() {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let b_lag = make_batch(&[(5u128, 1, 50), (30, 1, 300), (90, 1, 900)]);
     let b_ahead = make_batch(&[(50u128, 1, 500), (60, 1, 600), (70, 1, 700)]);
     assert_advance_to_matches_seek_oracle(schema, &[b_lag, b_ahead], &[40, 55, 65, 95]);
@@ -511,7 +501,7 @@ fn advance_to_forward_skips_ahead_source() {
 /// the fast path must leave the cursor in a state the rebuild can recover.
 #[test]
 fn advance_to_interleaved_forward_backward() {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let b0 = make_batch(&[(10u128, 1, 100), (30, 1, 300), (50, 1, 500), (70, 1, 700)]);
     let b1 = make_batch(&[(20u128, 1, 200), (40, 1, 400), (60, 1, 600)]);
     // up, up, up, BACK, up, BACK, up, BACK.
@@ -524,7 +514,7 @@ fn advance_to_interleaved_forward_backward() {
 /// ghost-fold handoff.
 #[test]
 fn advance_to_forward_lands_past_straddling_ghost() {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     // PK=200 nets to 0: +1 from b_a, -1 from b_b. Live trace = {10, 20, 400}.
     let b_a = make_batch(&[(10u128, 1, 100), (200, 1, 2000), (400, 1, 4000)]);
     let b_b = make_batch(&[(20u128, 1, 200), (200, -1, 2000)]);
@@ -550,7 +540,7 @@ fn advance_to_forward_lands_past_straddling_ghost() {
 /// invalidate cleanly (the fast path no-ops on an empty tree).
 #[test]
 fn advance_to_forward_exhausts_source_mid_sweep() {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let b_short = make_batch(&[(10u128, 1, 100), (20, 1, 200)]); // max 20
     let b_long = make_batch(&[(10u128, 1, 100), (50, 1, 500), (90, 1, 900)]);
     // 40 gallops b_short to its end (pop_top), leaving b_long to emit 50;
@@ -560,7 +550,7 @@ fn advance_to_forward_exhausts_source_mid_sweep() {
 
 #[test]
 fn test_scatter_many_sources_beyond_old_cap() {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let n = 33usize;
     let batches: Vec<Rc<super::super::batch::Batch>> = (0..n)
         .map(|i| make_batch(&[(i as u128, 1i64, (i * 100) as i64)]))
@@ -787,7 +777,7 @@ fn drain_chunks(cursor: &mut ReadCursor, n: usize) -> Vec<(u128, i64, i64)> {
 }
 
 fn materialize_rows(sources: &[Rc<Batch>]) -> Vec<(u128, i64, i64)> {
-    let cursor = create_read_cursor(sources, &[], make_schema_i64());
+    let cursor = create_read_cursor(sources, &[], make_schema_u128_i64());
     let batch = cursor.materialize();
     (0..batch.count)
         .map(|row| {
@@ -805,7 +795,7 @@ fn drain_chunk_single_source_matches_materialize() {
     let batch = make_batch(&rows);
     let expected = materialize_rows(&[Rc::clone(&batch)]);
     for chunk_rows in [1, 2, 5, 100] {
-        let mut cursor = create_read_cursor(&[Rc::clone(&batch)], &[], make_schema_i64());
+        let mut cursor = create_read_cursor(&[Rc::clone(&batch)], &[], make_schema_u128_i64());
         assert_eq!(
             drain_chunks(&mut cursor, chunk_rows),
             expected,
@@ -814,13 +804,13 @@ fn drain_chunk_single_source_matches_materialize() {
     }
     // 4 rows / chunk 2: exact multiple (no trailing partial chunk).
     let even = make_batch(&rows[..4]);
-    let mut cursor = create_read_cursor(&[Rc::clone(&even)], &[], make_schema_i64());
+    let mut cursor = create_read_cursor(&[Rc::clone(&even)], &[], make_schema_u128_i64());
     assert_eq!(drain_chunks(&mut cursor, 2), materialize_rows(&[even]));
 }
 
 #[test]
 fn drain_chunk_empty_cursor_returns_none() {
-    let mut cursor = create_read_cursor(&[], &[], make_schema_i64());
+    let mut cursor = create_read_cursor(&[], &[], make_schema_u128_i64());
     assert!(cursor.drain_chunk(4).is_none());
 }
 
@@ -838,14 +828,14 @@ fn drain_chunk_multi_source_matches_single_source() {
     let expected = materialize_rows(&[Rc::clone(&b1), Rc::clone(&b2)]);
     assert_eq!(expected, materialize_rows(&[Rc::clone(&consolidated_equivalent)]));
     for chunk_rows in [1, 2, 100] {
-        let mut multi = create_read_cursor(&[Rc::clone(&b1), Rc::clone(&b2)], &[], make_schema_i64());
+        let mut multi = create_read_cursor(&[Rc::clone(&b1), Rc::clone(&b2)], &[], make_schema_u128_i64());
         assert_eq!(
             drain_chunks(&mut multi, chunk_rows),
             expected,
             "merge path, chunk_rows={chunk_rows}"
         );
 
-        let mut single = create_read_cursor(&[Rc::clone(&consolidated_equivalent)], &[], make_schema_i64());
+        let mut single = create_read_cursor(&[Rc::clone(&consolidated_equivalent)], &[], make_schema_u128_i64());
         assert_eq!(
             drain_chunks(&mut single, chunk_rows),
             expected,
@@ -858,7 +848,7 @@ fn drain_chunk_multi_source_matches_single_source() {
 /// byte-form PK write would otherwise index empty `sources` and panic.
 #[test]
 fn copy_current_row_into_invalid_is_noop() {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let cursor = create_read_cursor(&[], &[], schema);
     assert!(!cursor.valid);
     let mut out = Batch::with_schema(schema, 1);
@@ -873,7 +863,7 @@ fn copy_current_row_into_invalid_is_noop() {
 /// then leaves the exit state at the first row past the group.
 #[test]
 fn for_each_pk_group_row_visits_subgroups_and_exits_clean() {
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let b1 = make_batch(&[(5, 1, 100), (10, 1, 1000)]);
     let b2 = make_batch(&[(5, 3, 200)]); // PK=5 payload 200 @ +3
     let mut c = create_read_cursor(&[b1, b2], &[], schema);
@@ -897,7 +887,7 @@ fn for_each_pk_group_row_visits_subgroups_and_exits_clean() {
 /// to compare against). Re-seats each head at the start, builds the loser
 /// tree, and drives — mirroring `new()`'s Multi arm.
 fn create_cursor_force_multi(batches: &[Rc<Batch>]) -> ReadCursor {
-    let mut c = create_read_cursor(batches, &[], make_schema_i64());
+    let mut c = create_read_cursor(batches, &[], make_schema_u128_i64());
     for state in c.states.iter_mut() {
         state.position = 0;
     }
@@ -924,7 +914,7 @@ fn pair_equiv_multi() {
     for (a, b) in cases {
         let srcs = [make_batch(a), make_batch(b)];
 
-        let mut pair = create_read_cursor(&srcs, &[], make_schema_i64());
+        let mut pair = create_read_cursor(&srcs, &[], make_schema_u128_i64());
         assert!(
             matches!(pair.mode, SourceMode::Pair),
             "production must pick Pair at len 2"
@@ -935,7 +925,7 @@ fn pair_equiv_multi() {
 
         // advance_to: each landing (valid, PK bytes, net weight) matches Multi.
         for key in 0u128..=6 {
-            let mut p = create_read_cursor(&srcs, &[], make_schema_i64());
+            let mut p = create_read_cursor(&srcs, &[], make_schema_u128_i64());
             let mut m = create_cursor_force_multi(&srcs);
             p.advance_to(&key.to_be_bytes());
             m.advance_to(&key.to_be_bytes());
@@ -1043,7 +1033,7 @@ fn write_test_shard_u64(
 fn pk_unique_and_payload_paths_agree() {
     crate::foundation::posix_io::raise_fd_limit_for_tests();
     let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let shard_rows: [&[(u128, i64, i64)]; 3] = [
         &[(1, 1, 100), (4, 1, 400), (7, 1, 700)],
         &[(2, 1, 200), (5, 1, 500), (7, 1, 700)],
@@ -1096,7 +1086,7 @@ fn pk_unique_and_payload_paths_agree() {
 fn pk_unique_flag_with_conflicting_payloads_panics() {
     crate::foundation::posix_io::raise_fd_limit_for_tests();
     let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_i64();
+    let schema = make_schema_u128_i64();
     let flag = super::super::layout::SHARD_FLAG_PK_UNIQUE;
     // Three "PkUnique" shards sharing PK 5 with DIFFERENT payloads — illegal.
     // Three sources force `Multi`; comparing the tied heads (tree build or
@@ -1120,7 +1110,7 @@ fn read_cursor_drive_pk_unique_multi_bench() {
     use std::time::Instant;
     crate::foundation::posix_io::raise_fd_limit_for_tests();
     let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_i64(); // U128 PK (stride 16) | I64 payload
+    let schema = make_schema_u128_i64(); // U128 PK (stride 16) | I64 payload
 
     // 4 shards, interleaved unique PKs (round-robin) so the Multi merge does
     // real cross-source work; flags = SHARD_FLAG_PK_UNIQUE so the opened
@@ -1482,7 +1472,7 @@ fn adv_schema_5xu64() -> SchemaDescriptor {
 fn adv_bench_schema(stride: usize) -> SchemaDescriptor {
     match stride {
         8 => make_schema_u64(),       // U64 PK + I64
-        16 => make_schema_i64(),      // U128 PK + I64
+        16 => make_schema_u128_i64(), // U128 PK + I64
         24 => wide_pk_3xu64_schema(), // 3×U64 PK + I64
         40 => adv_schema_5xu64(),     // 5×U64 PK + I64
         _ => unreachable!("bench stride must be one of ADV_STRIDES"),

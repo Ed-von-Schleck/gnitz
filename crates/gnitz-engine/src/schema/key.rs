@@ -799,4 +799,45 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn pkbuf_eq_hash_compare_only_len_window() {
+        use std::collections::HashSet;
+        // Same meaningful bytes, different tail → equal and same hash.
+        let mut a = PkBuf::from_bytes(&7u64.to_le_bytes());
+        let b = PkBuf::from_bytes(&7u64.to_le_bytes());
+        a.bytes[8] = 0xAB; // tail garbage past len; eq/hash must ignore it
+        assert!(a == b);
+        let mut set: HashSet<PkBuf> = HashSet::new();
+        set.insert(b);
+        assert!(set.contains(&a), "tail bytes must not affect membership");
+    }
+
+    #[test]
+    fn pkbuf_borrow_heterogeneous_lookup() {
+        use std::collections::HashSet;
+        let mut set: HashSet<PkBuf> = HashSet::new();
+        set.insert(PkBuf::from_bytes(&123u64.to_le_bytes()));
+        // Raw &[u8] lookup via Borrow<[u8]> — no PkBuf construction.
+        assert!(set.contains(&123u64.to_le_bytes()[..]));
+        assert!(!set.contains(&124u64.to_le_bytes()[..]));
+    }
+
+    #[test]
+    fn pkbuf_wide_differs_past_byte_16() {
+        // Two 24-byte keys identical in the first 16 bytes but differing in the
+        // last 8 must be distinct — the failure mode of any u128-truncating key.
+        let mut x = Vec::new();
+        x.extend_from_slice(&1u64.to_le_bytes());
+        x.extend_from_slice(&2u64.to_le_bytes());
+        x.extend_from_slice(&3u64.to_le_bytes());
+        let mut y = x.clone();
+        y[16..24].copy_from_slice(&999u64.to_le_bytes());
+        let px = PkBuf::from_bytes(&x);
+        let py = PkBuf::from_bytes(&y);
+        assert!(px != py);
+        let mut set = std::collections::HashSet::new();
+        set.insert(px);
+        assert!(!set.contains(&py));
+    }
 }

@@ -1,35 +1,57 @@
-//! Secondary index integration: AviDesc, op_integrate_with_indexes.
+//! Secondary index integration: AviBake/AviDesc, op_integrate_with_indexes.
 
 use crate::ops::{AggDescriptor, AggOp};
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{type_code, ColumnLocator, SchemaColumn, SchemaDescriptor};
 use crate::storage::Batch;
+
+use super::util::GroupKeyExtractor;
 
 // ---------------------------------------------------------------------------
 // Public descriptor types
 // ---------------------------------------------------------------------------
 
-/// Combined AggValueIndex descriptor for `op_integrate_with_indexes`.
-///
-/// One descriptor (and one index table) serves *every* MIN/MAX aggregate of a
-/// reduce. `aggs` is the value-indexed (`AggOp::uses_value_index`) subset of the
-/// reduce's descriptors, in `agg_descs` order — entry `j` is the aggregate
-/// written under ordinal `j` in the combined key `group_cols ‖ ordinal ‖
-/// av_encoded`. Carrying the descriptors (rather than a stripped
-/// `(col, for_max, type)` tuple) lets the population derive `for_max`/type the
-/// same way the reduce read side does, so the two cannot drift.
+/// The compile-time-baked write-side AVI resources (`Program::avi_bakes`):
+/// the composite index schema, the group-key gatherer, the value-indexed
+/// (`AggOp::uses_value_index`) subset of the reduce's descriptors in
+/// descriptor order (entry `j` is the aggregate written under ordinal `j` in
+/// the combined key `group_cols ‖ ordinal ‖ av_encoded`), and each aggregate
+/// column's resolved locator. Baked once at compile so the per-tick
+/// population loop re-derives nothing. Carrying the descriptors (rather than
+/// a stripped `(col, for_max, type)` tuple) lets the population derive
+/// `for_max`/type the same way the reduce read side does, so the two cannot
+/// drift.
+pub struct AviBake {
+    pub(crate) extractor: GroupKeyExtractor,
+    pub(crate) schema: SchemaDescriptor,
+    pub(crate) aggs: Vec<AggDescriptor>,
+    /// Parallel to `aggs`: each aggregate column's location in the reduce's
+    /// input schema.
+    pub(crate) agg_locs: Vec<ColumnLocator>,
+}
+
+impl AviBake {
+    pub(crate) fn new(src: &SchemaDescriptor, group_by_cols: &[u32], aggs: &[AggDescriptor]) -> Self {
+        AviBake {
+            extractor: GroupKeyExtractor::new(src, group_by_cols),
+            schema: make_avi_schema(src, group_by_cols),
+            aggs: aggs.to_vec(),
+            agg_locs: aggs.iter().map(|d| src.locate(d.col_idx as usize)).collect(),
+        }
+    }
+}
+
+/// Combined AggValueIndex descriptor for `op_integrate_with_indexes`. One
+/// descriptor (and one index table) serves *every* MIN/MAX aggregate of a
+/// reduce; everything but the table lives in the baked [`AviBake`].
 ///
 /// The `table` raw pointer is `pub(crate)` rather than `pub`: it is a bare
 /// `*mut Table` whose access is constrained to crate-internal call sites
 /// (the compiler emits the desc in `vm`, `op_integrate_with_indexes` consumes
-/// it) — never a cross-boundary handle. The slices borrow from the compiled
-/// program's instruction, so building a desc per tick allocates nothing.
+/// it) — never a cross-boundary handle. `bake` borrows from the compiled
+/// program, so building a desc per tick allocates nothing.
 pub struct AviDesc<'a> {
     pub(crate) table: *mut crate::storage::Table,
-    pub(crate) group_by_cols: &'a [u32],
-    pub(crate) aggs: &'a [AggDescriptor],
-    /// The baked composite-key gatherer (`Program::avi_extractors`), resolved
-    /// once at compile — the population loop re-derives nothing per tick.
-    pub(crate) extractor: &'a super::util::GroupKeyExtractor,
+    pub(crate) bake: &'a AviBake,
 }
 
 /// AVI index schema: the group-by columns (native fixed-width types, in GROUP
@@ -80,7 +102,6 @@ pub(crate) fn make_avi_schema(src: &SchemaDescriptor, group_by_cols: &[u32]) -> 
 pub fn op_integrate_with_indexes(
     batch: &Batch,
     target_table: Option<&mut crate::storage::Table>,
-    input_schema: &SchemaDescriptor,
     avi: Option<&AviDesc<'_>>,
 ) -> Result<(), crate::storage::StorageError> {
     if batch.count == 0 {
@@ -103,32 +124,22 @@ pub fn op_integrate_with_indexes(
     // `group ‖ ordinal` matches the full group+aggregate identity with no hash
     // and no collision. One entry per (row, value-indexed aggregate) is written
     // into the one table with one ingest. `for_max`/type are derived from each
-    // aggregate descriptor exactly as the reduce read side does. Gather against
-    // `input_schema`: the delta `mb` is physically laid out in it.
+    // baked aggregate descriptor exactly as the reduce read side does.
     if let Some(avi_desc) = avi {
-        let avi_schema = make_avi_schema(input_schema, avi_desc.group_by_cols);
-        let num_aggs = avi_desc.aggs.len();
+        let bake = avi_desc.bake;
+        let num_aggs = bake.aggs.len();
         // `Raw` from `with_schema`; the `extend_*` population below never raises
         // it. Capacity is one entry per (row × value-indexed aggregate).
-        let mut avi_batch = Batch::with_schema(avi_schema, batch.count * num_aggs);
+        let mut avi_batch = Batch::with_schema(bake.schema, batch.count * num_aggs);
 
-        // Resolve each aggregate column's location once (loop-invariant): a PK
-        // aggregate is sliced from the packed PK region, a payload aggregate read
-        // from its dense slot.
-        let locs: Vec<_> = avi_desc
-            .aggs
-            .iter()
-            .map(|d| input_schema.locate(d.col_idx as usize))
-            .collect();
-
-        let extractor = avi_desc.extractor;
+        let extractor = &bake.extractor;
         let n = extractor.stride;
         let mut key = [0u8; crate::schema::MAX_PK_BYTES];
         let mut pk_scratch = [0u8; 16];
         for row in 0..batch.count {
             let weight = mb.get_weight(row);
             extractor.gather(&mb, row, &mut key);
-            for (j, (d, loc)) in avi_desc.aggs.iter().zip(&locs).enumerate() {
+            for (j, (d, loc)) in bake.aggs.iter().zip(&bake.agg_locs).enumerate() {
                 // PK is never null; a NULL payload aggregate is skipped for this
                 // ordinal (the seek then misses → MIN/MAX renders NULL).
                 if loc.is_null(&mb, row) {

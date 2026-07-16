@@ -1,9 +1,11 @@
-//! System table constants, the per-family descriptor table, and PK packing
-//! helpers.
+//! System table constants, the per-family descriptor table, PK packing
+//! helpers, and the per-family row codecs (batch row-view decoders and
+//! row builders) over those constants.
 //!
-//! Pure data — no state, no CatalogEngine dependency.
+//! Pure data and stateless codecs — no state, no CatalogEngine dependency.
 
 use crate::schema::{SchemaColumn, SchemaDescriptor};
+use crate::storage::{Batch, BatchBuilder};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -47,14 +49,13 @@ pub(super) const CIRCUIT_NODE_COLUMNS_TAB_ID: i64 = gnitz_wire::CIRCUIT_NODE_COL
 // PK list encoding lives in gnitz-wire so the client and engine cannot
 // drift on the on-disk format. Re-export under the historical paths so
 // existing `pub(super)` callers in this crate keep working unchanged.
-// The `unused_imports` allow covers two cases: (1) symbols used only by
-// sibling modules via `use sys_tables::*`, and (2) symbols referenced
-// only from the cfg(test) block below.
+// Production code spells the packers `gnitz_wire::…` (or reaches them via
+// the row decoders below); the unqualified names are used only by tests,
+// so their re-exports are test-scoped and deny-warnings polices them.
+pub(super) use gnitz_wire::unpack_pk_cols;
 pub(crate) use gnitz_wire::PkColList;
-#[allow(unused_imports)]
-pub(super) use gnitz_wire::PK_LIST_PACKED_FLAG;
-#[allow(unused_imports)]
-pub(super) use gnitz_wire::{pack_pk_cols, unpack_pk_cols, PK_LIST_MAX_COLS};
+#[cfg(test)]
+pub(super) use gnitz_wire::{pack_pk_cols, PK_LIST_MAX_COLS, PK_LIST_PACKED_FLAG};
 
 /// Hard-validate a decoded PK list against the table's columns. Shared by
 /// the production wire path (`hook_table_register`) and the test-only
@@ -203,6 +204,101 @@ pub(crate) const IDXTAB_PAY_IS_UNIQUE: usize = pay_index_in(gnitz_wire::IDX_TAB_
 
 pub(super) const SEQTAB_COL_VALUE: usize = col_index_in(gnitz_wire::SEQ_TAB_COLS, "next_val");
 pub(super) const SEQTAB_PAY_VALUE: usize = pay_index_in(gnitz_wire::SEQ_TAB_COLS, "next_val");
+
+// ---------------------------------------------------------------------------
+// Per-family row-view decoders — the one reading of each family's payload
+// layout, shared by the precheck arms (`precheck_family`) and the register
+// hooks (which re-decode on the paths that skip precheck: boot replay and
+// worker ddl_sync).
+// ---------------------------------------------------------------------------
+
+/// Decode TABLE_TAB row `i`: `(schema_id, name, pk_list, flags)`.
+pub(super) fn read_table_tab_row(batch: &Batch, i: usize) -> (i64, String, PkColList, u64) {
+    (
+        batch.read_payload_u64(i, TABTAB_PAY_SCHEMA_ID) as i64,
+        batch.read_payload_string(i, TABTAB_PAY_NAME),
+        unpack_pk_cols(batch.read_payload_u64(i, TABTAB_PAY_PK_COL_IDX)),
+        batch.read_payload_u64(i, TABTAB_PAY_FLAGS),
+    )
+}
+
+/// Decode VIEW_TAB row `i`: `(schema_id, name, pk_list)`. The pk_list is the
+/// view's persisted leading-k column list; a bare `0` decodes back to `[0]`.
+pub(super) fn read_view_tab_row(batch: &Batch, i: usize) -> (i64, String, PkColList) {
+    (
+        batch.read_payload_u64(i, VIEWTAB_PAY_SCHEMA_ID) as i64,
+        batch.read_payload_string(i, VIEWTAB_PAY_NAME),
+        unpack_pk_cols(batch.read_payload_u64(i, VIEWTAB_PAY_PK_COL_IDX)),
+    )
+}
+
+/// Decode IDX_TAB row `i`: `(owner_id, source_cols, is_unique)`. `source_cols`
+/// carries `pack_pk_cols(&col_indices)` (a single-column index is the
+/// 1-element degenerate case). The name column is deliberately not decoded —
+/// the hook path never reads it, and it would be a wasted allocation there.
+pub(super) fn read_idx_tab_row(batch: &Batch, i: usize) -> (i64, PkColList, bool) {
+    (
+        batch.read_payload_u64(i, IDXTAB_PAY_OWNER_ID) as i64,
+        unpack_pk_cols(batch.read_payload_u64(i, IDXTAB_PAY_SOURCE_COLS)),
+        batch.read_payload_u64(i, IDXTAB_PAY_IS_UNIQUE) != 0,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Per-family row builders — the one writing of each family's payload layout,
+// shared by the fresh-DB bootstrap self-description and the test-only DDL
+// entry points.
+// ---------------------------------------------------------------------------
+
+/// Append one COL_TAB row for column `col_idx` of `owner_id`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn push_col_tab_row(
+    bb: &mut BatchBuilder,
+    owner_id: i64,
+    owner_kind: i64,
+    col_idx: i64,
+    name: &str,
+    type_code: u8,
+    is_nullable: bool,
+    fk_table_id: i64,
+    fk_col_idx: i64,
+    is_hidden: bool,
+    weight: i64,
+) {
+    bb.begin_row(pack_column_id(owner_id, col_idx) as u128, weight);
+    bb.put_u64(owner_id as u64);
+    bb.put_u64(owner_kind as u64);
+    bb.put_u64(col_idx as u64);
+    bb.put_string(name);
+    bb.put_u64(type_code as u64);
+    bb.put_u64(if is_nullable { 1 } else { 0 });
+    bb.put_u64(fk_table_id as u64);
+    bb.put_u64(fk_col_idx as u64);
+    bb.put_u64(0); // is_serial — neither engine-side writer marks SERIAL
+    bb.put_u64(if is_hidden { 1 } else { 0 });
+    bb.end_row();
+}
+
+/// Append one TABLE_TAB registration row (weight +1, created_lsn 0 — both
+/// engine-side writers register fresh tables).
+pub(super) fn push_table_tab_row(
+    bb: &mut BatchBuilder,
+    tid: i64,
+    schema_id: i64,
+    name: &str,
+    directory: &str,
+    pk_col_idx: u64,
+    flags: u64,
+) {
+    bb.begin_row(tid as u128, 1);
+    bb.put_u64(schema_id as u64);
+    bb.put_string(name);
+    bb.put_string(directory);
+    bb.put_u64(pk_col_idx);
+    bb.put_u64(0); // created_lsn
+    bb.put_u64(flags);
+    bb.end_row();
+}
 
 // Default arena sizes for system tables and user tables
 pub(super) const SYS_TABLE_ARENA: u64 = 256 * 1024; // 256 KB

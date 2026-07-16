@@ -52,7 +52,6 @@ pub const EXPR_STR_COL_LE_CONST: u32 = 42;
 pub const EXPR_STR_COL_EQ_COL: u32 = 43;
 pub const EXPR_STR_COL_LT_COL: u32 = 44;
 pub const EXPR_STR_COL_LE_COL: u32 = 45;
-pub const EXPR_EMIT_NULL: u32 = 46;
 
 // ---------------------------------------------------------------------------
 // Blob framing constants and operand packing

@@ -12,7 +12,7 @@ use super::super::error::StorageError;
 use super::batch::{strides_from_schema, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::layout::*;
 use super::xor8;
-use crate::foundation::codec::write_u64_le;
+use crate::foundation::codec::{read_i64_le, read_u64_le, write_u64_le};
 use crate::foundation::posix_io::{fdatasync_eintr, fsync_eintr};
 use crate::foundation::xxh;
 use crate::schema::key::pack_pk_be;
@@ -167,7 +167,7 @@ fn detect_encoding(data: &[u8], element_width: usize) -> RegionEncoding {
 fn detect_weight_encoding(data: &[u8]) -> RegionEncoding {
     debug_assert!(!data.is_empty() && data.len().is_multiple_of(8));
     let n = data.len() / 8;
-    let first = i64::from_le_bytes(data[..8].try_into().unwrap());
+    let first = read_i64_le(data, 0);
     // Single decode pass building the on-disk image directly: `value_a` LE ‖
     // `value_b` LE ‖ bitvec (bit i set ⇔ row i == value_b). The buffer is
     // allocated lazily at the first sighting of a second distinct value —
@@ -177,7 +177,7 @@ fn detect_weight_encoding(data: &[u8]) -> RegionEncoding {
     // allocation).
     let mut second: Option<(i64, Vec<u8>)> = None;
     for i in 1..n {
-        let v = i64::from_le_bytes(data[i * 8..(i + 1) * 8].try_into().unwrap());
+        let v = read_i64_le(data, i * 8);
         if v == first {
             continue;
         }
@@ -331,7 +331,7 @@ impl DecodedRegion {
 /// reference, and store the low `elem_width` bytes. Pure byte arithmetic over
 /// in-bounds slices — infallible once the reader's open-time checks hold.
 pub(crate) fn decode_for_region(encoded: &[u8], n: usize, elem_width: usize) -> DecodedRegion {
-    let reference = u64::from_le_bytes(encoded[..8].try_into().unwrap());
+    let reference = read_u64_le(encoded, 0);
     let bw = (encoded.len() - 8) / n;
     debug_assert!((1..8).contains(&bw), "open-time checks bound bw to 1..stride<=8");
     let mask = (1u64 << (8 * bw)) - 1;
@@ -340,7 +340,7 @@ pub(crate) fn decode_for_region(encoded: &[u8], n: usize, elem_width: usize) -> 
     let offset_at = |i: usize| -> u64 {
         let base = 8 + i * bw;
         if base + 8 <= encoded.len() {
-            u64::from_le_bytes(encoded[base..base + 8].try_into().unwrap()) & mask
+            read_u64_le(encoded, base) & mask
         } else {
             encoded[base..base + bw]
                 .iter()

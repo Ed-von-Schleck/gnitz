@@ -799,7 +799,7 @@ fn wire_size_range_matches_encoded_size() {
     for count in [0usize, 1, 4, 8] {
         let sz = wire_size_range(STATUS_OK, &[], Some(&sd), None, &batch, count, None);
         let mut buf = vec![0u8; sz];
-        let written = encode_wire_into_range(&mut buf, 0, 1, 0, 0, 0, STATUS_OK, Some(&sd), &batch, 0, count, None);
+        let written = encode_wire_into_range(&mut buf, 0, 1, 0, 0, STATUS_OK, Some(&sd), &batch, 0, count, None);
         assert_eq!(written, sz, "wire_size_range mismatch for count={count}");
     }
 }
@@ -823,7 +823,7 @@ fn encode_range_roundtrip() {
     // Encode rows [2, 5) into a wire frame with the schema block.
     let sz = wire_size_range(STATUS_OK, &[], Some(&sd), None, &batch, 3, None);
     let mut buf = vec![0u8; sz];
-    encode_wire_into_range(&mut buf, 0, 1, 0, 0, 0, STATUS_OK, Some(&sd), &batch, 2, 3, None);
+    encode_wire_into_range(&mut buf, 0, 1, 0, 0, STATUS_OK, Some(&sd), &batch, 2, 3, None);
 
     // Decode and verify row values.
     let decoded = decode_wire_ipc(&buf).expect("decode_wire_ipc");
@@ -847,7 +847,7 @@ fn continuation_frame_decoded_with_schema_hint() {
     let frame_flags = wire_flags_set_schema_version(FLAG_CONTINUATION, server_version);
     let sz = wire_size_range(STATUS_OK, &[], None, None, &batch, 4, None);
     let mut buf = vec![0u8; sz];
-    encode_wire_into_range(&mut buf, 0, 1, 0, frame_flags, 0, STATUS_OK, None, &batch, 0, 4, None);
+    encode_wire_into_range(&mut buf, 0, 1, 0, frame_flags, STATUS_OK, None, &batch, 0, 4, None);
 
     // decode_wire_ipc must fail (no schema in frame, no hint).
     assert!(

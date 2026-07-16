@@ -346,7 +346,7 @@ impl CatalogEngine {
     /// sole caller (`boot_checkpoint`) bumps the checkpoint generation right
     /// after, and that flush carries this row to the same shard.
     pub fn record_topology(&mut self, worker_count: u32) {
-        let value = ((worker_count as u64) << 32) | crate::storage::STATE_FORMAT as u64;
+        let value = crate::storage::topology_word(worker_count);
         if self.recorded_topology == value {
             return;
         }

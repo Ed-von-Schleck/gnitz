@@ -8,16 +8,16 @@
 //! miscompute.
 
 use crate::schema::{encode_german_string, ColumnLocator, SchemaDescriptor};
-// Wire opcodes (1–46) the client emits, matched as arms in `from_wire`. They are
+// Wire opcodes (1–45) the client emits, matched as arms in `from_wire`. They are
 // `pub const … : u32` in gnitz-wire, so a plain `use` binds them for pattern use.
 use gnitz_wire::{
     EXPR_BOOL_AND, EXPR_BOOL_NOT, EXPR_BOOL_OR, EXPR_CMP_EQ, EXPR_CMP_GE, EXPR_CMP_GT, EXPR_CMP_LE, EXPR_CMP_LT,
-    EXPR_CMP_NE, EXPR_COPY_COL, EXPR_EMIT, EXPR_EMIT_NULL, EXPR_FCMP_EQ, EXPR_FCMP_GE, EXPR_FCMP_GT, EXPR_FCMP_LE,
-    EXPR_FCMP_LT, EXPR_FCMP_NE, EXPR_FLOAT_ADD, EXPR_FLOAT_DIV, EXPR_FLOAT_MUL, EXPR_FLOAT_NEG, EXPR_FLOAT_SUB,
-    EXPR_INT_ADD, EXPR_INT_DIV, EXPR_INT_MOD, EXPR_INT_MUL, EXPR_INT_NEG, EXPR_INT_SUB, EXPR_INT_TO_FLOAT,
-    EXPR_IS_NOT_NULL, EXPR_IS_NULL, EXPR_LOAD_COL_FLOAT, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST, EXPR_LOAD_NULL,
-    EXPR_SELECT, EXPR_STR_COL_EQ_COL, EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LE_COL, EXPR_STR_COL_LE_CONST,
-    EXPR_STR_COL_LT_COL, EXPR_STR_COL_LT_CONST,
+    EXPR_CMP_NE, EXPR_COPY_COL, EXPR_EMIT, EXPR_FCMP_EQ, EXPR_FCMP_GE, EXPR_FCMP_GT, EXPR_FCMP_LE, EXPR_FCMP_LT,
+    EXPR_FCMP_NE, EXPR_FLOAT_ADD, EXPR_FLOAT_DIV, EXPR_FLOAT_MUL, EXPR_FLOAT_NEG, EXPR_FLOAT_SUB, EXPR_INT_ADD,
+    EXPR_INT_DIV, EXPR_INT_MOD, EXPR_INT_MUL, EXPR_INT_NEG, EXPR_INT_SUB, EXPR_INT_TO_FLOAT, EXPR_IS_NOT_NULL,
+    EXPR_IS_NULL, EXPR_LOAD_COL_FLOAT, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST, EXPR_LOAD_NULL, EXPR_SELECT,
+    EXPR_STR_COL_EQ_COL, EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LE_COL, EXPR_STR_COL_LE_CONST, EXPR_STR_COL_LT_COL,
+    EXPR_STR_COL_LT_CONST,
 };
 
 /// The register file is capped at 64: the BOOL_AND/BOOL_OR 3VL paths, the
@@ -209,9 +209,6 @@ pub(crate) enum LogicalInstr {
         src: u16,
         out: u32,
     },
-    EmitNull {
-        out: u32,
-    },
 }
 
 // ---------------------------------------------------------------------------
@@ -377,9 +374,6 @@ pub(in crate::expr) enum Instr {
     },
     Emit {
         src: u16,
-        out: u32,
-    },
-    EmitNull {
         out: u32,
     },
 }
@@ -565,7 +559,6 @@ impl LogicalProgram {
                     col_a: q[2],
                     col_b: q[3],
                 },
-                EXPR_EMIT_NULL => LogicalInstr::EmitNull { out: q[2] },
                 _ => return Err(ExprValidateErr::UnknownOpcode(op)),
             });
         }
@@ -771,7 +764,6 @@ impl LogicalProgram {
                     });
                 }
                 L::Emit { src, out } => instrs.push(I::Emit { src, out }),
-                L::EmitNull { out } => instrs.push(I::EmitNull { out }),
             }
         }
         // Encode each string constant once into a 16-byte German-string cell
@@ -930,7 +922,6 @@ impl LogicalProgram {
                     check_col_in_range(in_schema, src_col)?;
                     check_out(out)?;
                 }
-                L::EmitNull { out } => check_out(out)?,
             }
         }
         Ok(())
@@ -1063,8 +1054,7 @@ fn each_reg_read(i: &Instr, mut f: impl FnMut(u16)) {
         | IsNotNull { .. }
         | StrColConst { .. }
         | StrColCol { .. }
-        | CopyCol { .. }
-        | EmitNull { .. } => {}
+        | CopyCol { .. } => {}
     }
 }
 
@@ -1211,8 +1201,7 @@ impl ResolvedProgram {
                 | LoadPk { .. }
                 | LoadConst { .. }
                 | LoadNull { .. }
-                | CopyCol { .. }
-                | EmitNull { .. } => {}
+                | CopyCol { .. } => {}
             }
         }
         let mut bit_only = bool_produced & !non_bool_read;
@@ -1284,8 +1273,7 @@ impl ResolvedProgram {
                 | BoolOr { .. }
                 | BoolNot { .. }
                 | CopyCol { .. }
-                | Emit { .. }
-                | EmitNull { .. } => {}
+                | Emit { .. } => {}
             }
         }
         true

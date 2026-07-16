@@ -200,33 +200,13 @@ pub(crate) fn cogroup_union(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-    use crate::storage::{Batch, Layout, ReadCursor};
+    use crate::storage::{Batch, ReadCursor};
+    use crate::test_support::make_schema_u64_i64;
     use std::rc::Rc;
-
-    fn schema() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        )
-    }
 
     /// Build a sorted+consolidated batch of `(pk, weight, payload)` rows.
     fn make_batch(rows: &[(u64, i64, i64)]) -> Rc<Batch> {
-        let s = schema();
-        let mut b = Batch::with_schema(s, rows.len().max(1));
-        for &(pk, w, v) in rows {
-            b.extend_pk(pk as u128);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &v.to_le_bytes());
-            b.count += 1;
-        }
-        b.certify_layout(Layout::Consolidated, &s);
-        Rc::new(b)
+        Rc::new(crate::test_support::make_batch(&make_schema_u64_i64(), rows))
     }
 
     /// A recorded co-group triple: the key, the delta range, and the PKs of the
@@ -312,7 +292,7 @@ mod tests {
     /// and walked match PKs) over a range of shapes.
     #[test]
     fn intersection_matches_reference_all_shapes() {
-        let s = schema();
+        let s = make_schema_u64_i64();
         let cases: &[CoGroupCase] = &[
             // (delta, match)
             (&[], &[(1, 1, 10)]),                                   // empty delta
@@ -349,7 +329,7 @@ mod tests {
 
     #[test]
     fn left_matches_reference_all_shapes() {
-        let s = schema();
+        let s = make_schema_u64_i64();
         let cases: &[CoGroupCase] = &[
             (&[], &[(1, 1, 10)]),
             (&[(1, 1, 10)], &[]),                                   // every delta key, empty match
@@ -378,7 +358,7 @@ mod tests {
     /// land past the ghost, identically to a from-scratch seek.
     #[test]
     fn intersection_skips_ghost_group_multi_source() {
-        let s = schema();
+        let s = make_schema_u64_i64();
         // Source A: pk 1,3,5 ; Source B: pk 3 (negated) → pk=3 nets to 0.
         let src_a = make_batch(&[(1, 1, 10), (3, 1, 30), (5, 1, 50)]);
         let src_b = make_batch(&[(3, -1, 30)]);
@@ -399,7 +379,7 @@ mod tests {
     /// inner joins on one trace in a LEFT JOIN epoch) without the old `rewind`.
     #[test]
     fn intersection_self_positions_stale_cursor() {
-        let s = schema();
+        let s = make_schema_u64_i64();
         let mb = make_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40), (5, 1, 50)]);
         let delta = make_batch(&[(1, 1, 1), (3, 1, 3), (5, 1, 5)]);
         let want = strip(&naive_intersection(&delta, &mb));
@@ -439,7 +419,7 @@ mod tests {
 
             // Emit into a real output batch; the skeleton bulk-appends the
             // single-source runs, the callback appends both shared groups.
-            let mut out = Batch::with_schema(schema(), (a.count + b.count).max(1));
+            let mut out = Batch::with_schema(make_schema_u64_i64(), (a.count + b.count).max(1));
             cogroup_union(&mut ac, &mut bc, &mut out, |o, ra, rb| {
                 o.append_batch(&a, ra.start, ra.end);
                 o.append_batch(&b, rb.start, rb.end);

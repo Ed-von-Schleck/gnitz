@@ -136,15 +136,13 @@ pub fn op_negate(batch: &Batch) -> Batch {
 
 /// Union: algebraic addition of two Z-Set streams.
 /// When both inputs are sorted, performs O(N) merge preserving sort order.
-pub fn op_union(batch_a: Batch, batch_b: Option<&Batch>, schema: &SchemaDescriptor) -> Batch {
-    let b = match batch_b {
-        Some(b) if b.count > 0 => b,
+pub fn op_union(batch_a: Batch, batch_b: &Batch, schema: &SchemaDescriptor) -> Batch {
+    if batch_b.count == 0 {
         // O(1) pass-through: no allocation, sorted/consolidated preserved.
-        _ => {
-            gnitz_debug!("op_union: a={} b=0 identity", batch_a.count);
-            return batch_a;
-        }
-    };
+        gnitz_debug!("op_union: a={} b=0 identity", batch_a.count);
+        return batch_a;
+    }
+    let b = batch_b;
     if batch_a.count == 0 {
         return b.clone_batch();
     }
@@ -306,10 +304,8 @@ pub fn op_null_extend(batch: &Batch, in_schema: &SchemaDescriptor, out_schema: &
     // Set null bits for all appended right-side columns
     let right_null_bits = super::util::all_payload_null_mask(right_npc);
     for row in 0..n {
-        let off = row * 8;
-        let in_null = u64::from_le_bytes(batch.null_bmp_data()[off..off + 8].try_into().unwrap());
-        let out_null = super::util::merge_null_words(in_null, right_null_bits, in_npc);
-        output.null_bmp_data_mut()[off..off + 8].copy_from_slice(&out_null.to_le_bytes());
+        let out_null = super::util::merge_null_words(batch.get_null_word(row), right_null_bits, in_npc);
+        output.set_null_word(row, out_null);
     }
 
     // Null-extending appends columns without touching PK order or weights, so the
@@ -348,7 +344,7 @@ mod tests {
         let schema = make_schema_u64_i64();
         let a = make_batch(&schema, &[(1, 1, 20)]);
         let b = make_batch(&schema, &[(1, 1, 10)]);
-        let out = op_union(a, Some(&b), &schema);
+        let out = op_union(a, &b, &schema);
         assert_eq!(out.count, 2);
         assert!(out.is_sorted());
         assert_eq!(get_payload_i64(&out, 0), 10);
@@ -376,7 +372,7 @@ mod tests {
                 (7, 1, 70),
             ],
         ); // huge side; PK=5 interleaves with a
-        let out = op_union(a, Some(&b), &schema);
+        let out = op_union(a, &b, &schema);
 
         let got: Vec<(u64, i64)> = (0..out.count)
             .map(|r| (out.get_pk(r) as u64, get_payload_i64(&out, r)))
@@ -404,7 +400,7 @@ mod tests {
         let schema = make_schema_u64_i64();
         let a = make_batch(&schema, &[(1, 1, 20), (1, 1, 30)]);
         let b = make_batch(&schema, &[(1, 1, 10), (1, 1, 25)]);
-        let out = op_union(a, Some(&b), &schema);
+        let out = op_union(a, &b, &schema);
         assert_eq!(out.count, 4);
         assert!(out.is_sorted());
         assert_eq!(get_payload_i64(&out, 0), 10);
@@ -420,7 +416,7 @@ mod tests {
         let schema = make_schema_u64_i64();
         let a = make_batch(&schema, &[(1, 1, 20), (3, 1, 300)]);
         let b = make_batch(&schema, &[(1, 1, 10), (2, 1, 200)]);
-        let out = op_union(a, Some(&b), &schema);
+        let out = op_union(a, &b, &schema);
         assert_eq!(out.count, 4);
         assert!(out.is_sorted());
         assert_eq!((out.get_pk(0) as u64), 1);
@@ -439,7 +435,7 @@ mod tests {
         let schema = make_schema_u64_i64();
         let a = make_batch(&schema, &[(1, 1, 10)]);
         let b = make_batch(&schema, &[(1, -1, 10)]);
-        let out = op_union(a, Some(&b), &schema);
+        let out = op_union(a, &b, &schema);
         assert_eq!(out.count, 2);
         assert!(out.is_sorted());
         assert_eq!(get_payload_i64(&out, 0), 10);
@@ -492,7 +488,7 @@ mod tests {
 
         let a = make_str_batch(&schema, &[(1, 1, "banana")]);
         let b = make_str_batch(&schema, &[(1, 1, "apple")]);
-        let out = op_union(a, Some(&b), &schema);
+        let out = op_union(a, &b, &schema);
 
         assert_eq!(out.count, 2, "Z-Set + keeps both shared-PK rows");
         assert!(out.is_sorted());
@@ -611,7 +607,7 @@ mod tests {
         let a = make_wide_batch(&schema, &[(0, 0, 1, 1, 20), (0, 0, 3, 1, 300)]);
         let b = make_wide_batch(&schema, &[(0, 0, 1, 1, 10), (0, 0, 2, 1, 200)]);
 
-        let out = op_union(a, Some(&b), &schema);
+        let out = op_union(a, &b, &schema);
         assert_eq!(out.count, 4);
         assert!(out.is_sorted());
         assert!(!out.is_consolidated());
@@ -632,7 +628,7 @@ mod tests {
         let schema = make_schema_u64_i64();
         let a = make_batch(&schema, &[]);
         let b = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
-        let out = op_union(a, Some(&b), &schema);
+        let out = op_union(a, &b, &schema);
         assert_eq!(out.count, 2);
         assert_eq!(out.get_pk(0) as u64, 1);
         assert_eq!(get_payload_i64(&out, 0), 10);
@@ -641,11 +637,11 @@ mod tests {
     }
 
     #[test]
-    fn test_op_union_b_none_passthrough() {
-        // batch_b None → batch_a returned verbatim (sorted/consolidated kept).
+    fn test_op_union_empty_b_passthrough() {
+        // batch_b empty → batch_a returned verbatim (sorted/consolidated kept).
         let schema = make_schema_u64_i64();
         let a = make_batch(&schema, &[(1, 1, 10)]);
-        let out = op_union(a, None, &schema);
+        let out = op_union(a, &make_batch(&schema, &[]), &schema);
         assert_eq!(out.count, 1);
         assert!(out.is_sorted() && out.is_consolidated());
         assert_eq!(get_payload_i64(&out, 0), 10);
@@ -663,7 +659,7 @@ mod tests {
         let schema = make_schema_i64pk_i64();
         let a = make_batch_i64pk(&schema, &[(-5, 1, 100), (0, 1, 200), (7, 1, 300)]);
         let b = make_batch_i64pk(&schema, &[(-1, 1, 400), (3, 1, 500)]);
-        let out = op_union(a, Some(&b), &schema);
+        let out = op_union(a, &b, &schema);
         assert_eq!(out.count, 5);
         assert!(out.is_sorted());
         let pks: Vec<i64> = (0..out.count)

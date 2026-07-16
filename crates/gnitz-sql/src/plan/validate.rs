@@ -288,10 +288,20 @@ pub(crate) struct HonoredQueryClauses {
     /// A `WITH` (CTE) clause. Honored only by CREATE VIEW, which inlines it (`inline_ctes`).
     /// A direct SELECT, a CTE body (nested CTE), and an INSERT source reject it.
     pub with: bool,
-    /// A `LIMIT`/`OFFSET` clause. Honored only by direct SELECT, which applies a plain `LIMIT n`
-    /// client-side and rejects `OFFSET` / `LIMIT … BY` with its own messages; when `true` this
-    /// guard leaves `limit_clause` to the caller.
-    pub limit: bool,
+    /// The site runs the client-side ordering sink: `ORDER BY` and `LIMIT`/`OFFSET` are applied
+    /// to the fetched batch. Honored only by direct SELECT, which also rejects the `LIMIT … BY`
+    /// sub-form with its own message; when `true` this guard leaves `order_by` and `limit_clause`
+    /// to the caller.
+    pub ordering_sink: bool,
+}
+
+impl HonoredQueryClauses {
+    /// A site that honors no envelope clause at all — every narrowing site
+    /// except direct SELECT.
+    pub const NONE: Self = HonoredQueryClauses {
+        with: false,
+        ordering_sink: false,
+    };
 }
 
 /// Reject every `Query`-envelope clause a narrowing site does not consume. `GenericDialect`
@@ -302,7 +312,8 @@ pub(crate) struct HonoredQueryClauses {
 ///
 /// This is the crate's single exhaustive `Query` destructure (no `..`): a future `sqlparser`
 /// field stops the build here until it is classified, converting a silent-drop-on-upgrade into a
-/// compile error. All four narrowing sites funnel through it, so no per-site list can drift.
+/// compile error. Every narrowing site funnels through it (direct SELECT and the INSERT source
+/// directly, the sub-query sites via [`plain_select_body`]), so no per-site list can drift.
 pub(crate) fn reject_unhonored_query_clauses(
     query: &sqlparser::ast::Query,
     honored: HonoredQueryClauses,
@@ -329,10 +340,10 @@ pub(crate) fn reject_unhonored_query_clauses(
     if !honored.with && with.is_some() {
         return Err(reject("WITH (CTE)"));
     }
-    if !honored.limit && limit_clause.is_some() {
+    if !honored.ordering_sink && limit_clause.is_some() {
         return Err(reject("LIMIT/OFFSET"));
     }
-    if order_by.is_some() {
+    if !honored.ordering_sink && order_by.is_some() {
         return Err(reject("ORDER BY"));
     }
     if fetch.is_some() {
@@ -354,6 +365,23 @@ pub(crate) fn reject_unhonored_query_clauses(
         return Err(reject("pipe operators (|>)"));
     }
     Ok(())
+}
+
+/// Reject a sub-`Query`'s whole envelope (no honored clause) and unwrap its
+/// body to the plain `Select` it must be — the shared front step of every
+/// narrowing site that consumes a nested query (a CTE body, a derived table,
+/// an EXISTS/IN or scalar subquery). `ctx` names the surface for both messages.
+pub(crate) fn plain_select_body<'a>(
+    q: &'a sqlparser::ast::Query,
+    ctx: &str,
+) -> Result<&'a sqlparser::ast::Select, GnitzSqlError> {
+    reject_unhonored_query_clauses(q, HonoredQueryClauses::NONE, ctx)?;
+    match q.body.as_ref() {
+        sqlparser::ast::SetExpr::Select(s) => Ok(s.as_ref()),
+        _ => Err(GnitzSqlError::Unsupported(format!(
+            "{ctx}: only a plain SELECT body is supported"
+        ))),
+    }
 }
 
 /// Reject every `Insert`-statement clause the INSERT planner does not consume. `extract_insert_parts`
@@ -454,14 +482,7 @@ pub(crate) fn reject_unhonored_insert_clauses(
     // ORDER BY, FETCH, FOR UPDATE/SHARE, SETTINGS, FORMAT, a `WITH`). Route it through the shared
     // `Query` guard so a dropped envelope clause is a clean error, not a silent full-table insert.
     if let Some(src) = source {
-        reject_unhonored_query_clauses(
-            src,
-            HonoredQueryClauses {
-                with: false,
-                limit: false,
-            },
-            context,
-        )?;
+        reject_unhonored_query_clauses(src, HonoredQueryClauses::NONE, context)?;
     }
     Ok(())
 }

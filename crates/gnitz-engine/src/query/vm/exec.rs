@@ -205,14 +205,9 @@ pub(crate) fn execute_epoch_multi(
                 reg_mut!(*out_reg).batch = result;
             }
 
-            Instr::Union {
-                in_a,
-                in_b,
-                has_b,
-                out_reg,
-            } => {
+            Instr::Union { in_a, in_b, out_reg } => {
                 let schema = &program.reg_meta[*in_a as usize].schema;
-                if *has_b && in_a == in_b {
+                if in_a == in_b {
                     // Self-union: Z + Z doubles every weight in-place. Reading
                     // batch_b after moving batch_a out would see an empty batch
                     // and produce +1 instead of +2.
@@ -220,7 +215,7 @@ pub(crate) fn execute_epoch_multi(
                     batch.map_weights(|w| w.wrapping_mul(2));
                     reg_mut!(*out_reg).batch = batch;
                 } else {
-                    let batch_b = if *has_b { Some(&reg!(*in_b).batch) } else { None };
+                    let batch_b = &reg!(*in_b).batch;
                     let batch_a = reg_mut!(*in_a).batch.take();
                     reg_mut!(*out_reg).batch = ops::op_union(batch_a, batch_b, schema);
                 }
@@ -234,30 +229,25 @@ pub(crate) fn execute_epoch_multi(
                 lo,
                 hi,
             } => {
-                if let Some(cursor) = cursor_mut!(*hist_reg) {
-                    let schema = &program.reg_meta[*in_reg as usize].schema;
-                    let delta = reg_mut!(*in_reg).batch.take();
-                    let (output, consolidated) = ops::op_weight_clamp(delta, cursor, schema, *lo, *hi);
-                    reg_mut!(*out_reg).batch = output;
-                    // Ingest consolidated delta into history table
-                    if *hist_table_idx >= 0 {
-                        let ptr = program.tables[*hist_table_idx as usize];
-                        let table = unsafe { &mut *ptr };
-                        let res = table.ingest_owned_batch(consolidated);
-                        fatal_on_tick_ingest_err("weight-clamp history", *hist_table_idx as i32, res);
-                    }
-                }
-                // If cursor is null, in_reg retains its data (not consumed).
+                let cursor = cursor_mut!(*hist_reg).expect("weight-clamp: history cursor unbound");
+                let schema = &program.reg_meta[*in_reg as usize].schema;
+                let delta = reg_mut!(*in_reg).batch.take();
+                let (output, consolidated) = ops::op_weight_clamp(delta, cursor, schema, *lo, *hi);
+                reg_mut!(*out_reg).batch = output;
+                // Ingest consolidated delta into history table
+                let ptr = program.tables[*hist_table_idx as usize];
+                let table = unsafe { &mut *ptr };
+                let res = table.ingest_owned_batch(consolidated);
+                fatal_on_tick_ingest_err("weight-clamp history", *hist_table_idx as i32, res);
             }
 
             Instr::JoinDT {
                 delta_reg,
                 trace_reg,
                 out_reg,
-                right_schema_idx,
             } => {
                 let left_schema = &program.reg_meta[*delta_reg as usize].schema;
-                let right_schema = &program.schemas[*right_schema_idx as usize];
+                let right_schema = &program.reg_meta[*trace_reg as usize].schema;
                 let out_schema = &program.reg_meta[*out_reg as usize].schema;
                 if let Some(cursor) = cursor_mut!(*trace_reg) {
                     let result = ops::op_join_delta_trace(
@@ -275,12 +265,11 @@ pub(crate) fn execute_epoch_multi(
                 delta_reg,
                 trace_reg,
                 out_reg,
-                right_schema_idx,
                 n_eq,
                 rel,
             } => {
                 let left_schema = &program.reg_meta[*delta_reg as usize].schema;
-                let right_schema = &program.schemas[*right_schema_idx as usize];
+                let right_schema = &program.reg_meta[*trace_reg as usize].schema;
                 let out_schema = &program.reg_meta[*out_reg as usize].schema;
                 if let Some(cursor) = cursor_mut!(*trace_reg) {
                     let result = ops::op_join_delta_trace_range(
@@ -317,8 +306,6 @@ pub(crate) fn execute_epoch_multi(
             }
 
             Instr::Integrate { in_reg, table_idx, avi } => {
-                let schema = &program.reg_meta[*in_reg as usize].schema;
-
                 let target_ptr = if *table_idx >= 0 {
                     program.tables[*table_idx as usize]
                 } else {
@@ -332,11 +319,7 @@ pub(crate) fn execute_epoch_multi(
 
                 let avi_desc = avi.as_ref().map(|a| AviDesc {
                     table: program.tables[a.table_idx as usize],
-                    group_by_cols: &program.group_cols
-                        [a.group_cols_offset as usize..(a.group_cols_offset as usize + a.group_cols_count as usize)],
-                    aggs: &program.agg_descs
-                        [a.agg_descs_offset as usize..(a.agg_descs_offset as usize + a.agg_descs_count as usize)],
-                    extractor: &program.avi_extractors[a.extractor_idx as usize],
+                    bake: &program.avi_bakes[a.bake_idx as usize],
                 });
 
                 gnitz_debug!(
@@ -345,7 +328,7 @@ pub(crate) fn execute_epoch_multi(
                     target.is_some(),
                     avi_desc.is_some()
                 );
-                let res = ops::op_integrate_with_indexes(&reg!(*in_reg).batch, target, schema, avi_desc.as_ref());
+                let res = ops::op_integrate_with_indexes(&reg!(*in_reg).batch, target, avi_desc.as_ref());
                 fatal_on_tick_ingest_err("integrate", *table_idx, res);
             }
 

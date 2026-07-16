@@ -849,36 +849,18 @@ mod tests {
     use super::super::batch::{Batch, Layout};
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-
-    fn make_schema_i64() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U128, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        )
-    }
+    use crate::test_support::make_schema_u128_i64;
 
     /// Build an owned `Batch` from a row tuple list. Tests obtain a `MemBatch`
     /// view via `batch.as_mem_batch()`. Avoids the prior pattern of building
     /// disjoint pk/weight/null/col Vecs, which doesn't fit the new MemBatch
     /// layout (single `data` slice + offsets).
     fn make_batch_i64(rows: &[(u128, i64, i64)]) -> Batch {
-        let schema = make_schema_i64();
-        let mut b = Batch::with_schema(schema, rows.len().max(1));
-        for &(pk, w, val) in rows {
-            b.extend_pk(pk);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &val.to_le_bytes());
-            b.count += 1;
-        }
-        b
+        crate::test_support::make_batch_u128_raw(&make_schema_u128_i64(), rows)
     }
 
     fn empty_batch_i64() -> Batch {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         Batch::empty_with_schema(&schema)
     }
 
@@ -925,7 +907,7 @@ mod tests {
             ],
             &[0],
         );
-        for (label, schema) in [("stride8", s8), ("stride16", make_schema_i64())] {
+        for (label, schema) in [("stride8", s8), ("stride16", make_schema_u128_i64())] {
             let batches: Vec<Batch> = (0..K).map(|_| bench_sorted_batch(&schema, N, DUP)).collect();
             let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
             let sorted: Vec<SortedMemBatch> = mem.iter().map(|mb| SortedMemBatch::new_unchecked(mb.clone())).collect();
@@ -1290,7 +1272,7 @@ mod tests {
 
     #[test]
     fn test_single_batch_passthrough() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         let batch = make_batch_i64(&[(10, 1, 100), (20, 1, 200), (30, 1, 300)]);
 
         let result = merge_to_rows(&[batch], &schema);
@@ -1302,7 +1284,7 @@ mod tests {
 
     #[test]
     fn test_two_batch_interleave() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         let b1 = make_batch_i64(&[(10, 1, 100), (30, 1, 300)]);
         let b2 = make_batch_i64(&[(20, 1, 200), (40, 1, 400)]);
 
@@ -1316,7 +1298,7 @@ mod tests {
 
     #[test]
     fn test_consolidation_same_pk_same_payload() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         let b1 = make_batch_i64(&[(10, 1, 100)]);
         let b2 = make_batch_i64(&[(10, 2, 100)]);
 
@@ -1327,7 +1309,7 @@ mod tests {
 
     #[test]
     fn test_consolidation_cancellation() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         let b1 = make_batch_i64(&[(10, 1, 100)]);
         let b2 = make_batch_i64(&[(10, -1, 100)]);
 
@@ -1337,7 +1319,7 @@ mod tests {
 
     #[test]
     fn test_same_pk_different_payload() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         let b1 = make_batch_i64(&[(10, 1, 100)]);
         let b2 = make_batch_i64(&[(10, 1, 200)]);
 
@@ -1349,7 +1331,7 @@ mod tests {
 
     #[test]
     fn test_three_way_merge() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         let b1 = make_batch_i64(&[(10, 1, 100), (40, 1, 400)]);
         let b2 = make_batch_i64(&[(20, 1, 200), (50, 1, 500)]);
         let b3 = make_batch_i64(&[(30, 1, 300), (60, 1, 600)]);
@@ -1362,14 +1344,14 @@ mod tests {
 
     #[test]
     fn test_empty_batches() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         let result = merge_to_rows(&[], &schema);
         assert_eq!(result.len(), 0);
     }
 
     #[test]
     fn test_one_empty_one_nonempty() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         let empty = empty_batch_i64();
         let b = make_batch_i64(&[(10, 1, 100)]);
 
@@ -1380,7 +1362,7 @@ mod tests {
 
     #[test]
     fn test_partial_cancellation_three_batches() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         // Insert PK=10 w=+1, PK=20 w=+1
         let b1 = make_batch_i64(&[(10, 1, 100), (20, 1, 200)]);
         // Delete PK=10 w=-1
@@ -1395,7 +1377,7 @@ mod tests {
 
     #[test]
     fn test_pk_hi_differentiation() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         let b1 = make_batch_i64(&[(10, 1, 100)]);
         let b2 = make_batch_i64(&[((1u128 << 64) | 10, 1, 200)]);
 
@@ -1407,7 +1389,7 @@ mod tests {
 
     #[test]
     fn test_many_duplicates_accumulate() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         // 5 separate single-row batches, same (PK, payload) → merged weight = 5
         let batches: Vec<Batch> = (0..5).map(|_| make_batch_i64(&[(42, 1, 999)])).collect();
         let result = merge_to_rows(&batches, &schema);
@@ -1417,7 +1399,7 @@ mod tests {
 
     #[test]
     fn test_weight_zero_skip() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         let b = make_batch_i64(&[(10, 0, 100), (20, 1, 200)]);
 
         let result = merge_to_rows(&[b], &schema);
@@ -1431,7 +1413,7 @@ mod tests {
 
     #[test]
     fn test_sorted_output_large() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         // 100 rows in reverse order, split into batches of 10
         let mut batches = Vec::new();
         for chunk in 0..10 {
@@ -1455,7 +1437,7 @@ mod tests {
     #[test]
     fn test_within_cursor_duplicates() {
         // Two rows with the same PK within a single sorted batch
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         let b = make_batch_i64(&[(10, 1, 100), (10, 1, 100), (20, 1, 200)]);
 
         let result = merge_to_rows(&[b], &schema);
@@ -1467,7 +1449,7 @@ mod tests {
     #[test]
     fn test_within_cursor_dup_different_payload() {
         // Two rows with same PK but different payload within one batch
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         let b = make_batch_i64(&[(10, 1, 100), (10, 1, 200), (20, 1, 300)]);
 
         let result = merge_to_rows(&[b], &schema);
@@ -1525,7 +1507,7 @@ mod tests {
 
     #[test]
     fn test_consolidate_empty() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         let b = empty_batch_i64();
         let result = run_consolidate(&b, &schema);
         assert_eq!(result.len(), 0);
@@ -1533,7 +1515,7 @@ mod tests {
 
     #[test]
     fn test_consolidate_single_row() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         let b = make_batch_i64(&[(5, 1, 42)]);
 
         let result = run_consolidate(&b, &schema);
@@ -1543,7 +1525,7 @@ mod tests {
 
     #[test]
     fn test_consolidate_already_sorted_no_dups() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         let b = make_batch_i64(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
 
         let result = run_consolidate(&b, &schema);
@@ -1555,7 +1537,7 @@ mod tests {
 
     #[test]
     fn test_consolidate_unsorted_no_dups() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         let b = make_batch_i64(&[(3, 1, 30), (1, 1, 10), (2, 1, 20)]);
 
         let result = run_consolidate(&b, &schema);
@@ -1568,7 +1550,7 @@ mod tests {
 
     #[test]
     fn test_consolidate_dup_weight_accumulation() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         // Same (PK, payload) with +1 and +1 → merged to +2
         let b = make_batch_i64(&[(5, 1, 42), (5, 1, 42)]);
 
@@ -1579,7 +1561,7 @@ mod tests {
 
     #[test]
     fn test_consolidate_ghost_elimination() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         // Same (PK, payload) with +1 and -1 → ghost, eliminated
         let b = make_batch_i64(&[(5, 1, 42), (5, -1, 42)]);
 
@@ -1589,7 +1571,7 @@ mod tests {
 
     #[test]
     fn test_consolidate_same_pk_different_payload() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         // Same PK but different payloads → both survive, sorted by payload
         let b = make_batch_i64(&[(5, 1, 200), (5, 1, 100)]);
 
@@ -1602,7 +1584,7 @@ mod tests {
 
     #[test]
     fn test_consolidate_unsorted_mixed() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         // Unsorted: insert + retract + different PKs
         let b = make_batch_i64(&[
             (10, 1, 100),  // insert pk=10 val=100
@@ -1620,7 +1602,7 @@ mod tests {
 
     #[test]
     fn test_consolidate_all_cancel() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         let b = make_batch_i64(&[(1, 1, 10), (1, -1, 10), (2, 3, 20), (2, -3, 20)]);
 
         let result = run_consolidate(&b, &schema);
@@ -1643,7 +1625,7 @@ mod tests {
 
     #[test]
     fn mem_batch_get_pk_bytes_matches_get_pk_u128() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         let pks: &[u128] = &[0, 1, u64::MAX as u128, (u64::MAX as u128) + 1, u128::MAX];
         let mut b = Batch::with_schema(schema, pks.len());
         for &pk in pks {
@@ -2276,7 +2258,7 @@ mod tests {
     /// +1/-1 pair never folds — leaking a spurious row.
     #[test]
     fn test_merge_same_pk_nonadjacent_payload_interleave() {
-        let schema = make_schema_i64();
+        let schema = make_schema_u128_i64();
         let b1 = make_batch_i64(&[(5, 1, 100)]);
         let b2 = make_batch_i64(&[(5, 1, 200)]);
         let b3 = make_batch_i64(&[(5, -1, 100)]);
@@ -2811,12 +2793,6 @@ mod tests {
     }
 
     /// Decode a single-column OPK PK back to its native I64 value.
-    fn i64_from_opk(opk: &[u8]) -> i64 {
-        let mut le = [0u8; 8];
-        gnitz_wire::decode_pk_column(&opk[..8], type_code::I64, &mut le);
-        i64::from_le_bytes(le)
-    }
-
     #[test]
     fn opk_single_signed_i64_negatives() {
         let s = pk_payload_schema(&[type_code::I64]);
@@ -2834,7 +2810,7 @@ mod tests {
         assert_consolidate_matches_reference(&s, &rows);
         // Concrete order check: negatives precede non-negatives.
         let out = run_consolidate_bytes(&make_batch_bytes(&s, &rows), &s);
-        let pks: Vec<i64> = out.iter().map(|r| i64_from_opk(&r.0)).collect();
+        let pks: Vec<i64> = out.iter().map(|r| crate::test_support::opk_pk_i64(&r.0)).collect();
         assert_eq!(pks, vec![i64::MIN, -100, -1, 0, i64::MAX]);
     }
 

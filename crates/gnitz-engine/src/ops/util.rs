@@ -42,7 +42,7 @@ pub(crate) fn all_payload_null_mask(npc: usize) -> u64 {
 
 /// Precomputed gatherer for the byte-form AVI composite group key. Resolves
 /// each group column's layout once — baked into the reduce plan (read side)
-/// and the compiled program (`Program::avi_extractors`, write side); `gather`
+/// and the compiled program (`Program::avi_bakes`, write side); `gather`
 /// then concatenates raw bytes per row. Callers must have passed
 /// `query::compiler::avi_group_key_eligible` (fixed-width, non-nullable
 /// columns), so it never sees STRING/BLOB or a NULL.
@@ -187,17 +187,10 @@ pub(super) fn decode_ordered(encoded: u64, col_type_code: TypeCode, for_max: boo
             let f32_bits = ieee_order_bits_f32_reverse(e);
             f64::to_bits(f32::from_bits(f32_bits) as f64)
         }
-        TypeCode::U8
-        | TypeCode::U16
-        | TypeCode::U32
-        | TypeCode::U64
-        | TypeCode::U128
-        | TypeCode::UUID
-        | TypeCode::String => e,
-        TypeCode::Blob => unreachable!("BLOB columns are not valid aggregate inputs"),
-        TypeCode::I128 => unreachable!(
-            "I128 is excluded from the AVI by agg_value_idx_eligible (16-byte value \
-             cannot order-encode into the 8-byte slot)"
+        TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 => e,
+        TypeCode::String | TypeCode::Blob | TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => unreachable!(
+            "AVI agg type {col_type_code:?} is not order-encodable (compile-rejected by \
+             agg_value_idx_eligible)"
         ),
     }
 }
@@ -219,12 +212,6 @@ pub(super) fn hash_german_string_content(hasher: &mut Xxh3Default, struct_bytes:
     hasher.update(content);
 }
 
-/// Extract 128-bit group key from a batch row.
-#[inline]
-pub(super) fn extract_group_key(mb: &MemBatch, row: usize, schema: &SchemaDescriptor, group_by_cols: &[u32]) -> u128 {
-    extract_group_key_row(mb, row, schema, group_by_cols)
-}
-
 /// The 128-bit group key of the **empty** group-column set — the constant `V₀` a
 /// global (ungrouped) aggregate folds to. Batch-free: identical to the XXH3 empty
 /// digest `extract_group_key(.., &[])` produces over any populated row (the
@@ -241,7 +228,7 @@ pub(crate) fn global_group_key() -> u128 {
     Xxh3Default::new().digest128()
 }
 
-/// Which canonical (order-preserving) fast-path arm [`extract_group_key_row`]
+/// Which canonical (order-preserving) fast-path arm [`extract_group_key`]
 /// emits the group key of `group_by_cols` through, or `None` for the XXH3
 /// fold (multi-column, nullable, or non-routable type). `op_reduce` upgrades
 /// its `trace_out` retraction probe to the monotone `advance_to` exactly when
@@ -275,7 +262,7 @@ pub(super) fn single_col_canonical_group_key(
 }
 
 /// Execute the canonical single-column fast-path arm through a resolved
-/// locator. Shared by the schema-walking [`extract_group_key_row`] and the
+/// locator. Shared by the schema-walking [`extract_group_key`] and the
 /// baked [`GroupKeyCols::key_row`], so the two produce identical keys by
 /// construction.
 ///
@@ -304,7 +291,7 @@ fn canonical_group_key<R: ColumnarSource>(src: &R, row: usize, arm: CanonicalKey
 }
 
 /// Hash one group column into the fold-path digest. The single per-column
-/// body shared by the schema-walking [`extract_group_key_row`] and the baked
+/// body shared by the schema-walking [`extract_group_key`] and the baked
 /// [`GroupKeyCols::key_row`] — a divergence would silently merge or split
 /// groups in the non-linear REDUCE fallback (wrong MIN/MAX).
 #[inline]
@@ -326,7 +313,7 @@ fn hash_group_col<R: ColumnarSource>(
             hasher.update(&key.to_le_bytes());
         }
         ColumnLocator::Payload { slot, size, type_code } => {
-            if nullable && (null_word >> slot) & 1 != 0 {
+            if nullable && crate::schema::null_bit(null_word, slot as usize) {
                 hasher.update(&[0u8]); // null marker
                 return;
             }
@@ -352,11 +339,12 @@ fn hash_group_col<R: ColumnarSource>(
     }
 }
 
-/// The one group-key hash body, generic over any [`ColumnarSource`] row — a
-/// `MemBatch` row and a `ReadCursor`'s current row hash byte-identically, so a
-/// trace row routes to the delta group it belongs to.
+/// Extract the 128-bit group key of one row — the one group-key hash body,
+/// generic over any [`ColumnarSource`] row: a `MemBatch` row and a
+/// `ReadCursor`'s current row hash byte-identically, so a trace row routes to
+/// the delta group it belongs to.
 #[inline]
-fn extract_group_key_row<R: ColumnarSource>(
+pub(super) fn extract_group_key<R: ColumnarSource>(
     src: &R,
     row: usize,
     schema: &SchemaDescriptor,
@@ -397,7 +385,7 @@ fn extract_group_key_row<R: ColumnarSource>(
     hasher.digest128()
 }
 
-/// The baked form of [`extract_group_key_row`]: per-column locators and
+/// The baked form of [`extract_group_key`]: per-column locators and
 /// nullability (the one schema fact a locator does not carry) resolved once at
 /// plan-bake time, for per-row hot loops (the non-linear REDUCE fallback's
 /// per-trace-row routing). Consumes the same shared per-column bodies

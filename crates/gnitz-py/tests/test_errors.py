@@ -276,7 +276,7 @@ class TestSchemaColumnLimit:
         cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True)]
         cols += [gnitz.ColumnDef(f"c{i}", gnitz.TypeCode.I64, is_nullable=True)
                  for i in range(65)]
-        with pytest.raises(ValueError, match="65"):
+        with pytest.raises(ValueError, match="MAX_COLUMNS"):
             gnitz.Schema(cols)
 
     def test_100_columns_raises(self):

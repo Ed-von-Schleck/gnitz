@@ -200,21 +200,6 @@ pub fn encode_message_noschema_parts(
     }
 }
 
-/// Flattened form of [`encode_message_parts`], for callers that need one
-/// contiguous payload buffer.
-#[allow(clippy::too_many_arguments)]
-pub fn encode_message(
-    target_id: u64,
-    client_id: u64,
-    flags: u64,
-    seek_pk: &PkTuple,
-    seek_col_idx: u64,
-    schema: Option<&Schema>,
-    data_batch: Option<&ZSetBatch>,
-) -> Vec<u8> {
-    encode_message_parts(target_id, client_id, flags, seek_pk, seek_col_idx, schema, data_batch).to_vec()
-}
-
 /// Encode the client's meta-schema WAL block for `schema` under table id `tid`
 /// — the exact bytes a schema-bearing push embeds (the `encode_wal_block(
 /// meta_schema(), tid, &schema_to_batch(s))` expression `encode_message_parts`
@@ -335,7 +320,7 @@ pub fn send_message(
 
 /// Control-only frame carrying an **explicit, arbitrary-length** `seek_pk_extra`
 /// blob, the channel for the SEEK_BY_INDEX_RANGE `RangeDescriptor`.
-/// `encode_message` derives
+/// `encode_message_parts` derives
 /// `seek_pk_extra` from `seek_pk.split_wire()`, which a `PkTuple` caps at 64
 /// bytes (`MAX_PK_BYTES - 16`); a max-arity range descriptor is up to 82 bytes,
 /// so it cannot ride a `PkTuple`. This passes the blob straight to
@@ -360,23 +345,6 @@ pub fn send_message_with_extra(
     };
     let payload = encode_control_block(&ctrl_hdr, "", seek_pk_extra);
     t.send_framed(&payload)
-}
-
-/// Like `send_message` but omits the schema block from the wire frame.
-/// The data block is still encoded using `data_schema`; the server must
-/// reconstruct the schema from its catalog (guided by the schema version in
-/// `flags`). Used by warm-cache PUSH paths where the server already knows the
-/// schema (version embedded in `flags` bits 24-39).
-pub fn send_message_noschema(
-    t: &mut ClientTransport,
-    target_id: u64,
-    client_id: u64,
-    flags: u64,
-    data_schema: &Schema,
-    data_batch: &ZSetBatch,
-) -> Result<(), ProtocolError> {
-    let parts = encode_message_noschema_parts(target_id, client_id, flags, data_schema, data_batch);
-    t.send_framed_iov(&parts.segments())
 }
 
 /// Parse a wire payload (without 4-byte frame header) into a `Message`.
@@ -910,12 +878,12 @@ mod tests {
         assert!(msg.error_text.is_some());
     }
 
-    // ── encode_message + parse_response roundtrips (no sockets) ─────────
+    // ── encode_message_parts + parse_response roundtrips (no sockets) ────
 
     #[test]
     fn test_encode_parse_control_only() {
         let seek_pk = 42u128 | (99u128 << 64);
-        let payload = encode_message(
+        let payload = encode_message_parts(
             0xDEAD,
             0xBEEF,
             FLAG_PUSH,
@@ -923,7 +891,8 @@ mod tests {
             7,
             None,
             None,
-        );
+        )
+        .to_vec();
         let msg = parse_response(&payload, None).unwrap();
         assert_eq!(msg.target_id, 0xDEAD);
         assert_eq!(msg.seek_pk, seek_pk);
@@ -953,7 +922,7 @@ mod tests {
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(val_bytes)],
         };
 
-        let payload = encode_message(42, 1, 0, &PkTuple::EMPTY, 0, Some(&schema), Some(&batch));
+        let payload = encode_message_parts(42, 1, 0, &PkTuple::EMPTY, 0, Some(&schema), Some(&batch)).to_vec();
         let msg = parse_response(&payload, None).unwrap();
         assert_eq!(msg.target_id, 42);
         assert!(msg.schema.is_some());
@@ -970,21 +939,21 @@ mod tests {
         };
         let empty = ZSetBatch::new(&schema);
 
-        let payload = encode_message(10, 1, 0, &PkTuple::EMPTY, 0, Some(&schema), Some(&empty));
+        let payload = encode_message_parts(10, 1, 0, &PkTuple::EMPTY, 0, Some(&schema), Some(&empty)).to_vec();
         let msg = parse_response(&payload, None).unwrap();
         // Schema sent, but no data (empty batch)
         assert!(msg.schema.is_some());
         assert!(msg.data_batch.is_none());
     }
 
-    /// A wide (stride 24) PK seek must split inside `encode_message`: low 16
-    /// bytes land in `seek_pk`, bytes 16..24 in `seek_pk_extra`. `parse_response`
-    /// only surfaces the low-16 `seek_pk`, so decode the control block directly
-    /// to inspect the extra region.
+    /// A wide (stride 24) PK seek must split inside `encode_message_parts`: low
+    /// 16 bytes land in `seek_pk`, bytes 16..24 in `seek_pk_extra`.
+    /// `parse_response` only surfaces the low-16 `seek_pk`, so decode the
+    /// control block directly to inspect the extra region.
     #[test]
     fn encode_message_wide_pk_seek_emits_extra() {
         let pk = PkTuple::from_bytes(&(0..24u8).collect::<Vec<_>>());
-        let payload = encode_message(7, 1, FLAG_SEEK, &pk, 0, None, None);
+        let payload = encode_message_parts(7, 1, FLAG_SEEK, &pk, 0, None, None).to_vec();
 
         let ctrl_size = u32::from_le_bytes(
             payload[gnitz_wire::WAL_OFF_SIZE..gnitz_wire::WAL_OFF_SIZE + 4]
@@ -1024,7 +993,8 @@ mod tests {
         let (mut a, mut b) = make_transport_pair();
         // Embed version=1 in flags; no schema block in the frame.
         let flags = wire_flags_set_schema_version(0, 1);
-        send_message_noschema(&mut a, 42, 0, flags, &schema, &batch).unwrap();
+        let parts = encode_message_noschema_parts(42, 0, flags, &schema, &batch);
+        a.send_framed_iov(&parts.segments()).unwrap();
 
         // Parse with a matching hint (same schema, version 1).
         let msg = recv_message(&mut b, Some((&schema, 1)), gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();

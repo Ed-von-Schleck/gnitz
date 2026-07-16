@@ -367,23 +367,20 @@ pub(crate) fn op_relay_scatter_consolidated_mode(
     })
 }
 
-/// Broadcast relay: deliver the FULL delta to every worker. The per-worker
+/// Broadcast relay: the FULL delta, delivered to every worker. The per-worker
 /// source slices are disjoint (each is one worker's base-table-PK-partitioned
-/// slice), so their concatenation is the full delta with no duplication; that
-/// concatenation is then cloned to each of `num_workers` destinations. The
+/// slice), so their concatenation is the full delta with no duplication. One
+/// batch is built; the SAL emit references it once per worker slot
+/// (`RelayDest::Broadcast`), so no per-worker clone is materialized. The
 /// range-join probe needs the whole delta on every worker — a range match can
 /// live on any worker's trace — which the equality scatter (one destination per
 /// row) cannot deliver. Sibling of `op_repartition_batches_mode` /
 /// `op_relay_scatter_consolidated_mode`, but without `col_indices` / `RouteMode`
-/// (broadcast routes nothing). All destination batches are byte-identical.
-pub(crate) fn op_relay_broadcast(
-    sources: &[Option<&Batch>],
-    schema: &SchemaDescriptor,
-    num_workers: usize,
-) -> Vec<Batch> {
+/// (broadcast routes nothing).
+pub(crate) fn op_relay_broadcast(sources: &[Option<&Batch>], schema: &SchemaDescriptor) -> Batch {
     let total: usize = sources.iter().flatten().map(|b| b.count).sum();
     if total == 0 {
-        return (0..num_workers).map(|_| Batch::empty_with_schema(schema)).collect();
+        return Batch::empty_with_schema(schema);
     }
     // Concatenate the disjoint slices into the full delta once (append_batch
     // relocates each source's blob, so independent source blobs stay valid).
@@ -393,10 +390,7 @@ pub(crate) fn op_relay_broadcast(
             full.append_batch(src, 0, src.count);
         }
     }
-    // Clone to every worker; the last destination takes ownership of `full`.
-    let mut out: Vec<Batch> = (1..num_workers).map(|_| full.clone_batch()).collect();
-    out.push(full);
-    out
+    full
 }
 
 // ---------------------------------------------------------------------------
@@ -407,7 +401,9 @@ pub(crate) fn op_relay_broadcast(
 mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-    use crate::test_support::{make_batch, make_schema_u64_i64, make_wide_batch, opk_pk, wide_pk_3xu64_schema};
+    use crate::test_support::{
+        make_batch, make_schema_u128_i64, make_schema_u64_i64, make_wide_batch, opk_pk, wide_pk_3xu64_schema,
+    };
 
     #[test]
     #[should_panic(expected = "source index must fit in u8")]
@@ -417,16 +413,6 @@ mod tests {
         let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
         let sources: Vec<Option<&Batch>> = vec![None; 257];
         let _ = op_repartition_batches_mode(&sources, &[0], &[], &schema, 4, RouteMode::GroupKey);
-    }
-
-    fn make_schema_u128_i64() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U128, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        )
     }
 
     fn make_schema_u64_string() -> SchemaDescriptor {

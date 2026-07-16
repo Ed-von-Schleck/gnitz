@@ -2,28 +2,23 @@
 //!
 //! Emission constructs `Instr` literals directly (there is deliberately no
 //! per-opcode constructor mirror); the builder's job is interning the shared
-//! resources those instructions index — funcs, tables, schemas, and the
-//! agg/group/reindex column pools — and assembling the final `Program`.
+//! resources those instructions index — funcs, tables, and the reindex column
+//! pools — and assembling the final `Program`.
 
 use super::*;
 use crate::expr::ScalarFunc;
-use crate::ops::AggDescriptor;
-use crate::schema::SchemaDescriptor;
 use crate::storage::Table;
 
 pub(crate) struct ProgramBuilder {
     instructions: Vec<Instr>,
     funcs: Vec<*const ScalarFunc>,
     tables: Vec<*mut Table>,
-    schemas: Vec<SchemaDescriptor>,
-    agg_descs: Vec<AggDescriptor>,
-    group_cols: Vec<u32>,
     reindex_cols: Vec<u32>,
     /// Parallel to `reindex_cols`: per-column carried promotion target tc
     /// (`0` = derive from source). Sliced alongside `reindex_cols` for `op_map`.
     reindex_target_tcs: Vec<u8>,
     reduce_plans: Vec<crate::ops::ReducePlan>,
-    avi_extractors: Vec<crate::ops::GroupKeyExtractor>,
+    avi_bakes: Vec<crate::ops::AviBake>,
 }
 
 // SAFETY: Same justification as Program — single-thread access, stable pointers.
@@ -35,13 +30,10 @@ impl ProgramBuilder {
             instructions: Vec::with_capacity(16),
             funcs: Vec::new(),
             tables: Vec::new(),
-            schemas: Vec::new(),
-            agg_descs: Vec::new(),
-            group_cols: Vec::new(),
             reindex_cols: Vec::new(),
             reindex_target_tcs: Vec::new(),
             reduce_plans: Vec::new(),
-            avi_extractors: Vec::new(),
+            avi_bakes: Vec::new(),
         }
     }
 
@@ -82,27 +74,6 @@ impl ProgramBuilder {
         idx
     }
 
-    pub fn schema_idx(&mut self, desc: SchemaDescriptor) -> u16 {
-        if let Some(i) = self.schemas.iter().position(|s| s == &desc) {
-            return i as u16;
-        }
-        let idx = self.schemas.len() as u16;
-        self.schemas.push(desc);
-        idx
-    }
-
-    pub fn add_agg_descs(&mut self, descs: &[AggDescriptor]) -> (u32, u16) {
-        let offset = self.agg_descs.len() as u32;
-        self.agg_descs.extend_from_slice(descs);
-        (offset, descs.len() as u16)
-    }
-
-    pub fn add_group_cols(&mut self, cols: &[u32]) -> (u32, u16) {
-        let offset = self.group_cols.len() as u32;
-        self.group_cols.extend_from_slice(cols);
-        (offset, cols.len() as u16)
-    }
-
     /// Store a baked reduce plan, returning its `Instr::Reduce::plan_idx`.
     pub fn add_reduce_plan(&mut self, plan: crate::ops::ReducePlan) -> u16 {
         let idx = self.reduce_plans.len() as u16;
@@ -110,11 +81,11 @@ impl ProgramBuilder {
         idx
     }
 
-    /// Store a baked AVI write-side group-key extractor, returning its
-    /// `IntegrateAvi::extractor_idx`.
-    pub fn add_avi_extractor(&mut self, extractor: crate::ops::GroupKeyExtractor) -> u16 {
-        let idx = self.avi_extractors.len() as u16;
-        self.avi_extractors.push(extractor);
+    /// Store the baked AVI write-side resources, returning
+    /// `IntegrateAvi::bake_idx`.
+    pub fn add_avi_bake(&mut self, bake: crate::ops::AviBake) -> u16 {
+        let idx = self.avi_bakes.len() as u16;
+        self.avi_bakes.push(bake);
         idx
     }
 
@@ -167,13 +138,10 @@ impl ProgramBuilder {
             reg_meta,
             funcs: self.funcs,
             tables: self.tables,
-            schemas: self.schemas,
-            agg_descs: self.agg_descs,
-            group_cols: self.group_cols,
             reindex_cols: self.reindex_cols,
             reindex_target_tcs: self.reindex_target_tcs,
             reduce_plans: self.reduce_plans,
-            avi_extractors: self.avi_extractors,
+            avi_bakes: self.avi_bakes,
         };
 
         let num_owned = owned_trace_regs.len();

@@ -1,5 +1,7 @@
 //! Column type codes and the typed `TypeCode` enum.
 
+use core::cmp::Ordering;
+
 #[allow(dead_code)]
 pub mod type_code {
     pub const U8: u8 = 1;
@@ -175,6 +177,52 @@ impl TypeCode {
     #[inline]
     pub fn carried_reindex_tc(self, common: TypeCode) -> u8 {
         carried_reindex_tc(self as u8, common as u8)
+    }
+}
+
+/// Compare two equal-length little-endian byte windows of a fixed-width column
+/// under the given raw `u8` type code: unsigned magnitude for U8–U64/U128/UUID,
+/// signed two's-complement for I8–I64/I128 (the `_ =>` default, covering any
+/// unknown code), and `total_cmp` for F32/F64. STRING/BLOB are not handled here
+/// — callers must dispatch German strings to content comparison first; a
+/// mis-routed 16-byte string window hits the width `unreachable!` rather than
+/// silently mis-comparing.
+#[inline]
+pub fn cmp_typed_le(a: &[u8], b: &[u8], tc: u8) -> Ordering {
+    debug_assert_eq!(a.len(), b.len(), "cmp_typed_le: windows must be equal length");
+    #[inline]
+    fn le_unsigned(b: &[u8]) -> u64 {
+        match b.len() {
+            1 => b[0] as u64,
+            2 => u16::from_le_bytes(b.try_into().unwrap()) as u64,
+            4 => u32::from_le_bytes(b.try_into().unwrap()) as u64,
+            8 => u64::from_le_bytes(b.try_into().unwrap()),
+            n => unreachable!("cmp_typed_le: unexpected unsigned window width {n}"),
+        }
+    }
+    #[inline]
+    fn le_signed(b: &[u8]) -> i64 {
+        match b.len() {
+            1 => b[0] as i8 as i64,
+            2 => i16::from_le_bytes(b.try_into().unwrap()) as i64,
+            4 => i32::from_le_bytes(b.try_into().unwrap()) as i64,
+            8 => i64::from_le_bytes(b.try_into().unwrap()),
+            n => unreachable!("cmp_typed_le: unexpected signed window width {n}"),
+        }
+    }
+    match tc {
+        type_code::U128 | type_code::UUID => {
+            u128::from_le_bytes(a.try_into().unwrap()).cmp(&u128::from_le_bytes(b.try_into().unwrap()))
+        }
+        type_code::I128 => i128::from_le_bytes(a.try_into().unwrap()).cmp(&i128::from_le_bytes(b.try_into().unwrap())),
+        type_code::F64 => {
+            f64::from_le_bytes(a.try_into().unwrap()).total_cmp(&f64::from_le_bytes(b.try_into().unwrap()))
+        }
+        type_code::F32 => {
+            f32::from_le_bytes(a.try_into().unwrap()).total_cmp(&f32::from_le_bytes(b.try_into().unwrap()))
+        }
+        type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64 => le_unsigned(a).cmp(&le_unsigned(b)),
+        _ => le_signed(a).cmp(&le_signed(b)), // I8/I16/I32/I64
     }
 }
 
@@ -823,6 +871,82 @@ mod tests {
         ] {
             assert!(FixedInt::from_type_code(tc).is_none(), "{tc:?} should be None");
         }
+    }
+
+    #[test]
+    fn cmp_typed_le_unsigned_and_signed_widths() {
+        use core::cmp::Ordering;
+        use type_code as tc;
+        // Unsigned: plain magnitude order.
+        assert_eq!(cmp_typed_le(&[1u8], &[2u8], tc::U8), Ordering::Less);
+        assert_eq!(
+            cmp_typed_le(&256u16.to_le_bytes(), &1u16.to_le_bytes(), tc::U16),
+            Ordering::Greater,
+            "multi-byte LE: 256 > 1 (guards a byte-swapped or first-byte-only compare)"
+        );
+        // Signed: negatives sort below non-negatives at every width.
+        assert_eq!(
+            cmp_typed_le(&(-1i8 as u8).to_le_bytes(), &0u8.to_le_bytes(), tc::I8),
+            Ordering::Less
+        );
+        assert_eq!(
+            cmp_typed_le(&(-5i32).to_le_bytes(), &5i32.to_le_bytes(), tc::I32),
+            Ordering::Less
+        );
+        assert_eq!(
+            cmp_typed_le(&i64::MIN.to_le_bytes(), &i64::MAX.to_le_bytes(), tc::I64),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn cmp_typed_le_u64_high_bit_sorts_last() {
+        use core::cmp::Ordering;
+        // The decode_le_i64 trap: `u64::MAX` must sort GREATER than 0, not first.
+        assert_eq!(
+            cmp_typed_le(&u64::MAX.to_le_bytes(), &0u64.to_le_bytes(), type_code::U64),
+            Ordering::Greater
+        );
+        assert_eq!(
+            cmp_typed_le(&u64::MAX.to_le_bytes(), &1u64.to_le_bytes(), type_code::U64),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn cmp_typed_le_floats_total_cmp() {
+        use core::cmp::Ordering;
+        // total_cmp: -0.0 < +0.0, and NaN is ordered (does not collapse to Equal).
+        assert_eq!(
+            cmp_typed_le(&(-0.0f64).to_le_bytes(), &0.0f64.to_le_bytes(), type_code::F64),
+            Ordering::Less
+        );
+        assert_eq!(
+            cmp_typed_le(&f64::NAN.to_le_bytes(), &f64::INFINITY.to_le_bytes(), type_code::F64),
+            Ordering::Greater
+        );
+        assert_eq!(
+            cmp_typed_le(&1.5f32.to_le_bytes(), &2.5f32.to_le_bytes(), type_code::F32),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn cmp_typed_le_wide_ints() {
+        use core::cmp::Ordering;
+        assert_eq!(
+            cmp_typed_le(&1u128.to_le_bytes(), &2u128.to_le_bytes(), type_code::U128),
+            Ordering::Less
+        );
+        assert_eq!(
+            cmp_typed_le(&u128::MAX.to_le_bytes(), &0u128.to_le_bytes(), type_code::UUID),
+            Ordering::Greater
+        );
+        // I128 signed: a negative sorts below zero.
+        assert_eq!(
+            cmp_typed_le(&(-1i128).to_le_bytes(), &0i128.to_le_bytes(), type_code::I128),
+            Ordering::Less
+        );
     }
 
     #[test]

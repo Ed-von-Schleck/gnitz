@@ -70,37 +70,11 @@ mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::Layout;
-
-    fn make_u64_i64_schema() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        )
-    }
-
-    /// Build a consolidated Batch from (pk, weight, payload) triples.
-    /// Assumes triples are already sorted by pk with no duplicate (pk, payload) pairs.
-    fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
-        let n = rows.len();
-        let mut b = Batch::with_schema(*schema, n.max(1));
-
-        for &(pk, w, val) in rows {
-            b.extend_pk(pk as u128);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &val.to_le_bytes());
-            b.count += 1;
-        }
-
-        b.into_consolidated(schema)
-    }
+    use crate::test_support::{make_batch, make_schema_u64_i64};
 
     #[test]
     fn owned_batch_roundtrip() {
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let batch = make_batch(&schema, &[(10, 1, 100), (20, 1, 200)]);
         assert_eq!(batch.count, 2);
         assert_eq!(batch.get_pk(0), 10);
@@ -114,7 +88,7 @@ mod tests {
 
     #[test]
     fn memtable_upsert_and_snapshot() {
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut mt = MemTable::new(schema, 1 << 20);
         assert!(mt.is_empty());
 
@@ -137,7 +111,7 @@ mod tests {
     /// path produces a fresh allocation.
     #[test]
     fn consolidate_for_flush_singleton_returns_existing_run() {
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut mt = MemTable::new(schema, 1 << 20);
 
         let b1 = make_batch(&schema, &[(10, 1, 100), (20, 1, 200)]);
@@ -190,7 +164,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "flagged consolidated")]
     fn memtable_lying_sorted_run_rejected_at_flush() {
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut mt = MemTable::new(schema, 1 << 20);
         mt.upsert_sorted_batch(make_batch(&schema, &[(5, 1, 50)]));
 
@@ -206,7 +180,7 @@ mod tests {
     /// ingress strip leaves every client batch) sort+consolidate without panic.
     #[test]
     fn memtable_cleared_flags_unsorted_run_consolidates_ok() {
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut mt = MemTable::new(schema, 1 << 20);
         mt.upsert_sorted_batch(make_batch(&schema, &[(5, 1, 50)]));
 
@@ -222,7 +196,7 @@ mod tests {
 
     #[test]
     fn memtable_lookup_pk() {
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut mt = MemTable::new(schema, 1 << 20);
 
         let b1 = make_batch(&schema, &[(10, 1, 100), (20, 1, 200), (30, 1, 300)]);
@@ -242,7 +216,7 @@ mod tests {
 
     #[test]
     fn memtable_bloom() {
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut mt = MemTable::new(schema, 1 << 20);
 
         let b1 = make_batch(&schema, &[(10, 1, 100), (20, 1, 200)]);
@@ -255,7 +229,7 @@ mod tests {
 
     #[test]
     fn memtable_reset() {
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut mt = MemTable::new(schema, 1 << 20);
         let b1 = make_batch(&schema, &[(10, 1, 100)]);
         mt.upsert_sorted_batch(b1);
@@ -272,7 +246,7 @@ mod tests {
     /// alive across `reset()`.  This is the cursor-lifetime contract.
     #[test]
     fn snapshot_survives_reset() {
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut mt = MemTable::new(schema, 1 << 20);
         let b1 = make_batch(&schema, &[(10, 1, 100)]);
         mt.upsert_sorted_batch(b1);
@@ -290,7 +264,7 @@ mod tests {
 
     #[test]
     fn batch_append_batch() {
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let src = make_batch(&schema, &[(10, 1, 100), (20, 1, 200), (30, 1, 300)]);
         let mut dst = Batch::with_schema(schema, 8);
 
@@ -310,7 +284,7 @@ mod tests {
 
     #[test]
     fn batch_append_batch_negated() {
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let src = make_batch(&schema, &[(10, 1, 100), (20, 2, 200)]);
         let mut dst = Batch::with_schema(schema, 8);
 
@@ -325,7 +299,7 @@ mod tests {
     fn batch_append_batch_from_empty_exceeds_initial_capacity() {
         // Regression: bulk append into an empty_with_schema() batch must not
         // spin when n >> initial capacity (which is 0).
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let rows: Vec<(u64, i64, i64)> = (1u64..=200).map(|i| (i, 1i64, (i * 10) as i64)).collect();
         let src = make_batch(&schema, &rows);
 
@@ -341,7 +315,7 @@ mod tests {
 
     #[test]
     fn batch_region_access() {
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let batch = make_batch(&schema, &[(10, 1, 100)]);
 
         // Schema has 2 columns: PK (U64) + payload (I64)
@@ -354,7 +328,7 @@ mod tests {
 
     #[test]
     fn batch_clear() {
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut batch = make_batch(&schema, &[(10, 1, 100)]);
         assert_eq!(batch.count, 1);
 
@@ -748,7 +722,7 @@ mod tests {
 
     #[test]
     fn test_inline_consolidate_basic() {
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut mt = MemTable::new(schema, 1 << 20);
 
         // Push 15 batches — no consolidation yet
@@ -771,7 +745,7 @@ mod tests {
 
     #[test]
     fn test_inline_consolidate_ghost_elimination() {
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut mt = MemTable::new(schema, 1 << 20);
 
         // 14 distinct insertions
@@ -796,7 +770,7 @@ mod tests {
 
     #[test]
     fn test_inline_consolidate_all_cancelled() {
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut mt = MemTable::new(schema, 1 << 20);
 
         // 8 insertions + 8 matching retractions = 16 batches
@@ -819,7 +793,7 @@ mod tests {
 
     #[test]
     fn test_inline_consolidate_below_threshold() {
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut mt = MemTable::new(schema, 1 << 20);
 
         for i in 0..15u64 {
@@ -835,7 +809,7 @@ mod tests {
 
     #[test]
     fn test_inline_consolidate_repeated() {
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let mut mt = MemTable::new(schema, 1 << 20);
 
         // First 16 → consolidation fires → 1 run
@@ -863,7 +837,7 @@ mod tests {
 
     #[test]
     fn test_inline_consolidate_should_flush() {
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         // Each 1-row batch = 32 bytes (U64 PK=8, weight=8, null=8, col=8).
         // max_bytes = 560 → threshold = 420.
         // After 14 insertions: runs_bytes = 448 > 420 → should_flush true.
@@ -974,7 +948,7 @@ mod tests {
         // Drain pool first.
         while acquire_buf().capacity() > 0 {}
 
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
         let data_cap = batch.data_capacity();
         assert!(data_cap > 0);
@@ -1005,7 +979,7 @@ mod tests {
         use crate::storage::batch_pool::acquire_buf;
         while acquire_buf().capacity() > 0 {}
 
-        let schema = make_u64_i64_schema();
+        let schema = make_schema_u64_i64();
         let batch = make_batch(&schema, &[(1, 1, 10)]);
         let cloned = batch.clone();
         drop(batch);

@@ -288,7 +288,7 @@ fn unix_and_tls_clients_share_a_table() {
 fn wire_version_mismatch_hello_gets_status_error() {
     let Some(srv) = ServerHandle::start_tls(1) else { return };
     let mut t = ClientTransport::connect(&srv.tls_target()).unwrap();
-    let payload = gnitz_wire::encode_hello_payload(gnitz_wire::WAL_FORMAT_VERSION as u16 + 1, 0);
+    let payload = gnitz_wire::encode_hello_payload(gnitz_wire::WAL_FORMAT_VERSION as u16 + 1);
     t.send_framed(&payload).unwrap();
     let buf = t.recv_framed(gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
     let msg = parse_response(&buf, None).unwrap();

@@ -19,13 +19,13 @@ pub use header::{
     STATUS_TXN_CONFLICT, WAL_BLOCK_HEADER_SIZE,
 };
 pub use message::{
-    decode_control_block, encode_control_block, encode_ddl_txn, encode_message, encode_message_noschema_parts,
-    encode_message_parts, encode_push_txn, encode_scan_multi, encode_schema_block, parse_response, recv_message,
-    send_message, send_message_noschema, send_message_with_extra, Message, MessageParts,
+    decode_control_block, encode_control_block, encode_ddl_txn, encode_message_noschema_parts, encode_message_parts,
+    encode_push_txn, encode_scan_multi, encode_schema_block, parse_response, recv_message, send_message,
+    send_message_with_extra, Message, MessageParts,
 };
 pub use transport::{hello_handshake, ClientTransport, FrameSegments, TransportWaker, FRAME_SEGMENTS};
 pub use types::{
-    meta_schema, BatchAppender, ColData, ColumnDef, FixedInt, PkColumn, PkTuple, Schema, TypeCode, ZSetBatch,
-    MAX_PK_BYTES, MAX_PK_COLUMNS, PK_LIST_MAX_COLS,
+    meta_schema, null_word_get, null_word_set, BatchAppender, ColData, ColumnDef, FixedInt, PkColumn, PkTuple, Schema,
+    TypeCode, ZSetBatch, MAX_PK_BYTES, MAX_PK_COLUMNS, PK_LIST_MAX_COLS,
 };
 pub use wal_block::{decode_wal_block, decode_wal_block_verified, encode_wal_block};

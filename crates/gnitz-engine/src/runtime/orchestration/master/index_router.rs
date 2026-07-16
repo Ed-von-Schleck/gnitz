@@ -120,32 +120,7 @@ pub(super) fn index_route_key(schema: &SchemaDescriptor, col_idx: u32, native: u
 mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn};
-    use crate::storage::Layout; // make_batch certifies its layout
-
-    fn make_schema_u64_i64() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        )
-    }
-
-    fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
-        let n = rows.len();
-        let mut b = Batch::with_schema(*schema, n.max(1));
-
-        for &(pk, w, val) in rows {
-            b.extend_pk(pk as u128);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &val.to_le_bytes());
-            b.count += 1;
-        }
-        b.certify_layout(Layout::Consolidated, schema);
-        b
-    }
+    use crate::test_support::{make_batch, make_schema_u64_i64};
 
     #[test]
     fn partition_router_basic() {

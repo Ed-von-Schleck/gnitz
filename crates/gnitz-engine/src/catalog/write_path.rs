@@ -307,9 +307,7 @@ impl CatalogEngine {
                 }
                 TABLE_TAB_ID => {
                     let tid = batch.get_pk(i) as i64;
-                    let sid = batch.read_payload_u64(i, TABTAB_PAY_SCHEMA_ID) as i64;
-                    let name = batch.read_payload_string(i, TABTAB_PAY_NAME);
-                    let pk = unpack_pk_cols(batch.read_payload_u64(i, TABTAB_PAY_PK_COL_IDX));
+                    let (sid, name, pk, _flags) = read_table_tab_row(batch, i);
 
                     // Collect ColumnDefs, rejecting any gap/duplicate in the
                     // column-index sequence (would mismap columns downstream).
@@ -326,9 +324,7 @@ impl CatalogEngine {
                 }
                 VIEW_TAB_ID => {
                     let vid = batch.get_pk(i) as i64;
-                    let sid = batch.read_payload_u64(i, VIEWTAB_PAY_SCHEMA_ID) as i64;
-                    let name = batch.read_payload_string(i, VIEWTAB_PAY_NAME);
-                    let pk = unpack_pk_cols(batch.read_payload_u64(i, VIEWTAB_PAY_PK_COL_IDX));
+                    let (sid, name, pk) = read_view_tab_row(batch, i);
 
                     // Reject any gap/duplicate in the column-index sequence.
                     // Rejecting here — before apply_entity_caches mutates the
@@ -340,11 +336,7 @@ impl CatalogEngine {
                     self.precheck_qname_unique(sid, &name, vid)?;
                 }
                 IDX_TAB_ID => {
-                    let owner_id = batch.read_payload_u64(i, IDXTAB_PAY_OWNER_ID) as i64;
-                    // source_cols carries pack_pk_cols(&col_indices); decode and
-                    // validate each column (a single-column index is the 1-element
-                    // degenerate case).
-                    let cols = gnitz_wire::unpack_pk_cols(batch.read_payload_u64(i, IDXTAB_PAY_SOURCE_COLS));
+                    let (owner_id, cols, _is_unique) = read_idx_tab_row(batch, i);
                     let index_name = batch.read_payload_string(i, IDXTAB_PAY_NAME);
                     let entry = self.validate_index_registration(owner_id, &cols)?;
 

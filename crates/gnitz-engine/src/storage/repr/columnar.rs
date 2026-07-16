@@ -3,11 +3,8 @@
 use std::cmp::Ordering;
 
 use crate::schema::{
-    compare_german_strings, read_signed, read_unsigned,
-    type_code::{
-        BLOB as TYPE_BLOB, F32 as TYPE_F32, F64 as TYPE_F64, I128 as TYPE_I128, STRING as TYPE_STRING,
-        U128 as TYPE_U128, U16 as TYPE_U16, U32 as TYPE_U32, U64 as TYPE_U64, U8 as TYPE_U8, UUID as TYPE_UUID,
-    },
+    compare_german_strings,
+    type_code::{BLOB as TYPE_BLOB, STRING as TYPE_STRING},
     SchemaDescriptor,
 };
 
@@ -77,23 +74,11 @@ pub(crate) fn compare_rows<A: ColumnarSource, B: ColumnarSource>(
 /// Compare two equal-length little-endian byte windows of a fixed-width column
 /// under the given raw `u8` type code. STRING/BLOB are not handled here — callers
 /// requiring them must dispatch German strings first (see [`cmp_col_window`]); a
-/// mis-routed 16-byte string window hits `read_signed`'s `unreachable!` rather than
+/// mis-routed 16-byte string window hits a width `unreachable!` rather than
 /// silently mis-comparing.
 #[inline]
 fn cmp_typed_le(a: &[u8], b: &[u8], type_code: u8) -> Ordering {
-    debug_assert_eq!(a.len(), b.len(), "cmp_typed_le: windows must be equal length");
-    match type_code {
-        TYPE_U128 | TYPE_UUID => {
-            u128::from_le_bytes(a.try_into().unwrap()).cmp(&u128::from_le_bytes(b.try_into().unwrap()))
-        }
-        // I128 payload (a cross-sign `_join_pk` surfaced into a payload slot) is
-        // stored native-LE and compares as a signed two's-complement value.
-        TYPE_I128 => i128::from_le_bytes(a.try_into().unwrap()).cmp(&i128::from_le_bytes(b.try_into().unwrap())),
-        TYPE_F64 => f64::from_le_bytes(a.try_into().unwrap()).total_cmp(&f64::from_le_bytes(b.try_into().unwrap())),
-        TYPE_F32 => f32::from_le_bytes(a.try_into().unwrap()).total_cmp(&f32::from_le_bytes(b.try_into().unwrap())),
-        TYPE_U8 | TYPE_U16 | TYPE_U32 | TYPE_U64 => read_unsigned(a, a.len()).cmp(&read_unsigned(b, b.len())),
-        _ => read_signed(a, a.len()).cmp(&read_signed(b, b.len())), // I8/I16/I32/I64
-    }
+    gnitz_wire::cmp_typed_le(a, b, type_code)
 }
 
 /// Compare two equal-width column windows of the given raw `u8` type code,
@@ -653,35 +638,25 @@ mod tests {
     /// Build a German string struct (len > SHORT_STRING_THRESHOLD) with its heap blob.
     fn make_long_string(data: &[u8]) -> ([u8; 16], Vec<u8>) {
         assert!(data.len() > SHORT_STRING_THRESHOLD);
-        let mut s = [0u8; 16];
-        s[0..4].copy_from_slice(&(data.len() as u32).to_le_bytes());
-        s[4..8].copy_from_slice(&data[0..4]); // prefix
-        s[8..16].copy_from_slice(&0u64.to_le_bytes()); // heap_offset = 0
-        (s, data.to_vec())
+        let mut blob = Vec::new();
+        let s = crate::schema::encode_german_string(data, &mut blob);
+        (s, blob)
     }
 
     #[test]
     fn test_german_string_short() {
-        let mut a = [0u8; 16];
-        let mut b = [0u8; 16];
+        let mut blob = Vec::new();
+        let a = crate::schema::encode_german_string(b"abc", &mut blob);
         // "abc" < "abd"
-        a[0..4].copy_from_slice(&3u32.to_le_bytes());
-        a[4] = b'a';
-        a[5] = b'b';
-        a[6] = b'c';
-        b[0..4].copy_from_slice(&3u32.to_le_bytes());
-        b[4] = b'a';
-        b[5] = b'b';
-        b[6] = b'd';
+        let b = crate::schema::encode_german_string(b"abd", &mut blob);
         assert_eq!(compare_german_strings(&a, &[], &b, &[]), Ordering::Less);
 
         // Equal
-        b[6] = b'c';
+        let b = crate::schema::encode_german_string(b"abc", &mut blob);
         assert_eq!(compare_german_strings(&a, &[], &b, &[]), Ordering::Equal);
 
         // Shorter < longer with same prefix: "abc" < "abcz"
-        b[0..4].copy_from_slice(&4u32.to_le_bytes());
-        b[7] = b'z';
+        let b = crate::schema::encode_german_string(b"abcz", &mut blob);
         assert_eq!(compare_german_strings(&a, &[], &b, &[]), Ordering::Less);
     }
 

@@ -6,7 +6,7 @@
 //! the bundle mechanics and the row-order-independent backfill are exercised on
 //! their own.
 //!
-//! Each segment is a minimal `input_delta → shard → gather → sink` identity view.
+//! Each segment is a minimal `input_delta → shard → sink` identity view.
 //! The `ExchangeShard` node makes `view_seeds_exchange_backfill` true, so every
 //! segment takes the *distributed* backfill tail — the path the dependency-order
 //! sort governs. A downstream segment reads an upstream segment's store, so a
@@ -21,14 +21,13 @@ mod common;
 use common::*;
 
 /// A minimal exchange-seeding identity view over `source_id`, keyed on PK col 0:
-/// `input_delta → shard([0]) → gather → sink`. `view_id` is pre-set so a
+/// `input_delta → shard([0]) → sink`. `view_id` is pre-set so a
 /// downstream segment can `ScanDelta` it.
 fn identity_exchange_circuit(view_id: u64, source_id: u64) -> gnitz_core::Circuit {
     let mut cb = CircuitBuilder::new(view_id, source_id);
     let inp = cb.input_delta();
     let sh = cb.shard(inp, &[0]);
-    let g = cb.gather(sh);
-    cb.sink(g);
+    cb.sink(sh);
     cb.build()
 }
 

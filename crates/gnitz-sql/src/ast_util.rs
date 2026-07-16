@@ -38,6 +38,24 @@ pub(crate) fn group_by_is_present(group_by: &sqlparser::ast::GroupByExpr) -> boo
     }
 }
 
+/// Parse `e` as a non-negative integer literal, or error. The single accept
+/// rule for the count-shaped clause positions — LIMIT, OFFSET, an ORDER BY
+/// position — where anything else (an expression like `1+1`, a string, an
+/// out-of-range number) must be a clean error: silently degrading a LIMIT
+/// returns every row. `what` names the clause for the message.
+pub(crate) fn expr_usize_literal(e: &sqlparser::ast::Expr, what: &str) -> Result<usize, GnitzSqlError> {
+    if let sqlparser::ast::Expr::Value(vws) = e {
+        if let sqlparser::ast::Value::Number(n, _) = &vws.value {
+            return n.parse::<usize>().map_err(|_| {
+                GnitzSqlError::Unsupported(format!("{what} must be a non-negative integer literal, got '{n}'"))
+            });
+        }
+    }
+    Err(GnitzSqlError::Unsupported(format!(
+        "{what} must be an integer literal, not an expression"
+    )))
+}
+
 /// The bare name of an unqualified single-part function call, or `None` for a
 /// qualified (`schema.fn`) name.
 pub(crate) fn single_fn_name(f: &sqlparser::ast::Function) -> Option<&str> {
@@ -587,8 +605,14 @@ impl<'a> WildcardRewrite<'a> {
             drop.extend(e.additional_elements.iter().map(|i| i.value.as_str()));
         }
         match &o.opt_exclude {
-            Some(ExcludeSelectItem::Single(i)) => drop.push(i.value.as_str()),
-            Some(ExcludeSelectItem::Multiple(v)) => drop.extend(v.iter().map(|i| i.value.as_str())),
+            // `EXCLUDE` columns parse as `ObjectName`s (sqlparser 0.62); take each
+            // one's bare identifier — a non-identifier part cannot name a column,
+            // so it drops out of the exclude set.
+            Some(ExcludeSelectItem::Single(i)) => drop.extend(object_name_ident(i).map(|id| id.value.as_str())),
+            Some(ExcludeSelectItem::Multiple(v)) => drop.extend(
+                v.iter()
+                    .filter_map(|i| object_name_ident(i).map(|id| id.value.as_str())),
+            ),
             None => {}
         }
         let mut rename = Vec::new();

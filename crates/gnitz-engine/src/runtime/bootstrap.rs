@@ -661,11 +661,6 @@ pub fn server_main(
     }
 
     // Reset SAL for fresh use (all workers have recovered)
-    use std::sync::atomic::{AtomicU64, Ordering};
-    unsafe {
-        let atomic = &*(sal_ptr as *const AtomicU64);
-        atomic.store(0, Ordering::Release);
-    }
     dispatcher.reset_sal();
 
     inject_recovery_panic("reset");

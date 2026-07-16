@@ -46,8 +46,8 @@ fn assert_ambiguous(r: Result<Vec<gnitz_sql::SqlResult>, GnitzSqlError>) {
 
 // ── ambiguity errors ─────────────────────────────────────────────────────────
 
-/// Direct SELECT projection — `apply_projection` (§5.2). `id` resolves to both
-/// `l.id` and `r.id`.
+/// Direct SELECT projection — `resolve_projection` via the ordering sink. `id`
+/// resolves to both `l.id` and `r.id`.
 #[test]
 fn test_direct_select_ambiguous_projection() {
     let srv = match ServerHandle::start() {
