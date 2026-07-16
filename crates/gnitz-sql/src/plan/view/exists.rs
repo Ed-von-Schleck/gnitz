@@ -172,30 +172,31 @@ fn resolve_correlation<'a>(
     let (outer_tid, outer_schema, outer_alias) = outer;
 
     // ── Subquery envelope ────────────────────────────────────────────────────
-    // For IN, `in_operand` carries the outer operand expression.
-    let (body, node_negated, in_operand) = match subq {
-        Expr::Exists { subquery, negated } => {
-            reject_unhonored_query_clauses(
-                subquery,
-                HonoredQueryClauses {
-                    with: false,
-                    limit: false,
-                },
-                "EXISTS subquery",
-            )?;
-            (subquery.body.as_ref(), *negated, None)
-        }
+    // For IN, `in_operand` carries the outer operand expression. Both node kinds
+    // carry a full `Query` (`InSubquery` since sqlparser 0.60), so one shared
+    // guard rejects the envelope (LIMIT / ORDER BY / WITH / …).
+    let (subquery, ctx, node_negated, in_operand) = match subq {
+        Expr::Exists { subquery, negated } => (subquery, "EXISTS subquery", *negated, None),
         Expr::InSubquery {
             expr,
             subquery,
             negated,
-        } => (subquery.as_ref(), *negated, Some(expr.as_ref())),
+        } => (subquery, "IN subquery", *negated, Some(expr.as_ref())),
         other => {
             return Err(GnitzSqlError::Plan(format!(
                 "exists builder dispatched on a non-subquery conjunct: {other:?}"
             )))
         }
     };
+    reject_unhonored_query_clauses(
+        subquery,
+        HonoredQueryClauses {
+            with: false,
+            limit: false,
+        },
+        ctx,
+    )?;
+    let body = subquery.body.as_ref();
     let inner_select = match body {
         SetExpr::Select(s) => s.as_ref(),
         _ => {

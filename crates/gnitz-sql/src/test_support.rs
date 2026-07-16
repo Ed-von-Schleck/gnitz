@@ -4,8 +4,7 @@
 //! compound PKs) and the literal-expression shapes can't drift between modules.
 
 use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
-use sqlparser::ast::{Expr, UnaryOperator, Value, ValueWithSpan};
-use sqlparser::tokenizer::Span;
+use sqlparser::ast::{Expr, UnaryOperator, Value};
 
 pub(crate) fn col_def(name: &str, tc: TypeCode, nullable: bool) -> ColumnDef {
     ColumnDef::new(name, tc, nullable)
@@ -74,35 +73,23 @@ pub(crate) fn compound_schema_u64_u64() -> Schema {
 
 /// An unsigned decimal literal, e.g. `42`.
 pub(crate) fn num_expr(n: &str) -> Expr {
-    Expr::Value(ValueWithSpan {
-        value: Value::Number(n.into(), false),
-        span: Span::empty(),
-    })
+    Expr::value(Value::Number(n.into(), false))
 }
 
 /// A negated decimal literal, e.g. `-1` (a `UnaryOp(Minus)` over a number).
 pub(crate) fn neg_num_expr(n: &str) -> Expr {
     Expr::UnaryOp {
         op: UnaryOperator::Minus,
-        expr: Box::new(Expr::Value(ValueWithSpan {
-            value: Value::Number(n.into(), false),
-            span: Span::empty(),
-        })),
+        expr: Box::new(num_expr(n)),
     }
 }
 
 /// A single-quoted string literal (a valid UUID seek key).
 pub(crate) fn uuid_str_expr(s: &str) -> Expr {
-    Expr::Value(ValueWithSpan {
-        value: Value::SingleQuotedString(s.into()),
-        span: Span::empty(),
-    })
+    Expr::value(Value::SingleQuotedString(s.into()))
 }
 
 /// A double-quoted token — an identifier in `GenericDialect`, never a literal.
 pub(crate) fn dquote_expr(s: &str) -> Expr {
-    Expr::Value(ValueWithSpan {
-        value: Value::DoubleQuotedString(s.into()),
-        span: Span::empty(),
-    })
+    Expr::value(Value::DoubleQuotedString(s.into()))
 }

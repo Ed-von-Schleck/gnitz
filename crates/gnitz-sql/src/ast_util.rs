@@ -3,11 +3,16 @@ use crate::ir::AggFunc;
 use gnitz_core::ColumnDef;
 use sqlparser::ast::{ExcludeSelectItem, RenameSelectItem, SelectItem, WildcardAdditionalOptions};
 
+/// The identifier of an `ObjectName`'s last part, or `None` when that part is
+/// not a plain identifier. The single ObjectName→ident unwrap behind
+/// [`extract_name`], the INSERT column list, and SERIAL recognition.
+pub(crate) fn object_name_ident(name: &sqlparser::ast::ObjectName) -> Option<&sqlparser::ast::Ident> {
+    name.0.last().and_then(|p| p.as_ident())
+}
+
 /// Extract the last identifier name from an ObjectName.
 pub(crate) fn extract_name(name: &sqlparser::ast::ObjectName, context: &str) -> Result<String, GnitzSqlError> {
-    name.0
-        .last()
-        .and_then(|p| p.as_ident())
+    object_name_ident(name)
         .map(|i| i.value.clone())
         .ok_or_else(|| GnitzSqlError::Bind(format!("empty name in {context}")))
 }
@@ -82,13 +87,12 @@ pub(crate) fn body_is_grouped(select: &sqlparser::ast::Select) -> bool {
 /// instead of to the scalar `Simple` builder. The recursion mirrors the binder's
 /// `bind_structural` node set so the two agree on where an aggregate can hide.
 pub(crate) fn projection_has_aggregate(select: &sqlparser::ast::Select) -> bool {
-    use sqlparser::ast::SelectItem;
-    select.projection.iter().any(|item| match item {
-        SelectItem::UnnamedExpr(e) => expr_has_aggregate(e),
-        SelectItem::ExprWithAlias { expr, .. } => expr_has_aggregate(expr),
-        // `*` / `tbl.*` cannot be an aggregate.
-        _ => false,
-    })
+    // `*` / `tbl.*` (the `None` items) cannot be an aggregate.
+    select
+        .projection
+        .iter()
+        .filter_map(projection_item_expr)
+        .any(expr_has_aggregate)
 }
 
 /// Recursively test whether an expression contains an aggregate function call:
@@ -127,6 +131,8 @@ pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Ex
             operand,
             conditions,
             else_result,
+            case_token: _,
+            end_token: _,
         } => {
             let mut ops: Vec<&Expr> = Vec::new();
             ops.extend(operand.as_deref());
@@ -150,6 +156,67 @@ pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Ex
         },
         _ => Vec::new(),
     }
+}
+
+/// Rebuild twin of [`expr_operands`] for the purely structural nodes: apply `f`
+/// to every direct operand of a binary/unary op, parens, BETWEEN, or CASE and
+/// reassemble the node around the results; `Ok(None)` for any other node (a
+/// leaf, a subquery, a function — the caller's special arms). The expression
+/// rewriters delegate their structural recursion here so their node set cannot
+/// drift from the walkers' — a node recursed by one rewriter is recursed by all.
+pub(crate) fn map_structural_operands<E>(
+    e: &sqlparser::ast::Expr,
+    f: &mut dyn FnMut(&sqlparser::ast::Expr) -> Result<sqlparser::ast::Expr, E>,
+) -> Result<Option<sqlparser::ast::Expr>, E> {
+    use sqlparser::ast::{CaseWhen, Expr};
+    Ok(Some(match e {
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(f(left)?),
+            op: op.clone(),
+            right: Box::new(f(right)?),
+        },
+        Expr::UnaryOp { op, expr } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(f(expr)?),
+        },
+        Expr::Nested(inner) => Expr::Nested(Box::new(f(inner)?)),
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => Expr::Between {
+            expr: Box::new(f(expr)?),
+            negated: *negated,
+            low: Box::new(f(low)?),
+            high: Box::new(f(high)?),
+        },
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            case_token,
+            end_token,
+        } => {
+            let operand = operand.as_ref().map(|o| f(o).map(Box::new)).transpose()?;
+            let mut conds = Vec::with_capacity(conditions.len());
+            for cw in conditions {
+                conds.push(CaseWhen {
+                    condition: f(&cw.condition)?,
+                    result: f(&cw.result)?,
+                });
+            }
+            let else_result = else_result.as_ref().map(|er| f(er).map(Box::new)).transpose()?;
+            Expr::Case {
+                operand,
+                conditions: conds,
+                else_result,
+                case_token: case_token.clone(),
+                end_token: end_token.clone(),
+            }
+        }
+        _ => return Ok(None),
+    }))
 }
 
 /// Count the `[NOT] EXISTS` / `[NOT] IN (SELECT …)` subquery nodes anywhere in
@@ -177,7 +244,9 @@ pub(crate) fn find_subquery(e: &sqlparser::ast::Expr) -> Option<&sqlparser::ast:
 pub(crate) fn projection_item_expr(item: &sqlparser::ast::SelectItem) -> Option<&sqlparser::ast::Expr> {
     use sqlparser::ast::SelectItem;
     match item {
-        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => Some(e),
+        SelectItem::UnnamedExpr(e)
+        | SelectItem::ExprWithAlias { expr: e, .. }
+        | SelectItem::ExprWithAliases { expr: e, .. } => Some(e),
         SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => None,
     }
 }
@@ -247,16 +316,59 @@ pub(crate) fn flatten_conjuncts<'e>(expr: &'e sqlparser::ast::Expr, out: &mut Ve
 /// Extract table name from a TableFactor::Table. Strict — a derived table
 /// (subquery in FROM) is rejected; only the CREATE VIEW planner paths that
 /// pre-compile derived tables may accept one (`extract_relation_name`).
+///
+/// The one acceptance point for a base-relation FROM factor, so every semantic
+/// qualifier gnitz does not implement is rejected here (exhaustive destructure,
+/// no `..`: a future `sqlparser` field stops the build until classified) —
+/// otherwise `AS OF`, TABLESAMPLE, PARTITION, WITH ORDINALITY, or table-function
+/// arguments would be silently dropped and the plain table scanned instead.
+/// Advisory-only qualifiers (`with_hints`, `index_hints` — MySQL/T-SQL index and
+/// locking hints that cannot change the result set) are accepted as no-ops.
 pub(crate) fn extract_table_factor_name(
     tf: &sqlparser::ast::TableFactor,
     context: &str,
 ) -> Result<String, GnitzSqlError> {
-    match tf {
-        sqlparser::ast::TableFactor::Table { name, .. } => extract_name(name, context),
-        _ => Err(GnitzSqlError::Unsupported(format!(
+    let sqlparser::ast::TableFactor::Table {
+        name,
+        alias: _,       // consumed by the callers that honor aliases
+        with_hints: _,  // advisory locking hints (T-SQL WITH (NOLOCK)): no result impact
+        index_hints: _, // advisory index hints (MySQL USE/FORCE INDEX): no result impact
+        args,
+        version,
+        with_ordinality,
+        partitions,
+        json_path,
+        sample,
+    } = tf
+    else {
+        return Err(GnitzSqlError::Unsupported(format!(
             "{context}: only simple table references supported"
-        ))),
+        )));
+    };
+    let reject = |clause: &str| {
+        Err(GnitzSqlError::Unsupported(format!(
+            "{context}: {clause} is not supported"
+        )))
+    };
+    if args.is_some() {
+        return reject("a table function in FROM");
     }
+    if version.is_some() {
+        return reject("time travel (AS OF / AT)");
+    }
+    if *with_ordinality {
+        return reject("WITH ORDINALITY");
+    }
+    if !partitions.is_empty() {
+        return reject("PARTITION selection");
+    }
+    if json_path.is_some() {
+        return reject("a JSON path on a table");
+    }
+    if sample.is_some() {
+        return reject("TABLESAMPLE");
+    }
+    extract_name(name, context)
 }
 
 /// Extract the resolvable relation name of a CREATE VIEW FROM factor: a table's
@@ -354,6 +466,41 @@ pub(crate) fn function_positional_args<'f>(
             ))),
         })
         .collect()
+}
+
+/// A strictly simple identifier expression's name, or the shared
+/// "column must be a simple identifier" Bind error. Backs [`index_column_ident`]
+/// and the CLUSTER BY column list (a `Vec<Expr>` in sqlparser).
+pub(crate) fn simple_ident_expr<'a>(e: &'a sqlparser::ast::Expr, context: &str) -> Result<&'a str, GnitzSqlError> {
+    match e {
+        sqlparser::ast::Expr::Identifier(id) => Ok(&id.value),
+        _ => Err(GnitzSqlError::Bind(format!(
+            "{context}: column must be a simple identifier"
+        ))),
+    }
+}
+
+/// The bare column name of an `IndexColumn` (a PRIMARY KEY / UNIQUE constraint
+/// column or a CREATE INDEX column), which gnitz requires to be a simple
+/// identifier. Any expression, operator class, or ordering qualifier is rejected
+/// — gnitz indexes are ordered ascending by key bytes and carry no per-column
+/// ordering. Shared by the CREATE INDEX loop and the table-level PK/UNIQUE loops,
+/// all of which see `Vec<IndexColumn>` since sqlparser 0.60.
+pub(crate) fn index_column_ident<'a>(
+    c: &'a sqlparser::ast::IndexColumn,
+    context: &str,
+) -> Result<&'a str, GnitzSqlError> {
+    if c.operator_class.is_some() {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "{context}: an operator class on an index column is not supported"
+        )));
+    }
+    if c.column.options.asc.is_some() || c.column.options.nulls_first.is_some() || c.column.with_fill.is_some() {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "{context}: per-column ordering (ASC/DESC, NULLS FIRST/LAST, WITH FILL) is not supported"
+        )));
+    }
+    simple_ident_expr(&c.column.expr, context)
 }
 
 /// Bare column name of a single-relation reference: a plain `Identifier`, or a

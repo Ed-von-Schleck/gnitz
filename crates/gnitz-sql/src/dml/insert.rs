@@ -4,7 +4,7 @@
 //! The SET-list binding and evaluation reuse `mutate`'s shared helpers so a
 //! `DO UPDATE SET` assignment behaves exactly like an `UPDATE ... SET`.
 
-use crate::ast_util::extract_name;
+use crate::ast_util::{extract_name, object_name_ident};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_value_to_col, ColumnValue};
 use crate::codec::nullmap::null_word_set;
@@ -18,8 +18,8 @@ use crate::ir::BoundExpr;
 use crate::SqlResult;
 use gnitz_core::{ColData, FixedInt, GnitzClient, PkColumn, PkTuple, Schema, WireConflictMode, ZSetBatch};
 use sqlparser::ast::{
-    Assignment, ConflictTarget, Expr, Ident, OnConflict, OnConflictAction, OnInsert, Query, SelectItem, SetExpr,
-    Statement, TableObject, Values,
+    Assignment, ConflictTarget, Expr, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Parens, Query,
+    SelectItem, SetExpr, TableObject, Values,
 };
 
 /// The resolved INSERT disposition after the ON CONFLICT clause (if any) is bound.
@@ -91,11 +91,11 @@ fn validate_conflict_target(target: &Option<ConflictTarget>, schema: &Schema) ->
 pub(crate) fn execute_insert(
     client: &mut GnitzClient,
     _schema_name: &str,
-    stmt: &Statement,
+    insert: &Insert,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     // Extract table name, row source, ON CONFLICT action, and RETURNING clause.
-    let (table_name_str, rows, columns, on_insert, returning) = extract_insert_parts(stmt)?;
+    let (table_name_str, rows, columns, on_insert, returning) = extract_insert_parts(insert)?;
 
     let (tid, schema) = binder.resolve_base_table(client, &table_name_str)?;
 
@@ -471,10 +471,20 @@ fn eval_do_update_rhs(
 /// order, so an explicit column list is correct only when it names every column
 /// once, in schema order. A reordered or partial list would silently misplace
 /// values — reject it. (Full column-list remapping is a separate feature.)
-fn validate_insert_column_list(columns: &[Ident], schema: &Schema) -> Result<(), GnitzSqlError> {
+fn validate_insert_column_list(columns: &[ObjectName], schema: &Schema) -> Result<(), GnitzSqlError> {
     if columns.is_empty() {
         return Ok(());
     }
+    // Each explicit INSERT column is a simple identifier (since sqlparser 0.60 the
+    // list is `Vec<ObjectName>`); extract the bare name.
+    let col_names: Vec<&str> = columns
+        .iter()
+        .map(|c| {
+            object_name_ident(c)
+                .map(|i| i.value.as_str())
+                .ok_or_else(|| GnitzSqlError::Bind("INSERT column list: column must be a simple identifier".into()))
+        })
+        .collect::<Result<_, _>>()?;
     // Expected list = every non-SERIAL column, in schema order. For a non-SERIAL
     // table this reduces to the full column list in schema order — byte-identical
     // to the pre-SERIAL behavior, not a regression.
@@ -484,19 +494,16 @@ fn validate_insert_column_list(columns: &[Ident], schema: &Schema) -> Result<(),
         .filter(|c| !c.is_serial)
         .map(|c| c.name.as_str())
         .collect();
-    let matches = columns.len() == expected.len()
-        && columns
-            .iter()
-            .zip(&expected)
-            .all(|(c, n)| c.value.eq_ignore_ascii_case(n));
+    let matches =
+        col_names.len() == expected.len() && col_names.iter().zip(&expected).all(|(c, n)| c.eq_ignore_ascii_case(n));
     if !matches {
         // Naming the SERIAL column at all is a targeted error, since it can never
         // appear in a valid list.
-        if columns.iter().any(|c| {
+        if col_names.iter().any(|c| {
             schema
                 .columns
                 .iter()
-                .any(|sc| sc.is_serial && sc.name.eq_ignore_ascii_case(&c.value))
+                .any(|sc| sc.is_serial && sc.name.eq_ignore_ascii_case(c))
         }) {
             return Err(GnitzSqlError::Unsupported(
                 "cannot supply a value for a SERIAL column; omit it from the INSERT".to_string(),
@@ -512,47 +519,44 @@ fn validate_insert_column_list(columns: &[Ident], schema: &Schema) -> Result<(),
 }
 
 /// `(table_name, rows, columns, on_clause, returning)` — return type of
-/// [`extract_insert_parts`]. `columns` is the explicit INSERT column list (empty
-/// when omitted); `returning` is the projection list of a RETURNING clause.
+/// [`extract_insert_parts`]. Each row is `Parens<Vec<Expr>>` (the sqlparser 0.60+
+/// VALUES row shape), which derefs to its expression list. `columns` is the
+/// explicit INSERT column list (empty when omitted); `returning` is the
+/// projection list of a RETURNING clause.
 type InsertParts<'a> = (
     String,
-    &'a [Vec<Expr>],
-    &'a [Ident],
+    &'a [Parens<Vec<Expr>>],
+    &'a [ObjectName],
     Option<&'a OnInsert>,
     Option<&'a [SelectItem]>,
 );
 
-fn extract_insert_parts(stmt: &Statement) -> Result<InsertParts<'_>, GnitzSqlError> {
-    match stmt {
-        Statement::Insert(insert) => {
-            let table_name = match &insert.table {
-                TableObject::TableName(obj_name) => extract_name(obj_name, "INSERT")?,
-                _ => {
-                    return Err(GnitzSqlError::Unsupported(
-                        "INSERT with table function not supported".to_string(),
-                    ))
-                }
-            };
-
-            let source = insert
-                .source
-                .as_ref()
-                .ok_or_else(|| GnitzSqlError::Unsupported("INSERT without VALUES not supported".to_string()))?;
-
-            let rows = extract_values_rows(source)?;
-            Ok((
-                table_name,
-                rows,
-                insert.columns.as_slice(),
-                insert.on.as_ref(),
-                insert.returning.as_deref(),
+fn extract_insert_parts(insert: &Insert) -> Result<InsertParts<'_>, GnitzSqlError> {
+    let table_name = match &insert.table {
+        TableObject::TableName(obj_name) => extract_name(obj_name, "INSERT")?,
+        _ => {
+            return Err(GnitzSqlError::Unsupported(
+                "INSERT with table function not supported".to_string(),
             ))
         }
-        _ => Err(GnitzSqlError::Bind("not an INSERT statement".to_string())),
-    }
+    };
+
+    let source = insert
+        .source
+        .as_ref()
+        .ok_or_else(|| GnitzSqlError::Unsupported("INSERT without VALUES not supported".to_string()))?;
+
+    let rows = extract_values_rows(source)?;
+    Ok((
+        table_name,
+        rows,
+        insert.columns.as_slice(),
+        insert.on.as_ref(),
+        insert.returning.as_deref(),
+    ))
 }
 
-fn extract_values_rows(query: &Query) -> Result<&[Vec<Expr>], GnitzSqlError> {
+fn extract_values_rows(query: &Query) -> Result<&[Parens<Vec<Expr>>], GnitzSqlError> {
     match query.body.as_ref() {
         SetExpr::Values(Values { rows, .. }) => Ok(rows),
         _ => Err(GnitzSqlError::Unsupported(
@@ -568,8 +572,11 @@ mod tests {
     use gnitz_core::TypeCode;
 
     // `two_col` has columns ["pk", "val"] in schema order.
-    fn idents(names: &[&str]) -> Vec<Ident> {
-        names.iter().map(|n| Ident::new(*n)).collect()
+    fn idents(names: &[&str]) -> Vec<ObjectName> {
+        names
+            .iter()
+            .map(|n| ObjectName::from(sqlparser::ast::Ident::new(*n)))
+            .collect()
     }
 
     #[test]

@@ -38,10 +38,9 @@ use crate::plan::view::predicates::extract_join_predicates;
 use crate::plan::view::{group_by, join, simple, EmitPieces, ViewChain};
 use gnitz_core::{GnitzClient, Schema, TypeCode};
 use sqlparser::ast::{
-    BinaryOperator, Expr, GroupByExpr, Ident, Join, JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, Query,
-    Select, SelectItem, SetExpr, TableFactor, Value, ValueWithSpan,
+    BinaryOperator, Expr, GroupByExpr, Ident, Join, JoinConstraint, JoinOperator, ObjectName, Query, Select,
+    SelectItem, SetExpr, TableFactor, Value,
 };
-use sqlparser::tokenizer::Span;
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -88,8 +87,12 @@ pub(crate) fn rewrite_eq_any_ne_all(query: &Query) -> Option<Query> {
         if let Some(sel) = s.selection.take() {
             s.selection = Some(map_eq_any_ne_all(&sel));
         }
+        // Mirror `projection_item_expr`'s item set, so detection and rewrite agree.
         for item in &mut s.projection {
-            if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
+            if let SelectItem::UnnamedExpr(e)
+            | SelectItem::ExprWithAlias { expr: e, .. }
+            | SelectItem::ExprWithAliases { expr: e, .. } = item
+            {
                 *e = map_eq_any_ne_all(e);
             }
         }
@@ -118,11 +121,10 @@ fn has_eq_any_ne_all(e: &Expr) -> bool {
 }
 
 fn map_eq_any_ne_all(e: &Expr) -> Expr {
-    use sqlparser::ast::CaseWhen;
-    // `= ANY` → IN ; `<> ALL` → NOT IN. The subquery's `Query` body (`SetExpr`)
-    // becomes the `InSubquery` subquery; an ANY/ALL subquery carries no
-    // meaningful ORDER BY / LIMIT (dropping the envelope matches the IN AST,
-    // whose subquery is itself a bare `SetExpr`).
+    // `= ANY` → IN ; `<> ALL` → NOT IN. The subquery's full `Query` becomes the
+    // `InSubquery` subquery (a `Query` since sqlparser 0.60); its envelope is
+    // not dropped — the exists builder's IN-subquery guard rejects a populated
+    // ORDER BY / LIMIT / WITH downstream.
     if let Expr::AnyOp {
         left,
         compare_op: BinaryOperator::Eq,
@@ -139,38 +141,19 @@ fn map_eq_any_ne_all(e: &Expr) -> Expr {
             let negated = matches!(e, Expr::AllOp { .. });
             return Expr::InSubquery {
                 expr: Box::new(map_eq_any_ne_all(left)),
-                subquery: sub.body.clone(),
+                subquery: sub.clone(),
                 negated,
             };
         }
     }
-    match e {
-        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-            left: Box::new(map_eq_any_ne_all(left)),
-            op: op.clone(),
-            right: Box::new(map_eq_any_ne_all(right)),
-        },
-        Expr::UnaryOp { op, expr } => Expr::UnaryOp {
-            op: *op,
-            expr: Box::new(map_eq_any_ne_all(expr)),
-        },
-        Expr::Nested(i) => Expr::Nested(Box::new(map_eq_any_ne_all(i))),
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-        } => Expr::Case {
-            operand: operand.as_ref().map(|o| Box::new(map_eq_any_ne_all(o))),
-            conditions: conditions
-                .iter()
-                .map(|cw| CaseWhen {
-                    condition: map_eq_any_ne_all(&cw.condition),
-                    result: map_eq_any_ne_all(&cw.result),
-                })
-                .collect(),
-            else_result: else_result.as_ref().map(|er| Box::new(map_eq_any_ne_all(er))),
-        },
-        other => other.clone(),
+    // Structural nodes recurse through the shared rebuild; leaves (and nodes
+    // this rewrite leaves untouched) clone through.
+    let mapped =
+        crate::ast_util::map_structural_operands::<std::convert::Infallible>(e, &mut |x| Ok(map_eq_any_ne_all(x)));
+    match mapped {
+        Ok(Some(m)) => m,
+        Ok(None) => e.clone(),
+        Err(never) => match never {},
     }
 }
 
@@ -338,6 +321,11 @@ pub(crate) fn emit_scalar_subquery_pieces(
                 expr: rewrite_expr(client, binder, chain, &mut acc, expr, &outer)?,
                 alias: alias.clone(),
             }),
+            SelectItem::ExprWithAliases { .. } => {
+                return Err(GnitzSqlError::Unsupported(
+                    "multi-alias projection (expr AS (a, b, …)) is not supported".into(),
+                ))
+            }
         }
     }
 
@@ -771,59 +759,15 @@ fn rewrite_expr(
         } => rewrite_quantifier(client, binder, chain, acc, left, compare_op, right, false, outer),
         Expr::IsNull(inner) => rewrite_null_test(client, binder, chain, acc, inner, true, outer),
         Expr::IsNotNull(inner) => rewrite_null_test(client, binder, chain, acc, inner, false, outer),
-        Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
-            left: Box::new(rewrite_expr(client, binder, chain, acc, left, outer)?),
-            op: op.clone(),
-            right: Box::new(rewrite_expr(client, binder, chain, acc, right, outer)?),
-        }),
-        Expr::UnaryOp { op, expr } => Ok(Expr::UnaryOp {
-            op: *op,
-            expr: Box::new(rewrite_expr(client, binder, chain, acc, expr, outer)?),
-        }),
-        Expr::Nested(inner) => Ok(Expr::Nested(Box::new(rewrite_expr(
-            client, binder, chain, acc, inner, outer,
-        )?))),
-        Expr::Between {
-            expr,
-            negated,
-            low,
-            high,
-        } => Ok(Expr::Between {
-            expr: Box::new(rewrite_expr(client, binder, chain, acc, expr, outer)?),
-            negated: *negated,
-            low: Box::new(rewrite_expr(client, binder, chain, acc, low, outer)?),
-            high: Box::new(rewrite_expr(client, binder, chain, acc, high, outer)?),
-        }),
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-        } => {
-            let operand = match operand {
-                Some(o) => Some(Box::new(rewrite_expr(client, binder, chain, acc, o, outer)?)),
-                None => None,
-            };
-            let mut conds = Vec::with_capacity(conditions.len());
-            for cw in conditions {
-                conds.push(sqlparser::ast::CaseWhen {
-                    condition: rewrite_expr(client, binder, chain, acc, &cw.condition, outer)?,
-                    result: rewrite_expr(client, binder, chain, acc, &cw.result, outer)?,
-                });
-            }
-            let else_result = match else_result {
-                Some(e) => Some(Box::new(rewrite_expr(client, binder, chain, acc, e, outer)?)),
-                None => None,
-            };
-            Ok(Expr::Case {
-                operand,
-                conditions: conds,
-                else_result,
-            })
-        }
         Expr::Function(f) if fn_name_is(f, "coalesce") => rewrite_coalesce(client, binder, chain, acc, f, outer),
         Expr::Function(f) => rewrite_function(client, binder, chain, acc, f, outer),
-        // A leaf (Identifier, CompoundIdentifier, Value, …) with no subquery inside.
-        other => Ok(other.clone()),
+        // Structural nodes (binary/unary ops, parens, BETWEEN, CASE) recurse
+        // through the shared rebuild; a leaf (Identifier, CompoundIdentifier,
+        // Value, …) with no subquery inside clones through.
+        other => Ok(crate::ast_util::map_structural_operands(other, &mut |x| {
+            rewrite_expr(client, binder, chain, acc, x, outer)
+        })?
+        .unwrap_or_else(|| other.clone())),
     }
 }
 
@@ -1203,7 +1147,7 @@ fn fresh_alias(taken: &mut HashSet<String>, base: &str) -> String {
 
 fn table_factor(relation: &str) -> TableFactor {
     TableFactor::Table {
-        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(relation))]),
+        name: ObjectName::from(Ident::new(relation)),
         alias: None,
         args: None,
         with_hints: Vec::new(),
@@ -1217,17 +1161,11 @@ fn table_factor(relation: &str) -> TableFactor {
 }
 
 fn num_zero() -> Expr {
-    Expr::Value(ValueWithSpan {
-        value: Value::Number("0".into(), false),
-        span: Span::empty(),
-    })
+    Expr::value(Value::Number("0".into(), false))
 }
 
 fn num_one() -> Expr {
-    Expr::Value(ValueWithSpan {
-        value: Value::Number("1".into(), false),
-        span: Span::empty(),
-    })
+    Expr::value(Value::Number("1".into(), false))
 }
 
 /// `1 = 1` (TRUE) / `1 = 0` (FALSE) as a boolean-typed constant expression.
@@ -1264,7 +1202,7 @@ fn or_expr(a: Expr, b: Expr) -> Expr {
 /// synthesized function node.
 fn fn_call(name: &str, args: Vec<Expr>) -> Expr {
     Expr::Function(sqlparser::ast::Function {
-        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))]),
+        name: ObjectName::from(Ident::new(name)),
         uses_odbc_syntax: false,
         parameters: sqlparser::ast::FunctionArguments::None,
         args: sqlparser::ast::FunctionArguments::List(sqlparser::ast::FunctionArgumentList {
@@ -1302,10 +1240,13 @@ fn coalesce_call(args: Vec<Expr>) -> Expr {
 fn blank_select() -> Select {
     Select {
         select_token: sqlparser::ast::helpers::attached_token::AttachedToken::empty(),
+        optimizer_hints: Vec::new(),
+        select_modifiers: None,
         distinct: None,
         top: None,
         top_before_distinct: false,
         projection: Vec::new(),
+        exclude: None,
         into: None,
         from: Vec::new(),
         lateral_views: Vec::new(),
@@ -1320,7 +1261,7 @@ fn blank_select() -> Select {
         qualify: None,
         window_before_qualify: false,
         value_table_mode: None,
-        connect_by: None,
+        connect_by: Vec::new(),
         flavor: sqlparser::ast::SelectFlavor::Standard,
     }
 }

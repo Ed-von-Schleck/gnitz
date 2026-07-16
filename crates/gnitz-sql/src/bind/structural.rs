@@ -113,6 +113,8 @@ pub(crate) fn bind_structural<L: LeafBinder>(expr: &Expr, leaf: &L) -> Result<Bo
             operand,
             conditions,
             else_result,
+            case_token: _,
+            end_token: _,
         } => {
             let mut branches = Vec::with_capacity(conditions.len());
             for CaseWhen { condition, result } in conditions {

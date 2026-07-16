@@ -209,14 +209,22 @@ pub(crate) fn reject_unhonored_select_clauses(
         distribute_by,
         sort_by,
         named_window,
+        // `SELECT * EXCLUDE (c)` (Redshift/DuckDB) drops columns from the
+        // wildcard: silently dropping it would widen the view's output schema.
+        exclude,
         // Inert: parser tokens, positional flags for an already-checked clause
-        // (`top`/`qualify`/`distinct`), or a clause the GenericDialect never
-        // produces (`value_table_mode` is BigQuery-only). No droppable semantics.
+        // (`top`/`qualify`/`distinct`), a clause the GenericDialect never
+        // produces (`value_table_mode` is BigQuery-only), or advisory-only
+        // annotations (`optimizer_hints` are comment hints; `select_modifiers`
+        // are MySQL perf/caching flags like STRAIGHT_JOIN / SQL_NO_CACHE). None
+        // change the result set.
         select_token: _,
         top_before_distinct: _,
         window_before_qualify: _,
         value_table_mode: _,
         flavor: _,
+        optimizer_hints: _,
+        select_modifiers: _,
     } = select;
 
     let reject = |clause: &str| unsupported_clause(context, clause);
@@ -248,8 +256,11 @@ pub(crate) fn reject_unhonored_select_clauses(
     if qualify.is_some() {
         return Err(reject("QUALIFY"));
     }
-    if connect_by.is_some() {
+    if !connect_by.is_empty() {
         return Err(reject("CONNECT BY"));
+    }
+    if exclude.is_some() {
+        return Err(reject("SELECT * EXCLUDE"));
     }
     if !lateral_views.is_empty() {
         return Err(reject("LATERAL VIEW"));
@@ -310,6 +321,7 @@ pub(crate) fn reject_unhonored_query_clauses(
         for_clause,
         settings,
         format_clause,
+        pipe_operators,
     } = query;
 
     let reject = |clause: &str| unsupported_clause(context, clause);
@@ -338,6 +350,9 @@ pub(crate) fn reject_unhonored_query_clauses(
     if format_clause.is_some() {
         return Err(reject("FORMAT"));
     }
+    if !pipe_operators.is_empty() {
+        return Err(reject("pipe operators (|>)"));
+    }
     Ok(())
 }
 
@@ -359,9 +374,12 @@ pub(crate) fn reject_unhonored_insert_clauses(
         source,
         columns: _,
         on: _,
-        // Inert keyword markers (`INTO` / `TABLE`): positional flags, no droppable semantics.
+        // Inert keyword markers (`INTO` / `TABLE`, the `INSERT` token) and
+        // advisory-only comment hints: positional flags, no droppable semantics.
         into: _,
         has_table_keyword: _,
+        insert_token: _,
+        optimizer_hints: _,
         // Handled downstream in `execute_insert`: INSERT ... RETURNING is supported
         // (projected client-side from the just-built batch).
         returning: _,
@@ -378,6 +396,11 @@ pub(crate) fn reject_unhonored_insert_clauses(
         after_columns,
         settings,
         format_clause,
+        output,
+        multi_table_insert_type,
+        multi_table_into_clauses,
+        multi_table_when_clauses,
+        multi_table_else_clause,
     } = insert;
 
     let reject = |clause: &str| unsupported_clause(context, clause);
@@ -417,6 +440,16 @@ pub(crate) fn reject_unhonored_insert_clauses(
     if format_clause.is_some() {
         return Err(reject("FORMAT"));
     }
+    if output.is_some() {
+        return Err(reject("OUTPUT"));
+    }
+    if multi_table_insert_type.is_some()
+        || !multi_table_into_clauses.is_empty()
+        || !multi_table_when_clauses.is_empty()
+        || multi_table_else_clause.is_some()
+    {
+        return Err(reject("multi-table INSERT (ALL/FIRST)"));
+    }
     // The `source` is a full `Query`; an INSERT honors no envelope clause on it (LIMIT/OFFSET,
     // ORDER BY, FETCH, FOR UPDATE/SHARE, SETTINGS, FORMAT, a `WITH`). Route it through the shared
     // `Query` guard so a dropped envelope clause is a clean error, not a silent full-table insert.
@@ -438,20 +471,25 @@ pub(crate) fn reject_unhonored_insert_clauses(
 /// under `GenericDialect` and were dropped — the join-update silently binds SET/WHERE against the
 /// wrong relation set.
 pub(crate) fn reject_unhonored_update_clauses(
-    stmt: &sqlparser::ast::Statement,
+    update: &sqlparser::ast::Update,
     context: &str,
 ) -> Result<(), GnitzSqlError> {
-    let sqlparser::ast::Statement::Update {
+    let sqlparser::ast::Update {
+        // Consumed by `execute_update`.
         table: _,
         assignments: _,
         selection: _,
+        // Inert: the `UPDATE` token and advisory-only comment hints.
+        update_token: _,
+        optimizer_hints: _,
+        // Rejected: each is a clause `execute_update` does not implement.
         from,
         returning,
+        output,
         or,
-    } = stmt
-    else {
-        return Err(GnitzSqlError::Bind("not an UPDATE statement".to_string()));
-    };
+        order_by,
+        limit,
+    } = update;
     let reject = |clause: &str| unsupported_clause(context, clause);
     if from.is_some() {
         return Err(reject("FROM (join-update)"));
@@ -459,8 +497,17 @@ pub(crate) fn reject_unhonored_update_clauses(
     if returning.is_some() {
         return Err(reject("RETURNING"));
     }
+    if output.is_some() {
+        return Err(reject("OUTPUT"));
+    }
     if or.is_some() {
         return Err(reject("OR (conflict clause)"));
+    }
+    if !order_by.is_empty() {
+        return Err(reject("ORDER BY"));
+    }
+    if limit.is_some() {
+        return Err(reject("LIMIT"));
     }
     Ok(())
 }
@@ -476,9 +523,13 @@ pub(crate) fn reject_unhonored_delete_clauses(
     let sqlparser::ast::Delete {
         from: _,
         selection: _,
+        // Inert: the `DELETE` token and advisory-only comment hints.
+        delete_token: _,
+        optimizer_hints: _,
         tables,
         using,
         returning,
+        output,
         order_by,
         limit,
     } = del;
@@ -492,11 +543,57 @@ pub(crate) fn reject_unhonored_delete_clauses(
     if returning.is_some() {
         return Err(reject("RETURNING"));
     }
+    if output.is_some() {
+        return Err(reject("OUTPUT"));
+    }
     if !order_by.is_empty() {
         return Err(reject("ORDER BY"));
     }
     if limit.is_some() {
         return Err(reject("LIMIT"));
+    }
+    Ok(())
+}
+
+/// Reject every `DROP` clause `execute_drop` does not consume. It reads `object_type` and `names`;
+/// `cascade`/`restrict` (dependent-object policy), `purge` (Hive data deletion), `temporary`
+/// (MySQL DROP TEMPORARY), and `table` (MySQL `DROP INDEX i ON t` — the ON target) all parse under
+/// `GenericDialect` and would otherwise be silently dropped. `if_exists` drops *loudly* (a missing
+/// object still errors), so it is not rejected; implement it later.
+///
+/// Exhaustive destructure (no `..`): a future `sqlparser` field stops the build.
+pub(crate) fn reject_unhonored_drop_clauses(
+    stmt: &sqlparser::ast::Statement,
+    context: &str,
+) -> Result<(), GnitzSqlError> {
+    let sqlparser::ast::Statement::Drop {
+        object_type: _,
+        names: _,
+        if_exists: _, // loud on drop; implement later
+        cascade,
+        restrict,
+        purge,
+        temporary,
+        table,
+    } = stmt
+    else {
+        return Err(GnitzSqlError::Bind("not a DROP statement".to_string()));
+    };
+    let reject = |clause: &str| unsupported_clause(context, clause);
+    if *cascade {
+        return Err(reject("CASCADE"));
+    }
+    if *restrict {
+        return Err(reject("RESTRICT"));
+    }
+    if *purge {
+        return Err(reject("PURGE"));
+    }
+    if *temporary {
+        return Err(reject("TEMPORARY"));
+    }
+    if table.is_some() {
+        return Err(reject("ON <table> (MySQL DROP INDEX target)"));
     }
     Ok(())
 }
@@ -522,7 +619,7 @@ pub(crate) fn reject_unhonored_start_transaction_clauses(
         transaction: _,
         modifier,
         statements,
-        exception_statements,
+        exception,
         has_end_keyword: _,
     } = stmt
     else {
@@ -538,7 +635,7 @@ pub(crate) fn reject_unhonored_start_transaction_clauses(
     if !statements.is_empty() {
         return Err(reject("a BEGIN ... END block"));
     }
-    if exception_statements.is_some() {
+    if exception.is_some() {
         return Err(reject("an EXCEPTION clause"));
     }
     Ok(())
@@ -595,27 +692,30 @@ pub(crate) fn reject_unhonored_rollback_clauses(
 }
 
 /// Reject every `CREATE TABLE` envelope clause `execute_create_table` does not consume. `name`,
-/// `columns`, `constraints`, `cluster_by`, `with_options` are consumed (column/constraint contents
-/// are further guarded by [`reject_unhonored_column_options`] / [`reject_unhonored_table_constraints`]).
+/// `columns`, `constraints`, `cluster_by`, `table_options` are consumed (column/constraint contents
+/// are further guarded by [`reject_unhonored_column_options`] / [`reject_unhonored_table_constraints`];
+/// `table_options` carries the `WITH (replicated = …)` option, parsed by `parse_replicated_option`).
 /// Rejected: `query` (CTAS), `temporary`/`global` (silent permanent table), `like`/`clone` (empty
-/// table, ignoring the template), `on_commit`, and `primary_key` (silently substitutes the PK). The
+/// table, ignoring the template), `on_commit`, `primary_key` (silently substitutes the PK), and
+/// `partition_of`/`for_values` (silently creates a standalone table instead of a partition child). The
 /// `_`-bound remainder parses under `GenericDialect` or not, but carries no gnitz-honorable semantics
 /// — storage/engine/vendor metadata accepted as no-ops, never changing a result.
 /// `or_replace`/`if_not_exists` drop *loudly* (a name collision still errors), so they are not
 /// rejected; implement them later.
 ///
-/// Exhaustive destructure (no `..`) over all 50 fields: a future `sqlparser` field stops the build.
+/// Exhaustive destructure (no `..`) over every field: a future `sqlparser` field stops the build.
 pub(crate) fn reject_unhonored_create_table_clauses(
     create: &sqlparser::ast::CreateTable,
     context: &str,
 ) -> Result<(), GnitzSqlError> {
     let sqlparser::ast::CreateTable {
-        // Consumed (column/constraint contents further guarded by the column-option and table-constraint guards).
+        // Consumed (column/constraint contents further guarded by the column-option and table-constraint guards;
+        // `table_options` carries `WITH (replicated = …)`).
         name: _,
         columns: _,
         constraints: _,
         cluster_by: _,
-        with_options: _,
+        table_options: _,
         // Loud on drop, not silent; implement later.
         or_replace: _,
         if_not_exists: _,
@@ -627,27 +727,26 @@ pub(crate) fn reject_unhonored_create_table_clauses(
         clone,
         on_commit,
         primary_key,
+        partition_of,
+        for_values,
         // No gnitz-honorable semantics — storage/engine/vendor metadata accepted as no-ops.
         external: _,
+        dynamic: _,
         transient: _,
         volatile: _,
         iceberg: _,
+        snapshot: _,
         hive_distribution: _,
         hive_formats: _,
-        table_properties: _,
         file_format: _,
         location: _,
+        version: _,
         without_rowid: _,
-        engine: _,
         comment: _,
-        auto_increment_offset: _,
-        default_charset: _,
-        collation: _,
         on_cluster: _,
         order_by: _,
         partition_by: _,
         clustered_by: _,
-        options: _,
         inherits: _,
         strict: _,
         copy_grants: _,
@@ -658,12 +757,22 @@ pub(crate) fn reject_unhonored_create_table_clauses(
         default_ddl_collation: _,
         with_aggregation_policy: _,
         with_row_access_policy: _,
+        with_storage_lifecycle_policy: _,
         with_tags: _,
         external_volume: _,
         base_location: _,
         catalog: _,
         catalog_sync: _,
         storage_serialization_policy: _,
+        target_lag: _,
+        warehouse: _,
+        refresh_mode: _,
+        initialize: _,
+        require_user: _,
+        diststyle: _,
+        distkey: _,
+        sortkey: _,
+        backup: _,
     } = create;
 
     let reject = |clause: &str| unsupported_clause(context, clause);
@@ -688,6 +797,9 @@ pub(crate) fn reject_unhonored_create_table_clauses(
     if primary_key.is_some() {
         return Err(reject("PRIMARY KEY expression"));
     }
+    if partition_of.is_some() || for_values.is_some() {
+        return Err(reject("PARTITION OF"));
+    }
     Ok(())
 }
 
@@ -698,17 +810,20 @@ pub(crate) fn reject_unhonored_create_table_clauses(
 /// later. `with_no_schema_binding` parses but is a no-op optimizer hint; the rest cannot populate
 /// under `GenericDialect`.
 pub(crate) fn reject_unhonored_create_view_clauses(
-    stmt: &sqlparser::ast::Statement,
+    cv: &sqlparser::ast::CreateView,
     context: &str,
 ) -> Result<(), GnitzSqlError> {
-    let sqlparser::ast::Statement::CreateView {
+    let sqlparser::ast::CreateView {
         name: _,
         query: _,
         materialized: _, // accepted: names gnitz's real behavior
         or_alter: _,
         or_replace: _,
         if_not_exists: _,          // loud on drop; implement later
+        name_before_not_exists: _, // positional flag for if_not_exists
         with_no_schema_binding: _, // no-op optimizer hint
+        secure: _,                 // Snowflake SECURE modifier: no result impact
+        copy_grants: _,            // Snowflake COPY GRANTS: no result impact
         options: _,
         cluster_by: _,
         comment: _,
@@ -716,10 +831,7 @@ pub(crate) fn reject_unhonored_create_view_clauses(
         columns,
         temporary,
         to, // rejected
-    } = stmt
-    else {
-        return Err(GnitzSqlError::Bind("not a CREATE VIEW statement".to_string()));
-    };
+    } = cv;
     let reject = |clause: &str| unsupported_clause(context, clause);
     if !columns.is_empty() {
         return Err(reject("output column aliases"));
@@ -755,10 +867,18 @@ pub(crate) fn reject_unhonored_create_index_clauses(
         nulls_distinct,
         with,
         predicate,
+        index_options,
+        alter_options,
     } = ci;
     let reject = |clause: &str| unsupported_clause(context, clause);
     if predicate.is_some() {
         return Err(reject("WHERE (partial index)"));
+    }
+    if !index_options.is_empty() {
+        return Err(reject("index options"));
+    }
+    if !alter_options.is_empty() {
+        return Err(reject("ALTER options (ALGORITHM / LOCK)"));
     }
     if let Some(t) = using {
         if !matches!(t, IndexType::BTree) {
@@ -780,11 +900,121 @@ pub(crate) fn reject_unhonored_create_index_clauses(
     Ok(())
 }
 
+/// Reject every FOREIGN KEY field beyond the target (`foreign_table` /
+/// `referred_columns` / `columns`) and the inert names: a referential action
+/// (`ON DELETE` / `ON UPDATE`), a `MATCH` kind, and constraint characteristics
+/// (DEFERRABLE) are all semantics gnitz does not implement. Since sqlparser 0.60
+/// the column-level and table-level FK both wrap the same `ForeignKeyConstraint`,
+/// so both guards share this one check (exhaustive destructure, no `..`).
+fn reject_unhonored_fk_fields(fk: &sqlparser::ast::ForeignKeyConstraint, context: &str) -> Result<(), GnitzSqlError> {
+    let sqlparser::ast::ForeignKeyConstraint {
+        // Consumed by `resolve_fk_target`.
+        columns: _,
+        foreign_table: _,
+        referred_columns: _,
+        // Inert metadata: gnitz has no FK constraint/index naming surface.
+        name: _,
+        index_name: _,
+        // Rejected: unimplemented semantics.
+        on_delete,
+        on_update,
+        match_kind,
+        characteristics,
+    } = fk;
+    if on_delete.is_some() || on_update.is_some() {
+        return Err(unsupported_clause(context, "FOREIGN KEY ON DELETE/ON UPDATE action"));
+    }
+    if match_kind.is_some() {
+        return Err(unsupported_clause(context, "FOREIGN KEY MATCH"));
+    }
+    if characteristics.is_some() {
+        return Err(unsupported_clause(context, "constraint characteristics (DEFERRABLE …)"));
+    }
+    Ok(())
+}
+
+/// Reject every PRIMARY KEY constraint field beyond the column list and the
+/// inert names. `index_type` follows CREATE INDEX's rule: the BTree default is
+/// accepted (it names gnitz's real ordered index), anything else is rejected.
+/// Shared by the column-level and table-level guards (both wrap
+/// `PrimaryKeyConstraint` since sqlparser 0.60; exhaustive destructure, no `..`).
+fn reject_unhonored_pk_fields(pk: &sqlparser::ast::PrimaryKeyConstraint, context: &str) -> Result<(), GnitzSqlError> {
+    let sqlparser::ast::PrimaryKeyConstraint {
+        // Consumed by `execute_create_table`.
+        columns: _,
+        // Inert metadata: gnitz has no PK constraint/index naming surface.
+        name: _,
+        index_name: _,
+        // Conditionally accepted / rejected below.
+        index_type,
+        index_options,
+        characteristics,
+    } = pk;
+    reject_index_constraint_extras(index_type, index_options, characteristics, context)
+}
+
+/// Reject every UNIQUE constraint field beyond the column list and the
+/// constraint name (which names the created index). `NULLS [NOT] DISTINCT`
+/// is rejected like CREATE INDEX rejects it — gnitz defines no NULL-conflict
+/// semantics to honor. Shared by the column-level and table-level guards
+/// (exhaustive destructure, no `..`).
+fn reject_unhonored_unique_fields(u: &sqlparser::ast::UniqueConstraint, context: &str) -> Result<(), GnitzSqlError> {
+    let sqlparser::ast::UniqueConstraint {
+        // Consumed by `execute_create_table` (the name becomes the index name).
+        name: _,
+        columns: _,
+        // Inert keyword phrasing (`UNIQUE KEY` vs `UNIQUE INDEX`).
+        index_type_display: _,
+        // Rejected: a separate index name would be undroppable (DROP INDEX
+        // resolves the constraint-derived name).
+        index_name,
+        // Conditionally accepted / rejected below.
+        index_type,
+        index_options,
+        characteristics,
+        nulls_distinct,
+    } = u;
+    if index_name.is_some() {
+        return Err(unsupported_clause(
+            context,
+            "a UNIQUE index name (use CONSTRAINT <name>)",
+        ));
+    }
+    if !matches!(nulls_distinct, sqlparser::ast::NullsDistinctOption::None) {
+        return Err(unsupported_clause(context, "NULLS [NOT] DISTINCT"));
+    }
+    reject_index_constraint_extras(index_type, index_options, characteristics, context)
+}
+
+/// The PK/UNIQUE-shared tail: accept only the BTree default `USING`, no index
+/// options, no constraint characteristics (DEFERRABLE …).
+fn reject_index_constraint_extras(
+    index_type: &Option<sqlparser::ast::IndexType>,
+    index_options: &[sqlparser::ast::IndexOption],
+    characteristics: &Option<sqlparser::ast::ConstraintCharacteristics>,
+    context: &str,
+) -> Result<(), GnitzSqlError> {
+    if let Some(t) = index_type {
+        if !matches!(t, sqlparser::ast::IndexType::BTree) {
+            return Err(unsupported_clause(context, "USING (non-default index type)"));
+        }
+    }
+    if !index_options.is_empty() {
+        return Err(unsupported_clause(context, "index options"));
+    }
+    if characteristics.is_some() {
+        return Err(unsupported_clause(context, "constraint characteristics (DEFERRABLE …)"));
+    }
+    Ok(())
+}
+
 /// Reject every column option `execute_create_table` does not honor. Honored: NULL/NOT NULL
-/// (nullability), UNIQUE (incl. PRIMARY KEY), FOREIGN KEY target. A FK referential action and every
+/// (nullability), PRIMARY KEY, UNIQUE, FOREIGN KEY target — the honored constraint variants are
+/// descended into (`reject_unhonored_{pk,unique,fk}_fields`) so an unimplemented field inside them
+/// (a referential action, DEFERRABLE, NULLS NOT DISTINCT, …) is rejected too. Every
 /// constraint/semantic option gnitz lacks (DEFAULT, CHECK, GENERATED, IDENTITY, ON UPDATE, COLLATE,
-/// …) is rejected; pure metadata (COMMENT/OPTIONS/POLICY/TAGS) is accepted. Exhaustive over all 20
-/// `ColumnOption` variants (no `_`): a new variant stops the build.
+/// SRID, INVISIBLE, …) is rejected; pure metadata (COMMENT/OPTIONS/POLICY/TAGS) is accepted. Exhaustive
+/// over all 23 `ColumnOption` variants (no `_`): a new variant stops the build.
 pub(crate) fn reject_unhonored_column_options(
     col: &sqlparser::ast::ColumnDef,
     context: &str,
@@ -793,15 +1023,13 @@ pub(crate) fn reject_unhonored_column_options(
     let reject = |clause: &str| unsupported_clause(context, clause);
     for opt in &col.options {
         match &opt.option {
-            O::Null | O::NotNull | O::Unique { .. } => {} // consumed
-            O::ForeignKey {
-                on_delete, on_update, ..
-            } => {
-                // target consumed; action rejected
-                if on_delete.is_some() || on_update.is_some() {
-                    return Err(reject("FOREIGN KEY ON DELETE/ON UPDATE action"));
-                }
-            }
+            O::Null | O::NotNull => {} // consumed
+            // Consumed, but only the column list / constraint name — descend into
+            // the wrapped constraint so an unimplemented field is rejected, not
+            // silently dropped.
+            O::Unique(u) => reject_unhonored_unique_fields(u, context)?,
+            O::PrimaryKey(pk) => reject_unhonored_pk_fields(pk, context)?,
+            O::ForeignKey(fk) => reject_unhonored_fk_fields(fk, context)?, // target consumed; the rest rejected
             O::Comment(_) | O::Options(_) | O::Policy(_) | O::Tags(_) => {} // inert metadata
             O::Default(_) => return Err(reject("DEFAULT")),
             O::Check(_) => return Err(reject("CHECK")),
@@ -814,6 +1042,8 @@ pub(crate) fn reject_unhonored_column_options(
             O::Materialized(_) => return Err(reject("MATERIALIZED column")),
             O::Ephemeral(_) => return Err(reject("EPHEMERAL column")),
             O::Alias(_) => return Err(reject("ALIAS column")),
+            O::Srid(_) => return Err(reject("SRID")),
+            O::Invisible => return Err(reject("INVISIBLE column")),
             O::DialectSpecific(_) => return Err(reject("dialect-specific column option")),
         }
     }
@@ -821,8 +1051,12 @@ pub(crate) fn reject_unhonored_column_options(
 }
 
 /// Reject every table constraint `execute_create_table` does not honor. Honored: PRIMARY KEY, UNIQUE,
-/// FOREIGN KEY target. A FK referential action, `CHECK`, inline `INDEX`, and `FULLTEXT`/`SPATIAL`
-/// indexes are rejected. Exhaustive over all 6 `TableConstraint` variants (no `_`).
+/// FOREIGN KEY target — each honored variant is descended into
+/// (`reject_unhonored_{pk,unique,fk}_fields`) so an unimplemented field inside it (a referential
+/// action, DEFERRABLE, NULLS NOT DISTINCT, …) is rejected too. `CHECK`, inline `INDEX`,
+/// `FULLTEXT`/`SPATIAL` indexes, and the Postgres `{PRIMARY KEY,UNIQUE} USING INDEX` promotions (no
+/// pre-existing index at CREATE TABLE) are rejected. Exhaustive over all 8 `TableConstraint`
+/// variants (no `_`).
 pub(crate) fn reject_unhonored_table_constraints(
     constraints: &[sqlparser::ast::TableConstraint],
     context: &str,
@@ -831,17 +1065,16 @@ pub(crate) fn reject_unhonored_table_constraints(
     let reject = |clause: &str| unsupported_clause(context, clause);
     for c in constraints {
         match c {
-            C::PrimaryKey { .. } | C::Unique { .. } => {}
-            C::ForeignKey {
-                on_delete, on_update, ..
-            } => {
-                if on_delete.is_some() || on_update.is_some() {
-                    return Err(reject("FOREIGN KEY ON DELETE/ON UPDATE action"));
-                }
-            }
-            C::Check { .. } => return Err(reject("CHECK constraint")),
-            C::Index { .. } => return Err(reject("INDEX in table definition")),
-            C::FulltextOrSpatial { .. } => return Err(reject("FULLTEXT/SPATIAL index")),
+            // Consumed, but only the column list / constraint name — descend so an
+            // unimplemented field is rejected, not silently dropped.
+            C::PrimaryKey(pk) => reject_unhonored_pk_fields(pk, context)?,
+            C::Unique(u) => reject_unhonored_unique_fields(u, context)?,
+            C::ForeignKey(fk) => reject_unhonored_fk_fields(fk, context)?,
+            C::Check(_) => return Err(reject("CHECK constraint")),
+            C::Index(_) => return Err(reject("INDEX in table definition")),
+            C::FulltextOrSpatial(_) => return Err(reject("FULLTEXT/SPATIAL index")),
+            C::PrimaryKeyUsingIndex(_) => return Err(reject("PRIMARY KEY USING INDEX")),
+            C::UniqueUsingIndex(_) => return Err(reject("UNIQUE USING INDEX")),
         }
     }
     Ok(())

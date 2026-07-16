@@ -19,7 +19,7 @@ use crate::SqlResult;
 use gnitz_core::{
     retraction_batch, ClientError, ColData, GnitzClient, PkColumn, PkTuple, Schema, WireConflictMode, ZSetBatch,
 };
-use sqlparser::ast::{Assignment, AssignmentTarget, Expr, FromTable, Statement};
+use sqlparser::ast::{Assignment, AssignmentTarget, Expr, FromTable};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -283,18 +283,10 @@ fn fetch_filtered<'a>(
 pub(crate) fn execute_update(
     client: &mut GnitzClient,
     _schema_name: &str,
-    stmt: &Statement,
+    update: &sqlparser::ast::Update,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
-    let (table, assignments_raw, selection) = match stmt {
-        Statement::Update {
-            table,
-            assignments,
-            selection,
-            ..
-        } => (table, assignments, selection),
-        _ => return Err(GnitzSqlError::Bind("not an UPDATE statement".to_string())),
-    };
+    let (table, assignments_raw, selection) = (&update.table, &update.assignments, &update.selection);
 
     let table_name = extract_table_factor_name(&table.relation, "UPDATE")?;
 
@@ -346,14 +338,9 @@ pub(crate) fn execute_update(
 pub(crate) fn execute_delete(
     client: &mut GnitzClient,
     _schema_name: &str,
-    stmt: &Statement,
+    del: &sqlparser::ast::Delete,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
-    let del = match stmt {
-        Statement::Delete(d) => d,
-        _ => return Err(GnitzSqlError::Bind("not a DELETE statement".to_string())),
-    };
-
     let tables = match &del.from {
         FromTable::WithFromKeyword(ts) | FromTable::WithoutKeyword(ts) => ts,
     };

@@ -36,7 +36,21 @@ impl fmt::Display for GnitzSqlError {
     }
 }
 
-impl std::error::Error for GnitzSqlError {}
+impl std::error::Error for GnitzSqlError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // The two wrapped-error variants expose their cause (sqlparser's
+        // `ParserError` gained a std `Error` impl in 0.61); the string/marker
+        // variants have none.
+        match self {
+            GnitzSqlError::Parse(e) => Some(e),
+            GnitzSqlError::Exec(e) => Some(e),
+            GnitzSqlError::Bind(_)
+            | GnitzSqlError::Plan(_)
+            | GnitzSqlError::Unsupported(_)
+            | GnitzSqlError::Conflict { .. } => None,
+        }
+    }
+}
 
 impl From<gnitz_core::ClientError> for GnitzSqlError {
     fn from(e: gnitz_core::ClientError) -> Self {

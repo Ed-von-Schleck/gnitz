@@ -161,10 +161,7 @@ mod tests {
 
     #[test]
     fn test_null_append_insert_update_identical_all_variants() {
-        let null_expr = Expr::Value(sqlparser::ast::ValueWithSpan {
-            value: Value::Null,
-            span: sqlparser::tokenizer::Span::empty(),
-        });
+        let null_expr = Expr::value(Value::Null);
         // (fresh empty ColData, wire type, expected NULL encoding) per variant.
         let cases: [(ColData, TypeCode, ColData); 4] = [
             (ColData::Fixed(Vec::new()), TypeCode::U32, ColData::Fixed(vec![0u8; 4])),
@@ -214,14 +211,10 @@ mod tests {
     /// check that replaced the per-type `parse`).
     #[test]
     fn insert_int_encoding_matches_native_and_range_checks() {
-        use sqlparser::ast::{UnaryOperator, ValueWithSpan};
-        use sqlparser::tokenizer::Span;
+        use sqlparser::ast::UnaryOperator;
 
         fn num(n: &str) -> Expr {
-            Expr::Value(ValueWithSpan {
-                value: Value::Number(n.into(), false),
-                span: Span::empty(),
-            })
+            Expr::value(Value::Number(n.into(), false))
         }
         fn neg(n: &str) -> Expr {
             Expr::UnaryOp {

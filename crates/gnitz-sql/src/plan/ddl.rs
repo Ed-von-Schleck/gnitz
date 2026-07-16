@@ -1,7 +1,7 @@
 //! DDL: CREATE TABLE (with FK resolution, UNIQUE, CLUSTER BY, REPLICATED), DROP,
 //! and CREATE INDEX. The compile side's only non-view surface.
 
-use crate::ast_util::extract_name;
+use crate::ast_util::{extract_name, index_column_ident, simple_ident_expr};
 use crate::bind::{find_unique_column, Binder};
 use crate::error::GnitzSqlError;
 use crate::plan::validate::{
@@ -12,7 +12,8 @@ use crate::types::{int_domain_fits, is_integer_type, serial_underlying, sql_type
 use crate::SqlResult;
 use gnitz_core::{ColumnDef, GnitzClient, IndexMeta, InlineUniqueIndex, TypeCode};
 use sqlparser::ast::{
-    ColumnOption, Expr, ObjectType, SqlOption, TableConstraint, Value, ValueWithSpan, WrappedCollection,
+    ColumnOption, CreateTableOptions, Expr, ForeignKeyConstraint, ObjectType, PrimaryKeyConstraint, SqlOption,
+    TableConstraint, UniqueConstraint, Value, ValueWithSpan, WrappedCollection,
 };
 
 /// FK child/parent type compatibility: an integer child widens to an integer
@@ -166,7 +167,15 @@ fn resolve_fk_target(
 /// single-source reads). Only the `replicated` key is recognized; any other
 /// `WITH` option is rejected so a typo cannot be silently ignored (gnitz has no
 /// other table-level `WITH` options today).
-fn parse_replicated_option(with_options: &[SqlOption]) -> Result<bool, GnitzSqlError> {
+fn parse_replicated_option(table_options: &CreateTableOptions) -> Result<bool, GnitzSqlError> {
+    // Only the `WITH (...)` form carries gnitz options. `OPTIONS(...)`,
+    // space-separated, and `TBLPROPERTIES` are vendor metadata accepted as no-ops
+    // (matching the pre-0.62 handling of the separate `options`/`table_properties`
+    // fields), and `None` is the common no-options case.
+    let with_options: &[SqlOption] = match table_options {
+        CreateTableOptions::With(opts) => opts,
+        _ => &[],
+    };
     let mut replicated = false;
     for opt in with_options {
         match opt {
@@ -252,22 +261,18 @@ pub(crate) fn execute_create_table(
     // unknown column name produces a Bind error rather than being eclipsed
     // by a duplicate-PK error from a separate inline `PRIMARY KEY` clause.
     for constraint in &create.constraints {
-        if let TableConstraint::PrimaryKey { columns: pk_cols, .. } = constraint {
+        if let TableConstraint::PrimaryKey(PrimaryKeyConstraint { columns: pk_cols, .. }) = constraint {
             if pk_decl_seen {
                 return Err(GnitzSqlError::Plan("Multiple PRIMARY KEYs defined".into()));
             }
             pk_decl_seen = true;
-            for col_ident in pk_cols {
-                let idx = sql_cols
-                    .iter()
-                    .position(|c| c.name.value.eq_ignore_ascii_case(&col_ident.value))
-                    .ok_or_else(|| {
-                        GnitzSqlError::Bind(format!("PRIMARY KEY column '{}' not found", col_ident.value))
-                    })?;
+            for col in pk_cols {
+                let col_name = index_column_ident(col, "PRIMARY KEY")?;
+                let idx = find_unique_column(&cols, col_name)?
+                    .ok_or_else(|| GnitzSqlError::Bind(format!("PRIMARY KEY column '{col_name}' not found")))?;
                 if pk_indices.contains(&(idx as u32)) {
                     return Err(GnitzSqlError::Plan(format!(
-                        "Duplicate column '{}' in PRIMARY KEY",
-                        col_ident.value
+                        "Duplicate column '{col_name}' in PRIMARY KEY"
                     )));
                 }
                 pk_indices.push(idx as u32);
@@ -281,7 +286,7 @@ pub(crate) fn execute_create_table(
     // see an empty `pk_indices` and fail spuriously.
     for (i, col) in sql_cols.iter().enumerate() {
         for opt in &col.options {
-            if let ColumnOption::Unique { is_primary: true, .. } = &opt.option {
+            if let ColumnOption::PrimaryKey(_) = &opt.option {
                 if pk_decl_seen {
                     return Err(GnitzSqlError::Plan("Multiple PRIMARY KEYs defined".into()));
                 }
@@ -295,11 +300,11 @@ pub(crate) fn execute_create_table(
     for (i, col) in sql_cols.iter().enumerate() {
         for opt in &col.options {
             match &opt.option {
-                ColumnOption::ForeignKey {
+                ColumnOption::ForeignKey(ForeignKeyConstraint {
                     foreign_table,
                     referred_columns,
                     ..
-                } => {
+                }) => {
                     let (tid, idx, parent_pk_type) = resolve_fk_target(
                         client,
                         schema_name,
@@ -314,9 +319,7 @@ pub(crate) fn execute_create_table(
                     cols[i].fk_col_idx = idx;
                     cols[i].type_code = parent_pk_type;
                 }
-                ColumnOption::Unique { is_primary: false, .. }
-                    if !unique_cols.iter().any(|(c, _)| c.as_slice() == [i as u32]) =>
-                {
+                ColumnOption::Unique(_) if !unique_cols.iter().any(|(c, _)| c.as_slice() == [i as u32]) => {
                     unique_cols.push((vec![i as u32], None));
                 }
                 _ => {}
@@ -326,12 +329,12 @@ pub(crate) fn execute_create_table(
 
     // Phase 4 — table-level FOREIGN KEY constraints.
     for constraint in &create.constraints {
-        if let TableConstraint::ForeignKey {
+        if let TableConstraint::ForeignKey(ForeignKeyConstraint {
             columns,
             foreign_table,
             referred_columns,
             ..
-        } = constraint
+        }) = constraint
         {
             if columns.len() != 1 {
                 return Err(GnitzSqlError::Unsupported(
@@ -365,18 +368,19 @@ pub(crate) fn execute_create_table(
     // significant: it drives the composite index's leading-key span and prefix
     // seeks).
     for constraint in &create.constraints {
-        if let TableConstraint::Unique {
+        if let TableConstraint::Unique(UniqueConstraint {
             name: name_ident,
             columns,
             ..
-        } = constraint
+        }) = constraint
         {
             if columns.is_empty() {
                 return Err(GnitzSqlError::Plan("UNIQUE constraint cannot be empty".into()));
             }
+            let mut col_names: Vec<&str> = Vec::with_capacity(columns.len());
             let mut col_indices: Vec<u32> = Vec::with_capacity(columns.len());
-            for col_ident in columns {
-                let col_name = &col_ident.value;
+            for c in columns {
+                let col_name = index_column_ident(c, "UNIQUE")?;
                 let idx = find_unique_column(&cols, col_name)?.ok_or_else(|| {
                     GnitzSqlError::Bind(format!("UNIQUE column '{col_name}' not found in table definition"))
                 })?;
@@ -385,12 +389,13 @@ pub(crate) fn execute_create_table(
                         "duplicate column '{col_name}' in UNIQUE constraint"
                     )));
                 }
+                col_names.push(col_name);
                 col_indices.push(idx as u32);
             }
             if unique_cols.iter().any(|(c, _)| c.as_slice() == col_indices.as_slice()) {
                 return Err(GnitzSqlError::Plan(format!(
                     "duplicate UNIQUE constraint on column(s) ({})",
-                    columns.iter().map(|c| c.value.as_str()).collect::<Vec<_>>().join(", ")
+                    col_names.join(", ")
                 )));
             }
             let constraint_name = name_ident.as_ref().map(|n| n.value.clone());
@@ -488,11 +493,12 @@ pub(crate) fn execute_create_table(
     // No clause ⇒ `k = 0` ⇒ default full-PK distribution (byte-identical to before
     // this feature). `GenericDialect` parses `CLUSTER BY a, b` into `cluster_by`.
     let dist_prefix_len = if let Some(cluster) = &create.cluster_by {
-        let (WrappedCollection::NoWrapping(idents) | WrappedCollection::Parentheses(idents)) = cluster;
-        let mut cluster_indices: Vec<u32> = Vec::with_capacity(idents.len());
-        for col_ident in idents {
-            let idx = find_unique_column(&cols, &col_ident.value)?
-                .ok_or_else(|| GnitzSqlError::Bind(format!("CLUSTER BY column '{}' not found", col_ident.value)))?;
+        let (WrappedCollection::NoWrapping(exprs) | WrappedCollection::Parentheses(exprs)) = cluster;
+        let mut cluster_indices: Vec<u32> = Vec::with_capacity(exprs.len());
+        for expr in exprs {
+            let col_name = simple_ident_expr(expr, "CLUSTER BY")?;
+            let idx = find_unique_column(&cols, col_name)?
+                .ok_or_else(|| GnitzSqlError::Bind(format!("CLUSTER BY column '{col_name}' not found")))?;
             cluster_indices.push(idx as u32);
         }
         gnitz_core::validate_dist_prefix(&pk_indices, &cluster_indices).map_err(GnitzSqlError::Plan)?
@@ -505,7 +511,7 @@ pub(crate) fn execute_create_table(
     // when every worker already holds the whole table. The flags packing cannot make
     // the conflict unrepresentable (replicated is a boolean bit, k a byte), so reject
     // it here.
-    let replicated = parse_replicated_option(&create.with_options)?;
+    let replicated = parse_replicated_option(&create.table_options)?;
     if replicated && dist_prefix_len != 0 {
         return Err(GnitzSqlError::Plan(
             "REPLICATED and CLUSTER BY are mutually exclusive: a replicated table keeps \
@@ -655,14 +661,7 @@ pub(crate) fn execute_create_index(
     let mut col_names: Vec<String> = Vec::with_capacity(ci.columns.len());
     let mut col_indices: Vec<u32> = Vec::with_capacity(ci.columns.len());
     for c in &ci.columns {
-        let col_name = match &c.column.expr {
-            Expr::Identifier(id) => id.value.clone(),
-            _ => {
-                return Err(GnitzSqlError::Bind(
-                    "CREATE INDEX: column must be a simple identifier".to_string(),
-                ))
-            }
-        };
+        let col_name = index_column_ident(c, "CREATE INDEX")?.to_string();
         let col_idx = find_unique_column(&schema.columns, &col_name)?
             .ok_or_else(|| GnitzSqlError::Bind(format!("column '{col_name}' not found")))?;
         if col_indices.contains(&(col_idx as u32)) {

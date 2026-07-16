@@ -43,7 +43,7 @@ pub(crate) fn serial_underlying(dt: &DataType) -> Option<TypeCode> {
     let DataType::Custom(name, _mods) = dt else {
         return None;
     };
-    let ident = name.0.last().and_then(|p| p.as_ident())?;
+    let ident = crate::ast_util::object_name_ident(name)?;
     match ident.value.to_ascii_uppercase().as_str() {
         "SMALLSERIAL" | "SERIAL2" => Some(TypeCode::I16),
         "SERIAL" | "SERIAL4" => Some(TypeCode::I32),
@@ -174,8 +174,8 @@ mod tests {
 
     #[test]
     fn float_maps_to_f32() {
-        assert_eq!(ok(DataType::Float(None)), TypeCode::F32);
-        assert_eq!(ok(DataType::Float(Some(24))), TypeCode::F32);
+        assert_eq!(ok(DataType::Float(ExactNumberInfo::None)), TypeCode::F32);
+        assert_eq!(ok(DataType::Float(ExactNumberInfo::Precision(24))), TypeCode::F32);
     }
 
     #[test]
@@ -273,8 +273,8 @@ mod tests {
     // --- SERIAL recognition (serial_underlying) ---
 
     fn custom(name: &str) -> DataType {
-        use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
-        DataType::Custom(ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))]), vec![])
+        use sqlparser::ast::{Ident, ObjectName};
+        DataType::Custom(ObjectName::from(Ident::new(name)), vec![])
     }
 
     #[test]

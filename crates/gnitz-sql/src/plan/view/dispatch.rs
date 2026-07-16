@@ -17,7 +17,7 @@ use crate::plan::view::{exists, group_by, join, scalar, set_op, simple, ViewChai
 use crate::SqlResult;
 use gnitz_core::{ColumnDef, GnitzClient, PlannedView, Schema};
 use sqlparser::ast::{
-    Expr, GroupByExpr, Ident, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor,
+    Expr, GroupByExpr, Ident, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, TableFactor,
     UnaryOperator, WildcardAdditionalOptions,
 };
 use std::collections::HashSet;
@@ -26,12 +26,11 @@ use std::rc::Rc;
 pub(crate) fn execute_create_view(
     client: &mut GnitzClient,
     schema_name: &str,
-    view_name_obj: &sqlparser::ast::ObjectName,
-    query: &Query,
-    stmt: &Statement,
+    cv: &sqlparser::ast::CreateView,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
-    let view_name = extract_name(view_name_obj, "CREATE VIEW")?;
+    let query: &Query = &cv.query;
+    let view_name = extract_name(&cv.name, "CREATE VIEW")?;
     validate_user_name(&view_name)?;
 
     // The CREATE VIEW envelope honors only `WITH` (inlined just below by `inline_ctes`); every
@@ -46,7 +45,9 @@ pub(crate) fn execute_create_view(
         "CREATE VIEW",
     )?;
 
-    let sql_text = format!("{stmt}");
+    // `CreateView`'s `Display` is exactly what `Statement::CreateView` delegates
+    // to, so this is the statement's full SQL text.
+    let sql_text = format!("{cv}");
 
     // Compile the sub-plans first. Pass-through CTEs inline into the binder cache;
     // non-pass-through CTEs and top-level derived tables compile into hidden view
@@ -614,6 +615,7 @@ fn compile_derived_tables(
             lateral,
             subquery,
             alias,
+            sample,
         } = tf
         else {
             continue;
@@ -626,6 +628,12 @@ fn compile_derived_tables(
         let ctx = format!("derived table '{}'", alias.name.value);
         if *lateral {
             return Err(GnitzSqlError::Unsupported(format!("{ctx}: LATERAL is not supported")));
+        }
+        // Silently dropping TABLESAMPLE would return all rows — a wrong result.
+        if sample.is_some() {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "{ctx}: TABLESAMPLE is not supported"
+            )));
         }
         reject_unhonored_query_clauses(
             subquery,

@@ -124,6 +124,24 @@ pub(crate) fn try_extract_pk_seek_residual<'e>(expr: &'e Expr, schema: &Schema) 
     (bound == schema.pk_count()).then_some((tuple, residual))
 }
 
+/// Classify a binary op's two operands as (column, literal): the column — bare
+/// or qualified (`t.pk`), the crate-wide single-relation convention — may sit on
+/// either side, and the literal is whatever `extract_sql_literal` accepts
+/// (numbers, optionally negated, or a single-quoted string — never a
+/// double-quoted identifier). Returns `(col_name, literal, flipped)`, where
+/// `flipped` is `true` when the literal was on the left (`lit OP col`), so a
+/// range recognizer can mirror the operator. Shared by the `=` and range
+/// (`<,<=,>,>=`) recognizers.
+fn split_col_vs_literal<'e>(a: &'e Expr, b: &'e Expr) -> Option<(&'e str, SqlLiteral<'e>, bool)> {
+    if let (Some(n), Some(l)) = (single_relation_col_name(a), extract_sql_literal(b)) {
+        Some((n, l, false))
+    } else if let (Some(n), Some(l)) = (single_relation_col_name(b), extract_sql_literal(a)) {
+        Some((n, l, true))
+    } else {
+        None
+    }
+}
+
 /// Extracts (col_idx, key) from `col = literal`. Does NOT check index existence.
 pub(crate) fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u128)> {
     let Expr::BinaryOp {
@@ -134,17 +152,8 @@ pub(crate) fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize,
     else {
         return None;
     };
-    // The column — bare or qualified (`t.pk`), the crate-wide single-relation
-    // convention — may sit on either side; the literal is whatever
-    // `extract_sql_literal` accepts (numbers, optionally negated, or a
-    // single-quoted string — but never a double-quoted identifier).
-    let (col_name, lit) = if let (Some(n), Some(l)) = (single_relation_col_name(left), extract_sql_literal(right)) {
-        (n, l)
-    } else if let (Some(n), Some(l)) = (single_relation_col_name(right), extract_sql_literal(left)) {
-        (n, l)
-    } else {
-        return None;
-    };
+    // `=` is symmetric, so the flipped flag is irrelevant here.
+    let (col_name, lit, _) = split_col_vs_literal(left, right)?;
     // Ambiguous (a dup-named `SELECT *` view) OR absent → None → fast path
     // declined; the WHERE then falls through to a bind that raises the precise
     // error rather than seeking the wrong column.
@@ -462,16 +471,9 @@ fn try_col_range_literal(expr: &Expr, schema: &Schema) -> Option<(usize, RangeEn
     let Expr::BinaryOp { left, op, right } = expr else {
         return None;
     };
-    // Which side is the column (bare or qualified `t.x`), which is the literal,
-    // and is the operator flipped (`lit OP col` ≡ `col FLIP(OP) lit`)?
-    let (col_name, lit, flipped) =
-        if let (Some(n), Some(l)) = (single_relation_col_name(left), extract_sql_literal(right)) {
-            (n, l, false)
-        } else if let (Some(n), Some(l)) = (single_relation_col_name(right), extract_sql_literal(left)) {
-            (n, l, true)
-        } else {
-            return None;
-        };
+    // Which side is the column, which is the literal, and is the operator flipped
+    // (`lit OP col` ≡ `col FLIP(OP) lit`)?
+    let (col_name, lit, flipped) = split_col_vs_literal(left, right)?;
     use BinaryOperator as B;
     let (side, mk): (RangeSide, fn(u128) -> Cut) = match (op, flipped) {
         (B::Gt, false) | (B::Lt, true) => (RangeSide::Start, Cut::After), // col > lit / lit < col

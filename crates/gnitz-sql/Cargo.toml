@@ -7,7 +7,7 @@ edition = "2021"
 integration = []
 
 [dependencies]
-sqlparser  = "0.56"
+sqlparser  = "0.62"
 gnitz-core = { path = "../gnitz-core" }
 gnitz-wire = { path = "../gnitz-wire" }
 
