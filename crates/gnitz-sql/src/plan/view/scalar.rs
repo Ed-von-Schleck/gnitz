@@ -24,6 +24,7 @@
 
 use crate::ast_util::{
     extract_table_name_and_alias, flatten_conjuncts, fn_name_is, function_positional_args, projection_item_expr,
+    wildcard_name_is_visible, WildcardRewrite,
 };
 use crate::bind::{bind_single_table, build_alias_map, Binder};
 use crate::error::GnitzSqlError;
@@ -310,9 +311,15 @@ pub(crate) fn emit_scalar_subquery_pieces(
 
     // ── Phase 2: projection ──────────────────────────────────────────────────
     let mut final_proj: Vec<SelectItem> = Vec::new();
+    // Validate an EXCEPT/EXCLUDE/RENAME name against the outer relation's
+    // visible columns (the only columns a scalar-subquery view's `*` expands).
+    let outer_visible = |n: &str| wildcard_name_is_visible(&outer.schema.columns, n);
     for item in &select.projection {
         match item {
-            SelectItem::Wildcard(_) => final_proj.extend(expand_outer_columns(&outer)),
+            SelectItem::Wildcard(_) => {
+                let rw = WildcardRewrite::for_item(item, outer_visible, "scalar subquery view")?;
+                final_proj.extend(expand_outer_columns(&outer, &rw));
+            }
             SelectItem::QualifiedWildcard(kind, _) => {
                 // `a.*` — only the outer alias is a valid qualifier here.
                 let name = qualified_wildcard_prefix(kind);
@@ -321,7 +328,8 @@ pub(crate) fn emit_scalar_subquery_pieces(
                         "qualified wildcard '{name}.*' does not name the view's FROM relation"
                     )));
                 }
-                final_proj.extend(expand_outer_columns(&outer));
+                let rw = WildcardRewrite::for_item(item, outer_visible, "scalar subquery view")?;
+                final_proj.extend(expand_outer_columns(&outer, &rw));
             }
             SelectItem::UnnamedExpr(e) => final_proj.push(SelectItem::UnnamedExpr(rewrite_expr(
                 client, binder, chain, &mut acc, e, &outer,
@@ -351,7 +359,11 @@ pub(crate) fn emit_scalar_subquery_pieces(
         // correlated aggregate; the final linear then runs over H.
         let h_alias = fresh_alias(&mut acc.taken, "x4h");
         let mut join_select = select.clone();
-        let mut h_proj = expand_outer_columns(&outer);
+        // H must carry EVERY outer column, un-renamed: the final `WHERE` may
+        // reference a column that `EXCEPT` drops from the output, and the final
+        // projection resolves outer columns over H by bare name — so the
+        // drop/rename happens only in `final_proj` above, never here.
+        let mut h_proj = expand_outer_columns(&outer, &WildcardRewrite::empty());
         h_proj.extend(std::mem::take(&mut acc.agg_proj));
         join_select.projection = h_proj;
         join_select.from[0].joins = std::mem::take(&mut acc.joins);
@@ -1141,17 +1153,26 @@ fn correlation_on(outer: &OuterCtx, corr: &[(usize, usize)], seg_alias: &str, k_
 }
 
 /// Every non-hidden outer column as a qualified projection item `outer.col`.
-fn expand_outer_columns(outer: &OuterCtx) -> Vec<SelectItem> {
+/// Expand the outer relation's visible columns as qualified `alias.col`
+/// projection items. `rw` applies the wildcard's `EXCEPT`/`EXCLUDE` (drop) and
+/// `RENAME` (emit `alias.col AS new` instead of the bare reference); pass
+/// [`WildcardRewrite::empty`] for an internal expansion (the H-materialization)
+/// that must stay complete and un-renamed.
+fn expand_outer_columns(outer: &OuterCtx, rw: &WildcardRewrite) -> Vec<SelectItem> {
     outer
         .schema
         .columns
         .iter()
-        .filter(|c| !c.is_hidden)
+        .filter(|c| !c.is_hidden && !rw.excludes(&c.name))
         .map(|c| {
-            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(vec![
-                Ident::new(outer.alias.clone()),
-                Ident::new(c.name.clone()),
-            ]))
+            let col_ref = Expr::CompoundIdentifier(vec![Ident::new(outer.alias.clone()), Ident::new(c.name.clone())]);
+            match rw.output_name(&c.name) {
+                Some(new) => SelectItem::ExprWithAlias {
+                    expr: col_ref,
+                    alias: Ident::new(new),
+                },
+                None => SelectItem::UnnamedExpr(col_ref),
+            }
         })
         .collect()
 }

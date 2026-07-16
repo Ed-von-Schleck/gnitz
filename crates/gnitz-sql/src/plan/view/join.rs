@@ -5,7 +5,7 @@
 
 use crate::ast_util::{
     collect_column_refs, collect_projection_column_refs, extract_table_name_and_alias, flatten_conjuncts,
-    is_wildcard_projection,
+    is_wildcard_projection, WildcardRewrite,
 };
 use crate::bind::{resolve_qualified_column, resolve_unqualified_column, AliasMap, Binder, ResolvedRelation};
 use crate::error::GnitzSqlError;
@@ -1775,12 +1775,28 @@ pub(crate) fn build_join_view_projection(
             // Visible combined columns only: a `SELECT *` join must not
             // re-admit an upstream source's hidden key (e.g. joining over a
             // view whose PK is a synthetic `_join_pk`) into this view's
-            // payload.
+            // payload. `EXCEPT`/`EXCLUDE`/`RENAME` rewrite the output list by
+            // name (drop-all/rename-all on a shared name — a two-`id` join drops
+            // or relabels both), and `REPLACE`/`ILIKE` reject in `for_item`.
+            // Validate names lazily against the same `coldef` range the loop
+            // expands — the closure is never called for a bare `*` (`for_item`
+            // short-circuits), so no combined columns are cloned on that path.
+            let rw = WildcardRewrite::for_item(
+                item,
+                |n| {
+                    (0..n_combined).any(|i| {
+                        let cd = coldef(i);
+                        !cd.is_hidden && cd.name.eq_ignore_ascii_case(n)
+                    })
+                },
+                label,
+            )?;
             for i in 0..n_combined {
                 let cd = coldef(i);
                 if cd.is_hidden {
                     continue;
                 }
+                let Some(cd) = rw.rewrite_column(&cd) else { continue };
                 cols.push(cd);
                 proj.push(payload_offset + i);
             }

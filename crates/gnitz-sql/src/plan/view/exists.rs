@@ -33,7 +33,7 @@
 
 use crate::ast_util::{
     body_is_grouped, expr_operands, extract_table_name_and_alias, find_subquery, flatten_conjuncts,
-    is_wildcard_projection, projection_item_expr,
+    is_wildcard_projection, projection_item_expr, wildcard_name_is_visible, WildcardRewrite,
 };
 use crate::bind::{
     bind_single_table, bind_single_table_mark, build_alias_map, resolve_qualified_column, resolve_unqualified_column,
@@ -864,13 +864,21 @@ fn build_mark_projection(
         if projection_item_expr(item).is_none() {
             // `*` / `t.*` → the visible outer columns only (single outer
             // relation). A hidden outer key (EXISTS over a view with a synthetic
-            // PK) is not re-admitted into this view's payload.
+            // PK) is not re-admitted into this view's payload. `EXCEPT`/
+            // `EXCLUDE`/`RENAME` rewrite by name; `REPLACE`/`ILIKE` reject.
+            let rw = WildcardRewrite::for_item(
+                item,
+                |n| wildcard_name_is_visible(&branch_schema.columns[npk..npk + outer_n], n),
+                "mark view",
+            )?;
             for i in npk..npk + outer_n {
-                if branch_schema.columns[i].is_hidden {
+                let col = &branch_schema.columns[i];
+                if col.is_hidden {
                     continue;
                 }
+                let Some(out) = rw.rewrite_column(col) else { continue };
                 items.push(ProjItem::PassThrough { src_col: i });
-                out_cols.push(branch_schema.columns[i].clone());
+                out_cols.push(out);
             }
             continue;
         }

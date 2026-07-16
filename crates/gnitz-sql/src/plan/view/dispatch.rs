@@ -4,7 +4,8 @@
 
 use crate::ast_util::{
     body_is_grouped, collect_column_refs, collect_projection_column_refs, count_subqueries, extract_name,
-    extract_relation_name, extract_table_factor_name, flatten_conjuncts, is_wildcard_projection, projection_item_expr,
+    extract_relation_name, extract_table_factor_name, flatten_conjuncts, is_bare_wildcard_projection,
+    projection_item_expr,
 };
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;
@@ -470,8 +471,10 @@ fn inline_passthrough_cte(
     // Positional identity projection: `*`, or one identifier per source column in
     // order. The qualified form (`SELECT t.a, t.b FROM t`) parses as `CompoundIdentifier`
     // and is the same positional pass-through; a dup-named source fails the per-position
-    // compare and compiles instead.
-    let proj_is_identity = is_wildcard_projection(&cte_select.projection)
+    // compare and compiles instead. Only a *bare* `*` is identity — a
+    // `* EXCEPT/EXCLUDE/RENAME` (or a rejected `* REPLACE/ILIKE`) CTE body must
+    // fall to the real builder (`compile_hidden_body`) so the modifier is honored.
+    let proj_is_identity = is_bare_wildcard_projection(&cte_select.projection)
         || (cte_select.projection.len() == cte_schema.columns.len()
             && cte_select.projection.iter().enumerate().all(|(i, item)| {
                 let want = &cte_schema.columns[i].name;

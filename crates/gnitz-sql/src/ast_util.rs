@@ -1,5 +1,7 @@
 use crate::error::GnitzSqlError;
 use crate::ir::AggFunc;
+use gnitz_core::ColumnDef;
+use sqlparser::ast::{ExcludeSelectItem, RenameSelectItem, SelectItem, WildcardAdditionalOptions};
 
 /// Extract the last identifier name from an ObjectName.
 pub(crate) fn extract_name(name: &sqlparser::ast::ObjectName, context: &str) -> Result<String, GnitzSqlError> {
@@ -365,4 +367,177 @@ pub(crate) fn single_relation_col_name(e: &sqlparser::ast::Expr) -> Option<&str>
         Expr::CompoundIdentifier(p) if p.len() == 2 => Some(&p[1].value),
         _ => None,
     }
+}
+
+/// The wildcard modifier options on a `*` / `tbl.*` item, else `None` — the one
+/// place that unifies the two `SelectItem` wildcard variants so a caller never
+/// has to match both.
+fn wildcard_options(item: &SelectItem) -> Option<&WildcardAdditionalOptions> {
+    match item {
+        SelectItem::Wildcard(o) | SelectItem::QualifiedWildcard(_, o) => Some(o),
+        _ => None,
+    }
+}
+
+/// True when a wildcard carries any modifier (`EXCEPT`/`EXCLUDE`/`REPLACE`/
+/// `RENAME`/`ILIKE`) — i.e. it is not a plain `*`. Backs
+/// [`is_bare_wildcard_projection`], which must keep an options-bearing wildcard
+/// out of the no-op identity fast paths.
+fn wildcard_options_present(o: &WildcardAdditionalOptions) -> bool {
+    o.opt_ilike.is_some()
+        || o.opt_exclude.is_some()
+        || o.opt_except.is_some()
+        || o.opt_replace.is_some()
+        || o.opt_rename.is_some()
+}
+
+/// A validated schema-space rewrite for one wildcard's `EXCEPT`/`EXCLUDE` +
+/// `RENAME`. Construction ([`WildcardRewrite::for_item`]):
+///   (a) rejects `REPLACE` and `ILIKE` (`Unsupported` — gnitz honors neither a
+///       value substitution nor a name-pattern filter);
+///   (b) unions `EXCEPT` ∪ `EXCLUDE` names into a drop-set;
+///   (c) collects `RENAME` as (from → to) pairs;
+///   (d) validates every drop name and every rename source names a *visible*
+///       column (via the caller's `is_visible`, so a typo errors instead of
+///       silently dropping/renaming nothing), that no column is both dropped
+///       and renamed, and that no `RENAME` source is named twice.
+/// Then per expanded column: [`excludes`](Self::excludes) (drop-all-matching)
+/// and [`output_name`](Self::output_name) (renamed target, else the original).
+/// Matching is case-insensitive (`eq_ignore_ascii_case`), like
+/// `find_unique_column`. A plain `*` yields an empty rewrite (excludes → false,
+/// output_name → None) and `is_visible` is never called.
+pub(crate) struct WildcardRewrite<'a> {
+    drop: Vec<&'a str>,
+    rename: Vec<(&'a str, &'a str)>, // (from, to)
+}
+
+impl<'a> WildcardRewrite<'a> {
+    pub(crate) fn for_item(
+        item: &'a SelectItem,
+        mut is_visible: impl FnMut(&str) -> bool,
+        context: &str,
+    ) -> Result<Self, GnitzSqlError> {
+        let Some(o) = wildcard_options(item) else {
+            return Ok(Self::empty());
+        };
+        // gnitz honors neither a computed value substitution (REPLACE) nor a
+        // name-pattern filter (ILIKE); reject rather than silently expand `*`.
+        if o.opt_replace.is_some() {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "{context}: SELECT * REPLACE is not supported"
+            )));
+        }
+        if o.opt_ilike.is_some() {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "{context}: SELECT * ILIKE is not supported"
+            )));
+        }
+        // EXCEPT and EXCLUDE are synonyms (ClickHouse/BigQuery vs Snowflake) —
+        // union both into one drop-set.
+        let mut drop = Vec::new();
+        if let Some(e) = &o.opt_except {
+            drop.push(e.first_element.value.as_str());
+            drop.extend(e.additional_elements.iter().map(|i| i.value.as_str()));
+        }
+        match &o.opt_exclude {
+            Some(ExcludeSelectItem::Single(i)) => drop.push(i.value.as_str()),
+            Some(ExcludeSelectItem::Multiple(v)) => drop.extend(v.iter().map(|i| i.value.as_str())),
+            None => {}
+        }
+        let mut rename = Vec::new();
+        match &o.opt_rename {
+            Some(RenameSelectItem::Single(a)) => rename.push((a.ident.value.as_str(), a.alias.value.as_str())),
+            Some(RenameSelectItem::Multiple(v)) => {
+                rename.extend(v.iter().map(|a| (a.ident.value.as_str(), a.alias.value.as_str())))
+            }
+            None => {}
+        }
+        let me = Self { drop, rename };
+        // A drop/rename source that names no visible column is a typo: error
+        // rather than silently dropping/renaming nothing.
+        for &n in me.drop.iter().chain(me.rename.iter().map(|(f, _)| f)) {
+            if !is_visible(n) {
+                return Err(GnitzSqlError::Bind(format!(
+                    "{context}: SELECT * EXCEPT/EXCLUDE/RENAME names unknown column '{n}'"
+                )));
+            }
+        }
+        // A column that is both excluded and renamed is a contradiction.
+        if let Some((f, _)) = me.rename.iter().find(|(f, _)| me.excludes(f)) {
+            return Err(GnitzSqlError::Bind(format!(
+                "{context}: SELECT * RENAME names excluded column '{f}'"
+            )));
+        }
+        // Contradictory rename sources (`RENAME (id AS x, id AS y)`) — `output_name`
+        // would silently keep only the first. Reject rather than drop `y`.
+        for (i, (f, _)) in me.rename.iter().enumerate() {
+            if me.rename[i + 1..].iter().any(|(g, _)| g.eq_ignore_ascii_case(f)) {
+                return Err(GnitzSqlError::Bind(format!(
+                    "{context}: SELECT * RENAME names column '{f}' twice"
+                )));
+            }
+        }
+        Ok(me)
+    }
+
+    /// The no-op rewrite — used where a wildcard is expanded internally (not the
+    /// user's final projection), e.g. the scalar-subquery H-materialization,
+    /// which must carry every outer column un-renamed.
+    pub(crate) fn empty() -> Self {
+        Self {
+            drop: Vec::new(),
+            rename: Vec::new(),
+        }
+    }
+
+    /// Whether an expanded column named `name` is dropped (`EXCEPT`/`EXCLUDE`).
+    pub(crate) fn excludes(&self, name: &str) -> bool {
+        self.drop.iter().any(|d| d.eq_ignore_ascii_case(name))
+    }
+
+    /// The renamed output name for an expanded column named `name`, or `None`
+    /// when it keeps its original name.
+    pub(crate) fn output_name(&self, name: &str) -> Option<&'a str> {
+        self.rename
+            .iter()
+            .find(|(f, _)| f.eq_ignore_ascii_case(name))
+            .map(|&(_, t)| t)
+    }
+
+    /// Apply the rewrite to one expanded column: `None` if it is dropped
+    /// (`EXCEPT`/`EXCLUDE`), else the column def with its `RENAME` target name
+    /// applied. The single home for the drop-then-rename per-column transform
+    /// every `ColumnDef`-producing wildcard-expansion loop shares.
+    pub(crate) fn rewrite_column(&self, col: &ColumnDef) -> Option<ColumnDef> {
+        if self.excludes(&col.name) {
+            return None;
+        }
+        let mut out = col.clone();
+        if let Some(new) = self.output_name(&out.name) {
+            out.name = new.to_string();
+        }
+        Some(out)
+    }
+}
+
+/// Whether `name` matches a *visible* (non-hidden) column of `cols`,
+/// case-insensitively — the visibility test the wildcard-modifier call sites
+/// hand to [`WildcardRewrite::for_item`]. Unlike [`find_unique_column`], a name
+/// shared by two visible columns is not an error here: a `SELECT * EXCEPT (id)`
+/// over a two-`id` join deliberately drops both.
+///
+/// [`find_unique_column`]: crate::bind::find_unique_column
+pub(crate) fn wildcard_name_is_visible(cols: &[ColumnDef], name: &str) -> bool {
+    cols.iter().any(|c| !c.is_hidden && c.name.eq_ignore_ascii_case(name))
+}
+
+/// A plain `*` projection (every item is `Wildcard` with NO modifiers) — a true
+/// identity expansion. A wildcard carrying any option is excluded, so the
+/// identity fast paths guarded by this fall through to real expansion where the
+/// options are honored (`EXCEPT`/`EXCLUDE`/`RENAME`) or rejected
+/// (`REPLACE`/`ILIKE`).
+pub(crate) fn is_bare_wildcard_projection(projection: &[SelectItem]) -> bool {
+    projection
+        .iter()
+        .all(|p| matches!(p, SelectItem::Wildcard(o) if !wildcard_options_present(o)))
 }

@@ -2,7 +2,9 @@
 //! EXCEPT, and DISTINCT, all hashed to a synthetic content-PK and combined with
 //! join-free union/negate/distinct/positive_part arithmetic per operator.
 
-use crate::ast_util::{extract_table_factor_name, is_wildcard_projection};
+use crate::ast_util::{
+    extract_table_factor_name, is_bare_wildcard_projection, wildcard_name_is_visible, WildcardRewrite,
+};
 use crate::bind::{bind_single_table, Binder};
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
@@ -137,8 +139,10 @@ fn resolve_set_projection(
     // Wildcard expands to *visible* columns only: an upstream synthetic key
     // (`_join_pk`, `_set_pk`, …) must not participate in UNION/INTERSECT/
     // EXCEPT/DISTINCT row identity — hashing it into the dedup key would keep
-    // otherwise-identical rows distinct.
-    if is_wildcard_projection(projection) {
+    // otherwise-identical rows distinct. Only a *bare* `*` takes this fast path;
+    // a `* EXCEPT/EXCLUDE/RENAME` (or a rejected `* REPLACE/ILIKE`) falls into
+    // the single Wildcard arm below.
+    if is_bare_wildcard_projection(projection) {
         let (indices, cols): (Vec<usize>, Vec<ColumnDef>) =
             source_schema.visible_columns().map(|(i, c)| (i, c.clone())).unzip();
         reject_float_keys(source_schema, &indices)?;
@@ -149,9 +153,14 @@ fn resolve_set_projection(
     for item in projection {
         match item {
             SelectItem::Wildcard(_) => {
+                // Visible columns only (as the bare-`*` fast path); `EXCEPT`/
+                // `EXCLUDE`/`RENAME` rewrite by name, `REPLACE`/`ILIKE` reject.
+                let rw =
+                    WildcardRewrite::for_item(item, |n| wildcard_name_is_visible(&source_schema.columns, n), context)?;
                 for (i, col) in source_schema.visible_columns() {
+                    let Some(out) = rw.rewrite_column(col) else { continue };
                     indices.push(i);
-                    out_cols.push(col.clone());
+                    out_cols.push(out);
                 }
             }
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {

@@ -1,4 +1,6 @@
-use crate::ast_util::{is_wildcard_projection, single_relation_col_name};
+use crate::ast_util::{
+    is_bare_wildcard_projection, single_relation_col_name, wildcard_name_is_visible, WildcardRewrite,
+};
 use crate::bind::find_unique_column;
 use crate::codec::nullmap::{null_word_get, null_word_set};
 use crate::error::GnitzSqlError;
@@ -35,7 +37,9 @@ pub(crate) fn apply_projection(
 }
 
 pub(crate) fn resolve_projection(projection: &[SelectItem], schema: &Schema) -> Result<Projection, GnitzSqlError> {
-    if is_wildcard_projection(projection) {
+    // Only a *bare* `*` is the no-op passthrough; a `* EXCEPT/EXCLUDE/RENAME`
+    // (or a rejected `* REPLACE/ILIKE`) falls through to the expansion arm below.
+    if is_bare_wildcard_projection(projection) {
         return Ok(None);
     }
 
@@ -49,9 +53,15 @@ pub(crate) fn resolve_projection(projection: &[SelectItem], schema: &Schema) -> 
     for item in projection {
         match item {
             SelectItem::Wildcard(_) => {
+                // `SELECT *` on this one-shot surface carries every physical
+                // column (hidden ones included, matching plain-`*` passthrough);
+                // `EXCEPT`/`EXCLUDE`/`RENAME` rewrite by visible name, and
+                // `REPLACE`/`ILIKE` are rejected inside `for_item`.
+                let rw = WildcardRewrite::for_item(item, |n| wildcard_name_is_visible(&schema.columns, n), "SELECT")?;
                 for (i, c) in schema.columns.iter().enumerate() {
+                    let Some(def) = rw.rewrite_column(c) else { continue };
                     col_indices.push(i);
-                    out_defs.push(c.clone());
+                    out_defs.push(def);
                 }
             }
             SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {

@@ -7,6 +7,7 @@
 //! builder (`plan::view::simple`) — the join and SET projections have their own
 //! leading-column contracts and build their layouts separately.
 
+use crate::ast_util::{wildcard_name_is_visible, WildcardRewrite};
 use crate::bind::bind_single_table;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
@@ -160,9 +161,20 @@ pub(crate) fn build_projection(
             // new view's payload. A hidden *source PK* is not lost: place_pk_front
             // re-prepends it below (staying hidden), so the derived view still
             // carries the full source PK verbatim.
-            for (i, _col) in source_schema.visible_columns() {
+            //
+            // `EXCEPT`/`EXCLUDE`/`RENAME` rewrite the output column list per
+            // column; `REPLACE`/`ILIKE` are rejected by `for_item`. A dropped
+            // source PK is re-prepended (hidden) by place_pk_front, exactly like
+            // `SELECT <non-pk cols>`.
+            let rw = WildcardRewrite::for_item(
+                item,
+                |n| wildcard_name_is_visible(&source_schema.columns, n),
+                "CREATE VIEW",
+            )?;
+            for (i, col) in source_schema.visible_columns() {
+                let Some(out) = rw.rewrite_column(col) else { continue };
                 items.push(ProjItem::PassThrough { src_col: i });
-                out_cols.push(source_schema.columns[i].clone());
+                out_cols.push(out);
             }
         } else {
             let (it, col) = resolve_proj_col(item, idx, source_schema)?;
