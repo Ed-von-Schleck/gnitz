@@ -198,6 +198,14 @@ impl DagEngine {
     /// Restart re-derives the view from its base tables (the same disk fault
     /// would already abort the base ingest via `ingest_store_and_indices`).
     pub fn flush_view_or_abort(&mut self, view_id: i64) {
+        // A non-checkpointed relation's output store is RAM-only by policy
+        // (`RelationKind::checkpointed`): a transient must never spill to
+        // shards — the flush would strand scratch shards its teardown then has
+        // to reap. Enforced here, in the flush primitive, so every caller is
+        // transient-proof by construction.
+        if self.tables.get(&view_id).is_some_and(|e| !e.kind.checkpointed()) {
+            return;
+        }
         if let Err(e) = self.flush(view_id) {
             crate::gnitz_fatal_abort!(
                 "dag: view trace flush failed (view_id={}): {} — view state \
@@ -248,8 +256,21 @@ impl DagEngine {
     /// tables are excluded: they live in `TableEntry::index_circuits`, not the
     /// plan cache, and stay erase-at-boot.
     pub(crate) fn collect_ephemeral_flush_tables(&mut self) -> (Vec<*mut Table>, Vec<*mut Table>) {
+        // Trace half: only a *checkpointed* relation's owned operator traces are
+        // persisted this round. Iterate the (smaller) plan cache and consult
+        // `tables` — a disjoint sibling field — for each plan's `kind`. Every
+        // `cache` entry has a matching `tables` entry (`ensure_compiled` requires
+        // `tables.get(view_id)` first; `unregister_table` removes both together),
+        // so this misses no checkpointed trace — and, load-bearing, it never
+        // returns a `Transient`'s traces: a transient's compiled plan lives in
+        // `cache[tid]` to run, but `kind.checkpointed()` excludes it here, so a
+        // `FLAG_FLUSH_EPH` round interleaving an in-flight transient cannot
+        // durably persist (leak) its RAM-only operator traces.
         let mut traces: Vec<*mut Table> = Vec::new();
-        for plan in self.cache.values_mut() {
+        for (tid, plan) in self.cache.iter_mut() {
+            if !self.tables.get(tid).is_some_and(|e| e.kind.checkpointed()) {
+                continue;
+            }
             for sub in plan.sub_plans_mut() {
                 // Null owned cursors before the fold so none holds a stale snapshot.
                 sub.vm.null_owned_cursors();
@@ -261,7 +282,9 @@ impl DagEngine {
 
         let mut outputs: Vec<*mut Table> = Vec::new();
         for entry in self.tables.values() {
-            if entry.kind != RelationKind::View {
+            // Only a checkpointed relation's output store is persisted this
+            // round; a Transient's output store is RAM-only by policy.
+            if !entry.kind.checkpointed() {
                 continue;
             }
             // Views are always `Partitioned`; a replicated view holds exactly its

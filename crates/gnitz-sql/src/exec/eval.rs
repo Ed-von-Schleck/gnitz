@@ -243,6 +243,81 @@ pub(crate) fn eval_pred_row(
     Ok(eval_expr(pred, batch, i, schema)?.is_some_and(|v| v != 0))
 }
 
+/// Row-free capability probe over the SAME [`BoundExprBackend`] surface
+/// [`InterpBackend`] runs: each node succeeds iff the interpreter's arm for it
+/// can never error. Deriving the thin-routing verdict from the shared trait
+/// means a capability added to the interpreter is a compile-error-enforced
+/// decision here too, so the verdict cannot silently drift from the execution.
+/// Having no row, the probe walks every operand and every CASE branch eagerly —
+/// deliberately conservative: a branch the interpreter would short-circuit past
+/// still disqualifies (the executor serves those shapes with full typing).
+struct ThinProbe<'a> {
+    schema: &'a Schema,
+}
+
+impl BoundExprBackend for ThinProbe<'_> {
+    type Out = ();
+
+    fn col_ref(&mut self, c: usize) -> Result<(), GnitzSqlError> {
+        // The interpreter decodes a column (PK or payload) only through
+        // `FixedInt::from_type_code` — ≤8-byte fixed-width integers; strings,
+        // blobs, floats, and U128/UUID all error there.
+        FixedInt::from_type_code(self.schema.columns[c].type_code)
+            .map(|_| ())
+            .ok_or_else(|| GnitzSqlError::Unsupported("column type not interpreter-evaluable".to_string()))
+    }
+
+    fn lit_int(&mut self, _v: i64) -> Result<(), GnitzSqlError> {
+        Ok(())
+    }
+
+    fn lit_float(&mut self, _v: f64) -> Result<(), GnitzSqlError> {
+        Err(GnitzSqlError::Unsupported("float literal".to_string()))
+    }
+
+    fn lit_str(&mut self, _s: &str) -> Result<(), GnitzSqlError> {
+        Err(GnitzSqlError::Unsupported("string literal".to_string()))
+    }
+
+    fn lit_null(&mut self) -> Result<(), GnitzSqlError> {
+        Ok(())
+    }
+
+    fn binop(&mut self, l: &BoundExpr, _op: BinOp, r: &BoundExpr) -> Result<(), GnitzSqlError> {
+        lower_bound_expr(l, self)?;
+        lower_bound_expr(r, self)
+    }
+
+    fn unop(&mut self, _op: UnaryOp, inner: &BoundExpr) -> Result<(), GnitzSqlError> {
+        lower_bound_expr(inner, self)
+    }
+
+    fn null_test(&mut self, _c: usize, _want_null: bool) -> Result<(), GnitzSqlError> {
+        Ok(())
+    }
+
+    fn agg_call(&mut self) -> Result<(), GnitzSqlError> {
+        Err(GnitzSqlError::Unsupported("aggregate call".to_string()))
+    }
+
+    fn case(&mut self, branches: &[(BoundExpr, BoundExpr)], else_: Option<&BoundExpr>) -> Result<(), GnitzSqlError> {
+        for (cond, result) in branches {
+            lower_bound_expr(cond, self)?;
+            lower_bound_expr(result, self)?;
+        }
+        match else_ {
+            Some(e) => lower_bound_expr(e, self),
+            None => Ok(()),
+        }
+    }
+}
+
+/// True iff the interpreter ([`eval_pred_row`]) can evaluate `e` on any row of
+/// `schema` without erroring — the thin-routing verdict.
+pub(crate) fn expr_is_thin(e: &BoundExpr, schema: &Schema) -> bool {
+    lower_bound_expr(e, &mut ThinProbe { schema }).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

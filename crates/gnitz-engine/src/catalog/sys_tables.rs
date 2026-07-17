@@ -33,6 +33,44 @@ pub(crate) const SEQ_ID_TOPOLOGY: i64 = 5;
 pub(crate) const FIRST_USER_TABLE_ID: i64 = gnitz_wire::FIRST_USER_TABLE_ID as i64;
 pub(super) const FIRST_USER_INDEX_ID: i64 = 1;
 
+/// First id of the **transient** (ad-hoc query) band: the top half of the
+/// relation-id space. Durable relations live in `[FIRST_USER_TABLE_ID, 1<<31)`;
+/// a transient's in-RAM, never-persisted id in `[1<<31, 1<<32)`.
+///
+/// **Why a u32 band, not a high i64 one.** A relation id is `u32` by physical
+/// contract throughout the engine, not merely on one wire: the SAL group header
+/// carries it as a u32 (`sal_begin_group`), `Table` stores `table_id: u32`,
+/// `PartitionedTable::new`/`ShardIndex::new` take a u32, `Batch::encode_to_wire`
+/// stamps a u32, and shard **file names on disk** embed it (`shard_{tid}_{lsn}.db`).
+/// The `i64` used for `dag.tables` keys and `target_id` parameters is a
+/// convenience width over that u32. An id above 2^32 does not fail loudly — it
+/// truncates, so `1<<62 | n` would arrive at the worker as `n`, a *live user
+/// relation*: the teardown broadcast would unregister it, the result scan would
+/// stream its rows, and the exchange relay's `(target_id, source_id)` key would
+/// never match its wait, wedging the worker. `1<<31` round-trips every one of
+/// those narrowings exactly (u32→i64 is a zero-extension, so it reads back as a
+/// positive `2147483648`).
+///
+/// Ids are **monotone and never recycled**: a worker that missed a
+/// `DropTransient` keeps `has_plan(tid)`, and a reused id would then silently
+/// drive the *stale* circuit against the new query's sources — wrong rows, no
+/// error. Never recycling degrades that same miss to a scratch leak the boot GC
+/// reaps. The counter is in-RAM and re-seeds here every boot; it is never
+/// persisted and advances no sequence.
+///
+/// The band is reserved against durable ids by `precheck_family` (the point an
+/// id enters `dag.tables`) and by `allocate_table_id`.
+pub(crate) const TRANSIENT_ID_BASE: i64 = 1 << 31;
+
+/// One past the last usable transient id — the band's other end, defined beside
+/// its base so the whole `[1<<31, 1<<32)` invariant lives in one place. An id at
+/// or above this would truncate through the u32 physical contract (above) and
+/// alias a *durable* relation instead of failing, so the master's allocator
+/// rejects the query at this bound. Reaching it takes 2^31 ad-hoc queries within
+/// a single boot; a restart re-seeds the counter, and the boot GC clears the
+/// scratch first.
+pub(crate) const TRANSIENT_ID_LIMIT: i64 = 1 << 32;
+
 pub(super) const SYS_CATALOG_DIRNAME: &str = "_system_catalog";
 
 pub(super) const SCHEMA_TAB_ID: i64 = gnitz_wire::SCHEMA_TAB as i64;
@@ -311,18 +349,7 @@ pub(super) const fn zero_col() -> SchemaColumn {
     SchemaColumn::new(0, 0)
 }
 
-/// Build a `SchemaDescriptor` from the wire-neutral column slice defined in
-/// `gnitz-wire`. Called at compile time — zero runtime allocation.
-const fn from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_indices: &[u32]) -> SchemaDescriptor {
-    let mut buf = [zero_col(); crate::schema::MAX_COLUMNS];
-    let mut i = 0;
-    while i < cols.len() {
-        buf[i] = SchemaColumn::new(cols[i].type_code as u8, if cols[i].nullable { 1 } else { 0 });
-        i += 1;
-    }
-    let (head, _) = buf.split_at(cols.len());
-    SchemaDescriptor::new(head, pk_indices)
-}
+use crate::schema::from_wire_cols;
 
 // Pre-computed schema statics, one per family, indexed by `SysFamily`
 // discriminant — initialised at compile time, never reconstructed.
@@ -449,21 +476,21 @@ pub(crate) const SYS_FAMILIES: [SysFamilyInfo; SysFamily::COUNT] = [
         id: CIRCUIT_NODES_TAB_ID,
         name: "_circuit_nodes",
         cols: gnitz_wire::CIRCUIT_NODES_COLS,
-        pk_cols: &[0, 1],
+        pk_cols: gnitz_wire::CIRCUIT_FAMILY_PK,
         topo_priority: 3,
     },
     SysFamilyInfo {
         id: CIRCUIT_EDGES_TAB_ID,
         name: "_circuit_edges",
         cols: gnitz_wire::CIRCUIT_EDGES_COLS,
-        pk_cols: &[0, 1],
+        pk_cols: gnitz_wire::CIRCUIT_FAMILY_PK,
         topo_priority: 4,
     },
     SysFamilyInfo {
         id: CIRCUIT_NODE_COLUMNS_TAB_ID,
         name: "_circuit_node_columns",
         cols: gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS,
-        pk_cols: &[0, 1],
+        pk_cols: gnitz_wire::CIRCUIT_FAMILY_PK,
         topo_priority: 5,
     },
 ];

@@ -27,7 +27,7 @@ use crate::runtime::tls::{ConnCountGuard, TlsShared};
 
 use crate::catalog::{
     CatalogEngine, FIRST_USER_TABLE_ID, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB_ID,
-    SEQ_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID,
+    SEQ_TAB_ID, TABLE_TAB_ID, TRANSIENT_ID_BASE, TRANSIENT_ID_LIMIT, VIEW_TAB_ID,
 };
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingTxn};
 use crate::runtime::lsn::ZoneLsnAllocator;
@@ -39,6 +39,7 @@ use crate::runtime::reactor::{
     join_into, mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either, FsyncFuture, PendingRelay, Reactor, ReadGuard,
     ReplyFuture,
 };
+use crate::runtime::sal::{BACKFILL_DECISION_CONTINUE, BACKFILL_DECISION_STOP};
 use crate::runtime::wire::{
     self as ipc, SchemaWithVersion, FLAG_GET_INDICES, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
 };
@@ -133,9 +134,31 @@ pub struct Shared {
     /// and every commit's zone strictly exceeds it, so a miss reading boot_seed can
     /// never false-pass.
     boot_seed: u64,
+    /// A dedicated exclusion between a transient's drive and the reactor-parking
+    /// CREATE-VIEW DDL. A distinct instance from `catalog_rwlock` on purpose: a
+    /// DDL parked on this one must not block `relay_loop`'s catalog read, or the
+    /// in-flight transient's relays could never complete and release it.
+    drive_rwlock: Rc<AsyncRwLock>,
+    /// Monotone, in-RAM, never-recycled transient-id source, seeded at
+    /// `TRANSIENT_ID_BASE` every boot (never persisted, advances no sequence).
+    /// See `TRANSIENT_ID_BASE` for why the band is a u32 one and why ids are
+    /// never recycled. Single-threaded reactor, so a plain `Cell` — no atomics.
+    next_transient_id: Rc<Cell<i64>>,
 }
 
 impl Shared {
+    /// Allocate the next transient id, or `Err` once the band is exhausted —
+    /// never wrap into the durable band, which would silently alias a live
+    /// relation. Monotone and never recycled (see `TRANSIENT_ID_BASE`).
+    fn alloc_transient_id(&self) -> Result<i64, String> {
+        let tid = self.next_transient_id.get();
+        if tid >= TRANSIENT_ID_LIMIT {
+            return Err("transient id space exhausted for this boot; restart the server".to_string());
+        }
+        self.next_transient_id.set(tid + 1);
+        Ok(tid)
+    }
+
     #[allow(clippy::mut_from_ref)]
     fn cat(&self) -> &mut CatalogEngine {
         unsafe { &mut *self.catalog }
@@ -311,6 +334,8 @@ impl ServerExecutor {
             draining: Rc::clone(&draining),
             table_commit_lsn: RefCell::new(FxHashMap::default()),
             boot_seed: initial_lsn,
+            drive_rwlock: Rc::new(AsyncRwLock::new()),
+            next_transient_id: Rc::new(Cell::new(TRANSIENT_ID_BASE)),
         });
 
         // Catch SIGTERM/SIGINT so the watchdog can drive a final checkpoint
@@ -656,9 +681,14 @@ async fn tick_loop_async(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>
         // flight — the loop is serial) and block until the DDL releases the
         // gate, so no tick runs (and no exchange tick is in flight) while the
         // DDL holds the catalog write lock and parks the reactor. Remaining
-        // Auto/Drain triggers in this batch run after release. No new triggers
-        // arrive meanwhile: the DDL's write lock blocks every push, so the
-        // committer fires no Auto.
+        // Auto/Drain triggers in this batch run after release.
+        //
+        // Effectively no new triggers arrive meanwhile: the DDL's write lock
+        // blocks every push, so the committer fires no Auto. A transient's own
+        // source drain is the one trigger that does NOT follow from a push — but
+        // it cannot be queued behind this gate either, because the DDL takes
+        // `drive_rwlock.write()` BEFORE sending the Quiesce, which parks it on any
+        // in-flight drive's read guard and blocks new drives outright.
         for trigger in std::mem::take(&mut triggers) {
             if let TickTrigger::Quiesce { acked, release } = trigger {
                 let _ = acked.send(());
@@ -726,19 +756,51 @@ async fn run_tick(
     // higher value would report an LSN that this tick never processed.
     let snapshot_lsn = shared.lsn_alloc.published();
 
-    // Allocate every (tid, worker) req_id up front so the SAL emission
-    // sequence is fully prepared before we take any locks.
+    emit_groups_await_acks(
+        shared,
+        "tick",
+        tids.len() * nw,
+        req_ids,
+        fut_slots,
+        ack_slots,
+        |disp, ids| {
+            for (i, &tid) in tids.iter().enumerate() {
+                disp.write_tick_group(tid, &ids[i * nw..(i + 1) * nw])?;
+            }
+            Ok(())
+        },
+    )
+    .await?;
+    shared.last_tick_lsn.set(snapshot_lsn);
+    Ok(())
+}
+
+/// Emit one prepared SAL group sequence and await every ACK — the one home for
+/// the delicate emit-and-await lock shape shared by `run_tick` and the transient
+/// drive loop: req_ids allocated before any lock, `catalog_rwlock.read()` (so
+/// DDL cannot mutate schemas mid-emission) + `sal_writer_excl` covering only the
+/// contiguous emission window (III.3b), one `signal_all` inside it, both
+/// released before awaiting so other reactor work proceeds concurrently with
+/// worker DAG eval. `emit` writes the group(s) against the freshly allocated
+/// req_ids and must not signal.
+async fn emit_groups_await_acks(
+    shared: &Rc<Shared>,
+    op: &'static str,
+    n_req: usize,
+    req_ids: &mut Vec<u64>,
+    fut_slots: &mut Vec<ReplyFuture>,
+    ack_slots: &mut Vec<Option<ipc::DecodedWire>>,
+    emit: impl FnOnce(&mut MasterDispatcher, &[u64]) -> Result<(), String>,
+) -> Result<(), String> {
     req_ids.clear();
-    req_ids.extend((0..tids.len() * nw).map(|_| shared.reactor.alloc_request_id()));
+    req_ids.extend((0..n_req).map(|_| shared.reactor.alloc_request_id()));
 
     let _cat_read = shared.catalog_rwlock.read().await;
     let _sal_excl = shared.sal_writer_excl.lock().await;
 
-    let emit_err = guard_panic("tick", || unsafe {
+    let emit_err = guard_panic(op, || unsafe {
         let disp = &mut *shared.dispatcher;
-        for (i, &tid) in tids.iter().enumerate() {
-            disp.write_tick_group(tid, &req_ids[i * nw..(i + 1) * nw])?;
-        }
+        emit(disp, req_ids)?;
         disp.signal_all();
         Ok(())
     });
@@ -749,13 +811,9 @@ async fn run_tick(
     fut_slots.clear();
     fut_slots.extend(req_ids.iter().copied().map(|id| shared.reactor.await_reply(id)));
     join_into(fut_slots, ack_slots).await;
-    let err = first_worker_error_opt("tick", ack_slots);
+    let err = first_worker_error_opt(op, ack_slots);
     ack_slots.clear();
-    if let Some(e) = err {
-        return Err(e);
-    }
-    shared.last_tick_lsn.set(snapshot_lsn);
-    Ok(())
+    err.map_or(Ok(()), Err)
 }
 
 // ---------------------------------------------------------------------------
@@ -772,7 +830,7 @@ async fn run_tick(
 ///
 /// A lost relay wedges workers blocked in `do_exchange_wait` forever
 /// (they ACK neither tick nor relay and the master stays alive), so both
-/// failure modes — an `emit_relay` error and no space after a reclaim
+/// failure modes — an `emit_relay_with_decision` error and no space after a reclaim
 /// checkpoint — `gnitz_fatal_abort!` rather than warn-and-drop: a loud,
 /// recoverable crash (workers self-exit via `getppid()`, operator
 /// restarts) beats a silent permanent cluster wedge.
@@ -783,6 +841,18 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
             None => return,
         };
 
+        // A transient's chunked exchange drive terminates like a backfill: when
+        // every worker's round is a pad, the master must stamp STOP so the drive
+        // unwinds instead of asking for another chunk. Captured before
+        // `prepare_relay` consumes `relay`.
+        //
+        // Inert for steady-state ticks: `all_pad` inits `true` and is ANDed each
+        // round with each worker's `BACKFILL_PAD_BIT`, which only `handle_backfill`
+        // (and so the transient drive) ever sets — a steady-state tick's
+        // FLAG_EXCHANGE carries `seek_col_idx = 0`, clearing `all_pad` on the first
+        // worker of every non-drive round.
+        let all_pad = relay.all_pad;
+
         // Phase 1: CPU work + catalog read only — no SAL mutex.
         let prep = {
             let _cat = shared.catalog_rwlock.read().await;
@@ -790,6 +860,11 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
                 Ok(p) => p,
                 Err(e) => gnitz_fatal_abort!("prepare_relay failed: {}", e),
             }
+        };
+        let decision = if all_pad {
+            BACKFILL_DECISION_STOP
+        } else {
+            BACKFILL_DECISION_CONTINUE
         };
 
         // Phase 2: emit under the SAL mutex. The space check shares the
@@ -804,7 +879,8 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
                 let _sal = shared.sal_writer_excl.lock().await;
                 if unsafe { (*shared.dispatcher).sal_has_relay_space_arming() } {
                     if let Err(e) = guard_panic("emit_relay", || unsafe {
-                        (*shared.dispatcher).emit_relay(prep.take().expect("relay emitted once"))
+                        (*shared.dispatcher)
+                            .emit_relay_with_decision(prep.take().expect("relay emitted once"), decision)
                     }) {
                         gnitz_fatal_abort!(
                             "emit_relay failed; a lost relay wedges workers \
@@ -934,6 +1010,17 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
     // same pre-alloc-block run. Never written to the SAL.
     if flags & gnitz_wire::FLAG_SCAN_MULTI != 0 {
         handle_scan_multi(shared, peer, client_id, data).await;
+        return;
+    }
+
+    // ---------- Transient (ad-hoc query) execution ----------
+    // Client→master frame carrying a whole DBSP circuit to run ONCE over the
+    // committed base snapshot and discard. Like DDL_TXN / PUSH_TXN / SCAN_MULTI it
+    // carries `target_id = 0` and re-decodes its body from the raw frame (the
+    // generic decode above sees no data block), so it belongs in the same
+    // pre-alloc-block run.
+    if flags & gnitz_wire::FLAG_RUN_TRANSIENT != 0 {
+        handle_run_transient(shared, peer, client_id, data, client_version).await;
         return;
     }
 
@@ -2003,6 +2090,244 @@ fn family_pks_by_sign(families: &[(i64, Batch)], tid: i64, positive: bool) -> Ve
         .unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// Transient (ad-hoc query) execution
+// ---------------------------------------------------------------------------
+
+/// A transient request frame's decoded body: the 3 circuit families and the
+/// declared output schema.
+struct TransientFrame {
+    nodes: Rc<Batch>,
+    edges: Rc<Batch>,
+    node_cols: Rc<Batch>,
+    out_schema: SchemaDescriptor,
+}
+
+/// Decode a `FLAG_RUN_TRANSIENT` frame's 4 blocks: the `CIRCUIT_NODES_TAB` /
+/// `CIRCUIT_EDGES_TAB` / `CIRCUIT_NODE_COLUMNS_TAB` families (matched by the tid
+/// the client stamped on each block header) and the trailing out-schema block.
+///
+/// The out-schema block is identified **by exclusion** — its tid is whatever the
+/// client's provisional view id truncated to, never a value to match on. The
+/// families are decoded against the master's OWN registered system schemas, so a
+/// client cannot dictate the layout its bytes are read with.
+fn decode_transient_frame(shared: &Rc<Shared>, data: &[u8]) -> Result<TransientFrame, String> {
+    let blocks = ipc::decode_ddl_txn(data).map_err(|e| format!("transient decode: {e}"))?;
+    let (mut nodes, mut edges, mut node_cols, mut out_schema) = (None, None, None, None);
+    for (block_tid, block) in blocks {
+        let fam = |tid| decode_sys_family(shared, tid, block).map(Rc::new);
+        match block_tid as u64 {
+            gnitz_wire::CIRCUIT_NODES_TAB => nodes = Some(fam(block_tid)?),
+            gnitz_wire::CIRCUIT_EDGES_TAB => edges = Some(fam(block_tid)?),
+            gnitz_wire::CIRCUIT_NODE_COLUMNS_TAB => node_cols = Some(fam(block_tid)?),
+            _ => {
+                out_schema =
+                    Some(ipc::decode_schema_block(block, false).map_err(|e| format!("transient out-schema: {e}"))?)
+            }
+        }
+    }
+    Ok(TransientFrame {
+        nodes: nodes.ok_or("transient: missing nodes family")?,
+        edges: edges.ok_or("transient: missing edges family")?,
+        node_cols: node_cols.ok_or("transient: missing node_columns family")?,
+        out_schema: out_schema.ok_or("transient: missing output schema")?,
+    })
+}
+
+/// Resolve `tid`'s system-family schema and decode a client wal-block slice
+/// against it — the master's OWN registered layout, so a client cannot dictate
+/// how its bytes are read. `sys_family_schema` rejects a bogus family tid
+/// without the panic `sys_tab_schema` would hit on an unknown id in the system
+/// range. Shared by the DDL_TXN bundle decode and the transient frame decode.
+fn decode_sys_family(shared: &Rc<Shared>, tid: i64, slice: &[u8]) -> Result<Batch, String> {
+    let schema = shared
+        .cat()
+        .sys_family_schema(tid)
+        .ok_or_else(|| format!("{tid} is not a system family"))?;
+    decode_client_batch(slice, &schema).map_err(|e| format!("family {tid} decode error: {e}"))
+}
+
+/// Run one ad-hoc `SELECT`: build the delivered circuit as a transient relation,
+/// drive it once over the committed base snapshot, stream the result, discard it.
+///
+/// Teardown runs on EVERY path past the id allocation — the drive registers
+/// master-side state and worker-side stores as it goes, so an early return
+/// without it leaks them. Hence the bound `result`: never `?` past the teardown.
+async fn handle_run_transient(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: &[u8], client_version: u16) {
+    let frame = match decode_transient_frame(shared, data) {
+        Ok(f) => f,
+        Err(e) => return send_error(peer, 0, client_id, e.as_bytes()).await,
+    };
+    let tid = match shared.alloc_transient_id() {
+        Ok(t) => t,
+        Err(e) => return send_error(peer, 0, client_id, e.as_bytes()).await,
+    };
+
+    let result = drive_transient(shared, peer, client_id, client_version, tid, frame).await;
+    teardown_transient(shared, tid).await;
+    if let Err(e) = result {
+        send_error(peer, tid, client_id, e.as_bytes()).await;
+    }
+}
+
+/// The drive proper, holding `drive_rwlock.read()` for its whole body so the
+/// reactor-parking CREATE-VIEW DDL cannot begin mid-flight (§ `handle_ddl_txn`).
+async fn drive_transient(
+    shared: &Rc<Shared>,
+    peer: &Peer,
+    client_id: u64,
+    client_version: u16,
+    tid: i64,
+    frame: TransientFrame,
+) -> Result<(), String> {
+    let _drive = shared.drive_rwlock.read().await;
+    let nw = shared.disp().num_workers();
+    let TransientFrame {
+        nodes,
+        edges,
+        node_cols,
+        out_schema,
+    } = frame;
+
+    // Derive the sources + the all-replicated verdict from the circuit, and inject
+    // the transient's ViewMeta into the memo (the master never compiles).
+    let (sources, all_replicated) =
+        shared
+            .cat()
+            .dag
+            .transient_prepare(tid, nodes.clone(), edges.clone(), node_cols.clone(), out_schema)?;
+
+    // A `ScanDelta` source in the transient band is a malformed frame: the SQL
+    // planner only ever names durable relations, and an id there could alias a
+    // CONCURRENT ad-hoc query's in-flight transient (drives overlap on the
+    // `drive_rwlock` read side), silently driving its half-built store into
+    // this result. Same trust-boundary posture as the `node_id_i32` gate and
+    // the `precheck_family` band guard: reject, never interpret.
+    if let Some(s) = sources.iter().find(|&&s| s >= TRANSIENT_ID_BASE) {
+        return Err(format!(
+            "transient: ScanDelta source {s} is in the reserved transient band, not a durable relation"
+        ));
+    }
+
+    // A view source reads its maintained output store, so its pending ticks must
+    // land before the drive or the query sees a stale view. MUST precede the first
+    // `catalog_rwlock` acquisition below: the drain parks at `rx.await`, and the
+    // writer-preferring lock held across that park would block DDL writers and the
+    // tick loop's own read lock (the BF-1 three-way deadlock the view-seek path
+    // encodes). A pure base-table transient never drains.
+    let over_view = sources
+        .iter()
+        .any(|s| shared.cat().dag.tables.get(s).is_some_and(|e| e.kind.is_view()));
+    if over_view {
+        drain_pending_ticks(shared).await;
+    }
+
+    // Schema-only registration: the master holds no transient data (its post-fork
+    // active range is empty, so the store is inert) but needs the entry for scan
+    // routing and the reply schema. Stamps the replication verdict on the schema.
+    shared.cat().register_transient_meta(tid, out_schema, all_replicated)?;
+
+    // Prep: broadcast the 3 circuit families (canonical CIRCUIT_FAMILIES order)
+    // as fire-and-forget groups. Workers hold them keyed by tid until the first
+    // drive group builds the circuit; that drive group's signal wakes the
+    // workers for all four groups, so prep emits no signal of its own.
+    guard_panic("transient prep", || unsafe {
+        let disp = &mut *shared.dispatcher;
+        for (&(fam_tid, _), batch) in gnitz_wire::CIRCUIT_FAMILIES.iter().zip([&nodes, &edges, &node_cols]) {
+            disp.broadcast_transient_family(tid, fam_tid as i64, batch)?;
+        }
+        Ok(())
+    })?;
+
+    // Drive each source to all-worker-ACK completion, one `emit_groups_await_acks`
+    // round per source (single-source-per-epoch). No `maybe_checkpoint` on this
+    // path — the write is emitted like a tick. The out-schema wire block is
+    // identical on every drive group, so it is built once. (`tid as u32`
+    // truncates a transient id to its low half in the block header, but that
+    // field is inert: it is the block's self-describing target tid, and the
+    // worker reads the tid from `seek_pk` — mirroring the client's own
+    // provisional-id-truncated schema block.)
+    let mut req_ids: Vec<u64> = Vec::with_capacity(nw);
+    let mut fut_slots: Vec<ReplyFuture> = Vec::with_capacity(nw);
+    let mut ack_slots: Vec<Option<ipc::DecodedWire>> = Vec::with_capacity(nw);
+    let schema_block = ipc::build_schema_wire_block(&out_schema, &[], 0, tid as u32);
+    for &src in &sources {
+        emit_groups_await_acks(
+            shared,
+            "transient drive",
+            nw,
+            &mut req_ids,
+            &mut fut_slots,
+            &mut ack_slots,
+            |disp, ids| {
+                disp.write_run_transient_drive(tid, src, all_replicated as u64, &out_schema, &schema_block, ids)
+            },
+        )
+        .await?;
+    }
+
+    // Stream the accumulated result: fan a scan of `tables[tid]` out to the workers
+    // and drain each train to the client. `replicated_unicast` reads the stamped
+    // verdict, so an all-replicated result is read from ONE worker rather than
+    // gathering W identical copies.
+    let unicast = replicated_unicast(shared.dispatcher, tid);
+    let lsn = shared.lsn_alloc.published();
+    match MasterDispatcher::fan_out_scan_async(
+        shared.dispatcher,
+        &shared.reactor,
+        &shared.sal_writer_excl,
+        unicast,
+        tid,
+        client_id,
+        peer,
+        client_version,
+    )
+    .await
+    {
+        Ok(true) => {
+            peer.send_buffer_or_close(make_terminal_scan_frame(tid, client_id, lsn))
+                .await;
+            Ok(())
+        }
+        Ok(false) => {
+            peer.close(); // client disconnected mid-stream
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Free a transient everywhere, on every exit path of `handle_run_transient`.
+///
+/// Emitting `DropTransient` only after the drive's last ACK is what orders it:
+/// per-worker SAL append order then guarantees every worker saw this tid's
+/// `RunTransient` groups first and none is mid-exchange for it when the teardown
+/// lands. A worker faulting mid-drive is fail-stop (the watchdog reaps the
+/// cluster), so its teardown is never delivered — the boot GC reaps the orphaned
+/// scratch instead.
+async fn teardown_transient(shared: &Rc<Shared>, tid: i64) {
+    {
+        let _sal = shared.sal_writer_excl.lock().await;
+        if let Err(e) = guard_panic("drop transient", || unsafe {
+            (*shared.dispatcher).broadcast_drop_transient(tid)
+        }) {
+            // Not fatal: the worker state is RAM + scratch the boot GC reaps, and
+            // ids are never recycled, so a missed teardown cannot alias a later
+            // query. Log loudly — it leaks until restart.
+            gnitz_warn!(
+                "transient {} teardown broadcast failed (leaks until restart): {}",
+                tid,
+                e
+            );
+        }
+    }
+    // The master's own entries: `tables[tid]` + the injected `meta[tid]` + the
+    // derived per-relation caches the result scan populated. Its scratch dir is
+    // never populated (the store is inert here), so there is nothing to remove
+    // on this side.
+    shared.cat().forget_transient(tid);
+}
+
 /// Atomic DDL transaction: ingest a bundle of system-table family batches under
 /// one durable SAL zone. Reached only via the `FLAG_DDL_TXN` route. Every
 /// catalog write — a CREATE's N families or a DROP/CREATE INDEX/CREATE SCHEMA's
@@ -2031,18 +2356,10 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
     let family_count = raw_families.len();
     let mut families: Vec<(i64, Batch)> = Vec::with_capacity(family_count);
     for &(tid, slice) in &raw_families {
-        let schema = match shared.cat().sys_family_schema(tid) {
-            Some(s) => s,
-            None => {
-                let msg = format!("DDL_TXN: {tid} is not a system family");
-                send_error(peer, 0, client_id, msg.as_bytes()).await;
-                return;
-            }
-        };
-        match decode_client_batch(slice, &schema) {
+        match decode_sys_family(shared, tid, slice) {
             Ok(b) => families.push((tid, b)),
             Err(e) => {
-                let msg = format!("DDL_TXN family {tid} decode error: {e}");
+                let msg = format!("DDL_TXN: {e}");
                 send_error(peer, 0, client_id, msg.as_bytes()).await;
                 return;
             }
@@ -2070,6 +2387,31 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
         done: tx,
     });
     let _ = rx.await;
+
+    // Exclude any in-flight transient drive before parking the reactor. A CREATE
+    // VIEW runs `drain_tick_blocking` + `fan_out_backfill` — synchronous futex
+    // loops — under the catalog write lock; beginning that while a shuffle
+    // transient's exchange is in flight wedges the cluster (its relays can never
+    // be emitted). Writer-preference then also blocks new transients for the
+    // duration.
+    //
+    // Taken BEFORE the Quiesce send, and that order is load-bearing: a transient
+    // parked in a drain of its own view source holds `drive_rwlock.read()`, and if
+    // an already-in-flight Quiesce gate sat ahead of that drain, the drain would
+    // never complete, the read guard would never drop, and this write would never
+    // return. Acquiring first parks the DDL on the read guard instead, so no
+    // transient `Drain` is ever queued behind the gate.
+    //
+    // Held to function end (across the drain and the backfill). Only the
+    // reactor-parking view path takes it: CREATE TABLE / DROP / a CREATE UNIQUE
+    // INDEX preflight never park the reactor, so they skip it. Distinct from
+    // `catalog_rwlock`, so a DDL parked here cannot block `relay_loop`'s catalog
+    // read — the in-flight transient's relays complete and release.
+    let _drive_excl = if view_create {
+        Some(shared.drive_rwlock.write().await)
+    } else {
+        None
+    };
 
     let _tick_gate = if view_create {
         let (acked_tx, acked_rx) = oneshot::channel::<()>();

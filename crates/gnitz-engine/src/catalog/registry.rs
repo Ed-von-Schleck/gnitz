@@ -184,8 +184,22 @@ impl CatalogEngine {
         sid
     }
 
+    /// Allocate the next durable relation id (tables and views share this
+    /// counter; indices have their own).
+    ///
+    /// Panics on reaching `TRANSIENT_ID_BASE` rather than issuing an id inside
+    /// the reserved transient band, where a later ad-hoc query's tid would alias
+    /// it and its teardown would unregister and delete this relation. Reaching it
+    /// needs 2^31 durable CREATEs, so this is a tripwire, not a live limit — and
+    /// it is the *secondary* guard: `precheck_family` rejects a band id at the
+    /// point one enters `dag.tables`, which covers the caller-chosen ids the
+    /// register hooks `raise_id_counter` from and which never pass through here.
     pub fn allocate_table_id(&mut self) -> i64 {
         let tid = self.next_table_id;
+        assert!(
+            tid < TRANSIENT_ID_BASE,
+            "durable relation ids exhausted: {tid} would enter the reserved transient band"
+        );
         self.next_table_id += 1;
         self.advance_sequence(SEQ_ID_TABLES, tid - 1, tid);
         tid

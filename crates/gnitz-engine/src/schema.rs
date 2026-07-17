@@ -19,6 +19,23 @@ pub use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
 /// re-exports each item so its call sites are unchanged.
 pub(crate) mod key;
 
+/// Build a `SchemaDescriptor` from a wire-neutral `WireSysCol` slice (the
+/// canonical system-table column arrays in `gnitz-wire`). The single builder
+/// behind every consumer of those arrays — the catalog's compile-time `SCHEMAS`
+/// statics and the query compiler's `from_owned` cursors over a transient's
+/// delivered circuit-family batches — homed here (L1, below both) so the two
+/// can never drift. `const`: zero runtime allocation.
+pub(crate) const fn from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_indices: &[u32]) -> SchemaDescriptor {
+    let mut buf = [SchemaColumn::new(0, 0); MAX_COLUMNS];
+    let mut i = 0;
+    while i < cols.len() {
+        buf[i] = SchemaColumn::new(cols[i].type_code as u8, if cols[i].nullable { 1 } else { 0 });
+        i += 1;
+    }
+    let (head, _) = buf.split_at(cols.len());
+    SchemaDescriptor::new(head, pk_indices)
+}
+
 // ---------------------------------------------------------------------------
 // Schema descriptor
 // ---------------------------------------------------------------------------

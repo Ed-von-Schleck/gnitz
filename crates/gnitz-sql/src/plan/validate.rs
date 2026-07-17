@@ -285,8 +285,10 @@ pub(crate) fn reject_unhonored_select_clauses(
 /// than a silent wrong result.
 #[derive(Clone, Copy)]
 pub(crate) struct HonoredQueryClauses {
-    /// A `WITH` (CTE) clause. Honored only by CREATE VIEW, which inlines it (`inline_ctes`).
-    /// A direct SELECT, a CTE body (nested CTE), and an INSERT source reject it.
+    /// A `WITH` (CTE) clause. Honored by CREATE VIEW and by direct SELECT — both
+    /// inline it (`inline_ctes`; a direct SELECT with a `WITH` always routes to
+    /// the transient executor, so the thin path can never resolve a FROM name a
+    /// CTE shadows). A CTE body (nested CTE) and an INSERT source reject it.
     pub with: bool,
     /// The site runs the client-side ordering sink: `ORDER BY` and `LIMIT`/`OFFSET` are applied
     /// to the fetched batch. Honored only by direct SELECT, which also rejects the `LIMIT … BY`

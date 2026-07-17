@@ -138,10 +138,9 @@ fn heap_less_with<'a, RowCmp: RowComparator + 'a>(
 }
 
 impl ReadCursor {
-    /// Build a ReadCursor from owned in-memory batches (no shards).
-    ///
-    /// Convenience wrapper used by test code.
-    #[cfg(test)]
+    /// Build a ReadCursor from owned in-memory batches (no shards). Used by the
+    /// transient executor to read a delivered circuit's family batches without a
+    /// backing `Table` (no scratch dir / `mkdir`), and by test code.
     pub(crate) fn from_owned(snapshots: &[Rc<Batch>], schema: SchemaDescriptor) -> ReadCursor {
         create_read_cursor(snapshots, &[], schema)
     }

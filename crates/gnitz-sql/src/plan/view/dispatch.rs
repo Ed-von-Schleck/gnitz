@@ -49,13 +49,40 @@ pub(crate) fn execute_create_view(
     // to, so this is the statement's full SQL text.
     let sql_text = format!("{cv}");
 
+    // Compile the body into a durable chain (real `alloc_table_id` ids), then
+    // commit it atomically. `build_query_segments` owns every shape rule; CREATE
+    // VIEW adds only the durable id origin and the `create_view_chain` commit.
+    let mut chain = ViewChain::new();
+    let final_vid = build_query_segments(client, query, binder, &mut chain, view_name, sql_text)?;
+    client
+        .create_view_chain(schema_name, chain.segments)
+        .map_err(GnitzSqlError::Exec)?;
+    Ok(SqlResult::ViewCreated { view_id: final_vid })
+}
+
+/// Compile one query body into a chain of `PlannedView` segments (hidden
+/// segments in dependency order, then the final view named `final_name`),
+/// filling `chain.segments` and returning the final view's id. The chain's id
+/// origin (durable `alloc_table_id` for CREATE VIEW, local provisional for a
+/// transient) is the only difference between the two callers; CTE inlining,
+/// derived-table compilation, the ANY/ALL rewrite, shape classification, and the
+/// per-shape emit are shared verbatim. Does NOT reject unhonored tail clauses —
+/// its callers own that (CREATE VIEW rejects ORDER BY/LIMIT before calling; the
+/// transient path rejects them in `execute_select`).
+fn build_query_segments(
+    client: &mut GnitzClient,
+    query: &Query,
+    binder: &mut Binder<'_>,
+    chain: &mut ViewChain,
+    final_name: String,
+    sql_text: String,
+) -> Result<u64, GnitzSqlError> {
     // Compile the sub-plans first. Pass-through CTEs inline into the binder cache;
     // non-pass-through CTEs and top-level derived tables compile into hidden view
     // segments on `chain`, registered in the binder so the final body below
     // resolves them by name.
-    let mut chain = ViewChain::new();
-    inline_ctes(client, query, binder, &mut chain)?;
-    compile_derived_tables(client, query, binder, &mut chain)?;
+    inline_ctes(client, query, binder, chain)?;
+    compile_derived_tables(client, query, binder, chain)?;
 
     // `x = ANY (sub)` / `x <> ALL (sub)` are equivalent to IN / NOT IN — rewrite
     // them up front so they classify to the existing semi/anti-join path rather
@@ -81,17 +108,17 @@ pub(crate) fn execute_create_view(
         // returns the `Select` the operator should see — with `selection` cleared on
         // the join path, so the WHERE is never re-applied over H.
         ViewShape::Distinct(select) => {
-            let (src, op_select) = resolve_operator_input(client, binder, select, &mut chain, "SELECT DISTINCT")?;
+            let (src, op_select) = resolve_operator_input(client, binder, select, chain, "SELECT DISTINCT")?;
             set_op::emit_distinct_pieces(final_vid, &op_select, src)?
         }
         ViewShape::GroupBy(select) => {
-            let (src, op_select) = resolve_operator_input(client, binder, select, &mut chain, "GROUP BY")?;
+            let (src, op_select) = resolve_operator_input(client, binder, select, chain, "GROUP BY")?;
             group_by::emit_group_by_pieces(client, final_vid, &op_select, src)?
         }
         // Any join FROM — 2-way, N-way, or self-referential — plans as a left-deep
         // chain; intermediate segments and self-join pass-through wrappers land on
         // `chain`, and the final step is emitted with `final_vid`.
-        ViewShape::Join(select) => join::plan_join_chain(client, binder, final_vid, select, &mut chain)?,
+        ViewShape::Join(select) => join::plan_join_chain(client, binder, final_vid, select, chain)?,
         ViewShape::Simple(select) => {
             // Linear filter/map view: lower to `Project(Filter?(Source))`, then emit.
             let rel = crate::plan::lp::lower_linear(client, binder, select)?;
@@ -133,24 +160,44 @@ pub(crate) fn execute_create_view(
                     "a scalar subquery over a compiled CTE/derived-table sub-plan is not supported".to_string(),
                 ));
             }
-            scalar::emit_scalar_subquery_pieces(client, final_vid, select, binder, &mut chain)?
+            scalar::emit_scalar_subquery_pieces(client, final_vid, select, binder, chain)?
         }
     };
 
-    // One atomic bundle: the hidden segments (dependency order) then the
-    // user-named final view.
-    let mut segments = chain.segments;
-    segments.push(PlannedView {
-        name: view_name,
+    // The final segment: the hidden segments already sit on the chain in
+    // dependency order; append the (user-named or synthetic) final view.
+    chain.segments.push(PlannedView {
+        name: final_name,
         sql_text,
         circuit,
         output_columns: out_cols,
         pk_cols,
     });
-    client
-        .create_view_chain(schema_name, segments)
-        .map_err(GnitzSqlError::Exec)?;
-    Ok(SqlResult::ViewCreated { view_id: final_vid })
+    Ok(final_vid)
+}
+
+/// Compile an ad-hoc `SELECT` into the same DBSP circuit a CREATE VIEW would
+/// build, as a chain of `PlannedView` segments minted from **local provisional**
+/// ids (no durable `alloc_table_id`). The executor path in `execute_select` runs
+/// `segments[0]` once as a transient when `segments.len() == 1`, and rejects a
+/// multi-segment bundle (3+-way join, self-join, DISTINCT/GROUP BY over a join,
+/// correlated subquery, non-pass-through CTE, derived table in FROM) with a clean
+/// `Unsupported` — those are the separate transient-chain plan's job.
+pub(crate) fn compile_query_to_circuit(
+    client: &mut GnitzClient,
+    query: &Query,
+    binder: &mut Binder<'_>,
+) -> Result<Vec<PlannedView>, GnitzSqlError> {
+    let mut chain = ViewChain::new_transient();
+    build_query_segments(
+        client,
+        query,
+        binder,
+        &mut chain,
+        "__adhoc_transient".to_string(),
+        "-- ad-hoc transient query".to_string(),
+    )?;
+    Ok(chain.segments)
 }
 
 /// The classified shape of a CREATE VIEW body. Classifying once — in this fixed

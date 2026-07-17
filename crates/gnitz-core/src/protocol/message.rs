@@ -8,6 +8,7 @@ use super::header::{
 use super::transport::ClientTransport;
 use super::types::{meta_schema, PkTuple, Schema, ZSetBatch};
 use super::wal_block::{decode_wal_block, encode_wal_block};
+use gnitz_wire::{FLAG_RUN_TRANSIENT, TRANSIENT_PROVISIONAL_VIEW_ID};
 
 pub struct Message {
     pub status: u32,
@@ -300,6 +301,38 @@ pub fn encode_ddl_txn(client_id: u64, families: &[(u64, &Schema, ZSetBatch)]) ->
     for (tid, schema, batch) in families {
         out.extend_from_slice(&encode_wal_block(schema, *tid as u32, batch));
     }
+    out
+}
+
+/// Encode a `FLAG_RUN_TRANSIENT` frame: one compiled ad-hoc SELECT circuit,
+/// shipped to run once as an unregistered, non-durable transient and stream its
+/// result back. The layout reuses the `encode_ddl_txn` family-block framing —
+/// the reused control block (`flags = FLAG_RUN_TRANSIENT`), a
+/// `u32` family count, then each family's `encode_wal_block` — carrying exactly
+/// the 3 circuit families (CIRCUIT_NODES / CIRCUIT_EDGES / CIRCUIT_NODE_COLUMNS,
+/// keyed under `TRANSIENT_PROVISIONAL_VIEW_ID`) followed by one final block that
+/// is the **output-schema block** (`encode_schema_block`, tid = the provisional
+/// id truncated to `u32`). The engine walks all four blocks by WAL header
+/// (`decode_ddl_txn`), matches the three `CIRCUIT_*_TAB` tids as circuit
+/// families, and decodes the remaining block — identified by exclusion: its tid
+/// is not a `CIRCUIT_*_TAB` id — as the output schema (`decode_schema_block`, reconstructing
+/// full `pk_indices`; this is why the schema is a schema block, not a COL_TAB
+/// family, which cannot carry the PK). No VIEW_TAB/COL_TAB/DEP rows; no fsync
+/// (a transient is a read, never durably registered).
+///
+/// `FLAG_HAS_SCHEMA` is deliberately NOT set, exactly as `encode_ddl_txn` does
+/// not set it. Those flags describe the OUTER control block's own inline
+/// schema/data slots, and this frame has neither: its blocks — the out-schema
+/// one included — live in the txn body, after the `u32` count. Claiming
+/// `FLAG_HAS_SCHEMA` makes the master's generic pre-route decode try to parse a
+/// top-level schema block where the count actually sits, failing the whole frame
+/// with "WAL block truncated" before the transient route is ever reached.
+pub fn encode_run_transient(client_id: u64, families: &[(u64, &Schema, ZSetBatch)], out_schema: &Schema) -> Vec<u8> {
+    let mut out = encode_txn_frame_prologue(client_id, FLAG_RUN_TRANSIENT, families.len() + 1);
+    for (tid, schema, batch) in families {
+        out.extend_from_slice(&encode_wal_block(schema, *tid as u32, batch));
+    }
+    out.extend_from_slice(&encode_schema_block(out_schema, TRANSIENT_PROVISIONAL_VIEW_ID as u32));
     out
 }
 

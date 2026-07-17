@@ -154,10 +154,17 @@ impl CatalogEngine {
     /// the scan dispatch so a replicated relation is read from one worker instead
     /// of gathering N identical copies. SEEK already unicasts to one worker, so it
     /// needs no equivalent check.
+    ///
+    /// A transient ad-hoc query is a relation too, and its result is streamed by
+    /// exactly this scan path: it falls through with the views and is answered by
+    /// `view_all_sources_replicated`'s own transient arm (off the master's
+    /// circuit-derived verdict, stamped on the registered schema), because a
+    /// transient is in no DepTab. Without that, an all-replicated transient's
+    /// result would be broadcast and the client would see N duplicate copies.
     pub fn relation_output_is_replicated(&mut self, id: i64) -> bool {
         match self.dag.tables.get(&id) {
             Some(e) if e.kind.is_base_table() => return e.schema.replicated(),
-            Some(_) => {} // view — fall through (releases the `tables` borrow)
+            Some(_) => {} // view / transient — fall through (releases the `tables` borrow)
             None => return false,
         }
         self.dag.view_all_sources_replicated(id)

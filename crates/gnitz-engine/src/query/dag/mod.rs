@@ -97,6 +97,14 @@ pub enum RelationKind {
     /// Materialised view: ephemeral, partitioned, rebuilt from its sources via
     /// the compiled circuit at open and on live CREATE.
     View,
+    /// Transient ad-hoc query: an unregistered-durably, non-durable,
+    /// unmaintained circuit run **once** over the committed base snapshot and
+    /// discarded. Named for its **storage policy** — never checkpointed, never
+    /// recovered, RAM-only scratch — not an execution count. It is never in the
+    /// DepTab (its `ScanDelta` source set is derived from the circuit directly),
+    /// so the maintenance/dependency walkers never see a Transient id; its
+    /// `recovery_source` arm is defensive only (a transient is never persisted).
+    Transient,
 }
 
 // Niche-optimised to the width of the `unique_pk: bool` it replaced, so
@@ -116,7 +124,32 @@ impl RelationKind {
             RelationKind::View => RecoverySource::RederiveCheckpointed {
                 committed: crate::foundation::worker_ctx::committed_generation(),
             },
+            // A transient is never persisted, so this is reached only defensively
+            // (e.g. an unexpected reopen); it must not claim a committed
+            // generation. `Rederive` erases at open — the correct empty start.
+            RelationKind::Transient => RecoverySource::Rederive,
         }
+    }
+
+    /// True iff this relation's state is persisted by the ephemeral checkpoint
+    /// round. Only a `View` output store / operator trace is checkpointed; a
+    /// `Transient` is RAM-only scratch and must be excluded, else its operator
+    /// traces leak into a durable manifest (`collect_ephemeral_flush_tables`)
+    /// and its output store is flushed to shards (`flush_view_or_abort`).
+    #[inline]
+    pub fn checkpointed(self) -> bool {
+        matches!(self, RelationKind::View)
+    }
+
+    /// True iff this relation may appear in the DepTab at all — as a dependent
+    /// view or as a source of one. Only a `Transient` never does: its `ScanDelta`
+    /// source set is derived from its delivered circuit directly, never recorded
+    /// as dependencies. DepTab-driven mechanisms key on this: teardown skips the
+    /// DepMap invalidation, and the all-sources-replicated verdict reads the
+    /// stamped schema flag instead of the (empty) dependency rows.
+    #[inline]
+    pub fn in_dep_tab(self) -> bool {
+        !matches!(self, RelationKind::Transient)
     }
 
     /// True iff this is a user base table (of either `unique_pk` flavor).
@@ -263,10 +296,16 @@ impl DagEngine {
     }
 
     pub fn unregister_table(&mut self, table_id: i64) {
+        // A Transient is never in the DepTab, so its teardown must not
+        // invalidate the DepMap: the rebuild would land on the next push's
+        // `evaluate_dag`, taxing ingestion for nothing after every ad-hoc query.
+        let invalidate = self.tables.get(&table_id).is_none_or(|e| e.kind.in_dep_tab());
         self.tables.remove(&table_id);
         self.cache.remove(&table_id);
         self.evict_meta(table_id);
-        self.dep.invalidate();
+        if invalidate {
+            self.dep.invalidate();
+        }
     }
 
     pub fn add_index_circuit(
@@ -358,6 +397,100 @@ impl DagEngine {
 
     // ── Compilation ─────────────────────────────────────────────────────
 
+    /// Build and compile a transient's delivered circuit into the plan cache,
+    /// keeping every `compiler` type inside the `dag` facade (the catalog/runtime
+    /// reach the compiler only here). The circuit arrives as its 3 family batches
+    /// (built by the client under the fixed provisional-view-id prefix);
+    /// `out_schema` is its declared output. Unlike `ensure_compiled` this reads no
+    /// sys tables — a transient has no rows there, so `ensure_compiled` would
+    /// `EmptyCircuit`. Scratch trace tables go under the already-registered
+    /// `tables[tid].directory`, so `register_table(.., Transient, ..)` must run
+    /// first; `ext_tables` is the live schema map the compile resolves sources
+    /// against.
+    pub fn compile_transient(
+        &mut self,
+        tid: i64,
+        nodes: Rc<Batch>,
+        edges: Rc<Batch>,
+        node_cols: Rc<Batch>,
+        out_schema: SchemaDescriptor,
+    ) -> Result<(), String> {
+        let view_dir = self
+            .tables
+            .get(&tid)
+            .map(|e| e.directory.clone())
+            .ok_or("compile_transient: tid not registered")?;
+        let ext_tables = self.ext_tables();
+        let loaded = build_transient_loaded(nodes, edges, node_cols, out_schema, "compile_transient")?;
+        // Materializing a transient circuit implies its meta is injected — the
+        // same invariant `transient_prepare` upholds on the master, so no
+        // `view_meta` memo miss can ever read the (empty) sys tables for a
+        // transient id and memoize mis-routing metadata. Evicted by
+        // `unregister_table`.
+        self.meta.insert(tid, Rc::new(ViewMeta::from_loaded(&loaded)));
+        // `RelationKind::Transient.recovery_source()` — the kind decides the
+        // recovery policy in one place, so the transient's operator-trace child
+        // tables open as `Rederive` (RAM-only scratch) instead of inheriting a
+        // view's checkpointed policy.
+        let output = compiler::compile_loaded(
+            loaded,
+            &view_dir,
+            tid as u64,
+            &ext_tables,
+            RelationKind::Transient.recovery_source(),
+        )
+        .map_err(|e| e.describe().to_string())?;
+        self.cache.insert(tid, output);
+        Ok(())
+    }
+
+    /// True iff a compiled plan is cached for `id`. A transient is compiled once
+    /// on first sight of its drive; subsequent per-source drives find it cached.
+    pub fn has_plan(&self, id: i64) -> bool {
+        self.cache.contains_key(&id)
+    }
+
+    /// Master-side transient preparation, derived from the delivered circuit
+    /// families alone — **without compiling or registering anything** (the master
+    /// never holds a `CompileOutput`; compiling would create rank-stamped scratch
+    /// tables it has no business owning). Returns the circuit's `ScanDelta`
+    /// sources — the sequence the master drives — and whether **every** one of
+    /// them is replicated.
+    ///
+    /// Also injects the transient's `ViewMeta` into the memo under `tid`. This is
+    /// load-bearing for the shuffle path: `view_meta` is memo-first, and a
+    /// transient has no sys-table rows, so an un-injected memo miss would read an
+    /// empty circuit and hand the master's exchange relay empty `shard_cols` and
+    /// `range_join_n_eq = None` — mis-routing the re-scatter and dropping the
+    /// `op_relay_broadcast` a pure-range join needs. Pre-injecting means every
+    /// `view_meta` getter returns this unchanged. `unregister_table` evicts it.
+    ///
+    /// A source that is not (yet) registered reads as non-replicated, and any
+    /// partitioned source forces a partitioned output — the conservative verdict,
+    /// matching `view_all_sources_replicated`.
+    ///
+    /// The `LoadedCircuit` is dropped here, so no `compiler` type escapes the
+    /// `dag` facade; only `ViewMeta` (a `dag` type) crosses.
+    pub fn transient_prepare(
+        &mut self,
+        tid: i64,
+        nodes: Rc<Batch>,
+        edges: Rc<Batch>,
+        node_cols: Rc<Batch>,
+        out_schema: SchemaDescriptor,
+    ) -> Result<(Vec<i64>, bool), String> {
+        let loaded = build_transient_loaded(nodes, edges, node_cols, out_schema, "transient_prepare")?;
+        let sources = compiler::scan_source_ids(&loaded, false);
+        if sources.is_empty() {
+            return Err("transient_prepare: circuit has no ScanDelta source".to_string());
+        }
+        let all_replicated = sources
+            .iter()
+            .all(|s| self.tables.get(s).is_some_and(|e| e.schema.replicated()));
+        self.meta.insert(tid, Rc::new(ViewMeta::from_loaded(&loaded)));
+        Ok((sources, all_replicated))
+    }
+
     /// Ensure a view's plan is compiled. Returns true if compilation succeeded.
     pub fn ensure_compiled(&mut self, view_id: i64) -> bool {
         if self.cache.contains_key(&view_id) {
@@ -372,14 +505,21 @@ impl DagEngine {
         }
     }
 
+    /// The registered relations visible to a compile: table id → schema.
+    fn ext_tables(&self) -> compiler::ExtTables {
+        self.tables.iter().map(|(&tid, te)| (tid, te.schema)).collect()
+    }
+
     /// Compile a view by reading system tables and calling `compiler::compile_view`.
     fn compile_view_internal(&self, view_id: i64) -> Option<CompileOutput> {
         let entry = self.tables.get(&view_id)?;
         let view_schema = &entry.schema;
         let view_dir = entry.directory.clone();
+        // The relation's own kind decides how its operator-trace child tables
+        // recover — checkpointed for a View, `Rederive` for a Transient.
+        let recovery = entry.kind.recovery_source();
 
-        // The registered relations visible to this compile: table id → schema.
-        let ext_tables: compiler::ExtTables = self.tables.iter().map(|(&tid, te)| (tid, te.schema)).collect();
+        let ext_tables = self.ext_tables();
 
         let result = unsafe {
             compiler::compile_view(
@@ -390,6 +530,7 @@ impl DagEngine {
                 &view_dir,
                 view_schema,
                 &ext_tables,
+                recovery,
             )
         };
 
@@ -414,6 +555,30 @@ impl DagEngine {
         self.meta.clear();
         self.dep = DepMap::default();
     }
+}
+
+/// Build + topo-sort a transient's delivered circuit families into a
+/// `LoadedCircuit` — the shared front half of `compile_transient` (worker) and
+/// `transient_prepare` (master). Topo-sorting here both satisfies
+/// `ViewMeta::from_loaded`'s adjacency precondition and rejects a cyclic
+/// (malformed) frame on either node.
+fn build_transient_loaded(
+    nodes: Rc<Batch>,
+    edges: Rc<Batch>,
+    node_cols: Rc<Batch>,
+    out_schema: SchemaDescriptor,
+    ctx: &str,
+) -> Result<compiler::LoadedCircuit, String> {
+    let mut loaded = compiler::build_loaded_from_batches(
+        nodes,
+        edges,
+        node_cols,
+        gnitz_wire::TRANSIENT_PROVISIONAL_VIEW_ID,
+        out_schema,
+    )
+    .ok_or_else(|| format!("{ctx}: circuit build failed"))?;
+    compiler::topo_sort(&mut loaded).map_err(|_| format!("{ctx}: circuit is cyclic"))?;
+    Ok(loaded)
 }
 
 // ---------------------------------------------------------------------------
@@ -994,5 +1159,93 @@ mod tests {
         batch.count += 1;
         dag.ingest_to_family(70, batch);
         unreachable!("ingest_store_and_indices must abort when the seam is armed");
+    }
+
+    // ── Transient (ad-hoc query) metadata ───────────────────────────────────
+
+    /// `ViewMeta::from_loaded` must derive a pure-range join's relay routing from
+    /// the circuit alone. This is the whole point of pre-injecting a transient's
+    /// meta: a transient has no sys-table rows, so `view_meta`'s memo miss would
+    /// read an empty circuit and answer `range_join_n_eq = None` + empty
+    /// `shard_cols` — which silently drops the `op_relay_broadcast` a pure-range
+    /// join's input relay needs (n_eq == 0 ⇒ broadcast, not scatter), losing rows.
+    #[test]
+    fn transient_view_meta_from_loaded_carries_range_join_relay_routing() {
+        use gnitz_wire::{JoinKind, OpNode, RangeRel};
+
+        // A pure-range join: ScanDelta → ExchangeShard → Join(DeltaTraceRange
+        // { n_eq: 0 }) → IntegrateSink.
+        let mut nodes: std::collections::HashMap<i32, OpNode> = std::collections::HashMap::new();
+        nodes.insert(0, OpNode::ScanDelta(7));
+        nodes.insert(1, OpNode::ExchangeShard { shard_cols: vec![1] });
+        nodes.insert(
+            2,
+            OpNode::Join(JoinKind::DeltaTraceRange {
+                n_eq: 0,
+                rel: RangeRel::Lt,
+            }),
+        );
+        nodes.insert(3, OpNode::IntegrateSink);
+        let edges = vec![(0, 1, 0), (1, 2, 0), (2, 3, 0)];
+
+        let loaded = compiler::loaded_for_test(nodes, edges);
+
+        let meta = ViewMeta::from_loaded(&loaded);
+        assert_eq!(
+            meta.range_join_n_eq,
+            Some(0),
+            "a pure-range join must be discriminated so the relay broadcasts instead of scattering"
+        );
+        assert_eq!(
+            meta.shard_cols.as_ref(),
+            &[1],
+            "the output ExchangeShard's shard cols must survive"
+        );
+        assert!(meta.has_join && meta.needs_exchange);
+    }
+
+    /// A transient's replication verdict is carried on its registered schema, and
+    /// `view_all_sources_replicated` reads it back from there — it can never come
+    /// off the DepTab, which a transient is never in. Both consumers depend on
+    /// this: the worker's exchange-skip (else an all-replicated result is
+    /// exchanged and N×-overcounted) and the master's scan routing (else N
+    /// duplicate copies reach the client).
+    #[test]
+    fn transient_replication_verdict_reads_off_the_stamped_schema() {
+        let mut dag = DagEngine::new();
+        let base = SchemaDescriptor::default();
+
+        for replicated in [false, true] {
+            let tid = if replicated { 101 } else { 100 };
+            dag.register_table(
+                tid,
+                StoreHandle::Borrowed(std::ptr::null_mut()),
+                base.with_replicated(replicated),
+                RelationKind::Transient,
+                0,
+                String::new(),
+            );
+            assert_eq!(
+                dag.view_all_sources_replicated(tid),
+                replicated,
+                "a Transient's verdict must come from its stamped schema flag, not the (empty) DepTab"
+            );
+            dag.unregister_table(tid);
+        }
+
+        // The DepTab path is untouched for a View: no sources recorded ⇒ false.
+        dag.register_table(
+            102,
+            StoreHandle::Borrowed(std::ptr::null_mut()),
+            base.with_replicated(true),
+            RelationKind::View,
+            0,
+            String::new(),
+        );
+        assert!(
+            !dag.view_all_sources_replicated(102),
+            "a View must still answer off the DepTab, not off a schema flag"
+        );
+        dag.unregister_table(102);
     }
 }

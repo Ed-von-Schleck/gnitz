@@ -446,6 +446,11 @@ pub fn server_main(
         // dag.tables, so a SAL-committed-but-unflushed CREATE is not mistaken
         // for an orphan.
         catalog.gc_orphan_directories();
+
+        // Reap transient (ad-hoc query) scratch orphaned by a pre-restart worker
+        // fault or panic (see `gc_transient_scratch` for why the schema-dir GC
+        // above can never cover it).
+        catalog.gc_transient_scratch();
     }
 
     // --- Boot invalid-view verdict + recovery-start generation bump ---

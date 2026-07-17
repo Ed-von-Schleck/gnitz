@@ -105,26 +105,26 @@ pub fn pk_i64_at(schema: &Schema, batch: &ZSetBatch, ci: usize, row: usize) -> i
     }
 }
 
+/// Read integer column `ci` of `row`, whichever region it lives in: a
+/// PK-region column (a base table's own PK, a shape's natural PK — e.g. a
+/// GROUP BY over the source PK — or a synthetic key like `_join_pk`) is
+/// decoded from `batch.pks`; a payload column from `batch.columns`.
+pub fn cell_i64(schema: &Schema, batch: &ZSetBatch, ci: usize, row: usize) -> i64 {
+    if schema.is_pk_col(ci) {
+        pk_i64_at(schema, batch, ci, row)
+    } else {
+        i64_at(batch, ci, row)
+    }
+}
+
 /// Read a view's named (integer) columns into sorted row tuples, so a test can
 /// compare incremental view contents against an expected full recompute without
-/// decoding the OPK PK region by hand. PK-region columns (a view's real natural
-/// PK — e.g. a GROUP BY over the source PK — or a synthetic `_join_pk`) are read
-/// from the decoded `batch.pks`; payload columns from `batch.columns`.
+/// decoding the OPK PK region by hand.
 pub fn payload_rows(client: &mut GnitzClient, sn: &str, view: &str, cols: &[&str]) -> Vec<Vec<i64>> {
     let (schema, batch) = read_view(client, sn, view);
     let idxs: Vec<usize> = cols.iter().map(|c| col_idx(&schema, c)).collect();
     let mut rows: Vec<Vec<i64>> = (0..batch.len())
-        .map(|r| {
-            idxs.iter()
-                .map(|&ci| {
-                    if schema.is_pk_col(ci) {
-                        pk_i64_at(&schema, &batch, ci, r)
-                    } else {
-                        i64_at(&batch, ci, r)
-                    }
-                })
-                .collect()
-        })
+        .map(|r| idxs.iter().map(|&ci| cell_i64(&schema, &batch, ci, r)).collect())
         .collect();
     rows.sort();
     rows

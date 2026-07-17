@@ -298,6 +298,28 @@ impl CatalogEngine {
                 continue;
             }
 
+            // Reserve the transient (ad-hoc query) id band against every DURABLE
+            // relation, here — the one place an id ENTERS the `dag.tables`
+            // namespace before any mutation. Guarding `allocate_table_id` alone
+            // would not reserve it: the register hooks take the id straight off
+            // the ingested row and `raise_id_counter` it, and the id is
+            // caller-chosen (a client may preset `circuit.view_id`), so a crafted
+            // CREATE VIEW could otherwise register a durable view inside the band.
+            // A transient later allocated at that id would alias it, and the
+            // transient's teardown would unregister and `remove_dir_all` the
+            // user's live view. TABLE_TAB / VIEW_TAB are the only families whose
+            // PK is a `dag.tables` id (index ids are a disjoint namespace —
+            // `next_index_id`/`SEQ_ID_INDICES` — and index tables live in
+            // `entry.index_circuits`, not `dag.tables`).
+            if matches!(table_id, TABLE_TAB_ID | VIEW_TAB_ID) {
+                let id = batch.get_pk(i) as i64;
+                if id >= TRANSIENT_ID_BASE {
+                    return Err(format!(
+                        "relation id {id} is in the reserved transient band (>= {TRANSIENT_ID_BASE})"
+                    ));
+                }
+            }
+
             match table_id {
                 SCHEMA_TAB_ID => {
                     let name = batch.read_payload_string(i, SCHEMATAB_PAY_NAME);

@@ -205,6 +205,98 @@ impl CatalogEngine {
         Ok(pt)
     }
 
+    /// The scratch root for a transient's RAM-only state — its output store, its
+    /// operator-trace tables, and (per worker rank) their partition subdirs. A
+    /// dedicated `_transient/<tid>` tree, distinct from every schema dir, so a
+    /// crash's orphaned scratch is reaped by a single dedicated boot-GC pass
+    /// (`gc_transient_scratch`; the schema-dir `gc_orphan_directories` never
+    /// descends here).
+    pub(crate) fn transient_scratch_dir(&self, tid: i64) -> String {
+        format!("{}/{tid}", self.transient_root())
+    }
+
+    fn transient_root(&self) -> String {
+        format!("{}/_transient", self.base_dir)
+    }
+
+    /// Boot-GC pass for transient scratch orphaned by a pre-restart worker fault
+    /// or panic. A transient's per-rank state is referenced by no manifest and no
+    /// system table, so `gc_orphan_directories` — which enumerates schema dirs
+    /// against the catalog — could never classify it; the whole subtree is
+    /// disposable by construction (RAM-only, never checkpointed, never
+    /// recovered). Clearing it before the first serve is also what makes
+    /// transient-id reuse safe across a restart: the master's transient-id
+    /// counter re-seeds at `TRANSIENT_ID_BASE` each boot, so a pre-crash tid's
+    /// scratch must be gone before that id is handed out again.
+    pub(crate) fn gc_transient_scratch(&self) {
+        let _ = std::fs::remove_dir_all(self.transient_root());
+    }
+
+    /// Register a transient's output store + `tables[tid]` entry
+    /// (`RelationKind::Transient`) WITHOUT compiling — the schema half both nodes
+    /// need: the master for scan routing / reply schema (it holds no transient
+    /// data, and its post-fork active range is empty, so the store is inert), the
+    /// worker as the RAM store its drive accumulates into; the worker then
+    /// compiles the delivered circuit via `dag.compile_transient` (the master
+    /// never compiles — compiling would create rank-stamped scratch tables it has
+    /// no business owning). The storage half of "a
+    /// transient is a view-lifecycle prefix": identical to a view's registration
+    /// except the kind is `Transient` (⇒ `RecoverySource::Rederive`, never
+    /// checkpointed) and the directory is the `_transient` scratch tree.
+    /// `single_partition` mirrors a view's replicated-output decision (all sources
+    /// replicated ⇒ one replicated partition; else hashed).
+    ///
+    /// That same bit is stamped onto the registered schema's `replicated` flag —
+    /// the transient's output IS replicated exactly when every source is (each
+    /// worker then computes the full result locally and skips the exchange). The
+    /// master derives the verdict once from the delivered circuit
+    /// (`DagEngine::transient_prepare`) and ships it to the workers in the drive
+    /// group, so master and worker stamp the identical bit. It is the single
+    /// carrier of the verdict for a transient, which is in no DepTab: both
+    /// `view_all_sources_replicated` (the worker's exchange-skip, and through the
+    /// `relation_output_is_replicated` fall-through the master's scan routing)
+    /// read it back off this flag.
+    pub(crate) fn register_transient_meta(
+        &mut self,
+        tid: i64,
+        out_schema: SchemaDescriptor,
+        single_partition: bool,
+    ) -> Result<(), String> {
+        let out_schema = out_schema.with_replicated(single_partition);
+        let dir = self.transient_scratch_dir(tid);
+        let store = self.build_partitioned_storage(
+            RelationKind::Transient,
+            &dir,
+            "transient",
+            tid,
+            out_schema,
+            single_partition,
+        )?;
+        self.dag.register_table(
+            tid,
+            StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(store))),
+            out_schema,
+            RelationKind::Transient,
+            0,
+            dir,
+        );
+        Ok(())
+    }
+
+    /// Forget a transient everywhere the CATALOG knows it: the DAG registry
+    /// (`tables`/`cache`/`meta`) and the derived per-relation caches the result
+    /// scan populated under its tid (`col_*`/`schema_wire_cache` via
+    /// `get_or_build_schema_wire_block`, plus the version counters). Transient
+    /// ids are monotone and never reused, so an entry left behind here would be
+    /// permanent dead memory — the same doctrine as `purge_table_versions` on
+    /// the drop hook. Idempotent (every removal no-ops when absent); shared by
+    /// the worker's `drop_transient` and the master's `teardown_transient`.
+    pub(crate) fn forget_transient(&mut self, tid: i64) {
+        self.caches.clear_col_cache_no_bump(tid);
+        self.caches.purge_table_versions(tid);
+        self.dag.unregister_table(tid);
+    }
+
     fn hook_table_register(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);

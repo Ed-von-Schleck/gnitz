@@ -82,8 +82,48 @@ pub const FLAG_PUSH_TXN: u64 = 1 << 61;
 /// SCAN_MULTI request flag. Client→master frame naming N relations to snapshot
 /// at one SAL cut. Wire-level routing hint consumed at `handle_message`; never
 /// written to the SAL. Bit 62 — the next free high client-only bit above
-/// `FLAG_PUSH_TXN` (61); 63 is the sign bit, left clear.
+/// `FLAG_PUSH_TXN` (61); 63 is the last free bit (`FLAG_RUN_TRANSIENT`).
 pub const FLAG_SCAN_MULTI: u64 = 1 << 62;
+
+/// RUN_TRANSIENT request flag. The client→master frame carrying one compiled
+/// ad-hoc SELECT circuit (the `encode_ddl_txn` family-block layout: the 3
+/// circuit families + the output-schema block, no VIEW_TAB/COL_TAB/DEP rows) to
+/// run once as an unregistered, non-durable transient and stream the result.
+/// Purely a wire-level routing hint consumed at `handle_message`; it is NEVER
+/// written to the SAL — the master decodes it, then drives the circuit's sources
+/// with its own engine-internal `runtime::sal::FLAG_RUN_TRANSIENT` (u32) groups,
+/// exactly as `FLAG_SEEK_BY_INDEX_RANGE` (bit 55) maps to the distinct
+/// `FLAG_SEEK_BY_INDEX_RANGE_SAL` (u32) dispatch flag. Bit 63 — the last free
+/// client-only bit. It is the sign bit, but `wire_flags` round-trips solely as a
+/// `TypeCode::U64` control-block column (`to_le_bytes`/`read_u64_region`) with no
+/// signed interpretation anywhere, so the high bit is safe.
+pub const FLAG_RUN_TRANSIENT: u64 = 1 << 63;
+
+/// The circuit-family PK prefix (`view_id`) a transient's 3 circuit families are
+/// encoded under, and the client's reply-train key for a transient result. It is
+/// NOT a durable table id — the engine allocates the real transient id
+/// server-side — only the fixed prefix the engine's in-memory circuit builder
+/// filters on. Client and engine must agree on it; a constant is sufficient
+/// because a transient's families are decoded in isolation, never against a
+/// shared catalog.
+///
+/// The value is `1 << 62`, far ABOVE every durable id, because it is a
+/// **client-side** key: `recv_scan` caches the reply's in-frame schema under it,
+/// so a low value would alias a real relation's schema-cache entry (`1` is
+/// `SCHEMA_TAB` — a transient run would poison the client's system-table schema
+/// cache and decode later scans with the wrong schema). In the transient's
+/// output-schema block the tid is truncated to `u32` (`0`) — harmless, since the
+/// frame decoder identifies that block by exclusion (its tid is not a
+/// `CIRCUIT_*_TAB` id), never by value.
+///
+/// It is deliberately UNRELATED to the engine's transient id band
+/// (`TRANSIENT_ID_BASE`), which is a high **u32** band because a real engine
+/// relation id must round-trip the SAL group header, the storage layer, and the
+/// shard file names — all `u32`. This id never becomes an engine tid (the engine
+/// allocates its own), so it is free to sit above `u32` where the client's cache
+/// needs it. Do not "unify" the two: an engine tid up here would truncate and
+/// silently alias a live relation.
+pub const TRANSIENT_PROVISIONAL_VIEW_ID: u64 = 1 << 62;
 
 /// Maximum relations in one SCAN_MULTI request. A product / master-state limit
 /// (the master holds N `ScanLease`s and N reply trains of bookkeeping); a
@@ -190,6 +230,7 @@ const _: () = {
         FLAG_ALLOCATE_INDEX_ID,
         FLAG_PUSH_TXN,
         FLAG_SCAN_MULTI,
+        FLAG_RUN_TRANSIENT,
     ];
     let mut acc = SAL_FLAGS_MASK | packed;
     let mut i = 0;

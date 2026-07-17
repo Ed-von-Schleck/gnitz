@@ -15,16 +15,17 @@ pub(crate) fn bind_residuals(residual: &[&Expr], schema: &Schema) -> Result<Vec<
 /// `gnitz_core::ScanResult`.
 type ScanReply = (Option<Arc<Schema>>, Option<ZSetBatch>, u64);
 
-/// Bind a candidate's residual conjuncts and filter a successful seek result
-/// through them — the shared success path of every WHERE-serving plan in
-/// `execute_select` (PK seek, range scan, equality seek).
+/// Filter a successful seek result through already-bound residual predicates —
+/// the shared success path of every WHERE-serving plan in `execute_select` (PK
+/// seek, range scan, equality seek). The caller binds via `bind_thin_residuals`,
+/// which is also the thin-routing verdict, so the plan that was approved is the
+/// plan that runs.
 pub(crate) fn residual_filtered(
     schema: &Schema,
     (s, b, lsn): ScanReply,
-    residual: &[&Expr],
+    preds: &[BoundExpr],
 ) -> Result<ScanReply, GnitzSqlError> {
-    let preds = bind_residuals(residual, schema)?;
-    let (s2, b2) = apply_residual_filter((s, b), &preds, schema)?;
+    let (s2, b2) = apply_residual_filter((s, b), preds, schema)?;
     Ok((s2, b2, lsn))
 }
 

@@ -24,6 +24,50 @@ pub(super) struct ViewMeta {
     pub has_join: bool,
 }
 
+impl ViewMeta {
+    /// Derive the metadata from an already-loaded circuit. The body behind
+    /// `view_meta`'s memo miss, factored out so a **transient** — whose circuit
+    /// arrives in its request frame and never reaches the sys tables — can have
+    /// its `ViewMeta` pre-injected into the memo at register time. Without that
+    /// injection `view_meta` would take its memo miss, read the (empty) sys
+    /// tables for the transient's id, and memoize a `LoadedCircuit::default()`:
+    /// empty `shard_cols` and `range_join_n_eq = None`, which silently mis-routes
+    /// the master's exchange relay.
+    ///
+    /// `loaded` MUST already be `topo_sort`ed: `compute_join_shard_map` walks
+    /// `loaded.outgoing`, which only `topo_sort` populates.
+    pub(super) fn from_loaded(loaded: &compiler::LoadedCircuit) -> ViewMeta {
+        let shard_cols: Rc<[i32]> = loaded
+            .nodes
+            .values()
+            .find_map(|op| match op {
+                gnitz_wire::OpNode::ExchangeShard { shard_cols } => {
+                    Some(shard_cols.iter().map(|&c| c as i32).collect::<Vec<_>>())
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
+            .into();
+        let join_shard_map: FxHashMap<i64, Rc<[(i32, u8)]>> = compiler::compute_join_shard_map(loaded)
+            .into_iter()
+            .map(|(tid, cols)| (tid, cols.into()))
+            .collect();
+        ViewMeta {
+            shard_cols,
+            join_shard_map,
+            range_join_n_eq: compiler::circuit_range_join_n_eq(loaded),
+            needs_exchange: loaded
+                .nodes
+                .values()
+                .any(|op| matches!(op, gnitz_wire::OpNode::ExchangeShard { .. })),
+            has_join: loaded
+                .nodes
+                .values()
+                .any(|op| matches!(op, gnitz_wire::OpNode::Join(_))),
+        }
+    }
+}
+
 /// The bidirectional view-dependency index with its validity flag bundled in, so
 /// "valid but stale" is unreachable: only `get_or_rebuild` sets `valid` (after
 /// repopulating both maps), and only `invalidate` clears it.
@@ -102,17 +146,7 @@ impl DagEngine {
     /// a *rebuilt* source view's output store would otherwise be missed by a
     /// dependency-only walk.
     pub fn all_scan_source_ids(&self, view_id: i64) -> Vec<i64> {
-        let loaded = self.load_meta_circuit(view_id);
-        let mut ids: Vec<i64> = Vec::new();
-        for op in loaded.nodes.values() {
-            if let gnitz_wire::OpNode::ScanDelta(t) | gnitz_wire::OpNode::ScanTrace(t) = op {
-                let id = *t as i64;
-                if !ids.contains(&id) {
-                    ids.push(id);
-                }
-            }
-        }
-        ids
+        compiler::scan_source_ids(&self.load_meta_circuit(view_id), true)
     }
 
     /// Transitive dependent closure of `seeds` over the view dependency map:
@@ -223,7 +257,24 @@ impl DagEngine {
     /// answers the question off the dependency map with no circuit load and no
     /// allocation. Reads LIVE table flags per call (never baked into a plan or
     /// meta cache): the flag changes with table registration.
+    ///
+    /// A **transient** is never in the DepTab (its `ScanDelta` sources are derived
+    /// from its delivered circuit, not recorded as dependencies), so the DepTab
+    /// path would read "no sources" and answer `false` for it. That is not merely
+    /// conservative here — it is wrong in both directions of the caller set: the
+    /// worker's `execute_multi_worker_step` would exchange every worker's full
+    /// local result for an all-replicated transient and N×-overcount the weights,
+    /// and the master's scan (via the `relation_output_is_replicated`
+    /// fall-through) would broadcast N duplicate copies to the client. Answer it
+    /// from the verdict the master derived from the circuit and stamped on the
+    /// registered schema at `register_transient_meta`, which is exactly this
+    /// predicate for a transient and reaches every worker in the drive group.
     pub(crate) fn view_all_sources_replicated(&mut self, view_id: i64) -> bool {
+        if let Some(e) = self.tables.get(&view_id) {
+            if !e.kind.in_dep_tab() {
+                return e.schema.replicated();
+            }
+        }
         self.get_dep_map();
         let Some(sources) = self.dep.reverse.get(&view_id) else {
             return false;
@@ -269,35 +320,9 @@ impl DagEngine {
         if let Some(m) = self.meta.get(&view_id) {
             return m.clone();
         }
-        let loaded = self.load_meta_circuit(view_id);
-        let shard_cols: Rc<[i32]> = loaded
-            .nodes
-            .values()
-            .find_map(|op| match op {
-                gnitz_wire::OpNode::ExchangeShard { shard_cols } => {
-                    Some(shard_cols.iter().map(|&c| c as i32).collect::<Vec<_>>())
-                }
-                _ => None,
-            })
-            .unwrap_or_default()
-            .into();
-        let join_shard_map: FxHashMap<i64, Rc<[(i32, u8)]>> = compiler::compute_join_shard_map(&loaded)
-            .into_iter()
-            .map(|(tid, cols)| (tid, cols.into()))
-            .collect();
-        let meta = Rc::new(ViewMeta {
-            shard_cols,
-            join_shard_map,
-            range_join_n_eq: compiler::circuit_range_join_n_eq(&loaded),
-            needs_exchange: loaded
-                .nodes
-                .values()
-                .any(|op| matches!(op, gnitz_wire::OpNode::ExchangeShard { .. })),
-            has_join: loaded
-                .nodes
-                .values()
-                .any(|op| matches!(op, gnitz_wire::OpNode::Join(_))),
-        });
+        // `load_meta_circuit` topo-sorts (falling back to an empty circuit on a
+        // malformed one), satisfying `from_loaded`'s precondition.
+        let meta = Rc::new(ViewMeta::from_loaded(&self.load_meta_circuit(view_id)));
         self.meta.insert(view_id, meta.clone());
         meta
     }

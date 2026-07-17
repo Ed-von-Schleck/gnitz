@@ -183,6 +183,20 @@ pub const CIRCUIT_NODE_COLUMNS_TAB: u64 = 13;
 // IDs 14 and 15 were previously CIRCUIT_PARAMS_TAB and CIRCUIT_GROUP_COLS_TAB,
 // now folded into CircuitNodes / CircuitNodeColumns.
 
+/// The three circuit families in canonical `[nodes, edges, node_columns]`
+/// order, each with its column slice — the ONE definition of the family list
+/// and its order, which client (`run_query` ships the families in this order)
+/// and engine (the worker buffers them in a 3-slot array indexed by position
+/// here) must agree on.
+pub const CIRCUIT_FAMILIES: [(u64, &[WireSysCol]); 3] = [
+    (CIRCUIT_NODES_TAB, CIRCUIT_NODES_COLS),
+    (CIRCUIT_EDGES_TAB, CIRCUIT_EDGES_COLS),
+    (CIRCUIT_NODE_COLUMNS_TAB, CIRCUIT_NODE_COLUMNS_COLS),
+];
+
+/// The circuit families' compound primary key: columns `(view_id, sub)`.
+pub const CIRCUIT_FAMILY_PK: &[u32] = &[0, 1];
+
 pub const FIRST_USER_TABLE_ID: u64 = 16;
 pub const FIRST_USER_SCHEMA_ID: u64 = 3;
 

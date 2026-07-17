@@ -4,12 +4,13 @@ use std::sync::Arc;
 use crate::error::ClientError;
 use crate::protocol::message::{encode_message_noschema_parts, encode_message_parts, MessageParts};
 use crate::protocol::{
-    encode_ddl_txn, encode_push_txn, encode_scan_multi, hello_handshake, recv_message, send_message,
-    send_message_with_extra, wire_flags_get_index_version, wire_flags_get_schema_version, wire_flags_set_conflict_mode,
-    wire_flags_set_index_version, wire_flags_set_schema_version, ClientTransport, Message, PkTuple, ProtocolError,
-    Schema, WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE,
-    FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_GET_INDICES, FLAG_PUSH, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
-    FLAG_SEEK_BY_INDEX_RANGE, STATUS_ERROR, STATUS_NO_INDEX, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
+    encode_ddl_txn, encode_push_txn, encode_run_transient, encode_scan_multi, hello_handshake, recv_message,
+    send_message, send_message_with_extra, wire_flags_get_index_version, wire_flags_get_schema_version,
+    wire_flags_set_conflict_mode, wire_flags_set_index_version, wire_flags_set_schema_version, ClientTransport,
+    Message, PkTuple, ProtocolError, Schema, WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID,
+    FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_GET_INDICES,
+    FLAG_PUSH, FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_SEEK_BY_INDEX_RANGE, STATUS_ERROR, STATUS_NO_INDEX,
+    STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
 };
 use lru::LruCache;
 
@@ -263,6 +264,26 @@ impl Session {
             results.push(self.recv_scan(tid)?);
         }
         Ok(results)
+    }
+
+    /// Ship one compiled ad-hoc SELECT circuit as a transient
+    /// (`FLAG_RUN_TRANSIENT`) and reassemble its streamed result. The reply is a
+    /// scan train — the output schema on the first frame (the engine always
+    /// embeds it for a transient, so there is no client schema cache to consult),
+    /// continuation frames until the terminal — reassembled exactly as `recv_scan`
+    /// does. The accumulated `ZSetBatch` is the transient's whole result (the
+    /// circuit's accumulated integral over the committed base snapshot), not a
+    /// per-chunk delta. Like `scan`, it advances no commit watermark.
+    pub fn run_transient(&mut self, families: &[(u64, &Schema, ZSetBatch)], out_schema: &Schema) -> ScanResult {
+        let payload = encode_run_transient(self.client_id, families, out_schema);
+        self.transport.send_framed(&payload)?;
+        // One outstanding request, so the reply train is positional; `recv_scan`'s
+        // `target_id` argument keys the schema cache — both the fallback read
+        // (which a transient never hits: its schema is always in-frame) and the
+        // in-frame WRITE. The provisional id lives in the transient band
+        // (`1 << 62`, above every durable id), so that write can never alias a
+        // real relation's cache entry.
+        self.recv_scan(gnitz_wire::TRANSIENT_PROVISIONAL_VIEW_ID)
     }
 
     pub fn seek(&mut self, target_id: u64, pk: &PkTuple) -> ScanResult {

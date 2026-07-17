@@ -44,38 +44,100 @@ pub(crate) fn load_circuit(
     view_id: u64,
     out_schema: SchemaDescriptor,
 ) -> Option<LoadedCircuit> {
+    let nodes_cur = open_system_cursor(sys_nodes)?;
+    let edges_cur = open_system_cursor(sys_edges)?;
+    let node_cols_cur = open_system_cursor(sys_node_cols)?;
+    assemble_circuit(nodes_cur, edges_cur, node_cols_cur, view_id, out_schema)
+}
+
+/// Build a `LoadedCircuit` from the three circuit families delivered **in a
+/// `FLAG_RUN_TRANSIENT` frame** — fresh, untrusted, per-request wire input,
+/// reusing the exact assembly the sys-table path uses. Each already-decoded
+/// family batch is wrapped in a standalone `ReadCursor` (`from_owned`) — no
+/// `Table`, no scratch dir, no `mkdir` — and the same `(view_id, sub)` OPK-prefix
+/// filter applies (the client packs the provisional `view_id` in the compound
+/// PK's high half exactly as CREATE VIEW does). The node-id `i32` reject in
+/// `assemble_circuit` guards the trust boundary.
+pub(crate) fn build_loaded_from_batches(
+    nodes_batch: std::rc::Rc<crate::storage::Batch>,
+    edges_batch: std::rc::Rc<crate::storage::Batch>,
+    node_cols_batch: std::rc::Rc<crate::storage::Batch>,
+    view_id: u64,
+    out_schema: SchemaDescriptor,
+) -> Option<LoadedCircuit> {
+    // The circuit-family schemas come from the shared wire-column builder
+    // (`schema::from_wire_cols`, compound `(view_id, sub)` PK) — the same
+    // builder the catalog's sys-table `SCHEMAS` statics use, so the cursor
+    // reads the client-encoded batch with byte-identical layout.
+    let fam = |cols| crate::schema::from_wire_cols(cols, gnitz_wire::CIRCUIT_FAMILY_PK);
+    let nodes_cur = ReadCursor::from_owned(&[nodes_batch], fam(gnitz_wire::CIRCUIT_NODES_COLS));
+    let edges_cur = ReadCursor::from_owned(&[edges_batch], fam(gnitz_wire::CIRCUIT_EDGES_COLS));
+    let node_cols_cur = ReadCursor::from_owned(&[node_cols_batch], fam(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS));
+    assemble_circuit(nodes_cur, edges_cur, node_cols_cur, view_id, out_schema)
+}
+
+/// Non-negative-`i32` node-id gate. A durable sys-table id is always in range;
+/// a transient's frame is untrusted, so an id that would truncate into a
+/// colliding engine key is rejected (returns `None`, aborting the load) rather
+/// than silently wrapped.
+#[inline]
+fn node_id_i32(v: i64) -> Option<i32> {
+    if (0..=i32::MAX as i64).contains(&v) {
+        Some(v as i32)
+    } else {
+        None
+    }
+}
+
+/// Read three positioned circuit cursors (filtered by the `view_id` OPK prefix)
+/// into a `LoadedCircuit` — the shared body behind both `load_circuit` (sys
+/// tables) and `build_loaded_from_batches` (transient frame), so the
+/// node-column `(kind, position)` sort, the `decode_op_node` calls, the node-id
+/// `i32` reject, and the edge-validity check exist exactly once.
+fn assemble_circuit(
+    mut nodes_cur: ReadCursor,
+    mut edges_cur: ReadCursor,
+    mut node_cols_cur: ReadCursor,
+    view_id: u64,
+    out_schema: SchemaDescriptor,
+) -> Option<LoadedCircuit> {
     let mut nodes: HashMap<i32, gnitz_wire::OpNode> = HashMap::new();
     let mut edges: Vec<(i32, i32, i32)> = Vec::new();
 
     // The circuit tables share a compound `(view_id, sub)` PK; the OPK image of
     // the leading unsigned view_id column is its big-endian bytes.
     let prefix = view_id.to_be_bytes();
+    // One abort flag for every malformed-row shape (an out-of-range id, a node
+    // that fails to decode): each must abort the WHOLE load — silently skipping
+    // a row leaves edges dangling, yielding an invalid topological order or
+    // silent output corruption.
+    let mut invalid = false;
 
     // Phase 1: read CircuitNodeColumns, sorted by (kind, position) per node.
     let mut cols_by_node: HashMap<i32, Vec<gnitz_wire::CircuitNodeColumn>> = HashMap::new();
-    open_system_cursor(sys_node_cols)?.for_each_positive_with_prefix(&prefix, |ch| {
-        cols_by_node
-            .entry(ch.read_i64(NODECOL_COL_NODE_ID) as i32)
+    node_cols_cur.for_each_positive_with_prefix(&prefix, |ch| match node_id_i32(ch.read_i64(NODECOL_COL_NODE_ID)) {
+        Some(nid) => cols_by_node
+            .entry(nid)
             .or_default()
             .push(gnitz_wire::CircuitNodeColumn {
                 kind: ch.read_i64(NODECOL_COL_KIND) as u64,
                 position: ch.read_i64(NODECOL_COL_POSITION) as u16,
                 value1: ch.read_i64(NODECOL_COL_VALUE1) as u64,
                 value2: ch.read_i64(NODECOL_COL_VALUE2) as u64,
-            });
+            }),
+        None => invalid = true,
     });
     // Sort each node's cols by (kind, position) so decode_op_node sees ordered slices.
     for v in cols_by_node.values_mut() {
         v.sort_by_key(|c| (c.kind, c.position));
     }
 
-    // Phase 2: read CircuitNodes; call decode_op_node for each. A node that
-    // fails to decode must abort the whole load: silently skipping it leaves
-    // any edge referencing it dangling, which yields an invalid topological
-    // order or silent output corruption.
-    let mut decode_failed = false;
-    open_system_cursor(sys_nodes)?.for_each_positive_with_prefix(&prefix, |ch| {
-        let node_id = ch.read_i64(NODES_COL_NODE_ID) as i32;
+    // Phase 2: read CircuitNodes; call decode_op_node for each.
+    nodes_cur.for_each_positive_with_prefix(&prefix, |ch| {
+        let Some(node_id) = node_id_i32(ch.read_i64(NODES_COL_NODE_ID)) else {
+            invalid = true;
+            return;
+        };
         let opcode = ch.read_i64(NODES_COL_OPCODE_NEW) as u64;
 
         let src_tab: Option<u64> = if ch.col_is_null(NODES_COL_SOURCE_TABLE) {
@@ -99,21 +161,26 @@ pub(crate) fn load_circuit(
             Ok(op) => {
                 nodes.insert(node_id, op);
             }
-            Err(_) => decode_failed = true,
+            Err(_) => invalid = true,
         }
     });
-    if decode_failed {
+    if invalid {
         return None;
     }
 
-    // Phase 3: read CircuitEdges.
-    open_system_cursor(sys_edges)?.for_each_positive_with_prefix(&prefix, |ch| {
-        edges.push((
-            ch.read_i64(EDGES_COL_SRC_NODE) as i32,
-            ch.read_i64(EDGES_COL_DST_NODE) as i32,
-            ch.read_i64(EDGES_COL_DST_PORT) as i32,
-        ));
+    // Phase 3: read CircuitEdges. A truncating endpoint id aborts the load.
+    edges_cur.for_each_positive_with_prefix(&prefix, |ch| {
+        match (
+            node_id_i32(ch.read_i64(EDGES_COL_SRC_NODE)),
+            node_id_i32(ch.read_i64(EDGES_COL_DST_NODE)),
+        ) {
+            (Some(src), Some(dst)) => edges.push((src, dst, ch.read_i64(EDGES_COL_DST_PORT) as i32)),
+            _ => invalid = true,
+        }
     });
+    if invalid {
+        return None;
+    }
 
     // Every edge must reference nodes that exist in the circuit. A dangling
     // endpoint (node failed to decode, or a partial schema flush) would create
@@ -134,11 +201,55 @@ pub(crate) fn load_circuit(
     })
 }
 
+/// The distinct scan-source table ids of a loaded circuit. With
+/// `include_trace: false`, only `ScanDelta` — the same set
+/// `Circuit::dependencies()` computes client-side, and the sequence the master
+/// drives a transient's sources in (`ScanTrace` is a read-only `ext_trace`
+/// lookup that no drive seeds, and a SQL-planner circuit never emits one). With
+/// `include_trace: true`, `ScanTrace` targets too — the boot invalid-view
+/// verdict's transitive check needs those as well.
+///
+/// Nodes are walked in ascending node-id order, NOT `loaded.nodes` iteration
+/// order: `nodes` is a `HashMap`, so iterating it directly would return the
+/// sources in a per-process-random sequence and make the drive order
+/// irreproducible across runs of the same query. Node ids are assigned by the
+/// client's circuit builder in construction order, so ascending id tracks the
+/// circuit's own build order, and the walk needs no `topo_sort` precondition
+/// (unlike reading `loaded.ordered`, which is empty until one runs — a silent
+/// "no sources" footgun).
+///
+/// The order is deterministic but NOT correctness-load-bearing: the master
+/// drives one source per epoch, and each epoch's delta joins against the other
+/// sources' already-accumulated traces (the symmetric 2-term bilinear form), so
+/// whichever source is driven last sees every other side in full. Every order
+/// yields the same Z-set, each cross term emitted exactly once.
+pub(crate) fn scan_source_ids(loaded: &LoadedCircuit, include_trace: bool) -> Vec<i64> {
+    let mut nids: Vec<i32> = loaded.nodes.keys().copied().collect();
+    nids.sort_unstable();
+    let mut out: Vec<i64> = Vec::new();
+    for nid in nids {
+        let t = match loaded.nodes.get(&nid) {
+            Some(gnitz_wire::OpNode::ScanDelta(t)) => *t as i64,
+            Some(gnitz_wire::OpNode::ScanTrace(t)) if include_trace => *t as i64,
+            _ => continue,
+        };
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Topological sort (Kahn's algorithm)
 // ---------------------------------------------------------------------------
 
 pub(crate) fn topo_sort(loaded: &mut LoadedCircuit) -> Result<(), CompileError> {
+    // Rebuild the derived fields from scratch so the sort is idempotent — a
+    // second run must not append duplicate adjacency entries.
+    loaded.ordered.clear();
+    loaded.outgoing.clear();
+    loaded.incoming.clear();
     let mut in_degree: HashMap<i32, i32> = HashMap::new();
     for &nid in loaded.nodes.keys() {
         in_degree.insert(nid, 0);

@@ -138,6 +138,26 @@ pub const FLAG_UNIQUE_PREFLIGHT: u32 = 131072;
 /// worker classifies it from this `u32` flag.
 pub const FLAG_SEEK_BY_INDEX_RANGE_SAL: u32 = 1 << 18;
 
+/// RUN_TRANSIENT master→worker dispatch flag. Drives one `ScanDelta` source of a
+/// transient (ad-hoc query) circuit through one epoch into its RAM-only output
+/// store. Bit 20, the next free SAL group-header bit above `FLAG_FLUSH_EPH`
+/// (1<<19). Both group shapes key the transient by `seek_pk = tid` — the tid is
+/// out of `target_id`'s range and `target_id` names the family/source instead: a
+/// PREP group (`target_id` = a `CIRCUIT_*_TAB` id) delivers one circuit family
+/// and is held unACKed; a DRIVE group (`target_id` = the source) carries the
+/// out-schema, builds + registers on first sight, and IS ACKed so the master's
+/// per-source barrier advances. Distinct from the client→master `u64` wire flag
+/// `gnitz_wire::FLAG_RUN_TRANSIENT` (bit 63): the wire flag is a routing hint on
+/// the client's request frame, never classified here. Broadcast-shaped.
+pub const FLAG_RUN_TRANSIENT: u32 = 1 << 20;
+/// DROP_TRANSIENT master→worker dispatch flag. Broadcast once at the tail of a
+/// transient's drive (on every exit path) to free its output store, compiled
+/// plan, memoized metadata, held circuit families, and `_transient/<tid>` scratch
+/// tree. Bit 21. Idempotent on the worker — every removal no-ops when absent — so
+/// a redelivery is harmless; the dispatch matrix defers it out of an in-flight
+/// evaluation, since it mutates maps the evaluation borrows. Broadcast-shaped.
+pub const FLAG_DROP_TRANSIENT: u32 = 1 << 21;
+
 // ---------------------------------------------------------------------------
 // Chunked distributed-backfill exchange coordination
 // ---------------------------------------------------------------------------
@@ -243,6 +263,8 @@ pub enum SalMessageKind {
     UniquePreflight,
     Push,
     Tick,
+    RunTransient,
+    DropTransient,
     SeekByIndex,
     SeekByIndexRange,
     Seek,
@@ -254,8 +276,9 @@ impl SalMessageKind {
     ///
     /// Priority order matches the worker's existing if-chain (see
     /// `worker::dispatch_inner`): SHUTDOWN > FLUSH > DDL_SYNC >
-    /// EXCHANGE_RELAY > BACKFILL > HAS_PK > GATHER > UNIQUE_PREFLIGHT >
-    /// PUSH > TICK > SEEK_BY_INDEX_RANGE > SEEK_BY_INDEX > SEEK > Scan.
+    /// RUN_TRANSIENT > DROP_TRANSIENT > EXCHANGE_RELAY > BACKFILL > HAS_PK >
+    /// GATHER > UNIQUE_PREFLIGHT > PUSH > TICK > SEEK_BY_INDEX_RANGE >
+    /// SEEK_BY_INDEX > SEEK > Scan.
     /// The first match wins. (Each kind owns a distinct bit, so the
     /// relative order of the disjoint range/point/seek arms is
     /// immaterial; it tracks the worker's if-chain for readability.)
@@ -271,6 +294,12 @@ impl SalMessageKind {
         }
         if flags & FLAG_DDL_SYNC != 0 {
             return SalMessageKind::DdlSync;
+        }
+        if flags & FLAG_RUN_TRANSIENT != 0 {
+            return SalMessageKind::RunTransient;
+        }
+        if flags & FLAG_DROP_TRANSIENT != 0 {
+            return SalMessageKind::DropTransient;
         }
         if flags & FLAG_EXCHANGE_RELAY != 0 {
             return SalMessageKind::ExchangeRelay;
@@ -305,6 +334,36 @@ impl SalMessageKind {
         SalMessageKind::Scan
     }
 
+    /// True iff this kind is **live point traffic**: client-driven work the worker
+    /// may serve inline at any depth, because it neither re-enters the DAG nor
+    /// mutates the catalog.
+    ///
+    /// A transient's non-exchange drive polls for exactly these between chunks
+    /// (`drain_live_traffic_between_chunks`), so ingestion and reads stay live
+    /// across a long ad-hoc query instead of stalling behind it. Everything else
+    /// (maintenance `Tick`, teardown `DropTransient`/`DdlSync`, other drives,
+    /// a checkpoint `Flush`/`FlushEph`, `Shutdown`, and the exchange kinds) stops
+    /// the poll and is left unread in the SAL for the unwinding top-level drain —
+    /// the poll waits for nothing, so it is free to leave a message rather than
+    /// consume-and-defer it.
+    ///
+    /// Stated as an ALLOWLIST so a newly added kind is non-live by default: the
+    /// conservative answer is "leave it for the top level", never "run it inline
+    /// mid-evaluation".
+    pub fn is_live_point_traffic(self) -> bool {
+        matches!(
+            self,
+            SalMessageKind::HasPk
+                | SalMessageKind::Gather
+                | SalMessageKind::UniquePreflight
+                | SalMessageKind::Push
+                | SalMessageKind::SeekByIndex
+                | SalMessageKind::SeekByIndexRange
+                | SalMessageKind::Seek
+                | SalMessageKind::Scan
+        )
+    }
+
     /// True when the worker must act on the group even if its per-worker
     /// data slot is empty (broadcast / control / data-rebroadcast kinds).
     /// Unicast kinds (SEEK, SEEK_BY_INDEX, Scan, UniquePreflight,
@@ -322,6 +381,8 @@ impl SalMessageKind {
                 | SalMessageKind::Gather
                 | SalMessageKind::Push
                 | SalMessageKind::Tick
+                | SalMessageKind::RunTransient
+                | SalMessageKind::DropTransient
         )
     }
 }

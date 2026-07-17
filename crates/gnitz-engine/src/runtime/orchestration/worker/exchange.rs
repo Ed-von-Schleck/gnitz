@@ -1,6 +1,6 @@
 //! Worker exchange-wait re-entry: the defer-then-replay machinery
-//! (`do_exchange_wait` inline dispatch loop + `dispatch_deferred` /
-//! `replay_deferred_ticks`).
+//! (`do_exchange_wait` inline dispatch loop + `dispatch_deferred`;
+//! deferred control groups replay in `replay_deferred_control`).
 
 use super::*;
 
@@ -69,7 +69,10 @@ impl WorkerProcess {
 
         let master_pid = self.master_pid;
         let want_key = (view_id, source_id);
-        let ctx = DispatchContext::InsideExchangeWait { want_key, schema };
+        let ctx = DispatchContext::InEval {
+            relay_wait: Some(want_key),
+            schema,
+        };
 
         loop {
             if let Some((b, decision)) = self.exchange.pending_relays.remove(&want_key) {
@@ -101,23 +104,6 @@ impl WorkerProcess {
                 match self.dispatch(ctx, kind, target_id, wire) {
                     DispatchOutcome::Continue => {}
                     DispatchOutcome::RelayMatched(batch) => return batch,
-                }
-            }
-        }
-    }
-
-    /// Replay FLAG_TICK messages deferred during an exchange wait. Runs
-    /// after the current tick's ACK has been sent so the master observes
-    /// ACKs in SAL arrival order. Each replayed tick may itself trigger
-    /// more exchanges and defer more ticks, so loop until the queue is
-    /// empty.
-    pub(super) fn replay_deferred_ticks(&mut self) {
-        while !self.exchange.deferred_ticks.is_empty() {
-            let ticks: Vec<(i64, u64)> = std::mem::take(&mut self.exchange.deferred_ticks);
-            for (target_id, req_id) in ticks {
-                match self.handle_tick(target_id, req_id) {
-                    Ok(()) => self.send_ack(target_id as u64, req_id),
-                    Err(e) => self.send_error(&e, req_id),
                 }
             }
         }

@@ -20,8 +20,8 @@ pub use header::{
 };
 pub use message::{
     decode_control_block, encode_control_block, encode_ddl_txn, encode_message_noschema_parts, encode_message_parts,
-    encode_push_txn, encode_scan_multi, encode_schema_block, parse_response, recv_message, send_message,
-    send_message_with_extra, Message, MessageParts,
+    encode_push_txn, encode_run_transient, encode_scan_multi, encode_schema_block, parse_response, recv_message,
+    send_message, send_message_with_extra, Message, MessageParts,
 };
 pub use transport::{hello_handshake, ClientTransport, FrameSegments, TransportWaker, FRAME_SEGMENTS};
 pub use types::{

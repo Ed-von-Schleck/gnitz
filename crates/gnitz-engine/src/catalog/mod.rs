@@ -52,7 +52,7 @@ use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, PartitionedTable, ReadCursor, RecoverySource, Routing, Table};
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
-pub(crate) use sys_tables::{FIRST_USER_TABLE_ID, SEQ_TAB_ID};
+pub(crate) use sys_tables::{FIRST_USER_TABLE_ID, SEQ_TAB_ID, TRANSIENT_ID_BASE, TRANSIENT_ID_LIMIT};
 pub(crate) use sys_tables::{IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS};
 pub(crate) use sys_tables::{IDX_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID};
 // The fixed system-table schema for a family tid. The production DDL decode

@@ -627,6 +627,52 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
 // compensate_stage_a, so the ghost -1 was untested.
 // ---------------------------------------------------------------------------
 
+/// The transient id band is reserved against every DURABLE relation, and the
+/// guard sits at `precheck_family` — the point an id ENTERS the `dag.tables`
+/// namespace, BEFORE any mutation.
+///
+/// Guarding `allocate_table_id` alone would not reserve it: the register hooks
+/// take the id straight off the ingested row and `raise_id_counter` it, and that
+/// id is caller-chosen (a client may preset `circuit.view_id`). A durable
+/// relation registered inside the band would later be aliased by an ad-hoc
+/// query's tid, and that query's teardown would unregister and `remove_dir_all`
+/// the user's live relation — silent destruction. Both families whose PK is a
+/// `dag.tables` id must reject it. (Index ids are a disjoint namespace.)
+#[test]
+fn precheck_rejects_durable_relation_id_in_transient_band() {
+    let dir = temp_dir("transient_band_reject");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    for (label, tid) in [
+        ("first id of the band", TRANSIENT_ID_BASE),
+        ("deep inside the band", TRANSIENT_ID_BASE + 4096),
+    ] {
+        let table_batch = build_table_tab_row(&dir, tid, pack_pk_cols(&[0]), "banded");
+        let err = engine.precheck_family(TABLE_TAB_ID, &table_batch).expect_err(&format!(
+            "TABLE_TAB id in the transient band must be rejected ({label})"
+        ));
+        assert!(err.contains("transient band"), "error must name the cause, got: {err}");
+
+        let view_batch = build_view_tab_row(tid, "bandedview", "SELECT 1");
+        let err = engine
+            .precheck_family(VIEW_TAB_ID, &view_batch)
+            .expect_err(&format!("VIEW_TAB id in the transient band must be rejected ({label})"));
+        assert!(err.contains("transient band"), "error must name the cause, got: {err}");
+    }
+
+    // The band is a ceiling, not a blanket ban: an ordinary durable id below it
+    // still passes this guard (it fails later for unrelated reasons, if at all).
+    let ok_batch = build_table_tab_row(&dir, TRANSIENT_ID_BASE - 1, pack_pk_cols(&[0]), "just_below");
+    let err = engine
+        .precheck_family(TABLE_TAB_ID, &ok_batch)
+        .err()
+        .unwrap_or_default();
+    assert!(
+        !err.contains("transient band"),
+        "an id below the band must not trip the band guard, got: {err}"
+    );
+}
+
 /// A CREATE bundle `[COL_TAB, TABLE_TAB]` whose TABLE_TAB fails **precheck**
 /// (duplicate name) must leave neither an orphan COL_TAB nor a ghost `-1`
 /// TABLE_TAB. The marker stays `None` (precheck failed before apply), so

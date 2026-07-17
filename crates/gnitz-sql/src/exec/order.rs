@@ -338,29 +338,78 @@ pub(crate) fn order_limit_project(
     offset: usize,
     limit: Option<usize>,
 ) -> Result<(Schema, ZSetBatch), GnitzSqlError> {
+    let resolved = resolve_projection(projection, actual_schema)?;
+    let batch = order_limit_resolved(&resolved, actual_schema, full_batch, order_by, offset, limit)?;
+    Ok(project(resolved, actual_schema, batch))
+}
+
+/// The sink over an already-projected result (the transient executor's streamed
+/// batch): sort and paginate under the identity projection — hidden synthetic
+/// keys stay physical, exactly like a view scan, and are stripped at
+/// presentation. Returns the schema unchanged alongside the windowed batch.
+pub(crate) fn order_limit_passthrough(
+    schema: Schema,
+    batch: ZSetBatch,
+    order_by: Option<&OrderBy>,
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<(Schema, ZSetBatch), GnitzSqlError> {
+    let out = order_limit_resolved(&None, &schema, Some(batch), order_by, offset, limit)?
+        .unwrap_or_else(|| ZSetBatch::new(&schema));
+    Ok((schema, out))
+}
+
+/// Sort and paginate the pre-projection batch; projection is the caller's.
+/// `resolved` is consulted only to resolve ORDER BY names / positions against
+/// the projected output (`None` = identity). Returns `full_batch` untouched
+/// when there is nothing to reorder, skip, or bound.
+fn order_limit_resolved(
+    resolved: &Projection,
+    actual_schema: &Schema,
+    full_batch: Option<ZSetBatch>,
+    order_by: Option<&OrderBy>,
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<Option<ZSetBatch>, GnitzSqlError> {
     let order_keys = match order_by {
         Some(ob) => resolve_order_by(ob)?,
         None => Vec::new(),
     };
 
-    let resolved = resolve_projection(projection, actual_schema)?;
-
-    // Zero-copy passthrough: nothing to reorder, skip, or bound. The identity
-    // projection hands the batch straight back.
+    // Zero-copy passthrough: nothing to reorder, skip, or bound.
     if order_keys.is_empty() && offset == 0 && limit.is_none() {
-        return Ok(project(resolved, actual_schema, full_batch));
+        return Ok(full_batch);
     }
 
     let has_cut = limit.is_some() || offset > 0;
-    let sort_keys = build_sort_keys(&order_keys, &resolved, actual_schema, has_cut)?;
+    let sort_keys = build_sort_keys(&order_keys, resolved, actual_schema, has_cut)?;
 
     let mut full = full_batch.unwrap_or_else(|| ZSetBatch::new(actual_schema));
     let n = full.len();
 
-    // Stable-sorted row permutation over the full batch.
+    // Sorted row permutation over the full batch.
     let mut perm: Vec<usize> = (0..n).collect();
     if !sort_keys.is_empty() {
-        perm.sort_by(|&ra, &rb| cmp_rows(&full, &sort_keys, ra, rb));
+        if has_cut {
+            // With a cut the appended identity tiebreak makes the comparator a
+            // total order (a consolidated batch has unique (PK, payload)), so
+            // stability is vacuous and an unstable partial selection is exact:
+            // every entry carries weight ≥ 1, so the first `offset + limit`
+            // entries always cover the whole logical window.
+            if let Some(l) = limit {
+                let k = offset.saturating_add(l).min(n);
+                if k == 0 {
+                    perm.clear();
+                } else if k < n {
+                    perm.select_nth_unstable_by(k - 1, |&ra, &rb| cmp_rows(&full, &sort_keys, ra, rb));
+                    perm.truncate(k);
+                }
+            }
+            perm.sort_unstable_by(|&ra, &rb| cmp_rows(&full, &sort_keys, ra, rb));
+        } else {
+            // No cut: stable sort, so ties keep their fetch order.
+            perm.sort_by(|&ra, &rb| cmp_rows(&full, &sort_keys, ra, rb));
+        }
     }
 
     // Multiplicity walk over the sorted order, then gather the survivors —
@@ -380,7 +429,7 @@ pub(crate) fn order_limit_project(
         *gathered.weights.last_mut().unwrap() = surviving;
     }
 
-    Ok(project(resolved, actual_schema, Some(gathered)))
+    Ok(Some(gathered))
 }
 
 #[cfg(test)]

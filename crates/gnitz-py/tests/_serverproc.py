@@ -18,9 +18,16 @@ preexec_fn runs after fork in a single-fork-safe context; we only invoke
 already-resolved libc + raw syscalls (no allocation-heavy work, no dlopen — libc
 is loaded at import time, before the fork).
 """
+import contextlib
 import ctypes
 import os
+import shutil
 import signal
+import subprocess
+import tempfile
+import time
+
+import pytest
 
 _PR_SET_PDEATHSIG = 1
 _libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -41,6 +48,46 @@ def is_debug_build():
     release builds drop them. There is no reliable signal in the stripped
     binary, so we trust the GNITZ_RELEASE env the bench harness sets."""
     return os.environ.get("GNITZ_RELEASE", "0") == "0"
+
+
+@contextlib.contextmanager
+def tiny_checkpoint_server(prefix, checkpoint_bytes=32 * 1024):
+    """A function-scoped gnitz-server with a tiny GNITZ_CHECKPOINT_BYTES, so
+    SAL checkpoints fire repeatedly during a test's own writes. Yields
+    `(sock_path, data_dir)`; kills the server and removes its tmpdir on exit.
+    32 KB default: a single push of ~500 rows encodes to roughly 30-60 KB, so
+    this fires multiple checkpoints per bulk insert."""
+    binary = os.environ.get(
+        "GNITZ_SERVER_BIN",
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../gnitz-server")),
+    )
+    if not os.path.isfile(binary):
+        pytest.skip(f"Server binary not found: {binary}")
+    workers = int(os.environ.get("GNITZ_WORKERS", "4"))
+    tmpdir = tempfile.mkdtemp(dir=os.path.expanduser("~/git/gnitz/tmp"), prefix=prefix)
+    data_dir = os.path.join(tmpdir, "data")
+    sock_path = os.path.join(tmpdir, "gnitz.sock")
+    env = os.environ.copy()
+    env["GNITZ_CHECKPOINT_BYTES"] = str(checkpoint_bytes)
+    proc = subprocess.Popen(
+        [binary, data_dir, sock_path, f"--workers={workers}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        preexec_fn=server_preexec,
+    )
+    try:
+        for _ in range(100):
+            if os.path.exists(sock_path):
+                break
+            time.sleep(0.1)
+        else:
+            raise RuntimeError("checkpoint server did not start")
+        yield sock_path, data_dir
+    finally:
+        proc.kill()
+        proc.wait()
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # Deadlock ceilings for concurrent-thread tests, NOT performance budgets. The

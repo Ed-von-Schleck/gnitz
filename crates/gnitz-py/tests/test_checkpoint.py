@@ -9,28 +9,12 @@ handling was incorrect.
 The server is function-scoped (each test gets its own instance) so that a
 misbehaving checkpoint cannot corrupt state for other tests.
 """
-import os
 import random
-import subprocess
-import tempfile
 import threading
 import time
-import shutil
 import pytest
 import gnitz
-from _serverproc import server_preexec, HANG_TIMEOUT, START_TIMEOUT
-
-
-BINARY = os.environ.get(
-    "GNITZ_SERVER_BIN",
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../gnitz-server")),
-)
-WORKERS = int(os.environ.get("GNITZ_WORKERS", "4"))
-
-# 32 KB: forces a checkpoint every ~32 KB of SAL writes.  A single push of
-# ~500 rows encodes to roughly 30–60 KB, so this fires multiple checkpoints
-# per bulk insert.
-CHECKPOINT_BYTES = 32 * 1024
+from _serverproc import tiny_checkpoint_server, HANG_TIMEOUT, START_TIMEOUT
 
 # Hang ceilings for the concurrent push/scan/seek/insert tests below — see the
 # rationale on the shared constants in _serverproc.py.
@@ -39,31 +23,8 @@ CHECKPOINT_BYTES = 32 * 1024
 @pytest.fixture
 def checkpoint_server():
     """Function-scoped server with a tiny SAL checkpoint threshold."""
-    if not os.path.isfile(BINARY):
-        pytest.skip(f"Server binary not found: {BINARY}")
-    tmpdir = tempfile.mkdtemp(dir=os.path.expanduser("~/git/gnitz/tmp"),
-                              prefix="gnitz_checkpoint_")
-    data_dir = os.path.join(tmpdir, "data")
-    sock_path = os.path.join(tmpdir, "gnitz.sock")
-    env = os.environ.copy()
-    env["GNITZ_CHECKPOINT_BYTES"] = str(CHECKPOINT_BYTES)
-    cmd = [BINARY, data_dir, sock_path, f"--workers={WORKERS}"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, env=env,
-                            preexec_fn=server_preexec)
-    for _ in range(100):
-        if os.path.exists(sock_path):
-            break
-        time.sleep(0.1)
-    else:
-        proc.kill()
-        proc.communicate()
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        raise RuntimeError("Checkpoint server did not start")
-    yield sock_path
-    proc.kill()
-    proc.wait()
-    shutil.rmtree(tmpdir, ignore_errors=True)
+    with tiny_checkpoint_server("gnitz_checkpoint_") as (sock_path, _data_dir):
+        yield sock_path
 
 
 @pytest.fixture

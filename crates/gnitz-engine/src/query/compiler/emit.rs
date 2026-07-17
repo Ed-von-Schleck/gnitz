@@ -119,6 +119,12 @@ pub(super) struct EmitCtx<'a> {
     pub ext_tables: &'a ExtTables,
     pub view_dir: &'a str,
     pub view_id: u64,
+    /// How this relation's operator-trace child tables recover at open — a
+    /// `View`'s are checkpointed, a `Transient`'s are `Rederive` (RAM-only
+    /// scratch, never persisted). Supplied by the caller from
+    /// `RelationKind::recovery_source()` rather than hardcoded here, so the kind
+    /// decides it in one place.
+    pub recovery: RecoverySource,
     // True iff every `ScanDelta` source of this view is a replicated base table.
     // Consumed by the `PartitionFilter` emit arm to bake the trim as a keep-all
     // identity (an all-replicated view runs correct-local on every worker).
@@ -180,20 +186,17 @@ impl EmitCtx<'_> {
         // Track the path before creating so cleanup also removes a partially
         // created directory if Table::new fails.
         self.scratch.track(child_dir.clone());
-        // `RederiveCheckpointed`: the ephemeral checkpoint round force-persists
-        // these view operator-trace tables with generation-stamped manifests.
-        // `create_child_table` is reached only from view-plan compilation, never
-        // index-circuit compilation (index tables stay plain `Rederive`).
-        Table::new(
-            &child_dir,
-            schema,
-            self.view_id as u32,
-            256 * 1024,
-            RecoverySource::RederiveCheckpointed {
-                committed: crate::foundation::worker_ctx::committed_generation(),
-            },
-        )
-        .map_err(|_| CompileError::Rejected("child table create failed"))
+        // `self.recovery` carries the owning relation's kind decision: a view's
+        // operator-trace tables are `RederiveCheckpointed` (the ephemeral
+        // checkpoint round force-persists them with generation-stamped
+        // manifests), a transient's are plain `Rederive` — RAM-only scratch that
+        // must never load a manifest, least of all a previous boot's, since
+        // transient ids re-seed at `TRANSIENT_ID_BASE` every boot and so reuse
+        // both the scratch dir and the `shard_{tid}_*` names. Reached only from
+        // relation-plan compilation, never index-circuit compilation (index
+        // tables stay plain `Rederive`).
+        Table::new(&child_dir, schema, self.view_id as u32, 256 * 1024, self.recovery)
+            .map_err(|_| CompileError::Rejected("child table create failed"))
     }
 
     /// Create a child table, keep it alive in `owned_tables`, and return a raw
@@ -930,6 +933,7 @@ pub(super) fn build_plan(
     ext_tables: &ExtTables,
     view_dir: &str,
     view_id: u64,
+    recovery: RecoverySource,
     output_node_id: Option<i32>,
     exchange_inputs: &[(i32, SchemaDescriptor)],
 ) -> Result<PlanBuildResult, CompileError> {
@@ -995,6 +999,7 @@ pub(super) fn build_plan(
         ext_tables,
         view_dir,
         view_id,
+        recovery,
         all_sources_replicated,
         builder: ProgramBuilder::new(),
         out_reg_of,

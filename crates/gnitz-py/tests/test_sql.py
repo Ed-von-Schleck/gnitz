@@ -183,13 +183,27 @@ class TestSqlSelect:
         finally:
             client.drop_schema(sn)
 
-    def test_select_nonindexed_where(self, client):
+    def test_select_nonindexed_where_is_served_by_the_executor(self, client):
+        """A WHERE on a non-indexed column is SERVED, not rejected.
+
+        No thin client-side path can evaluate this residual, so it routes to the
+        on-demand executor: the query is compiled into a DBSP circuit, run once
+        over the committed base snapshot as a transient, and streamed back. It
+        used to raise `GnitzError` ("no usable index"); that rejection is gone.
+        """
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
-            self._setup_with_rows(client, sn)
-            with pytest.raises(gnitz.GnitzError):
-                client.execute_sql("SELECT * FROM t WHERE val = 5", schema_name=sn)
+            self._setup_with_rows(client, sn)  # (1,10) … (5,50)
+            res = client.execute_sql("SELECT * FROM t WHERE val = 30", schema_name=sn)
+            assert res[0]["type"] == "Rows"
+            rows = [r for r in res[0]["rows"] if r.weight > 0]
+            assert [(r.pk, r.val) for r in rows] == [(3, 30)], f"val = 30 selects exactly row pk=3, got {rows}"
+
+            # A non-equality residual routes the same way.
+            res = client.execute_sql("SELECT * FROM t WHERE val > 30", schema_name=sn)
+            rows = [r for r in res[0]["rows"] if r.weight > 0]
+            assert sorted(r.pk for r in rows) == [4, 5], f"val > 30 selects pks 4,5, got {rows}"
             client.execute_sql("DROP TABLE t", schema_name=sn)
         finally:
             client.drop_schema(sn)
@@ -212,20 +226,13 @@ class TestSqlSelect:
         client.create_schema(sn)
         try:
             self._setup_with_rows(client, sn)
-            # DISTINCT is *accepted today* on `pk` — it returns rows with the dedup
-            # silently dropped (correct only because pk is unique). The guard must
-            # intercept it, turning a previously-accepted query into an explicit error.
-            with pytest.raises(gnitz.GnitzError, match="DISTINCT is not supported"):
-                client.execute_sql("SELECT DISTINCT pk FROM t", schema_name=sn)
+            # Plain DISTINCT / GROUP BY / HAVING / WITH are no longer rejected —
+            # they route to the transient circuit executor (positive end-to-end
+            # tests land with the master drive path). This guard test keeps only
+            # the clauses NEITHER path has an operator for.
             # DISTINCT ON gets its own message (no CREATE VIEW redirect).
             with pytest.raises(gnitz.GnitzError, match="DISTINCT ON is not supported"):
                 client.execute_sql("SELECT DISTINCT ON (pk) pk FROM t", schema_name=sn)
-            # GROUP BY: returns ungrouped rows today.
-            with pytest.raises(gnitz.GnitzError, match="GROUP BY is not supported"):
-                client.execute_sql("SELECT pk FROM t GROUP BY pk", schema_name=sn)
-            # HAVING: predicate silently dropped today.
-            with pytest.raises(gnitz.GnitzError, match="HAVING is not supported"):
-                client.execute_sql("SELECT pk FROM t HAVING pk > 0", schema_name=sn)
             # OFFSET and ORDER BY are now honored by the client-side sink (see
             # test_order_by.py); only the ClickHouse `LIMIT … BY` per-group form
             # stays rejected on the LIMIT envelope.
@@ -245,11 +252,6 @@ class TestSqlSelect:
                 client.execute_sql(
                     "SELECT pk FROM t QUALIFY ROW_NUMBER() OVER (ORDER BY pk) = 1", schema_name=sn
                 )
-            # WITH on a direct SELECT was silently ignored; a shadowing CTE returned the wrong table.
-            with pytest.raises(gnitz.GnitzError, match="WITH .CTE. is not supported"):
-                client.execute_sql("WITH c AS (SELECT * FROM t) SELECT pk FROM c", schema_name=sn)
-            with pytest.raises(gnitz.GnitzError, match="WITH .CTE. is not supported"):
-                client.execute_sql("WITH t AS (SELECT * FROM t) SELECT pk FROM t", schema_name=sn)
             # Envelope tail clauses GenericDialect parses and used to drop.
             with pytest.raises(gnitz.GnitzError, match="FOR UPDATE/SHARE is not supported"):
                 client.execute_sql("SELECT pk FROM t FOR UPDATE", schema_name=sn)

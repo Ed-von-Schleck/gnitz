@@ -361,8 +361,13 @@ class TestIndexSql:
         finally:
             _drop_all(client, sn, tables=["t"])
 
-    def test_select_nonindexed_col_rejects(self, client):
-        """WHERE on a column with no index raises an error."""
+    def test_select_nonindexed_col_served_by_executor(self, client):
+        """WHERE on a column with no index is SERVED, not rejected.
+
+        No index means no thin access path, so the query routes to the on-demand
+        executor (compiled to a DBSP circuit, run once over the committed base
+        snapshot, streamed back). This used to raise a "no usable index" error.
+        """
         sn = _sn()
         client.create_schema(sn)
         try:
@@ -370,8 +375,9 @@ class TestIndexSql:
                 "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
                 schema_name=sn,
             )
-            with pytest.raises(gnitz.GnitzError):
-                client.execute_sql("SELECT * FROM t WHERE val = 5", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 6), (3, 5)", schema_name=sn)
+            assert _result_pks(client.execute_sql(
+                "SELECT * FROM t WHERE val = 5", schema_name=sn)) == [1, 3]
         finally:
             _drop_all(client, sn, tables=["t"])
 
@@ -1923,11 +1929,14 @@ class TestCompositeIndex:
                 "INSERT INTO t VALUES (40, 1, NULL, 11)", schema_name=sn)
             client.execute_sql("CREATE INDEX ON t(a, b)", schema_name=sn)
 
-            # Leading-prefix WHERE a=1 over (a, b) with b nullable is NOT served
-            # by the index (it would silently drop the (1, NULL) row), so direct
-            # SELECT raises the clean "non-indexed" error.
-            with pytest.raises(gnitz.GnitzError):
-                client.execute_sql("SELECT * FROM t WHERE a = 1", schema_name=sn)
+            # Leading-prefix WHERE a=1 over (a, b) with b nullable is NOT served by
+            # the index -- it would silently drop the (1, NULL) row. It is instead
+            # served by the on-demand executor, which scans the base and so DOES
+            # return that row. This asserts the real property the old "raises a
+            # clean non-indexed error" check was only a proxy for: pk=40 (a=1,
+            # b=NULL) must not go missing.
+            assert _pks(client.execute_sql(
+                "SELECT * FROM t WHERE a = 1", schema_name=sn)) == [10, 20, 40]
 
             # The full key still uses the index and finds the non-null row.
             assert _pks(client.execute_sql(
@@ -2243,11 +2252,10 @@ class TestIndexRangeSql:
             client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
             q = lambda s: _result_pks(client.execute_sql(s, schema_name=sn))
             assert q("SELECT * FROM t WHERE x BETWEEN 10 AND 20") == [2, 3]
-            # NOT BETWEEN on the sole indexed column with no other predicate is not
-            # a contiguous interval and not servable → clean error (not mis-served).
-            with pytest.raises(gnitz.GnitzError):
-                client.execute_sql("SELECT * FROM t WHERE x NOT BETWEEN 10 AND 20",
-                                   schema_name=sn)
+            # NOT BETWEEN is not a contiguous interval, so no index seek serves it.
+            # The on-demand executor does, and must get the complement exactly
+            # right (it used to be a clean error rather than mis-served).
+            assert q("SELECT * FROM t WHERE x NOT BETWEEN 10 AND 20") == [1, 4]
         finally:
             _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])
 
@@ -2292,16 +2300,18 @@ class TestIndexRangeSql:
         finally:
             _drop_all(client, sn, indices=[f"{sn}__t__idx_a_b"], tables=["t"])
 
-    def test_range_nonindexed_rejects(self, client):
+    def test_range_nonindexed_served_by_executor(self, client):
+        """A range predicate on a non-indexed column has no thin access path, so
+        it is served by the on-demand executor rather than rejected."""
         sn = _sn()
         client.create_schema(sn)
         try:
             client.execute_sql(
                 "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
                 schema_name=sn)
-            client.execute_sql("INSERT INTO t VALUES (1, 5)", schema_name=sn)
-            with pytest.raises(gnitz.GnitzError):
-                client.execute_sql("SELECT * FROM t WHERE x > 5", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 6), (3, 4)", schema_name=sn)
+            assert _result_pks(client.execute_sql(
+                "SELECT * FROM t WHERE x > 5", schema_name=sn)) == [2]
         finally:
             _drop_all(client, sn, tables=["t"])
 
