@@ -115,11 +115,11 @@ fn range_per_row_seek(
         // Galloping forward skip seeded at the live position; falls back to a
         // bounded backward search on the `Lt`/`Le` `n_eq == 0` reset (all rows
         // seek 0x00…), so it stays correct for that non-monotone case too.
-        cursor.advance_to(start.as_slice());
+        cursor.advance_to(start.pk_bytes());
         while cursor.valid
             && end
                 .as_ref()
-                .is_none_or(|e| cursor.current_pk_cmp_bytes(e.as_slice()).is_lt())
+                .is_none_or(|e| cursor.current_pk_cmp_bytes(e.pk_bytes()).is_lt())
         {
             let w_out = w_delta.wrapping_mul(cursor.current_weight);
             if w_out != 0 {
@@ -190,7 +190,7 @@ fn range_merge_walk(
         // Galloping forward skip to the covered start: the targets ascend across
         // groups, so `advance_to` seeded at the live position skips untouched
         // trace groups and the intra-group dead head in one hop.
-        cursor.advance_to(start.as_slice());
+        cursor.advance_to(start.pk_bytes());
         let mut ptr = lo; // monotone delta pointer
         while cursor.valid {
             // Bind the PK once: both the span-end bound and the range-slot read
@@ -198,7 +198,7 @@ fn range_merge_walk(
             // key in [start, end) carries eq prefix E, so `end` alone delimits
             // the group — no per-row eq check needed.
             let pk = cursor.current_pk_bytes();
-            if end.as_ref().is_some_and(|e2| pk >= e2.as_slice()) {
+            if end.as_ref().is_some_and(|e2| pk >= e2.pk_bytes()) {
                 break; // reached the covered-span end (the dead tail follows)
             }
             let s = &pk[eq_size..]; // trace range slot (PK is exactly stride bytes)

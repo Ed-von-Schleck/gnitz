@@ -11,6 +11,7 @@
 //! native-`u128` `Cut` values, so the two derivations are not shared — only the
 //! byte successor is.
 
+use crate::schema::key::PkBuf;
 use gnitz_wire::{RangeRel, MAX_PK_BYTES};
 
 /// Fixed-width byte-string successor: `p + 1` with carry, in place. Returns
@@ -25,31 +26,6 @@ pub(crate) fn increment_key_in_place(p: &mut [u8]) -> bool {
         }
     }
     false
-}
-
-/// A `stride`-byte OPK cut key over the trace PK space. Backed by stack storage
-/// (`MAX_PK_BYTES` bounds every trace PK stride); read the live key via
-/// [`Self::as_slice`].
-#[derive(Clone, Copy)]
-pub(crate) struct CutKey {
-    buf: [u8; MAX_PK_BYTES],
-    len: usize,
-}
-
-impl CutKey {
-    fn zeroed(len: usize) -> Self {
-        debug_assert!(len <= MAX_PK_BYTES);
-        CutKey {
-            buf: [0u8; MAX_PK_BYTES],
-            len,
-        }
-    }
-
-    /// The `stride`-byte key.
-    #[inline]
-    pub(crate) fn as_slice(&self) -> &[u8] {
-        &self.buf[..self.len]
-    }
 }
 
 /// Half-open `[start, end)` cut points over the trace PK space for one delta
@@ -69,32 +45,32 @@ impl CutKey {
 /// | `Ge` | `eq‖d`               | same as `Gt`                              |
 /// | `Lt` | `eq ‖ 0x00*slot`     | `Some(eq‖d)`                              |
 /// | `Le` | `eq ‖ 0x00*slot`     | `succ(eq‖d)`; carry ⇒ end                  |
-pub(crate) fn range_cut_points(eq: &[u8], d: &[u8], rel: RangeRel) -> Option<(CutKey, Option<CutKey>)> {
+pub(crate) fn range_cut_points(eq: &[u8], d: &[u8], rel: RangeRel) -> Option<(PkBuf, Option<PkBuf>)> {
     let eq_size = eq.len();
     let slot_size = d.len();
     let stride = eq_size + slot_size;
     debug_assert!(stride <= MAX_PK_BYTES && slot_size > 0);
 
     // p = eq ‖ d — the delta row's own PK region.
-    let mut p = CutKey::zeroed(stride);
-    p.buf[..eq_size].copy_from_slice(eq);
-    p.buf[eq_size..stride].copy_from_slice(d);
+    let mut p = PkBuf::zeroed(stride);
+    p.bytes[..eq_size].copy_from_slice(eq);
+    p.bytes[eq_size..stride].copy_from_slice(d);
 
     // eq ‖ 0x00*slot — the lowest key in this eq group (the Lt/Le start). The
     // slot region is already zero from `zeroed`.
-    let mut eq_low = CutKey::zeroed(stride);
-    eq_low.buf[..eq_size].copy_from_slice(eq);
+    let mut eq_low = PkBuf::zeroed(stride);
+    eq_low.bytes[..eq_size].copy_from_slice(eq);
 
     // succ(eq) zero-padded — the first key of the NEXT eq group (the Gt/Ge end).
     // `None` (scan to table end) when there is no eq prefix or `succ(eq)` carries
     // out (the last eq group). The slot bytes stay zero, so `succ` ripples only
     // through the eq prefix sub-slice.
-    let next_group = || -> Option<CutKey> {
+    let next_group = || -> Option<PkBuf> {
         if eq_size == 0 {
             return None;
         }
         let mut k = eq_low;
-        if increment_key_in_place(&mut k.buf[..eq_size]) {
+        if increment_key_in_place(&mut k.bytes[..eq_size]) {
             Some(k)
         } else {
             None
@@ -106,7 +82,7 @@ pub(crate) fn range_cut_points(eq: &[u8], d: &[u8], rel: RangeRel) -> Option<(Cu
             // start = succ(eq‖d); a full carry-out means eq‖d is the maximal key —
             // no key space above it, so the row matches nothing.
             let mut start = p;
-            if !increment_key_in_place(&mut start.buf[..stride]) {
+            if !increment_key_in_place(&mut start.bytes[..stride]) {
                 return None;
             }
             Some((start, next_group()))
@@ -118,7 +94,7 @@ pub(crate) fn range_cut_points(eq: &[u8], d: &[u8], rel: RangeRel) -> Option<(Cu
             // (eq‖0xFF… → the next eq group's first key), and a full carry-out
             // means scan to the table end.
             let mut end = p;
-            let end = increment_key_in_place(&mut end.buf[..stride]).then_some(end);
+            let end = increment_key_in_place(&mut end.bytes[..stride]).then_some(end);
             Some((eq_low, end))
         }
     }
@@ -163,7 +139,7 @@ mod tests {
     // exact-comparable, plus a 1-eq-slot variant for prefix coverage.
 
     fn cuts(eq: &[u8], d: &[u8], rel: RangeRel) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
-        range_cut_points(eq, d, rel).map(|(s, e)| (s.as_slice().to_vec(), e.map(|e| e.as_slice().to_vec())))
+        range_cut_points(eq, d, rel).map(|(s, e)| (s.pk_bytes().to_vec(), e.map(|e| e.pk_bytes().to_vec())))
     }
 
     #[test]

@@ -317,6 +317,16 @@ impl PkBuf {
     /// zero. The only row constructor: `MappedShard::get_pk_bytes(row)`
     /// returns exactly `pk_stride` bytes, and manifest `parse` passes
     /// its on-disk `len`/payload slice.
+    /// All-zero key of the given width — mutable scratch for cut-key
+    /// derivation (the fields are public; write the meaningful span in place).
+    pub fn zeroed(len: usize) -> Self {
+        debug_assert!(len <= MAX_PK_BYTES);
+        PkBuf {
+            bytes: [0u8; MAX_PK_BYTES],
+            len: len as u8,
+        }
+    }
+
     pub fn from_bytes(slice: &[u8]) -> Self {
         debug_assert!(slice.len() <= MAX_PK_BYTES);
         let mut bytes = [0u8; MAX_PK_BYTES];
