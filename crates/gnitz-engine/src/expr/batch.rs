@@ -676,6 +676,31 @@ pub(in crate::expr) fn eval_batch(
             }
 
             // ----------------------------------------------------------------
+            // Integer set membership (col IN (…) as one opcode)
+            // ----------------------------------------------------------------
+            // Binary-search each row's i64 register image in the sorted,
+            // deduplicated pool. `LoadPayloadInt` writes every row's register
+            // (NULL rows too, tracked in `null_bits`), so the search reads a real
+            // i64 for all rows and the NULL-row result is masked by `null_copy1`
+            // — exactly how `IntNeg` handles a NULL row.
+            Instr::IntInSet {
+                dst,
+                value_reg,
+                set_idx,
+            } => {
+                let dst = dst as usize;
+                let vi = value_reg as usize;
+                let set = &prog.int_sets[set_idx as usize]; // decoded once, sorted ascending
+                let base_v = vi * MORSEL;
+                let base_d = dst * MORSEL;
+                for i in 0..m {
+                    scratch.regs[base_d + i] = set.binary_search(&scratch.regs[base_v + i]).is_ok() as i64;
+                }
+                null_copy1(scratch, dst, vi, m); // dst_null = value_reg_null → NULL in ⇒ NULL out
+                maybe_pack_bool_bits(scratch, prog, dst, m);
+            }
+
+            // ----------------------------------------------------------------
             // Float arithmetic
             // ----------------------------------------------------------------
             Instr::FloatAdd { dst, a, b } => {

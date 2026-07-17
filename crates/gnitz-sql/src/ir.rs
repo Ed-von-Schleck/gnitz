@@ -35,6 +35,16 @@ pub(crate) enum BoundExpr {
         branches: Vec<(BoundExpr, BoundExpr)>,
         else_: Option<Box<BoundExpr>>,
     },
+    /// `inner IN (items…)` bound faithfully (un-desugared): each backend decides
+    /// how to lower it — a `≤8-byte-integer` operand with all-integer-literal
+    /// items compiles to one `INT_IN_SET`; anything else falls back to the
+    /// `inner = i0 OR inner = i1 OR …` chain. `NOT IN` is the outer
+    /// `UnaryOp(Not, InList)`. `items` is always non-empty (the binder rejects
+    /// `IN ()`).
+    InList {
+        inner: Box<BoundExpr>,
+        items: Vec<BoundExpr>,
+    },
 }
 
 /// Common numeric type for arithmetic and conditional blends, matching the
@@ -97,6 +107,8 @@ impl BoundExpr {
                 }
                 ty
             }
+            // The membership test is a boolean, like the comparison `BinOp` arm.
+            BoundExpr::InList { .. } => TypeCode::I64,
         }
     }
 }

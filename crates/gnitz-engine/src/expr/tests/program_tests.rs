@@ -1873,3 +1873,150 @@ fn test_new_panics_on_aliased_register() {
     // A compiler-built (trusted) aliased-register program still panics from `new`.
     let _ = LogicalProgram::new(vec![LogicalInstr::IntAdd { dst: 0, a: 0, b: 1 }], 2, 0, vec![]);
 }
+
+// ---------------------------------------------------------------------------
+// INT_IN_SET — set membership as one opcode (O(1) registers, O(log N) per row)
+// ---------------------------------------------------------------------------
+
+/// Pack a sorted, deduplicated i64 set into the `N × 8-byte LE` pool layout the
+/// const pool carries for `INT_IN_SET`.
+fn pack_i64_set(values: &[i64]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 8);
+    for v in values {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    bytes
+}
+
+/// `r0 = col1; r1 = r0 IN set`, result_reg = 1 — the compiled shape of
+/// `col1 IN (…)`. `col_tc` picks col1's type (I64 / U64 / …).
+fn in_set_prog(col_tc: u8, set: &[i64]) -> (SchemaDescriptor, ResolvedProgram) {
+    let schema = make_schema(0, &[8, col_tc]); // col0 = PK(U64), col1 = col_tc
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::IntInSet {
+            dst: 1,
+            value_reg: 0,
+            set_idx: 0,
+        },
+    ];
+    let prog = make_prog(&schema, instrs, 2, 1, vec![pack_i64_set(set)]);
+    (schema, prog)
+}
+
+#[test]
+fn test_int_in_set_hit_miss_null() {
+    let (schema, prog) = in_set_prog(9 /* I64 */, &[1, 3, 5, 42]);
+
+    // Hit: 42 ∈ {1,3,5,42}.
+    let mb = make_int_batch(&schema, &[(1, 1, 0, &[42])]);
+    assert_eq!(eval_predicate(&prog, &mb.as_mem_batch(), 0), (1, false));
+
+    // Miss: 7 ∉ set.
+    let mb = make_int_batch(&schema, &[(1, 1, 0, &[7])]);
+    assert_eq!(eval_predicate(&prog, &mb.as_mem_batch(), 0), (0, false));
+
+    // NULL operand ⇒ NULL out (col1 is payload index 0 → null_word bit 0).
+    let mb = make_int_batch(&schema, &[(1, 1, 0b1, &[0])]);
+    let (_v, is_null) = eval_predicate(&prog, &mb.as_mem_batch(), 0);
+    assert!(is_null, "NULL operand must produce a NULL membership result");
+}
+
+#[test]
+fn test_int_in_set_u64_neg_one_matches_max() {
+    // `u64col IN (-1)`: the column loads as i64 -1 (bare bit-reinterpret) and the
+    // folded literal -1 is i64 -1, so u64::MAX matches — same as the OR-chain's
+    // bit-equal `col = -1`.
+    let (schema, prog) = in_set_prog(8 /* U64 */, &[-1]);
+    let mb = make_int_batch(&schema, &[(1, 1, 0, &[u64::MAX as i64])]);
+    assert_eq!(eval_predicate(&prog, &mb.as_mem_batch(), 0), (1, false));
+    // A different u64 value misses.
+    let mb = make_int_batch(&schema, &[(1, 1, 0, &[7])]);
+    assert_eq!(eval_predicate(&prog, &mb.as_mem_batch(), 0), (0, false));
+}
+
+#[test]
+fn test_int_in_set_signed_negatives_by_signed_order() {
+    // Signed set with negatives, sorted ascending in signed i64 order.
+    let (schema, prog) = in_set_prog(9 /* I64 */, &[-5, -1, 0, 3]);
+    for (v, want) in [(-5i64, 1), (-1, 1), (0, 1), (3, 1), (2, 0), (100, 0)] {
+        let mb = make_int_batch(&schema, &[(1, 1, 0, &[v])]);
+        assert_eq!(
+            eval_predicate(&prog, &mb.as_mem_batch(), 0),
+            (want, false),
+            "value {v} membership"
+        );
+    }
+}
+
+#[test]
+fn test_int_in_set_1000_elements_compiles_and_evals() {
+    // The whole point: a 1000-element set is O(1) registers (the OR-chain would
+    // have needed ~4000, blowing the 64-register cap with TooManyRegs).
+    let set: Vec<i64> = (0..1000).collect();
+    let (schema, prog) = in_set_prog(9 /* I64 */, &set);
+    assert_eq!(prog.num_regs, 2, "membership uses two registers regardless of set size");
+    let mb = make_int_batch(&schema, &[(1, 1, 0, &[777])]);
+    assert_eq!(eval_predicate(&prog, &mb.as_mem_batch(), 0), (1, false));
+    let mb = make_int_batch(&schema, &[(1, 1, 0, &[1000])]);
+    assert_eq!(eval_predicate(&prog, &mb.as_mem_batch(), 0), (0, false));
+}
+
+#[test]
+fn test_int_not_in_set_null_operand_excluded() {
+    // NOT IN = bool_not(IN). A NULL operand makes IN NULL, NOT(NULL) NULL — the
+    // row is excluded (3VL), matching the OR-chain's `NOT(NULL) = NULL`.
+    let schema = make_schema(0, &[8, 9]); // col0 = PK(U64), col1 = I64
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::IntInSet {
+            dst: 1,
+            value_reg: 0,
+            set_idx: 0,
+        },
+        LogicalInstr::BoolNot { dst: 2, a: 1 },
+    ];
+    let prog = make_prog(&schema, instrs, 3, 2, vec![pack_i64_set(&[1, 2, 3])]);
+    // NULL operand → NOT IN is NULL (excluded).
+    let mb = make_int_batch(&schema, &[(1, 1, 0b1, &[0])]);
+    assert!(
+        eval_predicate(&prog, &mb.as_mem_batch(), 0).1,
+        "NOT IN NULL must be NULL"
+    );
+    // A non-member is included by NOT IN.
+    let mb = make_int_batch(&schema, &[(1, 1, 0, &[9])]);
+    assert_eq!(eval_predicate(&prog, &mb.as_mem_batch(), 0), (1, false));
+    // A member is excluded by NOT IN.
+    let mb = make_int_batch(&schema, &[(1, 1, 0, &[2])]);
+    assert_eq!(eval_predicate(&prog, &mb.as_mem_batch(), 0), (0, false));
+}
+
+#[test]
+fn test_int_in_set_empty_pool_always_false() {
+    // A zero-length pool matches nothing (binary_search on `[]` is always Err),
+    // and `len % 8 == 0` so it validates.
+    let (schema, prog) = in_set_prog(9 /* I64 */, &[]);
+    let mb = make_int_batch(&schema, &[(1, 1, 0, &[42])]);
+    assert_eq!(eval_predicate(&prog, &mb.as_mem_batch(), 0), (0, false));
+}
+
+#[test]
+fn test_int_in_set_validate_rejects_misaligned_pool() {
+    // A pool whose length is not a multiple of 8 is a clean IntSetNotAligned,
+    // not a silent chunks_exact tail-drop at resolve. `from_wire` runs the
+    // structure-only validate, so it rejects here.
+    // Quad: [INT_IN_SET=46, dst=1, value_reg=0, set_idx=0], pool of 5 bytes.
+    assert_eq!(
+        wire_err(LogicalProgram::from_wire(&[46, 1, 0, 0], 2, 1, vec![vec![0u8; 5]])),
+        ExprValidateErr::IntSetNotAligned { set_idx: 0, len: 5 }
+    );
+}
+
+#[test]
+fn test_int_in_set_validate_rejects_out_of_range_set_idx() {
+    // set_idx = 9 against a pool of length 1 → ConstIdxOutOfRange.
+    assert_eq!(
+        wire_err(LogicalProgram::from_wire(&[46, 1, 0, 9], 2, 1, vec![vec![0u8; 8]])),
+        ExprValidateErr::ConstIdxOutOfRange { const_idx: 9, n: 1 }
+    );
+}

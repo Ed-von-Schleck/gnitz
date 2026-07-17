@@ -36,6 +36,10 @@ pub(crate) trait BoundExprBackend {
         branches: &[(BoundExpr, BoundExpr)],
         else_: Option<&BoundExpr>,
     ) -> Result<Self::Out, GnitzSqlError>;
+    /// `inner IN (items…)`, received *unevaluated* like `binop`/`case` so a
+    /// backend can decide between the `INT_IN_SET` fast path and the OR-chain
+    /// fallback using the schema it holds. `items` is non-empty.
+    fn in_list(&mut self, inner: &BoundExpr, items: &[BoundExpr]) -> Result<Self::Out, GnitzSqlError>;
 }
 
 /// Dispatch a single `BoundExpr` node to the backend. The lone `match` over the
@@ -56,7 +60,36 @@ pub(crate) fn lower_bound_expr<B: BoundExprBackend>(
         BoundExpr::IsNotNull(c) => backend.null_test(*c, false),
         BoundExpr::AggCall { .. } => backend.agg_call(),
         BoundExpr::Case { branches, else_ } => backend.case(branches, else_.as_deref()),
+        BoundExpr::InList { inner, items } => backend.in_list(inner, items),
     }
+}
+
+/// An IN-list item folds to an integer constant iff it is an integer literal or
+/// the unary negation of one (`-1` binds to `UnaryOp(Neg, LitInt(1))` — sqlparser
+/// lexes the minus separately). `wrapping_neg` matches the engine's `IntNeg` and
+/// the interpreter's `Neg`, so the folded image is bit-identical to the runtime
+/// OR-chain literal. Anything else → `None` → the OR-chain fallback.
+fn fold_int_literal(e: &BoundExpr) -> Option<i64> {
+    match e {
+        BoundExpr::LitInt(v) => Some(*v),
+        BoundExpr::UnaryOp(UnaryOp::Neg, inner) => match inner.as_ref() {
+            BoundExpr::LitInt(v) => Some(v.wrapping_neg()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The OR-chain fallback for a non-integer / non-literal `IN`:
+/// `inner = i0 OR inner = i1 OR …`. `items` must be non-empty (the binder rejects
+/// `IN ()`).
+fn in_list_or_chain(inner: &BoundExpr, items: &[BoundExpr]) -> BoundExpr {
+    let eq = |it: &BoundExpr| BoundExpr::BinOp(Box::new(inner.clone()), BinOp::Eq, Box::new(it.clone()));
+    let mut chain = eq(&items[0]);
+    for it in &items[1..] {
+        chain = BoundExpr::BinOp(Box::new(chain), BinOp::Or, Box::new(eq(it)));
+    }
+    chain
 }
 
 /// Try to compile a string comparison (col vs const, const vs col, col vs col).
@@ -250,6 +283,29 @@ impl BoundExprBackend for OpcodeBackend<'_> {
             acc = self.eb.select(conds[i], result_reg, acc);
         }
         Ok((acc, any_float))
+    }
+
+    fn in_list(&mut self, inner: &BoundExpr, items: &[BoundExpr]) -> Result<Self::Out, GnitzSqlError> {
+        // Fast path: a ≤8-byte-integer operand + every item a foldable integer
+        // literal → one INT_IN_SET. `self.schema` is the schema `inner` was bound
+        // against — source schema for a table filter, reduce-output schema for
+        // HAVING — so the int gate is correct in both, and a HAVING large-IN
+        // compiles here too. Use `FixedInt::from_type_code(...).is_some()` — the
+        // exact predicate the interpreter/thin-probe gate on — not
+        // `is_pk_eligible`, which wrongly admits U128/UUID/I128.
+        if gnitz_wire::FixedInt::from_type_code(inner.infer_type(self.schema)).is_some() {
+            if let Some(mut values) = items.iter().map(fold_int_literal).collect::<Option<Vec<i64>>>() {
+                values.sort_unstable();
+                values.dedup();
+                let (reg, _is_float) = lower_bound_expr(inner, self)?; // integer ⇒ not float
+                let idx = self.eb.add_const_int_set(&values);
+                return Ok((self.eb.int_in_set(reg, idx), false));
+            }
+        }
+        // Fallback: OR-chain via the existing binop path (float operand →
+        // int_to_float + fcmp; non-literal item → column compare). Rare,
+        // register-limited as today.
+        lower_bound_expr(&in_list_or_chain(inner, items), self)
     }
 
     fn binop(&mut self, left: &BoundExpr, op: BinOp, right: &BoundExpr) -> Result<Self::Out, GnitzSqlError> {
@@ -612,6 +668,183 @@ mod tests {
         );
         let mut eb = ExprBuilder::new();
         let err = compile_bound_expr(&expr, &schema, &mut eb).expect_err("string + 1 must not compile");
+        assert!(
+            matches!(err, GnitzSqlError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // IN-list lowering: INT_IN_SET fast path vs OR-chain fallback
+    // ------------------------------------------------------------------
+
+    /// col0 = pk (U64), col1 = a (I64), col2 = b (I64).
+    fn two_int_schema() -> Schema {
+        Schema {
+            columns: vec![
+                col("pk", TypeCode::U64),
+                col("a", TypeCode::I64),
+                col("b", TypeCode::I64),
+            ],
+            pk_cols: vec![0],
+        }
+    }
+
+    fn in_list(inner: BoundExpr, items: Vec<BoundExpr>) -> BoundExpr {
+        BoundExpr::InList {
+            inner: Box::new(inner),
+            items,
+        }
+    }
+
+    /// `-v` binds to `UnaryOp(Neg, LitInt(v))` (sqlparser lexes the minus
+    /// separately); the fold path must still emit INT_IN_SET.
+    fn neg_lit(v: i64) -> BoundExpr {
+        BoundExpr::UnaryOp(UnaryOp::Neg, Box::new(BoundExpr::LitInt(v)))
+    }
+
+    /// An integer operand with all-integer-literal items → one INT_IN_SET, for
+    /// both positive and negative-literal lists.
+    #[test]
+    fn in_list_int_emits_int_in_set() {
+        use gnitz_wire::EXPR_INT_IN_SET;
+        let schema = two_int_schema();
+        for items in [
+            vec![BoundExpr::LitInt(1), BoundExpr::LitInt(2), BoundExpr::LitInt(3)],
+            vec![neg_lit(1), neg_lit(2)],
+        ] {
+            let prog = compile_bound_expr_to_program(&in_list(BoundExpr::ColRef(1), items), &schema).unwrap();
+            let ops = opcodes(&prog);
+            assert!(
+                ops.contains(&EXPR_INT_IN_SET),
+                "int IN must emit INT_IN_SET, ops={ops:?}"
+            );
+        }
+    }
+
+    /// The pool is sorted and deduplicated: `a IN (1, 1, 2)` packs 2 i64s (16
+    /// bytes), not 3.
+    #[test]
+    fn in_list_int_pool_is_sorted_and_deduped() {
+        let schema = two_int_schema();
+        let items = vec![BoundExpr::LitInt(2), BoundExpr::LitInt(1), BoundExpr::LitInt(1)];
+        let prog = compile_bound_expr_to_program(&in_list(BoundExpr::ColRef(1), items), &schema).unwrap();
+        assert_eq!(prog.const_strings.len(), 1, "one const-pool entry (the packed set)");
+        assert_eq!(
+            prog.const_strings[0].len(),
+            2 * 8,
+            "duplicate 1 must collapse: 2 i64s = 16 bytes"
+        );
+        // Packed ascending: [1, 2].
+        assert_eq!(&prog.const_strings[0][0..8], &1i64.to_le_bytes());
+        assert_eq!(&prog.const_strings[0][8..16], &2i64.to_le_bytes());
+    }
+
+    /// The motivating fix: a large integer IN list compiles to O(1) registers.
+    /// The OR-chain needs ~4N registers and blows the 64-register cap at N=17
+    /// (`TooManyRegs`); the fast path is register-flat regardless of N.
+    #[test]
+    fn in_list_large_int_list_compiles_within_register_cap() {
+        let schema = two_int_schema();
+        let items: Vec<BoundExpr> = (0..500).map(BoundExpr::LitInt).collect();
+        let prog = compile_bound_expr_to_program(&in_list(BoundExpr::ColRef(1), items), &schema).unwrap();
+        assert!(
+            prog.num_regs <= 4,
+            "membership is O(1) registers; got {} for a 500-element list",
+            prog.num_regs
+        );
+        assert_eq!(
+            prog.const_strings[0].len(),
+            500 * 8,
+            "the whole set rides one pool entry"
+        );
+    }
+
+    /// A float operand falls back to the OR-chain (int-cast + fcmp), never
+    /// INT_IN_SET.
+    #[test]
+    fn in_list_float_operand_falls_back_to_or_chain() {
+        use gnitz_wire::{EXPR_FCMP_EQ, EXPR_INT_IN_SET};
+        let schema = case_schema(); // col2 = f (F64)
+        let prog = compile_bound_expr_to_program(
+            &in_list(BoundExpr::ColRef(2), vec![BoundExpr::LitInt(1), BoundExpr::LitInt(2)]),
+            &schema,
+        )
+        .unwrap();
+        let ops = opcodes(&prog);
+        assert!(!ops.contains(&EXPR_INT_IN_SET), "float IN must not emit INT_IN_SET");
+        assert!(ops.contains(&EXPR_FCMP_EQ), "float IN lowers to fcmp OR-chain");
+    }
+
+    /// A string operand falls back to the OR-chain (str_col_eq_const).
+    #[test]
+    fn in_list_string_operand_falls_back_to_or_chain() {
+        use gnitz_wire::{EXPR_INT_IN_SET, EXPR_STR_COL_EQ_CONST};
+        let schema = str_schema(); // col1 = s (String)
+        let prog = compile_bound_expr_to_program(
+            &in_list(
+                BoundExpr::ColRef(1),
+                vec![BoundExpr::LitStr("a".into()), BoundExpr::LitStr("b".into())],
+            ),
+            &schema,
+        )
+        .unwrap();
+        let ops = opcodes(&prog);
+        assert!(!ops.contains(&EXPR_INT_IN_SET), "string IN must not emit INT_IN_SET");
+        assert!(
+            ops.contains(&EXPR_STR_COL_EQ_CONST),
+            "string IN lowers to str_col_eq_const"
+        );
+    }
+
+    /// A non-literal item (a column) forces the OR-chain even for an int operand.
+    #[test]
+    fn in_list_non_literal_item_falls_back_to_or_chain() {
+        use gnitz_wire::{EXPR_CMP_EQ, EXPR_INT_IN_SET};
+        let schema = two_int_schema();
+        let prog = compile_bound_expr_to_program(
+            &in_list(BoundExpr::ColRef(1), vec![BoundExpr::LitInt(1), BoundExpr::ColRef(2)]),
+            &schema,
+        )
+        .unwrap();
+        let ops = opcodes(&prog);
+        assert!(
+            !ops.contains(&EXPR_INT_IN_SET),
+            "non-literal item must not emit INT_IN_SET"
+        );
+        assert!(ops.contains(&EXPR_CMP_EQ), "non-literal item lowers to cmp OR-chain");
+    }
+
+    /// A float-literal item forces the OR-chain even for an int operand
+    /// (`a IN (1, 2.5)`).
+    #[test]
+    fn in_list_float_literal_item_falls_back_to_or_chain() {
+        use gnitz_wire::EXPR_INT_IN_SET;
+        let schema = two_int_schema();
+        let prog = compile_bound_expr_to_program(
+            &in_list(
+                BoundExpr::ColRef(1),
+                vec![BoundExpr::LitInt(1), BoundExpr::LitFloat(2.5)],
+            ),
+            &schema,
+        )
+        .unwrap();
+        assert!(
+            !opcodes(&prog).contains(&EXPR_INT_IN_SET),
+            "a float-literal item must not emit INT_IN_SET"
+        );
+    }
+
+    /// A wide-int (U128) operand takes the OR-chain, which the integer-load path
+    /// then rejects — the same error the OR-chain gave before.
+    #[test]
+    fn in_list_wide_int_operand_rejects() {
+        let schema = Schema {
+            columns: vec![col("pk", TypeCode::U64), col("w", TypeCode::U128)],
+            pk_cols: vec![0],
+        };
+        let err = compile_bound_expr_to_program(&in_list(BoundExpr::ColRef(1), vec![BoundExpr::LitInt(1)]), &schema)
+            .expect_err("wide-int IN must not compile");
         assert!(
             matches!(err, GnitzSqlError::Unsupported(_)),
             "expected Unsupported, got {err:?}"

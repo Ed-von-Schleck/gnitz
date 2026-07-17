@@ -52,6 +52,12 @@ pub const EXPR_STR_COL_LE_CONST: u32 = 42;
 pub const EXPR_STR_COL_EQ_COL: u32 = 43;
 pub const EXPR_STR_COL_LT_COL: u32 = 44;
 pub const EXPR_STR_COL_LE_COL: u32 = 45;
+/// Integer set membership: `[EXPR_INT_IN_SET, dst, value_reg, set_idx]`. Tests
+/// register `value_reg`'s i64 image for membership in the sorted, deduplicated
+/// i64 pool at const index `set_idx` (packed `N × 8-byte LE`) by binary search,
+/// writing a 0/1 boolean into `dst`. NULL input propagates to NULL. `set_idx` is
+/// a const-pool index (full u32, like `EXPR_STR_COL_*_CONST`), not a register.
+pub const EXPR_INT_IN_SET: u32 = 46;
 
 // ---------------------------------------------------------------------------
 // Blob framing constants and operand packing

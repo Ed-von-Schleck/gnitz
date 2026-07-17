@@ -2,10 +2,10 @@ use gnitz_wire::{
     EXPR_BOOL_AND, EXPR_BOOL_NOT, EXPR_BOOL_OR, EXPR_CMP_EQ, EXPR_CMP_GE, EXPR_CMP_GT, EXPR_CMP_LE, EXPR_CMP_LT,
     EXPR_CMP_NE, EXPR_COPY_COL, EXPR_EMIT, EXPR_FCMP_EQ, EXPR_FCMP_GE, EXPR_FCMP_GT, EXPR_FCMP_LE, EXPR_FCMP_LT,
     EXPR_FCMP_NE, EXPR_FLOAT_ADD, EXPR_FLOAT_DIV, EXPR_FLOAT_MUL, EXPR_FLOAT_NEG, EXPR_FLOAT_SUB, EXPR_INT_ADD,
-    EXPR_INT_DIV, EXPR_INT_MOD, EXPR_INT_MUL, EXPR_INT_NEG, EXPR_INT_SUB, EXPR_INT_TO_FLOAT, EXPR_IS_NOT_NULL,
-    EXPR_IS_NULL, EXPR_LOAD_COL_FLOAT, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST, EXPR_LOAD_NULL, EXPR_SELECT,
-    EXPR_STR_COL_EQ_COL, EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LE_COL, EXPR_STR_COL_LE_CONST, EXPR_STR_COL_LT_COL,
-    EXPR_STR_COL_LT_CONST,
+    EXPR_INT_DIV, EXPR_INT_IN_SET, EXPR_INT_MOD, EXPR_INT_MUL, EXPR_INT_NEG, EXPR_INT_SUB, EXPR_INT_TO_FLOAT,
+    EXPR_IS_NOT_NULL, EXPR_IS_NULL, EXPR_LOAD_COL_FLOAT, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST, EXPR_LOAD_NULL,
+    EXPR_SELECT, EXPR_STR_COL_EQ_COL, EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LE_COL, EXPR_STR_COL_LE_CONST,
+    EXPR_STR_COL_LT_COL, EXPR_STR_COL_LT_CONST,
 };
 
 /// A compiled expression program: a flat list of 4-word instructions
@@ -15,13 +15,17 @@ pub struct ExprProgram {
     pub num_regs: u32,
     pub result_reg: u32,
     pub code: Vec<u32>,
-    pub const_strings: Vec<String>,
+    /// The byte-transparent const pool: length-prefixed raw byte strings. Holds
+    /// german-string cells (string comparisons) and packed sorted-i64 arrays
+    /// (`INT_IN_SET` value pools) alike — the engine and interpreter interpret
+    /// each entry by the opcode that indexes it, never as text.
+    pub const_strings: Vec<Vec<u8>>,
 }
 
 impl ExprProgram {
     /// Serialise to a self-contained byte sequence (magic "EXPR"), suitable for a BLOB column.
     pub fn encode(&self) -> Vec<u8> {
-        let strs: Vec<&[u8]> = self.const_strings.iter().map(String::as_bytes).collect();
+        let strs: Vec<&[u8]> = self.const_strings.iter().map(Vec::as_slice).collect();
         gnitz_wire::encode_expr_blob(self.num_regs, self.result_reg, &self.code, &strs)
     }
 }
@@ -30,7 +34,7 @@ impl ExprProgram {
 pub struct ExprBuilder {
     code: Vec<u32>,
     next_reg: u32,
-    const_strings: Vec<String>,
+    const_strings: Vec<Vec<u8>>,
 }
 
 impl Default for ExprBuilder {
@@ -239,12 +243,40 @@ impl ExprBuilder {
         self.emit(EXPR_COPY_COL, type_code, src_col_idx, payload_col_idx);
     }
 
-    // --- String constants ---
+    // --- Const pool (byte-transparent) ---
+
+    /// Push a raw byte string into the const pool and return its index. The pool
+    /// is byte-transparent: german-string cells and packed i64 sets share it,
+    /// each interpreted by the opcode that indexes it. Every call pushes a fresh
+    /// entry — no cross-call dedup.
+    pub fn add_const_bytes(&mut self, bytes: Vec<u8>) -> u32 {
+        let idx = self.const_strings.len() as u32;
+        self.const_strings.push(bytes);
+        idx
+    }
 
     pub fn add_const_string(&mut self, s: String) -> u32 {
-        let idx = self.const_strings.len() as u32;
-        self.const_strings.push(s);
-        idx
+        self.add_const_bytes(s.into_bytes())
+    }
+
+    /// Push a sorted, deduplicated i64 value pool for `INT_IN_SET`, packed as
+    /// `N × 8-byte LE`, and return its const index. `values` MUST be sorted
+    /// ascending (signed i64) and deduplicated by the caller — the engine and
+    /// interpreter binary-search it as given.
+    pub fn add_const_int_set(&mut self, values: &[i64]) -> u32 {
+        let mut bytes = Vec::with_capacity(values.len() * 8);
+        for v in values {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        self.add_const_bytes(bytes)
+    }
+
+    // --- Integer set membership ---
+
+    /// `value_reg IN <set at const_idx>` → a fresh 0/1 boolean register. NULL
+    /// input propagates to NULL (the engine copies the operand's null word).
+    pub fn int_in_set(&mut self, value_reg: u32, const_idx: u32) -> u32 {
+        self.binary_op(EXPR_INT_IN_SET, value_reg, const_idx)
     }
 
     // --- String comparisons ---
@@ -304,7 +336,7 @@ mod tests {
         assert_eq!(dec.num_regs, prog.num_regs);
         assert_eq!(dec.result_reg, prog.result_reg);
         assert_eq!(dec.code, prog.code);
-        let expected: Vec<Vec<u8>> = prog.const_strings.iter().map(|s| s.as_bytes().to_vec()).collect();
-        assert_eq!(dec.const_strings, expected);
+        // Both sides are now `Vec<Vec<u8>>` — compare the byte-transparent pool directly.
+        assert_eq!(dec.const_strings, prog.const_strings);
     }
 }

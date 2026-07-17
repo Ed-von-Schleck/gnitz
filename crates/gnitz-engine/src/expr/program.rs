@@ -8,16 +8,16 @@
 //! miscompute.
 
 use crate::schema::{encode_german_string, ColumnLocator, SchemaDescriptor};
-// Wire opcodes (1–45) the client emits, matched as arms in `from_wire`. They are
+// Wire opcodes (1–46) the client emits, matched as arms in `from_wire`. They are
 // `pub const … : u32` in gnitz-wire, so a plain `use` binds them for pattern use.
 use gnitz_wire::{
     EXPR_BOOL_AND, EXPR_BOOL_NOT, EXPR_BOOL_OR, EXPR_CMP_EQ, EXPR_CMP_GE, EXPR_CMP_GT, EXPR_CMP_LE, EXPR_CMP_LT,
     EXPR_CMP_NE, EXPR_COPY_COL, EXPR_EMIT, EXPR_FCMP_EQ, EXPR_FCMP_GE, EXPR_FCMP_GT, EXPR_FCMP_LE, EXPR_FCMP_LT,
     EXPR_FCMP_NE, EXPR_FLOAT_ADD, EXPR_FLOAT_DIV, EXPR_FLOAT_MUL, EXPR_FLOAT_NEG, EXPR_FLOAT_SUB, EXPR_INT_ADD,
-    EXPR_INT_DIV, EXPR_INT_MOD, EXPR_INT_MUL, EXPR_INT_NEG, EXPR_INT_SUB, EXPR_INT_TO_FLOAT, EXPR_IS_NOT_NULL,
-    EXPR_IS_NULL, EXPR_LOAD_COL_FLOAT, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST, EXPR_LOAD_NULL, EXPR_SELECT,
-    EXPR_STR_COL_EQ_COL, EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LE_COL, EXPR_STR_COL_LE_CONST, EXPR_STR_COL_LT_COL,
-    EXPR_STR_COL_LT_CONST,
+    EXPR_INT_DIV, EXPR_INT_IN_SET, EXPR_INT_MOD, EXPR_INT_MUL, EXPR_INT_NEG, EXPR_INT_SUB, EXPR_INT_TO_FLOAT,
+    EXPR_IS_NOT_NULL, EXPR_IS_NULL, EXPR_LOAD_COL_FLOAT, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST, EXPR_LOAD_NULL,
+    EXPR_SELECT, EXPR_STR_COL_EQ_COL, EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LE_COL, EXPR_STR_COL_LE_CONST,
+    EXPR_STR_COL_LT_COL, EXPR_STR_COL_LT_CONST,
 };
 
 /// The register file is capped at 64: the BOOL_AND/BOOL_OR 3VL paths, the
@@ -36,6 +36,7 @@ pub(crate) enum ExprValidateErr {
     RegOutOfRange { reg: u16, num_regs: u32 },
     RegisterAliasing { dst: u16, a: u16, b: u16 },
     ConstIdxOutOfRange { const_idx: u32, n: usize },
+    IntSetNotAligned { set_idx: u32, len: usize },
     ColOutOfRange { col: u32, num_columns: usize },
     ColNotPayload { col: u32 },
     ColTooWideForRegister { col: u32, size: usize },
@@ -201,6 +202,14 @@ pub(crate) enum LogicalInstr {
         col_a: u32,
         col_b: u32,
     },
+    /// Integer set membership: `dst = value_reg ∈ set[set_idx]`. `set_idx` is a
+    /// const-pool index (`u32`, like `StrColConst.const_idx`) — the packed
+    /// sorted-i64 pool, decoded once at `resolve`.
+    IntInSet {
+        dst: u16,
+        value_reg: u16,
+        set_idx: u32,
+    },
     CopyCol {
         src_col: u32,
         out: u32,
@@ -364,6 +373,14 @@ pub(in crate::expr) enum Instr {
         dst: u16,
         pi_a: u8,
         pi_b: u8,
+    },
+    /// Integer set membership: `dst = value_reg ∈ int_sets[set_idx]`. The pool is
+    /// decoded once at `resolve` into `ResolvedProgram.int_sets` (sorted
+    /// ascending, signed i64); `set_idx` indexes that vector, not the const pool.
+    IntInSet {
+        dst: u16,
+        value_reg: u16,
+        set_idx: u32,
     },
     /// Verbatim column copy into output payload slot `out`. `src` carries the
     /// PK-vs-payload distinction plus width/type — the one resolved-column
@@ -559,6 +576,13 @@ impl LogicalProgram {
                     col_a: q[2],
                     col_b: q[3],
                 },
+                // `value_reg` rides the `a` slot (`q[2] as u16`); `set_idx` takes
+                // the full `q[3]` u32 const index, never truncated to u16.
+                EXPR_INT_IN_SET => LogicalInstr::IntInSet {
+                    dst,
+                    value_reg: a,
+                    set_idx: q[3],
+                },
                 _ => return Err(ExprValidateErr::UnknownOpcode(op)),
             });
         }
@@ -610,6 +634,10 @@ impl LogicalProgram {
         let mut reg_tc = [0u8; MAX_REGS];
         let is_u64 = |tc: u8| tc == type_code::U64;
         let mut instrs = Vec::with_capacity(self.instrs.len());
+        // Decoded `INT_IN_SET` pools, indexed by the resolved `set_idx`. Decoded
+        // once here (never per row); each `IntInSet` re-points its `set_idx` at
+        // its slot in this vector.
+        let mut int_sets: Vec<Vec<i64>> = Vec::new();
         for li in self.instrs {
             match li {
                 L::LoadColInt { dst, col } => {
@@ -755,6 +783,28 @@ impl LogicalProgram {
                         pi_b: schema.payload_mapping_byte(col_b as usize),
                     });
                 }
+                L::IntInSet {
+                    dst,
+                    value_reg,
+                    set_idx,
+                } => {
+                    // Decode the packed pool once, here — never per row. Immutable
+                    // read (not `mem::take`): `resolve` runs on client-controlled
+                    // wire input, and `validate` does not enforce one-const-index-
+                    // per-opcode, so a blob that shares an index between two
+                    // opcodes must stay inert, not corrupt the other's slot.
+                    let set: Vec<i64> = self.const_strings[set_idx as usize]
+                        .chunks_exact(8)
+                        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                        .collect();
+                    let new_idx = int_sets.len() as u32;
+                    int_sets.push(set);
+                    instrs.push(I::IntInSet {
+                        dst,
+                        value_reg,
+                        set_idx: new_idx,
+                    });
+                }
                 L::CopyCol { src_col, out } => {
                     // The source's location, width, and type — dropped from the wire
                     // `CopyCol` — resolve to the one canonical record.
@@ -782,6 +832,7 @@ impl LogicalProgram {
             result_reg: self.result_reg,
             const_cells,
             const_blob,
+            int_sets,
             no_nulls: false,
             bit_only_mask: 0,
             bool_input_mask: 0,
@@ -910,6 +961,28 @@ impl LogicalProgram {
                     }
                     check_col_payload(in_schema, col)?;
                 }
+                // Set membership over the register `value_reg`; `set_idx` is a
+                // const-pool index whose entry must be a whole number of 8-byte
+                // i64s (the `len % 8` check turns a truncating pool entry into a
+                // clean `Rejected` instead of a silent `chunks_exact` tail-drop).
+                L::IntInSet {
+                    dst,
+                    value_reg,
+                    set_idx,
+                } => {
+                    check_reg(value_reg, num_regs)?;
+                    check_reg(dst, num_regs)?;
+                    if set_idx as usize >= self.const_strings.len() {
+                        return Err(E::ConstIdxOutOfRange {
+                            const_idx: set_idx,
+                            n: self.const_strings.len(),
+                        });
+                    }
+                    let len = self.const_strings[set_idx as usize].len();
+                    if !len.is_multiple_of(8) {
+                        return Err(E::IntSetNotAligned { set_idx, len });
+                    }
+                }
                 L::StrColCol { dst, col_a, col_b, .. } => {
                     check_reg(dst, num_regs)?;
                     check_col_payload(in_schema, col_a)?;
@@ -998,6 +1071,10 @@ pub(in crate::expr) struct ResolvedProgram {
     /// engine-wide `compare_german_strings`.
     pub(in crate::expr) const_cells: Vec<[u8; 16]>,
     pub(in crate::expr) const_blob: Vec<u8>,
+    /// Decoded `INT_IN_SET` value pools, indexed by the resolved `set_idx`. Each
+    /// pool is sorted ascending in signed-i64 `Ord` and deduplicated (built that
+    /// way by the client backend), so `eval_batch` binary-searches it directly.
+    pub(in crate::expr) int_sets: Vec<Vec<i64>>,
     /// True iff no instruction can produce a NULL against the schema this program
     /// was resolved against, so the evaluator skips null-bit tracking entirely.
     /// Resolved once — the answer is only meaningful for that one schema, since
@@ -1043,7 +1120,11 @@ fn each_reg_read(i: &Instr, mut f: impl FnMut(u16)) {
             f(a);
             f(b);
         }
-        IntNeg { a, .. } | FloatNeg { a, .. } | IntToFloat { a, .. } | BoolNot { a, .. } => f(a),
+        IntNeg { a, .. }
+        | FloatNeg { a, .. }
+        | IntToFloat { a, .. }
+        | BoolNot { a, .. }
+        | IntInSet { value_reg: a, .. } => f(a),
         Emit { src, .. } => f(src),
         LoadPayloadInt { .. }
         | LoadPayloadFloat { .. }
@@ -1154,6 +1235,11 @@ impl ResolvedProgram {
                     bool_produced |= 1u64 << dst;
                     non_bool_read |= (1u64 << a) | (1u64 << b);
                 }
+                // Bool producer reading one integer register (its value operand).
+                IntInSet { dst, value_reg, .. } => {
+                    bool_produced |= 1u64 << dst;
+                    non_bool_read |= 1u64 << value_reg;
+                }
                 // Binary register readers (non-bool-producing).
                 IntAdd { a, b, .. }
                 | IntSub { a, b, .. }
@@ -1263,6 +1349,9 @@ impl ResolvedProgram {
                 | FloatNeg { .. }
                 | Cmp { .. }
                 | FCmp { .. }
+                // Set membership introduces no NULL beyond its input register; a
+                // nullable source column is already disqualified at its `Load`.
+                | IntInSet { .. }
                 | IntToFloat { .. }
                 // Select only copies branch values — any NULL a branch can
                 // produce is already accounted for by that branch's own producer

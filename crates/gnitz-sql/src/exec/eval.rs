@@ -125,6 +125,30 @@ impl BoundExprBackend for InterpBackend<'_> {
         }
     }
 
+    fn in_list(&mut self, inner: &BoundExpr, items: &[BoundExpr]) -> Result<Self::Out, GnitzSqlError> {
+        // `inner IN (items…)` as a direct 3VL membership scan. The interpreter is a
+        // tree-walk with no register cap — unlike the compiled VM, whose 64-register
+        // cap is the entire reason `INT_IN_SET` exists — so it needs no fast path:
+        // evaluate the operand once, then linear-scan the items. This is exactly the
+        // `inner = i0 OR inner = i1 OR …` chain's 3VL (TRUE on first match, else NULL
+        // if any item is NULL, else FALSE), with no per-row allocation, sort, or
+        // cloned OR-tree, and it handles every item type uniformly (int literals,
+        // negated literals, columns) via the shared `Eq`-equivalent i64 compare.
+        let v = match lower_bound_expr(inner, self)? {
+            Some(v) => v,
+            None => return Ok(None), // NULL operand ⇒ NULL
+        };
+        let mut saw_null = false;
+        for it in items {
+            match lower_bound_expr(it, self)? {
+                Some(iv) if iv == v => return Ok(Some(1)),
+                Some(_) => {}
+                None => saw_null = true,
+            }
+        }
+        Ok(if saw_null { None } else { Some(0) })
+    }
+
     fn binop(&mut self, l: &BoundExpr, op: BinOp, r: &BoundExpr) -> Result<Self::Out, GnitzSqlError> {
         // SQL 3VL: short-circuit before propagating NULL.
         // TRUE OR any = TRUE; FALSE AND any = FALSE — regardless of NULL.
@@ -309,6 +333,16 @@ impl BoundExprBackend for ThinProbe<'_> {
             Some(e) => lower_bound_expr(e, self),
             None => Ok(()),
         }
+    }
+
+    fn in_list(&mut self, inner: &BoundExpr, items: &[BoundExpr]) -> Result<(), GnitzSqlError> {
+        // Thin iff the operand and every item are thin — matching the OR-chain
+        // fallback's thinness (a float/string item makes it non-thin).
+        lower_bound_expr(inner, self)?;
+        for it in items {
+            lower_bound_expr(it, self)?;
+        }
+        Ok(())
     }
 }
 
@@ -566,5 +600,96 @@ mod tests {
         }
         let got = eval_expr(&BoundExpr::ColRef(1), &batch, 0, &schema).unwrap();
         assert_eq!(got, Some(-1i64), "U64::MAX must bitcast to -1i64 via new path");
+    }
+
+    // ------------------------------------------------------------------
+    // IN-list interpreter evaluation (InterpBackend::in_list)
+    // ------------------------------------------------------------------
+
+    fn in_list(inner: BoundExpr, items: Vec<BoundExpr>) -> BoundExpr {
+        BoundExpr::InList {
+            inner: Box::new(inner),
+            items,
+        }
+    }
+
+    fn neg_lit(v: i64) -> BoundExpr {
+        BoundExpr::UnaryOp(UnaryOp::Neg, Box::new(BoundExpr::LitInt(v)))
+    }
+
+    #[test]
+    fn in_list_interp_hit_miss_null() {
+        let schema = two_col(TypeCode::I64);
+        // Hit: 42 ∈ {1, 42}.
+        let b = batch_2col(42i64.to_le_bytes().to_vec(), TypeCode::I64, 0);
+        assert_eq!(
+            eval_expr(
+                &in_list(BoundExpr::ColRef(1), vec![BoundExpr::LitInt(1), BoundExpr::LitInt(42)]),
+                &b,
+                0,
+                &schema
+            )
+            .unwrap(),
+            Some(1)
+        );
+        // Miss: 42 ∉ {1, 2}.
+        assert_eq!(
+            eval_expr(
+                &in_list(BoundExpr::ColRef(1), vec![BoundExpr::LitInt(1), BoundExpr::LitInt(2)]),
+                &b,
+                0,
+                &schema
+            )
+            .unwrap(),
+            Some(0)
+        );
+        // NULL operand ⇒ NULL out.
+        let bn = batch_2col(vec![0u8; 8], TypeCode::I64, 0b1);
+        assert_eq!(
+            eval_expr(
+                &in_list(BoundExpr::ColRef(1), vec![BoundExpr::LitInt(0)]),
+                &bn,
+                0,
+                &schema
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn in_list_interp_u64_neg_one_matches_max() {
+        // `u64col IN (-1)`: the column decodes to i64 -1, the folded literal -1 is
+        // i64 -1 — u64::MAX matches, exactly as the compiled VM.
+        let schema = float_col_schema(TypeCode::U64);
+        let mut batch = ZSetBatch::new(&schema);
+        batch.pks.push_u128(1);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[1] {
+            buf.extend_from_slice(&u64::MAX.to_le_bytes());
+        }
+        assert_eq!(
+            eval_expr(&in_list(BoundExpr::ColRef(1), vec![neg_lit(1)]), &batch, 0, &schema).unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn in_list_interp_signed_negative_set() {
+        let schema = two_col(TypeCode::I64);
+        let items = vec![neg_lit(5), neg_lit(1), BoundExpr::LitInt(0), BoundExpr::LitInt(3)];
+        // -1 ∈ {-5, -1, 0, 3}.
+        let b = batch_2col((-1i64).to_le_bytes().to_vec(), TypeCode::I64, 0);
+        assert_eq!(
+            eval_expr(&in_list(BoundExpr::ColRef(1), items.clone()), &b, 0, &schema).unwrap(),
+            Some(1)
+        );
+        // 2 ∉ set.
+        let b = batch_2col(2i64.to_le_bytes().to_vec(), TypeCode::I64, 0);
+        assert_eq!(
+            eval_expr(&in_list(BoundExpr::ColRef(1), items), &b, 0, &schema).unwrap(),
+            Some(0)
+        );
     }
 }
