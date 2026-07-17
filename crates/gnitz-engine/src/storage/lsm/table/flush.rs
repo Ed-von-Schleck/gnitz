@@ -63,9 +63,26 @@ impl Table {
     /// (which exhausted the default `ulimit -n` after a handful of tables).
     /// The caller owns the returned `OwnedFd`, which closes it on drop — so an
     /// error `?` anywhere downstream releases it with no manual close.
+    ///
+    /// An absent directory is created here: a `Rederive` table opens dirless
+    /// (`Table::new` defers the create because in steady state such a table
+    /// never writes a file), and this is the single choke point every file
+    /// write goes through. NOCOW (btrfs; silently ignored elsewhere) is applied
+    /// to every opened fd — a cheap idempotent ioctl, and the one place that
+    /// covers dirs created lazily here as well as dirs pre-created by the
+    /// catalog's layout staging (index dirs), so files written into either
+    /// inherit the flag.
     pub(super) fn open_dirfd(&self) -> Result<OwnedFd, StorageError> {
         let dir_c = super::super::cstr(self.directory.as_str())?;
-        open_owned(&dir_c, libc::O_RDONLY | libc::O_DIRECTORY).ok_or(StorageError::Io)
+        let fd = match open_owned(&dir_c, libc::O_RDONLY | libc::O_DIRECTORY) {
+            Some(fd) => fd,
+            None => {
+                let dir_c = super::ensure_dir(&self.directory)?;
+                open_owned(&dir_c, libc::O_RDONLY | libc::O_DIRECTORY).ok_or(StorageError::Io)?
+            }
+        };
+        crate::foundation::posix_io::try_set_nocow(fd.as_raw_fd());
+        Ok(fd)
     }
 
     // ------------------------------------------------------------------

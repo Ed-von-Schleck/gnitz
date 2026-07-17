@@ -69,7 +69,7 @@ pub(crate) fn is_index_dir_name(name: &str) -> bool {
 /// itself for master/standalone, `{idx_dir}/w{rank}` for a forked worker
 /// (single-writer isolation for spills and compaction, so sibling workers never
 /// collide on same-name `.tmp`/compaction files under the shared tree).
-/// `Table::new` creates the path recursively, so this is a pure path function.
+/// A pure path function; `new_index_table` creates the path recursively.
 pub(crate) fn index_table_dir(idx_dir: &str) -> String {
     if crate::foundation::worker_ctx::is_worker() {
         format!("{idx_dir}/w{}", crate::foundation::worker_ctx::worker_rank())
@@ -84,8 +84,15 @@ pub(crate) fn index_table_dir(idx_dir: &str) -> String {
 /// `RecoverySource::Rederive` (load-bearing — a durable source would
 /// double-count its loaded shards on the next open) must never diverge.
 pub(crate) fn new_index_table(idx_dir: &str, index_id: i64, idx_schema: SchemaDescriptor) -> Result<Table, String> {
+    let table_dir = index_table_dir(idx_dir);
+    // An index dir is a catalog-owned LAYOUT node — staged into
+    // `pending_dir_deletions`, enumerated by `gc_orphan_directories`, reaped by
+    // name on DROP — so it is materialized at DDL time. (A `Rederive`
+    // `Table::new` itself opens dirless and would create the path only on its
+    // first spill.)
+    std::fs::create_dir_all(&table_dir).map_err(|e| format!("Failed to create index dir {table_dir}: {e}"))?;
     Table::new(
-        &index_table_dir(idx_dir),
+        &table_dir,
         idx_schema,
         index_id as u32,
         SYS_TABLE_ARENA,

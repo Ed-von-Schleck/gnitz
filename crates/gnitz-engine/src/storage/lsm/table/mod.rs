@@ -261,14 +261,18 @@ impl Table {
         arena_size: u64,
         recovery_source: RecoverySource,
     ) -> Result<Self, StorageError> {
-        let dir_c = ensure_dir(dir)?;
-
-        // Try to set NOCOW (btrfs; silently ignored on other fs)
-        set_nocow_dir(&dir_c);
-
         // Decide the open action per recovery source:
         //   SalReplay            → always load the manifest.
         //   Rederive             → always erase stale shards and start empty.
+        //     DIRLESS: the directory is not created here. A Rederive table
+        //     starts empty, its steady-state flushes land in the RAM tier, and
+        //     it never publishes a manifest — so in the common case its dir
+        //     would hold nothing, ever. `open_dirfd` (the single choke point
+        //     every file write goes through) creates it lazily on the first
+        //     spill, making a Rederive open free of filesystem work (this is
+        //     what keeps a transient ad-hoc query's per-partition scratch
+        //     tables syscall-free). A dir left by a previous boot still gets
+        //     its stale shards erased (a missing dir erases nothing).
         //   RederiveCheckpointed → load only when the manifest's checkpoint
         //     generation equals the caller's committed generation; otherwise
         //     erase the shards *and* unlink the manifest so a later re-open
@@ -279,12 +283,17 @@ impl Table {
         // `Some(0)` == committed `0`). Table unit tests that want a
         // guaranteed-empty open use `Rederive`, not `RederiveCheckpointed`.
         let load_shards = match recovery_source {
-            RecoverySource::SalReplay => true,
+            RecoverySource::SalReplay => {
+                // Try to set NOCOW (btrfs; silently ignored on other fs).
+                set_nocow_dir(&ensure_dir(dir)?);
+                true
+            }
             RecoverySource::Rederive => {
                 erase_stale_shards(dir, table_id);
                 false
             }
             RecoverySource::RederiveCheckpointed { committed } => {
+                set_nocow_dir(&ensure_dir(dir)?);
                 let manifest_path = format!("{dir}/manifest.bin");
                 let cpath = super::super::cstr(manifest_path.clone())?;
                 if super::manifest::peek_generation(&cpath)? == Some(committed) {
@@ -1323,12 +1332,17 @@ mod tests {
             .unwrap();
         assert!(matches!(t.flush_prepare().unwrap(), FlushOutcome::Done));
 
-        let shard_files: Vec<String> = std::fs::read_dir(&tdir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with("shard_"))
-            .collect();
+        // A Rederive table opens dirless (created lazily on first spill), so a
+        // sub-ceiling flush leaves not even the directory behind — the
+        // strongest form of "no file".
+        let shard_files: Vec<String> = match std::fs::read_dir(&tdir) {
+            Err(_) => Vec::new(),
+            Ok(rd) => rd
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("shard_"))
+                .collect(),
+        };
         assert!(shard_files.is_empty(), "non-durable flush wrote files: {shard_files:?}");
         assert!(t.all_shard_arcs().is_empty());
         assert!(t.in_memory_runs().count() > 0);
