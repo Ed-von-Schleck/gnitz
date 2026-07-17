@@ -80,8 +80,7 @@ impl DagEngine {
             return 0;
         }
 
-        let schema = entry.schema;
-        Self::ingest_store_and_indices(table_id, entry, &schema, batch);
+        Self::ingest_store_and_indices(table_id, entry, batch);
 
         0
     }
@@ -125,7 +124,7 @@ impl DagEngine {
 
         let entry = self.tables.get_mut(&table_id).unwrap();
 
-        Self::ingest_store_and_indices(table_id, entry, &schema, &effective_batch);
+        Self::ingest_store_and_indices(table_id, entry, &effective_batch);
 
         Some(effective_batch)
     }
@@ -141,11 +140,11 @@ impl DagEngine {
     /// batch (its WAL zone stays above the flushed-shard watermark, so it *will*
     /// be replayed). Silent swallowing is the one unsound response — it neither
     /// applies nor replays the entry, and the next checkpoint orphans it.
-    fn ingest_store_and_indices(table_id: i64, entry: &mut TableEntry, schema: &SchemaDescriptor, source: &Batch) {
+    fn ingest_store_and_indices(table_id: i64, entry: &mut TableEntry, source: &Batch) {
         let index_batches: Vec<Batch> = entry
             .index_circuits
             .iter()
-            .map(|ic| Self::batch_project_index(source, &ic.key_spec, schema, &ic.index_schema))
+            .map(|ic| Self::batch_project_index(source, &ic.key_spec, &ic.index_schema))
             .collect();
 
         if let Err(e) = inject_ingest_apply_error("store", entry.handle.ingest_borrowed_batch(source)) {
@@ -396,10 +395,8 @@ impl DagEngine {
     pub(crate) fn batch_project_index(
         src: &Batch,
         spec: &crate::schema::IndexKeySpec,
-        src_schema: &SchemaDescriptor,
         idx_schema: &SchemaDescriptor,
     ) -> Batch {
-        let src_pk_stride = src_schema.pk_stride() as usize;
         let idx_stride = idx_schema.pk_stride() as usize;
 
         let mut out = Batch::with_schema(*idx_schema, src.count.max(1));
@@ -413,29 +410,21 @@ impl DagEngine {
 
         let mb = src.as_mem_batch();
 
-        // `spec` is the per-column read/encode plan — the registered circuit's
-        // precomputed `key_spec` on the per-push path — so the row loop does no
-        // per-column method call or schema indexing.
-        let idx_key_size = spec.key_size();
-
         for row in 0..src.count {
             let weight = src.get_weight(row);
             if weight == 0 {
                 continue;
             }
-            // Leading index-key slots: each indexed value re-encoded OPK into
-            // its promoted slot. The index table's PK region is
-            // order-preserving like any other; seeks (has_pk / seek_by_index)
-            // encode the same way. NULL in ANY indexed column ⇒ row not
-            // indexed; retractions (weight < 0) DO project, so the index
-            // entry retracts with its source row.
-            if !spec.write_span(&mb, row, &mut idx_pk_buf) {
+            // The row's entry key `[span ‖ src_pk]`: each indexed value
+            // re-encoded OPK into its promoted slot, then the source PK region
+            // verbatim (laid out in pk_indices order, already OPK). The index
+            // table's PK region is order-preserving like any other; seeks
+            // (has_pk / seek_by_index) encode the same way. NULL in ANY indexed
+            // column ⇒ row not indexed; retractions (weight < 0) DO project, so
+            // the index entry retracts with its source row.
+            if !spec.write_entry(&mb, row, &mut idx_pk_buf) {
                 continue;
             }
-            // The source PK region is laid out in pk_indices order, so the
-            // index's trailing PK suffix is byte-identical to the source's PK
-            // (already OPK).
-            idx_pk_buf[idx_key_size..idx_key_size + src_pk_stride].copy_from_slice(src.get_pk_bytes(row));
             out.extend_pk_bytes(&idx_pk_buf[..idx_stride]);
             out.extend_weight(&weight.to_le_bytes());
             // Index schema has zero payload columns, but the null_bmp region

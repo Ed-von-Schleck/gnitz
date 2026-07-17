@@ -2620,3 +2620,50 @@ class TestIndexBoundPushdown:
         finally:
             _drop_all(client, sn, views=["mv"],
                       indices=[f"{sn}__t__idx_ind"], tables=["t"])
+
+
+class TestNonUniquePkIndexGather:
+    """A non-`unique_pk` table lets one PK carry several live payloads that
+    differ in an indexed column, so an index entry denotes (indexed span, PK),
+    not the PK alone. Every index-served path (point seek, range) must return
+    the same rows and weights as the index-free scan — the by-PK gather lost
+    range rows and mis-resolved / double-counted point seeks."""
+
+    def _seed(self, client, sn):
+        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+        schema = gnitz.Schema(cols)
+        tid = client.create_table(sn, "t", cols, unique_pk=False)
+        # Six PKs (spread across the W=4 partitions), each carrying two payloads
+        # with distinct vals — the multi-payload-per-PK shape the by-PK gather
+        # mishandles. The master merges the per-worker partial sets by raw append.
+        b = gnitz.ZSetBatch(schema)
+        for pk, val in [(1, 5), (1, 7), (2, 6), (2, 8), (3, 5), (3, 9),
+                        (4, 7), (4, 6), (5, 8), (5, 5), (6, 9), (6, 7)]:
+            b.append(pk=pk, val=val)
+        client.push(tid, b)
+        return tid
+
+    def test_seek_and_range_match_index_free_scan(self, client):
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._seed(client, sn)
+            queries = [
+                "SELECT * FROM t WHERE val = 5",         # point, matches 2 PKs
+                "SELECT * FROM t WHERE val = 7",         # point, one payload of a 2-payload PK
+                "SELECT * FROM t WHERE val BETWEEN 5 AND 7",  # range spanning duplicate groups
+                "SELECT * FROM t WHERE val >= 8",        # open-ended range
+            ]
+            # Reference: the index-free full scan + filter (served by the executor).
+            want = {q: _result_rows(client.execute_sql(q, schema_name=sn)) for q in queries}
+            # Each query must return a non-trivial multiset — otherwise the
+            # comparison below could pass vacuously.
+            assert all(len(v) >= 2 for v in want.values())
+
+            client.execute_sql("CREATE INDEX ON t(val)", schema_name=sn)
+            for q in queries:
+                got = _result_rows(client.execute_sql(q, schema_name=sn))
+                assert got == want[q], f"index path diverged from the scan for: {q}"
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])

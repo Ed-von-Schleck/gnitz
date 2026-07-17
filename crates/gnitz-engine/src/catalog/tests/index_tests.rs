@@ -2533,12 +2533,7 @@ fn test_seek_prefix_matches_projection() {
     bb.end_row();
     let projected = {
         let b = bb.finish();
-        crate::query::DagEngine::batch_project_index(
-            &b,
-            &crate::schema::IndexKeySpec::new(&[1, 2], &src, &idx),
-            &src,
-            &idx,
-        )
+        crate::query::DagEngine::batch_project_index(&b, &crate::schema::IndexKeySpec::new(&[1, 2], &src, &idx), &idx)
     };
     assert_eq!(projected.count, 1);
 
@@ -2582,7 +2577,7 @@ fn project_leading_span(src: SchemaDescriptor, idx: &SchemaDescriptor, native: u
     bb.end_row();
     let projected = {
         let b = bb.finish();
-        crate::query::DagEngine::batch_project_index(&b, &crate::schema::IndexKeySpec::new(&[1], &src, idx), &src, idx)
+        crate::query::DagEngine::batch_project_index(&b, &crate::schema::IndexKeySpec::new(&[1], &src, idx), idx)
     };
     let key_size = idx.columns[0].size() as usize;
     projected.get_pk_bytes(0)[..key_size].to_vec()
@@ -2686,7 +2681,6 @@ fn composite_index_signed_leading_unsigned_tiebreak_orders() {
             crate::query::DagEngine::batch_project_index(
                 &b,
                 &crate::schema::IndexKeySpec::new(&[1, 2], &src, &idx),
-                &src,
                 &idx,
             )
         };
@@ -3414,7 +3408,6 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     let idx_batch = DagEngine::batch_project_index(
         &bb,
         &crate::schema::IndexKeySpec::new(&[3], &schema, &idx_schema),
-        &schema,
         &idx_schema,
     );
 
@@ -3477,13 +3470,11 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
 }
 
 #[test]
-fn test_seek_by_index_full_arity_nonunique_sort_skipped() {
+fn test_seek_by_index_full_arity_nonunique_group_ascending() {
     // A full-arity equality seek (`natives.len() == col_indices.len()`) on a
-    // NON-unique index pins the one duplicate group, so the index already emits
-    // its members source-PK-ascending and the path skips the sort. The rows are
-    // *inserted* out of PK order (9,3,6); the result must come back in ascending
-    // PK order (3,6,9) — confirming the collected entries were already sorted, so
-    // skipping the sort is correct.
+    // NON-unique index pins the one duplicate group and returns EVERY member.
+    // The rows are *inserted* out of PK order (9,3,6); the result comes back in
+    // ascending PK order (3,6,9) — the gather's storage-order sweep.
     let dir = temp_dir("catalog_full_arity_skip");
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::U64)];
@@ -3506,16 +3497,316 @@ fn test_seek_by_index_full_arity_nonunique_sort_skipped() {
         .unwrap()
         .0
         .expect("full-arity equality seek must find the x=50 group");
-    // Read PKs in *result-batch order* (no re-sort): the resolve appends in the
-    // collected order, which for the skipped-sort path is the index emission
-    // order — already source-PK-ascending.
+    // Read PKs in *result-batch order* (no re-sort): the gather emits in
+    // ascending source-PK storage order regardless of insertion order.
     let pks_in_order: Vec<u128> = (0..r.count).map(|i| r.get_pk(i)).collect();
     assert_eq!(
         pks_in_order,
         vec![3, 6, 9],
-        "full-arity equality entries arrive source-PK-ascending; the sort is correctly skipped"
+        "every duplicate-group member returned, in ascending source-PK order"
     );
     assert!((0..r.count).all(|i| r.get_weight(i) == 1));
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── Multi-payload-per-PK on a non-`unique_pk` base table ──────────────────
+//
+// On a non-`unique_pk` table two live rows can share a PK and differ in an
+// indexed column, so an index entry denotes (indexed span, source PK) — never
+// the PK alone. The gather resolves by the entry key `[span ‖ src_pk]`: the
+// old by-PK resolve landed on the group's *first* payload (point seek) or
+// dropped the non-first payloads (range). Each test below builds a table where
+// one PK carries several live payloads.
+
+#[test]
+fn test_seek_by_index_point_multi_payload_resolves_by_span() {
+    // (pk=1,val=5) and (pk=1,val=7) both live. seek val=7 must resolve to (1,7),
+    // not the first payload (1,5) at PK 1 — the defect a by-PK gather hit.
+    let dir = temp_dir("catalog_multipayload_point");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["val"], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    let mut bb = BatchBuilder::new(schema);
+    for (pk, val) in [(1u128, 5u64), (1, 7)] {
+        bb.begin_row(pk, 1);
+        bb.put_u64(val);
+        bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    let r = engine.seek_by_index(tid, &[1], &[7u128]).unwrap().0;
+    assert_eq!(
+        result_triples(r),
+        vec![(1, 7, 1)],
+        "val=7 resolves by span to (1,7), not the first payload at PK 1"
+    );
+    // val=5 still resolves to (1,5) — sort-order luck did not save the wrong one.
+    let r5 = engine.seek_by_index(tid, &[1], &[5u128]).unwrap().0;
+    assert_eq!(result_triples(r5), vec![(1, 5, 1)]);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_seek_by_index_range_multi_payload_keeps_all() {
+    // val BETWEEN 5 AND 7 must return BOTH same-PK rows at weight 1 — the by-PK
+    // gather dropped (1,7), turning SUM(val) into 5 instead of 12. Asserted on
+    // weights, and against a full scan filtered by the same predicate.
+    let dir = temp_dir("catalog_multipayload_range");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["val"], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    let mut bb = BatchBuilder::new(schema);
+    for (pk, val) in [(1u128, 5u64), (1, 7)] {
+        bb.begin_row(pk, 1);
+        bb.put_u64(val);
+        bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    let r = engine
+        .seek_by_index_range(tid, &[1], &RangeDescriptor::new(&[], Before(5), After(7)))
+        .unwrap()
+        .0;
+    let got = result_triples(r);
+    assert_eq!(
+        got,
+        vec![(1, 5, 1), (1, 7, 1)],
+        "both payloads at PK 1 kept with weights intact"
+    );
+
+    // Identical to a full scan filtered by the same predicate (index-free path).
+    let (scan, _) = engine.scan_family(tid).unwrap();
+    let mut want: Vec<(u128, u64, i64)> = (0..scan.count)
+        .filter(|&i| scan.get_weight(i) > 0)
+        .map(|i| (scan.get_pk(i), scan.read_payload_u64(i, 0), scan.get_weight(i)))
+        .filter(|&(_, v, _)| (5..=7).contains(&v))
+        .collect();
+    want.sort();
+    assert_eq!(got, want, "index range must match full-scan + filter");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_seek_by_index_range_multi_payload_middle_only() {
+    // Three payloads at one PK, only the middle in range: (1,5),(1,7),(1,9),
+    // val ∈ (5, 9) → only (1,7). Exercises the `first_fail` split (the first
+    // candidate fails) followed by a trailing failure (the last candidate fails).
+    let dir = temp_dir("catalog_multipayload_middle");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["val"], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    let mut bb = BatchBuilder::new(schema);
+    for (pk, val) in [(1u128, 5u64), (1, 7), (1, 9)] {
+        bb.begin_row(pk, 1);
+        bb.put_u64(val);
+        bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    let r = engine
+        .seek_by_index_range(tid, &[1], &RangeDescriptor::new(&[], After(5), Before(9)))
+        .unwrap()
+        .0;
+    assert_eq!(result_triples(r), vec![(1, 7, 1)], "only the in-range middle payload");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_seek_by_index_range_failing_group_does_not_truncate() {
+    // A leading candidate that fails the filter must not stop the walk: PK 1
+    // carries an out-of-range payload (val=5) sorted before its in-range one
+    // (val=6), and PK 2's in-range row (val=7) still has to be emitted. Guards
+    // the `first_fail` range-extend across PK groups.
+    let dir = temp_dir("catalog_multipayload_notruncate");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["val"], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    let mut bb = BatchBuilder::new(schema);
+    for (pk, val) in [(1u128, 5u64), (1, 6), (2, 7)] {
+        bb.begin_row(pk, 1);
+        bb.put_u64(val);
+        bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    // val ∈ [6, 8)
+    let r = engine
+        .seek_by_index_range(tid, &[1], &RangeDescriptor::new(&[], Before(6), Before(8)))
+        .unwrap()
+        .0;
+    assert_eq!(
+        result_triples(r),
+        vec![(1, 6, 1), (2, 7, 1)],
+        "PK 1's out-of-range payload dropped, PK 2's in-range row still emitted"
+    );
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Collect `(pk, a, b, weight)` (payload slots 0, 1) for every positive-weight
+/// row, sorted — the composite-index reference form.
+fn result_ab_quads(r: Option<Batch>) -> Vec<(u128, u64, u64, i64)> {
+    let mut out: Vec<(u128, u64, u64, i64)> = match r {
+        Some(b) => (0..b.count)
+            .filter(|&i| b.get_weight(i) > 0)
+            .map(|i| {
+                (
+                    b.get_pk(i),
+                    b.read_payload_u64(i, 0),
+                    b.read_payload_u64(i, 1),
+                    b.get_weight(i),
+                )
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    out.sort();
+    out
+}
+
+#[test]
+fn test_seek_by_index_composite_prefix_no_double_count() {
+    // Index (a, b); rows (pk=1,a=5,b=1) and (pk=1,a=5,b=2). A leading-prefix seek
+    // on a=5 (`natives.len()=1 < 2`) must return both rows once each. The by-PK
+    // gather with no dedup probed PK 1 twice and emitted (1,5,1) twice, dropping
+    // (1,5,2).
+    let dir = temp_dir("catalog_composite_prefix_dup");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![
+        col_def("id", type_code::U64),
+        col_def("a", type_code::U64),
+        col_def("b", type_code::U64),
+    ];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["a", "b"], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    let mut bb = BatchBuilder::new(schema);
+    for (pk, a, b) in [(1u128, 5u64, 1u64), (1, 5, 2)] {
+        bb.begin_row(pk, 1);
+        bb.put_u64(a);
+        bb.put_u64(b);
+        bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    let r = engine.seek_by_index(tid, &[1, 2], &[5u128]).unwrap().0;
+    assert_eq!(
+        result_ab_quads(r),
+        vec![(1, 5, 1, 1), (1, 5, 2, 1)],
+        "prefix seek on a=5 returns both (a=5) rows once each — no double-count, none dropped"
+    );
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_seek_by_index_composite_prefix_null_gate() {
+    // Index (a, b) with b nullable; rows (pk=1,a=5,b=NULL) and (pk=1,a=5,b=9).
+    // The NULL-b row is absent from the index (`batch_project_index` skips a row
+    // with a NULL in any indexed column), so the prefix seek on a=5 must return
+    // only (1,5,9). The full-arity gather spec re-applies the all-column NULL
+    // gate; a seek-side (prefix-arity) spec would resurrect the NULL row.
+    let dir = temp_dir("catalog_composite_prefix_null");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![
+        col_def("id", type_code::U64),
+        col_def("a", type_code::U64),
+        ColumnDef {
+            name: "b".into(),
+            type_code: type_code::U64,
+            is_nullable: true,
+            fk_table_id: 0,
+            fk_col_idx: 0,
+            is_hidden: false,
+        },
+    ];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["a", "b"], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    let mut bb = BatchBuilder::new(schema);
+    // (1, 5, NULL)
+    bb.begin_row(1u128, 1);
+    bb.put_u64(5);
+    bb.put_null();
+    bb.end_row();
+    // (1, 5, 9)
+    bb.begin_row(1u128, 1);
+    bb.put_u64(5);
+    bb.put_u64(9);
+    bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    let r = engine.seek_by_index(tid, &[1, 2], &[5u128]).unwrap().0;
+    assert_eq!(
+        result_ab_quads(r),
+        vec![(1, 5, 9, 1)],
+        "the NULL-b row is not in the index and must not be resurrected by the gather"
+    );
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_seek_by_index_unique_pk_multi_value_regression() {
+    // The span filter must be behaviour-identical on a `unique_pk` table (one
+    // live row per PK ⇒ resolving by PK equals resolving by span). Point seek
+    // and range both return exactly the expected rows at weight 1.
+    let dir = temp_dir("catalog_unique_pk_regression");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
+    engine.create_index("public.t", &["val"], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    let mut bb = BatchBuilder::new(schema);
+    for (pk, val) in [(1u128, 10u64), (2, 20), (3, 30)] {
+        bb.begin_row(pk, 1);
+        bb.put_u64(val);
+        bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    let r = engine.seek_by_index(tid, &[1], &[20u128]).unwrap().0;
+    assert_eq!(result_triples(r), vec![(2, 20, 1)]);
+
+    // val ∈ [10, 20]
+    let rr = engine
+        .seek_by_index_range(tid, &[1], &RangeDescriptor::new(&[], Before(10), After(20)))
+        .unwrap()
+        .0;
+    assert_eq!(result_triples(rr), vec![(1, 10, 1), (2, 20, 1)]);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

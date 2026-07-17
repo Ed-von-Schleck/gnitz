@@ -571,10 +571,9 @@ impl CatalogEngine {
         targets: &[IndexProjectionTarget],
         check_dups: bool,
     ) -> Result<(), String> {
-        let owner_schema = match self.dag.tables.get(&owner_id) {
-            Some(e) => e.schema,
-            None => return Ok(()),
-        };
+        if !self.dag.tables.contains_key(&owner_id) {
+            return Ok(());
+        }
         let chunk_rows = self.ddl_scan_chunk_rows;
         let mut seen: Vec<rustc_hash::FxHashSet<PkBuf>> = if check_dups {
             targets.iter().map(|_| rustc_hash::FxHashSet::default()).collect()
@@ -587,7 +586,7 @@ impl CatalogEngine {
         };
         while let Some(chunk) = handle.drain_chunk(chunk_rows) {
             for (ti, t) in targets.iter().enumerate() {
-                let projected = DagEngine::batch_project_index(&chunk, &t.spec, &owner_schema, &t.idx_schema);
+                let projected = DagEngine::batch_project_index(&chunk, &t.spec, &t.idx_schema);
                 if projected.count == 0 {
                     continue;
                 }

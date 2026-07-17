@@ -38,10 +38,15 @@ fn write_bounded_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid
     }
 }
 
-/// A `(id U64 PK | val I64)` base of `NBASE` rows with `val = id * 10`, indexed on
-/// `val`, plus a registered identity view carrying `bound`. Returns
+/// A `(id U64 PK | val I64)` base of `NBASE` rows with `val = val_of(id)`,
+/// indexed on `val`, plus a registered identity view carrying `bound`. Returns
 /// `(engine, base tid, view id)`.
-fn fixture(name: &str, bound: Option<ScanBound>, unique_pk: bool) -> (CatalogEngine, i64, i64) {
+fn fixture_with(
+    name: &str,
+    bound: Option<ScanBound>,
+    unique_pk: bool,
+    val_of: impl Fn(u64) -> u64,
+) -> (CatalogEngine, i64, i64) {
     let dir = temp_dir(name);
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
@@ -51,7 +56,7 @@ fn fixture(name: &str, bound: Option<ScanBound>, unique_pk: bool) -> (CatalogEng
     let mut bb = BatchBuilder::new(schema);
     for i in 0..NBASE {
         bb.begin_row(i as u128, 1);
-        bb.put_u64(i * 10);
+        bb.put_u64(val_of(i));
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
@@ -64,6 +69,22 @@ fn fixture(name: &str, bound: Option<ScanBound>, unique_pk: bool) -> (CatalogEng
     let batch = build_view_tab_row(vid, "v_base", "SELECT * FROM base");
     engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
     (engine, tid, vid)
+}
+
+/// [`fixture_with`] at `val = id * 10` — correlated, the default shape.
+fn fixture(name: &str, bound: Option<ScanBound>, unique_pk: bool) -> (CatalogEngine, i64, i64) {
+    fixture_with(name, bound, unique_pk, |i| i * 10)
+}
+
+/// [`fixture_with`] at `val = (NBASE - id) * 10` — anti-correlated with the
+/// PK, so the index's val-ascending walk visits ids in *descending* order. The
+/// low-val end of a range is thus the *highest* ids: a chunk anchored at val's
+/// minimum walks the base's last PK group (id `NBASE-1`), exhausting the base
+/// cursor, and the next chunk's first probe is a lower id — a backward re-seek
+/// from an invalid cursor, which `val = id * 10` (strictly monotone in the PK)
+/// can never produce.
+fn anticorrelated_fixture(name: &str, bound: Option<ScanBound>) -> (CatalogEngine, i64, i64) {
+    fixture_with(name, bound, true, |i| (NBASE - i) * 10)
 }
 
 /// A bound on index column 1 (`val`) over the half-open cut interval.
@@ -124,6 +145,40 @@ fn bounded_cursor_yields_in_range_rows_across_chunks() {
         .filter(|&(pk, _)| (50..60).contains(&pk))
         .collect();
     assert_eq!(got, full, "bounded and full must agree on rows and weights");
+    engine.close();
+}
+
+/// The cross-chunk BACKWARD probe on an EXHAUSTED base cursor. With `val`
+/// anti-correlated to the PK, a range anchored at val's minimum makes chunk 0
+/// walk the base's last PK group (id `NBASE-1`) — exhausting the base cursor —
+/// while chunk 1's first PK sorts *below* it. This catches both a `== Less`-only
+/// seek guard (which would skip the backward re-seek and drop the group) and a
+/// `!valid`-terminates-the-loop guard (which would drop every later chunk), on
+/// the `unique_pk` table the backfill actually ships.
+#[test]
+fn bounded_cursor_backward_probe_across_exhausted_chunk() {
+    // val ∈ [10, 110): the 10 lowest vals ⇒ ids 190..200 (the highest ids).
+    // 10/200 is inside the 1/16 gate, so the index is taken.
+    let (mut engine, tid, vid) =
+        anticorrelated_fixture("srccur_anticorr", Some(val_bound(Cut::Before(10), Cut::Before(110))));
+    let mut cur = engine.open_source_cursor(vid, tid).unwrap();
+    assert!(
+        matches!(cur, SourceCursor::Bounded(_)),
+        "a 10/200 range must take the index"
+    );
+
+    // Chunk of 3: chunk 0 collects vals {10,20,30} ⇒ ids {197,198,199}, ending on
+    // the base's last PK group and exhausting the cursor; each later chunk's first
+    // probe is a lower id, seeking backward from that invalid cursor.
+    let got = drain_all(&mut cur, 3);
+    let want: Vec<(u128, i64)> = (190..200u128).map(|i| (i, 1)).collect();
+    assert_eq!(got, want, "every in-range row emitted across backward chunk boundaries");
+
+    let full: Vec<(u128, i64)> = full_drain(&mut engine, tid)
+        .into_iter()
+        .filter(|&(pk, _)| (190..200).contains(&pk))
+        .collect();
+    assert_eq!(got, full, "backward cross-chunk probes must match the full scan");
     engine.close();
 }
 
@@ -326,16 +381,20 @@ fn dropped_index_falls_back_to_full_scan() {
     engine.close();
 }
 
-/// A non-`unique_pk` source full-scans: the gather resolves by source PK alone and
-/// would lose rows / double weights where one PK carries several live payloads.
+/// A non-`unique_pk` source takes the bounded path like any other source, and a
+/// PK group whose live index entries STRADDLE a chunk boundary is emitted exactly
+/// once per row: each chunk's gather is windowed to the entries that chunk
+/// collected, so the group is re-walked by both chunks but each row passes the
+/// window filter in only one. Chunk size 1 forces every group to straddle.
 #[test]
-fn non_unique_pk_source_falls_back_to_full_scan() {
+fn non_unique_pk_straddling_group_matches_full_scan() {
     let (mut engine, tid, vid) = fixture(
         "srccur_nonuniq",
         Some(val_bound(Cut::Before(500), Cut::Before(600))),
         false,
     );
-    // Two live payloads under one PK — exactly what the PK-only gather mishandles.
+    // A second live payload under PK 55, also in range: the group's entries
+    // (550, 55) and (555, 55) land in different chunks at chunk size 1.
     let schema = engine.get_schema(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(55u128, 1);
@@ -345,13 +404,17 @@ fn non_unique_pk_source_falls_back_to_full_scan() {
 
     let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(
-        matches!(cur, SourceCursor::Full(_)),
-        "a non-unique_pk source must full-scan"
+        matches!(cur, SourceCursor::Bounded(_)),
+        "an 11/201 range on a non-unique_pk source must take the index"
     );
+    let want: Vec<(u128, i64)> = full_drain(&mut engine, tid)
+        .into_iter()
+        .filter(|&(pk, _)| (50..60).contains(&pk))
+        .collect();
     assert_eq!(
-        drain_all(&mut cur, 64),
-        full_drain(&mut engine, tid),
-        "weights must match the full scan under a duplicated PK"
+        drain_all(&mut cur, 1),
+        want,
+        "each straddling-group row must be emitted exactly once, at full-scan weights"
     );
     engine.close();
 }

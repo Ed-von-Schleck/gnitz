@@ -83,7 +83,6 @@ fn setup_wide_unique(
     let idx_batch = DagEngine::batch_project_index(
         &bb,
         &crate::schema::IndexKeySpec::new(&[3], &schema, &idx_schema),
-        &schema,
         &idx_schema,
     );
     base.ingest_owned_batch(bb).unwrap();

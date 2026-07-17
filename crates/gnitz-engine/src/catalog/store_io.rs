@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::schema::project_schema;
-use crate::storage::{gather_source_rows, BoundedIndexCursor};
+use crate::storage::BoundedIndexCursor;
 
 impl CatalogEngine {
     /// The registry entry for `table_id`, or the shared "Unknown table_id"
@@ -90,6 +90,10 @@ impl CatalogEngine {
     /// single-key `None` — so a removed PK with no committed row contributes
     /// nothing. `project` lists the parent column indices to return (all
     /// non-PK scalar columns); an empty `project` returns PK-only rows.
+    /// Each PK resolves to its group's FIRST live row: FK dereference is by-PK
+    /// by definition, and FK validation admits a lone-PK parent without
+    /// requiring `unique_pk`, so on such an engine-API parent a multi-payload
+    /// PK dereferences to the (PK, payload)-least member.
     ///
     /// Reuses one cursor across all keys (cheaper than N `seek_family` calls,
     /// each of which re-opens a cursor). Projection keeps the result scalar-
@@ -148,113 +152,43 @@ impl CatalogEngine {
         Ok((entry, ic))
     }
 
-    /// Index-assisted lookup: prefix-scan the index by `natives` — the native
-    /// key values of the leading `natives.len()` indexed columns
-    /// (`natives.len()` may be `< col_indices.len()` for a leading-prefix
-    /// scan) — reconstruct the source PK from the index PK suffix, and resolve
-    /// to the source rows.
+    /// Index-assisted lookup: the source rows whose leading `natives.len()`
+    /// indexed columns equal `natives` (`natives.len()` may be
+    /// `< col_indices.len()` for a leading-prefix scan).
+    ///
+    /// An equality seek IS the degenerate range `[Before(v), After(v)]` on the
+    /// last supplied column — by the OPK group-key property those cuts bound
+    /// exactly the whole duplicate group of the full supplied prefix — so this
+    /// delegates to [`Self::seek_by_index_range`]: one walk/gather mechanism
+    /// under the point seek, the range seek, and the bounded backfill.
     ///
     /// Rows with a NULL in ANY indexed column are absent from the index
     /// (`batch_project_index` skips them), so a prefix scan returns only rows
     /// whose trailing indexed columns are all non-NULL — the SQL planner must
     /// not serve a prefix predicate from an index whose uncovered trailing
-    /// columns are nullable.
+    /// columns are nullable. (The gather's full-arity entry filter re-applies
+    /// that gate; see `gather_source_rows`.)
     pub fn seek_by_index(
         &mut self,
         table_id: i64,
         col_indices: &[u32],
         natives: &[u128],
     ) -> Result<(Option<Batch>, SchemaDescriptor), String> {
-        let (entry, ic) = self.table_and_index(table_id, col_indices)?;
-
-        let src_schema = entry.schema;
-        let src_pk_stride = src_schema.pk_stride() as usize;
-        let idx_key_size = ic.index_schema.leading_key_size(col_indices.len());
-
-        // OPK-encode the supplied natives into a leading-key prefix through the
-        // circuit's baked spec, cut to the supplied arity. The spec pairs each
-        // source column (the sign-extension width) with its promoted index
-        // column; the index PK region is OPK-at-rest, so the prefix is
-        // order-preserving and matches stored entries (`batch_project_index`
-        // encodes through the same spec).
-        let spec = ic.key_spec.prefix(natives.len());
-        let (opk, prefix_len) = spec.seek_prefix(natives);
-        let opk_prefix = &opk[..prefix_len];
-
-        // One index cursor for the walk; collect each positive match's source-PK
-        // suffix. The walk yields only positive-weight entries
-        // (`walk_to_positive_with_prefix`), so every yielded entry is live — push
-        // its source PK unconditionally.
-        //
-        // Seek to the first positive-weight match, then walk forward with
-        // `walk_to_positive_with_prefix` after each consumed entry. Re-calling
-        // `seek_first_positive_with_prefix` inside the loop would re-seek and
-        // re-find the same entry forever — an orphaned index entry (positive
-        // weight, no source row) would spin.
-        // A non-unique indexed value matches multiple rows; accumulate ALL of
-        // them on this worker, not just the first. (A unique index yields one
-        // match, so this is equivalent there.) Index entries co-locate with
-        // their source rows (partitioned by source PK), so a value's matches can
-        // be spread across workers: this returns one worker's partial set and
-        // the master (`fan_out_seek_by_index_collect_async`) merges across all.
-        let mut idx_cursor = ic.table_mut().open_cursor();
-        let mut pks: Vec<crate::storage::PkBuf> = Vec::new();
-
-        let mut hit = idx_cursor.seek_first_positive_with_prefix(opk_prefix);
-        while hit {
-            let cur_pk = idx_cursor.current_pk_bytes();
-            pks.push(crate::storage::PkBuf::from_bytes(
-                &cur_pk[idx_key_size..idx_key_size + src_pk_stride],
-            ));
-            idx_cursor.advance();
-            hit = idx_cursor.walk_to_positive_with_prefix(opk_prefix);
-        }
-        // Free the index merge tree and its shard snapshots before the base cursor
-        // opens. An early free, not an invariant: a cursor pins the mmap rather
-        // than the file, so holding both would be correct too.
-        drop(idx_cursor);
-
-        // Full-arity equality (`natives.len() == col_indices.len()`) pins every
-        // indexed column, so the entries vary only in their trailing source-PK
-        // suffix and the walk already yields them ascending — skip the sort. A
-        // leading-prefix seek leaves trailing indexed columns free, interleaving
-        // source PKs across groups, so it must sort to recover storage order.
-        if natives.len() < col_indices.len() {
-            pks.sort_unstable();
-        }
-        // An empty `pks` short-circuits before the base cursor's snapshot clone.
-        let batch = (!pks.is_empty())
-            .then(|| gather_source_rows(&mut entry.handle.open_cursor(), src_schema, &pks))
-            .flatten();
-        Ok((batch, src_schema))
+        let (&last, eq) = natives
+            .split_last()
+            .ok_or_else(|| "seek_by_index: no key values supplied".to_string())?;
+        let range = gnitz_wire::RangeDescriptor::new(eq, gnitz_wire::Cut::Before(last), gnitz_wire::Cut::After(last));
+        self.seek_by_index_range(table_id, col_indices, &range)
     }
 
     /// Ordered range scan over a secondary index: the leading
     /// `range.eq_vals().len()` columns are equality-pinned, and the next index
     /// column is bounded by the descriptor's half-open cut interval
-    /// `[start, end)`. Each `Cut` maps to one byte key in the index PK space —
-    ///
-    /// | cut         | byte key                                                |
-    /// |-------------|---------------------------------------------------------|
-    /// | `Before(v)` | `pad(group(v))` — below every duplicate of `v`          |
-    /// | `After(v)`  | `pad(succ(group(v)))` — above every duplicate of `v`;   |
-    /// |             | `succ` overflow ⇒ no key space above the group (`+∞`)   |
-    ///
-    /// where `group(v)` is the `prefix_len`-byte `[eq OPK ‖ promoted slot OPK]`
-    /// group key, `pad` zero-extends to the index PK stride, and `succ` is the
-    /// fixed-width byte successor. The walk is then uniform — seek to `start`,
-    /// advance while `key < end` — with `start ≥ end` (or a `+∞` start)
-    /// provably empty. SQL bound semantics (inclusivity, unboundedness,
-    /// out-of-range saturation) are resolved to cuts in the planner; none of
-    /// them reach this layer.
-    ///
-    /// Correctness rests on the post-`cff7c58` OPK ordering invariant: the index
-    /// PK region is `[promoted leading-key OPK ‖ source-PK OPK]` and memcmp order
-    /// on those bytes equals typed order (signed and composite included). For any
-    /// `prefix_len`-byte group key `p`, every full key `k` with
-    /// `k[..prefix_len] == p` satisfies `pad(p) ≤ k < pad(succ(p))`, so a cut key
-    /// includes or excludes whole duplicate groups with no per-row inclusivity
-    /// test.
+    /// `[start, end)`. The cut → byte-key mapping and its correctness argument
+    /// live on [`index_range_keys`]; the walk is then uniform — seek to `start`,
+    /// advance while `key < end`. SQL bound semantics (inclusivity,
+    /// unboundedness, out-of-range saturation) are resolved to cuts in the
+    /// planner; none of them reach this layer.
     ///
     /// Returns this worker's matching source rows; the master broadcasts to every
     /// worker and merges (the index is partitioned by source PK, so a range's
@@ -282,9 +216,9 @@ impl CatalogEngine {
         let mut cur = BoundedIndexCursor::new(
             ic.table_mut().open_cursor(),
             entry.handle.open_cursor(),
-            &start,
+            start,
             end,
-            ic.index_schema.leading_key_size(col_indices.len()),
+            ic.key_spec,
             src_schema,
             0,
         );
@@ -383,15 +317,6 @@ impl CatalogEngine {
             // remapped transient with no index circuits.
             return Some(SourceCursor::Full(Box::new(self.open_store_cursor(source)?)));
         };
-        // The gather resolves by source PK alone and emits one (PK, payload) group
-        // per PK — wrong on a non-`unique_pk` base table, where one PK can carry
-        // several live payloads differing in the indexed column. (That is a
-        // pre-existing bug in the thin index path; do not promote it into durably
-        // persisted, incrementally maintained views.) Every SQL-created table is
-        // `unique_pk`, so this costs nothing on the SQL path.
-        if !entry.unique_pk() {
-            return Some(SourceCursor::Full(Box::new(self.open_store_cursor(source)?)));
-        }
         let (start, end) = match index_range_keys(ic, &bound.desc) {
             // Provably empty — decided before any cursor is built.
             Ok(Some(keys)) => keys,
@@ -422,9 +347,9 @@ impl CatalogEngine {
         Some(SourceCursor::Bounded(Box::new(BoundedIndexCursor::new(
             idx,
             *src,
-            &start,
+            start,
             end,
-            ic.index_schema.leading_key_size(bound.idx_cols.as_slice().len()),
+            ic.key_spec,
             entry.schema,
             // The PK scratch's exact per-chunk bound: the measured range size,
             // capped at the drivers' chunk size.
@@ -586,7 +511,3 @@ fn copy_cursor_cols_to_batch(cursor: &ReadCursor, out: &mut Batch, proj: &[(usiz
     out.extend_null_bmp(&proj_null.to_le_bytes());
     out.count += 1;
 }
-
-// `increment_key_in_place` and its unit coverage moved to
-// `storage/range_key.rs` (the shared home for the byte successor and the
-// range-join cut-point derivation).
