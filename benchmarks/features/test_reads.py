@@ -104,6 +104,38 @@ def test_seek_by_index(client, schema_name, bench_timer, scale_mode):
 
 
 # ---------------------------------------------------------------------------
+# groupby_indexed_filter — ad-hoc GROUP BY whose WHERE hits a secondary index
+# ---------------------------------------------------------------------------
+
+# Coprime to NGROUP, so `ind` and `g` are independent by CRT: `WHERE ind = c`
+# selects base/NIND rows spread across all groups.
+NIND = 1001
+
+# One ad-hoc GROUP BY per iteration compiles a transient and backfills it
+# through the source drive. Sized like the streaming iteration counts rather
+# than `_reads`: an unbounded backfill scans the whole base per iteration, so
+# `_reads`' 5000 would scan 5e9 rows at full scale.
+GROUPBY_ITERS = {"quick": 20, "full": 50}
+
+
+def test_groupby_indexed_filter(client, schema_name, bench_timer, scale_mode):
+    sn, sz = schema_name, feature_sz(scale_mode)
+    client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
+                       "v BIGINT NOT NULL, ind BIGINT NOT NULL)", schema_name=sn)
+    tid, schema = client.resolve_table(sn, "t")
+    push_stream(client, tid, schema,
+                lambda b, k: b.append(pk=k + 1, g=k % NGROUP, v=(k * 7) % 1000, ind=k % NIND),
+                sz["base"])
+    client.execute_sql("CREATE INDEX ON t(ind)", schema_name=sn)
+    # 1/1001 selectivity at every scale, an order of magnitude inside the
+    # source drive's index-vs-full-scan gate.
+    for i in range(GROUPBY_ITERS[scale_mode]):
+        bench_timer.measure(client.execute_sql,
+                            f"SELECT g, SUM(v) AS s FROM t WHERE ind = {i % NIND} GROUP BY g",
+                            schema_name=sn, rows_per_call=max(1, sz["base"] // NIND))
+
+
+# ---------------------------------------------------------------------------
 # scan_many_2 / scan_many_8 — consistent multi-view snapshot latency
 # ---------------------------------------------------------------------------
 

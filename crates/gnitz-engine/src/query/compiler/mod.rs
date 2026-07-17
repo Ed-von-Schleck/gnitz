@@ -19,8 +19,8 @@ use optimize::*;
 
 pub(crate) use emit::is_worker_scratch_dir_name;
 pub(crate) use load::{
-    build_loaded_from_batches, circuit_range_join_n_eq, load_circuit, reindex_cols_through_filters, scan_source_ids,
-    scan_tid_through_filters, topo_sort,
+    build_loaded_from_batches, circuit_range_join_n_eq, circuit_source_bound, load_circuit,
+    reindex_cols_through_filters, scan_source_ids, scan_tid_through_filters, topo_sort,
 };
 pub(crate) use optimize::compute_join_shard_map;
 
@@ -201,6 +201,12 @@ pub(crate) struct CompileOutput {
     /// The unary output `ExchangeShard` is a proven no-op (every row already on
     /// the worker owning its distribution key) — the output IPC is elided.
     pub skips_exchange: bool,
+    /// The `(source table id, secondary-index range)` the planner pushed onto the
+    /// primary source's `ScanDelta`, consulted only by the two circuit backfill
+    /// drivers (a steady-state delta never opens the source cursor). A **physical
+    /// access hint**: `None` means "full-scan", which is always correct, and the
+    /// circuit's `Filter` carries the full predicate either way.
+    pub source_bound: Option<(i64, gnitz_wire::ScanBound)>,
 }
 
 impl CompileOutput {
@@ -352,6 +358,11 @@ pub(crate) fn compile_loaded(
     let skip_nodes = compute_skip_nodes(&loaded);
     let range_join_n_eq = circuit_range_join_n_eq(&loaded);
     let skips_exchange = compute_skips_exchange(&loaded, ext_tables);
+    // Swept from `loaded`, not threaded out of `emit_node`: `EmitCtx` flows into
+    // `SubPlan`, never into `CompileOutput`, and an `Exchanged` shape runs
+    // `build_plan` once per side plus post — so an emit-sourced value would need
+    // a cross-sub-plan merge.
+    let source_bound = circuit_source_bound(&loaded);
 
     let annotated = |shape: PlanShape| CompileOutput {
         shape,
@@ -359,6 +370,7 @@ pub(crate) fn compile_loaded(
         join_shard_map,
         range_join_n_eq,
         skips_exchange,
+        source_bound,
     };
 
     let exchange_nids: Vec<i32> = loaded
@@ -475,13 +487,18 @@ pub(crate) fn compile_loaded(
 mod tests {
     use super::*;
 
+    /// An unbounded delta scan — every fixture circuit's source shape.
+    fn scan_delta(source: u64) -> gnitz_wire::OpNode {
+        gnitz_wire::OpNode::ScanDelta { source, bound: None }
+    }
+
     #[test]
     fn test_topo_sort_simple() {
         let mut loaded = LoadedCircuit {
             out_schema: SchemaDescriptor::default(),
             nodes: {
                 let mut m = HashMap::new();
-                m.insert(0, gnitz_wire::OpNode::ScanDelta(0));
+                m.insert(0, scan_delta(0));
                 m.insert(1, gnitz_wire::OpNode::Filter(None));
                 m.insert(2, gnitz_wire::OpNode::IntegrateSink);
                 m
@@ -890,7 +907,7 @@ mod tests {
         // Circuit: SCAN(0) → DISTINCT(1) → INTEGRATE(2)
         // An invalid view_dir forces create_child_table to fail inside emit_node.
         let mut nodes = HashMap::new();
-        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(99));
+        nodes.insert(0, scan_delta(99));
         nodes.insert(1, gnitz_wire::OpNode::Distinct);
         nodes.insert(2, gnitz_wire::OpNode::IntegrateSink);
         let loaded = make_loaded(nodes, vec![(0, 1, 0), (1, 2, 0)]);
@@ -973,7 +990,7 @@ mod tests {
                 &[0],
             );
             let mut nodes = HashMap::new();
-            nodes.insert(0, OpNode::ScanDelta(10));
+            nodes.insert(0, scan_delta(10));
             nodes.insert(
                 1,
                 OpNode::Reduce {
@@ -1031,7 +1048,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&view_dir);
             std::fs::create_dir_all(&view_dir).unwrap();
             let mut nodes = HashMap::new();
-            nodes.insert(0, OpNode::ScanDelta(10));
+            nodes.insert(0, scan_delta(10));
             nodes.insert(
                 1,
                 OpNode::Reduce {
@@ -1130,7 +1147,7 @@ mod tests {
         // Join(DT) --> IntegrateSink.
         let schema = wide_pk_schema();
         let mut nodes = HashMap::new();
-        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(10));
+        nodes.insert(0, scan_delta(10));
         nodes.insert(1, gnitz_wire::OpNode::ScanTrace(20));
         nodes.insert(2, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
         nodes.insert(3, gnitz_wire::OpNode::IntegrateSink);
@@ -1161,7 +1178,7 @@ mod tests {
         // view_dir forces create_child_table to fail; the Integrate must
         // not be silently dropped — build_plan must return None.
         let mut nodes = HashMap::new();
-        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(99));
+        nodes.insert(0, scan_delta(99));
         nodes.insert(1, gnitz_wire::OpNode::IntegrateTrace);
         nodes.insert(2, gnitz_wire::OpNode::IntegrateSink);
         let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN)];
@@ -1195,7 +1212,7 @@ mod tests {
         // different physical layout → must be rejected (item 32), else the client
         // reads a 16-byte string descriptor out of 8-byte integer storage.
         let mut nodes = HashMap::new();
-        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(99));
+        nodes.insert(0, scan_delta(99));
         nodes.insert(1, gnitz_wire::OpNode::IntegrateSink);
         let edges = vec![(0, 1, PORT_IN)];
         let mut loaded = make_loaded(nodes, edges);
@@ -1227,7 +1244,7 @@ mod tests {
         // that fails to decode must abort, not silently degrade to WHERE TRUE.
         let corrupt = vec![0xFFu8; 16]; // valid length, invalid magic
         let mut nodes = HashMap::new();
-        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(99));
+        nodes.insert(0, scan_delta(99));
         nodes.insert(1, gnitz_wire::OpNode::Filter(Some(corrupt)));
         nodes.insert(2, gnitz_wire::OpNode::IntegrateSink);
         let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN)];
@@ -1247,7 +1264,7 @@ mod tests {
         // ScanDelta(99) → Map(Expression{corrupt blob}) → IntegrateSink.
         let corrupt = vec![0xFFu8; 16];
         let mut nodes = HashMap::new();
-        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(99));
+        nodes.insert(0, scan_delta(99));
         nodes.insert(
             1,
             gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
@@ -1378,7 +1395,7 @@ mod tests {
         let blob = eb.build(0).encode();
 
         let mut nodes = HashMap::new();
-        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(99));
+        nodes.insert(0, scan_delta(99));
         nodes.insert(
             1,
             gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
@@ -1425,7 +1442,7 @@ mod tests {
         let reindex_cols: Vec<u16> = (0..n_cols as u16).collect();
 
         let mut nodes = HashMap::new();
-        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(99));
+        nodes.insert(0, scan_delta(99));
         nodes.insert(
             1,
             gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
@@ -1454,7 +1471,7 @@ mod tests {
         eb.copy_col(type_code::I64 as u32, 2, 0);
         let blob = eb.build(0).encode();
         let mut nodes = HashMap::new();
-        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(99));
+        nodes.insert(0, scan_delta(99));
         nodes.insert(
             1,
             gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
@@ -1491,7 +1508,7 @@ mod tests {
         eb.copy_col(type_code::U64 as u32, 9, 0);
         let blob = eb.build(0).encode();
         let mut nodes = HashMap::new();
-        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(99));
+        nodes.insert(0, scan_delta(99));
         nodes.insert(
             1,
             gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
@@ -1544,7 +1561,7 @@ mod tests {
         // ScanDelta → IntegrateTrace → IntegrateSink. Using an invalid sub-path
         // for the trace table so create_child_table fails the compile.
         let mut nodes = HashMap::new();
-        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(10));
+        nodes.insert(0, scan_delta(10));
         nodes.insert(1, gnitz_wire::OpNode::IntegrateTrace);
         nodes.insert(2, gnitz_wire::OpNode::IntegrateSink);
         let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN)];
@@ -1786,7 +1803,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&view_dir);
         std::fs::create_dir_all(&view_dir).unwrap();
         let mut nodes = HashMap::new();
-        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(10));
+        nodes.insert(0, scan_delta(10));
         nodes.insert(1, mid);
         nodes.insert(2, gnitz_wire::OpNode::IntegrateSink);
         let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN)];
@@ -1999,9 +2016,9 @@ mod tests {
             // Two sources, one of them scanned twice (dedup), plus a ScanTrace
             // that only the `include_trace` walk returns (a read-only ext_trace
             // lookup no drive seeds).
-            nodes.insert(0, gnitz_wire::OpNode::ScanDelta(20));
-            nodes.insert(1, gnitz_wire::OpNode::ScanDelta(10));
-            nodes.insert(2, gnitz_wire::OpNode::ScanDelta(20));
+            nodes.insert(0, scan_delta(20));
+            nodes.insert(1, scan_delta(10));
+            nodes.insert(2, scan_delta(20));
             nodes.insert(3, gnitz_wire::OpNode::ScanTrace(30));
             nodes.insert(4, gnitz_wire::OpNode::IntegrateSink);
             make_loaded(nodes, vec![])
@@ -2053,7 +2070,7 @@ mod tests {
     /// and would no longer read the register at runtime.)
     fn make_dtor_fanout(distinct_id: i32, reader_id: i32) -> LoadedCircuit {
         let mut nodes = HashMap::new();
-        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(10));
+        nodes.insert(0, scan_delta(10));
         nodes.insert(distinct_id, gnitz_wire::OpNode::Distinct);
         nodes.insert(reader_id, gnitz_wire::OpNode::Negate);
         nodes.insert(3, gnitz_wire::OpNode::IntegrateSink);
@@ -2173,7 +2190,7 @@ mod tests {
         //          Join(2) --port0--> IntegrateSink(3)
         let schema = two_col_schema();
         let mut nodes = HashMap::new();
-        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(10));
+        nodes.insert(0, scan_delta(10));
         nodes.insert(1, gnitz_wire::OpNode::ScanTrace(20));
         nodes.insert(2, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
         nodes.insert(3, gnitz_wire::OpNode::IntegrateSink);
@@ -2224,7 +2241,7 @@ mod tests {
         // add_scan_trace is emitted and one extra delta register is allocated.
         let schema = two_col_schema();
         let mut nodes = HashMap::new();
-        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(10));
+        nodes.insert(0, scan_delta(10));
         nodes.insert(1, gnitz_wire::OpNode::ScanTrace(20));
         nodes.insert(2, gnitz_wire::OpNode::Union);
         nodes.insert(3, gnitz_wire::OpNode::IntegrateSink);
@@ -2287,7 +2304,7 @@ mod tests {
         // register — so the compiled program is the JoinDT alone.
         let schema = two_col_schema();
         let mut nodes = HashMap::new();
-        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(10));
+        nodes.insert(0, scan_delta(10));
         nodes.insert(1, gnitz_wire::OpNode::ScanTrace(20));
         nodes.insert(2, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
         nodes.insert(3, gnitz_wire::OpNode::IntegrateSink);
@@ -2366,7 +2383,7 @@ mod tests {
         std::fs::create_dir_all(&view_dir).unwrap();
 
         let mut nodes = HashMap::new();
-        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(10));
+        nodes.insert(0, scan_delta(10));
         nodes.insert(1, gnitz_wire::OpNode::ScanTrace(20));
         nodes.insert(2, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
         nodes.insert(3, gnitz_wire::OpNode::IntegrateTrace);
@@ -2430,7 +2447,7 @@ mod tests {
         //   ScanDelta(right_tid=20) → Map(reindex_col=0) → Join
         let dummy_blob = dummy_expr_blob();
         let mut nodes = HashMap::new();
-        nodes.insert(0, OpNode::ScanDelta(10));
+        nodes.insert(0, scan_delta(10));
         nodes.insert(
             1,
             OpNode::Map(MapKind::Expression {
@@ -2439,7 +2456,7 @@ mod tests {
                 reindex_target_tcs: vec![],
             }),
         );
-        nodes.insert(2, OpNode::ScanDelta(20));
+        nodes.insert(2, scan_delta(20));
         nodes.insert(
             3,
             OpNode::Map(MapKind::Expression {
@@ -2481,7 +2498,7 @@ mod tests {
         // so the one-hop lookup misses it; BFS through Filter must find it.
         let dummy_blob = dummy_expr_blob();
         let mut nodes = HashMap::new();
-        nodes.insert(0, OpNode::ScanDelta(42));
+        nodes.insert(0, scan_delta(42));
         nodes.insert(1, OpNode::Filter(Some(dummy_blob.clone())));
         nodes.insert(
             2,
@@ -2524,7 +2541,7 @@ mod tests {
         // `has_join_shard && has_exchange` would (incorrectly) call it a range
         // join. circuit_range_join_n_eq must return None — no DeltaTraceRange node.
         let mut gb = HashMap::new();
-        gb.insert(0, OpNode::ScanDelta(7));
+        gb.insert(0, scan_delta(7));
         gb.insert(
             1,
             OpNode::Map(MapKind::Expression {
@@ -2556,7 +2573,7 @@ mod tests {
 
         // A range join: a Join(DeltaTraceRange) node makes it Some, carrying n_eq.
         let mut rj = HashMap::new();
-        rj.insert(0, OpNode::ScanDelta(7));
+        rj.insert(0, scan_delta(7));
         rj.insert(1, OpNode::ScanTrace(8));
         rj.insert(
             2,
@@ -2587,7 +2604,7 @@ mod tests {
         // test_reindex_cols_through_filters_range_join_feeds_join_directly.
         let dummy_blob = dummy_expr_blob();
         let mut nodes = HashMap::new();
-        nodes.insert(0, OpNode::ScanDelta(99));
+        nodes.insert(0, scan_delta(99));
         nodes.insert(
             1,
             OpNode::Map(MapKind::Expression {
@@ -2627,7 +2644,7 @@ mod tests {
         // ScanDelta(99) ─► Map(reindex=[2]) ─┬─► Join(DeltaTraceRange)  [delta, PORT_IN_A]
         //                                     └─► PartitionFilter ─► IntegrateTrace ─► Join  [PORT_TRACE]
         let mut nodes = HashMap::new();
-        nodes.insert(0, OpNode::ScanDelta(99));
+        nodes.insert(0, scan_delta(99));
         nodes.insert(
             1,
             OpNode::Map(MapKind::Expression {
@@ -2667,7 +2684,7 @@ mod tests {
         let dummy_blob = dummy_expr_blob();
         // Trivial: ScanDelta → Map(reindex) directly (no Filter).
         let mut nodes = HashMap::new();
-        nodes.insert(0, OpNode::ScanDelta(7));
+        nodes.insert(0, scan_delta(7));
         nodes.insert(
             1,
             OpNode::Map(MapKind::Expression {
@@ -2681,7 +2698,7 @@ mod tests {
 
         // Absent: ScanDelta → Map with no reindex columns.
         let mut nodes2 = HashMap::new();
-        nodes2.insert(0, OpNode::ScanDelta(7));
+        nodes2.insert(0, scan_delta(7));
         nodes2.insert(
             1,
             OpNode::Map(MapKind::Expression {
@@ -2703,7 +2720,7 @@ mod tests {
         // ScanDelta(0) ──► Map(reindex_col=2)
         //              └──► Filter ──► Map(reindex_col=5)
         let mut nodes = HashMap::new();
-        nodes.insert(0, OpNode::ScanDelta(42));
+        nodes.insert(0, scan_delta(42));
         nodes.insert(
             1,
             OpNode::Map(MapKind::Expression {
@@ -2737,7 +2754,7 @@ mod tests {
         use gnitz_wire::{MapKind, OpNode};
         let dummy_blob = dummy_expr_blob();
         let mut nodes = HashMap::new();
-        nodes.insert(0, OpNode::ScanDelta(42));
+        nodes.insert(0, scan_delta(42));
         nodes.insert(
             1,
             OpNode::Map(MapKind::Expression {
@@ -2765,7 +2782,7 @@ mod tests {
         // ScanDelta(7) ──► Filter(not-null) ──► Map(reindex [2])
         //              └──► Filter(is-null)  ──► Map(reindex [2])  (identical seq)
         let mut nodes = HashMap::new();
-        nodes.insert(0, OpNode::ScanDelta(7));
+        nodes.insert(0, scan_delta(7));
         nodes.insert(1, OpNode::Filter(Some(dummy_blob.clone())));
         nodes.insert(
             2,
@@ -2806,7 +2823,7 @@ mod tests {
         //              │                       └─► IntegrateTrace
         //              └──► Map(reindex [0]) ──► Map(Projection) ──► Distinct   (a_all → proj_a → D)
         let mut nodes = HashMap::new();
-        nodes.insert(0, OpNode::ScanDelta(10));
+        nodes.insert(0, scan_delta(10));
         nodes.insert(
             1,
             OpNode::Map(MapKind::Expression {
@@ -2856,7 +2873,7 @@ mod tests {
 
         let dummy_blob = dummy_expr_blob();
         let mut nodes = HashMap::new();
-        nodes.insert(0, OpNode::ScanDelta(10));
+        nodes.insert(0, scan_delta(10));
         nodes.insert(1, OpNode::ScanTrace(20));
         nodes.insert(
             2,
@@ -2908,7 +2925,7 @@ mod tests {
         // ScanDelta(7) → ExchangeShard, no Filter: the zero-hop base case (no `WHERE`),
         // which already co-partitioned before the walk reached through Filters.
         let mut nodes = HashMap::new();
-        nodes.insert(0, OpNode::ScanDelta(7));
+        nodes.insert(0, scan_delta(7));
         nodes.insert(1, OpNode::ExchangeShard { shard_cols: vec![0] });
         let loaded = make_loaded(nodes, vec![(0, 1, PORT_IN)]);
         assert_eq!(
@@ -2919,7 +2936,7 @@ mod tests {
 
         // ScanDelta(7) → Filter → ExchangeShard.
         let mut nodes = HashMap::new();
-        nodes.insert(0, OpNode::ScanDelta(7));
+        nodes.insert(0, scan_delta(7));
         nodes.insert(1, OpNode::Filter(Some(dummy_blob.clone())));
         nodes.insert(2, OpNode::ExchangeShard { shard_cols: vec![0] });
         let loaded = make_loaded(nodes, vec![(0, 1, PORT_IN), (1, 2, PORT_IN)]);
@@ -2951,7 +2968,7 @@ mod tests {
         let dummy_blob = dummy_expr_blob();
         // ScanDelta(7) → Map(reindex) → ExchangeShard.
         let mut nodes = HashMap::new();
-        nodes.insert(0, OpNode::ScanDelta(7));
+        nodes.insert(0, scan_delta(7));
         nodes.insert(
             1,
             OpNode::Map(MapKind::Expression {
@@ -2971,7 +2988,7 @@ mod tests {
         // ScanDelta(7) → Map(reindex) → Filter → ExchangeShard: a Filter below the
         // Map does not rescue it — the walk still reaches the Map and bails.
         let mut nodes = HashMap::new();
-        nodes.insert(0, OpNode::ScanDelta(7));
+        nodes.insert(0, scan_delta(7));
         nodes.insert(
             1,
             OpNode::Map(MapKind::Expression {
@@ -2997,7 +3014,7 @@ mod tests {
     fn test_scan_tid_through_filters_partition_filter() {
         use gnitz_wire::OpNode;
         let mut nodes = HashMap::new();
-        nodes.insert(0, OpNode::ScanDelta(7));
+        nodes.insert(0, scan_delta(7));
         nodes.insert(1, OpNode::PartitionFilter);
         nodes.insert(2, OpNode::ExchangeShard { shard_cols: vec![0] });
         let loaded = make_loaded(nodes, vec![(0, 1, PORT_IN), (1, 2, PORT_IN)]);
@@ -3016,8 +3033,8 @@ mod tests {
         let dummy_blob = dummy_expr_blob();
         // Two scans feed the ExchangeShard directly (set-op-like fan-in).
         let mut nodes = HashMap::new();
-        nodes.insert(0, OpNode::ScanDelta(7));
-        nodes.insert(1, OpNode::ScanDelta(8));
+        nodes.insert(0, scan_delta(7));
+        nodes.insert(1, scan_delta(8));
         nodes.insert(2, OpNode::ExchangeShard { shard_cols: vec![0] });
         let loaded = make_loaded(nodes, vec![(0, 2, PORT_IN_A), (1, 2, PORT_IN_B)]);
         assert_eq!(
@@ -3029,8 +3046,8 @@ mod tests {
         // Fan-in one hop in: two scans feed a Filter that feeds the shard. The shard
         // has one incoming edge, but the Filter has two — bail at the Filter.
         let mut nodes = HashMap::new();
-        nodes.insert(0, OpNode::ScanDelta(7));
-        nodes.insert(1, OpNode::ScanDelta(8));
+        nodes.insert(0, scan_delta(7));
+        nodes.insert(1, scan_delta(8));
         nodes.insert(2, OpNode::Filter(Some(dummy_blob)));
         nodes.insert(3, OpNode::ExchangeShard { shard_cols: vec![0] });
         let loaded = make_loaded(nodes, vec![(0, 2, PORT_IN_A), (1, 2, PORT_IN_B), (2, 3, PORT_IN)]);

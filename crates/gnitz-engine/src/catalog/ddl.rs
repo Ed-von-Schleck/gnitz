@@ -398,7 +398,7 @@ impl CatalogEngine {
             // result. The cursor owns its sources via `Rc` and stays valid
             // while epochs ingest into the view family; the scanned source
             // itself is never written here.
-            let Some(mut handle) = self.open_store_cursor(source_id) else {
+            let Some(mut handle) = self.open_source_cursor(vid, source_id) else {
                 continue;
             };
             let mut touched = false;
@@ -411,10 +411,13 @@ impl CatalogEngine {
                     // ground seed fires (op_reduce mints its one SQL-required row
                     // only when it receives an epoch). A no-op for every other view
                     // — all operators early-return on an empty delta. This mirrors
-                    // the partitioned exchange-backfill's trailing pad round; it
-                    // must live here because `backfill_view` drives BOTH live CREATE
-                    // and the post-recovery rebuild of non-exchange views, so a call
-                    // site would lose the ground row on restart of an empty view.
+                    // the partitioned exchange-backfill's trailing pad round. It
+                    // must live here rather than at the call site because the
+                    // reachable dry shapes — a live CREATE over an empty source, and
+                    // a provably-empty index range — would otherwise lose the ground
+                    // row. (An index-bounded cursor reaching its range end and a
+                    // full scan whose every row the `Filter` drops both land here or
+                    // in the empty-delta no-op, so the seed fires either way.)
                     None if first => match self.dag.tables.get(&source_id).map(|e| e.schema) {
                         Some(schema) => Batch::empty_with_schema(&schema),
                         None => break,

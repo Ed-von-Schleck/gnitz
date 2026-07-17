@@ -229,7 +229,7 @@ pub(crate) fn scan_source_ids(loaded: &LoadedCircuit, include_trace: bool) -> Ve
     let mut out: Vec<i64> = Vec::new();
     for nid in nids {
         let t = match loaded.nodes.get(&nid) {
-            Some(gnitz_wire::OpNode::ScanDelta(t)) => *t as i64,
+            Some(gnitz_wire::OpNode::ScanDelta { source, .. }) => *source as i64,
             Some(gnitz_wire::OpNode::ScanTrace(t)) if include_trace => *t as i64,
             _ => continue,
         };
@@ -429,7 +429,9 @@ pub(crate) fn scan_tid_through_filters(loaded: &LoadedCircuit, enid: i32) -> Opt
         }
         let src_nid = ins[0].0;
         match loaded.nodes.get(&src_nid) {
-            Some(gnitz_wire::OpNode::ScanDelta(t)) | Some(gnitz_wire::OpNode::ScanTrace(t)) => return Some(*t as i64),
+            Some(gnitz_wire::OpNode::ScanDelta { source: t, .. }) | Some(gnitz_wire::OpNode::ScanTrace(t)) => {
+                return Some(*t as i64)
+            }
             Some(gnitz_wire::OpNode::Filter(_)) => cur = src_nid,
             _ => return None,
         }
@@ -453,6 +455,19 @@ pub(crate) fn scan_tid_through_filters(loaded: &LoadedCircuit, enid: i32) -> Opt
 pub(crate) fn circuit_range_join_n_eq(loaded: &LoadedCircuit) -> Option<u8> {
     loaded.nodes.values().find_map(|op| match op {
         gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTraceRange { n_eq, .. }) => Some(*n_eq),
+        _ => None,
+    })
+}
+
+/// The `(source table id, bound)` the planner pushed onto a `ScanDelta`'s
+/// backfill scan. At most ONE exists by construction — only the builder's
+/// primary source can carry a bound (`input_delta_bounded`); tagged secondary
+/// inputs never do — so the type says so. A **hint**: `None` means "full-scan",
+/// which is always correct, and a hand-crafted circuit with several bounded
+/// scans yields an arbitrary one (harmless — the rest degrade to full scans).
+pub(crate) fn circuit_source_bound(loaded: &LoadedCircuit) -> Option<(i64, gnitz_wire::ScanBound)> {
+    loaded.nodes.values().find_map(|op| match op {
+        gnitz_wire::OpNode::ScanDelta { source, bound: Some(b) } => Some((*source as i64, *b)),
         _ => None,
     })
 }

@@ -93,3 +93,27 @@ pub(crate) fn uuid_str_expr(s: &str) -> Expr {
 pub(crate) fn dquote_expr(s: &str) -> Expr {
     Expr::value(Value::DoubleQuotedString(s.into()))
 }
+
+/// Parse a bare SQL expression (e.g. a WHERE predicate) via `GenericDialect`.
+pub(crate) fn parse_expr_sql(src: &str) -> Expr {
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+    Parser::new(&GenericDialect {})
+        .try_with_sql(src)
+        .unwrap()
+        .parse_expr()
+        .unwrap()
+}
+
+/// Non-unique `IndexMeta` list from raw column-index lists.
+pub(crate) fn idx_metas(col_lists: &[&[u32]]) -> std::sync::Arc<Vec<gnitz_core::IndexMeta>> {
+    std::sync::Arc::new(
+        col_lists
+            .iter()
+            .map(|cols| gnitz_core::IndexMeta {
+                cols: gnitz_core::PkColList::from_slice(cols),
+                is_unique: false,
+            })
+            .collect(),
+    )
+}

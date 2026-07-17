@@ -11,7 +11,7 @@ use crate::ast_util::{extract_table_factor_name, group_by_is_present, projection
 use crate::bind::{bind_single_table, Binder};
 use crate::dml::plan::{
     classify_access, collect_index_range_candidates, collect_index_seek_candidates, extract_limit, extract_offset,
-    first_index_hit, seek_pk_multi, AccessPath,
+    first_index_hit, seek_pk_multi, AccessPath, IndexListMemo,
 };
 use crate::error::GnitzSqlError;
 use crate::exec::eval::expr_is_thin;
@@ -24,7 +24,6 @@ use crate::plan::validate::{
 use crate::SqlResult;
 use gnitz_core::{GnitzClient, PlannedView, Schema};
 use sqlparser::ast::{Expr, LimitClause, Query, SelectItem, SetExpr};
-use std::sync::Arc;
 
 pub(crate) fn execute_select(
     client: &mut GnitzClient,
@@ -137,17 +136,10 @@ pub(crate) fn execute_select(
             // interpreter cannot run can never be served thin, so attempting its
             // seek would be wasted I/O ending in a hard error.
 
-            // One epoch-validated GET_INDICES round-trip serves both collectors:
-            // `table_indexes` always hits the wire (its epoch cache only skips
-            // re-decoding), so the range→equality fall-through must not fetch
-            // the same list twice within one statement.
-            let mut idx_memo: Option<Arc<Vec<gnitz_core::IndexMeta>>> = None;
-            let range_cands = collect_index_range_candidates(where_expr, &schema, || {
-                let list = client.table_indexes(tid)?;
-                idx_memo = Some(Arc::clone(&list));
-                Ok(list)
-            })
-            .map_err(GnitzSqlError::Exec)?;
+            let mut idx_memo = IndexListMemo::default();
+            let range_cands =
+                collect_index_range_candidates(where_expr, &schema, || idx_memo.get(|| client.table_indexes(tid)))
+                    .map_err(GnitzSqlError::Exec)?;
             let mut thin_range = Vec::new();
             for c in range_cands {
                 if let Some(preds) = bind_thin_residuals(&c.residual, &schema)? {
@@ -162,11 +154,9 @@ pub(crate) fn execute_select(
             };
 
             if hit.is_none() {
-                let candidates = collect_index_seek_candidates(where_expr, &schema, || match idx_memo {
-                    Some(list) => Ok(list),
-                    None => client.table_indexes(tid),
-                })
-                .map_err(GnitzSqlError::Exec)?;
+                let candidates =
+                    collect_index_seek_candidates(where_expr, &schema, || idx_memo.get(|| client.table_indexes(tid)))
+                        .map_err(GnitzSqlError::Exec)?;
                 let mut thin_seek = Vec::new();
                 for (cols, vals, residual) in candidates {
                     if let Some(preds) = bind_thin_residuals(&residual, &schema)? {

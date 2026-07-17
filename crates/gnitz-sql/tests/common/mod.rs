@@ -150,10 +150,12 @@ pub fn scan_circuit_nodes(client: &mut GnitzClient) -> Option<ZSetBatch> {
     client.scan(CIRCUIT_NODES_TAB).unwrap().1
 }
 
-/// Count nodes with opcode `op` belonging to view `vid` in a `nodes`-table batch
-/// (from `scan_circuit_nodes`). The compound PK is (view_id, sub) packed LE into
-/// 16 bytes (view_id in the low 8); a scan returns the full schema order, so the
-/// opcode is column index 3 (Fixed u64-LE, non-PK).
+/// Count rows belonging to view `vid` whose column-3 u64 equals `op`, in a
+/// circuit-table batch — `nodes` (from `scan_circuit_nodes`, column 3 = opcode)
+/// or `node_columns` (column 3 = kind). Both tables share the compound PK
+/// (view_id, sub) packed LE into 16 bytes (view_id in the low 8); a scan returns
+/// the full schema order, so the discriminator is column index 3 (Fixed u64-LE,
+/// non-PK).
 pub fn opcode_node_count(batch: Option<&ZSetBatch>, vid: u64, op: u64) -> usize {
     let batch = match batch {
         Some(b) => b,
@@ -179,4 +181,17 @@ pub fn opcode_node_count(batch: Option<&ZSetBatch>, vid: u64, op: u64) -> usize 
 /// `opcode_node_count` for the NULL-join-key plan-shape tests.
 pub fn filter_node_count(client: &mut GnitzClient, vid: u64) -> usize {
     opcode_node_count(scan_circuit_nodes(client).as_ref(), vid, OPCODE_FILTER)
+}
+
+/// Count `vid`'s `NODE_COL_KIND_SCAN_BOUND` param rows — one per indexed column
+/// of a pushed-down backfill-scan bound, so `0` means the view's `ScanDelta`
+/// carries no bound. The `node_columns` table shares the circuit-table shape
+/// `opcode_node_count` matches on: (view_id, sub) PK, u64 discriminator (here
+/// `kind`) at column index 3.
+pub fn scan_bound_col_count(client: &mut GnitzClient, vid: u64) -> usize {
+    opcode_node_count(
+        client.scan(gnitz_wire::CIRCUIT_NODE_COLUMNS_TAB).unwrap().1.as_ref(),
+        vid,
+        gnitz_wire::NODE_COL_KIND_SCAN_BOUND,
+    )
 }

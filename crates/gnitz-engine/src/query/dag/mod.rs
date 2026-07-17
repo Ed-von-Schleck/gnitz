@@ -505,6 +505,18 @@ impl DagEngine {
         }
     }
 
+    /// The backfill-scan bound for `source` under `view_id`, if the compiled plan
+    /// pushed one down. The cache is keyed by view id **and** transient tid, so one
+    /// accessor serves both drives. By value (`ScanBound: Copy`) so callers can
+    /// re-borrow `self` without holding this borrow.
+    pub fn source_scan_bound(&self, view_id: i64, source: i64) -> Option<gnitz_wire::ScanBound> {
+        self.cache
+            .get(&view_id)
+            .and_then(|co| co.source_bound)
+            .filter(|&(s, _)| s == source)
+            .map(|(_, b)| b)
+    }
+
     /// The registered relations visible to a compile: table id → schema.
     fn ext_tables(&self) -> compiler::ExtTables {
         self.tables.iter().map(|(&tid, te)| (tid, te.schema)).collect()
@@ -1176,7 +1188,7 @@ mod tests {
         // A pure-range join: ScanDelta → ExchangeShard → Join(DeltaTraceRange
         // { n_eq: 0 }) → IntegrateSink.
         let mut nodes: std::collections::HashMap<i32, OpNode> = std::collections::HashMap::new();
-        nodes.insert(0, OpNode::ScanDelta(7));
+        nodes.insert(0, OpNode::ScanDelta { source: 7, bound: None });
         nodes.insert(1, OpNode::ExchangeShard { shard_cols: vec![1] });
         nodes.insert(
             2,

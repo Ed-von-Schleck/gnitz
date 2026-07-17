@@ -363,17 +363,26 @@ impl PkColList {
     /// arity before constructing, because a silent clamp here would desync the
     /// list from the persisted/packed form it round-trips with.
     pub fn from_slice(cols: &[u32]) -> Self {
-        assert!(
-            (1..=PK_LIST_MAX_COLS).contains(&cols.len()),
-            "PkColList::from_slice: count {} out of range 1..={PK_LIST_MAX_COLS}",
-            cols.len(),
-        );
+        Self::try_from_slice(cols).unwrap_or_else(|| {
+            panic!(
+                "PkColList::from_slice: count {} out of range 1..={PK_LIST_MAX_COLS}",
+                cols.len(),
+            )
+        })
+    }
+    /// Fallible [`Self::from_slice`] for untrusted (wire-decoded) input: `None`
+    /// on an out-of-range length instead of a panic. The arity rule lives here,
+    /// so decode boundaries need no mirrored pre-check.
+    pub fn try_from_slice(cols: &[u32]) -> Option<Self> {
+        if !(1..=PK_LIST_MAX_COLS).contains(&cols.len()) {
+            return None;
+        }
         let mut arr = [0u32; PK_LIST_MAX_COLS];
         arr[..cols.len()].copy_from_slice(cols);
-        PkColList {
+        Some(PkColList {
             cols: arr,
             len: cols.len(),
-        }
+        })
     }
     /// The count exactly as decoded from the wire. May be 0 or larger than
     /// `PK_LIST_MAX_COLS` for a malformed/crafted packed value — deliberately

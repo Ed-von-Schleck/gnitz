@@ -67,7 +67,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
     // Identity view over base. Circuit and dep rows must precede the VIEW_TAB
     // row so registration can compile and backfill.
     let vid = engine.allocate_table_id();
-    write_identity_circuit(&mut engine, vid, tid);
+    write_identity_circuit(&mut engine, vid, tid, None);
     engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
     engine.write_view_deps(vid, &[tid]).unwrap();
 
@@ -164,7 +164,7 @@ fn index_rebuilds_across_chunk_boundary_view_defers() {
     engine.create_index("public.base", &["val"], true).unwrap();
 
     let vid = engine.allocate_table_id();
-    write_identity_circuit(&mut engine, vid, tid);
+    write_identity_circuit(&mut engine, vid, tid, None);
     engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
     engine.write_view_deps(vid, &[tid]).unwrap();
     let batch = build_view_tab_row(vid, "v_base", "SELECT * FROM base");

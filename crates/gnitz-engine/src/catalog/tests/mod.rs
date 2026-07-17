@@ -6,6 +6,7 @@ mod engine_tests;
 mod fk_tests;
 mod index_tests;
 mod reopen_rebuild_tests;
+mod source_cursor_tests;
 mod uuid_tests;
 mod wide_pk_validation;
 
@@ -86,8 +87,9 @@ fn build_table_tab_row_flags(dir: &str, tid: i64, raw_pk_cols: u64, table_name: 
 /// `vid` and write its rows through the applied-delta path. The payload
 /// column layout follows `gnitz_wire::CIRCUIT_NODES_COLS` /
 /// `CIRCUIT_EDGES_COLS`; the compound PK `(view_id, sub)` is packed by
-/// `pack_view_pk`.
-fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64) {
+/// `pack_view_pk`. `scan_blob` is the scan node's optional expr/param blob —
+/// a bounded-scan fixture ships its `RangeDescriptor` there.
+fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64, scan_blob: Option<&[u8]>) {
     let nodes_schema = sys_tab_schema(CIRCUIT_NODES_TAB_ID);
     let mut bb = BatchBuilder::new(nodes_schema);
     // node 0: ScanDelta(base_tid)
@@ -95,7 +97,10 @@ fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64) {
     bb.put_u64(0);
     bb.put_u64(gnitz_wire::OPCODE_SCAN_DELTA);
     bb.put_u64(base_tid as u64); // source_table
-    bb.put_null(); // expr_program
+    match scan_blob {
+        Some(b) => bb.put_blob(b),
+        None => bb.put_null(),
+    }
     bb.end_row();
     // node 1: Integrate (terminal sink — moves the delta into the view store)
     bb.begin_row(pack_view_pk(vid, 1), 1);

@@ -775,7 +775,7 @@ fn test_view_backfill_chunked_matches_unchunked() {
     engine.ddl_scan_chunk_rows = 3;
 
     let vid = engine.allocate_table_id();
-    write_identity_circuit(&mut engine, vid, tid);
+    write_identity_circuit(&mut engine, vid, tid, None);
     engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
     engine.write_view_deps(vid, &[tid]).unwrap();
     let batch = build_view_tab_row(vid, "v_chunk", "SELECT * FROM base");

@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::schema::project_schema;
+use crate::storage::{gather_source_rows, BoundedIndexCursor};
 
 impl CatalogEngine {
     /// The registry entry for `table_id`, or the shared "Unknown table_id"
@@ -208,8 +209,9 @@ impl CatalogEngine {
             idx_cursor.advance();
             hit = idx_cursor.walk_to_positive_with_prefix(opk_prefix);
         }
-        // Free the index merge tree and its shard snapshots before the base
-        // cursor opens, so the two never coexist.
+        // Free the index merge tree and its shard snapshots before the base cursor
+        // opens. An early free, not an invariant: a cursor pins the mmap rather
+        // than the file, so holding both would be correct too.
         drop(idx_cursor);
 
         // Full-arity equality (`natives.len() == col_indices.len()`) pins every
@@ -220,47 +222,11 @@ impl CatalogEngine {
         if natives.len() < col_indices.len() {
             pks.sort_unstable();
         }
-        Ok((Self::resolve_source_pks(&entry.handle, src_schema, &pks), src_schema))
-    }
-
-    /// Resolve already-collected source PKs against the base table into a result
-    /// batch — every present, live, exact-PK row at its net `current_weight`
-    /// (never a hardcoded 1, so Z-Set multiplicity is preserved) — or `None` when
-    /// nothing resolves.
-    ///
-    /// `pks` must be **ascending** in `compare_pk_bytes` (storage) order: each
-    /// `seek_exact_live` then lower-bounds at or past the previous key, turning K
-    /// scattered point-seeks into one monotone forward sweep that keeps shard
-    /// pages and merge state hot. The PKs are index entries' source-PK OPK
-    /// suffixes, whose memcmp order equals base storage order, so a byte sort *is*
-    /// the seek order; `PkBuf` carries the exact `src_pk_stride` bytes inline (up
-    /// to `MAX_PK_BYTES`), so wide sources resolve with no widen. `acc` is sized
-    /// to `pks.len()` — a tight upper bound, since base PKs are unique and each
-    /// carries one indexed value — so it never grows row by row; an empty `pks`
-    /// short-circuits before the base cursor's snapshot clone + tree build.
-    fn resolve_source_pks(
-        handle: &StoreHandle,
-        src_schema: SchemaDescriptor,
-        pks: &[crate::storage::PkBuf],
-    ) -> Option<Batch> {
-        debug_assert!(
-            pks.windows(2).all(|w| w[0] <= w[1]),
-            "resolve_source_pks requires ascending PKs for the monotone sweep"
-        );
-        if pks.is_empty() {
-            return None;
-        }
-        let mut src_cursor = handle.open_cursor();
-        let mut acc = Batch::with_schema(src_schema, pks.len());
-        for pk in pks {
-            // PKs are asserted ascending above, so the galloping `advance_to`
-            // seeds each probe at the prior position — one monotone forward sweep.
-            if src_cursor.advance_to_exact_live(pk.pk_bytes()) {
-                let w = src_cursor.current_weight;
-                src_cursor.copy_current_row_into(&mut acc, w);
-            }
-        }
-        (acc.count > 0).then_some(acc)
+        // An empty `pks` short-circuits before the base cursor's snapshot clone.
+        let batch = (!pks.is_empty())
+            .then(|| gather_source_rows(&mut entry.handle.open_cursor(), src_schema, &pks))
+            .flatten();
+        Ok((batch, src_schema))
     }
 
     /// Ordered range scan over a secondary index: the leading
@@ -299,98 +265,30 @@ impl CatalogEngine {
         col_indices: &[u32],
         range: &gnitz_wire::RangeDescriptor,
     ) -> Result<(Option<Batch>, SchemaDescriptor), String> {
-        use gnitz_wire::Cut;
-
         let (entry, ic) = self.table_and_index(table_id, col_indices)?;
-
-        // Precondition: the range column sits right after the equality prefix, so
-        // `n_eq + 1` leading columns must exist. The worker validates this at the
-        // trust boundary, but this `pub` method is also reachable from unit tests —
-        // guard here too, *before* the `col_indices[..=n_eq]` /
-        // `leading_key_size(n_eq + 1)` indexing below would panic. (Written
-        // `n_eq >= len`, never a `+ 1` that could overflow on an adversarial
-        // length.) It also keeps `prefix_len < idx_pk_stride` strict, so `pad`
-        // always extends the group key.
-        let eq_natives = range.eq_vals();
-        let n_eq = eq_natives.len();
-        if n_eq >= col_indices.len() {
-            return Err(format!(
-                "seek_by_index_range: n_eq {n_eq} has no range column within index \
-                 arity {} on cols {col_indices:?}",
-                col_indices.len()
-            ));
-        }
-
         let src_schema = entry.schema;
-        let src_pk_stride = src_schema.pk_stride() as usize;
-        let idx_pk_stride = ic.index_schema.pk_stride() as usize; // leading + source PK
-        let idx_key_size = ic.index_schema.leading_key_size(col_indices.len());
-        let prefix_len = ic.index_schema.leading_key_size(n_eq + 1); // eq prefix + range slot
 
-        // Every cut key is `pad(group(v))` or its successor for a full
-        // (n_eq + 1)-column group key, so the circuit's baked spec cut to the
-        // equality prefix PLUS the range column encodes both cuts through the
-        // same path the write side uses (`write_span`/`batch_project_index` —
-        // byte-identical by construction). Stack scratch throughout: MAX_PK_BYTES
-        // bounds every index schema's pk_stride (asserted in
-        // SchemaDescriptor::new), and `seek_prefix` leaves the bytes past
-        // `prefix_len` zero, so `group(v)` IS `pad(group(v))`.
-        let spec = ic.key_spec.prefix(n_eq + 1);
-        let mut natives = [0u128; gnitz_wire::PK_LIST_MAX_COLS];
-        natives[..n_eq].copy_from_slice(eq_natives);
-        // Cut → byte key, `None` = `+∞`. `After` steps to the byte successor of
-        // the whole group, so e.g. an exclusive lower bound seeks strictly past
-        // every duplicate of `v` in O(log N) (no per-row skip); the carry may
-        // ripple into the equality prefix, which is exactly the first key of the
-        // next equality group.
-        let mut cut_key = |c: Cut| {
-            natives[n_eq] = c.value();
-            let mut k = spec.seek_prefix(&natives[..=n_eq]).0;
-            match c {
-                Cut::Before(_) => Some(k),
-                Cut::After(_) => crate::storage::increment_key_in_place(&mut k[..prefix_len]).then_some(k),
-            }
-        };
-        let (start, end) = (cut_key(range.start), cut_key(range.end));
-
-        // A `+∞` start, or `start ≥ end`, is provably empty (a zero-width
-        // saturated interval, or an inverted range like `x > 5 AND x < 3` the
-        // planner does not pre-reject): short-circuit before constructing any
-        // cursor or running the O(log N) seek.
-        let Some(start) = start else {
+        // A `+∞` start, or an inverted/zero-width interval, is provably empty:
+        // short-circuit before constructing any cursor or running the O(log N) seek.
+        let Some((start, end)) = index_range_keys(ic, range)? else {
             return Ok((None, src_schema));
         };
-        let end = end.as_ref().map(|e| &e[..idx_pk_stride]);
-        if end.is_some_and(|e| &start[..idx_pk_stride] >= e) {
-            return Ok((None, src_schema));
-        }
 
-        // One index cursor for the walk; collect each positive match's source PK.
-        let mut idx_cursor = ic.table_mut().open_cursor();
-        let mut pks: Vec<crate::storage::PkBuf> = Vec::new();
-
-        idx_cursor.seek_bytes(&start[..idx_pk_stride]);
-        while idx_cursor.valid {
-            let cur_pk = idx_cursor.current_pk_bytes();
-            if end.is_some_and(|e| cur_pk >= e) {
-                break;
-            }
-            if idx_cursor.current_weight > 0 {
-                pks.push(crate::storage::PkBuf::from_bytes(
-                    &cur_pk[idx_key_size..idx_key_size + src_pk_stride],
-                ));
-            }
-            idx_cursor.advance();
-        }
-        // Free the index merge tree and its shard snapshots before the base
-        // cursor opens, so the two never coexist and obsolete shards can be
-        // reclaimed.
-        drop(idx_cursor);
-
-        // A range spans many duplicate groups, so the collected source PKs
-        // interleave across the base table — sort to recover the ascending sweep.
-        pks.sort_unstable();
-        Ok((Self::resolve_source_pks(&entry.handle, src_schema, &pks), src_schema))
+        // The wire seek IS one unchunked drain of the bounded cursor — the same
+        // walk/gather the backfill scan drives chunk-wise, so the two paths
+        // cannot diverge on the weight-consolidation subtleties. The `.filter`
+        // maps the cursor's `Some(empty)` ("in-range entries, none resolved")
+        // back to this API's `None`.
+        let mut cur = BoundedIndexCursor::new(
+            ic.table_mut().open_cursor(),
+            entry.handle.open_cursor(),
+            &start,
+            end,
+            ic.index_schema.leading_key_size(col_indices.len()),
+            src_schema,
+            0,
+        );
+        Ok((cur.drain_chunk(usize::MAX).filter(|b| b.count > 0), src_schema))
     }
 
     /// Flush a table's WAL.
@@ -439,9 +337,219 @@ impl CatalogEngine {
     /// The handle owns its sources via `Rc`, so it stays valid while the
     /// caller mutates OTHER relations (index table, view family) between
     /// chunks; the scanned relation itself must not be written mid-loop.
-    pub(crate) fn open_store_cursor(&mut self, table_id: i64) -> Option<ReadCursor> {
+    pub(crate) fn open_store_cursor(&self, table_id: i64) -> Option<ReadCursor> {
         self.dag.tables.get(&table_id).map(|e| e.handle.open_cursor())
     }
+
+    /// The source cursor for driving `source` through `view_id`'s circuit: an
+    /// index-bounded cursor when the compiled plan pushed a bound down, the index
+    /// circuit resolves, and the range measures selective; else the full-scan
+    /// cursor. Every fallback is a **performance** choice, never a correctness one
+    /// — the circuit's `Filter` is authoritative and unchanged, so `Full` and
+    /// `Bounded` yield the same view. Note the open may COMPILE the view (see the
+    /// `ensure_compiled` below) — plan-cache side effects included.
+    ///
+    /// `None` iff the source table is **unregistered** — byte-identical to
+    /// `open_store_cursor`'s contract, which callers treat as "skip this source".
+    /// A registered-but-empty table yields `Some`, and a *provably empty* range
+    /// yields `Some(SourceCursor::Empty)`: collapsing that into `None` would make a
+    /// driver skip the source entirely rather than feed it one empty epoch.
+    pub(crate) fn open_source_cursor(&mut self, view_id: i64, source: i64) -> Option<SourceCursor> {
+        // Must precede `source_scan_bound`: `handle_backfill` reaches here before
+        // anything compiles the view, and an uncached plan would silently report
+        // "no bound" — the motivating GROUP BY case would full-scan invisibly.
+        // Cache-first and idempotent, so it is also correct for a transient.
+        let bound = self
+            .dag
+            .ensure_compiled(view_id)
+            .then(|| self.dag.source_scan_bound(view_id, source))
+            .flatten();
+        let Some(bound) = bound else {
+            return Some(SourceCursor::Full(Box::new(self.open_store_cursor(source)?)));
+        };
+        // A bounded cursor is only sound in a process that owns base partitions: an
+        // index circuit is a local shadow of the local base slice, and where no
+        // slice is owned (the master) a bounded cursor returns zero rows rather
+        // than an error — the fallbacks below would not catch it and the view would
+        // silently fill empty. Hard, not `debug_assert!`: release is a supported
+        // deployment, and this costs one compare per bounded backfill, not per row.
+        assert!(
+            self.active_part_start != self.active_part_end,
+            "bounded source cursor in a process owning no base partitions (view {view_id}, source {source})",
+        );
+
+        let Ok((entry, ic)) = self.table_and_index(source, bound.idx_cols.as_slice()) else {
+            // The index was dropped since the plan compiled, or the id is a
+            // remapped transient with no index circuits.
+            return Some(SourceCursor::Full(Box::new(self.open_store_cursor(source)?)));
+        };
+        // The gather resolves by source PK alone and emits one (PK, payload) group
+        // per PK — wrong on a non-`unique_pk` base table, where one PK can carry
+        // several live payloads differing in the indexed column. (That is a
+        // pre-existing bug in the thin index path; do not promote it into durably
+        // persisted, incrementally maintained views.) Every SQL-created table is
+        // `unique_pk`, so this costs nothing on the SQL path.
+        if !entry.unique_pk() {
+            return Some(SourceCursor::Full(Box::new(self.open_store_cursor(source)?)));
+        }
+        let (start, end) = match index_range_keys(ic, &bound.desc) {
+            // Provably empty — decided before any cursor is built.
+            Ok(Some(keys)) => keys,
+            Ok(None) => return Some(SourceCursor::Empty),
+            // Malformed: `n_eq` pins every column with no range column left.
+            Err(_) => return Some(SourceCursor::Full(Box::new(self.open_store_cursor(source)?))),
+        };
+
+        // Both cursors open in one synchronous stretch with no reactor yield: the
+        // worker is single-threaded and `ingest_store_and_indices` writes
+        // base-then-index non-atomically, so a yield between the two opens could
+        // snapshot a base row whose index entry is not yet visible — losing a row a
+        // full scan would have returned. (`entry` is registered — `table_and_index`
+        // resolved it — so the `?` cannot fire here.)
+        let idx = ic.table_mut().open_cursor();
+        let src = Box::new(self.open_store_cursor(source)?);
+        // The only cost model. A bounded scan is not unconditionally cheaper: for a
+        // range matching M of N rows it costs an index walk of M, an M log M sort,
+        // and M galloping base probes, where a full scan is one sequential columnar
+        // drain of N — so it loses badly as M → N (`WHERE indexed > 0` matches
+        // everything). M is not estimated: it is measured exactly in O(log N)
+        // before the first row is read (`count_range_raw` is `&self` and
+        // repositions nothing), so `Full` hands `src` over verbatim.
+        let m = idx.count_range_raw(start.pk_bytes(), end.as_ref().map(|e| e.pk_bytes()));
+        if m > src.estimated_length() / INDEX_SCAN_RATIO {
+            return Some(SourceCursor::Full(src));
+        }
+        Some(SourceCursor::Bounded(Box::new(BoundedIndexCursor::new(
+            idx,
+            *src,
+            &start,
+            end,
+            ic.index_schema.leading_key_size(bound.idx_cols.as_slice().len()),
+            entry.schema,
+            // The PK scratch's exact per-chunk bound: the measured range size,
+            // capped at the drivers' chunk size.
+            m.min(self.ddl_scan_chunk_rows),
+        ))))
+    }
+}
+
+/// Use the index only when its range covers at most 1/16 of the local base slice.
+const INDEX_SCAN_RATIO: usize = 16;
+
+/// The source cursor a circuit backfill drives, in the two shapes the drive can
+/// take plus the provably-empty one. Interchangeable by construction: the
+/// circuit's `Filter` decides what the view contains, so which variant is chosen
+/// only decides how many rows the scan reads.
+///
+/// Both cursor variants are boxed (a `ReadCursor` is ~560 bytes and a
+/// `BoundedIndexCursor` holds two of them; clippy's `large_enum_variant`) —
+/// one allocation per backfill, never per chunk.
+pub(crate) enum SourceCursor {
+    Full(Box<ReadCursor>),
+    Bounded(Box<BoundedIndexCursor>),
+    /// A provably-empty index range. Distinct from `Full` so nothing is scanned,
+    /// and distinct from `open_source_cursor -> None` so the source still feeds
+    /// one empty epoch (which is what mints a global aggregate's ground row).
+    Empty,
+}
+
+impl SourceCursor {
+    pub(crate) fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
+        match self {
+            SourceCursor::Full(c) => c.drain_chunk(max_rows),
+            SourceCursor::Bounded(c) => c.drain_chunk(max_rows),
+            SourceCursor::Empty => None,
+        }
+    }
+}
+
+/// The half-open OPK key range `[start, end)` for `range` over `ic`'s index, each
+/// key exactly `ic.index_schema.pk_stride()` bytes.
+///
+/// `Ok(None)` = provably empty (a `+∞` saturated start, or an inverted range like
+/// `x > 5 AND x < 3` the planner does not pre-reject). `Err` = the descriptor pins
+/// `n_eq` columns with no range column left within the index's arity — a trust
+/// boundary the `pub` seek path must reject and a backfill bound merely degrades on.
+///
+/// Each `Cut` maps to one byte key in the index PK space —
+///
+/// | cut         | byte key                                                |
+/// |-------------|---------------------------------------------------------|
+/// | `Before(v)` | `pad(group(v))` — below every duplicate of `v`          |
+/// | `After(v)`  | `pad(succ(group(v)))` — above every duplicate of `v`;   |
+/// |             | `succ` overflow ⇒ no key space above the group (`+∞`)   |
+///
+/// where `group(v)` is the `prefix_len`-byte `[eq OPK ‖ promoted slot OPK]` group
+/// key, `pad` zero-extends to the index PK stride, and `succ` is the fixed-width
+/// byte successor. The walk is then uniform — seek to `start`, advance while
+/// `key < end`. SQL bound semantics (inclusivity, unboundedness, out-of-range
+/// saturation) are resolved to cuts in the planner; none reach this layer.
+///
+/// Correctness rests on the OPK ordering invariant: the index PK region is
+/// `[promoted leading-key OPK ‖ source-PK OPK]` and memcmp order on those bytes
+/// equals typed order (signed and composite included). For any `prefix_len`-byte
+/// group key `p`, every full key `k` with `k[..prefix_len] == p` satisfies
+/// `pad(p) ≤ k < pad(succ(p))`, so a cut key includes or excludes whole duplicate
+/// groups with no per-row inclusivity test.
+fn index_range_keys(
+    ic: &crate::query::IndexCircuitEntry,
+    range: &gnitz_wire::RangeDescriptor,
+) -> Result<Option<(crate::storage::PkBuf, Option<crate::storage::PkBuf>)>, String> {
+    use gnitz_wire::Cut;
+
+    let cols = ic.col_indices.as_slice();
+    // Precondition: the range column sits right after the equality prefix, so
+    // `n_eq + 1` leading columns must exist. Guard *before* the `natives[..=n_eq]` /
+    // `leading_key_size(n_eq + 1)` indexing below would panic. (Written
+    // `n_eq >= len`, never a `+ 1` that could overflow on an adversarial length.)
+    // It also keeps `prefix_len < idx_pk_stride` strict, so `pad` always extends
+    // the group key.
+    let eq_natives = range.eq_vals();
+    let n_eq = eq_natives.len();
+    if n_eq >= cols.len() {
+        return Err(format!(
+            "index range: n_eq {n_eq} has no range column within index arity {} on cols {cols:?}",
+            cols.len()
+        ));
+    }
+
+    let idx_pk_stride = ic.index_schema.pk_stride() as usize; // leading + source PK
+    let prefix_len = ic.index_schema.leading_key_size(n_eq + 1); // eq prefix + range slot
+
+    // Every cut key is `pad(group(v))` or its successor for a full (n_eq + 1)-column
+    // group key, so the circuit's baked spec cut to the equality prefix PLUS the
+    // range column encodes both cuts through the same path the write side uses
+    // (`write_span`/`batch_project_index` — byte-identical by construction). Stack
+    // scratch throughout: MAX_PK_BYTES bounds every index schema's pk_stride
+    // (asserted in `SchemaDescriptor::new`), and `seek_prefix` leaves the bytes past
+    // `prefix_len` zero, so `group(v)` IS `pad(group(v))`.
+    let spec = ic.key_spec.prefix(n_eq + 1);
+    let mut natives = [0u128; gnitz_wire::PK_LIST_MAX_COLS];
+    natives[..n_eq].copy_from_slice(eq_natives);
+    // Cut → byte key, `None` = `+∞`. `After` steps to the byte successor of the
+    // whole group, so e.g. an exclusive lower bound seeks strictly past every
+    // duplicate of `v` in O(log N) (no per-row skip); the carry may ripple into the
+    // equality prefix, which is exactly the first key of the next equality group.
+    let mut cut_key = |c: Cut| -> Option<crate::storage::PkBuf> {
+        natives[n_eq] = c.value();
+        let mut k = spec.seek_prefix(&natives[..=n_eq]).0;
+        match c {
+            Cut::Before(_) => Some(crate::storage::PkBuf::from_bytes(&k[..idx_pk_stride])),
+            Cut::After(_) => crate::storage::increment_key_in_place(&mut k[..prefix_len])
+                .then(|| crate::storage::PkBuf::from_bytes(&k[..idx_pk_stride])),
+        }
+    };
+    let (start, end) = (cut_key(range.start), cut_key(range.end));
+
+    // A `+∞` start, or `start ≥ end`, is provably empty (a zero-width saturated
+    // interval, or an inverted range).
+    let Some(start) = start else {
+        return Ok(None);
+    };
+    if end.as_ref().is_some_and(|e| start.pk_bytes() >= e.pk_bytes()) {
+        return Ok(None);
+    }
+    Ok(Some((start, end)))
 }
 
 /// Projecting sibling of `copy_cursor_row_with_weight`: append the cursor's

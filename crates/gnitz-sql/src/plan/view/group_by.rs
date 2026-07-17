@@ -160,11 +160,15 @@ fn group_col_reduce_pos(
 /// or a hidden view H compiled from a JOIN input, over which the group /
 /// aggregate / HAVING columns resolve by name (a qualifier on a compound ref is
 /// informational in a single-source context — see `bind_single_table`).
+/// `bound` narrows the initial full-source backfill scan to a secondary-index
+/// range. A physical access hint only: the WHERE below is emitted verbatim either
+/// way, so the bound never changes what the view contains.
 pub(crate) fn emit_group_by_pieces(
     client: &mut GnitzClient,
     view_id: u64,
     select: &sqlparser::ast::Select,
     source: (u64, std::rc::Rc<Schema>),
+    bound: Option<gnitz_wire::ScanBound>,
 ) -> Result<EmitPieces, GnitzSqlError> {
     // Grouped views consume FROM, WHERE, GROUP BY, HAVING, and the projection; reject every
     // other clause (PREWHERE, TOP, QUALIFY, …) so a dropped clause is a clean error.
@@ -379,12 +383,17 @@ pub(crate) fn emit_group_by_pieces(
 
     // 5. Build circuit
     let mut cb = CircuitBuilder::new(view_id, source_tid);
-    let inp = cb.input_delta();
+    let inp = cb.input_delta_bounded(bound);
 
     // Optional WHERE filter (elided when the predicate bound to a true constant).
+    // Emitted VERBATIM — the index conjuncts a `bound` covers are NOT trimmed out
+    // of it: a steady-state push never consults the bound, so a row failing the
+    // index predicate but passing the residual would leak if the filter were
+    // narrowed. (A wholly-constant WHERE elides the node, but cannot co-occur with
+    // a bound: it has no `col OP literal` conjunct for a candidate to come from.)
     let filtered = if let Some(where_expr) = &select.selection {
-        let bound = bind_single_table(where_expr, &source_schema)?;
-        match compile_filter_program(&bound, &source_schema)? {
+        let pred = bind_single_table(where_expr, &source_schema)?;
+        match compile_filter_program(&pred, &source_schema)? {
             Some(p) => cb.filter(inp, Some(p)),
             None => inp,
         }

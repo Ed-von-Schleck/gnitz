@@ -1720,11 +1720,17 @@ impl BatchBuilder {
         self.curr_col += 1;
     }
 
-    /// Put a string value for the current payload column.
-    pub(crate) fn put_string(&mut self, s: &str) {
-        let st = crate::schema::encode_german_string(s.as_bytes(), &mut self.batch.blob);
+    /// Put raw bytes for the current STRING/BLOB payload column — the one
+    /// German-string encode site; `read_german_bytes` is the read-back twin.
+    pub(crate) fn put_blob(&mut self, b: &[u8]) {
+        let st = crate::schema::encode_german_string(b, &mut self.batch.blob);
         self.batch.extend_col(self.curr_col, &st);
         self.curr_col += 1;
+    }
+
+    /// Put a string value for the current payload column.
+    pub(crate) fn put_string(&mut self, s: &str) {
+        self.put_blob(s.as_bytes());
     }
 
     // The non-u64/string put variants are exercised only by the catalog tests

@@ -1187,7 +1187,7 @@ impl WorkerProcess {
             .get_schema_desc(source_tid)
             .ok_or_else(|| format!("backfill: no schema for source {source_tid}"))?;
         let mut handle = if has {
-            self.cat().open_store_cursor(source_tid)
+            self.cat().open_source_cursor(view_id, source_tid)
         } else {
             None
         };

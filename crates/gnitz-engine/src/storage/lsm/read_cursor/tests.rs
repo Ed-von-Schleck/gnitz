@@ -2103,3 +2103,106 @@ fn read_cursor_advance_to_rebuild_bench() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// count_range_raw — the source drive's index-vs-full-scan gate reads the range
+// size before deciding, so it must be exact over raw entries and side-effect free.
+// ---------------------------------------------------------------------------
+
+/// Count `[start, end)` the expensive way: drive the merge and count the groups
+/// a walk would step over, raw (every run's entry, ghosts and duplicates
+/// included) rather than consolidated.
+fn counted_walk_raw(
+    batches: &[Rc<Batch>],
+    shards: &[Rc<MappedShard>],
+    schema: SchemaDescriptor,
+    lo: u128,
+    hi: Option<u128>,
+) -> usize {
+    let mut n = 0;
+    for b in batches {
+        for i in 0..b.count {
+            let pk = b.get_pk(i);
+            if pk >= lo && hi.is_none_or(|h| pk < h) {
+                n += 1;
+            }
+        }
+    }
+    for s in shards {
+        let cur = create_read_cursor(&[], &[Rc::clone(s)], schema);
+        let mat = cur.materialize();
+        for i in 0..mat.count {
+            let pk = mat.get_pk(i);
+            if pk >= lo && hi.is_none_or(|h| pk < h) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Over a multi-run cursor (memtable runs + a shard), `count_range_raw` equals a
+/// counted walk of `[start, end)` — including a run that holds no entry in range,
+/// and a `end = None` arm that counts to the end of every run.
+#[test]
+fn count_range_raw_equals_counted_walk() {
+    crate::foundation::posix_io::raise_fd_limit_for_tests();
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_u128_i64();
+
+    // Overlapping runs: run A and the shard both hold pk=20 (a cross-run
+    // duplicate `count_range_raw` counts twice, by contract), and run C holds
+    // nothing inside [10, 40).
+    let a = make_batch(&[(5, 1, 50), (20, 1, 200), (30, 1, 300)]);
+    let b = make_batch(&[(10, 1, 100), (25, 1, 250), (60, 1, 600)]);
+    let c = make_batch(&[(80, 1, 800), (90, 1, 900)]);
+    let shard = write_test_shard(&dir, &schema, 0, &[(20, 1, 201), (35, 1, 350), (70, 1, 700)], 0);
+
+    let batches = [Rc::clone(&a), Rc::clone(&b), Rc::clone(&c)];
+    let shards = [Rc::clone(&shard)];
+    let cursor = create_read_cursor(&batches, &shards, schema);
+
+    for (lo, hi) in [
+        (10u128, Some(40u128)), // spans all four runs; C contributes 0
+        (0, Some(1000)),        // everything
+        (0, Some(0)),           // empty
+        (100, Some(200)),       // past every entry
+        (20, Some(21)),         // the cross-run duplicate group alone
+        (10, None),             // unbounded arm — to the end of every run
+        (0, None),
+    ] {
+        let want = counted_walk_raw(&batches, &shards, schema, lo, hi);
+        let got = cursor.count_range_raw(&lo.to_be_bytes(), hi.map(|h| h.to_be_bytes()).as_ref().map(|k| &k[..]));
+        assert_eq!(got, want, "count_range_raw([{lo}, {hi:?}))");
+    }
+    // The cross-run duplicate is counted raw, once per run — the gate's inputs
+    // are both raw counts, so both err the same direction.
+    assert_eq!(
+        cursor.count_range_raw(&20u128.to_be_bytes(), Some(&21u128.to_be_bytes()[..])),
+        2
+    );
+}
+
+/// `count_range_raw` takes `&self` and builds no merge tree: a following
+/// `seek_bytes` must land identically with or without it.
+#[test]
+fn count_range_raw_does_not_reposition() {
+    let schema = make_schema_u128_i64();
+    let batches = [
+        make_batch(&[(5, 1, 50), (20, 1, 200), (30, 1, 300)]),
+        make_batch(&[(10, 1, 100), (25, 1, 250)]),
+    ];
+
+    let mut plain = create_read_cursor(&batches, &[], schema);
+    let mut counted = create_read_cursor(&batches, &[], schema);
+
+    assert!(counted.count_range_raw(&10u128.to_be_bytes(), Some(&30u128.to_be_bytes()[..])) > 0);
+    assert_eq!(counted.valid, plain.valid);
+    assert_eq!(counted.current_pk_bytes(), plain.current_pk_bytes());
+
+    plain.seek_bytes(&25u128.to_be_bytes());
+    counted.seek_bytes(&25u128.to_be_bytes());
+    assert_eq!(counted.valid, plain.valid);
+    assert_eq!(counted.current_pk_bytes(), plain.current_pk_bytes());
+    assert_eq!(scan_all(&mut counted), scan_all(&mut plain));
+}

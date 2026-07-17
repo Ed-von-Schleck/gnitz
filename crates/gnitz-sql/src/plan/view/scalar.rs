@@ -362,7 +362,7 @@ pub(crate) fn emit_scalar_subquery_pieces(
         let (h_tid, h_schema) = chain.add_segment(client, |client, chain, vid| {
             join::plan_join_chain(client, binder, vid, &join_select, chain)
         })?;
-        binder.cache_alias(&h_alias, (h_tid, Rc::clone(&h_schema)))?;
+        binder.cache_alias(&h_alias, (h_tid, Rc::clone(&h_schema)), false)?;
         final_select.from[0].relation = table_factor(&h_alias);
         final_select.from[0].joins = Vec::new();
     }
@@ -614,9 +614,12 @@ fn build_correlated_join(
     };
     let source = (sub.inner_tid, Rc::clone(&sub.inner_schema));
     let (g_vid, g_schema) = chain.add_segment(client, move |client, _chain, vid| {
-        group_by::emit_group_by_pieces(client, vid, &g_select, source)
+        // Unbounded: `sub.inner_tid`'s catalog provenance is not established here
+        // (the synthesized `Select` is built inside a `move` closure, with no binder
+        // in reach), and a bound may only be extracted for a catalog-issued id.
+        group_by::emit_group_by_pieces(client, vid, &g_select, source, None)
     })?;
-    binder.cache_alias(&seg_alias, (g_vid, g_schema))?;
+    binder.cache_alias(&seg_alias, (g_vid, g_schema), false)?;
 
     // LEFT JOIN step:  outer LEFT JOIN seg ON a.k = seg.x4k{i}_m AND …
     let on = correlation_on(outer, &sub.corr, &seg_alias, &k_names);
@@ -693,9 +696,12 @@ fn build_uncorrelated_join(
     };
     let source = (sub.inner_tid, Rc::clone(&sub.inner_schema));
     let (g_vid, g_schema) = chain.add_segment(client, move |client, _chain, vid| {
-        group_by::emit_group_by_pieces(client, vid, &g_select, source)
+        // Unbounded: `sub.inner_tid`'s catalog provenance is not established here
+        // (the synthesized `Select` is built inside a `move` closure, with no binder
+        // in reach), and a bound may only be extracted for a catalog-issued id.
+        group_by::emit_group_by_pieces(client, vid, &g_select, source, None)
     })?;
-    binder.cache_alias(&seg_alias, (g_vid, g_schema))?;
+    binder.cache_alias(&seg_alias, (g_vid, g_schema), false)?;
 
     // INNER JOIN ON  outer_col OP seg.x4agg{i}
     let on = Expr::BinaryOp {

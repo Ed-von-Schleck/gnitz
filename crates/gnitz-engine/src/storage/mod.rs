@@ -44,6 +44,7 @@ pub(crate) use columnar::{
 pub(crate) use crate::schema::key::PkBuf;
 pub(crate) use crate::schema::key::{compare_pk_bytes, compare_pk_ordering, opk_key, pack_pk_be, pk_bytes_eq};
 pub(crate) use gnitz_wire::wal::write_header_and_directory as wal_write_header_and_directory;
+pub(crate) use lsm::index_gather::{gather_source_rows, BoundedIndexCursor};
 pub(crate) use lsm::manifest::{partition_manifest_path, peek_generation, topology_word};
 #[cfg(test)]
 pub(crate) use lsm::partitioned_table::partial_flush_lsn_fixture;

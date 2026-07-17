@@ -73,6 +73,7 @@ pub const NODE_COL_KIND_REINDEX: u64 = 6; // MAP_EXPR equijoin pre-index cols (v
 pub const NODE_COL_KIND_RANGE_JOIN: u64 = 7; // JOIN_DELTA_TRACE_RANGE params (value1=n_eq, value2=rel)
 pub const NODE_COL_KIND_GLOBAL_GROUND: u64 = 8; // REDUCE global-aggregate ground discriminator (value1=bool)
 pub const NODE_COL_KIND_REDUCE_OUT_KEY: u64 = 9; // REDUCE output-key kind (value1=ReduceOutKey); absent ⇒ SyntheticFold
+pub const NODE_COL_KIND_SCAN_BOUND: u64 = 10; // SCAN_DELTA backfill-scan index column list (value1=col_idx, position=key order)
 
 // ---------------------------------------------------------------------------
 // Aggregate function IDs
@@ -306,12 +307,35 @@ pub enum MapKind {
     HashRow(Vec<u16>, Vec<u8>, u8),
 }
 
+/// A secondary-index range bound for a `ScanDelta`'s backfill scan: the index's
+/// declared column list and the half-open range over its leading columns.
+/// Resolved server-side against the source table's index circuits.
+///
+/// A **physical access hint, never a semantic filter**. The circuit's `Filter`
+/// still carries the full predicate, so a bounded and an unbounded scan produce
+/// the same view — a bound only narrows which rows the initial scan reads. That
+/// is what lets every consumer degrade to a full scan (a dropped index, an
+/// unselective range, a malformed wire row) without changing results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanBound {
+    pub idx_cols: crate::PkColList,
+    pub desc: crate::RangeDescriptor,
+}
+
 /// Typed operator-node payload. Expression blobs are stored as raw `Vec<u8>` and decoded
 /// with `gnitz_wire::decode_expr_blob`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpNode {
-    /// `OPCODE_SCAN_DELTA = 11`. Delta input; carries the source `table_id`.
-    ScanDelta(TableId),
+    /// `OPCODE_SCAN_DELTA = 11`. Delta input for `source`.
+    ///
+    /// `bound` is a **backfill-scan hint only**: steady-state deltas never open
+    /// the source cursor and ignore it entirely. A non-`None` bound narrows the
+    /// initial full-source scan to a secondary-index range, leaving the
+    /// downstream `Filter` — and therefore the view — unchanged.
+    ScanDelta {
+        source: TableId,
+        bound: Option<ScanBound>,
+    },
     /// `OPCODE_SCAN_TRACE_TABLE = 31`. Read-only trace source for join trace ports.
     ScanTrace(TableId),
     /// `OPCODE_FILTER = 1`. Optional expression predicate blob.
@@ -437,7 +461,13 @@ fn encode_col_list_with_tcs(kind: u64, cols: &[u16], target_tcs: &[u8]) -> Vec<N
 /// `OpNode`).
 pub fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
     match op {
-        OpNode::ScanDelta(tid) => ((OPCODE_SCAN_DELTA, Some(tid), None), Vec::new()),
+        // An unbounded `ScanDelta` carries no param rows and no blob — byte-identical
+        // to a pre-bound circuit, so every stored view round-trips unchanged.
+        OpNode::ScanDelta { source, bound: None } => ((OPCODE_SCAN_DELTA, Some(source), None), Vec::new()),
+        OpNode::ScanDelta { source, bound: Some(b) } => (
+            (OPCODE_SCAN_DELTA, Some(source), Some(b.desc.encode())),
+            encode_col_list(NODE_COL_KIND_SCAN_BOUND, b.idx_cols.as_slice().iter().copied()),
+        ),
         OpNode::ScanTrace(tid) => ((OPCODE_SCAN_TRACE_TABLE, Some(tid), None), Vec::new()),
         OpNode::Filter(blob) => ((OPCODE_FILTER, None, blob), Vec::new()),
         OpNode::Map(MapKind::Projection(cols)) => {
@@ -537,8 +567,25 @@ pub fn decode_op_node(
     };
     Ok(match opcode {
         OPCODE_SCAN_DELTA => {
-            let tid = src_tab.ok_or_else(|| "SCAN_DELTA missing source_table".to_string())?;
-            OpNode::ScanDelta(tid)
+            let source = src_tab.ok_or_else(|| "SCAN_DELTA missing source_table".to_string())?;
+            // A malformed bound degrades to `None` — it is NEVER an `Err`. The bound
+            // decides scan speed, never correctness (the `Filter` is authoritative), and
+            // `assemble_circuit` aborts the whole view load on any node `Err` — so
+            // erroring here would let one corrupt hint row make a stored view
+            // unloadable. An absent list, an over-long one, a missing blob, and an
+            // undecodable descriptor all mean the same thing: no usable hint.
+            let bound_cols: Vec<u32> = collect_cols(NODE_COL_KIND_SCAN_BOUND)
+                .iter()
+                .map(|&c| c as u32)
+                .collect();
+            let bound = crate::PkColList::try_from_slice(&bound_cols)
+                .zip(
+                    expr_blob
+                        .as_deref()
+                        .and_then(|b| crate::RangeDescriptor::decode(b).ok()),
+                )
+                .map(|(idx_cols, desc)| ScanBound { idx_cols, desc });
+            OpNode::ScanDelta { source, bound }
         }
         OPCODE_SCAN_TRACE_TABLE => {
             let tid = src_tab.ok_or_else(|| "SCAN_TRACE missing source_table".to_string())?;
@@ -775,5 +822,106 @@ mod tests {
         assert!(decode_op_node(OPCODE_SCAN_TRACE_TABLE, None, None, &[])
             .unwrap_err()
             .contains("source_table"));
+    }
+
+    /// Re-decode an encoded node through the row bundle `encode_op_node` produces.
+    fn roundtrip(op: OpNode) -> Result<OpNode, String> {
+        let ((opcode, src_tab, blob), rows) = encode_op_node(op);
+        let cols: Vec<CircuitNodeColumn> = rows
+            .into_iter()
+            .map(|(kind, position, value1, value2)| CircuitNodeColumn {
+                kind,
+                position,
+                value1,
+                value2,
+            })
+            .collect();
+        decode_op_node(opcode, src_tab, blob, &cols)
+    }
+
+    /// A bounded `ScanDelta` round-trips its descriptor and its column list — in
+    /// order. The list is position-keyed, so a reversed list must stay reversed.
+    #[test]
+    fn scan_bound_roundtrips_preserving_col_order() {
+        let bound = ScanBound {
+            idx_cols: crate::PkColList::from_slice(&[9, 3, 5]),
+            desc: crate::RangeDescriptor::new(&[7, 11], crate::Cut::After(4), crate::Cut::Before(90)),
+        };
+        let node = OpNode::ScanDelta {
+            source: 42,
+            bound: Some(bound),
+        };
+        assert_eq!(roundtrip(node.clone()).unwrap(), node);
+        // Order is significant and carried by `position`, not by chance.
+        match roundtrip(node).unwrap() {
+            OpNode::ScanDelta { bound: Some(b), .. } => assert_eq!(b.idx_cols.as_slice(), &[9, 3, 5]),
+            other => panic!("expected a bounded ScanDelta, got {other:?}"),
+        }
+    }
+
+    /// An unbounded `ScanDelta` emits no param rows and no blob — byte-identical to
+    /// the pre-bound encoding, so stored circuits round-trip unchanged.
+    #[test]
+    fn unbounded_scan_delta_encodes_identically() {
+        let (fields, rows) = encode_op_node(OpNode::ScanDelta { source: 7, bound: None });
+        assert_eq!(fields, (OPCODE_SCAN_DELTA, Some(7), None));
+        assert!(rows.is_empty());
+        assert_eq!(
+            decode_op_node(OPCODE_SCAN_DELTA, Some(7), None, &[]).unwrap(),
+            OpNode::ScanDelta { source: 7, bound: None }
+        );
+    }
+
+    /// Every malformed-hint shape degrades to `bound: None` — no panic, no `Err`.
+    /// An `Err` here would abort the whole view load over a physical access hint.
+    #[test]
+    fn malformed_scan_bound_degrades_to_none() {
+        let good_blob = crate::RangeDescriptor::new(&[1], crate::Cut::Before(0), crate::Cut::After(9)).encode();
+        let col = |position: u16, value1: u64| CircuitNodeColumn {
+            kind: NODE_COL_KIND_SCAN_BOUND,
+            position,
+            value1,
+            value2: 0,
+        };
+        let over_long: Vec<CircuitNodeColumn> =
+            (0..=crate::PK_LIST_MAX_COLS as u16).map(|i| col(i, i as u64)).collect();
+        struct Case {
+            what: &'static str,
+            blob: Option<Vec<u8>>,
+            cols: Vec<CircuitNodeColumn>,
+        }
+        let cases = [
+            // A col-list longer than the arity cap — would panic `from_slice`.
+            Case {
+                what: "over-long list",
+                blob: Some(good_blob.clone()),
+                cols: over_long,
+            },
+            // A bounded node whose descriptor blob never arrived.
+            Case {
+                what: "missing blob",
+                blob: None,
+                cols: vec![col(0, 1)],
+            },
+            // A blob that fails `RangeDescriptor::decode`'s validation.
+            Case {
+                what: "undecodable blob",
+                blob: Some(vec![0xff, 0xff, 0xff]),
+                cols: vec![col(0, 1)],
+            },
+            // A blob with no col-list: "absent" and "length 0" are the same bytes.
+            Case {
+                what: "no col list",
+                blob: Some(good_blob),
+                cols: Vec::new(),
+            },
+        ];
+        for Case { what, blob, cols } in cases {
+            assert_eq!(
+                decode_op_node(OPCODE_SCAN_DELTA, Some(3), blob, &cols).unwrap(),
+                OpNode::ScanDelta { source: 3, bound: None },
+                "{what} must degrade to an unbounded scan"
+            );
+        }
     }
 }

@@ -755,6 +755,38 @@ impl ReadCursor {
         self.states.iter().map(|s| s.count.saturating_sub(s.position)).sum()
     }
 
+    /// The number of raw entries this cursor's runs hold in `[start, end)`
+    /// (`end = None` ⇒ to the end of every run). Both keys must be exactly
+    /// `pk_stride` OPK bytes.
+    ///
+    /// Exact over **raw** entries: cross-run duplicates and ghosts are counted, so
+    /// this is an upper bound on the live group count a walk would emit. `&self` —
+    /// nothing is repositioned and no merge tree is built, so a later `seek_bytes`
+    /// lands identically whether or not this ran. `O(sources × log N)`: two
+    /// per-source binary lower bounds, the same searches `seek_bytes` would run to
+    /// reach either edge.
+    ///
+    /// Every source of one cursor is a run of the same `Table` and shares that
+    /// schema's stride, which is what makes one `start`/`end` pair valid across all
+    /// of them.
+    pub fn count_range_raw(&self, start: &[u8], end: Option<&[u8]>) -> usize {
+        debug_assert_eq!(start.len(), self.schema.pk_stride() as usize);
+        debug_assert!(end.is_none_or(|e| e.len() == self.schema.pk_stride() as usize));
+        self.sources
+            .iter()
+            .zip(self.states.iter())
+            .map(|(src, st)| {
+                let lo = src.find_lower_bound_bytes(start);
+                // `st.count` is the run's row count, so it is `lb(+∞)` for the
+                // unbounded arm. Callers short-circuit the inverted and saturated
+                // cases and each run is sorted, so `hi >= lo`; `saturating_sub`
+                // costs nothing and keeps a future caller from underflowing.
+                let hi = end.map_or(st.count, |e| src.find_lower_bound_bytes(e));
+                hi.saturating_sub(lo)
+            })
+            .sum()
+    }
+
     /// Raw column pointer for the current row, indexed by LOGICAL column index.
     ///
     /// Returns null for the PK column — use `current_key_narrow()` /

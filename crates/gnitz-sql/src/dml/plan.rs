@@ -274,6 +274,30 @@ pub(crate) fn seek_pk_multi(
     Ok((reply_schema, out))
 }
 
+/// Memoizes one `table_indexes` list across the range → equality collector
+/// fall-through. `table_indexes` ALWAYS hits the wire (its epoch cache only
+/// skips re-decoding), so within one statement the second collector must reuse
+/// the first's list rather than fetch it twice — every consumer of both
+/// collectors routes its `fetch_indexes` through one of these.
+#[derive(Default)]
+pub(crate) struct IndexListMemo(Option<Arc<Vec<gnitz_core::IndexMeta>>>);
+
+impl IndexListMemo {
+    pub(crate) fn get(
+        &mut self,
+        fetch: impl FnOnce() -> Result<Arc<Vec<gnitz_core::IndexMeta>>, ClientError>,
+    ) -> Result<Arc<Vec<gnitz_core::IndexMeta>>, ClientError> {
+        match &self.0 {
+            Some(list) => Ok(Arc::clone(list)),
+            None => {
+                let list = fetch()?;
+                self.0 = Some(Arc::clone(&list));
+                Ok(list)
+            }
+        }
+    }
+}
+
 /// Try each index candidate's seek in order, treating `ClientError::NoIndex` as
 /// "try the next candidate". Returns the first hit's `(candidate, reply)` — a
 /// hit with no matching rows is still terminal — or `None` when no candidate's
@@ -697,8 +721,8 @@ mod tests {
     use super::*;
     use crate::codec::pk_codec::extract_pk_value;
     use crate::test_support::{
-        col_def, compound_schema_u64_u64, dquote_expr, neg_num_expr, num_expr, pk_schema, uuid_schema_payload,
-        uuid_schema_pk, uuid_str_expr,
+        col_def, compound_schema_u64_u64, dquote_expr, idx_metas, neg_num_expr, num_expr, parse_expr_sql, pk_schema,
+        uuid_schema_payload, uuid_schema_pk, uuid_str_expr,
     };
 
     fn make_schema_col(tc: TypeCode) -> Schema {
@@ -736,18 +760,6 @@ mod tests {
         }
     }
 
-    fn idx_metas(col_lists: &[&[u32]]) -> Arc<Vec<gnitz_core::IndexMeta>> {
-        Arc::new(
-            col_lists
-                .iter()
-                .map(|cols| gnitz_core::IndexMeta {
-                    cols: gnitz_core::PkColList::from_slice(cols),
-                    is_unique: false,
-                })
-                .collect(),
-        )
-    }
-
     fn idx_list(metas: &[(&[u32], bool)]) -> Arc<Vec<gnitz_core::IndexMeta>> {
         Arc::new(
             metas
@@ -758,16 +770,6 @@ mod tests {
                 })
                 .collect(),
         )
-    }
-
-    fn parse_expr_sql(src: &str) -> Expr {
-        use sqlparser::dialect::GenericDialect;
-        use sqlparser::parser::Parser;
-        Parser::new(&GenericDialect {})
-            .try_with_sql(src)
-            .unwrap()
-            .parse_expr()
-            .unwrap()
     }
 
     // ------------------------------------------------------------------

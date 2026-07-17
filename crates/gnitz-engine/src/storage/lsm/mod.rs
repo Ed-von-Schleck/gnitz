@@ -15,6 +15,7 @@
 //! move under `lsm/`.
 
 // Re-exported from storage/mod.rs.
+pub(super) mod index_gather;
 pub(super) mod manifest;
 pub(super) mod partitioned_table;
 pub(super) mod read_cursor;

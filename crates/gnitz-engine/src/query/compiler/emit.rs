@@ -279,7 +279,9 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
     };
 
     match op {
-        gnitz_wire::OpNode::ScanDelta(tid) => {
+        // `bound` is a backfill-scan hint consumed by the source drive, not by the
+        // VM: emission is identical bounded or not.
+        gnitz_wire::OpNode::ScanDelta { source: tid, .. } => {
             let schema = ext_schema(ctx.ext_tables, *tid as i64, "scan-delta: unknown source table")?;
             ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(schema);
             ctx.source_reg_map.insert(*tid as i64, reg_id);
@@ -984,7 +986,7 @@ pub(super) fn build_plan(
         .nodes
         .values()
         .filter_map(|op| match op {
-            gnitz_wire::OpNode::ScanDelta(tid) => Some(*tid as i64),
+            gnitz_wire::OpNode::ScanDelta { source, .. } => Some(*source as i64),
             _ => None,
         })
         .all(|tid| {

@@ -51,6 +51,7 @@ fn emit_linear_opts(view_id: u64, rel: Rel, shard: bool) -> Result<EmitPieces, G
     let Rel::Source {
         tid: source_tid,
         schema: source_schema,
+        bound,
     } = src
     else {
         unreachable!("a lowered linear view terminates in one Source");
@@ -75,7 +76,9 @@ fn emit_linear_opts(view_id: u64, rel: Rel, shard: bool) -> Result<EmitPieces, G
     });
 
     let mut cb = CircuitBuilder::new(view_id, source_tid);
-    let inp = cb.input_delta();
+    // The `Filter` below is emitted verbatim whether or not a bound rode in: the
+    // bound narrows the backfill scan, never the predicate.
+    let inp = cb.input_delta_bounded(bound);
     let filtered = match expr_prog {
         Some(p) => cb.filter(inp, Some(p)),
         None => inp,

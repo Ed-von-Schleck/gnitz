@@ -21,7 +21,16 @@ pub(crate) enum Rel {
     /// A base table or committed/hidden view. `schema` is the full registered
     /// schema; a later hidden-view input will restrict its visible range, but a
     /// base table or user view is fully visible.
-    Source { tid: u64, schema: Rc<Schema> },
+    ///
+    /// `bound` narrows the initial backfill scan to a secondary-index range. A
+    /// physical access hint carried as data — extracted where catalog provenance is
+    /// known (`lower_linear`, which holds the client, the binder and the raw AST) and
+    /// consumed by the emitter, which has none of those.
+    Source {
+        tid: u64,
+        schema: Rc<Schema>,
+        bound: Option<gnitz_wire::ScanBound>,
+    },
     /// Linear filter; `pred` is bound against `input`'s (source) schema.
     Filter { input: Box<Rel>, pred: BoundExpr },
     /// Linear projection; `items`/`out_cols` as in `codec::project_schema`. The
@@ -57,9 +66,18 @@ pub(crate) fn lower_linear(
     let table_name = extract_relation_name(&select.from[0].relation, "CREATE VIEW")?;
     let (source_tid, source_schema) = binder.resolve(client, &table_name)?;
 
+    // Extracted here, not inside the WHERE block below: that block only *wraps*
+    // `rel` in a `Rel::Filter`, so there is no `Source` left to mutate by then.
+    let bound = crate::plan::index_bound::scan_bound_for_input(
+        client,
+        select.selection.as_ref(),
+        (source_tid, &source_schema),
+        binder.is_catalog_relation(&table_name),
+    )?;
     let mut rel = Rel::Source {
         tid: source_tid,
         schema: Rc::clone(&source_schema),
+        bound,
     };
 
     // WHERE — bound against the source schema (the only schema in scope).
@@ -103,6 +121,8 @@ pub(crate) fn passthrough_rel(tid: u64, schema: Rc<Schema>) -> Result<Rel, Gnitz
         input: Box::new(Rel::Source {
             tid,
             schema: Rc::clone(&schema),
+            // A pass-through wrapper has no WHERE, so no conjunct to bound on.
+            bound: None,
         }),
         items,
         out_cols,

@@ -9,11 +9,12 @@ use crate::ast_util::{
 };
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;
+use crate::plan::index_bound;
 use crate::plan::validate::{
     plain_select_body, reject_unhonored_query_clauses, reject_unhonored_select_clauses, unsupported_clause,
     validate_user_name, HonoredClauses, HonoredQueryClauses,
 };
-use crate::plan::view::{exists, group_by, join, scalar, set_op, simple, ViewChain};
+use crate::plan::view::{exists, group_by, join, scalar, set_op, simple, EmitPieces, ViewChain};
 use crate::SqlResult;
 use gnitz_core::{ColumnDef, GnitzClient, PlannedView, Schema};
 use sqlparser::ast::{
@@ -108,13 +109,13 @@ fn build_query_segments(
         // returns the `Select` the operator should see — with `selection` cleared on
         // the join path, so the WHERE is never re-applied over H.
         ViewShape::Distinct(select) => {
-            let (src, op_select) = resolve_operator_input(client, binder, select, chain, "SELECT DISTINCT")?;
-            set_op::emit_distinct_pieces(final_vid, &op_select, src)?
+            // No bound: DISTINCT takes its delta through the shared set-op side
+            // pipeline (`input_delta_tagged`), not the builder's primary source —
+            // and so costs no GET_INDICES probe.
+            let inp = resolve_operator_input(client, binder, select, chain, "SELECT DISTINCT")?;
+            set_op::emit_distinct_pieces(final_vid, &inp.select, inp.src)?
         }
-        ViewShape::GroupBy(select) => {
-            let (src, op_select) = resolve_operator_input(client, binder, select, chain, "GROUP BY")?;
-            group_by::emit_group_by_pieces(client, final_vid, &op_select, src)?
-        }
+        ViewShape::GroupBy(select) => emit_bounded_group_by(client, binder, final_vid, select, chain, "GROUP BY")?,
         // Any join FROM — 2-way, N-way, or self-referential — plans as a left-deep
         // chain; intermediate segments and self-join pass-through wrappers land on
         // `chain`, and the final step is emitted with `final_vid`.
@@ -466,7 +467,8 @@ fn inline_ctes(
         if is_compilable_hidden_body(cte_select) {
             // A later CTE may reference an earlier one, so register immediately.
             let resolved = compile_hidden_body(client, binder, cte_select, &cte.alias.columns, &ctx, chain)?;
-            binder.cache_alias(&cte.alias.name.value, resolved)?;
+            // A chain-minted segment id, not a catalog one: no index bound.
+            binder.cache_alias(&cte.alias.name.value, resolved, false)?;
         } else {
             inline_passthrough_cte(client, cte, cte_select, binder, &ctx, chain)?;
         }
@@ -525,7 +527,8 @@ fn inline_passthrough_cte(
             }));
     if !proj_is_identity {
         let resolved = compile_hidden_body(client, binder, cte_select, &cte.alias.columns, ctx, chain)?;
-        binder.cache_alias(&cte.alias.name.value, resolved)?;
+        // A chain-minted segment id, not a catalog one: no index bound.
+        binder.cache_alias(&cte.alias.name.value, resolved, false)?;
         return Ok(());
     }
     // Apply CTE column aliases (`WITH cte(a, b) AS ...`).
@@ -536,7 +539,10 @@ fn inline_passthrough_cte(
     } else {
         cte_schema
     };
-    binder.cache_alias(&cte.alias.name.value, (cte_tid, cte_schema))?;
+    // The pass-through caches the SOURCE TABLE's real catalog id (column aliasing
+    // renames but never reorders, so index column indices still line up), so a
+    // `WITH c AS (SELECT * FROM t) … WHERE indexed = 5` keeps its bound.
+    binder.cache_alias(&cte.alias.name.value, (cte_tid, cte_schema), true)?;
     Ok(())
 }
 
@@ -576,8 +582,7 @@ fn compile_hidden_body(
     let is_plain_join = !from.joins.is_empty() && !grouped;
     chain.add_segment(client, |client, chain, vid| {
         let (circuit, mut cols, pk) = if grouped {
-            let (src, op_select) = resolve_operator_input(client, binder, select, chain, ctx)?;
-            group_by::emit_group_by_pieces(client, vid, &op_select, src)?
+            emit_bounded_group_by(client, binder, vid, select, chain, ctx)?
         } else if is_plain_join {
             join::plan_join_chain(client, binder, vid, select, chain)?
         } else {
@@ -603,21 +608,60 @@ fn resolve_operator_input(
     select: &Select,
     chain: &mut ViewChain,
     context: &str,
-) -> Result<((u64, Rc<Schema>), Select), GnitzSqlError> {
+) -> Result<OperatorInput, GnitzSqlError> {
     if select.from.len() != 1 {
         return Err(GnitzSqlError::Unsupported(format!(
             "{context}: only a single table without JOINs is supported"
         )));
     }
     let mut op_select = select.clone();
-    let src = if !select.from[0].joins.is_empty() {
+    if !select.from[0].joins.is_empty() {
         op_select.selection = None;
-        compile_join_to_hidden(client, binder, select, chain)?
-    } else {
-        let name = extract_relation_name(&select.from[0].relation, context)?;
-        binder.resolve(client, &name)?
-    };
-    Ok((src, op_select))
+        return Ok(OperatorInput {
+            src: compile_join_to_hidden(client, binder, select, chain)?,
+            select: op_select,
+            src_is_catalog: false,
+        });
+    }
+    let name = extract_relation_name(&select.from[0].relation, context)?;
+    let src = binder.resolve(client, &name)?;
+    Ok(OperatorInput {
+        src,
+        select: op_select,
+        src_is_catalog: binder.is_catalog_relation(&name),
+    })
+}
+
+/// The GROUP BY emission both entry points share: resolve the operator input,
+/// extract its backfill-scan index bound, and emit the grouped circuit.
+fn emit_bounded_group_by(
+    client: &mut GnitzClient,
+    binder: &mut Binder<'_>,
+    vid: u64,
+    select: &Select,
+    chain: &mut ViewChain,
+    ctx: &str,
+) -> Result<EmitPieces, GnitzSqlError> {
+    let inp = resolve_operator_input(client, binder, select, chain, ctx)?;
+    let bound = index_bound::scan_bound_for_input(
+        client,
+        inp.select.selection.as_ref(),
+        (inp.src.0, &inp.src.1),
+        inp.src_is_catalog,
+    )?;
+    group_by::emit_group_by_pieces(client, vid, &inp.select, inp.src, bound)
+}
+
+/// What [`resolve_operator_input`] resolved: the source relation, the `Select` the
+/// operator should evaluate over it, and the source's catalog provenance.
+struct OperatorInput {
+    src: (u64, Rc<Schema>),
+    select: Select,
+    /// True iff `src` is a catalog-issued relation — the index-bound gate,
+    /// computed at the resolve site (see `Binder::is_catalog_relation`). `false`
+    /// on the join path, whose H is a hidden view that cannot own an index and
+    /// whose WHERE the join circuit already consumed.
+    src_is_catalog: bool,
 }
 
 /// Compile every derived table in the query's top-level FROM (the base relation
@@ -684,7 +728,8 @@ fn compile_derived_tables(
     }
     // The final body resolves every sibling; a sibling alias shadows a same-named CTE.
     for (name, resolved) in deferred {
-        binder.cache_alias(&name, resolved)?;
+        // A chain-minted derived-table id, not a catalog one: no index bound.
+        binder.cache_alias(&name, resolved, false)?;
     }
     Ok(())
 }

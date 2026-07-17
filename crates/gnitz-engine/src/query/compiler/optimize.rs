@@ -13,10 +13,10 @@ pub(super) fn first_input(loaded: &LoadedCircuit, nid: i32) -> Option<i32> {
 pub(crate) fn compute_join_shard_map(loaded: &LoadedCircuit) -> JoinShardMap {
     let mut join_shard_map = HashMap::new();
     for (&nid, op) in &loaded.nodes {
-        if let gnitz_wire::OpNode::ScanDelta(tid) = op {
+        if let gnitz_wire::OpNode::ScanDelta { source, .. } = op {
             let rcs = reindex_cols_through_filters(loaded, nid);
             if !rcs.is_empty() {
-                join_shard_map.insert(*tid as i64, rcs);
+                join_shard_map.insert(*source as i64, rcs);
             }
         }
     }

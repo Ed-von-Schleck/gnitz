@@ -13,7 +13,7 @@
 mod insert;
 mod mutate;
 mod overlay;
-mod plan;
+pub(crate) mod plan;
 mod rmw;
 mod select;
 

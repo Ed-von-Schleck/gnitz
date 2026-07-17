@@ -45,9 +45,9 @@ impl Circuit {
         // preserves the first-wins ordering of the prior HashSet-insert filter.
         let mut deps: Vec<TableId> = Vec::new();
         for op in self.nodes.values() {
-            if let OpNode::ScanDelta(tid) = op {
-                if !deps.contains(tid) {
-                    deps.push(*tid);
+            if let OpNode::ScanDelta { source, .. } = op {
+                if !deps.contains(source) {
+                    deps.push(*source);
                 }
             }
         }
@@ -154,7 +154,19 @@ impl CircuitBuilder {
     /// construction. Replaces the legacy "SCAN_TRACE with source=0 +
     /// dependency lookup" trick.
     pub fn input_delta(&mut self) -> NodeId {
-        self.alloc_node(OpNode::ScanDelta(self.primary_source_id))
+        self.input_delta_bounded(None)
+    }
+
+    /// Primary delta input whose **backfill scan** is bounded to a secondary-index
+    /// range. Identical to [`Self::input_delta`] except that the initial
+    /// full-source scan reads only the index range; steady-state deltas ignore the
+    /// bound entirely. The caller still emits the full `Filter` downstream — the
+    /// bound narrows what is read, never what the view contains.
+    pub fn input_delta_bounded(&mut self, bound: Option<gnitz_wire::ScanBound>) -> NodeId {
+        self.alloc_node(OpNode::ScanDelta {
+            source: self.primary_source_id,
+            bound,
+        })
     }
 
     /// Read-only trace source for a join trace port. Never participates in
@@ -166,7 +178,10 @@ impl CircuitBuilder {
     /// Tagged secondary delta input for multi-input views (e.g. equijoin).
     /// `source_table_id` becomes a real dependency.
     pub fn input_delta_tagged(&mut self, source_table_id: u64) -> NodeId {
-        self.alloc_node(OpNode::ScanDelta(source_table_id))
+        self.alloc_node(OpNode::ScanDelta {
+            source: source_table_id,
+            bound: None,
+        })
     }
 
     pub fn filter(&mut self, input: NodeId, expr: Option<ExprProgram>) -> NodeId {

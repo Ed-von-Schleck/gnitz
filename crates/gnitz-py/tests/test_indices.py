@@ -2470,3 +2470,153 @@ class TestChunkedReplyTrains:
             assert q("SELECT * FROM t WHERE x = 1") == list(range(7, n, 2))
         finally:
             _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])
+
+
+# ---------------------------------------------------------------------------
+# TestIndexBoundPushdown — the index bound pushed into a circuit's backfill scan
+# ---------------------------------------------------------------------------
+#
+# The bound is a physical access hint: the circuit's Filter carries the full
+# predicate either way, so a bounded build and an unbounded one must agree on
+# rows AND weights. Each test therefore compares against the same query planned
+# without an index. Run at GNITZ_WORKERS=4 these also guard the co-location
+# claim the bound rests on — an index circuit shadows only its own worker's base
+# slice, so a bounded scan that needed a cross-worker gather would lose rows.
+
+
+def _grouped(client, sn, sql):
+    """Sorted (group, aggregate) tuples from a grouped SELECT."""
+    return _result_rows(client.execute_sql(sql, schema_name=sn))
+
+
+class TestIndexBoundPushdown:
+    def test_groupby_bounded_matches_unbounded(self, client):
+        """An ad-hoc GROUP BY over an indexed WHERE returns exactly what the
+        same query returns with no index to bound on."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL,"
+                " v BIGINT NOT NULL, ind BIGINT NOT NULL)", schema_name=sn)
+            n = 2000
+            _insert_rows(client, sn,
+                         [(i, i % 7, i * 3, i % 11) for i in range(n)], chunk=500)
+            q = "SELECT g, SUM(v) AS s FROM t WHERE ind = 4 GROUP BY g"
+            unbounded = _grouped(client, sn, q)
+            assert unbounded, "the fixture must match some rows"
+
+            client.execute_sql("CREATE INDEX ON t(ind)", schema_name=sn)
+            assert _grouped(client, sn, q) == unbounded, \
+                "a bounded backfill scan must not change the aggregate"
+
+            # A range bound, likewise. 1/11 of rows per `ind` value, so
+            # `ind < 2` is ~2/11 — inside the selectivity gate.
+            qr = "SELECT g, COUNT(*) AS c FROM t WHERE ind < 2 GROUP BY g"
+            assert _grouped(client, sn, qr) == sorted(
+                (i % 7, sum(1 for k in range(n) if k % 7 == i % 7 and k % 11 < 2))
+                for i in range(7))
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_ind"], tables=["t"])
+
+    def test_create_view_bounded_matches_unbounded(self, client):
+        """A CREATE VIEW backfill over an indexed WHERE materialises exactly
+        what the unindexed build materialises."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL,"
+                " v BIGINT NOT NULL, ind BIGINT NOT NULL)", schema_name=sn)
+            n = 2000
+            _insert_rows(client, sn,
+                         [(i, i % 7, i * 3, i % 11) for i in range(n)], chunk=500)
+            # Built BEFORE the index exists: no bound.
+            client.execute_sql(
+                "CREATE VIEW v_plain AS SELECT g, SUM(v) AS s FROM t"
+                " WHERE ind = 4 GROUP BY g", schema_name=sn)
+            plain = _grouped(client, sn, "SELECT * FROM v_plain")
+
+            client.execute_sql("CREATE INDEX ON t(ind)", schema_name=sn)
+            # Built AFTER: its backfill takes the bounded scan.
+            client.execute_sql(
+                "CREATE VIEW v_bound AS SELECT g, SUM(v) AS s FROM t"
+                " WHERE ind = 4 GROUP BY g", schema_name=sn)
+            assert _grouped(client, sn, "SELECT * FROM v_bound") == plain
+
+            # Steady state: a push FAILING the index predicate must be dropped by
+            # the Filter, and one PASSING it must land — the bound is consulted
+            # only at backfill, so maintenance is unchanged.
+            _insert_rows(client, sn, [(n, 0, 100, 5), (n + 1, 0, 1000, 4)])
+            after = dict(_grouped(client, sn, "SELECT * FROM v_bound"))
+            assert after[0] == dict(plain)[0] + 1000, \
+                "the matching push must maintain the bounded view; the other must not"
+        finally:
+            _drop_all(client, sn, views=["v_bound", "v_plain"],
+                      indices=[f"{sn}__t__idx_ind"], tables=["t"])
+
+    def test_null_indexed_column_returned_by_neither_build(self, client):
+        """A NULL-valued row is absent from the index, so a bounded scan can
+        never return it — and under 3VL the Filter drops it too. Both builds
+        must agree."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL,"
+                " ind BIGINT)", schema_name=sn)
+            rows = [(i, i % 3, i % 5) for i in range(300)]
+            rows += [(300 + i, i % 3, "NULL") for i in range(30)]
+            _insert_rows(client, sn, rows)
+            q = "SELECT g, COUNT(*) AS c FROM t WHERE ind >= 0 GROUP BY g"
+            unbounded = _grouped(client, sn, q)
+
+            client.execute_sql("CREATE INDEX ON t(ind)", schema_name=sn)
+            assert _grouped(client, sn, q) == unbounded
+            # The NULL rows are in neither: 300 non-NULL rows over 3 groups.
+            assert sum(c for _, c in unbounded) == 300
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_ind"], tables=["t"])
+
+    def test_dropped_index_falls_back_to_full_scan(self, client):
+        """A view whose plan named an index that is later dropped still builds
+        correctly — the engine degrades to a full scan."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL,"
+                " ind BIGINT NOT NULL)", schema_name=sn)
+            _insert_rows(client, sn, [(i, i % 4, i % 9) for i in range(400)])
+            client.execute_sql("CREATE INDEX ON t(ind)", schema_name=sn)
+            q = "SELECT g, COUNT(*) AS c FROM t WHERE ind = 3 GROUP BY g"
+            bounded = _grouped(client, sn, q)
+
+            client.execute_sql(f"DROP INDEX {sn}__t__idx_ind", schema_name=sn)
+            assert _grouped(client, sn, q) == bounded, \
+                "dropping the index must fall back to a full scan, not lose rows"
+        finally:
+            _drop_all(client, sn, tables=["t"])
+
+    def test_replicated_global_aggregate_grounds_on_empty_range(self, client):
+        """A replicated base's global COUNT(*) is the shape that reaches
+        `backfill_view`, and an unmatched WHERE makes its range provably empty.
+        The ground row must still be minted: COUNT(*) = 0, one row."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, ind BIGINT NOT NULL)"
+                " WITH (replicated = true)", schema_name=sn)
+            _insert_rows(client, sn, [(i, i % 5) for i in range(100)])
+            client.execute_sql("CREATE INDEX ON t(ind)", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW mv AS SELECT COUNT(*) AS c FROM t WHERE ind = 999",
+                schema_name=sn)
+            res = client.execute_sql("SELECT * FROM mv", schema_name=sn)
+            rows = [r for r in res[0]["rows"] if r.weight > 0]
+            assert len(rows) == 1, "an empty range must still seed the ground row"
+            assert rows[0][0] == 0
+        finally:
+            _drop_all(client, sn, views=["mv"],
+                      indices=[f"{sn}__t__idx_ind"], tables=["t"])
