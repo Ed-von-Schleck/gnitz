@@ -146,6 +146,39 @@ pub(crate) fn build_projection(
     projection: &[SelectItem],
     source_schema: &Schema,
 ) -> Result<(Vec<ProjItem>, Vec<ColumnDef>), GnitzSqlError> {
+    let (mut items, mut out_cols) = resolve_projection_items(projection, source_schema)?;
+    place_pk_front(&mut items, &mut out_cols, source_schema);
+    Ok((items, out_cols))
+}
+
+/// Build the projected `(items, out_cols)` for the **ad-hoc read path**
+/// (`plan_read_spec`): the full source PK is **always hidden-prepended** to slots
+/// `0..k`, and every SELECT item — a projected PK column included — is a payload
+/// slot in SELECT order (materialized by a `COPY_COL` / computed `EMIT`). Unlike
+/// [`build_projection`]'s `place_pk_front` (which *promotes* a projected PK to
+/// the visible front, CREATE VIEW behavior), this preserves the user's column
+/// order (`SELECT a, id` stays `[a, id]`) and never rejects a PK-dropping
+/// projection — the physical key rides hidden.
+pub(crate) fn build_read_projection(
+    projection: &[SelectItem],
+    source_schema: &Schema,
+) -> Result<(Vec<ProjItem>, Vec<ColumnDef>), GnitzSqlError> {
+    let (mut items, mut out_cols) = resolve_projection_items(projection, source_schema)?;
+    for (target, &pk) in source_schema.pk_indices().iter().enumerate() {
+        items.insert(target, ProjItem::PassThrough { src_col: pk });
+        out_cols.insert(target, source_schema.columns[pk].clone().hidden());
+    }
+    Ok((items, out_cols))
+}
+
+/// Resolve every SELECT item into `(ProjItem, ColumnDef)` in SELECT order,
+/// expanding `SELECT *` (honoring `EXCEPT`/`EXCLUDE`/`RENAME`, rejecting
+/// `REPLACE`/`ILIKE`). PK placement is the caller's (view: `place_pk_front`;
+/// read path: hidden-prepend).
+fn resolve_projection_items(
+    projection: &[SelectItem],
+    source_schema: &Schema,
+) -> Result<(Vec<ProjItem>, Vec<ColumnDef>), GnitzSqlError> {
     let mut items: Vec<ProjItem> = Vec::new();
     let mut out_cols: Vec<ColumnDef> = Vec::new();
 
@@ -183,6 +216,5 @@ pub(crate) fn build_projection(
         }
     }
 
-    place_pk_front(&mut items, &mut out_cols, source_schema);
     Ok((items, out_cols))
 }

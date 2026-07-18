@@ -23,6 +23,7 @@ mod german_string;
 mod handshake;
 mod pk;
 mod range;
+mod read_spec;
 mod types;
 mod uuid;
 
@@ -38,6 +39,7 @@ pub use german_string::*;
 pub use handshake::*;
 pub use pk::*;
 pub use range::*;
+pub use read_spec::*;
 pub use types::*;
 pub use uuid::*;
 // Flat-export `wal`'s constants (referenced everywhere) but not its framer

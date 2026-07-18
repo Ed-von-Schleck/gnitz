@@ -341,19 +341,25 @@ fn debug_env_usize(var: &str) -> Option<usize> {
 /// synthetic schema — Gather's projection, HasPk UniqueIndex's index schema —
 /// whose block is built fresh per reply: serving the table's cached block for
 /// those would make the master decode the frames with the table's row stride,
-/// and caching them would poison the table's block.
+/// and caching them would poison the table's block. `Echoed` is a client-echoed
+/// raw wire block (ScanSpec): the block is forwarded verbatim (never rebuilt —
+/// the engine descriptor drops the hidden flags) and is **always included** on
+/// the reply's first frame at version 0, since the cache-bypassing client has
+/// no schema cache to fall back on; the descriptor (its decoded form) drives
+/// only the wire-safe / chunking decision.
 #[derive(Clone, Copy)]
 enum ReplySchema<'a> {
     None,
     Table(&'a SchemaDescriptor),
     OneOff(&'a SchemaDescriptor),
+    Echoed(&'a SchemaDescriptor, &'a [u8]),
 }
 
 impl<'a> ReplySchema<'a> {
     fn descriptor(self) -> Option<&'a SchemaDescriptor> {
         match self {
             ReplySchema::None => None,
-            ReplySchema::Table(s) | ReplySchema::OneOff(s) => Some(s),
+            ReplySchema::Table(s) | ReplySchema::OneOff(s) | ReplySchema::Echoed(s, _) => Some(s),
         }
     }
 }
@@ -427,7 +433,7 @@ impl WorkerProcess {
     /// Decode `seek_col_idx` — `pack_pk_cols(col_indices)`, whose packed flag
     /// (bit 63) is always set, so a real index seek is never 0 — and validate
     /// every column against the table's schema before touching the catalog.
-    /// Shared by the SeekByIndex and SeekByIndexRange arms.
+    /// Used by the SeekByIndex arm.
     fn validated_index_cols(
         &mut self,
         target_id: i64,
@@ -590,8 +596,8 @@ impl WorkerProcess {
     /// | Push              | inline (must)          | inline (must — sal_writer_excl deadlock) |
     /// | Tick              | inline + replay defer  | defer to exchange.deferred_control     |
     /// | SeekByIndex       | inline                 | inline                                 |
-    /// | SeekByIndexRange  | inline                 | inline                                 |
     /// | Seek              | inline                 | inline                                 |
+    /// | ScanSpec          | inline                 | inline                                 |
     /// | Scan              | inline                 | inline                                 |
     ///
     /// Reasons for the non-trivial rules (each cites the bug or
@@ -775,8 +781,8 @@ impl WorkerProcess {
             | (_, SalMessageKind::UniquePreflight)
             | (_, SalMessageKind::Push)
             | (_, SalMessageKind::SeekByIndex)
-            | (_, SalMessageKind::SeekByIndexRange)
             | (_, SalMessageKind::Seek)
+            | (_, SalMessageKind::ScanSpec)
             | (_, SalMessageKind::Scan) => self.run_via_dispatch_inner(kind, target_id, wire),
         }
     }
@@ -1004,27 +1010,6 @@ impl WorkerProcess {
                 )
             }
 
-            SalMessageKind::SeekByIndexRange => {
-                let cols = self.validated_index_cols(target_id, seek_col_idx, "seek_by_index_range")?;
-                // Decode the range descriptor from seek_pk_extra. `decode`
-                // validates the exact length and arity cap at the trust boundary
-                // (mirroring the SeekByIndex `% 16` guard), so a malformed frame
-                // is rejected rather than mis-decoded; the arity check against
-                // the actual column list is the engine method's self-guard,
-                // whose Err surfaces through the same error path below.
-                let desc = gnitz_wire::RangeDescriptor::decode(&seek_pk_extra)
-                    .map_err(|e| format!("seek_by_index_range: {e}"))?;
-                let (result, schema) = self.cat().seek_by_index_range(target_id, cols.as_slice(), &desc)?;
-                self.stream_batch_response(
-                    target_id as u64,
-                    result,
-                    ReplySchema::Table(&schema),
-                    request_id,
-                    client_id,
-                    0,
-                )
-            }
-
             SalMessageKind::Seek => {
                 // The full seek key arrives as the wire pair seek_pk (low ≤16
                 // native bytes) + seek_pk_extra (the 16..stride suffix, empty for
@@ -1057,6 +1042,30 @@ impl WorkerProcess {
                     client_id,
                     client_version,
                     force_fifo,
+                )
+            }
+
+            SalMessageKind::ScanSpec => {
+                // The control block's `seek_pk_extra` bundles the encoded `ReadSpec`
+                // and the client's raw reply-schema wire block. Decode the spec and
+                // the reply schema (a structural decode with the hidden flags dropped
+                // — the engine `SchemaDescriptor` carries none); the raw block is
+                // echoed verbatim on the reply's first frame (`ReplySchema::Echoed`,
+                // never rebuilt, never version-gated).
+                let (spec_bytes, reply_block) =
+                    gnitz_wire::unpack_scan_spec_extra(&seek_pk_extra).map_err(|e| format!("scan_spec: {e}"))?;
+                let spec = gnitz_wire::ReadSpec::decode(spec_bytes).map_err(|e| format!("scan_spec: {e}"))?;
+                let reply_schema = ipc::decode_schema_block(reply_block, true)
+                    .map_err(|e| format!("scan_spec: reply schema block: {e}"))?;
+                let keeper = self.cat().scan_spec_family(target_id, &spec, &reply_schema)?;
+                self.send_scan_response(
+                    target_id as u64,
+                    Rc::new(keeper),
+                    ReplySchema::Echoed(&reply_schema, reply_block),
+                    request_id,
+                    client_id,
+                    0,
+                    false,
                 )
             }
 
@@ -2163,8 +2172,8 @@ mod tests {
             SalMessageKind::Push,
             SalMessageKind::Tick,
             SalMessageKind::SeekByIndex,
-            SalMessageKind::SeekByIndexRange,
             SalMessageKind::Seek,
+            SalMessageKind::ScanSpec,
             SalMessageKind::Scan,
         ];
         // Kinds the InEval context MUST defer.

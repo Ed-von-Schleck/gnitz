@@ -180,6 +180,40 @@ impl MasterDispatcher {
         )
     }
 
+    /// Write one ScanSpec (`ReadSpec`) group: the plain-scan shape plus the
+    /// `FLAG_SCAN_SPEC` SAL dispatch flag and the client's bundled spec +
+    /// reply-schema blob forwarded **verbatim** in `seek_pk_extra`. The master
+    /// never decodes the blob (the worker is the sole `ReadSpec`/OPK decoder). The
+    /// embedded group schema block is the target's cached block — harmless, since
+    /// the worker's ScanSpec handler reads the reply schema from `seek_pk_extra`,
+    /// not the group block. `wire_flags = 0`: the worker echoes the client's block
+    /// rather than negotiating a schema version.
+    pub(super) fn write_scan_spec_group(
+        &mut self,
+        target_id: i64,
+        req_ids: &[u64],
+        unicast_worker: i32,
+        client_id: u64,
+        seek_pk_extra: &[u8],
+    ) -> Result<(), String> {
+        let (schema, block, _safe, _stride) = self.cached_schema_block(target_id);
+        self.write_group_with_req_ids(
+            target_id,
+            FLAG_SCAN_SPEC,
+            0,
+            &[],
+            &schema,
+            &[],
+            0,
+            0,
+            req_ids,
+            unicast_worker,
+            client_id,
+            Some(block.as_slice()),
+            seek_pk_extra,
+        )
+    }
+
     /// Encode batch once directly into SAL mmap, replicate to all workers.
     /// `lsn` is supplied by the caller: a DDL zone LSN (`broadcast_ddl`), the
     /// checkpoint generation (FlushEph round), or 0 for command-only groups.
@@ -936,40 +970,7 @@ impl MasterDispatcher {
         .await
     }
 
-    /// SELECT-path ordered range scan over a secondary index: broadcast the range
-    /// descriptor to ALL workers and MERGE every matching base row into one batch.
-    ///
-    /// Differs from `fan_out_seek_by_index_collect_async` only in the
-    /// master→worker leg: the `u32` SAL dispatch flag
-    /// `FLAG_SEEK_BY_INDEX_RANGE_SAL` (so the worker classifies it as
-    /// `SeekByIndexRange`, not a point seek), and the descriptor riding
-    /// `seek_pk_extra` (arbitrary length — this leg is not `PkTuple`-bound; the
-    /// worker is the sole OPK encoder, so the descriptor is forwarded verbatim).
-    /// A range's matches scatter by source PK, so broadcast-and-merge is the
-    /// correct, in-tree mechanism — no range-aware exchange is needed.
-    pub async fn fan_out_seek_by_index_range_collect_async(
-        disp_ptr: *mut MasterDispatcher,
-        reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex<()>>,
-        target_id: i64,
-        seek_col_idx: u64,
-        seek_pk_extra: &[u8],
-    ) -> Result<Option<Batch>, String> {
-        Self::fan_out_index_collect_common(
-            disp_ptr,
-            reactor,
-            sal_excl,
-            target_id,
-            FLAG_SEEK_BY_INDEX_RANGE_SAL,
-            0,
-            seek_col_idx,
-            seek_pk_extra,
-            "seek_by_index_range",
-        )
-        .await
-    }
-
-    /// Shared skeleton of the two broadcast-and-merge index seeks above:
+    /// Shared skeleton of the broadcast-and-merge index seek:
     /// fan one frame out to ALL workers under `sal_flag` and merge every
     /// worker's matching base rows into one batch via the train drain
     /// (an oversized worker reply arrives as a chunked train; a single-frame
@@ -1152,6 +1153,32 @@ impl MasterDispatcher {
         // `send_encoded` — draining the doomed trains would be pure waste. On a
         // fault the client sees its data frames followed by a STATUS_ERROR frame,
         // which `recv_scan_response` handles mid-stream.
+        forward_scan_slots(reactor, peer, slots, &req_ids, unicast).await
+    }
+
+    /// ScanSpec (`ReadSpec`) fan-out — the exact `fan_out_scan_async` shape, but
+    /// the group is written by `write_scan_spec_group` (carrying `FLAG_SCAN_SPEC`
+    /// and the client's verbatim `seek_pk_extra` blob) and there is no schema-
+    /// version negotiation: the worker's reply force-includes the client's echoed
+    /// block, so no per-worker version is threaded. Routing is scan-parity
+    /// (`unicast` = worker-0 for a replicated relation, else broadcast), and the
+    /// reply-train forwarding + error contract are shared with the plain scan.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fan_out_scan_spec_async(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
+        unicast: i32,
+        target_id: i64,
+        client_id: u64,
+        peer: &Peer,
+        seek_pk_extra: &[u8],
+    ) -> Result<bool, String> {
+        let (slots, req_ids, _lease) =
+            dispatch_scan_fanout(disp_ptr, reactor, sal_excl, unicast, |disp, req_ids, unicast| {
+                disp.write_scan_spec_group(target_id, req_ids, unicast, client_id, seek_pk_extra)
+            })
+            .await?;
         forward_scan_slots(reactor, peer, slots, &req_ids, unicast).await
     }
 

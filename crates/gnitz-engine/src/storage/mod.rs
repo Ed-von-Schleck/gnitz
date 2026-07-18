@@ -53,7 +53,7 @@ pub(crate) use lsm::read_cursor::REWIND_CALLS;
 pub(crate) use lsm::read_cursor::{DrainGuard, ReadCursor, DDL_SCAN_CHUNK_ROWS};
 pub(crate) use lsm::spill::{KeyProducer, SpillSort};
 pub(crate) use merge::{BlobCacheGuard, DirectWriter};
-pub(crate) use range_key::{increment_key_in_place, range_cut_points};
+pub(crate) use range_key::{range_cut_points, range_keys_from_cuts};
 
 /// Convert a path string to a `CString`, mapping an interior NUL to
 /// `InvalidPath` — the one conversion every storage path takes.

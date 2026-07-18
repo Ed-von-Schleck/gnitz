@@ -11,6 +11,12 @@ fn names(s: &gnitz_core::Schema) -> Vec<String> {
     s.columns.iter().map(|c| c.name.to_lowercase()).collect()
 }
 
+/// User-visible column names — the read path hidden-prepends the source PK, so a
+/// direct SELECT's client-facing schema is the visible subset.
+fn visible_names(s: &gnitz_core::Schema) -> Vec<String> {
+    s.visible_columns().map(|(_, c)| c.name.to_lowercase()).collect()
+}
+
 // ── item 40: PK column move must preserve remaining order ─────────────
 
 #[test]
@@ -547,22 +553,24 @@ fn test_direct_select_qualified_alias_and_duplicate_items() {
 
     // Qualified references resolve like bare ones.
     let (s, b) = select_rows(&mut client, &sn, "SELECT t.id, t.a FROM t");
-    assert_eq!(names(&s), vec!["id", "a"]);
+    assert_eq!(visible_names(&s), vec!["id", "a"]);
     assert_eq!(b.len(), 2);
 
     // An alias renames the output column.
     let (s, _) = select_rows(&mut client, &sn, "SELECT id, a AS x FROM t");
-    assert_eq!(names(&s), vec!["id", "x"]);
+    assert_eq!(visible_names(&s), vec!["id", "x"]);
 
     // One output column per projection item: `a, a` yields two `a` columns
     // carrying identical data.
     let (s, b) = select_rows(&mut client, &sn, "SELECT id, a, a FROM t");
-    assert_eq!(names(&s), vec!["id", "a", "a"]);
+    assert_eq!(visible_names(&s), vec!["id", "a", "a"]);
     assert_eq!(b.len(), 2);
+    // Physical columns: [id(hidden PK), id, a, a] — the two `a` copies are the
+    // last two, and must carry identical data.
     for r in 0..b.len() {
         assert_eq!(
-            i64_at(&b, 1, r),
             i64_at(&b, 2, r),
+            i64_at(&b, 3, r),
             "duplicated projection items carry identical data"
         );
     }

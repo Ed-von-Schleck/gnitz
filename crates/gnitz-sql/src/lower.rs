@@ -1,6 +1,5 @@
 use crate::error::GnitzSqlError;
 use crate::ir::{BinOp, BoundExpr, UnaryOp};
-use crate::types::is_wide_int;
 use gnitz_core::ExprBuilder;
 use gnitz_core::Schema;
 
@@ -201,7 +200,7 @@ impl BoundExprBackend for OpcodeBackend<'_> {
         // STRING/BLOB landing here is arithmetic or a mixed-type comparison
         // (`a.s > b.int`) and must error, not load garbage.
         let tc = self.schema.columns[idx].type_code;
-        if is_wide_int(tc) {
+        if tc.is_wide_int() {
             return Err(GnitzSqlError::Unsupported(format!(
                 "column {:?} is {tc:?}; 128-bit columns cannot be used in view \
                  expressions (use a primary-key seek or CREATE INDEX instead)",

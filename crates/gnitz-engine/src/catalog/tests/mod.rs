@@ -6,6 +6,7 @@ mod engine_tests;
 mod fk_tests;
 mod index_tests;
 mod reopen_rebuild_tests;
+mod scan_spec_tests;
 mod source_cursor_tests;
 mod uuid_tests;
 mod wide_pk_validation;

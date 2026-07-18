@@ -206,7 +206,7 @@ fn resolve_where_rows(
             // `pk IN (…)`: the concatenated seek replies ARE the matching rows —
             // no residual; an absent key contributes none, so the count reports
             // rows actually touched.
-            let (schema_opt, committed) = seek_pk_multi(client, tid, schema, &pks, None)?;
+            let (schema_opt, committed) = seek_pk_multi(client, tid, schema, &pks)?;
             let stride = schema.pk_stride() as u8;
             let keys: Vec<PkTuple> = pks.iter().map(|&k| PkTuple::from_u128(stride, k)).collect();
             let net = buffered_keys(client, tid, &keys);

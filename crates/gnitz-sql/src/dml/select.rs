@@ -1,29 +1,32 @@
-//! Direct `SELECT`: route between the thin keyseek path (single table,
-//! bare-column projection, index-served WHERE whose residual the client-side
-//! interpreter can evaluate) and the transient circuit executor (every other
-//! shape — set-ops, JOINs, DISTINCT / GROUP BY / HAVING, computed projections,
-//! CTEs, and typed / non-indexed WHERE). Routing is decided at the exact points
-//! the thin ladder would otherwise hard-error, from the SAME classification the
-//! thin execution then consumes — so a thin verdict can never die later at seek
-//! or row eval, and no classification or index-metadata fetch runs twice.
+//! Direct `SELECT`: route a single-relation, non-aggregate SELECT through the
+//! **parameterized bounded read** (`plan_read_spec` → a `ReadSpec` executed
+//! server-side: bound pushdown, predicate, projection, ORDER BY / LIMIT top-k)
+//! and everything else — set-ops, JOINs, DISTINCT / GROUP BY / HAVING,
+//! aggregates, CTEs — through the transient circuit executor. A shape the read
+//! spec cannot serve (a non-projected ORDER BY key, an aggregate, a subquery in
+//! the projection, a WHERE the expression VM cannot compile) falls back to the
+//! executor, which either handles it or produces the same rejection.
 
-use crate::ast_util::{extract_table_factor_name, group_by_is_present, projection_item_expr, single_relation_col_name};
-use crate::bind::{bind_single_table, Binder};
-use crate::dml::plan::{
-    classify_access, collect_index_range_candidates, collect_index_seek_candidates, extract_limit, extract_offset,
-    first_index_hit, seek_pk_multi, AccessPath, IndexListMemo,
+use crate::ast_util::{
+    extract_table_factor_name, flatten_conjuncts, group_by_is_present, is_bare_wildcard_projection,
+    projection_has_aggregate,
 };
+use crate::bind::{bind_single_table, Binder};
+use crate::codec::project_schema::{build_read_projection, compile_projection_map};
+use crate::dml::plan::{extract_limit, extract_offset, try_extract_pk_in, try_extract_pk_range};
 use crate::error::GnitzSqlError;
-use crate::exec::eval::expr_is_thin;
-use crate::exec::order::{order_limit_passthrough, order_limit_project};
-use crate::exec::residual::residual_filtered;
-use crate::ir::BoundExpr;
+use crate::exec::order::{order_limit_passthrough, read_spec_finish, resolve_read_spec_order};
+use crate::ir::{BinOp, BoundExpr};
+use crate::lower::compile_filter_program;
+use crate::plan::index_bound::best_index_bound;
 use crate::plan::validate::{
     reject_unhonored_query_clauses, reject_unhonored_select_clauses, HonoredClauses, HonoredQueryClauses,
 };
 use crate::SqlResult;
-use gnitz_core::{GnitzClient, PlannedView, Schema};
-use sqlparser::ast::{Expr, LimitClause, Query, SelectItem, SetExpr};
+use gnitz_core::protocol::encode_schema_block;
+use gnitz_core::{GnitzClient, PlannedView, Schema, ZSetBatch};
+use gnitz_wire::{ReadBound, ReadSpec};
+use sqlparser::ast::{Expr, LimitClause, Query, Select, SetExpr};
 
 pub(crate) fn execute_select(
     client: &mut GnitzClient,
@@ -34,7 +37,7 @@ pub(crate) fn execute_select(
     // Envelope guard for BOTH paths: ORDER BY / LIMIT / OFFSET are applied by the
     // client-side ordering sink over either path's fetched batch, and WITH is
     // honored by the executor (CTE inlining — a WITH always routes there below,
-    // so the thin path can never resolve a FROM name a CTE shadows). Everything
+    // so the read-spec path can never resolve a FROM name a CTE shadows). Everything
     // else (FETCH, FOR UPDATE/SHARE, SETTINGS, FORMAT, pipe operators) is
     // rejected up front so neither path silently drops it.
     reject_unhonored_query_clauses(
@@ -55,9 +58,9 @@ pub(crate) fn execute_select(
         }
     }
 
-    // §3 shape routing, from the AST alone: a WITH, a set-op body, a JOIN,
-    // DISTINCT / GROUP BY / HAVING, or a computed projection has no thin
-    // operator and compiles through the executor instead.
+    // Shape routing, from the AST alone: a WITH, a set-op body, a JOIN, DISTINCT
+    // / GROUP BY / HAVING, or an aggregate projection has no read-spec operator
+    // and compiles through the executor instead.
     let select = match query.body.as_ref() {
         SetExpr::Select(s) if query.with.is_none() => s,
         _ => return execute_select_via_executor(client, query, binder),
@@ -67,14 +70,13 @@ pub(crate) fn execute_select(
         || select.distinct.is_some()
         || group_by_is_present(&select.group_by)
         || select.having.is_some()
-        || !projection_is_thin(&select.projection)
+        || projection_has_aggregate(select)
     {
         return execute_select_via_executor(client, query, binder);
     }
 
-    // Thin body-clause guard: WHERE (the ladder below) and the projection are
-    // honored; DISTINCT / grouping routed above; the exotic tail (PREWHERE, TOP,
-    // QUALIFY, …) has no operator on either path and rejects here.
+    // Body-clause guard: WHERE and the projection are honored; DISTINCT / grouping
+    // routed above; the exotic tail (PREWHERE, TOP, QUALIFY, …) rejects here.
     reject_unhonored_select_clauses(
         select,
         HonoredClauses {
@@ -87,159 +89,212 @@ pub(crate) fn execute_select(
 
     let limit = extract_limit(query)?;
     let offset = extract_offset(query)?;
-    let has_order_by = query.order_by.is_some();
 
     let table_name = extract_table_factor_name(&select.from[0].relation, "FROM")?;
     let (tid, schema) = binder.resolve(client, &table_name)?;
 
-    // The WHERE access path, classified ONCE by the shared UPDATE/DELETE
-    // recognizer. Each arm either serves thin or routes to the executor when its
-    // residual is not client-evaluable — decided by binding the residual and
-    // checking the bound IR against exactly what the interpreter runs
-    // (`bind_thin_residuals`), never by a parallel AST walk that could drift.
-    let (schema_out, batch_opt, _) = match classify_access(select.selection.as_ref(), &schema) {
-        AccessPath::ScanAll => client.scan(tid)?,
-        AccessPath::PkMultiSeek { pks } => {
-            // `pk IN (…)` multi-seek: the IN list is the whole top-level WHERE
-            // (`try_extract_pk_in` matches only a bare InList), so no residual
-            // filtering applies and every fetched row is an output row. `row_cap`
-            // early-stops the seek in IN-list order, so it is a pure no-ORDER-BY
-            // fetch optimization: disabled under ORDER BY (which must sort the
-            // full result), else it fetches `offset + limit` rows — enough logical
-            // rows for the window, since every fetched entry has weight 1 here.
-            let row_cap = if has_order_by {
-                None
-            } else {
-                limit.map(|l| l.saturating_add(offset))
-            };
-            let (schema_opt, batch_opt) = seek_pk_multi(client, tid, &schema, &pks, row_cap)?;
-            (schema_opt, batch_opt, 0)
-        }
-        AccessPath::PkSeek { pk, residual } => {
-            let Some(preds) = bind_thin_residuals(&residual, &schema)? else {
-                return execute_select_via_executor(client, query, binder);
-            };
-            let res = client.seek(tid, &pk)?;
-            residual_filtered(&schema, res, &preds)?
-        }
-        AccessPath::Filtered { where_expr } => {
-            // Order: PK equality (above) → range index → equality index →
-            // executor. Try RANGE candidates first so a composite `a = 5 AND
-            // b > 10` uses the (a,b) range scan instead of a bare `a = 5` prefix
-            // seek + in-memory `b > 10` residual. A range candidate is never less
-            // selective than the equality prefix it extends (a full
-            // all-columns-equality match yields no range column, hence no range
-            // candidate), so range-first is strict.
-            //
-            // Each candidate list is pre-filtered to the candidates whose
-            // residual is thin-evaluable — a candidate whose residual the
-            // interpreter cannot run can never be served thin, so attempting its
-            // seek would be wasted I/O ending in a hard error.
+    // A plain `SELECT *` (no EXCEPT/RENAME/… modifiers) with no WHERE / ORDER BY
+    // / LIMIT / OFFSET stays a plain scan (the server's full-scan snapshot cache);
+    // the read spec never emits an identity descriptor. A modifier-bearing
+    // wildcard falls through to `plan_read_spec`, which expands it.
+    let bare_star = is_bare_wildcard_projection(&select.projection);
+    if bare_star && select.selection.is_none() && query.order_by.is_none() && limit.is_none() && offset == 0 {
+        let (schema_out, batch_opt, _) = client.scan(tid)?;
+        let out_schema = schema_out.map(|s| (*s).clone()).unwrap_or_else(|| (*schema).clone());
+        let batch = batch_opt.unwrap_or_else(|| ZSetBatch::new(&out_schema));
+        return Ok(SqlResult::Rows {
+            schema: out_schema,
+            batch,
+        });
+    }
 
-            let mut idx_memo = IndexListMemo::default();
-            let range_cands =
-                collect_index_range_candidates(where_expr, &schema, || idx_memo.get(|| client.table_indexes(tid)))
-                    .map_err(GnitzSqlError::Exec)?;
-            let mut thin_range = Vec::new();
-            for c in range_cands {
-                if let Some(preds) = bind_thin_residuals(&c.residual, &schema)? {
-                    thin_range.push((c, preds));
-                }
-            }
-            let mut hit = match first_index_hit(thin_range, |(c, _)| {
-                client.seek_by_index_range(tid, c.idx_cols.as_slice(), &c.desc)
-            })? {
-                Some(((_, preds), res)) => Some(residual_filtered(&schema, res, &preds)?),
-                None => None,
-            };
+    match plan_read_spec(client, select, query, &schema, tid, limit, offset)? {
+        Some(result) => Ok(result),
+        // A shape the read spec cannot serve (non-projected ORDER BY, subquery /
+        // qualified-wildcard projection, a WHERE the expression VM cannot compile)
+        // routes to the executor, which handles it or re-raises the same error.
+        None => execute_select_via_executor(client, query, binder),
+    }
+}
 
-            if hit.is_none() {
-                let candidates =
-                    collect_index_seek_candidates(where_expr, &schema, || idx_memo.get(|| client.table_indexes(tid)))
-                        .map_err(GnitzSqlError::Exec)?;
-                let mut thin_seek = Vec::new();
-                for (cols, vals, residual) in candidates {
-                    if let Some(preds) = bind_thin_residuals(&residual, &schema)? {
-                        thin_seek.push((cols, vals, preds));
-                    }
-                }
-                if let Some(((_, _, preds), res)) = first_index_hit(thin_seek, |(cols, vals, _)| {
-                    client.seek_by_index(tid, cols.as_slice(), vals)
-                })? {
-                    hit = Some(residual_filtered(&schema, res, &preds)?);
-                }
-            }
+// ---------------------------------------------------------------------------
+// plan_read_spec — the parameterized bounded read
+// ---------------------------------------------------------------------------
 
-            match hit {
-                Some(res) => res,
-                // No index (or no thin-evaluable candidate) serves this WHERE:
-                // the executor runs it as a server-side typed scan + filter.
-                None => return execute_select_via_executor(client, query, binder),
-            }
-        }
+/// Collapse the routing verdict on a fallible planning step: a `Bind` error is
+/// hard (no path could resolve it); any other error routes to the executor,
+/// which serves the shape or re-raises the identical rejection.
+fn hard_or_route<T>(r: Result<T, GnitzSqlError>) -> Result<Option<T>, GnitzSqlError> {
+    match r {
+        Ok(x) => Ok(Some(x)),
+        Err(e @ GnitzSqlError::Bind(_)) => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Build and run a `ReadSpec` for a single-relation, non-aggregate SELECT.
+/// `Ok(Some(result))` = served; `Ok(None)` = route to the executor (a shape the
+/// read spec cannot express); `Err(Bind)` = a hard bind error (unknown column).
+fn plan_read_spec(
+    client: &mut GnitzClient,
+    select: &Select,
+    query: &Query,
+    schema: &Schema,
+    tid: u64,
+    limit: Option<usize>,
+    offset: usize,
+) -> Result<Option<SqlResult>, GnitzSqlError> {
+    // 1. Bound (an access superset) + the conjuncts to re-impose as the predicate.
+    let (bound, pred_exprs) = extract_bound(client, tid, schema, select.selection.as_ref())?;
+
+    // 2. Compile the predicate over the SOURCE schema. `Unsupported` (a wide-int /
+    //    LIKE / string-arithmetic WHERE) routes to the executor, which re-raises
+    //    the identical rejection.
+    let Some(predicate) = hard_or_route(compile_read_spec_predicate(&pred_exprs, schema))? else {
+        return Ok(None);
     };
 
-    // Use the resolved schema for column metadata
-    let actual_schema = schema_out.as_deref().unwrap_or(&*schema);
+    // 3. Projection items — the source PK hidden-prepended to slots `0..k`, then
+    //    every SELECT item as a payload slot in SELECT order. A qualified wildcard
+    //    / subquery / other non-map projection → executor.
+    let Some((mut items, mut out_cols)) = hard_or_route(build_read_projection(&select.projection, schema))? else {
+        return Ok(None);
+    };
+    let k = schema.pk_indices().len();
 
-    // ORDER BY / OFFSET / LIMIT sink: sort the full fetched batch, apply the
-    // multiplicity-aware window, then project. It sorts BEFORE projection so an
-    // ORDER BY key absent from the projected columns still resolves.
-    let (proj_schema, final_batch) = order_limit_project(
-        &select.projection,
-        actual_schema,
-        batch_opt,
+    // 4. ORDER BY keys over the reply columns; a non-projected source column is
+    //    appended as a hidden payload column (so it can still order the result).
+    //    An ORDER BY expression → `Unsupported` (routes; the executor rejects it
+    //    identically).
+    let Some(order) = hard_or_route(resolve_read_spec_order(
+        &mut items,
+        &mut out_cols,
+        schema,
         query.order_by.as_ref(),
-        offset,
-        limit,
-    )?;
+    ))?
+    else {
+        return Ok(None);
+    };
 
-    Ok(SqlResult::Rows {
-        schema: proj_schema,
-        batch: final_batch,
-    })
-}
+    // 5. Reply schema + projection blob (the payload slice `items[k..]`).
+    let reply_schema = Schema::from_parts(out_cols, (0..k).collect())
+        .map_err(|e| GnitzSqlError::Unsupported(format!("read-spec reply schema is invalid: {e}")))?;
+    let projection = compile_projection_map(&items[k..], schema)?.encode();
 
-// ---------------------------------------------------------------------------
-// §3 routing helpers
-// ---------------------------------------------------------------------------
-
-/// True iff every projection item is a shape the thin projection resolver
-/// (`resolve_projection`) accepts, derived from the SAME helpers it consumes so
-/// the verdict cannot drift from the execution: a plain `*` (`tbl.*` is not
-/// resolvable thin), or an expression `single_relation_col_name` recognizes — a
-/// bare `Identifier` or two-part `CompoundIdentifier`, optionally aliased. A
-/// computed expression, function call, aggregate, multi-alias item, or
-/// deeper-qualified reference routes to the executor.
-fn projection_is_thin(items: &[SelectItem]) -> bool {
-    items.iter().all(|item| match projection_item_expr(item) {
-        None => matches!(item, SelectItem::Wildcard(_)),
-        Some(e) => single_relation_col_name(e).is_some(),
-    })
-}
-
-/// Bind residual conjuncts for the thin path, accepting them only when the
-/// interpreter (`exec::eval`) can run every node — probed via `expr_is_thin`,
-/// which shares the interpreter's own `BoundExprBackend` walk. `Ok(Some(preds))`
-/// is both the thin verdict AND the execution plan — the same bound objects
-/// filter the fetched rows, so approve-then-fail drift is impossible.
-/// `Ok(None)` routes to the typed executor: a float / string / U128 / UUID
-/// column or literal, an aggregate, or an expression shape the thin grammar
-/// lacks. A `Bind` error (unknown / ambiguous column) stays a hard error — no
-/// path could resolve it.
-fn bind_thin_residuals(residual: &[&Expr], schema: &Schema) -> Result<Option<Vec<BoundExpr>>, GnitzSqlError> {
-    let mut preds = Vec::with_capacity(residual.len());
-    for &e in residual {
-        match bind_single_table(e, schema) {
-            Ok(b) if expr_is_thin(&b, schema) => preds.push(b),
-            Ok(_) => return Ok(None),
-            Err(e @ GnitzSqlError::Bind(_)) => return Err(e),
-            Err(_) => return Ok(None),
-        }
+    // `LIMIT 0` short-circuits to an empty result — no request dispatched.
+    if limit == Some(0) {
+        let batch = ZSetBatch::new(&reply_schema);
+        return Ok(Some(SqlResult::Rows {
+            schema: reply_schema,
+            batch,
+        }));
     }
-    Ok(Some(preds))
+    // OFFSET+LIMIT logical rows; `0` = unbounded (an OFFSET with no LIMIT too).
+    let limit_k = limit.map(|l| l.saturating_add(offset) as u64).unwrap_or(0);
+
+    // 6. Ship the spec + the reply-schema wire block (with hidden flags).
+    let reply_block = encode_schema_block(&reply_schema, tid as u32);
+    let spec = ReadSpec {
+        bound,
+        predicate,
+        projection,
+        order,
+        limit_k,
+    };
+    let (recv_schema, batch) = client
+        .scan_spec(tid, &spec.encode(), &reply_block)
+        .map_err(GnitzSqlError::Exec)?;
+
+    // 7. Client finish: sort the concatenation by the wire keys, window, present.
+    //    Decode against the echoed schema (the batch's own layout), falling back
+    //    to the block we built.
+    let out_schema = recv_schema.map(|s| (*s).clone()).unwrap_or(reply_schema);
+    let batch = batch.unwrap_or_else(|| ZSetBatch::new(&out_schema));
+    let (schema, batch) = read_spec_finish(out_schema, batch, &spec.order, offset, limit);
+    Ok(Some(SqlResult::Rows { schema, batch }))
 }
 
+/// Extract the `ReadBound` and the WHERE conjuncts to re-impose as the
+/// server-side predicate. The predicate is: empty for `PkSet` (the gather is
+/// exact); the extractor's residual for `PkRange` and a wide-int `IndexRange`
+/// (byte-exact walks — consumed conjuncts are applied exactly and stripped);
+/// and the whole WHERE for `None` and a ≤8-byte-int `IndexRange` (whose
+/// selectivity gate may degrade the bound to a full cursor).
+fn extract_bound<'e>(
+    client: &mut GnitzClient,
+    tid: u64,
+    schema: &Schema,
+    where_expr: Option<&'e Expr>,
+) -> Result<(ReadBound, Vec<&'e Expr>), GnitzSqlError> {
+    let Some(we) = where_expr else {
+        return Ok((ReadBound::None, Vec::new()));
+    };
+    let mut all_conjuncts = Vec::new();
+    flatten_conjuncts(we, &mut all_conjuncts);
+
+    // `pk IN (…)` → an exact gather (empty predicate). Keys ship deduplicated
+    // (`try_extract_pk_in`) in whatever order the list gave them — the worker
+    // OPK-sorts before its forward sweep, so wire order is irrelevant.
+    if let Some(keys) = try_extract_pk_in(we, schema) {
+        if keys.len() > gnitz_wire::MAX_PK_SET_KEYS {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "pk IN (…) with {} keys exceeds the {}-key limit",
+                keys.len(),
+                gnitz_wire::MAX_PK_SET_KEYS
+            )));
+        }
+        return Ok((ReadBound::PkSet(keys), Vec::new()));
+    }
+
+    // A PK equality / range → a byte-exact bounded PK walk; the residual (the
+    // WHERE minus every conjunct the walk applies exactly — equalities and
+    // consumed range cuts alike) is the predicate. Exactness at any PK width
+    // is what serves a wide (U128) PK range without the predicate VM.
+    if let Some((desc, residual)) = try_extract_pk_range(we, schema) {
+        return Ok((ReadBound::PkRange(desc), residual));
+    }
+
+    // The best secondary-index bound, keeping its residual. The walk gating is
+    // the worker's own decision, derived from the range column's type
+    // (`TypeCode::is_wide_int` — the shared authority): a wide-int bound runs
+    // the byte-exact walk, so the candidate's residual (the WHERE minus the
+    // consumed conjuncts, which the VM could not compile anyway) is the
+    // predicate; a narrow bound may be gate-degraded to a full cursor, so the
+    // whole WHERE stays the predicate.
+    if let Some(c) = best_index_bound(we, schema, || client.table_indexes(tid))? {
+        let range_col = c.idx_cols.as_slice()[c.desc.eq_vals().len()] as usize;
+        let wide = schema.columns[range_col].type_code.is_wide_int();
+        let bound = ReadBound::IndexRange {
+            idx_cols: gnitz_wire::pack_pk_cols(c.idx_cols.as_slice()),
+            desc: c.desc,
+        };
+        let pred = if wide { c.residual } else { all_conjuncts };
+        return Ok((bound, pred));
+    }
+
+    Ok((ReadBound::None, all_conjuncts))
+}
+
+/// Bind + AND-combine `exprs`, compile to the wire predicate blob. Empty input or
+/// a statically-true predicate → an empty blob (the bound is exact).
+fn compile_read_spec_predicate(exprs: &[&Expr], schema: &Schema) -> Result<Vec<u8>, GnitzSqlError> {
+    let Some((first, rest)) = exprs.split_first() else {
+        return Ok(Vec::new());
+    };
+    let mut bound = bind_single_table(first, schema)?;
+    for &e in rest {
+        let next = bind_single_table(e, schema)?;
+        bound = BoundExpr::BinOp(Box::new(bound), BinOp::And, Box::new(next));
+    }
+    match compile_filter_program(&bound, schema)? {
+        Some(prog) => Ok(prog.encode()),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Resolve the ORDER BY clause to wire `OrderKey`s over the (server-projected)
+/// reply columns, **appending any non-projected source column as a hidden payload
+/// column** so it can order the result (§ the read path sorts server-side over a
 /// The executor branch: compile the SELECT into the same circuit a CREATE VIEW
 /// would build, run it once as a transient, and apply the shared client-side
 /// ordering sink (ORDER BY / OFFSET / LIMIT) over the streamed result. The

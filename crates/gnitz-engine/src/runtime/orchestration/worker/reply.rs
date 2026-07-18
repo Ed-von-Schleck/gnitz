@@ -69,10 +69,11 @@ impl WorkerProcess {
     }
 
     /// Reply schema wire block: the table's cached block for `Table`, a
-    /// one-off (never cached) block for `OneOff`. Returns the block, the
-    /// table's schema version, and the schema's wire-safety
-    /// (`(None, 0, true)` for `ReplySchema::None`) — `Table` reads the
-    /// cached wire-safe bit instead of recomputing it per reply.
+    /// one-off (never cached) block for `OneOff`, the verbatim client bytes at
+    /// version 0 for `Echoed`. Returns the block, the schema version, and the
+    /// schema's wire-safety (`(None, 0, true)` for `ReplySchema::None`) —
+    /// `Table` reads the cached wire-safe bit instead of recomputing it per
+    /// reply.
     fn reply_schema_block(&mut self, tid_key: i64, schema: ReplySchema<'_>) -> (Option<Rc<Vec<u8>>>, u16, bool) {
         match schema {
             ReplySchema::None => (None, 0, true),
@@ -84,6 +85,7 @@ impl WorkerProcess {
                 let e = ipc::get_or_build_schema_wire_block(self.cat(), tid_key, s);
                 (Some(e.entry.block), e.version, e.entry.wire_safe)
             }
+            ReplySchema::Echoed(s, block) => (Some(Rc::new(block.to_vec())), 0, schema_wire_safe(s)),
         }
     }
 
@@ -243,9 +245,13 @@ impl WorkerProcess {
         let tid_key = target_id as i64;
         // Obtain prebuilt schema block + server version. include_schema controls
         // whether the first frame carries a schema block; server_version is always
-        // embedded in wire_flags so the client can cache/verify.
+        // embedded in wire_flags so the client can cache/verify. An echoed block
+        // is never version-gated: the cache-bypassing ScanSpec client decodes
+        // every frame against the first frame's block, with no cache to miss to.
         let (block_rc, server_version, is_wire_safe) = self.reply_schema_block(tid_key, schema);
-        let prebuilt_rc = block_rc.filter(|_| gnitz_wire::wire_should_include_schema(client_version, server_version));
+        let always_include = matches!(schema, ReplySchema::Echoed(..));
+        let prebuilt_rc = block_rc
+            .filter(|_| always_include || gnitz_wire::wire_should_include_schema(client_version, server_version));
         let schema_version_flags = gnitz_wire::wire_flags_set_schema_version(0, server_version);
 
         // When schema omission is in effect (prebuilt_rc=None), pass schema=None to

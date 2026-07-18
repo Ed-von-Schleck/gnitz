@@ -1087,18 +1087,12 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
         .await;
         return;
     }
-    if flags & gnitz_wire::FLAG_SEEK_BY_INDEX_RANGE != 0 {
-        let _g = shared.catalog_rwlock.read().await;
-        handle_seek_by_index_range(
-            shared,
-            peer,
-            client_id,
-            target_id,
-            decoded.control.seek_col_idx,   // pack_pk_cols(col_indices)
-            &decoded.control.seek_pk_extra, // encoded RangeDescriptor
-            client_version,
-        )
-        .await;
+    // ScanSpec must be routed before the generic empty-batch scan dispatch below
+    // (a `ReadSpec` request carries an empty batch, so target_id alone would route
+    // it to the plain-scan fallthrough). Like `handle_scan` it drains view ticks
+    // inside `drain_then_lock`, so it takes no dispatch-level lock here.
+    if flags & gnitz_wire::FLAG_SCAN_SPEC != 0 {
+        handle_scan_spec(shared, peer, client_id, target_id, &decoded.control.seek_pk_extra).await;
         return;
     }
 
@@ -1651,63 +1645,6 @@ async fn handle_seek_by_index(
     }
 }
 
-/// SELECT-path ordered range scan over a secondary index. Validate the column
-/// list, confirm an index on it exists (else STATUS_NO_INDEX, like
-/// `handle_seek_by_index`), then broadcast the range descriptor to all
-/// workers and merge — a range's matches scatter by source PK, so there is no
-/// single-worker fast path. The descriptor is forwarded verbatim (the worker is
-/// the sole OPK encoder).
-async fn handle_seek_by_index_range(
-    shared: &Rc<Shared>,
-    peer: &Peer,
-    client_id: u64,
-    target_id: i64,
-    seek_col_idx: u64,
-    seek_pk_extra: &[u8],
-    client_version: u16,
-) {
-    if reject_unknown_table(shared, peer, client_id, target_id).await {
-        return;
-    }
-    if target_id < FIRST_USER_TABLE_ID {
-        let msg = format!("SEEK_BY_INDEX_RANGE on system table {target_id} is not supported");
-        send_error(peer, target_id, client_id, msg.as_bytes()).await;
-        return;
-    }
-    let cols = match validated_index_cols(shared, target_id, seek_col_idx, "seek_by_index_range") {
-        Ok(cols) => cols,
-        Err(msg) => {
-            send_error(peer, target_id, client_id, msg.as_bytes()).await;
-            return;
-        }
-    };
-    // Confirm a secondary index on this exact column list exists. `.is_some()`
-    // copies a bool out, so no catalog borrow is held across the await below.
-    let has_index = shared
-        .cat()
-        .index_circuit_for_cols(target_id, cols.as_slice())
-        .is_some();
-    if !has_index {
-        send_control_only(peer, target_id, client_id, STATUS_NO_INDEX).await;
-        return;
-    }
-    match MasterDispatcher::fan_out_seek_by_index_range_collect_async(
-        shared.dispatcher,
-        &shared.reactor,
-        &shared.sal_writer_excl,
-        target_id,
-        seek_col_idx,
-        seek_pk_extra,
-    )
-    .await
-    {
-        Ok(merged) => {
-            send_ok_response(shared, peer, target_id, merged.as_ref(), client_id, 0, client_version).await;
-        }
-        Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
-    }
-}
-
 /// GET_INDICES: serve the client's durable, epoch-validated cache of a table's
 /// secondary-index metadata — the `(col_idx, is_unique)` set, projected from the
 /// DAG `index_circuits` (the system's operative truth for "is this column
@@ -1888,21 +1825,52 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id
         effective_client_version,
     )
     .await;
-    match result {
-        Ok(true) => {
-            let terminal = make_terminal_scan_frame(target_id, client_id, lsn);
-            peer.send_buffer_or_close(terminal).await;
-        }
-        Ok(false) => {
-            peer.close();
-        }
-        Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
-    }
+    finish_scan_fanout(peer, target_id, client_id, lsn, result).await;
 }
 
 fn make_terminal_scan_frame(target_id: i64, client_id: u64, lsn: u64) -> PooledSendBuf {
     // Terminal scan frame: no schema block, no data. Client ignores schema version here.
     encode_response_buffer(target_id, client_id, None, STATUS_OK, b"", None, lsn as u128, 0)
+}
+
+/// Finish one scan-shaped fan-out: `Ok(true)` → the terminal frame (stamped
+/// with the pre-dispatch `lsn`), `Ok(false)` → the forward already failed
+/// (close the peer), `Err` → the error frame. Shared by the plain scan and the
+/// ScanSpec handler.
+async fn finish_scan_fanout(peer: &Peer, target_id: i64, client_id: u64, lsn: u64, result: Result<bool, String>) {
+    match result {
+        Ok(true) => {
+            let terminal = make_terminal_scan_frame(target_id, client_id, lsn);
+            peer.send_buffer_or_close(terminal).await;
+        }
+        Ok(false) => peer.close(),
+        Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
+    }
+}
+
+/// Parameterized bounded read (`ReadSpec`). The scan pipeline, minus schema
+/// negotiation: the reply schema is the client's echoed block, forwarded verbatim
+/// in `seek_pk_extra` and re-emitted by each worker. `drain_then_lock` still
+/// drains a view target's pending ticks first (freshness), and routing/terminal-
+/// frame/error handling are identical to `handle_scan`.
+async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64, seek_pk_extra: &[u8]) {
+    let Some(_g) = drain_then_lock(shared, peer, client_id, target_id).await else {
+        return;
+    };
+    let lsn = shared.last_tick_lsn.get();
+    let unicast = replicated_unicast(shared.dispatcher, target_id);
+    let result = MasterDispatcher::fan_out_scan_spec_async(
+        shared.dispatcher,
+        &shared.reactor,
+        &shared.sal_writer_excl,
+        unicast,
+        target_id,
+        client_id,
+        peer,
+        seek_pk_extra,
+    )
+    .await;
+    finish_scan_fanout(peer, target_id, client_id, lsn, result).await;
 }
 
 /// One relation's Phase-1 capture for `scan_multi_body`: its tid and the

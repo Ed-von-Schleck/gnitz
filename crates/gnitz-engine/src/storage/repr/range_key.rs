@@ -1,18 +1,23 @@
 //! Shared range-probe key arithmetic.
 //!
-//! `increment_key_in_place` is the fixed-width byte successor used by both the
-//! single-table secondary-index range scan (`catalog/store.rs`,
-//! `seek_by_index_range`) and the range-join probe (`ops/join.rs`).
+//! `increment_key_in_place` is the fixed-width byte successor used by the
+//! secondary-index range walks, the PK-range read bound, and the range-join
+//! probe (`ops/join.rs`).
+//!
+//! `range_keys_from_cuts` maps a native-`u128` `Cut` pair (a wire
+//! `RangeDescriptor`) to its half-open `[start, end)` OPK key range — the one
+//! derivation behind both the secondary-index range walk (`index_range_keys`)
+//! and the base-PK range bound (`pk_range_keys`), which differ only in how a
+//! cut value encodes to its OPK group prefix.
 //!
 //! `range_cut_points` derives the half-open `[start, end)` byte interval one
 //! range-join term walks over the other side's reindex trace, implementing the
 //! cut-point table for each range relation. It drives off the delta row's
-//! raw OPK PK bytes (eq prefix + range slot) rather than the index scan's
-//! native-`u128` `Cut` values, so the two derivations are not shared — only the
-//! byte successor is.
+//! raw OPK PK bytes (eq prefix + range slot) rather than native-`u128` `Cut`
+//! values, so it shares only the byte successor with the cut derivation.
 
 use crate::schema::key::PkBuf;
-use gnitz_wire::{RangeRel, MAX_PK_BYTES};
+use gnitz_wire::{Cut, RangeDescriptor, RangeRel, MAX_PK_BYTES};
 
 /// Fixed-width byte-string successor: `p + 1` with carry, in place. Returns
 /// `false` when `p` is all-`0xFF` (or empty) — no successor exists at this width
@@ -26,6 +31,45 @@ pub(crate) fn increment_key_in_place(p: &mut [u8]) -> bool {
         }
     }
     false
+}
+
+/// Map `range`'s cut pair to its half-open `[start, end)` OPK key range over a
+/// `stride`-byte key space. `encode(v)` returns the OPK group prefix for cut
+/// value `v` as `([u8; MAX_PK_BYTES], prefix_len)` — the leading `prefix_len`
+/// bytes meaningful, everything after zero, so `group(v)` IS `pad(group(v))`
+/// (the minimum full key of the group). Each cut then maps uniformly:
+///
+/// | cut         | byte key                                                |
+/// |-------------|---------------------------------------------------------|
+/// | `Before(v)` | `pad(group(v))` — below every duplicate of `v`          |
+/// | `After(v)`  | `pad(succ(group(v)))` — above every duplicate of `v`;   |
+/// |             | `succ` overflow ⇒ no key space above the group (`+∞`)   |
+///
+/// `None` = provably empty: a `+∞` start (`After` on a saturated group), or
+/// `start ≥ end` (an inverted / zero-width interval the planner does not
+/// pre-reject). `end == None` inside `Some` means "scan to the table end".
+/// SQL bound semantics (inclusivity, unboundedness, out-of-range saturation)
+/// are resolved to cuts in the planner; none reach this layer.
+pub(crate) fn range_keys_from_cuts(
+    range: &RangeDescriptor,
+    stride: usize,
+    mut encode: impl FnMut(u128) -> ([u8; MAX_PK_BYTES], usize),
+) -> Option<(PkBuf, Option<PkBuf>)> {
+    let mut cut_key = |c: Cut| -> Option<PkBuf> {
+        let (mut k, prefix_len) = encode(c.value());
+        match c {
+            Cut::Before(_) => Some(PkBuf::from_bytes(&k[..stride])),
+            // The carry may ripple into the equality prefix — exactly the first
+            // key of the next equality group.
+            Cut::After(_) => increment_key_in_place(&mut k[..prefix_len]).then(|| PkBuf::from_bytes(&k[..stride])),
+        }
+    };
+    let start = cut_key(range.start)?;
+    let end = cut_key(range.end);
+    if end.as_ref().is_some_and(|e| start.pk_bytes() >= e.pk_bytes()) {
+        return None;
+    }
+    Some((start, end))
 }
 
 /// Half-open `[start, end)` cut points over the trace PK space for one delta

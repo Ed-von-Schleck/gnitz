@@ -9,8 +9,8 @@ use crate::protocol::{
     wire_flags_set_conflict_mode, wire_flags_set_index_version, wire_flags_set_schema_version, ClientTransport,
     Message, PkTuple, ProtocolError, Schema, WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID,
     FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_GET_INDICES,
-    FLAG_PUSH, FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_SEEK_BY_INDEX_RANGE, STATUS_ERROR, STATUS_NO_INDEX,
-    STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
+    FLAG_PUSH, FLAG_SCAN_SPEC, FLAG_SEEK, FLAG_SEEK_BY_INDEX, STATUS_ERROR, STATUS_NO_INDEX, STATUS_SCHEMA_MISMATCH,
+    STATUS_TXN_CONFLICT,
 };
 use lru::LruCache;
 
@@ -323,34 +323,6 @@ impl Session {
         self.recover_schema(table_id, msg)
     }
 
-    /// Ordered range scan over a secondary index, described by `desc` (the
-    /// equality-pinned leading values plus the half-open cut interval on the
-    /// next index column). Arity is validated upstream in
-    /// `GnitzClient::seek_by_index_range`, the single choke point.
-    ///
-    /// The encoded `RangeDescriptor` rides the **explicit** `seek_pk_extra`
-    /// blob (up to 82 bytes at max index arity — over the 64-byte `PkTuple`
-    /// cap), so it goes through `send_message_with_extra`, not `send_message`.
-    pub fn seek_by_index_range(
-        &mut self,
-        table_id: u64,
-        col_indices: &[u32],
-        desc: &gnitz_wire::RangeDescriptor,
-    ) -> ScanResult {
-        let flags = self.versioned_flags(table_id, FLAG_SEEK_BY_INDEX_RANGE);
-        let seek_col_idx = gnitz_wire::pack_pk_cols(col_indices);
-        send_message_with_extra(
-            &mut self.transport,
-            table_id,
-            self.client_id,
-            flags,
-            seek_col_idx,
-            &desc.encode(),
-        )?;
-        let msg = self.recv_checked(table_id)?;
-        self.recover_schema(table_id, msg)
-    }
-
     /// Pure transport for GET_INDICES: send the cached index epoch and receive
     /// the server's reply on a dedicated path — `recv_message(fd, None, ..)`,
     /// never the cache-aware recv — so the per-table `schema_cache` is
@@ -422,14 +394,23 @@ impl Session {
         self.transport.send_framed_batch(parts)
     }
 
-    /// Receive a streaming scan/seek response: reassemble continuation frames,
-    /// absorb any schema block into the cache, and recover the schema from the
-    /// cache if the response was schema-less. Same body as the sync `scan`.
-    pub fn recv_scan(&mut self, target_id: u64) -> ScanResult {
+    /// Reassemble one reply train: receive frames via `recv_one` until the
+    /// terminal (non-continuation) frame, keeping the first in-frame schema and
+    /// concatenating data batches. Status is checked on **every** frame — a
+    /// `STATUS_ERROR` fault frame has flags 0, structurally identical to the
+    /// master's terminal frame, so a flags-only check would silently drop it.
+    /// `recv_one` gets the first frame's schema (`None` until it arrives) as
+    /// the decode hint for hint-driven receivers. Returns
+    /// `(schema, data, terminal seek_pk)` — the scan paths read the terminal
+    /// frame's `seek_pk` as the last-committed LSN.
+    fn drain_reply_train(
+        &mut self,
+        mut recv_one: impl FnMut(&mut Self, Option<&Arc<Schema>>) -> Result<Message, ClientError>,
+    ) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>, u64), ClientError> {
         let mut schema: Option<Arc<Schema>> = None;
         let mut data: Option<ZSetBatch> = None;
         let lsn: u64 = loop {
-            let msg = check_response(self.recv_cached(target_id)?)?;
+            let msg = check_response(recv_one(self, schema.as_ref())?)?;
             let is_continuation = (msg.flags & FLAG_CONTINUATION) != 0;
             schema = schema.or(msg.schema);
             if let Some(batch) = msg.data_batch {
@@ -442,11 +423,58 @@ impl Session {
                 break msg.seek_pk as u64;
             }
         };
+        Ok((schema, data, lsn))
+    }
+
+    /// Receive a streaming scan/seek response: reassemble continuation frames,
+    /// absorb any schema block into the cache, and recover the schema from the
+    /// cache if the response was schema-less. Same body as the sync `scan`.
+    pub fn recv_scan(&mut self, target_id: u64) -> ScanResult {
+        let (mut schema, data, lsn) = self.drain_reply_train(|s, _| s.recv_cached(target_id))?;
         // Warm-cache responses omit the schema block. Recover once from the LRU.
         if schema.is_none() {
             schema = self.schema_cache.get(&target_id).map(|(s, _)| Arc::clone(s));
         }
         Ok((schema, data, lsn))
+    }
+
+    /// Ship a parameterized bounded read (`ReadSpec`) and reassemble its result.
+    /// `spec` is the encoded `ReadSpec`; `reply_block` is the projected reply
+    /// schema's wire block (with hidden flags) — both ride the control block's
+    /// `seek_pk_extra` blob, bundled by [`gnitz_wire::pack_scan_spec_extra`]. The
+    /// master forwards the blob verbatim and each worker echoes `reply_block` back
+    /// on its first frame. Returns the (echoed reply schema, one concatenated
+    /// batch). Like `scan`, it advances no commit watermark and — critically —
+    /// never touches the schema cache (see [`Self::recv_scan_spec`]).
+    pub fn scan_spec(
+        &mut self,
+        target_id: u64,
+        spec: &[u8],
+        reply_block: &[u8],
+    ) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>), ClientError> {
+        let extra = gnitz_wire::pack_scan_spec_extra(spec, reply_block);
+        send_message_with_extra(
+            &mut self.transport,
+            target_id,
+            self.client_id,
+            FLAG_SCAN_SPEC,
+            0,
+            &extra,
+        )?;
+        self.recv_scan_spec()
+    }
+
+    /// Reassemble a ScanSpec reply train, **bypassing the schema cache** entirely:
+    /// a per-query projected schema keyed under the table id would corrupt a later
+    /// plain scan of the same relation. Block-less continuation frames decode
+    /// against the first frame's echoed schema (version 0), NOT the LRU cache —
+    /// the train's running schema is the decode hint.
+    fn recv_scan_spec(&mut self) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>), ClientError> {
+        let (schema, data, _) = self.drain_reply_train(|s, first| {
+            let hint = first.map(|sch| (sch.as_ref(), 0u16));
+            Ok(recv_message(&mut s.transport, hint, s.max_payload_len)?)
+        })?;
+        Ok((schema, data))
     }
 
     /// Receive a single push ACK, absorbing any schema block it carries into
@@ -487,7 +515,7 @@ impl Session {
 
     /// Recover the schema for a single-frame seek response and assemble the
     /// `ScanResult`: prefer the in-frame schema, else fall back to the cache.
-    /// Shared tail of `seek` / `seek_by_index` / `seek_by_index_range`.
+    /// Shared tail of `seek` / `seek_by_index`.
     fn recover_schema(&mut self, target_id: u64, msg: Message) -> ScanResult {
         let schema = msg
             .schema

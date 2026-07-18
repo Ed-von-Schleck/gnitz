@@ -572,8 +572,11 @@ fn test_direct_select_except() {
     );
     exec(&mut client, &sn, "INSERT INTO t VALUES (1, 10, 100), (2, 20, 200)");
     let (s, b) = select_rows(&mut client, &sn, "SELECT * EXCEPT (a) FROM t");
+    // The read path hidden-prepends the source PK, so check the user-visible set.
     assert_eq!(
-        s.columns.iter().map(|c| c.name.to_lowercase()).collect::<Vec<_>>(),
+        s.visible_columns()
+            .map(|(_, c)| c.name.to_lowercase())
+            .collect::<Vec<_>>(),
         vec!["id", "b"],
         "a excluded from direct SELECT result schema"
     );
@@ -595,14 +598,16 @@ fn test_direct_select_rename() {
     exec(&mut client, &sn, "INSERT INTO t VALUES (1, 10)");
     let (s, _) = select_rows(&mut client, &sn, "SELECT * RENAME (a AS x) FROM t");
     assert_eq!(
-        s.columns.iter().map(|c| c.name.to_lowercase()).collect::<Vec<_>>(),
+        s.visible_columns()
+            .map(|(_, c)| c.name.to_lowercase())
+            .collect::<Vec<_>>(),
         vec!["id", "x"],
         "a renamed to x in direct SELECT result schema"
     );
 }
 
 #[test]
-fn test_direct_select_except_pk_rejected() {
+fn test_direct_select_except_pk_hidden() {
     let srv = match ServerHandle::start() {
         Some(s) => s,
         None => return,
@@ -613,12 +618,16 @@ fn test_direct_select_except_pk_rejected() {
         &sn,
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
     );
-    // Direct SELECT has no place_pk_front — dropping the PK hits the same
-    // pre-existing "must include a PRIMARY KEY column" rejection as `SELECT a`.
-    match try_exec(&mut client, &sn, "SELECT * EXCEPT (id) FROM t").unwrap_err() {
-        GnitzSqlError::Unsupported(s) => assert!(s.contains("PRIMARY KEY"), "got: {s}"),
-        e => panic!("expected Unsupported, got {e:?}"),
-    }
+    exec(&mut client, &sn, "INSERT INTO t (id, a) VALUES (1, 10), (2, 20)");
+    // The ad-hoc read path hidden-prepends the source PK, so dropping it from the
+    // projection is allowed (the physical key rides hidden) — only `a` is visible.
+    let res = try_exec(&mut client, &sn, "SELECT * EXCEPT (id) FROM t").unwrap();
+    let gnitz_sql::SqlResult::Rows { schema, batch } = res.into_iter().next().unwrap() else {
+        panic!("expected Rows");
+    };
+    let visible: Vec<&str> = schema.visible_columns().map(|(_, c)| c.name.as_str()).collect();
+    assert_eq!(visible, vec!["a"], "only `a` visible; the PK `id` rides hidden");
+    assert_eq!(batch.len(), 2);
 }
 
 // ── REPLACE / ILIKE rejection (single unbypassable authority) ─────────────────

@@ -241,23 +241,78 @@ pub(crate) fn try_extract_pk_in(expr: &Expr, schema: &Schema) -> Option<Vec<u128
     }
 }
 
-/// Seek every key of a [`AccessPath::PkMultiSeek`] list and concatenate the
-/// replies into one batch: absent keys contribute no rows, so the batch holds
-/// exactly the rows the IN list matches. `row_cap` stops seeking once that many
-/// rows have accumulated (SELECT's LIMIT — every fetched row is an output row
-/// on this path, so further round trips are pure waste).
+/// An **exact-or-superset** PK range for `where_expr` plus the residual — the
+/// WHERE conjuncts the bound does NOT apply, to re-impose as the ScanSpec
+/// predicate. `None` when no PK conjunct bounds the PK.
+///
+/// The PK is treated as its own index: the same collectors and consumption
+/// discipline as [`collect_index_range_candidates`], with eligibility flipped
+/// to PK columns (always non-nullable, so no trailing-nullable rejection) —
+/// consume the leading equality prefix in pk-list order, then bound the next
+/// PK column by its first start/end cuts. The PK walk is **byte-exact at any
+/// width** (`seek_range_bytes`), so every consumed conjunct — equalities and
+/// chosen range cuts alike — is applied exactly by the walk and stripped from
+/// the residual. That is what makes a wide (U128) PK range servable at all:
+/// its conjunct never needs the predicate VM. A half-consumed BETWEEN and any
+/// redundant same-side cut stay residuals (`bound_next_column`'s discipline).
+/// A full/partial equality with no range column left lowers its last pinned
+/// column to a degenerate point.
+pub(crate) fn try_extract_pk_range<'e>(
+    where_expr: &'e Expr,
+    schema: &Schema,
+) -> Option<(RangeDescriptor, Vec<&'e Expr>)> {
+    let pk = schema.pk_indices();
+    let mut conjuncts = Vec::new();
+    flatten_conjuncts(where_expr, &mut conjuncts);
+
+    let eqs = collect_eq_conjuncts(&conjuncts, schema, |col| schema.is_pk_col(col));
+    let pk_cols: Vec<u32> = pk.iter().map(|&c| c as u32).collect();
+    let (mut eq_vals, mut consumed) = consume_leading_eq_prefix(&pk_cols, &eqs);
+
+    if eq_vals.len() < pk.len() {
+        let ends = collect_range_ends(&conjuncts, schema);
+        if let Some((start, end)) = bound_next_column(pk_cols[eq_vals.len()], &ends, schema, &mut consumed) {
+            let desc = RangeDescriptor::new(&eq_vals, start, end);
+            return Some((desc, residual_conjuncts(&conjuncts, &consumed)));
+        }
+    }
+    // No range on the next column (or every PK column pinned): a full/partial
+    // equality. Lower the last pinned column to a degenerate point, else
+    // nothing bounds the PK.
+    let last = eq_vals.pop()?;
+    Some((
+        RangeDescriptor::point(&eq_vals, last),
+        residual_conjuncts(&conjuncts, &consumed),
+    ))
+}
+
+/// Fetch every key of a [`AccessPath::PkMultiSeek`] list — the UPDATE/DELETE
+/// committed-row fetch — as identity ScanSpec `PkSet` gathers (no predicate,
+/// no projection), the same `ReadBound::PkSet` request the SELECT path issues:
+/// one round trip per `MAX_PK_SET_KEYS` chunk instead of one per key. Absent
+/// keys contribute no rows, so the concatenation holds exactly the rows the IN
+/// list matches. `pks` must be deduplicated (`try_extract_pk_in` guarantees
+/// it; the wire decoder rejects duplicates).
 pub(crate) fn seek_pk_multi(
     client: &mut GnitzClient,
     table_id: u64,
     schema: &Schema,
     pks: &[u128],
-    row_cap: Option<usize>,
 ) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>), GnitzSqlError> {
-    let stride = schema.pk_stride() as u8;
+    let reply_block = gnitz_core::protocol::encode_schema_block(schema, table_id as u32);
     let mut reply_schema: Option<Arc<Schema>> = None;
     let mut out: Option<ZSetBatch> = None;
-    for &v in pks {
-        let (schema_opt, batch_opt, _) = client.seek(table_id, &PkTuple::from_u128(stride, v))?;
+    for chunk in pks.chunks(gnitz_wire::MAX_PK_SET_KEYS) {
+        let spec = gnitz_wire::ReadSpec {
+            bound: gnitz_wire::ReadBound::PkSet(chunk.to_vec()),
+            predicate: Vec::new(),
+            projection: Vec::new(),
+            order: Vec::new(),
+            limit_k: 0,
+        };
+        let (schema_opt, batch_opt) = client
+            .scan_spec(table_id, &spec.encode(), &reply_block)
+            .map_err(GnitzSqlError::Exec)?;
         if reply_schema.is_none() {
             reply_schema = schema_opt;
         }
@@ -266,9 +321,6 @@ pub(crate) fn seek_pk_multi(
                 None => out = Some(batch),
                 Some(acc) => acc.extend_from_owned(batch),
             }
-        }
-        if row_cap.is_some_and(|cap| out.as_ref().is_some_and(|b| b.pks.len() >= cap)) {
-            break;
         }
     }
     Ok((reply_schema, out))
@@ -301,8 +353,7 @@ impl IndexListMemo {
 /// Try each index candidate's seek in order, treating `ClientError::NoIndex` as
 /// "try the next candidate". Returns the first hit's `(candidate, reply)` — a
 /// hit with no matching rows is still terminal — or `None` when no candidate's
-/// index exists. The shared loop skeleton of the SELECT range/equality ladders
-/// and the UPDATE/DELETE filtered fetch.
+/// index exists. The loop skeleton of the UPDATE/DELETE filtered fetch.
 pub(crate) fn first_index_hit<C, T>(
     candidates: Vec<C>,
     mut seek: impl FnMut(&C) -> Result<T, ClientError>,
@@ -348,7 +399,7 @@ pub(crate) fn collect_index_seek_candidates<'e>(
     let mut conjuncts = Vec::new();
     flatten_conjuncts(expr, &mut conjuncts);
 
-    let eqs = collect_eq_conjuncts(&conjuncts, schema);
+    let eqs = collect_eq_conjuncts(&conjuncts, schema, |col| index_eligible_col(schema, col));
     if eqs.is_empty() {
         return Ok(Vec::new());
     }
@@ -389,25 +440,31 @@ pub(crate) fn collect_index_seek_candidates<'e>(
     Ok(out)
 }
 
-/// Every `col = literal` equality among `conjuncts`, tagged with its conjunct
-/// index so the residual can exclude exactly the consumed conjuncts. PK columns
-/// and index-ineligible types can never carry a secondary index, so they are
-/// never collected. Shared by the equality and range candidate collectors —
-/// the eligibility rule must stay identical between them.
+/// Every `col = literal` equality among `conjuncts` whose column `eligible`
+/// accepts, tagged with its conjunct index so the residual can exclude exactly
+/// the consumed conjuncts. The index collectors pass
+/// [`index_eligible_col`]; the PK-range extractor passes `is_pk_col`.
 fn collect_eq_conjuncts(
     conjuncts: &[&Expr],
     schema: &Schema,
+    eligible: impl Fn(usize) -> bool,
 ) -> Vec<(usize /*conjunct*/, usize /*col*/, u128 /*key*/)> {
     let mut eqs = Vec::new();
     for (ci, &cand) in conjuncts.iter().enumerate() {
         if let Some((col, key)) = try_col_eq_literal(cand, schema) {
-            let tc = schema.columns[col].type_code;
-            if !schema.is_pk_col(col) && tc.is_pk_eligible() {
+            if eligible(col) {
                 eqs.push((ci, col, key));
             }
         }
     }
     eqs
+}
+
+/// The secondary-index eligibility both index collectors share: PK columns and
+/// index-ineligible types can never carry a secondary index. The rule must
+/// stay identical between the equality and range candidate collectors.
+fn index_eligible_col(schema: &Schema, col: usize) -> bool {
+    !schema.is_pk_col(col) && schema.columns[col].type_code.is_pk_eligible()
 }
 
 /// Consume equality conjuncts as an index's leading columns (leading-prefix
@@ -562,6 +619,66 @@ struct RangeEndEntry {
     end: RangeEnd,
 }
 
+/// Every range end among `conjuncts` (`col OP lit`, flipped forms, desugared
+/// non-negated `BETWEEN`), tagged with its conjunct index. Shared by the index
+/// range collector and the PK-range extractor.
+fn collect_range_ends<'c>(conjuncts: &[&'c Expr], schema: &Schema) -> Vec<RangeEndEntry> {
+    let mut ends: Vec<RangeEndEntry> = Vec::new();
+    for (ci, &cand) in conjuncts.iter().enumerate() {
+        if let Some((col, end)) = try_col_range_literal(cand, schema) {
+            ends.push(RangeEndEntry { conjunct: ci, col, end });
+        } else if let Some((col, both)) = try_col_between(cand, schema) {
+            ends.extend(both.map(|end| RangeEndEntry { conjunct: ci, col, end }));
+        }
+    }
+    ends
+}
+
+/// Bound `range_col` by the FIRST start-side and FIRST end-side cut among
+/// `ends` — never a compare of two packed natives to pick the tighter one (the
+/// cff7c58 trap one layer up; the residual/predicate re-imposes any redundant
+/// same-side end exactly) — widening an unconstrained side to the column
+/// type's edge cut (`Before(min)` / `After(max)` ARE "unbounded": no entry
+/// lies outside the column's type range). Pushes onto `consumed` each range
+/// conjunct whose ends were ALL chosen: a simple `col OP lit` has one end; a
+/// BETWEEN has two sharing one conjunct, and with only one chosen its
+/// un-applied half must stay a residual (else `b > 5 AND b BETWEEN 10 AND 50`
+/// would lose `b >= 10` while seeding the start from `b > 5`). `None` when no
+/// end covers `range_col`, or its type carries no ordered range.
+fn bound_next_column(
+    range_col: u32,
+    ends: &[RangeEndEntry],
+    schema: &Schema,
+    consumed: &mut Vec<usize>,
+) -> Option<(Cut, Cut)> {
+    let start_idx = ends
+        .iter()
+        .position(|e| e.col as u32 == range_col && e.end.side == RangeSide::Start);
+    let end_idx = ends
+        .iter()
+        .position(|e| e.col as u32 == range_col && e.end.side == RangeSide::End);
+    if start_idx.is_none() && end_idx.is_none() {
+        return None;
+    }
+    let tc = schema.columns[range_col as usize].type_code;
+    let (edge_start, edge_end) = Cut::type_edges(tc)?;
+    let start = start_idx.map_or(edge_start, |i| ends[i].end.cut);
+    let end = end_idx.map_or(edge_end, |i| ends[i].end.cut);
+
+    let chosen = [start_idx, end_idx];
+    for cj in chosen.iter().flatten().map(|&i| ends[i].conjunct) {
+        let all_chosen = ends
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.conjunct == cj)
+            .all(|(i, _)| chosen.contains(&Some(i)));
+        if all_chosen && !consumed.contains(&cj) {
+            consumed.push(cj);
+        }
+    }
+    Some((start, end))
+}
+
 /// Recognize a NON-negated `col BETWEEN lo AND hi` (numeric literals only) as
 /// the two range ends it desugars to — `col >= lo` and `col <= hi`. BETWEEN is
 /// a single AST node (`flatten_conjuncts` keeps it whole). A negated BETWEEN
@@ -619,15 +736,8 @@ pub(crate) fn collect_index_range_candidates<'e>(
     // Equality conjuncts (for the leading prefix) and range ends, both tagged
     // with their conjunct index so the residual excludes exactly the consumed
     // conjuncts.
-    let eqs = collect_eq_conjuncts(&conjuncts, schema);
-    let mut ends: Vec<RangeEndEntry> = Vec::new();
-    for (ci, &cand) in conjuncts.iter().enumerate() {
-        if let Some((col, end)) = try_col_range_literal(cand, schema) {
-            ends.push(RangeEndEntry { conjunct: ci, col, end });
-        } else if let Some((col, both)) = try_col_between(cand, schema) {
-            ends.extend(both.map(|end| RangeEndEntry { conjunct: ci, col, end }));
-        }
-    }
+    let eqs = collect_eq_conjuncts(&conjuncts, schema, |col| index_eligible_col(schema, col));
+    let ends = collect_range_ends(&conjuncts, schema);
     // A range candidate needs at least one range end; a pure-equality WHERE is
     // handled by collect_index_seek_candidates, so this costs no wire traffic then.
     if ends.is_empty() {
@@ -646,53 +756,16 @@ pub(crate) fn collect_index_range_candidates<'e>(
         } // no column left to range over
         let range_col = idx_cols[n_eq];
 
-        // First start-side and first end-side cut on the range column become
-        // the interval. Never compare multiple same-side cuts (the cff7c58 trap
-        // one layer up); `apply_residual_filter` trims any redundant same-side end.
-        let start_idx = ends
-            .iter()
-            .position(|e| e.col as u32 == range_col && e.end.side == RangeSide::Start);
-        let end_idx = ends
-            .iter()
-            .position(|e| e.col as u32 == range_col && e.end.side == RangeSide::End);
-        if start_idx.is_none() && end_idx.is_none() {
-            continue;
-        } // range column not covered
-
         // Covered columns are the equality prefix + the range column (n_eq + 1);
         // the leading-prefix safety rejection is shared with the equality path.
         if uncovered_trailing_nullable(idx_cols, n_eq + 1, schema) {
             continue;
         }
 
-        // An unconstrained side widens to the type-edge cut — `Before(min)` /
-        // `After(max)` ARE "unbounded", since no index entry lies outside the
-        // range column's type. (At least one end on this column parsed into
-        // `ends`, so the type is range-servable and the edges exist.)
-        let tc = schema.columns[range_col as usize].type_code;
-        let Some((edge_start, edge_end)) = Cut::type_edges(tc) else {
-            continue;
-        };
-        let start = start_idx.map_or(edge_start, |i| ends[i].end.cut);
-        let end = end_idx.map_or(edge_end, |i| ends[i].end.cut);
-
-        // Consume the range conjuncts whose ends were ALL chosen as bounds. A
-        // simple `col OP lit` has one end; a BETWEEN has two sharing one
-        // conjunct, and with only one chosen its un-applied half must stay a
-        // residual filter (else `b > 5 AND b BETWEEN 10 AND 50` would lose
-        // `b >= 10` while seeding lo from `b > 5`).
-        let chosen = [start_idx, end_idx];
         let mut consumed = eq_consumed;
-        for cj in chosen.iter().flatten().map(|&i| ends[i].conjunct) {
-            let all_chosen = ends
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.conjunct == cj)
-                .all(|(i, _)| chosen.contains(&Some(i)));
-            if all_chosen && !consumed.contains(&cj) {
-                consumed.push(cj);
-            }
-        }
+        let Some((start, end)) = bound_next_column(range_col, &ends, schema, &mut consumed) else {
+            continue; // range column not covered
+        };
 
         out.push(IndexRangeCandidate {
             idx_cols: meta.cols,

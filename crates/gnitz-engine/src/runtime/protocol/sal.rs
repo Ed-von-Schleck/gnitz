@@ -97,6 +97,11 @@ pub const FLAG_PUSH: u32 = gnitz_wire::FLAG_PUSH as u32;
 pub const FLAG_HAS_PK: u32 = gnitz_wire::FLAG_HAS_PK as u32;
 pub const FLAG_SEEK: u32 = gnitz_wire::FLAG_SEEK as u32;
 pub const FLAG_SEEK_BY_INDEX: u32 = gnitz_wire::FLAG_SEEK_BY_INDEX as u32;
+/// Parameterized bounded read (`ReadSpec`). Lives inside the wire SAL flag block
+/// (bit 10) and is carried verbatim from the client wire frame into the SAL group
+/// header — one allocation, mirrored here as a `u32` (unlike the high client-only
+/// request bits, which need a distinct u32 SAL dispatch flag).
+pub const FLAG_SCAN_SPEC: u32 = gnitz_wire::FLAG_SCAN_SPEC as u32;
 pub const FLAG_EXCHANGE_RELAY: u32 = 512;
 pub const FLAG_BACKFILL: u32 = 2048;
 pub const FLAG_TICK: u32 = 4096;
@@ -106,8 +111,7 @@ pub const FLAG_FLUSH: u32 = 16384;
 /// their manifests with the checkpoint generation carried in the group header's
 /// `lsn` field. Dispatched inline in both worker contexts like `FLAG_FLUSH`, but
 /// distinct so the base round (`FLAG_FLUSH`, `SalReplay` user tables) and the
-/// ephemeral round (`Rederive` view state) stay separate handlers. Bit 19 — the
-/// next free bit above `FLAG_SEEK_BY_INDEX_RANGE_SAL` (1<<18).
+/// ephemeral round (`Rederive` view state) stay separate handlers. Bit 19.
 pub const FLAG_FLUSH_EPH: u32 = 1 << 19;
 /// Marks an empty broadcast group as the closing "commit sentinel" of an
 /// atomic zone. All preceding groups at the same LSN belong to the zone;
@@ -129,14 +133,6 @@ pub const FLAG_GATHER: u32 = 65536;
 /// `validate_unique_index_create_async`). Unicast-shaped like a Scan: every
 /// worker gets its own req_id slot and answers with a frame train.
 pub const FLAG_UNIQUE_PREFLIGHT: u32 = 131072;
-/// Ordered range scan over a secondary index (master→worker leg). The
-/// `u32`-space dispatch flag for `SalMessageKind::SeekByIndexRange`; bit 18,
-/// the next free SAL group-header bit above `FLAG_UNIQUE_PREFLIGHT` (1<<17).
-/// Distinct from the client→master `u64` wire flag `FLAG_SEEK_BY_INDEX_RANGE`
-/// (bit 55), which lives among the wire packed fields and is never classified
-/// here. A range seek must fan out (its matches scatter by source PK), so the
-/// worker classifies it from this `u32` flag.
-pub const FLAG_SEEK_BY_INDEX_RANGE_SAL: u32 = 1 << 18;
 
 /// RUN_TRANSIENT master→worker dispatch flag. Drives one `ScanDelta` source of a
 /// transient (ad-hoc query) circuit through one epoch into its RAM-only output
@@ -266,8 +262,8 @@ pub enum SalMessageKind {
     RunTransient,
     DropTransient,
     SeekByIndex,
-    SeekByIndexRange,
     Seek,
+    ScanSpec,
     Scan,
 }
 
@@ -277,8 +273,8 @@ impl SalMessageKind {
     /// Priority order matches the worker's existing if-chain (see
     /// `worker::dispatch_inner`): SHUTDOWN > FLUSH > DDL_SYNC >
     /// RUN_TRANSIENT > DROP_TRANSIENT > EXCHANGE_RELAY > BACKFILL > HAS_PK >
-    /// GATHER > UNIQUE_PREFLIGHT > PUSH > TICK > SEEK_BY_INDEX_RANGE >
-    /// SEEK_BY_INDEX > SEEK > Scan.
+    /// GATHER > UNIQUE_PREFLIGHT > PUSH > TICK >
+    /// SEEK_BY_INDEX > SEEK > SCAN_SPEC > Scan.
     /// The first match wins. (Each kind owns a distinct bit, so the
     /// relative order of the disjoint range/point/seek arms is
     /// immaterial; it tracks the worker's if-chain for readability.)
@@ -322,14 +318,14 @@ impl SalMessageKind {
         if flags & FLAG_TICK != 0 {
             return SalMessageKind::Tick;
         }
-        if flags & FLAG_SEEK_BY_INDEX_RANGE_SAL != 0 {
-            return SalMessageKind::SeekByIndexRange;
-        }
         if flags & FLAG_SEEK_BY_INDEX != 0 {
             return SalMessageKind::SeekByIndex;
         }
         if flags & FLAG_SEEK != 0 {
             return SalMessageKind::Seek;
+        }
+        if flags & FLAG_SCAN_SPEC != 0 {
+            return SalMessageKind::ScanSpec;
         }
         SalMessageKind::Scan
     }
@@ -358,8 +354,8 @@ impl SalMessageKind {
                 | SalMessageKind::UniquePreflight
                 | SalMessageKind::Push
                 | SalMessageKind::SeekByIndex
-                | SalMessageKind::SeekByIndexRange
                 | SalMessageKind::Seek
+                | SalMessageKind::ScanSpec
                 | SalMessageKind::Scan
         )
     }

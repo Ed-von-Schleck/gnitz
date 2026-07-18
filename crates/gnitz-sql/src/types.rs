@@ -80,20 +80,13 @@ pub(crate) fn is_integer_type(tc: TypeCode) -> bool {
     )
 }
 
-/// The 16-byte integer-ish types (U128, UUID, I128) that have no i64 slot: the
-/// engine's payload integer load handles only 1/2/4/8-byte columns, so the
-/// lowerer must reject these in arithmetic/comparison contexts.
-pub(crate) fn is_wide_int(tc: TypeCode) -> bool {
-    matches!(tc, TypeCode::U128 | TypeCode::UUID | TypeCode::I128)
-}
-
 /// Whether MIN/MAX has a correct accumulator path for this column type. Wide
 /// integer-ish types (U128/UUID/I128) have no i64 slot, and STRING/BLOB have no
 /// usable ordering in the i64 comparator (`decode_signed` reads the descriptor
 /// prefix as a garbage signed int). Everything else — narrow and 64-bit ints,
 /// and floats — orders correctly.
 pub(crate) fn is_min_max_orderable(tc: TypeCode) -> bool {
-    !is_wide_int(tc) && !tc.is_german_string()
+    !tc.is_wide_int() && !tc.is_german_string()
 }
 
 /// True iff every value of integer type `child` is representable in integer type

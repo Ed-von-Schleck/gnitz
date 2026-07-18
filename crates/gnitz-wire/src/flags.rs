@@ -21,6 +21,14 @@ pub const FLAG_PUSH: u64 = 32;
 pub const FLAG_HAS_PK: u64 = 64;
 pub const FLAG_SEEK: u64 = 128;
 pub const FLAG_SEEK_BY_INDEX: u64 = 256;
+/// SCAN_SPEC request flag. The client→master leg of a parameterized bounded
+/// read (`ReadSpec`). Unlike the high request bits (GET_INDICES, SEEK_BY_INDEX_
+/// RANGE, …) this lives *inside* the SAL flag block (bits 0-15, `SAL_FLAGS_MASK`)
+/// so it is carried verbatim from the wire frame into the SAL group header — one
+/// allocation, no separate u32 dispatch flag. The engine mirrors it as a `u32`.
+// bit 10 — next free in the 0-15 SAL block (the 512↔2048 gap between the engine's
+// FLAG_EXCHANGE_RELAY (bit 9) and FLAG_BACKFILL (bit 11)).
+pub const FLAG_SCAN_SPEC: u64 = 1 << 10;
 pub const FLAG_HAS_SCHEMA: u64 = 1 << 48;
 pub const FLAG_HAS_DATA: u64 = 1 << 49;
 /// Set on every per-worker scan response frame. Absent on the terminal
@@ -34,16 +42,6 @@ pub const FLAG_CONTINUATION: u64 = 1 << 52;
 /// Bit 54 is the lowest free request bit (50/51/53 are the engine-internal
 /// FLAG_BATCH_SORTED / FLAG_BATCH_CONSOLIDATED / FLAG_SCAN_LAST below).
 pub const FLAG_GET_INDICES: u64 = 1 << 54;
-
-/// SEEK_BY_INDEX_RANGE request flag. The client→master leg of an ordered
-/// range scan over a secondary index. Like GET_INDICES it is a high request
-/// bit (54 taken, 55 the next free) that rides above the SAL mirror and the
-/// bit-16–47 packed fields, so it never collides with a packed field. Unlike
-/// GET_INDICES (answered master-locally) a range seek *fans out* to workers,
-/// so the master→worker leg carries a *separate* `u32` SAL dispatch flag
-/// (`runtime::sal::FLAG_SEEK_BY_INDEX_RANGE_SAL`); this high bit is never
-/// written to the SAL group header.
-pub const FLAG_SEEK_BY_INDEX_RANGE: u64 = 1 << 55;
 
 /// ALLOCATE_SERIAL_RANGE request flag. The client→master leg of a user-table
 /// SERIAL sequence range reservation. Like the other high request bits it rides
@@ -91,9 +89,8 @@ pub const FLAG_SCAN_MULTI: u64 = 1 << 62;
 /// run once as an unregistered, non-durable transient and stream the result.
 /// Purely a wire-level routing hint consumed at `handle_message`; it is NEVER
 /// written to the SAL — the master decodes it, then drives the circuit's sources
-/// with its own engine-internal `runtime::sal::FLAG_RUN_TRANSIENT` (u32) groups,
-/// exactly as `FLAG_SEEK_BY_INDEX_RANGE` (bit 55) maps to the distinct
-/// `FLAG_SEEK_BY_INDEX_RANGE_SAL` (u32) dispatch flag. Bit 63 — the last free
+/// with its own engine-internal `runtime::sal::FLAG_RUN_TRANSIENT` (u32)
+/// dispatch groups. Bit 63 — the last free
 /// client-only bit. It is the sign bit, but `wire_flags` round-trips solely as a
 /// `TypeCode::U64` control-block column (`to_le_bytes`/`read_u64_region`) with no
 /// signed interpretation anywhere, so the high bit is safe.
@@ -222,7 +219,6 @@ const _: () = {
         FLAG_CONTINUATION,
         FLAG_SCAN_LAST,
         FLAG_GET_INDICES,
-        FLAG_SEEK_BY_INDEX_RANGE,
         FLAG_ALLOCATE_SERIAL_RANGE,
         FLAG_DDL_TXN,
         FLAG_ALLOCATE_TABLE_ID,

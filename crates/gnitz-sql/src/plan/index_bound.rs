@@ -8,7 +8,9 @@
 //! the opaque `ExprProgram` blob, where a mistake would be a *narrowing* one:
 //! silently wrong rows.
 
-use crate::dml::plan::{collect_index_range_candidates, collect_index_seek_candidates, IndexListMemo};
+use crate::dml::plan::{
+    collect_index_range_candidates, collect_index_seek_candidates, IndexListMemo, IndexRangeCandidate,
+};
 use crate::error::GnitzSqlError;
 use gnitz_core::{GnitzClient, Schema};
 use gnitz_wire::{Cut, RangeDescriptor, ScanBound};
@@ -57,16 +59,36 @@ pub(crate) fn scan_bound_for_input(
 ///
 /// The merged candidates are ranked by [`pinned_score`] — most-constrained
 /// first — and the head taken outright. There is no residual pre-filter and no
-/// probe: unlike the thin seek path, the caller emits the FULL predicate as the
-/// `Filter`, so each candidate's residual is discarded. Both collectors reject a
-/// candidate with an uncovered nullable trailing column (a NULL in any indexed
-/// column omits the whole row from the index, so such a bound would drop rows the
-/// predicate matches).
+/// probe: the caller emits the FULL predicate as the `Filter`, so each
+/// candidate's residual is discarded. Both collectors reject a candidate with
+/// an uncovered nullable trailing column (a NULL in any indexed column omits
+/// the whole row from the index, so such a bound would drop rows the predicate
+/// matches).
 fn scan_bound_from<F>(
     where_expr: &sqlparser::ast::Expr,
     schema: &Schema,
-    mut fetch: F,
+    fetch: F,
 ) -> Result<Option<ScanBound>, GnitzSqlError>
+where
+    F: FnMut() -> Result<Arc<Vec<gnitz_core::IndexMeta>>, gnitz_core::ClientError>,
+{
+    Ok(best_index_bound(where_expr, schema, fetch)?.map(|c| ScanBound {
+        idx_cols: c.idx_cols,
+        desc: c.desc,
+    }))
+}
+
+/// The best index range/equality bound for `where_expr` as a full
+/// [`IndexRangeCandidate`] — descriptor plus the chosen candidate's residual
+/// (the WHERE conjuncts the bound does not apply). The `ReadSpec` bound
+/// extractor consumes the residual (it becomes the server-side predicate for a
+/// wide-int, byte-exact, conjunct-stripped bound); [`scan_bound_from`] discards
+/// it. One candidate-assembly + ranking site for both.
+pub(crate) fn best_index_bound<'e, F>(
+    where_expr: &'e sqlparser::ast::Expr,
+    schema: &Schema,
+    mut fetch: F,
+) -> Result<Option<IndexRangeCandidate<'e>>, GnitzSqlError>
 where
     F: FnMut() -> Result<Arc<Vec<gnitz_core::IndexMeta>>, gnitz_core::ClientError>,
 {
@@ -76,24 +98,20 @@ where
     let seeks =
         collect_index_seek_candidates(where_expr, schema, || memo.get(&mut fetch)).map_err(GnitzSqlError::Exec)?;
 
-    let mut cands: Vec<ScanBound> = ranges
+    let mut cands: Vec<IndexRangeCandidate> = ranges
         .into_iter()
-        .map(|c| ScanBound {
-            idx_cols: c.idx_cols,
-            desc: c.desc,
-        })
-        .chain(seeks.into_iter().map(|(idx_cols, vals, _residual)| {
+        .chain(seeks.into_iter().map(|(idx_cols, vals, residual)| {
             let n = vals.len();
-            let last = vals[n - 1];
-            ScanBound {
+            IndexRangeCandidate {
                 idx_cols,
-                desc: RangeDescriptor::new(&vals[..n - 1], Cut::Before(last), Cut::After(last)),
+                desc: RangeDescriptor::point(&vals[..n - 1], vals[n - 1]),
+                residual,
             }
         }))
         .collect();
     // Stable sort: on a full tie the range collector's candidate (listed first)
     // wins, matching each collector's own internal preference order.
-    cands.sort_by_key(|b| Reverse(pinned_score(b, schema)));
+    cands.sort_by_key(|c| Reverse(pinned_score(&c.idx_cols, &c.desc, schema)));
     Ok(cands.into_iter().next())
 }
 
@@ -110,15 +128,15 @@ where
 /// unbounded side, so it scores 0. (A point cut on a type-edge value — `a =
 /// u64::MAX` — is indistinguishable from the widened edge and forfeits that
 /// side's credit: a mis-*ranking* only, never a mis-*bound*.)
-fn pinned_score(b: &ScanBound, schema: &Schema) -> (u32, Reverse<usize>) {
-    let n_eq = b.desc.eq_vals().len();
-    let range_col = b.idx_cols.as_slice()[n_eq];
+fn pinned_score(idx_cols: &gnitz_core::PkColList, desc: &RangeDescriptor, schema: &Schema) -> (u32, Reverse<usize>) {
+    let n_eq = desc.eq_vals().len();
+    let range_col = idx_cols.as_slice()[n_eq];
     let sides = match Cut::type_edges(schema.columns[range_col as usize].type_code) {
-        Some((lo, hi)) => (b.desc.start != lo) as u32 + (b.desc.end != hi) as u32,
+        Some((lo, hi)) => (desc.start != lo) as u32 + (desc.end != hi) as u32,
         // Unreachable: both collectors only emit range-servable column types.
         None => 2,
     };
-    (2 * n_eq as u32 + sides, Reverse(b.idx_cols.as_slice().len()))
+    (2 * n_eq as u32 + sides, Reverse(idx_cols.as_slice().len()))
 }
 
 #[cfg(test)]

@@ -147,15 +147,15 @@ class TestBaseTableOrderBy:
 
 
 # ---------------------------------------------------------------------------
-# Thin-path top-N: the `pk IN (…)` fetch-cap must be disabled under ORDER BY
+# PkSet top-N: the gather's LIMIT must select by sort order, not key order
 # ---------------------------------------------------------------------------
 
 
-class TestThinPathTopN:
+class TestPkSetTopN:
     def test_pk_in_order_by_limit_returns_true_smallest(self, client):
         """`WHERE pk IN (…) ORDER BY v LIMIT n` returns the true n smallest by v,
-        not the first n keys in IN-list order — proving `row_cap` is disabled
-        under ORDER BY (else it fetches pk=1,2 and sorts only those)."""
+        not the first n keys in key order — proving the worker top-k selects
+        under the ORDER BY comparator, never a gather-order prefix."""
         sn = "tp" + _uid()
         client.create_schema(sn)
         try:

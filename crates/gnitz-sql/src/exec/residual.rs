@@ -1,32 +1,12 @@
-use super::batch::copy_batch_row_owned;
 use super::eval::eval_pred_row;
 use crate::bind::bind_single_table;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use gnitz_core::{Schema, ZSetBatch};
 use sqlparser::ast::Expr;
-use std::sync::Arc;
 
 pub(crate) fn bind_residuals(residual: &[&Expr], schema: &Schema) -> Result<Vec<BoundExpr>, GnitzSqlError> {
     residual.iter().map(|&e| bind_single_table(e, schema)).collect()
-}
-
-/// A successful seek/scan reply: `(schema, batch, lsn)` — the `Ok` shape of
-/// `gnitz_core::ScanResult`.
-type ScanReply = (Option<Arc<Schema>>, Option<ZSetBatch>, u64);
-
-/// Filter a successful seek result through already-bound residual predicates —
-/// the shared success path of every WHERE-serving plan in `execute_select` (PK
-/// seek, range scan, equality seek). The caller binds via `bind_thin_residuals`,
-/// which is also the thin-routing verdict, so the plan that was approved is the
-/// plan that runs.
-pub(crate) fn residual_filtered(
-    schema: &Schema,
-    (s, b, lsn): ScanReply,
-    preds: &[BoundExpr],
-) -> Result<ScanReply, GnitzSqlError> {
-    let (s2, b2) = apply_residual_filter((s, b), preds, schema)?;
-    Ok((s2, b2, lsn))
 }
 
 /// True when row `i` of `batch` satisfies every residual predicate. An empty
@@ -66,33 +46,4 @@ pub(crate) fn matching_indices(
         }
     }
     Ok(matched)
-}
-
-fn apply_residual_filter(
-    result: (Option<Arc<Schema>>, Option<ZSetBatch>),
-    preds: &[BoundExpr],
-    schema: &Schema,
-) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>), GnitzSqlError> {
-    if preds.is_empty() {
-        return Ok(result);
-    }
-    let (schema_opt, batch_opt) = result;
-    let mut batch = match batch_opt {
-        None => return Ok((schema_opt, None)),
-        Some(b) => b,
-    };
-    let actual_schema = schema_opt.as_deref().unwrap_or(schema);
-    let n = batch.pks.len();
-    let matched = matching_indices(preds, &batch, actual_schema)?;
-    if matched.len() == n {
-        // Every row passed — return the fetched batch unmoved, no per-row clone.
-        return Ok((schema_opt, Some(batch)));
-    }
-    // The fetched batch is owned and dropped here, and each row survives at
-    // most once — move String/Blob cells out instead of cloning them.
-    let mut new_batch = ZSetBatch::new(actual_schema);
-    for &i in &matched {
-        copy_batch_row_owned(&mut batch, i, &mut new_batch, actual_schema);
-    }
-    Ok((schema_opt, Some(new_batch)))
 }

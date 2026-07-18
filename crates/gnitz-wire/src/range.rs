@@ -1,6 +1,7 @@
 // ---------------------------------------------------------------------------
-// SEEK_BY_INDEX_RANGE descriptor — the wire payload of an ordered range scan
-// over a secondary index.
+// Range-bound descriptor — the shared wire form of an ordered range bound:
+// a `ReadSpec` PK / index bound, the circuit `ScanBound`, and the engine's
+// bounded index walks all carry one.
 //
 // Both client (gnitz-core) and engine (gnitz-engine worker) MUST share this
 // encoder/decoder so they cannot drift on the encoding — the same rule
@@ -125,14 +126,28 @@ impl RangeDescriptor {
         }
     }
 
+    /// A full or partial equality lowered to its degenerate point range:
+    /// `eq_vals` pin the leading columns and the next column is exactly `v`
+    /// (`[Before(v), After(v))`) — the single spelling of "equality = a
+    /// zero-width range on the last pinned column".
+    pub fn point(eq_vals: &[u128], v: u128) -> Self {
+        RangeDescriptor::new(eq_vals, Cut::Before(v), Cut::After(v))
+    }
+
     /// The equality-pinned leading values; the range column sits right after
     /// them at index position `eq_vals().len()`.
     pub fn eq_vals(&self) -> &[u128] {
         &self.eq[..self.n_eq]
     }
 
+    /// The exact wire span of a descriptor with `n_eq` equality values — the
+    /// one definition of the `2 + 16·(n_eq + 2)` layout.
+    pub const fn encoded_len(n_eq: usize) -> usize {
+        2 + 16 * (n_eq + 2)
+    }
+
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(2 + 16 * (self.n_eq + 2));
+        let mut out = Vec::with_capacity(Self::encoded_len(self.n_eq));
         out.push(self.n_eq as u8);
         let mut flags = 0u8;
         if self.start.is_after() {
@@ -171,7 +186,7 @@ impl RangeDescriptor {
         if flags & !(START_AFTER | END_AFTER) != 0 {
             return Err(format!("range descriptor has unknown flag bits {flags:#04x}"));
         }
-        let expected = 2 + 16 * (n_eq + 2);
+        let expected = Self::encoded_len(n_eq);
         if buf.len() != expected {
             return Err(format!("range descriptor length {} != expected {expected}", buf.len()));
         }

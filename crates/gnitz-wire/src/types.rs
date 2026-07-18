@@ -81,6 +81,15 @@ impl TypeCode {
         matches!(self, TypeCode::F32 | TypeCode::F64)
     }
 
+    /// The 16-byte integer-ish types (U128, UUID, I128) with no i64 slot in the
+    /// expression VM: a bound on such a column cannot be re-imposed by a
+    /// compiled predicate, so a range walk over it must be byte-exact
+    /// (un-gated). The SQL layer (conjunct stripping) and the engine worker
+    /// (walk gating) both derive that split from this one predicate.
+    pub const fn is_wide_int(&self) -> bool {
+        matches!(self, TypeCode::U128 | TypeCode::UUID | TypeCode::I128)
+    }
+
     /// Whether this type uses the 16-byte "German string" layout (a 4-byte
     /// length, a 4-byte inline prefix, and an inline-or-out-of-line tail).
     /// STRING and BLOB share this representation; both must compare, relocate,

@@ -1574,14 +1574,18 @@ def test_compound_pk_pk_and_payload_reorder_with_nulls(client):
         _cleanup(client, sn, "t")
 
 
-def test_compound_pk_no_pk_projection_rejected(client):
+def test_compound_pk_no_pk_projection_hidden(client):
+    """The ad-hoc read path hidden-prepends the full compound source PK, so
+    dropping every PK column from the projection is allowed — `SELECT payload`
+    returns only `payload` while `(a, b)` ride the physical key hidden."""
     sn = "cpk" + _uid()
     client.create_schema(sn)
     try:
         _make_compound_table(client, sn, "t")
-        with pytest.raises(gnitz.GnitzError) as exc:
-            client.execute_sql("SELECT payload FROM t", schema_name=sn)
-        assert "at least one PRIMARY KEY column" in str(exc.value)
+        client.execute_sql("INSERT INTO t VALUES (1, 2, 100), (3, 4, 200)", schema_name=sn)
+        res = client.execute_sql("SELECT payload FROM t", schema_name=sn)[0]
+        assert res["type"] == "Rows", res
+        assert sorted(r.payload for r in res["rows"]) == [100, 200]
     finally:
         _cleanup(client, sn, "t")
 

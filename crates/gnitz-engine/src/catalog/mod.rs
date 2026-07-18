@@ -34,6 +34,7 @@ mod hooks;
 mod metadata;
 mod partition_lsn;
 mod registry;
+mod scan_spec;
 mod store_io;
 mod sys_tables;
 mod types;

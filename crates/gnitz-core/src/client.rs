@@ -6,7 +6,6 @@ use crate::protocol::types::type_code_from_u64;
 use crate::protocol::{
     BatchAppender, ColData, ColumnDef, PkColumn, PkTuple, Schema, TypeCode, WireConflictMode, ZSetBatch,
 };
-use gnitz_wire::RangeDescriptor;
 use lru::LruCache;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -428,6 +427,20 @@ impl GnitzClient {
         self.session.scan(table_id)
     }
 
+    /// Run a parameterized bounded read (`ReadSpec`) — the ad-hoc SELECT access
+    /// path. `spec` is the encoded `ReadSpec`; `reply_block` is the projected
+    /// reply schema's wire block. Returns the (echoed reply schema, one batch);
+    /// the SQL layer applies the client-side ORDER BY / LIMIT window. Bypasses the
+    /// schema cache, so it never poisons a later plain `scan` of the same table.
+    pub fn scan_spec(
+        &mut self,
+        table_id: u64,
+        spec: &[u8],
+        reply_block: &[u8],
+    ) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>), ClientError> {
+        self.session.scan_spec(table_id, spec, reply_block)
+    }
+
     /// Consistent snapshot of N relations at one server-side SAL cut, returned
     /// in request order. An atomic multi-table `push_txn` is never observed torn
     /// across the result set. Like `scan`, it leaves `last_seen_lsn` untouched.
@@ -462,37 +475,6 @@ impl GnitzClient {
             )));
         }
         self.session.seek_by_index(table_id, col_indices, key_vals)
-    }
-
-    /// Ordered range scan over a secondary index: the leading
-    /// `desc.eq_vals().len()` columns are equality-pinned, and the next index
-    /// column is bounded by the descriptor's half-open cut interval
-    /// `[start, end)`. The guards below fail a malformed request fast, before
-    /// any round trip; the engine method self-guards the same arity rule, so
-    /// a binding that bypasses this entry point still cannot drive it out of
-    /// bounds.
-    ///
-    /// `Before(type_min)‥After(type_max)` is a legitimate full index scan over
-    /// the range column's non-NULL rows — the SQL planner sends exactly that
-    /// for an unconstrained or saturated side (e.g. `x < 3e9` on an I32
-    /// column), and a column-NULL row is absent from the index, matching SQL
-    /// range NULL-exclusion. A zero-width or inverted interval is equally
-    /// legitimate: the engine detects it byte-wise and returns nothing.
-    pub fn seek_by_index_range(&mut self, table_id: u64, col_indices: &[u32], desc: &RangeDescriptor) -> ScanResult {
-        gnitz_wire::validate_pk_col_list(col_indices)
-            .map_err(|e| ClientError::ServerError(format!("seek_by_index_range: {e}")))?;
-        // The range column sits right after the equality prefix, so the prefix
-        // must be strictly shorter than the index column list. (Written `>=`,
-        // never a `+ 1` that could overflow on an adversarial length.)
-        if desc.eq_vals().len() >= col_indices.len() {
-            return Err(ClientError::ServerError(format!(
-                "seek_by_index_range: {} equality values leave no range column \
-                 within index arity {}",
-                desc.eq_vals().len(),
-                col_indices.len()
-            )));
-        }
-        self.session.seek_by_index_range(table_id, col_indices, desc)
     }
 
     /// The secondary-index descriptor for `col_idx` of `table_id`, served from a

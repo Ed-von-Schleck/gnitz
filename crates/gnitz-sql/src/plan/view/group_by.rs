@@ -12,7 +12,7 @@ use crate::plan::validate::{
     reject_duplicate_column_names, reject_float_key, reject_unhonored_select_clauses, HonoredClauses,
 };
 use crate::plan::view::EmitPieces;
-use crate::types::{is_integer_type, is_min_max_orderable, is_wide_int};
+use crate::types::{is_integer_type, is_min_max_orderable};
 use gnitz_core::{CircuitBuilder, ColumnDef, ExprBuilder, GnitzClient, ReduceOutKey, Schema, TypeCode};
 use gnitz_wire::{AGG_COUNT, AGG_COUNT_NON_NULL, AGG_MAX, AGG_MIN, AGG_SUM, AGG_SUM_ZERO};
 use sqlparser::ast::{Expr, GroupByExpr, SelectItem};
@@ -728,7 +728,7 @@ fn push_agg_specs(
         let tc = schema.columns[c].type_code;
         match agg_func {
             AggFunc::Sum | AggFunc::Avg => {
-                if !(is_integer_type(tc) || tc.is_float()) || is_wide_int(tc) {
+                if !(is_integer_type(tc) || tc.is_float()) || tc.is_wide_int() {
                     return Err(GnitzSqlError::Bind(format!(
                         "{agg_func:?} is not supported on column type {tc:?} ('{}')",
                         schema.columns[c].name,

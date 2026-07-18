@@ -219,6 +219,24 @@ impl ReadCursor {
         self.drive();
     }
 
+    /// Position the cursor on the half-open OPK range `[start, end)`. Each
+    /// source seeks to its lower bound of `start`, and — when `end` is given —
+    /// has its row count clamped to its lower bound of `end`, so every
+    /// drain/advance path simply exhausts at the cut: no per-row boundary
+    /// check, no over-read past the range. One reposition + one rebuild (a
+    /// separate truncate-after-seek would re-drive and lose the seeked group).
+    /// The upper bound is part of the cursor's view from then on (`rewind`
+    /// keeps it). Both keys must be exactly `pk_stride` OPK bytes.
+    pub fn seek_range_bytes(&mut self, start: &[u8], end: Option<&[u8]>) {
+        for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
+            state.seek_bytes(src, start);
+            if let Some(end) = end {
+                state.count = state.count.min(src.find_lower_bound_bytes(end));
+            }
+        }
+        self.rebuild_and_drive();
+    }
+
     /// Reset every source to its first row and re-drive, positioning the cursor
     /// at the first row in storage order. Use this instead of `seek(u128::MIN)`
     /// to rewind a cursor: a signed-PK trace's minimum is a negative value, not
