@@ -4,11 +4,83 @@
 //! coherence the old 13-parameter `op_reduce` signature spread across the
 //! instruction operands; the per-epoch call re-derives nothing.
 
-use crate::schema::{ColumnLocator, ReduceOutKey, SchemaDescriptor, TypeCode};
+use crate::schema::{
+    copy_pk_columns_into, type_code, ColumnLocator, ReduceOutKey, SchemaColumn, SchemaDescriptor, TypeCode,
+    MAX_COLUMNS, MAX_PK_COLUMNS,
+};
 
 use super::super::util::{GroupKeyCols, GroupKeyExtractor};
 use super::agg::{AggDescriptor, AggOp};
 use super::sort::packed_sort_spec;
+
+/// Engine adapter over the single shared typing rule
+/// (`gnitz_wire::agg_output_type`).
+pub(crate) const fn agg_output_type(agg_op: AggOp, col_type_code: TypeCode) -> u8 {
+    let func = match agg_op {
+        AggOp::Count => gnitz_wire::AggFunc::Count,
+        AggOp::CountNonNull => gnitz_wire::AggFunc::CountNonNull,
+        AggOp::SumZero => gnitz_wire::AggFunc::SumZero,
+        AggOp::Sum => gnitz_wire::AggFunc::Sum,
+        AggOp::Min => gnitz_wire::AggFunc::Min,
+        AggOp::Max => gnitz_wire::AggFunc::Max,
+    };
+    gnitz_wire::agg_output_type(func, col_type_code as u8)
+}
+
+/// Build the reduce output schema by **obeying** the planner's shipped
+/// `out_key`. The compiler (`emit_reduce`) validates `out_key` against the
+/// input schema (`SchemaDescriptor::reduce_out_key`) before calling this, so
+/// the three arms are byte-identical to what the planner laid out; the ad-hoc
+/// fold (`AdhocFold::new`) derives its SyntheticFold layout through the same
+/// single authority. Caller guarantees the output column count fits
+/// `MAX_COLUMNS`.
+pub(crate) fn build_reduce_output_schema(
+    input: &SchemaDescriptor,
+    group_cols: &[u32],
+    agg_descs: &[AggDescriptor],
+    out_key: ReduceOutKey,
+) -> SchemaDescriptor {
+    let mut cols = [SchemaColumn::new(0, 0); MAX_COLUMNS];
+    let mut n = 0;
+    let mut pk_idx = [0u32; MAX_PK_COLUMNS];
+    let mut pk_len = 0usize;
+
+    match out_key {
+        ReduceOutKey::PkPermutation => {
+            // Output PK region mirrors the source's PK byte layout: walk
+            // `pk_columns()` in pk-list order rather than `group_cols` order.
+            let k = copy_pk_columns_into(input, &mut cols, &mut pk_idx);
+            n = k;
+            pk_len = k;
+        }
+        ReduceOutKey::SingleNaturalCol => {
+            // A single non-PK-or-PK natural group column keyed directly (e.g.
+            // GROUP BY a U64 payload column, where `pk_columns()` would name the
+            // wrong column).
+            cols[n] = input.columns[group_cols[0] as usize];
+            pk_idx[pk_len] = n as u32;
+            pk_len += 1;
+            n += 1;
+        }
+        ReduceOutKey::SyntheticFold => {
+            // Synthetic U128 PK, group columns as payload.
+            cols[n] = SchemaColumn::new(type_code::U128, 0);
+            pk_idx[pk_len] = n as u32;
+            pk_len += 1;
+            n += 1;
+            for &gc in group_cols {
+                cols[n] = input.columns[gc as usize];
+                n += 1;
+            }
+        }
+    }
+    // Aggregate results (same for all arms)
+    for ad in agg_descs {
+        cols[n] = SchemaColumn::new(agg_output_type(ad.agg_op, ad.col_type_code), 0);
+        n += 1;
+    }
+    SchemaDescriptor::new(&cols[..n], &pk_idx[..pk_len])
+}
 
 /// Role of one reduce-output payload column, resolved at plan build so the
 /// per-emitted-group loop does no `locate()` walk or bounds re-derivation.

@@ -10,7 +10,7 @@ use super::super::util::{extract_group_key, ieee_order_bits_f32, ieee_order_bits
 use super::agg::{apply_agg_from_value_index, Accumulator, AggDescriptor, AggOp};
 use super::emit::{emit_global_ground, emit_reduce_row};
 use super::op_reduce::cursor_matches_group;
-use super::plan::ReducePlan;
+use super::plan::{agg_output_type, build_reduce_output_schema, ReducePlan};
 use super::sort::{argsort_delta, compare_by_group_cols, packed_sort_spec};
 use crate::schema::ColumnLocator;
 use crate::storage::ReadCursor;
@@ -8458,4 +8458,128 @@ fn avi_skip_global_aggregate() {
         (Some(1), Some(5), 2),
         "retract-the-max global recedes via probe"
     );
+}
+
+#[test]
+fn test_agg_output_type() {
+    assert_eq!(agg_output_type(AggOp::Count, TypeCode::I64), type_code::I64);
+    assert_eq!(agg_output_type(AggOp::Sum, TypeCode::F64), type_code::F64);
+    assert_eq!(agg_output_type(AggOp::Sum, TypeCode::I32), type_code::I64);
+    assert_eq!(agg_output_type(AggOp::Max, TypeCode::F32), type_code::F64);
+    // MIN/MAX select an existing row, so they preserve the source type: every
+    // ≤8-byte integer keeps its own type (no widening to I64).
+    assert_eq!(agg_output_type(AggOp::Min, TypeCode::I8), type_code::I8);
+    assert_eq!(agg_output_type(AggOp::Max, TypeCode::I16), type_code::I16);
+    assert_eq!(agg_output_type(AggOp::Min, TypeCode::I32), type_code::I32);
+    assert_eq!(agg_output_type(AggOp::Max, TypeCode::U8), type_code::U8);
+    assert_eq!(agg_output_type(AggOp::Min, TypeCode::U16), type_code::U16);
+    assert_eq!(agg_output_type(AggOp::Max, TypeCode::U32), type_code::U32);
+    // U64 folds into the general rule (the source type *is* U64); SUM over a
+    // U64 source is also typed U64 (the i64 accumulator bit pattern is the
+    // correct unsigned sum), so a downstream unsigned compare re-seeds right.
+    assert_eq!(agg_output_type(AggOp::Min, TypeCode::U64), type_code::U64);
+    assert_eq!(agg_output_type(AggOp::Max, TypeCode::U64), type_code::U64);
+    assert_eq!(agg_output_type(AggOp::Sum, TypeCode::U64), type_code::U64);
+    // Non-fixed-int sources (STRING / 16-byte) fall to the I64 arm as a
+    // total-function default. MIN/MAX over them is rejected at compile (the
+    // SQL binder, and emit_reduce's order-encodability guard — see
+    // test_build_plan_min_max_over_non_encodable_rejected), so this result only
+    // types a discarded schema and never reaches execution; agg_output_type
+    // stays total, hence these asserts still hold.
+    assert_eq!(agg_output_type(AggOp::Max, TypeCode::String), type_code::I64);
+    assert_eq!(agg_output_type(AggOp::Min, TypeCode::U128), type_code::I64);
+}
+
+#[test]
+fn test_build_reduce_output_schema_natural_pk() {
+    let input = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::U64, 0), // group col
+            SchemaColumn::new(type_code::I64, 0), // agg col
+        ],
+        &[0],
+    );
+    let aggs = vec![AggDescriptor {
+        col_idx: 2,
+        agg_op: AggOp::Sum,
+        col_type_code: TypeCode::I64,
+    }];
+    let out = build_reduce_output_schema(&input, &[1], &aggs, gnitz_wire::ReduceOutKey::SingleNaturalCol);
+    // Natural PK (single U64 group col) → [U64_PK, I64_agg]
+    assert_eq!(out.num_columns(), 2);
+    assert_eq!(out.columns[0].type_code, type_code::U64);
+    assert_eq!(out.columns[1].type_code, type_code::I64);
+}
+
+#[test]
+fn test_build_reduce_output_schema_compound_natural_pk() {
+    // Input: pk_indices = [0, 1] (compound 2×U64), payload I64.
+    let input = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0, 1],
+    );
+    let aggs = vec![AggDescriptor {
+        col_idx: 2,
+        agg_op: AggOp::Count,
+        col_type_code: TypeCode::I64,
+    }];
+    // group_cols = [1, 0] — permuted; the set still equals pk_indices.
+    let out = build_reduce_output_schema(&input, &[1, 0], &aggs, gnitz_wire::ReduceOutKey::PkPermutation);
+    // 2 PK cols + 1 agg col; pk_indices in source's pk-list order [0, 1].
+    assert_eq!(out.num_columns(), 3);
+    assert_eq!(out.pk_indices(), &[0, 1]);
+    assert_eq!(out.columns[0].type_code, type_code::U64);
+    assert_eq!(out.columns[1].type_code, type_code::U64);
+    assert_eq!(out.columns[2].type_code, type_code::I64);
+}
+
+#[test]
+fn test_build_reduce_output_schema_single_pk_group_by_pk() {
+    // Single-PK input grouped by its PK must collapse to the single-column
+    // natural-PK shape (one PK col + agg).
+    let input = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let aggs = vec![AggDescriptor {
+        col_idx: 1,
+        agg_op: AggOp::Sum,
+        col_type_code: TypeCode::I64,
+    }];
+    let out = build_reduce_output_schema(&input, &[0], &aggs, gnitz_wire::ReduceOutKey::PkPermutation);
+    assert_eq!(out.num_columns(), 2);
+    assert_eq!(out.pk_indices(), &[0]);
+    assert_eq!(out.columns[0].type_code, type_code::U64);
+    assert_eq!(out.columns[1].type_code, type_code::I64);
+}
+
+#[test]
+fn test_build_reduce_output_schema_synthetic_pk() {
+    let input = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::STRING, 0), // group col
+            SchemaColumn::new(type_code::I64, 0),    // agg col
+        ],
+        &[0],
+    );
+    let aggs = vec![AggDescriptor {
+        col_idx: 2,
+        agg_op: AggOp::Count,
+        col_type_code: TypeCode::I64,
+    }];
+    let out = build_reduce_output_schema(&input, &[1], &aggs, gnitz_wire::ReduceOutKey::SyntheticFold);
+    // Synthetic PK (STRING group col) → [U128_hash, STRING_group, I64_count]
+    assert_eq!(out.num_columns(), 3);
+    assert_eq!(out.columns[0].type_code, type_code::U128);
+    assert_eq!(out.columns[1].type_code, type_code::STRING);
+    assert_eq!(out.columns[2].type_code, type_code::I64);
 }

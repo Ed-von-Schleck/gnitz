@@ -3,7 +3,6 @@
 //! schemas.
 
 use super::*;
-use gnitz_wire::ReduceOutKey;
 
 /// The first (usually sole) node feeding `nid`, if any.
 pub(super) fn first_input(loaded: &LoadedCircuit, nid: i32) -> Option<i32> {
@@ -157,24 +156,6 @@ pub(super) fn compute_skip_nodes(loaded: &LoadedCircuit) -> HashSet<i32> {
 // Schema construction helpers
 // ---------------------------------------------------------------------------
 
-/// Copy `schema`'s PK columns to `cols[..pk_count]` and populate `pk_idx`
-/// with `[0, 1, ..., pk_count - 1]`. Returns `pk_count`. PK columns always
-/// occupy the leading positions of the output schema, so the new PK
-/// indices are dense and identical to the loop counter.
-pub(super) fn copy_pk_columns_into(
-    schema: &SchemaDescriptor,
-    cols: &mut [SchemaColumn],
-    pk_idx: &mut [u32; crate::schema::MAX_PK_COLUMNS],
-) -> usize {
-    let mut k = 0;
-    for (_, _, c) in schema.pk_columns() {
-        cols[k] = *c;
-        pk_idx[k] = k as u32;
-        k += 1;
-    }
-    k
-}
-
 /// `None` when the merged column count would overflow the fixed `[_; 65]` schema
 /// array — a crafted/corrupt `Join` node; the caller fails the compile rather
 /// than aborting. (The outer-join null-fill columns are built by the `NullExtend`
@@ -317,72 +298,6 @@ pub(super) fn reindex_output_schema(
     }
     let pk_idx: Vec<u32> = (0..pk_n as u32).collect();
     SchemaDescriptor::new(&cols[..pk_n + payload_n], &pk_idx)
-}
-
-/// Engine adapter over the single shared typing rule
-/// (`gnitz_wire::agg_output_type`).
-pub(super) const fn agg_output_type(agg_op: AggOp, col_type_code: TypeCode) -> u8 {
-    let func = match agg_op {
-        AggOp::Count => gnitz_wire::AggFunc::Count,
-        AggOp::CountNonNull => gnitz_wire::AggFunc::CountNonNull,
-        AggOp::SumZero => gnitz_wire::AggFunc::SumZero,
-        AggOp::Sum => gnitz_wire::AggFunc::Sum,
-        AggOp::Min => gnitz_wire::AggFunc::Min,
-        AggOp::Max => gnitz_wire::AggFunc::Max,
-    };
-    gnitz_wire::agg_output_type(func, col_type_code as u8)
-}
-
-/// Build the reduce output schema by **obeying** the planner's shipped
-/// `out_key`. The caller (`emit_reduce`) validates `out_key` against the input
-/// schema (`SchemaDescriptor::reduce_out_key`) before calling this, so the
-/// three arms are byte-identical to what the planner laid out.
-pub(super) fn build_reduce_output_schema(
-    input: &SchemaDescriptor,
-    group_cols: &[u32],
-    agg_descs: &[AggDescriptor],
-    out_key: ReduceOutKey,
-) -> SchemaDescriptor {
-    let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-    let mut n = 0;
-    let mut pk_idx = [0u32; crate::schema::MAX_PK_COLUMNS];
-    let mut pk_len = 0usize;
-
-    match out_key {
-        ReduceOutKey::PkPermutation => {
-            // Output PK region mirrors the source's PK byte layout: walk
-            // `pk_columns()` in pk-list order rather than `group_cols` order.
-            let k = copy_pk_columns_into(input, &mut cols, &mut pk_idx);
-            n = k;
-            pk_len = k;
-        }
-        ReduceOutKey::SingleNaturalCol => {
-            // A single non-PK-or-PK natural group column keyed directly (e.g.
-            // GROUP BY a U64 payload column, where `pk_columns()` would name the
-            // wrong column).
-            cols[n] = input.columns[group_cols[0] as usize];
-            pk_idx[pk_len] = n as u32;
-            pk_len += 1;
-            n += 1;
-        }
-        ReduceOutKey::SyntheticFold => {
-            // Synthetic U128 PK, group columns as payload.
-            cols[n] = SchemaColumn::new(type_code::U128, 0);
-            pk_idx[pk_len] = n as u32;
-            pk_len += 1;
-            n += 1;
-            for &gc in group_cols {
-                cols[n] = input.columns[gc as usize];
-                n += 1;
-            }
-        }
-    }
-    // Aggregate results (same for all arms)
-    for ad in agg_descs {
-        cols[n] = SchemaColumn::new(agg_output_type(ad.agg_op, ad.col_type_code), 0);
-        n += 1;
-    }
-    SchemaDescriptor::new(&cols[..n], &pk_idx[..pk_len])
 }
 
 pub(super) fn agg_value_idx_eligible(tc: TypeCode) -> bool {

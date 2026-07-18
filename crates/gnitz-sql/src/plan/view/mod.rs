@@ -1,7 +1,8 @@
 //! CREATE VIEW circuit builders, one per view shape. `dispatch` is the front
 //! door (classify + route); `predicates` and `join` form the join cluster;
-//! `group_by`, `set_op`, and `simple` cover the remaining shapes. Only
-//! `execute_create_view` is exposed; everything else is internal to the cluster.
+//! `group_by`, `set_op`, and `simple` cover the remaining shapes. Exposed:
+//! the dispatch entry points plus the shared aggregate/projection analysis the
+//! ad-hoc fold path consumes; every emitter is internal to the cluster.
 
 mod dispatch;
 mod exists;
@@ -13,6 +14,11 @@ mod set_op;
 mod simple;
 
 pub(crate) use dispatch::{compile_query_to_circuit, execute_alter_view, execute_create_view};
+// The single-relation aggregate analysis + HAVING binding and the bare-column
+// projection resolver double as the ad-hoc fold planner's front end
+// (`dml::select`) — re-exported so the view emitters themselves stay private.
+pub(crate) use group_by::{analyze_group_by, bind_having_expr, HavingCtx};
+pub(crate) use set_op::resolve_set_projection;
 
 use crate::error::GnitzSqlError;
 use gnitz_core::{Circuit, ColumnDef, GnitzClient, PlannedView, Schema};

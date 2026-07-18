@@ -306,9 +306,7 @@ pub(crate) fn seek_pk_multi(
         let spec = gnitz_wire::ReadSpec {
             bound: gnitz_wire::ReadBound::PkSet(chunk.to_vec()),
             predicate: Vec::new(),
-            projection: Vec::new(),
-            order: Vec::new(),
-            limit_k: 0,
+            sink: gnitz_wire::ReadSink::all_rows(),
         };
         let (schema_opt, batch_opt) = client
             .scan_spec(table_id, &spec.encode(), &reply_block)

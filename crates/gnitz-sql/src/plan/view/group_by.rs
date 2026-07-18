@@ -1,8 +1,13 @@
-//! GROUP BY / HAVING / aggregation view compilation: the agg-spec model
-//! (`AggMapping`/`AggShape`/`AggSpec`), the reduce-output schema layout, the
-//! post-reduce projection, and the HAVING cluster (collection, binding, and the
-//! `Having` leaf binder over the grouped relation).
+//! GROUP BY / HAVING / aggregation view compilation over the shared aggregate
+//! layout model (`crate::agg`): the shared analysis (`analyze_group_by`), the
+//! reduce-output schema layout, the post-reduce projection, and the HAVING
+//! cluster (collection, binding, and the `Having` leaf binder over the grouped
+//! relation).
 
+use crate::agg::{
+    agg_arg_col, append_agg_mapping, group_col_reduce_pos, push_agg_specs, synthetic_fold_cols, AggMapping, AggShape,
+    AggSpec, GroupByLayout, GroupBySelectItem,
+};
 use crate::ast_util::{expr_operands, single_relation_col_name};
 use crate::bind::{bind_single_table, bind_structural, find_unique_column, fold_null_test, LeafBinder, SingleTable};
 use crate::error::GnitzSqlError;
@@ -12,142 +17,134 @@ use crate::plan::validate::{
     reject_duplicate_column_names, reject_float_key, reject_unhonored_select_clauses, HonoredClauses,
 };
 use crate::plan::view::EmitPieces;
-use crate::types::{is_integer_type, is_min_max_orderable};
-use gnitz_core::{CircuitBuilder, ColumnDef, ExprBuilder, GnitzClient, ReduceOutKey, Schema, TypeCode};
-use gnitz_wire::{AGG_COUNT, AGG_COUNT_NON_NULL, AGG_MAX, AGG_MIN, AGG_SUM, AGG_SUM_ZERO};
+use gnitz_core::{CircuitBuilder, ColumnDef, ExprBuilder, GnitzClient, ReduceOutKey, Schema};
+use gnitz_wire::AggFunc as WireAggFunc;
 use sqlparser::ast::{Expr, GroupByExpr, SelectItem};
 
-/// Tracks how a user-level aggregate maps to reduce agg_specs.
-struct AggMapping {
-    specs_start: usize, // index into agg_specs
-    shape: AggShape,
-    output_name: String,
-    output_type: TypeCode,
-    /// Whether the output column can be NULL at runtime, computed once at
-    /// construction (`append_agg_mapping`) and read by both the SELECT
-    /// projection's output schema and the HAVING `IS [NOT] NULL` const-fold, so
-    /// the two cannot drift. Companion shapes are blanket-nullable; `Direct` is
-    /// the exact structural fact (`direct_agg_nullable`).
-    output_nullable: bool,
-    agg_func: AggFunc,
-    arg_col: Option<usize>,
-}
-
-impl AggMapping {
-    /// Whether the aggregate's argument column holds floats — selects the float
-    /// vs integer load/divide path when finalizing AVG / nullable SUM.
-    fn arg_is_float(&self, schema: &Schema) -> bool {
-        self.arg_col
-            .map(|c| schema.columns[c].type_code.is_float())
-            .unwrap_or(false)
-    }
-}
-
-/// How an aggregate's value column is finalized — which also fixes how many
-/// physical specs `push_agg_specs` emits and how the SELECT projection / HAVING
-/// binding read the result. `Avg` and `NullfillSum` each carry a hidden
-/// COUNT_NON_NULL companion at `specs_start + 1`: their null-ness derives from
-/// `companion == 0`, never the value column's saturating `has_value` bit.
-/// `Direct` is a single spec copied straight through.
-#[derive(Clone, Copy)]
-enum AggShape {
-    Direct,
-    Avg,
-    NullfillSum,
-}
-
-impl AggShape {
-    /// True iff a hidden COUNT_NON_NULL companion sits at `specs_start + 1` and
-    /// carries this aggregate's null-ness (AVG and nullable-source SUM).
-    fn has_count_companion(self) -> bool {
-        matches!(self, AggShape::Avg | AggShape::NullfillSum)
-    }
-}
-
-/// One physical reduce spec: the wire agg op code (`AGG_*`), its source column,
-/// and the output column type it produces. `out_type` is computed once at spec
-/// creation by `push_agg_specs` (the spec-layout authority), so the reduce
-/// schema builder reads it directly instead of reconstructing it from `op`. The
-/// circuit builder consumes only `(op, col)`.
-struct AggSpec {
-    op: u64,
-    col: usize,
-    out_type: TypeCode,
-}
-
-/// The aggregate output type, via the single shared planner/engine rule
-/// (`gnitz_wire::agg_output_type`). AVG is planner-lowered (SUM/COUNT + a
-/// finalize divide) before the wire and always produces F64. A source-less
-/// aggregate (COUNT) passes I64, which the rule maps to its own default arms.
-pub(crate) fn agg_result_type(func: AggFunc, src_col: Option<usize>, schema: &Schema) -> TypeCode {
-    let wire_func = match func {
-        AggFunc::Avg => return TypeCode::F64,
-        AggFunc::Count => gnitz_core::AggFunc::Count,
-        AggFunc::CountNonNull => gnitz_core::AggFunc::CountNonNull,
-        AggFunc::Sum => gnitz_core::AggFunc::Sum,
-        AggFunc::Min => gnitz_core::AggFunc::Min,
-        AggFunc::Max => gnitz_core::AggFunc::Max,
-    };
-    let src_tc = match src_col {
-        Some(c) => schema.columns[c].type_code as u8,
-        None => TypeCode::I64 as u8,
-    };
-    TypeCode::from_validated_u8(gnitz_core::agg_output_type(wire_func, src_tc))
-}
-
-/// Whether an `AggShape::Direct` aggregate's output column can be NULL at
-/// runtime, given the query shape. Computed once per aggregate at mapping
-/// construction (`AggMapping::output_nullable`); everything downstream reads
-/// the stored field.
-///
-/// A **global** (empty group set) aggregate seeds a ground row that renders
-/// SUM/MIN/MAX/AVG as NULL over an empty source, so it is always nullable. A
-/// **grouped** aggregate never renders NULL from emptiness (an emptied group is
-/// retracted, not null-filled), so on a surviving group:
-/// * COUNT / COUNT_NON_NULL are always a concrete integer (`empty_renders_zero`);
-/// * a Direct SUM is only reached for a non-nullable source (a nullable source
-///   routes to `NullfillSum`), so it always has a value;
-/// * MIN / MAX render NULL only for an all-NULL group, i.e. a nullable source.
-///
-/// Mirrors `emit.rs`'s null-bit rule (`is_untouched() && !empty_renders_zero()`).
-/// AVG is never `Direct` (it always carries a COUNT_NON_NULL companion).
-fn direct_agg_nullable(agg_func: AggFunc, arg_col: Option<usize>, is_global: bool, schema: &Schema) -> bool {
-    match agg_func {
-        AggFunc::Count | AggFunc::CountNonNull => false,
-        AggFunc::Sum => is_global,
-        AggFunc::Min | AggFunc::Max => is_global || schema.columns[arg_col.unwrap()].is_nullable,
-        AggFunc::Avg => unreachable!("AVG is never AggShape::Direct"),
-    }
-}
-
-/// What each SELECT item represents in a GROUP BY query.
-enum GroupBySelectItem {
-    GroupCol { src_col: usize, name: String },
-    Aggregate { agg_idx: usize },
-}
-
-/// Reduce-output column index for a group column `src_col`, mirroring the
-/// reduce output schema layout keyed by `out_key`:
-///
-/// * `PkPermutation` — the PK region holds the source PK columns in source-PK
-///   order; locate `src_col` there.
-/// * `SingleNaturalCol` — the lone group col is the PK at index 0.
-/// * `SyntheticFold` — group cols follow the U128 `_group_pk`, in GROUP BY order.
-fn group_col_reduce_pos(
-    src_col: usize,
-    out_key: ReduceOutKey,
+/// Analyze a single-relation aggregate `select` against `source_schema` into its
+/// physical [`GroupByLayout`] — GROUP BY resolution, the projection-mixing rule,
+/// aggregate spec/mapping construction, the SUM/AVG and MIN/MAX type gates, and
+/// HAVING-only aggregate materialization. Pure analysis: no clause gate (each
+/// caller invokes it), no COUNT(*) companion (the view path appends it), no
+/// circuit.
+pub(crate) fn analyze_group_by(
+    select: &sqlparser::ast::Select,
     source_schema: &Schema,
-    group_col_indices: &[usize],
-) -> usize {
-    match out_key {
-        ReduceOutKey::PkPermutation => source_schema
-            .pk_cols
-            .iter()
-            .position(|&pi| pi == src_col)
-            .expect("PkPermutation: every group col is a source PK col"),
-        ReduceOutKey::SingleNaturalCol => 0,
-        ReduceOutKey::SyntheticFold => 1 + group_col_indices.iter().position(|&gi| gi == src_col).unwrap(),
+) -> Result<GroupByLayout, GnitzSqlError> {
+    // Parse GROUP BY → group column indices.
+    let group_exprs = match &select.group_by {
+        GroupByExpr::Expressions(exprs, _) => exprs,
+        _ => {
+            return Err(GnitzSqlError::Unsupported(
+                "GROUP BY: only expression list supported".to_string(),
+            ))
+        }
+    };
+    let mut group_col_indices: Vec<usize> = Vec::new();
+    for ge in group_exprs {
+        // Bare or qualified (`t.g`) single-relation reference — the qualifier
+        // carries no disambiguating information over the single grouped source,
+        // matching HAVING and the projection (`bind_single_table`).
+        let name = single_relation_col_name(ge).ok_or_else(|| {
+            GnitzSqlError::Unsupported("GROUP BY: only simple column references supported".to_string())
+        })?;
+        let idx = find_unique_column(&source_schema.columns, name)?
+            .ok_or_else(|| GnitzSqlError::Bind(format!("GROUP BY column '{name}' not found")))?;
+        reject_float_key(&source_schema.columns[idx], "GROUP BY")?;
+        group_col_indices.push(idx);
     }
+
+    // An empty group set is the user's ungrouped (global) scalar aggregate —
+    // `SELECT MIN(x) FROM t` with no GROUP BY. It compiles as a one-row reduce
+    // (synthetic `_group_pk` at the constant V₀) that must emit exactly one row
+    // even over an empty/fully-retracted source, so the engine seeds a ground row
+    // (COUNT=0, SUM/MIN/MAX/AVG=NULL) — which is also why a global aggregate's
+    // output is always nullable. Grouped reduces (`group_col_indices` non-empty)
+    // pass `false` and are byte-for-byte unchanged.
+    let global_ground = group_col_indices.is_empty();
+
+    // Analyze SELECT items → group cols + aggregates.
+    let mut agg_mappings: Vec<AggMapping> = Vec::new();
+    let mut select_items: Vec<GroupBySelectItem> = Vec::new();
+    let mut agg_specs: Vec<AggSpec> = Vec::new();
+
+    for (idx, item) in select.projection.iter().enumerate() {
+        let (expr, alias) = match item {
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
+            SelectItem::UnnamedExpr(expr) => (expr, None),
+            _ => {
+                return Err(GnitzSqlError::Unsupported(
+                    "GROUP BY: unsupported SELECT item".to_string(),
+                ))
+            }
+        };
+
+        let bound = bind_single_table(expr, source_schema)?;
+        match &bound {
+            BoundExpr::ColRef(col_idx) => {
+                if !group_col_indices.contains(col_idx) {
+                    return Err(GnitzSqlError::Plan(format!(
+                        "column '{}' must appear in GROUP BY or an aggregate function",
+                        source_schema.columns[*col_idx].name
+                    )));
+                }
+                let name = alias.unwrap_or_else(|| source_schema.columns[*col_idx].name.clone());
+                select_items.push(GroupBySelectItem::GroupCol {
+                    src_col: *col_idx,
+                    name,
+                });
+            }
+            BoundExpr::AggCall { func, arg } => {
+                let src_col = agg_arg_col(arg.as_deref())?;
+                let agg_idx = agg_mappings.len();
+                let out_name = alias.unwrap_or_else(|| {
+                    let prefix = match func {
+                        AggFunc::Count | AggFunc::CountNonNull => "_count",
+                        AggFunc::Sum => "_sum",
+                        AggFunc::Min => "_min",
+                        AggFunc::Max => "_max",
+                        AggFunc::Avg => "_avg",
+                    };
+                    format!("{prefix}{idx}")
+                });
+                append_agg_mapping(
+                    *func,
+                    src_col,
+                    out_name,
+                    global_ground,
+                    source_schema,
+                    &mut agg_specs,
+                    &mut agg_mappings,
+                )?;
+                select_items.push(GroupBySelectItem::Aggregate { agg_idx });
+            }
+            _ => {
+                return Err(GnitzSqlError::Plan(
+                    "GROUP BY SELECT: only column refs and aggregates supported".to_string(),
+                ))
+            }
+        }
+    }
+
+    // Materialise aggregates referenced only by HAVING. HAVING is evaluated
+    // over the grouped relation, so every aggregate it references needs an
+    // agg_spec and a reduce-output column even when the SELECT list omits it.
+    if let Some(having_expr) = &select.having {
+        collect_having_aggs(
+            having_expr,
+            global_ground,
+            source_schema,
+            &mut agg_specs,
+            &mut agg_mappings,
+        )?;
+    }
+
+    Ok(GroupByLayout {
+        group_col_indices,
+        agg_specs,
+        agg_mappings,
+        select_items,
+    })
 }
 
 /// Emit a GROUP BY view's reduce circuit from its `select`, returning
@@ -197,141 +194,45 @@ pub(crate) fn emit_group_by_pieces(
     // co-partition analyzers now compare the full PK sequence — so a reduce that
     // shards by one component of a compound PK gets the exchange it needs.
 
-    // 2. Parse GROUP BY → group column indices
-    let group_exprs = match &select.group_by {
-        GroupByExpr::Expressions(exprs, _) => exprs,
-        _ => {
-            return Err(GnitzSqlError::Unsupported(
-                "GROUP BY: only expression list supported".to_string(),
-            ))
-        }
-    };
-    let mut group_col_indices: Vec<usize> = Vec::new();
-    for ge in group_exprs {
-        // Bare or qualified (`t.g`) single-relation reference — the qualifier
-        // carries no disambiguating information over the single grouped source,
-        // matching HAVING and the projection (`bind_single_table`).
-        let name = single_relation_col_name(ge).ok_or_else(|| {
-            GnitzSqlError::Unsupported("GROUP BY: only simple column references supported".to_string())
-        })?;
-        let idx = find_unique_column(&source_schema.columns, name)?
-            .ok_or_else(|| GnitzSqlError::Bind(format!("GROUP BY column '{name}' not found")))?;
-        reject_float_key(&source_schema.columns[idx], "GROUP BY")?;
-        group_col_indices.push(idx);
-    }
+    // GROUP BY resolution, projection-mixing rule, aggregate spec/mapping
+    // construction, and HAVING-only aggregate materialization — the shared
+    // analysis (`analyze_group_by`), also driving the ad-hoc path. The clause
+    // gate above and the COUNT(*) companion below stay here.
+    let layout = analyze_group_by(select, &source_schema)?;
+    let global_ground = layout.global_ground();
+    let GroupByLayout {
+        group_col_indices,
+        mut agg_specs,
+        agg_mappings,
+        select_items,
+    } = layout;
 
-    // An empty group set is the user's ungrouped (global) scalar aggregate —
-    // `SELECT MIN(x) FROM t` with no GROUP BY. It compiles as a one-row reduce
-    // (synthetic `_group_pk` at the constant V₀) that must emit exactly one row
-    // even over an empty/fully-retracted source, so the engine seeds a ground row
-    // (COUNT=0, SUM/MIN/MAX/AVG=NULL) — which is also why a global aggregate's
-    // output is always nullable. Grouped reduces (`group_col_indices` non-empty)
-    // pass `false` and are byte-for-byte unchanged.
-    let global_ground = group_col_indices.is_empty();
-
-    // 3. Analyze SELECT items → group cols + aggregates
-    let mut agg_mappings: Vec<AggMapping> = Vec::new();
-    let mut select_items: Vec<GroupBySelectItem> = Vec::new();
-    let mut agg_specs: Vec<AggSpec> = Vec::new();
-
-    for (idx, item) in select.projection.iter().enumerate() {
-        let (expr, alias) = match item {
-            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
-            SelectItem::UnnamedExpr(expr) => (expr, None),
-            _ => {
-                return Err(GnitzSqlError::Unsupported(
-                    "GROUP BY: unsupported SELECT item".to_string(),
-                ))
-            }
-        };
-
-        let bound = bind_single_table(expr, &source_schema)?;
-        match &bound {
-            BoundExpr::ColRef(col_idx) => {
-                if !group_col_indices.contains(col_idx) {
-                    return Err(GnitzSqlError::Plan(format!(
-                        "column '{}' must appear in GROUP BY or an aggregate function",
-                        source_schema.columns[*col_idx].name
-                    )));
-                }
-                let name = alias.unwrap_or_else(|| source_schema.columns[*col_idx].name.clone());
-                select_items.push(GroupBySelectItem::GroupCol {
-                    src_col: *col_idx,
-                    name,
-                });
-            }
-            BoundExpr::AggCall { func, arg } => {
-                let src_col = agg_arg_col(arg.as_deref())?;
-                let agg_idx = agg_mappings.len();
-                let out_name = alias.unwrap_or_else(|| {
-                    let prefix = match func {
-                        AggFunc::Count | AggFunc::CountNonNull => "_count",
-                        AggFunc::Sum => "_sum",
-                        AggFunc::Min => "_min",
-                        AggFunc::Max => "_max",
-                        AggFunc::Avg => "_avg",
-                    };
-                    format!("{prefix}{idx}")
-                });
-                append_agg_mapping(
-                    *func,
-                    src_col,
-                    out_name,
-                    global_ground,
-                    &source_schema,
-                    &mut agg_specs,
-                    &mut agg_mappings,
-                )?;
-                select_items.push(GroupBySelectItem::Aggregate { agg_idx });
-            }
-            _ => {
-                return Err(GnitzSqlError::Plan(
-                    "GROUP BY SELECT: only column refs and aggregates supported".to_string(),
-                ))
-            }
-        }
-    }
-
-    // 3b. Materialise aggregates referenced only by HAVING. HAVING is evaluated
-    //     over the grouped relation, so every aggregate it references needs an
-    //     agg_spec and a reduce-output column even when the SELECT list omits
-    //     it. Done before reduce_schema is built so the new columns are included.
-    if let Some(having_expr) = &select.having {
-        collect_having_aggs(
-            having_expr,
-            global_ground,
-            &source_schema,
-            &mut agg_specs,
-            &mut agg_mappings,
-        )?;
-    }
-
-    // 3c. Every grouped or global scalar reduce gates group existence on a
-    //     NULL-blind COUNT(*) cardinality (a group exists iff its net row weight
-    //     > 0). Both the combined value-index path and the single-scan fallback
-    //     read it — a mixed reduce folds its linear companions to a numeric value
-    //     whose saturating `has_value` cannot signal an emptied group, so without
-    //     this companion an emptied group would emit a phantom `(g, NULL, 0)` row.
-    //     Reuse a user COUNT(*) when present; else append exactly one hidden
-    //     trailing companion. Appended last — after every SELECT and HAVING-only
-    //     aggregate — so it shifts no existing aggregate's specs_start; it is added
-    //     to agg_specs only (never select_items / agg_mappings), so the post-reduce
-    //     MAP strips it (a raw reduce column with no output column, like a
-    //     HAVING-only agg). Every planner-built reduce is grouped or a global
-    //     scalar aggregate, so the guard is simply "no COUNT(*) present yet" —
-    //     linear or not. (`all_linear` is computed here pre-append for the
-    //     two-phase decision below; the companion never changes linearity.)
+    // Every grouped or global scalar reduce gates group existence on a
+    // NULL-blind COUNT(*) cardinality (a group exists iff its net row weight
+    // > 0). Both the combined value-index path and the single-scan fallback
+    // read it — a mixed reduce folds its linear companions to a numeric value
+    // whose saturating `has_value` cannot signal an emptied group, so without
+    // this companion an emptied group would emit a phantom `(g, NULL, 0)` row.
+    // Reuse a user COUNT(*) when present; else append exactly one hidden
+    // trailing companion. Appended last — after every SELECT and HAVING-only
+    // aggregate — so it shifts no existing aggregate's specs_start; it is added
+    // to agg_specs only (never select_items / agg_mappings), so the post-reduce
+    // MAP strips it (a raw reduce column with no output column, like a
+    // HAVING-only agg). Every planner-built reduce is grouped or a global
+    // scalar aggregate, so the guard is simply "no COUNT(*) present yet" —
+    // linear or not. (`all_linear` is computed here pre-append for the
+    // two-phase decision below; the companion never changes linearity.)
     let all_linear = agg_specs
         .iter()
-        .all(|s| matches!(s.op, AGG_COUNT | AGG_SUM | AGG_COUNT_NON_NULL));
-    if !agg_specs.iter().any(|s| s.op == AGG_COUNT) {
+        .all(|s| matches!(s.op, WireAggFunc::Count | WireAggFunc::Sum | WireAggFunc::CountNonNull));
+    if !agg_specs.iter().any(|s| s.op == WireAggFunc::Count) {
         // Route through push_agg_specs — the single source of truth for spec
         // layout and out_type — rather than hand-rolling the COUNT spec. The
         // companion has no select_item / agg_mapping, so its AggShape is discarded.
         push_agg_specs(AggFunc::Count, None, &source_schema, &mut agg_specs)?;
     }
 
-    // 4. The reduce output-key kind, shipped to the engine (see `ReduceOutKey`:
+    // The reduce output-key kind, shipped to the engine (see `ReduceOutKey`:
     //    the planner owns this decision, the engine validates and obeys it).
     //    Everything below — schema layout, shard key, column positions — derives
     //    from this one value. The two empty-group reduces (two-phase local /
@@ -340,48 +241,41 @@ pub(crate) fn emit_group_by_pieces(
     let out_key = source_schema.reduce_out_key(&group_col_indices);
 
     // Build the reduce output schema (mirrors the engine's
-    // `build_reduce_output_schema`, which lays out from the same `out_key`).
-    let mut reduce_schema_cols: Vec<ColumnDef> = Vec::new();
-    let mut reduce_pk_cols: Vec<usize> = Vec::new();
-    match out_key {
+    // `build_reduce_output_schema`, which lays out from the same `out_key`). The
+    // aggregate columns trail the PK region — plus, on the synthetic path only,
+    // the group cols carried as payload — at the output type push_agg_specs
+    // computed per spec (float SUM/MIN/MAX → F64, MIN/MAX preserve the source
+    // type, SUM/COUNT* → I64), so the planner's virtual reduce schema matches
+    // the compiler's physical reduce output with no per-op reconstruction.
+    let (reduce_schema_cols, reduce_pk_cols) = match out_key {
         ReduceOutKey::PkPermutation => {
-            for &pi in &source_schema.pk_cols {
-                reduce_pk_cols.push(reduce_schema_cols.len());
-                reduce_schema_cols.push(source_schema.columns[pi].clone());
-            }
+            let mut cols: Vec<ColumnDef> = source_schema
+                .pk_cols
+                .iter()
+                .map(|&pi| source_schema.columns[pi].clone())
+                .collect();
+            let pk: Vec<usize> = (0..cols.len()).collect();
+            cols.extend(agg_specs.iter().map(|s| ColumnDef::new("_agg", s.out_type, false)));
+            (cols, pk)
         }
         ReduceOutKey::SingleNaturalCol => {
-            reduce_pk_cols.push(0);
-            reduce_schema_cols.push(source_schema.columns[group_col_indices[0]].clone());
+            let mut cols = vec![source_schema.columns[group_col_indices[0]].clone()];
+            cols.extend(agg_specs.iter().map(|s| ColumnDef::new("_agg", s.out_type, false)));
+            (cols, vec![0])
         }
-        ReduceOutKey::SyntheticFold => {
-            reduce_pk_cols.push(0);
-            // Hidden: the synthetic group key is a physical PK column but not a
-            // presentation column. The group columns follow it as visible payload,
-            // so `SELECT *` shows the grouping values and aggregates, not the hash.
-            reduce_schema_cols.push(ColumnDef::new("_group_pk", TypeCode::U128, false).hidden());
-            for &gi in &group_col_indices {
-                reduce_schema_cols.push(source_schema.columns[gi].clone());
-            }
-        }
-    }
-    // The aggregate columns are pushed next, so they start at the current width
-    // of the reduce schema: the PK region plus, on the synthetic path only, the
-    // group cols carried as payload.
-    let agg_col_offset = reduce_schema_cols.len();
-    for spec in &agg_specs {
-        // Each spec carries the output column type push_agg_specs computed for it
-        // (float SUM/MIN/MAX → F64, MIN/MAX preserve the source type, SUM/COUNT*
-        // → I64), so the planner's virtual reduce schema matches the compiler's
-        // physical reduce output (§3a) with no per-op reconstruction.
-        reduce_schema_cols.push(ColumnDef::new("_agg", spec.out_type, false));
-    }
+        // The shared SyntheticFold layout (also the ad-hoc partial schema).
+        ReduceOutKey::SyntheticFold => (
+            synthetic_fold_cols(&source_schema, &group_col_indices, &agg_specs, false),
+            vec![0],
+        ),
+    };
+    let agg_col_offset = reduce_schema_cols.len() - agg_specs.len();
     let reduce_schema = Schema {
         columns: reduce_schema_cols,
         pk_cols: reduce_pk_cols,
     };
 
-    // 5. Build circuit
+    // Build circuit
     let mut cb = CircuitBuilder::new(view_id, source_tid);
     let inp = cb.input_delta_bounded(bound);
 
@@ -425,7 +319,7 @@ pub(crate) fn emit_group_by_pieces(
     };
     // The circuit builder needs only (op, col) per spec; out_type is the
     // planner's concern and already shaped reduce_schema above.
-    let circuit_specs: Vec<(u64, usize)> = agg_specs.iter().map(|s| (s.op, s.col)).collect();
+    let circuit_specs: Vec<(u64, usize)> = agg_specs.iter().map(|s| (s.op.as_u64(), s.col)).collect();
     // Two-phase (distributable) path for an all-linear, integer, partitioned GLOBAL
     // aggregate: fold a per-worker partial locally (no exchange), then exchange only
     // the ≤ N partials to V₀'s owner and combine them. A linear aggregate satisfies
@@ -438,7 +332,9 @@ pub(crate) fn emit_group_by_pieces(
     let two_phase = global_ground
         && !source_replicated
         && all_linear
-        && !agg_specs.iter().any(|s| s.op == AGG_SUM && s.out_type.is_float());
+        && !agg_specs
+            .iter()
+            .any(|s| s.op == WireAggFunc::Sum && s.out_type.is_float());
     let reduced = if two_phase {
         // Phase 1 — per-worker local partial. No ExchangeShard, global_ground = false
         // (a worker with no local rows contributes no partial, never a ground row).
@@ -454,20 +350,16 @@ pub(crate) fn emit_group_by_pieces(
         // is unchanged; the trailing COUNT-of-partials is the existence gate (the
         // reduce's cardinality gate finds it via the lone AggOp::Count). global_ground
         // = true: an empty global source emits exactly one ground row here.
-        let mut combine_specs: Vec<(u64, usize)> = circuit_specs
+        // Merge each partial with the shared per-op combine rule
+        // (`AggFunc::merge_func` — the same rule the ad-hoc client combiner
+        // applies). Local output column `1 + i` holds local agg `i` (col 0 is
+        // _group_pk).
+        let mut combine_specs: Vec<(u64, usize)> = agg_specs
             .iter()
             .enumerate()
-            .map(|(i, (op, _))| {
-                let merge = match *op {
-                    AGG_COUNT | AGG_COUNT_NON_NULL => AGG_SUM_ZERO,
-                    AGG_SUM => AGG_SUM,
-                    _ => unreachable!("two_phase implies all-linear, integer specs"),
-                };
-                // Local output column `1 + i` holds local agg `i` (col 0 is _group_pk).
-                (merge, 1 + i)
-            })
+            .map(|(i, s)| (s.op.merge_func().as_u64(), 1 + i))
             .collect();
-        combine_specs.push((AGG_COUNT, 0)); // COUNT-of-partials existence gate
+        combine_specs.push((WireAggFunc::Count.as_u64(), 0)); // COUNT-of-partials existence gate
         cb.reduce_multi(local, &[], &combine_specs, true, ReduceOutKey::SyntheticFold)
     } else if source_replicated {
         // Shard-free: every worker reduces its full local copy to the same global
@@ -477,7 +369,7 @@ pub(crate) fn emit_group_by_pieces(
         cb.reduce_multi(filtered, &reduce_group_cols, &circuit_specs, global_ground, out_key)
     };
 
-    // 6. Post-reduce MAP: project group cols + compute aggregates (AVG = SUM/COUNT)
+    // Post-reduce MAP: project group cols + compute aggregates (AVG = SUM/COUNT)
     //    Reduce output: [pk, (group_cols...), agg0, agg1, ...]
     //    MAP inherits PK from input; ExprProgram writes payload columns only.
     //    Natural-PK group cols are part of that inherited PK region — the alias
@@ -615,7 +507,7 @@ pub(crate) fn emit_group_by_pieces(
     // The result_reg for a MAP program is typically 0 (true = pass through)
     let post_map_prog = post_map_eb.build(0);
 
-    // 7. Optional HAVING filter, applied to the grouped relation *before* the
+    // Optional HAVING filter, applied to the grouped relation *before* the
     //    SELECT projection — the relational order standard SQL specifies. Filter
     //    and map are both row-wise linear operators and commute, so this is
     //    semantically and incrementally sound. Binding against reduce_schema lets
@@ -644,7 +536,7 @@ pub(crate) fn emit_group_by_pieces(
 
     let mapped = cb.map_expr(filtered_reduced, post_map_prog);
 
-    // 8. Sink
+    // Sink
     cb.sink(mapped);
     let circuit = cb.build();
 
@@ -658,20 +550,6 @@ pub(crate) fn emit_group_by_pieces(
     // column. `reduce_schema.pk_cols` is dense (`0..pk_count`).
     let view_pk: Vec<u32> = (0..reduce_schema.pk_cols.len() as u32).collect();
     Ok((circuit, out_cols, view_pk))
-}
-
-/// The physical source column of a bound aggregate argument: `None` for
-/// COUNT(*), the column index for a plain (possibly qualified) reference. A
-/// computed argument (`SUM(a + b)`) is rejected — the engine aggregates a
-/// physical column.
-fn agg_arg_col(arg: Option<&BoundExpr>) -> Result<Option<usize>, GnitzSqlError> {
-    match arg {
-        None => Ok(None),
-        Some(BoundExpr::ColRef(c)) => Ok(Some(*c)),
-        Some(_) => Err(GnitzSqlError::Unsupported(
-            "aggregate on computed expression not supported".to_string(),
-        )),
-    }
 }
 
 /// Resolve a HAVING function call to its aggregate function selector + argument
@@ -695,145 +573,6 @@ fn having_agg_func(
 /// column too, so `MAX(c2)` never binds to `SUM(c1)`.
 fn agg_mapping_matches(m: &AggMapping, agg_func: AggFunc, arg_col: Option<usize>) -> bool {
     m.agg_func == agg_func && (matches!(agg_func, AggFunc::Count) || m.arg_col == arg_col)
-}
-
-/// Push the engine `agg_specs` for one aggregate and return whether it is an
-/// AVG (which materialises two specs — SUM then COUNT_NON_NULL). The single
-/// source of truth for the spec layout — and for each spec's output column type,
-/// recorded here (the one place the AVG split lives) so the reduce schema
-/// builder never reconstructs it from the op code. Shared by the SELECT
-/// projection and the HAVING-only materialisation so the two stay in lockstep —
-/// notably the AVG-emits-two-specs invariant, on which the reduce-output column
-/// positions and `AggMapping::specs_start` both depend.
-fn push_agg_specs(
-    agg_func: AggFunc,
-    arg_col: Option<usize>,
-    schema: &Schema,
-    agg_specs: &mut Vec<AggSpec>,
-) -> Result<AggShape, GnitzSqlError> {
-    // Every aggregate except COUNT(*) needs a column argument, which the specs
-    // below unwrap. Validating here — the single source of truth for spec
-    // layout — covers both the SELECT-list and HAVING callers, so neither needs
-    // its own wildcard guard and a future caller cannot reintroduce the panic.
-    if !matches!(agg_func, AggFunc::Count) && arg_col.is_none() {
-        return Err(GnitzSqlError::Plan(format!(
-            "{agg_func:?} requires an argument column; only COUNT(*) accepts a wildcard"
-        )));
-    }
-    // Reject argument column types the engine cannot evaluate. Single validated
-    // gate for both the SELECT-list and HAVING callers. Both bind their aggregate
-    // call through the leaf binder, which already rejects unorderable MIN/MAX —
-    // that arm here is the backstop; the SUM/AVG arm is the sole gate.
-    if let Some(c) = arg_col {
-        let tc = schema.columns[c].type_code;
-        match agg_func {
-            AggFunc::Sum | AggFunc::Avg => {
-                if !(is_integer_type(tc) || tc.is_float()) || tc.is_wide_int() {
-                    return Err(GnitzSqlError::Bind(format!(
-                        "{agg_func:?} is not supported on column type {tc:?} ('{}')",
-                        schema.columns[c].name,
-                    )));
-                }
-            }
-            AggFunc::Min | AggFunc::Max => {
-                if !is_min_max_orderable(tc) {
-                    return Err(GnitzSqlError::Bind(format!(
-                        "{agg_func:?} is not supported on column type {tc:?} ('{}')",
-                        schema.columns[c].name,
-                    )));
-                }
-            }
-            AggFunc::Count | AggFunc::CountNonNull => {}
-        }
-    }
-    let mut push = |op: u64, func: AggFunc, col: usize| {
-        agg_specs.push(AggSpec {
-            op,
-            col,
-            out_type: agg_result_type(func, Some(col), schema),
-        });
-    };
-    Ok(match agg_func {
-        AggFunc::Count => {
-            push(AGG_COUNT, AggFunc::Count, 0);
-            AggShape::Direct
-        }
-        AggFunc::CountNonNull => {
-            push(AGG_COUNT_NON_NULL, AggFunc::CountNonNull, arg_col.unwrap());
-            AggShape::Direct
-        }
-        AggFunc::Sum => {
-            let c = arg_col.unwrap();
-            push(AGG_SUM, AggFunc::Sum, c);
-            // A nullable source means the group's non-null count can fall back to
-            // zero — its last contributor retracted — while the group still
-            // survives (via COUNT(*) or another aggregate), which SQL renders as
-            // NULL. The raw SUM column cannot express that on the linear fold: its
-            // `has_value` boolean saturates true and never returns to false, so a
-            // netted-to-zero SUM emits a concrete 0 where NULL is correct. Attach a
-            // hidden COUNT_NON_NULL companion and let the finalize null-gate the
-            // SUM on it — distinguishing SUM({5,-5})=0 from SUM({NULL})=NULL. A
-            // non-nullable source can never be NULL on a surviving group, so it
-            // keeps its plain single-spec copy.
-            if schema.columns[c].is_nullable {
-                push(AGG_COUNT_NON_NULL, AggFunc::CountNonNull, c);
-                AggShape::NullfillSum
-            } else {
-                AggShape::Direct
-            }
-        }
-        AggFunc::Min => {
-            push(AGG_MIN, AggFunc::Min, arg_col.unwrap());
-            AggShape::Direct
-        }
-        AggFunc::Max => {
-            push(AGG_MAX, AggFunc::Max, arg_col.unwrap());
-            AggShape::Direct
-        }
-        AggFunc::Avg => {
-            let c = arg_col.unwrap();
-            push(AGG_SUM, AggFunc::Sum, c);
-            push(AGG_COUNT_NON_NULL, AggFunc::CountNonNull, c);
-            AggShape::Avg
-        }
-    })
-}
-
-/// Push the agg_specs + `AggMapping` for one aggregate — the single
-/// construction site, shared by the SELECT projection and the HAVING-only
-/// materialisation (`collect_having_aggs`) so the reduce-output column
-/// positions and the output nullability cannot drift between the two. Reuses
-/// `push_agg_specs` (the spec-layout authority); `is_global` is whether the
-/// group set is empty (a global aggregate's ground row renders NULL).
-fn append_agg_mapping(
-    agg_func: AggFunc,
-    arg_col: Option<usize>,
-    output_name: String,
-    is_global: bool,
-    source_schema: &Schema,
-    agg_specs: &mut Vec<AggSpec>,
-    agg_mappings: &mut Vec<AggMapping>,
-) -> Result<(), GnitzSqlError> {
-    let out_type = agg_result_type(agg_func, arg_col, source_schema);
-    let start = agg_specs.len();
-    let shape = push_agg_specs(agg_func, arg_col, source_schema, agg_specs)?;
-    let output_nullable = match shape {
-        // AVG's and nullable-SUM's null-ness lives in the COUNT_NON_NULL
-        // companion (the finalize renders NULL via div-by-zero), so their
-        // outputs keep the blanket nullable mark.
-        AggShape::Avg | AggShape::NullfillSum => true,
-        AggShape::Direct => direct_agg_nullable(agg_func, arg_col, is_global, source_schema),
-    };
-    agg_mappings.push(AggMapping {
-        specs_start: start,
-        shape,
-        output_name,
-        output_type: out_type,
-        output_nullable,
-        agg_func,
-        arg_col,
-    });
-    Ok(())
 }
 
 /// Recursively collect aggregate calls referenced in a HAVING expression,
@@ -877,12 +616,12 @@ fn collect_having_aggs(
 /// re-passing five unchanging arguments at every node. (The reduce schema
 /// itself is not needed for binding — the caller compiles the bound expression
 /// against it separately.)
-struct HavingCtx<'a> {
-    source_schema: &'a Schema,
-    group_col_indices: &'a [usize],
-    out_key: ReduceOutKey,
-    agg_mappings: &'a [AggMapping],
-    agg_col_offset: usize,
+pub(crate) struct HavingCtx<'a> {
+    pub(crate) source_schema: &'a Schema,
+    pub(crate) group_col_indices: &'a [usize],
+    pub(crate) out_key: ReduceOutKey,
+    pub(crate) agg_mappings: &'a [AggMapping],
+    pub(crate) agg_col_offset: usize,
 }
 
 /// Resolve a HAVING aggregate function reference to its reduce `AggMapping`, or a
@@ -914,7 +653,7 @@ fn resolve_having_mapping<'a>(
 /// HAVING inherits the full operator map (incl. `Mul`/`Div`/`Mod`), `UnaryOp`,
 /// and the `BETWEEN` desugar from the core — the `Having` leaf supplies only the
 /// three grouped-relation decisions.
-fn bind_having_expr(expr: &Expr, ctx: &HavingCtx) -> Result<BoundExpr, GnitzSqlError> {
+pub(crate) fn bind_having_expr(expr: &Expr, ctx: &HavingCtx) -> Result<BoundExpr, GnitzSqlError> {
     bind_structural(expr, &Having { ctx })
 }
 
@@ -1044,93 +783,5 @@ impl LeafBinder for Having<'_> {
                 ))
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::col_def;
-
-    // Columns: 0=pk(U64), 1=n(I64), 2=b(Blob), 3=u(UUID), 4=s(String).
-    fn schema() -> Schema {
-        Schema {
-            columns: vec![
-                col_def("pk", TypeCode::U64, false),
-                col_def("n", TypeCode::I64, true),
-                col_def("b", TypeCode::Blob, true),
-                col_def("u", TypeCode::UUID, true),
-                col_def("s", TypeCode::String, true),
-            ],
-            pk_cols: vec![0],
-        }
-    }
-
-    fn try_push(func: AggFunc, arg_col: Option<usize>) -> Result<AggShape, GnitzSqlError> {
-        let mut specs = Vec::new();
-        push_agg_specs(func, arg_col, &schema(), &mut specs)
-    }
-
-    #[test]
-    fn push_agg_specs_rejects_unevaluatable_arg_types() {
-        assert!(matches!(try_push(AggFunc::Sum, Some(2)), Err(GnitzSqlError::Bind(_)))); // SUM(blob)
-        assert!(matches!(try_push(AggFunc::Avg, Some(3)), Err(GnitzSqlError::Bind(_)))); // AVG(uuid)
-        assert!(matches!(try_push(AggFunc::Min, Some(4)), Err(GnitzSqlError::Bind(_)))); // MIN(str)
-        assert!(matches!(try_push(AggFunc::Max, Some(2)), Err(GnitzSqlError::Bind(_))));
-        // MAX(blob)
-    }
-
-    #[test]
-    fn push_agg_specs_accepts_valid_arg_types() {
-        assert!(try_push(AggFunc::Sum, Some(1)).is_ok()); // SUM(i64)
-        assert!(try_push(AggFunc::Avg, Some(1)).is_ok()); // AVG(i64)
-        assert!(try_push(AggFunc::Min, Some(1)).is_ok()); // MIN(i64)
-        assert!(try_push(AggFunc::Count, None).is_ok()); // COUNT(*)
-        assert!(try_push(AggFunc::CountNonNull, Some(2)).is_ok()); // COUNT(blob) — presence only
-    }
-
-    /// SUM over a U64 source is typed U64 (bit pattern is the correct unsigned
-    /// sum), so a downstream unsigned compare re-seeds; a narrow unsigned / signed
-    /// source widens to I64. MIN/MAX preserve the U64 source type as before.
-    #[test]
-    fn agg_result_type_sum_preserves_u64() {
-        let s = Schema {
-            columns: vec![
-                col_def("pk", TypeCode::U64, false),
-                col_def("u", TypeCode::U64, true),
-                col_def("w", TypeCode::U32, true),
-                col_def("i", TypeCode::I64, true),
-                col_def("f", TypeCode::F64, true),
-            ],
-            pk_cols: vec![0],
-        };
-        assert_eq!(agg_result_type(AggFunc::Sum, Some(1), &s), TypeCode::U64); // SUM(u64) → U64
-        assert_eq!(agg_result_type(AggFunc::Sum, Some(2), &s), TypeCode::I64); // SUM(u32) → I64
-        assert_eq!(agg_result_type(AggFunc::Sum, Some(3), &s), TypeCode::I64); // SUM(i64) → I64
-        assert_eq!(agg_result_type(AggFunc::Sum, Some(4), &s), TypeCode::F64); // SUM(f64) → F64
-        assert_eq!(agg_result_type(AggFunc::Min, Some(1), &s), TypeCode::U64); // MIN(u64) preserved
-    }
-
-    // The Direct-aggregate nullability decision shared by the SELECT projection
-    // (output-schema nullability) and the HAVING `IS [NOT] NULL` const-fold. Col 0
-    // (`pk`, U64) is non-nullable; col 1 (`n`, I64) is nullable.
-    #[test]
-    fn direct_agg_nullable_matches_emit_semantics() {
-        let s = schema();
-        // COUNT / COUNT_NON_NULL: always a concrete integer, grouped or global.
-        assert!(!direct_agg_nullable(AggFunc::Count, None, false, &s));
-        assert!(!direct_agg_nullable(AggFunc::Count, None, true, &s));
-        assert!(!direct_agg_nullable(AggFunc::CountNonNull, Some(1), false, &s));
-        assert!(!direct_agg_nullable(AggFunc::CountNonNull, Some(1), true, &s));
-        // Direct SUM (only reached for a non-nullable source): NULL only globally,
-        // where an empty source seeds a NULL ground row. Grouped never renders NULL.
-        assert!(!direct_agg_nullable(AggFunc::Sum, Some(0), false, &s));
-        assert!(direct_agg_nullable(AggFunc::Sum, Some(0), true, &s));
-        // MIN / MAX: NULL globally (ground row), or grouped over a nullable source
-        // (all-NULL group). Grouped over a non-nullable source never renders NULL.
-        assert!(!direct_agg_nullable(AggFunc::Min, Some(0), false, &s)); // grouped, non-nullable pk
-        assert!(direct_agg_nullable(AggFunc::Min, Some(1), false, &s)); // grouped, nullable n
-        assert!(direct_agg_nullable(AggFunc::Max, Some(0), true, &s)); // global, non-nullable pk
-        assert!(direct_agg_nullable(AggFunc::Max, Some(1), false, &s)); // grouped, nullable n
     }
 }

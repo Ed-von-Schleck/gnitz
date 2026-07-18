@@ -1,12 +1,13 @@
-//! Direct `SELECT`: route a single-relation, non-aggregate SELECT through the
-//! **parameterized bounded read** (`plan_read_spec` → a `ReadSpec` executed
+//! Direct `SELECT`: route a single-relation SELECT through the **parameterized
+//! bounded read** (`plan_read_spec` → a `ReadSpec` rows sink executed
 //! server-side: bound pushdown, predicate, projection, ORDER BY / LIMIT top-k)
-//! and everything else — set-ops, JOINs, DISTINCT / GROUP BY / HAVING,
-//! aggregates, CTEs — through the transient circuit executor. A shape the read
-//! spec cannot serve (a non-projected ORDER BY key, an aggregate, a subquery in
-//! the projection, a WHERE the expression VM cannot compile) falls back to the
-//! executor, which either handles it or produces the same rejection.
+//! or, for aggregate / DISTINCT shapes, through the **fold sink**
+//! (`execute_aggregate_select` → a per-worker hash-fold + client finishing).
+//! Everything else — set-ops, JOINs, CTEs, and any shape either sink cannot
+//! serve — falls back to the transient circuit executor, which either handles
+//! it or produces the same rejection.
 
+use crate::agg::{synthetic_fold_cols, GroupByLayout};
 use crate::ast_util::{
     extract_table_factor_name, flatten_conjuncts, group_by_is_present, is_bare_wildcard_projection,
     projection_has_aggregate,
@@ -15,6 +16,7 @@ use crate::bind::{bind_single_table, Binder};
 use crate::codec::project_schema::{build_read_projection, compile_projection_map};
 use crate::dml::plan::{extract_limit, extract_offset, try_extract_pk_in, try_extract_pk_range};
 use crate::error::GnitzSqlError;
+use crate::exec::agg_finish::{agg_finish, build_agg_out_schema, having_supported, AggFinish};
 use crate::exec::order::{order_limit_passthrough, read_spec_finish, resolve_read_spec_order};
 use crate::ir::{BinOp, BoundExpr};
 use crate::lower::compile_filter_program;
@@ -22,10 +24,11 @@ use crate::plan::index_bound::best_index_bound;
 use crate::plan::validate::{
     reject_unhonored_query_clauses, reject_unhonored_select_clauses, HonoredClauses, HonoredQueryClauses,
 };
+use crate::plan::{analyze_group_by, bind_having_expr, resolve_set_projection, HavingCtx};
 use crate::SqlResult;
 use gnitz_core::protocol::encode_schema_block;
-use gnitz_core::{GnitzClient, PlannedView, Schema, ZSetBatch};
-use gnitz_wire::{ReadBound, ReadSpec};
+use gnitz_core::{GnitzClient, PlannedView, ReduceOutKey, Schema, ZSetBatch, MAX_COLUMNS};
+use gnitz_wire::{AggReadItem, AggReadSpec, ReadBound, ReadSink, ReadSpec};
 use sqlparser::ast::{Expr, LimitClause, Query, Select, SetExpr};
 
 pub(crate) fn execute_select(
@@ -65,13 +68,28 @@ pub(crate) fn execute_select(
         SetExpr::Select(s) if query.with.is_none() => s,
         _ => return execute_select_via_executor(client, query, binder),
     };
-    if select.from.len() != 1
-        || !select.from[0].joins.is_empty()
-        || select.distinct.is_some()
+
+    // A join / comma-join FROM derives a new relation — no single-relation sink
+    // serves it, aggregated or not, so it routes to the executor before the
+    // aggregate split (`SELECT COUNT(*) FROM t1, t2` is a JOIN shape, not an
+    // aggregate over one table).
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return execute_select_via_executor(client, query, binder);
+    }
+
+    // Aggregate / DISTINCT shapes: a single-relation query over a plain table or
+    // view name folds via the fold sink; a derived table (or a fold plan the
+    // shared validation rejects) falls to the transient executor. DISTINCT
+    // takes precedence over GROUP BY (the DISTINCT arm's gate then rejects
+    // GROUP BY), matching the view path.
+    if select.distinct.is_some()
         || group_by_is_present(&select.group_by)
         || select.having.is_some()
         || projection_has_aggregate(select)
     {
+        if let Some(result) = execute_aggregate_select(client, select, query, binder)? {
+            return Ok(result);
+        }
         return execute_select_via_executor(client, query, binder);
     }
 
@@ -197,9 +215,11 @@ fn plan_read_spec(
     let spec = ReadSpec {
         bound,
         predicate,
-        projection,
-        order,
-        limit_k,
+        sink: ReadSink::Rows {
+            projection,
+            order,
+            limit_k,
+        },
     };
     let (recv_schema, batch) = client
         .scan_spec(tid, &spec.encode(), &reply_block)
@@ -210,7 +230,10 @@ fn plan_read_spec(
     //    to the block we built.
     let out_schema = recv_schema.map(|s| (*s).clone()).unwrap_or(reply_schema);
     let batch = batch.unwrap_or_else(|| ZSetBatch::new(&out_schema));
-    let (schema, batch) = read_spec_finish(out_schema, batch, &spec.order, offset, limit);
+    let ReadSink::Rows { order, .. } = &spec.sink else {
+        unreachable!()
+    };
+    let (schema, batch) = read_spec_finish(out_schema, batch, order, offset, limit);
     Ok(Some(SqlResult::Rows { schema, batch }))
 }
 
@@ -292,9 +315,178 @@ fn compile_read_spec_predicate(exprs: &[&Expr], schema: &Schema) -> Result<Vec<u
     }
 }
 
-/// Resolve the ORDER BY clause to wire `OrderKey`s over the (server-projected)
-/// reply columns, **appending any non-projected source column as a hidden payload
-/// column** so it can order the result (§ the read path sorts server-side over a
+// ---------------------------------------------------------------------------
+// execute_aggregate_select — the ad-hoc aggregate / DISTINCT fold
+// ---------------------------------------------------------------------------
+
+/// Serve a single-relation GROUP BY / global aggregate / HAVING / DISTINCT query
+/// via the ReadSpec fold sink (a per-worker hash-fold) + client finishing.
+/// `Ok(Some)` = served; `Ok(None)` = route to the transient executor (a
+/// non-single-relation FROM, a plan wider than one schema, or a shape the shared
+/// validation rejects — the executor serves it or re-raises the identical
+/// error); `Err(Bind)` = a hard bind error. The only hard ad-hoc error is the
+/// runtime per-worker group cap, surfaced from the wire call.
+fn execute_aggregate_select(
+    client: &mut GnitzClient,
+    select: &Select,
+    query: &Query,
+    binder: &mut Binder<'_>,
+) -> Result<Option<SqlResult>, GnitzSqlError> {
+    // The caller routed joins already; a derived table cannot fold either.
+    let Ok(table_name) = extract_table_factor_name(&select.from[0].relation, "FROM") else {
+        return Ok(None);
+    };
+    let is_distinct = select.distinct.is_some();
+
+    // The routing split sits above the shared clause gate, so invoke it here —
+    // `grouping`/`distinct` per query. DISTINCT's arm sets `grouping:false`, so a
+    // query with both DISTINCT and GROUP BY is rejected (DISTINCT-first). The
+    // unconditional PREWHERE/TOP/QUALIFY/DISTINCT-ON rejection is preserved.
+    reject_unhonored_select_clauses(
+        select,
+        HonoredClauses {
+            where_filter: true,
+            grouping: !is_distinct,
+            distinct: is_distinct,
+        },
+        if is_distinct {
+            "SELECT DISTINCT"
+        } else {
+            "aggregate SELECT"
+        },
+    )?;
+
+    let (tid, schema) = binder.resolve(client, &table_name)?;
+
+    // Resolve the physical layout (shared with the view path). DISTINCT is the
+    // degenerate grouped fold — zero aggregates over the set-op projection
+    // resolver (bare columns only, float keys rejected); GROUP BY / global
+    // aggregates use the shared `analyze_group_by`.
+    let layout = if is_distinct {
+        let Some((indices, out_cols)) =
+            hard_or_route(resolve_set_projection(&select.projection, &schema, "SELECT DISTINCT"))?
+        else {
+            return Ok(None);
+        };
+        GroupByLayout::distinct(indices, &out_cols)
+    } else {
+        let Some(layout) = hard_or_route(analyze_group_by(select, &schema))? else {
+            return Ok(None);
+        };
+        layout
+    };
+    let n_group = layout.group_col_indices.len();
+
+    // The one width invariant bounding a fold plan: the partial reply layout
+    // `[_group_pk | group cols | agg partials]` must be a legal schema. Wider
+    // (e.g. many repeated aggregates) → the executor (no cap), never an error.
+    if 1 + n_group + layout.agg_specs.len() > MAX_COLUMNS {
+        return Ok(None);
+    }
+
+    // The final output schema — built at plan time so a duplicate output name
+    // rejects before any dispatch, exactly as every view compile does (the
+    // executor re-raises the identical duplicate-name error).
+    let Some(out_schema) = hard_or_route(build_agg_out_schema(&layout, &schema))? else {
+        return Ok(None);
+    };
+
+    // The partial reply schema — the shared SyntheticFold reduce-output layout
+    // the worker emits and echoes back (parity with the view path's reduce
+    // schema by construction). Partial agg columns are nullable: an all-NULL
+    // SUM/MIN/MAX group emits a NULL partial the client must carry.
+    let partial_schema = Schema::from_parts(
+        synthetic_fold_cols(&schema, &layout.group_col_indices, &layout.agg_specs, true),
+        vec![0],
+    )
+    .map_err(|e| GnitzSqlError::Unsupported(format!("ad-hoc aggregate reply schema is invalid: {e}")))?;
+
+    // HAVING: bind against the SyntheticFold reduce layout, then probe the typed
+    // IEEE evaluator over that layout; a non-numeric / string / U64 / wide
+    // HAVING routes the whole query to the executor at plan time.
+    let bound_having = match &select.having {
+        Some(having_expr) => {
+            let ctx = HavingCtx {
+                source_schema: &schema,
+                group_col_indices: &layout.group_col_indices,
+                out_key: ReduceOutKey::SyntheticFold,
+                agg_mappings: &layout.agg_mappings,
+                agg_col_offset: layout.synthetic_agg_col_offset(),
+            };
+            let Some(bound) = hard_or_route(bind_having_expr(having_expr, &ctx))? else {
+                return Ok(None);
+            };
+            if !having_supported(&bound, &partial_schema) {
+                return Ok(None);
+            }
+            Some(bound)
+        }
+        None => None,
+    };
+
+    // WHERE → bound + residual predicate, exactly as the plain read path (the
+    // grouped view applies WHERE via the identical compiler, so a WHERE that fails
+    // here also fails the executor — no works→error regression).
+    let (bound, pred_exprs) = extract_bound(client, tid, &schema, select.selection.as_ref())?;
+    let Some(predicate) = hard_or_route(compile_read_spec_predicate(&pred_exprs, &schema))? else {
+        return Ok(None);
+    };
+
+    let limit = extract_limit(query)?;
+    let offset = extract_offset(query)?;
+    // `LIMIT 0` short-circuits to an empty result — no request dispatched
+    // (parity with the rows path).
+    if limit == Some(0) {
+        let batch = ZSetBatch::new(&out_schema);
+        return Ok(Some(SqlResult::Rows {
+            schema: out_schema,
+            batch,
+        }));
+    }
+
+    let spec = ReadSpec {
+        bound,
+        predicate,
+        sink: ReadSink::Fold(AggReadSpec {
+            group_cols: layout.group_col_indices.iter().map(|&c| c as u16).collect(),
+            aggs: layout
+                .agg_specs
+                .iter()
+                .map(|s| AggReadItem {
+                    op: s.op,
+                    src_col: s.col as u16,
+                })
+                .collect(),
+        }),
+    };
+    let reply_block = encode_schema_block(&partial_schema, tid as u32);
+
+    // Dispatch. A wire error (including the runtime per-worker group cap) is HARD —
+    // by now the fold is mid-flight on the workers and cannot fall back.
+    let (_recv_schema, batch) = client
+        .scan_spec(tid, &spec.encode(), &reply_block)
+        .map_err(GnitzSqlError::Exec)?;
+    let partial = batch.unwrap_or_else(|| ZSetBatch::new(&partial_schema));
+
+    // Client finishing (combine by group value, ground row, AVG/NullfillSum,
+    // HAVING, projection), then the shared ORDER BY / OFFSET / LIMIT sink.
+    let finish = AggFinish {
+        source_schema: &schema,
+        layout: &layout,
+        partial_schema: &partial_schema,
+        out_schema: &out_schema,
+        having: bound_having.as_ref(),
+    };
+    let out_batch = agg_finish(&finish, &partial)?;
+
+    let (schema_out, batch_out) =
+        order_limit_passthrough(out_schema, out_batch, query.order_by.as_ref(), offset, limit)?;
+    Ok(Some(SqlResult::Rows {
+        schema: schema_out,
+        batch: batch_out,
+    }))
+}
+
 /// The executor branch: compile the SELECT into the same circuit a CREATE VIEW
 /// would build, run it once as a transient, and apply the shared client-side
 /// ordering sink (ORDER BY / OFFSET / LIMIT) over the streamed result. The

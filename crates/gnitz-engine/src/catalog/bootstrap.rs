@@ -1,4 +1,5 @@
 use super::*;
+use crate::foundation::env::env_usize;
 
 impl CatalogEngine {
     // -- Open engine (main entry point) ------------------------------------
@@ -59,11 +60,11 @@ impl CatalogEngine {
             // rounds (lockstep padding, SAL reclaim) over small tables. A 0 or
             // unparseable value falls back to the default (drain_chunk requires
             // max_rows > 0).
-            ddl_scan_chunk_rows: std::env::var("GNITZ_DDL_SCAN_CHUNK_ROWS")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|&n| n > 0)
-                .unwrap_or(crate::storage::DDL_SCAN_CHUNK_ROWS),
+            ddl_scan_chunk_rows: env_usize("GNITZ_DDL_SCAN_CHUNK_ROWS", crate::storage::DDL_SCAN_CHUNK_ROWS),
+            // Per-worker distinct-group cap for the ad-hoc aggregate fold.
+            // `GNITZ_ADHOC_GROUP_CAP` overrides it (E2E can shrink it to force
+            // the cap error).
+            adhoc_group_cap: env_usize("GNITZ_ADHOC_GROUP_CAP", super::ADHOC_GROUP_CAP),
         };
 
         if is_new {

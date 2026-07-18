@@ -1,3 +1,4 @@
+mod agg;
 mod ast_util;
 mod bind;
 mod codec;

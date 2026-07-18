@@ -253,6 +253,14 @@ def race_server(monkeypatch):
 
 
 @pytest.fixture
+def adhoc_group_cap_server(monkeypatch):
+    """Server with a tiny ad-hoc aggregate per-worker group cap, to exercise the
+    GROUP BY resource-exhaustion abort (`GNITZ_ADHOC_GROUP_CAP`). Not a debug-only
+    seam — the cap is read at bootstrap on every build."""
+    yield from _seamed_server(monkeypatch, {"GNITZ_ADHOC_GROUP_CAP": "4"})
+
+
+@pytest.fixture
 def unique_preflight_frame_server(monkeypatch):
     """Server whose CREATE UNIQUE INDEX pre-flight streams tiny (7-key) frames
     so a small table already produces multi-frame continuation trains per

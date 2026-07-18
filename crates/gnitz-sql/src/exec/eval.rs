@@ -185,25 +185,19 @@ impl BoundExprBackend for InterpBackend<'_> {
             None => return Ok(None),
             Some(v) => v,
         };
+        // Divide/mod by zero is SQL NULL — the same semantics the engine expr
+        // VM's `div_like` applies (zero divisor marks the row NULL), so a
+        // residual filter and a compiled circuit filter agree.
+        if matches!(op, BinOp::Div | BinOp::Mod) && rv == 0 {
+            return Ok(None);
+        }
         Ok(Some(match op {
             BinOp::Add => lv.wrapping_add(rv),
             BinOp::Sub => lv.wrapping_sub(rv),
             BinOp::Mul => lv.wrapping_mul(rv),
             // wrapping_div/rem prevent the i64::MIN / -1 overflow panic.
-            BinOp::Div => {
-                if rv == 0 {
-                    0
-                } else {
-                    lv.wrapping_div(rv)
-                }
-            }
-            BinOp::Mod => {
-                if rv == 0 {
-                    0
-                } else {
-                    lv.wrapping_rem(rv)
-                }
-            }
+            BinOp::Div => lv.wrapping_div(rv),
+            BinOp::Mod => lv.wrapping_rem(rv),
             BinOp::Eq => (lv == rv) as i64,
             BinOp::Ne => (lv != rv) as i64,
             BinOp::Gt => (lv > rv) as i64,
@@ -376,6 +370,19 @@ mod tests {
             Box::new(BoundExpr::LitInt(-1)),
         );
         assert!(eval_expr(&expr, &batch, 0, &schema).is_ok());
+    }
+
+    /// Divide/mod by zero is SQL NULL — the engine expr VM's `div_like`
+    /// semantics, shared by every consumer of this interpreter (residual
+    /// filters, DML `SET` / ON CONFLICT expressions).
+    #[test]
+    fn test_div_mod_by_zero_is_null() {
+        let schema = two_col(TypeCode::I64);
+        let batch = batch_2col(7i64.to_le_bytes().to_vec(), TypeCode::I64, 0);
+        for op in [BinOp::Div, BinOp::Mod] {
+            let expr = BoundExpr::BinOp(Box::new(BoundExpr::ColRef(1)), op, Box::new(BoundExpr::LitInt(0)));
+            assert_eq!(eval_expr(&expr, &batch, 0, &schema).unwrap(), None);
+        }
     }
 
     // ------------------------------------------------------------------

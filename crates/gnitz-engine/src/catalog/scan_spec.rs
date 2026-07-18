@@ -1,8 +1,9 @@
 //! Parameterized bounded read (`ReadSpec`) execution — the worker half of the
 //! ad-hoc SELECT scan. Runs **once per worker over one merged partition cursor**:
-//! open a cursor for the bound, then per chunk `op_filter(predicate)` →
-//! `op_map(projection)` → the bounded top-k / materialize sink. No DBSP circuit,
-//! no operator state, no exchange.
+//! open a cursor for the bound, then per chunk `op_filter(predicate)` → the
+//! sink — rows (`op_map(projection)` → bounded top-k / materialize) or the
+//! aggregate hash-fold (`AdhocFold`). No DBSP circuit, no operator state, no
+//! exchange.
 //!
 //! The reply schema arrives as the client's raw echoed wire block (decoded by the
 //! worker one layer up); this module takes the decoded `SchemaDescriptor` and
@@ -10,12 +11,12 @@
 
 use std::cmp::Ordering;
 
-use gnitz_wire::{RangeDescriptor, ReadBound, ReadSpec, TypeCode};
+use gnitz_wire::{AggReadSpec, OrderKey, RangeDescriptor, ReadBound, ReadSink, ReadSpec, TypeCode};
 
 use super::store_io::SourceCursor;
 use super::*;
 use crate::expr::{LogicalProgram, ScalarFunc};
-use crate::ops::{op_filter, op_map, ReindexSpec};
+use crate::ops::{op_filter, op_map, AdhocFold, ReindexSpec};
 use crate::schema::key::opk_key;
 use crate::schema::{null_bit, ColumnLocator, MAX_PK_BYTES};
 use crate::storage::{cmp_col_window, compare_pk_bytes, compare_rows, ColumnarSource, PkBuf};
@@ -32,9 +33,11 @@ impl CatalogEngine {
     /// wire block and replies by force-including those raw bytes; this method does
     /// the bound walk, predicate, projection, and ORDER BY / LIMIT reduction.
     ///
-    /// `Err` on a corrupt program blob, a reply/​source PK-stride mismatch, or a
-    /// missing wide-int index — every one a corrupt/stale frame, surfaced as a
-    /// `STATUS_ERROR` reply.
+    /// `Err` on a corrupt program blob, a reply schema that does not match the
+    /// sink's expected shape (rows: PK-stride equality; fold: the derived
+    /// SyntheticFold layout), a missing wide-int index — every one a
+    /// corrupt/stale frame, surfaced as a `STATUS_ERROR` reply — or the fold's
+    /// per-worker group cap (a resource-exhaustion abort).
     pub(crate) fn scan_spec_family(
         &mut self,
         target_id: i64,
@@ -43,40 +46,60 @@ impl CatalogEngine {
     ) -> Result<Batch, String> {
         let src_schema = self.table_entry(target_id)?.schema;
 
-        // op_map's identity reindex byte-copies the source OPK verbatim into the
-        // reply PK region, gated on stride equality (a mismatch would zero-fill it
-        // and corrupt the client's PK tiebreak). The trusted planner always
-        // matches; this guards the echoed client blob.
-        if reply_schema.pk_stride() != src_schema.pk_stride() {
-            return Err(format!(
-                "scan_spec: reply pk_stride {} != source pk_stride {}",
-                reply_schema.pk_stride(),
-                src_schema.pk_stride()
-            ));
-        }
-
-        // Compile the predicate/projection once per request, exactly as the
-        // circuit compiler does (`query/compiler/emit.rs`).
+        // Compile the predicate once per request, exactly as the circuit
+        // compiler does (`query/compiler/emit.rs`).
         let predicate = match spec.predicate.is_empty() {
             true => None,
             false => Some(compile_predicate(&spec.predicate, &src_schema)?),
         };
-        let projection = match spec.projection.is_empty() {
-            true => None,
-            false => Some(compile_projection(&spec.projection, &src_schema, reply_schema)?),
-        };
 
         let chunk_rows = self.ddl_scan_chunk_rows.max(1);
         let mut source = self.open_scan_spec_cursor(target_id, &spec.bound, &src_schema)?;
-        Ok(run_scan_spec_sink(
-            &mut source,
-            predicate.as_ref(),
-            projection.as_ref(),
-            &src_schema,
-            reply_schema,
-            spec,
-            chunk_rows,
-        ))
+
+        match &spec.sink {
+            ReadSink::Fold(agg) => run_scan_fold_sink(
+                &mut source,
+                predicate.as_ref(),
+                &src_schema,
+                reply_schema,
+                agg,
+                chunk_rows,
+                self.adhoc_group_cap,
+            ),
+            ReadSink::Rows {
+                projection,
+                order,
+                limit_k,
+            } => {
+                // op_map's identity reindex byte-copies the source OPK verbatim
+                // into the reply PK region, gated on stride equality (a mismatch
+                // would zero-fill it and corrupt the client's PK tiebreak). The
+                // trusted planner always matches; this guards the echoed client
+                // blob. (A fold sink emits a synthetic `_agg_pk` PK and never
+                // byte-copies the source PK, so the guard is rows-sink-only.)
+                if reply_schema.pk_stride() != src_schema.pk_stride() {
+                    return Err(format!(
+                        "scan_spec: reply pk_stride {} != source pk_stride {}",
+                        reply_schema.pk_stride(),
+                        src_schema.pk_stride()
+                    ));
+                }
+                let projection = match projection.is_empty() {
+                    true => None,
+                    false => Some(compile_projection(projection, &src_schema, reply_schema)?),
+                };
+                Ok(run_scan_rows_sink(
+                    &mut source,
+                    predicate.as_ref(),
+                    projection.as_ref(),
+                    &src_schema,
+                    reply_schema,
+                    order,
+                    *limit_k,
+                    chunk_rows,
+                ))
+            }
+        }
     }
 
     /// Open the source cursor for `bound` over `source`'s merged partitions.
@@ -224,29 +247,61 @@ impl ScanSpecCursor {
     }
 }
 
-/// Run the two-shape sink over `source`. Returns one keeper batch in the
+/// Run the fold sink over `source`: fold every surviving chunk into per-group
+/// accumulators and return the partial reduce-output rows — or `Err` when the
+/// per-worker group cap is exceeded (a resource-exhaustion abort, before any
+/// data frame is sent). A fold spec carries no projection: survivors fold
+/// directly.
+fn run_scan_fold_sink(
+    source: &mut ScanSpecCursor,
+    predicate: Option<&ScalarFunc>,
+    src_schema: &SchemaDescriptor,
+    reply_schema: &SchemaDescriptor,
+    agg: &AggReadSpec,
+    chunk_rows: usize,
+    group_cap: usize,
+) -> Result<Batch, String> {
+    let mut fold = AdhocFold::new(src_schema, reply_schema, agg, group_cap)?;
+    while let Some(chunk) = source.next_chunk(chunk_rows) {
+        if chunk.count == 0 {
+            continue;
+        }
+        let filtered = match predicate {
+            Some(f) => op_filter(&chunk, f, src_schema),
+            None => chunk,
+        };
+        if filtered.count == 0 {
+            continue;
+        }
+        fold.fold_chunk(&filtered)?;
+    }
+    Ok(fold.finish())
+}
+
+/// Run the rows sink over `source`, returning one keeper batch in the
 /// `reply_schema` shape (a superset of this worker's contribution; the client
 /// re-sorts the concatenation and applies the exact window).
-fn run_scan_spec_sink(
+#[allow(clippy::too_many_arguments)]
+fn run_scan_rows_sink(
     source: &mut ScanSpecCursor,
     predicate: Option<&ScalarFunc>,
     projection: Option<&ScalarFunc>,
     src_schema: &SchemaDescriptor,
     reply_schema: &SchemaDescriptor,
-    spec: &ReadSpec,
+    order: &[OrderKey],
+    limit_k: u64,
     chunk_rows: usize,
 ) -> Batch {
-    let limit_k = spec.limit_k;
     // Bounded top-k: an ORDER BY with a small window. Everything else materializes
     // (an ORDER-BY early-stop would truncate in cursor order, not sort order).
-    let topk = !spec.order.is_empty() && limit_k > 0 && limit_k <= MAX_WORKER_TOPK;
+    let topk = !order.is_empty() && limit_k > 0 && limit_k <= MAX_WORKER_TOPK;
     // No-ORDER-BY early stop: drain until the summed survivor weight reaches the
     // window. Draining in `limit_k`-sized chunks is what makes this O(limit_k)
     // rather than O(chunk) — but only when every drained row survives. With a
     // predicate, survivors ≪ drained rows and a tiny chunk degrades to
     // row-at-a-time cursor driving, so drain full chunks instead and over-read
     // at most one chunk.
-    let early_stop = spec.order.is_empty() && limit_k > 0;
+    let early_stop = order.is_empty() && limit_k > 0;
     let drain_rows = if early_stop && predicate.is_none() {
         (limit_k as usize).clamp(1, chunk_rows)
     } else {
@@ -254,8 +309,7 @@ fn run_scan_spec_sink(
     };
 
     // Pre-resolve each ORDER BY key to its reply-schema locator (the top-k shape).
-    let order_locs: Vec<OrderLocator> = spec
-        .order
+    let order_locs: Vec<OrderLocator> = order
         .iter()
         .map(|k| OrderLocator {
             loc: reply_schema.locate(k.col as usize),

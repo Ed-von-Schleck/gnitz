@@ -36,6 +36,25 @@ pub(crate) const fn from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_indices: 
     SchemaDescriptor::new(head, pk_indices)
 }
 
+/// Copy `schema`'s PK columns to `cols[..pk_count]` and populate `pk_idx`
+/// with `[0, 1, ..., pk_count - 1]`. Returns `pk_count`. PK columns always
+/// occupy the leading positions of the output schema, so the new PK
+/// indices are dense and identical to the loop counter. The shared prologue
+/// of every derived-schema builder (join/map/reduce/null-extend outputs).
+pub(crate) fn copy_pk_columns_into(
+    schema: &SchemaDescriptor,
+    cols: &mut [SchemaColumn],
+    pk_idx: &mut [u32; MAX_PK_COLUMNS],
+) -> usize {
+    let mut k = 0;
+    for (_, _, c) in schema.pk_columns() {
+        cols[k] = *c;
+        pk_idx[k] = k as u32;
+        k += 1;
+    }
+    k
+}
+
 // ---------------------------------------------------------------------------
 // Schema descriptor
 // ---------------------------------------------------------------------------

@@ -131,7 +131,7 @@ fn hash_shard_side(
 /// aliased column references; rejects computed expressions (which have no
 /// meaningful set identity here) with a clean error rather than silently
 /// dropping them.
-fn resolve_set_projection(
+pub(crate) fn resolve_set_projection(
     projection: &[SelectItem],
     source_schema: &Schema,
     context: &str,

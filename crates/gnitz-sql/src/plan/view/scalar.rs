@@ -499,7 +499,7 @@ fn lower_subquery<'a>(
 ) -> Result<LoweredSub<'a>, GnitzSqlError> {
     let split = resolve_and_split(client, binder, q, outer)?;
     let (agg_func, agg_arg_col) = classify_aggregate(split.proj_expr, &split.inner_schema)?;
-    let agg_tc = group_by::agg_result_type(agg_func, agg_arg_col, &split.inner_schema);
+    let agg_tc = crate::agg::agg_result_type(agg_func, agg_arg_col, &split.inner_schema);
     Ok(LoweredSub {
         corr: split.corr,
         inner_tid: split.inner_tid,
@@ -541,7 +541,7 @@ fn lower_quantifier<'a>(
                 .into(),
         ));
     }
-    let agg_tc = group_by::agg_result_type(agg_func, Some(col), &split.inner_schema);
+    let agg_tc = crate::agg::agg_result_type(agg_func, Some(col), &split.inner_schema);
     Ok(LoweredSub {
         corr: split.corr,
         inner_tid: split.inner_tid,

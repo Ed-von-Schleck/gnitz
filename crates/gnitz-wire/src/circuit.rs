@@ -121,6 +121,22 @@ impl AggFunc {
     pub fn as_u64(self) -> u64 {
         self as u64
     }
+
+    /// The aggregate that merges this aggregate's per-worker **partials** —
+    /// THE shared combine rule (its two consumers must never drift: the
+    /// planner's two-phase global-aggregate combine reduce, and the ad-hoc
+    /// fold's client-side cross-worker combiner). COUNT/COUNT_NON_NULL
+    /// partials sum with `SumZero` (a count's empty value is 0, not NULL);
+    /// SUM partials sum with plain `Sum` (NULL ground); MIN/MAX partials
+    /// merge by re-applying themselves.
+    pub fn merge_func(self) -> AggFunc {
+        match self {
+            AggFunc::Count | AggFunc::CountNonNull | AggFunc::SumZero => AggFunc::SumZero,
+            AggFunc::Sum => AggFunc::Sum,
+            AggFunc::Min => AggFunc::Min,
+            AggFunc::Max => AggFunc::Max,
+        }
+    }
 }
 
 /// Output type code of an aggregate over a source column of type `src_tc` —

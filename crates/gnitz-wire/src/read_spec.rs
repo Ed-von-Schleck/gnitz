@@ -1,15 +1,18 @@
 // ---------------------------------------------------------------------------
 // ReadSpec — the parameterized-scan descriptor for an ad-hoc bounded SELECT.
 //
-// One wire descriptor carries bound extraction, predicate evaluation,
-// projection, and ORDER BY / LIMIT top-k out to the workers, executed
-// single-pass over each worker's merged partition cursor. Both client
-// (gnitz-core) and engine (gnitz-engine worker) share this encoder/decoder —
-// the same drift-safety rule `RangeDescriptor` follows. The master forwards the
-// encoded blob verbatim (it never decodes the bound); the worker decodes it at
-// the trust boundary and rejects any malformed frame.
+// One wire descriptor carries bound extraction, predicate evaluation, and the
+// sink — row forwarding (projection + ORDER BY / LIMIT top-k) or an aggregate
+// fold — out to the workers, executed single-pass over each worker's merged
+// partition cursor. Both client (gnitz-core) and engine (gnitz-engine worker)
+// share this encoder/decoder — the same drift-safety rule `RangeDescriptor`
+// follows. The master forwards the encoded blob verbatim (it never decodes the
+// bound); the worker decodes it at the trust boundary and rejects any
+// malformed frame.
 // ---------------------------------------------------------------------------
 
+use crate::catalog::MAX_COLUMNS;
+use crate::circuit::AggFunc;
 use crate::range::RangeDescriptor;
 
 /// ORDER BY keys apply in sequence; a spec carries at most this many.
@@ -19,12 +22,15 @@ pub const MAX_PK_SET_KEYS: usize = 65_536;
 /// Decode-side ceiling on a full encoded `ReadSpec` blob.
 pub const MAX_READ_SPEC_BYTES: usize = 2 << 20;
 
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 const BOUND_NONE: u8 = 0;
 const BOUND_PK_RANGE: u8 = 1;
 const BOUND_INDEX_RANGE: u8 = 2;
 const BOUND_PK_SET: u8 = 3;
+
+const SINK_ROWS: u8 = 0;
+const SINK_FOLD: u8 = 1;
 
 const ORDER_DESC: u8 = 1 << 0;
 const ORDER_NULLS_FIRST: u8 = 1 << 1;
@@ -38,6 +44,63 @@ pub struct OrderKey {
     pub col: u16,
     pub desc: bool,
     pub nulls_first: bool,
+}
+
+/// One physical aggregate item in a fold sink. This is the physical reduce
+/// layout the view planner's `push_agg_specs` produces — **not** the SELECT
+/// list: AVG contributes `[Sum, CountNonNull]`, a nullable SUM carries its
+/// `CountNonNull` companion, HAVING-only aggregates append items. `src_col` is
+/// a source-schema column index (`col 0` for COUNT(*), whose arm never reads
+/// the column).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AggReadItem {
+    pub op: AggFunc,
+    pub src_col: u16,
+}
+
+/// The fold sink's aggregate spec: a per-worker hash-fold over the scanned
+/// rows. `group_cols` are source-schema indices (empty = a global aggregate;
+/// `aggs = []` = `SELECT DISTINCT` over `group_cols`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggReadSpec {
+    pub group_cols: Vec<u16>,
+    pub aggs: Vec<AggReadItem>,
+}
+
+/// What the worker does with the rows surviving `bound` + `predicate` —
+/// exactly one of the two sinks. A fold carries no projection / ORDER BY /
+/// LIMIT because all SQL-level finishing on an aggregate result is
+/// client-side; the enum makes that unrepresentable rather than decode-checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadSink {
+    /// Forward rows: projection → ORDER BY / LIMIT top-k.
+    Rows {
+        /// Compiled projection map program over the SOURCE schema → reply
+        /// payload columns. Empty = identity (reply schema == source schema).
+        projection: Vec<u8>,
+        /// ORDER BY keys applied in sequence; `col` indices refer to the REPLY
+        /// schema. `len ≤ MAX_ORDER_KEYS`.
+        order: Vec<OrderKey>,
+        /// OFFSET + LIMIT in logical rows (summed weight). 0 = unbounded.
+        /// (`LIMIT 0` never reaches the wire — the SQL layer short-circuits an
+        /// empty window.)
+        limit_k: u64,
+    },
+    /// Fold rows into per-group accumulators (GROUP BY / global aggregate /
+    /// DISTINCT) and emit partial reduce-output rows.
+    Fold(AggReadSpec),
+}
+
+impl ReadSink {
+    /// The identity sink: forward every surviving row unprojected, unordered,
+    /// unbounded.
+    pub fn all_rows() -> Self {
+        ReadSink::Rows {
+            projection: Vec::new(),
+            order: Vec::new(),
+            limit_k: 0,
+        }
+    }
 }
 
 /// The bound a `ReadSpec` walks before predicate/projection. `RangeDescriptor`
@@ -77,23 +140,15 @@ impl ReadBound {
     }
 }
 
-/// A parameterized bounded scan: bound → predicate → projection → ORDER BY /
-/// LIMIT, executed on the workers over one merged partition cursor.
+/// A parameterized bounded scan: bound → predicate → sink (row forwarding or
+/// aggregate fold), executed on the workers over one merged partition cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadSpec {
     pub bound: ReadBound,
     /// Compiled predicate over the SOURCE schema ("EXPR" blob). Empty = the
     /// bound is exact and no residual filter runs.
     pub predicate: Vec<u8>,
-    /// Compiled projection map program over the SOURCE schema → reply payload
-    /// columns. Empty = identity (reply schema == source schema).
-    pub projection: Vec<u8>,
-    /// ORDER BY keys applied in sequence; `col` indices refer to the REPLY
-    /// schema. `len ≤ MAX_ORDER_KEYS`.
-    pub order: Vec<OrderKey>,
-    /// OFFSET + LIMIT in logical rows (summed weight). 0 = unbounded. (`LIMIT 0`
-    /// never reaches the wire — the SQL layer short-circuits an empty window.)
-    pub limit_k: u64,
+    pub sink: ReadSink,
 }
 
 /// Pack a ScanSpec request's control-block `seek_pk_extra` blob: the encoded
@@ -204,9 +259,25 @@ fn read_range_descriptor(r: &mut Reader) -> Result<RangeDescriptor, String> {
 impl ReadSpec {
     /// Serialise to a version-prefixed LE byte sequence (§ layout below).
     pub fn encode(&self) -> Vec<u8> {
-        // Header: version | bound_kind | n_order_keys | reserved | u64 limit_k.
-        let mut out = vec![VERSION, self.bound.kind(), self.order.len() as u8, 0u8];
-        out.extend_from_slice(&self.limit_k.to_le_bytes());
+        // Header: version | bound_kind | sink_tag | reserved. One up-front
+        // reservation covering every section (64 covers the fixed header,
+        // range descriptors, and section length prefixes).
+        let sink_tag = match &self.sink {
+            ReadSink::Rows { .. } => SINK_ROWS,
+            ReadSink::Fold(_) => SINK_FOLD,
+        };
+        let cap = 64
+            + self.predicate.len()
+            + match &self.bound {
+                ReadBound::PkSet(keys) => 16 * keys.len(),
+                _ => 0,
+            }
+            + match &self.sink {
+                ReadSink::Rows { projection, order, .. } => projection.len() + 4 * order.len(),
+                ReadSink::Fold(agg) => 2 * agg.group_cols.len() + 3 * agg.aggs.len(),
+            };
+        let mut out = Vec::with_capacity(cap);
+        out.extend_from_slice(&[VERSION, self.bound.kind(), sink_tag, 0u8]);
 
         match &self.bound {
             ReadBound::None => {}
@@ -223,30 +294,52 @@ impl ReadSpec {
             }
         }
 
-        for key in &self.order {
-            out.extend_from_slice(&key.col.to_le_bytes());
-            let mut flags = 0u8;
-            if key.desc {
-                flags |= ORDER_DESC;
-            }
-            if key.nulls_first {
-                flags |= ORDER_NULLS_FIRST;
-            }
-            out.push(flags);
-            out.push(0u8); // reserved
-        }
-
         out.extend_from_slice(&(self.predicate.len() as u32).to_le_bytes());
         out.extend_from_slice(&self.predicate);
-        out.extend_from_slice(&(self.projection.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.projection);
+
+        match &self.sink {
+            ReadSink::Rows {
+                projection,
+                order,
+                limit_k,
+            } => {
+                out.push(order.len() as u8);
+                out.extend_from_slice(&limit_k.to_le_bytes());
+                for key in order {
+                    out.extend_from_slice(&key.col.to_le_bytes());
+                    let mut flags = 0u8;
+                    if key.desc {
+                        flags |= ORDER_DESC;
+                    }
+                    if key.nulls_first {
+                        flags |= ORDER_NULLS_FIRST;
+                    }
+                    out.push(flags);
+                    out.push(0u8); // reserved
+                }
+                out.extend_from_slice(&(projection.len() as u32).to_le_bytes());
+                out.extend_from_slice(projection);
+            }
+            ReadSink::Fold(agg) => {
+                out.extend_from_slice(&(agg.group_cols.len() as u16).to_le_bytes());
+                for &c in &agg.group_cols {
+                    out.extend_from_slice(&c.to_le_bytes());
+                }
+                out.push(agg.aggs.len() as u8);
+                for item in &agg.aggs {
+                    out.push(item.op as u8);
+                    out.extend_from_slice(&item.src_col.to_le_bytes());
+                }
+            }
+        }
         out
     }
 
     /// Decode and validate at the trust boundary. Rejects: an over-cap blob,
-    /// unknown version/kind, order-key or PkSet count over cap, a raw-u128
-    /// duplicate PkSet key (dedup is type-agnostic), an unknown order flag bit,
-    /// length overflows/truncation, and trailing bytes.
+    /// unknown version/kind/sink tag, order-key / PkSet / fold-section count
+    /// over cap, a raw-u128 duplicate PkSet key (dedup is type-agnostic), an
+    /// unknown order flag bit or aggregate op, length overflows/truncation, and
+    /// trailing bytes.
     pub fn decode(buf: &[u8]) -> Result<Self, String> {
         if buf.len() > MAX_READ_SPEC_BYTES {
             return Err(format!(
@@ -260,13 +353,8 @@ impl ReadSpec {
             return Err(format!("read_spec: unknown version {version}"));
         }
         let bound_kind = r.u8()?;
-        let n_order = r.u8()? as usize;
+        let sink_tag = r.u8()?;
         let _reserved = r.u8()?;
-        let limit_k = r.u64()?;
-
-        if n_order > MAX_ORDER_KEYS {
-            return Err(format!("read_spec: {n_order} order keys exceeds cap {MAX_ORDER_KEYS}"));
-        }
 
         let bound = match bound_kind {
             BOUND_NONE => ReadBound::None,
@@ -295,37 +383,75 @@ impl ReadSpec {
             other => return Err(format!("read_spec: unknown bound kind {other}")),
         };
 
-        let mut order = Vec::with_capacity(n_order);
-        for _ in 0..n_order {
-            let col = r.u16()?;
-            let flags = r.u8()?;
-            if flags & !(ORDER_DESC | ORDER_NULLS_FIRST) != 0 {
-                return Err(format!("read_spec: order key has unknown flag bits {flags:#04x}"));
-            }
-            let _rsv = r.u8()?;
-            order.push(OrderKey {
-                col,
-                desc: flags & ORDER_DESC != 0,
-                nulls_first: flags & ORDER_NULLS_FIRST != 0,
-            });
-        }
-
         let pred_len = r.u32()? as usize;
         let predicate = r.take(pred_len)?.to_vec();
-        let proj_len = r.u32()? as usize;
-        let projection = r.take(proj_len)?.to_vec();
+
+        let sink = match sink_tag {
+            SINK_ROWS => {
+                let n_order = r.u8()? as usize;
+                if n_order > MAX_ORDER_KEYS {
+                    return Err(format!("read_spec: {n_order} order keys exceeds cap {MAX_ORDER_KEYS}"));
+                }
+                let limit_k = r.u64()?;
+                let mut order = Vec::with_capacity(n_order);
+                for _ in 0..n_order {
+                    let col = r.u16()?;
+                    let flags = r.u8()?;
+                    if flags & !(ORDER_DESC | ORDER_NULLS_FIRST) != 0 {
+                        return Err(format!("read_spec: order key has unknown flag bits {flags:#04x}"));
+                    }
+                    let _rsv = r.u8()?;
+                    order.push(OrderKey {
+                        col,
+                        desc: flags & ORDER_DESC != 0,
+                        nulls_first: flags & ORDER_NULLS_FIRST != 0,
+                    });
+                }
+                let proj_len = r.u32()? as usize;
+                let projection = r.take(proj_len)?.to_vec();
+                ReadSink::Rows {
+                    projection,
+                    order,
+                    limit_k,
+                }
+            }
+            SINK_FOLD => {
+                // Trust-boundary caps only: a legitimate fold's reply schema is
+                // width-checked by the SQL layer (`1 + groups + aggs ≤
+                // MAX_COLUMNS`), so either count exceeding one schema's column
+                // cap marks a malformed frame.
+                let n_group_cols = r.u16()? as usize;
+                if n_group_cols > MAX_COLUMNS {
+                    return Err(format!(
+                        "read_spec: {n_group_cols} group cols exceeds cap {MAX_COLUMNS}"
+                    ));
+                }
+                let mut group_cols = Vec::with_capacity(n_group_cols);
+                for _ in 0..n_group_cols {
+                    group_cols.push(r.u16()?);
+                }
+                let n_aggs = r.u8()? as usize;
+                if n_aggs > MAX_COLUMNS {
+                    return Err(format!("read_spec: {n_aggs} agg items exceeds cap {MAX_COLUMNS}"));
+                }
+                let mut aggs = Vec::with_capacity(n_aggs);
+                for _ in 0..n_aggs {
+                    let op_byte = r.u8()?;
+                    let op = AggFunc::from_wire(op_byte as u64)
+                        .ok_or_else(|| format!("read_spec: unknown aggregate op {op_byte}"))?;
+                    let src_col = r.u16()?;
+                    aggs.push(AggReadItem { op, src_col });
+                }
+                ReadSink::Fold(AggReadSpec { group_cols, aggs })
+            }
+            other => return Err(format!("read_spec: unknown sink tag {other}")),
+        };
 
         if r.remaining() != 0 {
             return Err(format!("read_spec: {} trailing bytes", r.remaining()));
         }
 
-        Ok(ReadSpec {
-            bound,
-            predicate,
-            projection,
-            order,
-            limit_k,
-        })
+        Ok(ReadSpec { bound, predicate, sink })
     }
 }
 
@@ -355,16 +481,20 @@ mod tests {
             ReadSpec {
                 bound: ReadBound::None,
                 predicate: vec![1, 2, 3, 4],
-                projection: vec![],
-                order: sample_order(),
-                limit_k: 42,
+                sink: ReadSink::Rows {
+                    projection: vec![],
+                    order: sample_order(),
+                    limit_k: 42,
+                },
             },
             ReadSpec {
                 bound: ReadBound::PkRange(RangeDescriptor::new(&[], After(10), After(u64::MAX as u128))),
                 predicate: vec![],
-                projection: vec![9, 9, 9],
-                order: vec![],
-                limit_k: 0,
+                sink: ReadSink::Rows {
+                    projection: vec![9, 9, 9],
+                    order: vec![],
+                    limit_k: 0,
+                },
             },
             ReadSpec {
                 bound: ReadBound::IndexRange {
@@ -372,20 +502,24 @@ mod tests {
                     desc: RangeDescriptor::new(&[7], Before(1), Before(u128::MAX)),
                 },
                 predicate: vec![5, 5],
-                projection: vec![6],
-                order: sample_order(),
-                limit_k: 100,
+                sink: ReadSink::Rows {
+                    projection: vec![6],
+                    order: sample_order(),
+                    limit_k: 100,
+                },
             },
             ReadSpec {
                 bound: ReadBound::PkSet(vec![5, 10, 3, 99]),
                 predicate: vec![],
-                projection: vec![],
-                order: vec![OrderKey {
-                    col: 7,
-                    desc: false,
-                    nulls_first: false,
-                }],
-                limit_k: 8,
+                sink: ReadSink::Rows {
+                    projection: vec![],
+                    order: vec![OrderKey {
+                        col: 7,
+                        desc: false,
+                        nulls_first: false,
+                    }],
+                    limit_k: 8,
+                },
             },
         ];
         for spec in specs {
@@ -403,53 +537,47 @@ mod tests {
         let spec = ReadSpec {
             bound: ReadBound::PkSet(vec![u64::MAX as u128, 5]),
             predicate: vec![],
-            projection: vec![],
-            order: vec![],
-            limit_k: 0,
+            sink: ReadSink::all_rows(),
         };
         let bytes = spec.encode();
         assert_eq!(ReadSpec::decode(&bytes), Ok(spec));
     }
 
-    #[test]
-    fn decode_rejects_bad_version() {
-        let mut bytes = ReadSpec {
+    fn empty_spec() -> ReadSpec {
+        ReadSpec {
             bound: ReadBound::None,
             predicate: vec![],
-            projection: vec![],
-            order: vec![],
-            limit_k: 0,
+            sink: ReadSink::all_rows(),
         }
-        .encode();
-        bytes[0] = 2;
+    }
+
+    #[test]
+    fn decode_rejects_bad_version() {
+        let mut bytes = empty_spec().encode();
+        bytes[0] = 99;
         assert!(ReadSpec::decode(&bytes).unwrap_err().contains("version"));
     }
 
     #[test]
     fn decode_rejects_unknown_kind() {
-        let mut bytes = ReadSpec {
-            bound: ReadBound::None,
-            predicate: vec![],
-            projection: vec![],
-            order: vec![],
-            limit_k: 0,
-        }
-        .encode();
+        let mut bytes = empty_spec().encode();
         bytes[1] = 9;
         assert!(ReadSpec::decode(&bytes).unwrap_err().contains("bound kind"));
     }
 
     #[test]
+    fn decode_rejects_unknown_sink_tag() {
+        let mut bytes = empty_spec().encode();
+        bytes[2] = 9;
+        assert!(ReadSpec::decode(&bytes).unwrap_err().contains("sink tag"));
+    }
+
+    #[test]
     fn decode_rejects_order_key_over_cap() {
-        let mut bytes = ReadSpec {
-            bound: ReadBound::None,
-            predicate: vec![],
-            projection: vec![],
-            order: vec![],
-            limit_k: 0,
-        }
-        .encode();
-        bytes[2] = (MAX_ORDER_KEYS + 1) as u8;
+        // Layout of the empty Rows spec: 4-byte header | u32 predicate len |
+        // n_order at offset 8.
+        let mut bytes = empty_spec().encode();
+        bytes[8] = (MAX_ORDER_KEYS + 1) as u8;
         assert!(ReadSpec::decode(&bytes).unwrap_err().contains("order keys exceeds cap"));
     }
 
@@ -457,8 +585,7 @@ mod tests {
     fn decode_rejects_pk_set_over_cap() {
         // Hand-build a header + PkSet count exceeding the cap (the count is read
         // before any per-key bytes, so no keys are needed to trip it).
-        let mut bytes = vec![VERSION, BOUND_PK_SET, 0, 0];
-        bytes.extend_from_slice(&0u64.to_le_bytes());
+        let mut bytes = vec![VERSION, BOUND_PK_SET, SINK_ROWS, 0];
         bytes.extend_from_slice(&((MAX_PK_SET_KEYS + 1) as u32).to_le_bytes());
         assert!(ReadSpec::decode(&bytes).unwrap_err().contains("PkSet count"));
     }
@@ -468,23 +595,14 @@ mod tests {
         let spec = ReadSpec {
             bound: ReadBound::PkSet(vec![5, 5]),
             predicate: vec![],
-            projection: vec![],
-            order: vec![],
-            limit_k: 0,
+            sink: ReadSink::all_rows(),
         };
         assert!(ReadSpec::decode(&spec.encode()).unwrap_err().contains("duplicate"));
     }
 
     #[test]
     fn decode_rejects_trailing_bytes() {
-        let mut bytes = ReadSpec {
-            bound: ReadBound::None,
-            predicate: vec![],
-            projection: vec![],
-            order: vec![],
-            limit_k: 0,
-        }
-        .encode();
+        let mut bytes = empty_spec().encode();
         bytes.push(0);
         assert!(ReadSpec::decode(&bytes).unwrap_err().contains("trailing"));
     }
@@ -494,9 +612,7 @@ mod tests {
         let bytes = ReadSpec {
             bound: ReadBound::PkSet(vec![1, 2, 3]),
             predicate: vec![],
-            projection: vec![],
-            order: vec![],
-            limit_k: 0,
+            sink: ReadSink::all_rows(),
         }
         .encode();
         // Chop the last key's bytes off.
@@ -529,5 +645,93 @@ mod tests {
         long.push(0);
         assert!(unpack_scan_spec_extra(&long).is_err());
         assert!(unpack_scan_spec_extra(&[]).is_err());
+    }
+
+    #[test]
+    fn roundtrips_fold_sink() {
+        let specs = [
+            // Grouped aggregate: two group cols, COUNT(*) + SUM(col 2).
+            ReadSpec {
+                bound: ReadBound::None,
+                predicate: vec![1, 2, 3],
+                sink: ReadSink::Fold(AggReadSpec {
+                    group_cols: vec![0, 3],
+                    aggs: vec![
+                        AggReadItem {
+                            op: AggFunc::Count,
+                            src_col: 0,
+                        },
+                        AggReadItem {
+                            op: AggFunc::Sum,
+                            src_col: 2,
+                        },
+                    ],
+                }),
+            },
+            // Global aggregate over a PK range: no group cols, MIN/MAX.
+            ReadSpec {
+                bound: ReadBound::PkRange(RangeDescriptor::new(&[], After(1), After(9))),
+                predicate: vec![],
+                sink: ReadSink::Fold(AggReadSpec {
+                    group_cols: vec![],
+                    aggs: vec![
+                        AggReadItem {
+                            op: AggFunc::Min,
+                            src_col: 4,
+                        },
+                        AggReadItem {
+                            op: AggFunc::Max,
+                            src_col: 4,
+                        },
+                    ],
+                }),
+            },
+            // DISTINCT: group cols, no aggs.
+            ReadSpec {
+                bound: ReadBound::None,
+                predicate: vec![],
+                sink: ReadSink::Fold(AggReadSpec {
+                    group_cols: vec![1, 2, 5],
+                    aggs: vec![],
+                }),
+            },
+        ];
+        for spec in specs {
+            let bytes = spec.encode();
+            assert!(bytes.len() <= MAX_READ_SPEC_BYTES);
+            assert_eq!(ReadSpec::decode(&bytes), Ok(spec.clone()), "{spec:?}");
+        }
+    }
+
+    /// Header + empty predicate of a hand-built fold-sink blob.
+    fn fold_header() -> Vec<u8> {
+        let mut bytes = vec![VERSION, BOUND_NONE, SINK_FOLD, 0];
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // predicate len
+        bytes
+    }
+
+    #[test]
+    fn fold_rejects_bad_op_code() {
+        let mut bytes = fold_header();
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // n_group_cols = 0
+        bytes.push(1); // n_aggs = 1
+        bytes.push(7); // no such AggFunc
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // src_col
+        assert!(ReadSpec::decode(&bytes).unwrap_err().contains("unknown aggregate op"));
+    }
+
+    #[test]
+    fn fold_rejects_over_cap() {
+        // Group-col count over the cap (read before per-col bytes, so no col
+        // bytes are needed to trip).
+        let mut bytes = fold_header();
+        bytes.extend_from_slice(&((MAX_COLUMNS + 1) as u16).to_le_bytes());
+        assert!(ReadSpec::decode(&bytes).unwrap_err().contains("group cols exceeds cap"));
+
+        // And an over-cap agg-item count (zero group cols first).
+        let mut bytes = fold_header();
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // n_group_cols = 0
+        bytes.push((MAX_COLUMNS + 1) as u8);
+        assert!(ReadSpec::decode(&bytes).unwrap_err().contains("agg items exceeds cap"));
     }
 }

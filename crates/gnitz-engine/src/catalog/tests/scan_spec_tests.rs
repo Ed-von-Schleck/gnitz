@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::storage::Batch;
-use gnitz_wire::{Cut, OrderKey, RangeDescriptor, ReadBound, ReadSpec};
+use gnitz_wire::{Cut, OrderKey, RangeDescriptor, ReadBound, ReadSink, ReadSpec};
 
 /// A `(id U64 PK | val I64)` base of `n` rows, `val = val_of(id)`, each at
 /// weight 1. Returns `(engine, tid)`.
@@ -48,9 +48,11 @@ fn identity_spec(bound: ReadBound, order: Vec<OrderKey>, limit_k: u64) -> ReadSp
     ReadSpec {
         bound,
         predicate: vec![],
-        projection: vec![],
-        order,
-        limit_k,
+        sink: ReadSink::Rows {
+            projection: vec![],
+            order,
+            limit_k,
+        },
     }
 }
 

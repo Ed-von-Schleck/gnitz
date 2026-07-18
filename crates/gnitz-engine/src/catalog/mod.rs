@@ -188,4 +188,14 @@ pub struct CatalogEngine {
     /// can only reach through `submit` — they shrink this field instead to
     /// exercise chunk boundaries.
     pub(crate) ddl_scan_chunk_rows: usize,
+
+    /// Per-worker distinct-group cap for the ad-hoc aggregate fold
+    /// (`GNITZ_ADHOC_GROUP_CAP` override, default `ADHOC_GROUP_CAP`). Beyond it
+    /// the fold aborts the request with a CREATE-VIEW suggestion — a stated
+    /// resource-exhaustion posture, never silent degradation. Per-worker, so it
+    /// never fires when the global group count ≤ cap.
+    pub(crate) adhoc_group_cap: usize,
 }
+
+/// Default value of [`CatalogEngine::adhoc_group_cap`].
+pub(crate) const ADHOC_GROUP_CAP: usize = 65_536;
