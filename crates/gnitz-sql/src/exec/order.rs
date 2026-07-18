@@ -18,7 +18,7 @@ use crate::ast_util::{expr_usize_literal, single_relation_col_name};
 use crate::bind::find_unique_column;
 use crate::codec::project_schema::ProjItem;
 use crate::error::GnitzSqlError;
-use crate::exec::batch::{copy_batch_row_owned, pk_col_window_at, Projection};
+use crate::exec::batch::{copy_batch_row_owned, pk_col_window_at};
 use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
 use gnitz_wire::cmp_typed_le;
 use sqlparser::ast::{Expr, OrderBy, OrderByKind, Value};
@@ -211,42 +211,26 @@ fn resolve_order_by(ob: &OrderBy) -> Result<Vec<OrderKey>, GnitzSqlError> {
     Ok(keys)
 }
 
-/// Resolve one ORDER BY key to a column index into the pre-projection (`actual`)
-/// schema. Positional → n-th **visible** output column (mapped back through
-/// `col_indices`); a name tries the output columns/aliases first, then the
-/// source (pre-projection) visible columns — so a non-projected column is
-/// orderable but a hidden synthetic key (`_join_pk`) is not name-addressable.
-fn resolve_key_to_source_col(
-    key: &OrderKey,
-    proj_schema: &Schema,
-    col_indices: &[usize],
-    actual_schema: &Schema,
-) -> Result<usize, GnitzSqlError> {
+/// Resolve one ORDER BY key to a column index into `schema` — the batch the
+/// passthrough sink sorts is already in its presentation shape (a view scan,
+/// an executor result, an aggregate finish), so a name resolves against the
+/// schema's columns/aliases (ambiguity → error) and a position names the n-th
+/// **visible** column (a result may carry a hidden synthetic key at physical
+/// index 0, so a naive `pos-1` would sort by the hidden key).
+fn resolve_key_col(key: &OrderKey, schema: &Schema) -> Result<usize, GnitzSqlError> {
     match &key.target {
         OrderTarget::Position(pos) => {
-            // 1-based over the visible output columns (a view result carries a
-            // hidden column at physical index 0, so a naive `pos-1` would sort by
-            // the hidden key).
-            let visible: Vec<usize> = proj_schema.visible_columns().map(|(i, _)| i).collect();
+            let visible: Vec<usize> = schema.visible_columns().map(|(i, _)| i).collect();
             if *pos == 0 || *pos > visible.len() {
                 return Err(GnitzSqlError::Unsupported(format!(
                     "ORDER BY position {pos} is out of range (1..={})",
                     visible.len()
                 )));
             }
-            Ok(col_indices[visible[*pos - 1]])
+            Ok(visible[*pos - 1])
         }
-        OrderTarget::Name(name) => {
-            // (2) output column name / alias (ambiguity → error), then
-            // (3) source column name (visible only).
-            if let Some(out_ci) = find_unique_column(&proj_schema.columns, name)? {
-                return Ok(col_indices[out_ci]);
-            }
-            if let Some(src_ci) = find_unique_column(&actual_schema.columns, name)? {
-                return Ok(src_ci);
-            }
-            Err(GnitzSqlError::Bind(format!("ORDER BY column '{name}' not found")))
-        }
+        OrderTarget::Name(name) => find_unique_column(&schema.columns, name)?
+            .ok_or_else(|| GnitzSqlError::Bind(format!("ORDER BY column '{name}' not found"))),
     }
 }
 
@@ -329,40 +313,6 @@ pub(crate) fn resolve_read_spec_order(
     Ok(out)
 }
 
-/// Build the full sort-key list: the ORDER BY keys, then — only when a
-/// LIMIT/OFFSET cut is present — the deterministic identity tiebreak (every PK
-/// column in pk-list order, then every payload column in schema order, all ASC
-/// NULLS FIRST) so distinct logical rows tied on the ORDER BY keys order
-/// consistently across worker counts and the cut is a function of the data.
-fn build_sort_keys(
-    order_keys: &[OrderKey],
-    resolved: &Projection,
-    actual_schema: &Schema,
-    has_cut: bool,
-) -> Result<Vec<SortKey>, GnitzSqlError> {
-    // The projected output schema + its source-column map. The passthrough
-    // (`None`) reproduces the source schema, so the identity map applies.
-    let identity_indices: Vec<usize>;
-    let (proj_schema, col_indices): (&Schema, &[usize]) = match resolved {
-        Some((s, ci)) => (s, ci),
-        None => {
-            identity_indices = (0..actual_schema.columns.len()).collect();
-            (actual_schema, &identity_indices)
-        }
-    };
-
-    let mut keys = Vec::with_capacity(order_keys.len());
-    for k in order_keys {
-        let ci = resolve_key_to_source_col(k, proj_schema, col_indices, actual_schema)?;
-        keys.push(SortKey::new(actual_schema, ci, k.asc, k.nulls_first));
-    }
-
-    if has_cut && !keys.is_empty() {
-        push_identity_tiebreak(&mut keys, actual_schema);
-    }
-    Ok(keys)
-}
-
 /// Append the deterministic identity tiebreak — every PK column in pk-list
 /// order, then every payload column in schema order, all ASC NULLS FIRST — so
 /// distinct logical rows tied on the ORDER BY keys order consistently across
@@ -416,9 +366,10 @@ fn paginate(weights: &[i64], offset: u64, hi: u64) -> Vec<(usize, i64)> {
 // ---------------------------------------------------------------------------
 
 /// The sink over an already-projected result (the transient executor's streamed
-/// batch): sort and paginate under the identity projection — hidden synthetic
-/// keys stay physical, exactly like a view scan, and are stripped at
-/// presentation. Returns the schema unchanged alongside the windowed batch.
+/// batch, the aggregate finisher's output): sort and paginate in place — hidden
+/// synthetic keys stay physical, exactly like a view scan, and are stripped at
+/// presentation. Returns the schema unchanged alongside the windowed batch
+/// (untouched when there is nothing to reorder, skip, or bound).
 pub(crate) fn order_limit_passthrough(
     schema: Schema,
     batch: ZSetBatch,
@@ -426,8 +377,24 @@ pub(crate) fn order_limit_passthrough(
     offset: usize,
     limit: Option<usize>,
 ) -> Result<(Schema, ZSetBatch), GnitzSqlError> {
-    let out = order_limit_resolved(&None, &schema, Some(batch), order_by, offset, limit)?
-        .unwrap_or_else(|| ZSetBatch::new(&schema));
+    let order_keys = match order_by {
+        Some(ob) => resolve_order_by(ob)?,
+        None => Vec::new(),
+    };
+    // Zero-copy passthrough: nothing to reorder, skip, or bound.
+    if order_keys.is_empty() && offset == 0 && limit.is_none() {
+        return Ok((schema, batch));
+    }
+    let has_cut = limit.is_some() || offset > 0;
+    let mut sort_keys = Vec::with_capacity(order_keys.len());
+    for k in &order_keys {
+        let ci = resolve_key_col(k, &schema)?;
+        sort_keys.push(SortKey::new(&schema, ci, k.asc, k.nulls_first));
+    }
+    if has_cut && !sort_keys.is_empty() {
+        push_identity_tiebreak(&mut sort_keys, &schema);
+    }
+    let out = sort_window(&schema, batch, &sort_keys, offset, limit);
     Ok((schema, out))
 }
 
@@ -458,34 +425,6 @@ pub(crate) fn read_spec_finish(
     }
     let gathered = sort_window(&schema, batch, &sort_keys, offset, limit);
     (schema, gathered)
-}
-
-/// Sort and paginate the pre-projection batch; projection is the caller's.
-/// `resolved` is consulted only to resolve ORDER BY names / positions against
-/// the projected output (`None` = identity). Returns `full_batch` untouched
-/// when there is nothing to reorder, skip, or bound.
-fn order_limit_resolved(
-    resolved: &Projection,
-    actual_schema: &Schema,
-    full_batch: Option<ZSetBatch>,
-    order_by: Option<&OrderBy>,
-    offset: usize,
-    limit: Option<usize>,
-) -> Result<Option<ZSetBatch>, GnitzSqlError> {
-    let order_keys = match order_by {
-        Some(ob) => resolve_order_by(ob)?,
-        None => Vec::new(),
-    };
-
-    // Zero-copy passthrough: nothing to reorder, skip, or bound.
-    if order_keys.is_empty() && offset == 0 && limit.is_none() {
-        return Ok(full_batch);
-    }
-
-    let has_cut = limit.is_some() || offset > 0;
-    let sort_keys = build_sort_keys(&order_keys, resolved, actual_schema, has_cut)?;
-    let full = full_batch.unwrap_or_else(|| ZSetBatch::new(actual_schema));
-    Ok(Some(sort_window(actual_schema, full, &sort_keys, offset, limit)))
 }
 
 /// Sort + multiplicity-window `full` by `sort_keys` (already tiebreak-extended
@@ -632,9 +571,10 @@ mod tests {
         }
     }
 
-    /// Test-only sort → window → project over the kept machinery (the production
-    /// `order_limit_project` wrapper went with the thin path; the client now
-    /// server-projects and calls `read_spec_finish`).
+    /// Test-only sort → window → project: the production sinks sort either an
+    /// already-projected result (`order_limit_passthrough`) or a ScanSpec reply
+    /// (`read_spec_finish`); this wrapper windows over the full source schema
+    /// and projects afterwards so the tests can order by non-projected columns.
     fn order_limit_project(
         projection: &[SelectItem],
         actual_schema: &Schema,
@@ -644,8 +584,9 @@ mod tests {
         limit: Option<usize>,
     ) -> Result<(Schema, ZSetBatch), GnitzSqlError> {
         let resolved = resolve_projection(projection, actual_schema)?;
-        let windowed = order_limit_resolved(&resolved, actual_schema, full_batch, order_by, offset, limit)?;
-        Ok(project(resolved, actual_schema, windowed))
+        let full = full_batch.unwrap_or_else(|| ZSetBatch::new(actual_schema));
+        let (_, windowed) = order_limit_passthrough(actual_schema.clone(), full, order_by, offset, limit)?;
+        Ok(project(resolved, actual_schema, Some(windowed)))
     }
 
     /// Run the sink for `sql` over `batch`, returning the ordered `(id, v)` pairs.
@@ -707,18 +648,34 @@ mod tests {
 
     #[test]
     fn sink_order_by_alias_and_positional() {
-        let schema = kv_schema();
+        // The passthrough sink sorts an already-projected result, so a SELECT
+        // alias is simply the result schema's column name — pin that both a
+        // name and a 1-based position resolve against it.
+        let schema = Schema {
+            columns: vec![col_def("id", TypeCode::U64, false), col_def("val", TypeCode::I64, true)],
+            pk_cols: vec![0],
+        };
         let mut b = ZSetBatch::new(&schema);
-        push_kv(&mut b, 1, Some(30), None, 1);
-        push_kv(&mut b, 2, Some(10), None, 1);
-        push_kv(&mut b, 3, Some(20), None, 1);
+        let mut push = |pk: u64, v: i64| {
+            b.pks.push_u128(pk as u128);
+            b.weights.push(1);
+            b.nulls.push(0);
+            if let ColData::Fixed(buf) = &mut b.columns[1] {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        };
+        push(1, 30);
+        push(2, 10);
+        push(3, 20);
+        let ids = |out: &ZSetBatch| (0..out.len()).map(|i| out.pks.get(i) as u64).collect::<Vec<_>>();
 
-        // Alias resolves to the output column; sort ascending by it.
-        let got = run("SELECT id, v AS val FROM t ORDER BY val", &schema, b.clone()).unwrap();
-        assert_eq!(got.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![2, 3, 1]);
-        // Positional: 2nd output column is `v`.
-        let got = run("SELECT id, v FROM t ORDER BY 2 DESC", &schema, b).unwrap();
-        assert_eq!(got.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![1, 3, 2]);
+        let q = parse_query("SELECT * FROM t ORDER BY val");
+        let (_, out) = order_limit_passthrough(schema.clone(), b.clone(), q.order_by.as_ref(), 0, None).unwrap();
+        assert_eq!(ids(&out), vec![2, 3, 1]);
+        // Positional: the 2nd visible column is `val`.
+        let q = parse_query("SELECT * FROM t ORDER BY 2 DESC");
+        let (_, out) = order_limit_passthrough(schema, b, q.order_by.as_ref(), 0, None).unwrap();
+        assert_eq!(ids(&out), vec![1, 3, 2]);
     }
 
     #[test]
