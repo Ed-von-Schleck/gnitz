@@ -622,7 +622,7 @@ struct RangeEndEntry {
 /// Every range end among `conjuncts` (`col OP lit`, flipped forms, desugared
 /// non-negated `BETWEEN`), tagged with its conjunct index. Shared by the index
 /// range collector and the PK-range extractor.
-fn collect_range_ends<'c>(conjuncts: &[&'c Expr], schema: &Schema) -> Vec<RangeEndEntry> {
+fn collect_range_ends(conjuncts: &[&Expr], schema: &Schema) -> Vec<RangeEndEntry> {
     let mut ends: Vec<RangeEndEntry> = Vec::new();
     for (ci, &cand) in conjuncts.iter().enumerate() {
         if let Some((col, end)) = try_col_range_literal(cand, schema) {

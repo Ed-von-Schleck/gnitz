@@ -18,7 +18,7 @@ use crate::plan::view::{exists, group_by, join, scalar, set_op, simple, EmitPiec
 use crate::SqlResult;
 use gnitz_core::{ColumnDef, GnitzClient, PlannedView, Schema};
 use sqlparser::ast::{
-    Expr, GroupByExpr, Ident, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, TableFactor,
+    Expr, GroupByExpr, Ident, ObjectName, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, TableFactor,
     UnaryOperator, WildcardAdditionalOptions,
 };
 use std::collections::HashSet;
@@ -59,6 +59,95 @@ pub(crate) fn execute_create_view(
         .create_view_chain(schema_name, chain.segments)
         .map_err(GnitzSqlError::Exec)?;
     Ok(SqlResult::ViewCreated { view_id: final_vid })
+}
+
+/// `ALTER VIEW <v> AS <query>` — drop-then-create under the same name with a
+/// FRESH vid (ids are never reused). Deliberately NOT atomic: the new plan is
+/// compiled and validated first, then two sequential DDL zones (drop old vid +
+/// hidden segments, then create the fresh chain), so a fault after the drop
+/// commits leaves no view `v` at all (reported with a re-issue-as-CREATE hint).
+/// sqlparser's `AlterView` has no `if_exists`, so a missing view is a hard error.
+pub(crate) fn execute_alter_view(
+    client: &mut GnitzClient,
+    schema_name: &str,
+    name: &ObjectName,
+    query: &Query,
+    binder: &mut Binder<'_>,
+) -> Result<SqlResult, GnitzSqlError> {
+    let view_name = extract_name(name, "ALTER VIEW")?;
+    validate_user_name(&view_name)?;
+
+    // Resolve the old vid; reject `ALTER VIEW <table>` and a missing relation.
+    let old_vid = resolve_view_id(client, schema_name, &view_name)?;
+
+    // Same envelope rules as CREATE VIEW (only `WITH` honored).
+    reject_unhonored_query_clauses(
+        query,
+        HonoredQueryClauses {
+            with: true,
+            ..HonoredQueryClauses::NONE
+        },
+        "ALTER VIEW",
+    )?;
+
+    // Re-render CREATE-VIEW-shaped so the stored sql_definition matches a fresh
+    // CREATE VIEW of the new definition.
+    let sql_text = format!("CREATE VIEW {view_name} AS {query}");
+
+    // Compile + validate the new plan (fresh vids) BEFORE issuing either zone, so
+    // a compile error leaves the old view fully intact.
+    let mut chain = ViewChain::new();
+    build_query_segments(client, query, binder, &mut chain, view_name.clone(), sql_text)?;
+
+    // Reject self-reference: `FROM v` in the new query resolves to the still-live
+    // old vid, which would appear as a source of the new plan — dropping it in
+    // zone 1 would remove the new definition's own input. Rejected before any zone.
+    if chain
+        .segments
+        .iter()
+        .any(|s| s.circuit.dependencies().contains(&old_vid))
+    {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "ALTER VIEW '{schema_name}.{view_name}' AS a query referencing the view itself is not supported"
+        )));
+    }
+
+    // Zone 1: drop the old view + its hidden segments. The engine's
+    // view-dependency guard (re-evaluated under the catalog write lock) rejects
+    // the drop if dependents exist — RESTRICT, before anything is torn down.
+    client.drop_view(schema_name, &view_name).map_err(GnitzSqlError::Exec)?;
+
+    // Zone 2: create the fresh chain under the same name. A failure here (engine/
+    // I/O fault, or a qname race — a concurrent same-name CREATE in the gap) is
+    // post-drop: the old view is durably gone, so surface a re-issue hint.
+    client.create_view_chain(schema_name, chain.segments).map_err(|e| {
+        GnitzSqlError::Plan(format!(
+            "ALTER VIEW '{schema_name}.{view_name}': the old view was dropped but installing the new \
+             definition failed ({e}); re-issue as CREATE VIEW {view_name} AS <query>"
+        ))
+    })?;
+
+    Ok(SqlResult::Altered {
+        object: "view".to_string(),
+        name: view_name,
+    })
+}
+
+/// Resolve `name` to a VIEW id, rejecting `ALTER VIEW <table>` and a missing
+/// relation.
+fn resolve_view_id(client: &mut GnitzClient, schema_name: &str, name: &str) -> Result<u64, GnitzSqlError> {
+    match client
+        .resolve_relation_kind(schema_name, name)
+        .map_err(GnitzSqlError::Exec)?
+    {
+        Some((vid, true)) => Ok(vid),
+        Some((_, false)) => Err(GnitzSqlError::Unsupported(format!(
+            "'{name}' is a table; ALTER VIEW requires a view (use ALTER TABLE)"
+        ))),
+        None => Err(GnitzSqlError::Bind(format!(
+            "View '{schema_name}.{name}' does not exist"
+        ))),
+    }
 }
 
 /// Compile one query body into a chain of `PlannedView` segments (hidden

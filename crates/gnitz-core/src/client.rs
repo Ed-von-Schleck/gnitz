@@ -601,10 +601,25 @@ impl GnitzClient {
         Ok(index_id)
     }
 
-    pub fn drop_index_by_name(&mut self, index_name: &str) -> Result<(), ClientError> {
+    /// Drop an index by name. `if_exists` swallows a missing index (returns
+    /// `Ok(())`) — honored at the primitive's own not-found path, NOT via a
+    /// client-side existence pre-check, which would be a TOCTOU (a concurrent
+    /// DROP landing in the gap resurfaces the very "not found" `IF EXISTS` must
+    /// suppress). `ALTER TABLE ... DROP CONSTRAINT IF EXISTS` sets it; the plain
+    /// `DROP INDEX` statement passes `false` (drops loudly, like DROP TABLE/VIEW).
+    pub fn drop_index_by_name(&mut self, index_name: &str, if_exists: bool) -> Result<(), ClientError> {
         let index_name = canon_name(index_name);
+        let not_found = |name: &str| -> Result<(), ClientError> {
+            if if_exists {
+                Ok(())
+            } else {
+                Err(ClientError::ServerError(format!("index '{name}' not found")))
+            }
+        };
         let (_, idx_batch, _) = self.session.scan(IDX_TAB)?;
-        let idx_batch = idx_batch.ok_or_else(|| ClientError::ServerError(format!("index '{index_name}' not found")))?;
+        let Some(idx_batch) = idx_batch else {
+            return not_found(&index_name);
+        };
         for i in idx_batch.live_rows() {
             let name = col_str(&idx_batch.columns[4], i)?.unwrap_or("");
             if name != index_name {
@@ -631,7 +646,7 @@ impl GnitzClient {
             self.push_ddl(&[(IDX_TAB, idx_schema, batch)])?;
             return Ok(());
         }
-        Err(ClientError::ServerError(format!("index '{index_name}' not found")))
+        not_found(&index_name)
     }
 
     /// `(name, indexed columns)` of every live secondary-index IDX_TAB row (name in
@@ -976,14 +991,7 @@ impl GnitzClient {
 
         let tbl_schema = table_tab_schema();
         let mut tb = ZSetBatch::new(tbl_schema);
-        BatchAppender::new(&mut tb, tbl_schema)
-            .add_row(record.tid as u128, -1)
-            .u64_val(record.schema_id)
-            .str_val(&table_name)
-            .str_val(&record.directory)
-            .u64_val(record.pk_col_idx)
-            .u64_val(record.created_lsn)
-            .u64_val(record.flags);
+        append_table_tab_row(&mut BatchAppender::new(&mut tb, tbl_schema), -1, &record, &table_name);
         self.push_ddl(&[(TABLE_TAB, tbl_schema, tb)])?;
 
         Ok(())
@@ -1280,6 +1288,108 @@ impl GnitzClient {
         Ok(())
     }
 
+    /// Rename a table or view: a `(-1, +1)` rewrite pair on TABLE_TAB / VIEW_TAB,
+    /// same id, the live record's exact payload at `-1` (the engine's §3.3 CAS
+    /// requires byte-equality) with only the `name` changed at `+1`. `is_view`
+    /// selects the family. One atomic `push_ddl`; the catalog write lock quiesces
+    /// pushes for the whole zone, and a rename changes no comparator or layout, so
+    /// no tick/exchange quiesce is needed.
+    pub fn alter_rename_relation(
+        &mut self,
+        schema_name: &str,
+        is_view: bool,
+        current_name: &str,
+        new_name: &str,
+    ) -> Result<(), ClientError> {
+        let schema_name = canon_name(schema_name);
+        let current_name = canon_name(current_name);
+        let new_name = canon_name(new_name);
+        let schema_id = self.lookup_schema_id(&schema_name)?;
+
+        if is_view {
+            let view_batch = self
+                .scan_catalog(VIEW_TAB)?
+                .ok_or_else(|| ClientError::ServerError(format!("View '{schema_name}.{current_name}' not found")))?;
+            let vr = find_view_record(&view_batch, schema_id, &current_name)?
+                .ok_or_else(|| ClientError::ServerError(format!("View '{schema_name}.{current_name}' not found")))?;
+            let view_s = view_tab_schema();
+            let mut vb = ZSetBatch::new(view_s);
+            {
+                let mut a = BatchAppender::new(&mut vb, view_s);
+                append_view_row(&mut a, -1, &vr);
+                let renamed = ViewRecord { name: new_name, ..vr };
+                append_view_row(&mut a, 1, &renamed);
+            }
+            self.push_ddl(&[(VIEW_TAB, view_s, vb)])?;
+        } else {
+            let record = self
+                .lookup_table_record(schema_id, &current_name)?
+                .ok_or_else(|| ClientError::ServerError(format!("Table '{schema_name}.{current_name}' not found")))?;
+            let tbl_s = table_tab_schema();
+            let mut tb = ZSetBatch::new(tbl_s);
+            {
+                let mut a = BatchAppender::new(&mut tb, tbl_s);
+                append_table_tab_row(&mut a, -1, &record, &current_name);
+                append_table_tab_row(&mut a, 1, &record, &new_name);
+            }
+            self.push_ddl(&[(TABLE_TAB, tbl_s, tb)])?;
+        }
+        Ok(())
+    }
+
+    /// Rename a column: a `(-1, +1)` COL_TAB rewrite pair, same packed column id,
+    /// the live column's exact payload at `-1` and only the `name` changed at
+    /// `+1`. Column names preserve case (unlike relation names), so `old_col` is
+    /// matched case-insensitively but the `-1` reproduces the STORED name so the
+    /// engine's §3.3 CAS accepts it. Rejects an unknown `old_col` and a collision
+    /// with an existing visible column.
+    pub fn alter_rename_column(
+        &mut self,
+        schema_name: &str,
+        table_name: &str,
+        old_col: &str,
+        new_col: &str,
+    ) -> Result<(), ClientError> {
+        let schema_name = canon_name(schema_name);
+        let table_name = canon_name(table_name);
+        let schema_id = self.lookup_schema_id(&schema_name)?;
+        let record = self
+            .lookup_table_record(schema_id, &table_name)?
+            .ok_or_else(|| ClientError::ServerError(format!("Table '{schema_name}.{table_name}' not found")))?;
+        let tid = record.tid;
+
+        let col_batch = self
+            .scan_catalog(COL_TAB)?
+            .ok_or_else(|| ClientError::ServerError("COL_TAB is empty".to_string()))?;
+        let columns = extract_col_entries(&col_batch, tid, OWNER_KIND_TABLE)?;
+        let col_idx = columns
+            .iter()
+            .position(|c| !c.is_hidden && c.name.eq_ignore_ascii_case(old_col))
+            .ok_or_else(|| {
+                ClientError::ServerError(format!("column '{old_col}' not found in '{schema_name}.{table_name}'"))
+            })?;
+        if columns
+            .iter()
+            .enumerate()
+            .any(|(i, c)| i != col_idx && !c.is_hidden && c.name.eq_ignore_ascii_case(new_col))
+        {
+            return Err(ClientError::ServerError(format!(
+                "column '{new_col}' already exists in '{schema_name}.{table_name}'"
+            )));
+        }
+        let cd = &columns[col_idx];
+
+        let col_s = col_tab_schema();
+        let mut cb = ZSetBatch::new(col_s);
+        {
+            let mut a = BatchAppender::new(&mut cb, col_s);
+            append_col_row(&mut a, tid, OWNER_KIND_TABLE, col_idx, &cd.name, cd, -1)?;
+            append_col_row(&mut a, tid, OWNER_KIND_TABLE, col_idx, new_col, cd, 1)?;
+        }
+        self.push_ddl(&[(COL_TAB, col_s, cb)])?;
+        Ok(())
+    }
+
     pub fn resolve_table_id(&mut self, schema_name: &str, table_name: &str) -> Result<(u64, Schema), ClientError> {
         let schema_name = canon_name(schema_name);
         let table_name = canon_name(table_name);
@@ -1295,25 +1405,29 @@ impl GnitzClient {
         let schema_name = canon_name(schema_name);
         let name = canon_name(name);
         let schema_id = self.lookup_schema_id(&schema_name)?;
-
-        // Try TABLE_TAB first (most common path). A decode error there is real
-        // catalog corruption and must surface — only a genuine miss falls
-        // through to the view branch.
-        if let Some(record) = self.lookup_table_record(schema_id, &name)? {
-            let schema = self.load_owner_schema(record.tid, OWNER_KIND_TABLE, record.pk_col_idx)?;
-            return Ok((record.tid, schema));
-        }
-
-        let view_batch = self.scan_catalog(VIEW_TAB)?;
-        let view_batch = view_batch
-            .ok_or_else(|| ClientError::ServerError(format!("Table or view '{schema_name}.{name}' not found")))?;
-        let record = find_view_record(&view_batch, schema_id, &name)?
+        let (id, owner_kind, pk_col_idx) = self
+            .lookup_relation(schema_id, &name)?
             .ok_or_else(|| ClientError::ServerError(format!("Table or view '{schema_name}.{name}' not found")))?;
         // The view PK is the persisted leading-k column list: a single synthetic
         // hash column for join/set-op/distinct views, or the source PK passed
         // through (0..k) for a plain projection over a compound-PK table.
-        let schema = self.load_owner_schema(record.vid, OWNER_KIND_VIEW, record.pk_col_idx)?;
-        Ok((record.vid, schema))
+        let schema = self.load_owner_schema(id, owner_kind, pk_col_idx)?;
+        Ok((id, schema))
+    }
+
+    /// Resolve `name` under `schema_name` to `(id, is_view)` WITHOUT assembling
+    /// its column schema — the id-only kind probe. Every table-vs-view
+    /// disambiguation (the binder's writable-target check, ALTER's target
+    /// resolution) routes through here rather than re-spelling the probe order.
+    /// `Ok(None)` = no such relation; `Err` = a missing schema or a catalog
+    /// decode error, which must surface rather than be masked as a miss.
+    pub fn resolve_relation_kind(&mut self, schema_name: &str, name: &str) -> Result<Option<(u64, bool)>, ClientError> {
+        let schema_name = canon_name(schema_name);
+        let name = canon_name(name);
+        let schema_id = self.lookup_schema_id(&schema_name)?;
+        Ok(self
+            .lookup_relation(schema_id, &name)?
+            .map(|(id, owner_kind, _)| (id, owner_kind == OWNER_KIND_VIEW)))
     }
 
     /// True iff base table `tid` is REPLICATED (decoded from `TABLE_TAB.flags`).
@@ -1361,6 +1475,20 @@ impl GnitzClient {
             Some(b) => find_table_record(b, schema_id, table_name),
             None => Ok(None),
         }
+    }
+
+    /// Find `name`'s live relation record under `schema_id`:
+    /// `(id, owner_kind, pk_col_idx)`. Probes TABLE_TAB first (most common
+    /// path); a decode error there is real catalog corruption and must surface
+    /// — only a genuine miss falls through to the VIEW_TAB probe.
+    fn lookup_relation(&mut self, schema_id: u64, name: &str) -> Result<Option<(u64, u64, u64)>, ClientError> {
+        if let Some(record) = self.lookup_table_record(schema_id, name)? {
+            return Ok(Some((record.tid, OWNER_KIND_TABLE, record.pk_col_idx)));
+        }
+        let Some(view_batch) = self.scan_catalog(VIEW_TAB)? else {
+            return Ok(None);
+        };
+        Ok(find_view_record(&view_batch, schema_id, name)?.map(|r| (r.vid, OWNER_KIND_VIEW, r.pk_col_idx)))
     }
 
     /// Load an owner's (table's or view's) columns from COL_TAB and assemble
@@ -1676,6 +1804,20 @@ fn append_view_row(a: &mut BatchAppender<'_>, weight: i64, rec: &ViewRecord) {
         .u64_val(rec.pk_col_idx);
 }
 
+/// Append one `TABLE_TAB` row — the write-side mirror of `find_table_record`
+/// (which reads every payload column except the `name` search key). The `name`
+/// is passed separately so a DROP or RENAME reproduces the live payload
+/// byte-for-byte (§3.3 CAS); the create/drop/rename paths all write through here.
+fn append_table_tab_row(a: &mut BatchAppender<'_>, weight: i64, rec: &TableRecord, name: &str) {
+    a.add_row(rec.tid as u128, weight)
+        .u64_val(rec.schema_id)
+        .str_val(name)
+        .str_val(&rec.directory)
+        .u64_val(rec.pk_col_idx)
+        .u64_val(rec.created_lsn)
+        .u64_val(rec.flags);
+}
+
 /// `Ok(None)` = absent (a legitimate miss); `Err` = a decode error on a corrupt
 /// `VIEW_TAB` batch.
 fn find_view_record(batch: &ZSetBatch, schema_id: u64, view_name: &str) -> Result<Option<ViewRecord>, ClientError> {
@@ -1735,6 +1877,34 @@ fn collect_schema_member_names(batch: &ZSetBatch, schema_id: u64) -> Result<Vec<
 /// Append one owner's `COL_TAB` column records to `a` — the single home for the
 /// COL_TAB row layout, shared by the table path (`build_col_tab_batch`) and the
 /// view-chain path (which merges every view's rows into one family batch).
+/// Append one `COL_TAB` row for column `col_idx` of `owner_id` at `weight`, with
+/// `name` (column names are case-preserved) and the rest of the payload from
+/// `cd`. The single home for the COL_TAB row layout — the create path
+/// (`append_col_rows`) and a RENAME COLUMN's `-1`/`+1` pair both write through
+/// here, so a rename's `-1` reproduces the live row byte-for-byte (§3.3 CAS).
+fn append_col_row(
+    a: &mut BatchAppender<'_>,
+    owner_id: u64,
+    owner_kind: u64,
+    col_idx: usize,
+    name: &str,
+    cd: &ColumnDef,
+    weight: i64,
+) -> Result<(), ClientError> {
+    a.add_row(pack_col_id(owner_id, col_idx)? as u128, weight)
+        .u64_val(owner_id)
+        .u64_val(owner_kind)
+        .u64_val(col_idx as u64)
+        .str_val(name)
+        .u64_val(cd.type_code as u64)
+        .u64_val(if cd.is_nullable { 1 } else { 0 })
+        .u64_val(cd.fk_table_id)
+        .u64_val(cd.fk_col_idx)
+        .u64_val(if cd.is_serial { 1 } else { 0 })
+        .u64_val(if cd.is_hidden { 1 } else { 0 });
+    Ok(())
+}
+
 fn append_col_rows(
     a: &mut BatchAppender<'_>,
     owner_id: u64,
@@ -1742,17 +1912,7 @@ fn append_col_rows(
     columns: &[ColumnDef],
 ) -> Result<(), ClientError> {
     for (i, col) in columns.iter().enumerate() {
-        a.add_row(pack_col_id(owner_id, i)? as u128, 1)
-            .u64_val(owner_id)
-            .u64_val(owner_kind)
-            .u64_val(i as u64)
-            .str_val(&col.name)
-            .u64_val(col.type_code as u64)
-            .u64_val(if col.is_nullable { 1 } else { 0 })
-            .u64_val(col.fk_table_id)
-            .u64_val(col.fk_col_idx)
-            .u64_val(if col.is_serial { 1 } else { 0 })
-            .u64_val(if col.is_hidden { 1 } else { 0 });
+        append_col_row(a, owner_id, owner_kind, i, &col.name, col, 1)?;
     }
     Ok(())
 }

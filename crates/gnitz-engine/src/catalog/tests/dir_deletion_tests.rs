@@ -197,10 +197,11 @@ fn gc_leaves_live_entities_untouched() {
     engine.create_schema("s2").unwrap();
     let t3 = engine.create_table("s2.t", &cols, &[0], true).unwrap();
 
+    // Id-only directories (§4): `t_{tid}`, regardless of the table name.
     let dirs = [
-        format!("{dir}/public/flushed_{t1}"),
-        format!("{dir}/public/flushed_{t1}/idx_{i1}"),
-        format!("{dir}/public/empty_{t2}"),
+        format!("{dir}/public/t_{t1}"),
+        format!("{dir}/public/t_{t1}/idx_{i1}"),
+        format!("{dir}/public/t_{t2}"),
         format!("{dir}/s2/t_{t3}"),
     ];
     for d in &dirs {

@@ -5,10 +5,10 @@
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;
 use crate::plan::validate::{
-    reject_unhonored_commit_clauses, reject_unhonored_create_index_clauses, reject_unhonored_create_table_clauses,
-    reject_unhonored_create_view_clauses, reject_unhonored_delete_clauses, reject_unhonored_drop_clauses,
-    reject_unhonored_insert_clauses, reject_unhonored_rollback_clauses, reject_unhonored_start_transaction_clauses,
-    reject_unhonored_update_clauses,
+    reject_unhonored_alter_table_clauses, reject_unhonored_alter_view_clauses, reject_unhonored_commit_clauses,
+    reject_unhonored_create_index_clauses, reject_unhonored_create_table_clauses, reject_unhonored_create_view_clauses,
+    reject_unhonored_delete_clauses, reject_unhonored_drop_clauses, reject_unhonored_insert_clauses,
+    reject_unhonored_rollback_clauses, reject_unhonored_start_transaction_clauses, reject_unhonored_update_clauses,
 };
 use crate::SqlResult;
 use crate::{dml, plan};
@@ -106,6 +106,28 @@ pub(crate) fn execute_statement(
         Statement::Delete(del) => {
             reject_unhonored_delete_clauses(del, "DELETE")?;
             dml::execute_delete(client, schema_name, del, &mut binder)
+        }
+        Statement::AlterTable(a) => {
+            reject_unhonored_alter_table_clauses(a, "ALTER TABLE")?;
+            // Exactly one operation per statement; a comma-separated multi-op ALTER
+            // is rejected (each op has distinct commit/validation needs, and DROP
+            // COLUMN's `column_names: Vec<Ident>` already collapses `DROP a, b` into
+            // one operation — so this only rejects genuinely separate operations).
+            if a.operations.len() != 1 {
+                return Err(GnitzSqlError::Unsupported(
+                    "ALTER TABLE with multiple comma-separated operations is not supported".to_string(),
+                ));
+            }
+            plan::execute_alter_table(client, schema_name, a, &mut binder)
+        }
+        Statement::AlterView {
+            name,
+            columns,
+            query,
+            with_options,
+        } => {
+            reject_unhonored_alter_view_clauses(columns, with_options, "ALTER VIEW")?;
+            plan::execute_alter_view(client, schema_name, name, query, &mut binder)
         }
         _ => Err(GnitzSqlError::Unsupported(format!(
             "unsupported SQL statement: {stmt:?}"

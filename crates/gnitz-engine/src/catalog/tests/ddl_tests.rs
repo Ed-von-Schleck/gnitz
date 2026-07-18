@@ -532,15 +532,16 @@ fn test_pk_change_invalidates_col_name_cache() {
     let _ = engine.get_column_names(tid);
     assert!(engine.caches.col_names.contains_key(&tid));
 
+    // Drive `apply_pk_col_of` directly (like `test_apply_pk_col_of_round_trips_..`):
+    // a bare `+1` re-ingest of an already-live TABLE_TAB row is a duplicate live
+    // head the §3.3 retraction contract now rejects at `precheck_family`, so this
+    // pins the applier's change-detection in isolation rather than the full write
+    // path. Invalidation is observed through the schema version.
     let ingest_pk = |engine: &mut CatalogEngine, raw_pk_cols: u64| {
         let batch = build_table_tab_row(&dir, tid, raw_pk_cols, "t");
-        engine.ingest_to_family(TABLE_TAB_ID, &batch).unwrap();
+        engine.apply_pk_col_of(TABTAB_PAY_PK_COL_IDX, &batch).unwrap();
     };
 
-    // Invalidation is observed through the schema version: later hooks in the
-    // same ingest (hook_cascade_fk's read_column_defs) legitimately refill the
-    // cleared caches from fresh storage, so cache-entry absence is not the
-    // invariant — the bump a client's stale version is checked against is.
     let v0 = engine.caches.get_schema_version(tid);
 
     // Identical retract/reinsert (same PK column 0): no invalidation.

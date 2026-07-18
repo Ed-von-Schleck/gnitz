@@ -2036,24 +2036,32 @@ async fn handle_system_scan(
 }
 
 /// Collect the PKs of the bundle's `tid` family whose weight matches the
-/// requested sign — the CREATE `+1` rows (`positive`) or the DROP `-1` rows.
-/// Empty if the bundle carries no such family. A DDL bundle is weight-homogeneous
-/// per family, so this cleanly selects the create rows or the drop rows.
+/// requested sign — the CREATE `+1` rows (`positive`) or the DROP `-1` rows —
+/// EXCLUDING any PK that carries BOTH signs in this family (a rewrite pair, e.g.
+/// a rename's `-1,+1`). A weight-homogeneous CREATE/DROP bundle has no such pair,
+/// so both call sites (`new_view_ids`, `dropped_tids`) are unchanged; a rename's
+/// paired PK is filtered from both, so a view rename triggers no backfill and a
+/// table rename's tid never enters `dropped_tids`. Derived batch-locally — the
+/// whole family (both signs of a pair) arrives as one batch on every path.
 fn family_pks_by_sign(families: &[(i64, Batch)], tid: i64, positive: bool) -> Vec<i64> {
     families
         .iter()
         .find(|(t, _)| *t == tid)
         .map(|(_, b)| {
-            (0..b.count)
-                .filter(|&i| {
-                    if positive {
-                        b.get_weight(i) > 0
-                    } else {
-                        b.get_weight(i) < 0
-                    }
-                })
-                .map(|i| b.get_pk(i) as i64)
-                .collect()
+            let pks_of = |want_pos: bool| -> Vec<i64> {
+                (0..b.count)
+                    .filter(|&i| {
+                        if want_pos {
+                            b.get_weight(i) > 0
+                        } else {
+                            b.get_weight(i) < 0
+                        }
+                    })
+                    .map(|i| b.get_pk(i) as i64)
+                    .collect()
+            };
+            let other = pks_of(!positive);
+            pks_of(positive).into_iter().filter(|pk| !other.contains(pk)).collect()
         })
         .unwrap_or_default()
 }

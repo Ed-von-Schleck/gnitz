@@ -207,7 +207,7 @@ impl CatalogEngine {
             self.validate_fk_column(cd, tid, first_pk, self_pk_type)?;
         }
 
-        let directory = table_dir(&self.base_dir, schema_name, table_name, tid);
+        let directory = table_dir(&self.base_dir, schema_name, tid);
         // This in-process test shortcut always builds partitioned, full-PK-distributed
         // tables (`replicated = false`, `k = 0` = default). REPLICATED and CLUSTER BY
         // routing are exercised through the catalog hook / SQL planner, not here.

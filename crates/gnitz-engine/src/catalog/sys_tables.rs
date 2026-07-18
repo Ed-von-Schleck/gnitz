@@ -225,6 +225,7 @@ pub(super) const COLTAB_COL_IS_NULLABLE: usize = col_index_in(gnitz_wire::COL_TA
 pub(super) const COLTAB_COL_FK_TABLE_ID: usize = col_index_in(gnitz_wire::COL_TAB_COLS, "fk_table_id");
 pub(super) const COLTAB_COL_FK_COL_IDX: usize = col_index_in(gnitz_wire::COL_TAB_COLS, "fk_col_idx");
 pub(super) const COLTAB_COL_IS_HIDDEN: usize = col_index_in(gnitz_wire::COL_TAB_COLS, "is_hidden");
+pub(super) const COLTAB_PAY_NAME: usize = pay_index_in(gnitz_wire::COL_TAB_COLS, "name");
 pub(super) const COLTAB_PAY_OWNER_ID: usize = pay_index_in(gnitz_wire::COL_TAB_COLS, "owner_id");
 pub(super) const COLTAB_PAY_COL_IDX: usize = pay_index_in(gnitz_wire::COL_TAB_COLS, "col_idx");
 pub(super) const COLTAB_PAY_FK_TABLE_ID: usize = pay_index_in(gnitz_wire::COL_TAB_COLS, "fk_table_id");

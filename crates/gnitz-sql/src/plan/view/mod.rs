@@ -12,7 +12,7 @@ mod scalar;
 mod set_op;
 mod simple;
 
-pub(crate) use dispatch::{compile_query_to_circuit, execute_create_view};
+pub(crate) use dispatch::{compile_query_to_circuit, execute_alter_view, execute_create_view};
 
 use crate::error::GnitzSqlError;
 use gnitz_core::{Circuit, ColumnDef, GnitzClient, PlannedView, Schema};

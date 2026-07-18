@@ -37,7 +37,7 @@ pub(crate) use batch_wire::{
     compute_wire_props, schema_wire_safe, wire_block_size, wire_header_dir_size, wire_region_sizes,
 };
 pub(crate) use columnar::{
-    cmp_col_window, compare_rows, compare_rows_fixedint_nonnull, with_payload_cmp, ColumnarSource,
+    cmp_col_window, compare_rows, compare_rows_except, compare_rows_fixedint_nonnull, with_payload_cmp, ColumnarSource,
 };
 // The PK key primitives live in `schema::key`; out-of-storage callers keep the
 // storage facade.

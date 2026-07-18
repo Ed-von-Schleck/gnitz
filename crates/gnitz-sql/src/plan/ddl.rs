@@ -614,7 +614,9 @@ pub(crate) fn execute_drop(
                 // infix): a clearer planner-side error, one fewer round-trip —
                 // the engine's own FK-index drop refusal stays the backstop.
                 validate_user_index_name(&name)?;
-                client.drop_index_by_name(&name).map_err(GnitzSqlError::Exec)?;
+                // Plain DROP INDEX drops loudly (like DROP TABLE/VIEW); only
+                // ALTER TABLE ... DROP CONSTRAINT IF EXISTS passes `true`.
+                client.drop_index_by_name(&name, false).map_err(GnitzSqlError::Exec)?;
             }
             _ => {
                 return Err(GnitzSqlError::Unsupported(format!(
@@ -633,40 +635,65 @@ pub(crate) fn execute_create_index(
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     let table_name = extract_name(&ci.table_name, "CREATE INDEX")?;
-
-    // A user-supplied index name flows through to the IDX_TAB row so
-    // `DROP INDEX <name>` resolves it. Validate it before anything else: a
-    // malformed or `__fk_`-infixed name would persist and be undroppable.
     let explicit_name = ci.name.as_ref().map(|n| extract_name(n, "CREATE INDEX")).transpose()?;
+    create_index_core(
+        client,
+        schema_name,
+        binder,
+        &table_name,
+        &ci.columns,
+        ci.unique,
+        explicit_name,
+        "CREATE INDEX",
+    )
+}
+
+/// The shared CREATE INDEX / `ALTER TABLE … ADD CONSTRAINT UNIQUE` core: validate
+/// the optional explicit name, resolve the base-table target and its indexed
+/// columns, generate or disambiguate the auto name, and create the index. `ctx`
+/// names the surface for error messages. Returns `IndexCreated { index_id }` — so
+/// ADD CONSTRAINT UNIQUE reuses the uniform create result surface.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_index_core(
+    client: &mut GnitzClient,
+    schema_name: &str,
+    binder: &mut Binder<'_>,
+    table_name: &str,
+    columns: &[sqlparser::ast::IndexColumn],
+    is_unique: bool,
+    explicit_name: Option<String>,
+    ctx: &str,
+) -> Result<SqlResult, GnitzSqlError> {
+    // A user-supplied index/constraint name flows through to the IDX_TAB row so
+    // `DROP INDEX`/`DROP CONSTRAINT <name>` resolves it. Validate it before
+    // anything else: a malformed or `__fk_`-infixed name would persist and be
+    // undroppable.
     if let Some(ref name) = explicit_name {
         validate_user_index_name(name)?;
     }
 
-    if ci.columns.is_empty() {
-        return Err(GnitzSqlError::Bind(
-            "CREATE INDEX: at least one column required".to_string(),
-        ));
+    if columns.is_empty() {
+        return Err(GnitzSqlError::Bind(format!("{ctx}: at least one column required")));
     }
-    let is_unique = ci.unique;
 
     // Resolve the target as a base table: this rejects a view (read-only — a
     // view's store is maintained solely by its circuit, so indexing a snapshot of
     // derived data has no defined semantics) with a precise error, and yields the
     // schema used to resolve the indexed columns. The client write below takes the
     // already-resolved (table_id, col_indices), so the name is resolved once.
-    let (table_id, schema) = binder.resolve_base_table(client, &table_name)?;
+    let (table_id, schema) = binder.resolve_base_table(client, table_name)?;
 
     // Resolve each indexed column to its index, in declared order; each must be a
     // simple identifier. Reject duplicate columns.
-    let mut col_names: Vec<String> = Vec::with_capacity(ci.columns.len());
-    let mut col_indices: Vec<u32> = Vec::with_capacity(ci.columns.len());
-    for c in &ci.columns {
-        let col_name = index_column_ident(c, "CREATE INDEX")?.to_string();
+    let mut col_names: Vec<String> = Vec::with_capacity(columns.len());
+    let mut col_indices: Vec<u32> = Vec::with_capacity(columns.len());
+    for c in columns {
+        let col_name = index_column_ident(c, ctx)?.to_string();
         let col_idx = find_unique_column(&schema.columns, &col_name)?
             .ok_or_else(|| GnitzSqlError::Bind(format!("column '{col_name}' not found")))?;
         if col_indices.contains(&(col_idx as u32)) {
             return Err(GnitzSqlError::Unsupported(format!(
-                "CREATE INDEX: duplicate column '{col_name}' in index list"
+                "{ctx}: duplicate column '{col_name}' in index list"
             )));
         }
         col_names.push(col_name);
@@ -690,7 +717,7 @@ pub(crate) fn execute_create_index(
         Some(name) => name, // explicit: an exact-name collision still errors in `create_index`
         None => {
             let names: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
-            let base = default_index_name(schema_name, &table_name, &names);
+            let base = default_index_name(schema_name, table_name, &names);
             let existing = client.index_name_cols().map_err(GnitzSqlError::Exec)?;
             // A prior *auto-named* index on this exact column set is the same index:
             // reject it, preserving the pre-disambiguation duplicate rejection (name

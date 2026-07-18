@@ -3,11 +3,13 @@
 //! module that reaches both `plan` and `dml`; `plan` itself never references
 //! `dml`.
 
+mod alter;
 mod ddl;
 pub(crate) mod index_bound;
 pub(crate) mod lp;
 pub(crate) mod validate;
 mod view;
 
+pub(crate) use alter::execute_alter_table;
 pub(crate) use ddl::{execute_create_index, execute_create_table, execute_drop};
-pub(crate) use view::{compile_query_to_circuit, execute_create_view};
+pub(crate) use view::{compile_query_to_circuit, execute_alter_view, execute_create_view};

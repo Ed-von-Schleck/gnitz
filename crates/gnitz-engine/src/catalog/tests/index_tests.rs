@@ -1835,7 +1835,7 @@ fn test_drop_unique_index_on_fk_column_keeps_shared_directory() {
     let child_tid = engine.create_table("public.child", &child_cols, &[0], true).unwrap();
     engine.create_index("public.child", &["refc"], true).unwrap();
 
-    let tbl_dir = format!("{dir}/public/child_{child_tid}");
+    let tbl_dir = format!("{dir}/public/t_{child_tid}");
     assert_eq!(
         count_idx_dirs(&tbl_dir),
         1,

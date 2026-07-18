@@ -1,3 +1,4 @@
+mod alter_tests;
 mod atomicity_tests;
 mod compound_pk_smoke;
 mod ddl_tests;

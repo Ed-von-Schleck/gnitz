@@ -45,14 +45,16 @@ pub(crate) fn schema_dir(base_dir: &str, schema_name: &str) -> String {
     format!("{base_dir}/{schema_name}")
 }
 
-/// `<base_dir>/<schema_name>/<name>_<tid>` — a table's directory.
-pub(crate) fn table_dir(base_dir: &str, schema_name: &str, name: &str, tid: i64) -> String {
-    format!("{base_dir}/{schema_name}/{name}_{tid}")
+/// `<base_dir>/<schema_name>/t_<tid>` — a table's directory. Id-only (no
+/// embedded name), so a RENAME never changes the path and never orphans data.
+pub(crate) fn table_dir(base_dir: &str, schema_name: &str, tid: i64) -> String {
+    format!("{base_dir}/{schema_name}/t_{tid}")
 }
 
-/// `<base_dir>/<schema_name>/view_<name>_<vid>` — a view's directory.
-pub(crate) fn view_dir(base_dir: &str, schema_name: &str, name: &str, vid: i64) -> String {
-    format!("{base_dir}/{schema_name}/view_{name}_{vid}")
+/// `<base_dir>/<schema_name>/v_<vid>` — a view's directory. Id-only (no embedded
+/// name), so a RENAME never changes the path and never orphans data.
+pub(crate) fn view_dir(base_dir: &str, schema_name: &str, vid: i64) -> String {
+    format!("{base_dir}/{schema_name}/v_{vid}")
 }
 
 /// `<owner_dir>/idx_<idx_id>` — an index's directory, nested in its owner.

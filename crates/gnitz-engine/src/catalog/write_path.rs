@@ -6,10 +6,12 @@
 //! `sys_tables.rs` / `apply_context.rs`. No second ingest entry point may
 //! skip this precheck/hooks path.
 
+use std::cmp::Ordering;
 use std::num::NonZeroU64;
 
 use super::*;
 use crate::schema::make_index_schema;
+use crate::storage::{compare_rows, compare_rows_except};
 
 /// The only handle the DDL/imperative layer has on catalog state: submit one
 /// system-family delta. It cannot name a `sys_*` table, so DDL code physically
@@ -210,6 +212,139 @@ impl CatalogEngine {
         Ok(())
     }
 
+    /// Materialize the live (net-positive) row for the OPK `pk_bytes` in
+    /// `family`'s store into a 1-row batch, with its net weight. `None` if no
+    /// live row. Reads only — the `copy_current_row_into` precedent is
+    /// `retract_single_row`. `ReadCursor` is not a `ColumnarSource`, so the CAS
+    /// needs the row materialized into a `Batch` before `compare_rows`.
+    fn seek_live_sys_row(&self, family: SysFamily, pk_bytes: &[u8]) -> Option<(Batch, i64)> {
+        let mut cursor = self.sys_store(family).open_cursor();
+        if !cursor.seek_exact_live(pk_bytes) {
+            return None;
+        }
+        let w = cursor.current_weight;
+        let mut b = Batch::with_schema(sys_tab_schema(family.id()), 1);
+        cursor.copy_current_row_into(&mut b, w);
+        Some((b, w))
+    }
+
+    /// §3.3(A): the post-image retraction contract for a rewrite-pair-capable
+    /// family (TABLE_TAB / VIEW_TAB / COL_TAB). For every distinct PK the batch
+    /// touches:
+    /// 1. **CAS** — every `-1` row must content-equal the current live row (you
+    ///    may only retract the element that exists). Via the generic
+    ///    `compare_rows`, which routes STRING/BLOB (`name`/`sql_definition`)
+    ///    through each side's own blob heap, so a valid rename to a name > 12
+    ///    bytes is accepted (a raw region `memcmp` would false-reject it) while a
+    ///    stale-snapshot `-1` is rejected.
+    /// 2. **Per-PK net** — `live_weight + Σ batch weights` must be 0 or 1 (sys
+    ///    stores are not `unique_pk`, so nothing else stops a duplicate live head
+    ///    or a persistent negative ghost).
+    /// 3. **Pair fields** — a PK carrying both signs (a rewrite pair) may differ
+    ///    from the live row only in `name` (`name_pay`); for a relation family
+    ///    (`is_relation`) a rewrite pair on a system-range id is additionally
+    ///    rejected.
+    ///
+    /// Returns the PKs whose net is dead (`≤ 0`) — the genuine drops — so the
+    /// relation drop guards re-key on net-liveness (a rename's net-live `-1` is
+    /// excluded) rather than raw batch weights.
+    fn precheck_retraction_contract(
+        &self,
+        family: SysFamily,
+        batch: &Batch,
+        name_pay: usize,
+        is_relation: bool,
+    ) -> Result<Vec<i64>, String> {
+        let schema = sys_tab_schema(family.id());
+        let mut net_dead: Vec<i64> = Vec::new();
+        let mut seen: Vec<u128> = Vec::new();
+        for i in 0..batch.count {
+            let pk = batch.get_pk(i);
+            if seen.contains(&pk) {
+                continue;
+            }
+            seen.push(pk);
+
+            // Per-PK batch signature (the batch is a handful of rows).
+            let mut batch_sum = 0i64;
+            let (mut has_neg, mut has_pos) = (false, false);
+            for j in 0..batch.count {
+                if batch.get_pk(j) != pk {
+                    continue;
+                }
+                let w = batch.get_weight(j);
+                batch_sum += w;
+                has_neg |= w < 0;
+                has_pos |= w > 0;
+            }
+
+            // (0) System-range rewrite guard (§3.3(B), relation families only):
+            // a rewrite pair (both signs) on a system-range id is rejected up
+            // front — before the CAS, so it fires regardless of whether a live
+            // row exists. Closes the pre-existing gap that no precheck guarded
+            // system-range payload ids.
+            if is_relation && has_neg && has_pos && (pk as i64) < FIRST_USER_TABLE_ID {
+                return Err(format!(
+                    "cannot ALTER a system relation (id {pk} < {FIRST_USER_TABLE_ID})"
+                ));
+            }
+
+            let live = self.seek_live_sys_row(family, batch.get_pk_bytes(i));
+            let live_weight = live.as_ref().map_or(0, |(_, w)| *w);
+            let live_batch: Option<&Batch> = live.as_ref().map(|(b, _)| b);
+
+            // (1) CAS: every -1 row must content-equal the live row.
+            if has_neg {
+                let Some(lb) = live_batch else {
+                    return Err(
+                        "catalog changed concurrently: retracting a system-catalog row that no longer exists".into(),
+                    );
+                };
+                for j in 0..batch.count {
+                    if batch.get_pk(j) == pk
+                        && batch.get_weight(j) < 0
+                        && compare_rows(&schema, lb, 0, batch, j) != Ordering::Equal
+                    {
+                        return Err(
+                            "catalog changed concurrently: the retracted system-catalog row differs from the current one"
+                                .into(),
+                        );
+                    }
+                }
+            }
+
+            // (2) Per-PK net ∈ {0, 1}.
+            let net = live_weight + batch_sum;
+            if !(0..=1).contains(&net) {
+                return Err(format!(
+                    "system-catalog write would leave PK {pk} at net weight {net} (expected 0 or 1)"
+                ));
+            }
+
+            // (3) Pair fields: a rewrite pair's `+1` may differ from the live row
+            // only in `name` (the CAS above already required a live row).
+            // `compare_rows_except` routes STRING/BLOB through each side's own
+            // blob heap, so a name > 12 bytes is compared by content, never a
+            // raw region `memcmp`.
+            if has_neg && has_pos {
+                let lb = live_batch.expect("a pair's -1 CAS already required a live row");
+                for j in 0..batch.count {
+                    if batch.get_pk(j) == pk
+                        && batch.get_weight(j) > 0
+                        && compare_rows_except(&schema, lb, 0, batch, j, name_pay) != Ordering::Equal
+                    {
+                        return Err("a system-catalog rewrite pair may only change the name".into());
+                    }
+                }
+            }
+
+            if net <= 0 {
+                net_dead.push(pk as i64);
+            }
+        }
+        Ok(net_dead)
+    }
+
     /// Visit every positive-weight `sys_indices` row whose owner and **exact
     /// column list** match `(owner_id, cols)`, invoking `f(index_id, is_unique)`
     /// for each. Centralises the IDX_TAB cursor walk shared by the DROP INDEX
@@ -279,18 +414,30 @@ impl CatalogEngine {
     pub(crate) fn precheck_family(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
         // Exhaustive over `SysFamily` (like `fire_hooks`): a newly-added family
         // must decide here whether it carries precheck guards.
-        match SysFamily::from_id(table_id) {
-            Some(SysFamily::Schema | SysFamily::Table | SysFamily::View | SysFamily::Index) => {}
-            Some(
-                SysFamily::Column
-                | SysFamily::ViewDep
-                | SysFamily::Sequence
-                | SysFamily::CircuitNodes
-                | SysFamily::CircuitEdges
-                | SysFamily::CircuitNodeColumns,
-            )
-            | None => return Ok(()),
-        }
+        let family = match SysFamily::from_id(table_id) {
+            Some(f) => f,
+            None => return Ok(()),
+        };
+        // §3.3(A): the retraction contract (CAS + per-PK net + pair-fields) runs
+        // for every rewrite-pair-capable family and yields the net-dead PKs.
+        // COL_TAB runs ONLY this layer (a column record has no relation guards);
+        // TABLE/VIEW run it, then the relation guards below re-key their drop
+        // checks on the net-dead set. SCHEMA/INDEX carry no rewrite pair, so they
+        // keep the raw weight<0 drop set (already net-dead) and skip the contract.
+        let net_dead: Vec<i64> = match family {
+            SysFamily::Table => self.precheck_retraction_contract(family, batch, TABTAB_PAY_NAME, true)?,
+            SysFamily::View => self.precheck_retraction_contract(family, batch, VIEWTAB_PAY_NAME, true)?,
+            SysFamily::Column => {
+                self.precheck_retraction_contract(family, batch, COLTAB_PAY_NAME, false)?;
+                return Ok(());
+            }
+            SysFamily::Schema | SysFamily::Index => Vec::new(),
+            SysFamily::ViewDep
+            | SysFamily::Sequence
+            | SysFamily::CircuitNodes
+            | SysFamily::CircuitEdges
+            | SysFamily::CircuitNodeColumns => return Ok(()),
+        };
 
         // -- Positive-weight (CREATE) checks ----------------------------------
         for i in 0..batch.count {
@@ -390,12 +537,18 @@ impl CatalogEngine {
         }
 
         // -- Negative-weight (DROP) checks ------------------------------------
-        let mut drop_ids: Vec<i64> = Vec::new();
-        for i in 0..batch.count {
-            if batch.get_weight(i) < 0 {
-                drop_ids.push(batch.get_pk(i) as i64);
-            }
-        }
+        // §3.3(B): re-key the drop integrity guards on PKs whose bundle net is
+        // DEAD, not raw weight<0 — so a rename pair's net-live `-1` is excluded
+        // and never rejected as "referenced by FK" / "View dependency". For
+        // TABLE/VIEW that is the contract's `net_dead`; SCHEMA/INDEX carry no
+        // rewrite pair, so raw weight<0 is already net-dead.
+        let mut drop_ids: Vec<i64> = match family {
+            SysFamily::Table | SysFamily::View => net_dead,
+            _ => (0..batch.count)
+                .filter(|&i| batch.get_weight(i) < 0)
+                .map(|i| batch.get_pk(i) as i64)
+                .collect(),
+        };
         if drop_ids.is_empty() {
             return Ok(());
         }
@@ -751,15 +904,31 @@ impl CatalogEngine {
             .iter()
             .any(|(_, b)| (0..b.count).any(|i| b.get_weight(i) > 0));
 
+        // §3.4: each family in the rollback list must be internally homogeneous
+        // (a pure CREATE or pure DROP) OR fully paired — every negative PK also
+        // appears positively in that same family and vice versa (a rewrite pair,
+        // e.g. a rename). A rename's single COL/TABLE/VIEW family is fully paired;
+        // `is_create` (computed above on the original un-negated weights) then
+        // classifies it either way, since a pure rename pair leaves an empty
+        // `pending_dir_deletions` (§3.2's reconciling hooks no-op the whole
+        // registration), so both drain/discard are no-ops on the empty vec.
         debug_assert!(
-            rollback_list
-                .iter()
-                .all(|(_, b)| (0..b.count).all(|i| b.get_weight(i) > 0))
-                || rollback_list
-                    .iter()
-                    .all(|(_, b)| (0..b.count).all(|i| b.get_weight(i) < 0)),
-            "compensate_stage_a assumes a weight-homogeneous bundle; a mixed \
-             CREATE/DROP bundle would misclassify the rollback direction and mishandle \
+            rollback_list.iter().all(|(_, b)| {
+                let neg: Vec<u128> = (0..b.count)
+                    .filter(|&i| b.get_weight(i) < 0)
+                    .map(|i| b.get_pk(i))
+                    .collect();
+                let pos: Vec<u128> = (0..b.count)
+                    .filter(|&i| b.get_weight(i) > 0)
+                    .map(|i| b.get_pk(i))
+                    .collect();
+                let homogeneous = neg.is_empty() || pos.is_empty();
+                let fully_paired = neg.iter().all(|pk| pos.contains(pk)) && pos.iter().all(|pk| neg.contains(pk));
+                homogeneous || fully_paired
+            }),
+            "compensate_stage_a assumes each rollback family is weight-homogeneous \
+             OR fully paired (a rename rewrite pair); a genuinely mixed CREATE/DROP \
+             family would misclassify the rollback direction and mishandle \
              pending_dir_deletions"
         );
 

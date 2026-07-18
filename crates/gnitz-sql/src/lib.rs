@@ -32,6 +32,14 @@ pub enum SqlResult {
         index_id: u64,
     },
     Dropped,
+    /// `ALTER TABLE/VIEW` (rename table/view/column, DROP CONSTRAINT, ALTER VIEW
+    /// AS). `object` is the altered kind (`"table"` / `"view"` / `"column"` /
+    /// `"constraint"`) and `name` its new/affected name. (`ADD CONSTRAINT UNIQUE`
+    /// maps to CREATE UNIQUE INDEX and returns `IndexCreated` instead.)
+    Altered {
+        object: String,
+        name: String,
+    },
     RowsAffected {
         count: usize,
     },

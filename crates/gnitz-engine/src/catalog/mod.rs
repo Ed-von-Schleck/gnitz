@@ -13,15 +13,15 @@
 //! System-table writes flow through [`fire_hooks`](CatalogEngine::fire_hooks),
 //! which dispatches two categories of handler per sys_table_id:
 //!
-//! * `apply_*` — pure cache-delta appliers. Each row's weight drives a
-//!   HashMap/HashSet insert (weight > 0) or remove (weight < 0). Naturally
-//!   handles retract+insert pairs because HashMap ops commute with the sign
-//!   of the weight.
-//! * `hook_*` — side-effectful, edge-triggered handlers that create
-//!   directories, allocate store partitions, register DAG entries, or
-//!   backfill derived state. These are NOT symmetric under retract+insert
-//!   on the same row; the current DDL surface (CREATE is +1, DROP is -1)
-//!   never produces that pattern, so edge-triggering is safe.
+//! * `apply_*` — pure cache-delta appliers, run over a sign-partitioned view of
+//!   the batch (all retractions before all insertions, §3.1) so a rewrite pair
+//!   (a rename's -1,+1 on one PK) applies its retraction before its insertion.
+//! * `hook_*` — side-effectful handlers that create directories, allocate store
+//!   partitions, register DAG entries, or backfill derived state. Storage is
+//!   applied before hooks fire, so the register/cascade hooks reconcile against
+//!   the row's *net* live state (`seek_exact_live`) rather than its own sign — a
+//!   rename pair (net-live before and after) fires neither teardown nor
+//!   re-registration, in any row order, on every application path.
 //!
 //! See `hooks.rs` for the cross-sys-table ordering contract and where it's
 //! enforced.

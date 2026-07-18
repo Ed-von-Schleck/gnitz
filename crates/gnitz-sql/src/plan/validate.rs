@@ -981,7 +981,10 @@ fn reject_unhonored_pk_fields(pk: &sqlparser::ast::PrimaryKeyConstraint, context
 /// is rejected like CREATE INDEX rejects it — gnitz defines no NULL-conflict
 /// semantics to honor. Shared by the column-level and table-level guards
 /// (exhaustive destructure, no `..`).
-fn reject_unhonored_unique_fields(u: &sqlparser::ast::UniqueConstraint, context: &str) -> Result<(), GnitzSqlError> {
+pub(crate) fn reject_unhonored_unique_fields(
+    u: &sqlparser::ast::UniqueConstraint,
+    context: &str,
+) -> Result<(), GnitzSqlError> {
     let sqlparser::ast::UniqueConstraint {
         // Consumed by `execute_create_table` (the name becomes the index name).
         name: _,
@@ -1099,6 +1102,64 @@ pub(crate) fn reject_unhonored_table_constraints(
             C::PrimaryKeyUsingIndex(_) => return Err(reject("PRIMARY KEY USING INDEX")),
             C::UniqueUsingIndex(_) => return Err(reject("UNIQUE USING INDEX")),
         }
+    }
+    Ok(())
+}
+
+/// Reject every `ALTER TABLE` envelope clause gnitz does not honor: `ONLY`
+/// (silently scopes out partition children), a Hive `SET LOCATION`, `ON CLUSTER`,
+/// and a non-`None` `table_type` (Iceberg/Dynamic — a different storage engine).
+/// The single operation (comma-count enforced by the caller) is dispatched in
+/// `plan/alter.rs`. Exhaustive destructure (no `..`): a future sqlparser field
+/// stops the build until it is classified.
+pub(crate) fn reject_unhonored_alter_table_clauses(
+    alter: &sqlparser::ast::AlterTable,
+    context: &str,
+) -> Result<(), GnitzSqlError> {
+    let sqlparser::ast::AlterTable {
+        // Consumed by the dispatcher.
+        name: _,
+        operations: _,
+        if_exists: _,
+        // Inert: the statement-terminator token.
+        end_token: _,
+        // Rejected.
+        only,
+        location,
+        on_cluster,
+        table_type,
+    } = alter;
+    let reject = |clause: &str| unsupported_clause(context, clause);
+    if *only {
+        return Err(reject("ONLY"));
+    }
+    if location.is_some() {
+        return Err(reject("SET LOCATION"));
+    }
+    if on_cluster.is_some() {
+        return Err(reject("ON CLUSTER"));
+    }
+    if table_type.is_some() {
+        return Err(reject("a non-default table type (Iceberg/Dynamic/External)"));
+    }
+    Ok(())
+}
+
+/// Reject an `ALTER VIEW … AS` with output column aliases (`ALTER VIEW v (a,b) AS`)
+/// or `WITH` options — gnitz derives the view's output schema from the query, so
+/// either would silently produce a different view. sqlparser's `AlterView` has no
+/// `if_exists`, so `ALTER VIEW IF EXISTS` never parses.
+pub(crate) fn reject_unhonored_alter_view_clauses(
+    columns: &[sqlparser::ast::Ident],
+    with_options: &[sqlparser::ast::SqlOption],
+    context: &str,
+) -> Result<(), GnitzSqlError> {
+    let reject = |clause: &str| unsupported_clause(context, clause);
+    if !columns.is_empty() {
+        return Err(reject("output column aliases"));
+    }
+    if !with_options.is_empty() {
+        return Err(reject("WITH options"));
     }
     Ok(())
 }

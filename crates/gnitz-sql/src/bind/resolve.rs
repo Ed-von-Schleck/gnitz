@@ -224,14 +224,15 @@ impl<'a> Binder<'a> {
                 self.cache_relation(name, tid, Rc::clone(&rc), true);
                 Ok((tid, rc))
             }
-            // Miss: re-probe including views to tell "is a view" (reject as
-            // read-only) from "does not exist" (propagate the original error).
-            Err(not_found) => match client.resolve_table_or_view_id(self.schema_name, name) {
-                Ok(_) => Err(GnitzSqlError::Unsupported(format!(
+            // Miss: kind-probe (id-only, no schema assembly) to tell "is a view"
+            // (reject as read-only) from "does not exist" (propagate the
+            // original error).
+            Err(not_found) => match client.resolve_relation_kind(self.schema_name, name) {
+                Ok(Some((_, true))) => Err(GnitzSqlError::Unsupported(format!(
                     "'{name}' is a view; INSERT, UPDATE, DELETE and CREATE INDEX \
                      require a base table"
                 ))),
-                Err(_) => Err(GnitzSqlError::Exec(not_found)),
+                _ => Err(GnitzSqlError::Exec(not_found)),
             },
         }
     }

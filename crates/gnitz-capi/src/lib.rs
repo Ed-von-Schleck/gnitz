@@ -1360,6 +1360,10 @@ pub unsafe extern "C" fn gnitz_execute_sql(
                         SqlResult::IndexCreated { index_id } => index_id,
                         SqlResult::RowsAffected { count } => count as u64,
                         SqlResult::Dropped => 0,
+                        // ALTER has no id to surface through `out_id` (the new
+                        // name is in the SqlResult, unreachable via this ABI) —
+                        // 0, consistent with Dropped/Rows.
+                        SqlResult::Altered { .. } => 0,
                         SqlResult::Rows { .. } => 0,
                         // A raw C caller cannot disambiguate the three transaction
                         // results via `out_id` alone — acceptable and consistent

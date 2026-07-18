@@ -403,6 +403,7 @@ impl Session {
     /// the decode hint for hint-driven receivers. Returns
     /// `(schema, data, terminal seek_pk)` — the scan paths read the terminal
     /// frame's `seek_pk` as the last-committed LSN.
+    #[allow(clippy::type_complexity)] // the (schema, data, terminal seek_pk) reply tuple
     fn drain_reply_train(
         &mut self,
         mut recv_one: impl FnMut(&mut Self, Option<&Arc<Schema>>) -> Result<Message, ClientError>,

@@ -14,16 +14,17 @@ impl CatalogEngine {
     // Two categories of handler are dispatched from here:
     //
     //   * `apply_*`  — pure cache-delta appliers. Each row's weight drives
-    //     a HashMap/HashSet insert (+1) or remove (-1). Naturally idempotent
-    //     under retract+insert because HashMap ops commute with weight sign.
-    //   * `hook_*`   — side-effectful, edge-triggered handlers that build
-    //     directories, allocate partitions, register DAG entries, or
-    //     backfill derived state. These are NOT idempotent across a
-    //     retract+insert pair on the same row; today's DDL surface never
-    //     produces such a pair for sys_tables / sys_views / sys_indices,
-    //     so edge-triggering is safe. If that ever changes (e.g. an ALTER
-    //     path that rewrites a row via -1,+1), these handlers need to be
-    //     revisited.
+    //     a HashMap/HashSet insert (weight > 0) or remove (weight < 0). They
+    //     run over a sign-partitioned view of the batch (all retractions before
+    //     all insertions, §3.1 `sign_partition_batch`), so a rewrite pair (a
+    //     rename's -1,+1 on one PK) applies its retraction before its insertion
+    //     — the order the retract-then-insert appliers require.
+    //   * `hook_*`   — side-effectful handlers that build directories, allocate
+    //     partitions, register DAG entries, or backfill derived state. Storage
+    //     is applied before hooks fire, so the register/cascade hooks gate on
+    //     the row's *net* live state (`seek_exact_live`) rather than its own
+    //     sign: a rename pair (net-live before and after) fires no teardown and
+    //     no re-registration, in any row order, on every application path.
     //
     // Cross-sys-table ordering contract (required by `hook_table_register`
     // and `hook_view_register`, which read sys_columns via
@@ -44,6 +45,16 @@ impl CatalogEngine {
     //     directly (loaded at open time), not the cache, so the ordering
     //     holds.
     pub(crate) fn fire_hooks(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
+        // §3.1: dispatch every handler over a sign-partitioned view (retractions
+        // before insertions) so a rewrite pair applies in retract-then-insert
+        // order for every fold, on the forward and the (negated) compensation
+        // path alike. A weight-homogeneous CREATE/DROP bundle is single-sign, so
+        // the partition is identity and `sign_partition_batch` returns `None` (no
+        // copy); only a mixed-sign bundle (a rename pair) is reordered into a
+        // private copy — the received `batch` (broadcast to workers, negated on
+        // rollback) is left untouched.
+        let reordered = Self::sign_partition_batch(batch, &sys_tab_schema(family.id()));
+        let batch = reordered.as_ref().unwrap_or(batch);
         // Exhaustive over `SysFamily`: a newly-added family is a compile error
         // here, not a silently-skipped `_` arm. The no-op families
         // (Sequence/Circuit*) are named, not swallowed by a wildcard.
@@ -90,6 +101,47 @@ impl CatalogEngine {
             SysFamily::CircuitNodes | SysFamily::CircuitEdges | SysFamily::CircuitNodeColumns => {}
         }
         Ok(())
+    }
+
+    /// A sign-partitioned copy of `batch` — all `weight < 0` rows first (in
+    /// original order), then all `weight > 0` rows — when it carries both signs;
+    /// `None` when weight-homogeneous (the partition is identity, so the caller
+    /// dispatches the original with no copy). This restores the natural Z-set
+    /// application order (every retraction observes the pre-bundle state for its
+    /// key) for every `apply_*` fold at once, on the forward path and on the
+    /// compensation path (where in-place negation flips a client's `-1`-first
+    /// pair to `+1`-first, which this re-canonicalizes by the batch's *current*
+    /// signs). Catalog bundles are ±1, so the `from_indexed_rows` no-weights
+    /// gather (which asserts nonzero weights) is sound.
+    fn sign_partition_batch(batch: &Batch, schema: &SchemaDescriptor) -> Option<Batch> {
+        let (mut has_neg, mut has_pos) = (false, false);
+        for i in 0..batch.count {
+            let w = batch.get_weight(i);
+            has_neg |= w < 0;
+            has_pos |= w > 0;
+            if has_neg && has_pos {
+                break;
+            }
+        }
+        if !(has_neg && has_pos) {
+            return None;
+        }
+        let mut indices: Vec<u32> = Vec::with_capacity(batch.count);
+        indices.extend((0..batch.count).filter(|&i| batch.get_weight(i) < 0).map(|i| i as u32));
+        indices.extend((0..batch.count).filter(|&i| batch.get_weight(i) > 0).map(|i| i as u32));
+        Some(Batch::from_indexed_rows(&batch.as_mem_batch(), &indices, schema))
+    }
+
+    /// Whether `pk_bytes` (the OPK key) names a *net-live* row in `family`'s
+    /// store — net positive weight through the merged cursor. Storage is applied
+    /// before hooks fire, so a rename pair's shared PK reads net-live (its `-1`
+    /// and `+1` are both present) while a genuine drop reads net-dead. The gate
+    /// for the reconciling register hooks (§3.2): a different question than
+    /// batch-local pair detection, and robust even to the consolidated sys tables
+    /// at boot replay (where a rename pair has folded to net `+1`, no `-1`
+    /// surviving) and to a multi-op recovery batch on one id.
+    fn sys_pk_is_live(&self, family: SysFamily, pk_bytes: &[u8]) -> bool {
+        self.sys_store(family).open_cursor().seek_exact_live(pk_bytes)
     }
 
     /// Fold a `sys_sequences` advance into the in-memory `user_sequences` map.
@@ -301,12 +353,20 @@ impl CatalogEngine {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let tid = batch.get_pk(i) as i64;
+            // §3.2: gate side effects on the row's NET live state (storage is
+            // already applied), not its own sign. A rename pair (net-live before
+            // and after) fires neither the `+1` registration nor the `-1`
+            // teardown, in any row order and on every application path.
+            let net_live = self.sys_pk_is_live(SysFamily::Table, batch.get_pk_bytes(i));
 
             if weight > 0 {
                 // System tables are pre-registered by `register_system_table_families`
                 // before `replay_catalog` fires hooks, so their rows show up here
-                // with the DAG already populated. Skip to avoid double-registration.
-                if self.dag.tables.contains_key(&tid) {
+                // with the DAG already populated; a rename pair's `+1` likewise
+                // finds the id already registered. Skip to avoid double-register.
+                // A `+1` whose net folds to dead (a create cancelled within its
+                // own bundle) registers nothing.
+                if !net_live || self.dag.tables.contains_key(&tid) {
                     continue;
                 }
 
@@ -340,7 +400,7 @@ impl CatalogEngine {
                 validate_relation_defs("table", tid, &name, &col_defs, &pk)?;
 
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
-                let directory = table_dir(&self.base_dir, &schema_name, &name, tid);
+                let directory = table_dir(&self.base_dir, &schema_name, tid);
                 let tbl_schema = self
                     .build_schema_from_col_defs(&col_defs, pk.as_slice(), dist_prefix_len)
                     .with_replicated(is_replicated);
@@ -371,34 +431,39 @@ impl CatalogEngine {
                     directory,
                 );
                 raise_id_counter(&mut self.next_table_id, tid);
-            } else if let Some(directory) = self.dag.tables.get(&tid).map(|e| e.directory.clone()) {
-                // Safe to cascade unconditionally: precheck_sys_ingest rejects
-                // FK/view-dep-blocked drops before the -1 row reaches the WAL.
-                // cascade_retract_indices cleans up any in-transaction FK indices
-                // (those were never broadcast and must be physically removed).
-                // During rollback the rollback gate in `CatalogDeltaSink::submit`
-                // ensures these writes bypass pending_broadcasts.
-                self.cascade_retract_indices(tid)?;
-                // Under atomic CREATE the COL_TAB rows are applied via the enqueuing
-                // path, so they are in compensation's drained set and negated
-                // directly. CREATE rollback replays descending topo, so this
-                // TABLE_TAB(6) -1 fires its DROP-branch cascade BEFORE the drained
-                // COL_TAB(1) -1: an unguarded cascade_retract_columns would retract
-                // the columns, then the drained -1 would retract them again → a net
-                // -1 ghost. Skip it during rollback so compensation's direct negate
-                // is the sole retractor. (The unguarded cascade_retract_indices above
-                // is the dual: FK auto-indices use submit_local — never enqueued — so
-                // the cascade is their only retractor and must run.)
-                if !self.ctx.in_rollback() {
-                    self.cascade_retract_columns(tid)?;
+            } else if !net_live {
+                // A genuine drop (net-dead): run the teardown cascade. A rename
+                // pair's `-1` is net-live, so this branch is skipped and the
+                // registration survives untouched.
+                if let Some(directory) = self.dag.tables.get(&tid).map(|e| e.directory.clone()) {
+                    // Safe to cascade unconditionally: precheck_sys_ingest rejects
+                    // FK/view-dep-blocked drops before the -1 row reaches the WAL.
+                    // cascade_retract_indices cleans up any in-transaction FK indices
+                    // (those were never broadcast and must be physically removed).
+                    // During rollback the rollback gate in `CatalogDeltaSink::submit`
+                    // ensures these writes bypass pending_broadcasts.
+                    self.cascade_retract_indices(tid)?;
+                    // Under atomic CREATE the COL_TAB rows are applied via the enqueuing
+                    // path, so they are in compensation's drained set and negated
+                    // directly. CREATE rollback replays descending topo, so this
+                    // TABLE_TAB(6) -1 fires its DROP-branch cascade BEFORE the drained
+                    // COL_TAB(1) -1: an unguarded cascade_retract_columns would retract
+                    // the columns, then the drained -1 would retract them again → a net
+                    // -1 ghost. Skip it during rollback so compensation's direct negate
+                    // is the sole retractor. (The unguarded cascade_retract_indices above
+                    // is the dual: FK auto-indices use submit_local — never enqueued — so
+                    // the cascade is their only retractor and must run.)
+                    if !self.ctx.in_rollback() {
+                        self.cascade_retract_columns(tid)?;
+                    }
+                    self.dag.unregister_table(tid);
+                    self.pending_dir_deletions.push(directory);
+                    // Purge both per-table version counters AFTER the cascade above:
+                    // cascade_retract_indices' apply_index_by_id bump and (on the
+                    // non-rollback path) cascade_retract_columns' invalidate_col_names
+                    // bump would otherwise `or_insert` them straight back.
+                    self.caches.purge_table_versions(tid);
                 }
-                self.dag.unregister_table(tid);
-                self.pending_dir_deletions.push(directory);
-                // Purge both per-table version counters AFTER the cascade above:
-                // cascade_retract_indices' apply_index_by_id bump and (on the
-                // non-rollback path) cascade_retract_columns' invalidate_col_names
-                // bump would otherwise `or_insert` them straight back.
-                self.caches.purge_table_versions(tid);
             }
         }
         Ok(())
@@ -443,11 +508,16 @@ impl CatalogEngine {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let vid = batch.get_pk(i) as i64;
+            // §3.2: gate on NET live state, so a rename pair (net-live before and
+            // after) fires neither registration nor teardown.
+            let net_live = self.sys_pk_is_live(SysFamily::View, batch.get_pk_bytes(i));
 
             if weight > 0 {
-                // See hook_table_register: system tables are pre-registered, user
-                // views are not, so this only skips re-registration on replay.
-                if self.dag.tables.contains_key(&vid) {
+                // See hook_table_register: system tables are pre-registered, a
+                // rename pair's `+1` finds its vid already registered, and a
+                // net-dead `+1` registers nothing — so this only registers a live,
+                // not-yet-registered view (the genuine CREATE).
+                if !net_live || self.dag.tables.contains_key(&vid) {
                     continue;
                 }
 
@@ -465,7 +535,7 @@ impl CatalogEngine {
                 validate_relation_defs("view", vid, &name, &col_defs, &pk)?;
 
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
-                let directory = view_dir(&self.base_dir, &schema_name, &name, vid);
+                let directory = view_dir(&self.base_dir, &schema_name, vid);
                 // Views are not distributed by a chosen key (§2): `0` is the
                 // full-PK default sentinel every non-CLUSTER BY caller passes.
                 let view_schema = self.build_schema_from_col_defs(&col_defs, pk.as_slice(), 0);
@@ -533,26 +603,30 @@ impl CatalogEngine {
                 {
                     self.backfill_view(vid);
                 }
-            } else if let Some(directory) = self.dag.tables.get(&vid).map(|e| e.directory.clone()) {
-                // Under atomic CREATE the circuit/dep/COL_TAB rows are applied via
-                // the enqueuing path, so they are in compensation's drained set and
-                // negated directly. CREATE rollback replays descending topo, so this
-                // VIEW_TAB(7) -1 fires its DROP-branch cascade BEFORE the drained
-                // circuit(3–5)/DEP(2)/COL(1) -1s: an unguarded cascade would retract
-                // them, then the drained -1s would retract them again → a net -1
-                // ghost. Skip it during rollback so compensation's direct negate is
-                // the sole retractor.
-                if !self.ctx.in_rollback() {
-                    self.cascade_retract_circuit_and_deps(vid)?;
-                    self.cascade_retract_columns(vid)?;
+            } else if !net_live {
+                // A genuine drop (net-dead): a rename pair's `-1` is net-live, so
+                // this teardown is skipped and the view registration survives.
+                if let Some(directory) = self.dag.tables.get(&vid).map(|e| e.directory.clone()) {
+                    // Under atomic CREATE the circuit/dep/COL_TAB rows are applied via
+                    // the enqueuing path, so they are in compensation's drained set and
+                    // negated directly. CREATE rollback replays descending topo, so this
+                    // VIEW_TAB(7) -1 fires its DROP-branch cascade BEFORE the drained
+                    // circuit(3–5)/DEP(2)/COL(1) -1s: an unguarded cascade would retract
+                    // them, then the drained -1s would retract them again → a net -1
+                    // ghost. Skip it during rollback so compensation's direct negate is
+                    // the sole retractor.
+                    if !self.ctx.in_rollback() {
+                        self.cascade_retract_circuit_and_deps(vid)?;
+                        self.cascade_retract_columns(vid)?;
+                    }
+                    self.dag.unregister_table(vid);
+                    self.pending_dir_deletions.push(directory);
+                    // See hook_table_register: purge post-cascade so the cascade's
+                    // own counter bumps can't re-create a dropped view's entries.
+                    // In rollback cascade_retract_columns is skipped (schema_version
+                    // not re-created) but the tail purge cleans both either way.
+                    self.caches.purge_table_versions(vid);
                 }
-                self.dag.unregister_table(vid);
-                self.pending_dir_deletions.push(directory);
-                // See hook_table_register: purge post-cascade so the cascade's
-                // own counter bumps can't re-create a dropped view's entries.
-                // In rollback cascade_retract_columns is skipped (schema_version
-                // not re-created) but the tail purge cleans both either way.
-                self.caches.purge_table_versions(vid);
             }
         }
         Ok(())
@@ -694,12 +768,28 @@ impl CatalogEngine {
         if self.ctx.in_rollback() {
             return Ok(());
         }
+        // §3.2: a rename pair's `+1` must NOT re-mint this table's FK auto-indices
+        // — the auto-index name embeds the *current* (new) table name, so its
+        // by-name dedup cannot suppress the duplicate a rename would produce for a
+        // non-PK FK column. Skip any `+1` whose tid also carries a `-1` in THIS
+        // same TABLE_TAB batch (pair-exclusion derived batch-locally). Load-bearing
+        // over a master-only threaded set: this hook fires on every `is_live()`
+        // path — live apply, worker `ddl_sync`, master SAL-tail recovery — where a
+        // threaded set would be absent and let a renamed FK-child mint a duplicate
+        // `__fk_` index (diverging the worker catalog / a recovery duplicate).
+        let renamed: Vec<i64> = (0..batch.count)
+            .filter(|&i| batch.get_weight(i) < 0)
+            .map(|i| batch.get_pk(i) as i64)
+            .collect();
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             if weight <= 0 {
                 continue;
             }
             let tid = batch.get_pk(i) as i64;
+            if renamed.contains(&tid) {
+                continue;
+            }
             if self.ctx.is_live() && self.dag.tables.contains_key(&tid) {
                 self.create_fk_indices(tid)?;
             }

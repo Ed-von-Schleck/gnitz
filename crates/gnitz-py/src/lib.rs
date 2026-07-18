@@ -1716,6 +1716,11 @@ impl PyGnitzClient {
                 SqlResult::Dropped => {
                     d.set_item("type", "Dropped")?;
                 }
+                SqlResult::Altered { object, name } => {
+                    d.set_item("type", "Altered")?;
+                    d.set_item("object", object)?;
+                    d.set_item("name", name)?;
+                }
                 SqlResult::RowsAffected { count } => {
                     d.set_item("type", "RowsAffected")?;
                     d.set_item("count", count)?;

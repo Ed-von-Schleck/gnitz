@@ -546,8 +546,9 @@ def test_orphan_drop_reclaimed_unflushed_create_survives():
         )
         b_tid, _ = conn.resolve_table("gc", "b")
 
-        a_dir = os.path.join(data_dir, "gc", f"a_{a_tid}")
-        b_dir = os.path.join(data_dir, "gc", f"b_{b_tid}")
+        # Id-only directories (§4): `t_{tid}`, regardless of the table name.
+        a_dir = os.path.join(data_dir, "gc", f"t_{a_tid}")
+        b_dir = os.path.join(data_dir, "gc", f"t_{b_tid}")
         assert os.path.isdir(a_dir), "dropped A's dir is gated (still on disk) pre-crash"
         assert os.path.isdir(b_dir), "B's dir exists pre-crash"
 
@@ -653,7 +654,8 @@ def test_recreated_schema_survives_recovery():
         conn.execute_sql("INSERT INTO fresh VALUES (1, 11), (2, 22)",
                          schema_name="reborn")
         schema_dir = os.path.join(data_dir, "reborn")
-        fresh_dir = os.path.join(schema_dir, f"fresh_{fresh_tid}")
+        # Id-only directory (§4): `t_{tid}`, not the table name.
+        fresh_dir = os.path.join(schema_dir, f"t_{fresh_tid}")
         assert os.path.isdir(fresh_dir)
 
         conn.close()
