@@ -147,8 +147,14 @@ macro_rules! gnitz_fatal_abort {
 mod tests {
     use super::*;
 
+    /// The logger state (`LEVEL`/`TAG`) is process-global; these tests each
+    /// `init` it, so they must not interleave across the parallel test
+    /// threads.
+    static LOG_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_init_and_level_checks() {
+        let _g = LOG_STATE.lock().unwrap();
         init(QUIET, b"T");
         assert!(!is_info());
         assert!(!is_debug());
@@ -167,6 +173,7 @@ mod tests {
 
     #[test]
     fn test_tag_packing() {
+        let _g = LOG_STATE.lock().unwrap();
         init(DEBUG, b"W2");
         let packed = TAG.load(Ordering::Relaxed);
         let bytes = u32::to_ne_bytes(packed);
@@ -186,6 +193,7 @@ mod tests {
     #[test]
     fn test_format_line_shape() {
         // `secs.millis tag LEVEL msg\n` — millis zero-padded to 3 digits.
+        let _g = LOG_STATE.lock().unwrap();
         init(NORMAL, b"W2");
         let mut buf = [0u8; 512];
         let len = format_line(&mut buf, "INFO", format_args!("hello {}", 42));
@@ -201,6 +209,7 @@ mod tests {
     fn test_format_line_truncates_with_trailing_newline() {
         // An oversized message fills the buffer exactly; the final byte is
         // still the terminating '\n' inside the single write.
+        let _g = LOG_STATE.lock().unwrap();
         init(QUIET, b"M");
         let long = "x".repeat(4096);
         let mut buf = [0u8; 512];
