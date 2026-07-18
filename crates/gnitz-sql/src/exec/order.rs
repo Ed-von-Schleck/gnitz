@@ -365,11 +365,11 @@ fn paginate(weights: &[i64], offset: u64, hi: u64) -> Vec<(usize, i64)> {
 // The sink
 // ---------------------------------------------------------------------------
 
-/// The sink over an already-projected result (the transient executor's streamed
-/// batch, the aggregate finisher's output): sort and paginate in place — hidden
-/// synthetic keys stay physical, exactly like a view scan, and are stripped at
-/// presentation. Returns the schema unchanged alongside the windowed batch
-/// (untouched when there is nothing to reorder, skip, or bound).
+/// The sink over an already-projected result (the aggregate finisher's output):
+/// sort and paginate in place — hidden synthetic keys stay physical, exactly
+/// like a view scan, and are stripped at presentation. Returns the schema
+/// unchanged alongside the windowed batch (untouched when there is nothing to
+/// reorder, skip, or bound).
 pub(crate) fn order_limit_passthrough(
     schema: Schema,
     batch: ZSetBatch,

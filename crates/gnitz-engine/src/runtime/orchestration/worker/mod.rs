@@ -52,52 +52,15 @@ struct DeferredDdl {
     batch: Batch,
 }
 
-/// A control group deferred out of a *blocking* evaluation poll (an exchange
-/// wait), replayed at the next top-level drain in SAL arrival order. Payloads
-/// are decoded EAGERLY at defer time — `Flush` runs inline in `InEval` and
-/// resets the SAL, so no raw wire pointer may be stashed across the wait (the
-/// `DeferredDdl` discipline). The non-blocking between-chunk poll never
-/// populates this: it leaves non-live-point groups unread in the SAL for the
-/// unwinding top-level drain instead.
-enum DeferredControl {
-    /// FLAG_TICK: replay needs only the view id and the original request id
-    /// (so the replayed ACK is routable).
-    Tick { target_id: i64, req_id: u64 },
-    /// A `RunTransient` group (prep or drive). Boxed: the payload embeds a
-    /// `SchemaDescriptor` + `Batch` (~1.5 KiB), far larger than its siblings.
-    RunTransient(Box<DeferredRunTransient>),
-    /// A `DropTransient` teardown for `tid` (a catalog mutation that must not
-    /// alias the live evaluation's borrow of `tables`/`cache`).
-    DropTransient { tid: i64 },
-}
-
-/// The decoded `RunTransient` group fields — `handle_run_transient`'s one
-/// parameter, so the inline (`dispatch_inner`) and deferred (`InEval`) paths
-/// construct the identical shape and can never drift.
-struct DeferredRunTransient {
-    tid: i64,
+/// A FLAG_TICK deferred out of a *blocking* evaluation poll (an exchange wait),
+/// replayed at the next top-level drain in SAL arrival order. Replay needs only
+/// the view id and the original request id (so the replayed ACK is routable) —
+/// decoded EAGERLY at defer time: `Flush` runs inline in `InEval` and resets the
+/// SAL, so no raw wire pointer may be stashed across the wait (the `DeferredDdl`
+/// discipline).
+struct DeferredTick {
     target_id: i64,
-    out_schema: Option<SchemaDescriptor>,
-    single_partition: u64,
-    batch: Option<Batch>,
-    request_id: u64,
-}
-
-impl DeferredRunTransient {
-    /// Extract a `RunTransient` group's fields from its decoded frame. The
-    /// `InEval` defer arm must extract EAGERLY (the `DeferredDdl` discipline:
-    /// `Flush` runs inline in `InEval` and resets the SAL, so no raw wire
-    /// pointer may be stashed across the wait).
-    fn from_decoded(target_id: i64, mut decoded: Option<ipc::DecodedWire>) -> Self {
-        DeferredRunTransient {
-            tid: decoded.as_ref().map(|d| d.control.seek_pk).unwrap_or(0) as i64,
-            target_id,
-            out_schema: decoded.as_ref().and_then(|d| d.schema),
-            single_partition: decoded.as_ref().map(|d| d.control.seek_col_idx).unwrap_or(0),
-            request_id: decoded.as_ref().map(|d| d.control.request_id).unwrap_or(0),
-            batch: decoded.take().and_then(|d| d.data_batch),
-        }
-    }
+    req_id: u64,
 }
 
 /// Per-chunk collective decision the master stamps onto a distributed-backfill
@@ -129,24 +92,17 @@ enum DispatchContext {
     /// The worker is draining the SAL from its main run loop — no DAG
     /// evaluation is in flight.
     TopLevel,
-    /// The worker is *inside an in-flight DAG evaluation* (a tick's exchange, a
-    /// backfill's, or a transient drive) and is polling the SAL for the next
-    /// unit of work. The single fact dispatch needs is whether that evaluation
-    /// is blocked awaiting a *specific* relay:
-    ///   * `relay_wait = Some((view_id, source_id))` — blocked in
-    ///     `do_exchange_wait` for that relay; a matching `EXCHANGE_RELAY`
-    ///     unblocks it, a non-matching one parks.
-    ///   * `relay_wait = None` — merely yielding *between chunks* of a
-    ///     non-exchange drive (the transient single/linear case); no relay is
-    ///     expected, so every `EXCHANGE_RELAY` parks.
+    /// The worker is blocked in `do_exchange_wait` inside an in-flight DAG
+    /// evaluation (a tick's exchange or a backfill's), polling the SAL for the
+    /// `EXCHANGE_RELAY` matching `relay_wait = (view_id, source_id)`: a matching
+    /// relay unblocks it, a non-matching one parks.
     ///
-    /// Either way, maintenance (`Tick`) and teardown (`DdlSync`/`DropTransient`)
-    /// defer — running them inline would re-enter or alias the live evaluation —
-    /// while live point reads/writes stay inline so ingestion never stalls.
-    /// `schema` fabricates an empty relay payload for a header-only relay (only
-    /// meaningful, and only set, when `relay_wait` is `Some`).
+    /// Maintenance (`Tick`) and `DdlSync` defer — running them inline would
+    /// re-enter or alias the live evaluation — while live point reads/writes stay
+    /// inline so ingestion never stalls. `schema` fabricates an empty relay
+    /// payload for a header-only relay.
     InEval {
-        relay_wait: Option<(i64, i64)>,
+        relay_wait: (i64, i64),
         schema: Option<SchemaDescriptor>,
     },
 }
@@ -165,16 +121,14 @@ enum DispatchOutcome {
 
 struct WorkerExchangeHandler {
     deferred: Vec<DeferredDdl>,
-    /// Control groups (`Tick`/`RunTransient`/`DropTransient`) encountered inside
-    /// a *blocking* evaluation poll (an exchange wait): a maintenance tick or a
-    /// nested transient drive re-enters the DAG, and a transient teardown
-    /// mutates `tables`/`cache` under the live evaluation's borrow — so all
-    /// three are stashed (decoded, see [`DeferredControl`]) and replayed at the
-    /// next top-level drain (`replay_deferred_control`) in SAL arrival order,
-    /// after the current tick's ACK is sent, so the master observes ACKs in SAL
-    /// arrival order and a later tick cannot re-enter `view_id` while an outer
-    /// exchange for the same view is still awaiting its relay.
-    deferred_control: Vec<DeferredControl>,
+    /// A maintenance `Tick` encountered inside a *blocking* evaluation poll (an
+    /// exchange wait) re-enters the DAG, so it is stashed (decoded, see
+    /// [`DeferredTick`]) and replayed at the next top-level drain
+    /// (`replay_deferred_ticks`) in SAL arrival order, after the current tick's
+    /// ACK is sent, so the master observes ACKs in SAL arrival order and a later
+    /// tick cannot re-enter `view_id` while an outer exchange for the same view is
+    /// still awaiting its relay.
+    deferred_ticks: Vec<DeferredTick>,
     /// FLAG_EXCHANGE_RELAY messages whose `(view_id, source_id)` doesn't
     /// match the active exchange wait. Keyed by the tuple so a stashed
     /// relay for one source never satisfies a wait for a different source
@@ -268,13 +222,6 @@ pub struct WorkerProcess {
     /// chunk (non-wire-safe STRING replies) check the hard `MAX_W2M_MSG` ring
     /// limit instead.
     reply_frame_budget: usize,
-    /// Per-transient (`tid`) circuit-family buffer. A transient's 3 circuit
-    /// families arrive as separate broadcast prep groups (`RunTransient` with a
-    /// `CIRCUIT_*_TAB` target) ahead of its per-source drive groups; they are
-    /// held here until the first drive group (`RunTransient` with a real source
-    /// target) builds + registers the transient, after which the entry is
-    /// dropped. The array is `[nodes, edges, node_columns]`.
-    transient_frames: HashMap<i64, [Option<std::rc::Rc<Batch>>; 3]>,
     read_cursor: u64,
     expected_epoch: u32,
 }
@@ -308,17 +255,6 @@ pub(crate) fn buffer_pending_delta(pending: &mut HashMap<i64, Batch>, tid: i64, 
     } else {
         pending.insert(tid, delta);
     }
-}
-
-/// The circuit-family slot a `RunTransient` PREP group's `target_id` names —
-/// its position in the canonical `gnitz_wire::CIRCUIT_FAMILIES` order — or
-/// `None` when the target is a real `ScanDelta` source (a DRIVE group). A
-/// transient's 3 circuit families are delivered ahead of its drives as separate
-/// broadcast prep groups so each fits the ordinary single-batch group format.
-fn transient_family_index(target_id: i64) -> Option<usize> {
-    gnitz_wire::CIRCUIT_FAMILIES
-        .iter()
-        .position(|&(tid, _)| tid == target_id as u64)
 }
 
 fn debug_env_usize(var: &str) -> Option<usize> {
@@ -410,7 +346,7 @@ impl WorkerProcess {
             w2m_writer,
             exchange: WorkerExchangeHandler {
                 deferred: Vec::new(),
-                deferred_control: Vec::new(),
+                deferred_ticks: Vec::new(),
                 pending_relays: HashMap::new(),
                 backfill_pad: None,
                 backfill_signal: None,
@@ -420,7 +356,6 @@ impl WorkerProcess {
             reply_frame_budget: debug_env_usize("GNITZ_REPLY_FRAME_BUDGET")
                 .filter(|&n| n > 0 && n <= w2m_ring::MAX_W2M_MSG as usize)
                 .unwrap_or(w2m_ring::MAX_W2M_MSG as usize),
-            transient_frames: HashMap::new(),
             read_cursor: 0,
             expected_epoch: 1,
         }
@@ -495,13 +430,12 @@ impl WorkerProcess {
         while let Some((kind, target_id, wire)) = self.next_sal_message() {
             match self.dispatch(DispatchContext::TopLevel, kind, target_id, wire) {
                 DispatchOutcome::Continue => {
-                    // Replay control groups (ticks, transient drives/teardowns)
-                    // deferred during any exchange wait now that the outer
-                    // tick's ACK has been sent. Pushes are handled inline in
+                    // Replay ticks deferred during any exchange wait now that the
+                    // outer tick's ACK has been sent. Pushes are handled inline in
                     // `do_exchange_wait` (safe because user-table push only
                     // appends to `pending_deltas`) so we don't defer them.
-                    if !self.exchange.deferred_control.is_empty() {
-                        self.replay_deferred_control();
+                    if !self.exchange.deferred_ticks.is_empty() {
+                        self.replay_deferred_ticks();
                     }
                 }
                 DispatchOutcome::RelayMatched(_) => {
@@ -514,26 +448,16 @@ impl WorkerProcess {
         }
     }
 
-    /// Replay control groups (`Tick`/`RunTransient`/`DropTransient`) deferred
-    /// inside a blocking evaluation poll, at top level in SAL arrival order.
-    /// Drained into a scratch vec first — a replayed tick or drive may itself
-    /// reach an exchange wait and defer more groups into a fresh
-    /// `deferred_control` — and looped until the queue stays empty.
-    fn replay_deferred_control(&mut self) {
-        while !self.exchange.deferred_control.is_empty() {
-            for c in std::mem::take(&mut self.exchange.deferred_control) {
-                match c {
-                    DeferredControl::Tick { target_id, req_id } => match self.handle_tick(target_id, req_id) {
-                        Ok(()) => self.send_ack(target_id as u64, req_id),
-                        Err(e) => self.send_error(&e, req_id),
-                    },
-                    DeferredControl::RunTransient(rt) => {
-                        let request_id = rt.request_id;
-                        if let Err(msg) = self.handle_run_transient(*rt) {
-                            self.send_error(&msg, request_id);
-                        }
-                    }
-                    DeferredControl::DropTransient { tid } => self.drop_transient(tid),
+    /// Replay ticks deferred inside a blocking evaluation poll, at top level in
+    /// SAL arrival order. Drained into a scratch vec first — a replayed tick may
+    /// itself reach an exchange wait and defer more ticks into a fresh
+    /// `deferred_ticks` — and looped until the queue stays empty.
+    fn replay_deferred_ticks(&mut self) {
+        while !self.exchange.deferred_ticks.is_empty() {
+            for DeferredTick { target_id, req_id } in std::mem::take(&mut self.exchange.deferred_ticks) {
+                match self.handle_tick(target_id, req_id) {
+                    Ok(()) => self.send_ack(target_id as u64, req_id),
+                    Err(e) => self.send_error(&e, req_id),
                 }
             }
         }
@@ -575,10 +499,8 @@ impl WorkerProcess {
     /// test (`tests::test_dispatch_matrix_*`) makes the *behavioral*
     /// spec for each non-trivial cell explicit.
     ///
-    /// (`InEval` = inside an in-flight evaluation: an exchange wait, or a
-    /// between-chunk drive poll. `relay_wait` distinguishes the two but only the
-    /// `ExchangeRelay` cell consults it; every other cell treats `InEval`
-    /// uniformly.)
+    /// (`InEval` = blocked in an exchange wait; only the `ExchangeRelay` cell
+    /// consults `relay_wait` — every other cell treats `InEval` uniformly.)
     ///
     /// | Kind              | TopLevel               | InEval                                 |
     /// |-------------------|------------------------|----------------------------------------|
@@ -586,15 +508,13 @@ impl WorkerProcess {
     /// | Flush             | inline (resets cursor) | inline (same)                          |
     /// | FlushEph          | inline                 | inline                                 |
     /// | DdlSync           | apply via cat().ddl_sync | defer to exchange.deferred            |
-    /// | RunTransient      | run_via_dispatch_inner | defer to exchange.deferred_control     |
-    /// | DropTransient     | run_via_dispatch_inner | defer to exchange.deferred_control     |
     /// | ExchangeRelay     | (unreachable, warn)    | match relay_wait OR park in pending_relays |
     /// | Backfill          | inline                 | inline                                 |
     /// | HasPk             | inline                 | inline                                 |
     /// | Gather            | inline                 | inline                                 |
     /// | UniquePreflight   | inline                 | inline                                 |
     /// | Push              | inline (must)          | inline (must — sal_writer_excl deadlock) |
-    /// | Tick              | inline + replay defer  | defer to exchange.deferred_control     |
+    /// | Tick              | inline + replay defer  | defer to exchange.deferred_ticks       |
     /// | SeekByIndex       | inline                 | inline                                 |
     /// | Seek              | inline                 | inline                                 |
     /// | ScanSpec          | inline                 | inline                                 |
@@ -607,7 +527,7 @@ impl WorkerProcess {
     ///   re-enter `view_id` with a different source and produce
     ///   schema-mismatched relays. Defer + replay after the outer
     ///   tick's ACK so the master observes ACKs in SAL arrival order.
-    ///   See `WorkerExchangeHandler::deferred_control` and the SAL
+    ///   See `WorkerExchangeHandler::deferred_ticks` and the SAL
     ///   exchange-interleaving fix (a later tick re-entering an
     ///   in-flight view exposed the original bug).
     ///
@@ -655,9 +575,7 @@ impl WorkerProcess {
                     .and_then(|d| ipc::peek_client_control(d).ok())
                     .map(|c| c.request_id)
                     .unwrap_or(0);
-                self.exchange
-                    .deferred_control
-                    .push(DeferredControl::Tick { target_id, req_id });
+                self.exchange.deferred_ticks.push(DeferredTick { target_id, req_id });
                 DispatchOutcome::Continue
             }
 
@@ -679,37 +597,6 @@ impl WorkerProcess {
                         }
                     }
                 }
-                DispatchOutcome::Continue
-            }
-
-            // ── RunTransient (start a drive) / DropTransient (tear one down):
-            //    inline at top-level (no evaluation is in flight). Inside an
-            //    evaluation, BOTH defer — same principle as Tick and DdlSync:
-            //    starting a nested drive re-enters the DAG, and a teardown is a
-            //    catalog mutation (`tables`/`cache` removal) that would alias the
-            //    live evaluation's borrow of those maps (the aliasing-UB hazard).
-            //    A non-exchange between-chunk poll never reaches this arm — it
-            //    leaves these kinds in the SAL for the unwinding top-level drain
-            //    (`DispatchContext::InEval { relay_wait: None }` polls only live
-            //    point traffic) — so it is exercised only by the exchange wait's
-            //    blocking poll, which replays `deferred_control` after it returns.
-            (DispatchContext::TopLevel, SalMessageKind::RunTransient)
-            | (DispatchContext::TopLevel, SalMessageKind::DropTransient) => {
-                self.run_via_dispatch_inner(kind, target_id, wire)
-            }
-            (DispatchContext::InEval { .. }, SalMessageKind::RunTransient) => {
-                let decoded = wire.and_then(|data| ipc::decode_wire(data).ok());
-                self.exchange
-                    .deferred_control
-                    .push(DeferredControl::RunTransient(Box::new(
-                        DeferredRunTransient::from_decoded(target_id, decoded),
-                    )));
-                DispatchOutcome::Continue
-            }
-            (DispatchContext::InEval { .. }, SalMessageKind::DropTransient) => {
-                self.exchange
-                    .deferred_control
-                    .push(DeferredControl::DropTransient { tid: target_id });
                 DispatchOutcome::Continue
             }
 
@@ -751,11 +638,8 @@ impl WorkerProcess {
                     Batch::with_schema(empty_schema, 0)
                 });
                 let relay_key = (target_id, relay_source_id);
-                // Delivered only to a wait that is blocked on exactly this relay
-                // (`relay_wait == Some(relay_key)`); a between-chunk poll
-                // (`relay_wait: None`) never matches, so it parks — correct, since
-                // a non-exchange drive expects no relay.
-                if relay_wait == Some(relay_key) {
+                // Delivered only to the wait blocked on exactly this relay.
+                if relay_wait == relay_key {
                     // Consumed for the active wait: act on the decision (record
                     // the slot, apply any inline checkpoint) before returning.
                     self.consume_backfill_decision(relay_decision);
@@ -832,11 +716,6 @@ impl WorkerProcess {
             .map(|d| std::mem::take(&mut d.control.seek_pk_extra))
             .unwrap_or_default();
 
-        // A transient drive group carries its circuit's output schema in the
-        // group's schema block (the worker needs it to build the circuit); read
-        // it before `decoded` is consumed by the `data_batch` take below.
-        let out_schema = decoded.as_ref().and_then(|d| d.schema);
-
         // Extract batch (consumes decoded)
         let batch = decoded.and_then(|d| d.data_batch);
 
@@ -861,34 +740,6 @@ impl WorkerProcess {
                     Ok(()) => self.send_ack(0, request_id),
                     Err(msg) => self.send_error(&msg, request_id),
                 }
-                Ok(())
-            }
-
-            // A transient's `RunTransient` groups are of two shapes, both keyed by
-            // `seek_pk = tid`:
-            //   * a PREP group (`target_id` is a `CIRCUIT_*_TAB` id) delivers one
-            //     circuit family batch — held, no ACK;
-            //   * a DRIVE group (`target_id` is a real `ScanDelta` source) carries
-            //     the output schema and drives that source through one epoch into
-            //     the RAM output store, building + registering the transient on
-            //     first sight — ACKed so the master's per-source barrier advances.
-            // `handle_run_transient` owns that split and its ACK.
-            SalMessageKind::RunTransient => self.handle_run_transient(DeferredRunTransient {
-                tid: seek_pk as i64,
-                target_id,
-                out_schema,
-                single_partition: seek_col_idx,
-                batch,
-                request_id,
-            }),
-
-            // Idempotent transient teardown: free the registered output store,
-            // the compiled plan, and the memoized metadata (all map-removes no-op
-            // when absent), then remove the transient's scratch directory. Runs
-            // only at top level (the dispatch matrix defers it out of an in-flight
-            // evaluation), so no live borrow of `tables`/`cache` is aliased.
-            SalMessageKind::DropTransient => {
-                self.drop_transient(target_id);
                 Ok(())
             }
 
@@ -919,7 +770,7 @@ impl WorkerProcess {
             SalMessageKind::Backfill => {
                 // `target_id` is the source table; `seek_pk` carries the view to
                 // drive. Stop-the-world (the DDL parks the reactor): no yield.
-                self.handle_backfill(target_id, seek_pk as i64, request_id, false)?;
+                self.handle_backfill(target_id, seek_pk as i64, request_id)?;
                 self.send_ack(target_id as u64, request_id);
                 Ok(())
             }
@@ -1164,19 +1015,9 @@ impl WorkerProcess {
     /// source's whole dependent closure: the source may already have populated
     /// dependents (live CREATE VIEW over a source with prior views; recovery
     /// step-4 rebuild next to resumed siblings) that a closure re-drive would
-    /// double-count.
-    /// `yield_between_chunks` is a property of the CALL, not the relation: a
-    /// transient drive runs concurrently with live traffic and must yield to
-    /// live point reads/writes between chunks (F5) so ingestion never stalls; a
-    /// view backfill runs stop-the-world (the DDL parks the reactor) and must
-    /// NOT yield.
-    fn handle_backfill(
-        &mut self,
-        source_tid: i64,
-        view_id: i64,
-        request_id: u64,
-        yield_between_chunks: bool,
-    ) -> Result<(), String> {
+    /// double-count. A view backfill runs stop-the-world (the DDL parks the
+    /// reactor), so it never yields to live traffic between chunks.
+    fn handle_backfill(&mut self, source_tid: i64, view_id: i64, request_id: u64) -> Result<(), String> {
         // Recovery step-4: the FIRST backfill command for an invalid view resets
         // its output partitions + operator scratch on THIS worker before any fill,
         // so the rebuild starts from an empty, well-formed store (the tick sweep
@@ -1211,12 +1052,6 @@ impl WorkerProcess {
             let chunk = drained.unwrap_or_else(|| Batch::empty_with_schema(&schema));
             self.exchange.backfill_pad = Some(pad);
             produced_any |= self.backfill_view_step(view_id, source_tid, chunk, request_id);
-            // Between chunks of a non-exchange concurrent drive, drain live point
-            // traffic inline (the exchange case yields inside `do_exchange_wait`
-            // instead). A stop-the-world view backfill skips this.
-            if yield_between_chunks {
-                self.drain_live_traffic_between_chunks();
-            }
             // do_exchange_wait applied any inline CHECKPOINT per relay and folded
             // it into Continue; the slot now holds the chunk's stop/continue
             // verdict, or `None` if this chunk issued no exchange (a non-barrier
@@ -1231,138 +1066,20 @@ impl WorkerProcess {
         // Steady-state ticks must keep passing a 0 pad bit (see do_exchange_wait).
         self.exchange.backfill_pad = None;
         // Release the last chunk's pinned delta registers: the source→dependents
-        // closure (covers a view backfill), plus the driven relation itself (a
-        // transient is NEVER in the DepTab — its sources derive from the circuit
-        // — so the closure walk misses it). Both are cheap no-ops when there is
-        // nothing pinned.
+        // closure, plus the view being backfilled. Both are cheap no-ops when
+        // there is nothing pinned.
         self.cat().dag.clear_regfile_deltas_from_source(source_tid);
         self.cat().dag.clear_view_regfile_deltas(view_id);
         // `backfill_view_step` bypasses the closure driver's per-view flush, so
         // flush the view's output trace once after the final chunk. Only when it
         // produced rows (the first source of a join produces none — it just
-        // fills its trace); `flush_view_or_abort` itself skips a non-checkpointed
-        // relation (a transient's output store is RAM-only; `scan_family` reads
-        // its memtable directly).
+        // fills its trace).
         if produced_any {
             // On abort the master's watchdog turns the dead worker into a
             // cluster abort, and restart re-derives the view.
             self.cat().dag.flush_view_or_abort(view_id);
         }
         Ok(())
-    }
-
-    /// Handle one `RunTransient` group for transient `tid` (see the dispatch arm
-    /// for the two shapes). A PREP group (`target_id` names a circuit family)
-    /// holds the delivered family batch and does NOT ACK — the master never
-    /// awaits prep, and SAL order guarantees a tid's 3 prep groups precede its
-    /// drive groups on every worker. A DRIVE group (`target_id` is a real
-    /// `ScanDelta` source) builds + registers the transient on first sight (from
-    /// the three held families + the delivered `out_schema`), then drives that
-    /// source through one epoch into the RAM output store and ACKs so the
-    /// master's per-source barrier advances. `single_partition` — the master's
-    /// all-sources-replicated verdict, carried in the drive group's
-    /// `seek_col_idx` — shapes the output store to match the master's read
-    /// routing (replicated ⇒ one partition; else hashed).
-    fn handle_run_transient(&mut self, rt: DeferredRunTransient) -> Result<(), String> {
-        let DeferredRunTransient {
-            tid,
-            target_id,
-            out_schema,
-            single_partition,
-            batch,
-            request_id,
-        } = rt;
-        if let Some(fam) = transient_family_index(target_id) {
-            // The prep group's ARRIVAL marks the family delivered; its batch is
-            // merely the content, which is legitimately EMPTY for a circuit that
-            // has no rows in that family — a filter/projection circuit has no node
-            // columns, and a single-node one has no edges. An empty batch carries
-            // no data block, so `batch` decodes to `None`; recording the slot only
-            // when a batch is present would leave it `None` and fail the drive
-            // with "missing <family> family" for exactly those shapes. Substitute
-            // the empty batch (the group's schema block is the family's own
-            // schema, which is what the circuit builder reads it back with).
-            let b = batch.unwrap_or_else(|| Batch::with_schema(out_schema.unwrap_or_default(), 0));
-            self.transient_frames.entry(tid).or_default()[fam] = Some(std::rc::Rc::new(b));
-            return Ok(());
-        }
-
-        // Drive group. Build + register once, on first sight of this tid.
-        if !self.cat().dag.has_plan(tid) {
-            let out_schema = out_schema.ok_or_else(|| "RunTransient drive: missing output schema".to_string())?;
-            let [nodes, edges, node_cols] = self
-                .transient_frames
-                .remove(&tid)
-                .ok_or_else(|| "RunTransient drive: no circuit families delivered".to_string())?;
-            let nodes = nodes.ok_or_else(|| "RunTransient: missing nodes family".to_string())?;
-            let edges = edges.ok_or_else(|| "RunTransient: missing edges family".to_string())?;
-            let node_cols = node_cols.ok_or_else(|| "RunTransient: missing node_columns family".to_string())?;
-            self.cat()
-                .register_transient_meta(tid, out_schema, single_partition != 0)?;
-            self.cat()
-                .dag
-                .compile_transient(tid, nodes, edges, node_cols, out_schema)?;
-        }
-        // The truncated backfill: drive this source's committed snapshot through
-        // the circuit into the RAM output store (F7/F9 handled by `handle_backfill`).
-        // `yield_between_chunks`: this drive runs concurrently with live traffic
-        // (unlike a view backfill's reactor-parked stop-the-world window), so
-        // ingestion must stay live across it.
-        self.handle_backfill(target_id, tid, request_id, true)?;
-        self.send_ack(target_id as u64, request_id);
-        Ok(())
-    }
-
-    /// Idempotent transient teardown: drop any held-but-never-built circuit
-    /// families, free the compiled plan + memoized metadata + registered output
-    /// store (all map-removes no-op when absent), then remove the
-    /// `_transient/<tid>` scratch tree (ignore ENOENT). Runs only at top level
-    /// (the dispatch matrix defers `DropTransient` out of an in-flight
-    /// evaluation), so no live borrow of `tables`/`cache` is aliased.
-    fn drop_transient(&mut self, tid: i64) {
-        self.transient_frames.remove(&tid);
-        let dir = self.cat().transient_scratch_dir(tid);
-        self.cat().forget_transient(tid);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Between chunks of a non-exchange transient drive, drain immediately
-    /// available live point traffic inline — keeping ingestion live — and STOP at
-    /// the first non-live message, leaving it (a tick, a teardown, another drive,
-    /// a checkpoint flush, a shutdown) in the SAL for the unwinding top-level
-    /// drain. The non-blocking dual of `do_exchange_wait`: because this poll waits
-    /// for nothing, it is free to leave a message unread rather than
-    /// consume-and-defer it.
-    fn drain_live_traffic_between_chunks(&mut self) {
-        while let Some(kind) = self.peek_sal_kind() {
-            if !kind.is_live_point_traffic() {
-                break;
-            }
-            let Some((kind, target_id, wire)) = self.next_sal_message() else {
-                break;
-            };
-            let _ = self.dispatch(
-                DispatchContext::InEval {
-                    relay_wait: None,
-                    schema: None,
-                },
-                kind,
-                target_id,
-                wire,
-            );
-        }
-    }
-
-    /// Peek the kind of the next SAL group WITHOUT advancing the read cursor or
-    /// latching any per-group state (`next_sal_message` latches the checkpoint
-    /// generation on `FlushEph`). `try_read` is a pure mmap read, so peeking a
-    /// group here and re-reading it at the top level is idempotent.
-    fn peek_sal_kind(&self) -> Option<SalMessageKind> {
-        if self.read_cursor + 8 >= self.sal_reader.mmap_size() {
-            return None;
-        }
-        let (msg, _next) = self.sal_reader.try_read(self.read_cursor, Some(self.expected_epoch))?;
-        Some(msg.kind)
     }
 
     /// View-scoped backfill of one chunk: run only `view_id`'s epoch over a
@@ -1838,7 +1555,7 @@ mod tests {
     fn make_handler() -> WorkerExchangeHandler {
         WorkerExchangeHandler {
             deferred: Vec::<DeferredDdl>::new(),
-            deferred_control: Vec::new(),
+            deferred_ticks: Vec::new(),
             pending_relays: HashMap::new(),
             backfill_pad: None,
             backfill_signal: None,
@@ -2020,7 +1737,6 @@ mod tests {
             pending_deltas: HashMap::new(),
             pending_streams: VecDeque::new(),
             reply_frame_budget: w2m_ring::MAX_W2M_MSG as usize,
-            transient_frames: HashMap::new(),
             read_cursor: 0,
             expected_epoch: 1,
         }
@@ -2037,26 +1753,23 @@ mod tests {
         make_test_worker(std::ptr::null_mut(), unsafe { std::mem::zeroed() })
     }
 
-    /// Tick inside an exchange wait MUST defer to `deferred_control`,
+    /// Tick inside an exchange wait MUST defer to `deferred_ticks`,
     /// not run inline. Cited bug: an inline tick eval re-enters `view_id`
     /// with a different source and produces schema-mismatched relays.
     #[test]
     fn test_dispatch_matrix_tick_defers_inside_exchange() {
         let mut wp = make_worker_for_matrix();
         let ctx = DispatchContext::InEval {
-            relay_wait: Some((100, 5)),
+            relay_wait: (100, 5),
             schema: Some(test_schema()),
         };
-        assert!(wp.exchange.deferred_control.is_empty());
+        assert!(wp.exchange.deferred_ticks.is_empty());
         let outcome = wp.dispatch(ctx, SalMessageKind::Tick, 999, None);
         assert!(matches!(outcome, DispatchOutcome::Continue));
-        assert_eq!(wp.exchange.deferred_control.len(), 1);
-        assert!(
-            matches!(
-                wp.exchange.deferred_control[0],
-                DeferredControl::Tick { target_id: 999, .. }
-            ),
-            "Tick target_id must be carried into deferred_control"
+        assert_eq!(wp.exchange.deferred_ticks.len(), 1);
+        assert_eq!(
+            wp.exchange.deferred_ticks[0].target_id, 999,
+            "Tick target_id must be carried into deferred_ticks"
         );
     }
 
@@ -2098,7 +1811,7 @@ mod tests {
         let schema = test_schema();
         let want_key = (100, 0);
         let ctx = DispatchContext::InEval {
-            relay_wait: Some(want_key),
+            relay_wait: want_key,
             schema: Some(schema),
         };
 
@@ -2153,13 +1866,11 @@ mod tests {
     #[test]
     fn test_dispatch_matrix_walk_kinds_defer_decisions() {
         // Every SalMessageKind, in classification priority order.
-        const ALL_KINDS: [SalMessageKind; 17] = [
+        const ALL_KINDS: [SalMessageKind; 15] = [
             SalMessageKind::Shutdown,
             SalMessageKind::Flush,
             SalMessageKind::FlushEph,
             SalMessageKind::DdlSync,
-            SalMessageKind::RunTransient,
-            SalMessageKind::DropTransient,
             SalMessageKind::ExchangeRelay,
             SalMessageKind::Backfill,
             SalMessageKind::HasPk,
@@ -2173,12 +1884,7 @@ mod tests {
             SalMessageKind::Scan,
         ];
         // Kinds the InEval context MUST defer.
-        let must_defer = [
-            SalMessageKind::Tick,
-            SalMessageKind::DdlSync,
-            SalMessageKind::RunTransient,
-            SalMessageKind::DropTransient,
-        ];
+        let must_defer = [SalMessageKind::Tick, SalMessageKind::DdlSync];
         // ExchangeRelay is its own special case (RelayMatched / park).
         // The rest go through dispatch_inner inline.
 
@@ -2189,14 +1895,14 @@ mod tests {
 
             let mut wp = make_worker_for_matrix();
             let ctx = DispatchContext::InEval {
-                relay_wait: Some((0, 0)),
+                relay_wait: (0, 0),
                 schema: Some(test_schema()),
             };
 
-            let before_ctrl = wp.exchange.deferred_control.len();
+            let before_ctrl = wp.exchange.deferred_ticks.len();
             let before_ddl = wp.exchange.deferred.len();
             let _ = wp.dispatch(ctx, kind, 42, None);
-            let after_ctrl = wp.exchange.deferred_control.len();
+            let after_ctrl = wp.exchange.deferred_ticks.len();
             let after_ddl = wp.exchange.deferred.len();
 
             match kind {
@@ -2204,17 +1910,9 @@ mod tests {
                     assert_eq!(
                         after_ctrl,
                         before_ctrl + 1,
-                        "Tick must defer to deferred_control inside exchange wait"
+                        "Tick must defer to deferred_ticks inside exchange wait"
                     );
                     assert_eq!(after_ddl, before_ddl, "Tick must NOT touch the deferred (DDL) queue");
-                }
-                SalMessageKind::RunTransient | SalMessageKind::DropTransient => {
-                    assert_eq!(
-                        after_ctrl,
-                        before_ctrl + 1,
-                        "transient control kinds must defer to deferred_control inside an evaluation"
-                    );
-                    assert_eq!(after_ddl, before_ddl, "must NOT touch the deferred (DDL) queue");
                 }
                 SalMessageKind::DdlSync => {
                     // DdlSync requires a decodable wire to actually defer

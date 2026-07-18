@@ -11,12 +11,6 @@ fn names(s: &gnitz_core::Schema) -> Vec<String> {
     s.columns.iter().map(|c| c.name.to_lowercase()).collect()
 }
 
-/// User-visible column names — the read path hidden-prepends the source PK, so a
-/// direct SELECT's client-facing schema is the visible subset.
-fn visible_names(s: &gnitz_core::Schema) -> Vec<String> {
-    s.visible_columns().map(|(_, c)| c.name.to_lowercase()).collect()
-}
-
 // ── item 40: PK column move must preserve remaining order ─────────────
 
 #[test]

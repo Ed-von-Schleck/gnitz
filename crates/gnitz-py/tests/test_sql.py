@@ -3,13 +3,112 @@
 Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_sql.py -v --tb=short
 """
+import os
 import random
+import threading
+import time
+
 import pytest
 import gnitz
 
 
 def _uid():
     return str(random.randint(100000, 999999))
+
+
+_NEEDS_MULTI = pytest.mark.skipif(
+    int(os.environ.get("GNITZ_WORKERS", "1")) < 2,
+    reason="the read/DDL concurrency path only exercises exchange/fanout at W >= 2",
+)
+
+
+@_NEEDS_MULTI
+def test_create_view_under_concurrent_adhoc_reads(client, server):
+    """CREATE VIEW must not wedge under concurrent ad-hoc reads and pushes.
+
+    A CREATE VIEW parks the single-threaded reactor (drain_tick_blocking +
+    fan_out_backfill are synchronous futex loops) under the catalog write lock.
+    Ad-hoc reads take only the catalog READ lock for the whole of one atomic
+    fan-out (no mid-flight release), so the writer-preferring catalog_rwlock
+    serialises each read entirely before or after the DDL window — never
+    interleaved, never wedged. Reads before/during/after the CREATE VIEW must all
+    succeed, ingestion must continue, and the post-DDL read must agree with the
+    view built mid-flight.
+    """
+    sn = "s" + _uid()
+    client.create_schema(sn)
+    client.execute_sql(
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL)", schema_name=sn
+    )
+    client.execute_sql(
+        "INSERT INTO t VALUES " + ", ".join(f"({i}, {i % 5})" for i in range(1, 201)), schema_name=sn
+    )
+    client.execute_sql(
+        "CREATE TABLE other (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)", schema_name=sn
+    )
+
+    errors = []
+    ddl_done = threading.Event()
+    q_count = [0]
+
+    def hammer_reads():
+        try:
+            with gnitz.connect(server) as c:
+                while not ddl_done.is_set() and q_count[0] < 400:
+                    res = c.execute_sql("SELECT g, COUNT(*) AS n FROM t GROUP BY g", schema_name=sn)
+                    assert res[0]["type"] == "Rows"
+                    n = sum(r.n for r in res[0]["rows"] if r.weight > 0)
+                    assert n == 200, f"ad-hoc read must see all 200 rows, saw {n}"
+                    q_count[0] += 1
+        except Exception as e:  # noqa: BLE001
+            errors.append(("read", repr(e)))
+
+    def hammer_pushes():
+        try:
+            with gnitz.connect(server) as c:
+                i = 0
+                while not ddl_done.is_set() and i < 400:
+                    c.execute_sql(f"INSERT INTO other VALUES ({i}, {i})", schema_name=sn)
+                    i += 1
+        except Exception as e:  # noqa: BLE001
+            errors.append(("push", repr(e)))
+
+    tq = threading.Thread(target=hammer_reads)
+    tp = threading.Thread(target=hammer_pushes)
+    tq.start()
+    tp.start()
+
+    time.sleep(0.05)
+    q_before = q_count[0]
+    t0 = time.time()
+    client.execute_sql("CREATE VIEW mid AS SELECT g, COUNT(*) AS n FROM t GROUP BY g", schema_name=sn)
+    ddl_secs = time.time() - t0
+    q_across = q_count[0] - q_before
+    ddl_done.set()
+
+    tq.join(timeout=120)
+    tp.join(timeout=120)
+    assert not tq.is_alive() and not tp.is_alive(), "deadlock: a concurrent worker never completed"
+    assert not errors, f"concurrent work failed: {errors}"
+    assert ddl_secs < 60, f"CREATE VIEW took {ddl_secs:.1f}s -- wedged behind the reads"
+    assert q_across > 0, (
+        "no ad-hoc read overlapped the CREATE VIEW -- the test proved nothing about read/DDL concurrency"
+    )
+
+    # The mid-flight DDL produced a correct view, and ad-hoc reads still agree.
+    def _rows(sql):
+        res = client.execute_sql(sql, schema_name=sn)
+        out = []
+        for r in res[0]["rows"]:
+            if r.weight <= 0:
+                continue
+            d = r._asdict()
+            out.append((tuple(d[k] for k in sorted(d)), r.weight))
+        return sorted(out)
+
+    assert _rows("SELECT g, COUNT(*) AS n FROM t GROUP BY g") == _rows("SELECT * FROM mid"), (
+        "post-DDL ad-hoc read must agree with the view built mid-flight"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -183,13 +282,12 @@ class TestSqlSelect:
         finally:
             client.drop_schema(sn)
 
-    def test_select_nonindexed_where_is_served_by_the_executor(self, client):
+    def test_select_nonindexed_where_is_served_by_the_read_path(self, client):
         """A WHERE on a non-indexed column is SERVED, not rejected.
 
-        No thin client-side path can evaluate this residual, so it routes to the
-        on-demand executor: the query is compiled into a DBSP circuit, run once
-        over the committed base snapshot as a transient, and streamed back. It
-        used to raise `GnitzError` ("no usable index"); that rejection is gone.
+        The residual compiles into the server-side read-spec predicate (a bounded
+        read with no usable seek key degrades to a full cursor + predicate), so the
+        query is served directly — no circuit, no per-query state.
         """
         sn = "s" + _uid()
         client.create_schema(sn)
@@ -205,6 +303,104 @@ class TestSqlSelect:
             rows = [r for r in res[0]["rows"] if r.weight > 0]
             assert sorted(r.pk for r in rows) == [4, 5], f"val > 30 selects pks 4,5, got {rows}"
             client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_derivation_shapes_rejected_with_create_view_advice(self, client):
+        """An ad-hoc SELECT reads one relation; a query that derives a new one
+        (JOIN, set-op, EXISTS/IN or scalar subquery, derived table, non-pass-through
+        CTE) is rejected from the AST alone with one template naming the construct
+        and pointing at CREATE VIEW."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup_with_rows(client, sn)  # t(pk, val)
+            client.execute_sql(
+                "CREATE TABLE u (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL)", schema_name=sn
+            )
+            client.execute_sql("INSERT INTO u VALUES (1, 10), (2, 20)", schema_name=sn)
+            cases = [
+                ("SELECT t.pk FROM t JOIN u ON t.val = u.k", "JOIN"),
+                ("SELECT val FROM t UNION SELECT k FROM u", "set operation"),
+                ("SELECT val FROM t INTERSECT SELECT k FROM u", "set operation"),
+                ("SELECT val FROM t EXCEPT SELECT k FROM u", "set operation"),
+                ("SELECT pk FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.val)", "EXISTS/IN subquery"),
+                ("SELECT pk FROM t WHERE val IN (SELECT k FROM u)", "EXISTS/IN subquery"),
+                ("SELECT pk FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.k = t.val)", "EXISTS/IN subquery"),
+                ("SELECT pk, (SELECT MAX(k) FROM u) FROM t", "scalar subquery"),
+                ("SELECT x FROM (SELECT val AS x FROM t) d", "derived table in FROM"),
+                ("WITH c AS (SELECT pk FROM t WHERE val > 20) SELECT pk FROM c", "non-pass-through CTE"),
+            ]
+            for sql, construct in cases:
+                with pytest.raises(gnitz.GnitzError) as ei:
+                    client.execute_sql(sql, schema_name=sn)
+                msg = str(ei.value)
+                assert "this query derives a new one" in msg, f"{sql!r}: not the derivation template: {msg}"
+                assert f"({construct})" in msg, f"{sql!r}: must name '{construct}', got: {msg}"
+                assert "CREATE VIEW" in msg, f"{sql!r}: must point at CREATE VIEW, got: {msg}"
+
+            # A comma-join is a shape CREATE VIEW rejects too, so the template's
+            # "CREATE VIEW AS <your query>" advice would be false for it: it gets
+            # its own message advising the explicit-JOIN rewrite.
+            with pytest.raises(gnitz.GnitzError) as ei:
+                client.execute_sql("SELECT pk FROM t, u WHERE t.val = u.k", schema_name=sn)
+            msg = str(ei.value)
+            assert "this query derives a new one" not in msg, f"comma-join must not use the template: {msg}"
+            assert "comma-join" in msg and "explicit JOIN" in msg and "CREATE VIEW" in msg, (
+                f"comma-join must advise the explicit-JOIN + CREATE VIEW rewrite, got: {msg}"
+            )
+        finally:
+            client.drop_schema(sn)
+
+    def test_direct_path_feature_limits_are_not_derivation_errors(self, client):
+        """A single-relation read using a feature the direct path cannot express
+        (LIKE / string-function WHERE, an ORDER BY expression, a string HAVING) is a
+        feature-named error — never the derivation template. The string HAVING names
+        CREATE VIEW as its remedy (the grouped view builder serves it)."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, s TEXT)",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b')", schema_name=sn)
+            for sql in ["SELECT pk FROM t WHERE s LIKE 'a%'", "SELECT pk FROM t ORDER BY pk + 1"]:
+                with pytest.raises(gnitz.GnitzError) as ei:
+                    client.execute_sql(sql, schema_name=sn)
+                assert "this query derives a new one" not in str(ei.value), (
+                    f"{sql!r} is a feature limit, not a derivation: {ei.value}"
+                )
+            # A string HAVING rejects with a CREATE VIEW remedy, not the template.
+            with pytest.raises(gnitz.GnitzError) as ei:
+                client.execute_sql("SELECT s, COUNT(*) FROM t GROUP BY s HAVING s = 'a'", schema_name=sn)
+            msg = str(ei.value)
+            assert "this query derives a new one" not in msg, msg
+            assert "CREATE VIEW" in msg, f"string HAVING must name CREATE VIEW: {msg}"
+        finally:
+            client.drop_schema(sn)
+
+    def test_passthrough_cte_reads_through_the_direct_path(self, client):
+        """A pass-through CTE over one relation inlines to it and reads via the
+        direct path — WHERE over the aliased CTE still filters."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup_with_rows(client, sn)  # t(pk, val): (1,10)…(5,50)
+            res = client.execute_sql(
+                "WITH x AS (SELECT * FROM t) SELECT pk FROM x WHERE val > 30", schema_name=sn
+            )
+            assert res[0]["type"] == "Rows"
+            pks = sorted(r.pk for r in res[0]["rows"] if r.weight > 0)
+            assert pks == [4, 5], f"the CTE inlines to t and the WHERE filters val > 30, got {pks}"
+
+            # Over a view, too.
+            client.execute_sql("CREATE VIEW v_hi AS SELECT pk, val FROM t WHERE val >= 30", schema_name=sn)
+            res = client.execute_sql(
+                "WITH y AS (SELECT * FROM v_hi) SELECT pk FROM y WHERE val = 50", schema_name=sn
+            )
+            pks = sorted(r.pk for r in res[0]["rows"] if r.weight > 0)
+            assert pks == [5], f"the CTE inlines to the view and the WHERE filters val = 50, got {pks}"
         finally:
             client.drop_schema(sn)
 
@@ -226,10 +422,9 @@ class TestSqlSelect:
         client.create_schema(sn)
         try:
             self._setup_with_rows(client, sn)
-            # Plain DISTINCT / GROUP BY / HAVING / WITH are no longer rejected —
-            # they route to the transient circuit executor (positive end-to-end
-            # tests land with the master drive path). This guard test keeps only
-            # the clauses NEITHER path has an operator for.
+            # Plain DISTINCT / GROUP BY / HAVING are served by the fold sink and a
+            # pass-through WITH by the read path; this guard test keeps only the
+            # clauses the direct path has no operator for.
             # DISTINCT ON gets its own message (no CREATE VIEW redirect).
             with pytest.raises(gnitz.GnitzError, match="DISTINCT ON is not supported"):
                 client.execute_sql("SELECT DISTINCT ON (pk) pk FROM t", schema_name=sn)

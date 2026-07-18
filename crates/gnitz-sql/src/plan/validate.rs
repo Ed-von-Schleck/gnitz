@@ -285,10 +285,11 @@ pub(crate) fn reject_unhonored_select_clauses(
 /// than a silent wrong result.
 #[derive(Clone, Copy)]
 pub(crate) struct HonoredQueryClauses {
-    /// A `WITH` (CTE) clause. Honored by CREATE VIEW and by direct SELECT — both
-    /// inline it (`inline_ctes`; a direct SELECT with a `WITH` always routes to
-    /// the transient executor, so the read-spec path can never resolve a FROM
-    /// name a CTE shadows). A CTE body (nested CTE) and an INSERT source reject it.
+    /// A `WITH` (CTE) clause. Honored by CREATE VIEW (`inline_ctes`) and by
+    /// direct SELECT (`cte_passthrough` aliases each pass-through CTE into the
+    /// binder cache, so a FROM name a CTE shadows resolves to the CTE's source;
+    /// a non-pass-through CTE rejects the whole query as a derivation). A CTE
+    /// body (nested CTE) and an INSERT source reject it.
     pub with: bool,
     /// The site runs the client-side ordering sink: `ORDER BY` and `LIMIT`/`OFFSET` are applied
     /// to the fetched batch. Honored only by direct SELECT, which also rejects the `LIMIT … BY`
@@ -384,6 +385,46 @@ pub(crate) fn plain_select_body<'a>(
             "{ctx}: only a plain SELECT body is supported"
         ))),
     }
+}
+
+/// The CTE list of a query with the one universal precondition applied —
+/// `WITH RECURSIVE` has no builder on any path. An absent `WITH` is the empty
+/// list. The shared entry of the two CTE inliners (CREATE VIEW's `inline_ctes`
+/// and the direct-SELECT read route).
+pub(crate) fn non_recursive_ctes(query: &sqlparser::ast::Query) -> Result<&[sqlparser::ast::Cte], GnitzSqlError> {
+    let Some(with) = &query.with else {
+        return Ok(&[]);
+    };
+    if with.recursive {
+        return Err(GnitzSqlError::Unsupported(
+            "recursive CTEs are not supported".to_string(),
+        ));
+    }
+    Ok(&with.cte_tables)
+}
+
+/// Unwrap one CTE to its plain `Select` body — the shared front step of the two
+/// CTE inliners (CREATE VIEW's `inline_ctes` and the direct-SELECT read route).
+/// Exhaustively destructures the `Cte` envelope so a future `sqlparser` field
+/// cannot be silently dropped (`materialized` parses only under
+/// PostgreSqlDialect — always `None` here), rejects the `Query`-envelope clauses
+/// a CTE body cannot honor via [`plain_select_body`], and rejects a ClickHouse
+/// trailing `FROM` (neither inliner can honor it).
+pub(crate) fn cte_select_body<'a>(
+    cte: &'a sqlparser::ast::Cte,
+    ctx: &str,
+) -> Result<&'a sqlparser::ast::Select, GnitzSqlError> {
+    let sqlparser::ast::Cte {
+        alias: _,
+        query,
+        from,
+        materialized: _,
+        closing_paren_token: _,
+    } = cte;
+    if from.is_some() {
+        return Err(unsupported_clause(ctx, "a trailing FROM"));
+    }
+    plain_select_body(query, ctx)
 }
 
 /// Reject every `Insert`-statement clause the INSERT planner does not consume. `extract_insert_parts`

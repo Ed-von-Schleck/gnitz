@@ -3,16 +3,16 @@
 //! `plan/view` that knows about all the others.
 
 use crate::ast_util::{
-    body_is_grouped, collect_column_refs, collect_projection_column_refs, count_subqueries, extract_name,
-    extract_relation_name, extract_table_factor_name, flatten_conjuncts, is_bare_wildcard_projection,
-    projection_item_expr,
+    body_is_grouped, classify_from, collect_column_refs, collect_projection_column_refs, count_select_subqueries,
+    extract_name, extract_relation_name, extract_table_factor_name, flatten_conjuncts, is_bare_wildcard_projection,
+    FromShape,
 };
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;
 use crate::plan::index_bound;
 use crate::plan::validate::{
-    plain_select_body, reject_unhonored_query_clauses, reject_unhonored_select_clauses, unsupported_clause,
-    validate_user_name, HonoredClauses, HonoredQueryClauses,
+    cte_select_body, non_recursive_ctes, plain_select_body, reject_unhonored_query_clauses,
+    reject_unhonored_select_clauses, validate_user_name, HonoredClauses, HonoredQueryClauses,
 };
 use crate::plan::view::{exists, group_by, join, scalar, set_op, simple, EmitPieces, ViewChain};
 use crate::SqlResult;
@@ -152,13 +152,9 @@ fn resolve_view_id(client: &mut GnitzClient, schema_name: &str, name: &str) -> R
 
 /// Compile one query body into a chain of `PlannedView` segments (hidden
 /// segments in dependency order, then the final view named `final_name`),
-/// filling `chain.segments` and returning the final view's id. The chain's id
-/// origin (durable `alloc_table_id` for CREATE VIEW, local provisional for a
-/// transient) is the only difference between the two callers; CTE inlining,
-/// derived-table compilation, the ANY/ALL rewrite, shape classification, and the
-/// per-shape emit are shared verbatim. Does NOT reject unhonored tail clauses —
-/// its callers own that (CREATE VIEW rejects ORDER BY/LIMIT before calling; the
-/// transient path rejects them in `execute_select`).
+/// filling `chain.segments` and returning the final view's id. Does NOT reject
+/// unhonored tail clauses — the caller owns that (CREATE VIEW rejects ORDER
+/// BY/LIMIT before calling).
 fn build_query_segments(
     client: &mut GnitzClient,
     query: &Query,
@@ -264,30 +260,6 @@ fn build_query_segments(
         pk_cols,
     });
     Ok(final_vid)
-}
-
-/// Compile an ad-hoc `SELECT` into the same DBSP circuit a CREATE VIEW would
-/// build, as a chain of `PlannedView` segments minted from **local provisional**
-/// ids (no durable `alloc_table_id`). The executor path in `execute_select` runs
-/// `segments[0]` once as a transient when `segments.len() == 1`, and rejects a
-/// multi-segment bundle (3+-way join, self-join, DISTINCT/GROUP BY over a join,
-/// correlated subquery, non-pass-through CTE, derived table in FROM) with a clean
-/// `Unsupported` — those are the separate transient-chain plan's job.
-pub(crate) fn compile_query_to_circuit(
-    client: &mut GnitzClient,
-    query: &Query,
-    binder: &mut Binder<'_>,
-) -> Result<Vec<PlannedView>, GnitzSqlError> {
-    let mut chain = ViewChain::new_transient();
-    build_query_segments(
-        client,
-        query,
-        binder,
-        &mut chain,
-        "__adhoc_transient".to_string(),
-        "-- ad-hoc transient query".to_string(),
-    )?;
-    Ok(chain.segments)
 }
 
 /// The classified shape of a CREATE VIEW body. Classifying once — in this fixed
@@ -414,13 +386,7 @@ impl<'a> ViewShape<'a> {
         // join-view WHERE is rejected wholesale by that builder) and before GROUP
         // BY, which cannot host the subquery in one circuit (both subquery
         // builders reject that combination with a targeted message).
-        let n_subq = select.selection.iter().map(count_subqueries).sum::<usize>()
-            + select
-                .projection
-                .iter()
-                .filter_map(projection_item_expr)
-                .map(count_subqueries)
-                .sum::<usize>();
+        let n_subq = count_select_subqueries(select);
         if n_subq >= 2 {
             return Err(GnitzSqlError::Unsupported(
                 "at most one EXISTS/IN subquery per view; compose via stacked views".into(),
@@ -530,29 +496,12 @@ fn inline_ctes(
     binder: &mut Binder<'_>,
     chain: &mut ViewChain,
 ) -> Result<(), GnitzSqlError> {
-    let Some(with) = &query.with else {
-        return Ok(());
-    };
-    if with.recursive {
-        return Err(GnitzSqlError::Unsupported("recursive CTEs not supported".to_string()));
-    }
-    for cte in &with.cte_tables {
+    for cte in non_recursive_ctes(query)? {
         let ctx = format!("CTE '{}'", cte.alias.name.value);
-        // Exhaustively destructure the `Cte` envelope so a future field can't be silently
-        // dropped. `materialized` parses only under PostgreSqlDialect (always None here).
-        let sqlparser::ast::Cte {
-            alias: _,
-            query: _,
-            from: cte_from,
-            materialized: _,
-            closing_paren_token: _,
-        } = cte;
-        if cte_from.is_some() {
-            return Err(unsupported_clause(&ctx, "a trailing FROM"));
-        }
         // Reject the `Query`-envelope clauses a CTE body cannot honor (a nested `WITH`,
-        // LIMIT/OFFSET, FETCH, FOR UPDATE/SHARE, SETTINGS, …) and unwrap the SELECT body.
-        let cte_select = plain_select_body(&cte.query, &ctx)?;
+        // LIMIT/OFFSET, FETCH, FOR UPDATE/SHARE, SETTINGS, a trailing FROM, …) and
+        // unwrap the SELECT body.
+        let cte_select = cte_select_body(cte, &ctx)?;
         if is_compilable_hidden_body(cte_select) {
             // A later CTE may reference an earlier one, so register immediately.
             let resolved = compile_hidden_body(client, binder, cte_select, &cte.alias.columns, &ctx, chain)?;
@@ -579,7 +528,8 @@ fn inline_passthrough_cte(
 ) -> Result<(), GnitzSqlError> {
     // Reject every Select-body clause the pass-through cannot honor (WHERE — a WHERE'd
     // CTE is routed to `compile_hidden_body` before reaching here — DISTINCT, GROUP BY,
-    // HAVING, and the exotic tail: PREWHERE, TOP, …).
+    // HAVING, and the exotic tail: PREWHERE, TOP, …) — `cte_passthrough`'s
+    // precondition, which the ad-hoc read route establishes with its own checks.
     reject_unhonored_select_clauses(
         cte_select,
         HonoredClauses {
@@ -589,19 +539,51 @@ fn inline_passthrough_cte(
         },
         ctx,
     )?;
-    if cte_select.from.len() != 1 || !cte_select.from[0].joins.is_empty() {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "{ctx}: only single table without JOINs"
-        )));
+    match cte_passthrough(client, cte_select, &cte.alias.columns, binder)? {
+        // Aliasable pass-through: cache the SOURCE TABLE's real catalog id (column
+        // aliasing renames but never reorders, so index column indices still line
+        // up), so a `WITH c AS (SELECT * FROM t) … WHERE indexed = 5` keeps its bound.
+        Some(resolved) => binder.cache_alias(&cte.alias.name.value, resolved, true)?,
+        // Not aliasable (subset/reordered/computed projection): compile a hidden
+        // segment, exactly like the same body as a derived table. A chain-minted
+        // segment id, not a catalog one: no index bound.
+        None => {
+            let resolved = compile_hidden_body(client, binder, cte_select, &cte.alias.columns, ctx, chain)?;
+            binder.cache_alias(&cte.alias.name.value, resolved, false)?;
+        }
     }
-    let cte_table_name = extract_table_factor_name(&cte_select.from[0].relation, ctx)?;
+    Ok(())
+}
+
+/// The pure pass-through predicate shared by the CREATE VIEW CTE inliner
+/// (`inline_passthrough_cte`) and the ad-hoc read route (`dml::select`): a CTE
+/// body that is a bare single-table (or view) identity/positional projection
+/// resolves directly to its source `(tid, schema)`, with any column aliases
+/// applied. Returns `Some((tid, schema))` for such an aliasable pass-through,
+/// `None` for everything else (a joined / multi-FROM / derived-table FROM or a
+/// non-identity projection); `Err` only on a hard bind failure (unknown source
+/// relation). The caller decides what `None` means: the CREATE VIEW inliner
+/// compiles a hidden segment; the read route rejects the whole query as a
+/// derivation. Both callers reject a WHERE'd / grouped / DISTINCT /
+/// exotic-clause body BEFORE calling (each with its own verdict), so such a
+/// body never reaches this predicate.
+pub(crate) fn cte_passthrough(
+    client: &mut GnitzClient,
+    cte_select: &Select,
+    column_aliases: &[sqlparser::ast::TableAliasColumnDef],
+    binder: &mut Binder<'_>,
+) -> Result<Option<(u64, Rc<Schema>)>, GnitzSqlError> {
+    // A single plain table/view FROM, no joins, no derived table.
+    if !matches!(classify_from(&cte_select.from), FromShape::SinglePlainRelation) {
+        return Ok(None);
+    }
+    let cte_table_name = extract_table_factor_name(&cte_select.from[0].relation, "CTE")?;
     let (cte_tid, cte_schema) = binder.resolve(client, &cte_table_name)?;
     // Positional identity projection: `*`, or one identifier per source column in
     // order. The qualified form (`SELECT t.a, t.b FROM t`) parses as `CompoundIdentifier`
     // and is the same positional pass-through; a dup-named source fails the per-position
-    // compare and compiles instead. Only a *bare* `*` is identity — a
-    // `* EXCEPT/EXCLUDE/RENAME` (or a rejected `* REPLACE/ILIKE`) CTE body must
-    // fall to the real builder (`compile_hidden_body`) so the modifier is honored.
+    // compare and is not identity. Only a *bare* `*` is identity — a
+    // `* EXCEPT/EXCLUDE/RENAME` (or a rejected `* REPLACE/ILIKE`) CTE body is not.
     let proj_is_identity = is_bare_wildcard_projection(&cte_select.projection)
         || (cte_select.projection.len() == cte_schema.columns.len()
             && cte_select.projection.iter().enumerate().all(|(i, item)| {
@@ -615,24 +597,17 @@ fn inline_passthrough_cte(
                 }
             }));
     if !proj_is_identity {
-        let resolved = compile_hidden_body(client, binder, cte_select, &cte.alias.columns, ctx, chain)?;
-        // A chain-minted segment id, not a catalog one: no index bound.
-        binder.cache_alias(&cte.alias.name.value, resolved, false)?;
-        return Ok(());
+        return Ok(None);
     }
     // Apply CTE column aliases (`WITH cte(a, b) AS ...`).
-    let cte_schema = if !cte.alias.columns.is_empty() {
+    let cte_schema = if !column_aliases.is_empty() {
         let mut s = (*cte_schema).clone();
-        apply_hidden_column_aliases(&cte.alias.columns, &mut s.columns, ctx)?;
-        std::rc::Rc::new(s)
+        apply_hidden_column_aliases(column_aliases, &mut s.columns, "CTE")?;
+        Rc::new(s)
     } else {
         cte_schema
     };
-    // The pass-through caches the SOURCE TABLE's real catalog id (column aliasing
-    // renames but never reorders, so index column indices still line up), so a
-    // `WITH c AS (SELECT * FROM t) … WHERE indexed = 5` keeps its bound.
-    binder.cache_alias(&cte.alias.name.value, (cte_tid, cte_schema), true)?;
-    Ok(())
+    Ok(Some((cte_tid, cte_schema)))
 }
 
 /// Compile a hidden-segment body — a JOIN, a GROUP BY / aggregate (over a table
@@ -651,6 +626,14 @@ fn compile_hidden_body(
     ctx: &str,
     chain: &mut ViewChain,
 ) -> Result<(u64, Rc<Schema>), GnitzSqlError> {
+    // A hidden segment compiles exactly one FROM item (a plain relation or a join
+    // chain). A comma-join / FROM-less body has no builder here — reject rather than
+    // silently compile only `from[0]` (`lower_linear` reads `from[0]` alone).
+    if select.from.len() != 1 {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "{ctx}: only a single FROM item is supported"
+        )));
+    }
     // A sub-plan body's FROM must be plain relations: the front door pre-compiles
     // derived tables only in the view's top-level FROM, so a nested one would
     // mis-resolve by alias here.

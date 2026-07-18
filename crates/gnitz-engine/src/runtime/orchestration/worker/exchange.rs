@@ -1,6 +1,6 @@
 //! Worker exchange-wait re-entry: the defer-then-replay machinery
 //! (`do_exchange_wait` inline dispatch loop + `dispatch_deferred`;
-//! deferred control groups replay in `replay_deferred_control`).
+//! deferred ticks replay in `replay_deferred_ticks`).
 
 use super::*;
 
@@ -70,7 +70,7 @@ impl WorkerProcess {
         let master_pid = self.master_pid;
         let want_key = (view_id, source_id);
         let ctx = DispatchContext::InEval {
-            relay_wait: Some(want_key),
+            relay_wait: want_key,
             schema,
         };
 

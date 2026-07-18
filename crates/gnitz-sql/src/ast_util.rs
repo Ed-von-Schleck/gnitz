@@ -269,6 +269,55 @@ pub(crate) fn projection_item_expr(item: &sqlparser::ast::SelectItem) -> Option<
     }
 }
 
+/// Count the `[NOT] EXISTS` / `[NOT] IN (SELECT …)` subquery nodes across the
+/// two expression surfaces of a SELECT — the WHERE and the projection items —
+/// the one definition of "which surfaces decide subquery detection", shared by
+/// the view-shape classifier and the direct-SELECT derivation gate.
+pub(crate) fn count_select_subqueries(select: &sqlparser::ast::Select) -> usize {
+    select.selection.iter().map(count_subqueries).sum::<usize>()
+        + select
+            .projection
+            .iter()
+            .filter_map(projection_item_expr)
+            .map(count_subqueries)
+            .sum::<usize>()
+}
+
+/// The classified shape of a FROM clause — the one definition of "a single plain
+/// table/view FROM", shared by the direct-SELECT derivation gate, the CTE
+/// pass-through predicate, and the subquery / set-op side resolvers.
+pub(crate) enum FromShape {
+    /// No FROM item at all.
+    Empty,
+    /// Multiple comma-separated FROM items (an implicit comma join). Distinct
+    /// from `Join` because CREATE VIEW serves an explicit JOIN chain but rejects
+    /// a multi-item FROM — the two shapes need different advice.
+    CommaJoin,
+    /// One FROM item carrying an explicit JOIN chain.
+    Join,
+    /// One FROM item that is not a plain relation name (a derived table, a table
+    /// function, …).
+    DerivedTable,
+    /// Exactly one plain relation name, no joins.
+    SinglePlainRelation,
+}
+
+pub(crate) fn classify_from(from: &[sqlparser::ast::TableWithJoins]) -> FromShape {
+    match from {
+        [] => FromShape::Empty,
+        [single] => {
+            if !single.joins.is_empty() {
+                FromShape::Join
+            } else if matches!(single.relation, sqlparser::ast::TableFactor::Table { .. }) {
+                FromShape::SinglePlainRelation
+            } else {
+                FromShape::DerivedTable
+            }
+        }
+        _ => FromShape::CommaJoin,
+    }
+}
+
 /// Collect every column reference in `expr` as `(qualifier, bare_name)` — a
 /// two-part `CompoundIdentifier` yields `(Some(q), c)`, a bare `Identifier` yields
 /// `(None, c)`. Sub-expressions recurse through `expr_operands` (function

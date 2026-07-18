@@ -450,15 +450,15 @@ fn unregistered_source_is_none() {
 
 /// `open_source_cursor` must compile the plan itself before reading the bound.
 ///
-/// `handle_backfill` — the driver for every exchange view, every ad-hoc transient,
-/// and every post-recovery rebuild — reaches the cursor open BEFORE anything
-/// compiles the view. With a cold cache and no `ensure_compiled`, the bound would
-/// read back as "absent" and the motivating case would ship silently dead: every
-/// other test here still passes, because a full scan is never *wrong*.
+/// `handle_backfill` — the driver for every exchange view and every
+/// post-recovery rebuild — reaches the cursor open BEFORE anything compiles the
+/// view. With a cold cache and no `ensure_compiled`, the bound would read back as
+/// "absent" and the motivating case would ship silently dead: every other test
+/// here still passes, because a full scan is never *wrong*.
 #[test]
 fn cold_plan_cache_still_finds_the_bound() {
     let (mut engine, tid, vid) = fixture("srccur_cold", Some(val_bound(Cut::Before(500), Cut::Before(600))), true);
-    // Exactly what a freshly-created view / transient looks like at the moment
+    // Exactly what a freshly-created view looks like at the moment
     // `handle_backfill` opens its source cursor.
     engine.dag.invalidate(vid);
     let cur = engine.open_source_cursor(vid, tid).unwrap();

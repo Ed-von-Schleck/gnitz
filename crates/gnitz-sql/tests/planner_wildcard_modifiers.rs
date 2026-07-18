@@ -14,9 +14,6 @@ use common::*;
 
 /// Lowercased names of the *visible* (presentation) columns — the wildcard
 /// modifiers only ever touch these; a hidden synthetic/PK slot is invisible.
-fn visible_names(s: &Schema) -> Vec<String> {
-    s.visible_columns().map(|(_, c)| c.name.to_lowercase()).collect()
-}
 
 fn view_schema(client: &mut GnitzClient, sn: &str, view: &str) -> Schema {
     client.resolve_table_or_view_id(sn, view).unwrap().1

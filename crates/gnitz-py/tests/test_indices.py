@@ -361,12 +361,11 @@ class TestIndexSql:
         finally:
             _drop_all(client, sn, tables=["t"])
 
-    def test_select_nonindexed_col_served_by_executor(self, client):
+    def test_select_nonindexed_col_served_by_read_path(self, client):
         """WHERE on a column with no index is SERVED, not rejected.
 
-        No index means no thin access path, so the query routes to the on-demand
-        executor (compiled to a DBSP circuit, run once over the committed base
-        snapshot, streamed back). This used to raise a "no usable index" error.
+        No index means no seek key, so the bounded read degrades to a full cursor
+        and the predicate runs server-side. Served directly — no circuit.
         """
         sn = _sn()
         client.create_schema(sn)
@@ -2300,9 +2299,9 @@ class TestIndexRangeSql:
         finally:
             _drop_all(client, sn, indices=[f"{sn}__t__idx_a_b"], tables=["t"])
 
-    def test_range_nonindexed_served_by_executor(self, client):
-        """A range predicate on a non-indexed column has no thin access path, so
-        it is served by the on-demand executor rather than rejected."""
+    def test_range_nonindexed_served_by_read_path(self, client):
+        """A range predicate on a non-indexed column has no seek key, so it is
+        served by the read-spec predicate (full cursor + predicate), not rejected."""
         sn = _sn()
         client.create_schema(sn)
         try:

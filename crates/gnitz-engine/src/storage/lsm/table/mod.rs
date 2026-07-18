@@ -79,6 +79,19 @@ pub enum RecoverySource {
     },
 }
 
+impl RecoverySource {
+    /// The checkpointed-rederive policy sampled at the current committed
+    /// checkpoint generation — the one constructor for a view's output store
+    /// and its operator-trace tables, so the reload gate's `committed` sample
+    /// can never drift between the two.
+    #[inline]
+    pub fn rederive_checkpointed_now() -> RecoverySource {
+        RecoverySource::RederiveCheckpointed {
+            committed: crate::foundation::worker_ctx::committed_generation(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Two-phase flush API
 // ---------------------------------------------------------------------------
@@ -270,8 +283,8 @@ impl Table {
         //     would hold nothing, ever. `open_dirfd` (the single choke point
         //     every file write goes through) creates it lazily on the first
         //     spill, making a Rederive open free of filesystem work (this is
-        //     what keeps a transient ad-hoc query's per-partition scratch
-        //     tables syscall-free). A dir left by a previous boot still gets
+        //     what keeps an index circuit's per-partition scratch tables
+        //     syscall-free). A dir left by a previous boot still gets
         //     its stale shards erased (a missing dir erases nothing).
         //   RederiveCheckpointed → load only when the manifest's checkpoint
         //     generation equals the caller's committed generation; otherwise

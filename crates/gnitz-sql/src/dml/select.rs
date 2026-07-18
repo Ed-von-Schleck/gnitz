@@ -1,16 +1,23 @@
-//! Direct `SELECT`: route a single-relation SELECT through the **parameterized
-//! bounded read** (`plan_read_spec` → a `ReadSpec` rows sink executed
-//! server-side: bound pushdown, predicate, projection, ORDER BY / LIMIT top-k)
-//! or, for aggregate / DISTINCT shapes, through the **fold sink**
+//! Direct `SELECT`: an ad-hoc SELECT reads exactly one relation, served through
+//! the **parameterized bounded read** (`plan_read_spec` → a `ReadSpec` rows sink
+//! executed server-side: bound pushdown, predicate, projection, ORDER BY / LIMIT
+//! top-k) or, for aggregate / DISTINCT shapes, through the **fold sink**
 //! (`execute_aggregate_select` → a per-worker hash-fold + client finishing).
-//! Everything else — set-ops, JOINs, CTEs, and any shape either sink cannot
-//! serve — falls back to the transient circuit executor, which either handles
-//! it or produces the same rejection.
+//!
+//! A query that *derives* a new relation — a JOIN, a set operation, an EXISTS/IN
+//! or scalar subquery, a derived table, a non-pass-through CTE — has no
+//! single-relation sink; `execute_select` rejects it from the AST alone
+//! (`reject_derivation`) with one actionable message pointing at CREATE VIEW,
+//! which maintains the derived relation incrementally. A single-relation read the
+//! direct path cannot express (a LIKE / string-function WHERE, an ORDER BY
+//! expression, a string / U64 HAVING) is a feature-named `Unsupported`, never the
+//! derivation template. A pass-through CTE over one relation is inlined
+//! (`cte_passthrough`) so trivial `WITH` queries keep reading through the direct path.
 
 use crate::agg::{synthetic_fold_cols, GroupByLayout};
 use crate::ast_util::{
-    extract_table_factor_name, flatten_conjuncts, group_by_is_present, is_bare_wildcard_projection,
-    projection_has_aggregate,
+    body_is_grouped, classify_from, count_select_subqueries, extract_table_factor_name, flatten_conjuncts,
+    is_bare_wildcard_projection, FromShape,
 };
 use crate::bind::{bind_single_table, Binder};
 use crate::codec::project_schema::{build_read_projection, compile_projection_map};
@@ -22,14 +29,52 @@ use crate::ir::{BinOp, BoundExpr};
 use crate::lower::compile_filter_program;
 use crate::plan::index_bound::best_index_bound;
 use crate::plan::validate::{
-    reject_unhonored_query_clauses, reject_unhonored_select_clauses, HonoredClauses, HonoredQueryClauses,
+    cte_select_body, non_recursive_ctes, reject_unhonored_query_clauses, reject_unhonored_select_clauses,
+    HonoredClauses, HonoredQueryClauses,
 };
-use crate::plan::{analyze_group_by, bind_having_expr, resolve_set_projection, HavingCtx};
+use crate::plan::{
+    analyze_group_by, bind_having_expr, cte_passthrough, has_scalar_subquery, resolve_set_projection, HavingCtx,
+};
 use crate::SqlResult;
 use gnitz_core::protocol::encode_schema_block;
-use gnitz_core::{GnitzClient, PlannedView, ReduceOutKey, Schema, ZSetBatch, MAX_COLUMNS};
+use gnitz_core::{GnitzClient, ReduceOutKey, Schema, ZSetBatch, MAX_COLUMNS};
 use gnitz_wire::{AggReadItem, AggReadSpec, ReadBound, ReadSink, ReadSpec};
 use sqlparser::ast::{Expr, LimitClause, Query, Select, SetExpr};
+
+/// The single derivation-rejection: an ad-hoc SELECT reads one relation, but this
+/// query derives a new one (`construct` names what was detected — `JOIN`, `set
+/// operation`, `EXISTS/IN subquery`, `scalar subquery`, `derived table in FROM`,
+/// `non-pass-through CTE`). One template, one code path, asserted verbatim by
+/// tests. The remedy is the product answer for a derived relation: a view, which
+/// the engine maintains incrementally.
+fn reject_derivation<T>(construct: &str) -> Result<T, GnitzSqlError> {
+    Err(GnitzSqlError::Unsupported(format!(
+        "ad-hoc SELECT reads a single relation; this query derives a new one ({construct}).\n\
+         CREATE VIEW <name> AS <your query> — the engine maintains it incrementally — then SELECT from it."
+    )))
+}
+
+/// An empty `Rows` result over `schema` — the `LIMIT 0` short-circuit both sinks
+/// share (no request dispatched).
+fn empty_rows(schema: Schema) -> SqlResult {
+    let batch = ZSetBatch::new(&schema);
+    SqlResult::Rows { schema, batch }
+}
+
+/// WHERE → the pushed-down `ReadBound` (an access superset) plus the compiled
+/// server-side predicate re-imposing the residual conjuncts — the shared front
+/// half of both sinks. A wide-int / LIKE / string-arithmetic WHERE the
+/// expression VM cannot compile is an `Unsupported`, propagated.
+fn where_bound_and_predicate(
+    client: &mut GnitzClient,
+    tid: u64,
+    schema: &Schema,
+    where_expr: Option<&Expr>,
+) -> Result<(ReadBound, Vec<u8>), GnitzSqlError> {
+    let (bound, pred_exprs) = extract_bound(client, tid, schema, where_expr)?;
+    let predicate = compile_read_spec_predicate(&pred_exprs, schema)?;
+    Ok((bound, predicate))
+}
 
 pub(crate) fn execute_select(
     client: &mut GnitzClient,
@@ -37,12 +82,10 @@ pub(crate) fn execute_select(
     query: &Query,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
-    // Envelope guard for BOTH paths: ORDER BY / LIMIT / OFFSET are applied by the
-    // client-side ordering sink over either path's fetched batch, and WITH is
-    // honored by the executor (CTE inlining — a WITH always routes there below,
-    // so the read-spec path can never resolve a FROM name a CTE shadows). Everything
-    // else (FETCH, FOR UPDATE/SHARE, SETTINGS, FORMAT, pipe operators) is
-    // rejected up front so neither path silently drops it.
+    // Envelope guard: ORDER BY / LIMIT / OFFSET are applied by the client-side
+    // ordering sink over the fetched batch, and WITH is inlined below
+    // (`cte_passthrough`). Everything else (FETCH, FOR UPDATE/SHARE, SETTINGS,
+    // FORMAT, pipe operators) is rejected up front so nothing is silently dropped.
     reject_unhonored_query_clauses(
         query,
         HonoredQueryClauses {
@@ -51,8 +94,8 @@ pub(crate) fn execute_select(
         },
         "direct SELECT",
     )?;
-    // The `LIMIT … BY` (ClickHouse per-group) sub-form has no operator on either
-    // path, so reject it rather than silently accept-and-ignore it.
+    // The `LIMIT … BY` (ClickHouse per-group) sub-form has no operator here, so
+    // reject it rather than silently accept-and-ignore it.
     if let Some(LimitClause::LimitOffset { limit_by, .. }) = &query.limit_clause {
         if !limit_by.is_empty() {
             return Err(GnitzSqlError::Unsupported(
@@ -61,36 +104,98 @@ pub(crate) fn execute_select(
         }
     }
 
-    // Shape routing, from the AST alone: a WITH, a set-op body, a JOIN, DISTINCT
-    // / GROUP BY / HAVING, or an aggregate projection has no read-spec operator
-    // and compiles through the executor instead.
+    // Step 1 — body kind. A set-op body derives; a plain SELECT continues; every
+    // other body (VALUES, a parenthesized query, TABLE t) is a plain `Unsupported`
+    // naming the shape — NOT the derivation template, because CREATE VIEW rejects
+    // the identical bodies, so its "CREATE VIEW AS <your query>" advice would be false.
     let select = match query.body.as_ref() {
-        SetExpr::Select(s) if query.with.is_none() => s,
-        _ => return execute_select_via_executor(client, query, binder),
+        SetExpr::SetOperation { .. } => return reject_derivation("set operation"),
+        SetExpr::Select(s) => s.as_ref(),
+        other => {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "direct SELECT does not support a {} body",
+                match other {
+                    SetExpr::Query(_) => "parenthesized subquery",
+                    SetExpr::Values(_) => "VALUES",
+                    SetExpr::Table(_) => "TABLE",
+                    SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) => "DML",
+                    _ => "non-SELECT",
+                }
+            )))
+        }
     };
 
-    // A join / comma-join FROM derives a new relation — no single-relation sink
-    // serves it, aggregated or not, so it routes to the executor before the
-    // aggregate split (`SELECT COUNT(*) FROM t1, t2` is a JOIN shape, not an
-    // aggregate over one table).
-    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
-        return execute_select_via_executor(client, query, binder);
+    // Step 2 — CTE inlining. Every CTE must be a pass-through over one relation,
+    // aliased into the binder cache (the source table's real catalog id, so a
+    // downstream `WHERE indexed = 5` keeps its bound); a non-pass-through CTE
+    // derives, and one such CTE rejects the whole query.
+    for cte in non_recursive_ctes(query)? {
+        let ctx = format!("CTE '{}'", cte.alias.name.value);
+        let cte_select = cte_select_body(cte, &ctx)?;
+        // Clauses CREATE VIEW cannot serve on a CTE either (DISTINCT, the exotic
+        // tail: PREWHERE, TOP, QUALIFY, …) keep their targeted error — the
+        // derivation template's CREATE VIEW advice would be false for them.
+        reject_unhonored_select_clauses(
+            cte_select,
+            HonoredClauses {
+                where_filter: true,
+                grouping: true,
+                distinct: false,
+            },
+            &ctx,
+        )?;
+        // A WHERE'd / grouped / aggregated CTE derives a new relation, and a
+        // view genuinely serves it (as a hidden segment) — so does any
+        // non-pass-through body `cte_passthrough` refuses (a joined / derived
+        // FROM, a non-identity projection): the derivation advice is true here.
+        if cte_select.selection.is_some() || cte_select.having.is_some() || body_is_grouped(cte_select) {
+            return reject_derivation("non-pass-through CTE");
+        }
+        match cte_passthrough(client, cte_select, &cte.alias.columns, binder)? {
+            Some(resolved) => binder.cache_alias(&cte.alias.name.value, resolved, true)?,
+            None => return reject_derivation("non-pass-through CTE"),
+        }
     }
 
-    // Aggregate / DISTINCT shapes: a single-relation query over a plain table or
-    // view name folds via the fold sink; a derived table (or a fold plan the
-    // shared validation rejects) falls to the transient executor. DISTINCT
-    // takes precedence over GROUP BY (the DISTINCT arm's gate then rejects
-    // GROUP BY), matching the view path.
-    if select.distinct.is_some()
-        || group_by_is_present(&select.group_by)
-        || select.having.is_some()
-        || projection_has_aggregate(select)
-    {
-        if let Some(result) = execute_aggregate_select(client, select, query, binder)? {
-            return Ok(result);
+    // Step 3 — FROM shape. Zero FROM is a plain `Unsupported`; an explicit JOIN
+    // or a derived table derives (a view serves both); a comma-join is a shape
+    // CREATE VIEW rejects too, so it gets its own advice (rewrite as an explicit
+    // JOIN first) instead of the derivation template.
+    match classify_from(&select.from) {
+        FromShape::Empty => {
+            return Err(GnitzSqlError::Unsupported(
+                "direct SELECT without FROM is not supported".to_string(),
+            ))
         }
-        return execute_select_via_executor(client, query, binder);
+        FromShape::Join => return reject_derivation("JOIN"),
+        FromShape::CommaJoin => {
+            return Err(GnitzSqlError::Unsupported(
+                "comma-join FROM (FROM a, b) is not supported; rewrite it as an explicit JOIN … ON …, then \
+                 CREATE VIEW <name> AS <that query> and SELECT from it"
+                    .to_string(),
+            ))
+        }
+        FromShape::DerivedTable => return reject_derivation("derived table in FROM"),
+        FromShape::SinglePlainRelation => {}
+    }
+
+    // Step 4 — subquery walk over the selection and projection. A single-relation
+    // subquery is detected by no earlier step; without this an EXISTS/IN in the
+    // WHERE would surface as a low-level bind error and a projected scalar subquery
+    // as a generic projection error. EXISTS/IN (`count_select_subqueries`) is
+    // checked before the scalar / ANY / ALL forms (`has_scalar_subquery`),
+    // mirroring the view-shape classifier.
+    if count_select_subqueries(select) > 0 {
+        return reject_derivation("EXISTS/IN subquery");
+    }
+    if has_scalar_subquery(select) {
+        return reject_derivation("scalar subquery");
+    }
+
+    // Step 5 — aggregate / DISTINCT shapes fold via the fold sink. DISTINCT takes
+    // precedence over GROUP BY (its arm rejects GROUP BY), matching the view path.
+    if select.distinct.is_some() || select.having.is_some() || body_is_grouped(select) {
+        return execute_aggregate_select(client, select, query, binder);
     }
 
     // Body-clause guard: WHERE and the projection are honored; DISTINCT / grouping
@@ -126,33 +231,21 @@ pub(crate) fn execute_select(
         });
     }
 
-    match plan_read_spec(client, select, query, &schema, tid, limit, offset)? {
-        Some(result) => Ok(result),
-        // A shape the read spec cannot serve (non-projected ORDER BY, subquery /
-        // qualified-wildcard projection, a WHERE the expression VM cannot compile)
-        // routes to the executor, which handles it or re-raises the same error.
-        None => execute_select_via_executor(client, query, binder),
-    }
+    // Step 6 — the read spec. Every planning outcome is terminal: a shape the
+    // direct path cannot express is a feature-named `Unsupported`, propagated from
+    // the offending resolver.
+    plan_read_spec(client, select, query, &schema, tid, limit, offset)
 }
 
 // ---------------------------------------------------------------------------
 // plan_read_spec — the parameterized bounded read
 // ---------------------------------------------------------------------------
 
-/// Collapse the routing verdict on a fallible planning step: a `Bind` error is
-/// hard (no path could resolve it); any other error routes to the executor,
-/// which serves the shape or re-raises the identical rejection.
-fn hard_or_route<T>(r: Result<T, GnitzSqlError>) -> Result<Option<T>, GnitzSqlError> {
-    match r {
-        Ok(x) => Ok(Some(x)),
-        Err(e @ GnitzSqlError::Bind(_)) => Err(e),
-        Err(_) => Ok(None),
-    }
-}
-
-/// Build and run a `ReadSpec` for a single-relation, non-aggregate SELECT.
-/// `Ok(Some(result))` = served; `Ok(None)` = route to the executor (a shape the
-/// read spec cannot express); `Err(Bind)` = a hard bind error (unknown column).
+/// Build and run a `ReadSpec` for a single-relation, non-aggregate SELECT. Every
+/// planning outcome is terminal: a shape the read spec cannot express (a wide-int
+/// / LIKE / string-arithmetic WHERE, a qualified-wildcard / other non-map
+/// projection, an ORDER BY expression) surfaces the offending resolver's own
+/// feature-named `Unsupported`; an unknown column is a `Bind` error.
 fn plan_read_spec(
     client: &mut GnitzClient,
     select: &Select,
@@ -161,38 +254,20 @@ fn plan_read_spec(
     tid: u64,
     limit: Option<usize>,
     offset: usize,
-) -> Result<Option<SqlResult>, GnitzSqlError> {
-    // 1. Bound (an access superset) + the conjuncts to re-impose as the predicate.
-    let (bound, pred_exprs) = extract_bound(client, tid, schema, select.selection.as_ref())?;
-
-    // 2. Compile the predicate over the SOURCE schema. `Unsupported` (a wide-int /
-    //    LIKE / string-arithmetic WHERE) routes to the executor, which re-raises
-    //    the identical rejection.
-    let Some(predicate) = hard_or_route(compile_read_spec_predicate(&pred_exprs, schema))? else {
-        return Ok(None);
-    };
+) -> Result<SqlResult, GnitzSqlError> {
+    // 1–2. WHERE → bound + compiled server-side predicate.
+    let (bound, predicate) = where_bound_and_predicate(client, tid, schema, select.selection.as_ref())?;
 
     // 3. Projection items — the source PK hidden-prepended to slots `0..k`, then
     //    every SELECT item as a payload slot in SELECT order. A qualified wildcard
-    //    / subquery / other non-map projection → executor.
-    let Some((mut items, mut out_cols)) = hard_or_route(build_read_projection(&select.projection, schema))? else {
-        return Ok(None);
-    };
+    //    / subquery / other non-map projection is an `Unsupported`, propagated.
+    let (mut items, mut out_cols) = build_read_projection(&select.projection, schema)?;
     let k = schema.pk_indices().len();
 
     // 4. ORDER BY keys over the reply columns; a non-projected source column is
     //    appended as a hidden payload column (so it can still order the result).
-    //    An ORDER BY expression → `Unsupported` (routes; the executor rejects it
-    //    identically).
-    let Some(order) = hard_or_route(resolve_read_spec_order(
-        &mut items,
-        &mut out_cols,
-        schema,
-        query.order_by.as_ref(),
-    ))?
-    else {
-        return Ok(None);
-    };
+    //    An ORDER BY expression is an `Unsupported`, propagated.
+    let order = resolve_read_spec_order(&mut items, &mut out_cols, schema, query.order_by.as_ref())?;
 
     // 5. Reply schema + projection blob (the payload slice `items[k..]`).
     let reply_schema = Schema::from_parts(out_cols, (0..k).collect())
@@ -201,11 +276,7 @@ fn plan_read_spec(
 
     // `LIMIT 0` short-circuits to an empty result — no request dispatched.
     if limit == Some(0) {
-        let batch = ZSetBatch::new(&reply_schema);
-        return Ok(Some(SqlResult::Rows {
-            schema: reply_schema,
-            batch,
-        }));
+        return Ok(empty_rows(reply_schema));
     }
     // OFFSET+LIMIT logical rows; `0` = unbounded (an OFFSET with no LIMIT too).
     let limit_k = limit.map(|l| l.saturating_add(offset) as u64).unwrap_or(0);
@@ -234,7 +305,7 @@ fn plan_read_spec(
         unreachable!()
     };
     let (schema, batch) = read_spec_finish(out_schema, batch, order, offset, limit);
-    Ok(Some(SqlResult::Rows { schema, batch }))
+    Ok(SqlResult::Rows { schema, batch })
 }
 
 /// Extract the `ReadBound` and the WHERE conjuncts to re-impose as the
@@ -320,22 +391,20 @@ fn compile_read_spec_predicate(exprs: &[&Expr], schema: &Schema) -> Result<Vec<u
 // ---------------------------------------------------------------------------
 
 /// Serve a single-relation GROUP BY / global aggregate / HAVING / DISTINCT query
-/// via the ReadSpec fold sink (a per-worker hash-fold) + client finishing.
-/// `Ok(Some)` = served; `Ok(None)` = route to the transient executor (a
-/// non-single-relation FROM, a plan wider than one schema, or a shape the shared
-/// validation rejects — the executor serves it or re-raises the identical
-/// error); `Err(Bind)` = a hard bind error. The only hard ad-hoc error is the
-/// runtime per-worker group cap, surfaced from the wire call.
+/// via the ReadSpec fold sink (a per-worker hash-fold) + client finishing. Every
+/// planning outcome is terminal: a shape the fold cannot express (a partial reply
+/// wider than the column limit, a string / U64 HAVING) is a feature-named
+/// `Unsupported`; a resolver's own `Unsupported`/`Bind` propagates. The only
+/// runtime error is the per-worker group cap, surfaced from the wire call.
 fn execute_aggregate_select(
     client: &mut GnitzClient,
     select: &Select,
     query: &Query,
     binder: &mut Binder<'_>,
-) -> Result<Option<SqlResult>, GnitzSqlError> {
-    // The caller routed joins already; a derived table cannot fold either.
-    let Ok(table_name) = extract_table_factor_name(&select.from[0].relation, "FROM") else {
-        return Ok(None);
-    };
+) -> Result<SqlResult, GnitzSqlError> {
+    // The caller validated `from[0]` is a plain table/view (step 3), so this only
+    // rejects an exotic table qualifier (a table function, AS OF, …).
+    let table_name = extract_table_factor_name(&select.from[0].relation, "FROM")?;
     let is_distinct = select.distinct.is_some();
 
     // The routing split sits above the shared clause gate, so invoke it here —
@@ -363,33 +432,27 @@ fn execute_aggregate_select(
     // resolver (bare columns only, float keys rejected); GROUP BY / global
     // aggregates use the shared `analyze_group_by`.
     let layout = if is_distinct {
-        let Some((indices, out_cols)) =
-            hard_or_route(resolve_set_projection(&select.projection, &schema, "SELECT DISTINCT"))?
-        else {
-            return Ok(None);
-        };
+        let (indices, out_cols) = resolve_set_projection(&select.projection, &schema, "SELECT DISTINCT")?;
         GroupByLayout::distinct(indices, &out_cols)
     } else {
-        let Some(layout) = hard_or_route(analyze_group_by(select, &schema))? else {
-            return Ok(None);
-        };
-        layout
+        analyze_group_by(select, &schema)?
     };
     let n_group = layout.group_col_indices.len();
 
     // The one width invariant bounding a fold plan: the partial reply layout
     // `[_group_pk | group cols | agg partials]` must be a legal schema. Wider
-    // (e.g. many repeated aggregates) → the executor (no cap), never an error.
+    // (e.g. many repeated aggregates) than the column limit has no fold reply
+    // layout — a feature limit of the direct path.
     if 1 + n_group + layout.agg_specs.len() > MAX_COLUMNS {
-        return Ok(None);
+        return Err(GnitzSqlError::Unsupported(format!(
+            "aggregate SELECT with {} group + aggregate columns exceeds the {MAX_COLUMNS}-column fold reply limit",
+            n_group + layout.agg_specs.len()
+        )));
     }
 
     // The final output schema — built at plan time so a duplicate output name
-    // rejects before any dispatch, exactly as every view compile does (the
-    // executor re-raises the identical duplicate-name error).
-    let Some(out_schema) = hard_or_route(build_agg_out_schema(&layout, &schema))? else {
-        return Ok(None);
-    };
+    // rejects before any dispatch, exactly as every view compile does.
+    let out_schema = build_agg_out_schema(&layout, &schema)?;
 
     // The partial reply schema — the shared SyntheticFold reduce-output layout
     // the worker emits and echoes back (parity with the view path's reduce
@@ -402,8 +465,11 @@ fn execute_aggregate_select(
     .map_err(|e| GnitzSqlError::Unsupported(format!("ad-hoc aggregate reply schema is invalid: {e}")))?;
 
     // HAVING: bind against the SyntheticFold reduce layout, then probe the typed
-    // IEEE evaluator over that layout; a non-numeric / string / U64 / wide
-    // HAVING routes the whole query to the executor at plan time.
+    // IEEE evaluator over that layout. The fold's client-side evaluator whitelists
+    // float and ≤32-bit / signed-≤64-bit integer columns; a string or U64 HAVING
+    // is not served here — but the grouped view builder serves it (same backend),
+    // so the message points at CREATE VIEW. (A wide U128/I128 HAVING rejects on
+    // both paths.)
     let bound_having = match &select.having {
         Some(having_expr) => {
             let ctx = HavingCtx {
@@ -413,11 +479,13 @@ fn execute_aggregate_select(
                 agg_mappings: &layout.agg_mappings,
                 agg_col_offset: layout.synthetic_agg_col_offset(),
             };
-            let Some(bound) = hard_or_route(bind_having_expr(having_expr, &ctx))? else {
-                return Ok(None);
-            };
+            let bound = bind_having_expr(having_expr, &ctx)?;
             if !having_supported(&bound, &partial_schema) {
-                return Ok(None);
+                return Err(GnitzSqlError::Unsupported(
+                    "a HAVING over string or 64-bit-unsigned aggregate columns is not supported on a direct SELECT; \
+                     CREATE VIEW <name> AS <your query> serves it (then SELECT from the view)"
+                        .to_string(),
+                ));
             }
             Some(bound)
         }
@@ -425,23 +493,16 @@ fn execute_aggregate_select(
     };
 
     // WHERE → bound + residual predicate, exactly as the plain read path (the
-    // grouped view applies WHERE via the identical compiler, so a WHERE that fails
-    // here also fails the executor — no works→error regression).
-    let (bound, pred_exprs) = extract_bound(client, tid, &schema, select.selection.as_ref())?;
-    let Some(predicate) = hard_or_route(compile_read_spec_predicate(&pred_exprs, &schema))? else {
-        return Ok(None);
-    };
+    // grouped view applies WHERE via the identical compiler, so a WHERE the direct
+    // path cannot compile also fails the view — no works→error regression).
+    let (bound, predicate) = where_bound_and_predicate(client, tid, &schema, select.selection.as_ref())?;
 
     let limit = extract_limit(query)?;
     let offset = extract_offset(query)?;
     // `LIMIT 0` short-circuits to an empty result — no request dispatched
     // (parity with the rows path).
     if limit == Some(0) {
-        let batch = ZSetBatch::new(&out_schema);
-        return Ok(Some(SqlResult::Rows {
-            schema: out_schema,
-            batch,
-        }));
+        return Ok(empty_rows(out_schema));
     }
 
     let spec = ReadSpec {
@@ -481,45 +542,8 @@ fn execute_aggregate_select(
 
     let (schema_out, batch_out) =
         order_limit_passthrough(out_schema, out_batch, query.order_by.as_ref(), offset, limit)?;
-    Ok(Some(SqlResult::Rows {
+    Ok(SqlResult::Rows {
         schema: schema_out,
         batch: batch_out,
-    }))
-}
-
-/// The executor branch: compile the SELECT into the same circuit a CREATE VIEW
-/// would build, run it once as a transient, and apply the shared client-side
-/// ordering sink (ORDER BY / OFFSET / LIMIT) over the streamed result. The
-/// transient's output is already projected server-side, so the sink runs with
-/// the identity projection (hidden synthetic keys stay physical and are
-/// stripped at presentation, exactly like a view scan). A multi-segment compile
-/// is out of scope (a separate plan).
-fn execute_select_via_executor(
-    client: &mut GnitzClient,
-    query: &Query,
-    binder: &mut Binder<'_>,
-) -> Result<SqlResult, GnitzSqlError> {
-    let limit = extract_limit(query)?;
-    let offset = extract_offset(query)?;
-    let mut segments = crate::plan::compile_query_to_circuit(client, query, binder)?;
-    if segments.len() != 1 {
-        return Err(GnitzSqlError::Unsupported(
-            "this ad-hoc query compiles to a multi-segment chain (3+-way join, self-join, DISTINCT / GROUP BY over a \
-             join, correlated subquery, non-pass-through CTE, or a derived table in FROM); use CREATE VIEW"
-                .to_string(),
-        ));
-    }
-    let PlannedView {
-        circuit,
-        output_columns,
-        pk_cols,
-        ..
-    } = segments.pop().unwrap();
-    // The result schema is the transient's own output schema, validated once and
-    // shared by the wire call, the sink, and the returned rows.
-    let schema = Schema::from_parts(output_columns, pk_cols.iter().map(|&c| c as usize).collect())
-        .map_err(|e| GnitzSqlError::Unsupported(format!("transient output schema is invalid: {e}")))?;
-    let batch = client.run_query(circuit, &schema).map_err(GnitzSqlError::Exec)?;
-    let (schema, batch) = order_limit_passthrough(schema, batch, query.order_by.as_ref(), offset, limit)?;
-    Ok(SqlResult::Rows { schema, batch })
+    })
 }

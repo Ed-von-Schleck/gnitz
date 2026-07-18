@@ -38,7 +38,3 @@ pub use protocol::{
     FLAG_SEEK_BY_INDEX, FLAG_SHUTDOWN, IPC_CONTROL_TID, MAX_COLUMNS, MAX_PK_BYTES, MAX_PK_COLUMNS, META_FLAG_IS_PK,
     META_FLAG_NULLABLE, PK_LIST_MAX_COLS, STATUS_ERROR, STATUS_OK, WAL_BLOCK_HEADER_SIZE,
 };
-pub use types::{
-    circuit_edges_schema, circuit_node_columns_schema, circuit_nodes_schema, col_tab_schema, dep_tab_schema,
-    schema_tab_schema, table_tab_schema, view_tab_schema,
-};

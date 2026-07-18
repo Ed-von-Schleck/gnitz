@@ -21,10 +21,9 @@ pub(crate) mod key;
 
 /// Build a `SchemaDescriptor` from a wire-neutral `WireSysCol` slice (the
 /// canonical system-table column arrays in `gnitz-wire`). The single builder
-/// behind every consumer of those arrays — the catalog's compile-time `SCHEMAS`
-/// statics and the query compiler's `from_owned` cursors over a transient's
-/// delivered circuit-family batches — homed here (L1, below both) so the two
-/// can never drift. `const`: zero runtime allocation.
+/// behind every consumer of those arrays — chiefly the catalog's compile-time
+/// `SCHEMAS` statics — homed here (L1) so they can never drift. `const`: zero
+/// runtime allocation.
 pub(crate) const fn from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_indices: &[u32]) -> SchemaDescriptor {
     let mut buf = [SchemaColumn::new(0, 0); MAX_COLUMNS];
     let mut i = 0;

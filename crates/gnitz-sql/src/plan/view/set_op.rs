@@ -18,16 +18,19 @@ use sqlparser::ast::{SelectItem, SetExpr, SetOperator, SetQuantifier};
 
 /// Resolve a set-op side's FROM: exactly one plain table. A derived table or a
 /// JOIN input is not composed here (set-op branches are not pre-compiled by the
-/// front door), so both reject via the strict extractor / the arity check.
+/// front door), so both reject via the shared FROM-shape check.
 fn resolve_side_source(
     client: &mut GnitzClient,
     binder: &mut Binder<'_>,
     select: &sqlparser::ast::Select,
     context: &str,
 ) -> Result<(u64, std::rc::Rc<Schema>), GnitzSqlError> {
-    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+    if !matches!(
+        crate::ast_util::classify_from(&select.from),
+        crate::ast_util::FromShape::SinglePlainRelation
+    ) {
         return Err(GnitzSqlError::Unsupported(format!(
-            "{context}: only a single table without JOINs is supported"
+            "{context}: only a single plain table without JOINs is supported"
         )));
     }
     let table_name = extract_table_factor_name(&select.from[0].relation, context)?;

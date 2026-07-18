@@ -56,6 +56,13 @@ pub fn read_view(client: &mut GnitzClient, sn: &str, view: &str) -> (Schema, ZSe
     }
 }
 
+/// User-visible column names, lowercased — the read path hidden-prepends the
+/// source PK (and grouped shapes a synthetic key), so a result's client-facing
+/// schema is the visible subset.
+pub fn visible_names(s: &Schema) -> Vec<String> {
+    s.visible_columns().map(|(_, c)| c.name.to_lowercase()).collect()
+}
+
 pub fn col_idx(schema: &Schema, name: &str) -> usize {
     schema
         .columns

@@ -898,10 +898,10 @@ pub(crate) fn resolve_single_plain_from(
     shape_err: &str,
     ctx: &str,
 ) -> Result<(u64, Rc<Schema>, String), GnitzSqlError> {
-    if from.len() != 1
-        || !from[0].joins.is_empty()
-        || matches!(&from[0].relation, sqlparser::ast::TableFactor::Derived { .. })
-    {
+    if !matches!(
+        crate::ast_util::classify_from(from),
+        crate::ast_util::FromShape::SinglePlainRelation
+    ) {
         return Err(GnitzSqlError::Unsupported(shape_err.into()));
     }
     let (name, alias) = extract_table_name_and_alias(&from[0].relation, ctx)?;

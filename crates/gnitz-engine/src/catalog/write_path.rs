@@ -445,24 +445,24 @@ impl CatalogEngine {
                 continue;
             }
 
-            // Reserve the transient (ad-hoc query) id band against every DURABLE
-            // relation, here — the one place an id ENTERS the `dag.tables`
-            // namespace before any mutation. Guarding `allocate_table_id` alone
-            // would not reserve it: the register hooks take the id straight off
-            // the ingested row and `raise_id_counter` it, and the id is
-            // caller-chosen (a client may preset `circuit.view_id`), so a crafted
-            // CREATE VIEW could otherwise register a durable view inside the band.
-            // A transient later allocated at that id would alias it, and the
-            // transient's teardown would unregister and `remove_dir_all` the
-            // user's live view. TABLE_TAB / VIEW_TAB are the only families whose
-            // PK is a `dag.tables` id (index ids are a disjoint namespace —
+            // Enforce the durable relation-id ceiling here — the one place an id
+            // ENTERS the `dag.tables` namespace before any mutation. Guarding
+            // `allocate_table_id` alone would not cover it: the register hooks take
+            // the id straight off the ingested row and `raise_id_counter` it, and
+            // the id is caller-chosen (a client may preset `circuit.view_id`), so a
+            // crafted CREATE VIEW could otherwise register a durable view at or
+            // above the ceiling — a conservative tripwire held safely short of the
+            // u32 physical contract every id narrows to (see `RELATION_ID_CEILING`).
+            // TABLE_TAB / VIEW_TAB are the only families whose PK is a
+            // `dag.tables` id (index ids are a disjoint namespace —
             // `next_index_id`/`SEQ_ID_INDICES` — and index tables live in
             // `entry.index_circuits`, not `dag.tables`).
             if matches!(table_id, TABLE_TAB_ID | VIEW_TAB_ID) {
                 let id = batch.get_pk(i) as i64;
-                if id >= TRANSIENT_ID_BASE {
+                let ceiling = sys_tables::RELATION_ID_CEILING;
+                if id >= ceiling {
                     return Err(format!(
-                        "relation id {id} is in the reserved transient band (>= {TRANSIENT_ID_BASE})"
+                        "relation id {id} is at or above the relation-id ceiling ({ceiling})"
                     ));
                 }
             }

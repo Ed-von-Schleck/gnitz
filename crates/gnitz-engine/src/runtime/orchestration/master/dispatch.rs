@@ -683,10 +683,10 @@ impl MasterDispatcher {
     /// `sal_writer_excl` for the duration; no awaits inside.
     ///
     /// CONTINUE == 0 is the value a plain steady-state relay's `seek_col_idx` has
-    /// always carried. Both the boot backfill collect-loop
-    /// (`collect_acks_and_relay`) and the reactor's `relay_loop` decide the value:
-    /// the latter stamps STOP on an all-pad round, which is what terminates a
-    /// transient's chunked exchange drive.
+    /// always carried. `collect_acks_and_relay` is the sole STOP/CHECKPOINT
+    /// stamper (it terminates a backfill's chunked exchange on an all-pad round);
+    /// the reactor's `relay_loop` serves only steady-state tick exchanges and
+    /// always passes CONTINUE.
     pub(crate) fn emit_relay_with_decision(&mut self, prep: RelayPrepared, decision: u64) -> Result<(), String> {
         let RelayPrepared {
             view_id,
@@ -1264,92 +1264,6 @@ impl MasterDispatcher {
             Some(schema_block.as_slice()),
             &[],
         )
-    }
-
-    // -----------------------------------------------------------------------
-    // Transient (ad-hoc query) group writers
-    // -----------------------------------------------------------------------
-
-    /// Broadcast one of a transient's 3 circuit families as a fire-and-forget PREP
-    /// group: the family batch, `target_id` = the family's `CIRCUIT_*_TAB` id,
-    /// `seek_pk` = the transient's `tid`. Every worker holds it keyed by tid
-    /// (`transient_frames`) until the first drive group builds + registers the
-    /// circuit. No per-worker req_ids and no ACK — the drive groups that follow are
-    /// the barrier, and they cannot be processed before these (same worker, one SAL,
-    /// append order). Does NOT signal: the first drive group always batches behind
-    /// the three prep groups, and its signal wakes the workers for all four.
-    ///
-    /// The tid rides `seek_pk` (u128), never `target_id`: the SAL group header's
-    /// `target_id` is a u32 relation slot, and `target_id` is already spoken for
-    /// here (it names the family).
-    pub(crate) fn broadcast_transient_family(
-        &mut self,
-        tid: i64,
-        family_tid: i64,
-        batch: &Batch,
-    ) -> Result<(), String> {
-        let (schema, schema_block, _safe, _stride) = self.cached_schema_block(family_tid);
-        self.write_broadcast(
-            family_tid,
-            0,
-            FLAG_RUN_TRANSIENT,
-            Some(batch),
-            &schema,
-            &[],
-            tid as u128,
-            Some(schema_block.as_slice()),
-        )
-    }
-
-    /// Emit one transient DRIVE group for `(tid, source)` with per-worker req_ids
-    /// (the caller awaits their ACKs, `run_tick` style). `target_id` = the
-    /// `ScanDelta` source to drive, `seek_pk` = the tid, `seek_col_idx` =
-    /// `single_partition` (the master's all-sources-replicated verdict, which picks
-    /// the worker's output-store shape), and the transient's out-schema as the
-    /// group's schema block, prebuilt once by the caller since it is identical for
-    /// every source (the worker needs it to build the circuit). No per-worker data
-    /// — the source's rows already live on the workers.
-    ///
-    /// Does NOT signal: the caller batches the signal with the SAL write under one
-    /// `sal_writer_excl` window.
-    pub(crate) fn write_run_transient_drive(
-        &mut self,
-        tid: i64,
-        source: i64,
-        single_partition: u64,
-        out_schema: &SchemaDescriptor,
-        schema_block: &[u8],
-        req_ids: &[u64],
-    ) -> Result<(), String> {
-        let none_batches: Vec<Option<&Batch>> = vec![None; req_ids.len()];
-        self.write_group_with_req_ids(
-            source,
-            FLAG_RUN_TRANSIENT,
-            0,
-            &none_batches,
-            out_schema,
-            &[],
-            tid as u128,
-            single_partition,
-            req_ids,
-            -1, /* broadcast: every worker drives its own partition of the source */
-            0,
-            Some(schema_block),
-            &[],
-        )
-    }
-
-    /// Broadcast a transient's teardown: every worker frees its `tables[tid]` /
-    /// `cache[tid]` / `meta[tid]` / held circuit families and removes the
-    /// `_transient/<tid>` scratch tree. Control-only (no batch), idempotent on the
-    /// worker (every removal no-ops when absent). Signals inside.
-    ///
-    /// `target_id` = tid: sound only because a transient id is allocated in a
-    /// high **u32** band (`TRANSIENT_ID_BASE`), so it round-trips the SAL header's
-    /// u32 relation slot exactly.
-    pub(crate) fn broadcast_drop_transient(&mut self, tid: i64) -> Result<(), String> {
-        let schema = SchemaDescriptor::default();
-        self.send_broadcast(tid, 0, FLAG_DROP_TRANSIENT, &schema, &[], 0)
     }
 
     // -----------------------------------------------------------------------

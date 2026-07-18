@@ -147,9 +147,9 @@ fn retain_in_index_range(
 ///
 /// Holds the index cursor and the base cursor **at once**, and neither is
 /// re-opened between chunks: `open_cursor` returns an `Rc` snapshot of the
-/// store's runs, and the ad-hoc transient drive runs concurrently with live
-/// traffic, so re-opening per chunk would give successive chunks different
-/// snapshots — a torn read no full scan can produce. Holding both is safe: a
+/// store's runs held for the whole chunked backfill, so re-opening per chunk
+/// would give successive chunks different snapshots — a torn read no full scan
+/// can produce. Holding both is safe: a
 /// `ReadCursor` owns `Rc<MappedShard>` / `Rc<Batch>`, which pins the mmap rather
 /// than the file, and memtable runs are never mutated in place.
 pub(crate) struct BoundedIndexCursor {

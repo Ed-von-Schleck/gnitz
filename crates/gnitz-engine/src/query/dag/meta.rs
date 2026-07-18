@@ -26,13 +26,7 @@ pub(super) struct ViewMeta {
 
 impl ViewMeta {
     /// Derive the metadata from an already-loaded circuit. The body behind
-    /// `view_meta`'s memo miss, factored out so a **transient** — whose circuit
-    /// arrives in its request frame and never reaches the sys tables — can have
-    /// its `ViewMeta` pre-injected into the memo at register time. Without that
-    /// injection `view_meta` would take its memo miss, read the (empty) sys
-    /// tables for the transient's id, and memoize a `LoadedCircuit::default()`:
-    /// empty `shard_cols` and `range_join_n_eq = None`, which silently mis-routes
-    /// the master's exchange relay.
+    /// `view_meta`'s memo miss.
     ///
     /// `loaded` MUST already be `topo_sort`ed: `compute_join_shard_map` walks
     /// `loaded.outgoing`, which only `topo_sort` populates.
@@ -146,7 +140,7 @@ impl DagEngine {
     /// a *rebuilt* source view's output store would otherwise be missed by a
     /// dependency-only walk.
     pub fn all_scan_source_ids(&self, view_id: i64) -> Vec<i64> {
-        compiler::scan_source_ids(&self.load_meta_circuit(view_id), true)
+        compiler::scan_source_ids(&self.load_meta_circuit(view_id))
     }
 
     /// Transitive dependent closure of `seeds` over the view dependency map:
@@ -257,24 +251,7 @@ impl DagEngine {
     /// answers the question off the dependency map with no circuit load and no
     /// allocation. Reads LIVE table flags per call (never baked into a plan or
     /// meta cache): the flag changes with table registration.
-    ///
-    /// A **transient** is never in the DepTab (its `ScanDelta` sources are derived
-    /// from its delivered circuit, not recorded as dependencies), so the DepTab
-    /// path would read "no sources" and answer `false` for it. That is not merely
-    /// conservative here — it is wrong in both directions of the caller set: the
-    /// worker's `execute_multi_worker_step` would exchange every worker's full
-    /// local result for an all-replicated transient and N×-overcount the weights,
-    /// and the master's scan (via the `relation_output_is_replicated`
-    /// fall-through) would broadcast N duplicate copies to the client. Answer it
-    /// from the verdict the master derived from the circuit and stamped on the
-    /// registered schema at `register_transient_meta`, which is exactly this
-    /// predicate for a transient and reaches every worker in the drive group.
     pub(crate) fn view_all_sources_replicated(&mut self, view_id: i64) -> bool {
-        if let Some(e) = self.tables.get(&view_id) {
-            if !e.kind.in_dep_tab() {
-                return e.schema.replicated();
-            }
-        }
         self.get_dep_map();
         let Some(sources) = self.dep.reverse.get(&view_id) else {
             return false;

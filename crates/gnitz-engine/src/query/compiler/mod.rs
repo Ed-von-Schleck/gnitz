@@ -19,8 +19,8 @@ use optimize::*;
 
 pub(crate) use emit::is_worker_scratch_dir_name;
 pub(crate) use load::{
-    build_loaded_from_batches, circuit_range_join_n_eq, circuit_source_bound, load_circuit,
-    reindex_cols_through_filters, scan_source_ids, scan_tid_through_filters, topo_sort,
+    circuit_range_join_n_eq, circuit_source_bound, load_circuit, reindex_cols_through_filters, scan_source_ids,
+    scan_tid_through_filters, topo_sort,
 };
 pub(crate) use optimize::compute_join_shard_map;
 
@@ -314,7 +314,8 @@ fn finalize_side(
     Ok(schema)
 }
 
-/// Compile a circuit for a single view.
+/// Compile a circuit for a single view: read the circuit from the system
+/// tables, then `topo_sort` → annotate → optimize → `build_plan`.
 ///
 /// # Safety
 /// All table handles must be valid pointers or null.
@@ -327,28 +328,9 @@ pub(crate) unsafe fn compile_view(
     view_dir: &str,
     view_schema: &SchemaDescriptor,
     ext_tables: &ExtTables,
-    recovery: RecoverySource,
 ) -> Result<CompileOutput, CompileError> {
-    let loaded =
+    let mut loaded =
         load_circuit(sys_nodes, sys_edges, sys_node_cols, view_id, *view_schema).ok_or(CompileError::LoadFailed)?;
-    compile_loaded(loaded, view_dir, view_id, ext_tables, recovery)
-}
-
-/// Compile an already-loaded circuit into a runnable plan. The sys-table-free
-/// half of `compile_view`: `topo_sort` → annotate → optimize → `build_plan`,
-/// operating only on the in-memory `LoadedCircuit` + the resident `ext_tables`
-/// map (no raw table pointers, hence safe). Shared by CREATE VIEW (via
-/// `compile_view`, which reads the circuit from the sys tables) and the
-/// transient executor (which builds the `LoadedCircuit` from a delivered
-/// `FLAG_RUN_TRANSIENT` frame — `load::build_loaded_from_batches` — and never
-/// touches the sys tables).
-pub(crate) fn compile_loaded(
-    mut loaded: LoadedCircuit,
-    view_dir: &str,
-    view_id: u64,
-    ext_tables: &ExtTables,
-    recovery: RecoverySource,
-) -> Result<CompileOutput, CompileError> {
     if loaded.nodes.is_empty() {
         return Err(CompileError::EmptyCircuit);
     }
@@ -386,17 +368,7 @@ pub(crate) fn compile_loaded(
     match exchange_nids.len() {
         0 => {
             let ordered = loaded.ordered.clone();
-            let plan = build_plan(
-                &loaded,
-                &skip_nodes,
-                &ordered,
-                ext_tables,
-                view_dir,
-                view_id,
-                recovery,
-                None,
-                &[],
-            )?;
+            let plan = build_plan(&loaded, &skip_nodes, &ordered, ext_tables, view_dir, view_id, None, &[])?;
             Ok(annotated(PlanShape::Single(plan.into_sub_plan())))
         }
         // One or two exchange boundaries: carve each side out by the ancestors
@@ -430,7 +402,6 @@ pub(crate) fn compile_loaded(
                     ext_tables,
                     view_dir,
                     view_id,
-                    recovery,
                     Some(ex_in),
                     &[],
                 )?;
@@ -446,7 +417,6 @@ pub(crate) fn compile_loaded(
                 ext_tables,
                 view_dir,
                 view_id,
-                recovery,
                 None,
                 &exchange_inputs,
             )?;
@@ -800,7 +770,6 @@ mod tests {
             &ext_tables,
             "/nonexistent_gnitz_test_path_xyz_abc",
             99,
-            test_recovery(),
             None,
             &[],
         );
@@ -823,17 +792,7 @@ mod tests {
             ..Default::default()
         };
         let ordered: Vec<i32> = (0..n).collect();
-        let result = build_plan(
-            &loaded,
-            &no_skips(),
-            &ordered,
-            &HashMap::new(),
-            "",
-            1,
-            test_recovery(),
-            None,
-            &[],
-        );
+        let result = build_plan(&loaded, &no_skips(), &ordered, &HashMap::new(), "", 1, None, &[]);
         assert!(
             result.is_err(),
             "build_plan must fail when register count exceeds u16::MAX"
@@ -882,18 +841,7 @@ mod tests {
             let loaded = make_loaded(nodes, edges);
             let ext: ExtTables = HashMap::from([(10, in_schema)]);
             let ordered = loaded.ordered.clone();
-            let some = build_plan(
-                &loaded,
-                &no_skips(),
-                &ordered,
-                &ext,
-                &view_dir,
-                1,
-                test_recovery(),
-                Some(2),
-                &[],
-            )
-            .is_ok();
+            let some = build_plan(&loaded, &no_skips(), &ordered, &ext, &view_dir, 1, Some(2), &[]).is_ok();
             let _ = std::fs::remove_dir_all(&view_dir);
             some
         };
@@ -941,18 +889,7 @@ mod tests {
             let loaded = make_loaded(nodes, edges);
             let ext: ExtTables = HashMap::from([(10, in_schema)]);
             let ordered = loaded.ordered.clone();
-            let some = build_plan(
-                &loaded,
-                &no_skips(),
-                &ordered,
-                &ext,
-                &view_dir,
-                1,
-                test_recovery(),
-                Some(2),
-                &[],
-            )
-            .is_ok();
+            let some = build_plan(&loaded, &no_skips(), &ordered, &ext, &view_dir, 1, Some(2), &[]).is_ok();
             let _ = std::fs::remove_dir_all(&view_dir);
             some
         };
@@ -1031,17 +968,7 @@ mod tests {
         let loaded = make_loaded(nodes, edges);
         let ext: ExtTables = HashMap::from([(10, schema), (20, schema)]);
         let ordered = loaded.ordered.clone();
-        let result = build_plan(
-            &loaded,
-            &no_skips(),
-            &ordered,
-            &ext,
-            "",
-            1,
-            test_recovery(),
-            Some(2),
-            &[],
-        );
+        let result = build_plan(&loaded, &no_skips(), &ordered, &ext, "", 1, Some(2), &[]);
         assert!(
             result.is_ok(),
             "wide-PK Join(DeltaTrace) must compile after byte-API port"
@@ -1069,7 +996,6 @@ mod tests {
             &ext,
             "/nonexistent_gnitz_test_path_integrate_trace",
             99,
-            test_recovery(),
             None,
             &[],
         );
@@ -1108,7 +1034,7 @@ mod tests {
         );
         let ext: ExtTables = HashMap::from([(99, in_schema)]);
         let ordered = loaded.ordered.clone();
-        let result = build_plan(&loaded, &no_skips(), &ordered, &ext, "", 99, test_recovery(), None, &[]);
+        let result = build_plan(&loaded, &no_skips(), &ordered, &ext, "", 99, None, &[]);
         assert!(result.is_err(), "type-mismatched sink schema must be rejected");
     }
 
@@ -1131,7 +1057,7 @@ mod tests {
         loaded.out_schema = in_schema;
         let ext: ExtTables = HashMap::from([(99, in_schema)]);
         let ordered = loaded.ordered.clone();
-        let result = build_plan(&loaded, &no_skips(), &ordered, &ext, "", 99, test_recovery(), None, &[]);
+        let result = build_plan(&loaded, &no_skips(), &ordered, &ext, "", 99, None, &[]);
         assert!(result.is_err(), "corrupt Filter blob must abort compilation");
     }
 
@@ -1155,7 +1081,7 @@ mod tests {
         let in_schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
         let ext: ExtTables = HashMap::from([(99, in_schema)]);
         let ordered = loaded.ordered.clone();
-        let result = build_plan(&loaded, &no_skips(), &ordered, &ext, "", 99, test_recovery(), None, &[]);
+        let result = build_plan(&loaded, &no_skips(), &ordered, &ext, "", 99, None, &[]);
         assert!(result.is_err(), "corrupt Map blob must abort compilation");
     }
 
@@ -1295,7 +1221,7 @@ mod tests {
         loaded.out_schema = reindex_output_schema(&in_schema, &[0u16, 1u16], &[], &[0, 1]);
         let ext: ExtTables = HashMap::from([(99, in_schema)]);
         let ordered = loaded.ordered.clone();
-        let result = build_plan(&loaded, &no_skips(), &ordered, &ext, "", 99, test_recovery(), None, &[]);
+        let result = build_plan(&loaded, &no_skips(), &ordered, &ext, "", 99, None, &[]);
         assert!(
             result.is_ok(),
             "compound (len > 1) reindex must compile after the gate lift"
@@ -1332,7 +1258,7 @@ mod tests {
         let loaded = make_loaded(nodes, edges);
         let ext: ExtTables = HashMap::from([(99, in_schema)]);
         let ordered = loaded.ordered.clone();
-        let result = build_plan(&loaded, &no_skips(), &ordered, &ext, "", 99, test_recovery(), None, &[]);
+        let result = build_plan(&loaded, &no_skips(), &ordered, &ext, "", 99, None, &[]);
         assert!(result.is_err(), "reindex list > MAX_PK_COLUMNS must fail the compile");
     }
 
@@ -1370,7 +1296,7 @@ mod tests {
         loaded.out_schema = reindex_output_schema(&in_schema, &[0u16], &[], &[2]);
         let ext: ExtTables = HashMap::from([(99, in_schema)]);
         let ordered = loaded.ordered.clone();
-        let result = build_plan(&loaded, &no_skips(), &ordered, &ext, "", 99, test_recovery(), None, &[]);
+        let result = build_plan(&loaded, &no_skips(), &ordered, &ext, "", 99, None, &[]);
         assert!(result.is_ok(), "pruned reindex must compile to the derived schema");
     }
 
@@ -1405,7 +1331,7 @@ mod tests {
         );
         let ext: ExtTables = HashMap::from([(99, in_schema)]);
         let ordered = loaded.ordered.clone();
-        let result = build_plan(&loaded, &no_skips(), &ordered, &ext, "", 99, test_recovery(), None, &[]);
+        let result = build_plan(&loaded, &no_skips(), &ordered, &ext, "", 99, None, &[]);
         assert!(result.is_err(), "out-of-range program copy must fail the compile");
     }
 
@@ -1452,7 +1378,6 @@ mod tests {
             &ext,
             "/nonexistent_gnitz_scratch_cleanup_test_path",
             1,
-            test_recovery(),
             Some(2),
             &[],
         );
@@ -1686,18 +1611,7 @@ mod tests {
         let loaded = make_loaded(nodes, edges);
         let ext: ExtTables = HashMap::from([(10, in_schema)]);
         let ordered = loaded.ordered.clone();
-        let some = build_plan(
-            &loaded,
-            &no_skips(),
-            &ordered,
-            &ext,
-            &view_dir,
-            1,
-            test_recovery(),
-            Some(2),
-            &[],
-        )
-        .is_ok();
+        let some = build_plan(&loaded, &no_skips(), &ordered, &ext, &view_dir, 1, Some(2), &[]).is_ok();
         let _ = std::fs::remove_dir_all(&view_dir);
         some
     }
@@ -1821,77 +1735,15 @@ mod tests {
         HashSet::new()
     }
 
-    /// The transient frame's trust boundary. `build_loaded_from_batches` reads a
-    /// FRESH, UNTRUSTED, per-request circuit straight off the wire — unlike
-    /// `load_circuit`, whose sys-table rows the engine itself wrote. A node id
-    /// outside positive `i32` must abort the whole load rather than silently
-    /// truncate into a colliding engine key (a wrapped id would alias another
-    /// node, re-wiring the circuit into one the client never sent).
-    ///
-    /// Aborting the WHOLE load is the point: silently skipping the bad row would
-    /// strand its edges, yielding an invalid topological order or silent output
-    /// corruption.
-    #[test]
-    fn build_loaded_from_batches_rejects_out_of_range_node_id() {
-        use crate::storage::{Batch, BatchBuilder};
-        let vid = gnitz_wire::TRANSIENT_PROVISIONAL_VIEW_ID;
-        let fam = |cols| crate::schema::from_wire_cols(cols, gnitz_wire::CIRCUIT_FAMILY_PK);
-
-        // One ScanDelta node, under the provisional view-id prefix, with a
-        // `node_id` the client chose. `sub` (the compound PK's low half) is 0.
-        let nodes_batch = |node_id: u64| {
-            let mut bb = BatchBuilder::new(fam(gnitz_wire::CIRCUIT_NODES_COLS));
-            bb.begin_row((vid as u128) << 64, 1);
-            bb.put_u64(node_id); // node_id
-            bb.put_u64(gnitz_wire::OPCODE_SCAN_DELTA); // opcode
-            bb.put_u64(42); // source_table
-            bb.put_null(); // expr_program
-            bb.end_row();
-            std::rc::Rc::new(bb.finish())
-        };
-        let empty = |cols| std::rc::Rc::new(Batch::with_schema(fam(cols), 0));
-
-        // Sanity: the same frame with an in-range id DOES load, so the rejection
-        // below is attributable to the id and nothing else.
-        assert!(
-            build_loaded_from_batches(
-                nodes_batch(7),
-                empty(gnitz_wire::CIRCUIT_EDGES_COLS),
-                empty(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS),
-                vid,
-                SchemaDescriptor::default(),
-            )
-            .is_some(),
-            "an in-range node id must load"
-        );
-
-        for bad in [i32::MAX as u64 + 1, u64::MAX, 1 << 40] {
-            assert!(
-                build_loaded_from_batches(
-                    nodes_batch(bad),
-                    empty(gnitz_wire::CIRCUIT_EDGES_COLS),
-                    empty(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS),
-                    vid,
-                    SchemaDescriptor::default(),
-                )
-                .is_none(),
-                "node id {bad} is outside positive i32 and must abort the load, not truncate"
-            );
-        }
-    }
-
     /// `scan_source_ids` returns the deduped source set of a 2-way join circuit
-    /// — `ScanTrace` only when asked — and, the property the master's drive
-    /// order rests on, is DETERMINISTIC. `loaded.nodes` is a `HashMap`, so a
-    /// naive `values()` walk would return the sources in a per-process-random
-    /// order; the ascending-node-id walk pins it.
+    /// — `ScanTrace` targets included — and is DETERMINISTIC. `loaded.nodes` is
+    /// a `HashMap`, so a naive `values()` walk would return the sources in a
+    /// per-process-random order; the ascending-node-id walk pins it.
     #[test]
     fn scan_source_ids_dedups_gates_scan_trace_and_is_deterministic() {
         let build = || {
             let mut nodes: HashMap<i32, gnitz_wire::OpNode> = HashMap::new();
-            // Two sources, one of them scanned twice (dedup), plus a ScanTrace
-            // that only the `include_trace` walk returns (a read-only ext_trace
-            // lookup no drive seeds).
+            // Two sources, one of them scanned twice (dedup), plus a ScanTrace.
             nodes.insert(0, scan_delta(20));
             nodes.insert(1, scan_delta(10));
             nodes.insert(2, scan_delta(20));
@@ -1900,31 +1752,16 @@ mod tests {
             make_loaded(nodes, vec![])
         };
 
-        let got = scan_source_ids(&build(), false);
+        let got = scan_source_ids(&build());
         assert_eq!(
             got,
-            vec![20, 10],
-            "ScanDelta set in ascending node-id order, deduped, ScanTrace(30) excluded"
-        );
-        assert_eq!(
-            scan_source_ids(&build(), true),
             vec![20, 10, 30],
-            "include_trace adds the ScanTrace target, same deterministic order"
+            "ScanDelta sources then the ScanTrace target, ascending node-id order, deduped"
         );
         // Determinism: re-deriving from an identically-shaped circuit must not
         // depend on HashMap iteration order.
         for _ in 0..16 {
-            assert_eq!(scan_source_ids(&build(), false), got, "drive order must be stable");
-        }
-    }
-
-    /// The child-table recovery policy these tests compile under: a view's, the
-    /// same one `compile_view_internal` derives from `RelationKind::View`. (A
-    /// transient compiles with `Rederive` instead; `build_plan` is agnostic and
-    /// only forwards it to `Table::new`.)
-    fn test_recovery() -> RecoverySource {
-        RecoverySource::RederiveCheckpointed {
-            committed: crate::foundation::worker_ctx::committed_generation(),
+            assert_eq!(scan_source_ids(&build()), got, "the order must be stable");
         }
     }
 
@@ -1975,17 +1812,7 @@ mod tests {
 
         let ext: ExtTables = HashMap::from([(10, two_col_schema())]);
         let ordered = loaded.ordered.clone();
-        let result = build_plan(
-            &loaded,
-            &no_skips(),
-            &ordered,
-            &ext,
-            &view_dir,
-            1,
-            test_recovery(),
-            Some(3),
-            &[],
-        );
+        let result = build_plan(&loaded, &no_skips(), &ordered, &ext, &view_dir, 1, Some(3), &[]);
         let _ = std::fs::remove_dir_all(&view_dir);
         assert!(
             result.is_ok(),
@@ -2001,17 +1828,7 @@ mod tests {
         let loaded = make_dtor_fanout(1, 2);
         let ext: ExtTables = HashMap::from([(10, two_col_schema())]);
         let ordered = loaded.ordered.clone();
-        let result = build_plan(
-            &loaded,
-            &no_skips(),
-            &ordered,
-            &ext,
-            "",
-            1,
-            test_recovery(),
-            Some(3),
-            &[],
-        );
+        let result = build_plan(&loaded, &no_skips(), &ordered, &ext, "", 1, Some(3), &[]);
         assert!(
             result.is_err(),
             "destructive-first fan-out must be rejected (return None), not emitted"
@@ -2036,17 +1853,7 @@ mod tests {
 
         let ext: ExtTables = HashMap::from([(10, two_col_schema())]);
         let ordered = loaded.ordered.clone();
-        let result = build_plan(
-            &loaded,
-            &skips,
-            &ordered,
-            &ext,
-            &view_dir,
-            1,
-            test_recovery(),
-            Some(3),
-            &[],
-        );
+        let result = build_plan(&loaded, &skips, &ordered, &ext, &view_dir, 1, Some(3), &[]);
         let _ = std::fs::remove_dir_all(&view_dir);
         assert!(
             result.is_ok(),
@@ -2086,7 +1893,6 @@ mod tests {
             &ext,
             "",
             1,
-            test_recovery(),
             Some(2), // bypass out_schema mismatch check; sink_reg already set by IntegrateSink
             &[],
         );
@@ -2137,7 +1943,6 @@ mod tests {
             &ext,
             "",
             1,
-            test_recovery(),
             Some(2), // bypass out_schema mismatch check
             &[],
         );
@@ -2200,7 +2005,6 @@ mod tests {
             &ext,
             "",
             1,
-            test_recovery(),
             Some(2), // bypass out_schema mismatch; sink_reg set by IntegrateSink
             &[],
         )
@@ -2281,7 +2085,6 @@ mod tests {
             &ext,
             &view_dir,
             1,
-            test_recovery(),
             Some(2), // bypass out_schema mismatch; sink_reg set by IntegrateSink
             &[],
         );

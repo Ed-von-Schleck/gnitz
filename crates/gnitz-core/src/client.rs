@@ -1150,8 +1150,7 @@ impl GnitzClient {
                     dep_a.add_row(pk, 1).u64_val(0); // dep_view_id
                 }
 
-                // 3–5. Materialise the typed circuit into the three-table bundle
-                // (shared with the transient executor, `run_query`).
+                // 3–5. Materialise the typed circuit into the three-table bundle.
                 let rows = pv.circuit.into_rows();
                 append_circuit_rows(&mut nodes_a, &mut edges_a, &mut ncol_a, vid, &rows);
 
@@ -1199,54 +1198,6 @@ impl GnitzClient {
         self.push_ddl(&families)?;
 
         Ok(vids)
-    }
-
-    /// Run a compiled ad-hoc SELECT once as a **transient**: the engine compiles
-    /// the same DBSP circuit a CREATE VIEW would, drives it once over the
-    /// committed base snapshot, streams the result, and discards all state — no
-    /// durable registration, no maintenance. This is the executor path for the
-    /// relational shapes the thin keyseek engine rejects (joins, GROUP BY,
-    /// DISTINCT, set-ops, typed / non-indexed WHERE). Ordering / pagination is a
-    /// separate client-side sink over the returned rows. `out_schema` is the
-    /// circuit's declared output schema (the caller validated it once and reuses
-    /// it for the returned rows).
-    ///
-    /// The circuit's three families ship under the fixed
-    /// `TRANSIENT_PROVISIONAL_VIEW_ID` prefix (the engine allocates the real,
-    /// in-RAM transient id server-side); the output schema rides as a schema block
-    /// so the engine reconstructs its full `pk_indices`. The reply streams back as
-    /// a scan train, reassembled into the result `ZSetBatch` (the circuit's
-    /// accumulated integral over the base, never a per-chunk delta).
-    pub fn run_query(&mut self, circuit: Circuit, out_schema: &Schema) -> Result<ZSetBatch, ClientError> {
-        let vid = gnitz_wire::TRANSIENT_PROVISIONAL_VIEW_ID;
-        let nodes_s = circuit_nodes_schema();
-        let edges_s = circuit_edges_schema();
-        let ncol_s = circuit_node_columns_schema();
-        let mut nodes_batch = ZSetBatch::new(nodes_s);
-        let mut edges_batch = ZSetBatch::new(edges_s);
-        let mut ncol_batch = ZSetBatch::new(ncol_s);
-        {
-            let mut nodes_a = BatchAppender::new(&mut nodes_batch, nodes_s);
-            let mut edges_a = BatchAppender::new(&mut edges_batch, edges_s);
-            let mut ncol_a = BatchAppender::new(&mut ncol_batch, ncol_s);
-            let rows = circuit.into_rows();
-            append_circuit_rows(&mut nodes_a, &mut edges_a, &mut ncol_a, vid, &rows);
-        }
-
-        // The three circuit families, in the canonical
-        // `gnitz_wire::CIRCUIT_FAMILIES` order and always present (an
-        // edge/column-free circuit ships empty families); the engine matches
-        // them by tid and reads the trailing schema block by exclusion.
-        let families: Vec<(u64, &Schema, ZSetBatch)> = vec![
-            (CIRCUIT_NODES_TAB, nodes_s, nodes_batch),
-            (CIRCUIT_EDGES_TAB, edges_s, edges_batch),
-            (CIRCUIT_NODE_COLUMNS_TAB, ncol_s, ncol_batch),
-        ];
-
-        let (_schema, data, _lsn) = self.session.run_transient(&families, out_schema)?;
-        // The reassembled batch is the whole result (empty when the query
-        // selected no rows); the reply's in-frame schema equals `out_schema`.
-        Ok(data.unwrap_or_else(|| ZSetBatch::new(out_schema)))
     }
 
     /// Drop a view and, cascading, every hidden segment view it owns
@@ -1736,10 +1687,9 @@ fn decode_view_record(batch: &ZSetBatch, i: usize) -> Result<ViewRecord, ClientE
 /// Append a circuit's node / edge / node-column rows to the three circuit-family
 /// batch appenders under `vid` (the compound `(view_id, sub)` PK prefix). The
 /// single home for the circuit-family wire layout — the PK packings and the
-/// nullable `source_table` / `expr_program` writers — shared by CREATE VIEW
-/// (`create_view_chain`) and the transient executor (`run_query`), so the two
-/// can never drift. See the convergence invariant in `create_view_chain` for why
-/// `view_id` rides the LOW u128 half.
+/// nullable `source_table` / `expr_program` writers — used by CREATE VIEW
+/// (`create_view_chain`). See the convergence invariant in `create_view_chain`
+/// for why `view_id` rides the LOW u128 half.
 fn append_circuit_rows(
     nodes_a: &mut BatchAppender<'_>,
     edges_a: &mut BatchAppender<'_>,

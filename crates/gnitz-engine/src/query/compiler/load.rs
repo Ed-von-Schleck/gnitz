@@ -37,49 +37,9 @@ fn open_system_cursor(table: *mut Table) -> Option<ReadCursor> {
     Some(t.open_cursor())
 }
 
-pub(crate) fn load_circuit(
-    sys_nodes: *mut Table,
-    sys_edges: *mut Table,
-    sys_node_cols: *mut Table,
-    view_id: u64,
-    out_schema: SchemaDescriptor,
-) -> Option<LoadedCircuit> {
-    let nodes_cur = open_system_cursor(sys_nodes)?;
-    let edges_cur = open_system_cursor(sys_edges)?;
-    let node_cols_cur = open_system_cursor(sys_node_cols)?;
-    assemble_circuit(nodes_cur, edges_cur, node_cols_cur, view_id, out_schema)
-}
-
-/// Build a `LoadedCircuit` from the three circuit families delivered **in a
-/// `FLAG_RUN_TRANSIENT` frame** — fresh, untrusted, per-request wire input,
-/// reusing the exact assembly the sys-table path uses. Each already-decoded
-/// family batch is wrapped in a standalone `ReadCursor` (`from_owned`) — no
-/// `Table`, no scratch dir, no `mkdir` — and the same `(view_id, sub)` OPK-prefix
-/// filter applies (the client packs the provisional `view_id` in the compound
-/// PK's high half exactly as CREATE VIEW does). The node-id `i32` reject in
-/// `assemble_circuit` guards the trust boundary.
-pub(crate) fn build_loaded_from_batches(
-    nodes_batch: std::rc::Rc<crate::storage::Batch>,
-    edges_batch: std::rc::Rc<crate::storage::Batch>,
-    node_cols_batch: std::rc::Rc<crate::storage::Batch>,
-    view_id: u64,
-    out_schema: SchemaDescriptor,
-) -> Option<LoadedCircuit> {
-    // The circuit-family schemas come from the shared wire-column builder
-    // (`schema::from_wire_cols`, compound `(view_id, sub)` PK) — the same
-    // builder the catalog's sys-table `SCHEMAS` statics use, so the cursor
-    // reads the client-encoded batch with byte-identical layout.
-    let fam = |cols| crate::schema::from_wire_cols(cols, gnitz_wire::CIRCUIT_FAMILY_PK);
-    let nodes_cur = ReadCursor::from_owned(&[nodes_batch], fam(gnitz_wire::CIRCUIT_NODES_COLS));
-    let edges_cur = ReadCursor::from_owned(&[edges_batch], fam(gnitz_wire::CIRCUIT_EDGES_COLS));
-    let node_cols_cur = ReadCursor::from_owned(&[node_cols_batch], fam(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS));
-    assemble_circuit(nodes_cur, edges_cur, node_cols_cur, view_id, out_schema)
-}
-
-/// Non-negative-`i32` node-id gate. A durable sys-table id is always in range;
-/// a transient's frame is untrusted, so an id that would truncate into a
-/// colliding engine key is rejected (returns `None`, aborting the load) rather
-/// than silently wrapped.
+/// Non-negative-`i32` node-id gate: an id that would truncate into a colliding
+/// engine key is rejected (returns `None`, aborting the load) rather than
+/// silently wrapped. A durable sys-table id is always in range.
 #[inline]
 fn node_id_i32(v: i64) -> Option<i32> {
     if (0..=i32::MAX as i64).contains(&v) {
@@ -89,18 +49,19 @@ fn node_id_i32(v: i64) -> Option<i32> {
     }
 }
 
-/// Read three positioned circuit cursors (filtered by the `view_id` OPK prefix)
-/// into a `LoadedCircuit` — the shared body behind both `load_circuit` (sys
-/// tables) and `build_loaded_from_batches` (transient frame), so the
-/// node-column `(kind, position)` sort, the `decode_op_node` calls, the node-id
-/// `i32` reject, and the edge-validity check exist exactly once.
-fn assemble_circuit(
-    mut nodes_cur: ReadCursor,
-    mut edges_cur: ReadCursor,
-    mut node_cols_cur: ReadCursor,
+/// Read the three circuit system tables (filtered by the `view_id` OPK prefix)
+/// into a `LoadedCircuit`: the node-column `(kind, position)` sort, the
+/// `decode_op_node` calls, the node-id `i32` reject, and the edge-validity check.
+pub(crate) fn load_circuit(
+    sys_nodes: *mut Table,
+    sys_edges: *mut Table,
+    sys_node_cols: *mut Table,
     view_id: u64,
     out_schema: SchemaDescriptor,
 ) -> Option<LoadedCircuit> {
+    let mut nodes_cur = open_system_cursor(sys_nodes)?;
+    let mut edges_cur = open_system_cursor(sys_edges)?;
+    let mut node_cols_cur = open_system_cursor(sys_node_cols)?;
     let mut nodes: HashMap<i32, gnitz_wire::OpNode> = HashMap::new();
     let mut edges: Vec<(i32, i32, i32)> = Vec::new();
 
@@ -201,36 +162,25 @@ fn assemble_circuit(
     })
 }
 
-/// The distinct scan-source table ids of a loaded circuit. With
-/// `include_trace: false`, only `ScanDelta` — the same set
-/// `Circuit::dependencies()` computes client-side, and the sequence the master
-/// drives a transient's sources in (`ScanTrace` is a read-only `ext_trace`
-/// lookup that no drive seeds, and a SQL-planner circuit never emits one). With
-/// `include_trace: true`, `ScanTrace` targets too — the boot invalid-view
-/// verdict's transitive check needs those as well.
+/// The distinct scan-source table ids of a loaded circuit: every `ScanDelta`
+/// source and every `ScanTrace` target — the boot invalid-view verdict's
+/// transitive check needs both.
 ///
 /// Nodes are walked in ascending node-id order, NOT `loaded.nodes` iteration
 /// order: `nodes` is a `HashMap`, so iterating it directly would return the
-/// sources in a per-process-random sequence and make the drive order
-/// irreproducible across runs of the same query. Node ids are assigned by the
+/// sources in a per-process-random sequence. Node ids are assigned by the
 /// client's circuit builder in construction order, so ascending id tracks the
 /// circuit's own build order, and the walk needs no `topo_sort` precondition
 /// (unlike reading `loaded.ordered`, which is empty until one runs — a silent
 /// "no sources" footgun).
-///
-/// The order is deterministic but NOT correctness-load-bearing: the master
-/// drives one source per epoch, and each epoch's delta joins against the other
-/// sources' already-accumulated traces (the symmetric 2-term bilinear form), so
-/// whichever source is driven last sees every other side in full. Every order
-/// yields the same Z-set, each cross term emitted exactly once.
-pub(crate) fn scan_source_ids(loaded: &LoadedCircuit, include_trace: bool) -> Vec<i64> {
+pub(crate) fn scan_source_ids(loaded: &LoadedCircuit) -> Vec<i64> {
     let mut nids: Vec<i32> = loaded.nodes.keys().copied().collect();
     nids.sort_unstable();
     let mut out: Vec<i64> = Vec::new();
     for nid in nids {
         let t = match loaded.nodes.get(&nid) {
             Some(gnitz_wire::OpNode::ScanDelta { source, .. }) => *source as i64,
-            Some(gnitz_wire::OpNode::ScanTrace(t)) if include_trace => *t as i64,
+            Some(gnitz_wire::OpNode::ScanTrace(t)) => *t as i64,
             _ => continue,
         };
         if !out.contains(&t) {

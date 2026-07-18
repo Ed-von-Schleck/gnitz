@@ -28,8 +28,8 @@ fn view_bound_cols(client: &mut gnitz_core::GnitzClient, sn: &str, name: &str) -
 }
 
 /// The motivating shape: a GROUP BY whose WHERE hits a secondary index compiles a
-/// `ScanDelta` carrying the bound — as a CREATE VIEW and as an ad-hoc SELECT (which
-/// the GROUP BY routes to the executor as a transient).
+/// `ScanDelta` carrying the bound as a CREATE VIEW; the ad-hoc form folds the same
+/// bounded WHERE via the fold sink and must not error.
 #[test]
 fn group_by_over_indexed_equality_carries_a_bound() {
     let srv = ServerHandle::start().unwrap();

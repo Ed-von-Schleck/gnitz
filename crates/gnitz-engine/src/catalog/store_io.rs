@@ -315,7 +315,7 @@ impl CatalogEngine {
         // Must precede `source_scan_bound`: `handle_backfill` reaches here before
         // anything compiles the view, and an uncached plan would silently report
         // "no bound" — the motivating GROUP BY case would full-scan invisibly.
-        // Cache-first and idempotent, so it is also correct for a transient.
+        // Cache-first and idempotent.
         let bound = self
             .dag
             .ensure_compiled(view_id)
@@ -356,8 +356,7 @@ impl CatalogEngine {
         desc: &gnitz_wire::RangeDescriptor,
     ) -> Option<SourceCursor> {
         let Ok((entry, ic)) = self.table_and_index(source, idx_cols) else {
-            // The index was dropped since the plan compiled, or the id is a
-            // remapped transient with no index circuits.
+            // The index was dropped since the plan compiled.
             return Some(SourceCursor::Full(Box::new(self.open_store_cursor(source)?)));
         };
         let (start, end) = match index_range_keys(ic, desc) {

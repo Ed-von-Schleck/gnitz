@@ -13,11 +13,14 @@ mod scalar;
 mod set_op;
 mod simple;
 
-pub(crate) use dispatch::{compile_query_to_circuit, execute_alter_view, execute_create_view};
+pub(crate) use dispatch::{cte_passthrough, execute_alter_view, execute_create_view};
 // The single-relation aggregate analysis + HAVING binding and the bare-column
 // projection resolver double as the ad-hoc fold planner's front end
 // (`dml::select`) — re-exported so the view emitters themselves stay private.
+// `has_scalar_subquery` and `cte_passthrough` back the ad-hoc read route's
+// derivation-rejection / pass-through-CTE gate.
 pub(crate) use group_by::{analyze_group_by, bind_having_expr, HavingCtx};
+pub(crate) use scalar::has_scalar_subquery;
 pub(crate) use set_op::resolve_set_projection;
 
 use crate::error::GnitzSqlError;
@@ -44,13 +47,6 @@ fn schema_of(cols: &[ColumnDef], pk: &[u32]) -> Rc<Schema> {
 pub(crate) struct ViewChain {
     owner_vid: Option<u64>,
     pub segments: Vec<PlannedView>,
-    /// Id source. `None` — durable CREATE VIEW: every segment id is a real
-    /// `alloc_table_id` server round trip. `Some(next)` — the ad-hoc transient
-    /// path: ids are minted from a **local provisional** counter, never touching
-    /// the durable `SEQ_ID_TABLES` sequence (the master discards them and remaps
-    /// server-side). Both modes flow through `mint_id`, so the segment/owner
-    /// invariants are identical; only the id origin differs.
-    next_local_id: Option<u64>,
 }
 
 impl ViewChain {
@@ -58,40 +54,17 @@ impl ViewChain {
         ViewChain {
             owner_vid: None,
             segments: Vec::new(),
-            next_local_id: None,
         }
     }
 
-    /// A chain for the ad-hoc transient path: ids are minted locally starting at
-    /// `1` (the circuit's provisional `view_id`), with no durable id allocation.
-    pub fn new_transient() -> Self {
-        ViewChain {
-            owner_vid: None,
-            segments: Vec::new(),
-            next_local_id: Some(1),
-        }
-    }
-
-    /// Mint the next segment id: a durable `alloc_table_id` for CREATE VIEW, or
-    /// the next local provisional id for a transient chain.
-    fn mint_id(&mut self, client: &mut GnitzClient) -> Result<u64, GnitzSqlError> {
-        match self.next_local_id.as_mut() {
-            Some(next) => {
-                let id = *next;
-                *next += 1;
-                Ok(id)
-            }
-            None => client.alloc_table_id().map_err(GnitzSqlError::Exec),
-        }
-    }
-
-    /// The final view's id, allocated on first use — a view with no hidden
-    /// segments never pays the allocation before its own emit.
+    /// The final view's id — a durable `alloc_table_id` server round trip,
+    /// allocated on first use so a view with no hidden segments never pays the
+    /// allocation before its own emit.
     pub fn owner_vid(&mut self, client: &mut GnitzClient) -> Result<u64, GnitzSqlError> {
         if let Some(v) = self.owner_vid {
             return Ok(v);
         }
-        let v = self.mint_id(client)?;
+        let v = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
         self.owner_vid = Some(v);
         Ok(v)
     }
@@ -107,7 +80,7 @@ impl ViewChain {
         client: &mut GnitzClient,
         emit: impl FnOnce(&mut GnitzClient, &mut ViewChain, u64) -> Result<EmitPieces, GnitzSqlError>,
     ) -> Result<(u64, Rc<Schema>), GnitzSqlError> {
-        let vid = self.mint_id(client)?;
+        let vid = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
         let (circuit, cols, pk) = emit(client, self, vid)?;
         let schema = schema_of(&cols, &pk);
         self.push_hidden(client, cols, pk, circuit)?;
