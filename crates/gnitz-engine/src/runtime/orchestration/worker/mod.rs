@@ -1816,11 +1816,7 @@ const UNIQUE_PREFLIGHT_SPILL_BYTES: usize = 128 * 1024 * 1024;
 /// worker RAM during the pre-flight is roughly this budget plus the sort index
 /// and one reorder buffer — bounded regardless of partition size.
 fn unique_preflight_spill_bytes() -> usize {
-    std::env::var("GNITZ_UNIQUE_PREFLIGHT_SPILL_BYTES")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(UNIQUE_PREFLIGHT_SPILL_BYTES)
+    crate::foundation::env::env_usize("GNITZ_UNIQUE_PREFLIGHT_SPILL_BYTES", UNIQUE_PREFLIGHT_SPILL_BYTES)
 }
 
 #[cfg(test)]

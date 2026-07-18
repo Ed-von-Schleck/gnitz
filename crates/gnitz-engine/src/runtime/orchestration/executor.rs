@@ -441,12 +441,7 @@ async fn accept_loop(shared: Rc<Shared>, ctx: AcceptCtx) {
 fn tls_hello_timeout() -> std::time::Duration {
     static T: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
-        std::time::Duration::from_millis(
-            std::env::var("GNITZ_TLS_HELLO_TIMEOUT_MS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(15_000),
-        )
+        std::time::Duration::from_millis(crate::foundation::env::env_u64("GNITZ_TLS_HELLO_TIMEOUT_MS", 15_000))
     })
 }
 

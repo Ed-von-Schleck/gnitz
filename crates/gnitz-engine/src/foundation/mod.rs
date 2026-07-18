@@ -3,6 +3,7 @@
 //! layering reads cleanly. The leaves share nothing but being leaves:
 //!   - `log`        — the `gnitz_*` logging macros + level/tag state
 //!   - `codec`      — little-endian byte pack/unpack
+//!   - `env`        — numeric `GNITZ_*` environment-variable overrides
 //!   - `xxh`        — XXH3 hashing
 //!   - `posix_io`   — POSIX I/O and Linux syscall wrappers (file I/O, sockets,
 //!     mmap, eventfd/futex/memfd IPC)
@@ -11,6 +12,7 @@
 #[macro_use]
 pub(crate) mod log;
 pub(crate) mod codec;
+pub(crate) mod env;
 pub(crate) mod posix_io;
 pub(crate) mod worker_ctx;
 pub(crate) mod xxh;

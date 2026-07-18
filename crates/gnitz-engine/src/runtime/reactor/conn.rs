@@ -17,11 +17,7 @@ use super::*;
 pub(crate) fn client_send_timeout() -> std::time::Duration {
     static TIMEOUT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *TIMEOUT.get_or_init(|| {
-        let ms = std::env::var("GNITZ_CLIENT_SEND_TIMEOUT_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(30_000);
-        std::time::Duration::from_millis(ms)
+        std::time::Duration::from_millis(crate::foundation::env::env_u64("GNITZ_CLIENT_SEND_TIMEOUT_MS", 30_000))
     })
 }
 
