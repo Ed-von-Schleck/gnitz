@@ -81,6 +81,10 @@ impl CatalogEngine {
                 self.apply_col_names_invalidate(batch)?;
                 self.apply_fk_constraints(batch)?;
                 self.apply_needs_lock(SysFamily::Column, batch)?;
+                // MUST be last — after `apply_col_names_invalidate` evicts the
+                // cached col defs — so the DROP NOT NULL descriptor rebuild reads
+                // the post-ALTER column defs (§5).
+                self.hook_column_alter(batch)?;
             }
             SysFamily::Index => {
                 self.apply_index_by_name(batch)?;
@@ -406,8 +410,70 @@ impl CatalogEngine {
             pack_column_id(owner_id, 0) as u128,
             pack_column_id(owner_id + 1, 0) as u128,
         );
-        if batch.count > 0 {
-            self.submit(SysFamily::Column, batch)?;
+        // These whole-table COL retractions are part of the owner's drop and run
+        // while the owner is still registered (before `unregister_table`), so the
+        // Column precheck arm's unpaired-`-1` reject must be bypassed — mirror
+        // `cascade_retract_indices`' `with_cascade_drop` guard.
+        self.with_cascade_drop(|s| {
+            if batch.count > 0 {
+                s.submit(SysFamily::Column, batch)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// ALTER … DROP NOT NULL side effect: when a COL_TAB rewrite pair flips a
+    /// base table's column `is_nullable 0→1`, the whole-schema payload comparator
+    /// moves `FixedIntNonnull → Generic`. Rebuild the descriptor from the
+    /// (freshly invalidated) column defs and publish it into the store in place,
+    /// so no path can sort a now-nullable column under the null-blind fast
+    /// comparator and let a NULL consolidate against a real `0` (§5).
+    ///
+    /// Trigger is **batch-shape-derived, never context-derived**: this hook fires
+    /// on live apply, worker sync, and boot replay alike, with no cascade flag, so
+    /// the shape is the only reliable signal. It acts only on a **rewrite pair** —
+    /// a column PK carrying both a `-1` and a `+1` row — whose owner is a
+    /// registered base table. Only a live column ALTER (or its rollback
+    /// compensation) produces one: CREATE TABLE bundles and boot replay are
+    /// all-`+1`, DROP TABLE/VIEW cascades all-`-1` — both skipped wholesale.
+    /// RENAME COLUMN, DROP COLUMN, and an already-nullable DROP NOT NULL pairs
+    /// reach the rebuild and no-op there (`SchemaDescriptor::eq`): none change a
+    /// descriptor field.
+    fn hook_column_alter(&mut self, batch: &Batch) -> Result<(), String> {
+        // Distinct owner tids with a `-1`/`+1` pair (COL_TAB PK = pack_col_id).
+        let mut owners: Vec<i64> = Vec::new();
+        for i in 0..batch.count {
+            if batch.get_weight(i) >= 0 {
+                continue;
+            }
+            let pk = batch.get_pk(i);
+            if !(0..batch.count).any(|j| batch.get_weight(j) > 0 && batch.get_pk(j) == pk) {
+                continue;
+            }
+            let owner = gnitz_wire::unpack_col_id(pk as u64).0 as i64;
+            if !owners.contains(&owner) {
+                owners.push(owner);
+            }
+        }
+        for owner in owners {
+            let Some(entry) = self.dag.tables.get(&owner) else {
+                continue;
+            };
+            if !entry.kind.is_base_table() {
+                continue;
+            }
+            let cur = entry.schema;
+            // Rebuild from the post-invalidate col defs, re-applying the routing
+            // fields `eq` ignores (replicated / dist_prefix_len). Only an
+            // is_nullable 0→1 flip changes the descriptor; when it does, publish
+            // infallibly in place (equal-region descriptor swap).
+            let col_defs = self.read_column_defs(owner);
+            let rebuilt = self
+                .build_schema_from_col_defs(&col_defs, cur.pk_indices(), cur.dist_prefix_len() as usize)
+                .with_replicated(cur.replicated());
+            if rebuilt != cur {
+                self.dag.swap_table_schema(owner, rebuilt);
+            }
         }
         Ok(())
     }

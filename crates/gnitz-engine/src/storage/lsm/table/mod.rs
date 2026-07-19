@@ -363,6 +363,21 @@ impl Table {
         self.shard_index.enable_pk_unique_tagging();
     }
 
+    /// Replace the payload comparator schema in place (ALTER … DROP NOT NULL),
+    /// setting all three comparator holders — the table itself (read cursor /
+    /// consolidation), the memtable (flush comparator) and the shard index
+    /// (compaction comparator) — so no path can still run the stale
+    /// `FixedIntNonnull` comparator against a now-nullable column and let a NULL
+    /// consolidate against a real `0`. The region layout is unchanged, so
+    /// on-disk shards and resident runs stay valid; only `cached_full_scan` must
+    /// be dropped, as it was materialized under the old null interpretation.
+    pub fn swap_schema(&mut self, schema: SchemaDescriptor) {
+        self.schema = schema;
+        self.memtable.swap_schema(schema);
+        self.shard_index.swap_schema(schema);
+        self.cached_full_scan = None;
+    }
+
     // ------------------------------------------------------------------
     // Ingest
     // ------------------------------------------------------------------

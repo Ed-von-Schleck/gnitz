@@ -5,13 +5,14 @@
 //! catalog-only `push_ddl` through the `gnitz-core` client.
 
 use crate::ast_util::extract_name;
-use crate::bind::Binder;
+use crate::bind::{find_unique_column, Binder};
 use crate::error::GnitzSqlError;
 use crate::plan::validate::{reject_unhonored_unique_fields, validate_user_index_name, validate_user_name};
 use crate::SqlResult;
 use gnitz_core::GnitzClient;
 use sqlparser::ast::{
-    AlterColumnOperation, AlterTable, AlterTableOperation, ObjectName, RenameTableNameKind, TableConstraint,
+    AlterColumnOperation, AlterTable, AlterTableOperation, DropBehavior, Ident, ObjectName, RenameTableNameKind,
+    TableConstraint,
 };
 
 pub(crate) fn execute_alter_table(
@@ -62,16 +63,43 @@ pub(crate) fn execute_alter_table(
             &name.value,
             *if_exists,
         ),
-        // DROP COLUMN is plan 4's; reject here without a plan path in the message.
-        AlterTableOperation::DropColumn { .. } => Err(GnitzSqlError::Unsupported(
-            "ALTER TABLE DROP COLUMN is not supported".to_string(),
-        )),
+        AlterTableOperation::DropColumn {
+            column_names,
+            if_exists: col_if_exists,
+            drop_behavior,
+            ..
+        } => drop_column(
+            client,
+            schema_name,
+            &alter.name,
+            alter.if_exists,
+            *col_if_exists,
+            column_names,
+            *drop_behavior,
+        ),
         // ADD COLUMN is plan 2's; reject here (its if_not_exists / column_position
         // FIRST/AFTER included).
         AlterTableOperation::AddColumn { .. } => Err(GnitzSqlError::Unsupported(
             "ALTER TABLE ADD COLUMN is not supported".to_string(),
         )),
-        AlterTableOperation::AlterColumn { op, .. } => reject_alter_column(op),
+        // Destructured per-variant so a newly supported operation is an additive
+        // arm split, and with no plan path in any message.
+        AlterTableOperation::AlterColumn { column_name, op } => {
+            use AlterColumnOperation as Op;
+            let msg = match op {
+                Op::DropNotNull => {
+                    return drop_not_null(client, schema_name, &alter.name, alter.if_exists, &column_name.value)
+                }
+                Op::SetNotNull => "ALTER COLUMN SET NOT NULL is not supported (needs a full-table validation scan)",
+                Op::SetDataType { .. } => "ALTER COLUMN SET DATA TYPE is not supported",
+                Op::SetDefault { .. } => "ALTER COLUMN SET DEFAULT is not supported (no column defaults in gnitz)",
+                Op::DropDefault => "ALTER COLUMN DROP DEFAULT is not supported (no column defaults in gnitz)",
+                Op::AddGenerated { .. } => {
+                    "ALTER COLUMN ADD GENERATED is not supported (no generated columns in gnitz)"
+                }
+            };
+            Err(GnitzSqlError::Unsupported(msg.to_string()))
+        }
         // Every other AlterTableOperation variant (RenameConstraint, DropPrimaryKey,
         // DropForeignKey, ChangeColumn, ModifyColumn, partition/RLS/trigger ops, …):
         // the catch-all reject. A wildcard is safe (no panic) — sqlparser is pinned
@@ -134,6 +162,109 @@ fn rename_column(
         .alter_rename_column(schema_name, &source_name, old_col, new_col)
         .map_err(GnitzSqlError::Exec)?;
     Ok(altered("column", new_col.to_string()))
+}
+
+/// `ALTER TABLE <t> DROP [COLUMN] [IF EXISTS] <c> [CASCADE]` — a **logical** drop:
+/// the column is flagged hidden and kept physically present (zero-filled NOT
+/// NULL, disk never reclaimed — the same as Postgres). `t` must be a base table.
+/// Rejects a PK / SERIAL / FK-child / secondary-index-covered column, a
+/// multi-column drop, and CASCADE; the dependent-view RESTRICT is enforced
+/// engine-side (like DROP TABLE), so it is not re-checked here.
+fn drop_column(
+    client: &mut GnitzClient,
+    schema_name: &str,
+    source: &ObjectName,
+    tbl_if_exists: bool,
+    col_if_exists: bool,
+    column_names: &[Ident],
+    drop_behavior: Option<DropBehavior>,
+) -> Result<SqlResult, GnitzSqlError> {
+    if matches!(drop_behavior, Some(DropBehavior::Cascade)) {
+        return Err(GnitzSqlError::Unsupported(
+            "ALTER TABLE DROP COLUMN CASCADE is not supported (gnitz has no cascadable dependent objects)".to_string(),
+        ));
+    }
+    // sqlparser collapses `DROP a, b` into one op with a multi-name vec.
+    if column_names.len() != 1 {
+        return Err(GnitzSqlError::Unsupported(
+            "ALTER TABLE DROP COLUMN supports exactly one column per statement".to_string(),
+        ));
+    }
+    let col_name = &column_names[0].value;
+    let source_name = extract_name(source, "ALTER TABLE")?;
+    let Some((tid, schema)) =
+        resolve_alter_base_table_with_schema(client, schema_name, &source_name, tbl_if_exists, "DROP COLUMN")?
+    else {
+        return Ok(altered("column", col_name.clone()));
+    };
+
+    let Some(col_idx) = find_unique_column(&schema.columns, col_name)? else {
+        if col_if_exists {
+            return Ok(altered("column", col_name.clone()));
+        }
+        return Err(missing("column", schema_name, col_name));
+    };
+    let cd = &schema.columns[col_idx];
+
+    if schema.pk_cols.contains(&col_idx) {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "cannot DROP COLUMN '{col_name}': it is part of the primary key"
+        )));
+    }
+    if cd.is_serial {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "cannot DROP COLUMN '{col_name}': it is a SERIAL column"
+        )));
+    }
+    if cd.fk_table_id != 0 {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "cannot DROP COLUMN '{col_name}': it carries a foreign key; drop the foreign key first"
+        )));
+    }
+    // Reject a column covered by a secondary index (best-effort UX — a concurrent
+    // CREATE INDEX could still slip one in; the engine does not re-guard, but a
+    // leftover index over the still-NOT-NULL hidden column is harmless and
+    // dormant). One GET_INDICES round-trip; `cols` are physical indices in the
+    // same space as `col_idx`, so a composite-index member is caught.
+    let indexes = client.table_indexes(tid).map_err(GnitzSqlError::Exec)?;
+    if indexes.iter().any(|im| im.cols.as_slice().contains(&(col_idx as u32))) {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "cannot DROP COLUMN '{col_name}': it is covered by a secondary index; DROP the index first"
+        )));
+    }
+
+    client.alter_drop_column(tid, col_idx).map_err(GnitzSqlError::Exec)?;
+    Ok(altered("column", col_name.clone()))
+}
+
+/// `ALTER TABLE <t> ALTER COLUMN <c> DROP NOT NULL` — flips the column's
+/// `is_nullable 0→1`, which (if the table was all-non-null-fixed-int) swaps the
+/// engine comparator `FixedIntNonnull → Generic`. `t` must be a base table; a PK
+/// column is rejected (PK columns are non-nullable). The dependent-view RESTRICT
+/// is enforced engine-side.
+fn drop_not_null(
+    client: &mut GnitzClient,
+    schema_name: &str,
+    source: &ObjectName,
+    tbl_if_exists: bool,
+    col_name: &str,
+) -> Result<SqlResult, GnitzSqlError> {
+    let source_name = extract_name(source, "ALTER TABLE")?;
+    let Some((tid, schema)) =
+        resolve_alter_base_table_with_schema(client, schema_name, &source_name, tbl_if_exists, "DROP NOT NULL")?
+    else {
+        return Ok(altered("column", col_name.to_string()));
+    };
+    let Some(col_idx) = find_unique_column(&schema.columns, col_name)? else {
+        return Err(missing("column", schema_name, col_name));
+    };
+    if schema.pk_cols.contains(&col_idx) {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "cannot DROP NOT NULL on '{col_name}': a primary-key column is non-nullable"
+        )));
+    }
+    client.alter_drop_not_null(tid, col_idx).map_err(GnitzSqlError::Exec)?;
+    Ok(altered("column", col_name.to_string()))
 }
 
 /// `ALTER TABLE <t> ADD CONSTRAINT [n] UNIQUE (cols)` — maps to the CREATE UNIQUE
@@ -206,22 +337,6 @@ fn drop_constraint(
     Ok(altered("constraint", name.to_string()))
 }
 
-/// Reject an `ALTER COLUMN` operation — every variant is unsupported in this plan
-/// (plan 4 flips `DROP NOT NULL` to supported). Destructured per-variant so that
-/// split is additive, and with no plan path in any message.
-fn reject_alter_column(op: &AlterColumnOperation) -> Result<SqlResult, GnitzSqlError> {
-    use AlterColumnOperation as Op;
-    let msg = match op {
-        Op::DropNotNull => "ALTER COLUMN DROP NOT NULL is not supported",
-        Op::SetNotNull => "ALTER COLUMN SET NOT NULL is not supported (needs a full-table validation scan)",
-        Op::SetDataType { .. } => "ALTER COLUMN SET DATA TYPE is not supported",
-        Op::SetDefault { .. } => "ALTER COLUMN SET DEFAULT is not supported (no column defaults in gnitz)",
-        Op::DropDefault => "ALTER COLUMN DROP DEFAULT is not supported (no column defaults in gnitz)",
-        Op::AddGenerated { .. } => "ALTER COLUMN ADD GENERATED is not supported (no generated columns in gnitz)",
-    };
-    Err(GnitzSqlError::Unsupported(msg.to_string()))
-}
-
 // --- shared helpers ---
 
 /// Resolve the ALTER target as a writable base table (validated name, view and
@@ -247,6 +362,26 @@ fn resolve_alter_base_table(
             Ok(Some(id))
         }
     }
+}
+
+/// As [`resolve_alter_base_table`], but also loads the resolved base table's full
+/// physical schema — columns include any hidden (dropped) slot and `pk_cols` are
+/// physical indices — for the DROP COLUMN / DROP NOT NULL column-level guards.
+/// `Ok(None)` is the `IF EXISTS` no-op.
+fn resolve_alter_base_table_with_schema(
+    client: &mut GnitzClient,
+    schema_name: &str,
+    source_name: &str,
+    if_exists: bool,
+    op: &str,
+) -> Result<Option<(u64, gnitz_core::Schema)>, GnitzSqlError> {
+    if resolve_alter_base_table(client, schema_name, source_name, if_exists, op)?.is_none() {
+        return Ok(None);
+    }
+    let (tid, schema) = client
+        .resolve_table_id(schema_name, source_name)
+        .map_err(GnitzSqlError::Exec)?;
+    Ok(Some((tid, schema)))
 }
 
 /// Reject an ALTER of a system relation (id below the user band). The engine's

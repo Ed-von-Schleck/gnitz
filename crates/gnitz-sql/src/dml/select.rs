@@ -219,9 +219,20 @@ pub(crate) fn execute_select(
     // A plain `SELECT *` (no EXCEPT/RENAME/… modifiers) with no WHERE / ORDER BY
     // / LIMIT / OFFSET stays a plain scan (the server's full-scan snapshot cache);
     // the read spec never emits an identity descriptor. A modifier-bearing
-    // wildcard falls through to `plan_read_spec`, which expands it.
+    // wildcard falls through to `plan_read_spec`, which expands it. A DROP
+    // COLUMN'd base table (hidden *payload* slot) also falls through, so
+    // `build_read_projection` filters the dropped slot out of the raw scan
+    // schema/batch (§6) instead of leaking it to the client. A view's hidden
+    // synthetic *key* slots do NOT fall through — they are filtered at
+    // presentation, and the scan path keeps the server's snapshot cache.
     let bare_star = is_bare_wildcard_projection(&select.projection);
-    if bare_star && select.selection.is_none() && query.order_by.is_none() && limit.is_none() && offset == 0 {
+    if bare_star
+        && !schema.has_hidden_payload()
+        && select.selection.is_none()
+        && query.order_by.is_none()
+        && limit.is_none()
+        && offset == 0
+    {
         let (schema_out, batch_opt, _) = client.scan(tid)?;
         let out_schema = schema_out.map(|s| (*s).clone()).unwrap_or_else(|| (*schema).clone());
         let batch = batch_opt.unwrap_or_else(|| ZSetBatch::new(&out_schema));

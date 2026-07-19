@@ -32,8 +32,10 @@ pub struct ColumnDef {
     /// Round-trips through the wire meta-schema (`META_FLAG_HIDDEN`) and
     /// `COL_TAB`. Presentation layers (wildcard expansion, name resolution,
     /// duplicate-name checks, client rows) skip it; physical layout, routing,
-    /// sort, and consolidation are unaffected. Base-table columns are never
-    /// hidden.
+    /// sort, and consolidation are unaffected. A base-table column becomes hidden
+    /// only via `ALTER TABLE … DROP COLUMN` (a logical drop): it stays physically
+    /// present and zero-filled NOT NULL, and is excluded from every name-facing
+    /// surface.
     pub is_hidden: bool,
 }
 
@@ -185,11 +187,28 @@ impl Schema {
     /// `(physical_col_idx, &ColumnDef)`. The index is the column's real position
     /// in the full physical schema — hidden slots are skipped but do not shift
     /// the indices of the visible ones, so every wildcard/presentation surface
-    /// that enumerates through this stays byte-offset-correct. Base-table schemas
-    /// have no hidden columns, so this is the full column list there.
+    /// that enumerates through this stays byte-offset-correct. A base-table schema
+    /// has a hidden column only after `ALTER … DROP COLUMN` (a logical drop); for
+    /// a never-dropped table this is the full column list.
     #[inline]
     pub fn visible_columns(&self) -> impl Iterator<Item = (usize, &ColumnDef)> {
         self.columns.iter().enumerate().filter(|(_, c)| !c.is_hidden)
+    }
+
+    /// True iff any **non-PK** column is hidden — i.e. the schema carries a
+    /// DROP COLUMN'd slot (a logical drop: physically present, zero-filled NOT
+    /// NULL, flagged hidden). A view's synthetic hidden key slots
+    /// (`_join_pk`/`_set_pk`/`_group_pk`, unprojected passthrough PKs) are PK
+    /// columns and do NOT count: they are filtered at presentation, so the
+    /// bare-`SELECT *` / `RETURNING *` fast paths stay on their raw-physical
+    /// passthrough for every view. Only a dropped column forces the
+    /// hidden-filtering projection.
+    #[inline]
+    pub fn has_hidden_payload(&self) -> bool {
+        self.columns
+            .iter()
+            .enumerate()
+            .any(|(i, c)| c.is_hidden && !self.is_pk_col(i))
     }
 
     /// The output-key kind a reduce grouped by `cols` over this schema gets —
@@ -657,6 +676,35 @@ impl ColData {
             ColData::U128s(v) => v.push(0u128),
         }
     }
+
+    /// The empty column of the canonical variant for wire type `tc` — the single
+    /// TypeCode→variant choice ([`ZSetBatch::filler_columns`] and the appenders
+    /// build on it).
+    pub fn empty_for(tc: TypeCode) -> Self {
+        match tc {
+            TypeCode::String => ColData::Strings(vec![]),
+            TypeCode::Blob => ColData::Bytes(vec![]),
+            TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => ColData::U128s(vec![]),
+            _ => ColData::Fixed(vec![]),
+        }
+    }
+
+    /// Append one zero-filled **non-null** cell for a column of wire type `tc` —
+    /// the single filler-cell encoding: a fixed column gets zero bytes, a German
+    /// string/blob an empty `Some` cell, a U128 a `0`. Used per-row for the
+    /// `ALTER … DROP COLUMN` hidden slot (§6) and in bulk by
+    /// [`ZSetBatch::filler_columns`]. Differs from [`Self::push_null`] only for
+    /// Strings/Bytes (`Some("")` vs `None`): the null bit stays **unset**, so the
+    /// cell must be a real value — which keeps validate happy against a NOT-NULL
+    /// column and keeps the table on the `FixedIntNonnull` fast comparator.
+    pub fn push_filler(&mut self, tc: TypeCode) {
+        match self {
+            ColData::Fixed(buf) => buf.extend(std::iter::repeat_n(0u8, tc.wire_stride())),
+            ColData::Strings(v) => v.push(Some(std::string::String::new())),
+            ColData::Bytes(v) => v.push(Some(Vec::new())),
+            ColData::U128s(v) => v.push(0u128),
+        }
+    }
 }
 
 /// True iff payload null-bit `pi` is set in `word` (the column is NULL). The
@@ -719,12 +767,11 @@ impl ZSetBatch {
                 if schema.is_pk_col(ci) {
                     ColData::Fixed(vec![])
                 } else {
-                    match col.type_code {
-                        TypeCode::String => ColData::Strings(vec![Some(String::new()); count]),
-                        TypeCode::Blob => ColData::Bytes(vec![Some(Vec::new()); count]),
-                        TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => ColData::U128s(vec![0u128; count]),
-                        _ => ColData::Fixed(vec![0u8; count * col.type_code.wire_stride()]),
+                    let mut cd = ColData::empty_for(col.type_code);
+                    for _ in 0..count {
+                        cd.push_filler(col.type_code);
                     }
+                    cd
                 }
             })
             .collect()

@@ -333,6 +333,45 @@ impl DagEngine {
         }
     }
 
+    /// Publish a new comparator schema for a registered base table in place
+    /// (ALTER … DROP NOT NULL). Equal-region by construction — the region count,
+    /// PK columns and column widths are unchanged; only a column's nullability
+    /// flips, which downgrades the whole-schema payload comparator
+    /// `FixedIntNonnull → Generic`. Infallible: a pure descriptor replacement is
+    /// the only safe shape (a fallible partial swap is the sole route to a
+    /// persistent half-swap where a NULL could consolidate against a real `0`).
+    ///
+    /// Updates the registry copy (`TableEntry.schema`) and pushes the same value
+    /// down through the store's owned copies —
+    /// `PartitionedTable` → each partition `Table` (table/memtable/shard-index) —
+    /// plus dropping `Table::cached_full_scan`. All copies are `Copy`, so each
+    /// assignment is a byte copy. No run rebuild, no shard reopen, no data
+    /// motion: existing (never-null) rows stay correctly sorted (§2).
+    pub(crate) fn swap_table_schema(&mut self, table_id: i64, schema: SchemaDescriptor) {
+        let entry = self
+            .tables
+            .get_mut(&table_id)
+            .expect("swap_table_schema: table must be registered");
+        // Post-fork the master holds no user partitions, so `as_partitioned_mut`
+        // returns a store with an empty partition set and the swap is the
+        // descriptor-only `TableEntry.schema` update; on every worker the store
+        // has live partitions and the swap fans out to each.
+        if let Some(pt) = entry.handle.as_partitioned_mut() {
+            pt.swap_schema(schema);
+        }
+        entry.schema = schema;
+        // §1 RESTRICT invariant, made load-bearing: no compiled circuit scans an
+        // altered base table (dependent views are rejected at plan time and by
+        // the catalog precheck arm), so no plan-cache invalidation is required.
+        debug_assert!(
+            {
+                let deps = self.get_dep_map();
+                deps.get(&table_id).is_none_or(|v| v.is_empty())
+            },
+            "swap_table_schema: table {table_id} has dependent views; RESTRICT should have rejected the ALTER",
+        );
+    }
+
     // ── Cache management ────────────────────────────────────────────────
 
     /// Drop one view's cached plan + memoized view metadata, leaving it

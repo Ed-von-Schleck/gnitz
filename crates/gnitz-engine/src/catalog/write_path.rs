@@ -331,7 +331,7 @@ impl CatalogEngine {
                 for j in 0..batch.count {
                     if batch.get_pk(j) == pk
                         && batch.get_weight(j) > 0
-                        && compare_rows_except(&schema, lb, 0, batch, j, name_pay) != Ordering::Equal
+                        && compare_rows_except(&schema, lb, 0, batch, j, 1 << name_pay) != Ordering::Equal
                     {
                         return Err("a system-catalog rewrite pair may only change the name".into());
                     }
@@ -343,6 +343,167 @@ impl CatalogEngine {
             }
         }
         Ok(net_dead)
+    }
+
+    /// §3.1: DROP-shape validation for the COL_TAB family, replacing the bare
+    /// retraction contract. Runs only on the master live-DDL `submit` path (worker
+    /// `ddl_sync` and SAL recovery bypass precheck). Enforces, per distinct column
+    /// PK on a registered owner:
+    ///
+    /// - **At most one row per sign** — a live ALTER is exactly one rewrite pair;
+    ///   nothing legitimate repeats a sign on one column PK.
+    /// - **CAS + net** (kept from the contract): the `-1` byte-equals the live
+    ///   row; per-PK `net ∈ {0,1}`.
+    /// - **Rewrite pair** (`-1` + `+1`, same id): every payload field other than
+    ///   `{name, is_hidden, is_nullable}` must match, and `is_hidden` /
+    ///   `is_nullable` may change only `0→1` (forward path; compensation replays
+    ///   `1→0` through `submit_local`, which bypasses precheck).
+    /// - **Transition-scoped guards** (load-bearing — a blanket guard would regress
+    ///   RENAME): a `name`-only pair (RENAME COLUMN) is always accepted; an
+    ///   `is_hidden 0→1` (DROP COLUMN) or `is_nullable 0→1` (DROP NOT NULL) pair
+    ///   requires the owner to be a registered user base table (not a view, not
+    ///   system-range) with **no dependent views**, and the column not to be a PK
+    ///   column.
+    /// - **Unpaired `-1`** on a registered owner is rejected (physical column
+    ///   removal does not exist); **unpaired `+1`** is rejected (no column-append
+    ///   feature). An unregistered owner is a live CREATE TABLE COL append (the
+    ///   owner table registers later in the bundle), so `+1`-only rows pass.
+    fn precheck_column_family(&mut self, batch: &Batch) -> Result<(), String> {
+        let schema = sys_tab_schema(COL_TAB_ID);
+        // The payload fields a rewrite pair may change; everything else must match.
+        let pair_mask: u64 = (1 << COLTAB_PAY_NAME) | (1 << COLTAB_PAY_IS_HIDDEN) | (1 << COLTAB_PAY_IS_NULLABLE);
+        let mut seen: Vec<u128> = Vec::new();
+        for i in 0..batch.count {
+            let pk = batch.get_pk(i);
+            if seen.contains(&pk) {
+                continue;
+            }
+            seen.push(pk);
+            let owner_id = gnitz_wire::unpack_col_id(pk as u64).0 as i64;
+
+            // Per-PK batch signature + the -1/+1 row indices for the pair check.
+            let mut batch_sum = 0i64;
+            let (mut neg_j, mut pos_j): (Option<usize>, Option<usize>) = (None, None);
+            for j in 0..batch.count {
+                if batch.get_pk(j) != pk || batch.get_weight(j) == 0 {
+                    continue;
+                }
+                let w = batch.get_weight(j);
+                batch_sum += w;
+                let slot = if w < 0 { &mut neg_j } else { &mut pos_j };
+                if slot.replace(j).is_some() {
+                    return Err(format!(
+                        "system-catalog write carries multiple same-sign rows for column {pk}"
+                    ));
+                }
+            }
+
+            // Unregistered owner: a live CREATE TABLE applies COL before TABLE, so
+            // the owner registers later in this bundle. A `+1` append is valid;
+            // a `-1` has no live row to retract.
+            let Some((is_base, owner_schema)) = self
+                .dag
+                .tables
+                .get(&owner_id)
+                .map(|e| (e.kind.is_base_table(), e.schema))
+            else {
+                if neg_j.is_some() {
+                    return Err(format!(
+                        "catalog changed concurrently: retracting a column of unregistered owner {owner_id}"
+                    ));
+                }
+                continue;
+            };
+
+            // (1) CAS: the `-1` must byte-equal the live row.
+            let live = self.seek_live_sys_row(SysFamily::Column, batch.get_pk_bytes(i));
+            if let Some(nj) = neg_j {
+                let Some((lb, _)) = live.as_ref() else {
+                    return Err(
+                        "catalog changed concurrently: retracting a system-catalog column that no longer exists".into(),
+                    );
+                };
+                if compare_rows(&schema, lb, 0, batch, nj) != Ordering::Equal {
+                    return Err(
+                        "catalog changed concurrently: the retracted column row differs from the current one".into(),
+                    );
+                }
+            }
+
+            // (2) Per-PK net ∈ {0,1}.
+            let live_weight = live.as_ref().map_or(0, |(_, w)| *w);
+            let net = live_weight + batch_sum;
+            if !(0..=1).contains(&net) {
+                return Err(format!(
+                    "system-catalog write would leave column {pk} at net weight {net} (expected 0 or 1)"
+                ));
+            }
+
+            match (neg_j, pos_j) {
+                (Some(nj), Some(pj)) => {
+                    // (3) Pair-field delta: every payload field outside
+                    // {name, is_hidden, is_nullable} must match (null- and
+                    // blob-aware, like the CAS).
+                    if compare_rows_except(&schema, batch, nj, batch, pj, pair_mask) != Ordering::Equal {
+                        return Err(
+                            "a column-ALTER rewrite pair may change only name, is_hidden, or is_nullable".into(),
+                        );
+                    }
+                    let hid_old = batch.read_payload_u64(nj, COLTAB_PAY_IS_HIDDEN);
+                    let hid_new = batch.read_payload_u64(pj, COLTAB_PAY_IS_HIDDEN);
+                    let null_old = batch.read_payload_u64(nj, COLTAB_PAY_IS_NULLABLE);
+                    let null_new = batch.read_payload_u64(pj, COLTAB_PAY_IS_NULLABLE);
+                    // Direction: is_hidden / is_nullable only 0→1 (forward path).
+                    if hid_new != hid_old && !(hid_old == 0 && hid_new == 1) {
+                        return Err("a column-ALTER may only set is_hidden 0→1 (DROP COLUMN)".into());
+                    }
+                    if null_new != null_old && !(null_old == 0 && null_new == 1) {
+                        return Err("a column-ALTER may only set is_nullable 0→1 (DROP NOT NULL)".into());
+                    }
+
+                    let is_drop = (hid_old == 0 && hid_new == 1) || (null_old == 0 && null_new == 1);
+                    if is_drop {
+                        // Owner must be a registered user base table; the column
+                        // must not be a PK column.
+                        if !is_base || owner_id < FIRST_USER_TABLE_ID {
+                            return Err(format!(
+                                "cannot DROP COLUMN / DROP NOT NULL on a column of {owner_id}: not a user base table"
+                            ));
+                        }
+                        let col_idx = gnitz_wire::unpack_col_id(pk as u64).1 as u32;
+                        if owner_schema.pk_indices().contains(&col_idx) {
+                            return Err("cannot DROP COLUMN / DROP NOT NULL on a primary-key column".into());
+                        }
+                        // Dependent-view RESTRICT (defense-in-depth; the friendly
+                        // client-side reject is in `plan/alter.rs`). A DROP COLUMN
+                        // / DROP NOT NULL must not proceed while a view scans the
+                        // base table: its operator traces hold re-keyed base rows
+                        // under the pre-ALTER comparator.
+                        if self.dag.get_dep_map().get(&owner_id).is_some_and(|v| !v.is_empty()) {
+                            return Err(format!(
+                                "cannot DROP COLUMN / DROP NOT NULL on table {owner_id}: it has dependent views (drop them first)"
+                            ));
+                        }
+                    }
+                    // name-only / no-op pair (RENAME COLUMN, already-nullable DROP
+                    // NOT NULL): accepted with no further guard — always safe,
+                    // including with dependent views (views bind columns by ordinal).
+                }
+                (Some(_), None) => {
+                    return Err(
+                        "cannot retract a column of a registered table (physical column removal is not supported)"
+                            .into(),
+                    );
+                }
+                (None, Some(_)) => {
+                    return Err(
+                        "cannot append a column to a registered table (ALTER TABLE ADD COLUMN is not supported)".into(),
+                    );
+                }
+                (None, None) => {}
+            }
+        }
+        Ok(())
     }
 
     /// Visit every positive-weight `sys_indices` row whose owner and **exact
@@ -428,7 +589,13 @@ impl CatalogEngine {
             SysFamily::Table => self.precheck_retraction_contract(family, batch, TABTAB_PAY_NAME, true)?,
             SysFamily::View => self.precheck_retraction_contract(family, batch, VIEWTAB_PAY_NAME, true)?,
             SysFamily::Column => {
-                self.precheck_retraction_contract(family, batch, COLTAB_PAY_NAME, false)?;
+                // Whole-table COL retractions during a DROP TABLE/VIEW cascade run
+                // while the owner is still registered and are unpaired `-1`s, which
+                // the arm would reject — the cascade wraps them in `with_cascade_drop`.
+                if self.ctx.in_cascade_drop() {
+                    return Ok(());
+                }
+                self.precheck_column_family(batch)?;
                 return Ok(());
             }
             SysFamily::Schema | SysFamily::Index => Vec::new(),

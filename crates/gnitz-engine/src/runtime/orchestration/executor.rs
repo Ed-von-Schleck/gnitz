@@ -26,8 +26,8 @@ use crate::foundation::posix_io;
 use crate::runtime::tls::{ConnCountGuard, TlsShared};
 
 use crate::catalog::{
-    CatalogEngine, FIRST_USER_TABLE_ID, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB_ID,
-    SEQ_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID,
+    CatalogEngine, COL_TAB_ID, FIRST_USER_TABLE_ID, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS,
+    IDX_TAB_ID, SEQ_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID,
 };
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingTxn};
 use crate::runtime::lsn::ZoneLsnAllocator;
@@ -2037,6 +2037,35 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
     let new_view_ids: Vec<i64> = family_pks_by_sign(&families, VIEW_TAB_ID, true);
     let view_create = !new_view_ids.is_empty();
 
+    // A column ALTER (RENAME COLUMN / DROP COLUMN / DROP NOT NULL) also needs the
+    // tick Quiesce (§4): DROP NOT NULL swaps the base comparator, and a worker
+    // parked in an unrelated exchange-wait would otherwise defer this ALTER's
+    // DdlSync *after* a straggler NULL push under the stale FixedIntNonnull
+    // comparator, silently consolidating a NULL against a real 0. Discriminate
+    // bundle-locally: a COL_TAB row with weight > 0 whose owner tid is a
+    // registered base table. CREATE TABLE applies COL before TABLE (owner not yet
+    // registered → excluded); DROP TABLE cascades columns engine-side (no COL
+    // family in the client bundle → excluded); table/view RENAME carry no COL_TAB.
+    // The flag benignly over-quiesces RENAME COLUMN / DROP COLUMN (neither changes
+    // the comparator) — far simpler than prospectively decoding the new
+    // comparator, and quiescing is always safe. It can only over-quiesce, never
+    // under-quiesce a DROP NOT NULL (which always emits a weight>0 COL row on a
+    // registered base owner). Read lock-free off the single-threaded reactor,
+    // before the write lock.
+    let cat = shared.cat();
+    let column_alter = families.iter().any(|(tid, b)| {
+        *tid == COL_TAB_ID
+            && (0..b.count).any(|i| {
+                b.get_weight(i) > 0
+                    && cat
+                        .dag
+                        .tables
+                        .get(&(gnitz_wire::unpack_col_id(b.get_pk(i) as u64).0 as i64))
+                        .map(|e| e.kind.is_base_table())
+                        .unwrap_or(false)
+            })
+    });
+
     // Drain the committer barrier BEFORE acquiring the catalog write
     // lock. The barrier flushes user-table WAL and waits for worker ACKs (tens
     // of ms under load); holding the write lock across that wait would block
@@ -2053,7 +2082,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
     });
     let _ = rx.await;
 
-    let _tick_gate = if view_create {
+    let _tick_gate = if view_create || column_alter {
         let (acked_tx, acked_rx) = oneshot::channel::<()>();
         let (release_tx, release_rx) = oneshot::channel::<()>();
         shared.tick_tx.send(TickTrigger::Quiesce {

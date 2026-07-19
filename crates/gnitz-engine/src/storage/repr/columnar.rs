@@ -41,18 +41,20 @@ pub(crate) fn compare_rows<A: ColumnarSource, B: ColumnarSource>(
     compare_rows_impl::<false, A, B>(schema, src_a, row_a, src_b, row_b, 0)
 }
 
-/// [`compare_rows`] with one payload column excluded — the catalog CAS's "a
-/// rewrite pair may differ only in `name`" probe. Cold path; `compare_rows`
-/// monomorphizes with the skip test compiled out (`SKIP = false`).
+/// [`compare_rows`] with a set of payload columns excluded (`skip_mask` bit `pi`
+/// skips payload column `pi`; payload count ≤ 64 by the null-word invariant) —
+/// the catalog CAS's "a rewrite pair may differ only in these fields" probe.
+/// Cold path; `compare_rows` monomorphizes with the skip test compiled out
+/// (`SKIP = false`).
 pub(crate) fn compare_rows_except<A: ColumnarSource, B: ColumnarSource>(
     schema: &SchemaDescriptor,
     src_a: &A,
     row_a: usize,
     src_b: &B,
     row_b: usize,
-    skip_pay: usize,
+    skip_mask: u64,
 ) -> Ordering {
-    compare_rows_impl::<true, A, B>(schema, src_a, row_a, src_b, row_b, skip_pay)
+    compare_rows_impl::<true, A, B>(schema, src_a, row_a, src_b, row_b, skip_mask)
 }
 
 #[inline]
@@ -62,13 +64,13 @@ fn compare_rows_impl<const SKIP: bool, A: ColumnarSource, B: ColumnarSource>(
     row_a: usize,
     src_b: &B,
     row_b: usize,
-    skip_pay: usize,
+    skip_mask: u64,
 ) -> Ordering {
     let null_word_a = src_a.get_null_word(row_a);
     let null_word_b = src_b.get_null_word(row_b);
 
     for (payload_col, _ci, col) in schema.payload_columns() {
-        if SKIP && payload_col == skip_pay {
+        if SKIP && (skip_mask >> payload_col) & 1 != 0 {
             continue;
         }
         let null_a = (null_word_a >> payload_col) & 1 != 0;

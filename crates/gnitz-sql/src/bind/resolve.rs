@@ -56,8 +56,9 @@ pub(crate) fn build_alias_map(relations: &[(&str, u64, &Rc<Schema>)]) -> AliasMa
 /// passthrough PK is unresolvable by name everywhere, without pruning any
 /// schema or shifting any offset — and a visible name shared with a hidden
 /// column is not spuriously ambiguous. (The DML sites that resolve names by
-/// hand — INSERT/UPDATE column lists — target base tables only, which never
-/// carry hidden columns.)
+/// hand — INSERT/UPDATE column lists — target base tables, whose only hidden
+/// columns come from DROP COLUMN and are excluded here by the `!c.is_hidden`
+/// filter, so a dropped column is unnameable.)
 pub(crate) fn find_unique_column(columns: &[ColumnDef], col_name: &str) -> Result<Option<usize>, GnitzSqlError> {
     let mut found: Option<usize> = None;
     for (i, c) in columns.iter().enumerate() {

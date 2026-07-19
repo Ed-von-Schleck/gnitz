@@ -158,7 +158,29 @@ fn recover_system_tables_from_sal(sal_ptr: *const u8, catalog: &mut CatalogEngin
             Some(b) if b.count > 0 => b,
             _ => return false,
         };
-        cat.ingest_to_family(msg.target_id as i64, &batch).is_ok()
+        // §3.2: route through `ddl_sync` (→ `apply_local`), NOT `ingest_to_family`
+        // (→ `submit` → `precheck_family`). These rows are master-validated by
+        // definition, and the Column precheck arm would false-reject a replayed
+        // DROP TABLE cascade's independent COL `-1` groups (unpaired on a
+        // still-registered owner) — the swallowed `.is_ok()` would then silently
+        // orphan the column band. `apply_local` still fires hooks, so a DROP NOT
+        // NULL pair in the un-checkpointed SAL tail actually swaps the base
+        // FixedIntNonnull → Generic here, before the post-ALTER NULL pushes
+        // replay. A replay error is now FATAL: a silently-swallowed swap failure
+        // would leave the base under the stale comparator → NULL-vs-0 corruption.
+        // Idempotent on a re-run (cascade `count>0` guard + net-dead register
+        // gate make a re-scan of an already-retracted band a no-op, not an Err),
+        // so fatal-on-Err never aborts a legitimate boot.
+        match cat.ddl_sync(msg.target_id as i64, batch) {
+            Ok(()) => true,
+            Err(e) => crate::gnitz_fatal_abort!(
+                "SAL system-table recovery apply failed (table_id={}, lsn={}): {} — \
+                 aborting before the SAL sentinel is reset",
+                msg.target_id,
+                msg.lsn,
+                e,
+            ),
+        }
     });
 
     if replayed > 0 {

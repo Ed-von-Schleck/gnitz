@@ -1307,35 +1307,78 @@ impl GnitzClient {
         let record = self
             .lookup_table_record(schema_id, &table_name)?
             .ok_or_else(|| ClientError::ServerError(format!("Table '{schema_name}.{table_name}' not found")))?;
-        let tid = record.tid;
+        self.alter_col_pair(
+            record.tid,
+            |columns| {
+                let col_idx = columns
+                    .iter()
+                    .position(|c| !c.is_hidden && c.name.eq_ignore_ascii_case(old_col))
+                    .ok_or_else(|| {
+                        ClientError::ServerError(format!(
+                            "column '{old_col}' not found in '{schema_name}.{table_name}'"
+                        ))
+                    })?;
+                if columns
+                    .iter()
+                    .enumerate()
+                    .any(|(i, c)| i != col_idx && !c.is_hidden && c.name.eq_ignore_ascii_case(new_col))
+                {
+                    return Err(ClientError::ServerError(format!(
+                        "column '{new_col}' already exists in '{schema_name}.{table_name}'"
+                    )));
+                }
+                Ok(col_idx)
+            },
+            |cd| cd.name = new_col.to_string(),
+        )
+    }
 
+    /// `ALTER TABLE … DROP COLUMN` (logical): a `(-1, +1)` COL_TAB rewrite pair on
+    /// the same packed column id — the live row's exact payload at `-1`, only
+    /// `is_hidden` flipped to true at `+1`. The column stays physically present
+    /// (`is_nullable`, `type_code`, position untouched), so the base table keeps
+    /// its comparator. One atomic `push_ddl`; the engine precheck arm validates
+    /// the drop shape and the dependent-view RESTRICT.
+    pub fn alter_drop_column(&mut self, tid: u64, col_idx: usize) -> Result<(), ClientError> {
+        self.alter_col_pair(tid, |cols| visible_at(cols, col_idx, tid), |cd| cd.is_hidden = true)
+    }
+
+    /// `ALTER TABLE … ALTER COLUMN … DROP NOT NULL`: a `(-1, +1)` COL_TAB rewrite
+    /// pair on the same packed column id, only `is_nullable` flipped to true at
+    /// `+1`. Once the catalog reports the column nullable, `ZSetBatch::validate`
+    /// permits a null bit there and the engine swaps the table comparator
+    /// `FixedIntNonnull → Generic` (if the table was all-non-null-fixed-int).
+    pub fn alter_drop_not_null(&mut self, tid: u64, col_idx: usize) -> Result<(), ClientError> {
+        self.alter_col_pair(tid, |cols| visible_at(cols, col_idx, tid), |cd| cd.is_nullable = true)
+    }
+
+    /// Build and push a COL_TAB `(-1, +1)` rewrite pair for one column of base
+    /// table `tid`: `resolve` picks the column from the live catalog entries, the
+    /// live row goes in verbatim at `-1` (stored name preserved, so the engine's
+    /// byte-equality CAS accepts it) and the same row with `flip` applied at `+1`.
+    /// The single client-side pipeline behind RENAME COLUMN, DROP COLUMN, and
+    /// DROP NOT NULL.
+    fn alter_col_pair(
+        &mut self,
+        tid: u64,
+        resolve: impl FnOnce(&[ColumnDef]) -> Result<usize, ClientError>,
+        flip: impl FnOnce(&mut ColumnDef),
+    ) -> Result<(), ClientError> {
         let col_batch = self
             .scan_catalog(COL_TAB)?
             .ok_or_else(|| ClientError::ServerError("COL_TAB is empty".to_string()))?;
         let columns = extract_col_entries(&col_batch, tid, OWNER_KIND_TABLE)?;
-        let col_idx = columns
-            .iter()
-            .position(|c| !c.is_hidden && c.name.eq_ignore_ascii_case(old_col))
-            .ok_or_else(|| {
-                ClientError::ServerError(format!("column '{old_col}' not found in '{schema_name}.{table_name}'"))
-            })?;
-        if columns
-            .iter()
-            .enumerate()
-            .any(|(i, c)| i != col_idx && !c.is_hidden && c.name.eq_ignore_ascii_case(new_col))
-        {
-            return Err(ClientError::ServerError(format!(
-                "column '{new_col}' already exists in '{schema_name}.{table_name}'"
-            )));
-        }
+        let col_idx = resolve(&columns)?;
         let cd = &columns[col_idx];
+        let mut new_cd = cd.clone();
+        flip(&mut new_cd);
 
         let col_s = col_tab_schema();
         let mut cb = ZSetBatch::new(col_s);
         {
             let mut a = BatchAppender::new(&mut cb, col_s);
             append_col_row(&mut a, tid, OWNER_KIND_TABLE, col_idx, &cd.name, cd, -1)?;
-            append_col_row(&mut a, tid, OWNER_KIND_TABLE, col_idx, new_col, cd, 1)?;
+            append_col_row(&mut a, tid, OWNER_KIND_TABLE, col_idx, &new_cd.name, &new_cd, 1)?;
         }
         self.push_ddl(&[(COL_TAB, col_s, cb)])?;
         Ok(())
@@ -1579,6 +1622,17 @@ impl TxnBuffer {
             .flatten()
             .map(move |(pk, &(fam, row))| (*pk, &self.families[fam].2, row))
     }
+}
+
+/// [`GnitzClient::alter_col_pair`] resolver for the visible column at physical
+/// `col_idx` (the planner resolves only visible columns, so an out-of-range or
+/// already-hidden index is a catalog race).
+fn visible_at(columns: &[ColumnDef], col_idx: usize, tid: u64) -> Result<usize, ClientError> {
+    columns
+        .get(col_idx)
+        .filter(|c| !c.is_hidden)
+        .map(|_| col_idx)
+        .ok_or_else(|| ClientError::ServerError(format!("column index {col_idx} not found on table {tid}")))
 }
 
 fn extract_col_entries(col_batch: &ZSetBatch, owner_id: u64, owner_kind: u64) -> Result<Vec<ColumnDef>, ClientError> {

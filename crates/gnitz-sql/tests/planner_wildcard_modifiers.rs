@@ -14,7 +14,6 @@ use common::*;
 
 /// Lowercased names of the *visible* (presentation) columns — the wildcard
 /// modifiers only ever touch these; a hidden synthetic/PK slot is invisible.
-
 fn view_schema(client: &mut GnitzClient, sn: &str, view: &str) -> Schema {
     client.resolve_table_or_view_id(sn, view).unwrap().1
 }

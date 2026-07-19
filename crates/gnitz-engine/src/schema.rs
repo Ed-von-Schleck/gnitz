@@ -472,9 +472,12 @@ impl SchemaDescriptor {
     }
 
     /// Distribution prefix length `k` — leading PK columns rows are hashed by
-    /// (`k == pk_count` for the full-PK default).
+    /// (`k == pk_count` for the full-PK default). Crate-visible so the ALTER …
+    /// DROP NOT NULL descriptor rebuild (`hook_column_alter`) can carry the
+    /// routing prefix across the swap — `SchemaDescriptor::eq` ignores it, so a
+    /// rebuilt descriptor must re-apply it explicitly (§5).
     #[inline]
-    const fn dist_prefix_len(&self) -> u8 {
+    pub(crate) const fn dist_prefix_len(&self) -> u8 {
         self.dist_prefix_len
     }
 

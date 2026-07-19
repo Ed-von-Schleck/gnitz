@@ -56,6 +56,16 @@ impl MemTable {
     fn bloom_capacity(&self) -> u32 {
         (self.max_bytes / 40).max(16) as u32
     }
+
+    /// Replace the payload comparator schema in place (ALTER … DROP NOT NULL).
+    /// The region layout is unchanged (same columns, same widths — only a
+    /// column's nullability flips), so already-resident runs stay valid; the
+    /// flush/consolidation paths (`runs_as_sorted` / `force_consolidate`) read
+    /// `&self.schema` at call time, so they pick up the new (null-aware)
+    /// comparator for every subsequent flush.
+    pub fn swap_schema(&mut self, schema: SchemaDescriptor) {
+        self.schema = schema;
+    }
 }
 
 #[cfg(test)]

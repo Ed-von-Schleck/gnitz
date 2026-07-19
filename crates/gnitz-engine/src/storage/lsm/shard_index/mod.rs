@@ -200,6 +200,15 @@ impl ShardIndex {
             can_tag_pk_unique: false,
         }
     }
+
+    /// Replace the compaction comparator schema in place (ALTER … DROP NOT
+    /// NULL). Shard files are layout-identical across the swap (only a
+    /// column's nullability changes), and `compact_shards` / `ShardEntry::open`
+    /// read `&self.schema` per call, so every subsequent compaction uses the
+    /// new (null-aware) comparator.
+    pub fn swap_schema(&mut self, schema: SchemaDescriptor) {
+        self.schema = schema;
+    }
 }
 
 #[cfg(test)]

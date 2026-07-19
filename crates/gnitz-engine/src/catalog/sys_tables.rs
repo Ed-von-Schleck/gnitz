@@ -53,7 +53,7 @@ pub(super) const SYS_CATALOG_DIRNAME: &str = "_system_catalog";
 pub(super) const SCHEMA_TAB_ID: i64 = gnitz_wire::SCHEMA_TAB as i64;
 pub(crate) const TABLE_TAB_ID: i64 = gnitz_wire::TABLE_TAB as i64;
 pub(crate) const VIEW_TAB_ID: i64 = gnitz_wire::VIEW_TAB as i64;
-pub(super) const COL_TAB_ID: i64 = gnitz_wire::COL_TAB as i64;
+pub(crate) const COL_TAB_ID: i64 = gnitz_wire::COL_TAB as i64;
 pub(crate) const IDX_TAB_ID: i64 = gnitz_wire::IDX_TAB as i64;
 pub(super) const DEP_TAB_ID: i64 = gnitz_wire::DEP_TAB as i64;
 pub(crate) const SEQ_TAB_ID: i64 = gnitz_wire::SEQ_TAB as i64;
@@ -207,6 +207,8 @@ pub(super) const COLTAB_PAY_OWNER_ID: usize = pay_index_in(gnitz_wire::COL_TAB_C
 pub(super) const COLTAB_PAY_COL_IDX: usize = pay_index_in(gnitz_wire::COL_TAB_COLS, "col_idx");
 pub(super) const COLTAB_PAY_FK_TABLE_ID: usize = pay_index_in(gnitz_wire::COL_TAB_COLS, "fk_table_id");
 pub(super) const COLTAB_PAY_FK_COL_IDX: usize = pay_index_in(gnitz_wire::COL_TAB_COLS, "fk_col_idx");
+pub(super) const COLTAB_PAY_IS_NULLABLE: usize = pay_index_in(gnitz_wire::COL_TAB_COLS, "is_nullable");
+pub(super) const COLTAB_PAY_IS_HIDDEN: usize = pay_index_in(gnitz_wire::COL_TAB_COLS, "is_hidden");
 
 pub(super) const IDXTAB_COL_OWNER_ID: usize = col_index_in(gnitz_wire::IDX_TAB_COLS, "owner_id");
 // Holds `pack_pk_cols(&col_indices)` for every row (single- and multi-column

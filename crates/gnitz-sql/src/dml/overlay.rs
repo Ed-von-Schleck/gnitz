@@ -83,8 +83,9 @@ pub(crate) fn buffered_all<'a>(client: &'a GnitzClient, tid: u64) -> Net<'a> {
 
 /// Layer `net` over a committed batch: the committed rows the transaction did
 /// NOT touch, plus its `Present` rows. All copies under `actual` — buffered
-/// batches are layout-identical to the reply (same base table; DDL is barred in
-/// a transaction and base-table columns are never hidden).
+/// batches are layout-identical to the reply: DDL is barred in a transaction, so
+/// both carry the same full physical schema (a DROP COLUMN'd base table has a
+/// hidden slot, but it is zero-filled NOT NULL on both sides — identical bytes).
 ///
 /// An empty `net` (autocommit, or a table the transaction has not touched) is
 /// the identity: the committed batch IS the effective state, returned uncopied.

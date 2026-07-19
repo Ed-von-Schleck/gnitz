@@ -14,7 +14,8 @@ pub(crate) fn reject_duplicate_column_names(cols: &[ColumnDef], context: &str) -
 }
 
 /// Raw-name form of [`reject_duplicate_column_names`], for surfaces that have
-/// only parser-AST names (CREATE TABLE — base-table columns are never hidden).
+/// only parser-AST names (CREATE TABLE — a freshly created column is never
+/// hidden; a base table gains a hidden slot only later, via DROP COLUMN).
 pub(crate) fn reject_duplicate_names<'a>(
     names: impl Iterator<Item = &'a str>,
     context: &str,

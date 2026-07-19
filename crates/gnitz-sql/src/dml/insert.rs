@@ -7,7 +7,7 @@
 use crate::ast_util::{extract_name, object_name_ident};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_value_to_col, ColumnValue};
-use crate::codec::pk_codec::{extract_pk_value, is_null_expr};
+use crate::codec::pk_codec::{extract_pk_value_mapped, is_null_expr};
 use crate::dml::mutate::{build_merged_row, eval_set_expr, resolve_set_target};
 use crate::dml::overlay::effective_row;
 use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
@@ -183,7 +183,19 @@ pub(crate) fn execute_insert(
             .1
     });
     let is_serial = serial_max.is_some();
-    let expected = schema.columns.len() - usize::from(is_serial);
+    // The user supplies one VALUES entry per visible, non-SERIAL column, in schema
+    // order; a dropped (hidden) column and the SERIAL PK take no user value. The
+    // row-invariant map physical ci → VALUES slot (`None` at SERIAL / hidden
+    // slots) drives PK extraction and the payload loop, so a mid-schema hidden
+    // column never consumes a user value (positional remap, §6).
+    let mut slot_of: Vec<Option<usize>> = vec![None; schema.columns.len()];
+    let mut expected = 0usize;
+    for (ci, c) in schema.visible_columns() {
+        if !c.is_serial {
+            slot_of[ci] = Some(expected);
+            expected += 1;
+        }
+    }
     let stride = schema.pk_stride() as u8;
 
     for row in rows {
@@ -218,15 +230,20 @@ pub(crate) fn execute_insert(
             }
             batch.pks.push_tuple(&PkTuple::from_u128(stride, id as u128));
         } else {
-            batch.pks.push_tuple(&extract_pk_value(row, &schema)?);
+            batch.pks.push_tuple(&extract_pk_value_mapped(row, &slot_of, &schema)?);
         }
         batch.weights.push(1);
 
         let mut null_bits: u64 = 0;
         for (payload_idx, ci, col_def) in schema.payload_columns() {
-            // SERIAL-omitted rows are dense over the payload columns; full rows
-            // are schema-indexed.
-            let val_expr = if is_serial { &row[payload_idx] } else { &row[ci] };
+            if col_def.is_hidden {
+                // Logical-dropped column: a zero-filled NOT-NULL filler cell (null
+                // bit left unset), keeping the batch rectangular and the table on
+                // the FixedIntNonnull comparator. The value is unobservable (§6).
+                batch.columns[ci].push_filler(col_def.type_code);
+                continue;
+            }
+            let val_expr = &row[slot_of[ci].expect("a visible payload column has a user value")];
             // Check if this value is NULL and set the null bitmap
             if is_null_expr(val_expr) {
                 null_word_set(&mut null_bits, payload_idx, true);
@@ -485,14 +502,14 @@ fn validate_insert_column_list(columns: &[ObjectName], schema: &Schema) -> Resul
                 .ok_or_else(|| GnitzSqlError::Bind("INSERT column list: column must be a simple identifier".into()))
         })
         .collect::<Result<_, _>>()?;
-    // Expected list = every non-SERIAL column, in schema order. For a non-SERIAL
-    // table this reduces to the full column list in schema order — byte-identical
-    // to the pre-SERIAL behavior, not a regression.
+    // Expected list = every visible (non-hidden), non-SERIAL column, in schema
+    // order. For a table with neither a SERIAL nor a dropped column this reduces
+    // to the full column list in schema order — not a regression. A hidden
+    // (dropped) column is unnameable, so it is excluded from the expected set.
     let expected: Vec<&str> = schema
-        .columns
-        .iter()
-        .filter(|c| !c.is_serial)
-        .map(|c| c.name.as_str())
+        .visible_columns()
+        .filter(|(_, c)| !c.is_serial)
+        .map(|(_, c)| c.name.as_str())
         .collect();
     let matches =
         col_names.len() == expected.len() && col_names.iter().zip(&expected).all(|(c, n)| c.eq_ignore_ascii_case(n));

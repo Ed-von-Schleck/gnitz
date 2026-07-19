@@ -53,9 +53,9 @@ use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, PartitionedTable, ReadCursor, RecoverySource, Routing, Table};
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
+pub(crate) use sys_tables::{COL_TAB_ID, IDX_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID};
 pub(crate) use sys_tables::{FIRST_USER_TABLE_ID, SEQ_TAB_ID};
 pub(crate) use sys_tables::{IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS};
-pub(crate) use sys_tables::{IDX_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID};
 // The fixed system-table schema for a family tid. The production DDL decode
 // reaches it through the `CatalogEngine::sys_family_schema` instance method
 // (preserving the layering); the crate-wide handle exists for the cross-crate

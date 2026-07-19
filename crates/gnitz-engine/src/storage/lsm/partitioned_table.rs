@@ -133,6 +133,17 @@ impl PartitionedTable {
         }
     }
 
+    /// Replace the comparator schema in place across the store and every child
+    /// partition (ALTER … DROP NOT NULL). Routing is unaffected — DROP NOT NULL
+    /// never touches PK columns — but the swap must reach every partition
+    /// atomically so no child keeps the stale `FixedIntNonnull` comparator.
+    pub fn swap_schema(&mut self, schema: SchemaDescriptor) {
+        self.schema = schema;
+        for t in &mut self.tables {
+            t.swap_schema(schema);
+        }
+    }
+
     /// True for a replicated store — one child holding the whole local dataset
     /// at partition 0 (a replicated base table or replicated-derived view). The
     /// bootstrap trim exempts these so partition 0 is never dropped on a worker

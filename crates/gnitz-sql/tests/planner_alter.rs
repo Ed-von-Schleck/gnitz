@@ -272,14 +272,7 @@ fn unsupported_alter_operations_rejected() {
     );
 
     reject_contains(&mut c, &sn, "ALTER TABLE t ADD COLUMN x BIGINT", "ADD COLUMN");
-    reject_contains(&mut c, &sn, "ALTER TABLE t DROP COLUMN a", "DROP COLUMN");
     reject_contains(&mut c, &sn, "ALTER TABLE t ALTER COLUMN a SET NOT NULL", "SET NOT NULL");
-    reject_contains(
-        &mut c,
-        &sn,
-        "ALTER TABLE t ALTER COLUMN a DROP NOT NULL",
-        "DROP NOT NULL",
-    );
     reject_contains(
         &mut c,
         &sn,
@@ -301,4 +294,161 @@ fn unsupported_alter_operations_rejected() {
     );
     // ONLY.
     reject_contains(&mut c, &sn, "ALTER TABLE ONLY t RENAME TO t2", "ONLY");
+}
+
+// ── DROP COLUMN / DROP NOT NULL (plan 4) ────────────────────────────────────
+
+#[test]
+fn drop_column_hides_middle_column_and_remaps_inserts() {
+    let Some(srv) = ServerHandle::start() else { return };
+    let (mut c, sn) = make_planner(&srv);
+    exec(
+        &mut c,
+        &sn,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT)",
+    );
+    exec(&mut c, &sn, "INSERT INTO t VALUES (1, 10, 100)");
+
+    match last(&mut c, &sn, "ALTER TABLE t DROP COLUMN a") {
+        SqlResult::Altered { object, name } => {
+            assert_eq!(object, "column");
+            assert_eq!(name, "a");
+        }
+        other => panic!("expected Altered, got {other:?}"),
+    }
+
+    // `SELECT *` excludes the dropped column (wildcard-leak regression), and the
+    // pre-DROP row reads back unchanged on the visible columns.
+    let (schema, batch) = read_view(&mut c, &sn, "t");
+    assert_eq!(visible_names(&schema), vec!["id".to_string(), "b".to_string()]);
+    let bi = col_idx(&schema, "b");
+    let idi = col_idx(&schema, "id");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(cell_i64(&schema, &batch, bi, 0), 100);
+    assert_eq!(pk_i64_at(&schema, &batch, idi, 0), 1);
+
+    // A new INSERT supplies only the visible columns; the value lands in `b`,
+    // not the dropped slot (positional-remap regression).
+    exec(&mut c, &sn, "INSERT INTO t VALUES (2, 200)");
+    let (s2, b2) = read_view(&mut c, &sn, "t");
+    let (bi2, idi2) = (col_idx(&s2, "b"), col_idx(&s2, "id"));
+    let row2 = (0..b2.len())
+        .find(|&r| pk_i64_at(&s2, &b2, idi2, r) == 2)
+        .expect("row id=2 present");
+    assert_eq!(cell_i64(&s2, &b2, bi2, row2), 200);
+
+    // The dropped column is unnameable: a projection and an explicit-list INSERT
+    // that reference it both error.
+    reject_contains(&mut c, &sn, "SELECT a FROM t", "not found");
+    reject_contains(&mut c, &sn, "INSERT INTO t (id, a, b) VALUES (3, 1, 2)", "column list");
+}
+
+#[test]
+fn drop_column_rejects_pk_multi_cascade_and_missing() {
+    let Some(srv) = ServerHandle::start() else { return };
+    let (mut c, sn) = make_planner(&srv);
+    exec(
+        &mut c,
+        &sn,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT)",
+    );
+
+    reject_contains(&mut c, &sn, "ALTER TABLE t DROP COLUMN id", "primary key");
+    // gnitz's dialect rejects the comma form `DROP COLUMN a, b` at parse time, so
+    // the multi-column guard is defense-in-depth for a directly-built AST; via SQL
+    // text the parser is what rejects it.
+    reject_contains(&mut c, &sn, "ALTER TABLE t DROP COLUMN a, b", "parser");
+    reject_contains(&mut c, &sn, "ALTER TABLE t DROP COLUMN a CASCADE", "cascade");
+    reject_contains(&mut c, &sn, "ALTER TABLE t DROP COLUMN nope", "does not exist");
+    reject_contains(&mut c, &sn, "ALTER TABLE nope DROP COLUMN a", "does not exist");
+    // IF EXISTS on a missing table is a no-op success.
+    assert!(try_exec(&mut c, &sn, "ALTER TABLE IF EXISTS nope DROP COLUMN a").is_ok());
+}
+
+#[test]
+fn drop_column_rejects_index_covered() {
+    let Some(srv) = ServerHandle::start() else { return };
+    let (mut c, sn) = make_planner(&srv);
+    exec(
+        &mut c,
+        &sn,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT)",
+    );
+    exec(&mut c, &sn, "CREATE INDEX ix ON t (a)");
+    // The index covers `a`; DROP COLUMN must reject until the index is dropped.
+    reject_contains(&mut c, &sn, "ALTER TABLE t DROP COLUMN a", "index");
+    // A column NOT covered by the index still drops cleanly.
+    match last(&mut c, &sn, "ALTER TABLE t DROP COLUMN b") {
+        SqlResult::Altered { .. } => {}
+        other => panic!("expected Altered, got {other:?}"),
+    }
+}
+
+#[test]
+fn drop_not_null_permits_null_after() {
+    let Some(srv) = ServerHandle::start() else { return };
+    let (mut c, sn) = make_planner(&srv);
+    // All-fixed-int NOT NULL, so the table is on the FixedIntNonnull fast
+    // comparator and DROP NOT NULL forces the real Generic swap.
+    exec(&mut c, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)");
+    exec(&mut c, &sn, "INSERT INTO t VALUES (1, 100)");
+
+    // A NULL is rejected before the ALTER (NOT NULL column).
+    reject_contains(&mut c, &sn, "INSERT INTO t VALUES (2, NULL)", "null");
+
+    match last(&mut c, &sn, "ALTER TABLE t ALTER COLUMN v DROP NOT NULL") {
+        SqlResult::Altered { object, name } => {
+            assert_eq!(object, "column");
+            assert_eq!(name, "v");
+        }
+        other => panic!("expected Altered, got {other:?}"),
+    }
+
+    // A NULL is now accepted, and the pre-ALTER non-null row still reads back.
+    exec(&mut c, &sn, "INSERT INTO t VALUES (2, NULL)");
+    let (schema, batch) = read_view(&mut c, &sn, "t");
+    assert_eq!(batch.len(), 2, "both rows present after DROP NOT NULL");
+    let (vi, idi) = (col_idx(&schema, "v"), col_idx(&schema, "id"));
+    let row1 = (0..batch.len())
+        .find(|&r| pk_i64_at(&schema, &batch, idi, r) == 1)
+        .expect("row id=1 present");
+    assert_eq!(cell_i64(&schema, &batch, vi, row1), 100);
+}
+
+#[test]
+fn drop_not_null_rejects_pk_column() {
+    let Some(srv) = ServerHandle::start() else { return };
+    let (mut c, sn) = make_planner(&srv);
+    exec(&mut c, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
+    reject_contains(&mut c, &sn, "ALTER TABLE t ALTER COLUMN id DROP NOT NULL", "primary");
+}
+
+#[test]
+fn drop_restrict_dependent_view_but_rename_ok() {
+    let Some(srv) = ServerHandle::start() else { return };
+    let (mut c, sn) = make_planner(&srv);
+    // `a` is NOT NULL so DROP NOT NULL on it is a real transition that reaches the
+    // dependent-view guard (a no-op on an already-nullable column would not).
+    exec(
+        &mut c,
+        &sn,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT NOT NULL, b BIGINT)",
+    );
+    exec(&mut c, &sn, "CREATE VIEW v AS SELECT id, b FROM t");
+
+    // A dependent view blocks DROP COLUMN and DROP NOT NULL of ANY column (the
+    // operator traces hold re-keyed base rows under the pre-ALTER comparator).
+    reject_contains(&mut c, &sn, "ALTER TABLE t DROP COLUMN a", "dependent view");
+    reject_contains(
+        &mut c,
+        &sn,
+        "ALTER TABLE t ALTER COLUMN a DROP NOT NULL",
+        "dependent view",
+    );
+    // But RENAME COLUMN is exempt (guard-scoping regression): it stays supported
+    // with a dependent view, since views bind columns by ordinal.
+    match last(&mut c, &sn, "ALTER TABLE t RENAME COLUMN a TO a2") {
+        SqlResult::Altered { .. } => {}
+        other => panic!("expected Altered, got {other:?}"),
+    }
 }

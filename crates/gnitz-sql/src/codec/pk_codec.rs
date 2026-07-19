@@ -2,7 +2,7 @@
 //! truth.
 //!
 //! `parse_pk_literal_packed` is the single helper through which every INSERT and
-//! SEEK PK literal flows (`extract_pk_value`, plus `try_col_eq_literal` /
+//! SEEK PK literal flows (`extract_pk_value_mapped`, plus `try_col_eq_literal` /
 //! `try_extract_pk_in` in the WHERE planner), so the master cannot route an
 //! INSERT and a DELETE for the same key to different workers.
 
@@ -41,7 +41,7 @@ pub(crate) fn parse_literal_i128(n_str: &str, negated: bool) -> Option<i128> {
 /// wrong rows — the cff7c58-class trap).
 ///
 /// This helper is the single source of truth for INSERT/SEEK PK routing —
-/// `extract_pk_value`, `try_col_eq_literal`, and `try_extract_pk_in` all
+/// `extract_pk_value_mapped`, `try_col_eq_literal`, and `try_extract_pk_in` all
 /// dispatch through it so the master cannot send INSERT and DELETE for the
 /// same key to different workers.
 pub(crate) fn parse_pk_literal_packed(tc: TypeCode, n_str: &str, negated: bool) -> Option<u128> {
@@ -133,20 +133,42 @@ pub(crate) fn parse_one_pk_literal(pk_expr: &Expr, tc: TypeCode, col_name: &str)
     }
 }
 
-/// Extract the primary key from a VALUES row as a `PkTuple`. Walks the PK
-/// columns in pk-list order, dispatches each through `parse_one_pk_literal`,
-/// and copies the column's native LE bytes into the tuple buffer.
+/// Extract the primary key from a VALUES row as a `PkTuple`, walking the PK
+/// columns in pk-list order, dispatching each through `parse_one_pk_literal`,
+/// and copying the column's native LE bytes into the tuple buffer. Test-only
+/// convenience over [`extract_pk_value_mapped`] for rows with the identity
+/// slot map; the INSERT path builds a hidden/SERIAL-aware map.
+#[cfg(test)]
 pub(crate) fn extract_pk_value(row: &[Expr], schema: &Schema) -> Result<PkTuple, GnitzSqlError> {
+    let slot_of: Vec<Option<usize>> = (0..row.len()).map(Some).collect();
+    extract_pk_value_mapped(row, &slot_of, schema)
+}
+
+/// Extract the primary key from a VALUES row as a `PkTuple`. `slot_of` maps each
+/// **physical** column index to its VALUES slot, with `None` for columns that
+/// carry no user value (SERIAL, or a hidden/dropped column). A PK column is
+/// never SERIAL-in-payload nor hidden, so every `pk_indices()` entry maps to
+/// `Some` slot for a well-formed INSERT.
+pub(crate) fn extract_pk_value_mapped(
+    row: &[Expr],
+    slot_of: &[Option<usize>],
+    schema: &Schema,
+) -> Result<PkTuple, GnitzSqlError> {
     let stride = schema.pk_stride() as u8;
     let mut tuple = PkTuple::new(stride);
     let mut off = 0usize;
     for &pi in schema.pk_indices() {
-        let pk_expr = row.get(pi).ok_or_else(|| {
-            GnitzSqlError::Bind(format!(
-                "PK column '{}' missing from INSERT row",
-                schema.columns[pi].name
-            ))
-        })?;
+        let pk_expr = slot_of
+            .get(pi)
+            .copied()
+            .flatten()
+            .and_then(|s| row.get(s))
+            .ok_or_else(|| {
+                GnitzSqlError::Bind(format!(
+                    "PK column '{}' missing from INSERT row",
+                    schema.columns[pi].name
+                ))
+            })?;
         let tc = schema.columns[pi].type_code;
         let v = parse_one_pk_literal(pk_expr, tc, &schema.columns[pi].name)?;
         let w = tc.wire_stride();

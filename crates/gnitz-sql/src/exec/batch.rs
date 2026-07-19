@@ -89,9 +89,12 @@ pub(crate) type Projection = Option<(Schema, Vec<usize>)>;
 /// ordering sink, which sorts in between) can resolve first and [`project`]
 /// after, with no batch copy.
 pub(crate) fn resolve_projection(projection: &[SelectItem], schema: &Schema) -> Result<Projection, GnitzSqlError> {
-    // Only a *bare* `*` is the no-op passthrough; a `* EXCEPT/EXCLUDE/RENAME`
-    // (or a rejected `* REPLACE/ILIKE`) falls through to the expansion arm below.
-    if is_bare_wildcard_projection(projection) {
+    // Only a *bare* `*` on a schema with no hidden payload column is the no-op
+    // passthrough; a `* EXCEPT/EXCLUDE/RENAME` (or a rejected `* REPLACE/ILIKE`),
+    // or a DROP COLUMN'd base table, falls through to the expansion arm below so
+    // the dropped slot is filtered out (§6). A view's hidden *key* slots don't
+    // force the fall-through — the expansion arm keeps them anyway.
+    if is_bare_wildcard_projection(projection) && !schema.has_hidden_payload() {
         return Ok(None);
     }
 
@@ -105,12 +108,18 @@ pub(crate) fn resolve_projection(projection: &[SelectItem], schema: &Schema) -> 
     for item in projection {
         match item {
             SelectItem::Wildcard(_) => {
-                // `SELECT *` on this one-shot surface carries every physical
-                // column (hidden ones included, matching plain-`*` passthrough);
-                // `EXCEPT`/`EXCLUDE`/`RENAME` rewrite by visible name, and
-                // `REPLACE`/`ILIKE` are rejected inside `for_item`.
+                // `SELECT *` excludes a hidden *non-PK* slot — a DROP COLUMN'd base
+                // column (§6) — but KEEPS a hidden PK/key column (a view's synthetic
+                // `_group_pk`/`_join_pk`, an unprojected passthrough PK): it carries
+                // the physical output key and is filtered only at presentation, and
+                // dropping it here would strip the batch of its key and trip the
+                // no-PK-projected guard below. `EXCEPT`/`EXCLUDE`/`RENAME` rewrite by
+                // visible name; `REPLACE`/`ILIKE` are rejected inside `for_item`.
                 let rw = WildcardRewrite::for_item(item, |n| wildcard_name_is_visible(&schema.columns, n), "SELECT")?;
                 for (i, c) in schema.columns.iter().enumerate() {
+                    if c.is_hidden && !schema.is_pk_col(i) {
+                        continue;
+                    }
                     let Some(def) = rw.rewrite_column(c) else { continue };
                     col_indices.push(i);
                     out_defs.push(def);
