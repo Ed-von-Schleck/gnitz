@@ -367,13 +367,9 @@ pub(crate) fn emit_scalar_subquery_pieces(
         final_select.from[0].joins = Vec::new();
     }
     let rel = lower_linear(client, binder, &final_select)?;
-    // A final over the exchange `H` must be fan_out-backfilled after H fills, so
-    // it needs an exchange node; a final over the base outer is backfilled inline.
-    if over_h {
-        simple::emit_linear_sharded(final_vid, rel)
-    } else {
-        simple::emit_linear(final_vid, rel)
-    }
+    // A final over the exchange `H` gets the seeding shard (H is a join segment
+    // on the chain); a final over the base outer is backfilled inline.
+    simple::emit_linear(chain, final_vid, rel)
 }
 
 /// The shared front half of subquery lowering: reject unsupported clauses,

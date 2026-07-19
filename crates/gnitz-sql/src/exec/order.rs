@@ -280,7 +280,7 @@ pub(crate) fn resolve_read_spec_order(
                 visible[*pos - 1]
             }
             OrderTarget::Name(name) => {
-                if let Some(ci) = find_unique_column(out_cols, name)? {
+                if let Some(ci) = find_unique_column(&*out_cols, name)? {
                     ci
                 } else if let Some(src_ci) = find_unique_column(&source_schema.columns, name)? {
                     // A non-projected source column. Any pass-through of it

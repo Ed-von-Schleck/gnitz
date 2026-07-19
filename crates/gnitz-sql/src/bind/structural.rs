@@ -332,15 +332,18 @@ fn bind_nullif<R: Clone, L: LeafBinder<R>>(args: &[&Expr], leaf: &L) -> Result<B
 /// (never null, never — for IS NULL — true), keeping the null-tracking opcode
 /// (which forces `eval_batch`'s slow path — `is_strictly_non_nullable` returns
 /// false on any is_null) out of the program. `nullable` is the caller's
-/// authoritative nullability fact for the value at column `idx` — a schema
+/// authoritative nullability fact for the value referenced by `r` — a schema
 /// column's `is_nullable`, or a HAVING aggregate's structural nullability.
-pub(crate) fn fold_null_test(nullable: bool, idx: usize, want_null: bool) -> BoundExpr {
+/// Generic over the leaf reference `R`: the `usize` runtime leaves reuse it via
+/// inference (`BExpr<usize>` = `BoundExpr`), and the HIR view leaf calls it with
+/// a `HirRef` so both derive the fold from the one function.
+pub(crate) fn fold_null_test<R>(nullable: bool, r: R, want_null: bool) -> BExpr<R> {
     if !nullable {
-        BoundExpr::LitInt(i64::from(!want_null))
+        BExpr::LitInt(i64::from(!want_null))
     } else if want_null {
-        BoundExpr::IsNull(idx)
+        BExpr::IsNull(r)
     } else {
-        BoundExpr::IsNotNull(idx)
+        BExpr::IsNotNull(r)
     }
 }
 

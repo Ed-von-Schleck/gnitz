@@ -59,9 +59,12 @@ pub(crate) fn build_alias_map(relations: &[(&str, u64, &Rc<Schema>)]) -> AliasMa
 /// hand — INSERT/UPDATE column lists — target base tables, whose only hidden
 /// columns come from DROP COLUMN and are excluded here by the `!c.is_hidden`
 /// filter, so a dropped column is unnameable.)
-pub(crate) fn find_unique_column(columns: &[ColumnDef], col_name: &str) -> Result<Option<usize>, GnitzSqlError> {
+pub(crate) fn find_unique_column<'a>(
+    columns: impl IntoIterator<Item = &'a ColumnDef>,
+    col_name: &str,
+) -> Result<Option<usize>, GnitzSqlError> {
     let mut found: Option<usize> = None;
-    for (i, c) in columns.iter().enumerate() {
+    for (i, c) in columns.into_iter().enumerate() {
         if !c.is_hidden && c.name.eq_ignore_ascii_case(col_name) {
             if found.is_some() {
                 return Err(GnitzSqlError::Bind(format!(

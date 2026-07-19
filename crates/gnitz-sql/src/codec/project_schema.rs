@@ -110,7 +110,7 @@ pub(crate) fn compile_projection_map(items: &[ProjItem], schema: &Schema) -> Res
 /// only through a computed expression) is auto-prepended so the view carries
 /// the full source PK verbatim. One loop serves every PK arity — `k == 1`
 /// reduces to a single move-to-front.
-fn place_pk_front(items: &mut Vec<ProjItem>, out_cols: &mut Vec<ColumnDef>, source_schema: &Schema) {
+pub(crate) fn place_pk_front(items: &mut Vec<ProjItem>, out_cols: &mut Vec<ColumnDef>, source_schema: &Schema) {
     for (target, &pk) in source_schema.pk_indices().iter().enumerate() {
         // First occurrence is the canonical physical-PK slot; any later
         // duplicate (SELECT pk, pk AS x) stays in the payload region and is

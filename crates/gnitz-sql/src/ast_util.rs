@@ -747,8 +747,9 @@ impl<'a> WildcardRewrite<'a> {
 /// over a two-`id` join deliberately drops both.
 ///
 /// [`find_unique_column`]: crate::bind::find_unique_column
-pub(crate) fn wildcard_name_is_visible(cols: &[ColumnDef], name: &str) -> bool {
-    cols.iter().any(|c| !c.is_hidden && c.name.eq_ignore_ascii_case(name))
+pub(crate) fn wildcard_name_is_visible<'a>(cols: impl IntoIterator<Item = &'a ColumnDef>, name: &str) -> bool {
+    cols.into_iter()
+        .any(|c| !c.is_hidden && c.name.eq_ignore_ascii_case(name))
 }
 
 /// A plain `*` projection (every item is `Wildcard` with NO modifiers) — a true

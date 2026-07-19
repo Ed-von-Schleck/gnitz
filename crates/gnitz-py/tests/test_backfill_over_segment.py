@@ -1,0 +1,225 @@
+"""E2E: a linear final over an exchange-seeding hidden segment must backfill.
+
+A CREATE VIEW whose final (or an intermediate) circuit is **linear** — no `Join`,
+no `ExchangeShard` — but whose delta source is an in-bundle hidden segment that
+itself seeds a distributed backfill (a grouped or joined CTE / derived table)
+used to silently lose ALL pre-existing base data on the data-before-view path.
+The fix: `simple::emit_linear` detects the seeding source and appends an identity
+`ExchangeShard` on the view PK so it rides the ordered `fan_out_backfill`.
+
+Each test asserts **data-before-view == view-before-data** (weights, not just row
+presence) and that a post-create insert *adds to* the backfilled rows and a
+delete of a backfilled row retracts it weight-correctly. A negative-cost guard
+pins that a linear view over a *linear* CTE is NOT over-sharded.
+
+Run at GNITZ_WORKERS=4 (the exchange/fanout paths only engage at W>1):
+    cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest \
+        tests/test_backfill_over_segment.py -v --tb=short
+"""
+import random
+
+import gnitz  # noqa: F401  (imported for parity with the sibling suites)
+
+OPCODE_EXCHANGE_SHARD = 20
+CIRCUIT_NODES_TAB = 11
+
+
+def _uid():
+    return str(random.randint(100000, 999999))
+
+
+def _cleanup(client, sn, tables=None, views=None):
+    for name in (views or []):
+        try:
+            client.execute_sql(f"DROP VIEW {name}", schema_name=sn)
+        except Exception:
+            pass
+    for name in (tables or []):
+        try:
+            client.execute_sql(f"DROP TABLE {name}", schema_name=sn)
+        except Exception:
+            pass
+    try:
+        client.drop_schema(sn)
+    except Exception:
+        pass
+
+
+def _weights(client, sn, view, cols):
+    """row-tuple over `cols` → net weight, dropping net-zero rows."""
+    vid = client.resolve_table(sn, view)[0]
+    m = {}
+    for r in client.scan(vid):
+        if r.weight == 0:
+            continue
+        d = r._asdict()
+        key = tuple(d[c] for c in cols)
+        m[key] = m.get(key, 0) + r.weight
+    return {k: v for k, v in m.items() if v != 0}
+
+
+def _has_exchange_shard(client, vid):
+    """True iff any `ExchangeShard` (opcode 20) circuit node belongs to `vid`."""
+    return any(
+        r.weight > 0 and r["view_id"] == vid and r["opcode"] == OPCODE_EXCHANGE_SHARD
+        for r in client.scan(CIRCUIT_NODES_TAB)
+    )
+
+
+def test_bfseg_linear_over_grouped_cte(client):
+    """Linear final over a grouped CTE — the canonical repro. Both orderings
+    must agree, and the backfilled rows survive a later insert and a delete."""
+    view = (
+        "CREATE VIEW s AS WITH c AS (SELECT id, SUM(v) AS sv FROM t GROUP BY id) "
+        "SELECT id FROM c WHERE sv > 10"
+    )
+    # data-before-view
+    sn_d = "bfsegd" + _uid()
+    client.create_schema(sn_d)
+    # view-before-data
+    sn_v = "bfsegv" + _uid()
+    client.create_schema(sn_v)
+    try:
+        for sn, view_first in ((sn_d, False), (sn_v, True)):
+            client.execute_sql(
+                "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            if view_first:
+                client.execute_sql(view, schema_name=sn)
+                client.execute_sql("INSERT INTO t VALUES (1, 20), (2, 5)", schema_name=sn)
+            else:
+                client.execute_sql("INSERT INTO t VALUES (1, 20), (2, 5)", schema_name=sn)
+                client.execute_sql(view, schema_name=sn)
+
+        # The backfill (data-before-view) must equal the steady state (view-first).
+        got_d = _weights(client, sn_d, "s", ["id"])
+        got_v = _weights(client, sn_v, "s", ["id"])
+        assert got_d == {(1,): 1}, f"data-before-view lost backfill: {got_d}"
+        assert got_d == got_v, f"backfill != steady state: {got_d} vs {got_v}"
+
+        # A post-create insert ADDS to the backfilled rows (does not replace them).
+        client.execute_sql("INSERT INTO t VALUES (3, 30)", schema_name=sn_d)
+        assert _weights(client, sn_d, "s", ["id"]) == {(1,): 1, (3,): 1}
+
+        # Deleting a backfilled row retracts it weight-correctly.
+        client.execute_sql("DELETE FROM t WHERE id = 1", schema_name=sn_d)
+        assert _weights(client, sn_d, "s", ["id"]) == {(3,): 1}
+    finally:
+        _cleanup(client, sn_d, tables=["t"], views=["s"])
+        _cleanup(client, sn_v, tables=["t"], views=["s"])
+
+
+def test_bfseg_linear_over_join_cte(client):
+    """Linear final over a join CTE — the join body seeds via its `Join` node."""
+    view = (
+        "CREATE VIEW s AS WITH c AS (SELECT a.id AS id, b.x AS x FROM a JOIN b ON a.k = b.id) "
+        "SELECT id FROM c WHERE x > 0"
+    )
+    sn_d = "bfsegjd" + _uid()
+    client.create_schema(sn_d)
+    sn_v = "bfsegjv" + _uid()
+    client.create_schema(sn_v)
+    try:
+        for sn, view_first in ((sn_d, False), (sn_v, True)):
+            client.execute_sql(
+                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            ins_a = "INSERT INTO a VALUES (1, 10), (2, 20), (3, 10)"
+            ins_b = "INSERT INTO b VALUES (10, 5), (20, 0)"  # b(20).x = 0 excluded by x > 0
+            if view_first:
+                client.execute_sql(view, schema_name=sn)
+                client.execute_sql(ins_a, schema_name=sn)
+                client.execute_sql(ins_b, schema_name=sn)
+            else:
+                client.execute_sql(ins_a, schema_name=sn)
+                client.execute_sql(ins_b, schema_name=sn)
+                client.execute_sql(view, schema_name=sn)
+        # a1→b10(x=5>0)✓ id=1; a3→b10(x=5>0)✓ id=3; a2→b20(x=0)✗.
+        got_d = _weights(client, sn_d, "s", ["id"])
+        got_v = _weights(client, sn_v, "s", ["id"])
+        assert got_d == {(1,): 1, (3,): 1}, f"data-before-view lost backfill: {got_d}"
+        assert got_d == got_v, f"backfill != steady state: {got_d} vs {got_v}"
+
+        client.execute_sql("INSERT INTO a VALUES (4, 20)", schema_name=sn_d)  # b20.x=0 ✗
+        client.execute_sql("INSERT INTO b VALUES (30, 9)", schema_name=sn_d)
+        client.execute_sql("INSERT INTO a VALUES (5, 30)", schema_name=sn_d)  # b30.x=9>0 ✓
+        assert _weights(client, sn_d, "s", ["id"]) == {(1,): 1, (3,): 1, (5,): 1}
+    finally:
+        _cleanup(client, sn_d, tables=["a", "b"], views=["s"])
+        _cleanup(client, sn_v, tables=["a", "b"], views=["s"])
+
+
+def test_bfseg_linear_hidden_between_two_seeding(client):
+    """A linear hidden segment between two seeding segments — the
+    `compile_hidden_body` linear-arm coverage: a grouped CTE `g`, a linear CTE
+    `l` over it (the middle segment that must itself shard), and a grouped final
+    over `l`."""
+    view = (
+        "CREATE VIEW s AS "
+        "WITH g AS (SELECT id, SUM(v) AS sv FROM t GROUP BY id), "
+        "     l AS (SELECT id, sv FROM g WHERE sv > 10) "
+        "SELECT sv, COUNT(*) AS c FROM l GROUP BY sv"
+    )
+    sn_d = "bfseg3d" + _uid()
+    client.create_schema(sn_d)
+    sn_v = "bfseg3v" + _uid()
+    client.create_schema(sn_v)
+    try:
+        for sn, view_first in ((sn_d, False), (sn_v, True)):
+            client.execute_sql(
+                "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            ins = "INSERT INTO t VALUES (1, 20), (2, 5), (3, 20), (4, 30)"
+            if view_first:
+                client.execute_sql(view, schema_name=sn)
+                client.execute_sql(ins, schema_name=sn)
+            else:
+                client.execute_sql(ins, schema_name=sn)
+                client.execute_sql(view, schema_name=sn)
+        # per-id sv: 1→20, 2→5(dropped), 3→20, 4→30. sv>10 keeps {20,20,30}.
+        # GROUP BY sv: sv=20 count 2, sv=30 count 1.
+        got_d = _weights(client, sn_d, "s", ["sv", "c"])
+        got_v = _weights(client, sn_v, "s", ["sv", "c"])
+        assert got_d == {(20, 2): 1, (30, 1): 1}, f"data-before-view lost backfill: {got_d}"
+        assert got_d == got_v, f"backfill != steady state: {got_d} vs {got_v}"
+
+        client.execute_sql("INSERT INTO t VALUES (5, 30)", schema_name=sn_d)
+        assert _weights(client, sn_d, "s", ["sv", "c"]) == {(20, 2): 1, (30, 2): 1}
+    finally:
+        _cleanup(client, sn_d, tables=["t"], views=["s"])
+        _cleanup(client, sn_v, tables=["t"], views=["s"])
+
+
+def test_bfseg_linear_over_linear_cte_not_oversharded(client):
+    """Negative-cost guard: a linear view over a *linear* CTE compiles with NO
+    `ExchangeShard` node — the seeding gate must not over-shard a source that is
+    inline-backfilled in dependency order."""
+    sn = "bfsegneg" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        # `c` is a linear CTE (WHERE only, no join/group) → a linear hidden
+        # segment that does not seed; `s` is a linear final over it.
+        client.execute_sql(
+            "CREATE VIEW s AS WITH c AS (SELECT id, v FROM t WHERE v > 0) "
+            "SELECT id FROM c WHERE v > 5",
+            schema_name=sn,
+        )
+        client.execute_sql("INSERT INTO t VALUES (1, 3), (2, 8)", schema_name=sn)
+        vid = client.resolve_table(sn, "s")[0]
+        assert not _has_exchange_shard(client, vid), \
+            "a linear view over a linear CTE must not be sharded"
+        # And it still backfills / maintains correctly (v>5 keeps id=2).
+        assert _weights(client, sn, "s", ["id"]) == {(2,): 1}
+    finally:
+        _cleanup(client, sn, tables=["t"], views=["s"])

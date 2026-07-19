@@ -44,6 +44,22 @@ pub(crate) enum Rel {
     },
 }
 
+impl Rel {
+    /// The primary source table id of a lowered linear `Rel`
+    /// (`Project(Filter?(Source))`). `simple::emit_linear` consults it to decide
+    /// whether the source is an exchange-seeding chain segment needing the
+    /// sharded emit.
+    pub(crate) fn source_tid(&self) -> u64 {
+        let mut cur = self;
+        loop {
+            match cur {
+                Rel::Project { input, .. } | Rel::Filter { input, .. } => cur = input,
+                Rel::Source { tid, .. } => return *tid,
+            }
+        }
+    }
+}
+
 /// Lower a linear (filter/map) CREATE VIEW body to `Project(Filter?(Source))`:
 /// clause rejection, single-table resolution, WHERE binding against the source
 /// schema, and projection building. The circuit is built by `simple::emit_linear`.

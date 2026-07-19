@@ -7,6 +7,7 @@ mod dispatch;
 mod dml;
 mod error;
 mod exec;
+mod hir;
 mod ir;
 mod lower;
 mod plan;

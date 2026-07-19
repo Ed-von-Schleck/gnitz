@@ -38,7 +38,7 @@ use std::rc::Rc;
 ///
 /// `Full` satisfies both. `Inner` neither.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum JoinType {
+pub(crate) enum JoinType {
     Inner,
     Left,
     Right,
@@ -46,11 +46,11 @@ enum JoinType {
 }
 
 impl JoinType {
-    fn preserves_left(self) -> bool {
+    pub(crate) fn preserves_left(self) -> bool {
         matches!(self, JoinType::Left | JoinType::Full)
     }
 
-    fn preserves_right(self) -> bool {
+    pub(crate) fn preserves_right(self) -> bool {
         matches!(self, JoinType::Right | JoinType::Full)
     }
 }
@@ -62,7 +62,11 @@ impl JoinType {
 /// (Left|Full). A client decoding a NULL in a NOT NULL column would panic, so
 /// this rule has exactly this one home — shared by the equi (`emit_join`) and
 /// range (`emit_range_join`) builders.
-fn combined_payload_coldefs(left_schema: &Schema, right_schema: &Schema, join_type: JoinType) -> Vec<ColumnDef> {
+pub(crate) fn combined_payload_coldefs(
+    left_schema: &Schema,
+    right_schema: &Schema,
+    join_type: JoinType,
+) -> Vec<ColumnDef> {
     let mut cols = Vec::with_capacity(left_schema.columns.len() + right_schema.columns.len());
     for col in &left_schema.columns {
         let mut c = col.clone();
@@ -304,7 +308,7 @@ struct LoweredJoin {
 ///
 /// sqlparser 0.56 spells the bare/`OUTER` forms as separate variants
 /// (`Left`/`LeftOuter`, `Right`/`RightOuter`); FULL has only `FullOuter`.
-fn join_on_and_type(join: &sqlparser::ast::Join) -> Result<(&Expr, JoinType), GnitzSqlError> {
+pub(crate) fn join_on_and_type(join: &sqlparser::ast::Join) -> Result<(&Expr, JoinType), GnitzSqlError> {
     match &join.join_operator {
         JoinOperator::Inner(JoinConstraint::On(e)) | JoinOperator::Join(JoinConstraint::On(e)) => {
             Ok((e, JoinType::Inner))
@@ -592,9 +596,9 @@ pub(crate) fn plan_join_chain(
             match wrappers.iter().find(|(base, _)| *base == r_base_tid) {
                 Some((_, w)) => w.clone(),
                 None => {
-                    let w = chain.add_segment(client, |_, _, vid| {
+                    let w = chain.add_segment(client, |_, chain, vid| {
                         let rel = crate::plan::lp::passthrough_rel(r_base_tid, Rc::clone(r_base_schema))?;
-                        crate::plan::view::simple::emit_linear(vid, rel)
+                        crate::plan::view::simple::emit_linear(chain, vid, rel)
                     })?;
                     wrappers.push((r_base_tid, w.clone()));
                     w
@@ -757,7 +761,7 @@ fn equi_keep_combined(projection: &[SelectItem], j: &LoweredJoin) -> Result<Vec<
 /// A schema pruned to its `keep` columns (ascending source order), payload-only —
 /// `pk_cols` is dropped (empty), since the pruned schema drives output-layout
 /// derivation and name resolution, never a PK region.
-fn prune_schema(schema: &Schema, keep: &[usize]) -> Schema {
+pub(crate) fn prune_schema(schema: &Schema, keep: &[usize]) -> Schema {
     Schema {
         columns: keep.iter().map(|&i| schema.columns[i].clone()).collect(),
         pk_cols: Vec::new(),

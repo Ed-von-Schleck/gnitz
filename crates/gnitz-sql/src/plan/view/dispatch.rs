@@ -201,14 +201,15 @@ fn build_query_segments(
             set_op::emit_distinct_pieces(final_vid, &inp.select, inp.src)?
         }
         ViewShape::GroupBy(select) => emit_bounded_group_by(client, binder, final_vid, select, chain, "GROUP BY")?,
-        // Any join FROM — 2-way, N-way, or self-referential — plans as a left-deep
-        // chain; intermediate segments and self-join pass-through wrappers land on
-        // `chain`, and the final step is emitted with `final_vid`.
-        ViewShape::Join(select) => join::plan_join_chain(client, binder, final_vid, select, chain)?,
-        ViewShape::Simple(select) => {
-            // Linear filter/map view: lower to `Project(Filter?(Source))`, then emit.
-            let rel = crate::plan::lp::lower_linear(client, binder, select)?;
-            simple::emit_linear(final_vid, rel)?
+        // Linear and join views route through the HIR pipeline: bind the whole
+        // `query` to a logical `RelExpr` tree, classify predicates, then lower to
+        // circuit(s) — a join FROM plans as a left-deep chain whose intermediate
+        // segments / self-join pass-through wrappers land on `chain`, and the
+        // final step is emitted with `final_vid`.
+        ViewShape::Relational => {
+            let (rel, ids) = crate::hir::bind::bind_query(client, binder, query)?;
+            let rel = crate::hir::rewrite::classify(rel)?;
+            crate::hir::lower::lower(client, chain, rel, ids, final_vid)?
         }
         ViewShape::Subquery {
             select,
@@ -278,8 +279,10 @@ enum ViewShape<'a> {
     /// `SELECT DISTINCT …` — over a plain FROM or a join (the input resolution
     /// compiles a join to a hidden view first).
     Distinct(&'a Select),
-    /// A plain (non-grouped) join FROM.
-    Join(&'a Select),
+    /// A relational body the HIR pipeline compiles — a linear filter/map view or
+    /// a plain (non-grouped) join FROM. The pipeline re-binds the whole `query`,
+    /// so no classified `Select` is threaded here.
+    Relational,
     /// A Simple-shaped view whose WHERE carries exactly one top-level
     /// `[NOT] EXISTS (…)` / `x [NOT] IN (SELECT …)` conjunct — routed to the
     /// semi/anti-join builder.
@@ -306,7 +309,6 @@ enum ViewShape<'a> {
     /// scalar-subquery builder, which decorrelates each into a reduce + join.
     ScalarSubquery(&'a Select),
     GroupBy(&'a Select),
-    Simple(&'a Select),
 }
 
 /// Peel `Nested` wrappers and `NOT`s off a WHERE conjunct; when the core is a
@@ -376,7 +378,7 @@ impl<'a> ViewShape<'a> {
             return Ok(if body_is_grouped(select) {
                 ViewShape::GroupBy(select)
             } else {
-                ViewShape::Join(select)
+                ViewShape::Relational
             });
         }
         // Exactly one `[NOT] EXISTS` / `[NOT] IN (SELECT …)` per view is
@@ -438,7 +440,7 @@ impl<'a> ViewShape<'a> {
         if scalar::has_scalar_subquery(select) {
             return Ok(ViewShape::ScalarSubquery(select));
         }
-        Ok(ViewShape::Simple(select))
+        Ok(ViewShape::Relational)
     }
 }
 
@@ -659,7 +661,7 @@ fn compile_hidden_body(
             join::plan_join_chain(client, binder, vid, select, chain)?
         } else {
             let rel = crate::plan::lp::lower_linear(client, binder, select)?;
-            simple::emit_linear(vid, rel)?
+            simple::emit_linear(chain, vid, rel)?
         };
         // Positional column aliases (`WITH d(a, b) AS …` / `(subquery) AS d(a, b)`).
         apply_hidden_column_aliases(column_aliases, &mut cols, ctx)?;

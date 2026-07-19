@@ -144,7 +144,7 @@ pub(crate) fn schema_type_codes(schema: &Schema) -> Vec<u64> {
 /// co-partition byte-for-byte and the `_join_pk` catalog stride matches both. Only
 /// a cross-sign pair whose unsigned side is 128-bit (`U128`/`UUID`) stays
 /// rejected — its faithful common type is a signed-256 type that does not exist.
-fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<TypeCode, GnitzSqlError> {
+pub(crate) fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<TypeCode, GnitzSqlError> {
     for col in [left, right] {
         reject_float_key(col, "JOIN ON")?;
     }
@@ -175,7 +175,7 @@ fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<TypeCod
 /// they are rejected here (they remain legal in the equality prefix). Floats are
 /// rejected by `validate_join_key_pair`, which then resolves the common integer
 /// type via `join_key_common_type` (cross-sign promotion included).
-fn validate_range_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<TypeCode, GnitzSqlError> {
+pub(crate) fn validate_range_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<TypeCode, GnitzSqlError> {
     for col in [left, right] {
         if col.type_code.is_german_string() {
             return Err(GnitzSqlError::Unsupported(format!(

@@ -148,6 +148,76 @@ impl<R> BExpr<R> {
     }
 }
 
+impl<R> BExpr<R> {
+    /// Rebuild the expression with every leaf reference (the `ColRef` / `IsNull`
+    /// / `IsNotNull` positions) mapped through `f`; every other arm maps
+    /// structurally. The one leaf-substitution walk — `hir::physical::resolve_refs`
+    /// (`ColId → usize`) is an instantiation.
+    pub(crate) fn try_map_refs<S, E>(&self, f: &impl Fn(&R) -> Result<S, E>) -> Result<BExpr<S>, E> {
+        Ok(match self {
+            BExpr::ColRef(r) => BExpr::ColRef(f(r)?),
+            BExpr::IsNull(r) => BExpr::IsNull(f(r)?),
+            BExpr::IsNotNull(r) => BExpr::IsNotNull(f(r)?),
+            BExpr::LitInt(v) => BExpr::LitInt(*v),
+            BExpr::LitFloat(v) => BExpr::LitFloat(*v),
+            BExpr::LitStr(s) => BExpr::LitStr(s.clone()),
+            BExpr::LitWide(s) => BExpr::LitWide(s.clone()),
+            BExpr::LitNull => BExpr::LitNull,
+            BExpr::BinOp(l, op, r) => BExpr::BinOp(Box::new(l.try_map_refs(f)?), *op, Box::new(r.try_map_refs(f)?)),
+            BExpr::UnaryOp(op, inner) => BExpr::UnaryOp(*op, Box::new(inner.try_map_refs(f)?)),
+            BExpr::AggCall { func, arg } => BExpr::AggCall {
+                func: *func,
+                arg: arg.as_deref().map(|a| a.try_map_refs(f)).transpose()?.map(Box::new),
+            },
+            BExpr::Case { branches, else_ } => BExpr::Case {
+                branches: branches
+                    .iter()
+                    .map(|(c, r)| Ok((c.try_map_refs(f)?, r.try_map_refs(f)?)))
+                    .collect::<Result<_, E>>()?,
+                else_: else_.as_deref().map(|e| e.try_map_refs(f)).transpose()?.map(Box::new),
+            },
+            BExpr::InList { inner, items } => BExpr::InList {
+                inner: Box::new(inner.try_map_refs(f)?),
+                items: items.iter().map(|i| i.try_map_refs(f)).collect::<Result<_, E>>()?,
+            },
+        })
+    }
+
+    /// Visit every leaf reference (the `ColRef` / `IsNull` / `IsNotNull`
+    /// positions), depth-first. The one reference-collection walk.
+    pub(crate) fn for_each_ref(&self, f: &mut impl FnMut(&R)) {
+        match self {
+            BExpr::ColRef(r) | BExpr::IsNull(r) | BExpr::IsNotNull(r) => f(r),
+            BExpr::LitInt(_) | BExpr::LitFloat(_) | BExpr::LitStr(_) | BExpr::LitWide(_) | BExpr::LitNull => {}
+            BExpr::BinOp(l, _, r) => {
+                l.for_each_ref(f);
+                r.for_each_ref(f);
+            }
+            BExpr::UnaryOp(_, inner) => inner.for_each_ref(f),
+            BExpr::AggCall { arg, .. } => {
+                if let Some(a) = arg {
+                    a.for_each_ref(f);
+                }
+            }
+            BExpr::Case { branches, else_ } => {
+                for (c, r) in branches {
+                    c.for_each_ref(f);
+                    r.for_each_ref(f);
+                }
+                if let Some(e) = else_ {
+                    e.for_each_ref(f);
+                }
+            }
+            BExpr::InList { inner, items } => {
+                inner.for_each_ref(f);
+                for i in items {
+                    i.for_each_ref(f);
+                }
+            }
+        }
+    }
+}
+
 impl BExpr<usize> {
     /// The runtime entry point: type a `ColRef(idx)` leaf as the schema column's
     /// declared type (`schema.columns[idx].type_code`, panicking on an

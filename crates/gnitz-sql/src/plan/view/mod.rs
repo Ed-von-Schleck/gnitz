@@ -7,11 +7,16 @@
 mod dispatch;
 mod exists;
 mod group_by;
-mod join;
-mod predicates;
+// `pub(crate)` for the HIR lowering: `crate::hir` calls these modules' AST-free
+// primitives cross-module (a private `mod` is visible only to its parent's
+// descendants, and `hir` is not one). The primitives relocate into `hir/lower/`
+// once their old orchestration callers (`scalar`, `compile_hidden_body`) are
+// migrated and deleted.
+pub(crate) mod join;
+pub(crate) mod predicates;
 mod scalar;
 mod set_op;
-mod simple;
+pub(crate) mod simple;
 
 pub(crate) use dispatch::{cte_passthrough, execute_alter_view, execute_create_view};
 // The single-relation aggregate analysis + HAVING binding and the bare-column
@@ -67,6 +72,27 @@ impl ViewChain {
         let v = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
         self.owner_vid = Some(v);
         Ok(v)
+    }
+
+    /// True iff `tid` is a segment already on this chain whose circuit contains a
+    /// `Join` or `ExchangeShard` node — the client-side mirror of the engine's
+    /// `view_seeds_exchange_backfill`. A linear view whose delta source is such a
+    /// seeding segment must be routed through the ordered distributed backfill
+    /// (`simple::emit_linear` appends its identity shard), or it silently loses
+    /// all pre-existing base data: its inline hook-time backfill reads a
+    /// still-empty sibling segment. A source that is a base table, a pass-through
+    /// CTE alias, or a linear segment is fully populated (or inline-backfilled in
+    /// dependency order) at hook time, so it keeps the unsharded emit.
+    pub fn segment_seeds_backfill(&self, tid: u64) -> bool {
+        self.segments.iter().any(|s| {
+            s.circuit.view_id == tid
+                && s.circuit.nodes.values().any(|op| {
+                    matches!(
+                        op,
+                        gnitz_core::OpNode::Join(_) | gnitz_core::OpNode::ExchangeShard { .. }
+                    )
+                })
+        })
     }
 
     /// Mint one hidden segment: allocate its view id, run `emit` with it (the

@@ -573,3 +573,62 @@ fn test_direct_select_qualified_alias_and_duplicate_items() {
     let (_, b) = select_rows(&mut client, &sn, "SELECT * FROM t WHERE t.id = 1");
     assert_eq!(b.len(), 1);
 }
+
+// ── 2b: computed-column output metadata (nullability + raw-index naming) ──
+// Column `is_nullable` and computed column *names* are checked by neither the
+// structural circuit dump (excludes schema/expr) nor the weight pins (weights
+// only), yet two exact-reproduction rules live exactly there.
+
+/// A computed projection column is ALWAYS nullable, regardless of the source
+/// expression's actual nullability — the hardcoded-`true` rule
+/// (`resolve_proj_col_with`, mirrored by the HIR bind). Inferring it from operand
+/// nullability would flip `a + 1` over a NOT NULL `a` to non-nullable and silently
+/// diverge a downstream `IS NOT NULL` const-elision.
+#[test]
+fn test_projection_computed_column_always_nullable() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT NOT NULL)")
+            .unwrap();
+        p.execute("CREATE VIEW v AS SELECT a + 1 AS x FROM t").unwrap();
+    }
+    let (_, s) = client.resolve_table_or_view_id(&sn, "v").unwrap();
+    let x = s
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case("x"))
+        .expect("output column x");
+    assert!(
+        x.is_nullable,
+        "a computed column is always nullable, even over a NOT NULL operand"
+    );
+}
+
+/// An unaliased computed column is named `_expr{idx}` by its RAW projection index
+/// — a wildcard item consumes one slot even though it expands to many columns, so
+/// `SELECT *, a + b` names the expr `_expr1`, not `_expr0`.
+#[test]
+fn test_projection_computed_column_raw_index_name() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)")
+            .unwrap();
+        p.execute("CREATE VIEW v AS SELECT *, a + b FROM t").unwrap();
+    }
+    let (_, s) = client.resolve_table_or_view_id(&sn, "v").unwrap();
+    assert!(
+        s.columns.iter().any(|c| c.name == "_expr1"),
+        "the computed column is named by its raw projection index (`_expr1`), got {:?}",
+        names(&s)
+    );
+}

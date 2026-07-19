@@ -230,3 +230,150 @@ fn replicated_reduce_weights() {
         "g=7 re-sums to 10 after the retraction"
     );
 }
+
+// ── 3-way chain (cut rule) ───────────────────────────────────────────
+// A 3-way equi chain over distinct tables. The cut segment `h0 = a3 ⋈ b3` carries
+// only the live columns (a3.av for the final projection, a3.id for the 2nd ON,
+// b3.bv for the final); a3.k / b3.* are pruned. Weight-pins the per-step cut
+// correctness (the off-by-`k` guard) — NOT a structural sentinel, so a later
+// box-8 pruning pass never churns it.
+#[test]
+fn three_way_chain_weights() {
+    let srv = match ServerHandle::start_n(4) {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE a3 (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, av BIGINT NOT NULL)",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE b3 (id BIGINT NOT NULL PRIMARY KEY, bk BIGINT NOT NULL, bv BIGINT NOT NULL)",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE c3 (id BIGINT NOT NULL PRIMARY KEY, cv BIGINT NOT NULL)",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW v AS SELECT a3.av AS av, b3.bv AS bv, c3.cv AS cv \
+         FROM a3 JOIN b3 ON a3.k = b3.bk JOIN c3 ON a3.id = c3.id",
+    );
+    exec(&mut client, &sn, "INSERT INTO a3 VALUES (1, 10, 100), (2, 10, 101)");
+    exec(&mut client, &sn, "INSERT INTO b3 VALUES (1, 10, 200)");
+    exec(&mut client, &sn, "INSERT INTO c3 VALUES (1, 300), (2, 301)");
+    assert_eq!(
+        row_weights(&mut client, &sn, "v", &["av", "bv", "cv"]),
+        w(&[(&[100, 200, 300], 1), (&[101, 200, 301], 1)]),
+        "each a-row joins b (k=10) then its own c (a.id=c.id), weight 1 — the cut must not drop or double"
+    );
+    exec(&mut client, &sn, "DELETE FROM a3 WHERE id = 2");
+    assert_eq!(
+        row_weights(&mut client, &sn, "v", &["av", "bv", "cv"]),
+        w(&[(&[100, 200, 300], 1)]),
+        "retracting a3(2) cleanly drops its chain row"
+    );
+}
+
+// ── 3-way self-join (cut × collision) ────────────────────────────────
+// `emp e JOIN emp m JOIN emp g` — the cut×collision intersection: the inner
+// `e ⋈ m` self-join wraps its right side (collision), and the outer step joins
+// the cut segment against a third `emp` read. `test_self_join.py` is presence-only
+// for the chain; pin the exact weights here.
+#[test]
+fn three_way_self_join_weights() {
+    let srv = match ServerHandle::start_n(4) {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE emp (id BIGINT NOT NULL PRIMARY KEY, mgr BIGINT NOT NULL, nm BIGINT NOT NULL)",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW v AS SELECT e.nm AS emp, m.nm AS boss, g.nm AS grandboss \
+         FROM emp e JOIN emp m ON e.mgr = m.id JOIN emp g ON m.mgr = g.id",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "INSERT INTO emp VALUES (1, 0, 100), (2, 1, 200), (3, 2, 300)",
+    );
+    // e=3→m=2→g=1: (300,200,100). e=2→m=1→g=0 (none). e=1→m=0 (none).
+    assert_eq!(
+        row_weights(&mut client, &sn, "v", &["emp", "boss", "grandboss"]),
+        w(&[(&[300, 200, 100], 1)]),
+        "the one full 3-level chain, weight 1 — the cut wrapper must not double"
+    );
+    exec(&mut client, &sn, "INSERT INTO emp VALUES (4, 3, 400)"); // e=4→m=3→g=2
+    assert_eq!(
+        row_weights(&mut client, &sn, "v", &["emp", "boss", "grandboss"]),
+        w(&[(&[300, 200, 100], 1), (&[400, 300, 200], 1)])
+    );
+    exec(&mut client, &sn, "DELETE FROM emp WHERE id = 4");
+    assert_eq!(
+        row_weights(&mut client, &sn, "v", &["emp", "boss", "grandboss"]),
+        w(&[(&[300, 200, 100], 1)]),
+        "retracting emp 4 drops its chain row; the reused base id stays weight-correct"
+    );
+}
+
+// ── 3-way chain with an OUTER step (null-widen × cut segment) ─────────
+// `(a3 JOIN b3) LEFT JOIN c3`: the cut INNER segment `h0 = a3 ⋈ b3` feeds a LEFT
+// join, so an h0 row with no matching c3 null-fills. Pin on the non-null a/b
+// columns (the null-filled `cv` is NULL). Catches a null-fill weight error over a
+// cut segment.
+#[test]
+fn three_way_outer_chain_weights() {
+    let srv = match ServerHandle::start_n(4) {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE a3 (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, av BIGINT NOT NULL)",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE b3 (id BIGINT NOT NULL PRIMARY KEY, bk BIGINT NOT NULL, bv BIGINT NOT NULL)",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE c3 (id BIGINT NOT NULL PRIMARY KEY, cv BIGINT NOT NULL)",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW v AS SELECT a3.av AS av, b3.bv AS bv \
+         FROM a3 JOIN b3 ON a3.k = b3.bk LEFT JOIN c3 ON a3.id = c3.id",
+    );
+    exec(&mut client, &sn, "INSERT INTO a3 VALUES (1, 10, 100), (2, 10, 101)");
+    exec(&mut client, &sn, "INSERT INTO b3 VALUES (1, 10, 200)");
+    exec(&mut client, &sn, "INSERT INTO c3 VALUES (1, 300)"); // matches a3(1) only
+                                                              // h0={(a1,b1),(a2,b1)}; LEFT JOIN c3: a1 matches c1, a2 null-fills — both survive.
+    assert_eq!(
+        row_weights(&mut client, &sn, "v", &["av", "bv"]),
+        w(&[(&[100, 200], 1), (&[101, 200], 1)]),
+        "the unmatched a-row null-fills at weight 1 (not 0, not doubled)"
+    );
+    exec(&mut client, &sn, "DELETE FROM b3 WHERE id = 1"); // empties h0
+    assert_eq!(
+        row_weights(&mut client, &sn, "v", &["av", "bv"]),
+        BTreeMap::new(),
+        "retracting the sole b-row empties h0; the matched AND the null-filled row retract with it"
+    );
+}
