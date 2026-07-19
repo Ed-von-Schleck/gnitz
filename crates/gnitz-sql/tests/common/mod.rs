@@ -11,6 +11,7 @@ use gnitz_core::{ColData, GnitzClient, PkColumn, Schema, ZSetBatch};
 use gnitz_sql::{GnitzSqlError, SqlPlanner, SqlResult};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::{CIRCUIT_NODES_TAB, OPCODE_FILTER};
+use std::collections::{BTreeMap, HashMap};
 
 /// Returns (client, schema_name) with a unique schema already created.
 /// The schema name is unique per call so parallel tests don't collide.
@@ -34,6 +35,24 @@ pub fn exec(client: &mut GnitzClient, sn: &str, sql: &str) {
 pub fn try_exec(client: &mut GnitzClient, sn: &str, sql: &str) -> Result<Vec<SqlResult>, GnitzSqlError> {
     let mut p = SqlPlanner::new(client, sn);
     p.execute(sql)
+}
+
+/// Assert `sql` fails with `want_variant` (`Unsupported`/`Bind`/`Plan`) whose
+/// inner message contains `want_msg` — pins both the guard identity and the
+/// message a migration must reproduce.
+pub fn assert_rejects_variant(client: &mut GnitzClient, sn: &str, sql: &str, want_variant: &str, want_msg: &str) {
+    let e = try_exec(client, sn, sql).unwrap_err();
+    let (variant, msg) = match &e {
+        GnitzSqlError::Unsupported(m) => ("Unsupported", m.clone()),
+        GnitzSqlError::Bind(m) => ("Bind", m.clone()),
+        GnitzSqlError::Plan(m) => ("Plan", m.clone()),
+        other => ("other", format!("{other:?}")),
+    };
+    assert_eq!(variant, want_variant, "variant mismatch for `{sql}`: {e:?}");
+    assert!(
+        msg.contains(want_msg),
+        "for `{sql}`\n  expected substring: {want_msg:?}\n  got: {msg:?}"
+    );
 }
 
 /// Execute a single statement expected to return `RowsAffected`, returning the
@@ -164,23 +183,9 @@ pub fn scan_circuit_nodes(client: &mut GnitzClient) -> Option<ZSetBatch> {
 /// the full schema order, so the discriminator is column index 3 (Fixed u64-LE,
 /// non-PK).
 pub fn opcode_node_count(batch: Option<&ZSetBatch>, vid: u64, op: u64) -> usize {
-    let batch = match batch {
-        Some(b) => b,
-        None => return 0,
-    };
-    let opcodes = match &batch.columns[3] {
-        ColData::Fixed(buf) => buf,
-        other => panic!("opcode column not Fixed: {other:?}"),
-    };
+    let Some(batch) = batch else { return 0 };
     (0..batch.len())
-        .filter(|&i| {
-            let pk = match &batch.pks {
-                PkColumn::Bytes { .. } => batch.pks.get_bytes(i),
-                other => panic!("circuit nodes PK not wide bytes: {other:?}"),
-            };
-            u64::from_le_bytes(pk[0..8].try_into().unwrap()) == vid
-                && u64::from_le_bytes(opcodes[i * 8..i * 8 + 8].try_into().unwrap()) == op
-        })
+        .filter(|&i| circuit_row_vid(batch, i) == vid && circuit_u64(batch, 3, i) == op)
         .count()
 }
 
@@ -201,4 +206,323 @@ pub fn scan_bound_col_count(client: &mut GnitzClient, vid: u64) -> usize {
         vid,
         gnitz_wire::NODE_COL_KIND_SCAN_BOUND,
     )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Circuit-shape canonicalizer — the pinning-suite infrastructure.
+//
+// A deterministic, emission-order-independent textual dump of a view's whole
+// circuit chain (final view + every hidden segment it transitively scans). Raw
+// `NodeId`s are construction-order-dependent (`CircuitBuilder::alloc_node`, ids
+// from 1) — *not* topological — so any id-keyed form churns on a refactor that
+// re-emits the same graph in a different order. This dump depends only on
+// **structure**: nodes are labelled by their DFS-from-sink position (`#N`), base
+// scan sources render by NAME, and hidden-segment sources render by structural
+// segment index. It reads only the three circuit system tables via `client.scan`
+// — no production change.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One decoded circuit (one `view_id`), grouped for rendering.
+#[derive(Default)]
+struct ViewCircuit {
+    /// `node_id -> (opcode, source_table)`. `source_table` is `Some` only on the
+    /// childless `Scan*` leaves (opcodes 11 / 31), per `encode_op_node`.
+    nodes: BTreeMap<u64, (u64, Option<u64>)>,
+    /// `node_id -> sorted [(kind, position, value1, value2)]`.
+    params: BTreeMap<u64, Vec<(u64, u64, u64, u64)>>,
+    /// `dst_node -> [(port, src_node)]`, sorted by port.
+    inputs: BTreeMap<u64, Vec<(u64, u64)>>,
+}
+
+impl ViewCircuit {
+    /// Sort params and inputs into their canonical (order-independent) form.
+    fn normalize(&mut self) {
+        for p in self.params.values_mut() {
+            p.sort_unstable();
+        }
+        for e in self.inputs.values_mut() {
+            e.sort_by_key(|(port, _)| *port);
+        }
+    }
+}
+
+/// A `nodes`/`node_columns`/`edges` circuit-table column read as `u64` (every
+/// discriminator/param column is a non-null `Fixed` U64).
+fn circuit_u64(batch: &ZSetBatch, col: usize, row: usize) -> u64 {
+    match &batch.columns[col] {
+        ColData::Fixed(b) => u64::from_le_bytes(b[row * 8..row * 8 + 8].try_into().unwrap()),
+        other => panic!("circuit column {col} not Fixed: {other:?}"),
+    }
+}
+
+/// `view_id` of circuit-table row `i` — the low 8 bytes of the (view_id, sub)
+/// compound PK, native-LE (the client decodes the OPK PK region on receive).
+fn circuit_row_vid(batch: &ZSetBatch, i: usize) -> u64 {
+    u64::from_le_bytes(batch.pks.get_bytes(i)[0..8].try_into().unwrap())
+}
+
+/// Fixed id → name for the circuit opcodes (mirrors `OPCODE_*`, `wire/circuit.rs`).
+/// Opcode 7 is the sink; 25 is the join-trace integral — kept distinct in the dump.
+fn opcode_name(op: u64) -> &'static str {
+    match op {
+        gnitz_wire::OPCODE_FILTER => "FILTER",
+        gnitz_wire::OPCODE_NEGATE => "NEGATE",
+        gnitz_wire::OPCODE_UNION => "UNION",
+        gnitz_wire::OPCODE_JOIN_DELTA_TRACE => "JOIN_DELTA_TRACE",
+        gnitz_wire::OPCODE_INTEGRATE => "INTEGRATE_SINK",
+        gnitz_wire::OPCODE_REDUCE => "REDUCE",
+        gnitz_wire::OPCODE_DISTINCT => "DISTINCT",
+        gnitz_wire::OPCODE_SCAN_DELTA => "SCAN_DELTA",
+        gnitz_wire::OPCODE_EXCHANGE_SHARD => "EXCHANGE_SHARD",
+        gnitz_wire::OPCODE_NULL_EXTEND => "NULL_EXTEND",
+        gnitz_wire::OPCODE_INTEGRATE_TRACE => "INTEGRATE_TRACE",
+        gnitz_wire::OPCODE_MAP_PROJ => "MAP_PROJ",
+        gnitz_wire::OPCODE_MAP_EXPR => "MAP_EXPR",
+        gnitz_wire::OPCODE_MAP_HASH_ROW => "MAP_HASH_ROW",
+        gnitz_wire::OPCODE_SCAN_TRACE_TABLE => "SCAN_TRACE_TABLE",
+        gnitz_wire::OPCODE_JOIN_DELTA_TRACE_RANGE => "JOIN_DELTA_TRACE_RANGE",
+        gnitz_wire::OPCODE_PARTITION_FILTER => "PARTITION_FILTER",
+        gnitz_wire::OPCODE_POSITIVE_PART => "POSITIVE_PART",
+        other => panic!("canonical_circuit_dump: unknown opcode {other}"),
+    }
+}
+
+/// Fixed id → name for the node-column kinds (mirrors `NODE_COL_KIND_*`).
+fn kind_name(kind: u64) -> &'static str {
+    match kind {
+        gnitz_wire::NODE_COL_KIND_GROUP => "GROUP",
+        gnitz_wire::NODE_COL_KIND_SHARD => "SHARD",
+        gnitz_wire::NODE_COL_KIND_PROJ => "PROJ",
+        gnitz_wire::NODE_COL_KIND_NULL_EXT => "NULL_EXT",
+        gnitz_wire::NODE_COL_KIND_AGG_SPEC => "AGG_SPEC",
+        gnitz_wire::NODE_COL_KIND_BRANCH_ID => "BRANCH_ID",
+        gnitz_wire::NODE_COL_KIND_REINDEX => "REINDEX",
+        gnitz_wire::NODE_COL_KIND_RANGE_JOIN => "RANGE_JOIN",
+        gnitz_wire::NODE_COL_KIND_GLOBAL_GROUND => "GLOBAL_GROUND",
+        gnitz_wire::NODE_COL_KIND_REDUCE_OUT_KEY => "REDUCE_OUT_KEY",
+        gnitz_wire::NODE_COL_KIND_SCAN_BOUND => "SCAN_BOUND",
+        other => panic!("canonical_circuit_dump: unknown node-column kind {other}"),
+    }
+}
+
+/// DFS pre-order from `start`, recursing children in **port order**, assigning
+/// each first-visited node its `#N` index. A revisited node (DAG sharing) keeps
+/// its first index. Cycle-free by construction; the visited guard makes DAG
+/// sharing terminate.
+fn dfs_index(start: u64, vc: &ViewCircuit, index_of: &mut HashMap<u64, usize>, order: &mut Vec<u64>) {
+    if index_of.contains_key(&start) {
+        return;
+    }
+    index_of.insert(start, order.len());
+    order.push(start);
+    if let Some(children) = vc.inputs.get(&start) {
+        for &(_port, src) in children {
+            dfs_index(src, vc, index_of, order);
+        }
+    }
+}
+
+/// Render one circuit into `out`, discovering any hidden segments its `Scan*`
+/// leaves reference (appended to `seg_order`/`seg_index` in first-reach `#N`
+/// order). Base sources render `base:<name>`; segment sources `seg:<idx>`.
+fn render_circuit(
+    vc: &ViewCircuit,
+    views: &BTreeMap<u64, ViewCircuit>,
+    base_by_id: &HashMap<u64, &str>,
+    seg_index: &mut HashMap<u64, usize>,
+    seg_order: &mut Vec<u64>,
+    out: &mut String,
+) {
+    // The sink is the unique IntegrateSink (opcode 7); IntegrateTrace is 25.
+    let sinks: Vec<u64> = vc
+        .nodes
+        .iter()
+        .filter(|(_, (op, _))| *op == gnitz_wire::OPCODE_INTEGRATE)
+        .map(|(nid, _)| *nid)
+        .collect();
+    assert_eq!(
+        sinks.len(),
+        1,
+        "canonical_circuit_dump: expected exactly one IntegrateSink (opcode 7), got {}",
+        sinks.len()
+    );
+
+    let mut index_of: HashMap<u64, usize> = HashMap::new();
+    let mut order: Vec<u64> = Vec::new();
+    dfs_index(sinks[0], vc, &mut index_of, &mut order);
+    assert_eq!(
+        index_of.len(),
+        vc.nodes.len(),
+        "canonical_circuit_dump: {} node(s) unreachable from the sink — off-cone nodes are undefined",
+        vc.nodes.len() - index_of.len()
+    );
+
+    for (n, nid) in order.iter().enumerate() {
+        let (opcode, src) = vc.nodes[nid];
+        let mut line = format!("#{n} {}", opcode_name(opcode));
+        if let Some(params) = vc.params.get(nid) {
+            if !params.is_empty() {
+                let ps: Vec<String> = params
+                    .iter()
+                    .map(|(k, p, v1, v2)| format!("({},{},{},{})", kind_name(*k), p, v1, v2))
+                    .collect();
+                line.push_str(&format!(" params:[{}]", ps.join(";")));
+            }
+        }
+        if let Some(id) = src {
+            let rendered = if let Some(name) = base_by_id.get(&id) {
+                format!("base:{name}")
+            } else if views.contains_key(&id) {
+                let idx = if let Some(&idx) = seg_index.get(&id) {
+                    idx
+                } else {
+                    let idx = seg_order.len();
+                    seg_index.insert(id, idx);
+                    seg_order.push(id);
+                    idx
+                };
+                format!("seg:{idx}")
+            } else {
+                panic!(
+                    "canonical_circuit_dump: source_table {id} is neither a listed base table nor a \
+                     hidden segment — add it to base_tables"
+                );
+            };
+            line.push_str(&format!(" src:{rendered}"));
+        }
+        if let Some(children) = vc.inputs.get(nid) {
+            let cs: Vec<String> = children
+                .iter()
+                .map(|(port, src)| format!("#{}@{}", index_of[src], port))
+                .collect();
+            line.push_str(&format!(" <- ({})", cs.join(",")));
+        }
+        line.push('\n');
+        out.push_str(&line);
+    }
+}
+
+/// Render `final_vid`'s circuit followed by every transitively-scanned hidden
+/// segment, in structural-index order (`final_vid` = seg 0).
+fn render_chain(views: &BTreeMap<u64, ViewCircuit>, final_vid: u64, base_tables: &[(&str, u64)]) -> String {
+    let base_by_id: HashMap<u64, &str> = base_tables.iter().map(|(n, id)| (*id, *n)).collect();
+    let mut seg_index: HashMap<u64, usize> = HashMap::new();
+    let mut seg_order: Vec<u64> = vec![final_vid];
+    seg_index.insert(final_vid, 0);
+
+    let mut out = String::new();
+    let mut i = 0;
+    while i < seg_order.len() {
+        let vid = seg_order[i];
+        let vc = views
+            .get(&vid)
+            .unwrap_or_else(|| panic!("canonical_circuit_dump: view {vid} has no rows in the circuit tables"));
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&format!("seg {i}:\n"));
+        render_circuit(vc, views, &base_by_id, &mut seg_index, &mut seg_order, &mut out);
+        i += 1;
+    }
+    out
+}
+
+fn maybe_eprint_dump(dump: &str) {
+    if std::env::var_os("GNITZ_DUMP_CIRCUIT").is_some() {
+        eprintln!("---8<--- canonical_circuit_dump ---8<---\n{dump}---8<--- end ---8<---");
+    }
+}
+
+/// Deterministic, emission-order-independent textual dump of a view's whole
+/// circuit chain (final view + every hidden segment it transitively scans).
+/// `base_tables` maps the test's known base-table names → ids so base scan
+/// sources render by NAME; segment sources render by structural segment index.
+/// Reads only the three circuit system tables via `client.scan`.
+///
+/// Set `GNITZ_DUMP_CIRCUIT=1` to `eprintln!` the dump while authoring a sentinel
+/// (capture it, paste it as `EXPECTED`); a normal run only returns the string.
+pub fn canonical_circuit_dump(client: &mut GnitzClient, final_vid: u64, base_tables: &[(&str, u64)]) -> String {
+    let mut views: BTreeMap<u64, ViewCircuit> = BTreeMap::new();
+
+    if let Some(b) = scan_circuit_nodes(client) {
+        for i in 0..b.len() {
+            let vid = circuit_row_vid(&b, i);
+            let nid = circuit_u64(&b, 2, i);
+            let opcode = circuit_u64(&b, 3, i);
+            // Only `Scan*` leaves (opcodes 11 / 31) carry a source_table
+            // (`encode_op_node`); reading col 4 solely for them sidesteps the
+            // nullable-column read entirely.
+            let src = if opcode == gnitz_wire::OPCODE_SCAN_DELTA || opcode == gnitz_wire::OPCODE_SCAN_TRACE_TABLE {
+                Some(circuit_u64(&b, 4, i))
+            } else {
+                None
+            };
+            views.entry(vid).or_default().nodes.insert(nid, (opcode, src));
+        }
+    }
+    if let Some(b) = client.scan(gnitz_wire::CIRCUIT_NODE_COLUMNS_TAB).unwrap().1 {
+        for i in 0..b.len() {
+            let vid = circuit_row_vid(&b, i);
+            let nid = circuit_u64(&b, 2, i);
+            let kind = circuit_u64(&b, 3, i);
+            let pos = circuit_u64(&b, 4, i);
+            let v1 = circuit_u64(&b, 5, i);
+            let v2 = circuit_u64(&b, 6, i);
+            views
+                .entry(vid)
+                .or_default()
+                .params
+                .entry(nid)
+                .or_default()
+                .push((kind, pos, v1, v2));
+        }
+    }
+    if let Some(b) = client.scan(gnitz_wire::CIRCUIT_EDGES_TAB).unwrap().1 {
+        for i in 0..b.len() {
+            let vid = circuit_row_vid(&b, i);
+            let dst = circuit_u64(&b, 2, i);
+            let port = circuit_u64(&b, 3, i);
+            let src = circuit_u64(&b, 4, i);
+            views
+                .entry(vid)
+                .or_default()
+                .inputs
+                .entry(dst)
+                .or_default()
+                .push((port, src));
+        }
+    }
+    for vc in views.values_mut() {
+        vc.normalize();
+    }
+
+    let dump = render_chain(&views, final_vid, base_tables);
+    maybe_eprint_dump(&dump);
+    dump
+}
+
+/// Render a single circuit straight from its `Circuit::into_rows()` bundle,
+/// with no server round-trip — the order-independence unit test's oracle. Shares
+/// the exact rendering core (`render_chain`) with [`canonical_circuit_dump`], so
+/// a byte-identical result across two node-creation orders proves the dump
+/// depends only on structure.
+pub fn canonical_circuit_dump_from_rows(
+    view_id: u64,
+    rows: &gnitz_core::CircuitRows,
+    base_tables: &[(&str, u64)],
+) -> String {
+    let mut vc = ViewCircuit::default();
+    for (nid, opcode, src, _blob) in &rows.nodes {
+        vc.nodes.insert(*nid, (*opcode, *src));
+    }
+    for (nid, kind, pos, v1, v2) in &rows.node_columns {
+        vc.params.entry(*nid).or_default().push((*kind, *pos as u64, *v1, *v2));
+    }
+    for (dst, port, src) in &rows.edges {
+        vc.inputs.entry(*dst).or_default().push((*port as u64, *src));
+    }
+    vc.normalize();
+    let mut views = BTreeMap::new();
+    views.insert(view_id, vc);
+    render_chain(&views, view_id, base_tables)
 }

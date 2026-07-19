@@ -202,7 +202,7 @@ fn test_cte_qualified_identity_passthrough_accepted() {
     // A qualified projection (`t.a, t.b`) is a positional identity pass-through,
     // equivalent to `SELECT *`. The identity check accepts the
     // `CompoundIdentifier` form by comparing `parts[1]` against each source
-    // column in order (§5.3) — it stays a positional test, never a name lookup.
+    // column in order — it stays a positional test, never a name lookup.
     p.execute("CREATE VIEW v AS WITH cte AS (SELECT t.a, t.b FROM t) SELECT * FROM cte")
         .unwrap();
     let (_, schema) = client.resolve_table_or_view_id(&sn, "v").unwrap();
@@ -370,5 +370,44 @@ fn sibling_reference_binds_cte_not_sibling() {
         s.columns.iter().any(|c| c.name.eq_ignore_ascii_case("v")),
         "b.v must resolve through CTE `a`; got {:?}",
         s.columns.iter().map(|c| &c.name).collect::<Vec<_>>()
+    );
+}
+
+// ── CTE-vs-sibling shadowing (behavioral schema pin) ─────────────────
+//
+// When a CTE and a same-named top-level FROM derived table collide, the derived
+// alias wins in the final body (`dispatch.rs` overwrite). Unpinned end-to-end
+// today; this is intended scoping a migration must reproduce. A
+// schema assertion (no data cycle): the resolved view's columns come from the
+// derived table, not the CTE.
+#[test]
+fn cte_shadowed_by_sibling_derived_alias() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)")
+            .unwrap();
+        // `x` names both a CTE (projecting `ca`) and the final body's derived
+        // table (projecting `cb`). The derived alias must win, so `SELECT * FROM x`
+        // expands the derived table's columns.
+        p.execute(
+            "CREATE VIEW v AS WITH x AS (SELECT a AS ca FROM t) \
+             SELECT * FROM (SELECT b AS cb FROM t) x",
+        )
+        .unwrap();
+    }
+    let (_, s) = client.resolve_table_or_view_id(&sn, "v").unwrap();
+    let names = visible_names(&s);
+    assert!(
+        names.iter().any(|n| n == "cb"),
+        "the sibling derived alias must shadow the same-named CTE; got {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n == "ca"),
+        "the shadowed CTE's columns must not appear in the final body; got {names:?}"
     );
 }

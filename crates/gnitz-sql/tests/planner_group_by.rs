@@ -813,7 +813,7 @@ fn test_aggregate_all_null_group_emits_null() {
     let cx = col_idx(&schema, "cx");
     let ca = col_idx(&schema, "ca");
     // SUM/MIN/MAX over an all-NULL group read as NULL — the schema marks these
-    // columns nullable (§8), so a decoder surfaces NULL rather than zero bytes.
+    // columns nullable, so a decoder surfaces NULL rather than zero bytes.
     assert!(
         is_null_at(&batch, col_idx(&schema, "sx") - pk, 0),
         "SUM of all-NULL group must be NULL"
@@ -925,4 +925,82 @@ fn group_by_accepts_qualified_column() {
         "CREATE VIEW v3 AS SELECT g, SUM(x) FROM t GROUP BY t.nope"
     )
     .is_err());
+}
+
+// ── Grouped-projection + HAVING rejection pins ───────────────────────
+//
+// Authored against the current compiler: the exact inner `String` **and**
+// variant. The SELECT-side "column must appear" (`Plan`) and the HAVING-side one
+// (`Bind`, `"HAVING: "` prefix) are deliberately **different** strings and
+// variants — asserted separately, never sharing one literal.
+
+#[test]
+fn grouped_projection_rejections() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (a BIGINT NOT NULL PRIMARY KEY, b BIGINT NOT NULL, v BIGINT NOT NULL)",
+    );
+    // A projected expression over a group column (`a + 1`) — not a bare column
+    // ref or aggregate.
+    assert_rejects_variant(
+        &mut client,
+        &sn,
+        "CREATE VIEW bad AS SELECT a + 1 FROM t GROUP BY a",
+        "Plan",
+        "GROUP BY SELECT: only column refs and aggregates supported",
+    );
+    // A bare non-group column in the SELECT (`b` not in GROUP BY).
+    assert_rejects_variant(
+        &mut client,
+        &sn,
+        "CREATE VIEW bad AS SELECT b FROM t GROUP BY a",
+        "Plan",
+        "column 'b' must appear in GROUP BY or an aggregate function",
+    );
+}
+
+#[test]
+fn having_rejections() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (a BIGINT NOT NULL PRIMARY KEY, b BIGINT NOT NULL, v BIGINT NOT NULL)",
+    );
+    // HAVING references a non-group column (`b`) — a `Bind` error with the
+    // `"HAVING: "` prefix, distinct from the SELECT-side `Plan` string above.
+    assert_rejects_variant(
+        &mut client,
+        &sn,
+        "CREATE VIEW bad AS SELECT a, COUNT(*) AS n FROM t GROUP BY a HAVING b > 0",
+        "Bind",
+        "HAVING: column 'b' must appear in GROUP BY or an aggregate function",
+    );
+    // HAVING references a non-existent column.
+    assert_rejects_variant(
+        &mut client,
+        &sn,
+        "CREATE VIEW bad AS SELECT a, COUNT(*) AS n FROM t GROUP BY a HAVING zzz > 0",
+        "Bind",
+        "HAVING: column 'zzz' not found",
+    );
+    // HAVING references a SELECT alias (`n`) — resolves by source name, so it is
+    // not found (a select-alias in HAVING stays rejected).
+    assert_rejects_variant(
+        &mut client,
+        &sn,
+        "CREATE VIEW bad AS SELECT a, COUNT(*) AS n FROM t GROUP BY a HAVING n > 0",
+        "Bind",
+        "HAVING: column 'n' not found",
+    );
 }
