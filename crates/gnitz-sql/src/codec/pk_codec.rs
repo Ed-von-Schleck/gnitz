@@ -46,20 +46,33 @@ pub(crate) fn parse_literal_i128(n_str: &str, negated: bool) -> Option<i128> {
 /// same key to different workers.
 pub(crate) fn parse_pk_literal_packed(tc: TypeCode, n_str: &str, negated: bool) -> Option<u128> {
     match tc {
-        // 16-byte types are their own packed form. U128/UUID take the full
-        // unsigned range; I128 (the internal join-key promotion type) is
-        // two's complement at 16 bytes, exactly `as u128`.
+        // U128/UUID take the full unsigned range — beyond i128, so they parse as
+        // u128 directly rather than through the i128 value path.
         TypeCode::U128 | TypeCode::UUID => {
             if negated {
                 return None;
             }
             n_str.parse::<u128>().ok()
         }
-        TypeCode::I128 => parse_literal_i128(n_str, negated).map(|v| v as u128),
+        _ => pack_pk_value(tc, parse_literal_i128(n_str, negated)?),
+    }
+}
+
+/// Pack an already-parsed literal value into its packed-u128 PK form — the
+/// value-level half of [`parse_pk_literal_packed`], for callers holding a native
+/// integer (a `LitInt`) that would otherwise stringify only to re-parse. Same
+/// contract: an out-of-type-range value declines (`None`) instead of wrapping.
+/// (A U128/UUID value above `i128::MAX` cannot arrive here — such literals only
+/// exist as digit strings and take the u128 parse above.)
+pub(crate) fn pack_pk_value(tc: TypeCode, v: i128) -> Option<u128> {
+    match tc {
+        TypeCode::U128 | TypeCode::UUID => (v >= 0).then_some(v as u128),
+        // I128 (the internal join-key promotion type) is two's complement at 16
+        // bytes, exactly `as u128`.
+        TypeCode::I128 => Some(v as u128),
         _ => {
             let fi = FixedInt::from_type_code(tc)?;
             let (min, max) = fi.range();
-            let v = parse_literal_i128(n_str, negated)?;
             (min <= v && v <= max).then(|| fi.pack(v))
         }
     }
@@ -71,12 +84,11 @@ pub(crate) fn parse_pk_literal_packed(tc: TypeCode, n_str: &str, negated: bool) 
 pub(crate) enum SqlLiteral<'a> {
     Number(&'a str, bool),
     Str(&'a str),
-    Null,
 }
 
-/// Centralizes the `Expr::Value` / `UnaryOp(Minus, Number)` unwrap shared by
-/// the SEEK/INSERT parse sites (`parse_one_pk_literal`, `try_col_eq_literal`,
-/// `try_extract_pk_in`).
+/// The `Expr::Value` / `UnaryOp(Minus, Number)` unwrap for the INSERT VALUES
+/// parse site ([`parse_one_pk_literal`]); the WHERE recognizers unwrap bound
+/// literals instead (`access`'s bound-literal seam).
 ///
 /// Matches `SingleQuotedString` only — NOT `DoubleQuotedString`: in
 /// `GenericDialect` a double-quoted token is an identifier, so treating
@@ -85,7 +97,6 @@ pub(crate) enum SqlLiteral<'a> {
 pub(crate) fn extract_sql_literal(expr: &Expr) -> Option<SqlLiteral<'_>> {
     match expr {
         Expr::Value(vws) => match &vws.value {
-            Value::Null => Some(SqlLiteral::Null),
             Value::Number(n, _) => Some(SqlLiteral::Number(n, false)),
             Value::SingleQuotedString(s) => Some(SqlLiteral::Str(s)),
             _ => None,

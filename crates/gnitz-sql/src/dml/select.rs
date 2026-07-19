@@ -14,20 +14,20 @@
 //! derivation template. A pass-through CTE over one relation is inlined
 //! (`cte_passthrough`) so trivial `WITH` queries keep reading through the direct path.
 
+use crate::access::{best_index_bound, try_extract_pk_in, try_extract_pk_range};
 use crate::agg::{synthetic_fold_cols, GroupByLayout};
 use crate::ast_util::{
-    body_is_grouped, classify_from, count_select_subqueries, extract_table_factor_name, flatten_conjuncts,
-    is_bare_wildcard_projection, FromShape,
+    body_is_grouped, classify_from, count_select_subqueries, extract_table_factor_name, is_bare_wildcard_projection,
+    FromShape,
 };
 use crate::bind::{bind_single_table, Binder};
 use crate::codec::project_schema::{build_read_projection, compile_projection_map};
-use crate::dml::plan::{extract_limit, extract_offset, try_extract_pk_in, try_extract_pk_range};
+use crate::dml::plan::{extract_limit, extract_offset};
 use crate::error::GnitzSqlError;
 use crate::exec::agg_finish::{agg_finish, build_agg_out_schema, having_supported, AggFinish};
 use crate::exec::order::{order_limit_passthrough, read_spec_finish, resolve_read_spec_order};
-use crate::ir::{BinOp, BoundExpr};
+use crate::ir::{find_wide_literal, wide_int_error, BinOp, BoundExpr};
 use crate::lower::compile_filter_program;
-use crate::plan::index_bound::best_index_bound;
 use crate::plan::validate::{
     cte_select_body, non_recursive_ctes, reject_unhonored_query_clauses, reject_unhonored_select_clauses,
     HonoredClauses, HonoredQueryClauses,
@@ -63,17 +63,63 @@ fn empty_rows(schema: Schema) -> SqlResult {
 
 /// WHERE → the pushed-down `ReadBound` (an access superset) plus the compiled
 /// server-side predicate re-imposing the residual conjuncts — the shared front
-/// half of both sinks. A wide-int / LIKE / string-arithmetic WHERE the
-/// expression VM cannot compile is an `Unsupported`, propagated.
+/// half of both sinks. Binds the WHERE once up front, then recognizes over the
+/// bound conjuncts. The predicate is: empty for `PkSet` (the gather is exact);
+/// the extractor's residual for `PkRange` and a wide-int `IndexRange` (byte-exact
+/// walks — consumed conjuncts are applied exactly and stripped); and the whole
+/// bound WHERE for `None` and a ≤8-byte-int `IndexRange` (whose selectivity gate
+/// may degrade the bound to a full cursor). A wide-int / LIKE / string-arithmetic
+/// WHERE the expression VM cannot compile is an `Unsupported`, propagated.
 fn where_bound_and_predicate(
     client: &mut GnitzClient,
     tid: u64,
     schema: &Schema,
     where_expr: Option<&Expr>,
 ) -> Result<(ReadBound, Vec<u8>), GnitzSqlError> {
-    let (bound, pred_exprs) = extract_bound(client, tid, schema, where_expr)?;
-    let predicate = compile_read_spec_predicate(&pred_exprs, schema)?;
-    Ok((bound, predicate))
+    let Some(we) = where_expr else {
+        return Ok((ReadBound::None, Vec::new()));
+    };
+    let bound_where = bind_single_table(we, schema)?;
+
+    // `pk IN (…)` → an exact gather (empty predicate). Keys ship deduplicated
+    // (`try_extract_pk_in`); the worker OPK-sorts before its forward sweep.
+    if let Some(keys) = try_extract_pk_in(&bound_where, schema) {
+        if keys.len() > gnitz_wire::MAX_PK_SET_KEYS {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "pk IN (…) with {} keys exceeds the {}-key limit",
+                keys.len(),
+                gnitz_wire::MAX_PK_SET_KEYS
+            )));
+        }
+        return Ok((ReadBound::PkSet(keys), Vec::new()));
+    }
+
+    // A PK equality / range → a byte-exact bounded PK walk; the residual (the WHERE
+    // minus every conjunct the walk applies exactly) is the predicate. Exactness at
+    // any PK width is what serves a wide (U128) PK range without the predicate VM.
+    if let Some((desc, residual)) = try_extract_pk_range(&bound_where, schema) {
+        let predicate = compile_read_spec_predicate(&residual, schema)?;
+        return Ok((ReadBound::PkRange(desc), predicate));
+    }
+
+    // The best secondary-index bound, keeping its residual. The walk gating is the
+    // worker's own decision, derived from the range column's type
+    // (`TypeCode::is_wide_int`): a wide-int bound runs the byte-exact walk, so the
+    // candidate's residual is the predicate; a narrow bound may be gate-degraded to
+    // a full cursor, so the whole WHERE stays the predicate.
+    if let Some(c) = best_index_bound(&bound_where, schema, || client.table_indexes(tid))? {
+        let wide = schema.columns[c.range_col()].type_code.is_wide_int();
+        let pred_exprs: Vec<&BoundExpr> = if wide { c.residual } else { vec![&bound_where] };
+        let predicate = compile_read_spec_predicate(&pred_exprs, schema)?;
+        let bound = ReadBound::IndexRange {
+            idx_cols: gnitz_wire::pack_pk_cols(c.idx_cols.as_slice()),
+            desc: c.desc,
+        };
+        return Ok((bound, predicate));
+    }
+
+    let predicate = compile_read_spec_predicate(&[&bound_where], schema)?;
+    Ok((ReadBound::None, predicate))
 }
 
 pub(crate) fn execute_select(
@@ -319,79 +365,25 @@ fn plan_read_spec(
     Ok(SqlResult::Rows { schema, batch })
 }
 
-/// Extract the `ReadBound` and the WHERE conjuncts to re-impose as the
-/// server-side predicate. The predicate is: empty for `PkSet` (the gather is
-/// exact); the extractor's residual for `PkRange` and a wide-int `IndexRange`
-/// (byte-exact walks — consumed conjuncts are applied exactly and stripped);
-/// and the whole WHERE for `None` and a ≤8-byte-int `IndexRange` (whose
-/// selectivity gate may degrade the bound to a full cursor).
-fn extract_bound<'e>(
-    client: &mut GnitzClient,
-    tid: u64,
-    schema: &Schema,
-    where_expr: Option<&'e Expr>,
-) -> Result<(ReadBound, Vec<&'e Expr>), GnitzSqlError> {
-    let Some(we) = where_expr else {
-        return Ok((ReadBound::None, Vec::new()));
-    };
-    let mut all_conjuncts = Vec::new();
-    flatten_conjuncts(we, &mut all_conjuncts);
-
-    // `pk IN (…)` → an exact gather (empty predicate). Keys ship deduplicated
-    // (`try_extract_pk_in`) in whatever order the list gave them — the worker
-    // OPK-sorts before its forward sweep, so wire order is irrelevant.
-    if let Some(keys) = try_extract_pk_in(we, schema) {
-        if keys.len() > gnitz_wire::MAX_PK_SET_KEYS {
-            return Err(GnitzSqlError::Unsupported(format!(
-                "pk IN (…) with {} keys exceeds the {}-key limit",
-                keys.len(),
-                gnitz_wire::MAX_PK_SET_KEYS
-            )));
-        }
-        return Ok((ReadBound::PkSet(keys), Vec::new()));
-    }
-
-    // A PK equality / range → a byte-exact bounded PK walk; the residual (the
-    // WHERE minus every conjunct the walk applies exactly — equalities and
-    // consumed range cuts alike) is the predicate. Exactness at any PK width
-    // is what serves a wide (U128) PK range without the predicate VM.
-    if let Some((desc, residual)) = try_extract_pk_range(we, schema) {
-        return Ok((ReadBound::PkRange(desc), residual));
-    }
-
-    // The best secondary-index bound, keeping its residual. The walk gating is
-    // the worker's own decision, derived from the range column's type
-    // (`TypeCode::is_wide_int` — the shared authority): a wide-int bound runs
-    // the byte-exact walk, so the candidate's residual (the WHERE minus the
-    // consumed conjuncts, which the VM could not compile anyway) is the
-    // predicate; a narrow bound may be gate-degraded to a full cursor, so the
-    // whole WHERE stays the predicate.
-    if let Some(c) = best_index_bound(we, schema, || client.table_indexes(tid))? {
-        let range_col = c.idx_cols.as_slice()[c.desc.eq_vals().len()] as usize;
-        let wide = schema.columns[range_col].type_code.is_wide_int();
-        let bound = ReadBound::IndexRange {
-            idx_cols: gnitz_wire::pack_pk_cols(c.idx_cols.as_slice()),
-            desc: c.desc,
-        };
-        let pred = if wide { c.residual } else { all_conjuncts };
-        return Ok((bound, pred));
-    }
-
-    Ok((ReadBound::None, all_conjuncts))
-}
-
-/// Bind + AND-combine `exprs`, compile to the wire predicate blob. Empty input or
-/// a statically-true predicate → an empty blob (the bound is exact).
-fn compile_read_spec_predicate(exprs: &[&Expr], schema: &Schema) -> Result<Vec<u8>, GnitzSqlError> {
-    let Some((first, rest)) = exprs.split_first() else {
+/// AND-combine the bound residual conjuncts and compile to the wire predicate
+/// blob. Empty input or a statically-true predicate → an empty blob (the bound is
+/// exact). A single conjunct (including the whole-WHERE case) compiles borrow-only;
+/// only a multi-conjunct residual clones — once, for the winning candidate — to
+/// build the owned `AND`-tree.
+fn compile_read_spec_predicate(exprs: &[&BoundExpr], schema: &Schema) -> Result<Vec<u8>, GnitzSqlError> {
+    let Some((&first, rest)) = exprs.split_first() else {
         return Ok(Vec::new());
     };
-    let mut bound = bind_single_table(first, schema)?;
-    for &e in rest {
-        let next = bind_single_table(e, schema)?;
-        bound = BoundExpr::BinOp(Box::new(bound), BinOp::And, Box::new(next));
-    }
-    match compile_filter_program(&bound, schema)? {
+    let folded;
+    let pred = if rest.is_empty() {
+        first
+    } else {
+        folded = rest.iter().fold(first.clone(), |acc, &e| {
+            BoundExpr::BinOp(Box::new(acc), BinOp::And, Box::new(e.clone()))
+        });
+        &folded
+    };
+    match compile_filter_program(pred, schema)? {
         Some(prog) => Ok(prog.encode()),
         None => Ok(Vec::new()),
     }
@@ -491,6 +483,12 @@ fn execute_aggregate_select(
                 agg_col_offset: layout.synthetic_agg_col_offset(),
             };
             let bound = bind_having_expr(having_expr, &ctx)?;
+            // A wide literal rejects on BOTH paths (the view's HAVING compiler
+            // rejects it too), so it must not fall into the probe's generic
+            // failure below — whose CREATE VIEW advice would be false for it.
+            if let Some(lit) = find_wide_literal(&bound) {
+                return Err(wide_int_error(lit));
+            }
             if !having_supported(&bound, &partial_schema) {
                 return Err(GnitzSqlError::Unsupported(
                     "a HAVING over string or 64-bit-unsigned aggregate columns is not supported on a direct SELECT; \

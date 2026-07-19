@@ -1,3 +1,4 @@
+mod access;
 mod agg;
 mod ast_util;
 mod bind;

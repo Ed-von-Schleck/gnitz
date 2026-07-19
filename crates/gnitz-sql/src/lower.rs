@@ -52,6 +52,12 @@ pub(crate) fn lower_bound_expr<B: BoundExprBackend>(
         BoundExpr::LitInt(v) => backend.lit_int(*v),
         BoundExpr::LitFloat(v) => backend.lit_float(*v),
         BoundExpr::LitStr(s) => backend.lit_str(s),
+        // A wide-integer literal has no VM slot (the register file is 8 bytes wide),
+        // so no backend can represent it: one reject arm here surfaces the real
+        // limitation for all three (server VM, client interp, HAVING) at once. A
+        // *servable* wide seek is consumed into a PK/index bound by the access-path
+        // recognizer and never reaches this walk.
+        BoundExpr::LitWide(s) => Err(crate::ir::wide_int_error(s)),
         BoundExpr::LitNull => backend.lit_null(),
         BoundExpr::BinOp(l, op, r) => backend.binop(l, *op, r),
         BoundExpr::UnaryOp(op, inner) => backend.unop(*op, inner),
@@ -832,6 +838,28 @@ mod tests {
             !opcodes(&prog).contains(&EXPR_INT_IN_SET),
             "a float-literal item must not emit INT_IN_SET"
         );
+    }
+
+    /// A surviving `LitWide` literal (an un-servable wide comparison, e.g.
+    /// `non_indexed_u64 = 18446744073709551615`) rejects at the compile boundary
+    /// with the shared wide-int message — the honest surfacing of the VM's
+    /// 8-byte-slot limitation, for every backend that funnels through this walk.
+    #[test]
+    fn lit_wide_rejects_at_compile_boundary() {
+        let schema = two_int_schema(); // (pk U64, a I64, b I64)
+        let expr = BoundExpr::BinOp(
+            Box::new(BoundExpr::ColRef(1)),
+            BinOp::Eq,
+            Box::new(BoundExpr::LitWide("18446744073709551615".to_string())),
+        );
+        let err = compile_bound_expr_to_program(&expr, &schema).expect_err("wide literal must not compile");
+        match err {
+            GnitzSqlError::Unsupported(msg) => {
+                assert!(msg.contains(crate::ir::WIDE_INT_UNSUPPORTED), "message: {msg}");
+                assert!(msg.contains("18446744073709551615"), "message names the literal: {msg}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 
     /// A wide-int (U128) operand takes the OR-chain, which the integer-load path

@@ -1,0 +1,1186 @@
+//! The PK / secondary-index **access-path recognizers**, over **bound conjuncts**
+//! ([`BoundExpr`]). One home, shared by the DML `ReadSpec`/mutate planners and the
+//! view compiler's scan-bound bridge: recognition is done once on the resolved
+//! bound IR, never re-matched on the AST.
+//!
+//! This is a genuine **AST-free leaf**: it imports strictly `ir`, `codec::pk_codec`,
+//! `error`, and `gnitz-core` — no `ast_util`, `bind`, `plan`, or `dml`. Column
+//! identity keys off the resolved `ColRef(idx)`; literals come back through the one
+//! seam [`bound_num_literal`] and pack **byte-exactly** via `pk_codec`
+//! (`pack_pk_value` / `parse_pk_literal_packed` / `parse_uuid_str`), so a bound is
+//! bit-identical to the retired AST recognizer's — the packing depends only on the
+//! parsed value and sign, never the literal's spelling.
+//!
+//! Residual conjuncts are returned as **borrows** of the caller's bound WHERE:
+//! candidates are collected per index but at most one is ever used, so the caller
+//! clones (or compiles) only the winner's residual.
+
+use crate::codec::pk_codec::{pack_pk_value, parse_literal_i128, parse_pk_literal_packed, parse_uuid_str};
+use crate::error::GnitzSqlError;
+use crate::ir::{BExpr, BinOp, BoundExpr, UnaryOp};
+use gnitz_core::{ClientError, Cut, FixedInt, IndexMeta, PkColList, PkTuple, RangeDescriptor, Schema, TypeCode};
+use std::cmp::Reverse;
+use std::collections::HashSet;
+use std::sync::Arc;
+
+// ---------------------------------------------------------------------------
+// The bound-literal seam
+// ---------------------------------------------------------------------------
+
+/// A bound numeric literal, sign applied. `LitInt` and `LitWide` — the two numeric
+/// literal shapes binding produces — optionally under an outer `Neg`, are the only
+/// cases: a negative literal rides as `UnaryOp(Neg, Lit…)`.
+#[derive(Clone, Copy)]
+enum NumLit<'e> {
+    /// A native literal (any i64, sign applied — `-(i64::MIN)` fits i128).
+    Small(i128),
+    /// A wide magnitude digit string + sign. Kept as the raw string because the
+    /// `i128`-vs-`u128` parse is the recognizer's call: it holds the column
+    /// `TypeCode`, and a `LitWide` in the `(i128::MAX, u128::MAX]` band
+    /// (`U128`/`UUID`) needs the u128 parse a signed value could not represent.
+    Wide(&'e str, bool),
+}
+
+/// The one seam from a bound numeric literal to a [`NumLit`].
+fn bound_num_literal(e: &BoundExpr) -> Option<NumLit<'_>> {
+    match e {
+        BExpr::LitInt(v) => Some(NumLit::Small(*v as i128)),
+        BExpr::LitWide(s) => Some(NumLit::Wide(s, false)),
+        BExpr::UnaryOp(UnaryOp::Neg, inner) => match inner.as_ref() {
+            BExpr::LitInt(v) => Some(NumLit::Small(-(*v as i128))),
+            BExpr::LitWide(s) => Some(NumLit::Wide(s, true)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Pack a numeric literal as a seek/range key for column type `tc`, byte-exactly
+/// via `pk_codec` (an out-of-type-range literal declines, never wraps).
+fn pack_num(tc: TypeCode, lit: NumLit<'_>) -> Option<u128> {
+    match lit {
+        NumLit::Small(v) => pack_pk_value(tc, v),
+        NumLit::Wide(s, negated) => parse_pk_literal_packed(tc, s, negated),
+    }
+}
+
+/// A bound literal accepted for a seek/range key: a numeric value + sign, or a
+/// string (a single-quoted UUID). The AST-free analogue of `pk_codec::SqlLiteral`.
+enum BoundLit<'e> {
+    Num(NumLit<'e>),
+    Str(&'e str),
+}
+
+fn bound_literal(e: &BoundExpr) -> Option<BoundLit<'_>> {
+    if let Some(n) = bound_num_literal(e) {
+        return Some(BoundLit::Num(n));
+    }
+    if let BExpr::LitStr(s) = e {
+        return Some(BoundLit::Str(s));
+    }
+    None
+}
+
+/// Classify a bound binary op's operands as `(col_idx, literal, flipped)`: the
+/// resolved `ColRef` may sit on either side, `flipped` is true when the literal was
+/// on the left (`lit OP col`), so a range recognizer can mirror the operator. The
+/// bound analogue of the AST `split_col_vs_literal`.
+fn bound_col_vs_literal<'e>(a: &'e BoundExpr, b: &'e BoundExpr) -> Option<(usize, BoundLit<'e>, bool)> {
+    if let BExpr::ColRef(idx) = a {
+        if let Some(l) = bound_literal(b) {
+            return Some((*idx, l, false));
+        }
+    }
+    if let BExpr::ColRef(idx) = b {
+        if let Some(l) = bound_literal(a) {
+            return Some((*idx, l, true));
+        }
+    }
+    None
+}
+
+/// Flatten a bound `AND`-tree into its leaf conjuncts, left to right. Binding
+/// already unwrapped `Nested`, so there is nothing else to descend. The bound
+/// analogue of `ast_util::flatten_conjuncts`, kept local so this leaf imports no
+/// `ast_util`.
+fn flatten_bound_conjuncts<'e>(expr: &'e BoundExpr, out: &mut Vec<&'e BoundExpr>) {
+    if let BExpr::BinOp(l, BinOp::And, r) = expr {
+        flatten_bound_conjuncts(l, out);
+        flatten_bound_conjuncts(r, out);
+    } else {
+        out.push(expr);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Front matchers
+// ---------------------------------------------------------------------------
+
+/// Extract `(col_idx, packed_key)` from a bound `col = literal`. Does NOT check
+/// index existence.
+fn try_col_eq_literal(expr: &BoundExpr, schema: &Schema) -> Option<(usize, u128)> {
+    let BExpr::BinOp(left, BinOp::Eq, right) = expr else {
+        return None;
+    };
+    // `=` is symmetric, so the flipped flag is irrelevant here.
+    let (col_idx, lit, _) = bound_col_vs_literal(left, right)?;
+    let col_tc = schema.columns[col_idx].type_code;
+
+    // A single-quoted string is a seek key only for a UUID column; numerics pack
+    // byte-exactly through pk_codec so the SEEK/INSERT parse sites cannot drift.
+    let key = match lit {
+        BoundLit::Str(s) if col_tc == TypeCode::UUID => parse_uuid_str(s).ok()?,
+        BoundLit::Str(_) => return None,
+        BoundLit::Num(n) => pack_num(col_tc, n)?,
+    };
+    Some((col_idx, key))
+}
+
+/// `Some(keys)` when `expr` is exactly `pk IN (literal, …)` on a single-column PK;
+/// the keys are deduped (first occurrence wins). `None` routes the WHERE back to
+/// the seek/index/scan ladder. `NOT IN` binds to `UnaryOp(Not, InList)` and so
+/// never matches the `InList` arm here.
+pub(crate) fn try_extract_pk_in(expr: &BoundExpr, schema: &Schema) -> Option<Vec<u128>> {
+    // Compound PK has no IN-list fast path; fall back to a full delta scan.
+    if schema.pk_count() != 1 {
+        return None;
+    }
+    let BExpr::InList { inner, items } = expr else {
+        return None;
+    };
+    let BExpr::ColRef(col_idx) = inner.as_ref() else {
+        return None;
+    };
+    let pk_idx = schema.pk_indices()[0];
+    if *col_idx != pk_idx {
+        return None;
+    }
+    let pk_col = &schema.columns[pk_idx];
+    let mut seen = HashSet::with_capacity(items.len());
+    let mut pks = Vec::with_capacity(items.len());
+    for item in items {
+        // Optionally-negated numerics, plus single-quoted UUID strings for a UUID
+        // PK — exactly the literals `try_col_eq_literal` accepts, so `IN (…)` and
+        // `= …` route identically. A NULL/float/non-literal or an unparseable UUID
+        // aborts to the slow scan.
+        let v = match bound_literal(item)? {
+            BoundLit::Num(n) => pack_num(pk_col.type_code, n)?,
+            BoundLit::Str(s) if pk_col.type_code == TypeCode::UUID => parse_uuid_str(s).ok()?,
+            _ => return None,
+        };
+        if seen.insert(v) {
+            pks.push(v);
+        }
+    }
+    Some(pks)
+}
+
+/// `Some((pk_tuple, residual))` when the conjuncts of `expr` bind every PK column
+/// to a literal; `residual` holds the leftover bound conjuncts to filter against
+/// the seeked row, empty when the `WHERE` is exactly the PK equality. `None` when
+/// the PK is not fully bound.
+pub(crate) fn try_extract_pk_seek_residual<'e>(
+    expr: &'e BoundExpr,
+    schema: &Schema,
+) -> Option<(PkTuple, Vec<&'e BoundExpr>)> {
+    let mut conjuncts = Vec::new();
+    flatten_bound_conjuncts(expr, &mut conjuncts);
+
+    let stride = schema.pk_stride() as u8;
+    let mut tuple = PkTuple::new(stride);
+    let mut slot_set = [false; gnitz_core::MAX_PK_COLUMNS];
+    let mut bound = 0usize;
+    let mut residual = Vec::new();
+
+    for &cand in &conjuncts {
+        // Consume `pk_col = literal` for an as-yet-unbound PK slot into the tuple;
+        // everything else routes to the residual.
+        let mut consumed = false;
+        if let Some((col_idx, val)) = try_col_eq_literal(cand, schema) {
+            if let Some(pk_pos) = schema.pk_indices().iter().position(|&pi| pi == col_idx) {
+                if !slot_set[pk_pos] {
+                    slot_set[pk_pos] = true;
+                    bound += 1;
+                    let off = schema.pk_byte_offset(col_idx);
+                    let w = schema.columns[col_idx].type_code.wire_stride();
+                    tuple.buf[off..off + w].copy_from_slice(&val.to_le_bytes()[..w]);
+                    consumed = true;
+                }
+            }
+        }
+        if !consumed {
+            residual.push(cand);
+        }
+    }
+
+    (bound == schema.pk_count()).then_some((tuple, residual))
+}
+
+/// An **exact-or-superset** PK range for `where_expr` plus the residual bound
+/// conjuncts. `None` when no PK conjunct bounds the PK. The PK is treated as its
+/// own index: the leading equality prefix in pk-list order, then the next PK
+/// column's first start/end cuts. The PK walk is byte-exact at any width, so every
+/// consumed conjunct is applied exactly and stripped from the residual — that is
+/// what makes a wide (U128) PK range servable without the predicate VM.
+pub(crate) fn try_extract_pk_range<'e>(
+    where_expr: &'e BoundExpr,
+    schema: &Schema,
+) -> Option<(RangeDescriptor, Vec<&'e BoundExpr>)> {
+    let pk = schema.pk_indices();
+    let mut conjuncts = Vec::new();
+    flatten_bound_conjuncts(where_expr, &mut conjuncts);
+
+    let eqs = collect_eq_conjuncts(&conjuncts, schema, |col| schema.is_pk_col(col));
+    let pk_cols: Vec<u32> = pk.iter().map(|&c| c as u32).collect();
+    let (mut eq_vals, mut consumed) = consume_leading_eq_prefix(&pk_cols, &eqs);
+
+    if eq_vals.len() < pk.len() {
+        let ends = collect_range_ends(&conjuncts, schema);
+        if let Some((start, end)) = bound_next_column(pk_cols[eq_vals.len()], &ends, schema, &mut consumed) {
+            let desc = RangeDescriptor::new(&eq_vals, start, end);
+            return Some((desc, residual_conjuncts(&conjuncts, &consumed)));
+        }
+    }
+    // No range on the next column (or every PK column pinned): a full/partial
+    // equality. Lower the last pinned column to a degenerate point, else nothing
+    // bounds the PK.
+    let last = eq_vals.pop()?;
+    Some((
+        RangeDescriptor::point(&eq_vals, last),
+        residual_conjuncts(&conjuncts, &consumed),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Shared collectors
+// ---------------------------------------------------------------------------
+
+/// Every `col = literal` equality among `conjuncts` whose column `eligible`
+/// accepts, tagged with its conjunct index so the residual can exclude exactly the
+/// consumed conjuncts. The index collectors pass [`index_eligible_col`]; the
+/// PK-range extractor passes `is_pk_col`.
+fn collect_eq_conjuncts(
+    conjuncts: &[&BoundExpr],
+    schema: &Schema,
+    eligible: impl Fn(usize) -> bool,
+) -> Vec<(usize /*conjunct*/, usize /*col*/, u128 /*key*/)> {
+    let mut eqs = Vec::new();
+    for (ci, &cand) in conjuncts.iter().enumerate() {
+        if let Some((col, key)) = try_col_eq_literal(cand, schema) {
+            if eligible(col) {
+                eqs.push((ci, col, key));
+            }
+        }
+    }
+    eqs
+}
+
+/// The secondary-index eligibility both index collectors share: PK columns and
+/// index-ineligible types can never carry a secondary index.
+fn index_eligible_col(schema: &Schema, col: usize) -> bool {
+    !schema.is_pk_col(col) && schema.columns[col].type_code.is_pk_eligible()
+}
+
+/// Consume equality conjuncts as an index's leading columns (leading-prefix rule:
+/// stop at the first column with no covering equality). Returns the covered key
+/// values and the consumed conjunct indices.
+fn consume_leading_eq_prefix(idx_cols: &[u32], eqs: &[(usize, usize, u128)]) -> (Vec<u128>, Vec<usize>) {
+    let mut vals = Vec::new();
+    let mut consumed = Vec::new();
+    for &col in idx_cols {
+        match eqs.iter().find(|&&(_, c, _)| c as u32 == col) {
+            Some(&(conj, _, key)) => {
+                vals.push(key);
+                consumed.push(conj);
+            }
+            None => break,
+        }
+    }
+    (vals, consumed)
+}
+
+/// True when an index column past the first `covered` is nullable — the
+/// leading-prefix safety rejection both collectors share (a NULL in any indexed
+/// column omits the whole row from the index, so an uncovered nullable trailing
+/// column would silently drop rows the predicate matches).
+fn uncovered_trailing_nullable(idx_cols: &[u32], covered: usize, schema: &Schema) -> bool {
+    covered < idx_cols.len()
+        && idx_cols[covered..]
+            .iter()
+            .any(|&c| schema.columns[c as usize].is_nullable)
+}
+
+/// The conjuncts a seek/range plan did not consume, kept as post-scan filters.
+/// Borrows: at most one candidate wins, so only the winner's residual is ever
+/// cloned or compiled by the caller.
+fn residual_conjuncts<'e>(conjuncts: &[&'e BoundExpr], consumed: &[usize]) -> Vec<&'e BoundExpr> {
+    conjuncts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !consumed.contains(i))
+        .map(|(_, &e)| e)
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Ordered range scans
+// ---------------------------------------------------------------------------
+
+/// Which end of the candidate interval a conjunct bounds.
+#[derive(Clone, Copy, PartialEq)]
+enum RangeSide {
+    Start,
+    End,
+}
+
+/// One end of a range predicate on a column: which interval end it bounds and the
+/// cut it induces there.
+struct RangeEnd {
+    side: RangeSide,
+    cut: Cut,
+}
+
+/// One collected range end tagged with the conjunct it came from.
+struct RangeEndEntry {
+    conjunct: usize,
+    col: usize,
+    end: RangeEnd,
+}
+
+/// Turn a range-end literal for column type `tc` into its cut; `mk` is the
+/// constructor for an in-range literal — `Cut::After` when the cut falls above the
+/// literal's whole duplicate group, `Cut::Before` when below. Values run as `i128`
+/// so a literal past the type's min/max SATURATES to the matching
+/// `Cut::type_edges` edge instead of wrapping. Returns `None` for a type that
+/// cannot carry an ordered range bound here (UUID, float, string), leaving the
+/// predicate a residual.
+fn parse_range_cut(tc: TypeCode, lit: NumLit<'_>, mk: fn(u128) -> Cut) -> Option<Cut> {
+    // U128: full unsigned range — saturation is impossible (an i128 cannot
+    // represent its upper half), and a literal past u128::MAX fails the parse,
+    // keeping the conjunct a residual.
+    if tc == TypeCode::U128 {
+        return match lit {
+            NumLit::Small(v) => (v >= 0).then(|| mk(v as u128)),
+            NumLit::Wide(_, true) => None,
+            NumLit::Wide(s, false) => s.parse::<u128>().ok().map(mk),
+        };
+    }
+    let fi = FixedInt::from_type_code(tc)?;
+    let (min, max) = fi.range();
+    let (below, above) = Cut::type_edges(tc)?;
+    let v = match lit {
+        NumLit::Small(v) => v,
+        NumLit::Wide(s, negated) => parse_literal_i128(s, negated)?,
+    };
+    Some(if v < min {
+        below
+    } else if v > max {
+        above
+    } else {
+        mk(fi.pack(v))
+    })
+}
+
+/// Recognize a bound `col OP lit` (and the flipped `lit OP col`) for OP in
+/// `>`,`>=`,`<`,`<=`, mapping it to the column index and a `RangeEnd`. Returns
+/// `None` for anything else (equality, non-numeric literal, non-range-servable
+/// type). A `BETWEEN` never reaches here: binding desugars it into `>= AND <=`,
+/// which flatten to two ordinary range-end conjuncts.
+fn try_col_range_literal(expr: &BoundExpr, schema: &Schema) -> Option<(usize, RangeEnd)> {
+    let BExpr::BinOp(left, op, right) = expr else {
+        return None;
+    };
+    if !matches!(op, BinOp::Gt | BinOp::Ge | BinOp::Lt | BinOp::Le) {
+        return None;
+    }
+    let (col_idx, lit, flipped) = bound_col_vs_literal(left, right)?;
+    let (side, mk): (RangeSide, fn(u128) -> Cut) = match (*op, flipped) {
+        (BinOp::Gt, false) | (BinOp::Lt, true) => (RangeSide::Start, Cut::After), // col > lit / lit < col
+        (BinOp::Ge, false) | (BinOp::Le, true) => (RangeSide::Start, Cut::Before), // col >= lit / lit <= col
+        (BinOp::Lt, false) | (BinOp::Gt, true) => (RangeSide::End, Cut::Before),  // col < lit / lit > col
+        (BinOp::Le, false) | (BinOp::Ge, true) => (RangeSide::End, Cut::After),   // col <= lit / lit >= col
+        _ => unreachable!("operator set guarded above"),
+    };
+    let tc = schema.columns[col_idx].type_code;
+    let BoundLit::Num(n) = lit else {
+        return None;
+    };
+    let cut = parse_range_cut(tc, n, mk)?;
+    Some((col_idx, RangeEnd { side, cut }))
+}
+
+/// Every range end among `conjuncts` (`col OP lit` and flipped forms), tagged with
+/// its conjunct index. Shared by the index range collector and the PK-range
+/// extractor. BETWEEN desugars to two `>=`/`<=` conjuncts at bind, each a separate
+/// entry here.
+fn collect_range_ends(conjuncts: &[&BoundExpr], schema: &Schema) -> Vec<RangeEndEntry> {
+    let mut ends: Vec<RangeEndEntry> = Vec::new();
+    for (ci, &cand) in conjuncts.iter().enumerate() {
+        if let Some((col, end)) = try_col_range_literal(cand, schema) {
+            ends.push(RangeEndEntry { conjunct: ci, col, end });
+        }
+    }
+    ends
+}
+
+/// Bound `range_col` by the FIRST start-side and FIRST end-side cut among `ends`
+/// (never a compare of two packed natives to pick the tighter one — the residual
+/// re-imposes any redundant same-side end exactly), widening an unconstrained side
+/// to the column type's edge cut. Pushes onto `consumed` each range conjunct whose
+/// ends were ALL chosen. `None` when no end covers `range_col`, or its type carries
+/// no ordered range.
+fn bound_next_column(
+    range_col: u32,
+    ends: &[RangeEndEntry],
+    schema: &Schema,
+    consumed: &mut Vec<usize>,
+) -> Option<(Cut, Cut)> {
+    let start_idx = ends
+        .iter()
+        .position(|e| e.col as u32 == range_col && e.end.side == RangeSide::Start);
+    let end_idx = ends
+        .iter()
+        .position(|e| e.col as u32 == range_col && e.end.side == RangeSide::End);
+    if start_idx.is_none() && end_idx.is_none() {
+        return None;
+    }
+    let tc = schema.columns[range_col as usize].type_code;
+    let (edge_start, edge_end) = Cut::type_edges(tc)?;
+    let start = start_idx.map_or(edge_start, |i| ends[i].end.cut);
+    let end = end_idx.map_or(edge_end, |i| ends[i].end.cut);
+
+    let chosen = [start_idx, end_idx];
+    for cj in chosen.iter().flatten().map(|&i| ends[i].conjunct) {
+        let all_chosen = ends
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.conjunct == cj)
+            .all(|(i, _)| chosen.contains(&Some(i)));
+        if all_chosen && !consumed.contains(&cj) {
+            consumed.push(cj);
+        }
+    }
+    Some((start, end))
+}
+
+// ---------------------------------------------------------------------------
+// Secondary-index seek + range candidates
+// ---------------------------------------------------------------------------
+
+/// One index-servable seek candidate: the index's FULL declared column list, the
+/// covered leading key values, and the residual bound conjuncts to filter after
+/// the seek.
+pub(crate) type IndexSeekCandidate<'e> = (PkColList, Vec<u128>, Vec<&'e BoundExpr>);
+
+/// Every index-servable seek candidate among the conjuncts of `expr`, best first.
+/// `fetch_indexes` (one epoch-validated GET_INDICES round-trip) is called only when
+/// at least one eligible equality exists.
+pub(crate) fn collect_index_seek_candidates<'e>(
+    expr: &'e BoundExpr,
+    schema: &Schema,
+    fetch_indexes: impl FnOnce() -> Result<Arc<Vec<IndexMeta>>, ClientError>,
+) -> Result<Vec<IndexSeekCandidate<'e>>, ClientError> {
+    let mut conjuncts = Vec::new();
+    flatten_bound_conjuncts(expr, &mut conjuncts);
+
+    let eqs = collect_eq_conjuncts(&conjuncts, schema, |col| index_eligible_col(schema, col));
+    if eqs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let indexes = fetch_indexes()?;
+    let mut out: Vec<IndexSeekCandidate<'e>> = Vec::new();
+    for meta in indexes.iter() {
+        let idx_cols = meta.cols.as_slice();
+        let (vals, consumed) = consume_leading_eq_prefix(idx_cols, &eqs);
+        if vals.is_empty() {
+            continue;
+        }
+        if uncovered_trailing_nullable(idx_cols, vals.len(), schema) {
+            continue;
+        }
+        out.push((meta.cols, vals, residual_conjuncts(&conjuncts, &consumed)));
+    }
+
+    // Best first: longer covered prefix wins; on a tie the tighter index wins.
+    out.sort_by(|a, b| {
+        b.1.len()
+            .cmp(&a.1.len())
+            .then_with(|| a.0.as_slice().len().cmp(&b.0.as_slice().len()))
+    });
+    Ok(out)
+}
+
+/// One index-servable range candidate: the index's FULL declared column list, the
+/// wire descriptor, and the residual bound conjuncts to filter after the scan.
+pub(crate) struct IndexRangeCandidate<'e> {
+    pub(crate) idx_cols: PkColList,
+    pub(crate) desc: RangeDescriptor,
+    pub(crate) residual: Vec<&'e BoundExpr>,
+}
+
+impl IndexRangeCandidate<'_> {
+    /// The range column: the index column immediately after the equality prefix —
+    /// the one layout invariant of the descriptor, kept here so consumers never
+    /// re-derive it from the candidate's internals.
+    pub(crate) fn range_col(&self) -> usize {
+        self.idx_cols.as_slice()[self.desc.eq_vals().len()] as usize
+    }
+}
+
+/// Every index-servable range candidate among the conjuncts of `expr`. Collect
+/// equality conjuncts (the leading prefix) and range ends; for each index consume
+/// the equalities as the leading `E` columns, then require column `E` to be covered
+/// by ≥1 range end. The FIRST start/end cut on column `E` become the interval.
+fn collect_index_range_candidates<'e>(
+    expr: &'e BoundExpr,
+    schema: &Schema,
+    fetch_indexes: impl FnOnce() -> Result<Arc<Vec<IndexMeta>>, ClientError>,
+) -> Result<Vec<IndexRangeCandidate<'e>>, ClientError> {
+    let mut conjuncts = Vec::new();
+    flatten_bound_conjuncts(expr, &mut conjuncts);
+
+    let eqs = collect_eq_conjuncts(&conjuncts, schema, |col| index_eligible_col(schema, col));
+    let ends = collect_range_ends(&conjuncts, schema);
+    // A range candidate needs at least one range end; a pure-equality WHERE is
+    // handled by collect_index_seek_candidates, so this costs no wire traffic then.
+    if ends.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let indexes = fetch_indexes()?;
+    let mut out: Vec<IndexRangeCandidate<'e>> = Vec::new();
+    for meta in indexes.iter() {
+        let idx_cols = meta.cols.as_slice();
+        let (eq_vals, eq_consumed) = consume_leading_eq_prefix(idx_cols, &eqs);
+        let n_eq = eq_vals.len();
+        // The range column is the next index column after the equality prefix.
+        if n_eq >= idx_cols.len() {
+            continue;
+        }
+        let range_col = idx_cols[n_eq];
+
+        // Covered columns are the equality prefix + the range column (n_eq + 1).
+        if uncovered_trailing_nullable(idx_cols, n_eq + 1, schema) {
+            continue;
+        }
+
+        let mut consumed = eq_consumed;
+        let Some((start, end)) = bound_next_column(range_col, &ends, schema, &mut consumed) else {
+            continue; // range column not covered
+        };
+
+        out.push(IndexRangeCandidate {
+            idx_cols: meta.cols,
+            desc: RangeDescriptor::new(&eq_vals, start, end),
+            residual: residual_conjuncts(&conjuncts, &consumed),
+        });
+    }
+
+    // Best first: more equality-pinned columns first, then the tighter index.
+    out.sort_by(|a, b| {
+        b.desc
+            .eq_vals()
+            .len()
+            .cmp(&a.desc.eq_vals().len())
+            .then_with(|| a.idx_cols.as_slice().len().cmp(&b.idx_cols.as_slice().len()))
+    });
+    Ok(out)
+}
+
+/// Memoizes one `table_indexes` list across the range → equality collector
+/// fall-through: `table_indexes` ALWAYS hits the wire, so within one statement the
+/// second collector reuses the first's list rather than fetch it twice.
+#[derive(Default)]
+struct IndexListMemo(Option<Arc<Vec<IndexMeta>>>);
+
+impl IndexListMemo {
+    fn get(
+        &mut self,
+        fetch: impl FnOnce() -> Result<Arc<Vec<IndexMeta>>, ClientError>,
+    ) -> Result<Arc<Vec<IndexMeta>>, ClientError> {
+        match &self.0 {
+            Some(list) => Ok(Arc::clone(list)),
+            None => {
+                let list = fetch()?;
+                self.0 = Some(Arc::clone(&list));
+                Ok(list)
+            }
+        }
+    }
+}
+
+/// The best index range/equality bound for `where_expr` as a full
+/// [`IndexRangeCandidate`] — descriptor plus the chosen candidate's residual (the
+/// WHERE conjuncts the bound does not apply). `fetch` (the GET_INDICES probe) is
+/// injected and called **at most once** (both collectors are lazy and share one
+/// [`IndexListMemo`]).
+///
+/// Every candidate unifies as a range: a pure n-column equality lowers to a
+/// degenerate point range over its LAST column, since `RangeDescriptor` cannot
+/// express "no range column". The merged candidates are ranked by [`pinned_score`]
+/// — most-constrained first — and the head taken outright.
+pub(crate) fn best_index_bound<'e, F>(
+    where_expr: &'e BoundExpr,
+    schema: &Schema,
+    mut fetch: F,
+) -> Result<Option<IndexRangeCandidate<'e>>, GnitzSqlError>
+where
+    F: FnMut() -> Result<Arc<Vec<IndexMeta>>, ClientError>,
+{
+    let mut memo = IndexListMemo::default();
+    let ranges =
+        collect_index_range_candidates(where_expr, schema, || memo.get(&mut fetch)).map_err(GnitzSqlError::Exec)?;
+    let seeks =
+        collect_index_seek_candidates(where_expr, schema, || memo.get(&mut fetch)).map_err(GnitzSqlError::Exec)?;
+
+    let mut cands: Vec<IndexRangeCandidate<'e>> = ranges
+        .into_iter()
+        .chain(seeks.into_iter().map(|(idx_cols, vals, residual)| {
+            let n = vals.len();
+            IndexRangeCandidate {
+                idx_cols,
+                desc: RangeDescriptor::point(&vals[..n - 1], vals[n - 1]),
+                residual,
+            }
+        }))
+        .collect();
+    // Stable sort: on a full tie the range collector's candidate (listed first)
+    // wins, matching each collector's own internal preference order.
+    cands.sort_by_key(|c| Reverse(pinned_score(c, schema)));
+    Ok(cands.into_iter().next())
+}
+
+/// How constrained a candidate leaves the index walk, as a totally ordered key:
+/// 2 per equality-pinned column plus 1 per real range side, then (ascending arity)
+/// the tighter index on a tie. One rule ranks equality and range candidates
+/// together — "most pinned columns wins".
+fn pinned_score(c: &IndexRangeCandidate<'_>, schema: &Schema) -> (u32, Reverse<usize>) {
+    let n_eq = c.desc.eq_vals().len();
+    let sides = match Cut::type_edges(schema.columns[c.range_col()].type_code) {
+        Some((lo, hi)) => (c.desc.start != lo) as u32 + (c.desc.end != hi) as u32,
+        // Unreachable: both collectors only emit range-servable column types.
+        None => 2,
+    };
+    (2 * n_eq as u32 + sides, Reverse(c.idx_cols.as_slice().len()))
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — over bound conjuncts (parse + bind), asserted values unchanged.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bind::bind_single_table;
+    use crate::codec::pk_codec::extract_pk_value;
+    use crate::test_support::{
+        bind_where, col_def, compound_schema_u64_u64, eq_expr, idx_metas, in_list_expr, neg_num_expr, num_expr,
+        parse_expr_sql, pk_schema, two_col, uuid_schema_payload, uuid_schema_pk,
+    };
+    use sqlparser::ast::Expr;
+
+    /// schema: (id U64 pk, a U64, b U64) → indexable cols a=1, b=2.
+    fn abc_schema() -> Schema {
+        Schema {
+            columns: vec![
+                col_def("id", TypeCode::U64, false),
+                col_def("a", TypeCode::U64, false),
+                col_def("b", TypeCode::U64, false),
+            ],
+            pk_cols: vec![0],
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // try_col_eq_literal — UUID + negative signed integer index seek keys
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_uuid_index_seek_string_literal() {
+        let schema = uuid_schema_payload();
+        let expr = bind_where("uid = '550e8400-e29b-41d4-a716-446655440000'", &schema);
+        assert_eq!(
+            try_col_eq_literal(&expr, &schema),
+            Some((1, 0x550e8400_e29b_41d4_a716_446655440000_u128))
+        );
+    }
+
+    #[test]
+    fn test_try_col_eq_literal_negative_i64() {
+        let schema = two_col(TypeCode::I64);
+        let expr = bind_where("val = -1", &schema);
+        // -1i64 as u64 = u64::MAX
+        assert_eq!(try_col_eq_literal(&expr, &schema), Some((1, ((-1i64) as u64) as u128)));
+    }
+
+    #[test]
+    fn test_try_col_eq_literal_negative_i32() {
+        let schema = two_col(TypeCode::I32);
+        let expr = bind_where("val = -1", &schema);
+        assert_eq!(
+            try_col_eq_literal(&expr, &schema),
+            Some((1, ((-1i32 as u32) as u64) as u128))
+        );
+    }
+
+    #[test]
+    fn test_try_col_eq_literal_negative_i16() {
+        let schema = two_col(TypeCode::I16);
+        let expr = bind_where("val = -1", &schema);
+        assert_eq!(
+            try_col_eq_literal(&expr, &schema),
+            Some((1, ((-1i16 as u16) as u64) as u128))
+        );
+    }
+
+    #[test]
+    fn test_try_col_eq_literal_negative_i8() {
+        let schema = two_col(TypeCode::I8);
+        let expr = bind_where("val = -5", &schema);
+        assert_eq!(
+            try_col_eq_literal(&expr, &schema),
+            Some((1, ((-5i8 as u8) as u64) as u128))
+        );
+    }
+
+    #[test]
+    fn test_try_col_eq_literal_positive_i64_still_works() {
+        let schema = two_col(TypeCode::I64);
+        let expr = bind_where("val = 42", &schema);
+        assert_eq!(try_col_eq_literal(&expr, &schema), Some((1, 42u128)));
+    }
+
+    #[test]
+    fn test_try_col_eq_literal_negative_u64_returns_none() {
+        // Cannot have a negative value for an unsigned column.
+        let schema = two_col(TypeCode::U64);
+        let expr = bind_where("val = -1", &schema);
+        assert_eq!(try_col_eq_literal(&expr, &schema), None);
+    }
+
+    #[test]
+    fn test_try_col_eq_literal_wide_u64_max() {
+        // u64::MAX overflows i64 → binds to `LitWide`; the recognizer parses it
+        // byte-exactly for a U64 column (the servable wide PK/index seek).
+        let schema = two_col(TypeCode::U64);
+        let expr = bind_where("val = 18446744073709551615", &schema);
+        assert_eq!(try_col_eq_literal(&expr, &schema), Some((1, u64::MAX as u128)));
+    }
+
+    /// A single-quoted UUID binds as a servable seek literal; a double-quoted token
+    /// is an `Identifier` in `GenericDialect`, so binding it as a column reference
+    /// fails (no such column) — it is never a seek literal. The double-quote
+    /// guarantee moved from the AST recognizer to the parser + binder.
+    #[test]
+    fn double_quoted_uuid_binds_as_column_ref_not_seek() {
+        let schema = uuid_schema_payload();
+        let sq = bind_single_table(&parse_expr_sql("uid = '550e8400-e29b-41d4-a716-446655440000'"), &schema).unwrap();
+        assert!(
+            try_col_eq_literal(&sq, &schema).is_some(),
+            "single-quoted UUID is a seek key"
+        );
+
+        let err = bind_single_table(
+            &parse_expr_sql("uid = \"550e8400-e29b-41d4-a716-446655440000\""),
+            &schema,
+        )
+        .expect_err("double-quoted token must not bind as a literal");
+        assert!(matches!(err, GnitzSqlError::Bind(_)), "got {err:?}");
+    }
+
+    // ------------------------------------------------------------------
+    // try_extract_pk_seek_residual — compound PK + residual carry
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn compound_pk_try_extract_pk_seek_full_binding() {
+        let schema = compound_schema_u64_u64();
+        let expr = bind_where("a = 1 AND b = 2", &schema);
+        let (pk, residual) = try_extract_pk_seek_residual(&expr, &schema).expect("must bind");
+        assert!(residual.is_empty());
+        assert_eq!(pk.stride, 16);
+        let mut expect = [0u8; 16];
+        expect[..8].copy_from_slice(&1u64.to_le_bytes());
+        expect[8..16].copy_from_slice(&2u64.to_le_bytes());
+        assert_eq!(pk.as_bytes(), &expect[..]);
+    }
+
+    #[test]
+    fn compound_pk_try_extract_pk_seek_reordered_and_tree() {
+        let schema = compound_schema_u64_u64();
+        // (b = 2) AND (a = 1) — order swapped; tuple must still pack in pk-list order.
+        let expr = bind_where("b = 2 AND a = 1", &schema);
+        let (pk, residual) = try_extract_pk_seek_residual(&expr, &schema).expect("must bind");
+        assert!(residual.is_empty());
+        let mut expect = [0u8; 16];
+        expect[..8].copy_from_slice(&1u64.to_le_bytes());
+        expect[8..16].copy_from_slice(&2u64.to_le_bytes());
+        assert_eq!(pk.as_bytes(), &expect[..]);
+    }
+
+    #[test]
+    fn compound_pk_try_extract_pk_seek_partial_returns_none() {
+        let schema = compound_schema_u64_u64();
+        let expr = bind_where("a = 1", &schema); // only one of two PK cols
+        assert!(try_extract_pk_seek_residual(&expr, &schema).is_none());
+    }
+
+    #[test]
+    fn compound_pk_try_extract_pk_seek_incomplete_pk_with_payload_returns_none() {
+        let schema = compound_schema_u64_u64();
+        // `a` binds, `v` is a payload conjunct → residual; PK stays incomplete → None.
+        let expr = bind_where("a = 1 AND v = 9", &schema);
+        assert!(try_extract_pk_seek_residual(&expr, &schema).is_none());
+    }
+
+    #[test]
+    fn compound_pk_try_extract_pk_seek_duplicate_binding_returns_none() {
+        let schema = compound_schema_u64_u64();
+        // (a = 1) AND (a = 2) — the second routes to the residual, `b` stays unbound → None.
+        let expr = bind_where("a = 1 AND a = 2", &schema);
+        assert!(try_extract_pk_seek_residual(&expr, &schema).is_none());
+    }
+
+    #[test]
+    fn pk_seek_residual_keeps_non_pk_conjunct() {
+        let schema = pk_schema(TypeCode::U64);
+        let expr = bind_where("id = 1 AND v = 9", &schema);
+        let (pk, residual) = try_extract_pk_seek_residual(&expr, &schema).expect("PK binds");
+        assert_eq!(pk.as_bytes(), &1u64.to_le_bytes()[..]);
+        assert_eq!(residual.len(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // collect_index_seek_candidates
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn collect_index_seek_candidates_skips_float_col() {
+        // `WHERE val = 1` on a float column emits no candidate: a float column is
+        // never index-key-eligible, so fetch_indexes must not even be called.
+        let schema = two_col(TypeCode::F64);
+        let expr = bind_where("val = 1", &schema);
+        let cands = collect_index_seek_candidates(&expr, &schema, || {
+            panic!("no eligible equality — the index list must not be fetched")
+        })
+        .unwrap();
+        assert!(cands.is_empty());
+    }
+
+    #[test]
+    fn collect_index_seek_candidates_flattens_and_tree() {
+        let schema = Schema {
+            columns: vec![
+                col_def("pk", TypeCode::U64, false),
+                col_def("a", TypeCode::U64, true),
+                col_def("b", TypeCode::U64, true),
+                col_def("c", TypeCode::U64, true),
+            ],
+            pk_cols: vec![0],
+        };
+        // (a = 1 AND b = 2) AND c = 3 — flattening the whole AND-tree finds all three.
+        let expr = bind_where("a = 1 AND b = 2 AND c = 3", &schema);
+        let indexes = idx_metas(&[&[1], &[2], &[3]]);
+        let cands = collect_index_seek_candidates(&expr, &schema, || Ok(indexes)).unwrap();
+        let mut cols: Vec<Vec<u32>> = cands.iter().map(|(c, _, _)| c.as_slice().to_vec()).collect();
+        cols.sort();
+        assert_eq!(cols, vec![vec![1], vec![2], vec![3]]);
+        for (_, vals, residual) in &cands {
+            assert_eq!(vals.len(), 1);
+            assert_eq!(residual.len(), 2);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // try_extract_pk_in
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn compound_pk_try_extract_pk_in_returns_none() {
+        let schema = compound_schema_u64_u64();
+        let expr = bind_where("a IN (1, 2)", &schema);
+        assert!(try_extract_pk_in(&expr, &schema).is_none());
+    }
+
+    #[test]
+    fn try_extract_pk_in_uuid_string_list_fast_path() {
+        let schema = uuid_schema_pk();
+        let expected = 0x550e8400_e29b_41d4_a716_446655440000_u128;
+        let expr = bind_where("id IN ('550e8400-e29b-41d4-a716-446655440000')", &schema);
+        let got = try_extract_pk_in(&expr, &schema).expect("UUID string IN-list should take fast path");
+        assert_eq!(got, vec![expected]);
+    }
+
+    #[test]
+    fn try_extract_pk_in_uuid_invalid_string_falls_back() {
+        let schema = uuid_schema_pk();
+        let expr = bind_where("id IN ('550e8400-e29b-41d4-a716-446655440000', 'not-a-uuid')", &schema);
+        assert!(
+            try_extract_pk_in(&expr, &schema).is_none(),
+            "invalid UUID in list should fall back to slow scan"
+        );
+    }
+
+    #[test]
+    fn try_extract_pk_in_negative_i32_list() {
+        let schema = pk_schema(TypeCode::I32);
+        let expr = bind_where("id IN (-1, -2)", &schema);
+        let got = try_extract_pk_in(&expr, &schema).expect("should match fast path");
+        assert_eq!(got, vec![(-1i32 as u32) as u128, (-2i32 as u32) as u128]);
+    }
+
+    // ------------------------------------------------------------------
+    // Routing parity: extract_pk_value (INSERT, AST) / try_col_eq_literal /
+    // try_extract_pk_in (bound) must agree byte-for-byte on the packed u128.
+    // ------------------------------------------------------------------
+
+    fn check_pk_parity(pk_tc: TypeCode, literal: Expr, expected: u128) {
+        let schema = pk_schema(pk_tc);
+
+        // 1. extract_pk_value (INSERT row) — pk_codec, AST-based.
+        let row = vec![literal.clone(), num_expr("0")];
+        let got_insert = extract_pk_value(&row, &schema).unwrap_or_else(|e| panic!("extract_pk_value({pk_tc:?}): {e}"));
+        assert_eq!(got_insert.split_wire().0, expected, "extract_pk_value");
+
+        // 2. try_col_eq_literal (bound WHERE pk = literal).
+        let eq = bind_single_table(&eq_expr("id", literal.clone()), &schema).expect("bind eq");
+        assert_eq!(
+            try_col_eq_literal(&eq, &schema),
+            Some((0, expected)),
+            "try_col_eq_literal"
+        );
+
+        // 3. try_extract_pk_in (bound WHERE pk IN (literal)).
+        let in_e = bind_single_table(&in_list_expr("id", vec![literal]), &schema).expect("bind in");
+        assert_eq!(
+            try_extract_pk_in(&in_e, &schema),
+            Some(vec![expected]),
+            "try_extract_pk_in"
+        );
+    }
+
+    #[test]
+    fn pk_parity_i8_neg1() {
+        check_pk_parity(TypeCode::I8, neg_num_expr("1"), (-1i8 as u8) as u128);
+    }
+
+    #[test]
+    fn pk_parity_i16_neg1() {
+        check_pk_parity(TypeCode::I16, neg_num_expr("1"), (-1i16 as u16) as u128);
+    }
+
+    #[test]
+    fn pk_parity_i32_neg1() {
+        check_pk_parity(TypeCode::I32, neg_num_expr("1"), (-1i32 as u32) as u128);
+    }
+
+    #[test]
+    fn pk_parity_i64_neg1() {
+        check_pk_parity(TypeCode::I64, neg_num_expr("1"), ((-1i64) as u64) as u128);
+    }
+
+    #[test]
+    fn pk_parity_i64_min() {
+        // Regression for the prepend-`-` parse rule: the `i64::MIN` magnitude
+        // overflows i64 → `LitWide`, and the recognizer parses it byte-exactly.
+        check_pk_parity(
+            TypeCode::I64,
+            neg_num_expr("9223372036854775808"),
+            (i64::MIN as u64) as u128,
+        );
+    }
+
+    #[test]
+    fn pk_parity_u16_max() {
+        check_pk_parity(TypeCode::U16, num_expr("65535"), 65535u128);
+    }
+
+    #[test]
+    fn pk_parity_u32_max() {
+        check_pk_parity(TypeCode::U32, num_expr("4294967295"), 4294967295u128);
+    }
+
+    #[test]
+    fn pk_parity_u64_max_wide() {
+        // u64::MAX binds to `LitWide` for the WHERE seeks; INSERT parses it directly.
+        check_pk_parity(TypeCode::U64, num_expr("18446744073709551615"), u64::MAX as u128);
+    }
+
+    // ------------------------------------------------------------------
+    // Qualified single-relation references take the same fast paths
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn qualified_refs_take_fast_paths() {
+        let schema = pk_schema(TypeCode::U64); // (id U64 pk, v)
+
+        // `t.v = 5` and the flipped `5 = t.v` → equality fast path (qualifier is
+        // stripped at bind — the single-relation leniency).
+        assert_eq!(
+            try_col_eq_literal(&bind_where("t.v = 5", &schema), &schema),
+            Some((1, 5))
+        );
+        assert_eq!(
+            try_col_eq_literal(&bind_where("5 = t.v", &schema), &schema),
+            Some((1, 5))
+        );
+
+        // `t.id = 1` binds the full PK → point seek.
+        let where_expr = bind_where("t.id = 1", &schema);
+        let (pk, residual) = try_extract_pk_seek_residual(&where_expr, &schema).expect("PK binds");
+        assert_eq!(pk.as_bytes(), &1u64.to_le_bytes()[..]);
+        assert!(residual.is_empty());
+
+        // `t.id IN (1, 2)` → multi-seek fast path.
+        assert_eq!(
+            try_extract_pk_in(&bind_where("t.id IN (1, 2)", &schema), &schema),
+            Some(vec![1, 2])
+        );
+
+        // `t.v > 5` / flipped `5 < t.v` → range end.
+        let (c, e) = try_col_range_literal(&bind_where("t.v > 5", &schema), &schema).unwrap();
+        assert_eq!(c, 1);
+        assert!(e.side == RangeSide::Start && e.cut == Cut::After(5));
+        let (_, e) = try_col_range_literal(&bind_where("5 < t.v", &schema), &schema).unwrap();
+        assert!(e.side == RangeSide::Start && e.cut == Cut::After(5));
+    }
+
+    // ------------------------------------------------------------------
+    // Ordered range-scan extraction
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_range_cut_saturates() {
+        use Cut::{After, Before};
+        // The wide (digit-string) arm exercises the same value classification the
+        // native arm takes, so one literal shape covers both.
+        let ck = |tc, s, neg, mk: fn(u128) -> Cut| parse_range_cut(tc, NumLit::Wide(s, neg), mk);
+        assert_eq!(ck(TypeCode::I32, "5", false, Before), Some(Before(5)));
+        assert_eq!(ck(TypeCode::I32, "5", false, After), Some(After(5)));
+        assert_eq!(
+            ck(TypeCode::I32, "5", true, Before),
+            Some(Before((-5i32 as u32) as u128))
+        );
+        let (min, max) = ((i32::MIN as u32) as u128, i32::MAX as u128);
+        assert_eq!(ck(TypeCode::I32, "3000000000", false, Before), Some(After(max)));
+        assert_eq!(ck(TypeCode::I32, "3000000000", false, After), Some(After(max)));
+        assert_eq!(ck(TypeCode::I32, "3000000000", true, Before), Some(Before(min)));
+        assert_eq!(ck(TypeCode::I32, "3000000000", true, After), Some(Before(min)));
+        assert_eq!(ck(TypeCode::U8, "300", false, Before), Some(After(255)));
+        assert_eq!(ck(TypeCode::String, "5", false, Before), None);
+    }
+
+    #[test]
+    fn try_col_range_literal_orientations() {
+        use Cut::{After, Before};
+        let schema = Schema {
+            columns: vec![col_def("id", TypeCode::U64, false), col_def("x", TypeCode::I64, false)],
+            pk_cols: vec![0],
+        };
+        let ck = |sql: &str| try_col_range_literal(&bind_where(sql, &schema), &schema);
+        let (c, e) = ck("x > 5").unwrap();
+        assert_eq!(c, 1);
+        assert!(e.side == RangeSide::Start && e.cut == After(5));
+        let (_, e) = ck("5 < x").unwrap();
+        assert!(e.side == RangeSide::Start && e.cut == After(5));
+        let (_, e) = ck("x <= 5").unwrap();
+        assert!(e.side == RangeSide::End && e.cut == After(5));
+        let (_, e) = ck("5 >= x").unwrap();
+        assert!(e.side == RangeSide::End && e.cut == After(5));
+        let (_, e) = ck("x >= 5").unwrap();
+        assert!(e.side == RangeSide::Start && e.cut == Before(5));
+        let (_, e) = ck("x < 5").unwrap();
+        assert!(e.side == RangeSide::End && e.cut == Before(5));
+        // Equality is not a range end.
+        assert!(ck("x = 5").is_none());
+    }
+
+    #[test]
+    fn range_candidate_composite_eq_prefix() {
+        use Cut::Before;
+        let schema = abc_schema();
+        let expr = bind_where("a = 7 AND b < 50", &schema);
+        let cands = collect_index_range_candidates(&expr, &schema, || Ok(idx_metas(&[&[1, 2]]))).unwrap();
+        assert_eq!(cands.len(), 1);
+        let c = &cands[0];
+        assert_eq!(c.desc.eq_vals(), &[7u128]);
+        assert_eq!(c.desc.start, Before(0));
+        assert_eq!(c.desc.end, Before(50));
+        assert!(c.residual.is_empty(), "both conjuncts consumed");
+    }
+
+    #[test]
+    fn range_candidate_between_desugars() {
+        use Cut::{After, Before};
+        let schema = Schema {
+            columns: vec![col_def("id", TypeCode::U64, false), col_def("x", TypeCode::I64, false)],
+            pk_cols: vec![0],
+        };
+        // BETWEEN desugars at bind to `x >= 10 AND x <= 20` → two consumed range ends.
+        let expr = bind_where("x BETWEEN 10 AND 20", &schema);
+        let cands = collect_index_range_candidates(&expr, &schema, || Ok(idx_metas(&[&[1]]))).unwrap();
+        assert_eq!(cands.len(), 1);
+        let c = &cands[0];
+        assert_eq!((c.desc.start, c.desc.end), (Before(10), After(20)));
+        assert!(c.residual.is_empty());
+
+        // NOT BETWEEN binds to `Not(x >= 10 AND x <= 20)` — one leaf conjunct, no
+        // range end → no candidate.
+        let expr = bind_where("x NOT BETWEEN 10 AND 20", &schema);
+        let cands = collect_index_range_candidates(&expr, &schema, || Ok(idx_metas(&[&[1]]))).unwrap();
+        assert!(cands.is_empty());
+    }
+
+    #[test]
+    fn range_candidate_redundant_same_side_keeps_first() {
+        use Cut::After;
+        let schema = Schema {
+            columns: vec![col_def("id", TypeCode::U64, false), col_def("x", TypeCode::U64, false)],
+            pk_cols: vec![0],
+        };
+        for sql in ["x > 5 AND x > 10", "x > 10 AND x > 5"] {
+            let expr = bind_where(sql, &schema);
+            let cands = collect_index_range_candidates(&expr, &schema, || Ok(idx_metas(&[&[1]]))).unwrap();
+            assert_eq!(cands.len(), 1, "{sql}");
+            let c = &cands[0];
+            let first_val: u128 = if sql.starts_with("x > 5") { 5 } else { 10 };
+            assert_eq!(c.desc.start, After(first_val), "{sql}");
+            assert_eq!(c.residual.len(), 1, "{sql}: other same-side end stays residual");
+        }
+    }
+
+    #[test]
+    fn range_candidate_saturates_out_of_range() {
+        use Cut::{After, Before};
+        let schema = Schema {
+            columns: vec![col_def("id", TypeCode::U64, false), col_def("x", TypeCode::I32, false)],
+            pk_cols: vec![0],
+        };
+        let (min, max) = ((i32::MIN as u32) as u128, i32::MAX as u128);
+
+        let expr = bind_where("x > 3000000000", &schema);
+        let c = collect_index_range_candidates(&expr, &schema, || Ok(idx_metas(&[&[1]]))).unwrap();
+        assert_eq!(c.len(), 1);
+        assert_eq!((c[0].desc.start, c[0].desc.end), (After(max), After(max)));
+
+        let expr = bind_where("x < 3000000000", &schema);
+        let c = collect_index_range_candidates(&expr, &schema, || Ok(idx_metas(&[&[1]]))).unwrap();
+        assert_eq!(c.len(), 1);
+        assert_eq!((c[0].desc.start, c[0].desc.end), (Before(min), After(max)));
+    }
+
+    #[test]
+    fn range_candidate_residual_non_range_conjunct() {
+        use Cut::After;
+        let schema = abc_schema();
+        // `b` indexed, `a` not part of the index → `a = 7` stays residual.
+        let expr = bind_where("b > 10 AND a = 7", &schema);
+        let cands = collect_index_range_candidates(&expr, &schema, || Ok(idx_metas(&[&[2]]))).unwrap();
+        assert_eq!(cands.len(), 1);
+        let c = &cands[0];
+        assert!(c.desc.eq_vals().is_empty());
+        assert_eq!(c.desc.start, After(10));
+        assert_eq!(c.residual.len(), 1, "`a = 7` is a residual conjunct");
+    }
+}

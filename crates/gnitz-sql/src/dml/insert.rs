@@ -5,10 +5,10 @@
 //! `DO UPDATE SET` assignment behaves exactly like an `UPDATE ... SET`.
 
 use crate::ast_util::{extract_name, object_name_ident};
-use crate::bind::{bind_single_table, find_unique_column, Binder};
+use crate::bind::{find_unique_column, Binder};
 use crate::codec::colwrite::{append_value_to_col, ColumnValue};
 use crate::codec::pk_codec::{extract_pk_value_mapped, is_null_expr};
-use crate::dml::mutate::{build_merged_row, eval_set_expr, resolve_set_target};
+use crate::dml::mutate::{bind_mutate_scalar, build_merged_row, eval_set_expr, resolve_set_target};
 use crate::dml::overlay::effective_row;
 use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
 use crate::error::GnitzSqlError;
@@ -359,7 +359,10 @@ fn bind_do_update_rhs(expr: &Expr, schema: &Schema) -> Result<BoundUpdateExpr, G
                 .to_string(),
         ));
     }
-    let bound = bind_single_table(expr, schema)?;
+    // The existing-row RHS is interpreted lazily per PK conflict, so reject a wide
+    // literal eagerly — else `DO UPDATE SET u64 = <wide>` on a no-conflict batch
+    // would silently insert instead of erroring.
+    let bound = bind_mutate_scalar(expr, schema)?;
     Ok(BoundUpdateExpr::Existing(bound))
 }
 

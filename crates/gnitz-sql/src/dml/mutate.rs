@@ -4,16 +4,17 @@
 //! helpers (`eval_set_expr`, `resolve_set_target`) are also reused by INSERT's
 //! `ON CONFLICT DO UPDATE`.
 
+use crate::access::collect_index_seek_candidates;
 use crate::ast_util::{extract_name, extract_table_factor_name};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_column_value, ColumnValue};
 use crate::dml::overlay::{buffered_all, buffered_keys, overlay_batch, Net};
-use crate::dml::plan::{classify_access, collect_index_seek_candidates, first_index_hit, seek_pk_multi, AccessPath};
+use crate::dml::plan::{classify_access, first_index_hit, seek_pk_multi, AccessPath};
 use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
 use crate::error::GnitzSqlError;
 use crate::exec::eval::eval_expr;
-use crate::exec::residual::{bind_residuals, matching_indices};
-use crate::ir::BoundExpr;
+use crate::exec::residual::matching_indices;
+use crate::ir::{find_wide_literal, wide_int_error, BoundExpr};
 use crate::SqlResult;
 use gnitz_core::null_word_set;
 use gnitz_core::{retraction_batch, ColData, GnitzClient, PkColumn, PkTuple, Schema, WireConflictMode, ZSetBatch};
@@ -23,6 +24,19 @@ use std::sync::Arc;
 // ---------------------------------------------------------------------------
 // SET-list helpers (shared with INSERT's ON CONFLICT DO UPDATE)
 // ---------------------------------------------------------------------------
+
+/// Bind a mutate SET / `DO UPDATE` RHS scalar against `schema`, rejecting a wide
+/// integer literal (`LitWide`) eagerly. The SET evaluators (`eval_set_expr`) run
+/// **lazily** per matched/conflicting row, so a `LitWide` there — which has no VM
+/// slot — would otherwise silently no-op when nothing matches instead of erroring
+/// deterministically. Shared by `UPDATE SET` and `ON CONFLICT DO UPDATE SET`.
+pub(crate) fn bind_mutate_scalar(expr: &Expr, schema: &Schema) -> Result<BoundExpr, GnitzSqlError> {
+    let bound = bind_single_table(expr, schema)?;
+    if let Some(lit) = find_wide_literal(&bound) {
+        return Err(wide_int_error(lit));
+    }
+    Ok(bound)
+}
 
 pub(crate) fn eval_set_expr(
     expr: &BoundExpr,
@@ -191,7 +205,9 @@ fn resolve_where_rows(
     schema: &Schema,
     selection: Option<&Expr>,
 ) -> Result<ResolvedRows, GnitzSqlError> {
-    match classify_access(selection, schema) {
+    // Bind the WHERE once; classification and residuals run on the bound conjuncts.
+    let bound = selection.map(|s| bind_single_table(s, schema)).transpose()?;
+    match classify_access(bound.as_ref(), schema) {
         AccessPath::ScanAll => {
             let (schema_opt, committed, _) = client.scan(tid)?;
             let net = buffered_all(client, tid);
@@ -221,7 +237,7 @@ fn resolve_where_rows(
             // seekable but not evaluable). Buffered rows are unindexed, so once the
             // transaction has touched this table every row must face the FULL
             // predicate instead.
-            let preds: Vec<&Expr> = if net.is_empty() { residual } else { vec![where_expr] };
+            let preds: Vec<&BoundExpr> = if net.is_empty() { residual } else { vec![where_expr] };
             resolve(schema, schema_opt, committed, &net, &preds)
         }
     }
@@ -235,12 +251,18 @@ fn resolve(
     schema_opt: Option<Arc<Schema>>,
     committed: Option<ZSetBatch>,
     net: &Net,
-    residual: &[&Expr],
+    preds: &[&BoundExpr],
 ) -> Result<ResolvedRows, GnitzSqlError> {
+    // The residual is interpreted lazily per row; reject an un-consumed wide
+    // literal here so an empty match errors deterministically rather than
+    // silently succeeding. A servable wide seek is consumed into the access-path
+    // bound and never reaches the residual.
+    if let Some(lit) = preds.iter().find_map(|p| find_wide_literal(p)) {
+        return Err(wide_int_error(lit));
+    }
     let actual = schema_opt.as_deref().unwrap_or(schema);
     let batch = overlay_batch(committed, net, actual);
-    let preds = bind_residuals(residual, schema)?;
-    let matched = matching_indices(&preds, &batch, actual)?;
+    let matched = matching_indices(preds, &batch, actual)?;
     Ok(ResolvedRows {
         schema: schema_opt,
         batch,
@@ -250,17 +272,17 @@ fn resolve(
 
 /// Fetch the committed candidates for a `Filtered` WHERE: the first existing
 /// index's equality seek (with the reduced residual left over from consuming its
-/// key columns), else the full scan (residual = the whole predicate). The first
-/// index that exists serves the query — a hit with no matching rows is terminal,
-/// it does NOT fall through to the scan.
-type FilteredFetch<'a> = (Option<Arc<Schema>>, Option<ZSetBatch>, Vec<&'a Expr>);
+/// key columns), else the full scan (residual = the whole bound predicate). The
+/// first index that exists serves the query — a hit with no matching rows is
+/// terminal, it does NOT fall through to the scan.
+type FilteredFetch<'e> = (Option<Arc<Schema>>, Option<ZSetBatch>, Vec<&'e BoundExpr>);
 
-fn fetch_filtered<'a>(
+fn fetch_filtered<'e>(
     client: &mut GnitzClient,
     tid: u64,
     schema: &Schema,
-    where_expr: &'a Expr,
-) -> Result<FilteredFetch<'a>, GnitzSqlError> {
+    where_expr: &'e BoundExpr,
+) -> Result<FilteredFetch<'e>, GnitzSqlError> {
     let candidates =
         collect_index_seek_candidates(where_expr, schema, || client.table_indexes(tid)).map_err(GnitzSqlError::Exec)?;
     if let Some(((_, _, residual), (schema_opt, batch_opt, _))) = first_index_hit(candidates, |(cols, vals, _)| {
@@ -293,7 +315,7 @@ pub(crate) fn execute_update(
     let mut seen: Vec<usize> = Vec::with_capacity(assignments_raw.len());
     for assignment in assignments_raw {
         let col_idx = resolve_set_target(assignment, &schema, &mut seen, "UPDATE SET")?;
-        let bound_val = bind_single_table(&assignment.value, &schema)?;
+        let bound_val = bind_mutate_scalar(&assignment.value, &schema)?;
         assignments.push((col_idx, bound_val));
     }
 

@@ -3,8 +3,9 @@
 //! single source of truth so the canonical schemas (PK widths, UUID columns,
 //! compound PKs) and the literal-expression shapes can't drift between modules.
 
+use crate::ir::BoundExpr;
 use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
-use sqlparser::ast::{Expr, UnaryOperator, Value};
+use sqlparser::ast::{BinaryOperator, Expr, Ident, UnaryOperator, Value};
 
 pub(crate) fn col_def(name: &str, tc: TypeCode, nullable: bool) -> ColumnDef {
     ColumnDef::new(name, tc, nullable)
@@ -92,6 +93,30 @@ pub(crate) fn uuid_str_expr(s: &str) -> Expr {
 /// A double-quoted token — an identifier in `GenericDialect`, never a literal.
 pub(crate) fn dquote_expr(s: &str) -> Expr {
     Expr::value(Value::DoubleQuotedString(s.into()))
+}
+
+/// A `col = rhs` equality expression (AST), for building recognizer/parity inputs.
+pub(crate) fn eq_expr(col: &str, rhs: Expr) -> Expr {
+    Expr::BinaryOp {
+        left: Box::new(Expr::Identifier(Ident::new(col))),
+        op: BinaryOperator::Eq,
+        right: Box::new(rhs),
+    }
+}
+
+/// A `col IN (items…)` expression (AST).
+pub(crate) fn in_list_expr(col: &str, items: Vec<Expr>) -> Expr {
+    Expr::InList {
+        expr: Box::new(Expr::Identifier(Ident::new(col))),
+        list: items,
+        negated: false,
+    }
+}
+
+/// Parse + bind a WHERE predicate against `schema` into a bound conjunct tree —
+/// the natural input for the `access` recognizers, which run on the bound IR.
+pub(crate) fn bind_where(sql: &str, schema: &Schema) -> BoundExpr {
+    crate::bind::bind_single_table(&parse_expr_sql(sql), schema).expect("bind WHERE")
 }
 
 /// Parse a bare SQL expression (e.g. a WHERE predicate) via `GenericDialect`.

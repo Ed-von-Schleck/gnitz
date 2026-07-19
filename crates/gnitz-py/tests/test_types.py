@@ -1366,6 +1366,104 @@ class TestTypeErrors:
 
 
 # ---------------------------------------------------------------------------
+# TestWideLiteralMutateGuards — an un-servable wide integer literal (one that
+# overflows i64, so it has no VM register slot) must reject *deterministically*
+# in the lazily-interpreted mutate positions (UPDATE/DELETE residual, SET RHS,
+# ON CONFLICT DO UPDATE SET RHS), never silently no-op on an empty match.
+# Servable positions (a PK / indexed seek that packs the literal byte-exactly)
+# are unaffected.
+# ---------------------------------------------------------------------------
+
+
+class TestWideLiteralMutateGuards:
+    _CREATE = (
+        "CREATE TABLE t (pk BIGINT UNSIGNED NOT NULL PRIMARY KEY, "
+        "v BIGINT UNSIGNED NOT NULL)"
+    )
+
+    def test_delete_wide_literal_on_nonindexed_col_errors(self, client):
+        """DELETE WHERE <non-indexed u64> = <wide> rejects (no VM slot) rather
+        than silently deleting nothing; the row survives."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(self._CREATE, schema_name=sn)
+            tid, _ = client.resolve_table(sn, "t")
+            client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql(
+                    f"DELETE FROM t WHERE v = {U64_MAX}", schema_name=sn
+                )
+            rows = _scan_map(client, tid)
+            assert rows[1].v == 100  # untouched — not a silent 0-row delete
+        finally:
+            _cleanup(client, sn, "t")
+
+    def test_update_set_wide_literal_errors_on_empty_match(self, client):
+        """UPDATE SET <u64> = <wide> rejects even when the WHERE matches nothing:
+        the SET-value guard fires eagerly at plan time, so there is no silent
+        0-row success."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(self._CREATE, schema_name=sn)
+            tid, _ = client.resolve_table(sn, "t")
+            client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                # WHERE pk = 999 matches nothing; the SET-value guard fires first.
+                client.execute_sql(
+                    f"UPDATE t SET v = {U64_MAX} WHERE pk = 999", schema_name=sn
+                )
+            rows = _scan_map(client, tid)
+            assert rows[1].v == 100  # untouched
+        finally:
+            _cleanup(client, sn, "t")
+
+    def test_on_conflict_do_update_wide_literal_errors_on_no_conflict(self, client):
+        """INSERT ... ON CONFLICT DO UPDATE SET <u64> = <wide> rejects at plan
+        time even when the PK does not conflict — no silent insert."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(self._CREATE, schema_name=sn)
+            tid, _ = client.resolve_table(sn, "t")
+            client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                # pk = 2 does not exist → no conflict; the SET-value guard fires.
+                client.execute_sql(
+                    f"INSERT INTO t VALUES (2, 1) "
+                    f"ON CONFLICT (pk) DO UPDATE SET v = {U64_MAX}",
+                    schema_name=sn,
+                )
+            rows = _scan_map(client, tid)
+            assert 2 not in rows  # nothing inserted
+        finally:
+            _cleanup(client, sn, "t")
+
+    def test_delete_wide_literal_on_indexed_col_is_servable(self, client):
+        """The guard is precise: a wide literal on an INDEXED column packs
+        byte-exactly into an index seek and deletes the matching row — servable
+        wide seeks are not over-rejected."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(self._CREATE, schema_name=sn)
+            tid, _ = client.resolve_table(sn, "t")
+            client.execute_sql("CREATE INDEX iv ON t (v)", schema_name=sn)
+            client.execute_sql(
+                f"INSERT INTO t VALUES (1, {U64_MAX}), (2, 5)", schema_name=sn
+            )
+            res = client.execute_sql(
+                f"DELETE FROM t WHERE v = {U64_MAX}", schema_name=sn
+            )
+            assert res[0]["count"] == 1
+            rows = _scan_map(client, tid)
+            assert 1 not in rows and rows[2].v == 5
+        finally:
+            _cleanup(client, sn, "t")
+
+
+# ---------------------------------------------------------------------------
 # TestPKNativeTypes — PK columns keep their declared type (no coercion).
 # ---------------------------------------------------------------------------
 

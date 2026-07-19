@@ -4,7 +4,7 @@ use crate::ast_util::{
     single_relation_col_name,
 };
 use crate::error::GnitzSqlError;
-use crate::ir::{AggFunc, BinOp, BoundExpr, UnaryOp};
+use crate::ir::{AggFunc, BExpr, BinOp, BoundExpr, UnaryOp};
 use crate::types::is_min_max_orderable;
 use gnitz_core::Schema;
 use sqlparser::ast::{
@@ -65,20 +65,23 @@ pub(crate) fn bind_single_table_mark(expr: &Expr, schema: &Schema, mark: i64) ->
 // so a new operator or fold lands on every context at the same time and cannot
 // silently drift between hand-copied walks.
 
-/// The three schema-aware leaves of `bind_structural`.
-pub(crate) trait LeafBinder {
+/// The three schema-aware leaves of `bind_structural`, generic over the leaf
+/// reference type `R` (the `ColRef`/`IsNull`/`IsNotNull` payload). `R` defaults
+/// to `usize`, so the four runtime leaf impls resolve to `LeafBinder<usize>`
+/// unannotated; a future view-side leaf will instantiate a column-identity `R`.
+pub(crate) trait LeafBinder<R = usize> {
     /// An `Identifier` / `CompoundIdentifier` column reference.
-    fn bind_column(&self, e: &Expr) -> Result<BoundExpr, GnitzSqlError>;
+    fn bind_column(&self, e: &Expr) -> Result<BExpr<R>, GnitzSqlError>;
     /// A function call (aggregates, or a context-specific rejection).
-    fn bind_function(&self, f: &Function) -> Result<BoundExpr, GnitzSqlError>;
+    fn bind_function(&self, f: &Function) -> Result<BExpr<R>, GnitzSqlError>;
     /// `inner IS [NOT] NULL` (`want_null` picks IS NULL vs IS NOT NULL).
-    fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<BoundExpr, GnitzSqlError>;
+    fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<BExpr<R>, GnitzSqlError>;
     /// A `[NOT] EXISTS` / `[NOT] IN (SELECT …)` node. Only the mark builder's
     /// leaf overrides this — it resolves the node to the branch's `0/1` constant
     /// ([`bind_single_table_mark`]); every other context keeps the placement
     /// rejection. (The top-level-AND-conjunct filter path never binds the node:
     /// the exists builder intercepts it before binding.)
-    fn bind_subquery(&self, _e: &Expr) -> Result<BoundExpr, GnitzSqlError> {
+    fn bind_subquery(&self, _e: &Expr) -> Result<BExpr<R>, GnitzSqlError> {
         Err(GnitzSqlError::Unsupported(
             "[NOT] EXISTS/IN (SELECT …) is only supported in a single-table CREATE VIEW \
              (in the WHERE clause or the SELECT list)"
@@ -90,7 +93,7 @@ pub(crate) trait LeafBinder {
 /// The one structural recursion. Needs no schema — every schema-aware decision
 /// is a leaf method. Generic over `L` (static dispatch) so a leaf's
 /// `bind_function` can recurse via `bind_structural(arg, self)`.
-pub(crate) fn bind_structural<L: LeafBinder>(expr: &Expr, leaf: &L) -> Result<BoundExpr, GnitzSqlError> {
+pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L) -> Result<BExpr<R>, GnitzSqlError> {
     match expr {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => leaf.bind_column(expr),
         // COALESCE / NULLIF are structural desugars into CASE, intercepted before
@@ -119,7 +122,7 @@ pub(crate) fn bind_structural<L: LeafBinder>(expr: &Expr, leaf: &L) -> Result<Bo
             let mut branches = Vec::with_capacity(conditions.len());
             for CaseWhen { condition, result } in conditions {
                 let cond = match operand {
-                    Some(op) => BoundExpr::BinOp(
+                    Some(op) => BExpr::BinOp(
                         Box::new(bind_structural(op, leaf)?),
                         BinOp::Eq,
                         Box::new(bind_structural(condition, leaf)?),
@@ -133,12 +136,12 @@ pub(crate) fn bind_structural<L: LeafBinder>(expr: &Expr, leaf: &L) -> Result<Bo
                 .map(|e| bind_structural(e, leaf))
                 .transpose()?
                 .map(Box::new);
-            Ok(BoundExpr::Case { branches, else_ })
+            Ok(BExpr::Case { branches, else_ })
         }
         Expr::BinaryOp { left, op, right } => {
             let l = bind_structural(left, leaf)?;
             let r = bind_structural(right, leaf)?;
-            Ok(BoundExpr::BinOp(Box::new(l), map_binop(op)?, Box::new(r)))
+            Ok(BExpr::BinOp(Box::new(l), map_binop(op)?, Box::new(r)))
         }
         Expr::UnaryOp { op, expr } => {
             let inner = bind_structural(expr, leaf)?;
@@ -151,7 +154,7 @@ pub(crate) fn bind_structural<L: LeafBinder>(expr: &Expr, leaf: &L) -> Result<Bo
                     )))
                 }
             };
-            Ok(BoundExpr::UnaryOp(uop, Box::new(inner)))
+            Ok(BExpr::UnaryOp(uop, Box::new(inner)))
         }
         // `e BETWEEN lo AND hi` ≡ `e >= lo AND e <= hi`; NOT BETWEEN negates it.
         // NULL semantics are SQL-correct under either form (a NULL operand makes
@@ -162,19 +165,19 @@ pub(crate) fn bind_structural<L: LeafBinder>(expr: &Expr, leaf: &L) -> Result<Bo
             low,
             high,
         } => {
-            let ge = BoundExpr::BinOp(
+            let ge = BExpr::BinOp(
                 Box::new(bind_structural(e, leaf)?),
                 BinOp::Ge,
                 Box::new(bind_structural(low, leaf)?),
             );
-            let le = BoundExpr::BinOp(
+            let le = BExpr::BinOp(
                 Box::new(bind_structural(e, leaf)?),
                 BinOp::Le,
                 Box::new(bind_structural(high, leaf)?),
             );
-            let between = BoundExpr::BinOp(Box::new(ge), BinOp::And, Box::new(le));
+            let between = BExpr::BinOp(Box::new(ge), BinOp::And, Box::new(le));
             Ok(if *negated {
-                BoundExpr::UnaryOp(UnaryOp::Not, Box::new(between))
+                BExpr::UnaryOp(UnaryOp::Not, Box::new(between))
             } else {
                 between
             })
@@ -195,12 +198,12 @@ pub(crate) fn bind_structural<L: LeafBinder>(expr: &Expr, leaf: &L) -> Result<Bo
                 .iter()
                 .map(|it| bind_structural(it, leaf))
                 .collect::<Result<Vec<_>, _>>()?;
-            let node = BoundExpr::InList {
+            let node = BExpr::InList {
                 inner: Box::new(inner),
                 items,
             };
             Ok(if *negated {
-                BoundExpr::UnaryOp(UnaryOp::Not, Box::new(node))
+                BExpr::UnaryOp(UnaryOp::Not, Box::new(node))
             } else {
                 node
             })
@@ -243,25 +246,31 @@ fn map_binop(op: &BinaryOperator) -> Result<BinOp, GnitzSqlError> {
     })
 }
 
-/// Number/string literal → `BoundExpr`.
-fn bind_literal(v: &Value) -> Result<BoundExpr, GnitzSqlError> {
+/// Number/string literal → `BExpr`. Leaf-free (no `ColRef` produced), so it is
+/// generic over `R` without a `Clone` bound.
+fn bind_literal<R>(v: &Value) -> Result<BExpr<R>, GnitzSqlError> {
     match v {
         Value::Number(n, _) => {
             if let Ok(i) = n.parse::<i64>() {
-                Ok(BoundExpr::LitInt(i))
+                Ok(BExpr::LitInt(i))
             } else if n.contains(['.', 'e', 'E']) {
                 n.parse::<f64>()
-                    .map(BoundExpr::LitFloat)
+                    .map(BExpr::LitFloat)
                     .map_err(|_| GnitzSqlError::Bind(format!("invalid number literal: {n}")))
             } else {
-                // Non-fractional literal that overflows i64. `BoundExpr::LitInt` is
-                // i64-only; representing it as f64 would run an integer-column
-                // comparison through a lossy 52-bit mantissa (e.g. u64::MAX matches
-                // the wrong rows).
-                Err(GnitzSqlError::Bind(format!("integer literal out of range: {n}")))
+                // Non-fractional literal that overflows i64 (U128/UUID/I128 range,
+                // or the `i64::MIN` magnitude under an outer `Neg`). Bind it
+                // *faithfully* as a `LitWide` carrying the raw magnitude string —
+                // schemaless binding cannot choose `i128`-vs-`u128` parsing, so the
+                // access-path recognizer (which holds the column `TypeCode`) parses
+                // it byte-exactly into a seek bound. Representing it as f64 would run
+                // an integer-column comparison through a lossy 52-bit mantissa (e.g.
+                // u64::MAX matches the wrong rows); the un-servable case rejects
+                // honestly at the compile boundary (`lower_bound_expr`), not here.
+                Ok(BExpr::LitWide(n.clone()))
             }
         }
-        Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => Ok(BoundExpr::LitStr(s.clone())),
+        Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => Ok(BExpr::LitStr(s.clone())),
         _ => Err(GnitzSqlError::Unsupported(format!(
             "value type not supported in expressions: {v:?}"
         ))),
@@ -272,11 +281,11 @@ fn bind_literal(v: &Value) -> Result<BoundExpr, GnitzSqlError> {
 /// is the result. Total over arity via explicit base cases; a literal operand is
 /// folded at the AST level so it never reaches `bind_null_test` (which resolves a
 /// *column* and would reject a literal with "expected a column reference").
-fn bind_coalesce<L: LeafBinder>(args: &[&Expr], leaf: &L) -> Result<BoundExpr, GnitzSqlError> {
+fn bind_coalesce<R: Clone, L: LeafBinder<R>>(args: &[&Expr], leaf: &L) -> Result<BExpr<R>, GnitzSqlError> {
     let [a, rest @ ..] = args else {
         // COALESCE() ≡ NULL (parser forbids; stay total) — also the tail after an
         // all-NULL-literals argument list.
-        return Ok(BoundExpr::LitNull);
+        return Ok(BExpr::LitNull);
     };
     if let Expr::Value(v) = a {
         // A NULL literal contributes nothing; any other literal is non-null → the result.
@@ -289,10 +298,10 @@ fn bind_coalesce<L: LeafBinder>(args: &[&Expr], leaf: &L) -> Result<BoundExpr, G
         return bind_structural(a, leaf); // last operand: its value is the result
     }
     let cond = leaf.bind_null_test(a, /* want_null = */ false)?; // IsNotNull(col) | LitInt(1)
-    if matches!(cond, BoundExpr::LitInt(1)) {
+    if matches!(cond, BExpr::LitInt(1)) {
         return bind_structural(a, leaf); // provably non-null (NOT NULL column) → always taken
     }
-    Ok(BoundExpr::Case {
+    Ok(BExpr::Case {
         branches: vec![(cond, bind_structural(a, leaf)?)],
         else_: Some(Box::new(bind_coalesce(rest, leaf)?)),
     })
@@ -301,20 +310,20 @@ fn bind_coalesce<L: LeafBinder>(args: &[&Expr], leaf: &L) -> Result<BoundExpr, G
 /// `NULLIF(a, b)` ≡ `CASE WHEN a = b THEN NULL ELSE a END`. Both operands bind
 /// through `bind_structural` (not `bind_null_test`), so NULLIF has no
 /// literal-operand pitfall.
-fn bind_nullif<L: LeafBinder>(args: &[&Expr], leaf: &L) -> Result<BoundExpr, GnitzSqlError> {
+fn bind_nullif<R: Clone, L: LeafBinder<R>>(args: &[&Expr], leaf: &L) -> Result<BExpr<R>, GnitzSqlError> {
     let [a, b] = args else {
         return Err(GnitzSqlError::Unsupported(
             "NULLIF: requires exactly two arguments".into(),
         ));
     };
     let a_bound = bind_structural(a, leaf)?;
-    let cond = BoundExpr::BinOp(
+    let cond = BExpr::BinOp(
         Box::new(a_bound.clone()),
         BinOp::Eq,
         Box::new(bind_structural(b, leaf)?),
     );
-    Ok(BoundExpr::Case {
-        branches: vec![(cond, BoundExpr::LitNull)],
+    Ok(BExpr::Case {
+        branches: vec![(cond, BExpr::LitNull)],
         else_: Some(Box::new(a_bound)),
     })
 }
@@ -482,9 +491,15 @@ mod tests {
     }
 
     #[test]
-    fn bind_literal_rejects_out_of_i64_range_integer() {
-        // u64::MAX overflows i64 and is non-fractional → rejected, not coerced to f64.
-        assert!(matches!(num("18446744073709551615"), Err(GnitzSqlError::Bind(_))));
+    fn bind_literal_wide_int_to_litwide() {
+        // u64::MAX overflows i64 and is non-fractional → bound faithfully as a
+        // `LitWide` carrying the raw magnitude string (not coerced to f64, not an
+        // error). The recognizer parses it byte-exactly; the un-servable case
+        // rejects at the compile boundary.
+        match num("18446744073709551615") {
+            Ok(BoundExpr::LitWide(s)) => assert_eq!(s, "18446744073709551615"),
+            other => panic!("expected LitWide, got {other:?}"),
+        }
     }
 
     #[test]

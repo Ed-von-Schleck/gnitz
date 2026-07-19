@@ -1,20 +1,20 @@
-//! The backfill-scan index bound a `ScanDelta` carries.
+//! The backfill-scan index bound a `ScanDelta` carries — the **AST view-bridge**
+//! into the [`crate::access`] recognizer leaf.
 //!
 //! A **physical access hint**, never a semantic filter: the caller emits the FULL
 //! `Filter` downstream regardless, so a bound only narrows what the initial
 //! full-source scan reads. That is why a bound may be dropped anywhere (no index,
-//! a non-catalog id, a dropped index at run time) with no effect on results — and
-//! why it is extracted from the raw AST here rather than recovered server-side from
-//! the opaque `ExprProgram` blob, where a mistake would be a *narrowing* one:
-//! silently wrong rows.
+//! a non-catalog id, a dropped index at run time) with no effect on results.
+//!
+//! This module binds the raw view WHERE and hands the bound conjuncts to
+//! `access::best_index_bound`. It imports **down** from the `access` leaf and is
+//! the last AST island of the access-path surface.
 
-use crate::dml::plan::{
-    collect_index_range_candidates, collect_index_seek_candidates, IndexListMemo, IndexRangeCandidate,
-};
+use crate::access::best_index_bound;
+use crate::bind::bind_single_table;
 use crate::error::GnitzSqlError;
 use gnitz_core::{GnitzClient, Schema};
-use gnitz_wire::{Cut, RangeDescriptor, ScanBound};
-use std::cmp::Reverse;
+use gnitz_wire::ScanBound;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -38,32 +38,13 @@ pub(crate) fn scan_bound_for_input(
     }
 }
 
-/// The best index range/equality bound for `where_expr`, or `None` when no index
-/// covers a leading conjunct. `fetch` (the GET_INDICES probe) is injected — which
-/// index to pick is a pure decision over `(where_expr, schema, index list)`, so it
-/// tests without a live catalog — and is called **at most once**: both collectors
-/// are lazy (a WHERE with no usable conjunct fetches no indexes) and share one
-/// [`IndexListMemo`].
+/// Bind the raw WHERE against the source schema, then take the best index bound its
+/// bound conjuncts admit (or `None`). `fetch` (the GET_INDICES probe) is injected —
+/// which index to pick is a pure decision over `(bound WHERE, schema, index list)`,
+/// so it tests without a live catalog — and is called at most once.
 ///
-/// Every candidate unifies as a range. A pure n-column equality lowers to a
-/// degenerate point range over its LAST column — eq = vals[..n-1], start =
-/// `Before(v_last)`, end = `After(v_last)` — since `RangeDescriptor` cannot
-/// express "no range column", and without the lowering the headline
-/// `WHERE indexed = 5` would carry no bound at all. The engine then cuts
-/// `[seek_prefix(vals), seek_prefix(vals)+1)` — exactly that key group, which also
-/// covers every `(vals, *)` entry when the index has trailing columns the equality
-/// does not pin. (`consume_leading_eq_prefix` breaks at the first uncovered
-/// column, so `1 <= n <= idx_cols.len() <= PK_LIST_MAX_COLS`: `n-1 <
-/// PK_LIST_MAX_COLS` satisfies `RangeDescriptor::new`'s strict arity assert, and
-/// `n_eq = n-1 < idx_cols.len()` satisfies the engine's arity check.)
-///
-/// The merged candidates are ranked by [`pinned_score`] — most-constrained
-/// first — and the head taken outright. There is no residual pre-filter and no
-/// probe: the caller emits the FULL predicate as the `Filter`, so each
-/// candidate's residual is discarded. Both collectors reject a candidate with
-/// an uncovered nullable trailing column (a NULL in any indexed column omits
-/// the whole row from the index, so such a bound would drop rows the predicate
-/// matches).
+/// The Filter emitter downstream binds this same WHERE again to compile the actual
+/// predicate; bind is pure, so the double-bind has no observable effect.
 fn scan_bound_from<F>(
     where_expr: &sqlparser::ast::Expr,
     schema: &Schema,
@@ -72,71 +53,11 @@ fn scan_bound_from<F>(
 where
     F: FnMut() -> Result<Arc<Vec<gnitz_core::IndexMeta>>, gnitz_core::ClientError>,
 {
-    Ok(best_index_bound(where_expr, schema, fetch)?.map(|c| ScanBound {
+    let bound = bind_single_table(where_expr, schema)?;
+    Ok(best_index_bound(&bound, schema, fetch)?.map(|c| ScanBound {
         idx_cols: c.idx_cols,
         desc: c.desc,
     }))
-}
-
-/// The best index range/equality bound for `where_expr` as a full
-/// [`IndexRangeCandidate`] — descriptor plus the chosen candidate's residual
-/// (the WHERE conjuncts the bound does not apply). The `ReadSpec` bound
-/// extractor consumes the residual (it becomes the server-side predicate for a
-/// wide-int, byte-exact, conjunct-stripped bound); [`scan_bound_from`] discards
-/// it. One candidate-assembly + ranking site for both.
-pub(crate) fn best_index_bound<'e, F>(
-    where_expr: &'e sqlparser::ast::Expr,
-    schema: &Schema,
-    mut fetch: F,
-) -> Result<Option<IndexRangeCandidate<'e>>, GnitzSqlError>
-where
-    F: FnMut() -> Result<Arc<Vec<gnitz_core::IndexMeta>>, gnitz_core::ClientError>,
-{
-    let mut memo = IndexListMemo::default();
-    let ranges =
-        collect_index_range_candidates(where_expr, schema, || memo.get(&mut fetch)).map_err(GnitzSqlError::Exec)?;
-    let seeks =
-        collect_index_seek_candidates(where_expr, schema, || memo.get(&mut fetch)).map_err(GnitzSqlError::Exec)?;
-
-    let mut cands: Vec<IndexRangeCandidate> = ranges
-        .into_iter()
-        .chain(seeks.into_iter().map(|(idx_cols, vals, residual)| {
-            let n = vals.len();
-            IndexRangeCandidate {
-                idx_cols,
-                desc: RangeDescriptor::point(&vals[..n - 1], vals[n - 1]),
-                residual,
-            }
-        }))
-        .collect();
-    // Stable sort: on a full tie the range collector's candidate (listed first)
-    // wins, matching each collector's own internal preference order.
-    cands.sort_by_key(|c| Reverse(pinned_score(&c.idx_cols, &c.desc, schema)));
-    Ok(cands.into_iter().next())
-}
-
-/// How constrained a candidate leaves the index walk, as a totally ordered key:
-/// 2 per equality-pinned column plus 1 per real range side, then (descending in
-/// the sort, so ascending arity) the tighter index on a tie.
-///
-/// One rule ranks equality and range candidates together — "most pinned columns
-/// wins" — where a "range beats equality" tier would mis-pick across indexes:
-/// `WHERE a = 5 AND b > 10` with `INDEX(a)` and `INDEX(b)` must bound on the
-/// point `a = 5` (score 2), not the half-open `b > 10` (score 1) that the
-/// selectivity gate then likely rejects, full-scanning past the usable bound.
-/// A side widened to the column type's edge cut by the collector IS the
-/// unbounded side, so it scores 0. (A point cut on a type-edge value — `a =
-/// u64::MAX` — is indistinguishable from the widened edge and forfeits that
-/// side's credit: a mis-*ranking* only, never a mis-*bound*.)
-fn pinned_score(idx_cols: &gnitz_core::PkColList, desc: &RangeDescriptor, schema: &Schema) -> (u32, Reverse<usize>) {
-    let n_eq = desc.eq_vals().len();
-    let range_col = idx_cols.as_slice()[n_eq];
-    let sides = match Cut::type_edges(schema.columns[range_col as usize].type_code) {
-        Some((lo, hi)) => (desc.start != lo) as u32 + (desc.end != hi) as u32,
-        // Unreachable: both collectors only emit range-servable column types.
-        None => 2,
-    };
-    (2 * n_eq as u32 + sides, Reverse(idx_cols.as_slice().len()))
 }
 
 #[cfg(test)]
@@ -144,6 +65,7 @@ mod tests {
     use super::*;
     use crate::test_support::{col_def, idx_metas, parse_expr_sql};
     use gnitz_core::TypeCode;
+    use gnitz_wire::Cut;
     use std::cell::Cell;
 
     /// `(id U64 pk, a U64, b U64 [nullable per arg])` — indexable cols a=1, b=2.
@@ -170,9 +92,7 @@ mod tests {
         (b, calls.get())
     }
 
-    /// A pure equality on a 1-column index lowers to a degenerate point range —
-    /// `RangeDescriptor` cannot express "no range column", and without this the
-    /// headline `WHERE indexed = 5` would carry no bound at all.
+    /// A pure equality on a 1-column index lowers to a degenerate point range.
     #[test]
     fn equality_lowers_to_a_degenerate_point_range() {
         let (b, calls) = bound_of("a = 5", &schema(false), &[&[1]]);
@@ -193,9 +113,7 @@ mod tests {
         assert_eq!((b.desc.start, b.desc.end), (Cut::Before(7), Cut::After(7)));
     }
 
-    /// An equality prefix plus a range on ONE index takes the range candidate: it
-    /// pins the prefix (score 2) AND a range side (score 3) where the bare prefix
-    /// seek pins only the prefix (score 2).
+    /// An equality prefix plus a range on ONE index takes the range candidate.
     #[test]
     fn equality_prefix_plus_range_takes_the_range_candidate() {
         let (b, _) = bound_of("a = 5 AND b > 10", &schema(false), &[&[1, 2]]);
@@ -205,11 +123,7 @@ mod tests {
         assert_ne!(b.desc.end, Cut::After(10), "the upper side stays open, not a point");
     }
 
-    /// Across SEPARATE indexes, most-pinned wins: `a = 5 AND b > 10` with
-    /// `INDEX(a)` and `INDEX(b)` must bound on the point `a = 5` (score 2), not
-    /// the half-open `b > 10` (score 1) — a "range beats equality" tier would
-    /// ship the wide range and the engine's selectivity gate would then likely
-    /// full-scan past the usable point bound.
+    /// Across SEPARATE indexes, most-pinned wins.
     #[test]
     fn point_on_one_index_beats_half_open_range_on_another() {
         let (b, _) = bound_of("a = 5 AND b > 10", &schema(false), &[&[1], &[2]]);
@@ -218,22 +132,16 @@ mod tests {
         assert_eq!((b.desc.start, b.desc.end), (Cut::Before(5), Cut::After(5)));
     }
 
-    /// A PK predicate never bounds: the collectors skip PK columns unconditionally,
-    /// whatever index circuits exist. So a bound always names a secondary index.
+    /// A PK predicate never bounds: the collectors skip PK columns unconditionally.
     #[test]
     fn pk_equality_never_bounds() {
         assert_eq!(bound_of("id = 5", &schema(false), &[&[1]]).0, None);
     }
 
-    /// An uncovered NULLABLE trailing index column must NOT bound. A NULL in any
-    /// indexed column omits the whole row from the index, so bounding `a = 5` on
-    /// index `(a, b)` with `b` nullable would silently drop every `(a=5, b=NULL)`
-    /// row the `Filter` accepts — a subset, not a superset.
+    /// An uncovered NULLABLE trailing index column must NOT bound.
     #[test]
     fn uncovered_nullable_trailing_column_never_bounds() {
         assert_eq!(bound_of("a = 5", &schema(true), &[&[1, 2]]).0, None);
-        // Non-nullable `b`: the same shape DOES bound — pinning that the guard
-        // above is the nullability, not the uncovered column.
         assert!(bound_of("a = 5", &schema(false), &[&[1, 2]]).0.is_some());
     }
 
@@ -241,17 +149,15 @@ mod tests {
     /// one overall — the collectors are lazy by contract.
     #[test]
     fn unindexed_column_bounds_nothing() {
-        // An index on `b` only; the WHERE names `a`.
         let (b, calls) = bound_of("a = 5", &schema(false), &[&[2]]);
         assert_eq!(b, None);
         assert_eq!(calls, 1, "the eq collector probes once, then finds no match");
-        // No `col OP literal` conjunct at all ⇒ no collector probes the wire.
         let (b, calls) = bound_of("a + b > 3", &schema(false), &[&[1]]);
         assert_eq!(b, None);
         assert_eq!(calls, 0, "a non-servable WHERE must cost no wire traffic");
     }
 
-    /// A BETWEEN is a two-sided range over one column.
+    /// A BETWEEN is a two-sided range over one column (desugared at bind).
     #[test]
     fn between_bounds_both_sides() {
         let (b, _) = bound_of("a BETWEEN 5 AND 9", &schema(false), &[&[1]]);
