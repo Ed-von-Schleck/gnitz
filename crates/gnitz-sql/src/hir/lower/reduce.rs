@@ -8,9 +8,12 @@
 use super::super::physical;
 use super::super::{slot_of, ColId, ColIdGen, HirExpr, HirRef, ProjEntry, RelExpr};
 use super::{cut_segment, emit_filter, extract_scan_bound, split_filter, CutMemo, SegInput};
-use crate::agg::{emit_reduce, group_col_reduce_pos, push_agg_specs, reduce_output_schema, AggSpec, ReduceShape};
+use crate::agg::{
+    emit_reduce, ensure_cardinality_count, group_col_reduce_pos, push_agg_specs, reduce_output_schema, AggSpec,
+    ReduceShape,
+};
 use crate::error::GnitzSqlError;
-use crate::ir::{AggFunc, BExpr, BoundExpr};
+use crate::ir::{BExpr, BoundExpr};
 use crate::lower::{compile_bound_expr, compile_filter_program};
 use crate::plan::validate::reject_duplicate_column_names;
 use crate::plan::view::{EmitPieces, ViewChain};
@@ -37,7 +40,6 @@ pub(crate) fn lower_reduce(
         input,
         group_cols,
         aggs,
-        ground,
     } = reduce
     else {
         unreachable!("lower_reduce receives a Reduce");
@@ -90,10 +92,7 @@ pub(crate) fn lower_reduce(
         let arg_pos = a.arg.map(|id| slot_of(&source_layout, id)).transpose()?;
         push_agg_specs(a.func, arg_pos, &source_schema.columns, &mut specs)?;
     }
-    let ground_start = specs.len();
-    if ground.is_some() {
-        push_agg_specs(AggFunc::Count, None, &source_schema.columns, &mut specs)?;
-    }
+    ensure_cardinality_count(&source_schema.columns, &mut specs)?;
 
     // Reduce strategy (two-phase global / replicated / sharded). The replication
     // probe is a full `TABLE_TAB` scan, so it is gated on catalog provenance: a
@@ -125,8 +124,9 @@ pub(crate) fn lower_reduce(
         .map(|j| group_col_reduce_pos(group_positions[j], out_key, &source_schema, &group_positions))
         .collect();
 
-    // Reduce output layout: `ColId` at each physical slot (placeholder for the
-    // hidden synthetic `_group_pk`).
+    // Reduce output layout: `ColId` at each physical slot. Slots with no logical
+    // identity — the synthetic `_group_pk` and the trailing cardinality COUNT —
+    // keep their placeholder id, which nothing can reference.
     let mut reduce_layout: Vec<ColId> = ids.placeholders(reduce_schema.columns.len());
     for (j, &gid) in group_cols.iter().enumerate() {
         reduce_layout[group_reduce_pos[j]] = gid;
@@ -137,9 +137,6 @@ pub(crate) fn lower_reduce(
         if let Some(c) = &a.companion {
             reduce_layout[slot + 1] = c.id;
         }
-    }
-    if let Some(g) = ground {
-        reduce_layout[agg_col_offset + ground_start] = g.id;
     }
 
     // HAVING filter over the raw reduce output.

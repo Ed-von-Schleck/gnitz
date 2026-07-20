@@ -121,15 +121,18 @@ pub(crate) enum RelExpr {
     },
     /// A GROUP BY / aggregate reduce. `group_cols` are `ColId`s of `input`; its
     /// output carries those same `ColId`s (source names) followed by each
-    /// aggregate's raw value column (and, for AVG / nullable SUM, its
-    /// `COUNT_NON_NULL` companion) and the optional cardinality `ground`. This is
-    /// the **raw** reduce output — the finalized SELECT shape is the finalize
-    /// `Project` above.
+    /// aggregate's raw value column and, for AVG / nullable SUM, its
+    /// `COUNT_NON_NULL` companion. This is the **raw** reduce output — the
+    /// finalized SELECT shape is the finalize `Project` above.
+    ///
+    /// The hidden cardinality COUNT the engine gates group existence on is *not*
+    /// modelled here: it is a physical emission artifact with no logical identity
+    /// (nothing can reference it), appended by `agg::ensure_cardinality_count` at
+    /// the layer that owns spec layout.
     Reduce {
         input: Rc<RelExpr>,
         group_cols: Vec<ColId>,
         aggs: Vec<HirAgg>,
-        ground: Option<HirCol>,
     },
     /// SELECT DISTINCT: dedup over the input's (visible) columns via a synthetic
     /// content-hash key.
@@ -152,13 +155,38 @@ pub(crate) enum RelExpr {
 /// never decomposed here — physicalization expands it to `Sum`+`CountNonNull`).
 /// `out` is the raw value column; `companion` is the hidden `COUNT_NON_NULL`
 /// column present iff the aggregate's null-ness derives from it (AVG, nullable
-/// SUM).
+/// SUM). Both are synthetic staging columns of the reduce's physical output —
+/// referenced only by the finalize/HAVING expressions bind builds over them — so
+/// [`HirAgg::new`] mints their defs from the aggregate's typing rather than any
+/// caller authoring them.
 #[derive(Clone)]
 pub(crate) struct HirAgg {
     pub func: AggFunc,
     pub arg: Option<ColId>,
     pub out: HirCol,
     pub companion: Option<HirCol>,
+}
+
+impl HirAgg {
+    /// Mint an aggregate's raw output column (and its `COUNT_NON_NULL` companion
+    /// when the shape carries one) from the typing `agg::agg_typing` decided. The
+    /// raw value column is a binding target, never wire-decoded, so it is
+    /// non-nullable — matching the physical reduce schema `agg::reduce_output_schema`
+    /// builds for the same aggregate.
+    pub(crate) fn new(ids: &mut ColIdGen, func: AggFunc, arg: Option<ColId>, typing: &crate::agg::AggTyping) -> Self {
+        HirAgg {
+            func,
+            arg,
+            out: HirCol {
+                id: ids.next(),
+                def: ColumnDef::new("_agg", typing.ops[0].1, false),
+            },
+            companion: typing.shape.has_count_companion().then(|| HirCol {
+                id: ids.next(),
+                def: ColumnDef::new("_cnt", TypeCode::I64, false),
+            }),
+        }
+    }
 }
 
 /// Which set operation. Copy so the generalized `classify` rebuild can carry it.
@@ -250,17 +278,11 @@ impl RelExpr {
 
     /// A reduce. `aggs` are already validated + nullability-stamped by bind (which
     /// holds the input env), so this is a plain node build — parity by construction.
-    pub(crate) fn reduce(
-        input: Rc<RelExpr>,
-        group_cols: Vec<ColId>,
-        aggs: Vec<HirAgg>,
-        ground: Option<HirCol>,
-    ) -> Rc<RelExpr> {
+    pub(crate) fn reduce(input: Rc<RelExpr>, group_cols: Vec<ColId>, aggs: Vec<HirAgg>) -> Rc<RelExpr> {
         Rc::new(RelExpr::Reduce {
             input,
             group_cols,
             aggs,
-            ground,
         })
     }
 
@@ -362,13 +384,12 @@ impl RelExpr {
                 input,
                 group_cols,
                 aggs,
-                ground,
             } => {
                 let n = f(input)?;
                 if same(&n, input) {
                     Rc::clone(rel)
                 } else {
-                    RelExpr::reduce(n, group_cols.clone(), aggs.clone(), ground.clone())
+                    RelExpr::reduce(n, group_cols.clone(), aggs.clone())
                 }
             }
             RelExpr::Join {
@@ -433,10 +454,10 @@ impl RelExpr {
                 input,
                 group_cols,
                 aggs,
-                ground,
             } => {
                 // Group cols keep their source `HirCol`s (from the input); then
-                // the raw agg value + companion columns, then the ground.
+                // each aggregate's raw value + companion columns. The physical
+                // cardinality COUNT has no logical column and is absent here.
                 let in_cols = input.cols();
                 let mut cols: Vec<HirCol> = group_cols
                     .iter()
@@ -447,9 +468,6 @@ impl RelExpr {
                     if let Some(c) = &a.companion {
                         cols.push(c.clone());
                     }
-                }
-                if let Some(g) = ground {
-                    cols.push(g.clone());
                 }
                 cols
             }

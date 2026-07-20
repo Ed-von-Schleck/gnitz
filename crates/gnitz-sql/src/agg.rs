@@ -76,6 +76,12 @@ pub(crate) struct AggSpec {
 /// finalize divide) before the wire and always produces F64. A source-less
 /// aggregate (COUNT) passes I64, which the rule maps to its own default arms.
 pub(crate) fn agg_result_type(func: AggFunc, src_col: Option<usize>, cols: &[ColumnDef]) -> TypeCode {
+    agg_result_type_of(func, src_col.map(|c| &cols[c]))
+}
+
+/// [`agg_result_type`] over the argument column's definition directly — the form
+/// the typing pass uses, where no column positions are in scope.
+pub(crate) fn agg_result_type_of(func: AggFunc, arg: Option<&ColumnDef>) -> TypeCode {
     let wire_func = match func {
         AggFunc::Avg => return TypeCode::F64,
         AggFunc::Count => gnitz_core::AggFunc::Count,
@@ -84,10 +90,7 @@ pub(crate) fn agg_result_type(func: AggFunc, src_col: Option<usize>, cols: &[Col
         AggFunc::Min => gnitz_core::AggFunc::Min,
         AggFunc::Max => gnitz_core::AggFunc::Max,
     };
-    let src_tc = match src_col {
-        Some(c) => cols[c].type_code as u8,
-        None => TypeCode::I64 as u8,
-    };
+    let src_tc = arg.map(|c| c.type_code as u8).unwrap_or(TypeCode::I64 as u8);
     TypeCode::from_validated_u8(gnitz_core::agg_output_type(wire_func, src_tc))
 }
 
@@ -432,11 +435,39 @@ pub(crate) fn push_agg_specs(
     cols: &[ColumnDef],
     agg_specs: &mut Vec<AggSpec>,
 ) -> Result<AggShape, GnitzSqlError> {
-    // Every aggregate except COUNT(*) needs a column argument, which the specs
+    let typing = agg_typing(agg_func, arg_col.map(|c| &cols[c]))?;
+    // Every op of one aggregate reads the same source column. COUNT(*) has no
+    // argument and the engine reads none, so slot 0 is the conventional
+    // placeholder (its output type is I64 regardless of what sits there).
+    let col = arg_col.unwrap_or(0);
+    agg_specs.extend(typing.ops.iter().map(|&(op, out_type)| AggSpec { op, col, out_type }));
+    Ok(typing.shape)
+}
+
+/// An aggregate's typing: everything decided by the function and its argument's
+/// definition alone, with no physical column positions involved.
+pub(crate) struct AggTyping {
+    pub(crate) shape: AggShape,
+    /// The physical ops and their output types, in spec order. `ops[0].1` is the
+    /// aggregate's **raw** reduce value type (for AVG, the SUM component's — not
+    /// the F64 the finalize renders).
+    pub(crate) ops: Vec<(WireAggFunc, TypeCode)>,
+    /// The finalize (SELECT-visible) output type — F64 for AVG, else the raw type.
+    pub(crate) view_type: TypeCode,
+}
+
+/// Decide an aggregate's shape, physical op sequence, and output types from its
+/// function and its argument column's definition. The typing half of
+/// [`push_agg_specs`], split out so a caller that needs the typing facts (the HIR
+/// bind, deciding whether to mint a companion and how to type the finalize
+/// projection) does not have to materialize a physical spec list at fabricated
+/// column positions to read them back.
+pub(crate) fn agg_typing(agg_func: AggFunc, arg: Option<&ColumnDef>) -> Result<AggTyping, GnitzSqlError> {
+    // Every aggregate except COUNT(*) needs a column argument, which the arms
     // below unwrap. Validating here — the single source of truth for spec
     // layout — covers both the SELECT-list and HAVING callers, so neither needs
     // its own wildcard guard and a future caller cannot reintroduce the panic.
-    if !matches!(agg_func, AggFunc::Count) && arg_col.is_none() {
+    if !matches!(agg_func, AggFunc::Count) && arg.is_none() {
         return Err(GnitzSqlError::Plan(format!(
             "{agg_func:?} requires an argument column; only COUNT(*) accepts a wildcard"
         )));
@@ -445,14 +476,14 @@ pub(crate) fn push_agg_specs(
     // gate for both the SELECT-list and HAVING callers. Both bind their aggregate
     // call through the leaf binder, which already rejects unorderable MIN/MAX —
     // that arm here is the backstop; the SUM/AVG arm is the sole gate.
-    if let Some(c) = arg_col {
-        let tc = cols[c].type_code;
+    if let Some(c) = arg {
+        let tc = c.type_code;
         match agg_func {
             AggFunc::Sum | AggFunc::Avg => {
                 if !(is_integer_type(tc) || tc.is_float()) || tc.is_wide_int() {
                     return Err(GnitzSqlError::Bind(format!(
                         "{agg_func:?} is not supported on column type {tc:?} ('{}')",
-                        cols[c].name,
+                        c.name,
                     )));
                 }
             }
@@ -460,68 +491,66 @@ pub(crate) fn push_agg_specs(
                 if !is_min_max_orderable(tc) {
                     return Err(GnitzSqlError::Bind(format!(
                         "{agg_func:?} is not supported on column type {tc:?} ('{}')",
-                        cols[c].name,
+                        c.name,
                     )));
                 }
             }
             AggFunc::Count | AggFunc::CountNonNull => {}
         }
     }
-    // The spec's output type comes straight from the shared wire typing rule
-    // over its own (op, source column) — the typed `op` IS the wire selector,
-    // so no parallel planner-enum representation rides along.
-    let mut push = |op: WireAggFunc, col: usize| {
-        let src_tc = cols[col].type_code as u8;
-        agg_specs.push(AggSpec {
-            op,
-            col,
-            out_type: TypeCode::from_validated_u8(gnitz_core::agg_output_type(op, src_tc)),
-        });
+    // An op's output type comes straight from the shared wire typing rule over
+    // its own (op, source type) — the typed `op` IS the wire selector, so no
+    // parallel planner-enum representation rides along. A source-less COUNT
+    // passes I64, which the rule maps to its own default arm.
+    let src_tc = arg.map(|c| c.type_code as u8).unwrap_or(TypeCode::I64 as u8);
+    let op = |o: WireAggFunc| (o, TypeCode::from_validated_u8(gnitz_core::agg_output_type(o, src_tc)));
+    let (shape, ops) = match agg_func {
+        AggFunc::Count => (AggShape::Direct, vec![op(WireAggFunc::Count)]),
+        AggFunc::CountNonNull => (AggShape::Direct, vec![op(WireAggFunc::CountNonNull)]),
+        AggFunc::Min => (AggShape::Direct, vec![op(WireAggFunc::Min)]),
+        AggFunc::Max => (AggShape::Direct, vec![op(WireAggFunc::Max)]),
+        // A nullable source means the group's non-null count can fall back to
+        // zero — its last contributor retracted — while the group still survives
+        // (via COUNT(*) or another aggregate), which SQL renders as NULL. The raw
+        // SUM column cannot express that on the linear fold: its `has_value`
+        // boolean saturates true and never returns to false, so a netted-to-zero
+        // SUM emits a concrete 0 where NULL is correct. Attach a hidden
+        // COUNT_NON_NULL companion and let the finalize null-gate the SUM on it —
+        // distinguishing SUM({5,-5})=0 from SUM({NULL})=NULL.
+        AggFunc::Sum if arg.expect("SUM has an argument").is_nullable => (
+            AggShape::NullfillSum,
+            vec![op(WireAggFunc::Sum), op(WireAggFunc::CountNonNull)],
+        ),
+        AggFunc::Sum => (AggShape::Direct, vec![op(WireAggFunc::Sum)]),
+        AggFunc::Avg => (AggShape::Avg, vec![op(WireAggFunc::Sum), op(WireAggFunc::CountNonNull)]),
     };
-    Ok(match agg_func {
-        AggFunc::Count => {
-            push(WireAggFunc::Count, 0);
-            AggShape::Direct
-        }
-        AggFunc::CountNonNull => {
-            push(WireAggFunc::CountNonNull, arg_col.unwrap());
-            AggShape::Direct
-        }
-        AggFunc::Sum => {
-            let c = arg_col.unwrap();
-            push(WireAggFunc::Sum, c);
-            // A nullable source means the group's non-null count can fall back to
-            // zero — its last contributor retracted — while the group still
-            // survives (via COUNT(*) or another aggregate), which SQL renders as
-            // NULL. The raw SUM column cannot express that on the linear fold: its
-            // `has_value` boolean saturates true and never returns to false, so a
-            // netted-to-zero SUM emits a concrete 0 where NULL is correct. Attach a
-            // hidden COUNT_NON_NULL companion and let the finalize null-gate the
-            // SUM on it — distinguishing SUM({5,-5})=0 from SUM({NULL})=NULL. A
-            // non-nullable source can never be NULL on a surviving group, so it
-            // keeps its plain single-spec copy.
-            if cols[c].is_nullable {
-                push(WireAggFunc::CountNonNull, c);
-                AggShape::NullfillSum
-            } else {
-                AggShape::Direct
-            }
-        }
-        AggFunc::Min => {
-            push(WireAggFunc::Min, arg_col.unwrap());
-            AggShape::Direct
-        }
-        AggFunc::Max => {
-            push(WireAggFunc::Max, arg_col.unwrap());
-            AggShape::Direct
-        }
-        AggFunc::Avg => {
-            let c = arg_col.unwrap();
-            push(WireAggFunc::Sum, c);
-            push(WireAggFunc::CountNonNull, c);
-            AggShape::Avg
-        }
+    Ok(AggTyping {
+        shape,
+        view_type: agg_result_type_of(agg_func, arg),
+        ops,
     })
+}
+
+/// Every planner-built reduce gates group existence on a NULL-blind COUNT(*)
+/// cardinality (a group exists iff its net row weight > 0). Both the combined
+/// value-index path and the single-scan fallback read it — a mixed reduce folds
+/// its linear companions to a numeric value whose saturating `has_value` cannot
+/// signal an emptied group, so without this companion an emptied group would emit
+/// a phantom `(g, NULL, 0)` row.
+///
+/// Reuse a user COUNT(*) when present; else append exactly one hidden trailing
+/// companion. Appended last — after every SELECT and HAVING-only aggregate — so it
+/// shifts no existing aggregate's `specs_start`; it gets no output column, so the
+/// post-reduce MAP strips it (like a HAVING-only aggregate). Every planner-built
+/// reduce is grouped or a global scalar aggregate, so the guard is simply "no
+/// COUNT(*) present yet" — linear or not. (The companion is itself a COUNT, so it
+/// never changes the linearity `emit_reduce`'s two-phase decision reads off the
+/// full spec list.) One home for the AST and HIR reduce emitters.
+pub(crate) fn ensure_cardinality_count(cols: &[ColumnDef], agg_specs: &mut Vec<AggSpec>) -> Result<(), GnitzSqlError> {
+    if !agg_specs.iter().any(|s| s.op == WireAggFunc::Count) {
+        push_agg_specs(AggFunc::Count, None, cols, agg_specs)?;
+    }
+    Ok(())
 }
 
 /// Push the agg_specs + `AggMapping` for one aggregate — the single

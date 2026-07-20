@@ -5,7 +5,7 @@
 //! relation).
 
 use crate::agg::{
-    agg_arg_col, append_agg_mapping, emit_reduce, group_col_reduce_pos, push_agg_specs, reduce_output_schema,
+    agg_arg_col, append_agg_mapping, emit_reduce, ensure_cardinality_count, group_col_reduce_pos, reduce_output_schema,
     AggMapping, AggShape, AggSpec, GroupByLayout, GroupBySelectItem, ReduceShape,
 };
 use crate::ast_util::{expr_operands, single_relation_col_name};
@@ -18,7 +18,6 @@ use crate::plan::validate::{
 };
 use crate::plan::view::EmitPieces;
 use gnitz_core::{CircuitBuilder, ColumnDef, ExprBuilder, GnitzClient, ReduceOutKey, Schema};
-use gnitz_wire::AggFunc as WireAggFunc;
 use sqlparser::ast::{Expr, GroupByExpr, SelectItem};
 
 /// Analyze a single-relation aggregate `select` against `source_schema` into its
@@ -206,27 +205,7 @@ pub(crate) fn emit_group_by_pieces(
         select_items,
     } = layout;
 
-    // Every grouped or global scalar reduce gates group existence on a
-    // NULL-blind COUNT(*) cardinality (a group exists iff its net row weight
-    // > 0). Both the combined value-index path and the single-scan fallback
-    // read it — a mixed reduce folds its linear companions to a numeric value
-    // whose saturating `has_value` cannot signal an emptied group, so without
-    // this companion an emptied group would emit a phantom `(g, NULL, 0)` row.
-    // Reuse a user COUNT(*) when present; else append exactly one hidden
-    // trailing companion. Appended last — after every SELECT and HAVING-only
-    // aggregate — so it shifts no existing aggregate's specs_start; it is added
-    // to agg_specs only (never select_items / agg_mappings), so the post-reduce
-    // MAP strips it (a raw reduce column with no output column, like a
-    // HAVING-only agg). Every planner-built reduce is grouped or a global
-    // scalar aggregate, so the guard is simply "no COUNT(*) present yet" —
-    // linear or not. (The companion is a COUNT, so it never changes the
-    // linearity `emit_reduce`'s two-phase decision reads off the full specs.)
-    if !agg_specs.iter().any(|s| s.op == WireAggFunc::Count) {
-        // Route through push_agg_specs — the single source of truth for spec
-        // layout and out_type — rather than hand-rolling the COUNT spec. The
-        // companion has no select_item / agg_mapping, so its AggShape is discarded.
-        push_agg_specs(AggFunc::Count, None, &source_schema.columns, &mut agg_specs)?;
-    }
+    ensure_cardinality_count(&source_schema.columns, &mut agg_specs)?;
 
     // The reduce's physical shape. Its `out_key` is the output-key kind shipped
     // to the engine (see `ReduceOutKey`: the planner owns this decision, the

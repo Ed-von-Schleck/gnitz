@@ -6,7 +6,7 @@
 //! so a `Get` resolves them by name.
 
 use super::{col_by_id, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, ProjEntry, RelExpr, SetOpKind};
-use crate::agg::{agg_result_type, direct_agg_nullable, push_agg_specs, AggShape};
+use crate::agg::{agg_typing, direct_agg_nullable, AggShape};
 use crate::ast_util::{
     agg_func_from_name, body_is_grouped, extract_relation_name, extract_table_name_and_alias, flatten_conjuncts,
     is_wildcard_projection, projection_item_expr, reject_unsupported_fn_qualifiers, single_fn_name,
@@ -565,14 +565,12 @@ fn bind_join_projection(
 
 // ── GROUP BY / aggregate / HAVING binding ────────────────────────────────────────
 
-/// One collected aggregate over the grouped input: the logical func + arg
-/// (`ColId`), the raw reduce value column (`out`) and optional `COUNT_NON_NULL`
-/// companion, and the finalize (view) output type / nullability.
+/// One collected aggregate over the grouped input: the `HirAgg` that goes into
+/// the `Reduce` node, plus the finalize (view) output type / nullability — bind
+/// state the reduce itself has no use for, since they describe the *finalize*
+/// projection's column, not the raw reduce one.
 struct GroupAgg {
-    func: AggFunc,
-    arg: Option<ColId>,
-    out: HirCol,
-    companion: Option<HirCol>,
+    agg: HirAgg,
     view_type: TypeCode,
     output_nullable: bool,
 }
@@ -639,8 +637,8 @@ fn agg_call(f: &Function) -> Result<(AggFunc, Option<&Expr>), GnitzSqlError> {
 
 /// The AVG / nullable-SUM / Direct finalize composite over the raw reduce output.
 fn finalize_agg_expr(ga: &GroupAgg) -> HirExpr {
-    let out = BExpr::ColRef(HirRef::Col(ga.out.id));
-    match (&ga.companion, ga.func) {
+    let out = BExpr::ColRef(HirRef::Col(ga.agg.out.id));
+    match (&ga.agg.companion, ga.agg.func) {
         (Some(cnt), AggFunc::Avg) => {
             // AVG = (sum * 1.0) / cnt — forces float division; div-by-zero → NULL.
             let cnt = BExpr::ColRef(HirRef::Col(cnt.id));
@@ -704,7 +702,6 @@ fn resolve_group_cols<L: LeafBinder<HirRef>>(
 fn collect_aggs<L: LeafBinder<HirRef>>(
     expr: &Expr,
     env: &[HirCol],
-    env_defs: &[ColumnDef],
     leaf: &L,
     is_global: bool,
     aggs: &mut Vec<GroupAgg>,
@@ -732,44 +729,27 @@ fn collect_aggs<L: LeafBinder<HirRef>>(
                     }
                 }
             }
-            if let Some(idx) = aggs.iter().position(|a| a.func == func && a.arg == arg) {
+            if let Some(idx) = aggs.iter().position(|a| a.agg.func == func && a.agg.arg == arg) {
                 return Ok(Some(idx));
             }
-            let arg_pos = arg.map(|id| env.iter().position(|c| c.id == id).expect("agg arg ColId in env"));
-            let mut specs = Vec::new();
-            let shape = push_agg_specs(func, arg_pos, env_defs, &mut specs)?;
-            let raw_type = specs[0].out_type;
-            let view_type = agg_result_type(func, arg_pos, env_defs);
-            let output_nullable = match shape {
+            let arg_def = arg.map(|id| &col_by_id(env, id).expect("agg arg ColId in env").def);
+            let typing = agg_typing(func, arg_def)?;
+            let output_nullable = match typing.shape {
                 AggShape::Avg | AggShape::NullfillSum => true,
                 AggShape::Direct => {
-                    let arg_nullable = arg_pos.map(|p| env_defs[p].is_nullable).unwrap_or(false);
-                    direct_agg_nullable(func, arg_nullable, is_global)
+                    direct_agg_nullable(func, arg_def.map(|d| d.is_nullable).unwrap_or(false), is_global)
                 }
             };
-            // The raw reduce value column is a binding target (never wire-decoded),
-            // so it is non-nullable — matching the old virtual reduce schema.
-            let out = HirCol {
-                id: ids.next(),
-                def: ColumnDef::new("_agg", raw_type, false),
-            };
-            let companion = shape.has_count_companion().then(|| HirCol {
-                id: ids.next(),
-                def: ColumnDef::new("_cnt", TypeCode::I64, false),
-            });
             aggs.push(GroupAgg {
-                func,
-                arg,
-                out,
-                companion,
-                view_type,
+                agg: HirAgg::new(ids, func, arg, &typing),
+                view_type: typing.view_type,
                 output_nullable,
             });
             return Ok(Some(aggs.len() - 1));
         }
     }
     for op in crate::ast_util::expr_operands(peeled) {
-        let _ = collect_aggs(op, env, env_defs, leaf, is_global, aggs, ids)?;
+        let _ = collect_aggs(op, env, leaf, is_global, aggs, ids)?;
     }
     Ok(None)
 }
@@ -783,9 +763,6 @@ fn bind_grouped_suffix<L: LeafBinder<HirRef>>(
     leaf: &L,
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let env = input.cols();
-    // The aggregate helpers need only the column defs — no physical schema (and
-    // no fabricated PK) is involved in typing an aggregate argument.
-    let env_defs: Vec<ColumnDef> = env.iter().map(|c| c.def.clone()).collect();
 
     let group_cols = resolve_group_cols(select, &env, leaf)?;
     let is_global = group_cols.is_empty();
@@ -798,31 +775,17 @@ fn bind_grouped_suffix<L: LeafBinder<HirRef>>(
     let mut item_agg: Vec<Option<usize>> = Vec::with_capacity(select.projection.len());
     for item in &select.projection {
         let idx = match projection_item_expr(item) {
-            Some(expr) => collect_aggs(expr, &env, &env_defs, leaf, is_global, &mut aggs, ids)?,
+            Some(expr) => collect_aggs(expr, &env, leaf, is_global, &mut aggs, ids)?,
             None => None,
         };
         item_agg.push(idx);
     }
     if let Some(having) = &select.having {
-        let _ = collect_aggs(having, &env, &env_defs, leaf, is_global, &mut aggs, ids)?;
+        let _ = collect_aggs(having, &env, leaf, is_global, &mut aggs, ids)?;
     }
 
-    // Ground COUNT(*) companion — appended when no COUNT(*) is already present.
-    let ground = (!aggs.iter().any(|a| a.func == AggFunc::Count)).then(|| HirCol {
-        id: ids.next(),
-        def: ColumnDef::new("_ground", TypeCode::I64, false),
-    });
-
-    let hir_aggs: Vec<HirAgg> = aggs
-        .iter()
-        .map(|a| HirAgg {
-            func: a.func,
-            arg: a.arg,
-            out: a.out.clone(),
-            companion: a.companion.clone(),
-        })
-        .collect();
-    let reduce = RelExpr::reduce(input, group_cols.clone(), hir_aggs, ground);
+    let hir_aggs: Vec<HirAgg> = aggs.iter().map(|a| a.agg.clone()).collect();
+    let reduce = RelExpr::reduce(input, group_cols.clone(), hir_aggs);
 
     // HAVING → a Filter over the raw reduce output.
     let mut rel = reduce;
@@ -867,7 +830,7 @@ fn bind_finalize_projection<L: LeafBinder<HirRef>>(
         };
         if let Some(agg_idx) = item_agg[idx] {
             let ga = &aggs[agg_idx];
-            let prefix = match ga.func {
+            let prefix = match ga.agg.func {
                 AggFunc::Count | AggFunc::CountNonNull => "_count",
                 AggFunc::Sum => "_sum",
                 AggFunc::Min => "_min",
@@ -946,7 +909,7 @@ impl<L: LeafBinder<HirRef>> GroupedLeaf<'_, L> {
         };
         self.aggs
             .iter()
-            .find(|a| a.func == func && a.arg == arg)
+            .find(|a| a.agg.func == func && a.agg.arg == arg)
             .ok_or_else(|| GnitzSqlError::Bind(format!("HAVING: aggregate {func:?} could not be resolved")))
     }
 }
@@ -967,7 +930,7 @@ impl<L: LeafBinder<HirRef>> LeafBinder<HirRef> for GroupedLeaf<'_, L> {
         if let Expr::Function(f) = peeled {
             if single_fn_name(f).and_then(agg_func_from_name).is_some() {
                 let ga = self.find_agg(f)?;
-                if let Some(cnt) = &ga.companion {
+                if let Some(cnt) = &ga.agg.companion {
                     // Nullable SUM / AVG: NULL ⇔ COUNT_NON_NULL companion is 0.
                     let bop = if want_null { BinOp::Eq } else { BinOp::Ne };
                     return Ok(BExpr::BinOp(
@@ -976,7 +939,11 @@ impl<L: LeafBinder<HirRef>> LeafBinder<HirRef> for GroupedLeaf<'_, L> {
                         Box::new(BExpr::LitInt(0)),
                     ));
                 }
-                return Ok(fold_null_test(ga.output_nullable, HirRef::Col(ga.out.id), want_null));
+                return Ok(fold_null_test(
+                    ga.output_nullable,
+                    HirRef::Col(ga.agg.out.id),
+                    want_null,
+                ));
             }
         }
         // A bare group-column reference; anything else (an arithmetic expression)
