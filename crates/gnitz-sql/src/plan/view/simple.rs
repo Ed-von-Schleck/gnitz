@@ -61,7 +61,7 @@ fn emit_linear_opts(view_id: u64, rel: Rel, shard: bool) -> Result<EmitPieces, G
     // Filter program (if any), compiled against the source schema. A predicate
     // that bound to a true constant compiles to no filter at all.
     let expr_prog = match &filter {
-        Some(pred) => compile_filter_program(pred, &source_schema)?,
+        Some(pred) => compile_filter_program(pred, &source_schema.columns)?,
         None => None,
     };
 

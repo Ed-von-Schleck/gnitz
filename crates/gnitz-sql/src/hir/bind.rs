@@ -6,7 +6,7 @@
 //! so a `Get` resolves them by name.
 
 use super::{col_by_id, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, ProjEntry, RelExpr, SetOpKind};
-use crate::agg::{agg_typing, direct_agg_nullable, AggShape};
+use crate::agg::{agg_output_nullable, agg_typing, default_agg_name, finalize_agg_bexpr, reject_min_max_unorderable};
 use crate::ast_util::{
     agg_func_from_name, body_is_grouped, extract_relation_name, extract_table_name_and_alias, flatten_conjuncts,
     is_wildcard_projection, projection_item_expr, reject_unsupported_fn_qualifiers, single_fn_name,
@@ -16,7 +16,7 @@ use crate::bind::{bind_structural, find_unique_column, fold_null_test, Binder, L
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BExpr, BinOp};
 use crate::plan::validate::{
-    reject_duplicate_column_names, reject_float_key, reject_unhonored_select_clauses, HonoredClauses,
+    reject_duplicate_names, reject_float_key, reject_unhonored_select_clauses, HonoredClauses,
 };
 use crate::plan::view::join::join_on_and_type;
 use gnitz_core::{ColumnDef, GnitzClient, TypeCode};
@@ -158,8 +158,15 @@ fn reject_dup_proj_names(items: &[ProjEntry], projection: &[SelectItem], ctx: &s
     if is_wildcard_projection(projection) {
         return Ok(());
     }
-    let out_defs: Vec<ColumnDef> = items.iter().map(|e| e.out.def.clone()).collect();
-    reject_duplicate_column_names(&out_defs, ctx)
+    // Hidden slots are skipped, exactly as `reject_duplicate_column_names` does:
+    // they are excluded from name resolution, so they cannot bind ambiguously.
+    reject_duplicate_names(
+        items
+            .iter()
+            .filter(|e| !e.out.def.is_hidden)
+            .map(|e| e.out.def.name.as_str()),
+        ctx,
+    )
 }
 
 /// Expand a bare `*` item over `cols` (honoring `EXCEPT`/`EXCLUDE`/`RENAME`,
@@ -635,31 +642,14 @@ fn agg_call(f: &Function) -> Result<(AggFunc, Option<&Expr>), GnitzSqlError> {
     }
 }
 
-/// The AVG / nullable-SUM / Direct finalize composite over the raw reduce output.
+/// The AVG / nullable-SUM / Direct finalize composite over the raw reduce output
+/// — the shared rule, over this binder's column-identity leaf.
 fn finalize_agg_expr(ga: &GroupAgg) -> HirExpr {
-    let out = BExpr::ColRef(HirRef::Col(ga.agg.out.id));
-    match (&ga.agg.companion, ga.agg.func) {
-        (Some(cnt), AggFunc::Avg) => {
-            // AVG = (sum * 1.0) / cnt — forces float division; div-by-zero → NULL.
-            let cnt = BExpr::ColRef(HirRef::Col(cnt.id));
-            BExpr::BinOp(
-                Box::new(BExpr::BinOp(Box::new(out), BinOp::Mul, Box::new(BExpr::LitFloat(1.0)))),
-                BinOp::Div,
-                Box::new(cnt),
-            )
-        }
-        (Some(cnt), _) => {
-            // Nullable SUM = sum / (cnt != 0) — an exact identity divisor while the
-            // non-null count is positive; div-by-zero → NULL when it hits zero.
-            let cnt = BExpr::ColRef(HirRef::Col(cnt.id));
-            BExpr::BinOp(
-                Box::new(out),
-                BinOp::Div,
-                Box::new(BExpr::BinOp(Box::new(cnt), BinOp::Ne, Box::new(BExpr::LitInt(0)))),
-            )
-        }
-        (None, _) => out,
-    }
+    finalize_agg_bexpr(
+        HirRef::Col(ga.agg.out.id),
+        ga.agg.companion.as_ref().map(|c| HirRef::Col(c.id)),
+        ga.agg.func,
+    )
 }
 
 /// Resolve GROUP BY columns to `ColId`s (bare/qualified refs only). A computed
@@ -716,30 +706,22 @@ fn collect_aggs<L: LeafBinder<HirRef>>(
                 None => None,
             };
             // MIN/MAX orderability — checked here (Unsupported) so the message and
-            // error variant match the old leaf binder, ahead of `push_agg_specs`'s
+            // error variant match the old leaf binder, ahead of `agg_typing`'s
             // `Bind` backstop.
-            if matches!(func, AggFunc::Min | AggFunc::Max) {
-                if let Some(id) = arg {
-                    let ty = col_by_id(env, id).expect("agg arg in env").def.type_code;
-                    if !crate::types::is_min_max_orderable(ty) {
-                        return Err(GnitzSqlError::Unsupported(format!(
-                            "{}: not supported on {ty:?} columns",
-                            if func == AggFunc::Min { "MIN" } else { "MAX" }
-                        )));
-                    }
-                }
+            if let Some(id) = arg {
+                reject_min_max_unorderable(func, col_by_id(env, id).expect("agg arg in env").def.type_code)?;
             }
             if let Some(idx) = aggs.iter().position(|a| a.agg.func == func && a.agg.arg == arg) {
                 return Ok(Some(idx));
             }
             let arg_def = arg.map(|id| &col_by_id(env, id).expect("agg arg ColId in env").def);
             let typing = agg_typing(func, arg_def)?;
-            let output_nullable = match typing.shape {
-                AggShape::Avg | AggShape::NullfillSum => true,
-                AggShape::Direct => {
-                    direct_agg_nullable(func, arg_def.map(|d| d.is_nullable).unwrap_or(false), is_global)
-                }
-            };
+            let output_nullable = agg_output_nullable(
+                typing.shape,
+                func,
+                arg_def.map(|d| d.is_nullable).unwrap_or(false),
+                is_global,
+            );
             aggs.push(GroupAgg {
                 agg: HirAgg::new(ids, func, arg, &typing),
                 view_type: typing.view_type,
@@ -830,14 +812,7 @@ fn bind_finalize_projection<L: LeafBinder<HirRef>>(
         };
         if let Some(agg_idx) = item_agg[idx] {
             let ga = &aggs[agg_idx];
-            let prefix = match ga.agg.func {
-                AggFunc::Count | AggFunc::CountNonNull => "_count",
-                AggFunc::Sum => "_sum",
-                AggFunc::Min => "_min",
-                AggFunc::Max => "_max",
-                AggFunc::Avg => "_avg",
-            };
-            let name = alias.unwrap_or_else(|| format!("{prefix}{idx}"));
+            let name = alias.unwrap_or_else(|| default_agg_name(ga.agg.func, idx));
             items.push(ProjEntry {
                 expr: finalize_agg_expr(ga),
                 out: HirCol {

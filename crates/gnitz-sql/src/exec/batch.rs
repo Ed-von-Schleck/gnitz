@@ -117,7 +117,7 @@ pub(crate) fn resolve_projection(projection: &[SelectItem], schema: &Schema) -> 
                 // visible name; `REPLACE`/`ILIKE` are rejected inside `for_item`.
                 let rw = WildcardRewrite::for_item(item, |n| wildcard_name_is_visible(&schema.columns, n), "SELECT")?;
                 for (i, c) in schema.columns.iter().enumerate() {
-                    if c.is_hidden && !schema.is_pk_col(i) {
+                    if schema.is_hidden_payload(i) {
                         continue;
                     }
                     let Some(def) = rw.rewrite_column(c) else { continue };

@@ -244,7 +244,7 @@ fn emit_side(
         unreachable!("a pass-through side is a Project");
     };
     let (where_preds, _) = super::split_filter(input);
-    let node = emit_filter(cb, inp, where_preds, &seg.layout, &seg.schema)?;
+    let node = emit_filter(cb, inp, where_preds, &seg.layout, &seg.schema.columns)?;
     // Every item is a bare column ref (that is what makes the side pass-through),
     // so each resolves to one source slot.
     let slots = items

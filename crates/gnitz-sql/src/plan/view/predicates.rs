@@ -36,7 +36,7 @@ use std::rc::Rc;
 /// plans are byte-identical.
 pub(crate) fn multi_null_filter_prog(
     cols: &[usize],
-    schema: &Schema,
+    coldefs: &[ColumnDef],
     want_null: bool,
 ) -> Result<gnitz_core::ExprProgram, GnitzSqlError> {
     // Caller invariant: cols is non-empty (at least one join key column) AND at
@@ -56,11 +56,7 @@ pub(crate) fn multi_null_filter_prog(
     // degrades correctly should that ever change — with every key NOT NULL,
     // `c IS NOT NULL` is a tautology (keep all rows) and `c IS NULL` a contradiction
     // (drop all), exactly right when no key can be NULL.
-    let nullable: Vec<usize> = cols
-        .iter()
-        .copied()
-        .filter(|&c| schema.columns[c].is_nullable)
-        .collect();
+    let nullable: Vec<usize> = cols.iter().copied().filter(|&c| coldefs[c].is_nullable).collect();
     let cols = if nullable.is_empty() { cols } else { &nullable[..] };
 
     let leaf = |c: usize| {
@@ -75,7 +71,7 @@ pub(crate) fn multi_null_filter_prog(
     for &c in &cols[1..] {
         expr = BoundExpr::BinOp(Box::new(expr), op, Box::new(leaf(c)));
     }
-    compile_bound_expr_to_program(&expr, schema)
+    compile_bound_expr_to_program(&expr, coldefs)
 }
 
 /// NULL-key gate: when any of `cols` is nullable, filter NULL-keyed rows out of
@@ -89,11 +85,11 @@ pub(crate) fn null_gate(
     cb: &mut CircuitBuilder,
     node: NodeId,
     cols: &[usize],
-    schema: &Schema,
+    coldefs: &[ColumnDef],
 ) -> Result<(NodeId, bool), GnitzSqlError> {
-    let nullable = cols.iter().any(|&c| schema.columns[c].is_nullable);
+    let nullable = cols.iter().any(|&c| coldefs[c].is_nullable);
     let gated = if nullable {
-        cb.filter(node, Some(multi_null_filter_prog(cols, schema, false)?))
+        cb.filter(node, Some(multi_null_filter_prog(cols, coldefs, false)?))
     } else {
         node
     };
@@ -105,8 +101,8 @@ pub(crate) fn null_gate(
 /// `0..n`, and `reindex_output_schema` places those payload columns at physical
 /// indices `k..k+n` regardless of the key arity `k` (the `k` PK slots precede
 /// them), so the payload offsets never shift with the number of key columns.
-pub(crate) fn build_reindex_program(schema: &Schema) -> gnitz_core::ExprProgram {
-    build_reindex_program_keep(schema, &(0..schema.columns.len()).collect::<Vec<_>>())
+pub(crate) fn build_reindex_program(coldefs: &[ColumnDef]) -> gnitz_core::ExprProgram {
+    build_reindex_program_keep(coldefs, &(0..coldefs.len()).collect::<Vec<_>>())
 }
 
 /// Build a reindex ExprProgram that copies only the `keep` source columns (in
@@ -117,19 +113,30 @@ pub(crate) fn build_reindex_program(schema: &Schema) -> gnitz_core::ExprProgram 
 /// indices `k..k+keep.len()` behind the `k` PK slots), so the program is the
 /// single source of truth for the pruned layout. Passing `0..n` reproduces the
 /// unpruned identity byte-for-byte.
-pub(crate) fn build_reindex_program_keep(schema: &Schema, keep: &[usize]) -> gnitz_core::ExprProgram {
+pub(crate) fn build_reindex_program_keep(coldefs: &[ColumnDef], keep: &[usize]) -> gnitz_core::ExprProgram {
     let mut eb = ExprBuilder::new();
     for (out_pos, &ci) in keep.iter().enumerate() {
-        let tc = schema.columns[ci].type_code as u32;
+        let tc = coldefs[ci].type_code as u32;
         eb.copy_col(tc, ci as u32, out_pos as u32);
     }
     eb.build(0) // result_reg unused — COPY_COL writes directly
 }
 
+/// Re-key `node` onto its own source PK, payload verbatim — the `P_all` operand of
+/// an outer null-fill's `positive_part(P_all − π_P(inner))`, and the NULL-key
+/// bypass re-key. The target type codes are all-zero (self-derive): the source PK
+/// columns already carry their own types, so the re-key is width- and sign-exact.
+/// One home, so every null-fill's preserved side is keyed identically to the
+/// `π_P(inner)` it is subtracted from — a drift there would be a silent weight bug.
+pub(crate) fn rekey_on_source_pk(cb: &mut CircuitBuilder, node: NodeId, schema: &Schema) -> NodeId {
+    let zero = vec![0u8; schema.pk_cols.len()];
+    cb.map_reindex(node, &schema.pk_cols, &zero, build_reindex_program(&schema.columns))
+}
+
 /// A schema's column type codes in order — the `null_extend` argument naming the
 /// NULL columns to append for the non-preserved side of an outer-join null-fill.
-pub(crate) fn schema_type_codes(schema: &Schema) -> Vec<u64> {
-    schema.columns.iter().map(|c| c.type_code as u64).collect()
+pub(crate) fn schema_type_codes(coldefs: &[ColumnDef]) -> Vec<u64> {
+    coldefs.iter().map(|c| c.type_code as u64).collect()
 }
 
 /// Validate one equijoin key pair and return the pair's common reindex output
@@ -292,36 +299,7 @@ pub(crate) fn extract_join_predicates(
         residual,
         ..
     } = collector;
-    if left_cols.is_empty() && range.is_none() {
-        // A residual cannot stand alone: a residual-only ON (`ON a.r <> b.s`) would
-        // be an incremental cross-join, which the engine cannot build. Residuals
-        // are only ever evaluated alongside a physical equi/range anchor (§3).
-        return Err(GnitzSqlError::Bind(
-            "JOIN ON must have at least one equijoin or range predicate".into(),
-        ));
-    }
-    // Reindex-slot arity cap: each equality pair plus the optional range slot
-    // becomes one synthetic `_join_pk` PK-list slot, and the codec holds at most
-    // PK_LIST_MAX_COLS. Reject a wider ON here as a clean planner error rather than
-    // a `pack_pk_cols` panic at registration. (The output pair-PK has its own cap,
-    // checked in the range circuit builder.)
-    let slots = left_cols.len() + range.is_some() as usize;
-    if slots > gnitz_core::PK_LIST_MAX_COLS {
-        return Err(GnitzSqlError::Unsupported(if range.is_none() {
-            format!(
-                "JOIN ON: at most {} equijoin key columns are supported (got {})",
-                gnitz_core::PK_LIST_MAX_COLS,
-                left_cols.len()
-            )
-        } else {
-            format!(
-                "range JOIN ON: at most {} join key columns (equality prefix + \
-                     range) are supported (got {})",
-                gnitz_core::PK_LIST_MAX_COLS,
-                slots
-            )
-        }));
-    }
+    reject_join_key_arity(left_cols.len(), range.is_some())?;
     Ok((left_cols, right_cols, target_tcs, range, residual))
 }
 
@@ -457,7 +435,7 @@ fn resolve_join_col_ref(expr: &Expr, alias_map: &AliasMap) -> Result<usize, Gnit
 /// `ColumnDef`s). Aggregates in ON are rejected outright.
 struct JoinResidual<'a> {
     alias_map: &'a AliasMap,
-    merged: &'a Schema,
+    merged: &'a [ColumnDef],
     base: usize,
 }
 
@@ -478,7 +456,7 @@ impl LeafBinder for JoinResidual<'_> {
     }
     fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<BoundExpr, GnitzSqlError> {
         let idx = self.idx(inner)?;
-        Ok(fold_null_test(self.merged.columns[idx].is_nullable, idx, want_null))
+        Ok(fold_null_test(self.merged[idx].is_nullable, idx, want_null))
     }
 }
 
@@ -489,7 +467,7 @@ impl LeafBinder for JoinResidual<'_> {
 pub(crate) fn and_fold_compile<'e>(
     conjuncts: impl IntoIterator<Item = &'e Expr>,
     mut bind: impl FnMut(&'e Expr) -> Result<BoundExpr, GnitzSqlError>,
-    schema: &Schema,
+    coldefs: &[ColumnDef],
 ) -> Result<Option<gnitz_core::ExprProgram>, GnitzSqlError> {
     let mut acc: Option<BoundExpr> = None;
     for e in conjuncts {
@@ -499,24 +477,59 @@ pub(crate) fn and_fold_compile<'e>(
             Some(a) => BoundExpr::BinOp(Box::new(a), BinOp::And, Box::new(b)),
         });
     }
-    acc.map(|e| compile_bound_expr_to_program(&e, schema)).transpose()
+    acc.map(|e| compile_bound_expr_to_program(&e, coldefs)).transpose()
 }
 
-/// AND every residual conjunct (bound against the merged join-output schema via
+/// The JOIN ON key-arity rules, shared by both join planners.
+///
+/// A residual cannot stand alone: a residual-only ON (`ON a.r <> b.s`) would be an
+/// incremental cross-join, which the engine cannot build. Residuals are only ever
+/// evaluated alongside a physical equi/range anchor (§3).
+///
+/// Reindex-slot arity cap: each equality pair plus the optional range slot becomes
+/// one synthetic `_join_pk` PK-list slot, and the codec holds at most
+/// `PK_LIST_MAX_COLS`. Reject a wider ON here as a clean planner error rather than
+/// a `pack_pk_cols` panic at registration. (The output pair-PK has its own cap,
+/// checked in the range circuit builder.)
+pub(crate) fn reject_join_key_arity(n_eq: usize, has_range: bool) -> Result<(), GnitzSqlError> {
+    if n_eq == 0 && !has_range {
+        return Err(GnitzSqlError::Bind(
+            "JOIN ON must have at least one equijoin or range predicate".into(),
+        ));
+    }
+    let slots = n_eq + has_range as usize;
+    if slots > gnitz_core::PK_LIST_MAX_COLS {
+        return Err(GnitzSqlError::Unsupported(if !has_range {
+            format!(
+                "JOIN ON: at most {} equijoin key columns are supported (got {n_eq})",
+                gnitz_core::PK_LIST_MAX_COLS,
+            )
+        } else {
+            format!(
+                "range JOIN ON: at most {} join key columns (equality prefix + \
+                 range) are supported (got {slots})",
+                gnitz_core::PK_LIST_MAX_COLS,
+            )
+        }));
+    }
+    Ok(())
+}
+
+/// AND every residual conjunct (bound against the merged join-output columns via
 /// the `JoinResidual` leaf) into one `ExprProgram`. `residual` is non-empty —
 /// callers guard, and the residual is only spliced for INNER joins (§6.3).
 pub(crate) fn build_residual_filter_prog(
     residual: &[Expr],
     alias_map: &AliasMap,
-    merged_schema: &Schema,
+    merged_cols: &[ColumnDef],
     payload_base: usize,
 ) -> Result<gnitz_core::ExprProgram, GnitzSqlError> {
     let leaf = JoinResidual {
         alias_map,
-        merged: merged_schema,
+        merged: merged_cols,
         base: payload_base,
     };
-    let prog = and_fold_compile(residual, |e| bind_structural(e, &leaf), merged_schema)?;
+    let prog = and_fold_compile(residual, |e| bind_structural(e, &leaf), merged_cols)?;
     Ok(prog.expect("non-empty residual"))
 }
 
@@ -562,7 +575,6 @@ mod tests {
         am.insert(
             "a".to_string(),
             ResolvedRelation {
-                table_id: 1,
                 schema: Rc::new(left_schema.clone()),
                 col_offset: 0,
             },
@@ -570,7 +582,6 @@ mod tests {
         am.insert(
             "b".to_string(),
             ResolvedRelation {
-                table_id: 2,
                 schema: Rc::new(right_schema.clone()),
                 col_offset: left_n,
             },
@@ -832,11 +843,11 @@ mod tests {
             pk_cols: vec![0],
         };
         // k = 1 (byte-identical to the old single-column null_filter_prog).
-        multi_null_filter_prog(&[0], &schema, false).unwrap();
-        multi_null_filter_prog(&[0], &schema, true).unwrap();
+        multi_null_filter_prog(&[0], &schema.columns, false).unwrap();
+        multi_null_filter_prog(&[0], &schema.columns, true).unwrap();
         // k ≥ 2: a multi-leaf And for want_null=false, a multi-leaf Or for true.
-        multi_null_filter_prog(&[0, 1, 2], &schema, false).unwrap();
-        multi_null_filter_prog(&[0, 1, 2], &schema, true).unwrap();
+        multi_null_filter_prog(&[0, 1, 2], &schema.columns, false).unwrap();
+        multi_null_filter_prog(&[0, 1, 2], &schema.columns, true).unwrap();
     }
 
     // ── Range / band join extraction ─────────────────────────────────────────

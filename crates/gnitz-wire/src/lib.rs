@@ -8,8 +8,9 @@
 //! module a symbol lives in. `control`, `type_code`, and `wal` are the
 //! exceptions: they remain named modules because callers reference their
 //! functions by path (`gnitz_wire::wal::encode`) — the generic names would
-//! collide at the crate root. `wal`'s *constants* (`WAL_*`, `MAX_WIRE_REGIONS`)
-//! are still flat-exported, since they are referenced pervasively.
+//! collide at the crate root. `wal`'s *constants* (`WAL_*`, `MAX_WIRE_REGIONS`,
+//! the `REG_*` region-convention indices) are still flat-exported, since they are
+//! referenced pervasively.
 
 #[cfg(not(target_endian = "little"))]
 compile_error!("GnitzDB requires a little-endian target; the wire format is LE-only.");
@@ -45,8 +46,9 @@ pub use uuid::*;
 // Flat-export `wal`'s constants (referenced everywhere) but not its framer
 // functions (`encode`/`block_size`/… stay `gnitz_wire::wal::`-qualified).
 pub use wal::{
-    IPC_CONTROL_TID, MAX_WIRE_REGIONS, WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT,
-    WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID, WAL_OFF_VERSION,
+    IPC_CONTROL_TID, MAX_WIRE_REGIONS, NUM_FIXED_REGIONS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
+    WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE,
+    WAL_OFF_TID, WAL_OFF_VERSION,
 };
 
 // ---------------------------------------------------------------------------

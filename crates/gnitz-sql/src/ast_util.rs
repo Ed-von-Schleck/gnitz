@@ -71,22 +71,40 @@ pub(crate) fn fn_name_is(f: &sqlparser::ast::Function, name: &str) -> bool {
     single_fn_name(f).is_some_and(|n| n.eq_ignore_ascii_case(name))
 }
 
+/// The one SQL-name ↔ aggregate map, read in both directions by
+/// [`agg_func_from_name`] and [`agg_func_name`]. `CountNonNull` is absent: it is
+/// not a spelling a user writes, but the `COUNT(x)` argument shape the binder
+/// picks after resolving `count` (see [`agg_func_name`]).
+const AGG_NAMES: [(&str, AggFunc); 5] = [
+    ("count", AggFunc::Count),
+    ("sum", AggFunc::Sum),
+    ("min", AggFunc::Min),
+    ("max", AggFunc::Max),
+    ("avg", AggFunc::Avg),
+];
+
 /// The `AggFunc` a function name denotes (`count`, `sum`, `min`, `max`, `avg`),
 /// matched case-insensitively without allocating; `None` for any other name.
 /// The single name→aggregate map: the binder's `bind_function` dispatches the
 /// argument shape from it (COUNT(*) vs COUNT(x)), and the dispatch walkers use
 /// it to detect an aggregate — an aggregate added here reaches them all at once.
 pub(crate) fn agg_func_from_name(name: &str) -> Option<AggFunc> {
-    const NAMES: [(&str, AggFunc); 5] = [
-        ("count", AggFunc::Count),
-        ("sum", AggFunc::Sum),
-        ("min", AggFunc::Min),
-        ("max", AggFunc::Max),
-        ("avg", AggFunc::Avg),
-    ];
-    NAMES
+    AGG_NAMES
         .into_iter()
         .find_map(|(n, f)| name.eq_ignore_ascii_case(n).then_some(f))
+}
+
+/// The canonical lowercase SQL name of an aggregate — [`agg_func_from_name`]
+/// inverted over the same table, so a name can never drift between the two
+/// directions. `CountNonNull` is the `COUNT(x)` argument shape of `count` and
+/// shares its name: both render `count`, which is what keeps an unaliased
+/// `COUNT(*)` and `COUNT(x)` on the same default output name.
+pub(crate) fn agg_func_name(f: AggFunc) -> &'static str {
+    let spelled = if f == AggFunc::CountNonNull { AggFunc::Count } else { f };
+    AGG_NAMES
+        .iter()
+        .find_map(|&(n, g)| (g == spelled).then_some(n))
+        .expect("every AggFunc spelling is in AGG_NAMES")
 }
 
 /// True when a SELECT body is grouped: it carries a GROUP BY or an aggregate in

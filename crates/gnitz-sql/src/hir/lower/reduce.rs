@@ -108,7 +108,7 @@ pub(crate) fn lower_reduce(
     let inp = cb.input_delta_bounded(bound);
     let filtered = match where_folded {
         // Already folded above (the scan bound reads the same folded predicate).
-        Some(f) => match compile_filter_program(&f, &source_schema)? {
+        Some(f) => match compile_filter_program(&f, &source_schema.columns)? {
             Some(p) => cb.filter(inp, Some(p)),
             None => inp,
         },
@@ -140,7 +140,7 @@ pub(crate) fn lower_reduce(
     }
 
     // HAVING filter over the raw reduce output.
-    let filtered_reduced = emit_filter(&mut cb, reduced, having_preds, &reduce_layout, &reduce_schema)?;
+    let filtered_reduced = emit_filter(&mut cb, reduced, having_preds, &reduce_layout, &reduce_schema.columns)?;
 
     // Finalize map + output columns + output layout. The PK region is inherited
     // by the MAP (natural group cols renamed in place; the synthetic `_group_pk`
@@ -181,7 +181,7 @@ pub(crate) fn lower_reduce(
                 eb.copy_col(tc as u32, *slot as u32, payload_idx);
             }
             _ => {
-                let reg = compile_bound_expr(&resolved, &reduce_schema, &mut eb)?;
+                let reg = compile_bound_expr(&resolved, &reduce_schema.columns, &mut eb)?;
                 eb.emit_col(reg, payload_idx);
             }
         }

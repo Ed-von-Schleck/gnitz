@@ -21,6 +21,21 @@
 
 use crate::{align8, checksum, read_u32_le, read_u64_le, write_u32_le, write_u64_le, WalError};
 
+/// The fixed regions that precede the payload columns in the region convention
+/// (§6), in order: PK, weight, null bitmap. Payload column `pi` lives at region
+/// `REG_PAYLOAD_START + pi`, and a batch has `NUM_FIXED_REGIONS + num_payload + 1`
+/// regions in total (the trailing blob heap). One home for a layout the client,
+/// the wire codec, and the engine all encode — the engine's `storage` re-exports
+/// these rather than restating them.
+pub const REG_PK: usize = 0;
+pub const REG_WEIGHT: usize = 1;
+pub const REG_NULL_BMP: usize = 2;
+pub const NUM_FIXED_REGIONS: usize = 3;
+pub const REG_PAYLOAD_START: usize = NUM_FIXED_REGIONS;
+// The fixed regions are exactly `REG_PK..=REG_NULL_BMP`, so the payload start and
+// the fixed-region count are the same number by construction.
+const _: () = assert!(REG_NULL_BMP + 1 == NUM_FIXED_REGIONS);
+
 pub const WAL_HEADER_SIZE: usize = 32;
 pub const WAL_FORMAT_VERSION: u32 = 6;
 

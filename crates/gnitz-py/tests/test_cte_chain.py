@@ -230,3 +230,60 @@ class TestCteChain:
             assert _rows(client, sn, "v", ["v"]) == [(20,), (99,)]  # UNION distinct
         finally:
             _cleanup(client, sn)
+
+    def test_band_left_join_in_cte_body(self, client):
+        """A band LEFT JOIN (equality prefix + range) inside a CTE body. A join in a
+        CTE body plans as a join chain, so this pins the outer null-fill on that route
+        — the direct `CREATE VIEW … LEFT JOIN` shape does not reach it."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)", schema_name=sn)
+            client.execute_sql("CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, w BIGINT NOT NULL)", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS WITH d AS ("
+                "SELECT t.id AS did, u.w AS uw FROM t LEFT JOIN u ON t.id = u.id AND t.v < u.w"
+                ") SELECT did, uw FROM d",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO u VALUES (1, 100), (2, 50)", schema_name=sn)
+            # t1 id=1,v=30: matches u1, 30<100 -> uw=100.
+            # t2 id=2,v=80: u2 exists but 80<50 false -> null-fill.
+            # t3 id=3,v=40: no u -> null-fill.
+            client.execute_sql("INSERT INTO t VALUES (1, 30), (2, 80), (3, 40)", schema_name=sn)
+            assert _rows(client, sn, "v", ["did", "uw"]) == [(1, 100), (2, None), (3, None)]
+
+            # Retracting the matched row removes it (and emits no stray null-fill).
+            client.execute_sql("DELETE FROM t WHERE id = 1", schema_name=sn)
+            assert _rows(client, sn, "v", ["did", "uw"]) == [(2, None), (3, None)]
+        finally:
+            _cleanup(client, sn)
+
+    def test_pure_range_left_join_in_cte_body(self, client):
+        """A pure-range LEFT JOIN (no equality prefix) inside a CTE body — the
+        threshold null-fill on the join-chain route. Several right rows per left row
+        pin that the matched multiplicity is carried, not collapsed."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)", schema_name=sn)
+            client.execute_sql("CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, w BIGINT NOT NULL)", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS WITH d AS ("
+                "SELECT t.id AS did, u.w AS uw FROM t LEFT JOIN u ON t.v < u.w"
+                ") SELECT did, uw FROM d",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO u VALUES (1, 50), (2, 200)", schema_name=sn)
+            # v=30 -> both; v=100 -> only 200; v=20 -> both; v=500 -> none (null-fill).
+            client.execute_sql("INSERT INTO t VALUES (1, 30), (2, 100), (3, 20), (4, 500)", schema_name=sn)
+            assert _rows(client, sn, "v", ["did", "uw"]) == [
+                (1, 50),
+                (1, 200),
+                (2, 200),
+                (3, 50),
+                (3, 200),
+                (4, None),
+            ]
+        finally:
+            _cleanup(client, sn)

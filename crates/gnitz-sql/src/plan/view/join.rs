@@ -14,8 +14,8 @@ use crate::plan::validate::{
 };
 use crate::plan::view::predicates::{
     build_reindex_program, build_reindex_program_keep, build_residual_filter_prog, converse_rel,
-    extract_join_predicates, multi_null_filter_prog, null_gate, pure_range_m_output_cols, schema_type_codes,
-    RangeConjunct,
+    extract_join_predicates, multi_null_filter_prog, null_gate, pure_range_m_output_cols, rekey_on_source_pk,
+    schema_type_codes, RangeConjunct,
 };
 use crate::plan::view::{EmitPieces, ViewChain};
 use gnitz_core::{
@@ -94,10 +94,10 @@ pub(crate) fn combined_payload_coldefs(
 /// equi builder (`slot_tcs = target_tcs`), the range builder
 /// (`slot_tcs = all_tcs`, the eq prefix plus the range slot), and the
 /// EXISTS/IN semi-join builder.
-pub(crate) fn side_target_tcs(cols: &[usize], schema: &Schema, slot_tcs: &[TypeCode]) -> Vec<u8> {
+pub(crate) fn side_target_tcs(cols: &[usize], coldefs: &[ColumnDef], slot_tcs: &[TypeCode]) -> Vec<u8> {
     cols.iter()
         .zip(slot_tcs)
-        .map(|(&c, &t)| schema.columns[c].type_code.carried_reindex_tc(t))
+        .map(|(&c, &t)| coldefs[c].type_code.carried_reindex_tc(t))
         .collect()
 }
 
@@ -140,7 +140,7 @@ pub(crate) struct EquiSide<'a> {
     pub(crate) input: gnitz_core::NodeId,
     pub(crate) cols: &'a [usize],
     pub(crate) target_tcs: &'a [u8],
-    pub(crate) schema: &'a Schema,
+    pub(crate) coldefs: &'a [ColumnDef],
     pub(crate) keep: &'a [usize],
 }
 
@@ -202,7 +202,11 @@ pub(crate) fn emit_range_null_fill_tail(
     let zero_tcs = vec![0u8; pair_pk];
 
     let (p_pk, p_n) = if preserved_is_left { (pa, left_n) } else { (pb, right_n) };
-    let o_col_tcs = schema_type_codes(if preserved_is_left { right_schema } else { left_schema });
+    let o_col_tcs = schema_type_codes(if preserved_is_left {
+        &right_schema.columns
+    } else {
+        &left_schema.columns
+    });
     let nullfill = cb.null_extend(nf_keyed, &o_col_tcs); // [P.pk × p_pk, P, NULL-O]
 
     // Pair-PK [a.pk…, b.pk…]: preserved side's pk from the PK region (0..p_pk),
@@ -224,7 +228,11 @@ pub(crate) fn emit_range_null_fill_tail(
     // P.pk × p_pk output payload slots stay 0 (projected away). The payload is P's
     // columns followed by O's (`o_col_tcs`), in input order — no reorder, since
     // map_reindex locks the output payload to input order.
-    let p_col_tcs = schema_type_codes(if preserved_is_left { left_schema } else { right_schema });
+    let p_col_tcs = schema_type_codes(if preserved_is_left {
+        &left_schema.columns
+    } else {
+        &right_schema.columns
+    });
     let mut eb = ExprBuilder::new();
     for (ci, &tc) in p_col_tcs.iter().chain(&o_col_tcs).enumerate() {
         eb.copy_col(tc as u32, (p_pk + ci) as u32, (p_pk + ci) as u32);
@@ -264,8 +272,8 @@ pub(crate) struct EquiNullFill<'a> {
     pub(crate) left: EquiSide<'a>,
     pub(crate) right: EquiSide<'a>,
     pub(crate) terms: &'a EquiTerms,
-    pub(crate) pruned_left: &'a Schema,
-    pub(crate) pruned_right: &'a Schema,
+    pub(crate) pruned_left: &'a [ColumnDef],
+    pub(crate) pruned_right: &'a [ColumnDef],
 }
 
 /// Emit `inner ∪ ν_A ∪ ν_B` — the outer join's null-fill, unioned onto the inner
@@ -336,7 +344,7 @@ pub(crate) fn emit_equi_null_fill(cb: &mut CircuitBuilder, nf: EquiNullFill<'_>)
                 side.input,
                 side.cols,
                 side.target_tcs,
-                build_reindex_program_keep(side.schema, side.keep),
+                build_reindex_program_keep(side.coldefs, side.keep),
             )
         } else {
             reindex
@@ -371,19 +379,19 @@ pub(crate) fn emit_equi_join_terms(
     a: EquiSide<'_>,
     b: EquiSide<'_>,
 ) -> Result<EquiTerms, GnitzSqlError> {
-    let (b_gated, b_nullable) = null_gate(cb, b.input, b.cols, b.schema)?;
+    let (b_gated, b_nullable) = null_gate(cb, b.input, b.cols, b.coldefs)?;
     let reindex_b = cb.map_reindex(
         b_gated,
         b.cols,
         b.target_tcs,
-        build_reindex_program_keep(b.schema, b.keep),
+        build_reindex_program_keep(b.coldefs, b.keep),
     );
-    let (a_gated, a_nullable) = null_gate(cb, a.input, a.cols, a.schema)?;
+    let (a_gated, a_nullable) = null_gate(cb, a.input, a.cols, a.coldefs)?;
     let reindex_a = cb.map_reindex(
         a_gated,
         a.cols,
         a.target_tcs,
-        build_reindex_program_keep(a.schema, a.keep),
+        build_reindex_program_keep(a.coldefs, a.keep),
     );
     let trace_a = cb.integrate_trace(reindex_a);
     let trace_b = cb.integrate_trace(reindex_b);
@@ -419,8 +427,8 @@ pub(crate) fn range_slots(
     right_cols: &[usize],
     eq_tcs: &[TypeCode],
     range: &RangeConjunct,
-    left_schema: &Schema,
-    right_schema: &Schema,
+    left_coldefs: &[ColumnDef],
+    right_coldefs: &[ColumnDef],
 ) -> RangeSlots {
     let left_reindex_cols: Vec<usize> = left_cols
         .iter()
@@ -433,8 +441,8 @@ pub(crate) fn range_slots(
         .chain(std::iter::once(range.right_col))
         .collect();
     let all_tcs: Vec<TypeCode> = eq_tcs.iter().copied().chain(std::iter::once(range.tc)).collect();
-    let left_target_tcs = side_target_tcs(&left_reindex_cols, left_schema, &all_tcs);
-    let right_target_tcs = side_target_tcs(&right_reindex_cols, right_schema, &all_tcs);
+    let left_target_tcs = side_target_tcs(&left_reindex_cols, left_coldefs, &all_tcs);
+    let right_target_tcs = side_target_tcs(&right_reindex_cols, right_coldefs, &all_tcs);
     RangeSlots {
         left_reindex_cols,
         right_reindex_cols,
@@ -458,22 +466,22 @@ pub(crate) fn range_gate_reindex_prologue(
     a_input: gnitz_core::NodeId,
     b_input: gnitz_core::NodeId,
     slots: &RangeSlots,
-    left_schema: &Schema,
-    right_schema: &Schema,
+    left_coldefs: &[ColumnDef],
+    right_coldefs: &[ColumnDef],
 ) -> Result<(gnitz_core::NodeId, gnitz_core::NodeId, bool), GnitzSqlError> {
-    let (a_gated, a_nullable) = null_gate(cb, a_input, &slots.left_reindex_cols, left_schema)?;
-    let (b_gated, _) = null_gate(cb, b_input, &slots.right_reindex_cols, right_schema)?;
+    let (a_gated, a_nullable) = null_gate(cb, a_input, &slots.left_reindex_cols, left_coldefs)?;
+    let (b_gated, _) = null_gate(cb, b_input, &slots.right_reindex_cols, right_coldefs)?;
     let reindex_a = cb.map_reindex(
         a_gated,
         &slots.left_reindex_cols,
         &slots.left_target_tcs,
-        build_reindex_program(left_schema),
+        build_reindex_program(left_coldefs),
     );
     let reindex_b = cb.map_reindex(
         b_gated,
         &slots.right_reindex_cols,
         &slots.right_target_tcs,
-        build_reindex_program(right_schema),
+        build_reindex_program(right_coldefs),
     );
     Ok((reindex_a, reindex_b, a_nullable))
 }
@@ -817,7 +825,6 @@ pub(crate) fn plan_join_chain(
             alias_map.insert(
                 a.to_ascii_lowercase(),
                 ResolvedRelation {
-                    table_id: acc_tid,
                     schema: Rc::clone(sch),
                     col_offset: *off,
                 },
@@ -826,7 +833,6 @@ pub(crate) fn plan_join_chain(
         alias_map.insert(
             right_alias.to_ascii_lowercase(),
             ResolvedRelation {
-                table_id: r_tid,
                 schema: Rc::clone(&r_schema),
                 col_offset: acc_schema.columns.len(),
             },
@@ -959,6 +965,100 @@ fn equi_keep_combined(projection: &[SelectItem], j: &LoweredJoin) -> Result<Vec<
     Ok(keep)
 }
 
+/// Outer + residual is unsupported: an outer preserved-side row's null-fill
+/// decides match existence from the inner output (or the MAX/MIN threshold
+/// witness), independently of the residual, and so would not retro-null-fill a row
+/// matched only by residual-failing pairs. A consistent boundary across all join
+/// shapes beats an inconsistent partial one; INNER residuals are fully supported.
+/// One home, so both join emitters reject identically.
+pub(crate) fn reject_outer_with_residual(kind: JoinType, residual_empty: bool) -> Result<(), GnitzSqlError> {
+    if kind != JoinType::Inner && !residual_empty {
+        return Err(GnitzSqlError::Unsupported(
+            "LEFT/RIGHT/FULL JOIN with a residual ON predicate (a non-equi/non-range \
+             conjunct, or a second range conjunct) is not supported; the residual \
+             would have to participate in the outer null-fill. Use INNER JOIN, or \
+             move the predicate to a WHERE over a wrapping view."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The range-join output pair-PK arity cap (`a.pk_count + b.pk_count ≤
+/// PK_LIST_MAX_COLS`) — the binding constraint on the synthesized output PK; the
+/// stride ceiling is non-binding (≤ 4·16 = 64 ≤ MAX_PK_BYTES). The engine's
+/// `validate_pk_cols` is the backstop; this is the friendly planner error. One
+/// home, so both range-join emitters reject identically.
+pub(crate) fn reject_pair_pk_overflow(pa: usize, pb: usize) -> Result<(), GnitzSqlError> {
+    let pair_pk = pa + pb;
+    if pair_pk > gnitz_core::PK_LIST_MAX_COLS {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "range JOIN output PK has {pair_pk} columns (a.pk {pa} + b.pk {pb}), \
+             exceeding the {}-column limit",
+            gnitz_core::PK_LIST_MAX_COLS
+        )));
+    }
+    Ok(())
+}
+
+/// The pure-range (`n_eq == 0`) outer-join restrictions. RIGHT/FULL is checked
+/// **first** so a FULL join reports the mirror-null-fill limitation rather than
+/// the narrower LEFT type rule.
+///
+/// The broadcast range join scatters the inner output by the OTHER side's range
+/// key, so gathering it onto the preserved-key worker would need a second
+/// sequential exchange the compiler forbids — the very reason LEFT uses a
+/// threshold. A RIGHT/FULL pure-range null-fill would need a full second
+/// threshold pipeline (a B-side `m_A = MAX/MIN(a.range)`), a standalone effort.
+///
+/// LEFT: the inline threshold null-fill reduces the range column with MIN/MAX (an
+/// 8-byte accumulator), then reindexes the result onto the range slot type.
+/// MIN/MAX preserves the source integer type, so any ≤8-byte integer range column
+/// yields a result the reindex consumes directly. A 16-byte U128/UUID/I128 range
+/// column has no 8-byte accumulator — reject up front rather than failing the
+/// compile.
+pub(crate) fn reject_pure_range_outer(kind: JoinType, range_tc: TypeCode) -> Result<(), GnitzSqlError> {
+    if kind.preserves_right() {
+        return Err(GnitzSqlError::Unsupported(
+            "pure-range RIGHT/FULL JOIN (a sole inequality range conjunct with no \
+             equality prefix) is not supported; its mirror null-fill has no inner-join \
+             witness on the preserved side. Use INNER/LEFT JOIN, or add an equality \
+             conjunct to make it a band join."
+                .into(),
+        ));
+    }
+    if kind.preserves_left() {
+        reject_pure_range_threshold_tc(
+            range_tc,
+            "pure-range LEFT JOIN",
+            "use a narrower range column, INNER JOIN, or a band join",
+        )?;
+    }
+    Ok(())
+}
+
+/// The threshold null-fill's range-column type rule, shared by every pure-range
+/// (`n_eq == 0`) shape that builds one: the threshold `m = MAX/MIN(other.range)` is
+/// an inline MIN/MAX reduce, which has only an 8-byte accumulator, so a 16-byte
+/// U128/UUID/I128 range column has no reduce that can produce it — reject up front
+/// rather than failing the compile. `surface` names the SQL shape and `remedy` the
+/// way out; the rule itself has one home, so a change to the accumulator width is
+/// one edit rather than three.
+pub(crate) fn reject_pure_range_threshold_tc(
+    range_tc: TypeCode,
+    surface: &str,
+    remedy: &str,
+) -> Result<(), GnitzSqlError> {
+    if FixedInt::from_type_code(range_tc).is_none() {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "{surface} needs a ≤8-byte integer range column (got {range_tc:?}); its threshold \
+             null-fill reduces the range column with MIN/MAX, which has no 16-byte accumulator \
+             — {remedy}"
+        )));
+    }
+    Ok(())
+}
+
 /// A schema pruned to its `keep` columns (ascending source order), payload-only —
 /// `pk_cols` is dropped (empty), since the pruned schema drives output-layout
 /// derivation and name resolution, never a PK region.
@@ -992,7 +1092,6 @@ fn prune_alias_map(alias_map: &AliasMap, keep: &[bool], left_n: usize) -> AliasM
         out.insert(
             alias.clone(),
             ResolvedRelation {
-                table_id: rel.table_id,
                 schema: Rc::new(prune_schema(&rel.schema, &kept)),
                 col_offset: new_offset,
             },
@@ -1006,22 +1105,7 @@ fn prune_alias_map(alias_map: &AliasMap, keep: &[bool], left_n: usize) -> AliasM
 /// `view_id` is pre-allocated so a chain's downstream segment can reference this
 /// segment's store; the segment itself is created by the caller.
 fn emit_join(view_id: u64, projection: &[SelectItem], mut lowered: LoweredJoin) -> Result<EmitPieces, GnitzSqlError> {
-    // Outer (LEFT/RIGHT/FULL) + residual is rejected (§3): for an outer join the ON
-    // predicate is part of the *match* condition — a preserved-side row whose only
-    // physical matches all fail the residual must still null-fill, but the null-fill
-    // decides match existence from the inner output (or the MAX/MIN threshold
-    // witness), independently of the residual, and so would not retro-null-fill a row
-    // matched only by residual-failing pairs. A consistent boundary across all join
-    // shapes beats an inconsistent partial one; INNER residuals are fully supported.
-    if lowered.join_type != JoinType::Inner && !lowered.residual.is_empty() {
-        return Err(GnitzSqlError::Unsupported(
-            "LEFT/RIGHT/FULL JOIN with a residual ON predicate (a non-equi/non-range \
-             conjunct, or a second range conjunct) is not supported; the residual \
-             would have to participate in the outer null-fill. Use INNER JOIN, or \
-             move the predicate to a WHERE over a wrapping view."
-                .into(),
-        ));
-    }
+    reject_outer_with_residual(lowered.join_type, lowered.residual.is_empty())?;
 
     // Range (band) join: one range conjunct (optionally behind equality
     // conjuncts) routes to the broadcast / re-key / output-exchange circuit. The
@@ -1065,8 +1149,8 @@ fn emit_join(view_id: u64, projection: &[SelectItem], mut lowered: LoweredJoin) 
 
     // Per-side carried target tc for each key pair (0 = self-derive); see
     // `side_target_tcs`.
-    let left_target_tcs = side_target_tcs(&left_join_cols, &left_schema, &target_tcs);
-    let right_target_tcs = side_target_tcs(&right_join_cols, &right_schema, &target_tcs);
+    let left_target_tcs = side_target_tcs(&left_join_cols, &left_schema.columns, &target_tcs);
+    let right_target_tcs = side_target_tcs(&right_join_cols, &right_schema.columns, &target_tcs);
 
     let left_n = left_schema.columns.len();
     let right_n = right_schema.columns.len();
@@ -1117,14 +1201,14 @@ fn emit_join(view_id: u64, projection: &[SelectItem], mut lowered: LoweredJoin) 
             input: input_a_raw,
             cols: &left_join_cols,
             target_tcs: &left_target_tcs,
-            schema: &left_schema,
+            coldefs: &left_schema.columns,
             keep: &keep_l,
         },
         EquiSide {
             input: input_b_raw,
             cols: &right_join_cols,
             target_tcs: &right_target_tcs,
-            schema: &right_schema,
+            coldefs: &right_schema.columns,
             keep: &keep_r,
         },
     )?;
@@ -1154,19 +1238,19 @@ fn emit_join(view_id: u64, projection: &[SelectItem], mut lowered: LoweredJoin) 
                     input: input_a_raw,
                     cols: &left_join_cols,
                     target_tcs: &left_target_tcs,
-                    schema: &left_schema,
+                    coldefs: &left_schema.columns,
                     keep: &keep_l,
                 },
                 right: EquiSide {
                     input: input_b_raw,
                     cols: &right_join_cols,
                     target_tcs: &right_target_tcs,
-                    schema: &right_schema,
+                    coldefs: &right_schema.columns,
                     keep: &keep_r,
                 },
                 terms: &terms,
-                pruned_left: &pruned_left_schema,
-                pruned_right: &pruned_right_schema,
+                pruned_left: &pruned_left_schema.columns,
+                pruned_right: &pruned_right_schema.columns,
             },
         )
     };
@@ -1200,11 +1284,7 @@ fn emit_join(view_id: u64, projection: &[SelectItem], mut lowered: LoweredJoin) 
     let merged = if post_filter.is_empty() {
         merged
     } else {
-        let merged_schema = Schema {
-            columns: out_cols.clone(),
-            pk_cols: (0..k).collect(),
-        };
-        let prog = build_residual_filter_prog(&post_filter, &alias_map, &merged_schema, k)?;
+        let prog = build_residual_filter_prog(&post_filter, &alias_map, &out_cols, k)?;
         cb.filter(merged, Some(prog))
     };
 
@@ -1307,18 +1387,7 @@ fn emit_range_join(
 
     // The reindex-slot arity cap (k ≤ PK_LIST_MAX_COLS) was enforced in
     // extract_join_predicates. Here we additionally cap the output pair-PK.
-    //
-    // Output pair-PK arity cap (a.pk_count + b.pk_count ≤ PK_LIST_MAX_COLS) — the
-    // binding constraint on the synthesized output PK; the stride ceiling is
-    // non-binding (≤ 4·16 = 64 ≤ MAX_PK_BYTES). The engine's validate_pk_cols is
-    // the backstop; this is the friendly planner error.
-    if pair_pk > gnitz_core::PK_LIST_MAX_COLS {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "range JOIN output PK has {pair_pk} columns (a.pk {pa} + b.pk {pb}), \
-             exceeding the {}-column limit",
-            gnitz_core::PK_LIST_MAX_COLS
-        )));
-    }
+    reject_pair_pk_overflow(pa, pb)?;
     // The widest intermediate is the re-key output: pair-PK + k `_join_pk` slots +
     // every A and B column.
     reject_column_overflow("range JOIN view intermediate", pair_pk + k + left_n + right_n)?;
@@ -1330,45 +1399,14 @@ fn emit_range_join(
         right_join_cols,
         eq_tcs,
         &range,
-        left_schema,
-        right_schema,
+        &left_schema.columns,
+        &right_schema.columns,
     );
 
-    // Pure-range (n_eq == 0) outer-join restrictions. The RIGHT/FULL rejection is checked
-    // FIRST so it wins for `Full` (which satisfies both `preserves_right()` and
-    // `preserves_left()`): a 16-byte FULL pure-range gets the RIGHT/FULL message, not the
-    // LEFT ≤8-byte one. Band (n_eq ≥ 1) has neither restriction — it uses the cap-free
-    // `positive_part(P − π_P(inner))` null-fill, so it has no range-type restriction.
+    // Pure-range (n_eq == 0) only. Band (n_eq ≥ 1) has neither restriction — it uses
+    // the cap-free `positive_part(P − π_P(inner))` null-fill.
     if n_eq == 0 {
-        // RIGHT/FULL is rejected: its mirror null-fill `ν_B` has no `π_B(inner)` witness.
-        // The broadcast range join scatters the inner output by the OTHER side's range
-        // key, so gathering it onto the preserved-key worker would need a second
-        // sequential exchange the compiler forbids — the very reason LEFT uses a threshold.
-        // A RIGHT/FULL pure-range null-fill would need a full second threshold pipeline (a
-        // B-side `m_A = MAX/MIN(a.range)`), a standalone effort.
-        if join_type.preserves_right() {
-            return Err(GnitzSqlError::Unsupported(
-                "pure-range RIGHT/FULL JOIN (a sole inequality range conjunct with no \
-                 equality prefix) is not supported; its mirror null-fill has no inner-join \
-                 witness on the preserved side. Use INNER/LEFT JOIN, or add an equality \
-                 conjunct to make it a band join."
-                    .into(),
-            ));
-        }
-        // LEFT (FULL already returned above): the inline threshold null-fill reduces the
-        // range column with MIN/MAX (an 8-byte accumulator), then reindexes the result onto
-        // the range slot type. MIN/MAX preserves the source integer type, so any ≤8-byte
-        // integer range column yields a result the reindex consumes directly. A 16-byte
-        // U128/UUID/I128 range column has no 8-byte accumulator — reject up front rather
-        // than failing the compile.
-        if join_type.preserves_left() && FixedInt::from_type_code(range.tc).is_none() {
-            let range_tc = range.tc;
-            return Err(GnitzSqlError::Unsupported(format!(
-                "pure-range LEFT JOIN needs a ≤8-byte integer range column (got {range_tc:?}); \
-                 its threshold null-fill reduces the range column with MIN/MAX, which has no \
-                 16-byte accumulator — use a narrower range column, INNER JOIN, or a band join"
-            )));
-        }
+        reject_pure_range_outer(join_type, range.tc)?;
     }
 
     let mut cb = CircuitBuilder::new(view_id, 0);
@@ -1381,8 +1419,14 @@ fn emit_range_join(
     // side's raw input so a preserved row with a NULL eq/range column (never an
     // inner match, never in `D`) is still null-filled (§4). The gated nodes feed
     // only the inner match.
-    let (reindex_a, reindex_b, left_key_nullable) =
-        range_gate_reindex_prologue(&mut cb, input_a_raw, input_b_raw, &slots, left_schema, right_schema)?;
+    let (reindex_a, reindex_b, left_key_nullable) = range_gate_reindex_prologue(
+        &mut cb,
+        input_a_raw,
+        input_b_raw,
+        &slots,
+        &left_schema.columns,
+        &right_schema.columns,
+    )?;
     let RangeSlots {
         left_reindex_cols,
         all_tcs,
@@ -1429,7 +1473,7 @@ fn emit_range_join(
     let merged = if residual.is_empty() {
         merged
     } else {
-        let prog = build_residual_filter_prog(residual, alias_map, &union_schema, k)?;
+        let prog = build_residual_filter_prog(residual, alias_map, &union_schema.columns, k)?;
         cb.filter(merged, Some(prog))
     };
 
@@ -1441,7 +1485,12 @@ fn emit_range_join(
         pair_pk_cols.push(k + left_n + b_pk);
     }
     let zero_tcs = vec![0u8; pair_pk];
-    let rekey = cb.map_reindex(merged, &pair_pk_cols, &zero_tcs, build_reindex_program(&union_schema));
+    let rekey = cb.map_reindex(
+        merged,
+        &pair_pk_cols,
+        &zero_tcs,
+        build_reindex_program(&union_schema.columns),
+    );
 
     // Re-key output layout: `[_pair_pk × pair_pk (PK), _join_pk × k, A cols, B cols]`.
     // The user projection drops the k `_join_pk` slots (they DIFFER per term and
@@ -1553,15 +1602,10 @@ fn emit_range_join(
                     merged,
                     &pair_pk_cols[..pa],
                     &zero_a,
-                    build_reindex_program(&union_schema),
+                    build_reindex_program(&union_schema.columns),
                 );
                 let proj_a = cb.map(rekey_a, &(pa + k..pa + k + left_n).collect::<Vec<_>>()); // π_A(inner)
-                let a_all = cb.map_reindex(
-                    input_a_raw,
-                    &left_schema.pk_cols,
-                    &zero_a,
-                    build_reindex_program(left_schema),
-                );
+                let a_all = rekey_on_source_pk(&mut cb, input_a_raw, left_schema);
                 let nu_a = cb.positive_diff(a_all, proj_a); // max(0, A − π_A(inner)), keyed [a.pk, A]
                 let branch = nf_tail(&mut cb, nu_a, true);
                 acc = cb.union(branch, acc);
@@ -1571,18 +1615,13 @@ fn emit_range_join(
                     merged,
                     &pair_pk_cols[pa..],
                     &zero_b,
-                    build_reindex_program(&union_schema),
+                    build_reindex_program(&union_schema.columns),
                 );
                 let proj_b = cb.map(
                     rekey_b,
                     &(pb + k + left_n..pb + k + left_n + right_n).collect::<Vec<_>>(),
                 ); // π_B(inner)
-                let b_all = cb.map_reindex(
-                    input_b_raw,
-                    &right_schema.pk_cols,
-                    &zero_b,
-                    build_reindex_program(right_schema),
-                );
+                let b_all = rekey_on_source_pk(&mut cb, input_b_raw, right_schema);
                 let nu_b = cb.positive_diff(b_all, proj_b); // max(0, B − π_B(inner)), keyed [b.pk, B]
                 let branch = nf_tail(&mut cb, nu_b, false);
                 acc = cb.union(branch, acc);
@@ -1603,11 +1642,7 @@ fn emit_range_join(
                 .cloned()
                 .chain(combined_payload.iter().cloned())
                 .collect();
-            let combined_schema = Schema {
-                columns: combined_cols,
-                pk_cols: (0..pair_pk).collect(),
-            };
-            let prog = build_residual_filter_prog(where_filter, alias_map, &combined_schema, pair_pk)?;
+            let prog = build_residual_filter_prog(where_filter, alias_map, &combined_cols, pair_pk)?;
             cb.filter(unioned, Some(prog))
         };
 
@@ -1712,7 +1747,7 @@ pub(crate) fn build_pure_range_threshold(
     // synthetic `_group_pk` fold, like every other empty-group reduce.
     let red = cb.reduce_multi_local(mbh, &[], &[(agg_func, 1)], false, ReduceOutKey::SyntheticFold); // [_group_pk:U128, m:Tc]
     let carried_m = range_tc.carried_reindex_tc(range_tc);
-    let reindex_m = cb.map_reindex(red, &[1], &[carried_m], build_reindex_program(&m_schema));
+    let reindex_m = cb.map_reindex(red, &[1], &[carried_m], build_reindex_program(&m_schema.columns));
     let trace_m = cb.integrate_trace(reindex_m);
 
     let j_am = cb.join_with_trace_range_node(int_a, trace_m, 0, rel_ab);
@@ -1734,7 +1769,7 @@ pub(crate) fn build_pure_range_threshold(
     let a_cols: Vec<usize> = (pa + 1..pa + 1 + left_n).collect();
     // One shared reindex program drives both re-keys, so the IDENTICAL encoding
     // is structural — `matched` and `a_pass` differ only in their input node.
-    let nf_reindex_prog = build_reindex_program(&nf_raw_schema);
+    let nf_reindex_prog = build_reindex_program(&nf_raw_schema.columns);
     let rekey_a = |cb: &mut CircuitBuilder, input: gnitz_core::NodeId| {
         let keyed = cb.map_reindex(input, &a_pk_in_raw, &zero_a, nf_reindex_prog.clone());
         cb.map(keyed, &a_cols) // [a.pk…, A]
@@ -1801,9 +1836,8 @@ pub(crate) fn union_null_key_rows(
     cols: &[usize],
     schema: &Schema,
 ) -> Result<gnitz_core::NodeId, GnitzSqlError> {
-    let anull = cb.filter(source, Some(multi_null_filter_prog(cols, schema, true)?));
-    let zero = vec![0u8; schema.pk_cols.len()];
-    let anull_keyed = cb.map_reindex(anull, &schema.pk_cols, &zero, build_reindex_program(schema));
+    let anull = cb.filter(source, Some(multi_null_filter_prog(cols, &schema.columns, true)?));
+    let anull_keyed = rekey_on_source_pk(cb, anull, schema);
     let anull_owned = cb.partition_filter(anull_keyed);
     Ok(cb.union(nf_match, anull_owned))
 }
@@ -1925,12 +1959,8 @@ mod tests {
             pk_cols: Vec::new(),
         })
     }
-    fn rel(tid: u64, schema: Rc<Schema>, col_offset: usize) -> ResolvedRelation {
-        ResolvedRelation {
-            table_id: tid,
-            schema,
-            col_offset,
-        }
+    fn rel(schema: Rc<Schema>, col_offset: usize) -> ResolvedRelation {
+        ResolvedRelation { schema, col_offset }
     }
 
     /// Chain regression: a 3-way chain's left accumulator carries several original
@@ -1943,9 +1973,9 @@ mod tests {
         // Accumulator layout: [_join_pk(0), a.x(1), b.m(2), b.n(3)] (left_n = 4);
         // right relation c.z at combined index 4.
         let mut am = AliasMap::new();
-        am.insert("a".to_string(), rel(10, sch(&["x"]), 1));
-        am.insert("b".to_string(), rel(10, sch(&["m", "n"]), 2));
-        am.insert("c".to_string(), rel(20, sch(&["z"]), 4));
+        am.insert("a".to_string(), rel(sch(&["x"]), 1));
+        am.insert("b".to_string(), rel(sch(&["m", "n"]), 2));
+        am.insert("c".to_string(), rel(sch(&["z"]), 4));
         let left_n = 4;
         // Kept: a.x(1), b.m(2), c.z(4). Dropped: _join_pk(0), b.n(3).
         let keep = vec![false, true, true, false, true];
@@ -1968,8 +1998,8 @@ mod tests {
     fn prune_alias_map_two_way_offsets() {
         // left a=[p, q] (offsets 0,1); right b=[r, s, t] (offsets 2,3,4). left_n = 2.
         let mut am = AliasMap::new();
-        am.insert("a".to_string(), rel(1, sch(&["p", "q"]), 0));
-        am.insert("b".to_string(), rel(2, sch(&["r", "s", "t"]), 2));
+        am.insert("a".to_string(), rel(sch(&["p", "q"]), 0));
+        am.insert("b".to_string(), rel(sch(&["r", "s", "t"]), 2));
         let left_n = 2;
         // Keep all of a; from b keep only s (idx 3). Dropped: r(2), t(4).
         let keep = vec![true, true, false, true, false];

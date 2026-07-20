@@ -676,10 +676,14 @@ pub struct SchemaWithVersion<'a> {
     pub version: u16,
 }
 
+// META_SCHEMA_DESC payload regions, after the fixed pk (= col_idx) / weight /
+// null_bmp trio: type_code (U64), flags (U64), name (STRING), then the blob.
+// Only the two U64 columns are read here; the name is carried but unused.
+const REG_TYPE_CODE: usize = gnitz_wire::REG_PAYLOAD_START;
+const REG_FLAGS: usize = gnitz_wire::REG_PAYLOAD_START + 1;
+
 pub(crate) fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescriptor, &'static str> {
     // Parse directly from WAL block bytes; no Batch allocation needed.
-    // META_SCHEMA_DESC layout: pk(reg 0), weight(1), null_bmp(2),
-    //   type_code/U64(3), flags/U64(4), name/STR(5), blob(6).
     //
     // Format validity — header size, version, `total_size` in-bounds, body
     // checksum, region count ≤ cap, and every region's extent within the block —
@@ -709,7 +713,7 @@ pub(crate) fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<
     if count > crate::schema::MAX_COLUMNS {
         return Err("schema exceeds column limit");
     }
-    if num_regions < 5 {
+    if num_regions <= REG_FLAGS {
         return Err("schema block region count mismatch");
     }
 
@@ -722,7 +726,7 @@ pub(crate) fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<
     // it big-endian to recover the native index. `validate_and_parse` already
     // bounded each region's extent to the block, so only the schema-level
     // "big enough for `count` columns" check remains.
-    let (pk_off, pk_sz) = (offs[0] as usize, sizes[0] as usize);
+    let (pk_off, pk_sz) = (offs[gnitz_wire::REG_PK] as usize, sizes[gnitz_wire::REG_PK] as usize);
     if pk_sz < count * 8 {
         return Err("schema col_idx region OOB");
     }
@@ -734,8 +738,8 @@ pub(crate) fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<
         }
     }
 
-    let (tc_off, tc_sz) = (offs[3] as usize, sizes[3] as usize);
-    let (fl_off, fl_sz) = (offs[4] as usize, sizes[4] as usize);
+    let (tc_off, tc_sz) = (offs[REG_TYPE_CODE] as usize, sizes[REG_TYPE_CODE] as usize);
+    let (fl_off, fl_sz) = (offs[REG_FLAGS] as usize, sizes[REG_FLAGS] as usize);
 
     if tc_sz < count * 8 {
         return Err("schema type_code region OOB");

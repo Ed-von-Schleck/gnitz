@@ -69,7 +69,7 @@ pub(crate) fn resolve_proj_col_with(
         }
         Ok((ProjItem::PassThrough { src_col: ci }, col))
     } else {
-        let out_type = bound.infer_type(source_schema);
+        let out_type = bound.infer_type(&source_schema.columns);
         Ok((
             ProjItem::Computed { bound_expr: bound },
             ColumnDef::new(alias.unwrap_or_else(|| format!("_expr{idx}")), out_type, true),
@@ -93,7 +93,7 @@ pub(crate) fn compile_projection_map(items: &[ProjItem], schema: &Schema) -> Res
                 eb.copy_col(tc, *src_col as u32, payload_idx);
             }
             ProjItem::Computed { bound_expr } => {
-                let reg = compile_bound_expr(bound_expr, schema, &mut eb)?;
+                let reg = compile_bound_expr(bound_expr, &schema.columns, &mut eb)?;
                 eb.emit_col(reg, payload_idx);
             }
         }

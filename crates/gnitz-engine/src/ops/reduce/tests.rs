@@ -1914,7 +1914,7 @@ fn test_emit_reduce_row_compound_pk_bytes() {
         false,
         false,
     );
-    emit_reduce_row(&mut output, &mb, 0, mb.get_pk_bytes(0), &accs, &plan);
+    emit_reduce_row(&mut output, (&mb, 0), mb.get_pk_bytes(0), &accs, &plan);
 
     assert_eq!(output.count, 1);
     // Source PK region is OPK (big-endian); the verbatim copy preserves it.
@@ -6386,7 +6386,7 @@ fn count_non_null_all_null_group_renders_zero_null_clear() {
         false,
         false,
     );
-    emit_reduce_row(&mut output, &mb, 0, mb.get_pk_bytes(0), &accs, &plan);
+    emit_reduce_row(&mut output, (&mb, 0), mb.get_pk_bytes(0), &accs, &plan);
 
     assert_eq!(output.count, 1);
     let out_mb = output.as_mem_batch();

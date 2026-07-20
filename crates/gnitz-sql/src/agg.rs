@@ -7,8 +7,9 @@
 //! (`synthetic_fold_cols`). A sibling of `ir` so `exec` keeps its documented
 //! shape (it sinks only into shared lower layers, never up into `plan`).
 
+use crate::ast_util::agg_func_name;
 use crate::error::GnitzSqlError;
-use crate::ir::{AggFunc, BoundExpr};
+use crate::ir::{AggFunc, BExpr, BinOp, BoundExpr};
 use crate::types::{is_integer_type, is_min_max_orderable};
 use gnitz_core::{ColumnDef, ReduceOutKey, Schema, TypeCode};
 use gnitz_wire::AggFunc as WireAggFunc;
@@ -434,14 +435,89 @@ pub(crate) fn push_agg_specs(
     arg_col: Option<usize>,
     cols: &[ColumnDef],
     agg_specs: &mut Vec<AggSpec>,
-) -> Result<AggShape, GnitzSqlError> {
+) -> Result<AggTyping, GnitzSqlError> {
     let typing = agg_typing(agg_func, arg_col.map(|c| &cols[c]))?;
     // Every op of one aggregate reads the same source column. COUNT(*) has no
     // argument and the engine reads none, so slot 0 is the conventional
     // placeholder (its output type is I64 regardless of what sits there).
     let col = arg_col.unwrap_or(0);
     agg_specs.extend(typing.ops.iter().map(|&(op, out_type)| AggSpec { op, col, out_type }));
-    Ok(typing.shape)
+    Ok(typing)
+}
+
+/// The default output column name for an unaliased aggregate at SELECT position
+/// `idx` — `_` + the aggregate's canonical SQL name + the position. User-visible
+/// in the view schema, so both binders must agree; derived from the one
+/// name↔aggregate table so it cannot drift from the spelling the parser accepts.
+pub(crate) fn default_agg_name(func: AggFunc, idx: usize) -> String {
+    format!("_{}{idx}", agg_func_name(func))
+}
+
+/// Reject a MIN/MAX over an argument type the operator cannot order. MIN/MAX
+/// have no correct accumulator path for wide (U128/UUID/I128) types — the i64
+/// slot cannot hold them — Blob has no ordering, and the String comparator in
+/// `decode_signed` reads the prefix as LE signed i64, which orders by neither
+/// bytes nor signedness. A non-MIN/MAX aggregate passes through, so a caller can
+/// hand its function over unconditionally. One home for the AST and HIR binds,
+/// which both reject ahead of `agg_typing`'s `Bind` backstop so the message and
+/// the error variant are the same on either path.
+pub(crate) fn reject_min_max_unorderable(func: AggFunc, ty: TypeCode) -> Result<(), GnitzSqlError> {
+    if matches!(func, AggFunc::Min | AggFunc::Max) && !is_min_max_orderable(ty) {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "{}: not supported on {ty:?} columns",
+            agg_func_name(func).to_ascii_uppercase()
+        )));
+    }
+    Ok(())
+}
+
+/// The finalize composite that renders one aggregate's SELECT/HAVING value from
+/// its raw reduce output column(s) — the single definition of the rule, shared by
+/// the AST binder (`R = usize`, a reduce-output column position) and the HIR
+/// binder (`R = HirRef`, a column identity).
+///
+/// * **AVG** (`companion`, `func == Avg`) — `(sum * 1.0) / cnt`. The `* 1.0`
+///   forces float division, which an int-source SUM/COUNT would otherwise
+///   truncate; a zero count divides by zero, which renders NULL — exactly AVG's
+///   empty/all-NULL-group result.
+/// * **Nullable SUM** (`companion`, any other func) — `sum / (cnt != 0)`. The raw
+///   SUM column saturates to a concrete 0 once its last non-null contributor is
+///   retracted, so null-ness comes from the COUNT_NON_NULL companion instead: the
+///   divisor is an exact identity (1) while the count is positive and 0 when it
+///   hits zero (div-by-zero → NULL). Type-preserving — unlike AVG, SUM keeps its
+///   own output type, since the divide dispatches on the SUM column's type.
+/// * **Direct** (no companion) — the value column itself, raw null bit included.
+pub(crate) fn finalize_agg_bexpr<R>(value: R, companion: Option<R>, func: AggFunc) -> BExpr<R> {
+    let value = BExpr::ColRef(value);
+    let Some(cnt) = companion else {
+        return value;
+    };
+    let cnt = BExpr::ColRef(cnt);
+    if func == AggFunc::Avg {
+        BExpr::BinOp(
+            Box::new(BExpr::BinOp(
+                Box::new(value),
+                BinOp::Mul,
+                Box::new(BExpr::LitFloat(1.0)),
+            )),
+            BinOp::Div,
+            Box::new(cnt),
+        )
+    } else {
+        BExpr::BinOp(
+            Box::new(value),
+            BinOp::Div,
+            Box::new(BExpr::BinOp(Box::new(cnt), BinOp::Ne, Box::new(BExpr::LitInt(0)))),
+        )
+    }
+}
+
+/// Whether an aggregate's **finalize** output is nullable. AVG's and nullable-SUM's
+/// null-ness lives in the COUNT_NON_NULL companion (the finalize renders NULL via
+/// div-by-zero), so a companion-carrying shape is unconditionally nullable; a direct
+/// shape falls back to the exact structural fact. One home for the AST and HIR binds.
+pub(crate) fn agg_output_nullable(shape: AggShape, agg_func: AggFunc, arg_nullable: bool, is_global: bool) -> bool {
+    shape.has_count_companion() || direct_agg_nullable(agg_func, arg_nullable, is_global)
 }
 
 /// An aggregate's typing: everything decided by the function and its argument's
@@ -568,24 +644,15 @@ pub(crate) fn append_agg_mapping(
     agg_specs: &mut Vec<AggSpec>,
     agg_mappings: &mut Vec<AggMapping>,
 ) -> Result<(), GnitzSqlError> {
-    let out_type = agg_result_type(agg_func, arg_col, &source_schema.columns);
     let start = agg_specs.len();
-    let shape = push_agg_specs(agg_func, arg_col, &source_schema.columns, agg_specs)?;
-    let output_nullable = match shape {
-        // AVG's and nullable-SUM's null-ness lives in the COUNT_NON_NULL
-        // companion (the finalize renders NULL via div-by-zero), so their
-        // outputs keep the blanket nullable mark.
-        AggShape::Avg | AggShape::NullfillSum => true,
-        AggShape::Direct => {
-            let arg_nullable = arg_col.map(|c| source_schema.columns[c].is_nullable).unwrap_or(false);
-            direct_agg_nullable(agg_func, arg_nullable, is_global)
-        }
-    };
+    let typing = push_agg_specs(agg_func, arg_col, &source_schema.columns, agg_specs)?;
+    let arg_nullable = arg_col.map(|c| source_schema.columns[c].is_nullable).unwrap_or(false);
+    let output_nullable = agg_output_nullable(typing.shape, agg_func, arg_nullable, is_global);
     agg_mappings.push(AggMapping {
         specs_start: start,
-        shape,
+        shape: typing.shape,
         output_name,
-        output_type: out_type,
+        output_type: typing.view_type,
         output_nullable,
         agg_func,
         arg_col,
@@ -614,7 +681,7 @@ mod tests {
 
     fn try_push(func: AggFunc, arg_col: Option<usize>) -> Result<AggShape, GnitzSqlError> {
         let mut specs = Vec::new();
-        push_agg_specs(func, arg_col, &schema().columns, &mut specs)
+        push_agg_specs(func, arg_col, &schema().columns, &mut specs).map(|t| t.shape)
     }
 
     #[test]
@@ -656,6 +723,19 @@ mod tests {
         assert_eq!(agg_result_type(AggFunc::Sum, Some(4), &s.columns), TypeCode::F64); // SUM(f64) → F64
         assert_eq!(agg_result_type(AggFunc::Min, Some(1), &s.columns), TypeCode::U64);
         // MIN(u64) preserved
+    }
+
+    /// The unaliased aggregate column names are user-visible in the view schema
+    /// (e2e-pinned), so the derivation from the canonical name table must render
+    /// exactly these — in particular both COUNT shapes share `_count`.
+    #[test]
+    fn default_agg_name_renders_pinned_view_column_names() {
+        assert_eq!(default_agg_name(AggFunc::Count, 0), "_count0");
+        assert_eq!(default_agg_name(AggFunc::CountNonNull, 0), "_count0");
+        assert_eq!(default_agg_name(AggFunc::Sum, 1), "_sum1");
+        assert_eq!(default_agg_name(AggFunc::Min, 2), "_min2");
+        assert_eq!(default_agg_name(AggFunc::Max, 3), "_max3");
+        assert_eq!(default_agg_name(AggFunc::Avg, 4), "_avg4");
     }
 
     // The Direct-aggregate nullability decision shared by the SELECT projection

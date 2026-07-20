@@ -1246,11 +1246,18 @@ pub unsafe extern "C" fn gnitz_seek(
     match c.0.seek(table_id, &t) {
         Ok((server_schema, data, _)) => {
             if !out_batch.is_null() {
-                let used_schema = server_schema
-                    .map(|s| (*s).clone())
-                    .unwrap_or_else(empty_schema_sentinel);
-                let batch = data.unwrap_or_else(|| ZSetBatch::new(&used_schema));
-                *out_batch = Box::into_raw(Box::new(GnitzBatch::from_parts(used_schema, batch)));
+                // No schema means the server matched no row, so there is nothing to
+                // describe a batch with — report the miss as a null batch, like
+                // `gnitz_seek_by_index`. (Fabricating a PK-less `Schema` here would
+                // panic in `ZSetBatch::new`, which indexes `pk_indices()[0]`.)
+                match server_schema {
+                    Some(s) => {
+                        let used_schema = (*s).clone();
+                        let batch = data.unwrap_or_else(|| ZSetBatch::new(&used_schema));
+                        *out_batch = Box::into_raw(Box::new(GnitzBatch::from_parts(used_schema, batch)));
+                    }
+                    None => *out_batch = std::ptr::null_mut(),
+                }
             }
             0
         }
@@ -1258,17 +1265,6 @@ pub unsafe extern "C" fn gnitz_seek(
             set_error(e);
             -1
         }
-    }
-}
-
-/// Placeholder schema returned to C callers when the server omits the schema
-/// in a seek/seek_by_index response (today: no row matched). `pk_cols` is
-/// empty so `pk_stride()` returns 0 instead of panicking on the unindexed
-/// `self.columns[0]`.
-fn empty_schema_sentinel() -> Schema {
-    Schema {
-        columns: vec![],
-        pk_cols: vec![],
     }
 }
 
@@ -1307,16 +1303,11 @@ pub unsafe extern "C" fn gnitz_seek_by_index(
     match c.0.seek_by_index(table_id, cols, &keys) {
         Ok((server_schema, data, _)) => {
             if !out_batch.is_null() {
-                match data {
-                    Some(b) => {
-                        let used_schema = server_schema
-                            .map(|s| (*s).clone())
-                            .unwrap_or_else(empty_schema_sentinel);
-                        *out_batch = Box::into_raw(Box::new(GnitzBatch::from_parts(used_schema, b)));
+                match (server_schema, data) {
+                    (Some(s), Some(b)) => {
+                        *out_batch = Box::into_raw(Box::new(GnitzBatch::from_parts((*s).clone(), b)));
                     }
-                    None => {
-                        *out_batch = std::ptr::null_mut();
-                    }
+                    _ => *out_batch = std::ptr::null_mut(),
                 }
             }
             0

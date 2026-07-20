@@ -62,9 +62,9 @@ pub(super) fn reindex_hash_row(out_schema: &SchemaDescriptor, output: &mut Batch
     let stride = out_schema.pk_stride() as usize;
     debug_assert!(stride <= 16, "reindex_hash_row: synthetic key stride {stride} > 16");
     for (row, pk) in pks.iter().enumerate() {
-        // Synthetic U128 (unsigned): OPK == big-endian. Right-aligned into stride
-        // to match the packer's synthetic-key layout.
-        output.set_pk_at_bytes(row, &pk.to_be_bytes()[16 - stride..]);
+        // Synthetic U128 (unsigned): OPK == big-endian, which `set_pk_at` writes
+        // right-aligned into the stride (and debug-checks fits in it).
+        output.set_pk_at(row, *pk);
     }
 }
 
@@ -408,14 +408,14 @@ mod tests {
                 PromoteKind::Wide { pi } => {
                     for row in 0..output.count {
                         let v = read_wide(batch, pi, row);
-                        output.set_pk_at_bytes(row, &v.to_be_bytes()[16 - stride..]);
+                        output.set_pk_at(row, v);
                     }
                 }
                 // Synthetic XXH3 hash key (unsigned U128): OPK == big-endian.
                 PromoteKind::String { pi } => {
                     for row in 0..output.count {
                         let h = read_string(batch, pi, row);
-                        output.set_pk_at_bytes(row, &h.to_be_bytes()[16 - stride..]);
+                        output.set_pk_at(row, h);
                     }
                 }
             }

@@ -25,8 +25,8 @@
 use crate::catalog::col;
 use crate::{
     encode_german_string, read_u32_le, read_u64_le, try_decode_german_string, TypeCode, WireSysCol, IPC_CONTROL_TID,
-    SHORT_STRING_THRESHOLD, WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE,
-    WAL_OFF_TID, WAL_OFF_VERSION,
+    NUM_FIXED_REGIONS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, SHORT_STRING_THRESHOLD, WAL_FORMAT_VERSION,
+    WAL_HEADER_SIZE, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID, WAL_OFF_VERSION,
 };
 
 const CONTROL_COLS: &[WireSysCol] = &[
@@ -83,24 +83,23 @@ const NULL_BIT_ERROR_MSG: u64 = 1u64 << PAYLOAD_ERROR_MSG;
 /// Equals the payload index of the column.
 const NULL_BIT_SEEK_PK_EXTRA: u64 = 1u64 << PAYLOAD_SEEK_PK_EXTRA;
 
-/// WAL region count for a CONTROL_SCHEMA block (V3 format):
-/// 3 fixed regions (pk 16B, weight, null_bmp) + (NUM_COLUMNS - 1) payload columns
-/// + 1 blob region.
-const NUM_REGIONS: usize = 3 + (NUM_COLUMNS - 1) + 1;
+/// WAL region count for a CONTROL_SCHEMA block: the fixed regions (pk, weight,
+/// null_bmp) + (NUM_COLUMNS - 1) payload columns + 1 blob region.
+const NUM_REGIONS: usize = NUM_FIXED_REGIONS + (NUM_COLUMNS - 1) + 1;
 
-// Region indices. V3 format: 3 system regions (pk=0, weight=1, null_bmp=2)
-// followed by payload columns in schema order, then blob last.
-const REGION_NULL_BMP: usize = 2;
-const REGION_STATUS: usize = 3 + PAYLOAD_STATUS;
-const REGION_CLIENT_ID: usize = 3 + PAYLOAD_CLIENT_ID;
-const REGION_TARGET_ID: usize = 3 + PAYLOAD_TARGET_ID;
-const REGION_FLAGS: usize = 3 + PAYLOAD_FLAGS;
-const REGION_SEEK_PK: usize = 3 + PAYLOAD_SEEK_PK;
-const REGION_SEEK_COL_IDX: usize = 3 + PAYLOAD_SEEK_COL_IDX;
-const REGION_REQUEST_ID: usize = 3 + PAYLOAD_REQUEST_ID;
-const REGION_ERROR_MSG: usize = 3 + PAYLOAD_ERROR_MSG;
-const REGION_SEEK_PK_EXTRA: usize = 3 + PAYLOAD_SEEK_PK_EXTRA;
-const REGION_BLOB: usize = NUM_REGIONS - 1;
+// Payload region indices: the fixed regions, then payload columns in schema
+// order, then blob last. The fixed indices themselves (`REG_PK`/`REG_WEIGHT`/
+// `REG_NULL_BMP`) come straight from `wal`.
+const REG_STATUS: usize = REG_PAYLOAD_START + PAYLOAD_STATUS;
+const REG_CLIENT_ID: usize = REG_PAYLOAD_START + PAYLOAD_CLIENT_ID;
+const REG_TARGET_ID: usize = REG_PAYLOAD_START + PAYLOAD_TARGET_ID;
+const REG_FLAGS: usize = REG_PAYLOAD_START + PAYLOAD_FLAGS;
+const REG_SEEK_PK: usize = REG_PAYLOAD_START + PAYLOAD_SEEK_PK;
+const REG_SEEK_COL_IDX: usize = REG_PAYLOAD_START + PAYLOAD_SEEK_COL_IDX;
+const REG_REQUEST_ID: usize = REG_PAYLOAD_START + PAYLOAD_REQUEST_ID;
+const REG_ERROR_MSG: usize = REG_PAYLOAD_START + PAYLOAD_ERROR_MSG;
+const REG_SEEK_PK_EXTRA: usize = REG_PAYLOAD_START + PAYLOAD_SEEK_PK_EXTRA;
+const REG_BLOB: usize = NUM_REGIONS - 1;
 
 // ---------------------------------------------------------------------------
 // Control-block codec — the one encoder/decoder both ends run.
@@ -116,11 +115,12 @@ const REGION_BLOB: usize = NUM_REGIONS - 1;
 /// Byte size of region `r` for a 1-row control block (blob counted as empty).
 const fn ctrl_region_size(r: usize) -> usize {
     match r {
-        0 => CONTROL_COLS[COL_MSG_IDX].type_code.wire_stride(), // pk (OPK)
-        1 | 2 => 8,                                             // weight, null_bmp
-        REGION_BLOB => 0,                                       // blob (no-blob image)
-        // payload region: payload index r-3 → column index r-3+1 (PK is col 0)
-        _ => CONTROL_COLS[r - 2].type_code.wire_stride(),
+        REG_PK => CONTROL_COLS[COL_MSG_IDX].type_code.wire_stride(),
+        REG_WEIGHT | REG_NULL_BMP => 8,
+        REG_BLOB => 0, // no-blob image
+        // Payload region: payload index `r - REG_PAYLOAD_START` → that + 1 as a
+        // column index, since the PK is column 0.
+        _ => CONTROL_COLS[r - REG_PAYLOAD_START + 1].type_code.wire_stride(),
     }
 }
 
@@ -149,17 +149,17 @@ const fn ctrl_region_offset(target_region: usize) -> usize {
 /// spills to the blob region — the universal hot path.
 pub const CTRL_BLOCK_SIZE_NO_BLOB: usize = ctrl_region_offset(NUM_REGIONS);
 
-const OFF_WEIGHT: usize = ctrl_region_offset(1);
-const OFF_NULL_BMP: usize = ctrl_region_offset(REGION_NULL_BMP);
-const OFF_STATUS: usize = ctrl_region_offset(REGION_STATUS);
-const OFF_CLIENT_ID: usize = ctrl_region_offset(REGION_CLIENT_ID);
-const OFF_TARGET_ID: usize = ctrl_region_offset(REGION_TARGET_ID);
-const OFF_FLAGS: usize = ctrl_region_offset(REGION_FLAGS);
-const OFF_SEEK_PK: usize = ctrl_region_offset(REGION_SEEK_PK);
-const OFF_SEEK_COL_IDX: usize = ctrl_region_offset(REGION_SEEK_COL_IDX);
-const OFF_REQUEST_ID: usize = ctrl_region_offset(REGION_REQUEST_ID);
-const OFF_ERROR_MSG: usize = ctrl_region_offset(REGION_ERROR_MSG);
-const OFF_SEEK_PK_EXTRA: usize = ctrl_region_offset(REGION_SEEK_PK_EXTRA);
+const OFF_WEIGHT: usize = ctrl_region_offset(REG_WEIGHT);
+const OFF_NULL_BMP: usize = ctrl_region_offset(REG_NULL_BMP);
+const OFF_STATUS: usize = ctrl_region_offset(REG_STATUS);
+const OFF_CLIENT_ID: usize = ctrl_region_offset(REG_CLIENT_ID);
+const OFF_TARGET_ID: usize = ctrl_region_offset(REG_TARGET_ID);
+const OFF_FLAGS: usize = ctrl_region_offset(REG_FLAGS);
+const OFF_SEEK_PK: usize = ctrl_region_offset(REG_SEEK_PK);
+const OFF_SEEK_COL_IDX: usize = ctrl_region_offset(REG_SEEK_COL_IDX);
+const OFF_REQUEST_ID: usize = ctrl_region_offset(REG_REQUEST_ID);
+const OFF_ERROR_MSG: usize = ctrl_region_offset(REG_ERROR_MSG);
+const OFF_SEEK_PK_EXTRA: usize = ctrl_region_offset(REG_SEEK_PK_EXTRA);
 
 /// Blob bytes a German string of length `len` spills into the shared blob
 /// region: 0 when it fits the 12-byte inline form, its full length otherwise.
@@ -274,7 +274,7 @@ pub fn encode_ctrl_block(
         buf[OFF_SEEK_PK_EXTRA..OFF_SEEK_PK_EXTRA + 16].copy_from_slice(&st);
     }
     buf[OFF_NULL_BMP..OFF_NULL_BMP + 8].copy_from_slice(&null_word.to_le_bytes());
-    let blob_dir = WAL_HEADER_SIZE + REGION_BLOB * 8;
+    let blob_dir = WAL_HEADER_SIZE + REG_BLOB * 8;
     buf[blob_dir + 4..blob_dir + 8].copy_from_slice(&(blob.len() as u32).to_le_bytes());
     buf[CTRL_BLOCK_SIZE_NO_BLOB..CTRL_BLOCK_SIZE_NO_BLOB + blob.len()].copy_from_slice(&blob);
     buf[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].copy_from_slice(&(total as u32).to_le_bytes());
@@ -347,14 +347,14 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
         return Err("control block wrong region count");
     }
 
-    let null_bmp = read_u64_region(data, REGION_NULL_BMP)?;
-    let status = read_u64_region(data, REGION_STATUS)? as u32;
-    let client_id = read_u64_region(data, REGION_CLIENT_ID)?;
-    let target_id = read_u64_region(data, REGION_TARGET_ID)?;
-    let flags = read_u64_region(data, REGION_FLAGS)?;
-    let seek_pk = read_u128_region(data, REGION_SEEK_PK)?;
-    let seek_col_idx = read_u64_region(data, REGION_SEEK_COL_IDX)?;
-    let request_id = read_u64_region(data, REGION_REQUEST_ID)?;
+    let null_bmp = read_u64_region(data, REG_NULL_BMP)?;
+    let status = read_u64_region(data, REG_STATUS)? as u32;
+    let client_id = read_u64_region(data, REG_CLIENT_ID)?;
+    let target_id = read_u64_region(data, REG_TARGET_ID)?;
+    let flags = read_u64_region(data, REG_FLAGS)?;
+    let seek_pk = read_u128_region(data, REG_SEEK_PK)?;
+    let seek_col_idx = read_u64_region(data, REG_SEEK_COL_IDX)?;
+    let request_id = read_u64_region(data, REG_REQUEST_ID)?;
 
     let error_is_null = (null_bmp & NULL_BIT_ERROR_MSG) != 0;
     let seek_extra_is_null = (null_bmp & NULL_BIT_SEEK_PK_EXTRA) != 0;
@@ -365,7 +365,7 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
     // non-null. When both are null (the universal case) skip the lookup
     // entirely, preserving the hot-path fast case.
     let blob: &[u8] = if !error_is_null || !seek_extra_is_null {
-        let (blob_off, blob_sz) = crate::wal::dir_entry(data, REGION_BLOB);
+        let (blob_off, blob_sz) = crate::wal::dir_entry(data, REG_BLOB);
         if blob_sz > 0 && blob_off.saturating_add(blob_sz) <= data.len() {
             &data[blob_off..blob_off + blob_sz]
         } else {
@@ -389,7 +389,7 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
         Vec::new()
     } else {
         read_german(
-            REGION_ERROR_MSG,
+            REG_ERROR_MSG,
             "error_msg region out of bounds",
             "error_msg string offset out of bounds",
         )?
@@ -399,7 +399,7 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
         Vec::new()
     } else {
         read_german(
-            REGION_SEEK_PK_EXTRA,
+            REG_SEEK_PK_EXTRA,
             "seek_pk_extra region out of bounds",
             "seek_pk_extra string offset out of bounds",
         )?
@@ -474,7 +474,7 @@ mod tests {
         let mut buf = vec![0u8; ctrl_block_size(long_msg.len(), 0)];
         let n = encode_ctrl_block(&mut buf, 0, 1, 2, 0, 0, 0, 0, 1, long_msg, b"");
         buf.truncate(n);
-        let (err_off, _) = crate::wal::dir_entry(&buf, REGION_ERROR_MSG);
+        let (err_off, _) = crate::wal::dir_entry(&buf, REG_ERROR_MSG);
         buf[err_off + 8..err_off + 16].copy_from_slice(&u64::MAX.to_le_bytes());
         match peek_control_block(&buf) {
             Err("error_msg string offset out of bounds") => {}

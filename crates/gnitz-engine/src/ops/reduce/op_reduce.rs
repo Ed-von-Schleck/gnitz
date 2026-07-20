@@ -1,5 +1,6 @@
 //! Incremental REDUCE operator: δ_out = Agg(history + δ_in) − Agg(history).
 
+use crate::schema::key::NarrowPkOpk;
 use crate::storage::{pk_bytes_eq, scatter_copy, Batch, DrainGuard, MemBatch, ReadCursor};
 
 use super::super::util::{extract_group_key, global_group_key};
@@ -128,8 +129,8 @@ pub(super) fn cursor_matches_group(
 /// Incremental DBSP REDUCE: δ_out = Agg(history + δ_in) - Agg(history).
 ///
 /// Everything that is a pure function of compile-time facts — schemas, group
-/// columns, aggregate descriptors, linearity, key kind, the emission role
-/// table, the global-ground flags — arrives baked in `plan` (one construction
+/// columns, aggregate descriptors, linearity, key kind, the group-exemplar
+/// locators, the global-ground flags — arrives baked in `plan` (one construction
 /// site, `ReducePlan::new`).
 pub fn op_reduce(
     delta: &Batch,
@@ -174,11 +175,8 @@ pub fn op_reduce(
         if global_ground && plan.i_am_owner {
             // V₀ batch-free: `extract_group_key` reads the (empty) delta's
             // `null_word` unconditionally and would panic on the empty slice.
-            let v0 = global_group_key();
-            let stride = output_schema.pk_stride() as usize;
-            let mut out_pk_buf = [0u8; crate::schema::MAX_PK_BYTES];
-            out_pk_buf[..stride].copy_from_slice(&v0.to_be_bytes()[16 - stride..]);
-            let out_pk_bytes = &out_pk_buf[..stride];
+            let v0 = NarrowPkOpk::new(global_group_key(), output_schema.pk_stride() as usize);
+            let out_pk_bytes = v0.bytes();
 
             trace_out_cursor.seek_bytes(out_pk_bytes);
             let has_v0 = trace_out_cursor.valid && trace_out_cursor.current_pk_eq(out_pk_bytes);
@@ -436,12 +434,11 @@ pub fn op_reduce(
         // group key at the output stride: the source PK value (`get_pk`) for
         // natural-PK grouping, the synthetic `extract_group_key` for payload GROUP
         // BY (which differs from the input row's PK). The single-column branch
-        // owns the only width ≤ 16, so `get_pk`/`[16 - stride..]` never overrun.
-        let mut out_pk_buf = [0u8; crate::schema::MAX_PK_BYTES];
+        // owns the only width ≤ 16, which `NarrowPkOpk` enforces.
+        let narrow_out_pk;
         let out_pk_bytes: &[u8] = if group_by_pk && output_schema.pk_indices().len() > 1 {
             group_pk_bytes
         } else {
-            let stride = output_schema.pk_stride() as usize;
             let key = if group_by_pk {
                 mb.get_pk(group_start_idx)
             } else if let Some(keys) = fallback_state
@@ -455,8 +452,8 @@ pub fn op_reduce(
             } else {
                 extract_group_key(&mb, group_start_idx, input_schema, group_by_cols)
             };
-            out_pk_buf[..stride].copy_from_slice(&key.to_be_bytes()[16 - stride..]);
-            &out_pk_buf[..stride]
+            narrow_out_pk = NarrowPkOpk::new(key, output_schema.pk_stride() as usize);
+            narrow_out_pk.bytes()
         };
 
         // Strict `<`: consecutive groups are comparator-distinct and the
@@ -677,7 +674,7 @@ pub fn op_reduce(
             None => accs.iter().any(|a| !a.is_untouched()),
         };
         if should_emit {
-            emit_reduce_row(&mut raw_output, &mb, group_start_idx, out_pk_bytes, &accs, plan);
+            emit_reduce_row(&mut raw_output, (&mb, group_start_idx), out_pk_bytes, &accs, plan);
         } else if global_ground {
             // The emission gate shed the computed row (this group emptied, or a
             // lone all-NULL MIN/MAX). For the user's ungrouped scalar aggregate

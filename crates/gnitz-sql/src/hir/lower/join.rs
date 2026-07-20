@@ -14,12 +14,12 @@ use crate::lower::compile_filter_program;
 use crate::plan::view::join::{
     band_union_schema, build_pure_range_threshold, combined_payload_coldefs, emit_equi_join_terms, emit_equi_null_fill,
     emit_range_null_fill_tail, is_identity_projection, join_pk_coldefs, normalize_to_ab, pair_pk_coldefs, prune_schema,
-    range_gate_reindex_prologue, range_slots, side_target_tcs, union_null_key_rows, EquiNullFill, EquiSide, JoinType,
-    RangeSlots,
+    range_gate_reindex_prologue, range_slots, reject_pair_pk_overflow, reject_pure_range_outer, side_target_tcs,
+    union_null_key_rows, EquiNullFill, EquiSide, JoinType, RangeSlots,
 };
-use crate::plan::view::predicates::{build_reindex_program, RangeConjunct};
+use crate::plan::view::predicates::{build_reindex_program, rekey_on_source_pk, RangeConjunct};
 use crate::plan::view::{EmitPieces, ViewChain};
-use gnitz_core::{CircuitBuilder, ColumnDef, FixedInt, GnitzClient, NodeId, Schema, TypeCode};
+use gnitz_core::{CircuitBuilder, ColumnDef, GnitzClient, NodeId, TypeCode};
 use std::collections::HashSet;
 
 /// The downstream demand on a join's output: the final projection and the
@@ -148,8 +148,8 @@ fn emit_equi(
         .collect::<Result<_, _>>()?;
     let target_tcs: Vec<TypeCode> = class.eq.iter().map(|p| p.tc).collect();
     let k = left_join_cols.len();
-    let left_target_tcs = side_target_tcs(&left_join_cols, left_schema, &target_tcs);
-    let right_target_tcs = side_target_tcs(&right_join_cols, right_schema, &target_tcs);
+    let left_target_tcs = side_target_tcs(&left_join_cols, &left_schema.columns, &target_tcs);
+    let right_target_tcs = side_target_tcs(&right_join_cols, &right_schema.columns, &target_tcs);
 
     // Reindex-payload keep set (equi_keep_combined + the ">= col 0" guard).
     let keep = keep_set(down, class, kind, left_in, right_in);
@@ -171,14 +171,14 @@ fn emit_equi(
             input: input_a_raw,
             cols: &left_join_cols,
             target_tcs: &left_target_tcs,
-            schema: left_schema,
+            coldefs: &left_schema.columns,
             keep: &keep_l,
         },
         EquiSide {
             input: input_b_raw,
             cols: &right_join_cols,
             target_tcs: &right_target_tcs,
-            schema: right_schema,
+            coldefs: &right_schema.columns,
             keep: &keep_r,
         },
     )?;
@@ -196,19 +196,19 @@ fn emit_equi(
                 input: input_a_raw,
                 cols: &left_join_cols,
                 target_tcs: &left_target_tcs,
-                schema: left_schema,
+                coldefs: &left_schema.columns,
                 keep: &keep_l,
             },
             right: EquiSide {
                 input: input_b_raw,
                 cols: &right_join_cols,
                 target_tcs: &right_target_tcs,
-                schema: right_schema,
+                coldefs: &right_schema.columns,
                 keep: &keep_r,
             },
             terms: &terms,
-            pruned_left: &pruned_left_schema,
-            pruned_right: &pruned_right_schema,
+            pruned_left: &pruned_left_schema.columns,
+            pruned_right: &pruned_right_schema.columns,
         },
     );
 
@@ -230,17 +230,13 @@ fn emit_equi(
 
     // One residual/WHERE filter over the normalized output (at most one source is
     // non-empty — classify_join_where). const-elision is harmless (INNER 3VL).
-    let merged_schema = Schema {
-        columns: out_cols.clone(),
-        pk_cols: (0..k).collect(),
-    };
     let merged = apply_filter(
         &mut cb,
         merged,
         &class.residual,
         down.where_preds,
         &merged_layout,
-        &merged_schema,
+        &out_cols,
     )?;
 
     // Output projection (build_join_view_projection): each item is a column ref;
@@ -302,45 +298,34 @@ fn emit_range(
     let pb = right_schema.pk_cols.len();
     let pair_pk = pa + pb;
 
-    if pair_pk > gnitz_core::PK_LIST_MAX_COLS {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "range JOIN view: the source-PK pair has {pair_pk} columns, exceeding the \
-             {}-column key limit",
-            gnitz_core::PK_LIST_MAX_COLS
-        )));
-    }
+    reject_pair_pk_overflow(pa, pb)?;
     crate::plan::validate::reject_column_overflow("range JOIN view intermediate", pair_pk + k + left_n + right_n)?;
 
-    // Pure-range (n_eq == 0) outer restrictions: RIGHT/FULL rejected first, then
-    // LEFT needs a <= 8-byte integer range column.
     if n_eq == 0 {
-        if kind.preserves_right() {
-            return Err(GnitzSqlError::Unsupported(
-                "pure-range RIGHT/FULL JOIN (a sole inequality range conjunct with no \
-                 equality prefix) is not supported; its mirror null-fill has no inner-join \
-                 witness on the preserved side. Use INNER/LEFT JOIN, or add an equality \
-                 conjunct to make it a band join."
-                    .into(),
-            ));
-        }
-        if kind.preserves_left() && FixedInt::from_type_code(range.tc).is_none() {
-            let range_tc = range.tc;
-            return Err(GnitzSqlError::Unsupported(format!(
-                "pure-range LEFT JOIN needs a ≤8-byte integer range column (got {range_tc:?}); \
-                 its threshold null-fill reduces the range column with MIN/MAX, which has no \
-                 16-byte accumulator — use a narrower range column, INNER JOIN, or a band join"
-            )));
-        }
+        reject_pure_range_outer(kind, range.tc)?;
     }
 
-    let slots = range_slots(&left_cols, &right_cols, &eq_tcs, &range_conj, left_schema, right_schema);
+    let slots = range_slots(
+        &left_cols,
+        &right_cols,
+        &eq_tcs,
+        &range_conj,
+        &left_schema.columns,
+        &right_schema.columns,
+    );
 
     let mut cb = CircuitBuilder::new(view_id, 0);
     let input_a_raw = cb.input_delta_tagged(left_in.tid);
     let input_b_raw = cb.input_delta_tagged(right_in.tid);
 
-    let (reindex_a, reindex_b, left_key_nullable) =
-        range_gate_reindex_prologue(&mut cb, input_a_raw, input_b_raw, &slots, left_schema, right_schema)?;
+    let (reindex_a, reindex_b, left_key_nullable) = range_gate_reindex_prologue(
+        &mut cb,
+        input_a_raw,
+        input_b_raw,
+        &slots,
+        &left_schema.columns,
+        &right_schema.columns,
+    )?;
     let RangeSlots {
         left_reindex_cols,
         all_tcs,
@@ -370,7 +355,7 @@ fn emit_range(
         merged
     } else {
         let folded = physical::fold_preds(&class.residual, &band_layout)?.expect("non-empty residual");
-        let prog = compile_filter_program(&folded, &union_schema)?.expect("residual is not a bare constant");
+        let prog = compile_filter_program(&folded, &union_schema.columns)?.expect("residual is not a bare constant");
         cb.filter(merged, Some(prog))
     };
 
@@ -383,7 +368,12 @@ fn emit_range(
         pair_pk_cols.push(k + left_n + b_pk);
     }
     let zero_tcs = vec![0u8; pair_pk];
-    let rekey = cb.map_reindex(merged, &pair_pk_cols, &zero_tcs, build_reindex_program(&union_schema));
+    let rekey = cb.map_reindex(
+        merged,
+        &pair_pk_cols,
+        &zero_tcs,
+        build_reindex_program(&union_schema.columns),
+    );
 
     let payload_offset = pair_pk + k;
     let pair_pk_coldefs: Vec<ColumnDef> = pair_pk_coldefs(left_schema, right_schema);
@@ -451,15 +441,10 @@ fn emit_range(
                     merged,
                     &pair_pk_cols[..pa],
                     &zero_a,
-                    build_reindex_program(&union_schema),
+                    build_reindex_program(&union_schema.columns),
                 );
                 let proj_a = cb.map(rekey_a, &(pa + k..pa + k + left_n).collect::<Vec<_>>()); // π_A(inner)
-                let a_all = cb.map_reindex(
-                    input_a_raw,
-                    &left_schema.pk_cols,
-                    &zero_a,
-                    build_reindex_program(left_schema),
-                );
+                let a_all = rekey_on_source_pk(&mut cb, input_a_raw, left_schema);
                 let nu_a = cb.positive_diff(a_all, proj_a);
                 let branch = nf_tail(&mut cb, nu_a, true);
                 acc = cb.union(branch, acc);
@@ -469,18 +454,13 @@ fn emit_range(
                     merged,
                     &pair_pk_cols[pa..],
                     &zero_b,
-                    build_reindex_program(&union_schema),
+                    build_reindex_program(&union_schema.columns),
                 );
                 let proj_b = cb.map(
                     rekey_b,
                     &(pb + k + left_n..pb + k + left_n + right_n).collect::<Vec<_>>(),
                 ); // π_B(inner)
-                let b_all = cb.map_reindex(
-                    input_b_raw,
-                    &right_schema.pk_cols,
-                    &zero_b,
-                    build_reindex_program(right_schema),
-                );
+                let b_all = rekey_on_source_pk(&mut cb, input_b_raw, right_schema);
                 let nu_b = cb.positive_diff(b_all, proj_b);
                 let branch = nf_tail(&mut cb, nu_b, false);
                 acc = cb.union(branch, acc);
@@ -491,14 +471,10 @@ fn emit_range(
         // One linear 3VL WHERE over the full-width `[pair-PK, A, B]` (base pair_pk).
         let combined_payload = combined_payload_coldefs(left_schema, right_schema, kind);
         let combined_cols: Vec<ColumnDef> = pair_pk_coldefs.iter().cloned().chain(combined_payload).collect();
-        let combined_schema = Schema {
-            columns: combined_cols,
-            pk_cols: (0..pair_pk).collect(),
-        };
         let mut where_layout = ids.placeholders(pair_pk);
         where_layout.extend(left_in.layout.iter().copied());
         where_layout.extend(right_in.layout.iter().copied());
-        let filtered = apply_filter(&mut cb, unioned, &[], down.where_preds, &where_layout, &combined_schema)?;
+        let filtered = apply_filter(&mut cb, unioned, &[], down.where_preds, &where_layout, &combined_cols)?;
 
         if is_identity_projection(&final_projection, left_n + right_n, pair_pk) {
             filtered
@@ -608,7 +584,7 @@ fn apply_filter(
     residual: &[HirExpr],
     where_preds: &[HirExpr],
     layout: &[ColId],
-    schema: &Schema,
+    cols: &[ColumnDef],
 ) -> Result<NodeId, GnitzSqlError> {
-    super::emit_filter(cb, merged, residual.iter().chain(where_preds), layout, schema)
+    super::emit_filter(cb, merged, residual.iter().chain(where_preds), layout, cols)
 }

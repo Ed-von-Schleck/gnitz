@@ -5,8 +5,9 @@
 //! relation).
 
 use crate::agg::{
-    agg_arg_col, append_agg_mapping, emit_reduce, ensure_cardinality_count, group_col_reduce_pos, reduce_output_schema,
-    AggMapping, AggShape, AggSpec, GroupByLayout, GroupBySelectItem, ReduceShape,
+    agg_arg_col, append_agg_mapping, default_agg_name, emit_reduce, ensure_cardinality_count, finalize_agg_bexpr,
+    group_col_reduce_pos, reduce_output_schema, AggMapping, AggShape, AggSpec, GroupByLayout, GroupBySelectItem,
+    ReduceShape,
 };
 use crate::ast_util::{expr_operands, single_relation_col_name};
 use crate::bind::{bind_single_table, bind_structural, find_unique_column, fold_null_test, LeafBinder, SingleTable};
@@ -96,16 +97,7 @@ pub(crate) fn analyze_group_by(
             BoundExpr::AggCall { func, arg } => {
                 let src_col = agg_arg_col(arg.as_deref())?;
                 let agg_idx = agg_mappings.len();
-                let out_name = alias.unwrap_or_else(|| {
-                    let prefix = match func {
-                        AggFunc::Count | AggFunc::CountNonNull => "_count",
-                        AggFunc::Sum => "_sum",
-                        AggFunc::Min => "_min",
-                        AggFunc::Max => "_max",
-                        AggFunc::Avg => "_avg",
-                    };
-                    format!("{prefix}{idx}")
-                });
+                let out_name = alias.unwrap_or_else(|| default_agg_name(*func, idx));
                 append_agg_mapping(
                     *func,
                     src_col,
@@ -229,7 +221,7 @@ pub(crate) fn emit_group_by_pieces(
     // a bound: it has no `col OP literal` conjunct for a candidate to come from.)
     let filtered = if let Some(where_expr) = &select.selection {
         let pred = bind_single_table(where_expr, &source_schema)?;
-        match compile_filter_program(&pred, &source_schema)? {
+        match compile_filter_program(&pred, &source_schema.columns)? {
             Some(p) => cb.filter(inp, Some(p)),
             None => inp,
         }
@@ -397,7 +389,7 @@ pub(crate) fn emit_group_by_pieces(
         )?;
         // A HAVING that bound to a true constant (e.g. `IS NOT NULL` on a shape
         // that can never be NULL) compiles to no filter operator at all.
-        match compile_filter_program(&bound, &reduce_schema)? {
+        match compile_filter_program(&bound, &reduce_schema.columns)? {
             Some(p) => cb.filter(reduced, Some(p)),
             None => reduced,
         }
@@ -566,46 +558,17 @@ impl LeafBinder for Having<'_> {
         Ok(BoundExpr::ColRef(reduce_col))
     }
     fn bind_function(&self, func: &sqlparser::ast::Function) -> Result<BoundExpr, GnitzSqlError> {
+        // The shared finalize rule over reduce-output column positions: the value
+        // column at `specs_start`, its COUNT_NON_NULL companion (when the shape
+        // carries one) at `specs_start + 1`.
         let ctx = self.ctx;
         let m = resolve_having_mapping(func, ctx)?;
-        let sum_col = ctx.agg_col_offset + m.specs_start;
-        let cnt_col = ctx.agg_col_offset + m.specs_start + 1;
-        match m.shape {
-            AggShape::Avg => {
-                // AVG = SUM / COUNT, both materialised as reduce columns. Force float
-                // division (an int-source SUM/COUNT would otherwise truncate) by
-                // lifting SUM to float via `* 1.0`.
-                let sum_f = BoundExpr::BinOp(
-                    Box::new(BoundExpr::ColRef(sum_col)),
-                    BinOp::Mul,
-                    Box::new(BoundExpr::LitFloat(1.0)),
-                );
-                Ok(BoundExpr::BinOp(
-                    Box::new(sum_f),
-                    BinOp::Div,
-                    Box::new(BoundExpr::ColRef(cnt_col)),
-                ))
-            }
-            AggShape::NullfillSum => {
-                // Same companion gate the SELECT projection applies: the raw SUM
-                // column saturates to a concrete 0 once its last non-null contributor
-                // is retracted, so read null-ness from the COUNT_NON_NULL companion
-                // via `sum / (cnt != 0)` — an exact identity divisor (1) while the
-                // count is positive, div-by-zero → NULL when it is 0.
-                // `compile_bound_expr` dispatches int vs float Div on the SUM column's
-                // type, so the gate is type-preserving without an explicit branch here.
-                Ok(BoundExpr::BinOp(
-                    Box::new(BoundExpr::ColRef(sum_col)),
-                    BinOp::Div,
-                    Box::new(BoundExpr::BinOp(
-                        Box::new(BoundExpr::ColRef(cnt_col)),
-                        BinOp::Ne,
-                        Box::new(BoundExpr::LitInt(0)),
-                    )),
-                ))
-            }
-            AggShape::Direct => Ok(BoundExpr::ColRef(sum_col)),
-        }
+        let val_col = ctx.agg_col_offset + m.specs_start;
+        Ok(finalize_agg_bexpr(
+            val_col,
+            m.shape.has_count_companion().then_some(val_col + 1),
+            m.agg_func,
+        ))
     }
     fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<BoundExpr, GnitzSqlError> {
         // IS [NOT] NULL over the grouped relation. A companion-carrying aggregate

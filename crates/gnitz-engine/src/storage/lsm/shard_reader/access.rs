@@ -6,7 +6,7 @@
 
 use std::ptr;
 
-use super::super::batch::FIXED_REGION_BYTES;
+use super::super::batch::{FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::super::merge::{ColPtr, UnifiedSource};
 use super::super::xor8;
 use super::{MappedShard, PackedRegion, PayloadRegion, ScalarRegion, WeightRegion};
@@ -373,13 +373,17 @@ impl MappedShard {
 
         let pk_stride = self.pk_stride as usize;
         let sz8 = row_count * 8;
-        expand_scalar(&self.pk, pk_stride, &mut data[offsets[0]..][..row_count * pk_stride]);
-        expand_weight(&self.weight, &mut data[offsets[1]..][..sz8]);
-        expand_scalar(&self.null_bmp, 8, &mut data[offsets[2]..][..sz8]);
+        expand_scalar(
+            &self.pk,
+            pk_stride,
+            &mut data[offsets[REG_PK]..][..row_count * pk_stride],
+        );
+        expand_weight(&self.weight, &mut data[offsets[REG_WEIGHT]..][..sz8]);
+        expand_scalar(&self.null_bmp, 8, &mut data[offsets[REG_NULL_BMP]..][..sz8]);
 
         for (pi, _ci, col) in schema.payload_columns() {
             let stride = col.size() as usize;
-            let off = offsets[3 + pi];
+            let off = offsets[REG_PAYLOAD_START + pi];
             let sz = row_count * stride;
             expand_payload(&self.col_regions[pi], stride, &mut data[off..][..sz]);
         }

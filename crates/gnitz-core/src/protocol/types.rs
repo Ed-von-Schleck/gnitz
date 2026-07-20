@@ -205,10 +205,17 @@ impl Schema {
     /// hidden-filtering projection.
     #[inline]
     pub fn has_hidden_payload(&self) -> bool {
-        self.columns
-            .iter()
-            .enumerate()
-            .any(|(i, c)| c.is_hidden && !self.is_pk_col(i))
+        (0..self.columns.len()).any(|i| self.is_hidden_payload(i))
+    }
+
+    /// Whether column `i` is a hidden **payload** column — one a wildcard drops.
+    /// A hidden PK column is not dropped: it carries the batch's key, and removing
+    /// it would strip the row of its identity. One home for that distinction, so
+    /// the passthrough decision (`has_hidden_payload`) and the projection that
+    /// implements it cannot disagree.
+    #[inline]
+    pub fn is_hidden_payload(&self, i: usize) -> bool {
+        self.columns[i].is_hidden && !self.is_pk_col(i)
     }
 
     /// The output-key kind a reduce grouped by `cols` over this schema gets —

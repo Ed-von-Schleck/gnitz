@@ -4,7 +4,7 @@ use crate::schema::ColumnLocator;
 use crate::storage::{Batch, MemBatch};
 
 use super::agg::Accumulator;
-use super::plan::{OutColRole, ReducePlan};
+use super::plan::ReducePlan;
 
 /// Emit one aggregate column: its value bits truncated to the column width when
 /// the accumulator holds a value, else its empty-render. An untouched accumulator
@@ -27,55 +27,71 @@ fn emit_agg_col(output: &mut Batch, acc: &Accumulator, out_pi: usize, cs: usize,
     }
 }
 
+/// Write a row's PK region and its `+1` weight. Paired with [`finish_row`],
+/// which pushes the null word the payload emitters accumulated and commits the
+/// row; every payload column between the two writes its own region at its own
+/// payload index, so their order is free.
+#[inline]
+fn begin_row(output: &mut Batch, out_pk_bytes: &[u8]) {
+    output.extend_pk_bytes(out_pk_bytes);
+    output.extend_weight(&1i64.to_le_bytes());
+}
+
+#[inline]
+fn finish_row(output: &mut Batch, null_word: u64) {
+    output.extend_null_bmp(&null_word.to_le_bytes());
+    output.count += 1;
+}
+
+/// Emit the trailing aggregate columns, starting at payload index `pi_base`
+/// (= the plan's group-exemplar count).
+#[inline]
+fn emit_agg_cols(output: &mut Batch, accs: &[Accumulator], plan: &ReducePlan, pi_base: usize, null_word: &mut u64) {
+    for (k, acc) in accs.iter().enumerate() {
+        emit_agg_col(output, acc, pi_base + k, plan.agg_col_widths[k], null_word);
+    }
+}
+
 /// Emit one reduce output row — the +1 new-value row. Retractions are not built
 /// here; they are byte-copied from the stored row via `copy_current_row_into`.
-/// Each payload column's role (aggregate vs. group exemplar, with a
-/// pre-resolved input locator) comes from the plan's role table.
+/// The output schema is `[key…, group exemplars…, aggregates…]`, so the two
+/// payload loops are positional against the plan's `exemplar_locs`.
 pub(super) fn emit_reduce_row(
     output: &mut Batch,
-    input_mb: &MemBatch,
-    exemplar_row: usize,
+    // The source row the group-exemplar columns copy from.
+    (input_mb, exemplar_row): (&MemBatch, usize),
     out_pk_bytes: &[u8],
     accs: &[Accumulator],
     plan: &ReducePlan,
 ) {
     // The caller materialised the group's output PK bytes once (verbatim source
     // PK for natural-PK grouping, the synthetic group key otherwise); copy them.
-    output.extend_pk_bytes(out_pk_bytes);
-    output.extend_weight(&1i64.to_le_bytes());
-
-    // Build null word and payload columns
+    begin_row(output, out_pk_bytes);
     let mut null_word: u64 = 0;
 
-    for (out_pi, role) in plan.out_roles.iter().enumerate() {
-        match *role {
-            OutColRole::Agg { k } => {
-                let cs = plan.agg_col_widths[k as usize];
-                emit_agg_col(output, &accs[k as usize], out_pi, cs, &mut null_word);
+    for (out_pi, loc) in plan.exemplar_locs.iter().enumerate() {
+        match *loc {
+            ColumnLocator::Pk { .. } => {
+                // PK lives in the OPK region; decode the addressed column back to
+                // native LE before copying into the payload region (a raw copy
+                // keeps the flipped sign bit / big-endian order for signed and
+                // wide columns).
+                let mut scratch = [0u8; 16];
+                output.extend_col(out_pi, loc.native_le_bytes(input_mb, exemplar_row, &mut scratch));
             }
-            OutColRole::Exemplar(loc) => match loc {
-                ColumnLocator::Pk { .. } => {
-                    // PK lives in the OPK region; decode the addressed column
-                    // back to native LE before copying into the payload region
-                    // (a raw copy keeps the flipped sign bit / big-endian order
-                    // for signed and wide columns).
-                    let mut scratch = [0u8; 16];
-                    output.extend_col(out_pi, loc.native_le_bytes(input_mb, exemplar_row, &mut scratch));
+            ColumnLocator::Payload { size, type_code, .. } => {
+                let is_null = loc.is_null(input_mb, exemplar_row);
+                if is_null {
+                    crate::schema::set_null_bit(&mut null_word, out_pi);
                 }
-                ColumnLocator::Payload { size, type_code, .. } => {
-                    let is_null = loc.is_null(input_mb, exemplar_row);
-                    if is_null {
-                        crate::schema::set_null_bit(&mut null_word, out_pi);
-                    }
-                    let cell = (!is_null).then(|| loc.bytes(input_mb, exemplar_row));
-                    output.append_payload_cell(out_pi, type_code, size as usize, cell, input_mb.blob, None);
-                }
-            },
+                let cell = (!is_null).then(|| loc.bytes(input_mb, exemplar_row));
+                output.append_payload_cell(out_pi, type_code, size as usize, cell, input_mb.blob, None);
+            }
         }
     }
+    emit_agg_cols(output, accs, plan, plan.exemplar_locs.len(), &mut null_word);
 
-    output.extend_null_bmp(&null_word.to_le_bytes());
-    output.count += 1;
+    finish_row(output, null_word);
 }
 
 /// Emit the synthetic **ground row** of a global (ungrouped) aggregate at PK
@@ -92,14 +108,14 @@ pub(super) fn emit_reduce_row(
 /// caller nets it to one row (the `has_old` retraction in `n>0`, the
 /// `!trace_out_has_V0` guard in `n==0`).
 pub(super) fn emit_global_ground(raw_output: &mut Batch, out_pk_bytes: &[u8], plan: &ReducePlan) {
-    // A global-aggregate output schema is `[_group_pk, aggs…]` — no group-exemplar
-    // columns — so every payload column in `emit_reduce_row` takes the `Agg` role
-    // and reads only the accumulator + `out_pk_bytes`; the lone role that
-    // dereferences `input_mb[exemplar_row]` is unreachable. Pin it: this is what
-    // lets the empty-delta seed pass an empty input batch with no out-of-bounds
-    // read.
+    // A global-aggregate output schema is `[_group_pk, aggs…]`: group-less, so
+    // `exemplar_locs` is empty and the whole payload is aggregates. That is why
+    // this path emits the aggregate columns *directly* rather than through
+    // `emit_reduce_row` — with no exemplar column there is no source row to
+    // supply, so the empty-delta seed (which has no input batch at all) is
+    // structurally unable to read one.
     debug_assert!(
-        plan.output_schema.num_payload_cols() == plan.agg_descs.len(),
+        plan.exemplar_locs.is_empty(),
         "global_ground output schema must have zero group-exemplar columns",
     );
 
@@ -116,10 +132,8 @@ pub(super) fn emit_global_ground(raw_output: &mut Batch, out_pk_bytes: &[u8], pl
         .map(|(d, &loc)| Accumulator::new(d, loc))
         .collect();
 
-    // No source row exists (the seed runs over an empty delta), and none is read:
-    // a throwaway empty input batch satisfies `emit_reduce_row`'s signature, and
-    // the unreachable exemplar role never dereferences it.
-    let empty_input = Batch::empty_with_schema(&plan.input_schema);
-    let empty_mb = empty_input.as_mem_batch();
-    emit_reduce_row(raw_output, &empty_mb, 0, out_pk_bytes, &accs, plan);
+    begin_row(raw_output, out_pk_bytes);
+    let mut null_word: u64 = 0;
+    emit_agg_cols(raw_output, &accs, plan, 0, &mut null_word);
+    finish_row(raw_output, null_word);
 }

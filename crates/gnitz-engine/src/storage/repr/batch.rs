@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::columnar::ColumnarSource;
 use super::merge::{self, ColPtr, MemBatch};
 use crate::foundation::codec::{align8, read_i64_le, read_u64_le};
+use crate::schema::key::NarrowPkOpk;
 use crate::schema::{BlobCache, SchemaDescriptor};
 
 static BLOB_ID_CTR: AtomicU64 = AtomicU64::new(1);
@@ -39,13 +40,11 @@ const _: () = assert!(MAX_WIRE_REGIONS == MAX_BATCH_REGIONS + 1); // = 69
 // ── Region indices into `offsets` / `strides` ───────────────────────────────
 //
 // Three fixed regions (PK is `pk_stride` bytes/row; weight and null_bmp are
-// 8 bytes/row); payload columns start at index 3 and continue for
+// 8 bytes/row); payload columns start at `REG_PAYLOAD_START` and continue for
 // `num_payload_cols()` slots. Use these constants instead of bare numeric
-// literals.
-pub(in crate::storage) const REG_PK: usize = 0;
-pub(in crate::storage) const REG_WEIGHT: usize = 1;
-pub(in crate::storage) const REG_NULL_BMP: usize = 2;
-pub(in crate::storage) const REG_PAYLOAD_START: usize = 3;
+// literals. Owned by `gnitz_wire::wal` (the client, the wire codec, and the
+// engine all encode the same convention), same as `MAX_WIRE_REGIONS`.
+pub(in crate::storage) use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 /// Stride (in bytes) of the weight and null_bmp fixed regions.
 const FIXED_REGION_STRIDE: u8 = 8;
 pub(in crate::storage) const FIXED_REGION_BYTES: usize = FIXED_REGION_STRIDE as usize;
@@ -713,22 +712,15 @@ impl Batch {
         self.extend_region(REG_PAYLOAD_START + pi, d);
     }
 
-    /// Append a narrow PK from a `u128`, writing **right-aligned big-endian**
-    /// bytes (the low `stride` bytes of `pk.to_be_bytes()`). For UNSIGNED PKs
+    /// Append a narrow PK from a `u128` — the [`NarrowPkOpk`] image (right-aligned
+    /// big-endian) appended through [`Self::extend_pk_bytes`]. For UNSIGNED PKs
     /// this is the correct OPK encoding (OPK == BE for unsigned), and
     /// `widen_pk_be(extend_pk(v))` round-trips. SIGNED or compound PKs are NOT
     /// sign-flipped here and must use `extend_pk_opk` / `extend_pk_bytes`.
     #[inline]
     pub fn extend_pk(&mut self, pk: u128) {
-        let stride = self.strides[REG_PK] as usize;
-        if stride > 16 {
-            panic!("extend_pk: wide region; use extend_pk_bytes");
-        }
-        debug_assert!(
-            stride >= 16 || (pk >> (stride * 8)) == 0,
-            "narrow batch requires high bits == 0",
-        );
-        self.extend_region(REG_PK, &pk.to_be_bytes()[16 - stride..]);
+        let key = NarrowPkOpk::new(pk, self.strides[REG_PK] as usize);
+        self.extend_pk_bytes(key.bytes());
     }
 
     #[inline]
@@ -751,24 +743,14 @@ impl Batch {
         self.extend_pk_bytes(&crate::test_support::opk_pk(schema, native_col_vals));
     }
 
-    /// Overwrite the narrow PK at `row` with a `u128`, writing right-aligned
-    /// big-endian bytes — matching `extend_pk` / `widen_pk_be`. Unsigned-only
-    /// (no sign flip); signed/compound callers use `set_pk_at_bytes`.
-    /// Test-only: production reindex paths write OPK via `set_pk_at_bytes`.
-    #[cfg(test)]
+    /// Overwrite the narrow PK at `row` with a `u128` — the [`NarrowPkOpk`] image
+    /// written through [`Self::set_pk_at_bytes`], the overwrite twin of
+    /// [`Self::extend_pk`]. Unsigned-only (no sign flip); signed/compound callers
+    /// use `set_pk_at_bytes` directly.
     #[inline]
     pub(crate) fn set_pk_at(&mut self, row: usize, pk: u128) {
-        let stride = self.strides[REG_PK] as usize;
-        if stride > 16 {
-            panic!("set_pk_at: wide region; use set_pk_at_bytes");
-        }
-        debug_assert!(
-            stride >= 16 || (pk >> (stride * 8)) == 0,
-            "narrow batch requires high bits == 0",
-        );
-        let off = self.offsets[REG_PK] + row * stride;
-        self.data[off..off + stride].copy_from_slice(&pk.to_be_bytes()[16 - stride..]);
-        self.downgrade();
+        let key = NarrowPkOpk::new(pk, self.strides[REG_PK] as usize);
+        self.set_pk_at_bytes(row, key.bytes());
     }
 
     /// Overwrite the PK at `row` with raw OPK bytes. Like every order-key mutator
@@ -2407,7 +2389,7 @@ mod tests {
     /// extend_pk on a stride-12 batch must reject a u128 with bits set above the
     /// 12-byte (96-bit) window in debug builds (silent truncation guard).
     #[test]
-    #[should_panic(expected = "narrow batch requires high bits == 0")]
+    #[should_panic(expected = "does not fit 12 bytes")]
     fn extend_pk_stride12_high_bits_panics() {
         let schema = SchemaDescriptor::new(
             &[

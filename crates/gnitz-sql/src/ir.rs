@@ -1,5 +1,5 @@
 use crate::error::GnitzSqlError;
-use gnitz_core::{Schema, TypeCode};
+use gnitz_core::{ColumnDef, TypeCode};
 
 #[derive(Clone, Debug, Copy, PartialEq)]
 pub(crate) enum AggFunc {
@@ -220,10 +220,10 @@ impl<R> BExpr<R> {
 
 impl BExpr<usize> {
     /// The runtime entry point: type a `ColRef(idx)` leaf as the schema column's
-    /// declared type (`schema.columns[idx].type_code`, panicking on an
+    /// declared type (`cols[idx].type_code`, panicking on an
     /// out-of-bounds index — unchanged from the original body).
-    pub(crate) fn infer_type(&self, schema: &Schema) -> TypeCode {
-        self.infer_type_with(&|idx: &usize| schema.columns[*idx].type_code)
+    pub(crate) fn infer_type(&self, cols: &[ColumnDef]) -> TypeCode {
+        self.infer_type_with(&|idx: &usize| cols[*idx].type_code)
     }
 }
 
@@ -339,11 +339,11 @@ mod tests {
         };
         // u64 + u64 → U64 (the folded-in correctness fix: must re-seed a
         // downstream unsigned compare).
-        assert_eq!(add(1, 2).infer_type(&s), TypeCode::U64);
+        assert_eq!(add(1, 2).infer_type(&s.columns), TypeCode::U64);
         // u64 + f64 → F64.
-        assert_eq!(add(1, 4).infer_type(&s), TypeCode::F64);
+        assert_eq!(add(1, 4).infer_type(&s.columns), TypeCode::F64);
         // u32 + u32 → I64 (unchanged; value stays < 2^63).
-        assert_eq!(add(3, 3).infer_type(&s), TypeCode::I64);
+        assert_eq!(add(3, 3).infer_type(&s.columns), TypeCode::I64);
         // Comparisons stay I64.
         assert_eq!(
             BoundExpr::BinOp(
@@ -351,7 +351,7 @@ mod tests {
                 BinOp::Gt,
                 Box::new(BoundExpr::ColRef(2))
             )
-            .infer_type(&s),
+            .infer_type(&s.columns),
             TypeCode::I64
         );
     }
@@ -366,7 +366,7 @@ mod tests {
                 vec![(BoundExpr::LitInt(1), BoundExpr::ColRef(1))],
                 Some(Box::new(BoundExpr::ColRef(2)))
             )
-            .infer_type(&s),
+            .infer_type(&s.columns),
             TypeCode::U64
         );
         // A float branch dominates → F64.
@@ -375,12 +375,12 @@ mod tests {
                 vec![(BoundExpr::LitInt(1), BoundExpr::ColRef(3))],
                 Some(Box::new(BoundExpr::ColRef(1)))
             )
-            .infer_type(&s),
+            .infer_type(&s.columns),
             TypeCode::F64
         );
         // All-NULL CASE stays I64 (LitNull is the neutral element, seed I64).
         assert_eq!(
-            case(vec![(BoundExpr::LitInt(1), BoundExpr::LitNull)], None).infer_type(&s),
+            case(vec![(BoundExpr::LitInt(1), BoundExpr::LitNull)], None).infer_type(&s.columns),
             TypeCode::I64
         );
         // A NULL branch never drags a U64 sibling back down.
@@ -392,7 +392,7 @@ mod tests {
                 ],
                 None
             )
-            .infer_type(&s),
+            .infer_type(&s.columns),
             TypeCode::U64
         );
     }
@@ -400,7 +400,7 @@ mod tests {
     #[test]
     fn lit_null_infers_i64() {
         let s = schema(&[TypeCode::U64, TypeCode::I64]);
-        assert_eq!(BoundExpr::LitNull.infer_type(&s), TypeCode::I64);
+        assert_eq!(BoundExpr::LitNull.infer_type(&s.columns), TypeCode::I64);
     }
 
     /// Pins every `infer_type` arm the pre-existing tests do not reach (the
@@ -413,18 +413,18 @@ mod tests {
         let s = schema(&[TypeCode::U64, TypeCode::U64, TypeCode::String]);
 
         // Literal arms fix their type.
-        assert_eq!(BoundExpr::LitFloat(1.5).infer_type(&s), TypeCode::F64);
-        assert_eq!(BoundExpr::LitStr("x".into()).infer_type(&s), TypeCode::String);
+        assert_eq!(BoundExpr::LitFloat(1.5).infer_type(&s.columns), TypeCode::F64);
+        assert_eq!(BoundExpr::LitStr("x".into()).infer_type(&s.columns), TypeCode::String);
 
         // UnaryOp(Neg) recurses into the inner type (U64 preserved); Not is boolean I64.
         let neg = BoundExpr::UnaryOp(UnaryOp::Neg, Box::new(BoundExpr::ColRef(1)));
-        assert_eq!(neg.infer_type(&s), TypeCode::U64);
+        assert_eq!(neg.infer_type(&s.columns), TypeCode::U64);
         let not = BoundExpr::UnaryOp(UnaryOp::Not, Box::new(BoundExpr::ColRef(1)));
-        assert_eq!(not.infer_type(&s), TypeCode::I64);
+        assert_eq!(not.infer_type(&s.columns), TypeCode::I64);
 
         // IS [NOT] NULL are boolean I64.
-        assert_eq!(BoundExpr::IsNull(1).infer_type(&s), TypeCode::I64);
-        assert_eq!(BoundExpr::IsNotNull(1).infer_type(&s), TypeCode::I64);
+        assert_eq!(BoundExpr::IsNull(1).infer_type(&s.columns), TypeCode::I64);
+        assert_eq!(BoundExpr::IsNotNull(1).infer_type(&s.columns), TypeCode::I64);
 
         // AggCall: AVG is always F64; MIN/MAX inherit the argument type
         // (U64 here) and fall back to I64 with no argument; every other
@@ -434,7 +434,7 @@ mod tests {
                 func: AggFunc::Avg,
                 arg: Some(Box::new(BoundExpr::ColRef(1)))
             }
-            .infer_type(&s),
+            .infer_type(&s.columns),
             TypeCode::F64
         );
         assert_eq!(
@@ -442,7 +442,7 @@ mod tests {
                 func: AggFunc::Max,
                 arg: Some(Box::new(BoundExpr::ColRef(1)))
             }
-            .infer_type(&s),
+            .infer_type(&s.columns),
             TypeCode::U64
         );
         assert_eq!(
@@ -450,7 +450,7 @@ mod tests {
                 func: AggFunc::Min,
                 arg: None
             }
-            .infer_type(&s),
+            .infer_type(&s.columns),
             TypeCode::I64
         );
         assert_eq!(
@@ -458,7 +458,7 @@ mod tests {
                 func: AggFunc::Sum,
                 arg: Some(Box::new(BoundExpr::ColRef(1)))
             }
-            .infer_type(&s),
+            .infer_type(&s.columns),
             TypeCode::I64
         );
         assert_eq!(
@@ -466,7 +466,7 @@ mod tests {
                 func: AggFunc::Count,
                 arg: None
             }
-            .infer_type(&s),
+            .infer_type(&s.columns),
             TypeCode::I64
         );
 
@@ -476,7 +476,7 @@ mod tests {
                 inner: Box::new(BoundExpr::ColRef(1)),
                 items: vec![BoundExpr::LitInt(1)],
             }
-            .infer_type(&s),
+            .infer_type(&s.columns),
             TypeCode::I64
         );
     }

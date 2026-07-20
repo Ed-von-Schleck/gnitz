@@ -87,17 +87,7 @@ fn classify_join(rel: &Rc<RelExpr>, memo: &mut RewriteMemo) -> Result<Rc<RelExpr
     let new_left = classify_rel(Rc::clone(left), memo)?;
     let new_right = classify_rel(Rc::clone(right), memo)?;
     let class = classify_on(on, &left.cols(), &right.cols())?;
-    // Outer + residual is unsupported: an outer preserved-side row's null-fill
-    // decides match existence independently of the residual (matching emit_join).
-    if *kind != JoinType::Inner && !class.residual.is_empty() {
-        return Err(GnitzSqlError::Unsupported(
-            "LEFT/RIGHT/FULL JOIN with a residual ON predicate (a non-equi/non-range \
-             conjunct, or a second range conjunct) is not supported; the residual \
-             would have to participate in the outer null-fill. Use INNER JOIN, or \
-             move the predicate to a WHERE over a wrapping view."
-                .into(),
-        ));
-    }
+    crate::plan::view::join::reject_outer_with_residual(*kind, class.residual.is_empty())?;
     Ok(Rc::new(RelExpr::Join {
         left: new_left,
         right: new_right,
@@ -152,28 +142,7 @@ fn classify_on(on: &[HirExpr], left_cols: &[HirCol], right_cols: &[HirCol]) -> R
         }
     }
 
-    if eq.is_empty() && range.is_none() {
-        return Err(GnitzSqlError::Bind(
-            "JOIN ON must have at least one equijoin or range predicate".into(),
-        ));
-    }
-    let slots = eq.len() + range.is_some() as usize;
-    if slots > gnitz_core::PK_LIST_MAX_COLS {
-        return Err(GnitzSqlError::Unsupported(if range.is_none() {
-            format!(
-                "JOIN ON: at most {} equijoin key columns are supported (got {})",
-                gnitz_core::PK_LIST_MAX_COLS,
-                eq.len()
-            )
-        } else {
-            format!(
-                "range JOIN ON: at most {} join key columns (equality prefix + \
-                 range) are supported (got {})",
-                gnitz_core::PK_LIST_MAX_COLS,
-                slots
-            )
-        }));
-    }
+    crate::plan::view::predicates::reject_join_key_arity(eq.len(), range.is_some())?;
     Ok(JoinClass { eq, range, residual })
 }
 

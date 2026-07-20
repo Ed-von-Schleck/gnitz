@@ -28,7 +28,7 @@ use crate::error::GnitzSqlError;
 use crate::ir::BExpr;
 use crate::plan::lp::Rel;
 use crate::plan::view::{simple, EmitPieces, ViewChain};
-use gnitz_core::{GnitzClient, Schema};
+use gnitz_core::{ColumnDef, GnitzClient, Schema};
 use gnitz_wire::ScanBound;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -354,10 +354,10 @@ pub(crate) fn emit_filter<'a>(
     node: gnitz_core::NodeId,
     preds: impl IntoIterator<Item = &'a HirExpr>,
     layout: &[ColId],
-    schema: &Schema,
+    cols: &[ColumnDef],
 ) -> Result<gnitz_core::NodeId, GnitzSqlError> {
     match physical::fold_preds(preds, layout)? {
-        Some(folded) => match crate::lower::compile_filter_program(&folded, schema)? {
+        Some(folded) => match crate::lower::compile_filter_program(&folded, cols)? {
             Some(prog) => Ok(cb.filter(node, Some(prog))),
             None => Ok(node),
         },

@@ -1,11 +1,11 @@
 use super::resolve::find_unique_column;
+use crate::agg::reject_min_max_unorderable;
 use crate::ast_util::{
-    agg_func_from_name, fn_name_is, function_positional_args, reject_unsupported_fn_qualifiers, single_fn_name,
-    single_relation_col_name,
+    agg_func_from_name, agg_func_name, fn_name_is, function_positional_args, reject_unsupported_fn_qualifiers,
+    single_fn_name, single_relation_col_name,
 };
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BExpr, BinOp, BoundExpr, UnaryOp};
-use crate::types::is_min_max_orderable;
 use gnitz_core::Schema;
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, UnaryOperator, Value,
@@ -407,33 +407,16 @@ impl LeafBinder for SingleTable<'_> {
                 ))
             }
             AggFunc::Sum | AggFunc::Min | AggFunc::Max | AggFunc::Avg => {
-                let name = match agg_func {
-                    AggFunc::Sum => "sum",
-                    AggFunc::Min => "min",
-                    AggFunc::Max => "max",
-                    AggFunc::Avg => "avg",
-                    AggFunc::Count | AggFunc::CountNonNull => unreachable!(),
-                };
                 if let FunctionArguments::List(list) = &func.args {
                     if list.args.len() == 1 {
                         if let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) = &list.args[0] {
                             let bound = bind_structural(inner, self)?;
-                            // MIN/MAX have no correct accumulator path for wide
-                            // (U128/UUID) types — the i64 slot cannot hold them —
-                            // Blob has no ordering, and the String comparator in
-                            // `decode_signed` reads the prefix as LE signed i64,
-                            // which orders by neither bytes nor signedness. Reject
-                            // here so the operator only sees types it can compare
-                            // correctly.
+                            // Reject an unorderable MIN/MAX argument here so the
+                            // operator only sees types it can compare correctly.
+                            // Guarded so the `infer_type` walk stays off the
+                            // SUM/AVG path, which has nothing to check.
                             if matches!(agg_func, AggFunc::Min | AggFunc::Max) {
-                                let arg_ty = bound.infer_type(self.schema);
-                                if !is_min_max_orderable(arg_ty) {
-                                    return Err(GnitzSqlError::Unsupported(format!(
-                                        "{}: not supported on {:?} columns",
-                                        name.to_uppercase(),
-                                        arg_ty
-                                    )));
-                                }
+                                reject_min_max_unorderable(agg_func, bound.infer_type(&self.schema.columns))?;
                             }
                             return Ok(BoundExpr::AggCall {
                                 func: agg_func,
@@ -443,7 +426,8 @@ impl LeafBinder for SingleTable<'_> {
                     }
                 }
                 Err(GnitzSqlError::Unsupported(format!(
-                    "{name}: requires exactly one column argument"
+                    "{}: requires exactly one column argument",
+                    agg_func_name(agg_func)
                 )))
             }
         }

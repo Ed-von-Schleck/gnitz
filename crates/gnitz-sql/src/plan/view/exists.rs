@@ -50,11 +50,13 @@ use crate::plan::validate::{
 use crate::plan::view::join::{
     band_union_schema, build_join_view_projection, build_pure_range_threshold, emit_equi_join_terms,
     is_identity_projection, join_pk_coldefs, normalize_to_ab, range_gate_reindex_prologue, range_slots,
-    side_target_tcs, union_null_key_rows, EquiSide, EquiTerms, RangeSlots,
+    reject_pure_range_threshold_tc, side_target_tcs, union_null_key_rows, EquiSide, EquiTerms, RangeSlots,
 };
-use crate::plan::view::predicates::{and_fold_compile, build_reindex_program, extract_join_predicates, RangeConjunct};
+use crate::plan::view::predicates::{
+    and_fold_compile, build_reindex_program, extract_join_predicates, rekey_on_source_pk, RangeConjunct,
+};
 use crate::plan::view::EmitPieces;
-use gnitz_core::{CircuitBuilder, ColumnDef, FixedInt, GnitzClient, NodeId, Schema, TypeCode};
+use gnitz_core::{CircuitBuilder, ColumnDef, GnitzClient, NodeId, Schema, TypeCode};
 use sqlparser::ast::{BinaryOperator, Expr, Ident, Select, SelectItem};
 use std::rc::Rc;
 
@@ -226,11 +228,8 @@ fn resolve_correlation<'a>(
     // inner after it) and an outer-only map for the user projection — the inner
     // alias is unresolvable there, which is correct SQL scoping for free.
     let outer_n = outer_schema.columns.len();
-    let outer_alias_map = build_alias_map(&[(&outer_alias, outer_tid, &outer_schema)]);
-    let alias_map = build_alias_map(&[
-        (&outer_alias, outer_tid, &outer_schema),
-        (&inner_alias, inner_tid, &inner_schema),
-    ]);
+    let outer_alias_map = build_alias_map(&[(&outer_alias, &outer_schema)]);
+    let alias_map = build_alias_map(&[(&outer_alias, &outer_schema), (&inner_alias, &inner_schema)]);
 
     // ── Inner WHERE: split conjuncts by side ─────────────────────────────────
     let (prefilter, mut corr_acc) = split_correlation_conjuncts(
@@ -243,7 +242,7 @@ fn resolve_correlation<'a>(
     let prefilter_prog = and_fold_compile(
         prefilter.iter().copied(),
         |e| bind_single_table(e, &inner_schema),
-        &inner_schema,
+        &inner_schema.columns,
     )?;
 
     // ── IN: synthesize the (outer_col = inner_col) pair as a qualified equality
@@ -353,7 +352,7 @@ fn resolve_correlation<'a>(
     let local_prog = and_fold_compile(
         local_conjuncts.iter().copied(),
         |e| bind_single_table(e, &outer_schema),
-        &outer_schema,
+        &outer_schema.columns,
     )?;
 
     Ok((
@@ -391,14 +390,12 @@ fn emit_correlated(
             emit_equi_exists(view_id, ctx, is_mark)
         }
         Some(range) => {
-            if ctx.left_cols.is_empty() && FixedInt::from_type_code(range.tc).is_none() {
-                let range_tc = range.tc;
-                return Err(GnitzSqlError::Unsupported(format!(
-                    "pure-range EXISTS/IN correlation needs a ≤8-byte integer range column \
-                     (got {range_tc:?}); its threshold null-fill reduces the range column with \
-                     MIN/MAX, which has no 16-byte accumulator — use a narrower range column \
-                     or add an equality conjunct"
-                )));
+            if ctx.left_cols.is_empty() {
+                reject_pure_range_threshold_tc(
+                    range.tc,
+                    "pure-range EXISTS/IN correlation",
+                    "use a narrower range column or add an equality conjunct",
+                )?;
             }
             // Widest intermediate is the band re-key: [a.pk, k pk, A, B].
             reject_column_overflow(
@@ -488,8 +485,8 @@ fn emit_equi_exists(view_id: u64, ctx: ExistsCtx<'_>, is_mark: bool) -> Result<E
     let a_n = ctx.outer_schema.columns.len();
     let b_n = ctx.inner_schema.columns.len();
 
-    let left_target_tcs = side_target_tcs(&ctx.left_cols, &ctx.outer_schema, &ctx.target_tcs);
-    let right_target_tcs = side_target_tcs(&ctx.right_cols, &ctx.inner_schema, &ctx.target_tcs);
+    let left_target_tcs = side_target_tcs(&ctx.left_cols, &ctx.outer_schema.columns, &ctx.target_tcs);
+    let right_target_tcs = side_target_tcs(&ctx.right_cols, &ctx.inner_schema.columns, &ctx.target_tcs);
 
     let (mut cb, a_local, b_local) = ctx.open_circuit(view_id);
 
@@ -509,14 +506,14 @@ fn emit_equi_exists(view_id: u64, ctx: ExistsCtx<'_>, is_mark: bool) -> Result<E
             input: a_local,
             cols: &ctx.left_cols,
             target_tcs: &left_target_tcs,
-            schema: &ctx.outer_schema,
+            coldefs: &ctx.outer_schema.columns,
             keep: &(0..a_n).collect::<Vec<_>>(),
         },
         EquiSide {
             input: b_local,
             cols: &ctx.right_cols,
             target_tcs: &right_target_tcs,
-            schema: &ctx.inner_schema,
+            coldefs: &ctx.inner_schema.columns,
             keep: &(0..b_n).collect::<Vec<_>>(),
         },
     )?;
@@ -535,7 +532,7 @@ fn emit_equi_exists(view_id: u64, ctx: ExistsCtx<'_>, is_mark: bool) -> Result<E
             a_local,
             &ctx.left_cols,
             &left_target_tcs,
-            build_reindex_program(&ctx.outer_schema),
+            build_reindex_program(&ctx.outer_schema.columns),
         )
     } else {
         reindex_a
@@ -577,8 +574,8 @@ fn emit_range_exists(
         &ctx.right_cols,
         &ctx.target_tcs,
         &range,
-        &ctx.outer_schema,
-        &ctx.inner_schema,
+        &ctx.outer_schema.columns,
+        &ctx.inner_schema.columns,
     );
 
     let (mut cb, a_local, b_local) = ctx.open_circuit(view_id);
@@ -587,8 +584,14 @@ fn emit_range_exists(
     // ALL key cols — eq + range): the match drops NULL-key rows on both sides;
     // `a_local` (NULL keys included) still feeds `a_all` / the anti NULL-key
     // branch, so those rows count as unmatched.
-    let (reindex_a, reindex_b, left_key_nullable) =
-        range_gate_reindex_prologue(&mut cb, a_local, b_local, &slots, &ctx.outer_schema, &ctx.inner_schema)?;
+    let (reindex_a, reindex_b, left_key_nullable) = range_gate_reindex_prologue(
+        &mut cb,
+        a_local,
+        b_local,
+        &slots,
+        &ctx.outer_schema.columns,
+        &ctx.inner_schema.columns,
+    )?;
     let RangeSlots {
         left_reindex_cols,
         all_tcs,
@@ -664,15 +667,15 @@ fn emit_range_exists(
         // (sitting at k + pk within the union layout), then project the A region.
         let union_schema = band_union_schema(&all_tcs, &ctx.outer_schema, &ctx.inner_schema);
         let a_pk_in_union: Vec<usize> = ctx.outer_schema.pk_cols.iter().map(|&p| k + p).collect();
-        let rekey_a = cb.map_reindex(merged, &a_pk_in_union, &zero_a, build_reindex_program(&union_schema));
+        let rekey_a = cb.map_reindex(
+            merged,
+            &a_pk_in_union,
+            &zero_a,
+            build_reindex_program(&union_schema.columns),
+        );
         let proj_a = cb.map(rekey_a, &(pa + k..pa + k + a_n).collect::<Vec<_>>()); // π_A(inner), [a.pk…, A]
 
-        let a_all = cb.map_reindex(
-            a_local,
-            &ctx.outer_schema.pk_cols,
-            &zero_a,
-            build_reindex_program(&ctx.outer_schema),
-        );
+        let a_all = rekey_on_source_pk(&mut cb, a_local, &ctx.outer_schema);
         if is_mark {
             // Both branches over one shared ν, keyed [a.pk…, A].
             let (matched, unmatched) = semi_and_anti(&mut cb, a_all, proj_a);
@@ -808,7 +811,7 @@ fn emit_mark_branch(
     let filtered = match &ctx.select.selection {
         Some(w) => {
             let bound = bind_single_table_mark(w, branch_schema, mark)?;
-            match compile_filter_program(&bound, branch_schema)? {
+            match compile_filter_program(&bound, &branch_schema.columns)? {
                 Some(prog) => cb.filter(node, Some(prog)),
                 None => node, // WHERE folded to a true constant — keep every row
             }

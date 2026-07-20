@@ -1,7 +1,7 @@
 use crate::error::GnitzSqlError;
 use crate::ir::{BinOp, BoundExpr, UnaryOp};
+use gnitz_core::ColumnDef;
 use gnitz_core::ExprBuilder;
-use gnitz_core::Schema;
 
 /// One structural walk of [`BoundExpr`], parameterized by what each node
 /// *produces*. The single `match` in [`lower_bound_expr`] is the sole walk of
@@ -103,7 +103,7 @@ fn try_compile_string_cmp(
     left: &BoundExpr,
     op: &BinOp,
     right: &BoundExpr,
-    schema: &Schema,
+    cols: &[ColumnDef],
     eb: &mut ExprBuilder,
 ) -> Result<Option<(u32, bool)>, GnitzSqlError> {
     // ColRef(string) op LitStr(s), or LitStr(s) op ColRef(string).
@@ -133,7 +133,7 @@ fn try_compile_string_cmp(
         // `str_col_*` opcodes content-compare both (via `compare_german_strings`),
         // so a BLOB column-vs-literal comparison lowers here too, not to the
         // integer path (which would read the descriptor bytes as a garbage int).
-        if schema.columns[idx].type_code.is_german_string() {
+        if cols[idx].type_code.is_german_string() {
             let const_idx = eb.add_const_string(s.clone());
             let reg = match cmp {
                 BinOp::Eq => eb.str_col_eq_const(idx, const_idx),
@@ -162,7 +162,7 @@ fn try_compile_string_cmp(
     }
     // ColRef(string/blob) op ColRef(string/blob)
     if let (BoundExpr::ColRef(a), BoundExpr::ColRef(b)) = (left, right) {
-        if schema.columns[*a].type_code.is_german_string() && schema.columns[*b].type_code.is_german_string() {
+        if cols[*a].type_code.is_german_string() && cols[*b].type_code.is_german_string() {
             let reg = match op {
                 BinOp::Eq => eb.str_col_eq_col(*a, *b),
                 BinOp::Ne => {
@@ -189,7 +189,7 @@ fn try_compile_string_cmp(
 /// `Out = (result_reg, is_float)`, where `is_float` indicates the register holds
 /// an f64 bit-pattern rather than a plain i64.
 pub(crate) struct OpcodeBackend<'a> {
-    schema: &'a Schema,
+    cols: &'a [ColumnDef],
     eb: &'a mut ExprBuilder,
 }
 
@@ -205,12 +205,12 @@ impl BoundExprBackend for OpcodeBackend<'_> {
         // `try_compile_string_cmp` before any recursion reaches this arm; so a
         // STRING/BLOB landing here is arithmetic or a mixed-type comparison
         // (`a.s > b.int`) and must error, not load garbage.
-        let tc = self.schema.columns[idx].type_code;
+        let tc = self.cols[idx].type_code;
         if tc.is_wide_int() {
             return Err(GnitzSqlError::Unsupported(format!(
                 "column {:?} is {tc:?}; 128-bit columns cannot be used in view \
                  expressions (use a primary-key seek or CREATE INDEX instead)",
-                self.schema.columns[idx].name,
+                self.cols[idx].name,
             )));
         }
         if tc.is_german_string() {
@@ -218,7 +218,7 @@ impl BoundExprBackend for OpcodeBackend<'_> {
                 "column {:?} is {tc:?}; string/blob columns support only =, <>, <, <=, \
                  >, >= against another string/blob column or a string literal — not \
                  arithmetic or comparison with a non-string column",
-                self.schema.columns[idx].name,
+                self.cols[idx].name,
             )));
         }
         if tc.is_float() {
@@ -292,13 +292,13 @@ impl BoundExprBackend for OpcodeBackend<'_> {
 
     fn in_list(&mut self, inner: &BoundExpr, items: &[BoundExpr]) -> Result<Self::Out, GnitzSqlError> {
         // Fast path: a ≤8-byte-integer operand + every item a foldable integer
-        // literal → one INT_IN_SET. `self.schema` is the schema `inner` was bound
+        // literal → one INT_IN_SET. `self.cols` is the schema `inner` was bound
         // against — source schema for a table filter, reduce-output schema for
         // HAVING — so the int gate is correct in both, and a HAVING large-IN
         // compiles here too. Use `FixedInt::from_type_code(...).is_some()` — the
         // exact predicate the interpreter/thin-probe gate on — not
         // `is_pk_eligible`, which wrongly admits U128/UUID/I128.
-        if gnitz_wire::FixedInt::from_type_code(inner.infer_type(self.schema)).is_some() {
+        if gnitz_wire::FixedInt::from_type_code(inner.infer_type(self.cols)).is_some() {
             if let Some(mut values) = items.iter().map(fold_int_literal).collect::<Option<Vec<i64>>>() {
                 values.sort_unstable();
                 values.dedup();
@@ -316,7 +316,7 @@ impl BoundExprBackend for OpcodeBackend<'_> {
     fn binop(&mut self, left: &BoundExpr, op: BinOp, right: &BoundExpr) -> Result<Self::Out, GnitzSqlError> {
         // String comparison detection — intercept before recursing into operands
         // (a bare string literal/column would otherwise error in `lit_str`/`col_ref`).
-        if let Some(result) = try_compile_string_cmp(left, &op, right, self.schema, self.eb)? {
+        if let Some(result) = try_compile_string_cmp(left, &op, right, self.cols, self.eb)? {
             return Ok(result);
         }
 
@@ -405,10 +405,10 @@ impl BoundExprBackend for OpcodeBackend<'_> {
 /// inside the `OpcodeBackend` recursion and never escapes here.
 pub(crate) fn compile_bound_expr(
     expr: &BoundExpr,
-    schema: &Schema,
+    cols: &[ColumnDef],
     eb: &mut ExprBuilder,
 ) -> Result<u32, GnitzSqlError> {
-    let mut backend = OpcodeBackend { schema, eb };
+    let mut backend = OpcodeBackend { cols, eb };
     lower_bound_expr(expr, &mut backend).map(|(reg, _)| reg)
 }
 
@@ -418,10 +418,10 @@ pub(crate) fn compile_bound_expr(
 /// register threaded into a larger one.
 pub(crate) fn compile_bound_expr_to_program(
     expr: &BoundExpr,
-    schema: &Schema,
+    cols: &[ColumnDef],
 ) -> Result<gnitz_core::ExprProgram, GnitzSqlError> {
     let mut eb = ExprBuilder::new();
-    let reg = compile_bound_expr(expr, schema, &mut eb)?;
+    let reg = compile_bound_expr(expr, cols, &mut eb)?;
     Ok(eb.build(reg))
 }
 
@@ -433,11 +433,11 @@ pub(crate) fn compile_bound_expr_to_program(
 /// drop every row.
 pub(crate) fn compile_filter_program(
     pred: &BoundExpr,
-    schema: &Schema,
+    cols: &[ColumnDef],
 ) -> Result<Option<gnitz_core::ExprProgram>, GnitzSqlError> {
     match pred {
         BoundExpr::LitInt(v) if *v != 0 => Ok(None),
-        _ => Ok(Some(compile_bound_expr_to_program(pred, schema)?)),
+        _ => Ok(Some(compile_bound_expr_to_program(pred, cols)?)),
     }
 }
 
@@ -464,7 +464,7 @@ mod tests {
 
     fn compile(left: &BoundExpr, op: BinOp, right: &BoundExpr, schema: &Schema) -> ExprProgram {
         let mut eb = ExprBuilder::new();
-        let (reg, _) = try_compile_string_cmp(left, &op, right, schema, &mut eb)
+        let (reg, _) = try_compile_string_cmp(left, &op, right, &schema.columns, &mut eb)
             .expect("compile ok")
             .expect("recognized as a string comparison");
         eb.build(reg)
@@ -512,7 +512,7 @@ mod tests {
         let s = BoundExpr::ColRef(1);
         let lit = BoundExpr::LitStr("x".to_string());
         let mut eb = ExprBuilder::new();
-        let err = try_compile_string_cmp(&lit, &BinOp::Add, &s, &schema, &mut eb)
+        let err = try_compile_string_cmp(&lit, &BinOp::Add, &s, &schema.columns, &mut eb)
             .expect_err("Add is not a string comparison");
         assert!(err.to_string().contains("Add"), "error must name op: {err}");
     }
@@ -579,7 +579,7 @@ mod tests {
             Box::new(BoundExpr::ColRef(2)),
         );
         let mut eb = ExprBuilder::new();
-        let err = compile_bound_expr(&expr, &schema, &mut eb).expect_err("string > int must not compile");
+        let err = compile_bound_expr(&expr, &schema.columns, &mut eb).expect_err("string > int must not compile");
         assert!(
             matches!(err, GnitzSqlError::Unsupported(_)),
             "expected Unsupported, got {err:?}"
@@ -622,7 +622,7 @@ mod tests {
             branches: vec![(gt0(), BoundExpr::ColRef(1))],
             else_: Some(Box::new(BoundExpr::LitInt(0))),
         };
-        let ops = opcodes(&compile_bound_expr_to_program(&case_int, &schema).unwrap());
+        let ops = opcodes(&compile_bound_expr_to_program(&case_int, &schema.columns).unwrap());
         assert!(ops.contains(&EXPR_SELECT), "CASE must lower to a SELECT");
         assert!(!ops.contains(&EXPR_INT_TO_FLOAT), "all-int CASE needs no float lift");
 
@@ -631,7 +631,7 @@ mod tests {
             branches: vec![(gt0(), BoundExpr::ColRef(2))],
             else_: Some(Box::new(BoundExpr::ColRef(1))),
         };
-        let ops = opcodes(&compile_bound_expr_to_program(&case_mixed, &schema).unwrap());
+        let ops = opcodes(&compile_bound_expr_to_program(&case_mixed, &schema.columns).unwrap());
         assert!(ops.contains(&EXPR_SELECT), "CASE must lower to a SELECT");
         assert!(
             ops.contains(&EXPR_INT_TO_FLOAT),
@@ -656,7 +656,7 @@ mod tests {
             else_: Some(Box::new(BoundExpr::LitStr("y".into()))),
         };
         assert!(matches!(
-            compile_bound_expr_to_program(&case_str, &schema),
+            compile_bound_expr_to_program(&case_str, &schema.columns),
             Err(GnitzSqlError::Unsupported(_))
         ));
     }
@@ -672,7 +672,7 @@ mod tests {
             Box::new(BoundExpr::LitInt(1)),
         );
         let mut eb = ExprBuilder::new();
-        let err = compile_bound_expr(&expr, &schema, &mut eb).expect_err("string + 1 must not compile");
+        let err = compile_bound_expr(&expr, &schema.columns, &mut eb).expect_err("string + 1 must not compile");
         assert!(
             matches!(err, GnitzSqlError::Unsupported(_)),
             "expected Unsupported, got {err:?}"
@@ -718,7 +718,7 @@ mod tests {
             vec![BoundExpr::LitInt(1), BoundExpr::LitInt(2), BoundExpr::LitInt(3)],
             vec![neg_lit(1), neg_lit(2)],
         ] {
-            let prog = compile_bound_expr_to_program(&in_list(BoundExpr::ColRef(1), items), &schema).unwrap();
+            let prog = compile_bound_expr_to_program(&in_list(BoundExpr::ColRef(1), items), &schema.columns).unwrap();
             let ops = opcodes(&prog);
             assert!(
                 ops.contains(&EXPR_INT_IN_SET),
@@ -733,7 +733,7 @@ mod tests {
     fn in_list_int_pool_is_sorted_and_deduped() {
         let schema = two_int_schema();
         let items = vec![BoundExpr::LitInt(2), BoundExpr::LitInt(1), BoundExpr::LitInt(1)];
-        let prog = compile_bound_expr_to_program(&in_list(BoundExpr::ColRef(1), items), &schema).unwrap();
+        let prog = compile_bound_expr_to_program(&in_list(BoundExpr::ColRef(1), items), &schema.columns).unwrap();
         assert_eq!(prog.const_strings.len(), 1, "one const-pool entry (the packed set)");
         assert_eq!(
             prog.const_strings[0].len(),
@@ -752,7 +752,7 @@ mod tests {
     fn in_list_large_int_list_compiles_within_register_cap() {
         let schema = two_int_schema();
         let items: Vec<BoundExpr> = (0..500).map(BoundExpr::LitInt).collect();
-        let prog = compile_bound_expr_to_program(&in_list(BoundExpr::ColRef(1), items), &schema).unwrap();
+        let prog = compile_bound_expr_to_program(&in_list(BoundExpr::ColRef(1), items), &schema.columns).unwrap();
         assert!(
             prog.num_regs <= 4,
             "membership is O(1) registers; got {} for a 500-element list",
@@ -773,7 +773,7 @@ mod tests {
         let schema = case_schema(); // col2 = f (F64)
         let prog = compile_bound_expr_to_program(
             &in_list(BoundExpr::ColRef(2), vec![BoundExpr::LitInt(1), BoundExpr::LitInt(2)]),
-            &schema,
+            &schema.columns,
         )
         .unwrap();
         let ops = opcodes(&prog);
@@ -791,7 +791,7 @@ mod tests {
                 BoundExpr::ColRef(1),
                 vec![BoundExpr::LitStr("a".into()), BoundExpr::LitStr("b".into())],
             ),
-            &schema,
+            &schema.columns,
         )
         .unwrap();
         let ops = opcodes(&prog);
@@ -809,7 +809,7 @@ mod tests {
         let schema = two_int_schema();
         let prog = compile_bound_expr_to_program(
             &in_list(BoundExpr::ColRef(1), vec![BoundExpr::LitInt(1), BoundExpr::ColRef(2)]),
-            &schema,
+            &schema.columns,
         )
         .unwrap();
         let ops = opcodes(&prog);
@@ -831,7 +831,7 @@ mod tests {
                 BoundExpr::ColRef(1),
                 vec![BoundExpr::LitInt(1), BoundExpr::LitFloat(2.5)],
             ),
-            &schema,
+            &schema.columns,
         )
         .unwrap();
         assert!(
@@ -852,7 +852,7 @@ mod tests {
             BinOp::Eq,
             Box::new(BoundExpr::LitWide("18446744073709551615".to_string())),
         );
-        let err = compile_bound_expr_to_program(&expr, &schema).expect_err("wide literal must not compile");
+        let err = compile_bound_expr_to_program(&expr, &schema.columns).expect_err("wide literal must not compile");
         match err {
             GnitzSqlError::Unsupported(msg) => {
                 assert!(msg.contains(crate::ir::WIDE_INT_UNSUPPORTED), "message: {msg}");
@@ -870,8 +870,11 @@ mod tests {
             columns: vec![col("pk", TypeCode::U64), col("w", TypeCode::U128)],
             pk_cols: vec![0],
         };
-        let err = compile_bound_expr_to_program(&in_list(BoundExpr::ColRef(1), vec![BoundExpr::LitInt(1)]), &schema)
-            .expect_err("wide-int IN must not compile");
+        let err = compile_bound_expr_to_program(
+            &in_list(BoundExpr::ColRef(1), vec![BoundExpr::LitInt(1)]),
+            &schema.columns,
+        )
+        .expect_err("wide-int IN must not compile");
         assert!(
             matches!(err, GnitzSqlError::Unsupported(_)),
             "expected Unsupported, got {err:?}"

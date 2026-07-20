@@ -181,6 +181,45 @@ pub(crate) fn pack_pk_be(pk_bytes: &[u8]) -> u128 {
     }
 }
 
+/// The OPK image of a **narrow unsigned** PK value: `pk`'s low `stride` bytes,
+/// big-endian. OPK == big-endian for an unsigned key, so `widen_pk_be(bytes())`
+/// recovers `pk`; a signed or compound key needs the per-column sign flip
+/// (`encode_order_preserving_pk`) and must not come through here.
+///
+/// The one home for "right-align a `u128` into an OPK of width `stride`" — every
+/// synthetic-key writer (the batch PK setters, the reduce group-key emitters)
+/// builds one, so the width checks below cannot be skipped by hand-rolling
+/// `&pk.to_be_bytes()[16 - stride..]`, which silently truncates a value that
+/// overflows the stride. Zero-cost: a 16-byte stack value, no allocation.
+pub(crate) struct NarrowPkOpk {
+    be: [u8; 16],
+    stride: usize,
+}
+
+impl NarrowPkOpk {
+    #[inline(always)]
+    pub(crate) fn new(pk: u128, stride: usize) -> Self {
+        assert!(
+            stride <= 16,
+            "narrow PK required, got stride {stride}; use the raw-OPK-bytes setter"
+        );
+        debug_assert!(
+            stride == 16 || (pk >> (stride * 8)) == 0,
+            "narrow PK {pk} does not fit {stride} bytes",
+        );
+        NarrowPkOpk {
+            be: pk.to_be_bytes(),
+            stride,
+        }
+    }
+
+    /// The `stride` order-preserving bytes — a full PK region for one row.
+    #[inline(always)]
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.be[16 - self.stride..]
+    }
+}
+
 /// A fixed-width order-preserving sort key built by left-aligning a row's
 /// `pk_stride` OPK bytes big-endian. The OPK bytes are order-preserving, and every
 /// row in one batch shares a single `pk_stride` (hence identical zero padding past

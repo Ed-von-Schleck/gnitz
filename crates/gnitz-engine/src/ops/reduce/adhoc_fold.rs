@@ -32,6 +32,7 @@ use super::agg::{Accumulator, AggDescriptor, AggOp};
 use super::emit::emit_reduce_row;
 use super::plan::{build_reduce_output_schema, ReducePlan};
 use super::sort::compare_by_group_cols;
+use crate::schema::key::NarrowPkOpk;
 use crate::schema::{ReduceOutKey, SchemaDescriptor, TypeCode, MAX_COLUMNS};
 use crate::storage::Batch;
 
@@ -260,12 +261,11 @@ impl AdhocFold {
                 Some(k) => k.key_row(&rep_mb, ord),
                 None => global_group_key(),
             };
-            let pk_be = key.to_be_bytes();
+            let pk = NarrowPkOpk::new(key, stride);
             emit_reduce_row(
                 &mut output,
-                &rep_mb,
-                ord,
-                &pk_be[16 - stride..],
+                (&rep_mb, ord),
+                pk.bytes(),
                 &self.accs[ord * n_aggs..(ord + 1) * n_aggs],
                 &self.plan,
             );

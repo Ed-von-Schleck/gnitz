@@ -383,7 +383,7 @@ fn compile_read_spec_predicate(exprs: &[&BoundExpr], schema: &Schema) -> Result<
         });
         &folded
     };
-    match compile_filter_program(pred, schema)? {
+    match compile_filter_program(pred, &schema.columns)? {
         Some(prog) => Ok(prog.encode()),
         None => Ok(Vec::new()),
     }

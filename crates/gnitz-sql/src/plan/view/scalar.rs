@@ -160,7 +160,6 @@ fn map_eq_any_ne_all(e: &Expr) -> Expr {
 /// The resolved outer relation — the view's single FROM table.
 struct OuterCtx {
     alias: String,
-    tid: u64,
     schema: Rc<Schema>,
 }
 
@@ -238,10 +237,9 @@ pub(crate) fn emit_scalar_subquery_pieces(
     // ── Outer relation ───────────────────────────────────────────────────────
     let (outer_name, outer_alias) =
         extract_table_name_and_alias(&select.from[0].relation, "CREATE VIEW scalar subquery")?;
-    let (outer_tid, outer_schema) = binder.resolve(client, &outer_name)?;
+    let (_, outer_schema) = binder.resolve(client, &outer_name)?;
     let outer = OuterCtx {
         alias: outer_alias,
-        tid: outer_tid,
         schema: outer_schema,
     };
 
@@ -421,7 +419,8 @@ fn resolve_and_split<'a>(
         "subquery",
     )?;
     reject_alias_collision(&outer.alias, &inner_alias)?;
-    // NOTE: `outer.tid == inner_tid` (a self-correlated subquery) is *supported* —
+    // NOTE: a self-correlated subquery (outer and inner naming the same relation)
+    // is *supported* —
     // `Gᵢ` is a distinct reduce segment (a distinct source id), so `H = outer ⋈ Gᵢ`
     // is the shared-source-branches shape (distinct dependency edges → separate
     // epochs), never a same-source-in-one-epoch self-join.
@@ -439,10 +438,7 @@ fn resolve_and_split<'a>(
 
     // Split the inner WHERE into inner-local vs correlation conjuncts.
     let outer_n = outer.schema.columns.len();
-    let alias_map = build_alias_map(&[
-        (&outer.alias, outer.tid, &outer.schema),
-        (&inner_alias, inner_tid, &inner_schema),
-    ]);
+    let alias_map = build_alias_map(&[(&outer.alias, &outer.schema), (&inner_alias, &inner_schema)]);
     let (inner_local, corr_acc) = split_correlation_conjuncts(
         inner_select.selection.as_ref(),
         &alias_map,
@@ -1206,12 +1202,7 @@ fn fn_call(name: &str, args: Vec<Expr>) -> Expr {
 /// `MAX(arg)` / `MIN(arg)` as an aggregate call — the synthesized aggregate for a
 /// range quantifier's `Gᵢ`.
 fn agg_call(func: AggFunc, arg: Expr) -> Expr {
-    let name = match func {
-        AggFunc::Max => "max",
-        AggFunc::Min => "min",
-        _ => unreachable!("only MIN/MAX are synthesized for range quantifiers"),
-    };
-    fn_call(name, vec![arg])
+    fn_call(crate::ast_util::agg_func_name(func), vec![arg])
 }
 
 fn coalesce_call(args: Vec<Expr>) -> Expr {

@@ -6,7 +6,6 @@ use std::rc::Rc;
 /// A relation resolved by name within a join `AliasMap` — each alias carries its
 /// base offset into the combined A‖B column space.
 pub(crate) struct ResolvedRelation {
-    pub table_id: u64,
     pub schema: Rc<Schema>,
     /// The base offset of this relation's columns within a join's combined
     /// column space.
@@ -16,17 +15,16 @@ pub(crate) struct ResolvedRelation {
 /// alias/name → resolved relation, for multi-table (join) column resolution.
 pub(crate) type AliasMap = HashMap<String, ResolvedRelation>;
 
-/// Build an `AliasMap` from `(alias, table_id, schema)` triples, assigning each
-/// relation's `col_offset` cumulatively in list order — the single encoding of
-/// the combined A‖B column space shared by the join and EXISTS/IN builders.
-pub(crate) fn build_alias_map(relations: &[(&str, u64, &Rc<Schema>)]) -> AliasMap {
+/// Build an `AliasMap` from `(alias, schema)` pairs, assigning each relation's
+/// `col_offset` cumulatively in list order — the single encoding of the combined
+/// A‖B column space shared by the join and EXISTS/IN builders.
+pub(crate) fn build_alias_map(relations: &[(&str, &Rc<Schema>)]) -> AliasMap {
     let mut map = AliasMap::with_capacity(relations.len());
     let mut col_offset = 0;
-    for &(alias, table_id, schema) in relations {
+    for &(alias, schema) in relations {
         map.insert(
             alias.to_ascii_lowercase(),
             ResolvedRelation {
-                table_id,
                 schema: Rc::clone(schema),
                 col_offset,
             },
@@ -344,7 +342,6 @@ mod tests {
         map.insert(
             "a".to_string(),
             ResolvedRelation {
-                table_id: 1,
                 schema: Rc::new(Schema {
                     columns: vec![col("x", TypeCode::I64), col("y", TypeCode::I64)],
                     pk_cols: vec![0],

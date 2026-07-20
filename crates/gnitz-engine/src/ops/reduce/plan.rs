@@ -82,19 +82,6 @@ pub(crate) fn build_reduce_output_schema(
     SchemaDescriptor::new(&cols[..n], &pk_idx[..pk_len])
 }
 
-/// Role of one reduce-output payload column, resolved at plan build so the
-/// per-emitted-group loop does no `locate()` walk or bounds re-derivation.
-#[derive(Clone, Copy)]
-pub(super) enum OutColRole {
-    /// Trailing aggregate column: `accs[k]`, emitted at width
-    /// `agg_col_widths[k]`.
-    Agg { k: u8 },
-    /// Group-exemplar column — a verbatim copy of the input group column read
-    /// through its pre-resolved locator, so the locator's own type code and
-    /// width are the emit dispatch and copy width.
-    Exemplar(ColumnLocator),
-}
-
 /// The baked per-instruction reduce plan. Input facts (schemas, group columns,
 /// aggregate descriptors) plus every derived gate `op_reduce` previously
 /// recomputed per epoch. Built by [`ReducePlan::new`] only.
@@ -144,8 +131,14 @@ pub struct ReducePlan {
     /// First aggregate column's logical index (aggregates are the trailing
     /// output columns, so this holds at any PK arity).
     pub(crate) cbase: usize,
-    /// Per-output-payload-column emit role, in payload order.
-    pub(super) out_roles: Vec<OutColRole>,
+    /// Group-exemplar output columns, in payload order: a verbatim copy of the
+    /// input group column read through its pre-resolved locator (whose type code
+    /// and width are the emit dispatch and copy width). These are the *leading*
+    /// payload columns and the aggregates the trailing ones, so exemplar `j` sits
+    /// at payload index `j` and aggregate `k` at `exemplar_locs.len() + k`. Empty
+    /// unless the output key is `SyntheticFold` — either natural key spells the
+    /// group value into the PK region itself.
+    pub(super) exemplar_locs: Vec<ColumnLocator>,
 }
 
 impl ReducePlan {
@@ -205,29 +198,22 @@ impl ReducePlan {
             .map(|k| output_schema.columns[cbase + k].size() as usize)
             .collect();
 
-        // Output-column roles. The output schema is compiler-built
-        // (`build_reduce_output_schema`), so a natural-PK output has no
-        // exemplar columns and a synthetic-fold output has exactly one exemplar
-        // per group column — anything else is unconstructible.
-        let out_roles: Vec<OutColRole> = output_schema
-            .payload_columns()
-            .map(|(_pi, ci, _col)| {
-                if ci >= cbase {
-                    OutColRole::Agg { k: (ci - cbase) as u8 }
-                } else if use_natural_pk {
-                    unreachable!("natural-PK reduce output has no group-exemplar columns");
-                } else {
-                    // Synthetic fold: exemplar ci = 1..N maps to group_by_cols[ci-1]
-                    // (the leading `_group_pk` occupies index 0).
-                    let grp_idx = ci - 1;
-                    assert!(
-                        grp_idx < group_by_cols.len(),
-                        "reduce output schema exemplar column without a group column",
-                    );
-                    OutColRole::Exemplar(input_schema.locate(group_by_cols[grp_idx] as usize))
-                }
-            })
-            .collect();
+        // Group-exemplar columns. The output schema is compiler-built
+        // (`build_reduce_output_schema`), so a natural-PK output has none and a
+        // synthetic-fold output has exactly one per group column, in order, ahead
+        // of the trailing aggregates. The assertion pins that layout — it is what
+        // makes the emitters positional (exemplar `j` at payload index `j`,
+        // aggregate `k` at `exemplar_locs.len() + k`) with no per-column role tag.
+        let exemplar_locs: Vec<ColumnLocator> = if use_natural_pk {
+            Vec::new()
+        } else {
+            group_by_cols.iter().map(|&c| input_schema.locate(c as usize)).collect()
+        };
+        assert_eq!(
+            exemplar_locs.len() + num_aggs,
+            output_schema.num_payload_cols(),
+            "reduce output schema must be [key columns…, group exemplars…, aggregates…]",
+        );
 
         ReducePlan {
             input_schema: *input_schema,
@@ -248,7 +234,7 @@ impl ReducePlan {
             fallback_keys,
             agg_col_widths,
             cbase,
-            out_roles,
+            exemplar_locs,
         }
     }
 }
