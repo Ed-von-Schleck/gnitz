@@ -415,13 +415,11 @@ class TestSetOps:
             ):
                 rejects(sql, "DISTINCT ON is not supported")
 
-            # --- GROUP BY / HAVING dropped in the DISTINCT-view and set-op-branch paths ---
+            # --- GROUP BY / HAVING dropped in the DISTINCT-view path ---
+            # (A GROUP BY set-op *side* is now honored — a grouped side compiles to a
+            #  hidden segment the set op re-hashes — so it is no longer a dropped clause.)
             rejects("CREATE VIEW v AS SELECT DISTINCT a FROM t GROUP BY a", "GROUP BY is not supported")
             rejects("CREATE VIEW v AS SELECT DISTINCT a FROM t HAVING a > 0", "HAVING is not supported")
-            rejects(
-                "CREATE VIEW v AS SELECT a FROM t GROUP BY a UNION ALL SELECT b FROM t",
-                "GROUP BY is not supported",
-            )
             # HAVING on a non-grouped (simple) view: no reduce, the predicate never runs.
             rejects("CREATE VIEW v AS SELECT a FROM t HAVING a > 0", "HAVING is not supported")
 
@@ -456,11 +454,9 @@ class TestSetOps:
             rejects("CREATE VIEW v AS SELECT pk FROM t SETTINGS max_threads = 1", "SETTINGS is not supported")
             rejects("CREATE VIEW v AS SELECT pk FROM t FORMAT JSON", "FORMAT is not supported")
 
-            # --- plain branch DISTINCT (shared guard; would leak dups under UNION ALL) ---
-            rejects(
-                "CREATE VIEW v AS SELECT DISTINCT a FROM t UNION ALL SELECT b FROM t",
-                "DISTINCT is not supported",
-            )
+            # (A DISTINCT set-op side is now honored — the side compiles to a hidden
+            #  segment that deduplicates before the UNION ALL, so it no longer leaks
+            #  duplicates and is no longer a dropped clause.)
 
             # --- every honored shape still compiles (positive controls) ---
             ok = {

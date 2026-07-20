@@ -5,19 +5,25 @@
 //! `inline_ctes`/`compile_derived_tables` ran first in `build_query_segments`),
 //! so a `Get` resolves them by name.
 
-use super::{col_by_id, ColId, ColIdGen, HirCol, HirExpr, HirRef, ProjEntry, RelExpr};
+use super::{col_by_id, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, ProjEntry, RelExpr, SetOpKind};
+use crate::agg::{agg_result_type, direct_agg_nullable, push_agg_specs, AggShape};
 use crate::ast_util::{
-    agg_func_from_name, extract_relation_name, extract_table_name_and_alias, flatten_conjuncts, is_wildcard_projection,
-    reject_unsupported_fn_qualifiers, single_fn_name, single_relation_col_name, wildcard_name_is_visible,
-    WildcardRewrite,
+    agg_func_from_name, body_is_grouped, extract_relation_name, extract_table_name_and_alias, flatten_conjuncts,
+    is_wildcard_projection, projection_item_expr, reject_unsupported_fn_qualifiers, single_fn_name,
+    single_relation_col_name, wildcard_name_is_visible, WildcardRewrite,
 };
 use crate::bind::{bind_structural, find_unique_column, fold_null_test, Binder, LeafBinder};
 use crate::error::GnitzSqlError;
-use crate::ir::BExpr;
-use crate::plan::validate::{reject_duplicate_column_names, reject_unhonored_select_clauses, HonoredClauses};
+use crate::ir::{AggFunc, BExpr, BinOp};
+use crate::plan::validate::{
+    reject_duplicate_column_names, reject_float_key, reject_unhonored_select_clauses, HonoredClauses,
+};
 use crate::plan::view::join::join_on_and_type;
 use gnitz_core::{ColumnDef, GnitzClient, TypeCode};
-use sqlparser::ast::{Expr, Function, Query, Select, SelectItem, SetExpr};
+use sqlparser::ast::{
+    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Query, Select, SelectItem, SetExpr,
+    SetOperator, SetQuantifier, TableFactor,
+};
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -33,13 +39,31 @@ pub(crate) fn bind_query(
     // `query.with` is ignored: the old inline_ctes/compile_derived_tables already
     // ran in build_query_segments and populated the binder cache with any
     // CTE/derived aliases, so binder.resolve picks them up as `Get`s.
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Err(GnitzSqlError::Unsupported(
-            "CREATE VIEW only supports SELECT".to_string(),
-        ));
-    };
-    let rel = bind_select(client, binder, &mut ids, select)?;
+    let rel = bind_body(client, binder, &mut ids, query.body.as_ref())?;
     Ok((rel, ids))
+}
+
+/// Bind one query body — a single SELECT (linear / join / grouped / DISTINCT) or
+/// a set operation whose sides bind recursively.
+fn bind_body(
+    client: &mut GnitzClient,
+    binder: &mut Binder<'_>,
+    ids: &mut ColIdGen,
+    body: &SetExpr,
+) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    match body {
+        SetExpr::Select(select) => bind_select(client, binder, ids, select),
+        SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } => bind_set_op(client, binder, ids, *op, *set_quantifier, left, right),
+        SetExpr::Query(q) => bind_body(client, binder, ids, q.body.as_ref()),
+        _ => Err(GnitzSqlError::Unsupported(
+            "CREATE VIEW only supports SELECT and set operations".to_string(),
+        )),
+    }
 }
 
 /// Bind one single-SELECT body — a linear (`Simple`) body or a FROM-join
@@ -70,12 +94,17 @@ fn bind_linear_select(
     ids: &mut ColIdGen,
     select: &Select,
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    let grouped = body_is_grouped(select);
+    let distinct = select.distinct.is_some();
     reject_unhonored_select_clauses(
         select,
         HonoredClauses {
             where_filter: true,
-            grouping: false,
-            distinct: false,
+            // Honor grouping only on the grouped path; the DISTINCT path passes
+            // `false` so a DISTINCT + GROUP BY body keeps the pinned "GROUP BY is
+            // not supported" rejection.
+            grouping: grouped && !distinct,
+            distinct,
         },
         "CREATE VIEW",
     )?;
@@ -100,15 +129,37 @@ fn bind_linear_select(
         rel = RelExpr::filter(rel, preds);
     }
 
+    // DISTINCT outranks a grouped shape (matching the old classify order); a real
+    // GROUP BY is already rejected by the gate above on this path.
+    if distinct {
+        // The dup-name guard fires in `lower_distinct` over the full output
+        // column list (the synthetic `_distinct_pk` included) — a strict superset
+        // of this projection, so checking it again here would be redundant.
+        let items = bind_projection(&select.projection, &env, &leaf, ids)?;
+        return Ok(RelExpr::distinct(RelExpr::project(rel, items)));
+    }
+    if grouped {
+        return bind_grouped_suffix(ids, select, rel, &leaf);
+    }
+
     // Projection — SELECT order (place_pk_front is physical, applied at lowering).
     let items = bind_projection(&select.projection, &env, &leaf, ids)?;
     // Dup-name check for a non-wildcard projection (matching lower_linear); a pure
     // `SELECT *` carries duplicates through positionally.
-    if !is_wildcard_projection(&select.projection) {
-        let out_defs: Vec<ColumnDef> = items.iter().map(|e| e.out.def.clone()).collect();
-        reject_duplicate_column_names(&out_defs, "CREATE VIEW projection")?;
-    }
+    reject_dup_proj_names(&items, &select.projection, "CREATE VIEW projection")?;
     Ok(RelExpr::project(rel, items))
+}
+
+/// Reject duplicate output names in a bound projection. A pure `SELECT *`
+/// carries duplicates through positionally (the wildcard expansion is the
+/// source's own column list), so only an explicit projection is checked — one
+/// home for the guard the four bind sites otherwise repeat verbatim.
+fn reject_dup_proj_names(items: &[ProjEntry], projection: &[SelectItem], ctx: &str) -> Result<(), GnitzSqlError> {
+    if is_wildcard_projection(projection) {
+        return Ok(());
+    }
+    let out_defs: Vec<ColumnDef> = items.iter().map(|e| e.out.def.clone()).collect();
+    reject_duplicate_column_names(&out_defs, ctx)
 }
 
 /// Expand a bare `*` item over `cols` (honoring `EXCEPT`/`EXCLUDE`/`RENAME`,
@@ -276,12 +327,14 @@ fn bind_join_select(
     ids: &mut ColIdGen,
     select: &Select,
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    let grouped = body_is_grouped(select);
+    let distinct = select.distinct.is_some();
     reject_unhonored_select_clauses(
         select,
         HonoredClauses {
             where_filter: true,
-            grouping: false,
-            distinct: false,
+            grouping: grouped && !distinct,
+            distinct,
         },
         "CREATE VIEW JOIN",
     )?;
@@ -332,13 +385,22 @@ fn bind_join_select(
         rel = RelExpr::filter(rel, preds);
     }
 
+    // DISTINCT / GROUP BY over a join: the operator sits above the join tree (the
+    // lowering cuts the join to a hidden segment). DISTINCT outranks grouped.
+    if distinct {
+        // Guarded by `lower_distinct` over the full output columns (see above).
+        let items = bind_join_projection(&select.projection, &scope, ids)?;
+        return Ok(RelExpr::distinct(RelExpr::project(rel, items)));
+    }
+    if grouped {
+        let leaf = JoinLeaf { scope: &scope };
+        return bind_grouped_suffix(ids, select, rel, &leaf);
+    }
+
     // Projection over the join output scope (column references + wildcard only,
     // matching `build_join_view_projection`).
     let items = bind_join_projection(&select.projection, &scope, ids)?;
-    if !is_wildcard_projection(&select.projection) {
-        let out_defs: Vec<ColumnDef> = items.iter().map(|e| e.out.def.clone()).collect();
-        reject_duplicate_column_names(&out_defs, "join view")?;
-    }
+    reject_dup_proj_names(&items, &select.projection, "join view")?;
     Ok(RelExpr::project(rel, items))
 }
 
@@ -499,4 +561,491 @@ fn bind_join_projection(
         });
     }
     Ok(items)
+}
+
+// ── GROUP BY / aggregate / HAVING binding ────────────────────────────────────────
+
+/// One collected aggregate over the grouped input: the logical func + arg
+/// (`ColId`), the raw reduce value column (`out`) and optional `COUNT_NON_NULL`
+/// companion, and the finalize (view) output type / nullability.
+struct GroupAgg {
+    func: AggFunc,
+    arg: Option<ColId>,
+    out: HirCol,
+    companion: Option<HirCol>,
+    view_type: TypeCode,
+    output_nullable: bool,
+}
+
+/// Peel `Nested` (parenthesis) wrappers off an expression.
+fn peel_nested(e: &Expr) -> &Expr {
+    let mut cur = e;
+    while let Expr::Nested(inner) = cur {
+        cur = inner;
+    }
+    cur
+}
+
+/// Extract the `ColId` of a bound bare column reference.
+fn col_of(e: HirExpr) -> Result<ColId, GnitzSqlError> {
+    match e {
+        BExpr::ColRef(HirRef::Col(id)) => Ok(id),
+        _ => Err(GnitzSqlError::Plan("internal: expected a column reference".into())),
+    }
+}
+
+/// Classify an aggregate function call into `(func, arg)` — mirroring
+/// `SingleTable::bind_function`'s argument-shape dispatch (COUNT(*) vs COUNT(x),
+/// SUM/MIN/MAX/AVG single-arg). Orderability/type validation happens later via
+/// `push_agg_specs`.
+fn agg_call(f: &Function) -> Result<(AggFunc, Option<&Expr>), GnitzSqlError> {
+    reject_unsupported_fn_qualifiers(f, "aggregates")?;
+    let base = single_fn_name(f).and_then(agg_func_from_name).ok_or_else(|| {
+        GnitzSqlError::Unsupported(format!(
+            "function '{}' not supported",
+            f.name.to_string().to_ascii_lowercase()
+        ))
+    })?;
+    match base {
+        AggFunc::Count => {
+            if let FunctionArguments::List(list) = &f.args {
+                if list.args.len() == 1 {
+                    match &list.args[0] {
+                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => return Ok((AggFunc::Count, None)),
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => {
+                            return Ok((AggFunc::CountNonNull, Some(inner)))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(GnitzSqlError::Unsupported("COUNT: unsupported argument form".into()))
+        }
+        AggFunc::Sum | AggFunc::Min | AggFunc::Max | AggFunc::Avg => {
+            if let FunctionArguments::List(list) = &f.args {
+                if list.args.len() == 1 {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) = &list.args[0] {
+                        return Ok((base, Some(inner)));
+                    }
+                }
+            }
+            Err(GnitzSqlError::Unsupported(format!(
+                "{base:?}: requires exactly one column argument"
+            )))
+        }
+        AggFunc::CountNonNull => unreachable!("agg_func_from_name never yields CountNonNull"),
+    }
+}
+
+/// The AVG / nullable-SUM / Direct finalize composite over the raw reduce output.
+fn finalize_agg_expr(ga: &GroupAgg) -> HirExpr {
+    let out = BExpr::ColRef(HirRef::Col(ga.out.id));
+    match (&ga.companion, ga.func) {
+        (Some(cnt), AggFunc::Avg) => {
+            // AVG = (sum * 1.0) / cnt — forces float division; div-by-zero → NULL.
+            let cnt = BExpr::ColRef(HirRef::Col(cnt.id));
+            BExpr::BinOp(
+                Box::new(BExpr::BinOp(Box::new(out), BinOp::Mul, Box::new(BExpr::LitFloat(1.0)))),
+                BinOp::Div,
+                Box::new(cnt),
+            )
+        }
+        (Some(cnt), _) => {
+            // Nullable SUM = sum / (cnt != 0) — an exact identity divisor while the
+            // non-null count is positive; div-by-zero → NULL when it hits zero.
+            let cnt = BExpr::ColRef(HirRef::Col(cnt.id));
+            BExpr::BinOp(
+                Box::new(out),
+                BinOp::Div,
+                Box::new(BExpr::BinOp(Box::new(cnt), BinOp::Ne, Box::new(BExpr::LitInt(0)))),
+            )
+        }
+        (None, _) => out,
+    }
+}
+
+/// Resolve GROUP BY columns to `ColId`s (bare/qualified refs only). A computed
+/// group column gives a GROUP-BY-context rejection (not the leaf's JOIN-ON message).
+fn resolve_group_cols<L: LeafBinder<HirRef>>(
+    select: &Select,
+    env: &[HirCol],
+    leaf: &L,
+) -> Result<Vec<ColId>, GnitzSqlError> {
+    let group_exprs = match &select.group_by {
+        GroupByExpr::Expressions(exprs, _) => exprs,
+        _ => {
+            return Err(GnitzSqlError::Unsupported(
+                "GROUP BY: only expression list supported".into(),
+            ))
+        }
+    };
+    let mut cols = Vec::new();
+    for ge in group_exprs {
+        if !matches!(peel_nested(ge), Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+            return Err(GnitzSqlError::Unsupported(
+                "GROUP BY: only simple column references supported".into(),
+            ));
+        }
+        let id = col_of(leaf.bind_column(ge)?)?;
+        let hc = col_by_id(env, id).expect("group col in env");
+        reject_float_key(&hc.def, "GROUP BY")?;
+        cols.push(id);
+    }
+    Ok(cols)
+}
+
+/// Collect the aggregate calls referenced in an expression, appending each not
+/// already present (deduped by `(func, arg)`). Recurses through non-aggregate
+/// operands, mirroring the binder's node set. Returns the `aggs` index of the
+/// aggregate the expression's own top level resolved to (`None` for anything
+/// else — a bare column ref, a buried aggregate, or no aggregate at all): the
+/// finalize projection consults this instead of re-parsing/re-binding a
+/// top-level aggregate call a second time.
+fn collect_aggs<L: LeafBinder<HirRef>>(
+    expr: &Expr,
+    env: &[HirCol],
+    env_defs: &[ColumnDef],
+    leaf: &L,
+    is_global: bool,
+    aggs: &mut Vec<GroupAgg>,
+    ids: &mut ColIdGen,
+) -> Result<Option<usize>, GnitzSqlError> {
+    let peeled = peel_nested(expr);
+    if let Expr::Function(f) = peeled {
+        if single_fn_name(f).and_then(agg_func_from_name).is_some() {
+            let (func, arg_expr) = agg_call(f)?;
+            let arg = match arg_expr {
+                Some(e) => Some(col_of(leaf.bind_column(e)?)?),
+                None => None,
+            };
+            // MIN/MAX orderability — checked here (Unsupported) so the message and
+            // error variant match the old leaf binder, ahead of `push_agg_specs`'s
+            // `Bind` backstop.
+            if matches!(func, AggFunc::Min | AggFunc::Max) {
+                if let Some(id) = arg {
+                    let ty = col_by_id(env, id).expect("agg arg in env").def.type_code;
+                    if !crate::types::is_min_max_orderable(ty) {
+                        return Err(GnitzSqlError::Unsupported(format!(
+                            "{}: not supported on {ty:?} columns",
+                            if func == AggFunc::Min { "MIN" } else { "MAX" }
+                        )));
+                    }
+                }
+            }
+            if let Some(idx) = aggs.iter().position(|a| a.func == func && a.arg == arg) {
+                return Ok(Some(idx));
+            }
+            let arg_pos = arg.map(|id| env.iter().position(|c| c.id == id).expect("agg arg ColId in env"));
+            let mut specs = Vec::new();
+            let shape = push_agg_specs(func, arg_pos, env_defs, &mut specs)?;
+            let raw_type = specs[0].out_type;
+            let view_type = agg_result_type(func, arg_pos, env_defs);
+            let output_nullable = match shape {
+                AggShape::Avg | AggShape::NullfillSum => true,
+                AggShape::Direct => {
+                    let arg_nullable = arg_pos.map(|p| env_defs[p].is_nullable).unwrap_or(false);
+                    direct_agg_nullable(func, arg_nullable, is_global)
+                }
+            };
+            // The raw reduce value column is a binding target (never wire-decoded),
+            // so it is non-nullable — matching the old virtual reduce schema.
+            let out = HirCol {
+                id: ids.next(),
+                def: ColumnDef::new("_agg", raw_type, false),
+            };
+            let companion = shape.has_count_companion().then(|| HirCol {
+                id: ids.next(),
+                def: ColumnDef::new("_cnt", TypeCode::I64, false),
+            });
+            aggs.push(GroupAgg {
+                func,
+                arg,
+                out,
+                companion,
+                view_type,
+                output_nullable,
+            });
+            return Ok(Some(aggs.len() - 1));
+        }
+    }
+    for op in crate::ast_util::expr_operands(peeled) {
+        let _ = collect_aggs(op, env, env_defs, leaf, is_global, aggs, ids)?;
+    }
+    Ok(None)
+}
+
+/// Bind the GROUP BY / aggregate / HAVING suffix over `input` (the `Filter?(source)`
+/// tree built by the FROM binder), producing `Project(Filter_having?(Reduce(input)))`.
+fn bind_grouped_suffix<L: LeafBinder<HirRef>>(
+    ids: &mut ColIdGen,
+    select: &Select,
+    input: Rc<RelExpr>,
+    leaf: &L,
+) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    let env = input.cols();
+    // The aggregate helpers need only the column defs — no physical schema (and
+    // no fabricated PK) is involved in typing an aggregate argument.
+    let env_defs: Vec<ColumnDef> = env.iter().map(|c| c.def.clone()).collect();
+
+    let group_cols = resolve_group_cols(select, &env, leaf)?;
+    let is_global = group_cols.is_empty();
+
+    // Aggregates from the projection ∪ HAVING (deduped). `item_agg[i]` is the
+    // `aggs` index a top-level projection item resolved to, when it is itself an
+    // aggregate call — reused by `bind_finalize_projection` so it doesn't re-parse
+    // and re-bind the same top-level call a second time.
+    let mut aggs: Vec<GroupAgg> = Vec::new();
+    let mut item_agg: Vec<Option<usize>> = Vec::with_capacity(select.projection.len());
+    for item in &select.projection {
+        let idx = match projection_item_expr(item) {
+            Some(expr) => collect_aggs(expr, &env, &env_defs, leaf, is_global, &mut aggs, ids)?,
+            None => None,
+        };
+        item_agg.push(idx);
+    }
+    if let Some(having) = &select.having {
+        let _ = collect_aggs(having, &env, &env_defs, leaf, is_global, &mut aggs, ids)?;
+    }
+
+    // Ground COUNT(*) companion — appended when no COUNT(*) is already present.
+    let ground = (!aggs.iter().any(|a| a.func == AggFunc::Count)).then(|| HirCol {
+        id: ids.next(),
+        def: ColumnDef::new("_ground", TypeCode::I64, false),
+    });
+
+    let hir_aggs: Vec<HirAgg> = aggs
+        .iter()
+        .map(|a| HirAgg {
+            func: a.func,
+            arg: a.arg,
+            out: a.out.clone(),
+            companion: a.companion.clone(),
+        })
+        .collect();
+    let reduce = RelExpr::reduce(input, group_cols.clone(), hir_aggs, ground);
+
+    // HAVING → a Filter over the raw reduce output.
+    let mut rel = reduce;
+    if let Some(having) = &select.having {
+        let grouped_leaf = GroupedLeaf {
+            leaf,
+            env: &env,
+            group_cols: &group_cols,
+            aggs: &aggs,
+        };
+        let hexpr = bind_structural(having, &grouped_leaf)?;
+        rel = RelExpr::filter(rel, vec![hexpr]);
+    }
+
+    // Finalize projection (strict grouped-projection validator).
+    // The dup-name guard fires in `lower_reduce` over the full output column list
+    // (the reduce PK region included), a strict superset of this projection.
+    let items = bind_finalize_projection(select, &env, &group_cols, &aggs, &item_agg, leaf, ids)?;
+    Ok(RelExpr::project(rel, items))
+}
+
+/// The finalize (SELECT) projection over the raw reduce output: every item is a
+/// bare group-col reference or an aggregate call (the strict validator).
+/// `item_agg[i]` is `bind_grouped_suffix`'s pre-resolved `aggs` index for a
+/// top-level aggregate item — the aggregate call itself is never re-parsed or
+/// re-bound here.
+fn bind_finalize_projection<L: LeafBinder<HirRef>>(
+    select: &Select,
+    env: &[HirCol],
+    group_cols: &[ColId],
+    aggs: &[GroupAgg],
+    item_agg: &[Option<usize>],
+    leaf: &L,
+    ids: &mut ColIdGen,
+) -> Result<Vec<ProjEntry>, GnitzSqlError> {
+    let mut items = Vec::new();
+    for (idx, item) in select.projection.iter().enumerate() {
+        let (expr, alias) = match item {
+            SelectItem::UnnamedExpr(e) => (e, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
+            _ => return Err(GnitzSqlError::Unsupported("GROUP BY: unsupported SELECT item".into())),
+        };
+        if let Some(agg_idx) = item_agg[idx] {
+            let ga = &aggs[agg_idx];
+            let prefix = match ga.func {
+                AggFunc::Count | AggFunc::CountNonNull => "_count",
+                AggFunc::Sum => "_sum",
+                AggFunc::Min => "_min",
+                AggFunc::Max => "_max",
+                AggFunc::Avg => "_avg",
+            };
+            let name = alias.unwrap_or_else(|| format!("{prefix}{idx}"));
+            items.push(ProjEntry {
+                expr: finalize_agg_expr(ga),
+                out: HirCol {
+                    id: ids.next(),
+                    def: ColumnDef::new(name, ga.view_type, ga.output_nullable),
+                },
+            });
+            continue;
+        }
+        let peeled = peel_nested(expr);
+        if matches!(peeled, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+            let id = col_of(leaf.bind_column(peeled)?)?;
+            if !group_cols.contains(&id) {
+                let name = col_by_id(env, id).map(|c| c.def.name.clone()).unwrap_or_default();
+                return Err(GnitzSqlError::Plan(format!(
+                    "column '{name}' must appear in GROUP BY or an aggregate function"
+                )));
+            }
+            let mut def = col_by_id(env, id).expect("group col in env").def.clone();
+            if let Some(a) = alias {
+                def.name = a;
+            }
+            items.push(ProjEntry {
+                expr: BExpr::ColRef(HirRef::Col(id)),
+                out: HirCol { id: ids.next(), def },
+            });
+            continue;
+        }
+        return Err(GnitzSqlError::Plan(
+            "GROUP BY SELECT: only column refs and aggregates supported".into(),
+        ));
+    }
+    Ok(items)
+}
+
+/// The leaf for HAVING over the grouped relation: group columns resolve to their
+/// source `ColId` (enforcing GROUP BY membership), aggregate calls to their
+/// finalize composite over the raw reduce output. Resolution routes through the
+/// original FROM leaf so `ColId`s match the collected aggregates and group cols.
+struct GroupedLeaf<'a, L: LeafBinder<HirRef>> {
+    leaf: &'a L,
+    env: &'a [HirCol],
+    group_cols: &'a [ColId],
+    aggs: &'a [GroupAgg],
+}
+
+impl<L: LeafBinder<HirRef>> GroupedLeaf<'_, L> {
+    fn resolve_group(&self, e: &Expr) -> Result<(ColId, bool), GnitzSqlError> {
+        // HAVING references the grouped relation by source name (matching the old
+        // `Having` binder's messages), enforcing GROUP BY membership.
+        let name = single_relation_col_name(e)
+            .ok_or_else(|| GnitzSqlError::Unsupported(format!("HAVING: unsupported column reference {e:?}")))?;
+        let idx = find_unique_column(self.env.iter().map(|c| &c.def), name)?
+            .ok_or_else(|| GnitzSqlError::Bind(format!("HAVING: column '{name}' not found")))?;
+        let hc = &self.env[idx];
+        if !self.group_cols.contains(&hc.id) {
+            return Err(GnitzSqlError::Bind(format!(
+                "HAVING: column '{name}' must appear in GROUP BY or an aggregate function"
+            )));
+        }
+        Ok((hc.id, hc.def.is_nullable))
+    }
+
+    fn find_agg(&self, f: &Function) -> Result<&GroupAgg, GnitzSqlError> {
+        let (func, arg_expr) = agg_call(f)?;
+        let arg = match arg_expr {
+            Some(e) => Some(col_of(self.leaf.bind_column(e)?)?),
+            None => None,
+        };
+        self.aggs
+            .iter()
+            .find(|a| a.func == func && a.arg == arg)
+            .ok_or_else(|| GnitzSqlError::Bind(format!("HAVING: aggregate {func:?} could not be resolved")))
+    }
+}
+
+impl<L: LeafBinder<HirRef>> LeafBinder<HirRef> for GroupedLeaf<'_, L> {
+    fn bind_column(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
+        let (id, _) = self.resolve_group(e)?;
+        Ok(BExpr::ColRef(HirRef::Col(id)))
+    }
+    fn bind_function(&self, f: &Function) -> Result<HirExpr, GnitzSqlError> {
+        if single_fn_name(f).and_then(agg_func_from_name).is_some() {
+            return Ok(finalize_agg_expr(self.find_agg(f)?));
+        }
+        self.leaf.bind_function(f)
+    }
+    fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<HirExpr, GnitzSqlError> {
+        let peeled = peel_nested(inner);
+        if let Expr::Function(f) = peeled {
+            if single_fn_name(f).and_then(agg_func_from_name).is_some() {
+                let ga = self.find_agg(f)?;
+                if let Some(cnt) = &ga.companion {
+                    // Nullable SUM / AVG: NULL ⇔ COUNT_NON_NULL companion is 0.
+                    let bop = if want_null { BinOp::Eq } else { BinOp::Ne };
+                    return Ok(BExpr::BinOp(
+                        Box::new(BExpr::ColRef(HirRef::Col(cnt.id))),
+                        bop,
+                        Box::new(BExpr::LitInt(0)),
+                    ));
+                }
+                return Ok(fold_null_test(ga.output_nullable, HirRef::Col(ga.out.id), want_null));
+            }
+        }
+        // A bare group-column reference; anything else (an arithmetic expression)
+        // gets the old aggregate-or-group-column rejection.
+        if single_relation_col_name(peeled).is_none() {
+            return Err(GnitzSqlError::Unsupported(
+                "HAVING: IS [NOT] NULL is only supported on an aggregate or a group column".into(),
+            ));
+        }
+        let (id, nullable) = self.resolve_group(peeled)?;
+        Ok(fold_null_test(nullable, HirRef::Col(id), want_null))
+    }
+}
+
+// ── Set-operation binding ────────────────────────────────────────────────────────
+
+/// Bind a set operation, binding both sides recursively; the `SetOp` constructor
+/// pairs columns positionally and promotes cross-width types.
+fn bind_set_op(
+    client: &mut GnitzClient,
+    binder: &mut Binder<'_>,
+    ids: &mut ColIdGen,
+    op: SetOperator,
+    quantifier: SetQuantifier,
+    left: &SetExpr,
+    right: &SetExpr,
+) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    match quantifier {
+        SetQuantifier::ByName | SetQuantifier::AllByName | SetQuantifier::DistinctByName => {
+            return Err(GnitzSqlError::Unsupported(
+                "BY NAME set operations are not supported".into(),
+            ))
+        }
+        _ => {}
+    }
+    let kind = match op {
+        SetOperator::Union => SetOpKind::Union,
+        SetOperator::Intersect => SetOpKind::Intersect,
+        SetOperator::Except => SetOpKind::Except,
+        _ => {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "set operation {op:?} not supported"
+            )))
+        }
+    };
+    let all = matches!(quantifier, SetQuantifier::All);
+    let left_rel = bind_set_side(client, binder, ids, left)?;
+    let right_rel = bind_set_side(client, binder, ids, right)?;
+    RelExpr::set_op(ids, kind, all, left_rel, right_rel)
+}
+
+/// Bind one set-operation side. A derived-table side is deferred (box 8) — rejected
+/// here with a clean message rather than the drifted resolution error.
+fn bind_set_side(
+    client: &mut GnitzClient,
+    binder: &mut Binder<'_>,
+    ids: &mut ColIdGen,
+    side: &SetExpr,
+) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    if let SetExpr::Select(s) = side {
+        for item in &s.from {
+            for tf in std::iter::once(&item.relation).chain(item.joins.iter().map(|j| &j.relation)) {
+                if matches!(tf, TableFactor::Derived { .. }) {
+                    return Err(GnitzSqlError::Unsupported(
+                        "set operation: a derived table set-op side is not supported".into(),
+                    ));
+                }
+            }
+        }
+    }
+    bind_body(client, binder, ids, side)
 }

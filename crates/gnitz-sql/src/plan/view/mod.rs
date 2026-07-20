@@ -15,7 +15,7 @@ mod group_by;
 pub(crate) mod join;
 pub(crate) mod predicates;
 mod scalar;
-mod set_op;
+pub(crate) mod set_op;
 pub(crate) mod simple;
 
 pub(crate) use dispatch::{cte_passthrough, execute_alter_view, execute_create_view};
@@ -35,6 +35,61 @@ use std::rc::Rc;
 /// Circuit + output columns + pk-list — the pieces every view emitter returns
 /// for a pre-allocated view id; the caller wraps them into a `PlannedView`.
 pub(crate) type EmitPieces = (Circuit, Vec<ColumnDef>, Vec<u32>);
+
+/// Structural check of every emitted circuit's exchange topology — the one
+/// backstop, since the engine hits `unreachable!` in `build_plan` on a violation
+/// rather than erroring cleanly. Phrased positionally: if any `Join` node is
+/// present every `ExchangeShard` must be sink-adjacent (the range-join output
+/// shard is the only exchange a join circuit carries, on the `shard→sink` tail);
+/// at most two `ExchangeShard`s (two only as parallel set-op sides); none
+/// downstream of another. Structural only — a wrong-*columns* cut still passes,
+/// so the weight pins are the real net.
+///
+/// One home, on the two paths every circuit reaches: `add_segment` (hidden
+/// segments) and `push_final` (the user-named view). No emitter has to remember
+/// to call it, and none can be added that escapes it.
+pub(crate) fn debug_assert_exchange_topology(circuit: &Circuit) {
+    let shards: Vec<gnitz_core::NodeId> = circuit
+        .nodes
+        .iter()
+        .filter(|(_, op)| matches!(op, gnitz_core::OpNode::ExchangeShard { .. }))
+        .map(|(id, _)| *id)
+        .collect();
+    debug_assert!(
+        shards.len() <= 2,
+        "view circuit has {} ExchangeShard nodes (max 2)",
+        shards.len()
+    );
+    let has_join = circuit
+        .nodes
+        .values()
+        .any(|op| matches!(op, gnitz_core::OpNode::Join(_)));
+    // A node's consumers (the nodes it feeds). `edges` maps (consumer, port) →
+    // producer, so a consumer of `src` is any key whose value is `src`.
+    let feeds = |src: gnitz_core::NodeId| -> Vec<&gnitz_core::OpNode> {
+        circuit
+            .edges
+            .iter()
+            .filter(|(_, producer)| **producer == src)
+            .filter_map(|((consumer, _port), _)| circuit.nodes.get(consumer))
+            .collect()
+    };
+    for &s in &shards {
+        // No shard directly downstream of another shard.
+        let downstream_shard = feeds(s)
+            .iter()
+            .any(|op| matches!(op, gnitz_core::OpNode::ExchangeShard { .. }));
+        debug_assert!(!downstream_shard, "an ExchangeShard feeds another ExchangeShard");
+        if has_join {
+            // In a join circuit every shard must be sink-adjacent (the range-join
+            // output `shard→sink` tail).
+            let sink_adjacent = feeds(s)
+                .iter()
+                .any(|op| matches!(op, gnitz_core::OpNode::IntegrateSink));
+            debug_assert!(sink_adjacent, "a Join circuit has a non-sink-adjacent ExchangeShard");
+        }
+    }
+}
 
 /// A `Schema` from emitted pieces: the output columns plus the pk-list (the
 /// leading `k` slots, widened from the wire's `u32` indices).
@@ -108,6 +163,7 @@ impl ViewChain {
     ) -> Result<(u64, Rc<Schema>), GnitzSqlError> {
         let vid = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
         let (circuit, cols, pk) = emit(client, self, vid)?;
+        debug_assert_exchange_topology(&circuit);
         let schema = schema_of(&cols, &pk);
         self.push_hidden(client, cols, pk, circuit)?;
         Ok((vid, schema))

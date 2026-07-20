@@ -75,7 +75,7 @@ pub(crate) struct AggSpec {
 /// (`gnitz_wire::agg_output_type`). AVG is planner-lowered (SUM/COUNT + a
 /// finalize divide) before the wire and always produces F64. A source-less
 /// aggregate (COUNT) passes I64, which the rule maps to its own default arms.
-pub(crate) fn agg_result_type(func: AggFunc, src_col: Option<usize>, schema: &Schema) -> TypeCode {
+pub(crate) fn agg_result_type(func: AggFunc, src_col: Option<usize>, cols: &[ColumnDef]) -> TypeCode {
     let wire_func = match func {
         AggFunc::Avg => return TypeCode::F64,
         AggFunc::Count => gnitz_core::AggFunc::Count,
@@ -85,7 +85,7 @@ pub(crate) fn agg_result_type(func: AggFunc, src_col: Option<usize>, schema: &Sc
         AggFunc::Max => gnitz_core::AggFunc::Max,
     };
     let src_tc = match src_col {
-        Some(c) => schema.columns[c].type_code as u8,
+        Some(c) => cols[c].type_code as u8,
         None => TypeCode::I64 as u8,
     };
     TypeCode::from_validated_u8(gnitz_core::agg_output_type(wire_func, src_tc))
@@ -107,11 +107,14 @@ pub(crate) fn agg_result_type(func: AggFunc, src_col: Option<usize>, schema: &Sc
 ///
 /// Mirrors `emit.rs`'s null-bit rule (`is_untouched() && !empty_renders_zero()`).
 /// AVG is never `Direct` (it always carries a COUNT_NON_NULL companion).
-fn direct_agg_nullable(agg_func: AggFunc, arg_col: Option<usize>, is_global: bool, schema: &Schema) -> bool {
+/// `arg_nullable` is the aggregate argument column's nullability (irrelevant, so
+/// pass `false`, for COUNT and SUM — only MIN/MAX consult it). Shared by the
+/// old view/ad-hoc mapping construction and the HIR reduce bind.
+pub(crate) fn direct_agg_nullable(agg_func: AggFunc, arg_nullable: bool, is_global: bool) -> bool {
     match agg_func {
         AggFunc::Count | AggFunc::CountNonNull => false,
         AggFunc::Sum => is_global,
-        AggFunc::Min | AggFunc::Max => is_global || schema.columns[arg_col.unwrap()].is_nullable,
+        AggFunc::Min | AggFunc::Max => is_global || arg_nullable,
         AggFunc::Avg => unreachable!("AVG is never AggShape::Direct"),
     }
 }
@@ -234,6 +237,173 @@ pub(crate) fn synthetic_fold_cols(
     cols
 }
 
+/// A reduce's physical shape: what it groups by, what it aggregates, and the two
+/// derived facts every downstream decision reads — the output-key kind and
+/// whether the group set is empty (a global aggregate). Constructed once per
+/// reduce and shared by the layout (`reduce_output_schema`) and the emission
+/// (`emit_reduce`), so the two cannot disagree about the shape they describe.
+pub(crate) struct ReduceShape<'a> {
+    pub(crate) source_schema: &'a Schema,
+    pub(crate) group_cols: &'a [usize],
+    pub(crate) specs: &'a [AggSpec],
+    /// `source_schema.reduce_out_key(group_cols)` — derived, never passed in.
+    pub(crate) out_key: ReduceOutKey,
+    /// An empty group set: the ungrouped global aggregate that grounds to one row.
+    pub(crate) global_ground: bool,
+    pub(crate) source_replicated: bool,
+}
+
+impl<'a> ReduceShape<'a> {
+    pub(crate) fn new(
+        source_schema: &'a Schema,
+        group_cols: &'a [usize],
+        specs: &'a [AggSpec],
+        source_replicated: bool,
+    ) -> Self {
+        ReduceShape {
+            out_key: source_schema.reduce_out_key(group_cols),
+            global_ground: group_cols.is_empty(),
+            source_schema,
+            group_cols,
+            specs,
+            source_replicated,
+        }
+    }
+}
+
+/// The reduce output schema for a group set, mirroring the engine's
+/// `build_reduce_output_schema` (which lays out from the same `out_key`), plus
+/// the offset of the first aggregate column. The aggregate columns trail the PK
+/// region — plus, on the synthetic path only, the group cols carried as payload
+/// — at the output type `push_agg_specs` computed per spec (float SUM/MIN/MAX →
+/// F64, MIN/MAX preserve the source type, SUM/COUNT* → I64), so the planner's
+/// virtual reduce schema matches the compiler's physical reduce output with no
+/// per-op reconstruction. One home for the view path and the HIR reduce shell.
+pub(crate) fn reduce_output_schema(sh: &ReduceShape<'_>) -> (Schema, usize) {
+    let (source_schema, agg_specs) = (sh.source_schema, sh.specs);
+    let (columns, pk_cols) = match sh.out_key {
+        ReduceOutKey::PkPermutation => {
+            let mut cols: Vec<ColumnDef> = source_schema
+                .pk_cols
+                .iter()
+                .map(|&pi| source_schema.columns[pi].clone())
+                .collect();
+            let pk: Vec<usize> = (0..cols.len()).collect();
+            cols.extend(agg_specs.iter().map(|s| ColumnDef::new("_agg", s.out_type, false)));
+            (cols, pk)
+        }
+        ReduceOutKey::SingleNaturalCol => {
+            let mut cols = vec![source_schema.columns[sh.group_cols[0]].clone()];
+            cols.extend(agg_specs.iter().map(|s| ColumnDef::new("_agg", s.out_type, false)));
+            (cols, vec![0])
+        }
+        // The shared SyntheticFold layout (also the ad-hoc partial schema).
+        ReduceOutKey::SyntheticFold => (
+            synthetic_fold_cols(source_schema, sh.group_cols, agg_specs, false),
+            vec![0],
+        ),
+    };
+    let agg_col_offset = columns.len() - agg_specs.len();
+    (Schema { columns, pk_cols }, agg_col_offset)
+}
+
+/// Emit the reduce operator(s) for a group set — the two-phase / replicated /
+/// sharded strategy selection. One home for the view path and the HIR reduce
+/// shell; `filtered` is the (already WHERE-filtered) input node.
+///
+/// For `PkPermutation`, shard/reindex the reduce by the group columns in
+/// source-PK (schema) order, not the user's GROUP BY order. The groups are
+/// identical under any permutation of the PK (each group is a PK singleton),
+/// and `build_reduce_output_schema` emits the output PK in source-PK order
+/// regardless — so this only normalizes the shard key. Without it a permuted
+/// grouping (e.g. `GROUP BY pk1, pk0`) shards by a non-PK-order key: the
+/// co-partition analyzer (correctly) declines to skip the exchange, the shuffle
+/// hash-routes by `[pk1, pk0]`, and the reduce output lands partitioned by
+/// `hash(pk1, pk0)` rather than by the view's declared PK `(pk0, pk1)` — so the
+/// multi-worker gather drops the rows that hashed to a different worker.
+/// Sharding in PK order keeps the reduce co-partitioned with the source (the
+/// exchange is skipped, or routes by `partition_for_pk_bytes`), so the view
+/// stays partitioned by its real PK. The other kinds keep the user order: their
+/// synthetic/single-natural PK and reduce layout depend on it
+/// (`group_col_reduce_pos`'s synthetic arm indexes by GROUP BY order).
+pub(crate) fn emit_reduce(
+    cb: &mut gnitz_core::CircuitBuilder,
+    filtered: gnitz_core::NodeId,
+    sh: &ReduceShape<'_>,
+) -> gnitz_core::NodeId {
+    let agg_specs = sh.specs;
+    let reduce_group_cols: Vec<usize> = if sh.out_key == ReduceOutKey::PkPermutation {
+        sh.source_schema.pk_cols.clone()
+    } else {
+        sh.group_cols.to_vec()
+    };
+    // The circuit builder needs only (op, col) per spec; out_type is the
+    // planner's concern and already shaped the reduce schema above.
+    let circuit_specs: Vec<(u64, usize)> = agg_specs.iter().map(|s| (s.op.as_u64(), s.col)).collect();
+    let all_linear = agg_specs
+        .iter()
+        .all(|s| matches!(s.op, WireAggFunc::Count | WireAggFunc::Sum | WireAggFunc::CountNonNull));
+    // Two-phase (distributable) path for an all-linear, integer, partitioned GLOBAL
+    // aggregate: fold a per-worker partial locally (no exchange), then exchange only
+    // the ≤ N partials to V₀'s owner and combine them. A linear aggregate satisfies
+    // Agg(A+B)=Agg(A)+Agg(B), so this replaces the single-worker full-delta funnel.
+    // Float SUM (and AVG over a float, whose SUM component is float) is excluded:
+    // IEEE-754 addition is non-associative, so summing per-worker partials would make
+    // the result depend on the worker count — those keep the deterministic funnel.
+    // `two_phase ⊆ global_ground`: it is the distributable refinement of the
+    // ungrouped (empty group set) case, so it reuses that predicate.
+    let two_phase = sh.global_ground
+        && !sh.source_replicated
+        && all_linear
+        && !agg_specs
+            .iter()
+            .any(|s| s.op == WireAggFunc::Sum && s.out_type.is_float());
+    if two_phase {
+        // Phase 1 — per-worker local partial. No ExchangeShard, global_ground = false
+        // (a worker with no local rows contributes no partial, never a ground row).
+        // Output: [_group_pk:U128 (col 0, PK), agg0 (col 1), agg1 (col 2), ...].
+        let local = cb.reduce_multi_local(filtered, &[], &circuit_specs, false, ReduceOutKey::SyntheticFold);
+        // Phase 2 (exchange) + Phase 3 (combine). reduce_multi inserts the single
+        // ExchangeShard(∅) routing every partial (all at PK V₀) to V₀'s owner, then
+        // the combine reduce sums each partial column: a COUNT/COUNT_NON_NULL partial
+        // sums with SumZero (Sum fold, 0 ground — a COUNT's empty value is 0, not
+        // NULL), a SUM partial with plain Sum (NULL ground). The user aggregate
+        // columns land at the same positions as the funnel reduce's, so the post-map
+        // is unchanged; the trailing COUNT-of-partials is the existence gate (the
+        // reduce's cardinality gate finds it via the lone AggOp::Count). global_ground
+        // = true: an empty global source emits exactly one ground row here.
+        // Merge each partial with the shared per-op combine rule
+        // (`AggFunc::merge_func` — the same rule the ad-hoc client combiner
+        // applies). Local output column `1 + i` holds local agg `i` (col 0 is
+        // _group_pk).
+        let mut combine_specs: Vec<(u64, usize)> = agg_specs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.op.merge_func().as_u64(), 1 + i))
+            .collect();
+        combine_specs.push((WireAggFunc::Count.as_u64(), 0)); // COUNT-of-partials existence gate
+        cb.reduce_multi(local, &[], &combine_specs, true, ReduceOutKey::SyntheticFold)
+    } else if sh.source_replicated {
+        // Shard-free: every worker reduces its full local copy to the same global
+        // aggregate (no ExchangeShard ⇒ no gather barrier, no N-fold sum).
+        cb.reduce_multi_local(
+            filtered,
+            &reduce_group_cols,
+            &circuit_specs,
+            sh.global_ground,
+            sh.out_key,
+        )
+    } else {
+        cb.reduce_multi(
+            filtered,
+            &reduce_group_cols,
+            &circuit_specs,
+            sh.global_ground,
+            sh.out_key,
+        )
+    }
+}
+
 /// The physical source column of a bound aggregate argument: `None` for
 /// COUNT(*), the column index for a plain (possibly qualified) reference. A
 /// computed argument (`SUM(a + b)`) is rejected — the engine aggregates a
@@ -259,7 +429,7 @@ pub(crate) fn agg_arg_col(arg: Option<&BoundExpr>) -> Result<Option<usize>, Gnit
 pub(crate) fn push_agg_specs(
     agg_func: AggFunc,
     arg_col: Option<usize>,
-    schema: &Schema,
+    cols: &[ColumnDef],
     agg_specs: &mut Vec<AggSpec>,
 ) -> Result<AggShape, GnitzSqlError> {
     // Every aggregate except COUNT(*) needs a column argument, which the specs
@@ -276,13 +446,13 @@ pub(crate) fn push_agg_specs(
     // call through the leaf binder, which already rejects unorderable MIN/MAX —
     // that arm here is the backstop; the SUM/AVG arm is the sole gate.
     if let Some(c) = arg_col {
-        let tc = schema.columns[c].type_code;
+        let tc = cols[c].type_code;
         match agg_func {
             AggFunc::Sum | AggFunc::Avg => {
                 if !(is_integer_type(tc) || tc.is_float()) || tc.is_wide_int() {
                     return Err(GnitzSqlError::Bind(format!(
                         "{agg_func:?} is not supported on column type {tc:?} ('{}')",
-                        schema.columns[c].name,
+                        cols[c].name,
                     )));
                 }
             }
@@ -290,7 +460,7 @@ pub(crate) fn push_agg_specs(
                 if !is_min_max_orderable(tc) {
                     return Err(GnitzSqlError::Bind(format!(
                         "{agg_func:?} is not supported on column type {tc:?} ('{}')",
-                        schema.columns[c].name,
+                        cols[c].name,
                     )));
                 }
             }
@@ -301,7 +471,7 @@ pub(crate) fn push_agg_specs(
     // over its own (op, source column) — the typed `op` IS the wire selector,
     // so no parallel planner-enum representation rides along.
     let mut push = |op: WireAggFunc, col: usize| {
-        let src_tc = schema.columns[col].type_code as u8;
+        let src_tc = cols[col].type_code as u8;
         agg_specs.push(AggSpec {
             op,
             col,
@@ -330,7 +500,7 @@ pub(crate) fn push_agg_specs(
             // SUM on it — distinguishing SUM({5,-5})=0 from SUM({NULL})=NULL. A
             // non-nullable source can never be NULL on a surviving group, so it
             // keeps its plain single-spec copy.
-            if schema.columns[c].is_nullable {
+            if cols[c].is_nullable {
                 push(WireAggFunc::CountNonNull, c);
                 AggShape::NullfillSum
             } else {
@@ -369,15 +539,18 @@ pub(crate) fn append_agg_mapping(
     agg_specs: &mut Vec<AggSpec>,
     agg_mappings: &mut Vec<AggMapping>,
 ) -> Result<(), GnitzSqlError> {
-    let out_type = agg_result_type(agg_func, arg_col, source_schema);
+    let out_type = agg_result_type(agg_func, arg_col, &source_schema.columns);
     let start = agg_specs.len();
-    let shape = push_agg_specs(agg_func, arg_col, source_schema, agg_specs)?;
+    let shape = push_agg_specs(agg_func, arg_col, &source_schema.columns, agg_specs)?;
     let output_nullable = match shape {
         // AVG's and nullable-SUM's null-ness lives in the COUNT_NON_NULL
         // companion (the finalize renders NULL via div-by-zero), so their
         // outputs keep the blanket nullable mark.
         AggShape::Avg | AggShape::NullfillSum => true,
-        AggShape::Direct => direct_agg_nullable(agg_func, arg_col, is_global, source_schema),
+        AggShape::Direct => {
+            let arg_nullable = arg_col.map(|c| source_schema.columns[c].is_nullable).unwrap_or(false);
+            direct_agg_nullable(agg_func, arg_nullable, is_global)
+        }
     };
     agg_mappings.push(AggMapping {
         specs_start: start,
@@ -412,7 +585,7 @@ mod tests {
 
     fn try_push(func: AggFunc, arg_col: Option<usize>) -> Result<AggShape, GnitzSqlError> {
         let mut specs = Vec::new();
-        push_agg_specs(func, arg_col, &schema(), &mut specs)
+        push_agg_specs(func, arg_col, &schema().columns, &mut specs)
     }
 
     #[test]
@@ -448,11 +621,12 @@ mod tests {
             ],
             pk_cols: vec![0],
         };
-        assert_eq!(agg_result_type(AggFunc::Sum, Some(1), &s), TypeCode::U64); // SUM(u64) → U64
-        assert_eq!(agg_result_type(AggFunc::Sum, Some(2), &s), TypeCode::I64); // SUM(u32) → I64
-        assert_eq!(agg_result_type(AggFunc::Sum, Some(3), &s), TypeCode::I64); // SUM(i64) → I64
-        assert_eq!(agg_result_type(AggFunc::Sum, Some(4), &s), TypeCode::F64); // SUM(f64) → F64
-        assert_eq!(agg_result_type(AggFunc::Min, Some(1), &s), TypeCode::U64); // MIN(u64) preserved
+        assert_eq!(agg_result_type(AggFunc::Sum, Some(1), &s.columns), TypeCode::U64); // SUM(u64) → U64
+        assert_eq!(agg_result_type(AggFunc::Sum, Some(2), &s.columns), TypeCode::I64); // SUM(u32) → I64
+        assert_eq!(agg_result_type(AggFunc::Sum, Some(3), &s.columns), TypeCode::I64); // SUM(i64) → I64
+        assert_eq!(agg_result_type(AggFunc::Sum, Some(4), &s.columns), TypeCode::F64); // SUM(f64) → F64
+        assert_eq!(agg_result_type(AggFunc::Min, Some(1), &s.columns), TypeCode::U64);
+        // MIN(u64) preserved
     }
 
     // The Direct-aggregate nullability decision shared by the SELECT projection
@@ -460,21 +634,20 @@ mod tests {
     // (`pk`, U64) is non-nullable; col 1 (`n`, I64) is nullable.
     #[test]
     fn direct_agg_nullable_matches_emit_semantics() {
-        let s = schema();
         // COUNT / COUNT_NON_NULL: always a concrete integer, grouped or global.
-        assert!(!direct_agg_nullable(AggFunc::Count, None, false, &s));
-        assert!(!direct_agg_nullable(AggFunc::Count, None, true, &s));
-        assert!(!direct_agg_nullable(AggFunc::CountNonNull, Some(1), false, &s));
-        assert!(!direct_agg_nullable(AggFunc::CountNonNull, Some(1), true, &s));
+        assert!(!direct_agg_nullable(AggFunc::Count, false, false));
+        assert!(!direct_agg_nullable(AggFunc::Count, false, true));
+        assert!(!direct_agg_nullable(AggFunc::CountNonNull, true, false));
+        assert!(!direct_agg_nullable(AggFunc::CountNonNull, true, true));
         // Direct SUM (only reached for a non-nullable source): NULL only globally,
         // where an empty source seeds a NULL ground row. Grouped never renders NULL.
-        assert!(!direct_agg_nullable(AggFunc::Sum, Some(0), false, &s));
-        assert!(direct_agg_nullable(AggFunc::Sum, Some(0), true, &s));
+        assert!(!direct_agg_nullable(AggFunc::Sum, false, false));
+        assert!(direct_agg_nullable(AggFunc::Sum, false, true));
         // MIN / MAX: NULL globally (ground row), or grouped over a nullable source
         // (all-NULL group). Grouped over a non-nullable source never renders NULL.
-        assert!(!direct_agg_nullable(AggFunc::Min, Some(0), false, &s)); // grouped, non-nullable pk
-        assert!(direct_agg_nullable(AggFunc::Min, Some(1), false, &s)); // grouped, nullable n
-        assert!(direct_agg_nullable(AggFunc::Max, Some(0), true, &s)); // global, non-nullable pk
-        assert!(direct_agg_nullable(AggFunc::Max, Some(1), false, &s)); // grouped, nullable n
+        assert!(!direct_agg_nullable(AggFunc::Min, false, false)); // grouped, non-nullable pk
+        assert!(direct_agg_nullable(AggFunc::Min, true, false)); // grouped, nullable n
+        assert!(direct_agg_nullable(AggFunc::Max, false, true)); // global, non-nullable pk
+        assert!(direct_agg_nullable(AggFunc::Max, true, false)); // grouped, nullable n
     }
 }

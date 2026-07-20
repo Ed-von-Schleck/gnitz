@@ -248,8 +248,14 @@ class TestTwoViewsJoin:
 
 # ── same-source INTERSECT / EXCEPT: rejected (Part 1a) ─────────────────────
 
-class TestSameSourceSetOpRejected:
-    def test_same_table_except_rejected(self, client):
+class TestSameSourceSetOpAccepted:
+    """The old same-relation INTERSECT/EXCEPT rejection is replaced by the uniform
+    pass-through wrapper (the same device the join planner uses): the right branch
+    is wrapped in a distinct segment, so one user push becomes two cascade epochs
+    and the ν-difference converges. These formerly-rejected shapes now compile and
+    maintain correct weights under insert *and* delete."""
+
+    def test_same_table_except_accepted_and_correct(self, client):
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -257,15 +263,33 @@ class TestSameSourceSetOpRejected:
                 "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, c BIGINT NOT NULL)",
                 schema_name=sn,
             )
-            with pytest.raises(gnitz.GnitzError):
-                client.execute_sql(
-                    "CREATE VIEW v AS SELECT c FROM t WHERE c > 0 EXCEPT SELECT c FROM t WHERE c < 10",
-                    schema_name=sn,
-                )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT c FROM t WHERE c > 0 EXCEPT SELECT c FROM t WHERE c < 10",
+                schema_name=sn,
+            )
+            vid = _vid(client, sn, "v")
+            t_state = {}
+
+            def check(ctx):
+                left = oracle.oracle_filter_project(
+                    {pk: r for pk, r in t_state.items() if r["c"] > 0}, where=None, project=["c"])
+                right = oracle.oracle_filter_project(
+                    {pk: r for pk, r in t_state.items() if r["c"] < 10}, where=None, project=["c"])
+                exp = oracle.oracle_setop("EXCEPT", left, right)
+                oracle.assert_view_matches(client, vid, ["c"], exp, ctx=ctx)
+
+            client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 15), (3, 8)", schema_name=sn)
+            oracle.apply_insert(t_state, "id", [
+                {"id": 1, "c": 5}, {"id": 2, "c": 15}, {"id": 3, "c": 8}])
+            check("after-insert")
+
+            client.execute_sql("DELETE FROM t WHERE id = 2", schema_name=sn)
+            oracle.apply_delete(t_state, "id", [2])
+            check("after-delete")
         finally:
             _cleanup(client, sn, tables=["t"], views=["v"])
 
-    def test_same_table_intersect_rejected(self, client):
+    def test_same_table_intersect_accepted_and_correct(self, client):
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -273,16 +297,34 @@ class TestSameSourceSetOpRejected:
                 "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, c BIGINT NOT NULL)",
                 schema_name=sn,
             )
-            with pytest.raises(gnitz.GnitzError):
-                client.execute_sql(
-                    "CREATE VIEW v AS SELECT c FROM t WHERE c > 0 INTERSECT SELECT c FROM t WHERE c < 10",
-                    schema_name=sn,
-                )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT c FROM t WHERE c > 0 INTERSECT SELECT c FROM t WHERE c < 10",
+                schema_name=sn,
+            )
+            vid = _vid(client, sn, "v")
+            t_state = {}
+
+            def check(ctx):
+                left = oracle.oracle_filter_project(
+                    {pk: r for pk, r in t_state.items() if r["c"] > 0}, where=None, project=["c"])
+                right = oracle.oracle_filter_project(
+                    {pk: r for pk, r in t_state.items() if r["c"] < 10}, where=None, project=["c"])
+                exp = oracle.oracle_setop("INTERSECT", left, right)
+                oracle.assert_view_matches(client, vid, ["c"], exp, ctx=ctx)
+
+            client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 15), (3, 8)", schema_name=sn)
+            oracle.apply_insert(t_state, "id", [
+                {"id": 1, "c": 5}, {"id": 2, "c": 15}, {"id": 3, "c": 8}])
+            check("after-insert")
+
+            client.execute_sql("DELETE FROM t WHERE id = 3", schema_name=sn)
+            oracle.apply_delete(t_state, "id", [3])
+            check("after-delete")
         finally:
             _cleanup(client, sn, tables=["t"], views=["v"])
 
-    def test_same_view_except_rejected(self, client):
-        """Both branches FROM the same view → same source id → rejected."""
+    def test_same_view_except_accepted_and_correct(self, client):
+        """Both branches FROM the same view → same source id → wrapped, not rejected."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -291,15 +333,21 @@ class TestSameSourceSetOpRejected:
                 schema_name=sn,
             )
             client.execute_sql("CREATE VIEW vt AS SELECT id, c FROM t WHERE c > 0", schema_name=sn)
-            with pytest.raises(gnitz.GnitzError):
-                client.execute_sql(
-                    "CREATE VIEW v AS SELECT c FROM vt EXCEPT SELECT c FROM vt",
-                    schema_name=sn,
-                )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT c FROM vt EXCEPT SELECT c FROM vt",
+                schema_name=sn,
+            )
+            vid = _vid(client, sn, "v")
+
+            client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 15)", schema_name=sn)
+            # A EXCEPT A is always empty.
+            oracle.assert_view_matches(client, vid, ["c"], {}, ctx="after-insert")
+            client.execute_sql("DELETE FROM t WHERE id = 1", schema_name=sn)
+            oracle.assert_view_matches(client, vid, ["c"], {}, ctx="after-delete")
         finally:
             _cleanup(client, sn, tables=["t"], views=["v", "vt"])
 
-    def test_same_view_intersect_rejected(self, client):
+    def test_same_view_intersect_accepted_and_correct(self, client):
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -308,11 +356,26 @@ class TestSameSourceSetOpRejected:
                 schema_name=sn,
             )
             client.execute_sql("CREATE VIEW vt AS SELECT id, c FROM t WHERE c > 0", schema_name=sn)
-            with pytest.raises(gnitz.GnitzError):
-                client.execute_sql(
-                    "CREATE VIEW v AS SELECT c FROM vt INTERSECT SELECT c FROM vt",
-                    schema_name=sn,
-                )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT c FROM vt INTERSECT SELECT c FROM vt",
+                schema_name=sn,
+            )
+            vid = _vid(client, sn, "v")
+            t_state = {}
+
+            def check(ctx):
+                side = oracle.oracle_filter_project(
+                    {pk: r for pk, r in t_state.items() if r["c"] > 0}, where=None, project=["c"])
+                # A INTERSECT A = distinct(A).
+                exp = oracle.oracle_setop("INTERSECT", side, side)
+                oracle.assert_view_matches(client, vid, ["c"], exp, ctx=ctx)
+
+            client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 15)", schema_name=sn)
+            oracle.apply_insert(t_state, "id", [{"id": 1, "c": 5}, {"id": 2, "c": 15}])
+            check("after-insert")
+            client.execute_sql("DELETE FROM t WHERE id = 1", schema_name=sn)
+            oracle.apply_delete(t_state, "id", [1])
+            check("after-delete")
         finally:
             _cleanup(client, sn, tables=["t"], views=["v", "vt"])
 

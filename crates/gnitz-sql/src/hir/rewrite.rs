@@ -12,18 +12,38 @@ use crate::ir::{BExpr, BinOp};
 use crate::plan::view::join::JoinType;
 use crate::plan::view::predicates::{converse_rel, validate_join_key_pair, validate_range_join_key_pair};
 use gnitz_core::{ColumnDef, RangeRel};
+use std::collections::HashMap;
 use std::rc::Rc;
 
-/// Classify every join's predicates and place the WHERE. The tree is
-/// `Project(Filter?(source))` (bind always appends a Project); a join-free
-/// (linear) tree is returned untouched.
+/// Classify every join's predicates and place the WHERE, recursing through the
+/// whole tree so a Join buried under a `Reduce`/`Distinct`/`SetOp` (GROUP BY over
+/// a join, set-op side that is a join, …) is classified too — else its
+/// `classified` stays `None` and lowering panics. A join-free (linear) tree is
+/// rebuilt unchanged.
+///
+/// Memoized by `Rc::as_ptr`, so a subtree referenced from two places stays **one**
+/// shared node through the rewrite. That identity is what the lowering's
+/// `Rc::as_ptr`-keyed cut memo reads to emit a shared subtree as a single hidden
+/// segment; a naive rebuild would split it into two.
 pub(crate) fn classify(rel: Rc<RelExpr>) -> Result<Rc<RelExpr>, GnitzSqlError> {
-    let RelExpr::Project { input, items } = rel.as_ref() else {
-        return Ok(rel);
-    };
-    let new_input = match input.as_ref() {
-        RelExpr::Filter { input: fin, preds } if matches!(fin.as_ref(), RelExpr::Join { .. }) => {
-            let mut join = classify_rel(Rc::clone(fin))?;
+    classify_rel(rel, &mut RewriteMemo::new())
+}
+
+/// The per-pass `Rc` identity memo: original node pointer → rewritten node.
+type RewriteMemo = HashMap<*const RelExpr, Rc<RelExpr>>;
+
+/// Rebuild the spine: classify every buried `Join`, and fold each WHERE `Filter`
+/// directly above a Join into its residual (INNER) or keep it as a post-null-fill
+/// filter (OUTER) — matching `classify_join_where`. Every other node delegates its
+/// reassembly to the generic `RelExpr::map_children`.
+fn classify_rel(rel: Rc<RelExpr>, memo: &mut RewriteMemo) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    let key = Rc::as_ptr(&rel);
+    if let Some(done) = memo.get(&key) {
+        return Ok(Rc::clone(done));
+    }
+    let out = match rel.as_ref() {
+        RelExpr::Filter { input, preds } if matches!(input.as_ref(), RelExpr::Join { .. }) => {
+            let mut join = classify_join(input, memo)?;
             if matches!(
                 join.as_ref(),
                 RelExpr::Join {
@@ -31,39 +51,41 @@ pub(crate) fn classify(rel: Rc<RelExpr>) -> Result<Rc<RelExpr>, GnitzSqlError> {
                     ..
                 }
             ) {
-                // INNER: `ON p WHERE q ≡ ON (p AND q)` — fold the WHERE into the top
-                // join's residual and drop the Filter (matching `classify_join_where`).
-                // `classify_rel` returns a freshly allocated Join, so mutate in place.
+                // INNER: `ON p WHERE q ≡ ON (p AND q)` — fold WHERE into the residual.
+                // `classify_join` returns a fresh Join, so mutate in place.
                 let RelExpr::Join { classified, .. } =
-                    Rc::get_mut(&mut join).expect("classify_rel returns a fresh Join")
+                    Rc::get_mut(&mut join).expect("classify_join returns a fresh Join")
                 else {
                     unreachable!()
                 };
-                let class = classified.as_mut().expect("classified before fold");
-                class.residual.extend(preds.iter().cloned());
+                classified
+                    .as_mut()
+                    .expect("classified before fold")
+                    .residual
+                    .extend(preds.iter().cloned());
+                join
             } else {
                 // OUTER: the WHERE is a 3VL filter over the post-null-fill output.
-                join = RelExpr::filter(join, preds.clone());
+                RelExpr::filter(join, preds.clone())
             }
-            join
         }
-        RelExpr::Join { .. } => classify_rel(Rc::clone(input))?,
-        _ => return Ok(rel), // linear tree — nothing to classify
+        RelExpr::Join { .. } => classify_join(&rel, memo)?,
+        _ => RelExpr::map_children(&rel, &mut |child| classify_rel(Rc::clone(child), memo))?,
     };
-    Ok(RelExpr::project(new_input, items.clone()))
+    memo.insert(key, Rc::clone(&out));
+    Ok(out)
 }
 
-/// Recursively classify a join subtree (fill each `Join.classified` from its ON).
-/// Join inputs are `Get`s or nested `Join`s.
-fn classify_rel(rel: Rc<RelExpr>) -> Result<Rc<RelExpr>, GnitzSqlError> {
+/// Classify one `Join` node (fill `classified` from its ON, recursing children).
+fn classify_join(rel: &Rc<RelExpr>, memo: &mut RewriteMemo) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let RelExpr::Join {
         left, right, kind, on, ..
     } = rel.as_ref()
     else {
-        return Ok(rel); // a Get (or a cut segment's Get) — leaf
+        unreachable!("classify_join receives a Join");
     };
-    let new_left = classify_rel(Rc::clone(left))?;
-    let new_right = classify_rel(Rc::clone(right))?;
+    let new_left = classify_rel(Rc::clone(left), memo)?;
+    let new_right = classify_rel(Rc::clone(right), memo)?;
     let class = classify_on(on, &left.cols(), &right.cols())?;
     // Outer + residual is unsupported: an outer preserved-side row's null-fill
     // decides match existence independently of the residual (matching emit_join).

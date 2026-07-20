@@ -14,12 +14,12 @@ use crate::plan::validate::{
     cte_select_body, non_recursive_ctes, plain_select_body, reject_unhonored_query_clauses,
     reject_unhonored_select_clauses, validate_user_name, HonoredClauses, HonoredQueryClauses,
 };
-use crate::plan::view::{exists, group_by, join, scalar, set_op, simple, EmitPieces, ViewChain};
+use crate::plan::view::{exists, group_by, join, scalar, simple, EmitPieces, ViewChain};
 use crate::SqlResult;
 use gnitz_core::{ColumnDef, GnitzClient, PlannedView, Schema};
 use sqlparser::ast::{
-    Expr, GroupByExpr, Ident, ObjectName, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, TableFactor,
-    UnaryOperator, WildcardAdditionalOptions,
+    Expr, GroupByExpr, Ident, ObjectName, Query, Select, SelectItem, SetExpr, TableFactor, UnaryOperator,
+    WildcardAdditionalOptions,
 };
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -181,31 +181,11 @@ fn build_query_segments(
     let shape = ViewShape::classify(query)?;
     let final_vid = chain.owner_vid(client)?;
     let (circuit, out_cols, pk_cols) = match shape {
-        ViewShape::SetOp {
-            op,
-            set_quantifier,
-            left,
-            right,
-        } => set_op::emit_set_op_pieces(client, final_vid, op, set_quantifier, left, right, binder)?,
-        // DISTINCT / GROUP BY resolve their input relation first: a plain FROM
-        // resolves through the binder; a join FROM compiles to a hidden view H whose
-        // circuit already applied the top-level WHERE, and the operator runs over H,
-        // resolving its projection / group columns against H by name. `resolve_operator_input`
-        // returns the `Select` the operator should see — with `selection` cleared on
-        // the join path, so the WHERE is never re-applied over H.
-        ViewShape::Distinct(select) => {
-            // No bound: DISTINCT takes its delta through the shared set-op side
-            // pipeline (`input_delta_tagged`), not the builder's primary source —
-            // and so costs no GET_INDICES probe.
-            let inp = resolve_operator_input(client, binder, select, chain, "SELECT DISTINCT")?;
-            set_op::emit_distinct_pieces(final_vid, &inp.select, inp.src)?
-        }
-        ViewShape::GroupBy(select) => emit_bounded_group_by(client, binder, final_vid, select, chain, "GROUP BY")?,
-        // Linear and join views route through the HIR pipeline: bind the whole
-        // `query` to a logical `RelExpr` tree, classify predicates, then lower to
-        // circuit(s) — a join FROM plans as a left-deep chain whose intermediate
-        // segments / self-join pass-through wrappers land on `chain`, and the
-        // final step is emitted with `final_vid`.
+        // Linear, join, GROUP BY, DISTINCT, and set-operation views route through
+        // the HIR pipeline: bind the whole `query` to a logical `RelExpr` tree,
+        // classify predicates, then lower to circuit(s) — nested combine segments /
+        // self-collision pass-through wrappers land on `chain`, and the final step
+        // is emitted with `final_vid`.
         ViewShape::Relational => {
             let (rel, ids) = crate::hir::bind::bind_query(client, binder, query)?;
             let rel = crate::hir::rewrite::classify(rel)?;
@@ -252,7 +232,10 @@ fn build_query_segments(
     };
 
     // The final segment: the hidden segments already sit on the chain in
-    // dependency order; append the (user-named or synthetic) final view.
+    // dependency order; append the (user-named or synthetic) final view. The
+    // hidden ones were checked inside `add_segment`; this is the other of the two
+    // paths every emitted circuit reaches.
+    super::debug_assert_exchange_topology(&circuit);
     chain.segments.push(PlannedView {
         name: final_name,
         sql_text,
@@ -263,25 +246,16 @@ fn build_query_segments(
     Ok(final_vid)
 }
 
-/// The classified shape of a CREATE VIEW body. Classifying once — in this fixed
-/// order — preserves the precedence the old guard ladder encoded: a set
-/// operation outranks everything; `DISTINCT` is checked before the single-FROM
-/// requirement; a grouped/aggregate JOIN classifies as `GroupBy` (its input
-/// resolution compiles the join to a hidden view). Everything else is a `Simple`
-/// filter/map view.
+/// The classified shape of a CREATE VIEW body: which of the two remaining
+/// pipelines compiles it. Every relational shape — linear, join, GROUP BY,
+/// DISTINCT, set operation — is `Relational` and routes through HIR; only the
+/// three subquery shapes still have their own AST emitters. Classification order
+/// is load-bearing where those three are concerned (a JOIN and a grouped body
+/// both outrank the WHERE-subquery check, as they did in the old ladder).
 enum ViewShape<'a> {
-    SetOp {
-        op: SetOperator,
-        set_quantifier: SetQuantifier,
-        left: &'a SetExpr,
-        right: &'a SetExpr,
-    },
-    /// `SELECT DISTINCT …` — over a plain FROM or a join (the input resolution
-    /// compiles a join to a hidden view first).
-    Distinct(&'a Select),
-    /// A relational body the HIR pipeline compiles — a linear filter/map view or
-    /// a plain (non-grouped) join FROM. The pipeline re-binds the whole `query`,
-    /// so no classified `Select` is threaded here.
+    /// A relational body the HIR pipeline compiles — a linear filter/map view, a
+    /// join FROM, a GROUP BY / aggregate, a DISTINCT, or a set operation. The
+    /// pipeline re-binds the whole `query`, so no classified `Select` is threaded here.
     Relational,
     /// A Simple-shaped view whose WHERE carries exactly one top-level
     /// `[NOT] EXISTS (…)` / `x [NOT] IN (SELECT …)` conjunct — routed to the
@@ -308,7 +282,6 @@ enum ViewShape<'a> {
     /// subquery (`(SELECT AGG …)`) or an ANY/ALL quantifier — routed to the
     /// scalar-subquery builder, which decorrelates each into a reduce + join.
     ScalarSubquery(&'a Select),
-    GroupBy(&'a Select),
 }
 
 /// Peel `Nested` wrappers and `NOT`s off a WHERE conjunct; when the core is a
@@ -336,21 +309,9 @@ fn as_subquery_conjunct(e: &Expr) -> Option<(&Expr, bool)> {
 
 impl<'a> ViewShape<'a> {
     fn classify(query: &'a Query) -> Result<ViewShape<'a>, GnitzSqlError> {
-        // Set operations (UNION/INTERSECT/EXCEPT) outrank the single-SELECT shapes.
+        // Set operations (UNION/INTERSECT/EXCEPT) route through the HIR pipeline.
         let select = match query.body.as_ref() {
-            SetExpr::SetOperation {
-                op,
-                set_quantifier,
-                left,
-                right,
-            } => {
-                return Ok(ViewShape::SetOp {
-                    op: *op,
-                    set_quantifier: *set_quantifier,
-                    left,
-                    right,
-                })
-            }
+            SetExpr::SetOperation { .. } => return Ok(ViewShape::Relational),
             SetExpr::Select(s) => s,
             _ => {
                 return Err(GnitzSqlError::Unsupported(
@@ -359,27 +320,20 @@ impl<'a> ViewShape<'a> {
             }
         };
 
-        // DISTINCT is checked before the single-FROM requirement. Both plain DISTINCT and DISTINCT
-        // ON route here; the shared side-compiler (compile_set_op_side) honors only FROM/WHERE/
-        // projection and rejects every other clause (DISTINCT ON, GROUP BY, HAVING, PREWHERE, TOP,
-        // …), none of which has incremental-view semantics here.
+        // DISTINCT routes through the HIR pipeline (checked before the single-FROM
+        // requirement, matching the old precedence).
         if select.distinct.is_some() {
-            return Ok(ViewShape::Distinct(select));
+            return Ok(ViewShape::Relational);
         }
         if select.from.len() != 1 {
             return Err(GnitzSqlError::Unsupported(
                 "CREATE VIEW: only single FROM item supported".to_string(),
             ));
         }
-        // A JOIN outranks the WHERE-subquery check; a grouped/aggregate join
-        // classifies as GroupBy (its input resolution compiles the join to a
-        // hidden view and the reduce runs over it).
+        // A JOIN (grouped or not) routes through the HIR pipeline, before the
+        // WHERE-subquery check.
         if !select.from[0].joins.is_empty() {
-            return Ok(if body_is_grouped(select) {
-                ViewShape::GroupBy(select)
-            } else {
-                ViewShape::Relational
-            });
+            return Ok(ViewShape::Relational);
         }
         // Exactly one `[NOT] EXISTS` / `[NOT] IN (SELECT …)` per view is
         // supported, anywhere in the WHERE or the projection. Two or more →
@@ -431,7 +385,7 @@ impl<'a> ViewShape<'a> {
         // handle the empty group set. A `MIN(x)+1` is detected too and rejected
         // by that validator, not by `Simple`'s lowering.
         if body_is_grouped(select) {
-            return Ok(ViewShape::GroupBy(select));
+            return Ok(ViewShape::Relational);
         }
         // A scalar aggregate subquery / ANY / ALL in the WHERE or projection routes
         // to the scalar-subquery builder. Checked after the EXISTS/IN and GROUP BY
@@ -669,45 +623,15 @@ fn compile_hidden_body(
     })
 }
 
-/// Resolve a DISTINCT / GROUP BY operator's input relation — the source
-/// `(id, schema)` — and the `Select` the operator should evaluate over it: a JOIN
-/// FROM compiles to a hidden view H on `chain` first (the join circuit already
-/// consumed the top-level WHERE), so the operator receives a clone with
-/// `selection` cleared — it must not re-apply the WHERE over H. A plain FROM
-/// resolves through the binder and keeps the `Select` as written (its WHERE is a
-/// filter over one base relation, already minimal).
-fn resolve_operator_input(
-    client: &mut GnitzClient,
-    binder: &mut Binder<'_>,
-    select: &Select,
-    chain: &mut ViewChain,
-    context: &str,
-) -> Result<OperatorInput, GnitzSqlError> {
-    if select.from.len() != 1 {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "{context}: only a single table without JOINs is supported"
-        )));
-    }
-    let mut op_select = select.clone();
-    if !select.from[0].joins.is_empty() {
-        op_select.selection = None;
-        return Ok(OperatorInput {
-            src: compile_join_to_hidden(client, binder, select, chain)?,
-            select: op_select,
-            src_is_catalog: false,
-        });
-    }
-    let name = extract_relation_name(&select.from[0].relation, context)?;
-    let src = binder.resolve(client, &name)?;
-    Ok(OperatorInput {
-        src,
-        select: op_select,
-        src_is_catalog: binder.is_catalog_relation(&name),
-    })
-}
-
-/// The GROUP BY emission both entry points share: resolve the operator input,
-/// extract its backfill-scan index bound, and emit the grouped circuit.
+/// Emit a hidden body's GROUP BY: resolve the input relation, extract its
+/// backfill-scan index bound, and emit the grouped circuit.
+///
+/// A JOIN FROM compiles to a hidden view H on `chain` first (the join circuit
+/// already consumed the top-level WHERE), so the reduce evaluates a clone with
+/// `selection` cleared — it must not re-apply the WHERE over H, and H is a hidden
+/// view that can own no index, so it takes no bound. A plain FROM resolves through
+/// the binder and keeps the `Select` as written (its WHERE is a filter over one
+/// base relation, already minimal) and is index-bound when catalog-issued.
 fn emit_bounded_group_by(
     client: &mut GnitzClient,
     binder: &mut Binder<'_>,
@@ -716,26 +640,22 @@ fn emit_bounded_group_by(
     chain: &mut ViewChain,
     ctx: &str,
 ) -> Result<EmitPieces, GnitzSqlError> {
-    let inp = resolve_operator_input(client, binder, select, chain, ctx)?;
-    let bound = index_bound::scan_bound_for_input(
-        client,
-        inp.select.selection.as_ref(),
-        (inp.src.0, &inp.src.1),
-        inp.src_is_catalog,
-    )?;
-    group_by::emit_group_by_pieces(client, vid, &inp.select, inp.src, bound)
-}
-
-/// What [`resolve_operator_input`] resolved: the source relation, the `Select` the
-/// operator should evaluate over it, and the source's catalog provenance.
-struct OperatorInput {
-    src: (u64, Rc<Schema>),
-    select: Select,
-    /// True iff `src` is a catalog-issued relation — the index-bound gate,
-    /// computed at the resolve site (see `Binder::is_catalog_relation`). `false`
-    /// on the join path, whose H is a hidden view that cannot own an index and
-    /// whose WHERE the join circuit already consumed.
-    src_is_catalog: bool,
+    if select.from.len() != 1 {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "{ctx}: only a single table without JOINs is supported"
+        )));
+    }
+    let mut op_select = select.clone();
+    let (src, src_is_catalog) = if select.from[0].joins.is_empty() {
+        let name = extract_relation_name(&select.from[0].relation, ctx)?;
+        (binder.resolve(client, &name)?, binder.is_catalog_relation(&name))
+    } else {
+        op_select.selection = None;
+        (compile_join_to_hidden(client, binder, select, chain)?, false)
+    };
+    let bound =
+        index_bound::scan_bound_for_input(client, op_select.selection.as_ref(), (src.0, &src.1), src_is_catalog)?;
+    group_by::emit_group_by_pieces(client, vid, &op_select, src, bound)
 }
 
 /// Compile every derived table in the query's top-level FROM (the base relation

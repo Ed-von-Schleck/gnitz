@@ -597,10 +597,11 @@ class TestPrunedHiddenJoin:
         finally:
             _cleanup(client, sn)
 
-    def test_qualified_agg_arg_dup_name_still_ambiguous(self, client):
-        """`SUM(orders.amt)` where BOTH sides carry `amt`: bare-name collection keeps
-        both candidates in H, so it still errors as ambiguous — the deterministic
-        pre-pruning behavior, not a liveness-dependent acceptance."""
+    def test_qualified_agg_arg_dup_name_resolves(self, client):
+        """`SUM(orders.amt)` where BOTH sides carry `amt`: the HIR binder resolves
+        the *qualified* aggregate argument against the join scope directly (no
+        bare-name H pruning), so it is unambiguous — a correctness improvement over
+        the old bare-name-collision rejection. It sums only `orders.amt`."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -608,17 +609,21 @@ class TestPrunedHiddenJoin:
                 "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL, amt BIGINT NOT NULL)",
                 schema_name=sn,
             )
-            # customers ALSO carries `amt`.
+            # customers ALSO carries `amt` (which the qualified arg must NOT sum).
             client.execute_sql(
                 "CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, amt BIGINT NOT NULL)", schema_name=sn
             )
-            with pytest.raises(Exception) as ei:
-                client.execute_sql(
-                    "CREATE VIEW v AS SELECT SUM(orders.amt) AS s "
-                    "FROM orders JOIN customers ON orders.cid = customers.id",
-                    schema_name=sn,
-                )
-            assert "ambiguous" in str(ei.value).lower(), str(ei.value)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT SUM(orders.amt) AS s "
+                "FROM orders JOIN customers ON orders.cid = customers.id",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO customers VALUES (1, 100), (2, 200)", schema_name=sn)
+            client.execute_sql(
+                "INSERT INTO orders VALUES (1, 1, 50), (2, 1, 80), (3, 2, 30)", schema_name=sn)
+            # Every order matches a customer; SUM(orders.amt) = 50+80+30 = 160
+            # (the customers' amt 100/200 must not contribute).
+            assert _rows(client, sn, "v", ["s"]) == [(160,)]
         finally:
             _cleanup(client, sn)
 

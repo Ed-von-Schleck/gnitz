@@ -110,7 +110,17 @@ pub(crate) fn compile_projection_map(items: &[ProjItem], schema: &Schema) -> Res
 /// only through a computed expression) is auto-prepended so the view carries
 /// the full source PK verbatim. One loop serves every PK arity — `k == 1`
 /// reduces to a single move-to-front.
-pub(crate) fn place_pk_front(items: &mut Vec<ProjItem>, out_cols: &mut Vec<ColumnDef>, source_schema: &Schema) {
+///
+/// Returns the permutation applied, as the pre-call index of each output slot
+/// (`None` for an auto-prepended PK column, which had no pre-call slot). Callers
+/// carrying a vector parallel to `out_cols` — the HIR's `ColId` layout — reorder
+/// it through this instead of re-deriving the convention.
+pub(crate) fn place_pk_front(
+    items: &mut Vec<ProjItem>,
+    out_cols: &mut Vec<ColumnDef>,
+    source_schema: &Schema,
+) -> Vec<Option<usize>> {
+    let mut perm: Vec<Option<usize>> = (0..items.len()).map(Some).collect();
     for (target, &pk) in source_schema.pk_indices().iter().enumerate() {
         // First occurrence is the canonical physical-PK slot; any later
         // duplicate (SELECT pk, pk AS x) stays in the payload region and is
@@ -123,8 +133,10 @@ pub(crate) fn place_pk_front(items: &mut Vec<ProjItem>, out_cols: &mut Vec<Colum
             Some(pos) => {
                 let it = items.remove(pos);
                 let col = out_cols.remove(pos);
+                let tag = perm.remove(pos);
                 items.insert(target, it);
                 out_cols.insert(target, col);
+                perm.insert(target, tag);
             }
             None => {
                 // Auto-prepended: the source PK column the user did not project.
@@ -134,9 +146,11 @@ pub(crate) fn place_pk_front(items: &mut Vec<ProjItem>, out_cols: &mut Vec<Colum
                 // synthetic `_join_pk`, stays hidden — `.hidden()` is idempotent.)
                 items.insert(target, ProjItem::PassThrough { src_col: pk });
                 out_cols.insert(target, source_schema.columns[pk].clone().hidden());
+                perm.insert(target, None);
             }
         }
     }
+    perm
 }
 
 /// Build the projected `(items, out_cols)` for a single-table view: resolve

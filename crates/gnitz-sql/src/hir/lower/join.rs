@@ -5,36 +5,22 @@
 //! `SelectItem`, `Expr`). It also hosts the segment-cut and source-collision
 //! rules.
 
-use super::super::{
-    slot_of, ColId, ColIdGen, EqPair, HirCol, HirExpr, HirRange, HirRef, JoinClass, ProjEntry, RelExpr,
-};
+use super::super::{slot_of, ColId, ColIdGen, EqPair, HirExpr, HirRange, HirRef, JoinClass, ProjEntry, RelExpr};
+use super::{resolve_collisions, resolve_input, CutMemo, SegInput};
 use crate::error::GnitzSqlError;
 use crate::hir::physical;
 use crate::ir::BExpr;
 use crate::lower::compile_filter_program;
 use crate::plan::view::join::{
-    band_union_schema, build_pure_range_threshold, combined_payload_coldefs, emit_equi_join_terms,
-    is_identity_projection, join_pk_coldefs, normalize_to_ab, prune_schema, range_gate_reindex_prologue, range_slots,
-    side_target_tcs, union_null_key_rows, EquiSide, EquiTerms, JoinType, RangeSlots,
+    band_union_schema, build_pure_range_threshold, combined_payload_coldefs, emit_equi_join_terms, emit_equi_null_fill,
+    emit_range_null_fill_tail, is_identity_projection, join_pk_coldefs, normalize_to_ab, pair_pk_coldefs, prune_schema,
+    range_gate_reindex_prologue, range_slots, side_target_tcs, union_null_key_rows, EquiNullFill, EquiSide, JoinType,
+    RangeSlots,
 };
-use crate::plan::view::predicates::{
-    build_reindex_program, build_reindex_program_keep, schema_type_codes, RangeConjunct,
-};
-use crate::plan::view::{simple, EmitPieces, ViewChain};
-use gnitz_core::{CircuitBuilder, ColumnDef, ExprBuilder, FixedInt, GnitzClient, NodeId, Schema, TypeCode};
-use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
-
-/// A resolved join input: its delta source, schema, and the `ColId` layout
-/// (physical column order) against which key / residual / projection references
-/// resolve. A base/segment `Get` maps directly; a nested `Join` is cut to a
-/// hidden segment.
-#[derive(Clone)]
-struct JoinInput {
-    tid: u64,
-    schema: Rc<Schema>,
-    layout: Vec<ColId>,
-}
+use crate::plan::view::predicates::{build_reindex_program, RangeConjunct};
+use crate::plan::view::{EmitPieces, ViewChain};
+use gnitz_core::{CircuitBuilder, ColumnDef, FixedInt, GnitzClient, NodeId, Schema, TypeCode};
+use std::collections::HashSet;
 
 /// The downstream demand on a join's output: the final projection and the
 /// post-join WHERE (outer joins only; empty for INNER — the rewrite folded the
@@ -56,22 +42,31 @@ impl Demand<'_> {
     }
 }
 
-/// Lower a `Project(Filter?(Join))` tree's join to circuit pieces for `view_id`.
+/// Lower a `Project(Filter?(Join))` tree's join to circuit pieces for `view_id`,
+/// plus the output `ColId` layout: `[k hidden `_join_pk` / `_pair_pk` slots]`
+/// followed by the projected payload in item order.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_join_view(
     client: &mut GnitzClient,
     chain: &mut ViewChain,
     ids: &mut ColIdGen,
+    memo: &mut CutMemo,
     project_items: &[ProjEntry],
     where_preds: &[HirExpr],
     join: &RelExpr,
     view_id: u64,
-) -> Result<EmitPieces, GnitzSqlError> {
-    let mut memo: HashMap<*const RelExpr, JoinInput> = HashMap::new();
+) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
     let down = Demand {
         items: project_items,
         where_preds,
     };
-    emit_step(client, chain, ids, &mut memo, down, join, view_id)
+    let pieces = emit_step(client, chain, ids, memo, down, join, view_id)?;
+    // The emitted pk-list is the synthetic key region; its width is the number of
+    // hidden placeholder ids the layout leads with.
+    let (_, _, ref pk_cols) = pieces;
+    let mut layout = ids.placeholders(pk_cols.len());
+    layout.extend(project_items.iter().map(|i| i.out.id));
+    Ok((pieces, layout))
 }
 
 /// Emit one join step, resolving (and cutting/wrapping) its two inputs first.
@@ -79,7 +74,7 @@ fn emit_step(
     client: &mut GnitzClient,
     chain: &mut ViewChain,
     ids: &mut ColIdGen,
-    memo: &mut HashMap<*const RelExpr, JoinInput>,
+    memo: &mut CutMemo,
     down: Demand<'_>,
     join: &RelExpr,
     view_id: u64,
@@ -106,131 +101,22 @@ fn emit_step(
     down.collect_refs(&mut live);
     class_referenced(class, &mut live);
 
-    let left_in = resolve_input(client, chain, ids, memo, left, &live)?;
-    let mut right_in = resolve_input(client, chain, ids, memo, right, &live)?;
-
-    // Source-collision: if both delta inputs carry the same tid (self-join / same
-    // relation), wrap the right side in an identity pass-through segment so the two
-    // inputs are distinct sources (the wrapped Get reuses the right side's ColIds,
-    // re-ordered to the wrapper's PK-front physical schema — resolve_refs absorbs it).
-    if left_in.tid == right_in.tid {
-        right_in = wrap_passthrough(client, chain, right, &right_in)?;
-    }
+    // Segment-cut then source-collision, both through the shared rules: a repeated
+    // tid (self-join) wraps the later side in a pass-through segment so the two
+    // delta inputs are distinct sources. The wrapped `Get` reuses its ColIds,
+    // re-ordered to the wrapper's PK-front schema — `resolve_refs` absorbs it.
+    let mut inputs = [
+        resolve_input(client, chain, ids, memo, left, &live)?,
+        resolve_input(client, chain, ids, memo, right, &live)?,
+    ];
+    resolve_collisions(client, chain, ids, &mut inputs, &[left, right], false)?;
+    let [left_in, right_in] = inputs;
 
     if class.range.is_some() {
         emit_range(ids, down, class, *kind, &left_in, &right_in, view_id)
     } else {
         emit_equi(ids, down, class, *kind, &left_in, &right_in, view_id)
     }
-}
-
-/// Resolve a join input: a `Get` maps to its `(tid, schema, layout)`; a nested
-/// `Join` is cut to a hidden segment (memoized by `Rc::as_ptr`).
-fn resolve_input(
-    client: &mut GnitzClient,
-    chain: &mut ViewChain,
-    ids: &mut ColIdGen,
-    memo: &mut HashMap<*const RelExpr, JoinInput>,
-    input: &Rc<RelExpr>,
-    live: &HashSet<ColId>,
-) -> Result<JoinInput, GnitzSqlError> {
-    match input.as_ref() {
-        RelExpr::Get { tid, schema, cols, .. } => Ok(JoinInput {
-            tid: *tid,
-            schema: Rc::clone(schema),
-            layout: cols.iter().map(|c| c.id).collect(),
-        }),
-        RelExpr::Join { .. } => cut_to_segment(client, chain, ids, memo, input, live),
-        _ => Err(GnitzSqlError::Plan("HIR join: unexpected input shape".into())),
-    }
-}
-
-/// Cut a combine-class (`Join`) input to a hidden segment and return a `Get`-like
-/// input over it. The segment `Get.layout` mirrors the segment's **physical**
-/// schema 1:1: `k` fresh hidden placeholder ids for the synthetic `_join_pk` /
-/// `_pair_pk` region, then the cut subtree's output ColIds verbatim (so the
-/// parent's payload references resolve to slots `k..` — the load-bearing off-by-`k`).
-fn cut_to_segment(
-    client: &mut GnitzClient,
-    chain: &mut ViewChain,
-    ids: &mut ColIdGen,
-    memo: &mut HashMap<*const RelExpr, JoinInput>,
-    join: &Rc<RelExpr>,
-    live: &HashSet<ColId>,
-) -> Result<JoinInput, GnitzSqlError> {
-    let key = Rc::as_ptr(join);
-    if let Some(cached) = memo.get(&key) {
-        return Ok(cached.clone());
-    }
-    // The cut subtree's LIVE output cols (chain-liveness prune) — projected identity
-    // into the segment (the registered schema is `join_pk + these`).
-    let out_cols: Vec<HirCol> = join.cols().into_iter().filter(|c| live.contains(&c.id)).collect();
-    let items: Vec<ProjEntry> = out_cols
-        .iter()
-        .map(|c| ProjEntry {
-            expr: BExpr::ColRef(HirRef::Col(c.id)),
-            out: c.clone(),
-        })
-        .collect();
-    let (seg_vid, seg_schema) = chain.add_segment(client, |client, chain, vid| {
-        let down = Demand {
-            items: &items,
-            where_preds: &[],
-        };
-        emit_step(client, chain, ids, memo, down, join, vid)
-    })?;
-    // Physical layout: k hidden placeholders (referenced by nothing) then the cut
-    // subtree's ColIds at slots k.. .
-    let mut layout = ids.placeholders(seg_schema.pk_cols.len());
-    layout.extend(out_cols.iter().map(|c| c.id));
-    let input = JoinInput {
-        tid: seg_vid,
-        schema: seg_schema,
-        layout,
-    };
-    memo.insert(key, input.clone());
-    Ok(input)
-}
-
-/// Wrap a self-join's right side in an identity pass-through segment (the same
-/// `passthrough_rel` + `emit_linear` device as the old collision wrapper). The
-/// returned input reuses the right side's original ColIds, re-ordered to the
-/// wrapper's PK-front physical schema (`build_projection`'s `place_pk_front`).
-fn wrap_passthrough(
-    client: &mut GnitzClient,
-    chain: &mut ViewChain,
-    right: &Rc<RelExpr>,
-    right_in: &JoinInput,
-) -> Result<JoinInput, GnitzSqlError> {
-    // Collision only arises for two base `Get`s on the same table (segments have
-    // distinct vids), so the right side is always a base `Get`.
-    let RelExpr::Get { cols, schema, .. } = right.as_ref() else {
-        return Err(GnitzSqlError::Plan(
-            "HIR self-join: wrapped side must be a base Get".into(),
-        ));
-    };
-    let base_tid = right_in.tid;
-    let base_schema = Rc::clone(schema);
-    let (wrap_vid, wrap_schema) = chain.add_segment(client, |_, chain, vid| {
-        let rel = crate::plan::lp::passthrough_rel(base_tid, Rc::clone(&base_schema))?;
-        simple::emit_linear(chain, vid, rel)
-    })?;
-    // The wrapper reorders the base cols PK-front: physical slot i holds base col
-    // `perm[i]` (PK indices, then the non-PK cols in original order). The wrapped
-    // layout carries the right side's original ColId at each physical slot.
-    let n = cols.len();
-    let perm: Vec<usize> = schema
-        .pk_indices()
-        .iter()
-        .copied()
-        .chain((0..n).filter(|i| !schema.is_pk_col(*i)))
-        .collect();
-    let layout: Vec<ColId> = perm.iter().map(|&i| cols[i].id).collect();
-    Ok(JoinInput {
-        tid: wrap_vid,
-        schema: wrap_schema,
-        layout,
-    })
 }
 
 // ── Equi emission (reproduces emit_join's equi path) ────────────────────────────
@@ -240,8 +126,8 @@ fn emit_equi(
     down: Demand<'_>,
     class: &JoinClass,
     kind: JoinType,
-    left_in: &JoinInput,
-    right_in: &JoinInput,
+    left_in: &SegInput,
+    right_in: &SegInput,
     view_id: u64,
 ) -> Result<EmitPieces, GnitzSqlError> {
     let left_schema = &left_in.schema;
@@ -296,76 +182,35 @@ fn emit_equi(
             keep: &keep_r,
         },
     )?;
-    let EquiTerms {
-        reindex_a,
-        reindex_b,
-        a_nullable: left_key_nullable,
-        b_nullable: right_key_nullable,
-        join_ab,
-        join_ba,
-    } = terms;
+    let inner_merged = normalize_to_ab(&mut cb, terms.join_ab, terms.join_ba, k, pl, pr);
 
-    let inner_merged = normalize_to_ab(&mut cb, join_ab, join_ba, k, pl, pr);
-
-    let merged = if kind == JoinType::Inner {
-        inner_merged
-    } else {
-        // Outer null-fill (symmetric ν_A / ν_B), keyed by `_join_pk`.
-        let equi_nf = |cb: &mut CircuitBuilder,
-                       p_all: NodeId,
-                       p0: usize,
-                       p_n: usize,
-                       o_col_tcs: &[u64],
-                       preserved_is_left: bool|
-         -> NodeId {
-            let proj_p = cb.map(inner_merged, &(p0..p0 + p_n).collect::<Vec<_>>());
-            let nu_p = cb.positive_diff(p_all, proj_p);
-            let ext = cb.null_extend(nu_p, o_col_tcs);
-            if preserved_is_left {
-                ext
-            } else {
-                let reorder: Vec<usize> = (k + pr..k + pr + pl).chain(k..k + pr).collect();
-                cb.map(ext, &reorder)
-            }
-        };
-        let mut merged = inner_merged;
-        if kind.preserves_left() {
-            let a_all = if left_key_nullable {
-                cb.map_reindex(
-                    input_a_raw,
-                    &left_join_cols,
-                    &left_target_tcs,
-                    build_reindex_program_keep(left_schema, &keep_l),
-                )
-            } else {
-                reindex_a
-            };
-            let nf_a = equi_nf(&mut cb, a_all, k, pl, &schema_type_codes(&pruned_right_schema), true);
-            merged = cb.union(nf_a, merged);
-        }
-        if kind.preserves_right() {
-            let b_all = if right_key_nullable {
-                cb.map_reindex(
-                    input_b_raw,
-                    &right_join_cols,
-                    &right_target_tcs,
-                    build_reindex_program_keep(right_schema, &keep_r),
-                )
-            } else {
-                reindex_b
-            };
-            let nf_b = equi_nf(
-                &mut cb,
-                b_all,
-                k + pl,
-                pr,
-                &schema_type_codes(&pruned_left_schema),
-                false,
-            );
-            merged = cb.union(nf_b, merged);
-        }
-        merged
-    };
+    let merged = emit_equi_null_fill(
+        &mut cb,
+        EquiNullFill {
+            inner_merged,
+            kind,
+            k,
+            pl,
+            pr,
+            left: EquiSide {
+                input: input_a_raw,
+                cols: &left_join_cols,
+                target_tcs: &left_target_tcs,
+                schema: left_schema,
+                keep: &keep_l,
+            },
+            right: EquiSide {
+                input: input_b_raw,
+                cols: &right_join_cols,
+                target_tcs: &right_target_tcs,
+                schema: right_schema,
+                keep: &keep_r,
+            },
+            terms: &terms,
+            pruned_left: &pruned_left_schema,
+            pruned_right: &pruned_right_schema,
+        },
+    );
 
     // Virtual combined output schema: k `_join_pk` cols + kept-A + kept-B (with the
     // outer nullability applied to the payload).
@@ -425,8 +270,8 @@ fn emit_range(
     down: Demand<'_>,
     class: &JoinClass,
     kind: JoinType,
-    left_in: &JoinInput,
-    right_in: &JoinInput,
+    left_in: &SegInput,
+    right_in: &SegInput,
     view_id: u64,
 ) -> Result<EmitPieces, GnitzSqlError> {
     let eq: &[EqPair] = &class.eq;
@@ -541,23 +386,7 @@ fn emit_range(
     let rekey = cb.map_reindex(merged, &pair_pk_cols, &zero_tcs, build_reindex_program(&union_schema));
 
     let payload_offset = pair_pk + k;
-    // Leading output PK columns: A's then B's source-PK column types (the re-key
-    // self-derive output type), non-nullable, `_pair_pk_{slot}` numbered.
-    let pair_pk_coldefs: Vec<ColumnDef> = left_schema
-        .pk_cols
-        .iter()
-        .map(|&c| (left_schema.as_ref(), c))
-        .chain(right_schema.pk_cols.iter().map(|&c| (right_schema.as_ref(), c)))
-        .enumerate()
-        .map(|(slot, (schema, c))| {
-            ColumnDef::new(
-                format!("_pair_pk_{slot}"),
-                schema.columns[c].type_code.reindex_output_type(),
-                false,
-            )
-            .hidden()
-        })
-        .collect();
+    let pair_pk_coldefs: Vec<ColumnDef> = pair_pk_coldefs(left_schema, right_schema);
 
     // Output projection: INNER reads off `rekey` (payload at `payload_offset`, and
     // always maps to drop the per-term `_join_pk` slots); OUTER reads off the
@@ -580,46 +409,8 @@ fn emit_range(
     let sink_input = if kind == JoinType::Inner {
         cb.map(rekey, &final_projection)
     } else {
-        // Shared null-fill tail: null-extend ν_P with the O-side NULL columns, re-key
-        // onto the pair-PK (other side packs to synthetic 0), project to the full
-        // combined width `[pair-PK, A, B]`.
         let nf_tail = |cb: &mut CircuitBuilder, nf_keyed: NodeId, preserved_is_left: bool| -> NodeId {
-            let (p_pk, p_n) = if preserved_is_left { (pa, left_n) } else { (pb, right_n) };
-            let o_col_tcs = schema_type_codes(if preserved_is_left { right_schema } else { left_schema });
-            let nullfill = cb.null_extend(nf_keyed, &o_col_tcs); // [P.pk × p_pk, P, NULL-O]
-
-            let mut nf_pair_pk_cols: Vec<usize> = Vec::with_capacity(pair_pk);
-            if preserved_is_left {
-                nf_pair_pk_cols.extend(0..pa);
-                for &b_pk in &right_schema.pk_cols {
-                    nf_pair_pk_cols.push(p_pk + p_n + b_pk);
-                }
-            } else {
-                for &a_pk in &left_schema.pk_cols {
-                    nf_pair_pk_cols.push(p_pk + p_n + a_pk);
-                }
-                nf_pair_pk_cols.extend(0..pb);
-            }
-
-            let p_col_tcs = schema_type_codes(if preserved_is_left { left_schema } else { right_schema });
-            let mut eb = ExprBuilder::new();
-            for (ci, &tc) in p_col_tcs.iter().chain(&o_col_tcs).enumerate() {
-                eb.copy_col(tc as u32, (p_pk + ci) as u32, (p_pk + ci) as u32);
-            }
-            let nf_rekey = cb.map_reindex(nullfill, &nf_pair_pk_cols, &zero_tcs, eb.build(0));
-
-            let nf_full_projection: Vec<usize> = (0..left_n + right_n)
-                .map(|ci| {
-                    if preserved_is_left {
-                        pair_pk + pa + ci
-                    } else if ci < left_n {
-                        pair_pk + pb + right_n + ci
-                    } else {
-                        pair_pk + pb + (ci - left_n)
-                    }
-                })
-                .collect();
-            cb.map(nf_rekey, &nf_full_projection)
+            emit_range_null_fill_tail(cb, left_schema, right_schema, nf_keyed, preserved_is_left)
         };
 
         // Full-width inner pairs `[pair-PK, A, B]` — drop the per-term `_join_pk` slots.
@@ -730,13 +521,7 @@ fn emit_range(
 /// ">= col 0" guard. A wildcard projection is already expanded into `ProjEntry`
 /// column refs by bind, so Rule 1 marks each visible projected col (a hidden col
 /// on a `SELECT *` is dropped — result-identical, unpinned).
-fn keep_set(
-    down: Demand<'_>,
-    class: &JoinClass,
-    kind: JoinType,
-    left_in: &JoinInput,
-    right_in: &JoinInput,
-) -> Vec<bool> {
+fn keep_set(down: Demand<'_>, class: &JoinClass, kind: JoinType, left_in: &SegInput, right_in: &SegInput) -> Vec<bool> {
     let left_layout = &left_in.layout;
     let right_layout = &right_in.layout;
     let left_n = left_layout.len();
@@ -816,8 +601,7 @@ fn slot_of_expr(e: &HirExpr, layout: &[ColId]) -> Result<usize, GnitzSqlError> {
     }
 }
 
-/// Emit the residual/WHERE filter over `merged` (at most one source non-empty),
-/// or pass `merged` through when there is nothing to filter / it elides.
+/// Emit the residual/WHERE filter over `merged` (at most one source non-empty).
 fn apply_filter(
     cb: &mut CircuitBuilder,
     merged: NodeId,
@@ -826,11 +610,5 @@ fn apply_filter(
     layout: &[ColId],
     schema: &Schema,
 ) -> Result<NodeId, GnitzSqlError> {
-    match physical::fold_preds(residual.iter().chain(where_preds), layout)? {
-        Some(folded) => match compile_filter_program(&folded, schema)? {
-            Some(prog) => Ok(cb.filter(merged, Some(prog))),
-            None => Ok(merged),
-        },
-        None => Ok(merged),
-    }
+    super::emit_filter(cb, merged, residual.iter().chain(where_preds), layout, schema)
 }

@@ -5,8 +5,8 @@
 //! relation).
 
 use crate::agg::{
-    agg_arg_col, append_agg_mapping, group_col_reduce_pos, push_agg_specs, synthetic_fold_cols, AggMapping, AggShape,
-    AggSpec, GroupByLayout, GroupBySelectItem,
+    agg_arg_col, append_agg_mapping, emit_reduce, group_col_reduce_pos, push_agg_specs, reduce_output_schema,
+    AggMapping, AggShape, AggSpec, GroupByLayout, GroupBySelectItem, ReduceShape,
 };
 use crate::ast_util::{expr_operands, single_relation_col_name};
 use crate::bind::{bind_single_table, bind_structural, find_unique_column, fold_null_test, LeafBinder, SingleTable};
@@ -199,7 +199,6 @@ pub(crate) fn emit_group_by_pieces(
     // analysis (`analyze_group_by`), also driving the ad-hoc path. The clause
     // gate above and the COUNT(*) companion below stay here.
     let layout = analyze_group_by(select, &source_schema)?;
-    let global_ground = layout.global_ground();
     let GroupByLayout {
         group_col_indices,
         mut agg_specs,
@@ -220,60 +219,24 @@ pub(crate) fn emit_group_by_pieces(
     // MAP strips it (a raw reduce column with no output column, like a
     // HAVING-only agg). Every planner-built reduce is grouped or a global
     // scalar aggregate, so the guard is simply "no COUNT(*) present yet" —
-    // linear or not. (`all_linear` is computed here pre-append for the
-    // two-phase decision below; the companion never changes linearity.)
-    let all_linear = agg_specs
-        .iter()
-        .all(|s| matches!(s.op, WireAggFunc::Count | WireAggFunc::Sum | WireAggFunc::CountNonNull));
+    // linear or not. (The companion is a COUNT, so it never changes the
+    // linearity `emit_reduce`'s two-phase decision reads off the full specs.)
     if !agg_specs.iter().any(|s| s.op == WireAggFunc::Count) {
         // Route through push_agg_specs — the single source of truth for spec
         // layout and out_type — rather than hand-rolling the COUNT spec. The
         // companion has no select_item / agg_mapping, so its AggShape is discarded.
-        push_agg_specs(AggFunc::Count, None, &source_schema, &mut agg_specs)?;
+        push_agg_specs(AggFunc::Count, None, &source_schema.columns, &mut agg_specs)?;
     }
 
-    // The reduce output-key kind, shipped to the engine (see `ReduceOutKey`:
-    //    the planner owns this decision, the engine validates and obeys it).
-    //    Everything below — schema layout, shard key, column positions — derives
-    //    from this one value. The two empty-group reduces (two-phase local /
-    //    combine) always ship `SyntheticFold`: an empty group set is neither
-    //    natural kind.
-    let out_key = source_schema.reduce_out_key(&group_col_indices);
-
-    // Build the reduce output schema (mirrors the engine's
-    // `build_reduce_output_schema`, which lays out from the same `out_key`). The
-    // aggregate columns trail the PK region — plus, on the synthetic path only,
-    // the group cols carried as payload — at the output type push_agg_specs
-    // computed per spec (float SUM/MIN/MAX → F64, MIN/MAX preserve the source
-    // type, SUM/COUNT* → I64), so the planner's virtual reduce schema matches
-    // the compiler's physical reduce output with no per-op reconstruction.
-    let (reduce_schema_cols, reduce_pk_cols) = match out_key {
-        ReduceOutKey::PkPermutation => {
-            let mut cols: Vec<ColumnDef> = source_schema
-                .pk_cols
-                .iter()
-                .map(|&pi| source_schema.columns[pi].clone())
-                .collect();
-            let pk: Vec<usize> = (0..cols.len()).collect();
-            cols.extend(agg_specs.iter().map(|s| ColumnDef::new("_agg", s.out_type, false)));
-            (cols, pk)
-        }
-        ReduceOutKey::SingleNaturalCol => {
-            let mut cols = vec![source_schema.columns[group_col_indices[0]].clone()];
-            cols.extend(agg_specs.iter().map(|s| ColumnDef::new("_agg", s.out_type, false)));
-            (cols, vec![0])
-        }
-        // The shared SyntheticFold layout (also the ad-hoc partial schema).
-        ReduceOutKey::SyntheticFold => (
-            synthetic_fold_cols(&source_schema, &group_col_indices, &agg_specs, false),
-            vec![0],
-        ),
-    };
-    let agg_col_offset = reduce_schema_cols.len() - agg_specs.len();
-    let reduce_schema = Schema {
-        columns: reduce_schema_cols,
-        pk_cols: reduce_pk_cols,
-    };
+    // The reduce's physical shape. Its `out_key` is the output-key kind shipped
+    // to the engine (see `ReduceOutKey`: the planner owns this decision, the
+    // engine validates and obeys it) — schema layout, shard key, and column
+    // positions all derive from that one value. The two empty-group reduces
+    // (two-phase local / combine) always ship `SyntheticFold`: an empty group set
+    // is neither natural kind.
+    let shape = ReduceShape::new(&source_schema, &group_col_indices, &agg_specs, source_replicated);
+    let out_key = shape.out_key;
+    let (reduce_schema, agg_col_offset) = reduce_output_schema(&shape);
 
     // Build circuit
     let mut cb = CircuitBuilder::new(view_id, source_tid);
@@ -295,79 +258,8 @@ pub(crate) fn emit_group_by_pieces(
         inp
     };
 
-    // REDUCE — always use multi-agg path.
-    //
-    // For `PkPermutation`, shard/reindex the reduce by the group columns in
-    // source-PK (schema) order, not the user's GROUP BY order. The groups are
-    // identical under any permutation of the PK (each group is a PK singleton),
-    // and `build_reduce_output_schema` emits the output PK in source-PK order
-    // regardless — so this only normalizes the shard key. Without it a permuted
-    // grouping (e.g. `GROUP BY pk1, pk0`) shards by a non-PK-order key: the
-    // co-partition analyzer (correctly) declines to skip the exchange, the
-    // shuffle hash-routes by `[pk1, pk0]`, and the reduce output lands
-    // partitioned by `hash(pk1, pk0)` rather than by the view's declared PK
-    // `(pk0, pk1)` — so the multi-worker gather drops the rows that hashed to a
-    // different worker. Sharding in PK order keeps the reduce co-partitioned with
-    // the source (the exchange is skipped, or routes by `partition_for_pk_bytes`),
-    // so the view stays partitioned by its real PK. The other kinds keep the
-    // user order: their synthetic/single-natural PK and reduce layout depend on
-    // it (`group_col_reduce_pos`'s synthetic arm indexes by GROUP BY order).
-    let reduce_group_cols: Vec<usize> = if out_key == ReduceOutKey::PkPermutation {
-        source_schema.pk_cols.clone()
-    } else {
-        group_col_indices.clone()
-    };
-    // The circuit builder needs only (op, col) per spec; out_type is the
-    // planner's concern and already shaped reduce_schema above.
-    let circuit_specs: Vec<(u64, usize)> = agg_specs.iter().map(|s| (s.op.as_u64(), s.col)).collect();
-    // Two-phase (distributable) path for an all-linear, integer, partitioned GLOBAL
-    // aggregate: fold a per-worker partial locally (no exchange), then exchange only
-    // the ≤ N partials to V₀'s owner and combine them. A linear aggregate satisfies
-    // Agg(A+B)=Agg(A)+Agg(B), so this replaces the single-worker full-delta funnel.
-    // Float SUM (and AVG over a float, whose SUM component is float) is excluded:
-    // IEEE-754 addition is non-associative, so summing per-worker partials would make
-    // the result depend on the worker count — those keep the deterministic funnel.
-    // `two_phase ⊆ global_ground`: it is the distributable refinement of the
-    // ungrouped (empty group set) case, so it reuses that predicate.
-    let two_phase = global_ground
-        && !source_replicated
-        && all_linear
-        && !agg_specs
-            .iter()
-            .any(|s| s.op == WireAggFunc::Sum && s.out_type.is_float());
-    let reduced = if two_phase {
-        // Phase 1 — per-worker local partial. No ExchangeShard, global_ground = false
-        // (a worker with no local rows contributes no partial, never a ground row).
-        // Output: [_group_pk:U128 (col 0, PK), agg0 (col 1), agg1 (col 2), ...].
-        let local = cb.reduce_multi_local(filtered, &[], &circuit_specs, false, ReduceOutKey::SyntheticFold);
-
-        // Phase 2 (exchange) + Phase 3 (combine). reduce_multi inserts the single
-        // ExchangeShard(∅) routing every partial (all at PK V₀) to V₀'s owner, then
-        // the combine reduce sums each partial column: a COUNT/COUNT_NON_NULL partial
-        // sums with SumZero (Sum fold, 0 ground — a COUNT's empty value is 0, not
-        // NULL), a SUM partial with plain Sum (NULL ground). The user aggregate
-        // columns land at the same positions as the funnel reduce's, so the post-map
-        // is unchanged; the trailing COUNT-of-partials is the existence gate (the
-        // reduce's cardinality gate finds it via the lone AggOp::Count). global_ground
-        // = true: an empty global source emits exactly one ground row here.
-        // Merge each partial with the shared per-op combine rule
-        // (`AggFunc::merge_func` — the same rule the ad-hoc client combiner
-        // applies). Local output column `1 + i` holds local agg `i` (col 0 is
-        // _group_pk).
-        let mut combine_specs: Vec<(u64, usize)> = agg_specs
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.op.merge_func().as_u64(), 1 + i))
-            .collect();
-        combine_specs.push((WireAggFunc::Count.as_u64(), 0)); // COUNT-of-partials existence gate
-        cb.reduce_multi(local, &[], &combine_specs, true, ReduceOutKey::SyntheticFold)
-    } else if source_replicated {
-        // Shard-free: every worker reduces its full local copy to the same global
-        // aggregate (no ExchangeShard ⇒ no gather barrier, no N-fold sum).
-        cb.reduce_multi_local(filtered, &reduce_group_cols, &circuit_specs, global_ground, out_key)
-    } else {
-        cb.reduce_multi(filtered, &reduce_group_cols, &circuit_specs, global_ground, out_key)
-    };
+    // REDUCE — the shared strategy selection (two-phase / replicated / sharded).
+    let reduced = emit_reduce(&mut cb, filtered, &shape);
 
     // Post-reduce MAP: project group cols + compute aggregates (AVG = SUM/COUNT)
     //    Reduce output: [pk, (group_cols...), agg0, agg1, ...]

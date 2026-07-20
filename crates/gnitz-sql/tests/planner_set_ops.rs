@@ -291,16 +291,16 @@ fn test_except_distinct_lifting_no_underflow() {
     );
 }
 
-// ── same-source INTERSECT/EXCEPT rejection ──────────────────────────
+// ── same-source INTERSECT/EXCEPT acceptance (uniform collision wrapper) ──────
 //
-// Both branches resolving to the SAME source relation id collapse to one
-// dependency edge: a single delta drives both branch pipelines in one pass and
-// the cross-correction term is dropped (silently wrong results). The guard
-// rejects exactly that. (The join planner solves the same constraint by
-// wrapping the repeated relation in a pass-through hidden view; set-op sides
-// do not wrap yet.) The discriminator is source-id equality, NOT base-table
-// overlap — two different views over the same base produce two edges and stay
-// accepted (see the two-view tests below).
+// Both branches resolving to the SAME source relation id would collapse to one
+// dependency edge (a single delta driving both branch pipelines in one epoch,
+// dropping the cross-correction term). The HIR lowering replaces the old
+// same-relation *guard* with the same uniform pass-through wrapper the join
+// planner uses: the right INTERSECT/EXCEPT branch is wrapped in a distinct
+// pass-through segment, so one user push becomes two separate cascade epochs and
+// the ν-difference converges to the correct net weights. UNION / UNION ALL are
+// exempt (linear merges). This flips the former rejection tests to acceptance.
 
 fn make_t_with_c(client: &mut GnitzClient, sn: &str) {
     let mut p = SqlPlanner::new(client, sn);
@@ -309,8 +309,8 @@ fn make_t_with_c(client: &mut GnitzClient, sn: &str) {
 }
 
 /// Create table `t(id, c)`, run any `extra_setup` statements, then assert
-/// `view_sql` is rejected by the same-source guard's "same relation" error.
-fn assert_same_relation_rejected(extra_setup: &[&str], view_sql: &str) {
+/// `view_sql` now compiles (the collision wrapper replaced the same-source guard).
+fn assert_same_relation_accepted(extra_setup: &[&str], view_sql: &str) {
     let srv = match ServerHandle::start() {
         Some(s) => s,
         None => return,
@@ -324,40 +324,38 @@ fn assert_same_relation_rejected(extra_setup: &[&str], view_sql: &str) {
         }
     }
     let mut p = SqlPlanner::new(&mut client, &sn);
-    match p.execute(view_sql).unwrap_err() {
-        GnitzSqlError::Unsupported(s) => assert!(s.contains("same relation"), "got: {}", s),
-        e => panic!("expected Unsupported, got {:?}", e),
-    }
+    p.execute(view_sql)
+        .unwrap_or_else(|e| panic!("same-relation set op must compile via the wrapper, got {e:?}"));
 }
 
 #[test]
-fn test_same_table_except_rejected() {
-    assert_same_relation_rejected(
+fn test_same_table_except_accepted() {
+    assert_same_relation_accepted(
         &[],
         "CREATE VIEW v AS SELECT c FROM t WHERE c > 0 EXCEPT SELECT c FROM t WHERE c < 10",
     );
 }
 
 #[test]
-fn test_same_table_intersect_rejected() {
-    assert_same_relation_rejected(
+fn test_same_table_intersect_accepted() {
+    assert_same_relation_accepted(
         &[],
         "CREATE VIEW v AS SELECT c FROM t WHERE c > 0 INTERSECT SELECT c FROM t WHERE c < 10",
     );
 }
 
 #[test]
-fn test_same_view_except_rejected() {
-    // Both branches read the same view → same source id → rejected.
-    assert_same_relation_rejected(
+fn test_same_view_except_accepted() {
+    // Both branches read the same view → same source id → wrapped, not rejected.
+    assert_same_relation_accepted(
         &["CREATE VIEW vt AS SELECT id, c FROM t WHERE c > 0"],
         "CREATE VIEW v AS SELECT c FROM vt EXCEPT SELECT c FROM vt",
     );
 }
 
 #[test]
-fn test_same_view_intersect_rejected() {
-    assert_same_relation_rejected(
+fn test_same_view_intersect_accepted() {
+    assert_same_relation_accepted(
         &["CREATE VIEW vt AS SELECT id, c FROM t WHERE c > 0"],
         "CREATE VIEW v AS SELECT c FROM vt INTERSECT SELECT c FROM vt",
     );

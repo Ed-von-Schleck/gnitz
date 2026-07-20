@@ -4,7 +4,7 @@
 //! projection (the pass-through/computed split + the PK-front convention, whose
 //! single home is `place_pk_front`).
 
-use super::{slot_of, ColId, HirExpr, HirRef, ProjEntry};
+use super::{slot_of, ColId, ColIdGen, HirExpr, HirRef, ProjEntry};
 use crate::codec::project_schema::{place_pk_front, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp, BoundExpr};
@@ -36,16 +36,28 @@ pub(crate) fn fold_preds<'a>(
     Ok(folded)
 }
 
+/// A physicalized projection: the emission items, the output column defs, the
+/// leading key arity, and the output `ColId` at each physical slot.
+pub(crate) struct PhysProjection {
+    pub items: Vec<ProjItem>,
+    pub out_cols: Vec<ColumnDef>,
+    pub pk_arity: usize,
+    pub layout: Vec<ColId>,
+}
+
 /// Physicalize a projection over `input_layout` / `input_schema` — the HIR
 /// realization of `build_projection`: resolve each `ProjEntry.expr`, classify a
 /// bare `ColRef(i)` as `PassThrough`/else `Computed`, take the output def from
-/// `ProjEntry.out`, then pin the source PK to the leading slots. Returns
-/// `(items, out_cols, pk_arity)` for the lowering to drive the emission strategy.
+/// `ProjEntry.out`, then pin the source PK to the leading slots. The returned
+/// `layout` is reordered through the same `place_pk_front` permutation (an
+/// auto-prepended hidden PK slot takes a fresh placeholder id), so a cut linear
+/// segment exposes its layout exactly like a combine one.
 pub(crate) fn physicalize_projection(
+    ids: &mut ColIdGen,
     items: &[ProjEntry],
     input_layout: &[ColId],
     input_schema: &Schema,
-) -> Result<(Vec<ProjItem>, Vec<ColumnDef>, usize), GnitzSqlError> {
+) -> Result<PhysProjection, GnitzSqlError> {
     let mut proj_items: Vec<ProjItem> = Vec::with_capacity(items.len());
     let mut out_cols: Vec<ColumnDef> = Vec::with_capacity(items.len());
     for entry in items {
@@ -56,6 +68,18 @@ pub(crate) fn physicalize_projection(
         });
         out_cols.push(entry.out.def.clone());
     }
-    place_pk_front(&mut proj_items, &mut out_cols, input_schema);
-    Ok((proj_items, out_cols, input_schema.pk_count()))
+    let perm = place_pk_front(&mut proj_items, &mut out_cols, input_schema);
+    let layout = perm
+        .into_iter()
+        .map(|src| match src {
+            Some(i) => items[i].out.id,
+            None => ids.next(),
+        })
+        .collect();
+    Ok(PhysProjection {
+        items: proj_items,
+        out_cols,
+        pk_arity: input_schema.pk_count(),
+        layout,
+    })
 }
