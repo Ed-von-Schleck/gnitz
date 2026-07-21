@@ -1,15 +1,10 @@
 use super::resolve::find_unique_column;
 use crate::agg::reject_min_max_unorderable;
-use crate::ast_util::{
-    agg_func_from_name, agg_func_name, fn_name_is, function_positional_args, reject_unsupported_fn_qualifiers,
-    single_fn_name, single_relation_col_name,
-};
+use crate::ast_util::{classify_agg_call, fn_name_is, function_positional_args, single_relation_col_name};
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BExpr, BinOp, BoundExpr, UnaryOp};
 use gnitz_core::Schema;
-use sqlparser::ast::{
-    BinaryOperator, CaseWhen, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, UnaryOperator, Value,
-};
+use sqlparser::ast::{BinaryOperator, CaseWhen, Expr, Function, UnaryOperator, Value};
 
 /// Bind an expression against a single-relation schema (WHERE, projections,
 /// set-op branches, DML). The structural recursion lives in `bind_structural`;
@@ -18,39 +13,6 @@ use sqlparser::ast::{
 /// `(expr, schema)` — no binder state is involved.
 pub(crate) fn bind_single_table(expr: &Expr, schema: &Schema) -> Result<BoundExpr, GnitzSqlError> {
     bind_structural(expr, &SingleTable { schema })
-}
-
-/// [`bind_single_table`] with the one `[NOT] EXISTS`/`[NOT] IN (SELECT …)` node
-/// resolved to the constant `mark` — the mark builder's per-branch binding: on
-/// the matched branch the subquery node is its truth value there (EXISTS → 1,
-/// NOT EXISTS → 0), on the unmatched branch the complement, and the surrounding
-/// OR/NOT/CASE evaluates over the constant like any other expression.
-pub(crate) fn bind_single_table_mark(expr: &Expr, schema: &Schema, mark: i64) -> Result<BoundExpr, GnitzSqlError> {
-    struct MarkLeaf<'a> {
-        inner: SingleTable<'a>,
-        mark: i64,
-    }
-    impl LeafBinder for MarkLeaf<'_> {
-        fn bind_column(&self, e: &Expr) -> Result<BoundExpr, GnitzSqlError> {
-            self.inner.bind_column(e)
-        }
-        fn bind_function(&self, f: &Function) -> Result<BoundExpr, GnitzSqlError> {
-            self.inner.bind_function(f)
-        }
-        fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<BoundExpr, GnitzSqlError> {
-            self.inner.bind_null_test(inner, want_null)
-        }
-        fn bind_subquery(&self, _e: &Expr) -> Result<BoundExpr, GnitzSqlError> {
-            Ok(BoundExpr::LitInt(self.mark))
-        }
-    }
-    bind_structural(
-        expr,
-        &MarkLeaf {
-            inner: SingleTable { schema },
-            mark,
-        },
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -76,17 +38,18 @@ pub(crate) trait LeafBinder<R = usize> {
     fn bind_function(&self, f: &Function) -> Result<BExpr<R>, GnitzSqlError>;
     /// `inner IS [NOT] NULL` (`want_null` picks IS NULL vs IS NOT NULL).
     fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<BExpr<R>, GnitzSqlError>;
-    /// A `[NOT] EXISTS` / `[NOT] IN (SELECT …)` node. Only the mark builder's
-    /// leaf overrides this — it resolves the node to the branch's `0/1` constant
-    /// ([`bind_single_table_mark`]); every other context keeps the placement
-    /// rejection. (The top-level-AND-conjunct filter path never binds the node:
-    /// the exists builder intercepts it before binding.)
-    fn bind_subquery(&self, _e: &Expr) -> Result<BExpr<R>, GnitzSqlError> {
-        Err(GnitzSqlError::Unsupported(
-            "[NOT] EXISTS/IN (SELECT …) is only supported in a single-table CREATE VIEW \
-             (in the WHERE clause or the SELECT list)"
+    /// A subquery node — `[NOT] EXISTS`, `[NOT] IN (SELECT …)`, a scalar
+    /// `(SELECT …)`, or an `ANY`/`ALL`/`SOME` comparison. The HIR view leaf
+    /// overrides this to record/bind the subquery for decorrelation; every other
+    /// context (DML, HAVING, ad-hoc reads) keeps the per-kind placement rejection.
+    fn bind_subquery(&self, e: &Expr) -> Result<BExpr<R>, GnitzSqlError> {
+        Err(GnitzSqlError::Unsupported(match e {
+            Expr::Subquery(_) => "scalar subqueries are not supported".into(),
+            Expr::AnyOp { .. } | Expr::AllOp { .. } => "ANY/SOME/ALL subquery comparisons are not supported".into(),
+            _ => "[NOT] EXISTS/IN (SELECT …) is only supported in a single-table CREATE VIEW \
+                  (in the WHERE clause or the SELECT list)"
                 .into(),
-        ))
+        }))
     }
 }
 
@@ -208,14 +171,12 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
                 node
             })
         }
-        // Subquery placement is the leaf's decision: the mark builder binds the
-        // node to its branch constant; every other leaf keeps the default
+        // Subquery placement is the leaf's decision: the HIR view leaf records the
+        // node for decorrelation; every other leaf keeps the default per-kind
         // placement rejection (HAVING, DML, a direct SELECT, …).
-        Expr::Exists { .. } | Expr::InSubquery { .. } => leaf.bind_subquery(expr),
-        Expr::Subquery(_) => Err(GnitzSqlError::Unsupported("scalar subqueries are not supported".into())),
-        Expr::AnyOp { .. } | Expr::AllOp { .. } => Err(GnitzSqlError::Unsupported(
-            "ANY/SOME/ALL subquery comparisons are not supported".into(),
-        )),
+        Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::Subquery(_) | Expr::AnyOp { .. } | Expr::AllOp { .. } => {
+            leaf.bind_subquery(expr)
+        }
         _ => Err(GnitzSqlError::Unsupported(format!(
             "expression type not supported: {expr:?}"
         ))),
@@ -370,67 +331,20 @@ impl LeafBinder for SingleTable<'_> {
         Ok(BoundExpr::ColRef(self.idx(e)?))
     }
     fn bind_function(&self, func: &Function) -> Result<BoundExpr, GnitzSqlError> {
-        reject_unsupported_fn_qualifiers(func, "aggregates")?;
-        // The one name→aggregate map (`agg_func_from_name`) — no allocation on
-        // the hit path; the argument shape then picks the COUNT variant and
-        // validates arity.
-        let Some(agg_func) = single_fn_name(func).and_then(agg_func_from_name) else {
-            return Err(GnitzSqlError::Unsupported(format!(
-                "function '{}' not supported",
-                func.name.to_string().to_ascii_lowercase()
-            )));
-        };
-        match agg_func {
-            AggFunc::Count | AggFunc::CountNonNull => {
-                if let FunctionArguments::List(list) = &func.args {
-                    if list.args.len() == 1 {
-                        match &list.args[0] {
-                            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
-                                return Ok(BoundExpr::AggCall {
-                                    func: AggFunc::Count,
-                                    arg: None,
-                                });
-                            }
-                            FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => {
-                                let bound = bind_structural(inner, self)?;
-                                return Ok(BoundExpr::AggCall {
-                                    func: AggFunc::CountNonNull,
-                                    arg: Some(Box::new(bound)),
-                                });
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Err(GnitzSqlError::Unsupported(
-                    "COUNT: unsupported argument form".to_string(),
-                ))
-            }
-            AggFunc::Sum | AggFunc::Min | AggFunc::Max | AggFunc::Avg => {
-                if let FunctionArguments::List(list) = &func.args {
-                    if list.args.len() == 1 {
-                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) = &list.args[0] {
-                            let bound = bind_structural(inner, self)?;
-                            // Reject an unorderable MIN/MAX argument here so the
-                            // operator only sees types it can compare correctly.
-                            // Guarded so the `infer_type` walk stays off the
-                            // SUM/AVG path, which has nothing to check.
-                            if matches!(agg_func, AggFunc::Min | AggFunc::Max) {
-                                reject_min_max_unorderable(agg_func, bound.infer_type(&self.schema.columns))?;
-                            }
-                            return Ok(BoundExpr::AggCall {
-                                func: agg_func,
-                                arg: Some(Box::new(bound)),
-                            });
-                        }
-                    }
-                }
-                Err(GnitzSqlError::Unsupported(format!(
-                    "{}: requires exactly one column argument",
-                    agg_func_name(agg_func)
-                )))
+        // Shape dispatch (COUNT(*) vs COUNT(x), arity) is leaf-independent — one
+        // home in `classify_agg_call`; this leaf only binds the argument and
+        // guards MIN/MAX orderability, once the argument's type is in hand.
+        let (agg_func, arg) = classify_agg_call(func)?;
+        let bound = arg.map(|e| bind_structural(e, self)).transpose()?;
+        if matches!(agg_func, AggFunc::Min | AggFunc::Max) {
+            if let Some(b) = &bound {
+                reject_min_max_unorderable(agg_func, b.infer_type(&self.schema.columns))?;
             }
         }
+        Ok(BoundExpr::AggCall {
+            func: agg_func,
+            arg: bound.map(Box::new),
+        })
     }
     fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<BoundExpr, GnitzSqlError> {
         let idx = self.idx(inner)?;
@@ -674,9 +588,9 @@ mod tests {
         assert_unsupported(bind_single_table(&empty, &f), "empty list");
     }
 
-    /// Subquery expressions outside the supported placements get the targeted
-    /// message, not the generic catch-all — while the mark leaf binds the same
-    /// nodes to its branch constant.
+    /// Subquery expressions get the targeted per-kind message from the default
+    /// `bind_subquery` leaf, not the generic catch-all. (The HIR view leaf
+    /// overrides `bind_subquery` to record the node for decorrelation instead.)
     #[test]
     fn test_bind_rejects_subquery_expressions_with_targeted_messages() {
         let schema = schema_with_val(TypeCode::I64);
@@ -691,14 +605,6 @@ mod tests {
                 bind_single_table(&parse(src), &schema),
                 "only supported in a single-table CREATE VIEW",
             );
-            // The mark leaf resolves the subquery node to its 0/1 constant.
-            assert!(bind_single_table_mark(&parse(src), &schema, 1).is_ok());
-        }
-        // The subquery node is the constant; surrounding structure survives:
-        // `c = 1 OR EXISTS(…)` at mark=0 binds as `(c = 1) OR 0`.
-        match bind_single_table_mark(&parse("c = 1 OR EXISTS (SELECT c FROM t)"), &schema, 0).unwrap() {
-            BoundExpr::BinOp(_, BinOp::Or, r) => assert!(matches!(*r, BoundExpr::LitInt(0))),
-            other => panic!("expected `… OR 0`, got {other:?}"),
         }
         assert_unsupported(
             bind_single_table(&parse("c = ANY (SELECT c FROM t)"), &schema),

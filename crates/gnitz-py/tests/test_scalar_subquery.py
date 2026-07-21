@@ -176,6 +176,68 @@ class TestUncorrelatedScalar:
         finally:
             _cleanup(client, sn, "v", "c", "a", "b")
 
+    def test_uncorrelated_nullable_sum_eq_empty_is_null(self, client):
+        """`x = (SELECT SUM(y) FROM d)` over a NULLABLE `y`: SUM over an empty /
+        fully-retracted / all-NULL group is NULL (not 0), so `x = NULL` is UNKNOWN and
+        matches nothing. The join must key on the finalized `sum / (cnt != 0)`, not the
+        raw reduce column — which reads a spurious 0 and would wrongly match `x = 0`."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql("CREATE TABLE t1 (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)", schema_name=sn)
+            client.execute_sql("CREATE TABLE d (id BIGINT NOT NULL PRIMARY KEY, y BIGINT)", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT t1.id FROM t1 WHERE t1.x = (SELECT SUM(y) FROM d)",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql("INSERT INTO t1 VALUES (1, 0), (2, 5)", schema_name=sn)
+            # Empty d -> SUM(y) = NULL -> `x = NULL` matches nothing (NOT `x = 0`).
+            assert _col_weights(client, vid, "id") == {}
+            client.execute_sql("INSERT INTO d VALUES (1, 5)", schema_name=sn)
+            # SUM = 5 -> `x = 5` matches id 2.
+            assert _col_weights(client, vid, "id") == {(2,): 1}
+            client.execute_sql("DELETE FROM d WHERE id = 1", schema_name=sn)
+            # d empty again -> SUM = NULL -> nothing (the regression: raw SUM reads 0
+            # here and would spuriously match id 1).
+            assert _col_weights(client, vid, "id") == {}
+            client.execute_sql("INSERT INTO d VALUES (2, NULL)", schema_name=sn)
+            # A lone NULL contribution -> COUNT_NON_NULL = 0 -> SUM = NULL -> nothing.
+            assert _col_weights(client, vid, "id") == {}
+        finally:
+            _cleanup(client, sn, "v", "t1", "d")
+
+    def test_uncorrelated_nullable_sum_range_empty_is_null(self, client):
+        """`x < (SELECT SUM(y) FROM d)` over a NULLABLE `y` — the pure-range path over
+        the finalized one-row aggregate: SUM over an empty / all-NULL group is NULL, so
+        the range threshold is empty and nothing matches (the raw column reads 0 and
+        would wrongly admit `x < 0`)."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql("CREATE TABLE t1 (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)", schema_name=sn)
+            client.execute_sql("CREATE TABLE d (id BIGINT NOT NULL PRIMARY KEY, y BIGINT)", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT t1.id FROM t1 WHERE t1.x < (SELECT SUM(y) FROM d)",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql("INSERT INTO t1 VALUES (1, -5), (2, 3), (3, 100)", schema_name=sn)
+            # Empty d -> SUM = NULL -> `x < NULL` UNKNOWN -> nothing (raw would read 0
+            # and wrongly admit `x < 0` -> id 1).
+            assert _col_weights(client, vid, "id") == {}
+            client.execute_sql("INSERT INTO d VALUES (1, 10)", schema_name=sn)
+            # SUM = 10 -> `x < 10`: id 1 (-5), id 2 (3).
+            assert _col_weights(client, vid, "id") == {(1,): 1, (2,): 1}
+            client.execute_sql("INSERT INTO d VALUES (2, NULL)", schema_name=sn)
+            # NULL ignored -> SUM still 10 -> unchanged.
+            assert _col_weights(client, vid, "id") == {(1,): 1, (2,): 1}
+            client.execute_sql("DELETE FROM d WHERE id = 1", schema_name=sn)
+            # Only a NULL contribution remains -> SUM = NULL -> nothing.
+            assert _col_weights(client, vid, "id") == {}
+        finally:
+            _cleanup(client, sn, "v", "t1", "d")
+
 
 class TestAuditCases:
     """Cases the external audit flagged: self-correlation (E), COALESCE fold (D),

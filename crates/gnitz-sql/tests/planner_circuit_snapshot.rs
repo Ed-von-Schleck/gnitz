@@ -757,7 +757,9 @@ fn sentinel_14a_scalar_correlated() {
 }
 // Multi-segment (generic cut + composition): seg 2 = the correlated COUNT reduce
 // (grouped by the correlation key), seg 1 = the LEFT join of the outer against it
-// (the scalar-decorrelation form), seg 0 = the finalize over the join output.
+// (the scalar-decorrelation form), seg 0 = the finalize over the join output. The
+// HIR path prunes the join payload to the live columns (the outer PK + the agg),
+// so the join carries fewer columns than the old AST H-materialization did.
 // COUNT's `coalesce_zero` finalize (0 over an empty group) is weight-pinned by the
 // existing test_scalar_subquery.py — not captured here (expr excluded).
 const EXPECTED_14A: &str = r#"seg 0:
@@ -773,16 +775,16 @@ seg 1:
 #3 POSITIVE_PART <- (#4@0)
 #4 UNION <- (#5@0,#10@1)
 #5 NEGATE <- (#6@0)
-#6 MAP_PROJ params:[(PROJ,0,1,0);(PROJ,1,2,0);(PROJ,2,3,0)] <- (#7@0)
+#6 MAP_PROJ params:[(PROJ,0,1,0)] <- (#7@0)
 #7 UNION <- (#8@0,#15@1)
-#8 MAP_PROJ params:[(PROJ,0,1,0);(PROJ,1,2,0);(PROJ,2,3,0);(PROJ,3,4,0)] <- (#9@0)
+#8 MAP_PROJ params:[(PROJ,0,1,0);(PROJ,1,2,0)] <- (#9@0)
 #9 JOIN_DELTA_TRACE <- (#10@0,#12@1)
 #10 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#11@0)
 #11 SCAN_DELTA src:base:a
 #12 INTEGRATE_TRACE <- (#13@0)
 #13 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#14@0)
 #14 SCAN_DELTA src:seg:2
-#15 MAP_PROJ params:[(PROJ,0,2,0);(PROJ,1,3,0);(PROJ,2,4,0);(PROJ,3,1,0)] <- (#16@0)
+#15 MAP_PROJ params:[(PROJ,0,2,0);(PROJ,1,1,0)] <- (#16@0)
 #16 JOIN_DELTA_TRACE <- (#13@0,#17@1)
 #17 INTEGRATE_TRACE <- (#10@0)
 
@@ -820,22 +822,18 @@ fn sentinel_14b_scalar_uncorrelated() {
     let dump = dump_for(&mut client, &sn, "14b_scalar_uncorrelated", "v", &["a", "b"]);
     assert_eq!(dump, EXPECTED_14B);
 }
-// Multi-segment: seg 2 = the uncorrelated global MAX reduce (one-row output),
-// seg 1 = the pure-range INNER join of the outer against that value (the aggregate
-// value is the join key), seg 0 = the finalize. The `< NULL ⇒ UNKNOWN` semantics
-// over an empty inner side are weight-pinned by the existing test_scalar_subquery.py.
+// Two segments: seg 1 = the uncorrelated global MAX reduce (one-row output),
+// seg 0 = the pure-range INNER join of the outer against that value (the aggregate
+// value is the join key) — the bare `a.id` projection fuses into the join's own
+// output, so the HIR path needs no separate finalize segment. The `< NULL ⇒
+// UNKNOWN` semantics over an empty inner side are weight-pinned by the existing
+// test_scalar_subquery.py.
 const EXPECTED_14B: &str = r#"seg 0:
 #0 INTEGRATE_SINK <- (#1@0)
 #1 EXCHANGE_SHARD params:[(SHARD,0,0,0);(SHARD,1,1,0)] <- (#2@0)
-#2 MAP_PROJ params:[(PROJ,0,2,0)] <- (#3@0)
-#3 SCAN_DELTA src:seg:1
-
-seg 1:
-#0 INTEGRATE_SINK <- (#1@0)
-#1 EXCHANGE_SHARD params:[(SHARD,0,0,0);(SHARD,1,1,0)] <- (#2@0)
-#2 MAP_PROJ params:[(PROJ,0,3,0);(PROJ,1,4,0);(PROJ,2,5,0)] <- (#3@0)
+#2 MAP_PROJ params:[(PROJ,0,3,0)] <- (#3@0)
 #3 MAP_EXPR params:[(REINDEX,0,1,0);(REINDEX,1,4,0)] <- (#4@0)
-#4 UNION <- (#5@0,#14@1)
+#4 UNION <- (#5@0,#13@1)
 #5 MAP_PROJ params:[(PROJ,0,1,0);(PROJ,1,2,0);(PROJ,2,3,0);(PROJ,3,4,0);(PROJ,4,5,0)] <- (#6@0)
 #6 JOIN_DELTA_TRACE_RANGE params:[(RANGE_JOIN,0,0,2)] <- (#7@0,#9@1)
 #7 MAP_EXPR params:[(REINDEX,0,2,0)] <- (#8@0)
@@ -843,14 +841,13 @@ seg 1:
 #9 INTEGRATE_TRACE <- (#10@0)
 #10 PARTITION_FILTER <- (#11@0)
 #11 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#12@0)
-#12 FILTER <- (#13@0)
-#13 SCAN_DELTA src:seg:2
-#14 MAP_PROJ params:[(PROJ,0,3,0);(PROJ,1,4,0);(PROJ,2,5,0);(PROJ,3,1,0);(PROJ,4,2,0)] <- (#15@0)
-#15 JOIN_DELTA_TRACE_RANGE params:[(RANGE_JOIN,0,0,0)] <- (#11@0,#16@1)
-#16 INTEGRATE_TRACE <- (#17@0)
-#17 PARTITION_FILTER <- (#7@0)
+#12 SCAN_DELTA src:seg:1
+#13 MAP_PROJ params:[(PROJ,0,3,0);(PROJ,1,4,0);(PROJ,2,5,0);(PROJ,3,1,0);(PROJ,4,2,0)] <- (#14@0)
+#14 JOIN_DELTA_TRACE_RANGE params:[(RANGE_JOIN,0,0,0)] <- (#11@0,#15@1)
+#15 INTEGRATE_TRACE <- (#16@0)
+#16 PARTITION_FILTER <- (#7@0)
 
-seg 2:
+seg 1:
 #0 INTEGRATE_SINK <- (#1@0)
 #1 MAP_EXPR <- (#2@0)
 #2 REDUCE params:[(AGG_SPEC,0,4,2);(AGG_SPEC,1,1,0);(GLOBAL_GROUND,0,1,0)] <- (#3@0)

@@ -70,13 +70,93 @@ pub(crate) fn slot_of(layout: &[ColId], id: ColId) -> Result<usize, crate::error
         .ok_or_else(|| crate::error::GnitzSqlError::Plan("internal: HIR column reference has no layout slot".into()))
 }
 
-/// Leaf reference for HIR expressions. Only `Col` for now; `Subquery` arrives
-/// with subquery decorrelation (additive — one variant). `Clone` is required for
-/// `bind_structural`'s `R: Clone` bound (the CASE/COALESCE desugars clone
-/// sub-exprs).
+/// Leaf reference for HIR expressions: a resolved column, or a bound subquery
+/// awaiting decorrelation. A `Subquery` leaf is minted by bind (an EXISTS/IN/
+/// scalar node bound in place) and consumed entirely by the decorrelation rewrite
+/// (`hir::rewrite::decorrelate`), which rebuilds it into `Join`/`Reduce` structure
+/// and substitutes the leaf with a `Col`/computed expression — none survive to
+/// physicalization. `Clone` is required for `bind_structural`'s `R: Clone` bound
+/// (the CASE/COALESCE desugars clone sub-exprs); the `Box` keeps the leaf small
+/// and breaks the `HirRef → SubqueryRef → HirExpr` type cycle.
 #[derive(Clone)]
 pub(crate) enum HirRef {
     Col(ColId),
+    Subquery(Box<SubqueryRef>),
+}
+
+/// A bound subquery leaf, produced by bind and consumed by decorrelation. `rel`
+/// is the inner relation already bound to logical structure: a `Filter?(Get)` for
+/// EXISTS/IN, or a grouped/global `Reduce` for a scalar aggregate. `correlation`
+/// are the mixed-scope WHERE conjuncts (over the outer ∪ inner `ColId` space) that
+/// become the decorrelated `Join`'s ON; `in_pair` (present only for the IN shape)
+/// carries the `(outer, inner)` equality folded into the ON at decorrelation,
+/// together with its combined operand nullability driving the NOT-IN /
+/// mark-position 3VL guards.
+#[derive(Clone)]
+pub(crate) struct SubqueryRef {
+    pub kind: SubqueryKind,
+    pub rel: Rc<RelExpr>,
+    pub correlation: Vec<HirExpr>,
+    pub in_pair: Option<InPair>,
+}
+
+/// An IN subquery's `outer IN (SELECT inner …)` comparison: the column pair whose
+/// equality becomes the decorrelated join key, and whether either operand is
+/// nullable (nullability is meaningless without a pair, so it rides here rather
+/// than as a separate always-co-set flag).
+#[derive(Clone, Copy)]
+pub(crate) struct InPair {
+    pub outer: ColId,
+    pub inner: ColId,
+    pub nullable: bool,
+}
+
+/// The two decorrelation shapes a bound subquery takes. `Exists` (covering
+/// `[NOT] EXISTS` and `[NOT] IN`) decorrelates to a Semi/Anti/Mark join;
+/// `negated` folds the `NOT`. `Scalar` (covering a scalar aggregate subquery and
+/// the MIN/MAX-normalized range ANY/ALL) decorrelates to a `Reduce` joined to the
+/// outer, its value substituted for the leaf; `coalesce_zero` wraps a COUNT's
+/// substituted value in `COALESCE(_, 0)` (the never-NULL COUNT repair).
+#[derive(Clone, Copy)]
+pub(crate) enum SubqueryKind {
+    Exists { negated: bool },
+    Scalar { coalesce_zero: bool },
+}
+
+impl SubqueryRef {
+    /// The type of the value this subquery contributes where its leaf sits — an
+    /// EXISTS/IN test is the `0/1` truth constant (`I64`); a scalar aggregate is
+    /// its finalize type (AVG divides to `F64`, every other aggregate keeps its
+    /// raw output type). Used to type a computed projection column that embeds the
+    /// subquery leaf, before decorrelation substitutes the real expression.
+    pub(crate) fn value_type(&self) -> TypeCode {
+        match self.kind {
+            SubqueryKind::Exists { .. } => TypeCode::I64,
+            SubqueryKind::Scalar { coalesce_zero } => {
+                if coalesce_zero {
+                    return TypeCode::I64; // COALESCE(COUNT, 0)
+                }
+                match self.scalar_agg() {
+                    Ok(agg) if agg.func == AggFunc::Avg => TypeCode::F64,
+                    Ok(agg) => agg.out.def.type_code,
+                    Err(_) => TypeCode::I64,
+                }
+            }
+        }
+    }
+
+    /// The single aggregate of a scalar subquery — its `rel` is invariantly the
+    /// one-aggregate `Reduce` built by `build_scalar_reduce`. The one home for
+    /// reading that invariant: every decorrelation site that needs the aggregate
+    /// (finalize value, null test, uncorrelated join key) resolves it here.
+    pub(crate) fn scalar_agg(&self) -> Result<&HirAgg, crate::error::GnitzSqlError> {
+        match self.rel.as_ref() {
+            RelExpr::Reduce { aggs, .. } if !aggs.is_empty() => Ok(&aggs[0]),
+            _ => Err(crate::error::GnitzSqlError::Plan(
+                "internal: a scalar subquery's rel is not a one-aggregate Reduce".into(),
+            )),
+        }
+    }
 }
 
 /// The bound-expression IR hosted on the HIR leaf. Structurally identical to the
@@ -118,6 +198,11 @@ pub(crate) enum RelExpr {
         /// `classified` by the predicate-classification rewrite (`None` before it).
         on: Vec<HirExpr>,
         classified: Option<JoinClass>,
+        /// The synthetic `0/1` mark column of a `JoinType::Mark` decorrelation
+        /// (`Some` iff `kind == Mark`, minted at decorrelation). Its `ColId` is the
+        /// `HirRef::Col(mark_id)` leaf the substituted subquery expression reads,
+        /// and it appears in `cols()` after the left side.
+        mark: Option<HirCol>,
     },
     /// A GROUP BY / aggregate reduce. `group_cols` are `ColId`s of `input`; its
     /// output carries those same `ColId`s (source names) followed by each
@@ -265,14 +350,22 @@ impl RelExpr {
         Rc::new(RelExpr::Project { input, items })
     }
 
-    /// A join. `classified` is `None` until the predicate rewrite fills it.
-    pub(crate) fn join(left: Rc<RelExpr>, right: Rc<RelExpr>, kind: JoinType, on: Vec<HirExpr>) -> Rc<RelExpr> {
+    /// A join. `classified` is `None` until the predicate rewrite fills it; `mark`
+    /// is `Some` only for a `JoinType::Mark` decorrelation.
+    pub(crate) fn join(
+        left: Rc<RelExpr>,
+        right: Rc<RelExpr>,
+        kind: JoinType,
+        on: Vec<HirExpr>,
+        mark: Option<HirCol>,
+    ) -> Rc<RelExpr> {
         Rc::new(RelExpr::Join {
             left,
             right,
             kind,
             on,
             classified: None,
+            mark,
         })
     }
 
@@ -398,6 +491,7 @@ impl RelExpr {
                 kind,
                 on,
                 classified,
+                mark,
             } => {
                 let (nl, nr) = (f(left)?, f(right)?);
                 if same(&nl, left) && same(&nr, right) {
@@ -409,6 +503,7 @@ impl RelExpr {
                         kind: *kind,
                         on: on.clone(),
                         classified: classified.clone(),
+                        mark: mark.clone(),
                     })
                 }
             }
@@ -445,11 +540,30 @@ impl RelExpr {
             RelExpr::Get { cols, .. } => cols.clone(),
             RelExpr::Filter { input, .. } => input.cols(),
             RelExpr::Project { items, .. } => items.iter().map(|e| e.out.clone()).collect(),
-            RelExpr::Join { left, right, kind, .. } => {
-                let mut cols = widen_cols(left.cols(), kind.preserves_right());
-                cols.extend(widen_cols(right.cols(), kind.preserves_left()));
-                cols
-            }
+            RelExpr::Join {
+                left,
+                right,
+                kind,
+                mark,
+                ..
+            } => match kind {
+                // A semi/anti join carries only the left (outer) columns; a mark
+                // join appends its synthetic `0/1` column after them. The equi/
+                // outer joins are left ++ right with the null-providing side widened
+                // per `kind` (`combined_payload_coldefs`, applied to the `HirCol`
+                // defs — same `ColId`s, widening changes only nullability).
+                JoinType::Semi | JoinType::Anti => left.cols(),
+                JoinType::Mark => {
+                    let mut cols = left.cols();
+                    cols.push(mark.clone().expect("Mark join carries a mark column"));
+                    cols
+                }
+                _ => {
+                    let mut cols = widen_cols(left.cols(), kind.preserves_right());
+                    cols.extend(widen_cols(right.cols(), kind.preserves_left()));
+                    cols
+                }
+            },
             RelExpr::Reduce {
                 input,
                 group_cols,

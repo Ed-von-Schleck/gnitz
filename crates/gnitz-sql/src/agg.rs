@@ -73,15 +73,10 @@ pub(crate) struct AggSpec {
 }
 
 /// The aggregate output type, via the single shared planner/engine rule
-/// (`gnitz_wire::agg_output_type`). AVG is planner-lowered (SUM/COUNT + a
-/// finalize divide) before the wire and always produces F64. A source-less
-/// aggregate (COUNT) passes I64, which the rule maps to its own default arms.
-pub(crate) fn agg_result_type(func: AggFunc, src_col: Option<usize>, cols: &[ColumnDef]) -> TypeCode {
-    agg_result_type_of(func, src_col.map(|c| &cols[c]))
-}
-
-/// [`agg_result_type`] over the argument column's definition directly — the form
-/// the typing pass uses, where no column positions are in scope.
+/// (`gnitz_wire::agg_output_type`), over the argument column's definition. AVG is
+/// planner-lowered (SUM/COUNT + a finalize divide) before the wire and always
+/// produces F64. A source-less aggregate (COUNT) passes I64, which the rule maps
+/// to its own default arms.
 pub(crate) fn agg_result_type_of(func: AggFunc, arg: Option<&ColumnDef>) -> TypeCode {
     let wire_func = match func {
         AggFunc::Avg => return TypeCode::F64,
@@ -717,11 +712,12 @@ mod tests {
             ],
             pk_cols: vec![0],
         };
-        assert_eq!(agg_result_type(AggFunc::Sum, Some(1), &s.columns), TypeCode::U64); // SUM(u64) → U64
-        assert_eq!(agg_result_type(AggFunc::Sum, Some(2), &s.columns), TypeCode::I64); // SUM(u32) → I64
-        assert_eq!(agg_result_type(AggFunc::Sum, Some(3), &s.columns), TypeCode::I64); // SUM(i64) → I64
-        assert_eq!(agg_result_type(AggFunc::Sum, Some(4), &s.columns), TypeCode::F64); // SUM(f64) → F64
-        assert_eq!(agg_result_type(AggFunc::Min, Some(1), &s.columns), TypeCode::U64);
+        let rt = |f, i: usize| agg_result_type_of(f, Some(&s.columns[i]));
+        assert_eq!(rt(AggFunc::Sum, 1), TypeCode::U64); // SUM(u64) → U64
+        assert_eq!(rt(AggFunc::Sum, 2), TypeCode::I64); // SUM(u32) → I64
+        assert_eq!(rt(AggFunc::Sum, 3), TypeCode::I64); // SUM(i64) → I64
+        assert_eq!(rt(AggFunc::Sum, 4), TypeCode::F64); // SUM(f64) → F64
+        assert_eq!(rt(AggFunc::Min, 1), TypeCode::U64);
         // MIN(u64) preserved
     }
 

@@ -11,11 +11,16 @@ use crate::ir::{BExpr, BinOp, BoundExpr};
 use gnitz_core::{ColumnDef, Schema};
 
 /// Substitute every `HirRef::Col(id)` leaf with `ColRef(position of id in
-/// layout)`. A `HirRef` with no layout slot is an internal compile error. (No
-/// `Subquery` arm exists yet; when it lands, this is the one point that rejects
-/// a survivor.)
+/// layout)`. A `HirRef` with no layout slot is an internal compile error, and a
+/// `HirRef::Subquery` leaf must have been consumed by decorrelation — its survival
+/// to physicalization is the one point that rejects it.
 pub(crate) fn resolve_refs(expr: &HirExpr, layout: &[ColId]) -> Result<BoundExpr, GnitzSqlError> {
-    expr.try_map_refs(&|HirRef::Col(id)| slot_of(layout, *id))
+    expr.try_map_refs(&|r| match r {
+        HirRef::Col(id) => slot_of(layout, *id),
+        HirRef::Subquery(_) => Err(GnitzSqlError::Plan(
+            "internal: subquery leaf survived to physicalization".into(),
+        )),
+    })
 }
 
 /// Resolve each conjunct against `layout` and AND-fold left-associatively
@@ -61,11 +66,7 @@ pub(crate) fn physicalize_projection(
     let mut proj_items: Vec<ProjItem> = Vec::with_capacity(items.len());
     let mut out_cols: Vec<ColumnDef> = Vec::with_capacity(items.len());
     for entry in items {
-        let bound = resolve_refs(&entry.expr, input_layout)?;
-        proj_items.push(match bound {
-            BoundExpr::ColRef(i) => ProjItem::PassThrough { src_col: i },
-            other => ProjItem::Computed { bound_expr: other },
-        });
+        proj_items.push(ProjItem::from_bound(resolve_refs(&entry.expr, input_layout)?));
         out_cols.push(entry.out.def.clone());
     }
     let perm = place_pk_front(&mut proj_items, &mut out_cols, input_schema);

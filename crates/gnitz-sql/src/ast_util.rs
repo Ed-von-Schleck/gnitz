@@ -107,6 +107,57 @@ pub(crate) fn agg_func_name(f: AggFunc) -> &'static str {
         .expect("every AggFunc spelling is in AGG_NAMES")
 }
 
+/// Classify an aggregate function call into `(func, arg)` — the one
+/// leaf-independent aggregate-call shape dispatch, composed from the name map and
+/// qualifier check above. `COUNT(*)` → `(Count, None)`, `COUNT(x)` →
+/// `(CountNonNull, Some(x))`, `SUM|MIN|MAX|AVG(x)` → `(that, Some(x))`. The
+/// argument expression is returned *unbound* for the caller to resolve against
+/// its own leaf (a schema index for the runtime `SingleTable` binder, a `ColId`
+/// for the HIR binders), so arity and argument-shape validation — and their error
+/// messages — have a single home every aggregate binder shares.
+pub(crate) fn classify_agg_call(
+    f: &sqlparser::ast::Function,
+) -> Result<(AggFunc, Option<&sqlparser::ast::Expr>), GnitzSqlError> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    reject_unsupported_fn_qualifiers(f, "aggregates")?;
+    let base = single_fn_name(f).and_then(agg_func_from_name).ok_or_else(|| {
+        GnitzSqlError::Unsupported(format!(
+            "function '{}' not supported",
+            f.name.to_string().to_ascii_lowercase()
+        ))
+    })?;
+    match base {
+        AggFunc::Count => {
+            if let FunctionArguments::List(list) = &f.args {
+                if list.args.len() == 1 {
+                    match &list.args[0] {
+                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => return Ok((AggFunc::Count, None)),
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => {
+                            return Ok((AggFunc::CountNonNull, Some(inner)))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(GnitzSqlError::Unsupported("COUNT: unsupported argument form".into()))
+        }
+        AggFunc::Sum | AggFunc::Min | AggFunc::Max | AggFunc::Avg => {
+            if let FunctionArguments::List(list) = &f.args {
+                if list.args.len() == 1 {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) = &list.args[0] {
+                        return Ok((base, Some(inner)));
+                    }
+                }
+            }
+            Err(GnitzSqlError::Unsupported(format!(
+                "{}: requires exactly one column argument",
+                agg_func_name(base)
+            )))
+        }
+        AggFunc::CountNonNull => unreachable!("agg_func_from_name never yields CountNonNull"),
+    }
+}
+
 /// True when a SELECT body is grouped: it carries a GROUP BY or an aggregate in
 /// its projection — the one disjunction behind every "route this body to the
 /// grouped builder / reject the grouped shape" test (the view-shape classifier,
@@ -194,88 +245,6 @@ pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Ex
     }
 }
 
-/// Rebuild twin of [`expr_operands`] for the purely structural nodes: apply `f`
-/// to every direct operand of a binary/unary op, parens, BETWEEN, or CASE and
-/// reassemble the node around the results; `Ok(None)` for any other node (a
-/// leaf, a subquery, a function — the caller's special arms). The expression
-/// rewriters delegate their structural recursion here so their node set cannot
-/// drift from the walkers' — a node recursed by one rewriter is recursed by all.
-pub(crate) fn map_structural_operands<E>(
-    e: &sqlparser::ast::Expr,
-    f: &mut dyn FnMut(&sqlparser::ast::Expr) -> Result<sqlparser::ast::Expr, E>,
-) -> Result<Option<sqlparser::ast::Expr>, E> {
-    use sqlparser::ast::{CaseWhen, Expr};
-    Ok(Some(match e {
-        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-            left: Box::new(f(left)?),
-            op: op.clone(),
-            right: Box::new(f(right)?),
-        },
-        Expr::UnaryOp { op, expr } => Expr::UnaryOp {
-            op: *op,
-            expr: Box::new(f(expr)?),
-        },
-        Expr::Nested(inner) => Expr::Nested(Box::new(f(inner)?)),
-        Expr::Between {
-            expr,
-            negated,
-            low,
-            high,
-        } => Expr::Between {
-            expr: Box::new(f(expr)?),
-            negated: *negated,
-            low: Box::new(f(low)?),
-            high: Box::new(f(high)?),
-        },
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-            case_token,
-            end_token,
-        } => {
-            let operand = operand.as_ref().map(|o| f(o).map(Box::new)).transpose()?;
-            let mut conds = Vec::with_capacity(conditions.len());
-            for cw in conditions {
-                conds.push(CaseWhen {
-                    condition: f(&cw.condition)?,
-                    result: f(&cw.result)?,
-                });
-            }
-            let else_result = else_result.as_ref().map(|er| f(er).map(Box::new)).transpose()?;
-            Expr::Case {
-                operand,
-                conditions: conds,
-                else_result,
-                case_token: case_token.clone(),
-                end_token: end_token.clone(),
-            }
-        }
-        _ => return Ok(None),
-    }))
-}
-
-/// Count the `[NOT] EXISTS` / `[NOT] IN (SELECT …)` subquery nodes anywhere in
-/// `e`. Subqueries are opaque leaves to `expr_operands`, so the walk visits each
-/// one (under OR/NOT, inside CASE, in a projection) without descending into its
-/// body — the mark dispatcher's "exactly one subquery per view" test.
-pub(crate) fn count_subqueries(e: &sqlparser::ast::Expr) -> usize {
-    use sqlparser::ast::Expr;
-    let here = usize::from(matches!(e, Expr::Exists { .. } | Expr::InSubquery { .. }));
-    here + expr_operands(e).into_iter().map(count_subqueries).sum::<usize>()
-}
-
-/// The first `[NOT] EXISTS` / `[NOT] IN (SELECT …)` subquery node anywhere in
-/// `e` (pre-order), walking the same node set as [`count_subqueries`]; the mark
-/// builder extracts its single subquery with this.
-pub(crate) fn find_subquery(e: &sqlparser::ast::Expr) -> Option<&sqlparser::ast::Expr> {
-    use sqlparser::ast::Expr;
-    if matches!(e, Expr::Exists { .. } | Expr::InSubquery { .. }) {
-        return Some(e);
-    }
-    expr_operands(e).into_iter().find_map(find_subquery)
-}
-
 /// The scalar expression of a projection item, or `None` for a wildcard.
 pub(crate) fn projection_item_expr(item: &sqlparser::ast::SelectItem) -> Option<&sqlparser::ast::Expr> {
     use sqlparser::ast::SelectItem;
@@ -287,18 +256,41 @@ pub(crate) fn projection_item_expr(item: &sqlparser::ast::SelectItem) -> Option<
     }
 }
 
-/// Count the `[NOT] EXISTS` / `[NOT] IN (SELECT …)` subquery nodes across the
-/// two expression surfaces of a SELECT — the WHERE and the projection items —
-/// the one definition of "which surfaces decide subquery detection", shared by
-/// the view-shape classifier and the direct-SELECT derivation gate.
-pub(crate) fn count_select_subqueries(select: &sqlparser::ast::Select) -> usize {
-    select.selection.iter().map(count_subqueries).sum::<usize>()
-        + select
-            .projection
-            .iter()
-            .filter_map(projection_item_expr)
-            .map(count_subqueries)
-            .sum::<usize>()
+/// The two expression surfaces subquery detection scans — a SELECT's WHERE and its
+/// projection items (a wildcard contributes none). The one definition of "which
+/// surfaces decide subquery detection", shared by the EXISTS/IN and scalar/ANY/ALL
+/// detectors below.
+fn select_exprs(select: &sqlparser::ast::Select) -> impl Iterator<Item = &sqlparser::ast::Expr> {
+    select
+        .selection
+        .iter()
+        .chain(select.projection.iter().filter_map(projection_item_expr))
+}
+
+/// Whether `select` carries a `[NOT] EXISTS` / `[NOT] IN (SELECT …)` subquery in
+/// its WHERE or projection. Subqueries are opaque leaves to `expr_operands`, so the
+/// walk visits each (under OR/NOT, inside CASE, in a projection) without descending
+/// into its body.
+pub(crate) fn has_exists_in_subquery(select: &sqlparser::ast::Select) -> bool {
+    select_exprs(select).any(expr_has_exists_in)
+}
+
+fn expr_has_exists_in(e: &sqlparser::ast::Expr) -> bool {
+    use sqlparser::ast::Expr;
+    matches!(e, Expr::Exists { .. } | Expr::InSubquery { .. }) || expr_operands(e).into_iter().any(expr_has_exists_in)
+}
+
+/// Whether `select` carries a scalar `Expr::Subquery` or an `Expr::AnyOp` /
+/// `Expr::AllOp` anywhere in its WHERE or projection. (EXISTS/IN are detected
+/// separately by [`has_exists_in_subquery`].)
+pub(crate) fn has_scalar_subquery(select: &sqlparser::ast::Select) -> bool {
+    select_exprs(select).any(expr_has_scalar_subquery)
+}
+
+fn expr_has_scalar_subquery(e: &sqlparser::ast::Expr) -> bool {
+    use sqlparser::ast::Expr;
+    matches!(e, Expr::Subquery(_) | Expr::AnyOp { .. } | Expr::AllOp { .. })
+        || expr_operands(e).into_iter().any(expr_has_scalar_subquery)
 }
 
 /// The classified shape of a FROM clause — the one definition of "a single plain

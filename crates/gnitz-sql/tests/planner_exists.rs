@@ -213,23 +213,30 @@ fn test_exists_rejections() {
          big DECIMAL(38,0) NOT NULL)",
     );
 
-    // Two subqueries anywhere in the view (here two WHERE conjuncts) → rejected
-    // by the total-count guard before any single-conjunct/mark classification.
-    assert_rejects(
-        &mut client,
-        &sn,
-        "CREATE VIEW r1 AS SELECT * FROM rj_a \
-         WHERE EXISTS (SELECT 1 FROM rj_b WHERE rj_b.k = rj_a.k) \
-         AND EXISTS (SELECT 1 FROM rj_b WHERE rj_b.w = rj_a.v)",
-        "at most one EXISTS/IN subquery per view",
+    // Two EXISTS subqueries now decorrelate into two chained semi-joins (each a
+    // separate segment) — no longer a rejection.
+    assert!(
+        try_exec(
+            &mut client,
+            &sn,
+            "CREATE VIEW r1 AS SELECT * FROM rj_a \
+             WHERE EXISTS (SELECT 1 FROM rj_b WHERE rj_b.k = rj_a.k) \
+             AND EXISTS (SELECT 1 FROM rj_b WHERE rj_b.w = rj_a.v)",
+        )
+        .is_ok(),
+        "two EXISTS subqueries should compose via decorrelation"
     );
-    // Same relation on both sides.
-    assert_rejects(
-        &mut client,
-        &sn,
-        "CREATE VIEW r2 AS SELECT * FROM rj_a \
-         WHERE EXISTS (SELECT 1 FROM rj_a AS x WHERE x.k = rj_a.k)",
-        "own FROM relation",
+    // EXISTS over the view's own FROM relation now composes: the self-collision
+    // wrapper gives the two join inputs distinct sources.
+    assert!(
+        try_exec(
+            &mut client,
+            &sn,
+            "CREATE VIEW r2 AS SELECT * FROM rj_a \
+             WHERE EXISTS (SELECT 1 FROM rj_a AS x WHERE x.k = rj_a.k)",
+        )
+        .is_ok(),
+        "same-relation EXISTS should compose via the self-collision wrapper"
     );
     // Outer-only conjunct inside the subquery WHERE.
     assert_rejects(

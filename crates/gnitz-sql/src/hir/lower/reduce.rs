@@ -7,7 +7,7 @@
 
 use super::super::physical;
 use super::super::{slot_of, ColId, ColIdGen, HirExpr, HirRef, ProjEntry, RelExpr};
-use super::{cut_segment, emit_filter, extract_scan_bound, split_filter, CutMemo, SegInput};
+use super::{cut_segment, emit_filter, extract_scan_bound, seginput_of_get, split_filter, CutMemo};
 use crate::agg::{
     emit_reduce, ensure_cardinality_count, group_col_reduce_pos, push_agg_specs, reduce_output_schema, AggSpec,
     ReduceShape,
@@ -48,25 +48,15 @@ pub(crate) fn lower_reduce(
     // Resolve the reduce's input: inline a base/segment `Get` (with WHERE + scan
     // bound), or cut a combine input (`Filter?(Join)`) to a hidden segment.
     let (inner_where, inner_source) = split_filter(input);
-    let (source, source_layout, bound, where_folded) = match inner_source {
-        RelExpr::Get {
-            tid,
-            schema,
-            cols,
-            from_catalog,
-        } => {
-            let layout: Vec<ColId> = cols.iter().map(|c| c.id).collect();
-            let folded = physical::fold_preds(inner_where, &layout)?;
-            let bound = extract_scan_bound(client, &folded, *from_catalog, *tid, schema)?;
-            let seg = SegInput {
-                tid: *tid,
-                schema: Rc::clone(schema),
-                layout: layout.clone(),
-                from_catalog: *from_catalog,
-            };
+    let (source, source_layout, bound, where_folded) = match seginput_of_get(inner_source) {
+        Some(seg) => {
+            // Base/segment Get: apply the WHERE + scan bound inline.
+            let folded = physical::fold_preds(inner_where, &seg.layout)?;
+            let bound = extract_scan_bound(client, &folded, seg.from_catalog, seg.tid, &seg.schema)?;
+            let layout = seg.layout.clone();
             (seg, layout, bound, folded)
         }
-        _ => {
+        None => {
             // Cut the whole input (WHERE included) to a hidden segment; the reduce
             // reads it delta-bounded with no bound / no re-applied WHERE.
             let mut live: HashSet<ColId> = HashSet::new();

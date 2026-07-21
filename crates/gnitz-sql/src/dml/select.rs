@@ -17,8 +17,8 @@
 use crate::access::{best_index_bound, try_extract_pk_in, try_extract_pk_range};
 use crate::agg::{synthetic_fold_cols, GroupByLayout};
 use crate::ast_util::{
-    body_is_grouped, classify_from, count_select_subqueries, extract_table_factor_name, is_bare_wildcard_projection,
-    FromShape,
+    body_is_grouped, classify_from, extract_table_factor_name, has_exists_in_subquery, has_scalar_subquery,
+    is_bare_wildcard_projection, FromShape,
 };
 use crate::bind::{bind_single_table, Binder};
 use crate::codec::project_schema::{build_read_projection, compile_projection_map};
@@ -32,9 +32,7 @@ use crate::plan::validate::{
     cte_select_body, non_recursive_ctes, reject_unhonored_query_clauses, reject_unhonored_select_clauses,
     HonoredClauses, HonoredQueryClauses,
 };
-use crate::plan::{
-    analyze_group_by, bind_having_expr, cte_passthrough, has_scalar_subquery, resolve_set_projection, HavingCtx,
-};
+use crate::plan::{analyze_group_by, bind_having_expr, cte_passthrough, resolve_set_projection, HavingCtx};
 use crate::SqlResult;
 use gnitz_core::protocol::encode_schema_block;
 use gnitz_core::{GnitzClient, ReduceOutKey, Schema, ZSetBatch, MAX_COLUMNS};
@@ -228,10 +226,10 @@ pub(crate) fn execute_select(
     // Step 4 — subquery walk over the selection and projection. A single-relation
     // subquery is detected by no earlier step; without this an EXISTS/IN in the
     // WHERE would surface as a low-level bind error and a projected scalar subquery
-    // as a generic projection error. EXISTS/IN (`count_select_subqueries`) is
+    // as a generic projection error. EXISTS/IN (`has_exists_in_subquery`) is
     // checked before the scalar / ANY / ALL forms (`has_scalar_subquery`),
     // mirroring the view-shape classifier.
-    if count_select_subqueries(select) > 0 {
+    if has_exists_in_subquery(select) {
         return reject_derivation("EXISTS/IN subquery");
     }
     if has_scalar_subquery(select) {

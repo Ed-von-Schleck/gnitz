@@ -1,11 +1,11 @@
-//! CREATE VIEW front door: validate the query envelope, inline CTEs, classify
-//! the view's shape, and dispatch to the matching builder. The single module in
-//! `plan/view` that knows about all the others.
+//! CREATE VIEW front door: validate the query envelope, inline CTEs / compile
+//! derived tables onto the chain, then drive the HIR pipeline (bind → decorrelate
+//! → classify → lower). The single module in `plan/view` that knows about all the
+//! others.
 
 use crate::ast_util::{
-    body_is_grouped, classify_from, collect_column_refs, collect_projection_column_refs, count_select_subqueries,
-    extract_name, extract_relation_name, extract_table_factor_name, flatten_conjuncts, is_bare_wildcard_projection,
-    FromShape,
+    body_is_grouped, classify_from, collect_column_refs, collect_projection_column_refs, extract_name,
+    extract_relation_name, extract_table_factor_name, is_bare_wildcard_projection, FromShape,
 };
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;
@@ -14,12 +14,11 @@ use crate::plan::validate::{
     cte_select_body, non_recursive_ctes, plain_select_body, reject_unhonored_query_clauses,
     reject_unhonored_select_clauses, validate_user_name, HonoredClauses, HonoredQueryClauses,
 };
-use crate::plan::view::{exists, group_by, join, scalar, simple, EmitPieces, ViewChain};
+use crate::plan::view::{group_by, join, simple, EmitPieces, ViewChain};
 use crate::SqlResult;
 use gnitz_core::{ColumnDef, GnitzClient, PlannedView, Schema};
 use sqlparser::ast::{
-    Expr, GroupByExpr, Ident, ObjectName, Query, Select, SelectItem, SetExpr, TableFactor, UnaryOperator,
-    WildcardAdditionalOptions,
+    Expr, GroupByExpr, Ident, ObjectName, Query, Select, SelectItem, SetExpr, TableFactor, WildcardAdditionalOptions,
 };
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -170,66 +169,17 @@ fn build_query_segments(
     inline_ctes(client, query, binder, chain)?;
     compile_derived_tables(client, query, binder, chain)?;
 
-    // `x = ANY (sub)` / `x <> ALL (sub)` are equivalent to IN / NOT IN — rewrite
-    // them up front so they classify to the existing semi/anti-join path rather
-    // than the scalar-subquery builder (range ANY/ALL stay for the scalar path).
-    let any_all_rewritten = scalar::rewrite_eq_any_ne_all(query);
-    let query: &Query = any_all_rewritten.as_ref().unwrap_or(query);
-
-    // Classify the final body's shape once (the load-bearing precedence the old
-    // guard ladder encoded), then emit its circuit pieces.
-    let shape = ViewShape::classify(query)?;
+    // Every view shape — linear, join, GROUP BY, DISTINCT, set operation, and every
+    // subquery form (EXISTS/IN, scalar aggregate, ANY/ALL) — routes through the HIR
+    // pipeline: bind the whole `query` to a logical `RelExpr` tree, decorrelate
+    // subqueries into `Join`/`Reduce` structure, classify predicates, then lower to
+    // circuit(s) — nested combine segments / self-collision pass-through wrappers
+    // land on `chain`, and the final step is emitted with `final_vid`.
     let final_vid = chain.owner_vid(client)?;
-    let (circuit, out_cols, pk_cols) = match shape {
-        // Linear, join, GROUP BY, DISTINCT, and set-operation views route through
-        // the HIR pipeline: bind the whole `query` to a logical `RelExpr` tree,
-        // classify predicates, then lower to circuit(s) — nested combine segments /
-        // self-collision pass-through wrappers land on `chain`, and the final step
-        // is emitted with `final_vid`.
-        ViewShape::Relational => {
-            let (rel, ids) = crate::hir::bind::bind_query(client, binder, query)?;
-            let rel = crate::hir::rewrite::classify(rel)?;
-            crate::hir::lower::lower(client, chain, rel, ids, final_vid)?
-        }
-        ViewShape::Subquery {
-            select,
-            subq,
-            outer_not,
-            local,
-        } => {
-            // The exists builder resolves its two relations against base tables
-            // only; composing it over compiled CTE/derived-table sub-plans is an
-            // unsupported combination.
-            if !chain.segments.is_empty() {
-                return Err(GnitzSqlError::Unsupported(
-                    "an EXISTS/IN subquery over a compiled CTE/derived-table sub-plan is not supported".to_string(),
-                ));
-            }
-            exists::emit_exists_pieces(client, final_vid, select, subq, outer_not, &local, binder)?
-        }
-        ViewShape::MarkSubquery(select) => {
-            // Shares the exists builder's two-relation resolution; composing over a
-            // compiled CTE/derived-table sub-plan is unsupported (same as Subquery).
-            if !chain.segments.is_empty() {
-                return Err(GnitzSqlError::Unsupported(
-                    "an EXISTS/IN subquery over a compiled CTE/derived-table sub-plan is not supported".to_string(),
-                ));
-            }
-            exists::emit_mark_pieces(client, final_vid, select, binder)?
-        }
-        ViewShape::ScalarSubquery(select) => {
-            // Decorrelates each scalar aggregate into a hidden reduce + join; the
-            // final linear runs over the composed hidden join `H`. Composing over a
-            // pre-compiled CTE/derived-table sub-plan is unsupported (same guard as
-            // the EXISTS paths).
-            if !chain.segments.is_empty() {
-                return Err(GnitzSqlError::Unsupported(
-                    "a scalar subquery over a compiled CTE/derived-table sub-plan is not supported".to_string(),
-                ));
-            }
-            scalar::emit_scalar_subquery_pieces(client, final_vid, select, binder, chain)?
-        }
-    };
+    let (rel, mut ids) = crate::hir::bind::bind_query(client, binder, query)?;
+    let rel = crate::hir::rewrite::decorrelate(rel, &mut ids)?;
+    let rel = crate::hir::rewrite::classify(rel)?;
+    let (circuit, out_cols, pk_cols) = crate::hir::lower::lower(client, chain, rel, ids, final_vid)?;
 
     // The final segment: the hidden segments already sit on the chain in
     // dependency order; append the (user-named or synthetic) final view. The
@@ -244,158 +194,6 @@ fn build_query_segments(
         pk_cols,
     });
     Ok(final_vid)
-}
-
-/// The classified shape of a CREATE VIEW body: which of the two remaining
-/// pipelines compiles it. Every relational shape — linear, join, GROUP BY,
-/// DISTINCT, set operation — is `Relational` and routes through HIR; only the
-/// three subquery shapes still have their own AST emitters. Classification order
-/// is load-bearing where those three are concerned (a JOIN and a grouped body
-/// both outrank the WHERE-subquery check, as they did in the old ladder).
-enum ViewShape<'a> {
-    /// A relational body the HIR pipeline compiles — a linear filter/map view, a
-    /// join FROM, a GROUP BY / aggregate, a DISTINCT, or a set operation. The
-    /// pipeline re-binds the whole `query`, so no classified `Select` is threaded here.
-    Relational,
-    /// A Simple-shaped view whose WHERE carries exactly one top-level
-    /// `[NOT] EXISTS (…)` / `x [NOT] IN (SELECT …)` conjunct — routed to the
-    /// semi/anti-join builder.
-    Subquery {
-        select: &'a Select,
-        /// The peeled `Exists`/`InSubquery` node (`Nested` and `NOT` wrappers
-        /// removed).
-        subq: &'a Expr,
-        /// True when a net-negating stack of `NOT` wrappers surrounded the
-        /// node; the builder folds it into the node's own `negated` flag.
-        outer_not: bool,
-        /// The remaining WHERE conjuncts, filtering the outer relation.
-        local: Vec<&'a Expr>,
-    },
-    /// A Simple-shaped view carrying exactly one `[NOT] EXISTS`/`[NOT] IN`
-    /// subquery in an *arbitrary* boolean position (under OR/NOT, inside CASE, or
-    /// projected as a column) — routed to the mark-join builder, which computes
-    /// the subquery's truth value as a `0/1` mark and lets ordinary expression
-    /// evaluation consume it. Reached only when the single-top-level-conjunct
-    /// `Subquery` fast path did not peel a clean conjunct.
-    MarkSubquery(&'a Select),
-    /// A Simple-shaped view whose WHERE or projection carries a scalar aggregate
-    /// subquery (`(SELECT AGG …)`) or an ANY/ALL quantifier — routed to the
-    /// scalar-subquery builder, which decorrelates each into a reduce + join.
-    ScalarSubquery(&'a Select),
-}
-
-/// Peel `Nested` wrappers and `NOT`s off a WHERE conjunct; when the core is a
-/// subquery test (`EXISTS` / `IN (SELECT …)`), return it with the net-negation
-/// flag — each peeled `NOT` toggles it, so `NOT (EXISTS …)` classifies like
-/// `NOT EXISTS …` and a double negation cancels.
-fn as_subquery_conjunct(e: &Expr) -> Option<(&Expr, bool)> {
-    let mut cur = e;
-    let mut outer_not = false;
-    loop {
-        match cur {
-            Expr::Nested(inner) => cur = inner,
-            Expr::UnaryOp {
-                op: UnaryOperator::Not,
-                expr,
-            } => {
-                outer_not = !outer_not;
-                cur = expr;
-            }
-            _ => break,
-        }
-    }
-    matches!(cur, Expr::Exists { .. } | Expr::InSubquery { .. }).then_some((cur, outer_not))
-}
-
-impl<'a> ViewShape<'a> {
-    fn classify(query: &'a Query) -> Result<ViewShape<'a>, GnitzSqlError> {
-        // Set operations (UNION/INTERSECT/EXCEPT) route through the HIR pipeline.
-        let select = match query.body.as_ref() {
-            SetExpr::SetOperation { .. } => return Ok(ViewShape::Relational),
-            SetExpr::Select(s) => s,
-            _ => {
-                return Err(GnitzSqlError::Unsupported(
-                    "CREATE VIEW only supports SELECT".to_string(),
-                ))
-            }
-        };
-
-        // DISTINCT routes through the HIR pipeline (checked before the single-FROM
-        // requirement, matching the old precedence).
-        if select.distinct.is_some() {
-            return Ok(ViewShape::Relational);
-        }
-        if select.from.len() != 1 {
-            return Err(GnitzSqlError::Unsupported(
-                "CREATE VIEW: only single FROM item supported".to_string(),
-            ));
-        }
-        // A JOIN (grouped or not) routes through the HIR pipeline, before the
-        // WHERE-subquery check.
-        if !select.from[0].joins.is_empty() {
-            return Ok(ViewShape::Relational);
-        }
-        // Exactly one `[NOT] EXISTS` / `[NOT] IN (SELECT …)` per view is
-        // supported, anywhere in the WHERE or the projection. Two or more →
-        // compose via stacked views. Counted across both surfaces up front (no
-        // regression — multi-subquery was always rejected). Checked after JOIN (a
-        // join-view WHERE is rejected wholesale by that builder) and before GROUP
-        // BY, which cannot host the subquery in one circuit (both subquery
-        // builders reject that combination with a targeted message).
-        let n_subq = count_select_subqueries(select);
-        if n_subq >= 2 {
-            return Err(GnitzSqlError::Unsupported(
-                "at most one EXISTS/IN subquery per view; compose via stacked views".into(),
-            ));
-        }
-        // Fast path: the one subquery is a clean top-level `AND` conjunct of the
-        // WHERE (no OR/NOT-combination, not projected) → the direct semi/anti
-        // filter view, which needs no mark column or filter step.
-        if let Some(selection) = &select.selection {
-            let mut conjuncts = Vec::new();
-            flatten_conjuncts(selection, &mut conjuncts);
-            let mut subq: Option<(&Expr, bool)> = None;
-            let mut local: Vec<&Expr> = Vec::new();
-            for &c in &conjuncts {
-                match as_subquery_conjunct(c) {
-                    Some(peeled) => subq = Some(peeled), // n_subq < 2 guarantees at most one
-                    None => local.push(c),
-                }
-            }
-            if let Some((node, outer_not)) = subq {
-                return Ok(ViewShape::Subquery {
-                    select,
-                    subq: node,
-                    outer_not,
-                    local,
-                });
-            }
-        }
-        // The one subquery sits under OR/NOT, inside CASE, or in the projection →
-        // the mark-join builder.
-        if n_subq == 1 {
-            return Ok(ViewShape::MarkSubquery(select));
-        }
-        // GROUP BY *or* a no-`GROUP BY` aggregate (`SELECT MIN(x) FROM t`) routes
-        // to the grouped builder: the latter is one logical group compiled as a
-        // reduce with an empty group-column set. Routing it here (rather than to
-        // `Simple`, which would refuse the aggregate in scalar lowering with a
-        // less specific error) reuses the entire grouped pipeline — the
-        // synthetic-PK branch and the strict projection validator both already
-        // handle the empty group set. A `MIN(x)+1` is detected too and rejected
-        // by that validator, not by `Simple`'s lowering.
-        if body_is_grouped(select) {
-            return Ok(ViewShape::Relational);
-        }
-        // A scalar aggregate subquery / ANY / ALL in the WHERE or projection routes
-        // to the scalar-subquery builder. Checked after the EXISTS/IN and GROUP BY
-        // paths: a view mixing an EXISTS/IN subquery with a scalar one lands on the
-        // EXISTS/mark path above and its scalar node is rejected at bind.
-        if scalar::has_scalar_subquery(select) {
-            return Ok(ViewShape::ScalarSubquery(select));
-        }
-        Ok(ViewShape::Relational)
-    }
 }
 
 /// Whether a single-SELECT body compiles straight into a hidden view: a JOIN

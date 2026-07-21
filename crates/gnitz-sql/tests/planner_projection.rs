@@ -581,7 +581,7 @@ fn test_direct_select_qualified_alias_and_duplicate_items() {
 
 /// A computed projection column is ALWAYS nullable, regardless of the source
 /// expression's actual nullability — the hardcoded-`true` rule
-/// (`resolve_proj_col_with`, mirrored by the HIR bind). Inferring it from operand
+/// (`resolve_proj_col`, mirrored by the HIR bind). Inferring it from operand
 /// nullability would flip `a + 1` over a NOT NULL `a` to non-nullable and silently
 /// diverge a downstream `IS NOT NULL` const-elision.
 #[test]

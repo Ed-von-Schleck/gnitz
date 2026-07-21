@@ -183,6 +183,67 @@ impl<R> BExpr<R> {
         })
     }
 
+    /// Rebuild the expression, expanding each leaf-bearing position into an
+    /// arbitrary sub-expression: `on_col` replaces a `ColRef(r)`, `on_null`
+    /// replaces an `IsNull(r)` / `IsNotNull(r)` (its `bool` is `want_null`).
+    /// Every other arm recurses structurally. This is the leaf-to-*expression*
+    /// substitution walk — distinct from [`try_map_refs`], which keeps each leaf a
+    /// leaf; the HIR's subquery decorrelation and mark-constant folding are its two
+    /// instantiations.
+    pub(crate) fn try_expand_leaves<E>(
+        &self,
+        on_col: &impl Fn(&R) -> Result<BExpr<R>, E>,
+        on_null: &impl Fn(&R, bool) -> Result<BExpr<R>, E>,
+    ) -> Result<BExpr<R>, E> {
+        Ok(match self {
+            BExpr::ColRef(r) => on_col(r)?,
+            BExpr::IsNull(r) => on_null(r, true)?,
+            BExpr::IsNotNull(r) => on_null(r, false)?,
+            BExpr::LitInt(v) => BExpr::LitInt(*v),
+            BExpr::LitFloat(v) => BExpr::LitFloat(*v),
+            BExpr::LitStr(s) => BExpr::LitStr(s.clone()),
+            BExpr::LitWide(s) => BExpr::LitWide(s.clone()),
+            BExpr::LitNull => BExpr::LitNull,
+            BExpr::BinOp(l, op, r) => BExpr::BinOp(
+                Box::new(l.try_expand_leaves(on_col, on_null)?),
+                *op,
+                Box::new(r.try_expand_leaves(on_col, on_null)?),
+            ),
+            BExpr::UnaryOp(op, inner) => BExpr::UnaryOp(*op, Box::new(inner.try_expand_leaves(on_col, on_null)?)),
+            BExpr::AggCall { func, arg } => BExpr::AggCall {
+                func: *func,
+                arg: arg
+                    .as_deref()
+                    .map(|a| a.try_expand_leaves(on_col, on_null))
+                    .transpose()?
+                    .map(Box::new),
+            },
+            BExpr::Case { branches, else_ } => BExpr::Case {
+                branches: branches
+                    .iter()
+                    .map(|(c, r)| {
+                        Ok((
+                            c.try_expand_leaves(on_col, on_null)?,
+                            r.try_expand_leaves(on_col, on_null)?,
+                        ))
+                    })
+                    .collect::<Result<_, E>>()?,
+                else_: else_
+                    .as_deref()
+                    .map(|e| e.try_expand_leaves(on_col, on_null))
+                    .transpose()?
+                    .map(Box::new),
+            },
+            BExpr::InList { inner, items } => BExpr::InList {
+                inner: Box::new(inner.try_expand_leaves(on_col, on_null)?),
+                items: items
+                    .iter()
+                    .map(|i| i.try_expand_leaves(on_col, on_null))
+                    .collect::<Result<_, E>>()?,
+            },
+        })
+    }
+
     /// Visit every leaf reference (the `ColRef` / `IsNull` / `IsNotNull`
     /// positions), depth-first. The one reference-collection walk.
     pub(crate) fn for_each_ref(&self, f: &mut impl FnMut(&R)) {

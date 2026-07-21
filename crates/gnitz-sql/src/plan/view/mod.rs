@@ -1,31 +1,26 @@
-//! CREATE VIEW circuit builders, one per view shape. `dispatch` is the front
-//! door (classify + route); `predicates` and `join` form the join cluster;
-//! `group_by`, `set_op`, and `simple` cover the remaining shapes. Exposed:
-//! the dispatch entry points plus the shared aggregate/projection analysis the
-//! ad-hoc fold path consumes; every emitter is internal to the cluster.
+//! CREATE VIEW circuit-building primitives, driven by the `crate::hir` lowering.
+//! `dispatch` is the front door (envelope validation + the HIR pipeline);
+//! `predicates` and `join` form the join cluster; `group_by`, `set_op`, and
+//! `simple` supply the AST-free emit primitives for the remaining shapes.
+//! Exposed: the dispatch entry points plus the shared aggregate/projection
+//! analysis the ad-hoc fold path consumes.
 
 mod dispatch;
-mod exists;
 mod group_by;
 // `pub(crate)` for the HIR lowering: `crate::hir` calls these modules' AST-free
 // primitives cross-module (a private `mod` is visible only to its parent's
-// descendants, and `hir` is not one). The primitives relocate into `hir/lower/`
-// once their old orchestration callers (`scalar`, `compile_hidden_body`) are
-// migrated and deleted.
+// descendants, and `hir` is not one).
 pub(crate) mod join;
 pub(crate) mod predicates;
-mod scalar;
 pub(crate) mod set_op;
 pub(crate) mod simple;
 
 pub(crate) use dispatch::{cte_passthrough, execute_alter_view, execute_create_view};
-// The single-relation aggregate analysis + HAVING binding and the bare-column
-// projection resolver double as the ad-hoc fold planner's front end
-// (`dml::select`) — re-exported so the view emitters themselves stay private.
-// `has_scalar_subquery` and `cte_passthrough` back the ad-hoc read route's
-// derivation-rejection / pass-through-CTE gate.
+// The single-relation aggregate analysis + HAVING binding double as the ad-hoc
+// fold planner's front end (`dml::select`) — re-exported so the view emitters
+// themselves stay private. `cte_passthrough` backs the ad-hoc read route's
+// pass-through-CTE gate.
 pub(crate) use group_by::{analyze_group_by, bind_having_expr, HavingCtx};
-pub(crate) use scalar::has_scalar_subquery;
 pub(crate) use set_op::resolve_set_projection;
 
 use crate::error::GnitzSqlError;

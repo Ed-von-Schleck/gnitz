@@ -37,12 +37,23 @@ use std::rc::Rc;
 ///     is emitted.
 ///
 /// `Full` satisfies both. `Inner` neither.
+///
+/// `Semi`, `Anti`, and `Mark` are the decorrelation-only kinds an EXISTS/IN
+/// subquery lowers to (never produced by a FROM-clause JOIN): a semi/anti join
+/// keeps/drops each left row by match existence, and a mark join tags each left
+/// row with a `0/1` match column. All three preserve neither side under the
+/// `preserves_left`/`preserves_right` predicates (they are `matches!`-based, so
+/// the new variants get `false` automatically), and carry only the left columns
+/// (plus, for `Mark`, the mark column) — see `RelExpr::cols`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JoinType {
     Inner,
     Left,
     Right,
     Full,
+    Semi,
+    Anti,
+    Mark,
 }
 
 impl JoinType {
@@ -970,18 +981,32 @@ fn equi_keep_combined(projection: &[SelectItem], j: &LoweredJoin) -> Result<Vec<
 /// witness), independently of the residual, and so would not retro-null-fill a row
 /// matched only by residual-failing pairs. A consistent boundary across all join
 /// shapes beats an inconsistent partial one; INNER residuals are fully supported.
-/// One home, so both join emitters reject identically.
+/// One home, so both join emitters and the decorrelated Semi/Anti/Mark joins
+/// reject identically. `Inner` alone allows a residual (a post-join filter);
+/// `Left/Right/Full` reject it (it would have to participate in the null-fill);
+/// `Semi/Anti/Mark` reject it with the EXISTS/IN correlation message (a residual
+/// correlation conjunct cannot participate in the match-existence decision).
 pub(crate) fn reject_outer_with_residual(kind: JoinType, residual_empty: bool) -> Result<(), GnitzSqlError> {
-    if kind != JoinType::Inner && !residual_empty {
-        return Err(GnitzSqlError::Unsupported(
+    if residual_empty {
+        return Ok(());
+    }
+    match kind {
+        JoinType::Inner => Ok(()),
+        JoinType::Left | JoinType::Right | JoinType::Full => Err(GnitzSqlError::Unsupported(
             "LEFT/RIGHT/FULL JOIN with a residual ON predicate (a non-equi/non-range \
              conjunct, or a second range conjunct) is not supported; the residual \
              would have to participate in the outer null-fill. Use INNER JOIN, or \
              move the predicate to a WHERE over a wrapping view."
                 .into(),
-        ));
+        )),
+        JoinType::Semi | JoinType::Anti | JoinType::Mark => Err(GnitzSqlError::Unsupported(
+            "EXISTS/IN correlation contains a conjunct the semi-join cannot consume \
+             (a non-equality/non-range comparison, a second range conjunct, or an OR \
+             group spanning both relations); it would have to participate in the \
+             match-existence decision. Filter inside the subquery or a wrapping view."
+                .into(),
+        )),
     }
-    Ok(())
 }
 
 /// The range-join output pair-PK arity cap (`a.pk_count + b.pk_count ≤

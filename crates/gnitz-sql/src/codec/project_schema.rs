@@ -13,13 +13,25 @@ use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use crate::lower::compile_bound_expr;
 use gnitz_core::{ColumnDef, ExprBuilder, ExprProgram, Schema};
-use sqlparser::ast::{Expr, SelectItem};
+use sqlparser::ast::SelectItem;
 
 /// One output column of a projection: a verbatim source column
 /// (`PassThrough`) or a value derived by an expression (`Computed`).
 pub(crate) enum ProjItem {
     PassThrough { src_col: usize },
     Computed { bound_expr: BoundExpr },
+}
+
+impl ProjItem {
+    /// Classify a *resolved* expression into an emission item: a bare column ref
+    /// is a zero-cost `PassThrough`, everything else a `Computed` program. The one
+    /// home for the split every physicalized projection makes.
+    pub(crate) fn from_bound(bound: BoundExpr) -> ProjItem {
+        match bound {
+            BoundExpr::ColRef(src_col) => ProjItem::PassThrough { src_col },
+            bound_expr => ProjItem::Computed { bound_expr },
+        }
+    }
 }
 
 /// Resolve one *non-wildcard* SELECT item against `source_schema` into a
@@ -36,19 +48,6 @@ fn resolve_proj_col(
     idx: usize,
     source_schema: &Schema,
 ) -> Result<(ProjItem, ColumnDef), GnitzSqlError> {
-    resolve_proj_col_with(item, idx, source_schema, |e| bind_single_table(e, source_schema))
-}
-
-/// [`resolve_proj_col`] with a caller-supplied expression binder — the mark
-/// builder binds through [`crate::bind::bind_single_table_mark`] so a projected
-/// subquery resolves to its branch constant, while the pass-through/computed
-/// split, naming, and typing conventions stay defined here once.
-pub(crate) fn resolve_proj_col_with(
-    item: &SelectItem,
-    idx: usize,
-    source_schema: &Schema,
-    bind: impl FnOnce(&Expr) -> Result<BoundExpr, GnitzSqlError>,
-) -> Result<(ProjItem, ColumnDef), GnitzSqlError> {
     let (expr, alias) = match item {
         SelectItem::UnnamedExpr(expr) => (expr, None),
         SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
@@ -58,7 +57,7 @@ pub(crate) fn resolve_proj_col_with(
             ))
         }
     };
-    let bound = bind(expr)?;
+    let bound = bind_single_table(expr, source_schema)?;
     // A (possibly aliased / qualified / parenthesized) bare column reference is a
     // pass-through; an alias only renames the output column. Anything else is a
     // computed column, typed by `infer_type` and named by its alias or `_expr{idx}`.

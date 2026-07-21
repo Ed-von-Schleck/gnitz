@@ -6,7 +6,7 @@
 //! rules.
 
 use super::super::{slot_of, ColId, ColIdGen, EqPair, HirExpr, HirRange, HirRef, JoinClass, ProjEntry, RelExpr};
-use super::{resolve_collisions, resolve_input, CutMemo, SegInput};
+use super::{collect_live_cols, resolve_collisions, resolve_input, CutMemo, SegInput};
 use crate::error::GnitzSqlError;
 use crate::hir::physical;
 use crate::ir::BExpr;
@@ -34,11 +34,7 @@ struct Demand<'a> {
 impl Demand<'_> {
     /// Every `ColId` the demand references, into `out`.
     fn collect_refs(&self, out: &mut HashSet<ColId>) {
-        for e in self.items.iter().map(|i| &i.expr).chain(self.where_preds) {
-            e.for_each_ref(&mut |HirRef::Col(id)| {
-                out.insert(*id);
-            });
-        }
+        collect_live_cols(self.items.iter().map(|i| &i.expr).chain(self.where_preds), out);
     }
 }
 
@@ -518,7 +514,11 @@ fn keep_set(down: Demand<'_>, class: &JoinClass, kind: JoinType, left_in: &SegIn
         .chain(down.where_preds)
         .chain(&class.residual)
     {
-        e.for_each_ref(&mut |HirRef::Col(id)| mark(&mut keep, *id));
+        e.for_each_ref(&mut |r| {
+            if let HirRef::Col(id) = r {
+                mark(&mut keep, *id);
+            }
+        });
     }
     // Rule 3: preserved side's nullable join-key components.
     if kind.preserves_left() {
@@ -560,11 +560,7 @@ fn class_referenced(class: &JoinClass, live: &mut HashSet<ColId>) {
         live.insert(r.left);
         live.insert(r.right);
     }
-    for e in &class.residual {
-        e.for_each_ref(&mut |HirRef::Col(id)| {
-            live.insert(*id);
-        });
-    }
+    collect_live_cols(&class.residual, live);
 }
 
 /// The physical position of a bare `ColRef` against a layout.
