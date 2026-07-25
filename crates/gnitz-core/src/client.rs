@@ -7,7 +7,7 @@ use crate::protocol::{
     BatchAppender, ColData, ColumnDef, PkColumn, PkTuple, Schema, TypeCode, WireConflictMode, ZSetBatch,
 };
 use lru::LruCache;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 const SCHEMA_CACHE_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::new(64).unwrap();
@@ -231,6 +231,12 @@ pub struct GnitzClient {
     /// statement reuse it (see `begin_catalog_snapshot`). `None` outside a
     /// statement — reads scan the wire directly.
     catalog_snapshot: Option<HashMap<u64, Option<Arc<ZSetBatch>>>>,
+    /// Table ids whose index list has already been refreshed within the current
+    /// statement snapshot — the index-list half of that snapshot, so a multi-segment
+    /// statement pays one `GET_INDICES` per table instead of one per segment.
+    /// Cleared with the snapshot, so a `CREATE INDEX` is visible to the next
+    /// statement exactly as before.
+    indices_refreshed: HashSet<u64>,
     /// Open transaction, if any. `Some` between `txn_begin` and its
     /// `txn_commit`/`txn_rollback`: **every** user-table write on this client
     /// (`push`, `push_with_mode`, `delete` — and so every SQL DML statement, C
@@ -265,6 +271,7 @@ impl GnitzClient {
             index_cache: LruCache::new(SCHEMA_CACHE_CAP),
             serial_cache: HashMap::new(),
             catalog_snapshot: None,
+            indices_refreshed: HashSet::new(),
             txn: None,
             last_seen_lsn,
         })
@@ -298,6 +305,7 @@ impl GnitzClient {
     /// should hold a snapshot across a catalog write.
     pub fn begin_catalog_snapshot(&mut self) {
         self.catalog_snapshot = Some(HashMap::new());
+        self.indices_refreshed.clear();
     }
 
     /// End the current catalog snapshot (drop the cached batches). The next
@@ -305,6 +313,7 @@ impl GnitzClient {
     /// visible to the next — there is no cross-statement state to invalidate.
     pub fn end_catalog_snapshot(&mut self) {
         self.catalog_snapshot = None;
+        self.indices_refreshed.clear();
     }
 
     /// Scan a system table, served from the statement snapshot when one is
@@ -516,6 +525,17 @@ impl GnitzClient {
     /// would truncate the packed `u64`'s high columns and drop the
     /// `PK_LIST_PACKED_FLAG` at bit 63).
     fn refresh_indices(&mut self, table_id: u64) -> Result<Arc<Vec<IndexMeta>>, ClientError> {
+        // Inside a statement snapshot, one refresh per table is authoritative: a
+        // statement cannot create or drop an index and then read it back (DDL has
+        // its own atomic commit and is rejected mid-transaction), so a second probe
+        // can only re-fetch the same epoch. Without this a CREATE VIEW pays one
+        // GET_INDICES round-trip per linear segment for the same answer. An LRU
+        // eviction between the two calls simply falls through to the wire.
+        if self.catalog_snapshot.is_some() && !self.indices_refreshed.insert(table_id) {
+            if let Some((list, _)) = self.index_cache.get(&table_id) {
+                return Ok(Arc::clone(list));
+            }
+        }
         let cached_epoch = self.index_cache.peek(&table_id).map(|(_, e)| *e).unwrap_or(0);
         let (batch, epoch) = self.session.fetch_indices(table_id, cached_epoch)?;
         if epoch == cached_epoch && cached_epoch != 0 {
