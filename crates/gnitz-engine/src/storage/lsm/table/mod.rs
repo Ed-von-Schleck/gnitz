@@ -1221,7 +1221,7 @@ mod tests {
 
         let pk3 = |a: u64, b: u64, c: u64| opk_pk(&schema, &[a as u128, b as u128, c as u128]);
         let wide_batch = |rows: &[(Vec<u8>, i64, i64)]| -> Batch {
-            let mut b = Batch::with_schema(schema, rows.len().max(1));
+            let mut b = Batch::with_capacity(schema, rows.len().max(1));
             for (pk, w, val) in rows {
                 b.extend_pk_bytes(pk);
                 b.extend_weight(&w.to_le_bytes());
@@ -1611,7 +1611,7 @@ mod tests {
 
         let pk3 = |a: u64, b: u64, c: u64| opk_pk(&schema, &[a as u128, b as u128, c as u128]);
         let wide_batch = |rows: &[(Vec<u8>, i64, i64)]| -> Batch {
-            let mut b = Batch::with_schema(schema, rows.len().max(1));
+            let mut b = Batch::with_capacity(schema, rows.len().max(1));
             for (pk, w, val) in rows {
                 b.extend_pk_bytes(pk);
                 b.extend_weight(&w.to_le_bytes());

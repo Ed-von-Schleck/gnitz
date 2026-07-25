@@ -54,7 +54,7 @@ fn gather_source_rows(
     );
     // Phase 1 — candidates: every live row of each PK group. `pks.len()` sizes the
     // common (`unique_pk`) case exactly; a multi-payload PK grows the batch.
-    let mut cand = Batch::with_schema(src_schema, pks.len());
+    let mut cand = Batch::with_capacity(src_schema, pks.len());
     for pk in pks {
         // A `false` return means no base row at or past `pk` exists. `pks`
         // ascends within the chunk, so every remaining probe is larger and
@@ -99,13 +99,20 @@ fn row_in_index_range<'b>(
 }
 
 /// Keep the rows of `cand` whose index entry key lies in `[lo, hi)`. One
-/// contiguous pass over the flat batch; on a miss, one `scatter_copy`
-/// (`Batch::from_indexed_rows`).
+/// contiguous pass over the flat batch; on a miss, one range gather
+/// (`Batch::from_ranges`).
 ///
 /// On a `unique_pk` table every candidate matches (the row's own span produced
 /// the entry the walk yielded), so the scan finds no failing row and `cand` is
 /// returned verbatim — no copy, and no allocation at all. Only a real miss (a
 /// multi-payload PK group, or a NULL-gated row on a prefix seek) pays for one.
+/// The survivors of an index-key-ordered candidate batch come in long contiguous
+/// runs, so a range list is both smaller than a per-row index list and copied
+/// region-wise rather than row-by-row. The blob is *not* shared from `cand`
+/// (which is what makes this an `append_ranges` rather than `Batch::from_ranges`):
+/// this result is what the wire range-seek ships, and sharing would carry the
+/// dropped candidates' string spans over the wire. The per-cell relocate copies
+/// only the survivors' spans, deduped.
 fn retain_in_index_range(
     cand: Batch,
     src_schema: SchemaDescriptor,
@@ -127,17 +134,26 @@ fn retain_in_index_range(
     let Some(first_fail) = first_fail else {
         return Some(cand);
     };
-    // Rows below `first_fail` already passed — range-extend, never re-test.
-    let mut keep: Vec<u32> = (0..first_fail as u32).collect();
-    keep.extend(
-        (first_fail + 1..cand.count)
-            .filter(|&r| row_in_index_range(&mb, r, spec, idx_stride, &mut key, lo, hi))
-            .map(|r| r as u32),
-    );
+    // Rows below `first_fail` already passed — one range, never re-tested.
+    let mut keep: Vec<(usize, usize)> = Vec::new();
+    if first_fail > 0 {
+        keep.push((0, first_fail));
+    }
+    for r in first_fail + 1..cand.count {
+        if !row_in_index_range(&mb, r, spec, idx_stride, &mut key, lo, hi) {
+            continue;
+        }
+        match keep.last_mut() {
+            Some(last) if last.1 == r => last.1 = r + 1,
+            _ => keep.push((r, r + 1)),
+        }
+    }
     if keep.is_empty() {
         return None;
     }
-    Some(Batch::from_indexed_rows(&mb, &keep, &src_schema))
+    let mut out = Batch::with_capacity(src_schema, crate::storage::range_rows(&keep));
+    out.append_ranges(&cand, &keep);
+    Some(out)
 }
 
 /// A chunked walk of one secondary-index key range, gathering each in-range live

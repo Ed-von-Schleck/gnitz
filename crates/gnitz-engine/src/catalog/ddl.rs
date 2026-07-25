@@ -796,7 +796,7 @@ mod dup_key_tests {
     fn idx_batch(spans: &[[u8; 24]]) -> Batch {
         // Three U64 PK columns → a 24-byte composite span (> 16 bytes).
         let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0); 3], &[0, 1, 2]);
-        let mut b = Batch::with_schema(schema, spans.len().max(1));
+        let mut b = Batch::with_capacity(schema, spans.len().max(1));
         for s in spans {
             b.ensure_row_capacity();
             b.extend_pk_bytes(s);

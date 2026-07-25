@@ -394,21 +394,20 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
                         // column with dense outs `0..n` (the planner's
                         // `build_reindex_program`), so the kept-column list is read
                         // straight off the decoded program — the single source of
-                        // truth. A program of any other shape falls back to "all input
-                        // columns" (the range-join `nf_rekey` copies at an offset and
-                        // lands here). An out-of-range source column means a
-                        // corrupt/forged catalog — `columns[c]` would read a zeroed
-                        // slot — so fail the compile.
+                        // truth. Every reindex program the planner emits comes from
+                        // that one builder and is therefore dense; any other shape is
+                        // a corrupt/forged catalog, as is an out-of-range source
+                        // column (`columns[c]` would read a zeroed slot). Both fail
+                        // the compile rather than deriving a schema the program does
+                        // not fully write.
                         let n_in = in_reg_schema.num_columns();
-                        let payload_cols: Vec<u16> = match prog.payload_copy_srcs() {
-                            Some(srcs) => {
-                                if srcs.iter().any(|&c| c as usize >= n_in) {
-                                    return Err(CompileError::Rejected("map: reindex payload column out of range"));
-                                }
-                                srcs.iter().map(|&c| c as u16).collect()
-                            }
-                            None => (0..n_in as u16).collect(),
+                        let Some(srcs) = prog.payload_copy_srcs() else {
+                            return Err(CompileError::Rejected("map: reindex program is not a dense copy list"));
                         };
+                        if srcs.iter().any(|&c| c as usize >= n_in) {
+                            return Err(CompileError::Rejected("map: reindex payload column out of range"));
+                        }
+                        let payload_cols: Vec<u16> = srcs.iter().map(|&c| c as u16).collect();
                         if pk_n + payload_cols.len() > crate::schema::MAX_COLUMNS {
                             return Err(CompileError::Rejected("map: reindex output exceeds MAX_COLUMNS"));
                         }
@@ -416,12 +415,22 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
                     } else {
                         loaded.out_schema
                     };
-                    // Validate the decoded program against the resolved node schema,
-                    // then build its MAP `ScalarFunc` — the decode above is reused here
-                    // rather than re-lowering the blob a second time.
+                    // Validate the decoded program against the resolved node schema —
+                    // including that it writes every declared output slot, since the
+                    // map output arena is uninitialized — then build its MAP
+                    // `ScalarFunc`. The decode above is reused here rather than
+                    // re-lowering the blob a second time. Rejected, not asserted:
+                    // circuits are client-supplied catalog data.
                     prog.validate(Some(&in_reg_schema), Some(&node_schema))
                         .map_err(expr_reject("map: program/schema mismatch"))?;
-                    let fp = ctx.push_func(ScalarFunc::from_map(prog, &in_reg_schema, &node_schema));
+                    let func = ScalarFunc::from_map(prog, &in_reg_schema, &node_schema);
+                    // A reindex-free map inherits the input PK region verbatim
+                    // (`PkFill::Copy`), so the strides must agree. Both reindex arms
+                    // overwrite every row's PK, so only this arm cares.
+                    if reindex_cols.is_empty() && func.map_out_schema().pk_stride() != in_reg_schema.pk_stride() {
+                        return Err(CompileError::Rejected("map: output PK stride differs from the input's"));
+                    }
+                    let fp = ctx.push_func(func);
                     ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(node_schema);
                     let func_idx = ctx.builder.func_idx(fp);
                     // An Expression map without reindex columns is a plain

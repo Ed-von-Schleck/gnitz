@@ -30,7 +30,7 @@ fn make_schema(pk_index: u32, col_types: &[u8]) -> SchemaDescriptor {
 }
 
 fn make_int_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, u64, &[i64])]) -> Batch {
-    let mut batch = Batch::with_schema(*schema, rows.len().max(1));
+    let mut batch = Batch::with_capacity(*schema, rows.len().max(1));
     batch.count = 0;
     for &(pk, weight, null_word, cols) in rows {
         batch.extend_pk(pk as u128);
@@ -303,7 +303,7 @@ fn test_load_const_encoding() {
 fn test_string_eq_const() {
     let schema = make_schema(0, &[8, 11]);
     // Build a batch with a short string "hello"
-    let mut batch = Batch::with_schema(schema, 1);
+    let mut batch = Batch::with_capacity(schema, 1);
     batch.count = 0;
     batch.extend_pk(1u128);
     batch.extend_weight(&1i64.to_le_bytes());
@@ -758,7 +758,7 @@ fn test_fcmp_eq_ne_lt_le() {
 #[test]
 fn test_string_lt_le_const() {
     let schema = make_schema(0, &[8, 11]);
-    let mut batch = Batch::with_schema(schema, 1);
+    let mut batch = Batch::with_capacity(schema, 1);
     batch.count = 0;
     batch.extend_pk(1u128);
     batch.extend_weight(&1i64.to_le_bytes());
@@ -817,7 +817,7 @@ fn test_string_lt_le_const() {
 fn test_string_col_eq_col() {
     // Schema: pk(U64), str_a(STRING), str_b(STRING)
     let schema = make_schema(0, &[8, 11, 11]);
-    let mut batch = Batch::with_schema(schema, 2);
+    let mut batch = Batch::with_capacity(schema, 2);
     batch.count = 0;
 
     // Row 0: str_a="abc", str_b="abc" (equal)
@@ -1048,7 +1048,7 @@ fn make_german_string(s: &[u8]) -> [u8; 16] {
 /// Build a 1-row batch with the given schema, containing `s` as the first payload column.
 fn make_single_string_batch(schema: SchemaDescriptor, s: &[u8]) -> Batch {
     let gs = make_german_string(s);
-    let mut batch = Batch::with_schema(schema, 1);
+    let mut batch = Batch::with_capacity(schema, 1);
     batch.count = 0;
     batch.extend_pk(1u128);
     batch.extend_weight(&1i64.to_le_bytes());
@@ -1865,6 +1865,52 @@ fn test_validate_output_index_map_vs_filter() {
     );
     // The same output opcode in a FILTER (out_schema None) is a harmless no-op.
     assert_eq!(prog.validate(Some(&in_schema), None), Ok(()));
+}
+
+/// Output coverage: with an `out_schema`, every declared payload slot must be
+/// written. Counted by popcount, so a duplicate destination — which leaves
+/// another slot unwritten while the instruction count still matches — is caught
+/// by the same rule.
+#[test]
+fn test_validate_rejects_unwritten_output_slot() {
+    use crate::schema::type_code;
+    // in/out: [U64 PK, I64, I64] — two output payload slots.
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let map = |quads: &[u32]| LogicalProgram::from_wire(quads, 0, 0, vec![]).unwrap();
+
+    // Both slots written — accepted.
+    assert_eq!(
+        map(&[34, 0, 1, 0, 34, 0, 2, 1]).validate(Some(&schema), Some(&schema)),
+        Ok(())
+    );
+
+    // Only slot 0 written.
+    assert_eq!(
+        map(&[34, 0, 1, 0]).validate(Some(&schema), Some(&schema)),
+        Err(ExprValidateErr::OutputSlotUnwritten {
+            written: 0b01,
+            num_payload_cols: 2,
+        })
+    );
+
+    // Two CopyCols, both onto slot 0: the count matches but slot 1 is unwritten.
+    assert_eq!(
+        map(&[34, 0, 1, 0, 34, 0, 2, 0]).validate(Some(&schema), Some(&schema)),
+        Err(ExprValidateErr::OutputSlotUnwritten {
+            written: 0b01,
+            num_payload_cols: 2,
+        })
+    );
+
+    // A predicate over the same program is unaffected — no output plan.
+    assert_eq!(map(&[34, 0, 1, 0]).validate(Some(&schema), None), Ok(()));
 }
 
 #[test]

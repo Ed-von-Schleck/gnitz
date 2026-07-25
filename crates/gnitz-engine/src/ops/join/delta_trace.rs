@@ -156,7 +156,7 @@ mod tests {
         let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 0, 0, 1, 100)]));
         let mut ch = ReadCursor::from_owned(&[trace_batch], schema);
 
-        let mut delta = Batch::with_schema(schema, 2);
+        let mut delta = Batch::with_capacity(schema, 2);
         // Row 0: pk=(1,0,0) payload=10 w=+1
         delta.extend_pk_opk(&schema, &[1, 0, 0]);
         delta.extend_weight(&1i64.to_le_bytes());
@@ -222,7 +222,7 @@ mod tests {
     }
 
     fn make_i32_batch(schema: &SchemaDescriptor, rows: &[(i32, i64, i64)]) -> Batch {
-        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        let mut b = Batch::with_capacity(*schema, rows.len().max(1));
         for &(pk, w, val) in rows {
             b.extend_pk((pk as u32) as u128);
             b.extend_weight(&w.to_le_bytes());

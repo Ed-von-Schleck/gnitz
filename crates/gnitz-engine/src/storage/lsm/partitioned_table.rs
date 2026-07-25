@@ -461,7 +461,7 @@ pub(crate) fn partial_flush_lsn_fixture() -> PartialFlushLsn {
     };
     // One-row (pk, weight=1, payload) batch routed by its narrow PK.
     let row = |pk: u64, val: i64| {
-        let mut b = Batch::with_schema(schema(), 1);
+        let mut b = Batch::with_capacity(schema(), 1);
         b.extend_pk(pk as u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -718,7 +718,7 @@ mod tests {
             "prefix twins co-partition on col0",
         );
 
-        let mut batch = Batch::with_schema(schema, 2);
+        let mut batch = Batch::with_capacity(schema, 2);
         for (pk, val) in [(twin_a, 100i64), (twin_b, 200)] {
             batch.extend_pk_bytes(&pk);
             batch.extend_weight(&1i64.to_le_bytes());
@@ -837,7 +837,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut batch = Batch::with_schema(schema, 256);
+        let mut batch = Batch::with_capacity(schema, 256);
         let mut n = 0;
         let mut k = 0u64;
         while n < 200 {

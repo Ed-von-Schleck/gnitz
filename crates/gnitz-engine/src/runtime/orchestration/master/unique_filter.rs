@@ -414,7 +414,7 @@ mod unique_filter_tests {
 
     fn make_row_batch(schema: SchemaDescriptor, rows: &[(u128, i64, u64, i64)]) -> Batch {
         // rows: (pk, weight, null_word, payload_col1_i64_value)
-        let mut batch = Batch::with_schema(schema, rows.len().max(1));
+        let mut batch = Batch::with_capacity(schema, rows.len().max(1));
         for &(pk, weight, null_word, payload_val) in rows {
             let lo = [payload_val];
             let hi = [0u64];

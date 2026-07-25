@@ -1043,7 +1043,7 @@ impl MasterDispatcher {
                     gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT >> 20
                 ));
             }
-            let a = acc.get_or_insert_with(|| Batch::with_schema(expected, mb.count));
+            let a = acc.get_or_insert_with(|| Batch::with_capacity(expected, mb.count));
             a.append_mem_batch(mb);
             Ok(())
         })

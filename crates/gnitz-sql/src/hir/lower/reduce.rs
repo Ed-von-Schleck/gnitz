@@ -156,8 +156,7 @@ pub(crate) fn lower_reduce(
                 pk_renamed[reduce_col] = true;
                 continue;
             }
-            let tc = reduce_schema.columns[reduce_col].type_code;
-            eb.copy_col(tc as u32, reduce_col as u32, payload_idx);
+            eb.copy_col(reduce_col as u32, payload_idx);
             out_cols.push(entry.out.def.clone());
             out_layout.push(entry.out.id);
             payload_idx += 1;
@@ -167,8 +166,7 @@ pub(crate) fn lower_reduce(
         let resolved = physical::resolve_refs(&entry.expr, &reduce_layout)?;
         match &resolved {
             BoundExpr::ColRef(slot) => {
-                let tc = reduce_schema.columns[*slot].type_code;
-                eb.copy_col(tc as u32, *slot as u32, payload_idx);
+                eb.copy_col(*slot as u32, payload_idx);
             }
             _ => {
                 let reg = compile_bound_expr(&resolved, &reduce_schema.columns, &mut eb)?;

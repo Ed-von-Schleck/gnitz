@@ -42,7 +42,7 @@ mod tests {
 
     // Helper: build a minimal shard file in memory and write to disk
     fn write_test_shard(path: &str, pks: &[u64], weights: &[i64], schema: &SchemaDescriptor) {
-        let mut batch = Batch::with_schema(*schema, pks.len());
+        let mut batch = Batch::with_capacity(*schema, pks.len());
 
         for i in 0..pks.len() {
             batch.extend_pk(pks[i] as u128);
@@ -410,7 +410,7 @@ mod tests {
         );
 
         // Build shard with short strings
-        let mut batch = Batch::with_schema(schema, 3);
+        let mut batch = Batch::with_capacity(schema, 3);
         for pk in [1u64, 2, 3] {
             batch.extend_pk(pk as u128);
             batch.extend_weight(&1i64.to_le_bytes());
@@ -461,7 +461,7 @@ mod tests {
         let schema = SchemaDescriptor::new(&[SchemaColumn::new(TYPE_U64, 0), SchemaColumn::new(TYPE_I64, 1)], &[0]);
 
         // Build shard: key 1 = non-null (42), key 2 = null
-        let mut batch = Batch::with_schema(schema, 2);
+        let mut batch = Batch::with_capacity(schema, 2);
         // Row 1: non-null
         batch.extend_pk(1u128);
         batch.extend_weight(&1i64.to_le_bytes());
@@ -518,7 +518,7 @@ mod tests {
 
     /// Write a shard with 3-column rows: (pk, weight, col1_val, col2_val).
     fn write_3col_shard(path: &str, rows: &[(u64, i64, i64, i64)], schema: &SchemaDescriptor) {
-        let mut batch = Batch::with_schema(*schema, rows.len());
+        let mut batch = Batch::with_capacity(*schema, rows.len());
         for &(pk, w, c1, c2) in rows {
             batch.extend_pk(pk as u128);
             batch.extend_weight(&w.to_le_bytes());
@@ -890,7 +890,7 @@ mod tests {
     /// `(pk_bytes, weight, payload_i64_vals)`; rows must already be in
     /// `compare_pk_bytes` order (compaction assumes sorted inputs).
     fn write_bytes_pk_shard(path: &str, schema: &SchemaDescriptor, rows: &[(Vec<u8>, i64, Vec<i64>)]) {
-        let mut batch = Batch::with_schema(*schema, rows.len().max(1));
+        let mut batch = Batch::with_capacity(*schema, rows.len().max(1));
         for (pk, w, vals) in rows {
             batch.extend_pk_bytes(pk);
             batch.extend_weight(&w.to_le_bytes());
@@ -1126,7 +1126,7 @@ mod tests {
     /// Build a `(PK, payload)`-sorted shard file from `rows`. Long strings (> 12
     /// bytes) spill to the blob heap; `None` cells set the null bit.
     fn write_diff_shard(path: &str, schema: &SchemaDescriptor, rows: &[DiffRow]) {
-        let mut batch = Batch::with_schema(*schema, rows.len().max(1));
+        let mut batch = Batch::with_capacity(*schema, rows.len().max(1));
         for &(pk, w, c0, c1, c2) in rows {
             let mut nw = 0u64;
             let st0 = match c0 {
@@ -1204,7 +1204,7 @@ mod tests {
     ) {
         let shards = open_shards(input_files, schema).unwrap();
         let counts: Vec<usize> = shards.iter().map(|s| s.count).collect();
-        let mut batch = Batch::with_schema(*schema, 1024);
+        let mut batch = Batch::with_capacity(*schema, 1024);
         let mut blob_cache = BlobCacheGuard::acquire(schema, 1024);
         let mut checker = PkUniqueChecker::new();
         run_merge(&shards, &counts, schema, |src, row, w| {
@@ -1366,7 +1366,7 @@ mod tests {
         let shards = open_shards(input_files, schema).unwrap();
         let counts: Vec<usize> = shards.iter().map(|s| s.count).collect();
         let n = guard_keys.len();
-        let mut batches: Vec<Batch> = (0..n).map(|_| Batch::with_schema(*schema, 256)).collect();
+        let mut batches: Vec<Batch> = (0..n).map(|_| Batch::with_capacity(*schema, 256)).collect();
         let mut blob_caches: Vec<BlobCacheGuard> = (0..n).map(|_| BlobCacheGuard::acquire(schema, 256)).collect();
         let mut checkers: Vec<PkUniqueChecker> = (0..n).map(|_| PkUniqueChecker::new()).collect();
         run_merge(&shards, &counts, schema, |src, row, w| {

@@ -128,9 +128,9 @@ pub fn op_integrate_with_indexes(
     if let Some(avi_desc) = avi {
         let bake = avi_desc.bake;
         let num_aggs = bake.aggs.len();
-        // `Raw` from `with_schema`; the `extend_*` population below never raises
-        // it. Capacity is one entry per (row × value-indexed aggregate).
-        let mut avi_batch = Batch::with_schema(bake.schema, batch.count * num_aggs);
+        // `Raw` from `with_capacity`; the `extend_*` population below never
+        // raises it. Capacity is one entry per (row × value-indexed aggregate).
+        let mut avi_batch = Batch::with_capacity(bake.schema, batch.count * num_aggs);
 
         let extractor = &bake.extractor;
         let n = extractor.stride;
@@ -263,7 +263,7 @@ mod avi_encode_tests {
         let cs = schema.columns[2].size() as usize;
         let payload_idx = schema.try_payload_idx(2).unwrap();
 
-        let mut batch = Batch::with_schema(schema, vals.len().max(1));
+        let mut batch = Batch::with_capacity(schema, vals.len().max(1));
         for (i, &v) in vals.iter().enumerate() {
             // OPK-encode the PK region (sign-flip for a signed `b`); `opk_pk`
             // truncates each u128 to the column width, so a negative `v as u128`

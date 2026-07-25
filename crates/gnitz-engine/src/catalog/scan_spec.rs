@@ -1,9 +1,10 @@
 //! Parameterized bounded read (`ReadSpec`) execution — the worker half of the
 //! ad-hoc SELECT scan. Runs **once per worker over one merged partition cursor**:
-//! open a cursor for the bound, then per chunk `op_filter(predicate)` → the
-//! sink — rows (`op_map(projection)` → bounded top-k / materialize) or the
-//! aggregate hash-fold (`AdhocFold`). No DBSP circuit, no operator state, no
-//! exchange.
+//! open a cursor for the bound, then per chunk take the predicate's surviving
+//! row ranges and drive them into the sink — rows (projected onto the keeper,
+//! then bounded top-k / materialize) or the aggregate hash-fold (`AdhocFold`).
+//! Nothing between the source chunk and the sink is materialized. No DBSP
+//! circuit, no operator state, no exchange.
 //!
 //! The reply schema arrives as the client's raw echoed wire block (decoded by the
 //! worker one layer up); this module takes the decoded `SchemaDescriptor` and
@@ -16,7 +17,7 @@ use gnitz_wire::{AggReadSpec, OrderKey, RangeDescriptor, ReadBound, ReadSink, Re
 use super::store_io::SourceCursor;
 use super::*;
 use crate::expr::{LogicalProgram, ScalarFunc};
-use crate::ops::{op_filter, op_map, AdhocFold, ReindexSpec};
+use crate::ops::AdhocFold;
 use crate::schema::key::opk_key;
 use crate::schema::{null_bit, ColumnLocator, MAX_PK_BYTES};
 use crate::storage::{cmp_col_window, compare_pk_bytes, compare_rows, ColumnarSource, PkBuf};
@@ -71,28 +72,38 @@ impl CatalogEngine {
                 order,
                 limit_k,
             } => {
-                // op_map's identity reindex byte-copies the source OPK verbatim
-                // into the reply PK region, gated on stride equality (a mismatch
-                // would zero-fill it and corrupt the client's PK tiebreak). The
-                // trusted planner always matches; this guards the echoed client
-                // blob. (A fold sink emits a synthetic `_agg_pk` PK and never
-                // byte-copies the source PK, so the guard is rows-sink-only.)
-                if reply_schema.pk_stride() != src_schema.pk_stride() {
-                    return Err(format!(
-                        "scan_spec: reply pk_stride {} != source pk_stride {}",
-                        reply_schema.pk_stride(),
-                        src_schema.pk_stride()
-                    ));
-                }
+                // The rows sink byte-copies the source OPK verbatim into the reply
+                // PK region, so the strides must agree — a mismatch would leave
+                // the keeper's uninitialized tail as the client's PK tiebreak.
+                // With no projection the whole row is copied region-wise off
+                // `reply_schema`'s strides, so the reply must be the source schema
+                // outright; the fold sink checks the same way
+                // (`AdhocFold::new`). The trusted planner always matches; this
+                // guards the echoed client blob. (A fold sink emits a synthetic
+                // `_agg_pk` PK and never byte-copies the source PK, so the stride
+                // half is rows-sink-only.)
                 let projection = match projection.is_empty() {
-                    true => None,
-                    false => Some(compile_projection(projection, &src_schema, reply_schema)?),
+                    true => {
+                        if !reply_schema.same_physical_layout(&src_schema) {
+                            return Err("scan_spec: identity rows reply schema differs from the source".into());
+                        }
+                        None
+                    }
+                    false => {
+                        if reply_schema.pk_stride() != src_schema.pk_stride() {
+                            return Err(format!(
+                                "scan_spec: reply pk_stride {} != source pk_stride {}",
+                                reply_schema.pk_stride(),
+                                src_schema.pk_stride()
+                            ));
+                        }
+                        Some(compile_projection(projection, &src_schema, reply_schema)?)
+                    }
                 };
                 Ok(run_scan_rows_sink(
                     &mut source,
                     predicate.as_ref(),
                     projection.as_ref(),
-                    &src_schema,
                     reply_schema,
                     order,
                     *limit_k,
@@ -229,7 +240,7 @@ impl ScanSpecCursor {
                     return None;
                 }
                 let cap = (g.keys.len() - g.next).min(max_rows);
-                let mut out = Batch::with_schema(g.src_schema, cap);
+                let mut out = Batch::with_capacity(g.src_schema, cap);
                 while g.next < g.keys.len() && out.count < max_rows {
                     let key = g.keys[g.next];
                     g.next += 1;
@@ -262,31 +273,39 @@ fn run_scan_fold_sink(
     group_cap: usize,
 ) -> Result<Batch, String> {
     let mut fold = AdhocFold::new(src_schema, reply_schema, agg, group_cap)?;
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
     while let Some(chunk) = source.next_chunk(chunk_rows) {
         if chunk.count == 0 {
             continue;
         }
-        let filtered = match predicate {
-            Some(f) => op_filter(&chunk, f, src_schema),
-            None => chunk,
-        };
-        if filtered.count == 0 {
-            continue;
-        }
-        fold.fold_chunk(&filtered)?;
+        survivor_ranges(predicate, &chunk, &mut ranges);
+        fold.fold_ranges(&chunk, &ranges)?;
     }
     Ok(fold.finish())
+}
+
+/// The filter's surviving row ranges over one chunk — the whole chunk when there
+/// is no predicate. `out` is per-request scratch reused across chunks.
+fn survivor_ranges(predicate: Option<&ScalarFunc>, chunk: &Batch, out: &mut Vec<(usize, usize)>) {
+    match predicate {
+        Some(f) => f.filter_ranges(chunk, out),
+        None => {
+            out.clear();
+            out.push((0, chunk.count));
+        }
+    }
 }
 
 /// Run the rows sink over `source`, returning one keeper batch in the
 /// `reply_schema` shape (a superset of this worker's contribution; the client
 /// re-sorts the concatenation and applies the exact window).
-#[allow(clippy::too_many_arguments)]
+///
+/// Each chunk's survivor ranges are appended straight onto the keeper — there is
+/// no intermediate survivor batch and no projected batch.
 fn run_scan_rows_sink(
     source: &mut ScanSpecCursor,
     predicate: Option<&ScalarFunc>,
     projection: Option<&ScalarFunc>,
-    src_schema: &SchemaDescriptor,
     reply_schema: &SchemaDescriptor,
     order: &[OrderKey],
     limit_k: u64,
@@ -321,29 +340,38 @@ fn run_scan_rows_sink(
     let mut keeper = Batch::empty_with_schema(reply_schema);
     // Summed survivor weight — tracked only for the bounded shapes that read it.
     let mut summed: i64 = 0;
+    // Per-request scratch, reused across chunks.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
 
     while let Some(chunk) = source.next_chunk(drain_rows) {
         if chunk.count == 0 {
             continue;
         }
-        let filtered = match predicate {
-            Some(f) => op_filter(&chunk, f, src_schema),
-            None => chunk,
-        };
-        if filtered.count == 0 {
-            continue;
+        survivor_ranges(predicate, &chunk, &mut ranges);
+        // Weigh the survivors off the source — the same weights that land in the
+        // keeper, read from a contiguous region rather than row-by-row off the
+        // destination. `topk` needs the chunk total; `early_stop` needs the
+        // running prefix, so it can cut the range list at the first range that
+        // covers the window: with survivors ≫ `limit_k` that gathers ~`limit_k`
+        // rows instead of the whole chunk's survivors. Ranges are whole rows, so
+        // the worker still returns a ≥ `limit_k`-weight superset and the client
+        // applies the exact window. The two are mutually exclusive by
+        // construction (`order` empty or not), so a top-k scan never cuts.
+        if topk {
+            summed += ranges.iter().map(|&(s, e)| chunk.sum_weights(s, e)).sum::<i64>();
+        } else if early_stop {
+            for (i, &(s, e)) in ranges.iter().enumerate() {
+                summed += chunk.sum_weights(s, e);
+                if summed >= limit_k as i64 {
+                    ranges.truncate(i + 1);
+                    break;
+                }
+            }
         }
-        let projected = match projection {
-            Some(f) => op_map(&filtered, f, src_schema, ReindexSpec::None),
-            None => filtered,
-        };
-        if projected.count == 0 {
-            continue;
+        match projection {
+            None => keeper.append_ranges(&chunk, &ranges),
+            Some(p) => p.append_map_ranges(&chunk, &mut keeper, &ranges),
         }
-        if topk || early_stop {
-            summed += sum_weights(&projected);
-        }
-        keeper.append_batch(&projected, 0, projected.count);
 
         if topk && summed > 2 * limit_k as i64 {
             (keeper, summed) = topk_keep(keeper, &order_locs, reply_schema, limit_k);
@@ -485,10 +513,6 @@ fn scan_spec_cmp(
     }
 }
 
-fn sum_weights(batch: &Batch) -> i64 {
-    (0..batch.count).map(|i| batch.get_weight(i)).sum()
-}
-
 /// The half-open OPK PK key range `[start, end)` for `range` over `schema`'s PK,
 /// the base-PK sibling of `index_range_keys`: the cut → key mapping and the
 /// provably-empty verdicts are the shared `range_keys_from_cuts` (§ its doc);
@@ -541,8 +565,10 @@ fn compile_predicate(blob: &[u8], schema: &SchemaDescriptor) -> Result<ScalarFun
 }
 
 /// Decode + validate a client projection (MAP) blob and build its map
-/// `ScalarFunc`. `check_out` bounds every payload slot against
-/// `out_schema.num_payload_cols()`, so an OOB slot is a clean `Err`, not a panic.
+/// `ScalarFunc` — the same path the circuit compiler runs. `validate` bounds
+/// every payload slot against `out_schema.num_payload_cols()` and requires the
+/// program to write all of them, so an OOB or unwritten slot is a clean `Err`
+/// rather than a panic or a shipped byte of the keeper's recycled tail.
 fn compile_projection(
     blob: &[u8],
     in_schema: &SchemaDescriptor,
@@ -550,9 +576,8 @@ fn compile_projection(
 ) -> Result<ScalarFunc, String> {
     let dep = gnitz_wire::decode_expr_blob(blob).ok_or("scan_spec: corrupt projection blob")?;
     let prog = LogicalProgram::from_wire(&dep.code, dep.num_regs, 0, dep.const_strings)
+        .and_then(|p| p.validate(Some(in_schema), Some(out_schema)).map(|()| p))
         .map_err(|e| format!("scan_spec: invalid projection program: {e:?}"))?;
-    prog.validate(Some(in_schema), Some(out_schema))
-        .map_err(|e| format!("scan_spec: projection/schema mismatch: {e:?}"))?;
     Ok(ScalarFunc::from_map(prog, in_schema, out_schema))
 }
 

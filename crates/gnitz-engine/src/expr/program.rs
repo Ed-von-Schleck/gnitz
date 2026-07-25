@@ -41,6 +41,7 @@ pub(crate) enum ExprValidateErr {
     ColNotPayload { col: u32 },
     ColTooWideForRegister { col: u32, size: usize },
     OutputIdxOutOfRange { out: u32, num_payload_cols: usize },
+    OutputSlotUnwritten { written: u64, num_payload_cols: usize },
 }
 
 // ---------------------------------------------------------------------------
@@ -857,6 +858,15 @@ impl LogicalProgram {
     /// operands the blob-derived resolve entries index. `None` schemas skip the
     /// corresponding checks — a filter (no output plan) passes `out_schema =
     /// None`, so output opcodes (eval no-ops there) are not checked.
+    ///
+    /// With an `out_schema` this is also where **output coverage** is decided:
+    /// every declared payload slot must be written by exactly one `CopyCol` or
+    /// `Emit`. Map output batches are provisioned uninitialized
+    /// (`Batch::with_capacity`), so an unwritten slot ships recycled bytes rather
+    /// than a zero — and the ad-hoc scan writes onto a keeper tail that is
+    /// literally a previous request's memory. By popcount rather than a length
+    /// check, so a duplicate destination is caught too (it leaves another slot's
+    /// bit clear).
     pub(crate) fn validate(
         &self,
         in_schema: Option<&SchemaDescriptor>,
@@ -864,6 +874,9 @@ impl LogicalProgram {
     ) -> Result<(), ExprValidateErr> {
         use ExprValidateErr as E;
         use LogicalInstr as L;
+        // Bit per written output payload slot; `check_out` bounds every `out`
+        // below `num_payload_cols() <= 64`, so no shift can overflow.
+        let mut written = 0u64;
         let num_regs = self.num_regs;
         if num_regs as usize > MAX_REGS {
             return Err(E::TooManyRegs(num_regs));
@@ -874,8 +887,9 @@ impl LogicalProgram {
                 num_regs,
             });
         }
-        // Bound `out` against the output payload width (output opcodes only).
-        let check_out = |out: u32| -> Result<(), E> {
+        // Bound `out` against the output payload width and record it as written
+        // (output opcodes only).
+        let mut check_out = |out: u32| -> Result<(), E> {
             if let Some(os) = out_schema {
                 if out as usize >= os.num_payload_cols() {
                     return Err(E::OutputIdxOutOfRange {
@@ -883,6 +897,7 @@ impl LogicalProgram {
                         num_payload_cols: os.num_payload_cols(),
                     });
                 }
+                written |= 1u64 << out;
             }
             Ok(())
         };
@@ -995,6 +1010,14 @@ impl LogicalProgram {
                     check_col_in_range(in_schema, src_col)?;
                     check_out(out)?;
                 }
+            }
+        }
+        if let Some(os) = out_schema {
+            if written.count_ones() as usize != os.num_payload_cols() {
+                return Err(E::OutputSlotUnwritten {
+                    written,
+                    num_payload_cols: os.num_payload_cols(),
+                });
             }
         }
         Ok(())

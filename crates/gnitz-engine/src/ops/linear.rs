@@ -5,7 +5,7 @@
 
 use std::cmp::Ordering;
 
-use crate::expr::ScalarFunc;
+use crate::expr::{PkFill, ScalarFunc};
 use crate::schema::SchemaDescriptor;
 use crate::storage::{with_payload_cmp, Batch, Layout, MemBatch};
 
@@ -24,32 +24,15 @@ pub fn op_filter(batch: &Batch, func: &ScalarFunc, schema: &SchemaDescriptor) ->
         return Batch::empty_with_schema(schema);
     }
 
-    let mb = batch.as_mem_batch();
-    let mut output = Batch::with_schema(*schema, n);
+    // The survivor list is a plain per-call `Vec`: measured against a reused one
+    // it is a wash (glibc grows the fresh allocation in place), and it is ~1% of
+    // the gather it feeds either way.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    func.filter_ranges(batch, &mut ranges);
+    let mut output = Batch::from_ranges(batch, &ranges, schema);
 
-    // When the schema has a STRING/BLOB column, copy 16-byte string structs
-    // verbatim (no per-row relocation); offsets inside the structs stay valid
-    // because both blobs are identical. No `!batch.blob.is_empty()` guard: a
-    // batch whose strings are all short (≤12 bytes, stored inline) has an empty
-    // blob, but the bulk copy is still correct — short strings are self-contained
-    // in their struct and an empty shared blob is a no-op for the absent long
-    // strings. Gating on a non-empty blob needlessly dropped all-short-string
-    // batches to the slow `relocate_string_cell` path.
-    let blob_passthrough = schema.has_german_string();
-    if blob_passthrough {
-        output.share_blob_from(batch);
-    }
-
-    func.run_filter(&mb, n, |start, end| {
-        if blob_passthrough {
-            output.append_batch_no_blob_reloc(batch, start, end);
-        } else {
-            output.append_batch(batch, start, end);
-        }
-    });
-
-    // The appends above downgraded `output` to `Raw`. A filtered subset preserves
-    // the input's order, weights, and (PK, payload) distinctness, so it carries
+    // The gather downgraded `output` to `Raw`. A filtered subset preserves the
+    // input's order, weights, and (PK, payload) distinctness, so it carries
     // exactly the input's layout — a faithful propagate (no re-verify).
     output.inherit_layout(batch);
 
@@ -57,12 +40,13 @@ pub fn op_filter(batch: &Batch, func: &ScalarFunc, schema: &SchemaDescriptor) ->
     output
 }
 
-/// What overwrites `evaluate_map_batch`'s bulk PK copy after a MAP — see
-/// [`op_map`]. The stored instruction operand is `query::vm::ReindexOperand`
-/// (`Pack` there keeps a side-table range); the exec dispatch resolves it to
-/// this borrowed form.
+/// Who writes the output PK region of a MAP — see [`op_map`]. Anything but
+/// `None` stamps it here, so the map itself runs `PkFill::Reindex` and leaves it
+/// alone. The stored instruction operand is `query::vm::ReindexOperand` (`Pack`
+/// there keeps a side-table range); the exec dispatch resolves it to this
+/// borrowed form.
 pub enum ReindexSpec<'a> {
-    /// Plain batch map — the bulk PK copy stands.
+    /// Plain batch map — the map inherits the input PK verbatim.
     None,
     /// Set each PK to a hash of the full output row (all payload columns) for
     /// EXCEPT/INTERSECT/DISTINCT full-row set identity.
@@ -76,17 +60,14 @@ pub enum ReindexSpec<'a> {
 /// per `reindex` (see [`ReindexSpec`]). The output schema lives in the func
 /// (`ScalarFunc::Map.out_schema`); `in_schema` feeds the reindex packer.
 pub fn op_map(batch: &Batch, func: &ScalarFunc, in_schema: &SchemaDescriptor, reindex: ReindexSpec<'_>) -> Batch {
-    // A reindex-free MAP inherits the input PK region verbatim through
-    // `evaluate_map_batch`'s bulk copy; a stride mismatch there silently leaves
-    // every output PK zeroed (wrong retraction keys → weight corruption), so
-    // keep it loud. Reindex maps legitimately differ — the packer / row hash
-    // overwrites the PK region below.
-    debug_assert!(
-        !matches!(reindex, ReindexSpec::None) || func.map_out_schema().pk_stride() == in_schema.pk_stride(),
-        "reindex-free MAP output PK stride must equal the input's",
-    );
-
-    let mut output = func.evaluate_map_batch(batch);
+    // A reindex-free MAP inherits the input PK region verbatim; the reindex arms
+    // below overwrite every row of it, so the map must not write it at all
+    // (their output stride legitimately differs from the input's).
+    let pk = match reindex {
+        ReindexSpec::None => PkFill::Copy,
+        _ => PkFill::Reindex,
+    };
+    let mut output = func.evaluate_map_batch(batch, pk);
     if batch.count == 0 {
         return output;
     }
@@ -152,7 +133,7 @@ pub fn op_union(batch_a: Batch, batch_b: &Batch, schema: &SchemaDescriptor) -> B
     }
 
     // Unsorted: concatenate (the appends leave `output` `Raw`).
-    let mut output = Batch::with_schema(*schema, batch_a.count + b.count);
+    let mut output = Batch::with_capacity(*schema, batch_a.count + b.count);
     output.append_batch(&batch_a, 0, batch_a.count);
     output.append_batch(b, 0, b.count);
     gnitz_debug!(
@@ -176,7 +157,7 @@ where
 {
     let n_a = batch_a.count;
     let n_b = batch_b.count;
-    let mut output = Batch::with_schema(*schema, n_a + n_b);
+    let mut output = Batch::with_capacity(*schema, n_a + n_b);
 
     let mb_a = batch_a.as_mem_batch();
     let mb_b = batch_b.as_mem_batch();
@@ -275,7 +256,7 @@ pub fn op_null_extend(batch: &Batch, in_schema: &SchemaDescriptor, out_schema: &
         return Batch::empty_with_schema(out_schema);
     }
 
-    let mut output = Batch::with_schema(*out_schema, n);
+    let mut output = Batch::with_capacity(*out_schema, n);
     output.count = n;
 
     // Propagate the input blob so long (> 12 byte) STRING/BLOB values whose
@@ -299,7 +280,14 @@ pub fn op_null_extend(batch: &Batch, in_schema: &SchemaDescriptor, out_schema: &
             .copy_from_slice(&batch.col_data(pi)[..n * stride]);
     }
 
-    // Right-side payload columns are already zero-filled by with_schema.
+    // The appended right-side cells are NULL, and a NULL cell is zero — the same
+    // invariant `DirectWriter::write_row` and `BatchBuilder::put_null` uphold
+    // actively. Zero them here rather than provisioning the whole arena zeroed:
+    // this touches only the right columns, and it keeps every counted row fully
+    // written (see `Batch::with_capacity`).
+    for pi in in_npc..out_schema.num_payload_cols() {
+        output.col_data_mut(pi).fill(0);
+    }
 
     // Set null bits for all appended right-side columns
     let right_null_bits = super::util::all_payload_null_mask(right_npc);
@@ -452,7 +440,7 @@ mod tests {
     /// the resulting batch is marked sorted+consolidated (caller supplies rows
     /// already in (PK, payload) order).
     fn make_str_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, &str)]) -> Batch {
-        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        let mut b = Batch::with_capacity(*schema, rows.len().max(1));
         for &(pk, w, s) in rows {
             b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
@@ -695,7 +683,7 @@ mod tests {
         // long (> 12 byte) string in the output resolved against an empty
         // blob and returned garbage.
         let in_schema = make_schema_pk_u64_payload_string();
-        let mut b = Batch::with_schema(in_schema, 1);
+        let mut b = Batch::with_capacity(in_schema, 1);
         let long_str: &[u8] = b"a-fairly-long-string-value"; // 26 bytes > 12
         b.extend_pk(1u128);
         b.extend_weight(&1i64.to_le_bytes());
@@ -723,7 +711,7 @@ mod tests {
         // op_filter over a batch with a BLOB payload column holding a long
         // (> 12 byte) value. The output BLOB must resolve to the original.
         let schema = make_schema_pk_u64_payload_blob();
-        let mut b = Batch::with_schema(schema, 2);
+        let mut b = Batch::with_capacity(schema, 2);
         let long_blob: &[u8] = b"a-fairly-long-blob-value-xyz"; // 28 bytes > 12
                                                                 // Row 0: long blob, val passes always-true filter.
         b.extend_pk(1u128);
@@ -819,7 +807,7 @@ mod tests {
         let right_schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
         assert_eq!(right_schema.num_payload_cols(), 0);
 
-        let mut b = Batch::with_schema(in_schema, 1);
+        let mut b = Batch::with_capacity(in_schema, 1);
         b.extend_pk(1u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());

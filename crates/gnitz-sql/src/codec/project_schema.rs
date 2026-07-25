@@ -86,10 +86,7 @@ pub(crate) fn compile_projection_map(items: &[ProjItem], schema: &Schema) -> Res
     for (payload_idx, item) in items.iter().enumerate() {
         let payload_idx = payload_idx as u32;
         match item {
-            ProjItem::PassThrough { src_col } => {
-                let tc = schema.columns[*src_col].type_code as u32;
-                eb.copy_col(tc, *src_col as u32, payload_idx);
-            }
+            ProjItem::PassThrough { src_col } => eb.copy_col(*src_col as u32, payload_idx),
             ProjItem::Computed { bound_expr } => {
                 let reg = compile_bound_expr(bound_expr, &schema.columns, &mut eb)?;
                 eb.emit_col(reg, payload_idx);

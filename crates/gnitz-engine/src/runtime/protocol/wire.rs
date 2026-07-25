@@ -145,7 +145,7 @@ pub(crate) fn get_or_build_schema_wire_block(
 pub(crate) fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]], hidden_mask: u128) -> Batch {
     let ncols = schema.num_columns();
     let meta = META_SCHEMA_DESC;
-    let mut batch = Batch::with_schema(meta, ncols);
+    let mut batch = Batch::with_capacity(meta, ncols);
 
     for ci in 0..ncols {
         let col = &schema.columns[ci];
@@ -1589,7 +1589,7 @@ mod tests {
             ],
             &[0],
         );
-        let mut batch = Batch::with_schema(schema, 1);
+        let mut batch = Batch::with_capacity(schema, 1);
         batch.extend_pk(1u128);
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&0u64.to_le_bytes());

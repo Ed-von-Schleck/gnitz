@@ -274,7 +274,7 @@ fn preflight_signed_payload_projection_roundtrip() {
         ],
         &[0],
     );
-    let mut batch = Batch::with_schema(schema, 8);
+    let mut batch = Batch::with_capacity(schema, 8);
     // (pk, val, weight, null): two rows share val=-5 (the duplicate the
     // pre-flight exists to catch), one NULL, one retracted row.
     let rows: [(u128, i64, i64, u64); 6] = [
@@ -328,7 +328,7 @@ fn preflight_weight2_row_emits_adjacent_pair() {
         ],
         &[0],
     );
-    let mut batch = Batch::with_schema(schema, 4);
+    let mut batch = Batch::with_capacity(schema, 4);
     let rows: [(u128, i64, i64, u64); 3] = [
         (1, 7, 1, 0),
         (2, 9, 2, 0), // consolidated duplicate: weight 2
@@ -366,7 +366,7 @@ fn preflight_composite_projection_distinguishes_trailing_column() {
         ],
         &[0],
     );
-    let mut batch = Batch::with_schema(schema, 4);
+    let mut batch = Batch::with_capacity(schema, 4);
     // (pk, a, b): (10,7,1) and (11,7,2) share a=7 but differ in b → distinct.
     let rows: [(u128, u64, u64); 2] = [(10, 7, 1), (11, 7, 2)];
     for &(pk, a, b) in &rows {
@@ -419,7 +419,7 @@ fn index_key_spec_equals_projected_leading_span() {
     let idx_key_size = spec.key_size();
     assert_eq!(idx_key_size, 8 + 16, "I64→U64 (8) + U128 (16)");
 
-    let mut batch = Batch::with_schema(owner, 4);
+    let mut batch = Batch::with_capacity(owner, 4);
     let rows: [(u128, i64, u128); 3] = [(1, -3, 100), (2, 7, u128::MAX), (3, i64::MIN, 0)];
     for &(id, a, b) in &rows {
         unsafe {
@@ -465,7 +465,7 @@ fn index_key_spec_skips_any_null_column() {
     );
     let cols = [1u32, 2];
     let idx_schema = make_index_schema(&cols, &owner).unwrap();
-    let mut batch = Batch::with_schema(owner, 4);
+    let mut batch = Batch::with_capacity(owner, 4);
     // (id, a, b, null_word over payload slots): both present, a NULL, b NULL.
     let rows: [(u128, i64, i64, u64); 3] = [
         (1, 5, 6, 0b00), // both present → indexed
@@ -522,7 +522,7 @@ fn key_bytes_reused_buffer_zeros_tail_when_narrowing() {
     // then reclaim. col1 is arbitrary (it never lands in the narrow span).
     const COL1: u64 = 0xAABB_CCDD_EEFF_0011;
     const COL2: u64 = 0x1122_3344_5566_7788;
-    let mut batch = Batch::with_schema(owner, 1);
+    let mut batch = Batch::with_capacity(owner, 1);
     unsafe {
         batch.append_row_simple(
             1,

@@ -21,7 +21,7 @@ mod data_roundtrip_proptest;
 
 // ── Public API ──────────────────────────────────────────────────────────────
 pub use crate::schema::key::{partition_for_key, partition_for_pk_bytes};
-pub use batch::{write_to_batch, Batch};
+pub use batch::{range_rows, write_to_batch, Batch};
 pub use batch_wire::decode_mem_batch_from_wal_block;
 pub use error::StorageError;
 pub use lsm::partitioned_table::{partition_range, PartitionedTable, Routing, NUM_PARTITIONS};

@@ -354,6 +354,8 @@ fn decode_mem_batch_inner<'a>(
             pk_stride: strides[REG_PK],
             blob,
             count: n,
+            // A borrowed wire view shares no blob identity with any batch.
+            blob_id: 0,
         },
         header.total_size,
     ))
@@ -372,7 +374,7 @@ mod tests {
     #[test]
     fn decode_from_wal_block_rejects_mismatched_pk_stride() {
         let schema = single_col_pk_schema(type_code::U64); // pk_stride = 8
-        let mut b = Batch::with_schema(schema, 1);
+        let mut b = Batch::with_capacity(schema, 1);
         b.extend_pk(42u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -392,7 +394,7 @@ mod tests {
     #[test]
     fn decode_from_wal_block_rejects_mismatched_weight_region() {
         let schema = single_col_pk_schema(type_code::U64);
-        let mut b = Batch::with_schema(schema, 1);
+        let mut b = Batch::with_capacity(schema, 1);
         b.extend_pk(42u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -412,7 +414,7 @@ mod tests {
     #[test]
     fn decode_from_wal_block_rejects_region_offset_past_block() {
         let schema = single_col_pk_schema(type_code::U64);
-        let mut b = Batch::with_schema(schema, 1);
+        let mut b = Batch::with_capacity(schema, 1);
         b.extend_pk(42u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -437,7 +439,7 @@ mod tests {
     #[test]
     fn decode_mem_batch_rejects_blob_region_past_block() {
         let schema = single_col_pk_schema(type_code::U64);
-        let mut b = Batch::with_schema(schema, 1);
+        let mut b = Batch::with_capacity(schema, 1);
         b.extend_pk(42u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -464,7 +466,7 @@ mod tests {
     #[should_panic(expected = "wire-safe schemas")]
     fn encode_range_to_wire_panics_on_nonempty_blob() {
         let schema = single_col_pk_schema(type_code::U64);
-        let mut b = Batch::with_schema(schema, 1);
+        let mut b = Batch::with_capacity(schema, 1);
         b.extend_pk(1u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());

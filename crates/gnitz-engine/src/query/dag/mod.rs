@@ -656,7 +656,7 @@ mod tests {
         // Put one row in the index table's memtable.
         {
             let entry = dag.tables.get_mut(&70).unwrap();
-            let mut batch = Batch::with_schema(idx_schema, 1);
+            let mut batch = Batch::with_capacity(idx_schema, 1);
             batch.extend_pk(1u128);
             batch.extend_weight(&1i64.to_le_bytes());
             batch.extend_null_bmp(&0u64.to_le_bytes());
@@ -710,7 +710,7 @@ mod tests {
         .unwrap();
 
         // Seed the store with a negative-PK row (PK=-5, payload=100).
-        let mut seed = Batch::with_schema(schema, 1);
+        let mut seed = Batch::with_capacity(schema, 1);
         seed.extend_pk_opk(&schema, &[(-5i64 as u64) as u128]);
         seed.extend_weight(&1i64.to_le_bytes());
         seed.extend_null_bmp(&0u64.to_le_bytes());
@@ -722,7 +722,7 @@ mod tests {
         assert!(pt.has_pk_bytes(&opk), "seed row must be present");
 
         // DELETE PK=-5: a -1 retraction batch.
-        let mut del = Batch::with_schema(schema, 1);
+        let mut del = Batch::with_capacity(schema, 1);
         del.extend_pk_opk(&schema, &[(-5i64 as u64) as u128]);
         del.extend_weight(&(-1i64).to_le_bytes());
         del.extend_null_bmp(&0u64.to_le_bytes());
@@ -780,7 +780,7 @@ mod tests {
         .unwrap();
 
         let row_pk1 = |payload: i64, weight: i64| {
-            let mut b = Batch::with_schema(schema, 1);
+            let mut b = Batch::with_capacity(schema, 1);
             b.extend_pk_opk(&schema, &[1u128]);
             b.extend_weight(&weight.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
@@ -850,7 +850,7 @@ mod tests {
         .unwrap();
 
         // Seed an unrelated row (PK=-5) so the store is non-empty.
-        let mut seed = Batch::with_schema(schema, 1);
+        let mut seed = Batch::with_capacity(schema, 1);
         seed.extend_pk_opk(&schema, &[(-5i64 as u64) as u128]);
         seed.extend_weight(&1i64.to_le_bytes());
         seed.extend_null_bmp(&0u64.to_le_bytes());
@@ -859,7 +859,7 @@ mod tests {
         pt.ingest_owned_batch(seed).unwrap();
 
         let retract_pk7 = || {
-            let mut del = Batch::with_schema(schema, 1);
+            let mut del = Batch::with_capacity(schema, 1);
             del.extend_pk_opk(&schema, &[7u128]);
             del.extend_weight(&(-1i64).to_le_bytes());
             del.extend_null_bmp(&0u64.to_le_bytes());
@@ -876,7 +876,7 @@ mod tests {
         // Case 2 — tombstoned key: insert PK=7, retract to net zero, then retract
         // a second time. The first retraction finds the stored row (count 1); the
         // second finds nothing and emits no phantom.
-        let mut ins = Batch::with_schema(schema, 1);
+        let mut ins = Batch::with_capacity(schema, 1);
         ins.extend_pk_opk(&schema, &[7u128]);
         ins.extend_weight(&1i64.to_le_bytes());
         ins.extend_null_bmp(&0u64.to_le_bytes());
@@ -942,7 +942,7 @@ mod tests {
 
         // Intra-batch +1, -1, +1 on a fresh wide PK K2=(7,8,9): the delete must
         // clear the `seen` entry so the re-insert is not re-negated. Net +1.
-        let mut b = Batch::with_schema(schema, 3);
+        let mut b = Batch::with_capacity(schema, 3);
         for (payload, w) in [(10i64, 1i64), (10, -1), (20, 1)] {
             b.extend_pk_bytes(&pk24(7, 8, 9));
             b.extend_weight(&w.to_le_bytes());
@@ -1040,7 +1040,7 @@ mod tests {
             0,
             String::new(),
         );
-        let mut batch = Batch::with_schema(schema, 1);
+        let mut batch = Batch::with_capacity(schema, 1);
         batch.extend_pk(1u128);
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&0u64.to_le_bytes());

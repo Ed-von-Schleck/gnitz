@@ -145,9 +145,16 @@ impl AdhocFold {
         })
     }
 
-    /// Fold one surviving (post-filter) source chunk into the group state.
-    /// `Err` on exceeding the per-worker group cap.
-    pub(crate) fn fold_chunk(&mut self, chunk: &Batch) -> Result<(), String> {
+    /// Fold every `[start, end)` row range of one source chunk into the group
+    /// state — the caller passes the filter's surviving row ranges directly, so
+    /// no survivor batch is materialized. `Err` on exceeding the per-worker group
+    /// cap.
+    ///
+    /// The whole list rather than one range: `MemBatch` carries its region
+    /// offsets by value (~½ KiB), so building the chunk's and the
+    /// representative-rows' views once per *range* would cost more than the fold
+    /// itself over a fragmented survivor list.
+    pub(crate) fn fold_ranges(&mut self, chunk: &Batch, ranges: &[(usize, usize)]) -> Result<(), String> {
         let Self {
             plan,
             keyer,
@@ -170,7 +177,7 @@ impl AdhocFold {
         let Some(keyer) = keyer else {
             // Global aggregate: one group at ordinal 0, created on the first
             // surviving row — no per-row key hash, memo, or comparator probe.
-            for row in 0..chunk.count {
+            for row in ranges.iter().flat_map(|&(s, e)| s..e) {
                 let w = mb.get_weight(row);
                 debug_assert!(w > 0, "adhoc fold: scan cursor must deliver positive weights");
                 if w <= 0 {
@@ -188,7 +195,7 @@ impl AdhocFold {
         };
         // Rebuilt only when a group insert mutates `rep_rows` — never per row.
         let mut rep_mb = rep_rows.as_mem_batch();
-        for row in 0..chunk.count {
+        for row in ranges.iter().flat_map(|&(s, e)| s..e) {
             let w = mb.get_weight(row);
             // The scan cursor delivers consolidated, positive-net-weight rows
             // (ghosts excluded). MIN/MAX correctness depends on stepping only
@@ -249,7 +256,7 @@ impl AdhocFold {
     pub(crate) fn finish(self) -> Batch {
         let n_aggs = self.plan.agg_descs.len();
         // The exact output row count is the group count — reserve once.
-        let mut output = Batch::with_schema(self.plan.output_schema, self.rep_rows.count.max(1));
+        let mut output = Batch::with_capacity(self.plan.output_schema, self.rep_rows.count.max(1));
         let rep_mb = self.rep_rows.as_mem_batch();
         let stride = self.plan.output_schema.pk_stride() as usize;
         for ord in 0..self.rep_rows.count {
@@ -309,7 +316,7 @@ mod tests {
     /// (pk, weight, grp, Option<val>) → a consolidated source batch.
     fn build(rows: &[(u64, i64, i64, Option<i64>)]) -> Batch {
         let s = src_schema();
-        let mut b = Batch::with_schema(s, rows.len().max(1));
+        let mut b = Batch::with_capacity(s, rows.len().max(1));
         for &(pk, w, grp, val) in rows {
             b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
@@ -379,7 +386,7 @@ mod tests {
         };
         let (src, reply) = (src_schema(), reply_schema(5));
         let mut fold = AdhocFold::new(&src, &reply, &spec, 1000).unwrap();
-        fold.fold_chunk(&batch).unwrap();
+        fold.fold_ranges(&batch, &[(0, batch.count)]).unwrap();
         let g = by_group(&fold.finish(), 5);
         assert_eq!(g.len(), 3);
         assert_eq!(g[&10], (1, vec![Some(3), Some(2), Some(300), Some(100), Some(200)]));
@@ -395,13 +402,39 @@ mod tests {
         };
         let (src, reply) = (src_schema(), reply_schema(2));
         let mut fold = AdhocFold::new(&src, &reply, &spec, 1000).unwrap();
-        fold.fold_chunk(&build(&[(1, 1, 7, Some(10)), (2, 1, 7, Some(20))]))
-            .unwrap();
-        fold.fold_chunk(&build(&[(3, 1, 7, Some(5)), (4, 1, 8, Some(99))]))
-            .unwrap();
+        let (c1, c2) = (
+            build(&[(1, 1, 7, Some(10)), (2, 1, 7, Some(20))]),
+            build(&[(3, 1, 7, Some(5)), (4, 1, 8, Some(99))]),
+        );
+        fold.fold_ranges(&c1, &[(0, c1.count)]).unwrap();
+        fold.fold_ranges(&c2, &[(0, c2.count)]).unwrap();
         let g = by_group(&fold.finish(), 2);
         assert_eq!(g[&7], (1, vec![Some(3), Some(35)]));
         assert_eq!(g[&8], (1, vec![Some(1), Some(99)]));
+    }
+
+    /// The range bounds are the filter's survivor ranges: rows outside every
+    /// folded range contribute nothing, and a group discovered only in a skipped
+    /// range never appears.
+    #[test]
+    fn fold_ranges_folds_only_the_given_ranges() {
+        let spec = AggReadSpec {
+            group_cols: vec![1],
+            aggs: vec![agg(AGG_COUNT, 0), agg(AGG_SUM, 2)],
+        };
+        let (src, reply) = (src_schema(), reply_schema(2));
+        let batch = build(&[
+            (1, 1, 7, Some(10)),
+            (2, 1, 9, Some(999)), // skipped
+            (3, 1, 7, Some(20)),
+            (4, 1, 7, Some(30)),
+        ]);
+        let mut fold = AdhocFold::new(&src, &reply, &spec, 1000).unwrap();
+        // Two survivor ranges: [0,1) and [2,4) — row 1 (group 9) is filtered out.
+        fold.fold_ranges(&batch, &[(0, 1), (2, 4)]).unwrap();
+        let g = by_group(&fold.finish(), 2);
+        assert_eq!(g.len(), 1, "group 9 lived only in the skipped range");
+        assert_eq!(g[&7], (1, vec![Some(3), Some(60)]));
     }
 
     #[test]
@@ -421,8 +454,8 @@ mod tests {
             &[0],
         );
         let mut fold = AdhocFold::new(&src, &reply, &spec, 1000).unwrap();
-        fold.fold_chunk(&build(&[(1, 1, 0, Some(3)), (2, 1, 0, Some(9)), (3, 1, 0, Some(1))]))
-            .unwrap();
+        let b = build(&[(1, 1, 0, Some(3)), (2, 1, 0, Some(9)), (3, 1, 0, Some(1))]);
+        fold.fold_ranges(&b, &[(0, b.count)]).unwrap();
         let out = fold.finish();
         assert_eq!(out.count, 1);
         assert_eq!(read_i64_le(out.col_data(0), 0), 3); // COUNT*
@@ -439,9 +472,8 @@ mod tests {
         let (src, reply) = (src_schema(), reply_schema(1));
         // Cap of 2 distinct groups; a third distinct group trips it.
         let mut fold = AdhocFold::new(&src, &reply, &spec, 2).unwrap();
-        let err = fold
-            .fold_chunk(&build(&[(1, 1, 1, Some(0)), (2, 1, 2, Some(0)), (3, 1, 3, Some(0))]))
-            .unwrap_err();
+        let b = build(&[(1, 1, 1, Some(0)), (2, 1, 2, Some(0)), (3, 1, 3, Some(0))]);
+        let err = fold.fold_ranges(&b, &[(0, b.count)]).unwrap_err();
         assert!(err.contains("CREATE VIEW"), "{err}");
     }
 

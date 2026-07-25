@@ -75,7 +75,7 @@ impl CatalogEngine {
         if !cursor.seek_exact_live(pk) {
             return None;
         }
-        let mut batch = Batch::with_schema(entry.schema, 1);
+        let mut batch = Batch::with_capacity(entry.schema, 1);
         cursor.copy_current_row_into(&mut batch, cursor.current_weight);
         Some(batch)
     }
@@ -123,7 +123,7 @@ impl CatalogEngine {
                 (ci, pi, schema.columns[ci].size() as usize)
             })
             .collect();
-        let mut out = Batch::with_schema(result_schema, pks.len());
+        let mut out = Batch::with_capacity(result_schema, pks.len());
         let mut cursor = entry.handle.open_cursor();
         for pk in pks {
             // Order is not required for correctness; `advance_to` is

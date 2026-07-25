@@ -681,7 +681,7 @@ fn test_wire_group_footprint_non_wire_safe_shared_span_dedup() {
     let span = b"a long shared string span well over twelve bytes";
     let gs = german_string(span, &mut blob); // appended once → shared offset
 
-    let mut batch = Batch::with_schema(schema, 2);
+    let mut batch = Batch::with_capacity(schema, 2);
     for pk in [1u128, 2u128] {
         batch.extend_pk(pk);
         batch.extend_weight(&1i64.to_le_bytes());

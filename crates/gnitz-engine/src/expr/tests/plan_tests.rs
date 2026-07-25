@@ -1,4 +1,4 @@
-use super::super::plan::ScalarFunc;
+use super::super::plan::{PkFill, ScalarFunc};
 use super::super::program::LogicalProgram;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 use crate::storage::Batch;
@@ -13,7 +13,7 @@ fn make_schema(pk_index: u32, col_types: &[u8]) -> SchemaDescriptor {
 }
 
 fn make_int_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, u64, &[i64])]) -> Batch {
-    let mut batch = Batch::with_schema(*schema, rows.len().max(1));
+    let mut batch = Batch::with_capacity(*schema, rows.len().max(1));
     for &(pk, weight, null_word, cols) in rows {
         batch.extend_pk(pk as u128);
         batch.extend_weight(&weight.to_le_bytes());
@@ -36,7 +36,7 @@ fn test_projection_batch() {
 
     let prog = LogicalProgram::copy_cols(&[2, 1]);
     let func = ScalarFunc::from_map(prog, &in_schema, &out_schema);
-    let result = func.evaluate_map_batch(&batch);
+    let result = func.evaluate_map_batch(&batch, PkFill::Copy);
     assert_eq!(result.count, 2);
 
     let r0_col0 = i64::from_le_bytes(result.col_data(0)[0..8].try_into().unwrap());
@@ -63,7 +63,7 @@ fn test_map_copy_and_emit() {
     let prog = crate::expr::LogicalProgram::new(instrs, 3, 2, vec![]);
 
     let func = ScalarFunc::from_map(prog, &in_schema, &out_schema);
-    let result = func.evaluate_map_batch(&batch);
+    let result = func.evaluate_map_batch(&batch, PkFill::Copy);
     assert_eq!(result.count, 1);
 
     let v0 = i64::from_le_bytes(result.col_data(0)[0..8].try_into().unwrap());
@@ -78,7 +78,7 @@ fn test_empty_batch() {
     let batch = Batch::empty_with_schema(&schema);
 
     let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema);
-    let result = func.evaluate_map_batch(&batch);
+    let result = func.evaluate_map_batch(&batch, PkFill::Copy);
     assert_eq!(result.count, 0);
 }
 
@@ -96,7 +96,7 @@ fn test_map_blob_passthrough_and_fallback() {
     }
     // Input: [U64 PK, STRING s1 (short inline), STRING s2 (long, heap-backed)].
     fn build(schema: &SchemaDescriptor) -> Batch {
-        let mut b = Batch::with_schema(*schema, 2);
+        let mut b = Batch::with_capacity(*schema, 2);
         for (pk, s1, s2) in [
             (1u128, b"ab".as_slice(), b"long-string-one-xyz".as_slice()),
             (2u128, b"cd".as_slice(), b"long-string-two-abcdef".as_slice()),
@@ -120,7 +120,7 @@ fn test_map_blob_passthrough_and_fallback() {
         let out_schema = make_schema(0, &[type_code::U64, type_code::STRING, type_code::STRING]);
         let prog = LogicalProgram::copy_cols(&[2, 1]);
         let func = ScalarFunc::from_map(prog, &in_schema, &out_schema);
-        let out = func.evaluate_map_batch(&batch);
+        let out = func.evaluate_map_batch(&batch, PkFill::Copy);
         assert_eq!(out.count, 2);
         assert_eq!(read_gs(&out, 0, 0), b"long-string-one-xyz"); // s2 → out payload 0
         assert_eq!(read_gs(&out, 1, 0), b"ab"); // s1 → out payload 1
@@ -136,7 +136,7 @@ fn test_map_blob_passthrough_and_fallback() {
         let out_schema = make_schema(0, &[type_code::U64, type_code::STRING]);
         let prog = LogicalProgram::copy_cols(&[1]);
         let func = ScalarFunc::from_map(prog, &in_schema, &out_schema);
-        let out = func.evaluate_map_batch(&batch);
+        let out = func.evaluate_map_batch(&batch, PkFill::Copy);
         assert_eq!(out.count, 2);
         assert_eq!(read_gs(&out, 0, 0), b"ab");
         assert_eq!(read_gs(&out, 0, 1), b"cd");
@@ -180,7 +180,7 @@ fn test_map_pk_copy_col_u128_and_signed_i64() {
 
     let pk0: u128 = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210;
     let pk1: i64 = -5; // negative: exercises the OPK sign-bit flip on decode
-    let mut batch = Batch::with_schema(in_schema, 1);
+    let mut batch = Batch::with_capacity(in_schema, 1);
     batch.extend_pk_opk(&in_schema, &[pk0, pk1 as u64 as u128]);
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());
@@ -192,7 +192,7 @@ fn test_map_pk_copy_col_u128_and_signed_i64() {
         1, // PK col 1 (I64) → payload 1
         2, // payload col 2 (I64) → payload 2
     ]);
-    let out = ScalarFunc::from_map(prog, &in_schema, &out_schema).evaluate_map_batch(&batch);
+    let out = ScalarFunc::from_map(prog, &in_schema, &out_schema).evaluate_map_batch(&batch, PkFill::Copy);
 
     assert_eq!(out.count, 1);
     assert_eq!(out.pk_data(), batch.pk_data(), "PK region copied verbatim");
@@ -241,7 +241,7 @@ fn test_map_copy_col_widens_into_promoted_slot() {
     );
 
     let (c0, c1, c2, c3): (u16, i16, i8, u8) = (0xBEEF, -300, -7, 0xFE);
-    let mut batch = Batch::with_schema(in_schema, 1);
+    let mut batch = Batch::with_capacity(in_schema, 1);
     batch.extend_pk_opk(&in_schema, &[c0 as u128, c1 as u16 as u128]);
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());
@@ -255,7 +255,7 @@ fn test_map_copy_col_widens_into_promoted_slot() {
         2, // I8 payload → sign-extend
         3, // U8 payload → zero-extend
     ]);
-    let out = ScalarFunc::from_map(prog, &in_schema, &out_schema).evaluate_map_batch(&batch);
+    let out = ScalarFunc::from_map(prog, &in_schema, &out_schema).evaluate_map_batch(&batch, PkFill::Copy);
 
     assert_eq!(out.count, 1);
     let widened = |pi: usize| i64::from_le_bytes(out.col_data(pi)[..8].try_into().unwrap());

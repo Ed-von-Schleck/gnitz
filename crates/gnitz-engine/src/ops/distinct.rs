@@ -241,7 +241,7 @@ mod tests {
 
     fn make_batch_narrow<const N: usize>(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
         let n = rows.len();
-        let mut b = Batch::with_schema(*schema, n.max(1));
+        let mut b = Batch::with_capacity(*schema, n.max(1));
         let col_size = N;
         for &(pk, w, val) in rows {
             b.extend_pk(pk as u128);
@@ -319,7 +319,7 @@ mod tests {
 
     /// Build a batch with one short (inline, ≤12-byte) BLOB payload value per row.
     fn make_batch_blob(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8])]) -> Batch {
-        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        let mut b = Batch::with_capacity(*schema, rows.len().max(1));
         for &(pk, w, val) in rows {
             assert!(val.len() <= 12, "test helper only supports inline (short) blobs");
             let mut cell = [0u8; 16];
@@ -374,7 +374,7 @@ mod tests {
     }
 
     fn make_compound_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, i64, i64)]) -> Batch {
-        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        let mut b = Batch::with_capacity(*schema, rows.len().max(1));
         for &(c0, c1, w, val) in rows {
             b.extend_pk_bytes(&opk_pk(schema, &[c0 as u128, c1 as u128]));
             b.extend_weight(&w.to_le_bytes());
@@ -544,7 +544,7 @@ mod tests {
             &[0u32],
         );
         let max_pk = u128::MAX;
-        let mut trace_b = Batch::with_schema(schema, 1);
+        let mut trace_b = Batch::with_capacity(schema, 1);
         trace_b.extend_pk(max_pk);
         trace_b.extend_weight(&1i64.to_le_bytes());
         trace_b.extend_null_bmp(&0u64.to_le_bytes());
@@ -555,7 +555,7 @@ mod tests {
         let trace = Rc::new(trace_b);
         let mut ch = ReadCursor::from_owned(&[trace], schema);
 
-        let mut delta = Batch::with_schema(schema, 1);
+        let mut delta = Batch::with_capacity(schema, 1);
         delta.extend_pk(max_pk);
         delta.extend_weight(&1i64.to_le_bytes());
         delta.extend_null_bmp(&0u64.to_le_bytes());

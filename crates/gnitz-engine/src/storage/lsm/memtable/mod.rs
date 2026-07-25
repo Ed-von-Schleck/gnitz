@@ -74,7 +74,6 @@ impl MemTable {
 // std::f*::consts.
 #[allow(clippy::approx_constant)]
 mod tests {
-    use super::super::batch::relocate_string_cell;
     use super::super::merge::SortedMemBatch;
     use super::runs::consolidate_batches;
     use super::*;
@@ -149,10 +148,10 @@ mod tests {
         assert!(!Rc::ptr_eq(&snap2, &runs_pre[1]));
     }
 
-    /// A 2-row batch with descending PKs — not `(PK, payload)`-sorted. Default
-    /// flags (`with_schema` sets both true); callers adjust them per scenario.
+    /// A 2-row batch with descending PKs — not `(PK, payload)`-sorted; `Raw` as
+    /// constructed, callers adjust the flags per scenario.
     fn desc_two_row_batch(schema: &SchemaDescriptor) -> Batch {
-        let mut b = Batch::with_schema(*schema, 2);
+        let mut b = Batch::with_capacity(*schema, 2);
         for &(pk, val) in &[(20u128, 200i64), (10, 100)] {
             b.extend_pk(pk);
             b.extend_weight(&1i64.to_le_bytes());
@@ -276,7 +275,7 @@ mod tests {
     fn batch_append_batch() {
         let schema = make_schema_u64_i64();
         let src = make_batch(&schema, &[(10, 1, 100), (20, 1, 200), (30, 1, 300)]);
-        let mut dst = Batch::with_schema(schema, 8);
+        let mut dst = Batch::with_capacity(schema, 8);
 
         // Append all rows
         dst.append_batch(&src, 0, 3);
@@ -296,7 +295,7 @@ mod tests {
     fn batch_append_batch_negated() {
         let schema = make_schema_u64_i64();
         let src = make_batch(&schema, &[(10, 1, 100), (20, 2, 200)]);
-        let mut dst = Batch::with_schema(schema, 8);
+        let mut dst = Batch::with_capacity(schema, 8);
 
         dst.append_batch_negated(&src, 0, 2);
         assert_eq!(dst.count, 2);
@@ -365,7 +364,7 @@ mod tests {
     fn make_reduce_batch(rows: &[(u128, i64, i64, i64)]) -> Batch {
         let schema = make_reduce_schema();
         let n = rows.len();
-        let mut b = Batch::with_schema(schema, n.max(1));
+        let mut b = Batch::with_capacity(schema, n.max(1));
 
         for &(pk, w, gv, av) in rows {
             b.extend_pk(pk);
@@ -441,7 +440,7 @@ mod tests {
     fn test_append_row_simple_nullable_string() {
         // Schema: U64(pk=0), STRING(nullable)
         let schema = make_schema_cols(&[(type_code::U64, 0), (type_code::STRING, 1)], 0);
-        let mut batch = Batch::with_schema(schema, 4);
+        let mut batch = Batch::with_capacity(schema, 4);
 
         // Row 0: non-null string "not null"
         let s = b"not null";
@@ -480,7 +479,7 @@ mod tests {
             &[(type_code::U64, 0), (type_code::STRING, 0), (type_code::STRING, 0)],
             0,
         );
-        let mut batch = Batch::with_schema(schema, 4);
+        let mut batch = Batch::with_capacity(schema, 4);
 
         let cases: &[(&[u8], &[u8])] = &[
             (b"Alice", b"short"),
@@ -529,7 +528,7 @@ mod tests {
             ],
             0,
         );
-        let mut batch = Batch::with_schema(schema, 1);
+        let mut batch = Batch::with_capacity(schema, 1);
 
         let n = 12;
         let mut lo = vec![0i64; n];
@@ -609,7 +608,7 @@ mod tests {
             ],
             0,
         );
-        let mut batch = Batch::with_schema(schema, 1);
+        let mut batch = Batch::with_capacity(schema, 1);
         // A negative value with bits in both halves: bit 127 set. The I128 column
         // is the first (and only) payload column, so lo/hi are indexed at pi = 0.
         let v: i128 = -0x0123_4567_89AB_CDEF_1122_3344_5566_7788;
@@ -629,7 +628,7 @@ mod tests {
 
     /// Verify that `append_row` substitutes an empty string when the
     /// declared length would read past the end of `blob_src`. This matches
-    /// `relocate_string_cell` and prevents silent corruption from emitting
+    /// the string relocator and prevents silent corruption from emitting
     /// unrelated bytes from the start of the blob.
     #[test]
     fn test_append_row_blob_length_header() {
@@ -640,7 +639,7 @@ mod tests {
             ],
             0,
         );
-        let mut batch = Batch::with_schema(schema, 1);
+        let mut batch = Batch::with_capacity(schema, 1);
 
         // Build a German String struct with length=20 but only 5 blob bytes available.
         // This triggers the malformed-wire-data fallback branch in append_row.
@@ -692,7 +691,7 @@ mod tests {
         for (n, iters) in [(1_000usize, 4000usize), (16_000, 400), (128_000, 60), (512_000, 15)] {
             // One consolidated batch of `n` distinct U64 PKs (only the PK region
             // is read by the bloom).
-            let mut batch = Batch::with_schema(schema, n);
+            let mut batch = Batch::with_capacity(schema, n);
             for i in 0..n {
                 batch.extend_pk(i as u128);
                 batch.extend_weight(&1i64.to_le_bytes());
@@ -879,7 +878,7 @@ mod tests {
         assert!(!mt.should_flush(), "net state should be under threshold");
     }
 
-    /// Bug 5: relocate_string_cell must not panic when blob offset is past end.
+    /// Bug 5: the string relocator must not panic when the blob offset is past end.
     #[test]
     fn test_relocate_string_cell_out_of_bounds() {
         // Build a 16-byte German string struct for a long string (length > 12)
@@ -893,11 +892,10 @@ mod tests {
         src_struct[8..16].copy_from_slice(&bad_offset.to_le_bytes());
 
         let src_blob: &[u8] = &[0u8; 10]; // only 10 bytes, offset 9999 is OOB
-        let mut dst = [0u8; 16];
         let mut dst_blob = Vec::new();
 
         // Must not panic
-        relocate_string_cell(&src_struct, src_blob, &mut dst, &mut dst_blob);
+        let dst = crate::schema::relocate_german_string_vec(&src_struct, src_blob, &mut dst_blob, None);
 
         // The corrupted string should have length set to 0
         let out_len = u32::from_le_bytes(dst[0..4].try_into().unwrap());
@@ -920,7 +918,7 @@ mod tests {
         );
 
         // Build a source Batch with a STRING column containing a bad blob offset.
-        let mut src = Batch::with_schema(schema, 1);
+        let mut src = Batch::with_capacity(schema, 1);
 
         // German string struct: length=20, prefix="ABCD", offset=9999 (OOB)
         let length: u32 = 20;
@@ -940,7 +938,7 @@ mod tests {
         src.count = 1;
 
         // Build destination batch and call append_row_from_source
-        let mut dst = Batch::with_schema(schema, 1);
+        let mut dst = Batch::with_capacity(schema, 1);
         let mut blob_cache: BlobCache = BlobCache::default();
 
         // Must not panic

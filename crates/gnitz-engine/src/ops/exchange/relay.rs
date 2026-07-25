@@ -384,7 +384,7 @@ pub(crate) fn op_relay_broadcast(sources: &[Option<&Batch>], schema: &SchemaDesc
     }
     // Concatenate the disjoint slices into the full delta once (append_batch
     // relocates each source's blob, so independent source blobs stay valid).
-    let mut full = Batch::with_schema(*schema, total);
+    let mut full = Batch::with_capacity(*schema, total);
     for src in sources.iter().flatten() {
         if src.count > 0 {
             full.append_batch(src, 0, src.count);
@@ -427,7 +427,7 @@ mod tests {
 
     fn make_batch_str(schema: &SchemaDescriptor, rows: &[(u64, i64, &str)]) -> Batch {
         let n = rows.len();
-        let mut b = Batch::with_schema(*schema, n.max(1));
+        let mut b = Batch::with_capacity(*schema, n.max(1));
 
         for &(pk, w, s) in rows {
             b.extend_pk(pk as u128);
@@ -556,7 +556,7 @@ mod tests {
     }
 
     fn make_narrow_compound_batch(schema: &SchemaDescriptor, rows: &[(u128, i64, i64)]) -> Batch {
-        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        let mut b = Batch::with_capacity(*schema, rows.len().max(1));
         for &(pk, w, val) in rows {
             // `mk_compound_pk` packs c0 in the low 8 bytes and c1 in the high 8.
             // The compound PK at rest is OPK = col0_BE ++ col1_BE, so encode the
@@ -648,7 +648,7 @@ mod tests {
     }
 
     fn make_i64_batch(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> Batch {
-        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        let mut b = Batch::with_capacity(*schema, rows.len().max(1));
         for &(pk, w, val) in rows {
             // Signed PK at rest is OPK (big-endian, sign-bit flipped), so
             // memcmp == signed order. Encode through extend_pk_opk, not the
@@ -728,7 +728,7 @@ mod tests {
         let num_workers = 4;
         let pk_vals: &[u64] = &[1, 7, 42, 100, 255, 1024, 65537, 999983];
 
-        let mut b = Batch::with_schema(schema, pk_vals.len());
+        let mut b = Batch::with_capacity(schema, pk_vals.len());
 
         for &pk in pk_vals {
             b.extend_pk(pk as u128);
@@ -761,7 +761,7 @@ mod tests {
         ];
 
         let n = pks.len();
-        let mut b = Batch::with_schema(schema, n);
+        let mut b = Batch::with_capacity(schema, n);
 
         for &pk in pks {
             b.extend_pk(pk);
@@ -788,7 +788,7 @@ mod tests {
         let num_workers = 4;
         let same_val: i64 = 42;
 
-        let mut b = Batch::with_schema(schema, 4);
+        let mut b = Batch::with_capacity(schema, 4);
 
         for pk in [1u64, 2, 3, 4] {
             b.extend_pk(pk as u128);
@@ -1020,7 +1020,7 @@ mod tests {
         let num_workers = 4;
         let vals: Vec<i64> = (0..64i64).map(|i| i * 997 + 1).collect();
 
-        let mut b = Batch::with_schema(schema, vals.len());
+        let mut b = Batch::with_capacity(schema, vals.len());
 
         for (i, &v) in vals.iter().enumerate() {
             b.extend_pk((i + 1) as u128);
@@ -1204,7 +1204,7 @@ mod tests {
     }
 
     fn make_join_key_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, u128)]) -> Batch {
-        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        let mut b = Batch::with_capacity(*schema, rows.len().max(1));
         for &(pk, c1, c2) in rows {
             b.extend_pk(pk as u128);
             b.extend_weight(&1i64.to_le_bytes());
@@ -1322,7 +1322,7 @@ mod tests {
         );
         // PK ascending; rows pk=1 and pk=4 share key -5 → must co-locate.
         let rows: &[(u64, i32)] = &[(1, -5), (2, 7), (3, i32::MIN), (4, -5), (5, 0), (6, -1)];
-        let mut b = Batch::with_schema(schema, rows.len());
+        let mut b = Batch::with_capacity(schema, rows.len());
         for &(pk, key) in rows {
             b.extend_pk(pk as u128);
             b.extend_weight(&1i64.to_le_bytes());
@@ -1390,7 +1390,7 @@ mod tests {
         );
         // OPK order: i32::MIN sign-flips to 0x0000_0000 → sorts first, then ascending.
         let pk_rows: &[(i32, u64)] = &[(i32::MIN, 9), (-5, 9), (-1, 9), (3, 9)];
-        let mut pb = Batch::with_schema(pk_schema, pk_rows.len());
+        let mut pb = Batch::with_capacity(pk_schema, pk_rows.len());
         for &(pk, v) in pk_rows {
             let mut opk = [0u8; 4];
             gnitz_wire::encode_pk_column(&pk.to_le_bytes(), type_code::I32, &mut opk);

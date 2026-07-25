@@ -447,7 +447,7 @@ mod tests {
     }
 
     fn build_batch_u32_payload(schema: &SchemaDescriptor, rows: &[(u64, u32)]) -> Batch {
-        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        let mut b = Batch::with_capacity(*schema, rows.len().max(1));
         for &(pk, val) in rows {
             b.extend_pk(pk as u128);
             b.extend_weight(&1i64.to_le_bytes());
@@ -459,7 +459,7 @@ mod tests {
     }
 
     fn build_batch_uuid_payload(schema: &SchemaDescriptor, rows: &[(u64, u128)]) -> Batch {
-        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        let mut b = Batch::with_capacity(*schema, rows.len().max(1));
         for &(pk, val) in rows {
             b.extend_pk(pk as u128);
             b.extend_weight(&1i64.to_le_bytes());
@@ -520,7 +520,7 @@ mod tests {
         // stored in blob). Both PromoteKind::String code paths execute, and
         // distinct strings hash to distinct PKs.
         let schema = make_schema_pk_u64_payload_string();
-        let mut b = Batch::with_schema(schema, 2);
+        let mut b = Batch::with_capacity(schema, 2);
 
         // Row 0: short string "foo" (3 bytes, inline).
         b.extend_pk(1u128);
@@ -566,7 +566,7 @@ mod tests {
         // PromoteKind::String early-returns 0 for length==0 — assert this is
         // the contract, not an accidental side-effect of xxh on empty input.
         let schema = make_schema_pk_u64_payload_string();
-        let mut b = Batch::with_schema(schema, 1);
+        let mut b = Batch::with_capacity(schema, 1);
         b.extend_pk(1u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -728,7 +728,7 @@ mod tests {
         // bytes into an 8-byte buffer and panicking. BLOB shares the
         // German-string layout and must take the String hash path.
         let schema = make_schema_pk_u64_payload_blob();
-        let mut b = Batch::with_schema(schema, 1);
+        let mut b = Batch::with_capacity(schema, 1);
         b.extend_pk(1u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -752,7 +752,7 @@ mod tests {
     /// so the zeroed payload is irrelevant — the batch just needs `count == n`
     /// and a PK region of `n * pk_stride` bytes to receive the synthetic key.
     fn make_zeroed_batch(schema: &SchemaDescriptor, n: usize) -> Batch {
-        let mut b = Batch::with_schema(*schema, n.max(1));
+        let mut b = Batch::with_capacity(*schema, n.max(1));
         let pk_stride = schema.pk_stride() as usize;
         let zeros = [0u8; gnitz_wire::MAX_PK_BYTES];
         for _ in 0..n {
@@ -790,7 +790,7 @@ mod tests {
         let uv: u128 = 0xdead_beef_cafe_1234_5678_9abc_def0_0001;
         let fv: f64 = 2.5;
 
-        let mut b = Batch::with_schema(schema, 1);
+        let mut b = Batch::with_capacity(schema, 1);
         b.extend_pk_opk(&schema, &[pk0 as u128, pk1 as u128]);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -840,7 +840,7 @@ mod tests {
         ];
         for (schema, col) in cases {
             // Three rows with assorted values exercising the per-row read.
-            let mut b = Batch::with_schema(*schema, 3);
+            let mut b = Batch::with_capacity(*schema, 3);
             for r in 0..3u64 {
                 b.extend_pk((r + 1) as u128 * 11);
                 b.extend_weight(&1i64.to_le_bytes());
@@ -891,7 +891,7 @@ mod tests {
             ],
             &[0],
         );
-        let mut b = Batch::with_schema(schema, 1);
+        let mut b = Batch::with_capacity(schema, 1);
         b.extend_pk(1u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -941,7 +941,7 @@ mod tests {
             (3, -5, 200),
             (4, i32::MIN, 0),
         ];
-        let mut b = Batch::with_schema(schema, rows.len());
+        let mut b = Batch::with_capacity(schema, rows.len());
         for &(pk, c1, c2) in rows {
             b.extend_pk(pk as u128);
             b.extend_weight(&1i64.to_le_bytes());
@@ -1005,7 +1005,7 @@ mod tests {
         // Non-trivial, high-entropy column values (so a forked hash seed/shift in
         // the wide arm lands on a different bucket with overwhelming probability).
         let key: [u64; 3] = [0x0102_0304_0506_0708, 0xA0B0_C0D0_E0F0_0102, 0xdead_beef_cafe_1234];
-        let mut b = Batch::with_schema(schema, 1);
+        let mut b = Batch::with_capacity(schema, 1);
         b.extend_pk(42u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -1087,7 +1087,7 @@ mod tests {
             ],
             &[0],
         );
-        let mut b = Batch::with_schema(schema, 2);
+        let mut b = Batch::with_capacity(schema, 2);
         // Row 0 and row 1: distinct PK, both NULL in col1 (slot zeroed, null bit set).
         for pk in [10u128, 20u128] {
             b.extend_pk(pk);
@@ -1128,7 +1128,7 @@ mod tests {
             &[0],
         );
         let rows: &[(i32, i32, u32)] = &[(-5, -5, 7), (i32::MIN, 1, u32::MAX), (42, -1, 0)];
-        let mut b = Batch::with_schema(schema, rows.len());
+        let mut b = Batch::with_capacity(schema, rows.len());
         for &(pk, c1, c2) in rows {
             // PK is OPK at rest: encode the I32 PK value.
             let mut opk = [0u8; 4];

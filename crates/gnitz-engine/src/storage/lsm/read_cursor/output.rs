@@ -202,7 +202,7 @@ impl ReadCursor {
                 // practice every cursor-source batch is already consolidated; see
                 // the note in `drain_to_batch`. This helper relies on neither.)
                 let end = start + row_count;
-                let mut out = Batch::with_schema(*schema, row_count.max(1));
+                let mut out = Batch::with_capacity(*schema, row_count.max(1));
                 out.append_batch(b, start, end);
                 // A contiguous slice of a sorted/consolidated source preserves its
                 // layout (faithful); `append_batch` downgraded `out` to `Raw` first.

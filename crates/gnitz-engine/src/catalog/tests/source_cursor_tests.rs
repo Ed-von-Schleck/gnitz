@@ -324,7 +324,7 @@ fn orphaned_index_entry_yields_empty_not_exhaustion() {
     // id 9999 exists in no base row — the same val group, an absent source PK.
     orphan_key[idx_key_size..idx_key_size + src_pk_stride].copy_from_slice(&9999u64.to_be_bytes()[8 - src_pk_stride..]);
 
-    let mut ob = Batch::with_schema(idx_schema, 1);
+    let mut ob = Batch::with_capacity(idx_schema, 1);
     ob.extend_pk_bytes(&orphan_key);
     ob.extend_weight(&1i64.to_le_bytes());
     ob.extend_null_bmp(&0u64.to_le_bytes());

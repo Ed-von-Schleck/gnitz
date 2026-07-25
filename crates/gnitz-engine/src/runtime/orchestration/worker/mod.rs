@@ -309,7 +309,7 @@ fn filter_by_pk_bytes(
     n: usize,
     mut exists: impl FnMut(&[u8]) -> bool,
 ) -> Batch {
-    let mut result = Batch::with_schema(schema, n);
+    let mut result = Batch::with_capacity(schema, n);
     if let Some(ref b) = batch {
         let mut blob_cache = BlobCacheGuard::acquire(&schema, n);
         for i in 0..n {
@@ -635,7 +635,7 @@ impl WorkerProcess {
                 // applies when the decode itself succeeded.
                 let relay_batch = decoded.data_batch.unwrap_or_else(|| {
                     let empty_schema = schema.unwrap_or_default();
-                    Batch::with_schema(empty_schema, 0)
+                    Batch::empty_with_schema(&empty_schema)
                 });
                 let relay_key = (target_id, relay_source_id);
                 // Delivered only to the wait blocked on exactly this relay.
@@ -987,7 +987,7 @@ impl WorkerProcess {
                 .cat()
                 .get_schema_desc(target_id)
                 .ok_or_else(|| format!("no schema for tid={target_id}"))?;
-            Batch::with_schema(schema, 0)
+            Batch::empty_with_schema(&schema)
         };
         self.evaluate_dag(target_id, delta, request_id);
         Ok(())
@@ -1567,14 +1567,14 @@ mod tests {
         let schema = test_schema();
         let mut pending: HashMap<i64, Batch> = HashMap::new();
 
-        let mut b1 = Batch::with_schema(schema, 1);
+        let mut b1 = Batch::with_capacity(schema, 1);
         b1.extend_pk(1u128);
         b1.extend_weight(&1i64.to_le_bytes());
         b1.extend_null_bmp(&0u64.to_le_bytes());
         b1.extend_col(0, &10u64.to_le_bytes());
         b1.count = 1;
 
-        let mut b2 = Batch::with_schema(schema, 1);
+        let mut b2 = Batch::with_capacity(schema, 1);
         b2.extend_pk(2u128);
         b2.extend_weight(&1i64.to_le_bytes());
         b2.extend_null_bmp(&0u64.to_le_bytes());
@@ -1600,9 +1600,9 @@ mod tests {
     fn test_pending_relays_queue_and_drain() {
         let mut h = make_handler();
         let schema = test_schema();
-        let mut batch_b = Batch::with_schema(schema, 0);
+        let mut batch_b = Batch::empty_with_schema(&schema);
         batch_b.count = 7;
-        let mut batch_c = Batch::with_schema(schema, 0);
+        let mut batch_c = Batch::empty_with_schema(&schema);
         batch_c.count = 9;
         h.pending_relays.insert((200, 0), (batch_b, 0));
         h.pending_relays.insert((300, 0), (batch_c, 0));
@@ -1624,9 +1624,9 @@ mod tests {
     fn test_pending_relays_keyed_by_view_and_source() {
         let mut h = make_handler();
         let schema = test_schema();
-        let mut batch_a = Batch::with_schema(schema, 0);
+        let mut batch_a = Batch::empty_with_schema(&schema);
         batch_a.count = 3;
-        let mut batch_b = Batch::with_schema(schema, 0);
+        let mut batch_b = Batch::empty_with_schema(&schema);
         batch_b.count = 11;
 
         // Same view_id=100, different source_ids 10 and 20.
@@ -2024,7 +2024,7 @@ mod tests {
     }
 
     fn make_n_row_batch(schema: SchemaDescriptor, n: usize) -> Batch {
-        let mut b = Batch::with_schema(schema, n.max(1));
+        let mut b = Batch::with_capacity(schema, n.max(1));
         for i in 0..n {
             b.extend_pk(i as u128);
             b.extend_weight(&1i64.to_le_bytes());
@@ -2333,13 +2333,10 @@ mod tests {
         out
     }
 
-    /// A zero-filled batch of `count` rows (with_schema zero-fills the data
-    /// region, so setting `count` directly yields decodable all-zero rows).
-    /// Used to make wire sizes cross MAX_W2M_MSG without writing 256 MiB.
+    /// A batch of `count` decodable all-zero rows — used to make wire sizes
+    /// cross MAX_W2M_MSG without writing 256 MiB.
     fn zero_batch(schema: SchemaDescriptor, count: usize) -> Batch {
-        let mut b = Batch::with_schema(schema, count);
-        b.count = count;
-        b
+        Batch::zeroed(schema, count)
     }
 
     /// Two queued trains drain strictly FIFO: every frame of train A

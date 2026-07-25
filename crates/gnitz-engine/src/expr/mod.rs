@@ -8,7 +8,7 @@ mod tests;
 // The whole external surface: the VM/compiler builds a `LogicalProgram` from the
 // wire blob and hands it to a `ScalarFunc` (filter, map, or projection). The
 // resolved form and its instruction model never leave this module.
-pub use plan::ScalarFunc;
+pub use plan::{PkFill, ScalarFunc};
 pub use program::LogicalProgram;
 
 // Logical instruction model — consumed by hand-written test programs in the expr

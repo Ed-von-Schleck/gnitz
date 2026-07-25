@@ -427,7 +427,7 @@ mod tests {
     fn test_range_dt_weights() {
         let schema = make_schema_u64_i64();
         // Trace: y=10 (w=2), y=20 (w=0, must be skipped), y=30 (w=1).
-        let mut trace = Batch::with_schema(schema, 3);
+        let mut trace = Batch::with_capacity(schema, 3);
         for &(pk, w, val) in &[(10u64, 2i64, 110i64), (20, 0, 120), (30, 1, 130)] {
             trace.extend_pk(pk as u128);
             trace.extend_weight(&w.to_le_bytes());
@@ -733,7 +733,7 @@ mod tests {
     /// tombstones (weight 0) and multiset duplicates explicitly, so the rows are
     /// flagged `Sorted`, not `Consolidated` — the contract the data actually meets.
     fn make_band_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, i64, i64)]) -> Batch {
-        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        let mut b = Batch::with_capacity(*schema, rows.len().max(1));
         for &(k, range, w, val) in rows {
             b.extend_pk_opk(schema, &[k as u128, range as u128]);
             b.extend_weight(&w.to_le_bytes());
@@ -749,7 +749,7 @@ mod tests {
     /// trace that deliberately carries a weight-0 tombstone, which a consolidated
     /// batch may not contain. Rows must be (PK, payload)-sorted.
     fn make_sorted_u64_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
-        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        let mut b = Batch::with_capacity(*schema, rows.len().max(1));
         for &(pk, w, val) in rows {
             b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
@@ -793,7 +793,7 @@ mod tests {
     /// tombstones (weight 0) and multiset duplicates the walk handles directly, so
     /// the data is sorted but not ghost-free/duplicate-folded.
     fn make_range_batch(schema: &SchemaDescriptor, rows: &[(Vec<u64>, u64, i64, i64)]) -> Batch {
-        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        let mut b = Batch::with_capacity(*schema, rows.len().max(1));
         for (eq, range, w, val) in rows {
             let mut vals: Vec<u128> = eq.iter().map(|&x| x as u128).collect();
             vals.push(*range as u128);

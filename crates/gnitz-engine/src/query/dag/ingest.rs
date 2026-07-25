@@ -318,7 +318,7 @@ impl DagEngine {
         // `-w` for the same element and drive intra-batch dedup net-negative.
         batch.map_weights(|w| w.clamp(-1, 1));
 
-        let mut effective = Batch::with_schema(*schema, batch.count * 2);
+        let mut effective = Batch::with_capacity(*schema, batch.count * 2);
         let mut state: FxHashMap<&[u8], UniquePkRowState> =
             FxHashMap::with_capacity_and_hasher(batch.count, Default::default());
 
@@ -386,7 +386,7 @@ impl DagEngine {
     ) -> Batch {
         let idx_stride = idx_schema.pk_stride() as usize;
 
-        let mut out = Batch::with_schema(*idx_schema, src.count.max(1));
+        let mut out = Batch::with_capacity(*idx_schema, src.count.max(1));
         // MAX_PK_BYTES bounds every index schema's pk_stride (asserted in
         // SchemaDescriptor::new), so the scratch PK buffer lives on the stack
         // with no per-batch heap allocation. The used [..idx_stride] prefix is
@@ -415,14 +415,14 @@ impl DagEngine {
             out.extend_pk_bytes(&idx_pk_buf[..idx_stride]);
             out.extend_weight(&weight.to_le_bytes());
             // Index schema has zero payload columns, but the null_bmp region
-            // is still part of the batch layout. Keep the per-row null-bmp
-            // append so the batch's region cursors stay in lockstep with
-            // `count` independent of `with_schema`'s zero-init.
+            // is still part of the batch layout, and the arena is uninitialized
+            // — so the per-row null-bmp append both keeps the region cursors in
+            // lockstep with `count` and is what makes the word zero.
             out.extend_null_bmp(&0u64.to_le_bytes());
             out.count += 1;
         }
 
-        // `out` is `Raw` from `with_schema`; the `extend_*` loop above never raises
+        // `out` is `Raw` from `with_capacity`; the `extend_*` loop above never raises
         // it, and the index-table ingest re-sorts/folds it.
         out
     }

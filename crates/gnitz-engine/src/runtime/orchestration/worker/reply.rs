@@ -596,7 +596,7 @@ pub(crate) fn send_unique_preflight_keys(
 
     // Reusable chunk batch: filled, encoded, and cleared per frame, sized up
     // front to exactly one frame's fill.
-    let mut chunk = Batch::with_schema(*frame_schema, keys.remaining().min(keys_per_frame));
+    let mut chunk = Batch::with_capacity(*frame_schema, keys.remaining().min(keys_per_frame));
     let mut is_first = true;
     loop {
         chunk.clear();

@@ -195,7 +195,7 @@ pub(crate) fn fsync_dir(path: &str) {
 /// Seek a system table by PK, copy the matching row with weight=-1.
 /// Returns a single-row retraction batch (or empty batch if PK not found).
 pub(crate) fn retract_single_row(table: &Table, schema: &SchemaDescriptor, pk: u128) -> Batch {
-    let mut batch = Batch::with_schema(*schema, 1);
+    let mut batch = Batch::with_capacity(*schema, 1);
     let mut cursor = table.open_cursor();
     // OPK-encode the native PK; correct for single-column and compound system PKs.
     let (opk, stride) = crate::storage::opk_key(schema, &pk.to_le_bytes());
@@ -210,7 +210,7 @@ pub(crate) fn retract_single_row(table: &Table, schema: &SchemaDescriptor, pk: u
 /// owner share a packed PK prefix (e.g. `sys_columns` keyed by
 /// `pack_column_id(owner, col)`).
 pub(crate) fn retract_rows_in_pk_range(table: &Table, schema: &SchemaDescriptor, start: u128, pk_end: u128) -> Batch {
-    let mut batch = Batch::with_schema(*schema, 8);
+    let mut batch = Batch::with_capacity(*schema, 8);
     let mut cursor = table.open_cursor();
     // U64-PK system table: OPK == big-endian; the native-value range
     // comparisons below (`current_key_narrow()`/`get_pk` vs `pk_end`) stay valid.
@@ -234,7 +234,7 @@ pub(crate) fn retract_rows_in_pk_range(table: &Table, schema: &SchemaDescriptor,
 /// contiguous in compound-PK sort order — `compare_pk_bytes` reproduces the
 /// `(view_id, sub)` ordering natively (no `(pk_hi, pk_lo)` u128 exploit).
 pub(crate) fn retract_rows_by_view(table: &Table, schema: &SchemaDescriptor, view_id: u64) -> Batch {
-    let mut batch = Batch::with_schema(*schema, 8);
+    let mut batch = Batch::with_capacity(*schema, 8);
     // The (view_id, sub) PK is OPK-at-rest; the leading view_id column (U64) is
     // big-endian, so the prefix must be OPK (BE), not native LE.
     let prefix = view_id.to_be_bytes();

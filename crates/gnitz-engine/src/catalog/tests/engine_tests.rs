@@ -733,7 +733,7 @@ fn test_read_payload_string_out_of_bounds_offset_returns_empty() {
         ],
         &[0],
     );
-    let mut batch = Batch::with_schema(schema, 1);
+    let mut batch = Batch::with_capacity(schema, 1);
     batch.extend_pk(1);
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());

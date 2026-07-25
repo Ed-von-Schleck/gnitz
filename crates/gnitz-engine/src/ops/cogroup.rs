@@ -419,7 +419,7 @@ mod tests {
 
             // Emit into a real output batch; the skeleton bulk-appends the
             // single-source runs, the callback appends both shared groups.
-            let mut out = Batch::with_schema(make_schema_u64_i64(), (a.count + b.count).max(1));
+            let mut out = Batch::with_capacity(make_schema_u64_i64(), (a.count + b.count).max(1));
             cogroup_union(&mut ac, &mut bc, &mut out, |o, ra, rb| {
                 o.append_batch(&a, ra.start, ra.end);
                 o.append_batch(&b, rb.start, rb.end);

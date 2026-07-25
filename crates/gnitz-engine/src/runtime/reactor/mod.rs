@@ -1011,7 +1011,7 @@ impl Reactor {
         let schema = zc.schema;
         let data_batch = zc.data_batch.map(|mb| {
             let sch = schema.as_ref().expect("FLAG_HAS_DATA set but no schema — ring corrupt");
-            let mut owned = crate::storage::Batch::with_schema(*sch, mb.count);
+            let mut owned = crate::storage::Batch::with_capacity(*sch, mb.count);
             owned.append_mem_batch(&mb);
             // The wire flags are ground truth. `append_mem_batch` leaves
             // `owned` `Raw`; raise to the decoded claim, debug-verifying the data.

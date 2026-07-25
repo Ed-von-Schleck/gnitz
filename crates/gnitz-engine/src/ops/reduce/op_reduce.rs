@@ -181,7 +181,7 @@ pub fn op_reduce(
             trace_out_cursor.seek_bytes(out_pk_bytes);
             let has_v0 = trace_out_cursor.valid && trace_out_cursor.current_pk_eq(out_pk_bytes);
             if !has_v0 {
-                let mut raw_output = Batch::with_schema(*output_schema, 1);
+                let mut raw_output = Batch::with_capacity(*output_schema, 1);
                 emit_global_ground(&mut raw_output, out_pk_bytes, plan);
                 return raw_output;
             }
@@ -224,7 +224,7 @@ pub fn op_reduce(
         Some(argsort_delta(working, plan.packed_sort, group_descs))
     };
 
-    let mut raw_output = Batch::with_schema(*output_schema, 32);
+    let mut raw_output = Batch::with_capacity(*output_schema, 32);
 
     let mut accs: Vec<Accumulator> = agg_descs
         .iter()
@@ -246,7 +246,7 @@ pub fn op_reduce(
 
     // Hoist replay batch outside the group loop: reuse the allocation across groups
     // rather than allocating and dropping once per group (can be 100k+ times per epoch).
-    let mut replay = (!all_linear && avi.is_none()).then(|| Batch::with_schema(*input_schema, 32));
+    let mut replay = (!all_linear && avi.is_none()).then(|| Batch::with_capacity(*input_schema, 32));
 
     // Single-scan trace gather for the non-linear, non-PK, no-index fallback.
     // Replaces the per-group full-trace rescan (O(groups × trace)) with one

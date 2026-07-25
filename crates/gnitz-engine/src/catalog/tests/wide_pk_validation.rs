@@ -33,7 +33,7 @@ fn pk24(a: u64, b: u64, c: u64) -> [u8; 24] {
 
 /// Build a batch for `wide_unique_schema`: rows of (pk, val, weight).
 fn wide_val_batch(schema: &SchemaDescriptor, rows: &[([u8; 24], u64, i64)]) -> Batch {
-    let mut b = Batch::with_schema(*schema, rows.len().max(1));
+    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
     for &(pk, val, w) in rows {
         b.extend_pk_bytes(&pk);
         b.extend_weight(&w.to_le_bytes());

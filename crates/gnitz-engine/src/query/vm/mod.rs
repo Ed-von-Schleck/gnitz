@@ -407,14 +407,14 @@ mod tests {
         // after backfill) must empty Delta registers while leaving Trace
         // registers untouched.
         let schema = schema_1i64();
-        let mut delta_batch = Batch::with_schema(schema, 1);
+        let mut delta_batch = Batch::with_capacity(schema, 1);
         delta_batch.extend_pk(1u128);
         delta_batch.extend_weight(&1i64.to_le_bytes());
         delta_batch.extend_null_bmp(&0u64.to_le_bytes());
         delta_batch.extend_col(0, &10i64.to_le_bytes());
         delta_batch.count += 1;
 
-        let mut trace_batch = Batch::with_schema(schema, 1);
+        let mut trace_batch = Batch::with_capacity(schema, 1);
         trace_batch.extend_pk(2u128);
         trace_batch.extend_weight(&1i64.to_le_bytes());
         trace_batch.extend_null_bmp(&0u64.to_le_bytes());
@@ -506,7 +506,7 @@ mod tests {
     /// Create a batch from (pk, weight, col0_i64) tuples.
     fn make_batch(schema: SchemaDescriptor, rows: &[(u128, i64, i64)]) -> Batch {
         let n = rows.len();
-        let mut b = Batch::with_schema(schema, n);
+        let mut b = Batch::with_capacity(schema, n);
         for &(pk, w, c0) in rows {
             b.extend_pk(pk);
             b.extend_weight(&w.to_le_bytes());
@@ -521,7 +521,7 @@ mod tests {
     /// Create a batch with two I64 payload columns.
     fn make_batch_2col(schema: SchemaDescriptor, rows: &[(u128, i64, i64, i64)]) -> Batch {
         let n = rows.len();
-        let mut b = Batch::with_schema(schema, n);
+        let mut b = Batch::with_capacity(schema, n);
         for &(pk, w, c0, c1) in rows {
             b.extend_pk(pk);
             b.extend_weight(&w.to_le_bytes());

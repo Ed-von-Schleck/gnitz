@@ -1260,7 +1260,7 @@ fn test_compound_pk_secondary_index_seek() {
     let schema = engine.get_schema(tid).unwrap();
     assert_eq!(schema.pk_stride(), 8, "compound (U32,U32) PK stride should be 8");
 
-    let mut b = Batch::with_schema(schema, 4);
+    let mut b = Batch::with_capacity(schema, 4);
     let rows: &[(u32, u32, u64)] = &[
         (10, 1, 100),
         (20, 1, 200),
@@ -1325,7 +1325,7 @@ fn test_compound_pk_secondary_index_retract() {
     engine.create_index("public.cpk_r", &["val"], false).unwrap();
     let schema = engine.get_schema(tid).unwrap();
 
-    let mut b = Batch::with_schema(schema, 2);
+    let mut b = Batch::with_capacity(schema, 2);
     let mut pk_buf = vec![0u8; 8];
     pk_buf[..4].copy_from_slice(&7u32.to_le_bytes());
     pk_buf[4..8].copy_from_slice(&3u32.to_le_bytes());
@@ -1340,7 +1340,7 @@ fn test_compound_pk_secondary_index_retract() {
     assert!(engine.seek_by_index(tid, &[2], &[500u128]).unwrap().0.is_some());
 
     // Retract the same row.
-    let mut r = Batch::with_schema(schema, 1);
+    let mut r = Batch::with_capacity(schema, 1);
     r.extend_pk_bytes(&pk_buf);
     r.extend_weight(&(-1i64).to_le_bytes());
     r.extend_null_bmp(&0u64.to_le_bytes());
@@ -1449,7 +1449,7 @@ fn test_seek_by_index_orphan_entry_terminates() {
     pk[..idx_key_size].copy_from_slice(&777u64.to_le_bytes()[..idx_key_size]);
     pk[idx_key_size..idx_key_size + 8].copy_from_slice(&12345u64.to_le_bytes());
 
-    let mut b = Batch::with_schema(idx_schema, 1);
+    let mut b = Batch::with_capacity(idx_schema, 1);
     b.extend_pk_bytes(&pk);
     b.extend_weight(&1i64.to_le_bytes());
     b.extend_null_bmp(&0u64.to_le_bytes());
@@ -3395,7 +3395,7 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     // indexed values 10/20/30 chosen so the index emission order (by x) differs
     // from the source-PK sort order.
     let rows: [([u8; 24], u64); 3] = [(pk24(3, 0, 1), 10), (pk24(1, 0, 5), 20), (pk24(2, 0, 9), 30)];
-    let mut bb = Batch::with_schema(schema, rows.len());
+    let mut bb = Batch::with_capacity(schema, rows.len());
     for &(pk, x) in &rows {
         bb.extend_pk_bytes(&pk);
         bb.extend_weight(&1i64.to_le_bytes());

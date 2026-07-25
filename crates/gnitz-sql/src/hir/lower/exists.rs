@@ -222,7 +222,7 @@ fn exists_equi_core(
             a_local,
             &left_cols,
             &left_target_tcs,
-            build_reindex_program(&left_in.schema.columns),
+            build_reindex_program(left_in.schema.columns.len()),
         )
     } else {
         terms.reindex_a
@@ -311,7 +311,7 @@ fn exists_range_core(
         // π_A(inner) keyed by the outer source PK.
         let union_schema = band_union_schema(&all_tcs, &left_in.schema, &right_in.schema);
         let a_pk_in_union: Vec<usize> = left_in.schema.pk_cols.iter().map(|&p| k + p).collect();
-        let proj_a = band_pi_preserved(cb, merged, &union_schema.columns, &a_pk_in_union, k, 0, a_n);
+        let proj_a = band_pi_preserved(cb, merged, union_schema.columns.len(), &a_pk_in_union, k, 0, a_n);
         let a_all = rekey_on_source_pk(cb, a_local, &left_in.schema);
         if is_mark {
             let (matched, unmatched) = semi_and_anti(cb, a_all, proj_a);

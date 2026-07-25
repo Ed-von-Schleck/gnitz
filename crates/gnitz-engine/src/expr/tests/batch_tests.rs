@@ -20,7 +20,7 @@ fn make_schema_2col() -> SchemaDescriptor {
 }
 
 fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
-    let mut b = Batch::with_schema(*schema, rows.len().max(1));
+    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
     for &(pk, w, val) in rows {
         b.extend_pk(pk as u128);
         b.extend_weight(&w.to_le_bytes());
@@ -151,7 +151,7 @@ fn test_str_col_eq_const_nullable_column_matches_per_row() {
     // 20 rows: alternating null/non-null, with the non-null rows alternating
     // between "foo" (matches the predicate) and "bar" (does not).
     let n = 20usize;
-    let mut batch = Batch::with_schema(schema, n);
+    let mut batch = Batch::with_capacity(schema, n);
     batch.count = 0;
     for row in 0..n {
         batch.extend_pk(row as u128 + 1);
@@ -204,7 +204,7 @@ fn test_str_col_eq_const_nullable_column_matches_per_row() {
 /// Build a 1-row batch with one nullable I64 column. `null` toggles the
 /// payload-0 null bit; `val` is the stored 8-byte payload regardless.
 fn make_int_row(schema: &SchemaDescriptor, val: i64, null: bool) -> Batch {
-    let mut b = Batch::with_schema(*schema, 1);
+    let mut b = Batch::with_capacity(*schema, 1);
     b.extend_pk(1u128);
     b.extend_weight(&1i64.to_le_bytes());
     let null_word: u64 = if null { 1 } else { 0 };
@@ -282,7 +282,7 @@ fn golden_float_div_zero_divisor_single_row() {
         ],
         &[0],
     );
-    let mut b = Batch::with_schema(schema, 1);
+    let mut b = Batch::with_capacity(schema, 1);
     b.extend_pk(1u128);
     b.extend_weight(&1i64.to_le_bytes());
     b.extend_null_bmp(&0u64.to_le_bytes());
@@ -314,7 +314,7 @@ fn golden_float_div_zero_divisor_single_row() {
 
 /// Build a 1-row batch with two nullable I64 columns plus a u64 PK.
 fn make_two_int_row(schema: &SchemaDescriptor, v1: i64, v2: i64, nulls: u64) -> Batch {
-    let mut b = Batch::with_schema(*schema, 1);
+    let mut b = Batch::with_capacity(*schema, 1);
     b.extend_pk(1u128);
     b.extend_weight(&1i64.to_le_bytes());
     b.extend_null_bmp(&nulls.to_le_bytes());
@@ -437,7 +437,7 @@ fn golden_str_col_eq_const_null_row() {
         ],
         &[0],
     );
-    let mut b = Batch::with_schema(schema, 1);
+    let mut b = Batch::with_capacity(schema, 1);
     b.extend_pk(1u128);
     b.extend_weight(&1i64.to_le_bytes());
     b.extend_null_bmp(&1u64.to_le_bytes()); // payload 0 (the string col) null
@@ -647,7 +647,7 @@ fn build_n_col_batch(
     f: impl Fn(usize, usize) -> i64,
     null_pred: impl Fn(usize, usize) -> bool,
 ) -> Batch {
-    let mut b = Batch::with_schema(*schema, n.max(1));
+    let mut b = Batch::with_capacity(*schema, n.max(1));
     for row in 0..n {
         b.extend_pk((row + 1) as u128);
         b.extend_weight(&1i64.to_le_bytes());
@@ -912,7 +912,7 @@ fn classifier_filter_result_reg_non_bool_falls_back() {
     let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 1, 0, vec![]), &schema);
 
     // Build 4 rows: non-null 1, non-null 0, null, non-null -5.
-    let mut b = Batch::with_schema(schema, 4);
+    let mut b = Batch::with_capacity(schema, 4);
     let rows: &[(i64, bool)] = &[(1, false), (0, false), (0, true), (-5, false)];
     for &(v, n) in rows {
         b.extend_pk(1u128);
@@ -944,7 +944,7 @@ fn bit_only_all_null_word_and() {
     let schema = schema_pk_two_ints_nullable();
 
     let n = 64;
-    let mut b = Batch::with_schema(schema, n);
+    let mut b = Batch::with_capacity(schema, n);
     for _ in 0..n {
         b.extend_pk(1u128);
         b.extend_weight(&1i64.to_le_bytes());
@@ -993,7 +993,7 @@ fn bit_only_is_not_null_tail_mask() {
     let schema = schema_pk_two_ints_nullable();
     // 65 rows — straddles the 64-bit word boundary so tail handling matters.
     let n = 65;
-    let mut b = Batch::with_schema(schema, n);
+    let mut b = Batch::with_capacity(schema, n);
     for row in 0..n {
         b.extend_pk((row + 1) as u128);
         b.extend_weight(&1i64.to_le_bytes());
@@ -1473,7 +1473,7 @@ fn str_const_filter_bench() {
         &[0],
     );
     let n = 1_000_000usize;
-    let mut batch = Batch::with_schema(schema, n);
+    let mut batch = Batch::with_capacity(schema, n);
     for row in 0..n {
         batch.extend_pk(row as u128 + 1);
         batch.extend_weight(&1i64.to_le_bytes());

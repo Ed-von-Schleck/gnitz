@@ -67,7 +67,7 @@ pub(crate) fn opk_pk(schema: &SchemaDescriptor, vals: &[u128]) -> Vec<u8> {
 /// allowed (multiset deltas), so only a strictly *decreasing* PK is rejected;
 /// `certify_layout(Consolidated)` then debug-verifies the full (PK, payload) order.
 pub(crate) fn make_wide_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, u64, i64, i64)]) -> Batch {
-    let mut b = Batch::with_schema(*schema, rows.len().max(1));
+    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
     for &(c0, c1, c2, w, val) in rows {
         b.extend_pk_opk(schema, &[c0 as u128, c1 as u128, c2 as u128]);
         b.extend_weight(&w.to_le_bytes());
@@ -90,7 +90,7 @@ pub(crate) fn make_wide_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, u64,
 /// weight `w`, and a single non-null I64 payload `val` at payload slot 0 — the
 /// row shape wide-PK storage/dag tests ingest one at a time.
 pub(crate) fn wide_row(schema: &SchemaDescriptor, pk: &[u8], w: i64, val: i64) -> Batch {
-    let mut b = Batch::with_schema(*schema, 1);
+    let mut b = Batch::with_capacity(*schema, 1);
     b.extend_pk_bytes(pk);
     b.extend_weight(&w.to_le_bytes());
     b.extend_null_bmp(&0u64.to_le_bytes());
@@ -133,7 +133,7 @@ pub(crate) fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) ->
 /// honestly `Raw`, for tests whose rows are unsorted or that exercise the
 /// sort/fold paths themselves.
 pub(crate) fn make_batch_raw(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
-    let mut b = Batch::with_schema(*schema, rows.len().max(1));
+    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
     for &(pk, w, val) in rows {
         b.extend_pk(pk as u128);
         b.extend_weight(&w.to_le_bytes());
@@ -147,7 +147,7 @@ pub(crate) fn make_batch_raw(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]
 /// [`make_batch_raw`] over [`make_schema_u128_i64`]-shaped schemas — native
 /// u128 PKs, rows left `Raw` in the order given.
 pub(crate) fn make_batch_u128_raw(schema: &SchemaDescriptor, rows: &[(u128, i64, i64)]) -> Batch {
-    let mut b = Batch::with_schema(*schema, rows.len().max(1));
+    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
     for &(pk, w, val) in rows {
         b.extend_pk(pk);
         b.extend_weight(&w.to_le_bytes());
@@ -204,7 +204,7 @@ pub(crate) fn make_schema_i64pk_i64() -> SchemaDescriptor {
 /// [`Batch::extend_pk_opk`] (sign-flipped big-endian), so the bytes match an
 /// ingested row; callers must pass OPK-sorted rows.
 pub(crate) fn make_batch_i64pk(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> Batch {
-    let mut b = Batch::with_schema(*schema, rows.len().max(1));
+    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
     for &(pk, w, val) in rows {
         b.extend_pk_opk(schema, &[(pk as u64) as u128]);
         b.extend_weight(&w.to_le_bytes());

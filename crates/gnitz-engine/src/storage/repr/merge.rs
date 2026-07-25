@@ -261,6 +261,12 @@ pub struct MemBatch<'a> {
     pub pk_stride: u8, // byte width of the PK region per row
     pub blob: &'a [u8],
     pub count: usize,
+    /// The source [`Batch::blob_id`], carried so an appending destination can
+    /// recognize its *own* blob and copy German-string structs verbatim instead
+    /// of relocating each cell (see `Batch::append_mem_batch_ranges`). A borrowed
+    /// wire view has no such identity and uses `0`, which no live batch ever has
+    /// (the counter starts at 1).
+    pub blob_id: u64,
 }
 
 impl<'a> MemBatch<'a> {
@@ -390,6 +396,17 @@ impl PosCursor {
 // DirectWriter: writes into pre-allocated output buffers
 // ---------------------------------------------------------------------------
 
+/// Writes rows into the pre-allocated region buffers of a `write_to_batch`
+/// arena.
+///
+/// **Every entry point must write each live byte of each row it counts** — the
+/// batch invariant (see `Batch::with_capacity`), and here the whole reason the
+/// arena can skip its memset. A skipped cell within a counted row leaks the
+/// recycled buffer's previous contents rather than reading back a zero. Hence
+/// `write_row` `fill(0)`s a null cell instead of skipping it, and the
+/// `repr::scatter` kernels write PK/weight/null in one fused pass and every
+/// payload cell unconditionally. Rows the writer declines to count (a ghost
+/// weight) need nothing: every reader bounds the batch to `count`.
 pub struct DirectWriter<'a> {
     // The repartition-scatter cluster (sibling `repr::scatter`) writes these
     // fixed-region buffers directly in its fused per-row loops, so they are
@@ -876,7 +893,7 @@ mod tests {
     /// ties) and per-compare length branch are on the measured path. The schema's
     /// `pk_stride` selects the width.
     fn bench_sorted_batch(schema: &SchemaDescriptor, n: usize, dup: usize) -> Batch {
-        let mut b = Batch::with_schema(*schema, n.max(1));
+        let mut b = Batch::with_capacity(*schema, n.max(1));
         for i in 0..n {
             b.extend_pk((i / dup) as u128);
             b.extend_weight(&1i64.to_le_bytes());
@@ -928,7 +945,7 @@ mod tests {
     }
 
     fn build_mat_batch(schema: &SchemaDescriptor, n: usize, k: usize, kind: u8) -> Batch {
-        let mut b = Batch::with_schema(*schema, n);
+        let mut b = Batch::with_capacity(*schema, n);
         for i in 0..n {
             b.extend_pk((k * n + i) as u128); // distinct ascending across batches
             b.extend_weight(&1i64.to_le_bytes());
@@ -1084,7 +1101,7 @@ mod tests {
     /// `key_fn(i)`, weight +1, both I64 payload columns derived from the row
     /// index (payloads are irrelevant when all PKs are distinct).
     fn bench_flush_batch(schema: &SchemaDescriptor, n: usize, key_fn: impl Fn(usize) -> u64) -> Batch {
-        let mut b = Batch::with_schema(*schema, n.max(1));
+        let mut b = Batch::with_capacity(*schema, n.max(1));
         for i in 0..n {
             b.extend_pk(key_fn(i) as u128);
             b.extend_weight(&1i64.to_le_bytes());
@@ -1627,7 +1644,7 @@ mod tests {
     fn mem_batch_get_pk_bytes_matches_get_pk_u128() {
         let schema = make_schema_u128_i64();
         let pks: &[u128] = &[0, 1, u64::MAX as u128, (u64::MAX as u128) + 1, u128::MAX];
-        let mut b = Batch::with_schema(schema, pks.len());
+        let mut b = Batch::with_capacity(schema, pks.len());
         for &pk in pks {
             b.extend_pk(pk);
             b.extend_weight(&1i64.to_le_bytes());

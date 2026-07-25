@@ -148,7 +148,7 @@ mod tests {
         gnitz_wire::encode_pk_column(&(-7i64).to_le_bytes(), type_code::I64, &mut opk);
 
         // Single I64 PK column, no payload: one row is PK bytes + weight + null word.
-        let mut batch = Batch::with_schema(schema, 1);
+        let mut batch = Batch::with_capacity(schema, 1);
         batch.extend_pk_bytes(&opk);
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&0u64.to_le_bytes());

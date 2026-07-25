@@ -43,7 +43,7 @@ fn push_row(b: &mut Batch, pk: u64, payload: i64, weight: i64) {
 fn gen_distinct(schema: &SchemaDescriptor, d: usize, ticks: usize) -> Vec<Batch> {
     (0..ticks)
         .map(|t| {
-            let mut b = Batch::with_schema(*schema, d.max(1));
+            let mut b = Batch::with_capacity(*schema, d.max(1));
             for i in 0..d {
                 let k = (t * d + i) as u64;
                 push_row(&mut b, k, k as i64, 1);
@@ -64,7 +64,7 @@ fn gen_churn(schema: &SchemaDescriptor, h: usize, d: usize, ticks: usize) -> Vec
     let mut counter: usize = 0;
     (0..ticks)
         .map(|_| {
-            let mut b = Batch::with_schema(*schema, d.max(1));
+            let mut b = Batch::with_capacity(*schema, d.max(1));
             for _ in 0..updates_per_tick {
                 let k = counter % h;
                 let payload = counter as i64;

@@ -338,7 +338,7 @@ mod tests {
                 ],
                 &[0],
             );
-            let mut b = Batch::with_schema(schema, 2);
+            let mut b = Batch::with_capacity(schema, 2);
             b.extend_pk(1u128);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
@@ -366,7 +366,7 @@ mod tests {
                 ],
                 &[0],
             );
-            let mut b = Batch::with_schema(schema, 2);
+            let mut b = Batch::with_capacity(schema, 2);
             b.extend_pk(1u128);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
@@ -399,7 +399,7 @@ mod tests {
                 ],
                 &[0],
             );
-            let mut b = Batch::with_schema(schema, 1);
+            let mut b = Batch::with_capacity(schema, 1);
             b.extend_pk(1u128);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
@@ -422,7 +422,7 @@ mod tests {
                 ],
                 &[0, 1],
             );
-            let mut b = Batch::with_schema(schema, 1);
+            let mut b = Batch::with_capacity(schema, 1);
             let mut pk = [0u8; 8];
             gnitz_wire::encode_pk_column(&7u32.to_le_bytes(), type_code::U32, &mut pk[0..4]);
             gnitz_wire::encode_pk_column(&(-9i32).to_le_bytes(), type_code::I32, &mut pk[4..8]);
@@ -463,7 +463,7 @@ mod tests {
     }
 
     fn make_batch_with_raw_pks(schema: &SchemaDescriptor, raw_pks: &[[u8; 16]]) -> Batch {
-        let mut b = Batch::with_schema(*schema, raw_pks.len().max(1));
+        let mut b = Batch::with_capacity(*schema, raw_pks.len().max(1));
         for pk in raw_pks {
             b.extend_pk_bytes(pk);
             b.extend_weight(&1i64.to_le_bytes());

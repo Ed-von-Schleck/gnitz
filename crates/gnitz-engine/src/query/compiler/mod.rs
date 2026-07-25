@@ -1192,8 +1192,8 @@ mod tests {
     fn test_build_plan_compound_reindex_accepted() {
         // Valid 2-col copy program so decode_expr_blob succeeds.
         let mut eb = gnitz_core::ExprBuilder::new();
-        eb.copy_col(type_code::U64 as u32, 0, 0);
-        eb.copy_col(type_code::I64 as u32, 1, 1);
+        eb.copy_col(0, 0);
+        eb.copy_col(1, 1);
         let blob = eb.build(0).encode();
 
         let mut nodes = HashMap::new();
@@ -1235,7 +1235,7 @@ mod tests {
     fn test_build_plan_reindex_exceeds_max_pk_columns_rejected() {
         // 6-column source, reindex on all 6 → pk_n (6) > MAX_PK_COLUMNS (5).
         let mut eb = gnitz_core::ExprBuilder::new();
-        eb.copy_col(type_code::U64 as u32, 0, 0);
+        eb.copy_col(0, 0);
         let blob = eb.build(0).encode();
 
         let n_cols = crate::schema::MAX_PK_COLUMNS + 1;
@@ -1270,7 +1270,7 @@ mod tests {
     fn test_build_plan_pruned_reindex_compiles() {
         // 3-column source; reindex on col0, program keeps only col 2 as payload.
         let mut eb = gnitz_core::ExprBuilder::new();
-        eb.copy_col(type_code::I64 as u32, 2, 0);
+        eb.copy_col(2, 0);
         let blob = eb.build(0).encode();
         let mut nodes = HashMap::new();
         nodes.insert(0, scan_delta(99));
@@ -1307,7 +1307,7 @@ mod tests {
     fn test_build_plan_reindex_program_oob_col_rejected() {
         // reindex on col0, program copies col 9 on a 2-column source.
         let mut eb = gnitz_core::ExprBuilder::new();
-        eb.copy_col(type_code::U64 as u32, 9, 0);
+        eb.copy_col(9, 0);
         let blob = eb.build(0).encode();
         let mut nodes = HashMap::new();
         nodes.insert(0, scan_delta(99));
@@ -2829,7 +2829,7 @@ mod tests {
         let g1 = 0xAAAA_AAAA_AAAA_AAAAu64 as i64;
 
         // Root-cause contrast: same PK, both NULL, different garbage bytes.
-        let mut pair = Batch::with_schema(merged, 2);
+        let mut pair = Batch::with_capacity(merged, 2);
         push_null_garbage(&mut pair, g0);
         push_null_garbage(&mut pair, g1);
         assert_eq!(
@@ -2845,7 +2845,7 @@ mod tests {
 
         // End-to-end under the merged schema: one NULL-garbage row per union input.
         let single = |garbage: i64| {
-            let mut bat = Batch::with_schema(merged, 1);
+            let mut bat = Batch::with_capacity(merged, 1);
             push_null_garbage(&mut bat, garbage);
             bat.certify_layout(Layout::Consolidated, &merged);
             bat

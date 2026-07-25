@@ -181,7 +181,7 @@ fn build_check_batch_with<K>(
             b.reserve_rows(keys.len());
             b
         }
-        _ => Batch::with_schema(*schema, keys.len()),
+        _ => Batch::with_capacity(*schema, keys.len()),
     };
     let null_word: u64 = crate::ops::all_payload_null_mask(npc);
     for key in keys {

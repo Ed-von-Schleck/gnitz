@@ -22,7 +22,7 @@ fn make_schema_u64() -> SchemaDescriptor {
 /// batch as sorted+consolidated.
 fn make_batch(rows: &[(u128, i64, i64)]) -> Rc<Batch> {
     let schema = make_schema_u128_i64();
-    let mut b = Batch::with_schema(schema, rows.len().max(1));
+    let mut b = Batch::with_capacity(schema, rows.len().max(1));
     for &(pk, w, val) in rows {
         b.extend_pk(pk);
         b.extend_weight(&w.to_le_bytes());
@@ -144,7 +144,7 @@ fn test_seek_compound_pk_lands_on_exact_row() {
     let schema = make_schema_compound_u64();
     // Canonical (first-column-major) storage order: (1,5) then (2,3).
     // As u128 the order is reversed: pack(2,3) < pack(1,5).
-    let mut b = Batch::with_schema(schema, 2);
+    let mut b = Batch::with_capacity(schema, 2);
     for &(c0, c1, v) in &[(1u64, 5u64, 100i64), (2, 3, 200)] {
         b.extend_pk_bytes(&compound_pk_bytes(c0, c1));
         b.extend_weight(&1i64.to_le_bytes());
@@ -190,7 +190,7 @@ fn i64_opk(v: i64) -> [u8; 8] {
 fn test_seek_signed_pk_lands_on_negative_row() {
     let schema = make_schema_signed_i64();
     // Storage (signed) order: -3, -1, 2.
-    let mut b = Batch::with_schema(schema, 3);
+    let mut b = Batch::with_capacity(schema, 3);
     for &(pk, v) in &[(-3i64, 30i64), (-1, 10), (2, 20)] {
         b.extend_pk_bytes(&i64_opk(pk));
         b.extend_weight(&1i64.to_le_bytes());
@@ -594,7 +594,7 @@ fn compound_opk(a: u64, b: u64) -> [u8; 16] {
 fn test_compound_pk_multi_source_merge_order() {
     let schema = make_compound_pk_schema();
     let make = |a: u64, b: u64, val: i64| -> Rc<Batch> {
-        let mut bt = Batch::with_schema(schema, 1);
+        let mut bt = Batch::with_capacity(schema, 1);
         bt.extend_pk_bytes(&compound_opk(a, b));
         bt.extend_weight(&1i64.to_le_bytes());
         bt.extend_null_bmp(&0u64.to_le_bytes());
@@ -636,7 +636,7 @@ fn pk3(a: u64, b: u64, c: u64) -> [u8; 24] {
 
 fn make_wide_batch(rows: &[([u8; 24], i64, i64)]) -> Rc<Batch> {
     let schema = wide_pk_3xu64_schema();
-    let mut bt = Batch::with_schema(schema, rows.len().max(1));
+    let mut bt = Batch::with_capacity(schema, rows.len().max(1));
     for (pk, w, val) in rows {
         bt.extend_pk_bytes(pk);
         bt.extend_weight(&w.to_le_bytes());
@@ -726,7 +726,7 @@ fn seek_first_positive_with_prefix_includes_negative_suffix() {
     };
     // Sorted by compare_pk_bytes: col0 asc, col1 signed asc (negatives first).
     let rows = [(mk(1, -5), 1i64), (mk(1, -1), 1), (mk(1, 3), 1), (mk(2, -9), 1)];
-    let mut b = Batch::with_schema(schema, rows.len());
+    let mut b = Batch::with_capacity(schema, rows.len());
     for (pk, val) in &rows {
         b.extend_pk_bytes(pk);
         b.extend_weight(&1i64.to_le_bytes());
@@ -851,7 +851,7 @@ fn copy_current_row_into_invalid_is_noop() {
     let schema = make_schema_u128_i64();
     let cursor = create_read_cursor(&[], &[], schema);
     assert!(!cursor.valid);
-    let mut out = Batch::with_schema(schema, 1);
+    let mut out = Batch::with_capacity(schema, 1);
     cursor.copy_current_row_into(&mut out, 1);
     assert_eq!(out.count, 0, "invalid cursor copy must not write a row");
 }
@@ -1369,7 +1369,7 @@ fn test_read_german_bytes_out_of_bounds_offset_returns_empty() {
         ],
         &[0],
     );
-    let mut b = Batch::with_schema(schema, 1);
+    let mut b = Batch::with_capacity(schema, 1);
     b.extend_pk(1);
     b.extend_weight(&1i64.to_le_bytes());
     b.extend_null_bmp(&0u64.to_le_bytes());
@@ -1586,7 +1586,7 @@ fn adv_build_interleaved_shards(
 /// tier of the leaf gallop, whose `get_pk_bytes` leaf differs from the shard mmap.
 fn adv_build_batch_dense(schema: SchemaDescriptor, count: usize) -> Rc<Batch> {
     let stride = schema.pk_stride() as usize;
-    let mut b = Batch::with_schema(schema, count.max(1));
+    let mut b = Batch::with_capacity(schema, count.max(1));
     for i in 0..count {
         b.extend_pk_bytes(&adv_key(i as u64, stride)[..stride]);
         b.extend_weight(&1i64.to_le_bytes());
@@ -1602,7 +1602,7 @@ fn adv_build_batch_dense(schema: SchemaDescriptor, count: usize) -> Rc<Batch> {
 /// the caller), OPK-encoding each PK. The delta source of the `Multi` fixture.
 fn adv_build_batch_rows(schema: SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Rc<Batch> {
     let stride = schema.pk_stride() as usize;
-    let mut b = Batch::with_schema(schema, rows.len().max(1));
+    let mut b = Batch::with_capacity(schema, rows.len().max(1));
     for &(pk, w, v) in rows {
         b.extend_pk_bytes(&adv_key(pk, stride)[..stride]);
         b.extend_weight(&w.to_le_bytes());

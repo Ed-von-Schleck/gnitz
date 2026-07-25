@@ -223,7 +223,7 @@ impl CatalogEngine {
             return None;
         }
         let w = cursor.current_weight;
-        let mut b = Batch::with_schema(sys_tab_schema(family.id()), 1);
+        let mut b = Batch::with_capacity(sys_tab_schema(family.id()), 1);
         cursor.copy_current_row_into(&mut b, w);
         Some((b, w))
     }

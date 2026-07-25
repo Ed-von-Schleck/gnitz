@@ -12,15 +12,34 @@ use super::program::{Instr, LogicalProgram, ResolvedProgram};
 use crate::schema::{ColumnLocator, SchemaDescriptor};
 use crate::storage::{Batch, MemBatch};
 
+/// Average survivor-run length below which [`ScalarFunc::append_map_ranges`]
+/// compacts a fragmented range list before running the compute kernel — see the
+/// break-even argument there.
+const COMPACT_RUN_LEN: usize = 16;
+
+/// How a map fills the output PK region — the explicit form of a decision the
+/// caller alone can make, so no path can silently leave the region unwritten.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PkFill {
+    /// Inherit the input PK verbatim. Requires equal PK strides, which the
+    /// circuit compiler rejects a violation of and the ad-hoc reply guard checks.
+    Copy,
+    /// Leave it to the caller: `op_map`'s reindex packer / row hash overwrites
+    /// every row's PK immediately after, emitting OPK bytes at the output stride
+    /// (which legitimately differs — e.g. U64 input → U128 synthetic PK).
+    Reindex,
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Copy a single column from `in_batch` to `output`. `cm.src` is the resolved
-/// source locator (PK byte window or dense payload slot). The source is read
-/// at its own type's width; when the destination slot (`cm.stride`, from the
-/// output schema) is wider — a promoted integer column — the copy
-/// sign/zero-extends the value into it.
+/// Copy a single column from `in_batch` to `output`, writing output row
+/// `dst_base + i` from source row `src_start + i` for `i in 0..n`. `cm.src` is
+/// the resolved source locator (PK byte window or dense payload slot). The
+/// source is read at its own type's width; when the destination slot
+/// (`cm.stride`, from the output schema) is wider — a promoted integer column —
+/// the copy sign/zero-extends the value into it.
 ///
 /// `blob_cache` doubles as the STRING/BLOB mode switch. `Some`: each cell is
 /// relocated into `output.blob` (else its heap offset dangles once the source
@@ -37,8 +56,10 @@ fn copy_column(
     output: &mut Batch,
     cm: &ColMove,
     mut blob_cache: Option<&mut crate::schema::BlobCache>,
+    src_start: usize,
+    dst_base: usize,
+    n: usize,
 ) {
-    let n = in_batch.count;
     let stride = cm.stride as usize; // destination write width
 
     // Destructure the locator ONCE before the row loops: the per-row bodies
@@ -57,12 +78,13 @@ fn copy_column(
             let pk_off = byte_off as usize;
             let src_stride = size as usize;
             let mut le = [0u8; crate::schema::MAX_PK_BYTES];
-            for row in 0..n {
-                let opk = in_batch.get_pk_bytes(row);
+            for i in 0..n {
+                let opk = in_batch.get_pk_bytes(src_start + i);
                 // Read the source column's OWN width from the OPK region (not the wider
                 // destination stride, which would over-read into the next PK column),
                 // decode to native LE, then widen if the output slot is wider.
                 gnitz_wire::decode_pk_column(&opk[pk_off..pk_off + src_stride], type_code, &mut le[..src_stride]);
+                let row = dst_base + i;
                 let out = &mut dst[row * stride..row * stride + stride];
                 if src_stride == stride {
                     out.copy_from_slice(&le[..stride]);
@@ -81,42 +103,48 @@ fn copy_column(
                 // shared BlobCache deduplicates identical spans across all columns/rows
                 // of this MAP.
                 let src_col = in_batch.col_data(in_pi);
-                for row in 0..n {
-                    let off = row * stride;
+                // One split borrow, so the destination region is resolved once
+                // rather than per row.
+                let (dst_col, dst_blob) = output.col_and_blob_mut(cm.dst_payload);
+                for i in 0..n {
+                    let src_off = (src_start + i) * stride;
                     let cell = crate::schema::relocate_german_string_vec(
-                        &src_col[off..off + stride],
+                        &src_col[src_off..src_off + stride],
                         &in_batch.blob,
-                        &mut output.blob,
+                        dst_blob,
                         blob_cache.as_deref_mut(),
                     );
-                    output.col_data_mut(cm.dst_payload)[off..off + 16].copy_from_slice(&cell);
+                    let dst_off = (dst_base + i) * 16;
+                    dst_col[dst_off..dst_off + 16].copy_from_slice(&cell);
                 }
             } else if src_stride == stride {
                 debug_assert!(
-                    n * stride <= in_batch.col_data(in_pi).len(),
-                    "copy_column: n*stride ({}*{}={}) > in_batch.col_data({}).len()={} \
+                    (src_start + n) * stride <= in_batch.col_data(in_pi).len(),
+                    "copy_column: (src_start+n)*stride (({}+{})*{}={}) > in_batch.col_data({}).len()={} \
                      (batch count={}, payload cols={})",
+                    src_start,
                     n,
                     stride,
-                    n * stride,
+                    (src_start + n) * stride,
                     in_pi,
                     in_batch.col_data(in_pi).len(),
                     in_batch.count,
                     in_batch.num_payload_cols(),
                 );
-                output
-                    .col_data_mut(cm.dst_payload)
-                    .copy_from_slice(&in_batch.col_data(in_pi)[..n * stride]);
+                let src = &in_batch.col_data(in_pi)[src_start * stride..(src_start + n) * stride];
+                output.col_data_mut(cm.dst_payload)[dst_base * stride..(dst_base + n) * stride].copy_from_slice(src);
             } else {
                 // Wider destination slot (a promoted integer column): sign/zero-extend
                 // the narrower source into it, one row at a time.
                 let src = in_batch.col_data(in_pi);
                 let dst = output.col_data_mut(cm.dst_payload);
-                for row in 0..n {
+                for i in 0..n {
+                    let sr = src_start + i;
+                    let dr = dst_base + i;
                     gnitz_wire::widen_native_le(
-                        &src[row * src_stride..row * src_stride + src_stride],
+                        &src[sr * src_stride..sr * src_stride + src_stride],
                         type_code,
-                        &mut dst[row * stride..row * stride + stride],
+                        &mut dst[dr * stride..dr * stride + stride],
                     );
                 }
             }
@@ -185,21 +213,21 @@ impl NullPerm {
         out
     }
 
-    /// Write the permuted null bitmap directly into `out` (one u64 per row).
-    /// `out.len()` must be `n * 8`.
-    fn apply_column_into(&self, in_null_bmp: &[u8], out: &mut [u8], n: usize) {
-        debug_assert_eq!(out.len(), n * 8);
+    /// Permute the null words of source rows `[src_start, src_start + n)` into
+    /// `out` rows `[dst_base, dst_base + n)` (one u64 per row).
+    ///
+    /// Always writes the whole word, including for a pure-compute map whose
+    /// permutation is empty: the destination may be a recycled, uninitialized
+    /// batch tail, so "already zero" is not available to assume.
+    fn write_rows(&self, in_null_bmp: &[u8], src_start: usize, out: &mut [u8], dst_base: usize, n: usize) {
+        let dst = &mut out[dst_base * 8..(dst_base + n) * 8];
         if self.pairs.is_empty() {
-            // Pure-compute map: nothing to permute. The output null region is
-            // zeroed on every construction path (fresh alloc, `recycle_buf`
-            // clear, `resize(size, 0)` re-zero), so an all-zero permutation is
-            // a no-op.
+            dst.fill(0);
             return;
         }
         for row in 0..n {
-            let off = row * 8;
-            let in_null = crate::foundation::codec::read_u64_le(in_null_bmp, off);
-            out[off..off + 8].copy_from_slice(&self.apply(in_null).to_le_bytes());
+            let in_null = crate::foundation::codec::read_u64_le(in_null_bmp, (src_start + row) * 8);
+            dst[row * 8..row * 8 + 8].copy_from_slice(&self.apply(in_null).to_le_bytes());
         }
     }
 }
@@ -314,6 +342,7 @@ impl ScalarFunc {
         let compute = (!emits.is_empty()).then_some(InterpretedCompute { prog, emits });
 
         let blob_passthrough = compute_blob_passthrough(in_schema, &col_moves);
+
         ScalarFunc(Repr::Map {
             col_moves,
             null_perm,
@@ -432,17 +461,39 @@ impl ScalarFunc {
         scan_filter_bits(&scratch.filter_bits[..words], n, &mut append_range);
     }
 
-    /// Execute map: system column clone → col_moves → NullPerm → compute. The
-    /// output schema and all per-column stride information are baked into the
-    /// `ScalarFunc`.
-    pub fn evaluate_map_batch(&self, in_batch: &Batch) -> Batch {
+    /// The predicate's surviving row ranges over `batch`, collected into `out`
+    /// (cleared first). The one definition of "which rows of this batch pass" —
+    /// every range-driven consumer (`op_filter`'s gather, the ad-hoc scan's rows
+    /// and fold sinks) reads the list rather than re-deriving it from
+    /// [`Self::run_filter`]'s callback, which cannot carry a `?` out or be cut
+    /// against a `LIMIT` window.
+    ///
+    /// `out` is caller-owned so it can be reused across chunks; a `[(0, n)]`
+    /// singleton is the agreed spelling of "no predicate".
+    pub fn filter_ranges(&self, batch: &Batch, out: &mut Vec<(usize, usize)>) {
+        out.clear();
+        self.run_filter(&batch.as_mem_batch(), batch.count, |start, end| out.push((start, end)));
+    }
+
+    /// Map every `[start, end)` range of `src`, in list order, onto `keeper`'s
+    /// tail — the ad-hoc rows sink's fused filter→project step, replacing an
+    /// `op_map` into a throwaway batch followed by `keeper.append_batch`.
+    ///
+    /// The PK region passes through verbatim ([`PkFill::Copy`]), so the strides
+    /// must agree; that is the rows-sink reply guard, and PK *type* parity is
+    /// planner-guaranteed by the verbatim passthrough clone.
+    pub fn append_map_ranges(&self, src: &Batch, keeper: &mut Batch, ranges: &[(usize, usize)]) {
+        self.map_ranges_into(src, keeper, ranges, PkFill::Copy);
+    }
+
+    /// Execute map over a whole batch into a fresh output: the DBSP `op_map`
+    /// entry point. `pk` says whether the output PK region is inherited verbatim
+    /// or stamped by the caller's reindex afterwards.
+    pub fn evaluate_map_batch(&self, in_batch: &Batch, pk: PkFill) -> Batch {
         let Repr::Map {
-            col_moves,
-            null_perm,
-            compute,
             blob_passthrough,
             out_schema,
-            scratch,
+            ..
         } = &self.0
         else {
             unreachable!("evaluate_map_batch on a Predicate ScalarFunc (the VM dispatch is per-node)");
@@ -451,48 +502,139 @@ impl ScalarFunc {
         if n == 0 {
             return Batch::empty_with_schema(out_schema);
         }
-
-        let mut output = Batch::with_schema(**out_schema, n);
-        output.count = n;
-
-        // PK copy: bulk when strides match. When they differ (reindex maps,
-        // e.g. U64 input → U128 synthetic PK), the PK region is left zero-
-        // initialized here; `op_map` then overwrites it via the reindex packer
-        // or `reindex_hash_row`, both of which emit OPK bytes.
-        let in_pk = in_batch.pk_data();
-        let out_pk = output.pk_data_mut();
-        if in_pk.len() == out_pk.len() {
-            out_pk.copy_from_slice(in_pk);
-        }
-        output.weight_data_mut().copy_from_slice(in_batch.weight_data());
-
-        // Column moves. When no string column is dropped (`blob_passthrough`),
-        // share the input blob once and copy every String/Blob struct verbatim —
-        // no per-row relocation and no dedup cache (`copy_column` gets `None`).
-        // Otherwise relocate each cell: the dedup cache is drawn from the
-        // thread-local pool only when the output has a German-string column (else
-        // `get_mut()` is None and the relocate path is never reached), and one
-        // upfront `reserve` (dedup keeps the output blob ≤ the input's) covers
-        // every ColMove without per-column realloc.
-        let mut blob_cache = if *blob_passthrough {
+        // Uninitialized: `validate` requires every map to write every output
+        // payload slot, and `map_rows_into` writes the PK (or the caller's
+        // reindex does), weight and null regions of every row.
+        let mut output = Batch::with_capacity(**out_schema, n);
+        // When no string column is dropped, adopt the input blob wholesale; the
+        // shared `blob_id` is then what tells `map_ranges_into` to copy every
+        // String/Blob struct verbatim instead of relocating each cell.
+        if *blob_passthrough {
             output.share_blob_from(in_batch);
-            crate::storage::BlobCacheGuard::empty()
-        } else {
-            let cache = crate::storage::BlobCacheGuard::acquire(out_schema, n);
-            if cache.is_active() {
-                output.blob.reserve(in_batch.blob.len());
+        }
+        self.map_ranges_into(in_batch, &mut output, &[(0, n)], pk);
+        output
+    }
+
+    /// The one map driver: provision `out`'s tail for the ranges, pick the blob
+    /// mode, and run [`Self::map_rows_into`] per range.
+    ///
+    /// The blob mode is the batch layer's rule — *the destination knows whether
+    /// it owns the source's bytes*: equal `blob_id` and equal length means `out`
+    /// holds exactly `src`'s heap, so German-string structs copy verbatim (see
+    /// `Batch::append_mem_batch_ranges`, which decides identically). Otherwise
+    /// each cell is relocated into `out.blob` under a dedup cache that spans the
+    /// call but never outlives it: every range reads the same live `src`, so a
+    /// span shared across ranges is appended once, while a later chunk (whose
+    /// recycled blob buffer can reuse the same address) gets a fresh cache.
+    ///
+    /// A fragmented range list under a compute-bearing map is compacted first:
+    /// the kernel evaluates one morsel at a time *per range*, so a list of 1-row
+    /// ranges would collapse it to row-at-a-time. A pure gather has no per-row
+    /// kernel and copies range-wise either way, and a handful of long runs
+    /// already vectorize — compacting those would be a wasted copy of the whole
+    /// chunk. The break-even is [`COMPACT_RUN_LEN`], not `MORSEL`: compaction
+    /// buys a full extra copy of every survivor (~1.5–15 ns/row) to save the
+    /// *per-range* setup — one morsel eval prologue, one `MemBatch` (~½ KiB by
+    /// value), one scratch borrow — a few hundred cycles. Runs longer than that
+    /// already amortize it, whatever the morsel width.
+    fn map_ranges_into(&self, src: &Batch, out: &mut Batch, ranges: &[(usize, usize)], pk: PkFill) {
+        let total = crate::storage::range_rows(ranges);
+        if total == 0 {
+            return;
+        }
+        // Compact a kernel-starving list into one contiguous range, then fall
+        // into the single copy loop below against the compacted source.
+        let starves_kernel = matches!(&self.0, Repr::Map { compute: Some(_), .. })
+            && ranges.len() > 1
+            && total < ranges.len() * COMPACT_RUN_LEN;
+        let compacted;
+        let (src, ranges) = match starves_kernel.then_some(src.schema).flatten() {
+            Some(s) => {
+                compacted = Batch::from_ranges(src, ranges, &s);
+                (&compacted, &[(0, total)][..])
             }
-            cache
+            None => (src, ranges),
         };
-        for cm in col_moves {
-            copy_column(in_batch, &mut output, cm, blob_cache.get_mut());
+
+        let old = out.count;
+        out.reserve_rows(total);
+        // Publish the new rows up front: the `*_mut` accessors are `count`-bounded,
+        // so `[old, old + total)` must be inside `count` before any write.
+        out.count = old + total;
+
+        let mut cache = match out.shares_blob_with(src) {
+            true => crate::storage::BlobCacheGuard::empty(),
+            false => {
+                let cache = crate::storage::BlobCacheGuard::acquire(self.map_out_schema(), total);
+                // Dedup keeps the output blob ≤ the input's, so one reserve covers
+                // every ColMove without per-column realloc.
+                if cache.is_active() {
+                    out.blob.reserve(src.blob.len());
+                }
+                cache
+            }
+        };
+        let mut dst = old;
+        for &(start, end) in ranges {
+            self.map_rows_into(src, out, start, dst, end - start, cache.get_mut(), pk);
+            dst += end - start;
         }
 
-        // Null bitmap (columnar) — written directly into the output buffer.
-        // Split-borrow: `in_batch` and `output` are distinct allocations.
+        // Matches `append_batch`: nothing downstream trusts the destination's
+        // order (a payload-reordering projection over a duplicate-PK input can
+        // break (PK, payload) order — the D1 fail-safe).
+        out.downgrade();
+    }
+
+    /// Map source rows `[src_start, src_start + n)` onto `out` rows
+    /// `[dst_base, dst_base + n)`: PK/weight passthrough, null permutation,
+    /// column moves, then the compute kernel. `out.count` must already cover the
+    /// destination window — every `*_mut` accessor is `count`-bounded.
+    #[allow(clippy::too_many_arguments)]
+    fn map_rows_into(
+        &self,
+        in_batch: &Batch,
+        output: &mut Batch,
+        src_start: usize,
+        dst_base: usize,
+        n: usize,
+        mut blob_cache: Option<&mut crate::schema::BlobCache>,
+        pk: PkFill,
+    ) {
+        let Repr::Map {
+            col_moves,
+            null_perm,
+            compute,
+            scratch,
+            ..
+        } = &self.0
+        else {
+            unreachable!("map_rows_into on a Predicate ScalarFunc");
+        };
+        if n == 0 {
+            return;
+        }
+
+        if let PkFill::Copy = pk {
+            let pk_st = in_batch.pk_stride() as usize;
+            debug_assert_eq!(pk_st, output.pk_stride() as usize, "PkFill::Copy: PK stride mismatch");
+            output.pk_data_mut()[dst_base * pk_st..(dst_base + n) * pk_st]
+                .copy_from_slice(&in_batch.pk_data()[src_start * pk_st..(src_start + n) * pk_st]);
+        }
+        output.weight_data_mut()[dst_base * 8..(dst_base + n) * 8]
+            .copy_from_slice(&in_batch.weight_data()[src_start * 8..(src_start + n) * 8]);
+
+        // Null bitmap, written before the compute kernel: EMIT merges its null
+        // bits into the word with a read-modify-write `|=`. Split-borrow:
+        // `in_batch` and `output` are distinct allocations.
         {
             let in_nb = in_batch.null_bmp_data();
-            null_perm.apply_column_into(in_nb, output.null_bmp_data_mut(), n);
+            null_perm.write_rows(in_nb, src_start, output.null_bmp_data_mut(), dst_base, n);
+        }
+
+        for cm in col_moves {
+            copy_column(in_batch, output, cm, blob_cache.as_deref_mut(), src_start, dst_base, n);
         }
 
         // Compute kernel
@@ -506,7 +648,7 @@ impl ScalarFunc {
 
             for morsel_start in (0..n).step_by(MORSEL) {
                 let m = MORSEL.min(n - morsel_start);
-                eval_batch(prog, &in_mb, morsel_start, m, &mut scratch);
+                eval_batch(prog, &in_mb, src_start + morsel_start, m, &mut scratch);
 
                 // EMIT: write each computed register to its output column.
                 // Value store and null merge run as two sequential loops, each
@@ -530,7 +672,7 @@ impl ScalarFunc {
                                 let is_null =
                                     !no_nulls && (scratch.null_bits[base_null_r + i / 64] >> (i % 64)) & 1 != 0;
                                 let val = if is_null { 0i64 } else { scratch.regs[base_r + i] };
-                                let off = (morsel_start + i) * 8;
+                                let off = (dst_base + morsel_start + i) * 8;
                                 dst8[off..off + 8].copy_from_slice(&val.to_le_bytes());
                             }
                         } else {
@@ -538,7 +680,7 @@ impl ScalarFunc {
                                 let is_null =
                                     !no_nulls && (scratch.null_bits[base_null_r + i / 64] >> (i % 64)) & 1 != 0;
                                 let val = if is_null { 0i64 } else { scratch.regs[base_r + i] };
-                                let off = (morsel_start + i) * stride;
+                                let off = (dst_base + morsel_start + i) * stride;
                                 dst8[off..off + stride].copy_from_slice(&val.to_le_bytes()[..stride]);
                             }
                         }
@@ -564,7 +706,7 @@ impl ScalarFunc {
                             while null_word != 0 {
                                 let bit = null_word.trailing_zeros() as usize;
                                 null_word &= null_word - 1;
-                                let off = (morsel_start + lo + bit) * 8;
+                                let off = (dst_base + morsel_start + lo + bit) * 8;
                                 let merged =
                                     u64::from_le_bytes(nb[off..off + 8].try_into().unwrap()) | (1u64 << out_payload);
                                 nb[off..off + 8].copy_from_slice(&merged.to_le_bytes());
@@ -574,10 +716,6 @@ impl ScalarFunc {
                 }
             }
         }
-
-        // `output` came from `with_schema` (`Raw`) and only raw region writes
-        // above, so it stays `Raw` — `op_map` keeps it that way.
-        output
     }
 }
 

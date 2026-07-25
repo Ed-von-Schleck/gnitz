@@ -455,7 +455,7 @@ mod group_key_tests {
         );
         let v0 = global_group_key();
         for (pk, payload, null) in [(1u128, 42i64, false), (999, -7, false), (0, 0, true)] {
-            let mut b = Batch::with_schema(schema, 1);
+            let mut b = Batch::with_capacity(schema, 1);
             b.extend_pk(pk);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&(null as u64).to_le_bytes());
@@ -486,7 +486,7 @@ mod group_key_tests {
         let key_as_payload = |tc: u8, le: &[u8]| -> u128 {
             let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(tc, 0)], &[0]);
             let pi = schema.try_payload_idx(1).unwrap();
-            let mut b = B::with_schema(schema, 1);
+            let mut b = B::with_capacity(schema, 1);
             b.extend_pk(0u128);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());

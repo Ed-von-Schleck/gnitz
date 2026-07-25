@@ -56,7 +56,7 @@ fn src_schema() -> SchemaDescriptor {
 }
 
 fn build_input(schema: &SchemaDescriptor) -> Batch {
-    let mut b = Batch::with_schema(*schema, N_ROWS);
+    let mut b = Batch::with_capacity(*schema, N_ROWS);
     for row in 0..N_ROWS as u64 {
         b.extend_pk(row as u128);
         b.extend_weight(&1i64.to_le_bytes());
@@ -164,7 +164,7 @@ fn secondary_index_bench_avi_decomposition() {
         n + 1 + AVI_AV_BYTES
     };
     let build_batch = || {
-        let mut out = Batch::with_schema(avi_schema, N_ROWS);
+        let mut out = Batch::with_capacity(avi_schema, N_ROWS);
         let mut key = [0u8; MAX_PK_BYTES];
         for row in 0..N_ROWS {
             let klen = avi_key(&mut key, row);
@@ -231,7 +231,7 @@ fn secondary_index_bench_avi_decomposition() {
 /// unsorted (real sort work) with occasional folds.
 fn bench_single_pk_sort(label: &str, pk_schema: SchemaDescriptor, pk_bytes_for: impl Fn(usize) -> [u8; 8]) {
     let build = || {
-        let mut out = Batch::with_schema(pk_schema, N_ROWS);
+        let mut out = Batch::with_capacity(pk_schema, N_ROWS);
         for row in 0..N_ROWS {
             out.extend_pk_bytes(&pk_bytes_for(row));
             out.extend_weight(&1i64.to_le_bytes());

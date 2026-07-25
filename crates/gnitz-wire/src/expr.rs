@@ -33,6 +33,11 @@ pub const EXPR_IS_NULL: u32 = 30;
 pub const EXPR_IS_NOT_NULL: u32 = 31;
 pub const EXPR_EMIT: u32 = 32;
 pub const EXPR_INT_TO_FLOAT: u32 = 33;
+/// Copy an input column verbatim into an output payload slot:
+/// `[EXPR_COPY_COL, 0, src_col, out_payload]`. Word 1 is unused — the engine
+/// resolves the source locator (PK byte window or dense payload slot) and both
+/// widths from the schemas it validates the program against, so a restated type
+/// code could only ever disagree with them.
 pub const EXPR_COPY_COL: u32 = 34;
 /// Conditional select (SQL CASE blend): `[EXPR_SELECT, dst, cond, a | (b << 16)]`.
 /// Three register sources — `cond`, `a`, `b` — packed into two operand words:

@@ -7,6 +7,7 @@ mod engine_tests;
 mod fk_tests;
 mod index_tests;
 mod reopen_rebuild_tests;
+mod scan_spec_bench;
 mod scan_spec_tests;
 mod source_cursor_tests;
 mod uuid_tests;
@@ -60,6 +61,81 @@ fn count_records(table: &mut Table) -> usize {
         c.advance();
     }
     count
+}
+
+/// A `col < lit` predicate blob over a fixed-int column — the program shape a
+/// `WHERE` conjunct compiles to. Built through the client's own `ExprBuilder`,
+/// so the test blobs are byte-identical to what the planner ships.
+fn pred_lt_blob(col: usize, lit: i64) -> Vec<u8> {
+    let mut eb = gnitz_core::ExprBuilder::new();
+    let (a, b) = (eb.load_col_int(col), eb.load_const(lit));
+    let r = eb.cmp_lt(a, b);
+    eb.build(r).encode()
+}
+
+/// A pure-gather projection blob: `(src_col, out_payload_slot)` CopyCols and
+/// nothing else.
+fn proj_blob(copies: &[(u32, u32)]) -> Vec<u8> {
+    let mut eb = gnitz_core::ExprBuilder::new();
+    for &(src, out) in copies {
+        eb.copy_col(src, out);
+    }
+    eb.build(0).encode()
+}
+
+/// A `ReadSink::Rows` spec over the whole table. Shared by the `scan_spec` tests
+/// and bench; the bound-walk tests take the `identity_spec` alias.
+fn rows_spec(
+    predicate: Vec<u8>,
+    projection: Vec<u8>,
+    order: Vec<gnitz_wire::OrderKey>,
+    limit_k: u64,
+) -> gnitz_wire::ReadSpec {
+    gnitz_wire::ReadSpec {
+        bound: gnitz_wire::ReadBound::None,
+        predicate,
+        sink: gnitz_wire::ReadSink::Rows {
+            projection,
+            order,
+            limit_k,
+        },
+    }
+}
+
+/// An empty `public.t` with `cols` (PK = column 0) in a fresh temp dir.
+fn table_fixture(name: &str, cols: &[ColumnDef]) -> (CatalogEngine, i64) {
+    let mut engine = CatalogEngine::open(&temp_dir(name)).unwrap();
+    let tid = engine.create_table("public.t", cols, &[0], false).unwrap();
+    (engine, tid)
+}
+
+/// [`table_fixture`] ingested in `rounds` PK-interleaved passes over ids `0..n`,
+/// every row at weight 1. `put_row` writes one row's payload columns.
+///
+/// One pass leaves a single sorted run; more makes the read cursor a genuine
+/// N-way merge over that many runs, which is what the bench needs and a
+/// bulk-drain would skip entirely.
+fn ingest_fixture(
+    name: &str,
+    cols: &[ColumnDef],
+    n: u64,
+    rounds: u64,
+    mut put_row: impl FnMut(&mut BatchBuilder, u64),
+) -> (CatalogEngine, i64) {
+    let (mut engine, tid) = table_fixture(name, cols);
+    let schema = engine.get_schema(tid).unwrap();
+    for round in 0..rounds {
+        let mut bb = BatchBuilder::new(schema);
+        let mut id = round;
+        while id < n {
+            bb.begin_row(id as u128, 1);
+            put_row(&mut bb, id);
+            bb.end_row();
+            id += rounds;
+        }
+        engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    }
+    (engine, tid)
 }
 
 /// Build a raw TABLE_TAB row for tests that drive the catalog applier or

@@ -88,8 +88,8 @@ pub(crate) fn null_gate(
 /// `0..n`, and `reindex_output_schema` places those payload columns at physical
 /// indices `k..k+n` regardless of the key arity `k` (the `k` PK slots precede
 /// them), so the payload offsets never shift with the number of key columns.
-pub(crate) fn build_reindex_program(coldefs: &[ColumnDef]) -> gnitz_core::ExprProgram {
-    build_reindex_program_keep(coldefs, &(0..coldefs.len()).collect::<Vec<_>>())
+pub(crate) fn build_reindex_program(n_cols: usize) -> gnitz_core::ExprProgram {
+    build_reindex_program_keep(&(0..n_cols).collect::<Vec<_>>())
 }
 
 /// Build a reindex ExprProgram that copies only the `keep` source columns (in
@@ -100,11 +100,14 @@ pub(crate) fn build_reindex_program(coldefs: &[ColumnDef]) -> gnitz_core::ExprPr
 /// indices `k..k+keep.len()` behind the `k` PK slots), so the program is the
 /// single source of truth for the pruned layout. Passing `0..n` reproduces the
 /// unpruned identity byte-for-byte.
-pub(crate) fn build_reindex_program_keep(coldefs: &[ColumnDef], keep: &[usize]) -> gnitz_core::ExprProgram {
+///
+/// The one producer of every reindex program, so the output slots are **dense
+/// `0..keep.len()` by construction** — which is what lets the engine require
+/// every map to write every declared output slot.
+pub(crate) fn build_reindex_program_keep(keep: &[usize]) -> gnitz_core::ExprProgram {
     let mut eb = ExprBuilder::new();
     for (out_pos, &ci) in keep.iter().enumerate() {
-        let tc = coldefs[ci].type_code as u32;
-        eb.copy_col(tc, ci as u32, out_pos as u32);
+        eb.copy_col(ci as u32, out_pos as u32);
     }
     eb.build(0) // result_reg unused — COPY_COL writes directly
 }
@@ -117,7 +120,12 @@ pub(crate) fn build_reindex_program_keep(coldefs: &[ColumnDef], keep: &[usize]) 
 /// `π_P(inner)` it is subtracted from — a drift there would be a silent weight bug.
 pub(crate) fn rekey_on_source_pk(cb: &mut CircuitBuilder, node: NodeId, schema: &Schema) -> NodeId {
     let zero = vec![0u8; schema.pk_cols.len()];
-    cb.map_reindex(node, &schema.pk_cols, &zero, build_reindex_program(&schema.columns))
+    cb.map_reindex(
+        node,
+        &schema.pk_cols,
+        &zero,
+        build_reindex_program(schema.columns.len()),
+    )
 }
 
 /// A schema's column type codes in order — the `null_extend` argument naming the

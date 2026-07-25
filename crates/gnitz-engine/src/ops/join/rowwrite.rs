@@ -59,7 +59,7 @@ mod tests {
         let right_schema = pk_only_schema();
         let left = build_wide_left_row(&left_schema, 1);
 
-        let mut trace = Batch::with_schema(right_schema, 1);
+        let mut trace = Batch::with_capacity(right_schema, 1);
         trace.extend_pk(1u128);
         trace.extend_weight(&1i64.to_le_bytes());
         trace.extend_null_bmp(&0u64.to_le_bytes());
@@ -70,7 +70,7 @@ mod tests {
         let cursor = &mut ch;
         cursor.seek_bytes(&1u64.to_be_bytes());
 
-        let mut output = Batch::with_schema(left_schema, 1);
+        let mut output = Batch::with_capacity(left_schema, 1);
         write_join_row(
             &mut output,
             &left.as_mem_batch(),
@@ -96,7 +96,7 @@ mod tests {
     }
 
     fn build_wide_left_row(left_schema: &SchemaDescriptor, pk: u64) -> Batch {
-        let mut b = Batch::with_schema(*left_schema, 1);
+        let mut b = Batch::with_capacity(*left_schema, 1);
         b.extend_pk(pk as u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());

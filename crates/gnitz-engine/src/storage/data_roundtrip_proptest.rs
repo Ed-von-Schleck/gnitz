@@ -72,7 +72,7 @@ fn arb_schema() -> impl Strategy<Value = SchemaDescriptor> {
 // Row generation
 // ---------------------------------------------------------------------------
 
-/// Build a batch row-by-row via `Batch::with_schema` and the public `extend_*`
+/// Build a batch row-by-row via `Batch::with_capacity` and the public `extend_*`
 /// appenders. The helper IS the test: its correctness over arbitrary
 /// width/interleaving is what makes the proptest interesting.
 ///
@@ -80,7 +80,7 @@ fn arb_schema() -> impl Strategy<Value = SchemaDescriptor> {
 /// single-column PK), so a caller can synthesize an absent prefix-twin key.
 fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128>) {
     let mut rng = crate::test_rng::Rng::new(seed);
-    let mut batch = Batch::with_schema(*schema, n);
+    let mut batch = Batch::with_capacity(*schema, n);
 
     let pk_count = schema.pk_columns().count();
     // The leading PK columns are fixed once; only the trailing column varies
@@ -126,8 +126,8 @@ fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128
         batch.count += 1;
     }
 
-    // extend_* did not touch the flags and with_schema defaults to Raw; a fresh
-    // batch is already Raw so ingest_owned_batch will sort + consolidate.
+    // extend_* did not touch the flags and the constructor defaults to Raw; a
+    // fresh batch is already Raw so ingest_owned_batch will sort + consolidate.
     (batch, leading)
 }
 
@@ -299,7 +299,7 @@ proptest! {
         }
 
         // Physical retraction: ingest the same rows negated into the memtable.
-        let mut neg = Batch::with_schema(schema, half.max(1));
+        let mut neg = Batch::with_capacity(schema, half.max(1));
         neg.append_batch_negated(&original, 0, half);
         table.ingest_owned_batch(neg).unwrap();
 
@@ -335,7 +335,7 @@ proptest! {
         for k in 0..WAVES {
             let start = k * rows / WAVES;
             let end = (k + 1) * rows / WAVES;
-            let mut wave = Batch::with_schema(schema, end - start);
+            let mut wave = Batch::with_capacity(schema, end - start);
             wave.append_batch(&original, start, end);
             table.ingest_owned_batch(wave).unwrap();
             table.flush().unwrap();

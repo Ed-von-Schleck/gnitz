@@ -29,7 +29,7 @@ fn string_schema() -> SchemaDescriptor {
 
 fn make_simple_batch(pk: u64, val: u64) -> Batch {
     let sd = simple_schema();
-    let mut b = Batch::with_schema(sd, 1);
+    let mut b = Batch::with_capacity(sd, 1);
     b.extend_pk(pk as u128);
     b.extend_weight(&1i64.to_le_bytes());
     b.extend_null_bmp(&0u64.to_le_bytes());
@@ -289,7 +289,7 @@ fn schema_roundtrip_wire_preserves_pk_order() {
 #[test]
 fn test_encode_decode_string_column() {
     let sd = string_schema();
-    let mut batch = Batch::with_schema(sd, 2);
+    let mut batch = Batch::with_capacity(sd, 2);
 
     batch.extend_pk(1u128);
     batch.extend_weight(&1i64.to_le_bytes());
@@ -779,7 +779,7 @@ use crate::runtime::wire::{
 
 fn make_wire_safe_batch(n: usize) -> Batch {
     let sd = simple_schema();
-    let mut b = Batch::with_schema(sd, n.max(1));
+    let mut b = Batch::with_capacity(sd, n.max(1));
     for i in 0..n {
         b.extend_pk(i as u128);
         b.extend_weight(&1i64.to_le_bytes());

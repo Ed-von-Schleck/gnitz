@@ -173,7 +173,7 @@ mod tests {
     /// need (they read only `pk_stride` + `get_pk_bytes`). Shared by the tests and
     /// the bench.
     fn build_pk_batch(schema: &SchemaDescriptor, pk_rows: &[Vec<u8>]) -> Batch {
-        let mut b = Batch::with_schema(*schema, pk_rows.len().max(1));
+        let mut b = Batch::with_capacity(*schema, pk_rows.len().max(1));
         for pk in pk_rows {
             b.extend_pk_bytes(pk);
             b.extend_weight(&1i64.to_le_bytes());

@@ -239,8 +239,13 @@ impl ExprBuilder {
         self.emit(EXPR_EMIT, 0, src_reg, payload_col_idx);
     }
 
-    pub fn copy_col(&mut self, type_code: u32, src_col_idx: u32, payload_col_idx: u32) {
-        self.emit(EXPR_COPY_COL, type_code, src_col_idx, payload_col_idx);
+    /// Copy input column `src_col_idx` verbatim into output payload slot
+    /// `payload_col_idx`. No type operand: the engine resolves the source
+    /// locator (PK byte window or dense payload slot) and both widths from the
+    /// schemas it validates the program against, so a restated type code could
+    /// only ever disagree with them.
+    pub fn copy_col(&mut self, src_col_idx: u32, payload_col_idx: u32) {
+        self.emit(EXPR_COPY_COL, 0, src_col_idx, payload_col_idx);
     }
 
     // --- Const pool (byte-transparent) ---
