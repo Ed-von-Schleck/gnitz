@@ -734,6 +734,19 @@ pub(super) fn emit_reduce(
     if agg.is_empty() {
         return Err(CompileError::Rejected("reduce: no aggregate spec"));
     }
+    // The low-level `CircuitBuilder` API and the wire decode take `global_ground`
+    // and the group columns independently and cross-check neither, but the ground
+    // row is only well-formed group-less: `emit_global_ground` writes the aggregate
+    // columns at payload index 0, which with a non-empty group set overwrites the
+    // exemplar slots and leaves their regions short — a malformed batch in release.
+    // The implication only runs one way (`ground ⇒ empty`; the threshold reduce and
+    // the two-phase phase-1 partial are group-less with `global_ground = false`), so
+    // the flag cannot simply be derived — this is the one cross-check.
+    if global_ground && !group_cols.is_empty() {
+        return Err(CompileError::Rejected(
+            "reduce: global_ground with a non-empty group set",
+        ));
+    }
     if agg.iter().any(|&(_, c)| c as usize >= in_reg_schema.num_columns()) {
         return Err(CompileError::Rejected("reduce: aggregate column out of range"));
     }

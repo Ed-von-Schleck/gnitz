@@ -2356,12 +2356,18 @@ fn make_batch_u64pk_i64grp_u64val(
     b
 }
 
-fn make_schema_u64pk_i64grp_i64val() -> SchemaDescriptor {
+/// `[U64 pk, I64 grp, I64 val]` — group by the I64 payload `grp`. `val_nullable`
+/// picks the two shapes the reduce tests need: NOT NULL keeps the reduce output on
+/// the null-blind fixed-int comparator, nullable is required wherever a test writes
+/// a null bit into `val` (and is what the non-linear delta is then consolidated
+/// under). `grp` stays NOT NULL — it is the group key, which
+/// `GroupKeyExtractor::new` asserts on.
+fn u64pk_i64grp_i64val(val_nullable: bool) -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, u8::from(val_nullable)),
         ],
         &[0],
     )
@@ -2761,7 +2767,7 @@ fn test_reduce_min_max_i64_boundary() {
     // Guard that the TypeCode::U64 branch does not leak into I64 paths:
     // MIN of {i64::MIN, -1, 0, i64::MAX} = i64::MIN,
     // MAX = i64::MAX.
-    let in_schema = make_schema_u64pk_i64grp_i64val();
+    let in_schema = u64pk_i64grp_i64val(false);
     let out_schema = make_out_schema_grp_i64agg();
 
     // MIN test.
@@ -7797,16 +7803,10 @@ fn run_minmax_epochs(
     states
 }
 
-/// `[U64 pk, I64 grp, I64 val]` → group by the I64 payload `grp`.
+/// The MIN/MAX epoch fixture: `val` nullable, because the all-NULL-group cases
+/// write a null bit into it.
 fn mm_in_schema() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    )
+    u64pk_i64grp_i64val(true)
 }
 
 /// `[U128 pk, I64 grp, I64 min(nullable), I64 max(nullable), I64 count]`.
@@ -8583,4 +8583,51 @@ fn test_build_reduce_output_schema_synthetic_pk() {
     assert_eq!(out.columns[0].type_code, type_code::U128);
     assert_eq!(out.columns[1].type_code, type_code::STRING);
     assert_eq!(out.columns[2].type_code, type_code::I64);
+}
+
+/// The reduce output schema must declare each aggregate column nullable exactly
+/// when `emit_agg_col` can set its null bit: an untouched SUM/MIN/MAX, which a
+/// NULL source value or an empty group set produces. The zero-identity family
+/// (COUNT / COUNT_NON_NULL / SumZero) renders a concrete `0` and stays NOT NULL,
+/// which is what keeps a COUNT-only or NOT-NULL-source grouped reduce on the
+/// null-blind fixed-int comparator. This pins the schema builder's *application*
+/// of the shared `AggFunc::raw_output_nullable`; the rule itself is pinned in
+/// `gnitz-wire`. The `group_cols = &[]` arm is also the range-join threshold
+/// reduce's shape (group-less MIN over a NOT NULL column).
+#[test]
+fn build_reduce_output_schema_agg_nullability_matrix() {
+    for src_nullable in [false, true] {
+        // Group by the payload `grp` (I64 is not a natural reduce key, so this is
+        // the SyntheticFold shape).
+        let input = u64pk_i64grp_i64val(src_nullable);
+        for agg_op in [
+            AggOp::Count,
+            AggOp::CountNonNull,
+            AggOp::SumZero,
+            AggOp::Sum,
+            AggOp::Min,
+            AggOp::Max,
+        ] {
+            let aggs = vec![AggDescriptor {
+                col_idx: 2,
+                agg_op,
+                col_type_code: TypeCode::I64,
+            }];
+            for group_cols in [&[1u32][..], &[][..]] {
+                let out_key = input.reduce_out_key(group_cols);
+                let out = build_reduce_output_schema(&input, group_cols, &aggs, out_key);
+                // Aggregates are the trailing output columns.
+                let got = out.columns[out.num_columns() - 1].nullable != 0;
+                let want = match agg_op {
+                    AggOp::Count | AggOp::CountNonNull | AggOp::SumZero => false,
+                    AggOp::Sum | AggOp::Min | AggOp::Max => src_nullable || group_cols.is_empty(),
+                };
+                assert_eq!(
+                    got, want,
+                    "{agg_op:?}: src_nullable={src_nullable}, group_cols={group_cols:?} \
+                     → expected nullable={want}",
+                );
+            }
+        }
+    }
 }

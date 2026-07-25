@@ -994,7 +994,8 @@ fn build_scalar_reduce(
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let arg_def = arg.map(|id| &col_by_id(inner_cols, id).expect("agg arg in inner").def);
     let typing = agg_typing(func, arg_def)?;
-    let hir_agg = HirAgg::new(ids, func, arg, &typing);
+    let arg_nullable = arg_def.map(|d| d.is_nullable).unwrap_or(false);
+    let hir_agg = HirAgg::new(ids, func, arg, &typing, arg_nullable, group_cols.is_empty());
     Ok(RelExpr::reduce(rel, group_cols, vec![hir_agg]))
 }
 
@@ -1285,14 +1286,10 @@ fn collect_aggs<L: LeafBinder<HirRef>>(
             None => {
                 let arg_def = arg.map(|id| &col_by_id(env, id).expect("agg arg ColId in env").def);
                 let typing = agg_typing(func, arg_def)?;
-                let output_nullable = agg_output_nullable(
-                    typing.shape,
-                    func,
-                    arg_def.map(|d| d.is_nullable).unwrap_or(false),
-                    is_global,
-                );
+                let arg_nullable = arg_def.map(|d| d.is_nullable).unwrap_or(false);
+                let output_nullable = agg_output_nullable(&typing, arg_nullable, is_global);
                 aggs.push(GroupAgg {
-                    agg: HirAgg::new(ids, func, arg, &typing),
+                    agg: HirAgg::new(ids, func, arg, &typing, arg_nullable, is_global),
                     view_type: typing.view_type,
                     output_nullable,
                 });

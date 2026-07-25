@@ -74,9 +74,15 @@ pub(crate) fn build_reduce_output_schema(
             }
         }
     }
-    // Aggregate results (same for all arms)
+    // Aggregate results (same for all arms). Nullability must cover what
+    // `emit_agg_col` writes — see `AggFunc::raw_output_nullable`. `col_idx` is
+    // range-checked by both callers before `agg_descs` is built.
+    let ungrouped = group_cols.is_empty();
     for ad in agg_descs {
-        cols[n] = SchemaColumn::new(agg_output_type(ad.agg_op, ad.col_type_code), 0);
+        let nullable = ad
+            .agg_op
+            .raw_output_nullable(input.columns[ad.col_idx as usize].nullable != 0, ungrouped);
+        cols[n] = SchemaColumn::new(agg_output_type(ad.agg_op, ad.col_type_code), nullable as u8);
         n += 1;
     }
     SchemaDescriptor::new(&cols[..n], &pk_idx[..pk_len])
@@ -214,6 +220,30 @@ impl ReducePlan {
             output_schema.num_payload_cols(),
             "reduce output schema must be [key columns…, group exemplars…, aggregates…]",
         );
+
+        // The declaration must **cover** the emission: `emit_agg_col` sets a null
+        // bit exactly when an untouched accumulator does not render a concrete `0`,
+        // and `raw_output_nullable` is that same rule over compile-time facts. A
+        // NOT NULL declaration on a column that can render NULL puts the row on the
+        // null-blind fixed-int comparator, which ranks that cell as a real `0` — so
+        // a `MIN: NULL → 0` transition compares equal to its own retraction and
+        // nets away, stranding a stale row in the trace. Checked once per plan
+        // (every reduce, data-independent) rather than per emitted row, and it
+        // covers the ad-hoc fold's schema too since that lands here as well. The
+        // converse slack is deliberate: declaring a column nullable that never
+        // renders NULL only forfeits a comparator class, and `op_reduce`'s callers
+        // may legitimately widen. `build_reduce_output_schema` produces the exact
+        // rule, which its own test pins.
+        let ungrouped = group_by_cols.is_empty();
+        for (k, d) in agg_descs.iter().enumerate() {
+            let renders_null = d
+                .agg_op
+                .raw_output_nullable(input_schema.columns[d.col_idx as usize].nullable != 0, ungrouped);
+            assert!(
+                !renders_null || output_schema.columns[cbase + k].nullable != 0,
+                "reduce output schema: aggregate column {k} can render NULL but is declared NOT NULL",
+            );
+        }
 
         ReducePlan {
             input_schema: *input_schema,

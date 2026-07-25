@@ -39,17 +39,38 @@ impl From<gnitz_wire::AggFunc> for AggOp {
     }
 }
 
+impl From<AggOp> for gnitz_wire::AggFunc {
+    fn from(o: AggOp) -> Self {
+        match o {
+            AggOp::Count => gnitz_wire::AggFunc::Count,
+            AggOp::Sum => gnitz_wire::AggFunc::Sum,
+            AggOp::Min => gnitz_wire::AggFunc::Min,
+            AggOp::Max => gnitz_wire::AggFunc::Max,
+            AggOp::CountNonNull => gnitz_wire::AggFunc::CountNonNull,
+            AggOp::SumZero => gnitz_wire::AggFunc::SumZero,
+        }
+    }
+}
+
 impl AggOp {
     pub fn is_linear(self) -> bool {
         matches!(self, AggOp::Count | AggOp::Sum | AggOp::CountNonNull | AggOp::SumZero)
     }
 
-    /// True iff an untouched accumulator renders `0`, not NULL — the
-    /// zero-identity family. COUNT / COUNT_NON_NULL count rows (empty = 0);
-    /// SumZero is Sum's fold under Count's 0 identity (the two-phase
-    /// partial-count combine). SUM / MIN / MAX have a NULL empty value.
+    /// See [`gnitz_wire::AggFunc::empty_renders_zero`] — the shared rule.
     pub fn empty_renders_zero(self) -> bool {
-        matches!(self, AggOp::Count | AggOp::CountNonNull | AggOp::SumZero)
+        gnitz_wire::AggFunc::from(self).empty_renders_zero()
+    }
+
+    /// See [`gnitz_wire::AggFunc::raw_output_nullable`] — the shared rule, whose
+    /// engine consumer is `build_reduce_output_schema`. `ungrouped` is
+    /// `group_cols.is_empty()`, not `global_ground`: the two extra shapes an empty
+    /// group set covers — the range-join threshold reduce and the two-phase
+    /// phase-1 local partial — emit at most one row per worker, so the
+    /// `FixedIntNonnull` comparator class forfeited there is worth nothing, and
+    /// the schema stays a pure function of the schema-level facts.
+    pub fn raw_output_nullable(self, src_nullable: bool, ungrouped: bool) -> bool {
+        gnitz_wire::AggFunc::from(self).raw_output_nullable(src_nullable, ungrouped)
     }
 
     /// True iff this aggregate is maintained through the combined AggValueIndex —

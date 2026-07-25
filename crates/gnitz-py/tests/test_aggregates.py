@@ -1157,6 +1157,107 @@ class TestGroupBy:
         finally:
             client.drop_schema(sn)
 
+    @pytest.mark.parametrize(
+        "pred, expected",
+        # `<=`, `>=`, `<` and `=` all lower to the same LoadPayloadInt/LoadConst/Cmp
+        # shape, so one comparison per extremum is the whole decision: `MIN(v) = 0`
+        # is the tightest (it also excludes the non-zero k=10), `MAX(v)` covers the
+        # mirror aggregate.
+        [
+            ("MIN(v) = 0", {30}),
+            ("MAX(v) <= 10", {10, 30}),
+        ],
+    )
+    def test_having_extremum_over_nullable_col_is_not_zero(self, client, pred, expected):
+        """A raw MIN/MAX column over a nullable source renders NULL as zero bytes
+        under a set null bit. If the reduce output declared that column NOT NULL,
+        the HAVING program (LoadPayloadInt + LoadConst + Cmp) would classify as
+        null-free and take the filter's `no_nulls` arm, which never reads the null
+        bitmap — comparing the NULL group as the value 0. Only a predicate that is
+        true at 0 discriminates, so both cases are; k=30 is the genuine-zero control
+        that must survive while the all-NULL k=20 is excluded."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  k BIGINT NOT NULL,"
+                "  v BIGINT NULL"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                f"CREATE VIEW vw AS SELECT k, COUNT(*) AS c FROM t GROUP BY k HAVING {pred}",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "vw")[0]
+
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10, 5), (2, 20, NULL), (3, 30, 0)",
+                schema_name=sn,
+            )
+            groups = {r["k"] for r in client.scan(vid) if r.weight > 0}
+            assert groups == expected, (
+                f"HAVING {pred}: expected groups {expected}, got {groups} "
+                "(a NULL aggregate compared as 0?)")
+
+            client.execute_sql("DROP VIEW vw", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_min_null_to_zero_transition_leaves_one_group(self, client):
+        """A NULL → 0 transition of a nullable MIN changes only the null bit: the
+        payload bytes are zero either way. If the owned reduce trace declared the
+        aggregate column NOT NULL its rows would compare under the null-blind
+        fixed-int comparator, so the `old @ -1` / `new @ +1` pair would net to zero
+        and the trace would keep the stale NULL row. The damage surfaces on the
+        *next* transition, whose retraction is byte-copied from that stale row —
+        leaving two positive-weight rows for one group. GROUP BY shards each group
+        whole onto one worker, so this reproduces at any worker count."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  k BIGINT NOT NULL,"
+                "  v BIGINT NULL"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW vw AS SELECT k, MIN(v) AS m FROM t GROUP BY k",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "vw")[0]
+
+            def one_row(step):
+                rows = list(client.scan(vid))
+                assert all(r.weight > 0 for r in rows), f"{step}: ghost weights: {rows}"
+                assert len(rows) == 1, f"{step}: expected exactly one group row, got {rows}"
+                return rows[0]
+
+            client.execute_sql("INSERT INTO t VALUES (1, 10, NULL)", schema_name=sn)
+            r = one_row("insert NULL")
+            assert r["k"] == 10 and r["m"] is None
+
+            # Correct even on the unfixed build — only the trace goes stale here.
+            client.execute_sql("UPDATE t SET v = 0 WHERE pk = 1", schema_name=sn)
+            r = one_row("NULL -> 0")
+            assert r["m"] == 0, f"MIN must be 0, got {r['m']}"
+
+            # The stale trace bites here: the retraction is byte-copied from it.
+            client.execute_sql("UPDATE t SET v = 7 WHERE pk = 1", schema_name=sn)
+            r = one_row("0 -> 7")
+            assert r["m"] == 7, f"MIN must be 7, got {r['m']}"
+
+            client.execute_sql("DROP VIEW vw", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
 
 class TestGroupByPkAndNullable:
     """`GROUP BY` containing the PK column or a nullable column."""
@@ -3358,6 +3459,70 @@ class TestGlobalAggregate:
             assert self._count_reduce_nodes(client, vai) == 2, "AVG over integer is two-phase"
             assert self._count_reduce_nodes(client, vsf) == 1, "float SUM keeps the funnel"
             assert self._count_reduce_nodes(client, vaf) == 1, "AVG over float keeps the funnel"
+        finally:
+            client.drop_schema(sn)
+
+    def test_having_ungrouped_sum_null_is_not_zero(self, client):
+        """The ground row renders SUM = NULL over an empty (or fully retracted)
+        source even though the source column is NOT NULL — the shape that makes the
+        raw aggregate column nullable on an empty group set alone. Its finalize is a
+        bare column reference, so `HAVING SUM(x) = 0` is a plain Cmp with no
+        NULL-forcing instruction: NULL = 0 is UNKNOWN and must exclude the ground
+        row, where reading the raw column's zero bytes would admit it."""
+        sn = "ga_" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW vw AS SELECT SUM(x) AS s FROM t HAVING SUM(x) = 0",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "vw")[0]
+
+            def positive_rows():
+                return [r for r in client.scan(vid) if r.weight > 0]
+
+            assert positive_rows() == [], "SUM over a never-populated source is NULL, not 0"
+
+            # Control: a genuine zero sum must pass, and read back as 0.
+            client.execute_sql("INSERT INTO t VALUES (1, 5), (2, -5)", schema_name=sn)
+            assert self._one_row(client, vid)["s"] == 0, "genuine SUM = 0 must pass HAVING"
+
+            # Fully retracted -> back to the NULL ground row -> excluded again.
+            client.execute_sql("DELETE FROM t", schema_name=sn)
+            assert positive_rows() == [], "fully retracted SUM is NULL, not 0"
+        finally:
+            client.drop_schema(sn)
+
+    def test_min_null_to_zero_transition_leaves_one_row(self, client):
+        """The global twin of the grouped stale-trace collapse: a NULL -> 0 MIN
+        transition changes only the null bit, so under a NOT NULL declaration the
+        `old @ -1` / `new @ +1` pair compares equal on the null-blind fixed-int
+        comparator and nets to zero, leaving the stale NULL row in the trace. The
+        damage surfaces on the *next* transition, whose retraction is byte-copied
+        from that stale row. MIN is not linear, so this is a single funnelled
+        reduce rather than the two-phase pair."""
+        sn = "ga_" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE VIEW vw AS SELECT MIN(v) AS m FROM t", schema_name=sn)
+            vid = client.resolve_table(sn, "vw")[0]
+
+            client.execute_sql("INSERT INTO t VALUES (1, NULL)", schema_name=sn)
+            assert self._one_row(client, vid)["m"] is None
+
+            client.execute_sql("UPDATE t SET v = 0 WHERE pk = 1", schema_name=sn)
+            assert self._one_row(client, vid)["m"] == 0, "MIN must be 0"
+
+            client.execute_sql("UPDATE t SET v = 7 WHERE pk = 1", schema_name=sn)
+            assert self._one_row(client, vid)["m"] == 7, "MIN must be 7"
         finally:
             client.drop_schema(sn)
 

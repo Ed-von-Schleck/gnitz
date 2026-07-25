@@ -322,18 +322,36 @@ pub(crate) struct HirAgg {
 
 impl HirAgg {
     /// Mint an aggregate's raw output column (and its `COUNT_NON_NULL` companion
-    /// when the shape carries one) from the typing `agg::agg_typing` decided. The
-    /// raw value column is a binding target, never wire-decoded, so it is
-    /// non-nullable — matching the physical reduce schema `agg::reduce_output_schema`
-    /// builds for the same aggregate.
-    pub(crate) fn new(ids: &ColIdGen, func: AggFunc, arg: Option<ColId>, typing: &crate::agg::AggTyping) -> Self {
+    /// when the shape carries one) from the typing `agg::agg_typing` decided.
+    ///
+    /// The raw value column's nullability is the shared
+    /// `AggFunc::raw_output_nullable` — the same rule the engine's physical reduce
+    /// output schema obeys, so the two layers agree on what the reduce can emit.
+    /// It is **not** cosmetic here: `null_gate` emits no NULL filter for a NOT NULL
+    /// key, so a companion-free MIN/MAX keyed directly by an uncorrelated scalar
+    /// subquery would carry its ground row's NULL (zero bytes) into `map_reindex`
+    /// ungated, where it OPK-encodes as the real key `0` and spuriously matches
+    /// `outer = 0`.
+    pub(crate) fn new(
+        ids: &ColIdGen,
+        func: AggFunc,
+        arg: Option<ColId>,
+        typing: &crate::agg::AggTyping,
+        arg_nullable: bool,
+        is_global: bool,
+    ) -> Self {
         HirAgg {
             func,
             arg,
             out: HirCol {
                 id: ids.next(),
-                def: ColumnDef::new("_agg", typing.ops[0].1, false),
+                def: ColumnDef::new(
+                    "_agg",
+                    typing.ops[0].1,
+                    typing.ops[0].0.raw_output_nullable(arg_nullable, is_global),
+                ),
             },
+            // The companion is COUNT_NON_NULL, whose empty render is a concrete `0`.
             companion: typing.shape.has_count_companion().then(|| HirCol {
                 id: ids.next(),
                 def: ColumnDef::new("_cnt", TypeCode::I64, false),

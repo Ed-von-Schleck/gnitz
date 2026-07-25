@@ -122,6 +122,35 @@ impl AggFunc {
         self as u64
     }
 
+    /// True iff an untouched accumulator renders a concrete `0` rather than
+    /// NULL — the zero-identity family. COUNT / COUNT_NON_NULL count rows
+    /// (empty = 0); SumZero is Sum's fold under Count's `0` identity (the
+    /// two-phase partial-count combine). SUM / MIN / MAX have a NULL empty
+    /// value.
+    pub const fn empty_renders_zero(self) -> bool {
+        matches!(self, AggFunc::Count | AggFunc::CountNonNull | AggFunc::SumZero)
+    }
+
+    /// True iff a reduce's **raw** output column for this aggregate can render
+    /// NULL, and must therefore be declared nullable — THE shared rule, and the
+    /// declaration half of the null-bit rule `emit_agg_col` writes
+    /// (`is_untouched() && !empty_renders_zero()`).
+    ///
+    /// A row carries an untouched accumulator only when the aggregate's source
+    /// column is nullable (the null gate is the group walk's one skip) or when
+    /// the group set is empty, where the ground row stands in for a
+    /// never-populated / fully-retracted source. A surviving *group* is never
+    /// null-filled from emptiness — it is retracted instead.
+    ///
+    /// Its two consumers must never drift: the engine's physical reduce output
+    /// schema (`build_reduce_output_schema`, where a NOT NULL declaration puts
+    /// the row on a null-blind comparator that would rank a NULL cell as a real
+    /// `0`) and the planner's finalize-level nullability (`agg_output_nullable`,
+    /// which widens this for the companion-carrying shapes).
+    pub const fn raw_output_nullable(self, src_nullable: bool, ungrouped: bool) -> bool {
+        !self.empty_renders_zero() && (src_nullable || ungrouped)
+    }
+
     /// The aggregate that merges this aggregate's per-worker **partials** —
     /// THE shared combine rule (its two consumers must never drift: the
     /// planner's two-phase global-aggregate combine reduce, and the ad-hoc

@@ -47,6 +47,8 @@ fn finish_row(output: &mut Batch, null_word: u64) {
 /// (= the plan's group-exemplar count).
 #[inline]
 fn emit_agg_cols(output: &mut Batch, accs: &[Accumulator], plan: &ReducePlan, pi_base: usize, null_word: &mut u64) {
+    // The declaration/emission agreement is pinned once per plan by
+    // `ReducePlan::new`, not per row.
     for (k, acc) in accs.iter().enumerate() {
         emit_agg_col(output, acc, pi_base + k, plan.agg_col_widths[k], null_word);
     }

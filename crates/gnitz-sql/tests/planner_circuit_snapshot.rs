@@ -825,15 +825,16 @@ fn sentinel_14b_scalar_uncorrelated() {
 // Two segments: seg 1 = the uncorrelated global MAX reduce (one-row output),
 // seg 0 = the pure-range INNER join of the outer against that value (the aggregate
 // value is the join key) — the bare `a.id` projection fuses into the join's own
-// output, so the HIR path needs no separate finalize segment. The `< NULL ⇒
-// UNKNOWN` semantics over an empty inner side are weight-pinned by the existing
-// test_scalar_subquery.py.
+// output, so the HIR path needs no separate finalize segment. `#12 FILTER` is the
+// null gate on that key: the global MAX renders NULL over an empty `b`, and
+// without the gate `map_reindex` would OPK-encode it as the real key `0`. The
+// `< NULL ⇒ UNKNOWN` semantics are weight-pinned by test_scalar_subquery.py.
 const EXPECTED_14B: &str = r#"seg 0:
 #0 INTEGRATE_SINK <- (#1@0)
 #1 EXCHANGE_SHARD params:[(SHARD,0,0,0);(SHARD,1,1,0)] <- (#2@0)
 #2 MAP_PROJ params:[(PROJ,0,3,0)] <- (#3@0)
 #3 MAP_EXPR params:[(REINDEX,0,1,0);(REINDEX,1,4,0)] <- (#4@0)
-#4 UNION <- (#5@0,#13@1)
+#4 UNION <- (#5@0,#14@1)
 #5 MAP_PROJ params:[(PROJ,0,1,0);(PROJ,1,2,0);(PROJ,2,3,0);(PROJ,3,4,0);(PROJ,4,5,0)] <- (#6@0)
 #6 JOIN_DELTA_TRACE_RANGE params:[(RANGE_JOIN,0,0,2)] <- (#7@0,#9@1)
 #7 MAP_EXPR params:[(REINDEX,0,2,0)] <- (#8@0)
@@ -841,11 +842,12 @@ const EXPECTED_14B: &str = r#"seg 0:
 #9 INTEGRATE_TRACE <- (#10@0)
 #10 PARTITION_FILTER <- (#11@0)
 #11 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#12@0)
-#12 SCAN_DELTA src:seg:1
-#13 MAP_PROJ params:[(PROJ,0,3,0);(PROJ,1,4,0);(PROJ,2,5,0);(PROJ,3,1,0);(PROJ,4,2,0)] <- (#14@0)
-#14 JOIN_DELTA_TRACE_RANGE params:[(RANGE_JOIN,0,0,0)] <- (#11@0,#15@1)
-#15 INTEGRATE_TRACE <- (#16@0)
-#16 PARTITION_FILTER <- (#7@0)
+#12 FILTER <- (#13@0)
+#13 SCAN_DELTA src:seg:1
+#14 MAP_PROJ params:[(PROJ,0,3,0);(PROJ,1,4,0);(PROJ,2,5,0);(PROJ,3,1,0);(PROJ,4,2,0)] <- (#15@0)
+#15 JOIN_DELTA_TRACE_RANGE params:[(RANGE_JOIN,0,0,0)] <- (#11@0,#16@1)
+#16 INTEGRATE_TRACE <- (#17@0)
+#17 PARTITION_FILTER <- (#7@0)
 
 seg 1:
 #0 INTEGRATE_SINK <- (#1@0)

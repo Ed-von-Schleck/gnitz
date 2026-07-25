@@ -441,7 +441,9 @@ fn execute_aggregate_select(
     // schema by construction). Partial agg columns are nullable: an all-NULL
     // SUM/MIN/MAX group emits a NULL partial the client must carry.
     let partial_schema = Schema::from_parts(
-        synthetic_fold_cols(&schema, &layout.group_col_indices, &layout.agg_specs, true),
+        // Blanket-nullable: this schema only decodes worker partials, and
+        // `same_physical_layout` ignores nullability.
+        synthetic_fold_cols(&schema, &layout.group_col_indices, &layout.agg_specs, &|_| true),
         vec![0],
     )
     .map_err(|e| GnitzSqlError::Unsupported(format!("ad-hoc aggregate reply schema is invalid: {e}")))?;

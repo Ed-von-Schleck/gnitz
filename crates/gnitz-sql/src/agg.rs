@@ -25,7 +25,7 @@ pub(crate) struct AggMapping {
     /// construction (`append_agg_mapping`) and read by both the SELECT
     /// projection's output schema and the HAVING `IS [NOT] NULL` const-fold, so
     /// the two cannot drift. Companion shapes are blanket-nullable; `Direct` is
-    /// the exact structural fact (`direct_agg_nullable`).
+    /// the exact structural fact (`AggFunc::raw_output_nullable`).
     pub(crate) output_nullable: bool,
     pub(crate) agg_func: AggFunc,
     pub(crate) arg_col: Option<usize>,
@@ -79,34 +79,6 @@ pub(crate) fn agg_result_type_of(func: AggFunc, arg: Option<&ColumnDef>) -> Type
     };
     let src_tc = arg.map(|c| c.type_code as u8).unwrap_or(TypeCode::I64 as u8);
     TypeCode::from_validated_u8(gnitz_core::agg_output_type(wire_func, src_tc))
-}
-
-/// Whether an `AggShape::Direct` aggregate's output column can be NULL at
-/// runtime, given the query shape. Computed once per aggregate at mapping
-/// construction (`AggMapping::output_nullable`); everything downstream reads
-/// the stored field.
-///
-/// A **global** (empty group set) aggregate seeds a ground row that renders
-/// SUM/MIN/MAX/AVG as NULL over an empty source, so it is always nullable. A
-/// **grouped** aggregate never renders NULL from emptiness (an emptied group is
-/// retracted, not null-filled), so on a surviving group:
-/// * COUNT / COUNT_NON_NULL are always a concrete integer (`empty_renders_zero`);
-/// * a Direct SUM is only reached for a non-nullable source (a nullable source
-///   routes to `NullfillSum`), so it always has a value;
-/// * MIN / MAX render NULL only for an all-NULL group, i.e. a nullable source.
-///
-/// Mirrors `emit.rs`'s null-bit rule (`is_untouched() && !empty_renders_zero()`).
-/// AVG is never `Direct` (it always carries a COUNT_NON_NULL companion).
-/// `arg_nullable` is the aggregate argument column's nullability (irrelevant, so
-/// pass `false`, for COUNT and SUM — only MIN/MAX consult it). Shared by the
-/// old view/ad-hoc mapping construction and the HIR reduce bind.
-pub(crate) fn direct_agg_nullable(agg_func: AggFunc, arg_nullable: bool, is_global: bool) -> bool {
-    match agg_func {
-        AggFunc::Count | AggFunc::CountNonNull => false,
-        AggFunc::Sum => is_global,
-        AggFunc::Min | AggFunc::Max => is_global || arg_nullable,
-        AggFunc::Avg => unreachable!("AVG is never AggShape::Direct"),
-    }
 }
 
 /// What each SELECT item represents in a GROUP BY query (in SELECT order).
@@ -202,15 +174,15 @@ pub(crate) fn group_col_reduce_pos(
 /// spec (at the spec's `out_type`). The single home of the layout the view
 /// path's virtual reduce schema, the ad-hoc partial reply schema, and the
 /// HAVING binder's `agg_col_offset = 1 + n_group` all assume. `aggs_nullable`
-/// is the one divergence: the view's virtual schema marks agg columns
-/// non-nullable (it is a binding target, never wire-decoded), while the ad-hoc
-/// partial schema must mark them nullable (an all-NULL SUM/MIN/MAX group ships
-/// a NULL partial).
+/// is the one divergence: the view path passes the exact per-spec rule
+/// (`agg_raw_nullable`, matching the engine's physical reduce schema), while the
+/// ad-hoc partial reply schema passes a blanket `true` — it only has to *decode*
+/// worker partials, and `same_physical_layout` ignores nullability there.
 pub(crate) fn synthetic_fold_cols(
     source_schema: &Schema,
     group_col_indices: &[usize],
     agg_specs: &[AggSpec],
-    aggs_nullable: bool,
+    aggs_nullable: &dyn Fn(&AggSpec) -> bool,
 ) -> Vec<ColumnDef> {
     let mut cols = Vec::with_capacity(1 + group_col_indices.len() + agg_specs.len());
     // Hidden: the synthetic group key is a physical PK column but not a
@@ -221,9 +193,21 @@ pub(crate) fn synthetic_fold_cols(
         cols.push(source_schema.columns[gi].clone());
     }
     for spec in agg_specs {
-        cols.push(ColumnDef::new("_agg", spec.out_type, aggs_nullable));
+        cols.push(ColumnDef::new("_agg", spec.out_type, aggs_nullable(spec)));
     }
     cols
+}
+
+/// The raw reduce column's nullability for one physical spec, via the shared
+/// `AggFunc::raw_output_nullable` the engine's `build_reduce_output_schema`
+/// obeys — so the planner's virtual reduce schema and the physical one agree.
+pub(crate) fn agg_raw_nullable(source_schema: &Schema, spec: &AggSpec, is_global: bool) -> bool {
+    let src_nullable = source_schema
+        .columns
+        .get(spec.col)
+        .map(|c| c.is_nullable)
+        .unwrap_or(false);
+    spec.op.raw_output_nullable(src_nullable, is_global)
 }
 
 /// A reduce's physical shape: what it groups by, what it aggregates, and the two
@@ -270,6 +254,7 @@ impl<'a> ReduceShape<'a> {
 /// per-op reconstruction. One home for the view path and the HIR reduce shell.
 pub(crate) fn reduce_output_schema(sh: &ReduceShape<'_>) -> (Schema, usize) {
     let (source_schema, agg_specs) = (sh.source_schema, sh.specs);
+    let is_global = sh.global_ground;
     let (columns, pk_cols) = match sh.out_key {
         ReduceOutKey::PkPermutation => {
             let mut cols: Vec<ColumnDef> = source_schema
@@ -278,17 +263,27 @@ pub(crate) fn reduce_output_schema(sh: &ReduceShape<'_>) -> (Schema, usize) {
                 .map(|&pi| source_schema.columns[pi].clone())
                 .collect();
             let pk: Vec<usize> = (0..cols.len()).collect();
-            cols.extend(agg_specs.iter().map(|s| ColumnDef::new("_agg", s.out_type, false)));
+            cols.extend(
+                agg_specs
+                    .iter()
+                    .map(|s| ColumnDef::new("_agg", s.out_type, agg_raw_nullable(source_schema, s, is_global))),
+            );
             (cols, pk)
         }
         ReduceOutKey::SingleNaturalCol => {
             let mut cols = vec![source_schema.columns[sh.group_cols[0]].clone()];
-            cols.extend(agg_specs.iter().map(|s| ColumnDef::new("_agg", s.out_type, false)));
+            cols.extend(
+                agg_specs
+                    .iter()
+                    .map(|s| ColumnDef::new("_agg", s.out_type, agg_raw_nullable(source_schema, s, is_global))),
+            );
             (cols, vec![0])
         }
         // The shared SyntheticFold layout (also the ad-hoc partial schema).
         ReduceOutKey::SyntheticFold => (
-            synthetic_fold_cols(source_schema, sh.group_cols, agg_specs, false),
+            synthetic_fold_cols(source_schema, sh.group_cols, agg_specs, &|s| {
+                agg_raw_nullable(source_schema, s, is_global)
+            }),
             vec![0],
         ),
     };
@@ -500,9 +495,12 @@ pub(crate) fn finalize_agg_bexpr<R>(value: R, companion: Option<R>, func: AggFun
 /// Whether an aggregate's **finalize** output is nullable. AVG's and nullable-SUM's
 /// null-ness lives in the COUNT_NON_NULL companion (the finalize renders NULL via
 /// div-by-zero), so a companion-carrying shape is unconditionally nullable; a direct
-/// shape falls back to the exact structural fact. One home for the ad-hoc (DML) and HIR binds.
-pub(crate) fn agg_output_nullable(shape: AggShape, agg_func: AggFunc, arg_nullable: bool, is_global: bool) -> bool {
-    shape.has_count_companion() || direct_agg_nullable(agg_func, arg_nullable, is_global)
+/// shape is exactly the raw reduce column's nullability, which is the shared
+/// `AggFunc::raw_output_nullable` the engine's physical reduce schema also obeys
+/// (`ops[0]` is the value spec — for AVG the SUM component, whose shape
+/// short-circuits above anyway). One home for the ad-hoc (DML) and HIR binds.
+pub(crate) fn agg_output_nullable(typing: &AggTyping, arg_nullable: bool, is_global: bool) -> bool {
+    typing.shape.has_count_companion() || typing.ops[0].0.raw_output_nullable(arg_nullable, is_global)
 }
 
 /// An aggregate's typing: everything decided by the function and its argument's
@@ -632,7 +630,7 @@ pub(crate) fn append_agg_mapping(
     let start = agg_specs.len();
     let typing = push_agg_specs(agg_func, arg_col, &source_schema.columns, agg_specs)?;
     let arg_nullable = arg_col.map(|c| source_schema.columns[c].is_nullable).unwrap_or(false);
-    let output_nullable = agg_output_nullable(typing.shape, agg_func, arg_nullable, is_global);
+    let output_nullable = agg_output_nullable(&typing, arg_nullable, is_global);
     agg_mappings.push(AggMapping {
         specs_start: start,
         shape: typing.shape,
@@ -725,24 +723,28 @@ mod tests {
     }
 
     // The Direct-aggregate nullability decision shared by the SELECT projection
-    // (output-schema nullability) and the HAVING `IS [NOT] NULL` const-fold. Col 0
-    // (`pk`, U64) is non-nullable; col 1 (`n`, I64) is nullable.
+    // (output-schema nullability) and the HAVING `IS [NOT] NULL` const-fold — and,
+    // through the same shared rule, by the engine's physical reduce output schema.
     #[test]
-    fn direct_agg_nullable_matches_emit_semantics() {
-        // COUNT / COUNT_NON_NULL: always a concrete integer, grouped or global.
-        assert!(!direct_agg_nullable(AggFunc::Count, false, false));
-        assert!(!direct_agg_nullable(AggFunc::Count, false, true));
-        assert!(!direct_agg_nullable(AggFunc::CountNonNull, true, false));
-        assert!(!direct_agg_nullable(AggFunc::CountNonNull, true, true));
-        // Direct SUM (only reached for a non-nullable source): NULL only globally,
-        // where an empty source seeds a NULL ground row. Grouped never renders NULL.
-        assert!(!direct_agg_nullable(AggFunc::Sum, false, false));
-        assert!(direct_agg_nullable(AggFunc::Sum, false, true));
-        // MIN / MAX: NULL globally (ground row), or grouped over a nullable source
-        // (all-NULL group). Grouped over a non-nullable source never renders NULL.
-        assert!(!direct_agg_nullable(AggFunc::Min, false, false)); // grouped, non-nullable pk
-        assert!(direct_agg_nullable(AggFunc::Min, true, false)); // grouped, nullable n
-        assert!(direct_agg_nullable(AggFunc::Max, false, true)); // global, non-nullable pk
-        assert!(direct_agg_nullable(AggFunc::Max, true, false)); // grouped, nullable n
+    fn raw_output_nullable_matches_emit_semantics() {
+        use WireAggFunc as W;
+        // COUNT / COUNT_NON_NULL / SumZero: always a concrete integer.
+        for f in [W::Count, W::CountNonNull, W::SumZero] {
+            for src_nullable in [false, true] {
+                for ungrouped in [false, true] {
+                    assert!(!f.raw_output_nullable(src_nullable, ungrouped), "{f:?}");
+                }
+            }
+        }
+        // SUM / MIN / MAX: NULL over an empty group set (the ground row stands in
+        // for a never-populated source), or grouped over a nullable source (an
+        // all-NULL group). Grouped over a non-nullable source never renders NULL —
+        // that is what keeps such a reduce on the null-blind fixed-int comparator.
+        for f in [W::Sum, W::Min, W::Max] {
+            assert!(!f.raw_output_nullable(false, false), "{f:?} grouped, non-nullable");
+            assert!(f.raw_output_nullable(true, false), "{f:?} grouped, nullable");
+            assert!(f.raw_output_nullable(false, true), "{f:?} global, non-nullable");
+            assert!(f.raw_output_nullable(true, true), "{f:?} global, nullable");
+        }
     }
 }

@@ -154,6 +154,36 @@ class TestUncorrelatedScalar:
         finally:
             _cleanup(client, sn, "v", "a", "b")
 
+    def test_uncorrelated_extremum_over_empty_source_is_null_not_zero(self, client):
+        """A companion-free MIN/MAX keys the join directly on the **raw** reduce
+        column, whose ground row over an empty source is NULL — zero bytes under a
+        set null bit. Declaring that column NOT NULL would suppress the lowering's
+        NULL gate, letting `map_reindex` OPK-encode it as the real key `0`.
+
+        Discriminating only where the predicate is true at 0: `a.v < MAX` needs a
+        **negative** v, and `a.v = MIN` needs a v of exactly 0. (The positive-only
+        `test_uncorrelated_max_range` above cannot tell NULL from 0.)"""
+        for pred, seeded in (("a.v < (SELECT MAX(w) FROM b)", {(1,): 1}), ("a.v = (SELECT MIN(w) FROM b)", {(2,): 1})):
+            sn = "s" + _uid()
+            client.create_schema(sn)
+            try:
+                self._setup(client, sn)
+                client.execute_sql(f"CREATE VIEW v AS SELECT a.id FROM a WHERE {pred}", schema_name=sn)
+                vid = client.resolve_table(sn, "v")[0]
+                # id 1 has v = -7 (so v < 0 holds), id 2 has v = 0 (so v = 0 holds).
+                client.execute_sql("INSERT INTO a VALUES (1, 1, -7), (2, 2, 0)", schema_name=sn)
+                # Empty b -> the extremum is NULL -> UNKNOWN -> no rows.
+                assert _col_weights(client, vid, "id") == {}, f"{pred}: NULL extremum compared as 0"
+                # Control: a **genuine zero** extremum must match where NULL did not
+                # — the tightest possible discriminator between the two.
+                client.execute_sql("INSERT INTO b VALUES (1, 1, 0)", schema_name=sn)
+                assert _col_weights(client, vid, "id") == seeded, pred
+                # Fully retracted -> back to the NULL ground row -> excluded again.
+                client.execute_sql("DELETE FROM b", schema_name=sn)
+                assert _col_weights(client, vid, "id") == {}, f"{pred}: retracted extremum compared as 0"
+            finally:
+                _cleanup(client, sn, "v", "a", "b")
+
     def test_uncorrelated_count_eq(self, client):
         """`a.v = (SELECT COUNT(*) FROM b)` — equi join against the global COUNT,
         whose ground row is a real 0 (so v = 0 matches an empty b)."""

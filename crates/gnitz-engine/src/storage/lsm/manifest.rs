@@ -40,7 +40,7 @@ const ENTRY_SIZE: usize = 160;
 /// operator-state schema or to the shard/manifest layout; a mismatch (recorded
 /// in `_sequences` via `SEQ_ID_TOPOLOGY`) wipes all Rederive view state at boot,
 /// always correct because it re-derives.
-pub const STATE_FORMAT: u32 = 2;
+pub const STATE_FORMAT: u32 = 3;
 
 /// The durable topology word recorded in `_sequences` (`SEQ_ID_TOPOLOGY`):
 /// `(worker_count << 32) | STATE_FORMAT`. The single packer shared by the
