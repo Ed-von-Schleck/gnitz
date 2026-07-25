@@ -4,7 +4,7 @@
 //! projection (the pass-through/computed split + the PK-front convention, whose
 //! single home is `place_pk_front`).
 
-use super::{slot_of, ColId, ColIdGen, HirExpr, HirRef, ProjEntry};
+use super::{slot_of, ColId, HirExpr, HirRef, ProjEntry};
 use crate::codec::project_schema::{place_pk_front, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp, BoundExpr};
@@ -51,14 +51,14 @@ pub(crate) struct PhysProjection {
 }
 
 /// Physicalize a projection over `input_layout` / `input_schema` — the HIR
-/// realization of `build_projection`: resolve each `ProjEntry.expr`, classify a
+/// realization of the linear projection: resolve each `ProjEntry.expr`, classify a
 /// bare `ColRef(i)` as `PassThrough`/else `Computed`, take the output def from
 /// `ProjEntry.out`, then pin the source PK to the leading slots. The returned
 /// `layout` is reordered through the same `place_pk_front` permutation (an
-/// auto-prepended hidden PK slot takes a fresh placeholder id), so a cut linear
-/// segment exposes its layout exactly like a combine one.
+/// auto-prepended hidden PK slot is [`ColId::NONE`] — the user never named that
+/// column, so nothing can reference it), so a cut linear segment exposes its layout
+/// exactly like a combine one.
 pub(crate) fn physicalize_projection(
-    ids: &mut ColIdGen,
     items: &[ProjEntry],
     input_layout: &[ColId],
     input_schema: &Schema,
@@ -74,7 +74,7 @@ pub(crate) fn physicalize_projection(
         .into_iter()
         .map(|src| match src {
             Some(i) => items[i].out.id,
-            None => ids.next(),
+            None => ColId::NONE,
         })
         .collect();
     Ok(PhysProjection {

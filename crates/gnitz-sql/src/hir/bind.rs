@@ -1,60 +1,91 @@
-//! AST → HIR binding. The one entry, `bind_query`, resolves every name to an
-//! opaque `ColId`, validates the honored clauses, and produces a logical
-//! `RelExpr` tree — single-table linear (`Simple`) and FROM-join (`Join`)
-//! bodies. CTE/derived aliases are already in the binder cache (the old
-//! `inline_ctes`/`compile_derived_tables` ran first in `build_query_segments`),
-//! so a `Get` resolves them by name.
+//! AST → HIR binding. `bind_body` resolves every name to an opaque `ColId`,
+//! validates the honored clauses, and produces a logical `RelExpr` tree for any
+//! relational body (linear / join / grouped / DISTINCT / set operation). The CTE
+//! phase (`bind_ctes`) compiles each CTE body to a hidden segment ahead of the
+//! main bind and registers its alias, so a `Get` resolves a CTE by name; a
+//! derived table binds its subquery recursively to an inline subtree
+//! (`resolve_table_factor`), never a segment.
 
 use super::{
-    col_by_id, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, InPair, ProjEntry, RelExpr, SetOpKind, SubqueryKind,
-    SubqueryRef,
+    as_col, bind_and_lower, col_by_id, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, InPair, ProjEntry, RelExpr,
+    SetOpKind, SubqueryKind, SubqueryRef,
 };
 use crate::agg::{agg_output_nullable, agg_typing, default_agg_name, finalize_agg_bexpr, reject_min_max_unorderable};
 use crate::ast_util::{
-    agg_func_from_name, body_is_grouped, classify_agg_call, classify_from, extract_table_name_and_alias,
-    flatten_conjuncts, has_exists_in_subquery, has_scalar_subquery, is_wildcard_projection, projection_item_expr,
-    reject_unsupported_fn_qualifiers, single_fn_name, single_relation_col_name, wildcard_name_is_visible, FromShape,
-    WildcardRewrite,
+    body_is_grouped, classify_agg_call, classify_from, expand_wildcard_item, extract_table_name_and_alias,
+    flatten_conjuncts, for_each_agg_call, group_by_exprs, has_exists_in_subquery, has_scalar_subquery, is_agg_call,
+    is_wildcard_projection, peel_nested, projection_item_expr, reject_computed_grouped_item, reject_ungrouped_column,
+    reject_unsupported_fn_qualifiers, single_relation_col_name, FromShape,
 };
+use crate::bind::{apply_positional_aliases, cte_passthrough};
 use crate::bind::{bind_structural, find_unique_column, fold_null_test, Binder, LeafBinder};
 use crate::error::GnitzSqlError;
+use crate::hir::chain::ViewChain;
+use crate::hir::guards::join_on_and_type;
 use crate::ir::{AggFunc, BExpr, BinOp};
-use crate::plan::validate::{
-    plain_select_body, reject_duplicate_names, reject_float_key, reject_unhonored_select_clauses, HonoredClauses,
+use crate::validate::{
+    cte_body, non_recursive_ctes, plain_select_body, reject_duplicate_names, reject_float_key,
+    reject_query_envelope_body, reject_unhonored_select_clauses, validate_user_name, HonoredClauses,
 };
-use crate::plan::view::join::join_on_and_type;
 use gnitz_core::{ColumnDef, GnitzClient, TypeCode};
 use sqlparser::ast::{
-    BinaryOperator, Expr, Function, GroupByExpr, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier,
-    TableFactor,
+    BinaryOperator, Expr, Function, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, TableFactor,
 };
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ops::Range;
 use std::rc::Rc;
 
-/// Bind a CREATE VIEW body to a logical `RelExpr` tree, returning the tree and
-/// the `ColIdGen` positioned past every minted id — the lowering continues it to
-/// mint fresh placeholder ids for a cut segment's hidden `_join_pk` slots.
-pub(crate) fn bind_query(
+/// Compile a query's CTEs ahead of the main body bind. A plain pass-through CTE
+/// (`SELECT * FROM t`, no WHERE/GROUP/DISTINCT) aliases to the source's real
+/// catalog id — preserving its downstream index-bound eligibility; every other
+/// CTE body compiles to a hidden segment via the shared HIR pipeline
+/// (`bind_and_lower`), registered under the CTE name so the body (and later CTEs)
+/// resolve it by name. Scoping precedence as SQL defines it: a CTE shadows a
+/// catalog name, and a later CTE sees earlier ones (registration is immediate).
+pub(crate) fn bind_ctes(
     client: &mut GnitzClient,
     binder: &mut Binder<'_>,
+    chain: &mut ViewChain,
     query: &Query,
-) -> Result<(Rc<RelExpr>, ColIdGen), GnitzSqlError> {
-    let mut ids = ColIdGen::new();
-    // `query.with` is ignored: the old inline_ctes/compile_derived_tables already
-    // ran in build_query_segments and populated the binder cache with any
-    // CTE/derived aliases, so binder.resolve picks them up as `Get`s.
-    let rel = bind_body(client, binder, &mut ids, query.body.as_ref())?;
-    Ok((rel, ids))
+) -> Result<(), GnitzSqlError> {
+    for cte in non_recursive_ctes(query)? {
+        let name = cte.alias.name.value.clone();
+        let ctx = format!("CTE '{name}'");
+        let body = cte_body(cte, &ctx)?;
+        // Pass-through fast path: an identity `SELECT * FROM t` body with no
+        // WHERE / GROUP BY / DISTINCT aliases straight to its source table. A
+        // WHERE'd / grouped / DISTINCT body compiles instead (it carries real
+        // work), and the exotic tail (TOP, PREWHERE, …) is rejected here.
+        if let SetExpr::Select(s) = body {
+            if s.selection.is_none() && !body_is_grouped(s) && s.distinct.is_none() {
+                reject_unhonored_select_clauses(s, HonoredClauses::PLAIN, &ctx)?;
+                if let Some(resolved) = cte_passthrough(client, s, &cte.alias.columns, binder)? {
+                    binder.cache_alias(&name, resolved, true)?;
+                    continue;
+                }
+            }
+        }
+        // Compiled path: a hidden HIR segment, with the CTE's positional column
+        // aliases applied to the emitted visible columns.
+        let (seg_vid, seg_schema, ()) = chain.add_segment(client, |client, chain, vid| {
+            let (circuit, mut cols, pk) = bind_and_lower(client, binder, chain, body, vid)?;
+            apply_positional_aliases(&cte.alias.columns, cols.iter_mut().collect(), &ctx)?;
+            Ok(((circuit, cols, pk), ()))
+        })?;
+        let resolved = (seg_vid, seg_schema);
+        // A chain-minted segment id, not a catalog one: no index bound.
+        binder.cache_alias(&name, resolved, false)?;
+    }
+    Ok(())
 }
 
 /// Bind one query body — a single SELECT (linear / join / grouped / DISTINCT) or
 /// a set operation whose sides bind recursively.
-fn bind_body(
+pub(crate) fn bind_body(
     client: &mut GnitzClient,
     binder: &mut Binder<'_>,
-    ids: &mut ColIdGen,
+    ids: &ColIdGen,
     body: &SetExpr,
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
     match body {
@@ -81,13 +112,65 @@ fn bind_conjuncts<L: LeafBinder<HirRef>>(expr: &Expr, leaf: &L) -> Result<Vec<Hi
     conjuncts.iter().map(|c| bind_structural(c, leaf)).collect()
 }
 
-/// Bind one single-SELECT body — a linear (`Simple`) body or a FROM-join
-/// (`Join`) body. Classify has already gated grouped/set-op/subquery bodies to
-/// the old path.
+/// Resolve one FROM table factor to `(source subtree, alias, output cols)`. A
+/// table/CTE name resolves via the binder to a base or segment `Get`; a derived
+/// table binds its subquery recursively to an **inline** subtree (never a
+/// segment — single-use and non-LATERAL, so uncorrelated) whose `AS d(col…)`
+/// aliases are applied to the returned cols (same `ColId`s, overridden names) the
+/// caller pushes into its scope/env. The subtree itself keeps its own names; a
+/// derived alias resolves through the caller's scope, never the binder cache.
+fn resolve_table_factor(
+    client: &mut GnitzClient,
+    binder: &mut Binder<'_>,
+    ids: &ColIdGen,
+    factor: &TableFactor,
+) -> Result<(Rc<RelExpr>, String, Vec<HirCol>), GnitzSqlError> {
+    if let TableFactor::Derived {
+        lateral,
+        subquery,
+        alias,
+        sample,
+    } = factor
+    {
+        let Some(alias) = alias else {
+            return Err(GnitzSqlError::Unsupported(
+                "a derived table (subquery in FROM) needs an alias".to_string(),
+            ));
+        };
+        // The alias is a user-visible name, so it is held to the general
+        // user-identifier rule (a leading `_` is reserved for the `__h…`
+        // hidden-view namespace) even though an inline derived subtree never
+        // enters the binder's alias cache.
+        validate_user_name(&alias.name.value)?;
+        let ctx = format!("derived table '{}'", alias.name.value);
+        if *lateral {
+            return Err(GnitzSqlError::Unsupported(format!("{ctx}: LATERAL is not supported")));
+        }
+        // Silently dropping TABLESAMPLE would return all rows — a wrong result.
+        if sample.is_some() {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "{ctx}: TABLESAMPLE is not supported"
+            )));
+        }
+        let body = reject_query_envelope_body(subquery, &ctx)?;
+        let subtree = bind_body(client, binder, ids, body)?;
+        let mut cols = subtree.cols();
+        apply_positional_aliases(&alias.columns, cols.iter_mut().map(|c| &mut c.def).collect(), &ctx)?;
+        return Ok((subtree, alias.name.value.clone(), cols));
+    }
+    let (name, alias) = extract_table_name_and_alias(factor, "CREATE VIEW")?;
+    let (tid, schema) = binder.resolve(client, &name)?;
+    let from_catalog = binder.is_catalog_relation(&name);
+    let get = RelExpr::get(ids, tid, schema, from_catalog);
+    let cols = get.cols();
+    Ok((get, alias, cols))
+}
+
+/// Bind one single-SELECT body — a linear body or a FROM-join body.
 fn bind_select(
     client: &mut GnitzClient,
     binder: &mut Binder<'_>,
-    ids: &mut ColIdGen,
+    ids: &ColIdGen,
     select: &Select,
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
     if select.from.len() != 1 {
@@ -106,30 +189,17 @@ fn bind_select(
 fn bind_linear_select(
     client: &mut GnitzClient,
     binder: &mut Binder<'_>,
-    ids: &mut ColIdGen,
+    ids: &ColIdGen,
     select: &Select,
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let grouped = body_is_grouped(select);
     let distinct = select.distinct.is_some();
-    reject_unhonored_select_clauses(
-        select,
-        HonoredClauses {
-            where_filter: true,
-            // Honor grouping only on the grouped path; the DISTINCT path passes
-            // `false` so a DISTINCT + GROUP BY body keeps the pinned "GROUP BY is
-            // not supported" rejection.
-            grouping: grouped && !distinct,
-            distinct,
-        },
-        "CREATE VIEW",
-    )?;
+    reject_unhonored_select_clauses(select, HonoredClauses::for_body(grouped, distinct), "CREATE VIEW")?;
 
-    let (name, outer_alias) = extract_table_name_and_alias(&select.from[0].relation, "CREATE VIEW")?;
-    let (tid, schema) = binder.resolve(client, &name)?;
-    let from_catalog = binder.is_catalog_relation(&name);
-    let get = RelExpr::get(ids, tid, schema, from_catalog);
-    // The one relation's cols — the leaf environment for name resolution.
-    let env = get.cols();
+    // The sole FROM relation (a table, a CTE, or a derived table) → its source
+    // subtree, alias, and the cols that form the leaf environment for name
+    // resolution.
+    let (source, outer_alias, env) = resolve_table_factor(client, binder, ids, &select.from[0].relation)?;
 
     // A subquery-carrying single-table body (EXISTS/IN, scalar aggregate, ANY/ALL)
     // routes to the record→bind→lookup two-pass, which binds each subquery as a
@@ -147,14 +217,14 @@ fn bind_linear_select(
             ));
         }
         if !grouped && !distinct {
-            return bind_linear_subquery_body(client, binder, ids, select, get, env, &outer_alias);
+            return bind_linear_subquery_body(client, binder, ids, select, source, env, &outer_alias);
         }
     }
 
     let leaf = HirSingleTable { env: &env };
 
     // WHERE — flatten to conjuncts, bind each through the HIR leaf.
-    let mut rel = get;
+    let mut rel = source;
     if let Some(where_expr) = &select.selection {
         rel = RelExpr::filter(rel, bind_conjuncts(where_expr, &leaf)?);
     }
@@ -165,7 +235,7 @@ fn bind_linear_select(
         // The dup-name guard fires in `lower_distinct` over the full output
         // column list (the synthetic `_distinct_pk` included) — a strict superset
         // of this projection, so checking it again here would be redundant.
-        let items = bind_projection(&select.projection, &env, &leaf, ids)?;
+        let items = bind_projection(&select.projection, &env, &leaf, ids, "CREATE VIEW projection")?;
         return Ok(RelExpr::distinct(RelExpr::project(rel, items)));
     }
     if grouped {
@@ -173,7 +243,7 @@ fn bind_linear_select(
     }
 
     // Projection — SELECT order (place_pk_front is physical, applied at lowering).
-    let items = bind_projection(&select.projection, &env, &leaf, ids)?;
+    let items = bind_projection(&select.projection, &env, &leaf, ids, "CREATE VIEW projection")?;
     // Dup-name check for a non-wildcard projection (matching lower_linear); a pure
     // `SELECT *` carries duplicates through positionally.
     reject_dup_proj_names(&items, &select.projection, "CREATE VIEW projection")?;
@@ -206,26 +276,15 @@ fn expand_wildcard(
     item: &SelectItem,
     cols: &[HirCol],
     ctx: &str,
-    ids: &mut ColIdGen,
+    ids: &ColIdGen,
 ) -> Result<Vec<ProjEntry>, GnitzSqlError> {
-    let rw = WildcardRewrite::for_item(item, |n| wildcard_name_is_visible(cols.iter().map(|c| &c.def), n), ctx)?;
-    let mut items = Vec::new();
-    for c in cols {
-        if c.def.is_hidden {
-            continue;
-        }
-        let Some(out_def) = rw.rewrite_column(&c.def) else {
-            continue;
-        };
-        items.push(ProjEntry {
-            expr: BExpr::ColRef(HirRef::Col(c.id)),
-            out: HirCol {
-                id: ids.next(),
-                def: out_def,
-            },
-        });
-    }
-    Ok(items)
+    Ok(expand_wildcard_item(item, cols.iter().map(|c| &c.def), ctx)?
+        .into_iter()
+        .map(|(i, def)| ProjEntry {
+            expr: BExpr::ColRef(HirRef::Col(cols[i].id)),
+            out: HirCol { id: ids.next(), def },
+        })
+        .collect())
 }
 
 /// Resolve every SELECT item into a `ProjEntry` in SELECT order, expanding a bare
@@ -237,7 +296,8 @@ fn bind_projection<L: LeafBinder<HirRef>>(
     projection: &[SelectItem],
     env: &[HirCol],
     leaf: &L,
-    ids: &mut ColIdGen,
+    ids: &ColIdGen,
+    ctx: &str,
 ) -> Result<Vec<ProjEntry>, GnitzSqlError> {
     let mut items = Vec::new();
     for (idx, item) in projection.iter().enumerate() {
@@ -245,16 +305,12 @@ fn bind_projection<L: LeafBinder<HirRef>>(
             // Only a *bare* `*` expands (a `tbl.*` QualifiedWildcard is not a
             // single-table projection item — it falls to the `_` reject arm, as in
             // `resolve_projection_items`).
-            SelectItem::Wildcard(_) => items.extend(expand_wildcard(item, env, "CREATE VIEW", ids)?),
+            SelectItem::Wildcard(_) => items.extend(expand_wildcard(item, env, ctx, ids)?),
             SelectItem::UnnamedExpr(expr) => items.push(bind_proj_expr(expr, None, idx, env, leaf, ids)?),
             SelectItem::ExprWithAlias { expr, alias } => {
                 items.push(bind_proj_expr(expr, Some(alias.value.clone()), idx, env, leaf, ids)?)
             }
-            _ => {
-                return Err(GnitzSqlError::Unsupported(
-                    "unsupported SELECT item in CREATE VIEW projection".to_string(),
-                ))
-            }
+            _ => return Err(GnitzSqlError::Unsupported(format!("unsupported SELECT item in {ctx}"))),
         }
     }
     Ok(items)
@@ -272,7 +328,7 @@ fn bind_proj_expr<L: LeafBinder<HirRef>>(
     idx: usize,
     env: &[HirCol],
     leaf: &L,
-    ids: &mut ColIdGen,
+    ids: &ColIdGen,
 ) -> Result<ProjEntry, GnitzSqlError> {
     let bound = bind_structural(expr, leaf)?;
     let out_def = if let BExpr::ColRef(HirRef::Col(id)) = &bound {
@@ -335,11 +391,11 @@ impl LeafBinder<HirRef> for HirSingleTable<'_> {
     }
     fn bind_function(&self, f: &Function) -> Result<HirExpr, GnitzSqlError> {
         // A Simple body has no aggregates (they route to GroupBy). Reject a
-        // function with the same message the old path produces: qualifiers first,
+        // function with the standard message: qualifiers first,
         // then an aggregate (`SUM(x)` in a WHERE fails downstream at compile with
         // exactly this message), then any other name.
         reject_unsupported_fn_qualifiers(f, "aggregates")?;
-        if single_fn_name(f).and_then(agg_func_from_name).is_some() {
+        if is_agg_call(f) {
             return Err(GnitzSqlError::Unsupported(
                 "aggregate function not allowed in expression context".to_string(),
             ));
@@ -367,6 +423,11 @@ impl LeafBinder<HirRef> for HirSingleTable<'_> {
 // `HirRef::Subquery` leaves; pass 2 re-runs the walk, substituting each recorded
 // node with its bound leaf. Decorrelation (`hir::rewrite`) consumes the leaves.
 
+/// Whether a function call names a supported aggregate — the one home of that
+/// test, so every surface that has to route an aggregate differently (the
+/// expression-context rejection, the scalar-subquery shape check, aggregate
+/// collection, and the two HAVING/grouped leaf binders) agrees on what counts as
+/// an aggregate call.
 /// Whether an expression node is itself a subquery of any kind (an opaque leaf to
 /// the structural walk) — the `SubqueryLeaf` uses it to route an `IS [NOT] NULL`
 /// over a subquery through the record/lookup pass.
@@ -377,14 +438,6 @@ fn is_subquery_expr(e: &Expr) -> bool {
     )
 }
 
-/// The `ColId` of a bare `ColRef` leaf, else `None`.
-fn as_col(e: &HirExpr) -> Option<ColId> {
-    match e {
-        BExpr::ColRef(HirRef::Col(id)) => Some(*id),
-        _ => None,
-    }
-}
-
 /// A subquery node bound for decorrelation: the value expression its leaf
 /// contributes where it sits, and whether that value is provably never NULL (an
 /// EXISTS/IN test or a COUNT — folds `IS [NOT] NULL` / COALESCE to a constant).
@@ -393,21 +446,35 @@ struct BoundSub {
     never_null: bool,
 }
 
-/// The subquery-recording (pass 1) or subquery-substituting (pass 2) mode.
-enum SubMode<'m> {
-    Record(&'m RefCell<Vec<*const Expr>>),
-    Lookup(&'m HashMap<*const Expr, BoundSub>),
+/// The mutable compilation state a subquery bind needs, behind one `RefCell` so
+/// the leaf can reach it from `LeafBinder`'s `&self`. Borrowed only for the
+/// duration of a single `bind_one_subquery` call, which never re-enters this leaf
+/// (a nested subquery is rejected by the inner correlation leaf).
+struct SubCtx<'a, 'b> {
+    client: &'a mut GnitzClient,
+    binder: &'a mut Binder<'b>,
 }
 
-/// The outer single-table leaf extended with subquery handling: it records (or
-/// looks up) an EXISTS/IN/scalar/ANY/ALL node and a subquery operand of
-/// `IS [NOT] NULL`, delegating every other decision to the inner `HirSingleTable`.
-struct SubqueryLeaf<'a, 'm> {
-    inner: HirSingleTable<'a>,
-    mode: SubMode<'m>,
+/// The outer single-table leaf extended with subquery handling: it binds an
+/// EXISTS/IN/scalar/ANY/ALL node — and a subquery operand of `IS [NOT] NULL` — in
+/// place, delegating every other decision to the inner `HirSingleTable`.
+struct SubqueryLeaf<'a, 'b, 'c> {
+    inner: HirSingleTable<'c>,
+    ctx: RefCell<SubCtx<'a, 'b>>,
+    ids: &'c ColIdGen,
+    env: &'c [HirCol],
+    outer_alias: &'c str,
 }
 
-impl LeafBinder<HirRef> for SubqueryLeaf<'_, '_> {
+impl SubqueryLeaf<'_, '_, '_> {
+    fn bind_sub(&self, e: &Expr) -> Result<BoundSub, GnitzSqlError> {
+        let mut ctx = self.ctx.borrow_mut();
+        let SubCtx { client, binder } = &mut *ctx;
+        bind_one_subquery(client, binder, self.ids, self.env, self.outer_alias, e)
+    }
+}
+
+impl LeafBinder<HirRef> for SubqueryLeaf<'_, '_, '_> {
     fn bind_column(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
         self.inner.bind_column(e)
     }
@@ -419,97 +486,49 @@ impl LeafBinder<HirRef> for SubqueryLeaf<'_, '_> {
         if !is_subquery_expr(peeled) {
             return self.inner.bind_null_test(inner, want_null);
         }
-        match &self.mode {
-            SubMode::Record(cell) => {
-                cell.borrow_mut().push(peeled as *const Expr);
-                Ok(BExpr::LitInt(0))
-            }
-            SubMode::Lookup(map) => {
-                let bs = map
-                    .get(&(peeled as *const Expr))
-                    .expect("every recorded subquery is bound before the lookup pass");
-                if bs.never_null {
-                    // COUNT / EXISTS / IN — never NULL, so the test folds to a constant.
-                    return Ok(BExpr::LitInt(i64::from(!want_null)));
-                }
-                // A nullable scalar: fold over the subquery leaf; decorrelation
-                // rewrites the IS [NOT] NULL over the substituted value column.
-                match &bs.value {
-                    BExpr::ColRef(r) => Ok(fold_null_test(true, r.clone(), want_null)),
-                    _ => Err(GnitzSqlError::Unsupported(
-                        "IS [NOT] NULL over this subquery form is not supported".into(),
-                    )),
-                }
-            }
+        let bs = self.bind_sub(peeled)?;
+        if bs.never_null {
+            // COUNT / EXISTS / IN — never NULL, so the test folds to a constant.
+            return Ok(BExpr::LitInt(i64::from(!want_null)));
+        }
+        // A nullable scalar: fold over the subquery leaf; decorrelation rewrites the
+        // IS [NOT] NULL over the substituted value column.
+        match bs.value {
+            BExpr::ColRef(r) => Ok(fold_null_test(true, r, want_null)),
+            _ => Err(GnitzSqlError::Unsupported(
+                "IS [NOT] NULL over this subquery form is not supported".into(),
+            )),
         }
     }
     fn bind_subquery(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
-        match &self.mode {
-            SubMode::Record(cell) => {
-                cell.borrow_mut().push(e as *const Expr);
-                Ok(BExpr::LitInt(0)) // placeholder — pass 1's result is discarded
-            }
-            SubMode::Lookup(map) => Ok(map
-                .get(&(e as *const Expr))
-                .expect("every recorded subquery is bound before the lookup pass")
-                .value
-                .clone()),
-        }
+        Ok(self.bind_sub(e)?.value)
     }
 }
 
-/// Bind a subquery-carrying single-table linear body to `Project(Filter?(Get))`
-/// via the record→bind→lookup two-pass.
+/// Bind a subquery-carrying single-table linear body to `Project(Filter?(Get))`.
+/// One pass: each subquery binds where `bind_structural` meets it, so the WHERE
+/// and the projection are walked exactly once and in source order.
 fn bind_linear_subquery_body(
     client: &mut GnitzClient,
     binder: &mut Binder<'_>,
-    ids: &mut ColIdGen,
+    ids: &ColIdGen,
     select: &Select,
     get: Rc<RelExpr>,
     env: Vec<HirCol>,
     outer_alias: &str,
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
-    // Pass 1 — record every subquery node across WHERE + projection.
-    let recorded: RefCell<Vec<*const Expr>> = RefCell::new(Vec::new());
-    {
-        let leaf = SubqueryLeaf {
-            inner: HirSingleTable { env: &env },
-            mode: SubMode::Record(&recorded),
-        };
-        if let Some(where_expr) = &select.selection {
-            bind_conjuncts(where_expr, &leaf)?;
-        }
-        for item in &select.projection {
-            if let Some(expr) = projection_item_expr(item) {
-                bind_structural(expr, &leaf)?;
-            }
-        }
-    }
-
-    // Bind each recorded subquery once (source order, deduped by pointer).
-    let mut seen: HashSet<*const Expr> = HashSet::new();
-    let mut map: HashMap<*const Expr, BoundSub> = HashMap::new();
-    for ptr in recorded.into_inner() {
-        if !seen.insert(ptr) {
-            continue;
-        }
-        // SAFETY: `ptr` was taken from a node of `select` during pass 1; `select`
-        // outlives this call and the AST is never mutated, so the node is live.
-        let e: &Expr = unsafe { &*ptr };
-        let bs = bind_one_subquery(client, binder, ids, &env, outer_alias, e)?;
-        map.insert(ptr, bs);
-    }
-
-    // Pass 2 — bind WHERE + projection, substituting each recorded subquery.
     let leaf = SubqueryLeaf {
         inner: HirSingleTable { env: &env },
-        mode: SubMode::Lookup(&map),
+        ctx: RefCell::new(SubCtx { client, binder }),
+        ids,
+        env: &env,
+        outer_alias,
     };
     let mut rel = get;
     if let Some(where_expr) = &select.selection {
         rel = RelExpr::filter(rel, bind_conjuncts(where_expr, &leaf)?);
     }
-    let items = bind_projection(&select.projection, &env, &leaf, ids)?;
+    let items = bind_projection(&select.projection, &env, &leaf, ids, "CREATE VIEW projection")?;
     reject_dup_proj_names(&items, &select.projection, "CREATE VIEW projection")?;
     Ok(RelExpr::project(rel, items))
 }
@@ -536,21 +555,13 @@ fn id_set(cols: &[HirCol]) -> HashSet<ColId> {
 fn resolve_inner<'e>(
     client: &mut GnitzClient,
     binder: &mut Binder<'_>,
-    ids: &mut ColIdGen,
+    ids: &ColIdGen,
     outer_env: &[HirCol],
     outer_alias: &str,
     subquery: &'e Query,
 ) -> Result<InnerResolved<'e>, GnitzSqlError> {
     let inner_select = plain_select_body(subquery, "subquery")?;
-    reject_unhonored_select_clauses(
-        inner_select,
-        HonoredClauses {
-            where_filter: true,
-            grouping: false,
-            distinct: false,
-        },
-        "subquery",
-    )?;
+    reject_unhonored_select_clauses(inner_select, HonoredClauses::PLAIN, "subquery")?;
     if !matches!(classify_from(&inner_select.from), FromShape::SinglePlainRelation) {
         return Err(GnitzSqlError::Unsupported(
             "EXISTS/IN subquery: only a single FROM table without JOINs is supported; compose via views".into(),
@@ -577,7 +588,12 @@ fn resolve_inner<'e>(
     let mut local_preds: Vec<HirExpr> = Vec::new();
     let mut correlation: Vec<HirExpr> = Vec::new();
     if let Some(where_expr) = &inner_select.selection {
-        let leaf = InnerCorrLeaf { scope: &scope };
+        let leaf = JoinLeaf {
+            scope: &scope,
+            nested_subquery_msg: Some(
+                "nested subqueries inside an EXISTS/IN subquery are not supported; compose via views",
+            ),
+        };
         for bound in bind_conjuncts(where_expr, &leaf)? {
             let (mut has_outer, mut has_inner) = (false, false);
             bound.for_each_ref(&mut |r| {
@@ -612,29 +628,6 @@ fn resolve_inner<'e>(
     })
 }
 
-/// The leaf for a subquery's inner WHERE, resolved against the (outer, inner)
-/// two-relation scope. A nested subquery here is rejected (compose via views).
-struct InnerCorrLeaf<'a> {
-    scope: &'a JoinScope,
-}
-
-impl LeafBinder<HirRef> for InnerCorrLeaf<'_> {
-    fn bind_column(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
-        (JoinLeaf { scope: self.scope }).bind_column(e)
-    }
-    fn bind_function(&self, f: &Function) -> Result<HirExpr, GnitzSqlError> {
-        (JoinLeaf { scope: self.scope }).bind_function(f)
-    }
-    fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<HirExpr, GnitzSqlError> {
-        (JoinLeaf { scope: self.scope }).bind_null_test(inner, want_null)
-    }
-    fn bind_subquery(&self, _e: &Expr) -> Result<HirExpr, GnitzSqlError> {
-        Err(GnitzSqlError::Unsupported(
-            "nested subqueries inside an EXISTS/IN subquery are not supported; compose via views".into(),
-        ))
-    }
-}
-
 /// The single projection expression of a subquery's SELECT, else `err`.
 fn single_projection_expr<'e>(select: &'e Select, err: &str) -> Result<&'e Expr, GnitzSqlError> {
     match select.projection.as_slice() {
@@ -648,7 +641,7 @@ fn single_projection_expr<'e>(select: &'e Select, err: &str) -> Result<&'e Expr,
 fn bind_one_subquery(
     client: &mut GnitzClient,
     binder: &mut Binder<'_>,
-    ids: &mut ColIdGen,
+    ids: &ColIdGen,
     outer_env: &[HirCol],
     outer_alias: &str,
     e: &Expr,
@@ -716,7 +709,7 @@ fn bind_one_subquery(
 fn bind_exists_sub(
     client: &mut GnitzClient,
     binder: &mut Binder<'_>,
-    ids: &mut ColIdGen,
+    ids: &ColIdGen,
     outer_env: &[HirCol],
     outer_alias: &str,
     subquery: &Query,
@@ -779,7 +772,7 @@ fn bind_exists_sub(
 fn bind_scalar_sub(
     client: &mut GnitzClient,
     binder: &mut Binder<'_>,
-    ids: &mut ColIdGen,
+    ids: &ColIdGen,
     outer_env: &[HirCol],
     outer_alias: &str,
     q: &Query,
@@ -792,18 +785,16 @@ fn bind_scalar_sub(
     let (func, arg) = classify_scalar_agg(proj_expr, &ir.inner_cols)?;
     let group_cols = scalar_group_cols(&ir.correlation, &id_set(&ir.inner_cols))?;
     let reduce = build_scalar_reduce(ids, ir.rel, group_cols, func, arg, &ir.inner_cols)?;
-    let is_count = matches!(func, AggFunc::Count | AggFunc::CountNonNull);
     let subref = SubqueryRef {
-        kind: SubqueryKind::Scalar {
-            coalesce_zero: is_count,
-        },
+        kind: SubqueryKind::Scalar,
         rel: reduce,
         correlation: ir.correlation,
         in_pair: None,
     };
+    let never_null = subref.never_null();
     Ok(BoundSub {
         value: BExpr::ColRef(HirRef::Subquery(Box::new(subref))),
-        never_null: is_count,
+        never_null,
     })
 }
 
@@ -814,7 +805,7 @@ fn bind_scalar_sub(
 fn bind_quantifier_sub(
     client: &mut GnitzClient,
     binder: &mut Binder<'_>,
-    ids: &mut ColIdGen,
+    ids: &ColIdGen,
     outer_env: &[HirCol],
     outer_alias: &str,
     left: &Expr,
@@ -878,7 +869,7 @@ fn bind_quantifier_sub(
     let group_cols = scalar_group_cols(&ir.correlation, &id_set(&ir.inner_cols))?;
     let reduce = build_scalar_reduce(ids, ir.rel, group_cols, agg_func, Some(inner_col), &ir.inner_cols)?;
     let subref = SubqueryRef {
-        kind: SubqueryKind::Scalar { coalesce_zero: false },
+        kind: SubqueryKind::Scalar,
         rel: reduce,
         correlation: ir.correlation,
         in_pair: None,
@@ -933,7 +924,7 @@ fn classify_scalar_agg(e: &Expr, inner_cols: &[HirCol]) -> Result<(AggFunc, Opti
     let Expr::Function(f) = peeled else {
         return Err(non_agg());
     };
-    if single_fn_name(f).and_then(agg_func_from_name).is_none() {
+    if !is_agg_call(f) {
         return Err(non_agg());
     }
     let (func, arg_expr) = classify_agg_call(f)?;
@@ -994,7 +985,7 @@ fn scalar_group_cols(correlation: &[HirExpr], inner_ids: &HashSet<ColId>) -> Res
 /// Build a scalar subquery's raw `Reduce` (one aggregate). The finalize composite
 /// is applied later by decorrelation over the raw reduce output.
 fn build_scalar_reduce(
-    ids: &mut ColIdGen,
+    ids: &ColIdGen,
     rel: Rc<RelExpr>,
     group_cols: Vec<ColId>,
     func: AggFunc,
@@ -1017,40 +1008,28 @@ fn build_scalar_reduce(
 fn bind_join_select(
     client: &mut GnitzClient,
     binder: &mut Binder<'_>,
-    ids: &mut ColIdGen,
+    ids: &ColIdGen,
     select: &Select,
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let grouped = body_is_grouped(select);
     let distinct = select.distinct.is_some();
-    reject_unhonored_select_clauses(
-        select,
-        HonoredClauses {
-            where_filter: true,
-            grouping: grouped && !distinct,
-            distinct,
-        },
-        "CREATE VIEW JOIN",
-    )?;
+    reject_unhonored_select_clauses(select, HonoredClauses::for_body(grouped, distinct), "CREATE VIEW JOIN")?;
     let from = &select.from[0];
 
-    // Leftmost relation.
-    let (lname, lalias) = extract_table_name_and_alias(&from.relation, "CREATE VIEW JOIN")?;
-    let (ltid, lschema) = binder.resolve(client, &lname)?;
-    let lget = RelExpr::get(ids, ltid, lschema, binder.is_catalog_relation(&lname));
+    // Leftmost relation (a table, a CTE, or a derived table).
+    let (left_src, lalias, lcols) = resolve_table_factor(client, binder, ids, &from.relation)?;
     let mut scope = JoinScope::new();
-    scope.push(&lalias, lget.cols());
-    let mut left = lget;
+    scope.push(&lalias, lcols);
+    let mut left = left_src;
 
-    // Each join step: bind the right relation, bind the ON conjuncts against the
+    // Each join step: resolve the right relation, bind the ON conjuncts against the
     // accumulated scope, then fold into a `Join` node.
     for join in &from.joins {
         let (on_expr, kind) = join_on_and_type(join)?;
-        let (rname, ralias) = extract_table_name_and_alias(&join.relation, "CREATE VIEW JOIN")?;
-        let (rtid, rschema) = binder.resolve(client, &rname)?;
-        let rget = RelExpr::get(ids, rtid, rschema, binder.is_catalog_relation(&rname));
-        scope.push(&ralias, rget.cols());
-        let on = bind_conjuncts(on_expr, &JoinLeaf { scope: &scope })?;
-        left = RelExpr::join(left, rget, kind, on, None);
+        let (right_src, ralias, rcols) = resolve_table_factor(client, binder, ids, &join.relation)?;
+        scope.push(&ralias, rcols);
+        let on = bind_conjuncts(on_expr, &join_leaf(&scope))?;
+        left = RelExpr::join(left, right_src, kind, on, None);
         // Reflect this step's null-widening back into the scope so a later ON /
         // the WHERE / the projection resolve against the widened nullability.
         scope.rewiden(left.cols());
@@ -1059,24 +1038,36 @@ fn bind_join_select(
     // WHERE → a `Filter` over the top join (raw conjuncts; the rewrite places them).
     let mut rel = left;
     if let Some(where_expr) = &select.selection {
-        rel = RelExpr::filter(rel, bind_conjuncts(where_expr, &JoinLeaf { scope: &scope })?);
+        rel = RelExpr::filter(rel, bind_conjuncts(where_expr, &join_leaf(&scope))?);
     }
 
     // DISTINCT / GROUP BY over a join: the operator sits above the join tree (the
     // lowering cuts the join to a hidden segment). DISTINCT outranks grouped.
     if distinct {
         // Guarded by `lower_distinct` over the full output columns (see above).
-        let items = bind_join_projection(&select.projection, &scope, ids)?;
+        let items = bind_projection(
+            &select.projection,
+            &scope.combined,
+            &join_leaf(&scope),
+            ids,
+            "JOIN view",
+        )?;
         return Ok(RelExpr::distinct(RelExpr::project(rel, items)));
     }
     if grouped {
-        let leaf = JoinLeaf { scope: &scope };
+        let leaf = join_leaf(&scope);
         return bind_grouped_suffix(ids, select, rel, &leaf);
     }
 
-    // Projection over the join output scope (column references + wildcard only,
-    // matching `build_join_view_projection`).
-    let items = bind_join_projection(&select.projection, &scope, ids)?;
+    // Projection over the join output scope (column references + wildcard only —
+    // a computed expression over a join output is rejected).
+    let items = bind_projection(
+        &select.projection,
+        &scope.combined,
+        &join_leaf(&scope),
+        ids,
+        "JOIN view",
+    )?;
     reject_dup_proj_names(&items, &select.projection, "join view")?;
     Ok(RelExpr::project(rel, items))
 }
@@ -1117,10 +1108,11 @@ impl JoinScope {
     }
 
     fn resolve_qualified(&self, alias: &str, name: &str) -> Result<ColId, GnitzSqlError> {
+        let lc = alias.to_ascii_lowercase();
         let (_, span) = self
             .relations
             .iter()
-            .find(|(a, _)| *a == alias.to_ascii_lowercase())
+            .find(|(a, _)| *a == lc)
             .ok_or_else(|| GnitzSqlError::Bind(format!("table alias '{alias}' not found")))?;
         let cols = self.rel_cols(span);
         let idx = find_unique_column(cols.iter().map(|c| &c.def), name)?
@@ -1154,6 +1146,19 @@ impl JoinScope {
 /// The leaf for a FROM-join scope (ON + WHERE binding).
 struct JoinLeaf<'a> {
     scope: &'a JoinScope,
+    /// The rejection for a subquery met at this leaf. `None` keeps the generic
+    /// `LeafBinder` message (a FROM-clause `ON`); the subquery-correlation leaf
+    /// sets the nested-subquery wording.
+    nested_subquery_msg: Option<&'static str>,
+}
+
+/// The FROM-clause `ON` / projection leaf: no nested-subquery override, so a
+/// subquery there gets the generic per-kind rejection.
+fn join_leaf(scope: &JoinScope) -> JoinLeaf<'_> {
+    JoinLeaf {
+        scope,
+        nested_subquery_msg: None,
+    }
 }
 
 impl JoinLeaf<'_> {
@@ -1186,58 +1191,12 @@ impl LeafBinder<HirRef> for JoinLeaf<'_> {
         let id = self.col_id(inner)?;
         Ok(fold_null_test(self.scope.is_nullable(id), HirRef::Col(id), want_null))
     }
-}
-
-/// Bind a join view's projection — column references + wildcard only (matching
-/// `build_join_view_projection`); a computed expression is rejected. A bare
-/// (possibly aliased) column resolves to a pass-through carrying the combined
-/// output col's (null-widened) def.
-fn bind_join_projection(
-    projection: &[SelectItem],
-    scope: &JoinScope,
-    ids: &mut ColIdGen,
-) -> Result<Vec<ProjEntry>, GnitzSqlError> {
-    let mut items = Vec::new();
-    for item in projection {
-        if matches!(item, SelectItem::Wildcard(_)) {
-            items.extend(expand_wildcard(item, &scope.combined, "JOIN view", ids)?);
-            continue;
-        }
-        let (expr, alias) = match item {
-            SelectItem::UnnamedExpr(e) => (e, None),
-            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias)),
-            _ => {
-                return Err(GnitzSqlError::Unsupported(
-                    "unsupported SELECT item in JOIN view".into(),
-                ))
-            }
-        };
-        let id = match expr {
-            Expr::Identifier(ident) => scope.resolve_unqualified(&ident.value)?,
-            Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-                scope.resolve_qualified(&parts[0].value, &parts[1].value)?
-            }
-            _ if alias.is_some() => {
-                return Err(GnitzSqlError::Unsupported(
-                    "JOIN view: only column references supported in AS clause".into(),
-                ))
-            }
-            _ => {
-                return Err(GnitzSqlError::Unsupported(
-                    "unsupported SELECT item in JOIN view".into(),
-                ))
-            }
-        };
-        let mut def = hircol_of(&scope.combined, id).def.clone();
-        if let Some(alias) = alias {
-            def.name = alias.value.clone();
-        }
-        items.push(ProjEntry {
-            expr: BExpr::ColRef(HirRef::Col(id)),
-            out: HirCol { id: ids.next(), def },
-        });
+    fn bind_subquery(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
+        Err(match self.nested_subquery_msg {
+            Some(msg) => GnitzSqlError::Unsupported(msg.into()),
+            None => crate::bind::structural::unsupported_subquery(e),
+        })
     }
-    Ok(items)
 }
 
 // ── GROUP BY / aggregate / HAVING binding ────────────────────────────────────────
@@ -1253,14 +1212,6 @@ struct GroupAgg {
 }
 
 /// Peel `Nested` (parenthesis) wrappers off an expression.
-fn peel_nested(e: &Expr) -> &Expr {
-    let mut cur = e;
-    while let Expr::Nested(inner) = cur {
-        cur = inner;
-    }
-    cur
-}
-
 /// Extract the `ColId` of a bound bare column reference.
 fn col_of(e: HirExpr) -> Result<ColId, GnitzSqlError> {
     match e {
@@ -1286,14 +1237,7 @@ fn resolve_group_cols<L: LeafBinder<HirRef>>(
     env: &[HirCol],
     leaf: &L,
 ) -> Result<Vec<ColId>, GnitzSqlError> {
-    let group_exprs = match &select.group_by {
-        GroupByExpr::Expressions(exprs, _) => exprs,
-        _ => {
-            return Err(GnitzSqlError::Unsupported(
-                "GROUP BY: only expression list supported".into(),
-            ))
-        }
-    };
+    let group_exprs = group_by_exprs(select)?;
     let mut cols = Vec::new();
     for ge in group_exprs {
         if !matches!(peel_nested(ge), Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
@@ -1322,51 +1266,48 @@ fn collect_aggs<L: LeafBinder<HirRef>>(
     leaf: &L,
     is_global: bool,
     aggs: &mut Vec<GroupAgg>,
-    ids: &mut ColIdGen,
+    ids: &ColIdGen,
 ) -> Result<Option<usize>, GnitzSqlError> {
-    let peeled = peel_nested(expr);
-    if let Expr::Function(f) = peeled {
-        if single_fn_name(f).and_then(agg_func_from_name).is_some() {
-            let (func, arg_expr) = classify_agg_call(f)?;
-            let arg = match arg_expr {
-                Some(e) => Some(col_of(leaf.bind_column(e)?)?),
-                None => None,
-            };
-            // MIN/MAX orderability — checked here (Unsupported) so the message and
-            // error variant match the old leaf binder, ahead of `agg_typing`'s
-            // `Bind` backstop.
-            if let Some(id) = arg {
-                reject_min_max_unorderable(func, col_by_id(env, id).expect("agg arg in env").def.type_code)?;
-            }
-            if let Some(idx) = aggs.iter().position(|a| a.agg.func == func && a.agg.arg == arg) {
-                return Ok(Some(idx));
-            }
-            let arg_def = arg.map(|id| &col_by_id(env, id).expect("agg arg ColId in env").def);
-            let typing = agg_typing(func, arg_def)?;
-            let output_nullable = agg_output_nullable(
-                typing.shape,
-                func,
-                arg_def.map(|d| d.is_nullable).unwrap_or(false),
-                is_global,
-            );
-            aggs.push(GroupAgg {
-                agg: HirAgg::new(ids, func, arg, &typing),
-                view_type: typing.view_type,
-                output_nullable,
-            });
-            return Ok(Some(aggs.len() - 1));
+    let mut top: Option<usize> = None;
+    let is_top = for_each_agg_call(expr, &mut |f| -> Result<(), GnitzSqlError> {
+        let (func, arg_expr) = classify_agg_call(f)?;
+        let arg = match arg_expr {
+            Some(e) => Some(col_of(leaf.bind_column(e)?)?),
+            None => None,
+        };
+        // MIN/MAX orderability — checked here (Unsupported) so the message and error
+        // variant match the leaf binder's, ahead of `agg_typing`'s `Bind` backstop.
+        if let Some(id) = arg {
+            reject_min_max_unorderable(func, col_by_id(env, id).expect("agg arg in env").def.type_code)?;
         }
-    }
-    for op in crate::ast_util::expr_operands(peeled) {
-        let _ = collect_aggs(op, env, leaf, is_global, aggs, ids)?;
-    }
-    Ok(None)
+        top = Some(match aggs.iter().position(|a| a.agg.func == func && a.agg.arg == arg) {
+            Some(idx) => idx,
+            None => {
+                let arg_def = arg.map(|id| &col_by_id(env, id).expect("agg arg ColId in env").def);
+                let typing = agg_typing(func, arg_def)?;
+                let output_nullable = agg_output_nullable(
+                    typing.shape,
+                    func,
+                    arg_def.map(|d| d.is_nullable).unwrap_or(false),
+                    is_global,
+                );
+                aggs.push(GroupAgg {
+                    agg: HirAgg::new(ids, func, arg, &typing),
+                    view_type: typing.view_type,
+                    output_nullable,
+                });
+                aggs.len() - 1
+            }
+        });
+        Ok(())
+    })?;
+    Ok(is_top.then_some(top).flatten())
 }
 
 /// Bind the GROUP BY / aggregate / HAVING suffix over `input` (the `Filter?(source)`
 /// tree built by the FROM binder), producing `Project(Filter_having?(Reduce(input)))`.
 fn bind_grouped_suffix<L: LeafBinder<HirRef>>(
-    ids: &mut ColIdGen,
+    ids: &ColIdGen,
     select: &Select,
     input: Rc<RelExpr>,
     leaf: &L,
@@ -1428,7 +1369,7 @@ fn bind_finalize_projection<L: LeafBinder<HirRef>>(
     aggs: &[GroupAgg],
     item_agg: &[Option<usize>],
     leaf: &L,
-    ids: &mut ColIdGen,
+    ids: &ColIdGen,
 ) -> Result<Vec<ProjEntry>, GnitzSqlError> {
     let mut items = Vec::new();
     for (idx, item) in select.projection.iter().enumerate() {
@@ -1454,9 +1395,7 @@ fn bind_finalize_projection<L: LeafBinder<HirRef>>(
             let id = col_of(leaf.bind_column(peeled)?)?;
             if !group_cols.contains(&id) {
                 let name = col_by_id(env, id).map(|c| c.def.name.clone()).unwrap_or_default();
-                return Err(GnitzSqlError::Plan(format!(
-                    "column '{name}' must appear in GROUP BY or an aggregate function"
-                )));
+                return Err(reject_ungrouped_column(&name));
             }
             let mut def = col_by_id(env, id).expect("group col in env").def.clone();
             if let Some(a) = alias {
@@ -1468,9 +1407,7 @@ fn bind_finalize_projection<L: LeafBinder<HirRef>>(
             });
             continue;
         }
-        return Err(GnitzSqlError::Plan(
-            "GROUP BY SELECT: only column refs and aggregates supported".into(),
-        ));
+        return Err(reject_computed_grouped_item());
     }
     Ok(items)
 }
@@ -1522,7 +1459,7 @@ impl<L: LeafBinder<HirRef>> LeafBinder<HirRef> for GroupedLeaf<'_, L> {
         Ok(BExpr::ColRef(HirRef::Col(id)))
     }
     fn bind_function(&self, f: &Function) -> Result<HirExpr, GnitzSqlError> {
-        if single_fn_name(f).and_then(agg_func_from_name).is_some() {
+        if is_agg_call(f) {
             return Ok(finalize_agg_expr(self.find_agg(f)?));
         }
         self.leaf.bind_function(f)
@@ -1530,7 +1467,7 @@ impl<L: LeafBinder<HirRef>> LeafBinder<HirRef> for GroupedLeaf<'_, L> {
     fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<HirExpr, GnitzSqlError> {
         let peeled = peel_nested(inner);
         if let Expr::Function(f) = peeled {
-            if single_fn_name(f).and_then(agg_func_from_name).is_some() {
+            if is_agg_call(f) {
                 let ga = self.find_agg(f)?;
                 if let Some(cnt) = &ga.agg.companion {
                     // Nullable SUM / AVG: NULL ⇔ COUNT_NON_NULL companion is 0.
@@ -1567,7 +1504,7 @@ impl<L: LeafBinder<HirRef>> LeafBinder<HirRef> for GroupedLeaf<'_, L> {
 fn bind_set_op(
     client: &mut GnitzClient,
     binder: &mut Binder<'_>,
-    ids: &mut ColIdGen,
+    ids: &ColIdGen,
     op: SetOperator,
     quantifier: SetQuantifier,
     left: &SetExpr,
@@ -1592,29 +1529,10 @@ fn bind_set_op(
         }
     };
     let all = matches!(quantifier, SetQuantifier::All);
-    let left_rel = bind_set_side(client, binder, ids, left)?;
-    let right_rel = bind_set_side(client, binder, ids, right)?;
+    // Each side binds as any relational body — a plain SELECT, a join, a grouped
+    // query, a nested set operation, or a derived table (all handled by
+    // `bind_body` → `resolve_table_factor`).
+    let left_rel = bind_body(client, binder, ids, left)?;
+    let right_rel = bind_body(client, binder, ids, right)?;
     RelExpr::set_op(ids, kind, all, left_rel, right_rel)
-}
-
-/// Bind one set-operation side. A derived-table side is deferred (box 8) — rejected
-/// here with a clean message rather than the drifted resolution error.
-fn bind_set_side(
-    client: &mut GnitzClient,
-    binder: &mut Binder<'_>,
-    ids: &mut ColIdGen,
-    side: &SetExpr,
-) -> Result<Rc<RelExpr>, GnitzSqlError> {
-    if let SetExpr::Select(s) = side {
-        for item in &s.from {
-            for tf in std::iter::once(&item.relation).chain(item.joins.iter().map(|j| &j.relation)) {
-                if matches!(tf, TableFactor::Derived { .. }) {
-                    return Err(GnitzSqlError::Unsupported(
-                        "set operation: a derived table set-op side is not supported".into(),
-                    ));
-                }
-            }
-        }
-    }
-    bind_body(client, binder, ids, side)
 }

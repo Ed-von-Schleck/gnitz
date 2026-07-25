@@ -12,41 +12,79 @@
 //! PK-front convention and the `HirRef → ColRef(position)` substitution.
 
 pub(crate) mod bind;
+pub(crate) mod chain;
+mod create;
+pub(crate) mod guards;
 pub(crate) mod lower;
 pub(crate) mod physical;
 pub(crate) mod rewrite;
 
+pub(crate) use create::{execute_alter_view, execute_create_view};
+
+use crate::bind::Binder;
 use crate::error::GnitzSqlError;
-use crate::ir::AggFunc;
-use crate::plan::view::join::JoinType;
-use gnitz_core::{ColumnDef, RangeRel, Schema, TypeCode};
+use crate::ir::{AggFunc, BExpr};
+use chain::{EmitPieces, ViewChain};
+use gnitz_core::{ColumnDef, GnitzClient, RangeRel, Schema, TypeCode};
+use sqlparser::ast::SetExpr;
 use std::rc::Rc;
 
-/// Opaque column identity, unique within one `bind_query` invocation, never
+/// The one shared compiler core: bind a query body to `RelExpr`, decorrelate its
+/// subqueries, classify join predicates, and lower to circuit pieces for the
+/// pre-allocated `view_id`. Every body reaches it — the top-level view body
+/// and each CTE body (inside its own `chain.add_segment`) — so the CTE phase and
+/// the top path share one pipeline; only the CTE phase threads `chain` ahead of
+/// it (to compile CTE segments before the body binds against their aliases).
+pub(crate) fn bind_and_lower(
+    client: &mut GnitzClient,
+    binder: &mut Binder<'_>,
+    chain: &mut ViewChain,
+    body: &SetExpr,
+    view_id: u64,
+) -> Result<EmitPieces, GnitzSqlError> {
+    let ids = ColIdGen::new();
+    let rel = bind::bind_body(client, binder, &ids, body)?;
+    let rel = rewrite::decorrelate(rel, &ids)?;
+    let rel = rewrite::classify(rel)?;
+    lower::lower(client, chain, rel, view_id)
+}
+
+/// Opaque column identity, unique within one `bind_and_lower` invocation, never
 /// renumbered. Its `u32` payload is an allocation order, not a layout position —
 /// consumers compare ids, never arithmetic on them.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct ColId(u32);
 
-/// Monotonic `ColId` minter, threaded through bind as a `&mut` field on the bind
-/// context. `Get` mints one per schema column at its reference site; `Project`
-/// mints one per output `ProjEntry`.
-pub(crate) struct ColIdGen(u32);
+impl ColId {
+    /// The identity-free slot: a physical layout position with no logical column
+    /// behind it — a hidden synthetic key (`_join_pk`, `_set_pk`, …), a reduce's
+    /// cardinality COUNT, an auto-prepended pass-through PK. Nothing can reference
+    /// such a slot (bind mints an id only where a name resolves), so it needs no
+    /// identity, only a position. Distinct from every minted id by construction:
+    /// `ColIdGen` counts up from 0.
+    pub(crate) const NONE: ColId = ColId(u32::MAX);
+}
+
+/// Monotonic `ColId` minter, threaded through bind by shared reference. `Get`
+/// mints one per schema column at its reference site; `Project` mints one per
+/// output `ProjEntry`. Bind-only: lowering assigns positions, never identities, so
+/// it pads its layouts with [`ColId::NONE`] instead.
+///
+/// Interior-mutable because minting is order-dependent but not exclusive: the
+/// subquery leaf mints ids from behind the `&self` of `LeafBinder`, while the
+/// projection binder around it mints its own. A `&mut` counter would force those
+/// two into separate passes over the AST for no reason — the counter is the one
+/// thing they genuinely share.
+pub(crate) struct ColIdGen(std::cell::Cell<u32>);
 
 impl ColIdGen {
     pub(crate) fn new() -> Self {
-        ColIdGen(0)
+        ColIdGen(std::cell::Cell::new(0))
     }
-    pub(crate) fn next(&mut self) -> ColId {
-        let id = ColId(self.0);
-        self.0 += 1;
+    pub(crate) fn next(&self) -> ColId {
+        let id = ColId(self.0.get());
+        self.0.set(id.0 + 1);
         id
-    }
-    /// `n` fresh ids for a physical layout's hidden key slots (`_join_pk`,
-    /// `_pair_pk`, …) — placeholders referenced by nothing, minted so a layout
-    /// position exists for every physical column.
-    pub(crate) fn placeholders(&mut self, n: usize) -> Vec<ColId> {
-        (0..n).map(|_| self.next()).collect()
     }
 }
 
@@ -62,12 +100,34 @@ pub(crate) fn col_by_id(cols: &[HirCol], id: ColId) -> Option<&HirCol> {
     cols.iter().find(|c| c.id == id)
 }
 
+/// The `ColId` of a bare `ColRef` leaf, else `None` (a literal, a computed
+/// expression, or an undecorrelated subquery operand).
+pub(crate) fn as_col(e: &HirExpr) -> Option<ColId> {
+    match e {
+        BExpr::ColRef(HirRef::Col(id)) => Some(*id),
+        _ => None,
+    }
+}
+
 /// The physical position of a `ColId` in a layout.
-pub(crate) fn slot_of(layout: &[ColId], id: ColId) -> Result<usize, crate::error::GnitzSqlError> {
+pub(crate) fn slot_of(layout: &[ColId], id: ColId) -> Result<usize, GnitzSqlError> {
     layout
         .iter()
         .position(|c| *c == id)
-        .ok_or_else(|| crate::error::GnitzSqlError::Plan("internal: HIR column reference has no layout slot".into()))
+        .ok_or_else(|| GnitzSqlError::Plan("internal: HIR column reference has no layout slot".into()))
+}
+
+/// The physical position of a bare `ColRef` leaf in a layout. Every projection
+/// item that reaches a combine emit is a bare column reference — a computed one is
+/// cut to a linear segment before it gets there — so anything else is an internal
+/// compile error, not a user-facing limit.
+pub(crate) fn slot_of_expr(e: &HirExpr, layout: &[ColId]) -> Result<usize, GnitzSqlError> {
+    match as_col(e) {
+        Some(id) => slot_of(layout, id),
+        None => Err(GnitzSqlError::Plan(
+            "internal: a combine projection item is not a column reference".into(),
+        )),
+    }
 }
 
 /// Leaf reference for HIR expressions: a resolved column, or a bound subquery
@@ -115,12 +175,11 @@ pub(crate) struct InPair {
 /// `[NOT] EXISTS` and `[NOT] IN`) decorrelates to a Semi/Anti/Mark join;
 /// `negated` folds the `NOT`. `Scalar` (covering a scalar aggregate subquery and
 /// the MIN/MAX-normalized range ANY/ALL) decorrelates to a `Reduce` joined to the
-/// outer, its value substituted for the leaf; `coalesce_zero` wraps a COUNT's
-/// substituted value in `COALESCE(_, 0)` (the never-NULL COUNT repair).
+/// outer, its value substituted for the leaf.
 #[derive(Clone, Copy)]
 pub(crate) enum SubqueryKind {
     Exists { negated: bool },
-    Scalar { coalesce_zero: bool },
+    Scalar,
 }
 
 impl SubqueryRef {
@@ -132,16 +191,27 @@ impl SubqueryRef {
     pub(crate) fn value_type(&self) -> TypeCode {
         match self.kind {
             SubqueryKind::Exists { .. } => TypeCode::I64,
-            SubqueryKind::Scalar { coalesce_zero } => {
-                if coalesce_zero {
-                    return TypeCode::I64; // COALESCE(COUNT, 0)
-                }
-                match self.scalar_agg() {
-                    Ok(agg) if agg.func == AggFunc::Avg => TypeCode::F64,
-                    Ok(agg) => agg.out.def.type_code,
-                    Err(_) => TypeCode::I64,
-                }
-            }
+            SubqueryKind::Scalar => match self.scalar_agg() {
+                Ok(agg) if agg.func == AggFunc::Avg => TypeCode::F64,
+                // COALESCE(COUNT, 0) is I64 — as is a raw COUNT's own out type.
+                Ok(agg) => agg.out.def.type_code,
+                Err(_) => TypeCode::I64,
+            },
+        }
+    }
+
+    /// Whether this subquery's value is provably never NULL: an EXISTS/IN test is
+    /// the `0/1` truth constant, and a COUNT over an empty group is `0`. Both
+    /// consumers of the fact derive it here rather than caching it — bind folds
+    /// `IS [NOT] NULL` / COALESCE over such a leaf to a constant, and the LEFT-join
+    /// decorrelation re-floors a COUNT to `0` to restore it after the null-fill.
+    pub(crate) fn never_null(&self) -> bool {
+        match self.kind {
+            SubqueryKind::Exists { .. } => true,
+            SubqueryKind::Scalar => matches!(
+                self.scalar_agg().map(|a| a.func),
+                Ok(AggFunc::Count | AggFunc::CountNonNull)
+            ),
         }
     }
 
@@ -149,10 +219,10 @@ impl SubqueryRef {
     /// one-aggregate `Reduce` built by `build_scalar_reduce`. The one home for
     /// reading that invariant: every decorrelation site that needs the aggregate
     /// (finalize value, null test, uncorrelated join key) resolves it here.
-    pub(crate) fn scalar_agg(&self) -> Result<&HirAgg, crate::error::GnitzSqlError> {
+    pub(crate) fn scalar_agg(&self) -> Result<&HirAgg, GnitzSqlError> {
         match self.rel.as_ref() {
             RelExpr::Reduce { aggs, .. } if !aggs.is_empty() => Ok(&aggs[0]),
-            _ => Err(crate::error::GnitzSqlError::Plan(
+            _ => Err(GnitzSqlError::Plan(
                 "internal: a scalar subquery's rel is not a one-aggregate Reduce".into(),
             )),
         }
@@ -194,10 +264,8 @@ pub(crate) enum RelExpr {
         left: Rc<RelExpr>,
         right: Rc<RelExpr>,
         kind: JoinType,
-        /// Raw ON conjuncts over the left ∪ right `ColId` space; partitioned into
-        /// `classified` by the predicate-classification rewrite (`None` before it).
-        on: Vec<HirExpr>,
-        classified: Option<JoinClass>,
+        /// The ON predicate, in whichever of its two forms the pipeline has reached.
+        on: JoinOn,
         /// The synthetic `0/1` mark column of a `JoinType::Mark` decorrelation
         /// (`Some` iff `kind == Mark`, minted at decorrelation). Its `ColId` is the
         /// `HirRef::Col(mark_id)` leaf the substituted subquery expression reads,
@@ -258,7 +326,7 @@ impl HirAgg {
     /// raw value column is a binding target, never wire-decoded, so it is
     /// non-nullable — matching the physical reduce schema `agg::reduce_output_schema`
     /// builds for the same aggregate.
-    pub(crate) fn new(ids: &mut ColIdGen, func: AggFunc, arg: Option<ColId>, typing: &crate::agg::AggTyping) -> Self {
+    pub(crate) fn new(ids: &ColIdGen, func: AggFunc, arg: Option<ColId>, typing: &crate::agg::AggTyping) -> Self {
         HirAgg {
             func,
             arg,
@@ -291,6 +359,46 @@ pub(crate) struct SetOpCol {
     pub out: HirCol,
 }
 
+/// Which side(s) of a join survive unmatched — the join kind carried in
+/// `RelExpr::Join.kind`, and the driver of both null-fill emission and
+/// output-column nullability. The two predicates:
+///   - `preserves_left()`  (`Left | Full`): a left row survives unmatched ⇒ the
+///     right columns can be NULL, and the null-fill `ν_A = positive_part(A − π_A(inner))`
+///     is emitted.
+///   - `preserves_right()` (`Right | Full`): a right row survives unmatched ⇒ the
+///     left columns can be NULL, and the mirror `ν_B = positive_part(B − π_B(inner))`
+///     is emitted.
+///
+/// `Full` satisfies both. `Inner` neither.
+///
+/// `Semi`, `Anti`, and `Mark` are the decorrelation-only kinds an EXISTS/IN
+/// subquery lowers to (never produced by a FROM-clause JOIN): a semi/anti join
+/// keeps/drops each left row by match existence, and a mark join tags each left
+/// row with a `0/1` match column. All three preserve neither side under the
+/// `preserves_left`/`preserves_right` predicates (they are `matches!`-based, so
+/// the new variants get `false` automatically), and carry only the left columns
+/// (plus, for `Mark`, the mark column) — see `RelExpr::cols`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinType {
+    Inner,
+    Left,
+    Right,
+    Full,
+    Semi,
+    Anti,
+    Mark,
+}
+
+impl JoinType {
+    pub(crate) fn preserves_left(self) -> bool {
+        matches!(self, JoinType::Left | JoinType::Full)
+    }
+
+    pub(crate) fn preserves_right(self) -> bool {
+        matches!(self, JoinType::Right | JoinType::Full)
+    }
+}
+
 /// An equality join-key pair: the two `ColId`s and their promoted common type.
 #[derive(Clone, Copy)]
 pub(crate) struct EqPair {
@@ -318,11 +426,35 @@ pub(crate) struct JoinClass {
     pub residual: Vec<HirExpr>,
 }
 
+/// A join's ON predicate in one of its two forms: the raw conjuncts bind produced
+/// (over the left ∪ right `ColId` space), or the [`JoinClass`] the classification
+/// rewrite partitioned them into. One field rather than a `Vec` plus an `Option`
+/// that are each dead in the other phase, so "classified before lowering" is a
+/// `match` the compiler checks instead of an `expect`.
+#[derive(Clone)]
+pub(crate) enum JoinOn {
+    Raw(Vec<HirExpr>),
+    Class(JoinClass),
+}
+
+impl JoinOn {
+    /// The classified form. Lowering runs strictly after the rewrite, so a `Raw`
+    /// here is an internal invariant break.
+    pub(crate) fn class(&self) -> Result<&JoinClass, GnitzSqlError> {
+        match self {
+            JoinOn::Class(c) => Ok(c),
+            JoinOn::Raw(_) => Err(GnitzSqlError::Plan(
+                "internal: join reached lowering unclassified".into(),
+            )),
+        }
+    }
+}
+
 impl RelExpr {
     /// A base table or committed/hidden-view source: one fresh `ColId` per
     /// registered schema column, in schema order (so a `ColId`'s env position is
     /// its schema position).
-    pub(crate) fn get(ids: &mut ColIdGen, tid: u64, schema: Rc<Schema>, from_catalog: bool) -> Rc<RelExpr> {
+    pub(crate) fn get(ids: &ColIdGen, tid: u64, schema: Rc<Schema>, from_catalog: bool) -> Rc<RelExpr> {
         let cols = schema
             .columns
             .iter()
@@ -350,8 +482,8 @@ impl RelExpr {
         Rc::new(RelExpr::Project { input, items })
     }
 
-    /// A join. `classified` is `None` until the predicate rewrite fills it; `mark`
-    /// is `Some` only for a `JoinType::Mark` decorrelation.
+    /// A join with its raw (unclassified) ON conjuncts; `mark` is `Some` only for a
+    /// `JoinType::Mark` decorrelation.
     pub(crate) fn join(
         left: Rc<RelExpr>,
         right: Rc<RelExpr>,
@@ -363,8 +495,7 @@ impl RelExpr {
             left,
             right,
             kind,
-            on,
-            classified: None,
+            on: JoinOn::Raw(on),
             mark,
         })
     }
@@ -389,7 +520,7 @@ impl RelExpr {
     /// the per-operator output nullability (Union `l||r`, Intersect `l&&r`, Except
     /// `l`). Rejects an arity or type mismatch — the one home for those guards.
     pub(crate) fn set_op(
-        ids: &mut ColIdGen,
+        ids: &ColIdGen,
         op: SetOpKind,
         all: bool,
         left: Rc<RelExpr>,
@@ -406,13 +537,12 @@ impl RelExpr {
         }
         let mut out = Vec::with_capacity(lcols.len());
         for (i, (l, r)) in lcols.iter().zip(&rcols).enumerate() {
-            let tc =
-                crate::plan::view::set_op::set_op_common_type(l.def.type_code, r.def.type_code).ok_or_else(|| {
-                    GnitzSqlError::Plan(format!(
-                        "set operation: column {} type mismatch ({:?} vs {:?})",
-                        i, l.def.type_code, r.def.type_code
-                    ))
-                })?;
+            let tc = guards::set_op_common_type(l.def.type_code, r.def.type_code).ok_or_else(|| {
+                GnitzSqlError::Plan(format!(
+                    "set operation: column {} type mismatch ({:?} vs {:?})",
+                    i, l.def.type_code, r.def.type_code
+                ))
+            })?;
             // Output name comes from the left side (SQL takes output names from
             // the first query); nullability is operator-specific.
             let is_nullable = match op {
@@ -446,87 +576,64 @@ impl RelExpr {
         rel: &Rc<RelExpr>,
         f: &mut impl FnMut(&Rc<RelExpr>) -> Result<Rc<RelExpr>, GnitzSqlError>,
     ) -> Result<Rc<RelExpr>, GnitzSqlError> {
-        let same = |a: &Rc<RelExpr>, b: &Rc<RelExpr>| Rc::ptr_eq(a, b);
+        /// One child: rebuild via `$ctor` only if `f` returned a different node.
+        macro_rules! one {
+            ($input:expr, $ctor:expr) => {{
+                let n = f($input)?;
+                if Rc::ptr_eq(&n, $input) {
+                    Rc::clone(rel)
+                } else {
+                    ($ctor)(n)
+                }
+            }};
+        }
+        /// Two children: same, but both must be unchanged to preserve identity.
+        macro_rules! two {
+            ($l:expr, $r:expr, $ctor:expr) => {{
+                let (nl, nr) = (f($l)?, f($r)?);
+                if Rc::ptr_eq(&nl, $l) && Rc::ptr_eq(&nr, $r) {
+                    Rc::clone(rel)
+                } else {
+                    ($ctor)(nl, nr)
+                }
+            }};
+        }
         Ok(match rel.as_ref() {
             RelExpr::Get { .. } => Rc::clone(rel),
-            RelExpr::Filter { input, preds } => {
-                let n = f(input)?;
-                if same(&n, input) {
-                    Rc::clone(rel)
-                } else {
-                    RelExpr::filter(n, preds.clone())
-                }
-            }
-            RelExpr::Project { input, items } => {
-                let n = f(input)?;
-                if same(&n, input) {
-                    Rc::clone(rel)
-                } else {
-                    RelExpr::project(n, items.clone())
-                }
-            }
-            RelExpr::Distinct { input } => {
-                let n = f(input)?;
-                if same(&n, input) {
-                    Rc::clone(rel)
-                } else {
-                    RelExpr::distinct(n)
-                }
-            }
+            RelExpr::Filter { input, preds } => one!(input, |n| RelExpr::filter(n, preds.clone())),
+            RelExpr::Project { input, items } => one!(input, |n| RelExpr::project(n, items.clone())),
+            RelExpr::Distinct { input } => one!(input, RelExpr::distinct),
             RelExpr::Reduce {
                 input,
                 group_cols,
                 aggs,
-            } => {
-                let n = f(input)?;
-                if same(&n, input) {
-                    Rc::clone(rel)
-                } else {
-                    RelExpr::reduce(n, group_cols.clone(), aggs.clone())
-                }
-            }
+            } => one!(input, |n| RelExpr::reduce(n, group_cols.clone(), aggs.clone())),
             RelExpr::Join {
                 left,
                 right,
                 kind,
                 on,
-                classified,
                 mark,
-            } => {
-                let (nl, nr) = (f(left)?, f(right)?);
-                if same(&nl, left) && same(&nr, right) {
-                    Rc::clone(rel)
-                } else {
-                    Rc::new(RelExpr::Join {
-                        left: nl,
-                        right: nr,
-                        kind: *kind,
-                        on: on.clone(),
-                        classified: classified.clone(),
-                        mark: mark.clone(),
-                    })
-                }
-            }
+            } => two!(left, right, |l, r| Rc::new(RelExpr::Join {
+                left: l,
+                right: r,
+                kind: *kind,
+                on: on.clone(),
+                mark: mark.clone(),
+            })),
             RelExpr::SetOp {
                 op,
                 all,
                 left,
                 right,
                 out,
-            } => {
-                let (nl, nr) = (f(left)?, f(right)?);
-                if same(&nl, left) && same(&nr, right) {
-                    Rc::clone(rel)
-                } else {
-                    Rc::new(RelExpr::SetOp {
-                        op: *op,
-                        all: *all,
-                        left: nl,
-                        right: nr,
-                        out: out.clone(),
-                    })
-                }
-            }
+            } => two!(left, right, |l, r| Rc::new(RelExpr::SetOp {
+                op: *op,
+                all: *all,
+                left: l,
+                right: r,
+                out: out.clone(),
+            })),
         })
     }
 
@@ -559,8 +666,11 @@ impl RelExpr {
                     cols
                 }
                 _ => {
-                    let mut cols = widen_cols(left.cols(), kind.preserves_right());
-                    cols.extend(widen_cols(right.cols(), kind.preserves_left()));
+                    let mut cols = left.cols();
+                    widen_if(cols.iter_mut().map(|c| &mut c.def), kind.preserves_right());
+                    let mut rcols = right.cols();
+                    widen_if(rcols.iter_mut().map(|c| &mut c.def), kind.preserves_left());
+                    cols.extend(rcols);
                     cols
                 }
             },
@@ -592,13 +702,18 @@ impl RelExpr {
 }
 
 /// Widen every def to nullable when `make_nullable` — the per-side outer-join
-/// nullability adjustment (`combined_payload_coldefs`), keeping each `ColId` so a
-/// resolved reference survives the widening.
-fn widen_cols(mut cols: Vec<HirCol>, make_nullable: bool) -> Vec<HirCol> {
-    if make_nullable {
-        for c in &mut cols {
-            c.def.is_nullable = true;
-        }
+/// nullability adjustment, and its **one** home. A preserved side forces the
+/// *other* side's columns nullable (`kind.preserves_left()` widens the right,
+/// `preserves_right()` the left), so the logical output columns ([`RelExpr::cols`])
+/// and the physical ones (`lower::join::combined_payload_coldefs`) derive
+/// nullability from the same primitive rather than restating the rule. Widening
+/// touches only `is_nullable`, so a `ColId` survives it and a resolved reference
+/// stays valid.
+pub(crate) fn widen_if<'a>(defs: impl Iterator<Item = &'a mut ColumnDef>, make_nullable: bool) {
+    if !make_nullable {
+        return;
     }
-    cols
+    for d in defs {
+        d.is_nullable = true;
+    }
 }

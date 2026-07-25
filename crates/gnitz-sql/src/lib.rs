@@ -3,6 +3,7 @@ mod agg;
 mod ast_util;
 mod bind;
 mod codec;
+mod ddl;
 mod dispatch;
 mod dml;
 mod error;
@@ -10,10 +11,10 @@ mod exec;
 mod hir;
 mod ir;
 mod lower;
-mod plan;
 #[cfg(test)]
 mod test_support;
 mod types;
+mod validate;
 
 pub use error::GnitzSqlError;
 

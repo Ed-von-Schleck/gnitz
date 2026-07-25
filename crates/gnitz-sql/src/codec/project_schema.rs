@@ -2,12 +2,11 @@
 //!
 //! `resolve_proj_col` resolves one SELECT item (column lookup + alias rename +
 //! computed-expr typing) and `place_pk_front` pins the source PK to the leading
-//! output slots; `build_projection` composes them into the single-table view's
-//! output layout. `build_projection`'s sole caller is the simple CREATE VIEW
-//! builder (`plan::view::simple`) — the join and SET projections have their own
-//! leading-column contracts and build their layouts separately.
+//! output slots. The CREATE VIEW linear projection composes them in
+//! `hir::physical::physicalize_projection`; `build_read_projection` is the ad-hoc
+//! read path's variant (PK hidden-prepended, user column order preserved).
 
-use crate::ast_util::{wildcard_name_is_visible, WildcardRewrite};
+use crate::ast_util::expand_wildcard_item;
 use crate::bind::bind_single_table;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
@@ -53,7 +52,7 @@ fn resolve_proj_col(
         SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
         _ => {
             return Err(GnitzSqlError::Unsupported(
-                "unsupported SELECT item in CREATE VIEW projection".to_string(),
+                "unsupported SELECT item in projection".to_string(),
             ))
         }
     };
@@ -152,43 +151,15 @@ pub(crate) fn place_pk_front(
     perm
 }
 
-/// Build the projected `(items, out_cols)` for a single-table view: resolve
-/// each SELECT item (expanding `SELECT *` to every source column), then pin the
-/// source PK to the leading slots.
-pub(crate) fn build_projection(
-    projection: &[SelectItem],
-    source_schema: &Schema,
-) -> Result<(Vec<ProjItem>, Vec<ColumnDef>), GnitzSqlError> {
-    let (mut items, mut out_cols) = resolve_projection_items(projection, source_schema)?;
-    place_pk_front(&mut items, &mut out_cols, source_schema);
-    Ok((items, out_cols))
-}
-
 /// Build the projected `(items, out_cols)` for the **ad-hoc read path**
 /// (`plan_read_spec`): the full source PK is **always hidden-prepended** to slots
 /// `0..k`, and every SELECT item — a projected PK column included — is a payload
 /// slot in SELECT order (materialized by a `COPY_COL` / computed `EMIT`). Unlike
-/// [`build_projection`]'s `place_pk_front` (which *promotes* a projected PK to
-/// the visible front, CREATE VIEW behavior), this preserves the user's column
-/// order (`SELECT a, id` stays `[a, id]`) and never rejects a PK-dropping
-/// projection — the physical key rides hidden.
+/// the CREATE VIEW linear path's [`place_pk_front`] (which *promotes* a projected
+/// PK to the visible front), this preserves the user's column order (`SELECT a,
+/// id` stays `[a, id]`) and never rejects a PK-dropping projection — the physical
+/// key rides hidden.
 pub(crate) fn build_read_projection(
-    projection: &[SelectItem],
-    source_schema: &Schema,
-) -> Result<(Vec<ProjItem>, Vec<ColumnDef>), GnitzSqlError> {
-    let (mut items, mut out_cols) = resolve_projection_items(projection, source_schema)?;
-    for (target, &pk) in source_schema.pk_indices().iter().enumerate() {
-        items.insert(target, ProjItem::PassThrough { src_col: pk });
-        out_cols.insert(target, source_schema.columns[pk].clone().hidden());
-    }
-    Ok((items, out_cols))
-}
-
-/// Resolve every SELECT item into `(ProjItem, ColumnDef)` in SELECT order,
-/// expanding `SELECT *` (honoring `EXCEPT`/`EXCLUDE`/`RENAME`, rejecting
-/// `REPLACE`/`ILIKE`). PK placement is the caller's (view: `place_pk_front`;
-/// read path: hidden-prepend).
-fn resolve_projection_items(
     projection: &[SelectItem],
     source_schema: &Schema,
 ) -> Result<(Vec<ProjItem>, Vec<ColumnDef>), GnitzSqlError> {
@@ -197,28 +168,12 @@ fn resolve_projection_items(
 
     for (idx, item) in projection.iter().enumerate() {
         if matches!(item, SelectItem::Wildcard(_)) {
-            // No early return: `SELECT *` expands here and then flows through
-            // place_pk_front below, so the source PK is pinned to slots 0..k
-            // even when it is not the table's leading column. A PK already at
-            // the front degenerates to the verbatim identity order.
-            //
-            // Hidden key slots are excluded — a `SELECT *` over a view whose key
-            // is synthetic (`_join_pk`, …) must not re-admit that column into the
-            // new view's payload. A hidden *source PK* is not lost: place_pk_front
-            // re-prepends it below (staying hidden), so the derived view still
-            // carries the full source PK verbatim.
-            //
-            // `EXCEPT`/`EXCLUDE`/`RENAME` rewrite the output column list per
-            // column; `REPLACE`/`ILIKE` are rejected by `for_item`. A dropped
-            // source PK is re-prepended (hidden) by place_pk_front, exactly like
-            // `SELECT <non-pk cols>`.
-            let rw = WildcardRewrite::for_item(
-                item,
-                |n| wildcard_name_is_visible(&source_schema.columns, n),
-                "CREATE VIEW",
-            )?;
-            for (i, col) in source_schema.visible_columns() {
-                let Some(out) = rw.rewrite_column(col) else { continue };
+            // Hidden key slots are excluded — a `SELECT *` over a view whose key is
+            // synthetic (`_join_pk`, …) must not re-admit that column into the
+            // result. A hidden *source PK* is not lost: it is re-prepended (staying
+            // hidden) below. `EXCEPT`/`EXCLUDE`/`RENAME` rewrite the output column
+            // list per column; `REPLACE`/`ILIKE` are rejected by `for_item`.
+            for (i, out) in expand_wildcard_item(item, &source_schema.columns, "SELECT")? {
                 items.push(ProjItem::PassThrough { src_col: i });
                 out_cols.push(out);
             }
@@ -229,5 +184,10 @@ fn resolve_projection_items(
         }
     }
 
+    // The full source PK, hidden-prepended to slots `0..k`.
+    for (target, &pk) in source_schema.pk_indices().iter().enumerate() {
+        items.insert(target, ProjItem::PassThrough { src_col: pk });
+        out_cols.insert(target, source_schema.columns[pk].clone().hidden());
+    }
     Ok((items, out_cols))
 }

@@ -4,14 +4,14 @@
 
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;
-use crate::plan::validate::{
+use crate::validate::{
     reject_unhonored_alter_table_clauses, reject_unhonored_alter_view_clauses, reject_unhonored_commit_clauses,
     reject_unhonored_create_index_clauses, reject_unhonored_create_table_clauses, reject_unhonored_create_view_clauses,
     reject_unhonored_delete_clauses, reject_unhonored_drop_clauses, reject_unhonored_insert_clauses,
     reject_unhonored_rollback_clauses, reject_unhonored_start_transaction_clauses, reject_unhonored_update_clauses,
 };
 use crate::SqlResult;
-use crate::{dml, plan};
+use crate::{ddl, dml};
 use gnitz_core::{ClientError, GnitzClient};
 use sqlparser::ast::Statement;
 
@@ -53,7 +53,7 @@ pub(crate) fn execute_statement(
     match stmt {
         // Transaction control. Each is a pure client-state-machine transition
         // (no compile, no data reshape), so the handler is inlined here; the
-        // clause-reject lives in `plan::validate` like every other statement's.
+        // clause-reject lives in `crate::validate` like every other statement's.
         // All state-machine errors (`transaction already open`, `no transaction
         // open`) are raised by the `client.txn_*` calls.
         Statement::StartTransaction { .. } => {
@@ -80,15 +80,15 @@ pub(crate) fn execute_statement(
         }
         Statement::CreateTable(create) => {
             reject_unhonored_create_table_clauses(create, "CREATE TABLE")?;
-            plan::execute_create_table(client, schema_name, create)
+            ddl::execute_create_table(client, schema_name, create)
         }
         Statement::Drop { object_type, names, .. } => {
             reject_unhonored_drop_clauses(stmt, "DROP")?;
-            plan::execute_drop(client, schema_name, object_type, names)
+            ddl::execute_drop(client, schema_name, object_type, names)
         }
         Statement::CreateView(cv) => {
             reject_unhonored_create_view_clauses(cv, "CREATE VIEW")?;
-            plan::execute_create_view(client, schema_name, cv, &mut binder)
+            crate::hir::execute_create_view(client, schema_name, cv, &mut binder)
         }
         Statement::Insert(insert) => {
             reject_unhonored_insert_clauses(insert, "INSERT")?;
@@ -97,7 +97,7 @@ pub(crate) fn execute_statement(
         Statement::Query(query) => dml::execute_select(client, schema_name, query, &mut binder),
         Statement::CreateIndex(ci) => {
             reject_unhonored_create_index_clauses(ci, "CREATE INDEX")?;
-            plan::execute_create_index(client, schema_name, ci, &mut binder)
+            ddl::execute_create_index(client, schema_name, ci, &mut binder)
         }
         Statement::Update(update) => {
             reject_unhonored_update_clauses(update, "UPDATE")?;
@@ -118,7 +118,7 @@ pub(crate) fn execute_statement(
                     "ALTER TABLE with multiple comma-separated operations is not supported".to_string(),
                 ));
             }
-            plan::execute_alter_table(client, schema_name, a, &mut binder)
+            ddl::execute_alter_table(client, schema_name, a, &mut binder)
         }
         Statement::AlterView {
             name,
@@ -127,7 +127,7 @@ pub(crate) fn execute_statement(
             with_options,
         } => {
             reject_unhonored_alter_view_clauses(columns, with_options, "ALTER VIEW")?;
-            plan::execute_alter_view(client, schema_name, name, query, &mut binder)
+            crate::hir::execute_alter_view(client, schema_name, name, query, &mut binder)
         }
         _ => Err(GnitzSqlError::Unsupported(format!(
             "unsupported SQL statement: {stmt:?}"

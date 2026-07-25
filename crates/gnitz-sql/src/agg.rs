@@ -1,6 +1,7 @@
 //! The aggregate layout model — the shared contract between the view circuit
-//! emitter (`plan::view::group_by`), the ad-hoc fold router (`dml::select`),
-//! and the client finisher (`exec::agg_finish`). Owns the physical spec layout
+//! emitter (`hir::lower::reduce`), the ad-hoc fold router (`dml::select` /
+//! `dml::group_by`), and the client finisher (`exec::agg_finish`). Owns the
+//! physical spec layout
 //! (`push_agg_specs` is the single authority for how many specs an aggregate
 //! materialises and their output types), the per-aggregate finishing metadata
 //! (`AggMapping`/`AggShape`), and the SyntheticFold reduce-output column layout
@@ -28,16 +29,6 @@ pub(crate) struct AggMapping {
     pub(crate) output_nullable: bool,
     pub(crate) agg_func: AggFunc,
     pub(crate) arg_col: Option<usize>,
-}
-
-impl AggMapping {
-    /// Whether the aggregate's argument column holds floats — selects the float
-    /// vs integer load/divide path when finalizing AVG / nullable SUM.
-    pub(crate) fn arg_is_float(&self, schema: &Schema) -> bool {
-        self.arg_col
-            .map(|c| schema.columns[c].type_code.is_float())
-            .unwrap_or(false)
-    }
 }
 
 /// How an aggregate's value column is finalized — which also fixes how many
@@ -125,10 +116,9 @@ pub(crate) enum GroupBySelectItem {
 }
 
 /// The validated GROUP BY / aggregate layout for a single-relation aggregate
-/// SELECT — the shared analysis both the CREATE VIEW planner
-/// (`emit_group_by_pieces`) and the ad-hoc fold path (`dml::select` /
-/// `exec::agg_finish`) consume, so their column layout and validation are
-/// parity by construction. `agg_specs` is the **pre-companion** physical reduce
+/// SELECT — the analysis the ad-hoc fold path (`dml::select` /
+/// `exec::agg_finish`) consumes, kept in parity with the HIR reduce lowering by
+/// construction. `agg_specs` is the **pre-companion** physical reduce
 /// layout: the view path appends its emission-only COUNT(*) cardinality
 /// companion afterwards (a `should_emit` signal), and the stateless fold does
 /// not need one.
@@ -453,9 +443,9 @@ pub(crate) fn default_agg_name(func: AggFunc, idx: usize) -> String {
 /// slot cannot hold them — Blob has no ordering, and the String comparator in
 /// `decode_signed` reads the prefix as LE signed i64, which orders by neither
 /// bytes nor signedness. A non-MIN/MAX aggregate passes through, so a caller can
-/// hand its function over unconditionally. One home for the AST and HIR binds,
-/// which both reject ahead of `agg_typing`'s `Bind` backstop so the message and
-/// the error variant are the same on either path.
+/// hand its function over unconditionally. One home for the ad-hoc (DML) and HIR
+/// binds, which both reject ahead of `agg_typing`'s `Bind` backstop so the message
+/// and the error variant are the same on either path.
 pub(crate) fn reject_min_max_unorderable(func: AggFunc, ty: TypeCode) -> Result<(), GnitzSqlError> {
     if matches!(func, AggFunc::Min | AggFunc::Max) && !is_min_max_orderable(ty) {
         return Err(GnitzSqlError::Unsupported(format!(
@@ -468,8 +458,8 @@ pub(crate) fn reject_min_max_unorderable(func: AggFunc, ty: TypeCode) -> Result<
 
 /// The finalize composite that renders one aggregate's SELECT/HAVING value from
 /// its raw reduce output column(s) — the single definition of the rule, shared by
-/// the AST binder (`R = usize`, a reduce-output column position) and the HIR
-/// binder (`R = HirRef`, a column identity).
+/// the ad-hoc DML binder (`R = usize`, a reduce-output column position) and the
+/// HIR binder (`R = HirRef`, a column identity).
 ///
 /// * **AVG** (`companion`, `func == Avg`) — `(sum * 1.0) / cnt`. The `* 1.0`
 ///   forces float division, which an int-source SUM/COUNT would otherwise
@@ -510,7 +500,7 @@ pub(crate) fn finalize_agg_bexpr<R>(value: R, companion: Option<R>, func: AggFun
 /// Whether an aggregate's **finalize** output is nullable. AVG's and nullable-SUM's
 /// null-ness lives in the COUNT_NON_NULL companion (the finalize renders NULL via
 /// div-by-zero), so a companion-carrying shape is unconditionally nullable; a direct
-/// shape falls back to the exact structural fact. One home for the AST and HIR binds.
+/// shape falls back to the exact structural fact. One home for the ad-hoc (DML) and HIR binds.
 pub(crate) fn agg_output_nullable(shape: AggShape, agg_func: AggFunc, arg_nullable: bool, is_global: bool) -> bool {
     shape.has_count_companion() || direct_agg_nullable(agg_func, arg_nullable, is_global)
 }
@@ -616,7 +606,7 @@ pub(crate) fn agg_typing(agg_func: AggFunc, arg: Option<&ColumnDef>) -> Result<A
 /// reduce is grouped or a global scalar aggregate, so the guard is simply "no
 /// COUNT(*) present yet" — linear or not. (The companion is itself a COUNT, so it
 /// never changes the linearity `emit_reduce`'s two-phase decision reads off the
-/// full spec list.) One home for the AST and HIR reduce emitters.
+/// full spec list.) One home for the ad-hoc (DML) and HIR reduce emitters.
 pub(crate) fn ensure_cardinality_count(cols: &[ColumnDef], agg_specs: &mut Vec<AggSpec>) -> Result<(), GnitzSqlError> {
     if !agg_specs.iter().any(|s| s.op == WireAggFunc::Count) {
         push_agg_specs(AggFunc::Count, None, cols, agg_specs)?;

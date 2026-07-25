@@ -1,27 +1,8 @@
-//! CREATE VIEW circuit-building primitives, driven by the `crate::hir` lowering.
-//! `dispatch` is the front door (envelope validation + the HIR pipeline);
-//! `predicates` and `join` form the join cluster; `group_by`, `set_op`, and
-//! `simple` supply the AST-free emit primitives for the remaining shapes.
-//! Exposed: the dispatch entry points plus the shared aggregate/projection
-//! analysis the ad-hoc fold path consumes.
-
-mod dispatch;
-mod group_by;
-// `pub(crate)` for the HIR lowering: `crate::hir` calls these modules' AST-free
-// primitives cross-module (a private `mod` is visible only to its parent's
-// descendants, and `hir` is not one).
-pub(crate) mod join;
-pub(crate) mod predicates;
-pub(crate) mod set_op;
-pub(crate) mod simple;
-
-pub(crate) use dispatch::{cte_passthrough, execute_alter_view, execute_create_view};
-// The single-relation aggregate analysis + HAVING binding double as the ad-hoc
-// fold planner's front end (`dml::select`) — re-exported so the view emitters
-// themselves stay private. `cte_passthrough` backs the ad-hoc read route's
-// pass-through-CTE gate.
-pub(crate) use group_by::{analyze_group_by, bind_having_expr, HavingCtx};
-pub(crate) use set_op::resolve_set_projection;
+//! The CREATE VIEW segment sink: `ViewChain` collects the hidden segments the
+//! HIR lowering cuts (in dependency order) plus the user-named final view, and
+//! commits them as one atomic `create_view_chain` bundle. `EmitPieces` is the
+//! per-segment emit product; `debug_assert_exchange_topology` is the one
+//! structural backstop every emitted circuit passes through.
 
 use crate::error::GnitzSqlError;
 use gnitz_core::{Circuit, ColumnDef, GnitzClient, PlannedView, Schema};
@@ -41,9 +22,12 @@ pub(crate) type EmitPieces = (Circuit, Vec<ColumnDef>, Vec<u32>);
 /// so the weight pins are the real net.
 ///
 /// One home, on the two paths every circuit reaches: `add_segment` (hidden
-/// segments) and `push_final` (the user-named view). No emitter has to remember
-/// to call it, and none can be added that escapes it.
+/// segments) and the final view push (`create::build_query_segments`). No emitter
+/// has to remember to call it, and none can be added that escapes it.
 pub(crate) fn debug_assert_exchange_topology(circuit: &Circuit) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
     let shards: Vec<gnitz_core::NodeId> = circuit
         .nodes
         .iter()
@@ -128,7 +112,7 @@ impl ViewChain {
     /// `Join` or `ExchangeShard` node — the client-side mirror of the engine's
     /// `view_seeds_exchange_backfill`. A linear view whose delta source is such a
     /// seeding segment must be routed through the ordered distributed backfill
-    /// (`simple::emit_linear` appends its identity shard), or it silently loses
+    /// (`linear::emit_linear` appends its identity shard), or it silently loses
     /// all pre-existing base data: its inline hook-time backfill reads a
     /// still-empty sibling segment. A source that is a base table, a pass-through
     /// CTE alias, or a linear segment is fully populated (or inline-backfilled in
@@ -147,21 +131,23 @@ impl ViewChain {
 
     /// Mint one hidden segment: allocate its view id, run `emit` with it (the
     /// emitter may push its own upstream segments first — it gets `self` back),
-    /// and push the emitted pieces. Returns the segment's `(view id, schema)`.
+    /// and push the emitted pieces. Returns the segment's `(view id, schema)` plus
+    /// whatever `emit` returned alongside its pieces (the lowering passes its
+    /// `ColId` layout out this way; the CTE phase passes `()`).
     /// The single home for the mint sequence's invariants: the id is allocated
     /// before the circuit is built (so downstream circuits can reference it) and
     /// segments land on the chain in dependency order.
-    pub fn add_segment(
+    pub fn add_segment<T>(
         &mut self,
         client: &mut GnitzClient,
-        emit: impl FnOnce(&mut GnitzClient, &mut ViewChain, u64) -> Result<EmitPieces, GnitzSqlError>,
-    ) -> Result<(u64, Rc<Schema>), GnitzSqlError> {
+        emit: impl FnOnce(&mut GnitzClient, &mut ViewChain, u64) -> Result<(EmitPieces, T), GnitzSqlError>,
+    ) -> Result<(u64, Rc<Schema>, T), GnitzSqlError> {
         let vid = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
-        let (circuit, cols, pk) = emit(client, self, vid)?;
+        let ((circuit, cols, pk), extra) = emit(client, self, vid)?;
         debug_assert_exchange_topology(&circuit);
         let schema = schema_of(&cols, &pk);
         self.push_hidden(client, cols, pk, circuit)?;
-        Ok((vid, schema))
+        Ok((vid, schema, extra))
     }
 
     /// Append a hidden segment, naming it `__h{owner}_{idx}` at creation — the

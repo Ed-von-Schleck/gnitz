@@ -9,10 +9,7 @@
 //! its own crate the two files would move together.
 
 mod resolve;
-mod structural;
+pub(crate) mod structural;
 
-pub(crate) use resolve::{find_unique_column, resolve_qualified_column, resolve_unqualified_column, AliasMap, Binder};
-// Used by the multi-way-join provenance map and `predicates.rs`'s unit tests, which
-// build `AliasMap`s directly.
-pub(crate) use resolve::ResolvedRelation;
+pub(crate) use resolve::{apply_positional_aliases, cte_passthrough, find_unique_column, Binder};
 pub(crate) use structural::{bind_single_table, bind_structural, fold_null_test, LeafBinder, SingleTable};

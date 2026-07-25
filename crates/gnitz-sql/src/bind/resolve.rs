@@ -1,19 +1,9 @@
+use crate::ast_util::{classify_from, extract_table_factor_name, is_bare_wildcard_projection, FromShape};
 use crate::error::GnitzSqlError;
 use gnitz_core::{ColumnDef, GnitzClient, Schema};
+use sqlparser::ast::{Expr, Select, SelectItem, TableAliasColumnDef};
 use std::collections::HashMap;
 use std::rc::Rc;
-
-/// A relation resolved by name within a join `AliasMap` — each alias carries its
-/// base offset into the combined A‖B column space.
-pub(crate) struct ResolvedRelation {
-    pub schema: Rc<Schema>,
-    /// The base offset of this relation's columns within a join's combined
-    /// column space.
-    pub col_offset: usize,
-}
-
-/// alias/name → resolved relation, for multi-table (join) column resolution.
-pub(crate) type AliasMap = HashMap<String, ResolvedRelation>;
 
 /// Find the column named `col_name` in `columns`, case-insensitively.
 ///
@@ -54,53 +44,6 @@ pub(crate) fn find_unique_column<'a>(
         }
     }
     Ok(found)
-}
-
-/// Resolves a column in a multi-table context (for joins).
-/// `tables` is keyed by lowercased aliases, so the `table_alias` probe is lowercased
-/// to match — SQL identifiers are case-insensitive, but the case-preserving dialect
-/// hands us the raw spelling (e.g. `A` for alias `a`).
-pub(crate) fn resolve_qualified_column(
-    table_alias: &str,
-    col_name: &str,
-    tables: &AliasMap,
-) -> Result<usize, GnitzSqlError> {
-    let rel = tables
-        .get(&table_alias.to_ascii_lowercase())
-        .ok_or_else(|| GnitzSqlError::Bind(format!("table alias '{table_alias}' not found")))?;
-    let idx = find_unique_column(&rel.schema.columns, col_name)?
-        .ok_or_else(|| GnitzSqlError::Bind(format!("column '{col_name}' not found in table '{table_alias}'")))?;
-    Ok(rel.col_offset + idx)
-}
-
-/// Resolves an unqualified column in a multi-table context.
-/// Tries each table in order; errors on ambiguity.
-pub(crate) fn resolve_unqualified_column(col_name: &str, tables: &AliasMap) -> Result<usize, GnitzSqlError> {
-    let mut found: Option<usize> = None;
-    for rel in tables.values() {
-        // The `?` rejects a name duplicated *within* one source relation (joining
-        // a dup-named `SELECT *` view); the `found.is_some()` check below rejects a
-        // name that appears across two source relations.
-        if let Some(idx) = find_unique_column(&rel.schema.columns, col_name)? {
-            if found.is_some() {
-                return Err(GnitzSqlError::Bind(format!(
-                    "ambiguous column '{col_name}' — qualify with table alias"
-                )));
-            }
-            found = Some(rel.col_offset + idx);
-        }
-    }
-    found.ok_or_else(|| GnitzSqlError::Bind(format!("column '{col_name}' not found in any table")))
-}
-
-/// The reserved-prefix / identifier rule for any relation name entering
-/// resolution — the same `gnitz_core` rule DDL creation enforces
-/// (`plan::validate::validate_user_name`), applied here without a `bind → plan`
-/// dependency. The `Binder` holds every name to it at the point the name
-/// becomes resolvable: catalog probes in `resolve` / `resolve_base_table`,
-/// alias inserts in `cache_alias`.
-fn validate_relation_name(name: &str) -> Result<(), GnitzSqlError> {
-    gnitz_core::validate_user_identifier(name).map_err(GnitzSqlError::Plan)
 }
 
 /// One Binder cache entry. Unlike a join `AliasMap`'s `ResolvedRelation` this
@@ -173,7 +116,7 @@ impl<'a> Binder<'a> {
         // Placed after the cache check — every cached name passed the same rule
         // on insert (`cache_alias` validates; `cache_relation` is fed from these
         // already-validated probes), never a raw `__h…` catalog name.
-        validate_relation_name(name)?;
+        crate::validate::validate_user_name(name)?;
         let (tid, schema) = client
             .resolve_table_or_view_id(self.schema_name, name)
             .map_err(GnitzSqlError::Exec)?;
@@ -199,7 +142,7 @@ impl<'a> Binder<'a> {
         // also closes the existence side-channel the two-probe fallback below
         // would otherwise open (a hidden segment returns "is a view", a missing
         // name returns "not found").
-        validate_relation_name(name)?;
+        crate::validate::validate_user_name(name)?;
         // `resolve_table_id` consults TABLE_TAB only, so a view name misses it.
         match client.resolve_table_id(self.schema_name, name) {
             Ok((tid, schema)) => {
@@ -237,10 +180,95 @@ impl<'a> Binder<'a> {
         resolved: (u64, Rc<Schema>),
         from_catalog: bool,
     ) -> Result<(), GnitzSqlError> {
-        validate_relation_name(name)?;
+        crate::validate::validate_user_name(name)?;
         self.cache_relation(name, resolved.0, resolved.1, from_catalog);
         Ok(())
     }
+}
+
+/// Apply positional column aliases (`WITH d(a, b) AS …` / `(subquery) AS d(a, b)`)
+/// to the *visible* columns of a body's output, in order — a rename only (`ColId`s
+/// and layout are untouched). A JOIN body's leading synthetic-PK region is hidden
+/// and skipped automatically, so positional aliases name exactly the visible output
+/// columns — the same columns a downstream query sees — with no misalignment.
+///
+/// One home for both column shapes this runs over: a hidden segment's registered
+/// `ColumnDef`s, and the `HirCol` scope/env cols a derived table resolves
+/// `d.col` / wildcard against (the caller projects to `&mut c.def`).
+pub(crate) fn apply_positional_aliases(
+    aliases: &[TableAliasColumnDef],
+    defs: Vec<&mut ColumnDef>,
+    ctx: &str,
+) -> Result<(), GnitzSqlError> {
+    if aliases.is_empty() {
+        return Ok(());
+    }
+    let mut visible: Vec<&mut ColumnDef> = defs.into_iter().filter(|c| !c.is_hidden).collect();
+    if aliases.len() != visible.len() {
+        return Err(GnitzSqlError::Plan(format!(
+            "{ctx} defines {} column aliases but body returns {} columns",
+            aliases.len(),
+            visible.len(),
+        )));
+    }
+    for (col, alias) in visible.iter_mut().zip(aliases) {
+        col.name = alias.name.value.clone();
+    }
+    Ok(())
+}
+
+/// The pure pass-through predicate shared by the CTE binding (`bind_ctes`) and the
+/// ad-hoc read route (`dml::select`): a CTE body that is a bare single-table (or
+/// view) identity/positional projection resolves directly to its source `(tid,
+/// schema)`, with any column aliases applied. Returns `Some((tid, schema))` for
+/// such an aliasable pass-through, `None` for everything else (a joined /
+/// multi-FROM / derived-table FROM or a non-identity projection); `Err` only on a
+/// hard bind failure (unknown source relation). The caller decides what `None`
+/// means: the CTE binding compiles a hidden segment; the read route rejects the
+/// whole query as a derivation. Both callers reject a WHERE'd / grouped / DISTINCT
+/// / exotic-clause body BEFORE calling (each with its own verdict), so such a body
+/// never reaches this predicate.
+pub(crate) fn cte_passthrough(
+    client: &mut GnitzClient,
+    cte_select: &Select,
+    column_aliases: &[TableAliasColumnDef],
+    binder: &mut Binder<'_>,
+) -> Result<Option<(u64, Rc<Schema>)>, GnitzSqlError> {
+    // A single plain table/view FROM, no joins, no derived table.
+    if !matches!(classify_from(&cte_select.from), FromShape::SinglePlainRelation) {
+        return Ok(None);
+    }
+    let cte_table_name = extract_table_factor_name(&cte_select.from[0].relation, "CTE")?;
+    let (cte_tid, cte_schema) = binder.resolve(client, &cte_table_name)?;
+    // Positional identity projection: `*`, or one identifier per source column in
+    // order. The qualified form (`SELECT t.a, t.b FROM t`) parses as `CompoundIdentifier`
+    // and is the same positional pass-through; a dup-named source fails the per-position
+    // compare and is not identity. Only a *bare* `*` is identity — a
+    // `* EXCEPT/EXCLUDE/RENAME` (or a rejected `* REPLACE/ILIKE`) CTE body is not.
+    let proj_is_identity = is_bare_wildcard_projection(&cte_select.projection)
+        || (cte_select.projection.len() == cte_schema.columns.len()
+            && cte_select.projection.iter().enumerate().all(|(i, item)| {
+                let want = &cte_schema.columns[i].name;
+                match item {
+                    SelectItem::UnnamedExpr(Expr::Identifier(id)) => id.value.eq_ignore_ascii_case(want),
+                    SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) if parts.len() == 2 => {
+                        parts[1].value.eq_ignore_ascii_case(want)
+                    }
+                    _ => false,
+                }
+            }));
+    if !proj_is_identity {
+        return Ok(None);
+    }
+    // Apply CTE column aliases (`WITH cte(a, b) AS ...`).
+    let cte_schema = if !column_aliases.is_empty() {
+        let mut s = (*cte_schema).clone();
+        apply_positional_aliases(column_aliases, s.columns.iter_mut().collect(), "CTE")?;
+        Rc::new(s)
+    } else {
+        cte_schema
+    };
+    Ok(Some((cte_tid, cte_schema)))
 }
 
 #[cfg(test)]
@@ -311,27 +339,5 @@ mod tests {
             Err(GnitzSqlError::Bind(s)) => assert!(s.contains("ambiguous"), "got: {s}"),
             other => panic!("expected Bind(ambiguous), got {other:?}"),
         }
-    }
-
-    #[test]
-    fn test_resolve_qualified_column_case_insensitive_alias() {
-        // The AliasMap is keyed by lowercased aliases (join.rs builds it with
-        // `.to_ascii_lowercase()`); under the case-preserving GenericDialect a reference
-        // like `ON A.x = ...` arrives as raw "A". The probe must lowercase to hit,
-        // and `col_offset` must still be added through.
-        let mut map: AliasMap = HashMap::new();
-        map.insert(
-            "a".to_string(),
-            ResolvedRelation {
-                schema: Rc::new(Schema {
-                    columns: vec![col("x", TypeCode::I64), col("y", TypeCode::I64)],
-                    pk_cols: vec![0],
-                }),
-                col_offset: 10,
-            },
-        );
-        assert_eq!(resolve_qualified_column("A", "x", &map).unwrap(), 10);
-        assert_eq!(resolve_qualified_column("A", "y", &map).unwrap(), 11);
-        assert_eq!(resolve_qualified_column("a", "x", &map).unwrap(), 10); // lower still works
     }
 }

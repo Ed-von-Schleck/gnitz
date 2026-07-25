@@ -1183,4 +1183,114 @@ mod tests {
         assert_eq!(c.desc.start, After(10));
         assert_eq!(c.residual.len(), 1, "`a = 7` is a residual conjunct");
     }
+
+    // ── best_index_bound: the whole-WHERE arbitration ────────────────────────────
+    //
+    // These pin the *chosen* bound, not just the per-shape collectors above: which
+    // candidate wins across shapes and across separate indexes, and how many index
+    // round-trips the choice costs (a probe is wire traffic, so "zero" is contract).
+
+    /// `(id U64 pk, a U64, b U64 [nullable per arg])` — indexable cols a=1, b=2.
+    fn bound_schema(b_nullable: bool) -> Schema {
+        Schema {
+            columns: vec![
+                col_def("id", TypeCode::U64, false),
+                col_def("a", TypeCode::U64, false),
+                col_def("b", TypeCode::U64, b_nullable),
+            ],
+            pk_cols: vec![0],
+        }
+    }
+
+    /// The bound `best_index_bound` picks for `where_sql`, plus the index-list fetch
+    /// count.
+    #[allow(clippy::type_complexity)]
+    fn bound_of(
+        where_sql: &str,
+        sch: &Schema,
+        lists: &[&[u32]],
+    ) -> (Option<(gnitz_wire::PkColList, gnitz_wire::RangeDescriptor)>, u32) {
+        let calls = std::cell::Cell::new(0);
+        let bound = bind_single_table(&parse_expr_sql(where_sql), sch).unwrap();
+        let c = best_index_bound(&bound, sch, || {
+            calls.set(calls.get() + 1);
+            Ok(idx_metas(lists))
+        })
+        .unwrap();
+        (c.map(|c| (c.idx_cols, c.desc)), calls.get())
+    }
+
+    /// A pure equality on a 1-column index lowers to a degenerate point range.
+    #[test]
+    fn equality_lowers_to_a_degenerate_point_range() {
+        let (b, calls) = bound_of("a = 5", &bound_schema(false), &[&[1]]);
+        let (idx_cols, desc) = b.expect("a = 5 on an index over `a` must bound");
+        assert_eq!(idx_cols.as_slice(), &[1]);
+        assert_eq!(desc.eq_vals(), &[] as &[u128]);
+        assert_eq!((desc.start, desc.end), (Cut::Before(5), Cut::After(5)));
+        assert_eq!(calls, 1, "one round-trip serves both collectors");
+    }
+
+    /// A two-column equality pins the leading column and points at the last.
+    #[test]
+    fn compound_equality_pins_the_leading_column() {
+        let (b, _) = bound_of("a = 5 AND b = 7", &bound_schema(false), &[&[1, 2]]);
+        let (idx_cols, desc) = b.expect("a compound equality must bound the compound index");
+        assert_eq!(idx_cols.as_slice(), &[1, 2]);
+        assert_eq!(desc.eq_vals(), &[5u128]);
+        assert_eq!((desc.start, desc.end), (Cut::Before(7), Cut::After(7)));
+    }
+
+    /// An equality prefix plus a range on ONE index takes the range candidate.
+    #[test]
+    fn equality_prefix_plus_range_takes_the_range_candidate() {
+        let (b, _) = bound_of("a = 5 AND b > 10", &bound_schema(false), &[&[1, 2]]);
+        let (_, desc) = b.expect("an eq-prefix + range must bound");
+        assert_eq!(desc.eq_vals(), &[5u128], "`a` is the pinned prefix");
+        assert_eq!(desc.start, Cut::After(10), "`b > 10` is an exclusive lower cut");
+        assert_ne!(desc.end, Cut::After(10), "the upper side stays open, not a point");
+    }
+
+    /// Across SEPARATE indexes, most-pinned wins.
+    #[test]
+    fn point_on_one_index_beats_half_open_range_on_another() {
+        let (b, _) = bound_of("a = 5 AND b > 10", &bound_schema(false), &[&[1], &[2]]);
+        let (idx_cols, desc) = b.expect("the point candidate must bound");
+        assert_eq!(idx_cols.as_slice(), &[1], "INDEX(a)'s point beats INDEX(b)'s range");
+        assert_eq!((desc.start, desc.end), (Cut::Before(5), Cut::After(5)));
+    }
+
+    /// A PK predicate never bounds: the collectors skip PK columns unconditionally.
+    #[test]
+    fn pk_equality_never_bounds() {
+        assert!(bound_of("id = 5", &bound_schema(false), &[&[1]]).0.is_none());
+    }
+
+    /// An uncovered NULLABLE trailing index column must NOT bound.
+    #[test]
+    fn uncovered_nullable_trailing_column_never_bounds() {
+        assert!(bound_of("a = 5", &bound_schema(true), &[&[1, 2]]).0.is_none());
+        assert!(bound_of("a = 5", &bound_schema(false), &[&[1, 2]]).0.is_some());
+    }
+
+    /// A WHERE no index covers costs ZERO round-trips on the range path and at most
+    /// one overall — the collectors are lazy by contract.
+    #[test]
+    fn unindexed_column_bounds_nothing() {
+        let (b, calls) = bound_of("a = 5", &bound_schema(false), &[&[2]]);
+        assert!(b.is_none());
+        assert_eq!(calls, 1, "the eq collector probes once, then finds no match");
+        let (b, calls) = bound_of("a + b > 3", &bound_schema(false), &[&[1]]);
+        assert!(b.is_none());
+        assert_eq!(calls, 0, "a non-servable WHERE must cost no wire traffic");
+    }
+
+    /// A BETWEEN is a two-sided range over one column (desugared at bind).
+    #[test]
+    fn between_bounds_both_sides() {
+        let (b, _) = bound_of("a BETWEEN 5 AND 9", &bound_schema(false), &[&[1]]);
+        let (_, desc) = b.expect("BETWEEN must bound");
+        assert_eq!(desc.eq_vals(), &[] as &[u128]);
+        assert_eq!((desc.start, desc.end), (Cut::Before(5), Cut::After(9)));
+    }
 }

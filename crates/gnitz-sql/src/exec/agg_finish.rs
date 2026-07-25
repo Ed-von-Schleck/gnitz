@@ -24,7 +24,7 @@ use crate::agg::{group_col_reduce_pos, AggShape, AggSpec, GroupByLayout, GroupBy
 use crate::error::GnitzSqlError;
 use crate::ir::{BinOp, BoundExpr, UnaryOp};
 use crate::lower::{lower_bound_expr, BoundExprBackend};
-use crate::plan::validate::reject_duplicate_column_names;
+use crate::validate::reject_duplicate_column_names;
 
 /// Everything the finish needs from the SQL layer, borrowed from the routing
 /// arm. `having` is the **pre-bound, pre-probed** HAVING expression (ColRefs

@@ -2288,3 +2288,28 @@ fn test_pure_range_full_wide_gets_purerange_message() {
         e => panic!("expected Unsupported, got {e:?}"),
     }
 }
+
+/// A computed projection over a FROM-clause JOIN. The join emit itself carries a
+/// bare column projection, so the shared lowering cuts the join to a hidden segment
+/// and evaluates the expression as a linear body over it — the same route a
+/// decorrelated scalar finalize takes. Previously rejected at bind.
+#[test]
+fn test_computed_projection_over_join() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+
+    p.execute("CREATE TABLE cpj_a (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, v BIGINT NOT NULL)")
+        .unwrap();
+    p.execute("CREATE TABLE cpj_b (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, w BIGINT NOT NULL)")
+        .unwrap();
+
+    let r = p.execute(
+        "CREATE VIEW cpj_v AS SELECT cpj_a.v + cpj_b.w AS s \
+         FROM cpj_a JOIN cpj_b ON cpj_a.fk = cpj_b.fk",
+    );
+    assert!(r.is_ok(), "computed projection over a JOIN failed: {:?}", r.err());
+}

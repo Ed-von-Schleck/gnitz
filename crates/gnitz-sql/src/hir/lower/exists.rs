@@ -1,29 +1,30 @@
-//! The EXISTS/IN semi-, anti-, and mark-join lowering shells. Reproduces
-//! `plan::view::exists`'s circuit node-for-node by calling the same AST-free
-//! primitives (`emit_equi_join_terms`, the range prologue, `positive_diff`, the
-//! pure-range threshold), but sources its inputs from the decorrelated HIR
-//! `Join{Semi|Anti|Mark}` node (`SegInput` layouts, `JoinClass`, `ProjEntry`)
-//! rather than the AST. Equi correlations key the view by the synthetic `_join_pk`
-//! (no output exchange); band and pure-range correlations re-key onto the outer
-//! source PK and ride the mandatory output exchange.
+//! The EXISTS/IN semi-, anti-, and mark-join lowering shells, driving the
+//! AST-free join primitives in `join.rs` (`emit_equi_join_terms`, the range
+//! prologue, `positive_diff`, the pure-range threshold) from the decorrelated HIR
+//! `Join{Semi|Anti|Mark}` node (`SegInput` layouts, `JoinClass`, `ProjEntry`).
+//! Equi correlations key the view by the synthetic `_join_pk` (no output
+//! exchange); band and pure-range correlations re-key onto the outer source PK and
+//! ride the mandatory output exchange.
 
-use super::super::{slot_of, ColId, ColIdGen, EqPair, HirExpr, HirRange, HirRef, ProjEntry, RelExpr};
+use super::super::{ColId, EqPair, HirExpr, HirRange, HirRef, ProjEntry, RelExpr};
+use super::join::{
+    band_pi_preserved, band_union_schema, build_pure_range_threshold, emit_equi_join_terms, join_pk_coldefs,
+    normalize_to_ab, pure_range_unmatched, range_prologue, resolve_eq_cols, side_target_tcs, EquiSide, RangePrologue,
+};
+use super::prims::{build_reindex_program, rekey_on_source_pk};
 use super::{
-    collect_live_cols, emit_filter, resolve_collisions, resolve_input, seginput_of_get, split_filter, CutMemo, SegInput,
+    apply_projection, collect_live_cols, emit_filter, key_region_layout, resolve_collisions, resolve_input,
+    resolve_projection, seginput_of_get, split_filter, CutMemo, SegInput,
 };
 use crate::codec::project_schema::{compile_projection_map, ProjItem};
 use crate::error::GnitzSqlError;
+use crate::hir::chain::{EmitPieces, ViewChain};
+use crate::hir::guards::reject_pure_range_threshold_tc;
 use crate::hir::physical;
+use crate::hir::JoinType;
 use crate::ir::BExpr;
-use crate::plan::validate::reject_column_overflow;
-use crate::plan::view::join::{
-    band_union_schema, build_pure_range_threshold, emit_equi_join_terms, is_identity_projection, join_pk_coldefs,
-    normalize_to_ab, range_gate_reindex_prologue, range_slots, reject_pure_range_threshold_tc, side_target_tcs,
-    union_null_key_rows, EquiSide, JoinType, RangeSlots,
-};
-use crate::plan::view::predicates::{build_reindex_program, rekey_on_source_pk, RangeConjunct};
-use crate::plan::view::{EmitPieces, ViewChain};
-use gnitz_core::{CircuitBuilder, ColumnDef, GnitzClient, NodeId, Schema, TypeCode};
+use crate::validate::reject_column_overflow;
+use gnitz_core::{CircuitBuilder, ColumnDef, GnitzClient, NodeId, Schema};
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -68,7 +69,6 @@ struct ExistsCircuit {
 fn emit_exists_circuit(
     client: &mut GnitzClient,
     chain: &mut ViewChain,
-    ids: &mut ColIdGen,
     memo: &mut CutMemo,
     source: &Rc<RelExpr>,
     left_prefilter: &[HirExpr],
@@ -77,16 +77,12 @@ fn emit_exists_circuit(
     is_mark: bool,
 ) -> Result<ExistsCircuit, GnitzSqlError> {
     let RelExpr::Join {
-        left,
-        right,
-        kind,
-        classified,
-        ..
+        left, right, kind, on, ..
     } = source.as_ref()
     else {
         unreachable!("emit_exists_circuit receives a Join");
     };
-    let class = classified.as_ref().expect("join classified before lowering");
+    let class = on.class()?;
     let negated = matches!(kind, JoinType::Anti);
 
     // Left-input live set (projection + prefilter + correlation-key left cols) for
@@ -100,7 +96,7 @@ fn emit_exists_circuit(
         live.insert(r.left);
     }
 
-    let left_in = resolve_input(client, chain, ids, memo, left, &live)?;
+    let left_in = resolve_input(client, chain, memo, left, &live)?;
     let (inner_preds, inner_src) = split_filter(right);
     let right_in = seginput_of_get(inner_src)
         .ok_or_else(|| GnitzSqlError::Plan("internal: EXISTS/IN inner relation is not a base Get".into()))?;
@@ -109,7 +105,7 @@ fn emit_exists_circuit(
     // as a distinct source (single-source-per-epoch) — wrap the colliding inner
     // side in a pass-through segment (the shared source-collision rule).
     let mut inputs = [left_in, right_in];
-    resolve_collisions(client, chain, ids, &mut inputs, &[left, right], false)?;
+    resolve_collisions(client, chain, &mut inputs, &[left, right], false)?;
     let [left_in, right_in] = inputs;
 
     let a_n = left_in.schema.columns.len();
@@ -172,7 +168,7 @@ fn emit_exists_circuit(
     })
 }
 
-/// Equi correlation (reproduces `emit_equi_exists`): the symmetric 2-term join over
+/// Equi correlation: the symmetric 2-term join over
 /// the NULL-gated sides, `π_A(inner)`, and `a_all` (the full outer re-keyed,
 /// reusing `reindex_a` when the key is NOT NULL). Output keyed by `_join_pk`, no
 /// output exchange. Returns `(primary, unmatched?, _join_pk cols)`.
@@ -190,15 +186,7 @@ fn exists_equi_core(
     let k = eq.len();
     let a_n = left_in.schema.columns.len();
     let b_n = right_in.schema.columns.len();
-    let left_cols: Vec<usize> = eq
-        .iter()
-        .map(|p| slot_of(&left_in.layout, p.left))
-        .collect::<Result<_, _>>()?;
-    let right_cols: Vec<usize> = eq
-        .iter()
-        .map(|p| slot_of(&right_in.layout, p.right))
-        .collect::<Result<_, _>>()?;
-    let target_tcs: Vec<TypeCode> = eq.iter().map(|p| p.tc).collect();
+    let (left_cols, right_cols, target_tcs) = resolve_eq_cols(eq, left_in, right_in)?;
     let left_target_tcs = side_target_tcs(&left_cols, &left_in.schema.columns, &target_tcs);
     let right_target_tcs = side_target_tcs(&right_cols, &right_in.schema.columns, &target_tcs);
     let keep_a: Vec<usize> = (0..a_n).collect();
@@ -249,9 +237,9 @@ fn exists_equi_core(
     }
 }
 
-/// Range correlation — band (`n_eq ≥ 1`) or pure range (`n_eq == 0`) — reproducing
-/// `emit_range_exists`. Both re-key onto the outer source PK and ride the range
-/// output exchange. Returns `(primary, unmatched?, _src_pk cols)`.
+/// Range correlation — band (`n_eq ≥ 1`) or pure range (`n_eq == 0`). Both re-key
+/// onto the outer source PK and ride the range output exchange. Returns
+/// `(primary, unmatched?, _src_pk cols)`.
 #[allow(clippy::too_many_arguments)]
 fn exists_range_core(
     cb: &mut CircuitBuilder,
@@ -267,47 +255,16 @@ fn exists_range_core(
     let a_n = left_in.schema.columns.len();
     let n_eq = eq.len();
     let k = n_eq + 1;
-    let pa = left_in.schema.pk_cols.len();
-    let zero_a = vec![0u8; pa];
 
-    let left_cols: Vec<usize> = eq
-        .iter()
-        .map(|p| slot_of(&left_in.layout, p.left))
-        .collect::<Result<_, _>>()?;
-    let right_cols: Vec<usize> = eq
-        .iter()
-        .map(|p| slot_of(&right_in.layout, p.right))
-        .collect::<Result<_, _>>()?;
-    let eq_tcs: Vec<TypeCode> = eq.iter().map(|p| p.tc).collect();
-    let range_conj = RangeConjunct {
-        left_col: slot_of(&left_in.layout, range.left)?,
-        right_col: slot_of(&right_in.layout, range.right)?,
-        op: range.op,
-        tc: range.tc,
-    };
-    let slots = range_slots(
-        &left_cols,
-        &right_cols,
-        &eq_tcs,
-        &range_conj,
-        &left_in.schema.columns,
-        &right_in.schema.columns,
-    );
-    let (reindex_a, reindex_b, left_key_nullable) = range_gate_reindex_prologue(
-        cb,
-        a_local,
-        b_local,
-        &slots,
-        &left_in.schema.columns,
-        &right_in.schema.columns,
-    )?;
-    let RangeSlots {
+    let RangePrologue {
+        reindex_a,
+        reindex_b,
+        left_key_nullable,
         left_reindex_cols,
         all_tcs,
         rel_ab,
         rel_ba,
-        ..
-    } = slots;
+    } = range_prologue(cb, left_in, right_in, a_local, b_local, eq, range)?;
 
     let (primary, unmatched): (NodeId, Option<NodeId>) = if n_eq == 0 {
         // Pure range: the one-row threshold m = MAX/MIN(b.range) decides existence.
@@ -325,23 +282,22 @@ fn exists_range_core(
             want_a_pass,
         );
         // `A − matched` (∪ NULL-range-key rows) — the anti / mark unmatched branch.
-        let build_unmatched = |cb: &mut CircuitBuilder| -> Result<NodeId, GnitzSqlError> {
-            let a_pass = thr.a_pass.expect("a_pass requested for the anti/mark branch");
-            let neg = cb.negate(thr.matched);
-            let nf_match = cb.union(a_pass, neg);
-            if left_key_nullable {
-                union_null_key_rows(cb, nf_match, a_local, &left_reindex_cols, &left_in.schema)
-            } else {
-                Ok(nf_match)
-            }
+        let mut unmatched = || {
+            pure_range_unmatched(
+                cb,
+                &thr,
+                left_key_nullable,
+                a_local,
+                &left_reindex_cols,
+                &left_in.schema,
+            )
         };
         if is_mark {
-            let unmatched = build_unmatched(cb)?;
-            (thr.matched, Some(unmatched))
+            (thr.matched, Some(unmatched()?))
         } else if !negated {
             (thr.matched, None)
         } else {
-            (build_unmatched(cb)?, None)
+            (unmatched()?, None)
         }
     } else {
         // Band: the eq-prefix scatter co-locates both sides, so the inner join, its
@@ -355,13 +311,7 @@ fn exists_range_core(
         // π_A(inner) keyed by the outer source PK.
         let union_schema = band_union_schema(&all_tcs, &left_in.schema, &right_in.schema);
         let a_pk_in_union: Vec<usize> = left_in.schema.pk_cols.iter().map(|&p| k + p).collect();
-        let rekey_a = cb.map_reindex(
-            merged,
-            &a_pk_in_union,
-            &zero_a,
-            build_reindex_program(&union_schema.columns),
-        );
-        let proj_a = cb.map(rekey_a, &(pa + k..pa + k + a_n).collect::<Vec<_>>());
+        let proj_a = band_pi_preserved(cb, merged, &union_schema.columns, &a_pk_in_union, k, 0, a_n);
         let a_all = rekey_on_source_pk(cb, a_local, &left_in.schema);
         if is_mark {
             let (matched, unmatched) = semi_and_anti(cb, a_all, proj_a);
@@ -388,26 +338,10 @@ fn exists_range_core(
     Ok((primary, unmatched, src_pk_coldefs))
 }
 
-/// The physical position of a bare `ColRef` against a layout; a computed EXISTS/IN
-/// filter-view projection is rejected (column references only — the semi/anti
-/// output carries just the outer columns).
-fn slot_of_expr(e: &HirExpr, layout: &[ColId]) -> Result<usize, GnitzSqlError> {
-    match e {
-        BExpr::ColRef(HirRef::Col(id)) => slot_of(layout, *id),
-        _ => Err(GnitzSqlError::Unsupported(
-            "an EXISTS/IN filter view projects only column references; a computed projection \
-             is not supported (move the computation to a wrapping view)"
-                .into(),
-        )),
-    }
-}
-
 /// Lower a decorrelated `Project(Filter?(Join{Semi|Anti}))` to circuit pieces.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_semi_anti_view(
     client: &mut GnitzClient,
     chain: &mut ViewChain,
-    ids: &mut ColIdGen,
     memo: &mut CutMemo,
     items: &[ProjEntry],
     fpreds: &[HirExpr],
@@ -421,32 +355,21 @@ pub(crate) fn lower_semi_anti_view(
         shard,
         left_in,
         ..
-    } = emit_exists_circuit(client, chain, ids, memo, source, fpreds, items, view_id, false)?;
+    } = emit_exists_circuit(client, chain, memo, source, fpreds, items, view_id, false)?;
 
     let npk = out_pk_cols.len();
     let a_n = left_in.schema.columns.len();
-    let mut proj_layout: Vec<ColId> = ids.placeholders(npk);
+    let mut proj_layout: Vec<ColId> = vec![ColId::NONE; npk];
     proj_layout.extend(left_in.layout.iter().copied());
-    let mut final_cols: Vec<ColumnDef> = out_pk_cols;
-    let mut final_projection: Vec<usize> = Vec::with_capacity(items.len());
-    for item in items {
-        final_projection.push(slot_of_expr(&item.expr, &proj_layout)?);
-        final_cols.push(item.out.def.clone());
-    }
-    let mut sink_input = if is_identity_projection(&final_projection, a_n, npk) {
-        primary
-    } else {
-        cb.map(primary, &final_projection)
-    };
+    let (final_projection, final_cols) = resolve_projection(items, &proj_layout, out_pk_cols)?;
+    let mut sink_input = apply_projection(&mut cb, primary, &final_projection, a_n, npk);
     if shard {
         sink_input = cb.shard(sink_input, &(0..npk).collect::<Vec<_>>());
     }
     cb.sink(sink_input);
     let circuit = cb.build();
     let view_pk: Vec<u32> = (0..npk as u32).collect();
-    let mut layout: Vec<ColId> = ids.placeholders(npk);
-    layout.extend(items.iter().map(|i| i.out.id));
-    Ok(((circuit, final_cols, view_pk), layout))
+    Ok(((circuit, final_cols, view_pk), key_region_layout(npk, items)))
 }
 
 /// Lower a decorrelated `Project(Filter?(Join{Mark}))` to circuit pieces: the
@@ -456,7 +379,6 @@ pub(crate) fn lower_semi_anti_view(
 pub(crate) fn lower_mark_view(
     client: &mut GnitzClient,
     chain: &mut ViewChain,
-    ids: &mut ColIdGen,
     memo: &mut CutMemo,
     items: &[ProjEntry],
     fpreds: &[HirExpr],
@@ -477,7 +399,7 @@ pub(crate) fn lower_mark_view(
         out_pk_cols,
         shard,
         left_in,
-    } = emit_exists_circuit(client, chain, ids, memo, source, &[], items, view_id, true)?;
+    } = emit_exists_circuit(client, chain, memo, source, &[], items, view_id, true)?;
     let unmatched = unmatched.expect("mark core returns an unmatched branch");
 
     let npk = out_pk_cols.len();
@@ -488,31 +410,19 @@ pub(crate) fn lower_mark_view(
         columns: branch_cols,
         pk_cols: (0..npk).collect(),
     };
-    let mut branch_layout: Vec<ColId> = ids.placeholders(npk);
+    let mut branch_layout: Vec<ColId> = vec![ColId::NONE; npk];
     branch_layout.extend(left_in.layout.iter().copied());
 
-    let (m_out, out_cols) = lower_mark_branch(
-        &mut cb,
-        matched,
+    let branch = MarkBranch {
         mark_id,
-        1,
-        fpreds,
+        where_preds: fpreds,
         items,
-        &branch_layout,
-        &branch_schema,
-        &out_pk_cols,
-    )?;
-    let (u_out, _) = lower_mark_branch(
-        &mut cb,
-        unmatched,
-        mark_id,
-        0,
-        fpreds,
-        items,
-        &branch_layout,
-        &branch_schema,
-        &out_pk_cols,
-    )?;
+        layout: &branch_layout,
+        schema: &branch_schema,
+        pk_cols: &out_pk_cols,
+    };
+    let (m_out, out_cols) = branch.emit(&mut cb, matched, 1)?;
+    let (u_out, _) = branch.emit(&mut cb, unmatched, 0)?;
     let mut out = cb.union(m_out, u_out);
     if shard {
         out = cb.shard(out, &(0..npk).collect::<Vec<_>>());
@@ -520,41 +430,46 @@ pub(crate) fn lower_mark_view(
     cb.sink(out);
     let circuit = cb.build();
     let view_pk: Vec<u32> = (0..npk as u32).collect();
-    let mut layout: Vec<ColId> = ids.placeholders(npk);
-    layout.extend(items.iter().map(|i| i.out.id));
-    Ok(((circuit, out_cols, view_pk), layout))
+    Ok(((circuit, out_cols, view_pk), key_region_layout(npk, items)))
 }
 
-/// Emit one mark branch: substitute the mark column by `mark_val`, apply the WHERE
-/// (folds to a true constant → no filter), then map the projection. The leading
-/// PK region is carried verbatim; the map program writes only the payload.
-#[allow(clippy::too_many_arguments)]
-fn lower_mark_branch(
-    cb: &mut CircuitBuilder,
-    node: NodeId,
+/// Everything a mark branch emits from, shared verbatim by the matched and
+/// unmatched branch — only the `0/1` mark constant differs between them.
+struct MarkBranch<'a> {
     mark_id: ColId,
-    mark_val: i64,
-    where_preds: &[HirExpr],
-    items: &[ProjEntry],
-    branch_layout: &[ColId],
-    branch_schema: &Schema,
-    pk_cols: &[ColumnDef],
-) -> Result<(NodeId, Vec<ColumnDef>), GnitzSqlError> {
-    let subst_preds: Vec<HirExpr> = where_preds
-        .iter()
-        .map(|p| subst_mark_lit(p, mark_id, mark_val))
-        .collect();
-    let filtered = emit_filter(cb, node, subst_preds.iter(), branch_layout, &branch_schema.columns)?;
+    where_preds: &'a [HirExpr],
+    items: &'a [ProjEntry],
+    layout: &'a [ColId],
+    schema: &'a Schema,
+    pk_cols: &'a [ColumnDef],
+}
 
-    let mut out_cols: Vec<ColumnDef> = pk_cols.to_vec();
-    let mut proj_items: Vec<ProjItem> = Vec::with_capacity(items.len());
-    for item in items {
-        let subst = subst_mark_lit(&item.expr, mark_id, mark_val);
-        proj_items.push(ProjItem::from_bound(physical::resolve_refs(&subst, branch_layout)?));
-        out_cols.push(item.out.def.clone());
+impl MarkBranch<'_> {
+    /// Emit one branch: substitute the mark column by `mark_val`, apply the WHERE
+    /// (folds to a true constant → no filter), then map the projection. The leading
+    /// PK region is carried verbatim; the map program writes only the payload.
+    fn emit(
+        &self,
+        cb: &mut CircuitBuilder,
+        node: NodeId,
+        mark_val: i64,
+    ) -> Result<(NodeId, Vec<ColumnDef>), GnitzSqlError> {
+        let subst = |e: &HirExpr| subst_mark_lit(e, self.mark_id, mark_val);
+        let subst_preds: Vec<HirExpr> = self.where_preds.iter().map(subst).collect();
+        let filtered = emit_filter(cb, node, subst_preds.iter(), self.layout, &self.schema.columns)?;
+
+        let mut out_cols: Vec<ColumnDef> = self.pk_cols.to_vec();
+        let mut proj_items: Vec<ProjItem> = Vec::with_capacity(self.items.len());
+        for item in self.items {
+            proj_items.push(ProjItem::from_bound(physical::resolve_refs(
+                &subst(&item.expr),
+                self.layout,
+            )?));
+            out_cols.push(item.out.def.clone());
+        }
+        let program = compile_projection_map(&proj_items, self.schema)?;
+        Ok((cb.map_expr(filtered, program), out_cols))
     }
-    let program = compile_projection_map(&proj_items, branch_schema)?;
-    Ok((cb.map_expr(filtered, program), out_cols))
 }
 
 /// Substitute `ColRef(Col(mark_id))` with `LitInt(val)` throughout an expression —

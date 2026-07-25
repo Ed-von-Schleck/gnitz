@@ -30,6 +30,17 @@ def _rows(client, sn, view, keys):
     return sorted(tuple(r._asdict()[k] for k in keys) for r in client.scan(vid) if r.weight > 0)
 
 
+def _weights(client, sn, view, keys):
+    """Net weight per row — the Z-set observable (a wrong multiplicity or a
+    weight-0 ghost is invisible to `_rows` but caught here)."""
+    vid = client.resolve_table(sn, view)[0]
+    acc = {}
+    for r in client.scan(vid):
+        k = tuple(r._asdict()[c] for c in keys)
+        acc[k] = acc.get(k, 0) + r.weight
+    return {k: w for k, w in sorted(acc.items()) if w != 0}
+
+
 def _two_tables(client, sn):
     client.execute_sql("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, total BIGINT NOT NULL)", schema_name=sn)
     client.execute_sql(
@@ -132,20 +143,36 @@ class TestDerivedTable:
         finally:
             _cleanup(client, sn)
 
-    def test_distinct_derived_rejected(self, client):
-        """A DISTINCT-body derived table is rejected. (A JOIN-body derived
-        table IS supported — see test_multiway_join.py.)"""
+    def test_distinct_derived_maintained(self, client):
+        """A DISTINCT-body derived table joined to a table compiles (the CTE/derived
+        HIR commit lifted the plain-SELECT restriction) and stays maintained on
+        weights: the DISTINCT dedups the derived `v` to weight 1, so a `v` matching a
+        `u.id` yields exactly one `dv` row regardless of its multiplicity in `t`."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
             client.execute_sql("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)", schema_name=sn)
             client.execute_sql("CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, w BIGINT NOT NULL)", schema_name=sn)
-            with pytest.raises(Exception) as ei:
-                client.execute_sql(
-                    "CREATE VIEW v AS SELECT d.v AS dv FROM (SELECT DISTINCT v FROM t) d JOIN u ON d.v = u.id",
-                    schema_name=sn,
-                )
-            assert "distinct" in str(ei.value).lower() or "not yet" in str(ei.value).lower(), str(ei.value)
+            client.execute_sql("INSERT INTO u VALUES (10, 100), (20, 200), (30, 300)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 10), (3, 20)", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT d.v AS dv FROM (SELECT DISTINCT v FROM t) d JOIN u ON d.v = u.id",
+                schema_name=sn,
+            )
+            # distinct v = {10, 20}; both match a u.id → dv 10, 20 at weight 1 each.
+            assert _weights(client, sn, "v", ["dv"]) == {(10,): 1, (20,): 1}
+            # A second row with v=10 does not change the DISTINCT output.
+            client.execute_sql("INSERT INTO t VALUES (4, 10)", schema_name=sn)
+            assert _weights(client, sn, "v", ["dv"]) == {(10,): 1, (20,): 1}
+            # A new distinct v=30 matches u.id=30.
+            client.execute_sql("INSERT INTO t VALUES (5, 30)", schema_name=sn)
+            assert _weights(client, sn, "v", ["dv"]) == {(10,): 1, (20,): 1, (30,): 1}
+            # Retract every source of v=10 → dv=10 retracts; v=20/30 stay.
+            client.execute_sql("DELETE FROM t WHERE v = 10", schema_name=sn)
+            assert _weights(client, sn, "v", ["dv"]) == {(20,): 1, (30,): 1}
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+            client.execute_sql("DROP TABLE u", schema_name=sn)
         finally:
             _cleanup(client, sn)
 

@@ -187,11 +187,77 @@ pub(crate) fn projection_has_aggregate(select: &sqlparser::ast::Select) -> bool 
 /// still a grouped shape) — any of its operands.
 fn expr_has_aggregate(e: &sqlparser::ast::Expr) -> bool {
     if let sqlparser::ast::Expr::Function(f) = e {
-        if single_fn_name(f).and_then(agg_func_from_name).is_some() {
+        if is_agg_call(f) {
             return true;
         }
     }
     expr_operands(e).into_iter().any(expr_has_aggregate)
+}
+
+/// Whether a function call names one of the aggregates.
+pub(crate) fn is_agg_call(f: &sqlparser::ast::Function) -> bool {
+    single_fn_name(f).and_then(agg_func_from_name).is_some()
+}
+
+/// Strip redundant parentheses.
+pub(crate) fn peel_nested(e: &sqlparser::ast::Expr) -> &sqlparser::ast::Expr {
+    let mut cur = e;
+    while let sqlparser::ast::Expr::Nested(inner) = cur {
+        cur = inner;
+    }
+    cur
+}
+
+/// Visit every aggregate call in `e`, outermost-first: when `e` is itself one, `f`
+/// runs on it and the walk stops (an aggregate's arguments cannot contain another
+/// aggregate); otherwise every operand is visited. Returns whether `e`'s own top
+/// level was the aggregate — the callers use it to tell "this item *is* an
+/// aggregate" from "it merely contains one".
+///
+/// The one traversal behind both grouped front ends. They must cover the same node
+/// set: an aggregate one reaches and the other misses would bind against a
+/// reduce-output column that was never materialized.
+pub(crate) fn for_each_agg_call<E>(
+    e: &sqlparser::ast::Expr,
+    f: &mut impl FnMut(&sqlparser::ast::Function) -> Result<(), E>,
+) -> Result<bool, E> {
+    let peeled = peel_nested(e);
+    if let sqlparser::ast::Expr::Function(func) = peeled {
+        if is_agg_call(func) {
+            f(func)?;
+            return Ok(true);
+        }
+    }
+    for op in expr_operands(peeled) {
+        for_each_agg_call(op, f)?;
+    }
+    Ok(false)
+}
+
+/// The GROUP BY clause's expression list. Only the plain list form is supported —
+/// `GROUPING SETS` / `CUBE` / `ROLLUP` / `ALL` produce multiple grouping keys per
+/// row, which no reduce shape models.
+pub(crate) fn group_by_exprs(select: &sqlparser::ast::Select) -> Result<&[sqlparser::ast::Expr], GnitzSqlError> {
+    match &select.group_by {
+        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => Ok(exprs),
+        _ => Err(GnitzSqlError::Unsupported(
+            "GROUP BY: only expression list supported".to_string(),
+        )),
+    }
+}
+
+/// The two rejections every grouped SELECT list shares, so the ad-hoc fold path
+/// and the view path cannot word them differently.
+pub(crate) fn reject_ungrouped_column(name: &str) -> GnitzSqlError {
+    GnitzSqlError::Plan(format!(
+        "column '{name}' must appear in GROUP BY or an aggregate function"
+    ))
+}
+
+/// The grouped SELECT list admits only bare group-column references and aggregate
+/// calls; anything computed over them has no reduce-output column.
+pub(crate) fn reject_computed_grouped_item() -> GnitzSqlError {
+    GnitzSqlError::Plan("GROUP BY SELECT: only column refs and aggregates supported".to_string())
 }
 
 /// The direct operand subexpressions of `e` — the node set the structural
@@ -326,48 +392,6 @@ pub(crate) fn classify_from(from: &[sqlparser::ast::TableWithJoins]) -> FromShap
         }
         _ => FromShape::CommaJoin,
     }
-}
-
-/// Collect every column reference in `expr` as `(qualifier, bare_name)` — a
-/// two-part `CompoundIdentifier` yields `(Some(q), c)`, a bare `Identifier` yields
-/// `(None, c)`. Sub-expressions recurse through `expr_operands` (function
-/// arguments included, so an aggregate's argument column is captured), the same
-/// node set the structural binder walks — a node it omits is one the binder
-/// rejects, so under-collection can only reproduce that bind error, never a wrong
-/// result. Subquery and `*`/`tbl.*` nodes contribute no references (the caller
-/// handles a wildcard). The join-chain liveness pre-pass and the hidden-`H`
-/// projection collector share this one walker.
-pub(crate) fn collect_column_refs<'e>(expr: &'e sqlparser::ast::Expr, out: &mut Vec<(Option<&'e str>, &'e str)>) {
-    use sqlparser::ast::Expr;
-    match expr {
-        Expr::Identifier(id) => out.push((None, id.value.as_str())),
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            out.push((Some(parts[0].value.as_str()), parts[1].value.as_str()));
-        }
-        _ => {
-            for sub in expr_operands(expr) {
-                collect_column_refs(sub, out);
-            }
-        }
-    }
-}
-
-/// Collect the column references of every projection item into `out` via
-/// `collect_column_refs`. Returns `false` when any item is a wildcard
-/// (`*` / `tbl.*`) — the caller's everything-is-referenced case, in which `out`
-/// is meaningless and ignored. The join-chain liveness pre-pass and the
-/// hidden-`H` projection collector share this one item walk.
-pub(crate) fn collect_projection_column_refs<'e>(
-    items: &'e [sqlparser::ast::SelectItem],
-    out: &mut Vec<(Option<&'e str>, &'e str)>,
-) -> bool {
-    for item in items {
-        match projection_item_expr(item) {
-            Some(e) => collect_column_refs(e, out),
-            None => return false, // wildcard
-        }
-    }
-    true
 }
 
 /// Flattens an `AND`-tree into its leaf conjuncts, left to right. Descends
@@ -748,6 +772,29 @@ impl<'a> WildcardRewrite<'a> {
         }
         Some(out)
     }
+}
+
+/// Expand one `*` item over `cols` into `(source index, output def)` pairs, in
+/// source order. Hidden columns are skipped — a synthetic view key (`_join_pk`,
+/// `_set_pk`, …) must never re-enter a payload or a row identity through a
+/// wildcard — and `EXCEPT`/`EXCLUDE`/`RENAME` are applied per column while
+/// `REPLACE`/`ILIKE` are rejected. The one wildcard expansion every projection
+/// resolver shares; `ctx` names the surface for the messages.
+pub(crate) fn expand_wildcard_item<'a, I>(
+    item: &SelectItem,
+    cols: I,
+    ctx: &str,
+) -> Result<Vec<(usize, ColumnDef)>, GnitzSqlError>
+where
+    I: IntoIterator<Item = &'a ColumnDef> + Clone,
+{
+    let rw = WildcardRewrite::for_item(item, |n| wildcard_name_is_visible(cols.clone(), n), ctx)?;
+    Ok(cols
+        .into_iter()
+        .enumerate()
+        .filter(|(_, c)| !c.is_hidden)
+        .filter_map(|(i, c)| rw.rewrite_column(c).map(|out| (i, out)))
+        .collect())
 }
 
 /// Whether `name` matches a *visible* (non-hidden) column of `cols`,

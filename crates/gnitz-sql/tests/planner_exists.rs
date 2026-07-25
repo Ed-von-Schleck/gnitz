@@ -382,3 +382,27 @@ fn test_exists_accepts_promotion_and_compound_keys() {
         "compound-key EXISTS should register"
     );
 }
+
+/// A computed projection over an EXISTS filter view. The semi-join emit projects
+/// only column references, so the lowering cuts it to a hidden segment and computes
+/// over it — the one fusion rule, rather than a per-join-kind rejection.
+#[test]
+fn test_computed_projection_over_semi_join() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+
+    p.execute("CREATE TABLE cps_a (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, v BIGINT NOT NULL)")
+        .unwrap();
+    p.execute("CREATE TABLE cps_b (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL)")
+        .unwrap();
+
+    let r = p.execute(
+        "CREATE VIEW cps_v AS SELECT v * 2 AS d FROM cps_a \
+         WHERE EXISTS (SELECT 1 FROM cps_b WHERE cps_b.fk = cps_a.fk)",
+    );
+    assert!(r.is_ok(), "computed projection over a semi-join failed: {:?}", r.err());
+}

@@ -151,34 +151,50 @@ pub(crate) fn reject_column_overflow(what: &str, cols: usize) -> Result<(), Gnit
     Ok(())
 }
 
-/// The `Select` clauses a view shape legitimately consumes, beyond the universal
-/// `from` + `projection`. Passed to [`reject_unhonored_select_clauses`]; every
-/// clause not named here (and not honored unconditionally) is rejected.
+/// The `Select` clauses a shape legitimately consumes, beyond the universal
+/// `from` + `projection` + `WHERE` (every surface binds a top-level WHERE).
+/// Passed to [`reject_unhonored_select_clauses`]; every clause not named here
+/// (and not honored unconditionally) is rejected.
 #[derive(Clone, Copy)]
 pub(crate) struct HonoredClauses {
-    /// A top-level `WHERE` filter. Honored by every shape except the join
-    /// builder, which consumes only the `ON` predicate — a join-view `WHERE` has
-    /// no builder and would be dropped.
-    pub where_filter: bool,
-    /// `GROUP BY` and its `HAVING`. Honored only by the grouped-aggregate builder.
+    /// `GROUP BY` and its `HAVING`. Honored only by the grouped-aggregate path.
     pub grouping: bool,
-    /// Plain `DISTINCT`. Honored only by the DISTINCT-view builder (which dedups
-    /// after this returns); every other site passes `false`. `DISTINCT ON` is
-    /// always rejected, independent of this flag.
+    /// Plain `DISTINCT`. Honored only by the DISTINCT path (which dedups after
+    /// this returns). `DISTINCT ON` is always rejected, independent of this flag.
     pub distinct: bool,
 }
 
-/// Reject any `Select` clause a view builder does not consume. Each CREATE VIEW
-/// builder reads a hand-picked subset of the parsed `Select`; without this guard
-/// every unread clause (PREWHERE, TOP, QUALIFY, a join-view WHERE, …) is silently
-/// dropped, turning the view the caller wrote into a different one that runs and
-/// returns rows — a silent wrong result. `honored` names the clauses *this* shape
-/// consumes; `context` names the surface for the message.
+impl HonoredClauses {
+    /// A shape consuming neither GROUP BY nor DISTINCT: a subquery body, a CTE
+    /// pass-through alias, a plain ungrouped SELECT.
+    pub(crate) const PLAIN: HonoredClauses = HonoredClauses {
+        grouping: false,
+        distinct: false,
+    };
+
+    /// The grouped-vs-DISTINCT split every SELECT-bodied surface makes, in one
+    /// home: GROUP BY is honored only on the grouped, **non**-DISTINCT path, so a
+    /// `SELECT DISTINCT … GROUP BY` body keeps the pinned "GROUP BY is not
+    /// supported" rejection — DISTINCT wins the routing split and its builder does
+    /// not group.
+    pub(crate) fn for_body(grouped: bool, distinct: bool) -> Self {
+        HonoredClauses {
+            grouping: grouped && !distinct,
+            distinct,
+        }
+    }
+}
+
+/// Reject any `Select` clause the surface behind it does not consume. Each reads a
+/// hand-picked subset of the parsed `Select`; without this guard every unread
+/// clause (PREWHERE, TOP, QUALIFY, …) is silently dropped, turning the query the
+/// caller wrote into a different one that runs and returns rows — a silent wrong
+/// result. `honored` names the clauses *this* shape consumes; `context` names the
+/// surface for the message.
 ///
 /// `DISTINCT` is gated by [`HonoredClauses::distinct`]: `DISTINCT ON` is always
 /// rejected (non-deterministic without an ORDER BY views forbid), while plain
-/// `DISTINCT` is rejected unless the caller honors it — only the DISTINCT-view
-/// builder does (it dedups after this returns); every other site passes `false`.
+/// `DISTINCT` is rejected unless the caller honors it.
 ///
 /// The match is an exhaustive destructure with no `..`: when a future
 /// `sqlparser` bump adds a `Select` field, this stops compiling until the new
@@ -194,8 +210,9 @@ pub(crate) fn reject_unhonored_select_clauses(
         // Read by every view builder.
         from: _,
         projection: _,
+        // Read by every surface — a top-level WHERE always binds.
+        selection: _,
         // Conditionally honored (see `HonoredClauses`); `distinct` handled below.
-        selection,
         distinct,
         group_by,
         having,
@@ -235,9 +252,6 @@ pub(crate) fn reject_unhonored_select_clauses(
     }
     if !honored.distinct && matches!(distinct, Some(Distinct::Distinct)) {
         return Err(reject("DISTINCT"));
-    }
-    if !honored.where_filter && selection.is_some() {
-        return Err(reject("WHERE"));
     }
     if !honored.grouping && crate::ast_util::group_by_is_present(group_by) {
         return Err(reject("GROUP BY"));
@@ -286,7 +300,7 @@ pub(crate) fn reject_unhonored_select_clauses(
 /// than a silent wrong result.
 #[derive(Clone, Copy)]
 pub(crate) struct HonoredQueryClauses {
-    /// A `WITH` (CTE) clause. Honored by CREATE VIEW (`inline_ctes`) and by
+    /// A `WITH` (CTE) clause. Honored by CREATE VIEW (the `bind_ctes` phase) and by
     /// direct SELECT (`cte_passthrough` aliases each pass-through CTE into the
     /// binder cache, so a FROM name a CTE shadows resolves to the CTE's source;
     /// a non-pass-through CTE rejects the whole query as a derivation). A CTE
@@ -371,16 +385,26 @@ pub(crate) fn reject_unhonored_query_clauses(
     Ok(())
 }
 
+/// Reject a sub-`Query`'s whole envelope (no honored clause) and return its body
+/// `SetExpr` — the shared front step of every narrowing site that consumes a
+/// nested query and accepts any relational body (a CTE body, a derived table).
+/// `plain_select_body` layers the "must be a plain SELECT" gate on top, for the
+/// sites that still require it (an EXISTS/IN or scalar subquery inner).
+pub(crate) fn reject_query_envelope_body<'a>(
+    q: &'a sqlparser::ast::Query,
+    ctx: &str,
+) -> Result<&'a sqlparser::ast::SetExpr, GnitzSqlError> {
+    reject_unhonored_query_clauses(q, HonoredQueryClauses::NONE, ctx)?;
+    Ok(q.body.as_ref())
+}
+
 /// Reject a sub-`Query`'s whole envelope (no honored clause) and unwrap its
-/// body to the plain `Select` it must be — the shared front step of every
-/// narrowing site that consumes a nested query (a CTE body, a derived table,
-/// an EXISTS/IN or scalar subquery). `ctx` names the surface for both messages.
+/// body to the plain `Select` it must be. `ctx` names the surface for both messages.
 pub(crate) fn plain_select_body<'a>(
     q: &'a sqlparser::ast::Query,
     ctx: &str,
 ) -> Result<&'a sqlparser::ast::Select, GnitzSqlError> {
-    reject_unhonored_query_clauses(q, HonoredQueryClauses::NONE, ctx)?;
-    match q.body.as_ref() {
+    match reject_query_envelope_body(q, ctx)? {
         sqlparser::ast::SetExpr::Select(s) => Ok(s.as_ref()),
         _ => Err(GnitzSqlError::Unsupported(format!(
             "{ctx}: only a plain SELECT body is supported"
@@ -390,8 +414,8 @@ pub(crate) fn plain_select_body<'a>(
 
 /// The CTE list of a query with the one universal precondition applied —
 /// `WITH RECURSIVE` has no builder on any path. An absent `WITH` is the empty
-/// list. The shared entry of the two CTE inliners (CREATE VIEW's `inline_ctes`
-/// and the direct-SELECT read route).
+/// list. The shared entry of the two CTE consumers (CREATE VIEW's `bind_ctes`
+/// phase and the direct-SELECT read route).
 pub(crate) fn non_recursive_ctes(query: &sqlparser::ast::Query) -> Result<&[sqlparser::ast::Cte], GnitzSqlError> {
     let Some(with) = &query.with else {
         return Ok(&[]);
@@ -404,8 +428,9 @@ pub(crate) fn non_recursive_ctes(query: &sqlparser::ast::Query) -> Result<&[sqlp
     Ok(&with.cte_tables)
 }
 
-/// Unwrap one CTE to its plain `Select` body — the shared front step of the two
-/// CTE inliners (CREATE VIEW's `inline_ctes` and the direct-SELECT read route).
+/// Unwrap one CTE to its plain `Select` body — the front step of the ad-hoc
+/// direct-SELECT read route (the CREATE VIEW CTE phase uses `cte_body`, which
+/// accepts any relational body).
 /// Exhaustively destructures the `Cte` envelope so a future `sqlparser` field
 /// cannot be silently dropped (`materialized` parses only under
 /// PostgreSqlDialect — always `None` here), rejects the `Query`-envelope clauses
@@ -415,6 +440,23 @@ pub(crate) fn cte_select_body<'a>(
     cte: &'a sqlparser::ast::Cte,
     ctx: &str,
 ) -> Result<&'a sqlparser::ast::Select, GnitzSqlError> {
+    match cte_body(cte, ctx)? {
+        sqlparser::ast::SetExpr::Select(s) => Ok(s.as_ref()),
+        _ => Err(GnitzSqlError::Unsupported(format!(
+            "{ctx}: only a plain SELECT body is supported"
+        ))),
+    }
+}
+
+/// Reject a CTE's envelope (a trailing FROM plus every unhonored `Query` clause)
+/// and return its body `SetExpr` — the front step of the CREATE VIEW CTE phase,
+/// which binds any relational body (a set operation, a grouped or join body, a
+/// nested derived table). `cte_select_body` layers the plain-SELECT gate on top
+/// for the ad-hoc read route, which supports only single-relation CTE bodies.
+pub(crate) fn cte_body<'a>(
+    cte: &'a sqlparser::ast::Cte,
+    ctx: &str,
+) -> Result<&'a sqlparser::ast::SetExpr, GnitzSqlError> {
     let sqlparser::ast::Cte {
         alias: _,
         query,
@@ -425,7 +467,7 @@ pub(crate) fn cte_select_body<'a>(
     if from.is_some() {
         return Err(unsupported_clause(ctx, "a trailing FROM"));
     }
-    plain_select_body(query, ctx)
+    reject_query_envelope_body(query, ctx)
 }
 
 /// Reject every `Insert`-statement clause the INSERT planner does not consume. `extract_insert_parts`

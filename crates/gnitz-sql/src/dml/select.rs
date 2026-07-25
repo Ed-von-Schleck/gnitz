@@ -20,19 +20,20 @@ use crate::ast_util::{
     body_is_grouped, classify_from, extract_table_factor_name, has_exists_in_subquery, has_scalar_subquery,
     is_bare_wildcard_projection, FromShape,
 };
+use crate::bind::cte_passthrough;
 use crate::bind::{bind_single_table, Binder};
 use crate::codec::project_schema::{build_read_projection, compile_projection_map};
+use crate::dml::group_by::{analyze_group_by, bind_having_expr, resolve_set_projection, HavingCtx};
 use crate::dml::plan::{extract_limit, extract_offset};
 use crate::error::GnitzSqlError;
 use crate::exec::agg_finish::{agg_finish, build_agg_out_schema, having_supported, AggFinish};
 use crate::exec::order::{order_limit_passthrough, read_spec_finish, resolve_read_spec_order};
 use crate::ir::{find_wide_literal, wide_int_error, BinOp, BoundExpr};
 use crate::lower::compile_filter_program;
-use crate::plan::validate::{
+use crate::validate::{
     cte_select_body, non_recursive_ctes, reject_unhonored_query_clauses, reject_unhonored_select_clauses,
     HonoredClauses, HonoredQueryClauses,
 };
-use crate::plan::{analyze_group_by, bind_having_expr, cte_passthrough, resolve_set_projection, HavingCtx};
 use crate::SqlResult;
 use gnitz_core::protocol::encode_schema_block;
 use gnitz_core::{GnitzClient, ReduceOutKey, Schema, ZSetBatch, MAX_COLUMNS};
@@ -179,15 +180,7 @@ pub(crate) fn execute_select(
         // Clauses CREATE VIEW cannot serve on a CTE either (DISTINCT, the exotic
         // tail: PREWHERE, TOP, QUALIFY, …) keep their targeted error — the
         // derivation template's CREATE VIEW advice would be false for them.
-        reject_unhonored_select_clauses(
-            cte_select,
-            HonoredClauses {
-                where_filter: true,
-                grouping: true,
-                distinct: false,
-            },
-            &ctx,
-        )?;
+        reject_unhonored_select_clauses(cte_select, HonoredClauses::for_body(true, false), &ctx)?;
         // A WHERE'd / grouped / aggregated CTE derives a new relation, and a
         // view genuinely serves it (as a hidden segment) — so does any
         // non-pass-through body `cte_passthrough` refuses (a joined / derived
@@ -244,15 +237,7 @@ pub(crate) fn execute_select(
 
     // Body-clause guard: WHERE and the projection are honored; DISTINCT / grouping
     // routed above; the exotic tail (PREWHERE, TOP, QUALIFY, …) rejects here.
-    reject_unhonored_select_clauses(
-        select,
-        HonoredClauses {
-            where_filter: true,
-            grouping: false,
-            distinct: false,
-        },
-        "direct SELECT",
-    )?;
+    reject_unhonored_select_clauses(select, HonoredClauses::PLAIN, "direct SELECT")?;
 
     let limit = extract_limit(query)?;
     let offset = extract_offset(query)?;
@@ -414,11 +399,7 @@ fn execute_aggregate_select(
     // unconditional PREWHERE/TOP/QUALIFY/DISTINCT-ON rejection is preserved.
     reject_unhonored_select_clauses(
         select,
-        HonoredClauses {
-            where_filter: true,
-            grouping: !is_distinct,
-            distinct: is_distinct,
-        },
+        HonoredClauses::for_body(true, is_distinct),
         if is_distinct {
             "SELECT DISTINCT"
         } else {

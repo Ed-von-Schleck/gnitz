@@ -3,20 +3,21 @@
 //! HIR `Reduce` node, and drives the shared `crate::agg` primitives — the
 //! strategy selection (`emit_reduce`), the reduce-output layout
 //! (`reduce_output_schema`, `group_col_reduce_pos`), and the spec decomposition
-//! (`push_agg_specs`) — which it shares verbatim with the AST view path.
+//! (`push_agg_specs`) — which it shares with the ad-hoc SELECT / GROUP BY
+//! aggregate path (`dml::group_by`, `exec::agg_finish`).
 
 use super::super::physical;
-use super::super::{slot_of, ColId, ColIdGen, HirExpr, HirRef, ProjEntry, RelExpr};
+use super::super::{slot_of, ColId, HirExpr, HirRef, ProjEntry, RelExpr};
 use super::{cut_segment, emit_filter, extract_scan_bound, seginput_of_get, split_filter, CutMemo};
 use crate::agg::{
     emit_reduce, ensure_cardinality_count, group_col_reduce_pos, push_agg_specs, reduce_output_schema, AggSpec,
     ReduceShape,
 };
 use crate::error::GnitzSqlError;
+use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::ir::{BExpr, BoundExpr};
 use crate::lower::{compile_bound_expr, compile_filter_program};
-use crate::plan::validate::reject_duplicate_column_names;
-use crate::plan::view::{EmitPieces, ViewChain};
+use crate::validate::reject_duplicate_column_names;
 use gnitz_core::{CircuitBuilder, ColumnDef, ExprBuilder, GnitzClient, ReduceOutKey};
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -29,7 +30,6 @@ use std::rc::Rc;
 pub(crate) fn lower_reduce(
     client: &mut GnitzClient,
     chain: &mut ViewChain,
-    ids: &mut ColIdGen,
     memo: &mut CutMemo,
     items: &[ProjEntry],
     having_preds: &[HirExpr],
@@ -62,7 +62,7 @@ pub(crate) fn lower_reduce(
             let mut live: HashSet<ColId> = HashSet::new();
             live.extend(group_cols.iter().copied());
             live.extend(aggs.iter().filter_map(|a| a.arg));
-            let seg = cut_segment(client, chain, ids, memo, input, &live)?;
+            let seg = cut_segment(client, chain, memo, input, &live)?;
             let layout = seg.layout.clone();
             (seg, layout, None, None)
         }
@@ -116,8 +116,8 @@ pub(crate) fn lower_reduce(
 
     // Reduce output layout: `ColId` at each physical slot. Slots with no logical
     // identity — the synthetic `_group_pk` and the trailing cardinality COUNT —
-    // keep their placeholder id, which nothing can reference.
-    let mut reduce_layout: Vec<ColId> = ids.placeholders(reduce_schema.columns.len());
+    // stay `ColId::NONE`, which nothing can reference.
+    let mut reduce_layout: Vec<ColId> = vec![ColId::NONE; reduce_schema.columns.len()];
     for (j, &gid) in group_cols.iter().enumerate() {
         reduce_layout[group_reduce_pos[j]] = gid;
     }

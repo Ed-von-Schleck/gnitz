@@ -7,14 +7,13 @@
 //! set identity is materialized before it is hashed. The shared source-collision
 //! rule then wraps a repeated relation (`t EXCEPT t`) in a pass-through segment.
 
-use super::super::{slot_of, ColId, ColIdGen, HirCol, RelExpr, SetOpKind};
+use super::super::{slot_of, ColId, HirCol, RelExpr, SetOpKind};
 use super::{cut_segment, emit_filter, resolve_collisions, resolve_input, CutMemo, SegInput};
 use crate::error::GnitzSqlError;
+use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::hir::physical;
 use crate::ir::{BExpr, BoundExpr};
-use crate::plan::validate::{reject_duplicate_column_names, reject_float_key};
-use crate::plan::view::set_op::{hash_shard_side, set_op_leaves};
-use crate::plan::view::{EmitPieces, ViewChain};
+use crate::validate::{reject_duplicate_column_names, reject_float_key};
 use gnitz_core::{CircuitBuilder, ColumnDef, GnitzClient, NodeId, TypeCode};
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -23,7 +22,6 @@ use std::rc::Rc;
 pub(crate) fn lower_setop(
     client: &mut GnitzClient,
     chain: &mut ViewChain,
-    ids: &mut ColIdGen,
     memo: &mut CutMemo,
     setop: &RelExpr,
     view_id: u64,
@@ -73,7 +71,6 @@ pub(crate) fn lower_setop(
         &mut cb,
         client,
         chain,
-        ids,
         memo,
         [left, right],
         &side_ids,
@@ -105,7 +102,7 @@ pub(crate) fn lower_setop(
         }
     };
     cb.sink(out_node);
-    hashed_out(cb, ids, "_set_pk", out.iter().map(|c| &c.out), "set operation view")
+    hashed_out(cb, "_set_pk", out.iter().map(|c| &c.out), "set operation view")
 }
 
 /// Lower a `SELECT DISTINCT` body (`Distinct(Project(...))`) — dedup over the
@@ -113,7 +110,6 @@ pub(crate) fn lower_setop(
 pub(crate) fn lower_distinct(
     client: &mut GnitzClient,
     chain: &mut ViewChain,
-    ids: &mut ColIdGen,
     memo: &mut CutMemo,
     input: &Rc<RelExpr>,
     view_id: u64,
@@ -125,11 +121,12 @@ pub(crate) fn lower_distinct(
     }
     let side_ids: Vec<ColId> = side_cols.iter().map(|c| c.id).collect();
     let mut cb = CircuitBuilder::new(view_id, 0);
-    let (node, slots) = lower_set_side(&mut cb, client, chain, ids, memo, input, &side_ids)?;
+    let seg = resolve_set_input(client, chain, memo, input, &side_ids)?;
+    let (node, slots) = emit_side(&mut cb, &seg, input, &side_ids)?;
     let sharded = hash_shard_side(&mut cb, node, &slots, &[], 0);
     let distinct_node = cb.distinct(sharded);
     cb.sink(distinct_node);
-    hashed_out(cb, ids, "_distinct_pk", side_cols.iter(), "SELECT DISTINCT view")
+    hashed_out(cb, "_distinct_pk", side_cols.iter(), "SELECT DISTINCT view")
 }
 
 /// Finish a content-hashed body: build the circuit and pair the synthetic hidden
@@ -137,7 +134,6 @@ pub(crate) fn lower_distinct(
 /// output `ColId` layout. One home for the `_set_pk` / `_distinct_pk` convention.
 fn hashed_out<'a>(
     cb: CircuitBuilder,
-    ids: &mut ColIdGen,
     pk_name: &str,
     cols: impl Iterator<Item = &'a HirCol>,
     dup_ctx: &str,
@@ -145,7 +141,7 @@ fn hashed_out<'a>(
     let circuit = cb.build();
     let (mut out_cols, mut layout) = (
         vec![ColumnDef::new(pk_name, TypeCode::U128, false).hidden()],
-        vec![ids.next()],
+        vec![ColId::NONE],
     );
     for c in cols {
         out_cols.push(c.def.clone());
@@ -163,17 +159,16 @@ fn lower_sides(
     cb: &mut CircuitBuilder,
     client: &mut GnitzClient,
     chain: &mut ViewChain,
-    ids: &mut ColIdGen,
     memo: &mut CutMemo,
     sides: [&Rc<RelExpr>; 2],
     side_ids: &[Vec<ColId>; 2],
     exempt: bool,
 ) -> Result<(NodeId, Vec<usize>, NodeId, Vec<usize>), GnitzSqlError> {
     let mut inputs = [
-        resolve_set_input(client, chain, ids, memo, sides[0], &side_ids[0])?,
-        resolve_set_input(client, chain, ids, memo, sides[1], &side_ids[1])?,
+        resolve_set_input(client, chain, memo, sides[0], &side_ids[0])?,
+        resolve_set_input(client, chain, memo, sides[1], &side_ids[1])?,
     ];
-    resolve_collisions(client, chain, ids, &mut inputs, &sides, exempt)?;
+    resolve_collisions(client, chain, &mut inputs, &sides, exempt)?;
     let [l, r] = inputs;
     let (l_node, l_slots) = emit_side(cb, &l, sides[0], &side_ids[0])?;
     let (r_node, r_slots) = emit_side(cb, &r, sides[1], &side_ids[1])?;
@@ -187,16 +182,15 @@ fn lower_sides(
 fn resolve_set_input(
     client: &mut GnitzClient,
     chain: &mut ViewChain,
-    ids: &mut ColIdGen,
     memo: &mut CutMemo,
     side: &Rc<RelExpr>,
     side_ids: &[ColId],
 ) -> Result<SegInput, GnitzSqlError> {
     if let Some(get) = passthrough_get(side) {
-        return resolve_input(client, chain, ids, memo, get, &side_ids.iter().copied().collect());
+        return resolve_input(client, chain, memo, get, &side_ids.iter().copied().collect());
     }
     let live: HashSet<ColId> = side_ids.iter().copied().collect();
-    cut_segment(client, chain, ids, memo, side, &live)
+    cut_segment(client, chain, memo, side, &live)
 }
 
 /// The base `Get` of a pure pass-through side (`Project(Filter?(Get))` whose every
@@ -259,17 +253,42 @@ fn emit_side(
     Ok((node, slots))
 }
 
-/// Lower a DISTINCT input to a `(node, slots)` pair — the single-side form of
-/// [`lower_sides`] (DISTINCT has no second side and so no collision to resolve).
-fn lower_set_side(
+/// Hash the projected columns to a synthetic content PK — widening
+/// each column whose `target_tcs` entry is non-zero into the promoted layout so
+/// both set-op sides share one physical representation — then shard by that PK.
+fn hash_shard_side(
     cb: &mut CircuitBuilder,
-    client: &mut GnitzClient,
-    chain: &mut ViewChain,
-    ids: &mut ColIdGen,
-    memo: &mut CutMemo,
-    side: &Rc<RelExpr>,
-    side_ids: &[ColId],
-) -> Result<(NodeId, Vec<usize>), GnitzSqlError> {
-    let seg = resolve_set_input(client, chain, ids, memo, side, side_ids)?;
-    emit_side(cb, &seg, side, side_ids)
+    filtered: gnitz_core::NodeId,
+    proj_indices: &[usize],
+    target_tcs: &[u8],
+    branch_id: u8,
+) -> gnitz_core::NodeId {
+    // Reindex by a hash of the projected columns, so set membership
+    // (EXCEPT/INTERSECT/UNION-distinct) is decided by the projected row content,
+    // not by the source table's PK: two rows from different tables sharing a PK
+    // but differing in payload must not match.
+    let reindexed = cb.map_hash_row(filtered, proj_indices, target_tcs, branch_id);
+    // Repartition by the synthetic hash PK (column 0) so that under
+    // multiple workers each row lands on the worker that owns its new PK's
+    // shard, co-locating matching rows for the downstream set arithmetic and
+    // placing each output row on its owning worker for the sink/scan. The hash
+    // is computed in-circuit, so the master cannot pre-shard the source by it;
+    // this in-circuit exchange is mandatory. Single-worker mode elides the IPC.
+    cb.shard(reindexed, &[0])
+}
+
+/// The two leaf nodes feeding an INTERSECT/EXCEPT weight-clamp arm. The distinct
+/// form clamps each side to {0,1} via `distinct` so the arithmetic is set-valued;
+/// `all` keeps the raw per-row bag counts.
+fn set_op_leaves(
+    cb: &mut CircuitBuilder,
+    all: bool,
+    left: gnitz_core::NodeId,
+    right: gnitz_core::NodeId,
+) -> (gnitz_core::NodeId, gnitz_core::NodeId) {
+    if all {
+        (left, right)
+    } else {
+        (cb.distinct(left), cb.distinct(right))
+    }
 }

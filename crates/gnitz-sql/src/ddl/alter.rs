@@ -1,13 +1,13 @@
 //! `ALTER TABLE` operation dispatch: rename table/view/column, ADD/DROP
 //! CONSTRAINT (mapped to the CREATE/DROP INDEX paths), and clean rejections for
 //! every operation not yet supported. `ALTER VIEW … AS` lives in
-//! `plan/view/dispatch.rs` (it recompiles a query). Every supported op is one
+//! `crate::hir::create` (it recompiles a query). Every supported op is one
 //! catalog-only `push_ddl` through the `gnitz-core` client.
 
 use crate::ast_util::extract_name;
 use crate::bind::{find_unique_column, Binder};
 use crate::error::GnitzSqlError;
-use crate::plan::validate::{reject_unhonored_unique_fields, validate_user_index_name, validate_user_name};
+use crate::validate::{reject_unhonored_unique_fields, validate_user_index_name, validate_user_name};
 use crate::SqlResult;
 use gnitz_core::GnitzClient;
 use sqlparser::ast::{
@@ -303,7 +303,7 @@ fn add_constraint(
     // `u.name` (the CONSTRAINT name) becomes the created index's name; `None`
     // auto-generates one (`create_index_core` via default_index_name).
     let explicit_name = u.name.as_ref().map(|n| n.value.clone());
-    super::ddl::create_index_core(
+    super::table::create_index_core(
         client,
         schema_name,
         binder,

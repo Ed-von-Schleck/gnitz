@@ -1,21 +1,23 @@
-//! The filter/map linear segment emitter: an optional WHERE filter plus a
-//! projection (pure column reorder/subset, or an expr-map when the projection
-//! derives or duplicates a PK column). Consumes the `Project(Filter?(Source))`
-//! IR that `lp::lower_linear` produces; the front-end (clause rejection,
-//! resolution, binding) lives in lowering.
+//! The linear segment emitter: an optional WHERE filter plus a projection (pure
+//! column reorder/subset, or an expr-map when the projection derives or duplicates
+//! a PK column). `lower::lower_linear` resolves the HIR to the physical inputs
+//! (source, scan bound, folded predicate, physicalized projection) and hands them
+//! here; this module owns only the `CircuitBuilder` call sequence and the
+//! backfill-seeding shard decision.
 
+use super::physical::PhysProjection;
+use super::SegInput;
 use crate::codec::project_schema::{compile_projection_map, ProjItem};
 use crate::error::GnitzSqlError;
+use crate::hir::chain::{EmitPieces, ViewChain};
+use crate::ir::BoundExpr;
 use crate::lower::compile_filter_program;
-use crate::plan::lp::Rel;
-use crate::plan::view::{EmitPieces, ViewChain};
 use gnitz_core::CircuitBuilder;
+use gnitz_wire::ScanBound;
 
-/// Emit a linear segment's circuit from its lowered `Rel`, deciding the
-/// backfill-seeding shard from the chain. Returns
-/// `(circuit, output_columns, pk_cols)`; the view's physical PK is the leading
-/// `k` source-PK columns (`pk_cols == 0..k`). `view_id` is the segment's
-/// allocated id (pre-allocated so a chain's downstream segment can reference it).
+/// Emit a linear segment's circuit for `view_id` from its resolved physical
+/// inputs. Returns `(circuit, output_columns, pk_cols)`; the view's physical PK is
+/// the leading `k = proj.pk_arity` source-PK columns (`pk_cols == 0..k`).
 ///
 /// The seeding rule, in its one home: a plain filter/map over a *base* table is
 /// backfilled inline from committed data; but a linear view whose source is an
@@ -28,35 +30,18 @@ use gnitz_core::CircuitBuilder;
 /// the view's own PK is appended (its source already partitions by this PK, so
 /// no row moves), solely to route the view through the ordered distributed
 /// backfill.
-pub(crate) fn emit_linear(chain: &ViewChain, view_id: u64, rel: Rel) -> Result<EmitPieces, GnitzSqlError> {
-    let shard = chain.segment_seeds_backfill(rel.source_tid());
-    emit_linear_opts(view_id, rel, shard)
-}
-
-fn emit_linear_opts(view_id: u64, rel: Rel, shard: bool) -> Result<EmitPieces, GnitzSqlError> {
-    // A lowered linear view is rooted at a Project (lowering appends one
-    // unconditionally), over an optional Filter, over one Source.
-    let Rel::Project {
-        input,
-        items,
-        out_cols,
-        pk_arity: k,
-    } = rel
-    else {
-        unreachable!("a lowered linear view is rooted at a Project");
-    };
-    let (filter, src) = match *input {
-        Rel::Filter { input, pred } => (Some(pred), *input),
-        other => (None, other),
-    };
-    let Rel::Source {
-        tid: source_tid,
-        schema: source_schema,
-        bound,
-    } = src
-    else {
-        unreachable!("a lowered linear view terminates in one Source");
-    };
+pub(super) fn emit_linear(
+    chain: &ViewChain,
+    view_id: u64,
+    src: &SegInput,
+    bound: Option<ScanBound>,
+    filter: Option<BoundExpr>,
+    proj: &PhysProjection,
+) -> Result<EmitPieces, GnitzSqlError> {
+    let shard = chain.segment_seeds_backfill(src.tid);
+    let source_schema = &src.schema;
+    let items = &proj.items;
+    let k = proj.pk_arity;
 
     // Filter program (if any), compiled against the source schema. A predicate
     // that bound to a true constant compiles to no filter at all.
@@ -76,7 +61,7 @@ fn emit_linear_opts(view_id: u64, rel: Rel, shard: bool) -> Result<EmitPieces, G
         ProjItem::PassThrough { src_col } => source_schema.is_pk_col(*src_col),
     });
 
-    let mut cb = CircuitBuilder::new(view_id, source_tid);
+    let mut cb = CircuitBuilder::new(view_id, src.tid);
     // The `Filter` below is emitted verbatim whether or not a bound rode in: the
     // bound narrows the backfill scan, never the predicate.
     let inp = cb.input_delta_bounded(bound);
@@ -89,7 +74,7 @@ fn emit_linear_opts(view_id: u64, rel: Rel, shard: bool) -> Result<EmitPieces, G
         // Emit only the payload slots (k..); the k physical PK columns are carried
         // by commit_row and must not appear in the program. payload_idx is the
         // dense output payload position, matching out_cols[k + payload_idx].
-        let program = compile_projection_map(&items[k..], &source_schema)?;
+        let program = compile_projection_map(&items[k..], source_schema)?;
         cb.map_expr(filtered, program)
     } else if items.len() < source_schema.columns.len()
         || items.iter().enumerate().any(|(i, item)| match item {
@@ -129,5 +114,5 @@ fn emit_linear_opts(view_id: u64, rel: Rel, shard: bool) -> Result<EmitPieces, G
     // The view's physical PK is the leading k columns (the source PK passed
     // through in pk_indices() order).
     let view_pk: Vec<u32> = (0..k as u32).collect();
-    Ok((circuit, out_cols, view_pk))
+    Ok((circuit, proj.out_cols.clone(), view_pk))
 }

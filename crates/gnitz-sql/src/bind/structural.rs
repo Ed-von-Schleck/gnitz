@@ -43,14 +43,21 @@ pub(crate) trait LeafBinder<R = usize> {
     /// overrides this to record/bind the subquery for decorrelation; every other
     /// context (DML, HAVING, ad-hoc reads) keeps the per-kind placement rejection.
     fn bind_subquery(&self, e: &Expr) -> Result<BExpr<R>, GnitzSqlError> {
-        Err(GnitzSqlError::Unsupported(match e {
-            Expr::Subquery(_) => "scalar subqueries are not supported".into(),
-            Expr::AnyOp { .. } | Expr::AllOp { .. } => "ANY/SOME/ALL subquery comparisons are not supported".into(),
-            _ => "[NOT] EXISTS/IN (SELECT …) is only supported in a single-table CREATE VIEW \
-                  (in the WHERE clause or the SELECT list)"
-                .into(),
-        }))
+        Err(unsupported_subquery(e))
     }
+}
+
+/// The per-kind "no subquery here" rejection — the [`LeafBinder::bind_subquery`]
+/// default, and what a leaf that overrides the method for *some* shapes falls back
+/// to for the rest.
+pub(crate) fn unsupported_subquery(e: &Expr) -> GnitzSqlError {
+    GnitzSqlError::Unsupported(match e {
+        Expr::Subquery(_) => "scalar subqueries are not supported".into(),
+        Expr::AnyOp { .. } | Expr::AllOp { .. } => "ANY/SOME/ALL subquery comparisons are not supported".into(),
+        _ => "[NOT] EXISTS/IN (SELECT …) is only supported in a single-table CREATE VIEW \
+              (in the WHERE clause or the SELECT list)"
+            .into(),
+    })
 }
 
 /// The one structural recursion. Needs no schema — every schema-aware decision

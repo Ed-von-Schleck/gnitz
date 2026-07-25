@@ -1,18 +1,18 @@
-//! The execute side: the four DML verbs (INSERT, SELECT, UPDATE, DELETE) over the
-//! shared WHERE access-path planning in `plan`. UPDATE and DELETE share `mutate`;
-//! INSERT and SELECT get their own module. Each verb issues `GnitzClient`
-//! RPCs and reshapes the reply client-side through the `exec`/`codec` layers.
-//! `dml` is a peer of `plan/` (the compile side): it consumes only what
-//! `plan/mod.rs` deliberately exposes — the shared validation/access-path
-//! leaves (`validate`, `index_bound`) and the re-exported single-relation
-//! aggregate analysis the fold path shares with the view compiler — never a
-//! view emitter directly.
+//! The execute side: the four DML verbs (INSERT, SELECT, UPDATE, DELETE). UPDATE
+//! and DELETE share `mutate`; INSERT and SELECT get their own module. Each verb
+//! issues `GnitzClient` RPCs and reshapes the reply client-side through the
+//! `exec`/`codec` layers. `dml` is a peer of `ddl/` (the DDL side): it consumes
+//! only the shared validation leaves (`crate::validate`) and the access-path
+//! recognizers (`crate::access`); its own single-relation aggregate / DISTINCT
+//! analysis for the fold path lives in `dml::group_by`, and pass-through-CTE
+//! inlining reuses `bind::cte_passthrough` — never a view emitter directly.
 //!
 //! Transactions need no special casing here. The client buffers every write while
 //! one is open, so the verbs just write; and they resolve UPDATE/DELETE/ON
 //! CONFLICT against a read-your-own-writes view of that buffer (the `overlay`
 //! module) which is empty — the identity — in autocommit.
 
+pub(crate) mod group_by;
 mod insert;
 mod mutate;
 mod overlay;

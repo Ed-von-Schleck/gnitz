@@ -4,11 +4,11 @@
 use crate::ast_util::{extract_name, index_column_ident, simple_ident_expr};
 use crate::bind::{find_unique_column, Binder};
 use crate::error::GnitzSqlError;
-use crate::plan::validate::{
+use crate::types::{int_domain_fits, is_integer_type, serial_underlying, sql_type_to_typecode};
+use crate::validate::{
     default_index_name, disambiguate_index_name, reject_duplicate_names, reject_non_key_eligible,
     reject_unhonored_column_options, reject_unhonored_table_constraints, validate_user_index_name, validate_user_name,
 };
-use crate::types::{int_domain_fits, is_integer_type, serial_underlying, sql_type_to_typecode};
 use crate::SqlResult;
 use gnitz_core::{ColumnDef, GnitzClient, IndexMeta, InlineUniqueIndex, TypeCode};
 use sqlparser::ast::{

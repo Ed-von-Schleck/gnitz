@@ -1,30 +1,28 @@
 //! Predicate-classification rewrite (pass 3). Partitions every `Join.on` into a
 //! `JoinClass` (equality pairs + an optional range conjunct + the residual) and
 //! folds the WHERE `Filter` — INNER into the residual, OUTER left as a
-//! post-null-fill filter. This is `PredicateCollector` re-hosted on `HirExpr`:
-//! left-vs-right is a `ColId` membership test (bind mints distinct ids per
-//! reference site, so even a self-join's two sides are disjoint), replacing the
-//! AST version's combined-offset arithmetic.
+//! post-null-fill filter. Left-vs-right is a `ColId` membership test (bind mints
+//! distinct ids per reference site, so even a self-join's two sides are disjoint).
 
 use super::{
-    col_by_id, ColId, ColIdGen, EqPair, HirCol, HirExpr, HirRange, HirRef, JoinClass, ProjEntry, RelExpr, SubqueryKind,
-    SubqueryRef,
+    as_col, col_by_id, ColId, ColIdGen, EqPair, HirCol, HirExpr, HirRange, HirRef, JoinClass, JoinOn, ProjEntry,
+    RelExpr, SubqueryKind, SubqueryRef,
 };
 use crate::agg::finalize_agg_bexpr;
 use crate::bind::fold_null_test;
 use crate::error::GnitzSqlError;
+use crate::hir::guards::{converse_rel, validate_join_key_pair, validate_range_join_key_pair};
+use crate::hir::JoinType;
 use crate::ir::{AggFunc, BExpr, BinOp, UnaryOp};
-use crate::plan::view::join::JoinType;
-use crate::plan::view::predicates::{converse_rel, validate_join_key_pair, validate_range_join_key_pair};
 use gnitz_core::{ColumnDef, RangeRel, TypeCode};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// Classify every join's predicates and place the WHERE, recursing through the
 /// whole tree so a Join buried under a `Reduce`/`Distinct`/`SetOp` (GROUP BY over
-/// a join, set-op side that is a join, …) is classified too — else its
-/// `classified` stays `None` and lowering panics. A join-free (linear) tree is
-/// rebuilt unchanged.
+/// a join, set-op side that is a join, …) is classified too — else its `on` stays
+/// `JoinOn::Raw` and lowering rejects it. A join-free (linear) tree is rebuilt
+/// unchanged.
 ///
 /// Memoized by `Rc::as_ptr`, so a subtree referenced from two places stays **one**
 /// shared node through the rewrite. That identity is what the lowering's
@@ -39,8 +37,8 @@ type RewriteMemo = HashMap<*const RelExpr, Rc<RelExpr>>;
 
 /// Rebuild the spine: classify every buried `Join`, and fold each WHERE `Filter`
 /// directly above a Join into its residual (INNER) or keep it as a post-null-fill
-/// filter (OUTER) — matching `classify_join_where`. Every other node delegates its
-/// reassembly to the generic `RelExpr::map_children`.
+/// filter (OUTER). Every other node delegates its reassembly to the generic
+/// `RelExpr::map_children`.
 fn classify_rel(rel: Rc<RelExpr>, memo: &mut RewriteMemo) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let key = Rc::as_ptr(&rel);
     if let Some(done) = memo.get(&key) {
@@ -58,16 +56,14 @@ fn classify_rel(rel: Rc<RelExpr>, memo: &mut RewriteMemo) -> Result<Rc<RelExpr>,
             ) {
                 // INNER: `ON p WHERE q ≡ ON (p AND q)` — fold WHERE into the residual.
                 // `classify_join` returns a fresh Join, so mutate in place.
-                let RelExpr::Join { classified, .. } =
-                    Rc::get_mut(&mut join).expect("classify_join returns a fresh Join")
+                let RelExpr::Join {
+                    on: JoinOn::Class(class),
+                    ..
+                } = Rc::get_mut(&mut join).expect("classify_join returns a fresh Join")
                 else {
-                    unreachable!()
+                    unreachable!("classify_join returns a classified Join")
                 };
-                classified
-                    .as_mut()
-                    .expect("classified before fold")
-                    .residual
-                    .extend(preds.iter().cloned());
+                class.residual.extend(preds.iter().cloned());
                 join
             } else {
                 // OUTER: the WHERE is a 3VL filter over the post-null-fill output.
@@ -81,7 +77,7 @@ fn classify_rel(rel: Rc<RelExpr>, memo: &mut RewriteMemo) -> Result<Rc<RelExpr>,
     Ok(out)
 }
 
-/// Classify one `Join` node (fill `classified` from its ON, recursing children).
+/// Classify one `Join` node (`JoinOn::Raw` → `JoinOn::Class`, recursing children).
 fn classify_join(rel: &Rc<RelExpr>, memo: &mut RewriteMemo) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let RelExpr::Join {
         left,
@@ -96,14 +92,16 @@ fn classify_join(rel: &Rc<RelExpr>, memo: &mut RewriteMemo) -> Result<Rc<RelExpr
     };
     let new_left = classify_rel(Rc::clone(left), memo)?;
     let new_right = classify_rel(Rc::clone(right), memo)?;
-    let class = classify_on(on, &left.cols(), &right.cols())?;
-    crate::plan::view::join::reject_outer_with_residual(*kind, class.residual.is_empty())?;
+    let JoinOn::Raw(raw) = on else {
+        unreachable!("classify visits each join once")
+    };
+    let class = classify_on(raw, &left.cols(), &right.cols())?;
+    crate::hir::guards::reject_outer_with_residual(*kind, class.residual.is_empty())?;
     Ok(Rc::new(RelExpr::Join {
         left: new_left,
         right: new_right,
         kind: *kind,
-        on: Vec::new(), // consumed into `classified`
-        classified: Some(class),
+        on: JoinOn::Class(class),
         mark: mark.clone(),
     }))
 }
@@ -153,16 +151,8 @@ fn classify_on(on: &[HirExpr], left_cols: &[HirCol], right_cols: &[HirCol]) -> R
         }
     }
 
-    crate::plan::view::predicates::reject_join_key_arity(eq.len(), range.is_some())?;
+    crate::hir::guards::reject_join_key_arity(eq.len(), range.is_some())?;
     Ok(JoinClass { eq, range, residual })
-}
-
-/// The `ColId` of a bare `ColRef` leaf, else `None` (a literal/expression operand).
-fn as_col(e: &HirExpr) -> Option<ColId> {
-    match e {
-        BExpr::ColRef(HirRef::Col(id)) => Some(*id),
-        _ => None,
-    }
 }
 
 /// Canonicalize a cross-table pair to `(left ColId, right ColId, swapped)` — the
@@ -186,8 +176,7 @@ fn def_of(cols: &[HirCol], id: ColId) -> &ColumnDef {
     &col_by_id(cols, id).expect("classified ColId in its side").def
 }
 
-/// `ir::BinOp` → the ordering `RangeRel` (the four range variants). AST-free —
-/// the `sql_binop_to_range_rel` in predicates.rs is `sqlparser::BinaryOperator`-typed.
+/// `ir::BinOp` → the ordering `RangeRel` (the four range variants).
 fn binop_to_range_rel(op: BinOp) -> Option<RangeRel> {
     match op {
         BinOp::Lt => Some(RangeRel::Lt),
@@ -211,11 +200,11 @@ fn binop_to_range_rel(op: BinOp) -> Option<RangeRel> {
 // `HirRef::Subquery` survives — a leftover is the physicalization's hard error.
 
 /// Decorrelate every subquery leaf in `rel`, minting mark columns from `ids`.
-pub(crate) fn decorrelate(rel: Rc<RelExpr>, ids: &mut ColIdGen) -> Result<Rc<RelExpr>, GnitzSqlError> {
+pub(crate) fn decorrelate(rel: Rc<RelExpr>, ids: &ColIdGen) -> Result<Rc<RelExpr>, GnitzSqlError> {
     decorrelate_rel(rel, ids)
 }
 
-fn decorrelate_rel(rel: Rc<RelExpr>, ids: &mut ColIdGen) -> Result<Rc<RelExpr>, GnitzSqlError> {
+fn decorrelate_rel(rel: Rc<RelExpr>, ids: &ColIdGen) -> Result<Rc<RelExpr>, GnitzSqlError> {
     // Subqueries live only in a single-table linear body's `Project(Filter?(Get))`
     // (bind rejects them elsewhere); transform that node, else recurse.
     if let RelExpr::Project { input, items } = rel.as_ref() {
@@ -239,11 +228,7 @@ fn filter_has_subquery(input: &Rc<RelExpr>) -> bool {
 }
 
 /// Transform a subquery-carrying `Project(items, Filter?(Get))` body.
-fn decorrelate_body(
-    items: &[ProjEntry],
-    input: &Rc<RelExpr>,
-    ids: &mut ColIdGen,
-) -> Result<Rc<RelExpr>, GnitzSqlError> {
+fn decorrelate_body(items: &[ProjEntry], input: &Rc<RelExpr>, ids: &ColIdGen) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let (fpreds, get): (Vec<HirExpr>, Rc<RelExpr>) = match input.as_ref() {
         RelExpr::Filter { input, preds } => (preds.clone(), Rc::clone(input)),
         _ => (Vec::new(), Rc::clone(input)),
@@ -344,7 +329,7 @@ fn decorrelate_body(
 fn build_joined_subref(
     cur: Rc<RelExpr>,
     s: &SubqueryRef,
-    ids: &mut ColIdGen,
+    ids: &ColIdGen,
     subst: &mut HashMap<*const RelExpr, HirExpr>,
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let p = Rc::as_ptr(&s.rel);
@@ -381,7 +366,7 @@ fn build_joined_subref(
             subst.insert(p, val);
             Ok(joined)
         }
-        SubqueryKind::Scalar { coalesce_zero } => {
+        SubqueryKind::Scalar => {
             if s.correlation.is_empty() {
                 return Err(GnitzSqlError::Unsupported(
                     "an uncorrelated scalar aggregate subquery is only supported as a top-level WHERE \
@@ -390,7 +375,7 @@ fn build_joined_subref(
                 ));
             }
             let joined = RelExpr::join(cur, Rc::clone(&s.rel), JoinType::Left, s.correlation.clone(), None);
-            subst.insert(p, scalar_value(s, coalesce_zero)?);
+            subst.insert(p, scalar_value(s, true)?);
             Ok(joined)
         }
     }
@@ -405,7 +390,7 @@ fn build_uncorrelated_inner(
     outer_col: ColId,
     op: BinOp,
     subref: &SubqueryRef,
-    ids: &mut ColIdGen,
+    ids: &ColIdGen,
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let agg = subref.scalar_agg()?;
     if matches!(agg.func, AggFunc::Avg) || agg.out.def.type_code.is_float() {
@@ -420,8 +405,8 @@ fn build_uncorrelated_inner(
     // COUNT_NON_NULL companion (`sum / (cnt != 0)`) — the raw reduce column reads a
     // spurious `0`, which as a join key would then spuriously match `outer = 0`. So
     // key on the *finalized* value, materialized as one column by a `Project` the
-    // lowering cuts to a hidden segment (reproducing the old scalar builder, whose
-    // `G_global` step ran through the general grouped-view finalize). A companion-free
+    // lowering cuts to a hidden segment (the `G_global` finalize runs through the
+    // general grouped-view finalize). A companion-free
     // aggregate needs no finalize — its raw column already is the value (plain SUM,
     // MIN/MAX re-derive NULL on exhaustion, COUNT is never NULL) — so it keys directly
     // with no extra segment.
@@ -451,17 +436,19 @@ fn build_uncorrelated_inner(
     Ok(RelExpr::join(cur, right, JoinType::Inner, on, None))
 }
 
-/// The scalar subquery's substituted value: the aggregate's finalize composite,
-/// wrapped in `COALESCE(_, 0)` for a COUNT (the never-NULL repair over the LEFT
-/// join's null-fill).
-fn scalar_value(s: &SubqueryRef, coalesce_zero: bool) -> Result<HirExpr, GnitzSqlError> {
+/// The scalar subquery's substituted value: the aggregate's finalize composite.
+/// `null_filled` says the decorrelation was a LEFT join, which null-fills an
+/// unmatched outer row — so a COUNT (never NULL by definition: an empty group
+/// counts `0`) is re-floored to `0`. The uncorrelated INNER join-as-filter passes
+/// `false`: it drops unmatched rows instead, so there is nothing to repair.
+fn scalar_value(s: &SubqueryRef, null_filled: bool) -> Result<HirExpr, GnitzSqlError> {
     let agg = s.scalar_agg()?;
     let v = finalize_agg_bexpr(
         HirRef::Col(agg.out.id),
         agg.companion.as_ref().map(|c| HirRef::Col(c.id)),
         agg.func,
     );
-    if coalesce_zero {
+    if null_filled && s.never_null() {
         // COUNT is Direct (`v == ColRef(agg.out)`); after the LEFT join it is
         // nullable, so `CASE WHEN it IS NOT NULL THEN it ELSE 0`.
         Ok(BExpr::Case {
@@ -500,10 +487,10 @@ fn as_uncorrelated_scalar_cmp(pred: &HirExpr) -> Option<(ColId, BinOp, &Subquery
     if !matches!(op, BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
         return None;
     }
-    if let (Some(oc), Some(s)) = (bare_col(l), uncorr_scalar(r)) {
+    if let (Some(oc), Some(s)) = (as_col(l), uncorr_scalar(r)) {
         return Some((oc, op, s));
     }
-    if let (Some(s), Some(oc)) = (uncorr_scalar(l), bare_col(r)) {
+    if let (Some(s), Some(oc)) = (uncorr_scalar(l), as_col(r)) {
         return Some((oc, converse_binop(op), s));
     }
     None
@@ -511,18 +498,9 @@ fn as_uncorrelated_scalar_cmp(pred: &HirExpr) -> Option<(ColId, BinOp, &Subquery
 
 fn uncorr_scalar(e: &HirExpr) -> Option<&SubqueryRef> {
     match e {
-        BExpr::ColRef(HirRef::Subquery(s))
-            if matches!(s.kind, SubqueryKind::Scalar { .. }) && s.correlation.is_empty() =>
-        {
+        BExpr::ColRef(HirRef::Subquery(s)) if matches!(s.kind, SubqueryKind::Scalar) && s.correlation.is_empty() => {
             Some(s)
         }
-        _ => None,
-    }
-}
-
-fn bare_col(e: &HirExpr) -> Option<ColId> {
-    match e {
-        BExpr::ColRef(HirRef::Col(id)) => Some(*id),
         _ => None,
     }
 }
