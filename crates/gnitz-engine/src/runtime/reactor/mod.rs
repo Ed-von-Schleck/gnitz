@@ -3974,10 +3974,10 @@ mod tests {
     /// writes instead of wedging in `send_encoded`.
     #[test]
     fn dropped_scan_lease_unblocks_streaming_writer() {
-        use crate::foundation::codec::align8;
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use crate::runtime::w2m_ring::{self, W2M_HEADER_SIZE};
         use crate::runtime::wire::{self as ipc, STATUS_OK};
+        use gnitz_wire::align8;
         use std::sync::atomic::Ordering;
         use std::time::{Duration, Instant};
 

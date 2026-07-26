@@ -1,5 +1,5 @@
 use super::*;
-use crate::storage::PkBuf;
+use crate::schema::key::PkBuf;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 impl CatalogEngine {

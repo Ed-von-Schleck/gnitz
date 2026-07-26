@@ -1,7 +1,7 @@
 use super::*;
-use crate::foundation::codec::as_le_bytes;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::Layout;
+use crate::test_support::as_le_bytes;
 use crate::test_support::{make_schema_u128_i64, wide_pk_3xu64_schema};
 
 /// `(U64 PK | I64 payload)` — stride-8, the dominant single-PK table shape.
@@ -945,9 +945,15 @@ fn pair_equiv_multi() {
     }
 }
 
-/// Write `rows` (each `(pk, weight, val)`) to a freshly-streamed `(U128 PK |
-/// I64 payload)` shard tagged with `flag` (`SHARD_FLAG_PK_UNIQUE` ⇒ the opened
-/// shard reports `is_pk_unique`, `0` ⇒ it does not). `rows` must be PK-ascending.
+/// Write `rows` (each `(pk, weight, val)`) to a freshly-streamed
+/// `(unsigned PK | I64 payload)` shard tagged with `flag`
+/// (`SHARD_FLAG_PK_UNIQUE` ⇒ the opened shard reports `is_pk_unique`, `0` ⇒ it
+/// does not). `rows` must be PK-ascending.
+///
+/// The PK width comes from `schema` — for an unsigned PK the OPK bytes ARE the
+/// big-endian value, so the region is the low `pk_stride` bytes of each key's
+/// BE image. That is what lets one writer serve both the 16-byte U128 and the
+/// 8-byte U64 fixtures; a stride-specific twin would only restate the schema.
 fn write_test_shard(
     dir: &tempfile::TempDir,
     schema: &SchemaDescriptor,
@@ -955,7 +961,11 @@ fn write_test_shard(
     rows: &[(u128, i64, i64)],
     flag: u8,
 ) -> Rc<MappedShard> {
-    let pks: Vec<u8> = rows.iter().flat_map(|&(pk, _, _)| pk.to_be_bytes()).collect();
+    let stride = schema.pk_stride() as usize;
+    let pks: Vec<u8> = rows
+        .iter()
+        .flat_map(|&(pk, _, _)| pk.to_be_bytes()[16 - stride..].to_vec())
+        .collect();
     let weights: Vec<i64> = rows.iter().map(|&(_, w, _)| w).collect();
     let nulls = vec![0u64; rows.len()];
     let vals: Vec<i64> = rows.iter().map(|&(_, _, v)| v).collect();
@@ -967,46 +977,7 @@ fn write_test_shard(
         as_le_bytes(&vals),
         &blob,
     ];
-    let path = dir.path().join(format!("rc_{flag}_{idx}.db"));
-    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-    super::super::shard_file::write_shard_streaming(
-        libc::AT_FDCWD,
-        &cpath,
-        rows.len() as u32,
-        &regions,
-        schema,
-        super::super::shard_file::ShardWriteOpts {
-            flags: flag,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    Rc::new(MappedShard::open(&cpath, schema, false).unwrap())
-}
-
-/// Stride-8 sibling of `write_test_shard`: `(U64 PK | I64 payload)`, 8-byte
-/// big-endian PKs. A separate fn (not a stride param on `write_test_shard`)
-/// so its 6 existing callers are untouched.
-fn write_test_shard_u64(
-    dir: &tempfile::TempDir,
-    schema: &SchemaDescriptor,
-    idx: usize,
-    rows: &[(u64, i64, i64)],
-    flag: u8,
-) -> Rc<MappedShard> {
-    let pks: Vec<u8> = rows.iter().flat_map(|&(pk, _, _)| pk.to_be_bytes()).collect();
-    let weights: Vec<i64> = rows.iter().map(|&(_, w, _)| w).collect();
-    let nulls = vec![0u64; rows.len()];
-    let vals: Vec<i64> = rows.iter().map(|&(_, _, v)| v).collect();
-    let blob: Vec<u8> = Vec::new();
-    let regions: Vec<&[u8]> = vec![
-        &pks,
-        as_le_bytes(&weights),
-        as_le_bytes(&nulls),
-        as_le_bytes(&vals),
-        &blob,
-    ];
-    let path = dir.path().join(format!("rc8_{flag}_{idx}.db"));
+    let path = dir.path().join(format!("rc{stride}_{flag}_{idx}.db"));
     let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
     super::super::shard_file::write_shard_streaming(
         libc::AT_FDCWD,
@@ -1166,8 +1137,10 @@ fn read_cursor_drive_pk_unique_multi_u64_bench() {
     let flag = super::super::layout::SHARD_FLAG_PK_UNIQUE;
     let shards: Vec<Rc<MappedShard>> = (0..N_SHARDS as u64)
         .map(|s| {
-            let rows: Vec<(u64, i64, i64)> = (0..PER_SHARD).map(|i| (i * N_SHARDS as u64 + s, 1, 7)).collect();
-            write_test_shard_u64(&dir, &schema, s as usize, &rows, flag)
+            let rows: Vec<(u128, i64, i64)> = (0..PER_SHARD)
+                .map(|i| ((i * N_SHARDS as u64 + s) as u128, 1, 7))
+                .collect();
+            write_test_shard(&dir, &schema, s as usize, &rows, flag)
         })
         .collect();
 
@@ -1295,8 +1268,8 @@ fn shard_point_probe_bench() {
 
     // Sparse (even) shard keys so odd probes resolve a lower bound *between*
     // two present keys. Construction + open outside the timed region.
-    let rows: Vec<(u64, i64, i64)> = (0..N).map(|i| (i * 2, 1, i as i64)).collect();
-    let shard = write_test_shard_u64(&dir, &schema, 0, &rows, 0);
+    let rows: Vec<(u128, i64, i64)> = (0..N).map(|i| ((i * 2) as u128, 1, i as i64)).collect();
+    let shard = write_test_shard(&dir, &schema, 0, &rows, 0);
 
     // Evenly-spaced ascending present keys for the monotone advance sweep.
     let step = (N / PROBES as u64).max(1);

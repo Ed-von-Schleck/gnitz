@@ -7,7 +7,7 @@
 //! type: a missing or mis-routed opcode is a compile error, not a silent
 //! miscompute.
 
-use crate::schema::{ColumnLocator, SchemaDescriptor};
+use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_wire::encode_german_string;
 // Wire opcodes (1–46) the client emits, matched as arms in `from_wire`. They are
 // `pub const … : u32` in gnitz-wire, so a plain `use` binds them for pattern use.
@@ -263,7 +263,7 @@ pub(crate) enum LogicalInstr {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::expr) enum Instr {
     /// Payload integer load. Width and signedness are `const fn`s of `tc`
-    /// (`type_size` / `is_signed_int`), recomputed once per instruction in the
+    /// (`wire_stride` / `is_signed_int`), recomputed once per instruction in the
     /// eval arm rather than carried here — the same convention as `LoadPk`.
     LoadPayloadInt {
         dst: u16,
@@ -276,7 +276,7 @@ pub(in crate::expr) enum Instr {
         tc: u8,
     },
     /// PK-region integer load: the addressed OPK column at byte `off`. Its width
-    /// and signedness are `const fn`s of `tc` (`type_size` / `is_signed_int` —
+    /// and signedness are `const fn`s of `tc` (`wire_stride` / `is_signed_int` —
     /// the same two `SchemaColumn::new` derives its fields from), recomputed once
     /// per instruction in the eval arm rather than carried here.
     LoadPk {
@@ -657,8 +657,8 @@ impl LogicalProgram {
     /// the given context (`is_filter = true` keeps `result_reg` eligible for
     /// bit_only). Consuming: a `Vec<LogicalInstr>` cannot be mutated in place into
     /// a `Vec<Instr>`. Preserves the per-register U64 signed→unsigned tracking.
-    pub(in crate::expr) fn resolve(self, schema: &SchemaDescriptor, is_filter: bool) -> ResolvedProgram {
-        use crate::schema::type_code;
+    pub(in crate::expr) fn resolve(self, schema: &dyn SchemaFacts, is_filter: bool) -> ResolvedProgram {
+        use gnitz_wire::type_code;
         use Instr as I;
         use LogicalInstr as L;
         // Per-register type code of the most recently produced integer value.
@@ -666,6 +666,17 @@ impl LogicalProgram {
         // pattern is negative for values >= 2^63. 0 = unknown (treated signed).
         let mut reg_tc = [0u8; MAX_REGS];
         let is_u64 = |tc: u8| tc == type_code::U64;
+        // Payload slot of a payload-only opcode's column operand. `validate`'s
+        // `ColKind::payload_only` rule rejects a PK column here and both
+        // `ScalarFunc` constructors validate before resolving, so the `None` arm
+        // is unreachable for any program that ever reaches a batch; it keeps the
+        // sentinel so an unvalidated program (tests) trips the kernels' own
+        // assertions instead of silently addressing payload slot 0.
+        let payload_slot = |ci: usize| {
+            schema
+                .payload_slot(ci)
+                .unwrap_or(gnitz_expr::PAYLOAD_MAPPING_PK_SENTINEL)
+        };
         let mut instrs = Vec::with_capacity(self.instrs.len());
         // Decoded `INT_IN_SET` pools, indexed by the resolved `set_idx`. Decoded
         // once here (never per row); each `IntInSet` re-points its `set_idx` at
@@ -674,8 +685,11 @@ impl LogicalProgram {
         for li in self.instrs {
             match li {
                 L::LoadColInt { dst, col } => {
-                    let tc = schema.columns[col as usize].type_code;
-                    instrs.push(match schema.locate(col as usize) {
+                    // One query: the locator already carries the type code the
+                    // per-register tracking wants, so asking `col_type_code`
+                    // too would make the two answers a divergence risk.
+                    let loc = schema.locate(col as usize);
+                    instrs.push(match loc {
                         ColumnLocator::Pk {
                             byte_off, type_code, ..
                         } => I::LoadPk {
@@ -689,18 +703,14 @@ impl LogicalProgram {
                             tc: type_code,
                         },
                     });
-                    reg_tc[dst as usize] = tc;
+                    reg_tc[dst as usize] = loc.type_code();
                 }
                 L::LoadColFloat { dst, col } => {
                     let ci = col as usize;
-                    debug_assert!(
-                        !schema.is_pk_col(ci),
-                        "resolve: LOAD_COL_FLOAT references PK column {ci} (PK is never float)"
-                    );
                     instrs.push(I::LoadPayloadFloat {
                         dst,
-                        pi: schema.payload_mapping_byte(ci),
-                        tc: schema.columns[ci].type_code,
+                        pi: payload_slot(ci),
+                        tc: schema.col_type_code(ci),
                     });
                     reg_tc[dst as usize] = 0;
                 }
@@ -767,55 +777,31 @@ impl LogicalProgram {
                 L::BoolAnd { dst, a, b } => instrs.push(I::BoolAnd { dst, a, b }),
                 L::BoolOr { dst, a, b } => instrs.push(I::BoolOr { dst, a, b }),
                 L::BoolNot { dst, a } => instrs.push(I::BoolNot { dst, a }),
-                L::IsNull { dst, col } => {
-                    debug_assert!(
-                        !schema.is_pk_col(col as usize),
-                        "resolve: IS_NULL references PK column {col} (payload-only opcode)"
-                    );
-                    instrs.push(I::IsNull {
-                        dst,
-                        pi: schema.payload_mapping_byte(col as usize),
-                    });
-                }
-                L::IsNotNull { dst, col } => {
-                    debug_assert!(
-                        !schema.is_pk_col(col as usize),
-                        "resolve: IS_NOT_NULL references PK column {col} (payload-only opcode)"
-                    );
-                    instrs.push(I::IsNotNull {
-                        dst,
-                        pi: schema.payload_mapping_byte(col as usize),
-                    });
-                }
+                L::IsNull { dst, col } => instrs.push(I::IsNull {
+                    dst,
+                    pi: payload_slot(col as usize),
+                }),
+                L::IsNotNull { dst, col } => instrs.push(I::IsNotNull {
+                    dst,
+                    pi: payload_slot(col as usize),
+                }),
                 L::StrColConst {
                     op,
                     dst,
                     col,
                     const_idx,
-                } => {
-                    debug_assert!(
-                        !schema.is_pk_col(col as usize),
-                        "resolve: STR_COL_CONST references PK column {col} (payload-only opcode)"
-                    );
-                    instrs.push(I::StrColConst {
-                        op,
-                        dst,
-                        pi: schema.payload_mapping_byte(col as usize),
-                        const_idx,
-                    });
-                }
-                L::StrColCol { op, dst, col_a, col_b } => {
-                    debug_assert!(
-                        !schema.is_pk_col(col_a as usize) && !schema.is_pk_col(col_b as usize),
-                        "resolve: STR_COL_COL references a PK column (col_a={col_a}, col_b={col_b}; payload-only opcode)"
-                    );
-                    instrs.push(I::StrColCol {
-                        op,
-                        dst,
-                        pi_a: schema.payload_mapping_byte(col_a as usize),
-                        pi_b: schema.payload_mapping_byte(col_b as usize),
-                    });
-                }
+                } => instrs.push(I::StrColConst {
+                    op,
+                    dst,
+                    pi: payload_slot(col as usize),
+                    const_idx,
+                }),
+                L::StrColCol { op, dst, col_a, col_b } => instrs.push(I::StrColCol {
+                    op,
+                    dst,
+                    pi_a: payload_slot(col_a as usize),
+                    pi_b: payload_slot(col_b as usize),
+                }),
                 L::IntInSet {
                     dst,
                     value_reg,
@@ -893,7 +879,7 @@ impl LogicalProgram {
     /// legitimate for a map (`copy_cols` builds exactly that shape), so
     /// [`Self::validate`] cannot reject it; as a *filter* it is a corrupt frame
     /// with no result to read, not a filter that passes nothing.
-    pub(crate) fn validate_predicate(&self, schema: &SchemaDescriptor) -> Result<(), ExprValidateErr> {
+    pub(crate) fn validate_predicate(&self, schema: &dyn SchemaFacts) -> Result<(), ExprValidateErr> {
         self.validate(Some(schema), None)?;
         if self.num_regs == 0 {
             return Err(ExprValidateErr::PredicateWithoutResultReg);
@@ -921,8 +907,8 @@ impl LogicalProgram {
     /// bit clear).
     pub(in crate::expr) fn validate(
         &self,
-        in_schema: Option<&SchemaDescriptor>,
-        out_schema: Option<&SchemaDescriptor>,
+        in_schema: Option<&dyn SchemaFacts>,
+        out_schema: Option<&dyn SchemaFacts>,
     ) -> Result<(), ExprValidateErr> {
         use ExprValidateErr as E;
         use LogicalInstr as L;
@@ -1102,7 +1088,7 @@ fn check_reg(r: u16, num_regs: u32) -> Result<(), ExprValidateErr> {
 /// re-checking it, so this is the only place a client blob is held to the
 /// contract.
 #[inline]
-fn check_col(in_schema: Option<&SchemaDescriptor>, col: u32, need: ColKind) -> Result<(), ExprValidateErr> {
+fn check_col(in_schema: Option<&dyn SchemaFacts>, col: u32, need: ColKind) -> Result<(), ExprValidateErr> {
     let Some(s) = in_schema else { return Ok(()) };
     if col as usize >= s.num_columns() {
         return Err(ExprValidateErr::ColOutOfRange {
@@ -1113,7 +1099,7 @@ fn check_col(in_schema: Option<&SchemaDescriptor>, col: u32, need: ColKind) -> R
     if need.payload_only() && s.is_pk_col(col as usize) {
         return Err(ExprValidateErr::ColNotPayload { col });
     }
-    let type_code = s.columns[col as usize].type_code;
+    let type_code = s.col_type_code(col as usize);
     let ok = match need {
         ColKind::AnyCol | ColKind::AnyPayload => true,
         ColKind::FixedInt => gnitz_wire::is_fixed_int(type_code),
@@ -1136,16 +1122,16 @@ fn check_col(in_schema: Option<&SchemaDescriptor>, col: u32, need: ColKind) -> R
 /// into a wider slot — there is no narrowing and no representation change.
 #[inline]
 fn check_copy_types(
-    in_schema: Option<&SchemaDescriptor>,
-    out_schema: Option<&SchemaDescriptor>,
+    in_schema: Option<&dyn SchemaFacts>,
+    out_schema: Option<&dyn SchemaFacts>,
     src_col: u32,
     out: u32,
 ) -> Result<(), ExprValidateErr> {
     let (Some(is), Some(os)) = (in_schema, out_schema) else {
         return Ok(());
     };
-    let src_tc = is.columns[src_col as usize].type_code;
-    let out_tc = os.columns[os.payload_col_idx(out as usize)].type_code;
+    let src_tc = is.col_type_code(src_col as usize);
+    let out_tc = os.col_type_code(os.payload_col_idx(out as usize));
     let ok = src_tc == out_tc || gnitz_wire::is_widening_promotion(src_tc, out_tc);
     if ok {
         Ok(())
@@ -1163,18 +1149,18 @@ fn check_copy_types(
 /// — no narrowing (which truncates an i64 and shears an f64) and no widening
 /// (which runs off the end of `to_le_bytes()`). A stride rule, not a type rule:
 /// `I64`, `U64` and `F64` are all legal targets and `validate` cannot tell which
-/// the register holds. Read off the column's cached `size()` rather than
-/// re-deriving it, so an undecodable type code (which `wire_stride` would report
-/// as 8) cannot slip through.
+/// the register holds. Both tests are needed and their order does not matter:
+/// `wire_stride` reports 8 for an undecodable type code, so the width test alone
+/// would admit one.
 #[inline]
-fn check_emit_slot(out_schema: Option<&SchemaDescriptor>, out: u32) -> Result<(), ExprValidateErr> {
+fn check_emit_slot(out_schema: Option<&dyn SchemaFacts>, out: u32) -> Result<(), ExprValidateErr> {
     let Some(os) = out_schema else { return Ok(()) };
-    let col = os.columns[os.payload_col_idx(out as usize)];
-    if col.size() != 8 || !gnitz_wire::is_valid_type_code(col.type_code) {
-        return Err(ExprValidateErr::EmitSlotNotEightBytes {
-            out,
-            type_code: col.type_code,
-        });
+    // `col_type_code`, like its two sibling checks — not `locate`, whose extra
+    // work (a release-active bound assert, plus an O(pk_count) OPK-offset walk
+    // for a PK column) buys nothing here: `size()` IS `wire_stride(type_code)`.
+    let type_code = os.col_type_code(os.payload_col_idx(out as usize));
+    if !gnitz_wire::is_valid_type_code(type_code) || gnitz_wire::wire_stride(type_code) != 8 {
+        return Err(ExprValidateErr::EmitSlotNotEightBytes { out, type_code });
     }
     Ok(())
 }
@@ -1183,14 +1169,14 @@ fn check_emit_slot(out_schema: Option<&SchemaDescriptor>, out: u32) -> Result<()
 /// rule that drives every signed→unsigned variant selection in `resolve`.
 #[inline]
 fn any_u64(reg_tc: &[u8; MAX_REGS], a: u16, b: u16) -> bool {
-    let u64_tc = crate::schema::type_code::U64;
+    let u64_tc = gnitz_wire::type_code::U64;
     reg_tc[a as usize] == u64_tc || reg_tc[b as usize] == u64_tc
 }
 
 #[inline]
 fn propagate_u64(reg_tc: &[u8; MAX_REGS], a: u16, b: u16) -> u8 {
     if any_u64(reg_tc, a, b) {
-        crate::schema::type_code::U64
+        gnitz_wire::type_code::U64
     } else {
         0
     }
@@ -1450,11 +1436,11 @@ impl ResolvedProgram {
     /// (so the evaluator can skip null-bit tracking entirely). Called once, from
     /// `resolve`, against the schema the program was resolved against — the only
     /// schema for which the answer means anything (`pi` operands come from it).
-    fn is_strictly_non_nullable(&self, schema: &SchemaDescriptor) -> bool {
+    fn is_strictly_non_nullable(&self, schema: &dyn SchemaFacts) -> bool {
         use Instr::*;
         let nullable_payload = |pi: u8| -> bool {
             let a = pi as usize;
-            a < schema.num_payload_cols() && schema.columns[schema.payload_col_idx(a)].nullable != 0
+            a < schema.num_payload_cols() && schema.col_nullable(schema.payload_col_idx(a))
         };
         for instr in &self.instrs {
             match *instr {

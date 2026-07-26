@@ -18,9 +18,10 @@ use crate::runtime::wire::{
     self, peek_control_block, SchemaWithVersion, FLAG_CONTINUATION, FLAG_HAS_SCHEMA, FLAG_SCAN_LAST,
 };
 use crate::runtime::worker::send_unique_preflight_keys;
+use crate::schema::key::PkBuf;
 use crate::schema::make_index_schema;
 use crate::schema::{type_code, IndexKeySpec, SchemaColumn, SchemaDescriptor};
-use crate::storage::{Batch, KeyProducer, PkBuf, SpillSort};
+use crate::storage::{Batch, KeyProducer, SpillSort};
 
 // ---------------------------------------------------------------------------
 // Span helpers

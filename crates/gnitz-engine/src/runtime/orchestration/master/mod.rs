@@ -29,7 +29,8 @@ use crate::runtime::wire::{
     self, col_names_as_refs, peek_control_block, DecodedWire, SchemaWithVersion, WireConflictMode, FLAG_CONTINUATION,
     FLAG_HAS_DATA, FLAG_SCAN_LAST,
 };
-use crate::storage::{Batch, PkBuf};
+use crate::schema::key::PkBuf;
+use crate::storage::Batch;
 use gnitz_wire::wire_flags_set_conflict_mode;
 use index_router::PartitionRouter;
 

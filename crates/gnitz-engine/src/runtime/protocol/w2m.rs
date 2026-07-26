@@ -400,9 +400,9 @@ impl W2mReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::foundation::codec::align8;
     use crate::runtime::w2m_ring::{self, W2mRingHeader, W2M_HEADER_SIZE};
     use crate::test_support::SharedRegion;
+    use gnitz_wire::align8;
     use std::sync::atomic::Ordering;
 
     /// Allocate a ring that holds at most `n_msgs` messages of `msg_sz` bytes.

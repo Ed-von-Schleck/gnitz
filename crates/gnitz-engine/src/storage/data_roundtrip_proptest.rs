@@ -51,7 +51,7 @@ fn arb_schema() -> impl Strategy<Value = SchemaDescriptor> {
             specs
                 .iter()
                 .filter(|&&(_, _, is_pk)| is_pk)
-                .map(|&(tc, _, _)| SchemaColumn::new(tc, 0).size() as usize)
+                .map(|&(tc, _, _)| gnitz_wire::wire_stride(tc))
                 .sum::<usize>()
                 <= MAX_PK_BYTES
         })
@@ -104,7 +104,7 @@ fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128
         let mut nw: u64 = 0;
         for (pi, _ci, col) in schema.payload_columns() {
             if col.nullable != 0 && rng.gen_range(2) == 0 {
-                nw |= 1 << pi;
+                gnitz_wire::null_word_set(&mut nw, pi, true);
             }
         }
         batch.extend_null_bmp(&nw.to_le_bytes());
@@ -112,7 +112,7 @@ fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128
         // Payload columns, in payload (not schema-column) index order.
         for (pi, _ci, col) in schema.payload_columns() {
             let cs = col.size() as usize;
-            if (nw >> pi) & 1 != 0 {
+            if gnitz_wire::null_word_get(nw, pi) {
                 batch.fill_col_zero(pi, cs); // null cell; zset_of won't read it
             } else if gnitz_wire::is_german_string(col.type_code) {
                 let val = arb_string(&mut rng);
@@ -161,7 +161,7 @@ fn row_key(batch: &Batch, schema: &SchemaDescriptor, row: usize) -> RowKey {
     let nw = batch.get_null_word(row);
     let mut vals: Vec<Option<Vec<u8>>> = Vec::with_capacity(schema.num_payload_cols());
     for (pi, _ci, col) in schema.payload_columns() {
-        if (nw >> pi) & 1 != 0 {
+        if gnitz_wire::null_word_get(nw, pi) {
             vals.push(None);
             continue;
         }

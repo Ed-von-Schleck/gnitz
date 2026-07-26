@@ -1,5 +1,6 @@
 use super::super::plan::{PkFill, ScalarFunc};
 use super::super::program::{ExprValidateErr, LogicalProgram};
+use super::make_int_batch;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 use crate::storage::Batch;
 
@@ -10,22 +11,6 @@ fn make_schema(pk_index: u32, col_types: &[u8]) -> SchemaDescriptor {
         columns[i] = SchemaColumn::new(tc, nullable);
     }
     SchemaDescriptor::new(&columns[..col_types.len()], &[pk_index])
-}
-
-fn make_int_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, u64, &[i64])]) -> Batch {
-    let mut batch = Batch::with_capacity(*schema, rows.len().max(1));
-    for &(pk, weight, null_word, cols) in rows {
-        batch.extend_pk(pk as u128);
-        batch.extend_weight(&weight.to_le_bytes());
-        batch.extend_null_bmp(&null_word.to_le_bytes());
-        for (pi, _ci, _col) in schema.payload_columns() {
-            if pi < cols.len() {
-                batch.extend_col(pi, &cols[pi].to_le_bytes());
-            }
-        }
-        batch.count += 1;
-    }
-    batch
 }
 
 #[test]

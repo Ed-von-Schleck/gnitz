@@ -5,7 +5,27 @@ mod program_tests;
 use super::batch::{eval_batch, EvalScratch, MORSEL, NULL_WORDS_PER_REG};
 use super::plan::read_reg_row0;
 use super::program::{Instr, ResolvedProgram};
-use crate::storage::MemBatch;
+use crate::schema::SchemaDescriptor;
+use crate::storage::{Batch, MemBatch};
+
+/// Build a `Batch` of `(pk, weight, null_word, payload i64 cells)` rows against
+/// `schema`. Shared by `plan_tests` and `program_tests`, which had byte-identical
+/// private copies.
+pub(super) fn make_int_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, u64, &[i64])]) -> Batch {
+    let mut batch = Batch::with_capacity(*schema, rows.len().max(1));
+    for &(pk, weight, null_word, cols) in rows {
+        batch.extend_pk(pk as u128);
+        batch.extend_weight(&weight.to_le_bytes());
+        batch.extend_null_bmp(&null_word.to_le_bytes());
+        for (pi, _ci, _col) in schema.payload_columns() {
+            if pi < cols.len() {
+                batch.extend_col(pi, &cols[pi].to_le_bytes());
+            }
+        }
+        batch.count += 1;
+    }
+    batch
+}
 
 #[inline]
 pub(super) fn float_to_bits(f: f64) -> i64 {

@@ -7,8 +7,9 @@ use crate::expr::{ExprValidateErr, LogicalProgram, ScalarFunc};
 use crate::foundation::worker_ctx::{num_workers, worker_rank};
 use crate::ops::{build_reduce_output_schema, AggDescriptor, AggOp};
 use crate::query::vm::{Instr, ProgramBuilder, RegisterMeta, VmHandle};
-use crate::schema::{is_fixed_int, type_code, DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{type_code, DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{ReadCursor, RecoverySource, Table};
+use gnitz_wire::is_fixed_int;
 
 mod emit;
 mod load;

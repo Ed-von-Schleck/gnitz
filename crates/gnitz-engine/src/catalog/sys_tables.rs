@@ -120,10 +120,10 @@ pub(super) fn validate_pk_cols(col_defs: &[super::types::ColumnDef], pk: &PkColL
         .iter()
         .map(|&c| gnitz_wire::wire_stride(col_defs[c as usize].type_code))
         .sum();
-    if pk_stride == 0 || pk_stride > gnitz_wire::MAX_PK_BYTES {
+    if pk_stride == 0 || pk_stride > crate::schema::MAX_PK_BYTES {
         return Err(format!(
             "Primary Key total stride must be 1..={} bytes, got {pk_stride}",
-            gnitz_wire::MAX_PK_BYTES
+            crate::schema::MAX_PK_BYTES
         ));
     }
     Ok(())

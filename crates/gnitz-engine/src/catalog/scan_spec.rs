@@ -19,8 +19,9 @@ use super::*;
 use crate::expr::{LogicalProgram, ScalarFunc};
 use crate::ops::AdhocFold;
 use crate::schema::key::opk_key;
+use crate::schema::key::{compare_pk_bytes, PkBuf};
 use crate::schema::{ColumnLocator, MAX_PK_BYTES};
-use crate::storage::{cmp_col_window, compare_pk_bytes, compare_rows, PkBuf};
+use crate::storage::{cmp_col_window, compare_rows};
 use gnitz_expr::RowSource;
 
 /// `limit_k` above which the worker materializes instead of running the bounded

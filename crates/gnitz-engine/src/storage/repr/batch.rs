@@ -7,10 +7,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::columnar::ColumnarSource;
 use super::merge::{self, BlobCacheGuard, ColPtr, MemBatch};
-use crate::foundation::codec::{align8, read_i64_le, read_u64_le};
 use crate::schema::key::NarrowPkOpk;
 use crate::schema::{BlobCache, SchemaDescriptor};
 use gnitz_expr::RowSource;
+use gnitz_wire::{align8, read_i64_le, read_u64_le};
 
 static BLOB_ID_CTR: AtomicU64 = AtomicU64::new(1);
 #[inline(always)]
@@ -1981,7 +1981,7 @@ impl BatchBuilder {
     pub(crate) fn put_null(&mut self) {
         let col_size = self.schema().columns[self.physical_col_idx()].size() as usize;
         self.batch.fill_col_zero(self.curr_col, col_size);
-        self.curr_null_word |= 1u64 << self.curr_col;
+        gnitz_wire::null_word_set(&mut self.curr_null_word, self.curr_col, true);
         self.curr_col += 1;
     }
 

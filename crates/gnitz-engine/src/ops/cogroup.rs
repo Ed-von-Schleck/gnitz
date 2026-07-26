@@ -12,7 +12,8 @@
 use std::cmp::Ordering;
 use std::ops::Range;
 
-use crate::storage::{pk_bytes_eq, Batch, ReadCursor};
+use crate::schema::key::pk_bytes_eq;
+use crate::storage::{Batch, ReadCursor};
 
 /// First row index past the equal-PK group beginning at `start`. Requires
 /// `start < batch.count`.

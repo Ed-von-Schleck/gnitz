@@ -63,7 +63,8 @@
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::foundation::codec::{align8, read_u64_raw, write_u64_raw};
+use crate::foundation::posix_io::{read_u64_raw, write_u64_raw};
+use gnitz_wire::align8;
 
 /// Fixed header size at the start of every W2M mmap region.
 pub const W2M_HEADER_SIZE: usize = 128;

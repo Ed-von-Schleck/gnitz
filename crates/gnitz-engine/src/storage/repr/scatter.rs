@@ -502,8 +502,8 @@ mod tests {
             let pk = read_pk_packed(&out_pk, i, pk_stride);
             let lo = pk as u64;
             let hi = (pk >> 64) as u64;
-            let w = i64::from_le_bytes(out_weight[i * 8..i * 8 + 8].try_into().unwrap());
-            let val = i64::from_le_bytes(out_col0[i * 8..i * 8 + 8].try_into().unwrap());
+            let w = gnitz_wire::read_i64_le(&out_weight, i * 8);
+            let val = gnitz_wire::read_i64_le(&out_col0, i * 8);
             result.push((lo, hi, w, val));
         }
         result
@@ -595,10 +595,10 @@ mod tests {
         }
         assert_eq!(&pk[0..24], &pk_c);
         assert_eq!(&pk[24..48], &pk_a);
-        assert_eq!(i64::from_le_bytes(wt[0..8].try_into().unwrap()), 1);
-        assert_eq!(i64::from_le_bytes(wt[8..16].try_into().unwrap()), 1);
-        assert_eq!(i64::from_le_bytes(col0[0..8].try_into().unwrap()), 300);
-        assert_eq!(i64::from_le_bytes(col0[8..16].try_into().unwrap()), 100);
+        assert_eq!(gnitz_wire::read_i64_le(&wt, 0), 1);
+        assert_eq!(gnitz_wire::read_i64_le(&wt, 8), 1);
+        assert_eq!(gnitz_wire::read_i64_le(&col0, 0), 300);
+        assert_eq!(gnitz_wire::read_i64_le(&col0, 8), 100);
     }
 
     #[test]
@@ -635,9 +635,7 @@ mod tests {
         assert_eq!(&pk[24..48], &pk_b);
         assert_eq!(&pk[48..72], &pk_a);
         assert_eq!(&pk[72..96], &pk_d);
-        let vals: Vec<i64> = (0..4)
-            .map(|i| i64::from_le_bytes(col0[i * 8..i * 8 + 8].try_into().unwrap()))
-            .collect();
+        let vals: Vec<i64> = (0..4).map(|i| gnitz_wire::read_i64_le(&col0, i * 8)).collect();
         assert_eq!(vals, vec![30, 20, 10, 40]);
     }
 
@@ -708,13 +706,9 @@ mod tests {
         assert_eq!(&pk[0..24], &pk_c);
         assert_eq!(&pk[24..48], &pk_a);
         assert_eq!(&pk[48..72], &pk_b);
-        let weights: Vec<i64> = (0..3)
-            .map(|i| i64::from_le_bytes(wt[i * 8..i * 8 + 8].try_into().unwrap()))
-            .collect();
+        let weights: Vec<i64> = (0..3).map(|i| gnitz_wire::read_i64_le(&wt, i * 8)).collect();
         assert_eq!(weights, vec![5, -1, 3]);
-        let vals: Vec<i64> = (0..3)
-            .map(|i| i64::from_le_bytes(col0[i * 8..i * 8 + 8].try_into().unwrap()))
-            .collect();
+        let vals: Vec<i64> = (0..3).map(|i| gnitz_wire::read_i64_le(&col0, i * 8)).collect();
         assert_eq!(vals, vec![9, 7, 8]);
     }
 
@@ -796,13 +790,9 @@ mod tests {
         assert_eq!(&pk[8..16], &pk_b);
         assert_eq!(&pk[16..24], &pk_a);
         assert_eq!(&pk[24..32], &pk_d);
-        let vals: Vec<i64> = (0..4)
-            .map(|i| i64::from_le_bytes(col0[i * 8..i * 8 + 8].try_into().unwrap()))
-            .collect();
+        let vals: Vec<i64> = (0..4).map(|i| gnitz_wire::read_i64_le(&col0, i * 8)).collect();
         assert_eq!(vals, vec![30, 20, 10, 40]);
-        let weights: Vec<i64> = (0..4)
-            .map(|i| i64::from_le_bytes(wt[i * 8..i * 8 + 8].try_into().unwrap()))
-            .collect();
+        let weights: Vec<i64> = (0..4).map(|i| gnitz_wire::read_i64_le(&wt, i * 8)).collect();
         assert_eq!(weights, vec![1, 1, 1, 1]);
     }
 
@@ -836,9 +826,7 @@ mod tests {
         assert_eq!(&pk[16..32], &pk_b);
         assert_eq!(&pk[32..48], &pk_a);
         assert_eq!(&pk[48..64], &pk_d);
-        let vals: Vec<i64> = (0..4)
-            .map(|i| i64::from_le_bytes(col0[i * 8..i * 8 + 8].try_into().unwrap()))
-            .collect();
+        let vals: Vec<i64> = (0..4).map(|i| gnitz_wire::read_i64_le(&col0, i * 8)).collect();
         assert_eq!(vals, vec![30, 20, 10, 40]);
     }
 
@@ -903,13 +891,9 @@ mod tests {
         assert_eq!(&pk[0..8], &pk_c);
         assert_eq!(&pk[8..16], &pk_a);
         assert_eq!(&pk[16..24], &pk_b);
-        let weights: Vec<i64> = (0..3)
-            .map(|i| i64::from_le_bytes(wt[i * 8..i * 8 + 8].try_into().unwrap()))
-            .collect();
+        let weights: Vec<i64> = (0..3).map(|i| gnitz_wire::read_i64_le(&wt, i * 8)).collect();
         assert_eq!(weights, vec![5, -1, 3]);
-        let vals: Vec<i64> = (0..3)
-            .map(|i| i64::from_le_bytes(col0[i * 8..i * 8 + 8].try_into().unwrap()))
-            .collect();
+        let vals: Vec<i64> = (0..3).map(|i| gnitz_wire::read_i64_le(&col0, i * 8)).collect();
         assert_eq!(vals, vec![9, 7, 8]);
     }
 
@@ -971,13 +955,9 @@ mod tests {
         assert_eq!(&pk[0..16], &pk_c);
         assert_eq!(&pk[16..32], &pk_a);
         assert_eq!(&pk[32..48], &pk_b);
-        let weights: Vec<i64> = (0..3)
-            .map(|i| i64::from_le_bytes(wt[i * 8..i * 8 + 8].try_into().unwrap()))
-            .collect();
+        let weights: Vec<i64> = (0..3).map(|i| gnitz_wire::read_i64_le(&wt, i * 8)).collect();
         assert_eq!(weights, vec![5, -1, 3]);
-        let vals: Vec<i64> = (0..3)
-            .map(|i| i64::from_le_bytes(col0[i * 8..i * 8 + 8].try_into().unwrap()))
-            .collect();
+        let vals: Vec<i64> = (0..3).map(|i| gnitz_wire::read_i64_le(&col0, i * 8)).collect();
         assert_eq!(vals, vec![9, 7, 8]);
     }
 }

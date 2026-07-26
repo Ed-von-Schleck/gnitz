@@ -278,10 +278,9 @@ impl AdhocFold {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::foundation::codec::read_i64_le;
     use crate::schema::{type_code, SchemaColumn};
     use crate::storage::Layout;
-    use gnitz_wire::{AggFunc, AggReadItem, AGG_COUNT, AGG_COUNT_NON_NULL, AGG_MAX, AGG_MIN, AGG_SUM};
+    use gnitz_wire::{read_i64_le, AggFunc, AggReadItem, AGG_COUNT, AGG_COUNT_NON_NULL, AGG_MAX, AGG_MIN, AGG_SUM};
 
     // Source: pk(U64), grp(I64), val(I64, nullable). val is payload slot 1.
     fn src_schema() -> SchemaDescriptor {

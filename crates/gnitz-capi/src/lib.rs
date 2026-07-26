@@ -425,9 +425,7 @@ fn append_row_inner(
                 if offset + 16 > col_data.len() {
                     return Err(format!("col_data too short for U128 at col {ci}"));
                 }
-                let lo = u64::from_le_bytes(col_data[offset..offset + 8].try_into().unwrap());
-                let hi = u64::from_le_bytes(col_data[offset + 8..offset + 16].try_into().unwrap());
-                v.push(((hi as u128) << 64) | lo as u128);
+                v.push(u128::from_le_bytes(col_data[offset..offset + 16].try_into().unwrap()));
                 offset += 16;
             }
         }

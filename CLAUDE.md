@@ -456,7 +456,7 @@ they are separate crates, so a `storage`-layer `use gnitz_expr::RowSource` is no
 an up-edge into the engine's own `expr` module. Read `expr` in the ladder above as
 the engine-local expression layer only.
 
-- **`foundation`** (L0) — unrelated leaves grouped only for layering: `log` (the `gnitz_*` macros), `codec` (LE pack/unpack), `xxh` (XXH3), `posix_io` (fd I/O, fsync, sockets), `syscall` (eventfd/futex/memfd/mmap), `worker_ctx` (worker rank/count).
+- **`foundation`** (L0) — unrelated leaves grouped only for layering: `log` (the `gnitz_*` macros), `env` (numeric `GNITZ_*` overrides), `xxh` (XXH3), `posix_io` (fd I/O, fsync, sockets, mmap + its unaligned `*_raw` accessors, eventfd/futex/memfd), `worker_ctx` (worker rank/count). Every little-endian byte primitive lives in `gnitz-wire`, not here.
 - **`schema`** — SQL type constants, schema descriptors, row-format helpers, and the order-preserving-key cluster (`key`). Shared by the storage, IPC, and query layers.
 - **`storage`** — the WAL/shard/MemTable stack behind one curated facade, in two sub-layers:
   - `repr` (L2) — the in-memory batch and the kernels over it: `batch` (region layout), `batch_wire` (wire/shard serde), `batch_pool` (buffer recycling), `columnar` (comparators), `merge` (sort-merge consolidation), `scatter` (exchange repartition), `heap` (k-way merge), `bloom`/`xor8` (PK-probe filters).

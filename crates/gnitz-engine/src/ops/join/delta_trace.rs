@@ -77,10 +77,10 @@ pub fn op_join_delta_trace(
 mod tests {
     use super::super::test_common::*;
     use super::*;
-    use crate::foundation::codec::read_i64_le;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::{Batch, Layout};
     use crate::test_support::{make_wide_batch, wide_pk_3xu64_schema};
+    use gnitz_wire::read_i64_le;
 
     /// Inner join delta×trace on a narrow (I32, 4-byte) signed PK. Every delta
     /// key has a trace match; all must be found, including the smallest key

@@ -25,9 +25,9 @@ mod tests {
     use super::super::shard_reader::MappedShard;
     use super::merge::{find_guard_for_key, open_shards};
     use super::*;
-    use crate::foundation::codec::{read_i64_le, read_u32_le};
     use crate::schema::key::pack_pk_be;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+    use gnitz_wire::{read_i64_le, read_u32_le};
     use std::ffi::CStr;
     use std::fs;
     use type_code::{I64 as TYPE_I64, STRING as TYPE_STRING, U64 as TYPE_U64};
@@ -37,7 +37,7 @@ mod tests {
         let pi = schema
             .try_payload_idx(col_idx)
             .expect("is_null test helper: col_idx is a payload column");
-        (null_word >> pi) & 1 != 0
+        gnitz_wire::null_word_get(null_word, pi)
     }
 
     // Helper: build a minimal shard file in memory and write to disk
@@ -1020,11 +1020,7 @@ mod tests {
         assert_compare_pk_bytes_sorted(&merged);
         // PK region is OPK; decode each column back to its native I64 value.
         let present: Vec<i64> = (0..merged.count)
-            .map(|i| {
-                let mut le = [0u8; 8];
-                gnitz_wire::decode_pk_column(merged.get_pk_bytes(i), type_code::I64, &mut le);
-                i64::from_le_bytes(le)
-            })
+            .map(|i| crate::test_support::opk_pk_i64(merged.get_pk_bytes(i)))
             .collect();
         assert_eq!(present, vec![-5, -2, 3, 10], "must be signed-sorted, not raw-LE");
 
@@ -1173,7 +1169,7 @@ mod tests {
                     .payload_columns()
                     .map(|(pi, _ci, col)| {
                         let cs = col.size() as usize;
-                        if (nw >> pi) & 1 == 1 {
+                        if gnitz_wire::null_word_get(nw, pi) {
                             DiffCell::Null
                         } else if gnitz_wire::is_german_string(col.type_code) {
                             let st: [u8; 16] = shard.get_col_ptr(i, pi, 16).try_into().unwrap();

@@ -706,7 +706,7 @@ pub(super) fn emit_reduce(
     group_cols: &[u16],
     agg: &[(gnitz_wire::AggFunc, u16)],
     global_ground: bool,
-    out_key: gnitz_wire::ReduceOutKey,
+    out_key: crate::schema::ReduceOutKey,
     in_regs: &HashMap<i32, i32>,
 ) -> Result<(), CompileError> {
     let loaded = ctx.loaded;
@@ -891,7 +891,7 @@ pub(super) fn emit_reduce(
         replicated
             || worker_rank() as usize
                 == crate::ops::worker_for_partition(
-                    crate::storage::partition_for_key(crate::ops::global_group_key()),
+                    crate::schema::key::partition_for_key(crate::ops::global_group_key()),
                     num_workers() as usize,
                 )
     };

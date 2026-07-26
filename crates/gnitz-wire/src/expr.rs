@@ -152,7 +152,7 @@ pub fn decode_expr_blob(blob: &[u8]) -> Option<ExprBlob> {
     if blob.len() < EXPR_BLOB_HEADER_SIZE {
         return None;
     }
-    if u32::from_le_bytes(blob[0..4].try_into().unwrap()) != EXPR_BLOB_MAGIC {
+    if crate::read_u32_le(blob, 0) != EXPR_BLOB_MAGIC {
         return None;
     }
     if blob[4] != EXPR_BLOB_VERSION {
@@ -163,8 +163,8 @@ pub fn decode_expr_blob(blob: &[u8]) -> Option<ExprBlob> {
     }
     let num_regs = u16::from_le_bytes(blob[6..8].try_into().unwrap()) as u32;
     let result_reg = u16::from_le_bytes(blob[8..10].try_into().unwrap()) as u32;
-    let n = u32::from_le_bytes(blob[12..16].try_into().unwrap());
-    if n % 4 != 0 {
+    let n = crate::read_u32_le(blob, 12);
+    if !n.is_multiple_of(4) {
         return None;
     }
     let code_bytes = (n as usize) * 4;
@@ -176,7 +176,7 @@ pub fn decode_expr_blob(blob: &[u8]) -> Option<ExprBlob> {
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    let s_count = u32::from_le_bytes(blob[code_end..code_end + 4].try_into().unwrap());
+    let s_count = crate::read_u32_le(blob, code_end);
     let mut cur = code_end + 4;
     // Each string costs at least its 4-byte length prefix; bound s_count against the
     // remaining bytes before reserving, so a corrupt count can't drive a huge with_capacity.
@@ -188,7 +188,7 @@ pub fn decode_expr_blob(blob: &[u8]) -> Option<ExprBlob> {
         if blob.len() < cur + 4 {
             return None;
         }
-        let l = u32::from_le_bytes(blob[cur..cur + 4].try_into().unwrap()) as usize;
+        let l = crate::read_u32_le(blob, cur) as usize;
         cur += 4;
         if blob.len() < cur + l {
             return None;

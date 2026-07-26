@@ -465,7 +465,7 @@ mod tests {
         gcols: &[u32],
         in_schema: SchemaDescriptor,
         out_schema: SchemaDescriptor,
-        out_key: gnitz_wire::ReduceOutKey,
+        out_key: crate::schema::ReduceOutKey,
     ) {
         let plan_idx = b.add_reduce_plan(crate::ops::ReducePlan::new(
             &in_schema,

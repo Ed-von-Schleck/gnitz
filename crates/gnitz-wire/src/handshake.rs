@@ -80,7 +80,7 @@ pub fn decode_hello_payload(payload: &[u8]) -> Result<HelloHeader, &'static str>
     if payload.len() != HELLO_PAYLOAD_LEN as usize {
         return Err("hello payload wrong size");
     }
-    let magic = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+    let magic = crate::read_u32_le(payload, 0);
     let version = u16::from_le_bytes(payload[4..6].try_into().unwrap());
     // bytes [6..8] are reserved padding
     Ok(HelloHeader { magic, version })
@@ -118,11 +118,11 @@ pub fn decode_hello_ack(payload: &[u8]) -> Result<HelloAck, &'static str> {
     if payload.len() != HELLO_ACK_PAYLOAD_LEN as usize {
         return Err("hello ack payload wrong size");
     }
-    let magic = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+    let magic = crate::read_u32_le(payload, 0);
     let status = u16::from_le_bytes(payload[4..6].try_into().unwrap());
     // bytes [6..8] are reserved padding
-    let limit_bytes = u32::from_le_bytes(payload[8..12].try_into().unwrap());
-    let published_lsn = u64::from_le_bytes(payload[12..20].try_into().unwrap());
+    let limit_bytes = crate::read_u32_le(payload, 8);
+    let published_lsn = crate::read_u64_le(payload, 12);
     Ok(HelloAck {
         magic,
         status,
@@ -150,7 +150,7 @@ mod hello_tests {
         // padding at 6..8.
         let payload = encode_hello_payload(0x1234);
         assert_eq!(payload.len(), HELLO_PAYLOAD_LEN as usize);
-        let magic = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+        let magic = crate::read_u32_le(&payload, 0);
         assert_eq!(magic, HELLO_MAGIC);
         let version = u16::from_le_bytes(payload[4..6].try_into().unwrap());
         assert_eq!(version, 0x1234);
@@ -178,16 +178,16 @@ mod hello_tests {
     fn ack_frame_layout_is_stable() {
         let ack = encode_hello_ack(HELLO_STATUS_OK, 16 * 1024 * 1024, 0x0102_0304_0506_0708);
         assert_eq!(ack.len(), HELLO_ACK_FRAME_SIZE);
-        let prefix = u32::from_le_bytes(ack[0..4].try_into().unwrap());
+        let prefix = crate::read_u32_le(&ack, 0);
         assert_eq!(prefix, HELLO_ACK_PAYLOAD_LEN);
-        let magic = u32::from_le_bytes(ack[4..8].try_into().unwrap());
+        let magic = crate::read_u32_le(&ack, 4);
         assert_eq!(magic, HELLO_MAGIC);
         let status = u16::from_le_bytes(ack[8..10].try_into().unwrap());
         assert_eq!(status, HELLO_STATUS_OK);
         // [10..12] are reserved padding.
-        let limit = u32::from_le_bytes(ack[12..16].try_into().unwrap());
+        let limit = crate::read_u32_le(&ack, 12);
         assert_eq!(limit, 16 * 1024 * 1024);
-        let published_lsn = u64::from_le_bytes(ack[16..24].try_into().unwrap());
+        let published_lsn = crate::read_u64_le(&ack, 16);
         assert_eq!(published_lsn, 0x0102_0304_0506_0708);
     }
 

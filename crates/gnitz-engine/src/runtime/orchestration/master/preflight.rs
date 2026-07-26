@@ -139,9 +139,7 @@ pub(super) fn format_pk_value_bytes(pk_bytes: &[u8], schema: &SchemaDescriptor) 
         // pk_bytes are OPK; decode each column back to native LE before reading
         // its scalar value. Reading OPK as native LE would render garbage for
         // signed columns (flipped sign bit) and any multi-byte unsigned column.
-        let mut le = [0u8; 16];
-        gnitz_wire::decode_pk_column(&pk_bytes[off..off + size], col.type_code, &mut le[..size]);
-        let v = u128::from_le_bytes(le);
+        let v = gnitz_wire::pk_native_key(pk_bytes, off, size, col.type_code);
         let s = match col.type_code {
             crate::schema::type_code::U128 => format!("{v}"),
             crate::schema::type_code::UUID => gnitz_wire::format_uuid(v),
@@ -2405,7 +2403,7 @@ impl MasterDispatcher {
                 out.push_row(
                     PkBuf::from_bytes(b.get_pk_bytes(j)),
                     proj_meta.iter().enumerate().map(|(k, &(col_type, col_size))| {
-                        if null_word & (1u64 << k) != 0 {
+                        if gnitz_wire::null_word_get(null_word, k) {
                             None
                         } else {
                             Some(payload_native_key(col_slices[k], j * col_size, col_size, col_type))

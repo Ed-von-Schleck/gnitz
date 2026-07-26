@@ -10,9 +10,9 @@ use super::super::batch::{FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, R
 use super::super::merge::{ColPtr, UnifiedSource};
 use super::super::xor8;
 use super::{MappedShard, PackedRegion, PayloadRegion, ScalarRegion, WeightRegion};
-use crate::foundation::codec::{read_i64_le, read_u64_le};
 use crate::schema::key::PkBuf;
 use crate::schema::{SchemaDescriptor, MAX_COLUMNS};
+use gnitz_wire::{read_i64_le, read_u64_le};
 
 impl ScalarRegion {
     /// This region as a uniform `(base, stride)` [`ColPtr`]: `Raw` points into

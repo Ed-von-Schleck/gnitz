@@ -16,9 +16,10 @@ use crate::runtime::sal::{
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::w2m_ring;
 use crate::runtime::wire::{self as ipc, FLAG_CONTINUATION, FLAG_SCAN_LAST, STATUS_ERROR, STATUS_OK};
+use crate::schema::key::PkBuf;
 use crate::schema::SchemaDescriptor;
 use crate::storage::{schema_wire_safe, Batch};
-use crate::storage::{BlobCacheGuard, FlushOutcome, FlushWork, PkBuf, StorageError, Table};
+use crate::storage::{BlobCacheGuard, FlushOutcome, FlushWork, StorageError, Table};
 
 // ---------------------------------------------------------------------------
 // WorkerExchangeHandler

@@ -251,7 +251,7 @@ mod avi_encode_tests {
     // the row index, keeping every PK distinct. `vals` are native values (signed
     // ones as their `i128` value) in ascending order.
     fn check_pk_source(tc: TypeCode, vals: &[i128]) {
-        let signed = crate::schema::is_signed_int(tc as u8);
+        let signed = gnitz_wire::is_signed_int(tc as u8);
         let schema = SchemaDescriptor::new(
             &[
                 SchemaColumn::new(type_code::U64, 0),

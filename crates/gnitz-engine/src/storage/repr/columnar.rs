@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::RowSource;
-use gnitz_wire::compare_german_strings;
+use gnitz_wire::{compare_german_strings, null_word_get, read_unsigned_exact};
 
 // ---------------------------------------------------------------------------
 // ColumnarSource trait
@@ -84,8 +84,8 @@ fn compare_rows_impl<const SKIP: bool, A: RowSource, B: RowSource>(
         if SKIP && (skip_mask >> payload_col) & 1 != 0 {
             continue;
         }
-        let null_a = (null_word_a >> payload_col) & 1 != 0;
-        let null_b = (null_word_b >> payload_col) & 1 != 0;
+        let null_a = null_word_get(null_word_a, payload_col);
+        let null_b = null_word_get(null_word_b, payload_col);
         if null_a && null_b {
             continue;
         }
@@ -304,30 +304,25 @@ pub(crate) fn compare_rows_fixedint_nonnull<A: RowSource, B: RowSource>(
     src_b: &B,
     row_b: usize,
 ) -> Ordering {
-    use crate::schema::read_unsigned;
     debug_assert!(
         schema_is_fixedint_nonnull(schema),
         "compare_rows_fixedint_nonnull on a non-fixedint or nullable schema",
-    );
-    // Shift-safety tripwire, hoisted out of the per-column loop below since the
-    // bound is schema-level (constant across every comparison). `cs*8-1` must
-    // stay a valid u64 shift, so every payload column must be ≤ 8 bytes.
-    // `schema_is_fixedint_nonnull` already implies this (FixedIntNonnull excludes
-    // U128/UUID); this guards a future maintainer who widens the predicate without
-    // revisiting the shift, which would otherwise become `1 << 127`.
-    debug_assert!(
-        schema.payload_columns().all(|(_, _, col)| col.size() <= 8),
-        "compare_rows_fixedint_nonnull: payload column wider than 8 bytes",
     );
     for (payload_col, _ci, col) in schema.payload_columns() {
         let cs = col.size() as usize;
         // Branchless sign-flip: signed columns flip their MSB so two's-complement
         // negatives sort below non-negatives; `is_signed` is 0 for unsigned
         // columns, so the XOR is a no-op there. `cs*8-1 ∈ {7,15,31,63}` is always
-        // a valid u64 shift. Reads `size`/`is_signed` only — never `type_code`.
+        // a valid u64 shift, because `FixedIntNonnull` admits a column only if
+        // `is_fixed_int(type_code)` — which is exactly "1/2/4/8 bytes", pinned by
+        // `gnitz_wire`'s `is_fixed_int_implies_shiftable_width`. Reads
+        // `size`/`is_signed` only — never `type_code`.
         let sign_flip = (col.is_signed() as u64) << (cs * 8 - 1);
-        let av = read_unsigned(src_a.get_col_ptr(row_a, payload_col, cs), cs) ^ sign_flip;
-        let bv = read_unsigned(src_b.get_col_ptr(row_b, payload_col, cs), cs) ^ sign_flip;
+        // `get_col_ptr` returns exactly `cs` bytes, so this is the exact-width
+        // read: the width form's `bytes[..cs]` bound is an out-of-line call at
+        // `opt-level=0`, twice per comparison, on the hottest merge comparator.
+        let av = read_unsigned_exact(src_a.get_col_ptr(row_a, payload_col, cs)) ^ sign_flip;
+        let bv = read_unsigned_exact(src_b.get_col_ptr(row_b, payload_col, cs)) ^ sign_flip;
         let ord = av.cmp(&bv);
         if ord != Ordering::Equal {
             return ord;
@@ -419,7 +414,7 @@ mod tests {
             &[]
         }
         fn get_null_word(&self, row: usize) -> u64 {
-            crate::foundation::codec::read_u64_le(&self.null_bmp, row * 8)
+            gnitz_wire::read_u64_le(&self.null_bmp, row * 8)
         }
         fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
             let off = row * col_size;
@@ -707,7 +702,7 @@ mod tests {
     /// the fast path matches the generic comparator for every ordered pair.
     fn check_single_col_fixedint(tc: u8, vals: &[i128]) {
         let schema = make_schema(&[(tc, 0)]);
-        let cs = SchemaColumn::new(tc, 0).size() as usize;
+        let cs = gnitz_wire::wire_stride(tc);
         let mut col = Vec::new();
         for &v in vals {
             col.extend_from_slice(&v.to_le_bytes()[..cs]);
@@ -752,7 +747,7 @@ mod tests {
         ] {
             let schema = make_schema(&[(c0, 0), (c1, 0)]);
             let (col0, col1) = mixed_rows(c0, c1);
-            let n = col0.len() / SchemaColumn::new(c0, 0).size() as usize;
+            let n = col0.len() / gnitz_wire::wire_stride(c0);
             let mut null_bmp = Vec::new();
             for _ in 0..n {
                 null_bmp.extend_from_slice(&0u64.to_le_bytes());
@@ -777,8 +772,8 @@ mod tests {
     /// Build two payload columns of types `(a, b)` with rows spanning negative,
     /// zero, small-positive, and high-bit-set values so signedness matters.
     fn mixed_rows(a: u8, b: u8) -> (Vec<u8>, Vec<u8>) {
-        let cs_a = SchemaColumn::new(a, 0).size() as usize;
-        let cs_b = SchemaColumn::new(b, 0).size() as usize;
+        let cs_a = gnitz_wire::wire_stride(a);
+        let cs_b = gnitz_wire::wire_stride(b);
         // (col0, col1) value pairs as i128 images; -1 stresses signed ordering,
         // the large positive stresses unsigned high-bit ordering.
         let pairs: &[(i128, i128)] = &[(-1, 5), (-1, 7), (0, 0), (1, -1), (1, 9)];
@@ -873,7 +868,7 @@ mod tests {
                 let cols: Vec<_> = types
                     .iter()
                     .map(|&t| {
-                        let cs = SchemaColumn::new(t, 0).size() as usize;
+                        let cs = gnitz_wire::wire_stride(t);
                         prop::collection::vec(any::<u8>(), n * cs)
                     })
                     .collect();

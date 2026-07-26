@@ -319,7 +319,7 @@ mod tests {
     };
 
     fn get_payload_i64(b: &Batch, row: usize) -> i64 {
-        crate::foundation::codec::read_i64_le(b.col_data(0), row * 8)
+        gnitz_wire::read_i64_le(b.col_data(0), row * 8)
     }
 
     // -----------------------------------------------------------------------
@@ -651,11 +651,7 @@ mod tests {
         assert_eq!(out.count, 5);
         assert!(out.is_sorted());
         let pks: Vec<i64> = (0..out.count)
-            .map(|i| {
-                let mut le = [0u8; 8];
-                gnitz_wire::decode_pk_column(out.get_pk_bytes(i), type_code::I64, &mut le);
-                i64::from_le_bytes(le)
-            })
+            .map(|i| crate::test_support::opk_pk_i64(out.get_pk_bytes(i)))
             .collect();
         assert_eq!(pks, vec![-5, -1, 0, 3, 7], "signed ascending PK order");
     }

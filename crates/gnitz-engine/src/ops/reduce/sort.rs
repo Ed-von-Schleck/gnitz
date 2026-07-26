@@ -2,8 +2,9 @@
 
 use std::cmp::Ordering;
 
+use crate::schema::key::compare_pk_bytes;
 use crate::schema::{key::PkSortKey, ColumnLocator, SchemaDescriptor, TypeCode};
-use crate::storage::{cmp_col_window, compare_pk_bytes, Batch, MemBatch};
+use crate::storage::{cmp_col_window, Batch, MemBatch};
 use gnitz_expr::RowSource;
 
 /// Compare two rows by group columns through pre-resolved [`ColumnLocator`]s
@@ -166,8 +167,9 @@ pub(super) fn argsort_pk_canonical(mb: &MemBatch) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::argsort_pk_canonical;
+    use crate::schema::key::compare_pk_bytes;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-    use crate::storage::{compare_pk_bytes, Batch};
+    use crate::storage::Batch;
 
     /// One batch row per supplied OPK byte vector (each must be `pk_stride` bytes),
     /// weight 1, null word 0, one zeroed I64 payload column — all the PK-sort paths

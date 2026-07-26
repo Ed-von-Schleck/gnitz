@@ -231,7 +231,7 @@ impl ColPromoter {
 /// every key arity and width. At arity 1 the output is byte-identical to the
 /// retained `#[cfg(test)] PkPromoter::promote_into` oracle.
 pub(super) struct ReindexPacker {
-    cols: [ColPromoter; gnitz_wire::MAX_PK_COLUMNS], // first `num_cols` valid
+    cols: [ColPromoter; crate::schema::MAX_PK_COLUMNS], // first `num_cols` valid
     num_cols: usize,
     pub(super) out_stride: usize,
 }
@@ -248,11 +248,11 @@ impl ReindexPacker {
         // these bounds must hold in release too. Each runs once per packer (out
         // of any row loop) — negligible cost.
         assert!(
-            reindex_cols.len() <= gnitz_wire::MAX_PK_COLUMNS,
+            reindex_cols.len() <= crate::schema::MAX_PK_COLUMNS,
             "ReindexPacker: {} reindex columns exceed MAX_PK_COLUMNS",
             reindex_cols.len()
         );
-        let mut cols = [ColPromoter::PLACEHOLDER; gnitz_wire::MAX_PK_COLUMNS];
+        let mut cols = [ColPromoter::PLACEHOLDER; crate::schema::MAX_PK_COLUMNS];
         let mut out_off = 0usize;
         for (i, &c) in reindex_cols.iter().enumerate() {
             let col_idx = c as usize;
@@ -278,9 +278,7 @@ impl ReindexPacker {
             // slot, so assert the invariant the encoders rely on. (Internal
             // type-system invariant, fully determined by `resolve_reindex_type`
             // — not input-driven, so debug-only is enough.)
-            debug_assert!(
-                out_size >= crate::schema::type_size(src_tc) as usize || !matches!(kind, PromoteKind::Narrow { .. })
-            );
+            debug_assert!(out_size >= gnitz_wire::wire_stride(src_tc) || !matches!(kind, PromoteKind::Narrow { .. }));
             cols[i] = ColPromoter {
                 out_off,
                 out_size,
@@ -290,7 +288,7 @@ impl ReindexPacker {
             out_off += out_size;
         }
         assert!(
-            out_off <= gnitz_wire::MAX_PK_BYTES,
+            out_off <= crate::schema::MAX_PK_BYTES,
             "ReindexPacker: packed stride {out_off} exceeds MAX_PK_BYTES"
         );
         ReindexPacker {
@@ -312,7 +310,7 @@ impl ReindexPacker {
     /// already carries the reindex output schema (PK stride == `out_stride`).
     pub(super) fn promote_into(&self, batch: &MemBatch, output: &mut Batch) {
         debug_assert_eq!(output.pk_stride() as usize, self.out_stride);
-        let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
+        let mut buf = [0u8; crate::schema::MAX_PK_BYTES];
         for row in 0..output.count {
             // Each column fully overwrites its slot (Narrow zeroes its own pad),
             // so reusing `buf` across rows needs no inter-row clear.
@@ -758,7 +756,7 @@ mod tests {
     fn make_zeroed_batch(schema: &SchemaDescriptor, n: usize) -> Batch {
         let mut b = Batch::with_capacity(*schema, n.max(1));
         let pk_stride = schema.pk_stride() as usize;
-        let zeros = [0u8; gnitz_wire::MAX_PK_BYTES];
+        let zeros = [0u8; crate::schema::MAX_PK_BYTES];
         for _ in 0..n {
             b.extend_pk_bytes(&zeros[..pk_stride]);
             b.extend_weight(&0i64.to_le_bytes());
@@ -808,7 +806,7 @@ mod tests {
         // out_stride = 8 (Pk U64) + 4 (I32) + 16 (U128) + 16 (F64→U128) = 44.
         assert_eq!(packer.out_stride, 8 + 4 + 16 + 16);
 
-        let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
+        let mut buf = [0u8; crate::schema::MAX_PK_BYTES];
         packer.pack_into(&mut buf[..packer.out_stride], &mb, 0);
 
         // Expected: each column's OPK bytes concatenated at its offset.
@@ -967,13 +965,13 @@ mod tests {
         packer.promote_into(&mb, &mut out);
 
         for row in 0..rows.len() {
-            let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
+            let mut buf = [0u8; crate::schema::MAX_PK_BYTES];
             packer.pack_into(&mut buf[..packer.out_stride], &mb, row);
             // Trace side (stored _join_pk) == scatter side (scratch buffer).
             assert_eq!(out.get_pk_bytes(row), &buf[..packer.out_stride], "row {row} key bytes");
             assert_eq!(
-                crate::storage::partition_for_pk_bytes(out.get_pk_bytes(row)),
-                crate::storage::partition_for_pk_bytes(&buf[..packer.out_stride]),
+                crate::schema::key::partition_for_pk_bytes(out.get_pk_bytes(row)),
+                crate::schema::key::partition_for_pk_bytes(&buf[..packer.out_stride]),
                 "row {row} co-partition",
             );
         }
@@ -1042,7 +1040,7 @@ mod tests {
         let consumer = out.get_pk_bytes(0);
 
         // PATH 2 — exchange scatter: pack_into into a scratch buffer.
-        let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
+        let mut buf = [0u8; crate::schema::MAX_PK_BYTES];
         packer.pack_into(&mut buf[..packer.out_stride], &mb, 0);
         let producer = &buf[..packer.out_stride];
 
@@ -1059,9 +1057,9 @@ mod tests {
 
         // (2) CO-PARTITION teeth: producer and consumer route to the same partition
         // through the WIDE arm of partition_for_pk_bytes.
-        let p_consumer = crate::storage::partition_for_pk_bytes(consumer);
-        let p_producer = crate::storage::partition_for_pk_bytes(producer);
-        let p_oracle = crate::storage::partition_for_pk_bytes(oracle.as_slice());
+        let p_consumer = crate::schema::key::partition_for_pk_bytes(consumer);
+        let p_producer = crate::schema::key::partition_for_pk_bytes(producer);
+        let p_oracle = crate::schema::key::partition_for_pk_bytes(oracle.as_slice());
         assert_eq!(p_producer, p_consumer, "producer/consumer co-partition (wide)");
         assert_eq!(p_consumer, p_oracle, "trace store / ingest co-partition (wide)");
 
@@ -1105,8 +1103,8 @@ mod tests {
         let packer = ReindexPacker::new(&schema, &[1], &[]);
         assert_eq!(packer.out_stride, 4); // U32 key → 4-byte slot
 
-        let mut buf0 = [0u8; gnitz_wire::MAX_PK_BYTES];
-        let mut buf1 = [0u8; gnitz_wire::MAX_PK_BYTES];
+        let mut buf0 = [0u8; crate::schema::MAX_PK_BYTES];
+        let mut buf1 = [0u8; crate::schema::MAX_PK_BYTES];
         packer.pack_into(&mut buf0[..packer.out_stride], &mb, 0);
         packer.pack_into(&mut buf1[..packer.out_stride], &mb, 1);
 

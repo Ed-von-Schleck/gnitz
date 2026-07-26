@@ -169,15 +169,14 @@ fn compute_blob_passthrough(in_schema: &SchemaDescriptor, col_moves: &[ColMove])
     {
         return false;
     }
-    // Each input German-string column (never a PK, so it has a dense payload
-    // index) must be the source of some ColMove; a dropped one leaves dead heap.
+    // Each input German-string column must be the source of some ColMove; a
+    // dropped one leaves dead heap. Compared as whole locators — `ColMove::src`
+    // is exactly what `locate` produced for its source column.
     (0..in_schema.num_columns())
         .filter(|&ci| gnitz_wire::is_german_string(in_schema.columns[ci].type_code))
         .all(|ci| {
-            let pi = in_schema.payload_mapping_byte(ci);
-            col_moves
-                .iter()
-                .any(|cm| matches!(cm.src, ColumnLocator::Payload { slot, .. } if slot == pi))
+            let src = in_schema.locate(ci);
+            col_moves.iter().any(|cm| cm.src == src)
         })
 }
 
@@ -204,11 +203,21 @@ impl NullPerm {
         NullPerm { pairs }
     }
 
-    #[inline]
+    /// `#[inline(always)]`: called once per mapped row by `write_rows`, and at
+    /// `opt-level=0` a plain hint leaves this frame a real call.
+    ///
+    /// Indexed, not `for &(src, dst) in &self.pairs`: at `opt-level=0` the slice
+    /// iterator's `next` stays an out-of-line call, so the iterator form costs a
+    /// call per (row × pair) that `inline(always)` on this body cannot remove.
+    #[inline(always)]
     fn apply(&self, in_null: u64) -> u64 {
         let mut out: u64 = 0;
-        for &(src, dst) in &self.pairs {
-            out |= ((in_null >> src) & 1) << dst;
+        let pairs = self.pairs.as_slice();
+        let mut i = 0;
+        while i < pairs.len() {
+            let (src, dst) = pairs[i];
+            out |= (gnitz_wire::null_word_get(in_null, src as usize) as u64) << dst;
+            i += 1;
         }
         out
     }
@@ -226,7 +235,7 @@ impl NullPerm {
             return;
         }
         for row in 0..n {
-            let in_null = crate::foundation::codec::read_u64_le(in_null_bmp, (src_start + row) * 8);
+            let in_null = gnitz_wire::read_u64_le(in_null_bmp, (src_start + row) * 8);
             dst[row * 8..row * 8 + 8].copy_from_slice(&self.apply(in_null).to_le_bytes());
         }
     }
@@ -706,8 +715,8 @@ impl ScalarFunc {
                         for_each_null_row(&scratch.null_bits, base_null_r, m, |i| {
                             win[i * 8..i * 8 + 8].fill(0);
                             let off = (row0 + i) * 8;
-                            let merged =
-                                u64::from_le_bytes(nb[off..off + 8].try_into().unwrap()) | (1u64 << out_payload);
+                            let mut merged = gnitz_wire::read_u64_le(nb, off);
+                            gnitz_wire::null_word_set(&mut merged, out_payload, true);
                             nb[off..off + 8].copy_from_slice(&merged.to_le_bytes());
                         });
                     }

@@ -363,7 +363,7 @@ fn test_restart_full() {
 fn test_restart_long_strings() {
     let dir = temp_dir("restart_long_str");
     let long_name = "this_is_a_very_long_table_name_exceeding_inline_threshold";
-    assert!(long_name.len() > crate::schema::SHORT_STRING_THRESHOLD);
+    assert!(long_name.len() > gnitz_wire::SHORT_STRING_THRESHOLD);
 
     {
         let mut engine = CatalogEngine::open(&dir).unwrap();

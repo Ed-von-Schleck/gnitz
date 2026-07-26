@@ -11,13 +11,16 @@
 //! the crate root (`gnitz_expr::FOO`), matching `gnitz-wire`'s leaf-crate shape.
 //!
 //! What lives here is the *resolved addressing* substrate — [`ColumnLocator`]
-//! (where a logical column physically sits in a row) and the access traits it
-//! reads through ([`RowSource`], and [`BatchView`] for the vectorized kernels).
+//! (where a logical column physically sits in a row), the access traits it
+//! reads through ([`RowSource`], and [`BatchView`] for the vectorized kernels),
+//! and [`SchemaFacts`], the schema surface the compiler resolves against.
 
 mod locator;
+mod schema_facts;
 mod view;
 
 pub use locator::*;
+pub use schema_facts::*;
 pub use view::*;
 
 #[cfg(test)]

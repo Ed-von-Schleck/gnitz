@@ -166,7 +166,7 @@ pub fn f64_at(batch: &ZSetBatch, col: usize, row: usize) -> f64 {
 /// Is the payload column at schema index `col` NULL in `row`? The null word
 /// is indexed by payload position (schema index minus the single PK column).
 pub fn is_null_at(batch: &ZSetBatch, payload_idx: usize, row: usize) -> bool {
-    (batch.nulls[row] >> payload_idx) & 1 != 0
+    gnitz_core::null_word_get(batch.nulls[row], payload_idx)
 }
 
 /// Scan the circuit `nodes` system table once, for reuse across several

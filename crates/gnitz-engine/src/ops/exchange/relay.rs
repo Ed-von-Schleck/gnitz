@@ -4,8 +4,9 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
 
+use crate::schema::key::{compare_pk_ordering, pack_pk_be};
 use crate::schema::SchemaDescriptor;
-use crate::storage::{compare_pk_ordering, pack_pk_be, scatter_multi_source, write_to_batch, Batch, Layout, MemBatch};
+use crate::storage::{scatter_multi_source, write_to_batch, Batch, Layout, MemBatch};
 
 use super::router::{build_w_map, RouteMode, ScatterKey};
 // Reached only from the `#[cfg(test)]` co-partition tests; production relay
@@ -17,7 +18,7 @@ use super::super::reindex::ReindexPacker;
 #[cfg(test)]
 use super::router::worker_for_partition;
 #[cfg(test)]
-use crate::storage::{compare_pk_bytes, partition_for_key, partition_for_pk_bytes};
+use crate::schema::key::{compare_pk_bytes, partition_for_key, partition_for_pk_bytes};
 
 // Thread-local pool: reuse Vec<Vec<(u8,u32)>> worker-row scratch across calls.
 thread_local! {
@@ -1247,7 +1248,7 @@ mod tests {
 
         let packer = ReindexPacker::new(&schema, &cols, &[]);
         let expected_worker = |sb: &Batch, r: usize| -> usize {
-            let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
+            let mut buf = [0u8; crate::schema::MAX_PK_BYTES];
             packer.pack_into(&mut buf[..packer.out_stride], &sb.as_mem_batch(), r);
             worker_for_partition(partition_for_pk_bytes(&buf[..packer.out_stride]), num_workers)
         };
@@ -1337,7 +1338,7 @@ mod tests {
 
         let packer = ReindexPacker::new(&schema, &cols, &targets);
         let expected_worker = |sb: &Batch, r: usize| -> usize {
-            let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
+            let mut buf = [0u8; crate::schema::MAX_PK_BYTES];
             packer.pack_into(&mut buf[..packer.out_stride], &sb.as_mem_batch(), r);
             worker_for_partition(partition_for_pk_bytes(&buf[..packer.out_stride]), num_workers)
         };
@@ -1416,7 +1417,7 @@ mod tests {
         assert_eq!(total_rows(&pk_repart), pk_rows.len(), "PK-key: no dropped rows");
         for (w, sb) in pk_repart.iter().enumerate() {
             for r in 0..sb.count {
-                let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
+                let mut buf = [0u8; crate::schema::MAX_PK_BYTES];
                 pk_packer.pack_into(&mut buf[..pk_packer.out_stride], &sb.as_mem_batch(), r);
                 assert_eq!(
                     worker_for_partition(partition_for_pk_bytes(&buf[..pk_packer.out_stride]), num_workers),

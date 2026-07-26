@@ -1,7 +1,8 @@
 //! Incremental REDUCE operator: δ_out = Agg(history + δ_in) − Agg(history).
 
+use crate::schema::key::pk_bytes_eq;
 use crate::schema::key::NarrowPkOpk;
-use crate::storage::{pk_bytes_eq, scatter_copy, Batch, DrainGuard, MemBatch, ReadCursor};
+use crate::storage::{scatter_copy, Batch, DrainGuard, MemBatch, ReadCursor};
 
 use super::super::util::{extract_group_key, global_group_key};
 use super::agg::{apply_agg_from_value_index, fold_old_aggs, read_old_minmax_encoded, Accumulator, AggOp};

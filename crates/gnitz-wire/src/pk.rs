@@ -75,16 +75,18 @@ pub fn decode_pk_column(src: &[u8], tc: u8, dst: &mut [u8]) {
 /// little-endian value occupies the leading `src.len()` bytes (the column size,
 /// which must be ≤ 16). For callers that want an owned scratch buffer rather
 /// than threading one through; slice the result with `&buf[..src.len()]`.
-#[inline]
+///
+/// `#[inline(always)]` for the same reason as [`promote_opk_column`]: it is a
+/// pure forwarder reached per row through `ColumnLocator::native_le_bytes` (SUM
+/// / MIN / MAX accumulation, index-span writes, reindex promotion), and at
+/// `opt-level=0` — the profile the E2E suite runs — a plain hint is a no-op, so
+/// the locator inlines away and lands on a real call.
+#[inline(always)]
 pub fn decode_pk_column_owned(src: &[u8], tc: u8) -> [u8; 16] {
     // `src.len()` is a schema-derived column stride and never exceeds 16; the
     // `buf[..src.len()]` slice below already panics past 16, so document the
     // contract loudly (the promoted ColPromoter Pk arm newly leans on this).
-    debug_assert!(
-        src.len() <= 16,
-        "decode_pk_column_owned: column stride {} > 16",
-        src.len()
-    );
+    debug_assert!(src.len() <= 16, "decode_pk_column_owned: column stride > 16");
     let mut buf = [0u8; 16];
     decode_pk_column(src, tc, &mut buf[..src.len()]);
     buf
@@ -257,10 +259,7 @@ pub fn payload_route_key(col_data: &[u8], offset: usize, col_size: usize, type_c
             widen_pk_be(&opk[..col_size], col_size)
         }
         crate::TypeCode::F32 | crate::TypeCode::F64 | crate::TypeCode::String | crate::TypeCode::Blob => {
-            let mut bytes = [0u8; 8];
-            let copy_len = col_size.min(8);
-            bytes[..copy_len].copy_from_slice(&src[..copy_len]);
-            u64::from_le_bytes(bytes) as u128
+            crate::read_unsigned(src, col_size.min(8)) as u128
         }
     }
 }
@@ -298,12 +297,7 @@ pub fn payload_native_key(col_data: &[u8], offset: usize, col_size: usize, type_
         crate::TypeCode::U128 | crate::TypeCode::UUID | crate::TypeCode::I128 => {
             u128::from_le_bytes(col_data[offset..offset + 16].try_into().unwrap())
         }
-        _ => {
-            let mut bytes = [0u8; 8];
-            let copy_len = col_size.min(8);
-            bytes[..copy_len].copy_from_slice(&col_data[offset..offset + copy_len]);
-            u64::from_le_bytes(bytes) as u128
-        }
+        _ => crate::read_unsigned(&col_data[offset..], col_size.min(8)) as u128,
     }
 }
 

@@ -1,8 +1,8 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use super::error::StorageError;
-use crate::foundation::codec::{read_u64_le, write_u64_le};
 use crate::foundation::posix_io::open_owned;
+use gnitz_wire::{read_u64_le, write_u64_le};
 
 // ---------------------------------------------------------------------------
 // Manifest file format

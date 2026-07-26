@@ -933,7 +933,7 @@ impl ReadCursor {
     /// null (`try_payload_idx` returns `None` for them).
     pub(crate) fn col_is_null(&self, col: usize) -> bool {
         match self.schema.try_payload_idx(col) {
-            Some(pi) => (self.current_null_word >> pi) & 1 != 0,
+            Some(pi) => gnitz_wire::null_word_get(self.current_null_word, pi),
             None => false,
         }
     }

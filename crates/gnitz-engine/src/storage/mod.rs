@@ -20,7 +20,6 @@ use repr::{batch, batch_wire, columnar, merge, range_key, scatter};
 mod data_roundtrip_proptest;
 
 // ── Public API ──────────────────────────────────────────────────────────────
-pub use crate::schema::key::{partition_for_key, partition_for_pk_bytes};
 pub use batch::{range_rows, write_to_batch, Batch};
 pub use batch_wire::decode_mem_batch_from_wal_block;
 pub use error::StorageError;
@@ -42,10 +41,10 @@ pub(crate) use batch_wire::{
 pub(crate) use columnar::{
     cmp_col_window, compare_rows, compare_rows_except, compare_rows_fixedint_nonnull, with_payload_cmp,
 };
-// The PK key primitives live in `schema::key`; out-of-storage callers keep the
-// storage facade.
-pub(crate) use crate::schema::key::PkBuf;
-pub(crate) use crate::schema::key::{compare_pk_bytes, compare_pk_ordering, opk_key, pack_pk_be, pk_bytes_eq};
+// The OPK key cluster is NOT re-exported here: `schema::key` owns it and every
+// caller names `crate::schema::key::X`. Re-exporting it split one §1/§6 rule
+// across two import paths, visibly — `ops/reduce/sort.rs` and
+// `catalog/scan_spec.rs` each imported from both in adjacent lines.
 pub(crate) use gnitz_wire::wal::write_header_and_directory as wal_write_header_and_directory;
 pub(crate) use lsm::index_gather::BoundedIndexCursor;
 pub(crate) use lsm::manifest::{partition_manifest_path, peek_generation, topology_word};

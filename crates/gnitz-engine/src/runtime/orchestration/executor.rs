@@ -2128,7 +2128,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
     // hook_index_register's own owner-check still succeeds later in the loop). The
     // IDX_TAB row layout (and the IDXTAB_PAY_* payload indices) is fixed by
     // `create_index` and read identically by `hook_index_register`.
-    let mut filter_seeds: Vec<(i64, u64, FxHashSet<crate::storage::PkBuf>, bool)> = Vec::new();
+    let mut filter_seeds: Vec<(i64, u64, FxHashSet<crate::schema::key::PkBuf>, bool)> = Vec::new();
     if let Some((_, idx_batch)) = families.iter().find(|(tid, _)| *tid == IDX_TAB_ID) {
         for i in 0..idx_batch.count {
             if idx_batch.get_weight(i) > 0 && idx_batch.read_payload_u64(i, IDXTAB_PAY_IS_UNIQUE) != 0 {

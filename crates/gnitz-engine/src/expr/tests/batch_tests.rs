@@ -9,6 +9,7 @@ use super::eval_predicate_via_batch as eval_predicate;
 use crate::expr::ScalarFunc;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, MemBatch};
+use crate::test_support::make_batch_raw;
 
 /// Build + validate a filter `ScalarFunc` in one step — the shape every
 /// predicate test here needs. `from_predicate` returns a `Result`; a test
@@ -26,18 +27,6 @@ fn make_schema_2col() -> SchemaDescriptor {
         ],
         &[0],
     )
-}
-
-fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
-    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
-    for &(pk, w, val) in rows {
-        b.extend_pk(pk as u128);
-        b.extend_weight(&w.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &val.to_le_bytes());
-        b.count += 1;
-    }
-    b
 }
 
 #[test]
@@ -79,7 +68,7 @@ fn test_scratch_null_words3() {
 #[test]
 fn test_eval_batch_add() {
     let schema = make_schema_2col();
-    let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
+    let batch = make_batch_raw(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
     let mb = batch.as_mem_batch();
 
     // r0 = pk (LoadColInt col 0 → resolves to Instr::LoadPk), r1 = col[1]
@@ -121,7 +110,7 @@ fn test_eval_batch_matches_eval_predicate() {
     let prog = LogicalProgram::new(instrs, 3, 2, vec![]).resolve(&schema, false);
 
     let rows: &[(u64, i64, i64)] = &[(1, 1, 5), (2, 1, 15), (3, 1, 25), (4, 1, 0)];
-    let batch = make_batch(&schema, rows);
+    let batch = make_batch_raw(&schema, rows);
     let mb = batch.as_mem_batch();
 
     let mut scratch = EvalScratch::default();

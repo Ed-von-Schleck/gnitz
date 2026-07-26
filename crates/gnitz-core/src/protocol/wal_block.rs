@@ -69,12 +69,12 @@ fn build_pk_region(pks: &PkColumn, pk_stride: usize, schema: &Schema) -> Vec<u8>
 /// used only by the round-trip tests (production STRING columns flow through
 /// `encode_german_col` / `decode_german_col`).
 #[cfg(test)]
-fn encode_german_string(s: &str, blob: &mut Vec<u8>) -> [u8; 16] {
+fn encode_german_str(s: &str, blob: &mut Vec<u8>) -> [u8; 16] {
     gnitz_wire::encode_german_string(s.as_bytes(), blob)
 }
 
 #[cfg(test)]
-fn decode_german_string(st: [u8; 16], blob: &[u8]) -> Result<String, ProtocolError> {
+fn decode_german_str(st: [u8; 16], blob: &[u8]) -> Result<String, ProtocolError> {
     let bytes = gnitz_wire::try_decode_german_string(&st, blob)
         .ok_or_else(|| ProtocolError::DecodeError("German String blob arena out of bounds".into()))?;
     String::from_utf8(bytes).map_err(|e| ProtocolError::DecodeError(format!("utf8 in German String: {e}")))
@@ -399,12 +399,8 @@ fn decode_wal_block_impl(
         // per-row bounds check is needed.
         let pk_tc = schema.columns[schema.pk_indices()[0]].type_code as u8;
         let mut v = Vec::with_capacity(count);
-        let mut pk_buf = [0u8; 8];
         for i in 0..count {
-            let base = pk_off + i * pk_stride;
-            gnitz_wire::decode_pk_column(&data[base..base + pk_stride], pk_tc, &mut pk_buf[..pk_stride]);
-            pk_buf[pk_stride..].fill(0);
-            v.push(u64::from_le_bytes(pk_buf));
+            v.push(gnitz_wire::pk_native_key(data, pk_off + i * pk_stride, pk_stride, pk_tc) as u64);
         }
         PkColumn::U64s(v)
     } else {
@@ -414,11 +410,8 @@ fn decode_wal_block_impl(
         // extent dominated by the region-size + directory checks (as above).
         let pk_tc = schema.columns[schema.pk_indices()[0]].type_code as u8;
         let mut v = Vec::with_capacity(count);
-        let mut le = [0u8; 16];
         for i in 0..count {
-            let base = pk_off + i * 16;
-            gnitz_wire::decode_pk_column(&data[base..base + 16], pk_tc, &mut le);
-            v.push(u128::from_le_bytes(le));
+            v.push(gnitz_wire::pk_native_key(data, pk_off + i * 16, 16, pk_tc));
         }
         PkColumn::U128s(v)
     };
@@ -611,9 +604,9 @@ mod tests {
     fn test_german_string_short() {
         for s in &["", "a", "abcd", "abcdefghijkl"] {
             let mut blob = Vec::new();
-            let st = encode_german_string(s, &mut blob);
+            let st = encode_german_str(s, &mut blob);
             assert!(blob.is_empty(), "short string '{s}' should not use blob");
-            let decoded = decode_german_string(st, &[]).unwrap();
+            let decoded = decode_german_str(st, &[]).unwrap();
             assert_eq!(&decoded, s, "roundtrip failed for '{s}'");
         }
     }
@@ -622,9 +615,9 @@ mod tests {
     fn test_german_string_long() {
         for s in &["abcdefghijklm", "hello world 12345", "a".repeat(100).as_str()] {
             let mut blob = Vec::new();
-            let st = encode_german_string(s, &mut blob);
+            let st = encode_german_str(s, &mut blob);
             assert!(!blob.is_empty(), "long string should use blob");
-            let decoded = decode_german_string(st, &blob).unwrap();
+            let decoded = decode_german_str(st, &blob).unwrap();
             assert_eq!(&decoded, s, "roundtrip failed for long string");
         }
     }
@@ -635,17 +628,17 @@ mod tests {
         let s12 = "123456789012";
         assert_eq!(s12.len(), 12);
         let mut blob12 = Vec::new();
-        let st12 = encode_german_string(s12, &mut blob12);
+        let st12 = encode_german_str(s12, &mut blob12);
         assert!(blob12.is_empty());
-        assert_eq!(decode_german_string(st12, &[]).unwrap(), s12);
+        assert_eq!(decode_german_str(st12, &[]).unwrap(), s12);
 
         // length=13 → blob
         let s13 = "1234567890123";
         assert_eq!(s13.len(), 13);
         let mut blob13 = Vec::new();
-        let st13 = encode_german_string(s13, &mut blob13);
+        let st13 = encode_german_str(s13, &mut blob13);
         assert_eq!(blob13.len(), 13);
-        assert_eq!(decode_german_string(st13, &blob13).unwrap(), s13);
+        assert_eq!(decode_german_str(st13, &blob13).unwrap(), s13);
     }
 
     #[test]
@@ -658,7 +651,7 @@ mod tests {
         st[0..4].copy_from_slice(&100u32.to_le_bytes()); // len = 100 (> 12 → reads blob)
         st[8..16].copy_from_slice(&0u64.to_le_bytes()); // offset 0
         let blob = vec![0u8; 50]; // shorter than len → out of bounds
-        let result = decode_german_string(st, &blob);
+        let result = decode_german_str(st, &blob);
         assert!(
             matches!(result, Err(ProtocolError::DecodeError(_))),
             "out-of-bounds long-string offset must return DecodeError, got {result:?}"

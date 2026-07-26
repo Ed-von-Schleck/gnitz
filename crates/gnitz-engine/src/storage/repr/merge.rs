@@ -15,13 +15,12 @@ use super::columnar::{schema_is_fixedint_nonnull, with_payload_cmp, ColumnarSour
 #[cfg(test)]
 use super::columnar;
 use super::heap::{drive_merge, HeapNode, LoserTree};
-use crate::foundation::codec::read_u64_le;
 #[cfg(test)]
 use crate::schema::key::compare_pk_bytes;
 use crate::schema::key::{compare_pk_ordering, pack_pk_be};
 use crate::schema::{BlobCache, SchemaDescriptor, MAX_COLUMNS};
 use gnitz_expr::{BatchView, RowSource};
-use gnitz_wire::is_german_string;
+use gnitz_wire::{is_german_string, read_u64_le};
 
 // ---------------------------------------------------------------------------
 // ColPtr / UnifiedSource: type-erased column accessors that work uniformly
@@ -318,8 +317,7 @@ impl<'a> MemBatch<'a> {
     }
     #[inline(always)]
     pub fn get_weight(&self, row: usize) -> i64 {
-        let off = self.offsets[super::batch::REG_WEIGHT] + row * 8;
-        i64::from_le_bytes(self.data[off..off + 8].try_into().unwrap())
+        gnitz_wire::read_i64_le(self.data, self.offsets[super::batch::REG_WEIGHT] + row * 8)
     }
     #[inline(always)]
     pub fn get_null_word(&self, row: usize) -> u64 {
@@ -500,7 +498,7 @@ impl<'a> DirectWriter<'a> {
 
         for (payload_idx, _ci, col) in schema.payload_columns() {
             let col_size = col.size() as usize;
-            let is_null = (null_word >> payload_idx) & 1 != 0;
+            let is_null = gnitz_wire::null_word_get(null_word, payload_idx);
 
             if is_null {
                 let off = out_row * col_size;
@@ -1330,8 +1328,8 @@ mod tests {
                 let pk = read_pk_packed(&out_pk, i, pk_stride);
                 let lo = pk as u64;
                 let hi = (pk >> 64) as u64;
-                let w = i64::from_le_bytes(out_weight[i * 8..i * 8 + 8].try_into().unwrap());
-                let v = i64::from_le_bytes(out_col0[i * 8..i * 8 + 8].try_into().unwrap());
+                let w = gnitz_wire::read_i64_le(&out_weight, i * 8);
+                let v = gnitz_wire::read_i64_le(&out_col0, i * 8);
                 result.push((lo, hi, w, v));
             }
             result
@@ -1566,8 +1564,8 @@ mod tests {
             let pk = read_pk_packed(&out_pk, i, pk_stride);
             let lo = pk as u64;
             let hi = (pk >> 64) as u64;
-            let w = i64::from_le_bytes(out_weight[i * 8..i * 8 + 8].try_into().unwrap());
-            let val = i64::from_le_bytes(out_col0[i * 8..i * 8 + 8].try_into().unwrap());
+            let w = gnitz_wire::read_i64_le(&out_weight, i * 8);
+            let val = gnitz_wire::read_i64_le(&out_col0, i * 8);
             result.push((lo, hi, w, val));
         }
         result
@@ -1801,8 +1799,8 @@ mod tests {
         let mut result = Vec::new();
         for i in 0..count {
             let pk = read_pk_packed(&out_pk, i, pk_stride);
-            let w = i64::from_le_bytes(out_weight[i * 8..i * 8 + 8].try_into().unwrap());
-            let v = i64::from_le_bytes(out_col0[i * 8..i * 8 + 8].try_into().unwrap());
+            let w = gnitz_wire::read_i64_le(&out_weight, i * 8);
+            let v = gnitz_wire::read_i64_le(&out_col0, i * 8);
             result.push((pk as u64, (pk >> 64) as u64, w, v));
         }
         result
@@ -2109,14 +2107,6 @@ mod tests {
         SchemaDescriptor::new(&cols, &pk)
     }
 
-    fn col_w(tc: u8) -> usize {
-        match tc {
-            type_code::U64 => 8,
-            type_code::U128 => 16,
-            _ => unreachable!(),
-        }
-    }
-
     /// OPK PK bytes: col0 = `lead`, last col = `tail`, all middle columns 0.
     /// Each unsigned column is stored big-endian (its OPK form), concatenated
     /// in pk-list order. The packed low-16 prefix is fully determined by the
@@ -2135,7 +2125,7 @@ mod tests {
             } else {
                 0
             };
-            let cw = col_w(tc);
+            let cw = gnitz_wire::wire_stride(tc);
             // Big-endian = OPK for an unsigned column: take the low `cw` bytes
             // of the BE u128 representation (the value fits within `cw` here).
             v.extend_from_slice(&val.to_be_bytes()[16 - cw..]);
@@ -2177,8 +2167,8 @@ mod tests {
         (0..count)
             .map(|i| {
                 let pk = out_pk[i * stride..(i + 1) * stride].to_vec();
-                let w = i64::from_le_bytes(out_w[i * 8..i * 8 + 8].try_into().unwrap());
-                let v = i64::from_le_bytes(out_c[i * 8..i * 8 + 8].try_into().unwrap());
+                let w = gnitz_wire::read_i64_le(&out_w, i * 8);
+                let v = gnitz_wire::read_i64_le(&out_c, i * 8);
                 (pk, w, v)
             })
             .collect()
@@ -2458,11 +2448,11 @@ mod tests {
             match c {
                 S::V(bytes) => gnitz_wire::encode_german_string(bytes, &mut b.blob),
                 S::Null => {
-                    *nw |= 1 << pi;
+                    gnitz_wire::null_word_set(nw, pi, true);
                     [0u8; 16]
                 }
                 S::NullGarbage(st) => {
-                    *nw |= 1 << pi;
+                    gnitz_wire::null_word_set(nw, pi, true);
                     *st
                 }
             }
@@ -2472,11 +2462,11 @@ mod tests {
             match c {
                 I::V(v) => v.to_le_bytes(),
                 I::Null => {
-                    *nw |= 1 << pi;
+                    gnitz_wire::null_word_set(nw, pi, true);
                     [0u8; 8]
                 }
                 I::NullGarbage(v) => {
-                    *nw |= 1 << pi;
+                    gnitz_wire::null_word_set(nw, pi, true);
                     v.to_le_bytes()
                 }
             }
@@ -2565,13 +2555,13 @@ mod tests {
             (0..out.count)
                 .map(|i| {
                     let pk = out.pk[i * out.pk_stride..(i + 1) * out.pk_stride].to_vec();
-                    let w = i64::from_le_bytes(out.wt[i * 8..i * 8 + 8].try_into().unwrap());
-                    let nw = u64::from_le_bytes(out.nb[i * 8..i * 8 + 8].try_into().unwrap());
+                    let w = gnitz_wire::read_i64_le(&out.wt, i * 8);
+                    let nw = gnitz_wire::read_u64_le(&out.nb, i * 8);
                     let cells = schema
                         .payload_columns()
                         .map(|(pi, _ci, col)| {
                             let cs = col.size() as usize;
-                            if (nw >> pi) & 1 == 1 {
+                            if gnitz_wire::null_word_get(nw, pi) {
                                 CellVal::Null
                             } else if gnitz_wire::is_german_string(col.type_code) {
                                 let st: [u8; 16] = out.cols[pi][i * 16..i * 16 + 16].try_into().unwrap();
@@ -2832,7 +2822,7 @@ mod tests {
             }
             if w != 0 {
                 let pk = mb.get_pk_bytes(head).to_vec();
-                let v = i64::from_le_bytes(mb.get_col_ptr(head, 0, 8).try_into().unwrap());
+                let v = gnitz_wire::read_signed_exact(mb.get_col_ptr(head, 0, 8));
                 out.push((pk, w, v));
             }
         }

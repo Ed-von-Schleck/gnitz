@@ -5,14 +5,15 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::foundation::codec::{align8, read_u32_raw, read_u64_raw, write_u32_raw, write_u64_raw};
 use crate::foundation::posix_io;
+use crate::foundation::posix_io::{read_u32_raw, read_u64_raw, write_u32_raw, write_u64_raw};
 use crate::runtime::wire::{
     build_schema_wire_block, encode_ctrl_block_direct, encode_wire_into, layout_to_wire_flags, wire_size,
     CTRL_BLOCK_SIZE_NO_BLOB, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, STATUS_OK,
 };
 use crate::schema::SchemaDescriptor;
 use crate::storage::{carve_writer_slices, scatter_copy, wire_header_dir_size, wire_region_sizes, Batch, DirectWriter};
+use gnitz_wire::align8;
 
 // ---------------------------------------------------------------------------
 // Constants

@@ -12,12 +12,13 @@ use super::super::error::StorageError;
 use super::batch::{strides_from_schema, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::layout::*;
 use super::xor8;
-use crate::foundation::codec::{read_i64_le, read_u64_le, write_u64_le};
 use crate::foundation::posix_io::{fdatasync_eintr, fsync_eintr};
 use crate::foundation::xxh;
 use crate::schema::key::pack_pk_be;
-use crate::schema::{read_signed, read_unsigned, SchemaDescriptor, MAX_PK_BYTES};
-use gnitz_wire::{is_fixed_int, is_signed_int};
+use crate::schema::{SchemaDescriptor, MAX_PK_BYTES};
+use gnitz_wire::{
+    is_fixed_int, is_signed_int, read_i64_le, read_signed_exact, read_u64_le, read_unsigned_exact, write_u64_le,
+};
 use xorf::Xor8;
 
 fn align64(val: usize) -> usize {
@@ -214,14 +215,16 @@ fn detect_weight_encoding(data: &[u8]) -> RegionEncoding {
 
 /// Widen one fixed-int cell to `u64`, matching the column's signedness:
 /// sign-extend to `i64` for signed type codes, zero-extend for unsigned — the
-/// same convention as `read_signed` / `read_unsigned`. Both spaces bit-cast to
-/// `u64`, so a FoR `wrapping_sub` / `wrapping_add` pair round-trips exactly.
+/// same convention as `read_signed_exact` / `read_unsigned_exact`. Both spaces
+/// bit-cast to `u64`, so a FoR `wrapping_sub` / `wrapping_add` pair round-trips
+/// exactly. `cell` is one whole column cell (both callers walk
+/// `chunks_exact(stride)`), so it carries its own width.
 #[inline]
-fn widen_cell(bytes: &[u8], stride: usize, signed: bool) -> u64 {
+fn widen_cell(cell: &[u8], signed: bool) -> u64 {
     if signed {
-        read_signed(bytes, stride) as u64
+        read_signed_exact(cell) as u64
     } else {
-        read_unsigned(bytes, stride)
+        read_unsigned_exact(cell)
     }
 }
 
@@ -245,7 +248,7 @@ fn for_params(data: &[u8], stride: usize, signed: bool, n: usize) -> Option<(u64
     let mut mn = u64::MAX;
     let mut mx = 0u64;
     for cell in data.chunks_exact(stride) {
-        let b = widen_cell(cell, stride, signed) ^ bias;
+        let b = widen_cell(cell, signed) ^ bias;
         mn = mn.min(b);
         mx = mx.max(b);
     }
@@ -279,7 +282,7 @@ fn build_for_buffer(data: &[u8], stride: usize, signed: bool, n: usize, referenc
     buf[..8].copy_from_slice(&reference.to_le_bytes());
     let mut pos = 8;
     for cell in data.chunks_exact(stride) {
-        let offset = widen_cell(cell, stride, signed).wrapping_sub(reference);
+        let offset = widen_cell(cell, signed).wrapping_sub(reference);
         buf[pos..pos + 8].copy_from_slice(&offset.to_le_bytes());
         pos += bw;
     }
@@ -369,7 +372,6 @@ pub(crate) fn decode_for_region(encoded: &[u8], n: usize, elem_width: usize) -> 
 /// test modules.
 #[cfg(test)]
 pub(crate) fn region_dir(image: &[u8], i: usize) -> (usize, u8) {
-    use crate::foundation::codec::read_u64_le;
     let dir_off = read_u64_le(image, OFF_DIR_OFFSET) as usize;
     let d = dir_off + i * DIR_ENTRY_SIZE;
     (read_u64_le(image, d + 8) as usize, image[d + 24])
@@ -623,9 +625,9 @@ fn write_shard_streaming_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::foundation::codec::{as_le_bytes, read_u64_le};
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
     use crate::storage::lsm::shard_reader::MappedShard;
+    use crate::test_support::as_le_bytes;
 
     fn make_schema_desc(num_cols: u32, pk_index: u32) -> SchemaDescriptor {
         let mut cols = [SchemaColumn::EMPTY; MAX_COLUMNS];

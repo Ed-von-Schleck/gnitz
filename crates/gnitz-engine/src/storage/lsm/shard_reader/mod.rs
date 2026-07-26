@@ -11,7 +11,9 @@ use xorf::Xor8;
 
 use super::shard_file::DecodedRegion;
 #[cfg(test)]
-use crate::foundation::codec::{as_le_bytes, read_i64_le, read_u64_le, write_u64_le};
+use crate::test_support::as_le_bytes;
+#[cfg(test)]
+use gnitz_wire::{read_i64_le, read_u64_le, write_u64_le};
 
 mod access;
 mod open;
@@ -462,7 +464,7 @@ mod tests {
         );
         // Patch the size field.  Checksum validation is disabled below so the
         // stale checksum doesn't mask the InvalidShard we're expecting.
-        crate::foundation::codec::write_u64_le(&mut data, weight_entry_off + 8, truncated_size);
+        gnitz_wire::write_u64_le(&mut data, weight_entry_off + 8, truncated_size);
         std::fs::write(&path, &data).unwrap();
 
         let cpath = std::ffi::CString::new(path).unwrap();

@@ -9,8 +9,8 @@ use super::super::error::StorageError;
 use super::super::layout::*;
 use super::super::xor8;
 use super::{MappedShard, Mmap, PackedRegion, PayloadRegion, ScalarRegion, WeightRegion};
-use crate::foundation::codec::{read_i64_le, read_u64_le};
 use crate::foundation::xxh;
+use gnitz_wire::{read_i64_le, read_u64_le};
 
 impl MappedShard {
     pub fn open(

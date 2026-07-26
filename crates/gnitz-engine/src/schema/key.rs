@@ -5,8 +5,8 @@
 //! such images with a raw `memcmp`, route a key to a partition, pack a narrow
 //! region into a sort key, and carry a width-tagged PK byte buffer. None of them
 //! reaches up into storage — the dependency runs `storage → schema::key`, the
-//! legitimate downward direction. `storage` re-exports each one from the leaf
-//! module that used to own it, so its call sites spell them unchanged.
+//! legitimate downward direction. This module is the one import path: every
+//! caller, storage included, names `crate::schema::key::X`.
 
 use std::cmp::Ordering;
 
@@ -403,8 +403,9 @@ impl PkBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{read_signed, type_code, SchemaColumn, SchemaDescriptor};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::pk_only_schema;
+    use gnitz_wire::{read_signed, read_unsigned};
 
     /// Independent typed reference comparator over native-LE PK bytes. This is
     /// the per-column column-walk that `compare_pk_bytes` used *before* the OPK
@@ -425,7 +426,6 @@ mod tests {
                     va.cmp(&vb)
                 }
                 type_code::U64 | type_code::U32 | type_code::U16 | type_code::U8 => {
-                    use crate::schema::read_unsigned;
                     read_unsigned(&a[off..], cs).cmp(&read_unsigned(&b[off..], cs))
                 }
                 _ => read_signed(&a[off..], cs).cmp(&read_signed(&b[off..], cs)),
@@ -774,16 +774,12 @@ mod tests {
         use crate::test_support::arb_pk_type;
         use proptest::prelude::*;
 
-        fn tc_size(tc: u8) -> usize {
-            SchemaColumn::new(tc, 0).size() as usize
-        }
-
         /// `(column type codes, pk_indices permutation, a_bytes, b_bytes)`.
         /// The permutation exercises non-identity `pk_indices` (e.g. `[1, 0]`),
         /// and 1..=4 columns spans both narrow (≤16) and wide (>16) strides.
         fn arb_pk_case() -> impl Strategy<Value = (Vec<u8>, Vec<u32>, Vec<u8>, Vec<u8>)> {
             prop::collection::vec(arb_pk_type(), 1..=4).prop_flat_map(|types| {
-                let stride: usize = types.iter().map(|&t| tc_size(t)).sum();
+                let stride: usize = types.iter().map(|&t| gnitz_wire::wire_stride(t)).sum();
                 let n = types.len();
                 (
                     Just(types),

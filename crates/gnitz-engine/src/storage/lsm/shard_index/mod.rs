@@ -215,9 +215,9 @@ impl ShardIndex {
 mod tests {
     use super::super::shard_file;
     use super::*;
-    use crate::foundation::codec::as_le_bytes;
     use crate::foundation::posix_io::raise_fd_limit_for_tests;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+    use crate::test_support::as_le_bytes;
     use crate::test_support::make_schema_u64_i64;
 
     /// Synthetic 2-column compound PK schema: (U64, U64) PK + I64

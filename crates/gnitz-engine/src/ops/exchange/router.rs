@@ -3,8 +3,9 @@
 
 use std::cell::RefCell;
 
+use crate::schema::key::{partition_for_key, partition_for_pk_bytes};
 use crate::schema::SchemaDescriptor;
-use crate::storage::{partition_for_key, partition_for_pk_bytes, Batch, MemBatch};
+use crate::storage::{Batch, MemBatch};
 
 use super::super::reindex::ReindexPacker;
 use super::super::util::GroupKeyCols;
@@ -111,7 +112,7 @@ pub(super) enum ScatterKey {
     PkBytes,
     Packed {
         packer: ReindexPacker,
-        buf: [u8; gnitz_wire::MAX_PK_BYTES],
+        buf: [u8; crate::schema::MAX_PK_BYTES],
     },
     Fold {
         keys: GroupKeyCols,
@@ -127,7 +128,7 @@ impl ScatterKey {
             match mode {
                 RouteMode::JoinPromote => ScatterKey::Packed {
                     packer: ReindexPacker::new(schema, cols, tcs),
-                    buf: [0u8; gnitz_wire::MAX_PK_BYTES],
+                    buf: [0u8; crate::schema::MAX_PK_BYTES],
                 },
                 RouteMode::GroupKey => ScatterKey::Fold {
                     keys: GroupKeyCols::new(schema, cols),
@@ -476,7 +477,7 @@ mod tests {
 
     #[test]
     fn routing_symmetry_master_worker() {
-        use crate::storage::partition_for_pk_bytes;
+        use crate::schema::key::partition_for_pk_bytes;
 
         let schema = SchemaDescriptor::new(&[u64_pk_col(), u64_pk_col(), i64_payload_col()], &[0, 1]);
         let raw_pks: Vec<[u8; 16]> = (0u64..100)
@@ -514,7 +515,7 @@ mod tests {
 
     #[test]
     fn routing_symmetry_four_u32() {
-        use crate::storage::partition_for_pk_bytes;
+        use crate::schema::key::partition_for_pk_bytes;
 
         let schema = SchemaDescriptor::new(
             &[

@@ -1,7 +1,8 @@
 //! Non-equi (range / band) join delta-trace.
 
+use crate::schema::key::pk_bytes_eq;
 use crate::schema::SchemaDescriptor;
-use crate::storage::{pk_bytes_eq, range_cut_points, Batch, MemBatch, ReadCursor};
+use crate::storage::{range_cut_points, Batch, MemBatch, ReadCursor};
 use gnitz_wire::RangeRel;
 
 use super::rowwrite::write_join_row;
@@ -265,9 +266,9 @@ fn advance_delta_ptr(delta_mb: &MemBatch, eq_size: usize, ptr: &mut usize, hi: u
 mod tests {
     use super::super::test_common::*;
     use super::*;
-    use crate::foundation::codec::read_i64_le;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::{Batch, Layout};
+    use gnitz_wire::read_i64_le;
 
     /// All four rels over an unsigned key, n_eq = 0. The boundary case x == y
     /// must match `Le`/`Ge` and not `Lt`/`Gt`. The trace payload tags the rows

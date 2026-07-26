@@ -209,26 +209,6 @@ impl TypeCode {
 #[inline]
 pub fn cmp_typed_le(a: &[u8], b: &[u8], tc: u8) -> Ordering {
     debug_assert_eq!(a.len(), b.len(), "cmp_typed_le: windows must be equal length");
-    #[inline]
-    fn le_unsigned(b: &[u8]) -> u64 {
-        match b.len() {
-            1 => b[0] as u64,
-            2 => u16::from_le_bytes(b.try_into().unwrap()) as u64,
-            4 => u32::from_le_bytes(b.try_into().unwrap()) as u64,
-            8 => u64::from_le_bytes(b.try_into().unwrap()),
-            n => unreachable!("cmp_typed_le: unexpected unsigned window width {n}"),
-        }
-    }
-    #[inline]
-    fn le_signed(b: &[u8]) -> i64 {
-        match b.len() {
-            1 => b[0] as i8 as i64,
-            2 => i16::from_le_bytes(b.try_into().unwrap()) as i64,
-            4 => i32::from_le_bytes(b.try_into().unwrap()) as i64,
-            8 => i64::from_le_bytes(b.try_into().unwrap()),
-            n => unreachable!("cmp_typed_le: unexpected signed window width {n}"),
-        }
-    }
     match tc {
         type_code::U128 | type_code::UUID => {
             u128::from_le_bytes(a.try_into().unwrap()).cmp(&u128::from_le_bytes(b.try_into().unwrap()))
@@ -240,8 +220,12 @@ pub fn cmp_typed_le(a: &[u8], b: &[u8], tc: u8) -> Ordering {
         type_code::F32 => {
             f32::from_le_bytes(a.try_into().unwrap()).total_cmp(&f32::from_le_bytes(b.try_into().unwrap()))
         }
-        type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64 => le_unsigned(a).cmp(&le_unsigned(b)),
-        _ => le_signed(a).cmp(&le_signed(b)), // I8/I16/I32/I64
+        // The windows ARE the columns (equal length, asserted above), so the
+        // exact form applies and no sub-slice bound is paid per comparison.
+        type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64 => {
+            crate::read_unsigned_exact(a).cmp(&crate::read_unsigned_exact(b))
+        }
+        _ => crate::read_signed_exact(a).cmp(&crate::read_signed_exact(b)), // I8/I16/I32/I64
     }
 }
 
@@ -636,6 +620,16 @@ const _: () = {
                 "TypeCode discriminant must round-trip through try_from_u8"
             );
         }
+        // `is_fixed_int` is the domain of `read_{signed,unsigned}_exact` AND the
+        // admission test for the engine's fixed-int fast-path row comparator,
+        // whose branchless sign-flip shifts by `size*8 - 1` into a u64. Widening
+        // `is_fixed_int` past 8 bytes would make that `1 << 127`; catching it
+        // here is what lets the comparator drop its per-comparison O(cols) walk.
+        let w = wire_stride(v as u8);
+        assert!(
+            !is_fixed_int(v as u8) || (w == 1 || w == 2 || w == 4 || w == 8),
+            "is_fixed_int must imply a 1/2/4/8-byte width"
+        );
         v += 1;
     }
     assert!(

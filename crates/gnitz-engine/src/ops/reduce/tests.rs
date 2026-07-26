@@ -2,11 +2,10 @@
 //! file rather than a shared `common.rs` so the tests file stays self-contained.
 
 use crate::expr::PkFill;
-use crate::foundation::codec::{read_i64_le, read_u64_le};
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{Batch, Layout};
 use crate::test_support::{make_schema_i64pk_i64, make_schema_u64_i64, opk_pk_i64};
-use gnitz_wire::encode_german_string;
+use gnitz_wire::{encode_german_string, read_i64_le, read_u64_le};
 
 use super::super::util::{extract_group_key, ieee_order_bits_f32, ieee_order_bits_f32_reverse};
 use super::agg::{apply_agg_from_value_index, Accumulator, AggDescriptor, AggOp};
@@ -3396,8 +3395,8 @@ fn avi_two_groups_distinct_byte_form_keys() {
     assert_eq!(out.count, 2, "two groups → two rows");
     // Output payload: a at pi 0, b at pi 1, min at pi 2.
     for i in 0..out.count {
-        let a = crate::foundation::codec::read_u32_le(out.col_data(0), i * 4);
-        let bb = crate::foundation::codec::read_u32_le(out.col_data(1), i * 4);
+        let a = gnitz_wire::read_u32_le(out.col_data(0), i * 4);
+        let bb = gnitz_wire::read_u32_le(out.col_data(1), i * 4);
         let min = read_i64_le(out.col_data(2), i * 8);
         let expected = match (a, bb) {
             (1, 1) => 10,
@@ -6776,7 +6775,7 @@ fn reduce_multi_avi_foreign_group() {
 
     assert_eq!(out.count, 2, "two groups → two rows");
     for i in 0..out.count {
-        let g = crate::foundation::codec::read_u32_le(out.col_data(0), i * 4) as i32;
+        let g = gnitz_wire::read_u32_le(out.col_data(0), i * 4) as i32;
         let min_a = read_i64_le(out.col_data(1), i * 8);
         let max_b = read_i64_le(out.col_data(2), i * 8);
         let count = read_i64_le(out.col_data(3), i * 8);
@@ -7156,8 +7155,8 @@ fn reduce_multi_avi_compound_group_key() {
     );
     assert_eq!(out.count, 2, "two compound groups");
     for i in 0..out.count {
-        let g1 = crate::foundation::codec::read_u32_le(out.col_data(0), i * 4) as i32;
-        let g2 = crate::foundation::codec::read_u32_le(out.col_data(1), i * 4) as i32;
+        let g1 = gnitz_wire::read_u32_le(out.col_data(0), i * 4) as i32;
+        let g2 = gnitz_wire::read_u32_le(out.col_data(1), i * 4) as i32;
         let min = read_i64_le(out.col_data(2), i * 8);
         match (g1, g2) {
             (1, 1) => assert_eq!(min, 4, "group (1,1) MIN"),
@@ -7873,8 +7872,8 @@ fn readback_mm(b: &Batch) -> MmState {
         assert_eq!(b.get_weight(r), 1, "each live group is one net-weight-1 row");
         let nw = b.get_null_word(r);
         let grp = read_i64_le(b.col_data(0), r * 8);
-        let min = ((nw >> 1) & 1 == 0).then(|| read_i64_le(b.col_data(1), r * 8));
-        let max = ((nw >> 2) & 1 == 0).then(|| read_i64_le(b.col_data(2), r * 8));
+        let min = (!gnitz_wire::null_word_get(nw, 1)).then(|| read_i64_le(b.col_data(1), r * 8));
+        let max = (!gnitz_wire::null_word_get(nw, 2)).then(|| read_i64_le(b.col_data(2), r * 8));
         let count = read_i64_le(b.col_data(3), r * 8);
         assert!(m.insert(grp, (min, max, count)).is_none(), "one output row per group");
     }
@@ -8190,8 +8189,8 @@ fn avi_skip_mixed_int_min_float_max() {
     let read = |b: &Batch| -> (Option<i64>, Option<f64>, i64) {
         assert_eq!(b.count, 1);
         let nw = b.get_null_word(0);
-        let min = ((nw >> 1) & 1 == 0).then(|| read_i64_le(b.col_data(1), 0));
-        let max = ((nw >> 2) & 1 == 0).then(|| f64::from_bits(read_u64_le(b.col_data(2), 0)));
+        let min = (!gnitz_wire::null_word_get(nw, 1)).then(|| read_i64_le(b.col_data(1), 0));
+        let max = (!gnitz_wire::null_word_get(nw, 2)).then(|| f64::from_bits(read_u64_le(b.col_data(2), 0)));
         let count = read_i64_le(b.col_data(3), 0);
         (min, max, count)
     };
@@ -8444,7 +8443,7 @@ fn avi_skip_global_aggregate() {
         assert_eq!(b.count, 1, "global aggregate is exactly one row");
         let nw = b.get_null_word(0);
         let min = (nw & 1 == 0).then(|| read_i64_le(b.col_data(0), 0));
-        let max = ((nw >> 1) & 1 == 0).then(|| read_i64_le(b.col_data(1), 0));
+        let max = (!gnitz_wire::null_word_get(nw, 1)).then(|| read_i64_le(b.col_data(1), 0));
         let count = read_i64_le(b.col_data(2), 0);
         (min, max, count)
     };
@@ -8506,7 +8505,7 @@ fn test_build_reduce_output_schema_natural_pk() {
         agg_op: AggOp::Sum,
         col_type_code: TypeCode::I64,
     }];
-    let out = build_reduce_output_schema(&input, &[1], &aggs, gnitz_wire::ReduceOutKey::SingleNaturalCol).unwrap();
+    let out = build_reduce_output_schema(&input, &[1], &aggs, crate::schema::ReduceOutKey::SingleNaturalCol).unwrap();
     // Natural PK (single U64 group col) → [U64_PK, I64_agg]
     assert_eq!(out.num_columns(), 2);
     assert_eq!(out.columns[0].type_code, type_code::U64);
@@ -8530,7 +8529,7 @@ fn test_build_reduce_output_schema_compound_natural_pk() {
         col_type_code: TypeCode::I64,
     }];
     // group_cols = [1, 0] — permuted; the set still equals pk_indices.
-    let out = build_reduce_output_schema(&input, &[1, 0], &aggs, gnitz_wire::ReduceOutKey::PkPermutation).unwrap();
+    let out = build_reduce_output_schema(&input, &[1, 0], &aggs, crate::schema::ReduceOutKey::PkPermutation).unwrap();
     // 2 PK cols + 1 agg col; pk_indices in source's pk-list order [0, 1].
     assert_eq!(out.num_columns(), 3);
     assert_eq!(out.pk_indices(), &[0, 1]);
@@ -8555,7 +8554,7 @@ fn test_build_reduce_output_schema_single_pk_group_by_pk() {
         agg_op: AggOp::Sum,
         col_type_code: TypeCode::I64,
     }];
-    let out = build_reduce_output_schema(&input, &[0], &aggs, gnitz_wire::ReduceOutKey::PkPermutation).unwrap();
+    let out = build_reduce_output_schema(&input, &[0], &aggs, crate::schema::ReduceOutKey::PkPermutation).unwrap();
     assert_eq!(out.num_columns(), 2);
     assert_eq!(out.pk_indices(), &[0]);
     assert_eq!(out.columns[0].type_code, type_code::U64);
@@ -8577,7 +8576,7 @@ fn test_build_reduce_output_schema_synthetic_pk() {
         agg_op: AggOp::Count,
         col_type_code: TypeCode::I64,
     }];
-    let out = build_reduce_output_schema(&input, &[1], &aggs, gnitz_wire::ReduceOutKey::SyntheticFold).unwrap();
+    let out = build_reduce_output_schema(&input, &[1], &aggs, crate::schema::ReduceOutKey::SyntheticFold).unwrap();
     // Synthetic PK (STRING group col) → [U128_hash, STRING_group, I64_count]
     assert_eq!(out.num_columns(), 3);
     assert_eq!(out.columns[0].type_code, type_code::U128);

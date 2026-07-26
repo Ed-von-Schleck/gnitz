@@ -194,3 +194,87 @@ fn is_null_reads_the_addressed_slot_bit() {
     assert!(!slot0.is_null(&v, 1), "a set bit at slot 2 must not read as slot 0");
     assert!(!pk.is_null(&v, 1), "PK columns are never null");
 }
+
+// ---------------------------------------------------------------------------
+// SchemaFacts
+// ---------------------------------------------------------------------------
+
+/// Column table and PK list of the fixture below. The PK list is **permuted and
+/// non-contiguous** (`PRIMARY KEY (c2, c0)`), the shape a harness that inferred
+/// PK order from column order could not see: `c2` sits at OPK offset 0 and `c0`
+/// at 8, the reverse of their column order.
+const TINY: [(u8, bool); 4] = [(tc::U32, false), (tc::F64, true), (tc::I64, false), (tc::STRING, false)];
+const TINY_PK: [usize; 2] = [2, 0];
+/// Per column: OPK byte offset for a PK column (indices 0 and 2), dense payload
+/// slot otherwise (indices 1 and 3) — two namespaces, disjoint by column.
+const TINY_ADDR: [u8; 4] = [8, 0, 0, 1];
+
+/// A schema whose `payload_col_idx` is derived independently of `locate` — the
+/// one direction an implementor writes by hand, and the one the harness has to
+/// be able to catch.
+struct TinySchema {
+    /// Injected fault: `payload_col_idx` shifts by one.
+    broken_payload_col_idx: bool,
+}
+
+impl SchemaFacts for TinySchema {
+    fn locate(&self, ci: usize) -> ColumnLocator {
+        let (type_code, _) = TINY[ci];
+        let size = gnitz_wire::wire_stride(type_code) as u8;
+        if TINY_PK.contains(&ci) {
+            ColumnLocator::Pk {
+                byte_off: TINY_ADDR[ci],
+                size,
+                type_code,
+            }
+        } else {
+            ColumnLocator::Payload {
+                slot: TINY_ADDR[ci],
+                size,
+                type_code,
+            }
+        }
+    }
+    fn payload_col_idx(&self, pi: usize) -> usize {
+        let ci = (0..TINY.len()).filter(|c| !TINY_PK.contains(c)).nth(pi).unwrap();
+        ci + self.broken_payload_col_idx as usize
+    }
+    fn num_payload_cols(&self) -> usize {
+        TINY.len() - TINY_PK.len()
+    }
+    fn num_columns(&self) -> usize {
+        TINY.len()
+    }
+    fn col_type_code(&self, ci: usize) -> u8 {
+        TINY[ci].0
+    }
+    fn col_nullable(&self, ci: usize) -> bool {
+        TINY[ci].1
+    }
+}
+
+#[test]
+fn schema_facts_harness_accepts_a_faithful_impl() {
+    assert_schema_facts_consistent(
+        &TinySchema {
+            broken_payload_col_idx: false,
+        },
+        &TINY,
+        &TINY_PK,
+    );
+}
+
+/// The harness must not be vacuous: an off-by-one `payload_col_idx` — the
+/// forwarder-reimplementation failure mode that silently flips `no_nulls` —
+/// has to fail it.
+#[test]
+#[should_panic(expected = "payload_col_idx")]
+fn schema_facts_harness_rejects_an_off_by_one_payload_col_idx() {
+    assert_schema_facts_consistent(
+        &TinySchema {
+            broken_payload_col_idx: true,
+        },
+        &TINY,
+        &TINY_PK,
+    );
+}

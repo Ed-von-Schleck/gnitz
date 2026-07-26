@@ -1,6 +1,6 @@
 use super::*;
+use crate::schema::key::PkBuf;
 use crate::schema::make_index_schema;
-use crate::storage::PkBuf;
 
 /// Build the one-row IDX_TAB batch registering an index (`weight` +1) or
 /// retracting a failed registration (−1). The single writer of the 6-column

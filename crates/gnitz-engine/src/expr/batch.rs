@@ -8,10 +8,8 @@
 use std::cmp::Ordering;
 
 use super::program::{CmpOp, Instr, ResolvedProgram, StrOp};
-use crate::foundation::codec::read_u64_le;
-use crate::schema::PAYLOAD_MAPPING_PK_SENTINEL;
-use crate::storage::MemBatch;
-use gnitz_wire::compare_german_strings;
+use gnitz_expr::{BatchView, PAYLOAD_MAPPING_PK_SENTINEL};
+use gnitz_wire::{compare_german_strings, null_word_get, read_u64_le};
 
 pub(in crate::expr) const MORSEL: usize = 256;
 pub(in crate::expr) const NULL_WORDS_PER_REG: usize = MORSEL / 64; // 4
@@ -189,18 +187,18 @@ fn fill_null_bits_mask(s: &mut EvalScratch, di: usize, null_bmp: &[u8], morsel_s
 }
 
 /// IS [NOT] NULL: read payload column `pi`'s null bit per row, optionally invert
-/// (`invert = 1` for IS NOT NULL), and write the boolean into register `dst`. The result
+/// (`invert` for IS NOT NULL), and write the boolean into register `dst`. The result
 /// register is always non-null (`clear_null_reg`).
 #[allow(clippy::too_many_arguments)]
 fn eval_is_null(
     scratch: &mut EvalScratch,
-    mb: &MemBatch,
+    null_bmp: &[u8],
     prog: &ResolvedProgram,
     dst: usize,
     morsel_start: usize,
     m: usize,
     pi: usize,
-    invert: u64,
+    invert: bool,
 ) {
     debug_assert_ne!(
         pi, PAYLOAD_MAPPING_PK_SENTINEL as usize,
@@ -209,10 +207,9 @@ fn eval_is_null(
     );
     scratch.clear_null_reg(dst, m);
     let base_d = dst * MORSEL;
-    let null_bmp = mb.null_bmp();
     for i in 0..m {
         let row_null = read_u64_le(null_bmp, (morsel_start + i) * 8);
-        scratch.regs[base_d + i] = (((row_null >> pi) & 1) ^ invert) as i64;
+        scratch.regs[base_d + i] = (null_word_get(row_null, pi) ^ invert) as i64;
     }
     maybe_pack_bool_bits(scratch, prog, dst, m);
 }
@@ -343,7 +340,7 @@ fn zero_null_rows(scratch: &mut EvalScratch, dst: usize, m: usize) {
 #[allow(clippy::too_many_arguments)]
 fn eval_str_cmp<'x>(
     scratch: &mut EvalScratch,
-    mb: &MemBatch,
+    null_bmp: &[u8],
     prog: &ResolvedProgram,
     dst: usize,
     morsel_start: usize,
@@ -354,7 +351,7 @@ fn eval_str_cmp<'x>(
     b_of: impl Fn(usize) -> (&'x [u8], &'x [u8]),
     pred: impl Fn(Ordering) -> bool,
 ) {
-    fill_null_bits_mask(scratch, dst, mb.null_bmp(), morsel_start, m, null_mask);
+    fill_null_bits_mask(scratch, dst, null_bmp, morsel_start, m, null_mask);
     let base_d = dst * MORSEL;
     for i in 0..m {
         let row = morsel_start + i;
@@ -367,9 +364,9 @@ fn eval_str_cmp<'x>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn eval_str_col_vs_const(
+fn eval_str_col_vs_const<B: BatchView>(
     scratch: &mut EvalScratch,
-    mb: &MemBatch,
+    mb: &B,
     prog: &ResolvedProgram,
     dst: usize,
     morsel_start: usize,
@@ -386,23 +383,23 @@ fn eval_str_col_vs_const(
     let cell = &prog.const_cells[const_idx];
     eval_str_cmp(
         scratch,
-        mb,
+        mb.null_bmp(),
         prog,
         dst,
         morsel_start,
         m,
         1u64 << pi,
         mb.col_data(pi, 16),
-        mb.blob,
+        mb.blob(),
         |_| (&cell[..], &prog.const_blob[..]),
         pred,
     );
 }
 
 #[allow(clippy::too_many_arguments)]
-fn eval_str_col_vs_col(
+fn eval_str_col_vs_col<B: BatchView>(
     scratch: &mut EvalScratch,
-    mb: &MemBatch,
+    mb: &B,
     prog: &ResolvedProgram,
     dst: usize,
     morsel_start: usize,
@@ -419,10 +416,10 @@ fn eval_str_col_vs_col(
     let pi_a = pi_byte_a as usize;
     let pi_b = pi_byte_b as usize;
     let col_b = mb.col_data(pi_b, 16);
-    let blob = mb.blob;
+    let blob = mb.blob();
     eval_str_cmp(
         scratch,
-        mb,
+        mb.null_bmp(),
         prog,
         dst,
         morsel_start,
@@ -456,9 +453,9 @@ fn encode_f64(f: f64) -> i64 {
 ///
 /// Callers loop over morsels and call this function once per morsel.
 #[allow(clippy::needless_range_loop)]
-pub(in crate::expr) fn eval_batch(
+pub(in crate::expr) fn eval_batch<B: BatchView>(
     prog: &ResolvedProgram,
-    mb: &MemBatch,
+    mb: &B,
     morsel_start: usize,
     m: usize,
     scratch: &mut EvalScratch,
@@ -541,6 +538,7 @@ pub(in crate::expr) fn eval_batch(
         }};
     }
 
+    let null_bmp = mb.null_bmp();
     for instr in &prog.instrs {
         match *instr {
             // ----------------------------------------------------------------
@@ -556,8 +554,8 @@ pub(in crate::expr) fn eval_batch(
                 let pi = pi as usize;
                 // Width and signedness are `const fn`s of `tc`; derive them once
                 // per instruction, outside the row loop (as `LoadPk` does).
-                let col_size = crate::schema::type_size(tc) as usize;
-                let is_signed = crate::schema::is_signed_int(tc);
+                let col_size = gnitz_wire::wire_stride(tc);
+                let is_signed = gnitz_wire::is_signed_int(tc);
                 let col_data = mb.col_data(pi, col_size);
                 let dst_reg = scratch.reg_mut(dst, m);
                 // Widen `m` rows of a `SZ`-byte little-endian column into i64 registers.
@@ -593,21 +591,25 @@ pub(in crate::expr) fn eval_batch(
                     // `is_wide_int` gate), so no LoadColInt ever resolves to one.
                     _ => unreachable!("LoadPayloadInt: col_size {col_size} > 8; wide columns rejected at compile"),
                 }
-                fill_null_bits_mask(scratch, dst, mb.null_bmp(), morsel_start, m, 1u64 << pi);
+                fill_null_bits_mask(scratch, dst, null_bmp, morsel_start, m, 1u64 << pi);
                 maybe_pack_bool_bits(scratch, prog, dst, m);
             }
 
             Instr::LoadPayloadFloat { dst, pi, tc } => {
+                debug_assert_ne!(
+                    pi, PAYLOAD_MAPPING_PK_SENTINEL,
+                    "LOAD_COL_FLOAT operand resolved to a PK column; a PK column is never float",
+                );
                 let dst = dst as usize;
                 let pi = pi as usize;
-                let col_size = crate::schema::type_size(tc) as usize;
+                let col_size = gnitz_wire::wire_stride(tc);
                 let col_data = mb.col_data(pi, col_size);
                 let dst_reg = scratch.reg_mut(dst, m);
                 // Branch on the type, not the width: `validate` pins this column
                 // to F32/F64 (`ColKind::Float`), so the two arms are total. An F32
                 // widens to f64 on load — every float register holds an f64 image,
                 // which is why a computed float column is declared F64.
-                if tc == crate::schema::type_code::F32 {
+                if tc == gnitz_wire::type_code::F32 {
                     let b = &col_data[morsel_start * 4..(morsel_start + m) * 4];
                     for (i, c) in b.chunks_exact(4).enumerate() {
                         let bits = u32::from_le_bytes(c.try_into().unwrap());
@@ -619,7 +621,7 @@ pub(in crate::expr) fn eval_batch(
                         dst_reg[i] = i64::from_le_bytes(c.try_into().unwrap());
                     }
                 }
-                fill_null_bits_mask(scratch, dst, mb.null_bmp(), morsel_start, m, 1u64 << pi);
+                fill_null_bits_mask(scratch, dst, null_bmp, morsel_start, m, 1u64 << pi);
                 maybe_pack_bool_bits(scratch, prog, dst, m);
             }
 
@@ -630,26 +632,29 @@ pub(in crate::expr) fn eval_batch(
             Instr::LoadPk { dst, off, tc } => {
                 let dst = dst as usize;
                 let byte_offset = off as usize;
-                let col_size = crate::schema::type_size(tc) as usize;
+                let col_size = gnitz_wire::wire_stride(tc);
                 // Wide (16-byte) PK columns are rejected at compile
                 // (`ExprValidateErr::ColKindMismatch` + the binder), so both
                 // branches below assume `col_size <= 8` (the signed branch's 8-byte
                 // scratch would otherwise panic-slice).
                 debug_assert!(col_size <= 8, "LoadPk: wide PK column rejected at compile");
-                let signed = crate::schema::is_signed_int(tc);
+                let signed = gnitz_wire::is_signed_int(tc);
                 let base_d = dst * MORSEL;
                 if signed {
                     // Decode the OPK column back to native LE (un-flips the sign
                     // bit), then sign-extend to i64 at the exact column width.
+                    // The scratch is declared outside the loop: `decode_pk_column`
+                    // writes every byte `read_signed` then reads, so a per-row
+                    // `[0u8; 8]` is a `memset` PLT call for a value never observed.
+                    let mut le = [0u8; 8];
                     for i in 0..m {
                         let opk = mb.get_pk_bytes(morsel_start + i);
-                        let mut le = [0u8; 8];
                         gnitz_wire::decode_pk_column(
                             &opk[byte_offset..byte_offset + col_size],
                             tc,
                             &mut le[..col_size],
                         );
-                        scratch.regs[base_d + i] = crate::schema::read_signed(&le, col_size);
+                        scratch.regs[base_d + i] = gnitz_wire::read_signed(&le, col_size);
                     }
                 } else {
                     // The addressed OPK column is big-endian; `widen_pk_be` right-
@@ -888,9 +893,12 @@ pub(in crate::expr) fn eval_batch(
             // ----------------------------------------------------------------
             // IS NULL / IS NOT NULL
             // ----------------------------------------------------------------
-            Instr::IsNull { dst, pi } => eval_is_null(scratch, mb, prog, dst as usize, morsel_start, m, pi as usize, 0),
-            Instr::IsNotNull { dst, pi } => {
-                eval_is_null(scratch, mb, prog, dst as usize, morsel_start, m, pi as usize, 1)
+            // One arm: the two opcodes carry identical fields and differ only
+            // in whether the bit is inverted.
+            Instr::IsNull { dst, pi } | Instr::IsNotNull { dst, pi } => {
+                let invert = matches!(*instr, Instr::IsNotNull { .. });
+                let d = dst as usize;
+                eval_is_null(scratch, null_bmp, prog, d, morsel_start, m, pi as usize, invert);
             }
 
             // ----------------------------------------------------------------

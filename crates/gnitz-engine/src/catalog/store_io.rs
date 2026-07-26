@@ -103,7 +103,7 @@ impl CatalogEngine {
     pub fn gather_family_bytes(
         &mut self,
         table_id: i64,
-        pks: &[crate::storage::PkBuf],
+        pks: &[crate::schema::key::PkBuf],
         project: &[u8],
     ) -> Result<Batch, String> {
         let entry = self.table_entry(table_id)?;
@@ -450,7 +450,7 @@ impl SourceCursor {
 fn index_range_keys(
     ic: &crate::query::IndexCircuitEntry,
     range: &gnitz_wire::RangeDescriptor,
-) -> Result<Option<(crate::storage::PkBuf, Option<crate::storage::PkBuf>)>, String> {
+) -> Result<Option<(crate::schema::key::PkBuf, Option<crate::schema::key::PkBuf>)>, String> {
     let cols = ic.col_indices.as_slice();
     // Precondition: the range column sits right after the equality prefix, so
     // `n_eq + 1` leading columns must exist. Guard *before* the `natives[..=n_eq]` /
@@ -505,8 +505,8 @@ fn copy_cursor_cols_to_batch(cursor: &ReadCursor, out: &mut Batch, proj: &[(usiz
     let src_null = cursor.current_null_word;
     let mut proj_null = 0u64;
     for (k, &(ci, pi, col_size)) in proj.iter().enumerate() {
-        if src_null & (1u64 << pi) != 0 {
-            proj_null |= 1u64 << k;
+        if gnitz_wire::null_word_get(src_null, pi) {
+            gnitz_wire::null_word_set(&mut proj_null, k, true);
         }
         let ptr = cursor.col_ptr(ci, col_size);
         if !ptr.is_null() {

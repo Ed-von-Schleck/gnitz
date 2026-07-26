@@ -161,10 +161,10 @@ pub(super) fn encode_ordered(bytes: &[u8], col_type_code: u8, for_max: bool) -> 
         type_code::F32 => ieee_order_bits_f32(u32::from_le_bytes(bytes[..4].try_into().unwrap())),
         type_code::F64 => ieee_order_bits(u64::from_le_bytes(bytes[..8].try_into().unwrap())),
         type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64 => {
-            crate::schema::read_unsigned(bytes, bytes.len())
+            gnitz_wire::read_unsigned_exact(bytes)
         }
         type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64 => {
-            (crate::schema::read_signed(bytes, bytes.len()) as u64).wrapping_add(1u64 << 63)
+            (gnitz_wire::read_signed_exact(bytes) as u64).wrapping_add(1u64 << 63)
         }
         other => unreachable!("AVI agg type {other} is not order-encodable (gated by agg_value_idx_eligible)"),
     };
@@ -257,7 +257,7 @@ pub(super) fn single_col_canonical_group_key(schema: &SchemaDescriptor, group_by
         return true;
     }
     let col = &schema.columns[c];
-    col.nullable == 0 && crate::schema::is_routable_int(col.type_code)
+    col.nullable == 0 && gnitz_wire::is_routable_int(col.type_code)
 }
 
 /// Hash one group column into the fold-path digest. The single per-column

@@ -2,7 +2,6 @@
 
 use std::rc::Rc;
 
-use crate::foundation::codec;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, MemBatch, MAX_WIRE_REGIONS};
 use gnitz_wire::control::german_spill_len;
@@ -193,12 +192,12 @@ pub(crate) fn batch_to_schema(batch: &Batch) -> Result<(SchemaDescriptor, Vec<Ve
     }
     let mut cols = [SchemaColumn::EMPTY; crate::schema::MAX_COLUMNS];
     let mut names = Vec::with_capacity(batch.count);
-    let mut pk_pairs: [(u8, u32); gnitz_wire::MAX_PK_COLUMNS] = [(0, 0); gnitz_wire::MAX_PK_COLUMNS];
+    let mut pk_pairs: [(u8, u32); crate::schema::MAX_PK_COLUMNS] = [(0, 0); crate::schema::MAX_PK_COLUMNS];
     let mut pk_count: usize = 0;
     for (i, col) in cols.iter_mut().enumerate().take(batch.count) {
         let off8 = i * 8;
-        let type_code_val = codec::read_u64_le(batch.col_data(0), off8) as u8;
-        let flags_val = codec::read_u64_le(batch.col_data(1), off8);
+        let type_code_val = gnitz_wire::read_u64_le(batch.col_data(0), off8) as u8;
+        let flags_val = gnitz_wire::read_u64_le(batch.col_data(1), off8);
         let off16 = i * 16;
         let mut st = [0u8; 16];
         st.copy_from_slice(&batch.col_data(2)[off16..off16 + 16]);
@@ -207,7 +206,7 @@ pub(crate) fn batch_to_schema(batch: &Batch) -> Result<(SchemaDescriptor, Vec<Ve
         let is_pk = (flags_val & META_FLAG_IS_PK) != 0;
         *col = SchemaColumn::new(type_code_val, if is_nullable { 1 } else { 0 });
         if is_pk {
-            if pk_count >= gnitz_wire::MAX_PK_COLUMNS {
+            if pk_count >= crate::schema::MAX_PK_COLUMNS {
                 return Err("too many PK columns");
             }
             let pos = ((flags_val & gnitz_wire::META_FLAG_PK_POS_MASK) >> gnitz_wire::META_FLAG_PK_POS_SHIFT) as u8;
@@ -219,7 +218,7 @@ pub(crate) fn batch_to_schema(batch: &Batch) -> Result<(SchemaDescriptor, Vec<Ve
         return Err("no PK column");
     }
     pk_pairs[..pk_count].sort_by_key(|(p, _)| *p);
-    let mut pk_indices: [u32; gnitz_wire::MAX_PK_COLUMNS] = [0; gnitz_wire::MAX_PK_COLUMNS];
+    let mut pk_indices: [u32; crate::schema::MAX_PK_COLUMNS] = [0; crate::schema::MAX_PK_COLUMNS];
     for (k, (_, ci)) in pk_pairs[..pk_count].iter().enumerate() {
         pk_indices[k] = *ci;
     }
@@ -756,13 +755,13 @@ pub(crate) fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<
     // Each entry pairs the PK column's logical index with its 0-indexed
     // position in the PK tuple (carried in the column's flags word).
     // Sorted by position before building the SchemaDescriptor.
-    let mut pk_pairs: [(u8, u32); gnitz_wire::MAX_PK_COLUMNS] = [(0, 0); gnitz_wire::MAX_PK_COLUMNS];
+    let mut pk_pairs: [(u8, u32); crate::schema::MAX_PK_COLUMNS] = [(0, 0); crate::schema::MAX_PK_COLUMNS];
     let mut pk_count: usize = 0;
 
     for (i, col) in cols[..count].iter_mut().enumerate() {
         let off8 = i * 8;
-        let tc = codec::read_u64_le(type_data, off8) as u8;
-        let fl = codec::read_u64_le(flags_data, off8);
+        let tc = gnitz_wire::read_u64_le(type_data, off8) as u8;
+        let fl = gnitz_wire::read_u64_le(flags_data, off8);
         // Reject unknown type codes here so a crafted wire schema cannot
         // smuggle in a type_code the downstream cursors can't decode.
         if !gnitz_wire::is_valid_type_code(tc) {
@@ -782,7 +781,7 @@ pub(crate) fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<
             if !gnitz_wire::is_pk_eligible(tc) {
                 return Err("PK column type not PK-eligible");
             }
-            if pk_count >= gnitz_wire::MAX_PK_COLUMNS {
+            if pk_count >= crate::schema::MAX_PK_COLUMNS {
                 return Err("too many PK columns");
             }
             let pos = ((fl & gnitz_wire::META_FLAG_PK_POS_MASK) >> gnitz_wire::META_FLAG_PK_POS_SHIFT) as u8;
@@ -796,7 +795,7 @@ pub(crate) fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<
     // Sort by position; single-PK schemas all carry position 0 so this
     // is a no-op for the common path.
     pk_pairs[..pk_count].sort_by_key(|(p, _)| *p);
-    let mut pk_indices: [u32; gnitz_wire::MAX_PK_COLUMNS] = [0; gnitz_wire::MAX_PK_COLUMNS];
+    let mut pk_indices: [u32; crate::schema::MAX_PK_COLUMNS] = [0; crate::schema::MAX_PK_COLUMNS];
     for (k, (_, ci)) in pk_pairs[..pk_count].iter().enumerate() {
         pk_indices[k] = *ci;
     }
@@ -850,7 +849,7 @@ fn wal_block_slice_at(data: &[u8], off: usize) -> Result<&[u8], &'static str> {
     if off + gnitz_wire::WAL_HEADER_SIZE > data.len() {
         return Err("WAL block header truncated");
     }
-    let size = codec::read_u32_le(data, off + WAL_OFF_SIZE) as usize;
+    let size = gnitz_wire::read_u32_le(data, off + WAL_OFF_SIZE) as usize;
     if size < gnitz_wire::WAL_HEADER_SIZE || off + size > data.len() {
         return Err("WAL block truncated");
     }
@@ -869,7 +868,7 @@ fn txn_frame_prologue(data: &[u8], min_family_bytes: usize) -> Result<(usize, us
     if off + 4 > data.len() {
         return Err("TXN family count truncated");
     }
-    let count = codec::read_u32_le(data, off) as usize;
+    let count = gnitz_wire::read_u32_le(data, off) as usize;
     let off = off + 4;
     let max_families = data.len().saturating_sub(off) / min_family_bytes + 1;
     Ok((count, off, count.min(max_families)))
@@ -880,7 +879,7 @@ pub fn decode_ddl_txn(data: &[u8]) -> Result<Vec<(i64, &[u8])>, &'static str> {
     let mut families = Vec::with_capacity(cap);
     for _ in 0..count {
         let block = wal_block_slice_at(data, off)?;
-        let tid = codec::read_u32_le(block, WAL_OFF_TID) as i64;
+        let tid = gnitz_wire::read_u32_le(block, WAL_OFF_TID) as i64;
         families.push((tid, block));
         off += block.len();
     }
@@ -927,7 +926,7 @@ pub fn decode_push_txn(data: &[u8]) -> Result<DecodedPushTxn<'_>, &'static str> 
         let schema_block = wal_block_slice_at(data, off)?;
         off += schema_block.len();
         let wal_block = wal_block_slice_at(data, off)?;
-        let tid = codec::read_u32_le(wal_block, WAL_OFF_TID) as i64;
+        let tid = gnitz_wire::read_u32_le(wal_block, WAL_OFF_TID) as i64;
         off += wal_block.len();
         families.push(TxnFamilyWire {
             tid,
@@ -940,7 +939,7 @@ pub fn decode_push_txn(data: &[u8]) -> Result<DecodedPushTxn<'_>, &'static str> 
     if off + 4 > data.len() {
         return Err("PUSH_TXN precondition count truncated");
     }
-    let pre_count = codec::read_u32_le(data, off) as usize;
+    let pre_count = gnitz_wire::read_u32_le(data, off) as usize;
     off += 4;
     // Bound the count by the bytes physically remaining (16 per precondition) so
     // a hostile count cannot force a giant pre-allocation, and the reads below
@@ -950,8 +949,8 @@ pub fn decode_push_txn(data: &[u8]) -> Result<DecodedPushTxn<'_>, &'static str> 
     }
     let mut preconditions = Vec::with_capacity(pre_count);
     for _ in 0..pre_count {
-        let tid = codec::read_u64_le(data, off) as i64;
-        let basis = codec::read_u64_le(data, off + 8);
+        let tid = gnitz_wire::read_u64_le(data, off) as i64;
+        let basis = gnitz_wire::read_u64_le(data, off + 8);
         off += 16;
         preconditions.push((tid, basis));
     }
@@ -982,7 +981,7 @@ pub fn decode_scan_multi(data: &[u8]) -> Result<Vec<(u64, u16)>, &'static str> {
     }
     let mut relations = Vec::with_capacity(count);
     for _ in 0..count {
-        let tid = codec::read_u64_le(data, off);
+        let tid = gnitz_wire::read_u64_le(data, off);
         let version = u16::from_le_bytes([data[off + 8], data[off + 9]]);
         off += RECORD_BYTES;
         relations.push((tid, version));
@@ -1547,7 +1546,7 @@ mod tests {
         let mut wire = build_schema_wire_block(&sd, &[b"c0".as_slice()], 0, 0);
         // Region 4 is the flags column; OR in NULLABLE on the PK (col 0).
         let (fl_off, _) = gnitz_wire::wal::dir_entry(&wire, 4);
-        let f = codec::read_u64_le(&wire, fl_off) | META_FLAG_NULLABLE;
+        let f = gnitz_wire::read_u64_le(&wire, fl_off) | META_FLAG_NULLABLE;
         wire[fl_off..fl_off + 8].copy_from_slice(&f.to_le_bytes());
         // verify_checksum=false: the flags region is inside the checksummed body.
         match decode_schema_block(&wire, false) {
