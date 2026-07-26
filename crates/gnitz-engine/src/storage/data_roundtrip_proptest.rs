@@ -170,7 +170,7 @@ fn row_key(batch: &Batch, schema: &SchemaDescriptor, row: usize) -> RowKey {
         let raw = batch.get_col_ptr(row, pi, cs);
         let logical = if gnitz_wire::is_german_string(col.type_code) {
             let st: [u8; 16] = raw.try_into().unwrap();
-            crate::schema::try_decode_german_string(&st, &batch.blob).unwrap()
+            gnitz_wire::try_decode_german_string(&st, &batch.blob).unwrap()
         } else {
             raw.to_vec()
         };

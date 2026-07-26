@@ -207,7 +207,7 @@ pub(super) fn decode_ordered(encoded: u64, col_type_code: TypeCode, for_max: boo
 /// string key routes to — and dedups against — the partition it belongs to.
 #[inline]
 pub(super) fn hash_german_string_content(hasher: &mut Xxh3Default, struct_bytes: &[u8], blob: &[u8]) {
-    let content = crate::schema::german_string_content(struct_bytes, blob);
+    let content = gnitz_wire::german_string_content(struct_bytes, blob);
     hasher.update(&(content.len() as u32).to_le_bytes());
     hasher.update(content);
 }

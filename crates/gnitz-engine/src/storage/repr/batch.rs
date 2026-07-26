@@ -656,9 +656,8 @@ impl Batch {
         if off + 16 > data.len() {
             return String::new();
         }
-        let st: [u8; 16] = data[off..off + 16].try_into().unwrap_or([0; 16]);
-        let bytes = crate::schema::try_decode_german_string(&st, &self.blob).unwrap_or_default();
-        String::from_utf8(bytes).unwrap_or_default()
+        let bytes = gnitz_wire::german_string_content(&data[off..off + 16], &self.blob);
+        String::from_utf8(bytes.to_vec()).unwrap_or_default()
     }
     /// Apply `f` to every row's weight in place. Generic so the per-epoch
     /// callers (negate, delta doubling) monomorphize to a tight loop. The
@@ -943,6 +942,16 @@ impl Batch {
         let mut is_string_at = [false; MAX_BATCH_REGIONS];
         // A shared blob needs no per-cell relocation, so it needs no string map
         // either — every column takes the bulk region copy below.
+        //
+        // Load-bearing: a *wire-borrowed* `MemBatch` carries `blob_id == 0`
+        // (`batch_wire.rs`) while every `Batch` mints an id from 1 up, so a
+        // wire source can never take this path — which is what makes the
+        // relocation below the canonicalizing gate for W2M frames, the one
+        // German-string ingress that skips `validate_string_heap_extents`.
+        debug_assert!(
+            self.blob_id != 0,
+            "append_mem_batch_ranges: a Batch must never carry the wire blob_id 0"
+        );
         let shares_blob = self.blob_id == src.blob_id && self.blob.len() == src.blob.len();
         if let (false, Some(s)) = (shares_blob, self.schema) {
             if !src.blob.is_empty() {
@@ -1419,7 +1428,7 @@ impl Batch {
                         } else {
                             std::slice::from_raw_parts(ptr, slen)
                         };
-                        let gs = crate::schema::encode_german_string(bytes, &mut self.blob);
+                        let gs = gnitz_wire::encode_german_string(bytes, &mut self.blob);
                         self.extend_col(pi, &gs);
                     }
                     crate::schema::type_code::F64 => {
@@ -1871,7 +1880,7 @@ impl BatchBuilder {
     /// Put raw bytes for the current STRING/BLOB payload column — the one
     /// German-string encode site; `read_german_bytes` is the read-back twin.
     pub(crate) fn put_blob(&mut self, b: &[u8]) {
-        let st = crate::schema::encode_german_string(b, &mut self.batch.blob);
+        let st = gnitz_wire::encode_german_string(b, &mut self.batch.blob);
         self.batch.extend_col(self.curr_col, &st);
         self.curr_col += 1;
     }
@@ -2569,28 +2578,6 @@ mod tests {
         b.reserve_rows(1);
         // Bit 100 is set — above the 96-bit stride window.
         b.extend_pk(1u128 << 100);
-    }
-
-    /// A long-string German cell whose heap region [offset, offset+len) overruns
-    /// the source blob must relocate to an empty string, not read out of bounds.
-    /// This is the safety primitive that `append_row_from_source_bytes` and
-    /// `write_join_row` rely on instead of the deleted `write_string_from_raw`.
-    #[test]
-    fn relocate_german_string_oob_falls_back_to_empty() {
-        // Build a long-string cell: length=100 (> 12), prefix bytes, and a
-        // heap offset of 0 — but the source blob is empty, so [0, 100) overruns.
-        let mut cell = [0u8; 16];
-        cell[0..4].copy_from_slice(&100u32.to_le_bytes()); // length
-        cell[4..8].copy_from_slice(b"abcd"); // inline prefix
-        cell[8..16].copy_from_slice(&0u64.to_le_bytes()); // heap offset 0
-        let src_blob: &[u8] = &[]; // empty: any long string overruns
-
-        let mut dst_blob: Vec<u8> = Vec::new();
-        let out = crate::schema::relocate_german_string_vec(&cell, src_blob, &mut dst_blob, None);
-        // Fallback: length field zeroed, nothing appended to dst_blob.
-        let out_len = u32::from_le_bytes(out[0..4].try_into().unwrap());
-        assert_eq!(out_len, 0, "OOB long string must relocate to empty");
-        assert!(dst_blob.is_empty(), "no bytes should be copied on overrun");
     }
 
     // ── Consumer skip-point flag verifiers (debug_verify_sorted /

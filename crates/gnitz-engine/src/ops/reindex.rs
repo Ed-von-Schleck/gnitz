@@ -78,7 +78,7 @@ pub(super) fn reindex_hash_row(out_schema: &SchemaDescriptor, output: &mut Batch
 /// German-string struct) hashes to 0.
 #[inline]
 pub(super) fn german_string_promote_key(struct_bytes: &[u8], blob: &[u8]) -> u128 {
-    let content = crate::schema::german_string_content(struct_bytes, blob);
+    let content = gnitz_wire::german_string_content(struct_bytes, blob);
     if content.is_empty() {
         return 0; // NULL / empty-string sentinel
     }
@@ -526,7 +526,7 @@ mod tests {
         b.extend_pk(1u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
-        let gs0 = crate::test_support::german_string(b"foo", &mut b.blob);
+        let gs0 = gnitz_wire::encode_german_string(b"foo", &mut b.blob);
         b.extend_col(0, &gs0);
         b.count += 1;
 
@@ -535,7 +535,7 @@ mod tests {
         b.extend_pk(2u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
-        let gs1 = crate::test_support::german_string(long_str, &mut b.blob);
+        let gs1 = gnitz_wire::encode_german_string(long_str, &mut b.blob);
         b.extend_col(0, &gs1);
         b.count += 1;
 
@@ -733,7 +733,7 @@ mod tests {
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
         // Short inline BLOB "abc" in a 16-byte German-string struct.
-        let gs = crate::test_support::german_string(b"abc", &mut b.blob);
+        let gs = gnitz_wire::encode_german_string(b"abc", &mut b.blob);
         b.extend_col(0, &gs);
         b.count += 1;
 
@@ -849,8 +849,7 @@ mod tests {
                 let cs = schema.columns[1].size() as usize;
                 let mut slot = [0u8; 16];
                 if gnitz_wire::is_german_string(col_tc) {
-                    slot[0..4].copy_from_slice(&3u32.to_le_bytes());
-                    slot[4..7].copy_from_slice(&[b'a' + r as u8, b'b', b'c']);
+                    slot = gnitz_wire::encode_german_string(&[b'a' + r as u8, b'b', b'c'], &mut b.blob);
                 } else {
                     slot[..cs.min(8)].copy_from_slice(&((r + 7) * 1000).to_le_bytes()[..cs.min(8)]);
                 }

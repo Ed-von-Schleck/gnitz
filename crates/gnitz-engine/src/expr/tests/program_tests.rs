@@ -309,7 +309,7 @@ fn test_string_eq_const() {
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());
     // German string struct for "hello" (5 bytes, inline)
-    let gs = crate::test_support::german_string(b"hello", &mut batch.blob);
+    let gs = gnitz_wire::encode_german_string(b"hello", &mut batch.blob);
     batch.extend_col(0, &gs);
     batch.count = 1;
 
@@ -763,7 +763,7 @@ fn test_string_lt_le_const() {
     batch.extend_pk(1u128);
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());
-    let gs = crate::test_support::german_string(b"hello", &mut batch.blob);
+    let gs = gnitz_wire::encode_german_string(b"hello", &mut batch.blob);
     batch.extend_col(0, &gs);
     batch.count = 1;
     let mb = batch.as_mem_batch();
@@ -824,9 +824,9 @@ fn test_string_col_eq_col() {
     batch.extend_pk(1u128);
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());
-    let gs_a = crate::test_support::german_string(b"abc", &mut batch.blob);
+    let gs_a = gnitz_wire::encode_german_string(b"abc", &mut batch.blob);
     batch.extend_col(0, &gs_a);
-    let gs_b = crate::test_support::german_string(b"abc", &mut batch.blob);
+    let gs_b = gnitz_wire::encode_german_string(b"abc", &mut batch.blob);
     batch.extend_col(1, &gs_b);
     batch.count += 1;
 
@@ -835,7 +835,7 @@ fn test_string_col_eq_col() {
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());
     batch.extend_col(0, &gs_a);
-    let gs_c = crate::test_support::german_string(b"xyz", &mut batch.blob);
+    let gs_c = gnitz_wire::encode_german_string(b"xyz", &mut batch.blob);
     batch.extend_col(1, &gs_c);
     batch.count += 1;
 
@@ -1042,7 +1042,7 @@ fn test_is_strictly_non_nullable_str_col() {
 /// Build a 16-byte inline German String struct for use in test batches.
 fn make_german_string(s: &[u8]) -> [u8; 16] {
     assert!(s.len() <= 12, "test helper only handles inline strings (≤ 12 bytes)");
-    crate::test_support::german_string(s, &mut Vec::new())
+    gnitz_wire::encode_german_string(s, &mut Vec::new())
 }
 
 /// Build a 1-row batch with the given schema, containing `s` as the first payload column.

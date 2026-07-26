@@ -251,12 +251,15 @@ impl Batch {
     }
 }
 
-/// Trust-boundary guard for the blob-passthrough decode: every long-string
-/// struct's `[offset, offset + len)` must lie inside the block's blob heap.
-/// Without this, a hostile client push could ship an overrunning struct that
-/// fires `german_string_tail`'s debug_assert (a debug-build DoS) and persists
-/// corrupt structs — the per-row relocation used to canonicalize these to the
-/// empty string. Null cells are zeroed (length 0 → short) and skip themselves.
+/// Trust-boundary guard for the blob-passthrough decode: every German-string
+/// cell must be in canonical form (`german_string_cell_ok`) against the block's
+/// blob heap. The passthrough copies the 16-byte structs verbatim, where the
+/// per-row relocation it replaced used to canonicalize them, so this is the one
+/// place a hostile client push is stopped from persisting a cell that
+/// `german_string_content` and `compare_german_strings` would read differently
+/// — an overrunning heap extent, or a padding/prefix skew that splits one Z-set
+/// element's weight across two rows consolidation will never merge. Null cells
+/// are zeroed (length 0 → canonical short) and pass trivially.
 fn validate_string_heap_extents(mb: &MemBatch<'_>, schema: &SchemaDescriptor) -> Result<(), &'static str> {
     if !schema.has_german_string() {
         return Ok(());
@@ -267,12 +270,8 @@ fn validate_string_heap_extents(mb: &MemBatch<'_>, schema: &SchemaDescriptor) ->
         }
         for row in 0..mb.count {
             let cell = mb.get_col_ptr(row, pi, 16);
-            let len = crate::foundation::codec::read_u32_le(cell, 0) as usize;
-            if len > crate::schema::SHORT_STRING_THRESHOLD {
-                let off = crate::foundation::codec::read_u64_le(cell, 8) as usize;
-                if off.saturating_add(len) > mb.blob.len() {
-                    return Err("data WAL long string overruns blob heap");
-                }
+            if !gnitz_wire::german_string_cell_ok(cell, mb.blob) {
+                return Err("data WAL German string is not in canonical form");
             }
         }
     }
@@ -283,6 +282,16 @@ fn validate_string_heap_extents(mb: &MemBatch<'_>, schema: &SchemaDescriptor) ->
 /// directly. No allocation; caller must keep `data` live for as long as the
 /// returned `MemBatch` is used. Checksum verification is skipped (IPC trusted
 /// path).
+///
+/// **Contract — this decode skips `validate_string_heap_extents`.** It is for
+/// the W2M ring only: worker-written shared memory, unreachable from a client
+/// (every client frame lands in `Batch::decode_from_wal_block`, which does
+/// validate). A caller must therefore either relocate every German-string cell
+/// on the way in (`Batch::append_mem_batch*`, which canonicalizes) or use a
+/// schema with no STRING/BLOB payload column — index-record and preflight
+/// schemas qualify, since `gnitz_wire::index_key_type` rejects both. Sites that
+/// read only the PK region are trivially fine: a PK column can never be a
+/// German string (`is_pk_eligible`).
 pub fn decode_mem_batch_from_wal_block<'a>(
     data: &'a [u8],
     schema: &SchemaDescriptor,

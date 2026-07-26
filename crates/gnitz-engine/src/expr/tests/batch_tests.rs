@@ -160,7 +160,7 @@ fn test_str_col_eq_const_nullable_column_matches_per_row() {
         let null_word: u64 = if is_null { 1 } else { 0 }; // bit 0 = col1
         batch.extend_null_bmp(&null_word.to_le_bytes());
         let s: &[u8] = if row % 4 == 1 { b"foo" } else { b"bar" };
-        let gs = crate::test_support::german_string(s, &mut batch.blob);
+        let gs = gnitz_wire::encode_german_string(s, &mut batch.blob);
         batch.extend_col(0, &gs);
         batch.count += 1;
     }
@@ -441,7 +441,7 @@ fn golden_str_col_eq_const_null_row() {
     b.extend_pk(1u128);
     b.extend_weight(&1i64.to_le_bytes());
     b.extend_null_bmp(&1u64.to_le_bytes()); // payload 0 (the string col) null
-    let gs = crate::test_support::german_string(b"foo", &mut b.blob);
+    let gs = gnitz_wire::encode_german_string(b"foo", &mut b.blob);
     b.extend_col(0, &gs);
     b.count = 1;
     let mb = b.as_mem_batch();
@@ -1486,7 +1486,7 @@ fn str_const_filter_bench() {
         } else {
             format!("k{}", row % 97)
         };
-        let gs = crate::test_support::german_string(s.as_bytes(), &mut batch.blob);
+        let gs = gnitz_wire::encode_german_string(s.as_bytes(), &mut batch.blob);
         batch.extend_col(0, &gs);
         batch.count += 1;
     }

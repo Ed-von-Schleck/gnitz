@@ -2,11 +2,8 @@
 
 use std::cmp::Ordering;
 
-use crate::schema::{
-    compare_german_strings,
-    type_code::{BLOB as TYPE_BLOB, STRING as TYPE_STRING},
-    SchemaDescriptor,
-};
+use crate::schema::SchemaDescriptor;
+use gnitz_wire::compare_german_strings;
 
 // ---------------------------------------------------------------------------
 // ColumnarSource trait
@@ -102,20 +99,12 @@ fn compare_rows_impl<const SKIP: bool, A: ColumnarSource, B: ColumnarSource>(
     Ordering::Equal
 }
 
-/// Compare two equal-length little-endian byte windows of a fixed-width column
-/// under the given raw `u8` type code. STRING/BLOB are not handled here — callers
-/// requiring them must dispatch German strings first (see [`cmp_col_window`]); a
-/// mis-routed 16-byte string window hits a width `unreachable!` rather than
-/// silently mis-comparing.
-#[inline]
-fn cmp_typed_le(a: &[u8], b: &[u8], type_code: u8) -> Ordering {
-    gnitz_wire::cmp_typed_le(a, b, type_code)
-}
-
 /// Compare two equal-width column windows of the given raw `u8` type code,
 /// dispatching German strings (STRING/BLOB) to content comparison through their
-/// backing blob arenas and every fixed-width type to [`cmp_typed_le`]. The blob
-/// slices back each side's German-string heap tail (ignored for non-string columns).
+/// backing blob arenas and every fixed-width type to `gnitz_wire::cmp_typed_le`
+/// (which is deliberately string-free — a mis-routed 16-byte string window hits
+/// its width `unreachable!` rather than silently mis-comparing). The blob slices
+/// back each side's German-string heap payload (ignored for non-string columns).
 ///
 /// This is the single home for the "STRING and BLOB share the 16-byte layout, so
 /// they must be compared by content before the fixed-width dispatch" rule:
@@ -124,10 +113,10 @@ fn cmp_typed_le(a: &[u8], b: &[u8], type_code: u8) -> Ordering {
 /// a BLOB key).
 #[inline]
 pub(crate) fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], type_code: u8) -> Ordering {
-    if type_code == TYPE_STRING || type_code == TYPE_BLOB {
+    if gnitz_wire::is_german_string(type_code) {
         compare_german_strings(a, a_blob, b, b_blob)
     } else {
-        cmp_typed_le(a, b, type_code)
+        gnitz_wire::cmp_typed_le(a, b, type_code)
     }
 }
 
@@ -660,78 +649,6 @@ mod tests {
         assert_eq!(compare_rows(&schema, &batch, 0, &batch, 0), Ordering::Equal);
     }
 
-    // ---------------------------------------------------------------------------
-    // German string comparator — direct tests (short, long, mixed lengths)
-    // ---------------------------------------------------------------------------
-
-    use crate::schema::SHORT_STRING_THRESHOLD;
-
-    /// Build a German string struct (len > SHORT_STRING_THRESHOLD) with its heap blob.
-    fn make_long_string(data: &[u8]) -> ([u8; 16], Vec<u8>) {
-        assert!(data.len() > SHORT_STRING_THRESHOLD);
-        let mut blob = Vec::new();
-        let s = crate::schema::encode_german_string(data, &mut blob);
-        (s, blob)
-    }
-
-    #[test]
-    fn test_german_string_short() {
-        let mut blob = Vec::new();
-        let a = crate::schema::encode_german_string(b"abc", &mut blob);
-        // "abc" < "abd"
-        let b = crate::schema::encode_german_string(b"abd", &mut blob);
-        assert_eq!(compare_german_strings(&a, &[], &b, &[]), Ordering::Less);
-
-        // Equal
-        let b = crate::schema::encode_german_string(b"abc", &mut blob);
-        assert_eq!(compare_german_strings(&a, &[], &b, &[]), Ordering::Equal);
-
-        // Shorter < longer with same prefix: "abc" < "abcz"
-        let b = crate::schema::encode_german_string(b"abcz", &mut blob);
-        assert_eq!(compare_german_strings(&a, &[], &b, &[]), Ordering::Less);
-    }
-
-    #[test]
-    fn test_german_string_long() {
-        // Long strings: equal except last byte
-        let data_a: Vec<u8> = b"hello_world_long_A".to_vec(); // len=18
-        let data_b_lt: Vec<u8> = b"hello_world_long_B".to_vec();
-        let (sa, blob_a) = make_long_string(&data_a);
-        let (sb_lt, blob_b_lt) = make_long_string(&data_b_lt);
-        assert_eq!(compare_german_strings(&sa, &blob_a, &sb_lt, &blob_b_lt), Ordering::Less);
-
-        // Equal long strings
-        let (sb_eq, blob_b_eq) = make_long_string(&data_a);
-        assert_eq!(
-            compare_german_strings(&sa, &blob_a, &sb_eq, &blob_b_eq),
-            Ordering::Equal
-        );
-
-        // Prefix differs early → less
-        let data_b_prefix: Vec<u8> = b"aello_world_long_A".to_vec();
-        let (sb_prefix, blob_b_prefix) = make_long_string(&data_b_prefix);
-        assert_eq!(
-            compare_german_strings(&sb_prefix, &blob_b_prefix, &sa, &blob_a),
-            Ordering::Less
-        );
-    }
-
-    #[test]
-    fn test_german_string_mixed_short_long() {
-        // Short (len=10) vs long (len=20) with same prefix; shorter < longer
-        let short_data = b"0123456789"; // len=10, ≤ SHORT_STRING_THRESHOLD → short
-        let mut s_short = [0u8; 16];
-        s_short[0..4].copy_from_slice(&10u32.to_le_bytes());
-        s_short[4..8].copy_from_slice(&short_data[0..4]);
-        s_short[8..14].copy_from_slice(&short_data[4..]);
-        let long_data: Vec<u8> = b"01234567890123456789".to_vec(); // len=20
-        let (s_long, blob_long) = make_long_string(&long_data);
-        assert_eq!(
-            compare_german_strings(&s_short, &[], &s_long, &blob_long),
-            Ordering::Less
-        );
-    }
-
     /// Test STRING column comparison via compare_rows (short strings).
     #[test]
     fn test_compare_rows_string() {
@@ -744,20 +661,9 @@ mod tests {
         );
 
         let mut col0 = Vec::new();
-        // "abc" (len=3)
-        let mut s1 = [0u8; 16];
-        s1[0..4].copy_from_slice(&3u32.to_le_bytes());
-        s1[4] = b'a';
-        s1[5] = b'b';
-        s1[6] = b'c';
-        col0.extend_from_slice(&s1);
-        // "abd" (len=3)
-        let mut s2 = [0u8; 16];
-        s2[0..4].copy_from_slice(&3u32.to_le_bytes());
-        s2[4] = b'a';
-        s2[5] = b'b';
-        s2[6] = b'd';
-        col0.extend_from_slice(&s2);
+        let mut blob = Vec::new();
+        col0.extend_from_slice(&gnitz_wire::encode_german_string(b"abc", &mut blob));
+        col0.extend_from_slice(&gnitz_wire::encode_german_string(b"abd", &mut blob));
 
         let batch = single_col_batch(&[0, 0], col0);
         // "abc" < "abd"

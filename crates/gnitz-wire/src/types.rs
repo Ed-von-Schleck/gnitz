@@ -239,8 +239,11 @@ pub fn cmp_typed_le(a: &[u8], b: &[u8], tc: u8) -> Ordering {
 /// counterpart to [`TypeCode::is_pk_eligible`] for callers holding a raw
 /// `type_code` (mirrors the free `wire_stride`). Unknown codes are ineligible.
 #[inline]
-pub fn is_pk_eligible(tc: u8) -> bool {
-    TypeCode::try_from_u8(tc).is_some_and(|t| t.is_pk_eligible())
+pub const fn is_pk_eligible(tc: u8) -> bool {
+    match TypeCode::try_from_u8(tc) {
+        Some(t) => t.is_pk_eligible(),
+        None => false,
+    }
 }
 
 /// Promote a base-table column's type to the leading-key type its secondary

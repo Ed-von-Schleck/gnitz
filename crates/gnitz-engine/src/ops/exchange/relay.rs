@@ -434,7 +434,7 @@ mod tests {
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
 
-            let gs = crate::test_support::german_string(s.as_bytes(), &mut b.blob);
+            let gs = gnitz_wire::encode_german_string(s.as_bytes(), &mut b.blob);
             b.extend_col(0, &gs);
             b.count += 1;
         }

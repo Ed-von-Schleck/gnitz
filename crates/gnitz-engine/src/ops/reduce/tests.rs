@@ -3,9 +3,10 @@
 
 use crate::expr::PkFill;
 use crate::foundation::codec::{read_i64_le, read_u64_le};
-use crate::schema::{encode_german_string, type_code, SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{Batch, Layout};
 use crate::test_support::{make_schema_i64pk_i64, make_schema_u64_i64, opk_pk_i64};
+use gnitz_wire::encode_german_string;
 
 use super::super::util::{extract_group_key, ieee_order_bits_f32, ieee_order_bits_f32_reverse};
 use super::agg::{apply_agg_from_value_index, Accumulator, AggDescriptor, AggOp};

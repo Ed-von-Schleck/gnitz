@@ -7,7 +7,8 @@
 //! type: a missing or mis-routed opcode is a compile error, not a silent
 //! miscompute.
 
-use crate::schema::{encode_german_string, ColumnLocator, SchemaDescriptor};
+use crate::schema::{ColumnLocator, SchemaDescriptor};
+use gnitz_wire::encode_german_string;
 // Wire opcodes (1–46) the client emits, matched as arms in `from_wire`. They are
 // `pub const … : u32` in gnitz-wire, so a plain `use` binds them for pattern use.
 use gnitz_wire::{

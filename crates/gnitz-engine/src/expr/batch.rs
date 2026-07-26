@@ -9,8 +9,9 @@ use std::cmp::Ordering;
 
 use super::program::{CmpOp, Instr, ResolvedProgram, StrOp};
 use crate::foundation::codec::read_u64_le;
-use crate::schema::{compare_german_strings, PAYLOAD_MAPPING_PK_SENTINEL};
+use crate::schema::PAYLOAD_MAPPING_PK_SENTINEL;
 use crate::storage::MemBatch;
+use gnitz_wire::compare_german_strings;
 
 pub(in crate::expr) const MORSEL: usize = 256;
 pub(in crate::expr) const NULL_WORDS_PER_REG: usize = MORSEL / 64; // 4

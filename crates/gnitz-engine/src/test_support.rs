@@ -99,13 +99,6 @@ pub(crate) fn wide_row(schema: &SchemaDescriptor, pk: &[u8], w: i64, val: i64) -
     b
 }
 
-/// Encode `s` as a 16-byte German-string struct — the production encoder,
-/// re-exported under the test-side name so no test re-derives the at-rest
-/// STRING/BLOB layout by hand.
-pub(crate) fn german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
-    crate::schema::encode_german_string(s, blob)
-}
-
 /// The canonical narrow test schema: U64 pk + a single I64 payload column.
 pub(crate) fn make_schema_u64_i64() -> SchemaDescriptor {
     SchemaDescriptor::new(
@@ -180,7 +173,9 @@ pub(crate) fn opk_pk_i64(opk_bytes: &[u8]) -> i64 {
 
 /// Read a German-string payload cell (16-byte struct at payload `col`, `row`)
 /// back to its content bytes — the test-side readback inverse of
-/// [`german_string`], via the production decoder.
+/// `gnitz_wire::encode_german_string`, via the production decoder. `unwrap`s:
+/// a test that writes a cell through the encoder and cannot read it back has
+/// found a bug, not a corrupt input.
 pub(crate) fn read_german_string(batch: &Batch, col: usize, row: usize) -> Vec<u8> {
     let off = row * 16;
     let gs: &[u8; 16] = batch.col_data(col)[off..off + 16].try_into().unwrap();

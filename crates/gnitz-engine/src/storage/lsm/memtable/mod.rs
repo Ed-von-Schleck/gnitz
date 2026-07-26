@@ -430,12 +430,6 @@ mod tests {
         SchemaDescriptor::new(&columns[..cols.len()], &[pk_index])
     }
 
-    fn decode_str(batch: &Batch, row: usize, payload_col: usize) -> Vec<u8> {
-        let raw = batch.get_col_ptr(row, payload_col, 16);
-        let st: [u8; 16] = raw.try_into().unwrap();
-        crate::schema::try_decode_german_string(&st, &batch.blob).unwrap()
-    }
-
     #[test]
     fn test_append_row_simple_nullable_string() {
         // Schema: U64(pk=0), STRING(nullable)
@@ -462,7 +456,7 @@ mod tests {
 
         assert_eq!(batch.count, 2);
         // Row 0: string decodes correctly
-        assert_eq!(decode_str(&batch, 0, 0), b"not null");
+        assert_eq!(crate::test_support::read_german_string(&batch, 0, 0), b"not null");
         // Row 0: not null
         assert_eq!(batch.get_null_word(0) & 1, 0);
         // Row 1: null bit set
@@ -500,8 +494,16 @@ mod tests {
 
         assert_eq!(batch.count, 4);
         for (i, (name, desc)) in cases.iter().enumerate() {
-            assert_eq!(decode_str(&batch, i, 0), *name, "row {i} name mismatch");
-            assert_eq!(decode_str(&batch, i, 1), *desc, "row {i} desc mismatch");
+            assert_eq!(
+                crate::test_support::read_german_string(&batch, 0, i),
+                *name,
+                "row {i} name mismatch"
+            );
+            assert_eq!(
+                crate::test_support::read_german_string(&batch, 1, i),
+                *desc,
+                "row {i} desc mismatch"
+            );
         }
     }
 
@@ -587,7 +589,7 @@ mod tests {
         let f64_val = f64::from_le_bytes(f64_bytes.try_into().unwrap());
         assert!((f64_val - 2.718281828).abs() < 1e-9, "f64: {f64_val}");
         // STRING
-        assert_eq!(decode_str(&batch, 0, 10), b"hello world!");
+        assert_eq!(crate::test_support::read_german_string(&batch, 10, 0), b"hello world!");
         // U128
         let u128_bytes = batch.get_col_ptr(0, 11, 16);
         let u128_lo = u64::from_le_bytes(u128_bytes[0..8].try_into().unwrap());
@@ -876,31 +878,6 @@ mod tests {
 
         // After consolidation: net 12 rows = 384 < 420
         assert!(!mt.should_flush(), "net state should be under threshold");
-    }
-
-    /// Bug 5: the string relocator must not panic when the blob offset is past end.
-    #[test]
-    fn test_relocate_string_cell_out_of_bounds() {
-        // Build a 16-byte German string struct for a long string (length > 12)
-        // with an out-of-bounds blob offset.
-        let length: u32 = 20;
-        let prefix = [b'A'; 4];
-        let bad_offset: u64 = 9999; // way past any blob
-        let mut src_struct = [0u8; 16];
-        src_struct[0..4].copy_from_slice(&length.to_le_bytes());
-        src_struct[4..8].copy_from_slice(&prefix);
-        src_struct[8..16].copy_from_slice(&bad_offset.to_le_bytes());
-
-        let src_blob: &[u8] = &[0u8; 10]; // only 10 bytes, offset 9999 is OOB
-        let mut dst_blob = Vec::new();
-
-        // Must not panic
-        let dst = crate::schema::relocate_german_string_vec(&src_struct, src_blob, &mut dst_blob, None);
-
-        // The corrupted string should have length set to 0
-        let out_len = u32::from_le_bytes(dst[0..4].try_into().unwrap());
-        assert_eq!(out_len, 0, "corrupted string should be zero-length");
-        assert!(dst_blob.is_empty(), "no blob data should have been copied");
     }
 
     /// Bug 5: append_row_from_source must not panic when blob offset is invalid.

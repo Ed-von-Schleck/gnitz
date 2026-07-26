@@ -416,11 +416,7 @@ mod tests {
             batch.extend_weight(&1i64.to_le_bytes());
             batch.extend_null_bmp(&0u64.to_le_bytes());
 
-            // Write a short string: "hi" (2 bytes, inline)
-            let mut str_struct = [0u8; 16];
-            str_struct[0..4].copy_from_slice(&2u32.to_le_bytes()); // length=2
-            str_struct[4] = b'h';
-            str_struct[5] = b'i'; // prefix
+            let str_struct = gnitz_wire::encode_german_string(b"hi", &mut batch.blob);
             batch.extend_col(0, &str_struct);
             batch.count += 1;
         }

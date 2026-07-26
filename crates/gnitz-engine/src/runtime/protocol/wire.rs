@@ -3,9 +3,10 @@
 use std::rc::Rc;
 
 use crate::foundation::codec;
-use crate::schema::{encode_german_string, type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, MemBatch, MAX_WIRE_REGIONS};
 use gnitz_wire::control::german_spill_len;
+use gnitz_wire::encode_german_string;
 
 // ---------------------------------------------------------------------------
 // Constants re-exported from gnitz_wire
@@ -201,7 +202,7 @@ pub(crate) fn batch_to_schema(batch: &Batch) -> Result<(SchemaDescriptor, Vec<Ve
         let off16 = i * 16;
         let mut st = [0u8; 16];
         st.copy_from_slice(&batch.col_data(2)[off16..off16 + 16]);
-        names.push(crate::schema::try_decode_german_string(&st, &batch.blob).unwrap());
+        names.push(gnitz_wire::try_decode_german_string(&st, &batch.blob).unwrap());
         let is_nullable = (flags_val & META_FLAG_NULLABLE) != 0;
         let is_pk = (flags_val & META_FLAG_IS_PK) != 0;
         *col = SchemaColumn::new(type_code_val, if is_nullable { 1 } else { 0 });

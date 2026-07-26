@@ -897,20 +897,14 @@ impl ReadCursor {
 
     /// Decode the German string at logical column `col` of the current row into raw
     /// bytes (STRING and BLOB share the 16-byte layout). Returns empty when the column
-    /// pointer is null or a long-string offset overruns the blob; the bounds check is
-    /// part of the decode. A malformed blob offset is reachable only via corrupt wire
-    /// input (the ingest path does not validate per-string offsets), so this degrades
-    /// to empty rather than aborting. There is deliberately NO debug_assert on the
-    /// `None` case: that case is exactly the condition being hardened, and a
-    /// debug_assert would re-introduce the dev-time abort and make the empty-on-overrun
-    /// contract untestable in the default (debug) test profile.
+    /// pointer is null or a long-string offset overruns the blob — the latter is
+    /// `german_string_content`'s own degrade-to-empty contract, shared with the
+    /// ordering and hashing paths so every reader sees a corrupt cell the same way.
     pub(crate) fn read_german_bytes(&self, col: usize) -> Vec<u8> {
-        let ptr = self.col_ptr(col, 16);
-        if ptr.is_null() {
-            return Vec::new();
+        match self.col_bytes(col, 16) {
+            Some(cell) => gnitz_wire::german_string_content(cell, self.blob_slice()).to_vec(),
+            None => Vec::new(),
         }
-        let st: [u8; 16] = unsafe { *(ptr as *const [u8; 16]) };
-        crate::schema::try_decode_german_string(&st, self.blob_slice()).unwrap_or_default()
     }
 
     /// Read a fixed 8-byte little-endian integer at logical column `col` of the current

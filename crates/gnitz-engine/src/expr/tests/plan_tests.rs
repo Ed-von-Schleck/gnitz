@@ -84,15 +84,10 @@ fn test_empty_batch() {
 
 #[test]
 fn test_map_blob_passthrough_and_fallback() {
-    use crate::schema::german_string_content;
-
     // German-string struct: short (≤12 bytes) inline, else heap-backed.
     fn push_gs(b: &mut Batch, pi: usize, s: &[u8]) {
-        let gs = crate::test_support::german_string(s, &mut b.blob);
+        let gs = gnitz_wire::encode_german_string(s, &mut b.blob);
         b.extend_col(pi, &gs);
-    }
-    fn read_gs(batch: &Batch, pi: usize, row: usize) -> Vec<u8> {
-        german_string_content(&batch.col_data(pi)[row * 16..row * 16 + 16], &batch.blob).to_vec()
     }
     // Input: [U64 PK, STRING s1 (short inline), STRING s2 (long, heap-backed)].
     fn build(schema: &SchemaDescriptor) -> Batch {
@@ -122,10 +117,16 @@ fn test_map_blob_passthrough_and_fallback() {
         let func = ScalarFunc::from_map(prog, &in_schema, &out_schema);
         let out = func.evaluate_map_batch(&batch, PkFill::Copy);
         assert_eq!(out.count, 2);
-        assert_eq!(read_gs(&out, 0, 0), b"long-string-one-xyz"); // s2 → out payload 0
-        assert_eq!(read_gs(&out, 1, 0), b"ab"); // s1 → out payload 1
-        assert_eq!(read_gs(&out, 0, 1), b"long-string-two-abcdef");
-        assert_eq!(read_gs(&out, 1, 1), b"cd");
+        assert_eq!(
+            crate::test_support::read_german_string(&out, 0, 0),
+            b"long-string-one-xyz"
+        ); // s2 → out payload 0
+        assert_eq!(crate::test_support::read_german_string(&out, 1, 0), b"ab"); // s1 → out payload 1
+        assert_eq!(
+            crate::test_support::read_german_string(&out, 0, 1),
+            b"long-string-two-abcdef"
+        );
+        assert_eq!(crate::test_support::read_german_string(&out, 1, 1), b"cd");
     }
 
     // (B) Drop the long string s2 → passthrough gated OFF (a dropped string column
@@ -138,8 +139,8 @@ fn test_map_blob_passthrough_and_fallback() {
         let func = ScalarFunc::from_map(prog, &in_schema, &out_schema);
         let out = func.evaluate_map_batch(&batch, PkFill::Copy);
         assert_eq!(out.count, 2);
-        assert_eq!(read_gs(&out, 0, 0), b"ab");
-        assert_eq!(read_gs(&out, 0, 1), b"cd");
+        assert_eq!(crate::test_support::read_german_string(&out, 0, 0), b"ab");
+        assert_eq!(crate::test_support::read_german_string(&out, 0, 1), b"cd");
         assert!(
             out.blob.len() < batch.blob.len(),
             "dropped-string relocate must not copy the dead heap ({} vs {})",

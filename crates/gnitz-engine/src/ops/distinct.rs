@@ -317,14 +317,11 @@ mod tests {
         )
     }
 
-    /// Build a batch with one short (inline, ≤12-byte) BLOB payload value per row.
+    /// Build a batch with one BLOB payload value per row.
     fn make_batch_blob(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8])]) -> Batch {
         let mut b = Batch::with_capacity(*schema, rows.len().max(1));
         for &(pk, w, val) in rows {
-            assert!(val.len() <= 12, "test helper only supports inline (short) blobs");
-            let mut cell = [0u8; 16];
-            cell[0..4].copy_from_slice(&(val.len() as u32).to_le_bytes());
-            cell[4..4 + val.len()].copy_from_slice(val);
+            let cell = gnitz_wire::encode_german_string(val, &mut b.blob);
             b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());

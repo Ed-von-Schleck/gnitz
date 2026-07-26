@@ -4,8 +4,6 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::foundation::codec::{read_u32_le, read_u64_le};
-
 pub(crate) use gnitz_wire::type_code;
 pub(crate) use gnitz_wire::ReduceOutKey;
 pub(crate) use gnitz_wire::TypeCode;
@@ -308,31 +306,22 @@ impl SchemaDescriptor {
                 assert!(pk_indices[j] != pk_indices[k], "new: duplicate PK column index",);
                 j += 1;
             }
-            // STRING and BLOB store a German-string struct whose heap_offset
-            // points into the batch blob. The PK region is bulk-copied without
-            // blob relocation, so these types would produce dangling pointers.
+            // One allow-list, shared with the catalog DDL and wire layers, so a
+            // newly added type code is PK-ineligible until explicitly vetted
+            // rather than silently admitted by a deny-list that forgot it.
+            // STRING/BLOB carry a heap offset the bulk-copied PK region cannot
+            // relocate; IEEE-754 floats break the byte-equal key contract that
+            // `compare_pk_bytes` and the order-preserving encoder rest on.
             assert!(
-                cols[pk_indices[k] as usize].type_code != type_code::STRING
-                    && cols[pk_indices[k] as usize].type_code != type_code::BLOB,
-                "new: STRING and BLOB columns cannot be PK columns \
-                 (PK region is bulk-copied without blob relocation)",
+                gnitz_wire::is_pk_eligible(cols[pk_indices[k] as usize].type_code),
+                "new: only integer scalar columns can be PK columns \
+                 (the PK region is compared and bulk-copied as raw bytes)",
             );
             // `compare_pk_bytes` reads PK bytes with no null-bit handling; a
             // nullable PK would silently corrupt the merge comparison.
             assert!(
                 cols[pk_indices[k] as usize].nullable == 0,
                 "new: PK columns must be non-nullable",
-            );
-            // `compare_pk_bytes` and the order-preserving sort-key encoder have
-            // no float arm (IEEE-754 breaks the byte-equal key contract), so
-            // both panic on a float PK. Float PKs are already rejected at the
-            // catalog DDL and wire layers; close the invariant here too so the
-            // descriptor constructor is the single authority on PK eligibility.
-            assert!(
-                cols[pk_indices[k] as usize].type_code != type_code::F32
-                    && cols[pk_indices[k] as usize].type_code != type_code::F64,
-                "new: F32 and F64 columns cannot be PK columns \
-                 (compare_pk_bytes has no float ordering)",
             );
             pk_arr[k] = pk_indices[k];
             let col_size = cols[pk_indices[k] as usize].size() as u16;
@@ -1257,32 +1246,6 @@ pub(crate) fn index_opk_prefix(native: u128, src_type: u8, idx_key_type: u8) -> 
     opk
 }
 
-/// Prepare the 16-byte German string output struct for a copy operation.
-/// Fills length, prefix, and (for short strings) inline suffix.
-/// For long strings dest[8..16] is left as zero — the caller must resolve
-/// the blob data and write the new offset in.
-/// Returns (dest_struct, is_long_string).
-#[inline]
-fn prep_german_string_copy(src: &[u8]) -> ([u8; 16], bool) {
-    debug_assert!(
-        src.len() >= 16,
-        "prep_german_string_copy: src must be a 16-byte German string struct"
-    );
-    let length = u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize;
-    let mut dest = [0u8; 16];
-    dest[0..4].copy_from_slice(&src[0..4]);
-    dest[4..8].copy_from_slice(&src[4..8]);
-    if length <= SHORT_STRING_THRESHOLD {
-        let suffix_len = length.saturating_sub(4);
-        if suffix_len > 0 {
-            dest[8..8 + suffix_len].copy_from_slice(&src[8..8 + suffix_len]);
-        }
-        (dest, false)
-    } else {
-        (dest, true)
-    }
-}
-
 /// Identity-keyed dedup cache for `relocate_german_string_vec`.
 ///
 /// Key: `(src_blob.as_ptr() as usize, old_offset, length)`. The same source
@@ -1293,149 +1256,73 @@ pub(crate) type BlobCache = FxHashMap<(usize, usize, usize), usize>;
 /// Copy a 16-byte German string cell and (for long strings) migrate the
 /// out-of-line payload from `src_blob` into `dst_blob`.
 ///
-/// The returned 16-byte cell is ready to write into the output column buffer.
-/// Short strings (≤ SHORT_STRING_THRESHOLD) are copied inline — `src_blob` is
-/// unused for them.
+/// The returned cell is ready to write into the output column buffer and is
+/// always **canonical** (`german_string_cell_ok`): pad bytes past the content
+/// are rebuilt as zero rather than copied through, so a skewed cell that
+/// reached memory some other way cannot propagate a compare-visible pad — the
+/// divergence where two rows hash equal but order unequal and never
+/// consolidate. Short strings resolve entirely inline; `src_blob` is unused.
 ///
 /// When `cache` is `Some`, the appended blob data is deduplicated by
 /// `(src_blob.as_ptr(), old_offset, length)` — i.e. the same source span is
 /// only copied once per merge.
 ///
-/// **Malformed-input fallback:** if the long-string header declares a region
-/// `[old_offset, old_offset + length)` that overruns `src_blob.len()`, the
-/// cell is rewritten to an empty string (length = 0) rather than triggering
-/// an out-of-bounds read. This keeps trusted in-memory callers panic-free
-/// even when fed corrupted data that slipped past validation.
+/// **Malformed-input fallback:** a long header declaring a region that overruns
+/// `src_blob` yields the canonical empty string rather than an out-of-bounds
+/// read, keeping trusted in-memory callers panic-free on data that slipped past
+/// validation.
+#[inline]
 pub(crate) fn relocate_german_string_vec(
     src_cell: &[u8],
     src_blob: &[u8],
     dst_blob: &mut Vec<u8>,
     cache: Option<&mut BlobCache>,
 ) -> [u8; 16] {
-    let (mut dest, is_long) = prep_german_string_copy(src_cell);
-    if !is_long {
-        return dest;
+    // One bounds check for the whole relocation: every read below is a constant
+    // index into a proven 16-byte cell.
+    let src: &[u8; 16] = src_cell[..16]
+        .try_into()
+        .expect("relocate_german_string_vec: src must be a 16-byte German string cell");
+    if gnitz_wire::read_u32_le(src, 0) as usize <= SHORT_STRING_THRESHOLD {
+        return gnitz_wire::canonical_short_cell(src);
     }
-    let length = u32::from_le_bytes(src_cell[0..4].try_into().unwrap()) as usize;
-    let old_offset = u64::from_le_bytes(src_cell[8..16].try_into().unwrap()) as usize;
-    if old_offset.saturating_add(length) > src_blob.len() {
-        // Malformed: emit an empty string. Zero the full inline header so no
-        // stale prefix bytes remain. dest[8..16] is already 0 (prep_german_string_copy
-        // zero-initialized the struct and left the long-string offset as 0).
-        dest[0..8].copy_from_slice(&0u64.to_le_bytes());
+    relocate_long_german_string(src, src_blob, dst_blob, cache)
+}
+
+/// The out-of-line half of `relocate_german_string_vec` — kept separate so the
+/// short path stays a branchless inline sequence with no call and no frame.
+fn relocate_long_german_string(
+    src: &[u8; 16],
+    src_blob: &[u8],
+    dst_blob: &mut Vec<u8>,
+    cache: Option<&mut BlobCache>,
+) -> [u8; 16] {
+    let length = gnitz_wire::read_u32_le(src, 0) as usize;
+    let old_offset = gnitz_wire::read_u64_le(src, 8);
+    let mut dest = [0u8; 16];
+    let Some(span) = gnitz_wire::blob_extent(src_blob.len(), old_offset, length) else {
+        // Malformed: the all-zero cell is the canonical empty string, and
+        // `dst_blob` is left untouched.
         return dest;
-    }
+    };
+    // `length > SHORT_STRING_THRESHOLD ≥ 4`, so all four prefix bytes are content.
+    dest[0..8].copy_from_slice(&src[0..8]);
     let new_offset = dst_blob.len();
     let off = match cache {
         Some(cache) => {
-            let key = (src_blob.as_ptr() as usize, old_offset, length);
+            let key = (src_blob.as_ptr() as usize, span.start, length);
             *cache.entry(key).or_insert_with(|| {
-                dst_blob.extend_from_slice(&src_blob[old_offset..old_offset + length]);
+                dst_blob.extend_from_slice(&src_blob[span]);
                 new_offset
             })
         }
         None => {
-            dst_blob.extend_from_slice(&src_blob[old_offset..old_offset + length]);
+            dst_blob.extend_from_slice(&src_blob[span]);
             new_offset
         }
     };
     dest[8..16].copy_from_slice(&(off as u64).to_le_bytes());
     dest
-}
-
-pub(crate) use gnitz_wire::encode_german_string;
-pub(crate) use gnitz_wire::try_decode_german_string;
-
-/// Bytes `[heap_offset, heap_offset + length)` of a long German string's blob
-/// payload, or `&[]` if the header overruns `blob`. Mirrors
-/// `relocate_german_string_vec`'s overrun guard: corrupt data that slipped past
-/// validation degrades to an empty payload rather than slicing OOB in release.
-/// A corrupt long string then hashes identically (`checksum(&[])`) at every
-/// call site, so routing stays deterministic.
-#[inline]
-pub(crate) fn long_string_bytes(blob: &[u8], heap_offset: usize, length: usize) -> &[u8] {
-    if heap_offset.saturating_add(length) > blob.len() {
-        &[]
-    } else {
-        &blob[heap_offset..heap_offset + length]
-    }
-}
-
-/// Full logical content bytes of a German string struct `s` (16-byte layout:
-/// `[0..4]` = length, then inline-or-heap content). Short strings
-/// (len ≤ SHORT_STRING_THRESHOLD) store content inline at `[4..4+length]`;
-/// long strings live in `blob` at the heap offset. Unlike `german_string_tail`,
-/// this returns the complete content with no prefix skip — for hashing or
-/// whole-value equality. A zero-length string yields `&[]`.
-#[inline]
-pub(crate) fn german_string_content<'a>(s: &'a [u8], blob: &'a [u8]) -> &'a [u8] {
-    let length = read_u32_le(s, 0) as usize;
-    if length == 0 {
-        &[]
-    } else if length <= SHORT_STRING_THRESHOLD {
-        &s[4..4 + length]
-    } else {
-        let heap_offset = read_u64_le(s, 8) as usize;
-        long_string_bytes(blob, heap_offset, length)
-    }
-}
-
-/// Returns bytes [4..end] of a German string as a contiguous slice.
-/// Short strings (len ≤ SHORT_STRING_THRESHOLD): inline at struct[8..4+end].
-/// Long strings: full string is in blob at heap_offset; skip first 4 bytes
-/// (they duplicate the prefix, already compared by the caller).
-#[inline]
-pub(crate) fn german_string_tail<'a>(s: &'a [u8], blob: &'a [u8], length: usize, end: usize) -> &'a [u8] {
-    if length <= SHORT_STRING_THRESHOLD {
-        debug_assert!(s.len() >= 4 + end, "german_string_tail: short string struct too small");
-        &s[8..4 + end]
-    } else {
-        let heap_offset = read_u64_le(s, 8) as usize;
-        let start = heap_offset.saturating_add(4);
-        let limit = heap_offset.saturating_add(end);
-        debug_assert!(
-            limit <= blob.len(),
-            "german_string_tail: long string [{start}..{limit}) overruns blob (len={})",
-            blob.len(),
-        );
-        // `end ≥ min_len > 4` at the one call site (compare_german_strings),
-        // so `start < limit`; if `limit ≤ blob.len()` the slice is in bounds.
-        if limit > blob.len() {
-            &[]
-        } else {
-            &blob[start..limit]
-        }
-    }
-}
-
-#[inline(always)]
-pub(crate) fn compare_german_strings(a: &[u8], blob_a: &[u8], b: &[u8], blob_b: &[u8]) -> std::cmp::Ordering {
-    let len_a = read_u32_le(a, 0) as usize;
-    let len_b = read_u32_le(b, 0) as usize;
-    let min_len = len_a.min(len_b);
-
-    // Fixed 4-byte prefix comparison — one register compare, no runtime-length
-    // memcmp. Valid because every cell zero-pads the prefix bytes beyond its
-    // length (`encode_german_string` starts from a zeroed struct): the first
-    // differing padded byte is either a real content difference or a longer
-    // string's non-zero byte against the shorter's zero pad, and both order
-    // exactly as the truncated-compare-then-length-tiebreak below would.
-    let pfx_a = u32::from_be_bytes(a[4..8].try_into().unwrap());
-    let pfx_b = u32::from_be_bytes(b[4..8].try_into().unwrap());
-    if pfx_a != pfx_b {
-        return pfx_a.cmp(&pfx_b);
-    }
-    if min_len <= 4 {
-        return len_a.cmp(&len_b);
-    }
-
-    // Bulk suffix comparison — vectorised memcmp via [u8]::cmp.
-    let tail_a = german_string_tail(a, blob_a, len_a, min_len);
-    let tail_b = german_string_tail(b, blob_b, len_b, min_len);
-    match tail_a.cmp(tail_b) {
-        std::cmp::Ordering::Equal => len_a.cmp(&len_b),
-        ord => ord,
-    }
 }
 
 /// Validate that a peer-supplied schema descriptor matches the expected one:
@@ -1771,78 +1658,29 @@ mod tests {
         assert_eq!(&result[4..8], &[0u8; 4], "fallback must zero the prefix field");
         assert_eq!(&result[8..16], &[0u8; 8], "fallback must leave blob offset zero");
         assert!(dst_blob.is_empty(), "fallback must not extend dst_blob");
+        assert!(gnitz_wire::german_string_cell_ok(&result, &dst_blob));
     }
 
+    /// The relocator rebuilds a cell rather than copying its bytes, so a skewed
+    /// pad — compare-visible but invisible to `german_string_content`, i.e. the
+    /// shape that splits one Z-set element's weight across two rows — cannot
+    /// survive a merge, scatter or map projection.
     #[test]
-    fn test_long_string_bytes_overrun_returns_empty() {
-        let blob = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
-        // In-bounds window returns the exact slice.
-        assert_eq!(long_string_bytes(&blob, 2, 3), &[3u8, 4, 5]);
-        // heap_offset + length past the end degrades to empty, no panic.
-        assert_eq!(long_string_bytes(&blob, 6, 10), &[] as &[u8]);
-        // heap_offset itself past the end.
-        assert_eq!(long_string_bytes(&blob, 99, 1), &[] as &[u8]);
-        // Saturating add: length near usize::MAX must not wrap to in-bounds.
-        assert_eq!(long_string_bytes(&blob, 4, usize::MAX), &[] as &[u8]);
-        // Exact fit is in bounds.
-        assert_eq!(long_string_bytes(&blob, 0, 8), &blob[..]);
-    }
-
-    /// Pins the zero-padded-cell invariant the fixed 4-byte u32 prefix compare
-    /// relies on: with `min_len < 4`, two cells differing only past `min_len`
-    /// must order by length (the shorter's prefix pad bytes are zero, the
-    /// longer's content byte is what makes the u32s differ) — exactly the
-    /// truncated-compare-then-length-tiebreak result.
-    #[test]
-    fn test_compare_german_strings_short_prefix_zero_padding() {
-        use std::cmp::Ordering;
-        let mut blob = Vec::new();
-        let cell = |s: &str, blob: &mut Vec<u8>| encode_german_string(s.as_bytes(), blob);
-        let a = cell("ab", &mut blob); // min_len 2 < 4
-        let b = cell("abc", &mut blob); // differs only at byte 2 (past min_len)
-        assert_eq!(compare_german_strings(&a, &blob, &b, &blob), Ordering::Less);
-        assert_eq!(compare_german_strings(&b, &blob, &a, &blob), Ordering::Greater);
-        // Embedded NUL past min_len aliases the shorter cell's zero padding in
-        // the u32 image; the length tiebreak must still order them.
-        let c = cell("ab\0", &mut blob);
-        assert_eq!(compare_german_strings(&a, &blob, &c, &blob), Ordering::Less);
-        assert_eq!(compare_german_strings(&c, &blob, &a, &blob), Ordering::Greater);
-        // And equal content stays Equal.
-        let a2 = cell("ab", &mut blob);
-        assert_eq!(compare_german_strings(&a, &blob, &a2, &blob), Ordering::Equal);
-    }
-
-    // The german_string_tail / compare_german_strings overrun fallback is
-    // release-only: in debug the `debug_assert!` fires loudly (intended), so
-    // these tests run only when debug assertions are off.
-    #[cfg(not(debug_assertions))]
-    #[test]
-    fn test_german_string_tail_overrun_returns_empty() {
-        // Long-string struct: length=20 (> SHORT_STRING_THRESHOLD), heap_offset
-        // far beyond a tiny blob. Release path must return &[] not slice OOB.
-        let mut s = [0u8; 16];
-        s[0..4].copy_from_slice(&20u32.to_le_bytes());
-        s[8..16].copy_from_slice(&999u64.to_le_bytes());
-        let blob = vec![0u8; 4];
-        // `end` = full length (the compare_german_strings call shape).
-        assert_eq!(german_string_tail(&s, &blob, 20, 20), &[] as &[u8]);
-    }
-
-    #[cfg(not(debug_assertions))]
-    #[test]
-    fn test_compare_german_strings_corrupt_long_cell_no_panic() {
-        // Two long-string cells with out-of-range heap offsets. Both tails
-        // degrade to empty, so the comparison resolves on length/prefix
-        // instead of panicking on an OOB blob slice.
-        let mut a = [0u8; 16];
-        a[0..4].copy_from_slice(&20u32.to_le_bytes());
-        a[4..8].copy_from_slice(b"abcd");
-        a[8..16].copy_from_slice(&500u64.to_le_bytes());
-        let mut b = a;
-        b[8..16].copy_from_slice(&900u64.to_le_bytes());
-        let blob = vec![0u8; 4];
-        // Equal length + equal prefix + empty tails ⇒ Equal, and crucially no panic.
-        assert_eq!(compare_german_strings(&a, &blob, &b, &blob), std::cmp::Ordering::Equal);
+    fn test_relocate_canonicalizes_pad_bytes() {
+        let mut dst_blob: Vec<u8> = Vec::new();
+        for content in [&b""[..], b"a", b"abc", b"abcd", b"abcdefghijkl"] {
+            let clean = gnitz_wire::encode_german_string(content, &mut Vec::new());
+            let mut dirty = clean;
+            for b in dirty[4 + content.len()..16].iter_mut() {
+                *b = 0xFF;
+            }
+            assert_eq!(
+                relocate_german_string_vec(&dirty, &[], &mut dst_blob, None),
+                clean,
+                "relocation must rebuild {content:?} in canonical form",
+            );
+        }
+        assert!(dst_blob.is_empty(), "inline cells must not touch the blob");
     }
 
     #[test]
@@ -2096,32 +1934,26 @@ mod tests {
         }
     }
 
+    /// The descriptor constructor admits exactly the wire allow-list — no more
+    /// (STRING/BLOB carry an unrelocatable heap offset, floats break the
+    /// byte-equal key contract) and no less. Driven off `is_pk_eligible` rather
+    /// than a hand-listed set so a newly added type code is covered the moment
+    /// it exists.
     #[test]
-    #[should_panic(expected = "STRING and BLOB columns cannot be PK columns")]
-    fn test_string_pk_rejected() {
-        let cols = [SchemaColumn::new(type_code::STRING, 0)];
-        SchemaDescriptor::new(&cols, &[0]);
-    }
-
-    #[test]
-    #[should_panic(expected = "STRING and BLOB columns cannot be PK columns")]
-    fn test_blob_pk_rejected() {
-        let cols = [SchemaColumn::new(type_code::BLOB, 0)];
-        SchemaDescriptor::new(&cols, &[0]);
-    }
-
-    #[test]
-    #[should_panic(expected = "F32 and F64 columns cannot be PK columns")]
-    fn test_f32_pk_rejected() {
-        let cols = [SchemaColumn::new(type_code::F32, 0)];
-        SchemaDescriptor::new(&cols, &[0]);
-    }
-
-    #[test]
-    #[should_panic(expected = "F32 and F64 columns cannot be PK columns")]
-    fn test_f64_pk_rejected() {
-        let cols = [SchemaColumn::new(type_code::F64, 0)];
-        SchemaDescriptor::new(&cols, &[0]);
+    fn test_pk_eligibility_matches_the_wire_allow_list() {
+        for tc in 0u8..=255 {
+            let Some(size) = gnitz_wire::TypeCode::try_from_u8(tc).map(|t| t.wire_stride()) else {
+                continue;
+            };
+            assert!(size > 0, "type_code {tc} has no width");
+            let cols = [SchemaColumn::new(tc, 0)];
+            let built = std::panic::catch_unwind(|| SchemaDescriptor::new(&cols, &[0])).is_ok();
+            assert_eq!(
+                built,
+                gnitz_wire::is_pk_eligible(tc),
+                "type_code {tc}: descriptor and wire allow-list disagree on PK eligibility",
+            );
+        }
     }
 
     #[test]

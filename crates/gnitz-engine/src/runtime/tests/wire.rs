@@ -3,8 +3,9 @@ use crate::runtime::wire::{
     encode_ctrl_block_direct, encode_wire, encode_wire_into, peek_client_control, peek_control_block, schema_to_batch,
     wire_size, CTRL_BLOCK_SIZE_NO_BLOB, STATUS_ERROR, STATUS_OK,
 };
-use crate::schema::{encode_german_string, try_decode_german_string, type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, Layout};
+use gnitz_wire::{encode_german_string, try_decode_german_string};
 
 fn simple_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(

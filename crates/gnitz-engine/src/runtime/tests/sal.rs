@@ -675,11 +675,12 @@ fn test_wire_group_footprint_non_wire_safe_shared_span_dedup() {
     // measuring the materialized sub-batch (not a naive per-row sum) is the only
     // byte-exact computation. Broadcast so both rows land in one slot.
     use crate::storage::Batch;
-    use crate::test_support::{german_string, make_schema_pk_u64_payload_string};
+    use crate::test_support::make_schema_pk_u64_payload_string;
+    use gnitz_wire::encode_german_string;
     let schema = make_schema_pk_u64_payload_string();
     let mut blob: Vec<u8> = Vec::new();
     let span = b"a long shared string span well over twelve bytes";
-    let gs = german_string(span, &mut blob); // appended once → shared offset
+    let gs = encode_german_string(span, &mut blob); // appended once → shared offset
 
     let mut batch = Batch::with_capacity(schema, 2);
     for pk in [1u128, 2u128] {

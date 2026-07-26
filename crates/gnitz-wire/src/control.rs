@@ -301,26 +301,36 @@ pub struct DecodedControl {
     pub block_size: usize,
 }
 
+/// The first `width` bytes of directory region `r`, or `Err(err)` if the entry
+/// declares fewer bytes than that or its extent escapes the block. The single
+/// bounds check behind every fixed-width control-block field read — the extent
+/// rule itself is `blob_extent`, shared with the German-string heap.
+#[inline(always)]
+fn region_bytes<'a>(data: &'a [u8], r: usize, width: usize, err: &'static str) -> Result<&'a [u8], &'static str> {
+    let (off, sz) = crate::wal::dir_entry(data, r);
+    if sz < width {
+        return Err(err);
+    }
+    match crate::blob_extent(data.len(), off as u64, width) {
+        Some(extent) => Ok(&data[extent]),
+        None => Err(err),
+    }
+}
+
 /// Bounds-checked read of a u64 from a fixed-width u64 region of a 1-row
 /// control block (exactly 8 bytes for 1 row).
 #[inline(always)]
 fn read_u64_region(data: &[u8], r: usize) -> Result<u64, &'static str> {
-    let (off, sz) = crate::wal::dir_entry(data, r);
-    if sz < 8 || off.saturating_add(8) > data.len() {
-        return Err("control block region out of bounds");
-    }
-    Ok(read_u64_le(data, off))
+    let bytes = region_bytes(data, r, 8, "control block region out of bounds")?;
+    Ok(read_u64_le(bytes, 0))
 }
 
 /// Bounds-checked read of a u128 from a fixed-width u128 region of a 1-row
 /// control block (exactly 16 bytes for 1 row).
 #[inline(always)]
 fn read_u128_region(data: &[u8], r: usize) -> Result<u128, &'static str> {
-    let (off, sz) = crate::wal::dir_entry(data, r);
-    if sz < 16 || off.saturating_add(16) > data.len() {
-        return Err("control block u128 region out of bounds");
-    }
-    Ok(u128::from_le_bytes(data[off..off + 16].try_into().unwrap()))
+    let bytes = region_bytes(data, r, 16, "control block u128 region out of bounds")?;
+    Ok(u128::from_le_bytes(bytes.try_into().unwrap()))
 }
 
 /// Decode all control fields directly from the WAL block's directory without
@@ -366,23 +376,14 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
     // entirely, preserving the hot-path fast case.
     let blob: &[u8] = if !error_is_null || !seek_extra_is_null {
         let (blob_off, blob_sz) = crate::wal::dir_entry(data, REG_BLOB);
-        if blob_sz > 0 && blob_off.saturating_add(blob_sz) <= data.len() {
-            &data[blob_off..blob_off + blob_sz]
-        } else {
-            &[]
-        }
+        crate::blob_extent(data.len(), blob_off as u64, blob_sz).map_or(&[][..], |extent| &data[extent])
     } else {
         &[]
     };
 
     let read_german = |region: usize, err: &'static str, oob: &'static str| -> Result<Vec<u8>, &'static str> {
-        let (off, sz) = crate::wal::dir_entry(data, region);
-        if sz < 16 || off.saturating_add(16) > data.len() {
-            return Err(err);
-        }
-        let mut st = [0u8; 16];
-        st.copy_from_slice(&data[off..off + 16]);
-        try_decode_german_string(&st, blob).ok_or(oob)
+        let cell: &[u8; 16] = region_bytes(data, region, 16, err)?.try_into().unwrap();
+        try_decode_german_string(cell, blob).ok_or(oob)
     };
 
     let error_msg = if error_is_null {
