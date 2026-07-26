@@ -40,9 +40,40 @@ pub(crate) enum ExprValidateErr {
     IntSetNotAligned { set_idx: u32, len: usize },
     ColOutOfRange { col: u32, num_columns: usize },
     ColNotPayload { col: u32 },
-    ColTooWideForRegister { col: u32, size: usize },
+    ColKindMismatch { col: u32, type_code: u8, want: ColKind },
+    CopyTypeMismatch { col: u32, src_tc: u8, out: u32, out_tc: u8 },
+    EmitSlotNotEightBytes { out: u32, type_code: u8 },
     OutputIdxOutOfRange { out: u32, num_payload_cols: usize },
     OutputSlotUnwritten { written: u64, num_payload_cols: usize },
+    PredicateWithoutResultReg,
+}
+
+/// What an opcode's kernel requires of a column operand — a *region* requirement
+/// (may it be a PK column?) and a *type* requirement, which are independent: the
+/// integer load kernels have a PK arm, while the payload-only kernels address a
+/// column through the dense payload index a PK column has no value for (the
+/// `pi = 255` sentinel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ColKind {
+    /// PK or payload, any type — a `CopyCol` source.
+    AnyCol,
+    /// PK or payload, fixed-width integer.
+    FixedInt,
+    /// Payload only, any type — the null-bitmap readers touch nothing else, so
+    /// U128 and STRING are legitimate.
+    AnyPayload,
+    /// Payload only, IEEE-754.
+    Float,
+    /// Payload only, the 16-byte German-string layout.
+    GermanString,
+}
+
+impl ColKind {
+    /// True iff a PK column is unusable here.
+    #[inline]
+    fn payload_only(self) -> bool {
+        matches!(self, ColKind::AnyPayload | ColKind::Float | ColKind::GermanString)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -795,10 +826,17 @@ impl LogicalProgram {
                     // wire input, and `validate` does not enforce one-const-index-
                     // per-opcode, so a blob that shares an index between two
                     // opcodes must stay inert, not corrupt the other's slot.
-                    let set: Vec<i64> = self.const_strings[set_idx as usize]
+                    let mut set: Vec<i64> = self.const_strings[set_idx as usize]
                         .chunks_exact(8)
                         .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
                         .collect();
+                    // The kernel binary-searches this pool, so ascending order is a
+                    // correctness precondition. Establish it here rather than trust
+                    // the client to have sorted it: set membership does not depend on
+                    // order, so sorting a skewed pool is always right, where rejecting
+                    // it would only turn a wrong answer into an error. Once per
+                    // compile; for an honest client the pool is already sorted.
+                    set.sort_unstable();
                     let new_idx = int_sets.len() as u32;
                     int_sets.push(set);
                     instrs.push(I::IntInSet {
@@ -850,6 +888,19 @@ impl LogicalProgram {
         prog
     }
 
+    /// Validate as a filter predicate: the schema-aware pass, plus the one rule
+    /// only a filter has — it must own a result register. `num_regs == 0` is
+    /// legitimate for a map (`copy_cols` builds exactly that shape), so
+    /// [`Self::validate`] cannot reject it; as a *filter* it is a corrupt frame
+    /// with no result to read, not a filter that passes nothing.
+    pub(crate) fn validate_predicate(&self, schema: &SchemaDescriptor) -> Result<(), ExprValidateErr> {
+        self.validate(Some(schema), None)?;
+        if self.num_regs == 0 {
+            return Err(ExprValidateErr::PredicateWithoutResultReg);
+        }
+        Ok(())
+    }
+
     /// Validate every value a client-authored program controls that reaches a
     /// panicking / OOB / truncating site, in one exhaustive `match self` (a new
     /// opcode cannot silently bypass a bound). `in_schema` / `out_schema` are
@@ -868,7 +919,7 @@ impl LogicalProgram {
     /// literally a previous request's memory. By popcount rather than a length
     /// check, so a duplicate destination is caught too (it leaves another slot's
     /// bit clear).
-    pub(crate) fn validate(
+    pub(in crate::expr) fn validate(
         &self,
         in_schema: Option<&SchemaDescriptor>,
         out_schema: Option<&SchemaDescriptor>,
@@ -945,25 +996,27 @@ impl LogicalProgram {
                 L::Emit { src, out } => {
                     check_reg(src, num_regs)?;
                     check_out(out)?;
+                    check_emit_slot(out_schema, out)?;
                 }
-                // LoadColInt: bound the column, then reject a >8-byte source (the
-                // wide-register artefact C retires) — zero false positives, the
-                // binder register-loads no wide column.
+                // LoadColInt: the payload and PK integer load kernels have arms only
+                // for the eight fixed-width integer types. A float column has a
+                // loadable *width* but not a loadable *type* (its bits would be
+                // reinterpreted as an integer), and an unknown type code reports
+                // width 8 and would slip through a width test.
                 L::LoadColInt { dst, col } => {
                     check_reg(dst, num_regs)?;
-                    check_col_in_range(in_schema, col)?;
-                    if let Some(is) = in_schema {
-                        let size = crate::schema::type_size(is.columns[col as usize].type_code) as usize;
-                        if size > 8 {
-                            return Err(E::ColTooWideForRegister { col, size });
-                        }
-                    }
+                    check_col(in_schema, col, ColKind::FixedInt)?;
                 }
-                // Payload-only column readers: bound the column, then reject a PK
-                // column (the `pi = 255` sentinel these opcodes cannot route).
-                L::LoadColFloat { dst, col } | L::IsNull { dst, col } | L::IsNotNull { dst, col } => {
+                // LoadColFloat: the float load kernel branches on width alone, so a
+                // 1- or 2-byte integer column makes it slice an 8-byte stride out of
+                // a narrower region.
+                L::LoadColFloat { dst, col } => {
                     check_reg(dst, num_regs)?;
-                    check_col_payload(in_schema, col)?;
+                    check_col(in_schema, col, ColKind::Float)?;
+                }
+                L::IsNull { dst, col } | L::IsNotNull { dst, col } => {
+                    check_reg(dst, num_regs)?;
+                    check_col(in_schema, col, ColKind::AnyPayload)?;
                 }
                 L::StrColConst {
                     dst, col, const_idx, ..
@@ -975,7 +1028,9 @@ impl LogicalProgram {
                             n: self.const_strings.len(),
                         });
                     }
-                    check_col_payload(in_schema, col)?;
+                    // The compare reads 16-byte German-string cells; a narrower
+                    // column makes `col_data(pi, 16)` over-read its region.
+                    check_col(in_schema, col, ColKind::GermanString)?;
                 }
                 // Set membership over the register `value_reg`; `set_idx` is a
                 // const-pool index whose entry must be a whole number of 8-byte
@@ -1001,15 +1056,17 @@ impl LogicalProgram {
                 }
                 L::StrColCol { dst, col_a, col_b, .. } => {
                     check_reg(dst, num_regs)?;
-                    check_col_payload(in_schema, col_a)?;
-                    check_col_payload(in_schema, col_b)?;
+                    check_col(in_schema, col_a, ColKind::GermanString)?;
+                    check_col(in_schema, col_b, ColKind::GermanString)?;
                 }
                 // dst-writers whose other operands are data / none.
                 L::LoadConst { dst, .. } | L::LoadNull { dst } => check_reg(dst, num_regs)?,
-                // CopyCol: any (payload or PK) source column, one output payload slot.
+                // CopyCol: any (payload or PK) source column, one output payload
+                // slot that can hold it.
                 L::CopyCol { src_col, out } => {
-                    check_col_in_range(in_schema, src_col)?;
+                    check_col(in_schema, src_col, ColKind::AnyCol)?;
                     check_out(out)?;
+                    check_copy_types(in_schema, out_schema, src_col, out)?;
                 }
             }
         }
@@ -1035,32 +1092,89 @@ fn check_reg(r: u16, num_regs: u32) -> Result<(), ExprValidateErr> {
     }
 }
 
-/// A column operand must index a real column (`< num_columns()`). The bound is
-/// `num_columns()`, not `MAX_COLUMNS`: the `[num_columns, 65)` zone reads a zeroed
-/// schema slot. Skipped when no `in_schema` is supplied (structure-only pass).
+/// The one column-operand check: range, then payload-ness, then the type class
+/// the opcode's kernel can decode — in that order, so a stronger requirement can
+/// never be tested against an unbounded index. Skipped entirely when no
+/// `in_schema` is supplied (the structure-only pass).
+///
+/// The bound is `num_columns()`, not `MAX_COLUMNS`: the `[num_columns, 65)` zone
+/// reads a zeroed schema slot. The kernels dispatch on a column's type without
+/// re-checking it, so this is the only place a client blob is held to the
+/// contract.
 #[inline]
-fn check_col_in_range(in_schema: Option<&SchemaDescriptor>, col: u32) -> Result<(), ExprValidateErr> {
-    if let Some(s) = in_schema {
-        if col as usize >= s.num_columns() {
-            return Err(ExprValidateErr::ColOutOfRange {
-                col,
-                num_columns: s.num_columns(),
-            });
-        }
+fn check_col(in_schema: Option<&SchemaDescriptor>, col: u32, need: ColKind) -> Result<(), ExprValidateErr> {
+    let Some(s) = in_schema else { return Ok(()) };
+    if col as usize >= s.num_columns() {
+        return Err(ExprValidateErr::ColOutOfRange {
+            col,
+            num_columns: s.num_columns(),
+        });
     }
-    Ok(())
+    if need.payload_only() && s.is_pk_col(col as usize) {
+        return Err(ExprValidateErr::ColNotPayload { col });
+    }
+    let type_code = s.columns[col as usize].type_code;
+    let ok = match need {
+        ColKind::AnyCol | ColKind::AnyPayload => true,
+        ColKind::FixedInt => gnitz_wire::is_fixed_int(type_code),
+        ColKind::Float => gnitz_wire::is_float(type_code),
+        ColKind::GermanString => gnitz_wire::is_german_string(type_code),
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(ExprValidateErr::ColKindMismatch {
+            col,
+            type_code,
+            want: need,
+        })
+    }
 }
 
-/// A payload-only column operand must be in range AND a payload (non-PK) column:
-/// routing a PK column to a payload-only opcode yields the `pi = 255` sentinel.
-/// Skipped when no `in_schema` is supplied (structure-only pass).
+/// A COPY_COL destination slot must hold its source verbatim. `copy_column`
+/// byte-copies at equal width and otherwise `widen_native_le`s a narrower integer
+/// into a wider slot — there is no narrowing and no representation change.
 #[inline]
-fn check_col_payload(in_schema: Option<&SchemaDescriptor>, col: u32) -> Result<(), ExprValidateErr> {
-    check_col_in_range(in_schema, col)?;
-    if let Some(s) = in_schema {
-        if s.is_pk_col(col as usize) {
-            return Err(ExprValidateErr::ColNotPayload { col });
-        }
+fn check_copy_types(
+    in_schema: Option<&SchemaDescriptor>,
+    out_schema: Option<&SchemaDescriptor>,
+    src_col: u32,
+    out: u32,
+) -> Result<(), ExprValidateErr> {
+    let (Some(is), Some(os)) = (in_schema, out_schema) else {
+        return Ok(());
+    };
+    let src_tc = is.columns[src_col as usize].type_code;
+    let out_tc = os.columns[os.payload_col_idx(out as usize)].type_code;
+    let ok = src_tc == out_tc || gnitz_wire::is_widening_promotion(src_tc, out_tc);
+    if ok {
+        Ok(())
+    } else {
+        Err(ExprValidateErr::CopyTypeMismatch {
+            col: src_col,
+            src_tc,
+            out,
+            out_tc,
+        })
+    }
+}
+
+/// EMIT stores a whole 8-byte register image, so its destination slot is 8 bytes
+/// — no narrowing (which truncates an i64 and shears an f64) and no widening
+/// (which runs off the end of `to_le_bytes()`). A stride rule, not a type rule:
+/// `I64`, `U64` and `F64` are all legal targets and `validate` cannot tell which
+/// the register holds. Read off the column's cached `size()` rather than
+/// re-deriving it, so an undecodable type code (which `wire_stride` would report
+/// as 8) cannot slip through.
+#[inline]
+fn check_emit_slot(out_schema: Option<&SchemaDescriptor>, out: u32) -> Result<(), ExprValidateErr> {
+    let Some(os) = out_schema else { return Ok(()) };
+    let col = os.columns[os.payload_col_idx(out as usize)];
+    if col.size() != 8 || !gnitz_wire::is_valid_type_code(col.type_code) {
+        return Err(ExprValidateErr::EmitSlotNotEightBytes {
+            out,
+            type_code: col.type_code,
+        });
     }
     Ok(())
 }
@@ -1089,6 +1203,11 @@ fn propagate_u64(reg_tc: &[u8; MAX_REGS], a: u16, b: u16) -> u8 {
 pub(in crate::expr) struct ResolvedProgram {
     pub(in crate::expr) instrs: Vec<Instr>,
     pub(in crate::expr) num_regs: u32,
+    /// The register holding the filter verdict. Filter-only state: a map's is
+    /// meaningless (both map construction sites hardcode 0 into the wire field)
+    /// and never read — the only consumers are the `is_filter` arms below and
+    /// the `Repr::Predicate` entry points, and `from_predicate` rejects a
+    /// register-free program so a filter's is always in range.
     pub(in crate::expr) result_reg: u32,
     /// Per-constant 16-byte German-string cell (indexed by `const_idx`) over
     /// the one shared `const_blob` — encoded once at resolve, compared by the
@@ -1096,8 +1215,9 @@ pub(in crate::expr) struct ResolvedProgram {
     pub(in crate::expr) const_cells: Vec<[u8; 16]>,
     pub(in crate::expr) const_blob: Vec<u8>,
     /// Decoded `INT_IN_SET` value pools, indexed by the resolved `set_idx`. Each
-    /// pool is sorted ascending in signed-i64 `Ord` and deduplicated (built that
-    /// way by the client backend), so `eval_batch` binary-searches it directly.
+    /// pool is sorted ascending in signed-i64 `Ord` by `resolve` — the wire order
+    /// is not trusted — so `eval_batch` binary-searches it directly. Duplicates
+    /// are left in place; `binary_search` is correct over them.
     pub(in crate::expr) int_sets: Vec<Vec<i64>>,
     /// True iff no instruction can produce a NULL against the schema this program
     /// was resolved against, so the evaluator skips null-bit tracking entirely.
@@ -1187,9 +1307,9 @@ impl ResolvedProgram {
     fn and_chain_mask(&self, is_filter: bool) -> u64 {
         let n = self.instrs.len();
         // Filter-only; need ≥ 3 instrs for a ≥ 2-AND chain. A filter has one
-        // register per instruction, so n == num_regs ≤ MAX_REGS (asserted), keeping
-        // `pc as u8` and the register-indexed scratch arrays in range.
-        if !is_filter || self.num_regs == 0 || !(3..=MAX_REGS).contains(&n) {
+        // register per instruction, so n == num_regs ≤ MAX_REGS (asserted),
+        // keeping `pc as u8` and the register-indexed scratch arrays in range.
+        if !is_filter || !(3..=MAX_REGS).contains(&n) {
             return 0;
         }
         // Terminal = last instruction = expression root; must be an AND on result_reg.
@@ -1240,10 +1360,10 @@ impl ResolvedProgram {
     }
 
     /// Classify each register's role on the nullable-arm hot path. Returns
-    /// `(bit_only_mask, bool_input_mask)`. `is_filter = true` keeps `result_reg`
-    /// eligible for bit_only (the `run_filter` fast path reads `bool_bits` of it
-    /// directly); for maps it is demoted to keep any stray `regs[result_reg]`
-    /// read live.
+    /// `(bit_only_mask, bool_input_mask)`. A filter's `result_reg` is forced to
+    /// be a bool input (the `run_filter` fast path reads `bool_bits` of it
+    /// directly). A map has no result register to force — its only register
+    /// consumer is `Emit`, which already marks its source non-bool.
     ///
     /// Every `1u64 << reg` below is in range: `LogicalProgram::new` asserts
     /// `num_regs <= MAX_REGS` and bounds every register operand by `num_regs`.
@@ -1314,18 +1434,14 @@ impl ResolvedProgram {
                 | CopyCol { .. } => {}
             }
         }
-        let mut bit_only = bool_produced & !non_bool_read;
-        if self.num_regs > 0 {
-            if is_filter {
-                // `run_filter`'s nullable arm consumes the result as packed bits
-                // (a word-level `bool_bits & !null_bits` merge), so the result
-                // producer must populate `bool_bits` whatever opcode it is —
-                // marking it a bool input routes every non-bool producer through
-                // `maybe_pack_bool_bits`.
-                bool_input |= 1u64 << self.result_reg as usize;
-            } else {
-                bit_only &= !(1u64 << self.result_reg as usize);
-            }
+        let bit_only = bool_produced & !non_bool_read;
+        if is_filter {
+            // `run_filter`'s nullable arm consumes the result as packed bits
+            // (a word-level `bool_bits & !null_bits` merge), so the result
+            // producer must populate `bool_bits` whatever opcode it is —
+            // marking it a bool input routes every non-bool producer through
+            // `maybe_pack_bool_bits`.
+            bool_input |= 1u64 << self.result_reg as usize;
         }
         (bit_only, bool_input)
     }

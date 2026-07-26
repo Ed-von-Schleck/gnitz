@@ -423,7 +423,7 @@ mod tests {
     // ── append_row_simple tests ──────────────────────────────────────────
 
     fn make_schema_cols(cols: &[(u8, u8)], pk_index: u32) -> SchemaDescriptor {
-        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+        let mut columns = [SchemaColumn::EMPTY; crate::schema::MAX_COLUMNS];
         for (i, &(tc, nullable)) in cols.iter().enumerate() {
             columns[i] = SchemaColumn::new(tc, nullable);
         }

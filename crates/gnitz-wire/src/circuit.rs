@@ -196,18 +196,11 @@ impl AggFunc {
 /// before the wire and never reaches this rule.
 pub const fn agg_output_type(func: AggFunc, src_tc: u8) -> u8 {
     use crate::types::type_code;
-    let is_float = src_tc == type_code::F32 || src_tc == type_code::F64;
+    let is_float = crate::types::is_float(src_tc);
     match func {
         AggFunc::Count | AggFunc::CountNonNull | AggFunc::SumZero => type_code::I64,
-        AggFunc::Sum => {
-            if is_float {
-                type_code::F64
-            } else if src_tc == type_code::U64 {
-                type_code::U64
-            } else {
-                type_code::I64
-            }
-        }
+        // Exactly the 8-byte register image the accumulator holds.
+        AggFunc::Sum => crate::types::register_image_type(src_tc),
         AggFunc::Min | AggFunc::Max => {
             if is_float {
                 type_code::F64
@@ -598,8 +591,22 @@ pub fn decode_op_node(
             .map(|c| c.value1 as u16)
             .collect()
     };
-    let collect_typecodes =
-        |kind: u64| -> Vec<u8> { cols.iter().filter(|c| c.kind == kind).map(|c| c.value1 as u8).collect() };
+    // The null-fill type codes become schema columns verbatim, so this decode is
+    // their trust boundary (see `is_valid_type_code` for why an unknown code is
+    // not inert) — the same rule `collect_cols_with_tcs` applies to a carried
+    // promotion target.
+    let collect_typecodes = |kind: u64| -> Result<Vec<u8>, String> {
+        cols.iter()
+            .filter(|c| c.kind == kind)
+            .map(|c| {
+                let tc = c.value1 as u8;
+                match crate::is_valid_type_code(tc) {
+                    true => Ok(tc),
+                    false => Err(format!("NULL_EXTEND: invalid column type code {tc}")),
+                }
+            })
+            .collect()
+    };
     let collect_aggs = || -> Result<Vec<(AggFunc, u16)>, String> {
         cols.iter()
             .filter(|c| c.kind == NODE_COL_KIND_AGG_SPEC)
@@ -722,7 +729,7 @@ pub fn decode_op_node(
             shard_cols: collect_cols(NODE_COL_KIND_SHARD),
         },
         OPCODE_NULL_EXTEND => OpNode::NullExtend {
-            type_codes: collect_typecodes(NODE_COL_KIND_NULL_EXT),
+            type_codes: collect_typecodes(NODE_COL_KIND_NULL_EXT)?,
         },
         OPCODE_PARTITION_FILTER => OpNode::PartitionFilter,
         _ => return Err(format!("unknown opcode {opcode}")),
@@ -855,6 +862,27 @@ mod tests {
         }];
         let err = decode_op_node(OPCODE_MAP_EXPR, None, Some(vec![1, 2, 3]), &cols).unwrap_err();
         assert!(err.contains("not PK-eligible"), "got: {err}");
+    }
+
+    /// A NULL_EXTEND type code becomes a schema column verbatim. An undecodable
+    /// one is not inert — `wire_stride` reports 8 for it, so it clears any width
+    /// test, and the schema it lands in becomes every downstream node's input.
+    #[test]
+    fn decode_rejects_invalid_null_extend_type_code() {
+        let col = |tc: u64| CircuitNodeColumn {
+            kind: NODE_COL_KIND_NULL_EXT,
+            position: 0,
+            value1: tc,
+            value2: 0,
+        };
+        let err = decode_op_node(OPCODE_NULL_EXTEND, None, None, &[col(200)]).unwrap_err();
+        assert!(err.contains("invalid column type code"), "got: {err}");
+        assert_eq!(
+            decode_op_node(OPCODE_NULL_EXTEND, None, None, &[col(crate::type_code::I64 as u64)]).unwrap(),
+            OpNode::NullExtend {
+                type_codes: vec![crate::type_code::I64],
+            }
+        );
     }
 
     /// A SCAN node with a NULL `source_table` cell is a corrupt circuit: reject it at

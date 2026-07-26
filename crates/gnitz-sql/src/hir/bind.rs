@@ -319,9 +319,10 @@ fn bind_projection<L: LeafBinder<HirRef>>(
 /// Bind one non-wildcard SELECT expression into a `ProjEntry`. A bare (possibly
 /// aliased/qualified/parenthesized) column reference binds to a pass-through
 /// carrying the source column's def (alias only renames); anything else is a
-/// computed column, `_expr{idx}` when unaliased, typed by `infer_type`, and
-/// **always nullable** (a fixed constant, never inferred — inferring from
-/// operand nullability would diverge a downstream `IS NOT NULL` const-elision).
+/// computed column, built by `ColumnDef::computed` — the same naming, typing and
+/// always-nullable rules `resolve_proj_col` applies on the ad-hoc path. (The
+/// nullability is a fixed constant, never inferred: inferring it from operand
+/// nullability would diverge a downstream `IS NOT NULL` const-elision.)
 fn bind_proj_expr<L: LeafBinder<HirRef>>(
     expr: &Expr,
     alias: Option<String>,
@@ -338,8 +339,7 @@ fn bind_proj_expr<L: LeafBinder<HirRef>>(
         }
         def
     } else {
-        let ty = bound.infer_type_with(&|r: &HirRef| type_of(env, r));
-        ColumnDef::new(alias.unwrap_or_else(|| format!("_expr{idx}")), ty, true)
+        ColumnDef::computed(alias, idx, bound.infer_type_with(&|r: &HirRef| type_of(env, r)))
     };
     Ok(ProjEntry {
         expr: bound,

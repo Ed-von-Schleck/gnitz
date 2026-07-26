@@ -118,6 +118,26 @@ fn pk_set_missing_keys_miss_silently() {
     assert_eq!(got, vec![(0u128, 0, 1), (4u128, 4, 1)]);
 }
 
+/// `OrderKey.col` is a raw client `u16` that reaches `reply_schema.locate`,
+/// whose bound is a release-active `assert!`. The locators are built before the
+/// top-k decision and before the chunk loop, so neither `limit_k` nor an empty
+/// table would have contained it.
+#[test]
+fn order_key_column_out_of_range_is_rejected() {
+    let (mut e, tid) = fixture("ss_order_oob", 4, |id| id as i64);
+    let spec = identity_spec(
+        ReadBound::None,
+        vec![OrderKey {
+            col: 99,
+            desc: false,
+            nulls_first: false,
+        }],
+        0,
+    );
+    let reply_schema = e.get_schema(tid).unwrap();
+    assert!(e.scan_spec_family(tid, &spec, &reply_schema).is_err());
+}
+
 #[test]
 fn order_by_desc_limit_keeps_top_k() {
     let (mut e, tid) = fixture("ss_topk", 20, |i| i as i64); // val == id

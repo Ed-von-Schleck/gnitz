@@ -4,6 +4,33 @@
 
 use super::*;
 
+/// The one place COL_TAB column records become a `SchemaDescriptor`, so it is
+/// where their admissibility is enforced — not at the callers.
+/// [`check_col_defs`] rather than `assert!`: the rows are catalog data a corrupt
+/// SAL can carry, and `hook_column_alter` plus the register hooks under boot
+/// replay / worker `ddl_sync` run on paths that skip the DDL precheck entirely.
+///
+/// `dist_prefix_len` is the persisted distribution prefix length `k`
+/// (`0` = default = full PK; clamped by `new_with_dist`). The table-register
+/// path passes the decoded `k`; the view path passes the full-PK default
+/// (views are not distributed by a chosen key).
+pub(crate) fn build_schema_from_col_defs(
+    col_defs: &[ColumnDef],
+    pk_cols: &[u32],
+    dist_prefix_len: usize,
+) -> Result<SchemaDescriptor, String> {
+    check_col_defs(col_defs)?;
+    let mut cols = [SchemaColumn::EMPTY; crate::schema::MAX_COLUMNS];
+    for (i, cd) in col_defs.iter().enumerate() {
+        cols[i] = SchemaColumn::new(cd.type_code, if cd.is_nullable { 1 } else { 0 });
+    }
+    Ok(SchemaDescriptor::new_with_dist(
+        &cols[..col_defs.len()],
+        pk_cols,
+        dist_prefix_len,
+    ))
+}
+
 impl CatalogEngine {
     // -- Iteration helpers ----------------------------------------------------
 
@@ -94,29 +121,6 @@ impl CatalogEngine {
         self.caches.col_names_bytes.insert(owner_id, Rc::new(bytes));
         self.caches.col_defs.insert(owner_id, defs.clone());
         defs
-    }
-
-    /// `dist_prefix_len` is the persisted distribution prefix length `k`
-    /// (`0` = default = full PK; clamped by `new_with_dist`). The table-register
-    /// path passes the decoded `k`; the view path passes the full-PK default
-    /// (views are not distributed by a chosen key).
-    pub(crate) fn build_schema_from_col_defs(
-        &self,
-        col_defs: &[ColumnDef],
-        pk_cols: &[u32],
-        dist_prefix_len: usize,
-    ) -> SchemaDescriptor {
-        assert!(
-            col_defs.len() <= crate::schema::MAX_COLUMNS,
-            "build_schema_from_col_defs: too many columns ({}) for entity (type_codes: {:?})",
-            col_defs.len(),
-            col_defs.iter().map(|c| c.type_code).collect::<Vec<_>>(),
-        );
-        let mut cols = [zero_col(); crate::schema::MAX_COLUMNS];
-        for (i, cd) in col_defs.iter().enumerate() {
-            cols[i] = SchemaColumn::new(cd.type_code, if cd.is_nullable { 1 } else { 0 });
-        }
-        SchemaDescriptor::new_with_dist(&cols[..col_defs.len()], pk_cols, dist_prefix_len)
     }
 
     // -- Registry query methods -----------------------------------------------

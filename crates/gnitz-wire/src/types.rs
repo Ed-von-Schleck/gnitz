@@ -77,8 +77,18 @@ impl TypeCode {
         }
     }
 
+    /// Whether this type is one of the two IEEE-754 column types. Typed
+    /// counterpart of the free [`is_float`].
     pub const fn is_float(&self) -> bool {
-        matches!(self, TypeCode::F32 | TypeCode::F64)
+        is_float(*self as u8)
+    }
+
+    /// The type of the 8-byte register image the engine materializes for a
+    /// computed value of this source type. Typed counterpart of the free
+    /// [`register_image_type`].
+    #[inline]
+    pub fn register_image(self) -> TypeCode {
+        TypeCode::from_validated_u8(register_image_type(self as u8))
     }
 
     /// The 16-byte integer-ish types (U128, UUID, I128) with no i64 slot in the
@@ -97,7 +107,7 @@ impl TypeCode {
     /// heap), never via fixed-width byte ops. Allow-list so new variants are
     /// excluded until explicitly vetted.
     pub const fn is_german_string(&self) -> bool {
-        matches!(self, TypeCode::String | TypeCode::Blob)
+        is_german_string(*self as u8)
     }
 
     /// Whether this type is a signed integer (I8/I16/I32/I64/I128). Typed
@@ -304,8 +314,58 @@ pub fn index_key_types(col_types: &[u8], src_pk_count: usize, src_pk_stride: usi
 /// `type_code` (mirrors the free `wire_stride`/`is_pk_eligible`). Unknown codes
 /// are not german strings.
 #[inline]
-pub fn is_german_string(tc: u8) -> bool {
+pub const fn is_german_string(tc: u8) -> bool {
     tc == type_code::STRING || tc == type_code::BLOB
+}
+
+/// True iff `tc` is one of the two IEEE-754 column types. The `u8` counterpart
+/// of [`TypeCode::is_float`], for the raw-type-code paths.
+#[inline]
+pub const fn is_float(tc: u8) -> bool {
+    matches!(tc, type_code::F32 | type_code::F64)
+}
+
+/// True iff `tc` decodes to a known [`TypeCode`]. The one predicate every
+/// trust boundary that turns raw client type-code bytes into a schema column
+/// asks: an unknown code is not inert — [`wire_stride`] reports 8 for it (so a
+/// width test passes it through) and [`TypeCode::from_validated_u8`] panics on
+/// it at every downstream consumer.
+#[inline]
+pub const fn is_valid_type_code(tc: u8) -> bool {
+    TypeCode::try_from_u8(tc).is_some()
+}
+
+/// The type of the 8-byte register image the engine materializes for a computed
+/// value of source type `tc`: any float lands as `F64` (`LOAD_COL_FLOAT` widens
+/// `F32` on load), `U64` stays unsigned so a downstream compare re-seeds the
+/// unsigned variant, and every other integer normalizes to `I64`. EMIT stores
+/// that image whole, so a computed column typed any narrower would ship the low
+/// half of an `f64` or wrap a negative value into an unsigned slot. The single
+/// rule behind both the planner's expression typing and [`agg_output_type`]'s
+/// `SUM` arm.
+#[inline]
+pub const fn register_image_type(tc: u8) -> u8 {
+    if is_float(tc) {
+        type_code::F64
+    } else if tc == type_code::U64 {
+        type_code::U64
+    } else {
+        type_code::I64
+    }
+}
+
+/// True iff `target` is a value-preserving *widening promotion* of `src` — the
+/// only type change a column copy performs (`widen_native_le` sign/zero-extends
+/// a narrower integer into a wider slot; there is no narrowing and no
+/// representation change). Rather than re-deriving the sign/width ladder,
+/// this reads back [`join_key_common_type`]'s contract: the promotion is
+/// idempotent, so `target` is a promotion of `src` iff resolving the pair
+/// `(src, target)` maps back to `target`. Shared by the engine compiler's
+/// carried-target validation and the expression validator's COPY_COL slot check
+/// so the two cannot drift.
+#[inline]
+pub fn is_widening_promotion(src: u8, target: u8) -> bool {
+    is_fixed_int(target) && join_key_common_type(src, target) == Some(target)
 }
 
 /// Whether a raw wire type code is a *signed* fixed-width integer

@@ -509,7 +509,7 @@ mod tests {
                 b: 1,
             }, // r2 = (r0 > r1)
         ];
-        let func = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 3, 2, vec![]), &schema);
+        let func = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 3, 2, vec![]), &schema).unwrap();
 
         let out = op_filter(&batch, &func, &schema);
         assert_eq!(out.count, 2, "only pk=2 and pk=3 pass val>10");
@@ -525,7 +525,7 @@ mod tests {
             LogicalInstr::LoadConst { dst: 0, val: 1 }, // always true
         ];
         let schema = make_schema_u64_i64();
-        let func = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 1, 0, vec![]), &schema);
+        let func = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 1, 0, vec![]), &schema).unwrap();
 
         let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
 
@@ -565,7 +565,7 @@ mod tests {
         let schema = make_schema_u64_i64();
         let empty_batch = Batch::empty_with_schema(&schema);
 
-        let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema);
+        let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema).unwrap();
         let out = op_map(&empty_batch, &func, &schema, ReindexSpec::None);
         assert_eq!(out.count, 0);
     }
@@ -740,7 +740,7 @@ mod tests {
     fn always_true_func(schema: &SchemaDescriptor) -> ScalarFunc {
         use crate::expr::{LogicalInstr, LogicalProgram};
         let instrs = vec![LogicalInstr::LoadConst { dst: 0, val: 1 }]; // always true
-        ScalarFunc::from_predicate(LogicalProgram::new(instrs, 1, 0, vec![]), schema)
+        ScalarFunc::from_predicate(LogicalProgram::new(instrs, 1, 0, vec![]), schema).unwrap()
     }
 
     #[test]
@@ -855,7 +855,7 @@ mod tests {
         let batch = make_batch(&schema, &[(1, 1, 200), (2, 1, 100), (3, 1, 300)]);
 
         // Projection plan: output keeps the same single payload column.
-        let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema);
+        let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema).unwrap();
 
         let out = op_map(
             &batch,
@@ -934,7 +934,7 @@ mod tests {
                 b: 1,
             },
         ];
-        let func = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 3, 2, vec![]), &schema);
+        let func = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 3, 2, vec![]), &schema).unwrap();
 
         let out = op_filter(&batch, &func, &schema);
         // pk=2(15), 3(25), 5(20), 7(30), 9(11), 11(50), 13(12), 15(100), 18(13), 20(22)

@@ -73,6 +73,20 @@ impl CatalogEngine {
                 order,
                 limit_k,
             } => {
+                // `OrderKey.col` is a raw client `u16` — a full reply-schema
+                // column index — that `run_scan_rows_sink` feeds straight to
+                // `reply_schema.locate`, whose bound is a release-active
+                // `assert!`. Bound it here, ahead of both reply shapes: the
+                // locators are built before the topk/early-stop decision and
+                // before the chunk loop, so `limit_k` and an empty table are no
+                // protection.
+                if let Some(k) = order.iter().find(|k| k.col as usize >= reply_schema.num_columns()) {
+                    return Err(format!(
+                        "scan_spec: order key column {} out of range ({} cols)",
+                        k.col,
+                        reply_schema.num_columns()
+                    ));
+                }
                 // The rows sink byte-copies the source OPK verbatim into the reply
                 // PK region, so the strides must agree — a mismatch would leave
                 // the keeper's uninitialized tail as the client's PK tiebreak.
@@ -559,10 +573,9 @@ fn pk_range_keys(schema: &SchemaDescriptor, range: &RangeDescriptor) -> Result<O
 /// is a corrupt frame (the client pre-compiled the identical program at plan time).
 fn compile_predicate(blob: &[u8], schema: &SchemaDescriptor) -> Result<ScalarFunc, String> {
     let dep = gnitz_wire::decode_expr_blob(blob).ok_or("scan_spec: corrupt predicate blob")?;
-    let prog = LogicalProgram::from_wire(&dep.code, dep.num_regs, dep.result_reg, dep.const_strings)
-        .and_then(|p| p.validate(Some(schema), None).map(|()| p))
-        .map_err(|e| format!("scan_spec: invalid predicate program: {e:?}"))?;
-    Ok(ScalarFunc::from_predicate(prog, schema))
+    LogicalProgram::from_wire(&dep.code, dep.num_regs, dep.result_reg, dep.const_strings)
+        .and_then(|p| ScalarFunc::from_predicate(p, schema))
+        .map_err(|e| format!("scan_spec: invalid predicate program: {e:?}"))
 }
 
 /// Decode + validate a client projection (MAP) blob and build its map
@@ -576,10 +589,9 @@ fn compile_projection(
     out_schema: &SchemaDescriptor,
 ) -> Result<ScalarFunc, String> {
     let dep = gnitz_wire::decode_expr_blob(blob).ok_or("scan_spec: corrupt projection blob")?;
-    let prog = LogicalProgram::from_wire(&dep.code, dep.num_regs, 0, dep.const_strings)
-        .and_then(|p| p.validate(Some(in_schema), Some(out_schema)).map(|()| p))
-        .map_err(|e| format!("scan_spec: invalid projection program: {e:?}"))?;
-    Ok(ScalarFunc::from_map(prog, in_schema, out_schema))
+    LogicalProgram::from_wire(&dep.code, dep.num_regs, 0, dep.const_strings)
+        .and_then(|p| ScalarFunc::from_map(p, in_schema, out_schema))
+        .map_err(|e| format!("scan_spec: invalid projection program: {e:?}"))
 }
 
 #[cfg(test)]

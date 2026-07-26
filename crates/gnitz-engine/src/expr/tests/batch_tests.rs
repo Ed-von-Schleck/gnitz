@@ -6,8 +6,17 @@
 use super::super::batch::{eval_batch, EvalScratch, MORSEL, NULL_WORDS_PER_REG};
 use super::super::program::{LogicalInstr, LogicalProgram, ResolvedProgram};
 use super::eval_predicate_via_batch as eval_predicate;
+use crate::expr::ScalarFunc;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, MemBatch};
+
+/// Build + validate a filter `ScalarFunc` in one step — the shape every
+/// predicate test here needs. `from_predicate` returns a `Result`; a test
+/// program that fails validation is a bug in the test, so unwrap once here
+/// rather than at each of the sites below.
+fn predicate(instrs: Vec<LogicalInstr>, num_regs: u32, result_reg: u32, schema: &SchemaDescriptor) -> ScalarFunc {
+    ScalarFunc::from_predicate(LogicalProgram::new(instrs, num_regs, result_reg, vec![]), schema).unwrap()
+}
 
 fn make_schema_2col() -> SchemaDescriptor {
     SchemaDescriptor::new(
@@ -173,7 +182,7 @@ fn test_str_col_eq_const_nullable_column_matches_per_row() {
         col: 1,
         const_idx: 0,
     }];
-    let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 1, 0, vec![b"foo".to_vec()]), &schema);
+    let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 1, 0, vec![b"foo".to_vec()]), &schema).unwrap();
 
     // Drive the (multi-morsel) batch path through run_filter and compare to
     // the m=1 wrapper.
@@ -226,7 +235,7 @@ fn schema_pk_int_nullable() -> SchemaDescriptor {
 
 #[test]
 fn golden_load_payload_null_row() {
-    use crate::expr::{CmpOp, ScalarFunc};
+    use crate::expr::CmpOp;
     let schema = schema_pk_int_nullable();
     let batch = make_int_row(&schema, 42, true);
     let mb = batch.as_mem_batch();
@@ -242,7 +251,7 @@ fn golden_load_payload_null_row() {
             b: 1,
         },
     ];
-    let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 3, 2, vec![]), &schema);
+    let kind = predicate(instrs, 3, 2, &schema);
     assert!(!kind.evaluate_predicate(&mb, 0));
 }
 
@@ -346,7 +355,7 @@ fn run_bool_combinator(schema: &SchemaDescriptor, batch: &Batch, op: fn(u16, u16
     let mut scratch = EvalScratch::default();
     scratch.ensure_capacity(3, false, 1);
     eval_batch(&prog, &mb, 0, 1, &mut scratch);
-    let val = scratch.regs[2 * MORSEL];
+    let val = super::read_reg_row0(&prog, &scratch, 2);
     let is_null = (scratch.null_bits[2 * NULL_WORDS_PER_REG] & 1) != 0;
     // The 3VL whole-word path writes the full u64 for word 0; bits beyond
     // bit 0 must be zero at m=1.
@@ -452,7 +461,7 @@ fn golden_str_col_eq_const_null_row() {
         col: 1,
         const_idx: 0,
     }];
-    let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 1, 0, vec![b"foo".to_vec()]), &schema);
+    let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 1, 0, vec![b"foo".to_vec()]), &schema).unwrap();
     assert!(
         !kind.evaluate_predicate(&mb, 0),
         "STR_COL_EQ_CONST on NULL row must not pass",
@@ -461,27 +470,26 @@ fn golden_str_col_eq_const_null_row() {
 
 #[test]
 fn golden_is_null_and_is_not_null_single_row() {
-    use crate::expr::ScalarFunc;
     let schema = schema_pk_int_nullable();
 
     // Null row: IS NULL → true, IS NOT NULL → false.
     let batch = make_int_row(&schema, 0, true);
     let mb = batch.as_mem_batch();
     let instrs_is_null = vec![LogicalInstr::IsNull { dst: 0, col: 1 }];
-    let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs_is_null, 1, 0, vec![]), &schema);
+    let kind = predicate(instrs_is_null, 1, 0, &schema);
     assert!(kind.evaluate_predicate(&mb, 0));
     let instrs_is_not_null = vec![LogicalInstr::IsNotNull { dst: 0, col: 1 }];
-    let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs_is_not_null, 1, 0, vec![]), &schema);
+    let kind = predicate(instrs_is_not_null, 1, 0, &schema);
     assert!(!kind.evaluate_predicate(&mb, 0));
 
     // Non-null row: opposite.
     let batch = make_int_row(&schema, 7, false);
     let mb = batch.as_mem_batch();
     let instrs_is_null = vec![LogicalInstr::IsNull { dst: 0, col: 1 }];
-    let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs_is_null, 1, 0, vec![]), &schema);
+    let kind = predicate(instrs_is_null, 1, 0, &schema);
     assert!(!kind.evaluate_predicate(&mb, 0));
     let instrs_is_not_null = vec![LogicalInstr::IsNotNull { dst: 0, col: 1 }];
-    let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs_is_not_null, 1, 0, vec![]), &schema);
+    let kind = predicate(instrs_is_not_null, 1, 0, &schema);
     assert!(kind.evaluate_predicate(&mb, 0));
 }
 
@@ -680,7 +688,7 @@ fn ref_and(a: Option<bool>, b: Option<bool>) -> (bool, bool) {
 /// reference computed from the column values.
 #[test]
 fn bit_only_three_and_chain_boundary_sweep() {
-    use crate::expr::{CmpOp, ScalarFunc};
+    use crate::expr::CmpOp;
 
     let schema = schema_pk_three_ints_nullable();
 
@@ -730,7 +738,7 @@ fn bit_only_three_and_chain_boundary_sweep() {
         );
         let mb = batch.as_mem_batch();
 
-        let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs.clone(), 9, 8, vec![]), &schema);
+        let kind = predicate(instrs.clone(), 9, 8, &schema);
 
         let mut passed = vec![false; n];
         kind.run_filter(&mb, n, |s, e| {
@@ -765,7 +773,7 @@ fn bit_only_three_and_chain_boundary_sweep() {
 /// reads `bool_bits[result_reg]` and must honor 3VL (NOT NULL = NULL = fail).
 #[test]
 fn bit_only_not_3vl_truth_table() {
-    use crate::expr::{CmpOp, ScalarFunc};
+    use crate::expr::CmpOp;
 
     let schema = schema_pk_int_nullable();
 
@@ -788,7 +796,7 @@ fn bit_only_not_3vl_truth_table() {
             }, // r2 = bool(col1)
             LogicalInstr::BoolNot { dst: 3, a: 2 },      // r3 = NOT r2
         ];
-        let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 4, 3, vec![]), &schema);
+        let kind = predicate(instrs, 4, 3, &schema);
         let mut passed = false;
         kind.run_filter(&mb, 1, |_, _| {
             passed = true;
@@ -883,7 +891,7 @@ fn classifier_pure_conjunction_filter() {
         5,
         vec![],
     )
-    .resolve(&schema, false);
+    .resolve(&schema, true);
     let (bit_only, bool_input) = prog.classify_registers(true);
     // Bool producers: r2 (CMP_GT), r4 (CMP_GT), r5 (BOOL_AND).
     // Non-bool readers consume r0/r1/r3 (CMPs read them as i64), so those
@@ -905,11 +913,10 @@ fn classifier_pure_conjunction_filter() {
 /// nullable word merge yields the same rows the per-row scan did.
 #[test]
 fn classifier_filter_result_reg_non_bool_falls_back() {
-    use crate::expr::ScalarFunc;
     let schema = schema_pk_int_nullable();
     // Predicate: WHERE col1 (treat int as truthy).
     let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 1 }];
-    let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 1, 0, vec![]), &schema);
+    let kind = predicate(instrs, 1, 0, &schema);
 
     // Build 4 rows: non-null 1, non-null 0, null, non-null -5.
     let mut b = Batch::with_capacity(schema, 4);
@@ -940,7 +947,7 @@ fn classifier_filter_result_reg_non_bool_falls_back() {
 /// row, matching the historical 3VL behavior.
 #[test]
 fn bit_only_all_null_word_and() {
-    use crate::expr::{CmpOp, ScalarFunc};
+    use crate::expr::CmpOp;
     let schema = schema_pk_two_ints_nullable();
 
     let n = 64;
@@ -973,7 +980,7 @@ fn bit_only_all_null_word_and() {
         }, // r4 = bool(col2)
         LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 },
     ];
-    let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 6, 5, vec![]), &schema);
+    let kind = predicate(instrs, 6, 5, &schema);
 
     let mut passed = vec![false; n];
     kind.run_filter(&mb, n, |s, e| {
@@ -988,8 +995,6 @@ fn bit_only_all_null_word_and() {
 /// bits become false-positive passing rows.
 #[test]
 fn bit_only_is_not_null_tail_mask() {
-    use crate::expr::ScalarFunc;
-
     let schema = schema_pk_two_ints_nullable();
     // 65 rows — straddles the 64-bit word boundary so tail handling matters.
     let n = 65;
@@ -1018,7 +1023,7 @@ fn bit_only_is_not_null_tail_mask() {
         LogicalInstr::IsNotNull { dst: 1, col: 2 },
         LogicalInstr::BoolAnd { dst: 2, a: 0, b: 1 },
     ];
-    let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 3, 2, vec![]), &schema);
+    let kind = predicate(instrs, 3, 2, &schema);
 
     let mut passed = vec![false; n];
     kind.run_filter(&mb, n, |s, e| {
@@ -1059,7 +1064,7 @@ fn schema_pk_three_ints_non_nullable() -> SchemaDescriptor {
 /// firing path, the survivor path, and partial-morsel tail handling.
 #[test]
 fn and_chain_skip_fires_boundary_sweep() {
-    use crate::expr::{CmpOp, ScalarFunc};
+    use crate::expr::CmpOp;
 
     let schema = schema_pk_three_ints_nullable();
 
@@ -1113,7 +1118,7 @@ fn and_chain_skip_fires_boundary_sweep() {
         );
         let mb = batch.as_mem_batch();
 
-        let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs.clone(), 10, 9, vec![]), &schema);
+        let kind = predicate(instrs.clone(), 10, 9, &schema);
 
         let mut passed = vec![false; n];
         kind.run_filter(&mb, n, |s, e| {
@@ -1150,7 +1155,7 @@ fn and_chain_skip_fires_boundary_sweep() {
 /// output would be identical either way — the survivors are what make it sharp.)
 #[test]
 fn and_chain_null_flood_does_not_misfire() {
-    use crate::expr::{CmpOp, ScalarFunc};
+    use crate::expr::CmpOp;
 
     let schema = schema_pk_three_ints_nullable();
 
@@ -1195,7 +1200,7 @@ fn and_chain_null_flood_does_not_misfire() {
         );
         let mb = batch.as_mem_batch();
 
-        let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs.clone(), 10, 9, vec![]), &schema);
+        let kind = predicate(instrs.clone(), 10, 9, &schema);
 
         let mut passed = vec![false; n];
         kind.run_filter(&mb, n, |s, e| {
@@ -1218,7 +1223,7 @@ fn and_chain_null_flood_does_not_misfire() {
 /// still be correct.
 #[test]
 fn and_chain_non_nullable_skips_runtime_check() {
-    use crate::expr::{CmpOp, ScalarFunc};
+    use crate::expr::CmpOp;
 
     let schema = schema_pk_three_ints_non_nullable();
 
@@ -1271,7 +1276,7 @@ fn and_chain_non_nullable_skips_runtime_check() {
         );
         let mb = batch.as_mem_batch();
 
-        let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs.clone(), 10, 9, vec![]), &schema);
+        let kind = predicate(instrs.clone(), 10, 9, &schema);
 
         let mut passed = vec![false; n];
         kind.run_filter(&mb, n, |s, e| {
@@ -1502,7 +1507,8 @@ fn str_const_filter_bench() {
         let func = ScalarFunc::from_predicate(
             LogicalProgram::new(instrs, 1, 0, vec![b"match_target".to_vec()]),
             &schema,
-        );
+        )
+        .unwrap();
 
         // Warm-up, then report the FASTEST of many timed passes — the minimum
         // is robust against thermal throttling and scheduler noise, unlike a

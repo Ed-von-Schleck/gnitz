@@ -46,7 +46,7 @@ pub(super) fn ext_schema(
 pub(super) fn union_nullability_merge(a: &SchemaDescriptor, b: &SchemaDescriptor) -> SchemaDescriptor {
     debug_assert_eq!(a.num_columns(), b.num_columns(), "union inputs must share a layout");
     debug_assert_eq!(a.pk_indices(), b.pk_indices(), "union inputs must share a layout");
-    let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+    let mut cols = [SchemaColumn::EMPTY; crate::schema::MAX_COLUMNS];
     for (c, col) in cols[..a.num_columns()].iter_mut().enumerate() {
         let ac = a.columns[c];
         let bc = b.columns[c];
@@ -152,10 +152,10 @@ impl EmitCtx<'_> {
         dep: gnitz_wire::ExprBlob,
         schema: &SchemaDescriptor,
     ) -> Result<*const ScalarFunc, CompileError> {
-        let prog = LogicalProgram::from_wire(&dep.code, dep.num_regs, dep.result_reg, dep.const_strings)
-            .and_then(|p| p.validate(Some(schema), None).map(|()| p))
+        let func = LogicalProgram::from_wire(&dep.code, dep.num_regs, dep.result_reg, dep.const_strings)
+            .and_then(|p| ScalarFunc::from_predicate(p, schema))
             .map_err(expr_reject("filter: invalid predicate program"))?;
-        Ok(self.push_func(ScalarFunc::from_predicate(prog, schema)))
+        Ok(self.push_func(func))
     }
 
     /// A MAP whose program is all-`CopyCol`: output payload `i` ← input column
@@ -166,10 +166,16 @@ impl EmitCtx<'_> {
         src_indices: &[i32],
         in_schema: &SchemaDescriptor,
         out_schema: &SchemaDescriptor,
-    ) -> *const ScalarFunc {
+    ) -> Result<*const ScalarFunc, CompileError> {
         let copies: Vec<u32> = src_indices.iter().map(|&ci| ci as u32).collect();
         let prog = LogicalProgram::copy_cols(&copies);
-        self.push_func(ScalarFunc::from_map(prog, in_schema, out_schema))
+        // `from_map` validates. The out-schema is derived here rather than
+        // supplied, but from a client column list: `build_map_output_schema` drops
+        // PK sources while `copy_cols` numbers destinations densely, so a PK index
+        // leaves a copy addressing a slot that does not exist.
+        let func = ScalarFunc::from_map(prog, in_schema, out_schema)
+            .map_err(expr_reject("projection map: program/schema mismatch"))?;
+        Ok(self.push_func(func))
     }
 
     /// Create a child table in a rank-stamped subdirectory of the view's
@@ -366,18 +372,17 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
                         return Ok(());
                     }
                     // The reindex output schema prepends `pk_n` synthetic PK
-                    // columns to the kept payload columns, written into a fixed
-                    // [_; MAX_COLUMNS] / [_; MAX_PK_COLUMNS] array. A hand-assembled
-                    // or planner-built list could exceed those bounds, or name a
-                    // column >= num_columns() (which `columns[c]` would read as a
-                    // zeroed slot — a silently wrong key). Fail the compile cleanly.
-                    // The byte stride needs no separate MAX_PK_BYTES check: each
+                    // columns to the kept payload columns. A hand-assembled or
+                    // planner-built list could name a column >= num_columns()
+                    // (which `columns[c]` would read as a zeroed slot — a silently
+                    // wrong key). Fail the compile cleanly. The column/PK-slot
+                    // counts are bounded by `reindex_output_schema` itself. The
+                    // byte stride needs no separate MAX_PK_BYTES check: each
                     // output PK column is reindex_output_type_code(tc).wire_stride()
                     // <= 16 bytes, so pk_n <= MAX_PK_COLUMNS (5) bounds the packed
                     // stride at 5 × 16 = 80 = MAX_PK_BYTES (ReindexPacker::new's
                     // assert is the tripwire).
-                    let pk_n = reindex_cols.len();
-                    if pk_n > crate::schema::MAX_PK_COLUMNS || oob_cols(reindex_cols, &in_reg_schema) {
+                    if oob_cols(reindex_cols, &in_reg_schema) {
                         return Err(CompileError::Rejected("map: reindex columns out of range"));
                     }
                     // A mismatched carried promotion target would panic in
@@ -408,22 +413,19 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
                             return Err(CompileError::Rejected("map: reindex payload column out of range"));
                         }
                         let payload_cols: Vec<u16> = srcs.iter().map(|&c| c as u16).collect();
-                        if pk_n + payload_cols.len() > crate::schema::MAX_COLUMNS {
-                            return Err(CompileError::Rejected("map: reindex output exceeds MAX_COLUMNS"));
-                        }
                         reindex_output_schema(&in_reg_schema, reindex_cols, reindex_target_tcs, &payload_cols)
+                            .ok_or(CompileError::Rejected("map: reindex output exceeds MAX_COLUMNS"))?
                     } else {
                         loaded.out_schema
                     };
-                    // Validate the decoded program against the resolved node schema —
-                    // including that it writes every declared output slot, since the
-                    // map output arena is uninitialized — then build its MAP
-                    // `ScalarFunc`. The decode above is reused here rather than
-                    // re-lowering the blob a second time. Rejected, not asserted:
-                    // circuits are client-supplied catalog data.
-                    prog.validate(Some(&in_reg_schema), Some(&node_schema))
+                    // `from_map` validates the decoded program against the resolved
+                    // node schema — including that it writes every declared output
+                    // slot, since the map output arena is uninitialized. The decode
+                    // above is reused here rather than re-lowering the blob a second
+                    // time. Rejected, not asserted: circuits are client-supplied
+                    // catalog data.
+                    let func = ScalarFunc::from_map(prog, &in_reg_schema, &node_schema)
                         .map_err(expr_reject("map: program/schema mismatch"))?;
-                    let func = ScalarFunc::from_map(prog, &in_reg_schema, &node_schema);
                     // A reindex-free map inherits the input PK region verbatim
                     // (`PkFill::Copy`), so the strides must agree. Both reindex arms
                     // overwrite every row's PK, so only this arm cares.
@@ -464,15 +466,16 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
                     // (restricted to the ≤8-byte fixed-int domain the payload widen
                     // supports) rejects a corrupt/forged carried target cleanly
                     // rather than truncating in `copy_column`.
-                    if 1 + proj_cols.len() > crate::schema::MAX_COLUMNS || oob_cols(proj_cols, &in_reg_schema) {
+                    if oob_cols(proj_cols, &in_reg_schema) {
                         return Err(CompileError::Rejected("hash-row map: columns out of range"));
                     }
                     if reindex_promotion_invalid(proj_cols, target_tcs, &in_reg_schema, true) {
                         return Err(CompileError::Rejected("hash-row map: invalid promotion target"));
                     }
                     let src_indices: Vec<i32> = proj_cols.iter().map(|&c| c as i32).collect();
-                    let node_schema = hashrow_output_schema(&in_reg_schema, proj_cols, target_tcs);
-                    let fp = ctx.create_universal_projection(&src_indices, &in_reg_schema, &node_schema);
+                    let node_schema = hashrow_output_schema(&in_reg_schema, proj_cols, target_tcs)
+                        .ok_or(CompileError::Rejected("hash-row map: output exceeds MAX_COLUMNS"))?;
+                    let fp = ctx.create_universal_projection(&src_indices, &in_reg_schema, &node_schema)?;
                     ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(node_schema);
                     let func_idx = ctx.builder.func_idx(fp);
                     ctx.builder.push(Instr::Map {
@@ -488,8 +491,13 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
                         return Err(CompileError::Rejected("projection map: columns out of range"));
                     }
                     let src_indices: Vec<i32> = cols.iter().map(|&c| c as i32).collect();
-                    let schema = build_map_output_schema(&in_reg_schema, &src_indices);
-                    let fp = ctx.create_universal_projection(&src_indices, &in_reg_schema, &schema);
+                    // `oob_cols` bounds each index but not the list length, and
+                    // duplicates are allowed, so a long list would overrun the
+                    // fixed `[_; MAX_COLUMNS]` schema array — the bound is
+                    // PK-inclusive and lives inside the builder.
+                    let schema = build_map_output_schema(&in_reg_schema, &src_indices)
+                        .ok_or(CompileError::Rejected("projection map: output exceeds MAX_COLUMNS"))?;
+                    let fp = ctx.create_universal_projection(&src_indices, &in_reg_schema, &schema)?;
                     ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(schema);
                     let func_idx = ctx.builder.func_idx(fp);
                     ctx.builder.push(Instr::Map {
@@ -660,27 +668,10 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
         gnitz_wire::OpNode::NullExtend { type_codes } => {
             let in_reg = in_reg(&in_regs, PORT_IN, "null-extend: missing input port")?;
             let in_schema = ctx.reg_meta[in_reg as usize].schema;
-            // The output schema — input columns followed by the null-fill columns
-            // (nullable), keyed by the input PK — is built here once and homed in
-            // `reg_meta`; the op derives its appended-column count from it. A
-            // crafted `type_codes` list would overflow the fixed `[_; 65]` schema
-            // array; reject rather than abort.
-            if in_schema.num_columns() + type_codes.len() > crate::schema::MAX_COLUMNS {
-                return Err(CompileError::Rejected("null-extend: merged schema exceeds MAX_COLUMNS"));
-            }
-            let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-            let mut pk_idx = [0u32; crate::schema::MAX_PK_COLUMNS];
-            let pk_len = copy_pk_columns_into(&in_schema, &mut cols, &mut pk_idx);
-            let mut n = pk_len;
-            for (_, _, c) in in_schema.payload_columns() {
-                cols[n] = *c;
-                n += 1;
-            }
-            for &tc in type_codes {
-                cols[n] = SchemaColumn::new(tc, 1);
-                n += 1;
-            }
-            let out_schema = SchemaDescriptor::new(&cols[..n], &pk_idx[..pk_len]);
+            // The output schema is built here once and homed in `reg_meta`; the
+            // op derives its appended-column count from it.
+            let out_schema = null_extend_output_schema(&in_schema, type_codes)
+                .ok_or(CompileError::Rejected("null-extend: merged schema exceeds MAX_COLUMNS"))?;
             ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(out_schema);
             ctx.builder.push(Instr::NullExtend {
                 in_reg: in_reg as u16,
@@ -787,7 +778,11 @@ pub(super) fn emit_reduce(
     if out_key != in_reg_schema.reduce_out_key(&gcols_u32) {
         return Err(CompileError::Rejected("reduce: out_key does not match input schema"));
     }
-    let reduce_out_schema = build_reduce_output_schema(&in_reg_schema, &gcols_u32, &agg_descs, out_key);
+    // `oob_cols` bounds each group/agg column index but not the list lengths,
+    // and duplicates are legal, so the schema builder owns the column-count
+    // bound (see `build_reduce_output_schema`).
+    let reduce_out_schema = build_reduce_output_schema(&in_reg_schema, &gcols_u32, &agg_descs, out_key)
+        .ok_or(CompileError::Rejected("reduce: output exceeds MAX_COLUMNS"))?;
 
     let trace_table_ptr = ctx.add_owned_trace_table(
         &format!("_reduce_{}_{nid}", ctx.view_id),

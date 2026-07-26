@@ -293,6 +293,31 @@ fn maybe_pack_bool_bits(scratch: &mut EvalScratch, prog: &ResolvedProgram, dst: 
     }
 }
 
+/// Call `f(i)` for each row `i` of a morsel of `m` rows whose null bit is set in
+/// the register-major `null_bits` window starting at `base`. NULL rows are the
+/// exception, so every consumer — zeroing a register's null entries, EMIT's
+/// value-slot zero plus output-bitmap merge — scans the set bits rather than
+/// branching per row.
+#[inline]
+pub(in crate::expr) fn for_each_null_row(null_bits: &[u64], base: usize, m: usize, mut f: impl FnMut(usize)) {
+    let words = m.div_ceil(64);
+    for w in 0..words {
+        let mut word = null_bits[base + w];
+        // Every producer writes only rows `0..m`, so bits at index >= m are zero
+        // and the bit-scan stays in the morsel — no tail re-masking needed.
+        debug_assert!(
+            w + 1 < words || m.is_multiple_of(64) || (word >> (m % 64)) == 0,
+            "null_bits tail word has bits set beyond m={m}",
+        );
+        let lo = w * 64;
+        while word != 0 {
+            let bit = word.trailing_zeros() as usize;
+            word &= word - 1;
+            f(lo + bit);
+        }
+    }
+}
+
 /// Walk `dst`'s null mask and zero the matching register entries. Used by
 /// the string-comparison helpers, which compute results unconditionally for
 /// vectorization and then clear null rows in a post-pass.
@@ -301,17 +326,8 @@ fn zero_null_rows(scratch: &mut EvalScratch, dst: usize, m: usize) {
         return;
     }
     let base_d = dst * MORSEL;
-    let base_null = dst * NULL_WORDS_PER_REG;
-    let words = m.div_ceil(64);
-    for w in 0..words {
-        let mut null_word = scratch.null_bits[base_null + w];
-        let lo = w * 64;
-        while null_word != 0 {
-            let bit = null_word.trailing_zeros() as usize;
-            scratch.regs[base_d + lo + bit] = 0;
-            null_word &= null_word - 1;
-        }
-    }
+    let EvalScratch { regs, null_bits, .. } = scratch;
+    for_each_null_row(null_bits, dst * NULL_WORDS_PER_REG, m, |i| regs[base_d + i] = 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -573,7 +589,7 @@ pub(in crate::expr) fn eval_batch(
                     (1, true) => load_int!(i8),
                     (1, false) => load_int!(u8),
                     // Wide (16-byte) columns are rejected at compile
-                    // (`ExprValidateErr::ColTooWideForRegister` + the binder's
+                    // (`ExprValidateErr::ColKindMismatch` + the binder's
                     // `is_wide_int` gate), so no LoadColInt ever resolves to one.
                     _ => unreachable!("LoadPayloadInt: col_size {col_size} > 8; wide columns rejected at compile"),
                 }
@@ -587,7 +603,11 @@ pub(in crate::expr) fn eval_batch(
                 let col_size = crate::schema::type_size(tc) as usize;
                 let col_data = mb.col_data(pi, col_size);
                 let dst_reg = scratch.reg_mut(dst, m);
-                if col_size == 4 {
+                // Branch on the type, not the width: `validate` pins this column
+                // to F32/F64 (`ColKind::Float`), so the two arms are total. An F32
+                // widens to f64 on load — every float register holds an f64 image,
+                // which is why a computed float column is declared F64.
+                if tc == crate::schema::type_code::F32 {
                     let b = &col_data[morsel_start * 4..(morsel_start + m) * 4];
                     for (i, c) in b.chunks_exact(4).enumerate() {
                         let bits = u32::from_le_bytes(c.try_into().unwrap());
@@ -612,7 +632,7 @@ pub(in crate::expr) fn eval_batch(
                 let byte_offset = off as usize;
                 let col_size = crate::schema::type_size(tc) as usize;
                 // Wide (16-byte) PK columns are rejected at compile
-                // (`ExprValidateErr::ColTooWideForRegister` + the binder), so both
+                // (`ExprValidateErr::ColKindMismatch` + the binder), so both
                 // branches below assume `col_size <= 8` (the signed branch's 8-byte
                 // scratch would otherwise panic-slice).
                 debug_assert!(col_size <= 8, "LoadPk: wide PK column rejected at compile");
@@ -679,8 +699,9 @@ pub(in crate::expr) fn eval_batch(
             // ----------------------------------------------------------------
             // Integer set membership (col IN (…) as one opcode)
             // ----------------------------------------------------------------
-            // Binary-search each row's i64 register image in the sorted,
-            // deduplicated pool. `LoadPayloadInt` writes every row's register
+            // Binary-search each row's i64 register image in the pool `resolve`
+            // sorted (duplicates left in place — `binary_search` is correct over
+            // them). `LoadPayloadInt` writes every row's register
             // (NULL rows too, tracked in `null_bits`), so the search reads a real
             // i64 for all rows and the NULL-row result is masked by `null_copy1`
             // — exactly how `IntNeg` handles a NULL row.

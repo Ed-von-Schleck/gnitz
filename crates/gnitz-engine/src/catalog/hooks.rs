@@ -313,8 +313,7 @@ impl CatalogEngine {
 
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
                 let directory = table_dir(&self.base_dir, &schema_name, tid);
-                let tbl_schema = self
-                    .build_schema_from_col_defs(&col_defs, pk.as_slice(), dist_prefix_len)
+                let tbl_schema = build_schema_from_col_defs(&col_defs, pk.as_slice(), dist_prefix_len)?
                     .with_replicated(is_replicated);
 
                 // One kind drives the whole property bundle: durability and
@@ -468,8 +467,8 @@ impl CatalogEngine {
             // is_nullable 0→1 flip changes the descriptor; when it does, publish
             // infallibly in place (equal-region descriptor swap).
             let col_defs = self.read_column_defs(owner);
-            let rebuilt = self
-                .build_schema_from_col_defs(&col_defs, cur.pk_indices(), cur.dist_prefix_len() as usize)
+            let rebuilt = build_schema_from_col_defs(&col_defs, cur.pk_indices(), cur.dist_prefix_len() as usize)
+                .map_err(|e| format!("column ALTER on table id={owner}: {e}"))?
                 .with_replicated(cur.replicated());
             if rebuilt != cur {
                 self.dag.swap_table_schema(owner, rebuilt);
@@ -502,8 +501,7 @@ impl CatalogEngine {
                 // The over-wide rejection inside `validate_relation_defs` is
                 // genuinely reachable here: compound-PK plain projection
                 // prepends the k source PK columns, so SELECT * over a wide
-                // compound-PK table can cross MAX_COLUMNS — a clean error beats
-                // build_schema_from_col_defs' assert aborting the process.
+                // compound-PK table can cross MAX_COLUMNS.
                 let (sid, name, pk) = read_view_tab_row(batch, i);
                 let col_defs = self.read_column_defs(vid);
                 validate_relation_defs("view", vid, &name, &col_defs, &pk)?;
@@ -512,7 +510,7 @@ impl CatalogEngine {
                 let directory = view_dir(&self.base_dir, &schema_name, vid);
                 // Views are not distributed by a chosen key (§2): `0` is the
                 // full-PK default sentinel every non-CLUSTER BY caller passes.
-                let view_schema = self.build_schema_from_col_defs(&col_defs, pk.as_slice(), 0);
+                let view_schema = build_schema_from_col_defs(&col_defs, pk.as_slice(), 0)?;
 
                 // See hook_table_register: one kind drives the bundle.
                 let kind = RelationKind::View;

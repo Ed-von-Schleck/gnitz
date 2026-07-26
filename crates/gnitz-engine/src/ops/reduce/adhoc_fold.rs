@@ -33,7 +33,7 @@ use super::emit::emit_reduce_row;
 use super::plan::{build_reduce_output_schema, ReducePlan};
 use super::sort::compare_by_group_cols;
 use crate::schema::key::NarrowPkOpk;
-use crate::schema::{ReduceOutKey, SchemaDescriptor, TypeCode, MAX_COLUMNS};
+use crate::schema::{ReduceOutKey, SchemaDescriptor, TypeCode};
 use crate::storage::Batch;
 
 /// The request-scoped fold state. `pub(crate)` so `catalog::scan_spec` can drive
@@ -111,14 +111,8 @@ impl AdhocFold {
         // compiler lays every reduce output with. The echoed client schema must
         // match it physically (types + PK region; nullability is presentation)
         // or the frame is malformed.
-        if 1 + group_cols.len() + agg_descs.len() > MAX_COLUMNS {
-            return Err(format!(
-                "scan_spec fold: {} group + {} agg columns exceed the {MAX_COLUMNS}-column schema cap",
-                group_cols.len(),
-                agg_descs.len()
-            ));
-        }
-        let derived = build_reduce_output_schema(src_schema, &group_cols, &agg_descs, ReduceOutKey::SyntheticFold);
+        let derived = build_reduce_output_schema(src_schema, &group_cols, &agg_descs, ReduceOutKey::SyntheticFold)
+            .ok_or("scan_spec fold: group + agg columns exceed the schema column cap")?;
         if !reply_schema.same_physical_layout(&derived) {
             return Err("scan_spec fold: reply schema does not match the derived fold layout".to_string());
         }

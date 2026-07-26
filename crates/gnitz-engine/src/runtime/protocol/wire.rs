@@ -191,7 +191,7 @@ pub(crate) fn batch_to_schema(batch: &Batch) -> Result<(SchemaDescriptor, Vec<Ve
     if batch.count > crate::schema::MAX_COLUMNS {
         return Err("schema exceeds column limit");
     }
-    let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+    let mut cols = [SchemaColumn::EMPTY; crate::schema::MAX_COLUMNS];
     let mut names = Vec::with_capacity(batch.count);
     let mut pk_pairs: [(u8, u32); gnitz_wire::MAX_PK_COLUMNS] = [(0, 0); gnitz_wire::MAX_PK_COLUMNS];
     let mut pk_count: usize = 0;
@@ -752,7 +752,7 @@ pub(crate) fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<
     let type_data = &data[tc_off..tc_off + count * 8];
     let flags_data = &data[fl_off..fl_off + count * 8];
 
-    let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+    let mut cols = [SchemaColumn::EMPTY; crate::schema::MAX_COLUMNS];
     // Each entry pairs the PK column's logical index with its 0-indexed
     // position in the PK tuple (carried in the column's flags word).
     // Sorted by position before building the SchemaDescriptor.
@@ -765,7 +765,7 @@ pub(crate) fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<
         let fl = codec::read_u64_le(flags_data, off8);
         // Reject unknown type codes here so a crafted wire schema cannot
         // smuggle in a type_code the downstream cursors can't decode.
-        if gnitz_wire::TypeCode::try_from_u8(tc).is_none() {
+        if !gnitz_wire::is_valid_type_code(tc) {
             return Err("schema: invalid type code");
         }
         let is_nullable = (fl & META_FLAG_NULLABLE) != 0;

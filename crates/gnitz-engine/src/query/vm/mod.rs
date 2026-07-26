@@ -488,7 +488,7 @@ mod tests {
     }
 
     fn make_schema(col_types: &[u8]) -> SchemaDescriptor {
-        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+        let mut columns = [SchemaColumn::EMPTY; crate::schema::MAX_COLUMNS];
         // Column 0 is always the U128 PK
         columns[0] = SchemaColumn::new(type_code::U128, 0);
         for (i, &tc) in col_types.iter().enumerate() {
@@ -568,7 +568,7 @@ mod tests {
             }, // r2 = r0 > r1
         ];
         let pred_prog = crate::expr::LogicalProgram::new(pred_instrs, 3, 2, vec![]);
-        let func = Box::new(crate::expr::ScalarFunc::from_predicate(pred_prog, &schema));
+        let func = Box::new(crate::expr::ScalarFunc::from_predicate(pred_prog, &schema).unwrap());
         let func_ptr = Box::into_raw(func) as *const ScalarFunc;
 
         let mut builder = ProgramBuilder::new();
@@ -784,11 +784,10 @@ mod tests {
         let out_schema = make_schema(&[type_code::I64]);
 
         // MAP with ScalarFunc projection: reorder/select columns.
-        let func = Box::new(crate::expr::ScalarFunc::from_map(
-            crate::expr::LogicalProgram::copy_cols(&[2]),
-            &in_schema,
-            &out_schema,
-        ));
+        let func = Box::new(
+            crate::expr::ScalarFunc::from_map(crate::expr::LogicalProgram::copy_cols(&[2]), &in_schema, &out_schema)
+                .unwrap(),
+        );
         let func_ptr = Box::into_raw(func) as *const ScalarFunc;
 
         let mut builder = ProgramBuilder::new();
@@ -1348,7 +1347,7 @@ mod tests {
             },
         ];
         let pred_prog = crate::expr::LogicalProgram::new(pred_instrs, 3, 2, vec![]);
-        let func = Box::new(crate::expr::ScalarFunc::from_predicate(pred_prog, &schema));
+        let func = Box::new(crate::expr::ScalarFunc::from_predicate(pred_prog, &schema).unwrap());
         let func_ptr = Box::into_raw(func) as *const ScalarFunc;
 
         let mut builder = ProgramBuilder::new();
@@ -1407,7 +1406,7 @@ mod tests {
         ];
         let prog = LogicalProgram::new(instrs, 3, 2, vec![]);
 
-        let func = Box::new(crate::expr::ScalarFunc::from_predicate(prog, &schema));
+        let func = Box::new(crate::expr::ScalarFunc::from_predicate(prog, &schema).unwrap());
         let func_ptr = Box::into_raw(func) as *const ScalarFunc;
 
         let mut builder = ProgramBuilder::new();

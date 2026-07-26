@@ -423,22 +423,15 @@ struct HavingEval<'a> {
 }
 
 impl HavingEval<'_> {
-    /// Whether `e` statically evaluates to a float: a float literal, a
-    /// float-typed column, arithmetic over either, or its negation.
-    /// Comparisons and logic are integer-valued. Exact — `Val::Float` arises
-    /// at runtime from precisely these shapes — so the plan-time float-modulo
-    /// rejection in `binop` covers every runtime occurrence.
+    /// Whether `e` statically evaluates to a float. The static type is exactly
+    /// what [`BExpr::infer_type_with`] reports — a float literal, a float-typed
+    /// column, arithmetic over either (`unify_numeric`), or a negation of one;
+    /// comparisons and logic are integer-valued there too. Exact — `Val::Float`
+    /// arises at runtime from precisely those shapes — so the plan-time
+    /// float-modulo rejection in `binop` covers every runtime occurrence.
     fn is_float_expr(&self, e: &BoundExpr) -> bool {
-        match e {
-            BoundExpr::ColRef(c) => self.types.get(*c).is_some_and(|tc| tc.is_float()),
-            BoundExpr::LitFloat(_) => true,
-            BoundExpr::BinOp(l, op, r) => {
-                matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod)
-                    && (self.is_float_expr(l) || self.is_float_expr(r))
-            }
-            BoundExpr::UnaryOp(UnaryOp::Neg, inner) => self.is_float_expr(inner),
-            _ => false,
-        }
+        e.infer_type_with(&|c: &usize| self.types.get(*c).copied().unwrap_or(TypeCode::I64))
+            .is_float()
     }
 }
 

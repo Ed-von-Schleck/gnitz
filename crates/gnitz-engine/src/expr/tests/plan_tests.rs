@@ -1,10 +1,10 @@
 use super::super::plan::{PkFill, ScalarFunc};
-use super::super::program::LogicalProgram;
+use super::super::program::{ExprValidateErr, LogicalProgram};
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 use crate::storage::Batch;
 
 fn make_schema(pk_index: u32, col_types: &[u8]) -> SchemaDescriptor {
-    let mut columns = [SchemaColumn::new(0, 0); MAX_COLUMNS];
+    let mut columns = [SchemaColumn::EMPTY; MAX_COLUMNS];
     for (i, &tc) in col_types.iter().enumerate() {
         let nullable = if i == pk_index as usize { 0 } else { 1 };
         columns[i] = SchemaColumn::new(tc, nullable);
@@ -35,7 +35,7 @@ fn test_projection_batch() {
     let batch = make_int_batch(&in_schema, &[(1, 1, 0, &[10, 20]), (2, 1, 0, &[30, 40])]);
 
     let prog = LogicalProgram::copy_cols(&[2, 1]);
-    let func = ScalarFunc::from_map(prog, &in_schema, &out_schema);
+    let func = ScalarFunc::from_map(prog, &in_schema, &out_schema).unwrap();
     let result = func.evaluate_map_batch(&batch, PkFill::Copy);
     assert_eq!(result.count, 2);
 
@@ -62,7 +62,7 @@ fn test_map_copy_and_emit() {
     ];
     let prog = crate::expr::LogicalProgram::new(instrs, 3, 2, vec![]);
 
-    let func = ScalarFunc::from_map(prog, &in_schema, &out_schema);
+    let func = ScalarFunc::from_map(prog, &in_schema, &out_schema).unwrap();
     let result = func.evaluate_map_batch(&batch, PkFill::Copy);
     assert_eq!(result.count, 1);
 
@@ -77,7 +77,7 @@ fn test_empty_batch() {
     let schema = make_schema(0, &[8, 9]);
     let batch = Batch::empty_with_schema(&schema);
 
-    let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema);
+    let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema).unwrap();
     let result = func.evaluate_map_batch(&batch, PkFill::Copy);
     assert_eq!(result.count, 0);
 }
@@ -114,7 +114,7 @@ fn test_map_blob_passthrough_and_fallback() {
         let batch = build(&in_schema);
         let out_schema = make_schema(0, &[type_code::U64, type_code::STRING, type_code::STRING]);
         let prog = LogicalProgram::copy_cols(&[2, 1]);
-        let func = ScalarFunc::from_map(prog, &in_schema, &out_schema);
+        let func = ScalarFunc::from_map(prog, &in_schema, &out_schema).unwrap();
         let out = func.evaluate_map_batch(&batch, PkFill::Copy);
         assert_eq!(out.count, 2);
         assert_eq!(
@@ -136,7 +136,7 @@ fn test_map_blob_passthrough_and_fallback() {
         let batch = build(&in_schema);
         let out_schema = make_schema(0, &[type_code::U64, type_code::STRING]);
         let prog = LogicalProgram::copy_cols(&[1]);
-        let func = ScalarFunc::from_map(prog, &in_schema, &out_schema);
+        let func = ScalarFunc::from_map(prog, &in_schema, &out_schema).unwrap();
         let out = func.evaluate_map_batch(&batch, PkFill::Copy);
         assert_eq!(out.count, 2);
         assert_eq!(crate::test_support::read_german_string(&out, 0, 0), b"ab");
@@ -193,7 +193,9 @@ fn test_map_pk_copy_col_u128_and_signed_i64() {
         1, // PK col 1 (I64) → payload 1
         2, // payload col 2 (I64) → payload 2
     ]);
-    let out = ScalarFunc::from_map(prog, &in_schema, &out_schema).evaluate_map_batch(&batch, PkFill::Copy);
+    let out = ScalarFunc::from_map(prog, &in_schema, &out_schema)
+        .unwrap()
+        .evaluate_map_batch(&batch, PkFill::Copy);
 
     assert_eq!(out.count, 1);
     assert_eq!(out.pk_data(), batch.pk_data(), "PK region copied verbatim");
@@ -256,7 +258,9 @@ fn test_map_copy_col_widens_into_promoted_slot() {
         2, // I8 payload → sign-extend
         3, // U8 payload → zero-extend
     ]);
-    let out = ScalarFunc::from_map(prog, &in_schema, &out_schema).evaluate_map_batch(&batch, PkFill::Copy);
+    let out = ScalarFunc::from_map(prog, &in_schema, &out_schema)
+        .unwrap()
+        .evaluate_map_batch(&batch, PkFill::Copy);
 
     assert_eq!(out.count, 1);
     let widened = |pi: usize| i64::from_le_bytes(out.col_data(pi)[..8].try_into().unwrap());
@@ -264,4 +268,21 @@ fn test_map_copy_col_widens_into_promoted_slot() {
     assert_eq!(widened(1), c1 as i64, "I16 PK sign-extends");
     assert_eq!(widened(2), c2 as i64, "I8 payload sign-extends");
     assert_eq!(widened(3), c3 as i64, "U8 payload zero-extends");
+}
+
+/// An empty wire program decodes to `num_regs = 0, result_reg = 0` — framing
+/// accepts it, and `validate` cannot reject it outright because that is exactly
+/// the shape every `copy_cols` map has. As a *filter* it has no result to read,
+/// so `from_predicate` rejects it rather than letting it masquerade as a filter
+/// that passes nothing (which a client would read as an empty table).
+#[test]
+fn test_register_free_predicate_is_rejected() {
+    let schema = make_schema(0, &[8, 9]);
+    let prog = LogicalProgram::from_wire(&[], 0, 0, vec![]).unwrap();
+    assert_eq!(
+        ScalarFunc::from_predicate(prog, &schema).err(),
+        Some(ExprValidateErr::PredicateWithoutResultReg)
+    );
+    // The same shape is legitimate as a map: `copy_cols` builds it.
+    assert!(ScalarFunc::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema).is_ok());
 }

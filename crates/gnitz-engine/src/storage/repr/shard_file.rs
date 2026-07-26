@@ -628,7 +628,7 @@ mod tests {
     use crate::storage::lsm::shard_reader::MappedShard;
 
     fn make_schema_desc(num_cols: u32, pk_index: u32) -> SchemaDescriptor {
-        let mut cols = [SchemaColumn::new(0, 0); MAX_COLUMNS];
+        let mut cols = [SchemaColumn::EMPTY; MAX_COLUMNS];
         cols[0] = SchemaColumn::new(8, 0);
         if num_cols > 1 {
             cols[1] = SchemaColumn::new(9, 0);

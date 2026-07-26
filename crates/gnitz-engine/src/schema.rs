@@ -33,7 +33,7 @@ pub(crate) mod key;
 /// `SCHEMAS` statics — homed here (L1) so they can never drift. `const`: zero
 /// runtime allocation.
 pub(crate) const fn from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_indices: &[u32]) -> SchemaDescriptor {
-    let mut buf = [SchemaColumn::new(0, 0); MAX_COLUMNS];
+    let mut buf = [SchemaColumn::EMPTY; MAX_COLUMNS];
     let mut i = 0;
     while i < cols.len() {
         buf[i] = SchemaColumn::new(cols[i].type_code as u8, if cols[i].nullable { 1 } else { 0 });
@@ -43,23 +43,63 @@ pub(crate) const fn from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_indices: 
     SchemaDescriptor::new(head, pk_indices)
 }
 
-/// Copy `schema`'s PK columns to `cols[..pk_count]` and populate `pk_idx`
-/// with `[0, 1, ..., pk_count - 1]`. Returns `pk_count`. PK columns always
-/// occupy the leading positions of the output schema, so the new PK
-/// indices are dense and identical to the loop counter. The shared prologue
-/// of every derived-schema builder (join/map/reduce/null-extend outputs).
-pub(crate) fn copy_pk_columns_into(
-    schema: &SchemaDescriptor,
-    cols: &mut [SchemaColumn],
-    pk_idx: &mut [u32; MAX_PK_COLUMNS],
-) -> usize {
-    let mut k = 0;
-    for (_, _, c) in schema.pk_columns() {
-        cols[k] = *c;
-        pk_idx[k] = k as u32;
-        k += 1;
+/// Accumulator for a derived schema whose PK is its leading `pk_len` columns —
+/// the shape of every schema the compiler and the reduce planner build
+/// (join / map / reindex / hash-row / null-extend / reduce outputs). PK columns
+/// always occupy the leading positions, so the PK index list is dense
+/// (`0..pk_len`) and `finish` re-derives it rather than tracking it.
+///
+/// Every push is bounded and returns `None` on overflow, so the fixed-array
+/// bound lives with the array instead of being re-derived — differently, and
+/// PK-inclusively — at each caller. Node/column lists are client-supplied
+/// catalog data, so an overflowing one must fail the compile, not abort.
+pub(crate) struct DerivedSchema {
+    cols: [SchemaColumn; MAX_COLUMNS],
+    n: usize,
+    pk_len: usize,
+}
+
+impl DerivedSchema {
+    pub(crate) fn new() -> Self {
+        DerivedSchema {
+            cols: [SchemaColumn::EMPTY; MAX_COLUMNS],
+            n: 0,
+            pk_len: 0,
+        }
     }
-    k
+
+    /// Append one payload column.
+    pub(crate) fn push(&mut self, col: SchemaColumn) -> Option<()> {
+        *self.cols.get_mut(self.n)? = col;
+        self.n += 1;
+        Some(())
+    }
+
+    /// Append one PK column. Must precede every [`Self::push`]: the PK occupies
+    /// the leading slots.
+    pub(crate) fn push_pk(&mut self, col: SchemaColumn) -> Option<()> {
+        debug_assert_eq!(self.pk_len, self.n, "PK columns must precede payload columns");
+        if self.pk_len == MAX_PK_COLUMNS {
+            return None;
+        }
+        self.push(col)?;
+        self.pk_len += 1;
+        Some(())
+    }
+
+    /// Append `schema`'s PK columns in PK-list order — the shared prologue of
+    /// every builder that inherits its input's key.
+    pub(crate) fn push_pk_of(&mut self, schema: &SchemaDescriptor) -> Option<()> {
+        for (_, _, c) in schema.pk_columns() {
+            self.push_pk(*c)?;
+        }
+        Some(())
+    }
+
+    pub(crate) fn finish(&self) -> SchemaDescriptor {
+        let pk_idx: [u32; MAX_PK_COLUMNS] = std::array::from_fn(|i| i as u32);
+        SchemaDescriptor::new(&self.cols[..self.n], &pk_idx[..self.pk_len])
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -76,7 +116,38 @@ pub struct SchemaColumn {
 }
 
 impl SchemaColumn {
+    /// The unused-slot filler for the fixed `[SchemaColumn; MAX_COLUMNS]` arrays
+    /// every schema and schema builder carries. Distinct from [`Self::new`] so
+    /// that padding — the one legitimate use of the undecodable type code `0` —
+    /// cannot be confused with a real column, and `new` can hold every column it
+    /// builds to a decodable code.
+    pub const EMPTY: SchemaColumn = SchemaColumn {
+        type_code: 0,
+        size: type_size(0),
+        nullable: 0,
+        is_signed: 0,
+    };
+
+    /// A real column of type `type_code`, which must decode (see
+    /// [`gnitz_wire::is_valid_type_code`] for why an unknown one is not inert).
+    /// Client-supplied codes are screened at their decode boundary; the assert is
+    /// the tripwire for a path that forgets to. Debug-only — the release engine
+    /// must still *survive* a corrupt code, which is what the expression
+    /// validator's `check_col` and the catalog's `check_col_defs` are for.
     pub const fn new(type_code: u8, nullable: u8) -> Self {
+        debug_assert!(gnitz_wire::is_valid_type_code(type_code), "invalid column type code");
+        Self::raw(type_code, nullable)
+    }
+
+    /// [`Self::new`] without the decodable-code assert — the corrupt-catalog
+    /// fixture. Only the tests that pin what the validators do with an
+    /// undecodable code (which a release build genuinely can carry) build one.
+    #[cfg(test)]
+    pub(crate) const fn corrupt(type_code: u8, nullable: u8) -> Self {
+        Self::raw(type_code, nullable)
+    }
+
+    const fn raw(type_code: u8, nullable: u8) -> Self {
         let is_signed = is_signed_int(type_code) as u8;
         SchemaColumn {
             type_code,
@@ -288,7 +359,7 @@ impl SchemaDescriptor {
             dist_prefix_len
         };
 
-        let mut columns = [SchemaColumn::new(0, 0); MAX_COLUMNS];
+        let mut columns = [SchemaColumn::EMPTY; MAX_COLUMNS];
         let mut i = 0;
         while i < cols.len() {
             columns[i] = cols[i];
@@ -728,7 +799,7 @@ impl IndexKeySpec {
             size: 0,
             type_code: 0,
         }; gnitz_wire::PK_LIST_MAX_COLS];
-        let mut idx_cols = [SchemaColumn::new(0, 0); gnitz_wire::PK_LIST_MAX_COLS];
+        let mut idx_cols = [SchemaColumn::EMPTY; gnitz_wire::PK_LIST_MAX_COLS];
         for (i, &c) in cols.iter().enumerate() {
             locators[i] = owner.locate(c as usize);
             idx_cols[i] = idx_schema.columns[i];
@@ -1523,7 +1594,7 @@ mod tests {
         assert_eq!(s.columns[1].type_code, type_code::I64);
         assert_eq!(s.columns[2].type_code, type_code::STRING);
 
-        // Trailing slot fill: SchemaColumn::new(0, 0) resolves via wire_stride(0)
+        // Trailing slot fill: SchemaColumn::EMPTY resolves via wire_stride(0)
         // → 8 (default arm). Locked in so future regressions in the trailing
         // representation are caught.
         assert_eq!(s.columns[3].type_code, 0);

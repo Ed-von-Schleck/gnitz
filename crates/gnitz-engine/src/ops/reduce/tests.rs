@@ -358,7 +358,7 @@ fn linear_sum_only_new_all_null_group_present() {
         LogicalInstr::Emit { src: 4, out: 1 },       // emit r4 → fin payload 1 (sum)
     ];
     let fin_func =
-        crate::expr::ScalarFunc::from_map(LogicalProgram::new(instrs, 5, 0, vec![]), &out_schema, &fin_schema);
+        crate::expr::ScalarFunc::from_map(LogicalProgram::new(instrs, 5, 0, vec![]), &out_schema, &fin_schema).unwrap();
 
     let aggs = [
         AggDescriptor {
@@ -561,7 +561,7 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
         LogicalInstr::Emit { src: 4, out: 2 },        // emit r4 → fin payload 2 (sum)
     ];
     let fin_func =
-        crate::expr::ScalarFunc::from_map(LogicalProgram::new(instrs, 5, 0, vec![]), &out_schema, &fin_schema);
+        crate::expr::ScalarFunc::from_map(LogicalProgram::new(instrs, 5, 0, vec![]), &out_schema, &fin_schema).unwrap();
 
     let aggs = [
         AggDescriptor {
@@ -8506,7 +8506,7 @@ fn test_build_reduce_output_schema_natural_pk() {
         agg_op: AggOp::Sum,
         col_type_code: TypeCode::I64,
     }];
-    let out = build_reduce_output_schema(&input, &[1], &aggs, gnitz_wire::ReduceOutKey::SingleNaturalCol);
+    let out = build_reduce_output_schema(&input, &[1], &aggs, gnitz_wire::ReduceOutKey::SingleNaturalCol).unwrap();
     // Natural PK (single U64 group col) → [U64_PK, I64_agg]
     assert_eq!(out.num_columns(), 2);
     assert_eq!(out.columns[0].type_code, type_code::U64);
@@ -8530,7 +8530,7 @@ fn test_build_reduce_output_schema_compound_natural_pk() {
         col_type_code: TypeCode::I64,
     }];
     // group_cols = [1, 0] — permuted; the set still equals pk_indices.
-    let out = build_reduce_output_schema(&input, &[1, 0], &aggs, gnitz_wire::ReduceOutKey::PkPermutation);
+    let out = build_reduce_output_schema(&input, &[1, 0], &aggs, gnitz_wire::ReduceOutKey::PkPermutation).unwrap();
     // 2 PK cols + 1 agg col; pk_indices in source's pk-list order [0, 1].
     assert_eq!(out.num_columns(), 3);
     assert_eq!(out.pk_indices(), &[0, 1]);
@@ -8555,7 +8555,7 @@ fn test_build_reduce_output_schema_single_pk_group_by_pk() {
         agg_op: AggOp::Sum,
         col_type_code: TypeCode::I64,
     }];
-    let out = build_reduce_output_schema(&input, &[0], &aggs, gnitz_wire::ReduceOutKey::PkPermutation);
+    let out = build_reduce_output_schema(&input, &[0], &aggs, gnitz_wire::ReduceOutKey::PkPermutation).unwrap();
     assert_eq!(out.num_columns(), 2);
     assert_eq!(out.pk_indices(), &[0]);
     assert_eq!(out.columns[0].type_code, type_code::U64);
@@ -8577,7 +8577,7 @@ fn test_build_reduce_output_schema_synthetic_pk() {
         agg_op: AggOp::Count,
         col_type_code: TypeCode::I64,
     }];
-    let out = build_reduce_output_schema(&input, &[1], &aggs, gnitz_wire::ReduceOutKey::SyntheticFold);
+    let out = build_reduce_output_schema(&input, &[1], &aggs, gnitz_wire::ReduceOutKey::SyntheticFold).unwrap();
     // Synthetic PK (STRING group col) → [U128_hash, STRING_group, I64_count]
     assert_eq!(out.num_columns(), 3);
     assert_eq!(out.columns[0].type_code, type_code::U128);
@@ -8615,7 +8615,7 @@ fn build_reduce_output_schema_agg_nullability_matrix() {
             }];
             for group_cols in [&[1u32][..], &[][..]] {
                 let out_key = input.reduce_out_key(group_cols);
-                let out = build_reduce_output_schema(&input, group_cols, &aggs, out_key);
+                let out = build_reduce_output_schema(&input, group_cols, &aggs, out_key).unwrap();
                 // Aggregates are the trailing output columns.
                 let got = out.columns[out.num_columns() - 1].nullable != 0;
                 let want = match agg_op {

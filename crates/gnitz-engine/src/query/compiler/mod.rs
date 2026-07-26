@@ -7,7 +7,7 @@ use crate::expr::{ExprValidateErr, LogicalProgram, ScalarFunc};
 use crate::foundation::worker_ctx::{num_workers, worker_rank};
 use crate::ops::{build_reduce_output_schema, AggDescriptor, AggOp};
 use crate::query::vm::{Instr, ProgramBuilder, RegisterMeta, VmHandle};
-use crate::schema::{copy_pk_columns_into, is_fixed_int, type_code, SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{is_fixed_int, type_code, DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{ReadCursor, RecoverySource, Table};
 
 mod emit;
@@ -679,7 +679,7 @@ mod tests {
             ],
             &[1, 2],
         );
-        let out = build_map_output_schema(&input, &[0, 3]);
+        let out = build_map_output_schema(&input, &[0, 3]).unwrap();
         // Two PK columns + two non-PK projected columns = 4 total.
         assert_eq!(out.num_columns(), 4);
         assert_eq!(out.pk_indices(), &[0, 1]);
@@ -692,8 +692,13 @@ mod tests {
             ],
             &[0],
         );
-        let out_single = build_map_output_schema(&input_single, &[1]);
+        let out_single = build_map_output_schema(&input_single, &[1]).unwrap();
         assert_eq!(out_single.pk_indices(), &[0]);
+
+        // The bound is PK-inclusive: a payload count that alone fits still
+        // overflows once the PK columns are prepended.
+        let wide: Vec<i32> = vec![1; crate::schema::MAX_COLUMNS];
+        assert_eq!(build_map_output_schema(&input_single, &wide), None);
     }
 
     #[test]
@@ -1109,7 +1114,7 @@ mod tests {
                 &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(key_tc, 0)],
                 &[0],
             );
-            let node_schema = reindex_output_schema(&in_schema, &[1u16], &[], &[0, 1]);
+            let node_schema = reindex_output_schema(&in_schema, &[1u16], &[], &[0, 1]).unwrap();
             assert_eq!(node_schema.columns[0].type_code, want_tc, "key {key_tc} → PK type");
             assert_eq!(node_schema.pk_stride(), want_stride, "key {key_tc} → pk_stride");
         }
@@ -1129,7 +1134,7 @@ mod tests {
             ],
             &[0],
         );
-        let out = reindex_output_schema(&in_schema, &[1u16, 2u16], &[], &[0, 1, 2]);
+        let out = reindex_output_schema(&in_schema, &[1u16, 2u16], &[], &[0, 1, 2]).unwrap();
         assert_eq!(out.pk_indices(), &[0, 1], "2-slot compound PK");
         assert_eq!(out.columns[0].type_code, type_code::I32, "slot0 keeps I32 native width");
         assert_eq!(out.columns[1].type_code, type_code::U128, "slot1 U128");
@@ -1156,7 +1161,7 @@ mod tests {
             ],
             &[0],
         );
-        let out = reindex_output_schema(&in_schema, &[1u16, 2u16], &[type_code::I64, 0], &[0, 1, 2]);
+        let out = reindex_output_schema(&in_schema, &[1u16, 2u16], &[type_code::I64, 0], &[0, 1, 2]).unwrap();
         assert_eq!(out.columns[0].type_code, type_code::I64, "slot0 carried T = I64");
         assert_eq!(out.columns[1].type_code, type_code::I64, "slot1 self-derives I64");
         assert_eq!(out.pk_stride(), 8 + 8, "both slots 8 bytes after promotion");
@@ -1176,7 +1181,7 @@ mod tests {
             ],
             &[0],
         );
-        let out = reindex_output_schema(&in_schema, &[1u16], &[], &[0u16, 3u16]);
+        let out = reindex_output_schema(&in_schema, &[1u16], &[], &[0u16, 3u16]).unwrap();
         assert_eq!(out.pk_indices(), &[0], "single synthetic PK slot");
         assert_eq!(out.columns[0].type_code, type_code::I32, "PK slot = reindex col1 (I32)");
         // Only the two kept payload columns follow — not all four input columns.
@@ -1218,7 +1223,7 @@ mod tests {
         );
         // The sink validates against the reindex Map's output schema (2 synthetic
         // PK slots [U64, I64] + the two input columns).
-        loaded.out_schema = reindex_output_schema(&in_schema, &[0u16, 1u16], &[], &[0, 1]);
+        loaded.out_schema = reindex_output_schema(&in_schema, &[0u16, 1u16], &[], &[0, 1]).unwrap();
         let ext: ExtTables = HashMap::from([(99, in_schema)]);
         let ordered = loaded.ordered.clone();
         let result = build_plan(&loaded, &no_skips(), &ordered, &ext, "", 99, None, &[]);
@@ -1293,7 +1298,7 @@ mod tests {
             ],
             &[0],
         );
-        loaded.out_schema = reindex_output_schema(&in_schema, &[0u16], &[], &[2]);
+        loaded.out_schema = reindex_output_schema(&in_schema, &[0u16], &[], &[2]).unwrap();
         let ext: ExtTables = HashMap::from([(99, in_schema)]);
         let ordered = loaded.ordered.clone();
         let result = build_plan(&loaded, &no_skips(), &ordered, &ext, "", 99, None, &[]);
@@ -1565,7 +1570,7 @@ mod tests {
         use crate::schema::MAX_COLUMNS;
         let half = MAX_COLUMNS / 2 + 2;
         let make = |n: usize| {
-            let mut cols = [SchemaColumn::new(0, 0); MAX_COLUMNS];
+            let mut cols = [SchemaColumn::EMPTY; MAX_COLUMNS];
             cols[0] = SchemaColumn::new(type_code::U128, 0);
             for col in cols.iter_mut().take(n).skip(1) {
                 *col = SchemaColumn::new(type_code::I64, 0);
@@ -1672,6 +1677,55 @@ mod tests {
         let proj = |cols: Vec<u16>| OpNode::Map(MapKind::Projection(cols));
         assert!(compiles_mid_node(two_col_schema(), proj(vec![1]), "proj_ok"));
         assert!(!compiles_mid_node(two_col_schema(), proj(vec![200]), "proj_oob"));
+        // A PK source: `build_map_output_schema` drops it while `copy_cols`
+        // numbers destinations densely, so the copy addresses a slot that does
+        // not exist — `from_map` would index past the fixed `[_; 65]`.
+        assert!(!compiles_mid_node(two_col_schema(), proj(vec![0]), "proj_pk"));
+        // `oob_cols` bounds each index but not the list length, and duplicates
+        // are legal, so a long list overruns `build_map_output_schema`'s array.
+        // Exactly MAX_COLUMNS payload sources already overflow — the schema also
+        // carries the input's PK column, which a length-only bound misses.
+        assert!(!compiles_mid_node(
+            two_col_schema(),
+            proj(vec![1; crate::schema::MAX_COLUMNS]),
+            "proj_len",
+        ));
+    }
+
+    /// The two derived map out-schemas are by construction ones `ScalarFunc`
+    /// accepts. `HashRow` is the only site that emits a *promoting* `CopyCol`,
+    /// so it is what makes `check_copy_types`' widening clause do work; the
+    /// reindex case pins that `payload_copy_srcs` and `reindex_output_schema`
+    /// cannot drift apart into a mixed-type copy.
+    #[test]
+    fn test_derived_map_schemas_satisfy_copy_types() {
+        use crate::expr::{LogicalProgram, ScalarFunc};
+        use optimize::{hashrow_output_schema, reindex_output_schema};
+        let in_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::STRING, 1),
+                SchemaColumn::new(type_code::F32, 1),
+                SchemaColumn::new(type_code::U128, 1),
+                SchemaColumn::new(type_code::U32, 1),
+            ],
+            &[0],
+        );
+        // Every source column copied into a dense destination slot, the shape
+        // `create_universal_projection` builds.
+        let cols: Vec<u16> = vec![0, 1, 2, 3, 4];
+        let prog = || LogicalProgram::copy_cols(&[0, 1, 2, 3, 4]);
+        let payload_cols: Vec<u16> = prog().payload_copy_srcs().unwrap().iter().map(|&c| c as u16).collect();
+        let reindexed = reindex_output_schema(&in_schema, &[4], &[type_code::U64], &payload_cols).unwrap();
+        assert!(ScalarFunc::from_map(prog(), &in_schema, &reindexed).is_ok());
+
+        // A cross-width set-op coercion: the U32 column promoted to I64, every
+        // other column carried verbatim (target 0). The promotion is one
+        // `reindex_promotion_invalid` admits, so a real HashRow can build it.
+        let tcs = vec![0, 0, 0, 0, type_code::I64];
+        assert!(!optimize::reindex_promotion_invalid(&cols, &tcs, &in_schema, true));
+        let hashed = hashrow_output_schema(&in_schema, &cols, &tcs).unwrap();
+        assert!(ScalarFunc::from_map(prog(), &in_schema, &hashed).is_ok());
     }
 
     #[test]
@@ -1693,10 +1747,12 @@ mod tests {
             },
             "nx_len",
         ));
+        // (An undecodable type code is rejected at the wire decode boundary,
+        // where the two sibling type-code lists are also validated.)
         // A near-max-width input plus a short extension overflows the *merged*
         // output width (guard 5, which guard 4 alone cannot catch): 64 + 2 > 65.
         let wide = {
-            let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+            let mut cols = [SchemaColumn::EMPTY; crate::schema::MAX_COLUMNS];
             cols[0] = SchemaColumn::new(type_code::U64, 0);
             for c in cols.iter_mut().take(64).skip(1) {
                 *c = SchemaColumn::new(type_code::I64, 0);

@@ -7,8 +7,8 @@
 
 use std::cell::RefCell;
 
-use super::batch::{eval_batch, EvalScratch, MORSEL, NULL_WORDS_PER_REG};
-use super::program::{Instr, LogicalProgram, ResolvedProgram};
+use super::batch::{eval_batch, for_each_null_row, EvalScratch, MORSEL, NULL_WORDS_PER_REG};
+use super::program::{ExprValidateErr, Instr, LogicalProgram, ResolvedProgram};
 use crate::schema::{ColumnLocator, SchemaDescriptor};
 use crate::storage::{Batch, MemBatch};
 
@@ -253,12 +253,12 @@ struct ColMove {
     stride: u8,
 }
 
-/// One EMIT target: computed register `reg` → output payload column `payload`
-/// at write width `stride` (from the output schema).
+/// One EMIT target: computed register `reg` → output payload column `payload`.
+/// No width: `validate`'s `check_emit_slot` holds every EMIT destination to an
+/// 8-byte slot, so the store is monomorphic.
 struct EmitCol {
     payload: usize,
     reg: usize,
-    stride: u8,
 }
 
 struct InterpretedCompute {
@@ -296,20 +296,47 @@ enum Repr {
     },
 }
 
+/// Read register `r`'s value after an m=1 `eval_batch`. On the nullable arm a
+/// bit_only register is never unpacked into `regs`, so its truth value lives at
+/// bit 0 of `bool_bits` instead — the one reader both `evaluate_predicate` and
+/// the expression tests go through.
+#[cfg(test)]
+#[inline]
+pub(in crate::expr) fn read_reg_row0(prog: &ResolvedProgram, scratch: &EvalScratch, r: usize) -> i64 {
+    if !prog.no_nulls && prog.is_bit_only(r) {
+        i64::from((scratch.bool_bits[r * NULL_WORDS_PER_REG] & 1) != 0)
+    } else {
+        scratch.regs[r * MORSEL]
+    }
+}
+
 impl ScalarFunc {
-    /// Filter via interpreted expression.
-    pub fn from_predicate(logical: LogicalProgram, schema: &SchemaDescriptor) -> Self {
-        ScalarFunc(Repr::Predicate {
+    /// Filter via interpreted expression. Validating here rather than at each
+    /// call site makes "this program was checked against the schema it runs
+    /// against" an invariant of the type: the arguments `validate` needs are
+    /// exactly this function's, so no construction path can skip it.
+    pub fn from_predicate(logical: LogicalProgram, schema: &SchemaDescriptor) -> Result<Self, ExprValidateErr> {
+        logical.validate_predicate(schema)?;
+        Ok(ScalarFunc(Repr::Predicate {
             prog: logical.resolve(schema, /* is_filter = */ true),
             scratch: RefCell::new(EvalScratch::default()),
-        })
+        }))
     }
 
     /// Map plan from a logical expression program. A pure projection is the
     /// special case where every instruction is a `CopyCol` (see
     /// [`LogicalProgram::copy_cols`]): `compute` is `None` and the plan reduces to
     /// `col_moves` + `null_perm`.
-    pub fn from_map(logical: LogicalProgram, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> Self {
+    /// Validated against both schemas here — see [`Self::from_predicate`]. The
+    /// EMIT store below reads a fixed 8-byte output slot, which is `validate`'s
+    /// `check_emit_slot` rule; running it inside the constructor makes that a
+    /// precondition of the type rather than a convention among callers.
+    pub fn from_map(
+        logical: LogicalProgram,
+        in_schema: &SchemaDescriptor,
+        out_schema: &SchemaDescriptor,
+    ) -> Result<Self, ExprValidateErr> {
+        logical.validate(Some(in_schema), Some(out_schema))?;
         let prog = logical.resolve(in_schema, /* is_filter = */ false);
         // One pass over the resolved instructions — `CopyCol`'s locator carries
         // the PK-vs-payload distinction, so there is no negative-sentinel decode
@@ -327,7 +354,6 @@ impl ScalarFunc {
                 Instr::Emit { src, out } => emits.push(EmitCol {
                     payload: out as usize,
                     reg: src as usize,
-                    stride: out_stride(out as usize),
                 }),
                 _ => {}
             }
@@ -343,14 +369,14 @@ impl ScalarFunc {
 
         let blob_passthrough = compute_blob_passthrough(in_schema, &col_moves);
 
-        ScalarFunc(Repr::Map {
+        Ok(ScalarFunc(Repr::Map {
             col_moves,
             null_perm,
             compute,
             blob_passthrough,
             out_schema: Box::new(*out_schema),
             scratch: RefCell::new(EvalScratch::default()),
-        })
+        }))
     }
 
     /// The map's owned output schema. Callers that construct or stamp the
@@ -364,9 +390,7 @@ impl ScalarFunc {
     }
 
     /// Evaluate predicate for a single row. Thin wrapper over `eval_batch` at
-    /// m=1: the value lives at `regs[r * MORSEL]` (or, when `result_reg` is
-    /// bit_only and nullable, at bit 0 of `bool_bits[r * NULL_WORDS_PER_REG]`,
-    /// since the unpack to `regs` is skipped in that case).
+    /// m=1, reading the result through [`read_reg_row0`].
     #[cfg(test)]
     pub(crate) fn evaluate_predicate(&self, batch: &MemBatch, row: usize) -> bool {
         let Repr::Predicate { prog, scratch } = &self.0 else {
@@ -376,19 +400,9 @@ impl ScalarFunc {
         let mut scratch = scratch.borrow_mut();
         scratch.ensure_capacity(prog.num_regs as usize, no_nulls, 1);
         eval_batch(prog, batch, row, 1, &mut scratch);
-        if prog.num_regs == 0 {
-            return false;
-        }
         let r = prog.result_reg as usize;
         let is_null = !no_nulls && (scratch.null_bits[r * NULL_WORDS_PER_REG] & 1) != 0;
-        if is_null {
-            return false;
-        }
-        if !no_nulls && prog.is_bit_only(r) {
-            (scratch.bool_bits[r * NULL_WORDS_PER_REG] & 1) != 0
-        } else {
-            scratch.regs[r * MORSEL] != 0
-        }
+        !is_null && read_reg_row0(prog, &scratch, r) != 0
     }
 
     /// Run the filter over all `n` rows of `mb`, invoking `append_range` for
@@ -400,6 +414,8 @@ impl ScalarFunc {
         };
         let no_nulls = prog.no_nulls;
         let num_regs = prog.num_regs as usize;
+        // `from_predicate` rejects a register-free program, so a predicate's
+        // `result_reg` always names an allocated register.
         let result_reg = prog.result_reg as usize;
 
         let mut scratch = scratch.borrow_mut();
@@ -407,28 +423,30 @@ impl ScalarFunc {
 
         let words = n.div_ceil(64);
 
-        // `no_nulls` mode allocates no `bool_bits` (capacity 0), so its arm
-        // scans `regs` per row and needs zeroed words for the `|=`. On the
-        // nullable arm the result register is ALWAYS packed —
-        // `classify_registers` marks a filter's result as a bool input, so
-        // every producer (boolean ops natively, value producers through
-        // `maybe_pack_bool_bits`) populates `bool_bits[result_reg]` — and the
-        // word-level merge overwrites every word.
-        if no_nulls {
-            scratch.filter_bits[..words].fill(0);
-        }
-
         for morsel_start in (0..n).step_by(MORSEL) {
             let m = MORSEL.min(n - morsel_start);
             eval_batch(prog, mb, morsel_start, m, &mut scratch);
 
             if no_nulls {
+                // `no_nulls` mode allocates no `bool_bits` (capacity 0), so the
+                // verdict is read out of `regs`. Packed a word at a time in a
+                // register — `morsel_start` is 64-aligned (MORSEL=256), so each
+                // morsel maps onto a contiguous run of `filter_bits` words, and
+                // writing every word whole spares both the read-modify-write and
+                // the up-front zero-fill.
                 let base_r = result_reg * MORSEL;
-                for i in 0..m {
-                    let abs = morsel_start + i;
-                    if scratch.regs[base_r + i] != 0 {
-                        scratch.filter_bits[abs / 64] |= 1u64 << (abs % 64);
+                let filter_word_base = morsel_start / 64;
+                // Split borrow, and the register window sliced once: the inner
+                // loop then runs over a slice of known length, so its bound and
+                // base pointer are hoisted out of it entirely.
+                let EvalScratch { regs, filter_bits, .. } = &mut *scratch;
+                let regs = &regs[base_r..base_r + m];
+                for (w, chunk) in regs.chunks(64).enumerate() {
+                    let mut bits = 0u64;
+                    for (i, &v) in chunk.iter().enumerate() {
+                        bits |= ((v != 0) as u64) << i;
                     }
+                    filter_bits[filter_word_base + w] = bits;
                 }
             } else {
                 // Word-level merge: filter bit = truthy & !null. morsel_start
@@ -651,67 +669,47 @@ impl ScalarFunc {
                 eval_batch(prog, &in_mb, src_start + morsel_start, m, &mut scratch);
 
                 // EMIT: write each computed register to its output column.
-                // Value store and null merge run as two sequential loops, each
-                // taking a fresh borrow of `output`. `Batch::data` is a single
-                // `Vec<u8>` holding every region, so a pointer into the null
-                // region derived once and held across a `col_data_mut` reborrow
-                // would be invalidated by it.
                 for e in emits {
                     let out_payload = e.payload;
-                    let stride = e.stride as usize;
                     let base_r = e.reg * MORSEL;
                     let base_null_r = e.reg * NULL_WORDS_PER_REG;
+                    let row0 = dst_base + morsel_start;
+                    // One split borrow: the value slots and this column's bit in
+                    // the row-major NULL bitmap are written in the same pass over
+                    // the null rows.
+                    let (col, nb) = output.col_and_null_bmp_mut(out_payload);
 
-                    {
-                        let dst8 = output.col_data_mut(out_payload);
-                        if stride == 8 {
-                            // Monomorphic fast arm: computed outputs are
-                            // overwhelmingly 8-byte, and a constant-width store
-                            // lets the loop vectorize.
-                            for i in 0..m {
-                                let is_null =
-                                    !no_nulls && (scratch.null_bits[base_null_r + i / 64] >> (i % 64)) & 1 != 0;
-                                let val = if is_null { 0i64 } else { scratch.regs[base_r + i] };
-                                let off = (dst_base + morsel_start + i) * 8;
-                                dst8[off..off + 8].copy_from_slice(&val.to_le_bytes());
-                            }
-                        } else {
-                            for i in 0..m {
-                                let is_null =
-                                    !no_nulls && (scratch.null_bits[base_null_r + i / 64] >> (i % 64)) & 1 != 0;
-                                let val = if is_null { 0i64 } else { scratch.regs[base_r + i] };
-                                let off = (dst_base + morsel_start + i) * stride;
-                                dst8[off..off + stride].copy_from_slice(&val.to_le_bytes()[..stride]);
-                            }
-                        }
-                    }
+                    // `check_emit_slot` holds every EMIT destination to an
+                    // 8-byte slot, so the morsel's outputs are one contiguous
+                    // window and the whole register image is the little-endian
+                    // encoding EMIT stores — one `copy_from_slice`, no per-row
+                    // bounds check and no per-row NULL branch.
+                    let win = &mut col[row0 * 8..(row0 + m) * 8];
+                    let regs = &scratch.regs[base_r..base_r + m];
+                    // SAFETY: `i64` has no padding and no invalid bit patterns,
+                    // and `main.rs` fails the build on a non-little-endian
+                    // target, so an i64 slice's byte image *is* its
+                    // `to_le_bytes()` sequence. `u8` is 1-aligned, and the window
+                    // is `m` elements of a slice with at least `m` left.
+                    let regs_le = unsafe { std::slice::from_raw_parts(regs.as_ptr().cast::<u8>(), m * 8) };
+                    win.copy_from_slice(regs_le);
 
-                    // The two bitmaps are transposed: `scratch.null_bits` is
-                    // register-major (bit i = row i), the output bitmap row-major
-                    // (one u64 per row, bit c = payload column c). The merge is a
-                    // scatter, never a word-at-a-time OR.
+                    // A NULL row's value slot reads as zero, and its bit is set
+                    // in the output bitmap. NULL rows are the exception, so both
+                    // are done by a sparse bit-scan rather than a per-row branch
+                    // that would de-vectorize the store above. The two bitmaps
+                    // are transposed — `scratch.null_bits` is register-major
+                    // (bit i = row i), the output bitmap row-major (one u64 per
+                    // row, bit c = payload column c) — so the merge is a scatter,
+                    // never a word-at-a-time OR.
                     if !no_nulls {
-                        let words = m.div_ceil(64);
-                        let nb = output.null_bmp_data_mut();
-                        for w in 0..words {
-                            let mut null_word = scratch.null_bits[base_null_r + w];
-                            // Every producer writes only rows `0..m`, so bits at
-                            // index >= m are zero and the bit-scan stays in the
-                            // morsel — no tail re-masking needed.
-                            debug_assert!(
-                                w + 1 < words || m.is_multiple_of(64) || (null_word >> (m % 64)) == 0,
-                                "null_bits tail word has bits set beyond m={m}",
-                            );
-                            let lo = w * 64;
-                            while null_word != 0 {
-                                let bit = null_word.trailing_zeros() as usize;
-                                null_word &= null_word - 1;
-                                let off = (dst_base + morsel_start + lo + bit) * 8;
-                                let merged =
-                                    u64::from_le_bytes(nb[off..off + 8].try_into().unwrap()) | (1u64 << out_payload);
-                                nb[off..off + 8].copy_from_slice(&merged.to_le_bytes());
-                            }
-                        }
+                        for_each_null_row(&scratch.null_bits, base_null_r, m, |i| {
+                            win[i * 8..i * 8 + 8].fill(0);
+                            let off = (row0 + i) * 8;
+                            let merged =
+                                u64::from_le_bytes(nb[off..off + 8].try_into().unwrap()) | (1u64 << out_payload);
+                            nb[off..off + 8].copy_from_slice(&merged.to_le_bytes());
+                        });
                     }
                 }
             }

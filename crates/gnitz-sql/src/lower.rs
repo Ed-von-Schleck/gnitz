@@ -295,10 +295,10 @@ impl BoundExprBackend for OpcodeBackend<'_> {
         // literal → one INT_IN_SET. `self.cols` is the schema `inner` was bound
         // against — source schema for a table filter, reduce-output schema for
         // HAVING — so the int gate is correct in both, and a HAVING large-IN
-        // compiles here too. Use `FixedInt::from_type_code(...).is_some()` — the
-        // exact predicate the interpreter/thin-probe gate on — not
-        // `is_pk_eligible`, which wrongly admits U128/UUID/I128.
-        if gnitz_wire::FixedInt::from_type_code(inner.infer_type(self.cols)).is_some() {
+        // compiles here too. Use `is_fixed_int` — the exact predicate the
+        // interpreter/thin-probe gate on — not `is_pk_eligible`, which wrongly
+        // admits U128/UUID/I128.
+        if gnitz_wire::is_fixed_int(inner.infer_type(self.cols) as u8) {
             if let Some(mut values) = items.iter().map(fold_int_literal).collect::<Option<Vec<i64>>>() {
                 values.sort_unstable();
                 values.dedup();

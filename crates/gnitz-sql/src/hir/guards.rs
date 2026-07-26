@@ -7,7 +7,7 @@
 use super::JoinType;
 use crate::error::GnitzSqlError;
 use crate::validate::reject_float_key;
-use gnitz_core::{ColumnDef, FixedInt, RangeRel, TypeCode};
+use gnitz_core::{ColumnDef, RangeRel, TypeCode};
 use sqlparser::ast::{Expr, JoinConstraint, JoinOperator};
 
 /// The ON expression and type of one join step. Each step supports
@@ -133,7 +133,7 @@ pub(crate) fn reject_pure_range_threshold_tc(
     surface: &str,
     remedy: &str,
 ) -> Result<(), GnitzSqlError> {
-    if FixedInt::from_type_code(range_tc).is_none() {
+    if !gnitz_wire::is_fixed_int(range_tc as u8) {
         return Err(GnitzSqlError::Unsupported(format!(
             "{surface} needs a ≤8-byte integer range column (got {range_tc:?}); its threshold \
              null-fill reduces the range column with MIN/MAX, which has no 16-byte accumulator \
@@ -259,7 +259,7 @@ pub(crate) fn set_op_common_type(l: TypeCode, r: TypeCode) -> Option<TypeCode> {
         return Some(l);
     }
     let t = l.join_key_common_type(r)?;
-    FixedInt::from_type_code(t).is_some().then_some(t)
+    gnitz_wire::is_fixed_int(t as u8).then_some(t)
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@
 //!
 //! Pure data and stateless codecs — no state, no CatalogEngine dependency.
 
-use crate::schema::{SchemaColumn, SchemaDescriptor};
+use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, BatchBuilder};
 
 // ---------------------------------------------------------------------------
@@ -129,13 +129,38 @@ pub(super) fn validate_pk_cols(col_defs: &[super::types::ColumnDef], pk: &PkColL
     Ok(())
 }
 
+/// The two rules a relation's column records must satisfy on their own, with no
+/// PK list in hand. Sole home, called both by [`validate_relation_defs`] (which
+/// only decorates the message with the relation's kind/name/id) and by
+/// `build_schema_from_col_defs`, so the precheck arms, the register hooks, boot
+/// replay and worker `ddl_sync` all reject identically without either entry
+/// point owning a copy.
+///
+/// `validate_pk_cols` allow-lists the PK columns' type codes; nothing checked a
+/// *payload* column's, and this is the trust boundary where COL_TAB rows become
+/// a `SchemaDescriptor` (see `gnitz_wire::is_valid_type_code` for why an unknown
+/// code is not inert).
+pub(super) fn check_col_defs(col_defs: &[super::types::ColumnDef]) -> Result<(), String> {
+    if col_defs.len() > crate::schema::MAX_COLUMNS {
+        return Err(format!(
+            "has {} columns (max {})",
+            col_defs.len(),
+            crate::schema::MAX_COLUMNS
+        ));
+    }
+    if let Some(cd) = col_defs.iter().find(|cd| !gnitz_wire::is_valid_type_code(cd.type_code)) {
+        return Err(format!("column '{}' has invalid type code {}", cd.name, cd.type_code));
+    }
+    Ok(())
+}
+
 /// One admissibility check for a relation's column records + PK list, shared
 /// by the TABLE/VIEW precheck arms, both register hooks (the deliberate
 /// precheck/hook double-run — boot replay and worker ddl_sync skip precheck),
 /// and the test-only `ddl.rs::create_table`, so every layer rejects
-/// identically. Order is load-bearing: col-defs non-empty (the cross-family
-/// COL_TAB-before-TABLE/VIEW ordering contract) → [`validate_pk_cols`] →
-/// MAX_COLUMNS.
+/// identically. Non-empty col-defs first (the cross-family
+/// COL_TAB-before-TABLE/VIEW ordering contract), then [`check_col_defs`], then
+/// [`validate_pk_cols`].
 pub(super) fn validate_relation_defs(
     kind: &str,
     id: i64,
@@ -150,15 +175,8 @@ pub(super) fn validate_relation_defs(
              TABLE_TAB/VIEW_TAB writes (see hooks.rs dispatch doc)."
         ));
     }
-    validate_pk_cols(col_defs, pk)?;
-    if col_defs.len() > crate::schema::MAX_COLUMNS {
-        return Err(format!(
-            "{kind} '{name}' (id={id}) has {} columns (max {})",
-            col_defs.len(),
-            crate::schema::MAX_COLUMNS
-        ));
-    }
-    Ok(())
+    check_col_defs(col_defs).map_err(|e| format!("{kind} '{name}' (id={id}) {e}"))?;
+    validate_pk_cols(col_defs, pk)
 }
 
 // ---------------------------------------------------------------------------
@@ -324,10 +342,6 @@ pub(super) const SYS_TABLE_ARENA: u64 = 256 * 1024; // 256 KB
 // ---------------------------------------------------------------------------
 // Schema derivation from the shared wire column slices
 // ---------------------------------------------------------------------------
-
-pub(super) const fn zero_col() -> SchemaColumn {
-    SchemaColumn::new(0, 0)
-}
 
 use crate::schema::from_wire_cols;
 

@@ -158,41 +158,36 @@ pub(super) fn compute_skip_nodes(loaded: &LoadedCircuit) -> HashSet<i32> {
 
 /// `None` when the merged column count would overflow the fixed `[_; 65]` schema
 /// array — a crafted/corrupt `Join` node; the caller fails the compile rather
-/// than aborting. (The outer-join null-fill columns are built by the `NullExtend`
-/// emit arm, which appends its `type_codes` as nullable columns directly.)
+/// than aborting. (The outer-join null-fill columns are appended by
+/// [`null_extend_output_schema`], not here.)
 pub(super) fn merge_schemas_for_join(left: &SchemaDescriptor, right: &SchemaDescriptor) -> Option<SchemaDescriptor> {
-    let total = left.num_columns() + right.num_payload_cols();
-    if total > crate::schema::MAX_COLUMNS {
-        return None;
+    let mut b = DerivedSchema::new();
+    b.push_pk_of(left)?;
+    for (_, _, c) in left.payload_columns().chain(right.payload_columns()) {
+        b.push(*c)?;
     }
-    let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-    let mut pk_idx = [0u32; crate::schema::MAX_PK_COLUMNS];
-    let pk_len = copy_pk_columns_into(left, &mut cols, &mut pk_idx);
-    let mut n = pk_len;
-    for (_, _, c) in left.payload_columns() {
-        cols[n] = *c;
-        n += 1;
-    }
-    for (_, _, c) in right.payload_columns() {
-        cols[n] = *c;
-        n += 1;
-    }
-    Some(SchemaDescriptor::new(&cols[..n], &pk_idx[..pk_len]))
+    Some(b.finish())
 }
 
-pub(super) fn build_map_output_schema(input: &SchemaDescriptor, src_indices: &[i32]) -> SchemaDescriptor {
-    let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-    let mut pk_idx = [0u32; crate::schema::MAX_PK_COLUMNS];
-    let pk_len = copy_pk_columns_into(input, &mut cols, &mut pk_idx);
-    let mut n = pk_len;
+/// Output schema of a plain projection Map: the input's PK columns, then the
+/// non-PK sources in `src_indices` order.
+///
+/// `None` when the merged column count would overflow the fixed `[_; 65]` schema
+/// array — a crafted/corrupt `Projection` node; the caller fails the compile
+/// rather than aborting. Self-protecting like [`merge_schemas_for_join`], and
+/// for the same reason: the bound is `pk_len + payload_n`, so a caller checking
+/// only `src_indices.len()` is short by the PK count. `src_indices` may repeat an
+/// index, so its length alone does not bound the payload count either.
+pub(super) fn build_map_output_schema(input: &SchemaDescriptor, src_indices: &[i32]) -> Option<SchemaDescriptor> {
+    let mut b = DerivedSchema::new();
+    b.push_pk_of(input)?;
     for &idx in src_indices {
         let i = idx as usize;
         if !input.is_pk_col(i) {
-            cols[n] = input.columns[i];
-            n += 1;
+            b.push(input.columns[i])?;
         }
     }
-    SchemaDescriptor::new(&cols[..n], &pk_idx[..pk_len])
+    Some(b.finish())
 }
 
 /// True iff any carried cross-width promotion target in `target_tcs` is invalid
@@ -220,7 +215,15 @@ pub(super) fn reindex_promotion_invalid(
         let t = target_tcs.get(i).copied().unwrap_or(0);
         t != 0 && {
             let src = schema.columns[c as usize].type_code;
-            (fixed_int_only && !gnitz_wire::is_fixed_int(t)) || gnitz_wire::join_key_common_type(src, t) != Some(t)
+            if fixed_int_only {
+                // Identical to the rule `check_copy_types` holds a COPY_COL
+                // destination to — the payload widen is the same kernel.
+                !gnitz_wire::is_widening_promotion(src, t)
+            } else {
+                // The reindex key path also admits the 16-byte OPK targets, so
+                // it takes the promotion ladder without the fixed-int clause.
+                gnitz_wire::join_key_common_type(src, t) != Some(t)
+            }
         }
     })
 }
@@ -233,20 +236,41 @@ pub(super) fn reindex_promotion_invalid(
 /// nullability: an INTERSECT/EXCEPT leaf is `distinct`-ed on its own before
 /// the tuple-tightening combine, so its row comparator must classify by what
 /// this side can actually emit.
+/// `None` when the synthetic PK plus the projected columns would overflow the
+/// fixed `[_; 65]` schema array — self-protecting like [`merge_schemas_for_join`]
+/// and [`build_map_output_schema`], so no caller owns the bound.
 pub(super) fn hashrow_output_schema(
     in_schema: &SchemaDescriptor,
     proj_cols: &[u16],
     target_tcs: &[u8],
-) -> SchemaDescriptor {
-    let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-    cols[0] = SchemaColumn::new(type_code::U128, 0);
+) -> Option<SchemaDescriptor> {
+    let mut b = DerivedSchema::new();
+    b.push_pk(SchemaColumn::new(type_code::U128, 0))?;
     for (j, &c) in proj_cols.iter().enumerate() {
         let src = in_schema.columns[c as usize];
         let tgt = target_tcs.get(j).copied().unwrap_or(0);
         let out_tc = if tgt != 0 { tgt } else { src.type_code };
-        cols[1 + j] = SchemaColumn::new(out_tc, src.nullable);
+        b.push(SchemaColumn::new(out_tc, src.nullable))?;
     }
-    SchemaDescriptor::new(&cols[..1 + proj_cols.len()], &[0])
+    Some(b.finish())
+}
+
+/// Output schema of an outer-join NULL_EXTEND: the input schema verbatim (PK
+/// region unchanged), then one nullable column per null-fill `type_codes` entry.
+/// `decode_op_node` rejects an undecodable type code, so every entry is a real
+/// column type.
+/// `None` when the merged column count would overflow the fixed `[_; 65]` schema
+/// array — self-protecting like the sibling builders.
+pub(super) fn null_extend_output_schema(in_schema: &SchemaDescriptor, type_codes: &[u8]) -> Option<SchemaDescriptor> {
+    let mut b = DerivedSchema::new();
+    b.push_pk_of(in_schema)?;
+    for (_, _, c) in in_schema.payload_columns() {
+        b.push(*c)?;
+    }
+    for &tc in type_codes {
+        b.push(SchemaColumn::new(tc, 1))?;
+    }
+    Some(b.finish())
 }
 
 /// Build the full output schema of a reindex Map: the synthetic PK column(s)
@@ -263,22 +287,16 @@ pub(super) fn hashrow_output_schema(
 /// slot `i` — the source columns the reindex program copies, derived from the
 /// program (and range-checked) by `emit_node`. A join side whose program skips a
 /// dead source column thus stops persisting it in the trace.
+/// `None` when the synthetic PK plus the kept payload columns would overflow the
+/// fixed `[_; 65]` schema array — self-protecting like the sibling builders, so
+/// the bound lives with the array rather than at each caller.
 pub(super) fn reindex_output_schema(
     in_schema: &SchemaDescriptor,
     reindex_cols: &[u16],
     target_tcs: &[u8],
     payload_cols: &[u16],
-) -> SchemaDescriptor {
-    let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
-    let pk_n = reindex_cols.len();
-    let payload_n = payload_cols.len();
-    // Self-protecting: a future caller that skips `emit_node`'s guard would
-    // otherwise hit a bare slice OOB in the `cols[pk_n + i]` writes below.
-    assert!(
-        pk_n + payload_n <= crate::schema::MAX_COLUMNS,
-        "reindex_output_schema: {pk_n} + {payload_n} columns exceed MAX_COLUMNS ({})",
-        crate::schema::MAX_COLUMNS,
-    );
+) -> Option<SchemaDescriptor> {
+    let mut b = DerivedSchema::new();
     for (i, &c) in reindex_cols.iter().enumerate() {
         let out_tc = gnitz_wire::resolve_reindex_type(
             in_schema.columns[c as usize].type_code,
@@ -291,13 +309,12 @@ pub(super) fn reindex_output_schema(
             gnitz_wire::is_pk_eligible(out_tc),
             "reindex output type code {out_tc} is not PK-eligible"
         );
-        cols[i] = SchemaColumn::new(out_tc, 0); // PK region: nullable = 0
+        b.push_pk(SchemaColumn::new(out_tc, 0))?; // PK region: nullable = 0
     }
-    for (i, &c) in payload_cols.iter().enumerate() {
-        cols[pk_n + i] = in_schema.columns[c as usize];
+    for &c in payload_cols {
+        b.push(in_schema.columns[c as usize])?;
     }
-    let pk_idx: Vec<u32> = (0..pk_n as u32).collect();
-    SchemaDescriptor::new(&cols[..pk_n + payload_n], &pk_idx)
+    Some(b.finish())
 }
 
 pub(super) fn agg_value_idx_eligible(tc: TypeCode) -> bool {

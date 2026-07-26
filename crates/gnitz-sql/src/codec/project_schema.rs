@@ -39,9 +39,9 @@ impl ProjItem {
 /// reference binds to a `PassThrough` — an alias only renames the output
 /// column, so an aliased or qualified PK column is still found by the
 /// PK-placement scan and a qualified non-PK column is not needlessly
-/// recomputed. Any other expression becomes a `Computed` column typed by
-/// `infer_type` and named by its alias (or `_expr{idx}`). `Wildcard` is
-/// expanded by the caller and rejected here.
+/// recomputed. Any other expression becomes a `Computed` column built by
+/// [`ColumnDef::computed`]. `Wildcard` is expanded by the caller and rejected
+/// here.
 fn resolve_proj_col(
     item: &SelectItem,
     idx: usize,
@@ -59,7 +59,7 @@ fn resolve_proj_col(
     let bound = bind_single_table(expr, source_schema)?;
     // A (possibly aliased / qualified / parenthesized) bare column reference is a
     // pass-through; an alias only renames the output column. Anything else is a
-    // computed column, typed by `infer_type` and named by its alias or `_expr{idx}`.
+    // computed column, built by `ColumnDef::computed` from its `infer_type`.
     if let BoundExpr::ColRef(ci) = bound {
         let mut col = source_schema.columns[ci].clone();
         if let Some(name) = alias {
@@ -67,10 +67,10 @@ fn resolve_proj_col(
         }
         Ok((ProjItem::PassThrough { src_col: ci }, col))
     } else {
-        let out_type = bound.infer_type(&source_schema.columns);
+        let nominal = bound.infer_type(&source_schema.columns);
         Ok((
             ProjItem::Computed { bound_expr: bound },
-            ColumnDef::new(alias.unwrap_or_else(|| format!("_expr{idx}")), out_type, true),
+            ColumnDef::computed(alias, idx, nominal),
         ))
     }
 }
@@ -98,7 +98,7 @@ pub(crate) fn compile_projection_map(items: &[ProjItem], schema: &Schema) -> Res
 
 /// Pin the full source PK to output slots `0..k` in `pk_indices()` order,
 /// matching the engine's `build_map_output_schema` (which copies every PK
-/// column to the front via `copy_pk_columns_into`). A PK column already at its
+/// column to the front via `DerivedSchema::push_pk_of`). A PK column already at its
 /// target slot stays; one appearing later is removed+inserted (shifting the
 /// spanned non-PK columns right by one, preserving their relative order — a
 /// swap would not); one absent from the projection (omitted, or referenced

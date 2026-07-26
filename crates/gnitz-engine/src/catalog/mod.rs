@@ -66,6 +66,7 @@ pub(crate) use sys_tables::sys_tab_schema;
 pub(crate) use types::ColumnDef;
 
 // Import everything from sys_tables for internal use.
+use registry::build_schema_from_col_defs;
 use sys_tables::*;
 
 // ── Catalog-internal re-exports — no out-of-catalog consumer (W8). These reach

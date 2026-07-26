@@ -693,7 +693,7 @@ mod tests {
 
     fn make_schema(cols: &[(u8, u8)]) -> SchemaDescriptor {
         // First column is PK (U64); subsequent are payload columns.
-        let mut columns = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+        let mut columns = [SchemaColumn::EMPTY; crate::schema::MAX_COLUMNS];
         columns[0] = SchemaColumn::new(type_code::U64, 0);
         for (i, &(tc, nullable)) in cols.iter().enumerate() {
             columns[i + 1] = SchemaColumn::new(tc, nullable);

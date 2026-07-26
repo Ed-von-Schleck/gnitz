@@ -75,12 +75,12 @@ pub(crate) type BoundExpr = BExpr<usize>;
 /// unsigned compare); else I64. All three are 8-byte slots — a pure type-label
 /// decision (the integer arithmetic itself is bit-identical either way).
 pub(crate) fn unify_numeric(a: TypeCode, b: TypeCode) -> TypeCode {
-    if matches!(a, TypeCode::F32 | TypeCode::F64) || matches!(b, TypeCode::F32 | TypeCode::F64) {
-        TypeCode::F64
-    } else if matches!(a, TypeCode::U64) || matches!(b, TypeCode::U64) {
-        TypeCode::U64
-    } else {
-        TypeCode::I64
+    // Per-operand this is exactly `register_image` (float → F64, U64 → U64,
+    // else I64); unifying a pair is the F64 > U64 > I64 join of the two images.
+    match (a.register_image(), b.register_image()) {
+        (TypeCode::F64, _) | (_, TypeCode::F64) => TypeCode::F64,
+        (TypeCode::U64, _) | (_, TypeCode::U64) => TypeCode::U64,
+        _ => TypeCode::I64,
     }
 }
 
@@ -456,6 +456,21 @@ mod tests {
             .infer_type(&s.columns),
             TypeCode::U64
         );
+    }
+
+    /// `infer_type` reports an expression's *nominal* type — `Neg` preserves its
+    /// operand's. What a computed column is *declared* as is a separate rule
+    /// (`register_image`, applied where the column def is built), because EMIT
+    /// stores a whole 8-byte register: an F32 negation computes in f64, and
+    /// declaring the column F32 shipped the low half of the double.
+    #[test]
+    fn neg_preserves_operand_type_and_register_image_widens_it() {
+        let s = schema(&[TypeCode::U64, TypeCode::F32, TypeCode::F64, TypeCode::U32, TypeCode::I8]);
+        let neg = |c: usize| BoundExpr::UnaryOp(UnaryOp::Neg, Box::new(BoundExpr::ColRef(c))).infer_type(&s.columns);
+        assert_eq!((neg(1), neg(1).register_image()), (TypeCode::F32, TypeCode::F64));
+        assert_eq!((neg(2), neg(2).register_image()), (TypeCode::F64, TypeCode::F64));
+        assert_eq!((neg(3), neg(3).register_image()), (TypeCode::U32, TypeCode::I64));
+        assert_eq!((neg(4), neg(4).register_image()), (TypeCode::I8, TypeCode::I64));
     }
 
     #[test]

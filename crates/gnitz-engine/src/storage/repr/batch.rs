@@ -600,6 +600,24 @@ impl Batch {
         (&mut self.data[off..end], &mut self.blob)
     }
 
+    /// Split borrow of payload column `pi`'s region and the NULL bitmap — for
+    /// EMIT, which writes a computed column's value slots and sets that column's
+    /// bit for the same rows. Regions are laid out in region-index order and
+    /// `REG_NULL_BMP` always precedes any payload region, so the split is a
+    /// plain `split_at_mut` at the column's offset. One call lets a single pass
+    /// over the null rows do both writes.
+    #[inline]
+    pub fn col_and_null_bmp_mut(&mut self, pi: usize) -> (&mut [u8], &mut [u8]) {
+        let n_off = self.offsets[REG_NULL_BMP];
+        let n_end = n_off + self.count * 8;
+        let r = REG_PAYLOAD_START + pi;
+        let c_off = self.offsets[r];
+        let c_end = c_off + self.count * self.strides[r] as usize;
+        debug_assert!(n_end <= c_off, "null bitmap region must precede payload region {pi}");
+        let (lo, hi) = self.data.split_at_mut(c_off);
+        (&mut hi[..c_end - c_off], &mut lo[n_off..n_end])
+    }
+
     /// Return a `DirectWriter` over this batch's data buffer, sized for
     /// `capacity` rows (not `count`). Used to re-fill a batch whose allocation
     /// is already live but whose row count has been reset (`clear()`, then

@@ -337,6 +337,43 @@ class TestFloatExpressions:
         finally:
             _cleanup(client, sn)
 
+    def test_neg_narrow_types(self, client):
+        """A negation is materialized from the 8-byte register image: an F32 is
+        widened to f64 on load and a narrow integer is negated as i64, so the
+        computed column must be declared F64/I64. Typing it at the source width
+        truncated the store — every F32 value collapsed to a denormal or 0.0 and
+        `-u32col` wrapped. Both the ad-hoc and the CREATE VIEW path bind the
+        column type through their own binder, so both are asserted."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, "
+                "f FLOAT NOT NULL, u INT UNSIGNED NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO t VALUES (1, 1.5, 7)", schema_name=sn)
+
+            res = client.execute_sql("SELECT -f AS nf, -u AS nu FROM t", schema_name=sn)[0]
+            assert res["type"] == "Rows", res
+            adhoc = list(res["rows"])[0]
+            assert adhoc.nf == pytest.approx(-1.5)
+            assert adhoc.nu == -7
+
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT id, -f AS nf, -u AS nu FROM t",
+                schema_name=sn,
+            )
+            vid, vschema = client.resolve_table(sn, "v")
+            types = {c.name: c.type_code for c in vschema.columns}
+            assert types["nf"] == gnitz.TypeCode.F64
+            assert types["nu"] == gnitz.TypeCode.I64
+            row = _scan_dicts(client, vid)[0]
+            assert row["nf"] == pytest.approx(-1.5)
+            assert row["nu"] == -7
+        finally:
+            _cleanup(client, sn)
+
     def test_float_cmp(self, client):
         """WHERE with float comparison (non-negative values)."""
         sn = "s" + _uid()

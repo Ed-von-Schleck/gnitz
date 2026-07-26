@@ -3,6 +3,7 @@ mod plan_tests;
 mod program_tests;
 
 use super::batch::{eval_batch, EvalScratch, MORSEL, NULL_WORDS_PER_REG};
+use super::plan::read_reg_row0;
 use super::program::{Instr, ResolvedProgram};
 use crate::storage::MemBatch;
 
@@ -27,7 +28,7 @@ pub(super) fn eval_predicate_via_batch(prog: &ResolvedProgram, mb: &MemBatch, ro
     scratch.ensure_capacity(prog.num_regs as usize, false, 1);
     eval_batch(prog, mb, row, 1, &mut scratch);
     let r = prog.result_reg as usize;
-    let val = scratch.regs[r * MORSEL];
+    let val = read_reg_row0(prog, &scratch, r);
     let is_null = (scratch.null_bits[r * NULL_WORDS_PER_REG] & 1) != 0;
     (val, is_null)
 }
@@ -65,7 +66,7 @@ pub(super) fn eval_with_emit_via_batch(
         return (0, true, emit_null_mask, emit_vals);
     }
     let r = prog.result_reg as usize;
-    let val = scratch.regs[r * MORSEL];
+    let val = read_reg_row0(prog, &scratch, r);
     let is_null = (scratch.null_bits[r * NULL_WORDS_PER_REG] & 1) != 0;
     (val, is_null, emit_null_mask, emit_vals)
 }

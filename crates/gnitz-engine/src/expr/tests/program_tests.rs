@@ -4,7 +4,7 @@
 
 use super::super::program::*;
 use super::{bits_to_float, eval_predicate_via_batch as eval_predicate, eval_with_emit_via_batch, float_to_bits};
-use crate::schema::{SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
+use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 use crate::storage::Batch;
 
 /// Build a `LogicalProgram` from typed instructions and resolve it against the
@@ -20,11 +20,15 @@ fn make_prog(
     LogicalProgram::new(instrs, num_regs, result_reg, const_strings).resolve(schema, /* is_filter = */ false)
 }
 
+/// `col_types` may name an *undecodable* type code: a release engine can carry
+/// one (a corrupt SAL / crafted wire schema), and the validator tests exist to
+/// pin what happens then — so the columns are built through
+/// `SchemaColumn::corrupt`, which skips the debug-only decodability assert.
 fn make_schema(pk_index: u32, col_types: &[u8]) -> SchemaDescriptor {
-    let mut columns = [SchemaColumn::new(0, 0); MAX_COLUMNS];
+    let mut columns = [SchemaColumn::EMPTY; MAX_COLUMNS];
     for (i, &tc) in col_types.iter().enumerate() {
         let nullable = if i == pk_index as usize { 0 } else { 1 };
-        columns[i] = SchemaColumn::new(tc, nullable);
+        columns[i] = SchemaColumn::corrupt(tc, nullable);
     }
     SchemaDescriptor::new(&columns[..col_types.len()], &[pk_index])
 }
@@ -1339,7 +1343,6 @@ fn test_load_null_else_branch_eval() {
 /// a NULL.
 #[test]
 fn test_load_null_forces_nullable_path() {
-    use crate::schema::type_code;
     let nonnull_schema = {
         let cols = [
             SchemaColumn::new(type_code::U64, 0),
@@ -1366,7 +1369,6 @@ fn test_load_null_forces_nullable_path() {
 /// Select copies branch values and adds no NULL of its own.
 #[test]
 fn test_select_non_nullable_when_branches_non_nullable() {
-    use crate::schema::type_code;
     let nonnull_schema = {
         let cols = [
             SchemaColumn::new(type_code::U64, 0),
@@ -1796,7 +1798,6 @@ fn test_validate_rejects_out_of_range_column() {
 
 #[test]
 fn test_validate_rejects_pk_column_for_payload_only_opcode() {
-    use crate::schema::type_code;
     // Schema with a PK at column 0 (non-nullable) plus a payload string column.
     let s_pk = SchemaDescriptor::new(
         &[
@@ -1825,7 +1826,6 @@ fn test_validate_rejects_pk_column_for_payload_only_opcode() {
 
 #[test]
 fn test_validate_rejects_wide_column_register_load() {
-    use crate::schema::type_code;
     // LOAD_COL_INT on a 16-byte U128 column: rejected before it hits the
     // wide-register eval artefact (Part C).
     let schema = SchemaDescriptor::new(
@@ -1838,13 +1838,217 @@ fn test_validate_rejects_wide_column_register_load() {
     let prog = LogicalProgram::from_wire(&[1, 0, 1, 0], 1, 0, vec![]).unwrap();
     assert_eq!(
         prog.validate(Some(&schema), None),
-        Err(ExprValidateErr::ColTooWideForRegister { col: 1, size: 16 })
+        Err(ExprValidateErr::ColKindMismatch {
+            col: 1,
+            type_code: type_code::U128,
+            want: ColKind::FixedInt,
+        })
     );
+}
+
+/// `LoadColInt`'s kernel decodes little-endian integer bytes; a width test alone
+/// let two shapes through that it cannot decode — a float column (whose bit
+/// pattern would become an integer; both widths take different kernel arms) and
+/// an unknown type code, which `wire_stride` maps to 8 by design.
+#[test]
+fn test_validate_load_col_int_requires_fixed_int() {
+    for tc in [type_code::F64, type_code::F32, 200, type_code::STRING] {
+        let schema = make_schema(0, &[type_code::U64, tc]);
+        let prog = LogicalProgram::from_wire(&[1, 0, 1, 0], 1, 0, vec![]).unwrap();
+        assert_eq!(
+            prog.validate(Some(&schema), None),
+            Err(ExprValidateErr::ColKindMismatch {
+                col: 1,
+                type_code: tc,
+                want: ColKind::FixedInt,
+            }),
+            "LOAD_COL_INT must reject type code {tc}"
+        );
+    }
+    // Every fixed-width integer is loadable, PK column included.
+    for tc in [
+        type_code::U8,
+        type_code::I8,
+        type_code::U16,
+        type_code::I16,
+        type_code::U32,
+        type_code::I32,
+        type_code::U64,
+        type_code::I64,
+    ] {
+        let schema = make_schema(0, &[type_code::U64, tc]);
+        let prog = LogicalProgram::from_wire(&[1, 0, 1, 0], 1, 0, vec![]).unwrap();
+        assert_eq!(prog.validate(Some(&schema), None), Ok(()), "type code {tc}");
+    }
+}
+
+/// `LoadColFloat`'s kernel branches on width alone: a 1- or 2-byte integer
+/// column makes it slice an 8-byte stride out of a narrower region (a panic),
+/// and every other non-float width is silent garbage.
+#[test]
+fn test_validate_load_col_float_requires_float() {
+    let case = |tc: u8| {
+        let schema = make_schema(0, &[type_code::U64, tc]);
+        LogicalProgram::from_wire(&[2, 0, 1, 0], 1, 0, vec![])
+            .unwrap()
+            .validate(Some(&schema), None)
+    };
+    for tc in [type_code::U16, type_code::U64, type_code::STRING] {
+        assert_eq!(
+            case(tc),
+            Err(ExprValidateErr::ColKindMismatch {
+                col: 1,
+                type_code: tc,
+                want: ColKind::Float,
+            }),
+            "LOAD_COL_FLOAT must reject type code {tc}"
+        );
+    }
+    assert_eq!(case(type_code::F32), Ok(()));
+    assert_eq!(case(type_code::F64), Ok(()));
+}
+
+/// The string compares read 16-byte German-string cells with `col_data(pi, 16)`,
+/// which over-reads (and eventually runs off) a narrower column's region.
+#[test]
+fn test_validate_str_opcodes_require_german_string() {
+    let schema = |a: u8, b: u8| make_schema(0, &[type_code::U64, a, b]);
+    // STR_COL_EQ_CONST (40) col=1.
+    let vs_const = |a: u8| {
+        LogicalProgram::from_wire(&[40, 0, 1, 0], 1, 0, vec![b"x".to_vec()])
+            .unwrap()
+            .validate(Some(&schema(a, type_code::STRING)), None)
+    };
+    assert_eq!(
+        vs_const(type_code::U64),
+        Err(ExprValidateErr::ColKindMismatch {
+            col: 1,
+            type_code: type_code::U64,
+            want: ColKind::GermanString,
+        })
+    );
+    assert_eq!(vs_const(type_code::STRING), Ok(()));
+    assert_eq!(vs_const(type_code::BLOB), Ok(()));
+
+    // STR_COL_EQ_COL (43) col_a=1 col_b=2 — both operands are checked.
+    let vs_col = |a: u8, b: u8| {
+        LogicalProgram::from_wire(&[43, 0, 1, 2], 1, 0, vec![])
+            .unwrap()
+            .validate(Some(&schema(a, b)), None)
+    };
+    assert_eq!(
+        vs_col(type_code::U64, type_code::STRING),
+        Err(ExprValidateErr::ColKindMismatch {
+            col: 1,
+            type_code: type_code::U64,
+            want: ColKind::GermanString,
+        })
+    );
+    assert_eq!(
+        vs_col(type_code::STRING, type_code::U64),
+        Err(ExprValidateErr::ColKindMismatch {
+            col: 2,
+            type_code: type_code::U64,
+            want: ColKind::GermanString,
+        })
+    );
+    assert_eq!(vs_col(type_code::STRING, type_code::BLOB), Ok(()));
+}
+
+/// `IsNull`/`IsNotNull` read the NULL bitmap and nothing else, so any payload
+/// column is legitimate — splitting them out of the shared payload-only arm must
+/// not have narrowed them to a type class.
+#[test]
+fn test_validate_null_tests_accept_any_payload_column() {
+    for tc in [type_code::U128, type_code::STRING, type_code::F32] {
+        let schema = make_schema(0, &[type_code::U64, tc]);
+        for op in [30u32, 31] {
+            let prog = LogicalProgram::from_wire(&[op, 0, 1, 0], 1, 0, vec![]).unwrap();
+            assert_eq!(prog.validate(Some(&schema), None), Ok(()), "opcode {op} type {tc}");
+        }
+    }
+}
+
+/// `copy_column` byte-copies at equal width and otherwise widens a narrower
+/// integer into a wider slot: no narrowing, no representation change. The
+/// widening set is exactly the cross-width set-op coercion the client emits.
+#[test]
+fn test_validate_copy_col_type_compatibility() {
+    // in: [U64 PK, <src>]; out: [U64 PK, <dst>] — one payload slot each.
+    let pair = |src: u8, dst: u8| {
+        let in_schema = make_schema(0, &[type_code::U64, src]);
+        let out_schema = make_schema(0, &[type_code::U64, dst]);
+        // COPY_COL (34) src_col=1 out=0.
+        LogicalProgram::from_wire(&[34, 0, 1, 0], 0, 0, vec![])
+            .unwrap()
+            .validate(Some(&in_schema), Some(&out_schema))
+    };
+    for (src, dst) in [
+        (type_code::I64, type_code::I64),
+        (type_code::STRING, type_code::STRING),
+        (type_code::BLOB, type_code::BLOB),
+        (type_code::U128, type_code::U128),
+        (type_code::F64, type_code::F64),
+        (type_code::U32, type_code::U64),
+        (type_code::U32, type_code::I64),
+        (type_code::U8, type_code::I16),
+    ] {
+        assert_eq!(pair(src, dst), Ok(()), "{src} -> {dst} must be accepted");
+    }
+    for (src, dst) in [
+        (type_code::STRING, type_code::U64),
+        (type_code::U64, type_code::STRING),
+        (type_code::U128, type_code::U64),
+        (type_code::U64, type_code::F64),
+        (type_code::F32, type_code::F64),
+        (type_code::U64, type_code::I64),
+    ] {
+        assert_eq!(
+            pair(src, dst),
+            Err(ExprValidateErr::CopyTypeMismatch {
+                col: 1,
+                src_tc: src,
+                out: 0,
+                out_tc: dst,
+            }),
+            "{src} -> {dst} must be rejected"
+        );
+    }
+    // A PK source into a payload slot of the same type is a copy, not a promotion.
+    let in_pk = make_schema(0, &[type_code::U64, type_code::I64]);
+    let out_pk = make_schema(0, &[type_code::I64, type_code::U64]);
+    let prog = LogicalProgram::from_wire(&[34, 0, 0, 0], 0, 0, vec![]).unwrap();
+    assert_eq!(prog.validate(Some(&in_pk), Some(&out_pk)), Ok(()));
+    // Both output-side checks are inert for a filter (`out_schema = None`).
+    assert_eq!(prog.validate(Some(&in_pk), None), Ok(()));
+}
+
+/// EMIT stores a whole 8-byte register image: a 16-byte slot panics on the first
+/// row and a narrower one truncates, so the destination stride is exactly 8.
+#[test]
+fn test_validate_emit_slot_must_be_eight_bytes() {
+    // out: [U64 PK, <slot>] — one payload slot, written by the single EMIT.
+    let case = |tc: u8| {
+        let schema = make_schema(0, &[type_code::U64, tc]);
+        // EMIT (32) src=0 out=0.
+        LogicalProgram::from_wire(&[32, 0, 0, 0], 1, 0, vec![])
+            .unwrap()
+            .validate(Some(&schema), Some(&schema))
+    };
+    for tc in [type_code::I64, type_code::U64, type_code::F64] {
+        assert_eq!(case(tc), Ok(()), "type code {tc}");
+    }
+    for tc in [type_code::STRING, type_code::U128, type_code::F32] {
+        assert_eq!(
+            case(tc),
+            Err(ExprValidateErr::EmitSlotNotEightBytes { out: 0, type_code: tc }),
+            "type code {tc}"
+        );
+    }
 }
 
 #[test]
 fn test_validate_output_index_map_vs_filter() {
-    use crate::schema::type_code;
     // in: [U64 PK, I64]; out: [U64 PK, I64] — one output payload slot.
     let in_schema = SchemaDescriptor::new(
         &[
@@ -1873,7 +2077,6 @@ fn test_validate_output_index_map_vs_filter() {
 /// by the same rule.
 #[test]
 fn test_validate_rejects_unwritten_output_slot() {
-    use crate::schema::type_code;
     // in/out: [U64 PK, I64, I64] — two output payload slots.
     let schema = SchemaDescriptor::new(
         &[
@@ -1924,7 +2127,7 @@ fn test_new_panics_on_aliased_register() {
 // INT_IN_SET — set membership as one opcode (O(1) registers, O(log N) per row)
 // ---------------------------------------------------------------------------
 
-/// Pack a sorted, deduplicated i64 set into the `N × 8-byte LE` pool layout the
+/// Pack an i64 set into the `N × 8-byte LE` pool layout the
 /// const pool carries for `INT_IN_SET`.
 fn pack_i64_set(values: &[i64]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(values.len() * 8);
@@ -2043,6 +2246,26 @@ fn test_int_in_set_empty_pool_always_false() {
     // and `len % 8 == 0` so it validates.
     let (schema, prog) = in_set_prog(9 /* I64 */, &[]);
     let mb = make_int_batch(&schema, &[(1, 1, 0, &[42])]);
+    assert_eq!(eval_predicate(&prog, &mb.as_mem_batch(), 0), (0, false));
+}
+
+/// The wire pool order is not trusted: `resolve` sorts it, because the kernel
+/// binary-searches it and the only sort otherwise happens in the client planner.
+#[test]
+fn test_int_in_set_unsorted_pool_is_sorted_at_resolve() {
+    let (schema, prog) = in_set_prog(9 /* I64 */, &[42, -1, 7, 3]);
+    assert_eq!(prog.int_sets[0], vec![-1, 3, 7, 42]);
+    // A binary search over the raw descending-ish order would miss 7 (it sits
+    // past the first probe's `42 > 7` left turn).
+    for v in [-1i64, 3, 7, 42] {
+        let mb = make_int_batch(&schema, &[(1, 1, 0, &[v])]);
+        assert_eq!(
+            eval_predicate(&prog, &mb.as_mem_batch(), 0),
+            (1, false),
+            "value {v} must be found"
+        );
+    }
+    let mb = make_int_batch(&schema, &[(1, 1, 0, &[8])]);
     assert_eq!(eval_predicate(&prog, &mb.as_mem_batch(), 0), (0, false));
 }
 

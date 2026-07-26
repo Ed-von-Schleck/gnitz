@@ -264,10 +264,12 @@ impl ExprBuilder {
         self.add_const_bytes(s.into_bytes())
     }
 
-    /// Push a sorted, deduplicated i64 value pool for `INT_IN_SET`, packed as
-    /// `N × 8-byte LE`, and return its const index. `values` MUST be sorted
-    /// ascending (signed i64) and deduplicated by the caller — the engine and
-    /// interpreter binary-search it as given.
+    /// Push an i64 value pool for `INT_IN_SET`, packed as `N × 8-byte LE`, and
+    /// return its const index. Sorting is not a wire contract: the engine's
+    /// `resolve` sorts the decoded pool before binary-searching it, because set
+    /// membership does not depend on order and trusting the client here would
+    /// turn a skewed pool into a wrong answer. Callers still sort (and dedup) to
+    /// keep the pool small.
     pub fn add_const_int_set(&mut self, values: &[i64]) -> u32 {
         let mut bytes = Vec::with_capacity(values.len() * 8);
         for v in values {

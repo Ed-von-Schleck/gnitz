@@ -4,10 +4,7 @@
 //! coherence the old 13-parameter `op_reduce` signature spread across the
 //! instruction operands; the per-epoch call re-derives nothing.
 
-use crate::schema::{
-    copy_pk_columns_into, type_code, ColumnLocator, ReduceOutKey, SchemaColumn, SchemaDescriptor, TypeCode,
-    MAX_COLUMNS, MAX_PK_COLUMNS,
-};
+use crate::schema::{type_code, ColumnLocator, DerivedSchema, ReduceOutKey, SchemaColumn, SchemaDescriptor, TypeCode};
 
 use super::super::util::{GroupKeyCols, GroupKeyExtractor};
 use super::agg::{AggDescriptor, AggOp};
@@ -32,45 +29,33 @@ pub(crate) const fn agg_output_type(agg_op: AggOp, col_type_code: TypeCode) -> u
 /// input schema (`SchemaDescriptor::reduce_out_key`) before calling this, so
 /// the three arms are byte-identical to what the planner laid out; the ad-hoc
 /// fold (`AdhocFold::new`) derives its SyntheticFold layout through the same
-/// single authority. Caller guarantees the output column count fits
-/// `MAX_COLUMNS`.
+/// single authority. `None` when the group + aggregate columns would overflow
+/// the fixed `[_; 65]` schema array — self-protecting like the compiler's
+/// sibling builders, so no caller owns the bound.
 pub(crate) fn build_reduce_output_schema(
     input: &SchemaDescriptor,
     group_cols: &[u32],
     agg_descs: &[AggDescriptor],
     out_key: ReduceOutKey,
-) -> SchemaDescriptor {
-    let mut cols = [SchemaColumn::new(0, 0); MAX_COLUMNS];
-    let mut n = 0;
-    let mut pk_idx = [0u32; MAX_PK_COLUMNS];
-    let mut pk_len = 0usize;
-
+) -> Option<SchemaDescriptor> {
+    let mut b = DerivedSchema::new();
     match out_key {
         ReduceOutKey::PkPermutation => {
             // Output PK region mirrors the source's PK byte layout: walk
             // `pk_columns()` in pk-list order rather than `group_cols` order.
-            let k = copy_pk_columns_into(input, &mut cols, &mut pk_idx);
-            n = k;
-            pk_len = k;
+            b.push_pk_of(input)?;
         }
         ReduceOutKey::SingleNaturalCol => {
             // A single non-PK-or-PK natural group column keyed directly (e.g.
             // GROUP BY a U64 payload column, where `pk_columns()` would name the
             // wrong column).
-            cols[n] = input.columns[group_cols[0] as usize];
-            pk_idx[pk_len] = n as u32;
-            pk_len += 1;
-            n += 1;
+            b.push_pk(input.columns[group_cols[0] as usize])?;
         }
         ReduceOutKey::SyntheticFold => {
             // Synthetic U128 PK, group columns as payload.
-            cols[n] = SchemaColumn::new(type_code::U128, 0);
-            pk_idx[pk_len] = n as u32;
-            pk_len += 1;
-            n += 1;
+            b.push_pk(SchemaColumn::new(type_code::U128, 0))?;
             for &gc in group_cols {
-                cols[n] = input.columns[gc as usize];
-                n += 1;
+                b.push(input.columns[gc as usize])?;
             }
         }
     }
@@ -82,10 +67,12 @@ pub(crate) fn build_reduce_output_schema(
         let nullable = ad
             .agg_op
             .raw_output_nullable(input.columns[ad.col_idx as usize].nullable != 0, ungrouped);
-        cols[n] = SchemaColumn::new(agg_output_type(ad.agg_op, ad.col_type_code), nullable as u8);
-        n += 1;
+        b.push(SchemaColumn::new(
+            agg_output_type(ad.agg_op, ad.col_type_code),
+            nullable as u8,
+        ))?;
     }
-    SchemaDescriptor::new(&cols[..n], &pk_idx[..pk_len])
+    Some(b.finish())
 }
 
 /// The baked per-instruction reduce plan. Input facts (schemas, group columns,
