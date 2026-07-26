@@ -435,8 +435,8 @@ pub(crate) fn default_agg_name(func: AggFunc, idx: usize) -> String {
 
 /// Reject a MIN/MAX over an argument type the operator cannot order. MIN/MAX
 /// have no correct accumulator path for wide (U128/UUID/I128) types — the i64
-/// slot cannot hold them — Blob has no ordering, and the String comparator in
-/// `decode_signed` reads the prefix as LE signed i64, which orders by neither
+/// slot cannot hold them — Blob has no ordering, and the engine's integer
+/// widening reads a String's prefix as LE signed i64, which orders by neither
 /// bytes nor signedness. A non-MIN/MAX aggregate passes through, so a caller can
 /// hand its function over unconditionally. One home for the ad-hoc (DML) and HIR
 /// binds, which both reject ahead of `agg_typing`'s `Bind` backstop so the message

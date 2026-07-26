@@ -419,6 +419,11 @@ impl FixedInt {
     /// Decode the leading `width()` little-endian bytes of `b` as this integer,
     /// sign- or zero-extended into `i64`. Total: every arm is a real ≤8-byte
     /// integer with a pinned width, so `try_into` cannot fail.
+    ///
+    /// `#[inline]` so the MIR is exported: the sibling constructors/accessors are
+    /// `const fn` (implicitly exportable), this one is not, so without the hint it
+    /// is an out-of-line cross-crate call even for the engine's per-row SUM.
+    #[inline]
     pub fn decode_le_i64(self, b: &[u8]) -> i64 {
         debug_assert!(b.len() >= self.width());
         match self {
@@ -606,6 +611,49 @@ mod tests {
         for t in [tc::F32, tc::F64, tc::STRING, tc::BLOB] {
             assert!(index_key_type(t).is_err(), "{t} must be rejected");
         }
+    }
+
+    /// Two structural facts the engine's index-span writer rests on, swept over
+    /// the whole `u8` domain rather than a hand-listed set:
+    ///   (a) every index key type is one of the four promoted targets, and
+    ///   (b) source width == index width EXACTLY when source type == index type.
+    ///
+    /// (b) is what makes `promote_opk_column`'s identity arm length-safe *and*
+    /// makes `src_tc == target_tc` the correct selector for it. It is a
+    /// `gnitz-wire` property end to end — `index_key_type`, `is_pk_eligible` and
+    /// `wire_stride` all live here — so it is pinned here, where a change to any
+    /// of the three cannot pass `cargo test -p gnitz-wire`.
+    #[test]
+    fn index_key_type_set_is_closed_and_width_stable() {
+        use type_code as tc;
+        let mut reached = 0usize;
+        for raw in 0u8..=u8::MAX {
+            if !is_pk_eligible(raw) {
+                assert!(
+                    index_key_type(raw).is_err(),
+                    "a PK-ineligible type {raw} must not be index-eligible"
+                );
+                continue;
+            }
+            let Ok(idx) = index_key_type(raw) else {
+                // I128 is PK-eligible (produced only as a cross-sign equijoin
+                // `_join_pk`) but has no index promotion.
+                assert_eq!(raw, tc::I128, "only I128 may be PK-eligible yet index-ineligible");
+                continue;
+            };
+            assert!(
+                matches!(idx, tc::U64 | tc::I64 | tc::U128 | tc::UUID),
+                "index_key_type({raw}) = {idx} lies outside the promoted target set",
+            );
+            assert_eq!(
+                wire_stride(raw) == wire_stride(idx),
+                raw == idx,
+                "tc={raw}: width equality must coincide with type identity",
+            );
+            reached += 1;
+        }
+        // U64/I64/U128/UUID (identity) + U8/U16/U32/I8/I16/I32 (promoted).
+        assert_eq!(reached, 10, "the reachable source→index pair set changed");
     }
 
     /// The reindex / `_join_pk` width policy (the single source of truth the

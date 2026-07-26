@@ -762,7 +762,7 @@ pub(super) fn emit_reduce(
 
     // Every aggregate that decodes its column value needs an order-encodable
     // (≤8-byte int/float) scalar. SUM/SUM_ZERO sum it — a 16-byte source would abort
-    // at the first push in `decode_signed` (`unreachable!`) and a string would
+    // when the accumulator classifies its widening (`SumWiden::classify`) and a string would
     // silently mis-sum; MIN/MAX compare it via `encode_ordered`, which has no
     // monotone key for STRING / U128 / UUID / BLOB. COUNT / COUNT_NON_NULL never
     // read the value. The SQL binder already rejects these,

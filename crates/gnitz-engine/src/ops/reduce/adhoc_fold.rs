@@ -350,7 +350,7 @@ mod tests {
             let vals: Vec<Option<i64>> = (0..n_aggs)
                 .map(|k| {
                     // Agg col k is payload slot 1 + k (slot 0 is the group col).
-                    if crate::schema::null_bit(nw, 1 + k) {
+                    if gnitz_wire::null_word_get(nw, 1 + k) {
                         None
                     } else {
                         Some(read_i64_le(out.col_data(1 + k), row * 8))

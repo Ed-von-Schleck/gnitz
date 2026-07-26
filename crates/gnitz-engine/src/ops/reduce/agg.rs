@@ -2,6 +2,7 @@
 
 use crate::schema::{ColumnLocator, TypeCode};
 use crate::storage::{MemBatch, ReadCursor};
+use gnitz_wire::FixedInt;
 
 // ---------------------------------------------------------------------------
 // Aggregate opcodes
@@ -93,36 +94,104 @@ pub struct AggDescriptor {
     pub col_type_code: TypeCode,
 }
 
-/// Accumulator: internal state for one aggregate column.
-///
-/// Field order: largest alignment first to minimise padding.
+/// Accumulator: internal state for one aggregate column. Rebuilt per epoch, then
+/// stepped once per input row per aggregate, so everything the step body needs
+/// beyond the row itself is resolved in `new`.
 pub(super) struct Accumulator {
     acc: i64,
     agg_op: AggOp,
     /// Where the aggregated column's value lives in a row (PK byte offset or
-    /// dense payload slot). Resolved once; the per-row read goes through it.
-    /// Also carries the column's type code — the single source for the
-    /// accumulator's decode/encode dispatch.
+    /// dense payload slot). Resolved once; the per-row value read goes through it.
     loc: ColumnLocator,
+    /// The source column's type — `loc.type_code()` validated once at `new`.
+    tc: TypeCode,
+    /// What one row does to the slot, resolved from `(agg_op, tc)` at `new`.
+    kind: StepKind,
     has_value: bool,
+}
+
+/// What [`Accumulator::step_from_batch`] does with one row, resolved once at
+/// construction so the per-row body dispatches on a discriminant instead of
+/// re-deriving the answer from `agg_op` and `tc`.
+///
+/// This matters beyond tidiness: at `opt-level=0` a derived `PartialEq` on
+/// `AggOp` is a real **call**, so the pre-resolved form removes two out-of-line
+/// comparisons per row per aggregate from the debug binary the E2E suite runs.
+/// Resolving it in `new` also makes the construction one exhaustive `match` over
+/// `AggOp` — a new opcode cannot reach the row path unclassified — and moves
+/// SUM's non-numeric rejection from a per-row unwrap to a once-per-epoch one.
+#[derive(Clone, Copy)]
+enum StepKind {
+    /// Value-independent: count the row before any column read, so a wide
+    /// (>8-byte) source column never reaches the value path.
+    Count,
+    /// Count the row after the NULL gate, still without reading its value.
+    CountNonNull,
+    /// Widen the native bytes into the `i64` slot and add `value * weight`.
+    Sum(SumWiden),
+    /// Order-encode at the source type and keep the extreme; `max` picks the
+    /// direction (the encoding itself is always MIN-oriented).
+    Extreme { max: bool },
+}
+
+/// How [`StepKind::Sum`] widens the source column's native bytes into the `i64`
+/// slot. A pure function of the column type — see [`SumWiden::for_type`].
+#[derive(Clone, Copy)]
+enum SumWiden {
+    /// A ≤8-byte integer. [`FixedInt`] *is* the domain on which "decode
+    /// little-endian bytes → i64" is total, and it carries its own width, so
+    /// holding one replaces the type code, the width and the signedness test.
+    /// It zero-extends unsigned sources (`U8` 0xFF → 255, never -1) and
+    /// reinterprets `U64`'s bit pattern as `i64` — SUM treats the slot as a bit
+    /// container, so wrap-around is unaffected by signedness.
+    Int(FixedInt),
+    F32,
+    F64,
+}
+
+impl SumWiden {
+    /// `None` for a type SUM cannot widen (STRING/BLOB/U128/UUID/I128) —
+    /// `FixedInt::from_type_code` is exhaustive over `TypeCode`, so a non-numeric
+    /// source lands there rather than silently widening as an integer.
+    fn for_type(tc: TypeCode) -> Option<SumWiden> {
+        match tc {
+            TypeCode::F32 => Some(SumWiden::F32),
+            TypeCode::F64 => Some(SumWiden::F64),
+            _ => FixedInt::from_type_code(tc).map(SumWiden::Int),
+        }
+    }
 }
 
 impl Accumulator {
     /// `loc` is the pre-resolved locator of `desc.col_idx` (the plan's baked
     /// `agg_locs` entry) — accumulators are rebuilt per epoch, the `locate()`
-    /// walk is not.
+    /// walk is not. What one row does to the slot is resolved here too, so the
+    /// per-row body dispatches on neither `agg_op` nor `TypeCode`.
     pub(super) fn new(desc: &AggDescriptor, loc: ColumnLocator) -> Self {
+        let tc = TypeCode::from_validated_u8(loc.type_code());
+        // Exhaustive over `AggOp`: a new opcode cannot reach the row path
+        // unclassified. Only SUM reads the value's type, and only SUM can fail
+        // to classify — the planner (`compiler::emit_reduce`) rejects a
+        // non-numeric SUM source, so this is an internal-bug assert, now paid
+        // once per epoch rather than per row.
+        let kind = match desc.agg_op {
+            AggOp::Count => StepKind::Count,
+            AggOp::CountNonNull => StepKind::CountNonNull,
+            AggOp::Sum | AggOp::SumZero => StepKind::Sum(
+                SumWiden::for_type(tc)
+                    .unwrap_or_else(|| unreachable!("SUM over non-numeric type {tc:?} (planner-rejected)")),
+            ),
+            AggOp::Min => StepKind::Extreme { max: false },
+            AggOp::Max => StepKind::Extreme { max: true },
+        };
         Accumulator {
             acc: 0,
             has_value: false,
             agg_op: desc.agg_op,
             loc,
+            tc,
+            kind,
         }
-    }
-
-    #[inline]
-    fn col_type_code(&self) -> TypeCode {
-        TypeCode::from_validated_u8(self.loc.type_code())
     }
 
     pub(super) fn reset(&mut self) {
@@ -158,7 +227,7 @@ impl Accumulator {
         // MIN/MAX hold the MIN-oriented order-preserving encoding; decode back to
         // native value bits for emit. Linear aggregates store the value verbatim.
         if self.agg_op.uses_value_index() {
-            super::super::util::decode_ordered(self.acc as u64, self.col_type_code(), false)
+            super::super::util::decode_ordered(self.acc as u64, self.tc, false)
         } else {
             self.acc as u64
         }
@@ -175,7 +244,7 @@ impl Accumulator {
     /// only, so callers gate on their own first/has_value state.
     #[inline]
     fn extreme_replaces(&self, enc: u64) -> bool {
-        if self.agg_op == AggOp::Max {
+        if matches!(self.kind, StepKind::Extreme { max: true }) {
             enc > self.acc as u64
         } else {
             enc < self.acc as u64
@@ -187,7 +256,7 @@ impl Accumulator {
     /// AVI probe-skip path in `op_reduce` to fold the stored `old` extreme into an
     /// accumulator already carrying the delta's positive-row extreme (`pos`).
     pub(super) fn merge_encoded_extreme(&mut self, enc: u64) {
-        debug_assert!(matches!(self.agg_op, AggOp::Min | AggOp::Max));
+        debug_assert!(matches!(self.kind, StepKind::Extreme { .. }));
         if !self.has_value || self.extreme_replaces(enc) {
             self.acc = enc as i64;
             self.has_value = true;
@@ -195,16 +264,19 @@ impl Accumulator {
     }
 
     fn is_float(&self) -> bool {
-        self.col_type_code().is_float()
+        self.tc.is_float()
     }
 
     /// Step: incorporate one input row into the accumulator.
+    ///
+    /// Runs once per input row per aggregate, so it dispatches on the
+    /// pre-resolved [`StepKind`] — no `AggOp` compare, no `TypeCode` match.
+    #[inline]
     pub(super) fn step_from_batch(&mut self, mb: &MemBatch, row: usize, weight: i64) {
         // COUNT is value-independent: count the row and return before any column
         // read, so a wide PK column (cs = 16) never reaches the ≤8-byte value path.
-        if self.agg_op == AggOp::Count {
-            self.acc = self.acc.wrapping_add(weight);
-            self.has_value = true;
+        if matches!(self.kind, StepKind::Count) {
+            self.count(weight);
             return;
         }
 
@@ -216,22 +288,18 @@ impl Accumulator {
 
         // COUNT_NON_NULL: presence established (PK, or non-null payload above).
         // Count the row without reading its value.
-        if self.agg_op == AggOp::CountNonNull {
-            self.acc = self.acc.wrapping_add(weight);
-            self.has_value = true;
+        if matches!(self.kind, StepKind::CountNonNull) {
+            self.count(weight);
             return;
         }
 
-        let tc = self.col_type_code();
-        let cs = self.loc.size();
-        // SUM accumulates into an i64/u64 slot via decode_signed/decode_float;
-        // MIN/MAX order-encode via encode_ordered. Both handle only the
-        // order-encodable ≤8-byte int/float types — any wider or non-numeric
-        // source (STRING, U128/UUID/BLOB, I128) is rejected when the reduce
-        // circuit is compiled (`compiler::emit_reduce`, for SQL and raw
-        // CircuitBuilder circuits alike) and never reaches here.
+        // SUM widens into an i64/u64 slot; MIN/MAX order-encode via
+        // encode_ordered. Both handle only the order-encodable ≤8-byte int/float
+        // types — any wider or non-numeric source (STRING, U128/UUID/BLOB, I128)
+        // is rejected when the reduce circuit is compiled (`compiler::emit_reduce`,
+        // for SQL and raw CircuitBuilder circuits alike) and never reaches here.
         debug_assert!(
-            cs <= 8,
+            self.loc.size() <= 8,
             "SUM/MIN/MAX over a >8-byte column must be rejected by the planner",
         );
 
@@ -242,21 +310,23 @@ impl Accumulator {
 
         let first = !self.has_value;
         self.has_value = true;
-        let is_f = self.is_float();
 
-        match self.agg_op {
+        match self.kind {
             // SumZero folds identically to Sum (it differs only in its identity /
-            // empty-render, handled by the seed and `emit_agg_col`).
-            AggOp::Sum | AggOp::SumZero => {
-                if is_f {
-                    let val_f = decode_float(bytes, tc);
-                    let cur_f = f64::from_bits(self.acc as u64);
-                    self.acc = f64::to_bits(cur_f + val_f * weight as f64) as i64;
-                } else {
-                    let val = decode_signed(bytes, tc);
-                    self.acc = self.acc.wrapping_add(val.wrapping_mul(weight));
-                }
+            // empty-render, handled by the seed and `emit_agg_col`). Every arm
+            // reads exactly the source column's width — `FixedInt::width()` and
+            // the float arms alike derive from the same schema column `loc` does.
+            StepKind::Sum(SumWiden::Int(fi)) => {
+                self.acc = self.acc.wrapping_add(fi.decode_le_i64(bytes).wrapping_mul(weight));
             }
+            StepKind::Sum(SumWiden::F32) => self.add_float(
+                f32::from_bits(u32::from_le_bytes(bytes[..4].try_into().unwrap())) as f64,
+                weight,
+            ),
+            StepKind::Sum(SumWiden::F64) => self.add_float(
+                f64::from_bits(u64::from_le_bytes(bytes[..8].try_into().unwrap())),
+                weight,
+            ),
             // MIN/MAX hold the AVI's MIN-oriented order-preserving encoding
             // (`encode_ordered`, `for_max=false`), so the extreme test is one
             // unsigned `u64` compare — the U64-unsigned and float-total-order
@@ -266,14 +336,29 @@ impl Accumulator {
             // source (STRING, U128/UUID/BLOB) is rejected when the reduce circuit
             // is compiled (`compiler::emit_reduce`), never executed, so
             // `encode_ordered`'s unreachable arm is genuinely unreachable.
-            AggOp::Min | AggOp::Max => {
-                let enc = super::super::util::encode_ordered(bytes, tc as u8, false);
+            StepKind::Extreme { .. } => {
+                let enc = super::super::util::encode_ordered(bytes, self.tc as u8, false);
                 if first || self.extreme_replaces(enc) {
                     self.acc = enc as i64;
                 }
             }
-            AggOp::Count | AggOp::CountNonNull => unreachable!("handled by early return above"),
+            StepKind::Count | StepKind::CountNonNull => unreachable!("handled by early return above"),
         }
+    }
+
+    /// Count one row at `weight` — the shared body of the two count arms.
+    #[inline]
+    fn count(&mut self, weight: i64) {
+        self.acc = self.acc.wrapping_add(weight);
+        self.has_value = true;
+    }
+
+    /// Accumulate `v * weight` into the float slot (the accumulator holds
+    /// `f64::to_bits` for a float aggregate).
+    #[inline]
+    fn add_float(&mut self, v: f64, weight: i64) {
+        let cur = f64::from_bits(self.acc as u64);
+        self.acc = f64::to_bits(cur + v * weight as f64) as i64;
     }
 
     /// Fold a stored linear aggregate value (read back from `trace_out`) into
@@ -305,79 +390,29 @@ impl Accumulator {
     }
 }
 
-/// Decode a column's bytes into an `i64`-shaped accumulator slot.
-///
-/// For sub-64-bit unsigned types (`U8`/`U16`/`U32`) the value is
-/// zero-extended into the i64, so signed comparison still orders
-/// correctly. Signed types are sign-extended as expected.
-///
-/// **U64 caveat:** the return value is the U64 bit pattern reinterpreted
-/// as `i64` — *not* a sign-extended signed value. Callers comparing the
-/// result for MIN/MAX ordering on a `U64` column must cast back to `u64`
-/// before comparing, otherwise values with the high bit set order
-/// incorrectly. SUM treats the slot as a bit container; wrap-around is
-/// unaffected by signedness.
-#[inline]
-fn decode_signed(bytes: &[u8], tc: TypeCode) -> i64 {
-    use crate::schema::{is_fixed_int, is_signed_int, read_signed, read_unsigned, type_size};
-    let tc = tc as u8;
-    // Explicit non-int rejection, not a bare if/else: a mis-dispatched float
-    // must trip here, never silently round-trip through `read_unsigned`.
-    if !is_fixed_int(tc) {
-        unreachable!("decode_signed: non-integer type {tc} (planner-rejected)");
-    }
-    let size = type_size(tc) as usize;
-    if is_signed_int(tc) {
-        read_signed(bytes, size)
-    } else {
-        // Unsigned sources zero-extend (U8 0xFF → 255, never sign-extend);
-        // U64 reinterprets the bit pattern per the doc caveat above.
-        read_unsigned(bytes, size) as i64
-    }
-}
-
-/// Decode a column's bytes as f64, with proper F32→F64 promotion.
-#[inline]
-fn decode_float(bytes: &[u8], tc: TypeCode) -> f64 {
-    match tc {
-        TypeCode::F32 => f32::from_bits(u32::from_le_bytes(bytes[..4].try_into().unwrap())) as f64,
-        TypeCode::F64 => f64::from_bits(u64::from_le_bytes(bytes[..8].try_into().unwrap())),
-        TypeCode::U8
-        | TypeCode::I8
-        | TypeCode::U16
-        | TypeCode::I16
-        | TypeCode::U32
-        | TypeCode::I32
-        | TypeCode::U64
-        | TypeCode::I64
-        | TypeCode::U128
-        | TypeCode::UUID
-        | TypeCode::String
-        | TypeCode::Blob
-        | TypeCode::I128 => unreachable!("decode_float: non-float type"),
-    }
-}
-
 /// Reconstruct the 8-byte `i64` accumulator bits from an emitted agg column.
 ///
 /// `bytes.len()` is the *output* column width. An 8-byte column (SUM, COUNT,
 /// `I64`/`U64`/`F64` — including a float MIN/MAX, which widens to `F64` and
 /// stores the `f64::to_bits` value even for an `F32` source) holds the raw
 /// accumulator bits verbatim. A narrow (<8-byte) column is only ever a
-/// narrow-integer MIN/MAX value; `decode_signed` sign/zero-extends it back into
-/// the slot exactly as the load path produced it.
+/// narrow-integer MIN/MAX value; [`FixedInt::decode_le_i64`] sign/zero-extends
+/// it back into the slot exactly as the load path produced it — the same
+/// widening [`SumWiden::Int`] applies, so the two directions cannot drift.
 ///
 /// Width-gating (not a source-type dispatch) is load-bearing: a float MIN/MAX
 /// stores `F64` bits under an `F32` source type, and COUNT can carry a
 /// non-integer source `col_type_code` (e.g. `COUNT(uuid_col)` → `UUID`) — either
-/// would mis-decode or hit `decode_signed`'s `unreachable!()` if dispatched on
-/// the source type. The narrow branch is reached only for narrow integers, where
-/// `decode_signed` is exactly right.
+/// would mis-decode or trip the `expect` below if dispatched on the source type.
+/// The narrow branch is reached only for narrow integers, where the widening is
+/// exactly right.
 pub(super) fn readback_agg_bits(bytes: &[u8], src_tc: TypeCode) -> u64 {
     if bytes.len() == 8 {
         u64::from_le_bytes(bytes.try_into().unwrap())
     } else {
-        decode_signed(bytes, src_tc) as u64
+        FixedInt::from_type_code(src_tc)
+            .expect("a narrow agg output column is always a narrow-integer MIN/MAX")
+            .decode_le_i64(bytes) as u64
     }
 }
 

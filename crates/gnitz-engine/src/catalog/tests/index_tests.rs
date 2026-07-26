@@ -1,5 +1,5 @@
 use super::*;
-use crate::schema::make_index_schema;
+use crate::schema::{make_index_schema, IndexKeySpec, MAX_PK_BYTES};
 
 // ── test_index_creation_and_backfill ────────────────────────────────────
 
@@ -987,50 +987,6 @@ fn test_seek_by_index_u16_column() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── Regression: native index key space, payload == PK (signed) ──────
-
-#[test]
-fn index_native_key_payload_matches_pk_signed() {
-    // The FK/index key space is NATIVE (zero-extended bits, signedness carried in
-    // the low source-width bytes only). A value derived from a native-LE payload
-    // column must equal the value decoded from the same value stored OPK in a PK
-    // column, so FK existence checks agree. has_pk/seek_by_index then re-encode
-    // this native value to OPK (sign-extending from the source width) to hit the
-    // order-preserving index.
-    use crate::schema::{payload_native_key, pk_native_key};
-    use gnitz_wire::encode_pk_column;
-
-    for &(tc, sz) in &[
-        (type_code::I8, 1usize),
-        (type_code::I16, 2),
-        (type_code::I32, 4),
-        (type_code::I64, 8),
-    ] {
-        for v in [i64::MIN >> (64 - sz * 8), -1i64, 0, 1, i64::MAX >> (64 - sz * 8)] {
-            let le = &v.to_le_bytes()[..sz];
-            let from_payload = payload_native_key(le, 0, sz, tc);
-            let mut opk_col = vec![0u8; sz];
-            encode_pk_column(le, tc, &mut opk_col);
-            let from_pk = pk_native_key(&opk_col, 0, sz, tc);
-            assert_eq!(
-                from_payload, from_pk,
-                "tc={tc} v={v}: payload (native LE) and PK (decoded OPK) index keys must agree",
-            );
-        }
-    }
-
-    // I32 -1 → zero-extended native bits 0xFFFFFFFF (NOT sign-extended).
-    assert_eq!(
-        payload_native_key(&(-1i32).to_le_bytes(), 0, 4, type_code::I32),
-        0xFFFF_FFFFu128
-    );
-    assert_eq!(
-        payload_native_key(&(-1i16).to_le_bytes(), 0, 2, type_code::I16),
-        0xFFFFu128
-    );
-    assert_eq!(payload_native_key(&[0xFFu8], 0, 1, type_code::I8), 0xFFu128);
-}
-
 #[test]
 fn test_drop_table_cleans_up_indices() {
     let dir = temp_dir("drop_table_idx");
@@ -1267,11 +1223,11 @@ fn test_compound_pk_secondary_index_seek() {
         (10, 2, 300), // same a as row 0, different b
         (40, 1, 200), // same val as row 1, different PK
     ];
-    let mut pk_buf = vec![0u8; 8];
     for &(a, bcol, val) in rows {
-        pk_buf[..4].copy_from_slice(&a.to_le_bytes());
-        pk_buf[4..8].copy_from_slice(&bcol.to_le_bytes());
-        b.extend_pk_bytes(&pk_buf);
+        // `extend_pk_bytes` takes the OPK image verbatim, so a compound PK must
+        // be built through `extend_pk_opk` — a native-LE concatenation is not the
+        // at-rest form (§6) and would ingest a PK region the engine forbids.
+        b.extend_pk_opk(&schema, &[a as u128, bcol as u128]);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
         b.extend_col(0, &val.to_le_bytes());
@@ -1326,10 +1282,7 @@ fn test_compound_pk_secondary_index_retract() {
     let schema = engine.get_schema(tid).unwrap();
 
     let mut b = Batch::with_capacity(schema, 2);
-    let mut pk_buf = vec![0u8; 8];
-    pk_buf[..4].copy_from_slice(&7u32.to_le_bytes());
-    pk_buf[4..8].copy_from_slice(&3u32.to_le_bytes());
-    b.extend_pk_bytes(&pk_buf);
+    b.extend_pk_opk(&schema, &[7, 3]);
     b.extend_weight(&1i64.to_le_bytes());
     b.extend_null_bmp(&0u64.to_le_bytes());
     b.extend_col(0, &500u64.to_le_bytes());
@@ -1341,7 +1294,7 @@ fn test_compound_pk_secondary_index_retract() {
 
     // Retract the same row.
     let mut r = Batch::with_capacity(schema, 1);
-    r.extend_pk_bytes(&pk_buf);
+    r.extend_pk_opk(&schema, &[7, 3]);
     r.extend_weight(&(-1i64).to_le_bytes());
     r.extend_null_bmp(&0u64.to_le_bytes());
     r.extend_col(0, &500u64.to_le_bytes());
@@ -2616,6 +2569,98 @@ fn signed_index_width_ladder_promotes_to_i64_and_orders() {
     }
 }
 
+// ── IndexKeySpec::write_span byte-equivalence ───────────────────────────────
+//
+// `write_span` reduces two operand paths to claimed identities: an unpromoted PK
+// source is copied verbatim out of the OPK region (skipping decode∘encode), and
+// a payload source is handed to the encoder straight from its slot (skipping the
+// widen-into-u128-and-reslice). A wrong byte in either silently corrupts a
+// secondary index, so both are pinned against an explicit oracle rather than
+// inferred — plus a structural gate on the source→index type pair set the
+// identities depend on.
+
+/// Independent oracle for `write_span`: `IndexKeySpec::seek_prefix` is the
+/// **seek-side** encoder, maintained separately, and it consumes native `u128`
+/// values rather than reading a row — so feeding it `ColumnLocator::native_key`
+/// exercises a read path `write_span` no longer takes (`write_span` reads raw
+/// `bytes` and promotes; this decodes to native first). `None` is the NULL skip.
+fn write_span_reference(
+    owner: &SchemaDescriptor,
+    spec: &IndexKeySpec,
+    cols: &[u32],
+    mb: &crate::storage::MemBatch<'_>,
+    row: usize,
+) -> Option<[u8; MAX_PK_BYTES]> {
+    let mut natives = Vec::with_capacity(cols.len());
+    for &c in cols {
+        let loc = owner.locate(c as usize);
+        if loc.is_null(mb, row) {
+            return None;
+        }
+        natives.push(loc.native_key(mb, row));
+    }
+    Some(spec.seek_prefix(&natives).0)
+}
+
+#[test]
+fn write_span_matches_the_oracle_on_compound_null_and_entry_shapes() {
+    // Compound PK `(U32, I64)` so the second indexed column is a PK column at a
+    // NON-ZERO byte offset — the coordinate the verbatim arm slices with.
+    let src = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U32, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I32, 1), // nullable payload
+        ],
+        &[0, 1],
+    );
+    let cols = [1u32, 2];
+    let idx = make_index_schema(&cols, &src).unwrap();
+    let spec = IndexKeySpec::new(&cols, &src, &idx);
+
+    let mut bb = BatchBuilder::new(src);
+    for (i, &(a, v)) in [(7u32, -1i64), (0, 0), (u32::MAX, i64::MIN), (3, i64::MAX)]
+        .iter()
+        .enumerate()
+    {
+        bb.begin_row_opk(&[a as u128, v as u64 as u128], 1);
+        bb.put_i32(-(i as i32));
+        bb.end_row();
+    }
+    // A NULL in the *trailing* indexed column: the leading column's bytes are
+    // written, then `write_span` bails with `false`.
+    bb.begin_row_opk(&[9, 5], 1);
+    bb.put_null();
+    bb.end_row();
+    let b = bb.finish();
+    let null_row = b.count - 1;
+
+    let mb = b.as_mem_batch();
+    let stride = src.pk_stride() as usize;
+    for row in 0..b.count {
+        let mut got = [0u8; MAX_PK_BYTES];
+        let g = spec.write_span(&mb, row, &mut got);
+        let want = write_span_reference(&src, &spec, &cols, &mb, row);
+        assert_eq!(g, want.is_some(), "row={row}: skip verdicts must agree");
+        assert_eq!(g, row != null_row, "row={row}: only the NULL row is skipped");
+        if let Some(want) = want {
+            assert_eq!(got[..spec.key_size()], want[..spec.key_size()], "row={row}");
+        }
+
+        // `write_entry` = span ‖ source-PK OPK suffix, at the span's width.
+        let mut entry = [0u8; MAX_PK_BYTES];
+        assert_eq!(spec.write_entry(&mb, row, &mut entry), g);
+        if g {
+            assert_eq!(entry[..spec.key_size()], got[..spec.key_size()]);
+            assert_eq!(
+                &entry[spec.key_size()..spec.key_size() + stride],
+                mb.get_pk_bytes(row),
+                "row={row}: PK suffix must be the row's OPK bytes, verbatim",
+            );
+        }
+    }
+}
+
 #[test]
 fn write_span_matches_seek_prefix_across_type_ladder() {
     // Write/seek byte-equality: the projected leading-key span (write side) must
@@ -2626,18 +2671,28 @@ fn write_span_matches_seek_prefix_across_type_ladder() {
     let cases: &[(u8, usize, &[i64])] = &[
         (tc::I8, 1, &[-128, -1, 0, 1, 127]),
         (tc::I16, 2, &[-32768, -1, 0, 1, 32767]),
+        (tc::U16, 2, &[0, 1, 42, 65535]),
         (tc::I32, 4, &[i32::MIN as i64, -42, -1, 0, 1, 42, i32::MAX as i64]),
         (tc::I64, 8, &[i64::MIN, -42, -1, 0, 1, 42, i64::MAX]),
         (tc::U8, 1, &[0, 1, 200, 255]),
         (tc::U32, 4, &[0, 1, 42, u32::MAX as i64]),
         (tc::U64, 8, &[0, 1, 42, -1 /* = u64::MAX bits */]),
         (tc::U128, 16, &[0, 1, 42, -1]),
+        (tc::UUID, 16, &[0, 1, 42, -1]),
     ];
     for &(t, sz, values) in cases {
         let src = SchemaDescriptor::new(&[SchemaColumn::new(tc::U64, 0), SchemaColumn::new(t, 0)], &[0]);
         let idx = make_index_schema(&[1], &src).unwrap();
         let idx_type = idx.columns[0].type_code;
         let idx_size = idx.columns[0].size() as usize;
+        // The same column as the table's PK — the source shape that reaches
+        // `write_span`'s PK arm (verbatim copy when unpromoted, decode+encode
+        // otherwise). The payload source alone cannot exercise it.
+        let pk_src = SchemaDescriptor::new(&[SchemaColumn::new(t, 0), SchemaColumn::new(tc::U64, 0)], &[0]);
+        let pk_idx = make_index_schema(&[0], &pk_src).unwrap();
+        assert_eq!(pk_idx.columns[0].type_code, idx_type);
+        let pk_spec = IndexKeySpec::new(&[0], &pk_src, &pk_idx);
+
         for &v in values {
             let native = native_u128_at(v, sz);
             let write_span = project_leading_span(src, &idx, native);
@@ -2646,6 +2701,19 @@ fn write_span_matches_seek_prefix_across_type_ladder() {
                 &write_span[..],
                 &seek[..idx_size],
                 "write/seek byte mismatch for tc={t} v={v}"
+            );
+
+            let mut bb = BatchBuilder::new(pk_src);
+            bb.begin_row_opk(&[native], 1);
+            bb.put_u64(0);
+            bb.end_row();
+            let b = bb.finish();
+            let mut span = [0u8; MAX_PK_BYTES];
+            assert!(pk_spec.write_span(&b.as_mem_batch(), 0, &mut span));
+            assert_eq!(
+                &span[..idx_size],
+                &seek[..idx_size],
+                "PK-source write/seek byte mismatch for tc={t} v={v}"
             );
         }
     }

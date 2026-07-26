@@ -11,11 +11,12 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use super::super::batch::{write_to_batch, Batch, Layout};
-use super::super::columnar::{with_row_cmp, ColumnarSource};
+use super::super::columnar::with_row_cmp;
 use super::super::merge::DirectWriter;
 use super::super::scatter::scatter_unified_sources_with_weights;
 use super::source::CursorSource;
 use super::{ReadCursor, RowComparator};
+use gnitz_expr::RowSource;
 
 thread_local! {
     /// Reusable per-thread scratch buffer for `drain_sorted_into`. Each
@@ -222,7 +223,7 @@ impl ReadCursor {
     /// blob bytes a full drain can produce; callers use this to size the
     /// output blob arena.
     fn total_blob_len(&self) -> usize {
-        self.sources.iter().map(|s| s.blob_slice().len()).sum()
+        self.sources.iter().map(|s| s.blob().len()).sum()
     }
 
     /// Current row's `(entry_idx, row, weight)`. Unlike `push_current_row`, applies

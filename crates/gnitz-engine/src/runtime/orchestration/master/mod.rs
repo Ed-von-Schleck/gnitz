@@ -8,8 +8,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::catalog::CatalogEngine;
 use crate::schema::SchemaDescriptor;
-use crate::schema::{payload_native_key, pk_native_key, IndexKeySpec, SchemaColumn};
+use crate::schema::{IndexKeySpec, SchemaColumn};
 use gnitz_wire::PkColList;
+use gnitz_wire::{payload_native_key, pk_native_key};
 
 use crate::ops::{
     op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode, with_broadcast_indices,

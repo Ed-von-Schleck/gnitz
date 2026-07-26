@@ -156,9 +156,222 @@ pub fn widen_pk_be(pk_bytes: &[u8], stride: usize) -> u128 {
     u128::from_be_bytes(buf)
 }
 
+/// Re-encode an at-rest OPK column at a promoted index/join type — the OPK→OPK
+/// sibling of [`encode_pk_column_promoted`] (native→OPK).
+///
+/// `src_tc == target_tc` is the **identity**: [`decode_pk_column`] and
+/// [`encode_pk_column`] are documented mutual fixed-width bijections, so
+/// decoding and re-encoding at the same type reproduces the input bytes. The
+/// fast path copies them verbatim instead. That equality also implies
+/// `dst.len() == src_opk.len()` (both are `wire_stride(tc)`), so the copy is
+/// length-safe.
+///
+/// One home for the rule: the secondary-index leading-key span
+/// (`IndexKeySpec::write_span`) and the reindex synthetic-key promotion
+/// (`ColPromoter`) must produce byte-identical output for the same logical
+/// value, and they did so only by spelling the same branch twice.
+/// `#[inline(always)]`, not `#[inline]`: this is a per-row call on two hot paths
+/// (`IndexKeySpec::write_span`'s PK arm, `ColPromoter::write_into`), and at
+/// `opt-level=0` — the debug binary the E2E suite runs — LLVM inlines nothing but
+/// the always-inline pass, so the hint leaves a ~38-instruction frame around what
+/// is otherwise a `copy_from_slice`. (The `debug_assert!` is deliberately not
+/// `debug_assert_eq!`: the latter takes both lengths by reference and spills
+/// them, ~13 instructions, for a message the following `copy_from_slice` panic
+/// already implies.)
+#[inline(always)]
+pub fn promote_opk_column(src_opk: &[u8], src_tc: u8, target_tc: u8, dst: &mut [u8]) {
+    if src_tc == target_tc {
+        debug_assert!(
+            dst.len() == src_opk.len(),
+            "promote_opk_column: identity width mismatch"
+        );
+        dst.copy_from_slice(src_opk);
+        return;
+    }
+    // `decode_pk_column_owned` yields exactly the zero-filled native-LE image
+    // the encoder wants.
+    let native = decode_pk_column_owned(src_opk, src_tc);
+    encode_pk_column_promoted(&native[..src_opk.len()], src_tc, target_tc, dst);
+}
+
+// Two distinct key spaces derive a `u128` from a column. They coincide for
+// unsigned types and differ for signed:
+//
+// * ROUTING (`*_route_key`): the canonical `widen_pk_be(OPK)` value — sign-
+//   flipped for signed. Used by exchange/`extract_group_key`, matching
+//   `partition_for_pk_bytes`, which is schema-less and *cannot* decode, so it
+//   must hash the OPK bytes' widened value. Both sides of a distributed join
+//   agree only in this space.
+// * INDEX (`*_native_key`): the native value (signed integers keep their
+//   two's-complement bits, zero-extended). Used by FK validation, unique-index
+//   maintenance, `has_pk`, and `seek_by_index`, which all re-encode native →
+//   OPK at the storage boundary (`Table::opk_key`, `batch_project_index`), so
+//   they need the native value back, not the sign-flipped one.
+//
+// Each space has a PK-side and a payload-side reader because the two regions
+// store the same logical value differently (OPK big-endian vs native LE); the
+// pair agrees by construction, which is what lets a value route and probe the
+// same whether it is a PK column or a payload FK.
+
+/// ROUTING key for one PK column's OPK bytes (canonical / sign-flipped).
+/// `col_size` is the addressed column's width (≤ 16); `offset` its byte offset
+/// within the PK region (0 for a lone PK).
+#[inline]
+pub fn pk_route_key(pk_bytes: &[u8], offset: usize, col_size: usize) -> u128 {
+    debug_assert!(
+        pk_bytes.len() >= offset + col_size,
+        "pk_route_key: buffer too short ({} < {})",
+        pk_bytes.len(),
+        offset + col_size,
+    );
+    widen_pk_be(&pk_bytes[offset..offset + col_size], col_size)
+}
+
+/// ROUTING key for one native little-endian payload column (canonical). Integer
+/// columns are OPK-encoded (signed sign-flip) then widened, so a payload FK
+/// column routes to the same partition as the same value stored as a PK column.
+/// U128/UUID are unsigned (OPK == native). Float/String/Blob have no PK
+/// counterpart; they keep a zero-extended low-8-byte key.
+#[inline]
+pub fn payload_route_key(col_data: &[u8], offset: usize, col_size: usize, type_code_val: u8) -> u128 {
+    debug_assert!(
+        col_data.len() >= offset + col_size,
+        "payload_route_key: buffer too short ({} < {})",
+        col_data.len(),
+        offset + col_size,
+    );
+    let src = &col_data[offset..offset + col_size];
+    match crate::TypeCode::from_validated_u8(type_code_val) {
+        crate::TypeCode::U128 | crate::TypeCode::UUID => u128::from_le_bytes(src.try_into().unwrap()),
+        crate::TypeCode::U8
+        | crate::TypeCode::I8
+        | crate::TypeCode::U16
+        | crate::TypeCode::I16
+        | crate::TypeCode::U32
+        | crate::TypeCode::I32
+        | crate::TypeCode::U64
+        | crate::TypeCode::I64
+        | crate::TypeCode::I128 => {
+            let mut opk = [0u8; 16];
+            encode_pk_column(src, type_code_val, &mut opk[..col_size]);
+            widen_pk_be(&opk[..col_size], col_size)
+        }
+        crate::TypeCode::F32 | crate::TypeCode::F64 | crate::TypeCode::String | crate::TypeCode::Blob => {
+            let mut bytes = [0u8; 8];
+            let copy_len = col_size.min(8);
+            bytes[..copy_len].copy_from_slice(&src[..copy_len]);
+            u64::from_le_bytes(bytes) as u128
+        }
+    }
+}
+
+/// INDEX key for one PK column's OPK bytes: decode back to the native value
+/// (signed bits preserved), zero-extended to `u128`. Feeds `has_pk` /
+/// `seek_by_index`, which re-encode native → OPK to hit the OPK-stored index.
+/// `offset + col_size` must lie within the OPK PK region (`pk_bytes`); a
+/// mismatched `col_size` slices past the column and panics.
+#[inline]
+pub fn pk_native_key(pk_bytes: &[u8], offset: usize, col_size: usize, type_code_val: u8) -> u128 {
+    debug_assert!(
+        pk_bytes.len() >= offset + col_size,
+        "pk_native_key: buffer too short ({} < {})",
+        pk_bytes.len(),
+        offset + col_size,
+    );
+    let mut le = [0u8; 16];
+    decode_pk_column(&pk_bytes[offset..offset + col_size], type_code_val, &mut le[..col_size]);
+    u128::from_le_bytes(le)
+}
+
+/// INDEX key for one native little-endian payload column: the native value,
+/// zero-extended. U128/UUID read all 16 bytes; narrower types zero-extend the
+/// low ≤8 bytes. Float/String/Blob keep the same zero-extended low-8-byte key.
+#[inline]
+pub fn payload_native_key(col_data: &[u8], offset: usize, col_size: usize, type_code_val: u8) -> u128 {
+    debug_assert!(
+        col_data.len() >= offset + col_size,
+        "payload_native_key: buffer too short ({} < {})",
+        col_data.len(),
+        offset + col_size,
+    );
+    match crate::TypeCode::from_validated_u8(type_code_val) {
+        crate::TypeCode::U128 | crate::TypeCode::UUID | crate::TypeCode::I128 => {
+            u128::from_le_bytes(col_data[offset..offset + 16].try_into().unwrap())
+        }
+        _ => {
+            let mut bytes = [0u8; 8];
+            let copy_len = col_size.min(8);
+            bytes[..copy_len].copy_from_slice(&col_data[offset..offset + copy_len]);
+            u64::from_le_bytes(bytes) as u128
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The property the two key spaces exist for: a value stored as a PK column
+    /// and the same value stored as a payload column must produce the same key
+    /// in each space, or the two sides of a distributed join land on different
+    /// workers (routing) or miss each other's index entries (native).
+    #[test]
+    fn pk_and_payload_keys_agree_on_one_logical_value() {
+        use crate::type_code as tc;
+        for &(t, sz) in &[(tc::I8, 1usize), (tc::I16, 2), (tc::I32, 4), (tc::I64, 8), (tc::U32, 4)] {
+            for &v in &[i64::MIN, -257, -1, 0, 1, 255, i64::MAX] {
+                let le = v.to_le_bytes();
+                let native = &le[..sz];
+                let mut opk = [0u8; 16];
+                encode_pk_column(native, t, &mut opk[..sz]);
+                assert_eq!(
+                    pk_route_key(&opk[..sz], 0, sz),
+                    payload_route_key(native, 0, sz, t),
+                    "route keys diverge for tc={t} v={v}",
+                );
+                assert_eq!(
+                    pk_native_key(&opk[..sz], 0, sz, t),
+                    payload_native_key(native, 0, sz, t),
+                    "native keys diverge for tc={t} v={v}",
+                );
+            }
+        }
+        // The native space zero-extends: a signed source keeps its
+        // two's-complement bits in the low source-width bytes and is NOT
+        // sign-extended to 128 bits (`has_pk` re-encodes from the source width).
+        assert_eq!(payload_native_key(&(-1i32).to_le_bytes(), 0, 4, tc::I32), 0xFFFF_FFFF);
+        assert_eq!(payload_native_key(&(-1i16).to_le_bytes(), 0, 2, tc::I16), 0xFFFF);
+        assert_eq!(payload_native_key(&[0xFFu8], 0, 1, tc::I8), 0xFF);
+    }
+
+    /// `promote_opk_column`'s identity arm must equal the general
+    /// decode-then-re-encode path it short-circuits, at every PK-eligible width.
+    #[test]
+    fn promote_opk_column_identity_matches_decode_encode() {
+        for &(t, sz) in &[
+            (crate::type_code::I8, 1usize),
+            (crate::type_code::U8, 1),
+            (crate::type_code::I16, 2),
+            (crate::type_code::U16, 2),
+            (crate::type_code::I32, 4),
+            (crate::type_code::U32, 4),
+            (crate::type_code::I64, 8),
+            (crate::type_code::U64, 8),
+        ] {
+            for &v in &[0i128, 1, -1, i64::MIN as i128, i64::MAX as i128, u64::MAX as i128] {
+                let le = (v as u128).to_le_bytes();
+                let native = &le[..sz];
+                let (mut opk, mut got) = ([0u8; 16], [0u8; 16]);
+                encode_pk_column(native, t, &mut opk[..sz]);
+                promote_opk_column(&opk[..sz], t, t, &mut got[..sz]);
+                let decoded = decode_pk_column_owned(&opk[..sz], t);
+                let mut want = [0u8; 16];
+                encode_pk_column_promoted(&decoded[..sz], t, t, &mut want[..sz]);
+                assert_eq!(got[..sz], want[..sz], "tc={t} v={v}");
+                assert_eq!(got[..sz], opk[..sz], "identity must be the verbatim OPK bytes");
+            }
+        }
+    }
 
     fn roundtrip(tc: u8, le: &[u8]) {
         let mut opk = vec![0u8; le.len()];

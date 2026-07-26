@@ -1,0 +1,13 @@
+[package]
+name    = "gnitz-expr"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gnitz-wire = { path = "../gnitz-wire" }
+
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = "deny"

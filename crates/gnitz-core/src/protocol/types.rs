@@ -714,25 +714,11 @@ impl ColData {
     }
 }
 
-/// True iff payload null-bit `pi` is set in `word` (the column is NULL). The
-/// null word packs one bit per *payload* column: bit `pi` is the `pi`-th non-PK
-/// column in schema order (`Schema::payload_idx`, §6). These two accessors are
-/// the single read/write convention for the bitmap.
-#[inline]
-pub fn null_word_get(word: u64, pi: usize) -> bool {
-    (word >> pi) & 1 == 1
-}
-
-/// Set (`is_null == true`) or clear (`is_null == false`) payload null-bit `pi`
-/// in `word`.
-#[inline]
-pub fn null_word_set(word: &mut u64, pi: usize, is_null: bool) {
-    if is_null {
-        *word |= 1u64 << pi;
-    } else {
-        *word &= !(1u64 << pi);
-    }
-}
+/// The single read/write convention for the payload null bitmap (bit `pi` = the
+/// `pi`-th non-PK column in schema order, `Schema::payload_idx`, §6). Defined in
+/// `gnitz-wire` — the crate that already owns the §6 region indices — so the
+/// client, the evaluator and the engine cannot spell it three different ways.
+pub use gnitz_wire::{null_word_get, null_word_set};
 
 #[cold]
 #[inline(never)]
@@ -1156,21 +1142,6 @@ impl<'a> BatchAppender<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn null_word_get_set_roundtrip() {
-        let mut w = 0u64;
-        assert!(!null_word_get(w, 3));
-        null_word_set(&mut w, 3, true);
-        assert!(null_word_get(w, 3));
-        assert_eq!(w, 0b1000);
-        // Clearing leaves the other bits untouched.
-        null_word_set(&mut w, 5, true);
-        null_word_set(&mut w, 3, false);
-        assert!(!null_word_get(w, 3));
-        assert!(null_word_get(w, 5));
-        assert_eq!(w, 0b100000);
-    }
 
     #[test]
     fn validate_parts_enforces_full_rule_set() {

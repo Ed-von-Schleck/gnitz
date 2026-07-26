@@ -7,7 +7,8 @@
 use super::batch::{Batch, Layout};
 use super::read_cursor::ReadCursor;
 use crate::schema::key::PkBuf;
-use crate::schema::{IndexKeySpec, RowView, SchemaDescriptor, MAX_PK_BYTES};
+use crate::schema::{IndexKeySpec, SchemaDescriptor, MAX_PK_BYTES};
+use gnitz_expr::RowSource;
 
 /// Resolve already-collected source PKs against a base-table cursor into a
 /// result batch — every live row whose index entry key `[span ‖ src_pk]` lies in
@@ -82,8 +83,8 @@ fn gather_source_rows(
 /// `IndexKeySpec::write_entry` (`false` = not indexed: a NULL in any indexed
 /// column).
 #[inline]
-fn row_in_index_range<'b>(
-    mb: &impl RowView<'b>,
+fn row_in_index_range(
+    mb: &impl RowSource,
     row: usize,
     spec: &IndexKeySpec,
     idx_stride: usize,

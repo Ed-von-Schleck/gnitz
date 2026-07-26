@@ -78,6 +78,32 @@ pub fn read_u64_le(buf: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
 }
 
+/// True iff payload null-bit `pi` is set in `word` (the column is NULL).
+///
+/// The null word packs one bit per *payload* column: bit `pi` is the `pi`-th
+/// non-PK column in schema order (the §6 region convention, whose `REG_NULL_BMP`
+/// index this crate already owns). These two accessors are the **one** read/write
+/// convention for the bitmap, shared by the client (`gnitz-core`), the evaluator
+/// (`gnitz-expr`) and the engine — it was previously spelled out in each.
+///
+/// `#[inline(always)]`, like the other per-row primitives: at `opt-level=0` a
+/// plain hint is a no-op, and these run once per payload column per row.
+#[inline(always)]
+pub fn null_word_get(word: u64, pi: usize) -> bool {
+    (word >> pi) & 1 == 1
+}
+
+/// Set (`is_null == true`) or clear (`is_null == false`) payload null-bit `pi`
+/// in `word`. See [`null_word_get`].
+#[inline(always)]
+pub fn null_word_set(word: &mut u64, pi: usize, is_null: bool) {
+    if is_null {
+        *word |= 1u64 << pi;
+    } else {
+        *word &= !(1u64 << pi);
+    }
+}
+
 // `write_u32_le` is used only by the WAL framer within this crate (the engine
 // re-exports the other three LE helpers but never this one), so it stays
 // crate-internal rather than widening the public surface with a dead export.
@@ -89,4 +115,26 @@ pub(crate) fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
 #[inline]
 pub fn write_u64_le(buf: &mut [u8], off: usize, val: u64) {
     buf[off..off + 8].copy_from_slice(&val.to_le_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The null-bitmap convention, pinned where it is now defined: setting and
+    /// clearing bit `pi` must leave every other payload slot untouched.
+    #[test]
+    fn null_word_get_set_roundtrip() {
+        let mut w = 0u64;
+        assert!(!null_word_get(w, 3));
+        null_word_set(&mut w, 3, true);
+        assert!(null_word_get(w, 3));
+        assert_eq!(w, 0b1000);
+        // Clearing leaves the other bits untouched.
+        null_word_set(&mut w, 5, true);
+        null_word_set(&mut w, 3, false);
+        assert!(!null_word_get(w, 3));
+        assert!(null_word_get(w, 5));
+        assert_eq!(w, 0b100000);
+    }
 }

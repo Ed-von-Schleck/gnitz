@@ -36,7 +36,13 @@ impl ScalarRegion {
 }
 
 impl MappedShard {
-    #[inline]
+    /// `#[inline(always)]`: every accessor below funnels through this one-liner,
+    /// and at `opt-level=0` the plain hint is a no-op — so leaving it on the hint
+    /// doubles the frame count of a shard cell read in the debug binary the E2E
+    /// suite runs. (The multi-arm accessors themselves deliberately keep the
+    /// plain hint; inlining a 3-arm match with a formatted `debug_assert!` into
+    /// every call site is not obviously a win.)
+    #[inline(always)]
     pub(crate) fn data(&self) -> &[u8] {
         self.mmap.as_slice()
     }
@@ -458,25 +464,31 @@ impl MappedShard {
     }
 }
 
-impl super::super::columnar::ColumnarSource for MappedShard {
-    #[inline]
+/// `MappedShard` is a [`RowSource`] but deliberately **not** a `BatchView`: a
+/// shard column may be a `ScalarRegion::Constant`, which has a cell address but
+/// no `rows * col_size` region to hand out.
+impl gnitz_expr::RowSource for MappedShard {
+    #[inline(always)]
     fn get_pk_bytes(&self, row: usize) -> &[u8] {
         MappedShard::get_pk_bytes(self, row)
     }
-    #[inline]
-    fn get_weight(&self, row: usize) -> i64 {
-        MappedShard::get_weight(self, row)
-    }
-    #[inline]
+    #[inline(always)]
     fn get_null_word(&self, row: usize) -> u64 {
         self.get_null_word(row)
     }
-    #[inline]
+    #[inline(always)]
     fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
         self.get_col_ptr(row, payload_col, col_size)
     }
-    #[inline]
-    fn blob_slice(&self) -> &[u8] {
+    #[inline(always)]
+    fn blob(&self) -> &[u8] {
         self.blob_slice()
+    }
+}
+
+impl super::super::columnar::ColumnarSource for MappedShard {
+    #[inline(always)]
+    fn get_weight(&self, row: usize) -> i64 {
+        MappedShard::get_weight(self, row)
     }
 }

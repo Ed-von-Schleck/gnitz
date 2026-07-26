@@ -309,7 +309,7 @@ fn permuted_gather_with_string_and_nullable_across_chunks() {
     // Decoded rows: (pk, s, pk_copy, Option<nv>).
     let mut decoded: Vec<(u128, String, u64, Option<i64>)> = (0..got.count)
         .map(|r| {
-            let nv = match crate::schema::null_bit(got.get_null_word(r), 2) {
+            let nv = match gnitz_wire::null_word_get(got.get_null_word(r), 2) {
                 true => None,
                 false => Some(i64::from_le_bytes(got.get_col_ptr(r, 2, 8).try_into().unwrap())),
             };
@@ -385,7 +385,7 @@ fn compute_projection_writes_at_keeper_tail_across_chunks() {
 
     let mut decoded: Vec<(u128, Option<i64>, i64)> = (0..got.count)
         .map(|r| {
-            let doubled = match crate::schema::null_bit(got.get_null_word(r), 0) {
+            let doubled = match gnitz_wire::null_word_get(got.get_null_word(r), 0) {
                 true => None,
                 false => Some(i64::from_le_bytes(got.get_col_ptr(r, 0, 8).try_into().unwrap())),
             };

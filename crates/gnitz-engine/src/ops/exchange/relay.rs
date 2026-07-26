@@ -1038,7 +1038,7 @@ mod tests {
             // Routing by a payload column uses the canonical route key (signed
             // columns are sign-flipped via payload_route_key) so a payload FK
             // routes identically to the same value stored as a PK column.
-            let route_key = crate::schema::payload_route_key(&v.to_le_bytes(), 0, 8, type_code::I64);
+            let route_key = gnitz_wire::payload_route_key(&v.to_le_bytes(), 0, 8, type_code::I64);
             let expected_partition = partition_for_key(route_key);
             let expected_worker = worker_for_partition(expected_partition, num_workers);
             let found = (0..sub_batches[expected_worker].count).any(|r| {

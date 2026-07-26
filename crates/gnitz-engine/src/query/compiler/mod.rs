@@ -1660,7 +1660,7 @@ mod tests {
         };
         // Control: SUM over an order-encodable I64 column compiles.
         assert!(compiles_mid_node(schema(type_code::I64), reduce.clone(), "sum_i64"));
-        // SUM over a 16-byte column would abort at the first push in `decode_signed`.
+        // SUM over a 16-byte column would abort in `SumWiden::classify`.
         assert!(!compiles_mid_node(schema(type_code::U128), reduce.clone(), "sum_u128"));
         // SUM over a STRING column would silently mis-sum.
         assert!(!compiles_mid_node(schema(type_code::STRING), reduce, "sum_str"));

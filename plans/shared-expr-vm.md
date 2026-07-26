@@ -1,12 +1,5 @@
 # One expression evaluator: extract the expr VM into `gnitz-expr`, delete both client interpreters
 
-> **Citation policy.** The working tree has uncommitted edits in several engine
-> files (`expr/plan.rs`, `catalog/scan_spec.rs`, `ops/*`, `storage/repr/*`,
-> `storage/lsm/index_gather.rs`, …), so line numbers there drift. Items in those
-> files are cited **by symbol name**; a line number, where given, is indicative.
-> Line numbers in `gnitz-wire`, `gnitz-core`, `gnitz-sql` and
-> `gnitz-engine/src/{schema.rs,expr/{program,batch}.rs}` are exact as of `a98664fb`.
-
 ## Goal
 
 Expression semantics live in three runtime evaluators that must agree by
@@ -95,7 +88,8 @@ lines, and ~40 items whose visibility widens from `pub(crate)` to `pub`.
   the German-string codec and comparator, and the four route/native-key functions this plan
   relocates are thin dispatch wrappers over `gnitz_wire::{encode_pk_column,
   decode_pk_column, widen_pk_be}` keyed on wire type codes — so "they have no
-  wire representation" would be a false argument. The real reason is cohesion and
+  wire representation" would be a false argument, and indeed those four **did**
+  end up in `gnitz-wire` rather than `gnitz-expr`. The real reason is cohesion and
   blast radius: `gnitz-wire` is the byte-level contract every crate (including
   `capi`/`py`) links, it is already 6185 lines, and adding 2368 lines of runtime
   evaluator plus a resolved-addressing layer makes that contract materially
@@ -113,85 +107,178 @@ lines, and ~40 items whose visibility widens from `pub(crate)` to `pub`.
   answer; with `RowView` deleted (below) `ColumnLocator`'s methods depend only on
   `BatchView`, which already lives in the shared crate.
 
-### Access traits: two, not three — `RowView` is deleted
+### Access traits: one per-row shape, `RowSource`, with two extensions (**DONE**)
 
-`MemBatch` currently implements `ColumnarSource`
-(`storage/repr/columnar.rs:15` — `get_pk_bytes`, `get_weight`, `get_null_word`,
-`get_col_ptr`, `blob_slice`; 7 implementors: `Batch`, `SortedMemBatch`,
-`MemBatch`, `MappedShard`, `RowRef`, `CursorSource`, `TestBatch`) and
-`RowView<'b>` (`schema.rs:709` — `get_null_word`, `get_pk_bytes`, `get_col_ptr`,
-with `&'b` returns decoupled from `&self`; sole implementor `MemBatch`).
+Before this landed the engine had two overlapping row-access traits:
+`ColumnarSource` (`storage/repr/columnar.rs` — `get_pk_bytes`, `get_weight`,
+`get_null_word`, `get_col_ptr`, `blob_slice`; 7 implementors: `Batch`,
+`SortedMemBatch`, `MemBatch`, `MappedShard`, `RowRef`, `CursorSource`,
+`TestBatch`) and `RowView<'b>` (`get_null_word`, `get_pk_bytes`, `get_col_ptr`;
+sole implementor `MemBatch`) — three methods spelled twice.
 
-`ColumnarSource` stays exactly as it is — it is storage-internal, needs the
-weight accessor, and its six non-`MemBatch` implementors never touch a locator.
+Rather than add a *third*, the shared per-row core now lives in `gnitz-expr` and
+both existing traits extend it:
 
-`RowView` is **deleted**, not relocated. Its `&'b` decoupling exists for one
-method — `ColumnLocator::bytes` (`schema.rs:777`) — which has exactly two call
-sites repo-wide (`ops/util.rs`'s group-key pack and `ops/reduce/emit.rs`'s
-exemplar-cell copy), both of which consume the slice within one statement and
-both of which bind `let mb = <batch>.as_mem_batch();` first (grep for
-`bytes(&…as_mem_batch()` → zero hits). The other four `RowView`-taking
-`ColumnLocator` methods (`is_null` `:760`, `native_le_bytes` `:794`,
-`native_key` `:813`, `route_key` `:838`) never return a `'b`-tied value, and the
-only external generic over `RowView` — `row_in_index_range` in
-`storage/lsm/index_gather.rs` — returns `bool`.
-
-So every `RowView` parameter becomes `&impl BatchView`, with
-`get_col_ptr(row, c, s)` → `&col_data(c, s)[row*s .. row*s+s]` and
-`get_null_word(row)` → `gnitz_wire::read_u64_le(null_bmp(), row*8)`. Retarget:
-the five `ColumnLocator` methods, the three `IndexKeySpec` methods
-(`schema.rs:950,981,997`), `row_in_index_range`, and delete the trait plus
-`impl RowView for MemBatch` (`storage/repr/merge.rs:337`). `ops/reindex.rs` and
-`catalog/scan_spec.rs` need no change at all — they destructure `ColumnLocator`
-and read `MemBatch`/`Batch` inherent accessors directly.
-
-**Two of them must keep an explicit batch lifetime — elision would bind the
-return to `&self` and break real callers:**
 ```rust
-fn bytes<'b>(&self, mb: &'b impl BatchView, row: usize) -> &'b [u8]
-fn native_le_bytes<'a, 'b: 'a>(&self, mb: &'b impl BatchView, row: usize,
+// gnitz-expr
+pub trait RowSource {                                   // the one per-row shape
+    fn get_pk_bytes(&self, row: usize) -> &[u8];
+    fn get_null_word(&self, row: usize) -> u64;
+    fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8];
+    fn blob(&self) -> &[u8];
+}
+pub trait BatchView: RowSource {                        // + whole regions
+    fn col_data(&self, payload_col: usize, col_size: usize) -> &[u8];
+    fn null_bmp(&self) -> &[u8];
+}
+// gnitz-engine storage
+pub(crate) trait ColumnarSource: RowSource { fn get_weight(&self, row: usize) -> i64; }
+```
+
+`RowView` is gone. `ColumnarSource` keeps exactly the one method the evaluator
+has no use for; `blob_slice` was renamed to `RowSource::blob` at its ~8 trait
+call sites (the inherent `MappedShard::blob_slice` / `ReadCursor::blob_slice`
+keep their names). All 7 implementors split into a `RowSource` impl plus a
+one-method `ColumnarSource` impl, so `MemBatch` writes each per-row forwarder
+**once** instead of twice.
+
+The split must be at the per-row/region seam and cannot go the other way:
+`MappedShard`, `RowRef` and `CursorSource` can address a cell but have no
+contiguous `rows * col_size` region to hand out (a shard column may be a
+`ScalarRegion::Constant`), so `ColumnarSource: BatchView` is impossible.
+
+`ColumnLocator`'s five row-reading methods bind to **`&impl RowSource`**, not
+`BatchView` — they touch only per-row accessors. That is what lets
+`ColumnarSource`-generic code read through a locator: `ops/util.rs`'s
+`canonical_group_key` was a verbatim copy of `ColumnLocator::route_key`'s two
+arms, existing *only* because its source was a `ReadCursor` and the locator
+demanded `BatchView`. It is deleted; `extract_group_key`, `GroupKeyCols::key_row`
+and **both arms of `hash_group_col`** now call `loc.route_key(src, row)`, and
+`CanonicalKeyArm` collapses to the `bool` predicate its production consumers
+always used (`.is_some()`), taking its arm/locator-mismatch `unreachable!` with
+it.
+
+**The same rule applies to `IndexKeySpec`.** Its `write_span` / `write_entry` /
+`key_bytes` and `index_gather.rs`'s `row_in_index_range` take **`&impl
+RowSource`** — their bodies touch only `get_pk_bytes` / `get_null_word` /
+`get_col_ptr`, so a `BatchView` bound would re-create exactly the over-constraint
+that forced `canonical_group_key` to exist, locking the index-span writer out of
+`MappedShard` / `CursorSource` for nothing. `write_span` itself reads through
+`loc.is_null` + `loc.bytes` and spells only the *encoder* per variant.
+
+**Every `ColumnarSource` bound whose body never reads the weight is now
+`RowSource`** — the comparators (`compare_rows{,_except,_impl,_fixedint_nonnull}`),
+`compare_by_group_cols`, `hash_group_col` / `extract_group_key` /
+`GroupKeyCols::key_row`, and `Batch::append_row_from_source{,_bytes}` /
+`append_row_tail_from_source` / `append_payload_cols`. `ReadCursor::
+current_row_source` returns `&impl RowSource` (a cursor's weight comes off the
+cursor, never the positioned source). `ColumnarSource` survives for `run_merge` /
+`merge_same_pk` / `RowRef` and is **no longer re-exported from `crate::storage`**;
+it is storage-internal.
+
+**The per-row accessors are NOT derived from the region ones.** An earlier draft
+rewrote every per-row read as `&col_data(c, s)[row*s .. row*s+s]` /
+`read_u64_le(null_bmp(), row*8)`. That form adds a row-count load, a second
+multiply and a second range check per read. In an optimized build it is free —
+the batch reference is `noalias`, so after inlining the region offset the count
+and the region range check are loop-invariant and LICM hoists them. At `-O0` it
+is not: no LICM — and `make server` builds debug, which is the binary the whole
+E2E suite runs. `RowSource` therefore declares the per-row shape as **required**
+methods with no defaults, bound by the contract `assert_batchview_consistent`
+checks.
+
+**`#[inline(always)]`, not `#[inline]`, on every dispatch-only accessor.**
+Verified by codegen: at `opt-level=0` LLVM runs no inliner *except* the
+always-inline pass, so `#[inline]` (an `inlinehint`) is a **no-op** there and a
+plain forwarder survives as a real call — a locator read then costs two frames
+(generic method → trait forwarder → inherent body) for one load. So the whole
+chain carries `always`:
+
+- **all seven `ColumnLocator` methods.** Not just the one-liners (`size`,
+  `type_code`, `is_null`, `bytes`): `native_le_bytes`, `native_key` and
+  `route_key` do no work of their own either — each is a two-arm match whose arms
+  are a single `gnitz_wire` call, so the hint left every per-row caller paying two
+  frames (`nm` found all three as real symbols, `route_key` twice).
+- `MemBatch`'s / `Batch`'s / `SortedMemBatch`'s / `CursorSource`'s / `RowRef`'s
+  `RowSource` / `BatchView` / `ColumnarSource` forwarders, **and the branch-free
+  inherent accessors those forwarders UFCS-call** — promoting only the forwarder
+  leaves the terminus a real call and does half the job.
+- `gnitz_wire::promote_opk_column` (per-row on two hot paths; its identity arm is
+  a `copy_from_slice` behind a ~38-instruction `-O0` frame otherwise) and
+  `gnitz_wire::null_word_get` / `null_word_set`.
+- `MappedShard::data()`, the one-liner all five of its accessors funnel through.
+  The multi-arm accessors themselves keep the plain hint deliberately: they are
+  cursor-merge, not locator, path, and inlining a 3-arm match with a formatted
+  `debug_assert!` into every `-O0` call site is not obviously a win.
+
+`gnitz_wire::read_u64_le` (the `get_null_word` terminus) keeps the plain hint, and
+this was **measured**, not assumed: its `-O0` body is a `0xf8`-byte frame whose
+bounds/spill ceremony `always` does not shrink, so promoting it grew the caller
+50 → 151 instructions to save ~10. `FixedInt::decode_le_i64` gained a plain
+`#[inline]` for a different reason — its sibling constructors are `const fn` (MIR
+exported implicitly), it was not, so without the hint it was an out-of-line
+cross-crate call even on the per-row SUM path.
+
+This is what makes the traits vanish — monomorphization alone does not. (It also
+means the debug build, not release, is where the attribute pays:
+`crates/Cargo.toml` sets `[profile.release] lto = true`, so release inlines these
+regardless.)
+
+**Two methods keep an explicit batch lifetime.** Not because a call site needs
+the outliving — both survive the narrowing to the *reference* lifetime — but
+because under elision the `&self` receiver captures the return and
+`native_le_bytes`'s `Payload` arm (which returns `self.bytes(mb, row)` as
+`&'a [u8]`) stops compiling:
+```rust
+fn bytes<'b>(&self, mb: &'b impl RowSource, row: usize) -> &'b [u8]
+fn native_le_bytes<'a, 'b: 'a>(&self, mb: &'b impl RowSource, row: usize,
                                scratch: &'a mut [u8; 16]) -> &'a [u8]
 ```
 `native_le_bytes` **keeps its `'b: 'a` bound** (a single `<'a>` over
-`mb: &'a impl BatchView` + `scratch: &'a mut [u8;16]` also works, since both
-`&'a T` and `&'a mut T` are covariant in `'a`): its `Payload` arm returns
-`self.bytes(mb, row)` — a batch-borrowed slice, `schema.rs:800-806` — so the two
-regions must stay related. Binding its return to `&self` would break
-`ops/reduce/agg.rs:220`, which holds the returned `bytes` live across a
-`self.acc = self.acc.wrapping_add(…)` mutation (E0502). The other six
-(`is_null`, `native_key`, `route_key`, the three `IndexKeySpec` methods,
-`row_in_index_range`) return `bool`/`u128` and take a bare `&impl BatchView`.
-No caller passes a temporary — the only inline `&batch.as_mem_batch()` call is
-`ScalarFunc::run_filter`, which returns `()`.
+`mb: &'a impl RowSource` + `scratch: &'a mut [u8;16]` also works, since both
+`&'a T` and `&'a mut T` are covariant in `'a`; `'b: 'a` is the weaker constraint
+and the zero-diff carry-over): its `Payload` arm returns `self.bytes(mb, row)` —
+a batch-borrowed slice — so the two regions must stay related. **Both receivers
+stay elided-fresh**: binding the return to `&self` would break
+`Accumulator::step_from_batch`, which holds the returned `bytes` live across a
+`self.acc = self.acc.wrapping_add(…)` mutation (E0502). The other three
+(`is_null`, `native_key`, `route_key`) return `bool`/`u128` and take a bare
+`&impl RowSource`; the three `IndexKeySpec` methods and `row_in_index_range`
+take `&impl BatchView`. No caller passes a temporary — the only inline
+`&batch.as_mem_batch()` call is `ScalarFunc::run_filter`, which returns `()`.
 
-`MemBatch` then carries both `ColumnarSource::get_pk_bytes` and
-`BatchView::get_pk_bytes`. Harmless: its inherent method wins for concrete
-receivers and no generic is bounded by both traits.
-
-`BatchView` is therefore the single row-and-column access shape for the
-evaluator *and* for locator reads: one trait added, one deleted.
+`RowSource` is therefore the single per-row access shape for the evaluator, for
+locator reads, and for storage; `BatchView` adds the region half the vectorized
+kernels need. Net: two traits added, two deleted (`RowView` and
+`ColumnarSource`'s four duplicated methods).
 
 ## The crates
 
 ```
-gnitz-wire ── gnitz-expr ─┬── gnitz-engine   (MemBatch impls BatchView; SchemaDescriptor impls SchemaFacts; plan.rs/ScalarFunc)
-                          ├── gnitz-core     (ZSetBatchView + ViewBuffers; Schema impls SchemaFacts)
+gnitz-wire ── gnitz-expr ─┬── gnitz-engine   (MemBatch impls RowSource+BatchView, ColumnarSource extends RowSource; SchemaDescriptor impls SchemaFacts; plan.rs/ScalarFunc)
+                          ├── gnitz-core     (ZSetBatchView + ViewBuffers impl RowSource+BatchView; Schema impls SchemaFacts)
                           └── gnitz-sql      (HAVING / residual / SET over the shared core)
 ```
 
-Add `gnitz-expr` to `crates/Cargo.toml` `members` and as a normal dependency of
-`gnitz-engine`, `gnitz-core`, `gnitz-sql`. `gnitz-engine`'s production deps stay
+`gnitz-expr` is a workspace member and a dependency of `gnitz-engine` already;
+**steps 4 and 5 add it to `gnitz-core` and `gnitz-sql`** (it is not yet a
+dependency of those two). `gnitz-engine`'s production deps stay
 `gnitz-wire` + `gnitz-expr` only (`gnitz-core` remains dev-only,
 `gnitz-engine/Cargo.toml:26`). `gnitz-wire`'s only dependency is `xxhash-rust`,
 so there is no cycle. No `capi`/`py` surface changes.
 
-Give `gnitz-expr` a `[lints]` block matching `gnitz-engine/Cargo.toml:29-33`
+`gnitz-expr` carries a `[lints]` block matching `gnitz-engine/Cargo.toml:29-33`
 (`rust.warnings = "deny"`, `clippy.all = "deny"`); there is no
 `[workspace.lints]`, and `make clippy` runs `--workspace --all-targets -- -D
-warnings` regardless. `lib.rs` must declare the modules **`pub mod`** (`pub mod
-locator; pub mod program; pub mod batch; pub mod filter;`) — with a private
-module plus selective `pub use`, the `pub` items the engine does not reach (e.g.
-`payload_route_key`) would trip `dead_code` under `-D warnings`.
+warnings` regardless.
+
+`lib.rs` uses **private `mod`s plus a flat `pub use module::*;`**, the
+`gnitz-wire/src/lib.rs:18-52` leaf-crate convention. An earlier draft demanded
+`pub mod` on the theory that a private module plus `pub use` would trip
+`dead_code` on items the engine does not reach; that is wrong for a library —
+`pub use locator::*;` raises those items' *effective* visibility to exported, and
+`dead_code` seeds its live set from effective visibility, so nothing `pub` and
+root-reachable in a lib is ever dead. Later steps keep the same shape.
 
 ### `gnitz-wire` owns the German-string comparator (the one wire change)
 
@@ -234,30 +321,55 @@ Two shapes later chunks must not re-introduce:
 
 ### The two traits
 
+`RowSource` + `BatchView` are **shipped** in `gnitz-expr`'s `view` module — six
+required methods across the pair, no defaults:
+
 ```rust
-/// Whole-column access for the vectorized kernels, and per-row access for
-/// `ColumnLocator`. Exactly the four accessors `eval_batch` and its kernels read
-/// (verified: no weight read, no `count`, no `pk_stride`, no region index).
-///
-/// Every slice is the WHOLE column/region, never a morsel slice: the kernels
-/// index absolutely (`eval_str_cmp` reads `col_a[row*16 .. row*16+16]` with
-/// `row = morsel_start + i`, `batch.rs:342-346`; the int/null kernels likewise).
-/// Load-bearing preconditions an implementor must uphold:
-///   `col_data(pi, sz).len() == rows * sz`, `null_bmp().len() == rows * 8`.
-/// Lifetimes are tied to `&self`, NOT decoupled — the client adapter owns the
-/// buffers it materializes and can only lend them for `&self`.
-pub trait BatchView {
-    /// Payload column `payload_col` as `rows * col_size` contiguous native-LE
-    /// bytes (a 16-byte German-string cell for STRING/BLOB).
-    fn col_data(&self, payload_col: usize, col_size: usize) -> &[u8];
-    /// Null bitmap: one 8-byte LE word per row, bit `pi` = payload slot `pi` is NULL.
-    fn null_bmp(&self) -> &[u8];
-    /// Row `row`'s packed OPK PK-region bytes (`pk_stride` wide).
+pub trait RowSource {
+    // Per-row accessors — address one cell directly (see the -O0 reasoning above).
     fn get_pk_bytes(&self, row: usize) -> &[u8];
-    /// The batch's German-string blob heap.
+    fn get_null_word(&self, row: usize) -> u64;
+    fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8];
     fn blob(&self) -> &[u8];
 }
 
+pub trait BatchView: RowSource {
+    // Region accessors — the WHOLE column/region, never a morsel slice: the
+    // kernels index absolutely (`eval_str_cmp` reads `col_a[row*16 .. row*16+16]`
+    // with `row = morsel_start + i`; the int/null kernels likewise). Implementor
+    // preconditions: `col_data(pi, sz).len() == rows * sz`,
+    // `null_bmp().len() == rows * 8`.
+    fn col_data(&self, payload_col: usize, col_size: usize) -> &[u8];
+    fn null_bmp(&self) -> &[u8];
+}
+
+/// The contract binding the two shapes, checked for `rows` rows over the given
+/// `(payload_col, col_size)` pairs:
+///   `get_col_ptr(row, pi, sz) == &col_data(pi, sz)[row*sz .. row*sz + sz]`
+///   `get_null_word(row)       == gnitz_wire::read_u64_le(null_bmp(), row*8)`
+/// A normal `pub fn`, not `#[cfg(test)]`, so cross-crate tests reach it.
+pub fn assert_batchview_consistent<B: BatchView>(v: &B, rows: usize, cols: &[(usize, usize)]);
+```
+
+Lifetimes are tied to `&self`, NOT decoupled — a client adapter owns the buffers
+it materializes and can only lend them for `&self`.
+
+**Step 4's `ZSetBatchView` must call `gnitz_expr::assert_batchview_consistent`.**
+It is the implementor that can actually violate the contract: its `col_data` is
+not a flat-region slice but a `pi → ci` map through `bufs.pi_to_ci[pi]` plus a
+`ColData::{Fixed, Strings, Bytes, U128s}` match, so a `get_col_ptr` that forgets
+the `str_cols[pi]` redirect returns wrong DML/HAVING results silently across the
+`gnitz-capi` C ABI. For `MemBatch` the same property is near-tautological (both
+accessors derive the same `offsets[REG_PAYLOAD_START + pi]` address) and is
+checked in `storage/repr/merge.rs`'s test module — one rule, one assertion, every
+implementor.
+
+`SchemaFacts` lands in **step 3**, alongside the five functions that become
+generic over it — its only consumers. Defining it earlier would put an
+eight-method duplicate API surface on `SchemaDescriptor` that no generic call
+site could reach.
+
+```rust
 /// Exactly the schema surface `resolve`, `validate` and
 /// `is_strictly_non_nullable` read.
 pub trait SchemaFacts {
@@ -286,28 +398,72 @@ Implement every method of both traits `#[inline]`.
 
 ### `gnitz-expr` modules
 
-- **`locator.rs`** — the shared **resolved-addressing substrate**, moved from
-  engine `schema.rs`; every body already touches only `gnitz_wire` + the row
-  accessors (verified: no `SchemaDescriptor`, no `MemBatch`, no log macro):
-  - `ColumnLocator` (`schema.rs:729`) — `pub(crate)` → `pub`; its
+- **`view.rs` (DONE)** — `RowSource`, `BatchView`, `assert_batchview_consistent`.
+- **`locator.rs` (DONE)** — the shared **resolved-addressing substrate**, moved
+  from engine `schema.rs`; every body touches only `gnitz_wire` + the row
+  accessors (no `SchemaDescriptor`, no `MemBatch`, no log macro):
+  - `ColumnLocator` — `pub(crate)` → `pub`; its
     `Pk { byte_off, size, type_code }` / `Payload { slot, size, type_code }`
-    fields become cross-crate-public. Methods `size` (`:745`), `type_code`
-    (`:752`), `is_null` (`:760`), `bytes` (`:777`), `native_le_bytes` (`:794`),
-    `native_key` (`:813`), `route_key` (`:838`) — the last five retargeted from
-    `&impl RowView<'b>` to `&impl BatchView` with the exact signatures given in
-    the trait section (`bytes` and `native_le_bytes` keep an explicit batch
-    lifetime). Keep the `size_of::<ColumnLocator>() <= 8` static assert (`:738`).
-  - the four free functions those methods dispatch to — `pk_route_key`
-    (`:1147`), `payload_route_key` (`:1163`), `pk_native_key` (`:1201`),
-    `payload_native_key` (`:1217`). They serve engine partition routing, not the
-    evaluator; they travel with `ColumnLocator` because Rust's orphan rule puts
-    inherent impls in the defining crate.
-  - `read_signed` (`:1096`), `PAYLOAD_MAPPING_PK_SENTINEL` (`:145`).
+    fields are now cross-crate-public. Methods `size`, `type_code`, `is_null`,
+    `bytes`, `native_le_bytes`, `native_key`, `route_key` — the last five
+    retargeted from `&impl RowView<'b>` to `&impl RowSource` with the exact
+    signatures given in the trait section (`bytes` and `native_le_bytes` keep an
+    explicit batch lifetime). The `size_of::<ColumnLocator>() <= 8` static assert
+    travelled with it. `size`/`type_code`/`is_null`/`bytes` are
+    `#[inline(always)]`; the other three keep `#[inline]`.
+  - `PAYLOAD_MAPPING_PK_SENTINEL`.
 
-  `Instr::CopyCol` (`program.rs:388`) carries a `ColumnLocator`, so the type must
+  `Instr::CopyCol` (`program.rs:390`) carries a `ColumnLocator`, so the type must
   sit in this crate; `eval_batch` never reads one (`CopyCol`/`Emit` are no-ops at
-  `batch.rs:532` — engine `plan.rs`'s `evaluate_map_batch`/`copy_column`
+  `batch.rs:533` — engine `plan.rs`'s `evaluate_map_batch`/`copy_column`
   materialize them).
+
+  **The four key derivations live in `gnitz-wire`, not here** (`pk_route_key`,
+  `payload_route_key`, `pk_native_key`, `payload_native_key`, with the
+  ROUTING-vs-INDEX key-space block comment). An earlier draft kept them beside
+  `ColumnLocator` on the theory that the orphan rule required it — but the orphan
+  rule constrains the inherent `impl`, not four non-generic free functions, and
+  `gnitz-expr` depends on `gnitz-wire` so the methods reach them either way. They
+  are thin dispatches over `encode_pk_column` / `decode_pk_column` /
+  `widen_pk_be` keyed on a wire type code, and **zero** of their 12 caller files
+  is expression code (`ops/util.rs`, `ops/reindex.rs`, `ops/exchange/relay.rs`,
+  `runtime/.../{index_router,mod,preflight,unique_filter}.rs`, `catalog/tests/`),
+  so `gnitz-wire` owns them under exactly the rule it states for `read_u64_le`.
+  **Engine call sites name `gnitz_wire::X` directly** — there is no engine
+  re-export, exactly as for the German-string cluster in step 1. (An earlier
+  version routed three of the four through `foundation::codec` and left
+  `pk_route_key` naming `gnitz_wire::`, which split one rule across two import
+  paths — visibly, in adjacent match arms of `ops/reindex.rs`. The four exist to
+  agree with each other pairwise; they are one item, not four.) All four keep
+  `#[inline]` for MIR export.
+
+  **`gnitz_wire::null_word_get` / `null_word_set` are the one null-bitmap
+  convention**, homed the same way and for the same reason: the payload bitmap is
+  a §6 region rule (`gnitz-wire` already owns `REG_NULL_BMP`), and it had been
+  spelled out three times — engine `schema::{null_bit, set_null_bit}` (deleted),
+  `gnitz_core::{null_word_get, null_word_set}` (now a re-export, so its ~23 call
+  sites are unchanged), and inline in `ColumnLocator::is_null`.
+
+  **`read_signed` and `read_unsigned` both move to `gnitz-wire` in step 3** —
+  never to `gnitz-expr`, and never split. This is the same rule the four key
+  functions above already follow, so step 3 is now a precedent-following move
+  rather than a new decision. Their caller files have nothing to do with
+  expressions (`schema/key.rs`, `storage/repr/shard_file.rs`, `ops/util.rs`,
+  `storage/repr/columnar.rs`), and most dispatch between the *pair* inside one
+  function; `shard_file.rs`/`key.rs` importing from an *expression* crate would be
+  bad cohesion. `gnitz-wire/src/lib.rs:54-57` already declares itself owner of
+  exactly this species, next to `read_u64_le`. The engine will name them
+  `gnitz_wire::read_signed` / `read_unsigned` **directly**, as it now does for the
+  four key derivations and the German-string cluster — no `foundation::codec`
+  re-export, which would only re-split one rule across two import paths.
+  `read_unsigned_zero_extends` moves with them. `ops/reduce/agg.rs` is **no longer
+  a caller**: its SUM widening now holds a `gnitz_wire::FixedInt` (resolved once
+  at `Accumulator::new`), which *is* the domain on which "decode LE bytes → i64"
+  is total and carries its own width — so it replaced the hand-rolled
+  `is_fixed_int`/`is_signed_int`/`read_signed`/`read_unsigned` classifier and the
+  duplicate of it in `decode_signed`. The deferral is still forced:
+  `read_signed`'s only expression-side consumer is in `expr/batch.rs`, a file
+  step 3 moves.
 - **`program.rs`** — `LogicalProgram`, `ResolvedProgram`, `Instr`, `CmpOp`,
   `StrOp`, `LogicalInstr`, `ExprValidateErr`, `from_wire` (`:470`), `resolve`
   (`:627`), `validate` (`:860`), the register analyses. Edits:
@@ -353,26 +509,28 @@ Implement every method of both traits `#[inline]`.
     unchanged.
   - delete the lone `gnitz_debug!` (`:416`, in `LogicalProgram::new`) — the only
     log macro in `program.rs`/`batch.rs`.
-  - `ExprValidateErr`'s doc comment (`:28-30`) currently says "`Debug` only … no
+  - `ExprValidateErr`'s doc comment (`:29-31`) currently says "`Debug` only … no
     consumer branches on the variant". The client now branches on
     `TooManyRegs(n)` (below), so update it.
-- **`batch.rs`** — `eval_batch` (`:442`), `EvalScratch` (`:23`), every kernel.
+- **`batch.rs`** — `eval_batch` (`:443`), `EvalScratch` (`:24`), every kernel.
   **Five** signatures take `mb: &MemBatch` and all five become `<B: BatchView>`:
-  `eval_is_null` (`:196`), `eval_str_cmp<'x>` (`:328`), `eval_str_col_vs_const`
-  (`:353`), `eval_str_col_vs_col` (`:385`), `eval_batch` (`:442`). Body edits:
-  `mb.blob` → `mb.blob()` at `:379` and `:405`; drop the `as usize` on the
-  `type_size` → `wire_stride` calls at `:541,586`. (`col_data` at
-  `:378,404,414,544,587`, `null_bmp` at `:211,340,579,601`, `get_pk_bytes` at
-  `:624,637` are already method calls.) The `&self`-tied returns are
-  borrow-check-safe: `eval_str_col_vs_col` (`:404-419`) holds `col_b`, `blob` and
-  a `move` closure live across a second `mb` pass, which under `BatchView` are
-  shared reborrows of `*mb` unified at one lifetime — exactly what
-  `b_of: impl Fn(usize) -> (&'x [u8], &'x [u8])` needs. The
-  `#[allow(clippy::too_many_arguments)]` attributes at `:101,193,326,352,385`
-  travel with the code. Remaining leans retarget to `gnitz_wire::{read_u64_le,
-  wire_stride, is_signed_int, decode_pk_column, widen_pk_be,
-  encode_german_string, compare_german_strings}` and `locator::{read_signed,
-  PAYLOAD_MAPPING_PK_SENTINEL}`.
+  `eval_is_null` (`:195`), `eval_str_cmp<'x>` (`:328`), `eval_str_col_vs_const`
+  (`:354`), `eval_str_col_vs_col` (`:387`), `eval_batch` (`:443`). Body edits:
+  `mb.blob` → `mb.blob()` at `:380` and `:406`; drop the `as usize` on the
+  **three** `type_size` → `wire_stride` calls at `:543,587,613` (the third is
+  `Instr::LoadPk`'s). (`col_data` at `:379,405,415,545,588`, `null_bmp` at
+  `:212,341,580,602`, `get_pk_bytes` at `:625,638` are already method calls.) The
+  `&self`-tied returns are borrow-check-safe: `eval_str_col_vs_col` holds `col_b`,
+  `blob` and a `move` closure live across a second `mb` pass, which under
+  `BatchView` are shared reborrows of `*mb` unified at one lifetime — exactly what
+  `b_of: impl Fn(usize) -> (&'x [u8], &'x [u8])` needs. The **four**
+  `#[allow(clippy::too_many_arguments)]` attributes at `:194,327,353,386` travel
+  with the code (`:102` is `type_complexity` on `reg4`, unrelated). Remaining leans retarget to `gnitz_wire::{read_u64_le,
+  read_signed, wire_stride, is_signed_int, decode_pk_column, widen_pk_be,
+  encode_german_string, compare_german_strings}` and
+  `locator::PAYLOAD_MAPPING_PK_SENTINEL` — `read_signed` moves to `gnitz-wire`
+  (with `read_unsigned` and `read_unsigned_zero_extends`) in this same step, not
+  to `locator.rs`.
 - **`filter.rs`** — two entry points lifted out of engine `plan.rs`:
   ```rust
   /// Invokes `append_range(start, end)` per maximal run of passing rows —
@@ -410,23 +568,24 @@ Implement every method of both traits `#[inline]`.
   its destination null word rather than OR-ing into it
   (`fill_null_bits_mask` `:186`, `null_or2` `:145`, `null_copy1` `:158`,
   `clear_null_reg` for `LoadPk`/`LoadConst` `:642,652`).
-- **`lib.rs`** — the four `pub mod`s plus a flat `pub use` of the public surface.
+- **`lib.rs`** — the modules (`locator`, `view`, `program`, `batch`, `filter`)
+  as private `mod`s plus a flat `pub use module::*;` of each.
 
-### The public surface: 40 named items
+### The public surface: 37 named items
 
-Stated as a number rather than implied: 40 named items, plus the 7
-`ColumnLocator` methods and 12 trait methods listed above. This is **not smaller
+Stated as a number rather than implied: 37 named items, plus the 7
+`ColumnLocator` methods and 14 trait methods listed above. This is **not smaller
 than before the extraction** — it is the same code with a wider visibility
 keyword; `gnitz-expr` is an internal workspace crate with no stability contract.
 What matters is that the `unsafe` and optimizer-internal items stay private.
 
-- Types (11): `ColumnLocator` (+ its 6 variant fields), `BatchView`,
+- Types (12): `ColumnLocator` (+ its 6 variant fields), `RowSource`, `BatchView`,
   `SchemaFacts`, `LogicalProgram`, `LogicalInstr`, `Instr`, `ResolvedProgram`,
   `EvalScratch`, `CmpOp`, `StrOp`, `ExprValidateErr`.
 - Consts (3): `PAYLOAD_MAPPING_PK_SENTINEL`, `MORSEL`, `NULL_WORDS_PER_REG`.
-- Free fns (8): `read_signed`, `pk_route_key`, `payload_route_key`,
-  `pk_native_key`, `payload_native_key`, `eval_batch`, `filter_batch`,
-  `eval_scalar_row`.
+- Free fns (4): `assert_batchview_consistent`, `eval_batch`, `filter_batch`,
+  `eval_scalar_row`. (Neither `read_signed` nor the four `*_route_key` /
+  `*_native_key` derivations is among them — all five go to `gnitz-wire`.)
 - `LogicalProgram` methods (8): `new` (`:415`), `copy_cols` (`:452`), `from_wire`
   (`:470`), `payload_copy_srcs` (`:597`), `sequential_copy_base` (`:615`),
   `resolve` (`:627`), `validate` (`:860`), and `Debug`/equality as already
@@ -456,13 +615,15 @@ them (engine `plan.rs` uses only `ensure_capacity` plus direct field indexing).
 ## Engine side
 
 **Stays in `gnitz-engine`:**
-- `MemBatch` (`storage/repr/merge.rs`) — stays in storage. Add `impl BatchView
-  for MemBatch<'_>`: `col_data`, `null_bmp`, `get_pk_bytes` already exist as
-  inherent `&'a`-returning methods and coerce to the trait's `&self` lifetime;
-  add `fn blob(&self) -> &[u8] { self.blob }` (an inherent field / trait method
-  name pair is legal, and the inherent methods shadow the trait's for direct
-  calls). `impl ColumnarSource for MemBatch` is untouched; `impl RowView for
-  MemBatch` is deleted.
+- `MemBatch` (`storage/repr/merge.rs`) — stays in storage, with `impl RowSource`
+  + `impl BatchView` + a one-method `impl ColumnarSource`: `col_data`,
+  `null_bmp`, `get_pk_bytes` already exist as inherent `&'a`-returning methods
+  and coerce to the trait's `&self` lifetime; `fn blob(&self) -> &[u8] {
+  self.blob }` (an inherent field / trait method name pair is legal, and the
+  inherent methods shadow the trait's for direct calls). Every forwarder is
+  `#[inline(always)]`. `impl RowView for MemBatch` is deleted, and
+  `ColumnarSource`'s four per-row methods are no longer restated here — they come
+  from `RowSource`.
 - `REG_*` / `MAX_BATCH_REGIONS`, `Batch`, `Batch::as_mem_batch`.
 - `impl SchemaFacts for SchemaDescriptor` — forwarding to `locate`
   (`schema.rs:656`), `is_pk_col` (`:571`), `payload_mapping_byte` (`:580`),
@@ -489,16 +650,23 @@ them (engine `plan.rs` uses only `ensure_capacity` plus direct field indexing).
   ```
   The two production callers (`catalog/scan_spec.rs`, `ops/linear.rs`) are
   untouched.
-- **Re-exports from engine `schema` so call sites compile unchanged**:
-  `ColumnLocator`, `read_signed`, `PAYLOAD_MAPPING_PK_SENTINEL`, **and all four
-  of `pk_route_key`/`payload_route_key`/`pk_native_key`/`payload_native_key`** —
-  the last four are named as `crate::schema::X` from 9 files outside `schema.rs`
-  (`ops/util.rs`, `ops/reindex.rs`, `ops/exchange/relay.rs`,
-  `runtime/orchestration/master/{index_router,mod,preflight}.rs`,
-  `catalog/tests/index_tests.rs`). The `schema` re-export also covers the 88
-  `ColumnLocator` references across 14 files.
+- **Re-exports, one rule: each item sits behind the module that owns its
+  concept.** `crate::schema` re-exports `ColumnLocator`,
+  `PAYLOAD_MAPPING_PK_SENTINEL` and `read_signed` — those *are* schema facts
+  (`SchemaDescriptor::locate` produces a locator, `compute_mappings` writes the
+  sentinel), so the facade is legitimate and covers the 88 `ColumnLocator`
+  references across 14 files unchanged. The four `*_route_key` / `*_native_key`
+  derivations deliberately do **not** come through `schema`, and do not come
+  through `foundation::codec` either: they are wire byte primitives, so they live
+  in `gnitz-wire` and every engine call site names `gnitz_wire::X` — the same home
+  and the same spelling step 3 gives `read_signed` / `read_unsigned`, and that
+  step 1 already gave the German-string cluster and the null-bitmap accessors. Two
+  earlier drafts split this rule by how many call sites would churn rather than by
+  ownership: one routed the four through `schema`, the next re-exported three of
+  the four through `foundation::codec`.
 - **`expr/mod.rs`** shrinks to `mod plan; #[cfg(test)] mod tests; pub use
-  plan::ScalarFunc;` plus `pub(crate) use gnitz_expr::{ExprValidateErr,
+  plan::{PkFill, ScalarFunc};` (it exports **`PkFill` as well as** `ScalarFunc`
+  today — `expr/mod.rs:11` — and must keep both) plus `pub(crate) use gnitz_expr::{ExprValidateErr,
   LogicalProgram};` (`ExprValidateErr` is used by
   `query/compiler/{emit.rs:14,mod.rs:6}`; demoting `LogicalProgram` from `pub
   use` to `pub(crate) use` is equivalent in a binary crate) and the
@@ -1056,10 +1224,20 @@ dev-dependency, so both schema types are in scope) asserting that
 agree on **all eight methods** — `locate`, `is_pk_col`, `payload_mapping_byte`,
 `payload_col_idx`, `num_payload_cols`, `num_columns`, `col_type_code`,
 `col_nullable` — for every `ci`/`pi` over a schema matrix: signed and unsigned
-PK; U64, U128, F64, STRING payload columns; every fixed width (1/2/4/8/16); a
-single PK at column 0; a single PK **not** at column 0; and a compound
-two-column PK. The last two shapes are where a naive `payload_col_idx` passes for
-`payload_idx` and fails here.
+PK; U64, U128, F64, STRING payload columns; **at least one nullable payload
+column** (or `col_nullable` is asserted only against `false`); every fixed width
+(1/2/4/8/16); a single PK at column 0; a single PK **not** at column 0; and a
+compound two-column PK. The last two shapes are where a naive `payload_col_idx`
+passes for `payload_idx` and fails here. `payload_mapping_byte` returns `u8`
+while `payload_col_idx` takes `usize`, so the round-trip needs a cast.
+
+It must stay a **two-impl equivalence** assertion, not a set of invariants
+checked against one impl: invariants cannot catch two self-consistent impls that
+disagree, which is exactly the `payload_col_idx` / `col_nullable` failure mode
+that silently decides `no_nulls`. It lives in `gnitz-engine`'s test tree because
+`gnitz-engine` is binary-only — nothing in `gnitz-core`/`gnitz-sql` can name a
+helper defined there — and the engine's `gnitz-core` dev-dependency
+(`gnitz-engine/Cargo.toml:26`) makes it the only place both schema types coexist.
 
 ## Tests
 
@@ -1139,32 +1317,108 @@ two-column PK. The last two shapes are where a naive `payload_col_idx` passes fo
   extent rule `blob_extent`, the one content accessor `german_string_content`,
   the canonical-form predicate `german_string_cell_ok` and its constructive
   inverse `canonical_short_cell`.
-- [ ] **Create `gnitz-expr`** (dep: `gnitz-wire`; workspace member; dep of
-  `gnitz-engine`/`gnitz-core`/`gnitz-sql`; `[lints]`; `pub mod`s). Define
-  `BatchView` and `SchemaFacts`. Move the substrate into `locator.rs`
-  (`ColumnLocator` + its 7 methods retargeted to `&impl BatchView` + the static
-  assert + the four route/native-key fns + `read_signed` +
-  `PAYLOAD_MAPPING_PK_SENTINEL`). **Delete `RowView`**: retarget `IndexKeySpec`'s
-  three methods and `index_gather.rs`'s `row_in_index_range` to `&impl
-  BatchView`, drop `impl RowView for MemBatch`. `impl BatchView for MemBatch`
-  (+ `blob()`); `impl SchemaFacts for SchemaDescriptor`; engine `schema`
-  re-exports the eight moved items; point `compute_mappings`'s sentinel at
-  `gnitz-expr`. Engine builds green.
+- [x] **DONE — Create `gnitz-expr`.** The crate exists: dep `gnitz-wire` only,
+  workspace member, dep of `gnitz-engine`, `[lints]` mirroring `gnitz-engine`,
+  private `mod` + flat `pub use` (**not** `pub mod` — the `dead_code` claim was
+  wrong for a lib). Steps 4/5 still have to add it to `gnitz-core` and
+  `gnitz-sql`.
+  - `view.rs` ships `RowSource` (4 methods) + `BatchView: RowSource` (2) — **six
+    required methods across the pair, no defaults** — plus the region/per-row
+    contract and the shared `assert_batchview_consistent`, which `MemBatch` and
+    the crate's own `TestView` both call. Step 4's `ZSetBatchView` must implement
+    **both** traits and must call the assertion.
+  - `locator.rs` holds `ColumnLocator` + its 7 methods (retargeted to
+    `&impl RowSource`, **all `#[inline(always)]`**) + the static assert +
+    `PAYLOAD_MAPPING_PK_SENTINEL`. The four route/native-key fns went to
+    `gnitz-wire` instead, and engine call sites name `gnitz_wire::` directly (see
+    the modules section) — there is no `foundation::codec` re-export of them.
+  - `RowView` is gone and `ColumnarSource` now **extends `RowSource`** with only
+    `get_weight`, so its four per-row methods have one definition instead of two
+    and `MemBatch` writes each forwarder once (`blob_slice` → `blob` at the trait
+    call sites). Every bound whose body never reads the weight was relaxed to
+    `RowSource` — including `IndexKeySpec`'s three methods and
+    `index_gather.rs`'s `row_in_index_range`, and `ReadCursor::current_row_source`'s
+    return — so `ColumnarSource` is now storage-internal and **not re-exported from
+    `crate::storage`**. The engine `schema` module re-exports `ColumnLocator` + the
+    sentinel so 90 `ColumnLocator` occurrences across 14 files are unchanged;
+    `RowSource`/`BatchView` are deliberately **not** re-exported — call sites
+    import `gnitz_expr::` directly.
+  - Because `ColumnLocator` binds to `RowSource`, `ColumnarSource`-generic code
+    can read through a locator: `ops/util.rs`'s `canonical_group_key` — a verbatim
+    copy of `route_key`'s two arms that existed only to work around the old bound —
+    is deleted, and `CanonicalKeyArm` collapsed to a `bool`.
+  - `IndexKeySpec::write_span` reads through the locator (`is_null` gates,
+    `bytes` reads) and spells only the *encoder* per variant: a PK source (already
+    OPK) goes to the new `gnitz_wire::promote_opk_column` (OPK→OPK, identity when
+    unpromoted), a payload source to `encode_pk_column_promoted` (native→OPK).
+    `ColPromoter::write_into` uses the same two primitives, so the index span and
+    the reindex `_join_pk` cannot drift — they previously agreed only by spelling
+    the same branch twice, and `ColPromoter` missed the identity arm for a
+    *carried* target equal to its source. `ColPromoter` also now stores the
+    **resolved** `out_tc = resolve_reindex_type(src_tc, carried)` rather than the
+    raw carried tc, so the `0` self-derive sentinel is undone once in `new`
+    instead of twice per row in two different spellings; with that, its `Pk`,
+    `Narrow` and `Wide` arms are each a single encoder call (only the XXH3 string
+    hash stands apart). `IndexKeySpec::new` asserts the property `write_span`
+    actually depends on — `index_key_type(src) == idx_col.type_code` — which
+    subsumes the German-string rejection it previously checked.
+    The identity is pinned in `gnitz-wire`
+    (`promote_opk_column_identity_matches_decode_encode`), as is the closed
+    source→index type-pair set (`index_key_type_set_is_closed_and_width_stable`);
+    engine-side, `write_span_matches_seek_prefix_across_type_ladder` holds both
+    arms to the independent `index_opk_prefix` oracle over 10 types, and
+    `write_span_matches_the_oracle_on_compound_null_and_entry_shapes` oracles the
+    compound-PK / NULL-skip / `write_entry` shapes against `seek_prefix` (the
+    separately-maintained seek-side encoder) rather than a hand-copied twin.
+  - `Accumulator` resolves **what one row does to the slot** once at construction,
+    as a `StepKind` (`Count | CountNonNull | Sum(SumWiden) | Extreme { max }`),
+    where `SumWiden::Int` holds a `gnitz_wire::FixedInt` — replacing three copies
+    of the classify-and-widen rule *and* removing three out-of-line calls per row
+    per aggregate from the debug binary (two derived-`PartialEq` `AggOp` compares
+    and an `Option::expect`; at `-O0` a derived `PartialEq` is a real call).
+    Construction is one exhaustive `match` over `AggOp`, so a new opcode cannot
+    reach the row path unclassified, and SUM's non-numeric rejection moved from a
+    per-row unwrap to a once-per-epoch one.
+    `extract_col_key` and `GroupKeyExtractor::gather`
+    keep calling `ColumnLocator` methods rather than pre-destructured twins: the
+    `#[inline(always)]` accessors make the dispatch free, verified by an
+    interleaved A/B of the AVI compose bench (6.10/6.11 vs 6.01/6.06 ns/row
+    against a hand-hoisted `GatherCol` variant — parity, inside the run-to-run
+    spread, with the simpler form marginally ahead on the full path).
+  - `BatchBuilder` gained `begin_row_opk(&[u128], weight)` (plus `put_i32` /
+    `put_i64`), so a compound-PK test row goes through the builder instead of
+    hand-rolling the `ensure_row_capacity`/`extend_*`/`count += 1` protocol — the
+    spelling that invites `extend_pk_bytes` over a native-LE concatenation, which
+    is not the at-rest form at all.
 - [ ] **Move `program.rs` + `batch.rs` + the filter entry points** into
-  `gnitz-expr`: delete the `gnitz_debug!`; add the private `NoSchema` and
-  turbofish `assembled`'s `validate`; make the five `mb`-taking fns generic over
-  `BatchView` and `resolve`/`validate`/`check_col_in_range`/`check_col_payload`/
-  `is_strictly_non_nullable` generic over `SchemaFacts`; drop the `as usize` on
-  the `wire_stride` calls; apply the public-surface list; update
-  `ExprValidateErr`'s doc comment; `filter.rs` gets `filter_batch` +
-  `scan_filter_bits` + `eval_scalar_row`; engine `plan.rs` retargets and
-  `ScalarFunc::run_filter` wraps `filter_batch`; `expr/mod.rs` shrinks to
-  re-exports; the three expr test files change only their `use` paths and lose
-  `eval_predicate_via_batch`. **Run the codegen verification here.**
+  `gnitz-expr`: delete the `gnitz_debug!`; **define `SchemaFacts`, `impl` it for
+  `SchemaDescriptor`, and make `resolve`/`validate`/`check_col_in_range`/
+  `check_col_payload`/`is_strictly_non_nullable` generic over it** (deferred from
+  step 2 — its only consumers move here); **move `read_signed` *and*
+  `read_unsigned` (plus `read_unsigned_zero_extends`) to `gnitz-wire`**, with the
+  engine naming them `gnitz_wire::` directly (~8 call-site edits); add the
+  private `NoSchema` and turbofish `assembled`'s `validate`; make the five
+  `mb`-taking fns generic over `BatchView` (the region half — the kernels need
+  `col_data`/`null_bmp`, not just `RowSource`); drop the `as usize` on the three
+  `wire_stride` calls; apply the public-surface list; update `ExprValidateErr`'s
+  doc comment; `filter.rs` gets `filter_batch` + `scan_filter_bits` +
+  `eval_scalar_row`; engine `plan.rs` retargets and `ScalarFunc::run_filter`
+  wraps `filter_batch`; **`Instr::LoadPk` carries a `gnitz_wire::FixedInt`
+  resolved at `resolve` time instead of a raw `tc: u8`** — its body
+  (`batch.rs:611-633`) is the last hand-rolled copy of the classify-then-widen
+  rule `FixedInt` packages and `SumWiden::Int` already adopted, and folding it in
+  here drops the `type_size` / `is_signed_int` / `read_signed` trio from the
+  per-instruction path in the same edit that moves the file;
+  `expr/mod.rs` shrinks to re-exports (keeping `PkFill`);
+  the three expr test files change only their `use` paths and lose
+  `eval_predicate_via_batch`. **Run the codegen verification here.** If this step
+  is too large, split it 3a (`program.rs` + `SchemaFacts`) / 3b (`batch.rs` +
+  `filter.rs` + the codegen A/B).
 - [ ] **Client adapter** in `gnitz-core`: `impl SchemaFacts for Schema` (write
   `payload_col_idx`, return `u8` type codes); add `build_pk_region_into` /
   `encode_german_col_into` (`pub(crate)`, existing signatures kept as wrappers);
-  `ViewBuffers` + `ZSetBatchView` with the `U128s` `unreachable!` arm; export both
+  `ViewBuffers` + `ZSetBatchView` (implementing **both** `RowSource` and
+  `BatchView`) with the `U128s` `unreachable!` arm; export both
   through `protocol/mod.rs` and `lib.rs`. Add `expr_unsupported` in `gnitz-sql`.
   **Run the `SchemaFacts` equivalence test here.**
 - [ ] **Swap HAVING**: compile in `select.rs` where `having_supported` was

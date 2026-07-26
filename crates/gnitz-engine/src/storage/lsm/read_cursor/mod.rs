@@ -20,6 +20,7 @@ use crate::schema::SchemaDescriptor;
 mod output;
 mod source;
 
+use gnitz_expr::RowSource;
 pub(crate) use output::DrainGuard;
 use source::CursorSource;
 
@@ -403,14 +404,16 @@ impl ReadCursor {
         self.sources[self.current_entry_idx].get_pk_bytes(self.current_row)
     }
 
-    /// The current row as a `(source, row)` pair for the shared `ColumnarSource`
+    /// The current row as a `(source, row)` pair for the shared [`RowSource`]
     /// kernels (`compare_rows`, group-key extraction, row copies). Resolves the
     /// (entry, row) pair once per row; the returned source is the current row's
     /// **own** entry, so its blob arena backs the row's German strings. The
-    /// opaque `impl ColumnarSource` keeps `CursorSource` private to lsm; every
-    /// use is monomorphic. Callers must gate on `valid` first.
+    /// opaque `impl RowSource` keeps `CursorSource` private to lsm; every use is
+    /// monomorphic. The bound is `RowSource`, not `ColumnarSource`: a cursor's
+    /// weight comes off the cursor (`current_weight`), never off the positioned
+    /// source. Callers must gate on `valid` first.
     #[inline]
-    pub(crate) fn current_row_source(&self) -> (&impl ColumnarSource, usize) {
+    pub(crate) fn current_row_source(&self) -> (&impl RowSource, usize) {
         debug_assert!(self.valid, "current_row_source on an invalid cursor");
         (&self.sources[self.current_entry_idx], self.current_row)
     }
@@ -892,7 +895,7 @@ impl ReadCursor {
         if !self.valid {
             return &[];
         }
-        self.sources[self.current_entry_idx].blob_slice()
+        self.sources[self.current_entry_idx].blob()
     }
 
     /// Decode the German string at logical column `col` of the current row into raw

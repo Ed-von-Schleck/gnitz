@@ -2,6 +2,7 @@
 //!
 //! These are shared across the storage, IPC, and query layers.
 
+use gnitz_expr::RowSource;
 use rustc_hash::FxHashMap;
 
 pub(crate) use gnitz_wire::type_code;
@@ -11,6 +12,15 @@ pub use gnitz_wire::MAX_COLUMNS;
 pub(crate) use gnitz_wire::SHORT_STRING_THRESHOLD;
 pub(crate) use gnitz_wire::{is_fixed_int, is_routable_int, is_signed_int};
 pub use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
+
+/// Resolved column addressing, homed in the leaf `gnitz-expr` crate so the
+/// expression evaluator (and, through it, the SQL client) shares one definition
+/// with the engine. Re-exported here because they *are* schema facts —
+/// `SchemaDescriptor::locate` produces a `ColumnLocator` and `compute_mappings`
+/// writes the sentinel — so every call site keeps naming `crate::schema::X`.
+/// The `*_route_key` / `*_native_key` byte derivations deliberately do NOT come
+/// through here: they are wire primitives and live in `foundation::codec`.
+pub(crate) use gnitz_expr::{ColumnLocator, PAYLOAD_MAPPING_PK_SENTINEL};
 
 /// Order-preserving primary-key (OPK) primitives — encode/compare/route/pack
 /// and the width-tagged `PkBuf`. Sits below both schema and storage; storage
@@ -134,13 +144,6 @@ pub(crate) fn seek_opk_bytes(
     le[NARROW_PK_MAX_BYTES..NARROW_PK_MAX_BYTES + needed].copy_from_slice(&extra[..needed]);
     Ok(key::opk_key(schema, &le[..stride]))
 }
-
-/// Sentinel for any dense payload-index slot (e.g.
-/// `SchemaDescriptor::payload_mapping[ci]`) that needs to express
-/// "this slot refers to a PK column, not a payload column". Using
-/// `u8::MAX` (not 0) keeps the sentinel unambiguous against a real
-/// payload index of 0.
-pub(crate) const PAYLOAD_MAPPING_PK_SENTINEL: u8 = u8::MAX;
 
 /// Pre-computed payload row-comparator strategy for a schema. Stored on
 /// `SchemaDescriptor` and computed once in `new()` so every merge/sort/join
@@ -675,169 +678,11 @@ impl SchemaDescriptor {
     }
 }
 
-/// Read payload slot `pi`'s bit from a row's null-bitmap word (the §6 contract:
-/// bit N = dense payload slot N is NULL).
-#[inline]
-pub(crate) fn null_bit(word: u64, pi: usize) -> bool {
-    (word >> pi) & 1 != 0
-}
-
-/// Set payload slot `pi`'s bit in a row's null-bitmap word.
-#[inline]
-pub(crate) fn set_null_bit(word: &mut u64, pi: usize) {
-    *word |= 1u64 << pi;
-}
-
-/// The three per-row region reads a [`ColumnLocator`]/[`IndexKeySpec`] needs from
-/// a physical batch, abstracted so schema (L1) does not name `storage::MemBatch`
-/// (L2) — the up-edge that would re-form the `schema ↔ storage` cycle. The sole
-/// implementor is `storage::MemBatch`; every call site monomorphizes to it, so
-/// this is **static dispatch only** — never take `&dyn RowView` (it would add a
-/// vtable to the per-row locator paths). The `&'b` returns are decoupled from
-/// `&self` so `bytes()` can hand back a slice that outlives the row-view borrow.
-pub(crate) trait RowView<'b> {
-    /// The row's null-bitmap word (bit N = payload slot N is NULL).
-    fn get_null_word(&self, row: usize) -> u64;
-    /// The row's packed OPK PK-region bytes (`pk_stride` wide).
-    fn get_pk_bytes(&self, row: usize) -> &'b [u8];
-    /// `size` bytes of payload column `col` (native LE) in `row`.
-    fn get_col_ptr(&self, row: usize, col: usize, size: usize) -> &'b [u8];
-}
-
-/// Where a logical column's value physically lives in a row, resolved once from
-/// the schema. The only sanctioned way to read a column whose index is not
-/// statically known to be a payload column: it cannot silently treat a PK
-/// column as payload (the corruption `payload_idx`'s sentinel return invited).
-/// A 4-byte `Copy` value (three `u8` fields + a 1-byte tag). The coordinates
-/// match the schema's own widths — `pk_byte_offset` returns `u8` (PK stride ≤
-/// `MAX_PK_BYTES` = 80), `payload_mapping` slots are `u8` (< `MAX_COLUMNS` = 65,
-/// so ≤ 63 with at least one PK column), and every fixed-width column is ≤ 16
-/// bytes — so `locate` stores them without widening and a `Vec<ColumnLocator>`
-/// (group-key / emit columns) stays dense.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ColumnLocator {
-    /// PK column: value is OPK-at-rest in the PK region at `byte_off`, width
-    /// `size`, type `type_code`. PK columns are non-nullable.
-    Pk { byte_off: u8, size: u8, type_code: u8 },
-    /// Payload column: value is native-LE in dense payload slot `slot` (also its
-    /// null-bitmap bit position), width `size`, type `type_code`.
-    Payload { slot: u8, size: u8, type_code: u8 },
-}
-
-const _: () = assert!(
-    std::mem::size_of::<ColumnLocator>() <= 8,
-    "ColumnLocator must stay packed; a usize coordinate would balloon it to 24 bytes",
-);
-
-impl ColumnLocator {
-    #[inline]
-    pub(crate) fn size(&self) -> usize {
-        match *self {
-            ColumnLocator::Pk { size, .. } | ColumnLocator::Payload { size, .. } => size as usize,
-        }
-    }
-
-    #[inline]
-    pub(crate) fn type_code(&self) -> u8 {
-        match *self {
-            ColumnLocator::Pk { type_code, .. } | ColumnLocator::Payload { type_code, .. } => type_code,
-        }
-    }
-
-    /// True iff this column is NULL in `row`. PK columns are never null.
-    #[inline]
-    pub(crate) fn is_null<'b>(&self, mb: &impl RowView<'b>, row: usize) -> bool {
-        match *self {
-            ColumnLocator::Pk { .. } => false,
-            ColumnLocator::Payload { slot, .. } => (mb.get_null_word(row) >> slot) & 1 != 0,
-        }
-    }
-
-    /// Raw at-rest bytes of the column in `row`: OPK/big-endian for a PK column,
-    /// native little-endian for a payload column. For hashing, group keys, and
-    /// verbatim copies. (Generalises the old `ColLoc::bytes`.) On a STRING/BLOB
-    /// column these are the 16-byte German-string struct (a blob heap offset for
-    /// long strings), not the content — content callers resolve through the blob
-    /// arena. The returned slice borrows the batch's page memory (`'b`), not the
-    /// `&self`/`&mb` reference, so it stays valid after the locator and the
-    /// row-view borrow are dropped (matching [`RowView::get_pk_bytes`]/
-    /// [`RowView::get_col_ptr`], which both return `&'b`).
-    #[inline]
-    pub(crate) fn bytes<'b>(&self, mb: &impl RowView<'b>, row: usize) -> &'b [u8] {
-        match *self {
-            ColumnLocator::Pk { byte_off, size, .. } => {
-                let o = byte_off as usize;
-                &mb.get_pk_bytes(row)[o..o + size as usize]
-            }
-            ColumnLocator::Payload { slot, size, .. } => mb.get_col_ptr(row, slot as usize, size as usize),
-        }
-    }
-
-    /// Native little-endian value bytes of the column in `row`: a payload
-    /// column verbatim, a PK column OPK-decoded into `scratch` (undoing the
-    /// big-endian sign-flipped at-rest form). The value-reading counterpart to
-    /// [`Self::bytes`] — every consumer that interprets a column's *value*
-    /// (aggregation, order-encoding, exemplar copies) must read through here so
-    /// a PK-source column can never be consumed in its at-rest byte order.
-    #[inline]
-    pub(crate) fn native_le_bytes<'a, 'b: 'a>(
-        &self,
-        mb: &impl RowView<'b>,
-        row: usize,
-        scratch: &'a mut [u8; 16],
-    ) -> &'a [u8] {
-        match *self {
-            ColumnLocator::Pk { size, type_code, .. } => {
-                *scratch = gnitz_wire::decode_pk_column_owned(self.bytes(mb, row), type_code);
-                &scratch[..size as usize]
-            }
-            ColumnLocator::Payload { .. } => self.bytes(mb, row),
-        }
-    }
-
-    /// Canonical native u128 key for the value in `row` (sign-aware; the form
-    /// `has_pk` and the index seeks compare on). Callers must `is_null`-gate a
-    /// nullable payload column first; a PK column is never null.
-    #[inline]
-    pub(crate) fn native_key<'b>(&self, mb: &impl RowView<'b>, row: usize) -> u128 {
-        match *self {
-            ColumnLocator::Pk {
-                byte_off,
-                size,
-                type_code,
-            } => pk_native_key(mb.get_pk_bytes(row), byte_off as usize, size as usize, type_code),
-            ColumnLocator::Payload { slot, size, type_code } => payload_native_key(
-                mb.get_col_ptr(row, slot as usize, size as usize),
-                0,
-                size as usize,
-                type_code,
-            ),
-        }
-    }
-
-    /// Canonical sign-aware *routing* key for the value in `row` — the form
-    /// `partition_for_pk_bytes` and the index routing cache compare on, and the
-    /// routing counterpart to [`Self::native_key`]. A PK column widens its OPK
-    /// bytes; a payload column OPK-encodes then widens, so equal logical values
-    /// route to the same partition whether stored as a PK or a payload column.
-    /// Callers must `is_null`-gate first. STRING/BLOB have no order-preserving
-    /// routing image (this returns `payload_route_key`'s raw low-8-byte image for
-    /// them); a caller routing by string content hashes it before reaching here.
-    #[inline]
-    pub(crate) fn route_key<'b>(&self, mb: &impl RowView<'b>, row: usize) -> u128 {
-        match *self {
-            ColumnLocator::Pk { byte_off, size, .. } => {
-                pk_route_key(mb.get_pk_bytes(row), byte_off as usize, size as usize)
-            }
-            ColumnLocator::Payload { slot, size, type_code } => payload_route_key(
-                mb.get_col_ptr(row, slot as usize, size as usize),
-                0,
-                size as usize,
-                type_code,
-            ),
-        }
-    }
-}
+// The payload null-bitmap accessors (`gnitz_wire::null_word_get` /
+// `null_word_set`) are NOT re-exported here. Like the OPK and German-string
+// primitives, the bitmap is a §6 byte convention owned by `gnitz-wire` — the
+// crate whose `REG_NULL_BMP` names the region — and shared verbatim with the
+// client and the evaluator; engine call sites name `gnitz_wire::` directly.
 
 impl SchemaDescriptor {
     /// Byte width of the leading `n` columns. For an index schema this is the
@@ -887,6 +732,20 @@ impl IndexKeySpec {
         for (i, &c) in cols.iter().enumerate() {
             locators[i] = owner.locate(c as usize);
             idx_cols[i] = idx_schema.columns[i];
+            // Spec-invariant, so checked once per circuit rather than per column
+            // per row: `write_span` hands each source's bytes to the OPK encoder
+            // *at `idx_cols[i].type_code`*, so the index column must be exactly
+            // the source's promotion. `index_key_type` errors on STRING/BLOB, so
+            // this also subsumes "a German-string source needs a content hash,
+            // not a raw cell encode" — its 16-byte struct (a heap offset for a
+            // long string) would otherwise encode as if it were an integer. Every
+            // production caller builds `idx_schema` through `make_index_schema`,
+            // which derives it from this very function.
+            debug_assert_eq!(
+                gnitz_wire::index_key_type(locators[i].type_code()).ok(),
+                Some(idx_cols[i].type_code),
+                "IndexKeySpec: index column {i} is not the source column's promotion",
+            );
         }
         IndexKeySpec {
             n: cols.len() as u8,
@@ -936,24 +795,40 @@ impl IndexKeySpec {
     /// pack byte-identically regardless of source/target width). A column whose
     /// source already matches the index type (`U128`/`UUID`, base unsigned ≤8B)
     /// reduces to `encode_pk_column`.
-    pub(crate) fn write_span<'b>(&self, mb: &impl RowView<'b>, row: usize, dst: &mut [u8]) -> bool {
+    ///
+    /// The source bytes come from the locator (`is_null` gates, `bytes` reads the
+    /// OPK PK window or the native-LE payload cell); the only thing spelled per
+    /// variant is *which encoder* consumes them — a PK source is already OPK, so
+    /// it goes through `gnitz_wire::promote_opk_column` (OPK→OPK, identity when
+    /// unpromoted), a payload source through `encode_pk_column_promoted`
+    /// (native→OPK). Those are the same two primitives `ops::reindex`'s
+    /// `ColPromoter::write_into` uses — the two must emit byte-identical keys for
+    /// one logical value, so they share the encoders rather than each spelling the
+    /// promotion.
+    ///
+    /// (The pre-rewrite form widened a payload cell into a `u128` and re-sliced it
+    /// back, which for every reachable index type is the identity on the cell
+    /// bytes — and is FALSE for the 16-byte German-string layout, which
+    /// [`Self::new`] rejects.)
+    pub(crate) fn write_span(&self, mb: &impl RowSource, row: usize, dst: &mut [u8]) -> bool {
+        debug_assert!(dst.len() >= self.key_size(), "write_span: dst shorter than the span");
         let mut off = 0;
         for (loc, col) in self.locators[..self.n as usize].iter().zip(self.idx_cols()) {
+            // PK columns are never null, so this is the payload-only NULL gate.
             if loc.is_null(mb, row) {
                 return false;
             }
-            let src_w = loc.size(); // source column width
             let target_w = col.size() as usize; // promoted index column width
-            let native = loc.native_key(mb, row); // zero-extended native LE in u128
-                                                  // Sign-extends a signed source / zero-extends an unsigned source from
-                                                  // `src_w`, then OPK-encodes at the promoted target. `src_w == target_w`
-                                                  // (no promotion, e.g. U128) reduces to `encode_pk_column`.
-            gnitz_wire::encode_pk_column_promoted(
-                &native.to_le_bytes()[..src_w],
-                loc.type_code(),
-                col.type_code,
-                &mut dst[off..off + target_w],
-            );
+            let out = &mut dst[off..off + target_w];
+            let src = loc.bytes(mb, row);
+            match *loc {
+                ColumnLocator::Pk { type_code, .. } => {
+                    gnitz_wire::promote_opk_column(src, type_code, col.type_code, out)
+                }
+                ColumnLocator::Payload { type_code, .. } => {
+                    gnitz_wire::encode_pk_column_promoted(src, type_code, col.type_code, out)
+                }
+            }
             off += target_w;
         }
         true
@@ -967,7 +842,7 @@ impl IndexKeySpec {
     /// Returns `false` (row not indexed — NULL in an indexed column; `dst`
     /// partially written) exactly as `write_span` does. Full-arity specs only:
     /// a prefix spec would place the suffix over the uncovered columns' bytes.
-    pub(crate) fn write_entry<'b>(&self, mb: &impl RowView<'b>, row: usize, dst: &mut [u8]) -> bool {
+    pub(crate) fn write_entry(&self, mb: &impl RowSource, row: usize, dst: &mut [u8]) -> bool {
         if !self.write_span(mb, row, dst) {
             return false;
         }
@@ -983,7 +858,7 @@ impl IndexKeySpec {
     /// reused scratch — free in the common same-circuit loop), so callers may
     /// slice `out.bytes[..stride]` as the span zero-padded to any wider stride.
     /// A NULL-skipped row returns `false` with `out` unchanged in meaning.
-    pub(crate) fn key_bytes<'b>(&self, mb: &impl RowView<'b>, row: usize, out: &mut key::PkBuf) -> bool {
+    pub(crate) fn key_bytes(&self, mb: &impl RowSource, row: usize, out: &mut key::PkBuf) -> bool {
         if !self.write_span(mb, row, &mut out.bytes) {
             return false;
         }
@@ -1112,114 +987,6 @@ pub(crate) fn read_unsigned(bytes: &[u8], size: usize) -> u64 {
         4 => u32::from_le_bytes(bytes[..4].try_into().unwrap()) as u64,
         8 => u64::from_le_bytes(bytes[..8].try_into().unwrap()),
         _ => unreachable!("read_unsigned: unexpected size {size}"),
-    }
-}
-
-// Two distinct key spaces derive a `u128` from a column. They coincide for
-// unsigned types and differ for signed:
-//
-// * ROUTING (`*_route_key`): the canonical `widen_pk_be(OPK)` value — sign-
-//   flipped for signed. Used by exchange/`extract_group_key`, matching
-//   `partition_for_pk_bytes`, which is schema-less and *cannot* decode, so it
-//   must hash the OPK bytes' widened value. Both sides of a distributed join
-//   agree only in this space.
-// * INDEX (`*_native_key`): the native value (signed integers keep their
-//   two's-complement bits, zero-extended). Used by FK validation, unique-index
-//   maintenance, `has_pk`, and `seek_by_index`, which all re-encode native →
-//   OPK at the storage boundary (`Table::opk_key`, `batch_project_index`), so
-//   they need the native value back, not the sign-flipped one.
-
-/// ROUTING key for one PK column's OPK bytes (canonical / sign-flipped).
-/// `col_size` is the addressed column's width (≤ 16); `offset` its byte offset
-/// within the PK region (0 for a lone PK).
-#[inline]
-pub(crate) fn pk_route_key(pk_bytes: &[u8], offset: usize, col_size: usize) -> u128 {
-    debug_assert!(
-        pk_bytes.len() >= offset + col_size,
-        "pk_route_key: buffer too short ({} < {})",
-        pk_bytes.len(),
-        offset + col_size,
-    );
-    gnitz_wire::widen_pk_be(&pk_bytes[offset..offset + col_size], col_size)
-}
-
-/// ROUTING key for one native little-endian payload column (canonical). Integer
-/// columns are OPK-encoded (signed sign-flip) then widened, so a payload FK
-/// column routes to the same partition as the same value stored as a PK column.
-/// U128/UUID are unsigned (OPK == native). Float/String/Blob have no PK
-/// counterpart; they keep a zero-extended low-8-byte key.
-#[inline]
-pub(crate) fn payload_route_key(col_data: &[u8], offset: usize, col_size: usize, type_code_val: u8) -> u128 {
-    debug_assert!(
-        col_data.len() >= offset + col_size,
-        "payload_route_key: buffer too short ({} < {})",
-        col_data.len(),
-        offset + col_size,
-    );
-    let src = &col_data[offset..offset + col_size];
-    match TypeCode::from_validated_u8(type_code_val) {
-        TypeCode::U128 | TypeCode::UUID => u128::from_le_bytes(src.try_into().unwrap()),
-        TypeCode::U8
-        | TypeCode::I8
-        | TypeCode::U16
-        | TypeCode::I16
-        | TypeCode::U32
-        | TypeCode::I32
-        | TypeCode::U64
-        | TypeCode::I64
-        | TypeCode::I128 => {
-            let mut opk = [0u8; 16];
-            gnitz_wire::encode_pk_column(src, type_code_val, &mut opk[..col_size]);
-            gnitz_wire::widen_pk_be(&opk[..col_size], col_size)
-        }
-        TypeCode::F32 | TypeCode::F64 | TypeCode::String | TypeCode::Blob => {
-            let mut bytes = [0u8; 8];
-            let copy_len = col_size.min(8);
-            bytes[..copy_len].copy_from_slice(&src[..copy_len]);
-            u64::from_le_bytes(bytes) as u128
-        }
-    }
-}
-
-/// INDEX key for one PK column's OPK bytes: decode back to the native value
-/// (signed bits preserved), zero-extended to `u128`. Feeds `has_pk` /
-/// `seek_by_index`, which re-encode native → OPK to hit the OPK-stored index.
-/// `offset + col_size` must lie within the OPK PK region (`pk_bytes`); a
-/// mismatched `col_size` slices past the column and panics.
-#[inline]
-pub(crate) fn pk_native_key(pk_bytes: &[u8], offset: usize, col_size: usize, type_code_val: u8) -> u128 {
-    debug_assert!(
-        pk_bytes.len() >= offset + col_size,
-        "pk_native_key: buffer too short ({} < {})",
-        pk_bytes.len(),
-        offset + col_size,
-    );
-    let mut le = [0u8; 16];
-    gnitz_wire::decode_pk_column(&pk_bytes[offset..offset + col_size], type_code_val, &mut le[..col_size]);
-    u128::from_le_bytes(le)
-}
-
-/// INDEX key for one native little-endian payload column: the native value,
-/// zero-extended. U128/UUID read all 16 bytes; narrower types zero-extend the
-/// low ≤8 bytes. Float/String/Blob keep the same zero-extended low-8-byte key.
-#[inline]
-pub(crate) fn payload_native_key(col_data: &[u8], offset: usize, col_size: usize, type_code_val: u8) -> u128 {
-    debug_assert!(
-        col_data.len() >= offset + col_size,
-        "payload_native_key: buffer too short ({} < {})",
-        col_data.len(),
-        offset + col_size,
-    );
-    match TypeCode::from_validated_u8(type_code_val) {
-        TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => {
-            u128::from_le_bytes(col_data[offset..offset + 16].try_into().unwrap())
-        }
-        _ => {
-            let mut bytes = [0u8; 8];
-            let copy_len = col_size.min(8);
-            bytes[..copy_len].copy_from_slice(&col_data[offset..offset + copy_len]);
-            u64::from_le_bytes(bytes) as u128
-        }
     }
 }
 

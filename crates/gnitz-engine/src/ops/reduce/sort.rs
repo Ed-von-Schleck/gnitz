@@ -3,13 +3,14 @@
 use std::cmp::Ordering;
 
 use crate::schema::{key::PkSortKey, ColumnLocator, SchemaDescriptor, TypeCode};
-use crate::storage::{cmp_col_window, compare_pk_bytes, Batch, ColumnarSource, MemBatch};
+use crate::storage::{cmp_col_window, compare_pk_bytes, Batch, MemBatch};
+use gnitz_expr::RowSource;
 
 /// Compare two rows by group columns through pre-resolved [`ColumnLocator`]s
 /// (the reduce plan's baked `sort_descs`). Generic over two
 /// [`ColumnarSource`]s, so an intra-batch argsort compare and the
 /// trace-cursor-vs-exemplar group-membership test share this one body.
-pub(super) fn compare_by_group_cols<A: ColumnarSource, B: ColumnarSource>(
+pub(super) fn compare_by_group_cols<A: RowSource, B: RowSource>(
     src_a: &A,
     row_a: usize,
     src_b: &B,
@@ -44,8 +45,8 @@ pub(super) fn compare_by_group_cols<A: ColumnarSource, B: ColumnarSource>(
                 // NULL is never set on non-nullable columns, so the bit is always 0
                 // there and this branch is harmless. NULLs sort before non-NULLs
                 // (NULLS FIRST), so all NULLs are adjacent and form a single group.
-                let a_is_null = crate::schema::null_bit(a_null_word, pi);
-                let b_is_null = crate::schema::null_bit(b_null_word, pi);
+                let a_is_null = gnitz_wire::null_word_get(a_null_word, pi);
+                let b_is_null = gnitz_wire::null_word_get(b_null_word, pi);
                 match (a_is_null, b_is_null) {
                     (true, true) => continue,
                     (true, false) => return Ordering::Less,
@@ -60,7 +61,7 @@ pub(super) fn compare_by_group_cols<A: ColumnarSource, B: ColumnarSource>(
                 let cs = size as usize;
                 let a = src_a.get_col_ptr(row_a, pi, cs);
                 let b = src_b.get_col_ptr(row_b, pi, cs);
-                let ord = cmp_col_window(a, src_a.blob_slice(), b, src_b.blob_slice(), type_code);
+                let ord = cmp_col_window(a, src_a.blob(), b, src_b.blob(), type_code);
                 if ord != Ordering::Equal {
                     return ord;
                 }

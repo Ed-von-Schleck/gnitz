@@ -169,7 +169,7 @@ impl ReducePlan {
         let all_linear = agg_descs.iter().all(|d| d.agg_op.is_linear());
         let group_by_pk = out_key == ReduceOutKey::PkPermutation;
         let monotone_out_pk =
-            group_by_pk || super::super::util::single_col_canonical_group_key(input_schema, group_by_cols).is_some();
+            group_by_pk || super::super::util::single_col_canonical_group_key(input_schema, group_by_cols);
         // Either natural kind keys the emitted row by the group value itself, so
         // the output schema carries no group-exemplar columns.
         let use_natural_pk = out_key != ReduceOutKey::SyntheticFold;

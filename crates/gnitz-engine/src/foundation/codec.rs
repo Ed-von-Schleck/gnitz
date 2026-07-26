@@ -6,6 +6,13 @@
 //! `gnitz_wire` (the crate that defines the wire format, and whose WAL framer
 //! needs them) and re-exported here; the engine's 15+ `codec::read_u32_le`
 //! callers are unchanged.
+//!
+//! The `*_route_key` / `*_native_key` key-space derivations deliberately do NOT
+//! come through here. They are `gnitz-wire`'s (thin dispatches over
+//! `encode_pk_column` / `decode_pk_column` / `widen_pk_be` keyed on a wire type
+//! code), and the four exist to agree with each other pairwise — so engine call
+//! sites name `gnitz_wire::X` directly, as they already do for the German-string
+//! cluster. Re-exporting a subset here split one rule across two import paths.
 
 pub use gnitz_wire::{align8, read_u32_le, read_u64_le, write_u64_le};
 

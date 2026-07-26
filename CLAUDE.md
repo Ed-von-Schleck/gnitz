@@ -424,11 +424,12 @@ executes them as a multi-process server.
 | Crate | Role | Depends on |
 |-------|------|------------|
 | `gnitz-wire` | Wire-protocol constants + codecs — the one definition client and engine must agree on | — |
+| `gnitz-expr` | The one expression evaluator, and the resolved column addressing it reads through | `wire` |
 | `gnitz-core` | Client core: connection, protocol, and the logical type / expression / circuit model | `wire` |
 | `gnitz-sql` | SQL front end: parser, binder, query planner | `core` |
 | `gnitz-capi` | C ABI bindings over the client core + planner | `core`, `sql` |
 | `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against | `core`, `sql` |
-| `gnitz-engine` | The DBSP execution engine and `gnitz-server` binary | `wire` |
+| `gnitz-engine` | The DBSP execution engine and `gnitz-server` binary | `wire`, `expr` |
 | `gnitz-test-harness` | Spawns a `gnitz-server` subprocess in a private tmpdir for integration tests | — |
 
 The SQL side compiles a query and ships it to the engine over `gnitz-wire`; the
@@ -449,6 +450,11 @@ storage        → schema                                   repr (L2) · lsm (L3
 schema         → foundation
 foundation (L0)  — independent leaves; depends on nothing
 ```
+
+`gnitz-wire` and `gnitz-expr` sit **below this whole table**, like `foundation`:
+they are separate crates, so a `storage`-layer `use gnitz_expr::RowSource` is not
+an up-edge into the engine's own `expr` module. Read `expr` in the ladder above as
+the engine-local expression layer only.
 
 - **`foundation`** (L0) — unrelated leaves grouped only for layering: `log` (the `gnitz_*` macros), `codec` (LE pack/unpack), `xxh` (XXH3), `posix_io` (fd I/O, fsync, sockets), `syscall` (eventfd/futex/memfd/mmap), `worker_ctx` (worker rank/count).
 - **`schema`** — SQL type constants, schema descriptors, row-format helpers, and the order-preserving-key cluster (`key`). Shared by the storage, IPC, and query layers.

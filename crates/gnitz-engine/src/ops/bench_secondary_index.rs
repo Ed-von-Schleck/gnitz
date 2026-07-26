@@ -269,6 +269,77 @@ fn secondary_index_bench_single_u64_pk_sort() {
     });
 }
 
+/// Per-row cost of composing one secondary-index entry key
+/// (`IndexKeySpec::write_entry` = leading-key span ‖ source-PK suffix) — the
+/// only bench that reaches the resolved-addressing free functions
+/// (`pk_native_key` / `payload_native_key`) and the `ColumnLocator` accessors
+/// they sit behind. `compose` in the AVI decomposition covers only the payload
+/// arm of `ColumnLocator::bytes`.
+///
+/// Four shapes, chosen to separate the encode paths: a **U64 PK** source (no
+/// promotion — the span is a verbatim copy of the OPK bytes already in the PK
+/// region), an **I64 payload** source (no promotion, native LE straight into the
+/// encoder), a **U32 payload → U64** source (real width promotion), and a
+/// **compound (U64 PK, I64 payload)** two-column span.
+#[test]
+#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+fn index_write_span_bench() {
+    use crate::schema::{make_index_schema, IndexKeySpec};
+
+    // `src_schema()` / `build_input` from the top of this file: U64 pk (col 0) |
+    // U32 (col 1) | I64 (col 2), 500k rows. The four shapes map onto it directly.
+    let src = src_schema();
+    let input = build_input(&src);
+    let mb = input.as_mem_batch();
+
+    println!("\nIndexKeySpec::write_entry — per-row cost ({ITERS}x{N_ROWS} rows):");
+    for (label, cols) in [
+        ("U64 PK        (identity)", &[0u32][..]),
+        ("I64 payload   (direct)  ", &[2][..]),
+        ("U32 payload   (promoted)", &[1][..]),
+        ("compound (PK, I64)      ", &[0, 2][..]),
+    ] {
+        let idx = make_index_schema(cols, &src).unwrap();
+        let spec = IndexKeySpec::new(cols, &src, &idx);
+        let elapsed = time(|| {
+            let mut key = [0u8; MAX_PK_BYTES];
+            for row in 0..N_ROWS {
+                std::hint::black_box(spec.write_entry(&mb, row, &mut key));
+                std::hint::black_box(&key);
+            }
+        });
+        let ns = ns_per_row(elapsed);
+        println!("  {label}  {ns:7.2} ns/row   ({:.2} Mrows/s)", 1000.0 / ns);
+    }
+
+    // What the identity arm buys, priced directly: the same unpromoted U64 PK
+    // column through `promote_opk_column`'s general decode∘encode path. Without
+    // this row the four numbers above have nothing to be compared against.
+    let stride = src.pk_stride() as usize;
+    for (label, identity) in [("identity (copy)   ", true), ("decode∘encode     ", false)] {
+        let elapsed = time(|| {
+            let mut key = [0u8; MAX_PK_BYTES];
+            for row in 0..N_ROWS {
+                let s = &mb.get_pk_bytes(row)[..stride];
+                if identity {
+                    gnitz_wire::promote_opk_column(s, type_code::U64, type_code::U64, &mut key[..stride]);
+                } else {
+                    let native = gnitz_wire::decode_pk_column_owned(s, type_code::U64);
+                    gnitz_wire::encode_pk_column_promoted(
+                        &native[..stride],
+                        type_code::U64,
+                        type_code::U64,
+                        &mut key[..stride],
+                    );
+                }
+                std::hint::black_box(&key);
+            }
+        });
+        let ns = ns_per_row(elapsed);
+        println!("  unpromoted PK OPK→OPK, {label}  {ns:7.2} ns/row");
+    }
+}
+
 /// Single-I64 PK: the signed single-column case. Confirms the order-preserving
 /// key is a net win (or at least not a regression) versus the old
 /// per-comparison signed cast.

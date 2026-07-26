@@ -19,7 +19,7 @@ fn emit_agg_col(output: &mut Batch, acc: &Accumulator, out_pi: usize, cs: usize,
         // family / SumZero) leaves the null bit clear so it renders a concrete
         // `0`; SUM/MIN/MAX flag NULL.
         if !acc.empty_renders_zero() {
-            crate::schema::set_null_bit(null_word, out_pi);
+            gnitz_wire::null_word_set(null_word, out_pi, true);
         }
         output.fill_col_zero(out_pi, cs);
     } else {
@@ -81,13 +81,14 @@ pub(super) fn emit_reduce_row(
                 let mut scratch = [0u8; 16];
                 output.extend_col(out_pi, loc.native_le_bytes(input_mb, exemplar_row, &mut scratch));
             }
-            ColumnLocator::Payload { size, type_code, .. } => {
-                let is_null = loc.is_null(input_mb, exemplar_row);
+            ColumnLocator::Payload { slot, size, type_code } => {
+                let cs = size as usize;
+                let is_null = gnitz_wire::null_word_get(input_mb.get_null_word(exemplar_row), slot as usize);
                 if is_null {
-                    crate::schema::set_null_bit(&mut null_word, out_pi);
+                    gnitz_wire::null_word_set(&mut null_word, out_pi, true);
                 }
-                let cell = (!is_null).then(|| loc.bytes(input_mb, exemplar_row));
-                output.append_payload_cell(out_pi, type_code, size as usize, cell, input_mb.blob, None);
+                let cell = (!is_null).then(|| input_mb.get_col_ptr(exemplar_row, slot as usize, cs));
+                output.append_payload_cell(out_pi, type_code, cs, cell, input_mb.blob, None);
             }
         }
     }

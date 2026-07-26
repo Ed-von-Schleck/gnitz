@@ -747,46 +747,70 @@ def test_index_on_uuid_pk_source_via_sql(client):
         _cleanup(client, sn, "src")
 
 
-def test_unique_index_on_compound_pk_column(client):
+# `a INT UNSIGNED` promotes to a 64-bit index key (the encode path);
+# `a BIGINT UNSIGNED` already *is* the index key type, so the index span is the
+# PK region's bytes copied verbatim (`promote_opk_column`'s identity arm). Both
+# must behave identically, so both shapes run the same pair of cases. The BIGINT
+# values straddle 2^63, where a lost sign-flip or byte-order slip in the
+# identity span would misorder or falsely collide.
+_CPK_INDEX_SHAPES = [
+    pytest.param("INT UNSIGNED", 1, [(1, 1), (2, 1), (3, 9)], id="promoted"),
+    pytest.param(
+        "BIGINT UNSIGNED",
+        7,
+        [
+            (0, 1),
+            (7, 1),
+            (9223372036854775807, 2),
+            (9223372036854775808, 3),
+            (18446744073709551615, 4),
+        ],
+        id="identity",
+    ),
+]
+
+
+def _cpk_index_table(client, sn, a_type):
+    client.create_schema(sn)
+    client.execute_sql(
+        f"CREATE TABLE src (a {a_type}, b INT UNSIGNED, PRIMARY KEY (a, b))",
+        schema_name=sn,
+    )
+    client.execute_sql("CREATE UNIQUE INDEX ON src (a)", schema_name=sn)
+
+
+@pytest.mark.parametrize("a_type, dup, _rows", _CPK_INDEX_SHAPES)
+def test_unique_index_on_compound_pk_column(client, a_type, dup, _rows):
     """UNIQUE INDEX on a single column of a compound PK. Two rows share that
     column's value but differ in the rest of the PK (so they are distinct PKs,
     a legal compound-key insert) — yet they violate UNIQUE on the indexed
     column. Pre-fix the validation keyed on the whole packed (a, b) key, so the
     duplicate `a` was silently accepted."""
     sn = "cpk" + _uid()
-    client.create_schema(sn)
     try:
-        client.execute_sql(
-            "CREATE TABLE src (a INT UNSIGNED, b INT UNSIGNED, PRIMARY KEY (a, b))",
-            schema_name=sn,
-        )
-        client.execute_sql("CREATE UNIQUE INDEX ON src (a)", schema_name=sn)
-        # (1,1) and (1,2): distinct PKs, same a=1 → UNIQUE(a) violation.
+        _cpk_index_table(client, sn, a_type)
+        # (dup,1) and (dup,2): distinct PKs, same `a` → UNIQUE(a) violation.
         with pytest.raises(gnitz.GnitzError):
             client.execute_sql(
-                "INSERT INTO src (a, b) VALUES (1, 1), (1, 2)", schema_name=sn,
+                f"INSERT INTO src (a, b) VALUES ({dup}, 1), ({dup}, 2)",
+                schema_name=sn,
             )
     finally:
         _cleanup(client, sn, "src")
 
 
-def test_unique_index_on_compound_pk_column_distinct_ok(client):
+@pytest.mark.parametrize("a_type, _dup, rows", _CPK_INDEX_SHAPES)
+def test_unique_index_on_compound_pk_column_distinct_ok(client, a_type, _dup, rows):
     """Counterpart to the violation test: distinct values on the indexed PK
     column must ingest cleanly (no false positive from the byte-slice key)."""
     sn = "cpk" + _uid()
-    client.create_schema(sn)
     try:
-        client.execute_sql(
-            "CREATE TABLE src (a INT UNSIGNED, b INT UNSIGNED, PRIMARY KEY (a, b))",
-            schema_name=sn,
-        )
-        client.execute_sql("CREATE UNIQUE INDEX ON src (a)", schema_name=sn)
-        client.execute_sql(
-            "INSERT INTO src (a, b) VALUES (1, 1), (2, 1), (3, 9)", schema_name=sn,
-        )
+        _cpk_index_table(client, sn, a_type)
+        values = ", ".join(f"({a}, {b})" for a, b in rows)
+        client.execute_sql(f"INSERT INTO src (a, b) VALUES {values}", schema_name=sn)
         tid, _ = client.resolve_table(sn, "src")
-        rows = sorted((row.a, row.b) for row in client.scan(tid) if row.weight > 0)
-        assert rows == [(1, 1), (2, 1), (3, 9)]
+        got = sorted((row.a, row.b) for row in client.scan(tid) if row.weight > 0)
+        assert got == sorted(rows)
     finally:
         _cleanup(client, sn, "src")
 

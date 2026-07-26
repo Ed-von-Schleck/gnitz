@@ -21,6 +21,7 @@ use super::shard_index::ShardIndex;
 use super::shard_reader::MappedShard;
 use crate::schema::key::pack_pk_be;
 use crate::schema::SchemaDescriptor;
+use gnitz_expr::RowSource;
 
 /// Fold `in_memory_l0` once it exceeds this many runs. Each fold re-merges the
 /// whole net-state window into one run, so the per-tick flush amplification is
@@ -191,35 +192,47 @@ pub(crate) enum RowRef {
     Shard(Rc<MappedShard>, usize),
 }
 
-impl columnar::ColumnarSource for RowRef {
+/// `#[inline(always)]` on every forwarder, for the reason spelled out on
+/// [`gnitz_expr::BatchView`]: at `opt-level=0` the plain hint is a no-op, and
+/// `Batch::append_row_from_source_bytes` calls through here once per payload
+/// column of every retracted row.
+impl RowSource for RowRef {
+    #[inline(always)]
     fn get_pk_bytes(&self, _row: usize) -> &[u8] {
         match self {
-            RowRef::Mem(b, r) => columnar::ColumnarSource::get_pk_bytes(b.as_ref(), *r),
-            RowRef::Shard(s, r) => columnar::ColumnarSource::get_pk_bytes(s.as_ref(), *r),
+            RowRef::Mem(b, r) => RowSource::get_pk_bytes(b.as_ref(), *r),
+            RowRef::Shard(s, r) => RowSource::get_pk_bytes(s.as_ref(), *r),
         }
     }
+    #[inline(always)]
+    fn get_null_word(&self, _row: usize) -> u64 {
+        match self {
+            RowRef::Mem(b, r) => RowSource::get_null_word(b.as_ref(), *r),
+            RowRef::Shard(s, r) => RowSource::get_null_word(s.as_ref(), *r),
+        }
+    }
+    #[inline(always)]
+    fn get_col_ptr(&self, _row: usize, payload_col: usize, col_size: usize) -> &[u8] {
+        match self {
+            RowRef::Mem(b, r) => RowSource::get_col_ptr(b.as_ref(), *r, payload_col, col_size),
+            RowRef::Shard(s, r) => RowSource::get_col_ptr(s.as_ref(), *r, payload_col, col_size),
+        }
+    }
+    #[inline(always)]
+    fn blob(&self) -> &[u8] {
+        match self {
+            RowRef::Mem(b, _) => RowSource::blob(b.as_ref()),
+            RowRef::Shard(s, _) => RowSource::blob(s.as_ref()),
+        }
+    }
+}
+
+impl columnar::ColumnarSource for RowRef {
+    #[inline(always)]
     fn get_weight(&self, _row: usize) -> i64 {
         match self {
             RowRef::Mem(b, r) => columnar::ColumnarSource::get_weight(b.as_ref(), *r),
             RowRef::Shard(s, r) => columnar::ColumnarSource::get_weight(s.as_ref(), *r),
-        }
-    }
-    fn get_null_word(&self, _row: usize) -> u64 {
-        match self {
-            RowRef::Mem(b, r) => columnar::ColumnarSource::get_null_word(b.as_ref(), *r),
-            RowRef::Shard(s, r) => columnar::ColumnarSource::get_null_word(s.as_ref(), *r),
-        }
-    }
-    fn get_col_ptr(&self, _row: usize, payload_col: usize, col_size: usize) -> &[u8] {
-        match self {
-            RowRef::Mem(b, r) => columnar::ColumnarSource::get_col_ptr(b.as_ref(), *r, payload_col, col_size),
-            RowRef::Shard(s, r) => columnar::ColumnarSource::get_col_ptr(s.as_ref(), *r, payload_col, col_size),
-        }
-    }
-    fn blob_slice(&self) -> &[u8] {
-        match self {
-            RowRef::Mem(b, _) => columnar::ColumnarSource::blob_slice(b.as_ref()),
-            RowRef::Shard(s, _) => columnar::ColumnarSource::blob_slice(s.as_ref()),
         }
     }
 }
@@ -760,6 +773,12 @@ fn erase_stale_shards(dir: &str, table_id: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Payload column 0 (an 8-byte integer) of a located row, read through the
+    /// [`RowSource`] view — the one read every `retract_pk` assertion makes.
+    fn row_val(fr: &RowRef) -> i64 {
+        i64::from_le_bytes(RowSource::get_col_ptr(fr, 0, 0, 8).try_into().unwrap())
+    }
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::{make_batch_raw, make_schema_u64_i64, opk_pk, wide_pk_3xu64_schema, wide_row};
 
@@ -909,10 +928,10 @@ mod tests {
         assert_eq!(w, 1);
         assert!(found.is_some());
         // The retracted row is the found row: a valid null word and an
-        // accessible payload column, read through the ColumnarSource view.
+        // accessible payload column, read through the RowSource view.
         let fr = found.expect("retracted row is the found row");
-        assert_ne!(columnar::ColumnarSource::get_null_word(&fr, 0), u64::MAX);
-        assert_eq!(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).len(), 8);
+        assert_ne!(RowSource::get_null_word(&fr, 0), u64::MAX);
+        assert_eq!(row_val(&fr), 100);
 
         let (w, found) = t.retract_pk(99);
         assert_eq!(w, 0);
@@ -971,7 +990,7 @@ mod tests {
 
         // The found row must be val=200, not the cancelled val=100
         let fr = found.expect("retracted row is the found row");
-        let val = i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap());
+        let val = row_val(&fr);
         assert_eq!(
             val, 200,
             "retract_pk must return the live (val=200) row, not the retracted val=100"
@@ -1107,7 +1126,7 @@ mod tests {
         assert!(found.is_some());
 
         let fr = found.expect("retracted row is the found row");
-        let val = i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap());
+        let val = row_val(&fr);
         assert_eq!(
             val, 200,
             "shard fallback must pick live payload (val=200), not cancelled (val=100)"
@@ -1591,7 +1610,7 @@ mod tests {
         assert_eq!(w, 1, "net weight 1 across the RAM runs");
         assert!(found.is_some());
         let fr = found.expect("retracted row is the found row");
-        let val = i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap());
+        let val = row_val(&fr);
         assert_eq!(
             val, 200,
             "RAM-tier global-net must pick live payload 200, not cancelled 100"
@@ -1645,7 +1664,7 @@ mod tests {
         assert_eq!(w, 1);
         assert!(found.is_some());
         let fr = found.expect("live twin is the found row");
-        let val = i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap());
+        let val = row_val(&fr);
         assert_eq!(val, 20, "found row must be the surviving twin's payload");
 
         let (w2, found2) = t.retract_pk_bytes(&pk3(1, 1, 100));
@@ -1700,7 +1719,7 @@ mod tests {
         assert_eq!(w, 1);
         assert!(found.is_some());
         let fr = found.expect("signed key is the found row");
-        let val = i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap());
+        let val = row_val(&fr);
         assert_eq!(val, -5, "found row payload marks the retracted signed key");
 
         // Retraction across a second run nets the signed key to zero.
@@ -1733,7 +1752,7 @@ mod tests {
         assert_eq!(w, 1, "global net weight is 1");
         assert!(found.is_some());
         let fr = found.expect("live row found");
-        let val = i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap());
+        let val = row_val(&fr);
         assert_eq!(
             val, 60,
             "global oracle rejects the cancelled val=50, arms live val=60 from RAM"
@@ -1772,7 +1791,7 @@ mod tests {
         let (w, found) = t.retract_pk(7);
         assert_eq!(w, 1, "total net weight across all three tiers");
         let fr = found.expect("live row found");
-        let val = i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap());
+        let val = row_val(&fr);
         assert_eq!(
             val, 80,
             "grouping must net val=70 across shard+memtable to zero and arm the RAM-tier val=80"
@@ -1811,7 +1830,7 @@ mod tests {
         assert_eq!(w, 1);
         assert!(found.is_some());
         let fr = found.expect("folded key is the found row");
-        let val = i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap());
+        let val = row_val(&fr);
         assert_eq!(val, 100, "found row payload survives the fold");
 
         // A PK absent from every run: bloom-miss path must equal the linear miss.
@@ -2023,7 +2042,7 @@ mod tests {
         assert_eq!(w, 1, "retract resolves the live row in in_memory_l0");
         assert!(found.is_some());
         let fr = found.expect("found row from RAM tier");
-        let val = i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap());
+        let val = row_val(&fr);
         assert_eq!(val, 30, "found-row payload matches the RAM-tier row");
     }
 

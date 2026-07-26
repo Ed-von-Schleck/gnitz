@@ -8,8 +8,6 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::batch::Batch;
-#[cfg(test)] // only the test-only native-u128 has_pk/retract_pk need opk_key
-use super::columnar;
 use super::error::StorageError;
 use super::read_cursor::{self, ReadCursor};
 use super::shard_reader::MappedShard;
@@ -742,7 +740,7 @@ mod tests {
         // the prefix) it would route by the full key to a different partition and
         // miss the row entirely.
         let read_found_val = |fr: &table::RowRef| {
-            i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(fr, 0, 0, 8).try_into().unwrap())
+            i64::from_le_bytes(gnitz_expr::RowSource::get_col_ptr(fr, 0, 0, 8).try_into().unwrap())
         };
         let (wa, fa) = pt.retract_pk_bytes(&twin_a);
         assert_eq!(wa, 1, "twin A found in its prefix-partition");

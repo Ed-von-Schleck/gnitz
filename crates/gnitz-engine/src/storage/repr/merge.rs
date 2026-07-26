@@ -19,7 +19,8 @@ use crate::foundation::codec::read_u64_le;
 #[cfg(test)]
 use crate::schema::key::compare_pk_bytes;
 use crate::schema::key::{compare_pk_ordering, pack_pk_be};
-use crate::schema::{BlobCache, RowView, SchemaDescriptor, MAX_COLUMNS};
+use crate::schema::{BlobCache, SchemaDescriptor, MAX_COLUMNS};
+use gnitz_expr::{BatchView, RowSource};
 use gnitz_wire::is_german_string;
 
 // ---------------------------------------------------------------------------
@@ -220,26 +221,29 @@ impl<'a> std::ops::Deref for SortedMemBatch<'a> {
 /// opaque type parameter), so the flush input must impl `ColumnarSource`
 /// directly. Forward each accessor to the inner `MemBatch`; `#[repr(transparent)]`
 /// makes every forward zero-cost.
-impl<'a> ColumnarSource for SortedMemBatch<'a> {
-    #[inline]
+impl<'a> RowSource for SortedMemBatch<'a> {
+    #[inline(always)]
     fn get_pk_bytes(&self, row: usize) -> &[u8] {
         self.0.get_pk_bytes(row)
     }
-    #[inline]
-    fn get_weight(&self, row: usize) -> i64 {
-        self.0.get_weight(row)
-    }
-    #[inline]
+    #[inline(always)]
     fn get_null_word(&self, row: usize) -> u64 {
         self.0.get_null_word(row)
     }
-    #[inline]
+    #[inline(always)]
     fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
         self.0.get_col_ptr(row, payload_col, col_size)
     }
-    #[inline]
-    fn blob_slice(&self) -> &[u8] {
+    #[inline(always)]
+    fn blob(&self) -> &[u8] {
         self.0.blob
+    }
+}
+
+impl<'a> ColumnarSource for SortedMemBatch<'a> {
+    #[inline(always)]
+    fn get_weight(&self, row: usize) -> i64 {
+        self.0.get_weight(row)
     }
 }
 
@@ -285,7 +289,7 @@ impl<'a> MemBatch<'a> {
     }
 
     /// Null bitmap region as a contiguous slice (`count * 8` bytes).
-    #[inline]
+    #[inline(always)]
     pub fn null_bmp(&self) -> &'a [u8] {
         let off = self.offsets[super::batch::REG_NULL_BMP];
         &self.data[off..off + self.count * 8]
@@ -293,7 +297,7 @@ impl<'a> MemBatch<'a> {
 
     /// Payload column `pi` as a contiguous slice (`count * stride` bytes).
     /// Caller supplies the stride from the schema (see `payload_columns`).
-    #[inline]
+    #[inline(always)]
     pub fn col_data(&self, pi: usize, stride: usize) -> &'a [u8] {
         let off = self.offsets[super::batch::REG_PAYLOAD_START + pi];
         &self.data[off..off + self.count * stride]
@@ -306,69 +310,77 @@ impl<'a> MemBatch<'a> {
         gnitz_wire::widen_pk_be(&self.data[off..off + stride], stride)
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn get_pk_bytes(&self, row: usize) -> &'a [u8] {
         let stride = self.pk_stride as usize;
         let off = self.offsets[super::batch::REG_PK] + row * stride;
         &self.data[off..off + stride]
     }
-    #[inline]
+    #[inline(always)]
     pub fn get_weight(&self, row: usize) -> i64 {
         let off = self.offsets[super::batch::REG_WEIGHT] + row * 8;
         i64::from_le_bytes(self.data[off..off + 8].try_into().unwrap())
     }
-    #[inline]
+    #[inline(always)]
     pub fn get_null_word(&self, row: usize) -> u64 {
         read_u64_le(self.data, self.offsets[super::batch::REG_NULL_BMP] + row * 8)
     }
-    #[inline]
+    #[inline(always)]
     pub fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &'a [u8] {
         let off = self.offsets[super::batch::REG_PAYLOAD_START + payload_col] + row * col_size;
         &self.data[off..off + col_size]
     }
 }
 
-/// `MemBatch` is the sole physical batch the schema-layer locators read through
-/// [`RowView`] — the trait lives up in `schema` so the L1 locator types never
-/// name this L2 type (breaking the last `schema → storage` up-edge). Each method
-/// forwards via UFCS to the inherent accessor of the same name, so the call binds
-/// to the concrete read rather than recursing into the trait; `#[inline]` plus
-/// monomorphization erase the trait entirely (no vtable — §3 / W2 guardrail).
-impl<'b> RowView<'b> for MemBatch<'b> {
-    #[inline]
+/// `MemBatch` is the sole physical batch the expression evaluator and the
+/// resolved-addressing types read through — [`RowSource`] per row, [`BatchView`]
+/// by region. Both traits live down in the leaf `gnitz-expr` crate, so those
+/// types never name this L2 type (and the SQL client can lend its own buffers
+/// through the same shapes). Each method forwards via UFCS to the inherent
+/// accessor of the same name, so the call binds to the concrete read rather than
+/// recursing into the trait.
+///
+/// Every forwarder — **and every inherent accessor it UFCS-calls** — is
+/// `#[inline(always)]`; see [`BatchView`] for why the plain hint is not enough.
+/// Promoting only the forwarder would leave the terminus a real call and do half
+/// the job.
+impl<'a> RowSource for MemBatch<'a> {
+    #[inline(always)]
+    fn get_pk_bytes(&self, row: usize) -> &[u8] {
+        MemBatch::get_pk_bytes(self, row)
+    }
+    #[inline(always)]
     fn get_null_word(&self, row: usize) -> u64 {
         MemBatch::get_null_word(self, row)
     }
-    #[inline]
-    fn get_pk_bytes(&self, row: usize) -> &'b [u8] {
-        MemBatch::get_pk_bytes(self, row)
+    #[inline(always)]
+    fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
+        MemBatch::get_col_ptr(self, row, payload_col, col_size)
     }
-    #[inline]
-    fn get_col_ptr(&self, row: usize, col: usize, size: usize) -> &'b [u8] {
-        MemBatch::get_col_ptr(self, row, col, size)
+    #[inline(always)]
+    fn blob(&self) -> &[u8] {
+        self.blob
+    }
+}
+
+/// The region half. The per-row accessors above are **not** derived from these
+/// (see [`BatchView`]): the derived form costs a row-count load, a second
+/// multiply and a second range check per read, which `-O0` cannot hoist.
+impl<'a> BatchView for MemBatch<'a> {
+    #[inline(always)]
+    fn col_data(&self, payload_col: usize, col_size: usize) -> &[u8] {
+        MemBatch::col_data(self, payload_col, col_size)
+    }
+    #[inline(always)]
+    fn null_bmp(&self) -> &[u8] {
+        MemBatch::null_bmp(self)
     }
 }
 
 impl<'a> ColumnarSource for MemBatch<'a> {
-    #[inline]
-    fn get_pk_bytes(&self, row: usize) -> &[u8] {
-        MemBatch::get_pk_bytes(self, row)
-    }
-    #[inline]
+    #[inline(always)]
     fn get_weight(&self, row: usize) -> i64 {
         MemBatch::get_weight(self, row)
-    }
-    #[inline]
-    fn get_null_word(&self, row: usize) -> u64 {
-        self.get_null_word(row)
-    }
-    #[inline]
-    fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
-        MemBatch::get_col_ptr(self, row, payload_col, col_size)
-    }
-    #[inline]
-    fn blob_slice(&self) -> &[u8] {
-        self.blob
     }
 }
 
@@ -879,6 +891,45 @@ mod tests {
     fn empty_batch_i64() -> Batch {
         let schema = make_schema_u128_i64();
         Batch::empty_with_schema(&schema)
+    }
+
+    /// `MemBatch`'s per-row accessors must address exactly the cell its region
+    /// accessors hold — the [`BatchView`] contract, checked through the shared
+    /// assertion so this batch and every other implementor (notably the client
+    /// adapter, whose `col_data` is a slot map rather than a flat region) are
+    /// held to one rule by one piece of code. Here it is near-tautological: both
+    /// sides derive the same payload-region offset, so it catches an index typo.
+    ///
+    /// It lives in `merge.rs`, not `schema.rs`: constructing a `Batch` there would
+    /// be the first `schema → storage` code reference in that file, the up-edge
+    /// the locator/batch split exists to prevent. `#[cfg(test)]` does not exempt it.
+    #[test]
+    fn batchview_row_matches_region() {
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),  // PK
+                SchemaColumn::new(type_code::I32, 0),  // payload slot 0, 4 bytes
+                SchemaColumn::new(type_code::U128, 0), // payload slot 1, 16 bytes
+                SchemaColumn::new(type_code::I64, 1),  // payload slot 2, 8 bytes, nullable
+            ],
+            &[0],
+        );
+        const ROWS: usize = 5;
+        let mut bb = crate::storage::BatchBuilder::new(schema);
+        for row in 0..ROWS {
+            bb.begin_row(row as u128, 1);
+            bb.put_i32(-(row as i32));
+            bb.put_u128((row as u128) << 100);
+            // NULL slot 2 on the odd rows, so the bitmap is not uniformly zero.
+            if row % 2 == 0 {
+                bb.put_i64(row as i64);
+            } else {
+                bb.put_null();
+            }
+            bb.end_row();
+        }
+        let b = bb.finish();
+        gnitz_expr::assert_batchview_consistent(&b.as_mem_batch(), ROWS, &[(0, 4), (1, 16), (2, 8)]);
     }
 
     fn read_pk_packed(out_pk: &[u8], i: usize, stride: usize) -> u128 {

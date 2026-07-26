@@ -93,7 +93,7 @@ impl PartitionRouter {
 }
 
 /// Encode a native index-seek key into the routing-cache image `extract_col_key`
-/// stores. Delegates to the shared `schema::payload_route_key` encoder — the same
+/// stores. Delegates to the shared `gnitz_wire::payload_route_key` encoder — the same
 /// one `extract_col_key`'s `route_key` bottoms out in — so the seek and record
 /// halves agree by construction. Returns `None` for STRING/BLOB: they can't be
 /// secondary-index columns (`index_key_type` rejects them at registration), so no
@@ -103,7 +103,7 @@ pub(super) fn index_route_key(schema: &SchemaDescriptor, col_idx: u32, native: u
     let col = schema.columns[col_idx as usize];
     match col.type_code {
         type_code::STRING | type_code::BLOB => None,
-        _ => Some(crate::schema::payload_route_key(
+        _ => Some(gnitz_wire::payload_route_key(
             &native.to_le_bytes(),
             0,
             col.size() as usize,

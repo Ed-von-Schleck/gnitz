@@ -36,8 +36,11 @@ pub(crate) use batch::{BatchBuilder, Layout, MAX_WIRE_REGIONS};
 pub(crate) use batch_wire::{
     compute_wire_props, schema_wire_safe, wire_block_size, wire_header_dir_size, wire_region_sizes,
 };
+// `ColumnarSource` is deliberately NOT re-exported: it adds only the Z-set
+// weight, and every out-of-storage consumer (the comparators, the group-key
+// extractors, the row appenders) reads rows through `gnitz_expr::RowSource`.
 pub(crate) use columnar::{
-    cmp_col_window, compare_rows, compare_rows_except, compare_rows_fixedint_nonnull, with_payload_cmp, ColumnarSource,
+    cmp_col_window, compare_rows, compare_rows_except, compare_rows_fixedint_nonnull, with_payload_cmp,
 };
 // The PK key primitives live in `schema::key`; out-of-storage callers keep the
 // storage facade.

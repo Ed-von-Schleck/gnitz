@@ -82,8 +82,8 @@ pub(crate) fn is_integer_type(tc: TypeCode) -> bool {
 
 /// Whether MIN/MAX has a correct accumulator path for this column type. Wide
 /// integer-ish types (U128/UUID/I128) have no i64 slot, and STRING/BLOB have no
-/// usable ordering in the i64 comparator (`decode_signed` reads the descriptor
-/// prefix as a garbage signed int). Everything else — narrow and 64-bit ints,
+/// usable ordering in the i64 comparator (the integer widening reads the
+/// descriptor prefix as a garbage signed int). Everything else — narrow and 64-bit ints,
 /// and floats — orders correctly.
 pub(crate) fn is_min_max_orderable(tc: TypeCode) -> bool {
     !tc.is_wide_int() && !tc.is_german_string()

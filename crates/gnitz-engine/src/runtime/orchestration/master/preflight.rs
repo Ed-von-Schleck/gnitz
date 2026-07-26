@@ -497,8 +497,10 @@ fn span_to_natives(span: &PkBuf, idx_cols: &[SchemaColumn]) -> [u128; gnitz_wire
     let mut off = 0;
     for (native, col) in natives.iter_mut().zip(idx_cols) {
         let sz = col.size() as usize;
-        let le = gnitz_wire::decode_pk_column_owned(&span.pk_bytes()[off..off + sz], col.type_code);
-        *native = u128::from_le_bytes(le);
+        // `pk_native_key` *is* "decode this OPK column window to its native
+        // zero-extended u128" — the same rule the FK/index key space uses
+        // everywhere else, so the decode is not respelled here.
+        *native = pk_native_key(span.pk_bytes(), off, sz, col.type_code);
         off += sz;
     }
     natives

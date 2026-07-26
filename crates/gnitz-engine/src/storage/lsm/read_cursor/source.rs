@@ -15,6 +15,7 @@ use super::super::columnar::ColumnarSource;
 use super::super::merge::UnifiedSource;
 use super::super::shard_reader::MappedShard;
 use crate::schema::SchemaDescriptor;
+use gnitz_expr::RowSource;
 
 pub(super) enum CursorSource {
     /// Rc-owned in-memory batch.  The Rc keeps the data alive for the
@@ -59,40 +60,43 @@ impl CursorSource {
     }
 }
 
-impl ColumnarSource for CursorSource {
-    #[inline]
+impl RowSource for CursorSource {
+    #[inline(always)]
     fn get_pk_bytes(&self, row: usize) -> &[u8] {
         match self {
             CursorSource::Batch(b) => b.get_pk_bytes(row),
             CursorSource::Shard(s) => s.get_pk_bytes(row),
         }
     }
-    #[inline]
-    fn get_weight(&self, row: usize) -> i64 {
-        match self {
-            CursorSource::Batch(b) => b.get_weight(row),
-            CursorSource::Shard(s) => s.get_weight(row),
-        }
-    }
-    #[inline]
+    #[inline(always)]
     fn get_null_word(&self, row: usize) -> u64 {
         match self {
             CursorSource::Batch(b) => b.get_null_word(row),
             CursorSource::Shard(s) => s.get_null_word(row),
         }
     }
-    #[inline]
+    #[inline(always)]
     fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
         match self {
             CursorSource::Batch(b) => b.get_col_ptr(row, payload_col, col_size),
             CursorSource::Shard(s) => s.get_col_ptr(row, payload_col, col_size),
         }
     }
-    #[inline]
-    fn blob_slice(&self) -> &[u8] {
+    #[inline(always)]
+    fn blob(&self) -> &[u8] {
         match self {
             CursorSource::Batch(b) => &b.blob,
             CursorSource::Shard(s) => s.blob_slice(),
+        }
+    }
+}
+
+impl ColumnarSource for CursorSource {
+    #[inline(always)]
+    fn get_weight(&self, row: usize) -> i64 {
+        match self {
+            CursorSource::Batch(b) => b.get_weight(row),
+            CursorSource::Shard(s) => s.get_weight(row),
         }
     }
 }

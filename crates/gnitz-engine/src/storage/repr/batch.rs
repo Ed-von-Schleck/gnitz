@@ -10,6 +10,7 @@ use super::merge::{self, BlobCacheGuard, ColPtr, MemBatch};
 use crate::foundation::codec::{align8, read_i64_le, read_u64_le};
 use crate::schema::key::NarrowPkOpk;
 use crate::schema::{BlobCache, SchemaDescriptor};
+use gnitz_expr::RowSource;
 
 static BLOB_ID_CTR: AtomicU64 = AtomicU64::new(1);
 #[inline(always)]
@@ -628,13 +629,13 @@ impl Batch {
     /// `pk_stride` bytes; the wide-PK (`pk_stride > 16`) catalog constraint
     /// checks in `catalog/validation.rs` key on it where a `u128` cannot
     /// encode the PK.
-    #[inline]
+    #[inline(always)]
     pub fn get_pk_bytes(&self, row: usize) -> &[u8] {
         let stride = self.strides[REG_PK] as usize;
         let off = self.offsets[REG_PK] + row * stride;
         &self.data[off..off + stride]
     }
-    #[inline]
+    #[inline(always)]
     pub fn get_weight(&self, row: usize) -> i64 {
         read_i64_le(&self.data[self.offsets[REG_WEIGHT]..], row * 8)
     }
@@ -680,7 +681,7 @@ impl Batch {
             .map(|w| i64::from_le_bytes(w.try_into().unwrap()))
             .sum()
     }
-    #[inline]
+    #[inline(always)]
     pub fn get_null_word(&self, row: usize) -> u64 {
         read_u64_le(&self.data[self.offsets[REG_NULL_BMP]..], row * 8)
     }
@@ -690,7 +691,7 @@ impl Batch {
         let off = self.offsets[REG_NULL_BMP] + row * 8;
         self.data[off..off + 8].copy_from_slice(&word.to_le_bytes());
     }
-    #[inline]
+    #[inline(always)]
     pub fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
         let off = self.offsets[REG_PAYLOAD_START + payload_col] + row * col_size;
         &self.data[off..off + col_size]
@@ -1379,7 +1380,7 @@ impl Batch {
                     0
                 }
             });
-            let is_null = crate::schema::null_bit(null_word, pi);
+            let is_null = gnitz_wire::null_word_get(null_word, pi);
             let col_size = sz as usize;
             let cell = (!is_null).then(|| std::slice::from_raw_parts(*ptr, col_size));
             self.append_payload_cell(pi, type_code, col_size, cell, blob_src, None);
@@ -1414,7 +1415,7 @@ impl Batch {
 
         for (pi, _ci, col) in schema.payload_columns() {
             let col_size = col.size() as usize;
-            let is_null = crate::schema::null_bit(null_word, pi);
+            let is_null = gnitz_wire::null_word_get(null_word, pi);
 
             if is_null {
                 self.append_payload_cell(pi, col.type_code, col_size, None, &[], None);
@@ -1563,7 +1564,7 @@ impl Batch {
     /// verbatim OPK bytes (`append_row_from_source_bytes`), so this native entry
     /// point has no production caller and is retained only for unit tests.
     #[cfg(test)]
-    pub(crate) fn append_row_from_source<S: ColumnarSource>(
+    pub(crate) fn append_row_from_source<S: RowSource>(
         &mut self,
         key: u128,
         weight: i64,
@@ -1584,7 +1585,7 @@ impl Batch {
     /// exactly `pk_stride` bytes (asserted by `extend_pk_bytes`). Also valid for
     /// narrow PKs — the only difference from the `u128` entry point is how the
     /// PK region is written.
-    pub fn append_row_from_source_bytes<S: ColumnarSource>(
+    pub fn append_row_from_source_bytes<S: RowSource>(
         &mut self,
         pk_bytes: &[u8],
         weight: i64,
@@ -1605,7 +1606,7 @@ impl Batch {
     /// `count`. The caller must have already written the PK region. `#[inline]`
     /// so the compaction/merge emit loop pays nothing for the extraction.
     #[inline]
-    fn append_row_tail_from_source<S: ColumnarSource>(
+    fn append_row_tail_from_source<S: RowSource>(
         &mut self,
         weight: i64,
         source: &S,
@@ -1634,7 +1635,7 @@ impl Batch {
     /// `count` or touch the layout. `#[inline]` — no per-row cross-file call
     /// boundary.
     #[inline]
-    pub(crate) fn append_payload_cols<S: ColumnarSource>(
+    pub(crate) fn append_payload_cols<S: RowSource>(
         &mut self,
         out_pi_base: usize,
         schema: &SchemaDescriptor,
@@ -1643,10 +1644,10 @@ impl Batch {
         null_word: u64,
         mut blob_cache: Option<&mut BlobCache>,
     ) {
-        let src_blob = src.blob_slice();
+        let src_blob = src.blob();
         for (pi, _ci, col) in schema.payload_columns() {
             let cs = col.size() as usize;
-            let is_null = crate::schema::null_bit(null_word, pi);
+            let is_null = gnitz_wire::null_word_get(null_word, pi);
             let cell = (!is_null).then(|| src.get_col_ptr(row, pi, cs));
             self.append_payload_cell(
                 out_pi_base + pi,
@@ -1760,26 +1761,29 @@ impl Clone for Batch {
     }
 }
 
-impl ColumnarSource for Batch {
-    #[inline]
+impl RowSource for Batch {
+    #[inline(always)]
     fn get_pk_bytes(&self, row: usize) -> &[u8] {
         Batch::get_pk_bytes(self, row)
     }
-    #[inline]
-    fn get_weight(&self, row: usize) -> i64 {
-        Batch::get_weight(self, row)
-    }
-    #[inline]
+    #[inline(always)]
     fn get_null_word(&self, row: usize) -> u64 {
         Batch::get_null_word(self, row)
     }
-    #[inline]
+    #[inline(always)]
     fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
         Batch::get_col_ptr(self, row, payload_col, col_size)
     }
-    #[inline]
-    fn blob_slice(&self) -> &[u8] {
+    #[inline(always)]
+    fn blob(&self) -> &[u8] {
         &self.blob
+    }
+}
+
+impl ColumnarSource for Batch {
+    #[inline(always)]
+    fn get_weight(&self, row: usize) -> i64 {
+        Batch::get_weight(self, row)
     }
 }
 
@@ -1862,13 +1866,45 @@ impl BatchBuilder {
         }
     }
 
-    /// Begin a new row with the given PK and weight.
+    /// Begin a new row with the given single-column PK and weight.
     pub(crate) fn begin_row(&mut self, pk: u128, weight: i64) {
         self.batch.ensure_row_capacity();
         self.batch.extend_pk(pk);
+        self.begin_row_tail(weight);
+    }
+
+    /// [`Self::begin_row`] for a **compound** PK: `natives` are the PK columns'
+    /// native values in PK-list order, OPK-encoded into the packed PK region.
+    /// Without this, every compound-PK test hand-rolls the
+    /// `ensure_row_capacity`/`extend_pk_opk`/`extend_weight`/…/`count += 1`
+    /// protocol — and a native-LE concatenation into `extend_pk_bytes` (the
+    /// obvious wrong spelling) is not the at-rest form at all.
+    #[cfg(test)]
+    pub(crate) fn begin_row_opk(&mut self, natives: &[u128], weight: i64) {
+        self.batch.ensure_row_capacity();
+        let schema = *self.schema();
+        self.batch.extend_pk_opk(&schema, natives);
+        self.begin_row_tail(weight);
+    }
+
+    fn begin_row_tail(&mut self, weight: i64) {
         self.batch.extend_weight(&weight.to_le_bytes());
         self.curr_null_word = 0;
         self.curr_col = 0;
+    }
+
+    /// Put an i32 value for the current payload column.
+    #[cfg(test)]
+    pub(crate) fn put_i32(&mut self, val: i32) {
+        self.batch.extend_col(self.curr_col, &val.to_le_bytes());
+        self.curr_col += 1;
+    }
+
+    /// Put an i64 value for the current payload column.
+    #[cfg(test)]
+    pub(crate) fn put_i64(&mut self, val: i64) {
+        self.batch.extend_col(self.curr_col, &val.to_le_bytes());
+        self.curr_col += 1;
     }
 
     /// Put a u64 value for the current payload column.

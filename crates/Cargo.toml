@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "gnitz-wire",
+    "gnitz-expr",
     "gnitz-core",
     "gnitz-sql",
     "gnitz-capi",

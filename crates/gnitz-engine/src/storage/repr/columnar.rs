@@ -3,20 +3,28 @@
 use std::cmp::Ordering;
 
 use crate::schema::SchemaDescriptor;
+use gnitz_expr::RowSource;
 use gnitz_wire::compare_german_strings;
 
 // ---------------------------------------------------------------------------
 // ColumnarSource trait
 // ---------------------------------------------------------------------------
 
-pub(crate) trait ColumnarSource {
-    /// The row's packed OPK PK-region bytes (`pk_stride` wide, region[0]).
-    fn get_pk_bytes(&self, row: usize) -> &[u8];
+/// A row source that also carries the Z-set weight — i.e. a *storage* row
+/// rather than a bare evaluator input.
+///
+/// The per-row accessors are [`RowSource`], the one shared definition the
+/// resolved-addressing types ([`gnitz_expr::ColumnLocator`]) bind to, so any
+/// `ColumnarSource` can be read through a locator directly. This trait adds
+/// exactly the one method the evaluator has no use for.
+///
+/// It cannot be folded into `BatchView` in the other direction: `MappedShard`,
+/// `RowRef` and `CursorSource` can address a cell but have no contiguous
+/// `rows * col_size` region to hand out (a shard column may be a scalar
+/// constant), so the split is at the per-row/region seam, not at this one.
+pub(crate) trait ColumnarSource: RowSource {
     /// The row's signed Z-set weight / multiplicity (region[1]).
     fn get_weight(&self, row: usize) -> i64;
-    fn get_null_word(&self, row: usize) -> u64;
-    fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8];
-    fn blob_slice(&self) -> &[u8];
 }
 
 // ---------------------------------------------------------------------------
@@ -28,7 +36,7 @@ pub(crate) trait ColumnarSource {
 /// This is the canonical implementation with the hoisted null_word optimisation:
 /// null words are read once per row outside the column loop.
 #[inline]
-pub(crate) fn compare_rows<A: ColumnarSource, B: ColumnarSource>(
+pub(crate) fn compare_rows<A: RowSource, B: RowSource>(
     schema: &SchemaDescriptor,
     src_a: &A,
     row_a: usize,
@@ -43,7 +51,7 @@ pub(crate) fn compare_rows<A: ColumnarSource, B: ColumnarSource>(
 /// the catalog CAS's "a rewrite pair may differ only in these fields" probe.
 /// Cold path; `compare_rows` monomorphizes with the skip test compiled out
 /// (`SKIP = false`).
-pub(crate) fn compare_rows_except<A: ColumnarSource, B: ColumnarSource>(
+pub(crate) fn compare_rows_except<A: RowSource, B: RowSource>(
     schema: &SchemaDescriptor,
     src_a: &A,
     row_a: usize,
@@ -55,7 +63,7 @@ pub(crate) fn compare_rows_except<A: ColumnarSource, B: ColumnarSource>(
 }
 
 #[inline]
-fn compare_rows_impl<const SKIP: bool, A: ColumnarSource, B: ColumnarSource>(
+fn compare_rows_impl<const SKIP: bool, A: RowSource, B: RowSource>(
     schema: &SchemaDescriptor,
     src_a: &A,
     row_a: usize,
@@ -65,6 +73,12 @@ fn compare_rows_impl<const SKIP: bool, A: ColumnarSource, B: ColumnarSource>(
 ) -> Ordering {
     let null_word_a = src_a.get_null_word(row_a);
     let null_word_b = src_b.get_null_word(row_b);
+    // Both blob arenas are loop-invariant, and only the German-string arm of
+    // `cmp_col_window` reads them. For a `MemBatch` that is a field load, but a
+    // `MappedShard`/`CursorSource`/`RowRef` resolves the mmap behind two calls —
+    // which this would otherwise pay twice per payload column per comparison, on
+    // the hottest comparator in the merge path.
+    let (blob_a, blob_b) = (src_a.blob(), src_b.blob());
 
     for (payload_col, _ci, col) in schema.payload_columns() {
         if SKIP && (skip_mask >> payload_col) & 1 != 0 {
@@ -85,9 +99,9 @@ fn compare_rows_impl<const SKIP: bool, A: ColumnarSource, B: ColumnarSource>(
         let cs = col.size() as usize;
         let ord = cmp_col_window(
             src_a.get_col_ptr(row_a, payload_col, cs),
-            src_a.blob_slice(),
+            blob_a,
             src_b.get_col_ptr(row_b, payload_col, cs),
-            src_b.blob_slice(),
+            blob_b,
             col.type_code,
         );
 
@@ -283,7 +297,7 @@ pub(crate) fn schema_is_fixedint_nonnull(schema: &SchemaDescriptor) -> bool {
 /// skipping null-bitmap reads and the per-column type-code dispatch. Caller MUST
 /// guarantee `schema_is_fixedint_nonnull(schema)`.
 #[inline]
-pub(crate) fn compare_rows_fixedint_nonnull<A: ColumnarSource, B: ColumnarSource>(
+pub(crate) fn compare_rows_fixedint_nonnull<A: RowSource, B: RowSource>(
     schema: &SchemaDescriptor,
     src_a: &A,
     row_a: usize,
@@ -399,13 +413,10 @@ mod tests {
         blob: Vec<u8>,
     }
 
-    impl ColumnarSource for TestBatch {
+    impl RowSource for TestBatch {
         // TestBatch models payload-only comparison; PK/weight are never read through it.
         fn get_pk_bytes(&self, _row: usize) -> &[u8] {
             &[]
-        }
-        fn get_weight(&self, _row: usize) -> i64 {
-            1
         }
         fn get_null_word(&self, row: usize) -> u64 {
             crate::foundation::codec::read_u64_le(&self.null_bmp, row * 8)
@@ -414,8 +425,14 @@ mod tests {
             let off = row * col_size;
             &self.col_data[payload_col][off..off + col_size]
         }
-        fn blob_slice(&self) -> &[u8] {
+        fn blob(&self) -> &[u8] {
             &self.blob
+        }
+    }
+
+    impl ColumnarSource for TestBatch {
+        fn get_weight(&self, _row: usize) -> i64 {
+            1
         }
     }
 

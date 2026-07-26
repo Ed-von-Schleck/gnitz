@@ -2321,7 +2321,7 @@ fn test_op_reduce_compound_pk_group_by_subset_count() {
 // -----------------------------------------------------------------------
 // U64 MIN/MAX: unsigned ordering for values with the high bit set.
 //
-// `decode_signed` returns the U64 bit pattern reinterpreted as `i64`;
+// The U64 widening returns the bit pattern reinterpreted as `i64`;
 // signed `<`/`>` flips for values >= 2^63. The fix dispatches on
 // TypeCode::U64 in the MIN/MAX comparison sites.
 // -----------------------------------------------------------------------
@@ -7584,7 +7584,7 @@ fn reduce_nullable_group_stays_absolute_seek() {
 // bug, not a perf one.
 #[test]
 fn single_col_canonical_group_key_predicate() {
-    use super::super::util::{single_col_canonical_group_key, CanonicalKeyArm};
+    use super::super::util::single_col_canonical_group_key;
     let u64c = SchemaColumn::new(type_code::U64, 0);
     let i64c = SchemaColumn::new(type_code::I64, 0);
     let i64_null = SchemaColumn::new(type_code::I64, 1);
@@ -7592,20 +7592,19 @@ fn single_col_canonical_group_key_predicate() {
     let f64c = SchemaColumn::new(type_code::F64, 0);
     let u128c = SchemaColumn::new(type_code::U128, 0);
 
-    let check = |cols: &[SchemaColumn], pk: &[u32], gb: &[u32], expected: Option<CanonicalKeyArm>, label: &str| {
+    let check = |cols: &[SchemaColumn], pk: &[u32], gb: &[u32], expected: bool, label: &str| {
         let schema = SchemaDescriptor::new(cols, pk);
         assert_eq!(single_col_canonical_group_key(&schema, gb), expected, "{label}");
     };
-    let (pk_arm, pl_arm) = (Some(CanonicalKeyArm::Pk), Some(CanonicalKeyArm::Payload));
-    check(&[u64c, i64c], &[0], &[1], pl_arm, "non-nullable I64 payload");
-    check(&[u64c, u64c], &[0], &[1], pl_arm, "non-nullable U64 payload");
-    check(&[u64c, u128c], &[0], &[1], pl_arm, "U128 payload (routable_int)");
-    check(&[u64c, i64c], &[0], &[0], pk_arm, "single PK column");
-    check(&[u64c, i64_null], &[0], &[1], None, "nullable → hash arm");
-    check(&[u64c, strc], &[0], &[1], None, "STRING → hash arm");
-    check(&[u64c, f64c], &[0], &[1], None, "float → hash arm");
-    check(&[u64c, i64c, i64c], &[0], &[1, 2], None, "multi-column → hash arm");
-    check(&[u64c, i64c], &[0], &[], None, "empty (global) group set");
+    check(&[u64c, i64c], &[0], &[1], true, "non-nullable I64 payload");
+    check(&[u64c, u64c], &[0], &[1], true, "non-nullable U64 payload");
+    check(&[u64c, u128c], &[0], &[1], true, "U128 payload (routable_int)");
+    check(&[u64c, i64c], &[0], &[0], true, "single PK column");
+    check(&[u64c, i64_null], &[0], &[1], false, "nullable → hash arm");
+    check(&[u64c, strc], &[0], &[1], false, "STRING → hash arm");
+    check(&[u64c, f64c], &[0], &[1], false, "float → hash arm");
+    check(&[u64c, i64c, i64c], &[0], &[1, 2], false, "multi-column → hash arm");
+    check(&[u64c, i64c], &[0], &[], false, "empty (global) group set");
 }
 
 // Many groups per epoch over ≥ 3 trace_out sources. 200 groups spanning the sign

@@ -19,8 +19,9 @@ use super::*;
 use crate::expr::{LogicalProgram, ScalarFunc};
 use crate::ops::AdhocFold;
 use crate::schema::key::opk_key;
-use crate::schema::{null_bit, ColumnLocator, MAX_PK_BYTES};
-use crate::storage::{cmp_col_window, compare_pk_bytes, compare_rows, ColumnarSource, PkBuf};
+use crate::schema::{ColumnLocator, MAX_PK_BYTES};
+use crate::storage::{cmp_col_window, compare_pk_bytes, compare_rows, PkBuf};
+use gnitz_expr::RowSource;
 
 /// `limit_k` above which the worker materializes instead of running the bounded
 /// top-k sink (a deep OFFSET ships unsorted and the client sorts). Worker
@@ -471,8 +472,8 @@ fn scan_spec_cmp(
             }
             ColumnLocator::Payload { slot, size, type_code } => {
                 let pi = slot as usize;
-                let an = null_bit(a_null, pi);
-                let cn = null_bit(c_null, pi);
+                let an = gnitz_wire::null_word_get(a_null, pi);
+                let cn = gnitz_wire::null_word_get(c_null, pi);
                 match (an, cn) {
                     (true, true) => continue,
                     // NULL placement is absolute (not flipped by `desc`).
@@ -494,7 +495,7 @@ fn scan_spec_cmp(
                         let sz = size as usize;
                         let av = b.get_col_ptr(a, pi, sz);
                         let cv = b.get_col_ptr(c, pi, sz);
-                        let mut ord = cmp_col_window(av, b.blob_slice(), cv, b.blob_slice(), type_code);
+                        let mut ord = cmp_col_window(av, b.blob(), cv, b.blob(), type_code);
                         if key.desc {
                             ord = ord.reverse();
                         }
