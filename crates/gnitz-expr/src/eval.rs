@@ -63,9 +63,15 @@ impl LogicalProgram {
     }
 
     /// A scalar expression evaluated row at a time through
-    /// [`Evaluator::eval_row`] — a HAVING term, a DML SET right-hand side. Same
-    /// checks as a map minus the output plan, and `result_reg` is demoted out of
-    /// bit_only so `regs[result_reg]` is always live.
+    /// [`Evaluator::eval_row`] — a DML SET right-hand side. Same checks as a map
+    /// minus the output plan. `result_reg` is not marked as a filter's, so it is
+    /// excluded from `bool_input`; a bare non-boolean result therefore has no
+    /// `bool_bits` bit, which is why a predicate must go through
+    /// [`Self::resolve_filter`] instead.
+    ///
+    /// A boolean-valued RHS (`SET flag = a AND b`) still reads back correctly:
+    /// nothing demotes `result_reg` out of bit_only, but `bool_pack_mask` covers
+    /// every bit_only register, so `read_reg_row0` finds the packed bit.
     pub fn resolve_scalar(self, schema: &dyn SchemaFacts) -> Result<Evaluator, ExprValidateErr> {
         self.validate(Some(schema), None)?;
         Ok(self.into_evaluator(schema, /* is_filter = */ false))

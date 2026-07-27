@@ -4,7 +4,7 @@ Covers:
   - DDL: every SQL type that maps to a TypeCode can be used in CREATE TABLE
   - Round-trip: INSERT boundary values for every type, scan and verify
   - U128 (DECIMAL(38,0) / DECIMAL(39,0)): full lifecycle including large values
-  - Type errors: BOOLEAN, non-zero-scale DECIMAL, DATE, U128 in view expressions
+  - Type errors: BOOLEAN, non-zero-scale DECIMAL, DATE, U128 in expressions
   - PK coercion: signed integer PK columns get coerced to unsigned
 """
 
@@ -1342,9 +1342,12 @@ class TestTypeErrors:
             _cleanup(client, sn, "t")
 
     def test_u128_non_pk_no_index_gives_clear_error(self, client):
-        """SELECT WHERE on a U128 non-PK column (no index) gives a helpful error.
-        The engine rejects the query before evaluation because the column has no
-        index; the error message guides the user to CREATE INDEX or CREATE VIEW."""
+        """SELECT WHERE on a U128 non-PK column (no index) gives a helpful error
+        rather than a wrong answer: a 16-byte column does not fit an expression
+        register, so the predicate cannot be compiled at all. The message names
+        the offending column and the limitation — it carries no remedy, because
+        the same rejection is reached from positions (a HAVING over a U128 group
+        column) where CREATE INDEX would not help."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -1360,7 +1363,7 @@ class TestTypeErrors:
                     "SELECT * FROM t WHERE big = 42", schema_name=sn
                 )
             err = str(exc_info.value)
-            assert "non-indexed" in err or "CREATE INDEX" in err or "CREATE VIEW" in err
+            assert '"big"' in err and "128-bit" in err, err
         finally:
             _cleanup(client, sn, "t")
 

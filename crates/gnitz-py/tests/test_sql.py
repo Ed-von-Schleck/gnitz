@@ -354,9 +354,10 @@ class TestSqlSelect:
 
     def test_direct_path_feature_limits_are_not_derivation_errors(self, client):
         """A single-relation read using a feature the direct path cannot express
-        (LIKE / string-function WHERE, an ORDER BY expression, a string HAVING) is a
-        feature-named error — never the derivation template. The string HAVING names
-        CREATE VIEW as its remedy (the grouped view builder serves it)."""
+        (LIKE / string-function WHERE, an ORDER BY expression) is a feature-named
+        error — never the derivation template. A string HAVING is not one of them:
+        it compiles through the same expression compiler a grouped view's
+        post-reduce FILTER uses, so it is served."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -371,12 +372,13 @@ class TestSqlSelect:
                 assert "this query derives a new one" not in str(ei.value), (
                     f"{sql!r} is a feature limit, not a derivation: {ei.value}"
                 )
-            # A string HAVING rejects with a CREATE VIEW remedy, not the template.
-            with pytest.raises(gnitz.GnitzError) as ei:
-                client.execute_sql("SELECT s, COUNT(*) FROM t GROUP BY s HAVING s = 'a'", schema_name=sn)
-            msg = str(ei.value)
-            assert "this query derives a new one" not in msg, msg
-            assert "CREATE VIEW" in msg, f"string HAVING must name CREATE VIEW: {msg}"
+            # A string HAVING is served on the direct path.
+            res = client.execute_sql(
+                "SELECT s, COUNT(*) AS c FROM t GROUP BY s HAVING s = 'a'", schema_name=sn
+            )
+            assert res[0]["type"] == "Rows", res[0]
+            got = sorted((r.s, r.c) for r in res[0]["rows"] if r.weight > 0)
+            assert got == [("a", 1)], f"string HAVING must be served on the direct path, got {got}"
         finally:
             client.drop_schema(sn)
 

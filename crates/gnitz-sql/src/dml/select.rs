@@ -10,9 +10,9 @@
 //! (`reject_derivation`) with one actionable message pointing at CREATE VIEW,
 //! which maintains the derived relation incrementally. A single-relation read the
 //! direct path cannot express (a LIKE / string-function WHERE, an ORDER BY
-//! expression, a string / U64 HAVING) is a feature-named `Unsupported`, never the
-//! derivation template. A pass-through CTE over one relation is inlined
-//! (`cte_passthrough`) so trivial `WITH` queries keep reading through the direct path.
+//! expression) is a feature-named `Unsupported`, never the derivation template. A
+//! pass-through CTE over one relation is inlined (`cte_passthrough`) so trivial
+//! `WITH` queries keep reading through the direct path.
 
 use crate::access::{best_index_bound, try_extract_pk_in, try_extract_pk_range};
 use crate::agg::{synthetic_fold_cols, GroupByLayout};
@@ -26,10 +26,10 @@ use crate::codec::project_schema::{build_read_projection, compile_projection_map
 use crate::dml::group_by::{analyze_group_by, bind_having_expr, resolve_set_projection, HavingCtx};
 use crate::dml::plan::{extract_limit, extract_offset};
 use crate::error::GnitzSqlError;
-use crate::exec::agg_finish::{agg_finish, build_agg_out_schema, having_supported, AggFinish};
+use crate::exec::agg_finish::{agg_finish, build_agg_out_schema, AggFinish};
 use crate::exec::order::{order_limit_passthrough, read_spec_finish, resolve_read_spec_order};
-use crate::ir::{find_wide_literal, wide_int_error, BinOp, BoundExpr};
-use crate::lower::compile_filter_program;
+use crate::ir::{BinOp, BoundExpr};
+use crate::lower::{compile_filter_evaluator, compile_filter_program};
 use crate::validate::{
     cte_select_body, non_recursive_ctes, reject_unhonored_query_clauses, reject_unhonored_select_clauses,
     HonoredClauses, HonoredQueryClauses,
@@ -379,9 +379,10 @@ fn compile_read_spec_predicate(exprs: &[&BoundExpr], schema: &Schema) -> Result<
 /// Serve a single-relation GROUP BY / global aggregate / HAVING / DISTINCT query
 /// via the ReadSpec fold sink (a per-worker hash-fold) + client finishing. Every
 /// planning outcome is terminal: a shape the fold cannot express (a partial reply
-/// wider than the column limit, a string / U64 HAVING) is a feature-named
-/// `Unsupported`; a resolver's own `Unsupported`/`Bind` propagates. The only
-/// runtime error is the per-worker group cap, surfaced from the wire call.
+/// wider than the column limit, a HAVING the shared expression compiler rejects)
+/// is a feature-named `Unsupported`; a resolver's own `Unsupported`/`Bind`
+/// propagates. The only runtime error is the per-worker group cap, surfaced from
+/// the wire call.
 fn execute_aggregate_select(
     client: &mut GnitzClient,
     select: &Select,
@@ -441,20 +442,22 @@ fn execute_aggregate_select(
     // schema by construction). Partial agg columns are nullable: an all-NULL
     // SUM/MIN/MAX group emits a NULL partial the client must carry.
     let partial_schema = Schema::from_parts(
-        // Blanket-nullable: this schema only decodes worker partials, and
-        // `same_physical_layout` ignores nullability.
+        // Blanket-nullable: this schema decodes the worker partials and is also
+        // what the HAVING predicate resolves against, so over-declaring only
+        // forces the evaluator's null-carrying arm.
         synthetic_fold_cols(&schema, &layout.group_col_indices, &layout.agg_specs, &|_| true),
         vec![0],
     )
     .map_err(|e| GnitzSqlError::Unsupported(format!("ad-hoc aggregate reply schema is invalid: {e}")))?;
 
-    // HAVING: bind against the SyntheticFold reduce layout, then probe the typed
-    // IEEE evaluator over that layout. The fold's client-side evaluator whitelists
-    // float and ≤32-bit / signed-≤64-bit integer columns; a string or U64 HAVING
-    // is not served here — but the grouped view builder serves it (same backend),
-    // so the message points at CREATE VIEW. (A wide U128/I128 HAVING rejects on
-    // both paths.)
-    let bound_having = match &select.having {
+    // HAVING: bind against the SyntheticFold reduce layout, then compile it with
+    // the same `BoundExpr → Evaluator` pipeline a grouped view's post-reduce
+    // FILTER uses, resolved against that layout. Compiling here (rather than in
+    // the client finish) keeps every rejection pre-dispatch, and it is the same
+    // rejection either path gives: a HAVING that fails to compile here fails as a
+    // view too — including a wide literal, which `lower_bound_expr` rejects with
+    // the message that names it.
+    let having_ev = match &select.having {
         Some(having_expr) => {
             let ctx = HavingCtx {
                 source_schema: &schema,
@@ -463,21 +466,7 @@ fn execute_aggregate_select(
                 agg_mappings: &layout.agg_mappings,
                 agg_col_offset: layout.synthetic_agg_col_offset(),
             };
-            let bound = bind_having_expr(having_expr, &ctx)?;
-            // A wide literal rejects on BOTH paths (the view's HAVING compiler
-            // rejects it too), so it must not fall into the probe's generic
-            // failure below — whose CREATE VIEW advice would be false for it.
-            if let Some(lit) = find_wide_literal(&bound) {
-                return Err(wide_int_error(lit));
-            }
-            if !having_supported(&bound, &partial_schema) {
-                return Err(GnitzSqlError::Unsupported(
-                    "a HAVING over string or 64-bit-unsigned aggregate columns is not supported on a direct SELECT; \
-                     CREATE VIEW <name> AS <your query> serves it (then SELECT from the view)"
-                        .to_string(),
-                ));
-            }
-            Some(bound)
+            compile_filter_evaluator(&bind_having_expr(having_expr, &ctx)?, &partial_schema)?
         }
         None => None,
     };
@@ -526,9 +515,9 @@ fn execute_aggregate_select(
         layout: &layout,
         partial_schema: &partial_schema,
         out_schema: &out_schema,
-        having: bound_having.as_ref(),
+        having: having_ev.as_ref(),
     };
-    let out_batch = agg_finish(&finish, &partial)?;
+    let out_batch = agg_finish(&finish, &partial);
 
     let (schema_out, batch_out) =
         order_limit_passthrough(out_schema, out_batch, query.order_by.as_ref(), offset, limit)?;

@@ -24,12 +24,14 @@ use gnitz_wire::{
 /// The register file is capped at 64: the BOOL_AND/BOOL_OR 3VL paths, the
 /// null-bit propagation, and every register-indexed mask (`bit_only_mask`,
 /// `bool_pack_mask`, `chain_trigger_mask`) address registers by bit in a `u64`.
-const MAX_REGS: usize = u64::BITS as usize;
+/// Public because a rejection message states the limit, and the number a caller
+/// prints must be the one [`LogicalProgram::from_wire`] enforces.
+pub const MAX_REGS: usize = u64::BITS as usize;
 
 /// Why a client-authored expr program was rejected at compile — a diagnostic for
 /// the recovery log, and a value consumers compare and match on (a rejected
 /// predicate is asserted to be exactly `PredicateWithoutResultReg`, and
-/// `TooManyRegs(n)`'s payload names the register limit in the rejection message).
+/// `TooManyRegs(n)`'s payload names how many registers the program asked for).
 /// Renaming or re-shaping a variant is a visible break, not an internal detail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExprValidateErr {

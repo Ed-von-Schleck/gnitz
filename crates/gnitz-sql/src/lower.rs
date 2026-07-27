@@ -1,7 +1,7 @@
 use crate::error::GnitzSqlError;
 use crate::ir::{BinOp, BoundExpr, UnaryOp};
-use gnitz_core::ColumnDef;
-use gnitz_core::ExprBuilder;
+use gnitz_core::{ColumnDef, ExprBuilder, Schema};
+use gnitz_expr::{Evaluator, ExprValidateErr, LogicalProgram, MAX_REGS};
 
 /// One structural walk of [`BoundExpr`], parameterized by what each node
 /// *produces*. The single `match` in [`lower_bound_expr`] is the sole walk of
@@ -53,10 +53,9 @@ pub(crate) fn lower_bound_expr<B: BoundExprBackend>(
         BoundExpr::LitFloat(v) => backend.lit_float(*v),
         BoundExpr::LitStr(s) => backend.lit_str(s),
         // A wide-integer literal has no VM slot (the register file is 8 bytes wide),
-        // so no backend can represent it: one reject arm here surfaces the real
-        // limitation for all three (server VM, client interp, HAVING) at once. A
-        // *servable* wide seek is consumed into a PK/index bound by the access-path
-        // recognizer and never reaches this walk.
+        // so no backend can represent it: one reject arm here states the limitation
+        // for every one of them. A *servable* wide seek is consumed into a PK/index
+        // bound by the access-path recognizer and never reaches this walk.
         BoundExpr::LitWide(s) => Err(crate::ir::wide_int_error(s)),
         BoundExpr::LitNull => backend.lit_null(),
         BoundExpr::BinOp(l, op, r) => backend.binop(l, *op, r),
@@ -208,8 +207,7 @@ impl BoundExprBackend for OpcodeBackend<'_> {
         let tc = self.cols[idx].type_code;
         if tc.is_wide_int() {
             return Err(GnitzSqlError::Unsupported(format!(
-                "column {:?} is {tc:?}; 128-bit columns cannot be used in view \
-                 expressions (use a primary-key seek or CREATE INDEX instead)",
+                "column {:?} is {tc:?}; 128-bit columns cannot be used in expressions",
                 self.cols[idx].name,
             )));
         }
@@ -237,7 +235,7 @@ impl BoundExprBackend for OpcodeBackend<'_> {
 
     fn lit_str(&mut self, _s: &str) -> Result<Self::Out, GnitzSqlError> {
         Err(GnitzSqlError::Unsupported(
-            "string literals not supported in view expressions".to_string(),
+            "string literals not supported in expressions".to_string(),
         ))
     }
 
@@ -438,6 +436,39 @@ pub(crate) fn compile_filter_program(
     match pred {
         BoundExpr::LitInt(v) if *v != 0 => Ok(None),
         _ => Ok(Some(compile_bound_expr_to_program(pred, cols)?)),
+    }
+}
+
+/// Compile a whole-predicate WHERE/HAVING/residual filter into the shared
+/// evaluator, resolved against the schema the rows it will run over carry.
+/// `None` is [`compile_filter_program`]'s statically-true verdict — the caller
+/// keeps every row.
+///
+/// The one place `ExprProgram`'s fields meet [`LogicalProgram::from_wire`]'s
+/// parameters, and the one place the resolver is chosen: `resolve_filter`, so a
+/// bare non-boolean predicate (`HAVING COUNT(*)`) still gets the `bool_bits` bit
+/// [`Evaluator::filter`] reads.
+pub(crate) fn compile_filter_evaluator(pred: &BoundExpr, schema: &Schema) -> Result<Option<Evaluator>, GnitzSqlError> {
+    let Some(p) = compile_filter_program(pred, &schema.columns)? else {
+        return Ok(None);
+    };
+    let ev = LogicalProgram::from_wire(&p.code, p.num_regs, p.result_reg, p.const_strings)
+        .map_err(expr_unsupported)?
+        .resolve_filter(schema)
+        .map_err(expr_unsupported)?;
+    Ok(Some(ev))
+}
+
+/// A shared-evaluator rejection as a SQL-layer `Unsupported`. `ExprValidateErr`
+/// is a diagnostic enum with no `Display`, so the fallback formats with `{:?}`;
+/// the register cap gets a message naming the limit, because it is the one
+/// narrowing a query that works today can hit.
+fn expr_unsupported(e: ExprValidateErr) -> GnitzSqlError {
+    match e {
+        ExprValidateErr::TooManyRegs(n) => GnitzSqlError::Unsupported(format!(
+            "expression needs {n} registers; the limit is {MAX_REGS} — split the predicate"
+        )),
+        other => GnitzSqlError::Unsupported(format!("expression cannot be compiled: {other:?}")),
     }
 }
 

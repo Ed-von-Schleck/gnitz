@@ -3,10 +3,11 @@
 //! The workers return one concatenated `ZSetBatch` of per-worker partial reduce
 //! rows (pure append, never consolidated). This module combines them by
 //! group-column **value** (weight-aware / Z-set-exact), synthesizes the global
-//! ground row, finishes AVG / nullable-SUM, evaluates HAVING with a typed IEEE
-//! evaluator that mirrors the engine expr VM, projects to SELECT order, and
-//! emits a batch carrying a hidden synthetic PK (stripped at presentation). The
-//! caller then applies the shared ORDER BY / OFFSET / LIMIT sink.
+//! ground row, finishes AVG / nullable-SUM, filters by HAVING through the shared
+//! expression evaluator (the same compiled program a grouped view's post-reduce
+//! FILTER runs), projects to SELECT order, and emits a batch carrying a hidden
+//! synthetic PK (stripped at presentation). The caller then applies the shared
+//! ORDER BY / OFFSET / LIMIT sink.
 //!
 //! Partial reply layout (the batch this module consumes) is the shared
 //! SyntheticFold layout (`crate::agg::synthetic_fold_cols`):
@@ -17,19 +18,20 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use gnitz_core::{null_word_set, ColData, ColumnDef, FixedInt, ReduceOutKey, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{
+    null_word_get, null_word_set, ColData, ColumnDef, FixedInt, ReduceOutKey, Schema, TypeCode, ViewBuffers, ZSetBatch,
+};
+use gnitz_expr::Evaluator;
 use gnitz_wire::{cmp_typed_le, AggFunc as WireAggFunc};
 
 use crate::agg::{group_col_reduce_pos, AggShape, AggSpec, GroupByLayout, GroupBySelectItem};
 use crate::error::GnitzSqlError;
-use crate::ir::{BinOp, BoundExpr, UnaryOp};
-use crate::lower::{lower_bound_expr, BoundExprBackend};
 use crate::validate::reject_duplicate_column_names;
 
 /// Everything the finish needs from the SQL layer, borrowed from the routing
-/// arm. `having` is the **pre-bound, pre-probed** HAVING expression (ColRefs
-/// into the reduce-output layout; no aggregate nodes) — `None` when the query
-/// has no HAVING or it was rejected to the executor at plan time.
+/// arm. `having` is the HAVING predicate **compiled at plan time** against
+/// `partial_schema` — `None` when the query has no HAVING or it folded to a
+/// statically-true constant.
 pub(crate) struct AggFinish<'a> {
     pub source_schema: &'a Schema,
     /// The shared aggregate layout (group columns, specs, mappings, SELECT
@@ -40,7 +42,7 @@ pub(crate) struct AggFinish<'a> {
     /// The final output schema (`build_agg_out_schema`, computed at plan time
     /// so a bad shape rejects before the fold is dispatched).
     pub out_schema: &'a Schema,
-    pub having: Option<&'a BoundExpr>,
+    pub having: Option<&'a Evaluator>,
 }
 
 /// One physical agg column's cross-worker combiner. The variant is selected by
@@ -94,12 +96,25 @@ impl ColAcc {
     }
 }
 
-/// A typed value used by the HAVING evaluator and the aggregate render.
+/// A combined accumulator's value, as the render and the group batch read it.
 #[derive(Clone, Copy)]
 enum Val {
     Int(i64),
     Float(f64),
     Null,
+}
+
+impl Val {
+    /// The 8-byte register image a Fixed column stores, or `None` for SQL NULL.
+    /// Both writers below go through this, so integer and float share one
+    /// truncation rule.
+    fn bits(self) -> Option<u64> {
+        match self {
+            Val::Int(i) => Some(i as u64),
+            Val::Float(f) => Some(f.to_bits()),
+            Val::Null => None,
+        }
+    }
 }
 
 /// Pre-resolved SELECT-item source (computed once per query, not per group): a
@@ -112,7 +127,7 @@ enum ItemSrc {
 /// Combine, finish, and project the concatenated worker partials into the final
 /// result batch (with a hidden synthetic PK). The caller applies ORDER BY /
 /// OFFSET / LIMIT afterwards.
-pub(crate) fn agg_finish(spec: &AggFinish, partial: &ZSetBatch) -> Result<ZSetBatch, GnitzSqlError> {
+pub(crate) fn agg_finish(spec: &AggFinish, partial: &ZSetBatch) -> ZSetBatch {
     let layout = spec.layout;
     let n_group = layout.group_col_indices.len();
     let n_aggs = layout.agg_specs.len();
@@ -158,7 +173,9 @@ pub(crate) fn agg_finish(spec: &AggFinish, partial: &ZSetBatch) -> Result<ZSetBa
         accs.extend(layout.agg_specs.iter().map(ColAcc::new));
     }
 
-    // 3–5. Finish + HAVING + project into the output batch.
+    // 3–5. Finish + HAVING + project into the output batch. Zero groups needs no
+    // guard: `filter` over a 0-row batch calls back zero times, and
+    // `emit_range(0, 0)` is a no-op.
     let item_srcs: Vec<ItemSrc> = layout
         .select_items
         .iter()
@@ -174,25 +191,109 @@ pub(crate) fn agg_finish(spec: &AggFinish, partial: &ZSetBatch) -> Result<ZSetBa
             GroupBySelectItem::Aggregate { agg_idx } => ItemSrc::Agg { agg_idx: *agg_idx },
         })
         .collect();
-    // HAVING evaluation state, built only when a HAVING survives to runtime.
-    let mut having_state = spec.having.map(|having| {
-        let types: Vec<TypeCode> = spec.partial_schema.columns.iter().map(|c| c.type_code).collect();
-        (having, types, Vec::new())
-    });
-    let mut out = ZSetBatch::new(spec.out_schema);
-    let mut out_pk: u128 = 0;
-    for (g, &rep) in reps.iter().enumerate() {
-        let gaccs = &accs[g * n_aggs..(g + 1) * n_aggs];
-        if let Some((having, types, row)) = &mut having_state {
-            fill_having_row(spec, partial, rep, gaccs, row);
-            if !truthy(eval_having(having, row, types)?) {
-                continue;
+    let mut out = ZSetBatch::with_capacity(spec.out_schema, reps.len());
+    // Both arms speak in half-open group ranges, which is what
+    // `Evaluator::filter` hands back; without a HAVING every group is one range.
+    let mut emit_range = |start: usize, end: usize| {
+        for g in start..end {
+            emit_row(
+                spec,
+                partial,
+                &item_srcs,
+                &mut out,
+                reps[g],
+                &accs[g * n_aggs..(g + 1) * n_aggs],
+            );
+        }
+    };
+    match spec.having {
+        None => emit_range(0, reps.len()),
+        Some(ev) => {
+            // One batch, one `filter` call — so the truth rule is the engine
+            // filter's own (`bool_bits & !null_bits`), and the region list, which
+            // borrows the buffers and so cannot be cached, is built once.
+            let groups = fill_group_batch(spec, partial, &reps, &accs);
+            let mut bufs = ViewBuffers::default();
+            let view = bufs.view(&groups, spec.partial_schema);
+            // `groups.len()`, not `reps.len()` — equal by construction, but the
+            // batch's own row count is what makes the view read in bounds.
+            ev.filter(&view, groups.len(), emit_range);
+        }
+    }
+    out
+}
+
+/// One row per group in the partial-reply layout — the client's reduce output:
+/// `[_group_pk | group cols copied from the representative partial row | raw
+/// accumulator values]`. `reps[g] == None` is the synthesized global ground
+/// group, which by construction has no group columns.
+///
+/// Filled a column at a time, so the destination column and its `ColData`
+/// variant are resolved once per column rather than once per cell.
+fn fill_group_batch(spec: &AggFinish, partial: &ZSetBatch, reps: &[Option<usize>], accs: &[ColAcc]) -> ZSetBatch {
+    let schema = spec.partial_schema;
+    let n_group = spec.layout.group_col_indices.len();
+    let n_aggs = spec.layout.agg_specs.len();
+    let n = reps.len();
+
+    let mut dst = ZSetBatch::with_capacity(schema, n);
+    // `_group_pk` is the dense group ordinal: present, unreferenceable. Pushed
+    // rather than assigned as a `PkColumn` variant, so the variant stays the one
+    // `empty_for_schema` derived from the schema.
+    for g in 0..n {
+        dst.pks.push_u128(g as u128);
+    }
+    dst.weights.resize(n, 1);
+    // One word per row, one bit per payload slot: materialized at its final
+    // length up front so each column pass can OR in its own bit `pi`.
+    dst.nulls.resize(n, 0);
+    let ZSetBatch { nulls, columns, .. } = &mut dst;
+
+    // `payload_columns` yields the payload slot as its enumeration ordinal, so
+    // `pi` is also the column's position in this layout: slots `0..n_group` are
+    // the group columns, the rest the agg partials.
+    for (pi, ci, col) in schema.payload_columns() {
+        let (tc, w) = (col.type_code, col.type_code.wire_stride());
+        if pi < n_group {
+            // A group column keeps its source type, so the move goes through the
+            // exhaustive `push_row_from` — a new `ColData` variant then has to be
+            // handled there rather than panicking at runtime.
+            for (g, &rep) in reps.iter().enumerate() {
+                let rep = rep.expect("a grouped result always has a representative row");
+                if null_word_get(partial.nulls[rep], pi) {
+                    push_null_cell(&mut columns[ci], tc, &mut nulls[g], pi);
+                } else {
+                    partial.columns[ci].push_row_from(rep, w, &mut columns[ci]);
+                }
+            }
+        } else {
+            // `accs` is group-major (the combine loop writes a whole group row at
+            // a time), so this column's cells are `n_aggs` apart.
+            let k = pi - n_group;
+            for g in 0..n {
+                match acc_val(&accs[g * n_aggs + k]).bits() {
+                    None => push_null_cell(&mut columns[ci], tc, &mut nulls[g], pi),
+                    Some(bits) => push_fixed_bits(&mut columns[ci], bits, w),
+                }
             }
         }
-        emit_row(spec, partial, &item_srcs, &mut out, out_pk, rep, gaccs);
-        out_pk += 1;
     }
-    Ok(out)
+
+    // The one rule `ViewBuffers::regions` does not already assert on this batch
+    // two lines later: a set null bit under a NOT NULL group column would leave
+    // the resolved program's `no_nulls` on, and the evaluator would read
+    // `push_null`'s zero bytes as a real `0`. Unconditional — release is where a
+    // stale bit becomes a silently wrong answer rather than a panic.
+    dst.validate(schema)
+        .expect("the group batch must satisfy the partial schema");
+    dst
+}
+
+/// Append a NULL cell to `col` and record it at payload slot `pi` in `word` —
+/// the one place the null bitmap and the pushed filler bytes are kept in step.
+fn push_null_cell(col: &mut ColData, tc: TypeCode, word: &mut u64, pi: usize) {
+    null_word_set(word, pi, true);
+    col.push_null(tc);
 }
 
 // ---------------------------------------------------------------------------
@@ -309,9 +410,9 @@ fn finish_agg(spec: &AggFinish, accs: &[ColAcc], agg_idx: usize) -> Val {
 }
 
 /// The combined accumulator's typed value — shared by the aggregate render and
-/// the HAVING row, so the two cannot drift. NULL for an uncontributed SUM /
-/// MIN / MAX (the global ground row, or an all-NULL group); counts are always
-/// concrete.
+/// the group batch the HAVING filter runs over, so the two cannot drift. NULL
+/// for an uncontributed SUM / MIN / MAX (the global ground row, or an all-NULL
+/// group); counts are always concrete.
 fn acc_val(acc: &ColAcc) -> Val {
     match acc {
         ColAcc::Count { n } => Val::Int(*n),
@@ -368,300 +469,6 @@ fn acc_f64(acc: &ColAcc) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// HAVING evaluation (typed, IEEE, 3VL — mirrors the engine expr VM)
-// ---------------------------------------------------------------------------
-
-/// Fill the reduce-output-layout typed row a bound HAVING expr evaluates over:
-/// `[_group_pk placeholder | group col values | combined agg values]`, matching
-/// the SyntheticFold ColRef indices the HAVING binder produced. `rep` is the
-/// group's representative partial row (`None` only for the global ground
-/// group, which has no group columns to read).
-fn fill_having_row(spec: &AggFinish, partial: &ZSetBatch, rep: Option<usize>, accs: &[ColAcc], row: &mut Vec<Val>) {
-    let n_group = spec.layout.group_col_indices.len();
-    row.clear();
-    row.resize(1 + n_group + spec.layout.agg_specs.len(), Val::Null);
-    for g in 0..n_group {
-        let rep = rep.expect("a grouped result always has a representative row");
-        let ci = 1 + g;
-        let tc = spec.partial_schema.columns[ci].type_code;
-        // A group column the evaluator supports decodes to i64 (the probe
-        // rejected any HAVING that references another type); unsupported types
-        // stay NULL — they are unreferenced.
-        if !partial.is_null(spec.partial_schema, rep, ci) {
-            if let Some(fi) = FixedInt::from_type_code(tc) {
-                let s = tc.wire_stride();
-                row[ci] = Val::Int(fi.decode_le_i64(fixed_slice(partial, ci, rep, s)));
-            }
-        }
-    }
-    for (k, acc) in accs.iter().enumerate() {
-        row[1 + n_group + k] = acc_val(acc);
-    }
-}
-
-/// Whether a HAVING result keeps the group (truthy, NULL/false drop) — matching
-/// the engine post-reduce FILTER (`eval_pred_row`: `v != 0`, NULL excluded).
-fn truthy(v: Val) -> bool {
-    match v {
-        Val::Int(i) => i != 0,
-        Val::Float(f) => f != 0.0,
-        Val::Null => false,
-    }
-}
-
-/// Typed interpreter backend over one reduce-layout row (`Out = Val`), on the
-/// shared `BoundExprBackend` walk. One backend serves both roles — the
-/// plan-time support probe ([`having_supported`], over a NULL row) and the
-/// per-group runtime evaluation — so the supported node/type set is defined
-/// exactly once, and a new `BoundExpr` variant cannot slip through silently
-/// (the shared walk fails to compile, or the node lands on a typed
-/// `Unsupported` arm that routes the query to the executor).
-struct HavingEval<'a> {
-    row: &'a [Val],
-    /// Reduce-output layout types (`[_group_pk, group cols…, agg partials…]`).
-    types: &'a [TypeCode],
-}
-
-impl HavingEval<'_> {
-    /// Whether `e` statically evaluates to a float. The static type is exactly
-    /// what [`BExpr::infer_type_with`] reports — a float literal, a float-typed
-    /// column, arithmetic over either (`unify_numeric`), or a negation of one;
-    /// comparisons and logic are integer-valued there too. Exact — `Val::Float`
-    /// arises at runtime from precisely those shapes — so the plan-time
-    /// float-modulo rejection in `binop` covers every runtime occurrence.
-    fn is_float_expr(&self, e: &BoundExpr) -> bool {
-        e.infer_type_with(&|c: &usize| self.types.get(*c).copied().unwrap_or(TypeCode::I64))
-            .is_float()
-    }
-}
-
-fn unsupported(what: &str) -> GnitzSqlError {
-    GnitzSqlError::Unsupported(format!("HAVING: {what} not supported in ad-hoc evaluation"))
-}
-
-impl BoundExprBackend for HavingEval<'_> {
-    type Out = Val;
-
-    fn col_ref(&mut self, c: usize) -> Result<Val, GnitzSqlError> {
-        // Only signed / narrow-unsigned integers and floats evaluate; a string
-        // / U64 / wide column routes the whole query to the executor at plan
-        // time (a U64 would need unsigned compare arms the typed evaluator
-        // does not carry).
-        let supported = self.types.get(c).is_some_and(|tc| {
-            tc.is_float()
-                || matches!(tc, TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64)
-                || matches!(tc, TypeCode::U8 | TypeCode::U16 | TypeCode::U32)
-        });
-        if !supported {
-            return Err(unsupported("column type"));
-        }
-        Ok(self.row[c])
-    }
-
-    fn lit_int(&mut self, v: i64) -> Result<Val, GnitzSqlError> {
-        Ok(Val::Int(v))
-    }
-
-    fn lit_float(&mut self, v: f64) -> Result<Val, GnitzSqlError> {
-        Ok(Val::Float(v))
-    }
-
-    fn lit_str(&mut self, _s: &str) -> Result<Val, GnitzSqlError> {
-        Err(unsupported("string literal"))
-    }
-
-    fn lit_null(&mut self) -> Result<Val, GnitzSqlError> {
-        Ok(Val::Null)
-    }
-
-    fn binop(&mut self, l: &BoundExpr, op: BinOp, r: &BoundExpr) -> Result<Val, GnitzSqlError> {
-        // The engine expr VM has no float-modulo instruction, so a CREATE VIEW
-        // rejects it at compile — reject it here (statically, before the NULL
-        // short-circuit, so the all-NULL plan-time probe sees it too) to keep
-        // ad-hoc HAVING ⊆ view HAVING.
-        if matches!(op, BinOp::Mod) && (self.is_float_expr(l) || self.is_float_expr(r)) {
-            return Err(unsupported("float modulo"));
-        }
-        // Both operands evaluate unconditionally — required by the plan-time
-        // probe (every node must be visited) and harmless at runtime (no
-        // supported node errors: div-by-zero is NULL, not an error).
-        let a = lower_bound_expr(l, self)?;
-        let b = lower_bound_expr(r, self)?;
-        Ok(match op {
-            BinOp::And | BinOp::Or => eval_3vl(op, a, b),
-            _ if matches!(a, Val::Null) || matches!(b, Val::Null) => Val::Null,
-            BinOp::Eq | BinOp::Ne | BinOp::Gt | BinOp::Ge | BinOp::Lt | BinOp::Le => eval_cmp(op, a, b),
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => eval_arith(op, a, b),
-        })
-    }
-
-    fn unop(&mut self, op: UnaryOp, inner: &BoundExpr) -> Result<Val, GnitzSqlError> {
-        let v = lower_bound_expr(inner, self)?;
-        Ok(match op {
-            UnaryOp::Neg => match v {
-                Val::Int(i) => Val::Int(i.wrapping_neg()),
-                Val::Float(f) => Val::Float(-f),
-                Val::Null => Val::Null,
-            },
-            UnaryOp::Not => match v {
-                Val::Null => Val::Null, // NOT NULL = NULL
-                v => Val::Int((!truthy(v)) as i64),
-            },
-        })
-    }
-
-    fn null_test(&mut self, _col: usize, _want_null: bool) -> Result<Val, GnitzSqlError> {
-        // Post-fold IS [NOT] NULL on a bound column (the binder const-folds the
-        // decidable shapes away before this).
-        Err(unsupported("IS [NOT] NULL"))
-    }
-
-    fn agg_call(&mut self) -> Result<Val, GnitzSqlError> {
-        // The HAVING binder resolves every aggregate to a reduce-layout ColRef.
-        Err(unsupported("aggregate call"))
-    }
-
-    fn case(&mut self, _branches: &[(BoundExpr, BoundExpr)], _else: Option<&BoundExpr>) -> Result<Val, GnitzSqlError> {
-        Err(unsupported("CASE"))
-    }
-
-    fn in_list(&mut self, _inner: &BoundExpr, _items: &[BoundExpr]) -> Result<Val, GnitzSqlError> {
-        Err(unsupported("IN"))
-    }
-}
-
-/// Plan-time support probe: run the typed evaluator over an all-NULL row. The
-/// walk visits every node (`binop`/`unop` recurse unconditionally, unsupported
-/// composites reject without recursing), so `is_ok()` iff every node and every
-/// referenced column type evaluates at runtime.
-pub(crate) fn having_supported(e: &BoundExpr, partial_schema: &Schema) -> bool {
-    let types: Vec<TypeCode> = partial_schema.columns.iter().map(|c| c.type_code).collect();
-    let row = vec![Val::Null; types.len()];
-    lower_bound_expr(
-        e,
-        &mut HavingEval {
-            row: &row,
-            types: &types,
-        },
-    )
-    .is_ok()
-}
-
-/// Evaluate the bound HAVING over one combined group row. Infallible after
-/// [`having_supported`] passed at plan time (the same backend walked the same
-/// tree); a residual `Err` propagates as the routing bug it would be.
-fn eval_having(e: &BoundExpr, row: &[Val], types: &[TypeCode]) -> Result<Val, GnitzSqlError> {
-    lower_bound_expr(e, &mut HavingEval { row, types })
-}
-
-fn eval_3vl(op: BinOp, a: Val, b: Val) -> Val {
-    let (ta, tb) = (tri(a), tri(b)); // Some(true/false) truth, None = unknown
-    match op {
-        BinOp::And => match (ta, tb) {
-            (Some(false), _) | (_, Some(false)) => Val::Int(0),
-            (Some(true), Some(true)) => Val::Int(1),
-            _ => Val::Null,
-        },
-        BinOp::Or => match (ta, tb) {
-            (Some(true), _) | (_, Some(true)) => Val::Int(1),
-            (Some(false), Some(false)) => Val::Int(0),
-            _ => Val::Null,
-        },
-        _ => unreachable!("eval_3vl only handles AND/OR"),
-    }
-}
-
-fn tri(v: Val) -> Option<bool> {
-    match v {
-        Val::Null => None,
-        other => Some(truthy(other)),
-    }
-}
-
-fn eval_cmp(op: BinOp, a: Val, b: Val) -> Val {
-    // Either float → native IEEE f64 compare (partial_cmp is None only for NaN,
-    // where only Ne holds — matching the engine `FCmp`); else signed i64.
-    let ord = if matches!(a, Val::Float(_)) || matches!(b, Val::Float(_)) {
-        as_f64(a).partial_cmp(&as_f64(b))
-    } else {
-        Some(as_i64(a).cmp(&as_i64(b)))
-    };
-    let res = match op {
-        BinOp::Eq => ord == Some(Ordering::Equal),
-        BinOp::Ne => ord != Some(Ordering::Equal),
-        BinOp::Lt => ord == Some(Ordering::Less),
-        BinOp::Le => matches!(ord, Some(Ordering::Less | Ordering::Equal)),
-        BinOp::Gt => ord == Some(Ordering::Greater),
-        BinOp::Ge => matches!(ord, Some(Ordering::Greater | Ordering::Equal)),
-        _ => unreachable!("eval_cmp only handles comparisons"),
-    };
-    Val::Int(res as i64)
-}
-
-fn eval_arith(op: BinOp, a: Val, b: Val) -> Val {
-    if matches!(a, Val::Float(_)) || matches!(b, Val::Float(_)) {
-        let (x, y) = (as_f64(a), as_f64(b));
-        match op {
-            BinOp::Add => Val::Float(x + y),
-            BinOp::Sub => Val::Float(x - y),
-            BinOp::Mul => Val::Float(x * y),
-            // Float divide by zero → NULL (engine `div_like`), not ±inf.
-            BinOp::Div => {
-                if y != 0.0 {
-                    Val::Float(x / y)
-                } else {
-                    Val::Null
-                }
-            }
-            // Rejected statically in `binop` (the engine VM has no float Mod).
-            BinOp::Mod => unreachable!("float modulo is rejected at plan time"),
-            _ => unreachable!(),
-        }
-    } else {
-        let (x, y) = (as_i64(a), as_i64(b));
-        match op {
-            BinOp::Add => Val::Int(x.wrapping_add(y)),
-            BinOp::Sub => Val::Int(x.wrapping_sub(y)),
-            BinOp::Mul => Val::Int(x.wrapping_mul(y)),
-            // Integer divide/mod by zero → NULL (engine semantics).
-            BinOp::Div => {
-                if y != 0 {
-                    Val::Int(x.wrapping_div(y))
-                } else {
-                    Val::Null
-                }
-            }
-            BinOp::Mod => {
-                if y != 0 {
-                    Val::Int(x.wrapping_rem(y))
-                } else {
-                    Val::Null
-                }
-            }
-            _ => unreachable!(),
-        }
-    }
-}
-
-fn as_f64(v: Val) -> f64 {
-    match v {
-        Val::Int(i) => i as f64,
-        Val::Float(f) => f,
-        Val::Null => unreachable!("NULL is handled before arithmetic"),
-    }
-}
-
-fn as_i64(v: Val) -> i64 {
-    match v {
-        Val::Int(i) => i,
-        // The integer branch of eval_cmp/eval_arith is only taken when neither
-        // operand is Float — a silent float truncation here would be a bug.
-        Val::Float(_) => unreachable!("integer arithmetic never receives a float"),
-        Val::Null => unreachable!("NULL is handled before arithmetic"),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Output schema + row emission
 // ---------------------------------------------------------------------------
 
@@ -690,16 +497,18 @@ pub(crate) fn build_agg_out_schema(layout: &GroupByLayout, source_schema: &Schem
         .map_err(|e| GnitzSqlError::Unsupported(format!("ad-hoc aggregate output schema is invalid: {e}")))
 }
 
+/// Project one group into `out`. The synthetic PK is the row's own ordinal, so
+/// it is read off `out` rather than threaded in.
 fn emit_row(
     spec: &AggFinish,
     partial: &ZSetBatch,
     item_srcs: &[ItemSrc],
     out: &mut ZSetBatch,
-    out_pk: u128,
     rep: Option<usize>,
     accs: &[ColAcc],
 ) {
     let out_schema = spec.out_schema;
+    let out_pk = out.len() as u128;
     out.pks.push_u128(out_pk);
     out.weights.push(1);
     let mut null_word: u64 = 0;
@@ -711,88 +520,197 @@ fn emit_row(
             ItemSrc::Group { partial_ci } => {
                 let rep = rep.expect("a grouped result always has a representative row");
                 if partial.is_null(spec.partial_schema, rep, *partial_ci) {
-                    null_word_set(&mut null_word, out_pi, true);
-                    out.columns[out_ci].push_null(out_tc);
+                    push_null_cell(&mut out.columns[out_ci], out_tc, &mut null_word, out_pi);
                 } else {
                     partial.columns[*partial_ci].push_row_from(rep, out_tc.wire_stride(), &mut out.columns[out_ci]);
                 }
             }
-            ItemSrc::Agg { agg_idx } => match finish_agg(spec, accs, *agg_idx) {
-                Val::Null => {
-                    null_word_set(&mut null_word, out_pi, true);
-                    out.columns[out_ci].push_null(out_tc);
-                }
-                Val::Int(bits) => push_fixed_bits(&mut out.columns[out_ci], bits as u64, out_tc.wire_stride()),
-                Val::Float(f) => push_fixed_bits(&mut out.columns[out_ci], f.to_bits(), out_tc.wire_stride()),
+            ItemSrc::Agg { agg_idx } => match finish_agg(spec, accs, *agg_idx).bits() {
+                None => push_null_cell(&mut out.columns[out_ci], out_tc, &mut null_word, out_pi),
+                Some(bits) => push_fixed_bits(&mut out.columns[out_ci], bits, out_tc.wire_stride()),
             },
         }
     }
     out.nulls.push(null_word);
 }
 
-/// Push the low `stride` bytes of `bits` into a Fixed output column.
+/// Push the low `stride` bytes of `bits` into a Fixed aggregate column. Every
+/// aggregate column — partial or output — is a `Fixed` of width ≤ 8:
+/// `agg_output_type` routes float SUM/MIN/MAX to F64 and SUM through
+/// `register_image_type`, and preserves a ≤8-byte integer source's own width for
+/// MIN/MAX.
 fn push_fixed_bits(col: &mut ColData, bits: u64, stride: usize) {
     match col {
         ColData::Fixed(buf) => buf.extend_from_slice(&bits.to_le_bytes()[..stride]),
-        _ => unreachable!("ad-hoc aggregate output column is not Fixed"),
+        _ => unreachable!("an ad-hoc aggregate column is a Fixed of width <= 8"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agg::synthetic_fold_cols;
     use crate::test_support::col_def;
+    use gnitz_core::PkColumn;
 
-    fn schema() -> Schema {
+    /// `(pk U64 | g I64 nullable | sm I16 nullable)` — one nullable group column
+    /// and a narrow aggregate source, so the fill exercises a NULL group value
+    /// and a sub-8-byte width.
+    fn source_schema() -> Schema {
         Schema {
             columns: vec![
-                col_def("_group_pk", TypeCode::U128, false),
-                col_def("g", TypeCode::I64, false),
-                col_def("agg0", TypeCode::I64, true),
+                col_def("pk", TypeCode::U64, false),
+                col_def("g", TypeCode::I64, true),
+                col_def("sm", TypeCode::I16, true),
             ],
             pk_cols: vec![0],
         }
     }
 
-    /// The probe must visit BOTH operands of a logical connective: an
-    /// unsupported node in the right branch of an `OR` whose left is a
-    /// satisfied literal has to reject at plan time. A short-circuiting probe
-    /// would pass it and the unsupported node would surface as a hard error
-    /// mid-query — this pins the non-short-circuiting walk `having_supported`
-    /// relies on.
-    #[test]
-    fn probe_visits_both_or_branches() {
-        let bad_rhs = BoundExpr::BinOp(
-            Box::new(BoundExpr::LitInt(1)),
-            BinOp::Or,
-            Box::new(BoundExpr::LitStr("x".to_string())),
-        );
-        assert!(!having_supported(&bad_rhs, &schema()));
-        let ok = BoundExpr::BinOp(
-            Box::new(BoundExpr::LitInt(1)),
-            BinOp::Or,
-            Box::new(BoundExpr::ColRef(2)),
-        );
-        assert!(having_supported(&ok, &schema()));
+    /// Two specs so `accs` is genuinely group-major with a stride of 2:
+    /// `MIN(sm)` at the source's own 2-byte width, then `COUNT(*)`.
+    fn agg_specs() -> Vec<AggSpec> {
+        vec![
+            AggSpec {
+                op: WireAggFunc::Min,
+                col: 2,
+                out_type: TypeCode::I16,
+            },
+            AggSpec {
+                op: WireAggFunc::Count,
+                col: 0,
+                out_type: TypeCode::I64,
+            },
+        ]
     }
 
-    /// Float modulo has no engine VM instruction, so a view HAVING rejects it —
-    /// the ad-hoc probe must too (ad-hoc HAVING ⊆ view HAVING), even through
-    /// the all-NULL probe row (the guard is static, pre-NULL-short-circuit).
+    fn partial_schema(src: &Schema, specs: &[AggSpec]) -> Schema {
+        Schema::from_parts(synthetic_fold_cols(src, &[1], specs, &|_| true), vec![0])
+            .expect("the SyntheticFold layout is a valid client schema")
+    }
+
+    fn fixed(col: &ColData) -> &[u8] {
+        match col {
+            ColData::Fixed(b) => b,
+            _ => panic!("expected a Fixed column"),
+        }
+    }
+
+    /// The group batch the HAVING filter runs over: group columns copied from
+    /// each representative partial row, aggregate partials taken from `accs` at
+    /// the declared width, and one null bit per payload slot. A wrong bit here
+    /// is a silently wrong HAVING verdict, not a crash.
     #[test]
-    fn probe_rejects_float_modulo() {
-        let float_mod = BoundExpr::BinOp(
-            Box::new(BoundExpr::LitFloat(2.5)),
-            BinOp::Mod,
-            Box::new(BoundExpr::ColRef(2)),
+    fn fill_group_batch_lays_out_values_and_null_bits() {
+        let src = source_schema();
+        let specs = agg_specs();
+        let partial_s = partial_schema(&src, &specs);
+        // `fill_group_batch` never reads the output schema; it only has to exist.
+        let out_s = Schema::from_parts(vec![col_def("_agg_pk", TypeCode::U128, false).hidden()], vec![0]).unwrap();
+        let layout = GroupByLayout {
+            group_col_indices: vec![1],
+            agg_specs: specs,
+            agg_mappings: vec![],
+            select_items: vec![],
+        };
+
+        // Two representative partial rows: group 0 has g = 10, group 1 has g NULL
+        // (payload slot 0). The agg columns are never read from `partial`.
+        let mut partial = ZSetBatch::new(&partial_s);
+        for (row, g) in [10i64, 0].into_iter().enumerate() {
+            partial.pks.push_u128(row as u128);
+            partial.weights.push(1);
+            partial.nulls.push(if row == 1 { 0b1 } else { 0 });
+            push_fixed_bits(&mut partial.columns[1], g as u64, 8);
+            push_fixed_bits(&mut partial.columns[2], 0, 2);
+            push_fixed_bits(&mut partial.columns[3], 0, 8);
+        }
+
+        let reps = [Some(0usize), Some(1usize)];
+        let accs = vec![
+            // Group 0: MIN(sm) = -5, COUNT = 2.
+            ColAcc::Extreme {
+                best: Some([0xfb, 0xff, 0, 0, 0, 0, 0, 0]),
+                is_max: false,
+                tc: TypeCode::I16,
+            },
+            ColAcc::Count { n: 2 },
+            // Group 1: an all-NULL MIN group, COUNT = 1.
+            ColAcc::Extreme {
+                best: None,
+                is_max: false,
+                tc: TypeCode::I16,
+            },
+            ColAcc::Count { n: 1 },
+        ];
+
+        let spec = AggFinish {
+            source_schema: &src,
+            layout: &layout,
+            partial_schema: &partial_s,
+            out_schema: &out_s,
+            having: None,
+        };
+        let got = fill_group_batch(&spec, &partial, &reps, &accs);
+
+        assert_eq!(got.len(), 2);
+        assert_eq!(got.weights, vec![1, 1]);
+        // Slot 0 = g, slot 1 = MIN(sm), slot 2 = COUNT. Group 1 nulls g and MIN.
+        assert_eq!(got.nulls, vec![0, 0b011]);
+        // `_group_pk` is the dense group ordinal.
+        assert_eq!(got.pks, PkColumn::U128s(vec![0, 1]));
+        // g: the copied value, then `push_null`'s zero filler.
+        assert_eq!(
+            fixed(&got.columns[1]),
+            10i64.to_le_bytes().iter().chain(&[0; 8]).copied().collect::<Vec<_>>()
         );
-        assert!(!having_supported(&float_mod, &schema()));
-        // Integer modulo stays supported.
-        let int_mod = BoundExpr::BinOp(
-            Box::new(BoundExpr::ColRef(2)),
-            BinOp::Mod,
-            Box::new(BoundExpr::LitInt(2)),
+        // MIN(sm) truncated to its declared 2 bytes, then a zeroed NULL cell.
+        assert_eq!(fixed(&got.columns[2]), &[0xfb, 0xff, 0, 0]);
+        // COUNT is never NULL.
+        assert_eq!(
+            fixed(&got.columns[3]),
+            2i64.to_le_bytes()
+                .iter()
+                .chain(&1i64.to_le_bytes())
+                .copied()
+                .collect::<Vec<_>>()
         );
-        assert!(having_supported(&int_mod, &schema()));
+    }
+
+    /// The global ground row: no group columns, every aggregate uncontributed.
+    /// `reps[0] == None` must not be dereferenced.
+    #[test]
+    fn fill_group_batch_handles_the_global_ground_row() {
+        let src = source_schema();
+        let specs = agg_specs();
+        let partial_s = Schema::from_parts(synthetic_fold_cols(&src, &[], &specs, &|_| true), vec![0]).unwrap();
+        let out_s = Schema::from_parts(vec![col_def("_agg_pk", TypeCode::U128, false).hidden()], vec![0]).unwrap();
+        let layout = GroupByLayout {
+            group_col_indices: vec![],
+            agg_specs: specs,
+            agg_mappings: vec![],
+            select_items: vec![],
+        };
+        let spec = AggFinish {
+            source_schema: &src,
+            layout: &layout,
+            partial_schema: &partial_s,
+            out_schema: &out_s,
+            having: None,
+        };
+        let accs = vec![
+            ColAcc::Extreme {
+                best: None,
+                is_max: false,
+                tc: TypeCode::I16,
+            },
+            ColAcc::Count { n: 0 },
+        ];
+        let got = fill_group_batch(&spec, &ZSetBatch::new(&partial_s), &[None], &accs);
+
+        assert_eq!(got.len(), 1);
+        // Slot 0 = MIN (NULL), slot 1 = COUNT (0, never NULL).
+        assert_eq!(got.nulls, vec![0b01]);
+        assert_eq!(fixed(&got.columns[2]), &0i64.to_le_bytes());
     }
 }

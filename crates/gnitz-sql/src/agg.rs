@@ -176,8 +176,10 @@ pub(crate) fn group_col_reduce_pos(
 /// HAVING binder's `agg_col_offset = 1 + n_group` all assume. `aggs_nullable`
 /// is the one divergence: the view path passes the exact per-spec rule
 /// (`agg_raw_nullable`, matching the engine's physical reduce schema), while the
-/// ad-hoc partial reply schema passes a blanket `true` — it only has to *decode*
-/// worker partials, and `same_physical_layout` ignores nullability there.
+/// ad-hoc partial reply schema passes a blanket `true`. That is conservative
+/// rather than cosmetic — the ad-hoc schema is also what the HAVING predicate
+/// resolves against, so over-declaring nullable only forces the evaluator's
+/// null-carrying arm, never a wrong answer.
 pub(crate) fn synthetic_fold_cols(
     source_schema: &Schema,
     group_col_indices: &[usize],

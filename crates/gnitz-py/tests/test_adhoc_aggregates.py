@@ -180,6 +180,166 @@ def test_having_parity(client):
         _cleanup(client, sn, "orders")
 
 
+# ---------------------------------------------------------------------------
+# HAVING through the shared expression evaluator
+#
+# The ad-hoc HAVING is compiled by the same `BoundExpr -> ExprProgram` compiler a
+# grouped view's post-reduce FILTER uses, and run by the same evaluator. So
+# `_parity` cannot catch a wrong *expression* result — both sides run the same
+# program. What it still discriminates is the surrounding physical shape: the
+# out-key layout (a single non-nullable natural key lives in the view's PK region
+# and is read with LoadPk, while ad-hoc is always the SyntheticFold payload
+# layout), the nullability verdict (ad-hoc declares every aggregate column
+# nullable, the view uses the per-spec rule), and the client's own materialized
+# reduce-output batch against the engine's.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def hg(client):
+    """A schema holding the `hg` table every HAVING test below reads, yielded as
+    the schema name."""
+    sn = "hg" + _uid()
+    client.create_schema(sn)
+    client.execute_sql(
+        "CREATE TABLE hg (pk BIGINT NOT NULL PRIMARY KEY, cat BIGINT NOT NULL, s TEXT,"
+        "                 u BIGINT UNSIGNED NOT NULL, sm SMALLINT, nn BIGINT NOT NULL, v BIGINT)",
+        schema_name=sn,
+    )
+    client.execute_sql(
+        "INSERT INTO hg VALUES "
+        "(1, 1, 'a',  9223372036854775808, -5,   10, 1),"
+        "(2, 1, 'a',  9223372036854775808, -1,   20, NULL),"
+        "(3, 2, 'b',  5,                    3,   30, 7),"
+        "(4, 2, NULL, 5,                    NULL, 40, NULL),"
+        "(5, 3, 'c',  18446744073709551615, 9,   50, NULL),"
+        "(6, 3, 'c',  18446744073709551615, 2,   60, NULL)",
+        schema_name=sn,
+    )
+    yield sn
+    _cleanup(client, sn, "hg")
+
+
+def _keys(rows, col):
+    return sorted(getattr(r, col) for r in rows if r.weight > 0)
+
+
+def _reject_both(client, sn, query):
+    """Assert `query` is rejected on the direct path AND as a CREATE VIEW, and
+    return the direct path's message."""
+    with pytest.raises(Exception) as ei:
+        _rows(client, sn, query)
+    msg = str(ei.value)
+    vn = "rv_" + _uid()
+    with pytest.raises(Exception):
+        client.execute_sql(f"CREATE VIEW {vn} AS {query}", schema_name=sn)
+    return msg
+
+
+def test_having_discriminating_parity(client, hg):
+    """The cases where the ad-hoc and view physical shapes genuinely differ."""
+    # A single NOT NULL U64 group column: the view routes it through the OPK PK
+    # region (SingleNaturalCol + LoadPk), ad-hoc through a payload slot. Also
+    # pins the unsigned comparison.
+    got = _parity(client, hg, "SELECT u, COUNT(*) AS c FROM hg GROUP BY u HAVING u > 9223372036854775807")
+    assert _keys(got, "u") == [9223372036854775808, 18446744073709551615], got
+    # A negative literal against a U64 column reads as u64::MAX on both paths,
+    # so the predicate is always false.
+    got = _parity(client, hg, "SELECT u, COUNT(*) AS c FROM hg GROUP BY u HAVING u > -1")
+    assert got == [], got
+    # A NOT NULL aggregate source, grouped: the view resolves `no_nulls = true`
+    # and reads the verdict out of the register file, ad-hoc resolves it false
+    # and reads `bool_bits & !null_bits`. Both evaluation arms of `filter`.
+    got = _parity(client, hg, "SELECT cat, SUM(nn) AS t FROM hg GROUP BY cat HAVING SUM(nn) > 0")
+    assert _keys(got, "cat") == [1, 2, 3], got
+    # The only narrow (2-byte) aggregate partial: MIN over SMALLINT keeps the
+    # source width, so the value round-trips i64 -> 2 bytes -> sign-extended i64.
+    got = _parity(client, hg, "SELECT cat, MIN(sm) AS m FROM hg GROUP BY cat HAVING MIN(sm) < 0")
+    assert _keys(got, "cat") == [1], got
+
+
+def test_having_new_capabilities(client, hg):
+    """Every one of these was rejected on the direct path before the swap."""
+    cases = [
+        ("SELECT s, COUNT(*) AS c FROM hg GROUP BY s HAVING s = 'a'", "s", ["a"]),
+        ("SELECT s, COUNT(*) AS c FROM hg GROUP BY s HAVING s > 'a'", "s", ["b", "c"]),
+        ("SELECT s, COUNT(*) AS c FROM hg GROUP BY s HAVING s IN ('a', 'c')", "s", ["a", "c"]),
+        ("SELECT s, COUNT(*) AS c FROM hg GROUP BY s HAVING s IS NULL", "s", [None]),
+        ("SELECT s, COUNT(*) AS c FROM hg GROUP BY s HAVING s IS NOT NULL", "s", ["a", "b", "c"]),
+        ("SELECT cat, MIN(v) AS m FROM hg GROUP BY cat HAVING MIN(v) IS NULL", "cat", [3]),
+        (
+            "SELECT cat, COUNT(*) AS c FROM hg GROUP BY cat "
+            "HAVING CASE WHEN COUNT(*) > 1 THEN 1 ELSE 0 END = 1",
+            "cat",
+            [1, 2, 3],
+        ),
+        ("SELECT cat, MIN(v) AS m FROM hg GROUP BY cat HAVING MIN(v) IN (1, 7)", "cat", [1, 2]),
+    ]
+    for q, col, want in cases:
+        got = _parity(client, hg, q)
+        assert _keys(got, col) == sorted(want), f"{q} -> {got}"
+
+
+def test_having_constants_and_edges(client, hg):
+    """Constant predicates, all-dropped / all-kept, non-contiguous survivors, an
+    empty source, and -0.0 truthiness — each with a positive control, so a
+    "drops everything" implementation cannot pass."""
+    # A statically-true HAVING folds away; 0 compiles to a real LoadConst that
+    # drops every group. (A bare `HAVING NULL` never reaches either compiler —
+    # the binder rejects a bare NULL literal, identically on both paths.)
+    assert _keys(_rows(client, hg, "SELECT cat FROM hg GROUP BY cat HAVING 1"), "cat") == [1, 2, 3]
+    assert _rows(client, hg, "SELECT cat FROM hg GROUP BY cat HAVING 0") == []
+    _reject_both(client, hg, "SELECT cat FROM hg GROUP BY cat HAVING NULL")
+    # Every group dropped, and its control.
+    assert _parity(client, hg, "SELECT cat FROM hg GROUP BY cat HAVING COUNT(*) > 99") == []
+    assert _keys(_parity(client, hg, "SELECT cat FROM hg GROUP BY cat HAVING COUNT(*) > 0"), "cat") == [1, 2, 3]
+    # Several filter ranges rather than one (0, n).
+    assert _keys(_parity(client, hg, "SELECT cat FROM hg GROUP BY cat HAVING cat <> 2"), "cat") == [1, 3]
+    # A global aggregate over an empty source grounds to one synthetic row,
+    # which HAVING still filters: NULL aggregates drop it, COUNT keeps it.
+    assert _parity(client, hg, "SELECT COUNT(*) AS c FROM hg WHERE pk < 0 HAVING SUM(cat) = 0") == []
+    got = _parity(client, hg, "SELECT COUNT(*) AS c FROM hg WHERE pk < 0 HAVING COUNT(*) = 0")
+    assert [r.c for r in got if r.weight > 0] == [0], got
+    assert _parity(client, hg, "SELECT COUNT(*) AS c FROM hg WHERE pk < 0 HAVING MAX(cat) >= 0") == []
+    # A bare float HAVING evaluating to -0.0: its bit pattern is nonzero, so
+    # the group is KEPT (the engine filter bit-tests, it does not compare 0.0).
+    got = _parity(client, hg, "SELECT cat FROM hg GROUP BY cat HAVING -(SUM(cat) * 0.0)")
+    assert _keys(got, "cat") == [1, 2, 3], got
+
+
+def test_having_rejections(client, hg):
+    """What the shared compiler still refuses — the same refusal on both paths —
+    plus the 64-register cap, with a control one conjunct under it."""
+    # No float-modulo instruction exists.
+    _reject_both(client, hg, "SELECT cat FROM hg GROUP BY cat HAVING SUM(v) % 2.0 > 0.5")
+    # A string literal on both sides has no column operand to dispatch on.
+    _reject_both(client, hg, "SELECT cat FROM hg GROUP BY cat HAVING 'a' = 'b'")
+
+    # The 64-register cap. `ExprBuilder` never reuses a register, so an equality
+    # conjunct over a plain group column costs 3 (load_col + load_const + cmp)
+    # and each AND one more: k conjuncts need 4k - 1, so 16 fit in 64 and 17 do
+    # not. A string IN costs 2N - 1 (one str_col_eq_const per item, whose column
+    # and const-pool indices are immediates, plus N-1 BoolOr): 32 fit, 33 do not.
+    #
+    # Only the direct path is asserted. CREATE VIEW ships the same over-cap
+    # program to the engine, which rejects it — but the DDL still succeeds and
+    # the view is silently empty, a separate defect not fixed here.
+    def _cap_rejection(query):
+        with pytest.raises(Exception) as ei:
+            _rows(client, hg, query)
+        msg = str(ei.value)
+        assert "64" in msg, f"the register-cap message must name the limit, got: {msg}"
+
+    conj = lambda k: " AND ".join(["cat = 1"] * k)
+    _cap_rejection(f"SELECT cat FROM hg GROUP BY cat HAVING {conj(17)}")
+    got = _parity(client, hg, f"SELECT cat FROM hg GROUP BY cat HAVING {conj(16)}")
+    assert _keys(got, "cat") == [1], got
+
+    in_list = lambda n: ", ".join(f"'v{i}'" for i in range(n))
+    _cap_rejection(f"SELECT s FROM hg GROUP BY s HAVING s IN ({in_list(33)})")
+    assert _parity(client, hg, f"SELECT s FROM hg GROUP BY s HAVING s IN ({in_list(32)})") == []
+
+
 def test_null_group_and_all_null_agg(client):
     sn = "ng" + _uid()
     client.create_schema(sn)

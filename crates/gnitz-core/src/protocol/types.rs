@@ -845,6 +845,30 @@ impl ZSetBatch {
             .collect()
     }
 
+    /// An empty batch with every growth stream sized for `n` rows: the PK
+    /// buffer, the weights, the null words and each payload column. The form to
+    /// use whenever the row count is known before the build loop — otherwise a
+    /// column-at-a-time fill reallocates its way up from zero.
+    pub fn with_capacity(schema: &Schema, n: usize) -> Self {
+        let mut b = Self::new(schema);
+        match &mut b.pks {
+            PkColumn::U64s(v) => v.reserve(n),
+            PkColumn::U128s(v) => v.reserve(n),
+            PkColumn::Bytes { buf, .. } => buf.reserve(n * schema.pk_stride()),
+        }
+        b.weights.reserve(n);
+        b.nulls.reserve(n);
+        for (_pi, ci, col) in schema.payload_columns() {
+            match &mut b.columns[ci] {
+                ColData::Fixed(v) => v.reserve(n * col.type_code.wire_stride()),
+                ColData::Strings(v) => v.reserve(n),
+                ColData::Bytes(v) => v.reserve(n),
+                ColData::U128s(v) => v.reserve(n),
+            }
+        }
+        b
+    }
+
     pub fn len(&self) -> usize {
         self.pks.len()
     }

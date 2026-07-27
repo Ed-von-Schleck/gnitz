@@ -17,7 +17,8 @@ discipline:
    aggregate HAVING, whitelist-limited: `col_ref` (`:457-461`) admits only F64
    + I8/I16/I32/I64 + U8/U16/U32 (no U64, no strings), and `null_test`
    (`:520-524`), `case` (`:531-533`), `in_list` (`:535-537`) return `Unsupported`
-   unconditionally.
+   unconditionally. **Deleted** in the Swap-HAVING step, together with
+   `having_supported` and the CREATE-VIEW-advice rejection it drove.
 
 This plan extracts the VM's evaluator core into a new leaf crate
 **`gnitz-expr`** (dependency: `gnitz-wire` only) so the SQL client runs the
@@ -263,10 +264,11 @@ gnitz-wire ── gnitz-expr ─┬── gnitz-engine   (MemBatch impls RowSour
                           └── gnitz-sql      (HAVING / residual / SET over the shared core)
 ```
 
-`gnitz-expr` is a workspace member and a dependency of `gnitz-engine` and (since
-step 4) `gnitz-core`; **step 5 adds it to `gnitz-sql`**, together with
-`expr_unsupported` — step 4 ships nothing in `gnitz-sql`, because a `pub(crate)`
-helper with no caller is `dead_code` under a workspace-wide `-D warnings`.
+`gnitz-expr` is a workspace member and a dependency of `gnitz-engine`,
+`gnitz-core` (step 4) and `gnitz-sql` (step 5, which also landed
+`expr_unsupported` — step 4 shipped nothing in `gnitz-sql`, because a
+`pub(crate)` helper with no caller is `dead_code` under a workspace-wide
+`-D warnings`).
 `gnitz-engine`'s production deps stay `gnitz-wire` + `gnitz-expr` only
 (`gnitz-core` remains dev-only, `gnitz-engine/Cargo.toml:27`). `gnitz-wire`'s only dependency is `xxhash-rust`,
 so there is no cycle. No `capi`/`py` surface changes.
@@ -763,6 +765,13 @@ region, the German cells and the blob arena keep their capacity across views.
 The region *list* is a fresh `Vec<&[u8]>` per view — `gnitz_wire::wal::encode`
 takes `&[&[u8]]`, and the buffers it borrows are `&mut self` until it is built.
 
+**`view()` therefore allocates on every call**, and it cannot cache the list:
+its elements borrow `self`. So a client **evaluates a batch**, never a row at a
+time in a loop — a per-row view would be a malloc, a PK-region rebuild, a
+`str_cols` resize and `1 + 2·npc` release-active asserts per row. Both
+production callers amortise it that way: `encode_wal_block` builds one per push,
+and the ad-hoc HAVING builds one over the whole materialized reduce output.
+
 `ZSetBatchView` hoists the three regions read **per row** — PK, blob, null
 bitmap — out of that list into fields (`nulls` as the `Vec<u64>` the region
 reinterprets, so it is one load rather than two). `col_data` / `null_bmp` are
@@ -770,184 +779,60 @@ read once per instruction per morsel and stay indexed.
 `gnitz_expr::assert_batchview_consistent` pins the two readings against each
 other, which is what makes the hoist safe to state as an optimisation.
 
-### Compiling a client program: the shared lines
+### Compiling a client program: one helper, in `lower.rs`
+
+The `ExprProgram → Evaluator` tail is **not** spelled at its call sites. It lives
+beside `compile_filter_program`, and `expr_unsupported` is **private to
+`lower.rs`** — every consumer reaches it through the helper that pairs it with a
+resolver:
 
 ```rust
-// in gnitz-sql, next to the other lowering helpers
-fn expr_unsupported(e: gnitz_expr::ExprValidateErr) -> GnitzSqlError {
-    match e {
-        gnitz_expr::ExprValidateErr::TooManyRegs(n) => GnitzSqlError::Unsupported(format!(
-            "expression needs {n} registers; the limit is 64 — split the predicate"
-        )),
-        other => GnitzSqlError::Unsupported(format!("expression cannot be compiled: {other:?}")),
-    }
-}
-
-let Some(p) = compile_filter_program(pred, &schema.columns)? else { /* statically true */ };
-let ev = LogicalProgram::from_wire(&p.code, p.num_regs, p.result_reg, p.const_strings)
-    .map_err(expr_unsupported)?
-    // `resolve_scalar` for HAVING / a SET RHS, `resolve_filter` for a residual.
-    .resolve_scalar(schema)
-    .map_err(expr_unsupported)?;
+pub(crate) fn compile_filter_evaluator(
+    pred: &BoundExpr,
+    schema: &Schema,
+) -> Result<Option<Evaluator>, GnitzSqlError>
 ```
+
+`lower.rs` imports `gnitz_core::{ColumnDef, ExprBuilder, Schema}` and
+`gnitz_expr::{Evaluator, ExprValidateErr, LogicalProgram, MAX_REGS}` at the top,
+so neither this helper nor `expr_unsupported` spells a crate path inline; the SET
+step's sibling follows the same shape.
+
+`None` is `compile_filter_program`'s statically-true verdict — the caller keeps
+every row. It picks `resolve_filter`, which is what a predicate needs (see the
+Swap-HAVING correction below), so no call site chooses a resolver. HAVING is one
+line (`dml/select.rs`); the residual step calls the same function.
+
 The `ExprProgram` fields (`expr.rs:14`: `code: Vec<u32>`, `num_regs: u32`,
 `result_reg: u32`, `const_strings: Vec<Vec<u8>>`) are byte-for-byte
-`from_wire`'s parameters (`program.rs:470`) — no round trip. The resolver does
-the schema-aware validation, so there is no separate `validate` call; both
-failure modes map through `expr_unsupported`.
+`from_wire`'s parameters (`program.rs:470`), so the body reads
+`from_wire(&p.code, p.num_regs, p.result_reg, p.const_strings)` — no round trip
+and no destructuring. The resolver does the schema-aware validation, so there is
+no separate `validate` call; both failure modes map through `expr_unsupported`.
+
+The SET step adds the scalar sibling in the same file (`resolve_scalar`, over
+`compile_int_scalar_program`), so `expr_unsupported` never has to widen.
+
+`gnitz_expr::MAX_REGS` is **`pub`**: the rejection message states the limit, and
+the number printed has to be the one `from_wire` enforces.
 
 **The 64-register cap is an accepted narrowing.** `from_wire` runs `validate`
 internally via `assembled`, which rejects `num_regs > MAX_REGS = 64`
 (`program.rs:26,868`). `ExprBuilder` never reuses a register
-(`alloc_reg`, `gnitz-core/src/expr.rs:52-56`), so `WHERE a=1 AND b=2 AND …` with
-*k* equality conjuncts costs `4k − 1` registers: **16 conjuncts fit (63), 17 do
-not (67)**. Same for an IN-list that misses the `IntInSet` fast path — string IN,
-float IN, or non-literal items (`lower.rs:293-313`) — which the code already
-documents as failing at N=17 (`lower.rs:748-750`). Today's tree-walks are
-unbounded, so this is a real regression; it is exactly the cap the CREATE VIEW
-path already has, i.e. it is parity, and the message names the limit.
+(`alloc_reg`, `gnitz-core/src/expr.rs:52-56`), so the cost is shape-dependent:
 
-### HAVING (`gnitz-sql/src/exec/agg_finish.rs`, `dml/select.rs`)
+- an AND-chain of *k* equality conjuncts costs `4k − 1` (`load_col` +
+  `load_const` + `cmp` per conjunct, plus `k − 1` `BoolAnd`): **16 fit (63), 17
+  do not (67)**. Same for an integer/float `IN` that misses the `IntInSet` fast
+  path (`lower.rs:293-313`) and lowers to the OR-chain.
+- a **string** `IN` costs `2N − 1`, not `4N − 1`: `str_col_eq_const` is a single
+  `binary_op` whose column and const-pool indices are *immediates*, not
+  registers (`gnitz-core/src/expr.rs:291-293`, `:66-70`), and `in_list_or_chain`
+  adds `N − 1` `BoolOr`. **32 fit (63), 33 do not (65).**
 
-The bound HAVING indexes into the SyntheticFold `partial_schema` layout
-`[_group_pk (U128, hidden, PK at ci 0) | group cols (visible payload) | agg
-partial cols]`. The ad-hoc path **unconditionally** builds this
-(`dml/select.rs:443-447`, `synthetic_fold_cols(&schema,
-&layout.group_col_indices, &layout.agg_specs, /* aggs_nullable = */ true)` +
-`Schema::from_parts(cols, vec![0])`; `out_key: ReduceOutKey::SyntheticFold`
-hard-coded at `select.rs:460`). Three consequences the design uses:
-- **No HAVING can reference the PK region.** `group_col_reduce_pos` returns
-  `1 + position(...)` for `SyntheticFold` (`agg.rs:196`) and
-  `synthetic_fold_cols` clones group columns in as *payload* — even when the
-  GROUP BY key is the table's own PK.
-- `payload_idx(ci) == ci − 1` throughout (`pk_cols == [0]`).
-- `aggs_nullable = true` (`agg.rs:224`) means the agg partial columns are
-  declared nullable, so `no_nulls` cannot fire on them and a set null bit is
-  honoured.
-
-**Compile at plan time, in `select.rs`, exactly where `having_supported` was.**
-Change `AggFinish`'s `having: Option<&'a BoundExpr>` (`agg_finish.rs:43`) to
-`having: Option<&'a Evaluator>` — `Evaluator` has no lifetime parameter, so
-`AggFinish<'a>`'s other `&'a` fields are unaffected, and `agg_finish.rs:178` is
-the only reader of `spec.having` repo-wide. In `select.rs` — after
-`bind_having_expr`, replacing the `having_supported` gate and its
-CREATE-VIEW-advice rejection (`:471-477`) — bind a local
-`let having_ev: Option<Evaluator>` where `bound_having` is bound today, produced
-by the shared lines above against `&partial_schema`, and pass
-`having_ev.as_ref()` at the construction site (`:522-528`).
-This keeps the rejection **pre-dispatch**, as today; compiling inside
-`agg_finish` would move it after the fold reply.
-
-`resolve_scalar` (not `resolve_filter`) because HAVING is evaluated row-at-a-time
-with `Evaluator::eval_row`: it demotes `result_reg` out of `bit_only` so
-`regs[result_reg]` is always live. It does not change `no_nulls`
-(`is_strictly_non_nullable` does not read the classification), only register
-classification and AND-chain detection.
-
-**Evaluate over a reused one-row batch.** Replace `fill_having_row` +
-`eval_having` + `truthy` in the existing single emit loop (`agg_finish.rs:184-194`
-— the loop, its `continue` early-out, and `emit_row` all stay):
-
-```rust
-// hoisted above the loop, only when spec.having.is_some()
-let mut hav = ZSetBatch::new(spec.partial_schema);   // PkColumn::U128s, filler ColData per column
-let mut bufs = ViewBuffers::default();
-…
-// inside the loop, replacing the fill_having_row/eval_having/truthy block
-if let Some(ev) = spec.having {
-    hav.truncate(0, spec.partial_schema);            // types.rs:846 — clears every per-row vec
-    hav.pks.push_u128(g as u128);                    // _group_pk: never referenced
-    hav.weights.push(1);
-    let mut nw: u64 = 0;
-    for gi in 0..n_group {
-        let ci = 1 + gi;
-        let pi = spec.partial_schema.payload_idx(ci);
-        let tc = spec.partial_schema.columns[ci].type_code;
-        let rep = rep.expect("a grouped result always has a representative row");
-        if partial.is_null(spec.partial_schema, rep, ci) {
-            null_word_set(&mut nw, pi, true);
-            hav.columns[ci].push_null(tc);
-        } else {
-            partial.columns[ci].push_row_from(rep, tc.wire_stride(), &mut hav.columns[ci]);
-        }
-    }
-    for (k, acc) in gaccs.iter().enumerate() {
-        let ci = 1 + n_group + k;
-        let pi = spec.partial_schema.payload_idx(ci);
-        let tc = spec.partial_schema.columns[ci].type_code;
-        match acc_val(acc) {                          // acc_val, NOT finish_agg — as fill_having_row
-            Val::Null      => { null_word_set(&mut nw, pi, true); hav.columns[ci].push_null(tc); }
-            Val::Int(b)    => push_fixed_bits(&mut hav.columns[ci], b as u64, tc.wire_stride()),
-            Val::Float(f)  => push_fixed_bits(&mut hav.columns[ci], f.to_bits(), tc.wire_stride()),
-        }
-    }
-    hav.nulls.push(nw);
-    let view = bufs.view(&hav, spec.partial_schema);
-    let (v, is_null) = ev.eval_row(&view, 0);
-    if is_null || v == 0 { continue; }
-}
-```
-
-Everything it calls already exists: `ZSetBatch::truncate` (`types.rs:846`),
-`PkColumn::push_u128` (`:392`), `ColData::push_row_from` (`:634`) —
-**variant-exhaustive, so a `U128s`/`Bytes`/`Strings` group column copies without
-a special case** — `ColData::push_null` (`:678`), `null_word_set` (`:729`),
-`push_fixed_bits` (`agg_finish.rs:743`), `acc_val` (`:315`), and `null_word_set`
-is already imported (`agg_finish.rs:20`). `push_fixed_bits`'s `unreachable!` can
-never fire: `agg_output_type` (`gnitz-wire/src/circuit.rs:168-190`) yields only
-`I64`/`U64`/`F64`/a fixed-int source type — all ≤ 8 bytes — so an `AggSpec`'s
-`out_type` is always a `ColData::Fixed` column. `view` is declared inside the
-`if let Some(ev)` block and its last use is `ev.eval_row`, so NLL releases the
-`&hav` and `&mut bufs` borrows before the next iteration's `truncate`/`view`. The
-null bits are
-**load-bearing** for the newly-enabled `IS NULL`: `acc_val` yields `Val::Null`
-for an all-NULL or uncontributed `SUM`/`MIN`/`MAX` group, and `MIN(v) IS NULL`
-compiles to a real null test. `rep == None` is the global ground group, which has
-`n_group == 0`. Agg partials are never F32 — `agg_output_type` maps float
-MIN/MAX/SUM to `F64` (`gnitz-wire/src/circuit.rs:174-189`) — so the `Val::Float`
-arm is always the 8-byte case. Steady-state allocation is zero: `truncate` keeps
-capacity, and `bufs.view` reuses its `Vec`s.
-
-The truth test `is_null || v == 0 → drop` is exactly today's `truthy` + NULL-drop
-and bit-identical to the engine filter's `bool_bits & !null_bits` (`eval_row`
-reads a bit_only result out of `bool_bits`, exactly as the filter does): for a
-boolean
-result `regs` is 0/1 and `bool_bits` matches; for a float result both sides
-bit-test.
-
-**Delete**: `HavingEval` (`:419`), its `impl BoundExprBackend` (`:449-538`),
-`is_float_expr` (`:431`), `having_supported` (`:544`), `fill_having_row`
-(`:379`), `truthy` (`:404`), `eval_3vl` (`:564`), `eval_cmp` (`:588`),
-`eval_arith` (`:608`), the `eval_having` shim, and `having_state`'s
-`Vec<TypeCode>` + `Vec<Val>`. **Keep `Val`** (`:99`) — it is the render currency
-of `finish_agg` (`:285`), `acc_val` (`:315`) and `emit_row` (`:700`).
-
-String / U64 / CASE / IN / `IS NULL` HAVING now works ad-hoc; the only remaining
-rejection is a compile error, identical to CREATE VIEW.
-
-**One intentional semantic change: `-0.0` truthiness.** Today
-`truthy(Val::Float(f)) => f != 0.0`, so a bare float HAVING evaluating to `-0.0`
-drops the group. The VM holds float results as **bit patterns** and both the
-engine filter (`pack_to_bool_bits`) and `Evaluator::eval_row` bit-test, and `(-0.0f64).to_bits() != 0`, so the group is kept — a move *toward*
-the CREATE VIEW path. NaN agrees on both (nonzero bits, `NaN != 0.0`).
-
-**Parity caveat — a pre-existing view-path bug.** The engine's physical reduce
-output descriptor declares agg columns **non**-nullable (`ops/reduce/plan.rs:79`,
-flag `0`) while `emit_agg_col` sets their null bit for an untouched SUM/MIN/MAX
-(`ops/reduce/emit.rs:16-28`) and writes zero bytes, so a view's post-reduce HAVING
-can take the `no_nulls` arm and compare a NULL aggregate as the value `0`.
-Exactly three shapes reproduce — grouped `MIN`/`MAX` over a **nullable** column,
-global `Direct SUM` over a **NOT NULL** column, and global `MIN`/`MAX` — because
-they alone combine a NULL-capable raw column with a HAVING program that has no
-NULL-forcing instruction. (`HAVING SUM(v) …` on a *nullable* source does **not**
-reproduce: it routes to the count-companion `NullfillSum` shape whose finalize
-`Div` already forces `no_nulls` off, pinned by
-`gnitz-py/tests/test_aggregates.py:912-957`.) So `HAVING MIN(v) <= 10` over an
-all-NULL group **keeps** a group that correct SQL — and the ad-hoc path after
-this plan — drops. That bug is out of scope here and is tracked in
-`plans/reduce-agg-output-nullability.md`. Consequence: the parity grid asserts
-ad-hoc results against **expected SQL semantics** for those three shapes, and
-against the CREATE VIEW result for everything else.
+Today's tree-walks are unbounded, so this is a real regression; the CREATE VIEW
+path has the same cap (its over-cap program is rejected engine-side), and the
+message names the limit.
 
 ### DML residual (`exec/residual.rs`, `dml/mutate.rs`)
 
@@ -1070,8 +955,15 @@ Classification, per assignment, exactly as `eval_set_expr` decides today:
   (`colwrite.rs:136,140`).
 
   `resolve_scalar` also keeps a boolean-valued RHS (`SET flag = a AND b`)
-  readable: it demotes `result_reg` out of `bit_only`, so `BoolAnd`/`BoolNot`
-  run `unpack_bool_to_regs` and `regs[result_reg]` is live.
+  readable — but **not** by demoting `result_reg` out of `bit_only`, as an
+  earlier draft claimed. Nothing demotes it: `is_filter` touches only
+  `bool_input` (`program.rs:1394-1401`). The register stays bit_only, and
+  `eval_row` reads it correctly because `bool_pack_mask = bit_only | bool_input`
+  (`:859`) covers every bit_only register, so `read_reg_row0` finds the packed
+  bit. `is_filter` changes **only register classification and AND-chain
+  detection, never `no_nulls`** (`is_strictly_non_nullable` does not read the
+  classification) — which is what makes the boolean-RHS reasoning above
+  independent of the source's nullability.
 
 - `eval_set_program(p: &SetProgram, view: &ZSetBatchView, batch: &ZSetBatch,
   row: usize) -> Result<ColumnValue>`: `Str(s)` →
@@ -1110,18 +1002,22 @@ body of `exec/eval.rs`; the file goes away and `exec/mod.rs:9` loses
 `ColumnValue::Str` needs an owned `String` and the VM has no string result
 register today. Only the numeric half is unified; `fn2` removes that limitation.
 
-### `find_wide_literal` stays
+### `find_wide_literal` survives exactly where evaluation stays lazy
 
-An earlier draft deleted it. It is load-bearing in two of its three sites and is
-kept in all three for uniformity:
-- `mutate.rs:35` (`bind_mutate_scalar`) — SET now compiles inside the RMW
+It is an **eager** guard for a lazily-evaluated expression, so it is as live as
+that laziness and no longer:
+- `mutate.rs:35` (`bind_mutate_scalar`) — permanent. SET compiles inside the RMW
   closure, i.e. only once rows have been fetched, so without this eager check a
   `LitWide` in a SET RHS would still silently no-op when nothing matches.
-- `select.rs:468` (HAVING) — kept for its message: it must not fall into the
-  generic compile failure.
-- `mutate.rs:260-263` (residual) — redundant now (compilation precedes the row
-  loop, and `lower_bound_expr` raises the identical `wide_int_error` at
-  `lower.rs:60`), but kept so all three read the same.
+- `mutate.rs:260-263` (residual) — live until the residual swap, because today's
+  interpreter runs per row and never fires on an empty fetch. **Delete it in that
+  step**: once compilation precedes the row loop, `lower_bound_expr` raises the
+  identical `wide_int_error` (`lower.rs:60`).
+- HAVING — **deleted with the swap**. The "it has its own message" rationale was
+  false: `compile_filter_program` now runs unconditionally at plan time and
+  `lower_bound_expr`'s `LitWide` arm *is* that message, naming the same literal
+  (both walks are left-to-right, and the `IN` fast path cannot swallow a
+  `LitWide` — `fold_int_literal` returns `None` for it).
 
 ## Verification
 
@@ -1215,48 +1111,34 @@ checks — the same rule, and the same reason, as `assert_batchview_consistent`.
 
 ## Tests
 
-- **Parity grid** (`GNITZ_WORKERS=4`; each case asserts the ad-hoc result equals
-  the CREATE VIEW result unless noted): U64 HAVING above 2⁶³; unsigned division;
-  negative-literal unsigned compares; string/blob group-column compares (`s =
-  'a'`, `s > 'a'`, `s IN (…)`, `str_col < blob_col`); `IS [NOT] NULL` including a
-  nullable U128 group column **and `MIN(v) IS NULL` over an all-NULL group**
-  (guards null-bit population); a `GROUP BY u128_col` whose HAVING references
-  only the aggregates (exercises `push_row_from`'s `U128s` arm); CASE with the
-  float-in-ELSE unification shape; IN with a NULL inner; float modulo; a bare
-  float HAVING evaluating to **`-0.0`** (asserts the group is kept, matching
-  CREATE VIEW).
-- **Expected-SQL-semantics cases** (not view-equality, per the parity caveat —
-  these three shapes are where the view path is wrong): grouped
-  `HAVING MIN(v) <= 10` over an all-NULL group, global `HAVING SUM(x) = 0` over a
-  NOT NULL column with an empty source, and global `HAVING MAX(x) >= 0` over an
-  empty source must each return no rows.
-- **`HAVING 'a' = 'b'` rejects identically on both paths.** A `LitStr op LitStr`
-  has no column operand, so `try_compile_string_cmp` (`lower.rs:102`) returns
-  `None` and `OpcodeBackend::lit_str` (`:238`) errors — ad-hoc *and* CREATE VIEW.
-  Assert the same `Unsupported`, not an empty result.
-- **Constant HAVING**: `HAVING 1` (→ `Ok(None)`, every group passes), `HAVING 0`
-  (→ real `LoadConst 0`, all dropped), `HAVING NULL` (→ `LoadNull`,
-  `is_strictly_non_nullable` false, null bit set → dropped). All three match
-  today's `truthy`.
-- **Zero surviving groups**: a grouped HAVING that drops every group, and a
-  grouped query whose partials are all non-positive (`reps.len() == 0`, reachable
-  at `agg_finish.rs:156` when not `global_ground`).
-- **64-register cap**: a 17-conjunct `UPDATE … WHERE` and a ≥17-item string IN in
-  both a residual and a HAVING reject with the message naming the limit; a
-  16-conjunct `WHERE` still works. Pins the narrowing as intentional.
-- **Flip the string-HAVING rejection tests to parity.**
-  `gnitz-sql/tests/adhoc_surface.rs:402`
-  (`string_having_rejection_names_create_view`) and
-  `gnitz-py/tests/test_sql.py:355`
-  (`test_direct_path_feature_limits_are_not_derivation_errors`, HAVING arm at
-  `:375-380`) currently assert `… GROUP BY s HAVING s = 'a'` is rejected with
-  CREATE-VIEW advice; after this plan it succeeds — rewrite them to assert the
-  ad-hoc result equals the CREATE-VIEW result.
-- **Delete the two `having_supported` in-module tests** in `agg_finish.rs`
-  (`probe_visits_both_or_branches`:771, `probe_rejects_float_modulo`:790). Their
-  properties are guaranteed by the shared compiler — float modulo by
-  `(BinOp::Mod, true) => Err(Unsupported("float modulo not supported"))`
-  (`lower.rs:355`).
+- **HAVING — landed with the swap** (`gnitz-py/tests/test_adhoc_aggregates.py`,
+  `GNITZ_WORKERS=4` and `1`). `_parity` can no longer catch a wrong *expression*
+  result — both paths run the same compiled program — so the grid is built
+  around what it still discriminates: the out-key layout (a single NOT NULL
+  `BIGINT UNSIGNED` group column lives in the view's OPK PK region and is read
+  with `LoadPk`, while ad-hoc is always the SyntheticFold payload layout), the
+  `no_nulls` divergence (a NOT NULL aggregate source resolves `no_nulls = true`
+  on the view and `false` ad-hoc — the two evaluation arms of
+  `Evaluator::filter`), and the client's materialized reduce-output batch
+  against the engine's `emit_agg_col`. Around that: the newly-served
+  string / `IN` / `IS [NOT] NULL` / `CASE` shapes, `MIN(v) IS NULL` over an
+  all-NULL group (guards null-bit population), a narrow 2-byte `MIN(SMALLINT)`
+  partial, constants, non-contiguous survivors, an empty source, and a bare
+  float HAVING evaluating to `-0.0` (kept — the filter bit-tests). Two facts the
+  grid pinned that the plan had wrong:
+  - **`HAVING NULL` is unreachable.** The binder rejects a bare `NULL` literal
+    (`value type not supported in expressions: Null`) before either compiler
+    sees it — identically on both paths. It is a `_reject_both` case, not a
+    "compiles to `LoadNull`, drops every group" case.
+  - **The register cap is asserted on the direct path only.** `CREATE VIEW` with
+    an over-cap program *succeeds*: the engine rejects the program
+    (`compile_view rejected …: filter: invalid predicate program`) but only
+    `gnitz_warn!`s it, so the view exists and is silently empty forever. That is
+    a separate pre-existing defect with its own plan; asserting a mirrored
+    rejection here would have locked it in.
+- **64-register cap (residual side, still to land)**: a 17-conjunct
+  `UPDATE … WHERE` and a ≥33-item string IN in a residual reject with the
+  message naming the limit; a 16-conjunct `WHERE` still works.
 - **DML:** `UPDATE … WHERE pk = k AND strcol = 'x'` (string residual, newly
   served); `DELETE FROM t WHERE nonnull_col IS NOT NULL` (the `Ok(None)` path —
   must delete every row); residual div/mod-by-zero conjuncts filter like the
@@ -1273,10 +1155,11 @@ checks — the same rule, and the same reason, as `assert_batchview_consistent`.
 
 ## Not in scope
 
-- **The reduce agg-output nullability bug** — `plans/reduce-agg-output-nullability.md`.
-- **The `AVG(u64)` render bug** — a `finish_agg` signedness bug in `acc_f64`
-  (`agg_finish.rs:357`), disjoint from everything here. Tracked in
-  `plans/adhoc-avg-u64-render.md`.
+- **The `AVG(u64)` render bug** — `acc_f64` reads an `IntSum` accumulator's
+  payload as a signed `i64`, so an ad-hoc `AVG` over a `BIGINT UNSIGNED` column
+  whose group sum has crossed 2⁶³ renders negative while the view is right.
+  Disjoint from everything here — it is in the *map* half of the ad-hoc finish,
+  which has its own plan.
 - **Div/mod already agree** — the engine VM and `InterpBackend` both mark a zero
   divisor NULL and use `wrapping_div`/`wrapping_rem` (`batch.rs:503-508,661-665`;
   `eval.rs:191-193`, with `test_div_mod_by_zero_is_null`). Routing residuals
@@ -1636,8 +1519,12 @@ checks — the same rule, and the same reason, as `assert_batchview_consistent`.
   is a region, so there is no wide-column `unreachable!` for later steps to work
   around. Each `SchemaFacts` conformance test runs in the crate that owns its
   implementor, over `gnitz_expr::SCHEMA_FACTS_CASES`.
-  Four rules landed one level down as part of it, and later steps should reach
-  for them rather than restating:
+  Rules that landed one level down as part of this effort, which later steps
+  should reach for rather than restating:
+  - `ZSetBatch::with_capacity(schema, n)` is the **one** "size every growth
+    stream for `n` rows" walk (PK buffer, weights, null words, each payload
+    column by variant); `insert.rs`'s VALUES build and the ad-hoc finish's two
+    batches all call it instead of spelling the two variant matches again.
   - `gnitz_wire::as_le_bytes` (sealed `LeScalar`, not `T: Copy`) is the **one**
     scalar-region reinterpret; the engine's `test_support` copy is deleted.
   - `gnitz_wire::wal::num_regions(npc)` is the region-count formula.
@@ -1653,23 +1540,67 @@ checks — the same rule, and the same reason, as `assert_batchview_consistent`.
     `schema.payload_columns()` — the same rule the builder writes with — instead
     of a running counter, and checks every region width with one
     `wire_stride`-derived expression.
-- [ ] **Swap HAVING** — also the step that adds the `gnitz-expr` dependency to
-  `gnitz-sql` and lands `expr_unsupported` there (it has no caller before this
-  step, and an uncalled `pub(crate)` helper is `dead_code`): compile in
-  `select.rs` where `having_supported` was
-  (via `resolve_scalar`); change `AggFinish::having` to
-  `Option<&Evaluator>`; replace the `fill_having_row`/`eval_having`/
-  `truthy` block with the reused one-row batch + `Evaluator::eval_row`; delete
-  `HavingEval` and its cluster (**keep `Val`**); drop the CREATE-VIEW-advice
-  message; flip `adhoc_surface.rs` / `test_sql.py`; delete the two in-module
-  `having_supported` tests; add the parity grid, the expected-SQL cases, the
-  constant-HAVING cases, the zero-group cases and the register-cap cases.
-- [ ] **Swap residual + SET**: `matching_indices` onto `resolve_filter` +
-  `Evaluator::filter` (empty-slice
-  and `Ok(None)` → `0..n`; `|start, end|`); add `compile_int_scalar_program` to
-  `lower.rs`; `compile_set_programs` inside the RMW closure against
-  `actual_schema`; the `insert.rs:348` EXCLUDED classifier; `write_set_rows` /
-  `client_side_merge_do_update` onto `eval_set_program` with hoisted
-  `ViewBuffers`; delete `exec/eval.rs`; retarget the div/overflow
+- [x] **DONE — Swap HAVING**, and with it the `gnitz-expr` dependency on
+  `gnitz-sql` plus `compile_filter_evaluator` (+ the private `expr_unsupported`)
+  in `lower.rs`. `select.rs` compiles the bound HAVING in **one line** where
+  `having_supported` was; `AggFinish::having` is `Option<&Evaluator>`;
+  `agg_finish` is infallible (`eval_having(…)?` was its only `?`). `HavingEval`
+  and its whole cluster are gone, together with `having_supported`,
+  `fill_having_row`, `truthy`, the CREATE-VIEW-advice rejection, the HAVING
+  `find_wide_literal` guard and the two in-module probe tests. `Val` and the
+  output path (`emit_row`, `item_srcs`, `finish_agg`, `acc_val`, `acc_f64`,
+  `push_fixed_bits`) are untouched — the map half is a separate step with its
+  own plan. String / U64 / `CASE` / `IN` / `IS NULL` HAVING now work ad-hoc.
+  `fill_group_batch(spec, partial, reps, accs)` materializes the reduce output
+  (it derives `n_aggs` from the layout rather than taking it), and `emit_row`
+  takes no `out_pk` — the synthetic PK is the row's own `out.len()` ordinal. Two
+  cell-writing rules are stated once for both writers and later steps should
+  reach for them: `Val::bits() -> Option<u64>` is the one integer/float →
+  register-image rule, and `push_null_cell(col, tc, word, pi)` the one place a
+  null bit and its filler cell are set together. `fill_group_batch` also carries
+  the batch's only data-dependent guard, **unconditional** rather than
+  `debug_assertions`-only: `ZSetBatch::validate` rejects a null bit under a NOT
+  NULL group column, which is what would otherwise leave the resolved program's
+  `no_nulls` on and read `push_null`'s zeros as a real `0`. Everything else it
+  checks `ViewBuffers::regions` already asserts unconditionally on the same
+  batch. Two unit tests in the file pin the fill's null-bit slots, group-major
+  `accs` stride and narrow-width truncation, plus the global-ground shape.
+  Three corrections this step establishes:
+  - **`resolve_filter`, not `resolve_scalar`, is the HAVING constructor**, and
+    the reason this plan gave for `resolve_scalar` was false. `resolve_scalar`
+    does **not** demote `result_reg` out of `bit_only` — `is_filter` touches
+    only `bool_input` (`program.rs:1394-1401`), while
+    `bit_only = bool_produced & !non_bool_read` (`:1403`) is untouched by it.
+    A bare non-boolean HAVING (`HAVING COUNT(*)`) is in neither `bit_only` nor
+    `bool_input` under `resolve_scalar`, so `filter`'s nullable arm would read a
+    stale `bool_bits` word. The same false claim was in `eval.rs`'s own doc
+    comment and is corrected there.
+  - **The client evaluates a *batch*, not a row at a time.** `ViewBuffers::view`
+    rebuilds its region list on every call, so the reduce output is materialized
+    once as a `ZSetBatch` (`fill_group_batch`, column at a time) and driven
+    through one `Evaluator::filter` — which also inherits the engine filter's
+    own truth rule instead of restating it beside a hand-written
+    `is_null || v == 0`.
+  - **The two paths run the same *logical* program, resolved against each path's
+    own schema — not a byte-identical resolved program.** They differ in exactly
+    one field, `no_nulls`: the ad-hoc partial schema declares every agg column
+    nullable, the view's reduce schema uses the per-spec rule. Conservative on
+    the client side, and a genuine test discriminator.
+- [ ] **Swap residual + SET**: `matching_indices` onto the shared
+  `compile_filter_evaluator` + `Evaluator::filter` (empty-slice and `Ok(None)` →
+  `0..n`; `|start, end|`, `end` exclusive); add `compile_int_scalar_program` and
+  its `resolve_scalar` sibling to `lower.rs` beside it; `compile_set_programs`
+  inside the RMW closure against `actual_schema`; the `insert.rs:348` EXCLUDED
+  classifier; `write_set_rows` / `client_side_merge_do_update` onto
+  `eval_set_program` with hoisted `ViewBuffers`; drop the residual
+  `find_wide_literal` guard; delete `exec/eval.rs`; retarget the div/overflow
   tests; add the DML tests.
+  - **Delete `BoundExprBackend` in the same step.** Removing `InterpBackend`
+    leaves `OpcodeBackend` as the sole implementor, and the trait's whole stated
+    value is cross-backend variant-coverage parity — which a single `match`
+    inside `OpcodeBackend` gives for free. Half its design rationale ("the
+    interpreter short-circuits `AND`/`OR`") dies with `InterpBackend` too.
+    `lower_bound_expr` + the trait collapse into `OpcodeBackend`'s own
+    recursion mechanically; letting it survive as a one-implementor indirection
+    is the shim shape this plan deleted `expr/mod.rs` for.
 - [ ] `make verify` + `make e2e` (`GNITZ_WORKERS=4`).

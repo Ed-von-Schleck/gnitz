@@ -16,7 +16,7 @@ use crate::exec::batch::{copy_batch_row, project, resolve_projection};
 use crate::ir::BoundExpr;
 use crate::SqlResult;
 use gnitz_core::null_word_set;
-use gnitz_core::{ColData, FixedInt, GnitzClient, PkColumn, PkTuple, Schema, WireConflictMode, ZSetBatch};
+use gnitz_core::{FixedInt, GnitzClient, PkTuple, Schema, WireConflictMode, ZSetBatch};
 use sqlparser::ast::{
     Assignment, ConflictTarget, Expr, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Parens, Query,
     SelectItem, SetExpr, TableObject, Values,
@@ -148,25 +148,9 @@ pub(crate) fn execute_insert(
         }
     };
 
-    // Build the incoming batch from VALUES rows, reserving each buffer for the
-    // known row count up front.
-    let mut batch = ZSetBatch::new(&schema);
+    // Build the incoming batch from VALUES rows, sized for the known row count.
     let n = rows.len();
-    match &mut batch.pks {
-        PkColumn::U64s(v) => v.reserve(n),
-        PkColumn::U128s(v) => v.reserve(n),
-        PkColumn::Bytes { buf, .. } => buf.reserve(n * schema.pk_stride()),
-    }
-    batch.weights.reserve(n);
-    batch.nulls.reserve(n);
-    for (_pi, ci, col_def) in schema.payload_columns() {
-        match &mut batch.columns[ci] {
-            ColData::Fixed(b) => b.reserve(n * col_def.type_code.wire_stride()),
-            ColData::Strings(v) => v.reserve(n),
-            ColData::Bytes(v) => v.reserve(n),
-            ColData::U128s(v) => v.reserve(n),
-        }
-    }
+    let mut batch = ZSetBatch::with_capacity(&schema, n);
 
     // A SERIAL PK is the table's lone single-column PK (enforced at CREATE), so
     // the user omits it: arity excludes it, the PK is drawn from the sequence and

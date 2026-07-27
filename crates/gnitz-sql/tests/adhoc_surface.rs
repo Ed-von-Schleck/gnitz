@@ -7,8 +7,8 @@
 //! set operation, an EXISTS/IN or scalar subquery, a derived table, a
 //! non-pass-through CTE — is rejected from the AST alone with one actionable
 //! message pointing at CREATE VIEW. A single-relation read the direct path cannot
-//! express (a LIKE / string-function WHERE, an ORDER BY expression, a string / U64
-//! HAVING) is a feature-named `Unsupported`, never the derivation template.
+//! express (a LIKE / string-function WHERE, an ORDER BY expression) is a
+//! feature-named `Unsupported`, never the derivation template.
 //!
 //! Scope: what is decided HERE, in the SQL layer — which shapes are served, which
 //! are rejected and with which message. The distributed correctness of the read /
@@ -396,17 +396,38 @@ fn order_by_expression_is_a_feature_rejection() {
     assert_feature_rejection(&mut client, &sn, "SELECT id FROM t ORDER BY id + 1");
 }
 
-/// A string HAVING on an ad-hoc GROUP BY rejects with a feature-named message that
-/// names CREATE VIEW as the remedy (the grouped view builder serves it).
+/// An ad-hoc HAVING compiles through the same expression compiler a grouped
+/// view's post-reduce FILTER uses, so a string HAVING is served and what is left
+/// rejected is exactly what CREATE VIEW rejects too — with the compiler's own
+/// message, not advice to build a view.
 #[test]
-fn string_having_rejection_names_create_view() {
+fn having_feature_limits_are_compiler_errors() {
     let Some(srv) = ServerHandle::start() else { return };
     let (mut client, sn) = make_planner(&srv);
     seed(&mut client, &sn);
-    let msg = assert_feature_rejection(&mut client, &sn, "SELECT s, COUNT(*) FROM t GROUP BY s HAVING s = 'a'");
+
+    let (s, b) = query(
+        &mut client,
+        &sn,
+        "SELECT s, COUNT(*) AS n FROM t GROUP BY s HAVING s = 'a'",
+    );
+    assert_eq!(col_weights(&s, &b, "n"), vec![(3, 1)], "s = 'a' groups 3 rows");
+
+    // A 128-bit column has no VM register, on either path.
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE tw (id BIGINT PRIMARY KEY, w DECIMAL(38,0))",
+    );
+    exec(&mut client, &sn, "INSERT INTO tw (id, w) VALUES (1, 1), (2, 2)");
+    let msg = assert_feature_rejection(&mut client, &sn, "SELECT w, COUNT(*) FROM tw GROUP BY w HAVING w > 5");
     assert!(
-        msg.contains("CREATE VIEW"),
-        "the string-HAVING rejection must name CREATE VIEW as the remedy, got: {msg}"
+        msg.contains("128-bit") && msg.contains("\"w\""),
+        "the rejection must name the offending column and the limitation, got: {msg}"
+    );
+    assert!(
+        !msg.contains("CREATE VIEW") && !msg.contains("primary-key seek"),
+        "a HAVING the shared compiler rejects must not advise a view or a PK seek, got: {msg}"
     );
 }
 
