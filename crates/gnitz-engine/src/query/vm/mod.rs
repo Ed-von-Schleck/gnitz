@@ -558,16 +558,16 @@ mod tests {
 
         // Predicate: col[1] > 0  (col[1] is the I64 payload at logical index 1)
         let pred_instrs = vec![
-            crate::expr::LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col[1]
-            crate::expr::LogicalInstr::LoadConst { dst: 1, val: 0 },  // r1 = 0
-            crate::expr::LogicalInstr::Cmp {
-                op: crate::expr::CmpOp::Gt,
+            gnitz_expr::LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col[1]
+            gnitz_expr::LogicalInstr::LoadConst { dst: 1, val: 0 },  // r1 = 0
+            gnitz_expr::LogicalInstr::Cmp {
+                op: gnitz_expr::CmpOp::Gt,
                 dst: 2,
                 a: 0,
                 b: 1,
             }, // r2 = r0 > r1
         ];
-        let pred_prog = crate::expr::LogicalProgram::new(pred_instrs, 3, 2, vec![]);
+        let pred_prog = gnitz_expr::LogicalProgram::new(pred_instrs, 3, 2, vec![]);
         let func = Box::new(crate::expr::ScalarFunc::from_predicate(pred_prog, &schema).unwrap());
         let func_ptr = Box::into_raw(func) as *const ScalarFunc;
 
@@ -785,7 +785,7 @@ mod tests {
 
         // MAP with ScalarFunc projection: reorder/select columns.
         let func = Box::new(
-            crate::expr::ScalarFunc::from_map(crate::expr::LogicalProgram::copy_cols(&[2]), &in_schema, &out_schema)
+            crate::expr::ScalarFunc::from_map(gnitz_expr::LogicalProgram::copy_cols(&[2]), &in_schema, &out_schema)
                 .unwrap(),
         );
         let func_ptr = Box::into_raw(func) as *const ScalarFunc;
@@ -1337,16 +1337,16 @@ mod tests {
         let schema = schema_1i64();
 
         let pred_instrs = vec![
-            crate::expr::LogicalInstr::LoadColInt { dst: 0, col: 1 },
-            crate::expr::LogicalInstr::LoadConst { dst: 1, val: 0 },
-            crate::expr::LogicalInstr::Cmp {
-                op: crate::expr::CmpOp::Gt,
+            gnitz_expr::LogicalInstr::LoadColInt { dst: 0, col: 1 },
+            gnitz_expr::LogicalInstr::LoadConst { dst: 1, val: 0 },
+            gnitz_expr::LogicalInstr::Cmp {
+                op: gnitz_expr::CmpOp::Gt,
                 dst: 2,
                 a: 0,
                 b: 1,
             },
         ];
-        let pred_prog = crate::expr::LogicalProgram::new(pred_instrs, 3, 2, vec![]);
+        let pred_prog = gnitz_expr::LogicalProgram::new(pred_instrs, 3, 2, vec![]);
         let func = Box::new(crate::expr::ScalarFunc::from_predicate(pred_prog, &schema).unwrap());
         let func_ptr = Box::into_raw(func) as *const ScalarFunc;
 
@@ -1388,7 +1388,7 @@ mod tests {
     /// Filter with expression bytecode: col1 > 25 keeps rows with val 30, 40, 50.
     #[test]
     fn test_filter_with_expr() {
-        use crate::expr::{CmpOp, LogicalInstr, LogicalProgram};
+        use gnitz_expr::{CmpOp, LogicalInstr, LogicalProgram};
 
         let schema = schema_1i64();
 

@@ -17,7 +17,8 @@
 //! values, so it shares only the byte successor with the cut derivation.
 
 use crate::schema::key::PkBuf;
-use gnitz_wire::{Cut, RangeDescriptor, RangeRel, MAX_PK_BYTES};
+use crate::schema::MAX_PK_BYTES;
+use gnitz_wire::{Cut, RangeDescriptor, RangeRel};
 
 /// Fixed-width byte-string successor: `p + 1` with carry, in place. Returns
 /// `false` when `p` is all-`0xFF` (or empty) — no successor exists at this width

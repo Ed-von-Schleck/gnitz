@@ -7,7 +7,7 @@
 //! type: a missing or mis-routed opcode is a compile error, not a silent
 //! miscompute.
 
-use gnitz_expr::{ColumnLocator, SchemaFacts};
+use crate::{ColumnLocator, SchemaFacts};
 use gnitz_wire::encode_german_string;
 // Wire opcodes (1–46) the client emits, matched as arms in `from_wire`. They are
 // `pub const … : u32` in gnitz-wire, so a plain `use` binds them for pattern use.
@@ -23,14 +23,16 @@ use gnitz_wire::{
 
 /// The register file is capped at 64: the BOOL_AND/BOOL_OR 3VL paths, the
 /// null-bit propagation, and every register-indexed mask (`bit_only_mask`,
-/// `bool_input_mask`, `chain_trigger_mask`) address registers by bit in a `u64`.
-pub(in crate::expr) const MAX_REGS: usize = u64::BITS as usize;
+/// `bool_pack_mask`, `chain_trigger_mask`) address registers by bit in a `u64`.
+const MAX_REGS: usize = u64::BITS as usize;
 
-/// Why a client-authored expr program was rejected at compile. `Debug` only — a
-/// diagnostic for the recovery log and test precision; no consumer branches on
-/// the variant.
+/// Why a client-authored expr program was rejected at compile — a diagnostic for
+/// the recovery log, and a value consumers compare and match on (a rejected
+/// predicate is asserted to be exactly `PredicateWithoutResultReg`, and
+/// `TooManyRegs(n)`'s payload names the register limit in the rejection message).
+/// Renaming or re-shaping a variant is a visible break, not an internal detail.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ExprValidateErr {
+pub enum ExprValidateErr {
     UnknownOpcode(u32),
     TooManyRegs(u32),
     ResultRegOutOfRange { result_reg: u32, num_regs: u32 },
@@ -54,7 +56,7 @@ pub(crate) enum ExprValidateErr {
 /// column through the dense payload index a PK column has no value for (the
 /// `pi = 255` sentinel).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ColKind {
+pub enum ColKind {
     /// PK or payload, any type — a `CopyCol` source.
     AnyCol,
     /// PK or payload, fixed-width integer.
@@ -70,7 +72,6 @@ pub(crate) enum ColKind {
 
 impl ColKind {
     /// True iff a PK column is unusable here.
-    #[inline]
     fn payload_only(self) -> bool {
         matches!(self, ColKind::AnyPayload | ColKind::Float | ColKind::GermanString)
     }
@@ -82,7 +83,7 @@ impl ColKind {
 
 /// Comparison operator, shared by integer (`Cmp`) and float (`FCmp`) compares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CmpOp {
+pub enum CmpOp {
     Eq,
     Ne,
     Gt,
@@ -93,7 +94,7 @@ pub(crate) enum CmpOp {
 
 /// German-string comparison operator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StrOp {
+pub enum StrOp {
     Eq,
     Lt,
     Le,
@@ -106,7 +107,7 @@ pub(crate) enum StrOp {
 /// One instruction with logical (schema) column indices, mirroring the wire
 /// opcodes the client emits. `LogicalProgram::resolve` lowers each into `Instr`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LogicalInstr {
+pub enum LogicalInstr {
     LoadColInt {
         dst: u16,
         col: u32,
@@ -261,7 +262,7 @@ pub(crate) enum LogicalInstr {
 /// per-register U64 type tracking: `signed: false` selects the unsigned path on
 /// `Cmp`/`IntDiv`/`IntMod`/`IntToFloat`, reinterpreting the i64 register as u64.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::expr) enum Instr {
+pub(crate) enum Instr {
     /// Payload integer load. Width and signedness are `const fn`s of `tc`
     /// (`wire_stride` / `is_signed_int`), recomputed once per instruction in the
     /// eval arm rather than carried here — the same convention as `LoadPk`.
@@ -445,13 +446,7 @@ impl LogicalProgram {
     /// client input — `validate` (structure only; no schema) panics rather than
     /// returns. This preserves the all-profiles register-valid / alias-free
     /// guarantee `reg3`/`reg4`'s raw split borrows depend on.
-    pub(crate) fn new(instrs: Vec<LogicalInstr>, num_regs: u32, result_reg: u32, const_strings: Vec<Vec<u8>>) -> Self {
-        gnitz_debug!(
-            "expr_program: instrs={} regs={} consts={}",
-            instrs.len(),
-            num_regs,
-            const_strings.len()
-        );
+    pub fn new(instrs: Vec<LogicalInstr>, num_regs: u32, result_reg: u32, const_strings: Vec<Vec<u8>>) -> Self {
         Self::assembled(instrs, num_regs, result_reg, const_strings)
             .unwrap_or_else(|e| panic!("compiler-built LogicalProgram is invalid: {e:?}"))
     }
@@ -478,11 +473,12 @@ impl LogicalProgram {
 
     /// A pure projection: `copies[i] = src_col` copies logical input column
     /// `src_col` into dense output payload slot `i`. The source type is derived in
-    /// `resolve` from the schema. The register-free (`num_regs == 0`) shape
-    /// `ScalarFunc::from_map` lowers into `col_moves` + `null_perm` and nothing
-    /// else. `LogicalInstr` is test-only, so this is the compiler's only way to
-    /// build a program without a wire blob.
-    pub(crate) fn copy_cols(copies: &[u32]) -> Self {
+    /// `resolve` from the schema. The register-free (`num_regs == 0`) shape a map
+    /// consumer turns into verbatim column moves and nothing else. The one
+    /// wire-free constructor a *production* caller uses — the circuit compiler
+    /// builds projections with it; [`LogicalProgram::new`] is reached only from
+    /// hand-written test programs.
+    pub fn copy_cols(copies: &[u32]) -> Self {
         let instrs = copies
             .iter()
             .enumerate()
@@ -500,7 +496,7 @@ impl LogicalProgram {
     /// (bad register, alias, const index) is rejected rather than panicked. The
     /// structure-only `validate(None, None)` preserves the all-profiles
     /// register-valid / alias-free invariant for every `from_wire` output.
-    pub(crate) fn from_wire(
+    pub fn from_wire(
         code: &[u32],
         num_regs: u32,
         result_reg: u32,
@@ -624,10 +620,10 @@ impl LogicalProgram {
 
     /// If every instruction is `CopyCol` writing dense payload outputs
     /// `out = [0, 1, 2, …]` (in instruction order), return the copies' source
-    /// columns — the program's payload copy list, from which `emit_node` derives
-    /// a reindex MAP's output payload schema. `None` for any other shape (a
-    /// compute instruction, or a permuted/offset destination).
-    pub(crate) fn payload_copy_srcs(&self) -> Option<Vec<u32>> {
+    /// columns — the program's payload copy list, from which a caller derives a
+    /// reindex MAP's output payload schema. `None` for any other shape (a compute
+    /// instruction, or a permuted/offset destination).
+    pub fn payload_copy_srcs(&self) -> Option<Vec<u32>> {
         self.instrs
             .iter()
             .enumerate()
@@ -645,7 +641,7 @@ impl LogicalProgram {
     ///
     /// Both checks are load-bearing — sequential sources AND dense destinations;
     /// a permuted-destination program is a real permutation, not an identity.
-    pub(crate) fn sequential_copy_base(&self) -> Option<usize> {
+    pub fn sequential_copy_base(&self) -> Option<usize> {
         let srcs = self.payload_copy_srcs()?;
         let &base = srcs.first()?;
         let ok = srcs.iter().enumerate().all(|(i, &s)| s == base + i as u32);
@@ -657,7 +653,7 @@ impl LogicalProgram {
     /// the given context (`is_filter = true` keeps `result_reg` eligible for
     /// bit_only). Consuming: a `Vec<LogicalInstr>` cannot be mutated in place into
     /// a `Vec<Instr>`. Preserves the per-register U64 signed→unsigned tracking.
-    pub(in crate::expr) fn resolve(self, schema: &dyn SchemaFacts, is_filter: bool) -> ResolvedProgram {
+    pub(crate) fn resolve_program(self, schema: &dyn SchemaFacts, is_filter: bool) -> ResolvedProgram {
         use gnitz_wire::type_code;
         use Instr as I;
         use LogicalInstr as L;
@@ -665,18 +661,13 @@ impl LogicalProgram {
         // Drives the signed→unsigned variant for U64 operands, whose i64 bit
         // pattern is negative for values >= 2^63. 0 = unknown (treated signed).
         let mut reg_tc = [0u8; MAX_REGS];
-        let is_u64 = |tc: u8| tc == type_code::U64;
         // Payload slot of a payload-only opcode's column operand. `validate`'s
-        // `ColKind::payload_only` rule rejects a PK column here and both
-        // `ScalarFunc` constructors validate before resolving, so the `None` arm
+        // `ColKind::payload_only` rule rejects a PK column here and callers
+        // validate before resolving, so the `None` arm
         // is unreachable for any program that ever reaches a batch; it keeps the
         // sentinel so an unvalidated program (tests) trips the kernels' own
         // assertions instead of silently addressing payload slot 0.
-        let payload_slot = |ci: usize| {
-            schema
-                .payload_slot(ci)
-                .unwrap_or(gnitz_expr::PAYLOAD_MAPPING_PK_SENTINEL)
-        };
+        let payload_slot = |ci: usize| schema.payload_slot(ci).unwrap_or(crate::PAYLOAD_MAPPING_PK_SENTINEL);
         let mut instrs = Vec::with_capacity(self.instrs.len());
         // Decoded `INT_IN_SET` pools, indexed by the resolved `set_idx`. Decoded
         // once here (never per row); each `IntInSet` re-points its `set_idx` at
@@ -706,12 +697,13 @@ impl LogicalProgram {
                     reg_tc[dst as usize] = loc.type_code();
                 }
                 L::LoadColFloat { dst, col } => {
-                    let ci = col as usize;
-                    instrs.push(I::LoadPayloadFloat {
-                        dst,
-                        pi: payload_slot(ci),
-                        tc: schema.col_type_code(ci),
-                    });
+                    // One query, as in the `LoadColInt` arm above: the locator
+                    // carries both the slot and the type code.
+                    let (pi, tc) = match schema.locate(col as usize) {
+                        ColumnLocator::Payload { slot, type_code, .. } => (slot, type_code),
+                        ColumnLocator::Pk { type_code, .. } => (crate::PAYLOAD_MAPPING_PK_SENTINEL, type_code),
+                    };
+                    instrs.push(I::LoadPayloadFloat { dst, pi, tc });
                     reg_tc[dst as usize] = 0;
                 }
                 L::LoadConst { dst, val } => {
@@ -758,7 +750,7 @@ impl LogicalProgram {
                 }
                 L::FCmp { op, dst, a, b } => instrs.push(I::FCmp { op, dst, a, b }),
                 L::IntToFloat { dst, a } => {
-                    let signed = !is_u64(reg_tc[a as usize]);
+                    let signed = reg_tc[a as usize] != type_code::U64;
                     instrs.push(I::IntToFloat { dst, a, signed });
                     reg_tc[dst as usize] = 0;
                 }
@@ -844,7 +836,7 @@ impl LogicalProgram {
         }
         // Encode each string constant once into a 16-byte German-string cell
         // over one shared const blob, so the str-vs-const eval arm compares it
-        // through the engine-wide `compare_german_strings` — no per-morsel
+        // through `gnitz_wire::compare_german_strings` — no per-morsel
         // re-derivation and no parallel prefix/length tables.
         let mut const_blob: Vec<u8> = Vec::new();
         let const_cells: Vec<[u8; 16]> = self
@@ -852,26 +844,25 @@ impl LogicalProgram {
             .iter()
             .map(|s| encode_german_string(s, &mut const_blob))
             .collect();
-        let mut prog = ResolvedProgram {
+        // Three independent passes over `instrs`, so the struct is built once,
+        // fully resolved — there is no moment where a mask field is a placeholder.
+        let RegisterRoles {
+            bit_only,
+            bool_input,
+            use_count,
+        } = classify_registers(&instrs, self.result_reg, is_filter);
+        ResolvedProgram {
+            no_nulls: is_strictly_non_nullable(&instrs, schema),
+            bit_only_mask: bit_only,
+            bool_pack_mask: bit_only | bool_input,
+            chain_trigger_mask: and_chain_mask(&instrs, self.result_reg, is_filter, &use_count),
             instrs,
             num_regs: self.num_regs,
             result_reg: self.result_reg,
             const_cells,
             const_blob,
             int_sets,
-            no_nulls: false,
-            bit_only_mask: 0,
-            bool_input_mask: 0,
-            chain_trigger_mask: 0,
-        };
-        // Three independent passes over `prog.instrs` — none reads the masks the
-        // others write, so the order is free.
-        prog.no_nulls = prog.is_strictly_non_nullable(schema);
-        let (bit_only, bool_input) = prog.classify_registers(is_filter);
-        prog.bit_only_mask = bit_only;
-        prog.bool_input_mask = bool_input;
-        prog.chain_trigger_mask = prog.and_chain_mask(is_filter);
-        prog
+        }
     }
 
     /// Validate as a filter predicate: the schema-aware pass, plus the one rule
@@ -899,13 +890,11 @@ impl LogicalProgram {
     ///
     /// With an `out_schema` this is also where **output coverage** is decided:
     /// every declared payload slot must be written by exactly one `CopyCol` or
-    /// `Emit`. Map output batches are provisioned uninitialized
-    /// (`Batch::with_capacity`), so an unwritten slot ships recycled bytes rather
-    /// than a zero — and the ad-hoc scan writes onto a keeper tail that is
-    /// literally a previous request's memory. By popcount rather than a length
-    /// check, so a duplicate destination is caught too (it leaves another slot's
-    /// bit clear).
-    pub(in crate::expr) fn validate(
+    /// `Emit`. Map output batches are provisioned uninitialized, so an unwritten
+    /// slot ships recycled bytes rather than a zero. Checked by popcount rather
+    /// than by length, so a duplicate destination is caught too (it leaves
+    /// another slot's bit clear).
+    pub(crate) fn validate(
         &self,
         in_schema: Option<&dyn SchemaFacts>,
         out_schema: Option<&dyn SchemaFacts>,
@@ -1069,7 +1058,6 @@ impl LogicalProgram {
 }
 
 /// A register operand is in range iff `< num_regs`.
-#[inline]
 fn check_reg(r: u16, num_regs: u32) -> Result<(), ExprValidateErr> {
     if (r as u32) < num_regs {
         Ok(())
@@ -1087,7 +1075,6 @@ fn check_reg(r: u16, num_regs: u32) -> Result<(), ExprValidateErr> {
 /// reads a zeroed schema slot. The kernels dispatch on a column's type without
 /// re-checking it, so this is the only place a client blob is held to the
 /// contract.
-#[inline]
 fn check_col(in_schema: Option<&dyn SchemaFacts>, col: u32, need: ColKind) -> Result<(), ExprValidateErr> {
     let Some(s) = in_schema else { return Ok(()) };
     if col as usize >= s.num_columns() {
@@ -1120,7 +1107,6 @@ fn check_col(in_schema: Option<&dyn SchemaFacts>, col: u32, need: ColKind) -> Re
 /// A COPY_COL destination slot must hold its source verbatim. `copy_column`
 /// byte-copies at equal width and otherwise `widen_native_le`s a narrower integer
 /// into a wider slot — there is no narrowing and no representation change.
-#[inline]
 fn check_copy_types(
     in_schema: Option<&dyn SchemaFacts>,
     out_schema: Option<&dyn SchemaFacts>,
@@ -1152,7 +1138,6 @@ fn check_copy_types(
 /// the register holds. Both tests are needed and their order does not matter:
 /// `wire_stride` reports 8 for an undecodable type code, so the width test alone
 /// would admit one.
-#[inline]
 fn check_emit_slot(out_schema: Option<&dyn SchemaFacts>, out: u32) -> Result<(), ExprValidateErr> {
     let Some(os) = out_schema else { return Ok(()) };
     // `col_type_code`, like its two sibling checks — not `locate`, whose extra
@@ -1167,13 +1152,11 @@ fn check_emit_slot(out_schema: Option<&dyn SchemaFacts>, out: u32) -> Result<(),
 
 /// True iff either operand register currently holds a U64 value — the single
 /// rule that drives every signed→unsigned variant selection in `resolve`.
-#[inline]
 fn any_u64(reg_tc: &[u8; MAX_REGS], a: u16, b: u16) -> bool {
     let u64_tc = gnitz_wire::type_code::U64;
     reg_tc[a as usize] == u64_tc || reg_tc[b as usize] == u64_tc
 }
 
-#[inline]
 fn propagate_u64(reg_tc: &[u8; MAX_REGS], a: u16, b: u16) -> u8 {
     if any_u64(reg_tc, a, b) {
         gnitz_wire::type_code::U64
@@ -1186,264 +1169,255 @@ fn propagate_u64(reg_tc: &[u8; MAX_REGS], a: u16, b: u16) -> u8 {
 // ResolvedProgram — the evaluable form
 // ---------------------------------------------------------------------------
 
-pub(in crate::expr) struct ResolvedProgram {
-    pub(in crate::expr) instrs: Vec<Instr>,
-    pub(in crate::expr) num_regs: u32,
+pub(crate) struct ResolvedProgram {
+    pub(crate) instrs: Vec<Instr>,
+    pub(crate) num_regs: u32,
     /// The register holding the filter verdict. Filter-only state: a map's is
     /// meaningless (both map construction sites hardcode 0 into the wire field)
     /// and never read — the only consumers are the `is_filter` arms below and
-    /// the `Repr::Predicate` entry points, and `from_predicate` rejects a
-    /// register-free program so a filter's is always in range.
-    pub(in crate::expr) result_reg: u32,
+    /// the filter entry points, and [`LogicalProgram::validate_predicate`]
+    /// rejects a register-free program so a filter's is always in range.
+    pub(crate) result_reg: u32,
     /// Per-constant 16-byte German-string cell (indexed by `const_idx`) over
-    /// the one shared `const_blob` — encoded once at resolve, compared by the
-    /// engine-wide `compare_german_strings`.
-    pub(in crate::expr) const_cells: Vec<[u8; 16]>,
-    pub(in crate::expr) const_blob: Vec<u8>,
+    /// the one shared `const_blob` — encoded once at resolve, compared by
+    /// `gnitz_wire::compare_german_strings`.
+    pub(crate) const_cells: Vec<[u8; 16]>,
+    pub(crate) const_blob: Vec<u8>,
     /// Decoded `INT_IN_SET` value pools, indexed by the resolved `set_idx`. Each
     /// pool is sorted ascending in signed-i64 `Ord` by `resolve` — the wire order
     /// is not trusted — so `eval_batch` binary-searches it directly. Duplicates
     /// are left in place; `binary_search` is correct over them.
-    pub(in crate::expr) int_sets: Vec<Vec<i64>>,
+    pub(crate) int_sets: Vec<Vec<i64>>,
     /// True iff no instruction can produce a NULL against the schema this program
     /// was resolved against, so the evaluator skips null-bit tracking entirely.
     /// Resolved once — the answer is only meaningful for that one schema, since
     /// the payload indices in `instrs` were assigned from it.
-    pub(in crate::expr) no_nulls: bool,
+    pub(crate) no_nulls: bool,
     /// Bit `r` set iff register `r` is only consumed by boolean ops, so its
     /// producer can skip the i64 unpack into `regs[r]`.
-    pub(in crate::expr) bit_only_mask: u64,
-    /// Bit `r` set iff register `r` is read by a boolean consumer; the producer
-    /// must populate `bool_bits[r]`.
-    pub(in crate::expr) bool_input_mask: u64,
+    bit_only_mask: u64,
+    /// Bit `r` set iff `r`'s producer must write `bool_bits[r]` — either a
+    /// downstream boolean consumer reads it, or `r` is bit_only and the filter
+    /// reads `bool_bits[result_reg]` directly. Stored as the union rather than
+    /// its two halves: `needs_bool_pack` is the only reader and runs per
+    /// instruction per morsel.
+    bool_pack_mask: u64,
     /// Destination registers of the non-terminal ANDs in the one result-terminal
     /// AND chain: bit `r` set means "if the AND writing register `r` is all
     /// definite-FALSE for the morsel, the filter result is too — write the terminal
     /// (`result_reg`) all-FALSE and stop". 0 for non-filter programs and programs
     /// with no such chain. Every register is `< num_regs ≤ 64` (asserted in
     /// `LogicalProgram::new`), so a u64 indexed by register suffices.
-    pub(in crate::expr) chain_trigger_mask: u64,
-}
-
-/// Invoke `f` once per register this instruction reads.
-fn each_reg_read(i: &Instr, mut f: impl FnMut(u16)) {
-    use Instr::*;
-    match *i {
-        IntAdd { a, b, .. }
-        | IntSub { a, b, .. }
-        | IntMul { a, b, .. }
-        | IntDiv { a, b, .. }
-        | IntMod { a, b, .. }
-        | FloatAdd { a, b, .. }
-        | FloatSub { a, b, .. }
-        | FloatMul { a, b, .. }
-        | FloatDiv { a, b, .. }
-        | Cmp { a, b, .. }
-        | FCmp { a, b, .. }
-        | BoolAnd { a, b, .. }
-        | BoolOr { a, b, .. } => {
-            f(a);
-            f(b);
-        }
-        Select { cond, a, b, .. } => {
-            f(cond);
-            f(a);
-            f(b);
-        }
-        IntNeg { a, .. }
-        | FloatNeg { a, .. }
-        | IntToFloat { a, .. }
-        | BoolNot { a, .. }
-        | IntInSet { value_reg: a, .. } => f(a),
-        Emit { src, .. } => f(src),
-        LoadPayloadInt { .. }
-        | LoadPayloadFloat { .. }
-        | LoadPk { .. }
-        | LoadConst { .. }
-        | LoadNull { .. }
-        | IsNull { .. }
-        | IsNotNull { .. }
-        | StrColConst { .. }
-        | StrColCol { .. }
-        | CopyCol { .. } => {}
-    }
+    pub(crate) chain_trigger_mask: u64,
 }
 
 impl ResolvedProgram {
-    #[inline]
-    pub(in crate::expr) fn is_bit_only(&self, reg: usize) -> bool {
+    /// Per instruction per morsel, from the BOOL arms of `eval_batch`.
+    #[inline(always)]
+    pub(crate) fn is_bit_only(&self, reg: usize) -> bool {
         (self.bit_only_mask >> reg) & 1 != 0
     }
 
-    /// True iff `reg`'s producer must write `bool_bits[reg]` — either because a
-    /// downstream BOOL consumer reads it, or because `reg` is bit_only and
-    /// `run_filter` reads `bool_bits[result_reg]` directly.
-    #[inline]
-    pub(in crate::expr) fn needs_bool_pack(&self, reg: usize) -> bool {
-        ((self.bit_only_mask | self.bool_input_mask) >> reg) & 1 != 0
+    /// True iff `reg`'s producer must write `bool_bits[reg]`. Per instruction
+    /// per morsel, from `maybe_pack_bool_bits`.
+    #[inline(always)]
+    pub(crate) fn needs_bool_pack(&self, reg: usize) -> bool {
+        (self.bool_pack_mask >> reg) & 1 != 0
     }
+}
 
-    /// Detect the one result-terminal AND chain and return, as `chain_trigger_mask`,
-    /// the destination registers of its non-terminal ANDs. At runtime, when such an
-    /// AND is all definite-FALSE for a morsel, `eval_batch` writes the terminal
-    /// (`result_reg`) all-FALSE and breaks (see the `BoolAnd` nullable arm). Only
-    /// the accumulator spine is walked, so an inner AND reached through a
-    /// `BoolNot`/`BoolOr` operand is never marked — forcing FALSE under those would
-    /// be a miscompile.
-    fn and_chain_mask(&self, is_filter: bool) -> u64 {
-        let n = self.instrs.len();
-        // Filter-only; need ≥ 3 instrs for a ≥ 2-AND chain. A filter has one
-        // register per instruction, so n == num_regs ≤ MAX_REGS (asserted),
-        // keeping `pc as u8` and the register-indexed scratch arrays in range.
-        if !is_filter || !(3..=MAX_REGS).contains(&n) {
-            return 0;
+/// Detect the one result-terminal AND chain and return, as `chain_trigger_mask`,
+/// the destination registers of its non-terminal ANDs. At runtime, when such an
+/// AND is all definite-FALSE for a morsel, `eval_batch` writes the terminal
+/// (`result_reg`) all-FALSE and breaks (see the `BoolAnd` nullable arm). Only
+/// the accumulator spine is walked, so an inner AND reached through a
+/// `BoolNot`/`BoolOr` operand is never marked — forcing FALSE under those would
+/// be a miscompile.
+///
+/// `use_count` comes from [`classify_registers`], which already visits every
+/// register read: a second exhaustive walk could silently under-count an opcode
+/// that gained an operand, and an under-counted register reads as a clean chain
+/// link when it is not.
+fn and_chain_mask(instrs: &[Instr], result_reg: u32, is_filter: bool, use_count: &[u8; MAX_REGS]) -> u64 {
+    let n = instrs.len();
+    // Filter-only; need ≥ 3 instrs for a ≥ 2-AND chain. A filter has one
+    // register per instruction, so n == num_regs ≤ MAX_REGS (asserted),
+    // keeping `pc as u8` and the register-indexed scratch array in range.
+    if !is_filter || !(3..=MAX_REGS).contains(&n) {
+        return 0;
+    }
+    // Terminal = last instruction = expression root; must be an AND on result_reg.
+    let Instr::BoolAnd {
+        dst: term_dst,
+        a: term_a,
+        b: term_b,
+    } = instrs[n - 1]
+    else {
+        return 0;
+    };
+    if term_dst as u32 != result_reg {
+        return 0;
+    }
+    // Single-assignment (alloc_reg never reuses): each register has one writer.
+    // Track only AND writers — a spine link must be an AND, so a non-MAX slot
+    // already means "written by an AND".
+    let mut and_writer = [u8::MAX; MAX_REGS];
+    for (pc, ins) in instrs.iter().enumerate() {
+        if let Instr::BoolAnd { dst, .. } = *ins {
+            and_writer[dst as usize] = pc as u8;
         }
-        // Terminal = last instruction = expression root; must be an AND on result_reg.
-        let Instr::BoolAnd {
-            dst: term_dst,
-            a: term_a,
-            b: term_b,
-        } = self.instrs[n - 1]
-        else {
-            return 0;
+    }
+    // A spine link is an AND-written register used exactly once (clean chain).
+    let is_link = |r: u16| and_writer[r as usize] != u8::MAX && use_count[r as usize] == 1;
+    // Walk the accumulator spine; mark every non-terminal chain AND by its dst.
+    let mut mask = 0u64;
+    let (mut a, mut b) = (term_a, term_b);
+    loop {
+        let acc = if is_link(a) {
+            a
+        } else if is_link(b) {
+            b
+        } else {
+            break;
         };
-        if term_dst as u32 != self.result_reg {
-            return 0;
-        }
-        // Single-assignment (alloc_reg never reuses): each register has one writer.
-        // Track only AND writers — a spine link must be an AND, so a non-MAX slot
-        // already means "written by an AND".
-        let mut and_writer = [u8::MAX; MAX_REGS];
-        let mut use_count = [0u8; MAX_REGS];
-        for (pc, ins) in self.instrs.iter().enumerate() {
-            if let Instr::BoolAnd { dst, .. } = *ins {
-                and_writer[dst as usize] = pc as u8;
-            }
-            each_reg_read(ins, |r| use_count[r as usize] = use_count[r as usize].saturating_add(1));
-        }
-        // A spine link is an AND-written register used exactly once (clean chain).
-        let is_link = |r: u16| and_writer[r as usize] != u8::MAX && use_count[r as usize] == 1;
-        // Walk the accumulator spine; mark every non-terminal chain AND by its dst.
-        let mut mask = 0u64;
-        let (mut a, mut b) = (term_a, term_b);
-        loop {
-            let acc = if is_link(a) {
-                a
-            } else if is_link(b) {
-                b
-            } else {
-                break;
-            };
-            mask |= 1u64 << acc;
-            let w = and_writer[acc as usize] as usize;
-            let Instr::BoolAnd { a: na, b: nb, .. } = self.instrs[w] else {
-                break;
-            };
-            a = na;
-            b = nb;
-        }
-        mask
-    }
-
-    /// Classify each register's role on the nullable-arm hot path. Returns
-    /// `(bit_only_mask, bool_input_mask)`. A filter's `result_reg` is forced to
-    /// be a bool input (the `run_filter` fast path reads `bool_bits` of it
-    /// directly). A map has no result register to force — its only register
-    /// consumer is `Emit`, which already marks its source non-bool.
-    ///
-    /// Every `1u64 << reg` below is in range: `LogicalProgram::new` asserts
-    /// `num_regs <= MAX_REGS` and bounds every register operand by `num_regs`.
-    pub(in crate::expr) fn classify_registers(&self, is_filter: bool) -> (u64, u64) {
-        use Instr::*;
-        let mut bool_produced: u64 = 0;
-        let mut non_bool_read: u64 = 0;
-        let mut bool_input: u64 = 0;
-        for instr in &self.instrs {
-            match *instr {
-                // Bool producers that are also binary register readers.
-                Cmp { dst, a, b, .. } | FCmp { dst, a, b, .. } => {
-                    bool_produced |= 1u64 << dst;
-                    non_bool_read |= (1u64 << a) | (1u64 << b);
-                }
-                // Bool producer reading one integer register (its value operand).
-                IntInSet { dst, value_reg, .. } => {
-                    bool_produced |= 1u64 << dst;
-                    non_bool_read |= 1u64 << value_reg;
-                }
-                // Binary register readers (non-bool-producing).
-                IntAdd { a, b, .. }
-                | IntSub { a, b, .. }
-                | IntMul { a, b, .. }
-                | IntDiv { a, b, .. }
-                | IntMod { a, b, .. }
-                | FloatAdd { a, b, .. }
-                | FloatSub { a, b, .. }
-                | FloatMul { a, b, .. }
-                | FloatDiv { a, b, .. } => {
-                    non_bool_read |= (1u64 << a) | (1u64 << b);
-                }
-                // Bool producers whose operands are payload columns, not regs.
-                StrColConst { dst, .. } | StrColCol { dst, .. } | IsNull { dst, .. } | IsNotNull { dst, .. } => {
-                    bool_produced |= 1u64 << dst;
-                }
-                // Binary bool consumers: producer + bool_input (not non_bool_read).
-                BoolAnd { dst, a, b } | BoolOr { dst, a, b } => {
-                    bool_produced |= 1u64 << dst;
-                    bool_input |= (1u64 << a) | (1u64 << b);
-                }
-                // Unary bool consumer.
-                BoolNot { dst, a } => {
-                    bool_produced |= 1u64 << dst;
-                    bool_input |= 1u64 << a;
-                }
-                // Unary register readers (non-bool).
-                IntNeg { a, .. } | FloatNeg { a, .. } | IntToFloat { a, .. } => {
-                    non_bool_read |= 1u64 << a;
-                }
-                // Ternary select: `cond` is read as a boolean (its producer must
-                // pack `bool_bits`), `a`/`b` as values. `dst` carries a value, so
-                // it is deliberately in neither set — keeping it out of
-                // `bool_produced` keeps it out of `bit_only`.
-                Select { cond, a, b, .. } => {
-                    bool_input |= 1u64 << cond;
-                    non_bool_read |= (1u64 << a) | (1u64 << b);
-                }
-                Emit { src, .. } => {
-                    non_bool_read |= 1u64 << src;
-                }
-                // No register reads / not bool.
-                LoadPayloadInt { .. }
-                | LoadPayloadFloat { .. }
-                | LoadPk { .. }
-                | LoadConst { .. }
-                | LoadNull { .. }
-                | CopyCol { .. } => {}
-            }
-        }
-        let bit_only = bool_produced & !non_bool_read;
-        if is_filter {
-            // `run_filter`'s nullable arm consumes the result as packed bits
-            // (a word-level `bool_bits & !null_bits` merge), so the result
-            // producer must populate `bool_bits` whatever opcode it is —
-            // marking it a bool input routes every non-bool producer through
-            // `maybe_pack_bool_bits`.
-            bool_input |= 1u64 << self.result_reg as usize;
-        }
-        (bit_only, bool_input)
-    }
-
-    /// Returns true if no instruction in this program can produce a NULL result
-    /// (so the evaluator can skip null-bit tracking entirely). Called once, from
-    /// `resolve`, against the schema the program was resolved against — the only
-    /// schema for which the answer means anything (`pi` operands come from it).
-    fn is_strictly_non_nullable(&self, schema: &dyn SchemaFacts) -> bool {
-        use Instr::*;
-        let nullable_payload = |pi: u8| -> bool {
-            let a = pi as usize;
-            a < schema.num_payload_cols() && schema.col_nullable(schema.payload_col_idx(a))
+        mask |= 1u64 << acc;
+        let w = and_writer[acc as usize] as usize;
+        let Instr::BoolAnd { a: na, b: nb, .. } = instrs[w] else {
+            break;
         };
-        for instr in &self.instrs {
-            match *instr {
+        a = na;
+        b = nb;
+    }
+    mask
+}
+
+/// What [`classify_registers`] derives in its one pass over the instruction
+/// stream.
+struct RegisterRoles {
+    /// Bit `r` set iff `r` is only consumed by boolean ops, so its producer can
+    /// skip the i64 unpack into `regs[r]`.
+    bit_only: u64,
+    /// Bit `r` set iff a boolean consumer reads `r`, so its producer must
+    /// populate `bool_bits[r]`.
+    bool_input: u64,
+    /// How many instructions read each register, saturating at 255.
+    use_count: [u8; MAX_REGS],
+}
+
+/// Classify each register's role on the nullable-arm hot path, and count every
+/// register read while doing it. A filter's `result_reg` is forced to be a bool
+/// input (the filter fast path reads `bool_bits` of it directly). A map has no
+/// result register to force — its only register consumer is `Emit`, which
+/// already marks its source non-bool.
+///
+/// This is the **one** exhaustive walk over register operands: `use_count` is
+/// accumulated here rather than by a second visitor, so an opcode that gains an
+/// operand cannot be classified correctly and counted wrong.
+///
+/// Every `1u64 << reg` below is in range: `LogicalProgram::new` asserts
+/// `num_regs <= MAX_REGS` and bounds every register operand by `num_regs`.
+fn classify_registers(instrs: &[Instr], result_reg: u32, is_filter: bool) -> RegisterRoles {
+    use Instr::*;
+    let mut bool_produced: u64 = 0;
+    let mut non_bool_read: u64 = 0;
+    let mut bool_input: u64 = 0;
+    let mut use_count = [0u8; MAX_REGS];
+    // Record each register read and OR it into the mask naming how it is read.
+    macro_rules! read {
+        ($mask:ident, $($r:expr),+) => {{ $(
+            use_count[$r as usize] = use_count[$r as usize].saturating_add(1);
+            $mask |= 1u64 << $r;
+        )+ }};
+    }
+    for instr in instrs {
+        match *instr {
+            // Bool producers that are also binary register readers.
+            Cmp { dst, a, b, .. } | FCmp { dst, a, b, .. } => {
+                bool_produced |= 1u64 << dst;
+                read!(non_bool_read, a, b);
+            }
+            // Bool producer reading one integer register (its value operand).
+            IntInSet { dst, value_reg, .. } => {
+                bool_produced |= 1u64 << dst;
+                read!(non_bool_read, value_reg);
+            }
+            // Binary register readers (non-bool-producing).
+            IntAdd { a, b, .. }
+            | IntSub { a, b, .. }
+            | IntMul { a, b, .. }
+            | IntDiv { a, b, .. }
+            | IntMod { a, b, .. }
+            | FloatAdd { a, b, .. }
+            | FloatSub { a, b, .. }
+            | FloatMul { a, b, .. }
+            | FloatDiv { a, b, .. } => {
+                read!(non_bool_read, a, b);
+            }
+            // Bool producers whose operands are payload columns, not regs.
+            StrColConst { dst, .. } | StrColCol { dst, .. } | IsNull { dst, .. } | IsNotNull { dst, .. } => {
+                bool_produced |= 1u64 << dst;
+            }
+            // Binary bool consumers: producer + bool_input (not non_bool_read).
+            BoolAnd { dst, a, b } | BoolOr { dst, a, b } => {
+                bool_produced |= 1u64 << dst;
+                read!(bool_input, a, b);
+            }
+            // Unary bool consumer.
+            BoolNot { dst, a } => {
+                bool_produced |= 1u64 << dst;
+                read!(bool_input, a);
+            }
+            // Unary register readers (non-bool).
+            IntNeg { a, .. } | FloatNeg { a, .. } | IntToFloat { a, .. } => {
+                read!(non_bool_read, a);
+            }
+            // Ternary select: `cond` is read as a boolean (its producer must
+            // pack `bool_bits`), `a`/`b` as values. `dst` carries a value, so
+            // it is deliberately in neither set — keeping it out of
+            // `bool_produced` keeps it out of `bit_only`.
+            Select { cond, a, b, .. } => {
+                read!(bool_input, cond);
+                read!(non_bool_read, a, b);
+            }
+            Emit { src, .. } => {
+                read!(non_bool_read, src);
+            }
+            // No register reads / not bool.
+            LoadPayloadInt { .. }
+            | LoadPayloadFloat { .. }
+            | LoadPk { .. }
+            | LoadConst { .. }
+            | LoadNull { .. }
+            | CopyCol { .. } => {}
+        }
+    }
+    if is_filter {
+        // The filter's nullable arm consumes the result as packed bits
+        // (a word-level `bool_bits & !null_bits` merge), so the result
+        // producer must populate `bool_bits` whatever opcode it is —
+        // marking it a bool input routes every non-bool producer through
+        // `maybe_pack_bool_bits`.
+        bool_input |= 1u64 << result_reg as usize;
+    }
+    RegisterRoles {
+        bit_only: bool_produced & !non_bool_read,
+        bool_input,
+        use_count,
+    }
+}
+
+/// Returns true if no instruction in `instrs` can produce a NULL result (so the
+/// evaluator can skip null-bit tracking entirely). Called once, from `resolve`,
+/// against the schema the program was resolved against — the only schema for
+/// which the answer means anything (`pi` operands come from it).
+fn is_strictly_non_nullable(instrs: &[Instr], schema: &dyn SchemaFacts) -> bool {
+    use Instr::*;
+    let nullable_payload = |pi: u8| -> bool {
+        let a = pi as usize;
+        a < schema.num_payload_cols() && schema.col_nullable(schema.payload_col_idx(a))
+    };
+    for instr in instrs {
+        match *instr {
                 // Division/modulo produce NULL on a zero divisor.
                 IntDiv { .. } | IntMod { .. } | FloatDiv { .. } => return false,
                 // IS_NULL / IS_NOT_NULL read the batch null bits.
@@ -1489,8 +1463,10 @@ impl ResolvedProgram {
                 | BoolNot { .. }
                 | CopyCol { .. }
                 | Emit { .. } => {}
-            }
         }
-        true
     }
+    true
 }
+
+#[cfg(test)]
+mod tests;

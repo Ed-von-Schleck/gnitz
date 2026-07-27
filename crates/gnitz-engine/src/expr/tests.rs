@@ -1,8 +1,27 @@
-use super::super::plan::{PkFill, ScalarFunc};
-use super::super::program::{ExprValidateErr, LogicalProgram};
-use super::make_int_batch;
+use gnitz_expr::{ExprValidateErr, LogicalProgram};
+
+use super::{PkFill, ScalarFunc};
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 use crate::storage::Batch;
+
+/// Build a `Batch` of `(pk, weight, null_word, payload i64 cells)` rows against
+/// `schema` — the engine-side physical batch these tests drive `ScalarFunc`
+/// with, as opposed to the owned-buffer view `gnitz-expr`'s own tests use.
+fn make_int_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, u64, &[i64])]) -> Batch {
+    let mut batch = Batch::with_capacity(*schema, rows.len().max(1));
+    for &(pk, weight, null_word, cols) in rows {
+        batch.extend_pk(pk as u128);
+        batch.extend_weight(&weight.to_le_bytes());
+        batch.extend_null_bmp(&null_word.to_le_bytes());
+        for (pi, _ci, _col) in schema.payload_columns() {
+            if pi < cols.len() {
+                batch.extend_col(pi, &cols[pi].to_le_bytes());
+            }
+        }
+        batch.count += 1;
+    }
+    batch
+}
 
 fn make_schema(pk_index: u32, col_types: &[u8]) -> SchemaDescriptor {
     let mut columns = [SchemaColumn::EMPTY; MAX_COLUMNS];
@@ -37,7 +56,7 @@ fn test_map_copy_and_emit() {
 
     let batch = make_int_batch(&in_schema, &[(1, 1, 0, &[10, 20])]);
 
-    use crate::expr::LogicalInstr;
+    use gnitz_expr::LogicalInstr;
     let instrs = vec![
         LogicalInstr::CopyCol { src_col: 1, out: 0 },
         LogicalInstr::LoadColInt { dst: 0, col: 1 },
@@ -45,7 +64,7 @@ fn test_map_copy_and_emit() {
         LogicalInstr::IntAdd { dst: 2, a: 0, b: 1 },
         LogicalInstr::Emit { src: 2, out: 1 },
     ];
-    let prog = crate::expr::LogicalProgram::new(instrs, 3, 2, vec![]);
+    let prog = LogicalProgram::new(instrs, 3, 2, vec![]);
 
     let func = ScalarFunc::from_map(prog, &in_schema, &out_schema).unwrap();
     let result = func.evaluate_map_batch(&batch, PkFill::Copy);
@@ -270,4 +289,46 @@ fn test_register_free_predicate_is_rejected() {
     );
     // The same shape is legitimate as a map: `copy_cols` builds it.
     assert!(ScalarFunc::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema).is_ok());
+}
+
+/// The predicate wiring `gnitz-expr`'s own tests cannot reach: `from_predicate`
+/// through `filter_ranges` over a real `Batch`, including the range coalescing
+/// that turns per-row verdicts into the `(start, end)` list every consumer reads.
+#[test]
+fn test_from_predicate_filter_ranges_over_a_batch() {
+    use gnitz_expr::{CmpOp, LogicalInstr};
+
+    let schema = make_schema(0, &[type_code::U64, type_code::I64]);
+    // Rows 1..=6 with col1 = 5, 20, 30, 0, 40, 50 → `col1 > 15` keeps
+    // {1, 2} and {4, 5}: two runs, so a PK-only or per-row answer would differ.
+    let rows: Vec<(u64, i64, u64, &[i64])> = vec![
+        (1, 1, 0, &[5]),
+        (2, 1, 0, &[20]),
+        (3, 1, 0, &[30]),
+        (4, 1, 0, &[0]),
+        (5, 1, 0, &[40]),
+        (6, 1, 0, &[50]),
+    ];
+    let batch = make_int_batch(&schema, &rows);
+
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 15 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
+    ];
+    let func = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 3, 2, vec![]), &schema).unwrap();
+
+    let mut ranges = Vec::new();
+    func.filter_ranges(&batch, &mut ranges);
+    assert_eq!(ranges, vec![(1, 3), (4, 6)]);
+
+    // `out` is cleared, not appended to, so a reused buffer cannot leak a
+    // previous chunk's ranges into this one.
+    func.filter_ranges(&batch, &mut ranges);
+    assert_eq!(ranges, vec![(1, 3), (4, 6)]);
 }

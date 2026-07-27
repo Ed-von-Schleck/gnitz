@@ -304,9 +304,9 @@ fn linear_sum_only_emptied_group_eliminated() {
 /// bit is NULL and the NullfillSum finalize renders SUM = NULL.
 #[test]
 fn linear_sum_only_new_all_null_group_present() {
-    use crate::expr::{CmpOp, LogicalInstr, LogicalProgram};
     use crate::schema::{type_code, SchemaColumn};
     use crate::storage::ReadCursor;
+    use gnitz_expr::{CmpOp, LogicalInstr, LogicalProgram};
     use std::rc::Rc;
 
     // Input: pk(U64), grp(I64), val(I64 nullable).
@@ -501,9 +501,9 @@ fn count_star_only_emptied_group_eliminated() {
 /// is exactly the defect the companion fixes.
 #[test]
 fn test_reduce_nullable_sum_retraction_becomes_null() {
-    use crate::expr::{CmpOp, LogicalInstr, LogicalProgram};
     use crate::schema::{type_code, SchemaColumn};
     use crate::storage::ReadCursor;
+    use gnitz_expr::{CmpOp, LogicalInstr, LogicalProgram};
     use std::rc::Rc;
 
     // Input: pk(U64), grp(I64), val(I64, NULLABLE).

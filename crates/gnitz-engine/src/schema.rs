@@ -22,10 +22,13 @@ pub use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
 
 /// Resolved column addressing, homed in the leaf `gnitz-expr` crate so the
 /// expression evaluator (and, through it, the SQL client) shares one definition
-/// with the engine. Re-exported here because they *are* schema facts —
-/// `SchemaDescriptor::locate` produces a `ColumnLocator` and `compute_mappings`
-/// writes the sentinel — so every call site keeps naming `crate::schema::X`.
-pub(crate) use gnitz_expr::{ColumnLocator, PAYLOAD_MAPPING_PK_SENTINEL};
+/// with the engine. Re-exported here because it *is* a schema fact —
+/// `SchemaDescriptor::locate` produces one — so every call site keeps naming
+/// `crate::schema::X`. `PAYLOAD_MAPPING_PK_SENTINEL` deliberately is not: its
+/// only engine reader is `payload_mapping`'s own encode/decode below, in this
+/// file.
+pub(crate) use gnitz_expr::ColumnLocator;
+use gnitz_expr::PAYLOAD_MAPPING_PK_SENTINEL;
 
 /// Order-preserving primary-key (OPK) primitives — encode/compare/route/pack
 /// and the width-tagged `PkBuf`. Sits below both schema and storage, and is the
@@ -138,14 +141,6 @@ impl SchemaColumn {
     /// validator's `check_col` and the catalog's `check_col_defs` are for.
     pub const fn new(type_code: u8, nullable: u8) -> Self {
         debug_assert!(gnitz_wire::is_valid_type_code(type_code), "invalid column type code");
-        Self::raw(type_code, nullable)
-    }
-
-    /// [`Self::new`] without the decodable-code assert — the corrupt-catalog
-    /// fixture. Only the tests that pin what the validators do with an
-    /// undecodable code (which a release build genuinely can carry) build one.
-    #[cfg(test)]
-    pub(crate) const fn corrupt(type_code: u8, nullable: u8) -> Self {
         Self::raw(type_code, nullable)
     }
 
@@ -1688,7 +1683,7 @@ mod tests {
     #[test]
     fn test_pk_eligibility_matches_the_wire_allow_list() {
         for tc in 0u8..=255 {
-            let Some(size) = gnitz_wire::TypeCode::try_from_u8(tc).map(|t| t.wire_stride()) else {
+            let Some(size) = TypeCode::try_from_u8(tc).map(|t| t.wire_stride()) else {
                 continue;
             };
             assert!(size > 0, "type_code {tc} has no width");

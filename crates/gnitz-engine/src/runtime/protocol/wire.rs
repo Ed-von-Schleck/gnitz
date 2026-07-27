@@ -1146,10 +1146,11 @@ pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::MAX_PK_COLUMNS;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::Layout;
     use crate::test_support::arb_type_code;
-    use gnitz_wire::{is_pk_eligible, MAX_PK_COLUMNS};
+    use gnitz_wire::is_pk_eligible;
     use proptest::collection::vec;
     use proptest::prelude::*;
     use proptest::test_runner::TestCaseError;

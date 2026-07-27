@@ -2,45 +2,43 @@
 // of PI meant to be replaced with std::f64::consts::PI.
 #![allow(clippy::approx_constant)]
 
-use super::super::program::*;
-use super::{
-    bits_to_float, eval_predicate_via_batch as eval_predicate, eval_with_emit_via_batch, float_to_bits, make_int_batch,
+use gnitz_wire::type_code;
+
+use super::{classify_registers, RegisterRoles};
+use crate::test_support::{
+    bits_to_float, filter_prog, float_to_bits, make_int_view, make_string_view, scalar_prog, schema_pk_ints,
+    schema_pk_strings, TestSchema, TestView,
 };
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
-use crate::storage::Batch;
+use crate::{CmpOp, ColKind, Evaluator, ExprValidateErr, Instr, LogicalInstr, LogicalProgram, StrOp};
 
-/// Build a `LogicalProgram` from typed instructions and resolve it against the
-/// schema in one step. Eval entry points take `&ResolvedProgram`, so every test
-/// prog must be resolved before being passed to `eval_predicate`/`eval_with_emit`.
-fn make_prog(
-    schema: &SchemaDescriptor,
-    instrs: Vec<LogicalInstr>,
-    num_regs: u32,
-    result_reg: u32,
-    const_strings: Vec<Vec<u8>>,
-) -> ResolvedProgram {
-    LogicalProgram::new(instrs, num_regs, result_reg, const_strings).resolve(schema, /* is_filter = */ false)
-}
-
-/// `col_types` may name an *undecodable* type code: a release engine can carry
-/// one (a corrupt SAL / crafted wire schema), and the validator tests exist to
-/// pin what happens then — so the columns are built through
-/// `SchemaColumn::corrupt`, which skips the debug-only decodability assert.
-fn make_schema(pk_index: u32, col_types: &[u8]) -> SchemaDescriptor {
-    let mut columns = [SchemaColumn::EMPTY; MAX_COLUMNS];
-    for (i, &tc) in col_types.iter().enumerate() {
-        let nullable = if i == pk_index as usize { 0 } else { 1 };
-        columns[i] = SchemaColumn::corrupt(tc, nullable);
-    }
-    SchemaDescriptor::new(&columns[..col_types.len()], &[pk_index])
+/// Run `ev` at m=1 over `(mb, row)` and report
+/// `(predicate value, predicate is_null, EMIT null mask, EMIT values)` — the
+/// map-side read, where each EMIT'd register lands in an output payload slot
+/// and a NULL register stores 0 with its output bit set.
+fn eval_with_emit(ev: &Evaluator, mb: &TestView, row: usize) -> (i64, bool, u64, Vec<i64>) {
+    let mut emit_vals: Vec<i64> = Vec::new();
+    let mut emit_null_mask: u64 = 0;
+    ev.eval_morsels(mb, row, 1, |_, out| {
+        for (src, payload) in ev.emit_targets() {
+            let mut is_null = false;
+            out.for_each_null_row(src as usize, |_| is_null = true);
+            if is_null {
+                emit_vals.push(0);
+                emit_null_mask |= 1u64 << payload;
+            } else {
+                emit_vals.push(out.reg_values(src as usize)[0]);
+            }
+        }
+    });
+    let (val, is_null) = ev.eval_row(mb, row);
+    (val, is_null, emit_null_mask, emit_vals)
 }
 
 #[test]
 fn test_int_comparisons() {
     // Schema: 2 columns, col0=PK(U64), col1=I64
-    let schema = make_schema(0, &[8, 9]);
-    let batch = make_int_batch(&schema, &[(1, 1, 0, &[42])]);
-    let mb = batch.as_mem_batch();
+    let schema = schema_pk_ints(1, true);
+    let mb = make_int_view(&schema, &[(1, 0, &[42])]);
 
     // r0 = load_col_int(1), r1 = load_const(42), r2 = cmp_eq(r0, r1)
     let instrs = vec![
@@ -53,8 +51,8 @@ fn test_int_comparisons() {
             b: 1,
         }, // r2 = (r0 == r1)
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, is_null) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (val, is_null) = prog.eval_row(&mb, 0);
     assert_eq!(val, 1);
     assert!(!is_null);
 
@@ -69,8 +67,8 @@ fn test_int_comparisons() {
             b: 1,
         },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 0);
 
     // Test GT
@@ -84,16 +82,15 @@ fn test_int_comparisons() {
             b: 1,
         },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 1);
 }
 
 #[test]
 fn test_int_arithmetic() {
-    let schema = make_schema(0, &[8, 9, 9]);
-    let batch = make_int_batch(&schema, &[(1, 1, 0, &[10, 3])]);
-    let mb = batch.as_mem_batch();
+    let schema = schema_pk_ints(2, true);
+    let mb = make_int_view(&schema, &[(1, 0, &[10, 3])]);
 
     // ADD: 10 + 3 = 13
     let instrs = vec![
@@ -101,8 +98,8 @@ fn test_int_arithmetic() {
         LogicalInstr::LoadColInt { dst: 1, col: 2 },
         LogicalInstr::IntAdd { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 13);
 
     // DIV by zero → NULL
@@ -111,8 +108,8 @@ fn test_int_arithmetic() {
         LogicalInstr::LoadConst { dst: 1, val: 0 },
         LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (_, is_null) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (_, is_null) = prog.eval_row(&mb, 0);
     assert!(is_null);
 
     // MOD by zero → NULL
@@ -121,8 +118,8 @@ fn test_int_arithmetic() {
         LogicalInstr::LoadConst { dst: 1, val: 0 },
         LogicalInstr::IntMod { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (_, is_null) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (_, is_null) = prog.eval_row(&mb, 0);
     assert!(is_null);
 
     // NEG: -10
@@ -130,19 +127,18 @@ fn test_int_arithmetic() {
         LogicalInstr::LoadColInt { dst: 0, col: 1 },
         LogicalInstr::IntNeg { dst: 1, a: 0 },
     ];
-    let prog = make_prog(&schema, instrs, 2, 1, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 2, 1, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, -10);
 }
 
 #[test]
 fn test_float_arithmetic_and_comparison() {
-    let schema = make_schema(0, &[8, 10, 10]);
+    let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::F64, type_code::F64]);
     // Store floats as i64 bits
     let a_bits = float_to_bits(3.14);
     let b_bits = float_to_bits(2.0);
-    let batch = make_int_batch(&schema, &[(1, 1, 0, &[a_bits, b_bits])]);
-    let mb = batch.as_mem_batch();
+    let mb = make_int_view(&schema, &[(1, 0, &[a_bits, b_bits])]);
 
     // FLOAT_ADD: 3.14 + 2.0
     let instrs = vec![
@@ -150,8 +146,8 @@ fn test_float_arithmetic_and_comparison() {
         LogicalInstr::LoadColFloat { dst: 1, col: 2 },
         LogicalInstr::FloatAdd { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     let result = bits_to_float(val);
     assert!((result - 5.14).abs() < 1e-10);
 
@@ -161,8 +157,8 @@ fn test_float_arithmetic_and_comparison() {
         LogicalInstr::LoadConst { dst: 1, val: 0 }, // zero bits
         LogicalInstr::FloatDiv { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (_, is_null) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (_, is_null) = prog.eval_row(&mb, 0);
     assert!(is_null);
 
     // FCMP_GT: 3.14 > 2.0
@@ -176,17 +172,16 @@ fn test_float_arithmetic_and_comparison() {
             b: 1,
         },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 1);
 }
 
 #[test]
 fn test_null_propagation() {
-    let schema = make_schema(0, &[8, 9, 9]);
+    let schema = schema_pk_ints(2, true);
     // col1 is null (bit 0 set), col2 is not null
-    let batch = make_int_batch(&schema, &[(1, 1, 1, &[0, 5])]);
-    let mb = batch.as_mem_batch();
+    let mb = make_int_view(&schema, &[(1, 1, &[0, 5])]);
 
     // ADD with one null operand → null
     let instrs = vec![
@@ -194,44 +189,42 @@ fn test_null_propagation() {
         LogicalInstr::LoadColInt { dst: 1, col: 2 },
         LogicalInstr::IntAdd { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (_, is_null) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (_, is_null) = prog.eval_row(&mb, 0);
     assert!(is_null);
 }
 
 #[test]
 fn test_is_null_is_not_null() {
-    let schema = make_schema(0, &[8, 9, 9]);
+    let schema = schema_pk_ints(2, true);
     // col1 is null (bit 0 set), col2 is not null
-    let batch = make_int_batch(&schema, &[(1, 1, 1, &[0, 5])]);
-    let mb = batch.as_mem_batch();
+    let mb = make_int_view(&schema, &[(1, 1, &[0, 5])]);
 
     // IS_NULL(col1) → 1 (always non-null result)
     let instrs = vec![LogicalInstr::IsNull { dst: 0, col: 1 }];
-    let prog = make_prog(&schema, instrs, 1, 0, vec![]);
-    let (val, is_null) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
+    let (val, is_null) = prog.eval_row(&mb, 0);
     assert_eq!(val, 1);
     assert!(!is_null);
 
     // IS_NOT_NULL(col1) → 0
     let instrs = vec![LogicalInstr::IsNotNull { dst: 0, col: 1 }];
-    let prog = make_prog(&schema, instrs, 1, 0, vec![]);
-    let (val, is_null) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
+    let (val, is_null) = prog.eval_row(&mb, 0);
     assert_eq!(val, 0);
     assert!(!is_null);
 
     // IS_NULL(col2) → 0
     let instrs = vec![LogicalInstr::IsNull { dst: 0, col: 2 }];
-    let prog = make_prog(&schema, instrs, 1, 0, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 0);
 }
 
 #[test]
 fn test_boolean_combinators() {
-    let schema = make_schema(0, &[8, 9]);
-    let batch = make_int_batch(&schema, &[(1, 1, 0, &[1])]);
-    let mb = batch.as_mem_batch();
+    let schema = schema_pk_ints(1, true);
+    let mb = make_int_view(&schema, &[(1, 0, &[1])]);
 
     // AND(1, 0) → 0
     let instrs = vec![
@@ -239,8 +232,8 @@ fn test_boolean_combinators() {
         LogicalInstr::LoadConst { dst: 1, val: 0 },
         LogicalInstr::BoolAnd { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 0);
 
     // OR(1, 0) → 1
@@ -249,8 +242,8 @@ fn test_boolean_combinators() {
         LogicalInstr::LoadConst { dst: 1, val: 0 },
         LogicalInstr::BoolOr { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 1);
 
     // NOT(1) → 0
@@ -258,16 +251,15 @@ fn test_boolean_combinators() {
         LogicalInstr::LoadColInt { dst: 0, col: 1 },
         LogicalInstr::BoolNot { dst: 1, a: 0 },
     ];
-    let prog = make_prog(&schema, instrs, 2, 1, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 2, 1, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 0);
 }
 
 #[test]
 fn test_load_const_encoding() {
-    let schema = make_schema(0, &[8, 9]);
-    let batch = make_int_batch(&schema, &[(1, 1, 0, &[0])]);
-    let mb = batch.as_mem_batch();
+    let schema = schema_pk_ints(1, true);
+    let mb = make_int_view(&schema, &[(1, 0, &[0])]);
 
     // Test large constant: 0x00000001_00000002 = (1 << 32) | 2 = 4294967298
     // Wire form: lo 32 bits = 2, hi 32 bits = 1.
@@ -275,34 +267,24 @@ fn test_load_const_encoding() {
         dst: 0,
         val: ((1i64) << 32) | (2i64 & 0xFFFF_FFFF),
     }];
-    let prog = make_prog(&schema, instrs, 1, 0, vec![]);
-    let (val, is_null) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
+    let (val, is_null) = prog.eval_row(&mb, 0);
     assert!(!is_null);
     assert_eq!(val, (1i64 << 32) | 2);
 
     // Test negative constant: -1 (the wire low/high split is reconstructed by
     // `from_wire`; the typed instruction carries the full i64 value directly).
     let instrs = vec![LogicalInstr::LoadConst { dst: 0, val: -1 }];
-    let prog = make_prog(&schema, instrs, 1, 0, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, -1);
 }
 
 #[test]
 fn test_string_eq_const() {
-    let schema = make_schema(0, &[8, 11]);
-    // Build a batch with a short string "hello"
-    let mut batch = Batch::with_capacity(schema, 1);
-    batch.count = 0;
-    batch.extend_pk(1u128);
-    batch.extend_weight(&1i64.to_le_bytes());
-    batch.extend_null_bmp(&0u64.to_le_bytes());
-    // German string struct for "hello" (5 bytes, inline)
-    let gs = gnitz_wire::encode_german_string(b"hello", &mut batch.blob);
-    batch.extend_col(0, &gs);
-    batch.count = 1;
-
-    let mb = batch.as_mem_batch();
+    let schema = schema_pk_strings(1, true);
+    // One row holding the short (inline, ≤12 byte) German string "hello".
+    let mb = make_string_view(&schema, &[&[b"hello".as_slice()]]);
 
     // STR_COL_EQ_CONST(col1, "hello") → 1
     let instrs = vec![LogicalInstr::StrColConst {
@@ -311,8 +293,8 @@ fn test_string_eq_const() {
         col: 1,
         const_idx: 0,
     }];
-    let prog = make_prog(&schema, instrs, 1, 0, vec![b"hello".to_vec()]);
-    let (val, is_null) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 1, 0, vec![b"hello".to_vec()]);
+    let (val, is_null) = prog.eval_row(&mb, 0);
     assert!(!is_null);
     assert_eq!(val, 1);
 
@@ -323,23 +305,22 @@ fn test_string_eq_const() {
         col: 1,
         const_idx: 0,
     }];
-    let prog = make_prog(&schema, instrs, 1, 0, vec![b"world".to_vec()]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 1, 0, vec![b"world".to_vec()]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 0);
 }
 
 #[test]
 fn test_int_to_float() {
-    let schema = make_schema(0, &[8, 9]);
-    let batch = make_int_batch(&schema, &[(1, 1, 0, &[42])]);
-    let mb = batch.as_mem_batch();
+    let schema = schema_pk_ints(1, true);
+    let mb = make_int_view(&schema, &[(1, 0, &[42])]);
 
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 },
         LogicalInstr::IntToFloat { dst: 1, a: 0 },
     ];
-    let prog = make_prog(&schema, instrs, 2, 1, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 2, 1, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(bits_to_float(val), 42.0);
 }
 
@@ -352,14 +333,13 @@ fn test_unsigned_opcode_swap_and_eval() {
     // (1) asserting the resolved instruction carries `signed: false` and (2)
     // running eval on v=u64::MAX and asserting the UNSIGNED result, which diverges
     // from the signed interpretation that all other tests (BIGINT < 2^63) exercise.
-    let schema = make_schema(0, &[8, 8]);
+    let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::U64]);
 
     // v = u64::MAX (bit pattern 0xFFFF...FF, i.e. -1 as i64); divisor const = 2.
     // Unsigned: MAX > 100, MAX/2 = 9223372036854775807, MAX%2 = 1.
     // Signed:   -1 < 100 (false), -1/2 = 0,             -1%2 = -1.
     let v_bits = u64::MAX as i64; // == -1i64
-    let batch = make_int_batch(&schema, &[(1, 1, 0, &[v_bits])]);
-    let mb = batch.as_mem_batch();
+    let mb = make_int_view(&schema, &[(1, 0, &[v_bits])]);
 
     // (a) col1 > 100  → the Gt compare must resolve to the unsigned form.
     let instrs = vec![
@@ -372,12 +352,12 @@ fn test_unsigned_opcode_swap_and_eval() {
             b: 1,
         }, // r2 = (r0 > r1)
     ];
-    let prog_gt = make_prog(&schema, instrs, 3, 2, vec![]);
+    let prog_gt = scalar_prog(&schema, instrs, 3, 2, vec![]);
     // Instruction 2 is the comparison after resolution; the U64 operand must
     // select the unsigned form.
     assert!(
         matches!(
-            prog_gt.instrs[2],
+            prog_gt.prog.instrs[2],
             Instr::Cmp {
                 op: CmpOp::Gt,
                 signed: false,
@@ -386,7 +366,7 @@ fn test_unsigned_opcode_swap_and_eval() {
         ),
         "U64 operand must select unsigned CMP_GT"
     );
-    let (val, is_null) = eval_predicate(&prog_gt, &mb, 0);
+    let (val, is_null) = prog_gt.eval_row(&mb, 0);
     assert!(!is_null);
     assert_eq!(
         val, 1,
@@ -399,12 +379,12 @@ fn test_unsigned_opcode_swap_and_eval() {
         LogicalInstr::LoadConst { dst: 1, val: 2 },
         LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
     ];
-    let prog_div = make_prog(&schema, instrs, 3, 2, vec![]);
+    let prog_div = scalar_prog(&schema, instrs, 3, 2, vec![]);
     assert!(
-        matches!(prog_div.instrs[2], Instr::IntDiv { signed: false, .. }),
+        matches!(prog_div.prog.instrs[2], Instr::IntDiv { signed: false, .. }),
         "U64 operand must select unsigned IntDiv"
     );
-    let (val, is_null) = eval_predicate(&prog_div, &mb, 0);
+    let (val, is_null) = prog_div.eval_row(&mb, 0);
     assert!(!is_null);
     assert_eq!(
         val, 9223372036854775807,
@@ -417,12 +397,12 @@ fn test_unsigned_opcode_swap_and_eval() {
         LogicalInstr::LoadConst { dst: 1, val: 2 },
         LogicalInstr::IntMod { dst: 2, a: 0, b: 1 },
     ];
-    let prog_mod = make_prog(&schema, instrs, 3, 2, vec![]);
+    let prog_mod = scalar_prog(&schema, instrs, 3, 2, vec![]);
     assert!(
-        matches!(prog_mod.instrs[2], Instr::IntMod { signed: false, .. }),
+        matches!(prog_mod.prog.instrs[2], Instr::IntMod { signed: false, .. }),
         "U64 operand must select unsigned IntMod"
     );
-    let (val, is_null) = eval_predicate(&prog_mod, &mb, 0);
+    let (val, is_null) = prog_mod.eval_row(&mb, 0);
     assert!(!is_null);
     assert_eq!(val, 1, "u64::MAX % 2 == 1 (unsigned); signed -1 % 2 would be -1",);
 
@@ -431,14 +411,14 @@ fn test_unsigned_opcode_swap_and_eval() {
         LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col1 (U64)
         LogicalInstr::IntToFloat { dst: 1, a: 0 },   // r1 = (f64) r0
     ];
-    let prog_cast = make_prog(&schema, instrs, 2, 1, vec![]);
+    let prog_cast = scalar_prog(&schema, instrs, 2, 1, vec![]);
     // Instruction 1 is the cast after resolution; the U64 operand must select
     // the unsigned form.
     assert!(
-        matches!(prog_cast.instrs[1], Instr::IntToFloat { signed: false, .. }),
+        matches!(prog_cast.prog.instrs[1], Instr::IntToFloat { signed: false, .. }),
         "U64 operand must select unsigned IntToFloat"
     );
-    let (val, is_null) = eval_predicate(&prog_cast, &mb, 0);
+    let (val, is_null) = prog_cast.eval_row(&mb, 0);
     assert!(!is_null);
     let f = bits_to_float(val);
     assert_eq!(
@@ -451,9 +431,8 @@ fn test_unsigned_opcode_swap_and_eval() {
 
 #[test]
 fn test_emit_with_targets() {
-    let schema = make_schema(0, &[8, 9, 9]);
-    let batch = make_int_batch(&schema, &[(1, 1, 0, &[10, 20])]);
-    let mb = batch.as_mem_batch();
+    let schema = schema_pk_ints(2, true);
+    let mb = make_int_view(&schema, &[(1, 0, &[10, 20])]);
 
     // Compute col1 + col2, EMIT to payload col 0
     let instrs = vec![
@@ -462,9 +441,9 @@ fn test_emit_with_targets() {
         LogicalInstr::IntAdd { dst: 2, a: 0, b: 1 },
         LogicalInstr::Emit { src: 2, out: 0 }, // emit r2 to payload col 0
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
 
-    let (val, is_null, mask, emit_vals) = eval_with_emit_via_batch(&prog, &mb, 0);
+    let (val, is_null, mask, emit_vals) = eval_with_emit(&prog, &mb, 0);
     assert_eq!(val, 30); // 10 + 20
     assert!(!is_null);
     assert_eq!(mask, 0);
@@ -474,10 +453,9 @@ fn test_emit_with_targets() {
 #[test]
 fn test_div_by_zero_null_semantics() {
     // Schema: pk(u64), col1(i64), col2(i64)
-    let schema = make_schema(0, &[8, 9, 9]);
+    let schema = schema_pk_ints(2, true);
     // Row: pk=1, col1=10, col2=3; null_word=0 (no nulls)
-    let batch = make_int_batch(&schema, &[(1, 1, 0, &[10, 3])]);
-    let mb = batch.as_mem_batch();
+    let mb = make_int_view(&schema, &[(1, 0, &[10, 3])]);
 
     // 1. INT_DIV by literal 0 → NULL
     let instrs = vec![
@@ -485,8 +463,8 @@ fn test_div_by_zero_null_semantics() {
         LogicalInstr::LoadConst { dst: 1, val: 0 },
         LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (_, is_null) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (_, is_null) = prog.eval_row(&mb, 0);
     assert!(is_null);
 
     // 2. INT_MOD by literal 0 → NULL
@@ -495,8 +473,8 @@ fn test_div_by_zero_null_semantics() {
         LogicalInstr::LoadConst { dst: 1, val: 0 },
         LogicalInstr::IntMod { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (_, is_null) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (_, is_null) = prog.eval_row(&mb, 0);
     assert!(is_null);
 
     // 3. FLOAT_DIV by 0.0 bits → NULL
@@ -505,8 +483,8 @@ fn test_div_by_zero_null_semantics() {
         LogicalInstr::LoadConst { dst: 1, val: 0 },
         LogicalInstr::FloatDiv { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (_, is_null) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (_, is_null) = prog.eval_row(&mb, 0);
     assert!(is_null);
 
     // 4. INT_DIV by non-null non-zero → correct quotient, not null
@@ -515,8 +493,8 @@ fn test_div_by_zero_null_semantics() {
         LogicalInstr::LoadColInt { dst: 1, col: 2 },
         LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, is_null) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (val, is_null) = prog.eval_row(&mb, 0);
     assert!(!is_null);
     assert_eq!(val, 3); // 10 / 3 = 3
 
@@ -524,15 +502,15 @@ fn test_div_by_zero_null_semantics() {
     // null_word bit 0 = col1 null; use col2 (bit 1) as divisor with col1 null
     // Schema col indices: col1=payload_idx 0, col2=payload_idx 1
     // Build a row where col2 is null (null_word bit 1 set)
-    let batch_null_div = make_int_batch(&schema, &[(1, 1, 2, &[10, 3])]);
-    let mb_null_div = batch_null_div.as_mem_batch();
+    let batch_null_div = make_int_view(&schema, &[(1, 2, &[10, 3])]);
+    let mb_null_div = batch_null_div;
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 },
         LogicalInstr::LoadColInt { dst: 1, col: 2 },
         LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (_, is_null) = eval_predicate(&prog, &mb_null_div, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (_, is_null) = prog.eval_row(&mb_null_div, 0);
     assert!(is_null);
 
     // 6. EMIT of INT_DIV-by-zero result → emit_null_mask bit set, buffer contains 0
@@ -542,17 +520,16 @@ fn test_div_by_zero_null_semantics() {
         LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
         LogicalInstr::Emit { src: 2, out: 0 },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (_, _, mask, emit_vals) = eval_with_emit_via_batch(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (_, _, mask, emit_vals) = eval_with_emit(&prog, &mb, 0);
     assert_eq!(mask & 1, 1); // bit 0 set → null
     assert_eq!(emit_vals[0], 0);
 }
 
 #[test]
 fn test_cmp_ge_lt_le() {
-    let schema = make_schema(0, &[8, 9]);
-    let batch = make_int_batch(&schema, &[(1, 1, 0, &[42])]);
-    let mb = batch.as_mem_batch();
+    let schema = schema_pk_ints(1, true);
+    let mb = make_int_view(&schema, &[(1, 0, &[42])]);
 
     // GE: 42 >= 42 → 1
     let instrs = vec![
@@ -565,8 +542,8 @@ fn test_cmp_ge_lt_le() {
             b: 1,
         },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 1);
 
     // GE: 42 >= 43 → 0
@@ -580,8 +557,8 @@ fn test_cmp_ge_lt_le() {
             b: 1,
         },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 0);
 
     // LT: 42 < 43 → 1
@@ -595,8 +572,8 @@ fn test_cmp_ge_lt_le() {
             b: 1,
         },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 1);
 
     // LT: 42 < 42 → 0
@@ -610,8 +587,8 @@ fn test_cmp_ge_lt_le() {
             b: 1,
         },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 0);
 
     // LE: 42 <= 42 → 1
@@ -625,8 +602,8 @@ fn test_cmp_ge_lt_le() {
             b: 1,
         },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 1);
 
     // LE: 42 <= 41 → 0
@@ -640,18 +617,17 @@ fn test_cmp_ge_lt_le() {
             b: 1,
         },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 0);
 }
 
 #[test]
 fn test_fcmp_eq_ne_lt_le() {
-    let schema = make_schema(0, &[8, 10, 10]);
+    let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::F64, type_code::F64]);
     let a_bits = float_to_bits(3.14);
     let b_bits = float_to_bits(2.0);
-    let batch = make_int_batch(&schema, &[(1, 1, 0, &[a_bits, b_bits])]);
-    let mb = batch.as_mem_batch();
+    let mb = make_int_view(&schema, &[(1, 0, &[a_bits, b_bits])]);
 
     // FCMP_EQ: 3.14 == 3.14 → 1
     let instrs = vec![
@@ -664,8 +640,8 @@ fn test_fcmp_eq_ne_lt_le() {
             b: 1,
         },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 1);
 
     // FCMP_EQ: 3.14 == 2.0 → 0
@@ -679,8 +655,8 @@ fn test_fcmp_eq_ne_lt_le() {
             b: 1,
         },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 0);
 
     // FCMP_NE: 3.14 != 2.0 → 1
@@ -694,8 +670,8 @@ fn test_fcmp_eq_ne_lt_le() {
             b: 1,
         },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 1);
 
     // FCMP_LT: 2.0 < 3.14 → 1
@@ -709,8 +685,8 @@ fn test_fcmp_eq_ne_lt_le() {
             b: 1,
         },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 1);
 
     // FCMP_LE: 2.0 <= 2.0 → 1
@@ -724,8 +700,8 @@ fn test_fcmp_eq_ne_lt_le() {
             b: 1,
         },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 1);
 
     // FCMP_GE: 2.0 >= 3.14 → 0
@@ -739,23 +715,15 @@ fn test_fcmp_eq_ne_lt_le() {
             b: 1,
         },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 0);
 }
 
 #[test]
 fn test_string_lt_le_const() {
-    let schema = make_schema(0, &[8, 11]);
-    let mut batch = Batch::with_capacity(schema, 1);
-    batch.count = 0;
-    batch.extend_pk(1u128);
-    batch.extend_weight(&1i64.to_le_bytes());
-    batch.extend_null_bmp(&0u64.to_le_bytes());
-    let gs = gnitz_wire::encode_german_string(b"hello", &mut batch.blob);
-    batch.extend_col(0, &gs);
-    batch.count = 1;
-    let mb = batch.as_mem_batch();
+    let schema = schema_pk_strings(1, true);
+    let mb = make_string_view(&schema, &[&[b"hello".as_slice()]]);
 
     // STR_COL_LT_CONST: "hello" < "world" → 1
     let instrs = vec![LogicalInstr::StrColConst {
@@ -764,8 +732,8 @@ fn test_string_lt_le_const() {
         col: 1,
         const_idx: 0,
     }];
-    let prog = make_prog(&schema, instrs, 1, 0, vec![b"world".to_vec()]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 1, 0, vec![b"world".to_vec()]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 1);
 
     // STR_COL_LT_CONST: "hello" < "hello" → 0
@@ -775,8 +743,8 @@ fn test_string_lt_le_const() {
         col: 1,
         const_idx: 0,
     }];
-    let prog = make_prog(&schema, instrs, 1, 0, vec![b"hello".to_vec()]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 1, 0, vec![b"hello".to_vec()]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 0);
 
     // STR_COL_LE_CONST: "hello" <= "hello" → 1
@@ -786,8 +754,8 @@ fn test_string_lt_le_const() {
         col: 1,
         const_idx: 0,
     }];
-    let prog = make_prog(&schema, instrs, 1, 0, vec![b"hello".to_vec()]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 1, 0, vec![b"hello".to_vec()]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 1);
 
     // STR_COL_LE_CONST: "hello" <= "hella" → 0
@@ -797,38 +765,23 @@ fn test_string_lt_le_const() {
         col: 1,
         const_idx: 0,
     }];
-    let prog = make_prog(&schema, instrs, 1, 0, vec![b"hella".to_vec()]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 1, 0, vec![b"hella".to_vec()]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 0);
 }
 
 #[test]
 fn test_string_col_eq_col() {
     // Schema: pk(U64), str_a(STRING), str_b(STRING)
-    let schema = make_schema(0, &[8, 11, 11]);
-    let mut batch = Batch::with_capacity(schema, 2);
-    batch.count = 0;
-
-    // Row 0: str_a="abc", str_b="abc" (equal)
-    batch.extend_pk(1u128);
-    batch.extend_weight(&1i64.to_le_bytes());
-    batch.extend_null_bmp(&0u64.to_le_bytes());
-    let gs_a = gnitz_wire::encode_german_string(b"abc", &mut batch.blob);
-    batch.extend_col(0, &gs_a);
-    let gs_b = gnitz_wire::encode_german_string(b"abc", &mut batch.blob);
-    batch.extend_col(1, &gs_b);
-    batch.count += 1;
-
-    // Row 1: str_a="abc", str_b="xyz" (not equal)
-    batch.extend_pk(2u128);
-    batch.extend_weight(&1i64.to_le_bytes());
-    batch.extend_null_bmp(&0u64.to_le_bytes());
-    batch.extend_col(0, &gs_a);
-    let gs_c = gnitz_wire::encode_german_string(b"xyz", &mut batch.blob);
-    batch.extend_col(1, &gs_c);
-    batch.count += 1;
-
-    let mb = batch.as_mem_batch();
+    let schema = schema_pk_strings(2, true);
+    // Row 0: str_a="abc", str_b="abc" (equal). Row 1: "abc" vs "xyz".
+    let mb = make_string_view(
+        &schema,
+        &[
+            &[b"abc".as_slice(), b"abc".as_slice()],
+            &[b"abc".as_slice(), b"xyz".as_slice()],
+        ],
+    );
 
     // Row 0: col1 == col2 → 1
     let instrs = vec![LogicalInstr::StrColCol {
@@ -837,22 +790,21 @@ fn test_string_col_eq_col() {
         col_a: 1,
         col_b: 2,
     }];
-    let prog = make_prog(&schema, instrs, 1, 0, vec![]);
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 1);
 
     // Row 1: col1 == col2 → 0
-    let (val, _) = eval_predicate(&prog, &mb, 1);
+    let (val, _) = prog.eval_row(&mb, 1);
     assert_eq!(val, 0);
 }
 
 #[test]
 fn test_complex_predicate() {
     // Schema: pk(U64), a(I64), b(I64), c(I64)
-    let schema = make_schema(0, &[8, 9, 9, 9]);
+    let schema = schema_pk_ints(3, true);
     // Row: a=15, b=50, c=42
-    let batch = make_int_batch(&schema, &[(1, 1, 0, &[15, 50, 42])]);
-    let mb = batch.as_mem_batch();
+    let mb = make_int_view(&schema, &[(1, 0, &[15, 50, 42])]);
 
     // (a > 10 AND b < 100) OR c == 42
     // r0=col1(a), r1=10, r2=(a>10), r3=col2(b), r4=100, r5=(b<100)
@@ -885,29 +837,28 @@ fn test_complex_predicate() {
         }, // r9 = (42 == 42) = 1
         LogicalInstr::BoolOr { dst: 10, a: 6, b: 9 }, // r10 = (1 OR 1) = 1
     ];
-    let prog = make_prog(&schema, instrs, 11, 10, vec![]);
-    let (val, is_null) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 11, 10, vec![]);
+    let (val, is_null) = prog.eval_row(&mb, 0);
     assert_eq!(val, 1);
     assert!(!is_null);
 
     // Test with a=5 (a>10 false), b=50, c=99 (c==42 false) → false
-    let batch2 = make_int_batch(&schema, &[(1, 1, 0, &[5, 50, 99])]);
-    let mb2 = batch2.as_mem_batch();
-    let (val, _) = eval_predicate(&prog, &mb2, 0);
+    let batch2 = make_int_view(&schema, &[(1, 0, &[5, 50, 99])]);
+    let mb2 = batch2;
+    let (val, _) = prog.eval_row(&mb2, 0);
     assert_eq!(val, 0);
 }
 
 #[test]
 fn test_zero_regs_program() {
     // A program with num_regs=0 (pure COPY_COL) must not crash.
-    let schema = make_schema(0, &[8, 9]);
-    let batch = make_int_batch(&schema, &[(1, 1, 0, &[100])]);
-    let mb = batch.as_mem_batch();
+    let schema = schema_pk_ints(1, true);
+    let mb = make_int_view(&schema, &[(1, 0, &[100])]);
 
     // One COPY_COL instruction: copy col 1 → payload 0 (source type derived in resolve)
     let instrs = vec![LogicalInstr::CopyCol { src_col: 1, out: 0 }];
-    let prog = make_prog(&schema, instrs, 0, 0, vec![]);
-    let (val, is_null) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 0, 0, vec![]);
+    let (val, is_null) = prog.eval_row(&mb, 0);
     // With num_regs=0, result should be (0, true) — sentinel
     assert_eq!(val, 0);
     assert!(is_null);
@@ -916,30 +867,29 @@ fn test_zero_regs_program() {
 #[test]
 fn test_resolve_column_indices_pk_at_col0() {
     // Schema: pk=col0(U64), col1=I64, col2=I64
-    let schema = make_schema(0, &[8, 9, 9]);
-    let batch = make_int_batch(&schema, &[(42, 1, 0, &[10, 20])]);
-    let mb = batch.as_mem_batch();
+    let schema = schema_pk_ints(2, true);
+    let mb = make_int_view(&schema, &[(42, 0, &[10, 20])]);
 
     // LOAD_COL_INT of pk column → LoadPk
     let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 0 }]; // col 0 = pk
-    let prog = LogicalProgram::new(instrs, 1, 0, vec![]).resolve(&schema, false);
-    assert!(matches!(prog.instrs[0], Instr::LoadPk { .. }));
-    let (val, is_null) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
+    assert!(matches!(prog.prog.instrs[0], Instr::LoadPk { .. }));
+    let (val, is_null) = prog.eval_row(&mb, 0);
     assert_eq!(val, 42);
     assert!(!is_null);
 
     // LOAD_COL_INT of col1 (logical 1) → LoadPayloadInt, physical 0
     let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 1 }];
-    let prog = LogicalProgram::new(instrs, 1, 0, vec![]).resolve(&schema, false);
-    assert!(matches!(prog.instrs[0], Instr::LoadPayloadInt { pi: 0, .. }));
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
+    assert!(matches!(prog.prog.instrs[0], Instr::LoadPayloadInt { pi: 0, .. }));
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 10);
 
     // LOAD_COL_INT of col2 (logical 2) → LoadPayloadInt, physical 1
     let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 2 }];
-    let prog = LogicalProgram::new(instrs, 1, 0, vec![]).resolve(&schema, false);
-    assert!(matches!(prog.instrs[0], Instr::LoadPayloadInt { pi: 1, .. }));
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
+    assert!(matches!(prog.prog.instrs[0], Instr::LoadPayloadInt { pi: 1, .. }));
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 20);
 }
 
@@ -947,29 +897,28 @@ fn test_resolve_column_indices_pk_at_col0() {
 fn test_resolve_column_indices_pk_at_middle() {
     // Schema: col0=I64, pk=col1(U64), col2=I64
     // Physical payload layout: [col0=payload0, col2=payload1]
-    let schema = make_schema(1, &[9, 8, 9]);
-    let batch = make_int_batch(&schema, &[(99, 1, 0, &[5, 7])]);
-    let mb = batch.as_mem_batch();
+    let schema = TestSchema::with_pk_at(1, &[type_code::I64, type_code::U64, type_code::I64]);
+    let mb = make_int_view(&schema, &[(99, 0, &[5, 7])]);
 
     // col0 (logical 0, before pk) → LoadPayloadInt, physical 0
     let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 0 }];
-    let prog = LogicalProgram::new(instrs, 1, 0, vec![]).resolve(&schema, false);
-    assert!(matches!(prog.instrs[0], Instr::LoadPayloadInt { pi: 0, .. }));
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
+    assert!(matches!(prog.prog.instrs[0], Instr::LoadPayloadInt { pi: 0, .. }));
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 5);
 
     // col1 (logical 1 = pk) → LoadPk
     let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 1 }];
-    let prog = LogicalProgram::new(instrs, 1, 0, vec![]).resolve(&schema, false);
-    assert!(matches!(prog.instrs[0], Instr::LoadPk { .. }));
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
+    assert!(matches!(prog.prog.instrs[0], Instr::LoadPk { .. }));
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 99);
 
     // col2 (logical 2, after pk) → LoadPayloadInt, physical 1
     let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 2 }];
-    let prog = LogicalProgram::new(instrs, 1, 0, vec![]).resolve(&schema, false);
-    assert!(matches!(prog.instrs[0], Instr::LoadPayloadInt { pi: 1, .. }));
-    let (val, _) = eval_predicate(&prog, &mb, 0);
+    let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
+    assert!(matches!(prog.prog.instrs[0], Instr::LoadPayloadInt { pi: 1, .. }));
+    let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 7);
 }
 
@@ -978,22 +927,22 @@ fn test_is_strictly_non_nullable_str_col() {
     // STR_COL_*_CONST and STR_COL_*_COL must flip no_nulls off when any
     // operand column is nullable; without that, the batch path skips null-bit
     // tracking and null rows leak through string predicates as definite results.
-    let nullable_schema = {
-        let cols = [
-            SchemaColumn::new(crate::schema::type_code::U64, 0),
-            SchemaColumn::new(crate::schema::type_code::STRING, 1),
-            SchemaColumn::new(crate::schema::type_code::STRING, 1),
-        ];
-        SchemaDescriptor::new(&cols, &[0])
-    };
-    let nonnull_schema = {
-        let cols = [
-            SchemaColumn::new(crate::schema::type_code::U64, 0),
-            SchemaColumn::new(crate::schema::type_code::STRING, 0),
-            SchemaColumn::new(crate::schema::type_code::STRING, 0),
-        ];
-        SchemaDescriptor::new(&cols, &[0])
-    };
+    let nullable_schema = TestSchema::new(
+        &[
+            (type_code::U64, false),
+            (type_code::STRING, true),
+            (type_code::STRING, true),
+        ],
+        &[0],
+    );
+    let nonnull_schema = TestSchema::new(
+        &[
+            (type_code::U64, false),
+            (type_code::STRING, false),
+            (type_code::STRING, false),
+        ],
+        &[0],
+    );
 
     // STR_COL_*_CONST on col1
     for (op, _name) in &[
@@ -1007,10 +956,13 @@ fn test_is_strictly_non_nullable_str_col() {
             col: 1,
             const_idx: 0,
         }];
-        let prog = make_prog(&nullable_schema, instrs.clone(), 1, 0, vec![b"x".to_vec()]);
-        assert!(!prog.no_nulls, "{_name}: nullable col1 must yield no_nulls=false");
-        let prog = make_prog(&nonnull_schema, instrs, 1, 0, vec![b"x".to_vec()]);
-        assert!(prog.no_nulls, "{_name}: non-nullable col1 must yield no_nulls=true");
+        let prog = scalar_prog(&nullable_schema, instrs.clone(), 1, 0, vec![b"x".to_vec()]);
+        assert!(!prog.prog.no_nulls, "{_name}: nullable col1 must yield no_nulls=false");
+        let prog = scalar_prog(&nonnull_schema, instrs, 1, 0, vec![b"x".to_vec()]);
+        assert!(
+            prog.prog.no_nulls,
+            "{_name}: non-nullable col1 must yield no_nulls=true"
+        );
     }
 
     // STR_COL_*_COL — both operands matter
@@ -1021,36 +973,28 @@ fn test_is_strictly_non_nullable_str_col() {
             col_a: 1,
             col_b: 2,
         }];
-        let prog = make_prog(&nullable_schema, instrs.clone(), 1, 0, vec![]);
-        assert!(!prog.no_nulls, "{_name}: nullable operands must yield no_nulls=false");
-        let prog = make_prog(&nonnull_schema, instrs, 1, 0, vec![]);
-        assert!(prog.no_nulls, "{_name}: non-nullable operands must yield no_nulls=true");
+        let prog = scalar_prog(&nullable_schema, instrs.clone(), 1, 0, vec![]);
+        assert!(
+            !prog.prog.no_nulls,
+            "{_name}: nullable operands must yield no_nulls=false"
+        );
+        let prog = scalar_prog(&nonnull_schema, instrs, 1, 0, vec![]);
+        assert!(
+            prog.prog.no_nulls,
+            "{_name}: non-nullable operands must yield no_nulls=true"
+        );
     }
 }
 
-/// Build a 16-byte inline German String struct for use in test batches.
-fn make_german_string(s: &[u8]) -> [u8; 16] {
-    assert!(s.len() <= 12, "test helper only handles inline strings (≤ 12 bytes)");
-    gnitz_wire::encode_german_string(s, &mut Vec::new())
-}
-
-/// Build a 1-row batch with the given schema, containing `s` as the first payload column.
-fn make_single_string_batch(schema: SchemaDescriptor, s: &[u8]) -> Batch {
-    let gs = make_german_string(s);
-    let mut batch = Batch::with_capacity(schema, 1);
-    batch.count = 0;
-    batch.extend_pk(1u128);
-    batch.extend_weight(&1i64.to_le_bytes());
-    batch.extend_null_bmp(&0u64.to_le_bytes());
-    batch.extend_col(0, &gs);
-    batch.count = 1;
-    batch
+/// Build a 1-row view with the given schema, containing `s` as the first payload column.
+fn make_single_string_batch(schema: &TestSchema, s: &[u8]) -> TestView {
+    make_string_view(schema, &[&[s]])
 }
 
 #[test]
 fn test_string_prefix_ordering() {
     // Schema: pk=col0(U64), col1=STRING
-    let schema = make_schema(0, &[8, 11]);
+    let schema = schema_pk_strings(1, true);
 
     // (col_string, const_string, expected_lt)
     let cases: &[(&[u8], &[u8], bool)] = &[
@@ -1076,16 +1020,15 @@ fn test_string_prefix_ordering() {
     ];
 
     for &(col_s, const_s, expected_lt) in cases {
-        let batch = make_single_string_batch(schema, col_s);
-        let mb = batch.as_mem_batch();
+        let mb = make_single_string_batch(&schema, col_s);
         let instrs = vec![LogicalInstr::StrColConst {
             op: StrOp::Lt,
             dst: 0,
             col: 1,
             const_idx: 0,
         }];
-        let prog = make_prog(&schema, instrs, 1, 0, vec![const_s.to_vec()]);
-        let (val, _) = eval_predicate(&prog, &mb, 0);
+        let prog = scalar_prog(&schema, instrs, 1, 0, vec![const_s.to_vec()]);
+        let (val, _) = prog.eval_row(&mb, 0);
         assert_eq!(
             val != 0,
             expected_lt,
@@ -1101,81 +1044,80 @@ fn test_string_prefix_ordering() {
 #[test]
 fn test_bool_and_or_three_valued_logic() {
     // Schema: pk(U64), col1(I64), col2(I64) — both nullable
-    let schema = make_schema(0, &[8, 9, 9]);
+    let schema = schema_pk_ints(2, true);
     // null_word bits: bit 0 = col1 null, bit 1 = col2 null
-    let batch = make_int_batch(
+    let mb = make_int_view(
         &schema,
         &[
-            (1, 1, 0, &[1, 0]), // row0: T, F
-            (2, 1, 0, &[0, 1]), // row1: F, T
-            (3, 1, 2, &[1, 0]), // row2: T, NULL
-            (4, 1, 2, &[0, 0]), // row3: F, NULL
-            (5, 1, 1, &[0, 1]), // row4: NULL, T
-            (6, 1, 1, &[0, 0]), // row5: NULL, F
-            (7, 1, 3, &[0, 0]), // row6: NULL, NULL
+            (1, 0, &[1, 0]), // row0: T, F
+            (2, 0, &[0, 1]), // row1: F, T
+            (3, 2, &[1, 0]), // row2: T, NULL
+            (4, 2, &[0, 0]), // row3: F, NULL
+            (5, 1, &[0, 1]), // row4: NULL, T
+            (6, 1, &[0, 0]), // row5: NULL, F
+            (7, 3, &[0, 0]), // row6: NULL, NULL
         ],
     );
-    let mb = batch.as_mem_batch();
 
     let and_instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 },
         LogicalInstr::LoadColInt { dst: 1, col: 2 },
         LogicalInstr::BoolAnd { dst: 2, a: 0, b: 1 },
     ];
-    let and_prog = make_prog(&schema, and_instrs, 3, 2, vec![]);
+    let and_prog = scalar_prog(&schema, and_instrs, 3, 2, vec![]);
 
     let or_instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 },
         LogicalInstr::LoadColInt { dst: 1, col: 2 },
         LogicalInstr::BoolOr { dst: 2, a: 0, b: 1 },
     ];
-    let or_prog = make_prog(&schema, or_instrs, 3, 2, vec![]);
+    let or_prog = scalar_prog(&schema, or_instrs, 3, 2, vec![]);
 
     // AND cases
-    let (v, n) = eval_predicate(&and_prog, &mb, 0);
+    let (v, n) = and_prog.eval_row(&mb, 0);
     assert_eq!(v, 0, "T AND F = F");
     assert!(!n);
-    let (v, n) = eval_predicate(&and_prog, &mb, 1);
+    let (v, n) = and_prog.eval_row(&mb, 1);
     assert_eq!(v, 0, "F AND T = F");
     assert!(!n);
-    let (_, n) = eval_predicate(&and_prog, &mb, 2);
+    let (_, n) = and_prog.eval_row(&mb, 2);
     assert!(n, "T AND NULL = NULL");
-    let (v, n) = eval_predicate(&and_prog, &mb, 3);
+    let (v, n) = and_prog.eval_row(&mb, 3);
     assert_eq!(v, 0, "F AND NULL = F");
     assert!(!n, "F AND NULL must not be null (SQL 3VL)");
-    let (_, n) = eval_predicate(&and_prog, &mb, 4);
+    let (_, n) = and_prog.eval_row(&mb, 4);
     assert!(n, "NULL AND T = NULL");
-    let (v, n) = eval_predicate(&and_prog, &mb, 5);
+    let (v, n) = and_prog.eval_row(&mb, 5);
     assert_eq!(v, 0, "NULL AND F = F");
     assert!(!n, "NULL AND F must not be null (SQL 3VL)");
-    let (_, n) = eval_predicate(&and_prog, &mb, 6);
+    let (_, n) = and_prog.eval_row(&mb, 6);
     assert!(n, "NULL AND NULL = NULL");
 
     // OR cases
-    let (v, n) = eval_predicate(&or_prog, &mb, 0);
+    let (v, n) = or_prog.eval_row(&mb, 0);
     assert_eq!(v, 1, "T OR F = T");
     assert!(!n);
-    let (v, n) = eval_predicate(&or_prog, &mb, 1);
+    let (v, n) = or_prog.eval_row(&mb, 1);
     assert_eq!(v, 1, "F OR T = T");
     assert!(!n);
-    let (v, n) = eval_predicate(&or_prog, &mb, 2);
+    let (v, n) = or_prog.eval_row(&mb, 2);
     assert_eq!(v, 1, "T OR NULL = T");
     assert!(!n, "T OR NULL must not be null (SQL 3VL)");
-    let (_, n) = eval_predicate(&or_prog, &mb, 3);
+    let (_, n) = or_prog.eval_row(&mb, 3);
     assert!(n, "F OR NULL = NULL");
-    let (v, n) = eval_predicate(&or_prog, &mb, 4);
+    let (v, n) = or_prog.eval_row(&mb, 4);
     assert_eq!(v, 1, "NULL OR T = T");
     assert!(!n, "NULL OR T must not be null (SQL 3VL)");
-    let (_, n) = eval_predicate(&or_prog, &mb, 5);
+    let (_, n) = or_prog.eval_row(&mb, 5);
     assert!(n, "NULL OR F = NULL");
-    let (_, n) = eval_predicate(&or_prog, &mb, 6);
+    let (_, n) = or_prog.eval_row(&mb, 6);
     assert!(n, "NULL OR NULL = NULL");
 }
 
 #[test]
 fn test_string_prefix_le_ordering() {
     // Spot-check LE (≤) to cover the equality boundary
-    let schema = make_schema(0, &[8, 11]);
+    let schema = schema_pk_strings(1, true);
 
     let cases: &[(&[u8], &[u8], bool)] = &[
         (b"abc", b"abc", true),   // equal → le
@@ -1189,16 +1131,15 @@ fn test_string_prefix_le_ordering() {
     ];
 
     for &(col_s, const_s, expected_le) in cases {
-        let batch = make_single_string_batch(schema, col_s);
-        let mb = batch.as_mem_batch();
+        let mb = make_single_string_batch(&schema, col_s);
         let instrs = vec![LogicalInstr::StrColConst {
             op: StrOp::Le,
             dst: 0,
             col: 1,
             const_idx: 0,
         }];
-        let prog = make_prog(&schema, instrs, 1, 0, vec![const_s.to_vec()]);
-        let (val, _) = eval_predicate(&prog, &mb, 0);
+        let prog = scalar_prog(&schema, instrs, 1, 0, vec![const_s.to_vec()]);
+        let (val, _) = prog.eval_row(&mb, 0);
         assert_eq!(
             val != 0,
             expected_le,
@@ -1220,7 +1161,7 @@ fn test_string_prefix_le_ordering() {
 #[test]
 fn test_select_truth_table() {
     // Schema: pk(u64), cond(i64), a(i64), b(i64).
-    let schema = make_schema(0, &[8, 9, 9, 9]);
+    let schema = schema_pk_ints(3, true);
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 }, // cond
         LogicalInstr::LoadColInt { dst: 1, col: 2 }, // a
@@ -1232,23 +1173,23 @@ fn test_select_truth_table() {
             b: 2,
         },
     ];
-    let prog = make_prog(&schema, instrs, 4, 3, vec![]);
+    let prog = scalar_prog(&schema, instrs, 4, 3, vec![]);
 
     // cond=1 (truthy) → a=100
-    let batch = make_int_batch(&schema, &[(1, 1, 0, &[1, 100, 200])]);
-    let (v, n) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    let batch = make_int_view(&schema, &[(1, 0, &[1, 100, 200])]);
+    let (v, n) = prog.eval_row(&batch, 0);
     assert!(!n);
     assert_eq!(v, 100, "truthy cond takes a");
 
     // cond=0 (false) → b=200
-    let batch = make_int_batch(&schema, &[(1, 1, 0, &[0, 100, 200])]);
-    let (v, n) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    let batch = make_int_view(&schema, &[(1, 0, &[0, 100, 200])]);
+    let (v, n) = prog.eval_row(&batch, 0);
     assert!(!n);
     assert_eq!(v, 200, "false cond takes b");
 
     // cond=NULL → b=200 (null_word bit 0 = cond/col1); value 7 is truthy but masked.
-    let batch = make_int_batch(&schema, &[(1, 1, 1, &[7, 100, 200])]);
-    let (v, n) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    let batch = make_int_view(&schema, &[(1, 1, &[7, 100, 200])]);
+    let (v, n) = prog.eval_row(&batch, 0);
     assert!(!n);
     assert_eq!(v, 200, "NULL cond falls to else (b), not a");
 }
@@ -1257,7 +1198,7 @@ fn test_select_truth_table() {
 /// irrelevant.
 #[test]
 fn test_select_null_bit_blend() {
-    let schema = make_schema(0, &[8, 9, 9, 9]);
+    let schema = schema_pk_ints(3, true);
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 }, // cond
         LogicalInstr::LoadColInt { dst: 1, col: 2 }, // a
@@ -1269,22 +1210,22 @@ fn test_select_null_bit_blend() {
             b: 2,
         },
     ];
-    let prog = make_prog(&schema, instrs, 4, 3, vec![]);
+    let prog = scalar_prog(&schema, instrs, 4, 3, vec![]);
 
     // cond truthy, a NULL (payload bit 1) → result NULL.
-    let batch = make_int_batch(&schema, &[(1, 1, 0b010, &[1, 0, 200])]);
-    let (_, n) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    let batch = make_int_view(&schema, &[(1, 0b010, &[1, 0, 200])]);
+    let (_, n) = prog.eval_row(&batch, 0);
     assert!(n, "truthy cond + NULL a → NULL");
 
     // cond truthy, b NULL (payload bit 2), a non-null → result = a; b's null ignored.
-    let batch = make_int_batch(&schema, &[(1, 1, 0b100, &[1, 55, 0])]);
-    let (v, n) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    let batch = make_int_view(&schema, &[(1, 0b100, &[1, 55, 0])]);
+    let (v, n) = prog.eval_row(&batch, 0);
     assert!(!n, "truthy cond ignores b's null");
     assert_eq!(v, 55);
 
     // cond false, b NULL → result NULL.
-    let batch = make_int_batch(&schema, &[(1, 1, 0b100, &[0, 55, 0])]);
-    let (_, n) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    let batch = make_int_view(&schema, &[(1, 0b100, &[0, 55, 0])]);
+    let (_, n) = prog.eval_row(&batch, 0);
     assert!(n, "false cond + NULL b → NULL");
 }
 
@@ -1292,7 +1233,7 @@ fn test_select_null_bit_blend() {
 /// `select(cond, 42, load_null())`: truthy → 42, else → NULL.
 #[test]
 fn test_load_null_else_branch_eval() {
-    let schema = make_schema(0, &[8, 9]);
+    let schema = schema_pk_ints(1, true);
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 }, // cond
         LogicalInstr::LoadConst { dst: 1, val: 42 }, // a
@@ -1304,22 +1245,22 @@ fn test_load_null_else_branch_eval() {
             b: 2,
         },
     ];
-    let prog = make_prog(&schema, instrs, 4, 3, vec![]);
+    let prog = scalar_prog(&schema, instrs, 4, 3, vec![]);
 
     // cond truthy → 42.
-    let batch = make_int_batch(&schema, &[(1, 1, 0, &[5])]);
-    let (v, n) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    let batch = make_int_view(&schema, &[(1, 0, &[5])]);
+    let (v, n) = prog.eval_row(&batch, 0);
     assert!(!n);
     assert_eq!(v, 42);
 
     // cond false → else NULL.
-    let batch = make_int_batch(&schema, &[(1, 1, 0, &[0])]);
-    let (_, n) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    let batch = make_int_view(&schema, &[(1, 0, &[0])]);
+    let (_, n) = prog.eval_row(&batch, 0);
     assert!(n, "false cond → else NULL");
 
     // cond NULL → else NULL.
-    let batch = make_int_batch(&schema, &[(1, 1, 1, &[9])]);
-    let (_, n) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    let batch = make_int_view(&schema, &[(1, 1, &[9])]);
+    let (_, n) = prog.eval_row(&batch, 0);
     assert!(n, "NULL cond → else NULL");
 }
 
@@ -1328,13 +1269,7 @@ fn test_load_null_else_branch_eval() {
 /// a NULL.
 #[test]
 fn test_load_null_forces_nullable_path() {
-    let nonnull_schema = {
-        let cols = [
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0), // NOT NULL
-        ];
-        SchemaDescriptor::new(&cols, &[0])
-    };
+    let nonnull_schema = TestSchema::new(&[(type_code::U64, false), (type_code::I64, false)], &[0]);
     // CASE WHEN col1 THEN col1 END: r0=col1, r1=load_null, r2=select(r0, r0, r1).
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 },
@@ -1346,23 +1281,23 @@ fn test_load_null_forces_nullable_path() {
             b: 1,
         },
     ];
-    let prog = make_prog(&nonnull_schema, instrs, 3, 2, vec![]);
-    assert!(!prog.no_nulls, "LoadNull must force the nullable path");
+    let prog = scalar_prog(&nonnull_schema, instrs, 3, 2, vec![]);
+    assert!(!prog.prog.no_nulls, "LoadNull must force the nullable path");
 }
 
 /// A Select over only NOT NULL branches (no LoadNull) stays strictly-non-nullable:
 /// Select copies branch values and adds no NULL of its own.
 #[test]
 fn test_select_non_nullable_when_branches_non_nullable() {
-    let nonnull_schema = {
-        let cols = [
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ];
-        SchemaDescriptor::new(&cols, &[0])
-    };
+    let nonnull_schema = TestSchema::new(
+        &[
+            (type_code::U64, false),
+            (type_code::I64, false),
+            (type_code::I64, false),
+            (type_code::I64, false),
+        ],
+        &[0],
+    );
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 },
         LogicalInstr::LoadColInt { dst: 1, col: 2 },
@@ -1374,9 +1309,9 @@ fn test_select_non_nullable_when_branches_non_nullable() {
             b: 2,
         },
     ];
-    let prog = make_prog(&nonnull_schema, instrs, 4, 3, vec![]);
+    let prog = scalar_prog(&nonnull_schema, instrs, 4, 3, vec![]);
     assert!(
-        prog.no_nulls,
+        prog.prog.no_nulls,
         "Select over NOT NULL branches must stay strictly-non-nullable"
     );
 }
@@ -1386,7 +1321,7 @@ fn test_select_non_nullable_when_branches_non_nullable() {
 #[test]
 fn test_select_u64_propagation() {
     // Schema: pk(u64), u64col(U64), i64col(I64).
-    let schema = make_schema(0, &[8, 8, 9]);
+    let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::U64, type_code::I64]);
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 2 }, // cond (i64)
         LogicalInstr::LoadColInt { dst: 1, col: 1 }, // a (U64)
@@ -1405,10 +1340,10 @@ fn test_select_u64_propagation() {
             b: 4,
         },
     ];
-    let prog = make_prog(&schema, instrs, 6, 5, vec![]);
+    let prog = scalar_prog(&schema, instrs, 6, 5, vec![]);
     assert!(
         matches!(
-            prog.instrs[5],
+            prog.prog.instrs[5],
             Instr::Cmp {
                 op: CmpOp::Gt,
                 signed: false,
@@ -1423,7 +1358,7 @@ fn test_select_u64_propagation() {
 /// AND as a bool_input, and the select dst (a value register) is never bit_only.
 #[test]
 fn test_select_classification() {
-    let schema = make_schema(0, &[8, 9, 9, 9, 9]);
+    let schema = schema_pk_ints(4, true);
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 }, // cond
         LogicalInstr::LoadColInt { dst: 1, col: 2 }, // a
@@ -1437,8 +1372,10 @@ fn test_select_classification() {
         LogicalInstr::LoadColInt { dst: 4, col: 4 }, // other bool
         LogicalInstr::BoolAnd { dst: 5, a: 3, b: 4 },
     ];
-    let prog = LogicalProgram::new(instrs, 6, 5, vec![]).resolve(&schema, /* is_filter = */ true);
-    let (bit_only, bool_input) = prog.classify_registers(true);
+    let prog = filter_prog(&schema, instrs, 6, 5, vec![]);
+    let RegisterRoles {
+        bit_only, bool_input, ..
+    } = classify_registers(&prog.prog.instrs, 5, true);
     assert_ne!(bool_input & (1 << 0), 0, "cond is read as a bool_input");
     assert_ne!(bool_input & (1 << 3), 0, "select result feeds BOOL_AND as bool_input");
     assert_eq!(bit_only & (1 << 3), 0, "select dst is a value register, never bit_only");
@@ -1467,7 +1404,7 @@ fn test_select_dst_alias_panics() {
 #[test]
 fn test_select_nesting() {
     // Schema: pk, c1, c2, v1, v2, v3.
-    let schema = make_schema(0, &[8, 9, 9, 9, 9, 9]);
+    let schema = schema_pk_ints(5, true);
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 }, // c1
         LogicalInstr::LoadColInt { dst: 1, col: 2 }, // c2
@@ -1487,19 +1424,19 @@ fn test_select_nesting() {
             b: 5,
         }, // outer = c1 ? v1 : inner
     ];
-    let prog = make_prog(&schema, instrs, 7, 6, vec![]);
+    let prog = scalar_prog(&schema, instrs, 7, 6, vec![]);
     // payload cols: c1, c2, v1=10, v2=20, v3=30.
     // c1 truthy → v1.
-    let batch = make_int_batch(&schema, &[(1, 1, 0, &[1, 1, 10, 20, 30])]);
-    let (v, _) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    let batch = make_int_view(&schema, &[(1, 0, &[1, 1, 10, 20, 30])]);
+    let (v, _) = prog.eval_row(&batch, 0);
     assert_eq!(v, 10, "c1 truthy → v1");
     // c1 false, c2 truthy → v2.
-    let batch = make_int_batch(&schema, &[(1, 1, 0, &[0, 1, 10, 20, 30])]);
-    let (v, _) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    let batch = make_int_view(&schema, &[(1, 0, &[0, 1, 10, 20, 30])]);
+    let (v, _) = prog.eval_row(&batch, 0);
     assert_eq!(v, 20, "c1 false, c2 truthy → v2");
     // both false → v3.
-    let batch = make_int_batch(&schema, &[(1, 1, 0, &[0, 0, 10, 20, 30])]);
-    let (v, _) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    let batch = make_int_view(&schema, &[(1, 0, &[0, 0, 10, 20, 30])]);
+    let (v, _) = prog.eval_row(&batch, 0);
     assert_eq!(v, 30, "both false → else v3");
 }
 
@@ -1507,23 +1444,12 @@ fn test_select_nesting() {
 // AND-chain short-circuit detection (`compute_and_chain`)
 // ---------------------------------------------------------------------------
 
-/// Resolve `instrs` as a FILTER program (is_filter = true) so AND-chain
-/// detection runs; `make_prog` resolves as a map (is_filter = false).
-fn resolve_filter(
-    schema: &SchemaDescriptor,
-    instrs: Vec<LogicalInstr>,
-    num_regs: u32,
-    result_reg: u32,
-) -> ResolvedProgram {
-    LogicalProgram::new(instrs, num_regs, result_reg, vec![]).resolve(schema, /* is_filter = */ true)
-}
-
 /// `c1>1 AND c2>1 AND c3>1 AND c4>1`: a clean left-deep 4-clause chain (3 ANDs).
 /// The two non-terminal ANDs (dst reg 5, reg 8) are triggers; the terminal AND
 /// (dst reg 11 = result_reg) is not marked.
 #[test]
 fn and_chain_marks_nonterminal_ands() {
-    let schema = make_schema(0, &[8, 9, 9, 9, 9]); // PK + 4 nullable I64
+    let schema = schema_pk_ints(4, true); // PK + 4 nullable I64
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 },
         LogicalInstr::LoadConst { dst: 1, val: 1 },
@@ -1558,7 +1484,7 @@ fn and_chain_marks_nonterminal_ands() {
         }, // c4>1
         LogicalInstr::BoolAnd { dst: 11, a: 8, b: 10 }, // terminal (reg 11)
     ];
-    let prog = resolve_filter(&schema, instrs, 12, 11);
+    let prog = filter_prog(&schema, instrs, 12, 11, vec![]).prog;
     assert_eq!(prog.chain_trigger_mask, (1u64 << 5) | (1u64 << 8));
     assert_eq!(prog.chain_trigger_mask.count_ones(), 2);
 }
@@ -1567,7 +1493,7 @@ fn and_chain_marks_nonterminal_ands() {
 /// empty: the spine walk finds no upstream single-use AND.
 #[test]
 fn and_chain_single_and_empty_mask() {
-    let schema = make_schema(0, &[8, 9, 9]);
+    let schema = schema_pk_ints(2, true);
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 },
         LogicalInstr::LoadConst { dst: 1, val: 1 },
@@ -1586,7 +1512,7 @@ fn and_chain_single_and_empty_mask() {
         },
         LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 }, // terminal = result_reg
     ];
-    let prog = resolve_filter(&schema, instrs, 6, 5);
+    let prog = filter_prog(&schema, instrs, 6, 5, vec![]).prog;
     assert_eq!(prog.chain_trigger_mask, 0);
 }
 
@@ -1595,7 +1521,7 @@ fn and_chain_single_and_empty_mask() {
 /// (`NOT false = true`).
 #[test]
 fn and_chain_not_terminal_no_mask() {
-    let schema = make_schema(0, &[8, 9, 9]);
+    let schema = schema_pk_ints(2, true);
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 },
         LogicalInstr::LoadConst { dst: 1, val: 1 },
@@ -1615,7 +1541,7 @@ fn and_chain_not_terminal_no_mask() {
         LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 },
         LogicalInstr::BoolNot { dst: 6, a: 5 }, // result_reg
     ];
-    let prog = resolve_filter(&schema, instrs, 7, 6);
+    let prog = filter_prog(&schema, instrs, 7, 6, vec![]).prog;
     assert_eq!(prog.chain_trigger_mask, 0);
 }
 
@@ -1623,7 +1549,7 @@ fn and_chain_not_terminal_no_mask() {
 /// through an OR operand, not the accumulator spine — not a trigger.
 #[test]
 fn and_chain_or_terminal_no_mask() {
-    let schema = make_schema(0, &[8, 9, 9, 9]);
+    let schema = schema_pk_ints(3, true);
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 },
         LogicalInstr::LoadConst { dst: 1, val: 1 },
@@ -1650,7 +1576,7 @@ fn and_chain_or_terminal_no_mask() {
         },
         LogicalInstr::BoolOr { dst: 8, a: 5, b: 7 }, // result_reg
     ];
-    let prog = resolve_filter(&schema, instrs, 9, 8);
+    let prog = filter_prog(&schema, instrs, 9, 8, vec![]).prog;
     assert_eq!(prog.chain_trigger_mask, 0);
 }
 
@@ -1658,7 +1584,7 @@ fn and_chain_or_terminal_no_mask() {
 /// detection is gated on `is_filter`, matching where `bit_only_mask` is gated.
 #[test]
 fn and_chain_map_program_no_mask() {
-    let schema = make_schema(0, &[8, 9, 9, 9]);
+    let schema = schema_pk_ints(3, true);
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 },
         LogicalInstr::LoadConst { dst: 1, val: 1 },
@@ -1685,8 +1611,8 @@ fn and_chain_map_program_no_mask() {
         },
         LogicalInstr::BoolAnd { dst: 8, a: 5, b: 7 },
     ];
-    let prog = LogicalProgram::new(instrs, 9, 8, vec![]).resolve(&schema, /* is_filter = */ false);
-    assert_eq!(prog.chain_trigger_mask, 0);
+    let prog = scalar_prog(&schema, instrs, 9, 8, vec![]);
+    assert_eq!(prog.prog.chain_trigger_mask, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1770,7 +1696,7 @@ fn test_from_wire_rejects_const_idx_out_of_range() {
 #[test]
 fn test_validate_rejects_out_of_range_column() {
     // LOAD_COL_INT (1) col=200 against a 3-column schema.
-    let s3 = make_schema(0, &[8, 9, 9]);
+    let s3 = schema_pk_ints(2, true);
     let prog = LogicalProgram::from_wire(&[1, 0, 200, 0], 1, 0, vec![]).unwrap();
     assert_eq!(
         prog.validate(Some(&s3), None),
@@ -1784,13 +1710,7 @@ fn test_validate_rejects_out_of_range_column() {
 #[test]
 fn test_validate_rejects_pk_column_for_payload_only_opcode() {
     // Schema with a PK at column 0 (non-nullable) plus a payload string column.
-    let s_pk = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::STRING, 1),
-        ],
-        &[0],
-    );
+    let s_pk = TestSchema::new(&[(type_code::U64, false), (type_code::STRING, true)], &[0]);
     // Each payload-only opcode that routes a PK column to the pi=255 sentinel.
     let cases: &[(&[u32], Vec<Vec<u8>>)] = &[
         (&[2, 0, 0, 0], vec![]),               // LOAD_COL_FLOAT col0
@@ -1813,13 +1733,7 @@ fn test_validate_rejects_pk_column_for_payload_only_opcode() {
 fn test_validate_rejects_wide_column_register_load() {
     // LOAD_COL_INT on a 16-byte U128 column: rejected before it hits the
     // wide-register eval artefact (Part C).
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U128, 1),
-        ],
-        &[0],
-    );
+    let schema = TestSchema::new(&[(type_code::U64, false), (type_code::U128, true)], &[0]);
     let prog = LogicalProgram::from_wire(&[1, 0, 1, 0], 1, 0, vec![]).unwrap();
     assert_eq!(
         prog.validate(Some(&schema), None),
@@ -1838,7 +1752,7 @@ fn test_validate_rejects_wide_column_register_load() {
 #[test]
 fn test_validate_load_col_int_requires_fixed_int() {
     for tc in [type_code::F64, type_code::F32, 200, type_code::STRING] {
-        let schema = make_schema(0, &[type_code::U64, tc]);
+        let schema = TestSchema::with_pk_at(0, &[type_code::U64, tc]);
         let prog = LogicalProgram::from_wire(&[1, 0, 1, 0], 1, 0, vec![]).unwrap();
         assert_eq!(
             prog.validate(Some(&schema), None),
@@ -1861,7 +1775,7 @@ fn test_validate_load_col_int_requires_fixed_int() {
         type_code::U64,
         type_code::I64,
     ] {
-        let schema = make_schema(0, &[type_code::U64, tc]);
+        let schema = TestSchema::with_pk_at(0, &[type_code::U64, tc]);
         let prog = LogicalProgram::from_wire(&[1, 0, 1, 0], 1, 0, vec![]).unwrap();
         assert_eq!(prog.validate(Some(&schema), None), Ok(()), "type code {tc}");
     }
@@ -1873,7 +1787,7 @@ fn test_validate_load_col_int_requires_fixed_int() {
 #[test]
 fn test_validate_load_col_float_requires_float() {
     let case = |tc: u8| {
-        let schema = make_schema(0, &[type_code::U64, tc]);
+        let schema = TestSchema::with_pk_at(0, &[type_code::U64, tc]);
         LogicalProgram::from_wire(&[2, 0, 1, 0], 1, 0, vec![])
             .unwrap()
             .validate(Some(&schema), None)
@@ -1897,7 +1811,7 @@ fn test_validate_load_col_float_requires_float() {
 /// which over-reads (and eventually runs off) a narrower column's region.
 #[test]
 fn test_validate_str_opcodes_require_german_string() {
-    let schema = |a: u8, b: u8| make_schema(0, &[type_code::U64, a, b]);
+    let schema = |a: u8, b: u8| TestSchema::with_pk_at(0, &[type_code::U64, a, b]);
     // STR_COL_EQ_CONST (40) col=1.
     let vs_const = |a: u8| {
         LogicalProgram::from_wire(&[40, 0, 1, 0], 1, 0, vec![b"x".to_vec()])
@@ -1946,7 +1860,7 @@ fn test_validate_str_opcodes_require_german_string() {
 #[test]
 fn test_validate_null_tests_accept_any_payload_column() {
     for tc in [type_code::U128, type_code::STRING, type_code::F32] {
-        let schema = make_schema(0, &[type_code::U64, tc]);
+        let schema = TestSchema::with_pk_at(0, &[type_code::U64, tc]);
         for op in [30u32, 31] {
             let prog = LogicalProgram::from_wire(&[op, 0, 1, 0], 1, 0, vec![]).unwrap();
             assert_eq!(prog.validate(Some(&schema), None), Ok(()), "opcode {op} type {tc}");
@@ -1961,8 +1875,8 @@ fn test_validate_null_tests_accept_any_payload_column() {
 fn test_validate_copy_col_type_compatibility() {
     // in: [U64 PK, <src>]; out: [U64 PK, <dst>] — one payload slot each.
     let pair = |src: u8, dst: u8| {
-        let in_schema = make_schema(0, &[type_code::U64, src]);
-        let out_schema = make_schema(0, &[type_code::U64, dst]);
+        let in_schema = TestSchema::with_pk_at(0, &[type_code::U64, src]);
+        let out_schema = TestSchema::with_pk_at(0, &[type_code::U64, dst]);
         // COPY_COL (34) src_col=1 out=0.
         LogicalProgram::from_wire(&[34, 0, 1, 0], 0, 0, vec![])
             .unwrap()
@@ -2000,8 +1914,8 @@ fn test_validate_copy_col_type_compatibility() {
         );
     }
     // A PK source into a payload slot of the same type is a copy, not a promotion.
-    let in_pk = make_schema(0, &[type_code::U64, type_code::I64]);
-    let out_pk = make_schema(0, &[type_code::I64, type_code::U64]);
+    let in_pk = TestSchema::with_pk_at(0, &[type_code::U64, type_code::I64]);
+    let out_pk = TestSchema::with_pk_at(0, &[type_code::I64, type_code::U64]);
     let prog = LogicalProgram::from_wire(&[34, 0, 0, 0], 0, 0, vec![]).unwrap();
     assert_eq!(prog.validate(Some(&in_pk), Some(&out_pk)), Ok(()));
     // Both output-side checks are inert for a filter (`out_schema = None`).
@@ -2014,7 +1928,7 @@ fn test_validate_copy_col_type_compatibility() {
 fn test_validate_emit_slot_must_be_eight_bytes() {
     // out: [U64 PK, <slot>] — one payload slot, written by the single EMIT.
     let case = |tc: u8| {
-        let schema = make_schema(0, &[type_code::U64, tc]);
+        let schema = TestSchema::with_pk_at(0, &[type_code::U64, tc]);
         // EMIT (32) src=0 out=0.
         LogicalProgram::from_wire(&[32, 0, 0, 0], 1, 0, vec![])
             .unwrap()
@@ -2035,14 +1949,8 @@ fn test_validate_emit_slot_must_be_eight_bytes() {
 #[test]
 fn test_validate_output_index_map_vs_filter() {
     // in: [U64 PK, I64]; out: [U64 PK, I64] — one output payload slot.
-    let in_schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    );
-    let out_schema = in_schema;
+    let in_schema = TestSchema::new(&[(type_code::U64, false), (type_code::I64, false)], &[0]);
+    let out_schema = TestSchema::new(&[(type_code::U64, false), (type_code::I64, false)], &[0]);
     // COPY_COL (34) src_col=0 out=200: rejected as a MAP (out_schema Some).
     let prog = LogicalProgram::from_wire(&[34, 0, 0, 200], 0, 0, vec![]).unwrap();
     assert_eq!(
@@ -2063,11 +1971,11 @@ fn test_validate_output_index_map_vs_filter() {
 #[test]
 fn test_validate_rejects_unwritten_output_slot() {
     // in/out: [U64 PK, I64, I64] — two output payload slots.
-    let schema = SchemaDescriptor::new(
+    let schema = TestSchema::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            (type_code::U64, false),
+            (type_code::I64, false),
+            (type_code::I64, false),
         ],
         &[0],
     );
@@ -2124,8 +2032,8 @@ fn pack_i64_set(values: &[i64]) -> Vec<u8> {
 
 /// `r0 = col1; r1 = r0 IN set`, result_reg = 1 — the compiled shape of
 /// `col1 IN (…)`. `col_tc` picks col1's type (I64 / U64 / …).
-fn in_set_prog(col_tc: u8, set: &[i64]) -> (SchemaDescriptor, ResolvedProgram) {
-    let schema = make_schema(0, &[8, col_tc]); // col0 = PK(U64), col1 = col_tc
+fn in_set_prog(col_tc: u8, set: &[i64]) -> (TestSchema, Evaluator) {
+    let schema = TestSchema::with_pk_at(0, &[8, col_tc]); // col0 = PK(U64), col1 = col_tc
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 },
         LogicalInstr::IntInSet {
@@ -2134,7 +2042,7 @@ fn in_set_prog(col_tc: u8, set: &[i64]) -> (SchemaDescriptor, ResolvedProgram) {
             set_idx: 0,
         },
     ];
-    let prog = make_prog(&schema, instrs, 2, 1, vec![pack_i64_set(set)]);
+    let prog = scalar_prog(&schema, instrs, 2, 1, vec![pack_i64_set(set)]);
     (schema, prog)
 }
 
@@ -2143,16 +2051,16 @@ fn test_int_in_set_hit_miss_null() {
     let (schema, prog) = in_set_prog(9 /* I64 */, &[1, 3, 5, 42]);
 
     // Hit: 42 ∈ {1,3,5,42}.
-    let mb = make_int_batch(&schema, &[(1, 1, 0, &[42])]);
-    assert_eq!(eval_predicate(&prog, &mb.as_mem_batch(), 0), (1, false));
+    let mb = make_int_view(&schema, &[(1, 0, &[42])]);
+    assert_eq!(prog.eval_row(&mb, 0), (1, false));
 
     // Miss: 7 ∉ set.
-    let mb = make_int_batch(&schema, &[(1, 1, 0, &[7])]);
-    assert_eq!(eval_predicate(&prog, &mb.as_mem_batch(), 0), (0, false));
+    let mb = make_int_view(&schema, &[(1, 0, &[7])]);
+    assert_eq!(prog.eval_row(&mb, 0), (0, false));
 
     // NULL operand ⇒ NULL out (col1 is payload index 0 → null_word bit 0).
-    let mb = make_int_batch(&schema, &[(1, 1, 0b1, &[0])]);
-    let (_v, is_null) = eval_predicate(&prog, &mb.as_mem_batch(), 0);
+    let mb = make_int_view(&schema, &[(1, 0b1, &[0])]);
+    let (_v, is_null) = prog.eval_row(&mb, 0);
     assert!(is_null, "NULL operand must produce a NULL membership result");
 }
 
@@ -2162,11 +2070,11 @@ fn test_int_in_set_u64_neg_one_matches_max() {
     // folded literal -1 is i64 -1, so u64::MAX matches — same as the OR-chain's
     // bit-equal `col = -1`.
     let (schema, prog) = in_set_prog(8 /* U64 */, &[-1]);
-    let mb = make_int_batch(&schema, &[(1, 1, 0, &[u64::MAX as i64])]);
-    assert_eq!(eval_predicate(&prog, &mb.as_mem_batch(), 0), (1, false));
+    let mb = make_int_view(&schema, &[(1, 0, &[u64::MAX as i64])]);
+    assert_eq!(prog.eval_row(&mb, 0), (1, false));
     // A different u64 value misses.
-    let mb = make_int_batch(&schema, &[(1, 1, 0, &[7])]);
-    assert_eq!(eval_predicate(&prog, &mb.as_mem_batch(), 0), (0, false));
+    let mb = make_int_view(&schema, &[(1, 0, &[7])]);
+    assert_eq!(prog.eval_row(&mb, 0), (0, false));
 }
 
 #[test]
@@ -2174,12 +2082,8 @@ fn test_int_in_set_signed_negatives_by_signed_order() {
     // Signed set with negatives, sorted ascending in signed i64 order.
     let (schema, prog) = in_set_prog(9 /* I64 */, &[-5, -1, 0, 3]);
     for (v, want) in [(-5i64, 1), (-1, 1), (0, 1), (3, 1), (2, 0), (100, 0)] {
-        let mb = make_int_batch(&schema, &[(1, 1, 0, &[v])]);
-        assert_eq!(
-            eval_predicate(&prog, &mb.as_mem_batch(), 0),
-            (want, false),
-            "value {v} membership"
-        );
+        let mb = make_int_view(&schema, &[(1, 0, &[v])]);
+        assert_eq!(prog.eval_row(&mb, 0), (want, false), "value {v} membership");
     }
 }
 
@@ -2189,18 +2093,21 @@ fn test_int_in_set_1000_elements_compiles_and_evals() {
     // have needed ~4000, blowing the 64-register cap with TooManyRegs).
     let set: Vec<i64> = (0..1000).collect();
     let (schema, prog) = in_set_prog(9 /* I64 */, &set);
-    assert_eq!(prog.num_regs, 2, "membership uses two registers regardless of set size");
-    let mb = make_int_batch(&schema, &[(1, 1, 0, &[777])]);
-    assert_eq!(eval_predicate(&prog, &mb.as_mem_batch(), 0), (1, false));
-    let mb = make_int_batch(&schema, &[(1, 1, 0, &[1000])]);
-    assert_eq!(eval_predicate(&prog, &mb.as_mem_batch(), 0), (0, false));
+    assert_eq!(
+        prog.prog.num_regs, 2,
+        "membership uses two registers regardless of set size"
+    );
+    let mb = make_int_view(&schema, &[(1, 0, &[777])]);
+    assert_eq!(prog.eval_row(&mb, 0), (1, false));
+    let mb = make_int_view(&schema, &[(1, 0, &[1000])]);
+    assert_eq!(prog.eval_row(&mb, 0), (0, false));
 }
 
 #[test]
 fn test_int_not_in_set_null_operand_excluded() {
     // NOT IN = bool_not(IN). A NULL operand makes IN NULL, NOT(NULL) NULL — the
     // row is excluded (3VL), matching the OR-chain's `NOT(NULL) = NULL`.
-    let schema = make_schema(0, &[8, 9]); // col0 = PK(U64), col1 = I64
+    let schema = schema_pk_ints(1, true); // col0 = PK(U64), col1 = I64
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 },
         LogicalInstr::IntInSet {
@@ -2210,19 +2117,16 @@ fn test_int_not_in_set_null_operand_excluded() {
         },
         LogicalInstr::BoolNot { dst: 2, a: 1 },
     ];
-    let prog = make_prog(&schema, instrs, 3, 2, vec![pack_i64_set(&[1, 2, 3])]);
+    let prog = scalar_prog(&schema, instrs, 3, 2, vec![pack_i64_set(&[1, 2, 3])]);
     // NULL operand → NOT IN is NULL (excluded).
-    let mb = make_int_batch(&schema, &[(1, 1, 0b1, &[0])]);
-    assert!(
-        eval_predicate(&prog, &mb.as_mem_batch(), 0).1,
-        "NOT IN NULL must be NULL"
-    );
+    let mb = make_int_view(&schema, &[(1, 0b1, &[0])]);
+    assert!(prog.eval_row(&mb, 0).1, "NOT IN NULL must be NULL");
     // A non-member is included by NOT IN.
-    let mb = make_int_batch(&schema, &[(1, 1, 0, &[9])]);
-    assert_eq!(eval_predicate(&prog, &mb.as_mem_batch(), 0), (1, false));
+    let mb = make_int_view(&schema, &[(1, 0, &[9])]);
+    assert_eq!(prog.eval_row(&mb, 0), (1, false));
     // A member is excluded by NOT IN.
-    let mb = make_int_batch(&schema, &[(1, 1, 0, &[2])]);
-    assert_eq!(eval_predicate(&prog, &mb.as_mem_batch(), 0), (0, false));
+    let mb = make_int_view(&schema, &[(1, 0, &[2])]);
+    assert_eq!(prog.eval_row(&mb, 0), (0, false));
 }
 
 #[test]
@@ -2230,8 +2134,8 @@ fn test_int_in_set_empty_pool_always_false() {
     // A zero-length pool matches nothing (binary_search on `[]` is always Err),
     // and `len % 8 == 0` so it validates.
     let (schema, prog) = in_set_prog(9 /* I64 */, &[]);
-    let mb = make_int_batch(&schema, &[(1, 1, 0, &[42])]);
-    assert_eq!(eval_predicate(&prog, &mb.as_mem_batch(), 0), (0, false));
+    let mb = make_int_view(&schema, &[(1, 0, &[42])]);
+    assert_eq!(prog.eval_row(&mb, 0), (0, false));
 }
 
 /// The wire pool order is not trusted: `resolve` sorts it, because the kernel
@@ -2239,19 +2143,15 @@ fn test_int_in_set_empty_pool_always_false() {
 #[test]
 fn test_int_in_set_unsorted_pool_is_sorted_at_resolve() {
     let (schema, prog) = in_set_prog(9 /* I64 */, &[42, -1, 7, 3]);
-    assert_eq!(prog.int_sets[0], vec![-1, 3, 7, 42]);
+    assert_eq!(prog.prog.int_sets[0], vec![-1, 3, 7, 42]);
     // A binary search over the raw descending-ish order would miss 7 (it sits
     // past the first probe's `42 > 7` left turn).
     for v in [-1i64, 3, 7, 42] {
-        let mb = make_int_batch(&schema, &[(1, 1, 0, &[v])]);
-        assert_eq!(
-            eval_predicate(&prog, &mb.as_mem_batch(), 0),
-            (1, false),
-            "value {v} must be found"
-        );
+        let mb = make_int_view(&schema, &[(1, 0, &[v])]);
+        assert_eq!(prog.eval_row(&mb, 0), (1, false), "value {v} must be found");
     }
-    let mb = make_int_batch(&schema, &[(1, 1, 0, &[8])]);
-    assert_eq!(eval_predicate(&prog, &mb.as_mem_batch(), 0), (0, false));
+    let mb = make_int_view(&schema, &[(1, 0, &[8])]);
+    assert_eq!(prog.eval_row(&mb, 0), (0, false));
 }
 
 #[test]
@@ -2273,4 +2173,51 @@ fn test_int_in_set_validate_rejects_out_of_range_set_idx() {
         wire_err(LogicalProgram::from_wire(&[46, 1, 0, 9], 2, 1, vec![vec![0u8; 8]])),
         ExprValidateErr::ConstIdxOutOfRange { const_idx: 9, n: 1 }
     );
+}
+
+/// Classifier: every CMP and every AND in a pure conjunction is bit_only
+/// (with `is_filter=true`); result_reg stays bit_only.
+#[test]
+fn classifier_pure_conjunction_filter() {
+    let schema = schema_pk_ints(2, true);
+    let prog = filter_prog(
+        &schema,
+        vec![
+            LogicalInstr::LoadColInt { dst: 0, col: 1 },
+            LogicalInstr::LoadConst { dst: 1, val: 1 },
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 2,
+                a: 0,
+                b: 1,
+            },
+            LogicalInstr::LoadColInt { dst: 3, col: 2 },
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 4,
+                a: 3,
+                b: 1,
+            },
+            LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 },
+        ],
+        6,
+        5,
+        vec![],
+    )
+    .prog;
+    let RegisterRoles {
+        bit_only, bool_input, ..
+    } = classify_registers(&prog.instrs, 5, true);
+    // Bool producers: r2 (CMP_GT), r4 (CMP_GT), r5 (BOOL_AND).
+    // Non-bool readers consume r0/r1/r3 (CMPs read them as i64), so those
+    // never qualify for bit_only. r2/r4 are read only by BOOL_AND, and r5
+    // (result_reg) stays bit_only under is_filter=true.
+    let expected_bit_only = (1u64 << 2) | (1u64 << 4) | (1u64 << 5);
+    assert_eq!(
+        bit_only, expected_bit_only,
+        "expected r2/r4/r5 bit_only; got mask {bit_only:#010b}"
+    );
+    // r2 and r4 are read by BOOL_AND; r5 (result_reg) is force-marked a bool
+    // input so the filter's nullable word merge always finds it packed.
+    assert_eq!(bool_input, (1 << 2) | (1 << 4) | (1 << 5));
 }

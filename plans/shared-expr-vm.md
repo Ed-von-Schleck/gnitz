@@ -172,9 +172,12 @@ that forced `canonical_group_key` to exist, locking the index-span writer out of
 `GroupKeyCols::key_row`, and `Batch::append_row_from_source{,_bytes}` /
 `append_row_tail_from_source` / `append_payload_cols`. `ReadCursor::
 current_row_source` returns `&impl RowSource` (a cursor's weight comes off the
-cursor, never the positioned source). `ColumnarSource` survives for `run_merge` /
-`merge_same_pk` / `RowRef` and is **no longer re-exported from `crate::storage`**;
-it is storage-internal.
+cursor, never the positioned source). `ColumnarSource` survives only for `run_merge_body` and `RowRef` — the merge
+comparator trio (`merge_less` / `merge_same_pk` / `merge_eq_payload`) reads no
+weight either, so the first two bind `RowSource` and `merge_eq_payload` needs no
+bound on `S` at all (its body touches only the generic `RowCmp`). It is **no
+longer re-exported from `crate::storage`**; it is storage-internal.
+`GroupKeyExtractor::gather` likewise takes `&impl RowSource`, not `&MemBatch`.
 
 **The per-row accessors are NOT derived from the region ones.** An earlier draft
 rewrote every per-row read as `&col_data(c, s)[row*s .. row*s+s]` /
@@ -245,7 +248,7 @@ stay elided-fresh**: binding the return to `&self` would break
 (`is_null`, `native_key`, `route_key`) return `bool`/`u128` and take a bare
 `&impl RowSource`; the three `IndexKeySpec` methods and `row_in_index_range`
 take `&impl BatchView`. No caller passes a temporary — the only inline
-`&batch.as_mem_batch()` call is `ScalarFunc::run_filter`, which returns `()`.
+`&batch.as_mem_batch()` call is `ScalarFunc::filter_ranges`, which returns `()`.
 
 `RowSource` is therefore the single per-row access shape for the evaluator, for
 locator reads, and for storage; `BatchView` adds the region half the vectorized
@@ -416,209 +419,104 @@ unsizing coercion handles all three. There is no `NoSchema`.
 `BatchView`/`RowSource` stay generic: those *are* per-row, and monomorphizing
 them in the engine's own codegen unit is what keeps the kernels identical.
 
-### `gnitz-expr` modules
+### `gnitz-expr` modules (**DONE**)
 
-- **`view.rs` (DONE)** — `RowSource`, `BatchView`, `assert_batchview_consistent`.
-- **`locator.rs` (DONE)** — the shared **resolved-addressing substrate**, moved
-  from engine `schema.rs`; every body touches only `gnitz_wire` + the row
-  accessors (no `SchemaDescriptor`, no `MemBatch`, no log macro):
-  - `ColumnLocator` — `pub(crate)` → `pub`; its
-    `Pk { byte_off, size, type_code }` / `Payload { slot, size, type_code }`
-    fields are now cross-crate-public. Methods `size`, `type_code`, `is_null`,
-    `bytes`, `native_le_bytes`, `native_key`, `route_key` — the last five
-    retargeted from `&impl RowView<'b>` to `&impl RowSource` with the exact
-    signatures given in the trait section (`bytes` and `native_le_bytes` keep an
-    explicit batch lifetime). The `size_of::<ColumnLocator>() <= 8` static assert
-    travelled with it. `size`/`type_code`/`is_null`/`bytes` are
-    `#[inline(always)]`; the other three keep `#[inline]`.
-  - `PAYLOAD_MAPPING_PK_SENTINEL`.
+Signatures only — the bodies are the engine's, moved verbatim.
 
-  `Instr::CopyCol` (`program.rs:390`) carries a `ColumnLocator`, so the type must
-  sit in this crate; `eval_batch` never reads one (`CopyCol`/`Emit` are no-ops at
-  `batch.rs:533` — engine `plan.rs`'s `evaluate_map_batch`/`copy_column`
-  materialize them).
+- **`view.rs`** — `RowSource`, `BatchView`, `assert_batchview_consistent`.
+- **`locator.rs`** — `ColumnLocator` (`Pk { byte_off, size, type_code }` /
+  `Payload { slot, size, type_code }`) with `size` / `type_code` / `is_null` /
+  `bytes` / `native_le_bytes` / `native_key` / `route_key`, all
+  `#[inline(always)]`; `PAYLOAD_MAPPING_PK_SENTINEL`; the
+  `size_of::<ColumnLocator>() <= 8` static assert.
+- **`schema_facts.rs`** — `SchemaFacts`, `assert_schema_facts_consistent`.
+- **`program.rs`** — `LogicalProgram` / `LogicalInstr` (wire-mirroring form,
+  logical column indices) and the crate-private `ResolvedProgram` / `Instr`
+  (resolved payload/PK indices) that `resolve_program` lowers into, plus the
+  crate-private `validate` / `validate_predicate` and the free `classify_registers`
+  / `and_chain_mask` / `is_strictly_non_nullable` analyses `resolve_program` runs
+  (free functions over `&[Instr]`, so `ResolvedProgram` is built once, fully
+  resolved, with no placeholder mask fields); `CmpOp`, `StrOp`, `ColKind`,
+  `ExprValidateErr`. `classify_registers` is the **one** exhaustive walk over
+  register operands — it returns the per-register use counts `and_chain_mask`
+  needs, so an opcode that gains an operand cannot be classified correctly and
+  counted wrong. `Instr::CopyCol` carries a `ColumnLocator`, which is why
+  that type sits in this crate; `eval_batch` never reads one (`CopyCol`/`Emit`
+  are no-ops there — engine `expr.rs` materializes them columnar-side).
+- **`batch.rs`** — the morsel kernel: `eval_batch`, `EvalScratch` and its
+  `ensure_capacity`/`grow`, `MORSEL`, `NULL_WORDS_PER_REG`, `for_each_null_row`,
+  and the per-opcode helpers. All crate-private.
+- **`eval.rs`** — the public driving surface: the three validating
+  `LogicalProgram::resolve_*` constructors and `Evaluator` (`eval_row` /
+  `filter` / `eval_morsels` / `copy_moves` / `emit_targets`) and `MorselOut`. The three drive methods carry
+  their own bodies — there are no free `filter_batch` / `eval_row` twins for
+  them to delegate to. Crate-private: `read_reg_row0` and `scan_filter_bits`.
+- **`test_support.rs`** (`#[cfg(test)]`) — `TestView`, `TestSchema`,
+  `make_int_view`, `make_n_col_view`, `make_int_row`, `schema_pk_ints`,
+  `locator_fixture`, `float_to_bits`/`bits_to_float`.
+- **`lib.rs`** — private `mod`s + flat `pub use module::*;`, and the crate-root
+  inlining doctrine.
 
-  **The four key derivations live in `gnitz-wire`, not here** (`pk_route_key`,
-  `payload_route_key`, `pk_native_key`, `payload_native_key`, with the
-  ROUTING-vs-INDEX key-space block comment). An earlier draft kept them beside
-  `ColumnLocator` on the theory that the orphan rule required it — but the orphan
-  rule constrains the inherent `impl`, not four non-generic free functions, and
-  `gnitz-expr` depends on `gnitz-wire` so the methods reach them either way. They
-  are thin dispatches over `encode_pk_column` / `decode_pk_column` /
-  `widen_pk_be` keyed on a wire type code, and **zero** of their 12 caller files
-  is expression code (`ops/util.rs`, `ops/reindex.rs`, `ops/exchange/relay.rs`,
-  `runtime/.../{index_router,mod,preflight,unique_filter}.rs`, `catalog/tests/`),
-  so `gnitz-wire` owns them under exactly the rule it states for `read_u64_le`.
-  **Engine call sites name `gnitz_wire::X` directly** — there is no engine
-  re-export, exactly as for the German-string cluster in step 1. (An earlier
-  version routed three of the four through `foundation::codec` and left
-  `pk_route_key` naming `gnitz_wire::`, which split one rule across two import
-  paths — visibly, in adjacent match arms of `ops/reindex.rs`. The four exist to
-  agree with each other pairwise; they are one item, not four.) All four keep
-  `#[inline]` for MIR export.
+### The public surface (**landed** in 3b)
 
-  **`gnitz_wire::null_word_get` / `null_word_set` are the one null-bitmap
-  convention**, homed the same way and for the same reason: the payload bitmap is
-  a §6 region rule (`gnitz-wire` already owns `REG_NULL_BMP`), and it had been
-  spelled out three times — engine `schema::{null_bit, set_null_bit}` (deleted),
-  `gnitz_core::{null_word_get, null_word_set}` (now a re-export, so its ~23 call
-  sites are unchanged), and inline in `ColumnLocator::is_null`.
+Everything steps 4/5/6 may name, and nothing else. The resolved form and the
+register file are gone from it — a caller outside the crate holds an
+[`Evaluator`], never a `(ResolvedProgram, EvalScratch)` pair.
 
-  **`read_signed` and `read_unsigned` both live in `gnitz-wire`** (moved in step
-  3a) — never in `gnitz-expr`, and never split. This is the same rule the four key
-  functions above follow. Their caller files have nothing to do with expressions
-  (`schema/key.rs`, `storage/repr/shard_file.rs`, `ops/util.rs`,
-  `storage/repr/columnar.rs`), and most dispatch between the *pair* inside one
-  function; `shard_file.rs`/`key.rs` importing from an *expression* crate would be
-  bad cohesion. `gnitz-wire/src/lib.rs` already declared itself owner of exactly
-  this species, next to `read_u64_le`. The engine names them
-  `gnitz_wire::read_signed` / `read_unsigned` **directly**, as it does for the
-  four key derivations and the German-string cluster — no `foundation::codec`
-  re-export, which would only re-split one rule across two import paths. That
-  rule then swallowed the rest of the species: `read_i64_le` moved to
-  `gnitz-wire` too, `foundation::codec` stopped re-exporting anything and was
-  then **deleted outright** — what remained was two unrelated halves, neither
-  cross-layer (the four unsafe unaligned `*_raw` mmap accessors, whose only
-  callers are `runtime/protocol/{sal,w2m_ring}.rs`, now live in
-  `foundation::posix_io` beside the mmap wrappers; the `#[cfg(test)]`
-  `as_le_bytes` typed-slice view moved to `test_support`).
+- **Addressing** — `ColumnLocator` (+ its 6 variant fields) and its 7 methods
+  `size` / `type_code` / `is_null` / `bytes` / `native_le_bytes` / `native_key` /
+  `route_key`; `PAYLOAD_MAPPING_PK_SENTINEL`.
+- **Access traits** — `RowSource` (4 methods), `BatchView` (2), plus
+  `assert_batchview_consistent`.
+- **Schema contract** — `SchemaFacts` (7 required + 1 provided), plus
+  `assert_schema_facts_consistent`.
+- **Program construction** — `LogicalProgram` with `new`, `copy_cols`,
+  `from_wire`, `payload_copy_srcs`, `sequential_copy_base`, and the three
+  **validating** resolvers `resolve_filter(schema)` / `resolve_map(in, out)` /
+  `resolve_scalar(schema)`, each returning `Result<Evaluator, ExprValidateErr>`;
+  `LogicalInstr`, `CmpOp`, `StrOp`, `ColKind`, `ExprValidateErr`.
+- **Evaluation** — `Evaluator` (`eval_row`, `filter`, `eval_morsels`,
+  `copy_moves`, `emit_targets`) and `MorselOut` (`rows`, `reg_values`,
+  `for_each_null_row`). `eval_morsels`' callback is `f(rel_start, &MorselOut)` —
+  the morsel's row count is `out.rows()`, not a second parameter. There is no
+  `MorselOut::value` / `is_null`: a bit_only register is never unpacked into
+  `regs` on the nullable arm, so the only correct single-row read is the
+  crate-private `read_reg_row0` that `eval_row` already goes through.
 
-  **The pair is `read_{signed,unsigned}_exact(cell)` plus a `(bytes, size)`
-  wrapper**, not one width-taking function. Same single ladder per signedness —
-  the wrapper *is* `_exact(&bytes[..size])` — but at `opt-level=0` that
-  sub-slice is an out-of-line `Range::index` call, and it was landing twice per
-  comparison inside `cmp_typed_le`, whose windows are exact already: measured
-  +9.5 % on `cmp_typed_le` and **+2.44 %** end-to-end on a 4-way 800 k-row
-  nullable merge when the width form was used there. Callers whose slice IS the
-  cell take `_exact` — `cmp_typed_le`, `compare_rows_fixedint_nonnull` (whose
-  `get_col_ptr` returns exactly `cs` bytes), `shard_file::widen_cell` (both
-  callers walk `chunks_exact(stride)`, so it dropped its `stride` parameter) and
-  `ops/util::encode_ordered` (which spelled `read_unsigned(bytes, bytes.len())`).
-  `cmp_typed_le` and the two `payload_*_key` derivations, which had spelled the
-  same 1/2/4/8 LE decode a third and fourth time inside `gnitz-wire` itself, now
-  call the pair. `read_unsigned_zero_extends` moved with them.
+`validate` and `validate_predicate` are **`pub(crate)`**, not public: every
+consumer reaches them through the resolver that pairs each with the resolution it
+guards. There is no unvalidated public `resolve` and no `is_filter: bool`
+parameter — resolution bakes in payload slots, PK byte offsets, type codes and
+the nullability verdict, so "this program was checked against the schema it runs
+on" has to be a property of the type rather than a convention each consuming
+crate remembers. The three resolvers differ in which rules apply, which is also
+what fixes the classification each resolves under:
 
-  **`compare_rows_fixedint_nonnull` dropped its per-comparison shift tripwire.**
-  It ran `schema.payload_columns().all(|c| c.size() <= 8)` — O(cols), with an
-  out-of-line iterator `next` at `-O0` — on *every* row comparison of the
-  hottest merge comparator: **−21.9 %** on `run_merge_dup_pk_bench` when removed.
-  The property is now pinned where it is actually decided, as a `const` assert in
-  `gnitz-wire` over the whole `u8` type-code domain: `is_fixed_int(tc)` implies
-  `wire_stride(tc) ∈ {1,2,4,8}`. `FixedIntNonnull` admits a column only via
-  `is_fixed_int`, so the branchless `1 << (cs*8 - 1)` sign-flip cannot become
-  `1 << 127` — checked at compile time instead of per row. `ops/reduce/agg.rs` is **not a
-  caller**: its SUM widening holds a `gnitz_wire::FixedInt` (resolved once at
-  `Accumulator::new`), which *is* the domain on which "decode LE bytes → i64" is
-  total and carries its own width — so it replaced the hand-rolled
-  `is_fixed_int`/`is_signed_int`/`read_signed`/`read_unsigned` classifier and the
-  duplicate of it in `decode_signed`.
-- **`program.rs`** — `LogicalProgram`, `ResolvedProgram`, `Instr`, `CmpOp`,
-  `StrOp`, `LogicalInstr`, `ExprValidateErr`, `from_wire` (`:470`), `resolve`
-  `validate`, the register analyses, and `ColKind` (a field of
-  `ExprValidateErr::ColKindMismatch` and `check_col`'s parameter, so it cannot
-  stay behind). The `&dyn SchemaFacts` retarget and every `crate::`-retarget
-  shipped in **3a**; the file already names nothing from `crate::`, so the move
-  is `git mv` + visibility + `use` lines. Residual edits:
-  - delete the lone `gnitz_debug!` (in `LogicalProgram::new`) — the only log
-    macro in `program.rs`/`batch.rs`, deliberately left in place by 3a.
-  - `ExprValidateErr`'s doc comment currently says "`Debug` only … no consumer
-    branches on the variant". The client now branches on `TooManyRegs(n)`
-    (below), so update it.
-- **`batch.rs`** — `eval_batch`, `EvalScratch`, every kernel. **Three**
-  signatures are `<B: BatchView>` — `eval_batch`, `eval_str_col_vs_const`,
-  `eval_str_col_vs_col`, the three that call `col_data`/`blob`. `eval_is_null`
-  and `eval_str_cmp` touch the batch only for its null bitmap, so they take
-  `null_bmp: &[u8]` and stay non-generic, the same shape their own callee
-  `fill_null_bits_mask` already had. Every lean is already retargeted (3a), so
-  the move is mechanical. The **four**
-  `#[allow(clippy::too_many_arguments)]` attributes travel with the code (the
-  `type_complexity` one on `reg4` is unrelated). Borrow-checking was verified
-  under `BatchView` in 3a: `eval_str_col_vs_col` holds `col_b`, `blob` and a
-  `move` closure live across a second `mb` pass, which are shared reborrows of
-  `*mb` unified at one lifetime — exactly what
-  `b_of: impl Fn(usize) -> (&'x [u8], &'x [u8])` needs, with no annotation.
-- **`filter.rs`** — two entry points lifted out of engine `plan.rs`:
-  ```rust
-  /// Invokes `append_range(start, end)` per maximal run of passing rows —
-  /// `end` is EXCLUSIVE, not a length (`scan_filter_bits` passes `row_base` /
-  /// `abs` / `n`; the engine consumer is `|start, end| out.push((start, end))`).
-  pub fn filter_batch<B: BatchView, F: FnMut(usize, usize)>(
-      prog: &ResolvedProgram, mb: &B, n: usize,
-      scratch: &mut EvalScratch, mut append_range: F,
-  )
-  /// Run `prog` over row `row` alone and read its result register.
-  pub fn eval_scalar_row<B: BatchView>(
-      prog: &ResolvedProgram, mb: &B, row: usize, scratch: &mut EvalScratch,
-  ) -> (i64, bool)   // (value or float bits, is_null)
-  ```
-  `filter_batch` is `ScalarFunc::run_filter`'s body verbatim after the
-  `Repr::Predicate` destructure and the `scratch.borrow_mut()` — it touches only
-  `prog.{no_nulls, num_regs, result_reg}` and the scratch. `append_range` must be
-  bound `mut` (it is passed as `&mut append_range` to `scan_filter_bits`). The
-  private `scan_filter_bits` (a free fn closing over nothing) moves with it. Both
-  handle `n == 0`: `ensure_capacity` sizes `regs` by `num_regs * MORSEL`
-  independent of `n`, the morsel loop is `(0..n).step_by(MORSEL)`, and
-  `scan_filter_bits` over an empty bit slice emits nothing.
+| resolver | checks | classification |
+|---|---|---|
+| `resolve_filter(schema)` | `validate(Some, None)` + must own a result register | `result_reg` stays bit_only-eligible |
+| `resolve_map(in, out)` | `validate(Some, Some)` — every output slot covered once | `result_reg` demoted |
+| `resolve_scalar(schema)` | `validate(Some, None)` | `result_reg` demoted |
 
-  `eval_scalar_row` is the existing test helper `eval_predicate_via_batch`
-  (`expr/tests/mod.rs:22-33`) promoted to production: `num_regs == 0` returns
-  `(0, true)`; else `scratch.ensure_capacity(prog.num_regs as usize,
-  /* no_nulls = */ false, 1)` — always the nullable arm, so `null_bits` and
-  `bool_bits` are allocated whatever `prog.no_nulls` says; then
-  `eval_batch(prog, mb, row, 1, scratch)` and read
-  `(scratch.regs[r*MORSEL], scratch.null_bits[r*NULL_WORDS_PER_REG] & 1 != 0)`.
-  Forcing the nullable arm is safe on two counts: every kernel branches on
-  `scratch.no_nulls` (set by `ensure_capacity`, `batch.rs:46`), never
-  `prog.no_nulls` (which only `filter_batch` reads); and reusing one scratch
-  across rows cannot leak a stale null bit, because every producer **assigns**
-  its destination null word rather than OR-ing into it
-  (`fill_null_bits_mask` `:186`, `null_or2` `:145`, `null_copy1` `:158`,
-  `clear_null_reg` for `LoadPk`/`LoadConst` `:642,652`).
-- **`lib.rs`** — the modules (`locator`, `view`, `program`, `batch`, `filter`)
-  as private `mod`s plus a flat `pub use module::*;` of each.
+Every test program in the crate validates, so there is no `resolve_unchecked`.
 
-### The public surface: 37 named items
+Deliberately **private to the crate**: `ResolvedProgram` and every field of it
+(`instrs`, `const_cells`, `const_blob`, `int_sets`, `no_nulls`, `bit_only_mask`,
+`bool_pack_mask`, `chain_trigger_mask`, …), the resolved `Instr` enum,
+`classify_registers`, `is_bit_only`, `needs_bool_pack`, `MAX_REGS`,
+`EvalScratch` and all its fields, `ensure_capacity`, `MORSEL`,
+`NULL_WORDS_PER_REG`, `eval_batch`, `read_reg_row0`. In
+particular `chain_trigger_mask` is a `resolve`-computed invariant and is no
+longer **assignable** from outside the crate that owns it; the AND-chain A/B
+bench that writes it lives in `batch/tests.rs`.
 
-Stated as a number rather than implied: 37 named items, plus the 7
-`ColumnLocator` methods and 14 trait methods listed above (`SchemaFacts`'s 7
-required + 1 provided, `RowSource`'s 4, `BatchView`'s 2). This is **not smaller
-than before the extraction** — it is the same code with a wider visibility
-keyword; `gnitz-expr` is an internal workspace crate with no stability contract.
-What matters is that the `unsafe` and optimizer-internal items stay private.
-
-- Types (12): `ColumnLocator` (+ its 6 variant fields), `RowSource`, `BatchView`,
-  `SchemaFacts`, `LogicalProgram`, `LogicalInstr`, `Instr`, `ResolvedProgram`,
-  `EvalScratch`, `CmpOp`, `StrOp`, `ExprValidateErr`.
-- Consts (3): `PAYLOAD_MAPPING_PK_SENTINEL`, `MORSEL`, `NULL_WORDS_PER_REG`.
-- Free fns (5): `assert_batchview_consistent`, `assert_schema_facts_consistent`,
-  `eval_batch`, `filter_batch`, `eval_scalar_row`. (Neither the
-  `read_{signed,unsigned}{,_exact}` ladder nor the four `*_route_key` /
-  `*_native_key` derivations is among them — they all go to `gnitz-wire`.)
-- `LogicalProgram` methods (8): `new` (`:415`), `copy_cols` (`:452`), `from_wire`
-  (`:470`), `payload_copy_srcs` (`:597`), `sequential_copy_base` (`:615`),
-  `resolve` (`:627`), `validate` (`:860`), and `Debug`/equality as already
-  derived. (`copy_cols`, `payload_copy_srcs`, `sequential_copy_base` have
-  **production** engine callers in `query/compiler/{emit,mod}.rs`; `new` has
-  `#[cfg(test)]` callers in `query/vm/mod.rs:570,1350,1408`,
-  `query/compiler/mod.rs:705`, `ops/linear.rs:536,552,767,961`,
-  `ops/reduce/tests.rs`, and the expr tests.)
-- `ResolvedProgram` (7): fields `instrs`, `num_regs`, `result_reg`, `no_nulls`,
-  `bit_only_mask`, `chain_trigger_mask`; methods `is_bit_only`,
-  `classify_registers`. (The last three are needed only by the engine-side expr
-  tests — `batch_tests.rs:840` reads `bit_only_mask`, `:887` calls
-  `classify_registers`, `program_tests.rs:1575,1576,1603,1632,1667,1702` read and
-  `batch_tests.rs:1450` **writes** `chain_trigger_mask` to A/B the AND-chain
-  skip. See the test decision below.)
-- `EvalScratch` (5): `Default`, `ensure_capacity`, fields `regs`, `null_bits`,
-  `bool_bits`.
-
-Deliberately **not** public: `const_cells`, `const_blob`, `int_sets`,
-`bool_input_mask`, `needs_bool_pack`, `MAX_REGS`, `filter_bits`, and
-— importantly — the `unsafe` split-borrow helpers `reg_mut` (`batch.rs:62`),
-`reg3` (`:68`), `null_words3` (`:81`), `reg4` (`:102`), `clear_null_reg`
-(`:122`). Those hand out aliasing split borrows whose soundness rests on an SSA
-property enforced only by a `debug_assert!`; nothing outside `gnitz-expr` calls
-them (engine `plan.rs` uses only `ensure_capacity` plus direct field indexing).
+Deliberately **private to `batch.rs`**: the `unsafe` split-borrow helpers
+`reg_mut`, `reg3`, `null_words3`, `reg4`, `clear_null_reg`. Those hand out
+aliasing split borrows whose soundness rests on an SSA property enforced only by
+a `debug_assert!`. No production caller outside `batch.rs` ever existed, and the
+two tests that called `reg3`/`null_words3` as inherent methods (so no `use` line
+named them) live in `batch/tests.rs`, a child module that reaches them without
+any widening.
 
 ## Engine side
 
@@ -640,38 +538,39 @@ them (engine `plan.rs` uses only `ensure_capacity` plus direct field indexing).
   No `#[inline]` on any of them — every caller reaches them through
   `&dyn SchemaFacts`, so the hint cannot fire through the vtable. The inherent
   `SchemaDescriptor::payload_mapping_byte` is **deleted**: with the sentinel out
-  of the trait its last caller was the forwarder itself, and `expr/plan.rs`'s
+  of the trait its last caller was the forwarder itself, and `expr.rs`'s
   `compute_blob_passthrough` — its one other user — now compares whole locators
   (`cm.src == in_schema.locate(ci)`), which is what a `ColMove`'s source is.
 - `compute_mappings` (`schema.rs:229`) — retarget its one sentinel reference to
   `gnitz_expr::PAYLOAD_MAPPING_PK_SENTINEL`.
-- `IndexKeySpec` (`schema.rs:950,981,997`) — its three row-reading methods
-  retarget from `RowView` to `&impl BatchView`.
-- `expr/plan.rs` in full: `ScalarFunc` (`from_predicate`, `from_map`),
-  `evaluate_map_batch`, `map_rows_into`, `append_map_ranges`, `filter_ranges`,
-  `covers_all_outputs`, `copy_column`, `NullPerm`, `evaluate_predicate`
-  (`#[cfg(test)]`), and its
-  `BlobCache` / `BlobCacheGuard` / `relocate_german_string_vec` uses
+- `IndexKeySpec` — its three row-reading methods retarget from `RowView` to
+  `&impl RowSource` (not `BatchView`: their bodies touch only per-row accessors,
+  and the looser bound is what keeps the index-span writer usable over
+  `MappedShard` / `CursorSource`).
+- `expr.rs` in full: `ScalarFunc` (`from_predicate`, `from_map`,
+  `filter_ranges`, `map_out_schema`, `evaluate_map_batch`, `append_map_ranges`),
+  `MapPlan` (`map_ranges_into`, `map_rows_into`), `copy_column`, `NullPerm`, and
+  its `BlobCache` / `BlobCacheGuard` / `relocate_german_string_vec` uses
   (map-materialization only — the filter path never touches the blob cache).
-  `run_filter` becomes:
-  ```rust
-  pub fn run_filter<F: FnMut(usize, usize)>(&self, mb: &MemBatch, n: usize, append_range: F) {
-      let Repr::Predicate { prog, scratch } = &self.0 else {
-          unreachable!("run_filter on a Map ScalarFunc (the VM dispatch is per-node)")
-      };
-      gnitz_expr::filter_batch(prog, mb, n, &mut scratch.borrow_mut(), append_range)
-  }
-  ```
-  The two production callers (`catalog/scan_spec.rs`, `ops/linear.rs`) are
+  `Repr` is `Predicate(Box<Evaluator>) | Map(Box<MapPlan>)` — both boxed, so the
+  enum stays pointer-sized whichever half is larger — and the variant is checked
+  in exactly two places: `filter_ranges`'s `let Repr::Predicate(ev) = …` and the
+  private `ScalarFunc::map() -> &MapPlan`. The map driver chain
+  (`map_ranges_into` → `map_rows_into`) lives on `MapPlan` and reads its fields
+  directly, so it re-checks nothing.
+  The two production filter callers (`catalog/scan_spec.rs`, `ops/linear.rs`) are
   untouched.
 - **Re-exports, one rule, stated as a boundary rather than a list: a *schema
   fact* comes through `crate::schema::X` at every engine call site; a *byte
   primitive* never does.** What a column's type is, how many of them there can
   be, how a key is shaped — schema facts, so `crate::schema` re-exports
   `type_code`, `TypeCode`, `MAX_COLUMNS`, `MAX_PK_BYTES`, `MAX_PK_COLUMNS`,
-  `ReduceOutKey`, plus `ColumnLocator` and `PAYLOAD_MAPPING_PK_SENTINEL`
-  (`SchemaDescriptor::locate` produces a locator, `compute_mappings` writes the
-  sentinel). How a value is *encoded or decoded* is a byte primitive and is
+  `ReduceOutKey` and `ColumnLocator` — and **every** engine call site of each
+  names `crate::schema::X`, with no surviving `gnitz_wire::` spelling of any of
+  them. `PAYLOAD_MAPPING_PK_SENTINEL` is deliberately *not* re-exported: its only
+  engine readers are `payload_mapping`'s own encode/decode inside `schema.rs`, so
+  it is a plain `use` there. How a value is *encoded or decoded* is a byte
+  primitive and is
   named `gnitz_wire::X` directly, including inside `schema.rs` itself:
   `read_{signed,unsigned}{,_exact}`, the four `*_route_key` / `*_native_key`
   derivations, the German-string cluster, the null-bitmap accessors, the aligned
@@ -696,51 +595,65 @@ them (engine `plan.rs` uses only `ensure_capacity` plus direct field indexing).
   Earlier drafts split this rule by how many call sites would churn rather than
   by ownership: one routed the four key derivations through `schema`, the next
   re-exported three of the four through `foundation::codec`, and 3a left the
-  aligned LE primitives re-exported there — visibly, with `expr/batch.rs` and
-  `expr/plan.rs` naming one `read_u64_le` two different ways.
-- **`expr/mod.rs`** shrinks to `mod plan; #[cfg(test)] mod tests; pub use
-  plan::{PkFill, ScalarFunc};` (it exports **`PkFill` as well as** `ScalarFunc`
-  today — `expr/mod.rs:11` — and must keep both) plus `pub(crate) use gnitz_expr::{ExprValidateErr,
-  LogicalProgram};` (`ExprValidateErr` is used by
-  `query/compiler/{emit.rs:14,mod.rs:6}`; demoting `LogicalProgram` from `pub
-  use` to `pub(crate) use` is equivalent in a binary crate) and the
-  `#[cfg(test)] pub(crate) use gnitz_expr::{CmpOp, LogicalInstr, StrOp};`
-  re-exports the vm/ops test builders consume.
+  aligned LE primitives re-exported there — visibly, with the expr batch and
+  plan files naming one `read_u64_le` two different ways.
+- **`expr` is one file**, `expr.rs`, declaring `PkFill` / `ScalarFunc` directly
+  plus `#[cfg(test)] mod tests;`. Once `program.rs` and `batch.rs` left, the
+  `expr/mod.rs` + `expr/plan.rs` pair was a shim re-exporting two items out of
+  its sole child, so it is gone; `crate::expr::{PkFill, ScalarFunc}` is unchanged
+  at every call site. It re-exports **nothing** from `gnitz-expr`: every site that named
+  `crate::expr::{LogicalProgram, LogicalInstr, CmpOp, StrOp, ExprValidateErr}`
+  names `gnitz_expr::` instead. This follows `RowSource`/`BatchView` — moved into
+  the same crate, in this same effort, consumed and produced by the module they
+  left, and deliberately not re-exported — rather than `ColumnLocator`, which
+  `crate::schema` re-exports because a locator *is* a schema fact that
+  `SchemaDescriptor::locate` produces. `LogicalProgram` is produced by
+  `query/compiler` and consumed by `expr.rs`; `expr` is its home in neither
+  direction, and a facade would leave peers of one crate spelled two ways on
+  adjacent lines — the drift failure this plan deleted the `crate::storage` OPK
+  facade for.
 
-### The expr test suite stays in `gnitz-engine`, unmoved
+### The expr test suite moved with the code (**DONE** in 3b)
 
-Measured: of `batch_tests.rs`'s 28 tests, **13** construct `ScalarFunc`, **12**
-build an engine `Batch` and call `eval_batch`, **3** touch neither — and **0**
-call `eval_batch` without constructing a `Batch`. `program_tests.rs`'s 56 tests
-go through `make_int_batch` (28 of them), `Batch::with_capacity` directly (3),
-`SchemaDescriptor::new` inline (1), STRING columns (7, three of which call
-`test_support::german_string(b"hello", &mut batch.blob)` — borrowing the batch's
-own blob mid-construction), and `schema.payload_columns()` (not a `SchemaFacts`
-method). `plan_tests.rs` holds byte-identical private copies of `make_schema` and
-`make_int_batch` (`:6`, `:15`) and must stay regardless.
+An earlier draft kept it in `gnitz-engine`, on the reading that `plan_tests.rs`
+held "byte-identical private copies of `make_schema` and `make_int_batch`". It
+has its own `make_schema` but *imported* `make_int_batch` from `tests/mod.rs`,
+and `program_tests.rs` named no engine type at all beyond the schema/batch
+fixtures. Once `Evaluator` deleted `ScalarFunc::run_filter` and
+`evaluate_predicate` — the only things pinning 13 of the 92 tests to the engine —
+nothing was left to pin any of them.
 
-So moving tests is a **rewrite**, not a move: ~120-180 lines of new
-`TestSchema`/`TestBatch` fixture in `gnitz-expr`, 12 rewritten `batch_tests`
-bodies and ~13 touched `program_tests` bodies, ending with **two** fixture
-families where there is one. The cost of keeping them where they are is three
-extra `pub` items (`bit_only_mask`, `chain_trigger_mask`, `classify_registers`),
-already listed above. Keeping them is the cheaper and simpler choice; take it.
+All 92 moved into `gnitz-expr` as per-module `tests` submodules (`program/`,
+`batch/`, `eval/`, `locator/`, `schema_facts/`, `view/`), each a *descendant* of
+the module it tests, so private items are reachable. Two items are `pub(crate)`
+across that seam rather than for a production reader — `Evaluator::prog` and
+`read_reg_row0`, both reached from `batch/tests.rs` and `program/tests.rs`, which
+descend from `batch`/`program` and not from `eval`.
 
-`tests/mod.rs`: `eval_predicate_via_batch` is deleted in favour of
-`gnitz_expr::eval_scalar_row`; `eval_with_emit_via_batch` stays (it walks
-`Instr::Emit`). Only `use` paths change in the three test files.
+`test_support.rs` holds the one fixture family: `TestView` (owned-buffer
+`BatchView`), `TestSchema` (`SchemaFacts` over a `(type_code, nullable)` table +
+PK list), `make_int_view`, `make_n_col_view`, `make_int_row`, `schema_pk_ints`,
+`locator_fixture`, `float_to_bits`/`bits_to_float` (spelled as the kernel's own
+`encode_f64`/`decode_f64`). There is no second family — in particular
+`assert_schema_facts_consistent` runs against **`TestSchema` itself**, the
+implementor whose payload slots and OPK offsets decide every kernel test's
+addressing, with a five-forwarder newtype supplying the off-by-one
+`payload_col_idx` that proves the harness is not vacuous.
+`gnitz-engine`'s `expr/tests.rs` (7 `ScalarFunc`/`PkFill` tests plus the
+`from_predicate` → `filter_ranges` pin) owns the only engine-side `make_schema`
+and `make_int_batch`, over the physical `Batch` those tests exist to exercise.
 
-`gnitz-expr` therefore ships one small `#[cfg(test)]` smoke test — a hand-built
-two-column `BatchView`/`SchemaFacts` pair proving the crate resolves and
-evaluates standalone. Its exhaustive coverage lives in `gnitz-engine`'s
-`expr/tests/`, which `make test` runs.
+`cargo test -p gnitz-expr` therefore runs the real suite (96 + 2 `#[ignore]`d
+benches), not a smoke test.
 
-**Why the hot path is unchanged.** `eval_batch<MemBatch>` and
-`filter_batch<MemBatch, _>` are the only instantiations the server binary
-compiles, and generics monomorphize **in the calling crate** — the engine's own
-codegen unit — so the vectorized kernel bodies are produced exactly as today,
-with or without LTO. The `BatchView` accessors are `#[inline]` and resolve to
-`MemBatch`'s inherent bodies. `lto = true` inlines the outer per-morsel call.
+**Why the hot path is unchanged.** `eval_batch<MemBatch>`,
+`Evaluator::filter<MemBatch, _>` and `eval_morsels<MemBatch, _>` are the only
+instantiations the server binary compiles, and generics monomorphize **in the
+calling crate** — the engine's own codegen unit — so the vectorized kernel bodies
+are produced exactly as today, with or without LTO. Verified by `objdump` on the
+`-O0` binary across the move: `eval_batch`'s body came out at 12756 instructions
+and 693 calls both before and after, with no new call target. The `BatchView`
+accessors are `#[inline(always)]` and resolve to `MemBatch`'s inherent bodies.
 
 ## Client side
 
@@ -885,7 +798,8 @@ for `Strings` and `v.iter().map(|o| o.as_deref())` for `Bytes`.
   const-folds null tests on non-nullable columns to `LitInt(0/1)`
   (`bind/structural.rs:496-506`); `CopyCol`/`Emit` are `eval_batch` no-ops and
   `OpcodeBackend` never emits `CopyCol`. **The guard**: every client site calls
-  `validate(Some(schema), None)` (below), which returns `ColTooWideForRegister`,
+  `resolve_scalar` / `resolve_filter`, whose validation returns
+  `ColTooWideForRegister`,
   so a future reject-list drift in `lower.rs` (a file fn1/fn2/fn3 all edit)
   surfaces as a typed `Unsupported`, not a panic across the `gnitz-capi` C ABI
   under `panic = "abort"`.
@@ -894,7 +808,7 @@ for `Strings` and `v.iter().map(|o| o.as_deref())` for `Bytes`.
 ones: `ResolvedProgram` exposes no referenced-column set, and both users are cold
 paths.
 
-### Compiling a client program: the shared four lines
+### Compiling a client program: the shared lines
 
 ```rust
 // in gnitz-sql, next to the other lowering helpers
@@ -908,14 +822,17 @@ fn expr_unsupported(e: gnitz_expr::ExprValidateErr) -> GnitzSqlError {
 }
 
 let Some(p) = compile_filter_program(pred, &schema.columns)? else { /* statically true */ };
-let logical = LogicalProgram::from_wire(&p.code, p.num_regs, p.result_reg, p.const_strings)
+let ev = LogicalProgram::from_wire(&p.code, p.num_regs, p.result_reg, p.const_strings)
+    .map_err(expr_unsupported)?
+    // `resolve_scalar` for HAVING / a SET RHS, `resolve_filter` for a residual.
+    .resolve_scalar(schema)
     .map_err(expr_unsupported)?;
-logical.validate(Some(schema), None).map_err(expr_unsupported)?;
-let prog = logical.resolve(schema, /* is_filter = */ …);
 ```
 The `ExprProgram` fields (`expr.rs:14`: `code: Vec<u32>`, `num_regs: u32`,
 `result_reg: u32`, `const_strings: Vec<Vec<u8>>`) are byte-for-byte
-`from_wire`'s parameters (`program.rs:470`) — no round trip.
+`from_wire`'s parameters (`program.rs:470`) — no round trip. The resolver does
+the schema-aware validation, so there is no separate `validate` call; both
+failure modes map through `expr_unsupported`.
 
 **The 64-register cap is an accepted narrowing.** `from_wire` runs `validate`
 internally via `assembled`, which rejects `num_regs > MAX_REGS = 64`
@@ -948,21 +865,21 @@ hard-coded at `select.rs:460`). Three consequences the design uses:
 
 **Compile at plan time, in `select.rs`, exactly where `having_supported` was.**
 Change `AggFinish`'s `having: Option<&'a BoundExpr>` (`agg_finish.rs:43`) to
-`having: Option<&'a ResolvedProgram>` — `ResolvedProgram` has no lifetime
-parameter (`program.rs:1065`), so `AggFinish<'a>`'s other `&'a` fields are
-unaffected, and `agg_finish.rs:178` is the only reader of `spec.having`
-repo-wide. In `select.rs` — after `bind_having_expr`, replacing the
-`having_supported` gate and its CREATE-VIEW-advice rejection (`:471-477`) — bind
-a local `let having_prog: Option<ResolvedProgram>` where `bound_having` is bound
-today, produced by the four lines against `&partial_schema` with `is_filter =
-false`, and pass `having_prog.as_ref()` at the construction site (`:522-528`).
+`having: Option<&'a Evaluator>` — `Evaluator` has no lifetime parameter, so
+`AggFinish<'a>`'s other `&'a` fields are unaffected, and `agg_finish.rs:178` is
+the only reader of `spec.having` repo-wide. In `select.rs` — after
+`bind_having_expr`, replacing the `having_supported` gate and its
+CREATE-VIEW-advice rejection (`:471-477`) — bind a local
+`let having_ev: Option<Evaluator>` where `bound_having` is bound today, produced
+by the shared lines above against `&partial_schema`, and pass
+`having_ev.as_ref()` at the construction site (`:522-528`).
 This keeps the rejection **pre-dispatch**, as today; compiling inside
 `agg_finish` would move it after the fold reply.
 
-`is_filter = false` (not `true`) because HAVING is evaluated row-at-a-time with
-`eval_scalar_row`: it demotes `result_reg` out of `bit_only`
-(`program.rs:1300-1303`) so `regs[result_reg]` is always live. It does not change
-`no_nulls` (`is_strictly_non_nullable` does not read `is_filter`), only register
+`resolve_scalar` (not `resolve_filter`) because HAVING is evaluated row-at-a-time
+with `Evaluator::eval_row`: it demotes `result_reg` out of `bit_only` so
+`regs[result_reg]` is always live. It does not change `no_nulls`
+(`is_strictly_non_nullable` does not read the classification), only register
 classification and AND-chain detection.
 
 **Evaluate over a reused one-row batch.** Replace `fill_having_row` +
@@ -973,10 +890,9 @@ classification and AND-chain detection.
 // hoisted above the loop, only when spec.having.is_some()
 let mut hav = ZSetBatch::new(spec.partial_schema);   // PkColumn::U128s, filler ColData per column
 let mut bufs = ViewBuffers::default();
-let mut scratch = EvalScratch::default();
 …
 // inside the loop, replacing the fill_having_row/eval_having/truthy block
-if let Some(prog) = spec.having {
+if let Some(ev) = spec.having {
     hav.truncate(0, spec.partial_schema);            // types.rs:846 — clears every per-row vec
     hav.pks.push_u128(g as u128);                    // _group_pk: never referenced
     hav.weights.push(1);
@@ -1006,7 +922,7 @@ if let Some(prog) = spec.having {
     hav.nulls.push(nw);
     bufs.fill(&hav, spec.partial_schema);
     let view = ZSetBatchView::new(&hav, spec.partial_schema, &bufs);
-    let (v, is_null) = eval_scalar_row(prog, &view, 0, &mut scratch);
+    let (v, is_null) = ev.eval_row(&view, 0);
     if is_null || v == 0 { continue; }
 }
 ```
@@ -1020,7 +936,7 @@ is already imported (`agg_finish.rs:20`). `push_fixed_bits`'s `unreachable!` can
 never fire: `agg_output_type` (`gnitz-wire/src/circuit.rs:168-190`) yields only
 `I64`/`U64`/`F64`/a fixed-int source type — all ≤ 8 bytes — so an `AggSpec`'s
 `out_type` is always a `ColData::Fixed` column. `view` is declared inside the
-`if let Some(prog)` block and its last use is `eval_scalar_row`, so NLL releases
+`if let Some(ev)` block and its last use is `ev.eval_row`, so NLL releases
 the `&hav`/`&bufs` borrows before the next iteration's `truncate`/`fill`. The
 null bits are
 **load-bearing** for the newly-enabled `IS NULL`: `acc_val` yields `Val::Null`
@@ -1032,7 +948,9 @@ arm is always the 8-byte case. Steady-state allocation is zero: `truncate` keeps
 capacity, `bufs.fill` reuses its `Vec`s.
 
 The truth test `is_null || v == 0 → drop` is exactly today's `truthy` + NULL-drop
-and bit-identical to the engine filter's `bool_bits & !null_bits`: for a boolean
+and bit-identical to the engine filter's `bool_bits & !null_bits` (`eval_row`
+reads a bit_only result out of `bool_bits`, exactly as the filter does): for a
+boolean
 result `regs` is 0/1 and `bool_bits` matches; for a float result both sides
 bit-test.
 
@@ -1049,8 +967,7 @@ rejection is a compile error, identical to CREATE VIEW.
 **One intentional semantic change: `-0.0` truthiness.** Today
 `truthy(Val::Float(f)) => f != 0.0`, so a bare float HAVING evaluating to `-0.0`
 drops the group. The VM holds float results as **bit patterns** and both the
-engine filter (`pack_to_bool_bits`, `batch.rs:276`) and `eval_scalar_row`
-bit-test, and `(-0.0f64).to_bits() != 0`, so the group is kept — a move *toward*
+engine filter (`pack_to_bool_bits`) and `Evaluator::eval_row` bit-test, and `(-0.0f64).to_bits() != 0`, so the group is kept — a move *toward*
 the CREATE VIEW path. NaN agrees on both (nonzero bits, `NaN != 0.0`).
 
 **Parity caveat — a pre-existing view-path bug.** The engine's physical reduce
@@ -1089,14 +1006,14 @@ Reply rows already arrive as a decoded `ZSetBatch` (`decode_wal_block`,
   nonnull_col IS NOT NULL` folds to `LitInt(1)` (`lower.rs:437`). The mirror case
   needs nothing: `LitInt(0)` fails the `v != 0` guard, compiles to a real
   `LoadConst 0`, and correctly drops every row;
-- else the four lines with `is_filter = true`, one `ViewBuffers`/`ZSetBatchView`,
-  and `filter_batch(&prog, &view, n, &mut EvalScratch::default(), |start, end|
+- else the shared lines with `resolve_filter`, one `ViewBuffers`/`ZSetBatchView`,
+  and `ev.filter(&view, n, |start, end|
   matched.extend(start..end))` — **`end` is exclusive, not a length**.
 
 `row_passes_residuals` (`:12`) is deleted. Its own doc comment carries the
 soundness argument for the fold: the engine `BoolAnd` nullable arm
 (`batch.rs:240-243`) yields definite-false when either side is definite-false and
-NULL otherwise, and `filter_batch` merges `bool_bits & !null_bits`, so a NULL
+NULL otherwise, and `Evaluator::filter` merges `bool_bits & !null_bits`, so a NULL
 conjunct excludes the row either way — identical to today's per-conjunct
 short-circuit. `and_chain_mask` (`program.rs:1163-1218`) requires the terminal
 instruction to be a `BoolAnd` writing `result_reg` and then walks whichever
@@ -1121,7 +1038,7 @@ adapter build for vectorized evaluation — a wash on a cold path.
 pub(crate) enum SetProgram {
     Str(String),          // BoundExpr::LitStr
     StrCol(usize),        // ColRef into a TypeCode::String column
-    Num(ResolvedProgram), // everything else — integer-valued
+    Num(Evaluator), // everything else — integer-valued
 }
 ```
 
@@ -1178,7 +1095,7 @@ Classification, per assignment, exactly as `eval_set_expr` decides today:
       Ok(eb.build(reg))
   }
   ```
-  then the shared `from_wire`/`validate`/`resolve` tail with `is_filter = false`.
+  then the shared `from_wire` / `resolve_scalar` tail.
 
   The float rejection is **required**: it replaces the check `InterpBackend`
   performs today (`lit_float` returns `(reg, true)` at `lower.rs:235`, float
@@ -1191,22 +1108,20 @@ Classification, per assignment, exactly as `eval_set_expr` decides today:
   `SET str = numeric` / `SET int = str` are rejected by `append_column_value`
   (`colwrite.rs:136,140`).
 
-  `is_filter = false` also keeps a boolean-valued RHS (`SET flag = a AND b`)
-  readable: it demotes `result_reg` out of `bit_only` (`program.rs:1303`), so
-  `BoolAnd`/`BoolNot` run `unpack_bool_to_regs` (`batch.rs:790,861`) and
-  `regs[result_reg]` is live.
+  `resolve_scalar` also keeps a boolean-valued RHS (`SET flag = a AND b`)
+  readable: it demotes `result_reg` out of `bit_only`, so `BoolAnd`/`BoolNot`
+  run `unpack_bool_to_regs` and `regs[result_reg]` is live.
 
 - `eval_set_program(p: &SetProgram, view: &ZSetBatchView, batch: &ZSetBatch,
-  row: usize, scratch: &mut EvalScratch) -> Result<ColumnValue>`: `Str(s)` →
+  row: usize) -> Result<ColumnValue>`: `Str(s)` →
   `ColumnValue::Str(s.clone())`; `StrCol(c)` → read `ColData::Strings` at `row`
-  (as today, `mutate.rs:49-57`); `Num(prog)` → `eval_scalar_row(prog, view, row,
-  scratch)` → `(_, true) => Null`, `(v, false) => Int(v)`. `eval_set_expr`
-  (`mutate.rs:41`) is deleted.
+  (as today, `mutate.rs:49-57`); `Num(ev)` → `ev.eval_row(view, row)` →
+  `(_, true) => Null`, `(v, false) => Int(v)`. `eval_set_expr` (`mutate.rs:41`)
+  is deleted. **No scratch parameter**: each `Evaluator` owns its register file.
 - `write_set_rows` (`mutate.rs:147`): takes `&[(usize, SetProgram)]`; builds one
-  `ViewBuffers` + `ZSetBatchView` over `current` and one `EvalScratch` before the
-  row loop; `asn_by_col` becomes `Vec<Option<&SetProgram>>`. `build_merged_row`'s
-  closure bound is `F: FnMut` (`mutate.rs:120`), so capturing `&mut EvalScratch`
-  is fine.
+  `ViewBuffers` + `ZSetBatchView` over `current` before the row loop;
+  `asn_by_col` becomes `Vec<Option<&SetProgram>>`. Nothing else is threaded
+  through it into `build_merged_row`.
 - `insert.rs`: `BoundUpdateExpr::{Existing(SetProgram), Excluded(SetProgram)}`
   (neither `ConflictPlan` `:28` nor `BoundUpdateExpr` `:44` derives
   `Clone`/`Debug`, and its only uses are `ConflictPlan::DoUpdatePk` `:37`,
@@ -1215,8 +1130,8 @@ Classification, per assignment, exactly as `eval_set_expr` decides today:
   **The EXCLUDED short-circuit at `insert.rs:348` builds
   `BoundUpdateExpr::Excluded(BoundExpr::ColRef(col_idx))` directly, bypassing
   `bind_mutate_scalar`** — route that bare `ColRef` through the same classifier.
-  Hoist **two** `ViewBuffers` (`bufs_excluded`, `bufs_existing`) plus one
-  `EvalScratch` above the loop — two are required because the `excluded` view
+  Hoist **two** `ViewBuffers` (`bufs_excluded`, `bufs_existing`) above the loop
+  — two are required because the `excluded` view
   holds `&bufs_excluded` for the whole loop, so the per-iteration `existing` fill
   needs a separately-owned buffer set (`&mut` vs the live `&`). Build the
   `excluded` view over `batch` once (it outlives the loop); for `existing` — an
@@ -1252,15 +1167,18 @@ kept in all three for uniformity:
 ### Codegen / throughput (mandatory step, not a gate)
 
 At the end of Sequencing **steps 3a, 3b and the `FixedInt` fold**, run the
-engine's `#[ignore]`d expr benches in `--release`, interleaved A/B against that
-step's parent commit (3a's run is recorded in its checkbox):
+`#[ignore]`d expr benches in `--release`, interleaved A/B against that
+step's parent commit (3a's run is recorded in its checkbox). They moved into
+`gnitz-expr` with the code, so they run against `TestView`, not `MemBatch` —
+which is why the codegen check below, not the timing, is the real evidence:
 ```
-cd crates && cargo test -p gnitz-engine --release and_chain_skip_bench \
+cd crates && cargo test -p gnitz-expr --release and_chain_skip_bench \
     -- --ignored --nocapture --test-threads=1
-cd crates && cargo test -p gnitz-engine --release str_const_filter_bench \
+cd crates && cargo test -p gnitz-expr --release str_const_filter_bench \
     -- --ignored --nocapture --test-threads=1
 ```
-(`expr/tests/batch_tests.rs:1363`, `:1463`.) Acceptance criterion: **throughput
+(`gnitz-expr/src/batch/tests.rs`, `gnitz-expr/src/eval/tests.rs`.)
+Acceptance criterion: **throughput
 parity**. Supporting evidence if a delta shows: `objdump -d` the `eval_batch`
 `Cmp` / `IntAdd` / `LoadPayloadInt` arms before and after — expected identical,
 since the generic instantiates in the engine's own codegen unit.
@@ -1269,10 +1187,10 @@ Both benches are `--release` with `lto = true`, so they are structurally blind t
 every `-O0` question the trait indirection raises — the `objdump` accessor-call
 count on the **debug** server binary is the real evidence there (3a's method).
 Their coverage, verified by reading both: `and_chain_skip_bench` drives
-`eval_batch` through its own morsel loop, never touching `run_filter`, and hits
-only `LoadPayloadInt`'s 8-byte arm — though its schema is fully nullable, so it
-does exercise the null-bit path. `str_const_filter_bench` uses `run_filter` over
-a non-nullable schema, so only the `no_nulls` arm. Neither covers `LoadPk`, the
+`eval_batch` through its own morsel loop, never touching `Evaluator::filter`, and
+hits only `LoadPayloadInt`'s 8-byte arm — though its schema is fully nullable, so
+it does exercise the null-bit path. `str_const_filter_bench` uses
+`Evaluator::filter` over a non-nullable schema, so only the `no_nulls` arm. Neither covers `LoadPk`, the
 narrow `load_int!` widths, or `eval_str_col_vs_col`.
 
 ### `SchemaFacts` equivalence test (load-bearing)
@@ -1381,7 +1299,7 @@ implementor — the same rule, and the same reason, as `assert_batchview_consist
   = x + 1` still reads the buffered `x` (the per-row `existing` view), and `ON
   CONFLICT DO UPDATE SET s = EXCLUDED.s` on a string column (the `insert.rs:348`
   classifier path). Retarget `eval.rs`'s div/overflow unit tests
-  (`test_div_mod_by_zero_is_null`:379 and neighbours) onto `eval_scalar_row` and
+  (`test_div_mod_by_zero_is_null`:379 and neighbours) onto `Evaluator::eval_row` and
   move them into `mutate.rs`'s test module. Update
   `gnitz-sql/tests/planner_null_predicate.rs`'s doc comment (lines 4, 10) — it
   narrates residual 3VL "through `eval_expr`"; prose only, still compiles.
@@ -1494,7 +1412,7 @@ implementor — the same rule, and the same reason, as `assert_batchview_consist
     method exists — most collide by name with one Rust would prefer in
     receiver-dot position — and as a direct column-table read for
     `col_type_code` / `col_nullable`, where the field *is* the fact.
-  - `resolve`, `validate`, `validate_predicate`, `check_col`, `check_copy_types`,
+  - `resolve_program`, `validate`, `validate_predicate`, `check_col`, `check_copy_types`,
     `check_emit_slot` and `is_strictly_non_nullable` read it as
     **`&dyn SchemaFacts`** / `Option<&dyn SchemaFacts>` (seven, not five:
     `af4360a5` merged `check_col_in_range`/`check_col_payload` into `check_col`
@@ -1593,45 +1511,89 @@ implementor — the same rule, and the same reason, as `assert_batchview_consist
     instruction the string compare executes, so a difference there is layout, not
     work. Judge this bench on codegen; use `and_chain` (4.68–4.78 ms, parity) for
     the timing check.
-- [ ] **3b: `git mv` `program.rs` + `batch.rs` into `gnitz-expr`**, plus the
-  filter entry points. A visibility + `use`-line pass whose **body diff is
-  empty**. Delete the `gnitz_debug!` (left in place by 3a: it violates no 3a
-  criterion, and deleting it early would have dropped a debug log for nothing if
-  3b slipped); move `ColKind` (a field of `ExprValidateErr::ColKindMismatch` and
-  the parameter of `check_col`, so it cannot stay behind) with its `payload_only`
-  helper; add `filter.rs` (`filter_batch` + `scan_filter_bits` +
-  `eval_scalar_row`); decide the public surface; `expr/mod.rs` shrinks to
-  re-exports (keeping `PkFill`); engine `plan.rs` retargets and
-  `ScalarFunc::run_filter` wraps `filter_batch`; retarget the four test files.
-  Not trivial — ~25 visibility markers and four test files reaching in via
-  `super::super::`. Three findings to carry:
-  - **The public surface is smaller than this plan's list assumes.** `validate`
-    is `pub(in crate::expr)` with **no caller outside `expr/`** — since
-    `af4360a5`, `ScalarFunc::from_predicate` / `from_map` return
-    `Result<Self, ExprValidateErr>` and validate internally, so `scan_spec.rs`
-    and `compiler/emit.rs` call *those*. In `gnitz-expr` `validate` becomes
-    `pub(crate)`; only `validate_predicate` needs `pub`. Re-derive the whole list
-    against live code, annotating `prod` vs `test-only`: `is_bit_only`'s only
-    engine caller is `plan.rs`'s `#[cfg(test)]` `evaluate_predicate`, which this
-    plan cites as production.
-  - **Three test imports this plan misses**, one in a file it claims needs no
-    change: `plan_tests.rs:1-2` (`use super::super::plan::{PkFill, ScalarFunc};`
-    and `use super::super::program::{ExprValidateErr, LogicalProgram};`),
-    `batch_tests.rs:6-7`, and `program_tests.rs:5` — a **glob** that must become
-    an explicit list, never `use gnitz_expr::*;`, in a 2291-line file that
-    already imports schema names. Also `tests/mod.rs:6` imports
-    `super::plan::read_reg_row0`, which stays engine-side.
-  - **`eval_scalar_row`'s ancestor is `ScalarFunc::evaluate_predicate`
-    (`plan.rs`), not the test helper `eval_predicate_via_batch`
-    (`tests/mod.rs`).** This plan copied the helper, inheriting its hardcoded
-    `ensure_capacity(…, /* no_nulls = */ false, 1)` and its missing guards.
-    `evaluate_predicate` already has the correct body: `no_nulls` passed through,
-    the `num_regs == 0` early return, and `!no_nulls &&` guarding both bit reads.
-    Forcing the nullable arm makes every row of a `prog.no_nulls` program pay
-    `fill_null_bits_mask` and `pack_to_bool_bits` on a per-*row* client path; and
-    the `num_regs == 0` guard must precede any `is_bit_only(result_reg)`
-    assertion, since `is_bit_only` is `bit_only_mask >> reg` and `validate`
-    bounds `result_reg` only when `num_regs != 0`.
+- [x] **DONE — 3b: `program.rs` + `batch.rs` live in `gnitz-expr`**, and the
+  crate is the evaluator. What landed:
+  - **`Evaluator` is the surface**, not `(prog, scratch)` free functions.
+    `LogicalProgram::resolve_{filter,map,scalar}(…) -> Result<Evaluator, _>`,
+    each validating before it resolves, and the `Evaluator` owns its
+    register file; `eval_row(mb, row) -> (i64, bool)`, `filter(mb, n,
+    append_range)`, `eval_morsels(mb, start, n, f)` (`f(rel_start, &MorselOut)`;
+    row ranges are half-open, `end` **exclusive**, everywhere), `copy_moves() ->
+    impl Iterator<Item = (ColumnLocator, u32)>`, `emit_targets() ->
+    impl Iterator<Item = (u16, u32)>`. `MorselOut` reads a morsel's results:
+    `rows`, `reg_values`, `for_each_null_row` — no `value` / `is_null`, since a
+    bit_only register is not in `regs` on the nullable arm and the only correct
+    single-row read is the crate-private `read_reg_row0`. Each of the three drive
+    methods carries its own body; there are no free `filter_batch` / `eval_row`
+    twins. `EvalScratch` (whose `ensure_capacity(&ResolvedProgram, n)` takes the
+    program, not its register count and nullability arm, so the scratch cannot be
+    sized for one arm and evaluated on the other), `MORSEL`, `NULL_WORDS_PER_REG`,
+    `eval_batch`, `read_reg_row0`, `is_bit_only`, `classify_registers`, the
+    `unsafe` split-borrow helpers (`reg_mut`, `reg3`, `null_words3`, `reg4`,
+    `clear_null_reg`, all `batch.rs`-private), `ResolvedProgram` and the whole
+    resolved `Instr` form are **private to the crate**. `LogicalProgram`, `LogicalInstr`, `CmpOp`, `StrOp`, `ColKind` and
+    `ExprValidateErr` stay public — they are the program-*construction* surface
+    the client legitimately builds against. Rewrite the three client sketches
+    (HAVING, residual, SET) against it: no `EvalScratch` is threaded anywhere,
+    and `eval_set_program` / `write_set_rows` / `build_merged_row` lose the
+    parameter entirely.
+  - `ScalarFunc::run_filter` and `evaluate_predicate` are **deleted**;
+    `filter_ranges` is the one engine spelling of "which rows pass", and it calls
+    `Evaluator::filter` directly. `Repr` is
+    `Predicate(Box<Evaluator>) | Map(Box<MapPlan>)`, and the map half's five
+    fields plus `map_ranges_into` / `map_rows_into` live on `MapPlan`, so the
+    variant is discriminated exactly twice (`filter_ranges` and the private
+    `ScalarFunc::map()`) instead of five times. A pure projection has
+    `compute: None` and never grows a register file. `MapPlan` resolves the
+    instruction stream **once, at construction** — `col_moves` from
+    `ev.copy_moves()` and `emits: Vec<(usize, usize)>` from `ev.emit_targets()`.
+    Neither is re-derived per morsel: measured at `-O0`, an `emit_targets()`
+    rescan inside the morsel callback costs ~52 instructions per program
+    instruction per morsel (474 for a 6-instruction program, 1930 for 34),
+    against 46 for the indexed walk over the resolved `Vec` — which
+    `append_map_ranges` pays per *range*, where `COMPACT_RUN_LEN` deliberately
+    lets 16-row ranges through uncompacted.
+    `map_rows_into`'s hand-rolled morsel loop is gone — `eval_morsels` is
+    the one home of `for morsel_start in (0..n).step_by(MORSEL)`.
+  - **The expr suite lives in `gnitz-expr`** — all 92 tests, in per-module
+    `tests` submodules (`program/`, `batch/`, `eval/`, `locator/`,
+    `schema_facts/`, `view/`) over **one** fixture family in `test_support`:
+    `TestView` / `TestSchema` (+ `TestSchema::with_pk_at`), the view builders
+    `make_int_view` / `make_int_row(schema, &[i64], null_word)` /
+    `make_n_col_view` / `make_string_view`, the schema builders
+    `schema_pk_ints` / `schema_pk_strings`, and the two program builders
+    `scalar_prog` / `filter_prog`. No test module defines its own schema, view or
+    program builder, and none names a bare type-code integer.
+    `assert_batchview_consistent` gained the negative case its sibling harness
+    already had — a `TestView` newtype whose `get_col_ptr` forgets one slot's
+    redirect must fail it. `expr/tests/mod.rs`
+    is gone; `plan_tests.rs` is `expr/tests.rs`, owns `make_int_batch`, and gains
+    one test pinning `from_predicate` → `filter_ranges` over a real `Batch`.
+    `SchemaColumn::corrupt` is deleted — `TestSchema` reports a type code
+    verbatim, so the escape hatch has no reason to exist.
+  - **No `crate::expr` re-export of anything from `gnitz-expr`** — call sites
+    name `gnitz_expr::` directly, matching the shipped `RowSource`/`BatchView`
+    decision. With `program.rs`/`batch.rs` gone the `expr/mod.rs` + `expr/plan.rs`
+    pair was a shim over a single child, so `expr` is now one file, `expr.rs`,
+    declaring `PkFill` / `ScalarFunc` directly plus `#[cfg(test)] mod tests;`.
+  - **One inlining doctrine**, stated once at the crate root, with the profile
+    fact behind it (no `[profile.test]`/`[profile.bench]`, so `#[inline]` is
+    decoration in this workspace). Its refinement is **measured, and is not what
+    an earlier draft of 3b assumed**: what gets `#[inline(always)]` is the
+    *test*, not the body. A per-row guard/forwarder/dispatch inlines; a per-row
+    item whose body is a *loop* stays out of line behind an always-inlined guard.
+    `ensure_capacity` (always-inlined length check + `#[cold] #[inline(never)]
+    grow`) and `maybe_pack_bool_bits` (always-inlined `no_nulls` /
+    `needs_bool_pack` test + out-of-line `pack_to_bool_bits`) are the two
+    instances: promoting the bodies too grew `eval_batch` from 12.7k to 22.1k
+    `-O0` instructions. Judge such a change on that instruction count, **not** on
+    the `-O0` AND-chain bench — re-measured, its run-to-run spread on one fixed
+    binary is 1.3×–1.8×, which swamps any effect an inlining decision has, and
+    `maybe_pack_bool_bits` runs once per instruction per *morsel* (≤62.5k calls
+    per pass), far too rarely for call overhead to move a 300 ms needle.
+    `for_each_null_row` is a deliberate, documented exception: a nested loop that
+    is still `#[inline(always)]`, since it has two call sites and its out-of-line
+    copies were about as large as the splice.
 - [ ] **Fold `FixedInt` into the load opcodes** (its own commit — it rewrites a
   per-row loop and deserves its own A/B). Its `validate`-side prerequisite is
   already satisfied: `check_col(…, ColKind::FixedInt)` makes
@@ -1705,18 +1667,19 @@ implementor — the same rule, and the same reason, as `assert_batchview_consist
   through `protocol/mod.rs` and `lib.rs`. Add `expr_unsupported` in `gnitz-sql`.
   **Run the `SchemaFacts` equivalence test here.**
 - [ ] **Swap HAVING**: compile in `select.rs` where `having_supported` was
-  (`is_filter = false`); change `AggFinish::having` to
-  `Option<&ResolvedProgram>`; replace the `fill_having_row`/`eval_having`/
-  `truthy` block with the reused one-row batch + `eval_scalar_row`; delete
+  (via `resolve_scalar`); change `AggFinish::having` to
+  `Option<&Evaluator>`; replace the `fill_having_row`/`eval_having`/
+  `truthy` block with the reused one-row batch + `Evaluator::eval_row`; delete
   `HavingEval` and its cluster (**keep `Val`**); drop the CREATE-VIEW-advice
   message; flip `adhoc_surface.rs` / `test_sql.py`; delete the two in-module
   `having_supported` tests; add the parity grid, the expected-SQL cases, the
   constant-HAVING cases, the zero-group cases and the register-cap cases.
-- [ ] **Swap residual + SET**: `matching_indices` onto `filter_batch` (empty-slice
+- [ ] **Swap residual + SET**: `matching_indices` onto `resolve_filter` +
+  `Evaluator::filter` (empty-slice
   and `Ok(None)` → `0..n`; `|start, end|`); add `compile_int_scalar_program` to
   `lower.rs`; `compile_set_programs` inside the RMW closure against
   `actual_schema`; the `insert.rs:348` EXCLUDED classifier; `write_set_rows` /
   `client_side_merge_do_update` onto `eval_set_program` with hoisted
-  `ViewBuffers`/`EvalScratch`; delete `exec/eval.rs`; retarget the div/overflow
+  `ViewBuffers`; delete `exec/eval.rs`; retarget the div/overflow
   tests; add the DML tests.
 - [ ] `make verify` + `make e2e` (`GNITZ_WORKERS=4`).

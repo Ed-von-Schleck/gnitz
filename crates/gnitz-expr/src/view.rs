@@ -38,14 +38,9 @@ pub trait RowSource {
 /// so an implementor that can compute a cell address directly does not pay to
 /// slice the whole region first. Deriving `get_col_ptr(row, c, s)` as
 /// `&col_data(c, s)[row * s..][..s]` costs a row-count load, a second multiply
-/// and a second range check per read. In an optimized build that is free — the
-/// batch reference is `noalias`, so the row count and the region range check are
-/// loop-invariant and get hoisted. At `-O0` it is not: there is no LICM, and
-/// **`#[inline]` is a no-op there** (only `#[inline(always)]` survives), so every
-/// per-row read becomes extra out-of-line calls plus the extra arithmetic. The
-/// debug server binary runs the whole E2E suite, so the direct form is the one
-/// that must exist — and the trivial forwarders that implement it must be
-/// `#[inline(always)]`, not `#[inline]`.
+/// and a second range check per read — free once LICM hoists them, but the
+/// debug build has no LICM and is what the whole E2E suite runs (see the
+/// crate-root inlining rule for why that build decides these questions).
 ///
 /// CONTRACT binding the two shapes, checked by [`assert_batchview_consistent`]:
 ///   `get_col_ptr(row, pi, sz) == &col_data(pi, sz)[row*sz .. row*sz + sz]`
@@ -98,3 +93,6 @@ pub fn assert_batchview_consistent<B: BatchView>(v: &B, rows: usize, cols: &[(us
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

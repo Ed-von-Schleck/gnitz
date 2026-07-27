@@ -1,0 +1,572 @@
+// `0 * MORSEL`, `1 * MORSEL`, `0 * NULL_WORDS_PER_REG` etc. are deliberate
+// layout-documenting expressions making the register/word index explicit at
+// each access site; collapsing them obscures which register is in use.
+#![allow(clippy::erasing_op, clippy::identity_op)]
+
+use gnitz_wire::type_code;
+
+use super::{eval_batch, EvalScratch, MORSEL, NULL_WORDS_PER_REG};
+use crate::eval::read_reg_row0;
+use crate::test_support::{
+    filter_prog, float_to_bits, make_int_row, make_int_view, make_n_col_view, scalar_prog, schema_pk_ints, TestSchema,
+    TestView,
+};
+use crate::{CmpOp, LogicalInstr, ResolvedProgram};
+
+/// Resolve a test program down to the raw evaluable form the kernel tests drive
+/// `eval_batch` with. The `Evaluator` wrapper is the *caller's* surface; these
+/// tests are below it.
+fn resolved(schema: &TestSchema, instrs: Vec<LogicalInstr>, num_regs: u32, result_reg: u32) -> ResolvedProgram {
+    scalar_prog(schema, instrs, num_regs, result_reg, vec![]).prog
+}
+
+/// A register file sized by hand — the split-borrow helper tests below are the
+/// only ones with no program to size it from. Everything else goes through
+/// `EvalScratch::ensure_capacity(&prog, _)`, which is what keeps the scratch's
+/// nullability arm and the program's from disagreeing.
+fn raw_scratch(num_regs: usize, no_nulls: bool, n: usize) -> EvalScratch {
+    let mut s = EvalScratch {
+        no_nulls,
+        ..Default::default()
+    };
+    let null_cap = if no_nulls { 0 } else { num_regs * NULL_WORDS_PER_REG };
+    s.grow(num_regs * MORSEL, null_cap, n.div_ceil(64));
+    s
+}
+
+#[test]
+fn test_scratch_reg3() {
+    let mut s = raw_scratch(3, /* no_nulls = */ true, MORSEL);
+    let m = 4;
+    // Fill regs 0 and 1 with known values
+    for i in 0..m {
+        s.regs[0 * MORSEL + i] = (i as i64) + 1;
+    }
+    for i in 0..m {
+        s.regs[1 * MORSEL + i] = (i as i64) * 10;
+    }
+    // Use reg3 to add reg0 + reg1 → reg2
+    {
+        let (ra, rb, rd) = s.reg3(0, 1, 2, m);
+        for i in 0..m {
+            rd[i] = ra[i] + rb[i];
+        }
+    }
+    assert_eq!(&s.regs[2 * MORSEL..2 * MORSEL + m], &[1, 12, 23, 34]);
+}
+
+#[test]
+fn test_scratch_null_words3() {
+    let mut s = raw_scratch(3, /* no_nulls = */ false, MORSEL);
+    let words = 1;
+    s.null_bits[0 * NULL_WORDS_PER_REG] = 0b1010;
+    s.null_bits[1 * NULL_WORDS_PER_REG] = 0b0110;
+    {
+        let (na, nb, nd) = s.null_words3(0, 1, 2, words);
+        nd[0] = na[0] | nb[0];
+    }
+    assert_eq!(s.null_bits[2 * NULL_WORDS_PER_REG], 0b1110);
+}
+
+#[test]
+fn test_eval_batch_add() {
+    let schema = schema_pk_ints(1, true);
+    let mb = make_int_view(&schema, &[(1, 0, &[10]), (2, 0, &[20]), (3, 0, &[30])]);
+
+    // r0 = pk (LoadColInt col 0 → resolves to Instr::LoadPk), r1 = col[1]
+    // (the first payload), r2 = r0 + r1
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 0 },
+        LogicalInstr::LoadColInt { dst: 1, col: 1 },
+        LogicalInstr::IntAdd { dst: 2, a: 0, b: 1 },
+    ];
+    let prog = resolved(&schema, instrs, 3, 2);
+    let mut scratch = EvalScratch::default();
+    scratch.ensure_capacity(&prog, 3);
+    eval_batch(&prog, &mb, 0, 3, &mut scratch);
+
+    // row 0: pk=1, val=10, sum=11
+    assert_eq!(scratch.regs[2 * MORSEL + 0], 11);
+    // row 1: pk=2, val=20, sum=22
+    assert_eq!(scratch.regs[2 * MORSEL + 1], 22);
+    // row 2: pk=3, val=30, sum=33
+    assert_eq!(scratch.regs[2 * MORSEL + 2], 33);
+}
+
+// ---------------------------------------------------------------------------
+// Edge-case golden tests at m=1
+//
+// These pin the points where the m=1 path through eval_batch could most
+// plausibly diverge from the historical per-row interpreter. They each set up
+// a one-row input and assert against a manually computed expected value via a
+// direct `eval_batch`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn golden_int_div_zero_divisor_single_row() {
+    let schema = schema_pk_ints(1, true);
+    let mb = make_int_row(&schema, &[10], 0);
+
+    // r0 = col1 = 10, r1 = 0, r2 = r0 / r1 → null
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 0 },
+        LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
+    ];
+    let prog = resolved(&schema, instrs, 3, 2);
+
+    let mut scratch = EvalScratch::default();
+    scratch.ensure_capacity(&prog, 1);
+    eval_batch(&prog, &mb, 0, 1, &mut scratch);
+    let is_null = (scratch.null_bits[2 * NULL_WORDS_PER_REG] & 1) != 0;
+    assert!(is_null, "INT_DIV by zero must produce NULL at m=1");
+    // The zero-mask merge into the destination null word must leave high bits zero.
+    assert_eq!(
+        scratch.null_bits[2 * NULL_WORDS_PER_REG] & !1u64,
+        0,
+        "high bits of dst null word must stay zero at m=1",
+    );
+}
+
+#[test]
+fn golden_float_div_zero_divisor_single_row() {
+    let schema = TestSchema::new(&[(type_code::U64, false), (type_code::F64, true)], &[0]);
+    // arbitrary non-zero F64 bits
+    let mb = make_int_view(&schema, &[(1, 0, &[float_to_bits(2.5)])]);
+
+    // r0 = col1 (f64), r1 = 0.0 bits, r2 = r0 / r1 → null
+    let instrs = vec![
+        LogicalInstr::LoadColFloat { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 0 },
+        LogicalInstr::FloatDiv { dst: 2, a: 0, b: 1 },
+    ];
+    let prog = resolved(&schema, instrs, 3, 2);
+
+    let mut scratch = EvalScratch::default();
+    scratch.ensure_capacity(&prog, 1);
+    eval_batch(&prog, &mb, 0, 1, &mut scratch);
+    let is_null = (scratch.null_bits[2 * NULL_WORDS_PER_REG] & 1) != 0;
+    assert!(is_null, "FLOAT_DIV by zero must produce NULL at m=1");
+    assert_eq!(
+        scratch.null_bits[2 * NULL_WORDS_PER_REG] & !1u64,
+        0,
+        "high bits of dst null word must stay zero at m=1",
+    );
+}
+
+/// Build a 1-row view with two nullable I64 columns plus a u64 PK.
+fn run_bool_combinator(schema: &TestSchema, batch: &TestView, op: fn(u16, u16, u16) -> LogicalInstr) -> (i64, bool) {
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadColInt { dst: 1, col: 2 },
+        op(2, 0, 1),
+    ];
+    let prog = resolved(schema, instrs, 3, 2);
+    let mut scratch = EvalScratch::default();
+    scratch.ensure_capacity(&prog, 1);
+    eval_batch(&prog, batch, 0, 1, &mut scratch);
+    let val = read_reg_row0(&prog, &scratch, 2);
+    let is_null = (scratch.null_bits[2 * NULL_WORDS_PER_REG] & 1) != 0;
+    // The 3VL whole-word path writes the full u64 for word 0; bits beyond
+    // bit 0 must be zero at m=1.
+    assert_eq!(
+        scratch.null_bits[2 * NULL_WORDS_PER_REG] & !1u64,
+        0,
+        "3VL whole-word path must leave high bits of dst null word zero at m=1",
+    );
+    (val, is_null)
+}
+
+#[test]
+fn golden_bool_and_3vl_single_row() {
+    let schema = schema_pk_ints(2, true);
+    // TRUE AND NULL = NULL: col1=1, col2=null (bit 1 set in null word)
+    let b = make_int_row(&schema, &[1, 0], 1u64 << 1);
+    let (_, n) = run_bool_combinator(&schema, &b, |dst, a, b| LogicalInstr::BoolAnd { dst, a, b });
+    assert!(n, "TRUE AND NULL must be NULL at m=1");
+
+    // FALSE AND NULL = FALSE: col1=0, col2=null
+    let b = make_int_row(&schema, &[0, 0], 1u64 << 1);
+    let (v, n) = run_bool_combinator(&schema, &b, |dst, a, b| LogicalInstr::BoolAnd { dst, a, b });
+    assert!(!n, "FALSE AND NULL must not be NULL at m=1");
+    assert_eq!(v, 0, "FALSE AND NULL must be FALSE at m=1");
+}
+
+#[test]
+fn golden_bool_or_3vl_single_row() {
+    let schema = schema_pk_ints(2, true);
+    // NULL OR TRUE = TRUE: col1=null (bit 0), col2=1
+    let b = make_int_row(&schema, &[0, 1], 1u64 << 0);
+    let (v, n) = run_bool_combinator(&schema, &b, |dst, a, b| LogicalInstr::BoolOr { dst, a, b });
+    assert!(!n, "NULL OR TRUE must not be NULL at m=1");
+    assert_eq!(v, 1, "NULL OR TRUE must be TRUE at m=1");
+
+    // NULL OR FALSE = NULL: col1=null, col2=0
+    let b = make_int_row(&schema, &[0, 0], 1u64 << 0);
+    let (_, n) = run_bool_combinator(&schema, &b, |dst, a, b| LogicalInstr::BoolOr { dst, a, b });
+    assert!(n, "NULL OR FALSE must be NULL at m=1");
+}
+
+#[test]
+fn golden_int_neg_null_source_single_row() {
+    let schema = schema_pk_ints(1, true);
+    // col1 null → INT_NEG result null. null_or1 at m=1.
+    let mb = make_int_row(&schema, &[0], 1);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::IntNeg { dst: 1, a: 0 },
+    ];
+    let prog = resolved(&schema, instrs, 2, 1);
+    let mut scratch = EvalScratch::default();
+    scratch.ensure_capacity(&prog, 1);
+    eval_batch(&prog, &mb, 0, 1, &mut scratch);
+    assert!(
+        (scratch.null_bits[1 * NULL_WORDS_PER_REG] & 1) != 0,
+        "INT_NEG of NULL must be NULL at m=1",
+    );
+}
+
+#[test]
+fn golden_bool_not_null_source_single_row() {
+    let schema = schema_pk_ints(1, true);
+    let mb = make_int_row(&schema, &[0], 1);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::BoolNot { dst: 1, a: 0 },
+    ];
+    let prog = resolved(&schema, instrs, 2, 1);
+    let mut scratch = EvalScratch::default();
+    scratch.ensure_capacity(&prog, 1);
+    eval_batch(&prog, &mb, 0, 1, &mut scratch);
+    assert!(
+        (scratch.null_bits[1 * NULL_WORDS_PER_REG] & 1) != 0,
+        "NOT NULL must be NULL at m=1",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SELECT (CASE blend) — word/morsel boundary sweep
+// ---------------------------------------------------------------------------
+
+/// SELECT over nullable branches, differential against a per-row 3VL reference,
+/// across every word/morsel boundary (1, 63, 64, 65, 128, 256, 257 rows). The
+/// nullable arm blends null masks at word granularity and values row-by-row, so
+/// a tail-word or boundary bug shows up as a value/null mismatch on some row.
+#[test]
+fn select_boundary_sweep() {
+    // Schema: pk(u64), cond(i64 nullable), a(i64 nullable), b(i64 nullable).
+    let schema = schema_pk_ints(3, true);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // cond
+        LogicalInstr::LoadColInt { dst: 1, col: 2 }, // a
+        LogicalInstr::LoadColInt { dst: 2, col: 3 }, // b
+        LogicalInstr::Select {
+            dst: 3,
+            cond: 0,
+            a: 1,
+            b: 2,
+        },
+    ];
+    let prog = resolved(&schema, instrs, 4, 3);
+
+    // Row-parameterized generators (must match the closures passed to make_n_col_view).
+    let cond_val = |row: usize| (row as i64) % 3 - 1; // cycles -1, 0, 1
+    let a_val = |row: usize| 1000 + row as i64;
+    let b_val = |row: usize| 2000 + row as i64;
+    let cond_null = |row: usize| row.is_multiple_of(5);
+    let a_null = |row: usize| row.is_multiple_of(7);
+    let b_null = |row: usize| row.is_multiple_of(11);
+
+    for &n in &[1, 63, 64, 65, 128, 256, 257] {
+        let mb = make_n_col_view(
+            &schema,
+            n,
+            |row, col| match col {
+                0 => cond_val(row),
+                1 => a_val(row),
+                _ => b_val(row),
+            },
+            |row, col| match col {
+                0 => cond_null(row),
+                1 => a_null(row),
+                _ => b_null(row),
+            },
+        );
+
+        let mut scratch = EvalScratch::default();
+        for morsel_start in (0..n).step_by(MORSEL) {
+            let m = MORSEL.min(n - morsel_start);
+            scratch.ensure_capacity(&prog, m);
+            eval_batch(&prog, &mb, morsel_start, m, &mut scratch);
+            let r = 3usize; // result_reg
+            for i in 0..m {
+                let row = morsel_start + i;
+                let take_a = !cond_null(row) && cond_val(row) != 0;
+                let (exp_val, exp_null) = if take_a {
+                    (a_val(row), a_null(row))
+                } else {
+                    (b_val(row), b_null(row))
+                };
+                let got_null = (scratch.null_bits[r * NULL_WORDS_PER_REG + i / 64] >> (i % 64)) & 1 != 0;
+                assert_eq!(got_null, exp_null, "n={n} row={row}: null mismatch");
+                if !exp_null {
+                    assert_eq!(scratch.regs[r * MORSEL + i], exp_val, "n={n} row={row}: value mismatch");
+                }
+            }
+        }
+    }
+}
+
+/// SELECT on the no-nulls fast arm: NOT NULL branches select `no_nulls=true`, so
+/// the value blend runs through `reg4` with no mask tracking. Verify the blend.
+#[test]
+fn select_no_nulls_fast_arm() {
+    // cond / a / b are all NOT NULL, which selects the no_nulls fast arm.
+    let schema = schema_pk_ints(3, false);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadColInt { dst: 1, col: 2 },
+        LogicalInstr::LoadColInt { dst: 2, col: 3 },
+        LogicalInstr::Select {
+            dst: 3,
+            cond: 0,
+            a: 1,
+            b: 2,
+        },
+    ];
+    let prog = resolved(&schema, instrs, 4, 3);
+    assert!(prog.no_nulls, "NOT NULL branches must select the no_nulls fast arm");
+
+    let n = 130usize; // crosses a 64-bit word and the MORSEL boundary isn't hit, but words are
+    let mb = make_n_col_view(
+        &schema,
+        n,
+        |row, col| match col {
+            0 => (row % 2) as i64, // alternating truthy/false
+            1 => 1000 + row as i64,
+            _ => 2000 + row as i64,
+        },
+        |_, _| false,
+    );
+    let mut scratch = EvalScratch::default();
+    scratch.ensure_capacity(&prog, n);
+    eval_batch(&prog, &mb, 0, n, &mut scratch);
+    for row in 0..n {
+        let expected = if row % 2 == 1 {
+            1000 + row as i64
+        } else {
+            2000 + row as i64
+        };
+        assert_eq!(scratch.regs[3 * MORSEL + row], expected, "row {row}: no-nulls blend");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bit-only / bool_bits vectorization tests
+// ---------------------------------------------------------------------------
+
+/// Boolean register consumed by an arithmetic opcode forces it OUT of
+/// bit_only. The AND result must still appear correctly in `regs` for the
+/// downstream add.
+#[test]
+fn bit_only_demotion_when_bool_feeds_arithmetic() {
+    let schema = schema_pk_ints(2, true);
+    // col1=2, col2=3, no nulls. Both > 1, so AND = 1. Add 0 → result = 1.
+    let mb = make_int_row(&schema, &[2, 3], 0);
+
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col1
+        LogicalInstr::LoadConst { dst: 1, val: 1 },  // r1 = 1
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 2,
+            a: 0,
+            b: 1,
+        }, // r2 = col1 > 1
+        LogicalInstr::LoadColInt { dst: 3, col: 2 }, // r3 = col2
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 4,
+            a: 3,
+            b: 1,
+        }, // r4 = col2 > 1
+        LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 }, // r5 = r2 AND r4    (consumed by ADD → not bit_only)
+        LogicalInstr::LoadConst { dst: 6, val: 0 },  // r6 = 0
+        LogicalInstr::IntAdd { dst: 7, a: 5, b: 6 }, // r7 = r5 + 0 = bool-as-int
+    ];
+    let prog = resolved(&schema, instrs, 8, 7);
+    // r5 is bool-produced but consumed by INT_ADD (non-bool). Must be demoted.
+    assert!(
+        !prog.is_bit_only(5),
+        "bool reg fed into arithmetic must NOT be bit_only",
+    );
+
+    let mut scratch = EvalScratch::default();
+    scratch.ensure_capacity(&prog, 1);
+    eval_batch(&prog, &mb, 0, 1, &mut scratch);
+    // r5 lives in regs as 0/1; r7 = r5 + 0 = 1.
+    assert_eq!(
+        scratch.regs[5 * MORSEL],
+        1,
+        "AND result must land in regs when !bit_only"
+    );
+    assert_eq!(scratch.regs[7 * MORSEL], 1, "downstream arithmetic reads bool as i64");
+}
+
+// ---------------------------------------------------------------------------
+// AND-chain dead-tail short-circuit (the runtime skip in eval_batch)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// A/B microbench for the AND-chain dead-tail skip (regression artifact).
+// ---------------------------------------------------------------------------
+
+/// Drive `eval_batch` over every morsel of `mb`, XOR-folding the terminal filter
+/// word into a checksum (anti-elision + an ON/OFF equivalence guard). The skip
+/// lives entirely in `eval_batch`; the filter's bit extraction is a fixed
+/// per-morsel cost, so isolating `eval_batch` measures the mechanism directly.
+fn run_chain_eval(prog: &ResolvedProgram, mb: &TestView, n: usize, scratch: &mut EvalScratch) -> u64 {
+    let base = prog.result_reg as usize * NULL_WORDS_PER_REG;
+    let mut checksum = 0u64;
+    for morsel_start in (0..n).step_by(MORSEL) {
+        let m = MORSEL.min(n - morsel_start);
+        eval_batch(prog, mb, morsel_start, m, scratch);
+        for w in 0..m.div_ceil(64) {
+            checksum ^= scratch.bool_bits[base + w] & !scratch.null_bits[base + w];
+        }
+    }
+    checksum
+}
+
+/// Time `run_chain_eval` with the skip ON (computed mask) vs OFF (mask zeroed)
+/// over `min` of `ITERS` order-alternated iterations; assert ON and OFF agree.
+fn bench_chain(label: &str, prog_on: &ResolvedProgram, prog_off: &ResolvedProgram, mb: &TestView, n: usize) {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    let mut scratch = EvalScratch::default();
+    scratch.ensure_capacity(prog_on, MORSEL);
+
+    // Warm up and confirm the skip does not change the result.
+    let c_on = run_chain_eval(prog_on, mb, n, &mut scratch);
+    let c_off = run_chain_eval(prog_off, mb, n, &mut scratch);
+    assert_eq!(c_on, c_off, "{label}: skip ON/OFF produced different filter results");
+
+    const ITERS: usize = 60;
+    let (mut min_on, mut min_off) = (u128::MAX, u128::MAX);
+    for i in 0..ITERS {
+        // Alternate which variant is timed first to cancel ordering drift.
+        if i % 2 == 0 {
+            let s = Instant::now();
+            black_box(run_chain_eval(prog_on, mb, n, &mut scratch));
+            min_on = min_on.min(s.elapsed().as_nanos());
+            let s = Instant::now();
+            black_box(run_chain_eval(prog_off, mb, n, &mut scratch));
+            min_off = min_off.min(s.elapsed().as_nanos());
+        } else {
+            let s = Instant::now();
+            black_box(run_chain_eval(prog_off, mb, n, &mut scratch));
+            min_off = min_off.min(s.elapsed().as_nanos());
+            let s = Instant::now();
+            black_box(run_chain_eval(prog_on, mb, n, &mut scratch));
+            min_on = min_on.min(s.elapsed().as_nanos());
+        }
+    }
+    let (ms_on, ms_off) = (min_on as f64 / 1e6, min_off as f64 / 1e6);
+    let delta = (min_off as f64 - min_on as f64) / min_off as f64 * 100.0;
+    println!(
+        "{label}: skip ON {ms_on:.2} ms  OFF {ms_off:.2} ms  ({n} rows)  -> {:.1}% {}",
+        delta.abs(),
+        if delta >= 0.0 {
+            "faster with skip"
+        } else {
+            "slower with skip"
+        },
+    );
+}
+
+/// A/B microbench: 1M-row batch, 5-clause nullable chain
+/// `a > t AND b > 0 AND c > 0 AND d > 0 AND e > 0`, skip toggled via the trigger
+/// mask in one binary. Run with:
+///   cargo test -p gnitz-expr --release and_chain_skip_bench \
+///       -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+fn and_chain_skip_bench() {
+    // PK + 5 nullable I64 columns.
+    let schema = schema_pk_ints(5, true);
+
+    // a > THRESHOLD AND b > 0 AND c > 0 AND d > 0 AND e > 0  (16 regs, result r15).
+    let build_instrs = |threshold: i64| {
+        vec![
+            LogicalInstr::LoadColInt { dst: 0, col: 1 }, // a
+            LogicalInstr::LoadConst { dst: 1, val: threshold },
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 2,
+                a: 0,
+                b: 1,
+            },
+            LogicalInstr::LoadColInt { dst: 3, col: 2 }, // b
+            LogicalInstr::LoadConst { dst: 4, val: 0 },
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 5,
+                a: 3,
+                b: 4,
+            },
+            LogicalInstr::BoolAnd { dst: 6, a: 2, b: 5 }, // trigger
+            LogicalInstr::LoadColInt { dst: 7, col: 3 },  // c
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 8,
+                a: 7,
+                b: 4,
+            },
+            LogicalInstr::BoolAnd { dst: 9, a: 6, b: 8 }, // trigger
+            LogicalInstr::LoadColInt { dst: 10, col: 4 }, // d
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 11,
+                a: 10,
+                b: 4,
+            },
+            LogicalInstr::BoolAnd { dst: 12, a: 9, b: 11 }, // trigger
+            LogicalInstr::LoadColInt { dst: 13, col: 5 },   // e
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 14,
+                a: 13,
+                b: 4,
+            },
+            LogicalInstr::BoolAnd { dst: 15, a: 12, b: 14 }, // result
+        ]
+    };
+
+    const N: usize = 1_000_000;
+
+    // Favorable: a = row (clustered), threshold at ~70% so the first ~70% of
+    // morsels are entirely a <= t (definite-FALSE); the rest pass all 5 clauses
+    // (b..e = 10 > 0). No nulls in a/b so the skip fires cleanly.
+    let favorable = make_n_col_view(
+        &schema,
+        N,
+        |row, col| if col == 0 { row as i64 } else { 10 },
+        |_, _| false,
+    );
+    // Neutral: a = 10 with threshold -1 (always true), so every morsel keeps a
+    // survivor and the skip never fires — measures the alive-reduce overhead.
+    let neutral = make_n_col_view(&schema, N, |_, _| 10, |_, _| false);
+
+    let mut variants: Vec<(&str, &TestView, i64)> = vec![
+        ("favorable", &favorable, (N as i64 * 7) / 10),
+        ("neutral", &neutral, -1),
+    ];
+    for (label, mb, threshold) in variants.drain(..) {
+        let prog_on = filter_prog(&schema, build_instrs(threshold), 16, 15, vec![]).prog;
+        let mut prog_off = filter_prog(&schema, build_instrs(threshold), 16, 15, vec![]).prog;
+        assert_ne!(prog_on.chain_trigger_mask, 0, "bench prog should have a detected chain");
+        prog_off.chain_trigger_mask = 0;
+        bench_chain(label, &prog_on, &prog_off, mb, N);
+    }
+}

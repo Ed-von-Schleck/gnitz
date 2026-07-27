@@ -590,7 +590,7 @@ pub(crate) fn merge_less<'a, S, RowCmp>(
     row_cmp: RowCmp,
 ) -> impl Fn(&HeapNode, &HeapNode) -> bool + Copy + 'a
 where
-    S: ColumnarSource,
+    S: RowSource,
     RowCmp: Fn(&SchemaDescriptor, &S, usize, &S, usize) -> Ordering + Copy + 'a,
 {
     move |a, b| {
@@ -611,9 +611,7 @@ where
 /// for the dominant ≤16-byte PK (the `compare_pk_bytes` tiebreak fires only
 /// when two wide PKs share a 16-byte prefix, so they never fold).
 #[inline]
-pub(crate) fn merge_same_pk<S: ColumnarSource>(
-    sources: &[S],
-) -> impl Fn(usize, usize, usize, usize) -> bool + Copy + '_ {
+pub(crate) fn merge_same_pk<S: RowSource>(sources: &[S]) -> impl Fn(usize, usize, usize, usize) -> bool + Copy + '_ {
     move |a_src, a_row, b_src, b_row| {
         compare_pk_ordering(sources[a_src].get_pk_bytes(a_row), sources[b_src].get_pk_bytes(b_row)) == Ordering::Equal
     }
@@ -628,7 +626,6 @@ pub(crate) fn merge_eq_payload<'a, S, RowCmp>(
     row_cmp: RowCmp,
 ) -> impl Fn(usize, usize, usize, usize) -> bool + Copy + 'a
 where
-    S: ColumnarSource,
     RowCmp: Fn(&SchemaDescriptor, &S, usize, &S, usize) -> Ordering + Copy + 'a,
 {
     move |a_src, a_row, b_src, b_row| row_cmp(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Equal

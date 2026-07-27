@@ -1,16 +1,21 @@
 //! Scalar function types for DBSP filter and map operators.
 //!
 //! `ScalarFunc` cleanly separates columnar operations (column moves, null
-//! permutation) from per-row operations (the expression interpreter). The VM
-//! passes one opaque `*const ScalarFunc` handle for any filter / map /
-//! projection.
+//! permutation) from per-row operations (the expression kernel). The VM passes
+//! one opaque `*const ScalarFunc` handle for any filter / map / projection.
+//!
+//! The evaluator itself lives in `gnitz-expr`; this module is a consumer of that
+//! crate, not its home, so `LogicalProgram`, the instruction model and the
+//! resolved form are named `gnitz_expr::` at each call site rather than
+//! re-exported here.
 
-use std::cell::RefCell;
+#[cfg(test)]
+mod tests;
 
-use super::batch::{eval_batch, for_each_null_row, EvalScratch, MORSEL, NULL_WORDS_PER_REG};
-use super::program::{ExprValidateErr, Instr, LogicalProgram, ResolvedProgram};
+use gnitz_expr::{Evaluator, ExprValidateErr, LogicalProgram};
+
 use crate::schema::{ColumnLocator, SchemaDescriptor};
-use crate::storage::{Batch, MemBatch};
+use crate::storage::Batch;
 
 /// Average survivor-run length below which [`ScalarFunc::append_map_ranges`]
 /// compacts a fragmented range list before running the compute kernel — see the
@@ -77,7 +82,9 @@ fn copy_column(
             let dst = output.col_data_mut(cm.dst_payload);
             let pk_off = byte_off as usize;
             let src_stride = size as usize;
-            let mut le = [0u8; crate::schema::MAX_PK_BYTES];
+            // One PK column, so 16 bytes covers every fixed-width type — not
+            // MAX_PK_BYTES, which is the whole multi-column PK stride.
+            let mut le = [0u8; 16];
             for i in 0..n {
                 let opk = in_batch.get_pk_bytes(src_start + i);
                 // Read the source column's OWN width from the OPK region (not the wider
@@ -102,14 +109,23 @@ fn copy_column(
                 // blob region. Relocate each cell's bytes into the output blob; the
                 // shared BlobCache deduplicates identical spans across all columns/rows
                 // of this MAP.
+                //
+                // A map never widens a string column, so both sides are the same
+                // 16-byte cell — asserted rather than assumed, since the loop
+                // below reads and writes at that one width.
+                debug_assert_eq!(
+                    (src_stride, stride),
+                    (16, 16),
+                    "German-string column moved at a non-16-byte stride",
+                );
                 let src_col = in_batch.col_data(in_pi);
                 // One split borrow, so the destination region is resolved once
                 // rather than per row.
                 let (dst_col, dst_blob) = output.col_and_blob_mut(cm.dst_payload);
                 for i in 0..n {
-                    let src_off = (src_start + i) * stride;
+                    let src_off = (src_start + i) * 16;
                     let cell = crate::schema::relocate_german_string_vec(
-                        &src_col[src_off..src_off + stride],
+                        &src_col[src_off..src_off + 16],
                         &in_batch.blob,
                         dst_blob,
                         blob_cache.as_deref_mut(),
@@ -236,7 +252,7 @@ impl NullPerm {
         }
         for row in 0..n {
             let in_null = gnitz_wire::read_u64_le(in_null_bmp, (src_start + row) * 8);
-            dst[row * 8..row * 8 + 8].copy_from_slice(&self.apply(in_null).to_le_bytes());
+            gnitz_wire::write_u64_le(dst, row * 8, self.apply(in_null));
         }
     }
 }
@@ -262,244 +278,130 @@ struct ColMove {
     stride: u8,
 }
 
-/// One EMIT target: computed register `reg` → output payload column `payload`.
-/// No width: `validate`'s `check_emit_slot` holds every EMIT destination to an
-/// 8-byte slot, so the store is monomorphic.
-struct EmitCol {
-    payload: usize,
-    reg: usize,
-}
-
-struct InterpretedCompute {
-    prog: ResolvedProgram,
-    emits: Vec<EmitCol>,
-}
-
 /// A compiled scalar function. The role is fixed at construction — the
 /// compiler/VM dispatch is per-node, so a func is only ever driven through the
 /// entry point matching its variant. Newtype over the private enum so the
 /// variant fields keep the module's internal visibility.
 pub struct ScalarFunc(Repr);
 
+/// Both variants are boxed so `Repr` stays pointer-sized: a `MapPlan` owns a
+/// whole `SchemaDescriptor` and an `Evaluator` a whole register file, so either
+/// one inline would size the enum for both. One indirection per batch is free —
+/// a `ScalarFunc` is built once per plan node.
 enum Repr {
-    /// Filter predicate. `prog.no_nulls` carries the nullability verdict
-    /// against the schema it was resolved against.
-    Predicate {
-        prog: ResolvedProgram,
-        scratch: RefCell<EvalScratch>,
-    },
-    /// Map/projection: columnar moves + null permutation + optional per-row
-    /// compute kernel, with the owned output schema.
-    Map {
-        col_moves: Vec<ColMove>,
-        null_perm: NullPerm,
-        compute: Option<InterpretedCompute>,
-        /// Precomputed [`compute_blob_passthrough`]: skip per-cell string
-        /// relocation and share the input blob when no string column is dropped.
-        blob_passthrough: bool,
-        /// Boxed: the descriptor is by far the largest field and would bloat
-        /// every `Repr` (clippy: large_enum_variant); one indirection per
-        /// batch is free.
-        out_schema: Box<SchemaDescriptor>,
-        scratch: RefCell<EvalScratch>,
-    },
+    /// Filter predicate, resolved against the schema it runs on (which is what
+    /// fixes its nullability verdict) and carrying its own register file.
+    Predicate(Box<Evaluator>),
+    Map(Box<MapPlan>),
 }
 
-/// Read register `r`'s value after an m=1 `eval_batch`. On the nullable arm a
-/// bit_only register is never unpacked into `regs`, so its truth value lives at
-/// bit 0 of `bool_bits` instead — the one reader both `evaluate_predicate` and
-/// the expression tests go through.
-#[cfg(test)]
-#[inline]
-pub(in crate::expr) fn read_reg_row0(prog: &ResolvedProgram, scratch: &EvalScratch, r: usize) -> i64 {
-    if !prog.no_nulls && prog.is_bit_only(r) {
-        i64::from((scratch.bool_bits[r * NULL_WORDS_PER_REG] & 1) != 0)
-    } else {
-        scratch.regs[r * MORSEL]
-    }
+/// Map/projection: columnar moves + null permutation + optional per-row compute
+/// kernel, with the owned output schema. Every map method lives here rather than
+/// on [`ScalarFunc`], so the internal `map_ranges_into` → `map_rows_into` chain
+/// reads its fields directly instead of re-checking the variant per call.
+struct MapPlan {
+    col_moves: Vec<ColMove>,
+    null_perm: NullPerm,
+    /// `Some` iff the program emits a computed register — a pure projection is
+    /// `None` and never grows a register file.
+    compute: Option<Evaluator>,
+    /// `(source register, output payload slot)` per `Emit`, resolved once at
+    /// construction like [`Self::col_moves`]. Empty iff `compute` is `None`.
+    /// Walking the evaluator's instruction stream instead would re-scan it once
+    /// per morsel, which the range-driven `append_map_ranges` path (16-row
+    /// ranges) pays on top of very little work.
+    emits: Vec<(usize, usize)>,
+    /// Precomputed [`compute_blob_passthrough`]: skip per-cell string relocation
+    /// and share the input blob when no string column is dropped.
+    blob_passthrough: bool,
+    out_schema: SchemaDescriptor,
 }
 
 impl ScalarFunc {
-    /// Filter via interpreted expression. Validating here rather than at each
-    /// call site makes "this program was checked against the schema it runs
-    /// against" an invariant of the type: the arguments `validate` needs are
-    /// exactly this function's, so no construction path can skip it.
+    /// Filter via interpreted expression.
     pub fn from_predicate(logical: LogicalProgram, schema: &SchemaDescriptor) -> Result<Self, ExprValidateErr> {
-        logical.validate_predicate(schema)?;
-        Ok(ScalarFunc(Repr::Predicate {
-            prog: logical.resolve(schema, /* is_filter = */ true),
-            scratch: RefCell::new(EvalScratch::default()),
-        }))
+        Ok(ScalarFunc(Repr::Predicate(Box::new(logical.resolve_filter(schema)?))))
     }
 
     /// Map plan from a logical expression program. A pure projection is the
     /// special case where every instruction is a `CopyCol` (see
     /// [`LogicalProgram::copy_cols`]): `compute` is `None` and the plan reduces to
     /// `col_moves` + `null_perm`.
-    /// Validated against both schemas here — see [`Self::from_predicate`]. The
-    /// EMIT store below reads a fixed 8-byte output slot, which is `validate`'s
-    /// `check_emit_slot` rule; running it inside the constructor makes that a
-    /// precondition of the type rather than a convention among callers.
     pub fn from_map(
         logical: LogicalProgram,
         in_schema: &SchemaDescriptor,
         out_schema: &SchemaDescriptor,
     ) -> Result<Self, ExprValidateErr> {
-        logical.validate(Some(in_schema), Some(out_schema))?;
-        let prog = logical.resolve(in_schema, /* is_filter = */ false);
-        // One pass over the resolved instructions — `CopyCol`'s locator carries
-        // the PK-vs-payload distinction, so there is no negative-sentinel decode
-        // and no parallel-`Vec` bytecode re-walk.
+        let ev = logical.resolve_map(in_schema, out_schema)?;
+        // Both instruction-stream reads happen here, once per plan node: the
+        // resolved `CopyCol` locator carries the PK-vs-payload distinction and
+        // the `Emit` targets are the output slots the compute kernel writes.
+        // Neither is re-derived per morsel.
         let out_stride = |payload: usize| out_schema.columns[out_schema.payload_col_idx(payload)].size();
-        let mut col_moves: Vec<ColMove> = Vec::new();
-        let mut emits: Vec<EmitCol> = Vec::new();
-        for instr in &prog.instrs {
-            match *instr {
-                Instr::CopyCol { src, out } => col_moves.push(ColMove {
-                    src,
-                    dst_payload: out as usize,
-                    stride: out_stride(out as usize),
-                }),
-                Instr::Emit { src, out } => emits.push(EmitCol {
-                    payload: out as usize,
-                    reg: src as usize,
-                }),
-                _ => {}
-            }
-        }
-
+        let col_moves: Vec<ColMove> = ev
+            .copy_moves()
+            .map(|(src, out)| ColMove {
+                src,
+                dst_payload: out as usize,
+                stride: out_stride(out as usize),
+            })
+            .collect();
+        let emits: Vec<(usize, usize)> = ev
+            .emit_targets()
+            .map(|(reg, out)| (reg as usize, out as usize))
+            .collect();
         // Null permutation: copied columns carry their source null bit (PK
         // sources are skipped inside `NullPerm::new` — the PK has no null bit).
         let null_perm = NullPerm::new(&col_moves);
 
         // Compute is needed iff the program emits a computed register: every
         // compute instruction exists only to feed an EMIT.
-        let compute = (!emits.is_empty()).then_some(InterpretedCompute { prog, emits });
+        let compute = (!emits.is_empty()).then_some(ev);
 
         let blob_passthrough = compute_blob_passthrough(in_schema, &col_moves);
 
-        Ok(ScalarFunc(Repr::Map {
+        Ok(ScalarFunc(Repr::Map(Box::new(MapPlan {
             col_moves,
             null_perm,
             compute,
+            emits,
             blob_passthrough,
-            out_schema: Box::new(*out_schema),
-            scratch: RefCell::new(EvalScratch::default()),
-        }))
+            out_schema: *out_schema,
+        }))))
+    }
+
+    /// The map plan. The VM's dispatch is per-node, so a func is only ever
+    /// driven through the entry points matching its variant — this is the one
+    /// place that says so for the map half.
+    fn map(&self) -> &MapPlan {
+        match &self.0 {
+            Repr::Map(m) => m,
+            Repr::Predicate(_) => unreachable!("map entry point on a Predicate ScalarFunc"),
+        }
     }
 
     /// The map's owned output schema. Callers that construct or stamp the
-    /// output batch outside `evaluate_map_batch` (op_map's reindex arms) read
-    /// it here instead of carrying a parallel schema operand.
+    /// output batch outside [`Self::evaluate_map_batch`] (op_map's reindex arms)
+    /// read it here instead of carrying a parallel schema operand.
     pub fn map_out_schema(&self) -> &SchemaDescriptor {
-        match &self.0 {
-            Repr::Map { out_schema, .. } => out_schema,
-            Repr::Predicate { .. } => unreachable!("predicate ScalarFunc has no output schema"),
-        }
-    }
-
-    /// Evaluate predicate for a single row. Thin wrapper over `eval_batch` at
-    /// m=1, reading the result through [`read_reg_row0`].
-    #[cfg(test)]
-    pub(crate) fn evaluate_predicate(&self, batch: &MemBatch, row: usize) -> bool {
-        let Repr::Predicate { prog, scratch } = &self.0 else {
-            unreachable!("evaluate_predicate on a Map ScalarFunc");
-        };
-        let no_nulls = prog.no_nulls;
-        let mut scratch = scratch.borrow_mut();
-        scratch.ensure_capacity(prog.num_regs as usize, no_nulls, 1);
-        eval_batch(prog, batch, row, 1, &mut scratch);
-        let r = prog.result_reg as usize;
-        let is_null = !no_nulls && (scratch.null_bits[r * NULL_WORDS_PER_REG] & 1) != 0;
-        !is_null && read_reg_row0(prog, &scratch, r) != 0
-    }
-
-    /// Run the filter over all `n` rows of `mb`, invoking `append_range` for
-    /// each maximal contiguous run of passing rows. The bitmap stays inside
-    /// `scratch` — no per-call `Vec<u64>` allocation.
-    pub fn run_filter<F: FnMut(usize, usize)>(&self, mb: &MemBatch, n: usize, mut append_range: F) {
-        let Repr::Predicate { prog, scratch } = &self.0 else {
-            unreachable!("run_filter on a Map ScalarFunc (the VM dispatch is per-node)");
-        };
-        let no_nulls = prog.no_nulls;
-        let num_regs = prog.num_regs as usize;
-        // `from_predicate` rejects a register-free program, so a predicate's
-        // `result_reg` always names an allocated register.
-        let result_reg = prog.result_reg as usize;
-
-        let mut scratch = scratch.borrow_mut();
-        scratch.ensure_capacity(num_regs, no_nulls, n);
-
-        let words = n.div_ceil(64);
-
-        for morsel_start in (0..n).step_by(MORSEL) {
-            let m = MORSEL.min(n - morsel_start);
-            eval_batch(prog, mb, morsel_start, m, &mut scratch);
-
-            if no_nulls {
-                // `no_nulls` mode allocates no `bool_bits` (capacity 0), so the
-                // verdict is read out of `regs`. Packed a word at a time in a
-                // register — `morsel_start` is 64-aligned (MORSEL=256), so each
-                // morsel maps onto a contiguous run of `filter_bits` words, and
-                // writing every word whole spares both the read-modify-write and
-                // the up-front zero-fill.
-                let base_r = result_reg * MORSEL;
-                let filter_word_base = morsel_start / 64;
-                // Split borrow, and the register window sliced once: the inner
-                // loop then runs over a slice of known length, so its bound and
-                // base pointer are hoisted out of it entirely.
-                let EvalScratch { regs, filter_bits, .. } = &mut *scratch;
-                let regs = &regs[base_r..base_r + m];
-                for (w, chunk) in regs.chunks(64).enumerate() {
-                    let mut bits = 0u64;
-                    for (i, &v) in chunk.iter().enumerate() {
-                        bits |= ((v != 0) as u64) << i;
-                    }
-                    filter_bits[filter_word_base + w] = bits;
-                }
-            } else {
-                // Word-level merge: filter bit = truthy & !null. morsel_start
-                // is 64-aligned (MORSEL=256), so each morsel maps onto a
-                // contiguous run of `filter_bits` words.
-                let base = result_reg * NULL_WORDS_PER_REG;
-                let words_m = m.div_ceil(64);
-                let filter_word_base = morsel_start / 64;
-                let tail_bits = m % 64;
-                let full_words = if tail_bits != 0 { words_m - 1 } else { words_m };
-                for w in 0..full_words {
-                    let vw = scratch.bool_bits[base + w];
-                    let nw = scratch.null_bits[base + w];
-                    scratch.filter_bits[filter_word_base + w] = vw & !nw;
-                }
-                if tail_bits != 0 {
-                    // Mask the dirty tail: ops like IS_NOT_NULL leave 1s
-                    // beyond `m % 64` (`bool_bits = !null_word`); without
-                    // this mask those phantom bits become false-positive
-                    // passing rows in `filter_bits`.
-                    let w = words_m - 1;
-                    let vw = scratch.bool_bits[base + w];
-                    let nw = scratch.null_bits[base + w];
-                    let mask = (1u64 << tail_bits) - 1;
-                    scratch.filter_bits[filter_word_base + w] = (vw & !nw) & mask;
-                }
-            }
-        }
-
-        scan_filter_bits(&scratch.filter_bits[..words], n, &mut append_range);
+        &self.map().out_schema
     }
 
     /// The predicate's surviving row ranges over `batch`, collected into `out`
-    /// (cleared first). The one definition of "which rows of this batch pass" —
-    /// every range-driven consumer (`op_filter`'s gather, the ad-hoc scan's rows
-    /// and fold sinks) reads the list rather than re-deriving it from
-    /// [`Self::run_filter`]'s callback, which cannot carry a `?` out or be cut
-    /// against a `LIMIT` window.
+    /// (cleared first). The one engine spelling of "which rows of this batch
+    /// pass" — every range-driven consumer (`op_filter`'s gather, the ad-hoc
+    /// scan's rows and fold sinks) reads the list rather than driving
+    /// [`Evaluator::filter`]'s callback itself, which cannot carry a `?` out or
+    /// be cut against a `LIMIT` window.
     ///
     /// `out` is caller-owned so it can be reused across chunks; a `[(0, n)]`
     /// singleton is the agreed spelling of "no predicate".
     pub fn filter_ranges(&self, batch: &Batch, out: &mut Vec<(usize, usize)>) {
+        let Repr::Predicate(ev) = &self.0 else {
+            unreachable!("filter_ranges on a Map ScalarFunc (the VM dispatch is per-node)");
+        };
         out.clear();
-        self.run_filter(&batch.as_mem_batch(), batch.count, |start, end| out.push((start, end)));
+        ev.filter(&batch.as_mem_batch(), batch.count, |start, end| out.push((start, end)));
     }
 
     /// Map every `[start, end)` range of `src`, in list order, onto `keeper`'s
@@ -510,39 +412,34 @@ impl ScalarFunc {
     /// must agree; that is the rows-sink reply guard, and PK *type* parity is
     /// planner-guaranteed by the verbatim passthrough clone.
     pub fn append_map_ranges(&self, src: &Batch, keeper: &mut Batch, ranges: &[(usize, usize)]) {
-        self.map_ranges_into(src, keeper, ranges, PkFill::Copy);
+        self.map().map_ranges_into(src, keeper, ranges, PkFill::Copy);
     }
 
     /// Execute map over a whole batch into a fresh output: the DBSP `op_map`
     /// entry point. `pk` says whether the output PK region is inherited verbatim
     /// or stamped by the caller's reindex afterwards.
     pub fn evaluate_map_batch(&self, in_batch: &Batch, pk: PkFill) -> Batch {
-        let Repr::Map {
-            blob_passthrough,
-            out_schema,
-            ..
-        } = &self.0
-        else {
-            unreachable!("evaluate_map_batch on a Predicate ScalarFunc (the VM dispatch is per-node)");
-        };
+        let map = self.map();
         let n = in_batch.count;
         if n == 0 {
-            return Batch::empty_with_schema(out_schema);
+            return Batch::empty_with_schema(&map.out_schema);
         }
         // Uninitialized: `validate` requires every map to write every output
         // payload slot, and `map_rows_into` writes the PK (or the caller's
         // reindex does), weight and null regions of every row.
-        let mut output = Batch::with_capacity(**out_schema, n);
+        let mut output = Batch::with_capacity(map.out_schema, n);
         // When no string column is dropped, adopt the input blob wholesale; the
         // shared `blob_id` is then what tells `map_ranges_into` to copy every
         // String/Blob struct verbatim instead of relocating each cell.
-        if *blob_passthrough {
+        if map.blob_passthrough {
             output.share_blob_from(in_batch);
         }
-        self.map_ranges_into(in_batch, &mut output, &[(0, n)], pk);
+        map.map_ranges_into(in_batch, &mut output, &[(0, n)], pk);
         output
     }
+}
 
+impl MapPlan {
     /// The one map driver: provision `out`'s tail for the ranges, pick the blob
     /// mode, and run [`Self::map_rows_into`] per range.
     ///
@@ -572,9 +469,7 @@ impl ScalarFunc {
         }
         // Compact a kernel-starving list into one contiguous range, then fall
         // into the single copy loop below against the compacted source.
-        let starves_kernel = matches!(&self.0, Repr::Map { compute: Some(_), .. })
-            && ranges.len() > 1
-            && total < ranges.len() * COMPACT_RUN_LEN;
+        let starves_kernel = self.compute.is_some() && ranges.len() > 1 && total < ranges.len() * COMPACT_RUN_LEN;
         let compacted;
         let (src, ranges) = match starves_kernel.then_some(src.schema).flatten() {
             Some(s) => {
@@ -593,7 +488,7 @@ impl ScalarFunc {
         let mut cache = match out.shares_blob_with(src) {
             true => crate::storage::BlobCacheGuard::empty(),
             false => {
-                let cache = crate::storage::BlobCacheGuard::acquire(self.map_out_schema(), total);
+                let cache = crate::storage::BlobCacheGuard::acquire(&self.out_schema, total);
                 // Dedup keeps the output blob ≤ the input's, so one reserve covers
                 // every ColMove without per-column realloc.
                 if cache.is_active() {
@@ -629,16 +524,6 @@ impl ScalarFunc {
         mut blob_cache: Option<&mut crate::schema::BlobCache>,
         pk: PkFill,
     ) {
-        let Repr::Map {
-            col_moves,
-            null_perm,
-            compute,
-            scratch,
-            ..
-        } = &self.0
-        else {
-            unreachable!("map_rows_into on a Predicate ScalarFunc");
-        };
         if n == 0 {
             return;
         }
@@ -657,32 +542,29 @@ impl ScalarFunc {
         // `in_batch` and `output` are distinct allocations.
         {
             let in_nb = in_batch.null_bmp_data();
-            null_perm.write_rows(in_nb, src_start, output.null_bmp_data_mut(), dst_base, n);
+            self.null_perm
+                .write_rows(in_nb, src_start, output.null_bmp_data_mut(), dst_base, n);
         }
 
-        for cm in col_moves {
+        for cm in &self.col_moves {
             copy_column(in_batch, output, cm, blob_cache.as_deref_mut(), src_start, dst_base, n);
         }
 
         // Compute kernel
-        if let Some(InterpretedCompute { prog, emits }) = compute {
-            let no_nulls = prog.no_nulls;
-            let num_regs = prog.num_regs as usize;
-
+        if let Some(ev) = &self.compute {
             let in_mb = in_batch.as_mem_batch();
-            let mut scratch = scratch.borrow_mut();
-            scratch.ensure_capacity(num_regs, no_nulls, n);
-
-            for morsel_start in (0..n).step_by(MORSEL) {
-                let m = MORSEL.min(n - morsel_start);
-                eval_batch(prog, &in_mb, src_start + morsel_start, m, &mut scratch);
-
+            ev.eval_morsels(&in_mb, src_start, n, |morsel_start, out| {
+                let m = out.rows();
                 // EMIT: write each computed register to its output column.
-                for e in emits {
-                    let out_payload = e.payload;
-                    let base_r = e.reg * MORSEL;
-                    let base_null_r = e.reg * NULL_WORDS_PER_REG;
-                    let row0 = dst_base + morsel_start;
+                // Indexed, not `for &(..) in &self.emits`: at opt-level=0 the
+                // slice iterator's `next` is an out-of-line call per (morsel ×
+                // emit), the same reason `NullPerm::apply` indexes.
+                let emits = self.emits.as_slice();
+                let row0 = dst_base + morsel_start;
+                let mut e = 0;
+                while e < emits.len() {
+                    let (reg, out_payload) = emits[e];
+                    e += 1;
                     // One split borrow: the value slots and this column's bit in
                     // the row-major NULL bitmap are written in the same pass over
                     // the null rows.
@@ -694,12 +576,12 @@ impl ScalarFunc {
                     // encoding EMIT stores — one `copy_from_slice`, no per-row
                     // bounds check and no per-row NULL branch.
                     let win = &mut col[row0 * 8..(row0 + m) * 8];
-                    let regs = &scratch.regs[base_r..base_r + m];
+                    let regs = out.reg_values(reg);
                     // SAFETY: `i64` has no padding and no invalid bit patterns,
                     // and `main.rs` fails the build on a non-little-endian
                     // target, so an i64 slice's byte image *is* its
                     // `to_le_bytes()` sequence. `u8` is 1-aligned, and the window
-                    // is `m` elements of a slice with at least `m` left.
+                    // is `m` elements of a slice with exactly `m` left.
                     let regs_le = unsafe { std::slice::from_raw_parts(regs.as_ptr().cast::<u8>(), m * 8) };
                     win.copy_from_slice(regs_le);
 
@@ -707,59 +589,19 @@ impl ScalarFunc {
                     // in the output bitmap. NULL rows are the exception, so both
                     // are done by a sparse bit-scan rather than a per-row branch
                     // that would de-vectorize the store above. The two bitmaps
-                    // are transposed — `scratch.null_bits` is register-major
-                    // (bit i = row i), the output bitmap row-major (one u64 per
-                    // row, bit c = payload column c) — so the merge is a scatter,
-                    // never a word-at-a-time OR.
-                    if !no_nulls {
-                        for_each_null_row(&scratch.null_bits, base_null_r, m, |i| {
-                            win[i * 8..i * 8 + 8].fill(0);
-                            let off = (row0 + i) * 8;
-                            let mut merged = gnitz_wire::read_u64_le(nb, off);
-                            gnitz_wire::null_word_set(&mut merged, out_payload, true);
-                            nb[off..off + 8].copy_from_slice(&merged.to_le_bytes());
-                        });
-                    }
+                    // are transposed — the register file's null bits are
+                    // register-major (bit i = row i), the output bitmap row-major
+                    // (one u64 per row, bit c = payload column c) — so the merge
+                    // is a scatter, never a word-at-a-time OR.
+                    out.for_each_null_row(reg, |i| {
+                        win[i * 8..i * 8 + 8].fill(0);
+                        let off = (row0 + i) * 8;
+                        let mut merged = gnitz_wire::read_u64_le(nb, off);
+                        gnitz_wire::null_word_set(&mut merged, out_payload, true);
+                        gnitz_wire::write_u64_le(nb, off, merged);
+                    });
                 }
-            }
+            });
         }
-    }
-}
-
-/// Walk `bits` and call `append_range(start, end)` for every maximal run of
-/// set bits. Fast paths: skip all-zero words; emit a whole-word run for
-/// all-ones words. The mixed case bit-scans the word.
-fn scan_filter_bits<F: FnMut(usize, usize)>(bits: &[u64], n: usize, append_range: &mut F) {
-    let mut range_start: isize = -1;
-    for (w, &word) in bits.iter().enumerate() {
-        let row_base = w * 64;
-        let chunk = (row_base + 64).min(n) - row_base;
-
-        if word == 0 {
-            if range_start >= 0 {
-                append_range(range_start as usize, row_base);
-                range_start = -1;
-            }
-        } else if word == u64::MAX || (chunk < 64 && word == (1u64 << chunk) - 1) {
-            if range_start < 0 {
-                range_start = row_base as isize;
-            }
-        } else {
-            for i in 0..chunk {
-                let passes = (word >> i) & 1 != 0;
-                let abs = row_base + i;
-                if passes {
-                    if range_start < 0 {
-                        range_start = abs as isize;
-                    }
-                } else if range_start >= 0 {
-                    append_range(range_start as usize, abs);
-                    range_start = -1;
-                }
-            }
-        }
-    }
-    if range_start >= 0 {
-        append_range(range_start as usize, n);
     }
 }

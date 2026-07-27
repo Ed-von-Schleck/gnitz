@@ -7,64 +7,96 @@
 
 use std::cmp::Ordering;
 
-use super::program::{CmpOp, Instr, ResolvedProgram, StrOp};
-use gnitz_expr::{BatchView, PAYLOAD_MAPPING_PK_SENTINEL};
+use crate::{BatchView, CmpOp, Instr, ResolvedProgram, StrOp, PAYLOAD_MAPPING_PK_SENTINEL};
 use gnitz_wire::{compare_german_strings, null_word_get, read_u64_le};
 
-pub(in crate::expr) const MORSEL: usize = 256;
-pub(in crate::expr) const NULL_WORDS_PER_REG: usize = MORSEL / 64; // 4
+pub(crate) const MORSEL: usize = 256;
+pub(crate) const NULL_WORDS_PER_REG: usize = MORSEL / 64; // 4
 
 // ---------------------------------------------------------------------------
 // EvalScratch — the SoA register file for batch evaluation
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
-pub(in crate::expr) struct EvalScratch {
+pub(crate) struct EvalScratch {
     /// Register buffers, register-major layout: regs[reg * MORSEL + row].
-    pub(in crate::expr) regs: Vec<i64>,
+    pub(crate) regs: Vec<i64>,
     /// Null bitmask, register-major: null_bits[reg * NULL_WORDS_PER_REG + word].
     /// Empty (capacity 0) when `no_nulls` is true.
-    pub(in crate::expr) null_bits: Vec<u64>,
+    pub(crate) null_bits: Vec<u64>,
     /// Packed truthy bits, register-major; bridges boolean producers and
     /// consumers on the nullable arm without per-row repack from `regs`.
     /// Empty (capacity 0) when `no_nulls` is true.
-    pub(in crate::expr) bool_bits: Vec<u64>,
-    /// Per-row filter bitmask; set by run_filter, ignored by evaluate_map_batch.
-    pub(in crate::expr) filter_bits: Vec<u64>,
-    pub(in crate::expr) no_nulls: bool,
+    pub(crate) bool_bits: Vec<u64>,
+    /// Per-row filter bitmask; written only by the filter path.
+    pub(crate) filter_bits: Vec<u64>,
+    no_nulls: bool,
 }
 
 impl EvalScratch {
-    /// Ensure the scratch buffer can hold `num_regs` registers and `(n+63)/64`
-    /// filter words.  Does not shrink.
-    pub(in crate::expr) fn ensure_capacity(&mut self, num_regs: usize, no_nulls: bool, n: usize) {
+    /// Ensure the scratch buffer can hold `prog`'s registers and `(n+63)/64`
+    /// filter words (`n = 0` for a driver that reads no filter bitmap). Does not
+    /// shrink.
+    ///
+    /// Takes the program rather than its register count and nullability arm:
+    /// the cached `no_nulls` decides which buffers exist *and* which arm every
+    /// kernel takes, so reading it from anywhere but the program that is about
+    /// to run would size the scratch for one arm and evaluate on the other.
+    ///
+    /// Split so the steady-state path — every call after the first, and the one
+    /// a map driver makes per *range* (which on an alternating predicate is per
+    /// row) — is four length compares with no call. `null_cap = 0` under
+    /// `no_nulls` makes its two compares statically false, which is exactly the
+    /// `!no_nulls` guard the un-split form spelled out: the null buffers stay at
+    /// capacity 0, and the kernels' `no_nulls` arms never touch them.
+    #[inline(always)]
+    pub(crate) fn ensure_capacity(&mut self, prog: &ResolvedProgram, n: usize) {
+        let num_regs = prog.num_regs as usize;
+        self.no_nulls = prog.no_nulls;
         let reg_cap = num_regs * MORSEL;
+        let null_cap = if prog.no_nulls {
+            0
+        } else {
+            num_regs * NULL_WORDS_PER_REG
+        };
+        let filter_words = n.div_ceil(64);
+        if self.regs.len() < reg_cap
+            || self.null_bits.len() < null_cap
+            || self.bool_bits.len() < null_cap
+            || self.filter_bits.len() < filter_words
+        {
+            self.grow(reg_cap, null_cap, filter_words);
+        }
+    }
+
+    /// The growth half of [`Self::ensure_capacity`]. `#[cold] #[inline(never)]`
+    /// is a code-size measure: both are no-ops at `-O0` and release inlines
+    /// regardless, but they keep the four `Vec::resize` sequences out of every
+    /// always-inlined call site.
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, reg_cap: usize, null_cap: usize, filter_words: usize) {
         if self.regs.len() < reg_cap {
             self.regs.resize(reg_cap, 0);
         }
-        self.no_nulls = no_nulls;
-        if !no_nulls {
-            let null_cap = num_regs * NULL_WORDS_PER_REG;
-            if self.null_bits.len() < null_cap {
-                self.null_bits.resize(null_cap, 0);
-            }
-            if self.bool_bits.len() < null_cap {
-                self.bool_bits.resize(null_cap, 0);
-            }
+        if self.null_bits.len() < null_cap {
+            self.null_bits.resize(null_cap, 0);
         }
-        let filter_words = n.div_ceil(64);
+        if self.bool_bits.len() < null_cap {
+            self.bool_bits.resize(null_cap, 0);
+        }
         if self.filter_bits.len() < filter_words {
             self.filter_bits.resize(filter_words, 0);
         }
     }
 
-    pub(in crate::expr) fn reg_mut(&mut self, reg: usize, m: usize) -> &mut [i64] {
+    fn reg_mut(&mut self, reg: usize, m: usize) -> &mut [i64] {
         &mut self.regs[reg * MORSEL..reg * MORSEL + m]
     }
 
     /// Split borrows: two shared sources + one mutable destination.
     /// Safety: SSA guarantees d != a and d != b (the debug_assert enforces this).
-    pub(in crate::expr) fn reg3(&mut self, a: usize, b: usize, d: usize, m: usize) -> (&[i64], &[i64], &mut [i64]) {
+    fn reg3(&mut self, a: usize, b: usize, d: usize, m: usize) -> (&[i64], &[i64], &mut [i64]) {
         debug_assert!(d != a && d != b, "reg3: dst aliases src register");
         unsafe {
             let ptr = self.regs.as_mut_ptr();
@@ -77,13 +109,7 @@ impl EvalScratch {
 
     /// Split borrows for null bit words.
     /// Safety: SSA guarantees d != a and d != b.
-    pub(in crate::expr) fn null_words3(
-        &mut self,
-        a: usize,
-        b: usize,
-        d: usize,
-        words: usize,
-    ) -> (&[u64], &[u64], &mut [u64]) {
+    fn null_words3(&mut self, a: usize, b: usize, d: usize, words: usize) -> (&[u64], &[u64], &mut [u64]) {
         debug_assert!(d != a && d != b, "null_words3: dst aliases src register");
         unsafe {
             let ptr = self.null_bits.as_mut_ptr();
@@ -98,14 +124,7 @@ impl EvalScratch {
     /// SELECT no-nulls value blend (`cond`, `a`, `b` → `dst`).
     /// Safety: SELECT's SSA anti-alias assert guarantees d != a, b, c.
     #[allow(clippy::type_complexity)]
-    pub(in crate::expr) fn reg4(
-        &mut self,
-        a: usize,
-        b: usize,
-        c: usize,
-        d: usize,
-        m: usize,
-    ) -> (&[i64], &[i64], &[i64], &mut [i64]) {
+    fn reg4(&mut self, a: usize, b: usize, c: usize, d: usize, m: usize) -> (&[i64], &[i64], &[i64], &mut [i64]) {
         debug_assert!(d != a && d != b && d != c, "reg4: dst aliases src register");
         unsafe {
             let ptr = self.regs.as_mut_ptr();
@@ -118,7 +137,7 @@ impl EvalScratch {
     }
 
     /// Zero the null bits for one register's morsel region.
-    pub(in crate::expr) fn clear_null_reg(&mut self, reg: usize, m: usize) {
+    fn clear_null_reg(&mut self, reg: usize, m: usize) {
         if self.no_nulls {
             return;
         }
@@ -261,7 +280,11 @@ fn unpack_bool_to_regs(scratch: &mut EvalScratch, dst: usize, m: usize) {
 }
 
 /// Pack one register's i64 truthy bits into `bool_bits[dst]`.
-#[inline]
+///
+/// Deliberately **not** `#[inline(always)]`, unlike its always-inlined caller:
+/// it is a word loop, not a guard, so it follows the crate-root rule — the same
+/// split as `EvalScratch::ensure_capacity`/`grow`. It runs once per instruction
+/// per morsel, not per row, so the caller's frame size is the cost that matters.
 fn pack_to_bool_bits(scratch: &mut EvalScratch, dst: usize, m: usize) {
     let words = m.div_ceil(64);
     let base_r = dst * MORSEL;
@@ -280,7 +303,11 @@ fn pack_to_bool_bits(scratch: &mut EvalScratch, dst: usize, m: usize) {
 /// Bridge for producers that wrote `regs[dst]` and may have a downstream BOOL
 /// consumer (or, for filters, a bit_only result_reg). Non-bool producers reach
 /// a BOOL consumer through this path without restructuring their inner loop.
-#[inline]
+///
+/// Per instruction per morsel, and on the `no_nulls` arm (or a register with no
+/// BOOL consumer) it is *only* the two-branch test — which is why the test
+/// inlines while [`pack_to_bool_bits`] stays out of line.
+#[inline(always)]
 fn maybe_pack_bool_bits(scratch: &mut EvalScratch, prog: &ResolvedProgram, dst: usize, m: usize) {
     if scratch.no_nulls {
         return;
@@ -294,9 +321,9 @@ fn maybe_pack_bool_bits(scratch: &mut EvalScratch, prog: &ResolvedProgram, dst: 
 /// the register-major `null_bits` window starting at `base`. NULL rows are the
 /// exception, so every consumer — zeroing a register's null entries, EMIT's
 /// value-slot zero plus output-bitmap merge — scans the set bits rather than
-/// branching per row.
-#[inline]
-pub(in crate::expr) fn for_each_null_row(null_bits: &[u64], base: usize, m: usize, mut f: impl FnMut(usize)) {
+/// branching per row. Per instruction per morsel.
+#[inline(always)]
+pub(crate) fn for_each_null_row(null_bits: &[u64], base: usize, m: usize, mut f: impl FnMut(usize)) {
     let words = m.div_ceil(64);
     for w in 0..words {
         let mut word = null_bits[base + w];
@@ -453,7 +480,7 @@ fn encode_f64(f: f64) -> i64 {
 ///
 /// Callers loop over morsels and call this function once per morsel.
 #[allow(clippy::needless_range_loop)]
-pub(in crate::expr) fn eval_batch<B: BatchView>(
+pub(crate) fn eval_batch<B: BatchView>(
     prog: &ResolvedProgram,
     mb: &B,
     morsel_start: usize,
@@ -480,6 +507,23 @@ pub(in crate::expr) fn eval_batch<B: BatchView>(
                 }
             }
             null_or2(scratch, $d, ai, bi, m);
+            maybe_pack_bool_bits(scratch, prog, $d, m);
+        }};
+    }
+    // Unary counterpart of `bin_op!`: read one source register, write one, copy
+    // the source null word, repack bool bits. Indexed rather than via `reg3` —
+    // `validate` anti-aliases only the binary opcodes, so a unary `dst == a` is
+    // legal (and `null_copy1` has its own `dst == src` early-out).
+    macro_rules! un_op {
+        ($a:expr, $d:expr, |$x:ident| $body:expr) => {{
+            let ai = $a as usize;
+            let base_a = ai * MORSEL;
+            let base_d = $d * MORSEL;
+            for i in 0..m {
+                let $x = scratch.regs[base_a + i];
+                scratch.regs[base_d + i] = $body;
+            }
+            null_copy1(scratch, $d, ai, m);
             maybe_pack_bool_bits(scratch, prog, $d, m);
         }};
     }
@@ -671,10 +715,7 @@ pub(in crate::expr) fn eval_batch<B: BatchView>(
 
             Instr::LoadConst { dst, val } => {
                 let dst = dst as usize;
-                let base_d = dst * MORSEL;
-                for i in 0..m {
-                    scratch.regs[base_d + i] = val;
-                }
+                scratch.reg_mut(dst, m).fill(val);
                 scratch.clear_null_reg(dst, m);
                 maybe_pack_bool_bits(scratch, prog, dst, m);
             }
@@ -689,17 +730,7 @@ pub(in crate::expr) fn eval_batch<B: BatchView>(
             // correct for dividends >= 2^63. Zero divisor marks NULL.
             Instr::IntDiv { dst, a, b, signed } => divmod!(a, b, dst as usize, signed, wrapping_div),
             Instr::IntMod { dst, a, b, signed } => divmod!(a, b, dst as usize, signed, wrapping_rem),
-            Instr::IntNeg { dst, a } => {
-                let dst = dst as usize;
-                let ai = a as usize;
-                let base_a = ai * MORSEL;
-                let base_d = dst * MORSEL;
-                for i in 0..m {
-                    scratch.regs[base_d + i] = scratch.regs[base_a + i].wrapping_neg();
-                }
-                null_copy1(scratch, dst, ai, m);
-                maybe_pack_bool_bits(scratch, prog, dst, m);
-            }
+            Instr::IntNeg { dst, a } => un_op!(a, dst as usize, |x| x.wrapping_neg()),
 
             // ----------------------------------------------------------------
             // Integer set membership (col IN (…) as one opcode)
@@ -715,16 +746,8 @@ pub(in crate::expr) fn eval_batch<B: BatchView>(
                 value_reg,
                 set_idx,
             } => {
-                let dst = dst as usize;
-                let vi = value_reg as usize;
                 let set = &prog.int_sets[set_idx as usize]; // decoded once, sorted ascending
-                let base_v = vi * MORSEL;
-                let base_d = dst * MORSEL;
-                for i in 0..m {
-                    scratch.regs[base_d + i] = set.binary_search(&scratch.regs[base_v + i]).is_ok() as i64;
-                }
-                null_copy1(scratch, dst, vi, m); // dst_null = value_reg_null → NULL in ⇒ NULL out
-                maybe_pack_bool_bits(scratch, prog, dst, m);
+                un_op!(value_reg, dst as usize, |x| set.binary_search(&x).is_ok() as i64)
             }
 
             // ----------------------------------------------------------------
@@ -746,17 +769,7 @@ pub(in crate::expr) fn eval_batch<B: BatchView>(
                 let fb_safe = if is_zero { 1.0 } else { fb };
                 (encode_f64(fa / fb_safe), is_zero)
             }),
-            Instr::FloatNeg { dst, a } => {
-                let dst = dst as usize;
-                let ai = a as usize;
-                let base_a = ai * MORSEL;
-                let base_d = dst * MORSEL;
-                for i in 0..m {
-                    scratch.regs[base_d + i] = encode_f64(-decode_f64(scratch.regs[base_a + i]));
-                }
-                null_copy1(scratch, dst, ai, m);
-                maybe_pack_bool_bits(scratch, prog, dst, m);
-            }
+            Instr::FloatNeg { dst, a } => un_op!(a, dst as usize, |x| encode_f64(-decode_f64(x))),
 
             // ----------------------------------------------------------------
             // Integer comparisons
@@ -802,13 +815,7 @@ pub(in crate::expr) fn eval_batch<B: BatchView>(
                 let ai = a as usize;
                 let bi = b as usize;
                 if scratch.no_nulls {
-                    let base_a = ai * MORSEL;
-                    let base_b = bi * MORSEL;
-                    let base_d = dst * MORSEL;
-                    for i in 0..m {
-                        scratch.regs[base_d + i] =
-                            ((scratch.regs[base_a + i] != 0) && (scratch.regs[base_b + i] != 0)) as i64;
-                    }
+                    bin_op!(a, b, dst, |x, y| ((x != 0) && (y != 0)) as i64);
                 } else {
                     // Nullable arm: word-level u64 3VL on packed truthy bits.
                     // Upstream producers populate `bool_bits` via
@@ -848,13 +855,7 @@ pub(in crate::expr) fn eval_batch<B: BatchView>(
                 let ai = a as usize;
                 let bi = b as usize;
                 if scratch.no_nulls {
-                    let base_a = ai * MORSEL;
-                    let base_b = bi * MORSEL;
-                    let base_d = dst * MORSEL;
-                    for i in 0..m {
-                        scratch.regs[base_d + i] =
-                            ((scratch.regs[base_a + i] != 0) || (scratch.regs[base_b + i] != 0)) as i64;
-                    }
+                    bin_op!(a, b, dst, |x, y| ((x != 0) || (y != 0)) as i64);
                 } else {
                     bool_and_or_word_loop(scratch, dst, ai, bi, m, /* is_or = */ true);
                     if !prog.is_bit_only(dst) {
@@ -866,12 +867,7 @@ pub(in crate::expr) fn eval_batch<B: BatchView>(
                 let dst = dst as usize;
                 let ai = a as usize;
                 if scratch.no_nulls {
-                    let base_a = ai * MORSEL;
-                    let base_d = dst * MORSEL;
-                    for i in 0..m {
-                        scratch.regs[base_d + i] = (scratch.regs[base_a + i] == 0) as i64;
-                    }
-                    null_copy1(scratch, dst, ai, m);
+                    un_op!(a, dst, |x| (x == 0) as i64);
                 } else {
                     let words = m.div_ceil(64);
                     let base_a = ai * NULL_WORDS_PER_REG;
@@ -893,34 +889,39 @@ pub(in crate::expr) fn eval_batch<B: BatchView>(
             // ----------------------------------------------------------------
             // IS NULL / IS NOT NULL
             // ----------------------------------------------------------------
-            // One arm: the two opcodes carry identical fields and differ only
-            // in whether the bit is inverted.
-            Instr::IsNull { dst, pi } | Instr::IsNotNull { dst, pi } => {
-                let invert = matches!(*instr, Instr::IsNotNull { .. });
-                let d = dst as usize;
-                eval_is_null(scratch, null_bmp, prog, d, morsel_start, m, pi as usize, invert);
-            }
+            // The two opcodes carry identical fields and differ only in whether
+            // the bit is inverted, so they share one kernel.
+            Instr::IsNull { dst, pi } => eval_is_null(
+                scratch,
+                null_bmp,
+                prog,
+                dst as usize,
+                morsel_start,
+                m,
+                pi as usize,
+                /* invert = */ false,
+            ),
+            Instr::IsNotNull { dst, pi } => eval_is_null(
+                scratch,
+                null_bmp,
+                prog,
+                dst as usize,
+                morsel_start,
+                m,
+                pi as usize,
+                /* invert = */ true,
+            ),
 
             // ----------------------------------------------------------------
             // Type cast. `signed: false` reinterprets the register as u64 first
             // so values >= 2^63 cast to the correct large positive float.
             // ----------------------------------------------------------------
             Instr::IntToFloat { dst, a, signed } => {
-                let dst = dst as usize;
-                let ai = a as usize;
-                let base_a = ai * MORSEL;
-                let base_d = dst * MORSEL;
-                if signed {
-                    for i in 0..m {
-                        scratch.regs[base_d + i] = encode_f64(scratch.regs[base_a + i] as f64);
-                    }
-                } else {
-                    for i in 0..m {
-                        scratch.regs[base_d + i] = encode_f64(scratch.regs[base_a + i] as u64 as f64);
-                    }
+                let d = dst as usize;
+                match signed {
+                    true => un_op!(a, d, |x| encode_f64(x as f64)),
+                    false => un_op!(a, d, |x| encode_f64(x as u64 as f64)),
                 }
-                null_copy1(scratch, dst, ai, m);
-                maybe_pack_bool_bits(scratch, prog, dst, m);
             }
 
             // ----------------------------------------------------------------
@@ -1026,3 +1027,6 @@ pub(in crate::expr) fn eval_batch<B: BatchView>(
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

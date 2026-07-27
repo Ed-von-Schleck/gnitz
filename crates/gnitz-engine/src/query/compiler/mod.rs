@@ -3,12 +3,13 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::expr::{ExprValidateErr, LogicalProgram, ScalarFunc};
+use crate::expr::ScalarFunc;
 use crate::foundation::worker_ctx::{num_workers, worker_rank};
 use crate::ops::{build_reduce_output_schema, AggDescriptor, AggOp};
 use crate::query::vm::{Instr, ProgramBuilder, RegisterMeta, VmHandle};
 use crate::schema::{type_code, DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{ReadCursor, RecoverySource, Table};
+use gnitz_expr::{ExprValidateErr, LogicalProgram};
 use gnitz_wire::is_fixed_int;
 
 mod emit;
@@ -704,7 +705,7 @@ mod tests {
 
     #[test]
     fn test_sequential_copy_projection() {
-        use crate::expr::{LogicalInstr, LogicalProgram};
+        use gnitz_expr::{LogicalInstr, LogicalProgram};
         // num_regs covers the largest register index in the synthetic programs
         // below so LogicalProgram::new's register-bounds assert passes; this test
         // exercises sequential_copy_base, not register limits.
@@ -817,7 +818,8 @@ mod tests {
         // is the aggregate column's type. The order-encodable I64 agg compiles (Some),
         // proving the circuit shape and view_dir are otherwise valid, so the STRING
         // agg's None is attributable solely to the guard.
-        use gnitz_wire::{AggFunc, OpNode, ReduceOutKey};
+        use crate::schema::ReduceOutKey;
+        use gnitz_wire::{AggFunc, OpNode};
         let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
         std::fs::create_dir_all(&base).unwrap();
 
@@ -869,7 +871,8 @@ mod tests {
     /// kinds: the three matching kinds compile, the six cross pairings reject.
     #[test]
     fn reduce_out_key_validation_rejects_mismatch() {
-        use gnitz_wire::{AggFunc, OpNode, ReduceOutKey};
+        use crate::schema::ReduceOutKey;
+        use gnitz_wire::{AggFunc, OpNode};
         let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
         std::fs::create_dir_all(&base).unwrap();
 
@@ -1624,7 +1627,8 @@ mod tests {
 
     #[test]
     fn test_reduce_group_cols_out_of_bounds_rejected() {
-        use gnitz_wire::{AggFunc, OpNode, ReduceOutKey};
+        use crate::schema::ReduceOutKey;
+        use gnitz_wire::{AggFunc, OpNode};
         let reduce = |group: Vec<u16>| OpNode::Reduce {
             group_cols: group,
             agg: vec![(AggFunc::Count, 0)],
@@ -1637,7 +1641,8 @@ mod tests {
 
     #[test]
     fn test_reduce_agg_spec_col_out_of_bounds_rejected() {
-        use gnitz_wire::{AggFunc, OpNode, ReduceOutKey};
+        use crate::schema::ReduceOutKey;
+        use gnitz_wire::{AggFunc, OpNode};
         let reduce = |col: u16| OpNode::Reduce {
             group_cols: vec![0],
             agg: vec![(AggFunc::Count, col)],
@@ -1650,7 +1655,8 @@ mod tests {
 
     #[test]
     fn test_reduce_sum_over_non_decodable_column_rejected() {
-        use gnitz_wire::{AggFunc, OpNode, ReduceOutKey};
+        use crate::schema::ReduceOutKey;
+        use gnitz_wire::{AggFunc, OpNode};
         // col 0 = U64 PK + group key; col 1 = the SUM aggregate column.
         let schema = |agg_tc: u8| {
             SchemaDescriptor::new(
@@ -1700,7 +1706,8 @@ mod tests {
     /// cannot drift apart into a mixed-type copy.
     #[test]
     fn test_derived_map_schemas_satisfy_copy_types() {
-        use crate::expr::{LogicalProgram, ScalarFunc};
+        use crate::expr::ScalarFunc;
+        use gnitz_expr::LogicalProgram;
         use optimize::{hashrow_output_schema, reindex_output_schema};
         let in_schema = SchemaDescriptor::new(
             &[
@@ -2268,7 +2275,8 @@ mod tests {
 
     #[test]
     fn test_circuit_range_join_n_eq_discriminator() {
-        use gnitz_wire::{AggFunc, JoinKind, MapKind, OpNode, ReduceOutKey};
+        use crate::schema::ReduceOutKey;
+        use gnitz_wire::{AggFunc, JoinKind, MapKind, OpNode};
         let dummy_blob = dummy_expr_blob();
 
         // A GROUP BY view: ScanDelta → Map(reindex) → ExchangeShard → Reduce →

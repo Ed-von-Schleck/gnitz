@@ -23,10 +23,9 @@ pub trait SchemaFacts {
     /// Dense payload slot of `ci`, or `None` for a PK column. Derived from
     /// [`Self::locate`], never separately implemented — the locator variant *is*
     /// the PK marker, so the two cannot disagree — and `Option`-shaped so "this
-    /// column has no payload slot" must be handled rather than poisoned with
-    /// [`crate::PAYLOAD_MAPPING_PK_SENTINEL`], which stays what it is: the
-    /// in-memory encoding of a `payload_mapping` table, not a value the compiler
-    /// hands around.
+    /// column has no payload slot" must be handled at each site rather than
+    /// carried around as [`crate::PAYLOAD_MAPPING_PK_SENTINEL`], which an
+    /// implementor would then have to synthesise.
     fn payload_slot(&self, ci: usize) -> Option<u8> {
         match self.locate(ci) {
             ColumnLocator::Payload { slot, .. } => Some(slot),
@@ -71,14 +70,10 @@ pub trait SchemaFacts {
 /// implementor calls it from its own test tree — the same shape as
 /// [`crate::assert_batchview_consistent`], and for the same reason: the engine's
 /// `SchemaDescriptor` and the client's `Schema` live in crates that cannot see
-/// each other's tests.
-///
-/// Takes `&dyn` for the reason it exists: most methods collide by name with an
-/// inherent method on a typical implementor, and Rust prefers the inherent one
-/// in receiver-dot position — a check written against the concrete type would
-/// never enter the impl, so the exact failure mode this catches (a forwarder
-/// that reimplements rather than forwards) would pass. Behind `&dyn` only the
-/// trait method is nameable.
+/// each other's tests. It takes `&dyn` only to match the trait's own dispatch
+/// (see the trait doc); a `<S: SchemaFacts>` generic would resolve to the trait
+/// methods just as well, since a type parameter has no inherent impls to shadow
+/// them — which is why the sibling harness is generic.
 pub fn assert_schema_facts_consistent(s: &dyn SchemaFacts, cols: &[(u8, bool)], pk: &[usize]) {
     assert_eq!(s.num_columns(), cols.len(), "num_columns()");
     assert_eq!(s.num_payload_cols(), cols.len() - pk.len(), "num_payload_cols()");
@@ -127,3 +122,6 @@ pub fn assert_schema_facts_consistent(s: &dyn SchemaFacts, cols: &[(u8, bool)], 
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

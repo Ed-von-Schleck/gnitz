@@ -12,17 +12,16 @@
 
 use std::cmp::Ordering;
 
-use gnitz_wire::{AggReadSpec, OrderKey, RangeDescriptor, ReadBound, ReadSink, ReadSpec, TypeCode};
+use gnitz_wire::{AggReadSpec, OrderKey, RangeDescriptor, ReadBound, ReadSink, ReadSpec};
 
 use super::store_io::SourceCursor;
 use super::*;
-use crate::expr::{LogicalProgram, ScalarFunc};
+use crate::expr::ScalarFunc;
 use crate::ops::AdhocFold;
-use crate::schema::key::opk_key;
-use crate::schema::key::{compare_pk_bytes, PkBuf};
-use crate::schema::{ColumnLocator, MAX_PK_BYTES};
+use crate::schema::key::{compare_pk_bytes, opk_key, PkBuf};
+use crate::schema::{ColumnLocator, TypeCode, MAX_PK_BYTES};
 use crate::storage::{cmp_col_window, compare_rows};
-use gnitz_expr::RowSource;
+use gnitz_expr::{LogicalProgram, RowSource};
 
 /// `limit_k` above which the worker materializes instead of running the bounded
 /// top-k sink (a deep OFFSET ships unsorted and the client sorts). Worker

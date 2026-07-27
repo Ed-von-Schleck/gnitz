@@ -83,7 +83,7 @@ pub(super) fn emit_reduce_row(
             }
             ColumnLocator::Payload { slot, size, type_code } => {
                 let cs = size as usize;
-                let is_null = gnitz_wire::null_word_get(input_mb.get_null_word(exemplar_row), slot as usize);
+                let is_null = loc.is_null(input_mb, exemplar_row);
                 if is_null {
                     gnitz_wire::null_word_set(&mut null_word, out_pi, true);
                 }

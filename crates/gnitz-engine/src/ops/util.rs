@@ -3,7 +3,7 @@
 use xxhash_rust::xxh3::Xxh3Default;
 
 use crate::schema::{type_code, ColumnLocator, SchemaDescriptor, TypeCode};
-use crate::storage::{MemBatch, ReadCursor};
+use crate::storage::ReadCursor;
 use gnitz_expr::RowSource;
 
 // ---------------------------------------------------------------------------
@@ -82,7 +82,7 @@ impl GroupKeyExtractor {
     /// Concatenate the group columns' raw little-endian bytes into `out` (which
     /// must be at least `self.stride` long), in `group_by_cols` order.
     #[inline]
-    pub(super) fn gather(&self, mb: &MemBatch, row: usize, out: &mut [u8]) {
+    pub(super) fn gather(&self, mb: &impl RowSource, row: usize, out: &mut [u8]) {
         let mut off = 0;
         for loc in &self.cols {
             let src = loc.bytes(mb, row);
@@ -160,9 +160,7 @@ pub(super) fn encode_ordered(bytes: &[u8], col_type_code: u8, for_max: bool) -> 
     let val = match col_type_code {
         type_code::F32 => ieee_order_bits_f32(u32::from_le_bytes(bytes[..4].try_into().unwrap())),
         type_code::F64 => ieee_order_bits(u64::from_le_bytes(bytes[..8].try_into().unwrap())),
-        type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64 => {
-            gnitz_wire::read_unsigned_exact(bytes)
-        }
+        type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64 => gnitz_wire::read_unsigned_exact(bytes),
         type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64 => {
             (gnitz_wire::read_signed_exact(bytes) as u64).wrapping_add(1u64 << 63)
         }
@@ -286,22 +284,19 @@ fn hash_group_col<R: RowSource>(
                 hasher.update(&[0u8]); // null marker
                 return;
             }
-            // `size` is already 16 for STRING/BLOB/U128/UUID (all share the wide
-            // 16-byte layout), so no per-type width fixup is needed here.
-            let cs = size as usize;
-            let b = src.get_col_ptr(row, slot as usize, cs);
             hasher.update(&[1u8]); // non-null marker
             if gnitz_wire::is_german_string(type_code) {
                 // STRING and BLOB both hash length-prefixed content via the shared
                 // helper (matching reindex_hash_row); load-bearing for BLOB grouping
-                // keys (Fix C), not only STRING.
-                hash_german_string_content(hasher, b, src.blob());
-            } else if type_code == type_code::U128 || type_code == type_code::UUID {
-                hasher.update(&b[..16]);
+                // keys, not only STRING. `size` is already 16 for them.
+                hash_german_string_content(hasher, src.get_col_ptr(row, slot as usize, size as usize), src.blob());
             } else {
                 // Canonical (sign-flipped/widened) value: a payload FK hashes like
                 // the same value stored as a PK column — the same `route_key` the
-                // Pk arm takes, which is exactly why the two agree.
+                // Pk arm takes, which is exactly why the two agree. This covers
+                // U128/UUID too: `payload_route_key`'s arm for them is
+                // `u128::from_le_bytes(cell)`, so its `to_le_bytes()` *is* the
+                // 16-byte cell.
                 hasher.update(&loc.route_key(src, row).to_le_bytes());
             }
         }
@@ -309,9 +304,9 @@ fn hash_group_col<R: RowSource>(
 }
 
 /// Extract the 128-bit group key of one row — the one group-key hash body,
-/// generic over any [`ColumnarSource`] row: a `MemBatch` row and a
-/// `ReadCursor`'s current row hash byte-identically, so a trace row routes to
-/// the delta group it belongs to.
+/// generic over any [`RowSource`] row: a `MemBatch` row and a `ReadCursor`'s
+/// current row hash byte-identically, so a trace row routes to the delta group
+/// it belongs to.
 #[inline]
 pub(super) fn extract_group_key<R: RowSource>(
     src: &R,

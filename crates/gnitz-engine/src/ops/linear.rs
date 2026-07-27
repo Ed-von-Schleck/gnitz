@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn test_op_filter_basic() {
-        use crate::expr::{CmpOp, LogicalInstr, LogicalProgram};
+        use gnitz_expr::{CmpOp, LogicalInstr, LogicalProgram};
 
         let schema = make_schema_u64_i64();
         let batch = make_batch(&schema, &[(1, 1, 5), (2, 1, 15), (3, 1, 25)]);
@@ -519,7 +519,7 @@ mod tests {
 
     #[test]
     fn test_op_filter_consolidated_flag() {
-        use crate::expr::{LogicalInstr, LogicalProgram};
+        use gnitz_expr::{LogicalInstr, LogicalProgram};
 
         let instrs = vec![
             LogicalInstr::LoadConst { dst: 0, val: 1 }, // always true
@@ -561,7 +561,7 @@ mod tests {
 
     #[test]
     fn test_op_map_empty_batch() {
-        use crate::expr::LogicalProgram;
+        use gnitz_expr::LogicalProgram;
         let schema = make_schema_u64_i64();
         let empty_batch = Batch::empty_with_schema(&schema);
 
@@ -734,7 +734,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn always_true_func(schema: &SchemaDescriptor) -> ScalarFunc {
-        use crate::expr::{LogicalInstr, LogicalProgram};
+        use gnitz_expr::{LogicalInstr, LogicalProgram};
         let instrs = vec![LogicalInstr::LoadConst { dst: 0, val: 1 }]; // always true
         ScalarFunc::from_predicate(LogicalProgram::new(instrs, 1, 0, vec![]), schema).unwrap()
     }
@@ -838,7 +838,7 @@ mod tests {
 
     #[test]
     fn test_op_map_with_reindex_promotes_payload_to_pk() {
-        use crate::expr::LogicalProgram;
+        use gnitz_expr::LogicalProgram;
         // op_map with reindex_col >= 0 rewrites the output PK by reading the
         // referenced column through the reindex packer. Verifies (1) every row's
         // output PK matches the source column value, (2) the resulting
@@ -889,7 +889,8 @@ mod tests {
     /// must keep exactly the rows whose payload exceeds 10, in input PK order.
     #[test]
     fn test_filter_batch_matches_per_row() {
-        use crate::expr::{CmpOp, LogicalInstr, LogicalProgram, ScalarFunc};
+        use crate::expr::ScalarFunc;
+        use gnitz_expr::{CmpOp, LogicalInstr, LogicalProgram};
 
         let schema = make_schema_u64_i64();
         // (pk, weight, payload); a row passes iff payload > 10.

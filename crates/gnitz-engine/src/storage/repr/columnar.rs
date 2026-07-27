@@ -14,7 +14,7 @@ use gnitz_wire::{compare_german_strings, null_word_get, read_unsigned_exact};
 /// rather than a bare evaluator input.
 ///
 /// The per-row accessors are [`RowSource`], the one shared definition the
-/// resolved-addressing types ([`gnitz_expr::ColumnLocator`]) bind to, so any
+/// resolved-addressing types ([`crate::schema::ColumnLocator`]) bind to, so any
 /// `ColumnarSource` can be read through a locator directly. This trait adds
 /// exactly the one method the evaluator has no use for.
 ///
