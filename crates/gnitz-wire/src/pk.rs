@@ -37,6 +37,25 @@ pub fn encode_pk_column(src: &[u8], tc: u8, dst: &mut [u8]) {
     }
 }
 
+/// OPK-encode a whole PK tuple: [`encode_pk_column`] over `cols` — the PK
+/// columns as `(width, type_code)` in **PK-list order** — tightly packed, no
+/// inter-column padding (§6). `src` and `dst` are both the tuple's `pk_stride`
+/// bytes.
+///
+/// The one packing walk, so a caller cannot pair the right per-column encoder
+/// with the wrong column order: PK-list order is what makes the result's
+/// unsigned byte comparison the typed PK order, and it is independent of column
+/// order (`PRIMARY KEY (b, a)`).
+#[inline]
+pub fn encode_pk_tuple(cols: impl IntoIterator<Item = (usize, u8)>, src: &[u8], dst: &mut [u8]) {
+    let mut off = 0;
+    for (cs, tc) in cols {
+        encode_pk_column(&src[off..off + cs], tc, &mut dst[off..off + cs]);
+        off += cs;
+    }
+    debug_assert_eq!(off, dst.len(), "pk tuple width != sum of column widths");
+}
+
 /// Symmetric inverse of [`encode_pk_column`]: decode an OPK column back to
 /// native little-endian bytes. `src` and `dst` are both `col.size()` bytes.
 /// Signed types un-flip the sign bit, then the big-endian image is byte-reversed

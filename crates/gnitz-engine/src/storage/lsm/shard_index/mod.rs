@@ -217,8 +217,8 @@ mod tests {
     use super::*;
     use crate::foundation::posix_io::raise_fd_limit_for_tests;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-    use crate::test_support::as_le_bytes;
     use crate::test_support::make_schema_u64_i64;
+    use gnitz_wire::as_le_bytes;
 
     /// Synthetic 2-column compound PK schema: (U64, U64) PK + I64
     /// payload. 16-byte PK region, but the column-aware comparison

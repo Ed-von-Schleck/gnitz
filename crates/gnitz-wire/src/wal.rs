@@ -36,6 +36,13 @@ pub const REG_PAYLOAD_START: usize = NUM_FIXED_REGIONS;
 // the fixed-region count are the same number by construction.
 const _: () = assert!(REG_NULL_BMP + 1 == NUM_FIXED_REGIONS);
 
+/// Region count of a batch with `num_payload_cols` payload columns: the fixed
+/// three, one per payload column, and the trailing blob heap. The blob region's
+/// index is `REG_PAYLOAD_START + num_payload_cols`, i.e. `num_regions(n) - 1`.
+pub const fn num_regions(num_payload_cols: usize) -> usize {
+    NUM_FIXED_REGIONS + num_payload_cols + 1
+}
+
 pub const WAL_HEADER_SIZE: usize = 32;
 pub const WAL_FORMAT_VERSION: u32 = 6;
 

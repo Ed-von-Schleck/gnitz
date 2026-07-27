@@ -627,7 +627,7 @@ mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
     use crate::storage::lsm::shard_reader::MappedShard;
-    use crate::test_support::as_le_bytes;
+    use gnitz_wire::as_le_bytes;
 
     fn make_schema_desc(num_cols: u32, pk_index: u32) -> SchemaDescriptor {
         let mut cols = [SchemaColumn::EMPTY; MAX_COLUMNS];

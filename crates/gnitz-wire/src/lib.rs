@@ -95,6 +95,27 @@ pub fn read_i64_le(buf: &[u8], off: usize) -> i64 {
     i64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
 }
 
+/// Padding-free little-endian scalars a region may be reinterpreted as. A sealed
+/// bound rather than `T: Copy`, which also admits padded types whose padding
+/// bytes are never initialized — reading those as `u8` is UB, and a safe fn must
+/// not carry an unenforced precondition.
+pub trait LeScalar: Copy {}
+macro_rules! le_scalar {
+    ($($t:ty),*) => { $(impl LeScalar for $t {})* };
+}
+le_scalar!(u8, i8, u16, i16, u32, i32, u64, i64, u128, i128);
+
+/// Reinterpret a `&[T]` of LE scalars as the region bytes it already is. On the
+/// little-endian target the native layout *is* the wire/shard layout, so this is
+/// the zero-copy way to hand a typed column (weights, null words, `u128` cells)
+/// to the byte-oriented region APIs.
+#[inline]
+pub fn as_le_bytes<T: LeScalar>(v: &[T]) -> &[u8] {
+    // SAFETY: `size_of_val(v)` initialized bytes borrowed from `v`, consumed as
+    // opaque bytes and never as typed values.
+    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
+}
+
 /// Read a whole 1/2/4/8-byte little-endian **signed** cell, sign-extended to
 /// i64 — the native-LE payload/decoded-PK read. `bytes.len()` IS the column
 /// width. Sibling of [`read_unsigned_exact`]; the two are the one pair every

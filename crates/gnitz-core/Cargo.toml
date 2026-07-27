@@ -7,6 +7,7 @@ edition = "2021"
 integration = []
 
 [dependencies]
+gnitz-expr  = { path = "../gnitz-expr" }
 gnitz-wire  = { path = "../gnitz-wire" }
 libc        = "0.2"
 lru         = "0.12"

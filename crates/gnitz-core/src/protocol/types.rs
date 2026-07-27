@@ -329,6 +329,52 @@ impl Schema {
     }
 }
 
+/// The schema surface the shared expression compiler resolves and validates
+/// against — the client's half of the impl the engine's `SchemaDescriptor`
+/// provides, so one compiler serves both.
+///
+/// `num_columns` and `num_payload_cols` are written UFCS: the inherent method of
+/// the same name would shadow the trait one in receiver-dot position and recurse.
+/// The last two read the column table, which *is* the fact; everything else the
+/// trait derives from `locate`.
+impl gnitz_expr::SchemaFacts for Schema {
+    fn locate(&self, ci: usize) -> gnitz_expr::ColumnLocator {
+        let tc = self.columns[ci].type_code;
+        // Every narrowing is in range: a payload slot is below MAX_COLUMNS, a PK
+        // byte offset below MAX_PK_BYTES, every fixed width is <= 16.
+        let size = tc.wire_stride() as u8;
+        if Schema::is_pk_col(self, ci) {
+            gnitz_expr::ColumnLocator::Pk {
+                byte_off: Schema::pk_byte_offset(self, ci) as u8,
+                size,
+                type_code: tc as u8,
+            }
+        } else {
+            gnitz_expr::ColumnLocator::Payload {
+                slot: Schema::payload_idx(self, ci) as u8,
+                size,
+                type_code: tc as u8,
+            }
+        }
+    }
+
+    fn num_payload_cols(&self) -> usize {
+        Schema::num_payload_cols(self)
+    }
+
+    fn num_columns(&self) -> usize {
+        Schema::num_columns(self)
+    }
+
+    fn col_type_code(&self, ci: usize) -> u8 {
+        self.columns[ci].type_code as u8
+    }
+
+    fn col_nullable(&self, ci: usize) -> bool {
+        self.columns[ci].is_nullable
+    }
+}
+
 /// Returns the META_SCHEMA singleton (4 columns: col_idx/U64 pk=0, type_code/U64, flags/U64, name/String).
 pub fn meta_schema() -> &'static Schema {
     static INSTANCE: OnceLock<Schema> = OnceLock::new();
@@ -703,15 +749,26 @@ impl ColData {
     }
 
     /// The empty column of the canonical variant for wire type `tc` — the single
-    /// TypeCode→variant choice ([`ZSetBatch::filler_columns`] and the appenders
-    /// build on it).
+    /// TypeCode→variant choice ([`ZSetBatch::filler_columns`], the appenders and
+    /// [`Self::matches_type`] all build on it). The wide arm goes through
+    /// `is_wide_int` rather than listing the three codes, so a newly added
+    /// 16-byte type cannot fall into the `Fixed` catch-all unnoticed.
+    #[inline(always)]
     pub fn empty_for(tc: TypeCode) -> Self {
         match tc {
             TypeCode::String => ColData::Strings(vec![]),
             TypeCode::Blob => ColData::Bytes(vec![]),
-            TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => ColData::U128s(vec![]),
+            _ if tc.is_wide_int() => ColData::U128s(vec![]),
             _ => ColData::Fixed(vec![]),
         }
+    }
+
+    /// True iff this column's variant is the one [`Self::empty_for`] builds for
+    /// `tc`. Derived from that function rather than restating its table, so the
+    /// canonical choice and the check that enforces it cannot disagree.
+    #[inline(always)]
+    pub fn matches_type(&self, tc: TypeCode) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(&Self::empty_for(tc))
     }
 
     /// Append one zero-filled **non-null** cell for a column of wire type `tc` —
@@ -869,21 +926,18 @@ impl ZSetBatch {
 
     /// Validate that all vectors are consistently sized for the given schema.
     pub fn validate(&self, schema: &Schema) -> Result<(), std::string::String> {
-        // Front-line agreement check: the Pk buffer variant must match the
-        // schema's PK arity. `empty_for_schema` always picks `Bytes` ⟺
-        // pk_count() >= 2 (a single PK column is <= 16 bytes), so this never
-        // fires on correct code — it is a cheap tripwire for exactly the
-        // planner/engine schema disagreement a compound-PK view could introduce.
-        // Without it a scalar/compound mismatch passes the stride check below
-        // and only surfaces as a deep panic in sort-merge/consolidation.
-        match &self.pks {
-            PkColumn::Bytes { .. } if schema.pk_count() < 2 => {
-                return Err("batch carries a wide PK buffer but schema PK is scalar".into())
-            }
-            PkColumn::U64s(_) | PkColumn::U128s(_) if schema.pk_count() >= 2 => {
-                return Err("batch carries a scalar PK but schema PK is compound".into())
-            }
-            _ => {}
+        // Front-line agreement check, derived from the canonical schema→variant
+        // chooser rather than restating it: a wide buffer under a scalar PK, a
+        // scalar buffer under a compound PK, *and* a `U64s` buffer under a
+        // 16-byte PK column, which the region encoder would silently truncate.
+        // Without it a mismatch passes the stride check below and only surfaces
+        // as a deep panic in sort-merge/consolidation.
+        if std::mem::discriminant(&self.pks) != std::mem::discriminant(&PkColumn::empty_for_schema(schema)) {
+            return Err(format!(
+                "PK buffer variant contradicts the schema's PK layout ({} PK column(s), stride {})",
+                schema.pk_count(),
+                schema.pk_stride()
+            ));
         }
         if let PkColumn::Bytes { stride, buf } = &self.pks {
             if *stride == 0 {
@@ -920,33 +974,25 @@ impl ZSetBatch {
         }
         for (_pi, ci, col_def) in schema.payload_columns() {
             let col = &self.columns[ci];
-            match col {
-                ColData::Fixed(bytes) => {
-                    let expected = n * col_def.type_code.wire_stride();
-                    if bytes.len() != expected {
-                        return Err(format!(
-                            "column {} Fixed byte length {} != expected {}",
-                            ci,
-                            bytes.len(),
-                            expected
-                        ));
-                    }
-                }
-                ColData::Strings(v) => {
-                    if v.len() != n {
-                        return Err(format!("column {} Strings length {} != row count {}", ci, v.len(), n));
-                    }
-                }
-                ColData::Bytes(v) => {
-                    if v.len() != n {
-                        return Err(format!("column {} Bytes length {} != row count {}", ci, v.len(), n));
-                    }
-                }
-                ColData::U128s(v) => {
-                    if v.len() != n {
-                        return Err(format!("column {} U128s length {} != row count {}", ci, v.len(), n));
-                    }
-                }
+            // The variant is decided by the *declared* type, never by the one
+            // found: a String-typed column carrying `Fixed` has a valid `n * 16`
+            // byte length, so the size check below cannot see it — and it would
+            // reach the expression kernels as German cells with arbitrary heap
+            // offsets.
+            if !col.matches_type(col_def.type_code) {
+                return Err(format!(
+                    "column {ci}: ColData variant contradicts schema type {:?}",
+                    col_def.type_code
+                ));
+            }
+            let (got, want) = match col {
+                ColData::Fixed(b) => (b.len(), n * col_def.type_code.wire_stride()),
+                ColData::Strings(v) => (v.len(), n),
+                ColData::Bytes(v) => (v.len(), n),
+                ColData::U128s(v) => (v.len(), n),
+            };
+            if got != want {
+                return Err(format!("column {ci}: length {got} != expected {want}"));
             }
         }
         // A null bit on a NOT NULL payload column would make FK/unique validation
@@ -987,7 +1033,7 @@ pub struct BatchAppender<'a> {
 
 impl<'a> BatchAppender<'a> {
     pub fn new(batch: &'a mut ZSetBatch, schema: &'a Schema) -> Self {
-        let payload_to_ci: Vec<usize> = (0..schema.num_columns()).filter(|&ci| !schema.is_pk_col(ci)).collect();
+        let payload_to_ci: Vec<usize> = schema.payload_columns().map(|(_, ci, _)| ci).collect();
         BatchAppender {
             batch,
             schema,
@@ -1160,6 +1206,23 @@ impl<'a> BatchAppender<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Schema` must answer the shared `SchemaFacts` shape matrix exactly. This
+    /// is where an OPK byte offset or a payload-slot off-by-one would
+    /// miscompute silently rather than error, and the harness is the only way to
+    /// reach the trait methods — two of them collide by name with an inherent
+    /// method Rust prefers in receiver-dot position.
+    #[test]
+    fn schema_conforms_to_schema_facts() {
+        gnitz_expr::assert_schema_facts_matrix(|cols, pk| {
+            let columns: Vec<ColumnDef> = cols
+                .iter()
+                .enumerate()
+                .map(|(i, &(tc, nullable))| ColumnDef::new(format!("c{i}"), TypeCode::from_validated_u8(tc), nullable))
+                .collect();
+            Schema::from_parts(columns, pk.to_vec()).expect("client-valid schema")
+        });
+    }
 
     #[test]
     fn validate_parts_enforces_full_rule_set() {
@@ -1496,9 +1559,9 @@ mod tests {
         batch.pks.push_u128(1);
         batch.weights.push(1);
         batch.nulls.push(0);
-        // Strings column is empty — mismatch
+        // Strings column is empty — mismatch (a cell count, not a byte length)
         let err = batch.validate(&schema).unwrap_err();
-        assert!(err.contains("Strings"));
+        assert!(err.contains("column 1: length 0 != expected 1"), "{err}");
     }
 
     #[test]
@@ -1514,9 +1577,9 @@ mod tests {
         batch.pks.push_u128(1);
         batch.weights.push(1);
         batch.nulls.push(0);
-        // Fixed column 1 is empty (needs 8 bytes) — mismatch
+        // Fixed column 1 is empty (needs 8 bytes) — a byte length, not a count
         let err = batch.validate(&schema).unwrap_err();
-        assert!(err.contains("Fixed"));
+        assert!(err.contains("column 1: length 0 != expected 8"), "{err}");
     }
 
     #[test]

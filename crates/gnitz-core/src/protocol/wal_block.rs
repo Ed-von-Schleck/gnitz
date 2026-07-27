@@ -1,73 +1,15 @@
 //! WAL-block encode/decode for the client wire codec.
 
 use super::error::ProtocolError;
+use super::regions::ViewBuffers;
 use super::types::{null_word_get, ColData, PkColumn, Schema, TypeCode, ZSetBatch};
+use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
-/// Build the PK region as a standalone `Vec<u8>`, encoding it as
-/// **order-preserving big-endian** (OPK) at rest. The in-memory `PkColumn`
-/// holds native LE values; this is the single client-side encode point (the
-/// server stores the region verbatim and `decode_wal_block` does the inverse).
-/// `schema` supplies per-column type codes for signed sign-flipping. The
-/// framer ([`gnitz_wire::wal::encode`]) places the region at its aligned
-/// offset, so this returns just the tightly-packed region bytes.
-fn build_pk_region(pks: &PkColumn, pk_stride: usize, schema: &Schema) -> Vec<u8> {
-    match pks {
-        PkColumn::U64s(v) => {
-            debug_assert!(pk_stride <= 8, "U64s pk_stride must be <= 8");
-            let pk_tc = schema.columns[schema.pk_indices()[0]].type_code as u8;
-            let mut out = vec![0u8; v.len() * pk_stride];
-            let mut w = 0;
-            for &x in v {
-                gnitz_wire::encode_pk_column(&x.to_le_bytes()[..pk_stride], pk_tc, &mut out[w..w + pk_stride]);
-                w += pk_stride;
-            }
-            out
-        }
-        PkColumn::U128s(v) => {
-            debug_assert_eq!(pk_stride, 16, "U128s requires pk_stride == 16");
-            // A lone 16-byte PK is U128/UUID (unsigned: OPK == big-endian) or I128
-            // (signed: OPK == big-endian with the leading sign bit flipped). Encode
-            // via encode_pk_column so the flip is applied for I128; for the unsigned
-            // types it is byte-identical to the prior `x.to_be_bytes()`.
-            let pk_tc = schema.columns[schema.pk_indices()[0]].type_code as u8;
-            let mut out = vec![0u8; v.len() * 16];
-            let mut w = 0;
-            for &x in v {
-                gnitz_wire::encode_pk_column(&x.to_le_bytes(), pk_tc, &mut out[w..w + 16]);
-                w += 16;
-            }
-            out
-        }
-        // Wide compound PK: encode each column of each row to OPK in pk-list order.
-        PkColumn::Bytes { buf: pk_buf, stride } => {
-            let row_stride = *stride as usize;
-            let row_count = pk_buf.len().checked_div(row_stride).unwrap_or(0);
-            let mut out = vec![0u8; pk_buf.len()];
-            // Collect (col_size, type_code) once; avoids schema re-iteration per row.
-            let col_info: Vec<(usize, u8)> = schema.pk_col_codes().collect();
-            for row in 0..row_count {
-                let src = &pk_buf[row * row_stride..(row + 1) * row_stride];
-                let dst_base = row * row_stride;
-                let mut off = 0;
-                for &(cs, tc) in &col_info {
-                    gnitz_wire::encode_pk_column(
-                        &src[off..off + cs],
-                        tc,
-                        &mut out[dst_base + off..dst_base + off + cs],
-                    );
-                    off += cs;
-                }
-            }
-            out
-        }
-    }
-}
-
 /// `&str` / `String` convenience wrappers over the wire German-string codec,
-/// used only by the round-trip tests (production STRING columns flow through
-/// `encode_german_col` / `decode_german_col`).
+/// used only by the round-trip tests (production STRING cells are built by
+/// `regions.rs` and read back by `decode_german_col`).
 #[cfg(test)]
 fn encode_german_str(s: &str, blob: &mut Vec<u8>) -> [u8; 16] {
     gnitz_wire::encode_german_string(s.as_bytes(), blob)
@@ -78,29 +20,6 @@ fn decode_german_str(st: [u8; 16], blob: &[u8]) -> Result<String, ProtocolError>
     let bytes = gnitz_wire::try_decode_german_string(&st, blob)
         .ok_or_else(|| ProtocolError::DecodeError("German String blob arena out of bounds".into()))?;
     String::from_utf8(bytes).map_err(|e| ProtocolError::DecodeError(format!("utf8 in German String: {e}")))
-}
-
-/// Encode a STRING/BLOB column region: one 16-byte German-string struct per
-/// row (a zeroed struct for null or `None` cells), spilling long values into
-/// `blob`. Shared by the STRING and BLOB encode arms — both are byte-oriented
-/// German strings, differing only in the source cell type.
-fn encode_german_col<'a>(
-    count: usize,
-    nulls: &[u64],
-    payload_idx: usize,
-    cells: impl Iterator<Item = Option<&'a [u8]>>,
-    blob: &mut Vec<u8>,
-) -> Vec<u8> {
-    let mut col_bytes = Vec::with_capacity(count * 16);
-    for (row, val) in cells.enumerate() {
-        let is_null = null_word_get(nulls[row], payload_idx);
-        if let (false, Some(b)) = (is_null, val) {
-            col_bytes.extend_from_slice(&gnitz_wire::encode_german_string(b, blob));
-        } else {
-            col_bytes.extend_from_slice(&[0u8; 16]);
-        }
-    }
-    col_bytes
 }
 
 /// Decode a STRING/BLOB column region into per-row raw-byte cells: `None` for
@@ -162,133 +81,16 @@ fn read_64bit_region<T: Copy + Default>(
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Encode a ZSetBatch into a WAL block `Vec<u8>`.
-///
-/// Region order: pk (pk_stride bytes each), weight, null, [non-PK cols in schema order], blob.
-/// num_regions = NUM_FIXED_REGIONS + num_payload_cols + 1.
+/// Frame the batch's §6 region list ([`ViewBuffers::regions`]) into a WAL block.
 pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Vec<u8> {
-    let count = batch.len();
-    let num_non_pk = schema.num_payload_cols();
-    let num_regions = gnitz_wire::NUM_FIXED_REGIONS + num_non_pk + 1;
-
-    // --- Pre-build String/U128 column region data (needs blob arena) ---
-    // Fixed columns are borrowed from batch.columns directly (no clone).
-    let mut blob: Vec<u8> = Vec::new();
-
-    // ColRegion::Prebuilt holds String/Blob temp Vecs; FixedRef and U128Ref mark
-    // columns that will borrow from batch.columns directly.
-    enum ColRegion {
-        Prebuilt(Vec<u8>),
-        FixedRef(usize), // schema column index → borrow batch.columns[ci]
-        U128Ref(usize),  // schema column index → reinterpret batch.columns[ci]'s u128s as bytes
-    }
-    let mut col_regions: Vec<ColRegion> = Vec::with_capacity(num_non_pk);
-
-    for (payload_idx, ci, col) in schema.payload_columns() {
-        match col.type_code {
-            // STRING and BLOB share the 16-byte German-string encoding; the only
-            // difference is the source cell type (`&str` vs `&[u8]`), both viewed
-            // as bytes here.
-            TypeCode::String => {
-                let strings = match &batch.columns[ci] {
-                    ColData::Strings(v) => v,
-                    _ => panic!("encode_wal_block: expected Strings for String column {ci}"),
-                };
-                let cells = strings.iter().map(|v| v.as_deref().map(str::as_bytes));
-                col_regions.push(ColRegion::Prebuilt(encode_german_col(
-                    count,
-                    &batch.nulls,
-                    payload_idx,
-                    cells,
-                    &mut blob,
-                )));
-            }
-            TypeCode::Blob => {
-                let bytes_col = match &batch.columns[ci] {
-                    ColData::Bytes(v) => v,
-                    _ => panic!("encode_wal_block: expected Bytes for BLOB column {ci}"),
-                };
-                let cells = bytes_col.iter().map(|v| v.as_deref());
-                col_regions.push(ColRegion::Prebuilt(encode_german_col(
-                    count,
-                    &batch.nulls,
-                    payload_idx,
-                    cells,
-                    &mut blob,
-                )));
-            }
-            TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => {
-                // Native u128 LE layout is byte-identical to the wire form, so
-                // the region borrows the column directly at collection time
-                // (the same reinterpret as the weight/null regions below) —
-                // no per-column copy.
-                match &batch.columns[ci] {
-                    ColData::U128s(_) => col_regions.push(ColRegion::U128Ref(ci)),
-                    _ => panic!("encode_wal_block: expected U128s for U128/UUID/I128 column {ci}"),
-                }
-            }
-            _ => {
-                let stride = col.type_code.wire_stride();
-                let fixed = match &batch.columns[ci] {
-                    ColData::Fixed(v) => v,
-                    _ => panic!("encode_wal_block: expected Fixed for column {ci}"),
-                };
-                assert_eq!(
-                    fixed.len(),
-                    count * stride,
-                    "col {} Fixed length {} != count*stride {}",
-                    ci,
-                    fixed.len(),
-                    count * stride
-                );
-                col_regions.push(ColRegion::FixedRef(ci));
-            }
-        }
-    }
-
-    // --- Collect region byte slices in canonical order, then frame once ---
-    //
-    // The blob heap is complete (grown by the column loop above), so every
-    // region buffer is now final and can be borrowed. `gnitz_wire::wal::encode`
-    // takes `&[&[u8]]`, so the borrow checker enforces exactly this ordering
-    // (allocate/grow to completion, then collect slices, then encode).
-    let pk_region = build_pk_region(&batch.pks, schema.pk_stride(), schema);
-    // SAFETY: reinterpret the i64/u64 Vecs as opaque LE bytes (their full
-    // length, so never over-reads); they are consumed as bytes, not typed
-    // values (little-endian target, asserted crate-wide).
-    let weight_bytes =
-        unsafe { std::slice::from_raw_parts(batch.weights.as_ptr() as *const u8, batch.weights.len() * 8) };
-    let null_bytes = unsafe { std::slice::from_raw_parts(batch.nulls.as_ptr() as *const u8, batch.nulls.len() * 8) };
-
-    let mut regions: Vec<&[u8]> = Vec::with_capacity(num_regions);
-    regions.push(&pk_region);
-    regions.push(weight_bytes);
-    regions.push(null_bytes);
-    for cr in &col_regions {
-        regions.push(match cr {
-            ColRegion::Prebuilt(data) => data.as_slice(),
-            ColRegion::FixedRef(ci) => match &batch.columns[*ci] {
-                ColData::Fixed(v) => v.as_slice(),
-                _ => unreachable!(),
-            },
-            ColRegion::U128Ref(ci) => match &batch.columns[*ci] {
-                // SAFETY: `v` is `v.len()` u128s = `v.len()*16` initialized
-                // bytes, borrowed from `batch` (which outlives `regions`); the
-                // region is consumed as opaque bytes, not typed values
-                // (little-endian target, asserted crate-wide).
-                ColData::U128s(v) => unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 16) },
-                _ => unreachable!(),
-            },
-        });
-    }
-    regions.push(&blob); // blob arena is always the last region
-    debug_assert_eq!(regions.len(), num_regions);
-
-    // Size the output to exactly one block, then frame in place. checksum =
-    // true: client frames always carry a body checksum. The buffer is pre-sized
-    // to `block_size_of(&regions)`, so encode never returns BufferTooSmall.
+    let mut bufs = ViewBuffers::default();
+    let regions = bufs.regions(batch, schema);
+    // Size the output to exactly one block, then frame in place, so encode never
+    // returns BufferTooSmall. checksum = true: client frames always carry a body
+    // checksum.
     let mut out = vec![0u8; gnitz_wire::wal::block_size_of(&regions)];
-    gnitz_wire::wal::encode(&mut out, 0, table_id, count as u32, &regions, true).expect("WAL encode: pre-sized buffer");
+    gnitz_wire::wal::encode(&mut out, 0, table_id, batch.len() as u32, &regions, true)
+        .expect("WAL encode: pre-sized buffer");
     out
 }
 
@@ -326,7 +128,7 @@ fn decode_wal_block_impl(
     let num_regions = header.num_regions as usize;
 
     // Client's half of the split: schema conformance.
-    let expected_num_regions = gnitz_wire::NUM_FIXED_REGIONS + schema.num_payload_cols() + 1;
+    let expected_num_regions = gnitz_wire::wal::num_regions(schema.num_payload_cols());
     if num_regions != expected_num_regions {
         return Err(ProtocolError::DecodeError(format!(
             "WAL block num_regions mismatch: expected {expected_num_regions}, got {num_regions}"
@@ -344,15 +146,11 @@ fn decode_wal_block_impl(
         return Ok((ZSetBatch::new(schema), table_id));
     }
 
-    // Read system regions
-    let mut region_idx = 0;
-
-    let (pk_off, pk_sz) = dir(region_idx);
-    region_idx += 1;
-    let (wt_off, wt_sz) = dir(region_idx);
-    region_idx += 1;
-    let (null_off, null_sz) = dir(region_idx);
-    region_idx += 1;
+    // Read system regions, by the shared §6 index — the same rule the encoder
+    // builds the list with, rather than a counter that happens to agree.
+    let (pk_off, pk_sz) = dir(REG_PK);
+    let (wt_off, wt_sz) = dir(REG_WEIGHT);
+    let (null_off, null_sz) = dir(REG_NULL_BMP);
 
     let expected_pk_sz = count * pk_stride;
     if pk_sz != expected_pk_sz {
@@ -364,9 +162,9 @@ fn decode_wal_block_impl(
     // numeric fast arms (byte-for-byte unchanged); a compound key never
     // decodes to a numeric variant.
     // The PK region at rest is OPK (order-preserving big-endian). Decode each
-    // variant back to the native LE values the in-memory `PkColumn` holds, so a
-    // subsequent `build_pk_region` (which OPK-encodes assuming LE input) does
-    // not double-encode.
+    // variant back to the native LE values the in-memory `PkColumn` holds, so
+    // re-encoding the batch (which OPK-encodes assuming LE input) does not
+    // double-encode.
     let pks: PkColumn = if schema.pk_count() >= 2 {
         // `stride` is a u8: reject (rather than silently truncate) any wire
         // schema whose packed PK region exceeds the field width.
@@ -426,34 +224,25 @@ fn decode_wal_block_impl(
         &[]
     };
 
-    // Read column regions
-    let mut columns: Vec<ColData> = Vec::with_capacity(schema.num_columns());
-
-    for (ci, col) in schema.columns.iter().enumerate() {
-        if schema.is_pk_col(ci) {
-            columns.push(ColData::Fixed(vec![]));
-            continue;
+    // Read column regions. The payload iterator supplies the slot, so payload
+    // slot `pi` ↔ region `REG_PAYLOAD_START + pi` is stated, not produced as a
+    // side effect of a counter; PK slots keep the empty `Fixed` placeholder
+    // `ZSetBatch::filler_columns` builds.
+    let mut columns = ZSetBatch::filler_columns(schema, 0);
+    for (pi, ci, col) in schema.payload_columns() {
+        let (reg_off, reg_sz) = dir(REG_PAYLOAD_START + pi);
+        // One width rule for every column kind: `wire_stride` is 16 for STRING,
+        // BLOB and the three 16-byte int types alike.
+        let expected_sz = count * col.type_code.wire_stride();
+        if reg_sz != expected_sz {
+            return Err(ProtocolError::DecodeError(format!(
+                "column {ci} region size mismatch: expected {expected_sz}, got {reg_sz}"
+            )));
         }
-
-        let payload_idx = schema.payload_idx(ci);
-        let (reg_off, reg_sz) = dir(region_idx);
-        region_idx += 1;
-
-        // STRING/BLOB/U128 regions are all 16 bytes/row; validate that once.
-        let check_16b = |label: &str| -> Result<(), ProtocolError> {
-            let expected_sz = count * 16;
-            if reg_sz != expected_sz {
-                return Err(ProtocolError::DecodeError(format!(
-                    "{label} column {ci} region size mismatch: expected {expected_sz}, got {reg_sz}"
-                )));
-            }
-            Ok(())
-        };
-        match col.type_code {
+        columns[ci] = match col.type_code {
             TypeCode::String => {
-                check_16b("String")?;
                 // Raw German-string cells, then UTF-8-validate each into a String.
-                let raw = decode_german_col(data, reg_off, blob, &nulls, payload_idx, count)?;
+                let raw = decode_german_col(data, reg_off, blob, &nulls, pi, count)?;
                 let mut vals: Vec<Option<String>> = Vec::with_capacity(count);
                 for cell in raw {
                     vals.push(match cell {
@@ -464,15 +253,10 @@ fn decode_wal_block_impl(
                         ),
                     });
                 }
-                columns.push(ColData::Strings(vals));
+                ColData::Strings(vals)
             }
-            TypeCode::Blob => {
-                check_16b("Blob")?;
-                let vals = decode_german_col(data, reg_off, blob, &nulls, payload_idx, count)?;
-                columns.push(ColData::Bytes(vals));
-            }
-            TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => {
-                check_16b("U128/UUID/I128")?;
+            TypeCode::Blob => ColData::Bytes(decode_german_col(data, reg_off, blob, &nulls, pi, count)?),
+            _ if col.type_code.is_wide_int() => {
                 // Native u128 LE layout is byte-identical to the region; the
                 // extent is dominated by the size + directory checks, so bulk-
                 // copy the whole region rather than reading each row.
@@ -483,24 +267,10 @@ fn decode_wal_block_impl(
                 unsafe {
                     std::ptr::copy_nonoverlapping(data[reg_off..].as_ptr(), vals.as_mut_ptr() as *mut u8, count * 16);
                 }
-                columns.push(ColData::U128s(vals));
+                ColData::U128s(vals)
             }
-            _ => {
-                let stride = col.type_code.wire_stride();
-                let expected_sz = count * stride;
-                if reg_sz != expected_sz {
-                    return Err(ProtocolError::DecodeError(format!(
-                        "Fixed column {ci} region size mismatch: expected {expected_sz}, got {reg_sz}"
-                    )));
-                }
-                if reg_off + reg_sz > data.len() {
-                    return Err(ProtocolError::DecodeError(format!(
-                        "Fixed column {ci} region out of bounds"
-                    )));
-                }
-                columns.push(ColData::Fixed(data[reg_off..reg_off + reg_sz].to_vec()));
-            }
-        }
+            _ => ColData::Fixed(data[reg_off..reg_off + reg_sz].to_vec()),
+        };
     }
 
     Ok((

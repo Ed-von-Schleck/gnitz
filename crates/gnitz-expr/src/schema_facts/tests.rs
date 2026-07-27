@@ -42,7 +42,7 @@ impl SchemaFacts for OffByOnePayloadColIdx {
 /// what decide those tests' `no_nulls` and column addresses.
 #[test]
 fn schema_facts_harness_accepts_a_faithful_impl() {
-    assert_schema_facts_consistent(&TestSchema::new(&TINY, &TINY_PK), &TINY, &TINY_PK);
+    crate::assert_schema_facts_matrix(TestSchema::new);
 }
 
 /// The harness must not be vacuous: an off-by-one `payload_col_idx` — the

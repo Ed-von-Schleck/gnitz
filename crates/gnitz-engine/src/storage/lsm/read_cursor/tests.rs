@@ -1,8 +1,8 @@
 use super::*;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::Layout;
-use crate::test_support::as_le_bytes;
 use crate::test_support::{make_schema_u128_i64, wide_pk_3xu64_schema};
+use gnitz_wire::as_le_bytes;
 
 /// `(U64 PK | I64 payload)` — stride-8, the dominant single-PK table shape.
 /// Used by the stride-8 drive bench, which exercises `pack_pk_be`'s 8-byte

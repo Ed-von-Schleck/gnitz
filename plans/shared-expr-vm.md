@@ -263,11 +263,12 @@ gnitz-wire ── gnitz-expr ─┬── gnitz-engine   (MemBatch impls RowSour
                           └── gnitz-sql      (HAVING / residual / SET over the shared core)
 ```
 
-`gnitz-expr` is a workspace member and a dependency of `gnitz-engine` already;
-**steps 4 and 5 add it to `gnitz-core` and `gnitz-sql`** (it is not yet a
-dependency of those two). `gnitz-engine`'s production deps stay
-`gnitz-wire` + `gnitz-expr` only (`gnitz-core` remains dev-only,
-`gnitz-engine/Cargo.toml:26`). `gnitz-wire`'s only dependency is `xxhash-rust`,
+`gnitz-expr` is a workspace member and a dependency of `gnitz-engine` and (since
+step 4) `gnitz-core`; **step 5 adds it to `gnitz-sql`**, together with
+`expr_unsupported` — step 4 ships nothing in `gnitz-sql`, because a `pub(crate)`
+helper with no caller is `dead_code` under a workspace-wide `-D warnings`.
+`gnitz-engine`'s production deps stay `gnitz-wire` + `gnitz-expr` only
+(`gnitz-core` remains dev-only, `gnitz-engine/Cargo.toml:27`). `gnitz-wire`'s only dependency is `xxhash-rust`,
 so there is no cycle. No `capi`/`py` surface changes.
 
 `gnitz-expr` carries a `[lints]` block matching `gnitz-engine/Cargo.toml:29-33`
@@ -357,15 +358,14 @@ pub fn assert_batchview_consistent<B: BatchView>(v: &B, rows: usize, cols: &[(us
 Lifetimes are tied to `&self`, NOT decoupled — a client adapter owns the buffers
 it materializes and can only lend them for `&self`.
 
-**Step 4's `ZSetBatchView` must call `gnitz_expr::assert_batchview_consistent`.**
-It is the implementor that can actually violate the contract: its `col_data` is
-not a flat-region slice but a `pi → ci` map through `bufs.pi_to_ci[pi]` plus a
-`ColData::{Fixed, Strings, Bytes, U128s}` match, so a `get_col_ptr` that forgets
-the `str_cols[pi]` redirect returns wrong DML/HAVING results silently across the
-`gnitz-capi` C ABI. For `MemBatch` the same property is near-tautological (both
-accessors derive the same `offsets[REG_PAYLOAD_START + pi]` address) and is
-checked in `storage/repr/merge.rs`'s test module — one rule, one assertion, every
-implementor.
+**`ZSetBatchView` calls `gnitz_expr::assert_batchview_consistent`** (step 4), as
+`MemBatch` does in `storage/repr/merge.rs`'s test module — one rule, one
+assertion, every implementor. For both, the column loop is near-tautological:
+each derives its per-row address and its region from the same region index, so a
+mis-mapped slot is unrepresentable rather than tested for. The two assertions
+that do bite on the client side are `null_bmp().len() == rows * 8` and the
+per-row `get_null_word` ↔ `null_bmp` agreement, which checks a reinterpreted
+region against a direct `batch.nulls[row]` index.
 
 `SchemaFacts` landed in **step 3a**, alongside the seven functions that read it —
 its only consumers. Defining it earlier would have put a duplicate API surface on
@@ -380,14 +380,19 @@ Three decisions it carries:
   method, or the column-table field where that *is* the fact — rather than
   reimplement; written UFCS wherever an inherent method exists, since most
   collide by name and Rust prefers the inherent one in receiver-dot position.
-- **Six required methods plus two provided** (`locate`, `payload_col_idx`,
-  `num_payload_cols`, `num_columns`, `col_type_code`, `col_nullable`; provided
-  `payload_slot` and `is_pk_col`). `payload_slot(ci) -> Option<u8>` destructures
-  `locate` and `is_pk_col` is `payload_slot(ci).is_none()`, so the locator
-  variant *is* the PK marker and an implementor cannot state the two and have
-  them disagree. `col_type_code` stays required — deriving it from `locate` is
-  not free (`SchemaDescriptor::locate` runs a release-active bound assert and an
-  O(pk_count) `pk_byte_offset` walk).
+- **Five required methods plus three provided** (`locate`, `num_payload_cols`,
+  `num_columns`, `col_type_code`, `col_nullable`; provided `payload_slot`,
+  `is_pk_col` and `payload_col_idx`). All three provided bodies come off
+  `locate`: `payload_slot(ci) -> Option<u8>` destructures it, `is_pk_col` is
+  `payload_slot(ci).is_none()`, and `payload_col_idx(pi)` is the `pi`-th column
+  with no payload slot — so the locator variant *is* the PK marker and an
+  implementor cannot state the directions and have them disagree.
+  `payload_col_idx` is the direction that decides `no_nulls`, which is exactly
+  why it is derived rather than hand-written; an implementor overrides it only
+  to answer it in O(1) from a table it already has (`SchemaDescriptor` does,
+  `gnitz_core::Schema` does not). `col_type_code` stays required — deriving it
+  from `locate` is not free (`SchemaDescriptor::locate` runs a release-active
+  bound assert and an O(pk_count) `pk_byte_offset` walk).
 
   **`PAYLOAD_MAPPING_PK_SENTINEL` is deliberately NOT in this contract.** An
   earlier shape had a required `payload_mapping_byte(ci) -> u8` returning the
@@ -468,8 +473,10 @@ register file are gone from it — a caller outside the crate holds an
   `route_key`; `PAYLOAD_MAPPING_PK_SENTINEL`.
 - **Access traits** — `RowSource` (4 methods), `BatchView` (2), plus
   `assert_batchview_consistent`.
-- **Schema contract** — `SchemaFacts` (7 required + 1 provided), plus
-  `assert_schema_facts_consistent`.
+- **Schema contract** — `SchemaFacts` (5 required + 3 provided), plus
+  `assert_schema_facts_consistent`, the shared shape matrix
+  `SCHEMA_FACTS_CASES` / `SchemaFactsCase`, and the driver
+  `assert_schema_facts_matrix(build)` that runs the harness over every case.
 - **Program construction** — `LogicalProgram` with `new`, `copy_cols`,
   `from_wire`, `payload_copy_srcs`, `sequential_copy_base`, and the three
   **validating** resolvers `resolve_filter(schema)` / `resolve_map(in, out)` /
@@ -532,9 +539,11 @@ any widening.
   from `RowSource`.
 - `REG_*` / `MAX_BATCH_REGIONS`, `Batch`, `Batch::as_mem_batch`.
 - `impl SchemaFacts for SchemaDescriptor` — six forwarders: `locate`,
-  `payload_col_idx`, `num_payload_cols`, `num_columns` (all UFCS to the inherent
-  method) plus `self.columns[ci].type_code` / `self.columns[ci].nullable != 0`,
-  where the field *is* the fact and there is no inherent method to forward to.
+  `num_payload_cols`, `num_columns` (all UFCS to the inherent method) plus
+  `self.columns[ci].type_code` / `self.columns[ci].nullable != 0`, where the
+  field *is* the fact and there is no inherent method to forward to; and
+  `payload_col_idx`, the one **override** of a provided method — the engine
+  already holds the `payload_to_ci` table that answers it in O(1).
   No `#[inline]` on any of them — every caller reaches them through
   `&dyn SchemaFacts`, so the hint cannot fire through the vtable. The inherent
   `SchemaDescriptor::payload_mapping_byte` is **deleted**: with the sentinel out
@@ -657,156 +666,109 @@ accessors are `#[inline(always)]` and resolve to `MemBatch`'s inherent bodies.
 
 ## Client side
 
-### `gnitz_core::Schema` impls `SchemaFacts`
+### `gnitz_core::Schema` impls `SchemaFacts` (**DONE** in 4)
 
-From existing methods on `gnitz-core/src/protocol/types.rs`: `is_pk_col`
-(`:138`), `num_columns` (`:87`), `num_payload_cols` (`:132`), `payload_idx`
-(`:168`), `pk_byte_offset` (`:145`), `payload_columns` (`:178`),
-`columns[ci].type_code` / `.is_nullable`.
-- `locate(ci)`: mirrors engine `locate` (`schema.rs:656`) exactly — `size =
-  columns[ci].type_code.wire_stride() as u8` (engine's `SchemaColumn.size` is
-  `wire_stride(tc) as u8`, set in `SchemaColumn::new`), then
-  `ColumnLocator::Pk { byte_off: pk_byte_offset(ci) as u8, size, type_code: tc as
-  u8 }` for a PK column (client `pk_byte_offset` sums PK-list-order
-  `wire_stride`s — the same walk as engine `pk_byte_offset`, `schema.rs:641`),
-  else `ColumnLocator::Payload { slot: payload_idx(ci) as u8, size, type_code:
-  tc as u8 }`.
-- `col_type_code(ci)`: `self.columns[ci].type_code as u8` — the client's field is
-  a `TypeCode` enum, the trait returns `u8`.
-- Neither `payload_slot` nor `is_pk_col` is written: the trait provides both off
-  `locate`, so the client impl is `locate` + the five plain accessors and never
-  names `PAYLOAD_MAPPING_PK_SENTINEL`. (An earlier shape required a
-  `payload_mapping_byte(ci) -> u8`, which would have forced this impl to branch
-  around `payload_idx`'s own non-PK `debug_assert!` to synthesise a sentinel.)
-- `payload_col_idx(pi)` — **`gnitz_core::Schema` has no such method, but the
-  computation already exists privately**: `BatchAppender::new`
-  (`protocol/types.rs:990`) builds `payload_to_ci: Vec<usize> =
-  (0..num_columns).filter(|ci| !is_pk_col(ci)).collect()`. Promote that to a
-  `Schema` method and have `BatchAppender` index it, rather than writing the walk
-  a second time; as a method it is
-  `self.payload_columns().nth(pi).map(|(_, ci, _)| ci).expect("payload_col_idx:
-  pi out of range")` (`payload_columns` yields `(pi, ci, &ColumnDef)`). This is
-  load-bearing and silent if wrong: it is the only consumer inside
-  `is_strictly_non_nullable` (`program.rs:1315-1317`), i.e. it decides
-  `no_nulls`. The obvious wrong implementation (`pi` itself) is correct only when
-  the PK sits at column 0; for any interspersed or compound PK it reads another
-  column's nullability → null bits silently ignored → wrong rows kept.
+In `protocol/types.rs`, directly under `impl Schema`. **Five methods, and no new
+inherent method on `Schema`**: `num_columns` and `num_payload_cols` are written
+UFCS because they collide by name with an inherent method Rust prefers in
+receiver-dot position, `locate` computes, and `col_type_code` / `col_nullable`
+read the column table, which *is* the fact. No `#[inline]` (every caller arrives
+through `&dyn SchemaFacts`) and no cached address table (the whole trait runs
+once per program compile). `payload_slot`, `is_pk_col` **and `payload_col_idx`**
+are not restated: the trait derives all three off `locate`. An earlier draft
+added an inherent `Schema::payload_col_idx` whose only caller was its own
+forwarder — the collision it then had to work around was one it created.
 
-**`locate` is the one genuinely new client method, and three partial copies of it
-already exist** — delete them as part of this step rather than leaving a fourth
-spelling: `gnitz-sql`'s `SortKey` (`exec/order.rs:35-63` — a struct-shaped
-`ColumnLocator`: PK-vs-payload address, width, type, null bit),
-`pk_col_window` / `pk_col_window_at` (`exec/batch.rs:53-78` — the PK-region
-address from `pk_byte_offset` + `wire_stride`), and `gnitz-py`'s `ColLayout`
-(`lib.rs:901-937` — a struct-of-arrays `Vec<ColumnLocator>`). None is fixable
-today because none of those crates depends on `gnitz-expr` yet; steps 4/5 are
-what make them reachable.
+`BatchAppender::new`'s private payload-cursor cache is built from
+`payload_columns()`, so "which columns are payload" has one home.
 
 Keep `Schema::payload_idx`'s live computation (`col_idx − count(pk < col_idx)`) —
 it already equals `compute_mappings`; pointing it at the shared function would
 force a `[u8; MAX_COLUMNS]` materialization on a `Vec`-based client.
 
-### `ViewBuffers` + `ZSetBatchView`: the one client adapter (in `gnitz-core`)
+**The three partial `locate` copies are not copies of `locate`.** An earlier
+draft mandated deleting `gnitz-sql`'s `SortKey` (`exec/order.rs:35-62`),
+`pk_col_window` / `pk_col_window_at` (`exec/batch.rs:53-77`) and `gnitz-py`'s
+`ColLayout` (`lib.rs:902-938`) as part of the client-adapter step, on the theory
+that only the missing dependency edge blocked them. The dependency is not the
+obstacle: `ColumnLocator::bytes`'s `Pk` arm reads **OPK big-endian** out of
+`get_pk_bytes`, whereas `pk_col_window_at` hands back **native-LE** bytes — the
+on-wire `PkColumn::Bytes` buffer, or `batch.pks.get(i).to_le_bytes()` for the
+scalar arms — which `SortKey` then feeds to `cmp_typed_le`. They read a different
+encoding. (`ColLayout` is further off still: six facts, of which `pk_stride` and
+`has_presented_pk` are not locator facts at all.) There is no checkbox for them
+and no `gnitz-py` dependency, which would also falsify the crate diagram above.
 
-A `ZSetBatch` (`protocol/types.rs:744`) is already region-shaped for the fixed
-and null parts. The owned scratch is split out of the borrowing view so a loop
-over short-lived batches allocates nothing after warmup (a `reset(&mut self,
-batch: &'a ZSetBatch)` cannot work: `'a` is fixed at construction and sits in an
-invariant position behind `&mut self`, while the ON CONFLICT `existing` is an
-owned `ZSetBatch` created *inside* the loop body — `E0597`).
+### `ViewBuffers` + `ZSetBatchView`: the one client adapter (**DONE** in 4)
 
-Both types go in `protocol/types.rs`, next to `ZSetBatch`/`ColData` (the `*_into`
-encode helpers stay in `wal_block.rs`), and are added to `protocol/mod.rs`'s
-`pub use types::{…}` list and `lib.rs`'s `pub use protocol::{…}` list — otherwise
-`gnitz-sql` cannot name them.
+In `gnitz-core/src/protocol/regions.rs`, a module whose subject is one thing — a
+`ZSetBatch` in §6 region form — exported through `protocol/mod.rs` and `lib.rs`
+so `gnitz-sql` can name both types. It is **not** a second mapping beside the WAL
+encoder: `encode_wal_block` already turned a `ZSetBatch` into exactly the §6
+region list (that is what `gnitz_wire::wal::encode` frames), so the one region
+builder is shared and `wal_block.rs` is left as framing plus decode. There are no
+allocating `build_pk_region` / `encode_german_col` forms; both moved into
+`regions.rs` with their sole caller as module-private `*_into` forms.
 
 ```rust
-#[derive(Default)]
-pub struct ViewBuffers {
-    /// Indexed by payload slot: German-encoded 16-byte cells of a String/Blob
-    /// column (`rows * 16` bytes); empty for every other column. Sized
-    /// `schema.num_payload_cols()`.
-    str_cols: Vec<Vec<u8>>,
-    /// Payload slot → schema column index, so `col_data` is O(1) instead of an
-    /// O(cols) `payload_columns()` scan per instruction per morsel.
-    pi_to_ci: Vec<usize>,
-    blob: Vec<u8>,
-    nulls_le: Vec<u8>,
-    pk_region: Vec<u8>,
-}
-impl ViewBuffers {
-    /// Clear and refill from `batch`; every `Vec` keeps its capacity.
-    /// Starts with `debug_assert_eq!(batch.nulls.len(), batch.len())`.
-    pub fn fill(&mut self, batch: &ZSetBatch, schema: &Schema) { … }
-}
-pub struct ZSetBatchView<'a> { batch: &'a ZSetBatch, schema: &'a Schema, bufs: &'a ViewBuffers }
-impl<'a> ZSetBatchView<'a> {
-    pub fn new(batch: &'a ZSetBatch, schema: &'a Schema, bufs: &'a ViewBuffers) -> Self { … }
-}
-impl BatchView for ZSetBatchView<'_> { … }
+let mut bufs = ViewBuffers::default();       // hoist above a loop over batches
+let view = bufs.view(batch, schema);         // the ONE way to get a ZSetBatchView
+let (v, is_null) = ev.eval_row(&view, row);
 ```
 
-Usage over one batch: `let mut bufs = ViewBuffers::default(); bufs.fill(&batch,
-schema); let view = ZSetBatchView::new(&batch, schema, &bufs);`. Usage in a loop
-over changing batches: hoist `bufs`, and per iteration `bufs.fill(b, schema); let
-view = ZSetBatchView::new(b, schema, &bufs);`.
+The API facts steps 5/6 build on:
 
-`fill` builds:
-- `pi_to_ci`: from `schema.payload_columns()` (which yields `(pi, ci,
-  &ColumnDef)`, `types.rs:178-184`).
-- `nulls_le`: `batch.nulls` (`Vec<u64>`, **one word per row** — `is_null` indexes
-  `self.nulls[row]`, `types.rs:800`) flattened to LE bytes. Byte-identical to the
-  engine's `null_bmp()` region.
-- `pk_region`: `build_pk_region_into(&mut self.pk_region, &batch.pks,
-  schema.pk_stride(), schema)` — the OPK bytes for every row
-  (`Schema::pk_stride`, `types.rs:111`). Required because `PkColumn`
-  (`types.rs:329`) holds *decoded native* values (`U64s`/`U128s`) or on-wire LE
-  bytes, never OPK — and a SET RHS or residual may legitimately reference the PK
-  column (`SET x = pk + 1`), which lowers to `Instr::LoadPk` and
-  `decode_pk_column`/`widen_pk_be` (`batch.rs:620-641`).
-- `str_cols[pi]` for every `ColData::Strings` (`types.rs:615`) and
-  `ColData::Bytes` (`:616`) column, threading **one** growing `blob` across all
-  of them so heap offsets are absolute and non-overlapping — the discipline
-  `encode_wal_block` (`wal_block.rs:176`) already uses.
+- `ViewBuffers::view(&'a mut self, &'a ZSetBatch, &Schema) -> ZSetBatchView<'a>`
+  fills and lends in one call. There is no public `fill` and no
+  `ZSetBatchView::new`, so there is no two-step protocol whose first half can be
+  forgotten, misordered, or run against a different batch; and the view borrows
+  the batch, so mutating the batch under a live view is a borrow error.
+- **ON CONFLICT needs two `ViewBuffers`** (`bufs_excluded`, `bufs_existing`): the
+  view borrows the buffers, so a second concurrent view over the same buffers is
+  `&mut` against a live `&mut` — a compile error.
+- **Every payload slot is a region**, `U128s` included. There is no wide-column
+  panic for a later step to guard.
+- **`ZSetBatch::validate` owns the "which `ColData` variant belongs to which
+  declared type" rule**, derived from `ColData::empty_for` — the canonical
+  TypeCode→variant chooser — via `ColData::matches_type`, so the choice and the
+  check that enforces it cannot disagree. That matters because it is classified by
+  the **declared type code** rather than the variant found: a `String`-typed
+  column carrying `ColData::Fixed` has a valid `rows*16` byte length, so it passes
+  every size check, passes `check_col` (which reads `col_type_code`), skips
+  materialization, and hands `eval_str_cmp` German cells with arbitrary heap
+  offsets. Every push path validates before encoding, so on that path the fault is
+  a typed `Err`, not a panic across the `gnitz-capi` C ABI under `panic = "abort"`.
+  The same rule is applied to the PK buffer, by comparing `self.pks`' discriminant
+  against `PkColumn::empty_for_schema(schema)` — which subsumes the two hand-written
+  scalar/compound arity arms *and* catches a `U64s` buffer under a 16-byte PK
+  column. `ViewBuffers::regions` re-asserts the payload rule as a boundary guard
+  (a view can be built over a batch that never went through validate — a
+  synthesized HAVING row, a SET overlay), and asserts the built region's own
+  length, which validate cannot state. Row counts are validate's rule alone and
+  are not restated. A client program that names a 16-byte column in an integer
+  register is rejected earlier still and typed —
+  `ExprValidateErr::ColKindMismatch` — so a reject-list drift in `lower.rs`
+  surfaces as an `Unsupported`.
+- `impl SchemaFacts for Schema`, above.
 
-**`build_pk_region` and `encode_german_col` need `*_into` variants.** Both are
-module-private `fn`s in `protocol/wal_block.rs` (`:15`, `:87`) that **return a
-freshly allocated `Vec`** (`vec![0u8; …]` at `:20`;
-`Vec::with_capacity(count*16)` at `:89`), so calling them from `fill` would
-allocate every iteration and defeat the whole design. Refactor each into a
-`pub(crate) fn …_into(dst: &mut Vec<u8>, …)` that clears and appends, with the
-existing signature kept as a thin wrapper for `encode_wal_block`.
-`encode_german_col`'s cells parameter is `impl Iterator<Item = Option<&'a [u8]>>`
-(`:87-93`), so `fill` passes `v.iter().map(|o| o.as_deref().map(str::as_bytes))`
-for `Strings` and `v.iter().map(|o| o.as_deref())` for `Bytes`.
+`pk_region` exists because a `PkColumn` holds **native LE** values (`U64s` /
+`U128s`) or on-wire LE bytes (`Bytes`), **never OPK** — and a SET RHS or residual
+may legitimately read the PK (`SET x = pk + 1`), which lowers to `Instr::LoadPk`.
+The German cells are materialized for every String/Blob column because a
+`ZSetBatch` has no German-string region at all; the builder that already
+materialized them for the encode path is the one that does it, so a String
+column's cells are built once by the one rule that has always built them.
+`Fixed` and `U128s` columns *are* regions and are borrowed in place; the PK
+region, the German cells and the blob arena keep their capacity across views.
+The region *list* is a fresh `Vec<&[u8]>` per view — `gnitz_wire::wal::encode`
+takes `&[&[u8]]`, and the buffers it borrows are `&mut self` until it is built.
 
-`col_data(pi, size)` maps `pi → ci` via `bufs.pi_to_ci[pi]`, then matches
-`batch.columns[ci]`:
-- `ColData::Fixed` (`:614`) → its bytes in place (`rows * wire_stride`,
-  native-LE). Zero-copy.
-- `ColData::Strings` / `ColData::Bytes` → `&bufs.str_cols[pi]` (`size` is 16).
-- `ColData::U128s` (`:620`) → `unreachable!("16-byte column in an expression
-  register")`. Unreachable by construction *and* guarded: `OpcodeBackend::col_ref`
-  rejects `is_wide_int` before anything else (`lower.rs:207-215`) and is the only
-  producer of `LoadColInt`/`LoadColFloat`; `try_compile_string_cmp` gates on
-  `is_german_string()` (`lower.rs:136,164`); the IN-list OR-chain and `case`
-  recurse through `binop` → `col_ref` (pinned by
-  `in_list_wide_int_operand_rejects`, `lower.rs:868-882`); `IS NULL` on a
-  nullable U128 *does* reach the VM but `eval_is_null` reads only `null_bmp()`
-  (`batch.rs:210-215`) and `null_test` (`lower.rs:388`) never routes through
-  `col_ref`; `IS NULL` on a *PK* column cannot arise because `bind_null_test`
-  const-folds null tests on non-nullable columns to `LitInt(0/1)`
-  (`bind/structural.rs:496-506`); `CopyCol`/`Emit` are `eval_batch` no-ops and
-  `OpcodeBackend` never emits `CopyCol`. **The guard**: every client site calls
-  `resolve_scalar` / `resolve_filter`, whose validation returns
-  `ColTooWideForRegister`,
-  so a future reject-list drift in `lower.rs` (a file fn1/fn2/fn3 all edit)
-  surfaces as a typed `Unsupported`, not a panic across the `gnitz-capi` C ABI
-  under `panic = "abort"`.
-
-`fill` materializes every string column eagerly rather than only the referenced
-ones: `ResolvedProgram` exposes no referenced-column set, and both users are cold
-paths.
+`ZSetBatchView` hoists the three regions read **per row** — PK, blob, null
+bitmap — out of that list into fields (`nulls` as the `Vec<u64>` the region
+reinterprets, so it is one load rather than two). `col_data` / `null_bmp` are
+read once per instruction per morsel and stay indexed.
+`gnitz_expr::assert_batchview_consistent` pins the two readings against each
+other, which is what makes the hoist safe to state as an optimisation.
 
 ### Compiling a client program: the shared lines
 
@@ -920,8 +882,7 @@ if let Some(ev) = spec.having {
         }
     }
     hav.nulls.push(nw);
-    bufs.fill(&hav, spec.partial_schema);
-    let view = ZSetBatchView::new(&hav, spec.partial_schema, &bufs);
+    let view = bufs.view(&hav, spec.partial_schema);
     let (v, is_null) = ev.eval_row(&view, 0);
     if is_null || v == 0 { continue; }
 }
@@ -936,8 +897,8 @@ is already imported (`agg_finish.rs:20`). `push_fixed_bits`'s `unreachable!` can
 never fire: `agg_output_type` (`gnitz-wire/src/circuit.rs:168-190`) yields only
 `I64`/`U64`/`F64`/a fixed-int source type — all ≤ 8 bytes — so an `AggSpec`'s
 `out_type` is always a `ColData::Fixed` column. `view` is declared inside the
-`if let Some(ev)` block and its last use is `ev.eval_row`, so NLL releases
-the `&hav`/`&bufs` borrows before the next iteration's `truncate`/`fill`. The
+`if let Some(ev)` block and its last use is `ev.eval_row`, so NLL releases the
+`&hav` and `&mut bufs` borrows before the next iteration's `truncate`/`view`. The
 null bits are
 **load-bearing** for the newly-enabled `IS NULL`: `acc_val` yields `Val::Null`
 for an all-NULL or uncontributed `SUM`/`MIN`/`MAX` group, and `MIN(v) IS NULL`
@@ -945,7 +906,7 @@ compiles to a real null test. `rep == None` is the global ground group, which ha
 `n_group == 0`. Agg partials are never F32 — `agg_output_type` maps float
 MIN/MAX/SUM to `F64` (`gnitz-wire/src/circuit.rs:174-189`) — so the `Val::Float`
 arm is always the 8-byte case. Steady-state allocation is zero: `truncate` keeps
-capacity, `bufs.fill` reuses its `Vec`s.
+capacity, and `bufs.view` reuses its `Vec`s.
 
 The truth test `is_null || v == 0 → drop` is exactly today's `truthy` + NULL-drop
 and bit-identical to the engine filter's `bool_bits & !null_bits` (`eval_row`
@@ -1118,8 +1079,9 @@ Classification, per assignment, exactly as `eval_set_expr` decides today:
   (as today, `mutate.rs:49-57`); `Num(ev)` → `ev.eval_row(view, row)` →
   `(_, true) => Null`, `(v, false) => Int(v)`. `eval_set_expr` (`mutate.rs:41`)
   is deleted. **No scratch parameter**: each `Evaluator` owns its register file.
-- `write_set_rows` (`mutate.rs:147`): takes `&[(usize, SetProgram)]`; builds one
-  `ViewBuffers` + `ZSetBatchView` over `current` before the row loop;
+- `write_set_rows` (`mutate.rs:147`): takes `&[(usize, SetProgram)]`; holds one
+  `ViewBuffers` and lends a view over `current` (`bufs.view(current, schema)`)
+  before the row loop;
   `asn_by_col` becomes `Vec<Option<&SetProgram>>`. Nothing else is threaded
   through it into `build_merged_row`.
 - `insert.rs`: `BoundUpdateExpr::{Existing(SetProgram), Excluded(SetProgram)}`
@@ -1131,14 +1093,13 @@ Classification, per assignment, exactly as `eval_set_expr` decides today:
   `BoundUpdateExpr::Excluded(BoundExpr::ColRef(col_idx))` directly, bypassing
   `bind_mutate_scalar`** — route that bare `ColRef` through the same classifier.
   Hoist **two** `ViewBuffers` (`bufs_excluded`, `bufs_existing`) above the loop
-  — two are required because the `excluded` view
-  holds `&bufs_excluded` for the whole loop, so the per-iteration `existing` fill
-  needs a separately-owned buffer set (`&mut` vs the live `&`). Build the
-  `excluded` view over `batch` once (it outlives the loop); for `existing` — an
-  owned 1-row `ZSetBatch` from `effective_row` (`insert.rs:459`,
-  `dml/overlay.rs:44-49`) — call `bufs_existing.fill(ex, schema)` and construct a
-  short-lived view inside the `Some(ex)` arm, which allocates nothing after
-  warmup.
+  — two are required because the `excluded` view holds `&mut bufs_excluded` for
+  the whole loop, so the per-iteration `existing` view needs a separately-owned
+  buffer set (`&mut` against a live `&mut`). Build the `excluded` view over
+  `batch` once (it outlives the loop); for `existing` — an owned 1-row
+  `ZSetBatch` from `effective_row` (`insert.rs:459`, `dml/overlay.rs:44-49`) —
+  call `bufs_existing.view(ex, schema)` inside the `Some(ex)` arm, which
+  allocates nothing after warmup beyond the view's own region list.
 
 **Delete** `InterpBackend` (`eval.rs:30`) with its `impl BoundExprBackend`
 (`:36`), `eval_expr` (`:244`) and `eval_pred_row` (`:254`) — the whole non-test
@@ -1209,20 +1170,28 @@ a `pub fn` taking `&dyn` — because most methods collide by name with a typical
 implementor's inherent method and Rust prefers the inherent one in receiver-dot
 position, so a check written against the concrete type never enters the impl.
 `cols` is the schema's own `(type_code, nullable)` column table and `pk` its PK
-list; there is no separate expectation struct to keep in step with it. Step 4
-calls it a **second** time, in the same `#[cfg(test)]` module and against the
-same table, with `gnitz_core::Schema`.
+list; there is no separate expectation struct to keep in step with it.
 
-Driving both impls off one expectation table is stronger than a two-impl
-equivalence assertion, not weaker: it pins the absolute answer, so it also
-catches two impls that agree with each other and are both wrong. It must not be
-weakened to invariants-only (an impl self-consistently shifted by one satisfies
-the round-trip and the sentinel rule) — the expectation table is what makes it
-bite, which is why the harness asserts each column's exact type code (`wire_stride`
-collapses 15 codes onto 5 widths), its nullability, and each PK column's OPK byte
-offset. That is the `payload_col_idx` / `col_nullable` failure mode that silently
-decides `no_nulls`, and the OPK-offset mismatch that silently reads a neighbouring
-PK column.
+Step 4 moved the **shape matrix** next to the harness, as the `pub const
+SCHEMA_FACTS_CASES` the driver `assert_schema_facts_matrix(build)` walks. That
+is what the harness's `pub fn` shape was for: each crate now tests its own
+implementor from its own test tree — `TestSchema` in `gnitz-expr`,
+`SchemaDescriptor` in `gnitz-engine`, `gnitz_core::Schema` in `gnitz-core` —
+against one set of absolute expectations, instead of one crate reaching into
+another's types through a dev-dependency. There is no separate weaker fixture in
+`gnitz-expr`'s own tests.
+
+Pinning the absolute answer is stronger than a two-impl equivalence assertion,
+not weaker: it catches two impls that agree with each other and are both wrong.
+It must not be weakened to invariants-only (an impl self-consistently shifted by
+one satisfies the round-trip and the sentinel rule) — the expectation table is
+what makes it bite, which is why the harness asserts each column's exact type
+code (`wire_stride` collapses 15 codes onto 5 widths), its nullability, and each
+PK column's OPK byte offset. That is the `col_nullable` failure mode that
+silently decides `no_nulls`, and the OPK-offset mismatch that silently reads a
+neighbouring PK column. The `payload_col_idx` round trip still bites for an impl
+that **overrides** it off a table (`SchemaDescriptor`, `TestSchema`); for one
+taking the provided body it is tautological, which is the point of deriving it.
 
 **PK-list order is a parameter, not an inference.** It is independent of column
 order — `PRIMARY KEY (b, a)` yields `pk_indices = [1, 0]`, and both
@@ -1240,11 +1209,9 @@ column order** and skips a column in between. The last three shapes are where a
 naive `payload_col_idx` passes for `payload_idx`, and the last is where a
 column-order OPK-offset derivation passes and the real one does not.
 
-The step-4 call site lives in `gnitz-engine`'s test tree: `gnitz-engine` is
-binary-only, and its `gnitz-core` dev-dependency (`gnitz-engine/Cargo.toml:26`)
-makes it the only place both schema types coexist. The *harness* lives in
-`gnitz-expr` rather than there, so it is reachable from any crate that adds an
-implementor — the same rule, and the same reason, as `assert_batchview_consistent`.
+Both the harness and the matrix live in `gnitz-expr`, so each is reachable from
+any crate that adds an implementor and every call site sits beside the impl it
+checks — the same rule, and the same reason, as `assert_batchview_consistent`.
 
 ## Tests
 
@@ -1659,14 +1626,37 @@ implementor — the same rule, and the same reason, as `assert_batchview_consist
     landing pads, because most of the body survives. Weight by call sites ×
     frequency, and decide a forwarder chain as a unit. **Body size in bytes is not
     the criterion.**
-- [ ] **Client adapter** in `gnitz-core`: `impl SchemaFacts for Schema` (write
-  `payload_col_idx`, return `u8` type codes); add `build_pk_region_into` /
-  `encode_german_col_into` (`pub(crate)`, existing signatures kept as wrappers);
-  `ViewBuffers` + `ZSetBatchView` (implementing **both** `RowSource` and
-  `BatchView`) with the `U128s` `unreachable!` arm; export both
-  through `protocol/mod.rs` and `lib.rs`. Add `expr_unsupported` in `gnitz-sql`.
-  **Run the `SchemaFacts` equivalence test here.**
-- [ ] **Swap HAVING**: compile in `select.rs` where `having_supported` was
+- [x] **DONE — Client adapter** in `gnitz-core`. `gnitz-expr` is a dependency and
+  `impl SchemaFacts for Schema` lives in `protocol/types.rs`; the one region
+  builder — shared with `encode_wal_block`, which is now framing only — lives in
+  the new `protocol/regions.rs`, with `ViewBuffers` and `ZSetBatchView`
+  (implementing **both** `RowSource` and `BatchView`) exported through
+  `protocol/mod.rs` and `lib.rs`. `ViewBuffers::default()` +
+  `bufs.view(batch, schema)` is the one way to obtain a view; every payload slot
+  is a region, so there is no wide-column `unreachable!` for later steps to work
+  around. Each `SchemaFacts` conformance test runs in the crate that owns its
+  implementor, over `gnitz_expr::SCHEMA_FACTS_CASES`.
+  Four rules landed one level down as part of it, and later steps should reach
+  for them rather than restating:
+  - `gnitz_wire::as_le_bytes` (sealed `LeScalar`, not `T: Copy`) is the **one**
+    scalar-region reinterpret; the engine's `test_support` copy is deleted.
+  - `gnitz_wire::wal::num_regions(npc)` is the region-count formula.
+  - `gnitz_wire::encode_pk_tuple(cols, src, dst)` is the **one** OPK packing walk
+    (PK-list order, tight packing, per-column `encode_pk_column`); the client's
+    compound-PK arm and the engine's `encode_order_preserving_pk` both call it,
+    the latter as its schema-typed face.
+  - `ZSetBatch::validate` owns both variant rules (`ColData` vs declared type,
+    `PkColumn` vs the schema's PK layout), each derived from the canonical
+    `empty_for` / `empty_for_schema` constructor by discriminant.
+  - `wal_block.rs`'s decode addresses regions by `REG_PK` / `REG_WEIGHT` /
+    `REG_NULL_BMP` / `REG_PAYLOAD_START + pi` and drives its column loop with
+    `schema.payload_columns()` — the same rule the builder writes with — instead
+    of a running counter, and checks every region width with one
+    `wire_stride`-derived expression.
+- [ ] **Swap HAVING** — also the step that adds the `gnitz-expr` dependency to
+  `gnitz-sql` and lands `expr_unsupported` there (it has no caller before this
+  step, and an uncalled `pub(crate)` helper is `dead_code`): compile in
+  `select.rs` where `having_supported` was
   (via `resolve_scalar`); change `AggFinish::having` to
   `Option<&Evaluator>`; replace the `fill_having_row`/`eval_having`/
   `truthy` block with the reused one-row batch + `Evaluator::eval_row`; delete

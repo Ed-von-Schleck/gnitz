@@ -1855,7 +1855,7 @@ mod tests {
     // ── SchemaFacts conformance ──────────────────────────────────────────────
 
     /// `SchemaDescriptor`'s `SchemaFacts` forwarders must report exactly what
-    /// the schema itself does. Checked through the shared harness, which is the
+    /// the schema itself does, over the shared shape matrix. The harness is the
     /// only way to reach the trait methods: most collide by name with an
     /// inherent method that Rust would prefer in receiver-dot position, so a
     /// forwarder that silently reimplements — and thereby flips `no_nulls` or
@@ -1863,90 +1863,13 @@ mod tests {
     /// check.
     #[test]
     fn schema_descriptor_conforms_to_schema_facts() {
-        /// `(columns as (type_code, nullable), pk list in PK-LIST order)`.
-        type Case = (&'static [(u8, bool)], &'static [usize]);
-        let cases: &[Case] = &[
-            // Single unsigned PK at column 0; U64/F64/STRING/U128 payload, one nullable.
-            (
-                &[
-                    (type_code::U64, false),
-                    (type_code::U64, false),
-                    (type_code::F64, true),
-                    (type_code::STRING, false),
-                    (type_code::U128, false),
-                ],
-                &[0],
-            ),
-            // Single signed PK NOT at column 0 — the payload slots renumber
-            // around it, so the `ci - 1` closed form does not hold.
-            (
-                &[
-                    (type_code::STRING, true),
-                    (type_code::I64, false),
-                    (type_code::U64, false),
-                    (type_code::F32, true),
-                ],
-                &[1],
-            ),
-            // Compound two-column PK (signed + unsigned, mixed widths).
-            (
-                &[
-                    (type_code::I32, false),
-                    (type_code::U16, false),
-                    (type_code::F64, false),
-                    (type_code::BLOB, true),
-                ],
-                &[0, 1],
-            ),
-            // Compound PK whose PK-LIST order REVERSES its column order
-            // (`PRIMARY KEY (b, a)`), and skips a column in between: the OPK
-            // offsets follow the pk list, so column 3 sits at offset 0 and
-            // column 0 at offset 8.
-            (
-                &[
-                    (type_code::U32, false),
-                    (type_code::STRING, true),
-                    (type_code::F64, false),
-                    (type_code::I64, false),
-                ],
-                &[3, 0],
-            ),
-            // Every fixed width as a PK column: 1/2/4/8 signed, plus a 16-byte
-            // payload column (a PK column is never wide).
-            (
-                &[
-                    (type_code::I8, false),
-                    (type_code::U16, false),
-                    (type_code::I32, false),
-                    (type_code::U64, false),
-                    (type_code::I128, true),
-                    (type_code::UUID, false),
-                ],
-                &[0, 1, 2, 3],
-            ),
-            // Every fixed width as a payload column, all nullable.
-            (
-                &[
-                    (type_code::U64, false),
-                    (type_code::U8, true),
-                    (type_code::I16, true),
-                    (type_code::U32, true),
-                    (type_code::I64, true),
-                    (type_code::U128, true),
-                ],
-                &[0],
-            ),
-            // PK-only: no payload columns at all.
-            (&[(type_code::U32, false)], &[0]),
-        ];
-        for &(cols, pk) in cases {
+        gnitz_expr::assert_schema_facts_matrix(|cols, pk| {
             let scols: Vec<SchemaColumn> = cols
                 .iter()
                 .map(|&(tc, nullable)| SchemaColumn::new(tc, nullable as u8))
                 .collect();
             let pk_idx: Vec<u32> = pk.iter().map(|&i| i as u32).collect();
-            let schema = SchemaDescriptor::new(&scols, &pk_idx);
-            gnitz_expr::assert_schema_facts_consistent(&schema, cols, pk);
-        }
+            SchemaDescriptor::new(&scols, &pk_idx)
+        });
     }
 }

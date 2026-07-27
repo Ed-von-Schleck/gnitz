@@ -11,7 +11,7 @@ use xorf::Xor8;
 
 use super::shard_file::DecodedRegion;
 #[cfg(test)]
-use crate::test_support::as_le_bytes;
+use gnitz_wire::as_le_bytes;
 #[cfg(test)]
 use gnitz_wire::{read_i64_le, read_u64_le, write_u64_le};
 

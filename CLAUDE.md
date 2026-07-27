@@ -425,7 +425,7 @@ executes them as a multi-process server.
 |-------|------|------------|
 | `gnitz-wire` | Wire-protocol constants + codecs — the one definition client and engine must agree on | — |
 | `gnitz-expr` | The one expression evaluator, and the resolved column addressing it reads through | `wire` |
-| `gnitz-core` | Client core: connection, protocol, and the logical type / expression / circuit model | `wire` |
+| `gnitz-core` | Client core: connection, protocol, and the logical type / expression / circuit model | `wire`, `expr` |
 | `gnitz-sql` | SQL front end: parser, binder, query planner | `core` |
 | `gnitz-capi` | C ABI bindings over the client core + planner | `core`, `sql` |
 | `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against | `core`, `sql` |
@@ -461,7 +461,7 @@ the engine-local expression layer only.
 - **`storage`** — the WAL/shard/MemTable stack behind one curated facade, in two sub-layers:
   - `repr` (L2) — the in-memory batch and the kernels over it: `batch` (region layout), `batch_wire` (wire/shard serde), `batch_pool` (buffer recycling), `columnar` (comparators), `merge` (sort-merge consolidation), `scatter` (exchange repartition), `heap` (k-way merge), `bloom`/`xor8` (PK-probe filters).
   - `lsm` (L3) — the on-disk half: `wal`, `shard_file`/`shard_reader`/`shard_index`, `compact` (N-way compaction), `memtable`, `read_cursor`, and the `Table`/`PartitionedTable` facades.
-- **`expr`** — compiled expression programs evaluated over batches (`program`, `batch`, `plan`).
+- **`expr`** — `ScalarFunc`: the filter/map plan the VM drives, over a `gnitz_expr::Evaluator` plus the columnar column-move and null-permutation halves. The evaluator itself lives in `gnitz-expr`.
 - **`ops`** — the DBSP operators: `join` (equi and range/band inner join, both Δ⋈trace; LEFT/RIGHT/FULL outer are built join-free from inner + `positive_part`, §3), `reduce` (aggregation), `exchange` (repartition: `router` + `relay`), `distinct`, `linear` (filter/map/negate/union), `scan`, `reindex` (re-key for join/group), `cogroup`, `index` (secondary indexes).
 - **`query`** (L5) — the circuit layer behind the `dag` facade: `compiler` (view → DBSP circuit → VM program), `vm` (executes the program), `dag` (`DagEngine`: plan cache, epoch evaluator, ingestion). `catalog` and `runtime` reach this layer only through `dag`.
 - **`catalog`** — the DDL/metadata engine wrapping `DagEngine`: `ddl`, `sys_tables`, `hooks`, `registry`, `metadata`, `validation`, `write_path`, persistence (`store_io`, `partition_lsn`), `cache`, `bootstrap`.

@@ -9,10 +9,8 @@ use crate::ColumnLocator;
 ///
 /// **Forward** every method to the type's own fact — its existing inherent
 /// method, or the column-table field where that *is* the fact — never
-/// recompute. A hand-written `payload_col_idx` that disagrees with the schema's
-/// own decides `no_nulls` differently and miscomputes silently; a
-/// `col_type_code` that disagrees changes which client programs `check_col`
-/// accepts.
+/// recompute: a `col_type_code` that disagrees with the schema's own changes
+/// which client programs `check_col` accepts.
 ///
 /// Reached through `&dyn SchemaFacts`: the whole trait runs once per program
 /// compile, never per row, so static dispatch buys nothing and the `Option<&_>`
@@ -36,9 +34,20 @@ pub trait SchemaFacts {
     fn is_pk_col(&self, ci: usize) -> bool {
         self.payload_slot(ci).is_none()
     }
-    /// Inverse of [`Self::payload_slot`]: dense payload slot → column
-    /// index. Caller must ensure `pi < num_payload_cols()`.
-    fn payload_col_idx(&self, pi: usize) -> usize;
+    /// Inverse of [`Self::payload_slot`]: dense payload slot → column index.
+    /// Caller must ensure `pi < num_payload_cols()`.
+    ///
+    /// Derived from [`Self::locate`] like the two above, so the two directions
+    /// cannot disagree — and this is the direction that decides `no_nulls`, so a
+    /// hand-written one that is off by one reads a neighbouring column's
+    /// nullability and silently drops null handling. Override only to answer it
+    /// in O(1) from a precomputed table.
+    fn payload_col_idx(&self, pi: usize) -> usize {
+        (0..self.num_columns())
+            .filter(|&ci| !self.is_pk_col(ci))
+            .nth(pi)
+            .expect("payload_col_idx: pi out of range")
+    }
     /// Number of non-PK columns.
     fn num_payload_cols(&self) -> usize;
     /// Number of logical columns (PK + payload).
@@ -50,6 +59,88 @@ pub trait SchemaFacts {
     fn col_type_code(&self, ci: usize) -> u8;
     /// True iff column `ci` admits NULL.
     fn col_nullable(&self, ci: usize) -> bool;
+}
+
+/// One [`SCHEMA_FACTS_CASES`] entry: a schema's column table as
+/// `(type_code, nullable)`, and its PK list in PK-LIST order.
+pub type SchemaFactsCase = (&'static [(u8, bool)], &'static [usize]);
+
+/// The shape matrix every implementor is driven against. It lives beside the
+/// harness so each crate tests its own implementor against the same absolute
+/// expectations, instead of one crate reaching into another's types.
+///
+/// Every case is admissible on the *client* side too (`Schema::validate_parts`):
+/// each PK column is non-nullable and PK-eligible, the widest schema is 6
+/// columns against `MAX_COLUMNS`, and the widest PK list is 4 —
+/// `PK_LIST_MAX_COLS` exactly.
+pub const SCHEMA_FACTS_CASES: &[SchemaFactsCase] = {
+    use gnitz_wire::type_code as tc;
+    &[
+        // Single unsigned PK at column 0; U64/F64/STRING/U128 payload, one nullable.
+        (
+            &[
+                (tc::U64, false),
+                (tc::U64, false),
+                (tc::F64, true),
+                (tc::STRING, false),
+                (tc::U128, false),
+            ],
+            &[0],
+        ),
+        // Single signed PK NOT at column 0 — the payload slots renumber around
+        // it, so the `ci - 1` closed form does not hold.
+        (
+            &[(tc::STRING, true), (tc::I64, false), (tc::U64, false), (tc::F32, true)],
+            &[1],
+        ),
+        // Compound two-column PK (signed + unsigned, mixed widths).
+        (
+            &[(tc::I32, false), (tc::U16, false), (tc::F64, false), (tc::BLOB, true)],
+            &[0, 1],
+        ),
+        // Compound PK whose PK-LIST order REVERSES its column order
+        // (`PRIMARY KEY (b, a)`), skipping a column in between: the OPK offsets
+        // follow the pk list, so column 3 sits at offset 0 and column 0 at 8.
+        (
+            &[(tc::U32, false), (tc::STRING, true), (tc::F64, false), (tc::I64, false)],
+            &[3, 0],
+        ),
+        // Every fixed width as a PK column: 1/2/4/8 signed, plus a 16-byte
+        // payload column (a PK column is never wide).
+        (
+            &[
+                (tc::I8, false),
+                (tc::U16, false),
+                (tc::I32, false),
+                (tc::U64, false),
+                (tc::I128, true),
+                (tc::UUID, false),
+            ],
+            &[0, 1, 2, 3],
+        ),
+        // Every fixed width as a payload column, all nullable.
+        (
+            &[
+                (tc::U64, false),
+                (tc::U8, true),
+                (tc::I16, true),
+                (tc::U32, true),
+                (tc::I64, true),
+                (tc::U128, true),
+            ],
+            &[0],
+        ),
+        // PK-only: no payload columns at all.
+        (&[(tc::U32, false)], &[0]),
+    ]
+};
+
+/// Drive [`assert_schema_facts_consistent`] over every [`SCHEMA_FACTS_CASES`]
+/// shape, building the implementor from each case's column table and PK list.
+pub fn assert_schema_facts_matrix<S: SchemaFacts>(build: impl Fn(&[(u8, bool)], &[usize]) -> S) {
+    for &(cols, pk) in SCHEMA_FACTS_CASES {
+        assert_schema_facts_consistent(&build(cols, pk), cols, pk);
+    }
 }
 
 /// Assert that `s` reports `cols` column-for-column and that its
@@ -108,10 +199,10 @@ pub fn assert_schema_facts_consistent(s: &dyn SchemaFacts, cols: &[(u8, bool)], 
         assert_eq!(loc.size(), gnitz_wire::wire_stride(want_tc), "locate({ci}).size()");
         match loc {
             ColumnLocator::Payload { slot, .. } => {
-                // The round trip is the real check: `payload_col_idx` is the one
-                // independently-implemented direction, and it is what decides
-                // `no_nulls`. An off-by-one there reads a neighbouring column's
-                // nullability and silently drops null handling.
+                // The round trip is what an impl that *overrides*
+                // `payload_col_idx` off a precomputed table is checked by; the
+                // provided body derives it from `locate` and is tautological
+                // here, which is the point.
                 let pi = slot as usize;
                 assert!(pi < cols.len() - pk.len(), "locate({ci}) slot {pi} out of range");
                 assert_eq!(s.payload_col_idx(pi), ci, "payload_col_idx(locate({ci}).slot)");

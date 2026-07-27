@@ -2,6 +2,7 @@ pub mod codec;
 pub mod error;
 pub mod header;
 pub mod message;
+pub mod regions;
 pub mod transport;
 pub mod types;
 pub mod wal_block;
@@ -23,6 +24,7 @@ pub use message::{
     encode_push_txn, encode_scan_multi, encode_schema_block, parse_response, recv_message, send_message,
     send_message_with_extra, Message, MessageParts,
 };
+pub use regions::{ViewBuffers, ZSetBatchView};
 pub use transport::{hello_handshake, ClientTransport, FrameSegments, TransportWaker, FRAME_SEGMENTS};
 pub use types::{
     meta_schema, null_word_get, null_word_set, BatchAppender, ColData, ColumnDef, FixedInt, PkColumn, PkTuple, Schema,

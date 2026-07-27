@@ -10,8 +10,6 @@
 
 use std::cmp::Ordering;
 
-use gnitz_wire::encode_pk_column;
-
 use crate::schema::{SchemaDescriptor, MAX_PK_BYTES};
 
 // ---------------------------------------------------------------------------
@@ -67,23 +65,25 @@ pub(crate) fn pk_bytes_eq(a: &[u8], b: &[u8]) -> bool {
 // Order-preserving PK encoder
 // ---------------------------------------------------------------------------
 
-/// Encode a full PK region (`schema.pk_stride()` bytes, columns in pk-list
-/// order) into an order-preserving big-endian key. `pk_bytes` and `out` are both
-/// `pk_stride` bytes. Iterates `schema.pk_columns()` — the *same* iterator
-/// `compare_pk_bytes` walks — so a non-identity `pk_indices` (e.g. `[1, 0]`)
-/// encodes in pk-list order, matching the comparator.
+/// The schema-typed face of [`gnitz_wire::encode_pk_tuple`]: encode a full PK
+/// region (`schema.pk_stride()` bytes) into its order-preserving big-endian key.
+/// `pk_bytes` and `out` are both `pk_stride` bytes. Feeds it
+/// `schema.pk_columns()` — the *same* iterator `compare_pk_bytes` walks — so a
+/// non-identity `pk_indices` (e.g. `[1, 0]`) encodes in pk-list order, matching
+/// the comparator.
 ///
 /// The encoding is **injective**: `encode(a) == encode(b)` iff
 /// `a == b` byte-for-byte, because each column's transform is a bijection on its
 /// byte range. Consolidation grouping relies on this — an OPK equality test is
 /// exactly a PK-byte equality test.
 pub(crate) fn encode_order_preserving_pk(schema: &SchemaDescriptor, pk_bytes: &[u8], out: &mut [u8]) {
-    let mut off = 0usize;
-    for (_ord, _ci, col) in schema.pk_columns() {
-        let cs = col.size() as usize;
-        encode_pk_column(&pk_bytes[off..off + cs], col.type_code, &mut out[off..off + cs]);
-        off += cs;
-    }
+    gnitz_wire::encode_pk_tuple(
+        schema
+            .pk_columns()
+            .map(|(_ord, _ci, col)| (col.size() as usize, col.type_code)),
+        pk_bytes,
+        out,
+    );
 }
 
 /// OPK-encode a PK from its **native LE** bytes into a stack buffer, returning
