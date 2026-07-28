@@ -186,14 +186,7 @@ pub(super) fn validate_relation_defs(
 // indices (batch reads, single leading PK column excluded).
 // ---------------------------------------------------------------------------
 
-use gnitz_wire::col_index_in;
-
-/// Payload-column index (single leading PK excluded) of `name` in `cols` —
-/// the layout `Batch::read_u64`-style decoders see. Valid only for the
-/// single-PK families (every family below has PK = column 0).
-const fn pay_index_in(cols: &[gnitz_wire::WireSysCol], name: &str) -> usize {
-    col_index_in(cols, name) - 1
-}
+use gnitz_wire::{col_index_in, pay_index_in};
 
 pub(super) const SCHEMATAB_PAY_NAME: usize = pay_index_in(gnitz_wire::SCHEMA_TAB_COLS, "name");
 

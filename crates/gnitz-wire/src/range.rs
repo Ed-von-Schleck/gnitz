@@ -38,7 +38,7 @@ pub enum Cut {
 impl Cut {
     /// `After(v)` when `after`, else `Before(v)` — the constructor dual of
     /// [`Self::is_after`], for callers holding the wire bit.
-    pub const fn new(after: bool, v: u128) -> Cut {
+    const fn new(after: bool, v: u128) -> Cut {
         if after {
             Cut::After(v)
         } else {
@@ -47,7 +47,7 @@ impl Cut {
     }
 
     /// Whether this cut falls above its group — `After`'s wire flag bit.
-    pub const fn is_after(self) -> bool {
+    const fn is_after(self) -> bool {
         matches!(self, Cut::After(_))
     }
 

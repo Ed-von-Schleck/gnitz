@@ -118,15 +118,23 @@ impl TypeCode {
         is_signed_int(*self as u8)
     }
 
-    /// Whether this type may be a PRIMARY KEY column. PK regions are compared
-    /// as raw bytes, which is correct only for integer scalars: String/Blob
-    /// carry out-of-line blob heaps that cannot be bulk-copied in the PK
-    /// region, and IEEE-754 floats break the byte-equal contract (-0.0/+0.0
-    /// compare unequal byte-wise but equal numerically, and NaN bit patterns
-    /// have no single canonical form). Allow-list (not deny-list) so new
-    /// variants are PK-ineligible until explicitly vetted. Integer scalars are
-    /// eligible: U8..U64, I8..I64, U128, UUID, I128 (the last produced only as a
-    /// cross-sign equijoin `_join_pk`, never via DDL).
+    /// Whether this type is a fixed-width **integer scalar** — equivalently,
+    /// whether an order-preserving byte encoding of it exists (§6). That one
+    /// property answers both questions the codebase asks of a type here:
+    ///
+    /// * **May it be a PRIMARY KEY column?** PK regions are compared as raw
+    ///   bytes, which is correct only for integer scalars: String/Blob carry
+    ///   out-of-line blob heaps that cannot be bulk-copied in the PK region, and
+    ///   IEEE-754 floats break the byte-equal contract (-0.0/+0.0 compare
+    ///   unequal byte-wise but equal numerically, and NaN bit patterns have no
+    ///   single canonical form).
+    /// * **Can `payload_route_key` encode it as an order-preserving routing
+    ///   key?** Same encoder, same domain; floats, strings and blobs route via
+    ///   the content-hash path instead.
+    ///
+    /// Allow-list (not deny-list) so a new variant is ineligible for both until
+    /// explicitly vetted. Eligible: U8..U64, I8..I64, U128, UUID, I128 (the last
+    /// produced only as a cross-sign equijoin `_join_pk`, never via DDL).
     pub const fn is_pk_eligible(&self) -> bool {
         matches!(
             self,
@@ -328,7 +336,7 @@ pub const fn is_valid_type_code(tc: u8) -> bool {
 /// rule behind both the planner's expression typing and [`agg_output_type`]'s
 /// `SUM` arm.
 #[inline]
-pub const fn register_image_type(tc: u8) -> u8 {
+pub(crate) const fn register_image_type(tc: u8) -> u8 {
     if is_float(tc) {
         type_code::F64
     } else if tc == type_code::U64 {
@@ -526,9 +534,9 @@ pub fn join_key_common_type(l: u8, r: u8) -> Option<u8> {
         return Some(if wire_stride(l) >= wire_stride(r) { l } else { r });
     }
     // Both unsigned (U8..U64 and the 16-byte U128/UUID) → the wider unsigned
-    // type; a 16-byte operand carries the pair to U128. `is_routable_int` is the
-    // U8..U64 + U128/UUID set; minus the signed ones leaves the unsigned routables.
-    let is_unsigned_int = |tc: u8| is_routable_int(tc) && !is_signed_int(tc);
+    // type; a 16-byte operand carries the pair to U128. `is_pk_eligible` is the
+    // integer-scalar set; minus the signed ones leaves the unsigned ones.
+    let is_unsigned_int = |tc: u8| is_pk_eligible(tc) && !is_signed_int(tc);
     if is_unsigned_int(l) && is_unsigned_int(r) {
         let wider = if wire_stride(l) >= wire_stride(r) { l } else { r };
         return Some(if wire_stride(wider) == 16 {
@@ -539,7 +547,7 @@ pub fn join_key_common_type(l: u8, r: u8) -> Option<u8> {
     }
     // Cross-sign integer keys: one side signed, the other unsigned. (Equal,
     // both-signed, and both-unsigned pairs all returned above, so any remaining
-    // routable-int pair is opposite-sign.) The common type must be a SIGNED type
+    // integer-scalar pair is opposite-sign.) The common type must be a SIGNED type
     // (a) strictly wider than the unsigned operand — a signed type of equal width
     // cannot represent the unsigned operand's full range, so distinct values
     // would alias — and (b) at least as wide as the signed operand. The unsigned
@@ -547,7 +555,7 @@ pub fn join_key_common_type(l: u8, r: u8) -> Option<u8> {
     // (`encode_pk_column_promoted`), so equal numeric values pack byte-identically.
     // wu ∈ {1,2,4,8,16}; only a U128/UUID unsigned operand (wu == 16) needs a
     // signed-256 type that does not exist → None.
-    if is_routable_int(l) && is_routable_int(r) {
+    if is_pk_eligible(l) && is_pk_eligible(r) {
         let (s, u) = if is_signed_int(l) { (l, r) } else { (r, l) };
         let common_w = (wire_stride(u) * 2).max(wire_stride(s));
         return match common_w {
@@ -585,7 +593,7 @@ pub const fn resolve_reindex_type(src_tc: u8, carried_tc: u8) -> u8 {
 /// `resolve_reindex_type(src, carried_reindex_tc(src, t)) == t` for any `t` a key
 /// of `src` can be promoted to (see the round-trip test).
 #[inline]
-pub const fn carried_reindex_tc(src_tc: u8, common_tc: u8) -> u8 {
+pub(crate) const fn carried_reindex_tc(src_tc: u8, common_tc: u8) -> u8 {
     if reindex_output_type_code(src_tc) != common_tc {
         common_tc
     } else {
@@ -593,18 +601,10 @@ pub const fn carried_reindex_tc(src_tc: u8, common_tc: u8) -> u8 {
     }
 }
 
-/// Whether a raw wire type code is any integer-valued fixed-width type that
-/// `payload_route_key` can encode as an order-preserving routing key:
-/// U8..U64, I8..I64, plus the 16-byte U128/UUID/I128. The superset of
-/// `is_fixed_int` that also admits the wide integer types. Floats, strings, and
-/// blobs route via the content-hash path instead, so they are excluded.
-pub const fn is_routable_int(tc: u8) -> bool {
-    is_fixed_int(tc) || matches!(tc, type_code::U128 | type_code::UUID | type_code::I128)
-}
-
 /// Wire stride (byte width) for a column type code. Delegates to the single
-/// width source [`TypeCode::stride`]; unknown codes return 8 (load-bearing —
-/// engine `compare_rows` and the trailing-slot fill depend on it).
+/// width source [`TypeCode::wire_stride`]; unknown codes return 8 (engine
+/// `compare_rows` and the trailing-slot fill depend on that default).
+#[inline]
 pub const fn wire_stride(tc: u8) -> usize {
     match TypeCode::try_from_u8(tc) {
         Some(t) => t.wire_stride(),

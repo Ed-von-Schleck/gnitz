@@ -397,9 +397,10 @@ impl RegisterFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ops::{AggDescriptor, AggOp};
+    use crate::ops::AggDescriptor;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode};
     use crate::storage::Layout;
+    use gnitz_wire::AggFunc;
 
     #[test]
     fn test_clear_deltas_clears_only_delta_registers() {
@@ -1139,12 +1140,12 @@ mod tests {
         let agg_descs = [
             AggDescriptor {
                 col_idx: 2,
-                agg_op: AggOp::Sum,
+                agg_op: AggFunc::Sum,
                 col_type_code: TypeCode::I64,
             },
             AggDescriptor {
                 col_idx: 0,
-                agg_op: AggOp::Count,
+                agg_op: AggFunc::Count,
                 col_type_code: TypeCode::I64,
             },
         ];
@@ -1248,7 +1249,7 @@ mod tests {
         let out_schema = make_schema(&[type_code::I64, type_code::I64]);
         let agg_descs = [AggDescriptor {
             col_idx: 2,
-            agg_op: AggOp::Min,
+            agg_op: AggFunc::Min,
             col_type_code: TypeCode::I64,
         }];
         let group_cols = [1u32];
@@ -1295,7 +1296,7 @@ mod tests {
         let out_schema = make_schema(&[type_code::I64, type_code::I64]);
         let agg_descs = [AggDescriptor {
             col_idx: 2,
-            agg_op: AggOp::Sum,
+            agg_op: AggFunc::Sum,
             col_type_code: TypeCode::I64,
         }];
         let group_cols = [1u32];
@@ -1488,12 +1489,12 @@ mod tests {
         let agg_descs = [
             AggDescriptor {
                 col_idx: 1, // schema col index for the val column
-                agg_op: AggOp::Count,
+                agg_op: AggFunc::Count,
                 col_type_code: TypeCode::I64,
             },
             AggDescriptor {
                 col_idx: 1, // schema col index for the val column
-                agg_op: AggOp::Sum,
+                agg_op: AggFunc::Sum,
                 col_type_code: TypeCode::I64,
             },
         ];
@@ -1600,12 +1601,12 @@ mod tests {
         let agg_descs = [
             AggDescriptor {
                 col_idx: 1,
-                agg_op: AggOp::Sum,
+                agg_op: AggFunc::Sum,
                 col_type_code: TypeCode::I64,
             },
             AggDescriptor {
                 col_idx: 0,
-                agg_op: AggOp::Count,
+                agg_op: AggFunc::Count,
                 col_type_code: TypeCode::I64,
             },
         ];

@@ -356,7 +356,7 @@ pub(crate) fn emit_reduce(
         // NULL), a SUM partial with plain Sum (NULL ground). The user aggregate
         // columns land at the same positions as the funnel reduce's, so the post-map
         // is unchanged; the trailing COUNT-of-partials is the existence gate (the
-        // reduce's cardinality gate finds it via the lone AggOp::Count). global_ground
+        // reduce's cardinality gate finds it via the lone AggFunc::Count). global_ground
         // = true: an empty global source emits exactly one ground row here.
         // Merge each partial with the shared per-op combine rule
         // (`AggFunc::merge_func` — the same rule the ad-hoc client combiner

@@ -1,10 +1,8 @@
 use super::error::ProtocolError;
-use super::header::{
-    META_FLAG_HIDDEN, META_FLAG_IS_PK, META_FLAG_NULLABLE, META_FLAG_PK_POS_MASK, META_FLAG_PK_POS_SHIFT,
-};
 use super::types::{
     meta_schema, type_code_from_u64, BatchAppender, ColData, ColumnDef, Schema, ZSetBatch, MAX_COLUMNS,
 };
+use gnitz_wire::{col_meta_hidden, col_meta_nullable, col_meta_pk_pos, pack_col_meta_flags};
 
 /// Convert a Schema to a META_SCHEMA-shaped ZSetBatch (one row per column).
 /// Mirrors Python's `schema_to_batch`.
@@ -18,19 +16,10 @@ pub fn schema_to_batch(schema: &Schema) -> ZSetBatch {
     {
         let mut appender = BatchAppender::new(&mut batch, ms);
         for (ci, col) in schema.columns.iter().enumerate() {
-            let mut flags: u64 = 0;
-            if col.is_nullable {
-                flags |= META_FLAG_NULLABLE;
-            }
-            if col.is_hidden {
-                flags |= META_FLAG_HIDDEN;
-            }
-            // Encode position-in-PK-tuple so compound `PRIMARY KEY (b, a)`
+            // Position-in-PK-tuple is carried so compound `PRIMARY KEY (b, a)`
             // decodes back to the user-declared order.
-            if let Some(pos) = schema.pk_cols.iter().position(|&p| p == ci) {
-                flags |= META_FLAG_IS_PK;
-                flags |= (pos as u64) << META_FLAG_PK_POS_SHIFT;
-            }
+            let pk_pos = schema.pk_cols.iter().position(|&p| p == ci).map(|p| p as u8);
+            let flags = pack_col_meta_flags(col.is_nullable, col.is_hidden, pk_pos);
             appender
                 .add_row(ci as u128, 1)
                 .u64_val(col.type_code as u64)
@@ -84,12 +73,10 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
         };
 
         let tc = type_code_from_u64(type_code_raw)?;
-        let is_nullable = (flags & META_FLAG_NULLABLE) != 0;
-        let is_pk = (flags & META_FLAG_IS_PK) != 0;
-        let is_hidden = (flags & META_FLAG_HIDDEN) != 0;
+        let is_nullable = col_meta_nullable(flags);
+        let is_hidden = col_meta_hidden(flags);
 
-        if is_pk {
-            let pos = ((flags & META_FLAG_PK_POS_MASK) >> META_FLAG_PK_POS_SHIFT) as u8;
+        if let Some(pos) = col_meta_pk_pos(flags) {
             pk_pairs.push((pos, i));
         }
 

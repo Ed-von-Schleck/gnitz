@@ -54,6 +54,24 @@ pub const fn col_index_in(cols: &[WireSysCol], name: &str) -> usize {
     panic!("column not found")
 }
 
+/// Dense **payload** index of the column named `name` in `cols` — its position
+/// among the non-PK columns, which is the slot the null bitmap and the payload
+/// region directory address it by (§6).
+///
+/// Valid only for a column list whose primary key is the single leading column,
+/// where the payload index collapses to `col_index_in(..) - 1`. Every list this
+/// is called with is one (`SCHEMA_TAB`, `TABLE_TAB`, `VIEW_TAB`, `COL_TAB`,
+/// `IDX_TAB`, `SEQ_TAB`, and the IPC control block); the compound-PK lists
+/// (`DEP_TAB`, the circuit families) renumber around *every* PK position, so
+/// the closed form does not hold for them and this must not be used there. The
+/// `assert!` rejects the PK column itself, and `col_index_in`'s own const-eval
+/// panic covers a renamed column — both at compile time.
+pub const fn pay_index_in(cols: &[WireSysCol], name: &str) -> usize {
+    let ci = col_index_in(cols, name);
+    assert!(ci != 0, "the leading PK column has no payload index");
+    ci - 1
+}
+
 // Every system table's column shape is defined once, here, and derived by
 // both sides: the engine builds its `SchemaDescriptor`s and the COL_TAB
 // self-description rows from these slices, the client builds its `Schema`s.
@@ -180,8 +198,6 @@ pub const SEQ_TAB: u64 = 7;
 pub const CIRCUIT_NODES_TAB: u64 = 11;
 pub const CIRCUIT_EDGES_TAB: u64 = 12;
 pub const CIRCUIT_NODE_COLUMNS_TAB: u64 = 13;
-// IDs 14 and 15 were previously CIRCUIT_PARAMS_TAB and CIRCUIT_GROUP_COLS_TAB,
-// now folded into CircuitNodes / CircuitNodeColumns.
 
 /// The circuit families' compound primary key: columns `(view_id, sub)`.
 pub const CIRCUIT_FAMILY_PK: &[u32] = &[0, 1];
@@ -197,7 +213,7 @@ pub const OWNER_KIND_VIEW: u64 = 1;
 // ---------------------------------------------------------------------------
 
 /// Bit width of the column-index field in a packed COL_TAB PK.
-pub const COL_ID_IDX_BITS: u32 = 9;
+pub(crate) const COL_ID_IDX_BITS: u32 = 9;
 
 /// Pack an owner (table/view) id and column index into the COL_TAB PK word:
 /// `(owner_id << 9) | col_idx`. Rejects a column index that overflows its
@@ -261,7 +277,7 @@ pub fn validate_user_identifier(name: &str) -> Result<(), String> {
 
 /// Maximum number of columns (PK + payload) in any table or view schema.
 /// Capped at 65 by the row-major null bitmap: each row stores one u64 word
-/// with one bit per nullable payload column, so payload columns ≤ 64.
+/// with one bit per payload column (§6), so payload columns ≤ 64.
 pub const MAX_COLUMNS: usize = 65;
 
 /// Sizing cap for the compound-PK column list.

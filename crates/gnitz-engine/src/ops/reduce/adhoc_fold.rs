@@ -28,7 +28,7 @@ use rustc_hash::FxHashMap;
 use gnitz_wire::AggReadSpec;
 
 use super::super::util::{global_group_key, GroupKeyCols};
-use super::agg::{Accumulator, AggDescriptor, AggOp};
+use super::agg::{Accumulator, AggDescriptor};
 use super::emit::emit_reduce_row;
 use super::plan::{build_reduce_output_schema, ReducePlan};
 use super::sort::compare_by_group_cols;
@@ -100,7 +100,7 @@ impl AdhocFold {
             }
             agg_descs.push(AggDescriptor {
                 col_idx: c as u32,
-                agg_op: AggOp::from(item.op),
+                agg_op: item.op,
                 col_type_code: TypeCode::from_validated_u8(src_schema.columns[c].type_code),
             });
         }

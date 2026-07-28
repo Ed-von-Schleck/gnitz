@@ -93,10 +93,13 @@ pub const FLAG_SEEK_BY_INDEX: u32 = gnitz_wire::FLAG_SEEK_BY_INDEX as u32;
 /// header — one allocation, mirrored here as a `u32` (unlike the high client-only
 /// request bits, which need a distinct u32 SAL dispatch flag).
 pub const FLAG_SCAN_SPEC: u32 = gnitz_wire::FLAG_SCAN_SPEC as u32;
-pub const FLAG_EXCHANGE_RELAY: u32 = 512;
-pub const FLAG_BACKFILL: u32 = 2048;
-pub const FLAG_TICK: u32 = 4096;
-pub const FLAG_FLUSH: u32 = 16384;
+// The next five are engine-internal in meaning but live in the shared 0-15
+// block, so `gnitz_wire` owns the bit (and its collision guard) while the
+// meaning stays here.
+pub const FLAG_EXCHANGE_RELAY: u32 = gnitz_wire::FLAG_EXCHANGE_RELAY as u32;
+pub const FLAG_BACKFILL: u32 = gnitz_wire::FLAG_BACKFILL as u32;
+pub const FLAG_TICK: u32 = gnitz_wire::FLAG_TICK as u32;
+pub const FLAG_FLUSH: u32 = gnitz_wire::FLAG_FLUSH as u32;
 /// Ephemeral-state flush round of the checkpoint sequence: flush every view's
 /// operator-trace tables and output stores (traces before outputs), stamping
 /// their manifests with the checkpoint generation carried in the group header's
@@ -109,7 +112,7 @@ pub const FLAG_FLUSH_EPH: u32 = 1 << 19;
 /// recovery applies them only when this sentinel is on disk. The flag
 /// rides on top of FLAG_DDL_SYNC for the worker's dispatch loop, which
 /// already no-ops on a DDL_SYNC group with `count == 0`.
-pub const FLAG_TXN_COMMIT: u32 = 32768;
+pub const FLAG_TXN_COMMIT: u32 = gnitz_wire::FLAG_TXN_COMMIT as u32;
 /// Batched stored-row gather: scatter a set of PKs to their owning workers,
 /// each worker reads the committed rows for the PKs it owns and replies with
 /// the rows projected to the columns named in the control block's
@@ -124,6 +127,25 @@ pub const FLAG_GATHER: u32 = 65536;
 /// `validate_unique_index_create_async`). Unicast-shaped like a Scan: every
 /// worker gets its own req_id slot and answers with a frame train.
 pub const FLAG_UNIQUE_PREFLIGHT: u32 = 131072;
+
+// The flags above that `gnitz_wire` does not allocate are the engine's own, and
+// stay strictly above the shared 0-15 block — that separation is what lets the
+// two crates allocate independently. `gnitz_wire`'s guard covers the block
+// itself; this covers the engine's side of the line.
+const _: () = {
+    let engine_only = [FLAG_FLUSH_EPH, FLAG_GATHER, FLAG_UNIQUE_PREFLIGHT];
+    let mut acc = 0u32;
+    let mut i = 0;
+    while i < engine_only.len() {
+        assert!(
+            engine_only[i] & gnitz_wire::SAL_FLAGS_MASK as u32 == 0,
+            "engine SAL flag collides with the wire-allocated 0-15 block"
+        );
+        assert!(engine_only[i] & acc == 0, "engine SAL flag bit collision");
+        acc |= engine_only[i];
+        i += 1;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Chunked distributed-backfill exchange coordination

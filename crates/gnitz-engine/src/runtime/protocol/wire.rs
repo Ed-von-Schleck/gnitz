@@ -21,8 +21,7 @@ pub use gnitz_wire::{
     wire_flags_get_conflict_mode, wire_flags_get_index_version, wire_flags_get_schema_version,
     wire_flags_set_index_version, wire_flags_set_schema_version, WireConflictMode, FLAG_BATCH_CONSOLIDATED,
     FLAG_BATCH_SORTED, FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_GET_INDICES, FLAG_HAS_DATA, FLAG_HAS_SCHEMA,
-    META_FLAG_IS_PK, META_FLAG_NULLABLE, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
-    STATUS_TXN_CONFLICT,
+    STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
 };
 
 /// Map a batch's layout claim to its wire flag bits. Encode normalizes
@@ -149,23 +148,16 @@ pub(crate) fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]], hi
 
     for ci in 0..ncols {
         let col = &schema.columns[ci];
-        let mut flags: u64 = 0;
-        if col.nullable != 0 {
-            flags |= META_FLAG_NULLABLE;
-        }
-        if hidden_mask & (1 << ci) != 0 {
-            flags |= gnitz_wire::META_FLAG_HIDDEN;
-        }
         // For compound PKs the position within `schema.pk_indices()` is
         // what determines decode order — column order ≠ PK order in
-        // general (e.g. `PRIMARY KEY (b, a)`). Encode the position so
-        // the decoder rebuilds `pk_indices` exactly as the user wrote
-        // them. Single-PK schemas write position 0, matching the
-        // pre-compound wire form (flag bit 1 set, upper bits zero).
-        if let Some(pos) = schema.pk_indices().iter().position(|&p| p as usize == ci) {
-            flags |= META_FLAG_IS_PK;
-            flags |= (pos as u64) << gnitz_wire::META_FLAG_PK_POS_SHIFT;
-        }
+        // general (e.g. `PRIMARY KEY (b, a)`). Carrying the position lets
+        // the decoder rebuild `pk_indices` exactly as the user wrote them.
+        let pk_pos = schema
+            .pk_indices()
+            .iter()
+            .position(|&p| p as usize == ci)
+            .map(|p| p as u8);
+        let flags = gnitz_wire::pack_col_meta_flags(col.nullable != 0, hidden_mask & (1 << ci) != 0, pk_pos);
 
         let type_code_val = col.type_code as u64;
         let name = if ci < col_names.len() { col_names[ci] } else { b"" };
@@ -202,14 +194,12 @@ pub(crate) fn batch_to_schema(batch: &Batch) -> Result<(SchemaDescriptor, Vec<Ve
         let mut st = [0u8; 16];
         st.copy_from_slice(&batch.col_data(2)[off16..off16 + 16]);
         names.push(gnitz_wire::try_decode_german_string(&st, &batch.blob).unwrap());
-        let is_nullable = (flags_val & META_FLAG_NULLABLE) != 0;
-        let is_pk = (flags_val & META_FLAG_IS_PK) != 0;
+        let is_nullable = gnitz_wire::col_meta_nullable(flags_val);
         *col = SchemaColumn::new(type_code_val, if is_nullable { 1 } else { 0 });
-        if is_pk {
+        if let Some(pos) = gnitz_wire::col_meta_pk_pos(flags_val) {
             if pk_count >= crate::schema::MAX_PK_COLUMNS {
                 return Err("too many PK columns");
             }
-            let pos = ((flags_val & gnitz_wire::META_FLAG_PK_POS_MASK) >> gnitz_wire::META_FLAG_PK_POS_SHIFT) as u8;
             pk_pairs[pk_count] = (pos, i as u32);
             pk_count += 1;
         }
@@ -767,10 +757,9 @@ pub(crate) fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<
         if !gnitz_wire::is_valid_type_code(tc) {
             return Err("schema: invalid type code");
         }
-        let is_nullable = (fl & META_FLAG_NULLABLE) != 0;
-        let is_pk = (fl & META_FLAG_IS_PK) != 0;
+        let is_nullable = gnitz_wire::col_meta_nullable(fl);
         *col = SchemaColumn::new(tc, if is_nullable { 1 } else { 0 });
-        if is_pk {
+        if let Some(pos) = gnitz_wire::col_meta_pk_pos(fl) {
             // Reject malformed PK columns here rather than letting them reach
             // `SchemaDescriptor::new`, whose `assert!`s would abort the engine
             // process on a nullable/STRING/BLOB PK and which silently accepts
@@ -784,7 +773,6 @@ pub(crate) fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<
             if pk_count >= crate::schema::MAX_PK_COLUMNS {
                 return Err("too many PK columns");
             }
-            let pos = ((fl & gnitz_wire::META_FLAG_PK_POS_MASK) >> gnitz_wire::META_FLAG_PK_POS_SHIFT) as u8;
             pk_pairs[pk_count] = (pos, i as u32);
             pk_count += 1;
         }
@@ -967,8 +955,7 @@ pub fn decode_push_txn(data: &[u8]) -> Result<DecodedPushTxn<'_>, &'static str> 
 /// well-formed but empty or over-cap list decodes cleanly and is rejected there
 /// with a specific message.
 ///
-/// `codec` has `read_u32_le`/`read_u64_le` but no `read_u16_le`, so the version
-/// is read with `u16::from_le_bytes`. Shares the control-block + `u32` count
+/// Shares the control-block + `u32` count
 /// prologue with `decode_ddl_txn`/`decode_push_txn` via `txn_frame_prologue`; the
 /// explicit 10-byte-record bound below then rejects a hostile count before
 /// allocating (the per-record reads would otherwise panic on a short slice).
@@ -982,7 +969,7 @@ pub fn decode_scan_multi(data: &[u8]) -> Result<Vec<(u64, u16)>, &'static str> {
     let mut relations = Vec::with_capacity(count);
     for _ in 0..count {
         let tid = gnitz_wire::read_u64_le(data, off);
-        let version = u16::from_le_bytes([data[off + 8], data[off + 9]]);
+        let version = gnitz_wire::read_u16_le(data, off + 8);
         off += RECORD_BYTES;
         relations.push((tid, version));
     }
@@ -1547,7 +1534,7 @@ mod tests {
         let mut wire = build_schema_wire_block(&sd, &[b"c0".as_slice()], 0, 0);
         // Region 4 is the flags column; OR in NULLABLE on the PK (col 0).
         let (fl_off, _) = gnitz_wire::wal::dir_entry(&wire, 4);
-        let f = gnitz_wire::read_u64_le(&wire, fl_off) | META_FLAG_NULLABLE;
+        let f = gnitz_wire::read_u64_le(&wire, fl_off) | gnitz_wire::META_FLAG_NULLABLE;
         wire[fl_off..fl_off + 8].copy_from_slice(&f.to_le_bytes());
         // verify_checksum=false: the flags region is inside the checksummed body.
         match decode_schema_block(&wire, false) {

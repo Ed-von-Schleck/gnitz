@@ -161,8 +161,8 @@ pub fn decode_expr_blob(blob: &[u8]) -> Option<ExprBlob> {
     if blob[5] != 0 || blob[10] != 0 || blob[11] != 0 {
         return None;
     }
-    let num_regs = u16::from_le_bytes(blob[6..8].try_into().unwrap()) as u32;
-    let result_reg = u16::from_le_bytes(blob[8..10].try_into().unwrap()) as u32;
+    let num_regs = crate::read_u16_le(blob, 6) as u32;
+    let result_reg = crate::read_u16_le(blob, 8) as u32;
     let n = crate::read_u32_le(blob, 12);
     if !n.is_multiple_of(4) {
         return None;

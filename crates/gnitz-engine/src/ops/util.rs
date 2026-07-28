@@ -255,7 +255,7 @@ pub(super) fn single_col_canonical_group_key(schema: &SchemaDescriptor, group_by
         return true;
     }
     let col = &schema.columns[c];
-    col.nullable == 0 && gnitz_wire::is_routable_int(col.type_code)
+    col.nullable == 0 && gnitz_wire::is_pk_eligible(col.type_code)
 }
 
 /// Hash one group column into the fold-path digest. The single per-column

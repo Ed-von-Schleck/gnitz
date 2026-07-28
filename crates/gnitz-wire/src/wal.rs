@@ -210,11 +210,11 @@ pub fn encode(
     let positions = write_header_and_directory(block, table_id, entry_count, region_sizes, total_size);
 
     // Phase 2: copy each region's bytes to its directory position. Bounds-checked
-    // `copy_from_slice` — one memcpy per non-empty region. (An earlier version
-    // coalesced source-adjacent runs into a single `copy_nonoverlapping`; that
-    // is unsound once regions arrive as independent `&[u8]` slices — a copy
-    // spanning region `i`'s length reads past its provenance — and the per-call
-    // saving is a fixed ~1-2 ns/region, off the durable-write scatter path.)
+    // `copy_from_slice` — one memcpy per non-empty region. Coalescing
+    // source-adjacent runs into a single `copy_nonoverlapping` is unsound here:
+    // the regions are independent `&[u8]` slices, so a copy spanning past region
+    // `i`'s length reads outside its provenance. The saving would be a fixed
+    // ~1-2 ns/region anyway, off the durable-write scatter path.
     for (i, r) in regions.iter().enumerate() {
         if r.is_empty() {
             continue;

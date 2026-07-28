@@ -52,10 +52,7 @@ pub use wal::{
 };
 
 // ---------------------------------------------------------------------------
-// Low-level byte primitives. One home, one spelling: every crate names
-// `gnitz_wire::X` directly — there is no engine re-export, for the same reason
-// the OPK, German-string and key-derivation clusters have none. A re-export
-// splits one rule across two import paths.
+// Low-level byte primitives.
 //
 // Three calling conventions over two rules, deliberately: the `*_le(buf, off)`
 // offset form for region walks (no slice construction at the call site), and —
@@ -64,8 +61,8 @@ pub use wal::{
 // tail. The width form IS the exact form after one sub-slice, so there is still
 // one ladder per signedness; splitting the entry point only moves the sub-slice
 // to the callers that actually need it. That matters: at `opt-level=0` the
-// `bytes[..size]` bound is an out-of-line `Range::index` call, and it landed
-// twice per comparison inside `cmp_typed_le`, whose windows are exact already.
+// `bytes[..size]` bound is an out-of-line `Range::index` call, and `cmp_typed_le`
+// would pay it twice per comparison over windows that are exact already.
 // ---------------------------------------------------------------------------
 
 /// Align `n` up to an 8-byte boundary.
@@ -78,6 +75,11 @@ pub const fn align8(n: usize) -> usize {
 #[inline]
 pub fn checksum(b: &[u8]) -> u64 {
     xxhash_rust::xxh3::xxh3_64(b)
+}
+
+#[inline]
+pub fn read_u16_le(buf: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes(buf[off..off + 2].try_into().unwrap())
 }
 
 #[inline]
@@ -194,8 +196,9 @@ pub fn null_word_set(word: &mut u64, pi: usize, is_null: bool) {
     }
 }
 
-// `write_u32_le` is used only by the WAL framer within this crate, so it stays
-// crate-internal rather than widening the public surface with a dead export.
+// `write_u32_le` has only in-crate callers (the WAL framer and the control-block
+// encoder), so it stays crate-internal rather than widening the public surface
+// with a dead export.
 #[inline]
 pub(crate) fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
     buf[off..off + 4].copy_from_slice(&val.to_le_bytes());

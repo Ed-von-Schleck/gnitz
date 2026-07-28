@@ -7,21 +7,14 @@
 use crate::schema::{type_code, ColumnLocator, DerivedSchema, ReduceOutKey, SchemaColumn, SchemaDescriptor, TypeCode};
 
 use super::super::util::{GroupKeyCols, GroupKeyExtractor};
-use super::agg::{AggDescriptor, AggOp};
+use super::agg::AggDescriptor;
 use super::sort::packed_sort_spec;
+use gnitz_wire::AggFunc;
 
-/// Engine adapter over the single shared typing rule
-/// (`gnitz_wire::agg_output_type`).
-pub(crate) const fn agg_output_type(agg_op: AggOp, col_type_code: TypeCode) -> u8 {
-    let func = match agg_op {
-        AggOp::Count => gnitz_wire::AggFunc::Count,
-        AggOp::CountNonNull => gnitz_wire::AggFunc::CountNonNull,
-        AggOp::SumZero => gnitz_wire::AggFunc::SumZero,
-        AggOp::Sum => gnitz_wire::AggFunc::Sum,
-        AggOp::Min => gnitz_wire::AggFunc::Min,
-        AggOp::Max => gnitz_wire::AggFunc::Max,
-    };
-    gnitz_wire::agg_output_type(func, col_type_code as u8)
+/// The single shared typing rule (`gnitz_wire::agg_output_type`), taking the
+/// typed `TypeCode` its engine callers hold rather than a raw code.
+pub(crate) const fn agg_output_type(agg_op: AggFunc, col_type_code: TypeCode) -> u8 {
+    gnitz_wire::agg_output_type(agg_op, col_type_code as u8)
 }
 
 /// Build the reduce output schema by **obeying** the planner's shipped
@@ -169,7 +162,7 @@ impl ReducePlan {
         // unique NULL-blind COUNT carries that signal. All three disjuncts are
         // load-bearing — see the emission gate in `op_reduce`.
         let cardinality_idx: Option<u8> = (all_linear || !group_by_cols.is_empty() || global_ground)
-            .then(|| agg_descs.iter().position(|d| d.agg_op == AggOp::Count))
+            .then(|| agg_descs.iter().position(|d| d.agg_op == AggFunc::Count))
             .flatten()
             .map(|i| i as u8);
 

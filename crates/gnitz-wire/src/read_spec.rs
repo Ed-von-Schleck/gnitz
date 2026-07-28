@@ -151,6 +151,14 @@ pub struct ReadSpec {
     pub sink: ReadSink,
 }
 
+/// Append a `u32`-length-prefixed byte section — the one variable-length
+/// section shape this format uses, and the exact inverse of
+/// [`Reader::bytes32`].
+fn put_bytes32(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
+}
+
 /// Pack a ScanSpec request's control-block `seek_pk_extra` blob: the encoded
 /// `ReadSpec` followed by the raw reply-schema wire block, each `u32`-length-
 /// prefixed. Bundling both in the arbitrary-length `seek_pk_extra` BLOB keeps
@@ -160,33 +168,21 @@ pub struct ReadSpec {
 /// the block.
 pub fn pack_scan_spec_extra(spec: &[u8], reply_block: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + spec.len() + reply_block.len());
-    out.extend_from_slice(&(spec.len() as u32).to_le_bytes());
-    out.extend_from_slice(spec);
-    out.extend_from_slice(&(reply_block.len() as u32).to_le_bytes());
-    out.extend_from_slice(reply_block);
+    put_bytes32(&mut out, spec);
+    put_bytes32(&mut out, reply_block);
     out
 }
 
 /// Split a ScanSpec `seek_pk_extra` blob back into `(spec_bytes, reply_block)`
 /// at the trust boundary — rejecting a truncated / trailing-byte frame.
 pub fn unpack_scan_spec_extra(extra: &[u8]) -> Result<(&[u8], &[u8]), String> {
-    let spec_len = extra.get(0..4).ok_or("scan_spec extra: truncated spec length")?;
-    let spec_len = u32::from_le_bytes(spec_len.try_into().unwrap()) as usize;
-    let spec_end = 4usize
-        .checked_add(spec_len)
-        .ok_or("scan_spec extra: spec length overflow")?;
-    let block_len_bytes = extra
-        .get(spec_end..spec_end + 4)
-        .ok_or("scan_spec extra: truncated block length")?;
-    let block_len = u32::from_le_bytes(block_len_bytes.try_into().unwrap()) as usize;
-    let block_start = spec_end + 4;
-    let block_end = block_start
-        .checked_add(block_len)
-        .ok_or("scan_spec extra: block length overflow")?;
-    if extra.len() != block_end {
-        return Err(format!("scan_spec extra: {} bytes, expected {block_end}", extra.len()));
+    let mut r = Reader::new(extra);
+    let spec = r.bytes32()?;
+    let block = r.bytes32()?;
+    if r.remaining() != 0 {
+        return Err(format!("scan_spec extra: {} trailing bytes", r.remaining()));
     }
-    Ok((&extra[4..spec_end], &extra[block_start..block_end]))
+    Ok((spec, block))
 }
 
 /// A bounds-checked forward reader over the encoded blob — every field access
@@ -229,6 +225,14 @@ impl<'a> Reader<'a> {
     }
     fn u128(&mut self) -> Result<u128, String> {
         Ok(u128::from_le_bytes(self.take(16)?.try_into().unwrap()))
+    }
+
+    /// A `u32`-length-prefixed byte section — the inverse of [`put_bytes32`].
+    /// The length is bounds-checked by `take`, so a hostile prefix is a clean
+    /// `Err` rather than an over-large allocation.
+    fn bytes32(&mut self) -> Result<&'a [u8], String> {
+        let n = self.u32()? as usize;
+        self.take(n)
     }
 
     /// The next byte without consuming it — used to compute a variable-length
@@ -294,8 +298,7 @@ impl ReadSpec {
             }
         }
 
-        out.extend_from_slice(&(self.predicate.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.predicate);
+        put_bytes32(&mut out, &self.predicate);
 
         match &self.sink {
             ReadSink::Rows {
@@ -317,8 +320,7 @@ impl ReadSpec {
                     out.push(flags);
                     out.push(0u8); // reserved
                 }
-                out.extend_from_slice(&(projection.len() as u32).to_le_bytes());
-                out.extend_from_slice(projection);
+                put_bytes32(&mut out, projection);
             }
             ReadSink::Fold(agg) => {
                 out.extend_from_slice(&(agg.group_cols.len() as u16).to_le_bytes());
@@ -383,8 +385,7 @@ impl ReadSpec {
             other => return Err(format!("read_spec: unknown bound kind {other}")),
         };
 
-        let pred_len = r.u32()? as usize;
-        let predicate = r.take(pred_len)?.to_vec();
+        let predicate = r.bytes32()?.to_vec();
 
         let sink = match sink_tag {
             SINK_ROWS => {
@@ -407,8 +408,7 @@ impl ReadSpec {
                         nulls_first: flags & ORDER_NULLS_FIRST != 0,
                     });
                 }
-                let proj_len = r.u32()? as usize;
-                let projection = r.take(proj_len)?.to_vec();
+                let projection = r.bytes32()?.to_vec();
                 ReadSink::Rows {
                     projection,
                     order,

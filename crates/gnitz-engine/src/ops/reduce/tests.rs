@@ -8,13 +8,14 @@ use crate::test_support::{make_schema_i64pk_i64, make_schema_u64_i64, opk_pk_i64
 use gnitz_wire::{encode_german_string, read_i64_le, read_u64_le};
 
 use super::super::util::{extract_group_key, ieee_order_bits_f32, ieee_order_bits_f32_reverse};
-use super::agg::{apply_agg_from_value_index, Accumulator, AggDescriptor, AggOp};
+use super::agg::{apply_agg_from_value_index, Accumulator, AggDescriptor};
 use super::emit::{emit_global_ground, emit_reduce_row};
 use super::op_reduce::cursor_matches_group;
 use super::plan::{agg_output_type, build_reduce_output_schema, ReducePlan};
 use super::sort::{argsort_delta, compare_by_group_cols, packed_sort_spec};
 use crate::schema::ColumnLocator;
 use crate::storage::ReadCursor;
+use gnitz_wire::AggFunc;
 
 /// Resolve `cols` to the baked group-column locators — what `ReducePlan::new`
 /// stores in `sort_descs`.
@@ -362,17 +363,17 @@ fn linear_sum_only_new_all_null_group_present() {
     let aggs = [
         AggDescriptor {
             col_idx: 2,
-            agg_op: AggOp::Sum,
+            agg_op: AggFunc::Sum,
             col_type_code: TypeCode::I64,
         },
         AggDescriptor {
             col_idx: 2,
-            agg_op: AggOp::CountNonNull,
+            agg_op: AggFunc::CountNonNull,
             col_type_code: TypeCode::I64,
         },
         AggDescriptor {
             col_idx: 0,
-            agg_op: AggOp::Count,
+            agg_op: AggFunc::Count,
             col_type_code: TypeCode::I64,
         },
     ];
@@ -446,7 +447,7 @@ fn count_star_only_emptied_group_eliminated() {
     );
     let aggs = [AggDescriptor {
         col_idx: 0,
-        agg_op: AggOp::Count,
+        agg_op: AggFunc::Count,
         col_type_code: TypeCode::I64,
     }];
 
@@ -565,17 +566,17 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
     let aggs = [
         AggDescriptor {
             col_idx: 0,
-            agg_op: AggOp::Count,
+            agg_op: AggFunc::Count,
             col_type_code: TypeCode::I64,
         },
         AggDescriptor {
             col_idx: 2,
-            agg_op: AggOp::Sum,
+            agg_op: AggFunc::Sum,
             col_type_code: TypeCode::I64,
         },
         AggDescriptor {
             col_idx: 2,
-            agg_op: AggOp::CountNonNull,
+            agg_op: AggFunc::CountNonNull,
             col_type_code: TypeCode::I64,
         },
     ];
@@ -718,12 +719,12 @@ fn null_min_retraction_re_emits_null() {
     let aggs = [
         AggDescriptor {
             col_idx: 2,
-            agg_op: AggOp::Count,
+            agg_op: AggFunc::Count,
             col_type_code: TypeCode::I64,
         },
         AggDescriptor {
             col_idx: 2,
-            agg_op: AggOp::Min,
+            agg_op: AggFunc::Min,
             col_type_code: TypeCode::I64,
         },
     ];
@@ -830,12 +831,12 @@ fn null_sum_fold_stays_null() {
     let aggs = [
         AggDescriptor {
             col_idx: 2,
-            agg_op: AggOp::Count,
+            agg_op: AggFunc::Count,
             col_type_code: TypeCode::I64,
         },
         AggDescriptor {
             col_idx: 2,
-            agg_op: AggOp::Sum,
+            agg_op: AggFunc::Sum,
             col_type_code: TypeCode::I64,
         },
     ];
@@ -1221,7 +1222,7 @@ fn test_reduce_count() {
 
     let agg = AggDescriptor {
         col_idx: 0,
-        agg_op: AggOp::Count,
+        agg_op: AggFunc::Count,
         col_type_code: TypeCode::I64,
     };
 
@@ -1434,7 +1435,7 @@ fn test_reduce_min_f32() {
 
     let agg = AggDescriptor {
         col_idx: 1,
-        agg_op: AggOp::Min,
+        agg_op: AggFunc::Min,
         col_type_code: TypeCode::F32,
     };
 
@@ -1482,7 +1483,7 @@ fn test_reduce_max_i16() {
 
     let agg = AggDescriptor {
         col_idx: 1,
-        agg_op: AggOp::Max,
+        agg_op: AggFunc::Max,
         col_type_code: TypeCode::I16,
     };
 
@@ -1901,7 +1902,7 @@ fn test_emit_reduce_row_compound_pk_bytes() {
     let mut output = Batch::with_capacity(out_schema, 1);
     let agg = AggDescriptor {
         col_idx: 2,
-        agg_op: AggOp::Count,
+        agg_op: AggFunc::Count,
         col_type_code: TypeCode::I64,
     };
     let accs: Vec<Accumulator> = vec![Accumulator::new(&agg, in_schema.locate(2))];
@@ -1961,7 +1962,7 @@ fn test_reduce_min_pk_col_compound_pk() {
     // MIN over the SECOND PK column (col_idx=1).
     let agg = AggDescriptor {
         col_idx: 1,
-        agg_op: AggOp::Min,
+        agg_op: AggFunc::Min,
         col_type_code: TypeCode::U64,
     };
 
@@ -2014,7 +2015,7 @@ fn test_reduce_min_pk_col_single_pk_u64() {
 
     let agg = AggDescriptor {
         col_idx: 0,
-        agg_op: AggOp::Min,
+        agg_op: AggFunc::Min,
         col_type_code: TypeCode::U64,
     };
     let out = op_reduce(
@@ -2062,7 +2063,7 @@ fn test_reduce_group_by_pk_permuted_preserves_pk_order() {
 
     let agg = AggDescriptor {
         col_idx: 2,
-        agg_op: AggOp::Count,
+        agg_op: AggFunc::Count,
         col_type_code: TypeCode::I64,
     };
 
@@ -2279,7 +2280,7 @@ fn test_op_reduce_compound_pk_group_by_subset_count() {
 
     let agg = AggDescriptor {
         col_idx: 2,
-        agg_op: AggOp::Count,
+        agg_op: AggFunc::Count,
         col_type_code: TypeCode::I64,
     };
 
@@ -2427,7 +2428,7 @@ fn test_reduce_min_u64_high_bit_set() {
 
     let agg = AggDescriptor {
         col_idx: 2,
-        agg_op: AggOp::Min,
+        agg_op: AggFunc::Min,
         col_type_code: TypeCode::U64,
     };
 
@@ -2468,7 +2469,7 @@ fn test_reduce_max_u64_high_bit_set() {
 
     let agg = AggDescriptor {
         col_idx: 2,
-        agg_op: AggOp::Max,
+        agg_op: AggFunc::Max,
         col_type_code: TypeCode::U64,
     };
 
@@ -2505,7 +2506,7 @@ fn test_reduce_min_u64_incremental() {
 
     let agg = AggDescriptor {
         col_idx: 2,
-        agg_op: AggOp::Min,
+        agg_op: AggFunc::Min,
         col_type_code: TypeCode::U64,
     };
 
@@ -2584,7 +2585,7 @@ fn test_reduce_max_u64_incremental() {
 
     let agg = AggDescriptor {
         col_idx: 2,
-        agg_op: AggOp::Max,
+        agg_op: AggFunc::Max,
         col_type_code: TypeCode::U64,
     };
 
@@ -2650,7 +2651,7 @@ fn test_avi_seed_u64_high_bit() {
 
     let desc = AggDescriptor {
         col_idx: 1,
-        agg_op: AggOp::Min,
+        agg_op: AggFunc::Min,
         col_type_code: TypeCode::U64,
     };
     let mut acc = Accumulator::new(&desc, in_schema.locate(1));
@@ -2696,7 +2697,7 @@ fn test_reduce_min_u64_replay_via_trace_in() {
 
     let agg = AggDescriptor {
         col_idx: 2,
-        agg_op: AggOp::Min,
+        agg_op: AggFunc::Min,
         col_type_code: TypeCode::U64,
     };
 
@@ -2782,7 +2783,7 @@ fn test_reduce_min_max_i64_boundary() {
 
         let agg = AggDescriptor {
             col_idx: 2,
-            agg_op: AggOp::Min,
+            agg_op: AggFunc::Min,
             col_type_code: TypeCode::I64,
         };
 
@@ -2815,7 +2816,7 @@ fn test_reduce_min_max_i64_boundary() {
 
         let agg = AggDescriptor {
             col_idx: 2,
-            agg_op: AggOp::Max,
+            agg_op: AggFunc::Max,
             col_type_code: TypeCode::I64,
         };
 
@@ -2903,12 +2904,12 @@ fn sum_count_aggs(sum_col: u32, sum_tc: TypeCode) -> [AggDescriptor; 2] {
     [
         AggDescriptor {
             col_idx: sum_col,
-            agg_op: AggOp::Sum,
+            agg_op: AggFunc::Sum,
             col_type_code: sum_tc,
         },
         AggDescriptor {
             col_idx: 0,
-            agg_op: AggOp::Count,
+            agg_op: AggFunc::Count,
             col_type_code: TypeCode::I64,
         },
     ]
@@ -2979,7 +2980,7 @@ fn test_reduce_group_by_pk_unsorted_input_count() {
 
     let agg = AggDescriptor {
         col_idx: 1,
-        agg_op: AggOp::Count,
+        agg_op: AggFunc::Count,
         col_type_code: TypeCode::I64,
     };
 
@@ -3068,7 +3069,7 @@ fn test_reduce_group_by_pk_unsorted_compound_pk_permuted() {
 
     let agg = AggDescriptor {
         col_idx: 2,
-        agg_op: AggOp::Count,
+        agg_op: AggFunc::Count,
         col_type_code: TypeCode::I64,
     };
 
@@ -3266,7 +3267,7 @@ fn test_reduce_min_group_by_pk_retracts_extreme() {
 
     let agg = AggDescriptor {
         col_idx: 1,
-        agg_op: AggOp::Min,
+        agg_op: AggFunc::Min,
         col_type_code: TypeCode::I64,
     };
 
@@ -3375,7 +3376,7 @@ fn avi_two_groups_distinct_byte_form_keys() {
 
     let agg = AggDescriptor {
         col_idx: 3,
-        agg_op: AggOp::Min,
+        agg_op: AggFunc::Min,
         col_type_code: TypeCode::I64,
     };
 
@@ -3496,7 +3497,7 @@ fn avi_retraction_returns_next_extremum() {
 
     let agg = AggDescriptor {
         col_idx: 2,
-        agg_op: AggOp::Min,
+        agg_op: AggFunc::Min,
         col_type_code: TypeCode::I64,
     };
 
@@ -3600,7 +3601,7 @@ fn avi_non_power_of_two_stride_drives_cursor() {
 
         let agg = AggDescriptor {
             col_idx: 2,
-            agg_op: AggOp::Min,
+            agg_op: AggFunc::Min,
             col_type_code: TypeCode::I64,
         };
 
@@ -3698,7 +3699,7 @@ fn trace_scan_retraction_recomputes_min() {
 
     let agg = AggDescriptor {
         col_idx: 2,
-        agg_op: AggOp::Min,
+        agg_op: AggFunc::Min,
         col_type_code: TypeCode::I64,
     };
 
@@ -3806,7 +3807,7 @@ fn min_tie_retract_one_copy_keeps_min() {
 
     let agg = AggDescriptor {
         col_idx: 2,
-        agg_op: AggOp::Min,
+        agg_op: AggFunc::Min,
         col_type_code: TypeCode::I64,
     };
 
@@ -3889,7 +3890,7 @@ fn min_ignores_null_values() {
 
     let agg = AggDescriptor {
         col_idx: 2,
-        agg_op: AggOp::Min,
+        agg_op: AggFunc::Min,
         col_type_code: TypeCode::I64,
     };
 
@@ -3999,7 +4000,7 @@ fn avi_multi_col_retraction_returns_next_extremum() {
 
     let agg = AggDescriptor {
         col_idx: 3,
-        agg_op: AggOp::Min,
+        agg_op: AggFunc::Min,
         col_type_code: TypeCode::I64,
     };
 
@@ -4154,7 +4155,7 @@ fn avi_wide_two_u64_groups_match_reference() {
 
     let agg = AggDescriptor {
         col_idx: 3,
-        agg_op: AggOp::Min,
+        agg_op: AggFunc::Min,
         col_type_code: TypeCode::I64,
     };
 
@@ -4257,7 +4258,7 @@ fn avi_wide_single_u128_group_distinct() {
 
     let agg = AggDescriptor {
         col_idx: 2,
-        agg_op: AggOp::Min,
+        agg_op: AggFunc::Min,
         col_type_code: TypeCode::I64,
     };
 
@@ -4373,7 +4374,7 @@ fn avi_wide_mixed_signed_unsigned_key() {
 
     let agg = AggDescriptor {
         col_idx: 3,
-        agg_op: AggOp::Min,
+        agg_op: AggFunc::Min,
         col_type_code: TypeCode::I64,
     };
 
@@ -4483,7 +4484,7 @@ fn avi_wide_prefix_collision_distinct_groups() {
 
     let agg = AggDescriptor {
         col_idx: 4,
-        agg_op: AggOp::Min,
+        agg_op: AggFunc::Min,
         col_type_code: TypeCode::I64,
     };
 
@@ -4601,7 +4602,7 @@ fn avi_wide_retraction_returns_next_extremum() {
 
     let agg = AggDescriptor {
         col_idx: 3,
-        agg_op: AggOp::Min,
+        agg_op: AggFunc::Min,
         col_type_code: TypeCode::I64,
     };
 
@@ -4669,7 +4670,7 @@ fn count_accumulator_over_uuid_pk_does_not_panic() {
     }
     let desc = AggDescriptor {
         col_idx: 0,
-        agg_op: AggOp::Count,
+        agg_op: AggFunc::Count,
         col_type_code: TypeCode::UUID,
     };
     let mut acc = Accumulator::new(&desc, schema.locate(0));
@@ -4712,7 +4713,7 @@ fn avi_read_extreme(
     .unwrap();
     let agg = AggDescriptor {
         col_idx,
-        agg_op: if for_max { AggOp::Max } else { AggOp::Min },
+        agg_op: if for_max { AggFunc::Max } else { AggFunc::Min },
         col_type_code: tc_enum,
     };
     let aggs = [agg];
@@ -4941,7 +4942,7 @@ fn reduce_wide_compound_pk_group_by_pk_counts_per_pk() {
 
     let agg = AggDescriptor {
         col_idx: 0,
-        agg_op: AggOp::Count,
+        agg_op: AggFunc::Count,
         col_type_code: TypeCode::U128,
     };
 
@@ -5224,7 +5225,7 @@ fn run_fallback_min_i64_grp(
 
     let agg = AggDescriptor {
         col_idx: 2,
-        agg_op: AggOp::Min,
+        agg_op: AggFunc::Min,
         col_type_code: TypeCode::I64,
     };
 
@@ -5383,7 +5384,7 @@ fn fallback_min_multi_col_group() {
 
     let agg = AggDescriptor {
         col_idx: 3,
-        agg_op: AggOp::Min,
+        agg_op: AggFunc::Min,
         col_type_code: TypeCode::I64,
     };
 
@@ -5493,7 +5494,7 @@ fn fallback_trace_rewind_at_most_once() {
     );
     let agg = AggDescriptor {
         col_idx: 2,
-        agg_op: AggOp::Min,
+        agg_op: AggFunc::Min,
         col_type_code: TypeCode::I64,
     };
 
@@ -5750,7 +5751,7 @@ fn test_reduce_max_blob_group_retraction() {
     );
     let agg = AggDescriptor {
         col_idx: 2,
-        agg_op: AggOp::Max,
+        agg_op: AggFunc::Max,
         col_type_code: TypeCode::I64,
     };
 
@@ -5845,17 +5846,17 @@ fn g_delta(rows: &[(u64, i64, i64)]) -> Batch {
 
 const G_COUNT: AggDescriptor = AggDescriptor {
     col_idx: 0,
-    agg_op: AggOp::Count,
+    agg_op: AggFunc::Count,
     col_type_code: TypeCode::U64,
 };
 const G_SUM: AggDescriptor = AggDescriptor {
     col_idx: 1,
-    agg_op: AggOp::Sum,
+    agg_op: AggFunc::Sum,
     col_type_code: TypeCode::I64,
 };
 const G_MIN: AggDescriptor = AggDescriptor {
     col_idx: 1,
-    agg_op: AggOp::Min,
+    agg_op: AggFunc::Min,
     col_type_code: TypeCode::I64,
 };
 
@@ -6314,12 +6315,12 @@ fn global_lone_min_avi_empty_prefix() {
 /// linear fast path), and an untouched accumulator renders `0`, not NULL.
 #[test]
 fn sumzero_folds_like_sum_and_empty_renders_zero() {
-    assert!(AggOp::SumZero.is_linear(), "SumZero must be linear");
+    assert!(AggFunc::SumZero.is_linear(), "SumZero must be linear");
 
     let schema = g_src();
     let desc = AggDescriptor {
         col_idx: 1,
-        agg_op: AggOp::SumZero,
+        agg_op: AggFunc::SumZero,
         col_type_code: TypeCode::I64,
     };
     let mut acc = Accumulator::new(&desc, schema.locate(1));
@@ -6352,7 +6353,7 @@ fn count_non_null_all_null_group_renders_zero_null_clear() {
     let in_schema = g_src(); // [U64 pk, I64 payload(nullable)]
     let desc = AggDescriptor {
         col_idx: 1,
-        agg_op: AggOp::CountNonNull,
+        agg_op: AggFunc::CountNonNull,
         col_type_code: TypeCode::I64,
     };
     let mut acc = Accumulator::new(&desc, in_schema.locate(1));
@@ -6428,12 +6429,12 @@ fn emit_global_ground_renders_count_family_zero_null_clear() {
     let descs = [
         AggDescriptor {
             col_idx: 0,
-            agg_op: AggOp::Count,
+            agg_op: AggFunc::Count,
             col_type_code: TypeCode::U64,
         },
         AggDescriptor {
             col_idx: 1,
-            agg_op: AggOp::CountNonNull,
+            agg_op: AggFunc::CountNonNull,
             col_type_code: TypeCode::I64,
         },
     ];
@@ -6512,15 +6513,15 @@ fn combine_partials(rows: &[(i64, Option<i64>)]) -> Batch {
 }
 
 // SumZero merges the partial counts; a trailing Count counts partial rows (the
-// existence gate `op_reduce` finds via the lone AggOp::Count).
+// existence gate `op_reduce` finds via the lone AggFunc::Count).
 const C_SUMZERO: AggDescriptor = AggDescriptor {
     col_idx: 1,
-    agg_op: AggOp::SumZero,
+    agg_op: AggFunc::SumZero,
     col_type_code: TypeCode::I64,
 };
 const C_COUNT_PARTIALS: AggDescriptor = AggDescriptor {
     col_idx: 0,
-    agg_op: AggOp::Count,
+    agg_op: AggFunc::Count,
     col_type_code: TypeCode::U128,
 };
 
@@ -6730,17 +6731,17 @@ fn reduce_multi_avi_foreign_group() {
     let aggs = [
         AggDescriptor {
             col_idx: 2,
-            agg_op: AggOp::Min,
+            agg_op: AggFunc::Min,
             col_type_code: TypeCode::I64,
         },
         AggDescriptor {
             col_idx: 3,
-            agg_op: AggOp::Max,
+            agg_op: AggFunc::Max,
             col_type_code: TypeCode::I64,
         },
         AggDescriptor {
             col_idx: 0,
-            agg_op: AggOp::Count,
+            agg_op: AggFunc::Count,
             col_type_code: TypeCode::U64,
         },
     ];
@@ -6838,12 +6839,12 @@ fn cg3_delta(rows: &[(u64, i64, i32, i64, bool)]) -> Batch {
 }
 const CG3_MIN: AggDescriptor = AggDescriptor {
     col_idx: 2,
-    agg_op: AggOp::Min,
+    agg_op: AggFunc::Min,
     col_type_code: TypeCode::I64,
 };
 const CG3_COUNT: AggDescriptor = AggDescriptor {
     col_idx: 0,
-    agg_op: AggOp::Count,
+    agg_op: AggFunc::Count,
     col_type_code: TypeCode::U64,
 };
 
@@ -7045,12 +7046,12 @@ fn reduce_multi_avi_same_col_min_max() {
     let aggs = [
         AggDescriptor {
             col_idx: 2,
-            agg_op: AggOp::Min,
+            agg_op: AggFunc::Min,
             col_type_code: TypeCode::I64,
         },
         AggDescriptor {
             col_idx: 2,
-            agg_op: AggOp::Max,
+            agg_op: AggFunc::Max,
             col_type_code: TypeCode::I64,
         },
         CG3_COUNT,
@@ -7113,12 +7114,12 @@ fn reduce_multi_avi_compound_group_key() {
     let aggs = [
         AggDescriptor {
             col_idx: 3,
-            agg_op: AggOp::Min,
+            agg_op: AggFunc::Min,
             col_type_code: TypeCode::I64,
         },
         AggDescriptor {
             col_idx: 0,
-            agg_op: AggOp::Count,
+            agg_op: AggFunc::Count,
             col_type_code: TypeCode::U64,
         },
     ];
@@ -7196,17 +7197,17 @@ fn reduce_multi_avi_global_emptied() {
     let aggs = [
         AggDescriptor {
             col_idx: 1,
-            agg_op: AggOp::Min,
+            agg_op: AggFunc::Min,
             col_type_code: TypeCode::I64,
         },
         AggDescriptor {
             col_idx: 2,
-            agg_op: AggOp::Sum,
+            agg_op: AggFunc::Sum,
             col_type_code: TypeCode::I64,
         },
         AggDescriptor {
             col_idx: 0,
-            agg_op: AggOp::Count,
+            agg_op: AggFunc::Count,
             col_type_code: TypeCode::U64,
         },
     ];
@@ -7827,17 +7828,17 @@ fn mm_aggs() -> [AggDescriptor; 3] {
     [
         AggDescriptor {
             col_idx: 2,
-            agg_op: AggOp::Min,
+            agg_op: AggFunc::Min,
             col_type_code: TypeCode::I64,
         },
         AggDescriptor {
             col_idx: 2,
-            agg_op: AggOp::Max,
+            agg_op: AggFunc::Max,
             col_type_code: TypeCode::I64,
         },
         AggDescriptor {
             col_idx: 0,
-            agg_op: AggOp::Count,
+            agg_op: AggFunc::Count,
             col_type_code: TypeCode::I64,
         },
     ]
@@ -8151,17 +8152,17 @@ fn avi_skip_mixed_int_min_float_max() {
     let aggs = [
         AggDescriptor {
             col_idx: 2,
-            agg_op: AggOp::Min,
+            agg_op: AggFunc::Min,
             col_type_code: TypeCode::I64,
         },
         AggDescriptor {
             col_idx: 3,
-            agg_op: AggOp::Max,
+            agg_op: AggFunc::Max,
             col_type_code: TypeCode::F64,
         },
         AggDescriptor {
             col_idx: 0,
-            agg_op: AggOp::Count,
+            agg_op: AggFunc::Count,
             col_type_code: TypeCode::I64,
         },
     ];
@@ -8227,17 +8228,17 @@ fn check_float_minmax_matches_reference(val_tc: TypeCode, epochs_rows: &[Vec<(u6
     let aggs = [
         AggDescriptor {
             col_idx: 2,
-            agg_op: AggOp::Min,
+            agg_op: AggFunc::Min,
             col_type_code: val_tc,
         },
         AggDescriptor {
             col_idx: 2,
-            agg_op: AggOp::Max,
+            agg_op: AggFunc::Max,
             col_type_code: val_tc,
         },
         AggDescriptor {
             col_idx: 0,
-            agg_op: AggOp::Count,
+            agg_op: AggFunc::Count,
             col_type_code: TypeCode::I64,
         },
     ];
@@ -8322,12 +8323,12 @@ fn check_pk_source_max(b_signed: bool) {
     let aggs = [
         AggDescriptor {
             col_idx: 1,
-            agg_op: AggOp::Max,
+            agg_op: AggFunc::Max,
             col_type_code: TypeCode::from_validated_u8(b_tc),
         },
         AggDescriptor {
             col_idx: 0,
-            agg_op: AggOp::Count,
+            agg_op: AggFunc::Count,
             col_type_code: TypeCode::U64,
         },
     ];
@@ -8407,17 +8408,17 @@ fn avi_skip_global_aggregate() {
     let aggs = [
         AggDescriptor {
             col_idx: 1,
-            agg_op: AggOp::Min,
+            agg_op: AggFunc::Min,
             col_type_code: TypeCode::I64,
         },
         AggDescriptor {
             col_idx: 1,
-            agg_op: AggOp::Max,
+            agg_op: AggFunc::Max,
             col_type_code: TypeCode::I64,
         },
         AggDescriptor {
             col_idx: 0,
-            agg_op: AggOp::Count,
+            agg_op: AggFunc::Count,
             col_type_code: TypeCode::I64,
         },
     ];
@@ -8462,32 +8463,32 @@ fn avi_skip_global_aggregate() {
 
 #[test]
 fn test_agg_output_type() {
-    assert_eq!(agg_output_type(AggOp::Count, TypeCode::I64), type_code::I64);
-    assert_eq!(agg_output_type(AggOp::Sum, TypeCode::F64), type_code::F64);
-    assert_eq!(agg_output_type(AggOp::Sum, TypeCode::I32), type_code::I64);
-    assert_eq!(agg_output_type(AggOp::Max, TypeCode::F32), type_code::F64);
+    assert_eq!(agg_output_type(AggFunc::Count, TypeCode::I64), type_code::I64);
+    assert_eq!(agg_output_type(AggFunc::Sum, TypeCode::F64), type_code::F64);
+    assert_eq!(agg_output_type(AggFunc::Sum, TypeCode::I32), type_code::I64);
+    assert_eq!(agg_output_type(AggFunc::Max, TypeCode::F32), type_code::F64);
     // MIN/MAX select an existing row, so they preserve the source type: every
     // ≤8-byte integer keeps its own type (no widening to I64).
-    assert_eq!(agg_output_type(AggOp::Min, TypeCode::I8), type_code::I8);
-    assert_eq!(agg_output_type(AggOp::Max, TypeCode::I16), type_code::I16);
-    assert_eq!(agg_output_type(AggOp::Min, TypeCode::I32), type_code::I32);
-    assert_eq!(agg_output_type(AggOp::Max, TypeCode::U8), type_code::U8);
-    assert_eq!(agg_output_type(AggOp::Min, TypeCode::U16), type_code::U16);
-    assert_eq!(agg_output_type(AggOp::Max, TypeCode::U32), type_code::U32);
+    assert_eq!(agg_output_type(AggFunc::Min, TypeCode::I8), type_code::I8);
+    assert_eq!(agg_output_type(AggFunc::Max, TypeCode::I16), type_code::I16);
+    assert_eq!(agg_output_type(AggFunc::Min, TypeCode::I32), type_code::I32);
+    assert_eq!(agg_output_type(AggFunc::Max, TypeCode::U8), type_code::U8);
+    assert_eq!(agg_output_type(AggFunc::Min, TypeCode::U16), type_code::U16);
+    assert_eq!(agg_output_type(AggFunc::Max, TypeCode::U32), type_code::U32);
     // U64 folds into the general rule (the source type *is* U64); SUM over a
     // U64 source is also typed U64 (the i64 accumulator bit pattern is the
     // correct unsigned sum), so a downstream unsigned compare re-seeds right.
-    assert_eq!(agg_output_type(AggOp::Min, TypeCode::U64), type_code::U64);
-    assert_eq!(agg_output_type(AggOp::Max, TypeCode::U64), type_code::U64);
-    assert_eq!(agg_output_type(AggOp::Sum, TypeCode::U64), type_code::U64);
+    assert_eq!(agg_output_type(AggFunc::Min, TypeCode::U64), type_code::U64);
+    assert_eq!(agg_output_type(AggFunc::Max, TypeCode::U64), type_code::U64);
+    assert_eq!(agg_output_type(AggFunc::Sum, TypeCode::U64), type_code::U64);
     // Non-fixed-int sources (STRING / 16-byte) fall to the I64 arm as a
     // total-function default. MIN/MAX over them is rejected at compile (the
     // SQL binder, and emit_reduce's order-encodability guard — see
     // test_build_plan_min_max_over_non_encodable_rejected), so this result only
     // types a discarded schema and never reaches execution; agg_output_type
     // stays total, hence these asserts still hold.
-    assert_eq!(agg_output_type(AggOp::Max, TypeCode::String), type_code::I64);
-    assert_eq!(agg_output_type(AggOp::Min, TypeCode::U128), type_code::I64);
+    assert_eq!(agg_output_type(AggFunc::Max, TypeCode::String), type_code::I64);
+    assert_eq!(agg_output_type(AggFunc::Min, TypeCode::U128), type_code::I64);
 }
 
 #[test]
@@ -8502,7 +8503,7 @@ fn test_build_reduce_output_schema_natural_pk() {
     );
     let aggs = vec![AggDescriptor {
         col_idx: 2,
-        agg_op: AggOp::Sum,
+        agg_op: AggFunc::Sum,
         col_type_code: TypeCode::I64,
     }];
     let out = build_reduce_output_schema(&input, &[1], &aggs, crate::schema::ReduceOutKey::SingleNaturalCol).unwrap();
@@ -8525,7 +8526,7 @@ fn test_build_reduce_output_schema_compound_natural_pk() {
     );
     let aggs = vec![AggDescriptor {
         col_idx: 2,
-        agg_op: AggOp::Count,
+        agg_op: AggFunc::Count,
         col_type_code: TypeCode::I64,
     }];
     // group_cols = [1, 0] — permuted; the set still equals pk_indices.
@@ -8551,7 +8552,7 @@ fn test_build_reduce_output_schema_single_pk_group_by_pk() {
     );
     let aggs = vec![AggDescriptor {
         col_idx: 1,
-        agg_op: AggOp::Sum,
+        agg_op: AggFunc::Sum,
         col_type_code: TypeCode::I64,
     }];
     let out = build_reduce_output_schema(&input, &[0], &aggs, crate::schema::ReduceOutKey::PkPermutation).unwrap();
@@ -8573,7 +8574,7 @@ fn test_build_reduce_output_schema_synthetic_pk() {
     );
     let aggs = vec![AggDescriptor {
         col_idx: 2,
-        agg_op: AggOp::Count,
+        agg_op: AggFunc::Count,
         col_type_code: TypeCode::I64,
     }];
     let out = build_reduce_output_schema(&input, &[1], &aggs, crate::schema::ReduceOutKey::SyntheticFold).unwrap();
@@ -8600,12 +8601,12 @@ fn build_reduce_output_schema_agg_nullability_matrix() {
         // the SyntheticFold shape).
         let input = u64pk_i64grp_i64val(src_nullable);
         for agg_op in [
-            AggOp::Count,
-            AggOp::CountNonNull,
-            AggOp::SumZero,
-            AggOp::Sum,
-            AggOp::Min,
-            AggOp::Max,
+            AggFunc::Count,
+            AggFunc::CountNonNull,
+            AggFunc::SumZero,
+            AggFunc::Sum,
+            AggFunc::Min,
+            AggFunc::Max,
         ] {
             let aggs = vec![AggDescriptor {
                 col_idx: 2,
@@ -8618,8 +8619,8 @@ fn build_reduce_output_schema_agg_nullability_matrix() {
                 // Aggregates are the trailing output columns.
                 let got = out.columns[out.num_columns() - 1].nullable != 0;
                 let want = match agg_op {
-                    AggOp::Count | AggOp::CountNonNull | AggOp::SumZero => false,
-                    AggOp::Sum | AggOp::Min | AggOp::Max => src_nullable || group_cols.is_empty(),
+                    AggFunc::Count | AggFunc::CountNonNull | AggFunc::SumZero => false,
+                    AggFunc::Sum | AggFunc::Min | AggFunc::Max => src_nullable || group_cols.is_empty(),
                 };
                 assert_eq!(
                     got, want,

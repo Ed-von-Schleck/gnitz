@@ -81,7 +81,7 @@ pub fn decode_hello_payload(payload: &[u8]) -> Result<HelloHeader, &'static str>
         return Err("hello payload wrong size");
     }
     let magic = crate::read_u32_le(payload, 0);
-    let version = u16::from_le_bytes(payload[4..6].try_into().unwrap());
+    let version = crate::read_u16_le(payload, 4);
     // bytes [6..8] are reserved padding
     Ok(HelloHeader { magic, version })
 }
@@ -119,7 +119,7 @@ pub fn decode_hello_ack(payload: &[u8]) -> Result<HelloAck, &'static str> {
         return Err("hello ack payload wrong size");
     }
     let magic = crate::read_u32_le(payload, 0);
-    let status = u16::from_le_bytes(payload[4..6].try_into().unwrap());
+    let status = crate::read_u16_le(payload, 4);
     // bytes [6..8] are reserved padding
     let limit_bytes = crate::read_u32_le(payload, 8);
     let published_lsn = crate::read_u64_le(payload, 12);

@@ -5,10 +5,13 @@
 // Wire protocol flags
 // ---------------------------------------------------------------------------
 
-/// Bits 0-15 are the SAL-level flags carried verbatim from the on-disk log
-/// into every control block.  Bits 16+ are wire-level fields (conflict mode,
-/// schema version) that are encoded by the sender and decoded by the receiver.
-const SAL_FLAGS_MASK: u64 = 0x0000_FFFF;
+/// Bits 0-15: the SAL-level flags carried verbatim from the on-disk log into
+/// every control block. Bits 16+ are wire-level fields (conflict mode, schema
+/// version) encoded by the sender and decoded by the receiver.
+///
+/// Exported so the engine can assert its own group-header flags — which live in
+/// a `u32` above this block — stay clear of it.
+pub const SAL_FLAGS_MASK: u64 = 0x0000_FFFF;
 
 pub const FLAG_SHUTDOWN: u64 = 4;
 pub const FLAG_DDL_SYNC: u64 = 8;
@@ -26,9 +29,36 @@ pub const FLAG_SEEK_BY_INDEX: u64 = 256;
 /// RANGE, …) this lives *inside* the SAL flag block (bits 0-15, `SAL_FLAGS_MASK`)
 /// so it is carried verbatim from the wire frame into the SAL group header — one
 /// allocation, no separate u32 dispatch flag. The engine mirrors it as a `u32`.
-// bit 10 — next free in the 0-15 SAL block (the 512↔2048 gap between the engine's
-// FLAG_EXCHANGE_RELAY (bit 9) and FLAG_BACKFILL (bit 11)).
 pub const FLAG_SCAN_SPEC: u64 = 1 << 10;
+
+// ---------------------------------------------------------------------------
+// Engine-internal SAL group-header flags that nonetheless live in the shared
+// 0-15 block.
+//
+// The engine never sends these to a client, but it allocates them out of the
+// same sixteen bits the wire request flags above use, because a group header
+// carries the block verbatim. Two crates allocating one bit range needs one
+// table, or the second allocator has to read the first's source to find a gap.
+// So the *bit* is reserved here — covered by the disjointness guard below,
+// exactly as `FLAG_BATCH_SORTED` and friends are — while the engine keeps the
+// meaning and mirrors each as the `u32` its group header stores.
+//
+// Bits 16+ of the group header are a different word from the wire `u64` (the
+// header's flags field is `u32`, and the packed wire fields at bits 16-47 never
+// reach it), so the engine's flags above bit 15 are its own namespace and are
+// not reserved here.
+// ---------------------------------------------------------------------------
+
+/// Relay leg of a distributed exchange (bit 9).
+pub const FLAG_EXCHANGE_RELAY: u64 = 1 << 9;
+/// Initial full-source scan feeding a newly created view (bit 11).
+pub const FLAG_BACKFILL: u64 = 1 << 11;
+/// Drive one view-maintenance tick (bit 12).
+pub const FLAG_TICK: u64 = 1 << 12;
+/// Base round of a checkpoint: flush base and system tables (bit 14).
+pub const FLAG_FLUSH: u64 = 1 << 14;
+/// Closing commit sentinel of an atomic write zone (bit 15).
+pub const FLAG_TXN_COMMIT: u64 = 1 << 15;
 pub const FLAG_HAS_SCHEMA: u64 = 1 << 48;
 pub const FLAG_HAS_DATA: u64 = 1 << 49;
 /// Set on every per-worker scan response frame. Absent on the terminal
@@ -45,8 +75,7 @@ pub const FLAG_GET_INDICES: u64 = 1 << 54;
 
 /// ALLOCATE_SERIAL_RANGE request flag. The client→master leg of a user-table
 /// SERIAL sequence range reservation. Like the other high request bits it rides
-/// above the SAL mirror (bits 0-15) and the bit-16–47 packed fields; bit 55 is
-/// the current top, so 56 is the next free. The request carries
+/// above the SAL mirror (bits 0-15) and the bit-16–47 packed fields. The request carries
 /// `target_id = table_id` (the sequence key) and the range `count` in
 /// `seek_col_idx`; this high bit is never written to the SAL group header.
 pub const FLAG_ALLOCATE_SERIAL_RANGE: u64 = 1 << 56;
@@ -162,16 +191,37 @@ const WIRE_SCHEMA_VERSION_MASK: u64 = 0xFFFF_u64 << WIRE_SCHEMA_VERSION_SHIFT;
 const WIRE_INDEX_VERSION_SHIFT: u32 = 40;
 const WIRE_INDEX_VERSION_MASK: u64 = 0xFF_u64 << WIRE_INDEX_VERSION_SHIFT;
 
-// Compile-time guard: SAL flags (bits 0-15) must stay clear of the wire-level
-// packed fields, those fields must not overlap each other, and every high
-// boolean flag (bits 48+, including the engine-internal ones) must be disjoint
-// from the SAL mirror, the packed fields, and each other (catches a regression
-// to a colliding bit at compile time).
+// Compile-time guard over the whole `u64`: no two flags may share a bit, and no
+// flag may land in the wire-level packed fields.
+//
+// The sweep runs in two passes because the 0-15 block and the 48+ block are
+// allocated by different rules, but both accumulate into one mask, so a
+// collision anywhere fails the build. The 0-15 pass covers the engine-owned
+// group-header bits too — that is the whole reason they are declared here.
 const _: () = {
     let packed = WIRE_CONFLICT_MODE_MASK | WIRE_SCHEMA_VERSION_MASK | WIRE_INDEX_VERSION_MASK;
     assert!(SAL_FLAGS_MASK & packed == 0);
     assert!(WIRE_CONFLICT_MODE_MASK & WIRE_SCHEMA_VERSION_MASK == 0);
     assert!(WIRE_SCHEMA_VERSION_MASK & WIRE_INDEX_VERSION_MASK == 0);
+
+    // Bits 0-15: the block a SAL group header carries verbatim, co-allocated by
+    // the client request flags and the engine's group-header flags.
+    let sal_block = [
+        FLAG_SHUTDOWN,
+        FLAG_DDL_SYNC,
+        FLAG_EXCHANGE,
+        FLAG_PUSH,
+        FLAG_HAS_PK,
+        FLAG_SEEK,
+        FLAG_SEEK_BY_INDEX,
+        FLAG_EXCHANGE_RELAY,
+        FLAG_SCAN_SPEC,
+        FLAG_BACKFILL,
+        FLAG_TICK,
+        FLAG_FLUSH,
+        FLAG_TXN_COMMIT,
+    ];
+    // Bits 48+: booleans that never enter a SAL group header.
     let high_flags = [
         FLAG_HAS_SCHEMA,
         FLAG_HAS_DATA,
@@ -188,8 +238,20 @@ const _: () = {
         FLAG_PUSH_TXN,
         FLAG_SCAN_MULTI,
     ];
-    let mut acc = SAL_FLAGS_MASK | packed;
+
+    let mut acc = 0u64;
     let mut i = 0;
+    while i < sal_block.len() {
+        assert!(
+            sal_block[i] & SAL_FLAGS_MASK == sal_block[i],
+            "SAL-block flag outside bits 0-15"
+        );
+        assert!(sal_block[i] & acc == 0, "wire flag bit collision");
+        acc |= sal_block[i];
+        i += 1;
+    }
+    acc = SAL_FLAGS_MASK | packed;
+    i = 0;
     while i < high_flags.len() {
         assert!(high_flags[i] & acc == 0, "wire flag bit collision");
         acc |= high_flags[i];
@@ -301,12 +363,70 @@ pub const META_FLAG_HIDDEN: u64 = 4;
 /// position so the decoder can reconstruct `pk_indices` in declaration
 /// order rather than column-position order (e.g. `PRIMARY KEY (b, a)`
 /// with `a` at column 1 and `b` at column 2 must decode to `[2, 1]`).
-pub const META_FLAG_PK_POS_SHIFT: u32 = 8;
-pub const META_FLAG_PK_POS_MASK: u64 = 0xFF << META_FLAG_PK_POS_SHIFT;
+const META_FLAG_PK_POS_SHIFT: u32 = 8;
+const META_FLAG_PK_POS_MASK: u64 = 0xFF << META_FLAG_PK_POS_SHIFT;
+
+/// Pack a schema block's per-column metadata flags word from its logical
+/// fields. `pk_pos` is the column's 0-indexed position in the PK tuple, or
+/// `None` for a non-PK column.
+///
+/// This word is written by both ends (the client encodes a schema it pushes,
+/// the engine encodes the schema it replies with) and read by both, so the bit
+/// layout lives here with its accessors rather than being re-spelled per codec —
+/// the same rule [`pack_table_flags`] follows for `TABLE_TAB.flags`.
+#[inline]
+pub fn pack_col_meta_flags(nullable: bool, hidden: bool, pk_pos: Option<u8>) -> u64 {
+    let pk = match pk_pos {
+        Some(p) => META_FLAG_IS_PK | ((p as u64) << META_FLAG_PK_POS_SHIFT),
+        None => 0,
+    };
+    pk | if nullable { META_FLAG_NULLABLE } else { 0 } | if hidden { META_FLAG_HIDDEN } else { 0 }
+}
+
+/// Decode the `nullable` bit from a per-column metadata flags word.
+#[inline]
+pub fn col_meta_nullable(flags: u64) -> bool {
+    flags & META_FLAG_NULLABLE != 0
+}
+
+/// Decode the `hidden` bit (see [`META_FLAG_HIDDEN`]).
+#[inline]
+pub fn col_meta_hidden(flags: u64) -> bool {
+    flags & META_FLAG_HIDDEN != 0
+}
+
+/// The column's 0-indexed position within the PK tuple, or `None` when it is
+/// not a PK column. Decoders sort their PK columns by this to rebuild the
+/// declared PK order.
+#[inline]
+pub fn col_meta_pk_pos(flags: u64) -> Option<u8> {
+    (flags & META_FLAG_IS_PK != 0).then_some(((flags & META_FLAG_PK_POS_MASK) >> META_FLAG_PK_POS_SHIFT) as u8)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-column metadata word both ends of the schema block encode and
+    /// decode: every field round-trips, and a non-PK column reports no position
+    /// however the other bits are set.
+    #[test]
+    fn col_meta_flags_roundtrip() {
+        for &nullable in &[false, true] {
+            for &hidden in &[false, true] {
+                for pk_pos in [None, Some(0u8), Some(1), Some(3), Some(u8::MAX)] {
+                    let f = pack_col_meta_flags(nullable, hidden, pk_pos);
+                    assert_eq!(col_meta_nullable(f), nullable);
+                    assert_eq!(col_meta_hidden(f), hidden);
+                    assert_eq!(col_meta_pk_pos(f), pk_pos);
+                }
+            }
+        }
+        // The pre-compound spelling: a single-PK column is `IS_PK` with a zero
+        // position byte.
+        assert_eq!(pack_col_meta_flags(false, false, Some(0)), META_FLAG_IS_PK);
+        assert_eq!(pack_col_meta_flags(true, false, None), META_FLAG_NULLABLE);
+    }
 
     #[test]
     fn validate_scan_multi_tids_accepts_valid_lists() {

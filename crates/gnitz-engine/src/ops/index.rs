@@ -1,8 +1,9 @@
 //! Secondary index integration: AviBake/AviDesc, op_integrate_with_indexes.
 
-use crate::ops::{AggDescriptor, AggOp};
+use crate::ops::AggDescriptor;
 use crate::schema::{type_code, ColumnLocator, SchemaColumn, SchemaDescriptor};
 use crate::storage::Batch;
+use gnitz_wire::AggFunc;
 
 use super::util::GroupKeyExtractor;
 
@@ -12,7 +13,7 @@ use super::util::GroupKeyExtractor;
 
 /// The compile-time-baked write-side AVI resources (`Program::avi_bakes`):
 /// the composite index schema, the group-key gatherer, the value-indexed
-/// (`AggOp::uses_value_index`) subset of the reduce's descriptors in
+/// (`AggFunc::uses_value_index`) subset of the reduce's descriptors in
 /// descriptor order (entry `j` is the aggregate written under ordinal `j` in
 /// the combined key `group_cols ‖ ordinal ‖ av_encoded`), and each aggregate
 /// column's resolved locator. Baked once at compile so the per-tick
@@ -156,7 +157,7 @@ pub fn op_integrate_with_indexes(
                 let av_u64 = super::util::encode_ordered(
                     loc.native_le_bytes(&mb, row, &mut pk_scratch),
                     d.col_type_code as u8,
-                    d.agg_op == AggOp::Max,
+                    d.agg_op == AggFunc::Max,
                 );
                 // Serialise the order-encoded value big-endian: the index orders
                 // entries by raw lexicographic byte comparison, so big-endian

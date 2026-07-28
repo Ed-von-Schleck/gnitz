@@ -390,7 +390,7 @@ mod tests {
             }
         }
 
-        // (5) U128 payload key — legacy: `is_routable_int` includes U128, so the
+        // (5) U128 payload key: `is_pk_eligible` includes U128, so the
         // wide arm of `loc.route_key` fed `partition_for_key`.
         {
             let schema = SchemaDescriptor::new(

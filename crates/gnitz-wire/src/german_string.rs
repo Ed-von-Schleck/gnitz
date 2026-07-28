@@ -89,7 +89,13 @@ pub fn try_decode_german_string(st: &[u8; 16], blob: &[u8]) -> Option<Vec<u8>> {
 pub fn german_string_cell_ok(cell: &[u8], blob: &[u8]) -> bool {
     let length = read_u32_le(cell, 0) as usize;
     if length <= SHORT_STRING_THRESHOLD {
-        return cell[4 + length..16].iter().all(|&b| b == 0);
+        // Asked as "is this already what the canonicalizer would produce" —
+        // which is what the short arm means. Two masked word compares instead of
+        // a byte-at-a-time pad scan LLVM cannot vectorize (the start index is
+        // runtime and the loop exits early), on the per-row client-push ingest
+        // trust boundary.
+        let c: &[u8; 16] = cell[..16].try_into().unwrap();
+        return *c == canonical_short_cell(c);
     }
     // `length > 4`, so the resolved range always holds the four prefix bytes.
     match blob_extent(blob.len(), read_u64_le(cell, 8), length) {
@@ -106,9 +112,9 @@ pub fn german_string_cell_ok(cell: &[u8], blob: &[u8]) -> bool {
 /// `src`'s length field must be ≤ `SHORT_STRING_THRESHOLD`; a long cell owns
 /// `[8..16)` as a heap offset and belongs to the relocator instead.
 ///
-/// Branchless by construction: the runtime-length `copy_from_slice` this
-/// replaces lowers to a `memcpy` PLT call for a ≤ 8-byte move, ~5× the cost on
-/// the per-row merge / scatter / map-projection loop.
+/// Branchless by construction: a runtime-length `copy_from_slice` would lower to
+/// a `memcpy` PLT call for a ≤ 8-byte move, ~5× the cost on the per-row merge /
+/// scatter / map-projection loop.
 #[inline]
 pub fn canonical_short_cell(src: &[u8; 16]) -> [u8; 16] {
     let length = read_u32_le(src, 0) as usize;

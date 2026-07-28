@@ -17,23 +17,38 @@ use crate::type_code;
 ///
 /// `src` and `dst` are both exactly `col.size()` bytes (1/2/4/8/16). Native
 /// little-endian input is byte-reversed to big-endian; signed types additionally
-/// flip the sign bit of the leading byte so the signed range maps monotonically
-/// onto the unsigned range. The result's unsigned lexicographic order equals the
-/// numeric order of the source value.
+/// flip the sign bit so the signed range maps monotonically onto the unsigned
+/// range. The result's unsigned lexicographic order equals the numeric order of
+/// the source value.
+///
+/// The sign flip rides in the integer, not in `dst`: the sign bit *is* the top
+/// bit of the big-endian image, so XOR-ing it before the store keeps the whole
+/// transform one load, one `bswap` and one store — a trailing `dst[0] ^= 0x80`
+/// would be a read-modify-write of bytes just written. [`decode_pk_column`] is
+/// the exact mirror.
 #[inline]
 pub fn encode_pk_column(src: &[u8], tc: u8, dst: &mut [u8]) {
     debug_assert_eq!(dst.len(), src.len());
-    let signed = crate::is_signed_int(tc);
+    let flip = crate::is_signed_int(tc);
     match dst.len() {
-        16 => dst.copy_from_slice(&u128::from_le_bytes(src.try_into().unwrap()).to_be_bytes()),
-        8 => dst.copy_from_slice(&u64::from_le_bytes(src.try_into().unwrap()).to_be_bytes()),
-        4 => dst.copy_from_slice(&u32::from_le_bytes(src.try_into().unwrap()).to_be_bytes()),
-        2 => dst.copy_from_slice(&u16::from_le_bytes(src.try_into().unwrap()).to_be_bytes()),
-        1 => dst[0] = src[0],
+        16 => {
+            let v = u128::from_le_bytes(src.try_into().unwrap()) ^ ((flip as u128) << 127);
+            dst.copy_from_slice(&v.to_be_bytes());
+        }
+        8 => {
+            let v = u64::from_le_bytes(src.try_into().unwrap()) ^ ((flip as u64) << 63);
+            dst.copy_from_slice(&v.to_be_bytes());
+        }
+        4 => {
+            let v = u32::from_le_bytes(src.try_into().unwrap()) ^ ((flip as u32) << 31);
+            dst.copy_from_slice(&v.to_be_bytes());
+        }
+        2 => {
+            let v = u16::from_le_bytes(src.try_into().unwrap()) ^ ((flip as u16) << 15);
+            dst.copy_from_slice(&v.to_be_bytes());
+        }
+        1 => dst[0] = src[0] ^ ((flip as u8) << 7),
         other => unreachable!("PK column size must be 1/2/4/8/16, got {other}"),
-    }
-    if signed {
-        dst[0] ^= 0x80;
     }
 }
 
@@ -57,35 +72,32 @@ pub fn encode_pk_tuple(cols: impl IntoIterator<Item = (usize, u8)>, src: &[u8], 
 }
 
 /// Symmetric inverse of [`encode_pk_column`]: decode an OPK column back to
-/// native little-endian bytes. `src` and `dst` are both `col.size()` bytes.
-/// Signed types un-flip the sign bit, then the big-endian image is byte-reversed
-/// back to little-endian.
+/// native little-endian bytes. `src` and `dst` are both `col.size()` bytes. The
+/// big-endian image is read, its sign bit un-flipped for signed types, and the
+/// native little-endian value stored — the mirror of the encoder, arm for arm,
+/// and likewise never a read-modify-write of `dst`.
 #[inline]
 pub fn decode_pk_column(src: &[u8], tc: u8, dst: &mut [u8]) {
     debug_assert_eq!(dst.len(), src.len());
-    let signed = crate::is_signed_int(tc);
-    dst.copy_from_slice(src);
-    if signed {
-        dst[0] ^= 0x80;
-    }
-    match dst.len() {
+    let flip = crate::is_signed_int(tc);
+    match src.len() {
         16 => {
-            let v = u128::from_be_bytes(dst.try_into().unwrap());
+            let v = u128::from_be_bytes(src.try_into().unwrap()) ^ ((flip as u128) << 127);
             dst.copy_from_slice(&v.to_le_bytes());
         }
         8 => {
-            let v = u64::from_be_bytes(dst.try_into().unwrap());
+            let v = u64::from_be_bytes(src.try_into().unwrap()) ^ ((flip as u64) << 63);
             dst.copy_from_slice(&v.to_le_bytes());
         }
         4 => {
-            let v = u32::from_be_bytes(dst.try_into().unwrap());
+            let v = u32::from_be_bytes(src.try_into().unwrap()) ^ ((flip as u32) << 31);
             dst.copy_from_slice(&v.to_le_bytes());
         }
         2 => {
-            let v = u16::from_be_bytes(dst.try_into().unwrap());
+            let v = u16::from_be_bytes(src.try_into().unwrap()) ^ ((flip as u16) << 15);
             dst.copy_from_slice(&v.to_le_bytes());
         }
-        1 => {}
+        1 => dst[0] = src[0] ^ ((flip as u8) << 7),
         other => unreachable!("PK column size must be 1/2/4/8/16, got {other}"),
     }
 }
@@ -140,21 +152,21 @@ pub fn widen_native_le(src: &[u8], src_tc: u8, dst: &mut [u8]) {
 /// cross-width join pack into byte-identical keys and co-partition.
 #[inline]
 pub fn encode_pk_column_promoted(src: &[u8], src_tc: u8, target_tc: u8, dst: &mut [u8]) {
-    let src_width = src.len();
-    let target_width = crate::wire_stride(target_tc);
-    debug_assert_eq!(dst.len(), target_width);
-    debug_assert!(target_width >= src_width);
-    // The fixed 16-byte `scratch` below caps the in-scope target width; every
-    // promoted `T` is a PK-eligible ≤16-byte scalar (the decode trust boundary
-    // validates this), so this documents the contract a wider future type would
-    // have to grow. A violation is a planner/compiler bug, never input — so it
-    // must fail loudly rather than silently emit a wrong (mis-joining) key.
-    debug_assert!(target_width <= 16);
-
+    debug_assert_eq!(dst.len(), crate::wire_stride(target_tc));
     if src_tc == target_tc {
         encode_pk_column(src, src_tc, dst);
         return;
     }
+    // `dst` is already the target width (asserted above), so read it from there
+    // rather than re-deriving it through the `wire_stride` table — the identity
+    // arm above is the common per-row case and must not pay for the slow one.
+    // The fixed 16-byte `scratch` caps the in-scope target width; every promoted
+    // `T` is a PK-eligible ≤16-byte scalar (the decode trust boundary validates
+    // this), so this documents the contract a wider future type would have to
+    // grow. A violation is a planner/compiler bug, never input — so it must fail
+    // loudly rather than silently emit a wrong (mis-joining) key.
+    let target_width = dst.len();
+    debug_assert!((src.len()..=16).contains(&target_width));
 
     let mut scratch = [0u8; 16];
     widen_native_le(src, src_tc, &mut scratch[..target_width]);
@@ -169,12 +181,30 @@ pub fn encode_pk_column_promoted(src: &[u8], src_tc: u8, target_tc: u8, dst: &mu
 /// Schema-free OPK byte primitive (sibling of [`encode_pk_column`]). A stride
 /// `> 16` is a wide region and a caller bug. Opposite alignment from a left-
 /// aligned sort-key packer; never conflate the two.
+///
+/// Specialized on the scalar widths, like the left-aligned sort-key packer it
+/// mirrors: the general arm's `copy_from_slice` has a runtime length, so it
+/// lowers to a zeroed 16-byte stack buffer plus a `memcpy` call, while a whole-
+/// width arm is one load and one `bswap`. This is the bottom of every PK→u128
+/// conversion — partition routing, XOR8 probes, the merge path — so the four
+/// arms buy ~2.5× there. A compound PK region of an unlisted total width
+/// (e.g. `(U32, U64)` = 12) falls to the general arm, which is why it stays.
+/// `widen_pk_be_matches_the_general_form` pins every stride against it.
 #[inline(always)]
 pub fn widen_pk_be(pk_bytes: &[u8], stride: usize) -> u128 {
     debug_assert!(stride <= 16, "widen_pk_be: wide PK region (stride {stride})");
-    let mut buf = [0u8; 16];
-    buf[16 - stride..].copy_from_slice(&pk_bytes[..stride]);
-    u128::from_be_bytes(buf)
+    match stride {
+        16 => u128::from_be_bytes(pk_bytes[..16].try_into().unwrap()),
+        8 => u64::from_be_bytes(pk_bytes[..8].try_into().unwrap()) as u128,
+        4 => u32::from_be_bytes(pk_bytes[..4].try_into().unwrap()) as u128,
+        2 => u16::from_be_bytes(pk_bytes[..2].try_into().unwrap()) as u128,
+        1 => pk_bytes[0] as u128,
+        _ => {
+            let mut buf = [0u8; 16];
+            buf[16 - stride..].copy_from_slice(&pk_bytes[..stride]);
+            u128::from_be_bytes(buf)
+        }
+    }
 }
 
 /// Decode one OPK PK column straight to `i64` — the exact inverse of
@@ -260,18 +290,21 @@ pub fn promote_opk_column(src_opk: &[u8], src_tc: u8, target_tc: u8, dst: &mut [
 // pair agrees by construction, which is what lets a value route and probe the
 // same whether it is a PK column or a payload FK.
 
+/// The addressed column's bytes — `col_size` bytes at `offset` — for the four
+/// key readers below. One bounds contract and one message for all four, instead
+/// of the same `debug_assert!` re-worded per function.
+#[inline(always)]
+fn cell(data: &[u8], offset: usize, col_size: usize) -> &[u8] {
+    debug_assert!(data.len() >= offset + col_size, "key column runs past its region");
+    &data[offset..offset + col_size]
+}
+
 /// ROUTING key for one PK column's OPK bytes (canonical / sign-flipped).
 /// `col_size` is the addressed column's width (≤ 16); `offset` its byte offset
 /// within the PK region (0 for a lone PK).
 #[inline]
 pub fn pk_route_key(pk_bytes: &[u8], offset: usize, col_size: usize) -> u128 {
-    debug_assert!(
-        pk_bytes.len() >= offset + col_size,
-        "pk_route_key: buffer too short ({} < {})",
-        pk_bytes.len(),
-        offset + col_size,
-    );
-    widen_pk_be(&pk_bytes[offset..offset + col_size], col_size)
+    widen_pk_be(cell(pk_bytes, offset, col_size), col_size)
 }
 
 /// ROUTING key for one native little-endian payload column (canonical). Integer
@@ -281,13 +314,7 @@ pub fn pk_route_key(pk_bytes: &[u8], offset: usize, col_size: usize) -> u128 {
 /// counterpart; they keep a zero-extended low-8-byte key.
 #[inline]
 pub fn payload_route_key(col_data: &[u8], offset: usize, col_size: usize, type_code_val: u8) -> u128 {
-    debug_assert!(
-        col_data.len() >= offset + col_size,
-        "payload_route_key: buffer too short ({} < {})",
-        col_data.len(),
-        offset + col_size,
-    );
-    let src = &col_data[offset..offset + col_size];
+    let src = cell(col_data, offset, col_size);
     match crate::TypeCode::from_validated_u8(type_code_val) {
         crate::TypeCode::U128 | crate::TypeCode::UUID => u128::from_le_bytes(src.try_into().unwrap()),
         crate::TypeCode::U8
@@ -299,9 +326,12 @@ pub fn payload_route_key(col_data: &[u8], offset: usize, col_size: usize, type_c
         | crate::TypeCode::U64
         | crate::TypeCode::I64
         | crate::TypeCode::I128 => {
+            // Encode straight into the right-aligned (zero-extended) slot the
+            // widened key wants, rather than encoding left-aligned and copying
+            // the result into a second buffer to widen it.
             let mut opk = [0u8; 16];
-            encode_pk_column(src, type_code_val, &mut opk[..col_size]);
-            widen_pk_be(&opk[..col_size], col_size)
+            encode_pk_column(src, type_code_val, &mut opk[16 - col_size..]);
+            u128::from_be_bytes(opk)
         }
         crate::TypeCode::F32 | crate::TypeCode::F64 | crate::TypeCode::String | crate::TypeCode::Blob => {
             crate::read_unsigned(src, col_size.min(8)) as u128
@@ -316,14 +346,8 @@ pub fn payload_route_key(col_data: &[u8], offset: usize, col_size: usize, type_c
 /// mismatched `col_size` slices past the column and panics.
 #[inline]
 pub fn pk_native_key(pk_bytes: &[u8], offset: usize, col_size: usize, type_code_val: u8) -> u128 {
-    debug_assert!(
-        pk_bytes.len() >= offset + col_size,
-        "pk_native_key: buffer too short ({} < {})",
-        pk_bytes.len(),
-        offset + col_size,
-    );
     let mut le = [0u8; 16];
-    decode_pk_column(&pk_bytes[offset..offset + col_size], type_code_val, &mut le[..col_size]);
+    decode_pk_column(cell(pk_bytes, offset, col_size), type_code_val, &mut le[..col_size]);
     u128::from_le_bytes(le)
 }
 
@@ -332,17 +356,12 @@ pub fn pk_native_key(pk_bytes: &[u8], offset: usize, col_size: usize, type_code_
 /// low ≤8 bytes. Float/String/Blob keep the same zero-extended low-8-byte key.
 #[inline]
 pub fn payload_native_key(col_data: &[u8], offset: usize, col_size: usize, type_code_val: u8) -> u128 {
-    debug_assert!(
-        col_data.len() >= offset + col_size,
-        "payload_native_key: buffer too short ({} < {})",
-        col_data.len(),
-        offset + col_size,
-    );
+    let src = cell(col_data, offset, col_size);
     match crate::TypeCode::from_validated_u8(type_code_val) {
         crate::TypeCode::U128 | crate::TypeCode::UUID | crate::TypeCode::I128 => {
-            u128::from_le_bytes(col_data[offset..offset + 16].try_into().unwrap())
+            u128::from_le_bytes(src.try_into().unwrap())
         }
-        _ => crate::read_unsigned(&col_data[offset..], col_size.min(8)) as u128,
+        _ => crate::read_unsigned(src, col_size.min(8)) as u128,
     }
 }
 
@@ -409,6 +428,28 @@ mod tests {
                 assert_eq!(got[..sz], want[..sz], "tc={t} v={v}");
                 assert_eq!(got[..sz], opk[..sz], "identity must be the verbatim OPK bytes");
             }
+        }
+    }
+
+    /// The width-specialized arms must agree with the general right-align form
+    /// at every stride a PK region can have — including the compound widths
+    /// (3, 5, 12, …) that only the general arm serves.
+    #[test]
+    fn widen_pk_be_matches_the_general_form() {
+        let bytes: [u8; 16] = core::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(1));
+        for stride in 1..=16usize {
+            let mut buf = [0u8; 16];
+            buf[16 - stride..].copy_from_slice(&bytes[..stride]);
+            assert_eq!(
+                widen_pk_be(&bytes, stride),
+                u128::from_be_bytes(buf),
+                "stride {stride} diverges from the general form"
+            );
+        }
+        // All-zero and all-ones edges at the specialized widths.
+        for stride in [1usize, 2, 4, 8, 16] {
+            assert_eq!(widen_pk_be(&[0u8; 16], stride), 0);
+            assert_eq!(widen_pk_be(&[0xFFu8; 16], stride), u128::MAX >> (128 - stride * 8));
         }
     }
 

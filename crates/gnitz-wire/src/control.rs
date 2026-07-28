@@ -44,62 +44,33 @@ const CONTROL_COLS: &[WireSysCol] = &[
 
 const NUM_COLUMNS: usize = CONTROL_COLS.len();
 
-const fn col_index(name: &str) -> usize {
-    crate::col_index_in(CONTROL_COLS, name)
-}
-
-const COL_MSG_IDX: usize = col_index("msg_idx");
-const COL_STATUS: usize = col_index("status");
-const COL_CLIENT_ID: usize = col_index("client_id");
-const COL_TARGET_ID: usize = col_index("target_id");
-const COL_FLAGS: usize = col_index("flags");
-const COL_SEEK_PK: usize = col_index("seek_pk");
-const COL_SEEK_COL_IDX: usize = col_index("seek_col_idx");
-const COL_REQUEST_ID: usize = col_index("request_id");
-const COL_ERROR_MSG: usize = col_index("error_msg");
-const COL_SEEK_PK_EXTRA: usize = col_index("seek_pk_extra");
-
-const fn payload_index(col_idx: usize) -> usize {
-    assert!(col_idx != COL_MSG_IDX, "PK column has no payload index");
-    // COL_MSG_IDX == 0 (first column), so all non-PK indices are > 0
-    col_idx - 1
-}
-
-const PAYLOAD_STATUS: usize = payload_index(COL_STATUS);
-const PAYLOAD_CLIENT_ID: usize = payload_index(COL_CLIENT_ID);
-const PAYLOAD_TARGET_ID: usize = payload_index(COL_TARGET_ID);
-const PAYLOAD_FLAGS: usize = payload_index(COL_FLAGS);
-const PAYLOAD_SEEK_PK: usize = payload_index(COL_SEEK_PK);
-const PAYLOAD_SEEK_COL_IDX: usize = payload_index(COL_SEEK_COL_IDX);
-const PAYLOAD_REQUEST_ID: usize = payload_index(COL_REQUEST_ID);
-const PAYLOAD_ERROR_MSG: usize = payload_index(COL_ERROR_MSG);
-const PAYLOAD_SEEK_PK_EXTRA: usize = payload_index(COL_SEEK_PK_EXTRA);
-
-/// Null-bit position for `error_msg` in the row null bitmap.
-/// Equals the payload index of the column.
-const NULL_BIT_ERROR_MSG: u64 = 1u64 << PAYLOAD_ERROR_MSG;
-
-/// Null-bit position for `seek_pk_extra` in the row null bitmap.
-/// Equals the payload index of the column.
-const NULL_BIT_SEEK_PK_EXTRA: u64 = 1u64 << PAYLOAD_SEEK_PK_EXTRA;
-
 /// WAL region count for a CONTROL_SCHEMA block: the fixed regions (pk, weight,
 /// null_bmp) + (NUM_COLUMNS - 1) payload columns + 1 blob region.
 const NUM_REGIONS: usize = NUM_FIXED_REGIONS + (NUM_COLUMNS - 1) + 1;
 
-// Payload region indices: the fixed regions, then payload columns in schema
-// order, then blob last. The fixed indices themselves (`REG_PK`/`REG_WEIGHT`/
-// `REG_NULL_BMP`) come straight from `wal`.
-const REG_STATUS: usize = REG_PAYLOAD_START + PAYLOAD_STATUS;
-const REG_CLIENT_ID: usize = REG_PAYLOAD_START + PAYLOAD_CLIENT_ID;
-const REG_TARGET_ID: usize = REG_PAYLOAD_START + PAYLOAD_TARGET_ID;
-const REG_FLAGS: usize = REG_PAYLOAD_START + PAYLOAD_FLAGS;
-const REG_SEEK_PK: usize = REG_PAYLOAD_START + PAYLOAD_SEEK_PK;
-const REG_SEEK_COL_IDX: usize = REG_PAYLOAD_START + PAYLOAD_SEEK_COL_IDX;
-const REG_REQUEST_ID: usize = REG_PAYLOAD_START + PAYLOAD_REQUEST_ID;
-const REG_ERROR_MSG: usize = REG_PAYLOAD_START + PAYLOAD_ERROR_MSG;
-const REG_SEEK_PK_EXTRA: usize = REG_PAYLOAD_START + PAYLOAD_SEEK_PK_EXTRA;
+/// Region index of the payload column named `name`: the fixed regions, then the
+/// payload columns in schema order (`pay_index_in`, valid here because the PK is
+/// the single leading column), then the blob region last. The fixed indices
+/// themselves (`REG_PK` / `REG_WEIGHT` / `REG_NULL_BMP`) come straight from
+/// `wal`. A column's null bit is its payload index, i.e. `reg - REG_PAYLOAD_START`.
+const fn reg(name: &str) -> usize {
+    REG_PAYLOAD_START + crate::pay_index_in(CONTROL_COLS, name)
+}
+
+const REG_STATUS: usize = reg("status");
+const REG_CLIENT_ID: usize = reg("client_id");
+const REG_TARGET_ID: usize = reg("target_id");
+const REG_FLAGS: usize = reg("flags");
+const REG_SEEK_PK: usize = reg("seek_pk");
+const REG_SEEK_COL_IDX: usize = reg("seek_col_idx");
+const REG_REQUEST_ID: usize = reg("request_id");
+const REG_ERROR_MSG: usize = reg("error_msg");
+const REG_SEEK_PK_EXTRA: usize = reg("seek_pk_extra");
 const REG_BLOB: usize = NUM_REGIONS - 1;
+
+/// Null-bit positions of the two nullable columns in the row null bitmap.
+const NULL_BIT_ERROR_MSG: u64 = 1u64 << (REG_ERROR_MSG - REG_PAYLOAD_START);
+const NULL_BIT_SEEK_PK_EXTRA: u64 = 1u64 << (REG_SEEK_PK_EXTRA - REG_PAYLOAD_START);
 
 // ---------------------------------------------------------------------------
 // Control-block codec — the one encoder/decoder both ends run.
@@ -115,7 +86,8 @@ const REG_BLOB: usize = NUM_REGIONS - 1;
 /// Byte size of region `r` for a 1-row control block (blob counted as empty).
 const fn ctrl_region_size(r: usize) -> usize {
     match r {
-        REG_PK => CONTROL_COLS[COL_MSG_IDX].type_code.wire_stride(),
+        // The PK is column 0 (`msg_idx`) — the same fact `reg` above rests on.
+        REG_PK => CONTROL_COLS[0].type_code.wire_stride(),
         REG_WEIGHT | REG_NULL_BMP => 8,
         REG_BLOB => 0, // no-blob image
         // Payload region: payload index `r - REG_PAYLOAD_START` → that + 1 as a
@@ -179,19 +151,12 @@ pub const fn ctrl_block_size(error_msg_len: usize, seek_pk_extra_len: usize) -> 
     CTRL_BLOCK_SIZE_NO_BLOB + german_spill_len(error_msg_len) + german_spill_len(seek_pk_extra_len)
 }
 
-const fn template_write_u32(buf: &mut [u8; CTRL_BLOCK_SIZE_NO_BLOB], off: usize, v: u32) {
-    let b = v.to_le_bytes();
+/// `copy_from_slice` is not `const`, so the template below writes its
+/// little-endian fields a byte at a time. Generic over the field width, since
+/// that is the only thing the u32 and u64 forms differed in.
+const fn template_write<const N: usize>(buf: &mut [u8; CTRL_BLOCK_SIZE_NO_BLOB], off: usize, b: [u8; N]) {
     let mut i = 0;
-    while i < 4 {
-        buf[off + i] = b[i];
-        i += 1;
-    }
-}
-
-const fn template_write_u64(buf: &mut [u8; CTRL_BLOCK_SIZE_NO_BLOB], off: usize, v: u64) {
-    let b = v.to_le_bytes();
-    let mut i = 0;
-    while i < 8 {
+    while i < N {
         buf[off + i] = b[i];
         i += 1;
     }
@@ -203,19 +168,24 @@ const fn template_write_u64(buf: &mut [u8; CTRL_BLOCK_SIZE_NO_BLOB], off: usize,
 /// callers that checksum their frames stamp it after encoding.
 const CTRL_BLOCK_TEMPLATE: [u8; CTRL_BLOCK_SIZE_NO_BLOB] = {
     let mut buf = [0u8; CTRL_BLOCK_SIZE_NO_BLOB];
-    template_write_u32(&mut buf, WAL_OFF_TID, IPC_CONTROL_TID);
-    template_write_u32(&mut buf, WAL_OFF_COUNT, 1);
-    template_write_u32(&mut buf, WAL_OFF_SIZE, CTRL_BLOCK_SIZE_NO_BLOB as u32);
-    template_write_u32(&mut buf, WAL_OFF_VERSION, WAL_FORMAT_VERSION);
-    template_write_u32(&mut buf, WAL_OFF_NUM_REGIONS, NUM_REGIONS as u32);
+    template_write(&mut buf, WAL_OFF_TID, IPC_CONTROL_TID.to_le_bytes());
+    template_write(&mut buf, WAL_OFF_COUNT, 1u32.to_le_bytes());
+    template_write(&mut buf, WAL_OFF_SIZE, (CTRL_BLOCK_SIZE_NO_BLOB as u32).to_le_bytes());
+    template_write(&mut buf, WAL_OFF_VERSION, WAL_FORMAT_VERSION.to_le_bytes());
+    template_write(&mut buf, WAL_OFF_NUM_REGIONS, (NUM_REGIONS as u32).to_le_bytes());
     let mut r = 0;
     while r < NUM_REGIONS {
-        template_write_u32(&mut buf, WAL_HEADER_SIZE + r * 8, ctrl_region_offset(r) as u32);
-        template_write_u32(&mut buf, WAL_HEADER_SIZE + r * 8 + 4, ctrl_region_size(r) as u32);
+        let dir = WAL_HEADER_SIZE + r * 8;
+        template_write(&mut buf, dir, (ctrl_region_offset(r) as u32).to_le_bytes());
+        template_write(&mut buf, dir + 4, (ctrl_region_size(r) as u32).to_le_bytes());
         r += 1;
     }
-    template_write_u64(&mut buf, OFF_WEIGHT, 1); // weight = +1
-    template_write_u64(&mut buf, OFF_NULL_BMP, NULL_BIT_ERROR_MSG | NULL_BIT_SEEK_PK_EXTRA);
+    template_write(&mut buf, OFF_WEIGHT, 1u64.to_le_bytes()); // weight = +1
+    template_write(
+        &mut buf,
+        OFF_NULL_BMP,
+        (NULL_BIT_ERROR_MSG | NULL_BIT_SEEK_PK_EXTRA).to_le_bytes(),
+    );
     buf
 };
 
@@ -274,10 +244,9 @@ pub fn encode_ctrl_block(
         buf[OFF_SEEK_PK_EXTRA..OFF_SEEK_PK_EXTRA + 16].copy_from_slice(&st);
     }
     buf[OFF_NULL_BMP..OFF_NULL_BMP + 8].copy_from_slice(&null_word.to_le_bytes());
-    let blob_dir = WAL_HEADER_SIZE + REG_BLOB * 8;
-    buf[blob_dir + 4..blob_dir + 8].copy_from_slice(&(blob.len() as u32).to_le_bytes());
+    crate::write_u32_le(buf, WAL_HEADER_SIZE + REG_BLOB * 8 + 4, blob.len() as u32);
     buf[CTRL_BLOCK_SIZE_NO_BLOB..CTRL_BLOCK_SIZE_NO_BLOB + blob.len()].copy_from_slice(&blob);
-    buf[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].copy_from_slice(&(total as u32).to_le_bytes());
+    crate::write_u32_le(buf, WAL_OFF_SIZE, total as u32);
     total
 }
 

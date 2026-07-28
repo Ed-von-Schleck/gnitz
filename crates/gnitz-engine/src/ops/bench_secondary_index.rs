@@ -23,9 +23,10 @@ use std::time::{Duration, Instant};
 
 use super::index::{make_avi_schema, op_integrate_with_indexes, AviBake, AviDesc};
 use super::util::{encode_ordered, GroupKeyExtractor, AVI_AV_BYTES};
-use super::{AggDescriptor, AggOp};
+use super::AggDescriptor;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
 use crate::storage::{Batch, RecoverySource, Table};
+use gnitz_wire::AggFunc;
 
 const N_ROWS: usize = 500_000;
 const N_GROUPS: u64 = 10_000;
@@ -209,7 +210,7 @@ fn secondary_index_bench_avi_decomposition() {
             &group_by_cols,
             &[AggDescriptor {
                 col_idx: 2,
-                agg_op: AggOp::Min,
+                agg_op: AggFunc::Min,
                 col_type_code: TypeCode::I64,
             }],
         );

@@ -2,95 +2,31 @@
 
 use crate::schema::{ColumnLocator, TypeCode};
 use crate::storage::{MemBatch, ReadCursor};
-use gnitz_wire::FixedInt;
+use gnitz_wire::{AggFunc, FixedInt};
 
 // ---------------------------------------------------------------------------
 // Aggregate opcodes
 // ---------------------------------------------------------------------------
 
-/// Aggregate function selector.
-///
-/// A typed enum so the compiler enforces exhaustive matching instead of the
-/// previous bare `u8` with private named constants.
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum AggOp {
-    Count = 1,
-    Sum = 2,
-    Min = 3,
-    Max = 4,
-    CountNonNull = 5,
-    /// `Sum`'s fold with `Count`'s `0` identity: sums values like `Sum` but
-    /// grounds/renders an untouched accumulator to `0` instead of NULL. The
-    /// two-phase global-aggregate combine sums per-worker partial count columns
-    /// with this (a COUNT's empty value is `0`, not NULL).
-    SumZero = 6,
-}
-
-impl From<gnitz_wire::AggFunc> for AggOp {
-    fn from(f: gnitz_wire::AggFunc) -> Self {
-        match f {
-            gnitz_wire::AggFunc::Count => AggOp::Count,
-            gnitz_wire::AggFunc::Sum => AggOp::Sum,
-            gnitz_wire::AggFunc::Min => AggOp::Min,
-            gnitz_wire::AggFunc::Max => AggOp::Max,
-            gnitz_wire::AggFunc::CountNonNull => AggOp::CountNonNull,
-            gnitz_wire::AggFunc::SumZero => AggOp::SumZero,
-        }
-    }
-}
-
-impl From<AggOp> for gnitz_wire::AggFunc {
-    fn from(o: AggOp) -> Self {
-        match o {
-            AggOp::Count => gnitz_wire::AggFunc::Count,
-            AggOp::Sum => gnitz_wire::AggFunc::Sum,
-            AggOp::Min => gnitz_wire::AggFunc::Min,
-            AggOp::Max => gnitz_wire::AggFunc::Max,
-            AggOp::CountNonNull => gnitz_wire::AggFunc::CountNonNull,
-            AggOp::SumZero => gnitz_wire::AggFunc::SumZero,
-        }
-    }
-}
-
-impl AggOp {
-    pub fn is_linear(self) -> bool {
-        matches!(self, AggOp::Count | AggOp::Sum | AggOp::CountNonNull | AggOp::SumZero)
-    }
-
-    /// See [`gnitz_wire::AggFunc::empty_renders_zero`] — the shared rule.
-    pub fn empty_renders_zero(self) -> bool {
-        gnitz_wire::AggFunc::from(self).empty_renders_zero()
-    }
-
-    /// See [`gnitz_wire::AggFunc::raw_output_nullable`] — the shared rule, whose
-    /// engine consumer is `build_reduce_output_schema`. `ungrouped` is
-    /// `group_cols.is_empty()`, not `global_ground`: the two extra shapes an empty
-    /// group set covers — the range-join threshold reduce and the two-phase
-    /// phase-1 local partial — emit at most one row per worker, so the
-    /// `FixedIntNonnull` comparator class forfeited there is worth nothing, and
-    /// the schema stays a pure function of the schema-level facts.
-    pub fn raw_output_nullable(self, src_nullable: bool, ungrouped: bool) -> bool {
-        gnitz_wire::AggFunc::from(self).raw_output_nullable(src_nullable, ungrouped)
-    }
-
-    /// True iff this aggregate is maintained through the combined AggValueIndex —
-    /// the order-encodable extremes MIN/MAX. This is the single source of truth
-    /// for "which aggregates the value index serves, and in what ordinal order":
-    /// the index write side (`op_integrate_with_indexes`) and the reduce read
-    /// side (`op_reduce`) both select and order their entries by this predicate
-    /// over `agg_descs`, so the two agree by construction.
-    pub fn uses_value_index(self) -> bool {
-        matches!(self, AggOp::Min | AggOp::Max)
-    }
-}
+// The engine has no aggregate the wire format cannot name, so it keeps no
+// parallel enum: `gnitz_wire::AggFunc` carries the discriminants, the decode
+// ladder, and every classification predicate (`is_linear`, `uses_value_index`,
+// `empty_renders_zero`, `raw_output_nullable`, `merge_func`), and the reduce
+// operator reads them directly.
+//
+// `raw_output_nullable`'s `ungrouped` argument is `group_cols.is_empty()`, not
+// `global_ground`: the two extra shapes an empty group set covers — the
+// range-join threshold reduce and the two-phase phase-1 local partial — emit at
+// most one row per worker, so the `FixedIntNonnull` comparator class forfeited
+// there is worth nothing, and the schema stays a pure function of the
+// schema-level facts.
 
 /// Descriptor for one aggregate function. Plain data — never transmuted or
 /// serialized (the wire ships `(AggFunc, u16)` specs; consumers are field reads).
 #[derive(Clone, Copy)]
 pub struct AggDescriptor {
     pub col_idx: u32,
-    pub agg_op: AggOp,
+    pub agg_op: AggFunc,
     pub col_type_code: TypeCode,
 }
 
@@ -99,7 +35,7 @@ pub struct AggDescriptor {
 /// beyond the row itself is resolved in `new`.
 pub(super) struct Accumulator {
     acc: i64,
-    agg_op: AggOp,
+    agg_op: AggFunc,
     /// Where the aggregated column's value lives in a row (PK byte offset or
     /// dense payload slot). Resolved once; the per-row value read goes through it.
     loc: ColumnLocator,
@@ -115,10 +51,10 @@ pub(super) struct Accumulator {
 /// re-deriving the answer from `agg_op` and `tc`.
 ///
 /// This matters beyond tidiness: at `opt-level=0` a derived `PartialEq` on
-/// `AggOp` is a real **call**, so the pre-resolved form removes two out-of-line
+/// `AggFunc` is a real **call**, so the pre-resolved form removes two out-of-line
 /// comparisons per row per aggregate from the debug binary the E2E suite runs.
 /// Resolving it in `new` also makes the construction one exhaustive `match` over
-/// `AggOp` — a new opcode cannot reach the row path unclassified — and moves
+/// `AggFunc` — a new opcode cannot reach the row path unclassified — and moves
 /// SUM's non-numeric rejection from a per-row unwrap to a once-per-epoch one.
 #[derive(Clone, Copy)]
 enum StepKind {
@@ -169,20 +105,20 @@ impl Accumulator {
     /// per-row body dispatches on neither `agg_op` nor `TypeCode`.
     pub(super) fn new(desc: &AggDescriptor, loc: ColumnLocator) -> Self {
         let tc = TypeCode::from_validated_u8(loc.type_code());
-        // Exhaustive over `AggOp`: a new opcode cannot reach the row path
+        // Exhaustive over `AggFunc`: a new opcode cannot reach the row path
         // unclassified. Only SUM reads the value's type, and only SUM can fail
         // to classify — the planner (`compiler::emit_reduce`) rejects a
         // non-numeric SUM source, so this is an internal-bug assert, now paid
         // once per epoch rather than per row.
         let kind = match desc.agg_op {
-            AggOp::Count => StepKind::Count,
-            AggOp::CountNonNull => StepKind::CountNonNull,
-            AggOp::Sum | AggOp::SumZero => StepKind::Sum(
+            AggFunc::Count => StepKind::Count,
+            AggFunc::CountNonNull => StepKind::CountNonNull,
+            AggFunc::Sum | AggFunc::SumZero => StepKind::Sum(
                 SumWiden::for_type(tc)
                     .unwrap_or_else(|| unreachable!("SUM over non-numeric type {tc:?} (planner-rejected)")),
             ),
-            AggOp::Min => StepKind::Extreme { max: false },
-            AggOp::Max => StepKind::Extreme { max: true },
+            AggFunc::Min => StepKind::Extreme { max: false },
+            AggFunc::Max => StepKind::Extreme { max: true },
         };
         Accumulator {
             acc: 0,
@@ -203,7 +139,7 @@ impl Accumulator {
         self.agg_op.is_linear()
     }
 
-    /// Delegates to [`AggOp::empty_renders_zero`] (the agg-op rationale lives
+    /// Delegates to [`AggFunc::empty_renders_zero`] (the agg-op rationale lives
     /// there); `emit_agg_col` reads it to render an untouched accumulator as `0`
     /// rather than NULL without a per-op switch.
     pub(super) fn empty_renders_zero(&self) -> bool {
@@ -270,7 +206,7 @@ impl Accumulator {
     /// Step: incorporate one input row into the accumulator.
     ///
     /// Runs once per input row per aggregate, so it dispatches on the
-    /// pre-resolved [`StepKind`] — no `AggOp` compare, no `TypeCode` match.
+    /// pre-resolved [`StepKind`] — no `AggFunc` compare, no `TypeCode` match.
     #[inline]
     pub(super) fn step_from_batch(&mut self, mb: &MemBatch, row: usize, weight: i64) {
         // COUNT is value-independent: count the row and return before any column
@@ -384,11 +320,11 @@ impl Accumulator {
     /// load-bearing — it cannot collapse to a single `is_float` branch.
     pub(super) fn merge_accumulated(&mut self, value_bits: u64) {
         match self.agg_op {
-            AggOp::Count | AggOp::CountNonNull => {
+            AggFunc::Count | AggFunc::CountNonNull => {
                 self.acc = self.acc.wrapping_add(value_bits as i64);
                 self.has_value = true;
             }
-            AggOp::Sum | AggOp::SumZero => {
+            AggFunc::Sum | AggFunc::SumZero => {
                 if self.is_float() {
                     let cur_f = f64::from_bits(self.acc as u64);
                     self.acc = f64::to_bits(cur_f + f64::from_bits(value_bits)) as i64;
@@ -397,7 +333,7 @@ impl Accumulator {
                 }
                 self.has_value = true;
             }
-            AggOp::Min | AggOp::Max => {
+            AggFunc::Min | AggFunc::Max => {
                 unreachable!("fold_old_aggs folds only linear aggregates")
             }
         }
@@ -555,7 +491,7 @@ mod tests {
         b
     }
 
-    fn f64_acc(agg_op: AggOp) -> Accumulator {
+    fn f64_acc(agg_op: AggFunc) -> Accumulator {
         let schema = SchemaDescriptor::new(
             &[
                 SchemaColumn::new(type_code::U64, 0),
@@ -577,7 +513,7 @@ mod tests {
     fn min_nan_first_does_not_poison() {
         let nan = f64_batch(f64::NAN);
         let finite = f64_batch(5.0);
-        let mut acc = f64_acc(AggOp::Min);
+        let mut acc = f64_acc(AggFunc::Min);
         acc.step_from_batch(&nan.as_mem_batch(), 0, 1);
         acc.step_from_batch(&finite.as_mem_batch(), 0, 1);
         let got = f64::from_bits(acc.get_value_bits());
@@ -591,7 +527,7 @@ mod tests {
     fn max_uses_total_order_for_nan() {
         let finite = f64_batch(5.0);
         let nan = f64_batch(f64::NAN);
-        let mut acc = f64_acc(AggOp::Max);
+        let mut acc = f64_acc(AggFunc::Max);
         acc.step_from_batch(&finite.as_mem_batch(), 0, 1);
         acc.step_from_batch(&nan.as_mem_batch(), 0, 1);
         let got = f64::from_bits(acc.get_value_bits());

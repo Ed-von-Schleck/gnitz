@@ -91,13 +91,6 @@ impl Circuit {
                 value2: v2,
             });
         }
-        // Sort each group by (kind, position) so the typed payloads come out
-        // in the order callers wrote them — the load path relies on this for
-        // group_cols / shard_cols / proj_cols / agg_specs / null_extend / reindex_cols.
-        for v in per_node.values_mut() {
-            v.sort_by_key(|c| (c.kind, c.position));
-        }
-
         let mut nodes = BTreeMap::new();
         for (nid, opcode, src_tab, expr_blob) in rows.nodes {
             let cols: Vec<gnitz_wire::CircuitNodeColumn> = per_node.remove(&nid).unwrap_or_default();

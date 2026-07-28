@@ -12,7 +12,7 @@ mod sort;
 mod tests;
 
 pub(crate) use adhoc_fold::AdhocFold;
-pub use agg::{AggDescriptor, AggOp};
+pub use agg::AggDescriptor;
 pub use op_reduce::op_reduce;
 pub(crate) use plan::build_reduce_output_schema;
 pub use plan::ReducePlan;

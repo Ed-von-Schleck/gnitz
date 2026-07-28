@@ -5,10 +5,11 @@ use crate::schema::key::NarrowPkOpk;
 use crate::storage::{scatter_copy, Batch, DrainGuard, MemBatch, ReadCursor};
 
 use super::super::util::{extract_group_key, global_group_key};
-use super::agg::{apply_agg_from_value_index, fold_old_aggs, read_old_minmax_encoded, Accumulator, AggOp};
+use super::agg::{apply_agg_from_value_index, fold_old_aggs, read_old_minmax_encoded, Accumulator};
 use super::emit::{emit_global_ground, emit_reduce_row};
 use super::plan::ReducePlan;
 use super::sort::{argsort_delta, argsort_pk_canonical, compare_by_group_cols};
+use gnitz_wire::AggFunc;
 
 /// Upper bound on the per-group delta rows the AVI probe-skip path pre-steps into
 /// a MIN/MAX accumulator. Pre-stepping is O(positive delta rows); the probe it
@@ -404,7 +405,7 @@ pub fn op_reduce(
     };
 
     // A group exists iff its net cardinality (row weight) is positive; the unique
-    // AggOp::Count accumulator carries that signal (baked by `ReducePlan::new`,
+    // AggFunc::Count accumulator carries that signal (baked by `ReducePlan::new`,
     // where the planner's companion-COUNT promise is local; `None` degrades a
     // genuinely count-less reduce to the touched-ness test below).
     let cardinality_idx: Option<usize> = plan.cardinality_idx.map(|i| i as usize);
@@ -581,7 +582,7 @@ pub fn op_reduce(
                     // of truth) — byte-for-byte the old behavior.
                     if saw_negative || d.col_type_code.is_float() || capped || !has_old {
                         gk[gstride] = j as u8;
-                        apply_agg_from_value_index(avi_c, &gk[..gstride + 1], d.agg_op == AggOp::Max, &mut accs[k]);
+                        apply_agg_from_value_index(avi_c, &gk[..gstride + 1], d.agg_op == AggFunc::Max, &mut accs[k]);
                     } else if let Some(enc) = read_old_minmax_encoded(
                         // `accs[k]` holds `pos` (or is untouched → NULL); fold in
                         // `old`, read off the trace_out cursor already positioned by

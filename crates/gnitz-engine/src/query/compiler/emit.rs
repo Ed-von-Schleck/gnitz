@@ -746,7 +746,7 @@ pub(super) fn emit_reduce(
         .iter()
         .map(|&(func, col_idx)| AggDescriptor {
             col_idx: col_idx as u32,
-            agg_op: AggOp::from(func),
+            agg_op: func,
             col_type_code: TypeCode::from_validated_u8(in_reg_schema.columns[col_idx as usize].type_code),
         })
         .collect();
@@ -761,7 +761,7 @@ pub(super) fn emit_reduce(
     // bypasses it: a failure fails the compile (so the view compiles to nothing)
     // rather than panicking a worker at execution.
     if agg_descs.iter().any(|ad| {
-        matches!(ad.agg_op, AggOp::Sum | AggOp::SumZero | AggOp::Min | AggOp::Max)
+        matches!(ad.agg_op, AggFunc::Sum | AggFunc::SumZero | AggFunc::Min | AggFunc::Max)
             && !agg_value_idx_eligible(ad.col_type_code)
     }) {
         return Err(CompileError::Rejected(

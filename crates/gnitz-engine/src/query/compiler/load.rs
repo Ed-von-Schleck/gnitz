@@ -88,11 +88,6 @@ pub(crate) fn load_circuit(
             }),
         None => invalid = true,
     });
-    // Sort each node's cols by (kind, position) so decode_op_node sees ordered slices.
-    for v in cols_by_node.values_mut() {
-        v.sort_by_key(|c| (c.kind, c.position));
-    }
-
     // Phase 2: read CircuitNodes; call decode_op_node for each.
     nodes_cur.for_each_positive_with_prefix(&prefix, |ch| {
         let Some(node_id) = node_id_i32(ch.read_i64(NODES_COL_NODE_ID)) else {

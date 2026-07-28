@@ -122,6 +122,26 @@ impl AggFunc {
         self as u64
     }
 
+    /// True iff `Agg(A + B) == Agg(A) + Agg(B)` — the aggregate is linear, so a
+    /// delta's contribution folds into the running accumulator with no history
+    /// replay. MIN/MAX are not: retracting the current extremum needs the next
+    /// value out of the trace.
+    pub const fn is_linear(self) -> bool {
+        matches!(
+            self,
+            AggFunc::Count | AggFunc::Sum | AggFunc::CountNonNull | AggFunc::SumZero
+        )
+    }
+
+    /// True iff this aggregate is maintained through the combined AggValueIndex —
+    /// the order-encodable extremes MIN/MAX. The single source of truth for
+    /// "which aggregates the value index serves, and in what ordinal order": the
+    /// engine's index write side and reduce read side both select and order
+    /// their entries by this predicate, so the two agree by construction.
+    pub const fn uses_value_index(self) -> bool {
+        matches!(self, AggFunc::Min | AggFunc::Max)
+    }
+
     /// True iff an untouched accumulator renders a concrete `0` rather than
     /// NULL — the zero-identity family. COUNT / COUNT_NON_NULL count rows
     /// (empty = 0); SumZero is Sum's fold under Count's `0` identity (the
@@ -434,13 +454,25 @@ pub struct CircuitNodeColumn {
     pub value2: u64,
 }
 
+/// This node's rows of one `kind`, in `position` order.
+///
+/// Column order is semantic for every list kind (`group_cols`, `shard_cols`,
+/// `proj_cols`, `reindex_cols`, the NULL_EXTEND type codes, the SCAN_BOUND
+/// column list), and `position` is what carries it. Ordering here — rather than
+/// making pre-sorted input an unstated precondition — puts the invariant in the
+/// one function that depends on it, so no caller has to know it exists.
+fn rows_of(cols: &[CircuitNodeColumn], kind: u64) -> Vec<&CircuitNodeColumn> {
+    let mut rows: Vec<&CircuitNodeColumn> = cols.iter().filter(|c| c.kind == kind).collect();
+    rows.sort_by_key(|c| c.position);
+    rows
+}
+
 /// Collect one column kind's `(value1, value2)` rows into parallel
-/// (source column index, promoted target type code) vectors. Rows are
-/// position-ordered per kind, so filtering preserves column order. `value2 == 0`
-/// means "keep/derive from the source type"; a non-zero target must satisfy
-/// `valid` — this decode is the trust boundary where catalog bytes become a
-/// typed node, so a bogus target is rejected here rather than left to drive a
-/// wrong slot width downstream.
+/// (source column index, promoted target type code) vectors, in column order.
+/// `value2 == 0` means "keep/derive from the source type"; a non-zero target
+/// must satisfy `valid` — this decode is the trust boundary where catalog bytes
+/// become a typed node, so a bogus target is rejected here rather than left to
+/// drive a wrong slot width downstream.
 fn collect_cols_with_tcs(
     cols: &[CircuitNodeColumn],
     kind: u64,
@@ -449,7 +481,7 @@ fn collect_cols_with_tcs(
 ) -> Result<(Vec<u16>, Vec<u8>), String> {
     let mut out_cols: Vec<u16> = Vec::new();
     let mut out_tcs: Vec<u8> = Vec::new();
-    for c in cols.iter().filter(|c| c.kind == kind) {
+    for c in rows_of(cols, kind) {
         let tc = c.value2 as u8;
         if tc != 0 && !valid(tc) {
             return Err(err(tc));
@@ -534,10 +566,8 @@ pub fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
             global_ground,
             out_key,
         } => {
-            let mut kind_rows = Vec::with_capacity(group_cols.len() + 4);
-            for (i, c) in group_cols.iter().enumerate() {
-                kind_rows.push((NODE_COL_KIND_GROUP, i as u16, *c as u64, 0));
-            }
+            let mut kind_rows = encode_col_list(NODE_COL_KIND_GROUP, group_cols);
+            kind_rows.reserve(agg.len() + 2);
             for (i, (func, col)) in agg.into_iter().enumerate() {
                 kind_rows.push((NODE_COL_KIND_AGG_SPEC, i as u16, func.as_u64(), col as u64));
             }
@@ -585,19 +615,14 @@ pub fn decode_op_node(
     expr_blob: Option<Vec<u8>>,
     cols: &[CircuitNodeColumn],
 ) -> Result<OpNode, String> {
-    let collect_cols = |kind: u64| -> Vec<u16> {
-        cols.iter()
-            .filter(|c| c.kind == kind)
-            .map(|c| c.value1 as u16)
-            .collect()
-    };
+    let collect_cols = |kind: u64| -> Vec<u16> { rows_of(cols, kind).iter().map(|c| c.value1 as u16).collect() };
     // The null-fill type codes become schema columns verbatim, so this decode is
     // their trust boundary (see `is_valid_type_code` for why an unknown code is
     // not inert) — the same rule `collect_cols_with_tcs` applies to a carried
     // promotion target.
     let collect_typecodes = |kind: u64| -> Result<Vec<u8>, String> {
-        cols.iter()
-            .filter(|c| c.kind == kind)
+        rows_of(cols, kind)
+            .iter()
             .map(|c| {
                 let tc = c.value1 as u8;
                 match crate::is_valid_type_code(tc) {
@@ -608,8 +633,8 @@ pub fn decode_op_node(
             .collect()
     };
     let collect_aggs = || -> Result<Vec<(AggFunc, u16)>, String> {
-        cols.iter()
-            .filter(|c| c.kind == NODE_COL_KIND_AGG_SPEC)
+        rows_of(cols, NODE_COL_KIND_AGG_SPEC)
+            .iter()
             .map(|c| {
                 AggFunc::from_wire(c.value1)
                     .ok_or_else(|| format!("unknown agg func id {}", c.value1))
@@ -800,6 +825,36 @@ mod tests {
         ];
         let node = decode_op_node(OPCODE_MAP_EXPR, None, Some(vec![1, 2, 3]), &cols).unwrap();
         assert_eq!(reindex_of(node), (vec![3, 3], vec![0, crate::type_code::I64]));
+    }
+
+    /// Column order comes from `position`, not from the order the rows happen to
+    /// arrive in: a catalog cursor yields them in PK order, which is neither
+    /// kind- nor position-grouped. Shuffling the input must not change the
+    /// decoded list.
+    #[test]
+    fn decode_orders_lists_by_position_not_input_order() {
+        let col = |kind: u64, position: u16, value1: u64| CircuitNodeColumn {
+            kind,
+            position,
+            value1,
+            value2: 0,
+        };
+        // Two interleaved lists, each in reverse position order.
+        let shuffled = [
+            col(NODE_COL_KIND_GROUP, 2, 30),
+            col(NODE_COL_KIND_AGG_SPEC, 1, AGG_SUM),
+            col(NODE_COL_KIND_GROUP, 0, 10),
+            col(NODE_COL_KIND_AGG_SPEC, 0, AGG_COUNT),
+            col(NODE_COL_KIND_GROUP, 1, 20),
+        ];
+        let node = decode_op_node(OPCODE_REDUCE, None, None, &shuffled).unwrap();
+        match node {
+            OpNode::Reduce { group_cols, agg, .. } => {
+                assert_eq!(group_cols, vec![10, 20, 30]);
+                assert_eq!(agg, vec![(AggFunc::Count, 0), (AggFunc::Sum, 0)]);
+            }
+            other => panic!("expected Reduce, got {other:?}"),
+        }
     }
 
     /// A range-join node decodes its `(n_eq, rel)` from the NODE_COL_KIND_RANGE_JOIN
