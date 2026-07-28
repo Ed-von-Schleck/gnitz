@@ -48,9 +48,11 @@ fn confined_worker(disp_ptr: *mut MasterDispatcher, target_id: i64, seek_pk_extr
     match kind {
         RelationKind::BaseTable { .. } => {}
         RelationKind::View if !cat.dag.view_has_replicated_source(target_id) => {}
-        // A single-partition view store, or the system catalog — one unpartitioned
-        // table per worker, holding whatever landed there.
-        _ => return None,
+        // A single-partition view store — one unpartitioned table per worker,
+        // holding whatever landed there.
+        RelationKind::View => return None,
+        // Rejected at the verb: a catalog family is served master-locally.
+        RelationKind::SystemCatalog => return None,
     }
     let (spec, _block) = gnitz_wire::unpack_scan_spec_extra(seek_pk_extra).ok()?;
     let desc = gnitz_wire::peek_pk_range(spec)?;

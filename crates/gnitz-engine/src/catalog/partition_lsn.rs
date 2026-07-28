@@ -155,12 +155,14 @@ impl CatalogEngine {
     /// of gathering N identical copies. SEEK already unicasts to one worker, so it
     /// needs no equivalent check.
     pub fn relation_output_is_replicated(&mut self, id: i64) -> bool {
-        match self.dag.tables.get(&id) {
-            Some(e) if e.kind.is_base_table() => return e.schema.replicated(),
-            Some(_) => {} // view — fall through (releases the `tables` borrow)
-            None => return false,
+        // `.map` releases the `tables` borrow before the view arm re-borrows self.
+        match self.dag.tables.get(&id).map(|e| (e.kind, e.schema.replicated())) {
+            Some((RelationKind::BaseTable { .. }, replicated)) => replicated,
+            // Master-broadcast DDL sync gives every worker a full identical copy.
+            Some((RelationKind::SystemCatalog, _)) => true,
+            Some((RelationKind::View, _)) => self.dag.view_all_sources_replicated(id),
+            None => false,
         }
-        self.dag.view_all_sources_replicated(id)
     }
 
     /// Invalidate all cached plans.

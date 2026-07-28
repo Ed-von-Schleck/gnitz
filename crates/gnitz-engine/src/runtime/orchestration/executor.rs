@@ -29,6 +29,7 @@ use crate::catalog::{
     CatalogEngine, COL_TAB_ID, FIRST_USER_TABLE_ID, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS,
     IDX_TAB_ID, SEQ_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID,
 };
+use crate::query::RelationKind;
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingTxn};
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{
@@ -945,8 +946,10 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
     if flags & gnitz_wire::FLAG_ALLOCATE_SERIAL_RANGE != 0 {
         let seq_id = target_id; // = table_id
         let count = decoded.control.seek_col_idx.max(1) as i64;
-        let base = commit_serial_range_durable(shared, seq_id, count).await;
-        send_alloc(peer, base, client_id).await;
+        match commit_serial_range_durable(shared, seq_id, count).await {
+            Ok(base) => send_alloc(peer, base, client_id).await,
+            Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
+        }
         return;
     }
 
@@ -976,12 +979,13 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
         // push-apply time, so `read_lock` locks once and never drains. A view seek
         // drains inside it (BF-1), which is why the lock is taken there and not
         // at dispatch level.
-        if let Some(_g) = read_lock(shared, peer, client_id, target_id).await {
+        if let Some((_g, kind)) = read_lock(shared, peer, client_id, target_id).await {
             serve_seek(
                 shared,
                 peer,
                 client_id,
                 target_id,
+                kind,
                 decoded.control.seek_pk,
                 &decoded.control.seek_pk_extra,
                 client_version,
@@ -993,7 +997,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
     if flags & FLAG_SEEK_BY_INDEX != 0 {
         // Only a base table can own a secondary index, so in practice `read_lock`
         // never drains here — but it is the same call every other read verb makes.
-        let Some(_g) = read_lock(shared, peer, client_id, target_id).await else {
+        let Some((_g, kind)) = read_lock(shared, peer, client_id, target_id).await else {
             return;
         };
         handle_seek_by_index(
@@ -1001,6 +1005,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
             peer,
             client_id,
             target_id,
+            kind,
             decoded.control.seek_col_idx, // pack_pk_cols(col_indices)
             decoded.control.seek_pk,
             &decoded.control.seek_pk_extra,
@@ -1043,13 +1048,12 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
     // would be routed to handle_scan, whose streamed table dump desyncs push
     // reply readers (they read exactly one frame).
     if flags & gnitz_wire::FLAG_PUSH != 0 && (!has_batch || batch_count == 0) {
-        // Same existence + writability gate as the INSERT path below; system
-        // tids are fixed and always present, so only user tables are probed.
-        // An empty push commits nothing, but a view target is rejected here
-        // too so a client bug that happens to produce an empty batch (e.g.
-        // `delete` with an empty pk list) fails the same way a non-empty one
-        // does instead of being masked by a no-op ACK.
-        if target_id >= FIRST_USER_TABLE_ID {
+        // Same existence + writability gate as the INSERT path below. An empty
+        // push commits nothing, but an unwritable target is rejected here too so
+        // a client bug that happens to produce an empty batch (e.g. `delete` with
+        // an empty pk list) fails the same way a non-empty one does instead of
+        // being masked by a no-op ACK.
+        {
             let _cat = shared.catalog_rwlock.read().await;
             if push_target_rejected(shared, peer, target_id, client_id).await {
                 return;
@@ -1166,19 +1170,22 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
     // Fallthrough: ignore (should not happen).
 }
 
-/// Serve a point lookup with the catalog read lock already held: a system tid
-/// reads the catalog directly; a user tid (base table or view) fans out to the
-/// owning worker by PK hash. SEEK unicasts to one worker, so no replicated fork.
+/// Serve a point lookup with the catalog read lock already held: a catalog
+/// family reads master-locally; a user relation (base table or view) fans out to
+/// the owning worker by PK hash. SEEK unicasts to one worker, so no replicated
+/// fork.
+#[allow(clippy::too_many_arguments)]
 async fn serve_seek(
     shared: &Rc<Shared>,
     peer: &Peer,
     client_id: u64,
     target_id: i64,
+    kind: RelationKind,
     pk: u128,
     seek_pk_extra: &[u8],
     client_version: u16,
 ) {
-    if target_id < FIRST_USER_TABLE_ID {
+    if kind == RelationKind::SystemCatalog {
         match unsafe { (*shared.catalog).seek_family(target_id, pk, seek_pk_extra) } {
             Ok((batch, _)) => {
                 send_ok_response(shared, peer, target_id, batch.as_ref(), client_id, pk, client_version).await
@@ -1395,15 +1402,17 @@ fn decode_client_batch(slice: &[u8], schema: &SchemaDescriptor) -> Result<Batch,
     Ok(b)
 }
 
-/// Reject a request addressed to an unknown table id. Returns `true` when
-/// the error reply was sent and the caller must return.
-async fn reject_unknown_table(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64) -> bool {
-    if shared.cat().has_id(target_id) {
-        return false;
+/// Resolve a read target's relation kind, rejecting an unknown table id.
+/// Returns `None` when the error reply was sent and the caller must return.
+/// The caller holds the catalog read lock.
+async fn resolve_read_target(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64) -> Option<RelationKind> {
+    // `kind` is `Copy`, so the `dag.tables` borrow ends before the await below.
+    let kind = shared.cat().dag.tables.get(&target_id).map(|e| e.kind);
+    if kind.is_none() {
+        let msg = format!("table {target_id} not found");
+        send_error(peer, target_id, client_id, msg.as_bytes()).await;
     }
-    let msg = format!("table {target_id} not found");
-    send_error(peer, target_id, client_id, msg.as_bytes()).await;
-    true
+    kind
 }
 
 /// Decode `seek_col_idx` (`pack_pk_cols(col_indices)` — the packed flag at bit
@@ -1432,12 +1441,13 @@ async fn handle_seek_by_index(
     peer: &Peer,
     client_id: u64,
     target_id: i64,
+    kind: RelationKind,
     seek_col_idx: u64,
     seek_pk: u128,
     seek_pk_extra: &[u8],
     client_version: u16,
 ) {
-    if target_id >= FIRST_USER_TABLE_ID {
+    if kind != RelationKind::SystemCatalog {
         let cols = match validated_index_cols(shared, target_id, seek_col_idx, "seek_by_index") {
             Ok(cols) => cols,
             Err(msg) => {
@@ -1630,31 +1640,34 @@ fn is_view(shared: &Rc<Shared>, tid: i64) -> bool {
     shared.cat().dag.tables.get(&tid).is_some_and(|e| e.kind.is_view())
 }
 
-/// Take the catalog read lock with `target_id` validated, draining pending view
-/// ticks first only when the target is a view. Returns the held guard, or `None`
-/// if the target was rejected (error already sent). The one read-lock entry point
-/// for every single-target read verb.
+/// Take the catalog read lock and resolve `target_id`'s kind from the same probe
+/// that validated it, draining pending view ticks first only when the target is a
+/// view. Returns `(guard, kind)`, or `None` if the target was rejected (error
+/// already sent). The one read-lock entry point for every single-target read verb:
+/// each one routes on the returned kind rather than re-deciding the system/user
+/// split from the id.
 ///
 /// A base table's rows AND its secondary indexes are written by the same ingest
 /// apply, which is what makes skipping the drain safe for an `IndexRange` bound
 /// too. A view drops the lock, drains with NO lock held (BF-1), then re-locks and
-/// re-checks existence — a DDL may have dropped it during the drain.
-async fn read_lock(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64) -> Option<ReadGuard> {
+/// re-resolves — a DDL may have dropped it during the drain.
+async fn read_lock(
+    shared: &Rc<Shared>,
+    peer: &Peer,
+    client_id: u64,
+    target_id: i64,
+) -> Option<(ReadGuard, RelationKind)> {
     {
         let g = shared.catalog_rwlock.read().await;
-        if reject_unknown_table(shared, peer, client_id, target_id).await {
-            return None;
-        }
-        if !is_view(shared, target_id) {
-            return Some(g);
+        let kind = resolve_read_target(shared, peer, client_id, target_id).await?;
+        if !kind.is_view() {
+            return Some((g, kind));
         }
     }
     drain_pending_ticks(shared).await;
     let g = shared.catalog_rwlock.read().await;
-    if reject_unknown_table(shared, peer, client_id, target_id).await {
-        return None;
-    }
-    Some(g)
+    let kind = resolve_read_target(shared, peer, client_id, target_id).await?;
+    Some((g, kind))
 }
 
 /// A scan's captured preliminary schema frame content: `(wire block,
@@ -1691,7 +1704,7 @@ fn build_prelim_schema_frame(tid: i64, client_id: u64, server_version: u16, bloc
 }
 
 async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64, client_version: u16) {
-    let Some(_g) = read_lock(shared, peer, client_id, target_id).await else {
+    let Some((_g, _kind)) = read_lock(shared, peer, client_id, target_id).await else {
         return;
     };
     let lsn = shared.last_tick_lsn.get();
@@ -1752,9 +1765,17 @@ async fn finish_scan_fanout(peer: &Peer, target_id: i64, client_id: u64, lsn: u6
 /// handling are identical to `handle_scan`; only the routing differs, since a
 /// bound can confine the read to one worker.
 async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64, seek_pk_extra: &[u8]) {
-    let Some(_g) = read_lock(shared, peer, client_id, target_id).await else {
+    let Some((_g, kind)) = read_lock(shared, peer, client_id, target_id).await else {
         return;
     };
+    // A `ReadSpec` has only a fan-out realization, and every worker holds a full
+    // copy of a catalog family — so fanning one out would concatenate W identical
+    // trains and inflate every row's weight W-fold, all replying STATUS_OK.
+    if kind == RelationKind::SystemCatalog {
+        let msg = format!("SCAN_SPEC: {target_id} is not a user relation");
+        send_error(peer, target_id, client_id, msg.as_bytes()).await;
+        return;
+    }
     let lsn = shared.last_tick_lsn.get();
     // A PK range confined to one partition unicasts: one SAL slot instead of W,
     // each of which would carry its own copy of the spec blob under the exclusive
@@ -1820,8 +1841,8 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
     // Drain pending ticks once — but only if some target is a view, the same rule
     // `read_lock` applies to a single target — and with NO catalog lock held
     // (BF-1). The classifying lock is dropped before the drain; Phase 1 re-resolves
-    // every tid under a fresh lock via `has_id`, so a DDL during the drain is
-    // caught there, and an unknown tid is rejected there rather than here.
+    // every tid's kind under a fresh lock, so a DDL during the drain is caught
+    // there, and an unknown tid is rejected there rather than here.
     let needs_drain = {
         let _cat = shared.catalog_rwlock.read().await;
         tids.iter().any(|&t| is_view(shared, t as i64))
@@ -1844,13 +1865,12 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
         let mut fanout: Vec<(i64, i32, u16)> = Vec::with_capacity(relations.len());
         for &(tid_u, client_ver) in &relations {
             let tid = tid_u as i64;
-            // Base tables AND views are legal; system tables stay on the plain
-            // path. `has_id` covers both under the catalog read lock.
-            if tid < FIRST_USER_TABLE_ID {
-                return Err(format!("SCAN_MULTI: {tid} is not a user relation"));
-            }
-            if !shared.cat().has_id(tid) {
-                return Err(format!("table {tid} not found"));
+            // Base tables AND views are legal; a catalog family stays on the
+            // plain path, which serves it master-locally.
+            match shared.cat().dag.tables.get(&tid).map(|e| e.kind) {
+                None => return Err(format!("table {tid} not found")),
+                Some(RelationKind::SystemCatalog) => return Err(format!("SCAN_MULTI: {tid} is not a user relation")),
+                Some(_) => {}
             }
             // `0` (worker-0 unicast) for a replicated relation, `-1` (broadcast)
             // otherwise — the same policy `handle_scan` applies per relation.
@@ -2417,9 +2437,8 @@ async fn send_error(peer: &Peer, target_id: i64, client_id: u64, error_msg: &[u8
 /// `next_table_id`), so a raw client push addressed to a view tid would
 /// otherwise commit rows into the view's output store that its circuit
 /// never produced — permanently divergent derived state. Only base tables
-/// are push targets; system-catalog tids never reach this (both arms gate
-/// on `FIRST_USER_TABLE_ID`). Caller holds the catalog read lock. Returns
-/// `true` iff an error frame was sent and the caller must return.
+/// are push targets. Caller holds the catalog read lock. Returns `true` iff
+/// an error frame was sent and the caller must return.
 async fn push_target_rejected(shared: &Shared, peer: &Peer, target_id: i64, client_id: u64) -> bool {
     match push_target_error(shared, target_id) {
         Some(msg) => {
@@ -2431,9 +2450,10 @@ async fn push_target_rejected(shared: &Shared, peer: &Peer, target_id: i64, clie
 }
 
 /// The reason `target_id` cannot receive a push (absent, or not a base table),
-/// or `None` if it can. The shared existence + writability gate behind both the
-/// plain-push arm (via `push_target_rejected`) and the per-family check in
-/// `push_txn_body`, which owns its own reply path.
+/// or `None` if it can. The shared existence + writability gate behind the
+/// plain-push arms (via `push_target_rejected`), the per-family check in
+/// `push_txn_body`, and the SERIAL range reservation — all of which address a
+/// base table by id and own their own reply path.
 fn push_target_error(shared: &Shared, target_id: i64) -> Option<String> {
     // `kind` is `Copy`; `.map` ends the `dag.tables` borrow before the caller's
     // awaits.
@@ -2498,11 +2518,21 @@ fn emit_zone_to_sal(shared: &Shared, op: &'static str, drained: &[(i64, Batch)],
 /// none of `handle_ddl`'s VIEW-only prelude (TickGate quiesce, committer barrier,
 /// base-table drain): a `sys_sequences` advance has no DAG evaluation and no
 /// rollback path.
-async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64, count: i64) -> i64 {
+async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64, count: i64) -> Result<i64, String> {
     let (base, zone_lsn, fsync_fut) = {
         // Lock order catalog -> SAL, matching INSERT/SEEK, so acquiring SAL under
         // catalog.write cannot deadlock. Both guards drop at the end of this block.
         let _write = shared.catalog_rwlock.write().await;
+
+        // A SERIAL sequence id IS the owning table's id, so the push-writability
+        // gate answers here too. Checked under the write lock that guards the
+        // reservation: an unvalidated id would durably write a `sys_sequences`
+        // row that `recover_sequences` replays straight into the catalog's own
+        // id counters at the next open.
+        if let Some(e) = push_target_error(shared, seq_id) {
+            return Err(e);
+        }
+
         let _sal_excl = shared.sal_writer_excl.lock().await;
 
         // Raw-pointer derefs (as handle_ddl) so no `&mut CatalogEngine` borrow is
@@ -2547,7 +2577,7 @@ async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64, count: i6
     // Publish only after fsync: readers never see an LSN whose backing
     // sys_sequences delta is not yet on disk.
     shared.lsn_alloc.publish(zone_lsn);
-    base
+    Ok(base)
 }
 
 async fn send_alloc(peer: &Peer, new_id: i64, client_id: u64) {
