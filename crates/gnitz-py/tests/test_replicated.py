@@ -45,8 +45,8 @@ def _select_pks(client, sql, sn):
     repeated PKs, not a deduped set."""
     res = client.execute_sql(sql, schema_name=sn)
     assert res[0]["type"] == "Rows"
-    b = res[0]["rows"].batch
-    if b is None:
+    b = res[0]["rows"]
+    if b.schema is None:
         return []
     return sorted(b.pks[i] for i in range(len(b.pks)) if b.weights[i] > 0)
 

@@ -73,7 +73,7 @@ def test_resolve_table_id(client):
     resolved_tid, schema = client.resolve_table(sn, "t")
     assert resolved_tid == tid
     assert len(schema.columns) == 2
-    assert schema.pk_index == 0
+    assert schema.pk_indices[0] == 0
     client.drop_table(sn, "t")
     client.drop_schema(sn)
 

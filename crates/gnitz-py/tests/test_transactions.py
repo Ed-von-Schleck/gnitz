@@ -26,7 +26,7 @@ def _kv_table(client, sn, name, unique_pk=True):
 def _batch(schema, rows, weight=1):
     b = gnitz.ZSetBatch(schema)
     for pk, val in rows:
-        b.append(pk=pk, val=val, weight=weight)
+        b.append(pk=pk, val=val, _weight=weight)
     return b
 
 
@@ -192,14 +192,14 @@ def _fk_tables(client, sn):
 def _p_batch(schema, ids, weight=1):
     b = gnitz.ZSetBatch(schema)
     for i in ids:
-        b.append(id=i, weight=weight)
+        b.append(id=i, _weight=weight)
     return b
 
 
 def _c_batch(schema, rows, weight=1):
     b = gnitz.ZSetBatch(schema)
     for cid, pid in rows:
-        b.append(id=cid, pid=pid, weight=weight)
+        b.append(id=cid, pid=pid, _weight=weight)
     return b
 
 
@@ -343,7 +343,7 @@ def _uniq_table(client, sn):
 def _u_batch(schema, rows, weight=1):
     b = gnitz.ZSetBatch(schema)
     for i, u in rows:
-        b.append(id=i, u=u, weight=weight)
+        b.append(id=i, u=u, _weight=weight)
     return b
 
 

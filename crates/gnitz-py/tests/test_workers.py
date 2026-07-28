@@ -83,9 +83,9 @@ def test_index_maintained_on_all_workers(client):
         tid, _ = client.resolve_table(sn, "t")
         for i in range(1, n + 1):
             result = client.seek_by_index(tid, [1], [i * 100])
-            assert result.batch is not None and len(result.batch.pks) == 1, \
+            assert result.schema is not None and len(result.pks) == 1, \
                 f"cust_id={i * 100} not found via index"
-            assert result.batch.pks[0] == i
+            assert result.pks[0] == i
     finally:
         _drop_all(client, sn, indices=[f"{sn}__t__idx_cust_id"], tables=["t"])
 
@@ -130,8 +130,8 @@ def test_seek_routes_to_correct_worker(client):
 
         tid, _ = client.resolve_table(sn, "t")
         result = client.seek(tid, pk=42)
-        assert result.batch is not None and len(result.batch.pks) == 1
-        assert result.batch.pks[0] == 42
+        assert result.schema is not None and len(result.pks) == 1
+        assert result.pks[0] == 42
     finally:
         _drop_all(client, sn, tables=["t"])
 
@@ -151,8 +151,8 @@ def test_seek_by_index_broadcast(client):
 
         tid, _ = client.resolve_table(sn, "t")
         result = client.seek_by_index(tid, [1], [1234])
-        assert result.batch is not None and len(result.batch.pks) == 1
-        assert result.batch.pks[0] == 7
+        assert result.schema is not None and len(result.pks) == 1
+        assert result.pks[0] == 7
     finally:
         _drop_all(client, sn, indices=[f"{sn}__t__idx_cust_id"], tables=["t"])
 
@@ -1428,11 +1428,11 @@ class TestRangeJoin:
             # invariant. (U64 PK columns: native packing is exact.)
             for (aid, bid) in pairs:
                 res = client.seek(vid, int(aid) | (int(bid) << 64))
-                assert res.batch is not None and len(res.batch.pks) == 1, \
+                assert res.schema is not None and len(res.pks) == 1, \
                     f"PK-seek ({aid},{bid}) should return exactly 1 row"
             # A guaranteed non-pair (a12.x=12 < b1.y=6 is false) seeks to nothing.
             res = client.seek(vid, 12 | (1 << 64))
-            assert res.batch is None or len(res.batch.pks) == 0
+            assert res.schema is None or len(res.pks) == 0
         finally:
             _drop_all(client, sn, views=["v"], tables=["a", "b"])
 

@@ -125,16 +125,11 @@ pub struct PySchema {
 #[pymethods]
 impl PySchema {
     #[new]
-    #[pyo3(signature = (columns, pk_index = None, pk_indices = None))]
-    pub fn new(columns: Bound<'_, PyList>, pk_index: Option<usize>, pk_indices: Option<Vec<usize>>) -> PyResult<Self> {
+    #[pyo3(signature = (columns, pk_indices = None))]
+    pub fn new(columns: Bound<'_, PyList>, pk_indices: Option<Vec<usize>>) -> PyResult<Self> {
         if columns.is_empty() {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "Schema must have at least 1 column",
-            ));
-        }
-        if pk_index.is_some() && pk_indices.is_some() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "pass either pk_index or pk_indices, not both",
             ));
         }
         // One pass: convert each column and note which ones carry the PK flag,
@@ -148,13 +143,12 @@ impl PySchema {
             }
             cols.push(py_col_to_rust(&c)?);
         }
-        let pk_cols = match (pk_index, pk_indices) {
-            (Some(i), _) => vec![i],
-            (None, Some(v)) => v,
-            // No explicit list: every flagged column, in declaration order; if
-            // nothing is flagged, column 0 is the key.
-            (None, None) if flagged.is_empty() => vec![0],
-            (None, None) => flagged,
+        // No explicit list: every flagged column, in declaration order; if
+        // nothing is flagged, column 0 is the key.
+        let pk_cols = match pk_indices {
+            Some(v) => v,
+            None if flagged.is_empty() => vec![0],
+            None => flagged,
         };
         // `Schema::from_parts` applies the shared rule set — the MAX_COLUMNS cap,
         // the structural PK rules, and per-PK-column nullability/eligibility.
@@ -170,17 +164,6 @@ impl PySchema {
     #[getter]
     pub fn pk_indices(&self) -> Vec<usize> {
         self.rust.pk_indices().to_vec()
-    }
-
-    /// Single-PK convenience. Raises ValueError on compound schemas.
-    #[getter]
-    pub fn pk_index(&self) -> PyResult<usize> {
-        if self.rust.pk_count() > 1 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "Schema has compound PK; use pk_indices instead of pk_index",
-            ));
-        }
-        Ok(self.rust.pk_indices()[0])
     }
 
     pub fn __repr__(&self) -> String {
@@ -224,22 +207,17 @@ fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyResult<PkCol
     Ok(pk_col)
 }
 
-/// Resolve a Python "schema-ish" argument to a `Bound<PySchema>`: a `Schema`, a
-/// `Struct` subclass (via its `_schema`), or a list of `ColumnDef` (wrapped in a
-/// fresh `Schema`). The single adapter for every method that accepts any of
-/// these forms.
+/// Resolve a Python "schema-ish" argument to a `Bound<PySchema>`: a `Schema`,
+/// or a list of `ColumnDef` wrapped in a fresh one. The single adapter for
+/// every method that accepts either form.
 fn resolve_py_schema<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PySchema>> {
-    // Bare `Schema` first: it is the common case, and a failed `getattr` would
-    // otherwise raise and swallow an AttributeError on every call.
+    // Bare `Schema` first: it is the common case.
     if let Ok(s) = obj.downcast::<PySchema>() {
         return Ok(s.clone());
     }
-    if let Ok(inner) = obj.getattr("_schema") {
-        return inner.downcast_into::<PySchema>().map_err(PyErr::from);
-    }
     // A sequence of ColumnDef → build a Schema (PK defaults handled by PySchema).
     let list = obj.downcast::<PyList>()?;
-    Bound::new(py, PySchema::new(list.clone(), None, None)?)
+    Bound::new(py, PySchema::new(list.clone(), None)?)
 }
 
 /// The schema's columns as a fresh Python list of `ColumnDef`, each flagged
@@ -415,7 +393,7 @@ fn write_pk_col_into(schema: &Schema, t: &mut gnitz_core::PkTuple, ci: usize, va
     let off = schema.pk_byte_offset(ci);
     match tc {
         TypeCode::U128 | TypeCode::UUID => {
-            t.buf[off..off + 16].copy_from_slice(&extract_uuid_or_u128(val, Some(tc))?.to_le_bytes())
+            t.buf[off..off + 16].copy_from_slice(&extract_uuid_or_u128(val)?.to_le_bytes())
         }
         TypeCode::I128 => t.buf[off..off + 16].copy_from_slice(&(val.extract::<i128>()? as u128).to_le_bytes()),
         _ => write_fixed_le_into(&mut t.buf[off..off + tc.wire_stride()], tc, val)?,
@@ -477,9 +455,9 @@ impl PyZSetBatch {
                 let ColData::Bytes(v) = col else { variant_mismatch() };
                 v.push(Some(val.extract::<Vec<u8>>()?));
             }
-            tc @ (TypeCode::U128 | TypeCode::UUID) => {
+            TypeCode::U128 | TypeCode::UUID => {
                 let ColData::U128s(v) = col else { variant_mismatch() };
-                v.push(extract_uuid_or_u128(val, Some(tc))?);
+                v.push(extract_uuid_or_u128(val)?);
             }
             TypeCode::I128 => {
                 let ColData::U128s(v) = col else { variant_mismatch() };
@@ -556,9 +534,8 @@ fn variant_mismatch() -> ! {
 
 #[pymethods]
 impl PyZSetBatch {
-    /// Construct a batch for `schema` — a `Schema`, a `Struct` subclass (whose
-    /// declared `_schema` is unwrapped), or a bare list of `ColumnDef`, all
-    /// resolved through [`resolve_py_schema`].
+    /// Construct a batch for `schema` — a `Schema` or a bare list of
+    /// `ColumnDef`, resolved through [`resolve_py_schema`].
     #[new]
     #[pyo3(signature = (schema))]
     pub fn new(py: Python<'_>, schema: Bound<'_, PyAny>) -> PyResult<Self> {
@@ -581,14 +558,14 @@ impl PyZSetBatch {
 
     /// Append one row from `{column_name: value}` keyword arguments; returns
     /// the batch so appends chain. `weight` defaults to 1.
-    #[pyo3(signature = (weight = 1, **values))]
+    #[pyo3(signature = (_weight = 1, **values))]
     pub fn append<'py>(
         slf: Bound<'py, Self>,
-        weight: i64,
+        _weight: i64,
         values: Option<Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, Self>> {
         let dict = values.unwrap_or_else(|| PyDict::new(slf.py()));
-        slf.borrow_mut().append_from_dict_inner(&dict, weight)?;
+        slf.borrow_mut().append_from_dict_inner(&dict, _weight)?;
         Ok(slf)
     }
 
@@ -643,25 +620,15 @@ impl PyZSetBatch {
 
 use gnitz_wire::format_uuid;
 
-/// Plain-hex parse for a non-UUID U128 column value: 1..=32 hex digits, no
-/// hyphen stripping, no sign.
-fn parse_plain_hex(s: &str) -> Option<u128> {
-    let b = s.as_bytes();
-    if b.is_empty() || b.len() > 32 || !b.iter().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    u128::from_str_radix(s, 16).ok()
-}
-
 /// Accept a Python int, `uuid.UUID` object (via `.int`), or string, returning
 /// the 128-bit value. Int is tried first because it is the common case in
 /// bulk inserts and avoids a Python attribute lookup per row.
 ///
-/// The string arm is type-directed: a UUID column accepts only canonical UUID
-/// text (`gnitz_wire::parse_uuid`), a U128 column only plain hex. Callers
-/// without a column type in hand (seek keys, raw PKs) pass `None` and get the
-/// union of the two forms.
-fn extract_uuid_or_u128(val: &Bound<'_, PyAny>, tc: Option<TypeCode>) -> PyResult<u128> {
+/// A string is canonical UUID text and nothing else (`gnitz_wire::parse_uuid`,
+/// the crate that owns wire-value text). Hex for a U128 column used to be
+/// accepted here alone — SQL reads the same literal as decimal and rejects
+/// bare hex, so the two write paths disagreed on what a string meant.
+fn extract_uuid_or_u128(val: &Bound<'_, PyAny>) -> PyResult<u128> {
     // `downcast` before `extract` on both arms: a failed `extract` builds *and
     // normalizes* a full `PyErr` (~140 ns) only to discard it, which a
     // `uuid.UUID` or string argument would pay on every row.
@@ -670,12 +637,8 @@ fn extract_uuid_or_u128(val: &Bound<'_, PyAny>, tc: Option<TypeCode>) -> PyResul
     }
     if let Ok(s) = val.downcast::<PyString>() {
         let s = s.to_cow()?;
-        return match tc {
-            Some(TypeCode::UUID) => gnitz_wire::parse_uuid(&s),
-            Some(_) => parse_plain_hex(&s),
-            None => gnitz_wire::parse_uuid(&s).or_else(|| parse_plain_hex(&s)),
-        }
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("invalid UUID/U128 hex string: {s:?}")));
+        return gnitz_wire::parse_uuid(&s)
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("invalid UUID string: {s:?}")));
     }
     // Last: `uuid.UUID` and friends, reached only once the cheap type tests fail.
     if let Ok(attr) = val.getattr(pyo3::intern!(val.py(), "int")) {
@@ -922,41 +885,6 @@ fn make_row(py: Python<'_>, data: &Arc<SharedBatchData>, row: usize, buf: &mut V
     .into_any())
 }
 
-// ---------------------------------------------------------------------------
-// PyRustBatch — lazy batch wrapper (read path only)
-// ---------------------------------------------------------------------------
-
-#[pyclass(name = "RustBatch")]
-pub struct PyRustBatch {
-    data: Arc<SharedBatchData>,
-}
-
-#[pymethods]
-impl PyRustBatch {
-    #[getter]
-    fn pks(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        pk_column_to_pylist(py, &self.data.schema, &self.data.batch.pks)
-    }
-
-    #[getter]
-    fn weights(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        Ok(PyList::new(py, &self.data.batch.weights)?.unbind())
-    }
-
-    #[getter]
-    fn columns(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        rust_batch_columns_to_py(py, &self.data.schema, &self.data.batch, self.data.batch.len())
-    }
-
-    fn __len__(&self) -> usize {
-        self.data.batch.len()
-    }
-
-    fn __repr__(&self) -> String {
-        format!("RustBatch(len={})", self.data.batch.len())
-    }
-}
-
 /// Materialize per-column value lists, indexed by *physical* column. A PK column
 /// holds an empty list — the PK region is surfaced through `.pks`. Decoding runs
 /// through [`cell_to_py`] under the column's resolved address, so a NULL reads
@@ -1006,11 +934,33 @@ impl PyScanResult {
         }
     }
 
+    /// The PK region as a Python list — one value per row, or packed `bytes`
+    /// per row for a compound key. Empty when the result carries no rows.
     #[getter]
-    fn batch(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn pks(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
         match &self.data {
-            None => Ok(py.None()),
-            Some(d) => Ok(Py::new(py, PyRustBatch { data: Arc::clone(d) })?.into_any()),
+            None => Ok(PyList::empty(py).unbind()),
+            Some(d) => pk_column_to_pylist(py, &d.schema, &d.batch.pks),
+        }
+    }
+
+    /// The per-row Z-set weights, positionally aligned with `pks`.
+    #[getter]
+    fn weights(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        match &self.data {
+            None => Ok(PyList::empty(py).unbind()),
+            Some(d) => Ok(PyList::new(py, &d.batch.weights)?.unbind()),
+        }
+    }
+
+    /// Per-column value lists indexed by *physical* column; a PK column holds
+    /// an empty list, since the PK region is surfaced through `pks`. For
+    /// presented-order access that decodes PK columns too, use `scalars`.
+    #[getter]
+    fn columns(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        match &self.data {
+            None => Ok(PyList::empty(py).unbind()),
+            Some(d) => rust_batch_columns_to_py(py, &d.schema, &d.batch, d.batch.len()),
         }
     }
 
@@ -1255,8 +1205,8 @@ impl PyGnitzClient {
     }
 
     /// create_table(schema_name, table_name, columns, unique_pk=True).
-    /// `columns` may be a `Schema`, a `Struct` subclass, or a list of
-    /// `ColumnDef` — all resolved through [`resolve_py_schema`], so the PK
+    /// `columns` may be a `Schema` or a list of `ColumnDef` — resolved through
+    /// [`resolve_py_schema`], so the PK
     /// columns come from the same rule every other schema surface applies.
     /// Partitioned, default distribution; no inline UNIQUE surface.
     #[pyo3(signature = (schema_name, table_name, columns, unique_pk = true))]
@@ -1428,7 +1378,7 @@ impl PyGnitzClient {
     ) -> PyResult<Py<PyScanResult>> {
         let keys: Vec<u128> = key_vals
             .iter()
-            .map(|item| extract_uuid_or_u128(&item, None))
+            .map(|item| extract_uuid_or_u128(&item))
             .collect::<PyResult<_>>()?;
         let c = self.live()?;
         let result = py.allow_threads(|| c.seek_by_index(table_id, &col_indices, &keys));
@@ -1598,7 +1548,7 @@ fn pk_tuple_from_py(pk: &Bound<'_, PyAny>) -> PyResult<gnitz_core::PkTuple> {
     if let Ok(bytes) = pk.downcast::<pyo3::types::PyBytes>() {
         return gnitz_core::PkTuple::try_from_bytes(bytes.as_bytes()).map_err(pyo3::exceptions::PyValueError::new_err);
     }
-    if let Ok(val) = extract_uuid_or_u128(pk, None) {
+    if let Ok(val) = extract_uuid_or_u128(pk) {
         return Ok(gnitz_core::PkTuple::from_u128_narrow(val));
     }
     if let Ok(val) = pk.extract::<i128>() {
@@ -2103,7 +2053,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySchema>()?;
     m.add_class::<PyRow>()?;
     m.add_class::<PyZSetBatch>()?;
-    m.add_class::<PyRustBatch>()?;
     m.add_class::<PyScanResult>()?;
     m.add_class::<PyRowIterator>()?;
     m.add_class::<PyGnitzClient>()?;

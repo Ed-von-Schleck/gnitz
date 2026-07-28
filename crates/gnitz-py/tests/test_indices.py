@@ -35,8 +35,8 @@ def _drop_all(client, sn, tables=(), views=(), indices=()):
 def _table_has_index(client, sn, table):
     """True if any live IdxTab row names `table` as its owner."""
     from gnitz import IDX_TAB
-    batch_obj = client.scan(IDX_TAB).batch
-    if batch_obj is None:
+    batch_obj = client.scan(IDX_TAB)
+    if batch_obj.schema is None:
         return False
     tid, _ = client.resolve_table(sn, table)
     for i in range(len(batch_obj.pks)):
@@ -81,8 +81,8 @@ class TestIndexDdl:
             # Verify IdxTab row exists with correct owner_id and source_cols
             # (the packed column-list u64, decoded via the shared codec).
             from gnitz import IDX_TAB, unpack_pk_cols
-            batch_obj = client.scan(IDX_TAB).batch
-            assert batch_obj is not None
+            batch_obj = client.scan(IDX_TAB)
+            assert batch_obj.schema is not None
             found = False
             tid, _ = client.resolve_table(sn, "t")
             for i in range(len(batch_obj.pks)):
@@ -114,8 +114,8 @@ class TestIndexDdl:
             assert results[0]["type"] == "IndexCreated"
             # is_unique flag should be 1 in IdxTab
             from gnitz import IDX_TAB
-            batch_obj = client.scan(IDX_TAB).batch
-            assert batch_obj is not None
+            batch_obj = client.scan(IDX_TAB)
+            assert batch_obj.schema is not None
             tid, _ = client.resolve_table(sn, "t")
             for i in range(len(batch_obj.pks)):
                 if batch_obj.weights[i] <= 0:
@@ -145,7 +145,7 @@ class TestIndexDdl:
 
             # Verify row is gone from IdxTab
             from gnitz import IDX_TAB
-            batch_obj = client.scan(IDX_TAB).batch
+            batch_obj = client.scan(IDX_TAB)
             if batch_obj is not None:
                 tid, _ = client.resolve_table(sn, "t")
                 for i in range(len(batch_obj.pks)):
@@ -251,9 +251,9 @@ class TestIndexSeek:
             client.execute_sql("CREATE INDEX ON t(cust_id)", schema_name=sn)
 
             result = client.seek_by_index(tid, [1], [42])
-            assert result.batch is not None
-            assert len(result.batch.pks) == 1
-            assert result.batch.pks[0] == 1
+            assert result.schema is not None
+            assert len(result.pks) == 1
+            assert result.pks[0] == 1
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_cust_id"],
@@ -270,7 +270,7 @@ class TestIndexSeek:
             client.execute_sql("CREATE INDEX ON t(cust_id)", schema_name=sn)
 
             result = client.seek_by_index(tid, [1], [999])
-            assert result.batch is None or len(result.batch.pks) == 0
+            assert result.schema is None or len(result.pks) == 0
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_cust_id"],
@@ -288,9 +288,9 @@ class TestIndexSeek:
             client.execute_sql("CREATE INDEX ON t(cust_id)", schema_name=sn)
 
             result = client.seek_by_index(tid, [1], [77])
-            assert result.batch is not None
-            assert len(result.batch.pks) == 1
-            assert result.batch.pks[0] == 10
+            assert result.schema is not None
+            assert len(result.pks) == 1
+            assert result.pks[0] == 10
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_cust_id"],
@@ -305,9 +305,9 @@ class TestIndexSeek:
             client.execute_sql("INSERT INTO t VALUES (5, 55)", schema_name=sn)
 
             result = client.seek_by_index(tid, [1], [55])
-            assert result.batch is not None
-            assert len(result.batch.pks) == 1
-            assert result.batch.pks[0] == 5
+            assert result.schema is not None
+            assert len(result.pks) == 1
+            assert result.pks[0] == 5
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_cust_id"],
@@ -335,8 +335,8 @@ class TestIndexSql:
             )
             assert results[0]["type"] == "Rows"
             rows = results[0]["rows"]
-            assert len(rows.batch.pks) == 1
-            assert rows.batch.pks[0] == 1
+            assert len(rows.pks) == 1
+            assert rows.pks[0] == 1
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_cust_id"],
@@ -357,7 +357,7 @@ class TestIndexSql:
                 "SELECT * FROM t WHERE pk = 7", schema_name=sn
             )
             assert results[0]["type"] == "Rows"
-            assert results[0]["rows"].batch.pks[0] == 7
+            assert results[0]["rows"].pks[0] == 7
         finally:
             _drop_all(client, sn, tables=["t"])
 
@@ -402,8 +402,8 @@ class TestIndexSql:
             )
             assert results[0]["type"] == "Rows"
             rows = results[0]["rows"]
-            assert len(rows.batch.pks) == 1
-            assert rows.batch.pks[0] == 1
+            assert len(rows.pks) == 1
+            assert rows.pks[0] == 1
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_cust_id"],
@@ -425,7 +425,7 @@ class TestIndexSql:
                 "SELECT * FROM t WHERE val = 999", schema_name=sn
             )
             assert results[0]["type"] == "Rows"
-            assert len(results[0]["rows"].batch.pks) == 0
+            assert len(results[0]["rows"].pks) == 0
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_val"],
@@ -452,8 +452,8 @@ class TestIndexSql:
                 )
                 assert results[0]["type"] == "Rows", f"expected Rows for score={val}"
                 rows = results[0]["rows"]
-                assert len(rows.batch.pks) == 1, f"expected 1 row for score={val}"
-                assert rows.batch.pks[0] == pk, f"wrong pk for score={val}"
+                assert len(rows.pks) == 1, f"expected 1 row for score={val}"
+                assert rows.pks[0] == pk, f"wrong pk for score={val}"
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_score"],
@@ -480,8 +480,8 @@ class TestIndexSql:
                 )
                 assert results[0]["type"] == "Rows", f"expected Rows for score={val}"
                 rows = results[0]["rows"]
-                assert len(rows.batch.pks) == 1, f"expected 1 row for score={val}"
-                assert rows.batch.pks[0] == pk, f"wrong pk for score={val}"
+                assert len(rows.pks) == 1, f"expected 1 row for score={val}"
+                assert rows.pks[0] == pk, f"wrong pk for score={val}"
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_score"],
@@ -503,7 +503,7 @@ class TestIndexSql:
                 "SELECT * FROM t WHERE val = -99", schema_name=sn
             )
             assert results[0]["type"] == "Rows"
-            assert len(results[0]["rows"].batch.pks) == 0
+            assert len(results[0]["rows"].pks) == 0
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_val"],
@@ -631,8 +631,8 @@ class TestIndexIntegrity:
 
             vid, _ = client.resolve_table(sn, "v")
             result = client.scan(vid)
-            assert result.batch is not None
-            assert len(result.batch.pks) == 1
+            assert result.schema is not None
+            assert len(result.pks) == 1
         finally:
             _drop_all(client, sn, views=["v"], tables=["t"])
 
@@ -715,8 +715,8 @@ class TestIndexIntegrity:
             # Verify final state
             tid, _ = client.resolve_table(sn, "t")
             result = client.scan(tid)
-            assert result.batch is not None
-            assert len(result.batch.pks) == 1
+            assert result.schema is not None
+            assert len(result.pks) == 1
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_val"],
@@ -906,8 +906,8 @@ class TestIndexReadBarrier:
                 "SELECT * FROM t WHERE val = 42", schema_name=sn)
             assert results[0]["type"] == "Rows"
             rows = results[0]["rows"]
-            assert len(rows.batch.pks) == 1
-            assert rows.batch.pks[0] == 1
+            assert len(rows.pks) == 1
+            assert rows.pks[0] == 1
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_val"],
@@ -936,8 +936,8 @@ class TestIndexReadBarrier:
                 )
                 assert results[0]["type"] == "Rows"
                 rows = results[0]["rows"]
-                assert len(rows.batch.pks) == 1
-                assert rows.batch.pks[0] == i + 1
+                assert len(rows.pks) == 1
+                assert rows.pks[0] == i + 1
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_val"],
@@ -980,10 +980,10 @@ class TestIndexReadBarrier:
                     f"SELECT * FROM t WHERE val = {val}", schema_name=sn)
                 assert results[0]["type"] == "Rows"
                 rows = results[0]["rows"]
-                assert len(rows.batch.pks) == 1, \
+                assert len(rows.pks) == 1, \
                     f"val={val} (pk={pk}) not found — index merge order bug"
-                assert rows.batch.pks[0] == pk, \
-                    f"val={val} resolved to pk={rows.batch.pks[0]}, expected {pk}"
+                assert rows.pks[0] == pk, \
+                    f"val={val} resolved to pk={rows.pks[0]}, expected {pk}"
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_val"],
@@ -1028,8 +1028,8 @@ class TestCreateUniqueIndexValidation:
             # must return all 50 rows.
             tid, _ = client.resolve_table(sn, "t")
             result = client.scan(tid)
-            assert result.batch is not None
-            assert len(result.batch.pks) == 50, "all workers must answer the scan"
+            assert result.schema is not None
+            assert len(result.pks) == 50, "all workers must answer the scan"
             # No phantom constraint: the index was never created.
             assert not _table_has_index(client, sn, "t")
             # And the write path is still healthy across workers.
@@ -1096,8 +1096,8 @@ class TestCreateUniqueIndexValidation:
                 "SELECT * FROM t WHERE val = 200", schema_name=sn)
             assert results[0]["type"] == "Rows"
             rows = results[0]["rows"]
-            assert len(rows.batch.pks) == 1
-            assert rows.batch.pks[0] == 20
+            assert len(rows.pks) == 1
+            assert rows.pks[0] == 20
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_val"],
@@ -1207,8 +1207,8 @@ class TestCreateUniqueIndexValidation:
 
             tid, _ = client.resolve_table(sn, "t")
             result = client.scan(tid)
-            assert result.batch is not None
-            assert len(result.batch.pks) == n + 1, "all workers must answer post-failure"
+            assert result.schema is not None
+            assert len(result.pks) == n + 1, "all workers must answer post-failure"
             assert not _table_has_index(client, sn, "t")
         finally:
             _drop_all(client, sn,
@@ -1342,8 +1342,8 @@ class TestAtomicUniqueTransfers:
             b.append(pk=1, val=5)
             client.push(tid, b)
             b = gnitz.ZSetBatch(schema)
-            b.append(pk=1, val=5, weight=-1)
-            b.append(pk=2, val=5, weight=1)
+            b.append(pk=1, val=5, _weight=-1)
+            b.append(pk=2, val=5, _weight=1)
             client.push(tid, b)  # must succeed
             rows = sorted((r.pk, r.val) for r in client.scan(tid) if r.weight > 0)
             assert rows == [(2, 5)], rows
@@ -1363,7 +1363,7 @@ class TestAtomicUniqueTransfers:
             b.append(pk=1, val=5)
             client.push(tid, b)
             b = gnitz.ZSetBatch(schema)
-            b.append(pk=3, val=5, weight=1)  # no retraction frees val=5
+            b.append(pk=3, val=5, _weight=1)  # no retraction frees val=5
             with pytest.raises(gnitz.GnitzError):
                 client.push(tid, b)
         finally:
@@ -1382,8 +1382,8 @@ class TestAtomicUniqueTransfers:
             b.append(pk=1, val=5)  # only pk=1 holds 5
             client.push(tid, b)
             b = gnitz.ZSetBatch(schema)
-            b.append(pk=3, val=5, weight=-1)  # forged: pk=3 does not hold 5
-            b.append(pk=2, val=5, weight=1)
+            b.append(pk=3, val=5, _weight=-1)  # forged: pk=3 does not hold 5
+            b.append(pk=2, val=5, _weight=1)
             with pytest.raises(gnitz.GnitzError):
                 client.push(tid, b)
         finally:
@@ -1404,9 +1404,9 @@ class TestAtomicUniqueTransfers:
             b.append(pk=2, val=6)  # committed holder of 6
             client.push(tid, b)
             b = gnitz.ZSetBatch(schema)
-            b.append(pk=2, val=7, weight=1)   # P2 upserted off 6
-            b.append(pk=4, val=6, weight=1)   # fresh insert of 6
-            b.append(pk=3, val=6, weight=-1)  # forged retraction names P3
+            b.append(pk=2, val=7, _weight=1)   # P2 upserted off 6
+            b.append(pk=4, val=6, _weight=1)   # fresh insert of 6
+            b.append(pk=3, val=6, _weight=-1)  # forged retraction names P3
             with pytest.raises(gnitz.GnitzError):
                 client.push(tid, b)
         finally:
@@ -1427,7 +1427,7 @@ class TestAtomicUniqueTransfers:
             b.append(id=1, val=5, data=100)
             client.push(tid, b)
             b = gnitz.ZSetBatch(schema)
-            b.append(id=1, val=5, data=200, weight=1)  # second live row at val=5
+            b.append(id=1, val=5, data=200, _weight=1)  # second live row at val=5
             with pytest.raises(gnitz.GnitzError):
                 client.push(tid, b)
         finally:
@@ -1444,12 +1444,12 @@ class TestAtomicUniqueTransfers:
                     gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
             tid, schema = self._raw_table(client, sn, cols, unique_pk=False)
             b = gnitz.ZSetBatch(schema)
-            b.append(id=1, val=5, weight=2)
+            b.append(id=1, val=5, _weight=2)
             with pytest.raises(gnitz.GnitzError):
                 client.push(tid, b)
             # The same row at unit weight passes.
             b = gnitz.ZSetBatch(schema)
-            b.append(id=1, val=5, weight=1)
+            b.append(id=1, val=5, _weight=1)
             client.push(tid, b)
         finally:
             _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
@@ -1744,14 +1744,14 @@ class TestUniqueIndexCreatePreflight:
         try:
             tid, schema = self._non_unique_pk_table(client, sn)
             b = gnitz.ZSetBatch(schema)
-            b.append(pk=1, val=10, weight=2)
+            b.append(pk=1, val=10, _weight=2)
             client.push(tid, b)
             with pytest.raises(gnitz.GnitzError):
                 client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
             assert not _table_has_index(client, sn, "t")
             # Control: distinct values on the same kind of table still pass.
             b = gnitz.ZSetBatch(schema)
-            b.append(pk=1, val=10, weight=-2)  # clear the duplicate
+            b.append(pk=1, val=10, _weight=-2)  # clear the duplicate
             b.append(pk=2, val=20)
             client.push(tid, b)
             client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
@@ -1772,12 +1772,12 @@ class TestUniqueIndexCreatePreflight:
             schema = gnitz.Schema(cols)
             tid = client.create_table(sn, "t", cols, unique_pk=True)
             b = gnitz.ZSetBatch(schema)
-            b.append(pk=1, val=10, weight=2)
+            b.append(pk=1, val=10, _weight=2)
             client.push(tid, b)
             rows = [(r.pk, r.weight) for r in client.scan(tid) if r.weight > 0]
             assert rows == [(1, 1)], rows
             b = gnitz.ZSetBatch(schema)
-            b.append(pk=1, val=10, weight=-1)
+            b.append(pk=1, val=10, _weight=-1)
             client.push(tid, b)
             assert [r for r in client.scan(tid) if r.weight > 0] == []
             client.execute_sql("CREATE UNIQUE INDEX ON t(pk)", schema_name=sn)

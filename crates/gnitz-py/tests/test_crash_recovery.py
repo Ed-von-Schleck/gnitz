@@ -425,8 +425,8 @@ def _index_on_col(conn, owner_tid, col_idx):
     """True if a live IdxTab row indexes column `col_idx` of table `owner_tid`."""
     from gnitz import IDX_TAB, unpack_pk_cols
 
-    batch_obj = conn.scan(IDX_TAB).batch
-    if batch_obj is None:
+    batch_obj = conn.scan(IDX_TAB)
+    if batch_obj.schema is None:
         return False
     for i in range(len(batch_obj.pks)):
         if batch_obj.weights[i] <= 0:
@@ -969,7 +969,7 @@ def test_secondary_index_select_after_restart():
 
         def seek_g7():
             res = conn.seek_by_index(tid, [1], [7])
-            return sorted(res.batch.pks) if res.batch is not None else []
+            return sorted(res.pks) if res.schema is not None else []
 
         expected = sorted(i for i in range(30) if i % 3 == 0)  # {0,3,...,27}
         assert seek_g7() == expected, "g=7 holders must survive restart exactly"

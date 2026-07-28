@@ -78,7 +78,7 @@ class TestNativePkSchema:
                 schema_name=sn,
             )
             _, schema = client.resolve_table(sn, "t")
-            assert schema.columns[schema.pk_index].type_code == tc
+            assert schema.columns[schema.pk_indices[0]].type_code == tc
         finally:
             _cleanup(client, sn, "t")
 

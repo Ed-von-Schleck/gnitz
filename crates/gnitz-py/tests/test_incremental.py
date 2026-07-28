@@ -39,7 +39,7 @@ class TestFilterRetraction:
             # BIGINT PKs are stored as signed I64; a U64-typed batch would encode
             # a different order-preserving PK image and never consolidate.
             batch = gnitz.ZSetBatch(t_schema)
-            batch.append(pk=1, val=100, weight=-1)
+            batch.append(pk=1, val=100, _weight=-1)
             client.push(tid, batch)
 
             assert len([r for r in client.scan(vid) if r.weight > 0]) == 0
@@ -70,7 +70,7 @@ class TestFilterRetraction:
             assert len([r for r in client.scan(vid) if r.weight > 0]) == 0
 
             batch = gnitz.ZSetBatch(t_schema)
-            batch.append(pk=1, val=10, weight=-1)
+            batch.append(pk=1, val=10, _weight=-1)
             client.push(tid, batch)
 
             assert len([r for r in client.scan(vid) if r.weight > 0]) == 0
@@ -118,7 +118,7 @@ class TestJoinRetraction:
             assert len([r for r in client.scan(vid) if r.weight > 0]) == 1
 
             batch = gnitz.ZSetBatch(a_schema)
-            batch.append(pk=1, val=100, weight=-1)
+            batch.append(pk=1, val=100, _weight=-1)
             client.push(a_tid, batch)
 
             assert len([r for r in client.scan(vid) if r.weight > 0]) == 0
@@ -141,7 +141,7 @@ class TestJoinRetraction:
             assert len([r for r in client.scan(vid) if r.weight > 0]) == 1
 
             batch = gnitz.ZSetBatch(b_schema)
-            batch.append(pk=1, label=999, weight=-1)
+            batch.append(pk=1, label=999, _weight=-1)
             client.push(b_tid, batch)
 
             assert len([r for r in client.scan(vid) if r.weight > 0]) == 0
@@ -214,7 +214,7 @@ class TestViewCascade:
             assert len([r for r in client.scan(v1_id) if r.weight > 0]) == 1
 
             batch = gnitz.ZSetBatch(t_schema)
-            batch.append(pk=1, val=100, weight=-1)
+            batch.append(pk=1, val=100, _weight=-1)
             client.push(tid, batch)
 
             assert len([r for r in client.scan(v1_id) if r.weight > 0]) == 0

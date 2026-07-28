@@ -1362,9 +1362,6 @@ def test_compound_pk_resolve_preserves_order(client):
         )
         _, schema = client.resolve_table(sn, "t")
         assert schema.pk_indices == [2, 1]
-        # Compound schema: pk_index getter must raise.
-        with pytest.raises(ValueError):
-            _ = schema.pk_index
     finally:
         _cleanup(client, sn, "t")
 
@@ -1382,7 +1379,7 @@ def test_compound_pk_scan_returns_bytes_pks(client):
         )
         tid, _ = client.resolve_table(sn, "t")
         sr = client.scan(tid)
-        pks = sr.batch.pks
+        pks = sr.pks
         assert len(pks) == 2
         # Each packed PK is 16 bytes: 8 (a, LE) || 8 (b, LE).
         for p in pks:

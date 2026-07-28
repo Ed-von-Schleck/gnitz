@@ -23,7 +23,7 @@ def _push(client, tid, schema, rows, weight=1):
     """Push [(pk, val), ...] with given weight."""
     batch = gnitz.ZSetBatch(schema)
     for pk, val in rows:
-        batch.append(pk=pk, val=val, weight=weight)
+        batch.append(pk=pk, val=val, _weight=weight)
     client.push(tid, batch)
 
 
@@ -134,8 +134,8 @@ def test_upsert_intra_batch_insert_then_delete(client):
     # val=0 in the retraction differs from the inserted val=10, but unique_pk
     # tables retract by PK match regardless of payload values.
     batch = gnitz.ZSetBatch(schema)
-    batch.append(pk=1, val=10, weight=1)
-    batch.append(pk=1, val=0, weight=-1)
+    batch.append(pk=1, val=10, _weight=1)
+    batch.append(pk=1, val=0, _weight=-1)
     client.push(tid, batch)
     assert _scan_rows(client, tid) == []
     client.drop_table(sn, "t")
@@ -149,8 +149,8 @@ def test_upsert_intra_batch_delete_then_insert(client):
     # val=0 in the retraction differs from the inserted val=10, but unique_pk
     # tables retract by PK match regardless of payload values.
     batch = gnitz.ZSetBatch(schema)
-    batch.append(pk=1, val=0, weight=-1)
-    batch.append(pk=1, val=99, weight=1)
+    batch.append(pk=1, val=0, _weight=-1)
+    batch.append(pk=1, val=99, _weight=1)
     client.push(tid, batch)
     assert _scan_rows(client, tid) == [(1, 99)]
     client.drop_table(sn, "t")

@@ -79,14 +79,14 @@ class TestLargeInList:
 
             # Delete a member: it leaves IN, appears nowhere (NOT IN never had it).
             batch = gnitz.ZSetBatch(t_schema)
-            batch.append(pk=3, val=0, weight=-1)
+            batch.append(pk=3, val=0, _weight=-1)
             client.push(tid, batch)
             assert _live_vals(client, vid) == {-100, 399}
             assert _live_vals(client, vid_not) == {-101, 400, 5000}
 
             # Delete a non-member: it leaves NOT IN, IN is unaffected.
             batch = gnitz.ZSetBatch(t_schema)
-            batch.append(pk=6, val=5000, weight=-1)
+            batch.append(pk=6, val=5000, _weight=-1)
             client.push(tid, batch)
             assert _live_vals(client, vid) == {-100, 399}
             assert _live_vals(client, vid_not) == {-101, 400}

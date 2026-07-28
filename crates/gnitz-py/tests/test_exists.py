@@ -179,7 +179,7 @@ class TestEquiExists:
             anti = client.resolve_table(sn, "anti")[0]
 
             batch = gnitz.ZSetBatch(schema)
-            batch.append(id=1, k=10, v=100, weight=2)
+            batch.append(id=1, k=10, v=100, _weight=2)
             client.push(tid, batch)
             assert _weights(client, anti, "v") == {100: 2}
             assert _weights(client, semi, "v") == {}

@@ -34,7 +34,7 @@ def _kv_table(client, sn, name):
 def _batch(schema, rows):
     b = gnitz.ZSetBatch(schema)
     for pk, val in rows:
-        b.append(pk=pk, val=val, weight=1)
+        b.append(pk=pk, val=val, _weight=1)
     return b
 
 
@@ -399,7 +399,7 @@ def test_fifo_ordering_big_then_small(reply_frame_budget_server):
         dim, dim_sch = _text_table(c, sn, "dim_text")
         db = gnitz.ZSetBatch(dim_sch)
         for i in range(5):
-            db.append(pk=i, s=f"name-{i}", weight=1)
+            db.append(pk=i, s=f"name-{i}", _weight=1)
         c.push(dim, db)
         res = c.scan_many([big, dim])
         assert _rows(res[0]) == big_rows

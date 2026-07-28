@@ -2,19 +2,18 @@
 test_ergonomics.py — Full coverage for the Python ergonomics API.
 
 Section 1: Offline (no server)
-    TestTypeCode, TestColumnDef, TestSchema, TestStruct,
+    TestTypeCode, TestColumnDef, TestSchema,
     TestRow, TestZSetBatchErrors, TestScanResultType
 
 Section 2: Online (server required, uses `client` fixture from conftest.py)
-    TestZSetBatchExtend, TestScanResultMethods, TestRowAccess, TestStructOnline
+    TestZSetBatchExtend, TestScanResultMethods, TestRowAccess
 """
 import random
 import typing
 import pytest
 
 import gnitz
-from gnitz import (TypeCode, ColumnDef, Schema, Row, ScanResult, ZSetBatch,
-                   Struct, field, U64, I64, F64, STRING, U128)
+from gnitz import TypeCode, ColumnDef, Schema, Row, ScanResult, ZSetBatch
 
 
 def _uid():
@@ -77,27 +76,24 @@ class TestSchema:
     def test_pk_inferred_from_flag(self):
         cols = [ColumnDef("a", TypeCode.U64),
                 ColumnDef("b", TypeCode.I64, primary_key=True)]
-        assert Schema(cols).pk_index == 1
+        assert Schema(cols).pk_indices[0] == 1
 
     def test_pk_defaults_to_zero(self):
         cols = [ColumnDef("a", TypeCode.U64),
                 ColumnDef("b", TypeCode.I64)]
-        assert Schema(cols).pk_index == 0
+        assert Schema(cols).pk_indices[0] == 0
 
     def test_multiple_pk_infers_compound(self):
         cols = [ColumnDef("a", TypeCode.U64, primary_key=True),
                 ColumnDef("b", TypeCode.I64, primary_key=True)]
         s = Schema(cols)
         assert s.pk_indices == [0, 1]
-        # Single-PK convenience getter raises on compound schemas.
-        with pytest.raises(ValueError):
-            _ = s.pk_index
 
-    def test_explicit_pk_index_overrides(self):
+    def test_explicit_pk_indices_override_the_flag(self):
         cols = [ColumnDef("a", TypeCode.U64, primary_key=True),
                 ColumnDef("b", TypeCode.I64),
                 ColumnDef("c", TypeCode.I64)]
-        assert Schema(cols, pk_index=2).pk_index == 2
+        assert Schema(cols, pk_indices=[2]).pk_indices[0] == 2
 
     def test_columns_stored(self):
         cols = [ColumnDef("a", TypeCode.U64, primary_key=True),
@@ -126,15 +122,9 @@ class TestSchema:
     def test_single_pk_returns_one_element_list(self):
         cols = [ColumnDef("a", TypeCode.U64),
                 ColumnDef("b", TypeCode.I64)]
-        s = Schema(cols, pk_index=0)
+        s = Schema(cols, pk_indices=[0])
         assert s.pk_indices == [0]
-        assert s.pk_index == 0
-
-    def test_pk_index_and_pk_indices_conflict(self):
-        cols = [ColumnDef("a", TypeCode.U64),
-                ColumnDef("b", TypeCode.I64)]
-        with pytest.raises(ValueError):
-            Schema(cols, pk_index=0, pk_indices=[0])
+        assert s.pk_indices[0] == 0
 
     # --- validation errors -------------------------------------------------
 
@@ -457,7 +447,7 @@ def _make_table(client):
 def _push_rows(client, tid, schema, pk_val_pairs, weight=1):
     batch = ZSetBatch(schema)
     for pk, val in pk_val_pairs:
-        batch.append(pk=pk, val=val, weight=weight)
+        batch.append(pk=pk, val=val, _weight=weight)
     client.push(tid, batch)
 
 
@@ -775,188 +765,6 @@ class TestRowAccess:
 # ---------------------------------------------------------------------------
 # Section 3 — Struct declarative schema API
 # ---------------------------------------------------------------------------
-
-class TestStruct:
-    """Offline tests for gnitz.Struct declarative schemas."""
-
-    def test_basic_schema(self):
-        class T(Struct):
-            pk:  U64 = field(primary_key=True)
-            val: I64
-        assert T._schema is not None
-        assert len(T._columns) == 2
-        assert T._schema.pk_index == 0
-
-    def test_pk_not_first_column(self):
-        class T(Struct):
-            val: I64
-            pk:  U64 = field(primary_key=True)
-        assert T._schema.pk_index == 1
-
-    def test_pk_defaults_to_zero(self):
-        class T(Struct):
-            a: U64
-            b: I64
-        assert T._schema.pk_index == 0
-
-    def test_column_names(self):
-        class T(Struct):
-            pk:  U64 = field(primary_key=True)
-            val: I64
-        assert T._columns[0].name == "pk"
-        assert T._columns[1].name == "val"
-
-    def test_column_type_codes(self):
-        class T(Struct):
-            a: U64
-            b: I64
-            c: F64
-        assert T._columns[0].type_code == TypeCode.U64
-        assert T._columns[1].type_code == TypeCode.I64
-        assert T._columns[2].type_code == TypeCode.F64
-
-    def test_nullable_union(self):
-        class T(Struct):
-            pk:  U64 = field(primary_key=True)
-            val: I64 | None
-        assert T._columns[1].is_nullable is True
-        assert T._columns[0].is_nullable is False
-
-    def test_nullable_optional(self):
-        class T(Struct):
-            pk:  U64 = field(primary_key=True)
-            val: typing.Optional[I64]
-        assert T._columns[1].is_nullable is True
-
-    def test_non_nullable_default(self):
-        class T(Struct):
-            pk: U64
-            val: I64
-        assert T._columns[0].is_nullable is False
-        assert T._columns[1].is_nullable is False
-
-    def test_multiple_pk_makes_a_compound_key(self):
-        """Two flagged fields declare a compound key, in declaration order —
-        the same rule Schema applies to a hand-built ColumnDef list."""
-        class T(Struct):
-            a: U64 = field(primary_key=True)
-            b: I64 = field(primary_key=True)
-            v: I64
-        assert T._schema.pk_indices == [0, 1]
-
-    def test_no_fields_raises(self):
-        with pytest.raises(TypeError, match="no fields"):
-            class T(Struct):
-                pass
-
-    def test_bad_annotation_raises(self):
-        with pytest.raises(TypeError, match="expected gnitz type"):
-            class T(Struct):
-                x: int
-
-    def test_instantiation_raises(self):
-        class T(Struct):
-            pk: U64
-        with pytest.raises(TypeError, match="schema descriptor"):
-            T()
-
-    def test_field_spec_cleaned_up(self):
-        class T(Struct):
-            pk: U64 = field(primary_key=True)
-            val: I64
-        assert not hasattr(T, 'pk') or not hasattr(getattr(T, 'pk', None), 'primary_key')
-
-    def test_all_type_markers(self):
-        class T(Struct):
-            a: gnitz.U8
-            b: gnitz.I8
-            c: gnitz.U16
-            d: gnitz.I16
-            e: gnitz.U32
-            f: gnitz.I32
-            g: gnitz.F32
-            h: gnitz.U64
-            i: gnitz.I64
-            j: gnitz.F64
-            k: gnitz.STRING
-            l: gnitz.U128
-        assert len(T._columns) == 12
-
-    def test_string_nullable(self):
-        class T(Struct):
-            pk:    U64 = field(primary_key=True)
-            label: STRING | None
-        assert T._columns[1].type_code == TypeCode.STRING
-        assert T._columns[1].is_nullable is True
-
-    def test_zsetbatch_accepts_struct(self):
-        class T(Struct):
-            pk:  U64 = field(primary_key=True)
-            val: I64
-        batch = ZSetBatch(T)
-        batch.append(pk=1, val=10)
-        assert len(batch) == 1
-
-    def test_schema_matches_manual(self):
-        class T(Struct):
-            pk:  U64 = field(primary_key=True)
-            val: I64 | None
-        manual = Schema([ColumnDef("pk", TypeCode.U64, primary_key=True),
-                         ColumnDef("val", TypeCode.I64, is_nullable=True)])
-        assert T._schema.pk_index == manual.pk_index
-        assert len(T._columns) == len(manual.columns)
-        for a, b in zip(T._columns, manual.columns):
-            assert a.name == b.name
-            assert a.type_code == b.type_code
-            assert a.is_nullable == b.is_nullable
-
-
-class TestStructOnline:
-    """Online tests: Struct-based create_table → push → scan round-trip."""
-
-    def test_create_table_with_struct(self, client):
-        class T(Struct):
-            pk:  U64 = field(primary_key=True)
-            val: I64
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        tid = client.create_table(sn, "t", T)
-        assert isinstance(tid, int) and tid > 0
-        client.drop_table(sn, "t")
-        client.drop_schema(sn)
-
-    def test_round_trip(self, client):
-        class T(Struct):
-            pk:  U64 = field(primary_key=True)
-            val: I64
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        tid = client.create_table(sn, "t", T)
-        batch = ZSetBatch(T)
-        batch.append(pk=1, val=10)
-        batch.append(pk=2, val=20)
-        client.push(tid, batch)
-        data = {r.pk: r.val for r in client.scan(tid)}
-        assert data == {1: 10, 2: 20}
-        client.drop_table(sn, "t")
-        client.drop_schema(sn)
-
-    def test_nullable_round_trip(self, client):
-        class T(Struct):
-            pk:    U64 = field(primary_key=True)
-            label: STRING | None
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        tid = client.create_table(sn, "t", T)
-        batch = ZSetBatch(T)
-        batch.append(pk=1, label="hello")
-        batch.append(pk=2, label=None)
-        client.push(tid, batch)
-        rows = {r.pk: r.label for r in client.scan(tid)}
-        assert rows[1] == "hello"
-        assert rows[2] is None
-        client.drop_table(sn, "t")
-        client.drop_schema(sn)
 
 
 class TestEmptyTableLazySchema:

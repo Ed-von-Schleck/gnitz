@@ -588,7 +588,7 @@ class TestU128:
         try:
             client.execute_sql(self._CREATE_PK, schema_name=sn)
             _, schema = client.resolve_table(sn, "t")
-            assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.U128
+            assert schema.columns[schema.pk_indices[0]].type_code == gnitz.TypeCode.U128
         finally:
             _cleanup(client, sn, "t")
 
@@ -602,7 +602,7 @@ class TestU128:
                 schema_name=sn,
             )
             _, schema = client.resolve_table(sn, "t")
-            assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.U128
+            assert schema.columns[schema.pk_indices[0]].type_code == gnitz.TypeCode.U128
         finally:
             _cleanup(client, sn, "t")
 
@@ -1005,7 +1005,7 @@ class TestUUID:
         try:
             client.execute_sql(self._CREATE_PK, schema_name=sn)
             _, schema = client.resolve_table(sn, "t")
-            assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.UUID
+            assert schema.columns[schema.pk_indices[0]].type_code == gnitz.TypeCode.UUID
         finally:
             _cleanup(client, sn, "t")
 
@@ -1032,7 +1032,7 @@ class TestUUID:
                 schema_name=sn,
             )
             _, schema = client.resolve_table(sn, "t")
-            assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.U128
+            assert schema.columns[schema.pk_indices[0]].type_code == gnitz.TypeCode.U128
             tid, _ = client.resolve_table(sn, "t")
             client.execute_sql("INSERT INTO t VALUES (42, 1)", schema_name=sn)
             rows = _scan_map(client, tid)
@@ -1487,7 +1487,7 @@ class TestPKNativeTypes:
         try:
             self._create_table_with_pk(client, sn, "TINYINT")
             _, schema = client.resolve_table(sn, "t")
-            assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.I8
+            assert schema.columns[schema.pk_indices[0]].type_code == gnitz.TypeCode.I8
         finally:
             _cleanup(client, sn, "t")
 
@@ -1496,7 +1496,7 @@ class TestPKNativeTypes:
         try:
             self._create_table_with_pk(client, sn, "SMALLINT")
             _, schema = client.resolve_table(sn, "t")
-            assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.I16
+            assert schema.columns[schema.pk_indices[0]].type_code == gnitz.TypeCode.I16
         finally:
             _cleanup(client, sn, "t")
 
@@ -1505,7 +1505,7 @@ class TestPKNativeTypes:
         try:
             self._create_table_with_pk(client, sn, "INT")
             _, schema = client.resolve_table(sn, "t")
-            assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.I32
+            assert schema.columns[schema.pk_indices[0]].type_code == gnitz.TypeCode.I32
         finally:
             _cleanup(client, sn, "t")
 
@@ -1514,7 +1514,7 @@ class TestPKNativeTypes:
         try:
             self._create_table_with_pk(client, sn, "BIGINT")
             _, schema = client.resolve_table(sn, "t")
-            assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.I64
+            assert schema.columns[schema.pk_indices[0]].type_code == gnitz.TypeCode.I64
         finally:
             _cleanup(client, sn, "t")
 
@@ -1523,7 +1523,7 @@ class TestPKNativeTypes:
         try:
             self._create_table_with_pk(client, sn, "BIGINT UNSIGNED")
             _, schema = client.resolve_table(sn, "t")
-            assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.U64
+            assert schema.columns[schema.pk_indices[0]].type_code == gnitz.TypeCode.U64
         finally:
             _cleanup(client, sn, "t")
 
@@ -1533,7 +1533,7 @@ class TestPKNativeTypes:
         try:
             self._create_table_with_pk(client, sn, "DECIMAL(38,0)")
             _, schema = client.resolve_table(sn, "t")
-            assert schema.columns[schema.pk_index].type_code == gnitz.TypeCode.U128
+            assert schema.columns[schema.pk_indices[0]].type_code == gnitz.TypeCode.U128
         finally:
             _cleanup(client, sn, "t")
 

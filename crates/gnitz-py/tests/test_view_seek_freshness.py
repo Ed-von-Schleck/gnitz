@@ -72,7 +72,7 @@ def _make_t_and_v(client, sn):
 
 def _push_one(client, tid, schema, pk, val, weight=1):
     batch = gnitz.ZSetBatch(schema)
-    batch.append(pk=pk, val=val, weight=weight)
+    batch.append(pk=pk, val=val, _weight=weight)
     client.push(tid, batch)
 
 

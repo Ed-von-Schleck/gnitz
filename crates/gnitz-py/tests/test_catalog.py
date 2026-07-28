@@ -166,7 +166,7 @@ class TestTableDDL:
         try:
             client.create_table(sn, tn, cols)
             _, schema = client.resolve_table(sn, tn)
-            assert schema.pk_index == 1
+            assert schema.pk_indices[0] == 1
         finally:
             try:
                 client.drop_table(sn, tn)
@@ -461,7 +461,7 @@ class TestViewLifecycle:
                 ins.append(pk=i, val=i * 10)
             client.push(tid, ins)
             ret = gnitz.ZSetBatch(schema)
-            ret.append(pk=2, val=20, weight=-1)
+            ret.append(pk=2, val=20, _weight=-1)
             client.push(tid, ret)
             rows = _scan_positive(client, vid)
             pks = {r.pk for r in rows}

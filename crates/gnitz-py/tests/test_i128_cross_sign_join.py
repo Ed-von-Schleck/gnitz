@@ -49,7 +49,7 @@ def _i128_schema():
             ColumnDef("pk", TypeCode.I128, primary_key=True),
             ColumnDef("dup", TypeCode.I128),
         ],
-        pk_index=0,
+        pk_indices=[0],
     )
 
 

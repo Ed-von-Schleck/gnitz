@@ -68,7 +68,7 @@ class TestSchemaMismatch:
             _cleanup(client, sn, tables=["t"])
 
     def test_wrong_pk_index(self, client):
-        """Batch that declares pk_index=1 when the table uses pk_index=0 must be rejected."""
+        """Batch keyed on column 1 when the table is keyed on column 0 must be rejected."""
         sn = "err" + _uid()
         try:
             tid = self._make_table(client, sn)
