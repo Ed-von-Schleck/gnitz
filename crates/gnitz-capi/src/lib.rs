@@ -1235,12 +1235,18 @@ pub unsafe extern "C" fn gnitz_seek(
 ) -> c_int {
     clear_error();
     let c = check_ptr_mut!(conn, -1);
-    if pk_bytes.is_null() || pk_len == 0 || pk_len > gnitz_core::MAX_PK_BYTES {
-        set_error("gnitz_seek: invalid pk_bytes or pk_len");
+    if pk_bytes.is_null() {
+        set_error("gnitz_seek: null pk_bytes");
         return -1;
     }
     let pk_slice = unsafe { std::slice::from_raw_parts(pk_bytes, pk_len) };
-    let t = gnitz_core::PkTuple::from_bytes(pk_slice);
+    let t = match gnitz_core::PkTuple::try_from_bytes(pk_slice) {
+        Ok(t) => t,
+        Err(e) => {
+            set_error(format!("gnitz_seek: {e}"));
+            return -1;
+        }
+    };
     match c.0.seek(table_id, &t) {
         Ok((server_schema, data, _)) => {
             if !out_batch.is_null() {
@@ -1380,9 +1386,10 @@ pub unsafe extern "C" fn gnitz_execute_sql(
 /// C return code for a SQL execution error: a retryable OCC conflict gets the
 /// dedicated `GNITZ_ERR_TXN_CONFLICT`; every other error keeps the generic `-1`.
 fn sql_error_code(e: &GnitzSqlError) -> c_int {
-    match e {
-        GnitzSqlError::Conflict { .. } => GNITZ_ERR_TXN_CONFLICT,
-        _ => -1,
+    if e.is_conflict() {
+        GNITZ_ERR_TXN_CONFLICT
+    } else {
+        -1
     }
 }
 

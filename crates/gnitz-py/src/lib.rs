@@ -7,11 +7,11 @@ use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 use gnitz_core::protocol::types::type_code_from_u64;
 use gnitz_core::{
     null_word_get, null_word_set, ClientError, ColData, ColumnDef, PkColumn, Schema, TypeCode, WireConflictMode,
-    ZSetBatch, MAX_PK_BYTES,
+    ZSetBatch,
 };
 use gnitz_core::{Circuit, CircuitBuilder, ExprBuilder, ExprProgram, GnitzClient};
 use gnitz_expr::{ColumnLocator, SchemaFacts};
-use gnitz_sql::{GnitzSqlError, SqlPlanner, SqlResult};
+use gnitz_sql::{SqlPlanner, SqlResult};
 
 // ---------------------------------------------------------------------------
 // GnitzError Python exception
@@ -25,51 +25,29 @@ pyo3::create_exception!(_native, GnitzError, pyo3::exceptions::PyException);
 pyo3::create_exception!(_native, GnitzConflictError, GnitzError);
 
 /// Wrap any `Display` error as a `GnitzError` PyErr. For the handful of
-/// non-`ClientError` failures (handshake, waker setup, wire validation); every
-/// `ClientError` goes through [`to_py_err`] instead.
+/// failures that carry no retryability verdict (handshake, waker setup).
 fn gnitz_err(e: impl std::fmt::Display) -> PyErr {
     GnitzError::new_err(e.to_string())
 }
 
-/// Map a client error to a Python exception, routing a `TxnConflict` to the
-/// dedicated retryable `GnitzConflictError` (everything else → `GnitzError`).
-/// Every `ClientError` in this file passes through here, so whether a conflict
-/// stays retryable can never depend on which call site raised it.
-fn to_py_err<T>(res: Result<T, ClientError>) -> PyResult<T> {
-    res.map_err(|e| {
-        let msg = e.to_string();
-        match e {
-            ClientError::TxnConflict { .. } => GnitzConflictError::new_err(msg),
-            _ => GnitzError::new_err(msg),
-        }
-    })
-}
-
-/// Map a SQL execution error to a Python exception. An OCC conflict
-/// (`GnitzSqlError::Conflict`) routes to the dedicated, retryable
-/// `GnitzConflictError`; everything else falls back to the generic `GnitzError`.
-/// The `Conflict` Display already synthesizes the user-facing message (naming the
-/// table for an autocommit statement), so `to_string` carries it verbatim.
-fn sql_err_to_py(e: GnitzSqlError) -> PyErr {
-    let msg = e.to_string();
-    match e {
-        GnitzSqlError::Conflict { .. } => GnitzConflictError::new_err(msg),
-        _ => GnitzError::new_err(msg),
+/// Wrap a `Display` failure that has already classified itself: a retryable OCC
+/// conflict becomes the dedicated `GnitzConflictError` (a `GnitzError` subclass,
+/// so existing `except GnitzError` handlers still catch it while applications
+/// that want to retry can name it), everything else the generic `GnitzError`.
+/// The verdict comes from the error enum's own `is_conflict`, never from a match
+/// re-typed here, so it cannot depend on which call site raised it.
+fn err_with_conflict(e: impl std::fmt::Display, conflict: bool) -> PyErr {
+    if conflict {
+        GnitzConflictError::new_err(e.to_string())
+    } else {
+        gnitz_err(e)
     }
 }
 
-/// Borrow a builder that has not been consumed yet, or raise. Paired with
-/// [`take_once`], this replaces the per-type "unwrap the `Option` or raise"
-/// macros that each `#[pyclass]` wrapper used to carry.
-fn live_mut<'a, T>(slot: &'a mut Option<T>, what: &str) -> PyResult<&'a mut T> {
-    slot.as_mut()
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("{what} already consumed")))
-}
-
-/// Consume a builder, or raise if it is already gone.
-fn take_once<T>(slot: &mut Option<T>, what: &str) -> PyResult<T> {
-    slot.take()
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("{what} already consumed")))
+/// Map a client error to a Python exception. Every `ClientError` in this file
+/// passes through here.
+fn to_py_err<T>(res: Result<T, ClientError>) -> PyResult<T> {
+    res.map_err(|e| err_with_conflict(&e, e.is_conflict()))
 }
 
 // ---------------------------------------------------------------------------
@@ -135,19 +113,13 @@ fn rust_col_to_py(py: Python<'_>, c: &ColumnDef, primary_key: bool) -> PyResult<
 // Schema
 // ---------------------------------------------------------------------------
 
-/// Stores columns as a Python list of PyColumnDef so Python can access
-/// schema.columns[i].type_code etc. without any extra copies, alongside the
-/// validated Rust `Schema` those columns denote.
+/// A validated Rust `Schema`, and nothing else: `columns` is derived from it on
+/// access, so there is no second representation that could drift.
 ///
 /// The PK column indices are held in **sort order** — e.g. `pk_indices=[2, 1]`
 /// sorts by col 2 first, then col 1. Order matters for seek/range semantics.
 #[pyclass(name = "Schema")]
 pub struct PySchema {
-    pub(crate) columns: Py<PyList>,
-    /// The validated Rust `Schema`, built once at construction. `ColumnDef` is
-    /// read-only from Python, so it can never drift from `columns` — and every
-    /// method that needs a `&Schema` clones this `Arc` rather than re-extracting
-    /// the whole column list from Python.
     pub(crate) rust: Arc<Schema>,
 }
 
@@ -188,15 +160,12 @@ impl PySchema {
         // `Schema::from_parts` applies the shared rule set — the MAX_COLUMNS cap,
         // the structural PK rules, and per-PK-column nullability/eligibility.
         let rust = Schema::from_parts(cols, pk_cols).map_err(pyo3::exceptions::PyValueError::new_err)?;
-        Ok(PySchema {
-            columns: columns.unbind(),
-            rust: Arc::new(rust),
-        })
+        Ok(PySchema { rust: Arc::new(rust) })
     }
 
     #[getter]
-    pub fn columns<'py>(&self, py: Python<'py>) -> Bound<'py, PyList> {
-        self.columns.bind(py).clone()
+    pub fn columns<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        rust_columns_to_py(py, &self.rust)
     }
 
     #[getter]
@@ -274,21 +243,22 @@ fn resolve_py_schema<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<
     Bound::new(py, PySchema::new(list.clone(), None, None)?)
 }
 
-fn rust_schema_to_py(py: Python<'_>, s: &Arc<Schema>) -> PyResult<Py<PySchema>> {
+/// The schema's columns as a fresh Python list of `ColumnDef`, each flagged
+/// with whether it is a PK column. Derived from the Rust `Schema` on every
+/// access — it is the only representation, so `Schema.columns[i].primary_key`
+/// always reflects the PK list the schema actually validated.
+fn rust_columns_to_py<'py>(py: Python<'py>, s: &Schema) -> PyResult<Bound<'py, PyList>> {
     let py_cols: Vec<PyObject> = s
         .columns
         .iter()
         .enumerate()
         .map(|(i, c)| rust_col_to_py(py, c, s.is_pk_col(i)))
         .collect::<PyResult<_>>()?;
-    let list = PyList::new(py, py_cols)?;
-    Py::new(
-        py,
-        PySchema {
-            columns: list.unbind(),
-            rust: Arc::clone(s),
-        },
-    )
+    PyList::new(py, py_cols)
+}
+
+fn rust_schema_to_py(py: Python<'_>, s: &Arc<Schema>) -> PyResult<Py<PySchema>> {
+    Py::new(py, PySchema { rust: Arc::clone(s) })
 }
 
 // ---------------------------------------------------------------------------
@@ -355,7 +325,7 @@ impl PyRow {
     }
 
     pub fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
-        Ok(self.values.bind(py).as_any().call_method0("__iter__")?.unbind())
+        Ok(self.values.bind(py).as_any().try_iter()?.into_any().unbind())
     }
 
     pub fn __len__(&self, py: Python<'_>) -> usize {
@@ -595,14 +565,7 @@ impl PyZSetBatch {
         weight: i64,
         values: Option<Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, Self>> {
-        let empty;
-        let dict = match values {
-            Some(d) => d,
-            None => {
-                empty = PyDict::new(slf.py());
-                empty
-            }
-        };
+        let dict = values.unwrap_or_else(|| PyDict::new(slf.py()));
         slf.borrow_mut().append_from_dict_inner(&dict, weight)?;
         Ok(slf)
     }
@@ -720,12 +683,16 @@ fn write_fixed_le_into(dst: &mut [u8], tc: TypeCode, item: &Bound<'_, PyAny>) ->
     Ok(())
 }
 
-/// Write one fixed-width value as little-endian bytes into the tail of `buf`.
+/// Write one fixed-width value as little-endian bytes onto the tail of `buf`.
+/// Encodes into a stack slot first: growing `buf` up front would zero-fill
+/// bytes the write immediately overwrites, and the extraction call in between
+/// stops the compiler from eliminating the fill.
 fn write_fixed_le(buf: &mut Vec<u8>, tc: TypeCode, item: &Bound<'_, PyAny>) -> PyResult<()> {
     let stride = tc.wire_stride();
-    let start = buf.len();
-    buf.resize(start + stride, 0);
-    write_fixed_le_into(&mut buf[start..start + stride], tc, item)
+    let mut tmp = [0u8; 16];
+    write_fixed_le_into(&mut tmp[..stride], tc, item)?;
+    buf.extend_from_slice(&tmp[..stride]);
+    Ok(())
 }
 
 /// Materialize a `PkColumn` as a Python list. A single-column key surfaces as
@@ -741,26 +708,18 @@ fn pk_column_to_pylist(py: Python<'_>, schema: &Schema, pks: &PkColumn) -> PyRes
             .collect();
         return Ok(PyList::new(py, items)?.unbind());
     }
-    let stride = schema.pk_stride() as u8;
+    let stride = schema.pk_stride();
     let tc = schema.columns[schema.pk_indices()[0]].type_code;
     let items: Vec<PyObject> = (0..pks.len())
-        .map(|i| pk_value_from_tuple(py, tc, 0, stride as usize, &pks.get_tuple(i, stride)))
+        .map(|i| pk_value_to_py(py, tc, pks.col_window(i, 0, stride).as_slice()))
         .collect::<PyResult<_>>()?;
     Ok(PyList::new(py, items)?.unbind())
 }
 
-/// Decode one PK column into a Python value, given its already-extracted
-/// `PkTuple` bytes for that row and the column's precomputed layout (type code,
-/// byte offset within the tuple, wire stride — hoisted by the callers so the
-/// per-row loop does no schema lookups).
-fn pk_value_from_tuple(
-    py: Python<'_>,
-    tc: TypeCode,
-    offset: usize,
-    stride: usize,
-    t: &gnitz_core::PkTuple,
-) -> PyResult<PyObject> {
-    let bytes = &t.buf[offset..offset + stride];
+/// Decode one PK column's native-LE bytes into a Python value. The 16-byte
+/// integer types route through [`u128_value_to_py`] so a PK renders exactly as
+/// the same column would in a payload; everything else is a fixed-width read.
+fn pk_value_to_py(py: Python<'_>, tc: TypeCode, bytes: &[u8]) -> PyResult<PyObject> {
     match tc {
         TypeCode::UUID | TypeCode::U128 | TypeCode::I128 => {
             u128_value_to_py(py, u128::from_le_bytes(bytes.try_into().unwrap()), tc)
@@ -769,29 +728,21 @@ fn pk_value_from_tuple(
     }
 }
 
-/// Read one fixed-width value as a Python object (integers as int, floats as float).
+/// Read one fixed-width value as a Python object (integers as int, floats as
+/// float). Widths come from `slice.len()` via the shared
+/// `read_signed_exact`/`read_unsigned_exact` pair, so the 1/2/4/8-byte table is
+/// not restated here; only the sign and float distinctions are type-directed.
 fn read_fixed_le(py: Python<'_>, tc: TypeCode, slice: &[u8]) -> PyObject {
-    macro_rules! num {
-        ($t:ty) => {
-            <$t>::from_le_bytes(slice.try_into().unwrap())
-                .into_pyobject(py)
-                .unwrap()
-                .into_any()
-                .unbind()
+    macro_rules! obj {
+        ($v:expr) => {
+            $v.into_pyobject(py).unwrap().into_any().unbind()
         };
     }
     match tc {
-        TypeCode::U8 => num!(u8),
-        TypeCode::I8 => num!(i8),
-        TypeCode::U16 => num!(u16),
-        TypeCode::I16 => num!(i16),
-        TypeCode::U32 => num!(u32),
-        TypeCode::I32 => num!(i32),
-        TypeCode::F32 => num!(f32),
-        TypeCode::U64 => num!(u64),
-        TypeCode::I64 => num!(i64),
-        TypeCode::F64 => num!(f64),
-        TypeCode::String | TypeCode::U128 | TypeCode::UUID | TypeCode::Blob | TypeCode::I128 => unreachable!(),
+        TypeCode::F32 => obj!(f32::from_le_bytes(slice.try_into().unwrap())),
+        TypeCode::F64 => obj!(f64::from_le_bytes(slice.try_into().unwrap())),
+        _ if tc.is_signed_int() => obj!(gnitz_wire::read_signed_exact(slice)),
+        _ => obj!(gnitz_wire::read_unsigned_exact(slice)),
     }
 }
 
@@ -863,11 +814,6 @@ struct SharedBatchData {
     /// `field_index`, and `scalars` all index through this, so every
     /// presentation surface agrees on positions.
     present: Vec<PresentedCol>,
-    /// `schema.pk_stride()`, the packed PK tuple width.
-    pk_stride: u8,
-    /// Whether any presented column is a PK column — when false, the per-row
-    /// build skips the PK tuple extraction entirely.
-    has_pk: bool,
 }
 
 fn make_shared_batch_data(
@@ -892,8 +838,6 @@ fn make_shared_batch_data(
             .collect::<HashMap<String, usize>>(),
     );
     Ok(Arc::new(SharedBatchData {
-        has_pk: present.iter().any(|(_, l)| matches!(l, ColumnLocator::Pk { .. })),
-        pk_stride: s.pk_stride() as u8,
         schema: s,
         batch: b,
         fields,
@@ -903,25 +847,16 @@ fn make_shared_batch_data(
 }
 
 /// Decode one cell at `loc` in `row`, for either a PK or a payload column.
-/// The single per-cell decode, shared by the row build and `scalars`; `pk` is
-/// the row's PK tuple, required only when `loc` is a PK column.
-fn value_at(
-    py: Python<'_>,
-    data: &SharedBatchData,
-    ci: usize,
-    loc: ColumnLocator,
-    row: usize,
-    pk: Option<&gnitz_core::PkTuple>,
-) -> PyResult<PyObject> {
+/// The single per-cell decode, shared by the row build and `scalars`. A PK
+/// column reads its own bytes straight out of the PK region — no whole-tuple
+/// copy, so a one-column read costs one column.
+fn value_at(py: Python<'_>, data: &SharedBatchData, ci: usize, loc: ColumnLocator, row: usize) -> PyResult<PyObject> {
     let tc = TypeCode::from_validated_u8(loc.type_code());
     match loc {
-        ColumnLocator::Pk { byte_off, size, .. } => pk_value_from_tuple(
-            py,
-            tc,
-            byte_off as usize,
-            size as usize,
-            pk.expect("a PK column is only decoded with its row's PK tuple"),
-        ),
+        ColumnLocator::Pk { byte_off, size, .. } => {
+            let w = data.batch.pks.col_window(row, byte_off as usize, size as usize);
+            pk_value_to_py(py, tc, w.as_slice())
+        }
         ColumnLocator::Payload { slot, size, .. } => {
             let is_null = null_word_get(data.batch.nulls[row], slot as usize);
             cell_to_py(py, &data.batch.columns[ci], row, is_null, tc, size as usize)
@@ -931,9 +866,8 @@ fn value_at(
 
 /// Build Python values for a single row from Rust data, appending to `out`.
 fn build_row_values_into(py: Python<'_>, data: &SharedBatchData, row: usize, out: &mut Vec<PyObject>) -> PyResult<()> {
-    let pk = data.has_pk.then(|| data.batch.pks.get_tuple(row, data.pk_stride));
     for &(ci, loc) in &data.present {
-        out.push(value_at(py, data, ci, loc, row, pk.as_ref())?);
+        out.push(value_at(py, data, ci, loc, row)?);
     }
     Ok(())
 }
@@ -1053,12 +987,10 @@ impl PyScanResult {
         }
     }
 
+    /// Truthiness follows from this: CPython derives `__bool__` from `__len__`
+    /// when a type defines no `nb_bool`.
     fn __len__(&self) -> usize {
         self.data.as_ref().map_or(0, |d| d.batch.len())
-    }
-
-    fn __bool__(&self) -> bool {
-        self.__len__() > 0
     }
 
     fn all(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
@@ -1143,18 +1075,13 @@ impl PyScanResult {
             }
         };
         // The presented-column table already holds this column's resolved
-        // address, so the row loop below does no schema lookups. `get_tuple`
-        // keeps compound-PK (`PkColumn::Bytes`) batches working.
+        // address, so the row loop below does no schema lookups.
         let (ci, loc) = *data
             .present
             .get(pos)
             .ok_or_else(|| pyo3::exceptions::PyIndexError::new_err("column index out of range"))?;
-        let is_pk = matches!(loc, ColumnLocator::Pk { .. });
         let items: Vec<PyObject> = (0..data.batch.len())
-            .map(|i| {
-                let pk = is_pk.then(|| data.batch.pks.get_tuple(i, data.pk_stride));
-                value_at(py, data, ci, loc, i, pk.as_ref())
-            })
+            .map(|i| value_at(py, data, ci, loc, i))
             .collect::<PyResult<_>>()?;
         Ok(PyList::new(py, items)?.unbind())
     }
@@ -1164,7 +1091,7 @@ impl PyScanResult {
 // PyRowIterator
 // ---------------------------------------------------------------------------
 
-#[pyclass]
+#[pyclass(name = "RowIterator")]
 pub struct PyRowIterator {
     data: Option<Arc<SharedBatchData>>,
     row_buf: Vec<PyObject>,
@@ -1239,8 +1166,11 @@ impl PyGnitzClient {
 #[pymethods]
 impl PyGnitzClient {
     #[new]
-    pub fn new(socket_path: &str) -> PyResult<Self> {
-        to_py_err(GnitzClient::connect(socket_path)).map(|c| PyGnitzClient { inner: Some(c) })
+    pub fn new(py: Python<'_>, socket_path: &str) -> PyResult<Self> {
+        // Connect + HELLO are blocking syscalls (up to a 10 s timeout for a
+        // `tls://` target); drop the GIL across them as every other blocking
+        // method here does.
+        to_py_err(py.allow_threads(|| GnitzClient::connect(socket_path))).map(|c| PyGnitzClient { inner: Some(c) })
     }
 
     /// The client's current OCC basis (the running max of observed server
@@ -1374,17 +1304,17 @@ impl PyGnitzClient {
         PyCircuitBuilder::new(source_table_id, 0)
     }
 
-    /// create_view_with_circuit — CONSUMES circuit. `columns` may be a
-    /// `Schema`, a `Struct` subclass (`_schema`), or a list of `ColumnDef`.
+    /// create_view_with_circuit. `columns` may be a `Schema`, a `Struct`
+    /// subclass (`_schema`), or a list of `ColumnDef`.
     pub fn create_view_with_circuit(
         &mut self,
         py: Python<'_>,
         schema_name: &str,
         view_name: &str,
-        mut circuit: PyRefMut<'_, PyCircuit>,
+        circuit: PyRef<'_, PyCircuit>,
         columns: Bound<'_, PyAny>,
     ) -> PyResult<u64> {
-        let circuit = take_once(&mut circuit.inner, "Circuit")?;
+        let circuit = circuit.inner.clone();
         let schema = Arc::clone(&resolve_py_schema(py, &columns)?.borrow().rust);
         // Hand-built circuits from the Python API emit a single output PK at slot 0.
         let c = self.live()?;
@@ -1489,7 +1419,7 @@ impl PyGnitzClient {
         let client_ref = self.live()?;
         let results = py
             .allow_threads(|| SqlPlanner::new(client_ref, schema_name).execute(sql))
-            .map_err(sql_err_to_py)?;
+            .map_err(|e| err_with_conflict(&e, e.is_conflict()))?;
 
         let py_list = PyList::empty(py);
         for r in results {
@@ -1547,16 +1477,6 @@ impl PyGnitzClient {
 // ExprBuilder + ExprProgram
 // ---------------------------------------------------------------------------
 
-fn parse_conflict_mode(mode: &str) -> PyResult<WireConflictMode> {
-    match mode {
-        "update" => Ok(WireConflictMode::Update),
-        "error" => Ok(WireConflictMode::Error),
-        other => Err(GnitzError::new_err(format!(
-            "invalid conflict mode '{other}', expected 'update' or 'error'"
-        ))),
-    }
-}
-
 /// Atomic write-batch transaction context manager: an RAII handle on the
 /// client's open transaction. `push`/`delete` are the client's own write methods
 /// — they buffer because a transaction is open, exactly as a SQL `INSERT` between
@@ -1579,7 +1499,7 @@ impl PyTxn {
     /// (`"update"` — the default — or `"error"`).
     #[pyo3(signature = (target_id, batch, mode = "update"))]
     pub fn push(&mut self, py: Python<'_>, target_id: u64, batch: PyRef<'_, PyZSetBatch>, mode: &str) -> PyResult<()> {
-        let m = parse_conflict_mode(mode)?;
+        let m: WireConflictMode = mode.parse().map_err(gnitz_err)?;
         // Hold the `PyRef` guard here and pass only the plain `&Schema`/
         // `&ZSetBatch` into the closure, so `with_client` can drop the GIL.
         let schema = batch.schema.as_ref();
@@ -1649,40 +1569,34 @@ impl PyTxn {
 }
 
 #[pyclass(name = "ExprBuilder")]
+#[derive(Default)]
 pub struct PyExprBuilder {
-    inner: Option<ExprBuilder>,
-}
-
-impl Default for PyExprBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
+    inner: ExprBuilder,
 }
 
 #[pymethods]
 impl PyExprBuilder {
     #[new]
     pub fn new() -> Self {
-        PyExprBuilder {
-            inner: Some(ExprBuilder::new()),
+        Self::default()
+    }
+
+    pub fn load_col_int(&mut self, col_idx: usize) -> u32 {
+        self.inner.load_col_int(col_idx)
+    }
+    pub fn load_const(&mut self, value: i64) -> u32 {
+        self.inner.load_const(value)
+    }
+    pub fn cmp_gt(&mut self, a: u32, b: u32) -> u32 {
+        self.inner.cmp_gt(a, b)
+    }
+
+    /// Compile the program built so far. The builder stays usable, so one
+    /// builder can yield programs for several result registers.
+    pub fn build(&self, result_reg: u32) -> PyExprProgram {
+        PyExprProgram {
+            inner: self.inner.clone().build(result_reg),
         }
-    }
-
-    pub fn load_col_int(&mut self, col_idx: usize) -> PyResult<u32> {
-        Ok(live_mut(&mut self.inner, "ExprBuilder")?.load_col_int(col_idx))
-    }
-    pub fn load_const(&mut self, value: i64) -> PyResult<u32> {
-        Ok(live_mut(&mut self.inner, "ExprBuilder")?.load_const(value))
-    }
-    pub fn cmp_gt(&mut self, a: u32, b: u32) -> PyResult<u32> {
-        Ok(live_mut(&mut self.inner, "ExprBuilder")?.cmp_gt(a, b))
-    }
-
-    /// Consume the builder and return a compiled ExprProgram.
-    pub fn build(&mut self, result_reg: u32) -> PyResult<PyExprProgram> {
-        Ok(PyExprProgram {
-            inner: take_once(&mut self.inner, "ExprBuilder")?.build(result_reg),
-        })
     }
 }
 
@@ -1707,7 +1621,7 @@ impl PyExprProgram {
 
 #[pyclass(name = "CircuitBuilder")]
 pub struct PyCircuitBuilder {
-    inner: Option<CircuitBuilder>,
+    inner: CircuitBuilder,
 }
 
 #[pymethods]
@@ -1719,74 +1633,70 @@ impl PyCircuitBuilder {
     #[pyo3(signature = (primary_source_id, view_id = 0))]
     pub fn new(primary_source_id: u64, view_id: u64) -> Self {
         PyCircuitBuilder {
-            inner: Some(CircuitBuilder::new(view_id, primary_source_id)),
+            inner: CircuitBuilder::new(view_id, primary_source_id),
         }
     }
 
-    pub fn input_delta(&mut self) -> PyResult<u64> {
-        Ok(live_mut(&mut self.inner, "CircuitBuilder")?.input_delta())
+    pub fn input_delta(&mut self) -> u64 {
+        self.inner.input_delta()
     }
-    pub fn negate(&mut self, input: u64) -> PyResult<u64> {
-        Ok(live_mut(&mut self.inner, "CircuitBuilder")?.negate(input))
+    pub fn negate(&mut self, input: u64) -> u64 {
+        self.inner.negate(input)
     }
-    pub fn union(&mut self, a: u64, b: u64) -> PyResult<u64> {
-        Ok(live_mut(&mut self.inner, "CircuitBuilder")?.union(a, b))
+    pub fn union(&mut self, a: u64, b: u64) -> u64 {
+        self.inner.union(a, b)
     }
-    pub fn distinct(&mut self, input: u64) -> PyResult<u64> {
-        Ok(live_mut(&mut self.inner, "CircuitBuilder")?.distinct(input))
+    pub fn distinct(&mut self, input: u64) -> u64 {
+        self.inner.distinct(input)
     }
 
     /// filter(input, expr=None) — clones ExprProgram so Python keeps its reference.
     #[pyo3(signature = (input, expr = None))]
-    pub fn filter(&mut self, input: u64, expr: Option<PyRef<'_, PyExprProgram>>) -> PyResult<u64> {
+    pub fn filter(&mut self, input: u64, expr: Option<PyRef<'_, PyExprProgram>>) -> u64 {
         let expr_opt = expr.map(|e| e.inner.clone());
-        Ok(live_mut(&mut self.inner, "CircuitBuilder")?.filter(input, expr_opt))
+        self.inner.filter(input, expr_opt)
     }
 
     #[pyo3(signature = (input, projection = None))]
-    pub fn map(&mut self, input: u64, projection: Option<Vec<usize>>) -> PyResult<u64> {
-        Ok(live_mut(&mut self.inner, "CircuitBuilder")?.map(input, projection.as_deref().unwrap_or(&[])))
+    pub fn map(&mut self, input: u64, projection: Option<Vec<usize>>) -> u64 {
+        self.inner.map(input, projection.as_deref().unwrap_or(&[]))
     }
 
-    pub fn join(&mut self, delta: u64, trace_table_id: u64) -> PyResult<u64> {
-        Ok(live_mut(&mut self.inner, "CircuitBuilder")?.join(delta, trace_table_id))
+    pub fn join(&mut self, delta: u64, trace_table_id: u64) -> u64 {
+        self.inner.join(delta, trace_table_id)
     }
 
     #[pyo3(signature = (input, group_by_cols, agg_func_id = 0, agg_col_idx = 0))]
-    pub fn reduce(
-        &mut self,
-        input: u64,
-        group_by_cols: Vec<usize>,
-        agg_func_id: u64,
-        agg_col_idx: usize,
-    ) -> PyResult<u64> {
-        Ok(live_mut(&mut self.inner, "CircuitBuilder")?.reduce(input, &group_by_cols, agg_func_id, agg_col_idx))
+    pub fn reduce(&mut self, input: u64, group_by_cols: Vec<usize>, agg_func_id: u64, agg_col_idx: usize) -> u64 {
+        self.inner.reduce(input, &group_by_cols, agg_func_id, agg_col_idx)
     }
 
-    pub fn sink(&mut self, input: u64) -> PyResult<u64> {
-        Ok(live_mut(&mut self.inner, "CircuitBuilder")?.sink(input))
+    pub fn sink(&mut self, input: u64) -> u64 {
+        self.inner.sink(input)
     }
 
-    /// Consume builder and produce a Circuit for create_view_with_circuit.
-    pub fn build(&mut self) -> PyResult<PyCircuit> {
-        Ok(PyCircuit {
-            inner: Some(take_once(&mut self.inner, "CircuitBuilder")?.build()),
-        })
+    /// Snapshot the graph built so far as a Circuit for
+    /// `create_view_with_circuit`. The builder stays usable.
+    pub fn build(&self) -> PyCircuit {
+        PyCircuit {
+            inner: self.inner.clone().build(),
+        }
     }
 }
 
 #[pyclass(name = "Circuit")]
 pub struct PyCircuit {
-    pub(crate) inner: Option<Circuit>,
+    pub(crate) inner: Circuit,
 }
 
 #[pymethods]
 impl PyCircuit {
     pub fn __repr__(&self) -> String {
-        match &self.inner {
-            Some(c) => format!("Circuit(view_id={}, nodes={})", c.view_id, c.nodes.len()),
-            None => "Circuit(consumed)".to_string(),
-        }
+        format!(
+            "Circuit(view_id={}, nodes={})",
+            self.inner.view_id,
+            self.inner.nodes.len()
+        )
     }
 }
 
@@ -1799,11 +1709,7 @@ fn pk_tuple_from_py(pk: &Bound<'_, PyAny>) -> PyResult<gnitz_core::PkTuple> {
     // bytes first: `downcast` rejects a non-bytes value without materializing a
     // PyErr, whereas `extract_uuid_or_u128` falls through to `getattr("int")`.
     if let Ok(bytes) = pk.downcast::<pyo3::types::PyBytes>() {
-        let b = bytes.as_bytes();
-        if b.is_empty() || b.len() > MAX_PK_BYTES {
-            return Err(pyo3::exceptions::PyValueError::new_err("pk bytes length out of range"));
-        }
-        return Ok(gnitz_core::PkTuple::from_bytes(b));
+        return gnitz_core::PkTuple::try_from_bytes(bytes.as_bytes()).map_err(pyo3::exceptions::PyValueError::new_err);
     }
     if let Ok(val) = extract_uuid_or_u128(pk, None) {
         return Ok(gnitz_core::PkTuple::from_u128_narrow(val));
@@ -1838,9 +1744,12 @@ enum IoOp {
 struct IoRequest {
     op: IoOp,
     target_id: u64,
-    /// Present hidden columns in the resulting rows (scan/seek only).
-    include_hidden: bool,
+    /// The future to resolve, paired with whether its rows present hidden
+    /// columns. `include_hidden` is a property of how the *result* is surfaced,
+    /// not of the request, so it travels with the future all the way to the GIL
+    /// block instead of being copied into the recv and decode types.
     future: Py<PyAny>,
+    include_hidden: bool,
 }
 
 /// Bound on the I/O request channel. Limits RAM when Python sends faster than
@@ -1859,7 +1768,10 @@ struct PyAsyncTransport {
     /// even after the I/O thread has dropped the session (the integer may
     /// already be recycled).
     waker: Option<gnitz_core::TransportWaker>,
-    event_loop: Py<PyAny>,
+    /// `event_loop.create_future`, bound once — the enqueue path calls it per
+    /// operation, and resolving the attribute by name each time would build its
+    /// name string every call. Same treatment `call_soon_threadsafe` gets.
+    create_future: Py<PyAny>,
     client_id: u64,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -1870,7 +1782,7 @@ impl PyAsyncTransport {
             .tx
             .as_ref()
             .ok_or_else(|| GnitzError::new_err("connection closed"))?;
-        let fut = self.event_loop.call_method0(py, "create_future")?;
+        let fut = self.create_future.call0(py)?;
         tx.try_send(IoRequest {
             op,
             target_id,
@@ -1917,9 +1829,10 @@ impl PyAsyncTransport {
         // `GnitzClient` and an `AsyncTransport` cannot mint the same id twice.
         let client_id = gnitz_core::new_client_id();
         let (tx, rx) = std::sync::mpsc::sync_channel(IO_CHANNEL_DEPTH);
-        // Bind `loop.call_soon_threadsafe` once instead of resolving the
-        // attribute (and building its name string) per resolved future.
+        // Bind the two loop methods once instead of resolving the attribute
+        // (and building its name string) per resolved future / per enqueue.
         let call_soon = event_loop.getattr(py, "call_soon_threadsafe")?;
+        let create_future = event_loop.getattr(py, "create_future")?;
         let sr_fn: Py<PyAny> = set_result_fn.clone_ref(py);
         let se_fn: Py<PyAny> = set_exception_fn.clone_ref(py);
 
@@ -1931,7 +1844,7 @@ impl PyAsyncTransport {
         Ok(PyAsyncTransport {
             tx: Some(tx),
             waker: Some(waker),
-            event_loop,
+            create_future,
             client_id,
             thread: Some(handle),
         })
@@ -1973,12 +1886,9 @@ impl PyAsyncTransport {
     /// ride the frame body).
     #[pyo3(signature = (target_ids, include_hidden = false))]
     fn scan_many(&self, py: Python<'_>, target_ids: Vec<u64>, include_hidden: bool) -> PyResult<PyObject> {
-        // Reject a malformed list locally, before enqueue — the same shared check
-        // the sync `Session::scan_multi` and the server run. An empty list would
-        // otherwise send a count=0 frame whose single server error frame the
-        // positional N-train read loop (N=0) never consumes, desyncing the
-        // connection; over-cap / duplicate are fast-fail.
-        gnitz_wire::validate_scan_multi_tids(&target_ids).map_err(gnitz_err)?;
+        // A malformed list (empty, over-cap, duplicate tid) is rejected by
+        // `Session::pack_scan_multi` when the I/O thread packs it, before any
+        // frame is written, and fails this one future.
         self.enqueue(py, IoOp::ScanMulti(target_ids), 0, include_hidden)
     }
 
@@ -2019,45 +1929,30 @@ impl Drop for PyAsyncTransport {
     }
 }
 
-/// Decoded scan response carried by `LoopResult::Scan`. Boxed in that variant so
-/// the scan payload doesn't pad the small `PushOk`/`Error` ones. `include_hidden`
-/// rides along because the GIL block resolves futures from `results` alone,
-/// without the parallel `recv_kinds`.
-struct ScanData {
-    schema: Option<Arc<Schema>>,
-    batch: Option<ZSetBatch>,
-    lsn: u64,
-    include_hidden: bool,
-}
+/// One decoded scan reply: the `(schema, batch, lsn)` triple `Session::recv_scan`
+/// returns and `triple_to_lazy` consumes, unchanged.
+type ScanTriple = (Option<Arc<Schema>>, Option<ZSetBatch>, u64);
 
 /// What one pipelined request's response resolved to.
 enum LoopResult {
     PushOk(u64),
     /// A server-level failure for this one request; fails its future alone.
     Error(String),
-    Scan(Box<ScanData>),
+    /// Boxed so the scan payload doesn't pad the small `PushOk`/`Error` variants.
+    Scan(Box<ScanTriple>),
     /// One `scan_many`'s N per-relation results, in request order.
-    ScanMulti(Vec<ScanData>),
+    ScanMulti(Vec<ScanTriple>),
 }
 
 /// How to receive a given request's response, paired positionally with its
 /// future. `Scan` covers both a full scan and a point seek — they read
-/// identically.
+/// identically. `Failed` is a request that never reached the wire (its frame
+/// was rejected at pack time); it consumes no reply and fails its future alone.
 enum RecvKind {
     Push { target_id: u64 },
-    Scan { target_id: u64, include_hidden: bool },
-    ScanMulti { target_ids: Vec<u64>, include_hidden: bool },
-}
-
-/// Receive one relation's scan reply and shape it into a `ScanData`. Shared by
-/// the single-`Scan` and per-relation `ScanMulti` recv arms of `async_io_loop`.
-fn recv_scan_data(session: &mut gnitz_core::Session, tid: u64, include_hidden: bool) -> Result<ScanData, ClientError> {
-    session.recv_scan(tid).map(|(schema, batch, lsn)| ScanData {
-        schema,
-        batch,
-        lsn,
-        include_hidden,
-    })
+    Scan { target_id: u64 },
+    ScanMulti { target_ids: Vec<u64> },
+    Failed(String),
 }
 
 /// Classify a recv error into the loop's result contract: a transport/protocol
@@ -2068,11 +1963,6 @@ fn classify_recv_err(e: ClientError) -> Result<LoopResult, String> {
         ClientError::Protocol(e) => Err(e.to_string()),
         e => Ok(LoopResult::Error(e.to_string())),
     }
-}
-
-/// `triple_to_lazy` for a decoded async-loop [`ScanData`].
-fn scandata_to_lazy(py: Python<'_>, sd: ScanData) -> PyResult<Py<PyScanResult>> {
-    triple_to_lazy(py, (sd.schema, sd.batch, sd.lsn), sd.include_hidden)
 }
 
 fn async_io_loop(
@@ -2088,7 +1978,9 @@ fn async_io_loop(
     // the normal `break` both fall through to its drop, which closes it — so
     // an unwind through this loop cannot leak it either.
 
-    let mut pending_futures: VecDeque<Py<PyAny>> = VecDeque::with_capacity(IO_BATCH_MAX);
+    // Each entry pairs the future to resolve with its result's presentation
+    // flag, so neither the recv types nor the decoded results carry it.
+    let mut pending_futures: VecDeque<(Py<PyAny>, bool)> = VecDeque::with_capacity(IO_BATCH_MAX);
 
     // Hoisted scratch — cleared each iteration so the outer buffers are reused.
     let mut parts: Vec<gnitz_core::MessageParts> = Vec::with_capacity(IO_BATCH_MAX);
@@ -2106,44 +1998,46 @@ fn async_io_loop(
         // the socket send buffer before reading any responses. Each request
         // is packed here on the I/O thread: push frames arrive pre-encoded,
         // scan/seek are stamped with the session-owned cache's schema version.
+        // A pack that the session rejects (a malformed `scan_many` tid list)
+        // contributes no frame — only a `Failed` recv slot — so the rejection
+        // fails that one future without ever touching the wire.
         parts.clear();
         recv_kinds.clear();
-        let pack = |req: IoRequest, parts: &mut Vec<_>, kinds: &mut Vec<_>, futs: &mut VecDeque<_>| {
-            let (p, rk) = match req.op {
-                IoOp::Push(p) => (
+        let pack = |req: IoRequest, parts: &mut Vec<_>, kinds: &mut Vec<RecvKind>, futs: &mut VecDeque<_>| {
+            let packed = match req.op {
+                IoOp::Push(p) => Ok((
                     p,
                     RecvKind::Push {
                         target_id: req.target_id,
                     },
-                ),
-                IoOp::Scan => (
+                )),
+                IoOp::Scan => Ok((
                     session.pack_scan(req.target_id),
                     RecvKind::Scan {
                         target_id: req.target_id,
-                        include_hidden: req.include_hidden,
                     },
-                ),
-                IoOp::Seek(pk) => (
+                )),
+                IoOp::Seek(pk) => Ok((
                     session.pack_seek(req.target_id, &pk),
                     RecvKind::Scan {
                         target_id: req.target_id,
-                        include_hidden: req.include_hidden,
                     },
-                ),
-                IoOp::ScanMulti(tids) => (
-                    session.pack_scan_multi(&tids),
-                    RecvKind::ScanMulti {
-                        target_ids: tids,
-                        include_hidden: req.include_hidden,
-                    },
-                ),
+                )),
+                IoOp::ScanMulti(tids) => session
+                    .pack_scan_multi(&tids)
+                    .map(|p| (p, RecvKind::ScanMulti { target_ids: tids })),
             };
-            parts.push(p);
-            kinds.push(rk);
-            futs.push_back(req.future);
+            match packed {
+                Ok((p, rk)) => {
+                    parts.push(p);
+                    kinds.push(rk);
+                }
+                Err(e) => kinds.push(RecvKind::Failed(e.to_string())),
+            }
+            futs.push_back((req.future, req.include_hidden));
         };
         pack(first, &mut parts, &mut recv_kinds, &mut pending_futures);
-        while parts.len() < IO_BATCH_MAX {
+        while recv_kinds.len() < IO_BATCH_MAX {
             match rx.try_recv() {
                 Ok(req) => pack(req, &mut parts, &mut recv_kinds, &mut pending_futures),
                 Err(_) => break,
@@ -2152,16 +2046,7 @@ fn async_io_loop(
 
         // Send the whole batch as one writev sequence.
         if let Err(e) = session.send_batch(&parts) {
-            Python::with_gil(|py| {
-                let exc = GnitzError::new_err(e.to_string())
-                    .into_pyobject(py)
-                    .unwrap()
-                    .into_any()
-                    .unbind();
-                for fut in pending_futures.drain(..) {
-                    let _ = call_soon.call1(py, (&se_fn, &fut, exc.clone_ref(py)));
-                }
-            });
+            fail_all(&rx, &mut pending_futures, &e.to_string(), &call_soon, &se_fn);
             return;
         }
 
@@ -2179,17 +2064,11 @@ fn async_io_loop(
                     Ok(lsn) => Ok(LoopResult::PushOk(lsn)),
                     Err(e) => classify_recv_err(e),
                 },
-                RecvKind::Scan {
-                    target_id,
-                    include_hidden,
-                } => match recv_scan_data(&mut session, target_id, include_hidden) {
-                    Ok(sd) => Ok(LoopResult::Scan(Box::new(sd))),
+                RecvKind::Scan { target_id } => match session.recv_scan(target_id) {
+                    Ok(t) => Ok(LoopResult::Scan(Box::new(t))),
                     Err(e) => classify_recv_err(e),
                 },
-                RecvKind::ScanMulti {
-                    ref target_ids,
-                    include_hidden,
-                } => {
+                RecvKind::ScanMulti { ref target_ids } => {
                     // Read the N reply trains positionally, in request order. A
                     // server-side shape/tid rejection arrives as one STATUS_ERROR
                     // train that fails the whole scan_many; a transport/protocol
@@ -2198,13 +2077,15 @@ fn async_io_loop(
                     // called for tids past a failure — matching a per-tid `break`.
                     match target_ids
                         .iter()
-                        .map(|&tid| recv_scan_data(&mut session, tid, include_hidden))
-                        .collect::<Result<Vec<ScanData>, _>>()
+                        .map(|&tid| session.recv_scan(tid))
+                        .collect::<Result<Vec<ScanTriple>, _>>()
                     {
-                        Ok(datas) => Ok(LoopResult::ScanMulti(datas)),
+                        Ok(triples) => Ok(LoopResult::ScanMulti(triples)),
                         Err(e) => classify_recv_err(e),
                     }
                 }
+                // Never reached the wire; no reply to consume.
+                RecvKind::Failed(ref msg) => Ok(LoopResult::Error(msg.clone())),
             };
             match r {
                 Ok(res) => results.push(res),
@@ -2218,10 +2099,9 @@ fn async_io_loop(
         // Single GIL acquisition to resolve all futures. The session absorbed
         // every response's schema into its own cache during recv, so there is
         // no separate cache-update step and no cross-thread lock.
-        let conn_lost = recv_err.is_some();
         Python::with_gil(|py| {
             for result in results.drain(..) {
-                let fut = pending_futures.pop_front().unwrap();
+                let (fut, include_hidden) = pending_futures.pop_front().unwrap();
                 match result {
                     LoopResult::PushOk(lsn) => {
                         let v = lsn.into_pyobject(py).unwrap().into_any().unbind();
@@ -2231,33 +2111,63 @@ fn async_io_loop(
                         let exc = GnitzError::new_err(err_text);
                         let _ = call_soon.call1(py, (&se_fn, &fut, exc));
                     }
-                    LoopResult::Scan(sd) => {
-                        let py_val = scandata_to_lazy(py, *sd).unwrap().into_any();
+                    LoopResult::Scan(t) => {
+                        let py_val = triple_to_lazy(py, *t, include_hidden).unwrap().into_any();
                         let _ = call_soon.call1(py, (&sr_fn, &fut, py_val));
                     }
-                    LoopResult::ScanMulti(datas) => {
+                    LoopResult::ScanMulti(triples) => {
                         // One PyScanResult per relation, in request order → a
                         // Python list, resolving the single scan_many future.
-                        let items: Vec<PyObject> = datas
+                        let items: Vec<PyObject> = triples
                             .into_iter()
-                            .map(|sd| scandata_to_lazy(py, sd).unwrap().into_any())
+                            .map(|t| triple_to_lazy(py, t, include_hidden).unwrap().into_any())
                             .collect();
                         let py_list = PyList::new(py, items).unwrap().into_any().unbind();
                         let _ = call_soon.call1(py, (&sr_fn, &fut, py_list));
                     }
                 }
             }
-            if let Some(e) = recv_err {
-                let exc = GnitzError::new_err(e).into_pyobject(py).unwrap().into_any().unbind();
-                for fut in pending_futures.drain(..) {
-                    let _ = call_soon.call1(py, (&se_fn, &fut, exc.clone_ref(py)));
-                }
-            }
         });
 
-        if conn_lost {
+        if let Some(e) = recv_err {
+            fail_all(&rx, &mut pending_futures, &e, &call_soon, &se_fn);
             return;
         }
+    }
+}
+
+/// Fail every future this loop still owns with `msg` and stop: the ones already
+/// dequeued for the current batch, then every request still sitting in the
+/// channel. Draining `rx` to exhaustion (rather than dropping it) is what makes
+/// a lost connection surface as a raised exception on *every* submitted
+/// operation — a dropped `IoRequest` would leave its coroutine awaiting a future
+/// nobody is left to resolve. The drain ends when the last sender is gone, after
+/// which `enqueue` reports the closed channel directly.
+fn fail_all(
+    rx: &std::sync::mpsc::Receiver<IoRequest>,
+    pending: &mut std::collections::VecDeque<(Py<PyAny>, bool)>,
+    msg: &str,
+    call_soon: &Py<PyAny>,
+    se_fn: &Py<PyAny>,
+) {
+    Python::with_gil(|py| {
+        let exc = GnitzError::new_err(msg.to_string())
+            .into_pyobject(py)
+            .unwrap()
+            .into_any()
+            .unbind();
+        for (fut, _) in pending.drain(..) {
+            let _ = call_soon.call1(py, (se_fn, &fut, exc.clone_ref(py)));
+        }
+    });
+    // One GIL acquisition per drained request, never one held across the
+    // blocking `recv`: the last sender is dropped by `close()`/`Drop` on the
+    // Python side, which cannot run while this thread holds the GIL.
+    for req in rx.iter() {
+        Python::with_gil(|py| {
+            let exc = GnitzError::new_err(msg.to_string());
+            let _ = call_soon.call1(py, (se_fn, &req.future, exc));
+        });
     }
 }
 
@@ -2269,6 +2179,15 @@ fn async_io_loop(
 #[pyfunction]
 fn unpack_pk_cols(v: u64) -> Vec<u32> {
     gnitz_wire::unpack_pk_cols(v).as_slice().to_vec()
+}
+
+/// The `(name, code)` column-type table, straight off `TypeCode::ALL`.
+/// `_types.py` builds its `TypeCode` IntEnum from this rather than re-typing the
+/// codes, so a variant added in `gnitz_wire` reaches Python with no edit here
+/// and none there.
+#[pyfunction]
+fn type_codes() -> Vec<(&'static str, u8)> {
+    TypeCode::ALL.iter().map(|&tc| (tc.wire_name(), tc as u8)).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2294,8 +2213,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("GnitzError", m.py().get_type::<GnitzError>())?;
     m.add("GnitzConflictError", m.py().get_type::<GnitzConflictError>())?;
     // System-table IDs — single-sourced from gnitz_wire (delegating codec, not
-    // a re-typed copy). `_types.py`'s TypeCode IntEnum stays literal (verified
-    // in sync with wire; drift is self-detecting E2E).
+    // a re-typed copy), as is the column-type table behind `type_codes()`.
     m.add("SCHEMA_TAB", gnitz_wire::SCHEMA_TAB)?;
     m.add("TABLE_TAB", gnitz_wire::TABLE_TAB)?;
     m.add("VIEW_TAB", gnitz_wire::VIEW_TAB)?;
@@ -2306,5 +2224,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("FIRST_USER_TABLE_ID", gnitz_wire::FIRST_USER_TABLE_ID)?;
     m.add("FIRST_USER_SCHEMA_ID", gnitz_wire::FIRST_USER_SCHEMA_ID)?;
     m.add_function(wrap_pyfunction!(unpack_pk_cols, m)?)?;
+    m.add_function(wrap_pyfunction!(type_codes, m)?)?;
     Ok(())
 }

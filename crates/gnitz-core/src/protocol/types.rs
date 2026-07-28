@@ -405,7 +405,45 @@ pub enum PkColumn {
     },
 }
 
+/// One PK column's bytes for one row, in **native little-endian** — borrowed
+/// from a compound (`Bytes`) PK buffer, or re-imaged from a widened scalar PK.
+/// Not the engine's OPK: a client `ZSetBatch` holds `PkColumn` values as the
+/// wire delivered them, so a signed column reads as two's complement.
+pub enum PkWindow<'a> {
+    Borrowed(&'a [u8]),
+    Inline { buf: [u8; 16], len: usize },
+}
+
+impl PkWindow<'_> {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            PkWindow::Borrowed(s) => s,
+            PkWindow::Inline { buf, len } => &buf[..*len],
+        }
+    }
+}
+
 impl PkColumn {
+    /// The `size` bytes of the PK column at PK-region byte offset `off` for row
+    /// `i`. The per-column PK read: unlike [`PkColumn::get_tuple`] it never
+    /// materializes the whole `MAX_PK_BYTES`-wide tuple, so a per-row loop that
+    /// wants one column pays 16 bytes at most instead of the full stride.
+    pub fn col_window(&self, i: usize, off: usize, size: usize) -> PkWindow<'_> {
+        match self {
+            PkColumn::Bytes { stride, buf } => {
+                let s = *stride as usize;
+                PkWindow::Borrowed(&buf[i * s + off..i * s + off + size])
+            }
+            // A scalar PK is a single column at offset 0; `get` widens
+            // `U64s`/`U128s` to u128, whose low `size` bytes are the column's
+            // native LE image (e.g. `I32(-1)` is `FF FF FF FF`).
+            _ => PkWindow::Inline {
+                buf: self.get(i).to_le_bytes(),
+                len: size,
+            },
+        }
+    }
+
     pub fn for_type(tc: TypeCode) -> Self {
         // I128 (a cross-sign `_join_pk`) is a 16-byte key: store its native bits
         // as u128 like U128/UUID; the signed interpretation happens only at the
@@ -609,6 +647,20 @@ impl PkTuple {
     /// are inert. Used by C and Python seek shims.
     pub fn from_u128_narrow(v: u128) -> Self {
         Self::from_u128(16, v)
+    }
+
+    /// [`PkTuple::from_bytes`] for an FFI caller holding a length it has not
+    /// checked: the one rule (a packed PK region is 1..=`MAX_PK_BYTES` bytes)
+    /// and the one message, instead of a per-binding pre-check ahead of the
+    /// hard assert below.
+    pub fn try_from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.is_empty() || bytes.len() > MAX_PK_BYTES {
+            return Err(format!(
+                "packed pk must be 1..={MAX_PK_BYTES} bytes, got {}",
+                bytes.len()
+            ));
+        }
+        Ok(Self::from_bytes(bytes))
     }
 
     /// Build a tuple from a raw byte slice. `bytes.len()` becomes the stride.

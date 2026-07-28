@@ -17,6 +17,16 @@ pub enum ClientError {
     },
 }
 
+impl ClientError {
+    /// Whether this failure is a retryable OCC conflict rather than a hard
+    /// error. The bindings surface conflicts as a dedicated, catchable type
+    /// (Python `GnitzConflictError`, C `GNITZ_ERR_TXN_CONFLICT`), so the
+    /// classification belongs to the enum — not to each binding's error mapper.
+    pub fn is_conflict(&self) -> bool {
+        matches!(self, ClientError::TxnConflict { .. })
+    }
+}
+
 impl From<ProtocolError> for ClientError {
     fn from(e: ProtocolError) -> Self {
         ClientError::Protocol(e)

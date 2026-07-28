@@ -5,8 +5,7 @@ from gnitz._native import (
     FIRST_USER_TABLE_ID, FIRST_USER_SCHEMA_ID, unpack_pk_cols,
 )
 from gnitz._types import TypeCode
-from gnitz._struct import (Struct, field,
-    U8, I8, U16, I16, U32, I32, F32, U64, I64, F64, STRING, U128)
+from gnitz._struct import *  # Struct, field, and one marker class per TypeCode
 
 
 def connect(socket_path):

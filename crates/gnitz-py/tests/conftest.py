@@ -327,6 +327,20 @@ def relay_lowspace_server(monkeypatch):
         s.teardown()
 
 
+@pytest.fixture
+def disposable_server():
+    """A server the test alone owns, yielded as `(target, proc)` so the test may
+    kill it mid-flight. The session server cannot be used for that — every other
+    test shares it. Teardown is kill-safe: `_Server.teardown` tolerates a process
+    the test already reaped."""
+    s = _Server(_server_binary())
+    try:
+        s.start()
+        yield s.target, s.proc
+    finally:
+        s.teardown()
+
+
 @pytest.fixture(autouse=True, scope="class")
 def _server_guard(_srv, request):
     """

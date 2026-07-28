@@ -835,11 +835,14 @@ class TestStruct:
         assert T._columns[0].is_nullable is False
         assert T._columns[1].is_nullable is False
 
-    def test_multiple_pk_raises(self):
-        with pytest.raises(TypeError, match="multiple primary keys"):
-            class T(Struct):
-                a: U64 = field(primary_key=True)
-                b: I64 = field(primary_key=True)
+    def test_multiple_pk_makes_a_compound_key(self):
+        """Two flagged fields declare a compound key, in declaration order —
+        the same rule Schema applies to a hand-built ColumnDef list."""
+        class T(Struct):
+            a: U64 = field(primary_key=True)
+            b: I64 = field(primary_key=True)
+            v: I64
+        assert T._schema.pk_indices == [0, 1]
 
     def test_no_fields_raises(self):
         with pytest.raises(TypeError, match="no fields"):

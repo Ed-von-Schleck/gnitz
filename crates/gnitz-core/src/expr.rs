@@ -31,6 +31,7 @@ impl ExprProgram {
 }
 
 /// Builds an expression bytecode program with automatic register allocation.
+#[derive(Clone)]
 pub struct ExprBuilder {
     code: Vec<u32>,
     next_reg: u32,

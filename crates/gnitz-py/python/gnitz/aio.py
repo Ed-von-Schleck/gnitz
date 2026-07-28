@@ -48,30 +48,7 @@ def connect(socket_path):
     Usable as both ``conn = await connect(path)``
     and ``async with connect(path) as conn:``.
     """
-    return _ConnectContext(socket_path)
-
-
-class _ConnectContext:
-
-    __slots__ = ("_path", "_conn")
-
-    def __init__(self, path):
-        self._path = path
-        self._conn = None
-
-    def __await__(self):
-        self._conn = AsyncConnection(self._path)
-        # Yield once so asyncio recognises this as a coroutine, then return.
-        return _immediate_return(self._conn).__await__()
-
-    async def __aenter__(self):
-        self._conn = AsyncConnection(self._path)
-        return self._conn
-
-    async def __aexit__(self, *exc):
-        if self._conn is not None:
-            self._conn._transport.close()
-        return False
+    return AsyncConnection(socket_path)
 
 
 async def _immediate_return(value):
@@ -84,6 +61,10 @@ class AsyncConnection:
     All I/O runs on a background Rust thread.  ``await`` on any method
     suspends the calling coroutine until the server responds — the event
     loop is free to service other work in the meantime.
+
+    Connecting is synchronous, so the object ``connect()`` returns is the
+    connection itself: awaiting it yields the same object, and entering it as
+    an ``async with`` block closes it on exit.
     """
 
     __slots__ = ("_transport",)
@@ -93,6 +74,11 @@ class AsyncConnection:
         self._transport = AsyncTransport(
             socket_path, loop, _set_result_safe, _set_exception_safe,
         )
+
+    def __await__(self):
+        # Yield once so asyncio recognises `await connect(path)` as awaiting a
+        # coroutine, then hand back this same connection.
+        return _immediate_return(self).__await__()
 
     async def push(self, target_id, batch):
         """Push a batch to a table.  Returns the ingest LSN (int)."""
@@ -146,10 +132,10 @@ class Pipeline:
     Results are available as ``pipe.results`` after the ``async with`` block.
     """
 
-    __slots__ = ("_conn", "_futures", "results")
+    __slots__ = ("_transport", "_futures", "results")
 
     def __init__(self, conn):
-        self._conn = conn
+        self._transport = conn._transport
         self._futures = []
         self.results = []
 
@@ -169,13 +155,13 @@ class Pipeline:
 
     def push(self, target_id, batch):
         """Queue a push.  Does not ``await`` — sends immediately."""
-        fut = self._conn._transport.push(target_id, batch)
+        fut = self._transport.push(target_id, batch)
         self._futures.append(fut)
         return fut
 
     def scan(self, target_id, include_hidden=False):
         """Queue a scan.  Does not ``await`` — sends immediately."""
-        fut = self._conn._transport.scan(target_id, include_hidden)
+        fut = self._transport.scan(target_id, include_hidden)
         self._futures.append(fut)
         return fut
 
@@ -184,6 +170,6 @@ class Pipeline:
 
         Resolves to a ``list`` of ``ScanResult`` in request order.
         """
-        fut = self._conn._transport.scan_many(target_ids, include_hidden)
+        fut = self._transport.scan_many(target_ids, include_hidden)
         self._futures.append(fut)
         return fut

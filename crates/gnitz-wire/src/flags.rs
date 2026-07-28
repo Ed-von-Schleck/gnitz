@@ -313,6 +313,21 @@ pub enum WireConflictMode {
     Error = 1,
 }
 
+impl std::str::FromStr for WireConflictMode {
+    type Err = String;
+
+    /// The two modes' user-facing names — the vocabulary every client binding
+    /// exposes as `push(conflict_mode=...)`. Owned here, next to the
+    /// discriminants, so no binding gets to invent a third spelling.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "update" => Ok(WireConflictMode::Update),
+            "error" => Ok(WireConflictMode::Error),
+            other => Err(format!("invalid conflict mode '{other}', expected 'update' or 'error'")),
+        }
+    }
+}
+
 impl WireConflictMode {
     #[inline]
     pub const fn as_u8(self) -> u8 {

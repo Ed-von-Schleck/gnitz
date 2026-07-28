@@ -18,6 +18,19 @@ pub enum GnitzSqlError {
     },
 }
 
+impl GnitzSqlError {
+    /// Whether this failure is a retryable OCC conflict. `Exec` delegates to the
+    /// client error it wraps, so a conflict stays classified as one however deep
+    /// it surfaced. Counterpart of `ClientError::is_conflict`.
+    pub fn is_conflict(&self) -> bool {
+        match self {
+            GnitzSqlError::Conflict { .. } => true,
+            GnitzSqlError::Exec(e) => e.is_conflict(),
+            _ => false,
+        }
+    }
+}
+
 impl fmt::Display for GnitzSqlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

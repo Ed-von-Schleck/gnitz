@@ -112,6 +112,7 @@ impl Circuit {
 /// 40-bit cap). `primary_source_id` is the table_id passed to the first
 /// `input_delta()` call so legacy callers don't have to thread it through
 /// every method invocation.
+#[derive(Clone)]
 pub struct CircuitBuilder {
     view_id: u64,
     primary_source_id: u64,

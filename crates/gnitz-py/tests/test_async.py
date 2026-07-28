@@ -579,6 +579,35 @@ def _os_thread_count() -> int:
 
 
 @pytest.mark.asyncio
+async def test_connection_loss_resolves_every_queued_request(disposable_server):
+    """Losing the connection must fail every submitted request, including the
+    ones still queued behind the in-flight batch.
+
+    The I/O thread batches at most IO_BATCH_MAX (1024) requests per cycle, so
+    the 3000 below leave ~2000 sitting in the request channel while the first
+    batch fails. Those carry futures nobody else can resolve: dropping them
+    would leave their coroutines awaiting forever, which is a hang, not an
+    error. The `wait_for` is the guard — a dropped future shows up as a timeout.
+    """
+    target, proc = disposable_server
+    conn = await aio.connect(target)
+    proc.kill()
+    proc.wait()
+
+    futs = [conn.scan(1) for _ in range(3000)]
+    results = await asyncio.wait_for(
+        asyncio.gather(*futs, return_exceptions=True), timeout=30)
+    resolved_ok = [r for r in results if not isinstance(r, BaseException)]
+    assert not resolved_ok, f"{len(resolved_ok)}/{len(results)} succeeded against a dead server"
+
+    # A request submitted after the failure was observed must resolve too.
+    with pytest.raises(gnitz.GnitzError):
+        await asyncio.wait_for(conn.scan(1), timeout=30)
+
+    await conn.aclose()
+
+
+@pytest.mark.asyncio
 async def test_drop_without_close_releases_thread(server):
     """Dropping an AsyncTransport (no close()) must let the I/O thread exit
     on its own — Drop shuts down the dup'd fd so recv_framed unblocks."""

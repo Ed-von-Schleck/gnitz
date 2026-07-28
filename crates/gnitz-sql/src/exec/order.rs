@@ -18,46 +18,10 @@ use crate::bind::find_unique_column;
 use crate::codec::project_schema::ProjItem;
 use crate::error::GnitzSqlError;
 use crate::exec::batch::copy_batch_row_owned;
-use gnitz_core::{ColData, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
 use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_wire::cmp_typed_le;
 use sqlparser::ast::{Expr, OrderBy, OrderByKind, Value};
-
-/// A PK column's value for one row, in **native little-endian** — either
-/// borrowed from a compound (`Bytes`) PK buffer or re-imaged from a widened
-/// scalar PK. Not the engine's OPK: a client `ZSetBatch` holds `PkColumn` values
-/// as the wire delivered them, and `cmp_typed_le` reads native LE.
-enum PkWindow<'a> {
-    Borrowed(&'a [u8]),
-    Inline { buf: [u8; 16], len: usize },
-}
-
-impl PkWindow<'_> {
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            PkWindow::Borrowed(s) => s,
-            PkWindow::Inline { buf, len } => &buf[..*len],
-        }
-    }
-}
-
-/// The `stride` bytes of the PK column at PK-region byte offset `off` for row
-/// `i`. The per-column `(pk_byte_offset, wire_stride)` lookups are hoisted into
-/// [`SortKey`], since the comparator runs O(n log n) times.
-fn pk_col_window_at<'a>(batch: &'a ZSetBatch, off: usize, stride: usize, i: usize) -> PkWindow<'a> {
-    match &batch.pks {
-        PkColumn::Bytes { stride: s, buf } => {
-            let s = *s as usize;
-            PkWindow::Borrowed(&buf[i * s + off..i * s + off + stride])
-        }
-        // A scalar PK (`get` widens `U64s`/`U128s` to `u128`); the low `stride`
-        // bytes are the column's native LE image (e.g. `I32(-1)` is `FF FF FF FF`).
-        _ => PkWindow::Inline {
-            buf: batch.pks.get(i).to_le_bytes(),
-            len: stride,
-        },
-    }
-}
 
 // ---------------------------------------------------------------------------
 // One sort key over the full pre-projection schema
@@ -116,7 +80,7 @@ fn col_is_null(batch: &ZSetBatch, key: &SortKey, i: usize) -> bool {
 
 /// Compare the **non-null** value of the key's column between rows `ra` and
 /// `rb` in content order (callers null-check first). PK columns read through
-/// the shared [`pk_col_window_at`] variant accessor; payload columns dispatch
+/// the shared `PkColumn::col_window` accessor; payload columns dispatch
 /// on their `ColData` variant. Fixed-width values compare via the shared
 /// `cmp_typed_le` — dispatched on the type code, never through
 /// `FixedInt::decode_le_i64`, which bit-reinterprets a full-width `U64` as
@@ -126,8 +90,8 @@ fn col_is_null(batch: &ZSetBatch, key: &SortKey, i: usize) -> bool {
 /// plain lexicographic byte order for equal content, and no `COLLATE` exists).
 fn cmp_col_value(batch: &ZSetBatch, key: &SortKey, ra: usize, rb: usize) -> Ordering {
     if let Some(off) = key.pk_offset {
-        let wa = pk_col_window_at(batch, off, key.stride, ra);
-        let wb = pk_col_window_at(batch, off, key.stride, rb);
+        let wa = batch.pks.col_window(ra, off, key.stride);
+        let wb = batch.pks.col_window(rb, off, key.stride);
         return cmp_typed_le(wa.as_slice(), wb.as_slice(), key.tc as u8);
     }
     match &batch.columns[key.ci] {
@@ -902,7 +866,7 @@ mod tests {
         let key = SortKey::new(&out_schema, 1, true, false);
         let bs: Vec<i16> = (0..out.len())
             .map(|i| {
-                let w = pk_col_window_at(&out, key.pk_offset.unwrap(), key.stride, i);
+                let w = out.pks.col_window(i, key.pk_offset.unwrap(), key.stride);
                 i16::from_le_bytes(w.as_slice().try_into().unwrap())
             })
             .collect();

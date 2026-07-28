@@ -47,6 +47,51 @@ pub enum TypeCode {
 }
 
 impl TypeCode {
+    /// Every variant, in wire-code order — the one enumeration of the type
+    /// table. Clients that must reproduce the table (the Python `TypeCode`
+    /// IntEnum) build it from here rather than re-typing the constants, so a
+    /// new variant reaches them without an edit on their side.
+    pub const ALL: [TypeCode; 15] = [
+        TypeCode::U8,
+        TypeCode::I8,
+        TypeCode::U16,
+        TypeCode::I16,
+        TypeCode::U32,
+        TypeCode::I32,
+        TypeCode::F32,
+        TypeCode::U64,
+        TypeCode::I64,
+        TypeCode::F64,
+        TypeCode::String,
+        TypeCode::U128,
+        TypeCode::UUID,
+        TypeCode::Blob,
+        TypeCode::I128,
+    ];
+
+    /// The type's name in the wire vocabulary — the spelling the
+    /// `type_code::*` constants use, which is what the client bindings expose.
+    /// Exhaustive on purpose: a new variant fails to compile until named.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            TypeCode::U8 => "U8",
+            TypeCode::I8 => "I8",
+            TypeCode::U16 => "U16",
+            TypeCode::I16 => "I16",
+            TypeCode::U32 => "U32",
+            TypeCode::I32 => "I32",
+            TypeCode::F32 => "F32",
+            TypeCode::U64 => "U64",
+            TypeCode::I64 => "I64",
+            TypeCode::F64 => "F64",
+            TypeCode::String => "STRING",
+            TypeCode::U128 => "U128",
+            TypeCode::UUID => "UUID",
+            TypeCode::Blob => "BLOB",
+            TypeCode::I128 => "I128",
+        }
+    }
+
     /// Convert a wire u8 that has already passed DDL validation. Panics on unknown codes.
     #[inline]
     pub fn from_validated_u8(v: u8) -> Self {

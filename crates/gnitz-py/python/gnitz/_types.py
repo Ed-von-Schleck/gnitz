@@ -1,19 +1,8 @@
 from enum import IntEnum
 
+from gnitz._native import type_codes
 
-class TypeCode(IntEnum):
-    U8     = 1
-    I8     = 2
-    U16    = 3
-    I16    = 4
-    U32    = 5
-    I32    = 6
-    F32    = 7
-    U64    = 8
-    I64    = 9
-    F64    = 10
-    STRING = 11
-    U128   = 12
-    UUID   = 13
-    BLOB   = 14
-    I128   = 15
+# The column-type table comes from gnitz_wire (via `TypeCode::ALL`), so the
+# names and codes cannot drift from the ones the wire, the engine and the C
+# bindings use — a variant added there appears here with no edit.
+TypeCode = IntEnum("TypeCode", dict(type_codes()))
