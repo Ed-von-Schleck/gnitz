@@ -96,8 +96,7 @@ class AsyncConnection:
 
     async def push(self, target_id, batch):
         """Push a batch to a table.  Returns the ingest LSN (int)."""
-        raw = batch._raw if hasattr(batch, "_raw") else batch
-        return await self._transport.push(target_id, raw)
+        return await self._transport.push(target_id, batch)
 
     async def scan(self, target_id, include_hidden=False):
         """Scan a table/view.  Returns a ``ScanResult``."""
@@ -170,8 +169,7 @@ class Pipeline:
 
     def push(self, target_id, batch):
         """Queue a push.  Does not ``await`` — sends immediately."""
-        raw = batch._raw if hasattr(batch, "_raw") else batch
-        fut = self._conn._transport.push(target_id, raw)
+        fut = self._conn._transport.push(target_id, batch)
         self._futures.append(fut)
         return fut
 

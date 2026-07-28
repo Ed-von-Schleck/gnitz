@@ -37,7 +37,11 @@ pub type MultiScanResult = Result<Vec<(Option<Arc<Schema>>, Option<ZSetBatch>, u
 /// Combines PID (top 32 bits) with a per-process monotonic sequence (bottom 32 bits).
 /// This guarantees uniqueness across all connections from the same process, and makes
 /// cross-process collisions practically impossible even with PID reuse.
-fn new_client_id() -> u64 {
+///
+/// Public because a binding that builds a bare [`Session`] rather than a
+/// `GnitzClient` (the gnitz-py async transport) must draw its id from this same
+/// counter — a second counter alongside it would hand out duplicates.
+pub fn new_client_id() -> u64 {
     static SEQ: AtomicU32 = AtomicU32::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed) as u64;
     (std::process::id() as u64) << 32 | seq
@@ -457,10 +461,14 @@ impl Session {
         Ok((schema, data))
     }
 
-    /// Receive a single push ACK, absorbing any schema block it carries into
-    /// the cache (matching the sync push path). The caller inspects the status.
-    pub fn recv_push_ack(&mut self, target_id: u64) -> Result<Message, ClientError> {
-        self.recv_cached(target_id)
+    /// Receive a single push ACK and return its ingest LSN, absorbing any schema
+    /// block it carries into the cache (matching the sync push path). The status
+    /// runs through the session's own `check_response`, so a pipelined push
+    /// classifies server failures exactly as the sync push does rather than
+    /// leaving each caller to re-derive the policy.
+    pub fn recv_push_ack(&mut self, target_id: u64) -> Result<u64, ClientError> {
+        let msg = self.recv_cached(target_id)?;
+        check_response(msg).map(|m| m.seek_pk as u64)
     }
 
     /// The client's cached schema version for `tid` (`0` = no cached schema, so

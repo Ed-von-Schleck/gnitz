@@ -194,20 +194,23 @@ class TestTableDDL:
             client.drop_schema(sn)
 
     def test_create_table_too_many_columns(self, client):
-        """66 columns exceeds the server limit (65) and raises GnitzError."""
+        """66 columns exceeds MAX_COLUMNS (65). `create_table` resolves its
+        argument to a Schema, so the shared rule set rejects it client-side —
+        the same ValueError `Schema(cols)` raises for the same list."""
         sn = "s" + _uid()
         client.create_schema(sn)
         cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True)]
         for i in range(65):
             cols.append(gnitz.ColumnDef(f"c{i}", gnitz.TypeCode.I64))
         try:
-            with pytest.raises(gnitz.GnitzError):
+            with pytest.raises(ValueError):
                 client.create_table(sn, "t" + _uid(), cols)
         finally:
             client.drop_schema(sn)
 
     def test_create_table_string_pk_rejected(self, client):
-        """STRING is not a valid primary key type."""
+        """STRING is not a valid primary key type — rejected client-side by the
+        same schema validation every other schema surface applies."""
         sn = "s" + _uid()
         client.create_schema(sn)
         cols = [
@@ -215,7 +218,7 @@ class TestTableDDL:
             gnitz.ColumnDef("val",  gnitz.TypeCode.I64),
         ]
         try:
-            with pytest.raises(gnitz.GnitzError):
+            with pytest.raises(ValueError):
                 client.create_table(sn, "t" + _uid(), cols)
         finally:
             client.drop_schema(sn)
