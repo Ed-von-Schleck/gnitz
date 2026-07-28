@@ -147,22 +147,15 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// True iff a read of relation `id` (base table or view) must be
-    /// **single-sourced** because its output is replicated — a full identical
-    /// copy lives on every worker. A base table carries the flag on its schema;
-    /// a view is replicated iff all its sources are (design §4.2). Consulted by
-    /// the scan dispatch so a replicated relation is read from one worker instead
-    /// of gathering N identical copies. SEEK already unicasts to one worker, so it
-    /// needs no equivalent check.
-    pub fn relation_output_is_replicated(&mut self, id: i64) -> bool {
-        // `.map` releases the `tables` borrow before the view arm re-borrows self.
-        match self.dag.tables.get(&id).map(|e| (e.kind, e.schema.replicated())) {
-            Some((RelationKind::BaseTable { .. }, replicated)) => replicated,
-            // Master-broadcast DDL sync gives every worker a full identical copy.
-            Some((RelationKind::SystemCatalog, _)) => true,
-            Some((RelationKind::View, _)) => self.dag.view_all_sources_replicated(id),
-            None => false,
-        }
+    /// True iff a read of relation `id` must be **single-sourced** because its
+    /// output is replicated — a full identical copy lives on every worker. Every
+    /// relation kind carries the answer on its schema (base table from
+    /// `TABLE_TAB.flags`, system catalog always, view iff all its sources are), so
+    /// this is one lookup. Consulted by the scan dispatch so a replicated relation
+    /// is read from one worker instead of gathering N identical copies. SEEK
+    /// already unicasts to one worker, so it needs no equivalent check.
+    pub fn relation_output_is_replicated(&self, id: i64) -> bool {
+        self.dag.tables.get(&id).is_some_and(|e| e.schema.replicated())
     }
 
     /// Invalidate all cached plans.

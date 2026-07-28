@@ -289,8 +289,9 @@ impl DagEngine {
     /// then dispatch on the compiled shape + routing annotations and run the
     /// view's epoch, returning the output delta (`None` when a phase produced
     /// nothing). The arms, in priority order:
-    /// 1. All-sources-replicated intercept (live table flags, never baked): the
-    ///    view computes its full result locally — no exchange IPC at all.
+    /// 1. Replicated-output intercept (the view's own schema bit, stamped at
+    ///    registration from its source set): the view computes its full result
+    ///    locally — no exchange IPC at all.
     /// 2. Range join — relay the source delta (eq-prefix scatter for a band
     ///    join, broadcast for a pure range join, decided master-side in
     ///    `prepare_relay`), then the exchanged pipeline. Checked before the
@@ -318,13 +319,12 @@ impl DagEngine {
             return None;
         }
 
-        // Arm 1. A view whose sources are all replicated holds the full copy of
-        // every source and receives the full (broadcast) delta on every worker,
-        // so it computes its entire result locally: the output is itself
-        // replicated and the worker-0 scan reads it whole. Every worker
-        // evaluates this identically, so they skip the same exchange rounds and
-        // the collective barrier stays balanced.
-        if self.view_all_sources_replicated(view_id) {
+        // Arm 1. A view stamped replicated holds every source in full and receives
+        // the full (broadcast) delta on every worker, so it computes its entire
+        // result locally and the worker-0 scan reads it whole. Every worker
+        // evaluates this identically, so they skip the same exchange rounds and the
+        // collective barrier stays balanced.
+        if self.tables.get(&view_id).is_some_and(|e| e.schema.replicated()) {
             return self.execute_epoch(view_id, input, src_id);
         }
 

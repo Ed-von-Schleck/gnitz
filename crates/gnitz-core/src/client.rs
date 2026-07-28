@@ -1061,10 +1061,9 @@ impl GnitzClient {
         Ok(vids[0])
     }
 
-    /// Create every view in `views` in one atomic `DDL_TXN`. `views` must be in
-    /// dependency (topological) order — VIEW_TAB row order sets each view's
-    /// registration `depth`; the distributed backfill tail re-derives
-    /// materialization order from the dep-map. Returns the vids in input order.
+    /// Create every view in `views` in one atomic `DDL_TXN`. Row order carries no
+    /// meaning — the engine orders registration and backfill by the dependencies it
+    /// reads out of DEP_TAB. Returns the vids in input order.
     ///
     /// **One `BatchAppender` per family spans all views** — the engine's derived
     /// per-family lists (`family_pks_by_sign`, `families.find`) read only the
@@ -1175,9 +1174,7 @@ impl GnitzClient {
                 append_circuit_rows(&mut nodes_a, &mut edges_a, &mut ncol_a, vid, &rows);
 
                 // 6. View record — the VIEW_TAB register hook triggers server-side
-                // compilation. Rows are appended in input (topological) order so
-                // each view's registration `depth` derives from its already-present
-                // sources. Encode the view PK with the shared wire packer so the
+                // compilation. Encode the view PK with the shared wire packer so the
                 // engine catalog decodes it identically to a TABLE_TAB PK.
                 let pk_packed = gnitz_wire::pack_pk_cols(&pv.pk_cols);
                 append_view_row(

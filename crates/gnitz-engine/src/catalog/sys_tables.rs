@@ -339,12 +339,16 @@ pub(super) const SYS_TABLE_ARENA: u64 = 256 * 1024; // 256 KB
 use crate::schema::from_wire_cols;
 
 // Pre-computed schema statics, one per family, indexed by `SysFamily`
-// discriminant — initialised at compile time, never reconstructed.
+// discriminant — initialised at compile time, never reconstructed. Every family
+// is stamped replicated: DDL is master-broadcast, so each worker holds an
+// identical full copy, and a reader single-sources it instead of gathering N
+// copies (`relation_output_is_replicated`).
 static SCHEMAS: [SchemaDescriptor; SysFamily::COUNT] = {
-    let mut arr = [from_wire_cols(SYS_FAMILIES[0].cols, SYS_FAMILIES[0].pk_cols); SysFamily::COUNT];
+    let mut arr =
+        [from_wire_cols(SYS_FAMILIES[0].cols, SYS_FAMILIES[0].pk_cols).with_replicated(true); SysFamily::COUNT];
     let mut i = 1;
     while i < SysFamily::COUNT {
-        arr[i] = from_wire_cols(SYS_FAMILIES[i].cols, SYS_FAMILIES[i].pk_cols);
+        arr[i] = from_wire_cols(SYS_FAMILIES[i].cols, SYS_FAMILIES[i].pk_cols).with_replicated(true);
         i += 1;
     }
     arr

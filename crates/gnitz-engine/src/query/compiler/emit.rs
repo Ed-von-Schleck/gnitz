@@ -119,9 +119,10 @@ pub(super) struct EmitCtx<'a> {
     pub ext_tables: &'a ExtTables,
     pub view_dir: &'a str,
     pub view_id: u64,
-    // True iff every `ScanDelta` source of this view is a replicated base table.
-    // Consumed by the `PartitionFilter` emit arm to bake the trim as a keep-all
-    // identity (an all-replicated view runs correct-local on every worker).
+    // The view's stamped `replicated` bit: every `ScanDelta` source is replicated,
+    // so the view runs correct-local on every worker. The `PartitionFilter` arm
+    // bakes its trim as a keep-all identity, and `emit_reduce` makes every worker
+    // the owner of the global-aggregate seed.
     pub all_sources_replicated: bool,
     pub builder: ProgramBuilder,
     pub out_reg_of: HashMap<i32, i32>,
@@ -869,32 +870,31 @@ pub(super) fn emit_reduce(
         });
     }
 
-    // Bake worker ownership of the global-aggregate seed exactly as the
-    // `PartitionFilter` arm bakes `(worker_rank(), num_workers())`. A reduce whose
-    // input has no upstream `ExchangeShard` is **replicated** (`reduce_multi_local`
-    // — the full source is on every worker), so every worker is its own owner and
-    // seeds its local copy; the load-bearing disjunct, since a replicated view is
-    // single-source-read from worker 0, not `worker_for_partition(V₀)`. A sharded
-    // global aggregate (`reduce_multi`) funnels all rows to partition
-    // `partition_for_key(V₀)`'s owner, so only that worker seeds. Checked against
-    // the static `loaded.incoming` graph (which retains the `ExchangeShard →
-    // Reduce` edge across the post-phase split), NOT the post-phase register wiring
-    // (the ExchangeShard node emits no instruction). `i_am_owner` is meaningful
-    // only when `global_ground`; left `false` otherwise so a grouped reduce never
-    // pays the bake.
-    let i_am_owner = global_ground && {
-        let replicated = !loaded.incoming.get(&nid).is_some_and(|ins| {
-            ins.iter().any(|&(src, port)| {
-                port == PORT_IN && matches!(loaded.nodes.get(&src), Some(gnitz_wire::OpNode::ExchangeShard { .. }))
-            })
-        });
-        replicated
+    // Bake worker ownership of the global-aggregate seed, exactly as the
+    // `PartitionFilter` arm bakes `(worker_rank(), num_workers())`. A worker seeds
+    // when it holds the whole input: either the view is stamped replicated (it runs
+    // correct-local everywhere and the read single-sources worker 0, which is not
+    // `worker_for_partition(V₀)`) or the reduce has no upstream `ExchangeShard`
+    // (`reduce_multi_local`, also reachable over a partitioned table through the raw
+    // `reduce()` binding — which is why the two tests stay separate). A sharded
+    // global aggregate funnels every row to `partition_for_key(V₀)`'s owner, so only
+    // that worker seeds. The shard test reads the static `loaded.incoming` graph,
+    // which keeps the `ExchangeShard → Reduce` edge across the post-phase split (the
+    // ExchangeShard node itself emits no instruction). Meaningful only when
+    // `global_ground`; left `false` otherwise so a grouped reduce never pays the bake.
+    let unsharded = !loaded.incoming.get(&nid).is_some_and(|ins| {
+        ins.iter().any(|&(src, port)| {
+            port == PORT_IN && matches!(loaded.nodes.get(&src), Some(gnitz_wire::OpNode::ExchangeShard { .. }))
+        })
+    });
+    let i_am_owner = global_ground
+        && (ctx.all_sources_replicated
+            || unsharded
             || worker_rank() as usize
                 == crate::ops::worker_for_partition(
                     crate::schema::key::partition_for_key(crate::ops::global_group_key()),
                     num_workers() as usize,
-                )
-    };
+                ));
 
     let avi_table_idx = (!avi_table_ptr.is_null()).then(|| ctx.builder.table_idx(avi_table_ptr) as u16);
 
@@ -982,25 +982,11 @@ pub(super) fn build_plan(
         reg_meta[reg as usize] = RegisterMeta::delta(*ex_schema);
     }
 
-    // Are all of this view's `ScanDelta` sources replicated base tables? The
-    // `ScanDelta` set is exactly `circuit.dependencies()` (`ScanTrace` excluded),
-    // the same source set `DagEngine::view_all_sources_replicated` reads from the
-    // dep map — so this compile-time flag equals the runtime decision that
-    // short-circuits the view to the local epoch path, and cannot drift from it.
-    // `loaded` is the whole circuit in every phase, so the flag is phase-independent.
-    let mut has_source = false;
-    let all_sources_replicated = loaded
-        .nodes
-        .values()
-        .filter_map(|op| match op {
-            gnitz_wire::OpNode::ScanDelta { source, .. } => Some(*source as i64),
-            _ => None,
-        })
-        .all(|tid| {
-            has_source = true;
-            ext_tables.get(&tid).is_some_and(|schema| schema.replicated())
-        })
-        && has_source;
+    // The view's own `replicated` bit, stamped at registration from the same
+    // `ScanDelta` source set (`circuit.dependencies()`). Reading it here instead of
+    // re-deriving it keeps the compile-time flag and the runtime decision that
+    // short-circuits the view to the local epoch path from ever drifting apart.
+    let all_sources_replicated = loaded.out_schema.replicated();
 
     let mut ctx = EmitCtx {
         loaded,

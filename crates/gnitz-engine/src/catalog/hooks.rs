@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::schema::make_index_schema;
+use rustc_hash::FxHashMap;
 
 impl CatalogEngine {
     // -- Hook processing ---------------------------------------------------
@@ -477,8 +478,36 @@ impl CatalogEngine {
         Ok(())
     }
 
+    /// Row indices in the order [`hook_view_register`](Self::hook_view_register)
+    /// must process them: retractions first (as `fire_hooks` hands them over),
+    /// then the live rows in dependency order, since registering a view reads its
+    /// sources' `replicated` bit and `depth`. Neither order the hook actually sees
+    /// is dependency order — boot replay walks VIEW_TAB in PK order, in which a
+    /// chain's user-named view sorts *before* the hidden segments it scans (its id
+    /// is minted before the body is bound). Without this a view is replicated
+    /// before a restart and partitioned after.
+    fn view_row_order(&mut self, batch: &Batch) -> Vec<usize> {
+        let mut rows: Vec<usize> = (0..batch.count).filter(|&i| batch.get_weight(i) <= 0).collect();
+        let mut live: Vec<usize> = (0..batch.count).filter(|&i| batch.get_weight(i) > 0).collect();
+        if live.len() > 1 {
+            let ids: Vec<i64> = live.iter().map(|&i| batch.get_pk(i) as i64).collect();
+            let rank: FxHashMap<i64, usize> = self
+                .dag
+                .order_by_view_deps(&ids)
+                .into_iter()
+                .enumerate()
+                .map(|(r, vid)| (vid, r))
+                .collect();
+            // Stable, so a malformed batch's duplicate `+1`s on one id keep row
+            // order among themselves.
+            live.sort_by_key(|&i| rank[&(batch.get_pk(i) as i64)]);
+        }
+        rows.append(&mut live);
+        rows
+    }
+
     fn hook_view_register(&mut self, batch: &Batch) -> Result<(), String> {
-        for i in 0..batch.count {
+        for i in self.view_row_order(batch) {
             let weight = batch.get_weight(i);
             let vid = batch.get_pk(i) as i64;
             // §3.2: gate on NET live state, so a rename pair (net-live before and
@@ -508,9 +537,22 @@ impl CatalogEngine {
 
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
                 let directory = view_dir(&self.base_dir, &schema_name, vid);
+                // The circuit's `circuit_nodes` are persisted before this VIEW_TAB
+                // row, so `get_source_ids` resolves here.
+                let source_ids = self.dag.get_source_ids(vid);
+                // A view's output is replicated exactly when every source it scans
+                // is: each worker then holds every input in full and computes the
+                // whole result locally (`execute_multi_worker_step` arm 1), and the
+                // read single-sources worker 0. Stamping it on the schema makes the
+                // property transitive — `view_row_order` registers this view after
+                // its sources, so a view over it reads the bit right here.
+                let replicated_source = |tid: &i64| self.dag.tables.get(tid).is_some_and(|e| e.schema.replicated());
+                let has_replicated_source = source_ids.iter().any(replicated_source);
+                let all_sources_replicated = !source_ids.is_empty() && source_ids.iter().all(replicated_source);
                 // Views are not distributed by a chosen key (§2): `0` is the
                 // full-PK default sentinel every non-CLUSTER BY caller passes.
-                let view_schema = build_schema_from_col_defs(&col_defs, pk.as_slice(), 0)?;
+                let view_schema =
+                    build_schema_from_col_defs(&col_defs, pk.as_slice(), 0)?.with_replicated(all_sources_replicated);
 
                 // See hook_table_register: one kind drives the bundle.
                 let kind = RelationKind::View;
@@ -522,11 +564,7 @@ impl CatalogEngine {
                 // whose key partition this worker does not own — see
                 // `build_partitioned_storage`). Build it single-partition; the
                 // read path single-sources it (all sources replicated ⇒ replicated
-                // output) or union-gathers it (mixed ⇒ locally partitioned). The
-                // circuit's `circuit_nodes` are persisted before this VIEW_TAB row,
-                // so `get_source_ids` resolves here.
-                let source_ids = self.dag.get_source_ids(vid);
-                let has_replicated_source = self.dag.view_has_replicated_source(vid);
+                // output) or union-gathers it (mixed ⇒ locally partitioned).
                 let et = self.with_staged_dir(directory.clone(), |s| {
                     s.build_partitioned_storage(kind, &directory, &name, vid, view_schema, has_replicated_source)
                 })?;

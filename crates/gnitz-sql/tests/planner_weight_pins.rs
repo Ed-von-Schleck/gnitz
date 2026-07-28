@@ -231,6 +231,184 @@ fn replicated_reduce_weights() {
     );
 }
 
+// ── Replicated-view chain (MANDATORY W>1) ────────────────────────────
+// `replicated_reduce_weights` above is the one-hop, base-table form. Insert a
+// single view hop and the whole classification must still hold: a view all of
+// whose sources are replicated is itself replicated, so every worker holds its
+// output in full and computes locally. Get that wrong and each exchange round
+// relays W byte-identical payloads that consolidate into one row at weight W —
+// `g=7` reads 120 instead of 30. Every downstream shape that carries an exchange
+// is pinned, plus a mixed-source control (`vmixagg`) that must NOT be
+// re-classified.
+
+/// Two replicated tables and one partitioned table — the source set both chain
+/// tests read.
+fn replicated_chain_fixture(client: &mut gnitz_core::GnitzClient, sn: &str) {
+    for t in ["rt", "ru"] {
+        exec(
+            client,
+            sn,
+            &format!(
+                "CREATE TABLE {t} (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, x BIGINT NOT NULL) \
+                 WITH (replicated = true)"
+            ),
+        );
+    }
+    exec(
+        client,
+        sn,
+        "CREATE TABLE fact (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL)",
+    );
+}
+
+fn insert_replicated_chain_rows(client: &mut gnitz_core::GnitzClient, sn: &str) {
+    for t in ["rt", "ru"] {
+        exec(
+            client,
+            sn,
+            &format!("INSERT INTO {t} VALUES (1, 7, 10), (2, 7, 20), (3, 8, 5)"),
+        );
+    }
+    exec(client, sn, "INSERT INTO fact VALUES (1, 7), (2, 8)");
+}
+
+#[test]
+fn replicated_view_chain_weights() {
+    let srv = match ServerHandle::start_n(4) {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    replicated_chain_fixture(&mut client, &sn);
+
+    exec(&mut client, &sn, "CREATE VIEW rv AS SELECT id, g, x FROM rt");
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW vagg AS SELECT g, SUM(x) AS s FROM rv GROUP BY g",
+    );
+    exec(&mut client, &sn, "CREATE VIEW vsum AS SELECT SUM(x) AS s FROM rv");
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW vunion AS SELECT id, x FROM rv UNION ALL SELECT id, x FROM ru",
+    );
+    // The join key must be a NON-PK column of `rv`: on `fact.k = rv.id` the key
+    // matches the distribution prefix, the join is marked co-partitioned, and the
+    // shape passes even unfixed.
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW vjoin AS SELECT fact.id AS fid, rv.x AS x FROM fact JOIN rv ON fact.k = rv.g",
+    );
+    exec(&mut client, &sn, "CREATE VIEW v3 AS SELECT g, s FROM vagg");
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW vmixagg AS SELECT fid, SUM(x) AS s FROM vjoin GROUP BY fid",
+    );
+    exec(&mut client, &sn, "CREATE VIEW vdist AS SELECT DISTINCT g FROM rv");
+    exec(&mut client, &sn, "CREATE VIEW vlin AS SELECT id, x FROM rv WHERE x > 0");
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW vcv AS SELECT COUNT(*) AS c FROM rv WHERE x > 1000",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW vcb AS SELECT COUNT(*) AS c FROM rt WHERE x > 1000",
+    );
+
+    insert_replicated_chain_rows(&mut client, &sn);
+
+    assert_eq!(
+        row_weights(&mut client, &sn, "vagg", &["g", "s"]),
+        w(&[(&[7, 30], 1), (&[8, 5], 1)]),
+        "GROUP BY over a replicated view: g=7 sums to 30, not 120=30×4"
+    );
+    assert_eq!(
+        row_weights(&mut client, &sn, "vsum", &["s"]),
+        w(&[(&[35], 1)]),
+        "global aggregate over a replicated view sums to 35, not 140=35×4"
+    );
+    assert_eq!(
+        row_weights(&mut client, &sn, "vunion", &["id", "x"]),
+        w(&[(&[1, 10], 2), (&[2, 20], 2), (&[3, 5], 2)]),
+        "UNION ALL of a replicated view and a replicated table: weight 2 (one per side), not 8"
+    );
+    assert_eq!(
+        row_weights(&mut client, &sn, "vjoin", &["fid", "x"]),
+        w(&[(&[1, 10], 1), (&[1, 20], 1), (&[2, 5], 1)]),
+        "partitioned ⋈ replicated-view on a non-PK key: weight 1, not 4"
+    );
+    assert_eq!(
+        row_weights(&mut client, &sn, "v3", &["g", "s"]),
+        w(&[(&[7, 30], 1), (&[8, 5], 1)]),
+        "the third level — the induction, not just one hop"
+    );
+    assert_eq!(
+        row_weights(&mut client, &sn, "vmixagg", &["fid", "s"]),
+        w(&[(&[1, 30], 1), (&[2, 5], 1)]),
+        "aggregate over a MIXED-source view: the fix must not over-claim replication"
+    );
+    assert_eq!(
+        row_weights(&mut client, &sn, "vdist", &["g"]),
+        w(&[(&[7], 1), (&[8], 1)]),
+        "DISTINCT over a replicated view — now a replicated store, no weight clamp to hide behind"
+    );
+    assert_eq!(
+        row_weights(&mut client, &sn, "vlin", &["id", "x"]),
+        w(&[(&[1, 10], 1), (&[2, 20], 1), (&[3, 5], 1)]),
+        "linear view over a replicated view — now a replicated store, no partition trim to hide behind"
+    );
+    // The empty global aggregate: exactly one worker mints the ground row, and it
+    // must be the one the single-sourced read goes to.
+    assert_eq!(
+        row_weights(&mut client, &sn, "vcv", &["c"]),
+        w(&[(&[0], 1)]),
+        "an empty COUNT(*) over a replicated view must still return its ground row"
+    );
+    assert_eq!(
+        row_weights(&mut client, &sn, "vcb", &["c"]),
+        w(&[(&[0], 1)]),
+        "the same query over the replicated base table — the reference the view shape must match"
+    );
+
+    exec(&mut client, &sn, "DELETE FROM rt WHERE id = 2");
+    assert_eq!(
+        row_weights(&mut client, &sn, "vagg", &["g", "s"]),
+        w(&[(&[7, 10], 1), (&[8, 5], 1)]),
+        "g=7 re-sums to 10 after the retraction — the incremental path is un-multiplied too"
+    );
+}
+
+// The same chain built AFTER the insert, so the distributed-backfill driver runs
+// instead of the tick. The path is selected by fixture ordering, so this cannot
+// fold into the test above.
+#[test]
+fn replicated_view_chain_backfill_weights() {
+    let srv = match ServerHandle::start_n(4) {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    replicated_chain_fixture(&mut client, &sn);
+    insert_replicated_chain_rows(&mut client, &sn);
+
+    exec(&mut client, &sn, "CREATE VIEW rv AS SELECT id, g, x FROM rt");
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW vagg AS SELECT g, SUM(x) AS s FROM rv GROUP BY g",
+    );
+    assert_eq!(
+        row_weights(&mut client, &sn, "vagg", &["g", "s"]),
+        w(&[(&[7, 30], 1), (&[8, 5], 1)]),
+        "backfilled GROUP BY over a replicated view: g=7 sums to 30, not 120=30×4"
+    );
+}
+
 // ── 3-way chain (cut rule) ───────────────────────────────────────────
 // A 3-way equi chain over distinct tables. The cut segment `h0 = a3 ⋈ b3` carries
 // only the live columns (a3.av for the final projection, a3.id for the 2nd ON,

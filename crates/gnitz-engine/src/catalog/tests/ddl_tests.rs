@@ -906,3 +906,87 @@ fn table_retract_applies_qname_before_id() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ── replicated_bit_is_transitive_and_survives_replay ─────────────────
+// A view is stamped replicated iff every source it scans is, so the property
+// climbs a view chain: base → producer → consumer. Registration reads its
+// sources' already-registered state, so `hook_view_register` must process a batch
+// in dependency order — which neither order it sees is. Both are reproduced here:
+// the live batch carries the consumer before the producer, and replay walks
+// VIEW_TAB in PK order, in which the consumer's id is the LOWER one (a chain's
+// user-named view is minted before its body is bound). Get it wrong and the
+// consumer stamps `false`, flipping its store to Hashed across a restart.
+#[test]
+fn replicated_bit_is_transitive_and_survives_replay() {
+    let dir = temp_dir("replicated_bit_transitive");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
+
+    // A REPLICATED base table. `create_table` has no replicated argument, so
+    // register it through the raw TABLE_TAB path with the flag packed in.
+    let rt = engine.allocate_table_id();
+    engine.write_column_records(rt, OWNER_KIND_TABLE, &cols).unwrap();
+    let flags = gnitz_wire::pack_table_flags(true, true, 0);
+    let batch = build_table_tab_row_flags(&dir, rt, pack_pk_cols(&[0]), "rt", flags);
+    engine.ingest_to_family(TABLE_TAB_ID, &batch).unwrap();
+
+    // A partitioned base table, for the negative direction.
+    let pt = engine.create_table("public.pt", &cols, &[0], true).unwrap();
+
+    // Consumer ids allocated BEFORE their producers, on both chains.
+    let r_consumer = engine.allocate_table_id();
+    let r_producer = engine.allocate_table_id();
+    let p_consumer = engine.allocate_table_id();
+    let p_producer = engine.allocate_table_id();
+
+    for (vid, src) in [
+        (r_producer, rt),
+        (r_consumer, r_producer),
+        (p_producer, pt),
+        (p_consumer, p_producer),
+    ] {
+        write_identity_circuit(&mut engine, vid, src, None);
+        engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
+        engine.write_view_deps(vid, &[src]).unwrap();
+    }
+
+    // One VIEW_TAB batch, consumers first — the dependency-reversed row order.
+    let mut bb = BatchBuilder::new(SysFamily::View.schema());
+    for (vid, name) in [
+        (r_consumer, "rv2"),
+        (p_consumer, "pv2"),
+        (r_producer, "rv"),
+        (p_producer, "pv"),
+    ] {
+        push_view_tab_row(&mut bb, vid, name, "SELECT id, x FROM src");
+    }
+    engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
+
+    // (replicated, depth) for a registered relation.
+    let stamp = |e: &CatalogEngine, id: i64| {
+        let t = e.dag.tables.get(&id).expect("registered");
+        (t.schema.replicated(), t.depth)
+    };
+    let assert_stamps = |e: &CatalogEngine, when: &str| {
+        assert!(stamp(e, rt).0, "replicated base table ({when})");
+        assert_eq!(stamp(e, r_producer), (true, 1), "view over a replicated table ({when})");
+        assert_eq!(
+            stamp(e, r_consumer),
+            (true, 2),
+            "view over a replicated VIEW — the bit and the depth must both climb ({when})"
+        );
+        assert_eq!(stamp(e, p_producer), (false, 1), "view over a table ({when})");
+        assert_eq!(stamp(e, p_consumer), (false, 2), "view over a view ({when})");
+    };
+    assert_stamps(&engine, "live CREATE");
+
+    engine.close();
+    drop(engine); // release locks before re-open
+
+    let mut engine2 = CatalogEngine::open(&dir).unwrap();
+    assert_stamps(&engine2, "after replay");
+    engine2.close();
+
+    let _ = fs::remove_dir_all(&dir);
+}

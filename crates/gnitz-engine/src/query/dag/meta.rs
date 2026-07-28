@@ -162,21 +162,27 @@ impl DagEngine {
         reachable
     }
 
-    /// Order a DDL bundle's view ids by their intra-bundle dependencies (Kahn's
-    /// algorithm over `get_source_ids(vid) ∩ bundle`), so a chain's upstream
-    /// hidden view is backfilled before a downstream one scans it. VIEW_TAB row
-    /// order carries the registration `depth` (a standing contract), but the
-    /// live backfill must not also couple to that order — a deliberately
-    /// row-misordered bundle must still backfill. A bundle is acyclic by
-    /// construction; the no-progress fallback appends the remainder in input
-    /// order so termination holds regardless.
-    pub fn order_by_intra_bundle_deps(&mut self, view_ids: &[i64]) -> Vec<i64> {
-        if view_ids.len() <= 1 {
-            return view_ids.to_vec();
-        }
-        let bundle: FxHashSet<i64> = view_ids.iter().copied().collect();
-        let mut in_deps: FxHashMap<i64, Vec<i64>> = FxHashMap::default();
+    /// The distinct ids of `view_ids` in dependency order (Kahn's algorithm over
+    /// `get_source_ids(vid) ∩ view_ids`): a source view precedes every dependent
+    /// that scans it, so it is registered and backfilled first. Neither order a
+    /// batch of views arrives in is dependency order — a DDL bundle carries the
+    /// client's submission order, boot replay carries VIEW_TAB PK order — so this
+    /// is where the order is established. Acyclic by construction; the no-progress
+    /// fallback appends the remainder so a malformed input terminates instead of
+    /// spinning.
+    pub fn order_by_view_deps(&mut self, view_ids: &[i64]) -> Vec<i64> {
+        let mut ids: Vec<i64> = Vec::with_capacity(view_ids.len());
+        let mut bundle: FxHashSet<i64> = FxHashSet::default();
         for &vid in view_ids {
+            if bundle.insert(vid) {
+                ids.push(vid);
+            }
+        }
+        if ids.len() <= 1 {
+            return ids;
+        }
+        let mut in_deps: FxHashMap<i64, Vec<i64>> = FxHashMap::default();
+        for &vid in &ids {
             let deps: Vec<i64> = self
                 .get_source_ids(vid)
                 .into_iter()
@@ -185,22 +191,18 @@ impl DagEngine {
             in_deps.insert(vid, deps);
         }
         let mut emitted: FxHashSet<i64> = FxHashSet::default();
-        let mut order: Vec<i64> = Vec::with_capacity(view_ids.len());
-        while order.len() < view_ids.len() {
+        let mut order: Vec<i64> = Vec::with_capacity(ids.len());
+        while order.len() < ids.len() {
             let before = order.len();
-            for &vid in view_ids {
+            for &vid in &ids {
                 if !emitted.contains(&vid) && in_deps[&vid].iter().all(|d| emitted.contains(d)) {
                     order.push(vid);
                     emitted.insert(vid);
                 }
             }
             if order.len() == before {
-                debug_assert!(false, "cycle in DDL bundle view dependencies: {view_ids:?}");
-                for &vid in view_ids {
-                    if emitted.insert(vid) {
-                        order.push(vid);
-                    }
-                }
+                debug_assert!(false, "cycle in view dependencies: {ids:?}");
+                order.extend(ids.iter().copied().filter(|v| !emitted.contains(v)));
             }
         }
         order
@@ -236,39 +238,14 @@ impl DagEngine {
         bases
     }
 
-    /// True iff every base-table source feeding `view_id` is replicated (and the
-    /// view has at least one source). Such a view's `ExchangeShard`s are all
-    /// skipped (`compute_co_partitioned` marks replicated sources co-partitioned),
-    /// so every worker computes the full result locally — the output is itself
-    /// **replicated** and its read must single-source (design §4.2). A view with
-    /// any partitioned source (e.g. partitioned ⋈ replicated) is partitioned and
-    /// its read gathers normally. A non-base-table source (a nested view) reads as
-    /// non-replicated here, so nested-over-replicated views are conservatively
-    /// treated as partitioned — the MVP surface is base-table dimensions.
-    ///
-    /// Sources come from the reverse dependency map, which records exactly
-    /// `circuit.dependencies()` — the deduped `ScanDelta` source set — so this
-    /// answers the question off the dependency map with no circuit load and no
-    /// allocation. Reads LIVE table flags per call (never baked into a plan or
-    /// meta cache): the flag changes with table registration.
-    pub(crate) fn view_all_sources_replicated(&mut self, view_id: i64) -> bool {
-        self.get_dep_map();
-        let Some(sources) = self.dep.reverse.get(&view_id) else {
-            return false;
-        };
-        !sources.is_empty()
-            && sources
-                .iter()
-                .all(|tid| self.tables.get(tid).is_some_and(|e| e.schema.replicated()))
-    }
-
     /// True iff view `view_id` has **any** replicated source — the flag
     /// `build_partitioned_storage` routes on. Such a view is built
     /// single-partition, so its whole local output sits in one child store and its
     /// rows are NOT keyed by `partition_for_pk`; no key-derived routing decision
-    /// holds for it. Same source set and same live-flag read as
-    /// [`view_all_sources_replicated`](Self::view_all_sources_replicated), which
-    /// answers the stricter question of whether the output is itself replicated.
+    /// holds for it. Answered off the reverse dependency map (which records
+    /// exactly `circuit.dependencies()`), so it costs no circuit load and no
+    /// allocation. Weaker than the view's own stamped `replicated` bit, which
+    /// needs *every* source replicated.
     pub(crate) fn view_has_replicated_source(&mut self, view_id: i64) -> bool {
         self.get_dep_map();
         self.dep.reverse.get(&view_id).is_some_and(|sources| {

@@ -36,9 +36,9 @@ pub(super) fn compute_co_partitioned(join_shard_map: &JoinShardMap, ext_tables: 
     //     dim copy, so no exchange is needed on either side (design §4.5). This is
     //     the case hash co-partitioning cannot serve: the fact need not be
     //     distributed by the join key, so one fact can join many replicated dims.
-    let any_replicated = ext_tables
-        .iter()
-        .any(|(tid, schema)| schema.replicated() && join_shard_map.contains_key(tid));
+    let any_replicated = join_shard_map
+        .keys()
+        .any(|tid| ext_tables.get(tid).is_some_and(|schema| schema.replicated()));
     let mut co_partitioned = HashSet::new();
     for (&tid, cols) in join_shard_map {
         let Some(ext_schema) = ext_tables.get(&tid) else {

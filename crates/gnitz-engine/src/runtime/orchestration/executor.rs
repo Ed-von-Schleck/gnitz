@@ -2308,12 +2308,12 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
         }
     }
 
-    // Order the bundle's new views by intra-bundle dependency before backfilling:
-    // a chain requires an upstream hidden view to be materialized before a
-    // downstream one scans it. The order is re-derived from the dep-map (populated
-    // during the ingest loop, DEP_TAB applying before VIEW_TAB) rather than from
-    // VIEW_TAB row order.
-    let ordered_view_ids: Vec<i64> = unsafe { (*cat_ptr_raw).dag.order_by_intra_bundle_deps(&new_view_ids) };
+    // Order the bundle's new views by dependency before backfilling: a chain
+    // requires an upstream hidden view to be materialized before a downstream one
+    // scans it. Registration already walked the dependencies to compute `depth`
+    // (one more than the deepest source), so ascending depth is that order.
+    let mut ordered_view_ids = new_view_ids.clone();
+    ordered_view_ids.sort_by_key(|vid| unsafe { (*cat_ptr_raw).dag.tables.get(vid).map_or(0, |e| e.depth) });
 
     // View-scoped distributed backfill for every exchange / equi-join view; plain
     // projection/filter views were already filled inline by hook_view_register
