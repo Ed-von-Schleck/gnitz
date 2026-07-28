@@ -373,6 +373,10 @@ impl<'a> BatchView for MemBatch<'a> {
     fn null_bmp(&self) -> &[u8] {
         MemBatch::null_bmp(self)
     }
+    #[inline(always)]
+    fn pk_region(&self) -> (&[u8], usize) {
+        (MemBatch::pk(self), self.pk_stride as usize)
+    }
 }
 
 impl<'a> ColumnarSource for MemBatch<'a> {

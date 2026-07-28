@@ -10,6 +10,7 @@ use gnitz_core::{
     MAX_PK_BYTES,
 };
 use gnitz_core::{Circuit, CircuitBuilder, ExprBuilder, ExprProgram, GnitzClient};
+use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_sql::{GnitzSqlError, SqlPlanner, SqlResult};
 
 /// The `(schema, data_batch, lsn)` a sync scan/seek/push resolves to.
@@ -894,20 +895,18 @@ fn cell_to_py(
 /// Per-column decode metadata, every field a pure function of the `Schema` and
 /// the presented column set. Computed once via [`ColLayout::for_schema`] and
 /// reused across every row of a batch, hoisting the schema lookups out of the
-/// per-row build loop. Naming the bundle (rather than scattering parallel
-/// `Vec`s) keeps it the single place the derivation lives — and the obvious
+/// per-row build loop. Naming the bundle keeps it the single place the
+/// derivation lives — and the obvious
 /// place to memoize per cached schema if the per-batch recompute ever shows up
 /// in a profile.
 #[derive(Default)]
 struct ColLayout {
-    /// `schema.is_pk_col(ci)`, per column.
-    is_pk: Vec<bool>,
-    /// `schema.payload_idx(ci)` for non-PK cols; 0 for PK cols (unused).
-    payload_idx: Vec<usize>,
-    /// `type_code.wire_stride()`, per column.
-    wire_stride: Vec<usize>,
-    /// `schema.pk_byte_offset(ci)` for PK cols; 0 for non-PK cols (unused).
-    pk_byte_offset: Vec<usize>,
+    /// Where each column physically lives — PK byte offset or payload slot,
+    /// plus its width — as the one resolved-addressing record the expression
+    /// evaluator and the engine's own scan paths read through. A tagged union
+    /// rather than four parallel `Vec`s, three of which would carry a
+    /// placeholder at every index the fourth describes.
+    locs: Vec<ColumnLocator>,
     /// `schema.pk_stride()`, the packed PK tuple width.
     pk_stride: u8,
     /// Whether any presented column is a PK column — when false, the per-row
@@ -917,21 +916,13 @@ struct ColLayout {
 
 impl ColLayout {
     fn for_schema(s: &Schema, present_cols: &[usize]) -> Self {
-        let is_pk: Vec<bool> = (0..s.columns.len()).map(|ci| s.is_pk_col(ci)).collect();
-        let payload_idx: Vec<usize> = (0..s.columns.len())
-            .map(|ci| if is_pk[ci] { 0 } else { s.payload_idx(ci) })
-            .collect();
-        let pk_byte_offset: Vec<usize> = (0..s.columns.len())
-            .map(|ci| if is_pk[ci] { s.pk_byte_offset(ci) } else { 0 })
-            .collect();
-        let has_presented_pk = present_cols.iter().any(|&ci| is_pk[ci]);
+        let locs: Vec<ColumnLocator> = (0..s.columns.len()).map(|ci| SchemaFacts::locate(s, ci)).collect();
         ColLayout {
-            is_pk,
-            payload_idx,
-            wire_stride: s.columns.iter().map(|c| c.type_code.wire_stride()).collect(),
-            pk_byte_offset,
+            has_presented_pk: present_cols
+                .iter()
+                .any(|&ci| matches!(locs[ci], ColumnLocator::Pk { .. })),
+            locs,
             pk_stride: s.pk_stride() as u8,
-            has_presented_pk,
         }
     }
 }
@@ -1002,24 +993,19 @@ fn build_row_values_into(py: Python<'_>, data: &SharedBatchData, row: usize, out
         .has_presented_pk
         .then(|| batch.pks.get_tuple(row, layout.pk_stride));
     for &ci in &data.present_cols {
-        if layout.is_pk[ci] {
-            out.push(pk_value_from_tuple(
+        let tc = schema.columns[ci].type_code;
+        match layout.locs[ci] {
+            ColumnLocator::Pk { byte_off, size, .. } => out.push(pk_value_from_tuple(
                 py,
-                schema.columns[ci].type_code,
-                layout.pk_byte_offset[ci],
-                layout.wire_stride[ci],
+                tc,
+                byte_off as usize,
+                size as usize,
                 pk_tuple.as_ref().expect("has_presented_pk covers every PK column"),
-            ));
-        } else {
-            let is_null = null_word_get(null_word, layout.payload_idx[ci]);
-            out.push(cell_to_py(
-                py,
-                &batch.columns[ci],
-                row,
-                is_null,
-                schema.columns[ci].type_code,
-                layout.wire_stride[ci],
-            )?);
+            )),
+            ColumnLocator::Payload { slot, size, .. } => {
+                let is_null = null_word_get(null_word, slot as usize);
+                out.push(cell_to_py(py, &batch.columns[ci], row, is_null, tc, size as usize)?);
+            }
         }
     }
     Ok(())
@@ -1295,30 +1281,30 @@ impl PyScanResult {
         let n = data.batch.len();
 
         let tc = data.schema.columns[col_idx].type_code;
-        let stride = tc.wire_stride();
 
-        // Specialize by column kind, with the per-column layout hoisted out of
-        // the row loop. Use get_tuple so compound-PK (PkColumn::Bytes) batches
-        // work too.
-        if data.schema.is_pk_col(col_idx) {
-            let pk_stride = data.schema.pk_stride() as u8;
-            let offset = data.schema.pk_byte_offset(col_idx);
-            let items: Vec<PyObject> = (0..data.batch.pks.len())
-                .map(|i| {
-                    let t = data.batch.pks.get_tuple(i, pk_stride);
-                    pk_value_from_tuple(py, tc, offset, stride, &t)
-                })
-                .collect();
-            return Ok(PyList::new(py, items)?.unbind());
+        // Specialize by column kind, with the per-column address resolved once
+        // out of the row loop. Use get_tuple so compound-PK (PkColumn::Bytes)
+        // batches work too.
+        match SchemaFacts::locate(data.schema.as_ref(), col_idx) {
+            ColumnLocator::Pk { byte_off, size, .. } => {
+                let pk_stride = data.schema.pk_stride() as u8;
+                let items: Vec<PyObject> = (0..data.batch.pks.len())
+                    .map(|i| {
+                        let t = data.batch.pks.get_tuple(i, pk_stride);
+                        pk_value_from_tuple(py, tc, byte_off as usize, size as usize, &t)
+                    })
+                    .collect();
+                Ok(PyList::new(py, items)?.unbind())
+            }
+            ColumnLocator::Payload { slot, size, .. } => {
+                let nulls = &data.batch.nulls;
+                let col = &data.batch.columns[col_idx];
+                let items: Vec<PyObject> = (0..n)
+                    .map(|i| cell_to_py(py, col, i, null_word_get(nulls[i], slot as usize), tc, size as usize))
+                    .collect::<PyResult<_>>()?;
+                Ok(PyList::new(py, items)?.unbind())
+            }
         }
-
-        let nulls = &data.batch.nulls;
-        let pi = data.schema.payload_idx(col_idx);
-        let col = &data.batch.columns[col_idx];
-        let items: Vec<PyObject> = (0..n)
-            .map(|i| cell_to_py(py, col, i, null_word_get(nulls[i], pi), tc, stride))
-            .collect::<PyResult<_>>()?;
-        Ok(PyList::new(py, items)?.unbind())
     }
 }
 

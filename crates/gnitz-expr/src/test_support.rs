@@ -102,6 +102,9 @@ impl BatchView for TestView {
     fn null_bmp(&self) -> &[u8] {
         &self.nulls
     }
+    fn pk_region(&self) -> (&[u8], usize) {
+        (&self.pk, self.pk_stride)
+    }
 }
 
 /// A [`SchemaFacts`] over a `(type_code, nullable)` column table plus a PK list

@@ -42,6 +42,9 @@ impl BatchView for MisMappedSlot {
     fn null_bmp(&self) -> &[u8] {
         self.0.null_bmp()
     }
+    fn pk_region(&self) -> (&[u8], usize) {
+        self.0.pk_region()
+    }
 }
 
 #[test]

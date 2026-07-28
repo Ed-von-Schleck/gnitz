@@ -34,35 +34,38 @@ fn raw_scratch(num_regs: usize, no_nulls: bool, n: usize) -> EvalScratch {
     s
 }
 
+/// One `split_windows` backs both scratch buffers and both arities, so drive
+/// every shape the kernels ask of it: two sources and three over `regs` (the
+/// binary opcodes and SELECT's blend), and two over `null_bits` (the null
+/// propagation, whose windows are words rather than values).
 #[test]
-fn test_scratch_reg3() {
-    let mut s = raw_scratch(3, /* no_nulls = */ true, MORSEL);
+fn test_scratch_splits_disjoint_windows() {
+    let mut s = raw_scratch(4, /* no_nulls = */ false, MORSEL);
     let m = 4;
-    // Fill regs 0 and 1 with known values
     for i in 0..m {
         s.regs[0 * MORSEL + i] = (i as i64) + 1;
-    }
-    for i in 0..m {
         s.regs[1 * MORSEL + i] = (i as i64) * 10;
+        s.regs[2 * MORSEL + i] = 100;
     }
-    // Use reg3 to add reg0 + reg1 → reg2
     {
-        let (ra, rb, rd) = s.reg3(0, 1, 2, m);
+        let ([ra, rb], rd) = s.regs_split([0, 1], 3, m);
         for i in 0..m {
             rd[i] = ra[i] + rb[i];
         }
     }
-    assert_eq!(&s.regs[2 * MORSEL..2 * MORSEL + m], &[1, 12, 23, 34]);
-}
+    assert_eq!(&s.regs[3 * MORSEL..3 * MORSEL + m], &[1, 12, 23, 34]);
+    {
+        let ([ra, rb, rc], rd) = s.regs_split([0, 1, 2], 3, m);
+        for i in 0..m {
+            rd[i] = ra[i] + rb[i] + rc[i];
+        }
+    }
+    assert_eq!(&s.regs[3 * MORSEL..3 * MORSEL + m], &[101, 112, 123, 134]);
 
-#[test]
-fn test_scratch_null_words3() {
-    let mut s = raw_scratch(3, /* no_nulls = */ false, MORSEL);
-    let words = 1;
     s.null_bits[0 * NULL_WORDS_PER_REG] = 0b1010;
     s.null_bits[1 * NULL_WORDS_PER_REG] = 0b0110;
     {
-        let (na, nb, nd) = s.null_words3(0, 1, 2, words);
+        let ([na, nb], nd) = s.null_split([0, 1], 2, 1);
         nd[0] = na[0] | nb[0];
     }
     assert_eq!(s.null_bits[2 * NULL_WORDS_PER_REG], 0b1110);

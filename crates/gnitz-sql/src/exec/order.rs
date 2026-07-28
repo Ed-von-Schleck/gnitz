@@ -19,6 +19,7 @@ use crate::codec::project_schema::ProjItem;
 use crate::error::GnitzSqlError;
 use crate::exec::batch::copy_batch_row_owned;
 use gnitz_core::{ColData, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
+use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_wire::cmp_typed_le;
 use sqlparser::ast::{Expr, OrderBy, OrderByKind, Value};
 
@@ -82,17 +83,26 @@ struct SortKey {
 }
 
 impl SortKey {
+    /// Every address the comparator needs comes from the one resolved-addressing
+    /// record, [`ColumnLocator`] — not from four independent `is_pk_col` /
+    /// `pk_byte_offset` / `payload_idx` / `wire_stride` lookups that could
+    /// disagree. It is the same record the engine's worker-side ORDER BY
+    /// comparator resolves through, which is what keeps the two byte-for-byte
+    /// equivalent as the schema layout evolves.
     fn new(schema: &Schema, ci: usize, asc: bool, nulls_first: bool) -> Self {
-        let tc = schema.columns[ci].type_code;
-        let is_pk = schema.is_pk_col(ci);
+        let loc = SchemaFacts::locate(schema, ci);
+        let (pk_offset, null_mask) = match loc {
+            ColumnLocator::Pk { byte_off, .. } => (Some(byte_off as usize), 0),
+            ColumnLocator::Payload { slot, .. } => (None, 1u64 << slot),
+        };
         SortKey {
             ci,
             asc,
             nulls_first,
-            tc,
-            stride: tc.wire_stride(),
-            pk_offset: is_pk.then(|| schema.pk_byte_offset(ci)),
-            null_mask: if is_pk { 0 } else { 1u64 << schema.payload_idx(ci) },
+            tc: schema.columns[ci].type_code,
+            stride: loc.size(),
+            pk_offset,
+            null_mask,
         }
     }
 }

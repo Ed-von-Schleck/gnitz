@@ -63,7 +63,7 @@ pub trait SchemaFacts {
 
 /// One [`SCHEMA_FACTS_CASES`] entry: a schema's column table as
 /// `(type_code, nullable)`, and its PK list in PK-LIST order.
-pub type SchemaFactsCase = (&'static [(u8, bool)], &'static [usize]);
+type SchemaFactsCase = (&'static [(u8, bool)], &'static [usize]);
 
 /// The shape matrix every implementor is driven against. It lives beside the
 /// harness so each crate tests its own implementor against the same absolute
@@ -73,7 +73,7 @@ pub type SchemaFactsCase = (&'static [(u8, bool)], &'static [usize]);
 /// each PK column is non-nullable and PK-eligible, the widest schema is 6
 /// columns against `MAX_COLUMNS`, and the widest PK list is 4 —
 /// `PK_LIST_MAX_COLS` exactly.
-pub const SCHEMA_FACTS_CASES: &[SchemaFactsCase] = {
+const SCHEMA_FACTS_CASES: &[SchemaFactsCase] = {
     use gnitz_wire::type_code as tc;
     &[
         // Single unsigned PK at column 0; U64/F64/STRING/U128 payload, one nullable.
@@ -137,6 +137,14 @@ pub const SCHEMA_FACTS_CASES: &[SchemaFactsCase] = {
 
 /// Drive [`assert_schema_facts_consistent`] over every [`SCHEMA_FACTS_CASES`]
 /// shape, building the implementor from each case's column table and PK list.
+///
+/// The whole harness's public surface, and a normal `pub fn` rather than a
+/// `#[cfg(test)]` helper, so every crate that adds an implementor calls it from
+/// its own test tree — the same shape as [`crate::assert_batchview_consistent`],
+/// and for the same reason: the engine's `SchemaDescriptor` and the client's
+/// `Schema` live in crates that cannot see each other's tests. The case table
+/// and the per-schema assertions behind it stay private, so a caller cannot
+/// drive a subset of the matrix and believe it checked the whole thing.
 pub fn assert_schema_facts_matrix<S: SchemaFacts>(build: impl Fn(&[(u8, bool)], &[usize]) -> S) {
     for &(cols, pk) in SCHEMA_FACTS_CASES {
         assert_schema_facts_consistent(&build(cols, pk), cols, pk);
@@ -157,15 +165,12 @@ pub fn assert_schema_facts_matrix<S: SchemaFacts>(build: impl Fn(&[(u8, bool)], 
 /// because a wrong offset reads a neighbouring PK column's bytes and still
 /// produces a value.
 ///
-/// A normal `pub fn`, not a `#[cfg(test)]` helper, so every crate that adds an
-/// implementor calls it from its own test tree — the same shape as
-/// [`crate::assert_batchview_consistent`], and for the same reason: the engine's
-/// `SchemaDescriptor` and the client's `Schema` live in crates that cannot see
-/// each other's tests. It takes `&dyn` only to match the trait's own dispatch
-/// (see the trait doc); a `<S: SchemaFacts>` generic would resolve to the trait
-/// methods just as well, since a type parameter has no inherent impls to shadow
-/// them — which is why the sibling harness is generic.
-pub fn assert_schema_facts_consistent(s: &dyn SchemaFacts, cols: &[(u8, bool)], pk: &[usize]) {
+/// It takes `&dyn` only to match the trait's own dispatch (see the trait doc); a
+/// `<S: SchemaFacts>` generic would resolve to the trait methods just as well,
+/// since a type parameter has no inherent impls to shadow them — which is why
+/// [`assert_schema_facts_matrix`], which has to *build* the implementor, is
+/// generic.
+pub(crate) fn assert_schema_facts_consistent(s: &dyn SchemaFacts, cols: &[(u8, bool)], pk: &[usize]) {
     assert_eq!(s.num_columns(), cols.len(), "num_columns()");
     assert_eq!(s.num_payload_cols(), cols.len() - pk.len(), "num_payload_cols()");
 

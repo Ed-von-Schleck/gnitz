@@ -285,6 +285,11 @@ impl gnitz_expr::BatchView for ZSetBatchView<'_> {
     fn null_bmp(&self) -> &[u8] {
         self.regions[REG_NULL_BMP]
     }
+
+    #[inline(always)]
+    fn pk_region(&self) -> (&[u8], usize) {
+        (self.pk, self.pk_stride)
+    }
 }
 
 #[cfg(test)]

@@ -45,6 +45,7 @@ pub trait RowSource {
 /// CONTRACT binding the two shapes, checked by [`assert_batchview_consistent`]:
 ///   `get_col_ptr(row, pi, sz) == &col_data(pi, sz)[row*sz .. row*sz + sz]`
 ///   `get_null_word(row)       == gnitz_wire::read_u64_le(null_bmp(), row*8)`
+///   `get_pk_bytes(row)        == &pk_region().0[row*s .. row*s + s]`, `s = .1`
 ///
 /// There are deliberately **no default bodies** for the per-row half. Defaulting
 /// it off the region accessors would make direct addressing opt-in: delete an
@@ -55,6 +56,11 @@ pub trait BatchView: RowSource {
     fn col_data(&self, payload_col: usize, col_size: usize) -> &[u8];
     /// The null-bitmap region in full (`rows * 8` bytes, u64 LE per row).
     fn null_bmp(&self) -> &[u8];
+    /// The OPK PK region in full (`rows * stride` bytes) and its per-row stride.
+    /// Returned as one pair rather than two accessors so a kernel that walks the
+    /// region pays one call to obtain both, matching the single `col_data` call
+    /// its payload counterpart makes.
+    fn pk_region(&self) -> (&[u8], usize);
 }
 
 /// Assert the region/per-row contract on [`BatchView`] for `rows` rows and the
@@ -75,6 +81,15 @@ pub fn assert_batchview_consistent<B: BatchView>(v: &B, rows: usize, cols: &[(us
             v.get_null_word(row),
             gnitz_wire::read_u64_le(bmp, row * 8),
             "get_null_word({row}) disagrees with null_bmp()",
+        );
+    }
+    let (pk, stride) = v.pk_region();
+    assert_eq!(pk.len(), rows * stride, "pk_region() must be rows * stride bytes");
+    for row in 0..rows {
+        assert_eq!(
+            v.get_pk_bytes(row),
+            &pk[row * stride..row * stride + stride],
+            "get_pk_bytes({row}) disagrees with pk_region()",
         );
     }
     for &(pi, sz) in cols {
