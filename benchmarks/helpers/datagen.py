@@ -232,6 +232,7 @@ def bulk_load(
     while i <= num_rows:
         batch = gnitz.ZSetBatch(schema)
         end = min(i + chunk, num_rows + 1)
+        rows = []
         for k in range(i, end):
             row = {"pk": k}
             for col in columns:
@@ -241,8 +242,9 @@ def bulk_load(
                     row[col.name] = None
                 else:
                     row[col.name] = gen_value(rng, col, k, pools, skew)
-            batch.append(**row)
+            rows.append(row)
             pks.append(k)
+        batch.extend(rows)
         conn.push(tid, batch)
         i = end
     return pks
@@ -254,10 +256,7 @@ def build_batch(schema, rows, weight: int = 1):
     Callers that time only the push (bench_timer.measure) build the batch with
     this first, then measure conn.push(tid, batch) alone.
     """
-    b = gnitz.ZSetBatch(schema)
-    for r in rows:
-        b.append(**r, weight=weight)
-    return b
+    return gnitz.ZSetBatch(schema).extend(rows, weight)
 
 
 def push_rows(conn, tid, schema, rows, weight: int = 1) -> None:
@@ -267,9 +266,7 @@ def push_rows(conn, tid, schema, rows, weight: int = 1) -> None:
 
 def push_one(conn, tid, schema, **row) -> None:
     """Push a single row (weight=1) as its own batch."""
-    b = gnitz.ZSetBatch(schema)
-    b.append(**row, weight=1)
-    conn.push(tid, b)
+    conn.push(tid, gnitz.ZSetBatch(schema).extend([row]))
 
 
 def push_stream(client, tid, schema, build, count, chunk: int = 250_000) -> None:

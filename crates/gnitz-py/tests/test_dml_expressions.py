@@ -257,7 +257,7 @@ def test_do_update_with_null_into_not_null_column_errors(client, schema_name):
 
 
 def test_residual_register_cap(client, schema_name):
-    """`ExprBuilder` never reuses a register, so an AND chain of k equality
+    """The planner's expression builder never reuses a register, so an AND chain of k equality
     conjuncts costs 4k - 1 registers (16 fit, 17 do not) and a string IN of N
     items costs 2N - 1 (32 fit, 33 do not). The rejection names the limit."""
     sn = schema_name

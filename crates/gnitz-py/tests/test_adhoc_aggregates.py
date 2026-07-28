@@ -315,7 +315,7 @@ def test_having_rejections(client, hg):
     # A string literal on both sides has no column operand to dispatch on.
     _reject_both(client, hg, "SELECT cat FROM hg GROUP BY cat HAVING 'a' = 'b'")
 
-    # The 64-register cap. `ExprBuilder` never reuses a register, so an equality
+    # The 64-register cap. The planner's expression builder never reuses a register, so an equality
     # conjunct over a plain group column costs 3 (load_col + load_const + cmp)
     # and each AND one more: k conjuncts need 4k - 1, so 16 fit in 64 and 17 do
     # not. A string IN costs 2N - 1 (one str_col_eq_const per item, whose column

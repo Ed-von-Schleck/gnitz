@@ -31,15 +31,18 @@ import asyncio
 from gnitz._native import AsyncTransport, GnitzError  # noqa: F401
 
 
-# Helpers passed to the Rust I/O thread for resolving futures safely.
-def _set_result_safe(future, value):
-    if not future.done():
-        future.set_result(value)
-
-
-def _set_exception_safe(future, exc):
-    if not future.done():
-        future.set_exception(exc)
+# Passed to the Rust I/O thread, which resolves a whole batch of futures through
+# one ``call_soon_threadsafe`` — that call allocates a handle, takes the loop
+# lock and writes the self-pipe, so paying it per future cost ~40x more than
+# paying it per batch and blocked the loop while the I/O thread held the GIL.
+def _resolve_batch(items):
+    for future, value, is_exception in items:
+        if future.done():
+            continue
+        if is_exception:
+            future.set_exception(value)
+        else:
+            future.set_result(value)
 
 
 def connect(socket_path):
@@ -71,9 +74,7 @@ class AsyncConnection:
 
     def __init__(self, socket_path):
         loop = asyncio.get_running_loop()
-        self._transport = AsyncTransport(
-            socket_path, loop, _set_result_safe, _set_exception_safe,
-        )
+        self._transport = AsyncTransport(socket_path, loop, _resolve_batch)
 
     def __await__(self):
         # Yield once so asyncio recognises `await connect(path)` as awaiting a

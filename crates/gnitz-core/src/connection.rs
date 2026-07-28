@@ -105,21 +105,13 @@ impl Session {
         // accepts the first frame at an 8-byte limit, so this must
         // happen before `send_message` would emit a control block.
         let (limit, published_lsn) = hello_handshake(&mut transport)?;
-        let session = Session::from_transport(transport, new_client_id(), limit as usize);
-        Ok((session, published_lsn))
-    }
-
-    /// Wrap an already-connected, already-handshaken transport. Used by the
-    /// gnitz-py async I/O thread, which connects + handshakes on the calling
-    /// thread (to capture the negotiated limit and dup the waker fd) and then
-    /// moves the raw transport onto its I/O thread to build the session there.
-    pub fn from_transport(transport: ClientTransport, client_id: u64, max_payload_len: usize) -> Self {
-        Session {
+        let session = Session {
             transport,
-            client_id,
-            max_payload_len,
+            client_id: new_client_id(),
+            max_payload_len: limit as usize,
             schema_cache: LruCache::new(SCHEMA_CACHE_CAP),
-        }
+        };
+        Ok((session, published_lsn))
     }
 
     pub fn close(self) {

@@ -8,9 +8,8 @@ Skew: o_cust (hot customers) and lineitem's l_order FK are drawn Zipfian.
 Tables (rows scale with SF): region(5), nation(25), customer(~150*SF),
 orders(~1500*SF), lineitem(~5000*SF, compound PK (l_order, l_line)).
 
-Rows are dicts keyed by column name so a test can `batch.append(**row)`.
-Independent of crates/gnitz-py/tests/tpch_gen.py (that one feeds circuit-builder
-correctness tests and lacks these columns/skew).
+Rows are dicts keyed by column name, so a caller can hand them straight to
+`ZSetBatch.extend(rows)`.
 """
 
 from __future__ import annotations
