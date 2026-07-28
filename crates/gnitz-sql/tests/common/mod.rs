@@ -19,7 +19,7 @@ pub fn make_planner(srv: &ServerHandle) -> (GnitzClient, String) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let sn = format!("s{}", SEQ.fetch_add(1, Ordering::Relaxed));
-    let mut client = GnitzClient::connect(&srv.sock_path).unwrap();
+    let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     client.create_schema(&sn).unwrap();
     (client, sn)
 }

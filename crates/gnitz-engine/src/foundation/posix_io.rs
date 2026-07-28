@@ -3,11 +3,12 @@
 //! - **File-I/O tier** — safe functions returning `io::Result` (or
 //!   `Option<OwnedFd>` where callers use absence semantically): fd read/write
 //!   with EINTR/partial-write handling, fdatasync/fsync, fallocate, ftruncate,
-//!   O_TMPFILE, NOCOW, madvise, the Unix server socket, fd-limit, `Mmap`.
+//!   O_TMPFILE, NOCOW, madvise, `map_shared_sized`, the Unix server socket,
+//!   fd-limit, `Mmap`.
 //! - **IPC tier** — raw return codes, kept deliberately: eventfd, futex,
-//!   memfd, `mmap_shared`. Their callers inspect errno (EAGAIN/ETIMEDOUT),
-//!   re-read rings rather than trust returns, and manage fd lifecycles
-//!   manually across `fork()`; `io::Result`/`OwnedFd` would fight that.
+//!   memfd. Their callers inspect errno (EAGAIN/ETIMEDOUT), re-read rings
+//!   rather than trust returns, and manage fd lifecycles manually across
+//!   `fork()`; `io::Result`/`OwnedFd` would fight that.
 
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::atomic::AtomicU32;
@@ -169,10 +170,12 @@ pub fn open_tmpfile(dir: &str) -> std::io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Set FS_NOCOW_FL on fd (btrfs in-place overwrites).
-/// Silently ignored on non-btrfs filesystems.
-/// Returns 0 on success, -1 on error (non-fatal).
-pub fn try_set_nocow(fd: i32) -> i32 {
+/// Ask btrfs to overwrite `fd` in place instead of copying (`FS_NOCOW_FL`).
+///
+/// Best-effort, like [`madvise_hugepage`]: ext4/xfs/tmpfs reject the flag with
+/// `EOPNOTSUPP` and have no copy-on-write path to disable, so a failure here is
+/// the normal case off btrfs and carries no information worth reporting.
+pub fn try_set_nocow(fd: i32) {
     // FS_IOC_GETFLAGS = 0x80086601, FS_IOC_SETFLAGS = 0x40086602
     // FS_NOCOW_FL = 0x00800000
     const FS_IOC_GETFLAGS: libc::c_ulong = 0x80086601;
@@ -182,10 +185,10 @@ pub fn try_set_nocow(fd: i32) -> i32 {
     let mut flags: libc::c_int = 0;
     unsafe {
         if libc::ioctl(fd, FS_IOC_GETFLAGS, &mut flags) < 0 {
-            return -1;
+            return;
         }
         flags |= FS_NOCOW_FL;
-        libc::ioctl(fd, FS_IOC_SETFLAGS, &flags)
+        libc::ioctl(fd, FS_IOC_SETFLAGS, &flags);
     }
 }
 
@@ -200,32 +203,6 @@ pub fn madvise_hugepage(ptr: *mut u8, size: usize) {
     }
     unsafe {
         libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_HUGEPAGE);
-    }
-}
-
-/// Pre-fault writable page-table entries for [ptr, ptr+size).
-/// Uses MADV_POPULATE_WRITE (Linux 5.14+): installs writable PTEs and
-/// triggers the filesystem page_mkwrite callback, so later writes don't
-/// fault.  Unlike memset, this does not dirty page contents or pollute
-/// CPU caches.  Best-effort: ignores errors and is a no-op for null ptr
-/// or size 0.
-pub fn madvise_populate_write(ptr: *mut u8, size: usize) {
-    if ptr.is_null() || size == 0 {
-        return;
-    }
-    unsafe {
-        libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_POPULATE_WRITE);
-    }
-}
-
-/// Hint the kernel to read-ahead [ptr, ptr+size) into page cache.
-/// Best-effort: ignores errors and is a no-op for null ptr or size 0.
-pub fn madvise_willneed(ptr: *mut u8, size: usize) {
-    if ptr.is_null() || size == 0 {
-        return;
-    }
-    unsafe {
-        libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_WILLNEED);
     }
 }
 
@@ -328,15 +305,7 @@ pub fn tcp_bind(addr: &std::net::SocketAddr) -> std::io::Result<i32> {
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let on: c_int = 1;
-        if libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_REUSEADDR,
-            &on as *const _ as *const libc::c_void,
-            std::mem::size_of::<c_int>() as libc::socklen_t,
-        ) < 0
-        {
+        if setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1) < 0 {
             return Err(close_with_errno(fd));
         }
         let (ss, len) = sockaddr_from_addr(addr);
@@ -359,41 +328,36 @@ pub fn tcp_local_addr(fd: i32) -> Option<std::net::SocketAddr> {
     addr_from_sockaddr(&ss)
 }
 
+/// `setsockopt` of a single `int` option. Returns the raw return code.
+pub(crate) fn setsockopt_int(fd: c_int, level: c_int, opt: c_int, val: c_int) -> c_int {
+    unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            opt,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<c_int>() as libc::socklen_t,
+        )
+    }
+}
+
 /// Bare `SO_KEEPALIVE` (no interval tuning): a silently half-open TCP
 /// connection is reaped by the kernel default probing (~2 h) instead of
 /// parking a recv forever.
 pub fn set_keepalive(fd: i32) {
-    let on: c_int = 1;
-    unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_KEEPALIVE,
-            &on as *const _ as *const libc::c_void,
-            std::mem::size_of::<c_int>() as libc::socklen_t,
-        );
-    }
+    setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
 }
 
 /// `TCP_NODELAY`: small control frames must not pay Nagle's 40 ms batching
 /// delay (AF_UNIX has no Nagle, so this restores latency parity).
 pub fn set_nodelay(fd: i32) {
-    let on: c_int = 1;
-    unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_NODELAY,
-            &on as *const _ as *const libc::c_void,
-            std::mem::size_of::<c_int>() as libc::socklen_t,
-        );
-    }
+    setsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
 }
 
 /// SocketAddr → (sockaddr_storage, socklen_t). Zero-pads the storage and
 /// preserves the IPv6 flowinfo/scope_id so link-local destinations route
 /// (without a scope id the kernel rejects an `fe80::` send with EINVAL).
-pub fn sockaddr_from_addr(addr: &std::net::SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+fn sockaddr_from_addr(addr: &std::net::SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     match addr {
         std::net::SocketAddr::V4(a) => {
@@ -420,7 +384,7 @@ pub fn sockaddr_from_addr(addr: &std::net::SocketAddr) -> (libc::sockaddr_storag
 /// sockaddr_storage → SocketAddr, discriminated by `ss_family` alone.
 /// None for non-AF_INET/AF_INET6. Preserves IPv6 flowinfo/scope_id so a
 /// reply to a received `src` reaches a link-local peer.
-pub fn addr_from_sockaddr(ss: &libc::sockaddr_storage) -> Option<std::net::SocketAddr> {
+fn addr_from_sockaddr(ss: &libc::sockaddr_storage) -> Option<std::net::SocketAddr> {
     match ss.ss_family as libc::c_int {
         libc::AF_INET => {
             let sin = unsafe { &*(ss as *const _ as *const libc::sockaddr_in) };
@@ -444,25 +408,18 @@ pub fn addr_from_sockaddr(ss: &libc::sockaddr_storage) -> Option<std::net::Socke
     }
 }
 
-/// Raise RLIMIT_NOFILE soft limit to `target` (capped by hard limit).
-/// Returns the new soft limit, or -1 on failure.
-pub fn raise_fd_limit(target: u64) -> i64 {
+/// Raise the `RLIMIT_NOFILE` soft limit towards `target`, capped by the hard
+/// limit. Best-effort: the engine opens far fewer descriptors than `target` on
+/// a small database, so a refusal only matters once the partition count grows,
+/// and then it surfaces as `EMFILE` at the open that could not be served.
+pub fn raise_fd_limit(target: u64) {
     unsafe {
         let mut rl: libc::rlimit = std::mem::zeroed();
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
-            return -1;
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 || rl.rlim_cur >= target as libc::rlim_t {
+            return;
         }
-        if rl.rlim_cur >= target as libc::rlim_t {
-            return rl.rlim_cur as i64;
-        }
-        rl.rlim_cur = target as libc::rlim_t;
-        if rl.rlim_cur > rl.rlim_max {
-            rl.rlim_cur = rl.rlim_max;
-        }
-        if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0 {
-            return -1;
-        }
-        rl.rlim_cur as i64
+        rl.rlim_cur = (target as libc::rlim_t).min(rl.rlim_max);
+        libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
     }
 }
 
@@ -766,9 +723,32 @@ pub fn futex_waitv_u32(ptrs: &[*const AtomicU32], expected: &[u32], timeout_ms: 
     }
 }
 
-/// mmap a shared, read-write region of `size` bytes backed by `fd`.
-/// Returns the mapped pointer, or null on error.
-pub fn mmap_shared(fd: i32, size: usize) -> *mut u8 {
+/// How [`map_shared_sized`] grows the backing object before mapping it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Backing {
+    /// `fallocate` — reserves the blocks, so a later store cannot fail for
+    /// want of space. For a real file, where the space is on disk.
+    Reserved,
+    /// `ftruncate` — sets the size only. For a memfd, whose pages are RAM
+    /// charged on first touch; `fallocate` would commit the whole region up
+    /// front (1 GiB per worker for the W2M rings).
+    Sized,
+}
+
+/// mmap `size` bytes of `fd` `MAP_SHARED` read-write, after growing the backing
+/// object to at least `size`.
+///
+/// The growth is the point: `mmap` past the end of the object succeeds, and the
+/// first store into the resulting hole raises `SIGBUS`, for which the server
+/// installs no handler. Failing to size the object has to abort here, where the
+/// errno still says why, rather than at an arbitrary later write.
+pub fn map_shared_sized(fd: c_int, size: usize, how: Backing) -> std::io::Result<*mut u8> {
+    if fd_size(fd)? < size {
+        match how {
+            Backing::Reserved => fallocate(fd, size as i64)?,
+            Backing::Sized => ftruncate(fd, size as i64)?,
+        }
+    }
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -780,10 +760,9 @@ pub fn mmap_shared(fd: i32, size: usize) -> *mut u8 {
         )
     };
     if ptr == libc::MAP_FAILED {
-        std::ptr::null_mut()
-    } else {
-        ptr as *mut u8
+        return Err(std::io::Error::last_os_error());
     }
+    Ok(ptr as *mut u8)
 }
 
 /// Raise RLIMIT_NOFILE soft limit to the hard limit.
@@ -802,7 +781,7 @@ pub(crate) fn raise_fd_limit_for_tests() {
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Unaligned raw accessors
 // ---------------------------------------------------------------------------
 
 // The four `*_raw` accessors below do unaligned `u32`/`u64` reads and writes at
@@ -869,17 +848,21 @@ mod tests {
 
     #[test]
     fn test_try_set_nocow() {
-        // On non-btrfs this returns -1, but must not crash
+        // Rejected on every non-btrfs filesystem; must not crash.
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let raw_fd = tmp.as_file().as_raw_fd();
-        let _ = try_set_nocow(raw_fd); // just verify no crash/panic
+        try_set_nocow(tmp.as_file().as_raw_fd());
     }
 
     #[test]
     fn test_raise_fd_limit() {
-        // Should succeed (may be no-op if already ≥ 1024)
-        let r = raise_fd_limit(1024);
-        assert!(r >= 1024, "expected ≥1024, got {r}");
+        raise_fd_limit(1024);
+        let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) }, 0);
+        assert!(
+            rl.rlim_cur >= 1024.min(rl.rlim_max),
+            "soft limit not raised: {}",
+            rl.rlim_cur
+        );
     }
 
     #[test]
@@ -1095,9 +1078,7 @@ mod tests {
 
         let fd = memfd_create(b"test_futex_shared");
         assert!(fd >= 0);
-        ftruncate(fd, 4096).unwrap();
-        let ptr = mmap_shared(fd, 4096);
-        assert!(!ptr.is_null());
+        let ptr = map_shared_sized(fd, 4096, Backing::Sized).unwrap();
 
         let atomic_ptr = ptr as *mut AtomicU32;
         unsafe {
@@ -1148,9 +1129,7 @@ mod tests {
 
         let fd = memfd_create(b"test_futex_waitv");
         assert!(fd >= 0);
-        ftruncate(fd, 4096).unwrap();
-        let ptr = mmap_shared(fd, 4096);
-        assert!(!ptr.is_null());
+        let ptr = map_shared_sized(fd, 4096, Backing::Sized).unwrap();
 
         let atomic_ptr = ptr as *mut AtomicU32;
         unsafe {
@@ -1228,8 +1207,7 @@ mod tests {
         use std::sync::atomic::Ordering;
         use std::time::Instant;
         let fd = memfd_create(b"test_waitv_u32");
-        ftruncate(fd, 4096).unwrap();
-        let ptr = mmap_shared(fd, 4096);
+        let ptr = map_shared_sized(fd, 4096, Backing::Sized).unwrap();
         let w0 = ptr as *const AtomicU32;
         let w1 = unsafe { ptr.add(64) } as *const AtomicU32;
         unsafe {
@@ -1277,12 +1255,10 @@ mod tests {
     }
 
     #[test]
-    fn test_mmap_shared() {
+    fn test_map_shared_sized() {
         let fd = memfd_create(b"test_mmap");
         assert!(fd >= 0);
-        ftruncate(fd, 8192).unwrap();
-        let ptr = mmap_shared(fd, 8192);
-        assert!(!ptr.is_null(), "mmap_shared returned null");
+        let ptr = map_shared_sized(fd, 8192, Backing::Sized).unwrap();
         // Write and read back
         unsafe {
             *ptr = 42;

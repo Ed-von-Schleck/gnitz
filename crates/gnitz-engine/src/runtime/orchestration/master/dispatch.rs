@@ -4,7 +4,6 @@
 
 use super::index_router::index_route_key;
 use super::*;
-use crate::runtime::sal::SENTINEL_SIZE;
 
 /// The verdict of `MasterDispatcher::txn_fit`.
 pub(crate) enum TxnFit {
@@ -123,12 +122,14 @@ impl MasterDispatcher {
         prebuilt_schema_block: Option<&[u8]>,
         seek_pk_extra: &[u8],
     ) -> Result<(), String> {
-        let (name_refs, n) = col_names_as_refs(col_names);
-        let col_names_opt = if n == 0 || prebuilt_schema_block.is_some() {
-            None
+        // Only build the name-ref array when it will actually be encoded; a
+        // prebuilt schema block already carries the names.
+        let (name_refs, n) = if prebuilt_schema_block.is_some() {
+            ([&[][..]; crate::schema::MAX_COLUMNS], 0)
         } else {
-            Some(&name_refs[..n])
+            col_names_as_refs(col_names)
         };
+        let col_names_opt = if n == 0 { None } else { Some(&name_refs[..n]) };
 
         self.sal.write_group_direct(
             target_id as u32,
@@ -232,12 +233,14 @@ impl MasterDispatcher {
         seek_pk: u128,
         prebuilt_schema_block: Option<&[u8]>,
     ) -> Result<(), String> {
-        let (name_refs, n) = col_names_as_refs(col_names);
-        let col_names_opt = if n == 0 || prebuilt_schema_block.is_some() {
-            None
+        // Only build the name-ref array when it will actually be encoded; a
+        // prebuilt schema block already carries the names.
+        let (name_refs, n) = if prebuilt_schema_block.is_some() {
+            ([&[][..]; crate::schema::MAX_COLUMNS], 0)
         } else {
-            Some(&name_refs[..n])
+            col_names_as_refs(col_names)
         };
+        let col_names_opt = if n == 0 { None } else { Some(&name_refs[..n]) };
 
         self.sal.write_broadcast_direct(
             target_id as u32,
@@ -548,8 +551,16 @@ impl MasterDispatcher {
     /// sal_has_relay_space() so relay_loop and the committer see the same
     /// verdict until a checkpoint bumps the epoch and disarms it.
     pub(crate) fn sal_has_relay_space_arming(&self) -> bool {
+        // Read once: this runs on every relay, and the env var cannot change
+        // mid-process.
         #[cfg(debug_assertions)]
-        if std::env::var("GNITZ_INJECT_RELAY_SPACE_LOW").is_ok() {
+        let armed = {
+            use std::sync::OnceLock;
+            static ARMED: OnceLock<bool> = OnceLock::new();
+            *ARMED.get_or_init(|| std::env::var_os("GNITZ_INJECT_RELAY_SPACE_LOW").is_some())
+        };
+        #[cfg(debug_assertions)]
+        if armed {
             let _ = Self::seam_armed_epoch().compare_exchange(
                 u32::MAX,
                 self.sal.epoch(),
@@ -1328,12 +1339,10 @@ impl MasterDispatcher {
 
     /// Whether a transaction's family groups fit the SAL, and if not, whether a
     /// checkpoint could make them fit. The committer's whole space question in
-    /// one call — it never sees the cursor, the mmap size, or `SENTINEL_SIZE`
-    /// (the sentinel is globally reserved by `sal_begin_group`, so the effective
-    /// capacity is `mmap_size - SENTINEL_SIZE`).
+    /// one call — it never sees the cursor or the capacity rule itself.
     pub(crate) fn txn_fit(&mut self, families: &[(i64, &Batch)]) -> TxnFit {
         let footprint = self.txn_zone_footprint(families);
-        let capacity = (self.sal.mmap_size() as usize).saturating_sub(SENTINEL_SIZE);
+        let capacity = self.sal.effective_capacity();
         if footprint > capacity {
             return TxnFit::Terminal;
         }
@@ -1423,11 +1432,11 @@ impl MasterDispatcher {
     /// `write_group_with_req_ids` funnel.
     pub(crate) fn write_checkpoint_group(&mut self, lsn: u64, flags: u32, req_ids: &[u64]) -> Result<(), String> {
         let schema = SchemaDescriptor::minimal_u64();
-        // One "slot" per worker with empty batch — each worker replies
-        // after flushing its system tables and advancing its epoch.
-        let refs: Vec<Option<&Batch>> = (0..self.num_workers).map(|_| None).collect();
+        // No batches: `write_group_direct` reads an absent entry as "no data for
+        // this worker", so every worker gets a schema-only slot and replies after
+        // flushing its system tables and advancing its epoch.
         self.sal
-            .write_group_direct(0, lsn, flags, 0, &refs, &schema, None, 0, 0, req_ids, -1, 0, None, &[])
+            .write_group_direct(0, lsn, flags, 0, &[], &schema, None, 0, 0, req_ids, -1, 0, None, &[])
     }
 
     /// Post-ACK checkpoint cleanup: flush system tables before resetting

@@ -237,8 +237,13 @@ fn carve_at<'a>(
 ) -> (&'a mut [u8], &'a mut [u8], &'a mut [u8], Vec<&'a mut [u8]>) {
     // Walk regions in order, splitting off [alignment pad | region] for each.
     // `base` tracks the absolute offset of `rest[0]` within `data`, so
-    // `offsets[r] - base` is the padding to discard before region `r`.
-    let mut slices: Vec<&mut [u8]> = Vec::with_capacity(nr);
+    // `offsets[r] - base` is the padding to discard before region `r`. The three
+    // fixed regions land in their own bindings and only the payload columns
+    // accumulate into the returned Vec.
+    let mut pk: Option<&mut [u8]> = None;
+    let mut weight: Option<&mut [u8]> = None;
+    let mut null_bmp: Option<&mut [u8]> = None;
+    let mut col_slices: Vec<&mut [u8]> = Vec::with_capacity(nr.saturating_sub(3));
     let mut rest: &mut [u8] = data;
     let mut base = 0usize;
     for r in 0..nr {
@@ -246,17 +251,22 @@ fn carve_at<'a>(
         let after_pad = std::mem::take(&mut rest).split_at_mut(pad).1;
         let sz = rows * strides[r] as usize;
         let (region, remainder) = after_pad.split_at_mut(sz);
-        slices.push(region);
+        match r {
+            REG_PK => pk = Some(region),
+            REG_WEIGHT => weight = Some(region),
+            REG_NULL_BMP => null_bmp = Some(region),
+            _ => col_slices.push(region),
+        }
         base = offsets[r] + sz;
         rest = remainder;
     }
 
-    let mut it = slices.into_iter();
-    let pk = it.next().expect("REG_PK");
-    let weight = it.next().expect("REG_WEIGHT");
-    let null_bmp = it.next().expect("REG_NULL_BMP");
-    let col_slices: Vec<&mut [u8]> = it.collect();
-    (pk, weight, null_bmp, col_slices)
+    (
+        pk.expect("REG_PK"),
+        weight.expect("REG_WEIGHT"),
+        null_bmp.expect("REG_NULL_BMP"),
+        col_slices,
+    )
 }
 
 /// Copy `count` rows of every region from `src` (regions at `src_offsets`)

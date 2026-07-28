@@ -16,7 +16,6 @@ fn test_sal_round_trip() {
         let region = SharedRegion::new(size);
         let ptr = region.ptr();
 
-        let nw = 4u32;
         let bufs: Vec<Vec<u8>> = vec![
             make_test_data(0xAA, 100),
             vec![],
@@ -27,7 +26,6 @@ fn test_sal_round_trip() {
         let payloads: Vec<&[u8]> = bufs.iter().map(|b| b.as_slice()).collect();
         let new_cursor = sal_write_group(ptr, 0, 42, 100, 0, 1, size as u64, &payloads).expect("group fits");
         assert!(new_cursor > 0);
-        let _ = nw;
 
         for w in 0..4u32 {
             let rr = sal_read_group_header(ptr, 0, w, None).expect("group present");
@@ -53,13 +51,11 @@ fn test_sal_unicast_isolation() {
         let size = 1 << 20;
         let region = SharedRegion::new(size);
         let ptr = region.ptr();
-        let nw = 4u32;
 
         let buf = make_test_data(0xDD, 128);
         let payloads: [&[u8]; 4] = [&[], &[], &buf, &[]];
 
         sal_write_group(ptr, 0, 10, 1, 0, 1, size as u64, &payloads).expect("group fits");
-        let _ = nw;
 
         for w in [0u32, 1, 3] {
             let rr = sal_read_group_header(ptr, 0, w, None).expect("group present");
@@ -79,7 +75,6 @@ fn test_sal_multiple_groups() {
         let size = 1 << 20;
         let region = SharedRegion::new(size);
         let ptr = region.ptr();
-        let nw = 2u32;
 
         let mut cursor = 0u64;
         for g in 0..3u64 {
@@ -87,7 +82,6 @@ fn test_sal_multiple_groups() {
             let payloads: [&[u8]; 2] = [&buf, &[]];
             cursor = sal_write_group(ptr, cursor, g as u32, g * 10, 0, 1, size as u64, &payloads).expect("group fits");
         }
-        let _ = nw;
 
         let mut rc = 0u64;
         for g in 0..3u64 {
@@ -194,11 +188,10 @@ fn sal_begin_group_rejects_too_many_workers() {
         let region = SharedRegion::new(size);
         let ptr = region.ptr();
         let sizes = [0u32; MAX_WORKERS + 1];
-        // num_workers = MAX_WORKERS + 1 must return None.
-        let result = sal_begin_group(ptr, 0, size, MAX_WORKERS + 1, 0, 0, 0, 1, &sizes[..MAX_WORKERS + 1]);
+        let result = sal_begin_group(ptr, 0, size, 0, 0, 0, 1, &sizes[..MAX_WORKERS + 1]);
         assert!(
             result.is_none(),
-            "sal_begin_group must reject num_workers > MAX_WORKERS"
+            "sal_begin_group must reject more than MAX_WORKERS entries"
         );
     }
 }
@@ -211,7 +204,7 @@ fn sal_begin_group_rejects_cursor_overflow() {
         let ptr = region.ptr();
         // Push the cursor so close to the end that the group header won't fit.
         let sizes = [0u32; 1];
-        let result = sal_begin_group(ptr, size - 1, size, 1, 0, 0, 0, 1, &sizes[..1]);
+        let result = sal_begin_group(ptr, size - 1, size, 0, 0, 0, 1, &sizes[..1]);
         assert!(
             result.is_none(),
             "sal_begin_group must reject when cursor + total > mmap_size"
@@ -246,14 +239,12 @@ fn test_commit_sentinel_round_trip() {
         let size = 1 << 20;
         let region = SharedRegion::new(size);
         let ptr = region.ptr();
-        let nw = 2u32;
 
         // Two normal groups at the same LSN.
         let buf = make_test_data(0xAA, 32);
         let payloads: [&[u8]; 2] = [&buf, &buf];
         let c1 = sal_write_group(ptr, 0, 100, 7, 0, 1, size as u64, &payloads).expect("group fits");
         let c2 = sal_write_group(ptr, c1, 101, 7, 0, 1, size as u64, &payloads).expect("group fits");
-        let _ = nw;
 
         // Sentinel via SalWriter at the same LSN. m2w_efds empty so
         // signal_all is a no-op (we never call it here anyway, but its
@@ -335,7 +326,7 @@ fn test_batched_push_shares_zone_lsn() {
         let size = 1 << 20;
         let region = SharedRegion::new(size);
         let ptr = region.ptr();
-        let nw = 2u32;
+        let nw = 4u32;
         let zone_lsn = 42u64;
 
         let payload = make_test_data(0xDD, 64);
@@ -451,11 +442,9 @@ fn test_two_groups_same_lsn() {
         let size = 1 << 20;
         let region = SharedRegion::new(size);
         let ptr = region.ptr();
-        let nw = 1u32;
 
         let buf1 = make_test_data(0x10, 32);
         let c1 = sal_write_group(ptr, 0, 7, 42, 0, 1, size as u64, &[&buf1]).expect("group fits");
-        let _ = nw;
 
         let buf2 = make_test_data(0x20, 32);
         sal_write_group(ptr, c1, 8, 42, 0, 1, size as u64, &[&buf2]).expect("group fits");
@@ -587,9 +576,8 @@ fn test_sal_prefix_packing_boundaries() {
 }
 
 // ---------------------------------------------------------------------------
-// wire_group_footprint exactness (load-bearing: the committer's per-transaction
-// fit check and Phase-B fail-stop depend on it equaling the bytes emission
-// actually consumes).
+// wire_group_footprint exactness: the committer's per-transaction fit check and
+// Phase-B fail-stop depend on it equaling the bytes emission actually consumes.
 // ---------------------------------------------------------------------------
 
 /// Emit `batch` (partitioned or broadcast) through `scatter_wire_group` and

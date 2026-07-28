@@ -82,17 +82,28 @@ impl W2mWriter {
             w2m_ring::commit(hdr, reservation);
         }
 
-        hdr.reader_seq().fetch_add(1, Ordering::Release);
-        if hdr.waiter_flags().load(Ordering::Acquire) & FLAG_MASTER_PARKED != 0 {
-            let rc = posix_io::futex_wake_u32(hdr.reader_seq() as *const AtomicU32, 1);
-            if rc < 0 {
-                crate::gnitz_fatal_abort!(
-                    "W2mWriter::send_encoded: futex_wake_u32 failed: rc={} errno={}",
-                    rc,
-                    posix_io::errno(),
-                );
-            }
-        }
+        bump_and_wake(
+            hdr.reader_seq(),
+            hdr.waiter_flags(),
+            FLAG_MASTER_PARKED,
+            "W2mWriter::send_encoded",
+        );
+    }
+}
+
+/// Publish a sequence bump and wake the peer if it parked on `seq`.
+///
+/// A failed `futex_wake` is fatal: the peer stays blocked forever on a queue
+/// that has work in it, which is a silent hang rather than an error anyone
+/// would see. `site` names the caller in that abort.
+fn bump_and_wake(seq: &AtomicU32, flags: &AtomicU32, parked_bit: u32, site: &str) {
+    seq.fetch_add(1, Ordering::Release);
+    if flags.load(Ordering::Acquire) & parked_bit == 0 {
+        return;
+    }
+    let rc = posix_io::futex_wake_u32(seq as *const AtomicU32, 1);
+    if rc < 0 {
+        crate::gnitz_fatal_abort!("{}: futex_wake_u32 failed: rc={} errno={}", site, rc, posix_io::errno());
     }
 }
 
@@ -178,17 +189,12 @@ impl InFlightState {
 
         if let Some(vrc) = last_vrc {
             self.hdr.advance_consume_cursor(vrc);
-            self.hdr.writer_seq().fetch_add(1, Ordering::Release);
-            if self.hdr.waiter_flags().load(Ordering::Acquire) & FLAG_WRITER_PARKED != 0 {
-                let rc = posix_io::futex_wake_u32(self.hdr.writer_seq() as *const AtomicU32, 1);
-                if rc < 0 {
-                    crate::gnitz_fatal_abort!(
-                        "W2mSlot::drop: futex_wake_u32 failed: rc={} errno={}",
-                        rc,
-                        posix_io::errno(),
-                    );
-                }
-            }
+            bump_and_wake(
+                self.hdr.writer_seq(),
+                self.hdr.waiter_flags(),
+                FLAG_WRITER_PARKED,
+                "W2mSlot::drop",
+            );
             // A burst that has fully drained can leave a large heap buffer
             // behind (VecDeque never shrinks on its own); reclaim it.
             if self.queue.is_empty() && self.queue.capacity() > INFLIGHT_SHRINK_THRESHOLD {

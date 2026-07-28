@@ -237,8 +237,8 @@ impl ServerExecutor {
         let reactor = match Reactor::new(256) {
             Ok(r) => Rc::new(r),
             Err(e) => {
-                eprintln!("io_uring init failed: {e}");
-                return -1;
+                gnitz_error!("io_uring init failed: {e}");
+                return 1;
             }
         };
         let sal_fd = unsafe { &*dispatcher }.sal_fd();

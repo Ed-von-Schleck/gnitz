@@ -114,7 +114,7 @@ fn slow_scan_client_is_evicted_after_deadline() {
     }
 
     // Slow client A: a raw connection that issues the scan then never reads.
-    let mut slow = ClientTransport::connect(&srv.sock_path).expect("connect");
+    let mut slow = ClientTransport::connect(srv.sock_path()).expect("connect");
     set_tiny_rcvbuf(slow.as_raw_fd());
     hello_handshake(&mut slow).expect("hello");
     // The scan request is just an empty control frame addressed to the table id.

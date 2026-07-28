@@ -48,28 +48,24 @@ fn wire_safe_slot_size(
 }
 
 /// The exact SAL footprint of a zone-closing `FLAG_TXN_COMMIT` sentinel — an
-/// all-zero-worker group (`8 + GROUP_HEADER_SIZE` bytes, no per-worker slots).
-/// `sal_begin_group` reserves this much headroom for **every non-sentinel
-/// group**, so the sentinel — written last, after all family groups and any
-/// zone-sharing single pushes — is guaranteed to fit. This makes `commit_zone`'s
-/// space-abort unreachable: a data group at the boundary degrades to a graceful
-/// `sal_begin_group` failure (`write_err` + skip) instead of aborting the node.
-/// Negligible (~536 B) against the 1 GiB SAL.
+/// all-zero-worker group, no per-worker slots. `sal_begin_group` reserves this
+/// much headroom for every non-sentinel group, so the sentinel — written last —
+/// always fits: a data group at the boundary fails `sal_begin_group` gracefully
+/// (`write_err` + skip) rather than aborting the node.
 pub(crate) const SENTINEL_SIZE: usize = 8 + GROUP_HEADER_SIZE;
 
 /// Floor for a `GNITZ_SAL_BYTES` override — must comfortably exceed one DDL zone
-/// plus the 2 MiB prefault-ahead window and the checkpoint headroom.
+/// plus the checkpoint headroom.
 const MIN_SAL_BYTES: usize = 16 << 20;
 
 /// The SAL mmap size in bytes. `SAL_MMAP_SIZE` (1 GiB) is the production default;
 /// `GNITZ_SAL_BYTES` overrides it downward. This exists because each server
-/// eagerly `fallocate`s + pre-faults the *whole* SAL at startup, so on a shared
-/// data_dir filesystem (e.g. a tmpfs `/tmp`) many servers spawning in parallel
-/// can exhaust it and take a `SIGBUS` on the forced page-fault — the integration
-/// test harness spawns dozens at once, so it sets a small value. The size is read
-/// once and cached: the master and its `fork()`ed workers inherit both the env
-/// and this cache, so they can never disagree on the wrap arithmetic. The
-/// override is clamped to `[MIN_SAL_BYTES, SAL_MMAP_SIZE]`.
+/// eagerly `fallocate`s the *whole* SAL at startup, so on a shared data_dir
+/// filesystem (e.g. a tmpfs `/tmp`) many servers spawning in parallel can
+/// exhaust it — the integration test harness spawns dozens at once, so it sets
+/// a small value. The size is read once and cached: the master and its `fork()`ed
+/// workers inherit both the env and this cache, so they can never disagree on the
+/// wrap arithmetic. The override is clamped to `[MIN_SAL_BYTES, SAL_MMAP_SIZE]`.
 ///
 /// Keep the value consistent across restarts on a given data_dir: recovery walks
 /// only the first `sal_mmap_size()` bytes of the SAL file, so restarting with a
@@ -82,8 +78,6 @@ pub fn sal_mmap_size() -> usize {
         crate::foundation::env::env_usize("GNITZ_SAL_BYTES", SAL_MMAP_SIZE).clamp(MIN_SAL_BYTES, SAL_MMAP_SIZE)
     })
 }
-
-const PAGE_SIZE: u64 = 4096;
 
 // SAL group header flags (u32): the shared `gnitz_wire` flag bits re-declared
 // as `u32` (the SAL group header's flag width).
@@ -208,11 +202,9 @@ pub(crate) fn unpack_gather_cols(packed: u64) -> impl Iterator<Item = u8> {
 // ---------------------------------------------------------------------------
 // SalMessageKind — receive-side classification of a SAL group's flag bits.
 //
-// Master-side encoding still uses raw FLAG_* writes (master.rs) and the
-// reactor only reads one bit (reactor/mod.rs). This enum is consumed by
-// the worker dispatch loop to give the compiler an exhaustiveness check
-// over every kind of message the worker can observe. Add a new variant
-// here whenever a new dispatch arm is added on the worker side.
+// The master encodes with raw FLAG_* writes; this enum is consumed by the
+// worker dispatch loop, so the compiler checks that every kind the worker can
+// observe has an arm. Add a variant here whenever a dispatch arm is added.
 // ---------------------------------------------------------------------------
 
 /// Classification of a SAL group's flag bits, used by the worker to
@@ -242,61 +234,33 @@ pub enum SalMessageKind {
     Scan,
 }
 
+/// Flag bit → kind, in priority order; the first bit set on the group wins.
+/// Each kind owns a distinct bit, so only `Shutdown` leading and the two flush
+/// rounds preceding the rest actually constrains anything.
+const KIND_BY_FLAG: [(u32, SalMessageKind); 14] = [
+    (FLAG_SHUTDOWN, SalMessageKind::Shutdown),
+    (FLAG_FLUSH, SalMessageKind::Flush),
+    (FLAG_FLUSH_EPH, SalMessageKind::FlushEph),
+    (FLAG_DDL_SYNC, SalMessageKind::DdlSync),
+    (FLAG_EXCHANGE_RELAY, SalMessageKind::ExchangeRelay),
+    (FLAG_BACKFILL, SalMessageKind::Backfill),
+    (FLAG_HAS_PK, SalMessageKind::HasPk),
+    (FLAG_GATHER, SalMessageKind::Gather),
+    (FLAG_UNIQUE_PREFLIGHT, SalMessageKind::UniquePreflight),
+    (FLAG_PUSH, SalMessageKind::Push),
+    (FLAG_TICK, SalMessageKind::Tick),
+    (FLAG_SEEK_BY_INDEX, SalMessageKind::SeekByIndex),
+    (FLAG_SEEK, SalMessageKind::Seek),
+    (FLAG_SCAN_SPEC, SalMessageKind::ScanSpec),
+];
+
 impl SalMessageKind {
-    /// Classify a SAL group by its flag word.
-    ///
-    /// Priority order matches the worker's existing if-chain (see
-    /// `worker::dispatch_inner`): SHUTDOWN > FLUSH > DDL_SYNC >
-    /// EXCHANGE_RELAY > BACKFILL > HAS_PK >
-    /// GATHER > UNIQUE_PREFLIGHT > PUSH > TICK >
-    /// SEEK_BY_INDEX > SEEK > SCAN_SPEC > Scan.
-    /// The first match wins. (Each kind owns a distinct bit, so the
-    /// relative order of the disjoint range/point/seek arms is
-    /// immaterial; it tracks the worker's if-chain for readability.)
+    /// Classify a SAL group by its flag word; `Scan` when no kind bit is set.
     pub fn classify(flags: u32) -> SalMessageKind {
-        if flags & FLAG_SHUTDOWN != 0 {
-            return SalMessageKind::Shutdown;
-        }
-        if flags & FLAG_FLUSH != 0 {
-            return SalMessageKind::Flush;
-        }
-        if flags & FLAG_FLUSH_EPH != 0 {
-            return SalMessageKind::FlushEph;
-        }
-        if flags & FLAG_DDL_SYNC != 0 {
-            return SalMessageKind::DdlSync;
-        }
-        if flags & FLAG_EXCHANGE_RELAY != 0 {
-            return SalMessageKind::ExchangeRelay;
-        }
-        if flags & FLAG_BACKFILL != 0 {
-            return SalMessageKind::Backfill;
-        }
-        if flags & FLAG_HAS_PK != 0 {
-            return SalMessageKind::HasPk;
-        }
-        if flags & FLAG_GATHER != 0 {
-            return SalMessageKind::Gather;
-        }
-        if flags & FLAG_UNIQUE_PREFLIGHT != 0 {
-            return SalMessageKind::UniquePreflight;
-        }
-        if flags & FLAG_PUSH != 0 {
-            return SalMessageKind::Push;
-        }
-        if flags & FLAG_TICK != 0 {
-            return SalMessageKind::Tick;
-        }
-        if flags & FLAG_SEEK_BY_INDEX != 0 {
-            return SalMessageKind::SeekByIndex;
-        }
-        if flags & FLAG_SEEK != 0 {
-            return SalMessageKind::Seek;
-        }
-        if flags & FLAG_SCAN_SPEC != 0 {
-            return SalMessageKind::ScanSpec;
-        }
-        SalMessageKind::Scan
+        KIND_BY_FLAG
+            .iter()
+            .find(|(bit, _)| flags & bit != 0)
+            .map_or(SalMessageKind::Scan, |&(_, kind)| kind)
     }
 
     /// True when the worker must act on the group even if its per-worker
@@ -372,9 +336,8 @@ fn data_wire_block_size_cached(schema: &SchemaDescriptor, count: usize, stride: 
 #[must_use = "SalGroup must be passed to commit(); dropping it leaves the SAL sentinel unwritten"]
 pub(crate) struct SalGroup {
     sal_ptr: *mut u8,
-    hdr_off: usize,
+    /// Offset of the group's 8-byte size prefix; the header follows it.
     base: usize,
-    total: usize,
     payload_size: usize,
     epoch: u32,
     mmap_size: usize,
@@ -393,39 +356,56 @@ impl Drop for SalGroup {
 impl SalGroup {
     #[inline]
     pub(crate) unsafe fn data_ptr(&self, offset: usize) -> *mut u8 {
-        self.sal_ptr.add(self.hdr_off + offset)
+        self.sal_ptr.add(self.base + 8 + offset)
+    }
+
+    /// Hand every non-empty worker slot to `f` as a mutable byte slice, in the
+    /// `align8` directory order `sal_begin_group` laid out.
+    ///
+    /// # Safety
+    /// `worker_sizes` must be the slice this group was begun with.
+    pub(crate) unsafe fn for_each_slot(&self, worker_sizes: &[u32], mut f: impl FnMut(usize, &mut [u8])) {
+        let mut off = GROUP_HEADER_SIZE;
+        for (w, &sz) in worker_sizes.iter().enumerate() {
+            let sz = sz as usize;
+            if sz == 0 {
+                continue;
+            }
+            f(w, std::slice::from_raw_parts_mut(self.data_ptr(off), sz));
+            off += align8(sz);
+        }
     }
 
     pub(crate) unsafe fn commit(mut self) -> u64 {
-        sal_write_sentinel(self.sal_ptr, self.base + self.total, self.mmap_size);
+        let end = self.base + 8 + self.payload_size;
+        sal_write_sentinel(self.sal_ptr, end, self.mmap_size);
         atomic_store_u64(
             self.sal_ptr.add(self.base),
             (self.epoch as u64) << 32 | self.payload_size as u64,
         );
-        let cursor = (self.base + self.total) as u64;
         self.committed = true;
-        cursor
+        end as u64
     }
 }
 
-/// Reserve SAL space, write group header + per-worker directory.
-/// Returns `None` if the group doesn't fit or `num_workers > MAX_WORKERS`.
+/// Reserve SAL space, write group header + per-worker directory. One entry per
+/// worker in `worker_sizes`. Returns `None` if the group doesn't fit or there
+/// are more than `MAX_WORKERS` entries.
 ///
 /// # Safety
 /// `sal_ptr` must be a valid mmap pointer of at least `mmap_size` bytes.
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sal_begin_group(
     sal_ptr: *mut u8,
     write_cursor: usize,
     mmap_size: usize,
-    num_workers: usize,
     target_id: u32,
     lsn: u64,
     flags: u32,
     epoch: u32,
     worker_sizes: &[u32],
 ) -> Option<SalGroup> {
-    if num_workers > MAX_WORKERS {
+    if worker_sizes.len() > MAX_WORKERS {
         return None;
     }
     debug_assert!(
@@ -436,7 +416,7 @@ pub(crate) unsafe fn sal_begin_group(
     // payload_size starts as GROUP_HEADER_SIZE (528, a multiple of 8) and grows
     // only by align8(sz) increments, so it is always a multiple of 8.
     let mut payload_size = GROUP_HEADER_SIZE;
-    for &sz in &worker_sizes[..num_workers] {
+    for &sz in worker_sizes {
         if sz > 0 {
             payload_size += align8(sz as usize);
         }
@@ -463,12 +443,11 @@ pub(crate) unsafe fn sal_begin_group(
     write_u32_raw(sal_ptr, hdr_off + 12, target_id);
 
     let mut data_offset = GROUP_HEADER_SIZE;
-    for w in 0..num_workers {
-        let sz = worker_sizes[w] as usize;
+    for (w, &sz) in worker_sizes.iter().enumerate() {
         if sz > 0 {
             write_u32_raw(sal_ptr, hdr_off + 16 + w * 4, data_offset as u32);
-            write_u32_raw(sal_ptr, hdr_off + 16 + MAX_WORKERS * 4 + w * 4, worker_sizes[w]);
-            data_offset += align8(sz);
+            write_u32_raw(sal_ptr, hdr_off + 16 + MAX_WORKERS * 4 + w * 4, sz);
+            data_offset += align8(sz as usize);
         } else {
             write_u32_raw(sal_ptr, hdr_off + 16 + w * 4, 0);
             write_u32_raw(sal_ptr, hdr_off + 16 + MAX_WORKERS * 4 + w * 4, 0);
@@ -477,9 +456,7 @@ pub(crate) unsafe fn sal_begin_group(
 
     Some(SalGroup {
         sal_ptr,
-        hdr_off,
         base,
-        total,
         payload_size,
         epoch,
         mmap_size,
@@ -512,7 +489,6 @@ pub(crate) unsafe fn sal_write_group(
         sal_ptr,
         write_cursor as usize,
         mmap_size as usize,
-        nw,
         target_id,
         lsn,
         flags,
@@ -572,10 +548,10 @@ pub(crate) unsafe fn sal_read_group_header(
     if payload_size == 0 {
         return None;
     }
-    // The load-bearing gate: on an epoch mismatch, return before ANY plain
-    // read of the header region. A stale slot at offset 0 after an epoch
-    // transition may be concurrently overwritten by the master; its bytes
-    // are unreadable until the prefix proves the slot belongs to our epoch.
+    // On an epoch mismatch, return before ANY plain read of the header region:
+    // a stale slot at offset 0 after an epoch transition may be concurrently
+    // overwritten by the master, so its bytes are unreadable until the prefix
+    // proves the slot belongs to our epoch.
     if let Some(exp) = expected_epoch {
         if epoch != exp {
             return None;
@@ -663,7 +639,6 @@ pub struct SalWriter {
     epoch: u32,
     checkpoint_threshold: u64,
     m2w_efds: Vec<i32>,
-    last_prefaulted: u64,
 }
 
 unsafe impl Send for SalWriter {}
@@ -679,24 +654,44 @@ impl SalWriter {
             epoch: 0,
             checkpoint_threshold,
             m2w_efds,
-            last_prefaulted: 0,
         }
     }
 
-    fn prefault_ahead(&mut self) {
-        const PREFAULT_AHEAD: u64 = 2 * 1024 * 1024;
-        let target = (self.write_cursor + PREFAULT_AHEAD).min(self.mmap_size);
-        if target <= self.last_prefaulted {
-            return;
+    /// SAL bytes a non-sentinel group may occupy: the mapping minus the
+    /// headroom `sal_begin_group` reserves for the zone-closing sentinel.
+    pub(crate) fn effective_capacity(&self) -> usize {
+        (self.mmap_size as usize).saturating_sub(SENTINEL_SIZE)
+    }
+
+    /// Reserve a group for `worker_sizes.len()` workers at the write cursor and
+    /// write its header + directory. `what` names the caller in the
+    /// out-of-space error. The group must be handed to `finish`.
+    fn begin(
+        &self,
+        what: &str,
+        target_id: u32,
+        lsn: u64,
+        sal_flags: u32,
+        worker_sizes: &[u32],
+    ) -> Result<SalGroup, String> {
+        unsafe {
+            sal_begin_group(
+                self.ptr,
+                self.write_cursor as usize,
+                self.mmap_size as usize,
+                target_id,
+                lsn,
+                sal_flags,
+                self.epoch,
+                worker_sizes,
+            )
         }
-        let raw_start = self.last_prefaulted.max(self.write_cursor);
-        let start = raw_start & !(PAGE_SIZE - 1);
-        let end_raw = (target + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let end = end_raw.min(self.mmap_size);
-        if end > start {
-            posix_io::madvise_willneed(unsafe { self.ptr.add(start as usize) }, (end - start) as usize);
-            self.last_prefaulted = target;
-        }
+        .ok_or_else(|| format!("SAL {what} failed (cursor={})", self.write_cursor))
+    }
+
+    /// Publish `group` and advance the write cursor past it.
+    fn finish(&mut self, group: SalGroup) {
+        self.write_cursor = unsafe { group.commit() };
     }
 
     /// Encode per-worker wire data directly into SAL mmap. Does NOT sync/signal.
@@ -724,7 +719,6 @@ impl SalWriter {
         prebuilt_schema_block: Option<&[u8]>,
         seek_pk_extra: &[u8],
     ) -> Result<(), String> {
-        self.prefault_ahead();
         let nw = self.m2w_efds.len();
         assert_eq!(
             req_ids.len(),
@@ -755,27 +749,11 @@ impl SalWriter {
             ) as u32;
         }
 
-        let group = unsafe {
-            sal_begin_group(
-                self.ptr,
-                self.write_cursor as usize,
-                self.mmap_size as usize,
-                nw,
-                target_id,
-                lsn,
-                sal_flags,
-                self.epoch,
-                &worker_sizes[..nw],
-            )
-        }
-        .ok_or_else(|| format!("SAL write_group_direct failed (cursor={})", self.write_cursor))?;
+        let group = self.begin("write_group_direct", target_id, lsn, sal_flags, &worker_sizes[..nw])?;
 
-        let mut off = GROUP_HEADER_SIZE;
-        for w in 0..nw {
-            let wsz = worker_sizes[w] as usize;
-            if wsz > 0 {
+        unsafe {
+            group.for_each_slot(&worker_sizes[..nw], |w, slot| {
                 let data_batch = worker_batches.get(w).and_then(|opt| opt.as_ref());
-                let slot = unsafe { std::slice::from_raw_parts_mut(group.data_ptr(off), wsz) };
                 let written = encode_wire_into(
                     slot,
                     0,
@@ -793,12 +771,11 @@ impl SalWriter {
                     prebuilt_schema_block,
                     seek_pk_extra,
                 );
-                debug_assert_eq!(written, wsz);
-                off += align8(wsz);
-            }
+                debug_assert_eq!(written, slot.len());
+            });
         }
 
-        self.write_cursor = unsafe { group.commit() };
+        self.finish(group);
         Ok(())
     }
 
@@ -876,7 +853,6 @@ impl SalWriter {
         prebuilt_schema_block: Option<&[u8]>,
         wire_props: Option<(bool, u32)>,
     ) -> Result<(), String> {
-        self.prefault_ahead();
         let nw = self.m2w_efds.len();
         assert_eq!(
             req_ids.len(),
@@ -934,75 +910,55 @@ impl SalWriter {
                 &owned_block
             }
         };
-        // ctrl block size for the no-error fast path is a compile-time constant.
-        let ctrl_size = CTRL_BLOCK_SIZE_NO_BLOB;
         let mut worker_sizes = [0u32; MAX_WORKERS];
         for w in 0..nw {
             worker_sizes[w] =
                 wire_safe_slot_size(schema, worker_indices[w].len(), wire_row_stride, schema_block.len()) as u32;
         }
 
-        let group = unsafe {
-            sal_begin_group(
-                self.ptr,
-                self.write_cursor as usize,
-                self.mmap_size as usize,
-                nw,
-                target_id,
-                lsn,
-                sal_flags,
-                self.epoch,
-                &worker_sizes[..nw],
-            )
-        }
-        .ok_or_else(|| format!("SAL scatter_wire_group failed (cursor={})", self.write_cursor))?;
+        let group = self.begin("scatter_wire_group", target_id, lsn, sal_flags, &worker_sizes[..nw])?;
 
         let mb = input_batch.as_mem_batch();
-        let mut off = GROUP_HEADER_SIZE;
-        for w in 0..nw {
-            let wsz = worker_sizes[w] as usize;
-            if wsz == 0 {
-                continue;
-            }
+        // The ctrl block size on the no-error fast path is a compile-time constant.
+        let ctrl_size = CTRL_BLOCK_SIZE_NO_BLOB;
+        unsafe {
+            group.for_each_slot(&worker_sizes[..nw], |w, slot| {
+                let count_w = worker_indices[w].len();
 
-            let count_w = worker_indices[w].len();
-            let slot = unsafe { std::slice::from_raw_parts_mut(group.data_ptr(off), wsz) };
+                // a. Schema block immediately after the ctrl slot.
+                slot[ctrl_size..ctrl_size + schema_block.len()].copy_from_slice(schema_block);
 
-            // a. Schema block immediately after the ctrl slot.
-            slot[ctrl_size..ctrl_size + schema_block.len()].copy_from_slice(schema_block);
+                // b. Data block when there are rows for this worker.
+                if count_w > 0 {
+                    let data_start = ctrl_size + schema_block.len();
+                    let data_sz = data_wire_block_size_cached(schema, count_w, wire_row_stride);
+                    let data_slot = &mut slot[data_start..data_start + data_sz];
+                    write_scattered_data_block(&mb, &worker_indices[w], schema, count_w, target_id, data_slot);
+                }
 
-            // b. Data block when there are rows for this worker.
-            if count_w > 0 {
-                let data_start = ctrl_size + schema_block.len();
-                let data_sz = data_wire_block_size_cached(schema, count_w, wire_row_stride);
-                let data_slot = &mut slot[data_start..data_start + data_sz];
-                write_scattered_data_block(&mb, &worker_indices[w], schema, count_w, target_id, data_slot);
-            }
-
-            // c. Ctrl block last (needs full_wire_flags which depends on count_w).
-            let full_wire_flags = wire_flags
-                | FLAG_HAS_SCHEMA
-                | if count_w > 0 { FLAG_HAS_DATA } else { 0 }
-                | layout_to_wire_flags(input_batch.layout());
-            encode_ctrl_block_direct(
-                slot,
-                0,
-                target_id as u64,
-                0,
-                full_wire_flags,
-                0,
-                seek_col_idx,
-                req_ids[w],
-                STATUS_OK,
-                b"",
-                &[],
-                false,
-            );
-
-            off += align8(wsz);
+                // c. Ctrl block last (needs full_wire_flags which depends on count_w).
+                let full_wire_flags = wire_flags
+                    | FLAG_HAS_SCHEMA
+                    | if count_w > 0 { FLAG_HAS_DATA } else { 0 }
+                    | layout_to_wire_flags(input_batch.layout());
+                encode_ctrl_block_direct(
+                    slot,
+                    0,
+                    target_id as u64,
+                    0,
+                    full_wire_flags,
+                    0,
+                    seek_col_idx,
+                    req_ids[w],
+                    STATUS_OK,
+                    b"",
+                    &[],
+                    false,
+                );
+            });
         }
 
-        self.write_cursor = unsafe { group.commit() };
+        self.finish(group);
         Ok(())
     }
 
@@ -1024,7 +980,6 @@ impl SalWriter {
         seek_pk: u128,
         prebuilt_schema_block: Option<&[u8]>,
     ) -> Result<(), String> {
-        self.prefault_ahead();
         let nw = self.m2w_efds.len();
         debug_assert!(
             prebuilt_schema_block.is_none() || col_names_opt.is_none(),
@@ -1041,24 +996,9 @@ impl SalWriter {
             &[],
         ) as u32;
         let mut worker_sizes = [0u32; MAX_WORKERS];
-        for item in worker_sizes.iter_mut().take(nw) {
-            *item = wsz;
-        }
+        worker_sizes[..nw].fill(wsz);
 
-        let group = unsafe {
-            sal_begin_group(
-                self.ptr,
-                self.write_cursor as usize,
-                self.mmap_size as usize,
-                nw,
-                target_id,
-                lsn,
-                sal_flags,
-                self.epoch,
-                &worker_sizes[..nw],
-            )
-        }
-        .ok_or_else(|| format!("SAL write_broadcast_direct failed (cursor={})", self.write_cursor))?;
+        let group = self.begin("write_broadcast_direct", target_id, lsn, sal_flags, &worker_sizes[..nw])?;
 
         if wsz > 0 {
             let wsz = wsz as usize;
@@ -1090,7 +1030,7 @@ impl SalWriter {
             }
         }
 
-        self.write_cursor = unsafe { group.commit() };
+        self.finish(group);
         Ok(())
     }
 
@@ -1102,24 +1042,15 @@ impl SalWriter {
     /// LSN are skipped. The sentinel is inert under the worker's hot
     /// path: the FLAG_DDL_SYNC branch no-ops on a group with no batch.
     pub fn write_commit_sentinel(&mut self, lsn: u64) -> Result<(), String> {
-        self.prefault_ahead();
-        let nw = self.m2w_efds.len();
         let worker_sizes = [0u32; MAX_WORKERS];
-        let group = unsafe {
-            sal_begin_group(
-                self.ptr,
-                self.write_cursor as usize,
-                self.mmap_size as usize,
-                nw,
-                0,
-                lsn,
-                FLAG_DDL_SYNC | FLAG_TXN_COMMIT,
-                self.epoch,
-                &worker_sizes[..nw],
-            )
-        }
-        .ok_or_else(|| format!("SAL write_commit_sentinel failed (cursor={})", self.write_cursor))?;
-        self.write_cursor = unsafe { group.commit() };
+        let group = self.begin(
+            "write_commit_sentinel",
+            0,
+            lsn,
+            FLAG_DDL_SYNC | FLAG_TXN_COMMIT,
+            &worker_sizes[..self.m2w_efds.len()],
+        )?;
+        self.finish(group);
         Ok(())
     }
 
@@ -1140,7 +1071,6 @@ impl SalWriter {
     pub fn checkpoint_reset(&mut self) {
         self.epoch += 1;
         self.write_cursor = 0;
-        self.last_prefaulted = 0;
         unsafe {
             atomic_store_u64(self.ptr, 0);
         }
@@ -1154,7 +1084,6 @@ impl SalWriter {
     pub fn boot_reset(&mut self) {
         self.write_cursor = 0;
         self.epoch = 1;
-        self.last_prefaulted = 0;
         unsafe {
             atomic_store_u64(self.ptr, 0);
         }
@@ -1213,10 +1142,9 @@ impl SalReader {
         }
     }
 
-    /// The SAL mmap size this reader was opened with. Stored rather than
-    /// re-fetched from the `sal_mmap_size()` global so the hot per-group read
-    /// loops do a field read, not an atomic `OnceLock` load. Mirrors
-    /// `SalWriter::mmap_size`.
+    /// The SAL mmap size this reader was opened with — not necessarily the
+    /// process-global `sal_mmap_size()`, since tests open readers over regions
+    /// smaller than its floor.
     #[inline]
     pub fn mmap_size(&self) -> u64 {
         self.mmap_size

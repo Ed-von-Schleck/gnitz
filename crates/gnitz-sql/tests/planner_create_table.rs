@@ -150,7 +150,7 @@ fn test_compound_pk_resolve_preserves_order() {
     }
     // Re-resolve with a fresh client to ensure we exercise the wire decode
     // path (not whatever schema cache the planner may have populated).
-    let mut fresh = GnitzClient::connect(&srv.sock_path).unwrap();
+    let mut fresh = GnitzClient::connect(srv.sock_path()).unwrap();
     let (_, s) = fresh.resolve_table_id(&sn, "cpk_order").unwrap();
     assert_eq!(s.pk_indices(), &[2, 1]);
 }

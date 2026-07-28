@@ -712,9 +712,13 @@ async fn commit_pushes(
         // data via the shard path, so this seam is useful for targeted
         // debugging rather than asserting invisibility after restart.
         #[cfg(debug_assertions)]
-        if std::env::var("GNITZ_INJECT_PUSH_ABORT").as_deref() == Ok("after_groups") {
-            unsafe {
-                libc::abort();
+        {
+            use std::sync::OnceLock;
+            static ARMED: OnceLock<bool> = OnceLock::new();
+            if *ARMED.get_or_init(|| std::env::var("GNITZ_INJECT_PUSH_ABORT").as_deref() == Ok("after_groups")) {
+                unsafe {
+                    libc::abort();
+                }
             }
         }
 
@@ -722,11 +726,11 @@ async fn commit_pushes(
         // fails the zone has no FLAG_TXN_COMMIT and recovery would silently
         // drop all groups in the zone — that is unrecoverable data loss
         // after a restart while the client already received Ok.  Abort.
+        // `commit_zone` signals the workers itself once the sentinel is published.
         let commit_zone_err = shared.disp().commit_zone(zone_lsn).err();
         if let Some(e) = commit_zone_err {
             crate::gnitz_fatal_abort!("commit_zone failed, durability lost: {}", e);
         }
-        shared.disp().signal_all();
 
         // Submit fsync SQE (synchronous — returns a future). The
         // ReplyFutures are built into `fut_slots` outside the lock scope:

@@ -267,7 +267,7 @@ fn big_push_and_multiframe_scan() {
 fn unix_and_tls_clients_share_a_table() {
     let Some(srv) = ServerHandle::start_tls(4) else { return };
     let (mut tls_client, sn, tid, schema) = client_with_table(&srv.tls_target());
-    let mut unix_client = GnitzClient::connect(&srv.sock_path).unwrap();
+    let mut unix_client = GnitzClient::connect(srv.sock_path()).unwrap();
 
     tls_client.push(tid, &schema, &make_batch(&schema, 0, 100)).unwrap();
     let (utid, uschema) = unix_client.resolve_table_id(&sn, "t").unwrap();

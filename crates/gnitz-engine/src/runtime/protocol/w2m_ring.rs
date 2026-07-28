@@ -274,10 +274,20 @@ pub unsafe fn init_region(ptr: *mut u8, capacity: u64) {
         2 * MAX_W2M_MSG,
         W2M_HEADER_SIZE,
     );
-    // The SKIP-wrap path writes an 8-byte sentinel and an 8-byte size prefix
-    // at phys(vwc). If capacity is not 8-aligned, phys(vwc) can sit fewer than
-    // 8 bytes from the end of the buffer, causing those writes to cross the
-    // mmap boundary.
+    init_region_inner(ptr, capacity);
+}
+
+/// Zero the header and seat all three cursors at the start of the data area.
+/// Shared by `init_region` and its test-only relaxed twin, which differ only in
+/// the lower bound they assert on `capacity`.
+///
+/// # Safety
+/// Same preconditions as [`init_region`].
+unsafe fn init_region_inner(ptr: *mut u8, capacity: u64) {
+    // The SKIP-wrap path writes an 8-byte sentinel and an 8-byte size prefix at
+    // phys(vwc). If capacity is not 8-aligned, phys(vwc) can sit fewer than 8
+    // bytes from the end of the buffer, so those writes would cross the mmap
+    // boundary.
     assert!(
         capacity.is_multiple_of(8),
         "W2M capacity={capacity} must be 8-byte aligned"
@@ -293,7 +303,7 @@ pub unsafe fn init_region(ptr: *mut u8, capacity: u64) {
     // raw pointer to avoid forming a &mut reference to the shared
     // struct (which would violate the `&'static Self` aliasing model
     // used elsewhere).
-    write_u64_raw(ptr, 80, capacity);
+    write_u64_raw(ptr, std::mem::offset_of!(W2mRingHeader, capacity), capacity);
 }
 
 /// Map a virtual cursor to its physical byte offset inside the mmap
@@ -514,16 +524,7 @@ pub(crate) unsafe fn try_reserve(
 #[cfg(test)]
 pub(crate) unsafe fn init_region_for_tests(ptr: *mut u8, capacity: u64) {
     assert!(capacity >= W2M_HEADER_SIZE as u64 + 16);
-    assert!(
-        capacity.is_multiple_of(8),
-        "W2M capacity={capacity} must be 8-byte aligned"
-    );
-    std::ptr::write_bytes(ptr, 0, W2M_HEADER_SIZE);
-    let hdr = &*(ptr as *const W2mRingHeader);
-    hdr.write_cursor.store(W2M_HEADER_SIZE as u64, Ordering::Release);
-    hdr.read_cursor.store(W2M_HEADER_SIZE as u64, Ordering::Release);
-    hdr.consume_cursor.store(W2M_HEADER_SIZE as u64, Ordering::Release);
-    write_u64_raw(ptr, 80, capacity);
+    init_region_inner(ptr, capacity);
 }
 
 /// Read-only predicate: would a `try_reserve` for `sz` bytes succeed
@@ -757,7 +758,7 @@ mod tests {
             let size = capacity as usize;
             let region = SharedRegion::new(size);
             let ptr = region.ptr();
-            init_region_raw(ptr, capacity);
+            super::init_region_for_tests(ptr, capacity);
             let hdr = W2mRingHeader::from_raw(ptr);
 
             // Publish 1, consume 1, publish 2, consume 2, publish 3.
@@ -809,7 +810,7 @@ mod tests {
             let size = capacity as usize;
             let region = SharedRegion::new(size);
             let ptr = region.ptr();
-            init_region_raw(ptr, capacity);
+            super::init_region_for_tests(ptr, capacity);
             let hdr = W2mRingHeader::from_raw(ptr);
 
             // Publish 3 bigs, consume 2. wc = HEADER + 3*big_total,
@@ -862,7 +863,7 @@ mod tests {
             let size = capacity as usize;
             let region = SharedRegion::new(size);
             let ptr = region.ptr();
-            init_region_raw(ptr, capacity);
+            super::init_region_for_tests(ptr, capacity);
             let hdr = W2mRingHeader::from_raw(ptr);
 
             for _ in 0..2 {
@@ -937,7 +938,7 @@ mod tests {
             let size = capacity as usize;
             let region = SharedRegion::new(size);
             let ptr = region.ptr();
-            init_region_raw(ptr, capacity);
+            super::init_region_for_tests(ptr, capacity);
             let hdr = W2mRingHeader::from_raw(ptr);
 
             // Prime with 2 publishes so rc trails wc by 1 thereafter.
@@ -974,11 +975,6 @@ mod tests {
         }
     }
 
-    /// Local alias to the pub(crate) test helper.
-    unsafe fn init_region_raw(ptr: *mut u8, capacity: u64) {
-        super::init_region_for_tests(ptr, capacity);
-    }
-
     /// Regression: deterministic sequence that lets the writer cross
     /// the reader after a SKIP wrap. With the buggy physical-cursor
     /// `wc >= rc || wc + total <= rc` predicate, publish #9 lands on
@@ -998,7 +994,7 @@ mod tests {
             let size = 4096; // one page is plenty for 600-ish bytes
             let region = SharedRegion::new(size);
             let ptr = region.ptr();
-            init_region_raw(ptr, capacity);
+            super::init_region_for_tests(ptr, capacity);
             let hdr = W2mRingHeader::from_raw(ptr);
 
             let publish = |tag: u8| match try_publish(hdr, ptr, msg_sz, |slot| {
@@ -1119,7 +1115,7 @@ mod tests {
             let size = capacity as usize;
             let region = SharedRegion::new(size);
             let ptr = region.ptr();
-            init_region_raw(ptr, capacity);
+            super::init_region_for_tests(ptr, capacity);
             let hdr = W2mRingHeader::from_raw(ptr);
 
             for _ in 0..2 {

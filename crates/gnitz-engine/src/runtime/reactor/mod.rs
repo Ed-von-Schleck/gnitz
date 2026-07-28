@@ -2885,11 +2885,8 @@ mod tests {
         const N_MESSAGES: u64 = 500;
         const TIMEOUT_SECS: u64 = 30;
 
-        let fd = crate::foundation::posix_io::memfd_create(b"w2m_stress");
-        assert!(fd >= 0, "memfd_create failed");
-        crate::foundation::posix_io::ftruncate(fd, CAPACITY as i64).unwrap();
-        let ptr = crate::foundation::posix_io::mmap_shared(fd, CAPACITY);
-        assert!(!ptr.is_null(), "mmap_shared failed");
+        let region = crate::test_support::SharedRegion::new(CAPACITY);
+        let ptr = region.ptr();
         unsafe {
             w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
         }
@@ -2983,11 +2980,6 @@ mod tests {
 
         // AsyncCancel the in-flight FUTEX_WAITV before the storage drops.
         reactor.request_shutdown();
-
-        unsafe {
-            libc::munmap(ptr as *mut libc::c_void, CAPACITY);
-            libc::close(fd);
-        }
     }
 
     /// High-volume variant of the W2M cross-process stress: 5 000
@@ -3008,11 +3000,8 @@ mod tests {
         const N_MESSAGES: u64 = 5_000;
         const TIMEOUT_SECS: u64 = 60;
 
-        let fd = crate::foundation::posix_io::memfd_create(b"w2m_stress_hv");
-        assert!(fd >= 0);
-        crate::foundation::posix_io::ftruncate(fd, CAPACITY as i64).unwrap();
-        let ptr = crate::foundation::posix_io::mmap_shared(fd, CAPACITY);
-        assert!(!ptr.is_null());
+        let region = crate::test_support::SharedRegion::new(CAPACITY);
+        let ptr = region.ptr();
         unsafe {
             w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
         }
@@ -3096,10 +3085,6 @@ mod tests {
         }
 
         reactor.request_shutdown();
-        unsafe {
-            libc::munmap(ptr as *mut libc::c_void, CAPACITY);
-            libc::close(fd);
-        }
     }
 
     /// Lost-wake guard for `refresh_futex_waitv_vals` (cluster C6).
@@ -3139,13 +3124,10 @@ mod tests {
         const CAPACITY: usize = 64 * 1024;
         const TIMEOUT: Duration = Duration::from_secs(10);
 
-        // memfd + mmap a tiny shared W2M ring (same setup the existing
-        // cross-process stress tests use, but shared with a thread).
-        let fd = crate::foundation::posix_io::memfd_create(b"w2m_refresh_pin");
-        assert!(fd >= 0, "memfd_create failed");
-        crate::foundation::posix_io::ftruncate(fd, CAPACITY as i64).unwrap();
-        let ptr = crate::foundation::posix_io::mmap_shared(fd, CAPACITY);
-        assert!(!ptr.is_null(), "mmap_shared failed");
+        // A tiny shared W2M ring (same setup the cross-process stress tests
+        // use, but shared with a thread).
+        let region = crate::test_support::SharedRegion::new(CAPACITY);
+        let ptr = region.ptr();
         unsafe {
             w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
         }
@@ -3266,11 +3248,6 @@ mod tests {
              reader_seq is snapshotted (stamp {snap_seq}); reordering them \
              opens the lost-wake window",
         );
-
-        unsafe {
-            libc::munmap(ptr as *mut libc::c_void, CAPACITY);
-            libc::close(fd);
-        }
     }
 
     // ─────────────────────────────────────────────────────────────────

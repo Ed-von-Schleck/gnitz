@@ -89,11 +89,8 @@ impl PartitionedTable {
         // (DROP) deterministically races this create. User tables only.
         #[cfg(debug_assertions)]
         if routing == Routing::Hashed {
-            if let Some(ms) = std::env::var("GNITZ_INJECT_TABLE_CREATE_DELAY_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|ms| *ms > 0)
-            {
+            let ms = crate::foundation::env::env_u64("GNITZ_INJECT_TABLE_CREATE_DELAY_MS", 0);
+            if ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(ms));
             }
         }
