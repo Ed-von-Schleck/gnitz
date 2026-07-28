@@ -108,6 +108,40 @@ fn pk_set_gathers_named_keys() {
     assert_eq!(got, vec![(2u128, 200, 1), (5u128, 500, 1), (7u128, 700, 1)]);
 }
 
+/// A system table's store is one unpartitioned `Table` holding every key, which
+/// the cursor reads whole — so the gather's ownership filter must keep every key
+/// there. Treating it like a hashed store would answer zero rows.
+#[test]
+fn pk_set_over_a_system_table_keeps_every_key() {
+    let (mut e, tid) = table_fixture("ss_pkset_sys", &id_val_cols());
+    let sys_schema = e.get_schema(TABLE_TAB_ID).unwrap();
+    let spec = identity_spec(ReadBound::PkSet(vec![tid as u128]), vec![], 0);
+    let keeper = e.scan_spec_family(TABLE_TAB_ID, &spec, &sys_schema).unwrap();
+    assert_eq!(
+        (0..keeper.count).map(|i| keeper.get_pk(i)).collect::<Vec<_>>(),
+        vec![tid as u128],
+        "the created table's TABLE_TAB row must come back"
+    );
+}
+
+/// Two distinct wire keys can share one OPK image — `opk_key` truncates to
+/// `pk_stride`, so `5` and `5 + 2^64` are the same U64 PK. The decoder's
+/// schema-free view cannot see that; the gather's post-sort scan must, or
+/// `advance_to_exact_live` re-finds the row and emits it twice. The reject must
+/// not depend on which worker owns the key, so it runs before the gather's
+/// ownership filter — a fixture whose store owns everything cannot show that, so
+/// the assertion is on the error alone.
+#[test]
+fn pk_set_rejects_keys_colliding_after_truncation() {
+    let (mut e, tid) = fixture("ss_pkset_trunc", 10, |i| i as i64);
+    let spec = identity_spec(ReadBound::PkSet(vec![5, 5 + (1u128 << 64)]), vec![], 0);
+    let reply_schema = e.get_schema(tid).unwrap();
+    let Err(err) = e.scan_spec_family(tid, &spec, &reply_schema) else {
+        panic!("colliding PkSet keys must be rejected, not gathered twice");
+    };
+    assert!(err.contains("duplicate"), "{err}");
+}
+
 #[test]
 fn pk_set_missing_keys_miss_silently() {
     let (mut e, tid) = fixture("ss_pkset_miss", 5, |i| i as i64);

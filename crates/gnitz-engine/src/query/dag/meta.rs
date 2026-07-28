@@ -262,6 +262,22 @@ impl DagEngine {
                 .all(|tid| self.tables.get(tid).is_some_and(|e| e.schema.replicated()))
     }
 
+    /// True iff view `view_id` has **any** replicated source — the flag
+    /// `build_partitioned_storage` routes on. Such a view is built
+    /// single-partition, so its whole local output sits in one child store and its
+    /// rows are NOT keyed by `partition_for_pk`; no key-derived routing decision
+    /// holds for it. Same source set and same live-flag read as
+    /// [`view_all_sources_replicated`](Self::view_all_sources_replicated), which
+    /// answers the stricter question of whether the output is itself replicated.
+    pub(crate) fn view_has_replicated_source(&mut self, view_id: i64) -> bool {
+        self.get_dep_map();
+        self.dep.reverse.get(&view_id).is_some_and(|sources| {
+            sources
+                .iter()
+                .any(|tid| self.tables.get(tid).is_some_and(|e| e.schema.replicated()))
+        })
+    }
+
     // ── ViewMeta (plan-free circuit metadata) ───────────────────────────
 
     /// Load typed circuit nodes/edges for metadata queries. Cheaper than full

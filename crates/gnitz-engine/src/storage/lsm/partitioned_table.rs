@@ -147,6 +147,16 @@ impl PartitionedTable {
         self.routing == Routing::Replicated
     }
 
+    /// True when [`open_cursor`](Self::open_cursor) could return `key` (full OPK
+    /// bytes) — the discard test for a broadcast key list. It mirrors that
+    /// method's clauses, so a caller never drops a key the cursor would have
+    /// found: an empty `tables` (the post-fork master) reads nothing, and a
+    /// replicated store's single child covers the whole local dataset, so it can
+    /// hold any key.
+    pub(crate) fn cursor_may_hold_key(&self, key: &[u8]) -> bool {
+        !self.tables.is_empty() && (self.is_replicated() || self.local_index_bytes(key).is_some())
+    }
+
     // ------------------------------------------------------------------
     // Ingest
     // ------------------------------------------------------------------
@@ -571,6 +581,59 @@ mod tests {
         assert!(!pt.has_pk(99));
         pt.flush().unwrap();
         assert!(pt.has_pk(10));
+    }
+
+    /// `cursor_may_hold_key` mirrors `open_cursor`'s clauses: a replicated store
+    /// can hold any key (its one child holds the whole local dataset), a hashed
+    /// store exactly the keys hashing into its own partition range, and a store
+    /// with no children none at all.
+    #[test]
+    fn cursor_may_hold_key_mirrors_the_cursor() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = make_schema_u64_i64();
+        let build = |name: &str, routing, start, end| {
+            let tdir = dir.path().join(name);
+            PartitionedTable::new(
+                tdir.to_str().unwrap(),
+                schema,
+                300,
+                routing,
+                RecoverySource::Rederive,
+                start,
+                end,
+            )
+            .unwrap()
+        };
+        // Enough distinct keys that every partition range sees both verdicts.
+        let keys: Vec<_> = (0u128..512)
+            .map(|k| crate::schema::key::opk_key(&schema, &k.to_le_bytes()).0)
+            .collect();
+        let stride = schema.pk_stride() as usize;
+
+        let repl = build("cmhk_repl", Routing::Replicated, 7, 8);
+        assert!(
+            keys.iter().all(|k| repl.cursor_may_hold_key(&k[..stride])),
+            "a replicated store can hold any key, whatever its part_offset"
+        );
+
+        // Worker 1 of 4 → partitions [64, 128).
+        let (start, end) = partition_range(1, 4);
+        let hashed = build("cmhk_hashed", Routing::Hashed, start, end);
+        for k in &keys {
+            let p = schema.partition_for_pk(&k[..stride]) as u32;
+            assert_eq!(
+                hashed.cursor_may_hold_key(&k[..stride]),
+                p >= start && p < end,
+                "partition {p}"
+            );
+        }
+
+        let empty = build("cmhk_empty", Routing::Hashed, 0, 0);
+        assert!(
+            keys.iter().all(|k| !empty.cursor_may_hold_key(&k[..stride])),
+            "no children (the post-fork master) → holds nothing"
+        );
     }
 
     #[test]

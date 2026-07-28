@@ -406,3 +406,39 @@ def test_fifo_ordering_big_then_small(reply_frame_budget_server):
         assert sorted((r.pk, r.s) for r in res[1] if r.weight > 0) == [(i, f"name-{i}") for i in range(5)]
     finally:
         c.drop_schema(sn)
+
+
+# ---------------------------------------------------------------------------
+# Base-table freshness: neither scan nor scan_many drains pending view ticks
+# ---------------------------------------------------------------------------
+
+
+def test_base_scan_is_fresh_with_dependent_views(client):
+    """A base table's own read is fully fresh the moment a push ACKs, whatever
+    its dependent views are doing — a pending tick can only change what a VIEW
+    sees. Three GROUP BY views ride on `t` so the tick queue is non-empty at
+    read time; both read verbs must still return every pushed row, and the
+    scan_many/scan lsn equality must hold."""
+    sn = "sm" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT, v BIGINT)", schema_name=sn
+        )
+        for i in range(3):
+            client.execute_sql(
+                f"CREATE VIEW agg{i} AS SELECT g, SUM(v) AS s FROM t WHERE v > {i} GROUP BY g",
+                schema_name=sn,
+            )
+        tid = client.resolve_table(sn, "t")[0]
+        vals = ",".join(f"({i}, {i % 4}, {i})" for i in range(60))
+        client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
+
+        want = sorted(range(60))
+        single = client.scan(tid)
+        assert sorted(r.id for r in single if r.weight > 0) == want
+        multi = client.scan_many([tid])
+        assert sorted(r.id for r in multi[0] if r.weight > 0) == want
+        assert multi[0].lsn == single.lsn
+    finally:
+        client.drop_schema(sn)

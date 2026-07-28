@@ -32,7 +32,8 @@ use crate::catalog::{
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingTxn};
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{
-    dispatch_scan_multi_fanout, first_worker_error_opt, replicated_unicast, MasterDispatcher, TxnFamily,
+    dispatch_scan_multi_fanout, first_worker_error_opt, replicated_unicast, scan_spec_route, MasterDispatcher,
+    TxnFamily,
 };
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{
@@ -971,23 +972,30 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
 
     // ---------- SELECTs (SEEK / SEEK_BY_INDEX / SCAN) ----------
     if flags & FLAG_SEEK != 0 {
-        // No dispatch-level read lock: `handle_seek` owns its locking so a view
-        // seek can release it to drain pending ticks (BF-1). The other seek arms
-        // are base-table-only and keep their dispatch lock.
-        handle_seek(
-            shared,
-            peer,
-            client_id,
-            target_id,
-            decoded.control.seek_pk,
-            &decoded.control.seek_pk_extra,
-            client_version,
-        )
-        .await;
+        // A base-table or system seek is the RMW hot path: base state is fresh at
+        // push-apply time, so `read_lock` locks once and never drains. A view seek
+        // drains inside it (BF-1), which is why the lock is taken there and not
+        // at dispatch level.
+        if let Some(_g) = read_lock(shared, peer, client_id, target_id).await {
+            serve_seek(
+                shared,
+                peer,
+                client_id,
+                target_id,
+                decoded.control.seek_pk,
+                &decoded.control.seek_pk_extra,
+                client_version,
+            )
+            .await;
+        }
         return;
     }
     if flags & FLAG_SEEK_BY_INDEX != 0 {
-        let _g = shared.catalog_rwlock.read().await;
+        // Only a base table can own a secondary index, so in practice `read_lock`
+        // never drains here — but it is the same call every other read verb makes.
+        let Some(_g) = read_lock(shared, peer, client_id, target_id).await else {
+            return;
+        };
         handle_seek_by_index(
             shared,
             peer,
@@ -1003,8 +1011,8 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
     }
     // ScanSpec must be routed before the generic empty-batch scan dispatch below
     // (a `ReadSpec` request carries an empty batch, so target_id alone would route
-    // it to the plain-scan fallthrough). Like `handle_scan` it drains view ticks
-    // inside `drain_then_lock`, so it takes no dispatch-level lock here.
+    // it to the plain-scan fallthrough). Like `handle_scan` it locks (and drains a
+    // view target) inside `read_lock`, so it takes no dispatch-level lock here.
     if flags & gnitz_wire::FLAG_SCAN_SPEC != 0 {
         handle_scan_spec(shared, peer, client_id, target_id, &decoded.control.seek_pk_extra).await;
         return;
@@ -1156,50 +1164,6 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
     }
 
     // Fallthrough: ignore (should not happen).
-}
-
-/// Serve a `FLAG_SEEK` point lookup (the dispatch arm releases the read lock
-/// before calling, so this owns its own locking). A base-table or system seek is
-/// the RMW hot path: base state is fresh at push-apply time, so it classifies and
-/// serves under one read lock and never drains. A view seek instead drops the
-/// lock, drains pending ticks with NO lock held (BF-1), then re-locks and
-/// re-checks — giving it the same read-your-writes freshness a view scan has.
-async fn handle_seek(
-    shared: &Rc<Shared>,
-    peer: &Peer,
-    client_id: u64,
-    target_id: i64,
-    pk: u128,
-    seek_pk_extra: &[u8],
-    client_version: u16,
-) {
-    // Base table / system: classify and serve under one read lock (`cat()`
-    // aliases the catalog; the lock excludes a concurrent DDL writer). Only a
-    // view needs the drop-drain-reacquire dance, so the hot path locks once.
-    // `is_some_and` ends the `dag.tables` borrow before any await.
-    {
-        let _g = shared.catalog_rwlock.read().await;
-        if reject_unknown_table(shared, peer, client_id, target_id).await {
-            return;
-        }
-        let is_view = shared
-            .cat()
-            .dag
-            .tables
-            .get(&target_id)
-            .is_some_and(|e| e.kind.is_view());
-        if !is_view {
-            serve_seek(shared, peer, client_id, target_id, pk, seek_pk_extra, client_version).await;
-            return;
-        }
-    }
-
-    // View: drain with NO catalog lock held (BF-1), then re-lock and re-check
-    // existence — a DDL may have dropped the view during the drain.
-    let Some(_g) = drain_then_lock(shared, peer, client_id, target_id).await else {
-        return;
-    };
-    serve_seek(shared, peer, client_id, target_id, pk, seek_pk_extra, client_version).await;
 }
 
 /// Serve a point lookup with the catalog read lock already held: a system tid
@@ -1473,9 +1437,6 @@ async fn handle_seek_by_index(
     seek_pk_extra: &[u8],
     client_version: u16,
 ) {
-    if reject_unknown_table(shared, peer, client_id, target_id).await {
-        return;
-    }
     if target_id >= FIRST_USER_TABLE_ID {
         let cols = match validated_index_cols(shared, target_id, seek_col_idx, "seek_by_index") {
             Ok(cols) => cols,
@@ -1660,12 +1621,34 @@ async fn drain_pending_ticks(shared: &Rc<Shared>) {
     }
 }
 
-/// Drain pending view ticks, then take the catalog read lock and re-check the
-/// target still exists (a DDL may have dropped it during the drain). Returns the
-/// held guard, or `None` if the target was rejected (error already sent). Encodes
-/// the BF-1 ordering — drain BEFORE the lock — in one place; shared by
-/// `handle_scan` and `handle_seek`'s view path.
-async fn drain_then_lock(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64) -> Option<ReadGuard> {
+/// True iff `tid` names a view — the one thing that decides whether a pending
+/// tick can change what a read sees, since `dep.forward`'s values are view ids
+/// only. An unknown tid is not a view. The caller must hold the catalog read
+/// lock; `is_some_and` ends the `dag.tables` borrow before the caller's next
+/// await.
+fn is_view(shared: &Rc<Shared>, tid: i64) -> bool {
+    shared.cat().dag.tables.get(&tid).is_some_and(|e| e.kind.is_view())
+}
+
+/// Take the catalog read lock with `target_id` validated, draining pending view
+/// ticks first only when the target is a view. Returns the held guard, or `None`
+/// if the target was rejected (error already sent). The one read-lock entry point
+/// for every single-target read verb.
+///
+/// A base table's rows AND its secondary indexes are written by the same ingest
+/// apply, which is what makes skipping the drain safe for an `IndexRange` bound
+/// too. A view drops the lock, drains with NO lock held (BF-1), then re-locks and
+/// re-checks existence — a DDL may have dropped it during the drain.
+async fn read_lock(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64) -> Option<ReadGuard> {
+    {
+        let g = shared.catalog_rwlock.read().await;
+        if reject_unknown_table(shared, peer, client_id, target_id).await {
+            return None;
+        }
+        if !is_view(shared, target_id) {
+            return Some(g);
+        }
+    }
     drain_pending_ticks(shared).await;
     let g = shared.catalog_rwlock.read().await;
     if reject_unknown_table(shared, peer, client_id, target_id).await {
@@ -1708,7 +1691,7 @@ fn build_prelim_schema_frame(tid: i64, client_id: u64, server_version: u16, bloc
 }
 
 async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64, client_version: u16) {
-    let Some(_g) = drain_then_lock(shared, peer, client_id, target_id).await else {
+    let Some(_g) = read_lock(shared, peer, client_id, target_id).await else {
         return;
     };
     let lsn = shared.last_tick_lsn.get();
@@ -1764,15 +1747,19 @@ async fn finish_scan_fanout(peer: &Peer, target_id: i64, client_id: u64, lsn: u6
 
 /// Parameterized bounded read (`ReadSpec`). The scan pipeline, minus schema
 /// negotiation: the reply schema is the client's echoed block, forwarded verbatim
-/// in `seek_pk_extra` and re-emitted by each worker. `drain_then_lock` still
-/// drains a view target's pending ticks first (freshness), and routing/terminal-
-/// frame/error handling are identical to `handle_scan`.
+/// in `seek_pk_extra` and re-emitted by each worker. `read_lock` still drains a
+/// view target's pending ticks first (freshness), and terminal-frame/error
+/// handling are identical to `handle_scan`; only the routing differs, since a
+/// bound can confine the read to one worker.
 async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64, seek_pk_extra: &[u8]) {
-    let Some(_g) = drain_then_lock(shared, peer, client_id, target_id).await else {
+    let Some(_g) = read_lock(shared, peer, client_id, target_id).await else {
         return;
     };
     let lsn = shared.last_tick_lsn.get();
-    let unicast = replicated_unicast(shared.dispatcher, target_id);
+    // A PK range confined to one partition unicasts: one SAL slot instead of W,
+    // each of which would carry its own copy of the spec blob under the exclusive
+    // SAL mutex.
+    let unicast = scan_spec_route(shared.dispatcher, target_id, seek_pk_extra);
     let result = MasterDispatcher::fan_out_scan_spec_async(
         shared.dispatcher,
         &shared.reactor,
@@ -1830,10 +1817,19 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
     let tids: Vec<u64> = relations.iter().map(|(tid, _)| *tid).collect();
     gnitz_wire::validate_scan_multi_tids(&tids)?;
 
-    // Drain pending ticks once (before the catalog lock — BF-1), as `handle_scan`
-    // does.
-    drain_pending_ticks(shared).await;
-    // The shared LSN stamped into every terminal — captured after the drain.
+    // Drain pending ticks once — but only if some target is a view, the same rule
+    // `read_lock` applies to a single target — and with NO catalog lock held
+    // (BF-1). The classifying lock is dropped before the drain; Phase 1 re-resolves
+    // every tid under a fresh lock via `has_id`, so a DDL during the drain is
+    // caught there, and an unknown tid is rejected there rather than here.
+    let needs_drain = {
+        let _cat = shared.catalog_rwlock.read().await;
+        tids.iter().any(|&t| is_view(shared, t as i64))
+    };
+    if needs_drain {
+        drain_pending_ticks(shared).await;
+    }
+    // The shared LSN stamped into every terminal.
     let lsn = shared.last_tick_lsn.get();
 
     // ── Phase 1: catalog lock — resolve shapes + schemas, dispatch one cut ──

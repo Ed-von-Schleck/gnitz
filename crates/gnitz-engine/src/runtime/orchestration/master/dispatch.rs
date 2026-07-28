@@ -4,6 +4,7 @@
 
 use super::index_router::index_route_key;
 use super::*;
+use crate::query::RelationKind;
 
 /// The verdict of `MasterDispatcher::txn_fit`.
 pub(crate) enum TxnFit {
@@ -14,6 +15,48 @@ pub(crate) enum TxnFit {
     Transient,
     /// It exceeds the SAL outright — no checkpoint can help; retrying is futile.
     Terminal,
+}
+
+/// Route a ScanSpec read, as the `unicast` shape every fan-out helper speaks:
+/// `-1` broadcasts, `>= 0` writes only that worker's SAL slot.
+///
+/// A replicated relation is a full identical copy on every worker, so worker 0
+/// answers it alone; otherwise the read goes to the single worker owning its PK
+/// range when [`confined_worker`] can prove one, and is broadcast when it cannot.
+pub(crate) fn scan_spec_route(disp_ptr: *mut MasterDispatcher, target_id: i64, seek_pk_extra: &[u8]) -> i32 {
+    let replicated = replicated_unicast(disp_ptr, target_id);
+    if replicated >= 0 {
+        return replicated;
+    }
+    confined_worker(disp_ptr, target_id, seek_pk_extra).map_or(-1, |w| w as i32)
+}
+
+/// The one worker that can answer this read, or `None` when nothing proves one —
+/// a non-`PkRange` bound, a forged descriptor (left for the worker to reject at
+/// the trust boundary), or a range spanning partitions. An `IndexRange` bound is
+/// never confined: a secondary index is one unpartitioned table per worker, so
+/// nothing derives its owner from the key.
+///
+/// Only a hashed store is key-routable. A view's store is hashed iff no source is
+/// replicated — `build_partitioned_storage` builds the rest single-partition, so
+/// their rows are not keyed by `partition_for_pk` at all. `handle.is_replicated()`
+/// cannot answer this on the master: a relation created post-fork has an empty
+/// active partition range there and reports `Hashed` whatever it is.
+fn confined_worker(disp_ptr: *mut MasterDispatcher, target_id: i64, seek_pk_extra: &[u8]) -> Option<usize> {
+    let cat = unsafe { &mut *(*disp_ptr).catalog };
+    let kind = cat.dag.tables.get(&target_id)?.kind;
+    match kind {
+        RelationKind::BaseTable { .. } => {}
+        RelationKind::View if !cat.dag.view_has_replicated_source(target_id) => {}
+        // A single-partition view store, or the system catalog — one unpartitioned
+        // table per worker, holding whatever landed there.
+        _ => return None,
+    }
+    let (spec, _block) = gnitz_wire::unpack_scan_spec_extra(seek_pk_extra).ok()?;
+    let desc = gnitz_wire::peek_pk_range(spec)?;
+    let schema = cat.get_schema_desc(target_id)?;
+    let partition = crate::catalog::scan_spec_partition(&schema, &desc)?;
+    Some(worker_for_partition(partition, unsafe { (*disp_ptr).num_workers }))
 }
 
 /// Timeout for the synchronous `W2mReceiver::wait_for` fallback in the two
@@ -1171,9 +1214,9 @@ impl MasterDispatcher {
     /// the group is written by `write_scan_spec_group` (carrying `FLAG_SCAN_SPEC`
     /// and the client's verbatim `seek_pk_extra` blob) and there is no schema-
     /// version negotiation: the worker's reply force-includes the client's echoed
-    /// block, so no per-worker version is threaded. Routing is scan-parity
-    /// (`unicast` = worker-0 for a replicated relation, else broadcast), and the
-    /// reply-train forwarding + error contract are shared with the plain scan.
+    /// block, so no per-worker version is threaded. `unicast` comes from
+    /// [`scan_spec_route`], and the reply-train forwarding + error contract are
+    /// shared with the plain scan.
     #[allow(clippy::too_many_arguments)]
     pub async fn fan_out_scan_spec_async(
         disp_ptr: *mut MasterDispatcher,

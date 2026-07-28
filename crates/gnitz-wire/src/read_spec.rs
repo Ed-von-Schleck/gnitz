@@ -124,8 +124,9 @@ pub enum ReadBound {
     /// column type, so a stripped conjunct is always re-imposed by the walk.
     IndexRange { idx_cols: u64, desc: RangeDescriptor },
     /// `pk IN (…)` for a single-column PK. Values are raw native keys widened to
-    /// `u128` (`FixedInt::pack`), **deduplicated**; wire order is irrelevant —
-    /// the worker OPK-sorts the keys before its forward gather.
+    /// `u128` (`FixedInt::pack`), and must be **distinct after truncation to the
+    /// PK's width** — the worker rejects the rest. Wire order is irrelevant: the
+    /// worker OPK-sorts the keys before its forward gather.
     PkSet(Vec<u128>),
 }
 
@@ -161,9 +162,10 @@ fn put_bytes32(out: &mut Vec<u8>, bytes: &[u8]) {
 
 /// Pack a ScanSpec request's control-block `seek_pk_extra` blob: the encoded
 /// `ReadSpec` followed by the raw reply-schema wire block, each `u32`-length-
-/// prefixed. Bundling both in the arbitrary-length `seek_pk_extra` BLOB keeps
-/// the master a pure forwarder (it never decodes the spec) and hands the worker
-/// the raw reply-schema bytes to **echo** verbatim — the engine
+/// prefixed. Bundling both in the arbitrary-length `seek_pk_extra` BLOB lets the
+/// master forward the blob verbatim — it peeks the bound header
+/// ([`peek_pk_range`]) to route the request but never decodes the spec — and
+/// hands the worker the raw reply-schema bytes to **echo** verbatim: the engine
 /// `SchemaDescriptor` drops the hidden flags, so the worker must never rebuild
 /// the block.
 pub fn pack_scan_spec_extra(spec: &[u8], reply_block: &[u8]) -> Vec<u8> {
@@ -183,6 +185,24 @@ pub fn unpack_scan_spec_extra(extra: &[u8]) -> Result<(&[u8], &[u8]), String> {
         return Err(format!("scan_spec extra: {} trailing bytes", r.remaining()));
     }
     Ok((spec, block))
+}
+
+/// The `PkRange` descriptor of an encoded `ReadSpec`, or `None` for every other
+/// bound kind, an unknown version, or a truncated prefix. Lets the master derive
+/// a routing decision without decoding the spec.
+///
+/// Reads only the header and the range descriptor, never the predicate / order /
+/// projection / PkSet sections, so a `PkSet` spec at the key cap costs one byte
+/// compare rather than a megabyte-scale parse. [`ReadSpec::decode`] remains the
+/// worker's full validating parse.
+pub fn peek_pk_range(buf: &[u8]) -> Option<RangeDescriptor> {
+    let mut r = Reader::new(buf);
+    if r.u8().ok()? != VERSION || r.u8().ok()? != BOUND_PK_RANGE {
+        return None;
+    }
+    r.u8().ok()?; // sink tag
+    r.u8().ok()?; // reserved
+    read_range_descriptor(&mut r).ok()
 }
 
 /// A bounds-checked forward reader over the encoded blob — every field access
@@ -339,9 +359,10 @@ impl ReadSpec {
 
     /// Decode and validate at the trust boundary. Rejects: an over-cap blob,
     /// unknown version/kind/sink tag, order-key / PkSet / fold-section count
-    /// over cap, a raw-u128 duplicate PkSet key (dedup is type-agnostic), an
-    /// unknown order flag bit or aggregate op, length overflows/truncation, and
-    /// trailing bytes.
+    /// over cap, an unknown order flag bit or aggregate op, length
+    /// overflows/truncation, and trailing bytes. Duplicate PkSet keys are NOT
+    /// rejected here — that check needs the PK width and lives in the worker's
+    /// schema-aware gather.
     pub fn decode(buf: &[u8]) -> Result<Self, String> {
         if buf.len() > MAX_READ_SPEC_BYTES {
             return Err(format!(
@@ -371,14 +392,13 @@ impl ReadSpec {
                 if count > MAX_PK_SET_KEYS {
                     return Err(format!("read_spec: PkSet count {count} exceeds cap {MAX_PK_SET_KEYS}"));
                 }
+                // Duplicates are NOT rejected here: this decoder has no schema, so
+                // a raw-`u128` set cannot see the wire keys that collide once
+                // truncated to the PK's width. The reject lives in the worker's
+                // schema-aware gather.
                 let mut keys = Vec::with_capacity(count);
-                let mut seen = std::collections::HashSet::with_capacity(count);
                 for _ in 0..count {
-                    let k = r.u128()?;
-                    if !seen.insert(k) {
-                        return Err(format!("read_spec: PkSet duplicate key {k}"));
-                    }
-                    keys.push(k);
+                    keys.push(r.u128()?);
                 }
                 ReadBound::PkSet(keys)
             }
@@ -590,14 +610,16 @@ mod tests {
         assert!(ReadSpec::decode(&bytes).unwrap_err().contains("PkSet count"));
     }
 
+    /// Duplicates round-trip: rejecting them needs the PK width, which this
+    /// decoder does not have — the worker's OPK-sorted gather rejects them.
     #[test]
-    fn decode_rejects_duplicate_pk_set_key() {
+    fn decode_keeps_duplicate_pk_set_keys() {
         let spec = ReadSpec {
             bound: ReadBound::PkSet(vec![5, 5]),
             predicate: vec![],
             sink: ReadSink::all_rows(),
         };
-        assert!(ReadSpec::decode(&spec.encode()).unwrap_err().contains("duplicate"));
+        assert_eq!(ReadSpec::decode(&spec.encode()).unwrap(), spec);
     }
 
     #[test]

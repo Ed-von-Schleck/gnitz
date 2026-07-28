@@ -608,6 +608,12 @@ impl IndexListMemo {
             }
         }
     }
+
+    /// The list a collector already fetched, empty if neither did (which can only
+    /// happen when neither produced a candidate).
+    fn fetched(&self) -> &[IndexMeta] {
+        self.0.as_deref().map_or(&[], |v| v.as_slice())
+    }
 }
 
 /// The best index range/equality bound for `where_expr` as a full
@@ -634,7 +640,7 @@ where
     let seeks =
         collect_index_seek_candidates(where_expr, schema, || memo.get(&mut fetch)).map_err(GnitzSqlError::Exec)?;
 
-    let mut cands: Vec<IndexRangeCandidate<'e>> = ranges
+    let cands: Vec<IndexRangeCandidate<'e>> = ranges
         .into_iter()
         .chain(seeks.into_iter().map(|(idx_cols, vals, residual)| {
             let n = vals.len();
@@ -645,24 +651,48 @@ where
             }
         }))
         .collect();
-    // Stable sort: on a full tie the range collector's candidate (listed first)
-    // wins, matching each collector's own internal preference order.
-    cands.sort_by_key(|c| Reverse(pinned_score(c, schema)));
-    Ok(cands.into_iter().next())
+    let is_unique = |cols: &PkColList| {
+        memo.fetched()
+            .iter()
+            .any(|m| m.is_unique && m.cols.as_slice() == cols.as_slice())
+    };
+    // `min_by_key` keeps the FIRST of equal keys, so on a full tie the range
+    // collector's candidate (listed first) wins, matching each collector's own
+    // internal preference order. It also scores each candidate exactly once,
+    // where a sort would re-derive the key per comparison.
+    Ok(cands
+        .into_iter()
+        .min_by_key(|c| Reverse(pinned_score(c, schema, is_unique(&c.idx_cols)))))
 }
 
 /// How constrained a candidate leaves the index walk, as a totally ordered key:
-/// 2 per equality-pinned column plus 1 per real range side, then (ascending arity)
-/// the tighter index on a tie. One rule ranks equality and range candidates
-/// together — "most pinned columns wins".
-fn pinned_score(c: &IndexRangeCandidate<'_>, schema: &Schema) -> (u32, Reverse<usize>) {
+/// a full unique point first, then 2 per equality-pinned column plus 1 per real
+/// range side, then (ascending arity) the tighter index on a tie. One rule ranks
+/// equality and range candidates together — "most pinned columns wins".
+///
+/// A point covering every column of a UNIQUE index selects at most one row, which
+/// no magnitude score can express: on a signed column a two-sided interval ties a
+/// point at 2, and on an unsigned column `WHERE a = 0` scores 1 — *below* an
+/// interval — because `type_edges(U64).0` is `Before(0)`. Leading with the flag
+/// settles both.
+fn pinned_score(c: &IndexRangeCandidate<'_>, schema: &Schema, unique: bool) -> (bool, u32, Reverse<usize>) {
     let n_eq = c.desc.eq_vals().len();
+    // A point on a *prefix* of a unique index (which the seek collector emits) is
+    // not itself unique; `idx_cols` is the index's FULL declared list, so
+    // `n_eq + 1 == len` is exactly "the point covers every column".
+    let unique_point = unique
+        && n_eq + 1 == c.idx_cols.as_slice().len()
+        && matches!((c.desc.start, c.desc.end), (Cut::Before(x), Cut::After(y)) if x == y);
     let sides = match Cut::type_edges(schema.columns[c.range_col()].type_code) {
         Some((lo, hi)) => (c.desc.start != lo) as u32 + (c.desc.end != hi) as u32,
         // Unreachable: both collectors only emit range-servable column types.
         None => 2,
     };
-    (2 * n_eq as u32 + sides, Reverse(c.idx_cols.as_slice().len()))
+    (
+        unique_point,
+        2 * n_eq as u32 + sides,
+        Reverse(c.idx_cols.as_slice().len()),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -675,8 +705,8 @@ mod tests {
     use crate::bind::bind_single_table;
     use crate::codec::pk_codec::extract_pk_value;
     use crate::test_support::{
-        bind_where, col_def, compound_schema_u64_u64, eq_expr, idx_metas, in_list_expr, neg_num_expr, num_expr,
-        parse_expr_sql, pk_schema, two_col, uuid_schema_payload, uuid_schema_pk,
+        bind_where, col_def, compound_schema_u64_u64, eq_expr, idx_metas, idx_metas_flagged, in_list_expr,
+        neg_num_expr, num_expr, parse_expr_sql, pk_schema, two_col, uuid_schema_payload, uuid_schema_pk,
     };
     use sqlparser::ast::Expr;
 
@@ -1292,5 +1322,108 @@ mod tests {
         let (_, desc) = b.expect("BETWEEN must bound");
         assert_eq!(desc.eq_vals(), &[] as &[u128]);
         assert_eq!((desc.start, desc.end), (Cut::Before(5), Cut::After(9)));
+    }
+
+    // ── best_index_bound: a full unique point outranks every interval ────────────
+    //
+    // Intervals here sit strictly inside the column's type range: an interval whose
+    // own cut lands on a type edge scores 1 and the comparison proves nothing.
+
+    /// `(id U64 pk, a T, b T)` — indexable cols a=1, b=2, both non-nullable.
+    fn typed_schema(tc: TypeCode) -> Schema {
+        Schema {
+            columns: vec![
+                col_def("id", TypeCode::U64, false),
+                col_def("a", tc, false),
+                col_def("b", tc, false),
+            ],
+            pk_cols: vec![0],
+        }
+    }
+
+    /// The index the arbitration picks for `where_sql`, given per-index uniqueness.
+    fn picked(where_sql: &str, sch: &Schema, lists: &[(&[u32], bool)]) -> (Vec<u32>, Cut, Cut) {
+        let bound = bind_single_table(&parse_expr_sql(where_sql), sch).unwrap();
+        let c = best_index_bound(&bound, sch, || Ok(idx_metas_flagged(lists)))
+            .unwrap()
+            .expect("the WHERE must bound some index");
+        (c.idx_cols.as_slice().to_vec(), c.desc.start, c.desc.end)
+    }
+
+    /// A full point on a UNIQUE index beats a two-sided interval on another index,
+    /// on a signed column (where both score 2 and the stable sort favoured the
+    /// range) and on an unsigned one (where the point's `Before(0)` start scores 1).
+    #[test]
+    fn full_unique_point_beats_an_interval() {
+        for (tc, pt) in [(TypeCode::U64, "5"), (TypeCode::I64, "5")] {
+            let sch = typed_schema(tc);
+            let where_sql = format!("a = {pt} AND b BETWEEN 1 AND 9");
+            let (cols, start, end) = picked(&where_sql, &sch, &[(&[1], true), (&[2], false)]);
+            assert_eq!(cols, vec![1], "{tc:?}: the unique point on `a` must win");
+            assert_eq!((start, end), (Cut::Before(5), Cut::After(5)));
+        }
+    }
+
+    /// The same at both type edges of both signednesses — the point's cuts coincide
+    /// with `type_edges` there, so its magnitude score is at its worst.
+    #[test]
+    fn full_unique_point_wins_at_the_type_edges() {
+        for (tc, lit) in [
+            (TypeCode::U64, "0"),
+            (TypeCode::U64, "18446744073709551615"),
+            (TypeCode::I64, "-9223372036854775808"),
+            (TypeCode::I64, "9223372036854775807"),
+        ] {
+            let sch = typed_schema(tc);
+            let where_sql = format!("a = {lit} AND b BETWEEN 1 AND 9");
+            let (cols, ..) = picked(&where_sql, &sch, &[(&[1], true), (&[2], false)]);
+            assert_eq!(cols, vec![1], "{tc:?} `a = {lit}` must win");
+        }
+    }
+
+    /// Without the UNIQUE flag the magnitude score decides as before: the interval
+    /// on `b` takes the signed tie.
+    #[test]
+    fn a_non_unique_point_still_loses_the_tie() {
+        let sch = typed_schema(TypeCode::I64);
+        let (cols, ..) = picked("a = 5 AND b BETWEEN 1 AND 9", &sch, &[(&[1], false), (&[2], false)]);
+        assert_eq!(cols, vec![2], "two candidates at score 2: the range collector's wins");
+    }
+
+    /// A point on a PREFIX of a UNIQUE index is not a unique point: it leaves the
+    /// index's trailing column free, so the interval keeps the tie.
+    #[test]
+    fn a_partial_prefix_of_a_unique_index_is_not_a_unique_point() {
+        // `(id U64 pk, a I64, b I64, c I64)` — `b` non-nullable, or the partial
+        // candidate is rejected outright by `uncovered_trailing_nullable`.
+        let sch = Schema {
+            columns: vec![
+                col_def("id", TypeCode::U64, false),
+                col_def("a", TypeCode::I64, false),
+                col_def("b", TypeCode::I64, false),
+                col_def("c", TypeCode::I64, false),
+            ],
+            pk_cols: vec![0],
+        };
+        let (cols, ..) = picked("a = 5 AND c BETWEEN 1 AND 9", &sch, &[(&[1, 2], true), (&[3], false)]);
+        assert_eq!(
+            cols,
+            vec![3],
+            "a prefix point on UNIQUE(a, b) selects more than one row"
+        );
+    }
+
+    /// The uniqueness lookup is not seek-only: a degenerate point the RANGE
+    /// collector produced (`a >= 5 AND a <= 5`) is scored unique too.
+    #[test]
+    fn a_range_collectors_point_is_scored_unique() {
+        let sch = typed_schema(TypeCode::I64);
+        let (cols, start, end) = picked(
+            "a >= 5 AND a <= 5 AND b BETWEEN 1 AND 9",
+            &sch,
+            &[(&[1], true), (&[2], false)],
+        );
+        assert_eq!(cols, vec![1]);
+        assert_eq!((start, end), (Cut::Before(5), Cut::After(5)));
     }
 }

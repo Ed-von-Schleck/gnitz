@@ -99,7 +99,7 @@ mod index_router;
 mod preflight;
 mod unique_filter;
 
-pub(crate) use dispatch::TxnFit;
+pub(crate) use dispatch::{scan_spec_route, TxnFit};
 #[cfg(test)]
 pub(crate) use preflight::PreflightAccumulator;
 pub(crate) use preflight::TxnFamily;

@@ -8,7 +8,9 @@
 //! `RangeDescriptor`) to its half-open `[start, end)` OPK key range — the one
 //! derivation behind both the secondary-index range walk (`index_range_keys`)
 //! and the base-PK range bound (`pk_range_keys`), which differ only in how a
-//! cut value encodes to its OPK group prefix.
+//! cut value encodes to its OPK group prefix. `range_shares_prefix` then answers
+//! whether such a range stays inside one distribution-prefix group, which is what
+//! lets a bounded read route to a single worker.
 //!
 //! `range_cut_points` derives the half-open `[start, end)` byte interval one
 //! range-join term walks over the other side's reindex trace, implementing the
@@ -32,6 +34,18 @@ pub(crate) fn increment_key_in_place(p: &mut [u8]) -> bool {
         }
     }
     false
+}
+
+/// Fixed-width byte-string predecessor: `p - 1` with borrow, in place — the
+/// mirror of [`increment_key_in_place`]. An all-zero `p` borrows out and wraps to
+/// all-`0xFF`; the sole caller never passes one.
+fn decrement_key_in_place(p: &mut [u8]) {
+    for b in p.iter_mut().rev() {
+        *b = b.wrapping_sub(1);
+        if *b != 0xFF {
+            return;
+        }
+    }
 }
 
 /// Map `range`'s cut pair to its half-open `[start, end)` OPK key range over a
@@ -71,6 +85,27 @@ pub(crate) fn range_keys_from_cuts(
         return None;
     }
     Some((start, end))
+}
+
+/// True when every key in a half-open `[start, end)` range from
+/// [`range_keys_from_cuts`] shares its leading `prefix` bytes. Since OPK order IS
+/// byte order, it is enough that the range's first and last keys agree there.
+///
+/// The last key is `end - 1`, undoing the `After` successor (and any carry ripple)
+/// the cut derivation applied — `Some(end)` only ever comes back with
+/// `start < end`, so the decrement cannot borrow out. `end == None` means the end
+/// cut carried out and the range runs to the table end, whose last key is
+/// all-`0xFF`.
+pub(crate) fn range_shares_prefix(start: &PkBuf, end: Option<&PkBuf>, prefix: usize) -> bool {
+    let last = match end {
+        Some(e) => {
+            let mut l = *e;
+            decrement_key_in_place(&mut l.bytes[..l.len as usize]);
+            l
+        }
+        None => PkBuf::from_bytes(&[0xFFu8; MAX_PK_BYTES][..start.len as usize]),
+    };
+    start.pk_bytes()[..prefix] == last.pk_bytes()[..prefix]
 }
 
 /// Half-open `[start, end)` cut points over the trace PK space for one delta
@@ -176,6 +211,43 @@ mod tests {
     fn succ_empty_carries_out() {
         let mut k: [u8; 0] = [];
         assert!(!increment_key_in_place(&mut k));
+    }
+
+    // --- range_shares_prefix ----------------------------------------------
+
+    fn buf(bytes: &[u8]) -> PkBuf {
+        PkBuf::from_bytes(bytes)
+    }
+
+    /// The last key is `end - 1`, so a range ending exactly at the next group's
+    /// first key still shares the prefix — one past that does not.
+    #[test]
+    fn shares_prefix_stops_at_the_group_boundary() {
+        let start = buf(&[0x07, 0x00]);
+        assert!(
+            range_shares_prefix(&start, Some(&buf(&[0x07, 0x01])), 1),
+            "one key wide"
+        );
+        assert!(
+            range_shares_prefix(&start, Some(&buf(&[0x08, 0x00])), 1),
+            "the whole group"
+        );
+        assert!(
+            !range_shares_prefix(&start, Some(&buf(&[0x08, 0x01])), 1),
+            "one key past"
+        );
+        // A borrow chain out of the trailing byte still lands in the group.
+        assert!(range_shares_prefix(&buf(&[0x07, 0x05]), Some(&buf(&[0x08, 0x00])), 1));
+    }
+
+    /// `end == None` runs to the table end (all-`0xFF`), which only the topmost
+    /// group shares a prefix with — that is what confines a maximal-value point.
+    #[test]
+    fn shares_prefix_handles_an_unbounded_end() {
+        assert!(range_shares_prefix(&buf(&[0xFF, 0xFF]), None, 1));
+        assert!(!range_shares_prefix(&buf(&[0x07, 0x00]), None, 1));
+        // A zero-width distribution prefix is shared by everything.
+        assert!(range_shares_prefix(&buf(&[0x07, 0x00]), None, 0));
     }
 
     // --- range_cut_points -------------------------------------------------

@@ -62,6 +62,8 @@ pub(crate) use sys_tables::{IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PA
 // wire roundtrip test, which decodes a client-encoded bundle against it.
 pub(crate) use cache::SchemaWireEntry;
 pub(crate) use metadata::CachedSchemaWire;
+// The master's ScanSpec confinement test.
+pub(crate) use scan_spec::scan_spec_partition;
 pub(crate) use sys_tables::sys_tab_schema;
 pub(crate) use types::ColumnDef;
 

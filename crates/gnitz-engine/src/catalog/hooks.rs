@@ -526,9 +526,7 @@ impl CatalogEngine {
                 // circuit's `circuit_nodes` are persisted before this VIEW_TAB row,
                 // so `get_source_ids` resolves here.
                 let source_ids = self.dag.get_source_ids(vid);
-                let has_replicated_source = source_ids
-                    .iter()
-                    .any(|id| self.dag.tables.get(id).is_some_and(|e| e.schema.replicated()));
+                let has_replicated_source = self.dag.view_has_replicated_source(vid);
                 let et = self.with_staged_dir(directory.clone(), |s| {
                     s.build_partitioned_storage(kind, &directory, &name, vid, view_schema, has_replicated_source)
                 })?;

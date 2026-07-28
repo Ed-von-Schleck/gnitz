@@ -64,6 +64,16 @@ impl StoreHandle {
         }
     }
 
+    /// Dispatched [`PartitionedTable::cursor_may_hold_key`]. A borrowed system
+    /// table is one unpartitioned `Table` that `open_cursor` reads whole, so it
+    /// can hold any key.
+    pub fn cursor_may_hold_key(&self, key: &[u8]) -> bool {
+        match self {
+            StoreHandle::Borrowed(_) => true,
+            StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).cursor_may_hold_key(key) },
+        }
+    }
+
     /// Dispatched `has_pk` that works for every variant. Takes a **native**
     /// `u128`; routes via `opk_key` internally. Never feed it `get_pk`
     /// (OPK-widened) — use [`has_pk_bytes`] for verbatim OPK bytes.

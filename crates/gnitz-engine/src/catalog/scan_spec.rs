@@ -190,7 +190,7 @@ impl CatalogEngine {
                         "scan_spec: PkSet gather requires a single-column PK (table {source})"
                     ));
                 }
-                let cursor = self.table_entry(source)?.handle.open_cursor();
+                let handle = &self.table_entry(source)?.handle;
                 let stride = src_schema.pk_stride() as usize;
                 // Encode each native key to its OPK image and sort byte-wise:
                 // OPK order IS typed PK order, so the gather below is one
@@ -208,8 +208,27 @@ impl CatalogEngine {
                     })
                     .collect();
                 opk_keys.sort_unstable();
+                // Trust boundary, second half: two distinct wire keys can share one
+                // OPK image (`opk_key` truncates to `pk_stride`, so `5` and
+                // `5 + 2^64` are the same U64 PK), which the decoder's schema-free
+                // view cannot see. The sort makes such a pair adjacent; left in, it
+                // would emit its row twice. Checked before the ownership filter so
+                // every worker returns the same verdict.
+                if let Some(w) = opk_keys.windows(2).find(|w| w[0] == w[1]) {
+                    return Err(format!(
+                        "scan_spec: PkSet duplicate key {:?} (table {source})",
+                        &w[0][..stride]
+                    ));
+                }
+                // Drop the keys this worker's cursor provably cannot reach: the
+                // request is broadcast, so at W workers every worker would
+                // otherwise probe all N keys to answer N/W of them.
+                opk_keys.retain(|key| handle.cursor_may_hold_key(&key[..stride]));
+                if opk_keys.is_empty() {
+                    return Ok(ScanSpecCursor::Source(SourceCursor::Empty));
+                }
                 Ok(ScanSpecCursor::PkSet(Box::new(PkSetGather {
-                    cursor,
+                    cursor: handle.open_cursor(),
                     keys: opk_keys,
                     stride,
                     next: 0,
@@ -568,6 +587,21 @@ fn pk_range_keys(schema: &SchemaDescriptor, range: &RangeDescriptor) -> Result<O
     ))
 }
 
+/// The one partition every row matching `range` can live in, or `None` when the
+/// range spans partitions (or is provably empty) — the master's confinement test,
+/// which turns a broadcast into a unicast.
+///
+/// `partition_for_pk` hashes only `key[..dist_stride]`, so the range is confined
+/// iff every key in it shares that prefix, which `range_shares_prefix` decides
+/// from the range's first and last keys. Partition ids are `mix(pk) >> 56` and so
+/// not monotone in key order; a prefix match over the whole range is what makes
+/// the single hash of `start` speak for all of it.
+pub(crate) fn scan_spec_partition(schema: &SchemaDescriptor, range: &RangeDescriptor) -> Option<usize> {
+    let (start, end) = pk_range_keys(schema, range).ok().flatten()?;
+    crate::storage::range_shares_prefix(&start, end.as_ref(), schema.dist_stride() as usize)
+        .then(|| schema.partition_for_pk(start.pk_bytes()))
+}
+
 /// Decode + validate a client predicate blob against `schema`, then build its
 /// predicate `ScalarFunc` — the same path the circuit compiler runs. Any failure
 /// is a corrupt frame (the client pre-compiled the identical program at plan time).
@@ -597,8 +631,8 @@ fn compile_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::type_code;
-    use crate::test_support::pk_only_schema;
+    use crate::schema::{type_code, SchemaColumn};
+    use crate::test_support::{opk_pk, pk_only_schema};
     use gnitz_wire::Cut::{After, Before};
 
     fn opk_u64(v: u64) -> Vec<u8> {
@@ -698,5 +732,110 @@ mod tests {
         let s = pk_only_schema(&[type_code::U64]);
         let d = RangeDescriptor::new(&[5], Before(0), After(0));
         assert!(pk_range_keys(&s, &d).is_err());
+    }
+
+    // ── scan_spec_partition — the master's confinement test ──────────────────
+
+    /// A full point is confined to the partition of its own PK bytes, at every PK
+    /// shape — single, wide, and compound (where the point pins the leading
+    /// columns through `eq_vals` and points at the last).
+    #[test]
+    fn scan_spec_partition_confines_a_full_point() {
+        let u64s = pk_only_schema(&[type_code::U64]);
+        assert_eq!(
+            scan_spec_partition(&u64s, &RangeDescriptor::new(&[], Before(42), After(42))),
+            Some(u64s.partition_for_pk(&opk_pk(&u64s, &[42])))
+        );
+
+        let u128s = pk_only_schema(&[type_code::U128]);
+        let wide = (1u128 << 100) | 7;
+        assert_eq!(
+            scan_spec_partition(&u128s, &RangeDescriptor::new(&[], Before(wide), After(wide))),
+            Some(u128s.partition_for_pk(&opk_pk(&u128s, &[wide])))
+        );
+
+        let comp = pk_only_schema(&[type_code::U32, type_code::U64]);
+        assert_eq!(
+            scan_spec_partition(&comp, &RangeDescriptor::new(&[9], Before(4), After(4))),
+            Some(comp.partition_for_pk(&opk_pk(&comp, &[9, 4])))
+        );
+    }
+
+    /// With `dist_prefix_len = 1` every row sharing the leading column lands in one
+    /// partition, so pinning it and ranging the trailing column is confined —
+    /// to the same partition full points on `(a, b)` reach. At the full-PK default
+    /// the same bound spans partitions.
+    #[test]
+    fn scan_spec_partition_follows_the_distribution_prefix() {
+        let cols = [
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+        ];
+        let prefix = SchemaDescriptor::new_with_dist(&cols, &[0, 1], 1);
+        // `a = 7 AND b > 3` — a whole trailing-column range inside one `a` group.
+        let ranged = RangeDescriptor::new(&[7], After(3), After(u64::MAX as u128));
+        let want = prefix.partition_for_pk(&opk_pk(&prefix, &[7, 0]));
+        assert_eq!(scan_spec_partition(&prefix, &ranged), Some(want));
+        for b in [4u128, u64::MAX as u128] {
+            assert_eq!(
+                scan_spec_partition(&prefix, &RangeDescriptor::new(&[7], Before(b), After(b))),
+                Some(want),
+                "a full point on (7, {b}) shares the group's partition"
+            );
+        }
+
+        let full = SchemaDescriptor::new_with_dist(&cols, &[0, 1], 2);
+        assert_eq!(
+            scan_spec_partition(&full, &ranged),
+            None,
+            "hashing the whole PK spreads one `a` group across partitions"
+        );
+    }
+
+    /// A maximal-value point carries out of `succ`, so its range has no `end` —
+    /// the all-`0xFF` last key must still confine it rather than broadcast. The
+    /// signed maximum's OPK is all-`0xFF` too (sign-flip).
+    #[test]
+    fn scan_spec_partition_confines_a_maximal_point() {
+        for tc in [type_code::U64, type_code::I64] {
+            let s = pk_only_schema(&[tc]);
+            let max = if tc == type_code::U64 {
+                u64::MAX as u128
+            } else {
+                i64::MAX as u128
+            };
+            let d = RangeDescriptor::new(&[], Before(max), After(max));
+            assert!(
+                pk_range_keys(&s, &d).unwrap().unwrap().1.is_none(),
+                "After(max) carries out"
+            );
+            assert_eq!(
+                scan_spec_partition(&s, &d),
+                Some(s.partition_for_pk(&opk_pk(&s, &[max])))
+            );
+        }
+    }
+
+    /// A range wider than one partition's key span is not confinable: partition
+    /// ids are `mix(pk) >> 56`, not monotone in key order, so only a whole-range
+    /// prefix match proves confinement. A provably-empty range is not confinable
+    /// either — the worker answers it (a fold sink still owes its ground row).
+    #[test]
+    fn scan_spec_partition_declines_a_multi_key_range() {
+        let s = pk_only_schema(&[type_code::U64]);
+        assert_eq!(
+            scan_spec_partition(&s, &RangeDescriptor::new(&[], Before(0), After(1000))),
+            None
+        );
+        assert_eq!(
+            scan_spec_partition(&s, &RangeDescriptor::new(&[], After(1000), Before(0))),
+            None,
+            "an inverted range is provably empty"
+        );
+        // Unbounded above from a non-maximal start: the last key is 0xFF…FF.
+        assert_eq!(
+            scan_spec_partition(&s, &RangeDescriptor::new(&[], Before(5), After(u64::MAX as u128))),
+            None
+        );
     }
 }

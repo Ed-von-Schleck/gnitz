@@ -33,6 +33,12 @@ def _positive(rows):
     return [r for r in rows if r.weight > 0]
 
 
+def _rows(client, sn, q):
+    res = client.execute_sql(q, schema_name=sn)[0]
+    assert res["type"] == "Rows", f"expected Rows, got {res['type']}: {res}"
+    return list(res["rows"])
+
+
 def _select_pks(client, sql, sn):
     """Sorted list of positive-weight PKs from a SQL SELECT — duplicates kept, so
     a ×W read inflation (the same row returned once per worker) shows up as
@@ -972,5 +978,72 @@ def test_replicated_equi_in_subquery(client):
         client.execute_sql("INSERT INTO b VALUES (1,1),(2,3)", schema_name=sn)
 
         assert _wmap(client.scan(vin), "v") == {100: 1, 300: 1, 400: 1}
+    finally:
+        client.drop_schema(sn)
+
+
+# ---------------------------------------------------------------------------
+# Bounded reads (ScanSpec) vs. the single-partition confinement gate
+# ---------------------------------------------------------------------------
+
+
+@_NEEDS_MULTI
+def test_replicated_pk_in_returns_every_key(client):
+    """`pk IN (…)` over a replicated table single-sources worker 0, whose store
+    holds one child covering the whole local dataset. Filtering its keys by
+    partition ownership there would drop most of the result."""
+    sn = "r" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL) "
+            "WITH (replicated = true)",
+            schema_name=sn,
+        )
+        vals = ",".join(f"({i}, {i * 7})" for i in range(200))
+        client.execute_sql(f"INSERT INTO dim VALUES {vals}", schema_name=sn)
+        wanted = list(range(0, 200, 3))
+        in_list = ",".join(str(v) for v in wanted)
+        rows = _rows(client, sn, f"SELECT id, v FROM dim WHERE id IN ({in_list})")
+        assert sorted(r.id for r in rows) == wanted
+        assert all(r.v == r.id * 7 for r in rows)
+    finally:
+        client.drop_schema(sn)
+
+
+@_NEEDS_MULTI
+def test_mixed_source_view_bounded_read_returns_every_row(client):
+    """A view with SOME replicated source (not all) is built single-partition, so
+    its rows are NOT keyed by the PK hash — a bounded read of it must broadcast.
+    Confining it would silently answer from one worker and come up empty."""
+    sn = "r" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, name BIGINT NOT NULL) "
+            "WITH (replicated = true)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE TABLE fact (id BIGINT NOT NULL PRIMARY KEY, dim_id BIGINT NOT NULL, "
+            "amount BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW j AS SELECT f.id AS fid, d.name AS name, f.amount AS amount "
+            "FROM fact f JOIN dim d ON f.dim_id = d.id",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "INSERT INTO dim VALUES (1, 100), (2, 200), (3, 300)", schema_name=sn)
+        vals = ",".join(f"({i}, {i % 3 + 1}, {i * 10})" for i in range(60))
+        client.execute_sql(f"INSERT INTO fact VALUES {vals}", schema_name=sn)
+
+        rows = _rows(client, sn, "SELECT fid, amount FROM j WHERE fid < 20")
+        assert sorted(r.fid for r in rows) == list(range(20))
+        assert all(r.amount == r.fid * 10 for r in rows)
+        # A point on the same view.
+        rows = _rows(client, sn, "SELECT amount FROM j WHERE fid = 47")
+        assert [r.amount for r in rows] == [470]
     finally:
         client.drop_schema(sn)

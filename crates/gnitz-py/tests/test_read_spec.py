@@ -33,8 +33,8 @@ def _cleanup(client, sn, *names):
         pass
 
 
-def _insert_range(client, sn, table, pairs):
-    vals = ",".join(f"({a}, {b})" for a, b in pairs)
+def _insert_range(client, sn, table, rows):
+    vals = ",".join("(" + ",".join(str(v) for v in row) + ")" for row in rows)
     client.execute_sql(f"INSERT INTO {table} VALUES {vals}", schema_name=sn)
 
 
@@ -139,6 +139,107 @@ def test_pk_in_large(client):
         in_list = ",".join(str(v) for v in [3, 17, 500, 999, 12345])
         rows = _rows(client, sn, f"SELECT id FROM t WHERE id IN ({in_list})")
         assert sorted(r.id for r in rows) == [3, 17, 500, 999]
+    finally:
+        _cleanup(client, sn, "t")
+
+
+# ---------------------------------------------------------------------------
+# Single-partition confinement: a PK range that provably lands on one worker is
+# unicast rather than broadcast. Every test here fails as a SHORT result (rows
+# answered by the wrong worker are simply absent), never as a wrong value.
+# ---------------------------------------------------------------------------
+
+
+def test_point_select_on_compound_pk(client):
+    """A full point on a compound PK: the range is one key wide, so it unicasts
+    to the worker owning that key's partition."""
+    sn = "rs" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (a BIGINT NOT NULL, b BIGINT NOT NULL, v BIGINT, PRIMARY KEY (a, b))",
+            schema_name=sn,
+        )
+        vals = ",".join(f"({a}, {b}, {a * 100 + b})" for a in range(6) for b in range(6))
+        client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
+        for a, b in [(0, 0), (3, 4), (5, 5)]:
+            rows = _rows(client, sn, f"SELECT v FROM t WHERE a = {a} AND b = {b}")
+            assert [r.v for r in rows] == [a * 100 + b], f"({a}, {b})"
+    finally:
+        _cleanup(client, sn, "t")
+
+
+def test_cluster_by_prefix_range_returns_every_row(client):
+    """With `CLUSTER BY a` every row sharing `a` lands in one partition, so a
+    bound pinning `a` and ranging `b` is confined — and must still return the
+    whole group, not the one key the range starts at."""
+    sn = "rs" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (a BIGINT NOT NULL, b BIGINT NOT NULL, v BIGINT, "
+            "PRIMARY KEY (a, b)) CLUSTER BY a",
+            schema_name=sn,
+        )
+        vals = ",".join(f"({a}, {b}, {a * 100 + b})" for a in range(4) for b in range(10))
+        client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
+        rows = _rows(client, sn, "SELECT b FROM t WHERE a = 2 AND b BETWEEN 3 AND 7")
+        assert sorted(r.b for r in rows) == [3, 4, 5, 6, 7]
+        # The whole `a` group, unbounded above.
+        rows = _rows(client, sn, "SELECT b FROM t WHERE a = 2 AND b >= 0")
+        assert sorted(r.b for r in rows) == list(range(10))
+    finally:
+        _cleanup(client, sn, "t")
+
+
+def test_point_select_on_partitioned_view(client):
+    """A view over a non-replicated source has a hash-partitioned output store,
+    so a point on its key is confinable — and must find its row."""
+    sn = "rs" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql("CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT, v BIGINT)", schema_name=sn)
+        client.execute_sql(
+            "CREATE VIEW agg AS SELECT g, SUM(v) AS total FROM t GROUP BY g",
+            schema_name=sn,
+        )
+        _insert_range(client, sn, "t", [(i, i % 5, i) for i in range(40)])
+        for g in range(5):
+            rows = _rows(client, sn, f"SELECT total FROM agg WHERE g = {g}")
+            assert [r.total for r in rows] == [sum(i for i in range(40) if i % 5 == g)], f"g={g}"
+    finally:
+        _cleanup(client, sn, "agg", "t")
+
+
+def test_empty_pk_range_count_returns_zero(client):
+    """A provably-empty PK range skips the fan-out for a rows sink — but a fold
+    still owes its ground row, so COUNT(*) must answer 0, not an empty result."""
+    sn = "rs" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)", schema_name=sn)
+        _insert_range(client, sn, "t", [(i, i) for i in range(20)])
+        rows = _rows(client, sn, "SELECT COUNT(*) AS c FROM t WHERE id > 10 AND id < 5")
+        assert [r.c for r in rows] == [0]
+        # The rows sink over the same empty range is genuinely empty.
+        assert _rows(client, sn, "SELECT id FROM t WHERE id > 10 AND id < 5") == []
+    finally:
+        _cleanup(client, sn, "t")
+
+
+def test_pk_in_spans_every_partition(client):
+    """`pk IN (…)` broadcasts and each worker keeps only the keys it can own —
+    a filter that must mirror the cursor exactly, or the result comes up short."""
+    sn = "rs" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)", schema_name=sn)
+        _insert_range(client, sn, "t", [(i, i * 3) for i in range(400)])
+        wanted = list(range(0, 400, 3))
+        in_list = ",".join(str(v) for v in wanted)
+        rows = _rows(client, sn, f"SELECT id, v FROM t WHERE id IN ({in_list})")
+        assert sorted(r.id for r in rows) == wanted
+        assert all(r.v == r.id * 3 for r in rows)
     finally:
         _cleanup(client, sn, "t")
 
