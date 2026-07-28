@@ -3,7 +3,7 @@ use crate::agg::reject_min_max_unorderable;
 use crate::ast_util::{classify_agg_call, fn_name_is, function_positional_args, single_relation_col_name};
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BExpr, BinOp, BoundExpr, UnaryOp};
-use gnitz_core::Schema;
+use gnitz_core::{ColumnDef, Schema};
 use sqlparser::ast::{BinaryOperator, CaseWhen, Expr, Function, UnaryOperator, Value};
 
 /// Bind an expression against a single-relation schema (WHERE, projections,
@@ -315,21 +315,33 @@ pub(crate) fn fold_null_test<R>(nullable: bool, r: R, want_null: bool) -> BExpr<
     }
 }
 
+/// The position of an `Identifier` / two-part `CompoundIdentifier` within one
+/// relation's columns. The qualifier on a compound ref is informational in a
+/// single-relation context (it carries no disambiguating information — a
+/// duplicated name is ambiguous even when qualified).
+///
+/// The one home for the single-relation resolve contract — the "expected a column
+/// reference" / "column not found" pair and the ambiguity error `find_unique_column`
+/// raises — shared by the runtime `SingleTable` leaf (columns by slice) and the HIR
+/// `HirSingleTable` leaf (columns behind `HirCol`), which resolve to a `usize` and a
+/// `ColId` respectively off the same index.
+pub(crate) fn single_relation_col_idx<'a>(
+    cols: impl IntoIterator<Item = &'a ColumnDef>,
+    e: &Expr,
+) -> Result<usize, GnitzSqlError> {
+    let name =
+        single_relation_col_name(e).ok_or_else(|| GnitzSqlError::Unsupported("expected a column reference".into()))?;
+    find_unique_column(cols, name)?.ok_or_else(|| GnitzSqlError::Bind(format!("column '{name}' not found")))
+}
+
 /// Leaf for a single-relation schema (WHERE, projections, set-ops, DML).
 pub(crate) struct SingleTable<'a> {
     pub schema: &'a Schema,
 }
 
 impl SingleTable<'_> {
-    /// The column index of an `Identifier` / two-part `CompoundIdentifier`. The
-    /// qualifier on a compound ref is informational in a single-table context
-    /// (it carries no disambiguating information — a duplicated name is ambiguous
-    /// even when qualified).
     fn idx(&self, e: &Expr) -> Result<usize, GnitzSqlError> {
-        let name = single_relation_col_name(e)
-            .ok_or_else(|| GnitzSqlError::Unsupported("expected a column reference".into()))?;
-        find_unique_column(&self.schema.columns, name)?
-            .ok_or_else(|| GnitzSqlError::Bind(format!("column '{name}' not found")))
+        single_relation_col_idx(&self.schema.columns, e)
     }
 }
 

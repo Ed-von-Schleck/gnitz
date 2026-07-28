@@ -133,8 +133,8 @@ fn classify_on(on: &[HirExpr], left_cols: &[HirCol], right_cols: &[HirCol]) -> R
                             tc,
                         });
                     }
-                    (_, Some((lc, rc, swapped))) if binop_to_range_rel(*op).is_some() && range.is_none() => {
-                        let rel = binop_to_range_rel(*op).expect("range rel present");
+                    (_, Some((lc, rc, swapped))) if range.is_none() && binop_to_range_rel(*op).is_some() => {
+                        let rel = binop_to_range_rel(*op).expect("guarded above");
                         let op = if swapped { converse_rel(rel) } else { rel };
                         let tc = validate_range_join_key_pair(def_of(left_cols, lc), def_of(right_cols, rc))?;
                         range = Some(HirRange {
@@ -544,8 +544,7 @@ fn substitute(e: &HirExpr, subst: &HashMap<*const RelExpr, HirExpr>) -> Result<H
         },
         &|r, want_null| match r {
             HirRef::Subquery(s) => null_subst(s, want_null),
-            HirRef::Col(_) if want_null => Ok(BExpr::IsNull(r.clone())),
-            HirRef::Col(_) => Ok(BExpr::IsNotNull(r.clone())),
+            HirRef::Col(_) => Ok(fold_null_test(true, r.clone(), want_null)),
         },
     )
 }

@@ -7,8 +7,8 @@
 //! (`resolve_table_factor`), never a segment.
 
 use super::{
-    as_col, bind_and_lower, col_by_id, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, InPair, ProjEntry, RelExpr,
-    SetOpKind, SubqueryKind, SubqueryRef,
+    as_col, bind_and_lower, col_by_id, widen_if, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, InPair, JoinType,
+    ProjEntry, RelExpr, SetOpKind, SubqueryKind, SubqueryRef,
 };
 use crate::agg::{agg_output_nullable, agg_typing, default_agg_name, finalize_agg_bexpr, reject_min_max_unorderable};
 use crate::ast_util::{
@@ -18,7 +18,7 @@ use crate::ast_util::{
     reject_unsupported_fn_qualifiers, single_relation_col_name, FromShape,
 };
 use crate::bind::{apply_positional_aliases, cte_passthrough};
-use crate::bind::{bind_structural, find_unique_column, fold_null_test, Binder, LeafBinder};
+use crate::bind::{bind_structural, find_unique_column, fold_null_test, single_relation_col_idx, Binder, LeafBinder};
 use crate::error::GnitzSqlError;
 use crate::hir::chain::ViewChain;
 use crate::hir::guards::join_on_and_type;
@@ -202,7 +202,7 @@ fn bind_linear_select(
     let (source, outer_alias, env) = resolve_table_factor(client, binder, ids, &select.from[0].relation)?;
 
     // A subquery-carrying single-table body (EXISTS/IN, scalar aggregate, ANY/ALL)
-    // routes to the record→bind→lookup two-pass, which binds each subquery as a
+    // routes to the subquery-aware leaf, which binds each subquery as a
     // `HirRef::Subquery` leaf for decorrelation. GROUP BY / DISTINCT cannot host a
     // subquery in one circuit: EXISTS/IN + GROUP BY gets the targeted message here,
     // and every other combination falls through to the plain leaf's per-kind
@@ -377,11 +377,7 @@ struct HirSingleTable<'a> {
 impl HirSingleTable<'_> {
     /// The env column of an `Identifier` / two-part `CompoundIdentifier`.
     fn resolve(&self, e: &Expr) -> Result<&HirCol, GnitzSqlError> {
-        let name = single_relation_col_name(e)
-            .ok_or_else(|| GnitzSqlError::Unsupported("expected a column reference".into()))?;
-        let idx = find_unique_column(self.env.iter().map(|c| &c.def), name)?
-            .ok_or_else(|| GnitzSqlError::Bind(format!("column '{name}' not found")))?;
-        Ok(&self.env[idx])
+        Ok(&self.env[single_relation_col_idx(self.env.iter().map(|c| &c.def), e)?])
     }
 }
 
@@ -413,24 +409,17 @@ impl LeafBinder<HirRef> for HirSingleTable<'_> {
 
 // ── Subquery binding (EXISTS/IN, scalar aggregate, ANY/ALL) ──────────────────────
 //
-// A subquery-carrying single-table linear body binds in a record→bind→lookup
-// two-pass, both passes over the real `bind_structural` (so every desugar/fold the
-// structural recursion performs — COALESCE truncation at a never-NULL COUNT,
-// provably-non-null elision, CASE short-circuit — is reached for free): pass 1
-// records each subquery node's pointer into an interior-mutable Vec (a push, no
-// binder borrow, so nested subqueries recurse at the phase level); the recorded
-// nodes are then bound with `&mut client, &mut binder` into a pointer-keyed map of
-// `HirRef::Subquery` leaves; pass 2 re-runs the walk, substituting each recorded
-// node with its bound leaf. Decorrelation (`hir::rewrite`) consumes the leaves.
+// A subquery-carrying single-table linear body binds in ONE pass over the real
+// `bind_structural`, so every desugar/fold the structural recursion performs —
+// COALESCE truncation at a never-NULL COUNT, provably-non-null elision, CASE
+// short-circuit — is reached for free. `SubqueryLeaf` binds each subquery node to a
+// `HirRef::Subquery` leaf where the walk meets it, reaching `&mut client, &mut
+// binder` through a `RefCell` (the `LeafBinder` methods take `&self`). Decorrelation
+// (`hir::rewrite`) consumes the leaves.
 
-/// Whether a function call names a supported aggregate — the one home of that
-/// test, so every surface that has to route an aggregate differently (the
-/// expression-context rejection, the scalar-subquery shape check, aggregate
-/// collection, and the two HAVING/grouped leaf binders) agrees on what counts as
-/// an aggregate call.
 /// Whether an expression node is itself a subquery of any kind (an opaque leaf to
 /// the structural walk) — the `SubqueryLeaf` uses it to route an `IS [NOT] NULL`
-/// over a subquery through the record/lookup pass.
+/// over a subquery operand to the subquery bind rather than to a column resolve.
 fn is_subquery_expr(e: &Expr) -> bool {
     matches!(
         e,
@@ -438,21 +427,26 @@ fn is_subquery_expr(e: &Expr) -> bool {
     )
 }
 
-/// A subquery node bound for decorrelation: the value expression its leaf
-/// contributes where it sits, and whether that value is provably never NULL (an
-/// EXISTS/IN test or a COUNT — folds `IS [NOT] NULL` / COALESCE to a constant).
-struct BoundSub {
-    value: HirExpr,
-    never_null: bool,
+/// Whether a bound subquery's value is provably never NULL — an EXISTS/IN test
+/// (`0/1`) or a COUNT. Derived from the leaf rather than carried alongside it, so
+/// [`SubqueryRef::never_null`] stays the one home of the rule: only a bare
+/// subquery leaf can be never-NULL, since every composite shape
+/// (`bind_quantifier_sub`'s 3VL wrapper) is a comparison over a nullable operand.
+fn value_never_null(value: &HirExpr) -> bool {
+    matches!(value, BExpr::ColRef(HirRef::Subquery(s)) if s.never_null())
 }
 
-/// The mutable compilation state a subquery bind needs, behind one `RefCell` so
-/// the leaf can reach it from `LeafBinder`'s `&self`. Borrowed only for the
-/// duration of a single `bind_one_subquery` call, which never re-enters this leaf
-/// (a nested subquery is rejected by the inner correlation leaf).
-struct SubCtx<'a, 'b> {
+/// Everything a subquery bind resolves against: the two mutable compilation
+/// handles plus the outer scope it correlates to. Behind one `RefCell` on the leaf,
+/// so `LeafBinder`'s `&self` methods can reach it; borrowed only for the duration of
+/// a single `bind_one_subquery` call, which never re-enters this leaf (a nested
+/// subquery is rejected by the inner correlation leaf).
+struct SubCtx<'a, 'b, 'c> {
     client: &'a mut GnitzClient,
     binder: &'a mut Binder<'b>,
+    ids: &'c ColIdGen,
+    outer_env: &'c [HirCol],
+    outer_alias: &'c str,
 }
 
 /// The outer single-table leaf extended with subquery handling: it binds an
@@ -460,17 +454,12 @@ struct SubCtx<'a, 'b> {
 /// place, delegating every other decision to the inner `HirSingleTable`.
 struct SubqueryLeaf<'a, 'b, 'c> {
     inner: HirSingleTable<'c>,
-    ctx: RefCell<SubCtx<'a, 'b>>,
-    ids: &'c ColIdGen,
-    env: &'c [HirCol],
-    outer_alias: &'c str,
+    ctx: RefCell<SubCtx<'a, 'b, 'c>>,
 }
 
 impl SubqueryLeaf<'_, '_, '_> {
-    fn bind_sub(&self, e: &Expr) -> Result<BoundSub, GnitzSqlError> {
-        let mut ctx = self.ctx.borrow_mut();
-        let SubCtx { client, binder } = &mut *ctx;
-        bind_one_subquery(client, binder, self.ids, self.env, self.outer_alias, e)
+    fn bind_sub(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
+        bind_one_subquery(&mut self.ctx.borrow_mut(), e)
     }
 }
 
@@ -486,14 +475,14 @@ impl LeafBinder<HirRef> for SubqueryLeaf<'_, '_, '_> {
         if !is_subquery_expr(peeled) {
             return self.inner.bind_null_test(inner, want_null);
         }
-        let bs = self.bind_sub(peeled)?;
-        if bs.never_null {
+        let value = self.bind_sub(peeled)?;
+        if value_never_null(&value) {
             // COUNT / EXISTS / IN — never NULL, so the test folds to a constant.
             return Ok(BExpr::LitInt(i64::from(!want_null)));
         }
         // A nullable scalar: fold over the subquery leaf; decorrelation rewrites the
         // IS [NOT] NULL over the substituted value column.
-        match bs.value {
+        match value {
             BExpr::ColRef(r) => Ok(fold_null_test(true, r, want_null)),
             _ => Err(GnitzSqlError::Unsupported(
                 "IS [NOT] NULL over this subquery form is not supported".into(),
@@ -501,7 +490,7 @@ impl LeafBinder<HirRef> for SubqueryLeaf<'_, '_, '_> {
         }
     }
     fn bind_subquery(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
-        Ok(self.bind_sub(e)?.value)
+        self.bind_sub(e)
     }
 }
 
@@ -519,10 +508,13 @@ fn bind_linear_subquery_body(
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let leaf = SubqueryLeaf {
         inner: HirSingleTable { env: &env },
-        ctx: RefCell::new(SubCtx { client, binder }),
-        ids,
-        env: &env,
-        outer_alias,
+        ctx: RefCell::new(SubCtx {
+            client,
+            binder,
+            ids,
+            outer_env: &env,
+            outer_alias,
+        }),
     };
     let mut rel = get;
     if let Some(where_expr) = &select.selection {
@@ -539,6 +531,9 @@ fn bind_linear_subquery_body(
 struct InnerResolved<'e> {
     rel: Rc<RelExpr>,
     inner_cols: Vec<HirCol>,
+    /// `inner_cols`' `ColId`s — built for the correlation split below, and reused by
+    /// the scalar/quantifier binders for their GROUP BY derivation.
+    inner_ids: HashSet<ColId>,
     inner_select: &'e Select,
     correlation: Vec<HirExpr>,
 }
@@ -552,14 +547,8 @@ fn id_set(cols: &[HirCol]) -> HashSet<ColId> {
 /// correlation conjuncts. The inner FROM must be one plain relation (no JOINs, no
 /// derived table, no GROUP BY / HAVING / DISTINCT); a conjunct referencing only
 /// the outer relation is rejected (hoisting would be wrong for NOT EXISTS).
-fn resolve_inner<'e>(
-    client: &mut GnitzClient,
-    binder: &mut Binder<'_>,
-    ids: &ColIdGen,
-    outer_env: &[HirCol],
-    outer_alias: &str,
-    subquery: &'e Query,
-) -> Result<InnerResolved<'e>, GnitzSqlError> {
+fn resolve_inner<'e>(cx: &mut SubCtx<'_, '_, '_>, subquery: &'e Query) -> Result<InnerResolved<'e>, GnitzSqlError> {
+    let (outer_env, outer_alias) = (cx.outer_env, cx.outer_alias);
     let inner_select = plain_select_body(subquery, "subquery")?;
     reject_unhonored_select_clauses(inner_select, HonoredClauses::PLAIN, "subquery")?;
     if !matches!(classify_from(&inner_select.from), FromShape::SinglePlainRelation) {
@@ -573,9 +562,9 @@ fn resolve_inner<'e>(
             "relation alias '{outer_alias}' is used by both the view FROM and its subquery; rename one"
         )));
     }
-    let (inner_tid, inner_schema) = binder.resolve(client, &inner_name)?;
-    let from_catalog = binder.is_catalog_relation(&inner_name);
-    let inner_get = RelExpr::get(ids, inner_tid, inner_schema, from_catalog);
+    let (inner_tid, inner_schema) = cx.binder.resolve(cx.client, &inner_name)?;
+    let from_catalog = cx.binder.is_catalog_relation(&inner_name);
+    let inner_get = RelExpr::get(cx.ids, inner_tid, inner_schema, from_catalog);
     let inner_cols = inner_get.cols();
 
     // Split the inner WHERE against the (outer, inner) scope by `ColId` membership.
@@ -623,6 +612,7 @@ fn resolve_inner<'e>(
     Ok(InnerResolved {
         rel,
         inner_cols,
+        inner_ids,
         inner_select,
         correlation,
     })
@@ -638,64 +628,26 @@ fn single_projection_expr<'e>(select: &'e Select, err: &str) -> Result<&'e Expr,
 
 /// Bind one subquery node into a `BoundSub`, dispatching on its kind. ANY/ALL is
 /// normalized here (`= ANY → IN`, `<> ALL → NOT IN`, range → `x OP (SELECT MIN/MAX)`).
-fn bind_one_subquery(
-    client: &mut GnitzClient,
-    binder: &mut Binder<'_>,
-    ids: &ColIdGen,
-    outer_env: &[HirCol],
-    outer_alias: &str,
-    e: &Expr,
-) -> Result<BoundSub, GnitzSqlError> {
+fn bind_one_subquery(cx: &mut SubCtx<'_, '_, '_>, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
     match e {
-        Expr::Exists { subquery, negated } => {
-            bind_exists_sub(client, binder, ids, outer_env, outer_alias, subquery, None, *negated)
-        }
+        Expr::Exists { subquery, negated } => bind_exists_sub(cx, subquery, None, *negated),
         Expr::InSubquery {
             expr,
             subquery,
             negated,
-        } => bind_exists_sub(
-            client,
-            binder,
-            ids,
-            outer_env,
-            outer_alias,
-            subquery,
-            Some(expr),
-            *negated,
-        ),
-        Expr::Subquery(q) => bind_scalar_sub(client, binder, ids, outer_env, outer_alias, q),
+        } => bind_exists_sub(cx, subquery, Some(expr), *negated),
+        Expr::Subquery(q) => bind_scalar_sub(cx, q),
         Expr::AnyOp {
             left,
             compare_op,
             right,
             ..
-        } => bind_quantifier_sub(
-            client,
-            binder,
-            ids,
-            outer_env,
-            outer_alias,
-            left,
-            compare_op,
-            right,
-            true,
-        ),
+        } => bind_quantifier_sub(cx, left, compare_op, right, true),
         Expr::AllOp {
             left,
             compare_op,
             right,
-        } => bind_quantifier_sub(
-            client,
-            binder,
-            ids,
-            outer_env,
-            outer_alias,
-            left,
-            compare_op,
-            right,
-            false,
-        ),
+        } => bind_quantifier_sub(cx, left, compare_op, right, false),
         other => Err(GnitzSqlError::Plan(format!(
             "internal: bind_one_subquery on a non-subquery node: {other:?}"
         ))),
@@ -705,18 +657,14 @@ fn bind_one_subquery(
 /// Bind an EXISTS / IN subquery into an `Exists`-kind `SubqueryRef`. For IN, the
 /// `(outer, inner)` equality is carried in `in_pair` (folded into the decorrelated
 /// join's ON); an EXISTS must be correlated.
-#[allow(clippy::too_many_arguments)]
 fn bind_exists_sub(
-    client: &mut GnitzClient,
-    binder: &mut Binder<'_>,
-    ids: &ColIdGen,
-    outer_env: &[HirCol],
-    outer_alias: &str,
+    cx: &mut SubCtx<'_, '_, '_>,
     subquery: &Query,
     in_operand: Option<&Expr>,
     negated: bool,
-) -> Result<BoundSub, GnitzSqlError> {
-    let ir = resolve_inner(client, binder, ids, outer_env, outer_alias, subquery)?;
+) -> Result<HirExpr, GnitzSqlError> {
+    let outer_env = cx.outer_env;
+    let ir = resolve_inner(cx, subquery)?;
     let mut in_pair = None;
     if let Some(operand) = in_operand {
         // IN shape: reject a tuple / non-plain-column LHS before extracting the pair.
@@ -761,70 +709,47 @@ fn bind_exists_sub(
         correlation: ir.correlation,
         in_pair,
     };
-    Ok(BoundSub {
-        value: BExpr::ColRef(HirRef::Subquery(Box::new(subref))),
-        never_null: true,
-    })
+    Ok(BExpr::ColRef(HirRef::Subquery(Box::new(subref))))
 }
 
 /// Bind a scalar aggregate subquery into a `Scalar`-kind `SubqueryRef` whose `rel`
 /// is a grouped (correlated) / global (uncorrelated) `Reduce`.
-fn bind_scalar_sub(
-    client: &mut GnitzClient,
-    binder: &mut Binder<'_>,
-    ids: &ColIdGen,
-    outer_env: &[HirCol],
-    outer_alias: &str,
-    q: &Query,
-) -> Result<BoundSub, GnitzSqlError> {
-    let ir = resolve_inner(client, binder, ids, outer_env, outer_alias, q)?;
+fn bind_scalar_sub(cx: &mut SubCtx<'_, '_, '_>, q: &Query) -> Result<HirExpr, GnitzSqlError> {
+    let ids = cx.ids;
+    let ir = resolve_inner(cx, q)?;
     let proj_expr = single_projection_expr(
         ir.inner_select,
         "a scalar subquery must be a single aggregate over its correlation group",
     )?;
     let (func, arg) = classify_scalar_agg(proj_expr, &ir.inner_cols)?;
-    let group_cols = scalar_group_cols(&ir.correlation, &id_set(&ir.inner_cols))?;
+    let group_cols = scalar_group_cols(&ir.correlation, &ir.inner_ids)?;
     let reduce = build_scalar_reduce(ids, ir.rel, group_cols, func, arg, &ir.inner_cols)?;
-    let subref = SubqueryRef {
+    Ok(BExpr::ColRef(HirRef::Subquery(Box::new(SubqueryRef {
         kind: SubqueryKind::Scalar,
         rel: reduce,
         correlation: ir.correlation,
         in_pair: None,
-    };
-    let never_null = subref.never_null();
-    Ok(BoundSub {
-        value: BExpr::ColRef(HirRef::Subquery(Box::new(subref))),
-        never_null,
-    })
+    }))))
 }
 
 /// Bind an ANY/ALL quantified comparison. `= ANY`/`<> ALL` route to IN/NOT IN;
 /// range ANY/ALL becomes `x OP (SELECT MIN/MAX)` — the 3VL null-fill wrapper for a
 /// correlated subquery, the bare comparison for an uncorrelated top-level one.
-#[allow(clippy::too_many_arguments)]
 fn bind_quantifier_sub(
-    client: &mut GnitzClient,
-    binder: &mut Binder<'_>,
-    ids: &ColIdGen,
-    outer_env: &[HirCol],
-    outer_alias: &str,
+    cx: &mut SubCtx<'_, '_, '_>,
     left: &Expr,
     compare_op: &BinaryOperator,
     right: &Expr,
     is_any: bool,
-) -> Result<BoundSub, GnitzSqlError> {
+) -> Result<HirExpr, GnitzSqlError> {
     let Expr::Subquery(q) = right else {
         return Err(GnitzSqlError::Unsupported(
             "an ANY/ALL operator's right operand must be a subquery".into(),
         ));
     };
     match (is_any, compare_op) {
-        (true, BinaryOperator::Eq) => {
-            return bind_exists_sub(client, binder, ids, outer_env, outer_alias, q, Some(left), false)
-        }
-        (false, BinaryOperator::NotEq) => {
-            return bind_exists_sub(client, binder, ids, outer_env, outer_alias, q, Some(left), true)
-        }
+        (true, BinaryOperator::Eq) => return bind_exists_sub(cx, q, Some(left), false),
+        (false, BinaryOperator::NotEq) => return bind_exists_sub(cx, q, Some(left), true),
         (true, BinaryOperator::NotEq) => {
             return Err(GnitzSqlError::Unsupported(
                 "`<> ANY (SELECT …)` is not supported (use NOT (x = ALL …) semantics via a wrapping view)".into(),
@@ -848,7 +773,8 @@ fn bind_quantifier_sub(
     };
     // x < ANY ⟺ < MAX; x > ANY ⟺ > MIN; x < ALL ⟺ < MIN; x > ALL ⟺ > MAX.
     let agg_func = if is_any == less { AggFunc::Max } else { AggFunc::Min };
-    let ir = resolve_inner(client, binder, ids, outer_env, outer_alias, q)?;
+    let (ids, outer_env) = (cx.ids, cx.outer_env);
+    let ir = resolve_inner(cx, q)?;
     let proj_expr = single_projection_expr(
         ir.inner_select,
         "a range ANY/ALL subquery must select a single non-nullable column",
@@ -866,7 +792,7 @@ fn bind_quantifier_sub(
         ));
     }
     let correlated = !ir.correlation.is_empty();
-    let group_cols = scalar_group_cols(&ir.correlation, &id_set(&ir.inner_cols))?;
+    let group_cols = scalar_group_cols(&ir.correlation, &ir.inner_ids)?;
     let reduce = build_scalar_reduce(ids, ir.rel, group_cols, agg_func, Some(inner_col), &ir.inner_cols)?;
     let subref = SubqueryRef {
         kind: SubqueryKind::Scalar,
@@ -896,10 +822,7 @@ fn bind_quantifier_sub(
                 .into(),
         ));
     };
-    Ok(BoundSub {
-        value,
-        never_null: false,
-    })
+    Ok(value)
 }
 
 /// Bind `e` against `env` and require a bare column reference, returning its `ColId`.
@@ -1033,7 +956,7 @@ fn bind_join_select(
         left = RelExpr::join(left, right_src, kind, on, None);
         // Reflect this step's null-widening back into the scope so a later ON /
         // the WHERE / the projection resolve against the widened nullability.
-        scope.rewiden(left.cols());
+        scope.widen_step(kind);
     }
 
     // WHERE → a `Filter` over the top join (raw conjuncts; the rewrite places them).
@@ -1097,11 +1020,22 @@ impl JoinScope {
             .push((alias.to_ascii_lowercase(), start..self.combined.len()));
     }
 
-    /// Adopt the join node's (null-widened) combined output as the scope columns;
-    /// the per-relation spans are unchanged (widening never changes column count).
-    fn rewiden(&mut self, combined: Vec<HirCol>) {
-        debug_assert_eq!(combined.len(), self.combined.len());
-        self.combined = combined;
+    /// Apply one join step's outer null-widening to the scope, in place: the
+    /// accumulated left side widens iff the step preserves its right, and the
+    /// just-pushed right relation iff it preserves its left — the same rule, through
+    /// the same [`widen_if`] primitive, that [`RelExpr::cols`] widens the join's
+    /// logical output with.
+    ///
+    /// In place rather than adopting `join.cols()`: a derived table's `AS d(col…)`
+    /// aliases live only on the cols `resolve_table_factor` handed the scope — the
+    /// bound subtree deliberately keeps its own inner names — so rebuilding the scope
+    /// from the tree would drop every positional alias in a join body. Widening
+    /// touches only `is_nullable`, so the aliases (and the `ColId`s) survive.
+    fn widen_step(&mut self, kind: JoinType) {
+        let split = self.relations.last().expect("a right relation was pushed").1.start;
+        let (left, right) = self.combined.split_at_mut(split);
+        widen_if(left.iter_mut().map(|c| &mut c.def), kind.preserves_right());
+        widen_if(right.iter_mut().map(|c| &mut c.def), kind.preserves_left());
     }
 
     fn rel_cols(&self, span: &Range<usize>) -> &[HirCol] {
@@ -1212,7 +1146,6 @@ struct GroupAgg {
     output_nullable: bool,
 }
 
-/// Peel `Nested` (parenthesis) wrappers off an expression.
 /// Extract the `ColId` of a bound bare column reference.
 fn col_of(e: HirExpr) -> Result<ColId, GnitzSqlError> {
     match e {

@@ -7,8 +7,8 @@
 //! set identity is materialized before it is hashed. The shared source-collision
 //! rule then wraps a repeated relation (`t EXCEPT t`) in a pass-through segment.
 
-use super::super::{slot_of, ColId, HirCol, RelExpr, SetOpKind};
-use super::{cut_segment, emit_filter, resolve_collisions, resolve_input, CutMemo, SegInput};
+use super::super::{slot_of, ColId, HirCol, HirExpr, ProjEntry, RelExpr, SetOpKind};
+use super::{cut_segment, emit_filter, resolve_collisions, seginput_of_get, CutMemo, SegInput};
 use crate::error::GnitzSqlError;
 use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::hir::physical;
@@ -42,21 +42,9 @@ pub(crate) fn lower_setop(
         reject_float_key(&c.out.def, "set operation")?;
     }
 
-    // Promotion targets: `0` keeps the side's own type, else the promoted common type.
-    let side_targets = |scols: &[HirCol]| -> Vec<u8> {
-        out.iter()
-            .zip(scols)
-            .map(|(o, s)| {
-                if s.def.type_code == o.out.def.type_code {
-                    0
-                } else {
-                    o.out.def.type_code as u8
-                }
-            })
-            .collect()
-    };
-    let left_tt = side_targets(&left.cols());
-    let right_tt = side_targets(&right.cols());
+    // Promotion targets, stamped per pair by `RelExpr::set_op`.
+    let left_tt: Vec<u8> = out.iter().map(|c| c.left_target).collect();
+    let right_tt: Vec<u8> = out.iter().map(|c| c.right_target).collect();
 
     // UNION ALL keeps both copies of an identical row, so the right side hashes on
     // a distinct branch id; every deduplicating op uses branch 0.
@@ -121,8 +109,8 @@ pub(crate) fn lower_distinct(
     }
     let side_ids: Vec<ColId> = side_cols.iter().map(|c| c.id).collect();
     let mut cb = CircuitBuilder::new(view_id, 0);
-    let seg = resolve_set_input(client, chain, memo, input, &side_ids)?;
-    let (node, slots) = emit_side(&mut cb, &seg, input, &side_ids)?;
+    let (seg, kind) = resolve_set_input(client, chain, memo, input, &side_ids)?;
+    let (node, slots) = emit_side(&mut cb, &seg, &kind, &side_ids)?;
     let sharded = hash_shard_side(&mut cb, node, &slots, &[], 0);
     let distinct_node = cb.distinct(sharded);
     cb.sink(distinct_node);
@@ -154,7 +142,6 @@ fn hashed_out<'a>(
 /// Lower both sides of a set operation, then apply the source-collision rule over
 /// their **resolved** tids — so a side that already became its own segment is
 /// correctly seen as distinct and never wrapped redundantly.
-#[allow(clippy::too_many_arguments)]
 fn lower_sides(
     cb: &mut CircuitBuilder,
     client: &mut GnitzClient,
@@ -164,93 +151,104 @@ fn lower_sides(
     side_ids: &[Vec<ColId>; 2],
     exempt: bool,
 ) -> Result<(NodeId, Vec<usize>, NodeId, Vec<usize>), GnitzSqlError> {
-    let mut inputs = [
-        resolve_set_input(client, chain, memo, sides[0], &side_ids[0])?,
-        resolve_set_input(client, chain, memo, sides[1], &side_ids[1])?,
-    ];
+    let (l_seg, l_kind) = resolve_set_input(client, chain, memo, sides[0], &side_ids[0])?;
+    let (r_seg, r_kind) = resolve_set_input(client, chain, memo, sides[1], &side_ids[1])?;
+    // The collision rule may re-point a side at a pass-through wrapper segment; the
+    // wrapper's layout still carries the source ids, so the addressing kind holds.
+    let mut inputs = [l_seg, r_seg];
     resolve_collisions(client, chain, &mut inputs, &sides, exempt)?;
-    let [l, r] = inputs;
-    let (l_node, l_slots) = emit_side(cb, &l, sides[0], &side_ids[0])?;
-    let (r_node, r_slots) = emit_side(cb, &r, sides[1], &side_ids[1])?;
+    let [l_seg, r_seg] = inputs;
+    let (l_node, l_slots) = emit_side(cb, &l_seg, &l_kind, &side_ids[0])?;
+    let (r_node, r_slots) = emit_side(cb, &r_seg, &r_kind, &side_ids[1])?;
     Ok((l_node, l_slots, r_node, r_slots))
 }
 
-/// Resolve one set-op side to a `SegInput`. A pure pass-through plain side reads
-/// its base relation directly (its source columns hash by value); every other
-/// shape — a computed projection, a combine — is cut to a hidden segment through
-/// the shared rule, so the set identity is materialized before it is hashed.
-fn resolve_set_input(
+/// How a resolved set-op side addresses its set-identity columns — **not** the
+/// same `ColId` space for the two shapes, so the discrimination is made once at
+/// resolve time and carried, rather than re-derived (and re-validated) at emit.
+enum SetSideKind<'a> {
+    /// A pure pass-through plain side, read straight off its base relation: the
+    /// layout carries the *source* ids, so a slot comes from resolving the
+    /// projection item's own expression — and the side's WHERE is still to be
+    /// inlined at emit (the segment shape already materialized its own).
+    PassThrough {
+        items: &'a [ProjEntry],
+        where_preds: &'a [HirExpr],
+    },
+    /// Every other shape — a computed projection, a combine — cut to a hidden
+    /// segment so the set identity is materialized before it is hashed. Its layout
+    /// carries the projection's *output* ids, so a slot is `slot_of(out_id)`.
+    Segment,
+}
+
+/// Resolve one set-op side to its delta source plus the addressing kind, making
+/// the pass-through-vs-segment decision once.
+fn resolve_set_input<'a>(
     client: &mut GnitzClient,
     chain: &mut ViewChain,
     memo: &mut CutMemo,
-    side: &Rc<RelExpr>,
+    side: &'a Rc<RelExpr>,
     side_ids: &[ColId],
-) -> Result<SegInput, GnitzSqlError> {
-    if let Some(get) = passthrough_get(side) {
-        return resolve_input(client, chain, memo, get, &side_ids.iter().copied().collect());
+) -> Result<(SegInput, SetSideKind<'a>), GnitzSqlError> {
+    if let Some((get, items, where_preds)) = passthrough_parts(side) {
+        // A pass-through side's base is a `Get`, so it is read in place and can
+        // never be cut — no live set is consulted.
+        let seg = seginput_of_get(get).expect("a pass-through side's base is a Get");
+        return Ok((seg, SetSideKind::PassThrough { items, where_preds }));
     }
     let live: HashSet<ColId> = side_ids.iter().copied().collect();
-    cut_segment(client, chain, memo, side, &live)
+    Ok((cut_segment(client, chain, memo, side, &live)?, SetSideKind::Segment))
 }
 
-/// The base `Get` of a pure pass-through side (`Project(Filter?(Get))` whose every
-/// item is a bare column ref), else `None` — a computed item has no set identity
-/// until it is materialized, so it must go through a segment.
-fn passthrough_get(side: &Rc<RelExpr>) -> Option<&Rc<RelExpr>> {
+/// A pure pass-through side (`Project(Filter?(Get))` whose every item is a bare
+/// column ref), split into its base `Get`, projection items, and WHERE — else
+/// `None`, since a computed item has no set identity until it is materialized.
+/// Returning the parts (rather than just the `Get`) is what lets the emit below
+/// consume the shape without re-matching it.
+fn passthrough_parts(side: &Rc<RelExpr>) -> Option<(&Rc<RelExpr>, &[ProjEntry], &[HirExpr])> {
     let RelExpr::Project { input, items } = side.as_ref() else {
         return None;
     };
     if !items.iter().all(|e| matches!(&e.expr, BExpr::ColRef(_))) {
         return None;
     }
-    let inner = match input.as_ref() {
-        RelExpr::Filter { input, .. } => input,
-        _ => input,
-    };
-    matches!(inner.as_ref(), RelExpr::Get { .. }).then_some(inner)
+    let (where_preds, inner) = super::split_filter(input);
+    matches!(inner.as_ref(), RelExpr::Get { .. }).then_some((inner, items, where_preds))
 }
 
 /// Emit one resolved side's delta input and return it with the slots
 /// `hash_shard_side` projects, in set-op column order.
-///
-/// The two side kinds resolve their slots against different `ColId` spaces, which
-/// is why this is one function rather than a shared `slot_of` loop. A **segment**
-/// side's layout carries the projection's *output* ids, so a slot is
-/// `slot_of(out_id)`. A **pass-through** side reads the base relation directly, so
-/// its layout carries the *source* ids and a slot comes from resolving the
-/// projection item's expression — which is also where the side's own WHERE is
-/// inlined (the segment path already materialized it).
 fn emit_side(
     cb: &mut CircuitBuilder,
     seg: &SegInput,
-    side: &Rc<RelExpr>,
+    kind: &SetSideKind<'_>,
     side_ids: &[ColId],
 ) -> Result<(NodeId, Vec<usize>), GnitzSqlError> {
     let inp = cb.input_delta_tagged(seg.tid);
-    let Some(_) = passthrough_get(side) else {
-        let slots = side_ids
-            .iter()
-            .map(|id| slot_of(&seg.layout, *id))
-            .collect::<Result<_, _>>()?;
-        return Ok((inp, slots));
-    };
-    let RelExpr::Project { input, items } = side.as_ref() else {
-        unreachable!("a pass-through side is a Project");
-    };
-    let (where_preds, _) = super::split_filter(input);
-    let node = emit_filter(cb, inp, where_preds, &seg.layout, &seg.schema.columns)?;
-    // Every item is a bare column ref (that is what makes the side pass-through),
-    // so each resolves to one source slot.
-    let slots = items
-        .iter()
-        .map(|e| match physical::resolve_refs(&e.expr, &seg.layout)? {
-            BoundExpr::ColRef(s) => Ok(s),
-            _ => Err(GnitzSqlError::Plan(
-                "internal: pass-through side item is not a column ref".into(),
-            )),
-        })
-        .collect::<Result<_, _>>()?;
-    Ok((node, slots))
+    match kind {
+        SetSideKind::Segment => {
+            let slots = side_ids
+                .iter()
+                .map(|id| slot_of(&seg.layout, *id))
+                .collect::<Result<_, _>>()?;
+            Ok((inp, slots))
+        }
+        SetSideKind::PassThrough { items, where_preds } => {
+            let node = emit_filter(cb, inp, *where_preds, &seg.layout, &seg.schema.columns)?;
+            // Every item is a bare column ref — that is what makes the side
+            // pass-through — so each resolves to exactly one source slot.
+            let slots = items
+                .iter()
+                .map(|e| match physical::resolve_refs(&e.expr, &seg.layout)? {
+                    BoundExpr::ColRef(s) => Ok(s),
+                    _ => Err(GnitzSqlError::Plan(
+                        "internal: pass-through side item is not a column ref".into(),
+                    )),
+                })
+                .collect::<Result<_, _>>()?;
+            Ok((node, slots))
+        }
+    }
 }
 
 /// Hash the projected columns to a synthetic content PK — widening

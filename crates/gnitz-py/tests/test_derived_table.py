@@ -89,6 +89,39 @@ class TestDerivedTable:
         finally:
             _cleanup(client, sn)
 
+    def test_derived_column_aliases_survive_a_join(self, client):
+        """A derived table's AS d(col...) aliases must survive the join steps above it.
+
+        The aliases live only on the columns the FROM binder hands the scope — the
+        bound subtree keeps its own inner names — so a join step that rebuilt its
+        scope from the tree would resolve `a.id`/`a.v` and reject `a.k`/`a.val`.
+        Both an ON and a projection reference are checked, and the outer join also
+        pins that the step's null-widening still reaches the scope.
+        """
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)", schema_name=sn)
+            client.execute_sql("CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, w BIGINT NOT NULL)", schema_name=sn)
+            # `a.k` is used as the join key AND projected; `a.val` is projected.
+            client.execute_sql(
+                "CREATE VIEW j AS SELECT a.k AS ak, a.val AS av, u.w AS uw "
+                "FROM (SELECT id, v FROM t) AS a(k, val) JOIN u ON a.k = u.id",
+                schema_name=sn,
+            )
+            # LEFT JOIN: the aliases must survive the null-widening rewrite too.
+            client.execute_sql(
+                "CREATE VIEW l AS SELECT a.k AS ak, u.w AS uw "
+                "FROM (SELECT id, v FROM t) AS a(k, val) LEFT JOIN u ON a.k = u.id",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO t VALUES (1, 20), (2, 5)", schema_name=sn)
+            client.execute_sql("INSERT INTO u VALUES (1, 50)", schema_name=sn)
+            assert _rows(client, sn, "j", ["ak", "av", "uw"]) == [(1, 20, 50)]
+            assert _rows(client, sn, "l", ["ak", "uw"]) == [(1, 50), (2, None)]
+        finally:
+            _cleanup(client, sn)
+
     def test_two_derived_tables_joined(self, client):
         """Both sides of the join are derived tables -> two hidden segments."""
         sn = "s" + _uid()

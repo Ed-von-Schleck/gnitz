@@ -8,9 +8,7 @@
 //! key-arity / outer-residual / pure-range guards.
 
 use super::super::guards::{converse_rel, reject_pair_pk_overflow, reject_pure_range_outer};
-use super::super::{
-    slot_of, widen_if, ColId, EqPair, HirExpr, HirRange, HirRef, JoinClass, JoinType, ProjEntry, RelExpr,
-};
+use super::super::{slot_of, widen_if, ColId, EqPair, HirExpr, HirRange, JoinClass, JoinType, ProjEntry, RelExpr};
 use super::prims::{
     build_reindex_program, build_reindex_program_keep, multi_null_filter_prog, null_gate, pure_range_m_output_cols,
     rekey_on_source_pk, schema_type_codes,
@@ -110,25 +108,32 @@ fn emit_step(
     }
 }
 
-/// Resolve a join's equality pairs to each side's key-column positions (in each
-/// input's layout) plus the per-pair promoted type codes — the shared key
-/// prologue of every equi/range emit, join and EXISTS/IN alike.
-#[allow(clippy::type_complexity)]
+/// A join's equality pairs resolved against both inputs: each side's key-column
+/// positions in its own layout, and the per-pair promoted type codes.
+pub(super) struct EquiKeys {
+    pub(super) left: Vec<usize>,
+    pub(super) right: Vec<usize>,
+    pub(super) tcs: Vec<TypeCode>,
+}
+
+/// Resolve a join's equality pairs to [`EquiKeys`] — the shared key prologue of
+/// every equi/range emit, join and EXISTS/IN alike.
 pub(super) fn resolve_eq_cols(
     eq: &[EqPair],
     left_in: &SegInput,
     right_in: &SegInput,
-) -> Result<(Vec<usize>, Vec<usize>, Vec<TypeCode>), GnitzSqlError> {
-    let left_cols: Vec<usize> = eq
-        .iter()
-        .map(|p| slot_of(&left_in.layout, p.left))
-        .collect::<Result<_, _>>()?;
-    let right_cols: Vec<usize> = eq
-        .iter()
-        .map(|p| slot_of(&right_in.layout, p.right))
-        .collect::<Result<_, _>>()?;
-    let tcs: Vec<TypeCode> = eq.iter().map(|p| p.tc).collect();
-    Ok((left_cols, right_cols, tcs))
+) -> Result<EquiKeys, GnitzSqlError> {
+    Ok(EquiKeys {
+        left: eq
+            .iter()
+            .map(|p| slot_of(&left_in.layout, p.left))
+            .collect::<Result<_, _>>()?,
+        right: eq
+            .iter()
+            .map(|p| slot_of(&right_in.layout, p.right))
+            .collect::<Result<_, _>>()?,
+        tcs: eq.iter().map(|p| p.tc).collect(),
+    })
 }
 
 // ── Equi emission ───────────────────────────────────────────────────────────────
@@ -147,7 +152,11 @@ fn emit_equi(
     let right_n = right_schema.columns.len();
 
     // Key columns: the eq pairs resolved to positions in each side's layout.
-    let (left_join_cols, right_join_cols, target_tcs) = resolve_eq_cols(&class.eq, left_in, right_in)?;
+    let EquiKeys {
+        left: left_join_cols,
+        right: right_join_cols,
+        tcs: target_tcs,
+    } = resolve_eq_cols(&class.eq, left_in, right_in)?;
     let k = left_join_cols.len();
     let left_target_tcs = side_target_tcs(&left_join_cols, &left_schema.columns, &target_tcs);
     let right_target_tcs = side_target_tcs(&right_join_cols, &right_schema.columns, &target_tcs);
@@ -158,8 +167,8 @@ fn emit_equi(
     let keep_r: Vec<usize> = (0..right_n).filter(|&i| keep[left_n + i]).collect();
     let pl = keep_l.len();
     let pr = keep_r.len();
-    let pruned_left_schema = prune_schema(left_schema, &keep_l);
-    let pruned_right_schema = prune_schema(right_schema, &keep_r);
+    let pruned_left = kept_coldefs(left_schema, &keep_l);
+    let pruned_right = kept_coldefs(right_schema, &keep_r);
     crate::validate::reject_column_overflow("JOIN view output", k + pl + pr)?;
 
     let mut cb = CircuitBuilder::new(view_id, 0);
@@ -199,11 +208,7 @@ fn emit_equi(
     // Virtual combined output schema: k `_join_pk` cols + kept-A + kept-B (with the
     // outer nullability applied to the payload).
     let mut out_cols: Vec<ColumnDef> = join_pk_coldefs(&target_tcs);
-    out_cols.extend(combined_payload_coldefs(
-        &pruned_left_schema,
-        &pruned_right_schema,
-        kind,
-    ));
+    out_cols.extend(combined_payload_coldefs(&pruned_left, &pruned_right, kind));
 
     // The merged-layout ColId vector: k identity-free key slots then the kept
     // payload ids — resolve_refs against it yields `k + pruned_index` for both the
@@ -370,12 +375,7 @@ fn emit_range(
                 (true, &pair_pk_cols[..pa], 0, left_n, input_a_raw, left_schema),
                 (false, &pair_pk_cols[pa..], left_n, right_n, input_b_raw, right_schema),
             ] {
-                let preserved = if preserved_is_left {
-                    kind.preserves_left()
-                } else {
-                    kind.preserves_right()
-                };
-                if !preserved {
+                if !kind.preserves(preserved_is_left) {
                     continue;
                 }
                 let pi = band_pi_preserved(
@@ -396,7 +396,7 @@ fn emit_range(
         };
 
         // One linear 3VL WHERE over the full-width `[pair-PK, A, B]` (base pair_pk).
-        let combined_payload = combined_payload_coldefs(left_schema, right_schema, kind);
+        let combined_payload = combined_payload_coldefs(&left_schema.columns, &right_schema.columns, kind);
         let combined_cols: Vec<ColumnDef> = pair_pk_coldefs.iter().cloned().chain(combined_payload).collect();
         let filtered = super::emit_filter(
             &mut cb,
@@ -437,18 +437,17 @@ fn keep_set(down: Demand<'_>, class: &JoinClass, kind: JoinType, left_in: &SegIn
         }
     };
     // Rules 1 + 2: projection, residual ON + top-level WHERE.
-    for e in down
-        .items
-        .iter()
-        .map(|i| &i.expr)
-        .chain(down.where_preds)
-        .chain(&class.residual)
-    {
-        e.for_each_ref(&mut |r| {
-            if let HirRef::Col(id) = r {
-                mark(&mut keep, *id);
-            }
-        });
+    let mut referenced: HashSet<ColId> = HashSet::new();
+    collect_live_cols(
+        down.items
+            .iter()
+            .map(|i| &i.expr)
+            .chain(down.where_preds)
+            .chain(&class.residual),
+        &mut referenced,
+    );
+    for id in referenced {
+        mark(&mut keep, id);
     }
     // Rule 3: preserved side's nullable join-key components.
     if kind.preserves_left() {
@@ -498,13 +497,18 @@ fn class_referenced(class: &JoinClass, live: &mut HashSet<ColId>) {
 /// primitive `RelExpr::cols` widens the *logical* join output with, so the physical
 /// and logical schemas cannot disagree (a client decoding a NULL in a NOT NULL
 /// column would panic). Shared by the equi and range join lowering.
-fn combined_payload_coldefs(left_schema: &Schema, right_schema: &Schema, join_type: JoinType) -> Vec<ColumnDef> {
-    let mut cols = left_schema.columns.clone();
+fn combined_payload_coldefs(left: &[ColumnDef], right: &[ColumnDef], join_type: JoinType) -> Vec<ColumnDef> {
+    let mut cols = left.to_vec();
     widen_if(cols.iter_mut(), join_type.preserves_right());
-    let mut rcols = right_schema.columns.clone();
+    let mut rcols = right.to_vec();
     widen_if(rcols.iter_mut(), join_type.preserves_left());
     cols.extend(rcols);
     cols
+}
+
+/// This side's kept payload column defs, in ascending source order.
+fn kept_coldefs(schema: &Schema, keep: &[usize]) -> Vec<ColumnDef> {
+    keep.iter().map(|&i| schema.columns[i].clone()).collect()
 }
 
 /// Per-side carried reindex target type for each join key slot: `T_i` only when
@@ -712,12 +716,12 @@ fn emit_range_null_fill_tail(
 /// sides (`k` is the key arity, each width its `keep` length), so there is nothing
 /// here to keep in sync with the emit above.
 struct EquiNullFill<'a> {
-    pub(crate) inner_merged: gnitz_core::NodeId,
-    pub(crate) kind: JoinType,
-    pub(crate) k: usize,
-    pub(crate) left: EquiSide<'a>,
-    pub(crate) right: EquiSide<'a>,
-    pub(crate) terms: &'a EquiTerms,
+    inner_merged: gnitz_core::NodeId,
+    kind: JoinType,
+    k: usize,
+    left: EquiSide<'a>,
+    right: EquiSide<'a>,
+    terms: &'a EquiTerms,
 }
 
 /// Emit `inner ∪ ν_A ∪ ν_B` — the outer join's null-fill, unioned onto the inner
@@ -764,12 +768,7 @@ fn emit_equi_null_fill(cb: &mut CircuitBuilder, nf: EquiNullFill<'_>) -> gnitz_c
         (true, left, right, terms.a_nullable, terms.reindex_a, k, pl),
         (false, right, left, terms.b_nullable, terms.reindex_b, k + pl, pr),
     ] {
-        let preserved = if preserved_is_left {
-            kind.preserves_left()
-        } else {
-            kind.preserves_right()
-        };
-        if !preserved {
+        if !kind.preserves(preserved_is_left) {
             continue;
         }
         let p_all = side.all(cb, nullable, reindex);
@@ -896,7 +895,11 @@ pub(crate) fn range_prologue(
     eq: &[EqPair],
     range: &HirRange,
 ) -> Result<RangePrologue, GnitzSqlError> {
-    let (left_cols, right_cols, eq_tcs) = resolve_eq_cols(eq, left_in, right_in)?;
+    let EquiKeys {
+        left: left_cols,
+        right: right_cols,
+        tcs: eq_tcs,
+    } = resolve_eq_cols(eq, left_in, right_in)?;
     let (left_coldefs, right_coldefs) = (&left_in.schema.columns, &right_in.schema.columns);
 
     let left_reindex_cols: Vec<usize> = left_cols
@@ -934,16 +937,6 @@ pub(crate) fn range_prologue(
         rel_ab: converse_rel(range.op),
         rel_ba: range.op,
     })
-}
-
-/// A schema pruned to its `keep` columns (ascending source order), payload-only —
-/// `pk_cols` is dropped (empty), since the pruned schema drives output-layout
-/// derivation and name resolution, never a PK region.
-fn prune_schema(schema: &Schema, keep: &[usize]) -> Schema {
-    Schema {
-        columns: keep.iter().map(|&i| schema.columns[i].clone()).collect(),
-        pk_cols: Vec::new(),
-    }
 }
 
 /// The pure-range threshold pipeline's outputs: `matched = A ⋈ {m}` and (when
@@ -1102,7 +1095,7 @@ pub(crate) fn band_union_schema(all_tcs: &[TypeCode], left: &Schema, right: &Sch
 /// for an all-replicated view, which runs correct-local over the full broadcast
 /// on every worker.) `source` is the caller's semantic preserved input (the raw
 /// input for the LEFT join; the locally pre-filtered outer for EXISTS).
-pub(crate) fn union_null_key_rows(
+fn union_null_key_rows(
     cb: &mut CircuitBuilder,
     nf_match: gnitz_core::NodeId,
     source: gnitz_core::NodeId,

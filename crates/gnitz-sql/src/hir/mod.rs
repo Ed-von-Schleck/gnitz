@@ -11,13 +11,13 @@
 //! positional pass (`physical.rs`) at lowering, the single home of the
 //! PK-front convention and the `HirRef → ColRef(position)` substitution.
 
-pub(crate) mod bind;
-pub(crate) mod chain;
+mod bind;
+mod chain;
 mod create;
-pub(crate) mod guards;
-pub(crate) mod lower;
-pub(crate) mod physical;
-pub(crate) mod rewrite;
+mod guards;
+mod lower;
+mod physical;
+mod rewrite;
 
 pub(crate) use create::{execute_alter_view, execute_create_view};
 
@@ -368,13 +368,22 @@ pub(crate) enum SetOpKind {
     Except,
 }
 
-/// One output column of a set operation: the paired left/right source `ColId`s
-/// and the promoted output column (common type + per-operator nullability).
+/// One output column of a set operation: the paired left/right source `ColId`s,
+/// the promoted output column (common type + per-operator nullability), and each
+/// side's content-hash widening target.
+///
+/// A target is `0` when that side already carries the promoted type (hash it as
+/// it lies), else the promoted type code — so both sides hash one physical
+/// representation. Stamped here, where the pair's source types and the promoted
+/// type are all in hand, rather than re-derived at lowering by walking both
+/// sides' whole column lists back out of the tree.
 #[derive(Clone)]
 pub(crate) struct SetOpCol {
     pub left: ColId,
     pub right: ColId,
     pub out: HirCol,
+    pub left_target: u8,
+    pub right_target: u8,
 }
 
 /// Which side(s) of a join survive unmatched — the join kind carried in
@@ -414,6 +423,17 @@ impl JoinType {
 
     pub(crate) fn preserves_right(self) -> bool {
         matches!(self, JoinType::Right | JoinType::Full)
+    }
+
+    /// [`Self::preserves_left`] or [`Self::preserves_right`], selected by side —
+    /// for the emit loops that walk both sides of a null-fill uniformly and would
+    /// otherwise spell the same two-arm dispatch out per loop.
+    pub(crate) fn preserves(self, is_left: bool) -> bool {
+        if is_left {
+            self.preserves_left()
+        } else {
+            self.preserves_right()
+        }
     }
 }
 
@@ -571,9 +591,12 @@ impl RelExpr {
             let mut def = l.def.clone();
             def.type_code = tc;
             def.is_nullable = is_nullable;
+            let target = |src: TypeCode| if src == tc { 0 } else { tc as u8 };
             out.push(SetOpCol {
                 left: l.id,
                 right: r.id,
+                left_target: target(l.def.type_code),
+                right_target: target(r.def.type_code),
                 out: HirCol { id: ids.next(), def },
             });
         }

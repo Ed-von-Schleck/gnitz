@@ -6,10 +6,11 @@
 //! exchange); band and pure-range correlations re-key onto the outer source PK and
 //! ride the mandatory output exchange.
 
-use super::super::{ColId, EqPair, HirExpr, HirRange, HirRef, ProjEntry, RelExpr};
+use super::super::{ColId, EqPair, HirExpr, HirRange, HirRef, JoinClass, ProjEntry, RelExpr};
 use super::join::{
     band_pi_preserved, band_union_schema, build_pure_range_threshold, emit_equi_join_terms, join_pk_coldefs,
-    normalize_to_ab, pure_range_unmatched, range_prologue, resolve_eq_cols, side_target_tcs, EquiSide, RangePrologue,
+    normalize_to_ab, pure_range_unmatched, range_prologue, resolve_eq_cols, side_target_tcs, EquiKeys, EquiSide,
+    RangePrologue,
 };
 use super::prims::{build_reindex_program, rekey_on_source_pk};
 use super::{
@@ -28,23 +29,28 @@ use gnitz_core::{CircuitBuilder, ColumnDef, GnitzClient, NodeId, Schema};
 use std::collections::HashSet;
 use std::rc::Rc;
 
-/// The shared semi + anti composition over the weight-exact null-fill set
-/// `ν = positive_part(A − π_A(inner)) = w_A·[S=0]`: the anti-join is ν itself; the
-/// semi-join its complement `A − ν`. Returns `(semi, anti)` over one shared ν.
-fn semi_and_anti(cb: &mut CircuitBuilder, a_all: NodeId, pi_a: NodeId) -> (NodeId, NodeId) {
+/// The branch(es) an EXISTS/IN view emits, as one composition over the weight-exact
+/// null-fill set `ν = positive_part(A − π_A(inner)) = w_A·[S=0]` — the unmatched
+/// outer rows at their true multiplicity. The three decorrelation kinds are three
+/// compositions of that one ν, so they are stated here together rather than as a
+/// per-kind branch tree at each call site:
+///
+/// ```text
+/// Anti = ν            Semi = A − ν            Mark = (A − ν, ν)
+/// ```
+///
+/// Returns `(primary, unmatched?)`, `unmatched` being `Some` exactly for `Mark`.
+/// Node allocation order is fixed across all three (`positive_diff`, then — unless
+/// Anti short-circuits — `negate` + `union`), so adding a kind never renumbers
+/// another kind's circuit.
+fn exists_branches(cb: &mut CircuitBuilder, a_all: NodeId, pi_a: NodeId, kind: JoinType) -> (NodeId, Option<NodeId>) {
     let nu = cb.positive_diff(a_all, pi_a); // ν, keyed like a_all
-    let neg = cb.negate(nu);
-    (cb.union(neg, a_all), nu)
-}
-
-/// One polarity of [`semi_and_anti`] for the filter view (the anti case builds no
-/// dangling semi nodes).
-fn semi_or_anti(cb: &mut CircuitBuilder, a_all: NodeId, pi_a: NodeId, negated: bool) -> NodeId {
-    if negated {
-        cb.positive_diff(a_all, pi_a)
-    } else {
-        semi_and_anti(cb, a_all, pi_a).0
+    if kind == JoinType::Anti {
+        return (nu, None);
     }
+    let neg = cb.negate(nu);
+    let semi = cb.union(neg, a_all); // A − ν
+    (semi, (kind == JoinType::Mark).then_some(nu))
 }
 
 /// The resolved core of one EXISTS/IN circuit: the two inputs, the tagged deltas
@@ -65,7 +71,6 @@ struct ExistsCircuit {
 /// (but not including) the projection tail. `left_prefilter` is the outer-local
 /// WHERE (the left-input prefilter for a semi/anti view; empty for a mark view,
 /// whose WHERE is applied post-mark per branch).
-#[allow(clippy::too_many_arguments)]
 fn emit_exists_circuit(
     client: &mut GnitzClient,
     chain: &mut ViewChain,
@@ -74,7 +79,6 @@ fn emit_exists_circuit(
     left_prefilter: &[HirExpr],
     items: &[ProjEntry],
     view_id: u64,
-    is_mark: bool,
 ) -> Result<ExistsCircuit, GnitzSqlError> {
     let RelExpr::Join {
         left, right, kind, on, ..
@@ -83,7 +87,6 @@ fn emit_exists_circuit(
         unreachable!("emit_exists_circuit receives a Join");
     };
     let class = on.class()?;
-    let negated = matches!(kind, JoinType::Anti);
 
     // Left-input live set (projection + prefilter + correlation-key left cols) for
     // a cut left input (a nested subquery); a bare Get reads everything.
@@ -147,16 +150,25 @@ fn emit_exists_circuit(
         &right_in.schema.columns,
     )?;
 
-    let (primary, unmatched, out_pk_cols, shard) = if let Some(range) = &class.range {
-        let (p, u, pk) = exists_range_core(
-            &mut cb, &left_in, &right_in, a_local, b_local, &class.eq, range, is_mark, negated,
-        )?;
-        (p, u, pk, true)
-    } else {
-        let (p, u, pk) = exists_equi_core(
-            &mut cb, &left_in, &right_in, a_local, b_local, &class.eq, is_mark, negated,
-        )?;
-        (p, u, pk, false)
+    let core = ExistsCore {
+        left_in: &left_in,
+        right_in: &right_in,
+        a_local,
+        b_local,
+        class,
+        kind: *kind,
+    };
+    // A range correlation re-keys onto the outer source PK and rides the mandatory
+    // range output exchange; an equi one is keyed by `_join_pk` and needs none.
+    let (primary, unmatched, out_pk_cols, shard) = match &class.range {
+        Some(range) => {
+            let (p, u, pk) = core.range(&mut cb, range)?;
+            (p, u, pk, true)
+        }
+        None => {
+            let (p, u, pk) = core.equi(&mut cb)?;
+            (p, u, pk, false)
+        }
     };
     Ok(ExistsCircuit {
         cb,
@@ -168,174 +180,187 @@ fn emit_exists_circuit(
     })
 }
 
-/// Equi correlation: the symmetric 2-term join over
-/// the NULL-gated sides, `π_A(inner)`, and `a_all` (the full outer re-keyed,
-/// reusing `reindex_a` when the key is NOT NULL). Output keyed by `_join_pk`, no
-/// output exchange. Returns `(primary, unmatched?, _join_pk cols)`.
-#[allow(clippy::too_many_arguments)]
-fn exists_equi_core(
-    cb: &mut CircuitBuilder,
-    left_in: &SegInput,
-    right_in: &SegInput,
+/// The resolved inputs an EXISTS/IN circuit core emits from: both sides (with their
+/// local WHEREs already fused into `a_local` / `b_local`), the classified
+/// correlation, and the decorrelation `kind` that selects the branch composition.
+/// Bundled because the equi and range cores take the same six values and differ
+/// only in which half of `class` they read.
+struct ExistsCore<'a> {
+    left_in: &'a SegInput,
+    right_in: &'a SegInput,
     a_local: NodeId,
     b_local: NodeId,
-    eq: &[EqPair],
-    is_mark: bool,
-    negated: bool,
-) -> Result<(NodeId, Option<NodeId>, Vec<ColumnDef>), GnitzSqlError> {
-    let k = eq.len();
-    let a_n = left_in.schema.columns.len();
-    let b_n = right_in.schema.columns.len();
-    let (left_cols, right_cols, target_tcs) = resolve_eq_cols(eq, left_in, right_in)?;
-    let left_target_tcs = side_target_tcs(&left_cols, &left_in.schema.columns, &target_tcs);
-    let right_target_tcs = side_target_tcs(&right_cols, &right_in.schema.columns, &target_tcs);
-    let keep_a: Vec<usize> = (0..a_n).collect();
-    let keep_b: Vec<usize> = (0..b_n).collect();
-
-    let terms = emit_equi_join_terms(
-        cb,
-        EquiSide {
-            input: a_local,
-            cols: &left_cols,
-            target_tcs: &left_target_tcs,
-            coldefs: &left_in.schema.columns,
-            keep: &keep_a,
-        },
-        EquiSide {
-            input: b_local,
-            cols: &right_cols,
-            target_tcs: &right_target_tcs,
-            coldefs: &right_in.schema.columns,
-            keep: &keep_b,
-        },
-    )?;
-
-    // π_A(inner): project each term straight to [_join_pk × k, A].
-    let pa_ab = cb.map(terms.join_ab, &(k..k + a_n).collect::<Vec<_>>());
-    let pa_ba = cb.map(terms.join_ba, &(k + b_n..k + b_n + a_n).collect::<Vec<_>>());
-    let pi_a = cb.union(pa_ab, pa_ba);
-
-    // a_all re-keys the full (locally filtered, NULL keys included) outer input,
-    // reusing reindex_a on a NOT NULL key (the NULL gate was a no-op there).
-    let a_all = if terms.a_nullable {
-        cb.map_reindex(
-            a_local,
-            &left_cols,
-            &left_target_tcs,
-            build_reindex_program(left_in.schema.columns.len()),
-        )
-    } else {
-        terms.reindex_a
-    };
-
-    let out_pk_cols = join_pk_coldefs(&target_tcs);
-    if is_mark {
-        let (matched, unmatched) = semi_and_anti(cb, a_all, pi_a);
-        Ok((matched, Some(unmatched), out_pk_cols))
-    } else {
-        Ok((semi_or_anti(cb, a_all, pi_a, negated), None, out_pk_cols))
-    }
+    class: &'a JoinClass,
+    kind: JoinType,
 }
 
-/// Range correlation — band (`n_eq ≥ 1`) or pure range (`n_eq == 0`). Both re-key
-/// onto the outer source PK and ride the range output exchange. Returns
-/// `(primary, unmatched?, _src_pk cols)`.
-#[allow(clippy::too_many_arguments)]
-fn exists_range_core(
-    cb: &mut CircuitBuilder,
-    left_in: &SegInput,
-    right_in: &SegInput,
-    a_local: NodeId,
-    b_local: NodeId,
-    eq: &[EqPair],
-    range: &HirRange,
-    is_mark: bool,
-    negated: bool,
-) -> Result<(NodeId, Option<NodeId>, Vec<ColumnDef>), GnitzSqlError> {
-    let a_n = left_in.schema.columns.len();
-    let n_eq = eq.len();
-    let k = n_eq + 1;
+impl ExistsCore<'_> {
+    /// Equi correlation: the symmetric 2-term join over
+    /// the NULL-gated sides, `π_A(inner)`, and `a_all` (the full outer re-keyed,
+    /// reusing `reindex_a` when the key is NOT NULL). Output keyed by `_join_pk`, no
+    /// output exchange. Returns `(primary, unmatched?, _join_pk cols)`.
+    fn equi(&self, cb: &mut CircuitBuilder) -> Result<(NodeId, Option<NodeId>, Vec<ColumnDef>), GnitzSqlError> {
+        let ExistsCore {
+            left_in,
+            right_in,
+            a_local,
+            b_local,
+            class,
+            kind,
+        } = *self;
+        let eq: &[EqPair] = &class.eq;
+        let k = eq.len();
+        let a_n = left_in.schema.columns.len();
+        let b_n = right_in.schema.columns.len();
+        let EquiKeys {
+            left: left_cols,
+            right: right_cols,
+            tcs: target_tcs,
+        } = resolve_eq_cols(eq, left_in, right_in)?;
+        let left_target_tcs = side_target_tcs(&left_cols, &left_in.schema.columns, &target_tcs);
+        let right_target_tcs = side_target_tcs(&right_cols, &right_in.schema.columns, &target_tcs);
+        let keep_a: Vec<usize> = (0..a_n).collect();
+        let keep_b: Vec<usize> = (0..b_n).collect();
 
-    let RangePrologue {
-        reindex_a,
-        reindex_b,
-        left_key_nullable,
-        left_reindex_cols,
-        all_tcs,
-        rel_ab,
-        rel_ba,
-    } = range_prologue(cb, left_in, right_in, a_local, b_local, eq, range)?;
-
-    let (primary, unmatched): (NodeId, Option<NodeId>) = if n_eq == 0 {
-        // Pure range: the one-row threshold m = MAX/MIN(b.range) decides existence.
-        let int_a = cb.partition_filter(reindex_a);
-        let trace_a = cb.integrate_trace(int_a);
-        let want_a_pass = negated || is_mark;
-        let thr = build_pure_range_threshold(
+        let terms = emit_equi_join_terms(
             cb,
-            &left_in.schema,
-            range.tc,
-            range.op,
-            reindex_b,
-            int_a,
-            trace_a,
-            want_a_pass,
-        );
-        // `A − matched` (∪ NULL-range-key rows) — the anti / mark unmatched branch.
-        let mut unmatched = || {
-            pure_range_unmatched(
-                cb,
-                &thr,
-                left_key_nullable,
+            EquiSide {
+                input: a_local,
+                cols: &left_cols,
+                target_tcs: &left_target_tcs,
+                coldefs: &left_in.schema.columns,
+                keep: &keep_a,
+            },
+            EquiSide {
+                input: b_local,
+                cols: &right_cols,
+                target_tcs: &right_target_tcs,
+                coldefs: &right_in.schema.columns,
+                keep: &keep_b,
+            },
+        )?;
+
+        // π_A(inner): project each term straight to [_join_pk × k, A].
+        let pa_ab = cb.map(terms.join_ab, &(k..k + a_n).collect::<Vec<_>>());
+        let pa_ba = cb.map(terms.join_ba, &(k + b_n..k + b_n + a_n).collect::<Vec<_>>());
+        let pi_a = cb.union(pa_ab, pa_ba);
+
+        // a_all re-keys the full (locally filtered, NULL keys included) outer input,
+        // reusing reindex_a on a NOT NULL key (the NULL gate was a no-op there).
+        let a_all = if terms.a_nullable {
+            cb.map_reindex(
                 a_local,
-                &left_reindex_cols,
-                &left_in.schema,
+                &left_cols,
+                &left_target_tcs,
+                build_reindex_program(left_in.schema.columns.len()),
             )
+        } else {
+            terms.reindex_a
         };
-        if is_mark {
-            (thr.matched, Some(unmatched()?))
-        } else if !negated {
-            (thr.matched, None)
-        } else {
-            (unmatched()?, None)
-        }
-    } else {
-        // Band: the eq-prefix scatter co-locates both sides, so the inner join, its
-        // π_A re-key, a_all, and the clamp are all partition-local.
-        let trace_a = cb.integrate_trace(reindex_a);
-        let trace_b = cb.integrate_trace(reindex_b);
-        let join_ab = cb.join_with_trace_range_node(reindex_a, trace_b, n_eq as u8, rel_ab);
-        let join_ba = cb.join_with_trace_range_node(reindex_b, trace_a, n_eq as u8, rel_ba);
-        let merged = normalize_to_ab(cb, join_ab, join_ba, k, a_n, right_in.schema.columns.len());
 
-        // π_A(inner) keyed by the outer source PK.
-        let union_schema = band_union_schema(&all_tcs, &left_in.schema, &right_in.schema);
-        let a_pk_in_union: Vec<usize> = left_in.schema.pk_cols.iter().map(|&p| k + p).collect();
-        let proj_a = band_pi_preserved(cb, merged, union_schema.columns.len(), &a_pk_in_union, k, 0, a_n);
-        let a_all = rekey_on_source_pk(cb, a_local, &left_in.schema);
-        if is_mark {
-            let (matched, unmatched) = semi_and_anti(cb, a_all, proj_a);
-            (matched, Some(unmatched))
-        } else {
-            (semi_or_anti(cb, a_all, proj_a, negated), None)
-        }
-    };
+        let (primary, unmatched) = exists_branches(cb, a_all, pi_a, kind);
+        Ok((primary, unmatched, join_pk_coldefs(&target_tcs)))
+    }
 
-    // View PK = the outer source PK, hidden (it also rides the payload verbatim).
-    let src_pk_coldefs: Vec<ColumnDef> = left_in
-        .schema
-        .pk_cols
-        .iter()
-        .map(|&c| {
-            ColumnDef::new(
-                left_in.schema.columns[c].name.clone(),
-                left_in.schema.columns[c].type_code.reindex_output_type(),
-                false,
-            )
-            .hidden()
-        })
-        .collect();
-    Ok((primary, unmatched, src_pk_coldefs))
+    /// Range correlation — band (`n_eq ≥ 1`) or pure range (`n_eq == 0`). Both re-key
+    /// onto the outer source PK and ride the range output exchange. Returns
+    /// `(primary, unmatched?, _src_pk cols)`.
+    fn range(
+        &self,
+        cb: &mut CircuitBuilder,
+        range: &HirRange,
+    ) -> Result<(NodeId, Option<NodeId>, Vec<ColumnDef>), GnitzSqlError> {
+        let ExistsCore {
+            left_in,
+            right_in,
+            a_local,
+            b_local,
+            class,
+            kind,
+        } = *self;
+        let eq: &[EqPair] = &class.eq;
+        let a_n = left_in.schema.columns.len();
+        let n_eq = eq.len();
+        let k = n_eq + 1;
+
+        let RangePrologue {
+            reindex_a,
+            reindex_b,
+            left_key_nullable,
+            left_reindex_cols,
+            all_tcs,
+            rel_ab,
+            rel_ba,
+        } = range_prologue(cb, left_in, right_in, a_local, b_local, eq, range)?;
+
+        let (primary, unmatched): (NodeId, Option<NodeId>) = if n_eq == 0 {
+            // Pure range: the one-row threshold m = MAX/MIN(b.range) decides existence.
+            let int_a = cb.partition_filter(reindex_a);
+            let trace_a = cb.integrate_trace(int_a);
+            // Only the branches that subtract from A (`A − matched`) need the passthrough.
+            let want_a_pass = kind != JoinType::Semi;
+            let thr = build_pure_range_threshold(
+                cb,
+                &left_in.schema,
+                range.tc,
+                range.op,
+                reindex_b,
+                int_a,
+                trace_a,
+                want_a_pass,
+            );
+            // `A − matched` (∪ NULL-range-key rows) — the anti / mark unmatched branch.
+            let mut unmatched = || {
+                pure_range_unmatched(
+                    cb,
+                    &thr,
+                    left_key_nullable,
+                    a_local,
+                    &left_reindex_cols,
+                    &left_in.schema,
+                )
+            };
+            // The threshold decides existence directly, so these are the three
+            // compositions `exists_branches` states over ν — spelled here against
+            // `matched` / `A − matched` because the threshold has no `π_A(inner)`.
+            match kind {
+                JoinType::Anti => (unmatched()?, None),
+                JoinType::Mark => (thr.matched, Some(unmatched()?)),
+                _ => (thr.matched, None),
+            }
+        } else {
+            // Band: the eq-prefix scatter co-locates both sides, so the inner join, its
+            // π_A re-key, a_all, and the clamp are all partition-local.
+            let trace_a = cb.integrate_trace(reindex_a);
+            let trace_b = cb.integrate_trace(reindex_b);
+            let join_ab = cb.join_with_trace_range_node(reindex_a, trace_b, n_eq as u8, rel_ab);
+            let join_ba = cb.join_with_trace_range_node(reindex_b, trace_a, n_eq as u8, rel_ba);
+            let merged = normalize_to_ab(cb, join_ab, join_ba, k, a_n, right_in.schema.columns.len());
+
+            // π_A(inner) keyed by the outer source PK.
+            let union_schema = band_union_schema(&all_tcs, &left_in.schema, &right_in.schema);
+            let a_pk_in_union: Vec<usize> = left_in.schema.pk_cols.iter().map(|&p| k + p).collect();
+            let proj_a = band_pi_preserved(cb, merged, union_schema.columns.len(), &a_pk_in_union, k, 0, a_n);
+            let a_all = rekey_on_source_pk(cb, a_local, &left_in.schema);
+            exists_branches(cb, a_all, proj_a, kind)
+        };
+
+        // View PK = the outer source PK, hidden (it also rides the payload verbatim).
+        let src_pk_coldefs: Vec<ColumnDef> = left_in
+            .schema
+            .pk_cols
+            .iter()
+            .map(|&c| {
+                ColumnDef::new(
+                    left_in.schema.columns[c].name.clone(),
+                    left_in.schema.columns[c].type_code.reindex_output_type(),
+                    false,
+                )
+                .hidden()
+            })
+            .collect();
+        Ok((primary, unmatched, src_pk_coldefs))
+    }
 }
 
 /// Lower a decorrelated `Project(Filter?(Join{Semi|Anti}))` to circuit pieces.
@@ -355,7 +380,7 @@ pub(crate) fn lower_semi_anti_view(
         shard,
         left_in,
         ..
-    } = emit_exists_circuit(client, chain, memo, source, fpreds, items, view_id, false)?;
+    } = emit_exists_circuit(client, chain, memo, source, fpreds, items, view_id)?;
 
     let npk = out_pk_cols.len();
     let a_n = left_in.schema.columns.len();
@@ -375,7 +400,6 @@ pub(crate) fn lower_semi_anti_view(
 /// Lower a decorrelated `Project(Filter?(Join{Mark}))` to circuit pieces: the
 /// matched / unmatched branches each bind the (post-mark) WHERE + projection with
 /// the mark column substituted by its `0/1` constant, then union.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_mark_view(
     client: &mut GnitzClient,
     chain: &mut ViewChain,
@@ -399,7 +423,7 @@ pub(crate) fn lower_mark_view(
         out_pk_cols,
         shard,
         left_in,
-    } = emit_exists_circuit(client, chain, memo, source, &[], items, view_id, true)?;
+    } = emit_exists_circuit(client, chain, memo, source, &[], items, view_id)?;
     let unmatched = unmatched.expect("mark core returns an unmatched branch");
 
     let npk = out_pk_cols.len();
@@ -421,8 +445,9 @@ pub(crate) fn lower_mark_view(
         schema: &branch_schema,
         pk_cols: &out_pk_cols,
     };
-    let (m_out, out_cols) = branch.emit(&mut cb, matched, 1)?;
-    let (u_out, _) = branch.emit(&mut cb, unmatched, 0)?;
+    let out_cols = branch.out_cols();
+    let m_out = branch.emit(&mut cb, matched, 1)?;
+    let u_out = branch.emit(&mut cb, unmatched, 0)?;
     let mut out = cb.union(m_out, u_out);
     if shard {
         out = cb.shard(out, &(0..npk).collect::<Vec<_>>());
@@ -445,30 +470,35 @@ struct MarkBranch<'a> {
 }
 
 impl MarkBranch<'_> {
+    /// The branch output schema: the carried PK region then the projected items.
+    /// Branch-invariant by construction — only the `0/1` mark constant differs
+    /// between the two branches, and it appears nowhere in the column defs.
+    fn out_cols(&self) -> Vec<ColumnDef> {
+        let mut cols: Vec<ColumnDef> = self.pk_cols.to_vec();
+        cols.extend(self.items.iter().map(|i| i.out.def.clone()));
+        cols
+    }
+
     /// Emit one branch: substitute the mark column by `mark_val`, apply the WHERE
     /// (folds to a true constant → no filter), then map the projection. The leading
     /// PK region is carried verbatim; the map program writes only the payload.
-    fn emit(
-        &self,
-        cb: &mut CircuitBuilder,
-        node: NodeId,
-        mark_val: i64,
-    ) -> Result<(NodeId, Vec<ColumnDef>), GnitzSqlError> {
+    fn emit(&self, cb: &mut CircuitBuilder, node: NodeId, mark_val: i64) -> Result<NodeId, GnitzSqlError> {
         let subst = |e: &HirExpr| subst_mark_lit(e, self.mark_id, mark_val);
         let subst_preds: Vec<HirExpr> = self.where_preds.iter().map(subst).collect();
         let filtered = emit_filter(cb, node, subst_preds.iter(), self.layout, &self.schema.columns)?;
 
-        let mut out_cols: Vec<ColumnDef> = self.pk_cols.to_vec();
-        let mut proj_items: Vec<ProjItem> = Vec::with_capacity(self.items.len());
-        for item in self.items {
-            proj_items.push(ProjItem::from_bound(physical::resolve_refs(
-                &subst(&item.expr),
-                self.layout,
-            )?));
-            out_cols.push(item.out.def.clone());
-        }
+        let proj_items: Vec<ProjItem> = self
+            .items
+            .iter()
+            .map(|item| {
+                Ok(ProjItem::from_bound(physical::resolve_refs(
+                    &subst(&item.expr),
+                    self.layout,
+                )?))
+            })
+            .collect::<Result<_, GnitzSqlError>>()?;
         let program = compile_projection_map(&proj_items, self.schema)?;
-        Ok((cb.map_expr(filtered, program), out_cols))
+        Ok(cb.map_expr(filtered, program))
     }
 }
 
@@ -483,13 +513,9 @@ fn subst_mark_lit(e: &HirExpr, mark_id: ColId, val: i64) -> HirExpr {
                 _ => BExpr::ColRef(r.clone()),
             })
         },
-        &|r, want_null| {
-            Ok(if want_null {
-                BExpr::IsNull(r.clone())
-            } else {
-                BExpr::IsNotNull(r.clone())
-            })
-        },
+        // The mark is non-nullable `0/1`, so the substitution never has to fold a
+        // null test — every leaf's `IS [NOT] NULL` passes through unchanged.
+        &|r, want_null| Ok(crate::bind::fold_null_test(true, r.clone(), want_null)),
     ) {
         Ok(out) => out,
         Err(never) => match never {},

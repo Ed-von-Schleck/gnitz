@@ -54,11 +54,19 @@ pub(crate) struct SegInput {
     pub from_catalog: bool,
 }
 
-/// The `Rc::as_ptr` cut memo, threaded through the whole lowering so a subtree
-/// referenced from two places — a shared CTE, a sub-join
-/// reachable from two parents — is cut to **one** hidden segment and every
-/// reference resolves to it. Per-shell memos would defeat that, which is the
-/// only reason the rewrites preserve `Rc` identity at all.
+/// The `Rc::as_ptr` cut memo, threaded through the whole lowering: a subtree
+/// reached from two places is cut to **one** hidden segment, and every reference
+/// resolves to it. It makes [`cut_segment`] idempotent per subtree identity, and
+/// is the only reason the HIR→HIR rewrites preserve `Rc` identity (a rebuild that
+/// dropped it would split a shared node into two segments). Per-shell memos would
+/// defeat both.
+///
+/// No producer shares a node *today* — bind builds a tree, and decorrelation
+/// dedups its cloned subquery `rel`s before placing them. Two references to one
+/// CTE are **not** an exception: each mints a fresh `Get` on the same tid, which
+/// [`resolve_collisions`] reconciles by tid, not this memo by identity. The memo
+/// keeps single-cutting a property of the lowering rather than an obligation on
+/// every producer.
 pub(crate) type CutMemo = HashMap<*const RelExpr, SegInput>;
 
 /// Insert every `HirRef::Col` id referenced anywhere in `exprs` into `live` — the
@@ -169,12 +177,7 @@ fn lower_body(
 ) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
     match rel.as_ref() {
         RelExpr::Project { input, items } => {
-            // Peel an optional WHERE `Filter` to `(fpreds, source_rc)`; a cut/exists
-            // path needs the source as an `Rc`, not a bare reference.
-            let (fpreds, source): (&[HirExpr], &Rc<RelExpr>) = match input.as_ref() {
-                RelExpr::Filter { input: src, preds } => (preds, src),
-                _ => (&[], input),
-            };
+            let (fpreds, source) = split_filter(input);
             match source.as_ref() {
                 // The fusion decision, asked once for every source kind rather than
                 // re-answered per arm: a shell that cannot materialize a computed
@@ -239,7 +242,6 @@ fn fuses_computed_projection(source: &RelExpr) -> bool {
 /// as a linear body over a synthetic `Get` on that segment. This is the
 /// scalar-decorrelation finalize: the finalize composite and the outer WHERE both
 /// run over the materialized join output.
-#[allow(clippy::too_many_arguments)]
 fn lower_computed_over_combine(
     client: &mut GnitzClient,
     chain: &mut ViewChain,
@@ -404,7 +406,7 @@ fn identity_project(subtree: &Rc<RelExpr>, keep: impl Fn(&super::HirCol) -> bool
 /// PK-front convention and the resulting `ColId` layout both come from
 /// `physicalize_projection`, the one home, instead of being hand-rolled here
 /// against a separately-synthesized `SELECT *`.
-pub(crate) fn wrap_passthrough_segment(
+fn wrap_passthrough_segment(
     client: &mut GnitzClient,
     chain: &mut ViewChain,
     get: &Rc<RelExpr>,
@@ -428,11 +430,13 @@ pub(crate) fn wrap_passthrough_segment(
 }
 
 /// Split an optional `Filter` off a node, returning its conjuncts (empty when
-/// absent) and the source below it.
-pub(crate) fn split_filter(input: &RelExpr) -> (&[HirExpr], &RelExpr) {
-    match input {
-        RelExpr::Filter { input, preds } => (preds, input.as_ref()),
-        other => (&[], other),
+/// absent) and the source below it. Hands back the source as the `Rc` every caller
+/// holds anyway — a cut/exists path needs to clone it, and a `&RelExpr` deref-coerces
+/// for the rest — so this is the one home for the peel.
+pub(crate) fn split_filter(input: &Rc<RelExpr>) -> (&[HirExpr], &Rc<RelExpr>) {
+    match input.as_ref() {
+        RelExpr::Filter { input, preds } => (preds, input),
+        _ => (&[], input),
     }
 }
 

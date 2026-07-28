@@ -13,12 +13,13 @@ use crate::agg::{
     emit_reduce, ensure_cardinality_count, group_col_reduce_pos, push_agg_specs, reduce_output_schema, AggSpec,
     ReduceShape,
 };
+use crate::codec::project_schema::{compile_projection_map, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::hir::chain::{EmitPieces, ViewChain};
-use crate::ir::{BExpr, BoundExpr};
-use crate::lower::{compile_bound_expr, compile_filter_program};
+use crate::ir::BExpr;
+use crate::lower::compile_filter_program;
 use crate::validate::reject_duplicate_column_names;
-use gnitz_core::{CircuitBuilder, ColumnDef, ExprBuilder, GnitzClient, ReduceOutKey};
+use gnitz_core::{CircuitBuilder, ColumnDef, GnitzClient, ReduceOutKey};
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -26,7 +27,6 @@ use std::rc::Rc;
 /// for `view_id`, returning the pieces plus the output `ColId` layout. `items` is
 /// the finalize projection; `having_preds` is the HAVING filter over the raw
 /// reduce output.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_reduce(
     client: &mut GnitzClient,
     chain: &mut ViewChain,
@@ -48,13 +48,12 @@ pub(crate) fn lower_reduce(
     // Resolve the reduce's input: inline a base/segment `Get` (with WHERE + scan
     // bound), or cut a combine input (`Filter?(Join)`) to a hidden segment.
     let (inner_where, inner_source) = split_filter(input);
-    let (source, source_layout, bound, where_folded) = match seginput_of_get(inner_source) {
+    let (source, bound, where_folded) = match seginput_of_get(inner_source) {
         Some(seg) => {
             // Base/segment Get: apply the WHERE + scan bound inline.
             let folded = physical::fold_preds(inner_where, &seg.layout)?;
             let bound = extract_scan_bound(client, &folded, seg.from_catalog, seg.tid, &seg.schema)?;
-            let layout = seg.layout.clone();
-            (seg, layout, bound, folded)
+            (seg, bound, folded)
         }
         None => {
             // Cut the whole input (WHERE included) to a hidden segment; the reduce
@@ -62,16 +61,15 @@ pub(crate) fn lower_reduce(
             let mut live: HashSet<ColId> = HashSet::new();
             live.extend(group_cols.iter().copied());
             live.extend(aggs.iter().filter_map(|a| a.arg));
-            let seg = cut_segment(client, chain, memo, input, &live)?;
-            let layout = seg.layout.clone();
-            (seg, layout, None, None)
+            (cut_segment(client, chain, memo, input, &live)?, None, None)
         }
     };
     let (source_tid, source_schema) = (source.tid, Rc::clone(&source.schema));
+    let source_layout = &source.layout;
 
     let group_positions: Vec<usize> = group_cols
         .iter()
-        .map(|g| slot_of(&source_layout, *g))
+        .map(|g| slot_of(source_layout, *g))
         .collect::<Result<_, _>>()?;
 
     // Decompose the aggregates into physical specs; record each agg's spec start.
@@ -79,7 +77,7 @@ pub(crate) fn lower_reduce(
     let mut agg_starts: Vec<usize> = Vec::new();
     for a in aggs {
         agg_starts.push(specs.len());
-        let arg_pos = a.arg.map(|id| slot_of(&source_layout, id)).transpose()?;
+        let arg_pos = a.arg.map(|id| slot_of(source_layout, id)).transpose()?;
         push_agg_specs(a.func, arg_pos, &source_schema.columns, &mut specs)?;
     }
     ensure_cardinality_count(&source_schema.columns, &mut specs)?;
@@ -138,46 +136,38 @@ pub(crate) fn lower_reduce(
     let mut out_cols: Vec<ColumnDef> = reduce_schema.columns[..pk_len].to_vec();
     let mut out_layout: Vec<ColId> = reduce_layout[..pk_len].to_vec();
     let mut pk_renamed = vec![false; pk_len];
-    let mut eb = ExprBuilder::new();
-    let mut payload_idx: u32 = 0;
+    let mut proj_items: Vec<ProjItem> = Vec::new();
     let is_natural = out_key != ReduceOutKey::SyntheticFold;
     for entry in items {
-        // A bare reference to a group column (finalize a natural PK in place).
-        let group_ref = match &entry.expr {
-            BExpr::ColRef(HirRef::Col(id)) if group_cols.contains(id) => Some(*id),
+        // A bare reference to a group column: its reduce-output slot, resolved in
+        // one scan (the position is what the emit needs, not the id).
+        let group_slot = match &entry.expr {
+            BExpr::ColRef(HirRef::Col(id)) => group_cols.iter().position(|g| g == id).map(|j| group_reduce_pos[j]),
             _ => None,
         };
-        if let Some(gid) = group_ref {
-            let j = group_cols.iter().position(|g| *g == gid).unwrap();
-            let reduce_col = group_reduce_pos[j];
-            if is_natural && !pk_renamed[reduce_col] {
-                out_cols[reduce_col].name = entry.out.def.name.clone();
-                out_layout[reduce_col] = entry.out.id;
-                pk_renamed[reduce_col] = true;
-                continue;
+        let item = match group_slot {
+            Some(reduce_col) => {
+                // A natural PK group column is finalized in place — renamed in the
+                // inherited PK region, not written by the map program. A second
+                // reference to the same group column falls through to the payload.
+                if is_natural && !pk_renamed[reduce_col] {
+                    out_cols[reduce_col].name = entry.out.def.name.clone();
+                    out_layout[reduce_col] = entry.out.id;
+                    pk_renamed[reduce_col] = true;
+                    continue;
+                }
+                ProjItem::PassThrough { src_col: reduce_col }
             }
-            eb.copy_col(reduce_col as u32, payload_idx);
-            out_cols.push(entry.out.def.clone());
-            out_layout.push(entry.out.id);
-            payload_idx += 1;
-            continue;
-        }
-        // Aggregate composite (or a Direct ColRef to a raw reduce column).
-        let resolved = physical::resolve_refs(&entry.expr, &reduce_layout)?;
-        match &resolved {
-            BoundExpr::ColRef(slot) => {
-                eb.copy_col(*slot as u32, payload_idx);
-            }
-            _ => {
-                let reg = compile_bound_expr(&resolved, &reduce_schema.columns, &mut eb)?;
-                eb.emit_col(reg, payload_idx);
-            }
-        }
+            // An aggregate composite, or a Direct `ColRef` to a raw reduce column.
+            None => ProjItem::from_bound(physical::resolve_refs(&entry.expr, &reduce_layout)?),
+        };
+        proj_items.push(item);
         out_cols.push(entry.out.def.clone());
         out_layout.push(entry.out.id);
-        payload_idx += 1;
     }
-    let mapped = cb.map_expr(filtered_reduced, eb.build(0));
+    // The payload slots, through the shared map compiler — `proj_items` is dense in
+    // payload order, since a renamed-in-place PK column never pushes one.
+    let mapped = cb.map_expr(filtered_reduced, compile_projection_map(&proj_items, &reduce_schema)?);
     cb.sink(mapped);
     let circuit = cb.build();
 
