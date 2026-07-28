@@ -54,8 +54,8 @@ fn filter_agrees_with_eval_row() {
 /// Regression: `is_strictly_non_nullable` formerly ignored STR_COL_*_CONST,
 /// so a `WHERE str_col = 'foo'` against a nullable string column would set
 /// `no_nulls=true` on the batch path and let null rows leak through as
-/// definite-true / definite-false results. Verify the batch path matches the
-/// per-row interpreter row-for-row on mixed null/non-null inputs.
+/// definite-true / definite-false results. Verify the batch path is
+/// row-for-row correct on mixed null/non-null inputs.
 #[test]
 fn test_str_col_eq_const_nullable_column_matches_per_row() {
     // Schema: pk(U64) + nullable STRING.

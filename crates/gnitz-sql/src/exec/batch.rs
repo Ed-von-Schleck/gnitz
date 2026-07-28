@@ -30,51 +30,23 @@ pub(crate) fn copy_batch_row_owned(src: &mut ZSetBatch, i: usize, dst: &mut ZSet
     }
 }
 
-/// The native-LE bytes of PK column `ci` at row `i`, as a fixed-width window.
-/// A compound (`Bytes`) PK yields a borrow of the column's OPK sub-range; a
-/// scalar PK (`U64s`/`U128s`) yields the low `wire_stride(tc)` bytes of the
-/// widened value (its native LE image — e.g. `I32(-1)` is `FF FF FF FF`). The
-/// single home for the Bytes-vs-scalar location logic shared by the residual
-/// interpreter (`eval`) and the ORDER BY comparator (`order`).
-pub(crate) enum PkWindow<'a> {
-    Borrowed(&'a [u8]),
-    Inline { buf: [u8; 16], len: usize },
-}
-
-impl PkWindow<'_> {
-    pub(crate) fn as_slice(&self) -> &[u8] {
-        match self {
-            PkWindow::Borrowed(s) => s,
-            PkWindow::Inline { buf, len } => &buf[..*len],
-        }
-    }
-}
-
-pub(crate) fn pk_col_window<'a>(batch: &'a ZSetBatch, schema: &Schema, ci: usize, i: usize) -> PkWindow<'a> {
-    pk_col_window_at(
-        batch,
-        schema.pk_byte_offset(ci),
-        schema.columns[ci].type_code.wire_stride(),
-        i,
-    )
-}
-
-/// [`pk_col_window`] with the column's `(pk_byte_offset, wire_stride)` already
-/// resolved — for callers that hoist the per-column schema lookups out of a
-/// per-row loop (the ORDER BY comparator's precomputed `SortKey`).
-pub(crate) fn pk_col_window_at<'a>(batch: &'a ZSetBatch, off: usize, stride: usize, i: usize) -> PkWindow<'a> {
-    match &batch.pks {
-        PkColumn::Bytes { stride: s, buf } => {
-            let s = *s as usize;
-            PkWindow::Borrowed(&buf[i * s + off..i * s + off + stride])
-        }
-        // A scalar PK (`get` widens `U64s`/`U128s` to `u128`); the low `stride`
-        // bytes are the column's native LE image.
-        _ => PkWindow::Inline {
-            buf: batch.pks.get(i).to_le_bytes(),
-            len: stride,
-        },
-    }
+/// Run a compiled predicate over a whole `ZSetBatch`, calling `emit_range` with
+/// each surviving half-open row range (`end` exclusive), in increasing order.
+///
+/// The one way a client filters a batch. It owns the two rules a call site would
+/// otherwise restate: the row count comes from the batch itself, so the view can
+/// never read out of bounds; and the batch is evaluated in one go, because
+/// `ViewBuffers::view` rebuilds a region list per call and a per-row view would
+/// pay a malloc plus a PK-region rebuild for every row.
+pub(crate) fn filter_batch(
+    ev: &gnitz_expr::Evaluator,
+    batch: &ZSetBatch,
+    schema: &Schema,
+    emit_range: impl FnMut(usize, usize),
+) {
+    let mut bufs = gnitz_core::ViewBuffers::default();
+    let view = bufs.view(batch, schema);
+    ev.filter(&view, batch.len(), emit_range);
 }
 
 /// A resolved projection: the output schema and, per output column, its source

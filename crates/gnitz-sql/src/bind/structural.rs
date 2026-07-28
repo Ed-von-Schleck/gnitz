@@ -234,7 +234,7 @@ fn bind_literal<R>(v: &Value) -> Result<BExpr<R>, GnitzSqlError> {
                 // it byte-exactly into a seek bound. Representing it as f64 would run
                 // an integer-column comparison through a lossy 52-bit mantissa (e.g.
                 // u64::MAX matches the wrong rows); the un-servable case rejects
-                // honestly at the compile boundary (`lower_bound_expr`), not here.
+                // honestly at the compile boundary (`OpcodeBackend::lower`), not here.
                 Ok(BExpr::LitWide(n.clone()))
             }
         }
@@ -419,6 +419,23 @@ mod tests {
     #[test]
     fn bind_literal_accepts_in_range_integer() {
         assert!(matches!(num("42"), Ok(BoundExpr::LitInt(42))));
+    }
+
+    /// A null test on a PK column never survives binding: a PK column is always
+    /// non-nullable, so [`fold_null_test`] const-folds it to a literal. That is
+    /// what keeps `IS [NOT] NULL` safe on a PK for the compiled evaluator, whose
+    /// `IsNull`/`IsNotNull` opcodes are payload-only and would reject a PK operand.
+    #[test]
+    fn null_test_on_pk_column_folds_to_a_literal() {
+        let schema = schema_with_val(TypeCode::I64); // pk is NOT NULL
+        assert!(matches!(
+            bind_single_table(&parse("pk IS NULL"), &schema).unwrap(),
+            BoundExpr::LitInt(0)
+        ));
+        assert!(matches!(
+            bind_single_table(&parse("pk IS NOT NULL"), &schema).unwrap(),
+            BoundExpr::LitInt(1)
+        ));
     }
 
     #[test]

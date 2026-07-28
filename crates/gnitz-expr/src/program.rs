@@ -8,7 +8,7 @@
 //! miscompute.
 
 use crate::{ColumnLocator, SchemaFacts};
-use gnitz_wire::encode_german_string;
+use gnitz_wire::{encode_german_string, FixedInt, TypeCode};
 // Wire opcodes (1–46) the client emits, matched as arms in `from_wire`. They are
 // `pub const … : u32` in gnitz-wire, so a plain `use` binds them for pattern use.
 use gnitz_wire::{
@@ -265,27 +265,28 @@ pub enum LogicalInstr {
 /// `Cmp`/`IntDiv`/`IntMod`/`IntToFloat`, reinterpreting the i64 register as u64.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Instr {
-    /// Payload integer load. Width and signedness are `const fn`s of `tc`
-    /// (`wire_stride` / `is_signed_int`), recomputed once per instruction in the
-    /// eval arm rather than carried here — the same convention as `LoadPk`.
+    /// Payload integer load. `fi` *is* the eight-arm decode the kernel dispatches
+    /// on, established once at resolve time (`validate` pins the column to
+    /// `ColKind::FixedInt`), so the row loop carries no wildcard arm.
     LoadPayloadInt {
         dst: u16,
         pi: u8,
-        tc: u8,
+        fi: FixedInt,
     },
+    /// Payload float load. `wide` is the F64-vs-F32 decode selector; `validate`
+    /// pins the column to `ColKind::Float`, so the two arms are total.
     LoadPayloadFloat {
         dst: u16,
         pi: u8,
-        tc: u8,
+        wide: bool,
     },
-    /// PK-region integer load: the addressed OPK column at byte `off`. Its width
-    /// and signedness are `const fn`s of `tc` (`wire_stride` / `is_signed_int` —
-    /// the same two `SchemaColumn::new` derives its fields from), recomputed once
-    /// per instruction in the eval arm rather than carried here.
+    /// PK-region integer load: the addressed OPK column at byte `off`. `off`
+    /// cannot come from `fi` — it is the column's offset within the OPK region,
+    /// not its width.
     LoadPk {
         dst: u16,
         off: u8,
-        tc: u8,
+        fi: FixedInt,
     },
     LoadConst {
         dst: u16,
@@ -659,10 +660,11 @@ impl LogicalProgram {
         use gnitz_wire::type_code;
         use Instr as I;
         use LogicalInstr as L;
-        // Per-register type code of the most recently produced integer value.
-        // Drives the signed→unsigned variant for U64 operands, whose i64 bit
-        // pattern is negative for values >= 2^63. 0 = unknown (treated signed).
-        let mut reg_tc = [0u8; MAX_REGS];
+        // Does this register currently hold a U64 value? That is the whole
+        // question the per-register tracking answers: it drives every
+        // signed→unsigned variant selection, because a U64 >= 2^63 has a
+        // negative i64 bit pattern. Unknown counts as not-U64, i.e. signed.
+        let mut reg_u64 = [false; MAX_REGS];
         // Payload slot of a payload-only opcode's column operand. `validate`'s
         // `ColKind::payload_only` rule rejects a PK column here and callers
         // validate before resolving, so the `None` arm
@@ -682,61 +684,69 @@ impl LogicalProgram {
                     // per-register tracking wants, so asking `col_type_code`
                     // too would make the two answers a divergence risk.
                     let loc = schema.locate(col as usize);
+                    // Total on a validated program: `validate` runs
+                    // `check_col(.., ColKind::FixedInt)` on every `LoadColInt`,
+                    // and that predicate is `gnitz_wire::is_fixed_int` — the same
+                    // eight codes `from_type_code` answers `Some` for. It covers
+                    // the PK arm too (`ColKind::FixedInt` is not payload-only, so
+                    // a U128/UUID PK is rejected as `ColKindMismatch`), which is
+                    // what makes the kernel's wide-column wildcard unnecessary.
+                    let fi = FixedInt::from_type_code(TypeCode::from_validated_u8(loc.type_code()))
+                        .expect("validated LoadColInt names a fixed-int column");
                     instrs.push(match loc {
-                        ColumnLocator::Pk {
-                            byte_off, type_code, ..
-                        } => I::LoadPk {
-                            dst,
-                            off: byte_off,
-                            tc: type_code,
-                        },
-                        ColumnLocator::Payload { slot, type_code, .. } => I::LoadPayloadInt {
-                            dst,
-                            pi: slot,
-                            tc: type_code,
-                        },
+                        ColumnLocator::Pk { byte_off, .. } => I::LoadPk { dst, off: byte_off, fi },
+                        ColumnLocator::Payload { slot, .. } => I::LoadPayloadInt { dst, pi: slot, fi },
                     });
-                    reg_tc[dst as usize] = loc.type_code();
+                    reg_u64[dst as usize] = loc.type_code() == type_code::U64;
                 }
                 L::LoadColFloat { dst, col } => {
-                    // One query, as in the `LoadColInt` arm above: the locator
-                    // carries both the slot and the type code.
-                    let (pi, tc) = match schema.locate(col as usize) {
-                        ColumnLocator::Payload { slot, type_code, .. } => (slot, type_code),
-                        ColumnLocator::Pk { type_code, .. } => (crate::PAYLOAD_MAPPING_PK_SENTINEL, type_code),
+                    // Total on a validated program, the same shape as the
+                    // `LoadColInt` arm above: `validate` runs
+                    // `check_col(.., ColKind::Float)`, so the column is F32 or F64
+                    // and nothing else. Stated positively so an unvalidated
+                    // program panics here rather than reading 8 bytes out of a
+                    // 4-byte region.
+                    let wide = match schema.col_type_code(col as usize) {
+                        type_code::F64 => true,
+                        type_code::F32 => false,
+                        other => unreachable!("validated LoadColFloat names F32/F64, got {other}"),
                     };
-                    instrs.push(I::LoadPayloadFloat { dst, pi, tc });
-                    reg_tc[dst as usize] = 0;
+                    instrs.push(I::LoadPayloadFloat {
+                        dst,
+                        pi: payload_slot(col as usize),
+                        wide,
+                    });
+                    reg_u64[dst as usize] = false;
                 }
                 L::LoadConst { dst, val } => {
                     instrs.push(I::LoadConst { dst, val });
-                    reg_tc[dst as usize] = 0;
+                    reg_u64[dst as usize] = false;
                 }
                 L::IntAdd { dst, a, b } => {
                     instrs.push(I::IntAdd { dst, a, b });
-                    reg_tc[dst as usize] = propagate_u64(&reg_tc, a, b);
+                    reg_u64[dst as usize] = reg_u64[a as usize] || reg_u64[b as usize];
                 }
                 L::IntSub { dst, a, b } => {
                     instrs.push(I::IntSub { dst, a, b });
-                    reg_tc[dst as usize] = propagate_u64(&reg_tc, a, b);
+                    reg_u64[dst as usize] = reg_u64[a as usize] || reg_u64[b as usize];
                 }
                 L::IntMul { dst, a, b } => {
                     instrs.push(I::IntMul { dst, a, b });
-                    reg_tc[dst as usize] = propagate_u64(&reg_tc, a, b);
+                    reg_u64[dst as usize] = reg_u64[a as usize] || reg_u64[b as usize];
                 }
                 L::IntDiv { dst, a, b } => {
-                    let u = any_u64(&reg_tc, a, b);
+                    let u = reg_u64[a as usize] || reg_u64[b as usize];
                     instrs.push(I::IntDiv { dst, a, b, signed: !u });
-                    reg_tc[dst as usize] = if u { type_code::U64 } else { 0 };
+                    reg_u64[dst as usize] = u;
                 }
                 L::IntMod { dst, a, b } => {
-                    let u = any_u64(&reg_tc, a, b);
+                    let u = reg_u64[a as usize] || reg_u64[b as usize];
                     instrs.push(I::IntMod { dst, a, b, signed: !u });
-                    reg_tc[dst as usize] = if u { type_code::U64 } else { 0 };
+                    reg_u64[dst as usize] = u;
                 }
                 L::IntNeg { dst, a } => {
                     instrs.push(I::IntNeg { dst, a });
-                    reg_tc[dst as usize] = reg_tc[a as usize];
+                    reg_u64[dst as usize] = reg_u64[a as usize];
                 }
                 L::FloatAdd { dst, a, b } => instrs.push(I::FloatAdd { dst, a, b }),
                 L::FloatSub { dst, a, b } => instrs.push(I::FloatSub { dst, a, b }),
@@ -746,15 +756,15 @@ impl LogicalProgram {
                 L::Cmp { op, dst, a, b } => {
                     // EQ/NE are bit-identical signed/unsigned; ordered compares
                     // pick the unsigned form when either operand is U64.
-                    let signed = matches!(op, CmpOp::Eq | CmpOp::Ne) || !any_u64(&reg_tc, a, b);
+                    let signed = matches!(op, CmpOp::Eq | CmpOp::Ne) || !(reg_u64[a as usize] || reg_u64[b as usize]);
                     instrs.push(I::Cmp { op, dst, a, b, signed });
-                    reg_tc[dst as usize] = 0;
+                    reg_u64[dst as usize] = false;
                 }
                 L::FCmp { op, dst, a, b } => instrs.push(I::FCmp { op, dst, a, b }),
                 L::IntToFloat { dst, a } => {
-                    let signed = reg_tc[a as usize] != type_code::U64;
+                    let signed = !reg_u64[a as usize];
                     instrs.push(I::IntToFloat { dst, a, signed });
-                    reg_tc[dst as usize] = 0;
+                    reg_u64[dst as usize] = false;
                 }
                 L::Select { dst, cond, a, b } => {
                     // U64-ness flows through Select exactly as through IntAdd: the
@@ -762,11 +772,11 @@ impl LogicalProgram {
                     // ordered compare / div / int_to_float on the CASE result picks
                     // the unsigned variant and values >= 2^63 order correctly.
                     instrs.push(I::Select { dst, cond, a, b });
-                    reg_tc[dst as usize] = propagate_u64(&reg_tc, a, b);
+                    reg_u64[dst as usize] = reg_u64[a as usize] || reg_u64[b as usize];
                 }
                 L::LoadNull { dst } => {
                     instrs.push(I::LoadNull { dst });
-                    reg_tc[dst as usize] = 0;
+                    reg_u64[dst as usize] = false;
                 }
                 L::BoolAnd { dst, a, b } => instrs.push(I::BoolAnd { dst, a, b }),
                 L::BoolOr { dst, a, b } => instrs.push(I::BoolOr { dst, a, b }),
@@ -1150,21 +1160,6 @@ fn check_emit_slot(out_schema: Option<&dyn SchemaFacts>, out: u32) -> Result<(),
         return Err(ExprValidateErr::EmitSlotNotEightBytes { out, type_code });
     }
     Ok(())
-}
-
-/// True iff either operand register currently holds a U64 value — the single
-/// rule that drives every signed→unsigned variant selection in `resolve`.
-fn any_u64(reg_tc: &[u8; MAX_REGS], a: u16, b: u16) -> bool {
-    let u64_tc = gnitz_wire::type_code::U64;
-    reg_tc[a as usize] == u64_tc || reg_tc[b as usize] == u64_tc
-}
-
-fn propagate_u64(reg_tc: &[u8; MAX_REGS], a: u16, b: u16) -> u8 {
-    if any_u64(reg_tc, a, b) {
-        gnitz_wire::type_code::U64
-    } else {
-        0
-    }
 }
 
 // ---------------------------------------------------------------------------

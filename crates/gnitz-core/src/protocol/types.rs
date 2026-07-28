@@ -1032,8 +1032,16 @@ impl ZSetBatch {
         }
         if not_null_mask != 0 {
             for (row, &word) in self.nulls.iter().enumerate() {
-                if word & not_null_mask != 0 {
-                    return Err(format!("row {row} sets a null bit on a NOT NULL column"));
+                let offending = word & not_null_mask;
+                if offending != 0 {
+                    // Name the column: the mask says only "some NOT NULL column",
+                    // and the caller cannot recover which from a bit position.
+                    let pi = offending.trailing_zeros() as usize;
+                    let name = schema
+                        .payload_columns()
+                        .find(|(p, _, _)| *p == pi)
+                        .map_or("?", |(_, _, c)| c.name.as_str());
+                    return Err(format!("row {row} sets a null bit on NOT NULL column '{name}'"));
                 }
             }
         }
@@ -1151,7 +1159,7 @@ impl<'a> BatchAppender<'a> {
     }
 
     /// Mark column `ci` NULL in the current row's null bitmap. The read side
-    /// (`eval_expr`, the WAL encoder) gates on `nulls[row] & (1 << payload_idx)`
+    /// (the expression evaluator, the WAL encoder) gates on `nulls[row] & (1 << payload_idx)`
     /// and consults the `Option` only when that bit is clear, so a pushed `None`
     /// and the bitmap must agree. Setting the bit here makes `str_null`/`bytes_null`
     /// self-sufficient — no out-of-band `null_mask` call required.

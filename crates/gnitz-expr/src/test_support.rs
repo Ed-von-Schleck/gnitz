@@ -209,28 +209,27 @@ fn push_payload_cols(v: &mut TestView, schema: &TestSchema) -> Vec<usize> {
     widths
 }
 
-/// Write `pk` into `row`'s PK region, addressed through the schema's own
+/// Write `pk` into every PK column of `row`, addressed through the schema's own
 /// locator — offset, width and type code all come from `locate`, so a fixture
-/// cannot disagree with the addressing the kernels use. `schema` must have
-/// exactly one PK column.
-fn set_sole_pk(v: &mut TestView, schema: &TestSchema, row: usize, pk: u64) {
-    let pk_ci = (0..schema.num_columns())
-        .find(|&ci| schema.is_pk_col(ci))
-        .expect("a PK column");
-    let ColumnLocator::Pk {
-        byte_off,
-        size,
-        type_code,
-    } = schema.locate(pk_ci)
-    else {
-        unreachable!("is_pk_col disagrees with locate")
-    };
-    v.set_pk_col(
-        row,
-        byte_off as usize,
-        &pk.to_le_bytes()[..(size as usize).min(8)],
-        type_code,
-    );
+/// cannot disagree with the addressing the kernels use. A compound PK gets the
+/// same source value in each column, truncated to that column's width; `pk` is a
+/// bit pattern, so a signed column reads it two's-complement.
+fn set_row_pk(v: &mut TestView, schema: &TestSchema, row: usize, pk: u64) {
+    for ci in 0..schema.num_columns() {
+        if let ColumnLocator::Pk {
+            byte_off,
+            size,
+            type_code,
+        } = schema.locate(ci)
+        {
+            v.set_pk_col(
+                row,
+                byte_off as usize,
+                &pk.to_le_bytes()[..(size as usize).min(8)],
+                type_code,
+            );
+        }
+    }
 }
 
 /// Build a [`TestView`] of `(pk, null_word, payload values)` rows against
@@ -240,7 +239,7 @@ pub fn make_int_view(schema: &TestSchema, rows: &[(u64, u64, &[i64])]) -> TestVi
     let mut v = TestView::new(rows.len(), schema.pk_stride());
     let widths = push_payload_cols(&mut v, schema);
     for (row, &(pk, null_word, cols)) in rows.iter().enumerate() {
-        set_sole_pk(&mut v, schema, row, pk);
+        set_row_pk(&mut v, schema, row, pk);
         v.set_null_word(row, null_word);
         for (pi, &val) in cols.iter().enumerate() {
             let w = widths[pi].min(8);
@@ -256,7 +255,7 @@ pub fn make_string_view(schema: &TestSchema, rows: &[&[&[u8]]]) -> TestView {
     let mut v = TestView::new(rows.len(), schema.pk_stride());
     push_payload_cols(&mut v, schema);
     for (row, cells) in rows.iter().enumerate() {
-        set_sole_pk(&mut v, schema, row, row as u64 + 1);
+        set_row_pk(&mut v, schema, row, row as u64 + 1);
         for (pi, s) in cells.iter().enumerate() {
             v.set_string(row, pi, s);
         }
@@ -300,7 +299,7 @@ pub fn make_n_col_view(
     let mut v = TestView::new(n, schema.pk_stride());
     push_payload_cols(&mut v, schema);
     for row in 0..n {
-        set_sole_pk(&mut v, schema, row, row as u64 + 1);
+        set_row_pk(&mut v, schema, row, row as u64 + 1);
         let mut null_word = 0u64;
         for col in 0..ncols {
             gnitz_wire::null_word_set(&mut null_word, col, null_pred(row, col));

@@ -421,6 +421,11 @@ impl FixedInt {
     }
 
     /// Byte width (1/2/4/8).
+    ///
+    /// `#[inline(always)]`: a `const fn` returning one of four constants, on the
+    /// evaluator's per-instruction PK-load path. Without the attribute it is an
+    /// out-of-line cross-crate call at `-O0` — the profile the E2E suite runs.
+    #[inline(always)]
     pub const fn width(self) -> usize {
         match self {
             Self::U8 | Self::I8 => 1,

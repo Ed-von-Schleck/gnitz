@@ -19,13 +19,14 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use gnitz_core::{
-    null_word_get, null_word_set, ColData, ColumnDef, FixedInt, ReduceOutKey, Schema, TypeCode, ViewBuffers, ZSetBatch,
+    null_word_get, null_word_set, ColData, ColumnDef, FixedInt, ReduceOutKey, Schema, TypeCode, ZSetBatch,
 };
 use gnitz_expr::Evaluator;
 use gnitz_wire::{cmp_typed_le, AggFunc as WireAggFunc};
 
 use crate::agg::{group_col_reduce_pos, AggShape, AggSpec, GroupByLayout, GroupBySelectItem};
 use crate::error::GnitzSqlError;
+use crate::exec::batch::filter_batch;
 use crate::validate::reject_duplicate_column_names;
 
 /// Everything the finish needs from the SQL layer, borrowed from the routing
@@ -213,11 +214,7 @@ pub(crate) fn agg_finish(spec: &AggFinish, partial: &ZSetBatch) -> ZSetBatch {
             // filter's own (`bool_bits & !null_bits`), and the region list, which
             // borrows the buffers and so cannot be cached, is built once.
             let groups = fill_group_batch(spec, partial, &reps, &accs);
-            let mut bufs = ViewBuffers::default();
-            let view = bufs.view(&groups, spec.partial_schema);
-            // `groups.len()`, not `reps.len()` — equal by construction, but the
-            // batch's own row count is what makes the view read in bounds.
-            ev.filter(&view, groups.len(), emit_range);
+            filter_batch(ev, &groups, spec.partial_schema, emit_range);
         }
     }
     out

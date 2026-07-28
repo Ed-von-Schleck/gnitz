@@ -117,6 +117,23 @@ impl ColumnLocator {
         }
     }
 
+    /// The ≤8-byte integer value in `row`, widened to `i64` under `fi`'s
+    /// signedness. The fused form of [`Self::native_le_bytes`] followed by
+    /// `FixedInt::decode_le_i64`, and the one place either kind of column becomes
+    /// an integer: a PK column goes through the OPK inverse without materializing
+    /// its native image first, a payload column reads verbatim.
+    ///
+    /// `fi` must be the column's own type (`FixedInt::from_type_code(type_code())`);
+    /// the width assert inside `decode_opk_i64` is what catches a caller that
+    /// pairs a locator with someone else's.
+    #[inline(always)]
+    pub fn decode_i64(&self, mb: &impl RowSource, row: usize, fi: gnitz_wire::FixedInt) -> i64 {
+        match *self {
+            ColumnLocator::Pk { .. } => gnitz_wire::decode_opk_i64(self.bytes(mb, row), fi),
+            ColumnLocator::Payload { .. } => fi.decode_le_i64(self.bytes(mb, row)),
+        }
+    }
+
     /// Canonical native u128 key for the value in `row` (sign-aware; the form
     /// `has_pk` and the index seeks compare on). Callers must `is_null`-gate a
     /// nullable payload column first; a PK column is never null.

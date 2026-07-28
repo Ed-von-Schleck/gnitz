@@ -17,8 +17,8 @@ pub struct ExprProgram {
     pub code: Vec<u32>,
     /// The byte-transparent const pool: length-prefixed raw byte strings. Holds
     /// german-string cells (string comparisons) and packed sorted-i64 arrays
-    /// (`INT_IN_SET` value pools) alike — the engine and interpreter interpret
-    /// each entry by the opcode that indexes it, never as text.
+    /// (`INT_IN_SET` value pools) alike — each entry is read by the opcode that
+    /// indexes it, never as text.
     pub const_strings: Vec<Vec<u8>>,
 }
 

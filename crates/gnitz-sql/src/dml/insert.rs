@@ -5,10 +5,10 @@
 //! `DO UPDATE SET` assignment behaves exactly like an `UPDATE ... SET`.
 
 use crate::ast_util::{extract_name, object_name_ident};
-use crate::bind::{find_unique_column, Binder};
-use crate::codec::colwrite::{append_value_to_col, ColumnValue};
+use crate::bind::{bind_single_table, find_unique_column, Binder};
+use crate::codec::colwrite::{append_value_to_col, check_not_null};
 use crate::codec::pk_codec::{extract_pk_value_mapped, is_null_expr};
-use crate::dml::mutate::{bind_mutate_scalar, build_merged_row, eval_set_expr, resolve_set_target};
+use crate::dml::mutate::{build_merged_row, classify_set_rhs, eval_set_program, resolve_set_target, SetProgram};
 use crate::dml::overlay::effective_row;
 use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
 use crate::error::GnitzSqlError;
@@ -16,7 +16,7 @@ use crate::exec::batch::{copy_batch_row, project, resolve_projection};
 use crate::ir::BoundExpr;
 use crate::SqlResult;
 use gnitz_core::null_word_set;
-use gnitz_core::{FixedInt, GnitzClient, PkTuple, Schema, WireConflictMode, ZSetBatch};
+use gnitz_core::{FixedInt, GnitzClient, PkTuple, Schema, ViewBuffers, WireConflictMode, ZSetBatch};
 use sqlparser::ast::{
     Assignment, ConflictTarget, Expr, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Parens, Query,
     SelectItem, SetExpr, TableObject, Values,
@@ -37,13 +37,22 @@ enum ConflictPlan {
     DoUpdatePk { assignments: Vec<(usize, BoundUpdateExpr)> },
 }
 
-/// Assignment RHS for `ON CONFLICT DO UPDATE`. Each variant wraps a
-/// `BoundExpr` and a scope — Existing evaluates against the stored
-/// row, Excluded against the incoming batch row. `EXCLUDED.col` is
-/// the only construct that escapes the existing-row scope.
+/// Assignment RHS for `ON CONFLICT DO UPDATE`. Each variant wraps a compiled
+/// [`SetProgram`] and a scope — Existing evaluates against the stored row,
+/// Excluded against the incoming batch row. `EXCLUDED.col` is the only construct
+/// that escapes the existing-row scope.
+///
+/// Both compile at bind time, against the catalog schema, which is the schema
+/// `insert.rs` reads every row through: the VALUES batch is built from it, and
+/// `effective_row`'s buffered branch copies into a batch built from it. Its
+/// committed branch returns the seek reply verbatim and drops the reply schema,
+/// so a row read back from the store is *assumed* to match — the same assumption
+/// `build_merged_row`'s carry path has always made here, not one this compilation
+/// introduces. (`mutate.rs` does not assume it: `resolve_where_rows` hands the
+/// reply schema back and the SET list compiles against that.)
 enum BoundUpdateExpr {
-    Existing(BoundExpr),
-    Excluded(BoundExpr),
+    Existing(SetProgram),
+    Excluded(SetProgram),
 }
 
 /// Validate the ON CONFLICT target against the supported subset:
@@ -228,8 +237,12 @@ pub(crate) fn execute_insert(
                 continue;
             }
             let val_expr = &row[slot_of[ci].expect("a visible payload column has a user value")];
-            // Check if this value is NULL and set the null bitmap
-            if is_null_expr(val_expr) {
+            let is_null = is_null_expr(val_expr);
+            // `ConflictPlan::DoUpdatePk` pushes only the *merged* batch, so an
+            // incoming NULL that survives this point never faces the wire
+            // boundary's own check.
+            check_not_null(col_def, is_null)?;
+            if is_null {
                 null_word_set(&mut null_bits, payload_idx, true);
             }
             append_value_to_col(&mut batch.columns[ci], col_def.type_code, val_expr)?;
@@ -316,20 +329,26 @@ fn bind_do_update_assignments(
         let col_idx = resolve_set_target(assignment, schema, &mut seen, "ON CONFLICT DO UPDATE SET")?;
         // Recognize EXCLUDED.col as a special form. sqlparser parses it
         // as a CompoundIdentifier: `EXCLUDED`.`col`.
-        let value = bind_do_update_rhs(&assignment.value, schema)?;
+        let value = bind_do_update_rhs(&assignment.value, col_idx, schema)?;
         out.push((col_idx, value));
     }
     Ok(out)
 }
 
-fn bind_do_update_rhs(expr: &Expr, schema: &Schema) -> Result<BoundUpdateExpr, GnitzSqlError> {
+fn bind_do_update_rhs(expr: &Expr, target: usize, schema: &Schema) -> Result<BoundUpdateExpr, GnitzSqlError> {
     // `EXCLUDED.col` — sqlparser produces `CompoundIdentifier`.
     if let Expr::CompoundIdentifier(parts) = expr {
         if parts.len() == 2 && parts[0].value.eq_ignore_ascii_case("EXCLUDED") {
             let col_name = parts[1].value.as_str();
             let col_idx = find_unique_column(&schema.columns, col_name)?
                 .ok_or_else(|| GnitzSqlError::Bind(format!("EXCLUDED.{col_name}: column not found")))?;
-            return Ok(BoundUpdateExpr::Excluded(BoundExpr::ColRef(col_idx)));
+            // Through the same classifier as a bare RHS, so `SET s = EXCLUDED.s`
+            // on a string column is a `StrCol` rather than an integer compile.
+            return Ok(BoundUpdateExpr::Excluded(classify_set_rhs(
+                &BoundExpr::ColRef(col_idx),
+                target,
+                schema,
+            )?));
         }
     }
     // Reject expressions that embed EXCLUDED references inside compound
@@ -343,11 +362,11 @@ fn bind_do_update_rhs(expr: &Expr, schema: &Schema) -> Result<BoundUpdateExpr, G
                 .to_string(),
         ));
     }
-    // The existing-row RHS is interpreted lazily per PK conflict, so reject a wide
-    // literal eagerly — else `DO UPDATE SET u64 = <wide>` on a no-conflict batch
-    // would silently insert instead of erroring.
-    let bound = bind_mutate_scalar(expr, schema)?;
-    Ok(BoundUpdateExpr::Existing(bound))
+    Ok(BoundUpdateExpr::Existing(classify_set_rhs(
+        &bind_single_table(expr, schema)?,
+        target,
+        schema,
+    )?))
 }
 
 /// Returns true if `expr` contains any `EXCLUDED.<col>` compound identifier —
@@ -426,6 +445,15 @@ fn client_side_merge_do_update(
     let mut seen_pks: std::collections::HashSet<PkTuple> = std::collections::HashSet::new();
     let mut out = ZSetBatch::new(schema);
 
+    // Two buffer sets, not one: the `excluded` view holds `&mut bufs_excluded`
+    // for the whole loop, so a second concurrent view over the same buffers would
+    // be `&mut` against a live `&mut`. The `existing` view is rebuilt per
+    // iteration over an owned ≤1-row batch, which NLL re-borrows cleanly and
+    // which is dwarfed by `effective_row`'s per-row seek round trip.
+    let mut bufs_excluded = ViewBuffers::default();
+    let mut bufs_existing = ViewBuffers::default();
+    let excluded_view = bufs_excluded.view(batch, schema);
+
     for i in 0..batch.pks.len() {
         let pk = batch.pks.get_tuple(i, stride);
         if !seen_pks.insert(pk) {
@@ -437,7 +465,7 @@ fn client_side_merge_do_update(
         }
 
         // The effective existing row — a row the transaction buffered is both the
-        // merge's carry source AND `eval_do_update_rhs`'s evaluation base, so
+        // merge's carry source AND the `Existing` scope's evaluation base, so
         // `SET x = x + 1` reads the buffered `x`; a buffered delete is no
         // conflict, and an untouched PK falls through to the committed store.
         let existing = effective_row(client, tid, schema, &pk)?;
@@ -447,28 +475,19 @@ fn client_side_merge_do_update(
                 copy_batch_row(batch, i, &mut out, schema);
             }
             Some(ex) => {
+                // The stored row is always row 0 of the ≤1-row `effective_row`
+                // batch; the incoming row is row `i` of the VALUES batch.
+                let existing_view = bufs_existing.view(ex, schema);
                 build_merged_row(batch, i, ex, 0, schema, &mut out, |ci| {
-                    asn_by_col[ci]
-                        .map(|rhs| eval_do_update_rhs(rhs, ex, batch, i, schema))
-                        .transpose()
+                    asn_by_col[ci].map(|rhs| match rhs {
+                        BoundUpdateExpr::Existing(p) => eval_set_program(p, &existing_view, 0),
+                        BoundUpdateExpr::Excluded(p) => eval_set_program(p, &excluded_view, i),
+                    })
                 })?;
             }
         }
     }
     Ok(out)
-}
-
-fn eval_do_update_rhs(
-    rhs: &BoundUpdateExpr,
-    existing: &ZSetBatch,
-    excluded: &ZSetBatch,
-    excluded_idx: usize,
-    schema: &Schema,
-) -> Result<ColumnValue, GnitzSqlError> {
-    match rhs {
-        BoundUpdateExpr::Existing(expr) => eval_set_expr(expr, existing, 0, schema),
-        BoundUpdateExpr::Excluded(expr) => eval_set_expr(expr, excluded, excluded_idx, schema),
-    }
 }
 
 /// INSERT writes VALUES positionally into `schema.payload_columns()` in schema

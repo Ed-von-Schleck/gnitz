@@ -28,7 +28,7 @@ use crate::dml::plan::{extract_limit, extract_offset};
 use crate::error::GnitzSqlError;
 use crate::exec::agg_finish::{agg_finish, build_agg_out_schema, AggFinish};
 use crate::exec::order::{order_limit_passthrough, read_spec_finish, resolve_read_spec_order};
-use crate::ir::{BinOp, BoundExpr};
+use crate::ir::BoundExpr;
 use crate::lower::{compile_filter_evaluator, compile_filter_program};
 use crate::validate::{
     cte_select_body, non_recursive_ctes, reject_unhonored_query_clauses, reject_unhonored_select_clauses,
@@ -350,23 +350,12 @@ fn plan_read_spec(
 
 /// AND-combine the bound residual conjuncts and compile to the wire predicate
 /// blob. Empty input or a statically-true predicate → an empty blob (the bound is
-/// exact). A single conjunct (including the whole-WHERE case) compiles borrow-only;
-/// only a multi-conjunct residual clones — once, for the winning candidate — to
-/// build the owned `AND`-tree.
+/// exact).
 fn compile_read_spec_predicate(exprs: &[&BoundExpr], schema: &Schema) -> Result<Vec<u8>, GnitzSqlError> {
-    let Some((&first, rest)) = exprs.split_first() else {
+    let Some(pred) = crate::ir::and_fold(exprs.iter().map(|e| (*e).clone())) else {
         return Ok(Vec::new());
     };
-    let folded;
-    let pred = if rest.is_empty() {
-        first
-    } else {
-        folded = rest.iter().fold(first.clone(), |acc, &e| {
-            BoundExpr::BinOp(Box::new(acc), BinOp::And, Box::new(e.clone()))
-        });
-        &folded
-    };
-    match compile_filter_program(pred, &schema.columns)? {
+    match compile_filter_program(&pred, &schema.columns)? {
         Some(prog) => Ok(prog.encode()),
         None => Ok(Vec::new()),
     }
@@ -455,7 +444,7 @@ fn execute_aggregate_select(
     // FILTER uses, resolved against that layout. Compiling here (rather than in
     // the client finish) keeps every rejection pre-dispatch, and it is the same
     // rejection either path gives: a HAVING that fails to compile here fails as a
-    // view too — including a wide literal, which `lower_bound_expr` rejects with
+    // view too — including a wide literal, which `OpcodeBackend::lower` rejects with
     // the message that names it.
     let having_ev = match &select.having {
         Some(having_expr) => {

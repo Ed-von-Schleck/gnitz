@@ -9,9 +9,10 @@
 
 use crate::codec::pk_codec::{parse_pk_literal_packed, parse_uuid_str};
 use crate::error::GnitzSqlError;
-use gnitz_core::{ColData, FixedInt, TypeCode};
+use gnitz_core::{ColData, ColumnDef, FixedInt, TypeCode};
 use sqlparser::ast::{Expr, UnaryOperator, Value};
 
+#[derive(Clone)]
 pub(crate) enum ColumnValue {
     Int(i64),
     Str(String),
@@ -122,22 +123,56 @@ pub(crate) fn append_value_to_col(col: &mut ColData, tc: TypeCode, val_expr: &Ex
     }
 }
 
+/// Reject a NULL destined for a NOT NULL column, naming it.
+///
+/// Both DML write paths check here rather than leaning on `ZSetBatch::validate`
+/// at the wire, because neither reaches the wire in time: `ON CONFLICT DO
+/// UPDATE` reads its incoming VALUES batch to build the merged row and never
+/// pushes it, and a transaction's buffered row is read back by later statements
+/// long before COMMIT validates it. Either reader is a program resolved with
+/// `no_nulls = true`, which would take the filler zero for a real value.
+pub(crate) fn check_not_null(col_def: &ColumnDef, is_null: bool) -> Result<(), GnitzSqlError> {
+    if is_null && !col_def.is_nullable {
+        return Err(GnitzSqlError::Bind(format!(
+            "NULL value in column '{}' violates NOT NULL",
+            col_def.name
+        )));
+    }
+    Ok(())
+}
+
+/// Which column types a SET value of each kind may target — the rule
+/// [`append_column_value`] enforces, stated once so the SET compiler can apply
+/// it before any row is fetched instead of only when one matched. `NULL` is
+/// admissible everywhere and needs no entry.
+pub(crate) fn set_target_admits(tc: TypeCode, str_valued: bool) -> bool {
+    if str_valued {
+        tc == TypeCode::String
+    } else {
+        // Implies `ColData::Fixed`: the variant is chosen from the type code.
+        FixedInt::from_type_code(tc).is_some()
+    }
+}
+
 pub(crate) fn append_column_value(col: &mut ColData, cv: ColumnValue, tc: TypeCode) -> Result<(), GnitzSqlError> {
+    let str_valued = matches!(cv, ColumnValue::Str(_));
+    if !matches!(cv, ColumnValue::Null) && !set_target_admits(tc, str_valued) {
+        return Err(GnitzSqlError::Bind(format!(
+            "cannot assign {} value to a {tc:?} column",
+            if str_valued { "string" } else { "integer" }
+        )));
+    }
     match cv {
         ColumnValue::Null => col.push_null(tc),
+        // Wrap-cast to the column's width (`i as u8`/`as i16`/…), the
+        // long-standing SET semantics, via the shared byte emitter.
         ColumnValue::Int(i) => match col {
-            ColData::Fixed(buf) => {
-                // Wrap-cast to the column's width (`i as u8`/`as i16`/…), the
-                // long-standing SET semantics, via the shared byte emitter.
-                let fi = FixedInt::from_type_code(tc)
-                    .ok_or_else(|| GnitzSqlError::Bind(format!("cannot assign Int to {tc:?}")))?;
-                encode_numeric(buf, fi, i);
-            }
-            _ => return Err(GnitzSqlError::Bind("Int value for non-numeric column".to_string())),
+            ColData::Fixed(buf) => encode_numeric(buf, FixedInt::from_type_code(tc).expect("admitted above"), i),
+            other => unreachable!("a fixed-int type code implies ColData::Fixed, got {other:?}"),
         },
         ColumnValue::Str(s) => match col {
             ColData::Strings(v) => v.push(Some(s)),
-            _ => return Err(GnitzSqlError::Bind("String value for non-string column".to_string())),
+            other => unreachable!("TypeCode::String implies ColData::Strings, got {other:?}"),
         },
     }
     Ok(())

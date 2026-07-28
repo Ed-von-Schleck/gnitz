@@ -8,7 +8,7 @@
 use std::cmp::Ordering;
 
 use crate::{BatchView, CmpOp, Instr, ResolvedProgram, StrOp, PAYLOAD_MAPPING_PK_SENTINEL};
-use gnitz_wire::{compare_german_strings, null_word_get, read_u64_le};
+use gnitz_wire::{compare_german_strings, null_word_get, read_u64_le, FixedInt};
 
 pub(crate) const MORSEL: usize = 256;
 pub(crate) const NULL_WORDS_PER_REG: usize = MORSEL / 64; // 4
@@ -593,14 +593,12 @@ pub(crate) fn eval_batch<B: BatchView>(
             // ----------------------------------------------------------------
             // Load operations
             // ----------------------------------------------------------------
-            Instr::LoadPayloadInt { dst, pi, tc } => {
+            Instr::LoadPayloadInt { dst, pi, fi } => {
                 let dst = dst as usize;
                 let pi = pi as usize;
-                // Width and signedness are `const fn`s of `tc`; derive them once
-                // per instruction, outside the row loop (as `LoadPk` does).
-                let col_size = gnitz_wire::wire_stride(tc);
-                let is_signed = gnitz_wire::is_signed_int(tc);
-                let col_data = mb.col_data(pi, col_size);
+                // The width is a `const fn` of `fi`; derive it once per
+                // instruction, outside the row loop (as `LoadPk` does).
+                let col_data = mb.col_data(pi, fi.width());
                 let dst_reg = scratch.reg_mut(dst, m);
                 // Widen `m` rows of a `SZ`-byte little-endian column into i64 registers.
                 // `SZ` is a compile-time constant per instantiation, so each expansion is
@@ -614,100 +612,74 @@ pub(crate) fn eval_batch<B: BatchView>(
                         }
                     }};
                 }
-                match (col_size, is_signed) {
+                // This match *is* `FixedInt`'s variants — total, with no wildcard,
+                // which is what `FixedInt` exists for: a wide column can no longer
+                // reach here, because `resolve_program` proved it could not.
+                match fi {
                     // 8-byte: the one width with no widening and no signed/unsigned split —
                     // the i64 register IS the storage type, a bare bit-reinterpret. Kept inline
                     // so `load_int!` (which appends `as i64`) never emits a vacuous `i64 as i64`.
-                    (8, _) => {
+                    FixedInt::U64 | FixedInt::I64 => {
                         let b = &col_data[morsel_start * 8..(morsel_start + m) * 8];
                         for (i, c) in b.chunks_exact(8).enumerate() {
                             dst_reg[i] = i64::from_le_bytes(c.try_into().unwrap());
                         }
                     }
-                    (4, true) => load_int!(i32),
-                    (4, false) => load_int!(u32),
-                    (2, true) => load_int!(i16),
-                    (2, false) => load_int!(u16),
-                    (1, true) => load_int!(i8),
-                    (1, false) => load_int!(u8),
-                    // Wide (16-byte) columns are rejected at compile
-                    // (`ExprValidateErr::ColKindMismatch` + the binder's
-                    // `is_wide_int` gate), so no LoadColInt ever resolves to one.
-                    _ => unreachable!("LoadPayloadInt: col_size {col_size} > 8; wide columns rejected at compile"),
+                    FixedInt::I32 => load_int!(i32),
+                    FixedInt::U32 => load_int!(u32),
+                    FixedInt::I16 => load_int!(i16),
+                    FixedInt::U16 => load_int!(u16),
+                    FixedInt::I8 => load_int!(i8),
+                    FixedInt::U8 => load_int!(u8),
                 }
                 fill_null_bits_mask(scratch, dst, null_bmp, morsel_start, m, 1u64 << pi);
                 maybe_pack_bool_bits(scratch, prog, dst, m);
             }
 
-            Instr::LoadPayloadFloat { dst, pi, tc } => {
+            Instr::LoadPayloadFloat { dst, pi, wide } => {
                 debug_assert_ne!(
                     pi, PAYLOAD_MAPPING_PK_SENTINEL,
                     "LOAD_COL_FLOAT operand resolved to a PK column; a PK column is never float",
                 );
                 let dst = dst as usize;
                 let pi = pi as usize;
-                let col_size = gnitz_wire::wire_stride(tc);
-                let col_data = mb.col_data(pi, col_size);
+                let col_data = mb.col_data(pi, if wide { 8 } else { 4 });
                 let dst_reg = scratch.reg_mut(dst, m);
-                // Branch on the type, not the width: `validate` pins this column
-                // to F32/F64 (`ColKind::Float`), so the two arms are total. An F32
-                // widens to f64 on load — every float register holds an f64 image,
-                // which is why a computed float column is declared F64.
-                if tc == gnitz_wire::type_code::F32 {
+                // `wide` is the resolve-time F64-vs-F32 verdict; `validate` pins
+                // this column to F32/F64 (`ColKind::Float`), so the two arms are
+                // total. An F32 widens to f64 on load — every float register holds
+                // an f64 image, which is why a computed float column is F64.
+                if wide {
+                    let b = &col_data[morsel_start * 8..(morsel_start + m) * 8];
+                    for (i, c) in b.chunks_exact(8).enumerate() {
+                        dst_reg[i] = i64::from_le_bytes(c.try_into().unwrap());
+                    }
+                } else {
                     let b = &col_data[morsel_start * 4..(morsel_start + m) * 4];
                     for (i, c) in b.chunks_exact(4).enumerate() {
                         let bits = u32::from_le_bytes(c.try_into().unwrap());
                         dst_reg[i] = encode_f64(f32::from_bits(bits) as f64);
-                    }
-                } else {
-                    let b = &col_data[morsel_start * 8..(morsel_start + m) * 8];
-                    for (i, c) in b.chunks_exact(8).enumerate() {
-                        dst_reg[i] = i64::from_le_bytes(c.try_into().unwrap());
                     }
                 }
                 fill_null_bits_mask(scratch, dst, null_bmp, morsel_start, m, 1u64 << pi);
                 maybe_pack_bool_bits(scratch, prog, dst, m);
             }
 
-            // PK-region integer load. `signed` selects the decode; the unsigned
-            // and signed branches delegate to `widen_pk_be` / `read_signed`.
-            // Width and signedness are `const fn`s of `tc`; derive them once per
-            // instruction, outside the row loop.
-            Instr::LoadPk { dst, off, tc } => {
+            // PK-region integer load: one `decode_opk_i64` per row, which is the
+            // exact inverse of the OPK encoding fused with `fi`'s widening. The
+            // slice width is derived once per instruction, outside the row loop.
+            // The 8-arm match stays inside `decode_opk_i64` rather than
+            // unswitching this loop into eight width-specialised copies: at `-O0`
+            // it is a handful of instructions on a loop-invariant 1-byte enum,
+            // and at `-O1`+ LLVM unswitches it.
+            Instr::LoadPk { dst, off, fi } => {
                 let dst = dst as usize;
                 let byte_offset = off as usize;
-                let col_size = gnitz_wire::wire_stride(tc);
-                // Wide (16-byte) PK columns are rejected at compile
-                // (`ExprValidateErr::ColKindMismatch` + the binder), so both
-                // branches below assume `col_size <= 8` (the signed branch's 8-byte
-                // scratch would otherwise panic-slice).
-                debug_assert!(col_size <= 8, "LoadPk: wide PK column rejected at compile");
-                let signed = gnitz_wire::is_signed_int(tc);
+                let w = fi.width();
                 let base_d = dst * MORSEL;
-                if signed {
-                    // Decode the OPK column back to native LE (un-flips the sign
-                    // bit), then sign-extend to i64 at the exact column width.
-                    // The scratch is declared outside the loop: `decode_pk_column`
-                    // writes every byte `read_signed` then reads, so a per-row
-                    // `[0u8; 8]` is a `memset` PLT call for a value never observed.
-                    let mut le = [0u8; 8];
-                    for i in 0..m {
-                        let opk = mb.get_pk_bytes(morsel_start + i);
-                        gnitz_wire::decode_pk_column(
-                            &opk[byte_offset..byte_offset + col_size],
-                            tc,
-                            &mut le[..col_size],
-                        );
-                        scratch.regs[base_d + i] = gnitz_wire::read_signed(&le, col_size);
-                    }
-                } else {
-                    // The addressed OPK column is big-endian; `widen_pk_be` right-
-                    // aligns it into a u128, recovering the native value.
-                    for i in 0..m {
-                        let opk = mb.get_pk_bytes(morsel_start + i);
-                        scratch.regs[base_d + i] =
-                            gnitz_wire::widen_pk_be(&opk[byte_offset..byte_offset + col_size], col_size) as i64;
-                    }
+                for i in 0..m {
+                    let opk = mb.get_pk_bytes(morsel_start + i);
+                    scratch.regs[base_d + i] = gnitz_wire::decode_opk_i64(&opk[byte_offset..byte_offset + w], fi);
                 }
                 scratch.clear_null_reg(dst, m);
                 maybe_pack_bool_bits(scratch, prog, dst, m);

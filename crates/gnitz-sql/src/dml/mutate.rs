@@ -1,23 +1,27 @@
 //! UPDATE and DELETE: resolve the matching rows once via `resolve_where_rows`
 //! (the shared PK-seek → secondary-index → predicate-scan ladder), then write
 //! the SET batch (UPDATE) or collect the PKs to retract (DELETE). The SET-list
-//! helpers (`eval_set_expr`, `resolve_set_target`) are also reused by INSERT's
-//! `ON CONFLICT DO UPDATE`.
+//! helpers (`classify_set_rhs`, `eval_set_program`, `resolve_set_target`) are
+//! also reused by INSERT's `ON CONFLICT DO UPDATE`.
 
 use crate::access::collect_index_seek_candidates;
 use crate::ast_util::{extract_name, extract_table_factor_name};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
-use crate::codec::colwrite::{append_column_value, ColumnValue};
+use crate::codec::colwrite::{append_column_value, check_not_null, set_target_admits, ColumnValue};
 use crate::dml::overlay::{buffered_all, buffered_keys, overlay_batch, Net};
 use crate::dml::plan::{classify_access, first_index_hit, seek_pk_multi, AccessPath};
 use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
 use crate::error::GnitzSqlError;
-use crate::exec::eval::eval_expr;
 use crate::exec::residual::matching_indices;
-use crate::ir::{find_wide_literal, wide_int_error, BoundExpr};
+use crate::ir::BoundExpr;
+use crate::lower::compile_scalar_evaluator;
 use crate::SqlResult;
 use gnitz_core::null_word_set;
-use gnitz_core::{retraction_batch, ColData, GnitzClient, PkColumn, PkTuple, Schema, WireConflictMode, ZSetBatch};
+use gnitz_core::{
+    retraction_batch, ColData, GnitzClient, PkColumn, PkTuple, Schema, TypeCode, ViewBuffers, WireConflictMode,
+    ZSetBatch, ZSetBatchView,
+};
+use gnitz_expr::Evaluator;
 use sqlparser::ast::{Assignment, AssignmentTarget, Expr, FromTable};
 use std::sync::Arc;
 
@@ -25,41 +29,84 @@ use std::sync::Arc;
 // SET-list helpers (shared with INSERT's ON CONFLICT DO UPDATE)
 // ---------------------------------------------------------------------------
 
-/// Bind a mutate SET / `DO UPDATE` RHS scalar against `schema`, rejecting a wide
-/// integer literal (`LitWide`) eagerly. The SET evaluators (`eval_set_expr`) run
-/// **lazily** per matched/conflicting row, so a `LitWide` there — which has no VM
-/// slot — would otherwise silently no-op when nothing matches instead of erroring
-/// deterministically. Shared by `UPDATE SET` and `ON CONFLICT DO UPDATE SET`.
-pub(crate) fn bind_mutate_scalar(expr: &Expr, schema: &Schema) -> Result<BoundExpr, GnitzSqlError> {
-    let bound = bind_single_table(expr, schema)?;
-    if let Some(lit) = find_wide_literal(&bound) {
-        return Err(wide_int_error(lit));
-    }
-    Ok(bound)
+/// A compiled SET / `DO UPDATE SET` right-hand side.
+///
+/// `Const` and `StrCol` are **structural, not an optimisation**: `ColumnValue`
+/// carries an owned `String` and the expression VM has no string result
+/// register, so `SET s = 'lit'` and `SET s = other_str` have no compiled form at
+/// all. A literal integer or NULL joins `Const` because it is the same thing —
+/// a row-independent value — and reaching it through the VM would run a whole
+/// single-row `eval_batch` per matched row to re-derive a constant.
+///
+/// `StrCol` is gated on `TypeCode::String` rather than `is_german_string()` on
+/// purpose: a BLOB column must fall into `Num`, where `OpcodeBackend`'s column
+/// load rejects it. That gate also keeps the arm structurally safe — a PK column
+/// can never be STRING (§1), so `StrCol` can never name one, whose slot in
+/// `ZSetBatch.columns` is an empty placeholder.
+pub(crate) enum SetProgram {
+    /// A row-independent value: a literal, or `NULL`.
+    Const(ColumnValue),
+    /// A bare reference to a `TypeCode::String` column, read verbatim.
+    StrCol(usize),
+    /// Everything else — integer-valued. Boxed so a `SetProgram` stays small
+    /// enough to sit in a `Vec` beside the other two arms (`Evaluator` owns a
+    /// resolved program plus its register file).
+    Num(Box<Evaluator>),
 }
 
-pub(crate) fn eval_set_expr(
-    expr: &BoundExpr,
-    batch: &ZSetBatch,
-    row_idx: usize,
-    schema: &Schema,
-) -> Result<ColumnValue, GnitzSqlError> {
-    match expr {
-        BoundExpr::LitStr(s) => return Ok(ColumnValue::Str(s.clone())),
-        BoundExpr::ColRef(c) => {
-            if let ColData::Strings(v) = &batch.columns[*c] {
-                return Ok(match &v[row_idx] {
-                    Some(s) => ColumnValue::Str(s.clone()),
-                    None => ColumnValue::Null,
-                });
-            }
-            // fall through: numeric column handled by eval_expr below
-        }
-        _ => {}
+/// Classify one SET RHS for target column `target` against the schema the rows
+/// it will run over carry. Shared by `UPDATE SET` and `ON CONFLICT DO UPDATE
+/// SET`, including the latter's `EXCLUDED.<col>` short-circuit, so a string
+/// EXCLUDED assignment classifies the same way a bare one does.
+///
+/// The target check is what makes [`eval_set_program`] infallible. Without it a
+/// kind mismatch (`SET int_col = 'abc'`) would surface only from
+/// `append_column_value`, i.e. only once a row matched — so a zero-match WHERE
+/// would report 0 rows updated instead of rejecting.
+pub(crate) fn classify_set_rhs(expr: &BoundExpr, target: usize, schema: &Schema) -> Result<SetProgram, GnitzSqlError> {
+    let p = match expr {
+        BoundExpr::LitStr(s) => SetProgram::Const(ColumnValue::Str(s.clone())),
+        BoundExpr::LitInt(v) => SetProgram::Const(ColumnValue::Int(*v)),
+        BoundExpr::LitNull => SetProgram::Const(ColumnValue::Null),
+        // `ColData::empty_for(TypeCode::String)` is the `Strings` variant and
+        // every batch reaching SET is built from a `Schema`, so the declared type
+        // code decides the representation.
+        BoundExpr::ColRef(c) if schema.columns[*c].type_code == TypeCode::String => SetProgram::StrCol(*c),
+        _ => SetProgram::Num(Box::new(compile_scalar_evaluator(expr, schema)?)),
+    };
+    let tc = schema.columns[target].type_code;
+    let str_valued = match &p {
+        SetProgram::Const(ColumnValue::Null) => return Ok(p), // NULL suits every column
+        SetProgram::Const(cv) => matches!(cv, ColumnValue::Str(_)),
+        SetProgram::StrCol(_) => true,
+        SetProgram::Num(_) => false,
+    };
+    if !set_target_admits(tc, str_valued) {
+        return Err(GnitzSqlError::Bind(format!(
+            "cannot assign {} value to column '{}' ({tc:?})",
+            if str_valued { "a string" } else { "an integer" },
+            schema.columns[target].name,
+        )));
     }
-    match eval_expr(expr, batch, row_idx, schema)? {
-        None => Ok(ColumnValue::Null),
-        Some(v) => Ok(ColumnValue::Int(v)),
+    Ok(p)
+}
+
+/// Read one SET RHS for `row` of the batch `view` presents. Infallible — every
+/// rejection happened at [`classify_set_rhs`].
+pub(crate) fn eval_set_program(p: &SetProgram, view: &ZSetBatchView<'_>, row: usize) -> ColumnValue {
+    match p {
+        SetProgram::Const(cv) => cv.clone(),
+        SetProgram::StrCol(c) => match &view.batch().columns[*c] {
+            ColData::Strings(v) => match &v[row] {
+                Some(s) => ColumnValue::Str(s.clone()),
+                None => ColumnValue::Null,
+            },
+            other => unreachable!("classify_set_rhs gates StrCol on TypeCode::String, got {other:?}"),
+        },
+        SetProgram::Num(ev) => match ev.eval_row(view, row) {
+            (_, true) => ColumnValue::Null,
+            (v, false) => ColumnValue::Int(v),
+        },
     }
 }
 
@@ -117,7 +164,7 @@ pub(crate) fn build_merged_row<F>(
     mut resolve: F,
 ) -> Result<(), GnitzSqlError>
 where
-    F: FnMut(usize) -> Result<Option<ColumnValue>, GnitzSqlError>,
+    F: FnMut(usize) -> Option<ColumnValue>,
 {
     dst.pks.push_from(&pk_src.pks, pk_idx);
     dst.weights.push(1);
@@ -125,9 +172,14 @@ where
     // payload bit (set on a NULL result, clear on non-NULL), unassigned bits ride.
     let mut null_bits = carry_src.nulls[carry_idx];
     for (payload_idx, ci, col_def) in schema.payload_columns() {
-        match resolve(ci)? {
+        match resolve(ci) {
             Some(cv) => {
-                null_word_set(&mut null_bits, payload_idx, matches!(cv, ColumnValue::Null));
+                // The NULL a SET produces at *run* time — an explicit `= NULL`, or
+                // NULL propagation through the compiled RHS — which
+                // `classify_set_rhs` cannot see.
+                let is_null = matches!(cv, ColumnValue::Null);
+                check_not_null(col_def, is_null)?;
+                null_word_set(&mut null_bits, payload_idx, is_null);
                 append_column_value(&mut dst.columns[ci], cv, col_def.type_code)?;
             }
             None => {
@@ -147,21 +199,24 @@ where
 fn write_set_rows(
     current: &ZSetBatch,
     matched: &[usize],
-    assignments: &[(usize, BoundExpr)],
+    assignments: &[(usize, SetProgram)],
     schema: &Schema,
     dst: &mut ZSetBatch,
 ) -> Result<(), GnitzSqlError> {
     // Pre-index assignments by column for O(1) lookup per payload column
     // (closes the prior O(cols²) per-row `assignments.iter().find`).
-    let mut asn_by_col: Vec<Option<&BoundExpr>> = vec![None; schema.columns.len()];
-    for (ci, expr) in assignments {
-        asn_by_col[*ci] = Some(expr);
+    let mut asn_by_col: Vec<Option<&SetProgram>> = vec![None; schema.columns.len()];
+    for (ci, p) in assignments {
+        asn_by_col[*ci] = Some(p);
     }
+    // One view over `current` for the whole loop — `ViewBuffers::view` rebuilds
+    // its region list per call, so a per-row view would be a malloc plus a
+    // PK-region rebuild per row.
+    let mut bufs = ViewBuffers::default();
+    let view = bufs.view(current, schema);
     for &row_idx in matched {
         build_merged_row(current, row_idx, current, row_idx, schema, dst, |ci| {
-            asn_by_col[ci]
-                .map(|expr| eval_set_expr(expr, current, row_idx, schema))
-                .transpose()
+            asn_by_col[ci].map(|p| eval_set_program(p, &view, row_idx))
         })?;
     }
     Ok(())
@@ -233,7 +288,7 @@ fn resolve_where_rows(
             let net = buffered_all(client, tid);
             // Committed rows already satisfy the winning index's equality prefix,
             // so its reduced `residual` decides them — and it is the only form the
-            // row evaluator can always handle (an indexed STRING/U128 equality is
+            // residual evaluator can always handle (an indexed 128-bit equality is
             // seekable but not evaluable). Buffered rows are unindexed, so once the
             // transaction has touched this table every row must face the FULL
             // predicate instead.
@@ -253,13 +308,6 @@ fn resolve(
     net: &Net,
     preds: &[&BoundExpr],
 ) -> Result<ResolvedRows, GnitzSqlError> {
-    // The residual is interpreted lazily per row; reject an un-consumed wide
-    // literal here so an empty match errors deterministically rather than
-    // silently succeeding. A servable wide seek is consumed into the access-path
-    // bound and never reaches the residual.
-    if let Some(lit) = preds.iter().find_map(|p| find_wide_literal(p)) {
-        return Err(wide_int_error(lit));
-    }
     let actual = schema_opt.as_deref().unwrap_or(schema);
     let batch = overlay_batch(committed, net, actual);
     let matched = matching_indices(preds, &batch, actual)?;
@@ -315,8 +363,7 @@ pub(crate) fn execute_update(
     let mut seen: Vec<usize> = Vec::with_capacity(assignments_raw.len());
     for assignment in assignments_raw {
         let col_idx = resolve_set_target(assignment, &schema, &mut seen, "UPDATE SET")?;
-        let bound_val = bind_mutate_scalar(&assignment.value, &schema)?;
-        assignments.push((col_idx, bound_val));
+        assignments.push((col_idx, bind_single_table(&assignment.value, &schema)?));
     }
 
     // Read the target rows and build the SET batch under the RMW driver: an
@@ -326,13 +373,25 @@ pub(crate) fn execute_update(
     let count = commit_rmw_or_buffer(client, &table_name, table_id, |client| {
         let resolved = resolve_where_rows(client, table_id, &schema, selection.as_ref())?;
         let actual_schema = resolved.schema.as_deref().unwrap_or(&*schema);
+        // Compile against the schema the rows actually carry — the reply schema,
+        // not the catalog one the RHS was bound against: resolution bakes in
+        // payload slots, PK byte offsets, type codes and the nullability verdict,
+        // so compiling against the wrong schema miscomputes silently.
+        //
+        // Unconditional, above the row-count check: an un-compilable RHS
+        // (`SET int_col = float_col`, a wide literal) then errors deterministically
+        // instead of only when at least one row matched.
+        let programs = assignments
+            .iter()
+            .map(|(ci, e)| Ok((*ci, classify_set_rhs(e, *ci, actual_schema)?)))
+            .collect::<Result<Vec<_>, GnitzSqlError>>()?;
         let count = resolved.matched.len();
         let write = if count > 0 {
             let mut updates = ZSetBatch::new(actual_schema);
             write_set_rows(
                 &resolved.batch,
                 &resolved.matched,
-                &assignments,
+                &programs,
                 actual_schema,
                 &mut updates,
             )?;
@@ -414,6 +473,20 @@ mod tests {
     use crate::test_support::{batch_2col, col_def, two_col};
     use gnitz_core::TypeCode;
 
+    /// Compile a SET list the way the RMW closure does — against the schema the
+    /// rows carry. A test whose RHS does not compile is a bug in the test.
+    fn programs(assignments: &[(usize, BoundExpr)], schema: &Schema) -> Vec<(usize, SetProgram)> {
+        assignments
+            .iter()
+            .map(|(ci, e)| {
+                (
+                    *ci,
+                    classify_set_rhs(e, *ci, schema).expect("test SET RHS must compile"),
+                )
+            })
+            .collect()
+    }
+
     // ------------------------------------------------------------------
     // write_set_rows must update the null bitmap for assignments
     // ------------------------------------------------------------------
@@ -427,7 +500,7 @@ mod tests {
 
         let assignments = vec![(1usize, BoundExpr::LitInt(99))];
         let mut dst = ZSetBatch::new(&schema);
-        write_set_rows(&current, &[0], &assignments, &schema, &mut dst).unwrap();
+        write_set_rows(&current, &[0], &programs(&assignments, &schema), &schema, &mut dst).unwrap();
 
         assert_eq!(
             dst.nulls[0] & 0b1,
@@ -465,7 +538,7 @@ mod tests {
         // SET a = b  (ColRef(2) = b, which is NULL in current)
         let assignments = vec![(1usize, BoundExpr::ColRef(2))];
         let mut dst = ZSetBatch::new(&schema);
-        write_set_rows(&current, &[0], &assignments, &schema, &mut dst).unwrap();
+        write_set_rows(&current, &[0], &programs(&assignments, &schema), &schema, &mut dst).unwrap();
 
         // a's null bit (payload_idx 0 → bit 0) must now be set
         assert_ne!(dst.nulls[0] & 0b01, 0, "a must be null after SET a = NULL_col");
@@ -498,7 +571,7 @@ mod tests {
         // Only assign to a; b is untouched
         let assignments = vec![(1usize, BoundExpr::LitInt(10))];
         let mut dst = ZSetBatch::new(&schema);
-        write_set_rows(&current, &[0], &assignments, &schema, &mut dst).unwrap();
+        write_set_rows(&current, &[0], &programs(&assignments, &schema), &schema, &mut dst).unwrap();
 
         assert_eq!(dst.nulls[0] & 0b01, 0, "a must not be null (assigned non-null)");
         assert_ne!(dst.nulls[0] & 0b10, 0, "b must remain null (unassigned)");
@@ -529,7 +602,7 @@ mod tests {
 
         let assignments = vec![(2usize, BoundExpr::LitInt(99))];
         let mut dst = ZSetBatch::new(&schema);
-        write_set_rows(&current, &[0], &assignments, &schema, &mut dst).unwrap();
+        write_set_rows(&current, &[0], &programs(&assignments, &schema), &schema, &mut dst).unwrap();
 
         if let ColData::Bytes(v) = &dst.columns[1] {
             assert_eq!(v[0].as_deref(), Some(&[1u8, 2, 3][..]));
@@ -581,7 +654,11 @@ mod tests {
         // Resolver: assign v = NULL (must SET its null bit); leave b unassigned (carry).
         let mut dst = ZSetBatch::new(&schema);
         build_merged_row(&pk_src, 0, &carry_src, 0, &schema, &mut dst, |ci| {
-            Ok(if ci == 1 { Some(ColumnValue::Null) } else { None })
+            if ci == 1 {
+                Some(ColumnValue::Null)
+            } else {
+                None
+            }
         })
         .unwrap();
 
@@ -597,5 +674,124 @@ mod tests {
         } else {
             panic!("expected carried Bytes column");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // SET right-hand sides through the shared evaluator
+    // ------------------------------------------------------------------
+
+    /// The written `i64` of `dst`'s single-row payload column `ci`.
+    fn written_i64(dst: &ZSetBatch, ci: usize) -> i64 {
+        match &dst.columns[ci] {
+            ColData::Fixed(buf) => i64::from_le_bytes(buf[..8].try_into().unwrap()),
+            other => panic!("expected a Fixed column, got {other:?}"),
+        }
+    }
+
+    /// A numeric RHS reading a **nullable** source column: the compiled program
+    /// resolves `no_nulls = false`, so a NULL source must come back as
+    /// `ColumnValue::Null` and set the destination's null bit rather than reading
+    /// the filler zeros as a real `0`.
+    #[test]
+    fn set_numeric_over_a_nullable_column() {
+        let schema = Schema {
+            columns: vec![
+                col_def("pk", TypeCode::U64, false),
+                col_def("a", TypeCode::I64, true),
+                col_def("b", TypeCode::I64, true),
+            ],
+            pk_cols: vec![0],
+        };
+        // b = 5 (non-null) in row 0, b = NULL in row 1.
+        let mut current = ZSetBatch::new(&schema);
+        for (i, (bits, null_word)) in [(5i64, 0u64), (0, 0b10)].into_iter().enumerate() {
+            current.pks.push_u128(i as u128 + 1);
+            current.weights.push(1);
+            current.nulls.push(null_word);
+            if let ColData::Fixed(buf) = &mut current.columns[1] {
+                buf.extend_from_slice(&0i64.to_le_bytes());
+            }
+            if let ColData::Fixed(buf) = &mut current.columns[2] {
+                buf.extend_from_slice(&bits.to_le_bytes());
+            }
+        }
+        // SET a = b + 1
+        let rhs = BoundExpr::BinOp(
+            Box::new(BoundExpr::ColRef(2)),
+            crate::ir::BinOp::Add,
+            Box::new(BoundExpr::LitInt(1)),
+        );
+        let mut dst = ZSetBatch::new(&schema);
+        write_set_rows(&current, &[0, 1], &programs(&[(1, rhs)], &schema), &schema, &mut dst).unwrap();
+
+        assert_eq!(written_i64(&dst, 1), 6, "non-null source: b + 1");
+        assert_eq!(dst.nulls[0] & 0b01, 0, "row 0's a is not null");
+        assert_ne!(dst.nulls[1] & 0b01, 0, "NULL + 1 is NULL, and its bit must be set");
+    }
+
+    /// A SET RHS reading the PK column — the PK region through the adapter, which
+    /// no other SET test exercises. It is also the shape a deferred cross-column
+    /// cell copy would have aborted on: a PK column's slot in `ZSetBatch.columns`
+    /// is an empty placeholder.
+    #[test]
+    fn set_reads_the_pk_column() {
+        let schema = two_col(TypeCode::I64);
+        let mut current = ZSetBatch::new(&schema);
+        current.pks.push_u128(41u128);
+        current.weights.push(1);
+        current.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut current.columns[1] {
+            buf.extend_from_slice(&0i64.to_le_bytes());
+        }
+        // SET val = pk + 1
+        let plus_one = BoundExpr::BinOp(
+            Box::new(BoundExpr::ColRef(0)),
+            crate::ir::BinOp::Add,
+            Box::new(BoundExpr::LitInt(1)),
+        );
+        let mut dst = ZSetBatch::new(&schema);
+        write_set_rows(&current, &[0], &programs(&[(1, plus_one)], &schema), &schema, &mut dst).unwrap();
+        assert_eq!(written_i64(&dst, 1), 42);
+
+        // And the bare `SET val = pk` form.
+        let mut dst = ZSetBatch::new(&schema);
+        write_set_rows(
+            &current,
+            &[0],
+            &programs(&[(1, BoundExpr::ColRef(0))], &schema),
+            &schema,
+            &mut dst,
+        )
+        .unwrap();
+        assert_eq!(written_i64(&dst, 1), 41);
+    }
+
+    /// A float-typed RHS into an integer column is rejected at compile — without
+    /// it the raw f64 bit pattern would pass `append_column_value`'s guard and
+    /// commit as a nonsense integer.
+    #[test]
+    fn set_int_column_from_float_expression_rejects() {
+        let schema = Schema {
+            columns: vec![
+                col_def("pk", TypeCode::U64, false),
+                col_def("n", TypeCode::I64, true),
+                col_def("f", TypeCode::F64, true),
+            ],
+            pk_cols: vec![0],
+        };
+        let Err(err) = classify_set_rhs(&BoundExpr::ColRef(2), 1, &schema) else {
+            panic!("SET int = float must reject");
+        };
+        assert!(
+            err.to_string().contains("floating-point"),
+            "error must name the cause: {err}"
+        );
+        // A float *comparison* is integer-valued (0/1) and stays servable.
+        let cmp = BoundExpr::BinOp(
+            Box::new(BoundExpr::ColRef(2)),
+            crate::ir::BinOp::Gt,
+            Box::new(BoundExpr::LitFloat(1.5)),
+        );
+        assert!(classify_set_rhs(&cmp, 1, &schema).is_ok());
     }
 }

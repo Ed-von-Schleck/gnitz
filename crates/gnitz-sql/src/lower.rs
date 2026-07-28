@@ -3,76 +3,11 @@ use crate::ir::{BinOp, BoundExpr, UnaryOp};
 use gnitz_core::{ColumnDef, ExprBuilder, Schema};
 use gnitz_expr::{Evaluator, ExprValidateErr, LogicalProgram, MAX_REGS};
 
-/// One structural walk of [`BoundExpr`], parameterized by what each node
-/// *produces*. The single `match` in [`lower_bound_expr`] is the sole walk of
-/// the enum: adding a `BoundExpr` variant makes it non-exhaustive, failing
-/// *every* backend to compile (variant-coverage parity). A backend that cannot
-/// represent a node returns a typed `Unsupported` arm — never a panic.
-///
-/// `binop`/`unop` receive their operands *unevaluated* (`&BoundExpr`) and drive
-/// the recursion themselves via [`lower_bound_expr`]; this is load-bearing — the
-/// opcode backend intercepts string comparisons before recursing into a string
-/// literal, and the interpreter short-circuits `AND`/`OR` to avoid evaluating an
-/// operand whose error would otherwise leak.
-pub(crate) trait BoundExprBackend {
-    type Out;
-    fn col_ref(&mut self, col: usize) -> Result<Self::Out, GnitzSqlError>;
-    fn lit_int(&mut self, v: i64) -> Result<Self::Out, GnitzSqlError>;
-    fn lit_float(&mut self, v: f64) -> Result<Self::Out, GnitzSqlError>;
-    fn lit_str(&mut self, s: &str) -> Result<Self::Out, GnitzSqlError>;
-    /// SQL `NULL` literal (and the implicit CASE ELSE).
-    fn lit_null(&mut self) -> Result<Self::Out, GnitzSqlError>;
-    fn binop(&mut self, left: &BoundExpr, op: BinOp, right: &BoundExpr) -> Result<Self::Out, GnitzSqlError>;
-    fn unop(&mut self, op: UnaryOp, inner: &BoundExpr) -> Result<Self::Out, GnitzSqlError>;
-    /// `IS NULL` (`want_null = true`) and `IS NOT NULL` (`want_null = false`).
-    fn null_test(&mut self, col: usize, want_null: bool) -> Result<Self::Out, GnitzSqlError>;
-    fn agg_call(&mut self) -> Result<Self::Out, GnitzSqlError>;
-    /// Searched CASE. Receives its branches (`(condition, result)` taken in order)
-    /// and optional ELSE *unevaluated*, driving the recursion via
-    /// [`lower_bound_expr`] — like `binop`, so a backend can lift/short-circuit.
-    fn case(
-        &mut self,
-        branches: &[(BoundExpr, BoundExpr)],
-        else_: Option<&BoundExpr>,
-    ) -> Result<Self::Out, GnitzSqlError>;
-    /// `inner IN (items…)`, received *unevaluated* like `binop`/`case` so a
-    /// backend can decide between the `INT_IN_SET` fast path and the OR-chain
-    /// fallback using the schema it holds. `items` is non-empty.
-    fn in_list(&mut self, inner: &BoundExpr, items: &[BoundExpr]) -> Result<Self::Out, GnitzSqlError>;
-}
-
-/// Dispatch a single `BoundExpr` node to the backend. The lone `match` over the
-/// enum — every backend funnels through it.
-pub(crate) fn lower_bound_expr<B: BoundExprBackend>(
-    expr: &BoundExpr,
-    backend: &mut B,
-) -> Result<B::Out, GnitzSqlError> {
-    match expr {
-        BoundExpr::ColRef(c) => backend.col_ref(*c),
-        BoundExpr::LitInt(v) => backend.lit_int(*v),
-        BoundExpr::LitFloat(v) => backend.lit_float(*v),
-        BoundExpr::LitStr(s) => backend.lit_str(s),
-        // A wide-integer literal has no VM slot (the register file is 8 bytes wide),
-        // so no backend can represent it: one reject arm here states the limitation
-        // for every one of them. A *servable* wide seek is consumed into a PK/index
-        // bound by the access-path recognizer and never reaches this walk.
-        BoundExpr::LitWide(s) => Err(crate::ir::wide_int_error(s)),
-        BoundExpr::LitNull => backend.lit_null(),
-        BoundExpr::BinOp(l, op, r) => backend.binop(l, *op, r),
-        BoundExpr::UnaryOp(op, inner) => backend.unop(*op, inner),
-        BoundExpr::IsNull(c) => backend.null_test(*c, true),
-        BoundExpr::IsNotNull(c) => backend.null_test(*c, false),
-        BoundExpr::AggCall { .. } => backend.agg_call(),
-        BoundExpr::Case { branches, else_ } => backend.case(branches, else_.as_deref()),
-        BoundExpr::InList { inner, items } => backend.in_list(inner, items),
-    }
-}
-
 /// An IN-list item folds to an integer constant iff it is an integer literal or
 /// the unary negation of one (`-1` binds to `UnaryOp(Neg, LitInt(1))` — sqlparser
-/// lexes the minus separately). `wrapping_neg` matches the engine's `IntNeg` and
-/// the interpreter's `Neg`, so the folded image is bit-identical to the runtime
-/// OR-chain literal. Anything else → `None` → the OR-chain fallback.
+/// lexes the minus separately). `wrapping_neg` matches the VM's `IntNeg`, so the
+/// folded image is bit-identical to the runtime OR-chain literal. Anything else
+/// → `None` → the OR-chain fallback.
 fn fold_int_literal(e: &BoundExpr) -> Option<i64> {
     match e {
         BoundExpr::LitInt(v) => Some(*v),
@@ -185,17 +120,52 @@ fn try_compile_string_cmp(
 }
 
 /// Lowers a `BoundExpr` to `ExprProgram` opcodes for the server-side circuit.
-/// `Out = (result_reg, is_float)`, where `is_float` indicates the register holds
-/// an f64 bit-pattern rather than a plain i64.
+/// Every node produces `(result_reg, is_float)`, where `is_float` indicates the
+/// register holds an f64 bit-pattern rather than a plain i64.
+///
+/// The single `match` in [`OpcodeBackend::lower`] is the sole walk of the enum:
+/// adding a `BoundExpr` variant makes it non-exhaustive and fails compilation.
+/// `binop` / `case` / `in_list` receive their operands *unevaluated*
+/// (`&BoundExpr`) and drive the recursion themselves, which `binop` needs: it
+/// intercepts a string comparison before recursing into a string literal or
+/// column, both of which `lower` would otherwise reject.
 pub(crate) struct OpcodeBackend<'a> {
     cols: &'a [ColumnDef],
     eb: &'a mut ExprBuilder,
 }
 
-impl BoundExprBackend for OpcodeBackend<'_> {
-    type Out = (u32, bool);
+impl OpcodeBackend<'_> {
+    /// Lower one node. The lone `match` over `BoundExpr`. Arms that are a single
+    /// builder call live here; only the four that recurse (`binop`, `case`,
+    /// `in_list`, `unop`) and `col_ref`'s type gate have their own method.
+    fn lower(&mut self, expr: &BoundExpr) -> Result<(u32, bool), GnitzSqlError> {
+        match expr {
+            BoundExpr::ColRef(c) => self.col_ref(*c),
+            BoundExpr::LitInt(v) => Ok((self.eb.load_const(*v), false)),
+            BoundExpr::LitFloat(v) => Ok((self.eb.load_const(v.to_bits() as i64), true)),
+            BoundExpr::LitStr(_) => Err(GnitzSqlError::Unsupported(
+                "string literals not supported in expressions".to_string(),
+            )),
+            // A wide-integer literal has no VM slot (the register file is 8 bytes
+            // wide), so one reject arm here states the limitation for every
+            // expression that reaches this walk. A *servable* wide seek is
+            // consumed into a PK/index bound by the access-path recognizer and
+            // never gets here.
+            BoundExpr::LitWide(s) => Err(crate::ir::wide_int_error(s)),
+            BoundExpr::LitNull => Ok(self.lit_null()),
+            BoundExpr::BinOp(l, op, r) => self.binop(l, *op, r),
+            BoundExpr::UnaryOp(op, inner) => self.unop(*op, inner),
+            BoundExpr::IsNull(c) => Ok((self.eb.is_null(*c), false)),
+            BoundExpr::IsNotNull(c) => Ok((self.eb.is_not_null(*c), false)),
+            BoundExpr::AggCall { .. } => Err(GnitzSqlError::Unsupported(
+                "aggregate function not allowed in expression context".to_string(),
+            )),
+            BoundExpr::Case { branches, else_ } => self.case(branches, else_.as_deref()),
+            BoundExpr::InList { inner, items } => self.in_list(inner, items),
+        }
+    }
 
-    fn col_ref(&mut self, idx: usize) -> Result<Self::Out, GnitzSqlError> {
+    fn col_ref(&mut self, idx: usize) -> Result<(u32, bool), GnitzSqlError> {
         // Every 16-byte column must be rejected here: the engine's payload integer
         // load handler has arms only for 1/2/4/8-byte columns, so a 16-byte column
         // hits its no-op arm and the following op reads stale scratch bytes —
@@ -225,44 +195,32 @@ impl BoundExprBackend for OpcodeBackend<'_> {
         Ok((self.eb.load_col_int(idx), false))
     }
 
-    fn lit_int(&mut self, v: i64) -> Result<Self::Out, GnitzSqlError> {
-        Ok((self.eb.load_const(v), false))
-    }
-
-    fn lit_float(&mut self, v: f64) -> Result<Self::Out, GnitzSqlError> {
-        Ok((self.eb.load_const(v.to_bits() as i64), true))
-    }
-
-    fn lit_str(&mut self, _s: &str) -> Result<Self::Out, GnitzSqlError> {
-        Err(GnitzSqlError::Unsupported(
-            "string literals not supported in expressions".to_string(),
-        ))
-    }
-
-    fn lit_null(&mut self) -> Result<Self::Out, GnitzSqlError> {
-        // A NULL value: `is_float = false` — LoadNull carries a zero i64 lane with
-        // the null bit set. If a sibling CASE branch is float, `case` lifts it.
-        Ok((self.eb.load_null(), false))
+    /// A NULL value: `is_float = false` — LoadNull carries a zero i64 lane with
+    /// the null bit set. If a sibling CASE branch is float, `case` lifts it.
+    /// A method rather than an inline arm because `case` also needs it, for the
+    /// implicit ELSE.
+    fn lit_null(&mut self) -> (u32, bool) {
+        (self.eb.load_null(), false)
     }
 
     fn case(
         &mut self,
         branches: &[(BoundExpr, BoundExpr)],
         else_: Option<&BoundExpr>,
-    ) -> Result<Self::Out, GnitzSqlError> {
+    ) -> Result<(u32, bool), GnitzSqlError> {
         // Lower every condition and result, plus the else (implicit NULL when
         // absent). Conditions stay as 0/1 int registers; only the result *values*
         // participate in float unification.
         let mut conds = Vec::with_capacity(branches.len());
         let mut results = Vec::with_capacity(branches.len());
         for (cond, result) in branches {
-            let (cond_reg, _cond_float) = lower_bound_expr(cond, self)?;
+            let (cond_reg, _cond_float) = self.lower(cond)?;
             conds.push(cond_reg);
-            results.push(lower_bound_expr(result, self)?);
+            results.push(self.lower(result)?);
         }
         let else_out = match else_ {
-            Some(e) => lower_bound_expr(e, self)?,
-            None => self.lit_null()?,
+            Some(e) => self.lower(e)?,
+            None => self.lit_null(),
         };
 
         // Float unification is one GLOBAL decision, not a per-pair fold: EXPR_SELECT
@@ -288,19 +246,19 @@ impl BoundExprBackend for OpcodeBackend<'_> {
         Ok((acc, any_float))
     }
 
-    fn in_list(&mut self, inner: &BoundExpr, items: &[BoundExpr]) -> Result<Self::Out, GnitzSqlError> {
+    fn in_list(&mut self, inner: &BoundExpr, items: &[BoundExpr]) -> Result<(u32, bool), GnitzSqlError> {
         // Fast path: a ≤8-byte-integer operand + every item a foldable integer
         // literal → one INT_IN_SET. `self.cols` is the schema `inner` was bound
         // against — source schema for a table filter, reduce-output schema for
         // HAVING — so the int gate is correct in both, and a HAVING large-IN
-        // compiles here too. Use `is_fixed_int` — the exact predicate the
-        // interpreter/thin-probe gate on — not `is_pk_eligible`, which wrongly
+        // compiles here too. Use `is_fixed_int` — the same predicate the VM's
+        // `ColKind::FixedInt` check applies — not `is_pk_eligible`, which wrongly
         // admits U128/UUID/I128.
         if gnitz_wire::is_fixed_int(inner.infer_type(self.cols) as u8) {
             if let Some(mut values) = items.iter().map(fold_int_literal).collect::<Option<Vec<i64>>>() {
                 values.sort_unstable();
                 values.dedup();
-                let (reg, _is_float) = lower_bound_expr(inner, self)?; // integer ⇒ not float
+                let (reg, _is_float) = self.lower(inner)?; // integer ⇒ not float
                 let idx = self.eb.add_const_int_set(&values);
                 return Ok((self.eb.int_in_set(reg, idx), false));
             }
@@ -308,18 +266,18 @@ impl BoundExprBackend for OpcodeBackend<'_> {
         // Fallback: OR-chain via the existing binop path (float operand →
         // int_to_float + fcmp; non-literal item → column compare). Rare,
         // register-limited as today.
-        lower_bound_expr(&in_list_or_chain(inner, items), self)
+        self.lower(&in_list_or_chain(inner, items))
     }
 
-    fn binop(&mut self, left: &BoundExpr, op: BinOp, right: &BoundExpr) -> Result<Self::Out, GnitzSqlError> {
+    fn binop(&mut self, left: &BoundExpr, op: BinOp, right: &BoundExpr) -> Result<(u32, bool), GnitzSqlError> {
         // String comparison detection — intercept before recursing into operands
         // (a bare string literal/column would otherwise error in `lit_str`/`col_ref`).
         if let Some(result) = try_compile_string_cmp(left, &op, right, self.cols, self.eb)? {
             return Ok(result);
         }
 
-        let (mut l, l_float) = lower_bound_expr(left, self)?;
-        let (mut r, r_float) = lower_bound_expr(right, self)?;
+        let (mut l, l_float) = self.lower(left)?;
+        let (mut r, r_float) = self.lower(right)?;
 
         // Boolean ops never need float cast
         if matches!(op, BinOp::And) {
@@ -369,8 +327,8 @@ impl BoundExprBackend for OpcodeBackend<'_> {
         }
     }
 
-    fn unop(&mut self, op: UnaryOp, inner: &BoundExpr) -> Result<Self::Out, GnitzSqlError> {
-        let (a, a_float) = lower_bound_expr(inner, self)?;
+    fn unop(&mut self, op: UnaryOp, inner: &BoundExpr) -> Result<(u32, bool), GnitzSqlError> {
+        let (a, a_float) = self.lower(inner)?;
         match op {
             UnaryOp::Neg => {
                 if a_float {
@@ -382,20 +340,6 @@ impl BoundExprBackend for OpcodeBackend<'_> {
             UnaryOp::Not => Ok((self.eb.bool_not(a), false)),
         }
     }
-
-    fn null_test(&mut self, col: usize, want_null: bool) -> Result<Self::Out, GnitzSqlError> {
-        if want_null {
-            Ok((self.eb.is_null(col), false))
-        } else {
-            Ok((self.eb.is_not_null(col), false))
-        }
-    }
-
-    fn agg_call(&mut self) -> Result<Self::Out, GnitzSqlError> {
-        Err(GnitzSqlError::Unsupported(
-            "aggregate function not allowed in expression context".to_string(),
-        ))
-    }
 }
 
 /// Compile a BoundExpr to ExprBuilder opcodes, returning the result register.
@@ -406,8 +350,7 @@ pub(crate) fn compile_bound_expr(
     cols: &[ColumnDef],
     eb: &mut ExprBuilder,
 ) -> Result<u32, GnitzSqlError> {
-    let mut backend = OpcodeBackend { cols, eb };
-    lower_bound_expr(expr, &mut backend).map(|(reg, _)| reg)
+    OpcodeBackend { cols, eb }.lower(expr).map(|(reg, _)| reg)
 }
 
 /// Compile a standalone BoundExpr into a finished `ExprProgram` (fresh
@@ -444,19 +387,56 @@ pub(crate) fn compile_filter_program(
 /// `None` is [`compile_filter_program`]'s statically-true verdict — the caller
 /// keeps every row.
 ///
-/// The one place `ExprProgram`'s fields meet [`LogicalProgram::from_wire`]'s
-/// parameters, and the one place the resolver is chosen: `resolve_filter`, so a
-/// bare non-boolean predicate (`HAVING COUNT(*)`) still gets the `bool_bits` bit
-/// [`Evaluator::filter`] reads.
+/// Picks `resolve_filter`, so a bare non-boolean predicate (`HAVING COUNT(*)`)
+/// still gets the `bool_bits` bit [`Evaluator::filter`] reads.
 pub(crate) fn compile_filter_evaluator(pred: &BoundExpr, schema: &Schema) -> Result<Option<Evaluator>, GnitzSqlError> {
     let Some(p) = compile_filter_program(pred, &schema.columns)? else {
         return Ok(None);
     };
-    let ev = LogicalProgram::from_wire(&p.code, p.num_regs, p.result_reg, p.const_strings)
-        .map_err(expr_unsupported)?
-        .resolve_filter(schema)
-        .map_err(expr_unsupported)?;
-    Ok(Some(ev))
+    Ok(Some(to_logical(p)?.resolve_filter(schema).map_err(expr_unsupported)?))
+}
+
+/// Compile a scalar (non-predicate) RHS — a SET / `DO UPDATE SET` value — into
+/// the shared evaluator, resolved against the schema the rows it will run over
+/// carry, and reject a float-typed result.
+///
+/// The float test has to happen here: nothing downstream can tell a float
+/// bit-pattern from an integer, so `append_column_value` would store the raw
+/// bits into an integer column.
+///
+/// Picks `resolve_scalar`, because a SET RHS is read through
+/// [`Evaluator::eval_row`]. Pairing each resolver with the one way of driving it
+/// is why `expr_unsupported` is private to this module.
+///
+/// It runs the backend itself rather than going through
+/// [`compile_bound_expr_to_program`], because it is the one caller that needs
+/// the recursion's `is_float` bit — every other one discards it.
+pub(crate) fn compile_scalar_evaluator(expr: &BoundExpr, schema: &Schema) -> Result<Evaluator, GnitzSqlError> {
+    let mut eb = ExprBuilder::new();
+    let (reg, is_float) = OpcodeBackend {
+        cols: &schema.columns,
+        eb: &mut eb,
+    }
+    .lower(expr)?;
+    if is_float {
+        // No target type accepts it: the register holds an f64 bit pattern, and
+        // the only column kind a SET value can be written to is a fixed-width
+        // integer (or a string, which never reaches this compiler).
+        return Err(GnitzSqlError::Unsupported(
+            "SET from a floating-point expression is not supported".to_string(),
+        ));
+    }
+    to_logical(eb.build(reg))?
+        .resolve_scalar(schema)
+        .map_err(expr_unsupported)
+}
+
+/// The one place `ExprProgram`'s fields meet [`LogicalProgram::from_wire`]'s
+/// parameters. They are byte-for-byte its arguments, so this is a hand-off, not
+/// a round trip; the caller then picks the resolver that matches how it will
+/// drive the program.
+fn to_logical(p: gnitz_core::ExprProgram) -> Result<LogicalProgram, GnitzSqlError> {
+    LogicalProgram::from_wire(&p.code, p.num_regs, p.result_reg, p.const_strings).map_err(expr_unsupported)
 }
 
 /// A shared-evaluator rejection as a SQL-layer `Unsupported`. `ExprValidateErr`

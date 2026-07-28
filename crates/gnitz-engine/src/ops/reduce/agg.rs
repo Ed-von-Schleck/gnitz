@@ -303,30 +303,42 @@ impl Accumulator {
             "SUM/MIN/MAX over a >8-byte column must be rejected by the planner",
         );
 
-        // `native_le_bytes` OPK-decodes a PK-source column back to native
-        // little-endian before aggregating; a payload column reads verbatim.
-        let mut pk_scratch = [0u8; 16];
-        let bytes = self.loc.native_le_bytes(mb, row, &mut pk_scratch);
-
         let first = !self.has_value;
         self.has_value = true;
 
+        // A PK-source column is at rest in OPK form, so every arm below reads it
+        // through the locator rather than off the region: the integer arm via
+        // `decode_i64` (the OPK inverse fused with the widening), the others via
+        // `native_le_bytes`, which materializes the native image into a scratch
+        // buffer. That buffer is declared per arm, not here: the integer arm
+        // never needs it, and at `-O0` a shared declaration is a 16-byte zero
+        // store per row on the hottest arm of the hottest aggregate.
         match self.kind {
             // SumZero folds identically to Sum (it differs only in its identity /
             // empty-render, handled by the seed and `emit_agg_col`). Every arm
             // reads exactly the source column's width — `FixedInt::width()` and
             // the float arms alike derive from the same schema column `loc` does.
             StepKind::Sum(SumWiden::Int(fi)) => {
-                self.acc = self.acc.wrapping_add(fi.decode_le_i64(bytes).wrapping_mul(weight));
+                self.acc = self
+                    .acc
+                    .wrapping_add(self.loc.decode_i64(mb, row, fi).wrapping_mul(weight));
             }
-            StepKind::Sum(SumWiden::F32) => self.add_float(
-                f32::from_bits(u32::from_le_bytes(bytes[..4].try_into().unwrap())) as f64,
-                weight,
-            ),
-            StepKind::Sum(SumWiden::F64) => self.add_float(
-                f64::from_bits(u64::from_le_bytes(bytes[..8].try_into().unwrap())),
-                weight,
-            ),
+            StepKind::Sum(SumWiden::F32) => {
+                let mut scratch = [0u8; 16];
+                let bytes = self.loc.native_le_bytes(mb, row, &mut scratch);
+                self.add_float(
+                    f32::from_bits(u32::from_le_bytes(bytes[..4].try_into().unwrap())) as f64,
+                    weight,
+                );
+            }
+            StepKind::Sum(SumWiden::F64) => {
+                let mut scratch = [0u8; 16];
+                let bytes = self.loc.native_le_bytes(mb, row, &mut scratch);
+                self.add_float(
+                    f64::from_bits(u64::from_le_bytes(bytes[..8].try_into().unwrap())),
+                    weight,
+                );
+            }
             // MIN/MAX hold the AVI's MIN-oriented order-preserving encoding
             // (`encode_ordered`, `for_max=false`), so the extreme test is one
             // unsigned `u64` compare — the U64-unsigned and float-total-order
@@ -337,6 +349,8 @@ impl Accumulator {
             // is compiled (`compiler::emit_reduce`), never executed, so
             // `encode_ordered`'s unreachable arm is genuinely unreachable.
             StepKind::Extreme { .. } => {
+                let mut scratch = [0u8; 16];
+                let bytes = self.loc.native_le_bytes(mb, row, &mut scratch);
                 let enc = super::super::util::encode_ordered(bytes, self.tc as u8, false);
                 if first || self.extreme_replaces(enc) {
                     self.acc = enc as i64;

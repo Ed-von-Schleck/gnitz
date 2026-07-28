@@ -31,7 +31,7 @@ pub(crate) enum BExpr<R> {
     /// parsing — only the access-path recognizer, holding the column `TypeCode`,
     /// parses the string (byte-exactly, via `pk_codec`) into a PK/index seek bound.
     /// Everywhere else a `LitWide` is un-servable: the one reject arm in
-    /// `lower_bound_expr` surfaces the VM's real 16-byte-slot limitation honestly.
+    /// `OpcodeBackend::lower` surfaces the VM's real 16-byte-slot limitation honestly.
     LitWide(String),
     /// SQL `NULL` literal / an implicit CASE ELSE. Lowers to `load_null`; its
     /// inferred type is `I64`, the neutral element of `unify_numeric` (so a NULL
@@ -288,44 +288,28 @@ impl BExpr<usize> {
     }
 }
 
-/// The one message for every un-servable wide-integer literal: the compile
-/// boundary ([`crate::lower::lower_bound_expr`]) and the eager mutate guards
-/// (`find_wide_literal`) build it via [`wide_int_error`], so the outcome is one
-/// uniform error naming the offending literal.
-pub(crate) const WIDE_INT_UNSUPPORTED: &str = "wide-integer comparison is only servable as an indexed equality/range";
-
-/// The uniform un-servable-wide-literal error, naming the literal. Shared by the
-/// compile boundary and every eager guard so the message cannot drift.
-pub(crate) fn wide_int_error(lit: &str) -> GnitzSqlError {
-    GnitzSqlError::Unsupported(format!("{WIDE_INT_UNSUPPORTED}: {lit}"))
+/// The one home of "a WHERE is the left-associated AND of its conjuncts";
+/// `None` when there are none. Every predicate the client compiles — the view
+/// filter, the wire ReadSpec residual, the DML residual — is built here.
+///
+/// Left-association is not cosmetic. The VM's AND-chain dead-tail skip requires
+/// the terminal instruction to be a `BoolAnd` writing the result register and
+/// then walks the accumulator spine, which `((a∧b)∧c)∧d` is exactly; a
+/// right-associated tree loses the skip.
+pub(crate) fn and_fold(preds: impl IntoIterator<Item = BoundExpr>) -> Option<BoundExpr> {
+    preds
+        .into_iter()
+        .reduce(|acc, e| BExpr::BinOp(Box::new(acc), BinOp::And, Box::new(e)))
 }
 
-/// The first [`BExpr::LitWide`] anywhere in `e`, if any — an **exhaustive** match
-/// over every recursive arm (a naive `matches!(e, LitWide(_))` is dead code: the
-/// real shape is `BinOp(ColRef, _, LitWide)`). Naming every variant forces a
-/// compile error if a future arm is added. Used by the eager guards: the
-/// SET/DO-UPDATE RHS and the UPDATE/DELETE residual are interpreted lazily
-/// per-row, so an un-consumed `LitWide` there would silently no-op on an empty
-/// match instead of rejecting deterministically.
-pub(crate) fn find_wide_literal<R>(e: &BExpr<R>) -> Option<&str> {
-    match e {
-        BExpr::LitWide(s) => Some(s),
-        BExpr::ColRef(_)
-        | BExpr::LitInt(_)
-        | BExpr::LitFloat(_)
-        | BExpr::LitStr(_)
-        | BExpr::LitNull
-        | BExpr::IsNull(_)
-        | BExpr::IsNotNull(_) => None,
-        BExpr::BinOp(l, _, r) => find_wide_literal(l).or_else(|| find_wide_literal(r)),
-        BExpr::UnaryOp(_, inner) => find_wide_literal(inner),
-        BExpr::AggCall { arg, .. } => arg.as_deref().and_then(find_wide_literal),
-        BExpr::Case { branches, else_ } => branches
-            .iter()
-            .find_map(|(c, r)| find_wide_literal(c).or_else(|| find_wide_literal(r)))
-            .or_else(|| else_.as_deref().and_then(find_wide_literal)),
-        BExpr::InList { inner, items } => find_wide_literal(inner).or_else(|| items.iter().find_map(find_wide_literal)),
-    }
+/// The one message for every un-servable wide-integer literal.
+pub(crate) const WIDE_INT_UNSUPPORTED: &str = "wide-integer comparison is only servable as an indexed equality/range";
+
+/// The uniform un-servable-wide-literal error, naming the literal. Built at the
+/// compile boundary (`OpcodeBackend::lower`), which is the only place a
+/// `LitWide` can survive to.
+pub(crate) fn wide_int_error(lit: &str) -> GnitzSqlError {
+    GnitzSqlError::Unsupported(format!("{WIDE_INT_UNSUPPORTED}: {lit}"))
 }
 
 #[derive(Clone, Debug, Copy)]

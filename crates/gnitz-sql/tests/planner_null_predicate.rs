@@ -1,13 +1,13 @@
 #![cfg(feature = "integration")]
 
 //! Three-valued-logic (3VL) regression tests for `AND`/`OR` in residual WHERE
-//! predicates (Bug 3). `eval_expr` must short-circuit `TRUE OR any → TRUE` and
-//! `FALSE AND any → FALSE` *before* propagating a NULL operand, instead of
-//! eagerly returning NULL the moment either side is NULL.
+//! predicates (Bug 3). The residual's compiled predicate must yield
+//! `TRUE OR any → TRUE` and `FALSE AND any → FALSE` rather than NULL the moment
+//! either side is NULL.
 //!
 //! Exercised through `DELETE … WHERE`: an `OR` at the top of the predicate
 //! cannot be decomposed into a PK seek, so it routes to the full-scan path that
-//! calls `eval_expr`; the `AND` case is observed under `NOT`, where FALSE and
+//! runs the residual; the `AND` case is observed under `NOT`, where FALSE and
 //! NULL produce different outcomes.
 
 mod common;

@@ -177,6 +177,32 @@ pub fn widen_pk_be(pk_bytes: &[u8], stride: usize) -> u128 {
     u128::from_be_bytes(buf)
 }
 
+/// Decode one OPK PK column straight to `i64` — the exact inverse of
+/// [`encode_pk_column`], fused with the widening [`FixedInt`] defines.
+///
+/// Spelled with byte-array literals rather than composed from `decode_pk_column`
+/// and [`widen_pk_be`]: this runs per row in the evaluator's `LoadPk` opcode, and
+/// at `-O0` (the profile the E2E suite runs) that composition costs an
+/// out-of-line call plus a 16-byte stack materialization the fused form does not
+/// need. `decode_opk_i64_matches_the_two_branches_it_replaces` pins it against
+/// both. The assert carries a static message: an `#[inline(always)]` body
+/// duplicates a formatted `Arguments` block into every call site.
+#[inline(always)]
+pub fn decode_opk_i64(opk: &[u8], fi: crate::FixedInt) -> i64 {
+    use crate::FixedInt as F;
+    debug_assert!(opk.len() == fi.width(), "decode_opk_i64: slice width != FixedInt width");
+    match fi {
+        F::U8 => opk[0] as i64,
+        F::I8 => (opk[0] ^ 0x80) as i8 as i64,
+        F::U16 => u16::from_be_bytes([opk[0], opk[1]]) as i64,
+        F::I16 => u16::from_be_bytes([opk[0] ^ 0x80, opk[1]]) as i16 as i64,
+        F::U32 => u32::from_be_bytes([opk[0], opk[1], opk[2], opk[3]]) as i64,
+        F::I32 => u32::from_be_bytes([opk[0] ^ 0x80, opk[1], opk[2], opk[3]]) as i32 as i64,
+        F::U64 => u64::from_be_bytes([opk[0], opk[1], opk[2], opk[3], opk[4], opk[5], opk[6], opk[7]]) as i64,
+        F::I64 => u64::from_be_bytes([opk[0] ^ 0x80, opk[1], opk[2], opk[3], opk[4], opk[5], opk[6], opk[7]]) as i64,
+    }
+}
+
 /// Re-encode an at-rest OPK column at a promoted index/join type — the OPK→OPK
 /// sibling of [`encode_pk_column_promoted`] (native→OPK).
 ///
@@ -425,6 +451,55 @@ mod tests {
             roundtrip(type_code::U128, &v.to_le_bytes());
             roundtrip(type_code::UUID, &v.to_le_bytes());
         }
+    }
+
+    /// `decode_opk_i64` is a third spelling of the OPK→native transform, so it
+    /// is pinned against the two branches it replaces: the signed
+    /// `decode_pk_column` + `read_signed` pair and the unsigned
+    /// `widen_pk_be(..) as i64`. A wrong XOR arm is otherwise a silent wrong
+    /// answer on every PK predicate.
+    #[test]
+    fn decode_opk_i64_matches_the_two_branches_it_replaces() {
+        use crate::FixedInt as F;
+        for &(fi, tc) in &[
+            (F::U8, type_code::U8),
+            (F::I8, type_code::I8),
+            (F::U16, type_code::U16),
+            (F::I16, type_code::I16),
+            (F::U32, type_code::U32),
+            (F::I32, type_code::I32),
+            (F::U64, type_code::U64),
+            (F::I64, type_code::I64),
+        ] {
+            let sz = fi.width();
+            let (lo, hi) = fi.range();
+            for v in [lo, -1, 0, 1, hi] {
+                if v < lo || v > hi {
+                    continue;
+                }
+                let le = (v as u128).to_le_bytes();
+                let mut opk = [0u8; 8];
+                encode_pk_column(&le[..sz], tc, &mut opk[..sz]);
+
+                let want = if crate::is_signed_int(tc) {
+                    let mut back = [0u8; 8];
+                    decode_pk_column(&opk[..sz], tc, &mut back[..sz]);
+                    crate::read_signed(&back, sz)
+                } else {
+                    widen_pk_be(&opk[..sz], sz) as i64
+                };
+                assert_eq!(
+                    decode_opk_i64(&opk[..sz], fi),
+                    want,
+                    "decode_opk_i64 diverges for {fi:?} v={v}"
+                );
+            }
+        }
+        // The unsigned 64-bit edge: the i64 register holds the bit pattern, so
+        // `u64::MAX` reads back as `-1`, exactly as `widen_pk_be(..) as i64` does.
+        let mut opk = [0u8; 8];
+        encode_pk_column(&u64::MAX.to_le_bytes(), type_code::U64, &mut opk);
+        assert_eq!(decode_opk_i64(&opk, crate::FixedInt::U64), -1i64);
     }
 
     #[test]

@@ -7,7 +7,7 @@
 use super::{slot_of, ColId, HirExpr, HirRef, ProjEntry};
 use crate::codec::project_schema::{place_pk_front, ProjItem};
 use crate::error::GnitzSqlError;
-use crate::ir::{BExpr, BinOp, BoundExpr};
+use crate::ir::BoundExpr;
 use gnitz_core::{ColumnDef, Schema};
 
 /// Substitute every `HirRef::Col(id)` leaf with `ColRef(position of id in
@@ -23,22 +23,18 @@ pub(crate) fn resolve_refs(expr: &HirExpr, layout: &[ColId]) -> Result<BoundExpr
     })
 }
 
-/// Resolve each conjunct against `layout` and AND-fold left-associatively
-/// (`None` for no conjuncts) — the one home of "WHERE = left-assoc AND of its
-/// conjuncts", consumed by the scan bound and every filter emit.
+/// Resolve each conjunct against `layout`, then hand them to [`crate::ir::and_fold`]
+/// — the HIR entry to that one rule, consumed by the scan bound and every filter
+/// emit.
 pub(crate) fn fold_preds<'a>(
     preds: impl IntoIterator<Item = &'a HirExpr>,
     layout: &[ColId],
 ) -> Result<Option<BoundExpr>, GnitzSqlError> {
-    let mut folded: Option<BoundExpr> = None;
-    for p in preds {
-        let b = resolve_refs(p, layout)?;
-        folded = Some(match folded {
-            None => b,
-            Some(acc) => BExpr::BinOp(Box::new(acc), BinOp::And, Box::new(b)),
-        });
-    }
-    Ok(folded)
+    let resolved: Vec<BoundExpr> = preds
+        .into_iter()
+        .map(|p| resolve_refs(p, layout))
+        .collect::<Result<_, _>>()?;
+    Ok(crate::ir::and_fold(resolved))
 }
 
 /// A physicalized projection: the emission items, the output column defs, the

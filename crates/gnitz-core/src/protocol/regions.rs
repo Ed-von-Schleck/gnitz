@@ -40,7 +40,7 @@ impl ViewBuffers {
     /// concurrent view over the same `ViewBuffers` is a compile error — a caller
     /// that needs two live views owns two `ViewBuffers`.
     pub fn view<'a>(&'a mut self, batch: &'a ZSetBatch, schema: &Schema) -> ZSetBatchView<'a> {
-        let (nulls, pk_stride) = (&batch.nulls, schema.pk_stride());
+        let pk_stride = schema.pk_stride();
         let regions = self.regions(batch, schema);
         // The three regions the evaluator reads per row are hoisted out of the
         // list; `col_data` / `null_bmp` are read once per morsel and stay indexed.
@@ -49,7 +49,7 @@ impl ViewBuffers {
             regions,
             pk,
             blob,
-            nulls,
+            batch,
             pk_stride,
         }
     }
@@ -223,17 +223,28 @@ fn encode_german_col_into<'a>(
 /// A [`ZSetBatch`] presented as §6 regions. Every accessor is one index — the
 /// slot-to-buffer question was answered once, when the list was built.
 ///
-/// `pk`, `blob` and `nulls` are the same three regions the list already holds,
-/// hoisted out of it because they are the ones read per row (the `nulls`
-/// reading is the `Vec<u64>` the region reinterprets, so it is also one load
-/// instead of two). `gnitz_expr::assert_batchview_consistent` pins the two
+/// `pk` and `blob` are the same two regions the list already holds, hoisted out
+/// of it because they are read per row.
+/// `gnitz_expr::assert_batchview_consistent` pins the region and per-row
 /// readings against each other.
+///
+/// The view also carries the batch it was built over, so a caller that needs
+/// both — registers through the evaluator, a `ColData` cell directly — passes
+/// one value instead of a `(&view, &batch)` pair that would type-check even when
+/// mismatched.
 pub struct ZSetBatchView<'a> {
     regions: Vec<&'a [u8]>,
     pk: &'a [u8],
     blob: &'a [u8],
-    nulls: &'a [u64],
+    batch: &'a ZSetBatch,
     pk_stride: usize,
+}
+
+impl<'a> ZSetBatchView<'a> {
+    /// The batch this view presents.
+    pub fn batch(&self) -> &'a ZSetBatch {
+        self.batch
+    }
 }
 
 impl gnitz_expr::RowSource for ZSetBatchView<'_> {
@@ -245,7 +256,7 @@ impl gnitz_expr::RowSource for ZSetBatchView<'_> {
 
     #[inline(always)]
     fn get_null_word(&self, row: usize) -> u64 {
-        self.nulls[row]
+        self.batch.nulls[row]
     }
 
     #[inline(always)]

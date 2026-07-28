@@ -4,13 +4,12 @@
 //! The batch arrives as a client `ZSetBatch` — one entry per `(PK, payload)` with
 //! an integer **weight**, decoded to native little-endian (not the engine's OPK).
 //! So ordering is a per-type, per-column typed compare (the shared
-//! `gnitz_wire::cmp_typed_le`), the same primitive the residual filter
-//! needs; there is no client `memcmp`/OPK trick. The sink sorts **before**
-//! projection so an ORDER BY key absent from the projected columns still
-//! resolves, then walks the sorted permutation by running **logical position** —
-//! LIMIT/OFFSET count multiplicity (summed weight), never Z-set entries — and
-//! gathers the surviving rows. See `plans` design notes; the invariants are
-//! pinned by the unit tests below.
+//! `gnitz_wire::cmp_typed_le`); there is no client `memcmp`/OPK trick. The sink
+//! sorts **before** projection so an ORDER BY key absent from the projected
+//! columns still resolves, then walks the sorted permutation by running
+//! **logical position** — LIMIT/OFFSET count multiplicity (summed weight), never
+//! Z-set entries — and gathers the surviving rows. The invariants are pinned by
+//! the unit tests below.
 
 use std::cmp::Ordering;
 
@@ -18,10 +17,46 @@ use crate::ast_util::{expr_usize_literal, single_relation_col_name};
 use crate::bind::find_unique_column;
 use crate::codec::project_schema::ProjItem;
 use crate::error::GnitzSqlError;
-use crate::exec::batch::{copy_batch_row_owned, pk_col_window_at};
-use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
+use crate::exec::batch::copy_batch_row_owned;
+use gnitz_core::{ColData, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
 use gnitz_wire::cmp_typed_le;
 use sqlparser::ast::{Expr, OrderBy, OrderByKind, Value};
+
+/// A PK column's value for one row, in **native little-endian** — either
+/// borrowed from a compound (`Bytes`) PK buffer or re-imaged from a widened
+/// scalar PK. Not the engine's OPK: a client `ZSetBatch` holds `PkColumn` values
+/// as the wire delivered them, and `cmp_typed_le` reads native LE.
+enum PkWindow<'a> {
+    Borrowed(&'a [u8]),
+    Inline { buf: [u8; 16], len: usize },
+}
+
+impl PkWindow<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            PkWindow::Borrowed(s) => s,
+            PkWindow::Inline { buf, len } => &buf[..*len],
+        }
+    }
+}
+
+/// The `stride` bytes of the PK column at PK-region byte offset `off` for row
+/// `i`. The per-column `(pk_byte_offset, wire_stride)` lookups are hoisted into
+/// [`SortKey`], since the comparator runs O(n log n) times.
+fn pk_col_window_at<'a>(batch: &'a ZSetBatch, off: usize, stride: usize, i: usize) -> PkWindow<'a> {
+    match &batch.pks {
+        PkColumn::Bytes { stride: s, buf } => {
+            let s = *s as usize;
+            PkWindow::Borrowed(&buf[i * s + off..i * s + off + stride])
+        }
+        // A scalar PK (`get` widens `U64s`/`U128s` to `u128`); the low `stride`
+        // bytes are the column's native LE image (e.g. `I32(-1)` is `FF FF FF FF`).
+        _ => PkWindow::Inline {
+            buf: batch.pks.get(i).to_le_bytes(),
+            len: stride,
+        },
+    }
+}
 
 // ---------------------------------------------------------------------------
 // One sort key over the full pre-projection schema
@@ -481,7 +516,7 @@ fn sort_window(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exec::batch::{pk_col_window, project, resolve_projection};
+    use crate::exec::batch::{project, resolve_projection};
     use crate::test_support::col_def;
     use gnitz_core::null_word_get;
     use sqlparser::ast::{Query, SelectItem, SetExpr, Statement};
@@ -852,10 +887,12 @@ mod tests {
         };
         let (out_schema, out) =
             order_limit_project(&select.projection, &schema, Some(b), q.order_by.as_ref(), 0, None).unwrap();
-        // Read `b` from the compound PK region (physical col 1).
+        // Read `b` from the compound PK region (physical col 1), addressed the
+        // way the comparator addresses it rather than by re-deriving the offset.
+        let key = SortKey::new(&out_schema, 1, true, false);
         let bs: Vec<i16> = (0..out.len())
             .map(|i| {
-                let w = pk_col_window(&out, &out_schema, 1, i);
+                let w = pk_col_window_at(&out, key.pk_offset.unwrap(), key.stride, i);
                 i16::from_le_bytes(w.as_slice().try_into().unwrap())
             })
             .collect();

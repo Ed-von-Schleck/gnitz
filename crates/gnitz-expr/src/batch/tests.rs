@@ -97,9 +97,9 @@ fn test_eval_batch_add() {
 // Edge-case golden tests at m=1
 //
 // These pin the points where the m=1 path through eval_batch could most
-// plausibly diverge from the historical per-row interpreter. They each set up
-// a one-row input and assert against a manually computed expected value via a
-// direct `eval_batch`.
+// plausibly diverge from the vectorized one. They each set up a one-row input
+// and assert against a manually computed expected value via a direct
+// `eval_batch`.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -411,6 +411,80 @@ fn bit_only_demotion_when_bool_feeds_arithmetic() {
         "AND result must land in regs when !bit_only"
     );
     assert_eq!(scratch.regs[7 * MORSEL], 1, "downstream arithmetic reads bool as i64");
+}
+
+/// Every `LoadPayloadInt` width in both signednesses, and a compound PK whose
+/// two columns differ in signedness — the arms `FixedInt` selects between. A
+/// swapped `U16`/`I16` arm or a dropped OPK sign-flip miscomputes silently, and
+/// no other test in this crate loads a narrow or signed column through the row
+/// kernels.
+#[test]
+fn int_loads_cover_every_width_and_both_pk_signednesses() {
+    const ROWS: usize = 5;
+    // ci0 = I32 PK, ci1 = U16 PK, in PK-list order [1, 0] — so the U16 sits at
+    // OPK byte 0 and the I32 at byte 2, and column order does not decide either.
+    let cols = [
+        (type_code::I32, false),
+        (type_code::U16, false),
+        (type_code::U8, true),
+        (type_code::I8, true),
+        (type_code::U16, true),
+        (type_code::I16, true),
+        (type_code::U32, true),
+        (type_code::I32, true),
+        (type_code::U64, true),
+        (type_code::I64, true),
+    ];
+    let schema = TestSchema::new(&cols, &[1, 0]);
+
+    // Per column, the i64 register image each of the five rows must load. An
+    // unsigned column's "-1" slot is the all-ones bit pattern, which reads back
+    // as that type's MAX — and as -1 for U64, whose register *is* the storage
+    // type.
+    let pk_bits: [u64; ROWS] = [0, u64::MAX, 1, 0x8000_8000, 0x7FFF_7FFF];
+    let expected: [[i64; ROWS]; 10] = [
+        [0, -1, 1, -2_147_450_880, 2_147_450_879], // ci0: I32 PK, low 4 bytes of pk_bits
+        [0, 65535, 1, 32768, 32767],               // ci1: U16 PK, low 2 bytes of pk_bits
+        [0, 255, 0, 1, 255],                       // U8
+        [-128, -1, 0, 1, 127],                     // I8
+        [0, 65535, 0, 1, 65535],                   // U16
+        [-32768, -1, 0, 1, 32767],                 // I16
+        [0, 4_294_967_295, 0, 1, 4_294_967_295],   // U32
+        [i32::MIN as i64, -1, 0, 1, i32::MAX as i64], // I32
+        [0, -1, 0, 1, -1],                         // U64
+        [i64::MIN, -1, 0, 1, i64::MAX],            // I64
+    ];
+
+    let payloads: Vec<Vec<i64>> = (0..ROWS)
+        .map(|r| expected[2..].iter().map(|c| c[r]).collect())
+        .collect();
+    let rows: Vec<(u64, u64, &[i64])> = (0..ROWS).map(|r| (pk_bits[r], 0, payloads[r].as_slice())).collect();
+    let mb = make_int_view(&schema, &rows);
+
+    // Load every column into its own register and read the register file back
+    // directly — the image is what is under test, so nothing is interposed
+    // between the load and the assertion.
+    let instrs = (0..cols.len() as u32)
+        .map(|ci| LogicalInstr::LoadColInt {
+            dst: ci as u16,
+            col: ci,
+        })
+        .collect();
+    let prog = resolved(&schema, instrs, cols.len() as u32, 0);
+    let mut scratch = EvalScratch::default();
+    scratch.ensure_capacity(&prog, ROWS);
+    eval_batch(&prog, &mb, 0, ROWS, &mut scratch);
+
+    for (ci, col_expected) in expected.iter().enumerate() {
+        for (r, want) in col_expected.iter().enumerate() {
+            assert_eq!(
+                scratch.regs[ci * MORSEL + r],
+                *want,
+                "column {ci} ({:?}), row {r}",
+                cols[ci].0
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
