@@ -1111,3 +1111,16 @@ fn decode_ddl_txn_is_unaffected_by_the_appended_section() {
     assert_eq!(decoded[0].0, 5);
     assert_eq!(decoded[1].0, 6);
 }
+
+#[test]
+fn schemaless_command_slot_is_a_bare_control_block() {
+    // Every command verb's SAL slot is written with no schema block and no data,
+    // and `CHECKPOINT_RESERVE` is sized from that. Both the size prediction and
+    // the encode must agree it is exactly one control block.
+    assert_eq!(
+        wire_size(STATUS_OK, b"", None, None, None, None, &[]),
+        CTRL_BLOCK_SIZE_NO_BLOB
+    );
+    let buf = encode_wire(7, 0, 0, 0, 0, 42, STATUS_OK, b"", None, None, None);
+    assert_eq!(buf.len(), CTRL_BLOCK_SIZE_NO_BLOB);
+}

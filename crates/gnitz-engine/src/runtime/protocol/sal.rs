@@ -75,9 +75,41 @@ fn wire_safe_slot_size(
 /// rather than aborting the node.
 pub(crate) const SENTINEL_SIZE: usize = 8 + group_header_size(0);
 
+/// Space held back from ordinary groups so the groups that must not fail always
+/// fit: a checkpoint round's `FLAG_FLUSH`/`FLAG_FLUSH_EPH` group, and the
+/// `FLAG_SHUTDOWN` broadcast (whose error `shutdown_workers` discards before
+/// blocking in `waitpid`). The band holds **two** of them: the watchdog's crash
+/// arm broadcasts `FLAG_SHUTDOWN` without the SAL mutex exactly while a
+/// committer flush round is parked awaiting the dead worker's ACK.
+/// `checkpoint_reserve_holds_two_terminal_groups` derives that bound from the
+/// constants, so a wider control block or `MAX_WORKERS` trips there. Negligible
+/// against both the 1 GiB default and the `MIN_SAL_BYTES` floor.
+pub(crate) const CHECKPOINT_RESERVE: usize = 64 << 10;
+
+/// The highest byte a group with `flags` may occupy.
+///
+/// The terminal groups — the checkpoint rounds and the shutdown broadcast — may
+/// spend the `CHECKPOINT_RESERVE` that exists for them, but not the sentinel
+/// headroom; nothing follows them in the epoch. A `FLAG_TXN_COMMIT` sentinel may
+/// spend the sentinel headroom but not the reserve. Every other group must leave
+/// both, which keeps the bound structural: an ordinary group always leaves room
+/// for one sentinel, and `emit_zone_to_sal` writes no bare sentinel, so no run of
+/// sentinels can reach the reserve. Capping the sentinel below `mmap_size` also
+/// stops one that ends exactly at the mapping's end from skipping its own
+/// terminating prefix.
+pub(crate) fn effective_max(flags: u32, mmap_size: usize) -> usize {
+    if flags & (FLAG_FLUSH | FLAG_FLUSH_EPH | FLAG_SHUTDOWN) != 0 {
+        mmap_size.saturating_sub(SENTINEL_SIZE)
+    } else if flags & FLAG_TXN_COMMIT != 0 {
+        mmap_size.saturating_sub(CHECKPOINT_RESERVE)
+    } else {
+        mmap_size.saturating_sub(SENTINEL_SIZE + CHECKPOINT_RESERVE)
+    }
+}
+
 /// Floor for a `GNITZ_SAL_BYTES` override — must comfortably exceed one DDL zone
 /// plus the checkpoint headroom.
-const MIN_SAL_BYTES: usize = 16 << 20;
+pub(crate) const MIN_SAL_BYTES: usize = 16 << 20;
 
 /// The SAL mmap size in bytes. `SAL_MMAP_SIZE` (1 GiB) is the production default;
 /// `GNITZ_SAL_BYTES` overrides it downward. This exists because each server
@@ -468,16 +500,8 @@ pub(crate) unsafe fn sal_begin_group(
         }
     }
     let total = 8 + payload_size;
-    // Global sentinel reservation: every non-sentinel group must leave
-    // SENTINEL_SIZE headroom so the zone-closing FLAG_TXN_COMMIT sentinel always
-    // fits at the end of the zone. Only the sentinel group itself may consume
-    // that reserve (it fits in exactly SENTINEL_SIZE bytes).
-    let effective_max = if flags & FLAG_TXN_COMMIT != 0 {
-        mmap_size
-    } else {
-        mmap_size.saturating_sub(SENTINEL_SIZE)
-    };
-    if write_cursor + total > effective_max {
+    let cap = effective_max(flags, mmap_size);
+    if write_cursor + total > cap {
         return None;
     }
 
@@ -737,10 +761,13 @@ impl SalWriter {
         }
     }
 
-    /// SAL bytes a non-sentinel group may occupy: the mapping minus the
-    /// headroom `sal_begin_group` reserves for the zone-closing sentinel.
+    /// SAL bytes an ordinary group may occupy: the mapping minus the headroom
+    /// `sal_begin_group` reserves for the zone-closing sentinel and minus the
+    /// band held back for the checkpoint and shutdown groups. A transaction whose
+    /// footprint exceeds this can never be written on any cursor, so `txn_fit`
+    /// must call it `Terminal` rather than loop on `Transient`.
     pub(crate) fn effective_capacity(&self) -> usize {
-        (self.mmap_size as usize).saturating_sub(SENTINEL_SIZE)
+        effective_max(0, self.mmap_size as usize)
     }
 
     /// Reserve a group for `worker_sizes.len()` workers at the write cursor and
@@ -781,6 +808,13 @@ impl SalWriter {
     /// `prebuilt_schema_block`: when `Some`, the bytes are copied into each
     /// slot's schema region instead of building one from `schema` + names.
     /// Mutually exclusive with `col_names_opt`; passing both is a bug.
+    ///
+    /// `schema: None` (with no prebuilt block) emits no schema block at all —
+    /// the command verbs whose worker arm resolves its own schema from its own
+    /// catalog. A group carrying data must always name its schema: that is what
+    /// stamps `Batch.schema` on the worker side, and `decode_wire` hard-errors on
+    /// FLAG_HAS_DATA without FLAG_HAS_SCHEMA, so the reply's request_id would fall
+    /// back to 0 and the master's `ReplyFuture` would never resolve.
     #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     pub fn write_group_direct(
         &mut self,
@@ -789,7 +823,7 @@ impl SalWriter {
         sal_flags: u32,
         wire_flags: u64,
         worker_batches: &[Option<&Batch>],
-        schema: &SchemaDescriptor,
+        schema: Option<&SchemaDescriptor>,
         col_names_opt: Option<&[&[u8]]>,
         seek_pk: u128,
         seek_col_idx: u64,
@@ -811,6 +845,11 @@ impl SalWriter {
             prebuilt_schema_block.is_none() || col_names_opt.is_none(),
             "write_group_direct: prebuilt_schema_block and col_names_opt are mutually exclusive",
         );
+        debug_assert!(
+            schema.is_some() || prebuilt_schema_block.is_some() || worker_batches.iter().all(|b| b.is_none()),
+            "write_group_direct: data without a schema — `decode_wire` rejects FLAG_HAS_DATA \
+             without FLAG_HAS_SCHEMA",
+        );
 
         let mut worker_sizes = [0u32; MAX_WORKERS];
         for w in 0..nw {
@@ -821,7 +860,7 @@ impl SalWriter {
             worker_sizes[w] = wire_size(
                 STATUS_OK,
                 b"",
-                Some(schema),
+                schema,
                 col_names_opt,
                 data_batch.copied(),
                 prebuilt_schema_block,
@@ -845,7 +884,7 @@ impl SalWriter {
                     req_ids[w],
                     STATUS_OK,
                     b"",
-                    Some(schema),
+                    schema,
                     col_names_opt,
                     data_batch.copied(),
                     prebuilt_schema_block,
@@ -872,8 +911,8 @@ impl SalWriter {
     /// slot, hence once per worker for a replicated family); `wire_props` is
     /// `(wire_safe, wire_row_stride)` as from `cached_schema_block`.
     ///
-    /// The sentinel is **not** included — it is globally reserved by
-    /// `sal_begin_group` (`SENTINEL_SIZE`), not counted per group.
+    /// Neither the sentinel nor the checkpoint band is included — both are
+    /// globally held back (`effective_capacity`), not counted per group.
     pub(crate) fn wire_group_footprint(
         &self,
         input_batch: &Batch,
@@ -967,7 +1006,7 @@ impl SalWriter {
                 sal_flags,
                 wire_flags,
                 &refs,
-                schema,
+                Some(schema),
                 None,
                 0,
                 seek_col_idx,
@@ -1048,6 +1087,10 @@ impl SalWriter {
     /// `prebuilt_schema_block`: when `Some`, the bytes are copied into the
     /// schema region instead of being built from `schema` + names. Mutually
     /// exclusive with `col_names_opt`; passing both is a bug.
+    ///
+    /// `schema: None` emits no schema block, as in `write_group_direct` — the
+    /// control-only broadcasts (`FLAG_FLUSH`/`FLAG_FLUSH_EPH`/`FLAG_SHUTDOWN`)
+    /// whose worker arm takes neither a schema nor a batch.
     #[allow(clippy::too_many_arguments)]
     pub fn write_broadcast_direct(
         &mut self,
@@ -1055,7 +1098,7 @@ impl SalWriter {
         lsn: u64,
         sal_flags: u32,
         batch: Option<&Batch>,
-        schema: &SchemaDescriptor,
+        schema: Option<&SchemaDescriptor>,
         col_names_opt: Option<&[&[u8]]>,
         seek_pk: u128,
         prebuilt_schema_block: Option<&[u8]>,
@@ -1065,16 +1108,13 @@ impl SalWriter {
             prebuilt_schema_block.is_none() || col_names_opt.is_none(),
             "write_broadcast_direct: prebuilt_schema_block and col_names_opt are mutually exclusive",
         );
+        debug_assert!(
+            schema.is_some() || prebuilt_schema_block.is_some() || batch.is_none(),
+            "write_broadcast_direct: data without a schema — `decode_wire` rejects FLAG_HAS_DATA \
+             without FLAG_HAS_SCHEMA",
+        );
 
-        let wsz = wire_size(
-            STATUS_OK,
-            b"",
-            Some(schema),
-            col_names_opt,
-            batch,
-            prebuilt_schema_block,
-            &[],
-        ) as u32;
+        let wsz = wire_size(STATUS_OK, b"", schema, col_names_opt, batch, prebuilt_schema_block, &[]) as u32;
         let mut worker_sizes = [0u32; MAX_WORKERS];
         worker_sizes[..nw].fill(wsz);
 
@@ -1095,7 +1135,7 @@ impl SalWriter {
                 0,
                 STATUS_OK,
                 b"",
-                Some(schema),
+                schema,
                 col_names_opt,
                 batch,
                 prebuilt_schema_block,

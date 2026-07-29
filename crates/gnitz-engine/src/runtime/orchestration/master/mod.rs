@@ -26,8 +26,8 @@ use crate::runtime::sal::{
 };
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::wire::{
-    self, col_names_as_refs, peek_control_block, DecodedWire, SchemaWithVersion, WireConflictMode, FLAG_CONTINUATION,
-    FLAG_HAS_DATA, FLAG_SCAN_LAST,
+    self, peek_control_block, DecodedWire, SchemaWithVersion, WireConflictMode, FLAG_CONTINUATION, FLAG_HAS_DATA,
+    FLAG_SCAN_LAST,
 };
 use crate::schema::key::PkBuf;
 use crate::storage::Batch;
@@ -47,7 +47,6 @@ pub(crate) struct RelayPrepared {
     source_id: i64,
     dest: RelayDest,
     schema: SchemaDescriptor,
-    name_bytes: Rc<Vec<Vec<u8>>>,
 }
 
 /// The relay's destination payloads: one batch per worker (scatter), or a

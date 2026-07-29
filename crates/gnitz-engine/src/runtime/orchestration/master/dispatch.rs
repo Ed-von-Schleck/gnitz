@@ -105,15 +105,6 @@ impl MasterDispatcher {
         self.sal.boot_reset();
     }
 
-    pub(super) fn get_schema_and_names(&mut self, target_id: i64) -> (SchemaDescriptor, Rc<Vec<Vec<u8>>>) {
-        let cat = unsafe { &mut *self.catalog };
-        let schema = cat
-            .get_schema_desc(target_id)
-            .unwrap_or_else(|| panic!("master: no schema for target_id={target_id}"));
-        let names = cat.get_col_names_bytes(target_id);
-        (schema, names)
-    }
-
     /// Return the schema descriptor, a cached prebuilt schema wire block,
     /// and the derived `(wire_safe, wire_row_fixed_stride)` for `target_id`.
     /// The block is built lazily on first call and stored in the catalog
@@ -122,10 +113,8 @@ impl MasterDispatcher {
     /// per-call `build_schema_wire_block` allocations and per-column
     /// iteration in `scatter_wire_group`.
     pub(super) fn cached_schema_block(&mut self, target_id: i64) -> (SchemaDescriptor, Rc<Vec<u8>>, bool, u32) {
+        let schema = self.schema_desc_for(target_id);
         let cat = unsafe { &mut *self.catalog };
-        let schema = cat
-            .get_schema_desc(target_id)
-            .unwrap_or_else(|| panic!("master: no schema for target_id={target_id}"));
         let e = crate::runtime::wire::get_or_build_schema_wire_block(cat, target_id, &schema);
         (schema, e.entry.block, e.entry.wire_safe, e.entry.wire_row_fixed_stride)
     }
@@ -138,68 +127,91 @@ impl MasterDispatcher {
     // Core send/receive helpers
     // -----------------------------------------------------------------------
 
-    /// Encode per-worker data with per-worker request ids. Used by async
-    /// fan-outs that need distinct ids per worker for reply routing.
+    /// Write one command group with per-worker request ids: no rows and no
+    /// schema block, so each worker's slot is a bare control block. Every
+    /// command verb's worker arm resolves the schema it needs from its own
+    /// catalog, so the block was dead weight in a slot it dominated.
     ///
-    /// Every caller is a command-only group (seek / scan / tick / gather /
-    /// pipeline / preflight): a lost command needs no crash recovery, so the
-    /// group's LSN is always 0. Durable writers (`scatter_wire_group`,
-    /// `write_broadcast_direct`, the commit sentinel) and the checkpoint flush
-    /// rounds (`write_checkpoint_group` — FlushEph's lsn IS the checkpoint
-    /// generation) carry caller-supplied LSNs on their own paths.
-    ///
-    /// `prebuilt_schema_block`: when `Some`, must be paired with empty
-    /// `col_names` (computing names only to discard them negates the savings).
+    /// `seek_pk`/`seek_col_idx` carry the verb's two scalar operands and
+    /// `seek_pk_extra` its verbatim payload. `lsn` is 0 for every verb — a lost
+    /// command needs no crash recovery — except the checkpoint rounds, where
+    /// FlushEph's lsn IS the checkpoint generation.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn write_group_with_req_ids(
+    pub(super) fn write_command_group(
         &mut self,
         target_id: i64,
+        lsn: u64,
         sal_flags: u32,
         wire_flags: u64,
-        worker_batches: &[Option<&Batch>],
-        schema: &SchemaDescriptor,
-        col_names: &[Vec<u8>],
         seek_pk: u128,
         seek_col_idx: u64,
         req_ids: &[u64],
         unicast_worker: i32,
         client_id: u64,
-        prebuilt_schema_block: Option<&[u8]>,
         seek_pk_extra: &[u8],
     ) -> Result<(), String> {
-        // Only build the name-ref array when it will actually be encoded; a
-        // prebuilt schema block already carries the names.
-        let (name_refs, n) = if prebuilt_schema_block.is_some() {
-            ([&[][..]; crate::schema::MAX_COLUMNS], 0)
-        } else {
-            col_names_as_refs(col_names)
-        };
-        let col_names_opt = if n == 0 { None } else { Some(&name_refs[..n]) };
-
         self.sal.write_group_direct(
             target_id as u32,
-            0,
+            lsn,
             sal_flags,
             wire_flags,
-            worker_batches,
-            schema,
-            col_names_opt,
+            &[],
+            None,
+            None,
             seek_pk,
             seek_col_idx,
             req_ids,
             unicast_worker,
             client_id,
-            prebuilt_schema_block,
+            None,
             seek_pk_extra,
         )
     }
 
-    /// Write one scan group's control block at the current SAL write cursor: no
-    /// data, `sal_flags = 0`, the caller's `wire_flags` (schema-version bits, plus
-    /// `FLAG_SCAN_FIFO_REPLY` for a multi-scan), and the relation's cached schema
-    /// block. The one home for the scan-group `write_group_with_req_ids` shape,
-    /// shared by the single-scan fan-out (`fan_out_scan_async`) and the multi-scan
-    /// one-cut writer (`dispatch_scan_multi_fanout`).
+    /// Write one group carrying rows, with per-worker request ids. The two
+    /// data-bearing fan-outs: the exchange relay (whose schema block is what
+    /// stamps `Batch.schema` on the worker side) and the `FLAG_HAS_PK` unique
+    /// check. LSN 0 — both are command-scoped; durable writers
+    /// (`scatter_wire_group`, `write_broadcast_direct`, the commit sentinel)
+    /// carry caller-supplied LSNs on their own paths.
+    ///
+    /// The schema block carries no column names: `decode_schema_block` parses
+    /// only the col_idx / type / flags regions, and these groups never leave the
+    /// master→worker SAL.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn write_data_group(
+        &mut self,
+        target_id: i64,
+        sal_flags: u32,
+        worker_batches: &[Option<&Batch>],
+        schema: &SchemaDescriptor,
+        seek_pk: u128,
+        seek_col_idx: u64,
+        req_ids: &[u64],
+    ) -> Result<(), String> {
+        self.sal.write_group_direct(
+            target_id as u32,
+            0,
+            sal_flags,
+            0,
+            worker_batches,
+            Some(schema),
+            None,
+            seek_pk,
+            seek_col_idx,
+            req_ids,
+            -1,
+            0,
+            None,
+            &[],
+        )
+    }
+
+    /// Write one scan group: `sal_flags = 0` and the caller's `wire_flags`
+    /// (schema-version bits, plus `FLAG_SCAN_FIFO_REPLY` for a multi-scan). The
+    /// worker's `scan_family` resolves and returns the relation's schema from its
+    /// own catalog. Shared by the single-scan fan-out (`fan_out_scan_async`) and
+    /// the multi-scan one-cut writer (`dispatch_scan_multi_fanout`).
     pub(super) fn write_one_scan_group(
         &mut self,
         target_id: i64,
@@ -208,20 +220,16 @@ impl MasterDispatcher {
         unicast_worker: i32,
         client_id: u64,
     ) -> Result<(), String> {
-        let (schema, block, _safe, _stride) = self.cached_schema_block(target_id);
-        self.write_group_with_req_ids(
+        self.write_command_group(
             target_id,
             0,
+            0,
             wire_flags,
-            &[],
-            &schema,
-            &[],
             0,
             0,
             req_ids,
             unicast_worker,
             client_id,
-            Some(block.as_slice()),
             &[],
         )
     }
@@ -229,11 +237,10 @@ impl MasterDispatcher {
     /// Write one ScanSpec (`ReadSpec`) group: the plain-scan shape plus the
     /// `FLAG_SCAN_SPEC` SAL dispatch flag and the client's bundled spec +
     /// reply-schema blob forwarded **verbatim** in `seek_pk_extra`. The master
-    /// never decodes the blob (the worker is the sole `ReadSpec`/OPK decoder). The
-    /// embedded group schema block is the target's cached block — harmless, since
-    /// the worker's ScanSpec handler reads the reply schema from `seek_pk_extra`,
-    /// not the group block. `wire_flags = 0`: the worker echoes the client's block
-    /// rather than negotiating a schema version.
+    /// never decodes the blob (the worker is the sole `ReadSpec`/OPK decoder), and
+    /// the worker's ScanSpec handler reads its reply schema out of the blob.
+    /// `wire_flags = 0`: the worker echoes the client's block rather than
+    /// negotiating a schema version.
     pub(super) fn write_scan_spec_group(
         &mut self,
         target_id: i64,
@@ -242,20 +249,16 @@ impl MasterDispatcher {
         client_id: u64,
         seek_pk_extra: &[u8],
     ) -> Result<(), String> {
-        let (schema, block, _safe, _stride) = self.cached_schema_block(target_id);
-        self.write_group_with_req_ids(
+        self.write_command_group(
             target_id,
+            0,
             FLAG_SCAN_SPEC,
             0,
-            &[],
-            &schema,
-            &[],
             0,
             0,
             req_ids,
             unicast_worker,
             client_id,
-            Some(block.as_slice()),
             seek_pk_extra,
         )
     }
@@ -264,53 +267,23 @@ impl MasterDispatcher {
     /// `lsn` is supplied by the caller: a DDL zone LSN (`broadcast_ddl`), the
     /// checkpoint generation (FlushEph round), or 0 for command-only groups.
     ///
-    /// `prebuilt_schema_block`: when `Some`, must be paired with empty
-    /// `col_names` (computing names only to discard them negates the savings).
-    #[allow(clippy::too_many_arguments)]
-    fn write_broadcast(
-        &mut self,
-        target_id: i64,
-        lsn: u64,
-        sal_flags: u32,
-        batch: Option<&Batch>,
-        schema: &SchemaDescriptor,
-        col_names: &[Vec<u8>],
-        seek_pk: u128,
-        prebuilt_schema_block: Option<&[u8]>,
-    ) -> Result<(), String> {
-        // Only build the name-ref array when it will actually be encoded; a
-        // prebuilt schema block already carries the names.
-        let (name_refs, n) = if prebuilt_schema_block.is_some() {
-            ([&[][..]; crate::schema::MAX_COLUMNS], 0)
-        } else {
-            col_names_as_refs(col_names)
-        };
-        let col_names_opt = if n == 0 { None } else { Some(&name_refs[..n]) };
-
-        self.sal.write_broadcast_direct(
-            target_id as u32,
-            lsn,
-            sal_flags,
-            batch,
-            schema,
-            col_names_opt,
-            seek_pk,
-            prebuilt_schema_block,
-        )
-    }
-
-    /// Control-only broadcast: write to all workers, signal (no fdatasync).
-    /// `lsn` as in `write_broadcast`.
+    /// Control-only broadcast: replicate one dataless slot to all workers, then
+    /// signal (no fdatasync). `lsn` is the caller's — a DDL zone LSN, the
+    /// checkpoint generation, or 0.
+    ///
+    /// A schema block built here carries no column names: `decode_schema_block`
+    /// parses only the col_idx / type / flags regions, and the SAL never leaves
+    /// the master→worker path.
     fn send_broadcast(
         &mut self,
         target_id: i64,
         lsn: u64,
         flags: u32,
-        schema: &SchemaDescriptor,
-        col_names: &[Vec<u8>],
+        schema: Option<&SchemaDescriptor>,
         seek_pk: u128,
     ) -> Result<(), String> {
-        self.write_broadcast(target_id, lsn, flags, None, schema, col_names, seek_pk, None)?;
+        self.sal
+            .write_broadcast_direct(target_id as u32, lsn, flags, None, schema, None, seek_pk, None)?;
         self.signal_all();
         Ok(())
     }
@@ -534,8 +507,8 @@ impl MasterDispatcher {
     /// A `FLAG_FLUSH_EPH` round's `lsn` IS the checkpoint generation (workers
     /// latch it via `set_committed_generation`); the base round passes 0.
     fn sync_flush_round(&mut self, lsn: u64, flags: u32) -> Result<(), String> {
-        let schema = SchemaDescriptor::minimal_u64();
-        self.send_broadcast(0, lsn, flags, &schema, &[], 0)?;
+        // No schema block: `handle_flush_all` takes neither a schema nor a batch.
+        self.send_broadcast(0, lsn, flags, None, 0)?;
         self.collect_acks()
     }
 
@@ -572,8 +545,11 @@ impl MasterDispatcher {
     /// Raw SAL relay-space threshold: at least 1/8 of the mmap still free.
     /// Seam-free — the boot backfill relay checks this directly because it
     /// must keep failing-on-low-space without observing the relay_loop test
-    /// seam (which would spuriously fail an in-progress backfill).
-    fn sal_relay_space_ok_raw(&self) -> bool {
+    /// seam (which would spuriously fail an in-progress backfill). The
+    /// watchdog's reclaim trigger reads it for the same reason: a timer
+    /// honouring the seam would checkpoint the armed epoch away before
+    /// `relay_loop` reached its low-space branch.
+    pub(crate) fn sal_relay_space_ok_raw(&self) -> bool {
         self.sal.mmap_size() - self.sal.cursor() >= (self.sal.mmap_size() >> 3)
     }
 
@@ -722,14 +698,11 @@ impl MasterDispatcher {
             })
         };
 
-        let (_, name_bytes) = self.get_schema_and_names(view_id);
-
         Ok(RelayPrepared {
             view_id,
             source_id,
             dest,
             schema,
-            name_bytes,
         })
     }
 
@@ -749,7 +722,6 @@ impl MasterDispatcher {
             source_id,
             dest,
             schema,
-            name_bytes,
         } = prep;
         let refs: Vec<Option<&Batch>> = match &dest {
             RelayDest::PerWorker(batches) => batches
@@ -770,20 +742,14 @@ impl MasterDispatcher {
         // collect reads W2M rings directly and never routes by req_id, so the
         // relay carries request_id 0 on every worker slot.
         let req_ids = [0u64; crate::runtime::sal::MAX_WORKERS];
-        self.write_group_with_req_ids(
+        self.write_data_group(
             view_id,
             FLAG_EXCHANGE_RELAY,
-            0,
             &refs,
             &schema,
-            &name_bytes,
             source_id as u128,
             decision,
             &req_ids[..self.num_workers],
-            -1,
-            0,
-            None,
-            &[],
         )?;
         self.signal_all();
         Ok(())
@@ -848,8 +814,8 @@ impl MasterDispatcher {
     /// reactor-parked DDL window).
     pub fn fan_out_backfill(&mut self, view_id: i64, source_id: i64) -> Result<(), String> {
         self.maybe_checkpoint()?;
-        let (schema, col_names) = self.get_schema_and_names(source_id);
-        self.send_broadcast(source_id, 0, FLAG_BACKFILL, &schema, &col_names, view_id as u128)?;
+        let schema = self.schema_desc_for(source_id);
+        self.send_broadcast(source_id, 0, FLAG_BACKFILL, Some(&schema), view_id as u128)?;
         self.collect_acks_and_relay(true)
     }
 
@@ -964,20 +930,16 @@ impl MasterDispatcher {
         // gate discard a late frame.
         let (mut slots, _req_ids, _lease) =
             dispatch_scan_fanout(disp_ptr, reactor, sal_excl, -1, |disp, req_ids, unicast| {
-                let (schema, block, _safe, _stride) = disp.cached_schema_block(target_id);
-                disp.write_group_with_req_ids(
+                disp.write_command_group(
                     target_id,
+                    0,
                     FLAG_SEEK_BY_INDEX,
                     0,
-                    &[],
-                    &schema,
-                    &[],
                     key,
                     col_idx as u64,
                     req_ids,
                     unicast,
                     0,
-                    Some(block.as_slice()),
                     &[],
                 )
             })
@@ -1063,21 +1025,20 @@ impl MasterDispatcher {
         let mut expected: Option<SchemaDescriptor> = None;
         let (slots, req_ids, _lease) =
             dispatch_scan_fanout(disp_ptr, reactor, sal_excl, unicast, |disp, req_ids, unicast| {
-                let (schema, block, _safe, _stride) = disp.cached_schema_block(target_id);
-                expected = Some(schema);
-                disp.write_group_with_req_ids(
+                // The schema is the master's own reply guard, not something the
+                // group carries: the worker's `seek_by_index` arm resolves its
+                // own from its own catalog.
+                expected = Some(disp.schema_desc_for(target_id));
+                disp.write_command_group(
                     target_id,
+                    0,
                     sal_flag,
                     0,
-                    &[],
-                    &schema,
-                    &[],
                     seek_pk,
                     seek_col_idx,
                     req_ids,
                     unicast,
                     0,
-                    Some(block.as_slice()),
                     seek_pk_extra,
                 )
             })
@@ -1269,13 +1230,13 @@ impl MasterDispatcher {
     /// them as an atomic zone.
     pub fn broadcast_ddl(&mut self, target_id: i64, batch: &Batch, lsn: u64) -> Result<(), String> {
         let (schema, schema_block, _safe, _stride) = self.cached_schema_block(target_id);
-        self.write_broadcast(
-            target_id,
+        self.sal.write_broadcast_direct(
+            target_id as u32,
             lsn,
             FLAG_DDL_SYNC,
             Some(batch),
-            &schema,
-            &[],
+            Some(&schema),
+            None,
             0,
             Some(schema_block.as_slice()),
         )?;
@@ -1298,28 +1259,67 @@ impl MasterDispatcher {
     // Tick group writer (used by the async tick task in executor.rs)
     // -----------------------------------------------------------------------
 
+    /// The one-shot tick-emit latch, but only for the table
+    /// `GNITZ_INJECT_TICK_EMIT_ERROR` names; `None` when the seam is unset or
+    /// `tid` is some other table. The env is read once — it cannot change
+    /// mid-process — and is checked before the catalog lookup, so an unset seam
+    /// costs one atomic load on the push path.
+    #[cfg(debug_assertions)]
+    fn injected_tick_emit_latch(&self, tid: i64) -> Option<&'static std::sync::atomic::AtomicBool> {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::OnceLock;
+        static TARGET: OnceLock<Option<String>> = OnceLock::new();
+        static ARMED: AtomicBool = AtomicBool::new(false);
+
+        let name = TARGET
+            .get_or_init(|| std::env::var("GNITZ_INJECT_TICK_EMIT_ERROR").ok())
+            .as_deref()?;
+        let (_, table) = unsafe { (*self.catalog).get_qualified_name(tid) }?;
+        (table == name).then_some(&ARMED)
+    }
+
+    /// Debug seam, arm half: a committed non-empty push to the named table arms
+    /// the one-shot tick-emit failure.
+    ///
+    /// Arming on a push rather than on "the next tick anywhere" is what makes the
+    /// seam land where the scenario it models does: a `CREATE VIEW` drives one
+    /// tick of its source to seed the view, well before any test read reaches the
+    /// tick loop, so an unconditional latch would always be spent by the CREATE.
+    /// That seeding push carries no rows, hence the row-count test.
+    #[cfg(debug_assertions)]
+    fn arm_injected_tick_emit_error(&self, target_id: i64, rows: usize) {
+        if rows > 0 {
+            if let Some(armed) = self.injected_tick_emit_latch(target_id) {
+                armed.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Debug seam, fire half: fail the armed table's next `write_tick_group`
+    /// before it writes anything — what a full SAL does to a tick. One-shot, so
+    /// the follow-up read can watch the re-queued tid tick and the view converge.
+    #[cfg(debug_assertions)]
+    fn take_injected_tick_emit_error(&self, tid: i64) -> bool {
+        let fires = self
+            .injected_tick_emit_latch(tid)
+            .is_some_and(|armed| armed.swap(false, std::sync::atomic::Ordering::Relaxed));
+        if fires {
+            gnitz_debug!("injected tick emit error fires (tid={})", tid);
+        }
+        fires
+    }
+
     /// Write a FLAG_TICK group for `tid` with per-worker req_ids. Does
     /// NOT signal — the caller batches multiple `write_tick_group` calls
-    /// followed by a single `signal_all` (IV.6). The underlying SAL
-    /// encoder reuses `write_group_with_req_ids`; per-worker slots all
-    /// carry the corresponding req_id from `req_ids[w]`.
+    /// followed by a single `signal_all` (IV.6). Per-worker slots each carry
+    /// the corresponding req_id from `req_ids[w]`. No schema block:
+    /// `handle_tick` looks the target's schema up in its own catalog.
     pub(crate) fn write_tick_group(&mut self, tid: i64, req_ids: &[u64]) -> Result<(), String> {
-        let (schema, schema_block, _safe, _stride) = self.cached_schema_block(tid);
-        self.write_group_with_req_ids(
-            tid,
-            FLAG_TICK,
-            0,
-            &[],
-            &schema,
-            &[],
-            0,
-            0,
-            req_ids,
-            -1,
-            0,
-            Some(schema_block.as_slice()),
-            &[],
-        )
+        #[cfg(debug_assertions)]
+        if self.take_injected_tick_emit_error(tid) {
+            return Err(format!("injected tick emit error (tid={tid})"));
+        }
+        self.write_command_group(tid, 0, FLAG_TICK, 0, 0, 0, req_ids, -1, 0, &[])
     }
 
     // -----------------------------------------------------------------------
@@ -1366,8 +1366,8 @@ impl MasterDispatcher {
     /// Broadcast `FLAG_SHUTDOWN` (each worker flushes + `_exit`s) and reap the
     /// worker processes.
     pub fn shutdown_workers(&mut self) {
-        let schema = SchemaDescriptor::minimal_u64();
-        let _ = self.send_broadcast(0, 0, FLAG_SHUTDOWN, &schema, &[], 0);
+        // No schema block: the worker's `Shutdown` arm takes no arguments.
+        let _ = self.send_broadcast(0, 0, FLAG_SHUTDOWN, None, 0);
         for w in 0..self.num_workers {
             let pid = self.worker_pids[w];
             if pid > 0 {
@@ -1435,6 +1435,8 @@ impl MasterDispatcher {
         mode: WireConflictMode,
         req_ids: &[u64],
     ) -> Result<(), String> {
+        #[cfg(debug_assertions)]
+        self.arm_injected_tick_emit_error(target_id, batch.count);
         let (schema, schema_block, wire_safe, wire_row_stride) = self.cached_schema_block(target_id);
         let nw = self.num_workers;
         let wire_flags = wire_flags_set_conflict_mode(0, mode);
@@ -1472,16 +1474,13 @@ impl MasterDispatcher {
     /// `FLAG_FLUSH_EPH` ephemeral round) with per-worker req_ids. Does NOT
     /// sync/signal. Caller signals + awaits replies. `lsn` is supplied by the
     /// caller — the ephemeral round passes the checkpoint generation there, which
-    /// workers read to stamp view manifests (the base round passes 0). This is
-    /// why the group is written directly rather than through the zero-LSN
-    /// `write_group_with_req_ids` funnel.
+    /// workers read to stamp view manifests (the base round passes 0).
+    ///
+    /// Every worker gets a bare control block: `handle_flush_all` takes neither a
+    /// schema nor a batch, and reads the generation from
+    /// `worker_ctx::committed_generation()`.
     pub(crate) fn write_checkpoint_group(&mut self, lsn: u64, flags: u32, req_ids: &[u64]) -> Result<(), String> {
-        let schema = SchemaDescriptor::minimal_u64();
-        // No batches: `write_group_direct` reads an absent entry as "no data for
-        // this worker", so every worker gets a schema-only slot and replies after
-        // flushing its system tables and advancing its epoch.
-        self.sal
-            .write_group_direct(0, lsn, flags, 0, &[], &schema, None, 0, 0, req_ids, -1, 0, None, &[])
+        self.write_command_group(0, lsn, flags, 0, 0, 0, req_ids, -1, 0, &[])
     }
 
     /// Post-ACK checkpoint cleanup: flush system tables before resetting
@@ -1552,7 +1551,9 @@ impl MasterDispatcher {
     /// Get the schema descriptor for a target_id. Panics if the table
     /// has no schema (committer should only see tables that validated).
     pub fn schema_desc_for(&mut self, target_id: i64) -> SchemaDescriptor {
-        self.get_schema_and_names(target_id).0
+        unsafe { &mut *self.catalog }
+            .get_schema_desc(target_id)
+            .unwrap_or_else(|| panic!("master: no schema for target_id={target_id}"))
     }
 
     pub(super) fn get_col_name(&mut self, target_id: i64, col_idx: usize) -> String {
@@ -1663,20 +1664,16 @@ async fn single_worker_async(
 ) -> Result<W2mSlot, String> {
     let (mut slots, _req_ids, _lease) =
         dispatch_scan_fanout(disp_ptr, reactor, sal_excl, worker as i32, |disp, req_ids, unicast| {
-            let (schema, block, _safe, _stride) = disp.cached_schema_block(target_id);
-            disp.write_group_with_req_ids(
+            disp.write_command_group(
                 target_id,
+                0,
                 flags,
                 0,
-                &[],
-                &schema,
-                &[],
                 seek_pk,
                 seek_col_idx,
                 req_ids,
                 unicast,
                 0,
-                Some(block.as_slice()),
                 seek_pk_extra,
             )
         })

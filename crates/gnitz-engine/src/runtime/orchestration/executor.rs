@@ -62,8 +62,14 @@ pub enum TickTrigger {
     /// coalesce threshold.  Tids come from `tick_rows` / `tick_tids`.
     Auto,
     /// Explicit drain requested by SCAN: forces the listed tids to tick
-    /// even if their `tick_rows` counter is empty, then signals `done`.
-    Drain { tids: Vec<i64>, done: oneshot::Sender<()> },
+    /// even if their `tick_rows` counter is empty, then reports the tick's
+    /// verdict on `done`. A reader that waited on a failed tick must be told:
+    /// its view is stale, and reporting success would serve stale rows under
+    /// `STATUS_OK`.
+    Drain {
+        tids: Vec<i64>,
+        done: oneshot::Sender<Result<(), String>>,
+    },
     /// Pause the tick subsystem for a stop-the-world CREATE-VIEW DDL. On
     /// dequeue the tick loop signals `acked` — proving no tick is in flight
     /// (the loop is serial, so the prior tick has returned) and none will
@@ -76,15 +82,43 @@ pub enum TickTrigger {
     },
 }
 
-/// Releases the tick-subsystem quiesce gate when dropped, so a CREATE-VIEW
-/// stop-the-world window ends on every exit path of `handle_ddl_txn`
-/// (success or early-return error). Sending wakes the parked `tick_loop_async`,
-/// which resumes dequeuing ticks. `None` for non-view DDL (no gate taken).
-struct TickGate(Option<oneshot::Sender<()>>);
+/// The stop-the-world window a CREATE-VIEW / column-ALTER DDL runs inside: the
+/// tick loop is parked and the DDL-window depth is raised for exactly as long as
+/// the gate lives. Dropping it releases both, so the window ends on every exit
+/// path of `handle_ddl_txn` (success or early-return error).
+///
+/// While the depth is non-zero no checkpoint round may run: its drain would
+/// never complete against a parked tick loop, and the DDL's own synchronous W2M
+/// collectors read the rings by position, so they would eat the round's ACKs and
+/// park the committer forever holding `sal_writer_excl`. A depth, not a flag —
+/// `handle_ddl_txn` awaits before taking the catalog write lock, so a second DDL
+/// enters its own window while the first is still in its.
+///
+/// `None` for non-quiescing DDL: no gate taken, no depth raised.
+struct TickGate(Option<(oneshot::Sender<()>, Rc<Cell<usize>>)>);
+
+impl TickGate {
+    /// Park the tick loop and enter a DDL window. Returns once the loop has
+    /// acked — no tick is in flight and none will start until this gate drops.
+    async fn quiescing(shared: &Rc<Shared>) -> Self {
+        let (acked_tx, acked_rx) = oneshot::channel::<()>();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        shared.tick_tx.send(TickTrigger::Quiesce {
+            acked: acked_tx,
+            release: release_rx,
+        });
+        let _ = acked_rx.await;
+        let depth = &shared.ddl_window;
+        depth.set(depth.get() + 1);
+        TickGate(Some((release_tx, Rc::clone(depth))))
+    }
+}
+
 impl Drop for TickGate {
     fn drop(&mut self) {
-        if let Some(tx) = self.0.take() {
-            let _ = tx.send(());
+        if let Some((release, depth)) = self.0.take() {
+            depth.set(depth.get() - 1);
+            let _ = release.send(());
         }
     }
 }
@@ -117,6 +151,10 @@ pub struct Shared {
     /// Shutdown barrier, so `handle_message`'s push path rejects new pushes
     /// — none may commit after the final checkpoint's view flush.
     draining: Rc<Cell<bool>>,
+    /// Nesting depth of the DDL windows in which the tick loop is parked; see
+    /// `TickGate`. Read by the committer (no checkpoint round while non-zero)
+    /// and by the watchdog (a SIGTERM waits the window out).
+    ddl_window: Rc<Cell<usize>>,
     /// OCC per-table commit-LSN map: `tid → zone LSN of its last committed
     /// write this boot`. Bumped under the writer's table lock immediately after
     /// a successful commit ACK (push arm and `push_txn_body`, `Ok` path only), and
@@ -218,6 +256,33 @@ impl Shared {
         out.extend(tids.drain(..));
         self.tick_rows.borrow_mut().clear();
     }
+
+    /// Put `tids` back after a tick failed to emit them, so their deltas are
+    /// ticked again instead of stranded. Restores both halves of what
+    /// `drain_tick_rows_into` emptied, with a non-zero count: the committer
+    /// queues a tid on the `*entry == 0` transition, so a restored tid left at 0
+    /// would be queued a second time by the next push and emitted twice. The
+    /// true count is gone; 1 only understates the coalesce threshold, which
+    /// honours the window instead of skipping it. Restored tids go ahead of
+    /// anything queued while the failed tick ran, in their original relative
+    /// order — `drain_tick_rows_into` preserves insertion order because
+    /// anti-join semantics need the a-side first.
+    fn requeue_tick_tids(&self, tids: &[i64]) {
+        if tids.is_empty() {
+            return;
+        }
+        let mut rows = self.tick_rows.borrow_mut();
+        let mut queue = self.tick_tids.borrow_mut();
+        // A tid a mid-tick push already re-queued moves back to its original
+        // position rather than staying behind the ones being restored. Both
+        // operands are bounded by the tables with pending deltas, and the failed
+        // tick just drained the queue, so this normally scans nothing.
+        queue.retain(|t| !tids.contains(t));
+        queue.splice(0..0, tids.iter().copied());
+        for &tid in tids {
+            rows.insert(tid, 1);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +349,8 @@ impl ServerExecutor {
 
         // Graceful-shutdown push gate (reactor-thread-only).
         let draining = Rc::new(Cell::new(false));
+        // Nesting depth of the quiescing-DDL windows (reactor-thread-only).
+        let ddl_window = Rc::new(Cell::new(0usize));
 
         let committer_shared = Rc::new(committer::Shared {
             reactor: Rc::clone(&reactor),
@@ -296,6 +363,7 @@ impl ServerExecutor {
             tick_rows: Rc::clone(&tick_rows),
             tick_tids: Rc::clone(&tick_tids),
             tick_tx: tick_tx.clone(),
+            ddl_window: Rc::clone(&ddl_window),
         });
         let shared = Rc::new(Shared {
             reactor: Rc::clone(&reactor),
@@ -312,6 +380,7 @@ impl ServerExecutor {
             tick_tids: Rc::clone(&tick_tids),
             table_locks: RefCell::new(FxHashMap::default()),
             draining: Rc::clone(&draining),
+            ddl_window: Rc::clone(&ddl_window),
             table_commit_lsn: RefCell::new(FxHashMap::default()),
             boot_seed: initial_lsn,
         });
@@ -542,6 +611,13 @@ async fn watchdog(shared: Rc<Shared>) {
             .await;
 
         if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+            // Let a quiescing DDL finish first. Its tick loop is parked, so the
+            // Shutdown barrier would resolve without a checkpoint and
+            // `shutdown_workers()` would then kill the workers under a live
+            // backfill, whose `fail_if_worker_dead` fatal-aborts.
+            if shared.ddl_window.get() != 0 {
+                continue;
+            }
             gnitz_info!("shutdown signal received; draining, checkpointing, and stopping");
 
             // 1. Stop admitting new pushes (none may commit after the final
@@ -577,6 +653,26 @@ async fn watchdog(shared: Rc<Shared>) {
             shared.disp().shutdown_workers();
             shared.reactor.request_shutdown();
             return;
+        }
+
+        // The only reclaim trigger on a workload with no writes: every read verb
+        // writes a SAL command group and nothing on a read path rewinds the
+        // cursor. Deliberately not awaited — this loop is the sole worker-crash
+        // detector and `flush_round`'s reply futures have no timeout, so awaiting
+        // would let a worker dying mid-checkpoint hang the node silently instead
+        // of aborting within one tick. The next tick re-checks and re-sends.
+        // On a write workload it is inert: the committer already checkpoints at
+        // 3/4 on every push, well before this 7/8 line. Skipped inside a DDL
+        // window, where the committer refuses every checkpoint anyway.
+        if shared.ddl_window.get() == 0 && !shared.disp().sal_relay_space_ok_raw() {
+            let (tx, done) = oneshot::channel();
+            shared.committer_tx.send(CommitRequest::Barrier {
+                kind: BarrierKind::Reclaim,
+                done: tx,
+            });
+            // Fire-and-forget: dropping the receiver is the whole point, not an
+            // RAII hold.
+            drop(done);
         }
     }
 }
@@ -688,14 +784,16 @@ async fn tick_loop_async(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>
         }
         tids_scratch.retain(|&tid| shared.cat().has_id(tid));
 
-        // Run the tick. Errors are reported in logs; every Drain trigger's
-        // `done` is signalled regardless so callers don't hang.
-        if let Err(e) = run_tick(&shared, &tids_scratch, nw, &mut req_ids, &mut fut_slots, &mut ack_slots).await {
+        // Run the tick. Errors are reported in logs AND handed to every Drain
+        // trigger's `done`: the waiting reader's view is stale, so reporting
+        // success would serve stale rows under STATUS_OK.
+        let tick_result = run_tick(&shared, &tids_scratch, nw, &mut req_ids, &mut fut_slots, &mut ack_slots).await;
+        if let Err(e) = &tick_result {
             gnitz_warn!("tick error: {}", e);
         }
         for t in triggers.drain(..) {
             if let TickTrigger::Drain { done, .. } = t {
-                let _ = done.send(());
+                let _ = done.send(tick_result.clone());
             }
         }
     }
@@ -730,24 +828,50 @@ async fn run_tick(
     let _cat_read = shared.catalog_rwlock.read().await;
     let _sal_excl = shared.sal_writer_excl.lock().await;
 
-    let emit_err = guard_panic("tick", || unsafe {
+    // Written by the closure as it goes, so the re-queue and reply-await below
+    // are also correct on `guard_panic`'s panic arm, which discards the closure's
+    // return value.
+    let emitted = Cell::new(0usize);
+    let emit = guard_panic("tick", || unsafe {
         let disp = &mut *shared.dispatcher;
+        let mut result = Ok(());
         for (i, &tid) in tids.iter().enumerate() {
-            disp.write_tick_group(tid, &req_ids[i * nw..(i + 1) * nw])?;
+            if let Err(e) = disp.write_tick_group(tid, &req_ids[i * nw..(i + 1) * nw]) {
+                result = Err(e);
+                break;
+            }
+            emitted.set(i + 1);
         }
-        disp.signal_all();
-        Ok(())
+        // Whatever was written is already published, so the workers consume it on
+        // the next signal or their SAL wait timeout regardless. Signal it and
+        // await its replies rather than returning while its evaluation is in
+        // flight.
+        if emitted.get() > 0 {
+            disp.signal_all();
+        }
+        result
     });
     drop(_sal_excl);
     drop(_cat_read);
-    emit_err?;
+
+    let n = emitted.get();
+    // The un-emitted tids never reached a worker, so they still need ticking. An
+    // emitted tid is already being ticked by the workers (its group is
+    // published), and `handle_tick` has taken its delta, so re-queueing it would
+    // only produce a no-op tick that then reports success and masks this failure.
+    shared.requeue_tick_tids(&tids[n..]);
 
     fut_slots.clear();
-    fut_slots.extend(req_ids.iter().copied().map(|id| shared.reactor.await_reply(id)));
+    fut_slots.extend(
+        req_ids[..n * nw]
+            .iter()
+            .copied()
+            .map(|id| shared.reactor.await_reply(id)),
+    );
     join_into(fut_slots, ack_slots).await;
-    let err = first_worker_error_opt("tick", ack_slots);
+    let worker_err = first_worker_error_opt("tick", ack_slots);
     ack_slots.clear();
-    if let Some(e) = err {
+    if let Some(e) = emit.err().or(worker_err) {
         return Err(e);
     }
     shared.last_tick_lsn.set(snapshot_lsn);
@@ -1611,24 +1735,31 @@ async fn handle_get_indices(shared: &Rc<Shared>, peer: &Peer, client_id: u64, ta
 /// iterate for the storm's duration (each pass sees `tick_tids` non-empty); the
 /// caller's own ACKed writes are covered after pass 1. View seeks confine this
 /// to views — base-table seeks never call it.
-async fn drain_pending_ticks(shared: &Rc<Shared>) {
+/// A failed tick is reported rather than swallowed: its views are stale, and the
+/// error also stops the loop from spinning on the `tick_tids` the failure
+/// re-queued.
+async fn drain_pending_ticks(shared: &Rc<Shared>) -> Result<(), String> {
     // Fast path: views already reflect every ACKed commit (see above).
     if shared.last_tick_lsn.get() >= shared.lsn_alloc.published() {
-        return;
+        return Ok(());
     }
     loop {
         let snapshot: Vec<i64> = shared.tick_tids.borrow().clone();
         let was_empty = snapshot.is_empty();
-        let (tx, rx) = oneshot::channel::<()>();
+        let (tx, rx) = oneshot::channel::<Result<(), String>>();
         shared.tick_tx.send(TickTrigger::Drain {
             tids: snapshot,
             done: tx,
         });
-        let _ = rx.await;
+        // A cancelled receiver means the tick loop is gone; treat it as done.
+        if let Ok(Err(e)) = rx.await {
+            return Err(e);
+        }
         if was_empty && shared.tick_tids.borrow().is_empty() {
             break;
         }
     }
+    Ok(())
 }
 
 /// True iff `tid` names a view — the one thing that decides whether a pending
@@ -1664,7 +1795,12 @@ async fn read_lock(
             return Some((g, kind));
         }
     }
-    drain_pending_ticks(shared).await;
+    // No preliminary frame has gone out yet (`negotiate_scan_schema` runs later),
+    // so a failed drain is still reportable as a plain error.
+    if let Err(e) = drain_pending_ticks(shared).await {
+        send_error(peer, target_id, client_id, e.as_bytes()).await;
+        return None;
+    }
     let g = shared.catalog_rwlock.read().await;
     let kind = resolve_read_target(shared, peer, client_id, target_id).await?;
     Some((g, kind))
@@ -1848,7 +1984,7 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
         tids.iter().any(|&t| is_view(shared, t as i64))
     };
     if needs_drain {
-        drain_pending_ticks(shared).await;
+        drain_pending_ticks(shared).await?;
     }
     // The shared LSN stamped into every terminal.
     let lsn = shared.last_tick_lsn.get();
@@ -2099,14 +2235,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
     let _ = rx.await;
 
     let _tick_gate = if view_create || column_alter {
-        let (acked_tx, acked_rx) = oneshot::channel::<()>();
-        let (release_tx, release_rx) = oneshot::channel::<()>();
-        shared.tick_tx.send(TickTrigger::Quiesce {
-            acked: acked_tx,
-            release: release_rx,
-        });
-        let _ = acked_rx.await;
-        TickGate(Some(release_tx))
+        TickGate::quiescing(shared).await
     } else {
         TickGate(None)
     };
@@ -2485,7 +2614,15 @@ fn emit_zone_to_sal(shared: &Shared, op: &'static str, drained: &[(i64, Batch)],
         if std::env::var("GNITZ_INJECT_DDL_PANIC").as_deref() == Ok("after_broadcasts") {
             libc::abort();
         }
-        (*disp).commit_zone(zone_lsn)?;
+        // An empty zone has no groups for recovery to gate, so its sentinel
+        // records nothing. Skipping it also makes "every sentinel follows an
+        // ordinary group" true by construction, which is what keeps a run of
+        // sentinels from reaching the checkpoint reserve.
+        // `apply_and_enqueue_family` drops empty batches, so a DDL bundle whose
+        // families all net to empty arrives here with `drained` empty.
+        if !drained.is_empty() {
+            (*disp).commit_zone(zone_lsn)?;
+        }
         Ok::<(), String>(())
     }) {
         gnitz_fatal_abort!("{} broadcast failed after in-memory catalog mutation: {}", op, e);

@@ -129,6 +129,9 @@ pub struct Shared {
     /// the checkpoint sequence's drain (`Drain`) and quiesce (`Quiesce`)
     /// between its base and ephemeral rounds.
     pub tick_tx: mpsc::Sender<TickTrigger>,
+    /// Nesting depth of the DDL windows in which the tick loop is parked (see
+    /// `TickGate`). No checkpoint round may run while it is non-zero.
+    pub ddl_window: Rc<Cell<usize>>,
 }
 
 impl Shared {
@@ -185,14 +188,24 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
         // workers.
         let has_barriers = !barriers.is_empty();
         let forced = barriers.iter().any(|(k, _)| *k == BarrierKind::Shutdown);
-        // Consume the one-shot force_checkpoint unconditionally (a transaction
-        // that didn't fit the SAL's remaining space set it), so the retry finds
-        // a reclaimed SAL even when `sal_needs_checkpoint()` is still false.
-        let force_ckpt = shared.force_checkpoint.take();
-        let checkpoint = forced
-            || force_ckpt
-            || shared.disp().sal_needs_checkpoint()
-            || (has_barriers && !shared.disp().sal_has_relay_space());
+        // No checkpoint round inside a DDL window: `run_checkpoint_sequence`'s
+        // drain would never complete against the parked tick loop, and the DDL's
+        // own W2M collectors would eat the round's ACKs (see `TickGate`).
+        // Refusing rather than waiting is safe — `relay_loop` cannot be mid-retry
+        // once the Quiesce is acked (a worker ACKs its tick only after its relay
+        // was written), the watchdog's barrier re-fires in 100 ms, and the
+        // backfill reclaims through its own `maybe_checkpoint`.
+        let ddl_window = shared.ddl_window.get() != 0;
+        // Consume the one-shot force_checkpoint (a transaction that didn't fit
+        // the SAL's remaining space set it), so the retry finds a reclaimed SAL
+        // even when `sal_needs_checkpoint()` is still false. Left armed inside a
+        // DDL window, where it could not be honoured anyway.
+        let force_ckpt = !ddl_window && shared.force_checkpoint.take();
+        let checkpoint = !ddl_window
+            && (forced
+                || force_ckpt
+                || shared.disp().sal_needs_checkpoint()
+                || (has_barriers && !shared.disp().sal_has_relay_space()));
 
         let (pushes, txns, barriers) = if checkpoint {
             // The full three-step sequence: gen bump → base round → drain →
@@ -210,7 +223,11 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
             commit_pushes(&shared, pushes, txns, &mut fut_slots, &mut ack_slots, &mut merge_pool).await;
         }
 
-        if has_barriers {
+        // A DDL or shutdown barrier can change a schema out from under the pooled
+        // per-(tid, mode) merge batches. A Reclaim barrier cannot, and the
+        // watchdog fires those on a timer, so clearing on those too would drop
+        // the pool every 100 ms while the SAL sits above its line.
+        if barriers.iter().any(|(k, _)| *k != BarrierKind::Reclaim) {
             merge_pool.clear();
         }
         for (_, b) in barriers {
@@ -380,9 +397,9 @@ async fn run_checkpoint_sequence(
     // source's full dependent closure with inline exchange rounds, and pushes are
     // held so `tick_tids` cannot grow. Mirrors the SCAN drain.
     let tids = shared.tick_tids.borrow().clone();
-    let (done_tx, done_rx) = oneshot::channel();
+    let (done_tx, done_rx) = oneshot::channel::<Result<(), String>>();
     shared.tick_tx.send(TickTrigger::Drain { tids, done: done_tx });
-    await_servicing(
+    let drained = await_servicing(
         done_rx,
         rx,
         &mut held_pushes,
@@ -393,6 +410,22 @@ async fn run_checkpoint_sequence(
         ack_slots,
     )
     .await;
+    // Step 3 would stamp every view manifest at `gen` while the views are missing
+    // the deltas this drain failed to tick — durable, generation-valid loss. Skip
+    // it: step 0's bump is already durable and the manifests are still at
+    // `gen - 1`, so `compute_invalid_views` rebuilds them from the base tables on
+    // the next boot. Aborting would be equally safe, but this path also runs on
+    // the Shutdown barrier, so it would turn any tick error during the final
+    // drain into `_exit(134)`.
+    match drained {
+        Some(Ok(())) => {}
+        Some(Err(e)) => {
+            crate::gnitz_warn!("checkpoint drain failed, skipping the ephemeral round: {}", e);
+            return (held_pushes, held_txns, deferred);
+        }
+        // Cancelled, or the request channel closed.
+        None => return (held_pushes, held_txns, deferred),
+    }
 
     // Quiesce so no tick runs during the ephemeral flush.
     let (acked_tx, acked_rx) = oneshot::channel();
@@ -401,7 +434,7 @@ async fn run_checkpoint_sequence(
         acked: acked_tx,
         release: release_rx,
     });
-    await_servicing(
+    let _ = await_servicing(
         acked_rx,
         rx,
         &mut held_pushes,
@@ -429,9 +462,13 @@ async fn run_checkpoint_sequence(
 /// barriers are deferred to sequence end, and pushes are held for the folded
 /// commit. The target is re-polled after each serviced request, so no wakeup
 /// is lost.
+///
+/// Returns the target's payload — `None` if it was cancelled or the request
+/// channel closed. The Drain target carries the tick's verdict, which decides
+/// whether the sequence's ephemeral round may run.
 #[allow(clippy::too_many_arguments)]
-async fn await_servicing(
-    target_rx: oneshot::Receiver<()>,
+async fn await_servicing<T>(
+    target_rx: oneshot::Receiver<T>,
     rx: &mut mpsc::Receiver<CommitRequest>,
     held_pushes: &mut Vec<PendingPush>,
     held_txns: &mut Vec<PendingTxn>,
@@ -439,22 +476,28 @@ async fn await_servicing(
     shared: &Rc<Shared>,
     fut_slots: &mut Vec<ReplyFuture>,
     ack_slots: &mut Vec<Option<DecodedWire>>,
-) {
+) -> Option<T> {
     // `oneshot::Receiver` is `Unpin`, so `&mut target` is itself a Future.
     let mut target = target_rx;
     loop {
         match select2(&mut target, rx.recv()).await {
             // Target fired (drain done / quiesce acked), or the channel closed.
-            Either::A(_) => return,
-            Either::B(None) => return,
+            Either::A(v) => return v.ok(),
+            Either::B(None) => return None,
             Either::B(Some(CommitRequest::Barrier {
                 kind: BarrierKind::Reclaim,
                 done,
             })) => {
                 // Reclaim-only base round: no gen re-bump, no re-staleing of
-                // view manifests.
-                if let Err(e) = flush_round(shared, None, fut_slots, ack_slots).await {
-                    crate::gnitz_fatal_abort!("reclaim checkpoint failed, cluster epoch-desynced: {}", e);
+                // view manifests. Gated on the same predicate `run` uses — step 1
+                // of the sequence in progress has already reset the SAL, and the
+                // watchdog fires these on a timer without waiting for the last
+                // one, so an ungated round here would repeat a full
+                // broadcast + per-worker-ACK + system-table flush for nothing.
+                if !shared.disp().sal_has_relay_space() {
+                    if let Err(e) = flush_round(shared, None, fut_slots, ack_slots).await {
+                        crate::gnitz_fatal_abort!("reclaim checkpoint failed, cluster epoch-desynced: {}", e);
+                    }
                 }
                 let _ = done.send(());
             }

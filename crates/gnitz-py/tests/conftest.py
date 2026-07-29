@@ -216,26 +216,37 @@ def client(_srv):
         yield conn
 
 
-def _seamed_server(monkeypatch, env: dict[str, str]):
-    """Spawn a dedicated server (separate from the session server) with
-    debug-only env seams set, yielding a connected client. Shared body of the
-    seam fixtures below; no-op against a release server (the seams are
-    `#[cfg(debug_assertions)]`). Forces >= 2 workers — the paths under test
-    are distributed. monkeypatch reverts the env vars at fixture teardown."""
-    binary = _server_binary()
+def _env_server(monkeypatch, env: dict[str, str], debug_only: bool = False):
+    """Spawn a dedicated server (separate from the session server) with `env`
+    set, yielding `(target, proc)` so the test can open its own connections and
+    assert the master is still alive. Shared body of every dedicated-server
+    fixture below. Forces >= 2 workers — the paths under test are distributed.
+    monkeypatch reverts the env vars at fixture teardown.
+
+    `debug_only` skips the test on a release build, for env vars that name a
+    `#[cfg(debug_assertions)]` injection seam: without the seam the test would
+    silently assert against an ordinary healthy run."""
+    if debug_only and not is_debug_build():
+        pytest.skip(f"injection seam requires a debug build: {', '.join(env)}")
 
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     if int(os.environ.get("GNITZ_WORKERS", "1")) < 2:
         monkeypatch.setenv("GNITZ_WORKERS", "4")
 
-    s = _Server(binary)
+    s = _Server(_server_binary())
     try:
         s.start()
-        with gnitz.connect(s.target) as conn:
-            yield conn
+        yield s.target, s.proc
     finally:
         s.teardown()
+
+
+def _seamed_server(monkeypatch, env: dict[str, str]):
+    """`_env_server`, yielding a connected client instead of `(target, proc)`."""
+    for target, _proc in _env_server(monkeypatch, env):
+        with gnitz.connect(target) as conn:
+            yield conn
 
 
 @pytest.fixture
@@ -310,21 +321,38 @@ def relay_lowspace_server(monkeypatch):
     fixtures it yields the `_Server` handle's (sock_path, proc) so the test can
     assert the master is still alive after the low-space relay.
 
-    Skipped on a release build: without the seam no low-space relay occurs, so
-    the test would pass without exercising the reclaim path. No
-    GNITZ_CHECKPOINT_BYTES override — the only checkpoint in the green run is
+    No GNITZ_CHECKPOINT_BYTES override — the only checkpoint in the green run is
     the seam-induced one, keeping the view results reliable."""
-    if not is_debug_build():
-        pytest.skip("relay-space injection seam requires a debug build")
-    monkeypatch.setenv("GNITZ_INJECT_RELAY_SPACE_LOW", "1")
-    if int(os.environ.get("GNITZ_WORKERS", "1")) < 2:
-        monkeypatch.setenv("GNITZ_WORKERS", "4")
-    s = _Server(_server_binary())
-    try:
-        s.start()
-        yield s.target, s.proc
-    finally:
-        s.teardown()
+    yield from _env_server(monkeypatch, {"GNITZ_INJECT_RELAY_SPACE_LOW": "1"}, debug_only=True)
+
+
+@pytest.fixture
+def tick_emit_fault_server(monkeypatch):
+    """Server whose first master-side tick emission for a table named
+    `tickfault` fails, reproducing what a full SAL does to a tick. Name-scoped so
+    a CREATE's own ticks cannot spend it, and one-shot so the follow-up read
+    observes the re-queued tid ticking and the view converging."""
+    for target, _proc in _env_server(
+        monkeypatch, {"GNITZ_INJECT_TICK_EMIT_ERROR": "tickfault"}, debug_only=True
+    ):
+        with gnitz.connect(target) as conn:
+            yield conn
+
+
+@pytest.fixture
+def tiny_sal_server(monkeypatch):
+    """SAL pinned to its 16 MiB floor with the checkpoint threshold above the
+    watchdog's 1/8-free line, so the watchdog is the ONLY thing that can reclaim
+    — a committer checkpoint at the default 3/4 threshold would otherwise reset
+    the cursor first and the test would pass with the watchdog deleted. Both are
+    real config knobs honoured in every build."""
+    yield from _env_server(
+        monkeypatch,
+        {
+            "GNITZ_SAL_BYTES": str(16 * 1024 * 1024),
+            "GNITZ_CHECKPOINT_BYTES": str(15 * 1024 * 1024),
+        },
+    )
 
 
 @pytest.fixture

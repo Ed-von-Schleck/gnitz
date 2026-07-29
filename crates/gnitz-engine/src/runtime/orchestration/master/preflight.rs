@@ -2135,20 +2135,18 @@ impl MasterDispatcher {
         // discards the undrained trains at the ring boundary.
         let (slots, req_ids, _lease) =
             dispatch_scan_fanout(disp_ptr, reactor, sal_excl, unicast, |disp, req_ids, unicast| {
-                let (schema, col_names) = disp.get_schema_and_names(owner_id);
-                disp.write_group_with_req_ids(
+                // The worker's `UniquePreflight` arm resolves the owner's schema
+                // from its own catalog.
+                disp.write_command_group(
                     owner_id,
+                    0,
                     FLAG_UNIQUE_PREFLIGHT,
                     0,
-                    &[],
-                    &schema,
-                    &col_names,
                     0,
                     packed,
                     req_ids,
                     unicast,
                     0,
-                    None,
                     &[],
                 )
             })
@@ -2228,20 +2226,20 @@ impl MasterDispatcher {
                     match check.payload.as_ref().expect("payload consumed") {
                         CheckPayload::Broadcast(batch) => {
                             let refs: Vec<Option<&Batch>> = (0..nw).map(|_| Some(batch)).collect();
-                            disp.write_group_with_req_ids(
+                            // `check.schema` is not derivable from the target id:
+                            // for a unique secondary index it is the INDEX
+                            // table's schema `(indexed_col, src_pk…)` sent under
+                            // the owner table's id, and `handle_has_pk` reads it
+                            // back to size `idx_key_size`. A catalog lookup on
+                            // the target id would give the owner's prefix width.
+                            disp.write_data_group(
                                 check.target_id,
                                 FLAG_HAS_PK,
-                                0,
                                 &refs,
                                 &check.schema,
-                                &[],
                                 0,
                                 check.col_hint,
                                 req_slice,
-                                -1,
-                                0,
-                                None,
-                                &[],
                             )?;
                         }
                         CheckPayload::ScatterSource { source } => {

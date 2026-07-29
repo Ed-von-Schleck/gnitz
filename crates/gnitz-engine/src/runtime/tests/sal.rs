@@ -1,9 +1,12 @@
 use crate::foundation::posix_io;
 use crate::runtime::sal::{
-    atomic_load_u64, group_header_size, sal_begin_group, sal_read_group_header, sal_tail_slot_count, sal_write_group,
-    SalReader, SalWriter, FLAG_DDL_SYNC, FLAG_TXN_COMMIT, MAX_WORKERS,
+    atomic_load_u64, effective_max, group_header_size, sal_begin_group, sal_read_group_header, sal_tail_slot_count,
+    sal_write_group, SalReader, SalWriter, CHECKPOINT_RESERVE, FLAG_DDL_SYNC, FLAG_FLUSH, FLAG_FLUSH_EPH,
+    FLAG_SHUTDOWN, FLAG_TXN_COMMIT, MAX_WORKERS, MIN_SAL_BYTES, SENTINEL_SIZE,
 };
+use crate::runtime::wire::CTRL_BLOCK_SIZE_NO_BLOB;
 use crate::test_support::SharedRegion;
+use gnitz_wire::align8;
 
 fn make_test_data(val: u8, len: usize) -> Vec<u8> {
     vec![val; len]
@@ -115,14 +118,18 @@ fn test_sal_epoch_write_read() {
 #[test]
 fn test_sal_full_error() {
     unsafe {
-        let size = 256;
+        // Sized off the ordinary cap, not off the raw mapping: with a bare 256-byte
+        // region the reserve alone would refuse the group and the size arithmetic
+        // this test exists for would never run.
+        let payload = 256usize;
+        let size = SENTINEL_SIZE + CHECKPOINT_RESERVE + payload;
         let region = SharedRegion::new(size);
         let ptr = region.ptr();
 
-        let buf = make_test_data(0xFF, size);
+        let buf = make_test_data(0xFF, payload);
         assert!(
             sal_write_group(ptr, 0, 0, 0, 0, 1, size as u64, &[&buf]).is_none(),
-            "group larger than the mmap must be rejected"
+            "a group overrunning the ordinary cap must be rejected"
         );
     }
 }
@@ -237,16 +244,94 @@ fn sal_begin_group_rejects_too_many_workers() {
 #[test]
 fn sal_begin_group_rejects_cursor_overflow() {
     unsafe {
-        let size = 512usize;
+        let size = SENTINEL_SIZE + CHECKPOINT_RESERVE + 512;
         let region = SharedRegion::new(size);
         let ptr = region.ptr();
-        // Push the cursor so close to the end that the group header won't fit.
+        // Push the cursor so close to the ordinary cap that the group header
+        // won't fit under it.
         let sizes = [0u32; 1];
-        let result = sal_begin_group(ptr, size - 1, size, 0, 0, 0, 1, &sizes[..1]);
+        let result = sal_begin_group(ptr, effective_max(0, size) - 1, size, 0, 0, 0, 1, &sizes[..1]);
         assert!(
             result.is_none(),
-            "sal_begin_group must reject when cursor + total > mmap_size"
+            "sal_begin_group must reject when cursor + total > the ordinary cap"
         );
+    }
+}
+
+/// The worst-case footprint of a terminal group: a `MAX_WORKERS` broadcast whose
+/// every slot is a bare control block. All three emitters — `sync_flush_round`,
+/// `shutdown_workers` and `write_checkpoint_group` — carry neither a schema block
+/// nor data.
+fn worst_case_terminal_group() -> usize {
+    8 + group_header_size(MAX_WORKERS) + MAX_WORKERS * align8(CTRL_BLOCK_SIZE_NO_BLOB)
+}
+
+#[test]
+fn effective_max_reserves_by_flag() {
+    let mmap = 1usize << 30;
+    assert_eq!(effective_max(0, mmap), mmap - SENTINEL_SIZE - CHECKPOINT_RESERVE);
+    for terminal in [FLAG_FLUSH, FLAG_FLUSH_EPH, FLAG_SHUTDOWN] {
+        assert_eq!(
+            effective_max(terminal, mmap),
+            mmap - SENTINEL_SIZE,
+            "a terminal group may spend the checkpoint reserve"
+        );
+    }
+    assert_eq!(
+        effective_max(FLAG_DDL_SYNC | FLAG_TXN_COMMIT, mmap),
+        mmap - CHECKPOINT_RESERVE,
+        "a sentinel may spend the sentinel headroom but not the reserve"
+    );
+}
+
+#[test]
+fn checkpoint_reserve_holds_two_terminal_groups() {
+    // Two, not one: the watchdog's crash arm broadcasts FLAG_SHUTDOWN without the
+    // SAL mutex exactly while a committer flush round is parked awaiting the dead
+    // worker's ACK, so both can land in the reserve band. Derived from the
+    // constants so a wider control block or MAX_WORKERS trips here rather than in
+    // production.
+    let terminal = worst_case_terminal_group();
+    assert!(
+        CHECKPOINT_RESERVE >= 2 * terminal + SENTINEL_SIZE,
+        "CHECKPOINT_RESERVE ({CHECKPOINT_RESERVE}) must cover two {terminal}-byte terminal groups plus a sentinel"
+    );
+}
+
+#[test]
+fn ordinary_cap_at_the_sal_floor_still_admits_a_group() {
+    // The floor is the smallest configurable mapping; the reserve must leave the
+    // overwhelming majority of it to ordinary groups.
+    let cap = effective_max(0, MIN_SAL_BYTES);
+    assert!(
+        cap > MIN_SAL_BYTES - MIN_SAL_BYTES / 64,
+        "the reserve must not eat the SAL floor: cap {cap} of {MIN_SAL_BYTES}"
+    );
+}
+
+#[test]
+fn terminal_and_sentinel_fit_where_an_ordinary_group_does_not() {
+    unsafe {
+        // Invariant 1: with the cursor just under the ordinary cap, the log still
+        // admits a full-width checkpoint round and a zone-closing sentinel.
+        let size = MIN_SAL_BYTES;
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
+        let cursor = effective_max(0, size) - 8;
+
+        let sizes = [0u32; 1];
+        assert!(
+            sal_begin_group(ptr, cursor, size, 0, 0, 0, 1, &sizes[..1]).is_none(),
+            "an ordinary group must be refused once the cursor passes the ordinary cap"
+        );
+        sal_begin_group(ptr, cursor, size, 0, 0, FLAG_DDL_SYNC | FLAG_TXN_COMMIT, 1, &[])
+            .expect("the zone-closing sentinel must still fit")
+            .commit();
+
+        let flush_sizes = [CTRL_BLOCK_SIZE_NO_BLOB as u32; MAX_WORKERS];
+        sal_begin_group(ptr, cursor, size, 0, 0, FLAG_FLUSH, 1, &flush_sizes)
+            .expect("a MAX_WORKERS checkpoint round must still fit")
+            .commit();
     }
 }
 
