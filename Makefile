@@ -96,6 +96,7 @@ release-test: e2e-release ## Validate the release build end-to-end
 clean: ## Remove built binaries + per-run scratch data (keeps post-mortem logs)
 	@echo "Removing server binaries and per-run scratch data..."
 	@rm -f gnitz-server gnitz-server-release gnitz-server-profiling
+	rm -f crates/gnitz-py/python/gnitz/_native*.so
 	@rm -rf ~/git/gnitz/tmp/gnitz_*
 
 distclean: clean ## clean + cargo target cache + post-mortem logs

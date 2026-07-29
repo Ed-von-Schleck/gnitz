@@ -266,12 +266,17 @@ class TestAppendKeywordPlan:
             ZSetBatch(schema).append(1, val=10)
 
     def test_bad_weight_names_the_argument(self):
+        """The failing argument is named in the exception's PEP 678 notes rather
+        than its message — that is where the binding layer puts argument context,
+        so a note-less exception would leave the caller with no idea which
+        keyword was at fault."""
         schema = Schema([
             ColumnDef("pk",  TypeCode.U64, primary_key=True),
             ColumnDef("val", TypeCode.I64),
         ])
-        with pytest.raises(TypeError, match="_weight"):
+        with pytest.raises(TypeError) as exc:
             ZSetBatch(schema).append(pk=1, val=10, _weight=1.5)
+        assert any("_weight" in n for n in exc.value.__notes__)
 
     def test_reentrant_append_raises_instead_of_aborting(self):
         """`extract` runs `__index__`, which can call back into the same batch.

@@ -114,7 +114,7 @@ fn py_col_to_rust(py: Python<'_>, c: &PyColumnDef) -> PyResult<ColumnDef> {
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 
-fn rust_col_to_py(py: Python<'_>, c: &ColumnDef, primary_key: bool) -> PyResult<PyObject> {
+fn rust_col_to_py(py: Python<'_>, c: &ColumnDef, primary_key: bool) -> PyResult<Py<PyAny>> {
     Ok(Py::new(
         py,
         PyColumnDef {
@@ -205,7 +205,7 @@ fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyResult<PkCol
     let mut pk_col = PkColumn::empty_for_schema(schema);
     for pk_val in pks {
         let mut t = gnitz_core::PkTuple::new(stride as u8);
-        if let Ok(bytes) = pk_val.downcast::<pyo3::types::PyBytes>() {
+        if let Ok(bytes) = pk_val.cast::<pyo3::types::PyBytes>() {
             let b = bytes.as_bytes();
             if b.len() != stride {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -232,11 +232,11 @@ fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyResult<PkCol
 /// every method that accepts either form.
 fn resolve_py_schema<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PySchema>> {
     // Bare `Schema` first: it is the common case.
-    if let Ok(s) = obj.downcast::<PySchema>() {
+    if let Ok(s) = obj.cast::<PySchema>() {
         return Ok(s.clone());
     }
     // A sequence of ColumnDef → build a Schema (PK defaults handled by PySchema).
-    let list = obj.downcast::<PyList>()?;
+    let list = obj.cast::<PyList>()?;
     Bound::new(py, PySchema::new(list.clone(), None)?)
 }
 
@@ -245,7 +245,7 @@ fn resolve_py_schema<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<
 /// access — it is the only representation, so `Schema.columns[i].primary_key`
 /// always reflects the PK list the schema actually validated.
 fn rust_columns_to_py<'py>(py: Python<'py>, s: &Schema) -> PyResult<Bound<'py, PyList>> {
-    let py_cols: Vec<PyObject> = s
+    let py_cols: Vec<Py<PyAny>> = s
         .columns
         .iter()
         .enumerate()
@@ -321,7 +321,7 @@ impl PyRow {
         self.fields.clone_ref(py)
     }
 
-    pub fn __getattr__(&self, py: Python<'_>, name: &Bound<'_, PyString>) -> PyResult<PyObject> {
+    pub fn __getattr__(&self, py: Python<'_>, name: &Bound<'_, PyString>) -> PyResult<Py<PyAny>> {
         // Attribute names in Python bytecode are interned, and so are the field
         // names (`make_shared_batch_data`), so the common case is a pointer
         // compare over the <=MAX_COLUMNS presented names — no SipHash of the
@@ -336,12 +336,12 @@ impl PyRow {
         }
     }
 
-    pub fn __getitem__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    pub fn __getitem__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let values = self.values.bind(py);
-        // `downcast` on both arms: `extract::<isize>()` on a string key would
+        // `cast` on both arms: `extract::<isize>()` on a string key would
         // build and normalize a full `PyErr` before failing over to the name
         // lookup, which is the whole cost gap between `row[0]` and `row["c"]`.
-        if key.downcast::<pyo3::types::PyInt>().is_ok() {
+        if key.cast::<pyo3::types::PyInt>().is_ok() {
             let idx = key.extract::<isize>()?;
             let len = values.len() as isize;
             let idx = if idx < 0 { idx + len } else { idx };
@@ -350,7 +350,7 @@ impl PyRow {
             }
             return Ok(values.get_item(idx as usize)?.unbind());
         }
-        if let Ok(name) = key.downcast::<PyString>() {
+        if let Ok(name) = key.cast::<PyString>() {
             return match field_pos(self.fields.bind(py), name)? {
                 Some(i) => Ok(values.get_item(i)?.unbind()),
                 None => Err(pyo3::exceptions::PyKeyError::new_err(name.to_cow()?.into_owned())),
@@ -359,7 +359,7 @@ impl PyRow {
         Err(pyo3::exceptions::PyTypeError::new_err("key must be int or str"))
     }
 
-    pub fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+    pub fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         Ok(self.values.bind(py).as_any().try_iter()?.into_any().unbind())
     }
 
@@ -380,8 +380,8 @@ impl PyRow {
         Ok(format!("Row({}, weight={})", parts.join(", "), self.weight))
     }
 
-    pub fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<PyObject> {
-        if let Ok(other_row) = other.downcast::<PyRow>() {
+    pub fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        if let Ok(other_row) = other.cast::<PyRow>() {
             let other_ref = other_row.borrow();
             let eq: bool = self.values.bind(py).eq(other_ref.values.bind(py))?;
             Ok(eq.into_pyobject(py)?.to_owned().into_any().unbind())
@@ -749,7 +749,7 @@ fn kwnames_eq(a: &Bound<'_, PyTuple>, b: &Bound<'_, PyTuple>) -> bool {
         if x.as_ptr() == y.as_ptr() {
             continue;
         }
-        let (Ok(xs), Ok(ys)) = (x.downcast::<PyString>(), y.downcast::<PyString>()) else {
+        let (Ok(xs), Ok(ys)) = (x.cast::<PyString>(), y.cast::<PyString>()) else {
             return false;
         };
         let (Ok(xc), Ok(yc)) = (xs.to_str(), ys.to_str()) else {
@@ -782,7 +782,7 @@ impl PyZSetBatch {
         for i in 0..nkw {
             let item = kwnames.get_item(i)?;
             names.push(
-                item.downcast_into::<PyString>()
+                item.cast_into::<PyString>()
                     .map_err(|_| pyo3::exceptions::PyTypeError::new_err("keywords must be strings"))?,
             );
         }
@@ -929,22 +929,6 @@ impl PyZSetBatch {
 /// # Safety
 /// CPython calling convention: `args` points at `nargs` positional values
 /// followed by one value per name in `kwnames`.
-unsafe extern "C" fn zsb_append_method(
-    slf: *mut ffi::PyObject,
-    args: *const *mut ffi::PyObject,
-    nargs: ffi::Py_ssize_t,
-    kwnames: *mut ffi::PyObject,
-) -> *mut ffi::PyObject {
-    // pyo3's own slot wrapper: it takes the GIL token, catches a panic as
-    // `PanicException`, and returns null on error. A panic is reachable here —
-    // `extract` calls `__index__`, which can re-enter `append` on this same
-    // batch — and without the guard Rust's abort shim would take the
-    // interpreter down.
-    pyo3::impl_::trampoline::fastcall_with_keywords(slf, args, nargs, kwnames, append_fastcall)
-}
-
-/// # Safety
-/// See [`zsb_append_method`].
 unsafe fn append_fastcall(
     py: Python<'_>,
     slf: *mut ffi::PyObject,
@@ -958,7 +942,8 @@ unsafe fn append_fastcall(
         ));
     }
     let slf = Borrowed::from_ptr(py, slf);
-    let batch: &Bound<'_, PyZSetBatch> = slf.downcast()?;
+    let batch = slf.cast::<PyZSetBatch>()?;
+    let batch: &Bound<'_, PyZSetBatch> = &batch;
     // A Python exception, not a panic: a value whose `__index__` re-enters
     // `append` on this batch must not abort the process.
     let mut b = batch.try_borrow_mut()?;
@@ -969,8 +954,8 @@ unsafe fn append_fastcall(
         empty = PyTuple::empty(py);
         &empty
     } else {
-        kw = Borrowed::from_ptr(py, kwnames);
-        kw.downcast::<PyTuple>()?
+        kw = Borrowed::from_ptr(py, kwnames).cast::<PyTuple>()?;
+        &kw
     };
     let idx = b.resolve_kw_plan(kwnames)?;
     b.write_kw_row(py, idx, args)?;
@@ -987,6 +972,14 @@ Append one row, one keyword per column: batch.append(pk=1, name='x').\n\
 An omitted or None column is NULL; _weight is the row's Z-set weight\n\
 (default 1, negative to retract). Returns the batch, so appends chain.";
 
+/// pyo3's own slot wrapper around [`append_fastcall`]: it attaches the
+/// interpreter, catches a panic as `PanicException`, and returns null on error.
+/// A panic is reachable here — `extract` calls `__index__`, which can re-enter
+/// `append` on this same batch — and without the guard Rust's abort shim would
+/// take the interpreter down.
+const ZSB_APPEND_METHOD: ffi::PyCFunctionFastWithKeywords =
+    pyo3::get_trampoline_function!(fastcall_cfunction_with_keywords, append_fastcall);
+
 /// `ffi::PyMethodDef` holds raw pointers so it is not `Sync`; CPython only ever
 /// reads this one.
 struct MethodDef(ffi::PyMethodDef);
@@ -995,13 +988,13 @@ unsafe impl Sync for MethodDef {}
 static APPEND_METHOD_DEF: MethodDef = MethodDef(ffi::PyMethodDef {
     ml_name: c"append".as_ptr(),
     ml_meth: ffi::PyMethodDefPointer {
-        PyCFunctionFastWithKeywords: zsb_append_method,
+        PyCFunctionFastWithKeywords: ZSB_APPEND_METHOD,
     },
     ml_flags: ffi::METH_FASTCALL | ffi::METH_KEYWORDS,
     ml_doc: APPEND_DOC.as_ptr(),
 });
 
-/// Install [`zsb_append_method`] as `ZSetBatch.append`.
+/// Install [`ZSB_APPEND_METHOD`] as `ZSetBatch.append`.
 fn install_append_method(py: Python<'_>) -> PyResult<()> {
     let ty = py.get_type::<PyZSetBatch>();
     let def = &APPEND_METHOD_DEF.0 as *const ffi::PyMethodDef as *mut ffi::PyMethodDef;
@@ -1059,7 +1052,7 @@ impl PyZSetBatch {
         slf.borrow_mut().with_rollback(|s| {
             for row_item in rows.try_iter()? {
                 let row_item = row_item?;
-                let dict: &Bound<'_, PyDict> = row_item.downcast()?;
+                let dict: &Bound<'_, PyDict> = row_item.cast()?;
                 // Read here, not by the column walk, so it is passed on as one
                 // already-recognised key.
                 let supplied = if s.weight_is_column {
@@ -1122,13 +1115,13 @@ use gnitz_wire::format_uuid;
 /// accepted here alone — SQL reads the same literal as decimal and rejects
 /// bare hex, so the two write paths disagreed on what a string meant.
 fn extract_uuid_or_u128(val: &Bound<'_, PyAny>) -> PyResult<u128> {
-    // `downcast` before `extract` on both arms: a failed `extract` builds *and
+    // `cast` before `extract` on both arms: a failed `extract` builds *and
     // normalizes* a full `PyErr` (~140 ns) only to discard it, which a
     // `uuid.UUID` or string argument would pay on every row.
-    if val.downcast::<pyo3::types::PyInt>().is_ok() {
+    if val.cast::<pyo3::types::PyInt>().is_ok() {
         return val.extract::<u128>();
     }
-    if let Ok(s) = val.downcast::<PyString>() {
+    if let Ok(s) = val.cast::<PyString>() {
         let s = s.to_cow()?;
         return gnitz_wire::parse_uuid(&s)
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("invalid UUID string: {s:?}")));
@@ -1206,7 +1199,7 @@ fn write_fixed_le(buf: &mut Vec<u8>, tc: TypeCode, item: &Bound<'_, PyAny>) -> P
 /// `bytes`: one packed PK region per row.
 fn pk_column_to_pylist(py: Python<'_>, schema: &Schema, batch: &ZSetBatch) -> PyResult<Py<PyList>> {
     if let PkColumn::Bytes { stride, buf } = &batch.pks {
-        let items: Vec<PyObject> = buf
+        let items: Vec<Py<PyAny>> = buf
             .chunks_exact(*stride as usize)
             .map(|c| pyo3::types::PyBytes::new(py, c).into_any().unbind())
             .collect();
@@ -1217,7 +1210,7 @@ fn pk_column_to_pylist(py: Python<'_>, schema: &Schema, batch: &ZSetBatch) -> Py
     // second derivation from `pk_stride` here.
     let ci = schema.pk_indices()[0];
     let loc = SchemaFacts::locate(schema, ci);
-    let items: Vec<PyObject> = (0..batch.pks.len())
+    let items: Vec<Py<PyAny>> = (0..batch.pks.len())
         .map(|i| value_at(py, batch, ci, loc, i))
         .collect::<PyResult<_>>()?;
     Ok(PyList::new(py, items)?.unbind())
@@ -1226,7 +1219,7 @@ fn pk_column_to_pylist(py: Python<'_>, schema: &Schema, batch: &ZSetBatch) -> Py
 /// Decode one PK column's native-LE bytes into a Python value. The 16-byte
 /// integer types route through [`u128_value_to_py`] so a PK renders exactly as
 /// the same column would in a payload; everything else is a fixed-width read.
-fn pk_value_to_py(py: Python<'_>, tc: TypeCode, bytes: &[u8]) -> PyResult<PyObject> {
+fn pk_value_to_py(py: Python<'_>, tc: TypeCode, bytes: &[u8]) -> PyResult<Py<PyAny>> {
     match tc {
         TypeCode::UUID | TypeCode::U128 | TypeCode::I128 => {
             u128_value_to_py(py, u128::from_le_bytes(bytes.try_into().unwrap()), tc)
@@ -1239,7 +1232,7 @@ fn pk_value_to_py(py: Python<'_>, tc: TypeCode, bytes: &[u8]) -> PyResult<PyObje
 /// float). Widths come from `slice.len()` via the shared
 /// `read_signed_exact`/`read_unsigned_exact` pair, so the 1/2/4/8-byte table is
 /// not restated here; only the sign and float distinctions are type-directed.
-fn read_fixed_le(py: Python<'_>, tc: TypeCode, slice: &[u8]) -> PyObject {
+fn read_fixed_le(py: Python<'_>, tc: TypeCode, slice: &[u8]) -> Py<PyAny> {
     macro_rules! obj {
         ($v:expr) => {
             $v.into_pyobject(py).unwrap().into_any().unbind()
@@ -1258,7 +1251,7 @@ fn read_fixed_le(py: Python<'_>, tc: TypeCode, slice: &[u8]) -> PyObject {
 /// the surface: UUID → canonical string, I128 → signed int, everything else
 /// (U128) → unsigned int. Single source of truth for that decision across every
 /// read path (row build, batch columns, scan columns).
-fn u128_value_to_py(py: Python<'_>, x: u128, tc: TypeCode) -> PyResult<PyObject> {
+fn u128_value_to_py(py: Python<'_>, x: u128, tc: TypeCode) -> PyResult<Py<PyAny>> {
     Ok(match tc {
         TypeCode::UUID => format_uuid(x).into_pyobject(py)?.into_any().unbind(),
         TypeCode::I128 => (x as i128).into_pyobject(py)?.into_any().unbind(),
@@ -1279,7 +1272,7 @@ fn cell_to_py(
     is_null: bool,
     tc: TypeCode,
     stride: usize,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     if is_null {
         return Ok(py.None());
     }
@@ -1351,7 +1344,7 @@ fn make_shared_batch_data(
 /// The single per-cell decode, shared by the row build, `scalars`, the PK list
 /// and the per-column lists. A PK column reads its own bytes straight out of
 /// the PK region — no whole-tuple copy, so a one-column read costs one column.
-fn value_at(py: Python<'_>, batch: &ZSetBatch, ci: usize, loc: ColumnLocator, row: usize) -> PyResult<PyObject> {
+fn value_at(py: Python<'_>, batch: &ZSetBatch, ci: usize, loc: ColumnLocator, row: usize) -> PyResult<Py<PyAny>> {
     let tc = TypeCode::from_validated_u8(loc.type_code());
     match loc {
         ColumnLocator::Pk { byte_off, size, .. } => {
@@ -1366,7 +1359,7 @@ fn value_at(py: Python<'_>, batch: &ZSetBatch, ci: usize, loc: ColumnLocator, ro
 }
 
 /// Build Python values for a single row from Rust data, appending to `out`.
-fn build_row_values_into(py: Python<'_>, data: &SharedBatchData, row: usize, out: &mut Vec<PyObject>) -> PyResult<()> {
+fn build_row_values_into(py: Python<'_>, data: &SharedBatchData, row: usize, out: &mut Vec<Py<PyAny>>) -> PyResult<()> {
     for &(ci, loc) in &data.present {
         out.push(value_at(py, &data.batch, ci, loc, row)?);
     }
@@ -1374,7 +1367,7 @@ fn build_row_values_into(py: Python<'_>, data: &SharedBatchData, row: usize, out
 }
 
 /// Build the `Row` object for one row, reusing `buf` as scratch across calls.
-fn make_row(py: Python<'_>, data: &Arc<SharedBatchData>, row: usize, buf: &mut Vec<PyObject>) -> PyResult<PyObject> {
+fn make_row(py: Python<'_>, data: &Arc<SharedBatchData>, row: usize, buf: &mut Vec<Py<PyAny>>) -> PyResult<Py<PyAny>> {
     buf.clear();
     build_row_values_into(py, data, row, buf)?;
     // `drain` hands the values over already-owned, so the tuple build costs no
@@ -1397,10 +1390,10 @@ fn make_row(py: Python<'_>, data: &Arc<SharedBatchData>, row: usize, buf: &mut V
 /// back as `None` here exactly as it does through a `Row` or `scalars()`.
 fn rust_batch_columns_to_py(py: Python<'_>, schema: &Schema, batch: &ZSetBatch) -> PyResult<Py<PyList>> {
     let n = batch.len();
-    let mut col_lists: Vec<PyObject> = Vec::with_capacity(schema.columns.len());
+    let mut col_lists: Vec<Py<PyAny>> = Vec::with_capacity(schema.columns.len());
     for ci in 0..schema.columns.len() {
         let loc = SchemaFacts::locate(schema, ci);
-        let items: Vec<PyObject> = match loc {
+        let items: Vec<Py<PyAny>> = match loc {
             ColumnLocator::Pk { .. } => Vec::new(),
             ColumnLocator::Payload { .. } => (0..n)
                 .map(|i| value_at(py, batch, ci, loc, i))
@@ -1429,7 +1422,7 @@ pub struct PyScanResult {
 #[pymethods]
 impl PyScanResult {
     #[getter]
-    fn schema(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn schema(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         match &self.data {
             None => Ok(py.None()),
             Some(d) => Ok(rust_schema_to_py(py, &d.schema)?.into_any()),
@@ -1485,21 +1478,21 @@ impl PyScanResult {
             return Ok(PyList::empty(py).unbind());
         };
         let mut buf = Vec::with_capacity(data.present.len());
-        let rows: Vec<PyObject> = (0..data.batch.len())
+        let rows: Vec<Py<PyAny>> = (0..data.batch.len())
             .map(|i| make_row(py, data, i, &mut buf))
             .collect::<PyResult<_>>()?;
         Ok(PyList::new(py, rows)?.unbind())
     }
 
     /// The first row, or `None` on an empty result.
-    fn first(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn first(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         match &self.data {
             Some(d) if !d.batch.is_empty() => make_row(py, d, 0, &mut Vec::with_capacity(d.present.len())),
             _ => Ok(py.None()),
         }
     }
 
-    fn one(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn one(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let n = self.__len__();
         if n != 1 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -1509,7 +1502,7 @@ impl PyScanResult {
         self.first(py)
     }
 
-    fn one_or_none(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn one_or_none(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let n = self.__len__();
         if n > 1 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -1540,7 +1533,7 @@ impl PyScanResult {
     }
 
     #[pyo3(signature = (col=None))]
-    fn scalars(&self, py: Python<'_>, col: Option<PyObject>) -> PyResult<Py<PyList>> {
+    fn scalars(&self, py: Python<'_>, col: Option<Py<PyAny>>) -> PyResult<Py<PyList>> {
         let Some(data) = &self.data else {
             return Ok(PyList::empty(py).unbind());
         };
@@ -1550,9 +1543,9 @@ impl PyScanResult {
             None => 0usize,
             Some(ref obj) => {
                 let obj = obj.bind(py);
-                if obj.downcast::<pyo3::types::PyInt>().is_ok() {
+                if obj.cast::<pyo3::types::PyInt>().is_ok() {
                     obj.extract::<usize>()?
-                } else if let Ok(name) = obj.downcast::<PyString>() {
+                } else if let Ok(name) = obj.cast::<PyString>() {
                     match field_pos(data.fields.bind(py), name)? {
                         Some(i) => i,
                         None => return Err(pyo3::exceptions::PyKeyError::new_err(name.to_cow()?.into_owned())),
@@ -1568,7 +1561,7 @@ impl PyScanResult {
             .present
             .get(pos)
             .ok_or_else(|| pyo3::exceptions::PyIndexError::new_err("column index out of range"))?;
-        let items: Vec<PyObject> = (0..data.batch.len())
+        let items: Vec<Py<PyAny>> = (0..data.batch.len())
             .map(|i| value_at(py, &data.batch, ci, loc, i))
             .collect::<PyResult<_>>()?;
         Ok(PyList::new(py, items)?.unbind())
@@ -1582,7 +1575,7 @@ impl PyScanResult {
 #[pyclass(name = "RowIterator")]
 pub struct PyRowIterator {
     data: Option<Arc<SharedBatchData>>,
-    row_buf: Vec<PyObject>,
+    row_buf: Vec<Py<PyAny>>,
     pos: usize,
 }
 
@@ -1592,7 +1585,7 @@ impl PyRowIterator {
         slf
     }
 
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let Some(data) = self.data.as_ref() else {
             return Ok(None);
         };
@@ -1657,14 +1650,14 @@ impl PyGnitzClient {
     /// across it, and map the failure to a Python exception (a retryable OCC
     /// conflict to `GnitzConflictError`). Every blocking method below goes
     /// through here, so freezing the other Python threads for a server
-    /// round-trip is impossible to reintroduce by forgetting `allow_threads`.
+    /// round-trip is impossible to reintroduce by forgetting `detach`.
     fn call<T: Send>(
         &mut self,
         py: Python<'_>,
         f: impl FnOnce(&mut GnitzClient) -> Result<T, ClientError> + Send,
     ) -> PyResult<T> {
         let c = self.live()?;
-        to_py_err(py.allow_threads(move || f(c)))
+        to_py_err(py.detach(move || f(c)))
     }
 }
 
@@ -1675,7 +1668,7 @@ impl PyGnitzClient {
         // Connect + HELLO are blocking syscalls (up to a 10 s timeout for a
         // `tls://` target); drop the GIL across them as every other blocking
         // method here does.
-        to_py_err(py.allow_threads(|| GnitzClient::connect(socket_path))).map(|c| PyGnitzClient { inner: Some(c) })
+        to_py_err(py.detach(|| GnitzClient::connect(socket_path))).map(|c| PyGnitzClient { inner: Some(c) })
     }
 
     /// The client's current OCC basis (the running max of observed server
@@ -1694,7 +1687,7 @@ impl PyGnitzClient {
     pub fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
-    pub fn __exit__(&mut self, _exc_type: PyObject, _exc_val: PyObject, _exc_tb: PyObject) -> bool {
+    pub fn __exit__(&mut self, _exc_type: Py<PyAny>, _exc_val: Py<PyAny>, _exc_tb: Py<PyAny>) -> bool {
         self.close();
         false
     }
@@ -1801,7 +1794,7 @@ impl PyGnitzClient {
     }
 
     /// resolve_table(schema_name, table_name) -> (tid: int, schema: Schema)
-    pub fn resolve_table(&mut self, py: Python<'_>, schema_name: &str, table_name: &str) -> PyResult<PyObject> {
+    pub fn resolve_table(&mut self, py: Python<'_>, schema_name: &str, table_name: &str) -> PyResult<Py<PyAny>> {
         let (tid, schema) = self.call(py, |c| c.resolve_table_or_view_id(schema_name, table_name))?;
         let py_schema = rust_schema_to_py(py, &Arc::new(schema))?.into_any();
         let tid_obj = tid.into_pyobject(py)?.into_any().unbind();
@@ -1881,11 +1874,11 @@ impl PyGnitzClient {
 
     /// execute_sql(sql, schema_name="public") -> list of result dicts
     #[pyo3(signature = (sql, schema_name = "public"))]
-    pub fn execute_sql(&mut self, py: Python<'_>, sql: &str, schema_name: &str) -> PyResult<PyObject> {
+    pub fn execute_sql(&mut self, py: Python<'_>, sql: &str, schema_name: &str) -> PyResult<Py<PyAny>> {
         // Plan + execute (all wire I/O, no Python) with the GIL released.
         let client_ref = self.live()?;
         let results = py
-            .allow_threads(|| SqlPlanner::new(client_ref, schema_name).execute(sql))
+            .detach(|| SqlPlanner::new(client_ref, schema_name).execute(sql))
             .map_err(|e| err_with_conflict(&e, e.is_conflict()))?;
 
         let py_list = PyList::empty(py);
@@ -1989,9 +1982,9 @@ impl PyTxn {
     fn __exit__(
         &mut self,
         py: Python<'_>,
-        exc_type: PyObject,
-        _exc_val: PyObject,
-        _exc_tb: PyObject,
+        exc_type: Py<PyAny>,
+        _exc_val: Py<PyAny>,
+        _exc_tb: Py<PyAny>,
     ) -> PyResult<bool> {
         if !self.open {
             return Ok(false);
@@ -2035,9 +2028,9 @@ impl PyTxn {
 /// column's own stride). The signed fallback keeps a negative key packing to the
 /// same two's-complement bytes the typed append path writes.
 fn pk_tuple_from_py(pk: &Bound<'_, PyAny>) -> PyResult<gnitz_core::PkTuple> {
-    // bytes first: `downcast` rejects a non-bytes value without materializing a
+    // bytes first: `cast` rejects a non-bytes value without materializing a
     // PyErr, whereas `extract_uuid_or_u128` falls through to `getattr("int")`.
-    if let Ok(bytes) = pk.downcast::<pyo3::types::PyBytes>() {
+    if let Ok(bytes) = pk.cast::<pyo3::types::PyBytes>() {
         return gnitz_core::PkTuple::try_from_bytes(bytes.as_bytes()).map_err(pyo3::exceptions::PyValueError::new_err);
     }
     if let Ok(val) = extract_uuid_or_u128(pk) {
@@ -2106,7 +2099,7 @@ struct PyAsyncTransport {
 }
 
 impl PyAsyncTransport {
-    fn enqueue(&self, py: Python<'_>, op: IoOp, target_id: u64, include_hidden: bool) -> PyResult<PyObject> {
+    fn enqueue(&self, py: Python<'_>, op: IoOp, target_id: u64, include_hidden: bool) -> PyResult<Py<PyAny>> {
         let tx = self
             .tx
             .as_ref()
@@ -2129,7 +2122,7 @@ impl PyAsyncTransport {
 #[pymethods]
 impl PyAsyncTransport {
     #[new]
-    fn new(py: Python<'_>, socket_path: &str, event_loop: PyObject, resolve_batch_fn: PyObject) -> PyResult<Self> {
+    fn new(py: Python<'_>, socket_path: &str, event_loop: Py<PyAny>, resolve_batch_fn: Py<PyAny>) -> PyResult<Self> {
         // The session owns the connection from birth, so every early return
         // below closes it via RAII; on success it moves into the I/O thread,
         // which closes it when it exits. Connect + HELLO run synchronously on
@@ -2137,7 +2130,7 @@ impl PyAsyncTransport {
         // so other Python threads can progress if the server is slow.
         // A bare `Session`, not a `GnitzClient`, so no OCC basis is tracked —
         // the HELLO ACK's `published_lsn` is discarded here.
-        let (session, _published_lsn) = to_py_err(py.allow_threads(|| gnitz_core::Session::connect(socket_path)))?;
+        let (session, _published_lsn) = to_py_err(py.detach(|| gnitz_core::Session::connect(socket_path)))?;
         let waker = session.waker().map_err(gnitz_err)?;
         // `Session::connect` mints this from the same generator the sync client
         // uses, so a process holding both a `GnitzClient` and an
@@ -2162,7 +2155,7 @@ impl PyAsyncTransport {
         })
     }
 
-    fn push(&self, py: Python<'_>, target_id: u64, batch: PyRef<'_, PyZSetBatch>) -> PyResult<PyObject> {
+    fn push(&self, py: Python<'_>, target_id: u64, batch: PyRef<'_, PyZSetBatch>) -> PyResult<Py<PyAny>> {
         // Encode the push frame with the GIL released — the schema/batch cross
         // as plain `&` refs, no clone (the `PyRef` guard stays out of the closure).
         // FLAG_PUSH marks the frame as a push independent of data presence, so an
@@ -2172,7 +2165,7 @@ impl PyAsyncTransport {
         let client_id = self.client_id;
         let schema = batch.schema.as_ref();
         let b = &batch.batch;
-        let parts = py.allow_threads(|| {
+        let parts = py.detach(|| {
             gnitz_core::encode_message_parts(
                 target_id,
                 client_id,
@@ -2187,7 +2180,7 @@ impl PyAsyncTransport {
     }
 
     #[pyo3(signature = (target_id, include_hidden = false))]
-    fn scan(&self, py: Python<'_>, target_id: u64, include_hidden: bool) -> PyResult<PyObject> {
+    fn scan(&self, py: Python<'_>, target_id: u64, include_hidden: bool) -> PyResult<Py<PyAny>> {
         self.enqueue(py, IoOp::Scan, target_id, include_hidden)
     }
 
@@ -2197,7 +2190,7 @@ impl PyAsyncTransport {
     /// as a list in request order. `target_id` is unused for this op (the tids
     /// ride the frame body).
     #[pyo3(signature = (target_ids, include_hidden = false))]
-    fn scan_many(&self, py: Python<'_>, target_ids: Vec<u64>, include_hidden: bool) -> PyResult<PyObject> {
+    fn scan_many(&self, py: Python<'_>, target_ids: Vec<u64>, include_hidden: bool) -> PyResult<Py<PyAny>> {
         // A malformed list (empty, over-cap, duplicate tid) is rejected by
         // `Session::pack_scan_multi` when the I/O thread packs it, before any
         // frame is written, and fails this one future.
@@ -2205,7 +2198,7 @@ impl PyAsyncTransport {
     }
 
     #[pyo3(signature = (target_id, pk, include_hidden = false))]
-    fn seek(&self, py: Python<'_>, target_id: u64, pk: Bound<'_, PyAny>, include_hidden: bool) -> PyResult<PyObject> {
+    fn seek(&self, py: Python<'_>, target_id: u64, pk: Bound<'_, PyAny>, include_hidden: bool) -> PyResult<Py<PyAny>> {
         let t = pk_tuple_from_py(&pk)?;
         self.enqueue(py, IoOp::Seek(t), target_id, include_hidden)
     }
@@ -2222,8 +2215,8 @@ impl PyAsyncTransport {
         self.waker.take();
         if let Some(h) = self.thread.take() {
             // Release the GIL so the I/O thread can finish any in-progress
-            // with_gil block before the join returns.
-            py.allow_threads(|| {
+            // `attach` block before the join returns.
+            py.detach(|| {
                 let _ = h.join();
             });
         }
@@ -2285,7 +2278,7 @@ fn classify_recv_err(e: ClientError) -> Result<LoopResult, String> {
 
 /// One `(future, value, is_exception)` triple — the shape `_resolve_batch`
 /// reads positionally. The single statement of that cross-language contract.
-fn resolve_item(py: Python<'_>, fut: Py<PyAny>, value: PyObject, is_exc: bool) -> PyObject {
+fn resolve_item(py: Python<'_>, fut: Py<PyAny>, value: Py<PyAny>, is_exc: bool) -> Py<PyAny> {
     PyTuple::new(
         py,
         [
@@ -2305,7 +2298,7 @@ fn resolve_item(py: Python<'_>, fut: Py<PyAny>, value: PyObject, is_exc: bool) -
 /// call — so a full batch scheduled one future at a time spends milliseconds
 /// under the GIL doing syscalls, starving the loop it is feeding. The batch is
 /// therefore the unit on the failure path as much as the success one.
-fn dispatch(py: Python<'_>, call_soon: &Py<PyAny>, resolve_fn: &Py<PyAny>, items: Vec<PyObject>) {
+fn dispatch(py: Python<'_>, call_soon: &Py<PyAny>, resolve_fn: &Py<PyAny>, items: Vec<Py<PyAny>>) {
     if items.is_empty() {
         return;
     }
@@ -2447,8 +2440,8 @@ fn async_io_loop(
         // A single GIL acquisition for the whole batch. The session absorbed
         // every response's schema into its own cache during recv, so there is
         // no separate cache-update step and no cross-thread lock.
-        Python::with_gil(|py| {
-            let items: Vec<PyObject> = results
+        Python::attach(|py| {
+            let items: Vec<Py<PyAny>> = results
                 .drain(..)
                 .map(|result| {
                     let (fut, include_hidden) = pending_futures.pop_front().unwrap();
@@ -2461,7 +2454,7 @@ fn async_io_loop(
                         LoopResult::ScanMulti(triples) => {
                             // One PyScanResult per relation, in request order → a
                             // Python list, resolving the single scan_many future.
-                            let per_rel: Vec<PyObject> = triples
+                            let per_rel: Vec<Py<PyAny>> = triples
                                 .into_iter()
                                 .map(|t| triple_to_lazy(py, t, include_hidden).unwrap().into_any())
                                 .collect();
@@ -2505,18 +2498,18 @@ fn fail_all(
             .collect();
         dispatch(py, call_soon, resolve_fn, items);
     };
-    Python::with_gil(|py| fail_batch(py, pending.drain(..).map(|(fut, _)| fut).collect()));
+    Python::attach(|py| fail_batch(py, pending.drain(..).map(|(fut, _)| fut).collect()));
     // Block for the next arrival, then take everything already queued behind it
     // in one batch. The GIL is never held across the blocking `recv`: the last
     // sender is dropped by `close()`/`Drop` on the Python side, which cannot run
-    // while this thread holds it — so the wait has to happen outside `with_gil`,
+    // while this thread holds it — so the wait has to happen outside `attach`,
     // and only the batch that has already arrived is resolved under it.
     while let Ok(first) = rx.recv() {
         let mut futs = vec![first.future];
         while let Ok(req) = rx.try_recv() {
             futs.push(req.future);
         }
-        Python::with_gil(|py| fail_batch(py, futs));
+        Python::attach(|py| fail_batch(py, futs));
     }
 }
 
