@@ -40,7 +40,7 @@ const ENTRY_SIZE: usize = 160;
 /// operator-state schema or to the shard/manifest layout; a mismatch (recorded
 /// in `_sequences` via `SEQ_ID_TOPOLOGY`) wipes all Rederive view state at boot,
 /// always correct because it re-derives.
-pub const STATE_FORMAT: u32 = 4;
+pub const STATE_FORMAT: u32 = 5;
 
 /// The durable topology word recorded in `_sequences` (`SEQ_ID_TOPOLOGY`):
 /// `(worker_count << 32) | STATE_FORMAT`. The single packer shared by the
@@ -314,18 +314,25 @@ fn peek_header_u64(path: &std::ffi::CStr, off: usize) -> Result<Option<u64>, Sto
     Ok(Some(read_u64_le(&hdr, off)))
 }
 
+/// Basename of a table's manifest inside its own directory. The one spelling —
+/// every producer, peeker and unlinker goes through `path`/`tmp_path`.
+pub const MANIFEST_FILE: &str = "manifest.bin";
+
+/// A table directory's manifest path.
+pub fn path(dir: &str) -> String {
+    format!("{dir}/{MANIFEST_FILE}")
+}
+
+/// The staging name `prepare_file` writes before renaming into `path(dir)`.
+pub fn tmp_path(dir: &str) -> String {
+    format!("{}.tmp", path(dir))
+}
+
 /// Read just the checkpoint generation from a manifest file header. `Ok(None)`
 /// when the file does not exist yet. Used by the conditional view-state reload:
 /// a `RederiveCheckpointed` table loads its shards only when its manifest
 /// generation equals the committed checkpoint generation, and erases them
 /// otherwise.
-/// Path of one partition's manifest inside a partitioned store's directory —
-/// the single spelling of the `part_{p}/manifest.bin` layout the boot resume
-/// verdict peeks and the rebuild reset unlinks.
-pub fn partition_manifest_path(dir: &str, p: u32) -> String {
-    format!("{dir}/part_{p}/manifest.bin")
-}
-
 pub fn peek_generation(path: &std::ffi::CStr) -> Result<Option<u64>, StorageError> {
     peek_header_u64(path, OFF_GENERATION)
 }

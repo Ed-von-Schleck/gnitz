@@ -20,7 +20,6 @@ mod optimize;
 use emit::*;
 use optimize::*;
 
-pub(crate) use emit::is_worker_scratch_dir_name;
 pub(crate) use load::{
     circuit_range_join_n_eq, circuit_source_bound, load_circuit, reindex_cols_through_filters, scan_source_ids,
     scan_tid_through_filters, topo_sort,
@@ -463,6 +462,22 @@ mod tests {
     /// An unbounded delta scan — every fixture circuit's source shape.
     fn scan_delta(source: u64) -> gnitz_wire::OpNode {
         gnitz_wire::OpNode::ScanDelta { source, bound: None }
+    }
+
+    /// The boot and rebuild sweeps find a scratch dir by parsing its name back,
+    /// so what the compiler builds must survive the round trip — including a
+    /// child name that itself contains underscores (`_reduce_in_{vid}_{nid}`).
+    #[test]
+    fn child_scratch_dir_round_trips_through_child_addr() {
+        let built = child_scratch_dir("/d", "_reduce_in_9_3");
+        let name = built.rsplit('/').next().unwrap();
+        assert_eq!(
+            crate::storage::ChildAddr::parse(name),
+            Some(crate::storage::ChildAddr::Scratch {
+                child: "_reduce_in_9_3",
+                rank: worker_rank(),
+            })
+        );
     }
 
     #[test]

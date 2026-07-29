@@ -11,6 +11,5 @@ mod dag;
 mod vm;
 
 pub(crate) use dag::{
-    is_worker_scratch_dir_name, DagEngine, ExchangeCallback, IndexCircuitEntry, RelationKind, StoreHandle,
-    SysTableRefs, TableEntry,
+    DagEngine, ExchangeCallback, IndexCircuitEntry, RelationKind, StoreHandle, SysTableRefs, TableEntry,
 };

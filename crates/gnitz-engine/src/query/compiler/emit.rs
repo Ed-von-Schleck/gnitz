@@ -58,18 +58,14 @@ pub(super) fn union_nullability_merge(a: &SchemaDescriptor, b: &SchemaDescriptor
 
 /// Path of a per-worker scratch directory under `view_dir`. Rank-stamped because
 /// forked workers share `view_dir`; an un-stamped path would have every worker
-/// open the same directory and clobber each other's shard files. Single source
-/// of truth for the convention — `EmitCtx::create_child_table` derives its path
-/// from it, so the rank stamp can never drift between child tables.
+/// open the same directory and clobber each other's shard files. The name comes
+/// from `ChildAddr`, which also parses it back for the boot and rebuild sweeps.
 pub(super) fn child_scratch_dir(view_dir: &str, child_name: &str) -> String {
-    format!("{}/scratch_{}_w{}", view_dir, child_name, worker_rank())
-}
-
-/// True iff `name` is one of THIS worker's rank-stamped scratch dirs — the
-/// inverse of the `child_scratch_dir` convention above, kept adjacent so the
-/// recovery reset sweep can never drift from the naming it must match.
-pub(crate) fn is_worker_scratch_dir_name(name: &str) -> bool {
-    name.starts_with("scratch_") && name.ends_with(&format!("_w{}", worker_rank()))
+    crate::storage::ChildAddr::Scratch {
+        child: child_name,
+        rank: worker_rank(),
+    }
+    .dir(view_dir)
 }
 
 // ---------------------------------------------------------------------------

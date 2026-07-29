@@ -220,7 +220,7 @@ impl CatalogEngine {
     }
 
     /// The on-disk directory of a user table (`{base_dir}/{schema}/{name}_{tid}`),
-    /// the parent of its per-partition `part_{p}` subdirs. Guaranteed to exist on
+    /// the parent of its child store subdirs (`ChildAddr`). Guaranteed to exist on
     /// the data filesystem once the table is created, so it anchors an
     /// `O_TMPFILE` spill (e.g. the CREATE UNIQUE INDEX pre-flight external sort)
     /// onto the same disk as the table's data. `None` for an unknown table.

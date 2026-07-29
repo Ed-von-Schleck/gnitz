@@ -99,7 +99,7 @@ impl ShardIndex {
         let mut removed = 0usize;
 
         // Stray manifest .tmp from a crash mid-publish.
-        let manifest_tmp = format!("{}/manifest.bin.tmp", self.output_dir);
+        let manifest_tmp = super::super::manifest::tmp_path(&self.output_dir);
         if std::fs::remove_file(&manifest_tmp).is_ok() {
             removed += 1;
         }

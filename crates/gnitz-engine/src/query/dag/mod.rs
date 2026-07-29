@@ -20,7 +20,6 @@ mod store_handle;
 
 use meta::{DepMap, ViewMeta};
 
-pub(crate) use crate::query::compiler::is_worker_scratch_dir_name;
 pub(crate) use store_handle::StoreHandle;
 
 // ---------------------------------------------------------------------------
@@ -702,10 +701,8 @@ mod tests {
             tdir.to_str().unwrap(),
             schema,
             1234,
-            crate::storage::Routing::Hashed,
+            crate::storage::Routing::Hashed { start: 0, end: 256 },
             RecoverySource::Rederive,
-            0,
-            256,
         )
         .unwrap();
 
@@ -772,10 +769,8 @@ mod tests {
             tdir.to_str().unwrap(),
             schema,
             1234,
-            crate::storage::Routing::Hashed,
+            crate::storage::Routing::Hashed { start: 0, end: 256 },
             RecoverySource::Rederive,
-            0,
-            256,
         )
         .unwrap();
 
@@ -842,10 +837,8 @@ mod tests {
             tdir.to_str().unwrap(),
             schema,
             1234,
-            crate::storage::Routing::Hashed,
+            crate::storage::Routing::Hashed { start: 0, end: 256 },
             RecoverySource::Rederive,
-            0,
-            256,
         )
         .unwrap();
 
@@ -911,10 +904,8 @@ mod tests {
             tdir.to_str().unwrap(),
             schema,
             555,
-            crate::storage::Routing::Hashed,
+            crate::storage::Routing::Hashed { start: 0, end: 256 },
             RecoverySource::Rederive,
-            0,
-            256,
         )
         .unwrap();
 

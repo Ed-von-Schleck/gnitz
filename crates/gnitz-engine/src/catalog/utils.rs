@@ -126,6 +126,20 @@ pub(crate) fn remove_stale_index_rank_dirs(idx_dir: &str) {
     }
 }
 
+/// Remove a relation's child directories that this boot's worker count no longer
+/// owns — `ChildAddr::is_owned_by` holds the rule. Names in none of the child
+/// grammars (an `idx_{id}` dir, say) are left alone.
+pub(crate) fn reclaim_retired_children(dir: &str, routing: Routing, num_workers: u32) {
+    for name in subdir_names(dir) {
+        let Some(child) = ChildAddr::parse(&name) else { continue };
+        if !child.is_owned_by(routing, num_workers) {
+            let full = format!("{dir}/{name}");
+            gnitz_debug!("recovery: removing retired child dir {}", full);
+            crate::storage::remove_child(&full);
+        }
+    }
+}
+
 /// True if `name` is shaped like a table or view directory — both end in
 /// `_<digits>` (`<name>_<tid>` and `view_<name>_<vid>` respectively).
 pub(crate) fn is_table_dir_name(name: &str) -> bool {

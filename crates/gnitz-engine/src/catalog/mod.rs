@@ -83,12 +83,12 @@ pub(in crate::catalog) use registry::raise_id_counter;
 pub(in crate::catalog) use sys_tables::SysFamily;
 pub(in crate::catalog) use sys_tables::{PUBLIC_SCHEMA_ID, SYSTEM_SCHEMA_ID};
 // Partition layout is owned by storage; the catalog only consumes it.
-pub(in crate::catalog) use crate::storage::{partition_manifest_path, partition_range, NUM_PARTITIONS};
+pub(in crate::catalog) use crate::storage::{ChildAddr, NUM_PARTITIONS};
 pub(in crate::catalog) use types::{FkConstraint, FkParentRef};
 pub(in crate::catalog) use utils::{
     cursor_read_string, cursor_read_u64, ensure_dir, fsync_dir, index_dir, is_index_dir_name, is_table_dir_name,
-    make_fk_index_name, new_index_table, remove_stale_index_rank_dirs, retract_rows_by_view, retract_rows_in_pk_range,
-    retract_single_row, schema_dir, subdir_names, table_dir, view_dir,
+    make_fk_index_name, new_index_table, reclaim_retired_children, remove_stale_index_rank_dirs, retract_rows_by_view,
+    retract_rows_in_pk_range, retract_single_row, schema_dir, subdir_names, table_dir, view_dir,
 };
 #[cfg(test)]
 pub(in crate::catalog) use utils::{make_secondary_index_name, parse_qualified_name};

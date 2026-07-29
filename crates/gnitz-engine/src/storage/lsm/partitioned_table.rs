@@ -1,13 +1,14 @@
 //! Partitioned table: hash-routes rows across N child Table handles.
 //!
-//! User tables hash-route across 256 partitions; replicated (system or
-//! replicated-derived) tables hold one. The 256-bucket index is the Fibonacci
+//! User tables hash-route across 256 partitions; replicated and
+//! replicated-derived tables hold one. The 256-bucket index is the Fibonacci
 //! `mix(pk) >> 56` (see `schema::key`), not `xxh3 & 0xFF`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::batch::Batch;
+use super::child_dir::ChildAddr;
 use super::error::StorageError;
 use super::read_cursor::{self, ReadCursor};
 use super::shard_reader::MappedShard;
@@ -29,14 +30,45 @@ thread_local! {
 // PartitionedTable
 // ---------------------------------------------------------------------------
 
-/// How a table distributes its rows across child `Table` handles.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// How a table distributes its rows across child `Table` handles, and which
+/// children this process holds. The child set is part of the routing rather
+/// than a separate range pair, so a replicated store cannot be built with
+/// anything but its own one child.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Routing {
-    /// One child holding the whole local dataset, unhashed — replicated base
-    /// tables and replicated-derived views.
-    Replicated,
-    /// 256-way hash scatter by `mix(pk) >> 56`.
-    Hashed,
+    /// One child holding the whole local dataset, unhashed — a replicated base
+    /// table's full copy or a replicated-derived view's local slice — homed at
+    /// the owning worker's rank.
+    Replicated { rank: u32 },
+    /// 256-way hash scatter by `mix(pk) >> 56`, over the `[start, end)` slice
+    /// of the tiling this process owns.
+    Hashed { start: u32, end: u32 },
+}
+
+impl Routing {
+    /// The children this store holds, in `tables` order.
+    pub fn children(self) -> impl Iterator<Item = ChildAddr<'static>> {
+        let (start, end, local) = match self {
+            Routing::Replicated { rank } => (rank, rank + 1, true),
+            Routing::Hashed { start, end } => (start, end, false),
+        };
+        (start..end).map(move |i| {
+            if local {
+                ChildAddr::Local(i)
+            } else {
+                ChildAddr::Partition(i)
+            }
+        })
+    }
+
+    /// Index of the first child held, which `local_slot` subtracts to map a
+    /// global partition to a `tables` slot.
+    fn offset(self) -> u32 {
+        match self {
+            Routing::Replicated { rank } => rank,
+            Routing::Hashed { start, .. } => start,
+        }
+    }
 }
 
 /// Scatter bucket count for `Routing::Hashed`; `mix` takes `(h >> 56)` ∈ 0..256.
@@ -62,7 +94,6 @@ pub fn partition_range(worker_id: u32, num_workers: u32) -> (u32, u32) {
 pub struct PartitionedTable {
     tables: Vec<Table>,
     routing: Routing,
-    part_offset: u32,
     schema: SchemaDescriptor,
 }
 
@@ -73,14 +104,12 @@ impl PartitionedTable {
         table_id: u32,
         routing: Routing,
         recovery_source: RecoverySource,
-        part_start: u32,
-        part_end: u32,
     ) -> Result<Self, StorageError> {
-        // Per-partition arena: a replicated store holds the whole dataset in one
+        // Per-child arena: a replicated store holds the whole dataset in one
         // child (1 MiB); a hashed store spreads it over 256 (256 KiB each).
         let arena_size: u64 = match routing {
-            Routing::Replicated => 1 << 20,
-            Routing::Hashed => 256 << 10,
+            Routing::Replicated { .. } => 1 << 20,
+            Routing::Hashed { .. } => 256 << 10,
         };
         table::ensure_dir(dir)?;
 
@@ -88,36 +117,41 @@ impl PartitionedTable {
         // partition subdirs do not, so a concurrent master remove_dir_all
         // (DROP) deterministically races this create. User tables only.
         #[cfg(debug_assertions)]
-        if routing == Routing::Hashed {
+        if matches!(routing, Routing::Hashed { .. }) {
             let ms = crate::foundation::env::env_u64("GNITZ_INJECT_TABLE_CREATE_DELAY_MS", 0);
             if ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(ms));
             }
         }
 
-        // The partition directory is `part_{p}` for both partition counts. For a
-        // single-partition store the one child lives at `part_{part_start}`: a
-        // replicated table (or replicated-derived view) is built at
-        // `[worker.part_start, +1)`, so its shard dir is distinct on every worker
-        // even though all workers share the data directory — a fixed `part_0`
-        // would collide (every worker flushing the same files). The master's
-        // pre-fork copy is built at `[0, 1)`, i.e. `part_0`, and a worker that
-        // inherits it across the fork re-homes it to its own `part_{part_start}`
-        // (`rehome_single_partition_stores`) before any flush. `Routing::Replicated`
-        // is always built with exactly one partition.
-        let mut tables = Vec::with_capacity((part_end - part_start) as usize);
-        for p in part_start..part_end {
-            let part_dir = format!("{dir}/part_{p}");
-            let t = Table::new(&part_dir, schema, table_id, arena_size, recovery_source)?;
-            tables.push(t);
+        // Workers share the data directory, so a single-partition store's child
+        // is stamped with the rank that owns it (`rep_{k}`) — a fixed name would
+        // have every worker flushing the same files, and a partition index would
+        // move the child when the worker count changes. The master's pre-fork
+        // child is rank 0; a worker that inherits it across the fork re-homes it
+        // to its own rank before any flush (`rehome_single_partition_stores`).
+        let mut tables = Vec::new();
+        for child in routing.children() {
+            tables.push(Table::new(
+                &child.dir(dir),
+                schema,
+                table_id,
+                arena_size,
+                recovery_source,
+            )?);
         }
 
         Ok(PartitionedTable {
             tables,
             routing,
-            part_offset: part_start,
             schema,
         })
+    }
+
+    /// How this store is routed, and which children it holds. The boot child-dir
+    /// reconciliation reads it to decide which grammar is live.
+    pub(crate) fn routing(&self) -> Routing {
+        self.routing
     }
 
     /// Enable `SHARD_FLAG_PK_UNIQUE` tagging for all partitions.
@@ -139,12 +173,12 @@ impl PartitionedTable {
         }
     }
 
-    /// True for a replicated store — one child holding the whole local dataset
-    /// at partition 0 (a replicated base table or replicated-derived view). The
-    /// bootstrap trim exempts these so partition 0 is never dropped on a worker
-    /// whose range excludes it.
+    /// True for a replicated store — one child holding the whole local dataset,
+    /// homed at this worker's rank (a replicated base table or replicated-derived
+    /// view). The bootstrap trim exempts these so the child is never dropped on a
+    /// worker whose partition range excludes the child's index.
     pub(crate) fn is_replicated(&self) -> bool {
-        self.routing == Routing::Replicated
+        matches!(self.routing, Routing::Replicated { .. })
     }
 
     /// True when [`open_cursor`](Self::open_cursor) could return `key` (full OPK
@@ -364,15 +398,19 @@ impl PartitionedTable {
     // Partition lifecycle
     // ------------------------------------------------------------------
 
+    /// Hashed stores only — a replicated store's child belongs to its rank, not
+    /// to a partition range, and the bootstrap trim exempts it.
     pub fn close_partitions_outside(&mut self, start: u32, end: u32) {
         assert!(start <= end, "close_partitions_outside: start ({start}) > end ({end})",);
+        let old_offset = match self.routing {
+            Routing::Hashed { start: s, .. } => s,
+            Routing::Replicated { .. } => panic!("close_partitions_outside on a replicated store"),
+        };
         assert!(
-            start >= self.part_offset,
-            "close_partitions_outside: left-expansion (start={start} < part_offset={}) \
+            start >= old_offset,
+            "close_partitions_outside: left-expansion (start={start} < offset={old_offset}) \
              not supported — surviving tables would map to wrong indices",
-            self.part_offset,
         );
-        let old_offset = self.part_offset;
         let old_tables = std::mem::take(&mut self.tables);
 
         for (local, table) in old_tables.into_iter().enumerate() {
@@ -382,12 +420,20 @@ impl PartitionedTable {
             }
             // else: table is dropped here (Table::drop calls close)
         }
-        self.part_offset = start;
+        self.routing = Routing::Hashed {
+            start,
+            end: start + self.tables.len() as u32,
+        };
     }
 
+    /// Drop every child. The routing *shape* is kept — the post-fork master
+    /// holds no children but a replicated store is still replicated.
     pub fn close_all_partitions(&mut self) {
         self.tables.clear();
-        self.part_offset = 0;
+        if let Routing::Hashed { start, end } = &mut self.routing {
+            *start = 0;
+            *end = 0;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -397,10 +443,10 @@ impl PartitionedTable {
     /// Maps a global partition id to this worker's local `tables` slot, or
     /// `None` when the partition is not held locally. Single source of the
     /// global→local translation for both the ingest scatter and the PK probe.
-    /// A partition below `part_offset` underflows the `wrapping_sub` to a value
-    /// past `tables.len()`, which the bound check maps to `None`.
+    /// A partition below the store's offset underflows the `wrapping_sub` to a
+    /// value past `tables.len()`, which the bound check maps to `None`.
     fn local_slot(&self, p: usize) -> Option<usize> {
-        let local = p.wrapping_sub(self.part_offset as usize);
+        let local = p.wrapping_sub(self.routing.offset() as usize);
         (local < self.tables.len()).then_some(local)
     }
 
@@ -480,8 +526,16 @@ pub(crate) fn partial_flush_lsn_fixture() -> PartialFlushLsn {
     let path = tdir.to_str().unwrap().to_owned();
 
     // Two live partitions (0 and 1) of a 256-way durable table.
-    let open =
-        || PartitionedTable::new(&path, schema(), 830, Routing::Hashed, RecoverySource::SalReplay, 0, 2).unwrap();
+    let open = || {
+        PartitionedTable::new(
+            &path,
+            schema(),
+            830,
+            Routing::Hashed { start: 0, end: 2 },
+            RecoverySource::SalReplay,
+        )
+        .unwrap()
+    };
     let mut pt = open();
 
     // PKs that route to live partitions 0 and 1 (narrow PK ⇒ partition_for_key
@@ -567,10 +621,8 @@ mod tests {
             tdir.to_str().unwrap(),
             schema,
             100,
-            Routing::Replicated,
+            Routing::Replicated { rank: 0 },
             RecoverySource::Rederive,
-            0,
-            1,
         )
         .unwrap();
 
@@ -592,18 +644,9 @@ mod tests {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
-        let build = |name: &str, routing, start, end| {
+        let build = |name: &str, routing| {
             let tdir = dir.path().join(name);
-            PartitionedTable::new(
-                tdir.to_str().unwrap(),
-                schema,
-                300,
-                routing,
-                RecoverySource::Rederive,
-                start,
-                end,
-            )
-            .unwrap()
+            PartitionedTable::new(tdir.to_str().unwrap(), schema, 300, routing, RecoverySource::Rederive).unwrap()
         };
         // Enough distinct keys that every partition range sees both verdicts.
         let keys: Vec<_> = (0u128..512)
@@ -611,15 +654,15 @@ mod tests {
             .collect();
         let stride = schema.pk_stride() as usize;
 
-        let repl = build("cmhk_repl", Routing::Replicated, 7, 8);
+        let repl = build("cmhk_repl", Routing::Replicated { rank: 7 });
         assert!(
             keys.iter().all(|k| repl.cursor_may_hold_key(&k[..stride])),
-            "a replicated store can hold any key, whatever its part_offset"
+            "a replicated store can hold any key, whatever rank homes it"
         );
 
         // Worker 1 of 4 → partitions [64, 128).
         let (start, end) = partition_range(1, 4);
-        let hashed = build("cmhk_hashed", Routing::Hashed, start, end);
+        let hashed = build("cmhk_hashed", Routing::Hashed { start, end });
         for k in &keys {
             let p = schema.partition_for_pk(&k[..stride]) as u32;
             assert_eq!(
@@ -629,7 +672,7 @@ mod tests {
             );
         }
 
-        let empty = build("cmhk_empty", Routing::Hashed, 0, 0);
+        let empty = build("cmhk_empty", Routing::Hashed { start: 0, end: 0 });
         assert!(
             keys.iter().all(|k| !empty.cursor_may_hold_key(&k[..stride])),
             "no children (the post-fork master) → holds nothing"
@@ -646,10 +689,8 @@ mod tests {
             tdir.to_str().unwrap(),
             schema,
             200,
-            Routing::Hashed,
+            Routing::Hashed { start: 0, end: 256 },
             RecoverySource::Rederive,
-            0,
-            256,
         )
         .unwrap();
 
@@ -672,10 +713,8 @@ mod tests {
             tdir.to_str().unwrap(),
             schema,
             300,
-            Routing::Hashed,
+            Routing::Hashed { start: 0, end: 256 },
             RecoverySource::Rederive,
-            0,
-            256,
         )
         .unwrap();
 
@@ -697,10 +736,8 @@ mod tests {
             tdir.to_str().unwrap(),
             schema,
             400,
-            Routing::Hashed,
+            Routing::Hashed { start: 0, end: 256 },
             RecoverySource::Rederive,
-            0,
-            256,
         )
         .unwrap();
 
@@ -745,10 +782,8 @@ mod tests {
             tdir.to_str().unwrap(),
             schema,
             900,
-            Routing::Hashed,
+            Routing::Hashed { start: 0, end: 256 },
             RecoverySource::Rederive,
-            0,
-            256,
         )
         .unwrap();
 
@@ -888,10 +923,8 @@ mod tests {
             tdir.to_str().unwrap(),
             schema,
             700,
-            Routing::Hashed,
+            Routing::Hashed { start: 0, end: 1 },
             RecoverySource::Rederive,
-            0,
-            1,
         )
         .unwrap();
 
@@ -934,17 +967,15 @@ mod tests {
             tdir.to_str().unwrap(),
             schema,
             500,
-            Routing::Hashed,
+            Routing::Hashed { start: 0, end: 256 },
             RecoverySource::Rederive,
-            0,
-            256,
         )
         .unwrap();
 
         assert_eq!(pt.tables.len(), 256);
         pt.close_partitions_outside(100, 110);
         assert_eq!(pt.tables.len(), 10);
-        assert_eq!(pt.part_offset, 100);
+        assert_eq!(pt.routing, Routing::Hashed { start: 100, end: 110 });
     }
 
     // ── In-memory ephemeral flush across partitions ──────────────────────
@@ -995,10 +1026,8 @@ mod tests {
             tdir.to_str().unwrap(),
             schema,
             800,
-            Routing::Hashed,
+            Routing::Hashed { start: 0, end: 256 },
             RecoverySource::SalReplay,
-            0,
-            256,
         )
         .unwrap();
 
@@ -1034,10 +1063,8 @@ mod tests {
             tdir.to_str().unwrap(),
             schema,
             810,
-            Routing::Hashed,
+            Routing::Hashed { start: 0, end: 256 },
             RecoverySource::Rederive,
-            0,
-            256,
         )
         .unwrap();
 
@@ -1069,10 +1096,8 @@ mod tests {
             tdir.to_str().unwrap(),
             schema,
             820,
-            Routing::Hashed,
+            Routing::Hashed { start: 0, end: 256 },
             RecoverySource::Rederive,
-            0,
-            256,
         )
         .unwrap();
 
@@ -1154,10 +1179,8 @@ mod tests {
             dir.join(name).to_str().unwrap(),
             make_schema_u64_i64(),
             table_id,
-            Routing::Hashed,
+            Routing::Hashed { start: 0, end: 256 },
             RecoverySource::SalReplay,
-            0,
-            256,
         )
         .unwrap()
     }

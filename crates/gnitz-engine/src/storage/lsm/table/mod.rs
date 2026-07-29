@@ -320,7 +320,7 @@ impl Table {
             }
             RecoverySource::RederiveCheckpointed { committed } => {
                 set_nocow_dir(&ensure_dir(dir)?);
-                let manifest_path = format!("{dir}/manifest.bin");
+                let manifest_path = super::manifest::path(dir);
                 let cpath = super::super::cstr(manifest_path.clone())?;
                 if super::manifest::peek_generation(&cpath)? == Some(committed) {
                     true
@@ -366,7 +366,7 @@ impl Table {
     /// Only `SalReplay` tables publish one (`Rederive` state is erased at open),
     /// but the path itself carries no state worth caching.
     fn manifest_full_path(&self) -> String {
-        format!("{}/manifest.bin", self.directory)
+        super::manifest::path(&self.directory)
     }
 
     /// Enable `SHARD_FLAG_PK_UNIQUE` tagging for flushed and compacted shards.

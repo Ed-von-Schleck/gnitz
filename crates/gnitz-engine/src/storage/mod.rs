@@ -46,8 +46,9 @@ pub(crate) use columnar::{
 // across two import paths, visibly — `ops/reduce/sort.rs` and
 // `catalog/scan_spec.rs` each imported from both in adjacent lines.
 pub(crate) use gnitz_wire::wal::write_header_and_directory as wal_write_header_and_directory;
+pub(crate) use lsm::child_dir::{remove_child, seed_missing_locals, ChildAddr};
 pub(crate) use lsm::index_gather::BoundedIndexCursor;
-pub(crate) use lsm::manifest::{partition_manifest_path, peek_generation, topology_word};
+pub(crate) use lsm::manifest::{peek_generation, topology_word};
 #[cfg(test)]
 pub(crate) use lsm::partitioned_table::partial_flush_lsn_fixture;
 #[cfg(test)]

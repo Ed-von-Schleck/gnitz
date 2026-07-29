@@ -509,10 +509,11 @@ fn run_worker_child(
     let w2m_writer = W2mWriter::new(ipc.w2m_ptrs[w], W2M_REGION_SIZE as u64);
 
     // Re-home inherited single-partition (replicated / replicated-derived) stores
-    // from the pre-fork master's `part_0` to THIS worker's own `part_{part_start}`
-    // dir before any flush — all workers share the data directory, so a fixed
-    // `part_0` would collide. The inherited store is empty; FLAG_PUSH replay fills
-    // the re-homed store.
+    // from the pre-fork master's `rep_0` to THIS worker's own `rep_{w}` dir before
+    // any flush — all workers share the data directory, so a fixed `rep_0` would
+    // collide. The inherited store is empty; the pre-fork `reconcile_child_dirs`
+    // already put this rank's checkpointed shards under `rep_{w}` (loaded on open)
+    // and FLAG_PUSH replay adds the SAL tail.
     //
     // Then recover: rebuild indexes, replay the SAL tail (buffering effective base
     // deltas), boot-flush the replayed rows durable. The buffered deltas seed
@@ -523,7 +524,7 @@ fn run_worker_child(
     // Either failure rides the startup ACK, which fails boot before the master
     // zeroes the SAL sentinel.
     let (pending_deltas, boot_err): (HashMap<i64, Batch>, Option<String>) = match catalog
-        .rehome_single_partition_stores(part_start)
+        .rehome_single_partition_stores()
         .map_err(|e| format!("W{w} rehome single-partition stores failed: {e}"))
         .and_then(|()| worker_boot_recovery(catalog, &sal_reader))
     {
@@ -615,6 +616,15 @@ fn run_server(
         // dag.tables, so a SAL-committed-but-unflushed CREATE is not mistaken
         // for an orphan.
         catalog.gc_orphan_directories();
+
+        // Bring the relation child directories into this boot's worker count and
+        // seed any replicated base table copy it needs. Must run after SAL replay
+        // (so `dag.tables` is complete and dropped subtrees are already gone) and
+        // before the fork, since each worker's `rehome_single_partition_stores`
+        // opens `rep_{rank}` unconditionally.
+        catalog
+            .reconcile_child_dirs(num_workers)
+            .map_err(|e| format!("child-dir reconciliation failed: {e}"))?;
     }
 
     // --- Boot invalid-view verdict + recovery-start generation bump ---

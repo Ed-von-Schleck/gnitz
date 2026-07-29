@@ -274,7 +274,7 @@ impl DagEngine {
                 continue;
             }
             // Views are always `Partitioned`; a replicated view holds exactly its
-            // one worker-owned partition (no `part_0`-only miss).
+            // one worker-owned child.
             if let Some(pt) = entry.handle.as_partitioned_mut() {
                 for t in pt.partitions_mut() {
                     outputs.push(t as *mut Table);

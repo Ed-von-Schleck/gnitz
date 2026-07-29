@@ -65,16 +65,18 @@ def _stop_server(proc):
     proc.wait()
 
 
-def _crash_and_restart(proc, sock_path, data_dir, workers=None, extra_env=None):
-    """SIGKILL the entire process group, clean up socket, restart."""
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    proc.wait()
+def _restart(stop, proc, sock_path, data_dir, workers=None, extra_env=None):
+    """Stop the server with `stop`, clean up the socket, restart it — optionally
+    at a different worker count."""
+    stop(proc)
     if os.path.exists(sock_path):
         os.unlink(sock_path)
     return _start_server(data_dir, sock_path, workers=workers, extra_env=extra_env)
+
+
+def _crash_and_restart(proc, sock_path, data_dir, workers=None, extra_env=None):
+    """SIGKILL the entire process group, clean up socket, restart."""
+    return _restart(_stop_server, proc, sock_path, data_dir, workers, extra_env)
 
 
 def _drain_stdout(proc):
@@ -119,6 +121,17 @@ def _graceful_stop_server(proc, timeout=30):
         pass
     proc.wait(timeout=timeout)
     return proc.returncode
+
+
+def _graceful_restart(proc, sock_path, data_dir, workers=None):
+    """Clean shutdown (final checkpoint) then restart, optionally at a new count.
+    A graceful stop that does not exit 0 is always a bug, so it is asserted here
+    rather than at each call site."""
+    def stop(p):
+        rc = _graceful_stop_server(p)
+        assert rc == 0, f"graceful shutdown must exit rc 0, got {rc}"
+
+    return _restart(stop, proc, sock_path, data_dir, workers)
 
 
 def test_table_data_survives_restart():
@@ -318,16 +331,10 @@ def test_graceful_shutdown_resumes_without_backfill():
         conn.close()
 
         # Graceful shutdown: SIGTERM the master. It must exit cleanly without
-        # hanging (a hang raises TimeoutExpired from proc.wait).
-        rc = _graceful_stop_server(proc)
-        assert rc == 0, f"graceful shutdown must exit rc 0, got {rc}"
-
-        if os.path.exists(sock_path):
-            os.unlink(sock_path)
-
-        # Restart: views must resume (no backfill) and be correct for both the
+        # hanging (a hang raises TimeoutExpired from proc.wait). On restart,
+        # views must resume (no backfill) and be correct for both the
         # pre-shutdown row and a freshly pushed one.
-        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        proc = _graceful_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
         conn = gnitz.connect(sock_path)
         vid2, _ = conn.resolve_table("gs", "v")
         conn.execute_sql("INSERT INTO t VALUES (2, 100)", schema_name="gs")
@@ -389,12 +396,7 @@ def test_rejected_view_push_leaves_no_trace_across_restart():
             conn.delete(vid, v_schema, [1])
         conn.close()
 
-        rc = _graceful_stop_server(proc)
-        assert rc == 0, f"graceful shutdown must exit rc 0, got {rc}"
-        if os.path.exists(sock_path):
-            os.unlink(sock_path)
-
-        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        proc = _graceful_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
         conn = gnitz.connect(sock_path)
         vid2, _ = conn.resolve_table("vguard", "v")
         after = sorted((r.pk, r.val, r.weight) for r in conn.scan(vid2))
@@ -1961,6 +1963,95 @@ def test_recovery_reset_injection_forces_correct_rebuild():
             assert rows[k]["dbl"] == k * 20
         assert _rebuilt_view_count(proc) >= 1, "the stale view must have been rebuilt, not resumed"
         conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+@pytest.mark.skipif(
+    _NUM_WORKERS < 2, reason="replication only matters with GNITZ_WORKERS >= 2"
+)
+def test_replicated_join_survives_worker_count_change():
+    """A replicated dim's per-worker copy is addressed by rank, so every launched
+    rank must read a copy that is current after a worker-count change.
+
+    The observable has to be a worker-LOCAL read: a scan of the replicated table
+    itself is single-sourced to worker 0, whose copy is current at every worker
+    count, so it stays correct either way. A `fact JOIN dim` skips the exchange on
+    both sides and cogroups against each worker's own `dim`, union-gathering the
+    result — a worker with an empty or stale copy silently contributes the wrong
+    rows, which the multiset assertions below catch.
+
+    The counts run 2 -> 4 -> 3. Widening covers the rebuild (ranks 2 and 3 have no
+    copy and must get one), narrowing covers reclamation plus the surviving ranks
+    keeping their own current copies. Every transition is a CLEAN shutdown, so the
+    data under test lives in shards rather than the un-checkpointed SAL tail, which
+    a worker-count increase does not recover: SAL replay indexes the group
+    directory by the launched rank, and a rank above the writing topology's count
+    reads a slot that topology never wrote. That is why the widening leg runs once,
+    on a directory that has never run wider — a re-grow after a shrink reads a
+    directory slot left behind by the earlier wide run and is a separate defect.
+    """
+    tmpdir = tempfile.mkdtemp(
+        dir=os.path.expanduser("~/git/gnitz/tmp"), prefix="gnitz_persist_repjoin_")
+    data_dir = os.path.join(tmpdir, "data")
+    sock_path = os.path.join(tmpdir, "gnitz.sock")
+
+    def join_rows():
+        conn = gnitz.connect(sock_path)
+        vid, _ = conn.resolve_table("rj", "j")
+        rows = {r["pk"]: r["v"] for r in conn.scan(vid) if r.weight > 0}
+        conn.close()
+        return rows
+
+    def insert_pairs(conn, lo, hi):
+        conn.execute_sql(
+            "INSERT INTO dim VALUES " + ", ".join(f"({i}, {i * 10})" for i in range(lo, hi)),
+            schema_name="rj")
+        conn.execute_sql(
+            "INSERT INTO fact VALUES " + ", ".join(f"({i}, {i})" for i in range(lo, hi)),
+            schema_name="rj")
+
+    try:
+        proc = _start_server(data_dir, sock_path, workers=2)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("rj")
+        conn.execute_sql(
+            "CREATE TABLE dim (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL) "
+            "WITH (replicated = true)", schema_name="rj")
+        conn.execute_sql(
+            "CREATE TABLE fact (pk BIGINT NOT NULL PRIMARY KEY, dim_pk BIGINT NOT NULL)",
+            schema_name="rj")
+        conn.execute_sql(
+            "CREATE VIEW j AS SELECT f.pk AS pk, d.v AS v "
+            "FROM fact f JOIN dim d ON f.dim_pk = d.pk", schema_name="rj")
+        insert_pairs(conn, 0, 64)
+        conn.close()
+
+        expected = {i: i * 10 for i in range(64)}
+        assert join_rows() == expected, "W=2: every fact must join its dim"
+
+        # --- Widen to 4: ranks 2 and 3 have no copy at all and must be rebuilt
+        #     from rank 0's, which is current at every worker count. Without the
+        #     rebuild they join against an empty dim and drop their share. ---
+        proc = _graceful_restart(proc, sock_path, data_dir, workers=4)
+        assert join_rows() == expected, "W=4: the new ranks must get a current copy"
+
+        # Mutate `dim` at W=4, so the W=3 leg has something a stale copy would miss.
+        conn = gnitz.connect(sock_path)
+        conn.execute_sql("DELETE FROM dim WHERE pk < 16", schema_name="rj")
+        insert_pairs(conn, 64, 80)
+        conn.close()
+        expected = {i: i * 10 for i in range(16, 80)}
+        assert join_rows() == expected, "W=4: the mutation must reach the join"
+
+        # --- Narrow to 3: rank 3's copy is retired, ranks 0..2 keep their own,
+        #     which already carry the mutation. ---
+        proc = _graceful_restart(proc, sock_path, data_dir, workers=3)
+        assert join_rows() == expected, (
+            "W=3: every surviving rank must read its own copy, mutation included"
+        )
+
         _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

@@ -223,34 +223,25 @@ impl CatalogEngine {
         // or union-gather (locally partitioned), governed by the read path, not the
         // store shape.
         //
-        // The single partition is built at THIS node's own range start
-        // (`[part_start, part_start + 1)`), not a fixed `part_0`: workers share the
-        // data directory, so each worker's full copy must land in a distinct
-        // `part_{start}` dir (a fixed `part_0` would collide on flush). A live CREATE
-        // runs this hook on each worker post-fork at its own `part_start`, so each
-        // builds a distinct dir directly. The pre-fork master (range start 0) builds
-        // `part_0`; a worker that inherits it across the fork re-homes it to its own
-        // start before any flush (`rehome_single_partition_stores`). The single-
-        // partition path must NOT fire for an empty active range (the post-fork
-        // master, `[0, 0)`): there the master builds zero partition Tables and stays
-        // inert via the `tables.is_empty()` guards.
-        let part_start = self.active_part_start;
-        let active_nonempty = self.active_part_end > part_start;
-        let (routing, part_end) = if single_partition && active_nonempty {
-            (Routing::Replicated, part_start + 1)
+        // The single child is homed at THIS process's own worker rank (see
+        // `PartitionedTable::new`), so a live CREATE on each worker post-fork
+        // builds a distinct dir directly. The single-partition path must NOT fire
+        // for an empty active range (the post-fork master, `[0, 0)`): there the
+        // master builds zero child Tables and stays inert via the
+        // `tables.is_empty()` guards.
+        let active_nonempty = self.active_part_end > self.active_part_start;
+        let routing = if single_partition && active_nonempty {
+            Routing::Replicated {
+                rank: crate::foundation::worker_ctx::worker_rank(),
+            }
         } else {
-            (Routing::Hashed, self.active_part_end)
+            Routing::Hashed {
+                start: self.active_part_start,
+                end: self.active_part_end,
+            }
         };
-        let mut pt = PartitionedTable::new(
-            directory,
-            schema,
-            id as u32,
-            routing,
-            kind.recovery_source(),
-            part_start,
-            part_end,
-        )
-        .map_err(|e| format!("Failed to create '{name}': error {e} (dir={directory})"))?;
+        let mut pt = PartitionedTable::new(directory, schema, id as u32, routing, kind.recovery_source())
+            .map_err(|e| format!("Failed to create '{name}': error {e} (dir={directory})"))?;
         if kind.is_base_table() {
             // Tag base-table shards as PkUnique so the read cursor can skip
             // payload comparison on a cross-source PK tie. Every base table

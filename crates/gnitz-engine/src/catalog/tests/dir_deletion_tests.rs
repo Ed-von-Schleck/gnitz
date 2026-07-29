@@ -338,3 +338,175 @@ fn gc_recreated_schema_survives_drain() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Child-dir reconciliation (`reconcile_child_dirs`)
+//
+// A single-partition (replicated) store names its one child by the rank that
+// owns it (`rep_{k}`); a hashed store names its 256 children by partition index
+// (`part_{p}`). The grammars are disjoint, so the boot pass can reclaim what
+// this topology does not own — and seed a launched rank's missing copy from
+// `rep_0` — without a directory→shape index.
+// ---------------------------------------------------------------------------
+
+/// Register a REPLICATED base table with one row flushed, and return
+/// `(tid, relation_directory)`. `create_table` has no replicated argument, so
+/// the row goes through the raw TABLE_TAB path with the flag packed in.
+fn replicated_table_with_a_shard(engine: &mut CatalogEngine, dir: &str, flush: bool) -> (i64, String) {
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
+    let rt = engine.allocate_table_id();
+    engine.write_column_records(rt, OWNER_KIND_TABLE, &cols).unwrap();
+    let flags = gnitz_wire::pack_table_flags(true, true, 0);
+    let batch = build_table_tab_row_flags(dir, rt, pack_pk_cols(&[0]), "rt", flags);
+    engine.ingest_to_family(TABLE_TAB_ID, &batch).unwrap();
+
+    let rel_dir = engine.dag.tables[&rt].directory.clone();
+    let mut bb = BatchBuilder::new(engine.get_schema_desc(rt).unwrap());
+    bb.begin_row(1u128, 1);
+    bb.put_i64(7);
+    bb.end_row();
+    engine.ingest_to_family(rt, &bb.finish()).unwrap();
+    if flush {
+        engine.flush_family(rt).unwrap();
+    }
+    (rt, rel_dir)
+}
+
+/// Sorted file names directly under `path`.
+fn file_names(path: &str) -> Vec<String> {
+    let mut v: Vec<String> = fs::read_dir(path)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+fn fabricate_dir(path: &str, marker: &str) {
+    fs::create_dir_all(path).unwrap();
+    fs::write(format!("{path}/{marker}"), b"x").unwrap();
+}
+
+#[test]
+fn retired_copies_are_reclaimed_and_missing_ones_seeded() {
+    let dir = temp_dir("reconcile_child_dirs_core");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let (_rt, rel) = replicated_table_with_a_shard(&mut engine, &dir, true);
+    assert!(Path::new(&format!("{rel}/rep_0/manifest.bin")).exists());
+    let rep0_files = file_names(&format!("{rel}/rep_0"));
+
+    // (i) A shrink from 4 workers (plus a scratch dir from a rank that no longer
+    // exists). Ranks below the launched count keep their own copies untouched.
+    for k in 1..4 {
+        let d = format!("{rel}/rep_{k}");
+        fabricate_dir(&d, "marker");
+        fs::write(format!("{d}/manifest.bin"), b"stub").unwrap();
+    }
+    fabricate_dir(&format!("{rel}/scratch_agg_w7"), "marker");
+
+    engine.reconcile_child_dirs(3).unwrap();
+
+    assert!(
+        Path::new(&format!("{rel}/rep_0")).exists(),
+        "worker 0's copy is the source"
+    );
+    assert!(!Path::new(&format!("{rel}/rep_3")).exists(), "rank 3 is retired at W=3");
+    assert!(!Path::new(&format!("{rel}/scratch_agg_w7")).exists());
+    for k in 1..3 {
+        assert!(
+            Path::new(&format!("{rel}/rep_{k}/marker")).exists(),
+            "rep_{k} already has a manifest, so it is current and must not be rebuilt"
+        );
+    }
+
+    // (ii) A rank whose copy is gone entirely is rebuilt from rep_0.
+    fs::remove_dir_all(format!("{rel}/rep_2")).unwrap();
+    engine.reconcile_child_dirs(3).unwrap();
+    assert_eq!(file_names(&format!("{rel}/rep_2")), rep0_files);
+    assert!(!Path::new(&format!("{rel}/rep_2/marker")).exists());
+
+    // (iii) A torn repair — shards present, no manifest — is redone, not adopted.
+    fs::remove_dir_all(format!("{rel}/rep_1")).unwrap();
+    fabricate_dir(&format!("{rel}/rep_1"), "0000000000000001.shard");
+    engine.reconcile_child_dirs(3).unwrap();
+    assert_eq!(
+        file_names(&format!("{rel}/rep_1")),
+        rep0_files,
+        "a manifest-less copy is rebuilt, so the manifest is the completeness witness"
+    );
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reconcile_skips_a_never_flushed_table() {
+    let dir = temp_dir("reconcile_child_dirs_unflushed");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let (_rt, rel) = replicated_table_with_a_shard(&mut engine, &dir, false);
+    assert!(!Path::new(&format!("{rel}/rep_0/manifest.bin")).exists());
+
+    fabricate_dir(&format!("{rel}/rep_9"), "marker");
+    engine.reconcile_child_dirs(4).unwrap();
+
+    for k in 1..4 {
+        assert!(
+            !Path::new(&format!("{rel}/rep_{k}")).exists(),
+            "nothing to copy from an unflushed table, so rep_{k} stays absent"
+        );
+    }
+    assert!(!Path::new(&format!("{rel}/rep_9")).exists(), "rank 9 is retired at W=4");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reconcile_never_touches_a_hashed_store() {
+    let dir = temp_dir("reconcile_child_dirs_hashed");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
+    let pt = engine.create_table("public.pt", &cols, &[0], true).unwrap();
+    let hashed = engine.dag.tables[&pt].directory.clone();
+    for p in 0..NUM_PARTITIONS {
+        assert!(Path::new(&format!("{hashed}/part_{p}")).exists());
+    }
+
+    // A hashed store's per-worker ranges tile 0..256 exactly at every worker
+    // count, so no partition is ever stale — the sweep must keep all 256.
+    for n in [1u32, 2, 4] {
+        engine.reconcile_child_dirs(n).unwrap();
+        for p in 0..NUM_PARTITIONS {
+            assert!(
+                Path::new(&format!("{hashed}/part_{p}")).exists(),
+                "partition {p} of a hashed store must survive reconcile at W={n}"
+            );
+        }
+    }
+
+    // Cross-grammar residue, both directions: what a shape flip leaves behind.
+    fabricate_dir(&format!("{hashed}/rep_1"), "marker");
+    let (_rt, rel) = replicated_table_with_a_shard(&mut engine, &dir, true);
+    for p in [64u32, 192] {
+        fabricate_dir(&format!("{rel}/part_{p}"), "marker");
+    }
+
+    engine.reconcile_child_dirs(4).unwrap();
+
+    assert!(
+        !Path::new(&format!("{hashed}/rep_1")).exists(),
+        "a rep_* child under a hashed store is residue"
+    );
+    for p in [64u32, 192] {
+        assert!(
+            !Path::new(&format!("{rel}/part_{p}")).exists(),
+            "a part_* child under a single-partition store is residue"
+        );
+    }
+    assert!(Path::new(&format!("{rel}/rep_0")).exists());
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
