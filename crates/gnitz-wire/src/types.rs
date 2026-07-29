@@ -760,6 +760,35 @@ mod tests {
         assert_eq!(reached, 10, "the reachable source→index pair set changed");
     }
 
+    /// `TypeCode::ALL` is the one enumeration of the wire type table — the
+    /// Python `TypeCode` IntEnum is built from it — so the table is pinned in
+    /// the crate that owns it rather than re-typed by each client. Swept over
+    /// the whole `u8` domain: `ALL` and `try_from_u8` must agree on membership
+    /// in *both* directions, which also catches a code `try_from_u8` accepts
+    /// but `ALL` omits — invisible to a client-side list of names.
+    #[test]
+    fn type_code_all_is_closed_over_the_wire_domain() {
+        for raw in 0u8..=u8::MAX {
+            let in_all = TypeCode::ALL.iter().any(|&tc| tc as u8 == raw);
+            assert_eq!(
+                TypeCode::try_from_u8(raw).is_some(),
+                in_all,
+                "code {raw}: try_from_u8 and ALL disagree on membership",
+            );
+        }
+        for &tc in &TypeCode::ALL {
+            assert_eq!(TypeCode::try_from_u8(tc as u8), Some(tc));
+        }
+        let mut codes: Vec<u8> = TypeCode::ALL.iter().map(|&tc| tc as u8).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), TypeCode::ALL.len(), "duplicate code in ALL");
+        let mut names: Vec<&str> = TypeCode::ALL.iter().map(|&tc| tc.wire_name()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), TypeCode::ALL.len(), "duplicate wire_name in ALL");
+    }
+
     /// The reindex / `_join_pk` width policy (the single source of truth the
     /// engine compiler and SQL planner both derive from): a ≤8-byte integer key
     /// keeps its native width; STRING/BLOB, U128/UUID, and floats collapse to
