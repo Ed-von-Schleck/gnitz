@@ -1,7 +1,7 @@
 use crate::foundation::posix_io;
 use crate::runtime::sal::{
-    atomic_load_u64, sal_begin_group, sal_read_group_header, sal_write_group, SalReader, SalWriter, FLAG_DDL_SYNC,
-    FLAG_TXN_COMMIT, GROUP_HEADER_SIZE, MAX_WORKERS,
+    atomic_load_u64, group_header_size, sal_begin_group, sal_read_group_header, sal_tail_slot_count, sal_write_group,
+    SalReader, SalWriter, FLAG_DDL_SYNC, FLAG_TXN_COMMIT, MAX_WORKERS,
 };
 use crate::test_support::SharedRegion;
 
@@ -119,7 +119,7 @@ fn test_sal_full_error() {
         let region = SharedRegion::new(size);
         let ptr = region.ptr();
 
-        let buf = make_test_data(0xFF, 100);
+        let buf = make_test_data(0xFF, size);
         assert!(
             sal_write_group(ptr, 0, 0, 0, 0, 1, size as u64, &[&buf]).is_none(),
             "group larger than the mmap must be rejected"
@@ -178,6 +178,44 @@ fn test_sal_checkpoint_reset() {
         assert_eq!(rr.epoch, 2);
         let data = std::slice::from_raw_parts(rr.data_ptr, rr.data_size as usize);
         assert_eq!(data, vec![0x22u8; 32].as_slice());
+    }
+}
+
+/// `wal.sal` is never truncated, so a group can land on an offset a wider group
+/// used before it. The narrow group's recorded slot count is what makes the
+/// leftover entries unreachable — both to a reader asking for one of them and to
+/// the tail-count probe boot replay steers by.
+#[test]
+fn a_group_hides_the_slots_of_a_wider_group_at_the_same_offset() {
+    unsafe {
+        let size = 1 << 20;
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
+        // An 8-worker group leaves a fully populated directory at offset 0.
+        let wide: Vec<Vec<u8>> = (0..8).map(|i| make_test_data(0xA0 + i as u8, 64)).collect();
+        let wide_refs: Vec<&[u8]> = wide.iter().map(|b| b.as_slice()).collect();
+        sal_write_group(ptr, 0, 0, 0, 0, 1, size as u64, &wide_refs).expect("group fits");
+
+        // The same offset rewritten by a 2-worker topology.
+        let narrow = [make_test_data(0x11, 32), make_test_data(0x22, 32)];
+        let narrow_refs: Vec<&[u8]> = narrow.iter().map(|b| b.as_slice()).collect();
+        sal_write_group(ptr, 0, 0, 0, 0, 2, size as u64, &narrow_refs).expect("group fits");
+
+        assert_eq!(
+            sal_tail_slot_count(ptr),
+            Some(2),
+            "the tail's own count is the narrow one"
+        );
+        for w in 0..8u32 {
+            let r = sal_read_group_header(ptr, 0, w, None).expect("group is readable");
+            assert_eq!(r.slots, 2);
+            if w < 2 {
+                assert_eq!(r.data_size, 32, "slot {w} is the narrow group's");
+            } else {
+                assert!(r.data_ptr.is_null(), "slot {w} was never written by this group");
+                assert_eq!(r.data_size, 0);
+            }
+        }
     }
 }
 
@@ -541,8 +579,8 @@ fn test_sal_prefix_epoch_gate() {
 #[test]
 fn test_sal_prefix_packing_boundaries() {
     // The (epoch << 32 | payload_size) prefix word must round-trip at the
-    // boundaries: a header-only group (payload_size == GROUP_HEADER_SIZE)
-    // with epoch u32::MAX, and a multi-MiB group with epoch 1.
+    // boundaries: a one-slot group with no data (payload_size == its header
+    // size) at epoch u32::MAX, and a multi-MiB group at epoch 1.
     unsafe {
         let size = 8 << 20;
         let region = SharedRegion::new(size);
@@ -553,17 +591,17 @@ fn test_sal_prefix_packing_boundaries() {
         let new_cursor = sal_write_group(ptr, 0, 0, 0, 0, u32::MAX, size as u64, &empty).expect("group fits");
         let word = atomic_load_u64(ptr);
         assert_eq!((word >> 32) as u32, u32::MAX);
-        assert_eq!((word & 0xFFFF_FFFF) as usize, GROUP_HEADER_SIZE);
+        assert_eq!((word & 0xFFFF_FFFF) as usize, group_header_size(1));
         let rr = sal_read_group_header(ptr, 0, 0, None).expect("group present");
         assert_eq!(rr.epoch, u32::MAX);
-        assert_eq!(rr.advance, (8 + GROUP_HEADER_SIZE) as u64);
+        assert_eq!(rr.advance, (8 + group_header_size(1)) as u64);
         assert_eq!(new_cursor, rr.advance);
 
         // Multi-MiB group, epoch 1.
         std::ptr::write_bytes(ptr, 0, size);
         let big = make_test_data(0xEE, 3 << 20);
         sal_write_group(ptr, 0, 0, 0, 0, 1, size as u64, &[&big]).expect("group fits");
-        let expected_payload = GROUP_HEADER_SIZE + (3 << 20); // 3 MiB is already 8-aligned
+        let expected_payload = group_header_size(1) + (3 << 20); // 3 MiB is already 8-aligned
         let word = atomic_load_u64(ptr);
         assert_eq!((word >> 32) as u32, 1);
         assert_eq!((word & 0xFFFF_FFFF) as usize, expected_payload);

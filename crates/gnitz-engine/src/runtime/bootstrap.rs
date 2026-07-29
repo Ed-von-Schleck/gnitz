@@ -10,7 +10,9 @@ use crate::foundation::posix_io;
 use crate::query::RelationKind;
 use crate::runtime::executor::{ServerExecutor, TlsListener};
 use crate::runtime::master::MasterDispatcher;
-use crate::runtime::sal::{sal_mmap_size, SalReader, SalWriter, FLAG_DDL_SYNC, FLAG_PUSH, FLAG_TXN_COMMIT};
+use crate::runtime::sal::{
+    sal_mmap_size, sal_tail_slot_count, SalReader, SalWriter, FLAG_DDL_SYNC, FLAG_PUSH, FLAG_TXN_COMMIT,
+};
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
 use crate::runtime::w2m_ring::{self, W2M_REGION_SIZE};
 use crate::runtime::wire as ipc;
@@ -77,19 +79,20 @@ fn collect_committed_lsns(sal_reader: &SalReader) -> HashSet<u64> {
 
 /// Pass 2: walk the SAL applying every committed group whose LSN is
 /// in `family_lsns` and exceeds the recorded flushed LSN. The closure
-/// receives the decoded batch and may filter by flag (e.g. master
-/// applies only FLAG_DDL_SYNC, worker only FLAG_PUSH).
+/// receives the group's raw wire bytes and may filter by flag (e.g. master
+/// applies only FLAG_DDL_SYNC, worker only FLAG_PUSH). It decodes what it
+/// keeps: `ipc::decode_wire` copies the whole batch out of the SAL, so decoding
+/// ahead of the flag test would pay for every group the caller drops.
 fn recover_sal<F>(
     sal_reader: &SalReader,
     catalog: &mut CatalogEngine,
+    committed: &HashSet<u64>,
     family_lsns: &HashMap<i64, u64>,
     mut apply: F,
 ) -> Result<u32, String>
 where
-    F: FnMut(&mut CatalogEngine, &crate::runtime::sal::SalMessage, ipc::DecodedWire) -> Result<bool, String>,
+    F: FnMut(&mut CatalogEngine, &crate::runtime::sal::SalMessage, &[u8]) -> Result<bool, String>,
 {
-    let committed = collect_committed_lsns(sal_reader);
-
     let mut applied: u32 = 0;
     for msg in sal_groups(sal_reader) {
         if !committed.contains(&msg.lsn) {
@@ -109,11 +112,7 @@ where
             Some(d) => d,
             None => continue,
         };
-        let decoded = match ipc::decode_wire(data) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        if apply(catalog, &msg, decoded)? {
+        if apply(catalog, &msg, data)? {
             applied += 1;
         }
     }
@@ -133,11 +132,12 @@ fn recover_system_tables_from_sal(sal_ptr: *const u8, catalog: &mut CatalogEngin
         .filter(|&(tid, _)| tid > 0 && tid < FIRST_USER_TABLE_ID)
         .collect();
 
-    let replayed = recover_sal(&sal_reader, catalog, &family_lsns, |cat, msg, decoded| {
+    let committed = collect_committed_lsns(&sal_reader);
+    let replayed = recover_sal(&sal_reader, catalog, &committed, &family_lsns, |cat, msg, data| {
         if msg.flags & FLAG_DDL_SYNC == 0 {
             return Ok(false);
         }
-        let batch = match decoded.data_batch {
+        let batch = match ipc::decode_wire(data).ok().and_then(|d| d.data_batch) {
             Some(b) if b.count > 0 => b,
             _ => return Ok(false),
         };
@@ -198,16 +198,25 @@ fn swept_base_tables(catalog: &mut CatalogEngine) -> Vec<i64> {
     catalog.dag.base_tables_reachable_from(view_ids)
 }
 
-/// Per-worker post-fork user-table replay. The worker's `sal_reader`
-/// already has the worker's per-cursor view; the apply closure decodes
-/// each FLAG_PUSH group's batch and applies it through the unique-pk path
-/// (`ingest_returning_effective`, the exact call `handle_push` makes) so
-/// retractions cancel correctly, and — for every base table feeding ≥1 view —
-/// buffers the returned effective delta into the returned map. That map seeds
-/// the worker's `pending_deltas`; the master's post-reset recovery tick sweep
-/// drains it into the views. Viewless bases ingest-and-discard (nothing to
+/// Per-worker post-fork user-table replay for `rank` of `num_workers`. The apply
+/// closure decodes each FLAG_PUSH group's batch and applies it through the
+/// unique-pk path (`ingest_returning_effective`, the exact call `handle_push`
+/// makes) so retractions cancel correctly, and — for every base table feeding ≥1
+/// view — buffers the returned effective delta into the returned map. That map
+/// seeds the worker's `pending_deltas`; the master's post-reset recovery tick
+/// sweep drains it into the views. Viewless bases ingest-and-discard (nothing to
 /// drive), so their tail never leaks into the sweep.
-fn recover_from_sal(sal_reader: &SalReader, catalog: &mut CatalogEngine) -> Result<HashMap<i64, Batch>, String> {
+///
+/// The tail is written pre-sliced, one slot per worker of the boot that wrote it.
+/// At the launched count this rank's own slot already holds exactly its rows; at
+/// any other count it holds neither all of them nor only them, so every written
+/// slot is walked and each partitioned group re-cut for the launched topology.
+fn recover_from_sal(
+    sal_ptr: *const u8,
+    rank: u32,
+    num_workers: u32,
+    catalog: &mut CatalogEngine,
+) -> Result<HashMap<i64, Batch>, String> {
     let all_lsns = catalog.collect_all_flushed_lsns();
     let family_lsns: HashMap<i64, u64> = all_lsns
         .into_iter()
@@ -216,33 +225,73 @@ fn recover_from_sal(sal_reader: &SalReader, catalog: &mut CatalogEngine) -> Resu
 
     let buffered_bases: HashSet<i64> = swept_base_tables(catalog).into_iter().collect();
 
+    let written = unsafe { sal_tail_slot_count(sal_ptr) }.unwrap_or(num_workers);
+    let reslice = written != num_workers;
+    let slots = if reslice { 0..written } else { rank..rank + 1 };
+
+    // `-1` for the eventfd: a recovery walk never waits on one.
+    let readers: Vec<SalReader> = slots.map(|s| SalReader::new(sal_ptr, s, sal_mmap_size(), -1)).collect();
+    // The committed-LSN set is read from the group headers, which are shared by
+    // every slot, so it is the same set for each reader.
+    let committed = collect_committed_lsns(&readers[0]);
+
     let mut pending: HashMap<i64, Batch> = HashMap::new();
-    let replayed = recover_sal(sal_reader, catalog, &family_lsns, |cat, msg, decoded| {
-        if msg.flags & FLAG_PUSH == 0 {
-            return Ok(false);
-        }
-        let batch = match decoded.data_batch {
-            Some(b) if b.count > 0 => b,
-            _ => return Ok(false),
-        };
-        let tid = msg.target_id as i64;
-        // The error rides the startup ACK: the master fails boot BEFORE zeroing the
-        // SAL sentinel, so the replayed data's only durable copy survives. A
-        // swallowed error here would zero the sentinel and orphan the un-applied
-        // committed data.
-        let effective = cat.ingest_returning_effective(tid, batch).map_err(|e| {
-            format!(
-                "SAL replay apply failed (table_id={}, lsn={}): {e}",
-                msg.target_id, msg.lsn
-            )
+    let mut replayed: u32 = 0;
+    for (idx, sal_reader) in readers.iter().enumerate() {
+        replayed += recover_sal(sal_reader, catalog, &committed, &family_lsns, |cat, msg, data| {
+            if msg.flags & FLAG_PUSH == 0 {
+                return Ok(false);
+            }
+            let tid = msg.target_id as i64;
+            // The catalog's schema, not the wire's: only the catalog stamps the
+            // `replicated` bit the branch below reads. `SchemaDescriptor` is `Copy`,
+            // so this holds no borrow on `cat` across the `&mut cat` ingest.
+            let schema = cat
+                .get_schema_desc(tid)
+                .ok_or_else(|| format!("SAL replay: no schema for table_id={tid} (lsn={})", msg.lsn))?;
+            // Broadcast, not sliced: every slot holds the whole copy, so a second
+            // reader would re-ingest the same rows and add their weights again. Never
+            // re-sliced either — this worker needs the full copy, not a share of it.
+            let replicated = schema.replicated();
+            if replicated && idx > 0 {
+                return Ok(false);
+            }
+            let batch = match ipc::decode_wire(data).ok().and_then(|d| d.data_batch) {
+                Some(b) if b.count > 0 => b,
+                _ => return Ok(false),
+            };
+            let owned = if reslice && !replicated {
+                // Re-cut with the write path's own router, so what survives is exactly
+                // what the master would have written to this rank's slot: same
+                // distribution-prefix hash, same partition→worker map.
+                let mb = batch.as_mem_batch();
+                crate::ops::with_worker_indices(&batch, &schema, num_workers as usize, |wi| {
+                    Batch::from_indexed_rows(&mb, &wi[rank as usize], &schema)
+                })
+            } else {
+                batch
+            };
+            if owned.count == 0 {
+                return Ok(false);
+            }
+            // The error rides the startup ACK: the master fails boot BEFORE zeroing
+            // the SAL sentinel, so the replayed data's only durable copy survives. A
+            // swallowed error here would zero the sentinel and orphan the un-applied
+            // committed data.
+            let effective = cat.ingest_returning_effective(tid, owned).map_err(|e| {
+                format!(
+                    "SAL replay apply failed (table_id={}, lsn={}): {e}",
+                    msg.target_id, msg.lsn
+                )
+            })?;
+            // Buffer the effective delta for the sweep; viewless bases discard it
+            // (nothing to drive).
+            if buffered_bases.contains(&tid) {
+                buffer_pending_delta(&mut pending, tid, effective);
+            }
+            Ok(true)
         })?;
-        // Buffer the effective delta for the sweep; viewless bases discard it
-        // (nothing to drive).
-        if buffered_bases.contains(&tid) {
-            buffer_pending_delta(&mut pending, tid, effective);
-        }
-        Ok(true)
-    })?;
+    }
 
     if replayed > 0 {
         boot_log(&format!("SAL recovery: replayed {replayed} blocks\n"));
@@ -265,11 +314,16 @@ fn recover_from_sal(sal_reader: &SalReader, catalog: &mut CatalogEngine) -> Resu
 /// The Err rides the startup ACK (see worker.run): a failed boot must abort
 /// before the master zeroes the SAL sentinel, or the replayed rows' only
 /// durable copy is destroyed.
-fn worker_boot_recovery(catalog: &mut CatalogEngine, sal_reader: &SalReader) -> Result<HashMap<i64, Batch>, String> {
+fn worker_boot_recovery(
+    catalog: &mut CatalogEngine,
+    sal_ptr: *const u8,
+    rank: u32,
+    num_workers: u32,
+) -> Result<HashMap<i64, Batch>, String> {
     catalog
         .backfill_all_indexes()
         .map_err(|e| format!("boot index backfill failed: {e}"))?;
-    let pending_deltas = recover_from_sal(sal_reader, catalog)?;
+    let pending_deltas = recover_from_sal(sal_ptr, rank, num_workers, catalog)?;
     // Keep the boot flush: the non-windowed recovery resets the SAL before the
     // master-driven tick sweep, so the replayed base rows must be shard-durable
     // first — else the reset would drop acknowledged tail data.
@@ -526,7 +580,7 @@ fn run_worker_child(
     let (pending_deltas, boot_err): (HashMap<i64, Batch>, Option<String>) = match catalog
         .rehome_single_partition_stores()
         .map_err(|e| format!("W{w} rehome single-partition stores failed: {e}"))
-        .and_then(|()| worker_boot_recovery(catalog, &sal_reader))
+        .and_then(|()| worker_boot_recovery(catalog, ipc.sal_ptr as *const u8, w as u32, num_workers))
     {
         Ok(pd) => (pd, None),
         Err(e) => {
@@ -648,6 +702,18 @@ fn run_server(
             .recovery_start_generation_bump()
             .map_err(|e| format!("recovery-start generation bump failed: {e}"))?;
         inject_recovery_panic("genbump");
+
+        // Name the replay path the workers will take, so the boot record shows
+        // whether the tail was re-sliced. Pre-fork, so this still reaches the
+        // master's stdout (the children redirect fd 1 to their own logs), and read
+        // from the same place the workers read it.
+        if let Some(written) = unsafe { sal_tail_slot_count(ipc.sal_ptr as *const u8) } {
+            if written != num_workers {
+                boot_log(&format!(
+                    "SAL tail written by {written} workers, launching {num_workers}\n"
+                ));
+            }
+        }
     }
 
     // Log fd assignments

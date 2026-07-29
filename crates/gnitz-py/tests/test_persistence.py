@@ -100,14 +100,18 @@ def _drain_stdout(proc):
     return out.decode(errors="replace")
 
 
-def _rebuilt_view_count(proc):
-    """Parse the most recent 'recovery: rebuilding N invalid view(s)' marker from
-    the master's stdout. Returns N (0 ⇒ every view resumed from its checkpoint),
-    or None if the marker was not seen."""
+def _parse_rebuilt_views(text):
+    """N from the most recent 'recovery: rebuilding N invalid view(s)' marker in
+    `text` (0 ⇒ every view resumed from its checkpoint), or None if the marker is
+    absent. Split from `_rebuilt_view_count` so a caller that already drained the
+    pipe for another marker can reuse the same text."""
     import re
-    text = _drain_stdout(proc)
     matches = re.findall(r"recovery: rebuilding (\d+) invalid view", text)
     return int(matches[-1]) if matches else None
+
+
+def _rebuilt_view_count(proc):
+    return _parse_rebuilt_views(_drain_stdout(proc))
 
 
 def _graceful_stop_server(proc, timeout=30):
@@ -1851,11 +1855,11 @@ def _start_expecting_boot_crash(data_dir, sock_path, workers=None, extra_env=Non
     raise RuntimeError("server did not crash within timeout")
 
 
-def _checkpoint_cut(data_dir, sock_path, schema):
-    """Shared 'cut' both checkpoint-resume tests start from: create <schema>.t
+def _checkpoint_cut(data_dir, sock_path, schema, workers=_NUM_WORKERS):
+    """Shared 'cut' the checkpoint-resume tests start from: create <schema>.t
     with view v (dbl = val * 2), insert pks 1..5, then graceful-checkpoint-stop
     the server and unlink the socket."""
-    proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+    proc = _start_server(data_dir, sock_path, workers=workers)
     conn = gnitz.connect(sock_path)
     conn.create_schema(schema)
     conn.execute_sql(
@@ -1968,29 +1972,53 @@ def test_recovery_reset_injection_forces_correct_rebuild():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-@pytest.mark.skipif(
-    _NUM_WORKERS < 2, reason="replication only matters with GNITZ_WORKERS >= 2"
-)
+def _create_replicated_join(conn, schema):
+    """A replicated `dim`, a partitioned `fact`, and a view joining them.
+
+    The join is the observable both replicated-copy tests read through, because a
+    scan of the replicated table itself is single-sourced to worker 0, whose copy
+    is current at every worker count — a damaged copy on workers 1..W-1 is
+    invisible to a plain SELECT. `fact JOIN dim` skips the exchange on both sides
+    and cogroups against each worker's own `dim`, union-gathering the result, so a
+    worker with an empty, stale, or duplicated copy shows up in the gathered rows
+    and weights."""
+    conn.create_schema(schema)
+    conn.execute_sql(
+        "CREATE TABLE dim (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL) "
+        "WITH (replicated = true)", schema_name=schema)
+    conn.execute_sql(
+        "CREATE TABLE fact (pk BIGINT NOT NULL PRIMARY KEY, dim_pk BIGINT NOT NULL)",
+        schema_name=schema)
+    conn.execute_sql(
+        "CREATE VIEW j AS SELECT f.pk AS pk, d.v AS v "
+        "FROM fact f JOIN dim d ON f.dim_pk = d.pk", schema_name=schema)
+
+
+def _insert_join_pairs(conn, schema, lo, hi):
+    """One `dim` row and one matching `fact` row per key in [lo, hi)."""
+    conn.execute_sql(
+        "INSERT INTO dim VALUES " + ", ".join(f"({i}, {i * 10})" for i in range(lo, hi)),
+        schema_name=schema)
+    conn.execute_sql(
+        "INSERT INTO fact VALUES " + ", ".join(f"({i}, {i})" for i in range(lo, hi)),
+        schema_name=schema)
+
+
 def test_replicated_join_survives_worker_count_change():
     """A replicated dim's per-worker copy is addressed by rank, so every launched
     rank must read a copy that is current after a worker-count change.
 
-    The observable has to be a worker-LOCAL read: a scan of the replicated table
-    itself is single-sourced to worker 0, whose copy is current at every worker
-    count, so it stays correct either way. A `fact JOIN dim` skips the exchange on
-    both sides and cogroups against each worker's own `dim`, union-gathering the
-    result — a worker with an empty or stale copy silently contributes the wrong
-    rows, which the multiset assertions below catch.
+    The counts run 2 -> 4 -> 3 -> 4. Widening covers the rebuild (ranks 2 and 3
+    have no copy and must get one), narrowing covers reclamation plus the surviving
+    ranks keeping their own current copies, and the final re-grow covers a boot
+    reading a tail a narrower count wrote: a clean shutdown leaves a live group at
+    SAL offset 0 written at W=3, and rank 3 must see its absent slot as empty
+    rather than as the earlier W=4 run's leftover at the same offset. Every
+    transition is a CLEAN shutdown, so the data under test lives in shards rather
+    than the un-checkpointed SAL tail.
 
-    The counts run 2 -> 4 -> 3. Widening covers the rebuild (ranks 2 and 3 have no
-    copy and must get one), narrowing covers reclamation plus the surviving ranks
-    keeping their own current copies. Every transition is a CLEAN shutdown, so the
-    data under test lives in shards rather than the un-checkpointed SAL tail, which
-    a worker-count increase does not recover: SAL replay indexes the group
-    directory by the launched rank, and a rank above the writing topology's count
-    reads a slot that topology never wrote. That is why the widening leg runs once,
-    on a directory that has never run wider — a re-grow after a shrink reads a
-    directory slot left behind by the earlier wide run and is a separate defect.
+    The worker counts are hardcoded, so this runs multi-worker even under
+    `make e2e WORKERS=1`.
     """
     tmpdir = tempfile.mkdtemp(
         dir=os.path.expanduser("~/git/gnitz/tmp"), prefix="gnitz_persist_repjoin_")
@@ -2005,26 +2033,12 @@ def test_replicated_join_survives_worker_count_change():
         return rows
 
     def insert_pairs(conn, lo, hi):
-        conn.execute_sql(
-            "INSERT INTO dim VALUES " + ", ".join(f"({i}, {i * 10})" for i in range(lo, hi)),
-            schema_name="rj")
-        conn.execute_sql(
-            "INSERT INTO fact VALUES " + ", ".join(f"({i}, {i})" for i in range(lo, hi)),
-            schema_name="rj")
+        _insert_join_pairs(conn, "rj", lo, hi)
 
     try:
         proc = _start_server(data_dir, sock_path, workers=2)
         conn = gnitz.connect(sock_path)
-        conn.create_schema("rj")
-        conn.execute_sql(
-            "CREATE TABLE dim (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL) "
-            "WITH (replicated = true)", schema_name="rj")
-        conn.execute_sql(
-            "CREATE TABLE fact (pk BIGINT NOT NULL PRIMARY KEY, dim_pk BIGINT NOT NULL)",
-            schema_name="rj")
-        conn.execute_sql(
-            "CREATE VIEW j AS SELECT f.pk AS pk, d.v AS v "
-            "FROM fact f JOIN dim d ON f.dim_pk = d.pk", schema_name="rj")
+        _create_replicated_join(conn, "rj")
         insert_pairs(conn, 0, 64)
         conn.close()
 
@@ -2052,6 +2066,169 @@ def test_replicated_join_survives_worker_count_change():
             "W=3: every surviving rank must read its own copy, mutation included"
         )
 
+        # --- Re-grow to 4: rank 3 reads the W=3 shutdown group at SAL offset 0,
+        #     which has no slot 3 — but the earlier W=4 epoch's group at that same
+        #     offset did. Reading that leftover aborts the worker's recovery. ---
+        proc = _graceful_restart(proc, sock_path, data_dir, workers=4)
+        assert join_rows() == expected, (
+            "W=4 again: re-growing past a narrower run must boot and read every copy"
+        )
+
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Un-checkpointed SAL tail across a worker-count change
+#
+# The SAL is written pre-sliced per worker at the then-current count and read
+# back by slot. A restart at a different count must therefore replay every slot
+# the tail carries and re-cut each partitioned group for the launched topology,
+# or client-ACKed, fdatasync-durable rows are silently lost. The counts below are
+# hardcoded, so these run multi-worker even under `make e2e WORKERS=1`.
+# ---------------------------------------------------------------------------
+
+
+def _assert_reslice_ran(proc):
+    """The changed-count replay marker, drained from the master's stdout. Proves
+    the boot actually took the re-slicing path rather than the same-count one.
+    Returns the drained text so a caller needing the rebuild marker too reads it
+    out of the same string (`_drain_stdout` consumes the pipe)."""
+    text = _drain_stdout(proc)
+    assert "SAL tail written by" in text, (
+        f"restart at a changed worker count must replay every written slot; "
+        f"boot output was:\n{text}"
+    )
+    return text
+
+
+@pytest.mark.parametrize("wrote,launched", [(4, 2), (1, 4)])
+def test_tail_survives_worker_count_change(wrote, launched):
+    """SIGKILL with an un-checkpointed tail at `wrote` workers, restart at
+    `launched`. Every launched rank must read all `wrote` slots and keep exactly
+    the rows its own partition range owns — on the growth leg three of the four
+    ranks have no slot of their own at all and depend entirely on slot 0 being
+    re-cut. Pre-fix, growth lost 150 of 200 rows.
+
+    The table is `CLUSTER BY` + compound PK, so a re-slice that hashed the full PK
+    instead of the distribution prefix would misroute; it carries a UNIQUE column,
+    so an over-populated secondary index shows up; and the tail ends in a
+    DELETE + re-INSERT, so the replay carries a retraction and the assertions test
+    weights rather than mere presence."""
+    tmpdir, data_dir, sock_path = _make_env()
+    try:
+        proc = _start_server(data_dir, sock_path, workers=wrote)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("ws")
+        conn.execute_sql(
+            "CREATE TABLE t (a BIGINT NOT NULL, b BIGINT NOT NULL, u BIGINT NOT NULL UNIQUE, "
+            "PRIMARY KEY (a, b)) CLUSTER BY a",
+            schema_name="ws",
+        )
+        # A pinned key set — 20 distinct `a`, 10 `b` each — so a changed hash fails
+        # loudly instead of silently degrading the partition spread.
+        vals = ",".join(f"({a}, {b}, {a * 10 + b})" for a in range(20) for b in range(10))
+        conn.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name="ws")
+        # Still in the same tail: retract one key and re-insert it.
+        conn.execute_sql("DELETE FROM t WHERE a = 7 AND b = 3", schema_name="ws")
+        conn.execute_sql("INSERT INTO t VALUES (7, 3, 73)", schema_name="ws")
+        conn.close()
+
+        proc = _crash_and_restart(proc, sock_path, data_dir, workers=launched)
+        _assert_reslice_ran(proc)
+
+        conn = gnitz.connect(sock_path)
+        tid, _ = conn.resolve_table("ws", "t")
+        # The raw row list, not a dict: `scan` concatenates per-worker frames with
+        # no cross-worker consolidation, so a row that survived on two workers
+        # arrives twice at weight 1 — exactly what a botched re-slice produces, and
+        # exactly what keying by PK would hide.
+        rows = list(conn.scan(tid))
+        assert len(rows) == 200, f"expected 200 rows after {wrote} -> {launched}, got {len(rows)}"
+        assert all(r.weight == 1 for r in rows), (
+            f"every surviving row must be at weight 1, got {sorted({r.weight for r in rows})}"
+        )
+        assert {(r["a"], r["b"]) for r in rows} == {(a, b) for a in range(20) for b in range(10)}
+
+        # The only index assertion that discriminates: deleting the sole holder of
+        # a `u` value and re-inserting that value must SUCCEED. Rejecting a
+        # duplicate and admitting a fresh value both pass with an index
+        # over-populated by a replayed foreign slot, so they prove nothing.
+        conn.execute_sql("DELETE FROM t WHERE a = 4 AND b = 5", schema_name="ws")
+        conn.execute_sql("INSERT INTO t VALUES (4, 5, 45)", schema_name="ws")
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_replicated_tail_survives_worker_count_shrink():
+    """A replicated table's rows are broadcast into EVERY SAL slot, not sliced, so
+    the changed-count replay must take exactly one slot and never re-cut it:
+    re-slicing would cut each worker's copy down to its partition share, replaying
+    all four slots would leave every row at weight 4."""
+    tmpdir, data_dir, sock_path = _make_env()
+    try:
+        proc = _start_server(data_dir, sock_path, workers=4)
+        conn = gnitz.connect(sock_path)
+        _create_replicated_join(conn, "rt")
+        _insert_join_pairs(conn, "rt", 0, 64)
+        conn.close()
+
+        proc = _crash_and_restart(proc, sock_path, data_dir, workers=2)
+        _assert_reslice_ran(proc)
+
+        conn = gnitz.connect(sock_path)
+        vid, _ = conn.resolve_table("rt", "j")
+        rows = list(conn.scan(vid))
+        assert len(rows) == 64, f"expected 64 joined rows after the shrink, got {len(rows)}"
+        assert all(r.weight == 1 for r in rows), (
+            f"a duplicated replicated copy shows as weight > 1, got "
+            f"{sorted({r.weight for r in rows})}"
+        )
+        assert {(r["pk"], r["v"]) for r in rows} == {(i, i * 10) for i in range(64)}
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_checkpoint_cut_plus_changed_count_tail():
+    """Where re-homed shard state meets the tail re-slice: checkpoint at W=4, push
+    a tail, SIGKILL, restart at W=2. The base must hold cut + tail exactly once —
+    a double-apply (checkpointed row plus replayed row) would show as weight 2.
+    The changed count invalidates every view, so unlike the same-count sibling
+    this restart rebuilds rather than resumes."""
+    tmpdir, data_dir, sock_path = _make_env()
+    try:
+        _checkpoint_cut(data_dir, sock_path, "cc", workers=4)
+
+        proc = _start_server(data_dir, sock_path, workers=4)
+        conn = gnitz.connect(sock_path)
+        for k in range(6, 11):
+            conn.execute_sql(f"INSERT INTO t VALUES ({k}, {k * 10})", schema_name="cc")
+        conn.close()
+        proc = _crash_and_restart(proc, sock_path, data_dir, workers=2)
+
+        # One drain, both markers.
+        text = _assert_reslice_ran(proc)
+        rebuilt = _parse_rebuilt_views(text)
+        assert rebuilt is not None and rebuilt >= 1, (
+            f"a changed-count restart invalidates every view, so it must rebuild; got {rebuilt}"
+        )
+
+        conn = gnitz.connect(sock_path)
+        tid, _ = conn.resolve_table("cc", "t")
+        rows = list(conn.scan(tid))
+        assert len(rows) == 10, f"base must hold cut + tail exactly once, got {len(rows)} rows"
+        assert all(r.weight == 1 for r in rows), (
+            f"a checkpointed row re-applied from the tail shows as weight 2, got "
+            f"{sorted({r.weight for r in rows})}"
+        )
+        assert {r["pk"] for r in rows} == set(range(1, 11))
+        assert all(r["val"] == r["pk"] * 10 for r in rows)
+        conn.close()
         _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

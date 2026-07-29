@@ -20,11 +20,32 @@ use gnitz_wire::align8;
 // ---------------------------------------------------------------------------
 
 pub const MAX_WORKERS: usize = 64;
-/// Group header: 16 fixed (lsn u64, flags u32, target_id u32) +
-/// MAX_WORKERS*4 offsets + MAX_WORKERS*4 sizes = 528, a multiple of 8.
-/// The group's size and epoch live in the atomically-published u64 prefix
-/// preceding the header (`(epoch << 32) | payload_size`), not in the header.
-pub(crate) const GROUP_HEADER_SIZE: usize = 16 + 2 * MAX_WORKERS * 4;
+
+/// Group header: 24 fixed (lsn u64, flags u32, target_id u32, slot count u32,
+/// pad u32) followed by one u32 offset and one u32 size per slot. Always a
+/// multiple of 8. The group's size and epoch live in the atomically-published
+/// u64 prefix preceding the header (`(epoch << 32) | payload_size`).
+///
+/// The directory is sized by the group's own slot count rather than by
+/// `MAX_WORKERS`, which makes a group self-describing: `wal.sal` is never
+/// truncated, so a group can land on an offset a wider group used before it, and
+/// the recorded count is what tells a reader that slot 5 of a 2-slot group is
+/// empty rather than a leftover. It also keeps a group's fixed overhead
+/// proportional to the worker count — at 4 workers the header is 56 bytes, not
+/// 528, which matters most for the commit sentinel (one per transaction, and
+/// otherwise all header).
+#[inline]
+pub(crate) const fn group_header_size(slots: usize) -> usize {
+    24 + 2 * slots * 4
+}
+
+// Header field offsets, relative to the start of the header.
+const OFF_LSN: usize = 0;
+const OFF_FLAGS: usize = 8;
+const OFF_TARGET_ID: usize = 12;
+const OFF_SLOT_COUNT: usize = 16;
+const OFF_DIRECTORY: usize = 24;
+
 pub(crate) const SAL_MMAP_SIZE: usize = 1 << 30;
 
 /// The SAL slot size for one worker's share of a **wire-safe** group: the
@@ -47,12 +68,12 @@ fn wire_safe_slot_size(
     CTRL_BLOCK_SIZE_NO_BLOB + schema_block_len + data_sz
 }
 
-/// The exact SAL footprint of a zone-closing `FLAG_TXN_COMMIT` sentinel — an
-/// all-zero-worker group, no per-worker slots. `sal_begin_group` reserves this
-/// much headroom for every non-sentinel group, so the sentinel — written last —
-/// always fits: a data group at the boundary fails `sal_begin_group` gracefully
-/// (`write_err` + skip) rather than aborting the node.
-pub(crate) const SENTINEL_SIZE: usize = 8 + GROUP_HEADER_SIZE;
+/// The exact SAL footprint of a zone-closing `FLAG_TXN_COMMIT` sentinel — a
+/// slotless group, header only. `sal_begin_group` reserves this much headroom for
+/// every non-sentinel group, so the sentinel — written last — always fits: a data
+/// group at the boundary fails `sal_begin_group` gracefully (`write_err` + skip)
+/// rather than aborting the node.
+pub(crate) const SENTINEL_SIZE: usize = 8 + group_header_size(0);
 
 /// Floor for a `GNITZ_SAL_BYTES` override — must comfortably exceed one DDL zone
 /// plus the checkpoint headroom.
@@ -360,6 +381,8 @@ pub(crate) struct SalGroup {
     sal_ptr: *mut u8,
     /// Offset of the group's 8-byte size prefix; the header follows it.
     base: usize,
+    /// Header + directory bytes; also the offset of slot 0's payload.
+    hdr_size: usize,
     payload_size: usize,
     epoch: u32,
     mmap_size: usize,
@@ -387,7 +410,7 @@ impl SalGroup {
     /// # Safety
     /// `worker_sizes` must be the slice this group was begun with.
     pub(crate) unsafe fn for_each_slot(&self, worker_sizes: &[u32], mut f: impl FnMut(usize, &mut [u8])) {
-        let mut off = GROUP_HEADER_SIZE;
+        let mut off = self.hdr_size;
         for (w, &sz) in worker_sizes.iter().enumerate() {
             let sz = sz as usize;
             if sz == 0 {
@@ -435,9 +458,10 @@ pub(crate) unsafe fn sal_begin_group(
         "SAL group epoch must be >= 1 — epoch 0 is indistinguishable from the empty-slot sentinel prefix"
     );
 
-    // payload_size starts as GROUP_HEADER_SIZE (528, a multiple of 8) and grows
-    // only by align8(sz) increments, so it is always a multiple of 8.
-    let mut payload_size = GROUP_HEADER_SIZE;
+    // payload_size starts as the header size (a multiple of 8) and grows only by
+    // align8(sz) increments, so it is always a multiple of 8.
+    let hdr_size = group_header_size(worker_sizes.len());
+    let mut payload_size = hdr_size;
     for &sz in worker_sizes {
         if sz > 0 {
             payload_size += align8(sz as usize);
@@ -460,25 +484,28 @@ pub(crate) unsafe fn sal_begin_group(
     let base = write_cursor;
     let hdr_off = base + 8;
 
-    write_u64_raw(sal_ptr, hdr_off, lsn);
-    write_u32_raw(sal_ptr, hdr_off + 8, flags);
-    write_u32_raw(sal_ptr, hdr_off + 12, target_id);
+    let slots = worker_sizes.len();
+    write_u64_raw(sal_ptr, hdr_off + OFF_LSN, lsn);
+    write_u32_raw(sal_ptr, hdr_off + OFF_FLAGS, flags);
+    write_u32_raw(sal_ptr, hdr_off + OFF_TARGET_ID, target_id);
+    write_u32_raw(sal_ptr, hdr_off + OFF_SLOT_COUNT, slots as u32);
+    write_u32_raw(sal_ptr, hdr_off + OFF_SLOT_COUNT + 4, 0);
 
-    let mut data_offset = GROUP_HEADER_SIZE;
+    // Every entry is written, empty ones included: `wal.sal` is never truncated,
+    // so an unwritten entry would read as whatever group last occupied this
+    // offset.
+    let mut data_offset = hdr_size;
     for (w, &sz) in worker_sizes.iter().enumerate() {
-        if sz > 0 {
-            write_u32_raw(sal_ptr, hdr_off + 16 + w * 4, data_offset as u32);
-            write_u32_raw(sal_ptr, hdr_off + 16 + MAX_WORKERS * 4 + w * 4, sz);
-            data_offset += align8(sz as usize);
-        } else {
-            write_u32_raw(sal_ptr, hdr_off + 16 + w * 4, 0);
-            write_u32_raw(sal_ptr, hdr_off + 16 + MAX_WORKERS * 4 + w * 4, 0);
-        }
+        let off = if sz > 0 { data_offset } else { 0 };
+        write_u32_raw(sal_ptr, hdr_off + OFF_DIRECTORY + w * 4, off as u32);
+        write_u32_raw(sal_ptr, hdr_off + OFF_DIRECTORY + slots * 4 + w * 4, sz);
+        data_offset += align8(sz as usize);
     }
 
     Some(SalGroup {
         sal_ptr,
         base,
+        hdr_size,
         payload_size,
         epoch,
         mmap_size,
@@ -518,7 +545,7 @@ pub(crate) unsafe fn sal_write_group(
         &sizes[..nw],
     )?;
 
-    let mut off = GROUP_HEADER_SIZE;
+    let mut off = group_header_size(nw);
     for p in payloads {
         if !p.is_empty() {
             std::ptr::copy_nonoverlapping(p.as_ptr(), group.data_ptr(off), p.len());
@@ -539,6 +566,9 @@ pub(crate) struct SalReadResult {
     pub flags: u32,
     pub target_id: u32,
     pub epoch: u32,
+    /// The slot count the group was written with. A reader asking for a slot at
+    /// or past it gets an empty slot.
+    pub slots: u32,
     /// This worker's payload slot; null/0 when the group carries no data
     /// for this worker (control broadcast, other-worker unicast).
     pub data_ptr: *const u8,
@@ -581,13 +611,29 @@ pub(crate) unsafe fn sal_read_group_header(
     }
 
     let hdr_off = rc + 8;
-    let lsn = read_u64_raw(sal_ptr, hdr_off);
-    let flags = read_u32_raw(sal_ptr, hdr_off + 8);
-    let target_id = read_u32_raw(sal_ptr, hdr_off + 12);
+    let lsn = read_u64_raw(sal_ptr, hdr_off + OFF_LSN);
+    let flags = read_u32_raw(sal_ptr, hdr_off + OFF_FLAGS);
+    let target_id = read_u32_raw(sal_ptr, hdr_off + OFF_TARGET_ID);
     let advance = (8 + align8(payload_size)) as u64;
 
-    let my_offset = read_u32_raw(sal_ptr, hdr_off + 16 + wid * 4) as usize;
-    let my_size = read_u32_raw(sal_ptr, hdr_off + 16 + MAX_WORKERS * 4 + wid * 4) as usize;
+    // The slot count bounds the directory read. A count whose directory does not
+    // fit the payload means the header and the prefix came from different groups:
+    // a crash between `sal_begin_group` writing a header and `commit` publishing
+    // its prefix leaves the previous epoch's prefix in front of the new header.
+    // Stop the walk there rather than index past the payload.
+    let slots = read_u32_raw(sal_ptr, hdr_off + OFF_SLOT_COUNT) as usize;
+    if slots > MAX_WORKERS || group_header_size(slots) > payload_size {
+        return None;
+    }
+
+    let (my_offset, my_size) = if wid < slots {
+        (
+            read_u32_raw(sal_ptr, hdr_off + OFF_DIRECTORY + wid * 4) as usize,
+            read_u32_raw(sal_ptr, hdr_off + OFF_DIRECTORY + slots * 4 + wid * 4) as usize,
+        )
+    } else {
+        (0, 0)
+    };
 
     let (data_ptr, data_size) = if my_size > 0 && my_offset > 0 {
         debug_assert!(
@@ -608,9 +654,21 @@ pub(crate) unsafe fn sal_read_group_header(
         flags,
         target_id,
         epoch,
+        slots: slots as u32,
         data_ptr,
         data_size,
     })
+}
+
+/// The slot count the SAL tail at `sal_ptr` was written with, or `None` when the
+/// tail is empty (or its first group is unreadable). The SAL is rewound at boot
+/// and at every checkpoint, so one master at one worker count writes a whole
+/// tail: the first group's count speaks for all of them.
+///
+/// # Safety
+/// `sal_ptr` must be a valid mmap pointer, and the SAL quiescent.
+pub(crate) unsafe fn sal_tail_slot_count(sal_ptr: *const u8) -> Option<u32> {
+    sal_read_group_header(sal_ptr, 0, 0, None).map(|r| r.slots)
 }
 
 /// Write a WAL data block for `count` rows into `data_slot` by scattering
@@ -826,7 +884,7 @@ impl SalWriter {
     ) -> usize {
         let nw = self.m2w_efds.len();
         let (wire_safe, wire_row_stride) = wire_props;
-        let mut total = 8 + GROUP_HEADER_SIZE;
+        let mut total = 8 + group_header_size(nw);
         if wire_safe {
             for wi in worker_indices.iter().take(nw) {
                 total += align8(wire_safe_slot_size(schema, wi.len(), wire_row_stride, schema_block_len));
@@ -1024,7 +1082,8 @@ impl SalWriter {
 
         if wsz > 0 {
             let wsz = wsz as usize;
-            let slot0 = unsafe { std::slice::from_raw_parts_mut(group.data_ptr(GROUP_HEADER_SIZE), wsz) };
+            let slot0_off = group.hdr_size;
+            let slot0 = unsafe { std::slice::from_raw_parts_mut(group.data_ptr(slot0_off), wsz) };
             let written = encode_wire_into(
                 slot0,
                 0,
@@ -1043,10 +1102,10 @@ impl SalWriter {
                 &[],
             );
             debug_assert_eq!(written, wsz);
-            let mut off = GROUP_HEADER_SIZE + align8(wsz);
+            let mut off = slot0_off + align8(wsz);
             for _ in 1..nw {
                 unsafe {
-                    std::ptr::copy_nonoverlapping(group.data_ptr(GROUP_HEADER_SIZE), group.data_ptr(off), wsz);
+                    std::ptr::copy_nonoverlapping(group.data_ptr(slot0_off), group.data_ptr(off), wsz);
                 }
                 off += align8(wsz);
             }
@@ -1058,20 +1117,13 @@ impl SalWriter {
 
     /// Write an empty commit sentinel for an atomic zone.
     ///
-    /// Header-only group (zero-byte payload for every worker) carrying
-    /// `FLAG_DDL_SYNC | FLAG_TXN_COMMIT`. Recovery uses the sentinel as
-    /// the "this LSN is closed" mark — without it, all groups at this
-    /// LSN are skipped. The sentinel is inert under the worker's hot
+    /// A slotless group carrying `FLAG_DDL_SYNC | FLAG_TXN_COMMIT`. Recovery uses
+    /// the sentinel as the "this LSN is closed" mark — without it, all groups at
+    /// this LSN are skipped. Every worker still sees it (the flags live in the
+    /// group header, which is not per-slot) and it is inert under the worker's hot
     /// path: the FLAG_DDL_SYNC branch no-ops on a group with no batch.
     pub fn write_commit_sentinel(&mut self, lsn: u64) -> Result<(), String> {
-        let worker_sizes = [0u32; MAX_WORKERS];
-        let group = self.begin(
-            "write_commit_sentinel",
-            0,
-            lsn,
-            FLAG_DDL_SYNC | FLAG_TXN_COMMIT,
-            &worker_sizes[..self.m2w_efds.len()],
-        )?;
+        let group = self.begin("write_commit_sentinel", 0, lsn, FLAG_DDL_SYNC | FLAG_TXN_COMMIT, &[])?;
         self.finish(group);
         Ok(())
     }
