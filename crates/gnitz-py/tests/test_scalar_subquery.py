@@ -26,18 +26,6 @@ def _cleanup(client, sn, *names):
     client.drop_schema(sn)
 
 
-def _rows(client, vid):
-    """List of (row, weight) for positive net-weight rows keyed by all columns."""
-    agg = {}
-    for row in client.scan(vid):
-        if row.weight == 0:
-            continue
-        key = tuple(sorted((c, getattr(row, c)) for c in row._fields if c != "weight")) \
-            if hasattr(row, "_fields") else None
-        agg[key if key is not None else id(row)] = agg.get(key, 0) + row.weight
-    return agg
-
-
 def _col_weights(client, vid, *cols):
     """{(col values…): net_weight} over positive-weight rows."""
     out = {}

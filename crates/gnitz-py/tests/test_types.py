@@ -43,11 +43,6 @@ def _cleanup(client, sn, *table_names):
         pass
 
 
-def _scan_pks(client, tid):
-    """Return sorted list of pk values for all positive-weight rows."""
-    return sorted(row.pk for row in client.scan(tid) if row.weight > 0)
-
-
 def _scan_map(client, tid):
     """Return {pk: row} for all positive-weight rows."""
     return {row.pk: row for row in client.scan(tid) if row.weight > 0}

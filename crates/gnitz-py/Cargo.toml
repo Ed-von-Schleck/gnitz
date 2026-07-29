@@ -16,4 +16,3 @@ gnitz-core     = { path = "../gnitz-core" }
 gnitz-expr     = { path = "../gnitz-expr" }
 gnitz-sql      = { path = "../gnitz-sql" }
 gnitz-wire     = { path = "../gnitz-wire" }
-libc           = "0.2"

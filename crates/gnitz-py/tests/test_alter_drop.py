@@ -24,10 +24,6 @@ def _rows(client, sn, sql):
     return list(res[0]["rows"])
 
 
-def _field_names(row):
-    return list(row._asdict().keys())
-
-
 # ── DROP COLUMN ─────────────────────────────────────────────────────────────
 
 
@@ -47,7 +43,7 @@ def test_drop_middle_column_wildcards_and_positional_remap(client):
         # back unchanged on the visible columns.
         rows = _rows(client, sn, "SELECT * FROM t")
         assert len(rows) == 1
-        assert "a" not in _field_names(rows[0])
+        assert "a" not in rows[0]._fields
         assert (rows[0]["id"], rows[0]["b"]) == (1, 100)
 
         # A new INSERT supplies only the visible columns; the value lands in `b`,
@@ -60,7 +56,7 @@ def test_drop_middle_column_wildcards_and_positional_remap(client):
         ret = client.execute_sql("INSERT INTO t VALUES (3, 300) RETURNING *", schema_name=sn)
         assert ret[0]["type"] == "Rows"
         ret_rows = list(ret[0]["rows"])
-        assert "a" not in _field_names(ret_rows[0])
+        assert "a" not in ret_rows[0]._fields
         assert (ret_rows[0]["id"], ret_rows[0]["b"]) == (3, 300)
 
         # The dropped column is unnameable: an explicit-list INSERT and a projection
@@ -91,7 +87,7 @@ def test_drop_column_index_covered_then_dropped(client):
         client.execute_sql(f"DROP INDEX {sn}__t__idx_a", schema_name=sn)
         client.execute_sql("ALTER TABLE t DROP COLUMN a", schema_name=sn)
         rows = _rows(client, sn, "SELECT * FROM t")
-        assert "a" not in _field_names(rows[0])
+        assert "a" not in rows[0]._fields
         assert (rows[0]["id"], rows[0]["b"]) == (1, 100)
     finally:
         client.drop_schema(sn)
@@ -203,7 +199,7 @@ def test_drop_restrict_dependent_view_leaves_catalog_intact(client):
 
         # The catalog is unchanged: `a` is still visible/usable and the view works.
         rows = _rows(client, sn, "SELECT * FROM t")
-        assert set(_field_names(rows[0])) == {"id", "a", "b"}
+        assert set(rows[0]._fields) == {"id", "a", "b"}
         assert [r["b"] for r in _rows(client, sn, "SELECT * FROM v")] == [100]
     finally:
         client.drop_schema(sn)

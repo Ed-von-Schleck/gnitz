@@ -81,25 +81,31 @@ class AsyncConnection:
         # coroutine, then hand back this same connection.
         return _immediate_return(self).__await__()
 
-    async def push(self, target_id, batch):
-        """Push a batch to a table.  Returns the ingest LSN (int)."""
-        return await self._transport.push(target_id, batch)
+    # Each of these submits the operation and hands back its future, rather
+    # than wrapping it in a coroutine: `await conn.push(...)` reads and behaves
+    # the same, but the operation reaches the I/O thread when it is called
+    # instead of when it is awaited.  That is what lets a caller fire several
+    # and gather them — the whole reason `Pipeline` reached past this class
+    # into the transport.
+    def push(self, target_id, batch):
+        """Push a batch to a table.  Awaits to the ingest LSN (int)."""
+        return self._transport.push(target_id, batch)
 
-    async def scan(self, target_id, include_hidden=False):
-        """Scan a table/view.  Returns a ``ScanResult``."""
-        return await self._transport.scan(target_id, include_hidden)
+    def scan(self, target_id, include_hidden=False):
+        """Scan a table/view.  Awaits to a ``ScanResult``."""
+        return self._transport.scan(target_id, include_hidden)
 
-    async def scan_many(self, target_ids, include_hidden=False):
+    def scan_many(self, target_ids, include_hidden=False):
         """Consistent snapshot of N relations at one server-side SAL cut.
 
-        Returns a ``list`` of ``ScanResult`` in request order.  An atomic
+        Awaits to a ``list`` of ``ScanResult`` in request order.  An atomic
         multi-table transaction is never observed torn across the list.
         """
-        return await self._transport.scan_many(target_ids, include_hidden)
+        return self._transport.scan_many(target_ids, include_hidden)
 
-    async def seek(self, table_id, pk=0, include_hidden=False):
-        """Point-lookup by primary key.  Returns a ``ScanResult``."""
-        return await self._transport.seek(table_id, pk, include_hidden)
+    def seek(self, table_id, pk=0, include_hidden=False):
+        """Point-lookup by primary key.  Awaits to a ``ScanResult``."""
+        return self._transport.seek(table_id, pk, include_hidden)
 
     async def aclose(self):
         """Close the connection."""
@@ -117,7 +123,7 @@ class AsyncConnection:
 
         Inside the pipeline block, ``push()`` / ``scan()`` fire immediately
         without waiting for individual responses.  All responses are collected
-        when the block exits.
+        into ``pipe.results`` when the block exits.
 
         **FIFO ordering caveat:** pipelines are safe for homogeneous batches
         (all pushes to one table, or all reads).  Mixing pushes and reads
@@ -128,15 +134,18 @@ class AsyncConnection:
 
 
 class Pipeline:
-    """Batch multiple operations into a single pipeline.
+    """Collect several in-flight operations and gather them on block exit.
 
-    Results are available as ``pipe.results`` after the ``async with`` block.
+    The connection's own methods already submit on call, so this adds only the
+    bookkeeping: every operation started through the pipeline is remembered,
+    and ``pipe.results`` holds them in submission order after the ``async
+    with`` block.
     """
 
-    __slots__ = ("_transport", "_futures", "results")
+    __slots__ = ("_conn", "_futures", "results")
 
     def __init__(self, conn):
-        self._transport = conn._transport
+        self._conn = conn
         self._futures = []
         self.results = []
 
@@ -154,23 +163,21 @@ class Pipeline:
                 await asyncio.gather(*self._futures, return_exceptions=True)
         return False
 
-    def push(self, target_id, batch):
-        """Queue a push.  Does not ``await`` — sends immediately."""
-        fut = self._transport.push(target_id, batch)
+    def _track(self, fut):
         self._futures.append(fut)
         return fut
 
+    def push(self, target_id, batch):
+        """Queue a push.  Does not ``await`` — sends immediately."""
+        return self._track(self._conn.push(target_id, batch))
+
     def scan(self, target_id, include_hidden=False):
         """Queue a scan.  Does not ``await`` — sends immediately."""
-        fut = self._transport.scan(target_id, include_hidden)
-        self._futures.append(fut)
-        return fut
+        return self._track(self._conn.scan(target_id, include_hidden))
 
     def scan_many(self, target_ids, include_hidden=False):
         """Queue a consistent multi-relation scan.  Does not ``await``.
 
         Resolves to a ``list`` of ``ScanResult`` in request order.
         """
-        fut = self._transport.scan_many(target_ids, include_hidden)
-        self._futures.append(fut)
-        return fut
+        return self._track(self._conn.scan_many(target_ids, include_hidden))

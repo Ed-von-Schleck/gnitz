@@ -20,11 +20,6 @@ def _uid():
     return str(random.randint(100000, 999999))
 
 
-def _field_names(row):
-    """The row's *visible* field names (hidden key slots excluded)."""
-    return list(row._asdict().keys())
-
-
 def _live(client, vid, include_hidden=False):
     return [r for r in client.scan(vid, include_hidden=include_hidden) if r.weight > 0]
 
@@ -32,8 +27,8 @@ def _live(client, vid, include_hidden=False):
 def _assert_no_synthetic(rows):
     """No presented column may be a hidden key slot (leading `_`)."""
     for r in rows:
-        for name in _field_names(r):
-            assert not name.startswith("_"), f"synthetic key leaked into row: {name} in {_field_names(r)}"
+        for name in r._fields:
+            assert not name.startswith("_"), f"synthetic key leaked into row: {name} in {r._fields}"
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +61,7 @@ class TestSelectStarHidesKey:
             client.execute_sql("INSERT INTO b VALUES (1, 7, 200)", schema_name=sn)
             rows = _live(client, vid)
             assert len(rows) == 1, rows
-            assert set(_field_names(rows[0])) == {"av", "bv"}
+            assert set(rows[0]._fields) == {"av", "bv"}
             _assert_no_synthetic(rows)
             assert (rows[0]["av"], rows[0]["bv"]) == (100, 200)
         finally:
@@ -87,7 +82,7 @@ class TestSelectStarHidesKey:
             client.execute_sql("INSERT INTO b VALUES (1, 9, 200)", schema_name=sn)
             rows = _live(client, vid)
             assert len(rows) == 1, rows
-            assert set(_field_names(rows[0])) == {"av", "bv"}
+            assert set(rows[0]._fields) == {"av", "bv"}
             _assert_no_synthetic(rows)
         finally:
             client.drop_schema(sn)
@@ -107,7 +102,7 @@ class TestSelectStarHidesKey:
             client.execute_sql("INSERT INTO b VALUES (1, 7, 200)", schema_name=sn)
             rows = _live(client, vid)
             assert len(rows) == 1, rows
-            assert set(_field_names(rows[0])) == {"av"}
+            assert set(rows[0]._fields) == {"av"}
             _assert_no_synthetic(rows)
         finally:
             client.drop_schema(sn)
@@ -126,7 +121,7 @@ class TestSelectStarHidesKey:
             client.execute_sql("INSERT INTO a VALUES (1, 10)", schema_name=sn)
             client.execute_sql("INSERT INTO b VALUES (1, 20)", schema_name=sn)
             rows = _live(client, vid)
-            assert set(_field_names(rows[0])) == {"val"}
+            assert set(rows[0]._fields) == {"val"}
             _assert_no_synthetic(rows)
         finally:
             client.drop_schema(sn)
@@ -142,7 +137,7 @@ class TestSelectStarHidesKey:
             vid = client.resolve_table(sn, "dv")[0]
             client.execute_sql("INSERT INTO a VALUES (1, 10), (2, 10), (3, 20)", schema_name=sn)
             rows = _live(client, vid)
-            assert set(_field_names(rows[0])) == {"val"}
+            assert set(rows[0]._fields) == {"val"}
             _assert_no_synthetic(rows)
             assert sorted(r["val"] for r in rows) == [10, 20]
         finally:
@@ -168,7 +163,7 @@ class TestSelectStarHidesKey:
                 "INSERT INTO orders VALUES (1, 'x', 10), (2, 'x', 20), (3, 'y', 30)", schema_name=sn)
             rows = _live(client, vid)
             _assert_no_synthetic(rows)
-            names = set(_field_names(rows[0]))
+            names = set(rows[0]._fields)
             assert names == {"category", "cnt"}, names
             got = {r["category"]: r["cnt"] for r in rows}
             assert got == {"x": 2, "y": 1}, got
@@ -191,7 +186,7 @@ def test_simple_view_omits_unprojected_pk_and_downstream_cannot_name_it(client):
         vid = client.resolve_table(sn, "sv")[0]
         client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=sn)
         rows = _live(client, vid)
-        assert set(_field_names(rows[0])) == {"val"}
+        assert set(rows[0]._fields) == {"val"}
         _assert_no_synthetic(rows)
 
         # A downstream view naming the hidden PK by name fails cleanly.
@@ -267,13 +262,13 @@ def test_include_hidden_surfaces_join_pk(client):
 
         # Default: hidden.
         vis = _live(client, vid)
-        assert "_join_pk" not in _field_names(vis[0])
+        assert "_join_pk" not in vis[0]._fields
 
         # include_hidden: the synthetic key surfaces at its physical slot with the
         # decoded join-key value (7).
         raw = _live(client, vid, include_hidden=True)
         assert len(raw) == 1, raw
-        names = _field_names(raw[0])
+        names = raw[0]._fields
         assert names[0] == "_join_pk", names
         assert raw[0]["_join_pk"] == 7
         assert (raw[0]["av"], raw[0]["bv"]) == (100, 200)
@@ -306,7 +301,7 @@ def test_view_over_view_cascade_hidden_keys(client):
         client.execute_sql("INSERT INTO b VALUES (1, 7, 200)", schema_name=sn)
         rows = _live(client, vid)
         assert len(rows) == 1, rows
-        assert set(_field_names(rows[0])) == {"av", "bv"}
+        assert set(rows[0]._fields) == {"av", "bv"}
         _assert_no_synthetic(rows)
         assert (rows[0]["av"], rows[0]["bv"]) == (100, 200)
     finally:
