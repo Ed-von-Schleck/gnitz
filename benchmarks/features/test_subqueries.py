@@ -15,12 +15,12 @@ SKEW_S = 1.1
 
 
 def _p_seed(batch, k):
-    batch.append(id=k + 1, region=(k + 1) % 5, weight=1)
+    batch.append(id=k + 1, region=(k + 1) % 5)
 
 
 def _ch_factory(dim):
     return stream_factory(
-        lambda batch, pk, v, w: batch.append(id=pk, pid=v[0], v=pk % 1000, weight=w),
+        lambda batch, pk, v, w: batch.append(id=pk, pid=v[0], v=pk % 1000, _weight=w),
         lambda rng: (zipf_choice(rng, dim, SKEW_S),),
     )
 

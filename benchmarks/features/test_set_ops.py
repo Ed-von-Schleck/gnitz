@@ -17,7 +17,7 @@ VMOD = 500  # value domain: t1[1..dim] and t2[1..dim] share (pk, val) → overla
 
 
 _base_seed, _stream_build = seed_stream(
-    lambda batch, pk, w: batch.append(pk=pk, val=pk % VMOD, weight=w))
+    lambda batch, pk, w: batch.append(pk=pk, val=pk % VMOD, _weight=w))
 
 
 def _setup(client, sn, view_sql, dim, base):

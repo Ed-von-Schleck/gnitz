@@ -22,7 +22,7 @@ def _e_row(batch, pk, w):
     note = None if rng.random() < 0.3 else rng.choice(NATIONS)
     batch.append(pk=pk, name=rng.choice(NATIONS), mode=rng.choice(SHIPMODES),
                  d=rng.randint(0, 300), disc=round(rng.uniform(0.0, 0.1), 3),
-                 note=note, v=rng.randint(0, 1000), weight=w)
+                 note=note, v=rng.randint(0, 1000), _weight=w)
 
 
 _base_seed, _stream = seed_stream(_e_row)

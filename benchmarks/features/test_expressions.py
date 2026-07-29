@@ -19,7 +19,7 @@ def _e_row(batch, pk, w):
     rng = random.Random(pk)
     b = None if rng.random() < 0.1 else rng.randint(0, 1000)
     batch.append(pk=pk, a=rng.randint(0, 20), b=b, price=rng.randint(100, 100000),
-                 disc=round(rng.uniform(0.0, 0.1), 2), weight=w)
+                 disc=round(rng.uniform(0.0, 0.1), 2), _weight=w)
 
 
 _base_seed, _stream = seed_stream(_e_row)

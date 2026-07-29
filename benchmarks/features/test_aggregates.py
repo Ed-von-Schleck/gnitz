@@ -24,7 +24,7 @@ def _e_row(batch, pk, w):
                  g2=rng.randint(0, 50), flag=rng.choice(STATUS),
                  flag2=rng.choice(SHIPMODES), g=rng.randint(0, 100),
                  price=rng.randint(100, 100000), disc=round(rng.uniform(0.0, 0.1), 2),
-                 weight=w)
+                 _weight=w)
 
 
 _base_seed, _stream = seed_stream(_e_row)

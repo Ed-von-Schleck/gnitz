@@ -47,11 +47,11 @@ def _atomic_worker(socket_path, sn, k_lines, ops, widx, barrier, queue):
             try:
                 with c.transaction() as txn:
                     ob = gnitz.ZSetBatch(o_sch)
-                    ob.append(o_key=okey, o_cust=(okey % 97) + 1, o_amt=100, weight=1)
+                    ob.append(o_key=okey, o_cust=(okey % 97) + 1, o_amt=100)
                     txn.push(o_tid, ob)
                     lb = gnitz.ZSetBatch(l_sch)
                     for ln in range(1, k_lines + 1):
-                        lb.append(l_order=okey, l_line=ln, l_qty=ln, weight=1)
+                        lb.append(l_order=okey, l_line=ln, l_qty=ln)
                     txn.push(l_tid, lb)
                 commits += 1
             except gnitz.GnitzConflictError:
@@ -128,7 +128,7 @@ def test_begin_commit_overhead(client, schema_name, bench_timer, scale_mode, var
 
     def one_row_batch(pk):
         b = gnitz.ZSetBatch(schema)
-        b.append(pk=pk, v=pk, weight=1)
+        b.append(pk=pk, v=pk)
         return b
 
     if variant == "empty_begin_commit":

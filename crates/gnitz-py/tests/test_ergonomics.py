@@ -2,12 +2,13 @@
 test_ergonomics.py — Full coverage for the Python ergonomics API.
 
 Section 1: Offline (no server)
-    TestTypeCode, TestColumnDef, TestSchema,
-    TestRow, TestZSetBatchErrors, TestScanResultType
+    TestTypeCode, TestColumnDef, TestSchema, TestRow, TestZSetBatchErrors,
+    TestAppendKeywordPlan, TestScanResultType
 
 Section 2: Online (server required, uses `client` fixture from conftest.py)
     TestZSetBatchExtend, TestScanResultMethods, TestRowAccess
 """
+import inspect
 import random
 import typing
 import pytest
@@ -421,6 +422,201 @@ class TestUuidAndBlobRoundtrip:
         assert cols[1] == [b"hello\x00world"]
 
 
+# `append` resolves a call site's keyword-name tuple into a write plan once and
+# reuses it. The tests below pin what that caching must not change.
+
+_PK_TYPES = [TypeCode.U8, TypeCode.I8, TypeCode.U16, TypeCode.I16,
+             TypeCode.U32, TypeCode.I32, TypeCode.U64, TypeCode.I64,
+             TypeCode.U128, TypeCode.UUID, TypeCode.I128]
+_PAYLOAD_ONLY_TYPES = [TypeCode.F32, TypeCode.F64, TypeCode.STRING, TypeCode.BLOB]
+_ALL_TYPES = _PK_TYPES + _PAYLOAD_ONLY_TYPES
+
+_RANGES = {
+    TypeCode.U8:  (0, 255),          TypeCode.I8:  (-128, 127),
+    TypeCode.U16: (0, 65535),        TypeCode.I16: (-32768, 32767),
+    TypeCode.U32: (0, 2**32 - 1),    TypeCode.I32: (-(2**31), 2**31 - 1),
+    TypeCode.U64: (0, 2**64 - 1),    TypeCode.I64: (-(2**63), 2**63 - 1),
+}
+
+
+def _rand_value(rng, tc):
+    if tc in _RANGES:
+        return rng.randint(*_RANGES[tc])
+    if tc in (TypeCode.U128, TypeCode.UUID):
+        return rng.getrandbits(128)
+    if tc is TypeCode.I128:
+        return rng.randint(-(2**127), 2**127 - 1)
+    if tc in (TypeCode.F32, TypeCode.F64):
+        return rng.uniform(-1e6, 1e6)
+    if tc is TypeCode.STRING:
+        return "s%d" % rng.randint(0, 10**6)
+    if tc is TypeCode.BLOB:
+        return bytes(rng.randrange(256) for _ in range(rng.randint(0, 5)))
+    raise AssertionError("unhandled type code %r" % (tc,))
+
+
+class TestAppendKeywordPlan:
+
+    def test_matches_dict_path_across_random_schemas(self):
+        """`append(**row)` and `extend([row])` are separate writers — one reads a
+        resolved keyword plan, the other looks each column up in a dict. They must
+        produce byte-identical batches for any schema, and between them the two
+        paths cover every type code."""
+        rng = random.Random(20260729)
+        seen = set()
+        for _ in range(2000):
+            ncols = rng.randint(2, 8)
+            npk = rng.randint(1, min(3, ncols - 1))
+            spec = []
+            for i in range(ncols):
+                is_pk = i < npk
+                tc = rng.choice(_PK_TYPES if is_pk else _ALL_TYPES)
+                seen.add(tc)
+                spec.append(("c%d" % i, tc, not is_pk and rng.random() < 0.4))
+            schema = Schema([ColumnDef(n, tc, is_nullable=nul) for n, tc, nul in spec],
+                            pk_indices=list(range(npk)))
+
+            row = {}
+            for name, tc, nullable in spec:
+                if nullable and rng.random() < 0.35:
+                    if rng.random() < 0.5:
+                        continue                    # omitted -> NULL
+                    row[name] = None                # explicit None -> NULL
+                else:
+                    row[name] = _rand_value(rng, tc)
+            keys = list(row)
+            rng.shuffle(keys)
+            row = {k: row[k] for k in keys}
+            weight = rng.choice([1, -1, 7])
+
+            got = ZSetBatch(schema)
+            got.append(_weight=weight, **row)
+            ref = ZSetBatch(schema)
+            ref.extend([dict(row, _weight=weight)])
+            assert got.pks == ref.pks
+            assert got.columns == ref.columns
+            assert got.weights == ref.weights == [weight]
+        assert seen == set(_ALL_TYPES)
+
+    def test_cycling_call_sites_keeps_every_row_correct(self):
+        """Rows arrive through a cache of resolved call sites. Cycling far more
+        keyword shapes than that cache holds must not let one row's plan write
+        another's row."""
+        cols = [ColumnDef("pk", TypeCode.U64, primary_key=True)] + [
+            ColumnDef("c%d" % i, TypeCode.I64, is_nullable=True) for i in range(5)]
+        schema = Schema(cols)
+        names = [c.name for c in cols[1:]]
+
+        rng = random.Random(7)
+        rows = []
+        for pk in range(500):
+            present = rng.sample(names, rng.randint(0, len(names)))
+            rng.shuffle(present)
+            rows.append(dict({"pk": pk}, **{n: pk * 10 + int(n[1:]) for n in present}))
+
+        batch = ZSetBatch(schema)
+        for row in rows:
+            batch.append(**row)
+        assert batch.pks == [r["pk"] for r in rows]
+        for col_i, name in enumerate(names, start=1):
+            assert batch.columns[col_i] == [r.get(name) for r in rows]
+
+    def test_weight_keyword_yields_to_a_column_of_that_name(self):
+        """`_weight` names the row weight only when no column claims it. The
+        schema is the authority, and both writers have to agree on that."""
+        schema = Schema([
+            ColumnDef("pk", TypeCode.U64, primary_key=True),
+            ColumnDef("_weight", TypeCode.I64),
+        ])
+        got = ZSetBatch(schema).append(pk=1, _weight=5)
+        ref = ZSetBatch(schema).extend([{"pk": 1, "_weight": 5}])
+        assert got.columns == ref.columns == [[], [5]]
+        assert got.weights == ref.weights == [1]
+        # The batch-wide parameter still reaches such a schema.
+        assert ZSetBatch(schema).extend([{"pk": 1, "_weight": 5}], -1).weights == [-1]
+
+    def test_one_name_feeds_every_column_that_has_it(self):
+        """A hidden column may shadow a visible one's name. The plan is resolved
+        by walking the schema, so both columns get the value — resolving
+        name->column instead would leave the shadow NULL (or fail outright, were
+        it NOT NULL)."""
+        schema = Schema([
+            ColumnDef("pk", TypeCode.U64, primary_key=True),
+            ColumnDef("v",  TypeCode.I64),
+            ColumnDef("v",  TypeCode.I64, is_hidden=True),
+        ])
+        batch = ZSetBatch(schema)
+        batch.append(pk=1, v=7)
+        assert batch.columns == [[], [7], [7]]
+
+    def test_unknown_keyword_raises_type_error_and_rolls_back(self):
+        """`weight=` used to be dropped silently, writing the row at +1."""
+        schema = Schema([
+            ColumnDef("pk",  TypeCode.U64, primary_key=True),
+            ColumnDef("val", TypeCode.I64),
+        ])
+        batch = ZSetBatch(schema).append(pk=1, val=10)
+        with pytest.raises(TypeError, match="_weight"):
+            batch.append(pk=2, val=20, weight=-1)
+        assert len(batch) == 1
+        assert batch.pks == [1]
+
+    def test_extend_rejects_unknown_key(self):
+        schema = Schema([
+            ColumnDef("pk",  TypeCode.U64, primary_key=True),
+            ColumnDef("val", TypeCode.I64),
+        ])
+        batch = ZSetBatch(schema)
+        with pytest.raises(TypeError, match="_weight"):
+            batch.extend([{"pk": 1, "val": 10, "weight": -1}])
+        assert len(batch) == 0
+
+    def test_positional_argument_rejected(self):
+        schema = Schema([
+            ColumnDef("pk",  TypeCode.U64, primary_key=True),
+            ColumnDef("val", TypeCode.I64),
+        ])
+        with pytest.raises(TypeError, match="positional"):
+            ZSetBatch(schema).append(1, val=10)
+
+    def test_bad_weight_names_the_argument(self):
+        schema = Schema([
+            ColumnDef("pk",  TypeCode.U64, primary_key=True),
+            ColumnDef("val", TypeCode.I64),
+        ])
+        with pytest.raises(TypeError, match="_weight"):
+            ZSetBatch(schema).append(pk=1, val=10, _weight=1.5)
+
+    def test_reentrant_append_raises_instead_of_aborting(self):
+        """`extract` runs `__index__`, which can call back into the same batch.
+        The raw method slot has no unwind guard, so this must come back as a
+        Python exception — a Rust panic here would abort the interpreter."""
+        schema = Schema([
+            ColumnDef("pk",  TypeCode.U64, primary_key=True),
+            ColumnDef("val", TypeCode.I64),
+        ])
+        batch = ZSetBatch(schema)
+
+        class Reenter:
+            def __index__(self):
+                batch.append(pk=99, val=99)
+                return 5
+
+        with pytest.raises(RuntimeError):
+            batch.append(pk=1, val=Reenter())
+        assert len(batch) == 0
+        batch.append(pk=2, val=2)          # still usable
+        assert batch.pks == [2]
+
+    def test_signature_is_introspectable(self):
+        """There are no .pyi stubs, so the method's own text signature is the
+        entire discoverability surface for the `_weight` spelling."""
+        sig = inspect.signature(ZSetBatch.append)
+        assert "_weight" in sig.parameters
+        assert ZSetBatch.append.__doc__
+        assert "_weight" in ZSetBatch.append.__doc__
+
+
 class TestScanResultType:
     """gnitz.ScanResult must be the native Rust type (not the old Python shim)."""
 
@@ -449,6 +645,23 @@ def _push_rows(client, tid, schema, pk_val_pairs, weight=1):
     for pk, val in pk_val_pairs:
         batch.append(pk=pk, val=val, _weight=weight)
     client.push(tid, batch)
+
+
+class TestAppendWeightsServerBacked:
+    """Weights written through the keyword plan have to reach the engine and
+    accumulate there, not merely land in the batch."""
+
+    def test_weights_survive_mixed_call_sites(self, client):
+        sn, tid, schema = _make_table(client)
+        batch = ZSetBatch(schema)
+        batch.append(pk=1, val=10)                 # one call site
+        batch.append(val=20, pk=2, _weight=3)      # a second: different shape
+        batch.append(**{"pk": 3, "val": 30})       # a third: splat
+        batch.append(pk=1, val=10, _weight=-1)     # retracts the first
+        assert batch.weights == [1, 3, 1, -1]
+        client.push(tid, batch)
+        result = client.scan(tid)
+        assert {row.pk: row.val for row in result} == {2: 20, 3: 30}
 
 
 class TestZSetBatchExtend:

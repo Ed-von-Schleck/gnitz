@@ -28,7 +28,7 @@ def _run(client, sn, bench_timer, table, ddl, view_ddl, read_view, row_fn, sz):
 def test_string_key(client, schema_name, bench_timer, scale_mode):
     def row(b, pk, w):
         rng = random.Random(pk)
-        b.append(pk=pk, g=NATIONS[pk % len(NATIONS)], v=rng.randint(0, 1000), weight=w)
+        b.append(pk=pk, g=NATIONS[pk % len(NATIONS)], v=rng.randint(0, 1000), _weight=w)
     _run(client, schema_name, bench_timer, "t",
          "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g TEXT NOT NULL, v BIGINT NOT NULL)",
          "CREATE VIEW v AS SELECT g, SUM(v) AS s, COUNT(*) AS n FROM t GROUP BY g",
@@ -38,7 +38,7 @@ def test_string_key(client, schema_name, bench_timer, scale_mode):
 def test_float_payload(client, schema_name, bench_timer, scale_mode):
     def row(b, pk, w):
         rng = random.Random(pk)
-        b.append(pk=pk, g=pk % NGROUP, f=round(rng.uniform(0.0, 1000.0), 4), weight=w)
+        b.append(pk=pk, g=pk % NGROUP, f=round(rng.uniform(0.0, 1000.0), 4), _weight=w)
     _run(client, schema_name, bench_timer, "t",
          "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, f DOUBLE NOT NULL)",
          "CREATE VIEW v AS SELECT g, SUM(f) AS s, AVG(f) AS a FROM t GROUP BY g",
@@ -48,7 +48,7 @@ def test_float_payload(client, schema_name, bench_timer, scale_mode):
 def test_compound_pk_base(client, schema_name, bench_timer, scale_mode):
     def row(b, pk, w):
         rng = random.Random(pk)
-        b.append(l_order=pk, l_line=1, l_ship=pk % NGROUP, l_qty=rng.randint(1, 50), weight=w)
+        b.append(l_order=pk, l_line=1, l_ship=pk % NGROUP, l_qty=rng.randint(1, 50), _weight=w)
     _run(client, schema_name, bench_timer, "li",
          "CREATE TABLE li (l_order BIGINT NOT NULL, l_line BIGINT NOT NULL, "
          "l_ship BIGINT NOT NULL, l_qty BIGINT NOT NULL, PRIMARY KEY (l_order, l_line))",
@@ -60,7 +60,7 @@ def test_narrow_ints(client, schema_name, bench_timer, scale_mode):
     def row(b, pk, w):
         rng = random.Random(pk)
         b.append(pk=pk, g=pk % NGROUP, a=rng.randint(-100, 100), bb=rng.randint(-1000, 1000),
-                 c=rng.randint(0, 2000), weight=w)
+                 c=rng.randint(0, 2000), _weight=w)
     _run(client, schema_name, bench_timer, "t",
          "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
          "a SMALLINT NOT NULL, bb INT NOT NULL, c INT UNSIGNED NOT NULL)",
@@ -71,7 +71,7 @@ def test_narrow_ints(client, schema_name, bench_timer, scale_mode):
 def test_u128_uuid_key(client, schema_name, bench_timer, scale_mode):
     def row(b, pk, w):
         rng = random.Random(pk)
-        b.append(pk=pk, uid=rng.getrandbits(120), v=rng.randint(0, 1000), weight=w)
+        b.append(pk=pk, uid=rng.getrandbits(120), v=rng.randint(0, 1000), _weight=w)
     _run(client, schema_name, bench_timer, "t",
          "CREATE TABLE t (pk DECIMAL(38,0) NOT NULL PRIMARY KEY, uid UUID NOT NULL, v BIGINT NOT NULL)",
          "CREATE VIEW v AS SELECT pk, uid, v FROM t",

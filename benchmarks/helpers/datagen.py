@@ -227,24 +227,23 @@ def bulk_load(
     """
     tid, schema = conn.resolve_table(schema_name, table_name)
     rng = random.Random(seed)
+    # Hoisted: every ColumnDef attribute read crosses into Rust and builds a
+    # fresh str, which at ~20 reads per row dominates the loop below.
+    spec = [(c.name, getattr(c, "is_nullable", False), c) for c in columns if c.name != "pk"]
     pks = []
     i = 1
     while i <= num_rows:
         batch = gnitz.ZSetBatch(schema)
         end = min(i + chunk, num_rows + 1)
-        rows = []
         for k in range(i, end):
             row = {"pk": k}
-            for col in columns:
-                if col.name == "pk":
-                    continue
-                if getattr(col, "is_nullable", False) and rng.random() < null_rate:
-                    row[col.name] = None
+            for name, nullable, col in spec:
+                if nullable and rng.random() < null_rate:
+                    row[name] = None
                 else:
-                    row[col.name] = gen_value(rng, col, k, pools, skew)
-            rows.append(row)
+                    row[name] = gen_value(rng, col, k, pools, skew)
+            batch.append(**row)
             pks.append(k)
-        batch.extend(rows)
         conn.push(tid, batch)
         i = end
     return pks

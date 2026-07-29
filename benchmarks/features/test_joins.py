@@ -52,7 +52,7 @@ def _load_dim_b(client, sn, dim):
 
 def _fact_ab(dim):
     return stream_factory(
-        lambda batch, pk, v, w: batch.append(pk=pk, k=v[0], av=v[1], weight=w),
+        lambda batch, pk, v, w: batch.append(pk=pk, k=v[0], av=v[1], _weight=w),
         lambda rng: (zipf_choice(rng, dim, SKEW_S), rng.randint(0, 1000)),
     )
 
@@ -119,7 +119,7 @@ def test_self(client, schema_name, bench_timer, scale_mode):
     _seed(client, sn, "emp",
           lambda b, i: b.append(id=i + 1, mgr=(i % dim) + 1, sal=(i * 11) % 100000), dim)
     base, stream = stream_factory(
-        lambda batch, pk, v, w: batch.append(id=pk, mgr=v[0], sal=v[1], weight=w),
+        lambda batch, pk, v, w: batch.append(id=pk, mgr=v[0], sal=v[1], _weight=w),
         lambda rng: (zipf_choice(rng, dim, SKEW_S), rng.randint(0, 100000)),
     )
     _seed(client, sn, "emp", base, sz["base"])
@@ -141,7 +141,7 @@ def test_band(client, schema_name, bench_timer, scale_mode):
                        "FROM ba JOIN bb ON ba.k = bb.k AND ba.lo <= bb.t", schema_name=sn)
     _seed(client, sn, "bb", lambda b, i: b.append(pk=i + 1, k=i + 1, t=500), dim)
     base, stream = stream_factory(
-        lambda batch, pk, v, w: batch.append(pk=pk, k=v[0], lo=v[1], weight=w),
+        lambda batch, pk, v, w: batch.append(pk=pk, k=v[0], lo=v[1], _weight=w),
         lambda rng: (zipf_choice(rng, dim, SKEW_S), rng.randint(0, 1000)),
     )
     _seed(client, sn, "ba", base, sz["base"])
@@ -162,7 +162,7 @@ def _make_range(client, sn):
 
 def _range_factory():
     return stream_factory(
-        lambda batch, pk, v, w: batch.append(pk=pk, x=v[0], weight=w),
+        lambda batch, pk, v, w: batch.append(pk=pk, x=v[0], _weight=w),
         lambda rng: (rng.randint(0, RANGE_DIM),),
     )
 
@@ -212,7 +212,7 @@ def test_compound_key(client, schema_name, bench_timer, scale_mode):
     _seed(client, sn, "cb",
           lambda b, i: b.append(pk=i + 1, x=(i % half) + 1, y=i // half, bv=(i * 5) % 1000), dim)
     base, stream = stream_factory(
-        lambda batch, pk, v, w: batch.append(pk=pk, x=v[0], y=v[1], av=v[2], weight=w),
+        lambda batch, pk, v, w: batch.append(pk=pk, x=v[0], y=v[1], av=v[2], _weight=w),
         lambda rng: (zipf_choice(rng, half, SKEW_S), rng.randint(0, 1), rng.randint(0, 1000)),
     )
     _seed(client, sn, "ca", base, sz["base"])

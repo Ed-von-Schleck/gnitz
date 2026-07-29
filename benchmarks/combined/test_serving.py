@@ -39,7 +39,7 @@ def _setup(client, sn, groups):
     tid, schema = client.resolve_table(sn, "o")
     b = gnitz.ZSetBatch(schema)
     for k in range(1, groups + 1):
-        b.append(pk=k, cust=k, amt=(k % 100) + 1, weight=1)
+        b.append(pk=k, cust=k, amt=(k % 100) + 1)
     client.push(tid, b)
 
 

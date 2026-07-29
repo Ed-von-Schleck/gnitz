@@ -82,11 +82,11 @@ def test_htap(client, socket_path, schema_name, bench_timer, scale_mode):
             with conn.transaction() as txn:
                 ob = gnitz.ZSetBatch(wo_sch)
                 ob.append(o_key=okey, o_cust=(okey % N_CUST) + 1,
-                          o_status=STATUS[okey % len(STATUS)], o_price=wrng.randint(100, 50000), weight=1)
+                          o_status=STATUS[okey % len(STATUS)], o_price=wrng.randint(100, 50000))
                 txn.push(wo_tid, ob)
                 lb = gnitz.ZSetBatch(wl_sch)
                 for ln in range(1, K + 1):
-                    lb.append(l_order=okey, l_line=ln, l_qty=ln, weight=1)
+                    lb.append(l_order=okey, l_line=ln, l_qty=ln)
                 txn.push(wl_tid, lb)
             commits += 1
             prod = zipf_choice(wrng, products, SKEW_S)
