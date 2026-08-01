@@ -91,6 +91,29 @@ def test_scan_many_two_tables_quiescent(client):
         client.drop_schema(sn)
 
 
+def test_scan_many_with_one_empty_relation(client):
+    """The results stay lined up with the requested tids when a relation is empty
+    on every worker. Such a relation contributes no worker frame at all — the
+    master forwards only frames carrying rows or a schema block — so its train is
+    delimited by its master-authored terminal alone."""
+    sn = "sm" + _uid()
+    client.create_schema(sn)
+    try:
+        a, a_sch = _kv_table(client, sn, "a")
+        empty, _ = _kv_table(client, sn, "empty")
+        b, b_sch = _kv_table(client, sn, "b")
+        client.push(a, _batch(a_sch, [(pk, pk * 10) for pk in range(20)]))
+        client.push(b, _batch(b_sch, [(99, 990)]))
+
+        res = client.scan_many([a, empty, b])
+        assert len(res) == 3
+        assert _pks(res[0]) == set(range(20))
+        assert len(res[1]) == 0
+        assert _pks(res[2]) == {99}
+    finally:
+        client.drop_schema(sn)
+
+
 # ---------------------------------------------------------------------------
 # Headline: torn-commit impossibility
 # ---------------------------------------------------------------------------

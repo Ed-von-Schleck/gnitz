@@ -6,9 +6,10 @@
 //! Nothing between the source chunk and the sink is materialized. No DBSP
 //! circuit, no operator state, no exchange.
 //!
-//! The reply schema arrives as the client's raw echoed wire block (decoded by the
-//! worker one layer up); this module takes the decoded `SchemaDescriptor` and
-//! never rebuilds the block.
+//! The reply schema arrives as the client's raw wire block (decoded by the
+//! worker one layer up); this module takes the decoded `SchemaDescriptor`. The
+//! block itself never leaves the request — the client decodes the reply against
+//! its own copy.
 
 use std::cmp::Ordering;
 
@@ -31,9 +32,9 @@ const MAX_WORKER_TOPK: u64 = 65_536;
 impl CatalogEngine {
     /// Execute `spec` against `target_id` on this worker's merged partition
     /// cursor, returning one keeper batch in the `reply_schema` shape. The caller
-    /// (the worker dispatch arm) decoded `reply_schema` from the client's echoed
-    /// wire block and replies by force-including those raw bytes; this method does
-    /// the bound walk, predicate, projection, and ORDER BY / LIMIT reduction.
+    /// (the worker dispatch arm) decoded `reply_schema` from the client's wire
+    /// block and replies with no block at all; this method does the bound walk,
+    /// predicate, projection, and ORDER BY / LIMIT reduction.
     ///
     /// `Err` on a corrupt program blob, a reply schema that does not match the
     /// sink's expected shape (rows: PK-stride equality; fold: the derived
@@ -94,7 +95,7 @@ impl CatalogEngine {
                 // `reply_schema`'s strides, so the reply must be the source schema
                 // outright; the fold sink checks the same way
                 // (`AdhocFold::new`). The trusted planner always matches; this
-                // guards the echoed client blob. (A fold sink emits a synthetic
+                // guards the client's blob. (A fold sink emits a synthetic
                 // `_agg_pk` PK and never byte-copies the source PK, so the stride
                 // half is rows-sink-only.)
                 let projection = match projection.is_empty() {

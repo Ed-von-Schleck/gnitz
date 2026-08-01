@@ -237,10 +237,10 @@ impl MasterDispatcher {
     /// Write one ScanSpec (`ReadSpec`) group: the plain-scan shape plus the
     /// `FLAG_SCAN_SPEC` SAL dispatch flag and the client's bundled spec +
     /// reply-schema blob forwarded **verbatim** in `seek_pk_extra`. The master
-    /// never decodes the blob (the worker is the sole `ReadSpec`/OPK decoder), and
-    /// the worker's ScanSpec handler reads its reply schema out of the blob.
-    /// `wire_flags = 0`: the worker echoes the client's block rather than
-    /// negotiating a schema version.
+    /// reads only the bound header out of the spec, to route (`confined_worker`);
+    /// the worker is the sole `ReadSpec`/OPK decoder and the only reader of the
+    /// reply-schema half. `wire_flags = 0`: the reply carries no schema block, so
+    /// there is no schema version to negotiate.
     pub(super) fn write_scan_spec_group(
         &mut self,
         target_id: i64,
@@ -1175,8 +1175,9 @@ impl MasterDispatcher {
     /// ScanSpec (`ReadSpec`) fan-out — the exact `fan_out_scan` shape, but
     /// the group is written by `write_scan_spec_group` (carrying `FLAG_SCAN_SPEC`
     /// and the client's verbatim `seek_pk_extra` blob) and there is no schema-
-    /// version negotiation: the worker's reply force-includes the client's echoed
-    /// block, so no per-worker version is threaded. `unicast` comes from
+    /// version negotiation: the reply carries no schema block at all — the client
+    /// decodes against the schema it authored — so no per-worker version is
+    /// threaded. `unicast` comes from
     /// [`scan_spec_route`], and the reply-train forwarding + error contract are
     /// shared with the plain scan.
     #[allow(clippy::too_many_arguments)]
@@ -1613,12 +1614,14 @@ async fn forward_scan_slots(
 
 /// Forward one worker's SCAN continuation train to the client: send each frame
 /// to `peer` (dropping it before awaiting the next, per the W2M ring contract)
-/// and loop until the train header reports no more frames. `slot` is the first,
+/// and loop until the train header reports no more frames. A frame carrying
+/// neither rows nor a schema block is dropped instead of forwarded — on a
+/// selective broadcast read that is W−1 of the W trains. `slot` is the first,
 /// already-awaited frame. Returns `Ok(false)` if the client disconnects
 /// mid-stream and `Err` on a malformed train header. Called by
 /// `forward_scan_slots`, once per drained train (one per worker, or a single
 /// one under unicast).
-async fn drain_scan_train(
+pub(super) async fn drain_scan_train(
     reactor: &crate::runtime::reactor::Reactor,
     peer: &Peer,
     mut slot: W2mSlot,
@@ -1626,14 +1629,22 @@ async fn drain_scan_train(
     worker: usize,
 ) -> Result<bool, String> {
     loop {
-        let (_, has_more) = parse_train_header(&slot, worker, "scan")?;
-        // Deadline-guarded (built into `send_slot`): a client that stops
-        // draining this zero-copy ring slot is evicted, rc goes negative, and
-        // this returns Ok(false); the caller drops the `ScanLease`, discarding
-        // the rest of the train and advancing consume_cursor so the worker
-        // unblocks.
-        let rc = peer.send_slot(slot).await;
-        if rc < 0 {
+        let (ctrl, has_more) = parse_train_header(&slot, worker, "scan")?;
+        // A frame with neither rows nor a schema block holds nothing the client
+        // can observe, and nothing a later frame could decode against. Drop it
+        // here rather than at the next reassignment: that releases the slot at
+        // the ring now, so a worker parked on a full ring is not held across the
+        // await below. A fault frame never gets here — `parse_train_header`
+        // returns `Err` on a non-zero status — and the train's terminal frame is
+        // master-authored, so the client still sees the train end.
+        //
+        // The send is deadline-guarded inside `send_slot`: a client that stops
+        // draining this zero-copy slot is evicted, rc goes negative, and the
+        // caller drops the `ScanLease`, discarding the rest of the train and
+        // advancing consume_cursor so the worker unblocks.
+        if ctrl.flags & (FLAG_HAS_DATA | FLAG_HAS_SCHEMA) == 0 {
+            drop(slot);
+        } else if peer.send_slot(slot).await < 0 {
             return Ok(false);
         }
         if !has_more {

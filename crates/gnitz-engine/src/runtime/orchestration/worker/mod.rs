@@ -270,35 +270,28 @@ fn debug_env_usize(var: &str) -> Option<usize> {
     }
 }
 
-/// Provenance of the schema attached to a worker reply, declared by the
-/// dispatch arm that knows where the descriptor came from.
+/// Which schema wire block a worker reply carries, declared by the dispatch arm
+/// that knows where the descriptor came from. Resolved by `reply_schema_block`;
+/// the descriptor never reaches the encoder (a block, when one is emitted,
+/// supersedes it).
 ///
 /// `Table` is the target table's own schema: the reply may serve (and
 /// populate) the table's cached schema wire block. `OneOff` is a projected or
 /// synthetic schema — Gather's projection, HasPk UniqueIndex's index schema —
 /// whose block is built fresh per reply: serving the table's cached block for
 /// those would make the master decode the frames with the table's row stride,
-/// and caching them would poison the table's block. `Echoed` is a client-echoed
-/// raw wire block (ScanSpec): the block is forwarded verbatim (never rebuilt —
-/// the engine descriptor drops the hidden flags) and is **always included** on
-/// the reply's first frame at version 0, since the cache-bypassing client has
-/// no schema cache to fall back on; the descriptor (its decoded form) drives
-/// only the wire-safe / chunking decision.
+/// and caching them would poison the table's block. `ClientAuthored` is the
+/// ScanSpec reply schema the client built and shipped in `seek_pk_extra`: the
+/// client decodes the reply against its own copy, so no block is emitted, and
+/// the descriptor answers only `schema_wire_safe` — `ReplySchema::None` would
+/// claim wire-safe unconditionally and send a STRING projection down the
+/// chunking path.
 #[derive(Clone, Copy)]
 enum ReplySchema<'a> {
     None,
     Table(&'a SchemaDescriptor),
     OneOff(&'a SchemaDescriptor),
-    Echoed(&'a SchemaDescriptor, &'a [u8]),
-}
-
-impl<'a> ReplySchema<'a> {
-    fn descriptor(self) -> Option<&'a SchemaDescriptor> {
-        match self {
-            ReplySchema::None => None,
-            ReplySchema::Table(s) | ReplySchema::OneOff(s) | ReplySchema::Echoed(s, _) => Some(s),
-        }
-    }
+    ClientAuthored(&'a SchemaDescriptor),
 }
 
 /// Filter a check-batch to the rows whose PK `exists` accepts, copying each
@@ -899,11 +892,9 @@ impl WorkerProcess {
 
             SalMessageKind::ScanSpec => {
                 // The control block's `seek_pk_extra` bundles the encoded `ReadSpec`
-                // and the client's raw reply-schema wire block. Decode the spec and
-                // the reply schema (a structural decode with the hidden flags dropped
-                // — the engine `SchemaDescriptor` carries none); the raw block is
-                // echoed verbatim on the reply's first frame (`ReplySchema::Echoed`,
-                // never rebuilt, never version-gated).
+                // and the client's reply-schema wire block. Decoding the block both
+                // validates it and gives `scan_spec_family` its output shape; it goes
+                // no further, since the client decodes the reply against its own copy.
                 let (spec_bytes, reply_block) =
                     gnitz_wire::unpack_scan_spec_extra(&seek_pk_extra).map_err(|e| format!("scan_spec: {e}"))?;
                 let spec = gnitz_wire::ReadSpec::decode(spec_bytes).map_err(|e| format!("scan_spec: {e}"))?;
@@ -913,7 +904,7 @@ impl WorkerProcess {
                 self.send_scan_response(
                     target_id as u64,
                     Rc::new(keeper),
-                    ReplySchema::Echoed(&reply_schema, reply_block),
+                    ReplySchema::ClientAuthored(&reply_schema),
                     request_id,
                     client_id,
                     0,

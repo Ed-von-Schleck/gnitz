@@ -203,9 +203,9 @@ pub fn encode_message_noschema_parts(
 /// Encode the client's meta-schema WAL block for `schema` under table id `tid`
 /// — the exact bytes a schema-bearing push embeds (the `encode_wal_block(
 /// meta_schema(), tid, &schema_to_batch(s))` expression `encode_message_parts`
-/// uses). Shared by the plain-push encoder and the always-schema-bearing
-/// `FLAG_PUSH_TXN` per-family block.
-pub fn encode_schema_block(schema: &Schema, tid: u32) -> Vec<u8> {
+/// uses). Shared by the plain-push encoder, the always-schema-bearing
+/// `FLAG_PUSH_TXN` per-family block, and the ScanSpec request's reply schema.
+pub(crate) fn encode_schema_block(schema: &Schema, tid: u32) -> Vec<u8> {
     encode_wal_block(meta_schema(), tid, &schema_to_batch(schema))
 }
 

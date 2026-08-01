@@ -35,7 +35,6 @@ use crate::validate::{
     HonoredClauses, HonoredQueryClauses,
 };
 use crate::SqlResult;
-use gnitz_core::protocol::encode_schema_block;
 use gnitz_core::{GnitzClient, ReduceOutKey, Schema, ZSetBatch, MAX_COLUMNS};
 use gnitz_wire::{AggReadItem, AggReadSpec, ReadBound, ReadSink, ReadSpec};
 use sqlparser::ast::{Expr, LimitClause, Query, Select, SetExpr};
@@ -321,8 +320,7 @@ fn plan_read_spec(
     // OFFSET+LIMIT logical rows; `0` = unbounded (an OFFSET with no LIMIT too).
     let limit_k = limit.map(|l| l.saturating_add(offset) as u64).unwrap_or(0);
 
-    // 6. Ship the spec + the reply-schema wire block (with hidden flags).
-    let reply_block = encode_schema_block(&reply_schema, tid as u32);
+    // 6. Ship the spec; the reply schema is the one we built.
     let spec = ReadSpec {
         bound,
         predicate,
@@ -332,19 +330,16 @@ fn plan_read_spec(
             limit_k,
         },
     };
-    let (recv_schema, batch) = client
-        .scan_spec(tid, &spec.encode(), &reply_block)
+    let batch = client
+        .scan_spec(tid, &spec.encode(), &reply_schema)
         .map_err(GnitzSqlError::Exec)?;
 
     // 7. Client finish: sort the concatenation by the wire keys, window, present.
-    //    Decode against the echoed schema (the batch's own layout), falling back
-    //    to the block we built.
-    let out_schema = recv_schema.map(|s| (*s).clone()).unwrap_or(reply_schema);
-    let batch = batch.unwrap_or_else(|| ZSetBatch::new(&out_schema));
+    let batch = batch.unwrap_or_else(|| ZSetBatch::new(&reply_schema));
     let ReadSink::Rows { order, .. } = &spec.sink else {
         unreachable!()
     };
-    let (schema, batch) = read_spec_finish(out_schema, batch, order, offset, limit);
+    let (schema, batch) = read_spec_finish(reply_schema, batch, order, offset, limit);
     Ok(SqlResult::Rows { schema, batch })
 }
 
@@ -426,10 +421,11 @@ fn execute_aggregate_select(
     // rejects before any dispatch, exactly as every view compile does.
     let out_schema = build_agg_out_schema(&layout, &schema)?;
 
-    // The partial reply schema — the shared SyntheticFold reduce-output layout
-    // the worker emits and echoes back (parity with the view path's reduce
-    // schema by construction). Partial agg columns are nullable: an all-NULL
-    // SUM/MIN/MAX group emits a NULL partial the client must carry.
+    // The partial reply schema — the shared SyntheticFold reduce-output layout the
+    // worker emits (parity with the view path's reduce schema by construction).
+    // It ships with the request and decodes every reply frame. Partial agg columns
+    // are nullable: an all-NULL SUM/MIN/MAX group emits a NULL partial the client
+    // must carry.
     let partial_schema = Schema::from_parts(
         // Blanket-nullable: this schema decodes the worker partials and is also
         // what the HAVING predicate resolves against, so over-declaring only
@@ -488,12 +484,10 @@ fn execute_aggregate_select(
                 .collect(),
         }),
     };
-    let reply_block = encode_schema_block(&partial_schema, tid as u32);
-
     // Dispatch. A wire error (including the runtime per-worker group cap) is HARD —
     // by now the fold is mid-flight on the workers and cannot fall back.
-    let (_recv_schema, batch) = client
-        .scan_spec(tid, &spec.encode(), &reply_block)
+    let batch = client
+        .scan_spec(tid, &spec.encode(), &partial_schema)
         .map_err(GnitzSqlError::Exec)?;
     let partial = batch.unwrap_or_else(|| ZSetBatch::new(&partial_schema));
 

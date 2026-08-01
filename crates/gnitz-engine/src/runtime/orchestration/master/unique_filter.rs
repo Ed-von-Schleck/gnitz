@@ -379,6 +379,7 @@ impl MasterDispatcher {
 
 #[cfg(test)]
 mod unique_filter_tests {
+    use super::super::dispatch::drain_scan_train;
     use super::*;
     use crate::schema::{type_code, SchemaColumn};
 
@@ -671,7 +672,15 @@ mod unique_filter_tests {
 
     struct DrainFixture {
         rings: Vec<crate::test_support::SharedRegion>,
-        reactor: crate::runtime::reactor::Reactor,
+        reactor: Rc<crate::runtime::reactor::Reactor>,
+        /// A `Peer` over a socketpair end whose partner is already closed, for
+        /// the drains that take one. It holds an owning `Rc<Reactor>`, so the
+        /// fixture owns it: a `Peer` local to a test body would outlive
+        /// `teardown` and keep the Reactor — and the `W2mSlot`s parked in it —
+        /// alive past the ring unmap.
+        peer: Peer,
+        /// Owns the fd `peer` borrows; closes it on drop.
+        peer_sock: std::os::unix::net::UnixStream,
         receiver: crate::runtime::w2m::W2mReceiver,
         req_ids: [u64; crate::runtime::sal::MAX_WORKERS],
     }
@@ -691,16 +700,21 @@ mod unique_filter_tests {
                 writers.push(W2mWriter::new(ptr, DRAIN_RING_CAPACITY as u64));
                 rings.push(region);
             }
-            let reactor = crate::runtime::reactor::Reactor::new(16).expect("reactor");
+            let reactor = Rc::new(crate::runtime::reactor::Reactor::new(16).expect("reactor"));
             let mut req_ids = [0u64; crate::runtime::sal::MAX_WORKERS];
             for id in req_ids[..n_workers].iter_mut() {
                 *id = reactor.alloc_scan_request_id();
             }
             let receiver = W2mReceiver::new(rings.iter().map(|r| r.ptr()).collect());
+            let (peer_sock, partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+            drop(partner);
+            let peer = Peer::unix(std::os::fd::AsRawFd::as_raw_fd(&peer_sock), Rc::clone(&reactor));
             (
                 DrainFixture {
                     rings,
                     reactor,
+                    peer,
+                    peer_sock,
                     receiver,
                     req_ids,
                 },
@@ -726,8 +740,13 @@ mod unique_filter_tests {
         fn teardown(self, lease: ScanLease) {
             // Drop the lease before the rings: its Drop purges scan_parked,
             // which would drop any still-queued W2mSlot borrowing the
-            // soon-to-be-unmapped region.
+            // soon-to-be-unmapped region. The Reactor goes next, for the same
+            // reason — it owns `scan_parked`, and a slot dropped after the
+            // unmap writes `consume_cursor` into freed memory. The Peer holds
+            // an owning `Rc<Reactor>`, so it must go before the Reactor.
             drop(lease);
+            drop(self.peer);
+            drop(self.peer_sock);
             drop(self.reactor);
             drop(self.receiver);
             // `self.rings` drops last, unmapping the regions.
@@ -1009,6 +1028,52 @@ mod unique_filter_tests {
 
         // The terminal continuation was never consumed.
         assert_frame_still_parked(&fx.reactor, w0_req);
+
+        fx.teardown(lease);
+    }
+
+    /// A worker scan frame carrying neither rows nor a schema block — every
+    /// worker that matched nothing on a selective broadcast read — is dropped
+    /// rather than forwarded to the client.
+    ///
+    /// `poll_once` is the primary detector: without the drop branch,
+    /// `peer.send_slot` parks forever on an fd the reactor never registered and
+    /// the single poll returns `Pending`, which `poll_once` panics on. The
+    /// cursor assertion corroborates that the slot was *released* — the frame is
+    /// retired at the ring, not leaked.
+    #[test]
+    fn drain_scan_train_drops_a_frame_with_neither_data_nor_schema() {
+        use crate::runtime::wire::STATUS_OK;
+        use std::sync::atomic::Ordering;
+
+        let (fx, writers) = DrainFixture::new(1);
+        let w0_req = fx.req_ids[0] as u32;
+        write_test_frame(
+            &writers[0],
+            w0_req,
+            FLAG_CONTINUATION | FLAG_SCAN_LAST,
+            STATUS_OK,
+            b"",
+            None,
+            None,
+        );
+
+        let lease = fx.reactor.scan_lease(&[w0_req]);
+        let mut slots = fx.initial_slots();
+        let slot = slots.pop().expect("first frame");
+
+        let before = unsafe { fx.receiver.header(0) }
+            .consume_cursor()
+            .load(Ordering::Acquire);
+        let drained = poll_once(drain_scan_train(&fx.reactor, &fx.peer, slot, w0_req, 0)).expect("healthy train");
+        assert!(drained, "the train drained without a client disconnect");
+        assert!(
+            unsafe { fx.receiver.header(0) }
+                .consume_cursor()
+                .load(Ordering::Acquire)
+                > before,
+            "the dropped slot was released at the ring"
+        );
 
         fx.teardown(lease);
     }

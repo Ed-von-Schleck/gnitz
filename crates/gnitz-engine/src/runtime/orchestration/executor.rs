@@ -1887,8 +1887,8 @@ async fn finish_scan_fanout(peer: &Peer, target_id: i64, client_id: u64, lsn: u6
 }
 
 /// Parameterized bounded read (`ReadSpec`). The scan pipeline, minus schema
-/// negotiation: the reply schema is the client's echoed block, forwarded verbatim
-/// in `seek_pk_extra` and re-emitted by each worker. `read_lock` still drains a
+/// negotiation: the client authors the reply schema and ships it in
+/// `seek_pk_extra`, so the reply carries no schema block. `read_lock` still drains a
 /// view target's pending ticks first (freshness), and terminal-frame/error
 /// handling are identical to `handle_scan`; only the routing differs, since a
 /// bound can confine the read to one worker.

@@ -161,13 +161,12 @@ fn put_bytes32(out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 /// Pack a ScanSpec request's control-block `seek_pk_extra` blob: the encoded
-/// `ReadSpec` followed by the raw reply-schema wire block, each `u32`-length-
+/// `ReadSpec` followed by the reply-schema wire block, each `u32`-length-
 /// prefixed. Bundling both in the arbitrary-length `seek_pk_extra` BLOB lets the
-/// master forward the blob verbatim — it peeks the bound header
-/// ([`peek_pk_range`]) to route the request but never decodes the spec — and
-/// hands the worker the raw reply-schema bytes to **echo** verbatim: the engine
-/// `SchemaDescriptor` drops the hidden flags, so the worker must never rebuild
-/// the block.
+/// master forward the blob to the workers without decoding the spec (it peeks
+/// only the bound header, [`peek_pk_range`], to route the request). The block
+/// does not travel back: the worker decodes it into the read's output shape,
+/// and the client decodes the reply against its own copy.
 pub fn pack_scan_spec_extra(spec: &[u8], reply_block: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + spec.len() + reply_block.len());
     put_bytes32(&mut out, spec);

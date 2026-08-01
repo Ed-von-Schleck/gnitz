@@ -9,6 +9,8 @@ Run with GNITZ_WORKERS=4 (the union-gather + top-k merge across partitions):
 """
 import random
 
+import gnitz
+
 
 def _uid():
     return str(random.randint(100000, 999999))
@@ -357,6 +359,35 @@ def test_empty_relation(client):
         client.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
         rows = _rows(client, sn, "SELECT v, id FROM t WHERE id = 999")
         assert rows == []
+    finally:
+        _cleanup(client, sn, "t")
+
+
+def test_all_empty_broadcast_keeps_the_column_metadata(client):
+    """An indexed read matching on no worker: every worker's reply frame carries
+    neither rows nor a schema block, so the master forwards none of them and the
+    client sees only the terminal frame. The result must still present the column
+    metadata — which the client authored and shipped with the request, since a
+    read-spec reply never carries a schema block back.
+
+    The unprojected source PK rides along as a hidden leading column and is not
+    part of the presented shape."""
+    sn = "rs" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql("CREATE TABLE t (id BIGINT PRIMARY KEY, flag BIGINT)", schema_name=sn)
+        client.execute_sql("CREATE INDEX ix ON t (flag)", schema_name=sn)
+        _insert_range(client, sn, "t", [(i, i % 4) for i in range(40)])
+
+        hit = _rows(client, sn, "SELECT id, flag FROM t WHERE flag = 2")
+        assert sorted(r.id for r in hit) == [i for i in range(40) if i % 4 == 2]
+
+        res = client.execute_sql("SELECT id, flag FROM t WHERE flag = 999", schema_name=sn)[0]
+        assert res["type"] == "Rows", f"expected Rows, got {res}"
+        miss = res["rows"]
+        assert len(miss) == 0
+        visible = [(c.name, c.type_code) for c in miss.schema.columns if not c.is_hidden]
+        assert visible == [("id", gnitz.TypeCode.I64), ("flag", gnitz.TypeCode.I64)]
     finally:
         _cleanup(client, sn, "t")
 

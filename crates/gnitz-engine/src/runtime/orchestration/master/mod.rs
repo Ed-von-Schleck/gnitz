@@ -27,7 +27,7 @@ use crate::runtime::sal::{
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::wire::{
     self, peek_control_block, DecodedWire, SchemaWithVersion, WireConflictMode, FLAG_CONTINUATION, FLAG_HAS_DATA,
-    FLAG_SCAN_LAST,
+    FLAG_HAS_SCHEMA, FLAG_SCAN_LAST,
 };
 use crate::schema::key::PkBuf;
 use crate::storage::Batch;

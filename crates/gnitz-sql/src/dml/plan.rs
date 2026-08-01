@@ -12,7 +12,6 @@ use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use gnitz_core::{ClientError, GnitzClient, PkTuple, Schema, ZSetBatch};
 use sqlparser::ast::LimitClause;
-use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Access-path classification
@@ -98,9 +97,7 @@ pub(crate) fn seek_pk_multi(
     table_id: u64,
     schema: &Schema,
     pks: &[u128],
-) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>), GnitzSqlError> {
-    let reply_block = gnitz_core::protocol::encode_schema_block(schema, table_id as u32);
-    let mut reply_schema: Option<Arc<Schema>> = None;
+) -> Result<Option<ZSetBatch>, GnitzSqlError> {
     let mut out: Option<ZSetBatch> = None;
     for chunk in pks.chunks(gnitz_wire::MAX_PK_SET_KEYS) {
         let spec = gnitz_wire::ReadSpec {
@@ -108,20 +105,17 @@ pub(crate) fn seek_pk_multi(
             predicate: Vec::new(),
             sink: gnitz_wire::ReadSink::all_rows(),
         };
-        let (schema_opt, batch_opt) = client
-            .scan_spec(table_id, &spec.encode(), &reply_block)
-            .map_err(GnitzSqlError::Exec)?;
-        if reply_schema.is_none() {
-            reply_schema = schema_opt;
-        }
-        if let Some(batch) = batch_opt {
+        if let Some(batch) = client
+            .scan_spec(table_id, &spec.encode(), schema)
+            .map_err(GnitzSqlError::Exec)?
+        {
             match &mut out {
                 None => out = Some(batch),
                 Some(acc) => acc.extend_from_owned(batch),
             }
         }
     }
-    Ok((reply_schema, out))
+    Ok(out)
 }
 
 /// Try each index candidate's seek in order, treating `ClientError::NoIndex` as

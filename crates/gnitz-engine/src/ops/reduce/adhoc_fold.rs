@@ -70,9 +70,9 @@ pub(crate) struct AdhocFold {
 
 impl AdhocFold {
     /// Build the fold state from a decoded fold spec. Validates group/agg
-    /// column indices against the source schema and the echoed `reply_schema`
-    /// against the engine-derived SyntheticFold layout (the spec AND the echoed
-    /// client blob are a trust boundary — a wrong-shaped but structurally valid
+    /// column indices against the source schema and the client's `reply_schema`
+    /// against the engine-derived SyntheticFold layout (the spec AND the client
+    /// blob are a trust boundary — a wrong-shaped but structurally valid
     /// reply schema would otherwise panic `ReducePlan::new`); aggregate-op
     /// validity is decode-enforced (`AggReadItem.op` is typed).
     pub(crate) fn new(
@@ -108,7 +108,7 @@ impl AdhocFold {
         // The ad-hoc partial layout is ALWAYS synthetic-fold: `_agg_pk` U128 PK,
         // group cols as payload, then the agg partial columns — a pure function
         // of `(src_schema, agg)`, derived here through the same authority the
-        // compiler lays every reduce output with. The echoed client schema must
+        // compiler lays every reduce output with. The client's reply schema must
         // match it physically (types + PK region; nullability is presentation)
         // or the frame is malformed.
         let derived = build_reduce_output_schema(src_schema, &group_cols, &agg_descs, ReduceOutKey::SyntheticFold)

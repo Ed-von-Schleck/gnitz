@@ -69,11 +69,13 @@ impl WorkerProcess {
     }
 
     /// Reply schema wire block: the table's cached block for `Table`, a
-    /// one-off (never cached) block for `OneOff`, the verbatim client bytes at
-    /// version 0 for `Echoed`. Returns the block, the schema version, and the
-    /// schema's wire-safety (`(None, 0, true)` for `ReplySchema::None`) —
-    /// `Table` reads the cached wire-safe bit instead of recomputing it per
-    /// reply.
+    /// one-off (never cached) block for `OneOff`, and none at all for
+    /// `ClientAuthored` — the client wrote that schema and decodes against it.
+    /// Returns the block, the schema version, and the schema's wire-safety
+    /// (`(None, 0, true)` for `ReplySchema::None`) — `Table` reads the cached
+    /// wire-safe bit instead of recomputing it per reply. This is the only
+    /// reader of the descriptor: the encoders take the block, never the
+    /// descriptor, so a variant that emits no block emits no schema.
     fn reply_schema_block(&mut self, tid_key: i64, schema: ReplySchema<'_>) -> (Option<Rc<Vec<u8>>>, u16, bool) {
         match schema {
             ReplySchema::None => (None, 0, true),
@@ -85,7 +87,7 @@ impl WorkerProcess {
                 let e = ipc::get_or_build_schema_wire_block(self.cat(), tid_key, s);
                 (Some(e.entry.block), e.version, e.entry.wire_safe)
             }
-            ReplySchema::Echoed(s, block) => (Some(Rc::new(block.to_vec())), 0, schema_wire_safe(s)),
+            ReplySchema::ClientAuthored(s) => (None, 0, schema_wire_safe(s)),
         }
     }
 
@@ -100,11 +102,10 @@ impl WorkerProcess {
     ) {
         let (prebuilt_rc, server_version, _) = self.reply_schema_block(target_id as i64, schema);
         let prebuilt = prebuilt_rc.as_deref().map(Vec::as_slice);
-        let sz = ipc::wire_size(STATUS_OK, &[], schema.descriptor(), None, result, prebuilt, &[]);
+        let sz = ipc::wire_size(STATUS_OK, &[], None, None, result, prebuilt, &[]);
         self.send_response_prebuilt(
             target_id,
             result,
-            schema.descriptor(),
             request_id,
             client_id,
             seek_pk,
@@ -125,7 +126,6 @@ impl WorkerProcess {
         &mut self,
         target_id: u64,
         result: Option<&Batch>,
-        schema: Option<&SchemaDescriptor>,
         request_id: u64,
         client_id: u64,
         seek_pk: u128,
@@ -146,7 +146,7 @@ impl WorkerProcess {
                 request_id,
                 STATUS_OK,
                 &[],
-                schema,
+                None,
                 None,
                 result,
                 prebuilt,
@@ -182,9 +182,9 @@ impl WorkerProcess {
         // region is `count · stride`, so wire_size_range(count) equals the
         // wire_size the single-frame path below would compute.
         let sz = if is_wire_safe {
-            ipc::wire_size_range(STATUS_OK, &[], schema.descriptor(), None, &batch, batch.count, prebuilt)
+            ipc::wire_size_range(STATUS_OK, &[], None, None, &batch, batch.count, prebuilt)
         } else {
-            ipc::wire_size(STATUS_OK, &[], schema.descriptor(), None, Some(&batch), prebuilt, &[])
+            ipc::wire_size(STATUS_OK, &[], None, None, Some(&batch), prebuilt, &[])
         };
         // Non-wire-safe replies cannot chunk, so they single-frame up to the
         // hard ring limit; wire-safe replies chunk past the (overridable)
@@ -198,7 +198,6 @@ impl WorkerProcess {
             self.send_response_prebuilt(
                 target_id,
                 Some(&batch),
-                schema.descriptor(),
                 request_id,
                 client_id,
                 seek_pk,
@@ -245,30 +244,13 @@ impl WorkerProcess {
         let tid_key = target_id as i64;
         // Obtain prebuilt schema block + server version. include_schema controls
         // whether the first frame carries a schema block; server_version is always
-        // embedded in wire_flags so the client can cache/verify. An echoed block
-        // is never version-gated: the cache-bypassing ScanSpec client decodes
-        // every frame against the first frame's block, with no cache to miss to.
+        // embedded in wire_flags so the client can cache/verify.
         let (block_rc, server_version, is_wire_safe) = self.reply_schema_block(tid_key, schema);
-        let always_include = matches!(schema, ReplySchema::Echoed(..));
-        let prebuilt_rc = block_rc
-            .filter(|_| always_include || gnitz_wire::wire_should_include_schema(client_version, server_version));
+        let prebuilt_rc = block_rc.filter(|_| gnitz_wire::wire_should_include_schema(client_version, server_version));
         let schema_version_flags = gnitz_wire::wire_flags_set_schema_version(0, server_version);
-
-        // When schema omission is in effect (prebuilt_rc=None), pass schema=None to
-        // the encode functions so has_schema stays false. Passing schema=Some with
-        // prebuilt=None would cause encode_wire_into_range to emit a schema block
-        // with empty column names, corrupting the client's schema cache.
-        let schema_for_encode = if prebuilt_rc.is_some() {
-            schema.descriptor()
-        } else {
-            None
-        };
 
         if !is_wire_safe {
             // STRING-column tables: no chunking. Check size; error if too big.
-            // Sized with descriptor=None to match `emit_non_wire_safe` exactly (a
-            // prebuilt block, present whenever a schema is emitted, supersedes the
-            // descriptor, so this equals sizing with `schema_for_encode`).
             let prebuilt = prebuilt_rc.as_deref().map(Vec::as_slice);
             let wire_sz = ipc::wire_size(STATUS_OK, &[], None, None, Some(&*batch), prebuilt, &[]);
             if wire_sz > w2m_ring::MAX_W2M_MSG as usize {
@@ -303,7 +285,7 @@ impl WorkerProcess {
         let total_rows = batch.count;
         let total_sz = {
             let prebuilt = prebuilt_rc.as_deref().map(Vec::as_slice);
-            ipc::wire_size_range(STATUS_OK, &[], schema_for_encode, None, &batch, total_rows, prebuilt)
+            ipc::wire_size_range(STATUS_OK, &[], None, None, &batch, total_rows, prebuilt)
         };
 
         if !force_fifo && total_sz <= self.reply_frame_budget {
@@ -316,17 +298,7 @@ impl WorkerProcess {
             let flags = schema_version_flags | FLAG_CONTINUATION | FLAG_SCAN_LAST;
             self.w2m_writer.send_encoded(total_sz, request_id as u32, |buf| {
                 ipc::encode_wire_into_range(
-                    buf,
-                    0,
-                    target_id,
-                    client_id,
-                    flags,
-                    STATUS_OK,
-                    schema_for_encode,
-                    &batch,
-                    0,
-                    total_rows,
-                    prebuilt,
+                    buf, 0, target_id, client_id, flags, STATUS_OK, None, &batch, 0, total_rows, prebuilt,
                 );
             });
         } else {
@@ -617,9 +589,8 @@ pub(crate) fn send_unique_preflight_keys(
         // the master's saved schema hint (synthetic schema version is 0, so
         // no wire_flags_set_schema_version is needed).
         let prebuilt: Option<&[u8]> = if is_first { Some(&schema_block) } else { None };
-        let schema_for_encode = if is_first { Some(frame_schema) } else { None };
         let flags = FLAG_CONTINUATION | if is_last { FLAG_SCAN_LAST } else { 0 };
-        let sz = ipc::wire_size_range(STATUS_OK, &[], schema_for_encode, None, &chunk, chunk.count, prebuilt);
+        let sz = ipc::wire_size_range(STATUS_OK, &[], None, None, &chunk, chunk.count, prebuilt);
         w2m_writer.send_encoded(sz, request_id as u32, |buf| {
             ipc::encode_wire_into_range(
                 buf,
@@ -628,7 +599,7 @@ pub(crate) fn send_unique_preflight_keys(
                 0,
                 flags,
                 STATUS_OK,
-                schema_for_encode,
+                None,
                 &chunk,
                 0,
                 chunk.count,

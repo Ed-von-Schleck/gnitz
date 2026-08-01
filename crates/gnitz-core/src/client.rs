@@ -437,17 +437,18 @@ impl GnitzClient {
     }
 
     /// Run a parameterized bounded read (`ReadSpec`) — the ad-hoc SELECT access
-    /// path. `spec` is the encoded `ReadSpec`; `reply_block` is the projected
-    /// reply schema's wire block. Returns the (echoed reply schema, one batch);
-    /// the SQL layer applies the client-side ORDER BY / LIMIT window. Bypasses the
-    /// schema cache, so it never poisons a later plain `scan` of the same table.
+    /// path. `spec` is the encoded `ReadSpec`; `reply_schema` is the projected
+    /// reply schema, shipped with the request and used to decode every reply
+    /// frame (the server sends none back). Returns one batch; the SQL layer
+    /// applies the client-side ORDER BY / LIMIT window. Bypasses the schema
+    /// cache, so it never poisons a later plain `scan` of the same table.
     pub fn scan_spec(
         &mut self,
         table_id: u64,
         spec: &[u8],
-        reply_block: &[u8],
-    ) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>), ClientError> {
-        self.session.scan_spec(table_id, spec, reply_block)
+        reply_schema: &Schema,
+    ) -> Result<Option<ZSetBatch>, ClientError> {
+        self.session.scan_spec(table_id, spec, reply_schema)
     }
 
     /// Consistent snapshot of N relations at one server-side SAL cut, returned

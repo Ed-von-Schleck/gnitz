@@ -3,6 +3,7 @@
 //! `SCAN_SPEC` is a user-relation verb: a system tid is rejected outright, and
 //! the rejection leaves the connection usable.
 
+use gnitz_core::protocol::{ColumnDef, Schema, TypeCode};
 use gnitz_core::{ClientError, GnitzClient, TABLE_TAB};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::{ReadBound, ReadSink, ReadSpec};
@@ -24,10 +25,11 @@ fn scan_spec_at_a_system_tid_is_rejected_and_the_connection_survives() {
     }
     .encode();
 
-    // The reply block is opaque bytes forwarded to the workers; the rejection
-    // lands before anything decodes it.
+    // `handle_scan_spec` rejects the system tid at the verb, before a single
+    // worker is dispatched — so the reply schema below is never consulted.
+    let reply_schema = Schema::from_parts(vec![ColumnDef::new("k", TypeCode::U64, false)], vec![0]).unwrap();
     let err = client
-        .scan_spec(TABLE_TAB, &spec, &[])
+        .scan_spec(TABLE_TAB, &spec, &reply_schema)
         .expect_err("a ReadSpec at a system tid must be rejected");
     let ClientError::ServerError(msg) = &err else {
         panic!("expected a STATUS_ERROR reply, got {err:?}");
