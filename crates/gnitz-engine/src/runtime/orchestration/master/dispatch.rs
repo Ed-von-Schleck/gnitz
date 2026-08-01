@@ -35,7 +35,8 @@ pub(crate) fn scan_spec_route(disp_ptr: *mut MasterDispatcher, target_id: i64, s
 /// a non-`PkRange` bound, a forged descriptor (left for the worker to reject at
 /// the trust boundary), or a range spanning partitions. An `IndexRange` bound is
 /// never confined: a secondary index is one unpartitioned table per worker, so
-/// nothing derives its owner from the key.
+/// nothing derives its owner from the key. A relation replicated in full on every
+/// worker never reaches here — [`scan_spec_route`] unicasts it to worker 0 first.
 ///
 /// Only a hashed store is key-routable. A view's store is hashed iff no source is
 /// replicated — `build_partitioned_storage` builds the rest single-partition, so
@@ -47,10 +48,10 @@ fn confined_worker(disp_ptr: *mut MasterDispatcher, target_id: i64, seek_pk_extr
     let kind = cat.dag.tables.get(&target_id)?.kind;
     match kind {
         RelationKind::BaseTable => {}
-        RelationKind::View if !cat.dag.view_has_replicated_source(target_id) => {}
         // A single-partition view store — one unpartitioned table per worker,
         // holding whatever landed there.
-        RelationKind::View => return None,
+        RelationKind::View if cat.dag.view_has_replicated_source(target_id) => return None,
+        RelationKind::View => {}
         // Rejected at the verb: a catalog family is served master-locally.
         RelationKind::SystemCatalog => return None,
     }

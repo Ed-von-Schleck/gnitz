@@ -134,6 +134,12 @@ impl RangeDescriptor {
         RangeDescriptor::new(eq_vals, Cut::Before(v), Cut::After(v))
     }
 
+    /// True iff the range column is pinned to a single value — the shape
+    /// [`Self::point`] builds. The recognizer dual of that constructor.
+    pub fn is_point(&self) -> bool {
+        matches!((self.start, self.end), (Cut::Before(a), Cut::After(b)) if a == b)
+    }
+
     /// The equality-pinned leading values; the range column sits right after
     /// them at index position `eq_vals().len()`.
     pub fn eq_vals(&self) -> &[u128] {

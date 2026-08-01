@@ -266,6 +266,29 @@ pub(crate) fn try_extract_pk_range<'e>(
     ))
 }
 
+/// True iff `desc` is a PK bound loose enough to give up for a one-row index
+/// point. Requires both:
+///
+/// * **No PK column pinned at all.** A descriptor that pins a leading PK column
+///   — an equality prefix, or the point `try_extract_pk_range` lowers a bare
+///   prefix to — can share the distribution prefix and unicast to one worker,
+///   which an `IndexRange` bound never does; and when the point covers the whole
+///   PK it already admits one row. [`Schema`] carries no `dist_prefix_len`, so
+///   "nothing pinned" is the only test available here.
+/// * **An index-eligible equality exists.** Nothing a unique point could be built
+///   from otherwise, and `table_indexes` always hits the wire — this keeps the
+///   GET_INDICES probe off the common `WHERE pk > x` read.
+pub(crate) fn pk_bound_is_preemptible(desc: &RangeDescriptor, where_expr: &BoundExpr, schema: &Schema) -> bool {
+    if !desc.eq_vals().is_empty() || desc.is_point() {
+        return false;
+    }
+    let mut conjuncts = Vec::new();
+    flatten_bound_conjuncts(where_expr, &mut conjuncts);
+    conjuncts
+        .iter()
+        .any(|c| try_col_eq_literal(c, schema).is_some_and(|(col, _)| index_eligible_col(schema, col)))
+}
+
 // ---------------------------------------------------------------------------
 // Shared collectors
 // ---------------------------------------------------------------------------
@@ -480,7 +503,22 @@ fn bound_next_column(
 /// One index-servable seek candidate: the index's FULL declared column list, the
 /// covered leading key values, and the residual bound conjuncts to filter after
 /// the seek.
-pub(crate) type IndexSeekCandidate<'e> = (PkColList, Vec<u128>, Vec<&'e BoundExpr>);
+pub(crate) struct IndexSeekCandidate<'e> {
+    pub(crate) cols: PkColList,
+    pub(crate) vals: Vec<u128>,
+    pub(crate) residual: Vec<&'e BoundExpr>,
+    /// Whether the index this candidate seeks is UNIQUE.
+    is_unique: bool,
+}
+
+impl IndexSeekCandidate<'_> {
+    /// A seek covering **every** column of a UNIQUE index: at most one row.
+    /// A point on a *prefix* of a unique index is not itself unique, and `cols`
+    /// is the index's FULL declared list, so this is exactly "fully covered".
+    fn is_unique_point(&self) -> bool {
+        self.is_unique && self.vals.len() == self.cols.as_slice().len()
+    }
+}
 
 /// Every index-servable seek candidate among the conjuncts of `expr`, best first.
 /// `fetch_indexes` (one epoch-validated GET_INDICES round-trip) is called only when
@@ -509,14 +547,22 @@ pub(crate) fn collect_index_seek_candidates<'e>(
         if uncovered_trailing_nullable(idx_cols, vals.len(), schema) {
             continue;
         }
-        out.push((meta.cols, vals, residual_conjuncts(&conjuncts, &consumed)));
+        out.push(IndexSeekCandidate {
+            cols: meta.cols,
+            vals,
+            residual: residual_conjuncts(&conjuncts, &consumed),
+            is_unique: meta.is_unique,
+        });
     }
 
-    // Best first: longer covered prefix wins; on a tie the tighter index wins.
+    // Best first: a seek covering every column of a UNIQUE index selects at most
+    // one row and outranks any longer prefix of a non-unique index; then longer
+    // covered prefix; then the tighter index.
     out.sort_by(|a, b| {
-        b.1.len()
-            .cmp(&a.1.len())
-            .then_with(|| a.0.as_slice().len().cmp(&b.0.as_slice().len()))
+        b.is_unique_point()
+            .cmp(&a.is_unique_point())
+            .then_with(|| b.vals.len().cmp(&a.vals.len()))
+            .then_with(|| a.cols.as_slice().len().cmp(&b.cols.as_slice().len()))
     });
     Ok(out)
 }
@@ -527,6 +573,8 @@ pub(crate) struct IndexRangeCandidate<'e> {
     pub(crate) idx_cols: PkColList,
     pub(crate) desc: RangeDescriptor,
     pub(crate) residual: Vec<&'e BoundExpr>,
+    /// Whether the index this candidate walks is UNIQUE.
+    is_unique: bool,
 }
 
 impl IndexRangeCandidate<'_> {
@@ -535,6 +583,15 @@ impl IndexRangeCandidate<'_> {
     /// re-derive it from the candidate's internals.
     pub(crate) fn range_col(&self) -> usize {
         self.idx_cols.as_slice()[self.desc.eq_vals().len()] as usize
+    }
+
+    /// A point covering **every** column of a UNIQUE index — the one fact
+    /// comparable against a PK candidate, since such a point admits at most one
+    /// row whatever the walk costs. A point on a *prefix* of a unique index is not
+    /// itself unique; `idx_cols` is the index's FULL declared list, so
+    /// `n_eq + 1 == len` is exactly "the point covers every column".
+    pub(crate) fn is_unique_point(&self) -> bool {
+        self.is_unique && self.desc.eq_vals().len() + 1 == self.idx_cols.as_slice().len() && self.desc.is_point()
     }
 }
 
@@ -584,6 +641,7 @@ fn collect_index_range_candidates<'e>(
             idx_cols: meta.cols,
             desc: RangeDescriptor::new(&eq_vals, start, end),
             residual: residual_conjuncts(&conjuncts, &consumed),
+            is_unique: meta.is_unique,
         });
     }
 
@@ -618,12 +676,6 @@ impl IndexListMemo {
             }
         }
     }
-
-    /// The list a collector already fetched, empty if neither did (which can only
-    /// happen when neither produced a candidate).
-    fn fetched(&self) -> &[IndexMeta] {
-        self.0.as_deref().map_or(&[], |v| v.as_slice())
-    }
 }
 
 /// The best index range/equality bound for `where_expr` as a full
@@ -650,29 +702,20 @@ where
     let seeks =
         collect_index_seek_candidates(where_expr, schema, || memo.get(&mut fetch)).map_err(GnitzSqlError::Exec)?;
 
-    let cands: Vec<IndexRangeCandidate<'e>> = ranges
-        .into_iter()
-        .chain(seeks.into_iter().map(|(idx_cols, vals, residual)| {
-            let n = vals.len();
-            IndexRangeCandidate {
-                idx_cols,
-                desc: RangeDescriptor::point(&vals[..n - 1], vals[n - 1]),
-                residual,
-            }
-        }))
-        .collect();
-    let is_unique = |cols: &PkColList| {
-        memo.fetched()
-            .iter()
-            .any(|m| m.is_unique && m.cols.as_slice() == cols.as_slice())
-    };
+    let cands = ranges.into_iter().chain(seeks.into_iter().map(|c| {
+        let n = c.vals.len();
+        IndexRangeCandidate {
+            idx_cols: c.cols,
+            desc: RangeDescriptor::point(&c.vals[..n - 1], c.vals[n - 1]),
+            residual: c.residual,
+            is_unique: c.is_unique,
+        }
+    }));
     // `min_by_key` keeps the FIRST of equal keys, so on a full tie the range
     // collector's candidate (listed first) wins, matching each collector's own
     // internal preference order. It also scores each candidate exactly once,
     // where a sort would re-derive the key per comparison.
-    Ok(cands
-        .into_iter()
-        .min_by_key(|c| Reverse(pinned_score(c, schema, is_unique(&c.idx_cols)))))
+    Ok(cands.min_by_key(|c| Reverse(pinned_score(c, schema))))
 }
 
 /// How constrained a candidate leaves the index walk, as a totally ordered key:
@@ -685,22 +728,15 @@ where
 /// point at 2, and on an unsigned column `WHERE a = 0` scores 1 — *below* an
 /// interval — because `type_edges(U64).0` is `Before(0)`. Leading with the flag
 /// settles both.
-fn pinned_score(c: &IndexRangeCandidate<'_>, schema: &Schema, unique: bool) -> (bool, u32, Reverse<usize>) {
-    let n_eq = c.desc.eq_vals().len();
-    // A point on a *prefix* of a unique index (which the seek collector emits) is
-    // not itself unique; `idx_cols` is the index's FULL declared list, so
-    // `n_eq + 1 == len` is exactly "the point covers every column".
-    let unique_point = unique
-        && n_eq + 1 == c.idx_cols.as_slice().len()
-        && matches!((c.desc.start, c.desc.end), (Cut::Before(x), Cut::After(y)) if x == y);
+fn pinned_score(c: &IndexRangeCandidate<'_>, schema: &Schema) -> (bool, u32, Reverse<usize>) {
     let sides = match Cut::type_edges(schema.columns[c.range_col()].type_code) {
         Some((lo, hi)) => (c.desc.start != lo) as u32 + (c.desc.end != hi) as u32,
         // Unreachable: both collectors only emit range-servable column types.
         None => 2,
     };
     (
-        unique_point,
-        2 * n_eq as u32 + sides,
+        c.is_unique_point(),
+        2 * c.desc.eq_vals().len() as u32 + sides,
         Reverse(c.idx_cols.as_slice().len()),
     )
 }
@@ -923,13 +959,60 @@ mod tests {
         let expr = bind_where("a = 1 AND b = 2 AND c = 3", &schema);
         let indexes = idx_metas(&[&[1], &[2], &[3]]);
         let cands = collect_index_seek_candidates(&expr, &schema, || Ok(indexes)).unwrap();
-        let mut cols: Vec<Vec<u32>> = cands.iter().map(|(c, _, _)| c.as_slice().to_vec()).collect();
+        let mut cols: Vec<Vec<u32>> = cands.iter().map(|c| c.cols.as_slice().to_vec()).collect();
         cols.sort();
         assert_eq!(cols, vec![vec![1], vec![2], vec![3]]);
-        for (_, vals, residual) in &cands {
-            assert_eq!(vals.len(), 1);
-            assert_eq!(residual.len(), 2);
+        for c in &cands {
+            assert_eq!(c.vals.len(), 1);
+            assert_eq!(c.residual.len(), 2);
         }
+    }
+
+    /// `(id U64 pk, x U64, a U64, b U64, c U64)` — all payload cols non-nullable so
+    /// no candidate is dropped by `uncovered_trailing_nullable`.
+    fn seek_rank_schema() -> Schema {
+        Schema {
+            columns: vec![
+                col_def("id", TypeCode::U64, false),
+                col_def("x", TypeCode::U64, false),
+                col_def("a", TypeCode::U64, false),
+                col_def("b", TypeCode::U64, false),
+                col_def("c", TypeCode::U64, false),
+            ],
+            pk_cols: vec![0],
+        }
+    }
+
+    /// The columns of the head (best) seek candidate for `where_sql`.
+    fn head_seek_cols(where_sql: &str, sch: &Schema, lists: &[(&[u32], bool)]) -> Vec<u32> {
+        let expr = bind_where(where_sql, sch);
+        let cands = collect_index_seek_candidates(&expr, sch, || Ok(idx_metas_flagged(lists))).unwrap();
+        cands
+            .first()
+            .expect("some index must be seekable")
+            .cols
+            .as_slice()
+            .to_vec()
+    }
+
+    /// A point covering every column of UNIQUE(x) selects at most one row, so it
+    /// outranks the longer — but non-unique, and disjoint — prefix of INDEX(a, b).
+    #[test]
+    fn a_covered_unique_index_outranks_a_longer_disjoint_prefix() {
+        let cols = head_seek_cols(
+            "x = 1 AND a = 2 AND b = 3",
+            &seek_rank_schema(),
+            &[(&[1], true), (&[2, 3], false)],
+        );
+        assert_eq!(cols, vec![1], "UNIQUE(x) admits one row; INDEX(a, b) admits many");
+    }
+
+    /// With no candidate fully covered the new leading term is false for both, so
+    /// the pre-existing rule decides: equal prefix lengths, then the tighter index.
+    #[test]
+    fn a_partial_cover_of_a_unique_index_does_not_jump_the_queue() {
+        let cols = head_seek_cols("a = 1", &seek_rank_schema(), &[(&[2, 3], true), (&[2, 3, 4], false)]);
+        assert_eq!(cols, vec![2, 3], "a prefix point on UNIQUE(a, b) is not itself unique");
     }
 
     // ------------------------------------------------------------------
@@ -1494,5 +1577,63 @@ mod tests {
         );
         assert_eq!(cols, vec![1]);
         assert_eq!((start, end), (Cut::Before(5), Cut::After(5)));
+    }
+
+    // ── when a PK bound yields to a one-row index point ─────────────────────────
+
+    /// The winner of the arbitration is a point covering a whole UNIQUE index.
+    #[test]
+    fn a_full_unique_point_is_recognized() {
+        let sch = bound_schema(false);
+        let bound = bind_where("a = 42", &sch);
+        let c = best_index_bound(&bound, &sch, || Ok(idx_metas_flagged(&[(&[1], true)])))
+            .unwrap()
+            .expect("the WHERE must bound some index");
+        assert!(c.is_unique_point());
+    }
+
+    /// Whether the PK bound `where_sql` extracts would yield to a one-row index
+    /// point. Panics when the WHERE bounds no PK range at all.
+    fn preemptible(where_sql: &str, sch: &Schema) -> bool {
+        let bound = bind_where(where_sql, sch);
+        let (desc, _) = try_extract_pk_range(&bound, sch).expect("the WHERE must bound the PK");
+        pk_bound_is_preemptible(&desc, &bound, sch)
+    }
+
+    #[test]
+    fn an_unpinned_pk_range_is_preemptible() {
+        assert!(preemptible("pk > 0 AND val = 42", &two_col(TypeCode::U64)));
+    }
+
+    /// A pinned leading PK column can share the distribution prefix and unicast to
+    /// one worker (`PRIMARY KEY (tenant, id) CLUSTER BY (tenant)`), which an
+    /// `IndexRange` bound never does. False regardless of `dist_prefix_len`, which
+    /// the client cannot see.
+    #[test]
+    fn a_pinned_prefix_is_not_preemptible() {
+        let sch = Schema {
+            columns: vec![
+                col_def("tenant", TypeCode::U64, false),
+                col_def("id", TypeCode::U64, false),
+                col_def("email", TypeCode::U64, false),
+            ],
+            pk_cols: vec![0, 1],
+        };
+        assert!(!preemptible("tenant = 7 AND id > 0 AND email = 42", &sch));
+        // The bare prefix lowers to a point over `tenant` with nothing pinned
+        // before it — still one worker's rows, not one row.
+        assert!(!preemptible("tenant = 7 AND email = 42", &sch));
+    }
+
+    #[test]
+    fn a_pk_point_is_not_preemptible() {
+        assert!(!preemptible("pk = 0 AND val = 42", &two_col(TypeCode::U64)));
+    }
+
+    /// No index-eligible equality: nothing a unique point could be built from, so
+    /// the GET_INDICES probe stays off the common bounded-read path.
+    #[test]
+    fn no_index_eligible_equality_is_not_preemptible() {
+        assert!(!preemptible("pk > 5 AND val > 1", &two_col(TypeCode::U64)));
     }
 }

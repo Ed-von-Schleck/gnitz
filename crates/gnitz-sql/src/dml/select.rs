@@ -14,7 +14,9 @@
 //! pass-through CTE over one relation is inlined (`cte_passthrough`) so trivial
 //! `WITH` queries keep reading through the direct path.
 
-use crate::access::{best_index_bound, try_extract_pk_in, try_extract_pk_range};
+use crate::access::{
+    best_index_bound, pk_bound_is_preemptible, try_extract_pk_in, try_extract_pk_range, IndexRangeCandidate,
+};
 use crate::agg::{synthetic_fold_cols, GroupByLayout};
 use crate::ast_util::{
     body_is_grouped, classify_from, extract_table_factor_name, has_exists_in_subquery, has_scalar_subquery,
@@ -62,7 +64,9 @@ fn empty_rows(schema: Schema) -> SqlResult {
 /// WHERE → the pushed-down `ReadBound` (an access superset) plus the compiled
 /// server-side predicate re-imposing the residual conjuncts — the shared front
 /// half of both sinks. Binds the WHERE once up front, then recognizes over the
-/// bound conjuncts. The predicate is: empty for `PkSet` (the gather is exact);
+/// bound conjuncts; a PK bound that pins no PK column yields to a point covering
+/// every column of a UNIQUE index, which admits at most one row.
+/// The predicate is: empty for `PkSet` (the gather is exact);
 /// the extractor's residual for `PkRange` and a wide-int `IndexRange` (byte-exact
 /// walks — consumed conjuncts are applied exactly and stripped); and the whole
 /// bound WHERE for `None` and a ≤8-byte-int `IndexRange` (whose selectivity gate
@@ -94,29 +98,60 @@ fn where_bound_and_predicate(
     // A PK equality / range → a byte-exact bounded PK walk; the residual (the WHERE
     // minus every conjunct the walk applies exactly) is the predicate. Exactness at
     // any PK width is what serves a wide (U128) PK range without the predicate VM.
+    // It yields only when the descriptor pins no PK column and a point covering
+    // every column of a UNIQUE index is available: that admits one row where an
+    // unpinned PK range admits the table.
     if let Some((desc, residual)) = try_extract_pk_range(&bound_where, schema) {
+        if pk_bound_is_preemptible(&desc, &bound_where, schema) {
+            let unique_idx =
+                best_index_bound(&bound_where, schema, || client.table_indexes(tid))?.filter(|c| c.is_unique_point());
+            if let Some(c) = unique_idx {
+                match index_bound_and_predicate(c, &bound_where, schema) {
+                    Ok(r) => return Ok(r),
+                    // The index arm re-imposes more of the WHERE than the PK arm's
+                    // residual, so it can need a conjunct the VM refuses (a wide
+                    // literal, a U128 column) that the PK walk consumes
+                    // byte-exactly. Keep the PK walk instead of failing the query;
+                    // an uncompilable residual still raises below.
+                    Err(GnitzSqlError::Unsupported(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
         let predicate = compile_read_spec_predicate(&residual, schema)?;
         return Ok((ReadBound::PkRange(desc), predicate));
     }
 
-    // The best secondary-index bound, keeping its residual. The walk gating is the
-    // worker's own decision, derived from the range column's type
-    // (`TypeCode::is_wide_int`): a wide-int bound runs the byte-exact walk, so the
-    // candidate's residual is the predicate; a narrow bound may be gate-degraded to
-    // a full cursor, so the whole WHERE stays the predicate.
+    // The best secondary-index bound, keeping its residual.
     if let Some(c) = best_index_bound(&bound_where, schema, || client.table_indexes(tid))? {
-        let wide = schema.columns[c.range_col()].type_code.is_wide_int();
-        let pred_exprs: Vec<&BoundExpr> = if wide { c.residual } else { vec![&bound_where] };
-        let predicate = compile_read_spec_predicate(&pred_exprs, schema)?;
-        let bound = ReadBound::IndexRange {
-            idx_cols: gnitz_wire::pack_pk_cols(c.idx_cols.as_slice()),
-            desc: c.desc,
-        };
-        return Ok((bound, predicate));
+        return index_bound_and_predicate(c, &bound_where, schema);
     }
 
     let predicate = compile_read_spec_predicate(&[&bound_where], schema)?;
     Ok((ReadBound::None, predicate))
+}
+
+/// An index candidate → its `ReadBound` plus the predicate that re-imposes what
+/// the walk does not apply. The walk gating is the worker's own decision, derived
+/// from the range column's type (`TypeCode::is_wide_int`): a wide-int bound runs
+/// the byte-exact walk, so the candidate's residual is the predicate; a narrow
+/// bound may be gate-degraded to a full cursor, so the whole WHERE stays the
+/// predicate.
+fn index_bound_and_predicate(
+    c: IndexRangeCandidate<'_>,
+    bound_where: &BoundExpr,
+    schema: &Schema,
+) -> Result<(ReadBound, Vec<u8>), GnitzSqlError> {
+    let wide = schema.columns[c.range_col()].type_code.is_wide_int();
+    let pred_exprs: Vec<&BoundExpr> = if wide { c.residual } else { vec![bound_where] };
+    let predicate = compile_read_spec_predicate(&pred_exprs, schema)?;
+    Ok((
+        ReadBound::IndexRange {
+            idx_cols: gnitz_wire::pack_pk_cols(c.idx_cols.as_slice()),
+            desc: c.desc,
+        },
+        predicate,
+    ))
 }
 
 pub(crate) fn execute_select(

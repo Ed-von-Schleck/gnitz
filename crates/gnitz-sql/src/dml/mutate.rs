@@ -333,10 +333,10 @@ fn fetch_filtered<'e>(
 ) -> Result<FilteredFetch<'e>, GnitzSqlError> {
     let candidates =
         collect_index_seek_candidates(where_expr, schema, || client.table_indexes(tid)).map_err(GnitzSqlError::Exec)?;
-    if let Some(((_, _, residual), (schema_opt, batch_opt, _))) = first_index_hit(candidates, |(cols, vals, _)| {
-        client.seek_by_index(tid, cols.as_slice(), vals)
-    })? {
-        return Ok((schema_opt, batch_opt, residual));
+    if let Some((cand, (schema_opt, batch_opt, _))) =
+        first_index_hit(candidates, |c| client.seek_by_index(tid, c.cols.as_slice(), &c.vals))?
+    {
+        return Ok((schema_opt, batch_opt, cand.residual));
     }
     let (schema_opt, batch_opt, _) = client.scan(tid)?;
     Ok((schema_opt, batch_opt, vec![where_expr]))
