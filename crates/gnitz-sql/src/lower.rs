@@ -873,8 +873,8 @@ mod tests {
         }
     }
 
-    /// A wide-int (U128) operand takes the OR-chain, which the integer-load path
-    /// then rejects — the same error the OR-chain gave before.
+    /// A wide-int (U128) operand takes the OR-chain, whose integer-load path has no
+    /// 16-byte slot and rejects.
     #[test]
     fn in_list_wide_int_operand_rejects() {
         let schema = Schema {
@@ -882,7 +882,7 @@ mod tests {
             pk_cols: vec![0],
         };
         let err = compile_bound_expr_to_program(
-            &in_list(BoundExpr::ColRef(1), vec![BoundExpr::LitInt(1)]),
+            &in_list(BoundExpr::ColRef(1), vec![BoundExpr::LitInt(1), BoundExpr::LitInt(2)]),
             &schema.columns,
         )
         .expect_err("wide-int IN must not compile");

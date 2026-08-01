@@ -152,25 +152,28 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
                 between
             })
         }
-        // `e IN (l1, …, ln)` binds faithfully to a `BoundExpr::InList` node (no
-        // desugar at bind, no schema, no fold): each backend then decides how to
-        // lower it — a ≤8-byte-integer operand with all-integer-literal items to
-        // one `INT_IN_SET`, else the `e = l1 OR … OR e = ln` chain. `NOT IN` wraps
-        // the node in `Not`. Item binding is eager (matching the old lazy OR-chain's
-        // error behavior: a NULL/string/non-literal item that fails to bind errors
-        // here in the same left-to-right position).
+        // `e IN (l)` IS `e = l` — the same structural desugar as BETWEEN above, and
+        // what makes the equality visible to the `access` recognizers, which all gate
+        // on `BinOp(_, Eq, _)`. Two or more items keep the faithful `InList` node, so
+        // lowering can pick a ≤8-byte-integer operand with all-integer-literal items
+        // to one `INT_IN_SET` and everything else to the `e = l1 OR … OR e = ln`
+        // chain. `NOT IN` wraps whichever node the arity picked. Item binding is
+        // eager, so a NULL/string/non-literal item errors in its written position.
         Expr::InList { expr: e, list, negated } => {
-            if list.is_empty() {
-                return Err(GnitzSqlError::Unsupported("IN with an empty list".into()));
-            }
-            let inner = bind_structural(e, leaf)?;
-            let items = list
-                .iter()
-                .map(|it| bind_structural(it, leaf))
-                .collect::<Result<Vec<_>, _>>()?;
-            let node = BExpr::InList {
-                inner: Box::new(inner),
-                items,
+            let node = match list.as_slice() {
+                [] => return Err(GnitzSqlError::Unsupported("IN with an empty list".into())),
+                [only] => BExpr::BinOp(
+                    Box::new(bind_structural(e, leaf)?),
+                    BinOp::Eq,
+                    Box::new(bind_structural(only, leaf)?),
+                ),
+                _ => BExpr::InList {
+                    inner: Box::new(bind_structural(e, leaf)?),
+                    items: list
+                        .iter()
+                        .map(|it| bind_structural(it, leaf))
+                        .collect::<Result<Vec<_>, _>>()?,
+                },
             };
             Ok(if *negated {
                 BExpr::UnaryOp(UnaryOp::Not, Box::new(node))
@@ -565,12 +568,13 @@ mod tests {
         }
     }
 
-    /// `c IN (…)` binds faithfully to an `InList` node (un-desugared); `NOT IN`
-    /// wraps it in `Not`. The tested operand is bound once as `inner`; every list
+    /// `c IN (…)` with two or more items binds faithfully to an `InList` node
+    /// (un-desugared); a one-item list folds to the `Eq` it is; `NOT IN` wraps the
+    /// result in `Not`. The tested operand is bound once as `inner`; every list
     /// item is bound in order into `items`. Lowering — not binding — chooses the
     /// INT_IN_SET fast path vs the OR-chain fallback.
     #[test]
-    fn test_bind_in_list_binds_faithful_node() {
+    fn test_bind_in_list_folds_one_item_else_binds_faithful() {
         let schema = schema_with_val(TypeCode::I64); // (pk U64, c I64)
         match bind_single_table(&parse("c IN (1, 2)"), &schema).unwrap() {
             BoundExpr::InList { inner, items } => {
@@ -581,23 +585,26 @@ mod tests {
             }
             other => panic!("expected InList, got {other:?}"),
         }
-        // A single element is still an InList with one item (no bare-Eq degenerate).
+        // A single element folds to the equality it spells — the shape the `access`
+        // recognizers match on, identical to what `c = 7` binds to.
         match bind_single_table(&parse("c IN (7)"), &schema).unwrap() {
-            BoundExpr::InList { items, .. } => {
-                assert_eq!(items.len(), 1);
-                assert!(matches!(items[0], BoundExpr::LitInt(7)));
+            BoundExpr::BinOp(inner, BinOp::Eq, item) => {
+                assert!(matches!(*inner, BoundExpr::ColRef(1)));
+                assert!(matches!(*item, BoundExpr::LitInt(7)));
             }
-            other => panic!("expected InList, got {other:?}"),
+            other => panic!("expected Eq, got {other:?}"),
         }
-        // NOT IN wraps the node in Not.
-        match bind_single_table(&parse("c NOT IN (1, 2)"), &schema).unwrap() {
-            BoundExpr::UnaryOp(UnaryOp::Not, inner) => {
-                assert!(matches!(*inner, BoundExpr::InList { .. }))
+        // NOT IN wraps whichever node the arity picked.
+        for (src, folded) in [("c NOT IN (7)", true), ("c NOT IN (1, 2)", false)] {
+            match bind_single_table(&parse(src), &schema).unwrap() {
+                BoundExpr::UnaryOp(UnaryOp::Not, inner) => {
+                    assert_eq!(matches!(*inner, BoundExpr::BinOp(_, BinOp::Eq, _)), folded, "{src}")
+                }
+                other => panic!("{src}: expected Not(_), got {other:?}"),
             }
-            other => panic!("expected Not(InList), got {other:?}"),
         }
         // Negative-literal items bind as `UnaryOp(Neg, LitInt)` (sqlparser lexes
-        // the minus separately) — the fold path handles them at lower time.
+        // the minus separately) — the INT_IN_SET lowering unwraps them.
         match bind_single_table(&parse("c IN (-1, -2)"), &schema).unwrap() {
             BoundExpr::InList { items, .. } => {
                 assert_eq!(items.len(), 2);

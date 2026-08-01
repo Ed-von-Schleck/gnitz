@@ -79,17 +79,16 @@ fn where_bound_and_predicate(
     };
     let bound_where = bind_single_table(we, schema)?;
 
-    // `pk IN (…)` → an exact gather (empty predicate). Keys ship deduplicated
-    // (`try_extract_pk_in`); the worker OPK-sorts before its forward sweep.
-    if let Some(keys) = try_extract_pk_in(&bound_where, schema) {
-        if keys.len() > gnitz_wire::MAX_PK_SET_KEYS {
-            return Err(GnitzSqlError::Unsupported(format!(
-                "pk IN (…) with {} keys exceeds the {}-key limit",
-                keys.len(),
-                gnitz_wire::MAX_PK_SET_KEYS
-            )));
+    // `pk IN (…)` → an exact gather of those keys, with the remaining conjuncts as
+    // the predicate. Keys ship deduplicated (`try_extract_pk_in`); the worker
+    // OPK-sorts before its forward sweep. A list past the wire's key cap declines to
+    // the ladder below, which serves it as an ordinary predicate scan.
+    match try_extract_pk_in(&bound_where, schema) {
+        Some((keys, residual)) if keys.len() <= gnitz_wire::MAX_PK_SET_KEYS => {
+            let predicate = compile_read_spec_predicate(&residual, schema)?;
+            return Ok((ReadBound::PkSet(keys), predicate));
         }
-        return Ok((ReadBound::PkSet(keys), Vec::new()));
+        _ => {}
     }
 
     // A PK equality / range → a byte-exact bounded PK walk; the residual (the WHERE

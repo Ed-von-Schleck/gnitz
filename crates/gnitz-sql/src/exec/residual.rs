@@ -30,10 +30,10 @@ pub(crate) fn matching_indices(
     schema: &Schema,
 ) -> Result<Vec<usize>, GnitzSqlError> {
     let n = batch.pks.len();
-    // No residual → every row, before any compilation. This exempts the two
-    // hottest DML shapes — `AccessPath::ScanAll` (`DELETE FROM t`) and
-    // `PkMultiSeek`, both of which always pass `&[]` — from building a view and
-    // materializing German cells for a predicate that does not exist.
+    // No residual → every row, before any compilation. This exempts the hottest DML
+    // shape — `AccessPath::ScanAll` (`DELETE FROM t`), which always passes `&[]` —
+    // from building a view and materializing German cells for a predicate that does
+    // not exist.
     //
     // `None` from the compile is the statically-true verdict: the binder
     // const-folds a null test on a non-nullable column, so

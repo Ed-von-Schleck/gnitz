@@ -706,9 +706,53 @@ class TestPkInMultiSeek:
                 pass
             client.drop_schema(sn)
 
+    def test_update_pk_in_with_a_companion_conjunct(self, client):
+        """A `pk IN (…)` conjunct still gathers those keys when the WHERE has more
+        to it; the rest post-filters the gathered rows, so only pk 3 is touched."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            tid = self._setup_t3(client, sn)
+            res = client.execute_sql(
+                "UPDATE t SET val = 0 WHERE pk IN (1, 3) AND val > 150", schema_name=sn
+            )
+            assert res[0]["count"] == 1
+            rows = _rows_map(client, tid)
+            assert rows[3].val == 0
+            assert rows[1].val == 100 and rows[2].val == 200
+            # The SELECT mirror: a PkSet gather carrying a predicate.
+            res = client.execute_sql(
+                "SELECT pk FROM t WHERE pk IN (1, 2, 3) AND val > 150", schema_name=sn
+            )
+            assert sorted(r.pk for r in res[0]["rows"]) == [2]
+        finally:
+            try:
+                client.execute_sql("DROP TABLE t", schema_name=sn)
+            except Exception:
+                pass
+            client.drop_schema(sn)
+
+    def test_delete_pk_one_key_in_matches_the_eq_spelling(self, client):
+        """A one-element list is the equality it spells: one row deleted, the
+        others untouched."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            tid = self._setup_t3(client, sn)
+            res = client.execute_sql("DELETE FROM t WHERE pk IN (2)", schema_name=sn)
+            assert res[0]["count"] == 1
+            rows = _rows_map(client, tid)
+            assert sorted(rows.keys()) == [1, 3]
+        finally:
+            try:
+                client.execute_sql("DROP TABLE t", schema_name=sn)
+            except Exception:
+                pass
+            client.drop_schema(sn)
+
     def test_update_pk_not_in_falls_to_scan(self, client):
-        """NOT IN never matches the fast path; the desugared OR-chain evaluates
-        on the predicate full scan."""
+        """NOT IN never matches the fast path; `Not(…)` over the membership test
+        evaluates as a residual predicate on the full scan."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:

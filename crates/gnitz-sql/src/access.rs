@@ -136,16 +136,16 @@ fn try_col_eq_literal(expr: &BoundExpr, schema: &Schema) -> Option<(usize, u128)
     Some((col_idx, key))
 }
 
-/// `Some(keys)` when `expr` is exactly `pk IN (literal, …)` on a single-column PK;
-/// the keys are deduped (first occurrence wins). `None` routes the WHERE back to
-/// the seek/index/scan ladder. `NOT IN` binds to `UnaryOp(Not, InList)` and so
-/// never matches the `InList` arm here.
-pub(crate) fn try_extract_pk_in(expr: &BoundExpr, schema: &Schema) -> Option<Vec<u128>> {
+/// The keys of a bound `pk IN (literal, …)` conjunct on a single-column PK, deduped
+/// (first occurrence wins). `None` for any other conjunct. `NOT IN` binds to
+/// `UnaryOp(Not, InList)` and so never matches here; a one-key `IN` folds to `Eq` at
+/// bind and is served by [`try_extract_pk_seek_residual`] / [`try_extract_pk_range`].
+fn pk_in_keys(conjunct: &BoundExpr, schema: &Schema) -> Option<Vec<u128>> {
     // Compound PK has no IN-list fast path; fall back to a full delta scan.
     if schema.pk_count() != 1 {
         return None;
     }
-    let BExpr::InList { inner, items } = expr else {
+    let BExpr::InList { inner, items } = conjunct else {
         return None;
     };
     let BExpr::ColRef(col_idx) = inner.as_ref() else {
@@ -173,6 +173,21 @@ pub(crate) fn try_extract_pk_in(expr: &BoundExpr, schema: &Schema) -> Option<Vec
         }
     }
     Some(pks)
+}
+
+/// `Some((keys, residual))` when one conjunct of `expr` is `pk IN (literal, …)` on a
+/// single-column PK: the gather keys plus the bound conjuncts to filter against the
+/// gathered rows. Conjunct-level like every recognizer beside it, so
+/// `pk IN (1, 2) AND v > 5` is a two-key gather rather than a full scan. `None`
+/// routes the WHERE back to the seek/index/scan ladder.
+pub(crate) fn try_extract_pk_in<'e>(expr: &'e BoundExpr, schema: &Schema) -> Option<(Vec<u128>, Vec<&'e BoundExpr>)> {
+    let mut conjuncts = Vec::new();
+    flatten_bound_conjuncts(expr, &mut conjuncts);
+    let (ci, keys) = conjuncts
+        .iter()
+        .enumerate()
+        .find_map(|(i, &c)| pk_in_keys(c, schema).map(|k| (i, k)))?;
+    Some((keys, residual_conjuncts(&conjuncts, &[ci])))
 }
 
 /// `Some((pk_tuple, residual))` when the conjuncts of `expr` bind every PK column
@@ -426,9 +441,10 @@ fn collect_range_ends(conjuncts: &[&BoundExpr], schema: &Schema) -> Vec<RangeEnd
 /// Bound `range_col` by the FIRST start-side and FIRST end-side cut among `ends`
 /// (never a compare of two packed natives to pick the tighter one — the residual
 /// re-imposes any redundant same-side end exactly), widening an unconstrained side
-/// to the column type's edge cut. Pushes onto `consumed` each range conjunct whose
-/// ends were ALL chosen. `None` when no end covers `range_col`, or its type carries
-/// no ordered range.
+/// to the column type's edge cut. Pushes each chosen end's conjunct onto `consumed`
+/// — `collect_range_ends` emits at most one end per conjunct, so choosing an end
+/// consumes its conjunct outright. `None` when no end covers `range_col`, or its
+/// type carries no ordered range.
 fn bound_next_column(
     range_col: u32,
     ends: &[RangeEndEntry],
@@ -449,14 +465,8 @@ fn bound_next_column(
     let start = start_idx.map_or(edge_start, |i| ends[i].end.cut);
     let end = end_idx.map_or(edge_end, |i| ends[i].end.cut);
 
-    let chosen = [start_idx, end_idx];
-    for cj in chosen.iter().flatten().map(|&i| ends[i].conjunct) {
-        let all_chosen = ends
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.conjunct == cj)
-            .all(|(i, _)| chosen.contains(&Some(i)));
-        if all_chosen && !consumed.contains(&cj) {
+    for cj in [start_idx, end_idx].iter().flatten().map(|&i| ends[i].conjunct) {
+        if !consumed.contains(&cj) {
             consumed.push(cj);
         }
     }
@@ -926,38 +936,99 @@ mod tests {
     // try_extract_pk_in
     // ------------------------------------------------------------------
 
+    /// The gather keys of `sql`, dropping the residual (which borrows the bound
+    /// expression and so cannot outlive this call).
+    fn pk_in_keys_of(sql: &str, schema: &Schema) -> Option<Vec<u128>> {
+        try_extract_pk_in(&bind_where(sql, schema), schema).map(|(keys, _)| keys)
+    }
+
+    /// The gather needs a genuine multi-key list on a single-column PK: a compound
+    /// PK declines, and a one-key list is an `Eq` by the time it gets here.
     #[test]
-    fn compound_pk_try_extract_pk_in_returns_none() {
-        let schema = compound_schema_u64_u64();
-        let expr = bind_where("a IN (1, 2)", &schema);
-        assert!(try_extract_pk_in(&expr, &schema).is_none());
+    fn try_extract_pk_in_declines_compound_pk_and_a_folded_one_key_list() {
+        assert!(pk_in_keys_of("a IN (1, 2)", &compound_schema_u64_u64()).is_none());
+        assert!(pk_in_keys_of("id IN (7)", &pk_schema(TypeCode::U64)).is_none());
     }
 
     #[test]
-    fn try_extract_pk_in_uuid_string_list_fast_path() {
-        let schema = uuid_schema_pk();
-        let expected = 0x550e8400_e29b_41d4_a716_446655440000_u128;
-        let expr = bind_where("id IN ('550e8400-e29b-41d4-a716-446655440000')", &schema);
-        let got = try_extract_pk_in(&expr, &schema).expect("UUID string IN-list should take fast path");
-        assert_eq!(got, vec![expected]);
+    fn try_extract_pk_in_uuid_string_list() {
+        assert_eq!(
+            pk_in_keys_of(
+                "id IN ('550e8400-e29b-41d4-a716-446655440000', '6ba7b810-9dad-11d1-80b4-00c04fd430c8')",
+                &uuid_schema_pk()
+            ),
+            Some(vec![
+                0x550e8400_e29b_41d4_a716_446655440000,
+                0x6ba7b810_9dad_11d1_80b4_00c04fd430c8
+            ])
+        );
     }
 
     #[test]
     fn try_extract_pk_in_uuid_invalid_string_falls_back() {
-        let schema = uuid_schema_pk();
-        let expr = bind_where("id IN ('550e8400-e29b-41d4-a716-446655440000', 'not-a-uuid')", &schema);
         assert!(
-            try_extract_pk_in(&expr, &schema).is_none(),
+            pk_in_keys_of(
+                "id IN ('550e8400-e29b-41d4-a716-446655440000', 'not-a-uuid')",
+                &uuid_schema_pk()
+            )
+            .is_none(),
             "invalid UUID in list should fall back to slow scan"
         );
     }
 
     #[test]
     fn try_extract_pk_in_negative_i32_list() {
-        let schema = pk_schema(TypeCode::I32);
-        let expr = bind_where("id IN (-1, -2)", &schema);
-        let got = try_extract_pk_in(&expr, &schema).expect("should match fast path");
-        assert_eq!(got, vec![(-1i32 as u32) as u128, (-2i32 as u32) as u128]);
+        assert_eq!(
+            pk_in_keys_of("id IN (-1, -2)", &pk_schema(TypeCode::I32)),
+            Some(vec![(-1i32 as u32) as u128, (-2i32 as u32) as u128])
+        );
+    }
+
+    /// Conjunct-level like every recognizer beside it: the list still bounds the
+    /// gather when it sits in an AND-tree, and the companion conjunct is returned as
+    /// the residual rather than sinking the whole WHERE to a scan.
+    #[test]
+    fn pk_in_inside_an_and_tree_gathers_with_a_residual() {
+        let schema = pk_schema(TypeCode::U64);
+        let expr = bind_where("v > 5 AND id IN (7, 9)", &schema);
+        let (keys, residual) = try_extract_pk_in(&expr, &schema).expect("the IN conjunct bounds the gather");
+        assert_eq!(keys, vec![7, 9]);
+        assert_eq!(residual.len(), 1, "`v > 5` stays residual");
+    }
+
+    // ------------------------------------------------------------------
+    // A one-element IN list is the equality it spells, so the `=` recognizers
+    // serve it. `bind::structural` pins the fold itself.
+    // ------------------------------------------------------------------
+
+    /// On `PRIMARY KEY (a, b)`, `a IN (7) AND b = 3` bounds the whole key. A genuine
+    /// multi-key list leaves the leading column unbound, which pins that the fold —
+    /// not some other path — is doing the work.
+    #[test]
+    fn one_key_in_list_bounds_the_pk_range() {
+        let schema = compound_schema_u64_u64();
+        let expr = bind_where("a IN (7) AND b = 3", &schema);
+        let (desc, residual) = try_extract_pk_range(&expr, &schema).expect("one-key IN bounds");
+        assert_eq!(desc, RangeDescriptor::point(&[7], 3));
+        assert!(residual.is_empty());
+        assert!(
+            try_extract_pk_range(&bind_where("a IN (7, 8) AND b = 3", &schema), &schema).is_none(),
+            "a real multi-key list leaves the leading PK column unbound"
+        );
+    }
+
+    /// On a U128 column the index bound must consume the conjunct outright — nothing
+    /// may reach the expression VM, which has no 16-byte slot for the OR-chain a
+    /// list lowers to.
+    #[test]
+    fn one_key_in_list_takes_an_index_bound() {
+        let schema = two_col(TypeCode::U128);
+        let expr = bind_where("val IN (7)", &schema);
+        let c = best_index_bound(&expr, &schema, || Ok(idx_metas(&[&[1]])))
+            .unwrap()
+            .expect("one-key IN must take an index bound");
+        assert_eq!(c.desc, RangeDescriptor::point(&[], 7));
+        assert!(c.residual.is_empty(), "the bound consumes the conjunct");
     }
 
     // ------------------------------------------------------------------
@@ -981,10 +1052,11 @@ mod tests {
             "try_col_eq_literal"
         );
 
-        // 3. try_extract_pk_in (bound WHERE pk IN (literal)).
-        let in_e = bind_single_table(&in_list_expr("id", vec![literal]), &schema).expect("bind in");
+        // 3. try_extract_pk_in — the repeat keeps it an `InList` (a one-item list
+        // folds to the `Eq` leg 2 already covers); the dedup collapses it to one key.
+        let in_e = bind_single_table(&in_list_expr("id", vec![literal.clone(), literal]), &schema).expect("bind in");
         assert_eq!(
-            try_extract_pk_in(&in_e, &schema),
+            try_extract_pk_in(&in_e, &schema).map(|(keys, _)| keys),
             Some(vec![expected]),
             "try_extract_pk_in"
         );
@@ -1063,10 +1135,7 @@ mod tests {
         assert!(residual.is_empty());
 
         // `t.id IN (1, 2)` → multi-seek fast path.
-        assert_eq!(
-            try_extract_pk_in(&bind_where("t.id IN (1, 2)", &schema), &schema),
-            Some(vec![1, 2])
-        );
+        assert_eq!(pk_in_keys_of("t.id IN (1, 2)", &schema), Some(vec![1, 2]));
 
         // `t.v > 5` / flipped `5 < t.v` → range end.
         let (c, e) = try_col_range_literal(&bind_where("t.v > 5", &schema), &schema).unwrap();

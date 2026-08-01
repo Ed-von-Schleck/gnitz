@@ -154,7 +154,8 @@ def test_pk_in_large(client):
 
 def test_point_select_on_compound_pk(client):
     """A full point on a compound PK: the range is one key wide, so it unicasts
-    to the worker owning that key's partition."""
+    to the worker owning that key's partition. `a IN (x)` is `a = x`, so both
+    spellings of the leading conjunct must confine to the same worker."""
     sn = "rs" + _uid()
     client.create_schema(sn)
     try:
@@ -165,8 +166,9 @@ def test_point_select_on_compound_pk(client):
         vals = ",".join(f"({a}, {b}, {a * 100 + b})" for a in range(6) for b in range(6))
         client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
         for a, b in [(0, 0), (3, 4), (5, 5)]:
-            rows = _rows(client, sn, f"SELECT v FROM t WHERE a = {a} AND b = {b}")
-            assert [r.v for r in rows] == [a * 100 + b], f"({a}, {b})"
+            for lead in (f"a = {a}", f"a IN ({a})"):
+                rows = _rows(client, sn, f"SELECT v FROM t WHERE {lead} AND b = {b}")
+                assert [r.v for r in rows] == [a * 100 + b], f"({a}, {b}) via {lead}"
     finally:
         _cleanup(client, sn, "t")
 

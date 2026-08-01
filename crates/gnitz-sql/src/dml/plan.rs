@@ -28,9 +28,13 @@ pub(crate) enum AccessPath<'e> {
     /// `WHERE` fully binds the PK: a single point seek; `residual` post-filters the
     /// seeked row's non-PK conjuncts (borrowed from the bound `WHERE`).
     PkSeek { pk: PkTuple, residual: Vec<&'e BoundExpr> },
-    /// `WHERE` is exactly `pk IN (literal, …)` on a single-column PK: one point seek
-    /// per key, no residual. Mutually exclusive with [`AccessPath::PkSeek`].
-    PkMultiSeek { pks: Vec<u128> },
+    /// `WHERE` holds a `pk IN (literal, …)` conjunct on a single-column PK: one point
+    /// seek per key, `residual` post-filtering the gathered rows' other conjuncts.
+    /// Mutually exclusive with [`AccessPath::PkSeek`].
+    PkMultiSeek {
+        pks: Vec<u128>,
+        residual: Vec<&'e BoundExpr>,
+    },
     /// `WHERE` needs a secondary-index probe, falling back to a predicate full scan
     /// when no index serves it.
     Filtered { where_expr: &'e BoundExpr },
@@ -44,8 +48,8 @@ pub(crate) fn classify_access<'e>(selection: Option<&'e BoundExpr>, schema: &Sch
     match selection {
         None => AccessPath::ScanAll,
         Some(where_expr) => {
-            if let Some(pks) = try_extract_pk_in(where_expr, schema) {
-                AccessPath::PkMultiSeek { pks }
+            if let Some((pks, residual)) = try_extract_pk_in(where_expr, schema) {
+                AccessPath::PkMultiSeek { pks, residual }
             } else if let Some((pk, residual)) = try_extract_pk_seek_residual(where_expr, schema) {
                 AccessPath::PkSeek { pk, residual }
             } else {
@@ -155,6 +159,56 @@ mod tests {
         {
             sqlparser::ast::Statement::Query(q) => *q,
             _ => panic!("not a query"),
+        }
+    }
+
+    /// The IN-list arity picks the path: one key folds to `Eq` at bind and takes the
+    /// unicast point seek; two or more take the multi-key gather; `NOT IN` binds to
+    /// `Not(…)`, which no recognizer matches, so it falls to a filtered scan.
+    #[test]
+    fn in_list_arity_picks_the_access_path() {
+        use crate::test_support::{bind_where, pk_schema};
+        use gnitz_core::TypeCode;
+
+        let schema = pk_schema(TypeCode::U64);
+        for (sql, want) in [
+            ("id IN (7)", "PkSeek"),
+            ("id IN (7, 9)", "PkMultiSeek"),
+            ("id NOT IN (7)", "Filtered"),
+            ("id NOT IN (7, 9)", "Filtered"),
+        ] {
+            let got = match classify_access(Some(&bind_where(sql, &schema)), &schema) {
+                AccessPath::PkSeek { residual, .. } => {
+                    assert!(residual.is_empty(), "{sql}");
+                    "PkSeek"
+                }
+                AccessPath::PkMultiSeek { pks, residual } => {
+                    assert_eq!(pks, vec![7, 9], "{sql}");
+                    assert!(residual.is_empty(), "{sql}");
+                    "PkMultiSeek"
+                }
+                AccessPath::Filtered { .. } => "Filtered",
+                AccessPath::ScanAll => "ScanAll",
+            };
+            assert_eq!(got, want, "{sql}");
+        }
+    }
+
+    /// A `pk IN (…)` conjunct still routes to the gather when the WHERE has more to
+    /// it; the rest rides along as the residual the fetched rows are filtered by.
+    #[test]
+    fn pk_in_with_a_companion_conjunct_still_gathers() {
+        use crate::test_support::{bind_where, pk_schema};
+        use gnitz_core::TypeCode;
+
+        let schema = pk_schema(TypeCode::U64);
+        let where_expr = bind_where("id IN (7, 9) AND v > 5", &schema);
+        match classify_access(Some(&where_expr), &schema) {
+            AccessPath::PkMultiSeek { pks, residual } => {
+                assert_eq!(pks, vec![7, 9]);
+                assert_eq!(residual.len(), 1, "`v > 5` post-filters the gathered rows");
+            }
+            _ => panic!("expected PkMultiSeek"),
         }
     }
 

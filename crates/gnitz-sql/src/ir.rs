@@ -52,12 +52,13 @@ pub(crate) enum BExpr<R> {
         branches: Vec<(BExpr<R>, BExpr<R>)>,
         else_: Option<Box<BExpr<R>>>,
     },
-    /// `inner IN (items…)` bound faithfully (un-desugared): each backend decides
-    /// how to lower it — a `≤8-byte-integer` operand with all-integer-literal
-    /// items compiles to one `INT_IN_SET`; anything else falls back to the
+    /// `inner IN (items…)` bound faithfully (un-desugared): lowering decides the
+    /// form — a `≤8-byte-integer` operand with all-integer-literal items compiles to
+    /// one `INT_IN_SET`; anything else falls back to the
     /// `inner = i0 OR inner = i1 OR …` chain. `NOT IN` is the outer
-    /// `UnaryOp(Not, InList)`. `items` is always non-empty (the binder rejects
-    /// `IN ()`).
+    /// `UnaryOp(Not, InList)`. `items` always holds two or more entries: the binder
+    /// rejects `IN ()` and folds `IN (l)` to `Eq`, so the recognizers over bound
+    /// conjuncts see a one-key list as the equality it is.
     InList {
         inner: Box<BExpr<R>>,
         items: Vec<BExpr<R>>,
@@ -534,7 +535,7 @@ mod tests {
         assert_eq!(
             BoundExpr::InList {
                 inner: Box::new(BoundExpr::ColRef(1)),
-                items: vec![BoundExpr::LitInt(1)],
+                items: vec![BoundExpr::LitInt(1), BoundExpr::LitInt(2)],
             }
             .infer_type(&s.columns),
             TypeCode::I64
