@@ -189,7 +189,7 @@ impl MappedShard {
         // writer never emits Constant for a wide PK (wide strides stay Raw by
         // construction), so this is defense-in-depth against a corrupt or
         // forged file.
-        if pk_stride as usize > crate::schema::NARROW_PK_MAX_BYTES && !matches!(pk, ScalarRegion::Raw { .. }) {
+        if pk_stride as usize > crate::schema::key::NARROW_PK_MAX_BYTES && !matches!(pk, ScalarRegion::Raw { .. }) {
             return Err(StorageError::InvalidShard);
         }
 

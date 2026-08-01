@@ -216,8 +216,8 @@ pub(super) fn build_check_batch(
     // not), so there is no narrow/wide split.
     let (stride, idx_key_type) = opk_leading_key(schema);
     build_check_batch_with(schema, keys, pooled, |b, &k| {
-        let buf = crate::schema::index_opk_prefix(k, src_type, idx_key_type);
-        b.extend_pk_bytes(&buf[..stride]);
+        let buf = crate::schema::key::index_opk_prefix(k, src_type, idx_key_type);
+        b.extend_pk_bytes(buf.padded(stride));
     })
 }
 
@@ -735,7 +735,7 @@ struct UniquePlan {
 /// found-set (which echoes matched probe keys) compares identical byte images.
 fn enc_key(schema: &SchemaDescriptor, v: u128, src_type: u8) -> PkBuf {
     let (stride, idx_key_type) = opk_leading_key(schema);
-    PkBuf::from_bytes(&crate::schema::index_opk_prefix(v, src_type, idx_key_type)[..stride])
+    PkBuf::from_bytes(crate::schema::key::index_opk_prefix(v, src_type, idx_key_type).padded(stride))
 }
 
 impl MasterDispatcher {
@@ -1180,7 +1180,7 @@ impl MasterDispatcher {
         let mut retracted_vals: FxHashSet<PkBuf> = FxHashSet::default();
         // Reused scratch the per-row OPK leading-key span is written into; each
         // `key_bytes` call overwrites it. No per-row allocation.
-        let mut keybuf = PkBuf::empty(0);
+        let mut keybuf = PkBuf::zeroed(0);
 
         for ci in 0..n_circuits {
             let (col_indices, idx_schema, spec) = unsafe {
@@ -1602,7 +1602,7 @@ impl MasterDispatcher {
                 // (two survivors, same span, different PK) on the way.
                 let mut by_span: FxHashMap<PkBuf, PkBuf> = FxHashMap::default();
                 let mut span_holders: Vec<(PkBuf, PkBuf)> = Vec::new();
-                let mut keybuf = PkBuf::empty(0);
+                let mut keybuf = PkBuf::zeroed(0);
                 for (pk, fam, row) in surviving {
                     let mb = b.batch(*fam).as_mem_batch();
                     if !spec.key_bytes(&mb, *row as usize, &mut keybuf) {
@@ -1685,7 +1685,7 @@ impl MasterDispatcher {
                 Some(FoldOp::Deleted) => true,
                 Some(FoldOp::Inserted(hf, hr)) => {
                     let hmb = b.batch(*hf).as_mem_batch();
-                    let mut hspan = PkBuf::empty(0);
+                    let mut hspan = PkBuf::zeroed(0);
                     !plan.spec.key_bytes(&hmb, *hr as usize, &mut hspan) || hspan != span
                 }
             };

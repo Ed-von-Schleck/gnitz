@@ -1,7 +1,7 @@
 //! Secondary index integration: AviBake/AviDesc, op_integrate_with_indexes.
 
 use crate::ops::AggDescriptor;
-use crate::schema::{type_code, ColumnLocator, SchemaColumn, SchemaDescriptor};
+use crate::schema::{type_code, ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor};
 use crate::storage::Batch;
 use gnitz_wire::AggFunc;
 
@@ -69,27 +69,20 @@ pub struct AviDesc<'a> {
 /// schema shape serves single- and multi-aggregate reduces alike. The empty
 /// global key reduces the prefix to just `ordinal`.
 pub(crate) fn make_avi_schema(src: &SchemaDescriptor, group_by_cols: &[u32]) -> SchemaDescriptor {
-    let mut cols = Vec::with_capacity(group_by_cols.len() + 2);
-    let mut pk = Vec::with_capacity(group_by_cols.len() + 2);
-    for (i, &c) in group_by_cols.iter().enumerate() {
+    // All-PK, no payload, PK dense in declared order — `DerivedSchema`'s shape.
+    // Its bounds (and `SchemaDescriptor::new`'s MAX_PK_BYTES assert) are the
+    // backstop should the `avi_group_key_eligible` gate ever be relaxed past the
+    // engine's PK limit.
+    let mut b = DerivedSchema::new();
+    let over = || panic!("make_avi_schema: composite key exceeds the PK column limit");
+    for &c in group_by_cols {
         // Force non-nullable: eligibility guarantees the value is always present.
-        cols.push(SchemaColumn::new(src.columns[c as usize].type_code, 0));
-        pk.push(i as u32);
+        b.push_pk(SchemaColumn::new(src.columns[c as usize].type_code, 0))
+            .unwrap_or_else(over);
     }
-    cols.push(SchemaColumn::new(type_code::U8, 0)); // ordinal
-    pk.push(group_by_cols.len() as u32);
-    cols.push(SchemaColumn::new(type_code::U64, 0)); // av_encoded
-    pk.push((group_by_cols.len() + 1) as u32);
-    let schema = SchemaDescriptor::new(&cols, &pk);
-    // Guard against a gate relaxation overshooting the engine PK limit. The
-    // byte-form cursor orders wide keys via compare_pk_bytes, so the bound is
-    // MAX_PK_BYTES, not the narrow cap.
-    debug_assert!(
-        schema.pk_stride() as usize <= crate::schema::MAX_PK_BYTES,
-        "make_avi_schema: composite key {} exceeds MAX_PK_BYTES",
-        schema.pk_stride(),
-    );
-    schema
+    b.push_pk(SchemaColumn::new(type_code::U8, 0)).unwrap_or_else(over); // ordinal
+    b.push_pk(SchemaColumn::new(type_code::U64, 0)).unwrap_or_else(over); // av_encoded
+    b.finish()
 }
 
 // ---------------------------------------------------------------------------

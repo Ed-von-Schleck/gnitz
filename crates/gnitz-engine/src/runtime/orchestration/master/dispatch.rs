@@ -861,9 +861,9 @@ impl MasterDispatcher {
         // always carries the full PK and the prefix ⊆ the PK, so a full-PK seek
         // pins exactly one worker — no broadcast clause. Encoding native → OPK is
         // load-bearing: hashing the native value misroutes signed/compound PKs.
-        let (opk, stride) = crate::schema::seek_opk_bytes(&schema, pk, seek_pk_extra)
+        let opk = crate::schema::key::seek_opk_bytes(&schema, pk, seek_pk_extra)
             .map_err(|e| format!("seek: table {target_id}: {e}"))?;
-        let worker = worker_for_partition(schema.partition_for_pk(&opk[..stride]), num_workers);
+        let worker = worker_for_partition(schema.partition_for_pk(opk.pk_bytes()), num_workers);
         single_worker(
             disp_ptr,
             reactor,

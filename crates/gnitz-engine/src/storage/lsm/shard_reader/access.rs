@@ -109,7 +109,7 @@ impl MappedShard {
                 PkBuf::from_bytes(self.get_pk_bytes(self.count - 1)),
             )
         } else {
-            let e = PkBuf::empty(self.pk_stride);
+            let e = PkBuf::zeroed(self.pk_stride as usize);
             (e, e)
         }
     }

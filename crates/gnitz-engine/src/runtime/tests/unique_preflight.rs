@@ -244,7 +244,7 @@ fn project_sorted(batch: &Batch, owner: &SchemaDescriptor, cols: &[u32]) -> Vec<
     let spec = IndexKeySpec::new(cols, owner, &idx_schema);
     let mb = batch.as_mem_batch();
     let mut keys: Vec<PkBuf> = Vec::new();
-    let mut keybuf = PkBuf::empty(0);
+    let mut keybuf = PkBuf::zeroed(0);
     for row in 0..batch.count {
         let w = batch.get_weight(row);
         if w <= 0 {
@@ -441,7 +441,7 @@ fn index_key_spec_equals_projected_leading_span() {
     assert_eq!(projected.count, rows.len());
 
     let mb = batch.as_mem_batch();
-    let mut keybuf = PkBuf::empty(0);
+    let mut keybuf = PkBuf::zeroed(0);
     for row in 0..batch.count {
         assert!(spec.key_bytes(&mb, row, &mut keybuf));
         assert_eq!(
@@ -488,7 +488,7 @@ fn index_key_spec_skips_any_null_column() {
     }
     let spec = IndexKeySpec::new(&cols, &owner, &idx_schema);
     let mb = batch.as_mem_batch();
-    let mut keybuf = PkBuf::empty(0);
+    let mut keybuf = PkBuf::zeroed(0);
     assert!(spec.key_bytes(&mb, 0, &mut keybuf), "both columns present ⇒ indexed");
     assert!(
         !spec.key_bytes(&mb, 1, &mut keybuf),
@@ -550,7 +550,7 @@ fn key_bytes_reused_buffer_zeros_tail_when_narrowing() {
     assert_eq!(narrow.key_size(), 8, "single U64 index column ⇒ 8-byte span");
 
     // ONE reused scratch buffer: wide first, then narrow.
-    let mut keybuf = PkBuf::empty(0);
+    let mut keybuf = PkBuf::zeroed(0);
 
     assert!(wide.key_bytes(&mb, 0, &mut keybuf), "wide row is indexed");
     assert_eq!(keybuf.len, 16);

@@ -142,8 +142,11 @@ impl CatalogEngine {
                     // the index PK is OPK-at-rest, so prefix-match the whole
                     // leading column (idx_key_size), not a source-width LE
                     // prefix.
-                    let opk = crate::schema::index_opk_prefix(fk_key, loc.type_code(), idx_key_type.unwrap());
-                    idx_cursor.as_mut().unwrap().seek_first_positive_with_prefix(&opk[..ks])
+                    let opk = crate::schema::key::index_opk_prefix(fk_key, loc.type_code(), idx_key_type.unwrap());
+                    idx_cursor
+                        .as_mut()
+                        .unwrap()
+                        .seek_first_positive_with_prefix(opk.padded(ks))
                 };
                 if !found {
                     let (sn, tn) = self.caches.entity_by_id.get(&table_id).cloned().unwrap_or_default();
@@ -229,7 +232,7 @@ impl CatalogEngine {
         // reused destination `IndexKeySpec::key_bytes` writes each row's span
         // into — no per-row allocation.
         let mut seen: FxHashSet<PkBuf> = FxHashSet::with_capacity_and_hasher(batch.count, Default::default());
-        let mut keybuf = PkBuf::empty(0);
+        let mut keybuf = PkBuf::zeroed(0);
 
         for ic in &entry.index_circuits {
             let Some(unique_slice) = ic.unique_cols() else { continue };

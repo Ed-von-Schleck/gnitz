@@ -550,8 +550,8 @@ impl Table {
     /// Check if a PK exists with positive net weight.
     #[cfg(test)] // production existence checks go through has_pk_bytes
     pub fn has_pk(&mut self, key: u128) -> bool {
-        let (opk, n) = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
-        self.has_pk_bytes(&opk[..n])
+        let opk = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
+        self.has_pk_bytes(opk.pk_bytes())
     }
 
     /// Byte-keyed PK existence check. The OPK-keyed memtable bloom gates the
@@ -602,8 +602,8 @@ impl Table {
     /// point has no production caller and is retained only for unit tests.
     #[cfg(test)]
     pub(crate) fn retract_pk(&mut self, key: u128) -> (i64, Option<RowRef>) {
-        let (opk, n) = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
-        self.retract_pk_bytes(&opk[..n])
+        let opk = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
+        self.retract_pk_bytes(opk.pk_bytes())
     }
 
     /// Look up a PK for retraction by its OPK `key` bytes. Returns the net

@@ -1185,7 +1185,7 @@ impl WorkerProcess {
         // partition. `key_bytes` keeps the single column→span definition shared
         // with the filter warmup and the master merge.
         let mut sorter = crate::storage::SpillSort::new(&dir, stride, unique_preflight_spill_bytes());
-        let mut keybuf = PkBuf::empty(0);
+        let mut keybuf = PkBuf::zeroed(0);
         if let Some(mut handle) = self.cat().open_store_cursor(owner_id) {
             while let Some(chunk) = handle.drain_chunk(chunk_rows) {
                 let mb = chunk.as_mem_batch();

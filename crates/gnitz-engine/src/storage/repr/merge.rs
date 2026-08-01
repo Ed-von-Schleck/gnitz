@@ -18,9 +18,10 @@ use super::heap::{drive_merge, HeapNode, LoserTree};
 #[cfg(test)]
 use crate::schema::key::compare_pk_bytes;
 use crate::schema::key::{compare_pk_ordering, pack_pk_be};
-use crate::schema::{BlobCache, SchemaDescriptor, MAX_COLUMNS};
+use crate::schema::{SchemaDescriptor, MAX_COLUMNS};
 use gnitz_expr::{BatchView, RowSource};
 use gnitz_wire::{is_german_string, read_u64_le};
+use rustc_hash::FxHashMap;
 
 // ---------------------------------------------------------------------------
 // ColPtr / UnifiedSource: type-erased column accessors that work uniformly
@@ -105,6 +106,85 @@ pub(crate) fn mem_batch_to_unified(mb: &MemBatch, schema: &SchemaDescriptor) -> 
         blob_ptr: mb.blob.as_ptr(),
         blob_len: mb.blob.len(),
     }
+}
+
+/// Identity-keyed dedup cache for `relocate_german_string_vec`.
+///
+/// Key: `(src_blob.as_ptr() as usize, old_offset, length)`. The same source
+/// span is copied at most once per merge — the cached value is the offset
+/// inside the destination blob where the bytes were appended.
+pub(crate) type BlobCache = FxHashMap<(usize, usize, usize), usize>;
+
+/// Copy a 16-byte German string cell and (for long strings) migrate the
+/// out-of-line payload from `src_blob` into `dst_blob`.
+///
+/// The returned cell is ready to write into the output column buffer and is
+/// always **canonical** (`german_string_cell_ok`): pad bytes past the content
+/// are rebuilt as zero rather than copied through, so a skewed cell that
+/// reached memory some other way cannot propagate a compare-visible pad — the
+/// divergence where two rows hash equal but order unequal and never
+/// consolidate. Short strings resolve entirely inline; `src_blob` is unused.
+///
+/// When `cache` is `Some`, the appended blob data is deduplicated by
+/// `(src_blob.as_ptr(), old_offset, length)` — i.e. the same source span is
+/// only copied once per merge.
+///
+/// **Malformed-input fallback:** a long header declaring a region that overruns
+/// `src_blob` yields the canonical empty string rather than an out-of-bounds
+/// read, keeping trusted in-memory callers panic-free on data that slipped past
+/// validation.
+#[inline]
+pub(crate) fn relocate_german_string_vec(
+    src_cell: &[u8],
+    src_blob: &[u8],
+    dst_blob: &mut Vec<u8>,
+    cache: Option<&mut BlobCache>,
+) -> [u8; 16] {
+    // One bounds check for the whole relocation: every read below is a constant
+    // index into a proven 16-byte cell.
+    let src: &[u8; 16] = src_cell[..16]
+        .try_into()
+        .expect("relocate_german_string_vec: src must be a 16-byte German string cell");
+    if gnitz_wire::read_u32_le(src, 0) as usize <= gnitz_wire::SHORT_STRING_THRESHOLD {
+        return gnitz_wire::canonical_short_cell(src);
+    }
+    relocate_long_german_string(src, src_blob, dst_blob, cache)
+}
+
+/// The out-of-line half of `relocate_german_string_vec` — kept separate so the
+/// short path stays a branchless inline sequence with no call and no frame.
+fn relocate_long_german_string(
+    src: &[u8; 16],
+    src_blob: &[u8],
+    dst_blob: &mut Vec<u8>,
+    cache: Option<&mut BlobCache>,
+) -> [u8; 16] {
+    let length = gnitz_wire::read_u32_le(src, 0) as usize;
+    let old_offset = gnitz_wire::read_u64_le(src, 8);
+    let mut dest = [0u8; 16];
+    let Some(span) = gnitz_wire::blob_extent(src_blob.len(), old_offset, length) else {
+        // Malformed: the all-zero cell is the canonical empty string, and
+        // `dst_blob` is left untouched.
+        return dest;
+    };
+    // `length > SHORT_STRING_THRESHOLD ≥ 4`, so all four prefix bytes are content.
+    dest[0..8].copy_from_slice(&src[0..8]);
+    let new_offset = dst_blob.len();
+    let off = match cache {
+        Some(cache) => {
+            let key = (src_blob.as_ptr() as usize, span.start, length);
+            *cache.entry(key).or_insert_with(|| {
+                dst_blob.extend_from_slice(&src_blob[span]);
+                new_offset
+            })
+        }
+        None => {
+            dst_blob.extend_from_slice(&src_blob[span]);
+            new_offset
+        }
+    };
+    dest[8..16].copy_from_slice(&(off as u64).to_le_bytes());
+    dest
 }
 
 // ---------------------------------------------------------------------------
@@ -436,7 +516,10 @@ pub struct DirectWriter<'a> {
     blob: &'a mut Vec<u8>,
     blob_cache: BlobCacheGuard,
     pub(super) count: usize,
-    pub(super) schema: SchemaDescriptor,
+    /// Borrowed, not owned: `write_row` reads it per row, and a `SchemaDescriptor`
+    /// is 424 bytes — copying it in would put a `memcpy` of that size on the
+    /// per-row path (and inflate the writer by the same amount).
+    pub(super) schema: &'a SchemaDescriptor,
 }
 
 impl<'a> DirectWriter<'a> {
@@ -446,7 +529,7 @@ impl<'a> DirectWriter<'a> {
         null_bmp: &'a mut [u8],
         col_bufs: Vec<&'a mut [u8]>,
         blob: &'a mut Vec<u8>,
-        schema: SchemaDescriptor,
+        schema: &'a SchemaDescriptor,
         blob_cache_capacity: usize,
     ) -> Self {
         let pk_stride = schema.pk_stride();
@@ -457,7 +540,7 @@ impl<'a> DirectWriter<'a> {
             null_bmp,
             col_bufs,
             blob,
-            blob_cache: BlobCacheGuard::acquire(&schema, blob_cache_capacity),
+            blob_cache: BlobCacheGuard::acquire(schema, blob_cache_capacity),
             count: 0,
             schema,
         }
@@ -490,7 +573,7 @@ impl<'a> DirectWriter<'a> {
         // cached `FixedIntNonnull` class). No null bit can be set and no column
         // is a German string, so skip the per-column null test and string-type
         // branch and copy each cell straight through.
-        if schema_is_fixedint_nonnull(&schema) {
+        if schema_is_fixedint_nonnull(schema) {
             for (payload_idx, _ci, col) in schema.payload_columns() {
                 let col_size = col.size() as usize;
                 let off = out_row * col_size;
@@ -525,8 +608,7 @@ impl<'a> DirectWriter<'a> {
     /// the cross-module inlining that same-module placement gave for free.
     #[inline]
     pub(super) fn write_string_cell(&mut self, payload_col: usize, src_struct: &[u8], src_blob: &[u8], out_row: usize) {
-        let dest =
-            crate::schema::relocate_german_string_vec(src_struct, src_blob, self.blob, self.blob_cache.get_mut());
+        let dest = relocate_german_string_vec(src_struct, src_blob, self.blob, self.blob_cache.get_mut());
         let off = out_row * 16;
         self.col_bufs[payload_col][off..off + 16].copy_from_slice(&dest);
     }
@@ -874,6 +956,82 @@ fn drain_groups_into<RowCmp>(
 
 #[cfg(test)]
 mod tests {
+    // Claim 6: the malformed-long-string fallback must zero both the length
+    // field (dest[0..4]) AND the prefix field (dest[4..8]).  Before the fix,
+    // dest[4..8] was left containing the garbage bytes copied from the corrupt
+    // source cell.
+    #[test]
+    fn test_malformed_long_string_fallback_clean_header() {
+        let mut src_cell = [0u8; 16];
+        // length = 20  (> SHORT_STRING_THRESHOLD = 12)
+        src_cell[0..4].copy_from_slice(&20u32.to_le_bytes());
+        // prefix = 0xDEADBEEF  (stale garbage that must be zeroed on fallback)
+        src_cell[4..8].copy_from_slice(&0xDEAD_BEEF_u32.to_le_bytes());
+        // heap_offset = 999  (well beyond src_blob)
+        src_cell[8..16].copy_from_slice(&999u64.to_le_bytes());
+
+        let src_blob = vec![0u8; 4]; // far too small
+        let mut dst_blob: Vec<u8> = Vec::new();
+
+        let result = relocate_german_string_vec(&src_cell, &src_blob, &mut dst_blob, None);
+
+        assert_eq!(
+            u32::from_le_bytes(result[0..4].try_into().unwrap()),
+            0,
+            "fallback must emit length=0",
+        );
+        assert_eq!(&result[4..8], &[0u8; 4], "fallback must zero the prefix field");
+        assert_eq!(&result[8..16], &[0u8; 8], "fallback must leave blob offset zero");
+        assert!(dst_blob.is_empty(), "fallback must not extend dst_blob");
+        assert!(gnitz_wire::german_string_cell_ok(&result, &dst_blob));
+    }
+
+    /// The relocator rebuilds a cell rather than copying its bytes, so a skewed
+    /// pad — compare-visible but invisible to `german_string_content`, i.e. the
+    /// shape that splits one Z-set element's weight across two rows — cannot
+    /// survive a merge, scatter or map projection.
+    #[test]
+    fn test_relocate_canonicalizes_pad_bytes() {
+        let mut dst_blob: Vec<u8> = Vec::new();
+        for content in [&b""[..], b"a", b"abc", b"abcd", b"abcdefghijkl"] {
+            let clean = gnitz_wire::encode_german_string(content, &mut Vec::new());
+            let mut dirty = clean;
+            for b in dirty[4 + content.len()..16].iter_mut() {
+                *b = 0xFF;
+            }
+            assert_eq!(
+                relocate_german_string_vec(&dirty, &[], &mut dst_blob, None),
+                clean,
+                "relocation must rebuild {content:?} in canonical form",
+            );
+        }
+        assert!(dst_blob.is_empty(), "inline cells must not touch the blob");
+    }
+
+    #[test]
+    fn test_relocate_german_string_vec_cache_hit_dedups() {
+        // Long-string source: length=20, payload at offset 0 in src_blob.
+        let payload: &[u8] = b"hello world test dat";
+        assert_eq!(payload.len(), 20);
+        let src_blob: Vec<u8> = payload.to_vec();
+
+        let mut src_cell = [0u8; 16];
+        src_cell[0..4].copy_from_slice(&20u32.to_le_bytes());
+        src_cell[4..8].copy_from_slice(&payload[0..4]);
+        src_cell[8..16].copy_from_slice(&0u64.to_le_bytes());
+
+        let mut dst_blob: Vec<u8> = Vec::new();
+        let mut cache: BlobCache = BlobCache::default();
+
+        let r1 = relocate_german_string_vec(&src_cell, &src_blob, &mut dst_blob, Some(&mut cache));
+        let after_first = dst_blob.len();
+        assert_eq!(after_first, 20, "first call must append payload exactly once");
+
+        let r2 = relocate_german_string_vec(&src_cell, &src_blob, &mut dst_blob, Some(&mut cache));
+        assert_eq!(dst_blob.len(), 20, "cache hit must not append a second copy");
+        assert_eq!(&r1[8..16], &r2[8..16], "both calls must return the same offset");
+    }
+
     use super::super::batch::{Batch, Layout};
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
@@ -1318,7 +1476,7 @@ mod tests {
                 blob: &mut out_blob,
                 blob_cache: BlobCacheGuard::acquire(schema, 0),
                 count: 0,
-                schema: *schema,
+                schema,
             };
 
             merge_batches(&sorted, schema, &mut writer);
@@ -1554,7 +1712,7 @@ mod tests {
                 blob: &mut out_blob,
                 blob_cache: BlobCacheGuard::acquire(schema, 0),
                 count: 0,
-                schema: *schema,
+                schema,
             };
             sort_and_consolidate(&batch, schema, &mut writer);
             count = writer.row_count();
@@ -1792,7 +1950,7 @@ mod tests {
                 blob: &mut out_blob,
                 blob_cache: BlobCacheGuard::acquire(schema, 0),
                 count: 0,
-                schema: *schema,
+                schema,
             };
             fold_sorted(&batch, schema, &mut writer);
             count = writer.row_count();
@@ -2160,7 +2318,7 @@ mod tests {
                 blob: &mut out_b,
                 blob_cache: BlobCacheGuard::acquire(schema, 0),
                 count: 0,
-                schema: *schema,
+                schema,
             };
             run(&mut writer);
             count = writer.row_count();
@@ -2526,7 +2684,7 @@ mod tests {
             let count;
             {
                 let col_refs: Vec<&mut [u8]> = cols.iter_mut().map(|c| c.as_mut_slice()).collect();
-                let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, col_refs, &mut blob, *schema, total_rows);
+                let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, col_refs, &mut blob, schema, total_rows);
                 run(&mut writer);
                 count = writer.row_count();
             }

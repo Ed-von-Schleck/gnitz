@@ -3,8 +3,7 @@
 //! These are shared across the storage, IPC, and query layers.
 
 use gnitz_expr::RowSource;
-use gnitz_wire::{is_fixed_int, is_signed_int, SHORT_STRING_THRESHOLD};
-use rustc_hash::FxHashMap;
+use gnitz_wire::{is_fixed_int, is_signed_int};
 
 // One rule for what this module re-exports: a *schema fact* — what a column's
 // type is, how many of them there can be, how a key is shaped — comes through
@@ -30,11 +29,12 @@ pub use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
 pub(crate) use gnitz_expr::ColumnLocator;
 use gnitz_expr::PAYLOAD_MAPPING_PK_SENTINEL;
 
-/// Order-preserving primary-key (OPK) primitives — encode/compare/route/pack
-/// and the width-tagged `PkBuf`. Sits below both schema and storage, and is the
-/// one import path: `storage` used to re-export the cluster so its call sites
-/// read `crate::storage::X`, which left the §1/§6 byte-order rule spelled two
-/// ways in adjacent lines of the same file.
+/// Order-preserving primary-key (OPK) primitives — every native→OPK encoder
+/// (whole PK, seek wire pair, index leading span), compare/route/pack, and the
+/// width-tagged `PkBuf` those encoders return. Sits below both schema and
+/// storage, and is the one import path: `storage` used to re-export the cluster
+/// so its call sites read `crate::storage::X`, which left the §1/§6 byte-order
+/// rule spelled two ways in adjacent lines of the same file.
 pub(crate) mod key;
 
 /// Build a `SchemaDescriptor` from a wire-neutral `WireSysCol` slice (the
@@ -169,48 +169,6 @@ impl SchemaColumn {
     pub(crate) const fn is_signed(&self) -> bool {
         self.is_signed != 0
     }
-}
-
-/// Widest PK region that still fits in a packed `u128` word (16 bytes), the
-/// boundary where a key stops fitting one `u128`. At or below it `get_pk`
-/// returns the exact key as a `u128` (wider regions must read `get_pk_bytes`)
-/// and the seek wire image splits into a low-16 word plus a `> 16` suffix
-/// (`seek_opk_bytes`); above it a shard's PK region must be stored `Raw`
-/// (a `Constant` region holds only 16 bytes) and is ordered via `compare_pk_bytes`.
-pub(crate) const NARROW_PK_MAX_BYTES: usize = 16;
-
-/// Reassemble the native seek image from the wire pair `(low, extra)` — the
-/// inverse of `PkTuple::split_wire` — and OPK-encode it via [`key::opk_key`].
-/// The shared seek-key encoder for the master partition router
-/// (`fan_out_seek`) and the worker SEEK handler (`seek_family`) at every
-/// PK width. The seek frame carries the key as native LE column bytes (it
-/// bypasses the client's `build_pk_region`, so the bytes are not yet OPK): the
-/// low ≤16 ride in `low`, a wide PK's `16..stride` suffix in `extra` (empty for
-/// narrow PKs).
-/// Errors if `extra` is shorter than the wide suffix `stride - 16`.
-pub(crate) fn seek_opk_bytes(
-    schema: &SchemaDescriptor,
-    low: u128,
-    extra: &[u8],
-) -> Result<([u8; MAX_PK_BYTES], usize), String> {
-    let stride = schema.pk_stride() as usize;
-    if stride > MAX_PK_BYTES {
-        return Err(format!("PK stride {stride} exceeds MAX_PK_BYTES {MAX_PK_BYTES}"));
-    }
-    let needed = stride.saturating_sub(NARROW_PK_MAX_BYTES);
-    if extra.len() < needed {
-        return Err(format!(
-            "PK stride {stride} requires {needed} extra bytes, got {}",
-            extra.len()
-        ));
-    }
-    // Native image = `low`'s 16 LE bytes, then the wide suffix. The upper bound
-    // is `16 + needed` (not `stride`): for a narrow PK `needed == 0` makes it the
-    // empty copy `le[16..16]` rather than the inverted range `le[16..stride]`.
-    let mut le = [0u8; MAX_PK_BYTES];
-    le[..NARROW_PK_MAX_BYTES].copy_from_slice(&low.to_le_bytes());
-    le[NARROW_PK_MAX_BYTES..NARROW_PK_MAX_BYTES + needed].copy_from_slice(&extra[..needed]);
-    Ok(key::opk_key(schema, &le[..stride]))
 }
 
 /// Pre-computed payload row-comparator strategy for a schema. Stored on
@@ -485,9 +443,6 @@ impl SchemaDescriptor {
 
     /// Iterate over PK columns in pk-list order. Mirror of
     /// `payload_columns()`. Yields `(pk_ord, col_idx, &SchemaColumn)`.
-    /// No non-test caller today; introduced preemptively so future
-    /// compound-PK migration sites can drop in `for (ord, ci, col) in
-    /// schema.pk_columns()` without redefining the iterator shape.
     #[inline]
     pub fn pk_columns(&self) -> impl Iterator<Item = (usize, usize, &SchemaColumn)> {
         self.pk_indices()
@@ -556,8 +511,8 @@ impl SchemaDescriptor {
     /// encoding flips the sign bit of the leading byte, so the `extend_pk` /
     /// `set_pk_at` u128 fast paths — which write right-aligned big-endian bytes
     /// with no sign flip — are wrong for it. Such callers must use
-    /// `extend_pk_bytes`. Only the `#[cfg(test)]` `append_row` guard needs this
-    /// today, so it is gated to test builds to keep the production API minimal.
+    /// `extend_pk_bytes`. Only test-build callers need it, so it is gated to
+    /// test builds to keep the production API minimal.
     #[cfg(test)]
     #[inline]
     pub(crate) const fn pk_is_signed_single_col(&self) -> bool {
@@ -566,17 +521,6 @@ impl SchemaDescriptor {
         }
         let tc = self.columns[self.pk_indices[0] as usize].type_code;
         is_signed_int(tc)
-    }
-
-    /// The single PK column index. Asserts pk_count == 1. Production callers
-    /// are gone (the control-block codec moved to `gnitz_wire`); kept for the
-    /// schema tests that pin single-PK behavior.
-    #[cfg(test)]
-    #[inline]
-    #[track_caller]
-    pub(crate) const fn pk_index_single(&self) -> u32 {
-        assert!(self.pk_count == 1, "compound PK not yet supported here");
-        self.pk_indices[0]
     }
 
     /// Number of non-PK ("payload") columns.
@@ -701,6 +645,15 @@ impl SchemaDescriptor {
         unreachable!("pk_byte_offset: col_idx is a pk column but not found in pk_columns()");
     }
 
+    /// Byte width of the leading `n` columns. For an index schema this is the
+    /// OPK leading-key span width (`idx_key_size`) — the sum of every promoted
+    /// column's width, never just `columns[0]` (a composite `UNIQUE (a, b)`
+    /// span can exceed 16 bytes); the source-PK suffix begins there.
+    #[inline]
+    pub(crate) fn leading_key_size(&self, n: usize) -> usize {
+        self.columns[..n].iter().map(|c| c.size() as usize).sum()
+    }
+
     /// Resolve where column `col_idx`'s value lives. The canonical entry point
     /// for reading a column whose index is not statically a payload column.
     #[inline]
@@ -710,8 +663,8 @@ impl SchemaDescriptor {
         // arrays, resolves to the PK arm, and dies in `pk_byte_offset`'s
         // `unreachable!()` with a message naming neither `locate` nor the bad
         // index. A `debug_assert` would let that ship in release, so this is a
-        // hard `assert!` in the `pk_index_single` canary style. It is a
-        // last-line guard against an internal bug, distinct from
+        // hard `assert!`. It is a last-line guard against an internal bug,
+        // distinct from
         // untrusted-index rejection (a client-supplied circuit naming an OOB
         // column). `locate` runs at extractor/program setup and, at worst, once
         // per group (`extract_group_key`) — never per row — so the check and the
@@ -780,17 +733,6 @@ impl gnitz_expr::SchemaFacts for SchemaDescriptor {
 // primitives, the bitmap is a §6 byte convention owned by `gnitz-wire` — the
 // crate whose `REG_NULL_BMP` names the region — and shared verbatim with the
 // client and the evaluator; engine call sites name `gnitz_wire::` directly.
-
-impl SchemaDescriptor {
-    /// Byte width of the leading `n` columns. For an index schema this is the
-    /// OPK leading-key span width (`idx_key_size`) — the sum of every promoted
-    /// column's width, never just `columns[0]` (a composite `UNIQUE (a, b)`
-    /// span can exceed 16 bytes); the source-PK suffix begins there.
-    #[inline]
-    pub(crate) fn leading_key_size(&self, n: usize) -> usize {
-        self.columns[..n].iter().map(|c| c.size() as usize).sum()
-    }
-}
 
 /// Precomputed read/encode plan for one index's OPK leading-key span: per
 /// indexed column, the owner-side read coordinate (PK-or-payload, resolved via
@@ -867,7 +809,7 @@ impl IndexKeySpec {
 
     /// The promoted index columns of the leading span, in index order.
     #[inline]
-    pub(crate) fn idx_cols(&self) -> &[SchemaColumn] {
+    fn idx_cols(&self) -> &[SchemaColumn] {
         &self.idx_cols[..self.n as usize]
     }
 
@@ -902,11 +844,6 @@ impl IndexKeySpec {
     /// `ColPromoter::write_into` uses — the two must emit byte-identical keys for
     /// one logical value, so they share the encoders rather than each spelling the
     /// promotion.
-    ///
-    /// (The pre-rewrite form widened a payload cell into a `u128` and re-sliced it
-    /// back, which for every reachable index type is the identity on the cell
-    /// bytes — and is FALSE for the 16-byte German-string layout, which
-    /// [`Self::new`] rejects.)
     pub(crate) fn write_span(&self, mb: &impl RowSource, row: usize, dst: &mut [u8]) -> bool {
         debug_assert!(dst.len() >= self.key_size(), "write_span: dst shorter than the span");
         let mut off = 0;
@@ -969,34 +906,23 @@ impl IndexKeySpec {
 
     /// Seek-side counterpart of [`Self::write_span`]: OPK-encode native key
     /// values (zero-extended, as `pk_native_key`/`payload_native_key` produce
-    /// them) into the leading-key prefix, returning the buffer and the filled
-    /// prefix length. For a leading-prefix seek, build the spec over only the
-    /// supplied columns. Each column makes the same `encode_pk_column_promoted`
-    /// call as `write_span`, so the seek prefix matches the projected entries
-    /// by construction. Bytes past the prefix stay zero (the source-PK suffix
-    /// is not part of the leading-column prefix).
-    pub(crate) fn seek_prefix(&self, natives: &[u128]) -> ([u8; MAX_PK_BYTES], usize) {
+    /// them) into the leading-key span, returned as a [`key::PkBuf`] of exactly
+    /// [`Self::key_size`] bytes. For a leading-prefix seek, build the spec over
+    /// only the supplied columns. Encodes through the shared
+    /// [`key::encode_leading_opk`], the same per-column call `write_span` makes,
+    /// so the seek prefix matches the projected entries by construction. Bytes
+    /// past the span stay zero (the source-PK suffix is not part of it).
+    pub(crate) fn seek_prefix(&self, natives: &[u128]) -> key::PkBuf {
         debug_assert_eq!(
             natives.len(),
             self.n as usize,
             "seek_prefix: one native value per spec column"
         );
-        let mut opk = [0u8; MAX_PK_BYTES];
-        let mut off = 0;
-        for (native, (loc, col)) in natives
+        let cols = self.locators[..self.n as usize]
             .iter()
-            .zip(self.locators[..self.n as usize].iter().zip(self.idx_cols()))
-        {
-            let size = col.size() as usize;
-            gnitz_wire::encode_pk_column_promoted(
-                &native.to_le_bytes()[..loc.size()],
-                loc.type_code(),
-                col.type_code,
-                &mut opk[off..off + size],
-            );
-            off += size;
-        }
-        (opk, off)
+            .zip(self.idx_cols())
+            .map(|(loc, col)| (loc.type_code(), *col));
+        key::encode_leading_opk(cols, natives)
     }
 }
 
@@ -1049,108 +975,6 @@ impl Default for SchemaDescriptor {
 // Row-format utilities
 // ---------------------------------------------------------------------------
 
-/// OPK-encode a native index-key value into the index's leading-column bytes,
-/// for a prefix seek or a check-batch composite PK — the scalar sibling of
-/// [`IndexKeySpec::seek_prefix`] for callers whose source column lives in
-/// another table's schema (FK probes). `src_type` is the *source* column type
-/// (the value in `native` is zero-extended): a signed source sign-extends from
-/// its native width before OPK-encoding at the promoted `idx_key_type`,
-/// byte-identical to the write-side `IndexKeySpec::write_span`. Bytes beyond
-/// the leading column stay zero (the source-PK suffix is not part of the
-/// leading-column prefix).
-#[inline]
-pub(crate) fn index_opk_prefix(native: u128, src_type: u8, idx_key_type: u8) -> [u8; MAX_PK_BYTES] {
-    let mut opk = [0u8; MAX_PK_BYTES];
-    let src_w = gnitz_wire::wire_stride(src_type);
-    let idx_w = gnitz_wire::wire_stride(idx_key_type);
-    gnitz_wire::encode_pk_column_promoted(
-        &native.to_le_bytes()[..src_w],
-        src_type,
-        idx_key_type,
-        &mut opk[..idx_w],
-    );
-    opk
-}
-
-/// Identity-keyed dedup cache for `relocate_german_string_vec`.
-///
-/// Key: `(src_blob.as_ptr() as usize, old_offset, length)`. The same source
-/// span is copied at most once per merge — the cached value is the offset
-/// inside the destination blob where the bytes were appended.
-pub(crate) type BlobCache = FxHashMap<(usize, usize, usize), usize>;
-
-/// Copy a 16-byte German string cell and (for long strings) migrate the
-/// out-of-line payload from `src_blob` into `dst_blob`.
-///
-/// The returned cell is ready to write into the output column buffer and is
-/// always **canonical** (`german_string_cell_ok`): pad bytes past the content
-/// are rebuilt as zero rather than copied through, so a skewed cell that
-/// reached memory some other way cannot propagate a compare-visible pad — the
-/// divergence where two rows hash equal but order unequal and never
-/// consolidate. Short strings resolve entirely inline; `src_blob` is unused.
-///
-/// When `cache` is `Some`, the appended blob data is deduplicated by
-/// `(src_blob.as_ptr(), old_offset, length)` — i.e. the same source span is
-/// only copied once per merge.
-///
-/// **Malformed-input fallback:** a long header declaring a region that overruns
-/// `src_blob` yields the canonical empty string rather than an out-of-bounds
-/// read, keeping trusted in-memory callers panic-free on data that slipped past
-/// validation.
-#[inline]
-pub(crate) fn relocate_german_string_vec(
-    src_cell: &[u8],
-    src_blob: &[u8],
-    dst_blob: &mut Vec<u8>,
-    cache: Option<&mut BlobCache>,
-) -> [u8; 16] {
-    // One bounds check for the whole relocation: every read below is a constant
-    // index into a proven 16-byte cell.
-    let src: &[u8; 16] = src_cell[..16]
-        .try_into()
-        .expect("relocate_german_string_vec: src must be a 16-byte German string cell");
-    if gnitz_wire::read_u32_le(src, 0) as usize <= SHORT_STRING_THRESHOLD {
-        return gnitz_wire::canonical_short_cell(src);
-    }
-    relocate_long_german_string(src, src_blob, dst_blob, cache)
-}
-
-/// The out-of-line half of `relocate_german_string_vec` — kept separate so the
-/// short path stays a branchless inline sequence with no call and no frame.
-fn relocate_long_german_string(
-    src: &[u8; 16],
-    src_blob: &[u8],
-    dst_blob: &mut Vec<u8>,
-    cache: Option<&mut BlobCache>,
-) -> [u8; 16] {
-    let length = gnitz_wire::read_u32_le(src, 0) as usize;
-    let old_offset = gnitz_wire::read_u64_le(src, 8);
-    let mut dest = [0u8; 16];
-    let Some(span) = gnitz_wire::blob_extent(src_blob.len(), old_offset, length) else {
-        // Malformed: the all-zero cell is the canonical empty string, and
-        // `dst_blob` is left untouched.
-        return dest;
-    };
-    // `length > SHORT_STRING_THRESHOLD ≥ 4`, so all four prefix bytes are content.
-    dest[0..8].copy_from_slice(&src[0..8]);
-    let new_offset = dst_blob.len();
-    let off = match cache {
-        Some(cache) => {
-            let key = (src_blob.as_ptr() as usize, span.start, length);
-            *cache.entry(key).or_insert_with(|| {
-                dst_blob.extend_from_slice(&src_blob[span]);
-                new_offset
-            })
-        }
-        None => {
-            dst_blob.extend_from_slice(&src_blob[span]);
-            new_offset
-        }
-    };
-    dest[8..16].copy_from_slice(&(off as u64).to_le_bytes());
-    dest
-}
-
 /// Validate that a peer-supplied schema descriptor matches the expected one:
 /// column count, PK column indices, per-column type codes and nullability.
 /// Used at every trust boundary where rows are decoded against a descriptor
@@ -1158,6 +982,12 @@ fn relocate_long_german_string(
 /// helpers do not validate shape, so an unguarded mismatch turns into
 /// misinterpreted bytes handed onward.
 pub(crate) fn validate_schema_match(wire: &SchemaDescriptor, expected: &SchemaDescriptor) -> Result<(), String> {
+    if wire == expected {
+        return Ok(());
+    }
+    // Only reached on a mismatch: the walk below exists to name it, not to
+    // decide it. Keeping `==` as the verdict is what stops the two from drifting
+    // — a field added to the comparison automatically tightens this validator.
     if wire.num_columns() != expected.num_columns() {
         return Err(format!(
             "Schema mismatch: expected {} columns, got {}",
@@ -1186,7 +1016,7 @@ pub(crate) fn validate_schema_match(wire: &SchemaDescriptor, expected: &SchemaDe
             ));
         }
     }
-    Ok(())
+    Err("Schema mismatch: descriptors differ".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1232,30 +1062,17 @@ pub(crate) fn make_index_schema(source_cols: &[u32], source: &SchemaDescriptor) 
     // Shared with the SQL planner's CREATE INDEX pre-check, so the promotion
     // rule and the arity/stride limits can never disagree across the layers.
     let promoted = gnitz_wire::index_key_types(&col_types, src_pk.len(), source.pk_stride() as usize)?;
-    let n = promoted.len();
-    let arity = n + src_pk.len();
-    let mut cols: Vec<SchemaColumn> = Vec::with_capacity(arity);
-    let mut pk_indices: Vec<u32> = Vec::with_capacity(arity);
-    for (i, &t) in promoted.iter().enumerate() {
-        cols.push(SchemaColumn::new(t, 0));
-        pk_indices.push(i as u32);
+    let mut b = DerivedSchema::new();
+    let over = || "Index: composite key exceeds the PK column limit".to_string();
+    for &t in &promoted {
+        b.push_pk(SchemaColumn::new(t, 0)).ok_or_else(over)?;
     }
-    for (j, &ci) in src_pk.iter().enumerate() {
-        cols.push(SchemaColumn::new(source.columns[ci as usize].type_code, 0));
-        pk_indices.push((n + j) as u32);
+    for &ci in src_pk {
+        b.push_pk(SchemaColumn::new(source.columns[ci as usize].type_code, 0))
+            .ok_or_else(over)?;
     }
-    Ok(SchemaDescriptor::new(&cols, &pk_indices))
+    Ok(b.finish())
 }
-
-/// Wire schema for the GET_INDICES descriptor list: `(packed_cols PK, is_unique)`.
-/// The PK carries `pack_pk_cols(&col_indices)` — unique per circuit (circuits
-/// dedup by column list), so a valid PK. The server ships this block on the data
-/// path; the client decodes against the wire schema and reads columns by position.
-pub(crate) fn index_meta_schema_desc() -> SchemaDescriptor {
-    let u64c = SchemaColumn::new(type_code::U64, 0);
-    SchemaDescriptor::new(&[u64c, u64c], &[0]) // [packed_cols (PK), is_unique]
-}
-pub(crate) const INDEX_META_COL_NAMES: [&[u8]; 2] = [b"cols", b"is_unique"];
 
 /// Build the schema for a `gather_family` result: the PK columns of `schema`
 /// (in pk-list order, so the packed PK round-trips identically) followed by
@@ -1267,26 +1084,23 @@ pub(crate) const INDEX_META_COL_NAMES: [&[u8]; 2] = [b"cols", b"is_unique"];
 /// expected reply schema, so a projected reply with the wrong shape errors
 /// instead of mis-decoding.
 pub(crate) fn project_schema(schema: &SchemaDescriptor, project: &[u8]) -> SchemaDescriptor {
-    let mut cols: Vec<SchemaColumn> = Vec::with_capacity(schema.pk_indices().len() + project.len());
-    let mut pk_idx: Vec<u32> = Vec::with_capacity(schema.pk_indices().len());
-    for (_, _, col) in schema.pk_columns() {
-        pk_idx.push(cols.len() as u32);
-        cols.push(*col);
-    }
+    let mut b = DerivedSchema::new();
+    b.push_pk_of(schema)
+        .expect("project_schema: source PK exceeds the PK limit");
     for &p in project {
         debug_assert!(
             !schema.is_pk_col(p as usize),
             "project_schema: projected column {p} is a PK column"
         );
-        cols.push(schema.columns[p as usize]);
+        b.push(schema.columns[p as usize])
+            .expect("project_schema: projection exceeds MAX_COLUMNS");
     }
-    SchemaDescriptor::new(&cols, &pk_idx)
+    b.finish()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::pk_only_schema;
 
     // ── Reduce output key ────────────────────────────────────────────────────
 
@@ -1457,82 +1271,6 @@ mod tests {
         assert!(validate_schema_match(&wire, &expected).is_err());
     }
 
-    // Claim 6: the malformed-long-string fallback must zero both the length
-    // field (dest[0..4]) AND the prefix field (dest[4..8]).  Before the fix,
-    // dest[4..8] was left containing the garbage bytes copied from the corrupt
-    // source cell.
-    #[test]
-    fn test_malformed_long_string_fallback_clean_header() {
-        let mut src_cell = [0u8; 16];
-        // length = 20  (> SHORT_STRING_THRESHOLD = 12)
-        src_cell[0..4].copy_from_slice(&20u32.to_le_bytes());
-        // prefix = 0xDEADBEEF  (stale garbage that must be zeroed on fallback)
-        src_cell[4..8].copy_from_slice(&0xDEAD_BEEF_u32.to_le_bytes());
-        // heap_offset = 999  (well beyond src_blob)
-        src_cell[8..16].copy_from_slice(&999u64.to_le_bytes());
-
-        let src_blob = vec![0u8; 4]; // far too small
-        let mut dst_blob: Vec<u8> = Vec::new();
-
-        let result = relocate_german_string_vec(&src_cell, &src_blob, &mut dst_blob, None);
-
-        assert_eq!(
-            u32::from_le_bytes(result[0..4].try_into().unwrap()),
-            0,
-            "fallback must emit length=0",
-        );
-        assert_eq!(&result[4..8], &[0u8; 4], "fallback must zero the prefix field");
-        assert_eq!(&result[8..16], &[0u8; 8], "fallback must leave blob offset zero");
-        assert!(dst_blob.is_empty(), "fallback must not extend dst_blob");
-        assert!(gnitz_wire::german_string_cell_ok(&result, &dst_blob));
-    }
-
-    /// The relocator rebuilds a cell rather than copying its bytes, so a skewed
-    /// pad — compare-visible but invisible to `german_string_content`, i.e. the
-    /// shape that splits one Z-set element's weight across two rows — cannot
-    /// survive a merge, scatter or map projection.
-    #[test]
-    fn test_relocate_canonicalizes_pad_bytes() {
-        let mut dst_blob: Vec<u8> = Vec::new();
-        for content in [&b""[..], b"a", b"abc", b"abcd", b"abcdefghijkl"] {
-            let clean = gnitz_wire::encode_german_string(content, &mut Vec::new());
-            let mut dirty = clean;
-            for b in dirty[4 + content.len()..16].iter_mut() {
-                *b = 0xFF;
-            }
-            assert_eq!(
-                relocate_german_string_vec(&dirty, &[], &mut dst_blob, None),
-                clean,
-                "relocation must rebuild {content:?} in canonical form",
-            );
-        }
-        assert!(dst_blob.is_empty(), "inline cells must not touch the blob");
-    }
-
-    #[test]
-    fn test_relocate_german_string_vec_cache_hit_dedups() {
-        // Long-string source: length=20, payload at offset 0 in src_blob.
-        let payload: &[u8] = b"hello world test dat";
-        assert_eq!(payload.len(), 20);
-        let src_blob: Vec<u8> = payload.to_vec();
-
-        let mut src_cell = [0u8; 16];
-        src_cell[0..4].copy_from_slice(&20u32.to_le_bytes());
-        src_cell[4..8].copy_from_slice(&payload[0..4]);
-        src_cell[8..16].copy_from_slice(&0u64.to_le_bytes());
-
-        let mut dst_blob: Vec<u8> = Vec::new();
-        let mut cache: BlobCache = BlobCache::default();
-
-        let r1 = relocate_german_string_vec(&src_cell, &src_blob, &mut dst_blob, Some(&mut cache));
-        let after_first = dst_blob.len();
-        assert_eq!(after_first, 20, "first call must append payload exactly once");
-
-        let r2 = relocate_german_string_vec(&src_cell, &src_blob, &mut dst_blob, Some(&mut cache));
-        assert_eq!(dst_blob.len(), 20, "cache hit must not append a second copy");
-        assert_eq!(&r1[8..16], &r2[8..16], "both calls must return the same offset");
-    }
-
     #[test]
     fn test_schema_column_layout_and_is_signed() {
         // Repurposing the old `_pad` byte as `is_signed` must not grow the struct:
@@ -1577,7 +1315,7 @@ mod tests {
         ];
         let s = SchemaDescriptor::new(&cols, &[0]);
         assert_eq!(s.num_columns(), 3);
-        assert_eq!(s.pk_index_single(), 0);
+        assert_eq!(s.pk_indices(), &[0]);
         assert_eq!(s.columns[0].type_code, type_code::U64);
         assert_eq!(s.columns[1].type_code, type_code::I64);
         assert_eq!(s.columns[2].type_code, type_code::STRING);
@@ -1599,7 +1337,7 @@ mod tests {
 
         // Non-zero pk_index round-trips (use I64 col at index 1, not STRING).
         let s2 = SchemaDescriptor::new(&cols, &[1]);
-        assert_eq!(s2.pk_index_single(), 1);
+        assert_eq!(s2.pk_indices(), &[1]);
 
         // Empty placeholder (Default-style).
         let empty = SchemaDescriptor::new(&[], &[]);
@@ -1742,114 +1480,6 @@ mod tests {
             SchemaColumn::new(type_code::U64, 0),
         ];
         let _ = SchemaDescriptor::new(&cols, &[0, 0]);
-    }
-
-    #[test]
-    #[should_panic(expected = "compound PK not yet supported here")]
-    fn test_pk_index_single_panics_on_compound() {
-        // Release-active canary the migration policy depends on.
-        let cols = [
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U32, 0),
-        ];
-        let s = SchemaDescriptor::new(&cols, &[0, 1]);
-        let _ = s.pk_index_single();
-    }
-
-    // ── seek_opk_bytes: the width-universal seek-key encoder ─────────────────
-
-    #[test]
-    fn seek_opk_bytes_narrow_matches_opk_key() {
-        // For every narrow stride (≤ 16) the wire pair degenerates to `(low, &[])`,
-        // so `seek_opk_bytes` must be byte-identical to a direct `opk_key` of the
-        // native value — both buffer and stride.
-        let cases = [
-            pk_only_schema(&[type_code::U8]),  // stride 1
-            pk_only_schema(&[type_code::U32]), // stride 4
-            pk_only_schema(&[type_code::U64]), // stride 8
-            pk_only_schema(&[type_code::I64]), // stride 8, signed → OPK flips the sign bit
-            // Compound (U32, U32) with a *permuted* PK list [1, 0]: stride 8,
-            // exercises the multi-column pk-list walk in the encoder.
-            SchemaDescriptor::new(
-                &[
-                    SchemaColumn::new(type_code::U32, 0),
-                    SchemaColumn::new(type_code::U32, 0),
-                ],
-                &[1, 0],
-            ),
-        ];
-        // Values spanning zero, small, mixed, and a sign-bit-set word (negative
-        // for the I64 case) so the sign-flip and byte order are exercised. Both
-        // encoders truncate to `stride`, so an over-wide value is a valid probe.
-        for s in cases {
-            for v in [0u128, 1, 0x0123_4567_89AB_CDEF, 0x8000_0000_0000_0000, u64::MAX as u128] {
-                let (want_opk, want_stride) = key::opk_key(&s, &v.to_le_bytes());
-                let (got_opk, got_stride) = seek_opk_bytes(&s, v, &[]).expect("narrow seek encodes");
-                assert_eq!(got_stride, want_stride, "stride mismatch for {s:?} v={v:#x}");
-                assert_eq!(
-                    got_opk[..got_stride],
-                    want_opk[..want_stride],
-                    "OPK bytes mismatch for {s:?} v={v:#x}",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn seek_opk_bytes_wide_reproduces_hand_built_opk() {
-        // (U64, U64, U64) = stride 24, wide. The wire pair carries the first 16
-        // native bytes in `low` and the trailing U64 in `extra`, exactly as
-        // `PkTuple::split_wire` packs them. All-unsigned ⇒ OPK is each column's
-        // big-endian image, so the expected key is built by hand.
-        let s = pk_only_schema(&[type_code::U64; 3]);
-        assert_eq!(s.pk_stride(), 24);
-        let (a, b, c): (u64, u64, u64) = (0x1122_3344_5566_7788, 0x99AA_BBCC_DDEE_FF00, 0x0102_0304_0506_0708);
-        // Native LE image = [a_LE, b_LE, c_LE]; split_wire's `low` is the first 16
-        // bytes (a in the low half, b in the high half), `extra` is c's 8 bytes.
-        let low = (a as u128) | ((b as u128) << 64);
-        let (opk, stride) = seek_opk_bytes(&s, low, &c.to_le_bytes()).expect("wide seek encodes");
-        assert_eq!(stride, 24);
-        let want: Vec<u8> = a
-            .to_be_bytes()
-            .into_iter()
-            .chain(b.to_be_bytes())
-            .chain(c.to_be_bytes())
-            .collect();
-        assert_eq!(&opk[..stride], want.as_slice());
-    }
-
-    #[test]
-    fn seek_opk_bytes_missing_extra_errs_not_panics() {
-        // A wide stride needs `stride - 16` extra bytes; too few must return Err,
-        // never panic — the runtime guard the two dispatch sites rely on.
-        let s = pk_only_schema(&[type_code::U64; 3]);
-        assert!(seek_opk_bytes(&s, 0, &[]).is_err(), "stride 24 with no extra must Err");
-        assert!(seek_opk_bytes(&s, 0, &[0u8; 7]).is_err(), "7 < 8 extra bytes must Err");
-        assert!(
-            seek_opk_bytes(&s, 0, &[0u8; 8]).is_ok(),
-            "exactly 8 extra bytes is enough"
-        );
-    }
-
-    #[test]
-    fn seek_opk_bytes_four_u128_ceiling() {
-        // The widest SQL-reachable PK is 4 columns (PK_LIST_MAX_COLS); 4×U128 =
-        // stride 64 exercises the `le[16..16 + needed]` copy at its ceiling
-        // (`needed == 48`). All-unsigned ⇒ OPK is each column's BE image.
-        // Column 0 rides in `low`; columns 1..4 (48 bytes) in `extra`.
-        let s = pk_only_schema(&[type_code::U128; 4]);
-        assert_eq!(s.pk_stride(), 64);
-        let vals: [u128; 4] = [
-            0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10,
-            0x1112_1314_1516_1718_191A_1B1C_1D1E_1F20,
-            0x2122_2324_2526_2728_292A_2B2C_2D2E_2F30,
-            0x3132_3334_3536_3738_393A_3B3C_3D3E_3F40,
-        ];
-        let extra: Vec<u8> = vals[1..].iter().flat_map(|v| v.to_le_bytes()).collect();
-        let (opk, stride) = seek_opk_bytes(&s, vals[0], &extra).expect("4×U128 encodes");
-        assert_eq!(stride, 64);
-        let want: Vec<u8> = vals.iter().flat_map(|v| v.to_be_bytes()).collect();
-        assert_eq!(&opk[..stride], want.as_slice());
     }
 
     // ── SchemaFacts conformance ──────────────────────────────────────────────

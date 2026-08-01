@@ -54,8 +54,8 @@ impl CatalogEngine {
         seek_pk_extra: &[u8],
     ) -> Result<(Option<Batch>, SchemaDescriptor), String> {
         let entry = self.table_entry(table_id)?;
-        let (opk, stride) = crate::schema::seek_opk_bytes(&entry.schema, seek_pk, seek_pk_extra)?;
-        Ok((Self::seek_entry_bytes(entry, &opk[..stride]), entry.schema))
+        let opk = crate::schema::key::seek_opk_bytes(&entry.schema, seek_pk, seek_pk_extra)?;
+        Ok((Self::seek_entry_bytes(entry, opk.pk_bytes()), entry.schema))
     }
 
     /// Byte-keyed sibling of [`seek_family`] for callers that already hold the
@@ -467,20 +467,18 @@ fn index_range_keys(
     }
 
     let idx_pk_stride = ic.index_schema.pk_stride() as usize; // leading + source PK
-    let prefix_len = ic.index_schema.leading_key_size(n_eq + 1); // eq prefix + range slot
 
     // The group prefix of a cut value is the full (n_eq + 1)-column leading key,
     // encoded through the circuit's baked spec — the same path the write side
     // uses (`write_span`/`batch_project_index` — byte-identical by construction).
-    // Stack scratch throughout: MAX_PK_BYTES bounds every index schema's
-    // pk_stride (asserted in `SchemaDescriptor::new`), and `seek_prefix` leaves
-    // the bytes past `prefix_len` zero, so `group(v)` IS `pad(group(v))`.
+    // `seek_prefix` returns it as a `PkBuf` whose zero tail makes `group(v)` IS
+    // `pad(group(v))`.
     let spec = ic.key_spec.prefix(n_eq + 1);
     let mut natives = [0u128; gnitz_wire::PK_LIST_MAX_COLS];
     natives[..n_eq].copy_from_slice(eq_natives);
     Ok(crate::storage::range_keys_from_cuts(range, idx_pk_stride, |v| {
         natives[n_eq] = v;
-        (spec.seek_prefix(&natives[..=n_eq]).0, prefix_len)
+        spec.seek_prefix(&natives[..=n_eq])
     }))
 }
 

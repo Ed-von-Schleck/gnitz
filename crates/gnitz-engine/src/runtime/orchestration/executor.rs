@@ -45,7 +45,7 @@ use crate::runtime::sal::BACKFILL_DECISION_CONTINUE;
 use crate::runtime::wire::{
     self as ipc, SchemaWithVersion, FLAG_GET_INDICES, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
 };
-use crate::schema::{index_meta_schema_desc, validate_schema_match, SchemaDescriptor, INDEX_META_COL_NAMES};
+use crate::schema::{type_code, validate_schema_match, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, BatchBuilder};
 
 pub(crate) const TICK_COALESCE_ROWS: usize = 10_000;
@@ -1646,6 +1646,17 @@ async fn handle_seek_by_index(
     }
 }
 
+/// Wire schema for the GET_INDICES descriptor list: `(packed_cols PK, is_unique)`,
+/// with its column names. The PK carries `pack_pk_cols(&col_indices)` — unique
+/// per circuit (circuits dedup by column list), so a valid PK. The server ships
+/// this block on the data path; the client decodes against it and reads columns
+/// by position.
+const INDEX_META_SCHEMA: SchemaDescriptor = {
+    let u64c = SchemaColumn::new(type_code::U64, 0);
+    SchemaDescriptor::new(&[u64c, u64c], &[0])
+};
+const INDEX_META_COL_NAMES: [&[u8]; 2] = [b"cols", b"is_unique"];
+
 /// GET_INDICES: serve the client's durable, epoch-validated cache of a table's
 /// secondary-index metadata — the `(col_idx, is_unique)` set, projected from the
 /// DAG `index_circuits` (the system's operative truth for "is this column
@@ -1668,7 +1679,7 @@ async fn handle_get_indices(shared: &Rc<Shared>, peer: &Peer, client_id: u64, ta
     // included) to (col_idx PK, is_unique). The response always carries its own
     // schema block on the data path, so the client decodes against the wire
     // schema and never needs — or pollutes — the per-table schema cache.
-    let desc = index_meta_schema_desc();
+    let desc = INDEX_META_SCHEMA;
     // Build the schema block before the descriptor is moved into BatchBuilder.
     let schema_block = ipc::build_schema_wire_block(&desc, &INDEX_META_COL_NAMES[..], 0, target_id as u32);
     let mut bb = BatchBuilder::new(desc);

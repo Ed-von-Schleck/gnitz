@@ -721,7 +721,7 @@ fn write_scattered_data_block(
     // No German-string columns on this fast path; DirectWriter still wants a blob
     // arena, so hand it a 0-cap stack-local that scatter_copy must not grow.
     let mut empty_blob: Vec<u8> = Vec::new();
-    let mut writer = DirectWriter::new(pk, weight, null_bmp, col_slices, &mut empty_blob, *schema, 0);
+    let mut writer = DirectWriter::new(pk, weight, null_bmp, col_slices, &mut empty_blob, schema, 0);
     scatter_copy(batch, indices, &[], &mut writer);
     debug_assert!(
         empty_blob.is_empty(),

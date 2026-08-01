@@ -2380,10 +2380,10 @@ fn test_seek_prefix_matches_projection() {
     let proj_key = &projected.get_pk_bytes(0)[..key_size];
 
     let spec = IndexKeySpec::new(&[1, 2], &src, &idx);
-    let (opk, plen) = spec.seek_prefix(&[(-5i32) as u32 as u128, 42u128]);
-    assert_eq!(plen, key_size);
+    let opk = spec.seek_prefix(&[(-5i32) as u32 as u128, 42u128]);
+    assert_eq!(opk.len as usize, key_size);
     assert_eq!(
-        &opk[..plen],
+        opk.pk_bytes(),
         proj_key,
         "seek prefix bytes must equal projected leading-key bytes"
     );
@@ -2476,7 +2476,7 @@ fn write_span_reference(
     cols: &[u32],
     mb: &crate::storage::MemBatch<'_>,
     row: usize,
-) -> Option<[u8; MAX_PK_BYTES]> {
+) -> Option<crate::schema::key::PkBuf> {
     let mut natives = Vec::with_capacity(cols.len());
     for &c in cols {
         let loc = owner.locate(c as usize);
@@ -2485,7 +2485,7 @@ fn write_span_reference(
         }
         natives.push(loc.native_key(mb, row));
     }
-    Some(spec.seek_prefix(&natives).0)
+    Some(spec.seek_prefix(&natives))
 }
 
 #[test]
@@ -2530,7 +2530,7 @@ fn write_span_matches_the_oracle_on_compound_null_and_entry_shapes() {
         assert_eq!(g, want.is_some(), "row={row}: skip verdicts must agree");
         assert_eq!(g, row != null_row, "row={row}: only the NULL row is skipped");
         if let Some(want) = want {
-            assert_eq!(got[..spec.key_size()], want[..spec.key_size()], "row={row}");
+            assert_eq!(&got[..spec.key_size()], want.pk_bytes(), "row={row}");
         }
 
         // `write_entry` = span ‖ source-PK OPK suffix, at the span's width.
@@ -2582,10 +2582,10 @@ fn write_span_matches_seek_prefix_across_type_ladder() {
         for &v in values {
             let native = native_u128_at(v, sz);
             let write_span = project_leading_span(src, &idx, native);
-            let seek = crate::schema::index_opk_prefix(native, t, idx_type);
+            let seek = crate::schema::key::index_opk_prefix(native, t, idx_type);
             assert_eq!(
                 &write_span[..],
-                &seek[..idx_size],
+                seek.padded(idx_size),
                 "write/seek byte mismatch for tc={t} v={v}"
             );
 
@@ -2598,7 +2598,7 @@ fn write_span_matches_seek_prefix_across_type_ladder() {
             assert!(pk_spec.write_span(&b.as_mem_batch(), 0, &mut span));
             assert_eq!(
                 &span[..idx_size],
-                &seek[..idx_size],
+                seek.padded(idx_size),
                 "PK-source write/seek byte mismatch for tc={t} v={v}"
             );
         }

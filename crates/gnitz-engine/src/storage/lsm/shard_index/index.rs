@@ -117,8 +117,8 @@ impl ShardIndex {
     /// production path. Wide PKs cannot fit a u128.
     #[cfg(test)]
     pub(crate) fn find_pk(&self, key: u128, visitor: &mut impl FnMut(Rc<MappedShard>, usize)) {
-        let (opk, stride) = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
-        self.find_pk_bytes(&opk[..stride], visitor);
+        let opk = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
+        self.find_pk_bytes(opk.pk_bytes(), visitor);
     }
 
     /// Point lookup by OPK `key` bytes — universal across all PK widths. L0 is

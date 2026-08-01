@@ -50,9 +50,9 @@ fn decrement_key_in_place(p: &mut [u8]) {
 
 /// Map `range`'s cut pair to its half-open `[start, end)` OPK key range over a
 /// `stride`-byte key space. `encode(v)` returns the OPK group prefix for cut
-/// value `v` as `([u8; MAX_PK_BYTES], prefix_len)` — the leading `prefix_len`
-/// bytes meaningful, everything after zero, so `group(v)` IS `pad(group(v))`
-/// (the minimum full key of the group). Each cut then maps uniformly:
+/// value `v` — a `PkBuf` whose `len` is the prefix width, so by `PkBuf`'s own
+/// zero-tail invariant `group(v)` IS `pad(group(v))` (the minimum full key of
+/// the group). Each cut then maps uniformly:
 ///
 /// | cut         | byte key                                                |
 /// |-------------|---------------------------------------------------------|
@@ -68,16 +68,20 @@ fn decrement_key_in_place(p: &mut [u8]) {
 pub(crate) fn range_keys_from_cuts(
     range: &RangeDescriptor,
     stride: usize,
-    mut encode: impl FnMut(u128) -> ([u8; MAX_PK_BYTES], usize),
+    mut encode: impl FnMut(u128) -> PkBuf,
 ) -> Option<(PkBuf, Option<PkBuf>)> {
     let mut cut_key = |c: Cut| -> Option<PkBuf> {
-        let (mut k, prefix_len) = encode(c.value());
-        match c {
-            Cut::Before(_) => Some(PkBuf::from_bytes(&k[..stride])),
-            // The carry may ripple into the equality prefix — exactly the first
-            // key of the next equality group.
-            Cut::After(_) => increment_key_in_place(&mut k[..prefix_len]).then(|| PkBuf::from_bytes(&k[..stride])),
+        let mut k = encode(c.value());
+        let prefix_len = k.len as usize;
+        // The carry may ripple into the equality prefix — exactly the first key
+        // of the next equality group; overflow means no key space above it.
+        if matches!(c, Cut::After(_)) && !increment_key_in_place(&mut k.bytes[..prefix_len]) {
+            return None;
         }
+        // Widening the prefix to the full `stride` is a `len` bump: the tail past
+        // a `PkBuf`'s `len` is zero by construction.
+        k.len = stride as u8;
+        Some(k)
     };
     let start = cut_key(range.start)?;
     let end = cut_key(range.end);

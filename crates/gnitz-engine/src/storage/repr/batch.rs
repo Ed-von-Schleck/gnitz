@@ -6,9 +6,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::columnar::ColumnarSource;
-use super::merge::{self, BlobCacheGuard, ColPtr, MemBatch};
+use super::merge::{self, relocate_german_string_vec, BlobCache, BlobCacheGuard, ColPtr, MemBatch};
 use crate::schema::key::NarrowPkOpk;
-use crate::schema::{BlobCache, SchemaDescriptor};
+use crate::schema::SchemaDescriptor;
 use gnitz_expr::RowSource;
 use gnitz_wire::{align8, read_i64_le, read_u64_le};
 
@@ -639,8 +639,8 @@ impl Batch {
     /// the writer is dropped.
     pub(crate) fn capacity_writer(&mut self) -> merge::DirectWriter<'_> {
         let cap = self.capacity as usize;
-        let schema = self.schema.expect("capacity_writer requires schema");
-        let (pk, weight, null_bmp, col_slices) = carve_writer_slices(&mut self.data, &schema, cap);
+        let schema = self.schema.as_ref().expect("capacity_writer requires schema");
+        let (pk, weight, null_bmp, col_slices) = carve_writer_slices(&mut self.data, schema, cap);
         merge::DirectWriter::new(pk, weight, null_bmp, col_slices, &mut self.blob, schema, cap)
     }
 
@@ -982,7 +982,7 @@ impl Batch {
             "append_mem_batch_ranges: a Batch must never carry the wire blob_id 0"
         );
         let shares_blob = self.blob_id == src.blob_id && self.blob.len() == src.blob.len();
-        if let (false, Some(s)) = (shares_blob, self.schema) {
+        if let (false, Some(s)) = (shares_blob, self.schema.as_ref()) {
             if !src.blob.is_empty() {
                 self.blob.reserve(src.blob.len());
             }
@@ -1017,7 +1017,7 @@ impl Batch {
                 if is_str && cs == 16 {
                     let mut dst_off = self.offsets[REG_PAYLOAD_START + pi] + self.count * 16;
                     for row in start..end {
-                        let cell = crate::schema::relocate_german_string_vec(
+                        let cell = relocate_german_string_vec(
                             src.get_col_ptr(row, pi, 16),
                             src.blob,
                             &mut self.blob,
@@ -1639,18 +1639,38 @@ impl Batch {
         weight: i64,
         source: &S,
         row: usize,
-        blob_cache: Option<&mut BlobCache>,
+        mut blob_cache: Option<&mut BlobCache>,
     ) {
-        let schema = self.schema.expect("append_row_from_source requires schema");
-
         self.extend_weight(&weight.to_le_bytes());
         let null_word = source.get_null_word(row);
         self.extend_null_bmp(&null_word.to_le_bytes());
 
-        self.append_payload_cols(0, &schema, source, row, null_word, blob_cache);
+        // Walks this batch's own schema by index, re-reading the 4-byte
+        // `SchemaColumn` per column, rather than calling the shared
+        // `append_payload_cols`: that takes the schema by reference, which the
+        // `&mut self` cell writes below would alias, and copying the descriptor
+        // out to dodge that puts a 424-byte `memcpy` on this per-row path. The
+        // cell body is still the shared `append_payload_cell`.
+        let src_blob = source.blob();
+        let num_payload = self.own_schema().num_payload_cols();
+        for pi in 0..num_payload {
+            let col = {
+                let s = self.own_schema();
+                s.columns[s.payload_col_idx(pi)]
+            };
+            let cs = col.size() as usize;
+            let cell = (!gnitz_wire::null_word_get(null_word, pi)).then(|| source.get_col_ptr(row, pi, cs));
+            self.append_payload_cell(pi, col.type_code, cs, cell, src_blob, blob_cache.as_deref_mut());
+        }
 
         self.count += 1;
         self.downgrade();
+    }
+
+    /// This batch's schema, which every row-append path requires.
+    #[inline]
+    fn own_schema(&self) -> &SchemaDescriptor {
+        self.schema.as_ref().expect("appending a row requires a schema")
     }
 
     /// Append the payload columns described by `schema` from `src[row]` into
@@ -1708,7 +1728,7 @@ impl Batch {
         match src_cell {
             None => self.fill_col_zero(out_pi, size),
             Some(cell) if gnitz_wire::is_german_string(type_code) => {
-                let dest = crate::schema::relocate_german_string_vec(cell, src_blob, &mut self.blob, blob_cache);
+                let dest = relocate_german_string_vec(cell, src_blob, &mut self.blob, blob_cache);
                 self.extend_col(out_pi, &dest);
             }
             Some(cell) => self.extend_col(out_pi, cell),
@@ -1846,7 +1866,7 @@ pub fn write_to_batch(
     let actual_rows;
     {
         let (pk, weight, null_bmp, col_slices) = carve_at(&mut data, &strides, nr, &offsets, max_rows);
-        let mut writer = merge::DirectWriter::new(pk, weight, null_bmp, col_slices, &mut blob, *schema, max_rows);
+        let mut writer = merge::DirectWriter::new(pk, weight, null_bmp, col_slices, &mut blob, schema, max_rows);
         write_fn(&mut writer);
         actual_rows = writer.row_count();
     }

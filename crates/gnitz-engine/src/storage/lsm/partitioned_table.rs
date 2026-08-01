@@ -319,14 +319,14 @@ impl PartitionedTable {
     /// check (passes a native value); all DML retraction routes through `_bytes`.
     #[cfg(test)]
     pub(crate) fn has_pk(&mut self, key: u128) -> bool {
-        let (opk, n) = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
-        self.has_pk_bytes(&opk[..n])
+        let opk = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
+        self.has_pk_bytes(opk.pk_bytes())
     }
 
     #[cfg(test)] // no production caller after the §4 DML/UPSERT byte-path fixes
     pub fn retract_pk(&mut self, key: u128) -> (i64, Option<table::RowRef>) {
-        let (opk, n) = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
-        self.retract_pk_bytes(&opk[..n])
+        let opk = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
+        self.retract_pk_bytes(opk.pk_bytes())
     }
 
     /// Byte-keyed sibling of [`has_pk`] for wide (`pk_stride > 16`) PKs.
@@ -650,13 +650,12 @@ mod tests {
         };
         // Enough distinct keys that every partition range sees both verdicts.
         let keys: Vec<_> = (0u128..512)
-            .map(|k| crate::schema::key::opk_key(&schema, &k.to_le_bytes()).0)
+            .map(|k| crate::schema::key::opk_key(&schema, &k.to_le_bytes()))
             .collect();
-        let stride = schema.pk_stride() as usize;
 
         let repl = build("cmhk_repl", Routing::Replicated { rank: 7 });
         assert!(
-            keys.iter().all(|k| repl.cursor_may_hold_key(&k[..stride])),
+            keys.iter().all(|k| repl.cursor_may_hold_key(k.pk_bytes())),
             "a replicated store can hold any key, whatever rank homes it"
         );
 
@@ -664,9 +663,9 @@ mod tests {
         let (start, end) = partition_range(1, 4);
         let hashed = build("cmhk_hashed", Routing::Hashed { start, end });
         for k in &keys {
-            let p = schema.partition_for_pk(&k[..stride]) as u32;
+            let p = schema.partition_for_pk(k.pk_bytes()) as u32;
             assert_eq!(
-                hashed.cursor_may_hold_key(&k[..stride]),
+                hashed.cursor_may_hold_key(k.pk_bytes()),
                 p >= start && p < end,
                 "partition {p}"
             );
@@ -674,7 +673,7 @@ mod tests {
 
         let empty = build("cmhk_empty", Routing::Hashed { start: 0, end: 0 });
         assert!(
-            keys.iter().all(|k| !empty.cursor_may_hold_key(&k[..stride])),
+            keys.iter().all(|k| !empty.cursor_may_hold_key(k.pk_bytes())),
             "no children (the post-fork master) → holds nothing"
         );
     }

@@ -883,7 +883,8 @@ mod tests {
     /// Bug 5: append_row_from_source must not panic when blob offset is invalid.
     #[test]
     fn test_append_row_from_source_corrupted_blob() {
-        use crate::schema::{type_code, BlobCache, SchemaColumn};
+        use crate::schema::{type_code, SchemaColumn};
+        use crate::storage::BlobCache;
 
         // Schema: col0 = PK (U64), col1 = STRING
         let schema = SchemaDescriptor::new(

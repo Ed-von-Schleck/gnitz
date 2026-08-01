@@ -490,7 +490,7 @@ mod tests {
                 &mut out_null,
                 vec![&mut out_col0],
                 &mut out_blob,
-                *schema,
+                schema,
                 0,
             );
             scatter_copy(&batch, indices, weights, &mut writer);
@@ -585,7 +585,7 @@ mod tests {
         let mut col0 = vec![0u8; n * 8];
         let mut blob: Vec<u8> = Vec::with_capacity(1);
         {
-            let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, schema, 0);
+            let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, &schema, 0);
             assert!(
                 writer.pk_stride != 8 && writer.pk_stride != 16,
                 "test must exercise the PKS = 0 sentinel arm",
@@ -623,7 +623,7 @@ mod tests {
         let mut col0 = vec![0u8; n * 8];
         let mut blob: Vec<u8> = Vec::with_capacity(1);
         {
-            let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, schema, 0);
+            let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, &schema, 0);
             assert!(
                 writer.pk_stride != 8 && writer.pk_stride != 16,
                 "test must exercise the PKS = 0 sentinel arm",
@@ -695,7 +695,7 @@ mod tests {
         let mut col0 = vec![0u8; n * 8];
         let mut blob: Vec<u8> = Vec::with_capacity(1);
         {
-            let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, schema, 0);
+            let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, &schema, 0);
             assert!(
                 writer.pk_stride != 8 && writer.pk_stride != 16,
                 "test must exercise the PKS = 0 sentinel arm",
@@ -780,7 +780,7 @@ mod tests {
         let mut col0 = vec![0u8; n * 8];
         let mut blob: Vec<u8> = Vec::with_capacity(1);
         {
-            let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, schema, 0);
+            let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, &schema, 0);
             assert_eq!(writer.pk_stride, 8, "test must exercise the const PKS=8 arm");
             scatter_multi_source(&sources, rows, &mut writer);
             assert_eq!(writer.row_count(), 4);
@@ -817,7 +817,7 @@ mod tests {
         let mut col0 = vec![0u8; n * 8];
         let mut blob: Vec<u8> = Vec::with_capacity(1);
         {
-            let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, schema, 0);
+            let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, &schema, 0);
             assert_eq!(writer.pk_stride, 16, "test must exercise the const PKS=16 arm");
             scatter_multi_source(&sources, rows, &mut writer);
             assert_eq!(writer.row_count(), 4);
@@ -882,7 +882,7 @@ mod tests {
         let mut col0 = vec![0u8; n * 8];
         let mut blob: Vec<u8> = Vec::with_capacity(1);
         {
-            let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, schema, 0);
+            let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, &schema, 0);
             assert_eq!(writer.pk_stride, 8, "test must exercise the const PKS=8 arm");
             scatter_unified_sources_with_weights(&sources, rows, &mut writer);
             assert_eq!(writer.row_count(), 3);
@@ -947,7 +947,7 @@ mod tests {
         let mut col0 = vec![0u8; n * 8];
         let mut blob: Vec<u8> = Vec::with_capacity(1);
         {
-            let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, schema, 0);
+            let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, &schema, 0);
             assert_eq!(writer.pk_stride, 16, "test must exercise the const PKS=16 arm");
             scatter_unified_sources_with_weights(&sources, rows, &mut writer);
             assert_eq!(writer.row_count(), 3);

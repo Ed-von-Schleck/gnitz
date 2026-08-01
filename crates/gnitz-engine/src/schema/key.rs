@@ -1,16 +1,28 @@
 //! Order-preserving primary-key (OPK) primitives — the §9 key cluster.
 //!
 //! These pure layout/key operations sit *below* both `schema` and `storage`:
-//! they encode a PK region to its order-preserving big-endian image, compare two
-//! such images with a raw `memcmp`, route a key to a partition, pack a narrow
-//! region into a sort key, and carry a width-tagged PK byte buffer. None of them
-//! reaches up into storage — the dependency runs `storage → schema::key`, the
-//! legitimate downward direction. This module is the one import path: every
-//! caller, storage included, names `crate::schema::key::X`.
+//! they encode a PK region — a whole one, a seek key reassembled from its wire
+//! pair, or an index's leading-column span — to its order-preserving big-endian
+//! image, compare two such images with a raw `memcmp`, route a key to a
+//! partition, pack a narrow region into a sort key, and carry a width-tagged PK
+//! byte buffer. None of them reaches up into storage — the dependency runs
+//! `storage → schema::key`, the legitimate downward direction. This module is
+//! the one import path: every caller, storage included, names
+//! `crate::schema::key::X`, and every native→OPK encoder lives here so the
+//! write, seek and route sides cannot spell the encoding differently.
 
 use std::cmp::Ordering;
 
-use crate::schema::{SchemaDescriptor, MAX_PK_BYTES};
+use crate::schema::{SchemaColumn, SchemaDescriptor, MAX_PK_BYTES};
+
+/// Widest PK region that still fits in a packed `u128` word (16 bytes), the
+/// boundary where a key stops fitting one `u128`. At or below it `get_pk`
+/// returns the exact key as a `u128` (wider regions must read `get_pk_bytes`)
+/// and the seek wire image splits into a low-16 word plus a wider suffix
+/// ([`seek_opk_bytes`]); above it a shard's PK region must be stored `Raw`
+/// (a `Constant` region holds only 16 bytes) and is ordered via
+/// [`compare_pk_bytes`].
+pub(crate) const NARROW_PK_MAX_BYTES: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Column-aware PK byte-region comparator
@@ -42,7 +54,7 @@ pub fn compare_pk_bytes(a: &[u8], b: &[u8]) -> Ordering {
 pub(crate) fn compare_pk_ordering(a: &[u8], b: &[u8]) -> Ordering {
     debug_assert_eq!(a.len(), b.len(), "compare_pk_ordering on unequal PK widths");
     match pack_pk_be(a).cmp(&pack_pk_be(b)) {
-        Ordering::Equal if a.len() > 16 => compare_pk_bytes(a, b),
+        Ordering::Equal if a.len() > NARROW_PK_MAX_BYTES => compare_pk_bytes(a, b),
         ord => ord,
     }
 }
@@ -86,58 +98,131 @@ pub(crate) fn encode_order_preserving_pk(schema: &SchemaDescriptor, pk_bytes: &[
     );
 }
 
-/// OPK-encode a PK from its **native LE** bytes into a stack buffer, returning
-/// the buffer and its `pk_stride`. `native_le` must hold at least `pk_stride`
-/// bytes (in pk-list column order); any trailing bytes are ignored. This is the
-/// single native→OPK encoder for **every** PK width — a caller holding a narrow
-/// value passes `&value.to_le_bytes()`; the seek path passes the reassembled
-/// wire image via [`crate::schema::seek_opk_bytes`].
+/// OPK-encode a PK from its **native LE** bytes, returning it as a `pk_stride`-
+/// wide [`PkBuf`]. `native_le` must hold at least `pk_stride` bytes (in pk-list
+/// column order); any trailing bytes are ignored. This is the single native→OPK
+/// encoder for **every** PK width — a caller holding a narrow value passes
+/// `&value.to_le_bytes()`; the seek path passes the reassembled wire image via
+/// [`seek_opk_bytes`].
 #[inline]
-pub(crate) fn opk_key(schema: &SchemaDescriptor, native_le: &[u8]) -> ([u8; crate::schema::MAX_PK_BYTES], usize) {
+pub(crate) fn opk_key(schema: &SchemaDescriptor, native_le: &[u8]) -> PkBuf {
     let stride = schema.pk_stride() as usize;
     debug_assert!(
         native_le.len() >= stride,
         "opk_key: native_le ({}) shorter than pk_stride ({stride})",
         native_le.len(),
     );
-    let mut opk = [0u8; crate::schema::MAX_PK_BYTES];
-    encode_order_preserving_pk(schema, &native_le[..stride], &mut opk[..stride]);
-    (opk, stride)
+    let mut out = PkBuf::zeroed(stride);
+    encode_order_preserving_pk(schema, &native_le[..stride], &mut out.bytes[..stride]);
+    out
+}
+
+/// Reassemble the native seek image from the wire pair `(low, extra)` — the
+/// inverse of `PkTuple::split_wire` — and OPK-encode it via [`opk_key`]. The
+/// shared seek-key encoder for the master partition router (`fan_out_seek`) and
+/// the worker SEEK handler (`seek_family`) at every PK width. The seek frame
+/// carries the key as native LE column bytes (it bypasses the client's
+/// `build_pk_region`, so the bytes are not yet OPK): the low
+/// [`NARROW_PK_MAX_BYTES`] ride in `low`, a wide PK's remaining suffix in
+/// `extra` (empty for narrow PKs).
+///
+/// Errors if `extra` is shorter than that suffix.
+pub(crate) fn seek_opk_bytes(schema: &SchemaDescriptor, low: u128, extra: &[u8]) -> Result<PkBuf, String> {
+    let stride = schema.pk_stride() as usize;
+    if stride > MAX_PK_BYTES {
+        return Err(format!("PK stride {stride} exceeds MAX_PK_BYTES {MAX_PK_BYTES}"));
+    }
+    let needed = stride.saturating_sub(NARROW_PK_MAX_BYTES);
+    if extra.len() < needed {
+        return Err(format!(
+            "PK stride {stride} requires {needed} extra bytes, got {}",
+            extra.len()
+        ));
+    }
+    // Native image = `low`'s 16 LE bytes, then the wide suffix. The upper bound
+    // is `16 + needed` (not `stride`): for a narrow PK `needed == 0` makes it the
+    // empty copy `le[16..16]` rather than the inverted range `le[16..stride]`.
+    let mut le = [0u8; MAX_PK_BYTES];
+    le[..NARROW_PK_MAX_BYTES].copy_from_slice(&low.to_le_bytes());
+    le[NARROW_PK_MAX_BYTES..NARROW_PK_MAX_BYTES + needed].copy_from_slice(&extra[..needed]);
+    Ok(opk_key(schema, &le[..stride]))
+}
+
+/// OPK-encode native key values into one leading-key span: column `i` reads
+/// `natives[i]`'s low source-width bytes and encodes at its target column's
+/// (possibly promoted) width, packed tightly in span order. The returned
+/// [`PkBuf`] is exactly the span — bytes past it stay zero, so it is also the
+/// minimum full key of its group and may be widened with [`PkBuf::padded`].
+///
+/// The one native→OPK leading-span encoder, shared by the index seek path
+/// (`IndexKeySpec::seek_prefix`, whose sources promote to wider index columns)
+/// and the base-table PK range path (whose source and target types are equal,
+/// making the promotion the identity arm of `encode_pk_column_promoted`). Both
+/// must agree byte-for-byte with the write side's `IndexKeySpec::write_span`,
+/// which is why they encode through the same call rather than each spelling it.
+pub(crate) fn encode_leading_opk(cols: impl IntoIterator<Item = (u8, SchemaColumn)>, natives: &[u128]) -> PkBuf {
+    let mut out = PkBuf::zeroed(0);
+    let mut off = 0usize;
+    for ((src_tc, target), native) in cols.into_iter().zip(natives) {
+        let w = target.size() as usize;
+        gnitz_wire::encode_pk_column_promoted(
+            &native.to_le_bytes()[..gnitz_wire::wire_stride(src_tc)],
+            src_tc,
+            target.type_code,
+            &mut out.bytes[off..off + w],
+        );
+        off += w;
+    }
+    out.len = off as u8;
+    out
+}
+
+/// OPK-encode a native index-key value into an index's leading key column, for a
+/// prefix seek or a check-batch composite PK — the scalar sibling of
+/// `IndexKeySpec::seek_prefix` for callers whose source column lives in another
+/// table's schema (FK probes). `src_type` is the *source* column type (the value
+/// in `native` is zero-extended): a signed source sign-extends from its native
+/// width before OPK-encoding at the promoted `idx_key_type`, byte-identical to
+/// the write-side `IndexKeySpec::write_span`.
+///
+/// The returned `PkBuf` is exactly the leading column; a caller matching against
+/// a wider composite (the source-PK suffix is zero) widens it with
+/// [`PkBuf::padded`].
+#[inline]
+pub(crate) fn index_opk_prefix(native: u128, src_type: u8, idx_key_type: u8) -> PkBuf {
+    encode_leading_opk([(src_type, SchemaColumn::new(idx_key_type, 0))], &[native])
 }
 
 // ---------------------------------------------------------------------------
 // Hash routing
 // ---------------------------------------------------------------------------
 
-// Multiplicative hash: two Fibonacci multipliers XOR'd together.
-// ~4 instructions vs ~20 for XXH3-64; distribution across 256 buckets
-// is sufficient for worker routing. XXH3 is reserved for filters
-// (xor8, bloom) where collision quality matters.
+/// Route a native PK value to a partition.
+///
+/// Multiplicative hash: two Fibonacci multipliers XOR'd together. ~4
+/// instructions vs ~20 for XXH3-64; distribution across 256 buckets is
+/// sufficient for worker routing. XXH3 is reserved for filters (xor8, bloom)
+/// where collision quality matters.
 #[inline(always)]
-fn mix(pk: u128) -> usize {
+pub fn partition_for_key(pk: u128) -> usize {
     let lo = pk as u64;
     let hi = (pk >> 64) as u64;
     let h = lo.wrapping_mul(0x9e3779b97f4a7c15_u64) ^ hi.wrapping_mul(0x6c62272e07bb0142_u64);
     (h >> 56) as usize
 }
 
-#[inline]
-pub fn partition_for_key(pk: u128) -> usize {
-    mix(pk)
-}
-
-/// Route an OPK PK region (any width) to a partition. For `len ≤ 16` the OPK
-/// bytes are big-endian, so `widen_pk_be` right-aligns them to recover the
-/// native unsigned value (sign-flipped for signed); `mix` of that equals
-/// `partition_for_key(widen_pk_be(bytes))`. This is the invariant the join
-/// router relies on: `extract_col_key` (both PK and OPK-encoded payload paths)
-/// also funnels through `widen_pk_be`, so the two sides of a distributed join
-/// agree. For wide regions (`len > 16`) it takes the top 8 bits of xxh3 of the
-/// OPK bytes directly (uniformly distributed already).
+/// Route an OPK PK region (any width) to a partition. For a narrow region the
+/// OPK bytes are big-endian, so `widen_pk_be` right-aligns them to recover the
+/// native unsigned value (sign-flipped for signed) and the result is
+/// `partition_for_key(widen_pk_be(bytes))` by construction. This is the
+/// invariant the join router relies on: `extract_col_key` (both PK and
+/// OPK-encoded payload paths) also funnels through `widen_pk_be`, so the two
+/// sides of a distributed join agree. For wide regions it takes the top 8 bits
+/// of xxh3 of the OPK bytes directly (uniformly distributed already).
 #[inline]
 pub fn partition_for_pk_bytes(bytes: &[u8]) -> usize {
-    if bytes.len() <= 16 {
-        mix(gnitz_wire::widen_pk_be(bytes, bytes.len()))
+    if bytes.len() <= NARROW_PK_MAX_BYTES {
+        partition_for_key(gnitz_wire::widen_pk_be(bytes, bytes.len()))
     } else {
         (crate::foundation::xxh::checksum(bytes) >> 56) as usize
     }
@@ -200,7 +285,7 @@ impl NarrowPkOpk {
     #[inline(always)]
     pub(crate) fn new(pk: u128, stride: usize) -> Self {
         assert!(
-            stride <= 16,
+            stride <= NARROW_PK_MAX_BYTES,
             "narrow PK required, got stride {stride}; use the raw-OPK-bytes setter"
         );
         debug_assert!(
@@ -342,22 +427,9 @@ impl Ord for PkBuf {
 }
 
 impl PkBuf {
-    /// All-zero `bytes`, `len = stride`. The zero-row / placeholder /
-    /// empty-shard form.
-    pub fn empty(stride: u8) -> Self {
-        debug_assert!(stride as usize <= MAX_PK_BYTES);
-        PkBuf {
-            bytes: [0u8; MAX_PK_BYTES],
-            len: stride,
-        }
-    }
-
-    /// `len = slice.len()`, `bytes[..len]` copied from `slice`, tail
-    /// zero. The only row constructor: `MappedShard::get_pk_bytes(row)`
-    /// returns exactly `pk_stride` bytes, and manifest `parse` passes
-    /// its on-disk `len`/payload slice.
-    /// All-zero key of the given width — mutable scratch for cut-key
-    /// derivation (the fields are public; write the meaningful span in place).
+    /// All-zero key of the given width — the zero-row / placeholder /
+    /// empty-shard form, and the mutable scratch every reused key buffer starts
+    /// from (the fields are public; write the meaningful span in place).
     pub fn zeroed(len: usize) -> Self {
         debug_assert!(len <= MAX_PK_BYTES);
         PkBuf {
@@ -366,6 +438,10 @@ impl PkBuf {
         }
     }
 
+    /// `len = slice.len()`, `bytes[..len]` copied from `slice`, tail
+    /// zero. The row constructor: `MappedShard::get_pk_bytes(row)`
+    /// returns exactly `pk_stride` bytes, and manifest `parse` passes
+    /// its on-disk `len`/payload slice.
     pub fn from_bytes(slice: &[u8]) -> Self {
         debug_assert!(slice.len() <= MAX_PK_BYTES);
         let mut bytes = [0u8; MAX_PK_BYTES];
@@ -459,173 +535,59 @@ mod tests {
         );
     }
 
-    #[test]
-    fn compare_pk_bytes_single_u64() {
-        let s = pk_only_schema(&[type_code::U64]);
-        let vals: [u64; 4] = [1, 2, 256, u64::MAX];
-        for i in 0..vals.len() {
-            for j in 0..vals.len() {
-                let a = vals[i].to_le_bytes();
-                let b = vals[j].to_le_bytes();
-                assert_eq!(
-                    cmp_pk_le(&s, &a, &b),
-                    vals[i].cmp(&vals[j]),
-                    "U64 mismatch at ({i}, {j})",
-                );
-                assert_opk_equivalence(&s, &a, &b);
+    /// Sweep one single-column PK schema pairwise over `vals`: the OPK memcmp
+    /// order at rest must equal `T`'s native typed order — an oracle fully
+    /// independent of the in-file `typed_cmp_pk_le` — and must also agree with
+    /// `typed_cmp_pk_le` over the same bytes. The `i == j` diagonal is the
+    /// equal-buffer case.
+    fn assert_single_col_order<T: Ord + Copy + std::fmt::Debug>(tc: u8, vals: &[T], le: impl Fn(T) -> Vec<u8>) {
+        let s = pk_only_schema(&[tc]);
+        for &a in vals {
+            for &b in vals {
+                let (ab, bb) = (le(a), le(b));
+                assert_eq!(cmp_pk_le(&s, &ab, &bb), a.cmp(&b), "type_code {tc}: {a:?} vs {b:?}");
+                assert_opk_equivalence(&s, &ab, &bb);
             }
         }
-        // Pin the LE-bytes vs lex-bytes regression: 1 < 256.
-        assert_eq!(
-            cmp_pk_le(&s, &1u64.to_le_bytes(), &256u64.to_le_bytes()),
-            Ordering::Less,
+    }
+
+    /// Boundary sweeps for every PK-eligible scalar type. The value sets carry
+    /// the regressions that used to have a test each: sign-extension (`-1 < 1`),
+    /// zero-extension (`0xFFFE > 1`), LE-vs-lex byte order (`1 < 256`), and the
+    /// 2^63 / 2^64 width boundaries that separate a U64 image from an I64 one.
+    #[test]
+    fn opk_order_matches_native_order_per_type() {
+        assert_single_col_order(type_code::U8, &[0u8, 1, 0x7F, 0x80, 0xFF], |v| vec![v]);
+        assert_single_col_order(type_code::I8, &[i8::MIN, -1, 0, 1, i8::MAX], |v| vec![v as u8]);
+        let le16 = |v: u16| v.to_le_bytes().to_vec();
+        assert_single_col_order(type_code::U16, &[0u16, 1, 0x0100, 0x8000, 0xFFFE, u16::MAX], le16);
+        assert_single_col_order(type_code::I16, &[i16::MIN, -1, 0, 1, i16::MAX], |v: i16| {
+            v.to_le_bytes().to_vec()
+        });
+        let le32 = |v: u32| v.to_le_bytes().to_vec();
+        assert_single_col_order(
+            type_code::U32,
+            &[0u32, 1, 256, 0x8000_0000, 0xFFFF_FFFE, u32::MAX],
+            le32,
         );
-    }
-
-    /// A single I128 PK column: the OPK memcmp order at rest must equal the typed
-    /// SIGNED i128 order, across the sign boundary and the 2^63/2^64 width
-    /// boundaries that distinguish a U64 image from an I64 image.
-    #[test]
-    fn compare_pk_bytes_single_i128() {
-        let s = pk_only_schema(&[type_code::I128]);
-        let vals: [i128; 7] = [i128::MIN, -1, 0, 1, 1i128 << 63, 1i128 << 64, i128::MAX];
-        for i in 0..vals.len() {
-            for j in 0..vals.len() {
-                let a = vals[i].to_le_bytes();
-                let b = vals[j].to_le_bytes();
-                assert_eq!(
-                    cmp_pk_le(&s, &a, &b),
-                    vals[i].cmp(&vals[j]),
-                    "I128 PK order mismatch at ({i}, {j})",
-                );
-                assert_opk_equivalence(&s, &a, &b);
-            }
-        }
-    }
-
-    #[test]
-    fn compare_pk_bytes_single_u128() {
-        let s = pk_only_schema(&[type_code::U128]);
-        let lo = u64::MAX as u128;
-        let hi = lo + 1;
-        assert_eq!(cmp_pk_le(&s, &lo.to_le_bytes(), &hi.to_le_bytes()), Ordering::Less,);
-        assert_eq!(cmp_pk_le(&s, &hi.to_le_bytes(), &lo.to_le_bytes()), Ordering::Greater,);
-        assert_eq!(cmp_pk_le(&s, &lo.to_le_bytes(), &lo.to_le_bytes()), Ordering::Equal,);
-        assert_opk_equivalence(&s, &lo.to_le_bytes(), &hi.to_le_bytes());
-        assert_opk_equivalence(&s, &hi.to_le_bytes(), &lo.to_le_bytes());
-    }
-
-    #[test]
-    fn compare_pk_bytes_single_uuid() {
-        let s = pk_only_schema(&[type_code::UUID]);
-        let low: u128 = 0x0000_0000_0000_0001;
-        let high: u128 = 0x8000_0000_0000_0000_0000_0000_0000_0000;
-        // High-bit-set sorts above small value (u128 LE numerical order).
-        assert_eq!(cmp_pk_le(&s, &low.to_le_bytes(), &high.to_le_bytes()), Ordering::Less,);
-        assert_opk_equivalence(&s, &low.to_le_bytes(), &high.to_le_bytes());
-    }
-
-    #[test]
-    fn compare_pk_bytes_single_signed_i8() {
-        let s = pk_only_schema(&[type_code::I8]);
-        let vals: [i8; 5] = [i8::MIN, -1, 0, 1, i8::MAX];
-        for i in 0..vals.len() {
-            for j in 0..vals.len() {
-                let a = [vals[i] as u8];
-                let b = [vals[j] as u8];
-                assert_eq!(
-                    cmp_pk_le(&s, &a, &b),
-                    vals[i].cmp(&vals[j]),
-                    "I8 mismatch at ({i}, {j})",
-                );
-                assert_opk_equivalence(&s, &a, &b);
-            }
-        }
-        // Sign-extension regression: -1 (0xFF) < 1 (0x01).
-        assert_eq!(cmp_pk_le(&s, &[0xFF], &[0x01]), Ordering::Less);
-    }
-
-    #[test]
-    fn compare_pk_bytes_single_signed_i16() {
-        let s = pk_only_schema(&[type_code::I16]);
-        let vals: [i16; 5] = [i16::MIN, -1, 0, 1, i16::MAX];
-        for i in 0..vals.len() {
-            for j in 0..vals.len() {
-                let a = vals[i].to_le_bytes();
-                let b = vals[j].to_le_bytes();
-                assert_eq!(
-                    cmp_pk_le(&s, &a, &b),
-                    vals[i].cmp(&vals[j]),
-                    "I16 mismatch at ({i}, {j})",
-                );
-                assert_opk_equivalence(&s, &a, &b);
-            }
-        }
-    }
-
-    #[test]
-    fn compare_pk_bytes_single_signed_i32() {
-        let s = pk_only_schema(&[type_code::I32]);
-        let vals: [i32; 5] = [i32::MIN, -1, 0, 1, i32::MAX];
-        for i in 0..vals.len() {
-            for j in 0..vals.len() {
-                let a = vals[i].to_le_bytes();
-                let b = vals[j].to_le_bytes();
-                assert_eq!(
-                    cmp_pk_le(&s, &a, &b),
-                    vals[i].cmp(&vals[j]),
-                    "I32 mismatch at ({i}, {j})",
-                );
-                assert_opk_equivalence(&s, &a, &b);
-            }
-        }
-    }
-
-    #[test]
-    fn compare_pk_bytes_single_signed_i64() {
-        let s = pk_only_schema(&[type_code::I64]);
-        let vals: [i64; 5] = [i64::MIN, -1, 0, 1, i64::MAX];
-        for i in 0..vals.len() {
-            for j in 0..vals.len() {
-                let a = vals[i].to_le_bytes();
-                let b = vals[j].to_le_bytes();
-                assert_eq!(
-                    cmp_pk_le(&s, &a, &b),
-                    vals[i].cmp(&vals[j]),
-                    "I64 mismatch at ({i}, {j})",
-                );
-                assert_opk_equivalence(&s, &a, &b);
-            }
-        }
-    }
-
-    #[test]
-    fn compare_pk_bytes_single_unsigned_u8() {
-        let s = pk_only_schema(&[type_code::U8]);
-        // High-bit-set vs small: 0xFF > 0x01 numerically as unsigned.
-        assert_eq!(cmp_pk_le(&s, &[0xFFu8], &[0x01u8]), Ordering::Greater);
-        assert_eq!(cmp_pk_le(&s, &[0x00u8], &[0xFFu8]), Ordering::Less);
-        assert_opk_equivalence(&s, &[0xFFu8], &[0x01u8]);
-        assert_opk_equivalence(&s, &[0x00u8], &[0xFFu8]);
-    }
-
-    #[test]
-    fn compare_pk_bytes_single_unsigned_u16() {
-        let s = pk_only_schema(&[type_code::U16]);
-        let lo: u16 = 0x0001;
-        let hi: u16 = 0xFFFE;
-        // Zero-extension: hi > lo. Sign-extension would invert.
-        assert_eq!(cmp_pk_le(&s, &lo.to_le_bytes(), &hi.to_le_bytes()), Ordering::Less,);
-        assert_opk_equivalence(&s, &lo.to_le_bytes(), &hi.to_le_bytes());
-    }
-
-    #[test]
-    fn compare_pk_bytes_single_unsigned_u32() {
-        let s = pk_only_schema(&[type_code::U32]);
-        let lo: u32 = 1;
-        let hi: u32 = 0xFFFF_FFFE;
-        assert_eq!(cmp_pk_le(&s, &lo.to_le_bytes(), &hi.to_le_bytes()), Ordering::Less,);
-        assert_opk_equivalence(&s, &lo.to_le_bytes(), &hi.to_le_bytes());
+        assert_single_col_order(type_code::I32, &[i32::MIN, -1, 0, 1, i32::MAX], |v: i32| {
+            v.to_le_bytes().to_vec()
+        });
+        assert_single_col_order(type_code::U64, &[0u64, 1, 2, 256, 1 << 63, u64::MAX], |v: u64| {
+            v.to_le_bytes().to_vec()
+        });
+        assert_single_col_order(type_code::I64, &[i64::MIN, -1, 0, 1, i64::MAX], |v: i64| {
+            v.to_le_bytes().to_vec()
+        });
+        let le128 = |v: u128| v.to_le_bytes().to_vec();
+        let wide = [0u128, 1, u64::MAX as u128, u64::MAX as u128 + 1, 1 << 127, u128::MAX];
+        assert_single_col_order(type_code::U128, &wide, le128);
+        assert_single_col_order(type_code::UUID, &wide, le128);
+        assert_single_col_order(
+            type_code::I128,
+            &[i128::MIN, -1, 0, 1, 1i128 << 63, 1i128 << 64, i128::MAX],
+            |v: i128| v.to_le_bytes().to_vec(),
+        );
     }
 
     #[test]
@@ -648,6 +610,9 @@ mod tests {
         assert_opk_equivalence(&s, &r0, &r1);
         assert_opk_equivalence(&s, &r1, &r2);
         assert_opk_equivalence(&s, &r0, &r2);
+        // Equal compound buffers compare Equal at every column.
+        assert_eq!(cmp_pk_le(&s, &r0, &r0), Ordering::Equal);
+        assert_opk_equivalence(&s, &r0, &r0);
     }
 
     #[test]
@@ -689,36 +654,6 @@ mod tests {
         assert_eq!(cmp_pk_le(&s, &a, &b), Ordering::Less);
         // Encoder iterates pk-list order [1,0], same as the comparator.
         assert_opk_equivalence(&s, &a, &b);
-    }
-
-    #[test]
-    fn compare_pk_bytes_equal_returns_equal() {
-        for tc in [
-            type_code::U8,
-            type_code::I8,
-            type_code::U16,
-            type_code::I16,
-            type_code::U32,
-            type_code::I32,
-            type_code::U64,
-            type_code::I64,
-            type_code::U128,
-            type_code::UUID,
-        ] {
-            let s = pk_only_schema(&[tc]);
-            let stride = s.pk_stride() as usize;
-            let buf = vec![0xABu8; stride];
-            assert_eq!(
-                cmp_pk_le(&s, &buf, &buf),
-                Ordering::Equal,
-                "equal-buffer mismatch for type_code {tc}",
-            );
-        }
-        // Compound (U64, U64) equal buffers.
-        let s = pk_only_schema(&[type_code::U64, type_code::U64]);
-        let buf = vec![0x7Fu8; 16];
-        assert_eq!(cmp_pk_le(&s, &buf, &buf), Ordering::Equal);
-        assert_opk_equivalence(&s, &buf, &buf);
     }
 
     /// The specialized `{8, 16}` register-load arms of `pack_pk_be` must be
@@ -843,6 +778,97 @@ mod tests {
                 prop_assert!(pk_bytes_eq(&oa, &oa));
             }
         }
+    }
+
+    // ── seek_opk_bytes: the width-universal seek-key encoder ─────────────────
+
+    #[test]
+    fn seek_opk_bytes_narrow_matches_opk_key() {
+        // For every narrow stride (≤ 16) the wire pair degenerates to `(low, &[])`,
+        // so `seek_opk_bytes` must be byte-identical to a direct `opk_key` of the
+        // native value — both buffer and stride.
+        let cases = [
+            pk_only_schema(&[type_code::U8]),  // stride 1
+            pk_only_schema(&[type_code::U32]), // stride 4
+            pk_only_schema(&[type_code::U64]), // stride 8
+            pk_only_schema(&[type_code::I64]), // stride 8, signed → OPK flips the sign bit
+            // Compound (U32, U32) with a *permuted* PK list [1, 0]: stride 8,
+            // exercises the multi-column pk-list walk in the encoder.
+            SchemaDescriptor::new(
+                &[
+                    SchemaColumn::new(type_code::U32, 0),
+                    SchemaColumn::new(type_code::U32, 0),
+                ],
+                &[1, 0],
+            ),
+        ];
+        // Values spanning zero, small, mixed, and a sign-bit-set word (negative
+        // for the I64 case) so the sign-flip and byte order are exercised. Both
+        // encoders truncate to `stride`, so an over-wide value is a valid probe.
+        for s in cases {
+            for v in [0u128, 1, 0x0123_4567_89AB_CDEF, 0x8000_0000_0000_0000, u64::MAX as u128] {
+                let want = opk_key(&s, &v.to_le_bytes());
+                let got = seek_opk_bytes(&s, v, &[]).expect("narrow seek encodes");
+                assert_eq!(got, want, "narrow seek must match opk_key for {s:?} v={v:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn seek_opk_bytes_wide_reproduces_hand_built_opk() {
+        // (U64, U64, U64) = stride 24, wide. The wire pair carries the first 16
+        // native bytes in `low` and the trailing U64 in `extra`, exactly as
+        // `PkTuple::split_wire` packs them. All-unsigned ⇒ OPK is each column's
+        // big-endian image, so the expected key is built by hand.
+        let s = pk_only_schema(&[type_code::U64; 3]);
+        assert_eq!(s.pk_stride(), 24);
+        let (a, b, c): (u64, u64, u64) = (0x1122_3344_5566_7788, 0x99AA_BBCC_DDEE_FF00, 0x0102_0304_0506_0708);
+        // Native LE image = [a_LE, b_LE, c_LE]; split_wire's `low` is the first 16
+        // bytes (a in the low half, b in the high half), `extra` is c's 8 bytes.
+        let low = (a as u128) | ((b as u128) << 64);
+        let opk = seek_opk_bytes(&s, low, &c.to_le_bytes()).expect("wide seek encodes");
+        assert_eq!(opk.len, 24);
+        let want: Vec<u8> = a
+            .to_be_bytes()
+            .into_iter()
+            .chain(b.to_be_bytes())
+            .chain(c.to_be_bytes())
+            .collect();
+        assert_eq!(opk.pk_bytes(), want.as_slice());
+    }
+
+    #[test]
+    fn seek_opk_bytes_missing_extra_errs_not_panics() {
+        // A wide stride needs `stride - 16` extra bytes; too few must return Err,
+        // never panic — the runtime guard the two dispatch sites rely on.
+        let s = pk_only_schema(&[type_code::U64; 3]);
+        assert!(seek_opk_bytes(&s, 0, &[]).is_err(), "stride 24 with no extra must Err");
+        assert!(seek_opk_bytes(&s, 0, &[0u8; 7]).is_err(), "7 < 8 extra bytes must Err");
+        assert!(
+            seek_opk_bytes(&s, 0, &[0u8; 8]).is_ok(),
+            "exactly 8 extra bytes is enough"
+        );
+    }
+
+    #[test]
+    fn seek_opk_bytes_four_u128_ceiling() {
+        // The widest SQL-reachable PK is 4 columns (PK_LIST_MAX_COLS); 4×U128 =
+        // stride 64 exercises the `le[16..16 + needed]` copy at its ceiling
+        // (`needed == 48`). All-unsigned ⇒ OPK is each column's BE image.
+        // Column 0 rides in `low`; columns 1..4 (48 bytes) in `extra`.
+        let s = pk_only_schema(&[type_code::U128; 4]);
+        assert_eq!(s.pk_stride(), 64);
+        let vals: [u128; 4] = [
+            0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10,
+            0x1112_1314_1516_1718_191A_1B1C_1D1E_1F20,
+            0x2122_2324_2526_2728_292A_2B2C_2D2E_2F30,
+            0x3132_3334_3536_3738_393A_3B3C_3D3E_3F40,
+        ];
+        let extra: Vec<u8> = vals[1..].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let opk = seek_opk_bytes(&s, vals[0], &extra).expect("4×U128 encodes");
+        assert_eq!(opk.len, 64);
+        let want: Vec<u8> = vals.iter().flat_map(|v| v.to_be_bytes()).collect();
+        assert_eq!(opk.pk_bytes(), want.as_slice());
     }
 
     #[test]

@@ -20,7 +20,7 @@ use super::*;
 use crate::expr::ScalarFunc;
 use crate::ops::AdhocFold;
 use crate::schema::key::{compare_pk_bytes, opk_key, PkBuf};
-use crate::schema::{ColumnLocator, TypeCode, MAX_PK_BYTES};
+use crate::schema::{ColumnLocator, TypeCode};
 use crate::storage::{cmp_col_window, compare_rows};
 use gnitz_expr::{LogicalProgram, RowSource};
 
@@ -201,10 +201,10 @@ impl CatalogEngine {
                 let mut opk_keys: Vec<[u8; 16]> = keys
                     .iter()
                     .map(|&k| {
-                        let (opk, st) = opk_key(src_schema, &k.to_le_bytes());
-                        debug_assert_eq!(st, stride);
+                        let opk = opk_key(src_schema, &k.to_le_bytes());
+                        debug_assert_eq!(opk.len as usize, stride);
                         let mut key = [0u8; 16];
-                        key[..stride].copy_from_slice(&opk[..stride]);
+                        key[..stride].copy_from_slice(opk.pk_bytes());
                         key
                     })
                     .collect();
@@ -575,15 +575,16 @@ fn pk_range_keys(schema: &SchemaDescriptor, range: &RangeDescriptor) -> Result<O
         range,
         schema.pk_stride() as usize,
         |v| {
-            let mut out = [0u8; MAX_PK_BYTES];
-            let mut off = 0usize;
-            for (i, (_ord, _ci, col)) in schema.pk_columns().enumerate().take(n_eq + 1) {
-                let cs = col.size() as usize;
-                let native = if i < n_eq { eq_natives[i] } else { v };
-                gnitz_wire::encode_pk_column(&native.to_le_bytes()[..cs], col.type_code, &mut out[off..off + cs]);
-                off += cs;
-            }
-            (out, off)
+            let mut natives = [0u128; gnitz_wire::PK_LIST_MAX_COLS];
+            natives[..n_eq].copy_from_slice(eq_natives);
+            natives[n_eq] = v;
+            // Source and target column are the same here (no index promotion),
+            // so the shared encoder's promote step is its identity arm.
+            let cols = schema
+                .pk_columns()
+                .take(n_eq + 1)
+                .map(|(_ord, _ci, col)| (col.type_code, *col));
+            crate::schema::key::encode_leading_opk(cols, &natives[..=n_eq])
         },
     ))
 }
@@ -697,8 +698,7 @@ mod tests {
         let neg1 = (-1i64 as u64) as u128;
         let d = RangeDescriptor::new(&[], After(neg1), After((i64::MAX as u64) as u128));
         let (start, end) = pk_range_keys(&s, &d).unwrap().unwrap();
-        let (opk0, st) = opk_key(&s, &0i64.to_le_bytes());
-        assert_eq!(start.pk_bytes(), &opk0[..st]);
+        assert_eq!(start, opk_key(&s, &0i64.to_le_bytes()));
         assert!(end.is_none());
     }
 
@@ -710,21 +710,21 @@ mod tests {
         let d = RangeDescriptor::new(&[5], After(3), After(u64::MAX as u128));
         let (start, end) = pk_range_keys(&s, &d).unwrap().unwrap();
         // start = OPK(5,4) — the prefix `(5,3)` incremented on b.
-        let (s54, st) = opk_key(&s, &{
+        let s54 = opk_key(&s, &{
             let mut v = Vec::new();
             v.extend_from_slice(&5u64.to_le_bytes());
             v.extend_from_slice(&4u64.to_le_bytes());
             v
         });
-        assert_eq!(start.pk_bytes(), &s54[..st]);
+        assert_eq!(start, s54);
         // end = the successor of `(5, MAX)` — carries into `a`, i.e. OPK(6, 0).
-        let (s60, _) = opk_key(&s, &{
+        let s60 = opk_key(&s, &{
             let mut v = Vec::new();
             v.extend_from_slice(&6u64.to_le_bytes());
             v.extend_from_slice(&0u64.to_le_bytes());
             v
         });
-        assert_eq!(end.unwrap().pk_bytes(), &s60[..st]);
+        assert_eq!(end.unwrap(), s60);
     }
 
     /// `n_eq` at the PK arity leaves no range column — a trust-boundary reject.

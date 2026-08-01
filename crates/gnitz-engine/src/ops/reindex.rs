@@ -7,7 +7,7 @@
 //! they stay `#[inline]` and monomorphic so producer and consumer keys agree.
 
 use crate::foundation::xxh;
-use crate::schema::{type_code, ColumnLocator, SchemaDescriptor};
+use crate::schema::{ColumnLocator, SchemaDescriptor};
 use crate::storage::{Batch, MemBatch};
 
 /// Set every row's PK to a hash of its full payload content. Identical row
@@ -93,60 +93,32 @@ pub(super) fn german_string_promote_key(struct_bytes: &[u8], blob: &[u8]) -> u12
 
 #[derive(Clone, Copy)]
 enum PromoteKind {
-    /// Reindex on a PK column: copy that column's OPK bytes verbatim. The PK
-    /// region is already OPK at rest (sign bit flipped for signed), so a verbatim
-    /// byte copy — right-aligned into the output stride — is the sign-aware
-    /// synthetic key. `widen_pk_be` of the result equals `extract_col_key`'s
-    /// `widen_pk_be(get_pk_bytes[col])`, so the reindexed (delta) side and the
-    /// OPK-routed (trace) side land on the same worker. `tc` is the source column
-    /// type code, needed only under width promotion (decode-to-native then
-    /// re-encode at `T`).
-    Pk { off: usize, cs: usize, tc: u8 },
-    /// U128/UUID payload (unsigned): OPK == big-endian.
-    Wide { pi: usize, tc: u8 },
-    /// STRING/BLOB payload: sign-agnostic XXH3 hash key.
+    /// Any scalar source column. The resolved [`ColumnLocator`] already says
+    /// which region holds the bytes — an at-rest OPK PK window (sign bit flipped
+    /// for signed, so a promoted copy is the sign-aware synthetic key) or a
+    /// native-LE payload cell — at what width and at what source type. Both
+    /// widths and both signs share this arm: the encode differs only by region,
+    /// which is what the locator discriminates.
+    Col(ColumnLocator),
+    /// STRING/BLOB payload: sign-agnostic XXH3 hash key. The only source that is
+    /// not a scalar cell the OPK encoders can consume.
     String { pi: usize },
-    /// Reindex on an integer payload column: OPK-encode the native value
-    /// (sign-flipped for signed), matching `extract_col_key`'s payload arm so
-    /// equal logical values from the Pk and Narrow arms produce identical bytes.
-    Narrow { pi: usize, cs: usize, tc: u8 },
 }
 
 /// Per-column classifier for "read a source column, project it to OPK PK
-/// bytes". The `match` on type code happens once per column at
-/// `ReindexPacker::new`; the resulting `PromoteKind` is stored on the
-/// `ColPromoter`, and the per-row work is the read + kind-specific OPK encode
-/// performed by `ColPromoter::write_into`.
+/// bytes". Runs once per column at `ReindexPacker::new`; the resulting
+/// `PromoteKind` is stored on the `ColPromoter`, and the per-row work is the
+/// read + OPK encode performed by `ColPromoter::write_into`.
 fn classify_promote(schema: &SchemaDescriptor, col_idx: usize) -> PromoteKind {
-    match schema.locate(col_idx) {
-        ColumnLocator::Pk {
-            byte_off,
-            size,
-            type_code,
-        } => PromoteKind::Pk {
-            off: byte_off as usize,
-            cs: size as usize,
-            tc: type_code,
-        },
-        ColumnLocator::Payload { slot, size, type_code } => {
-            let pi = slot as usize;
-            match type_code {
-                type_code::U128 | type_code::UUID => PromoteKind::Wide { pi, tc: type_code },
-                // BLOB shares the 16-byte German-string struct layout with
-                // STRING, so it must take the same hash path (not the narrow
-                // ≤8-byte copy).
-                type_code::STRING | type_code::BLOB => PromoteKind::String { pi },
-                // All ≤8-byte integer and float types: OPK-encode the native
-                // value (sign-flip for signed integers), matching
-                // extract_col_key's payload arm. Float bit patterns OPK-encode
-                // as their unsigned image.
-                _ => PromoteKind::Narrow {
-                    pi,
-                    cs: size as usize,
-                    tc: type_code,
-                },
-            }
+    let loc = schema.locate(col_idx);
+    match loc {
+        // BLOB shares the 16-byte German-string struct layout with STRING, so it
+        // takes the same hash path rather than a raw cell encode. Neither can be
+        // a PK column, so only the payload arm needs the test.
+        ColumnLocator::Payload { slot, type_code, .. } if gnitz_wire::is_german_string(type_code) => {
+            PromoteKind::String { pi: slot as usize }
         }
+        _ => PromoteKind::Col(loc),
     }
 }
 
@@ -187,7 +159,7 @@ impl ColPromoter {
         out_off: 0,
         out_size: 0,
         out_tc: 0,
-        kind: PromoteKind::Wide { pi: 0, tc: 0 },
+        kind: PromoteKind::String { pi: 0 },
     };
 
     /// Write this column's `out_size` OPK bytes into `dst` (len == out_size).
@@ -200,23 +172,23 @@ impl ColPromoter {
     #[inline]
     fn write_into(&self, dst: &mut [u8], batch: &MemBatch, row: usize) {
         match self.kind {
-            // Source PK column is OPK at rest: verbatim copy when unpromoted,
-            // else decode to native and re-encode at `out_tc` (sign/zero-extended)
-            // so both join sides pack equal values identically.
-            PromoteKind::Pk { off, cs, tc } => {
-                gnitz_wire::promote_opk_column(&batch.get_pk_bytes(row)[off..off + cs], tc, self.out_tc, dst);
-            }
-            // Integer or float payload column, native LE — exactly the encoder's
-            // input. A float self-derives to U128, so the promotion also does the
-            // low-`cs`-bytes right-alignment the slot needs.
-            PromoteKind::Narrow { pi, cs, tc } => {
-                gnitz_wire::encode_pk_column_promoted(batch.get_col_ptr(row, pi, cs), tc, self.out_tc, dst);
-            }
-            // U128/UUID are unsigned, so OPK is plain big-endian — but go through
-            // the encoder rather than spelling `to_be_bytes`, so the arm cannot
-            // drift from the others if a wide promotion ever appears.
-            PromoteKind::Wide { pi, tc } => {
-                gnitz_wire::encode_pk_column_promoted(batch.get_col_ptr(row, pi, 16), tc, self.out_tc, dst)
+            PromoteKind::Col(loc) => {
+                let src = loc.bytes(batch, row);
+                match loc {
+                    // Source PK column is OPK at rest: verbatim copy when
+                    // unpromoted, else decode to native and re-encode at `out_tc`
+                    // (sign/zero-extended) so both join sides pack equal values
+                    // identically.
+                    ColumnLocator::Pk { type_code, .. } => {
+                        gnitz_wire::promote_opk_column(src, type_code, self.out_tc, dst)
+                    }
+                    // Payload cell, native LE — exactly the encoder's input, at
+                    // any width. A float self-derives to U128, so the promotion
+                    // also does the right-alignment the slot needs.
+                    ColumnLocator::Payload { type_code, .. } => {
+                        gnitz_wire::encode_pk_column_promoted(src, type_code, self.out_tc, dst)
+                    }
+                }
             }
             // Synthetic XXH3 content hash (unsigned U128): OPK == big-endian.
             PromoteKind::String { pi } => dst.copy_from_slice(&read_string(batch, pi, row).to_be_bytes()),
@@ -273,12 +245,15 @@ impl ReindexPacker {
             let carried = target_tcs.get(i).copied().unwrap_or(0);
             let out_tc = gnitz_wire::resolve_reindex_type(src_tc, carried);
             let out_size = gnitz_wire::wire_stride(out_tc);
-            // The Narrow arm right-aligns `cs` native bytes into `out_size`; a
-            // negative pad (out_size < cs) is unreachable but would corrupt the
-            // slot, so assert the invariant the encoders rely on. (Internal
-            // type-system invariant, fully determined by `resolve_reindex_type`
-            // — not input-driven, so debug-only is enough.)
-            debug_assert!(out_size >= gnitz_wire::wire_stride(src_tc) || !matches!(kind, PromoteKind::Narrow { .. }));
+            // The payload arm right-aligns the source's native bytes into
+            // `out_size`; a negative pad (out_size < source width) is unreachable
+            // but would corrupt the slot, so assert the invariant the encoders
+            // rely on. (Internal type-system invariant, fully determined by
+            // `resolve_reindex_type` — not input-driven, so debug-only is enough.)
+            debug_assert!(
+                out_size >= gnitz_wire::wire_stride(src_tc)
+                    || !matches!(kind, PromoteKind::Col(ColumnLocator::Payload { .. }))
+            );
             cols[i] = ColPromoter {
                 out_off,
                 out_size,
@@ -356,11 +331,16 @@ mod tests {
         #[inline]
         fn promote(&self, batch: &MemBatch, row: usize) -> u128 {
             match self.kind {
-                PromoteKind::Pk { off, cs, .. } => gnitz_wire::pk_route_key(batch.get_pk_bytes(row), off, cs),
-                PromoteKind::Narrow { pi, cs, tc } => {
-                    gnitz_wire::payload_route_key(batch.get_col_ptr(row, pi, cs), 0, cs, tc)
+                PromoteKind::Col(ColumnLocator::Pk { byte_off, size, .. }) => {
+                    gnitz_wire::pk_route_key(batch.get_pk_bytes(row), byte_off as usize, size as usize)
                 }
-                PromoteKind::Wide { pi, .. } => read_wide(batch, pi, row),
+                PromoteKind::Col(ColumnLocator::Payload { slot, size, type_code }) => {
+                    let (pi, cs) = (slot as usize, size as usize);
+                    match type_code {
+                        crate::schema::type_code::U128 | crate::schema::type_code::UUID => read_wide(batch, pi, row),
+                        _ => gnitz_wire::payload_route_key(batch.get_col_ptr(row, pi, cs), 0, cs, type_code),
+                    }
+                }
                 PromoteKind::String { pi } => read_string(batch, pi, row),
             }
         }
@@ -384,7 +364,8 @@ mod tests {
                 // right-aligned with left zero-pad. widen_pk_be of the result
                 // equals extract_col_key's `widen_pk_be(get_pk_bytes[col])`, so
                 // routing agrees.
-                PromoteKind::Pk { off, cs, .. } => {
+                PromoteKind::Col(ColumnLocator::Pk { byte_off, size, .. }) => {
+                    let (off, cs) = (byte_off as usize, size as usize);
                     // Loop-invariant scratch: only `buf[16 - cs..]` is rewritten per
                     // row; the left zero-pad (read when stride > cs) is set once.
                     let mut buf = [0u8; 16];
@@ -394,23 +375,28 @@ mod tests {
                         output.set_pk_at_bytes(row, &buf[16 - stride..]);
                     }
                 }
-                // Payload integer: OPK-encode the native value (sign-flipped for
-                // signed), matching extract_col_key's payload arm.
-                PromoteKind::Narrow { pi, cs, tc } => {
-                    // Loop-invariant scratch: `encode_pk_column` fully overwrites the
-                    // `[16 - cs..]` slice each row; the zero prefix persists.
-                    let mut opk = [0u8; 16];
-                    for row in 0..output.count {
-                        let native = batch.get_col_ptr(row, pi, cs);
-                        gnitz_wire::encode_pk_column(native, tc, &mut opk[16 - cs..]);
-                        output.set_pk_at_bytes(row, &opk[16 - stride..]);
-                    }
-                }
-                // U128/UUID are unsigned: OPK == big-endian.
-                PromoteKind::Wide { pi, .. } => {
-                    for row in 0..output.count {
-                        let v = read_wide(batch, pi, row);
-                        output.set_pk_at(row, v);
+                PromoteKind::Col(ColumnLocator::Payload { slot, size, type_code }) => {
+                    let (pi, cs) = (slot as usize, size as usize);
+                    match type_code {
+                        // U128/UUID are unsigned: OPK == big-endian.
+                        crate::schema::type_code::U128 | crate::schema::type_code::UUID => {
+                            for row in 0..output.count {
+                                let v = read_wide(batch, pi, row);
+                                output.set_pk_at(row, v);
+                            }
+                        }
+                        // Payload integer: OPK-encode the native value (sign-flipped
+                        // for signed), matching extract_col_key's payload arm.
+                        _ => {
+                            // Loop-invariant scratch: `encode_pk_column` fully overwrites
+                            // the `[16 - cs..]` slice each row; the zero prefix persists.
+                            let mut opk = [0u8; 16];
+                            for row in 0..output.count {
+                                let native = batch.get_col_ptr(row, pi, cs);
+                                gnitz_wire::encode_pk_column(native, type_code, &mut opk[16 - cs..]);
+                                output.set_pk_at_bytes(row, &opk[16 - stride..]);
+                            }
+                        }
                     }
                 }
                 // Synthetic XXH3 hash key (unsigned U128): OPK == big-endian.

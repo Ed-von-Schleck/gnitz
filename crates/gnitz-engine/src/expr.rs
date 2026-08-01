@@ -60,7 +60,7 @@ fn copy_column(
     in_batch: &Batch,
     output: &mut Batch,
     cm: &ColMove,
-    mut blob_cache: Option<&mut crate::schema::BlobCache>,
+    mut blob_cache: Option<&mut crate::storage::BlobCache>,
     src_start: usize,
     dst_base: usize,
     n: usize,
@@ -124,7 +124,7 @@ fn copy_column(
                 let (dst_col, dst_blob) = output.col_and_blob_mut(cm.dst_payload);
                 for i in 0..n {
                     let src_off = (src_start + i) * 16;
-                    let cell = crate::schema::relocate_german_string_vec(
+                    let cell = crate::storage::relocate_german_string_vec(
                         &src_col[src_off..src_off + 16],
                         &in_batch.blob,
                         dst_blob,
@@ -521,7 +521,7 @@ impl MapPlan {
         src_start: usize,
         dst_base: usize,
         n: usize,
-        mut blob_cache: Option<&mut crate::schema::BlobCache>,
+        mut blob_cache: Option<&mut crate::storage::BlobCache>,
         pk: PkFill,
     ) {
         if n == 0 {
