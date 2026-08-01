@@ -4,6 +4,7 @@
 
 use super::index_router::index_route_key;
 use super::*;
+use crate::runtime::sal::MAX_WORKERS;
 
 /// The verdict of `MasterDispatcher::txn_fit`.
 pub(crate) enum TxnFit {
@@ -1161,9 +1162,12 @@ impl MasterDispatcher {
         // or client disconnect: `_lease` drops on return and `route_scan_slot`
         // discards every undrained frame at the ring boundary, advancing
         // `consume_cursor`, so a still-streaming worker cannot wedge in
-        // `send_encoded` — draining the doomed trains would be pure waste. On a
-        // fault the client sees its data frames followed by a STATUS_ERROR frame,
-        // which `recv_scan_response` handles mid-stream.
+        // `send_encoded` — draining the doomed trains would be pure waste. The
+        // client may already have received earlier workers' data frames when the
+        // fault surfaces, so the STATUS_ERROR frame `send_error` emits can arrive
+        // mid-stream: `Connection::drain_reply_train` (gnitz-core), the one reply
+        // reassembler, returns on the first STATUS_ERROR and discards the batch
+        // it had accumulated, so no partial rows surface.
         forward_scan_slots(reactor, peer, slots, &req_ids, unicast).await
     }
 
@@ -1576,66 +1580,137 @@ pub(crate) async fn await_scan_slots(
     }
 }
 
+/// Ceiling on the coalesced head buffer, bounding the copy a scan pays to save
+/// its per-frame `OP_SEND`/`OP_TIMEOUT`/`OP_ASYNC_CANCEL` triples.
+///
+/// `fanout_coalesced_egress_bench` (reactor tests) sweeps the tradeoff: the win
+/// grows with worker count and shrinks with total size, reaching break-even
+/// around 128 KiB at two workers but still large there at eight. 32 KiB sits
+/// well inside the winning region at every worker count, so raise it from that
+/// bench rather than from first principles.
+const COALESCE_MAX_BYTES: usize = 32 * 1024;
+
+/// One awaited scan-train head, classified.
+#[derive(Clone, Copy, Default)]
+pub(super) struct TrainHead {
+    /// The frame carries rows or a schema block. A frame with neither holds
+    /// nothing the client can observe and nothing a later frame could decode
+    /// against, so it is dropped rather than forwarded — on a selective
+    /// broadcast read that is W−1 of the W trains.
+    pub(super) observable: bool,
+    /// The worker's train continues past this frame.
+    has_more: bool,
+}
+
+/// Parse and classify one scan-train frame. The single definition of which
+/// frames reach the client, shared by the fan-out's coalescing decision and by
+/// the per-worker drain.
+pub(super) fn classify_head(slot: &W2mSlot, worker: usize) -> Result<TrainHead, String> {
+    let (ctrl, has_more) = parse_train_header(slot, worker, "scan")?;
+    Ok(TrainHead {
+        observable: ctrl.flags & (FLAG_HAS_DATA | FLAG_HAS_SCHEMA) != 0,
+        has_more,
+    })
+}
+
 /// Forward each already-awaited worker scan train to the client in ascending
-/// worker order via `drain_scan_train`. Under unicast the single slot belongs to
-/// worker `unicast`, not slot 0. `Ok(false)` on client disconnect, `Err` on a
-/// worker fault / malformed train. Shared by `fan_out_scan` and
+/// worker order. Under unicast the single slot belongs to worker `unicast`, not
+/// slot 0. `Ok(false)` on client disconnect, `Err` on a worker fault /
+/// malformed train. Shared by `fan_out_scan` and
 /// `await_and_drain_scan_relation`.
-async fn forward_scan_slots(
+///
+/// When every train is a single frame and the heads together stay under
+/// [`COALESCE_MAX_BYTES`], they are concatenated into one pooled buffer and
+/// leave in one egress operation instead of W. Each frame carries its own
+/// `[len | payload]` prefix inside the ring mapping, so the concatenation is a
+/// valid wire stream with nothing synthesized between frames. Anything else
+/// falls back to [`drain_scan_train`] per worker.
+pub(super) async fn forward_scan_slots(
     reactor: &crate::runtime::reactor::Reactor,
     peer: &Peer,
     slots: Vec<W2mSlot>,
     req_ids: &[u64],
     unicast: i32,
 ) -> Result<bool, String> {
-    for (i, slot) in slots.into_iter().enumerate() {
-        let w = if unicast >= 0 { unicast as usize } else { i };
-        if !drain_scan_train(reactor, peer, slot, req_ids[i] as u32, w).await? {
-            return Ok(false);
+    let worker_of = |i: usize| if unicast >= 0 { unicast as usize } else { i };
+    // Classify every head before sending anything: whether they can leave as one
+    // buffer is not known until every train has been seen. Both arms then run
+    // off these, so no head is parsed twice. `slots.len()` is the worker count,
+    // which `await_scan_slots` caps at MAX_WORKERS.
+    let mut heads = [TrainHead::default(); MAX_WORKERS];
+    let mut observable = 0usize;
+    let mut total = 0usize;
+    let mut any_tail = false;
+    for (i, slot) in slots.iter().enumerate() {
+        heads[i] = classify_head(slot, worker_of(i))?;
+        any_tail |= heads[i].has_more;
+        if heads[i].observable {
+            observable += 1;
+            total += slot.frame_bytes().len();
         }
     }
-    Ok(true)
+    if any_tail || observable < 2 || total > COALESCE_MAX_BYTES {
+        // Coalescing a multi-frame train would land its continuations behind the
+        // next worker's head, reordering the client's rows. Below two frames
+        // there is no kernel op to save.
+        for (i, slot) in slots.into_iter().enumerate() {
+            if !drain_scan_train(reactor, peer, slot, heads[i], req_ids[i] as u32, worker_of(i)).await? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    // Every train is one frame, so the heads in worker order ARE the whole
+    // reply, in exactly the order the per-worker drain would have produced.
+    let mut buf = crate::storage::batch_pool::acquire_buf();
+    buf.reserve(total);
+    for (i, slot) in slots.iter().enumerate() {
+        if heads[i].observable {
+            buf.extend_from_slice(slot.frame_bytes());
+        }
+    }
+    // The copy is synchronous, so every ring slot is released before the SQE
+    // exists — a client that stalls this send cannot pin a slot and fill the
+    // worker's W2M ring.
+    drop(slots);
+    Ok(peer.send_buffer(crate::storage::batch_pool::PooledSendBuf(buf)).await >= 0)
 }
 
 /// Forward one worker's SCAN continuation train to the client: send each frame
 /// to `peer` (dropping it before awaiting the next, per the W2M ring contract)
-/// and loop until the train header reports no more frames. A frame carrying
-/// neither rows nor a schema block is dropped instead of forwarded — on a
-/// selective broadcast read that is W−1 of the W trains. `slot` is the first,
-/// already-awaited frame. Returns `Ok(false)` if the client disconnects
-/// mid-stream and `Err` on a malformed train header. Called by
-/// `forward_scan_slots`, once per drained train (one per worker, or a single
-/// one under unicast).
+/// and loop until the train header reports no more frames. `slot` is the first,
+/// already-awaited frame and `head` its classification. Returns `Ok(false)` if
+/// the client disconnects mid-stream and `Err` on a malformed train header.
+///
+/// An unobservable frame is dropped here rather than at the next reassignment:
+/// that releases the slot at the ring now, so a worker parked on a full ring is
+/// not held across the await below. A fault frame never gets here —
+/// `parse_train_header` returns `Err` on a non-zero status — and the train's
+/// terminal frame is master-authored, so the client still sees the train end.
+///
+/// The send is deadline-guarded inside `send_slot`: a client that stops draining
+/// this zero-copy slot is evicted, rc goes negative, and the caller drops the
+/// `ScanLease`, discarding the rest of the train and advancing consume_cursor so
+/// the worker unblocks.
 pub(super) async fn drain_scan_train(
     reactor: &crate::runtime::reactor::Reactor,
     peer: &Peer,
     mut slot: W2mSlot,
+    mut head: TrainHead,
     req_id: u32,
     worker: usize,
 ) -> Result<bool, String> {
     loop {
-        let (ctrl, has_more) = parse_train_header(&slot, worker, "scan")?;
-        // A frame with neither rows nor a schema block holds nothing the client
-        // can observe, and nothing a later frame could decode against. Drop it
-        // here rather than at the next reassignment: that releases the slot at
-        // the ring now, so a worker parked on a full ring is not held across the
-        // await below. A fault frame never gets here — `parse_train_header`
-        // returns `Err` on a non-zero status — and the train's terminal frame is
-        // master-authored, so the client still sees the train end.
-        //
-        // The send is deadline-guarded inside `send_slot`: a client that stops
-        // draining this zero-copy slot is evicted, rc goes negative, and the
-        // caller drops the `ScanLease`, discarding the rest of the train and
-        // advancing consume_cursor so the worker unblocks.
-        if ctrl.flags & (FLAG_HAS_DATA | FLAG_HAS_SCHEMA) == 0 {
+        if !head.observable {
             drop(slot);
         } else if peer.send_slot(slot).await < 0 {
             return Ok(false);
         }
-        if !has_more {
+        if !head.has_more {
             break;
         }
         slot = reactor.await_scan_slot(req_id).await;
+        head = classify_head(&slot, worker)?;
     }
     Ok(true)
 }

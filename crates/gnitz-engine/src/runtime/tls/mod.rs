@@ -35,11 +35,10 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
-use std::time::Instant;
 
 use crate::foundation::posix_io;
 use crate::runtime::reactor::io::{self, RecvBuf};
-use crate::runtime::reactor::{client_send_timeout, mpsc, select2, AsyncMutex, Either, Reactor};
+use crate::runtime::reactor::{guard_client_egress, mpsc, AsyncMutex, Reactor};
 use crate::runtime::w2m::W2mSlot;
 use crate::storage::batch_pool::PooledSendBuf;
 
@@ -283,34 +282,16 @@ impl TlsShared {
         bytes.len() as i32
     }
 
-    /// Wrap a send future in the per-frame eviction deadline. The deadline
-    /// wraps EVERY client-bound send, not just `send_slot` — load-bearing,
-    /// not fd-parity boilerplate: because `send_bytes` holds `send_mutex`
-    /// across its sends, a send parked forever on a non-reading client
-    /// would hold the mutex forever, wedging the flusher and every other
-    /// sender. The timer wraps the whole future including any
-    /// `lock().await`, so it fires even while merely blocked on a mutex a
-    /// stalled peer is holding — `posix_io::shutdown(fd)` then aborts
-    /// whichever `send_raw` holds the mutex, the holder drops its guard,
-    /// and this send proceeds (to also fail on the shut socket). The
-    /// per-frame window is ample: every TLS server→client frame is bounded
-    /// (control/OK/ACK replies, or one bounded W2M slot-frame — scans
-    /// stream as bounded continuations).
+    /// [`guard_client_egress`] for this connection. The deadline matters more
+    /// here than on the fd path: `send_bytes` holds `send_mutex` across its
+    /// sends, so a send parked forever on a non-reading client would hold the
+    /// mutex forever, wedging the flusher and every other sender. The timer
+    /// wraps the whole future including the `lock().await`, so it fires even
+    /// while merely blocked on a mutex a stalled peer is holding — the
+    /// `shutdown` aborts whichever `send_raw` holds the mutex, the holder drops
+    /// its guard, and this send proceeds (to also fail on the shut socket).
     async fn guard_eviction<F: Future<Output = i32>>(&self, what: &str, fut: F) -> i32 {
-        let mut fut = std::pin::pin!(fut);
-        let deadline = Instant::now() + client_send_timeout();
-        match select2(fut.as_mut(), self.reactor.timer(deadline)).await {
-            Either::A(rc) => rc,
-            Either::B(()) => {
-                crate::gnitz_warn!(
-                    "tls: client fd={} stalled {what} past {:?}; evicting",
-                    self.fd,
-                    client_send_timeout(),
-                );
-                posix_io::shutdown(self.fd); // abort the parked send_raw / unblock the mutex
-                fut.await.min(-1)
-            }
-        }
+        guard_client_egress(&self.reactor, self.fd, what, fut).await
     }
 
     pub(crate) async fn send_guarded(&self, bytes: &[u8]) -> i32 {

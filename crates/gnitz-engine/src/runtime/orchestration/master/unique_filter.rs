@@ -379,7 +379,7 @@ impl MasterDispatcher {
 
 #[cfg(test)]
 mod unique_filter_tests {
-    use super::super::dispatch::drain_scan_train;
+    use super::super::dispatch::{classify_head, drain_scan_train, forward_scan_slots};
     use super::*;
     use crate::schema::{type_code, SchemaColumn};
 
@@ -1065,7 +1065,9 @@ mod unique_filter_tests {
         let before = unsafe { fx.receiver.header(0) }
             .consume_cursor()
             .load(Ordering::Acquire);
-        let drained = poll_once(drain_scan_train(&fx.reactor, &fx.peer, slot, w0_req, 0)).expect("healthy train");
+        let head = classify_head(&slot, 0).expect("healthy header");
+        assert!(!head.observable, "a frame with neither rows nor a schema block");
+        let drained = poll_once(drain_scan_train(&fx.reactor, &fx.peer, slot, head, w0_req, 0)).expect("healthy train");
         assert!(drained, "the train drained without a client disconnect");
         assert!(
             unsafe { fx.receiver.header(0) }
@@ -1074,6 +1076,58 @@ mod unique_filter_tests {
                 > before,
             "the dropped slot was released at the ring"
         );
+
+        fx.teardown(lease);
+    }
+
+    /// When every train is one frame, `forward_scan_slots` concatenates the
+    /// observable heads into one pooled buffer and issues a single send.
+    ///
+    /// The discriminator is that the copy is synchronous, so EVERY ring slot is
+    /// released before the send is even submitted: the per-worker fallback would
+    /// instead hand worker 0's slot to `send_slot`, which pins it (and every
+    /// later worker's) until a CQE that never comes here. So all three cursors
+    /// advancing on a poll that has not yet completed is only possible on the
+    /// coalesced arm. Worker 1 contributes nothing observable and must be
+    /// dropped rather than concatenated, exactly as the per-worker drain does.
+    #[test]
+    fn forward_scan_slots_coalesces_single_frame_heads() {
+        use crate::runtime::wire::STATUS_OK;
+        use std::sync::atomic::Ordering;
+
+        let schema = two_col_schema();
+        let rows_a = make_row_batch(schema, &[(1, 1, 0, 10)]);
+        let rows_c = make_row_batch(schema, &[(2, 1, 0, 20)]);
+
+        let (fx, writers) = DrainFixture::new(3);
+        let reqs: Vec<u32> = (0..3).map(|w| fx.req_ids[w] as u32).collect();
+        write_test_frame(&writers[0], reqs[0], 0, STATUS_OK, b"", Some(&schema), Some(&rows_a));
+        write_test_frame(&writers[1], reqs[1], 0, STATUS_OK, b"", None, None);
+        write_test_frame(&writers[2], reqs[2], 0, STATUS_OK, b"", Some(&schema), Some(&rows_c));
+
+        let lease = fx.reactor.scan_lease(&reqs);
+        let slots = fx.initial_slots();
+        let before: Vec<u64> = (0..3)
+            .map(|w| {
+                unsafe { fx.receiver.header(w) }
+                    .consume_cursor()
+                    .load(Ordering::Acquire)
+            })
+            .collect();
+
+        // The fixture's peer has no reader, so the send parks and the forward
+        // cannot finish in one poll — the cursors are what carry the verdict.
+        let done = try_poll_once(forward_scan_slots(&fx.reactor, &fx.peer, slots, &fx.req_ids, -1));
+        assert!(done.is_none(), "the coalesced send parks on a peer nobody reads");
+        for (w, &was) in before.iter().enumerate() {
+            assert!(
+                unsafe { fx.receiver.header(w) }
+                    .consume_cursor()
+                    .load(Ordering::Acquire)
+                    > was,
+                "worker {w}'s slot must be released before the send is submitted",
+            );
+        }
 
         fx.teardown(lease);
     }

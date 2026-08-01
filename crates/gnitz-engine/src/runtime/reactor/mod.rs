@@ -61,7 +61,9 @@ mod runloop;
 pub mod sync;
 mod uring;
 
-pub(crate) use conn::client_send_timeout;
+#[cfg(test)]
+use conn::client_send_timeout;
+pub(crate) use conn::guard_client_egress;
 
 #[cfg(test)]
 use futures::SendFuture;
@@ -2356,67 +2358,78 @@ mod tests {
         }
     }
 
-    /// Concrete test of the partial-send contract: io_uring's OP_SEND on
-    /// a stream socket can return `rc < len`.  Uses a real AF_UNIX
-    /// socketpair with a deliberately-small send buffer so the kernel
-    /// returns partial counts, forcing `send_buffer`'s loop to resubmit
-    /// the remaining slice until the full buffer drains.
+    /// The egress deadline is process-wide, so both socketpair send tests seed
+    /// it through here with one value: short enough that the eviction test
+    /// waits it out in a couple of seconds, and far above what the partial-send
+    /// test needs to push 200 KB through a draining reader.
+    fn short_client_send_timeout() -> Duration {
+        conn::force_client_send_timeout(Duration::from_secs(2));
+        client_send_timeout()
+    }
+
+    /// A socketpair set up for an egress test: the reactor, the sender fd, and
+    /// the receiver end. The sender is registered in `conns` so `send_inflight`
+    /// accounting has something to touch, as in real flow. `sndbuf` shrinks both
+    /// socket buffers, so a payload larger than it is guaranteed to split across
+    /// several OP_SEND CQEs. The caller closes both fds.
+    unsafe fn egress_pair(sndbuf: Option<i32>) -> (Rc<Reactor>, i32, i32) {
+        let mut fds = [0i32; 2];
+        assert_eq!(
+            libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()),
+            0,
+            "socketpair"
+        );
+        let (sender, receiver) = (fds[0], fds[1]);
+        if let Some(bytes) = sndbuf {
+            for (fd, opt) in [(sender, libc::SO_SNDBUF), (receiver, libc::SO_RCVBUF)] {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    opt,
+                    &bytes as *const _ as *const libc::c_void,
+                    std::mem::size_of::<i32>() as u32,
+                );
+            }
+        }
+        let r: Rc<Reactor> = Rc::new(make_reactor());
+        r.inner.conns.borrow_mut().insert(sender, Box::new(io::Conn::new()));
+        (r, sender, receiver)
+    }
+
+    /// Read `expect` bytes off `fd` and close it, so the send under test never
+    /// stalls on a full socket buffer. Returns what it actually saw.
+    fn spawn_drain(fd: i32, expect: usize) -> std::thread::JoinHandle<usize> {
+        std::thread::spawn(move || unsafe {
+            let mut seen = 0usize;
+            let mut scratch = vec![0u8; 64 * 1024];
+            while seen < expect {
+                let n = libc::read(fd, scratch.as_mut_ptr() as *mut libc::c_void, scratch.len());
+                if n <= 0 {
+                    break;
+                }
+                seen += n as usize;
+            }
+            libc::close(fd);
+            seen
+        })
+    }
+
+    /// Concrete test of the partial-send contract: io_uring's OP_SEND on a
+    /// stream socket can return `rc < len`. A 200 KB payload over ~8 KB socket
+    /// buffers forces `send_buffer`'s loop to resubmit the remaining slice until
+    /// the full buffer drains.
     #[test]
     fn send_buffer_loops_until_full_payload_sent_over_socketpair() {
+        short_client_send_timeout();
         unsafe {
-            let mut fds = [0i32; 2];
-            let rc = libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr());
-            assert_eq!(rc, 0, "socketpair");
-            let (sender, receiver) = (fds[0], fds[1]);
-            // Shrink both buffers to ~8 KB so a 200 KB payload is
-            // guaranteed to split across multiple OP_SEND CQEs.
-            let bufsz: i32 = 8 * 1024;
-            libc::setsockopt(
-                sender,
-                libc::SOL_SOCKET,
-                libc::SO_SNDBUF,
-                &bufsz as *const _ as *const libc::c_void,
-                std::mem::size_of::<i32>() as u32,
-            );
-            libc::setsockopt(
-                receiver,
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                &bufsz as *const _ as *const libc::c_void,
-                std::mem::size_of::<i32>() as u32,
-            );
-
-            let r: Rc<Reactor> = Rc::new(make_reactor());
-            // Register the sender in conns so send_inflight accounting
-            // has something to touch (matches real-world flow).
-            r.inner.conns.borrow_mut().insert(sender, Box::new(io::Conn::new()));
-
-            // 200 KB > both SNDBUF and RCVBUF → guaranteed partial sends.
+            let (r, sender, receiver) = egress_pair(Some(8 * 1024));
             let payload = vec![0x5Au8; 200 * 1024];
             let payload_len = payload.len();
-            let sender_fd = sender;
-
-            // Drain the receiver in a background thread so the kernel
-            // socket-buffer drains and subsequent OP_SEND can make
-            // progress.  Without the drain, send_buffer blocks
-            // indefinitely at ~8 KB.
-            let drain_t = std::thread::spawn(move || {
-                let mut total = 0usize;
-                let mut scratch = vec![0u8; 32 * 1024];
-                while total < payload_len {
-                    let n = libc::read(receiver, scratch.as_mut_ptr() as *mut libc::c_void, scratch.len());
-                    if n <= 0 {
-                        break;
-                    }
-                    total += n as usize;
-                }
-                libc::close(receiver);
-                total
-            });
+            let drain_t = spawn_drain(receiver, payload_len);
 
             let r2 = Rc::clone(&r);
             let sent = r.block_on(async move {
-                r2.send_buffer(sender_fd, crate::storage::batch_pool::PooledSendBuf(payload))
+                r2.send_buffer(sender, crate::storage::batch_pool::PooledSendBuf(payload))
                     .await
             });
             let received = drain_t.join().expect("drain thread");
@@ -2433,6 +2446,135 @@ mod tests {
                  would leave the client blocked waiting for bytes that never \
                  arrive"
             );
+        }
+    }
+
+    /// `send_buffer` carries the client-egress deadline: a peer that never reads
+    /// must be evicted, not park the connection task forever on a
+    /// master-authored frame. No reader thread here, so once both socket buffers
+    /// fill the send makes zero progress and only the timer can end it — by
+    /// shutting the fd down and surfacing a negative rc.
+    #[test]
+    fn send_buffer_evicts_a_client_that_never_drains() {
+        let timeout = short_client_send_timeout();
+        unsafe {
+            let (r, sender, receiver) = egress_pair(Some(4 * 1024));
+
+            // Far larger than both buffers, and nothing ever reads the other
+            // end — the send stalls partway and only the deadline can end it.
+            let payload = vec![0x7Au8; 1024 * 1024];
+            let r2 = Rc::clone(&r);
+            let start = Instant::now();
+            let rc = r.block_on(async move {
+                r2.send_buffer(sender, crate::storage::batch_pool::PooledSendBuf(payload))
+                    .await
+            });
+            let elapsed = start.elapsed();
+
+            assert!(rc < 0, "a client that never drains must be evicted, got rc={rc}");
+            assert!(
+                elapsed >= timeout,
+                "eviction must wait out the full deadline ({timeout:?}), took {elapsed:?}"
+            );
+            // The eviction path shuts the socket down, so nothing more can be
+            // written to it — that is what releases the send's held resources.
+            let probe = libc::send(sender, [0u8; 1].as_ptr() as *const libc::c_void, 1, libc::MSG_NOSIGNAL);
+            assert_eq!(probe, -1, "evicted fd must be shut down for send");
+
+            libc::close(sender);
+            libc::close(receiver);
+        }
+    }
+
+    /// Where coalescing stops paying, which is what `COALESCE_MAX_BYTES` is set
+    /// from: W head frames leaving as W guarded sends versus one guarded send of
+    /// their concatenation. Each send costs an `OP_SEND` + `OP_TIMEOUT` +
+    /// `OP_ASYNC_CANCEL` triple across two `io_uring_enter` calls, so the win is
+    /// a fixed cost per elided frame and the loss is the concatenation copy —
+    /// the grid brackets the crossover on both axes.
+    ///
+    /// Only the RATIO is meaningful: absolute per-batch times swing up to 2.5x
+    /// with machine load. Both arms send through `send_buffer`, so this isolates
+    /// the per-frame kernel cost; the real per-worker drain uses `send_slot`,
+    /// which additionally pins a ring slot. Arm order alternates per sample
+    /// because the second send of a pair is systematically the cheaper one.
+    ///
+    /// `cd crates && cargo test -p gnitz-engine --release fanout_coalesced_egress_bench -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore]
+    fn fanout_coalesced_egress_bench() {
+        use crate::storage::batch_pool::{acquire_buf, PooledSendBuf};
+        use std::hint::black_box;
+
+        const ITERS: usize = 3000;
+
+        for w in [2usize, 4, 8] {
+            for total in [4 * 1024usize, 32 * 1024, 64 * 1024, 128 * 1024] {
+                let per_frame = total / w;
+                unsafe {
+                    let (r, sender, receiver) = egress_pair(None);
+                    // Both arms push `total` bytes per sample; the reader keeps
+                    // the socket buffers from ever stalling a send, so the timed
+                    // region is kernel-op cost, not backpressure.
+                    let expect = 2 * ITERS * total;
+                    let drain_t = spawn_drain(receiver, expect);
+
+                    let frame = vec![0xA5u8; per_frame];
+                    let r2 = Rc::clone(&r);
+                    let (per_frame_dur, coalesced_dur) = r.block_on(async move {
+                        let (mut a, mut b) = (Duration::ZERO, Duration::ZERO);
+                        for i in 0..ITERS {
+                            // Source buffers are filled outside the timed region
+                            // on both arms except the concatenation itself,
+                            // which is the copy under test.
+                            let mut bufs = Vec::with_capacity(w);
+                            for _ in 0..w {
+                                let mut buf = acquire_buf();
+                                buf.extend_from_slice(&frame);
+                                bufs.push(PooledSendBuf(buf));
+                            }
+                            let run_per_frame = async |bufs: Vec<PooledSendBuf>| {
+                                let t = Instant::now();
+                                for buf in bufs {
+                                    black_box(r2.send_buffer(sender, buf).await);
+                                }
+                                t.elapsed()
+                            };
+                            let run_coalesced = async || {
+                                let t = Instant::now();
+                                let mut buf = acquire_buf();
+                                buf.reserve(total);
+                                for _ in 0..w {
+                                    buf.extend_from_slice(&frame);
+                                }
+                                black_box(r2.send_buffer(sender, PooledSendBuf(buf)).await);
+                                t.elapsed()
+                            };
+                            if i % 2 == 0 {
+                                a += run_per_frame(bufs).await;
+                                b += run_coalesced().await;
+                            } else {
+                                b += run_coalesced().await;
+                                a += run_per_frame(bufs).await;
+                            }
+                        }
+                        (a, b)
+                    });
+
+                    let seen = drain_t.join().expect("drain thread");
+                    assert_eq!(seen, expect, "reader must observe every byte both arms sent");
+                    libc::close(sender);
+
+                    let delta = coalesced_dur.as_secs_f64() / per_frame_dur.as_secs_f64() - 1.0;
+                    println!(
+                        "coalesced egress W={w} total={total}B: coalesced vs per-frame {:+.1}% \
+                         (per-frame {:?}/batch, coalesced {:?}/batch)",
+                        delta * 100.0,
+                        per_frame_dur / ITERS as u32,
+                        coalesced_dur / ITERS as u32,
+                    );
+                }
+            }
         }
     }
 

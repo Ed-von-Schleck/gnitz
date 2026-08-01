@@ -4,21 +4,69 @@
 use super::futures::{AcceptFuture, RawRecvFuture, RecvFuture, SendAlive, SendFuture};
 use super::*;
 
+/// Cached [`client_send_timeout`] in milliseconds; `0` = not yet read.
+static CLIENT_SEND_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Per-frame wall-clock deadline for client egress, read once from
-/// `GNITZ_CLIENT_SEND_TIMEOUT_MS` (default 30 s). Applied to zero-copy
-/// ring-slot sends on the fd path and to EVERY client-bound TLS send (the
-/// TLS `send_mutex` is held across sends, so an unbounded send would wedge
-/// the whole connection). The deadline is per-frame, so a client making
-/// steady progress across a large train is never penalised — only one that
-/// makes zero progress for the full window (a stalled or maliciously
-/// zero-window peer) is evicted. Generous by default so ordinary transient
-/// congestion never sheds a healthy client; e2e tests shrink it to bound
-/// the freeze window they assert on.
+/// `GNITZ_CLIENT_SEND_TIMEOUT_MS` (default 30 s). The deadline is per-frame, so
+/// a client making steady progress across a large train is never penalised —
+/// only one that makes zero progress for the full window (a stalled or
+/// maliciously zero-window peer) is evicted. Generous by default so ordinary
+/// transient congestion never sheds a healthy client; e2e tests shrink it to
+/// bound the freeze window they assert on.
 pub(crate) fn client_send_timeout() -> std::time::Duration {
-    static TIMEOUT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
-    *TIMEOUT.get_or_init(|| {
-        std::time::Duration::from_millis(crate::foundation::env::env_u64("GNITZ_CLIENT_SEND_TIMEOUT_MS", 30_000))
-    })
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut ms = CLIENT_SEND_TIMEOUT_MS.load(Relaxed);
+    if ms == 0 {
+        ms = crate::foundation::env::env_u64("GNITZ_CLIENT_SEND_TIMEOUT_MS", 30_000);
+        CLIENT_SEND_TIMEOUT_MS.store(ms, Relaxed);
+    }
+    std::time::Duration::from_millis(ms)
+}
+
+/// Shorten the deadline for a test that has to wait one out. Overrides whatever
+/// an earlier send already cached, so it does not depend on test order; every
+/// caller sets the same value, so concurrent tests agree.
+#[cfg(test)]
+pub(crate) fn force_client_send_timeout(d: std::time::Duration) {
+    CLIENT_SEND_TIMEOUT_MS.store(d.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Run one client-bound send under [`client_send_timeout`]. Every egress path
+/// on both transports goes through here, so none can reintroduce an unbounded
+/// park by picking a different primitive.
+///
+/// On expiry the client is treated as dead: `shutdown(SHUT_RDWR)` forces the
+/// in-flight `OP_SEND` to error out promptly, then the SAME future is awaited
+/// to completion, so whatever its SQE still references — a pinned `W2mSlot`, a
+/// pooled buffer, the TLS `send_mutex` — outlives its CQE. Returns the send rc:
+/// `>= 0` sent, `< 0` the client disconnected or was evicted (clamped negative
+/// in case the completion raced the deadline).
+///
+/// `select2` gets `fut.as_mut()` (a `Pin<&mut>` — itself a `Future`), so the
+/// timer winning drops only that borrow, never the send future: it stays owned
+/// here for the mandatory post-`shutdown` await.
+pub(crate) async fn guard_client_egress<F: Future<Output = i32>>(
+    reactor: &Reactor,
+    fd: i32,
+    what: &str,
+    fut: F,
+) -> i32 {
+    let mut fut = std::pin::pin!(fut);
+    let deadline = Instant::now() + client_send_timeout();
+    match select2(fut.as_mut(), reactor.timer(deadline)).await {
+        Either::A(rc) => rc,
+        Either::B(()) => {
+            crate::gnitz_warn!(
+                "client fd={} stalled {} past {:?}; evicting",
+                fd,
+                what,
+                client_send_timeout(),
+            );
+            crate::foundation::posix_io::shutdown(fd);
+            fut.await.min(-1)
+        }
+    }
 }
 
 impl Reactor {
@@ -174,13 +222,25 @@ impl Reactor {
         }
     }
 
-    /// Returns total bytes sent (>= 0) or negative errno. The loop is
-    /// load-bearing: OP_SEND on a stream socket may return rc < len
-    /// when the kernel's socket buffer fills up.
+    /// Send a whole owned buffer, returning total bytes sent (>= 0) or negative
+    /// errno. The send loop handles `rc < len`: OP_SEND on a stream socket
+    /// returns short when the kernel's socket buffer fills up.
+    ///
+    /// Carries the egress deadline like [`Self::send_slot`]. The master-authored
+    /// frames on this path pin no W2M ring slot, but a scan's terminal frame is
+    /// sent while `handle_scan` still holds the catalog read guard, so a stalled
+    /// client would block every DDL — and every reader queued behind a waiting
+    /// writer — for as long as it stalls.
     pub async fn send_buffer(&self, fd: i32, buf: crate::storage::batch_pool::PooledSendBuf) -> i32 {
         let len = buf.0.len();
         let ptr = buf.0.as_ptr();
-        self.send_buf_inner(fd, ptr, len, SendAlive::Pooled(Rc::new(buf))).await
+        guard_client_egress(
+            self,
+            fd,
+            "egress",
+            self.send_buf_inner(fd, ptr, len, SendAlive::Pooled(Rc::new(buf))),
+        )
+        .await
     }
 
     /// Send the frame bytes of a W2M ring slot directly, without copying,
@@ -193,39 +253,18 @@ impl Reactor {
     /// pins the slot; with enough stalled frames the worker's W2M ring fills
     /// and the single-threaded worker blocks synchronously in `send_encoded`'s
     /// futex, starving every other client's SAL progress — a cluster-wide
-    /// freeze. All ring-slot egress (scan trains, seek replies) shares this
-    /// one guarded primitive, so no forwarding path can reintroduce the
-    /// freeze by picking an unguarded variant.
-    ///
-    /// If the send makes no progress within `client_send_timeout()`, the
-    /// client is treated as dead: `shutdown(SHUT_RDWR)` forces the in-flight
-    /// `OP_SEND` to error out promptly, then the SAME send future is awaited
-    /// to completion so the held `W2mSlot` is released (advancing
-    /// consume_cursor) only AFTER its CQE — never dropped while an SQE still
-    /// references its buffer. Returns the send rc: `>= 0` sent, `< 0` the
-    /// client disconnected or was evicted (the post-`shutdown` rc, clamped
-    /// negative in case the completion raced the deadline).
-    ///
-    /// Passing `send_fut.as_mut()` (a `Pin<&mut>` — itself a `Future`) to
-    /// `select2` means the timer winning drops only that borrow, never the send
-    /// future, so it stays owned here for the mandatory post-`shutdown` await.
+    /// freeze. On expiry [`guard_client_egress`] releases the slot only AFTER
+    /// the send's CQE, never while an SQE still references its buffer.
     pub async fn send_slot(&self, fd: i32, slot: W2mSlot) -> i32 {
         let frame = slot.frame_bytes();
         let (ptr, len) = (frame.as_ptr(), frame.len());
-        let mut send_fut = std::pin::pin!(self.send_buf_inner(fd, ptr, len, SendAlive::Slot(Rc::new(slot))));
-        let deadline = Instant::now() + client_send_timeout();
-        match select2(send_fut.as_mut(), self.timer(deadline)).await {
-            Either::A(rc) => rc,
-            Either::B(()) => {
-                crate::gnitz_warn!(
-                    "reactor: client fd={} stalled ring-slot egress past {:?}; evicting to free the W2M ring",
-                    fd,
-                    client_send_timeout(),
-                );
-                crate::foundation::posix_io::shutdown(fd);
-                send_fut.await.min(-1)
-            }
-        }
+        guard_client_egress(
+            self,
+            fd,
+            "ring-slot egress",
+            self.send_buf_inner(fd, ptr, len, SendAlive::Slot(Rc::new(slot))),
+        )
+        .await
     }
 
     /// Common send loop. `alive` keeps the backing memory valid until the CQE fires.

@@ -53,6 +53,11 @@ impl Peer {
         }
     }
 
+    /// Send an owned buffer to the client. Like every `Peer` egress method it
+    /// runs under the per-frame deadline both transports share
+    /// (`reactor::guard_client_egress`), so a stalled client is shut down rather
+    /// than parking this task. Returns the send rc (`< 0` — disconnect or
+    /// eviction — means the client is gone).
     pub async fn send_buffer(&self, buf: PooledSendBuf) -> i32 {
         match &self.inner {
             PeerInner::Unix { fd, reactor } => reactor.send_buffer(*fd, buf).await,
@@ -60,11 +65,9 @@ impl Peer {
         }
     }
 
-    /// Forward a worker W2M ring slot to the client under the per-frame
-    /// egress deadline: a client that stalls the send is shut down so the
-    /// held ring slot frees (see [`Reactor::send_slot`]; the TLS side's
-    /// deadline lives in `TlsShared::send_guarded`). Returns the send rc
-    /// (`< 0` — disconnect or eviction — means the client is gone).
+    /// Forward a worker W2M ring slot to the client. Same deadline as
+    /// [`Self::send_buffer`], and here it also frees the held ring slot — see
+    /// [`Reactor::send_slot`] for why that matters.
     pub async fn send_slot(&self, slot: W2mSlot) -> i32 {
         match &self.inner {
             PeerInner::Unix { fd, reactor } => reactor.send_slot(*fd, slot).await,
