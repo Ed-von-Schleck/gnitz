@@ -155,8 +155,8 @@ impl FlushWork {
 /// run was pure overhead there. A run that is never probed before the next fold
 /// pays nothing; a hot-probed run builds once and amortizes over every probe until
 /// the fold replaces it. A worker owns its partition single-threaded, so
-/// `OnceCell` needs no synchronization. Correctness never needs an XOR8 or a
-/// PK-unique certificate here.
+/// `OnceCell` needs no synchronization. The bloom only skips work — correctness
+/// never depends on it.
 struct InMemRun {
     batch: Rc<Batch>,
     bloom: OnceCell<BloomFilter>,
@@ -367,13 +367,6 @@ impl Table {
     /// but the path itself carries no state worth caching.
     fn manifest_full_path(&self) -> String {
         super::manifest::path(&self.directory)
-    }
-
-    /// Enable `SHARD_FLAG_PK_UNIQUE` tagging for flushed and compacted shards.
-    /// Only call this for base tables with a user-defined PK constraint enforced
-    /// by the DML layer. Idempotent.
-    pub fn enable_pk_unique_tagging(&mut self) {
-        self.shard_index.enable_pk_unique_tagging();
     }
 
     /// Replace the payload comparator schema in place (ALTER … DROP NOT NULL),
@@ -1941,19 +1934,20 @@ mod tests {
         assert!(t2.has_pk(500), "barrier-flushed row survives reopen");
     }
 
-    /// A `can_tag_pk_unique` base table's barrier shard carries
-    /// `SHARD_FLAG_PK_UNIQUE` and an XOR8 filter; the same holds for a SalReplay
-    /// spill.
+    /// A barrier folds the live memtable and L0 into one shard, and a ceiling
+    /// breach spills to one shard. Both outputs go through the filter-building
+    /// writer, so each carries an XOR8 — and the barrier's covers a PK that was
+    /// only ever live in the memtable, which is what pins that the fold happened
+    /// before the write.
     #[test]
-    fn salreplay_barrier_and_spill_carry_pk_unique_tag() {
+    fn salreplay_barrier_folds_memtable_and_l0_then_spill_writes_one_shard() {
         let schema = make_schema_u64_i64();
 
-        // Barrier shard: live memtable + populated L0, base-table tagging on.
+        // Barrier shard: live memtable + populated L0.
         {
             let dir = tempfile::tempdir().unwrap();
-            let tdir = dir.path().join("barrier_tag");
+            let tdir = dir.path().join("barrier_xor8");
             let mut t = new_table(&tdir, schema, 7300, 128, RecoverySource::SalReplay);
-            t.enable_pk_unique_tagging();
 
             // Overflow 8 rows into L0, then leave 2 rows live in the memtable.
             let over: Vec<(u64, i64, i64)> = (0..8).map(|k| (k, 1, (k * 10) as i64)).collect();
@@ -1966,7 +1960,6 @@ mod tests {
             t.flush().unwrap();
             let shards = t.all_shard_arcs();
             assert_eq!(shards.len(), 1, "barrier folds memtable + L0 into one shard");
-            assert!(shards[0].is_pk_unique, "barrier shard must carry SHARD_FLAG_PK_UNIQUE");
             assert!(shards[0].has_xor8(), "barrier shard must carry the XOR8 filter");
             assert!(
                 shards[0].xor8_may_contain(100),
@@ -1974,12 +1967,11 @@ mod tests {
             );
         }
 
-        // SalReplay spill: durable + tagged.
+        // Ceiling-breach spill.
         {
             let dir = tempfile::tempdir().unwrap();
-            let tdir = dir.path().join("spill_tag");
+            let tdir = dir.path().join("spill_xor8");
             let mut t = new_table(&tdir, schema, 7301, 128, RecoverySource::SalReplay);
-            t.enable_pk_unique_tagging();
             t.set_inmem_ceiling_for_test(100);
 
             let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (k, 1, (k * 10) as i64)).collect();
@@ -1987,10 +1979,6 @@ mod tests {
             assert_eq!(t.in_memory_bytes(), 0, "ceiling breach spilled to disk");
             let shards = t.all_shard_arcs();
             assert_eq!(shards.len(), 1, "one spilled shard");
-            assert!(
-                shards[0].is_pk_unique,
-                "SalReplay spill must carry SHARD_FLAG_PK_UNIQUE"
-            );
             assert!(shards[0].has_xor8(), "SalReplay spill must carry the XOR8 filter");
         }
     }
@@ -2021,7 +2009,6 @@ mod tests {
         let schema = make_schema_u64_i64();
         // Small arena so an 8-row ingest overflows the memtable into in_memory_l0.
         let mut t = new_table(&tdir, schema, 7500, 128, RecoverySource::SalReplay);
-        t.enable_pk_unique_tagging();
 
         let rows: Vec<(u64, i64, i64)> = (0..8).map(|k| (k, 1, (k * 10) as i64)).collect();
         t.ingest_owned_batch(make_batch(&rows)).unwrap();

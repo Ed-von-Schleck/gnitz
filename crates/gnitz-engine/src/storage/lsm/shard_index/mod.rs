@@ -180,10 +180,6 @@ pub struct ShardIndex {
     /// an unpublished spill prunes it here (`run_compact`). Clean files from
     /// prior barriers are already durable and never re-synced.
     unsynced: Vec<String>,
-    /// Propagated from `Table::can_tag_pk_unique`; passed through to
-    /// `compact_shards` / `merge_and_route` so compacted output shards
-    /// are tagged correctly. Defaults to `false` (conservative).
-    can_tag_pk_unique: bool,
 }
 
 impl ShardIndex {
@@ -197,7 +193,6 @@ impl ShardIndex {
             compact_seq: 0,
             pending_deletions: Vec::new(),
             unsynced: Vec::new(),
-            can_tag_pk_unique: false,
         }
     }
 

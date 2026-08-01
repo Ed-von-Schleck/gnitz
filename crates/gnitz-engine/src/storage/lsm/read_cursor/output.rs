@@ -11,7 +11,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use super::super::batch::{write_to_batch, Batch, Layout};
-use super::super::columnar::with_row_cmp;
+use super::super::columnar::with_payload_cmp;
 use super::super::merge::DirectWriter;
 use super::super::scatter::scatter_unified_sources_with_weights;
 use super::source::CursorSource;
@@ -263,14 +263,7 @@ impl ReadCursor {
     /// filters) collect into a local `Vec` instead — this helper only supports
     /// row-count and full-cursor termination.
     fn drain_sorted_into(&mut self, limit: usize, out: &mut Vec<(u32, u32, i64)>) {
-        with_row_cmp!(
-            self.schema,
-            self.is_pk_unique,
-            Self::drain_sorted_into_with,
-            self,
-            limit,
-            out
-        );
+        with_payload_cmp!(self.schema, Self::drain_sorted_into_with, self, limit, out);
     }
 
     #[inline]

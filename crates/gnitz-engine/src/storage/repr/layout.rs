@@ -13,6 +13,7 @@ pub(crate) const OFF_DIR_OFFSET: usize = 24;
 // Bytes [32,40) reserved (zero).
 pub(crate) const OFF_XOR8_OFFSET: usize = 40;
 pub(crate) const OFF_XOR8_SIZE: usize = 48;
+// Bytes [56,64) reserved (zero).
 
 pub(crate) const ENCODING_RAW: u8 = 0x00;
 pub(crate) const ENCODING_CONSTANT: u8 = 0x01;
@@ -23,12 +24,3 @@ pub(crate) const ENCODING_TWO_VALUE: u8 = 0x02;
 /// region's offset range. Legal only on payload column directory entries, only
 /// on compaction outputs.
 pub(crate) const ENCODING_FOR: u8 = 0x03;
-
-/// Byte offset of the one-byte flags field in the shard header.
-/// Bytes [57,64) are reserved (zero).
-pub(crate) const OFF_FLAGS: usize = 56;
-
-/// Shard header flag: at most one positive-weight row per PK key in this shard.
-/// Only set for base-table shards that pass `PkUniqueChecker`; never set for
-/// intermediate views, secondary index tables, or shards containing retractions.
-pub(crate) const SHARD_FLAG_PK_UNIQUE: u8 = 0x01;

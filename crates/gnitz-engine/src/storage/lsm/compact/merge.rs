@@ -17,7 +17,7 @@ use super::super::batch::write_to_batch;
 use super::super::error::StorageError;
 use super::super::merge::{run_merge, UnifiedSource};
 use super::super::scatter::scatter_unified_sources_with_weights;
-use super::super::shard_file::{PkUniqueChecker, ShardWriteOpts};
+use super::super::shard_file::ShardWriteOpts;
 use super::super::shard_reader::MappedShard;
 use crate::schema::key::pack_pk_be;
 use crate::schema::SchemaDescriptor;
@@ -37,9 +37,11 @@ pub(super) fn open_shards(input_files: &[&CStr], schema: &SchemaDescriptor) -> R
     Ok(shards)
 }
 
-/// Guard owning `key` (see [`super::super::super::guard_slot`]). Monotone in
-/// `key`, so over the sorted merge stream each guard's survivors form one
-/// contiguous run.
+/// Guard owning `key` (see [`super::super::super::guard_slot`]). Test-only: the
+/// production split is [`compact_routed`]'s per-guard `partition_point` over the
+/// sorted survivor buffer, and the differential oracles route row-at-a-time
+/// through this instead so the two derivations stay independent.
+#[cfg(test)]
 pub(super) fn find_guard_for_key(guard_keys: &[u128], key: u128) -> usize {
     crate::storage::lsm::guard_slot(guard_keys, key, |&g| g)
 }
@@ -64,9 +66,8 @@ pub(super) fn compact_routed(
     input_files: &[&CStr],
     guard_keys: &[u128],
     schema: &SchemaDescriptor,
-    can_tag_pk_unique: bool,
     emit_empty_guards: bool,
-    mut name_for: impl FnMut(u128) -> String,
+    name_for: &mut dyn FnMut(u128) -> String,
 ) -> Result<Vec<(u128, String)>, StorageError> {
     // An empty guard list would make find_guard_for_key index a nonexistent
     // guard; every caller passes a non-empty list, but don't rely on it silently.
@@ -77,35 +78,22 @@ pub(super) fn compact_routed(
     let total_rows: usize = counts.iter().sum(); // survivor upper bound
     let total_blob: usize = shards.iter().map(|s| s.blob_len).sum();
 
-    // Phase 1 — merge into survivors (sorted (PK, payload)), counting the rows
-    // routed to each guard. `find_guard_for_key` is monotone over the sorted
-    // stream, so each guard's survivors are contiguous; observing on that sorted
-    // stream is also what lets `PkUniqueChecker` spot adjacent duplicate PKs.
-    // Checkers exist only when tagging is on — a never-observed checker
-    // vacuously qualifies, which must not leak a spurious PK_UNIQUE tag.
+    // Phase 1 — merge into survivors, sorted (PK, payload). The emit stays a bare
+    // push: `pack_pk_be` preserves the merge order, so each guard's survivors are
+    // one contiguous run and the split points are `guard_keys.len()` binary
+    // searches over the finished buffer rather than a guard lookup per row.
     let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(total_rows);
-    let mut checkers: Option<Vec<PkUniqueChecker>> =
-        can_tag_pk_unique.then(|| (0..guard_keys.len()).map(|_| PkUniqueChecker::new()).collect());
-    let mut run_len = vec![0usize; guard_keys.len()];
-    if guard_keys.len() == 1 && !can_tag_pk_unique {
-        // Single-guard, untagged (every view/scratch-table compaction): no
-        // routing and no observation — the emit is a bare survivor push.
-        run_merge(&shards, &counts, schema, |src, row, w| {
-            survivors.push((src as u32, row as u32, w));
-        });
-        run_len[0] = survivors.len();
-    } else {
-        run_merge(&shards, &counts, schema, |src, row, w| {
-            survivors.push((src as u32, row as u32, w));
-            let pk = shards[src].get_pk_bytes(row);
-            let prefix = pack_pk_be(pk);
-            let g = find_guard_for_key(guard_keys, prefix);
-            if let Some(checkers) = checkers.as_mut() {
-                checkers[g].observe(prefix, pk, w);
-            }
-            run_len[g] += 1;
-        });
-    }
+    run_merge(&shards, &counts, schema, |src, row, w| {
+        survivors.push((src as u32, row as u32, w));
+    });
+
+    // `bounds[g]..bounds[g + 1]` is guard `g`'s slice. Guard 0 also owns anything
+    // below `guard_keys[0]`, which is what `find_guard_for_key`'s clamp does.
+    let prefix_at = |&(src, row, _): &(u32, u32, i64)| pack_pk_be(shards[src as usize].get_pk_bytes(row as usize));
+    let bounds: Vec<usize> = std::iter::once(0)
+        .chain((1..guard_keys.len()).map(|g| survivors.partition_point(|s| prefix_at(s) < guard_keys[g])))
+        .chain(std::iter::once(survivors.len()))
+        .collect();
 
     // Phase 2 — one shard per guard, each scattered column-at-a-time from its
     // contiguous survivor slice. The `UnifiedSource` views hold raw pointers into
@@ -123,10 +111,8 @@ pub(super) fn compact_routed(
         }
     }
 
-    let mut start = 0;
     for g in 0..guard_keys.len() {
-        let bucket = &survivors[start..start + run_len[g]];
-        start += run_len[g];
+        let bucket = &survivors[bounds[g]..bounds[g + 1]];
         if bucket.is_empty() && !emit_empty_guards {
             continue;
         }
@@ -151,12 +137,7 @@ pub(super) fn compact_routed(
                 return Err(e);
             }
         };
-        let opts = ShardWriteOpts {
-            durable: true, // compaction outputs must survive a crash on their own
-            flags: checkers.as_ref().map_or(0, |c| c[g].flags()),
-            pack_ints: true,
-        };
-        if let Err(e) = batch.write_as_shard(&cpath, schema, opts) {
+        if let Err(e) = batch.write_as_shard(&cpath, schema, ShardWriteOpts::COMPACTION) {
             unlink_written(&out);
             return Err(e);
         }
@@ -177,17 +158,15 @@ pub fn compact_shards(
     input_files: &[&CStr],
     output_file: &CStr,
     schema: &SchemaDescriptor,
-    can_tag_pk_unique: bool,
 ) -> Result<(), StorageError> {
     let path = output_file.to_str().unwrap_or("").to_string();
-    compact_routed(input_files, &[0], schema, can_tag_pk_unique, true, |_| path.clone())?;
+    compact_routed(input_files, &[0], schema, true, &mut |_| path.clone())?;
     Ok(())
 }
 
 /// Compact `input_files` across `guard_keys` into one column-first output shard
 /// per non-empty guard, each named by the compaction grammar
 /// (`naming::compact_shard_name` — see its collision-freedom notes).
-#[allow(clippy::too_many_arguments)]
 pub fn merge_and_route(
     input_files: &[&CStr],
     output_dir: &CStr,
@@ -196,10 +175,9 @@ pub fn merge_and_route(
     table_id: u32,
     level_num: u32,
     compact_seq: u64,
-    can_tag_pk_unique: bool,
 ) -> Result<Vec<(u128, String)>, StorageError> {
     let dir = output_dir.to_str().unwrap_or("").to_string();
-    compact_routed(input_files, guard_keys, schema, can_tag_pk_unique, false, move |gk| {
+    compact_routed(input_files, guard_keys, schema, false, &mut |gk| {
         format!(
             "{dir}/{}",
             super::super::naming::compact_shard_name(table_id, compact_seq, level_num as usize, gk)

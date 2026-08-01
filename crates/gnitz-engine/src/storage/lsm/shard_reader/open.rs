@@ -234,10 +234,6 @@ impl MappedShard {
             None
         };
 
-        // Read the flags byte written at OFF_FLAGS (byte 56). The `file_size`
-        // guard is a defensive backstop; a well-formed shard always carries it.
-        let is_pk_unique = file_size > OFF_FLAGS && (data[OFF_FLAGS] & SHARD_FLAG_PK_UNIQUE != 0);
-
         Ok(MappedShard {
             mmap,
             count,
@@ -249,7 +245,6 @@ impl MappedShard {
             blob_len,
             xor8_filter,
             pk_stride,
-            is_pk_unique,
         })
     }
 }

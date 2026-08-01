@@ -192,11 +192,11 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// Build the partitioned storage for a top-level relation. Durability and
-    /// Pk-unique tagging are derived from `kind`, so a relation cannot be
-    /// (e.g.) ephemeral-but-Pk-tagged. Only user relations are built here
-    /// (system catalog tables are plain single `Table`s built at bootstrap),
-    /// so the partition count is always `NUM_PARTITIONS`.
+    /// Build the partitioned storage for a top-level relation. Recovery is
+    /// derived from `kind`, so a relation cannot be (e.g.) ephemeral but
+    /// SAL-replayed. Only user relations are built here (system catalog tables
+    /// are plain single `Table`s built at bootstrap), so the partition count is
+    /// always `NUM_PARTITIONS`.
     /// The `with_staged_dir` crash-cleanup wrapping the call in
     /// `hook_table_register`/`hook_view_register` is deliberately left at each
     /// call site: this helper takes `&self` and is pure construction, so
@@ -239,15 +239,8 @@ impl CatalogEngine {
                 end: self.active_part_end,
             }
         };
-        let mut pt = PartitionedTable::new(directory, schema, id as u32, routing, kind.recovery_source())
-            .map_err(|e| format!("Failed to create '{name}': error {e} (dir={directory})"))?;
-        if kind.is_base_table() {
-            // Tag base-table shards as PkUnique so the read cursor can skip
-            // payload comparison on a cross-source PK tie. The flush-time checker
-            // marks only shards whose data is actually unique.
-            pt.enable_pk_unique_tagging();
-        }
-        Ok(pt)
+        PartitionedTable::new(directory, schema, id as u32, routing, kind.recovery_source())
+            .map_err(|e| format!("Failed to create '{name}': error {e} (dir={directory})"))
     }
 
     fn hook_table_register(&mut self, batch: &Batch) -> Result<(), String> {
@@ -304,8 +297,8 @@ impl CatalogEngine {
                 let tbl_schema = build_schema_from_col_defs(&col_defs, pk.as_slice(), dist_prefix_len)?
                     .with_replicated(is_replicated);
 
-                // One kind drives the whole property bundle: durability and
-                // Pk-unique tagging.
+                // One kind drives the property bundle: recovery source, and what
+                // only base tables do (PK enforcement, secondary indexes).
                 let kind = RelationKind::BaseTable;
                 gnitz_debug!(
                     "catalog: creating table dir={} name={} tid={} parts={}",

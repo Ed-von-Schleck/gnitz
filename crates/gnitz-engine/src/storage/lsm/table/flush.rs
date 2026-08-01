@@ -17,7 +17,7 @@ use super::super::batch::Batch;
 use super::super::error::StorageError;
 use super::super::manifest::PreparedManifest;
 use super::super::memtable;
-use super::super::shard_file::{self, PkUniqueChecker};
+use super::super::shard_file;
 use super::{FlushOutcome, FlushWork, InMemRun, RecoverySource, Table, INMEM_CEILING, INMEM_COMPACT_THRESHOLD};
 use crate::foundation::posix_io::{fdatasync_eintr, fsync_eintr, open_owned};
 
@@ -130,21 +130,6 @@ impl Table {
         )
     }
 
-    /// `SHARD_FLAG_PK_UNIQUE` (or 0) for a consolidated run about to become a
-    /// shard, computed by observing all rows in sorted order. Only base tables
-    /// set `can_tag_pk_unique`; every other table's runs stay untagged ZSet.
-    fn shard_flush_flags(&self, run: &Batch) -> u8 {
-        if !self.shard_index.can_tag_pk_unique() {
-            return 0;
-        }
-        let mut checker = PkUniqueChecker::new();
-        for i in 0..run.count {
-            let pk = run.get_pk_bytes(i);
-            checker.observe(crate::schema::key::pack_pk_be(pk), pk, run.get_weight(i));
-        }
-        checker.flags()
-    }
-
     // ------------------------------------------------------------------
     // Barrier / durable flush (two-phase)
     // ------------------------------------------------------------------
@@ -255,7 +240,6 @@ impl Table {
         );
         let (shard_name, lsn_max) = self.next_shard_name_and_lsn();
         let name_c = super::super::cstr(shard_name.as_str())?;
-        let flush_flags = self.shard_flush_flags(&run);
 
         let dirfd = self.open_dirfd()?;
         let res = shard_file::write_shard_streaming(
@@ -265,8 +249,7 @@ impl Table {
             &run.regions(),
             &self.schema,
             shard_file::ShardWriteOpts {
-                durable: false, // unsynced; the barrier sweep fdatasyncs it by path
-                flags: flush_flags,
+                durable: false,   // unsynced; the barrier sweep fdatasyncs it by path
                 pack_ints: false, // L0 spill/checkpoint shards stay plain (no FoR packing)
             },
         );
@@ -379,8 +362,7 @@ impl Table {
     /// index's `unsynced` set. For `SalReplay` the next barrier fdatasyncs them
     /// by path before publishing (the `has_unsynced` gate disjunct guarantees a
     /// barrier fires while unpublished spills exist, so the checkpoint's global
-    /// SAL reset never drops an acknowledged spill); the PK-unique tag stays (a
-    /// read-path property, not a durability one). Rederive spills publish no
+    /// SAL reset never drops an acknowledged spill). Rederive spills publish no
     /// manifest and are erased+rebuilt at open, so their `unsynced` marks are
     /// pruned by disk compaction and never swept.
     ///

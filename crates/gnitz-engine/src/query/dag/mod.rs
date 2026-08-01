@@ -83,8 +83,7 @@ impl IndexCircuitEntry {
 /// What a top-level relation *is*. Bundles every per-kind property that used
 /// to be set independently, so the nonsense combinations are unconstructable:
 /// a durable relation that also rebuilds from source (double count), an
-/// ephemeral one that never rebuilds (permanently empty), a view that tags
-/// Pk-unique.
+/// ephemeral one that never rebuilds (permanently empty).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RelationKind {
     /// System catalog table: durable, single-partition, never rebuilt from
@@ -113,9 +112,8 @@ impl RelationKind {
     }
 
     /// True iff this is a user base table. Gates what only base tables do:
-    /// run `enforce_unique_pk` on ingest, own secondary index circuits (index
-    /// projection runs only on the base-table DML paths) and tag
-    /// flushed/compacted shards Pk-unique.
+    /// run `enforce_unique_pk` on ingest, and own secondary index circuits
+    /// (index projection runs only on the base-table DML paths).
     #[inline]
     pub fn is_base_table(self) -> bool {
         matches!(self, RelationKind::BaseTable)

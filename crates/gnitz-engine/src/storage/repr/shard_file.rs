@@ -14,8 +14,7 @@ use super::layout::*;
 use super::xor8;
 use crate::foundation::posix_io::{fdatasync_eintr, fsync_eintr};
 use crate::foundation::xxh;
-use crate::schema::key::pack_pk_be;
-use crate::schema::{SchemaDescriptor, MAX_PK_BYTES};
+use crate::schema::SchemaDescriptor;
 use gnitz_wire::{
     is_fixed_int, is_signed_int, read_i64_le, read_signed_exact, read_u64_le, read_unsigned_exact, write_u64_le,
 };
@@ -23,85 +22,6 @@ use xorf::Xor8;
 
 fn align64(val: usize) -> usize {
     (val + ALIGNMENT - 1) & !(ALIGNMENT - 1)
-}
-
-// ---------------------------------------------------------------------------
-// PkUniqueChecker — shared detection primitive (used by flush and compaction)
-// ---------------------------------------------------------------------------
-
-/// Determines at write time whether an output shard qualifies as PkUnique.
-///
-/// Call `observe` once per output row in write order. A shard qualifies if it
-/// contains no negative-weight rows and no duplicate adjacent PKs. The u128
-/// prefix fast-path avoids the full byte compare for the overwhelmingly common
-/// case of distinct adjacent PKs.
-///
-/// Placed in `shard_file.rs` so both the flush path (table.rs) and the
-/// compaction path (compact.rs) can use it without a separate module.
-pub struct PkUniqueChecker {
-    last_prefix: u128,
-    last_pk: [u8; MAX_PK_BYTES],
-    has_last: bool,
-    qualifies: bool,
-}
-
-impl PkUniqueChecker {
-    pub fn new() -> Self {
-        Self {
-            last_prefix: 0,
-            last_pk: [0; MAX_PK_BYTES],
-            has_last: false,
-            qualifies: true,
-        }
-    }
-
-    /// Observe one output row. `prefix` must be `pack_pk_be(pk_bytes)` — the
-    /// compaction emit loop already has it for guard routing, so it is taken
-    /// rather than recomputed. `pk_bytes` is the OPK-encoded key slice (sorted;
-    /// needed to confirm a prefix tie for wide keys). `weight` is the net row
-    /// weight after consolidation.
-    pub fn observe(&mut self, prefix: u128, pk_bytes: &[u8], weight: i64) {
-        if !self.qualifies {
-            return;
-        }
-        if weight < 0 {
-            self.qualifies = false;
-            return;
-        }
-        debug_assert_eq!(prefix, pack_pk_be(pk_bytes));
-        let n = pk_bytes.len().min(MAX_PK_BYTES);
-        // Is this row an adjacent duplicate of its predecessor? For narrow keys
-        // (n ≤ 16) pack_pk_be is injective, so an equal prefix *is* an equal PK
-        // and last_pk is never maintained; for wide keys the prefix is lossy, so
-        // a prefix tie is only confirmed by the full byte compare. The has_last
-        // guard keeps the first row — or a genuine all-zero key, which aliases
-        // the zero-initialised last_prefix/last_pk — from reading as a duplicate.
-        let is_duplicate =
-            self.has_last && prefix == self.last_prefix && (n <= 16 || self.last_pk[..n] == pk_bytes[..n]);
-        if is_duplicate {
-            self.qualifies = false;
-            return;
-        }
-        // Remember this row as the predecessor for the next observe. Narrow keys
-        // skip the last_pk copy — for them the prefix alone is authoritative.
-        self.last_prefix = prefix;
-        if n > 16 {
-            self.last_pk[..n].copy_from_slice(&pk_bytes[..n]);
-        }
-        self.has_last = true;
-    }
-
-    /// Returns `SHARD_FLAG_PK_UNIQUE` when the observed stream was unique,
-    /// otherwise 0. Callers gate on `can_tag_pk_unique` before constructing a
-    /// checker — a never-observed checker vacuously qualifies.
-    pub fn flags(&self) -> u8 {
-        use super::layout::SHARD_FLAG_PK_UNIQUE;
-        if self.qualifies {
-            SHARD_FLAG_PK_UNIQUE
-        } else {
-            0
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -405,15 +325,23 @@ fn build_xor8_from_pk_region(pk_bytes: &[u8], stride: usize) -> Option<Xor8> {
 ///
 /// `durable` fdatasyncs the file and its directory around the finalizing
 /// rename — spills and barrier folds pass `false` (the barrier's by-path sweep
-/// fdatasyncs them), compaction outputs and WAL-block conversions pass `true`.
-/// `flags` is the persisted `OFF_FLAGS` header byte (`SHARD_FLAG_PK_UNIQUE`).
+/// fdatasyncs them), compaction outputs pass `true`.
 /// `pack_ints` enables FoR (`ENCODING_FOR`) on eligible integer payload
 /// regions — set only by compaction; L0 spill/checkpoint writers stay raw.
 #[derive(Clone, Copy, Default)]
 pub struct ShardWriteOpts {
     pub durable: bool,
-    pub flags: u8,
     pub pack_ints: bool,
+}
+
+impl ShardWriteOpts {
+    /// The compaction write policy: outputs must survive a crash on their own,
+    /// and their integer payload regions are FoR-packed. The differential-test
+    /// oracles reuse it so they cannot drift from the production write.
+    pub const COMPACTION: Self = Self {
+        durable: true,
+        pack_ints: true,
+    };
 }
 
 /// Write the .tmp shard, then fdatasync (if `opts.durable`), close, and rename
@@ -451,8 +379,7 @@ pub fn write_shard_streaming(
 
 /// Open .tmp shard, write header+regions+xor8, leave fd open and unsynced.
 /// Caller is responsible for fdatasync, close, and rename. On error the fd
-/// is closed and the .tmp is unlinked. `opts.flags` is written to the
-/// `OFF_FLAGS` byte in the header; `opts.durable` is the caller's concern.
+/// is closed and the .tmp is unlinked. `opts.durable` is the caller's concern.
 #[allow(clippy::needless_range_loop)]
 fn write_shard_streaming_inner(
     dirfd: c_int,
@@ -583,7 +510,6 @@ fn write_shard_streaming_inner(
     write_u64_le(&mut hdr_buf, OFF_DIR_OFFSET, dir_offset as u64);
     write_u64_le(&mut hdr_buf, OFF_XOR8_OFFSET, xor8_offset as u64);
     write_u64_le(&mut hdr_buf, OFF_XOR8_SIZE, xor8_size as u64);
-    hdr_buf[OFF_FLAGS] = opts.flags;
 
     let tmp_name = super::super::cstr_with_tmp_suffix(basename)?;
 
@@ -1029,79 +955,6 @@ mod tests {
         for p in &pks128 {
             assert!(xor8::may_contain(&f128, *p));
         }
-    }
-
-    const FLAG: u8 = SHARD_FLAG_PK_UNIQUE;
-
-    /// `flags()` after observing the given OPK byte rows in order.
-    fn tag(rows: &[(&[u8], i64)]) -> u8 {
-        let mut c = PkUniqueChecker::new();
-        for &(pk, w) in rows {
-            c.observe(pack_pk_be(pk), pk, w);
-        }
-        c.flags()
-    }
-
-    #[test]
-    fn pk_unique_checker_narrow_adjacent_duplicate() {
-        let k5 = 5u64.to_be_bytes();
-        let k6 = 6u64.to_be_bytes();
-        // Regression: a narrow (≤16B) duplicate appearing exactly twice was
-        // missed. pack_pk_be is injective for ≤16B, so the prefix tie alone
-        // proves the duplicate — last_pk is not maintained for narrow keys, and
-        // the old fall-through byte compare ran against a stale/zero buffer.
-        assert_eq!(tag(&[(&k5, 1), (&k5, 1)]), 0, "adjacent narrow dup must disqualify");
-        assert_eq!(tag(&[(&k5, 1), (&k6, 1)]), FLAG, "distinct narrow keys qualify");
-        assert_eq!(tag(&[(&k5, 1)]), FLAG, "single key qualifies");
-        // Three consecutive copies were caught even before the fix; assert the
-        // post-fix behavior is still correct.
-        assert_eq!(tag(&[(&k5, 1), (&k5, 1), (&k5, 1)]), 0);
-    }
-
-    #[test]
-    fn pk_unique_checker_all_zero_key() {
-        // The all-zero key aliases the initial last_prefix/last_pk state. A lone
-        // zero key (or zero followed by a distinct key) must still qualify; only
-        // an actual adjacent zero duplicate disqualifies. The audit's proposed
-        // short-circuit dropped the has_last guard and regressed this case.
-        let z = 0u64.to_be_bytes();
-        let k1 = 1u64.to_be_bytes();
-        assert_eq!(tag(&[(&z, 1)]), FLAG, "lone zero key qualifies");
-        assert_eq!(tag(&[(&z, 1), (&k1, 1)]), FLAG, "zero then distinct qualifies");
-        assert_eq!(tag(&[(&z, 1), (&z, 1)]), 0, "adjacent zero dup disqualifies");
-    }
-
-    #[test]
-    fn pk_unique_checker_wide_prefix_twins() {
-        // Wide (>16B) keys sharing a 16-byte prefix: the prefix tie is not
-        // authoritative, so the full byte compare on last_pk decides.
-        let mut a = [0u8; 24];
-        let mut b = [0u8; 24];
-        a[..16].copy_from_slice(&[7u8; 16]);
-        b[..16].copy_from_slice(&[7u8; 16]);
-        a[16] = 1;
-        b[16] = 2;
-        assert_eq!(
-            tag(&[(&a, 1), (&b, 1)]),
-            FLAG,
-            "wide prefix-twins, distinct tails qualify"
-        );
-        assert_eq!(tag(&[(&a, 1), (&a, 1)]), 0, "identical wide keys disqualify");
-        // Interleaving a distinct-prefix row must not lose the wide last_pk.
-        let c = [9u8; 24];
-        assert_eq!(
-            tag(&[(&a, 1), (&c, 1), (&a, 1)]),
-            FLAG,
-            "non-adjacent wide repeats qualify"
-        );
-    }
-
-    #[test]
-    fn pk_unique_checker_negative_weight() {
-        let k1 = 1u64.to_be_bytes();
-        let k2 = 2u64.to_be_bytes();
-        // A negative weight disqualifies regardless of PK distinctness.
-        assert_eq!(tag(&[(&k1, 1), (&k2, -1)]), 0, "negative weight disqualifies");
     }
 }
 

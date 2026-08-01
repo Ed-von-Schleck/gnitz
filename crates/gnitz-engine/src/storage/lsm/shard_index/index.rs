@@ -16,17 +16,6 @@ use super::{
 };
 
 impl ShardIndex {
-    /// Enable `SHARD_FLAG_PK_UNIQUE` tagging for compacted shards.
-    /// Only call this for base tables with a user-defined PK constraint.
-    pub fn enable_pk_unique_tagging(&mut self) {
-        self.can_tag_pk_unique = true;
-    }
-
-    /// Whether flushed/compacted shards may be tagged `SHARD_FLAG_PK_UNIQUE`.
-    pub(in crate::storage) fn can_tag_pk_unique(&self) -> bool {
-        self.can_tag_pk_unique
-    }
-
     pub(super) fn all_entries(&self) -> impl Iterator<Item = &ShardEntry> {
         self.l0.iter().chain(
             self.levels
@@ -202,7 +191,6 @@ impl ShardIndex {
             self.table_id,
             1,
             compact_seq,
-            self.can_tag_pk_unique,
         )?;
 
         self.commit_l0_to_l1(&guard_outputs, l0_max_lsn)?;
@@ -317,7 +305,7 @@ impl ShardIndex {
         let input_cstrs: Vec<&CStr> = input_cstrings.iter().map(|c| c.as_c_str()).collect();
         let out_cstr = super::super::cstr(out_path.as_str())?;
 
-        if let Err(e) = compact::compact_shards(&input_cstrs, &out_cstr, &self.schema, self.can_tag_pk_unique) {
+        if let Err(e) = compact::compact_shards(&input_cstrs, &out_cstr, &self.schema) {
             let _ = fs::remove_file(&out_path);
             return Err(e);
         }
@@ -414,7 +402,6 @@ impl ShardIndex {
             self.table_id,
             DEST_IDX as u32 + 1,
             compact_seq,
-            self.can_tag_pk_unique,
         )?;
 
         let opened = self.open_outputs(&guard_outputs, vert_max_lsn)?;

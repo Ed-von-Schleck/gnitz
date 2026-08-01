@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 
 use crate::expr::{PkFill, ScalarFunc};
 use crate::schema::SchemaDescriptor;
-use crate::storage::{with_payload_cmp, Batch, Layout, MemBatch};
+use crate::storage::{with_payload_cmp, Batch, Layout, MemBatch, RowComparator};
 
 use super::cogroup::{cogroup_union, BatchCursor};
 use super::reindex::{reindex_hash_row, ReindexPacker};
@@ -153,7 +153,7 @@ fn op_union_merge(batch_a: &Batch, batch_b: &Batch, schema: &SchemaDescriptor) -
 #[inline]
 fn op_union_merge_inner<RowCmp>(batch_a: &Batch, batch_b: &Batch, schema: &SchemaDescriptor, row_cmp: RowCmp) -> Batch
 where
-    RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
+    RowCmp: for<'x> RowComparator<MemBatch<'x>>,
 {
     let n_a = batch_a.count;
     let n_b = batch_b.count;

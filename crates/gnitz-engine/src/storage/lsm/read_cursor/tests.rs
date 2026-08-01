@@ -4,9 +4,9 @@ use crate::storage::Layout;
 use crate::test_support::{make_schema_u128_i64, wide_pk_3xu64_schema};
 use gnitz_wire::as_le_bytes;
 
-/// `(U64 PK | I64 payload)` — stride-8, the dominant single-PK table shape.
-/// Used by the stride-8 drive bench, which exercises `pack_pk_be`'s 8-byte
-/// register arm and the u128-vs-u64 compare in `compare_pk_ordering`.
+/// `(U64 PK | I64 payload)` — stride-8, the dominant single-PK table shape. It
+/// exercises `pack_pk_be`'s 8-byte register arm and the u128-vs-u64 compare in
+/// `compare_pk_ordering`.
 fn make_schema_u64() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
@@ -404,7 +404,7 @@ fn test_scatter_constant_pk_shard() {
 
     // A single-row shard Constant-encodes its PK region at rest, which used to
     // fall back to the row-major scatter; the column-major path now handles it.
-    let shard = write_test_shard(&dir, &schema, 0, &[(42, 1, 999)], 0);
+    let shard = write_test_shard(&dir, &schema, 0, &[(42, 1, 999)]);
     let cursor = create_read_cursor(&[], &[shard], schema);
     let result = cursor.materialize();
 
@@ -891,7 +891,7 @@ fn create_cursor_force_multi(batches: &[Rc<Batch>]) -> ReadCursor {
     for state in c.states.iter_mut() {
         state.position = 0;
     }
-    c.mode = SourceMode::Multi(ReadCursor::build_tree(&c.sources, &c.states, &c.schema, c.is_pk_unique));
+    c.mode = SourceMode::Multi(ReadCursor::build_tree(&c.sources, &c.states, &c.schema));
     c.drive();
     c
 }
@@ -946,9 +946,7 @@ fn pair_equiv_multi() {
 }
 
 /// Write `rows` (each `(pk, weight, val)`) to a freshly-streamed
-/// `(unsigned PK | I64 payload)` shard tagged with `flag`
-/// (`SHARD_FLAG_PK_UNIQUE` ⇒ the opened shard reports `is_pk_unique`, `0` ⇒ it
-/// does not). `rows` must be PK-ascending.
+/// `(unsigned PK | I64 payload)` shard. `rows` must be PK-ascending.
 ///
 /// The PK width comes from `schema` — for an unsigned PK the OPK bytes ARE the
 /// big-endian value, so the region is the low `pk_stride` bytes of each key's
@@ -959,7 +957,6 @@ fn write_test_shard(
     schema: &SchemaDescriptor,
     idx: usize,
     rows: &[(u128, i64, i64)],
-    flag: u8,
 ) -> Rc<MappedShard> {
     let stride = schema.pk_stride() as usize;
     let pks: Vec<u8> = rows
@@ -977,7 +974,7 @@ fn write_test_shard(
         as_le_bytes(&vals),
         &blob,
     ];
-    let path = dir.path().join(format!("rc{stride}_{flag}_{idx}.db"));
+    let path = dir.path().join(format!("rc{stride}_{idx}.db"));
     let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
     super::super::shard_file::write_shard_streaming(
         libc::AT_FDCWD,
@@ -985,23 +982,18 @@ fn write_test_shard(
         rows.len() as u32,
         &regions,
         schema,
-        super::super::shard_file::ShardWriteOpts {
-            flags: flag,
-            ..Default::default()
-        },
+        super::super::shard_file::ShardWriteOpts::default(),
     )
     .unwrap();
     Rc::new(MappedShard::open(&cpath, schema, false).unwrap())
 }
 
-/// The PkUnique drive path (all sources flagged `is_pk_unique`, payload
-/// comparison skipped) and the payload path (same bytes, flag cleared) must
-/// produce identical output on contract-satisfying unique-PK data. Only the
-/// shard flag differs, so this isolates the comparator-path choice that
-/// `with_row_cmp!` unifies. Cross-source PK 1 (shards A+C) and PK 7 (A+B)
-/// repeat with identical payloads, so both paths must fold their weights.
+/// A `Multi` merge over several *shard* sources folds cross-source weights:
+/// PK 1 (shards A+C) and PK 7 (A+B) repeat with identical payloads, so each
+/// must emit once at the summed weight. The batch-source equivalent
+/// (`pair_equiv_multi`) does not reach the shard path.
 #[test]
-fn pk_unique_and_payload_paths_agree() {
+fn multi_shard_merge_folds_cross_source_weights() {
     crate::foundation::posix_io::raise_fd_limit_for_tests();
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u128_i64();
@@ -1010,30 +1002,15 @@ fn pk_unique_and_payload_paths_agree() {
         &[(2, 1, 200), (5, 1, 500), (7, 1, 700)],
         &[(1, 1, 100), (3, 1, 300), (6, 1, 600)],
     ];
-    let build = |flag: u8| -> Vec<Rc<MappedShard>> {
-        shard_rows
-            .iter()
-            .enumerate()
-            .map(|(i, rows)| write_test_shard(&dir, &schema, i, rows, flag))
-            .collect()
-    };
-    let pku = build(super::super::layout::SHARD_FLAG_PK_UNIQUE);
-    let plain = build(0);
+    let shards: Vec<Rc<MappedShard>> = shard_rows
+        .iter()
+        .enumerate()
+        .map(|(i, rows)| write_test_shard(&dir, &schema, i, rows))
+        .collect();
 
-    let mut pku_cursor = create_read_cursor(&[], &pku, schema);
-    let mut plain_cursor = create_read_cursor(&[], &plain, schema);
-    assert!(pku_cursor.is_pk_unique, "flag=PK_UNIQUE ⇒ PkUnique path");
-    assert!(!plain_cursor.is_pk_unique, "flag=0 ⇒ payload path");
-
-    let got = scan_all(&mut pku_cursor);
+    let mut cursor = create_read_cursor(&[], &shards, schema);
     assert_eq!(
-        got,
-        scan_all(&mut plain_cursor),
-        "PkUnique path must equal payload path"
-    );
-    // Independent oracle: cross-source same-(PK,payload) rows fold their weights.
-    assert_eq!(
-        got,
+        scan_all(&mut cursor),
         vec![
             (1, 0, 2),
             (2, 0, 1),
@@ -1045,124 +1022,6 @@ fn pk_unique_and_payload_paths_agree() {
         ],
         "merge must fold PK 1 and PK 7 across sources",
     );
-}
-
-/// The relocated PkUnique debug-assert must still fire when a flag-tagged
-/// (PkUnique) source set VIOLATES the contract (same PK, different payloads) —
-/// the only direct probe of the comparator's invariant now that it lives in
-/// `with_row_cmp!`. Debug-only (the assert is compiled out in release).
-#[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "PK tie with differing payloads")]
-fn pk_unique_flag_with_conflicting_payloads_panics() {
-    crate::foundation::posix_io::raise_fd_limit_for_tests();
-    let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_u128_i64();
-    let flag = super::super::layout::SHARD_FLAG_PK_UNIQUE;
-    // Three "PkUnique" shards sharing PK 5 with DIFFERENT payloads — illegal.
-    // Three sources force `Multi`; comparing the tied heads (tree build or
-    // drive) trips the relocated debug_assert.
-    let a = write_test_shard(&dir, &schema, 0, &[(5, 1, 100)], flag);
-    let b = write_test_shard(&dir, &schema, 1, &[(5, 1, 200)], flag);
-    let c = write_test_shard(&dir, &schema, 2, &[(5, 1, 300)], flag);
-    let mut cursor = create_read_cursor(&[], &[a, b, c], schema);
-    while cursor.valid {
-        cursor.advance();
-    }
-}
-
-/// Throughput of the all-PkUnique `Multi` drive (the path now collapsed onto
-/// `drive_with_inner`). Parity gate: the rows/s must not regress after the
-/// collapse — in `--release` the relocated `debug_assert!` vanishes and the
-/// PkUnique comparator is codegen-identical to a bare trivial one.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn read_cursor_drive_pk_unique_multi_bench() {
-    use std::time::Instant;
-    crate::foundation::posix_io::raise_fd_limit_for_tests();
-    let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_u128_i64(); // U128 PK (stride 16) | I64 payload
-
-    // 4 shards, interleaved unique PKs (round-robin) so the Multi merge does
-    // real cross-source work; flags = SHARD_FLAG_PK_UNIQUE so the opened
-    // shards report `is_pk_unique` and the cursor drives the PkUnique path.
-    const N_SHARDS: usize = 4;
-    const PER_SHARD: u128 = 200_000;
-    let flag = super::super::layout::SHARD_FLAG_PK_UNIQUE;
-    let shards: Vec<Rc<MappedShard>> = (0..N_SHARDS as u128)
-        .map(|s| {
-            let rows: Vec<(u128, i64, i64)> = (0..PER_SHARD).map(|i| (i * N_SHARDS as u128 + s, 1, 7)).collect();
-            write_test_shard(&dir, &schema, s as usize, &rows, flag)
-        })
-        .collect();
-
-    // Build the cursor ONCE (construction stays outside the timed region — the
-    // measurement is drive-only) and confirm we exercise the all-PkUnique
-    // Multi path. `rewind()` re-drives from row 0 each iteration.
-    let mut c = create_read_cursor(&[], &shards, schema);
-    assert!(c.is_pk_unique, "bench must drive the all-PkUnique path");
-    assert!(matches!(c.mode, SourceMode::Multi(_)), "bench must drive Multi");
-
-    const ITERS: usize = 20;
-    let total_rows = N_SHARDS as u128 * PER_SHARD;
-    let mut sink = 0i64;
-    let t = Instant::now();
-    for _ in 0..ITERS {
-        c.rewind();
-        while c.valid {
-            sink = sink.wrapping_add(std::hint::black_box(c.current_weight));
-            c.advance();
-        }
-    }
-    let secs = t.elapsed().as_secs_f64();
-    std::hint::black_box(sink);
-    let rps = (ITERS as u128 * total_rows) as f64 / secs;
-    println!("drive_pk_unique_multi: {total_rows} rows × {ITERS} iters in {secs:.3}s = {rps:.0} rows/s");
-}
-
-/// Stride-8 sibling of `read_cursor_drive_pk_unique_multi_bench` — the worst
-/// case for `compare_pk_ordering` (the 8-byte `pack_pk_be` arm + the
-/// u128-vs-u64 compare). Single `U64`/`I64` PKs are the dominant table shape;
-/// this is the regression guard for the common-width loser-tree drive.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn read_cursor_drive_pk_unique_multi_u64_bench() {
-    use std::time::Instant;
-    crate::foundation::posix_io::raise_fd_limit_for_tests();
-    let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_u64(); // U64 PK (stride 8) | I64 payload
-
-    const N_SHARDS: usize = 4;
-    const PER_SHARD: u64 = 200_000;
-    let flag = super::super::layout::SHARD_FLAG_PK_UNIQUE;
-    let shards: Vec<Rc<MappedShard>> = (0..N_SHARDS as u64)
-        .map(|s| {
-            let rows: Vec<(u128, i64, i64)> = (0..PER_SHARD)
-                .map(|i| ((i * N_SHARDS as u64 + s) as u128, 1, 7))
-                .collect();
-            write_test_shard(&dir, &schema, s as usize, &rows, flag)
-        })
-        .collect();
-
-    let mut c = create_read_cursor(&[], &shards, schema);
-    assert!(c.is_pk_unique, "bench must drive the all-PkUnique path");
-    assert!(matches!(c.mode, SourceMode::Multi(_)), "bench must drive Multi");
-
-    const ITERS: usize = 20;
-    let total_rows = N_SHARDS as u64 * PER_SHARD;
-    let mut sink = 0i64;
-    let t = Instant::now();
-    for _ in 0..ITERS {
-        c.rewind();
-        while c.valid {
-            sink = sink.wrapping_add(std::hint::black_box(c.current_weight));
-            c.advance();
-        }
-    }
-    let secs = t.elapsed().as_secs_f64();
-    std::hint::black_box(sink);
-    let rps = (ITERS as u64 * total_rows) as f64 / secs;
-    println!("drive_pk_unique_multi_u64: {total_rows} rows × {ITERS} iters in {secs:.3}s = {rps:.0} rows/s");
 }
 
 /// Baseline: shard-backed merge-scan throughput. Four overlapping-key shards
@@ -1269,7 +1128,7 @@ fn shard_point_probe_bench() {
     // Sparse (even) shard keys so odd probes resolve a lower bound *between*
     // two present keys. Construction + open outside the timed region.
     let rows: Vec<(u128, i64, i64)> = (0..N).map(|i| ((i * 2) as u128, 1, i as i64)).collect();
-    let shard = write_test_shard(&dir, &schema, 0, &rows, 0);
+    let shard = write_test_shard(&dir, &schema, 0, &rows);
 
     // Evenly-spaced ascending present keys for the monotone advance sweep.
     let step = (N / PROBES as u64).max(1);
@@ -1502,7 +1361,6 @@ fn adv_write_shard(
     pks: &[u8],
     weights: &[i64],
     vals: &[i64],
-    flag: u8,
 ) -> Rc<MappedShard> {
     let count = weights.len();
     debug_assert_eq!(pks.len(), count * schema.pk_stride() as usize);
@@ -1518,10 +1376,7 @@ fn adv_write_shard(
         count as u32,
         &regions,
         schema,
-        super::super::shard_file::ShardWriteOpts {
-            flags: flag,
-            ..Default::default()
-        },
+        super::super::shard_file::ShardWriteOpts::default(),
     )
     .unwrap();
     Rc::new(MappedShard::open(&cpath, schema, false).unwrap())
@@ -1550,7 +1405,7 @@ fn adv_build_interleaved_shards(
             }
             let weights = vec![1i64; cnt];
             let vals = vec![0i64; cnt];
-            adv_write_shard(dir, schema, &format!("{name}_{s}"), &pks, &weights, &vals, 0)
+            adv_write_shard(dir, schema, &format!("{name}_{s}"), &pks, &weights, &vals)
         })
         .collect()
 }
@@ -1593,7 +1448,6 @@ fn adv_write_shard_rows(
     schema: &SchemaDescriptor,
     name: &str,
     rows: &[(u64, i64, i64)],
-    flag: u8,
 ) -> Rc<MappedShard> {
     let stride = schema.pk_stride() as usize;
     let cnt = rows.len();
@@ -1605,7 +1459,7 @@ fn adv_write_shard_rows(
         weights.push(w);
         vals.push(v);
     }
-    adv_write_shard(dir, schema, name, &pks, &weights, &vals, flag)
+    adv_write_shard(dir, schema, name, &pks, &weights, &vals)
 }
 
 /// `Multi` fixture: one in-RAM delta batch + `k` shards, keys interleaved over
@@ -1646,7 +1500,7 @@ fn adv_build_multi_fixture(
     let shards = rows[1..]
         .iter()
         .enumerate()
-        .map(|(i, r)| adv_write_shard_rows(dir, schema, &format!("{name}_{i}"), r, 0))
+        .map(|(i, r)| adv_write_shard_rows(dir, schema, &format!("{name}_{i}"), r))
         .collect();
     (delta, shards)
 }
@@ -2129,7 +1983,7 @@ fn count_range_raw_equals_counted_walk() {
     let a = make_batch(&[(5, 1, 50), (20, 1, 200), (30, 1, 300)]);
     let b = make_batch(&[(10, 1, 100), (25, 1, 250), (60, 1, 600)]);
     let c = make_batch(&[(80, 1, 800), (90, 1, 900)]);
-    let shard = write_test_shard(&dir, &schema, 0, &[(20, 1, 201), (35, 1, 350), (70, 1, 700)], 0);
+    let shard = write_test_shard(&dir, &schema, 0, &[(20, 1, 201), (35, 1, 350), (70, 1, 700)]);
 
     let batches = [Rc::clone(&a), Rc::clone(&b), Rc::clone(&c)];
     let shards = [Rc::clone(&shard)];

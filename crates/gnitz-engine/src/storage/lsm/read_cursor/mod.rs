@@ -9,11 +9,11 @@ use std::ptr;
 use std::rc::Rc;
 
 use super::batch::Batch;
+use super::columnar::with_payload_cmp;
 use super::columnar::ColumnarSource;
 use super::heap::{drive_merge, HeapNode, LoserTree};
-use super::merge::UnifiedSource;
+use super::merge::{self, UnifiedSource};
 use super::shard_reader::MappedShard;
-use super::with_row_cmp;
 use crate::schema::key::{compare_pk_ordering, pk_bytes_eq};
 use crate::schema::SchemaDescriptor;
 
@@ -103,10 +103,6 @@ pub struct ReadCursor {
     unified_sources: OnceCell<Vec<UnifiedSource>>,
     mode: SourceMode,
     schema: SchemaDescriptor,
-    /// Every source is a PkUnique shard ⇒ payload comparison is skipped on PK
-    /// ties (a cross-source PK match is the same Z-set element). The non-PkUnique
-    /// comparator is read live from `schema.payload_cmp` via `with_payload_cmp!`.
-    is_pk_unique: bool,
     // Current row state
     pub valid: bool,
     pub current_weight: i64,
@@ -115,28 +111,11 @@ pub struct ReadCursor {
     current_row: usize,
 }
 
-/// Row comparator alias for the monomorphized `_with` variants.  `Copy` lets
-/// callers forward the same comparator down the call chain at zero cost.
-trait RowComparator: Fn(&SchemaDescriptor, &CursorSource, usize, &CursorSource, usize) -> Ordering + Copy {}
-impl<F> RowComparator for F where F: Fn(&SchemaDescriptor, &CursorSource, usize, &CursorSource, usize) -> Ordering + Copy
-{}
-
-/// The full loser-tree order — the shared [`merge::merge_less`] trio member
-/// (OPK byte order via `compare_pk_ordering`, then the payload `row_cmp`),
-/// so the cursor's heap order can never diverge from the flush/compaction
-/// kernel's. The **single** source of truth for "which head sorts first": the
-/// tree build, every `drive`, and the forward-seek fast path all key the heap
-/// through it, so a tree maintained in place can never order rows differently
-/// from how it was built. All-PkUnique callers pass a trivial
-/// `|_, _, _, _, _| Ordering::Equal` (a PK tie ⇒ the same Z-set element).
-#[inline]
-fn heap_less_with<'a, RowCmp: RowComparator + 'a>(
-    schema: &'a SchemaDescriptor,
-    sources: &'a [CursorSource],
-    row_cmp: RowCmp,
-) -> impl Fn(&HeapNode, &HeapNode) -> bool + Copy + 'a {
-    super::merge::merge_less(schema, sources, row_cmp)
-}
+/// The comparator the `_with` variants are monomorphized over — the same
+/// [`merge::RowComparator`] the flush/compaction kernel uses, at this cursor's
+/// source type.
+trait RowComparator: merge::RowComparator<CursorSource> {}
+impl<F: merge::RowComparator<CursorSource>> RowComparator for F {}
 
 impl ReadCursor {
     /// Build a ReadCursor from owned in-memory batches (no shards) — a test-only
@@ -147,11 +126,14 @@ impl ReadCursor {
         create_read_cursor(snapshots, &[], schema)
     }
 
-    /// Builds the loser tree under the selected `row_cmp` (the `with_row_cmp!`
+    /// Builds the loser tree under the selected `row_cmp` (the `with_payload_cmp!`
     /// layer hands it a monomorphized comparator). Keyless leaf: it carries only
     /// the row index; the comparator reads each player's OPK bytes through
-    /// `(source_idx, row)` — `compare_pk_ordering`, then the payload tiebreak — the
-    /// shared `heap_less_with` order the drive and forward-seek paths reuse.
+    /// `(source_idx, row)` — `compare_pk_ordering`, then the payload tiebreak. That
+    /// is [`merge::merge_less`], the same order the flush/compaction kernel merges
+    /// under, and the one the drive and forward-seek paths key the heap through, so
+    /// a tree maintained in place can never order rows differently from how it was
+    /// built.
     #[inline]
     fn build_tree_with<RowCmp: RowComparator>(
         sources: &[CursorSource],
@@ -160,32 +142,22 @@ impl ReadCursor {
         row_cmp: RowCmp,
     ) -> LoserTree {
         let init = |i: usize| states[i].is_valid().then(|| states[i].position as u32);
-        LoserTree::build(sources.len(), init, heap_less_with(schema, sources, row_cmp))
+        LoserTree::build(sources.len(), init, merge::merge_less(schema, sources, row_cmp))
     }
 
-    fn build_tree(
-        sources: &[CursorSource],
-        states: &[CursorState],
-        schema: &SchemaDescriptor,
-        is_pk_unique: bool,
-    ) -> LoserTree {
-        // `with_row_cmp!` selects the payload comparator; the PK axis is
+    fn build_tree(sources: &[CursorSource], states: &[CursorState], schema: &SchemaDescriptor) -> LoserTree {
+        // `with_payload_cmp!` selects the payload comparator; the PK axis is
         // `compare_pk_ordering` (no stride dispatch).
-        with_row_cmp!(schema, is_pk_unique, Self::build_tree_with, sources, states, schema)
+        with_payload_cmp!(schema, Self::build_tree_with, sources, states, schema)
     }
 
     fn new(sources: Vec<CursorSource>, states: Vec<CursorState>, schema: SchemaDescriptor) -> Self {
         debug_assert_eq!(sources.len(), states.len());
-        let is_pk_unique = !sources.is_empty()
-            && sources.iter().all(|s| match s {
-                CursorSource::Shard(shard) => shard.is_pk_unique,
-                CursorSource::Batch(_) => false,
-            });
         let mode = match sources.len() {
             0 => SourceMode::Empty,
             1 => SourceMode::Single,
             2 => SourceMode::Pair,
-            _ => SourceMode::Multi(Self::build_tree(&sources, &states, &schema, is_pk_unique)),
+            _ => SourceMode::Multi(Self::build_tree(&sources, &states, &schema)),
         };
         let mut cursor = ReadCursor {
             sources,
@@ -193,7 +165,6 @@ impl ReadCursor {
             unified_sources: OnceCell::new(),
             mode,
             schema,
-            is_pk_unique,
             valid: false,
             current_weight: 0,
             current_null_word: 0,
@@ -211,12 +182,7 @@ impl ReadCursor {
     /// before the next `drive`.
     fn rebuild_and_drive(&mut self) {
         if let SourceMode::Multi(_) = &self.mode {
-            self.mode = SourceMode::Multi(Self::build_tree(
-                &self.sources,
-                &self.states,
-                &self.schema,
-                self.is_pk_unique,
-            ));
+            self.mode = SourceMode::Multi(Self::build_tree(&self.sources, &self.states, &self.schema));
         }
         self.drive();
     }
@@ -306,11 +272,11 @@ impl ReadCursor {
 
     /// Gallop the `Multi` loser tree forward to the first head `>= key`, then
     /// drive the first live group. The gallop keys the heap through the shared
-    /// `heap_less_with` order, with the comparator selected by `with_row_cmp!`.
+    /// [`merge::merge_less`] order, with the comparator selected by `with_payload_cmp!`.
     /// Precondition (enforced by [`advance_to`]'s dispatch):
     /// `matches!(self.mode, SourceMode::Multi)` and `key` > the current emitted PK.
     fn seek_forward_multi(&mut self, key: &[u8]) {
-        with_row_cmp!(self.schema, self.is_pk_unique, Self::seek_forward_multi_with, self, key);
+        with_payload_cmp!(self.schema, Self::seek_forward_multi_with, self, key);
     }
 
     /// Gallop the heads forward with the selected `row_cmp`, then drive. The PK
@@ -322,7 +288,7 @@ impl ReadCursor {
     }
 
     /// Maintain the `Multi` loser tree in place while galloping its heads forward
-    /// to `key`, keyed by the shared `heap_less_with(.., row_cmp)` order. Scoping
+    /// to `key`, keyed by the shared [`merge::merge_less`] order. Scoping
     /// the heap/sources/states borrows to this call frees `self` for the caller's
     /// following `drive`. Precondition: `matches!(self.mode, SourceMode::Multi)`.
     fn gallop_heap_forward<RowCmp: RowComparator>(&mut self, key: &[u8], row_cmp: RowCmp) {
@@ -330,7 +296,7 @@ impl ReadCursor {
             SourceMode::Multi(h) => h,
             _ => unreachable!("gallop_heap_forward requires SourceMode::Multi"),
         };
-        let less = heap_less_with(&self.schema, &self.sources, row_cmp);
+        let less = merge::merge_less(&self.schema, &self.sources, row_cmp);
         Self::seek_phase(heap, &self.sources, &mut self.states, key, &less);
     }
 
@@ -442,21 +408,14 @@ impl ReadCursor {
     /// Walk the equal-`key` PK group, invoking `f(&*self)` at each emitted row so
     /// the callback can read the current trace row's columns / weight (e.g.
     /// `write_join_row`, `push_current_row`). Commits `current_*` per row (the
-    /// callback reads through it), but hoists the `with_row_cmp!` dispatch out of
-    /// the loop. `f` must not re-enter the cursor. On return the cursor sits at the
+    /// callback reads through it), but hoists the `with_payload_cmp!` dispatch out
+    /// of the loop. `f` must not re-enter the cursor. On return the cursor sits at the
     /// first row past the group (or `valid == false` at end of source) with every
     /// `current_*` field committed, at `(PK, payload)`-sub-group granularity — the
     /// same group-walk contract as the `while current_pk_eq { advance }` loops it
     /// replaces.
     pub(crate) fn for_each_pk_group_row<F: FnMut(&ReadCursor)>(&mut self, key: &[u8], f: F) {
-        with_row_cmp!(
-            self.schema,
-            self.is_pk_unique,
-            Self::for_each_pk_group_row_with,
-            self,
-            key,
-            f
-        );
+        with_payload_cmp!(self.schema, Self::for_each_pk_group_row_with, self, key, f);
     }
 
     /// Walks the equal-PK group, invoking `f` at each emitted row. The monomorphized
@@ -571,7 +530,8 @@ impl ReadCursor {
         if !self.valid {
             return;
         }
-        with_row_cmp!(self.schema, self.is_pk_unique, Self::advance_with, self);
+        self.pre_step_single();
+        self.drive();
     }
 
     /// Step past the previously-emitted row before a re-drive. Only `Single`
@@ -594,7 +554,7 @@ impl ReadCursor {
 
     #[inline]
     fn drive(&mut self) {
-        with_row_cmp!(self.schema, self.is_pk_unique, Self::drive_with, self);
+        with_payload_cmp!(self.schema, Self::drive_with, self);
     }
 
     /// Commit (or invalidate from) the `(net_weight, source_idx, row)` a drive
@@ -686,7 +646,7 @@ impl ReadCursor {
         }
     }
 
-    /// `Multi` non-PkUnique drive, monomorphized on payload (`row_cmp`).
+    /// `Multi` drive, monomorphized on payload (`row_cmp`).
     /// Precondition: `matches!(self.mode, SourceMode::Multi)`.
     #[inline]
     fn drive_with_inner<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) {
@@ -707,9 +667,9 @@ impl ReadCursor {
         // `same_pk` is the width-agnostic OPK equality (so two distinct wide
         // PKs sharing a prefix never fold); `eq_payload` is payload-only (the
         // PK term is `same_pk`).
-        let less = heap_less_with(schema, sources, row_cmp);
-        let same_pk = super::merge::merge_same_pk(sources);
-        let eq_payload = super::merge::merge_eq_payload(schema, sources, row_cmp);
+        let less = merge::merge_less(schema, sources, row_cmp);
+        let same_pk = merge::merge_same_pk(sources);
+        let eq_payload = merge::merge_eq_payload(schema, sources, row_cmp);
         let emitted = Self::drive_inner(heap, sources, states, less, same_pk, eq_payload);
         self.commit_emitted(emitted);
     }
@@ -723,8 +683,7 @@ impl ReadCursor {
     /// Consumes the emitted group (advances both heads past it), so the next call
     /// opens the next group — the same postcondition `drive_with_inner`'s heap fold
     /// leaves, which is why `advance` must NOT pre-step for a Pair. Monomorphized on
-    /// payload (`row_cmp`); PkUnique passes the trivial `row_cmp` (equal PK ⇒ same
-    /// element).
+    /// payload (`row_cmp`).
     #[inline]
     fn drive_pair_inner<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) {
         debug_assert!(matches!(self.mode, SourceMode::Pair));

@@ -99,10 +99,6 @@ pub struct MappedShard {
     xor8_filter: Option<Xor8>,
     /// Physical byte width of each PK value on disk (8 for U64, 16 for U128/String).
     pub(crate) pk_stride: u8,
-    /// True when `SHARD_FLAG_PK_UNIQUE` is set: this shard contains at most one
-    /// positive-weight row per PK. When all cursor sources carry this flag, the
-    /// payload comparator can be skipped on a cross-source PK tie.
-    pub(crate) is_pk_unique: bool,
 }
 
 // MappedShard does not implement Drop — the owned `mmap: Mmap` field handles

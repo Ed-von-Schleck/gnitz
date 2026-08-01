@@ -660,6 +660,12 @@ pub(crate) fn run_merge<S: ColumnarSource>(
     with_payload_cmp!(schema, run_merge_body, sources, &mut cursors, schema, emit)
 }
 
+/// The payload comparator every merge path is monomorphized over, for a source
+/// type `S`. `Copy` lets one selected comparator forward down a whole call chain
+/// at no cost. `with_payload_cmp!` is what picks the concrete one.
+pub(crate) trait RowComparator<S>: Fn(&SchemaDescriptor, &S, usize, &S, usize) -> Ordering + Copy {}
+impl<S, F> RowComparator<S> for F where F: Fn(&SchemaDescriptor, &S, usize, &S, usize) -> Ordering + Copy {}
+
 /// The (PK, payload) merge comparator trio, shared by the flush/compaction
 /// kernel ([`run_merge_body`]) and the read cursor's loser-tree drives so the
 /// two can never diverge on the §4 total order. All three are `#[inline]`
@@ -677,7 +683,7 @@ pub(crate) fn merge_less<'a, S, RowCmp>(
 ) -> impl Fn(&HeapNode, &HeapNode) -> bool + Copy + 'a
 where
     S: RowSource,
-    RowCmp: Fn(&SchemaDescriptor, &S, usize, &S, usize) -> Ordering + Copy + 'a,
+    RowCmp: RowComparator<S> + 'a,
 {
     move |a, b| {
         let (a_src, a_row) = (a.source_idx as usize, a.row as usize);
@@ -712,7 +718,7 @@ pub(crate) fn merge_eq_payload<'a, S, RowCmp>(
     row_cmp: RowCmp,
 ) -> impl Fn(usize, usize, usize, usize) -> bool + Copy + 'a
 where
-    RowCmp: Fn(&SchemaDescriptor, &S, usize, &S, usize) -> Ordering + Copy + 'a,
+    RowCmp: RowComparator<S> + 'a,
 {
     move |a_src, a_row, b_src, b_row| row_cmp(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Equal
 }
@@ -733,7 +739,7 @@ fn run_merge_body<S, RowCmp>(
     row_cmp: RowCmp,
 ) where
     S: ColumnarSource,
-    RowCmp: Fn(&SchemaDescriptor, &S, usize, &S, usize) -> Ordering + Copy,
+    RowCmp: RowComparator<S>,
 {
     // `less` reads `a.row` / `b.row` from the heap node directly — never
     // touches `cursors` — so it coexists with the `&mut cursors` borrow held
@@ -859,7 +865,7 @@ fn sort_consolidate_inner<RowCmp>(
     writer: &mut DirectWriter,
     row_cmp: RowCmp,
 ) where
-    RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
+    RowCmp: for<'x> RowComparator<MemBatch<'x>>,
 {
     let mut entries: Vec<SortEntry> = (0..n as u32)
         .map(|i| SortEntry {
@@ -899,7 +905,7 @@ pub(crate) fn fold_sorted(batch: &MemBatch, schema: &SchemaDescriptor, writer: &
 #[inline]
 fn fold_with<RowCmp>(n: usize, batch: &MemBatch, schema: &SchemaDescriptor, writer: &mut DirectWriter, row_cmp: RowCmp)
 where
-    RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
+    RowCmp: for<'x> RowComparator<MemBatch<'x>>,
 {
     // Input is already sorted, so the iteration position is the batch row index.
     drain_groups_into(n, batch, schema, writer, row_cmp, |pos| pos);
@@ -924,7 +930,7 @@ fn drain_groups_into<RowCmp>(
     row_cmp: RowCmp,
     resolve: impl Fn(usize) -> usize,
 ) where
-    RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
+    RowCmp: for<'x> RowComparator<MemBatch<'x>>,
 {
     let mut pending_idx = resolve(0);
     let mut pending_weight = batch.get_weight(pending_idx);
