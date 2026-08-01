@@ -68,7 +68,7 @@ fn scatter_col_first(batch: &MemBatch<'_>, indices: &[u32], writer: &mut DirectW
     }
 
     let schema = writer.schema;
-    for (pi, _ci, col) in schema.payload_columns() {
+    for (pi, col) in schema.payload_columns() {
         let cs = col.size() as usize;
         if is_german_string(col.type_code) {
             // Blob relocation is sequential per-row; no way to batch.
@@ -219,7 +219,7 @@ pub fn scatter_multi_source(sources: &[Option<MemBatch<'_>>], rows: &[(u8, u32)]
 
     // One pass per column keeps destination writes sequential.
     let schema = writer.schema;
-    for (pi, _ci, col) in schema.payload_columns() {
+    for (pi, col) in schema.payload_columns() {
         let cs = col.size() as usize;
         if is_german_string(col.type_code) {
             for (out, &(si, ri)) in rows.iter().enumerate() {
@@ -336,7 +336,7 @@ pub(crate) fn scatter_unified_sources_with_weights(
     }
 
     let schema = writer.schema;
-    for (pi, _ci, col) in schema.payload_columns() {
+    for (pi, col) in schema.payload_columns() {
         let cs = col.size() as usize;
         if is_german_string(col.type_code) {
             // Blob relocation is per-row regardless; no way to batch.

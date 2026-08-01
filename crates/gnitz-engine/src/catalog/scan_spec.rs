@@ -580,10 +580,7 @@ fn pk_range_keys(schema: &SchemaDescriptor, range: &RangeDescriptor) -> Result<O
             natives[n_eq] = v;
             // Source and target column are the same here (no index promotion),
             // so the shared encoder's promote step is its identity arm.
-            let cols = schema
-                .pk_columns()
-                .take(n_eq + 1)
-                .map(|(_ord, _ci, col)| (col.type_code, *col));
+            let cols = schema.pk_columns().take(n_eq + 1).map(|(_, col)| (col.type_code, *col));
             crate::schema::key::encode_leading_opk(cols, &natives[..=n_eq])
         },
     ))

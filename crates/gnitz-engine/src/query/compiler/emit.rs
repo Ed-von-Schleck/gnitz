@@ -46,14 +46,14 @@ pub(super) fn ext_schema(
 pub(super) fn union_nullability_merge(a: &SchemaDescriptor, b: &SchemaDescriptor) -> SchemaDescriptor {
     debug_assert_eq!(a.num_columns(), b.num_columns(), "union inputs must share a layout");
     debug_assert_eq!(a.pk_indices(), b.pk_indices(), "union inputs must share a layout");
-    let mut cols = [SchemaColumn::EMPTY; crate::schema::MAX_COLUMNS];
-    for (c, col) in cols[..a.num_columns()].iter_mut().enumerate() {
-        let ac = a.columns[c];
-        let bc = b.columns[c];
-        debug_assert_eq!(ac.type_code, bc.type_code, "union inputs must share a layout");
-        *col = SchemaColumn::new(ac.type_code, ac.nullable | bc.nullable);
-    }
-    SchemaDescriptor::new(&cols[..a.num_columns()], a.pk_indices())
+    let cols: Vec<SchemaColumn> = (0..a.num_columns())
+        .map(|c| {
+            let (ac, bc) = (a.columns[c], b.columns[c]);
+            debug_assert_eq!(ac.type_code, bc.type_code, "union inputs must share a layout");
+            SchemaColumn::new(ac.type_code, ac.nullable | bc.nullable)
+        })
+        .collect();
+    SchemaDescriptor::new(&cols, a.pk_indices())
 }
 
 /// Path of a per-worker scratch directory under `view_dir`. Rank-stamped because
@@ -888,7 +888,7 @@ pub(super) fn emit_reduce(
             || unsharded
             || worker_rank() as usize
                 == crate::ops::worker_for_partition(
-                    crate::schema::key::partition_for_key(crate::ops::global_group_key()),
+                    gnitz_wire::partition_for_key(crate::ops::global_group_key()),
                     num_workers() as usize,
                 ));
 

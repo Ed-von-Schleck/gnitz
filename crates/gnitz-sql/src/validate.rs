@@ -122,13 +122,21 @@ pub(crate) fn reject_float_keys(source_schema: &Schema, indices: &[usize]) -> Re
 /// shared allow-list (fixed-width integer, U128, UUID).
 pub(crate) fn reject_non_key_eligible(name: &str, tc: TypeCode, role: &str) -> Result<(), GnitzSqlError> {
     if !tc.is_pk_eligible() {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "{role} column '{name}' of type {tc:?} is not supported \
-             ({role} must be a fixed-width integer, U128, or UUID column; \
-             String, Blob, and float columns cannot be a {role} key)"
-        )));
+        return Err(non_key_eligible_error(name, tc, role));
     }
     Ok(())
+}
+
+/// The named-column rendering of "this type cannot be a key column" — the
+/// planner's half of `gnitz_wire::PkRule::NotEligible`, split out so the
+/// CREATE TABLE path can raise the identical message from the shared rule's
+/// verdict instead of re-testing eligibility itself.
+pub(crate) fn non_key_eligible_error(name: &str, tc: TypeCode, role: &str) -> GnitzSqlError {
+    GnitzSqlError::Unsupported(format!(
+        "{role} column '{name}' of type {tc:?} is not supported \
+         ({role} must be a fixed-width integer, U128, or UUID column; \
+         String, Blob, and float columns cannot be a {role} key)"
+    ))
 }
 
 /// The single spelling of an "unhonored clause" rejection. `reject_unhonored_select_clauses`,

@@ -80,7 +80,7 @@ fn compare_rows_impl<const SKIP: bool, A: RowSource, B: RowSource>(
     // the hottest comparator in the merge path.
     let (blob_a, blob_b) = (src_a.blob(), src_b.blob());
 
-    for (payload_col, _ci, col) in schema.payload_columns() {
+    for (payload_col, col) in schema.payload_columns() {
         if SKIP && (skip_mask >> payload_col) & 1 != 0 {
             continue;
         }
@@ -213,33 +213,21 @@ fn gallop_lower_bound_bytes<'a>(count: usize, key: &[u8], hint: usize, get: impl
 // wider PKs fall back to the byte search.
 // ---------------------------------------------------------------------------
 
-/// Shared stride→register-width dispatch for the two OPK seek entry points
-/// below: load the probe and each row key through the width-matched
-/// `PkSortKey` and hand the resulting `lt` predicate to the given search;
-/// strides past the register widths take the byte-`memcmp` fallback. A local
-/// macro by design — the schema/key layer does not export a cross-layer
-/// dispatch, and the two searches (stateless vs. galloping) stay separate
-/// algorithms behind one width dispatch.
+/// Binds the probe and row keys of the two OPK seek entry points below to the
+/// width-matched `PkSortKey` and hands the resulting `lt` predicate to the given
+/// search; the width taxonomy itself is `key::pk_width_dispatch`. The two
+/// searches (stateless vs. galloping) stay separate algorithms behind it.
 macro_rules! opk_width_dispatch {
     ($stride:expr, $key:expr, $get:expr, |$lt:ident| $search:expr, $bytes_fallback:expr) => {
-        match $stride {
-            0..=8 => {
-                let p = u64::from_opk($key);
-                let $lt = |i: usize| u64::from_opk($get(i)) < p;
+        crate::schema::key::pk_width_dispatch!(
+            $stride,
+            |K| {
+                let p = K::from_opk($key);
+                let $lt = |i: usize| K::from_opk($get(i)) < p;
                 $search
-            }
-            9..=16 => {
-                let p = u128::from_opk($key);
-                let $lt = |i: usize| u128::from_opk($get(i)) < p;
-                $search
-            }
-            17..=32 => {
-                let p = <[u128; 2]>::from_opk($key);
-                let $lt = |i: usize| <[u128; 2]>::from_opk($get(i)) < p;
-                $search
-            }
-            _ => $bytes_fallback,
-        }
+            },
+            $bytes_fallback
+        )
     };
 }
 
@@ -308,7 +296,7 @@ pub(crate) fn compare_rows_fixedint_nonnull<A: RowSource, B: RowSource>(
         schema_is_fixedint_nonnull(schema),
         "compare_rows_fixedint_nonnull on a non-fixedint or nullable schema",
     );
-    for (payload_col, _ci, col) in schema.payload_columns() {
+    for (payload_col, col) in schema.payload_columns() {
         let cs = col.size() as usize;
         // Branchless sign-flip: signed columns flip their MSB so two's-complement
         // negatives sort below non-negatives; `is_signed` is 0 for unsigned

@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 
-use crate::schema::key::compare_pk_bytes;
+use crate::schema::key::{compare_pk_bytes, pk_width_dispatch};
 use crate::schema::{key::PkSortKey, ColumnLocator, SchemaDescriptor, TypeCode};
 use crate::storage::{cmp_col_window, Batch, MemBatch};
 use gnitz_expr::RowSource;
@@ -152,16 +152,11 @@ fn sort_indices_keyed<K: PkSortKey>(mb: &MemBatch) -> Vec<u32> {
 /// PKs alike. PKs too wide to pack (`> 32` B — exotic 3–5 wide-column
 /// composites) byte-walk the OPK regions via `compare_pk_bytes`.
 pub(super) fn argsort_pk_canonical(mb: &MemBatch) -> Vec<u32> {
-    match mb.pk_stride as usize {
-        0..=8 => sort_indices_keyed::<u64>(mb),
-        9..=16 => sort_indices_keyed::<u128>(mb),
-        17..=32 => sort_indices_keyed::<[u128; 2]>(mb),
-        _ => {
-            let mut idx: Vec<u32> = (0..mb.count as u32).collect();
-            idx.sort_unstable_by(|&a, &b| compare_pk_bytes(mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize)));
-            idx
-        }
-    }
+    pk_width_dispatch!(mb.pk_stride as usize, |K| sort_indices_keyed::<K>(mb), {
+        let mut idx: Vec<u32> = (0..mb.count as u32).collect();
+        idx.sort_unstable_by(|&a, &b| compare_pk_bytes(mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize)));
+        idx
+    })
 }
 
 #[cfg(test)]

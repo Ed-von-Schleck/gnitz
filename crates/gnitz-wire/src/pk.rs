@@ -192,7 +192,10 @@ pub fn encode_pk_column_promoted(src: &[u8], src_tc: u8, target_tc: u8, dst: &mu
 /// `widen_pk_be_matches_the_general_form` pins every stride against it.
 #[inline(always)]
 pub fn widen_pk_be(pk_bytes: &[u8], stride: usize) -> u128 {
-    debug_assert!(stride <= 16, "widen_pk_be: wide PK region (stride {stride})");
+    debug_assert!(
+        stride <= NARROW_PK_MAX_BYTES,
+        "widen_pk_be: wide PK region (stride {stride})"
+    );
     match stride {
         16 => u128::from_be_bytes(pk_bytes[..16].try_into().unwrap()),
         8 => u64::from_be_bytes(pk_bytes[..8].try_into().unwrap()) as u128,
@@ -269,6 +272,44 @@ pub fn promote_opk_column(src_opk: &[u8], src_tc: u8, target_tc: u8, dst: &mut [
     // the encoder wants.
     let native = decode_pk_column_owned(src_opk, src_tc);
     encode_pk_column_promoted(&native[..src_opk.len()], src_tc, target_tc, dst);
+}
+
+/// Widest PK region that still fits in a packed `u128` word, the boundary where
+/// a key stops fitting one register. At or below it [`widen_pk_be`] recovers the
+/// exact key as a `u128` (wider regions must be read as bytes) and
+/// [`partition_for_pk_bytes`] routes through that value; above it a key is
+/// ordered and hashed as raw bytes.
+pub const NARROW_PK_MAX_BYTES: usize = 16;
+
+/// Route a native PK value to a partition.
+///
+/// Multiplicative hash: two Fibonacci multipliers XOR'd together. ~4
+/// instructions vs ~20 for XXH3-64; distribution across 256 buckets is
+/// sufficient for worker routing. XXH3 is reserved for filters (xor8, bloom)
+/// where collision quality matters.
+#[inline(always)]
+pub fn partition_for_key(pk: u128) -> usize {
+    let lo = pk as u64;
+    let hi = (pk >> 64) as u64;
+    let h = lo.wrapping_mul(0x9e3779b97f4a7c15_u64) ^ hi.wrapping_mul(0x6c62272e07bb0142_u64);
+    (h >> 56) as usize
+}
+
+/// Route an OPK PK region (any width) to a partition. For a narrow region the
+/// OPK bytes are big-endian, so [`widen_pk_be`] right-aligns them to recover the
+/// native unsigned value (sign-flipped for signed) and the result is
+/// `partition_for_key(widen_pk_be(bytes))` by construction. This is the
+/// invariant the join router relies on: `extract_col_key` (both PK and
+/// OPK-encoded payload paths) also funnels through `widen_pk_be`, so the two
+/// sides of a distributed join agree. For wide regions it takes the top 8 bits
+/// of xxh3 of the OPK bytes directly (uniformly distributed already).
+#[inline]
+pub fn partition_for_pk_bytes(bytes: &[u8]) -> usize {
+    if bytes.len() <= NARROW_PK_MAX_BYTES {
+        partition_for_key(widen_pk_be(bytes, bytes.len()))
+    } else {
+        (crate::checksum(bytes) >> 56) as usize
+    }
 }
 
 // Two distinct key spaces derive a `u128` from a column. They coincide for

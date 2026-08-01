@@ -86,7 +86,7 @@ pub(crate) fn mem_batch_to_unified(mb: &MemBatch, schema: &SchemaDescriptor) -> 
         base: std::ptr::null(),
         stride: 0,
     }; MAX_COLUMNS - 1];
-    for (pi, _ci, col) in schema.payload_columns() {
+    for (pi, col) in schema.payload_columns() {
         let off = mb.offsets[super::batch::REG_PAYLOAD_START + pi];
         cols[pi] = ColPtr {
             base: unsafe { data_ptr.add(off) },
@@ -574,7 +574,7 @@ impl<'a> DirectWriter<'a> {
         // is a German string, so skip the per-column null test and string-type
         // branch and copy each cell straight through.
         if schema_is_fixedint_nonnull(schema) {
-            for (payload_idx, _ci, col) in schema.payload_columns() {
+            for (payload_idx, col) in schema.payload_columns() {
                 let col_size = col.size() as usize;
                 let off = out_row * col_size;
                 let src = batch.get_col_ptr(row, payload_idx, col_size);
@@ -583,7 +583,7 @@ impl<'a> DirectWriter<'a> {
             return;
         }
 
-        for (payload_idx, _ci, col) in schema.payload_columns() {
+        for (payload_idx, col) in schema.payload_columns() {
             let col_size = col.size() as usize;
             let is_null = gnitz_wire::null_word_get(null_word, payload_idx);
 
@@ -2678,7 +2678,7 @@ mod tests {
             let mut pk = vec![0u8; rows * pk_stride];
             let mut wt = vec![0u8; rows * 8];
             let mut nb = vec![0u8; rows * 8];
-            let col_sizes: Vec<usize> = schema.payload_columns().map(|(_, _, c)| c.size() as usize).collect();
+            let col_sizes: Vec<usize> = schema.payload_columns().map(|(_, c)| c.size() as usize).collect();
             let mut cols: Vec<Vec<u8>> = col_sizes.iter().map(|&cs| vec![0u8; rows * cs]).collect();
             let mut blob: Vec<u8> = Vec::with_capacity(total_blob.max(1));
             let count;
@@ -2718,7 +2718,7 @@ mod tests {
                     let nw = gnitz_wire::read_u64_le(&out.nb, i * 8);
                     let cells = schema
                         .payload_columns()
-                        .map(|(pi, _ci, col)| {
+                        .map(|(pi, col)| {
                             let cs = col.size() as usize;
                             if gnitz_wire::null_word_get(nw, pi) {
                                 CellVal::Null

@@ -49,7 +49,7 @@ mod tests {
             batch.extend_weight(&weights[i].to_le_bytes());
             batch.extend_null_bmp(&0u64.to_le_bytes());
 
-            for (pi, _ci, col) in schema.payload_columns() {
+            for (pi, col) in schema.payload_columns() {
                 let cs = col.size() as usize;
                 let mut val_bytes = vec![0u8; cs];
                 let copy_len = cs.min(8);
@@ -1167,7 +1167,7 @@ mod tests {
                 let nw = shard.get_null_word(i);
                 let cells = schema
                     .payload_columns()
-                    .map(|(pi, _ci, col)| {
+                    .map(|(pi, col)| {
                         let cs = col.size() as usize;
                         if gnitz_wire::null_word_get(nw, pi) {
                             DiffCell::Null

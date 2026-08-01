@@ -473,12 +473,11 @@ fn index_range_keys(
     // uses (`write_span`/`batch_project_index` — byte-identical by construction).
     // `seek_prefix` returns it as a `PkBuf` whose zero tail makes `group(v)` IS
     // `pad(group(v))`.
-    let spec = ic.key_spec.prefix(n_eq + 1);
     let mut natives = [0u128; gnitz_wire::PK_LIST_MAX_COLS];
     natives[..n_eq].copy_from_slice(eq_natives);
     Ok(crate::storage::range_keys_from_cuts(range, idx_pk_stride, |v| {
         natives[n_eq] = v;
-        spec.seek_prefix(&natives[..=n_eq])
+        ic.key_spec.seek_prefix(&natives[..=n_eq])
     }))
 }
 

@@ -292,6 +292,32 @@ impl ReduceOutKey {
     /// The one precedence chain (eq-PK ▷ single-natural ▷ synthetic). Planner
     /// decision and engine validation both route through here, each feeding its
     /// own schema representation's two predicates, so the sides cannot drift.
+    /// The whole decision from the facts both sides already hold: the source's
+    /// PK column list, the GROUP BY column list, and a `(type_code, nullable)`
+    /// reader for a group column.
+    ///
+    /// The planner decides with this and ships the verdict; the engine
+    /// re-derives it here to *validate* what was shipped, and rejects the
+    /// circuit on a mismatch. Since a disagreement is what that check is
+    /// looking for, the two predicates it compares — the PK-permutation test and
+    /// the single-natural-column test — must not themselves be written twice,
+    /// or the check compares two independent implementations rather than one
+    /// rule against one transmission.
+    pub fn for_group_cols(pk_cols: &[u32], group_cols: &[u32], col: impl Fn(u32) -> (u8, bool)) -> Self {
+        // A permutation, not a prefix: the SQL may list PK columns in any order.
+        let eq_pk = group_cols.len() == pk_cols.len() && pk_cols.iter().all(|p| group_cols.contains(p));
+        let single_natural = match *group_cols {
+            [c] => {
+                let (type_code, nullable) = col(c);
+                // A nullable column can never key the output: the PK region
+                // carries no null bitmap.
+                !nullable && crate::TypeCode::try_from_u8(type_code).is_some_and(|t| t.is_natural_reduce_key())
+            }
+            _ => false,
+        };
+        Self::decide(eq_pk, single_natural)
+    }
+
     pub fn decide(group_cols_eq_pk: bool, single_col_natural: bool) -> Self {
         if group_cols_eq_pk {
             ReduceOutKey::PkPermutation

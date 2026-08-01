@@ -264,7 +264,7 @@ fn validate_string_heap_extents(mb: &MemBatch<'_>, schema: &SchemaDescriptor) ->
     if !schema.has_german_string() {
         return Ok(());
     }
-    for (pi, _ci, col) in schema.payload_columns() {
+    for (pi, col) in schema.payload_columns() {
         if !gnitz_wire::is_german_string(col.type_code) {
             continue;
         }

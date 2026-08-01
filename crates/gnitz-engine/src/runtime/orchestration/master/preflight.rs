@@ -187,7 +187,7 @@ fn build_check_batch_with<K>(
         push_pk(&mut batch, key);
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&null_word.to_le_bytes());
-        for (c, _ci, col) in schema.payload_columns() {
+        for (c, col) in schema.payload_columns() {
             batch.fill_col_zero(c, col.size() as usize);
         }
         batch.count += 1;
@@ -735,7 +735,7 @@ struct UniquePlan {
 /// found-set (which echoes matched probe keys) compares identical byte images.
 fn enc_key(schema: &SchemaDescriptor, v: u128, src_type: u8) -> PkBuf {
     let (stride, idx_key_type) = opk_leading_key(schema);
-    PkBuf::from_bytes(crate::schema::key::index_opk_prefix(v, src_type, idx_key_type).padded(stride))
+    crate::schema::key::index_opk_prefix(v, src_type, idx_key_type).widened(stride)
 }
 
 impl MasterDispatcher {

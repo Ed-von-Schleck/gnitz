@@ -387,7 +387,7 @@ impl MappedShard {
         expand_weight(&self.weight, &mut data[offsets[REG_WEIGHT]..][..sz8]);
         expand_scalar(&self.null_bmp, 8, &mut data[offsets[REG_NULL_BMP]..][..sz8]);
 
-        for (pi, _ci, col) in schema.payload_columns() {
+        for (pi, col) in schema.payload_columns() {
             let stride = col.size() as usize;
             let off = offsets[REG_PAYLOAD_START + pi];
             let sz = row_count * stride;
@@ -440,7 +440,7 @@ impl MappedShard {
             base: ptr::null(),
             stride: 0,
         }; MAX_COLUMNS - 1];
-        for (pi, _ci, col) in schema.payload_columns() {
+        for (pi, col) in schema.payload_columns() {
             let cs = col.size() as usize;
             cols[pi] = match &self.col_regions[pi] {
                 PayloadRegion::Scalar(s) => s.to_col_ptr(data_ptr, cs),

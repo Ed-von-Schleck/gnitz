@@ -18,7 +18,9 @@ use super::super::reindex::ReindexPacker;
 #[cfg(test)]
 use super::router::worker_for_partition;
 #[cfg(test)]
-use crate::schema::key::{compare_pk_bytes, partition_for_key, partition_for_pk_bytes};
+use crate::schema::key::compare_pk_bytes;
+#[cfg(test)]
+use gnitz_wire::{partition_for_key, partition_for_pk_bytes};
 
 // Thread-local pool: reuse Vec<Vec<(u8,u32)>> worker-row scratch across calls.
 thread_local! {

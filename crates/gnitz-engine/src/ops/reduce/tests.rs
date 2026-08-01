@@ -7699,7 +7699,7 @@ fn zset_canonical(
         let pk = b.get_pk_bytes(r).to_vec();
         let nw = b.get_null_word(r);
         let mut payload = Vec::new();
-        for (pi, _ci, col) in out_schema.payload_columns() {
+        for (pi, col) in out_schema.payload_columns() {
             let cs = col.size() as usize;
             payload.extend_from_slice(&b.col_data(pi)[r * cs..r * cs + cs]);
         }

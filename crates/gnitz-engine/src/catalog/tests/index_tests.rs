@@ -2376,7 +2376,7 @@ fn test_seek_prefix_matches_projection() {
     };
     assert_eq!(projected.count, 1);
 
-    let key_size: usize = (0..2).map(|i| idx.columns[i].size() as usize).sum();
+    let key_size = idx.leading_key_size(2);
     let proj_key = &projected.get_pk_bytes(0)[..key_size];
 
     let spec = IndexKeySpec::new(&[1, 2], &src, &idx);
@@ -2620,7 +2620,7 @@ fn composite_index_signed_leading_unsigned_tiebreak_orders() {
         &[0],
     );
     let idx = make_index_schema(&[1, 2], &src).unwrap();
-    let key_size: usize = (0..2).map(|i| idx.columns[i].size() as usize).sum();
+    let key_size = idx.leading_key_size(2);
     // (a, b) in strictly ascending numeric order — including same-`a` tie pairs.
     let rows: &[(i32, u64)] = &[(i32::MIN, 5), (-1, 0), (-1, 9), (0, 0), (0, 1), (1, 0), (i32::MAX, 7)];
     let mut spans: Vec<Vec<u8>> = Vec::new();

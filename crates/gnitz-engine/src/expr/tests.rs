@@ -13,7 +13,7 @@ fn make_int_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, u64, &[i64])]) -
         batch.extend_pk(pk as u128);
         batch.extend_weight(&weight.to_le_bytes());
         batch.extend_null_bmp(&null_word.to_le_bytes());
-        for (pi, _ci, _col) in schema.payload_columns() {
+        for (pi, _col) in schema.payload_columns() {
             if pi < cols.len() {
                 batch.extend_col(pi, &cols[pi].to_le_bytes());
             }

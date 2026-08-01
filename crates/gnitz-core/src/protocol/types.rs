@@ -99,6 +99,23 @@ pub struct Schema {
     pub pk_cols: Vec<usize>,
 }
 
+/// The client's rendering of a [`gnitz_wire::PkRule`]. The rule set itself lives
+/// in `gnitz-wire` and is shared with the SQL planner and the engine catalog;
+/// only the wording is per-layer. The client's is a `&'static str` so its DDL
+/// gateways and the C ABI stay allocation-free on the error path.
+fn pk_rule_message(rule: gnitz_wire::PkRule) -> &'static str {
+    use gnitz_wire::PkRule;
+    match rule {
+        PkRule::Empty => "pk_cols must not be empty",
+        PkRule::TooManyColumns { .. } => "pk_cols exceeds PK_LIST_MAX_COLS",
+        PkRule::IndexOutOfRange { .. } => "pk_cols index out of range",
+        PkRule::Duplicate { .. } => "pk_cols contains duplicates",
+        PkRule::Nullable { .. } => "PK column must be non-nullable",
+        PkRule::NotEligible { .. } => "PK column type not PK-eligible",
+        PkRule::StrideOutOfRange { .. } => "PK total stride exceeds MAX_PK_BYTES",
+    }
+}
+
 impl Schema {
     /// Number of logical columns in this schema (PK + payload).
     #[inline]
@@ -238,16 +255,15 @@ impl Schema {
 
     /// The output-key kind a reduce grouped by `cols` over this schema gets —
     /// the planner-side decision shipped on the wire and validated (never
-    /// re-decided) by the engine, both through [`ReduceOutKey::decide`]. A
-    /// nullable group column can never key the output (the PK region has no
-    /// null bitmap), so it lands on the synthetic fold.
+    /// re-decided) by the engine, both through
+    /// [`ReduceOutKey::for_group_cols`].
     pub fn reduce_out_key(&self, cols: &[usize]) -> ReduceOutKey {
-        let eq_pk = cols.len() == self.pk_cols.len() && self.pk_cols.iter().all(|p| cols.contains(p));
-        let single_natural = cols.len() == 1 && {
-            let c = &self.columns[cols[0]];
-            c.type_code.is_natural_reduce_key() && !c.is_nullable
-        };
-        ReduceOutKey::decide(eq_pk, single_natural)
+        let pk: Vec<u32> = self.pk_cols.iter().map(|&c| c as u32).collect();
+        let group: Vec<u32> = cols.iter().map(|&c| c as u32).collect();
+        ReduceOutKey::for_group_cols(&pk, &group, |c| {
+            let cd = &self.columns[c as usize];
+            (cd.type_code as u8, cd.is_nullable)
+        })
     }
 
     /// Validate a candidate PK index list against the schema's arity and
@@ -260,24 +276,8 @@ impl Schema {
     /// secondary-index schema that uses the extra `MAX_PK_COLUMNS` slot, so a
     /// PK they accept must round-trip through the codec.
     pub fn validate_pk_cols(pk_cols: &[usize], ncols: usize) -> Result<(), &'static str> {
-        if pk_cols.is_empty() {
-            return Err("pk_cols must not be empty");
-        }
-        if pk_cols.len() > PK_LIST_MAX_COLS {
-            return Err("pk_cols exceeds PK_LIST_MAX_COLS");
-        }
-        if pk_cols.iter().any(|&c| c >= ncols) {
-            return Err("pk_cols index out of range");
-        }
-        // O(n²) is faster than HashSet for n ≤ 5.
-        for i in 0..pk_cols.len() {
-            for j in i + 1..pk_cols.len() {
-                if pk_cols[i] == pk_cols[j] {
-                    return Err("pk_cols contains duplicates");
-                }
-            }
-        }
-        Ok(())
+        let idx: Vec<u32> = pk_cols.iter().map(|&c| c.min(u32::MAX as usize) as u32).collect();
+        gnitz_wire::validate_pk_indices(&idx, ncols).map_err(pk_rule_message)
     }
 
     /// The single definition of "these parts form an admissible schema": the
@@ -294,15 +294,13 @@ impl Schema {
             return Err("column count exceeds MAX_COLUMNS");
         }
         Self::validate_pk_cols(pk_cols, columns.len())?;
-        for &pk in pk_cols {
-            if columns[pk].is_nullable {
-                return Err("PK column must be non-nullable");
-            }
-            if !columns[pk].type_code.is_pk_eligible() {
-                return Err("PK column type not PK-eligible");
-            }
-        }
-        Ok(())
+        let idx: Vec<u32> = pk_cols.iter().map(|&c| c as u32).collect();
+        gnitz_wire::validate_pk_column_types(&idx, |c| {
+            let cd = &columns[c as usize];
+            (cd.type_code as u8, cd.is_nullable)
+        })
+        .map(|_stride| ())
+        .map_err(pk_rule_message)
     }
 
     /// Fallible constructor for a schema assembled from untrusted parts — a

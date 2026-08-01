@@ -78,10 +78,7 @@ pub(crate) fn range_keys_from_cuts(
         if matches!(c, Cut::After(_)) && !increment_key_in_place(&mut k.bytes[..prefix_len]) {
             return None;
         }
-        // Widening the prefix to the full `stride` is a `len` bump: the tail past
-        // a `PkBuf`'s `len` is zero by construction.
-        k.len = stride as u8;
-        Some(k)
+        Some(k.widened(stride))
     };
     let start = cut_key(range.start)?;
     let end = cut_key(range.end);

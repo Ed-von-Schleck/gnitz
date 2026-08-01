@@ -41,7 +41,7 @@ use gnitz_expr::RowSource;
 /// sort below chunk N's last, which is why the sweep must stay backward-capable.
 fn gather_source_rows(
     src_cursor: &mut ReadCursor,
-    src_schema: SchemaDescriptor,
+    src_schema: &SchemaDescriptor,
     pks: &[PkBuf],
     spec: &IndexKeySpec,
     lo: &[u8],
@@ -54,7 +54,7 @@ fn gather_source_rows(
     // Phase 1 — candidates: every live row of each PK group. An index owner is
     // always a base table (one live payload per PK), so `pks.len()` sizes it
     // exactly.
-    let mut cand = Batch::with_capacity(src_schema, pks.len());
+    let mut cand = Batch::with_capacity(*src_schema, pks.len());
     for pk in pks {
         // A `false` return means no base row at or past `pk` exists. `pks`
         // ascends within the chunk, so every remaining probe is larger and
@@ -112,7 +112,7 @@ fn row_in_index_range(
 /// string spans over the wire.
 fn retain_in_index_range(
     cand: Batch,
-    src_schema: SchemaDescriptor,
+    src_schema: &SchemaDescriptor,
     spec: &IndexKeySpec,
     lo: &[u8],
     hi: Option<&[u8]>,
@@ -148,7 +148,7 @@ fn retain_in_index_range(
     if keep.is_empty() {
         return None;
     }
-    let mut out = Batch::with_capacity(src_schema, crate::storage::range_rows(&keep));
+    let mut out = Batch::with_capacity(*src_schema, crate::storage::range_rows(&keep));
     out.append_ranges(&cand, &keep);
     Some(out)
 }
@@ -269,7 +269,7 @@ impl BoundedIndexCursor {
         // that escape would silently truncate the view mid-range.
         let mut batch = gather_source_rows(
             &mut self.src,
-            self.src_schema,
+            &self.src_schema,
             &self.pks,
             &self.spec,
             self.start.pk_bytes(),

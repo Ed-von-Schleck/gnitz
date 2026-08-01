@@ -273,7 +273,7 @@ pub fn op_null_extend(batch: &Batch, in_schema: &SchemaDescriptor, out_schema: &
     output.weight_data_mut().copy_from_slice(batch.weight_data());
 
     // Copy input payload columns
-    for (pi, _ci, col) in in_schema.payload_columns() {
+    for (pi, col) in in_schema.payload_columns() {
         let stride = col.size() as usize;
         output
             .col_data_mut(pi)
@@ -665,7 +665,7 @@ mod tests {
     /// the input PK — what `emit.rs` bakes and `exec.rs` passes to the op.
     fn null_extend_out_schema(in_schema: &SchemaDescriptor, right_schema: &SchemaDescriptor) -> SchemaDescriptor {
         let mut cols: Vec<SchemaColumn> = (0..in_schema.num_columns()).map(|ci| in_schema.columns[ci]).collect();
-        for (_, _, col) in right_schema.payload_columns() {
+        for (_, col) in right_schema.payload_columns() {
             let mut c = *col;
             c.nullable = 1;
             cols.push(c);

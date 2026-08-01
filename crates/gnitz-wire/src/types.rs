@@ -346,6 +346,119 @@ pub fn index_key_types(col_types: &[u8], src_pk_count: usize, src_pk_stride: usi
     Ok(promoted)
 }
 
+/// Which rule a candidate primary key broke. Returned by
+/// [`validate_pk_indices`] / [`validate_pk_column_types`] instead of a formatted
+/// string so each layer can render its own message — the SQL planner names the
+/// offending column, the catalog quotes the type code, the client returns a
+/// `&'static str` — while the *rule set itself* stays in one place. `Display`
+/// gives the neutral wording for callers that need no decoration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PkRule {
+    /// No PK columns at all. Every base table has an enforced primary key.
+    Empty,
+    /// Arity past [`PK_LIST_MAX_COLS`], the persisted PK-list codec capacity.
+    TooManyColumns { count: usize },
+    /// A PK index that names no column.
+    IndexOutOfRange { col: u32 },
+    /// The same column listed twice — it would double-count in the stride and
+    /// yield duplicates from the PK-column walk.
+    Duplicate { col: u32 },
+    /// STRING/BLOB (an unrelocatable heap offset) or a float (IEEE-754 breaks
+    /// the byte-equal key contract the OPK encoder rests on).
+    NotEligible { col: u32, type_code: u8 },
+    /// The PK region carries no null bitmap, so a NULL has nowhere to live.
+    Nullable { col: u32 },
+    /// The packed PK region must fit [`MAX_PK_BYTES`].
+    StrideOutOfRange { stride: usize },
+}
+
+impl core::fmt::Display for PkRule {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            PkRule::Empty => write!(f, "primary key must name at least one column"),
+            PkRule::TooManyColumns { count } => {
+                write!(
+                    f,
+                    "primary key column count {count} out of range 1..={}",
+                    crate::PK_LIST_MAX_COLS
+                )
+            }
+            PkRule::IndexOutOfRange { col } => write!(f, "primary key index {col} out of bounds"),
+            PkRule::Duplicate { col } => write!(f, "primary key names column {col} twice"),
+            PkRule::NotEligible { col, type_code } => write!(
+                f,
+                "primary key column {col} has type_code {type_code}; only fixed-width integer, \
+                 U128, UUID, and I128 columns can be PK columns \
+                 (String, Blob, and float columns cannot)"
+            ),
+            PkRule::Nullable { col } => write!(f, "primary key column {col} must not be nullable"),
+            PkRule::StrideOutOfRange { stride } => write!(
+                f,
+                "primary key total stride must be 1..={} bytes, got {stride}",
+                crate::MAX_PK_BYTES
+            ),
+        }
+    }
+}
+
+/// The structural half of the primary-key admission rule: non-empty, within the
+/// [`crate::PK_LIST_MAX_COLS`] arity cap, every index naming a real column, no
+/// duplicates. Needs only the PK list and the column count, so the surfaces that
+/// build a PK before their columns exist (the C ABI) can run it on its own.
+pub fn validate_pk_indices(pk_cols: &[u32], ncols: usize) -> Result<(), PkRule> {
+    if pk_cols.is_empty() {
+        return Err(PkRule::Empty);
+    }
+    if pk_cols.len() > crate::PK_LIST_MAX_COLS {
+        return Err(PkRule::TooManyColumns { count: pk_cols.len() });
+    }
+    for (j, &c) in pk_cols.iter().enumerate() {
+        if c as usize >= ncols {
+            return Err(PkRule::IndexOutOfRange { col: c });
+        }
+        if pk_cols[..j].contains(&c) {
+            return Err(PkRule::Duplicate { col: c });
+        }
+    }
+    Ok(())
+}
+
+/// The typed half: every PK column PK-eligible and non-nullable, and the packed
+/// region within [`MAX_PK_BYTES`]. `col` yields `(type_code, nullable)` for a PK
+/// index and may assume it is in range — run [`validate_pk_indices`] first (or
+/// [`validate_pk_tuple`], which runs both). Returns the validated `pk_stride`,
+/// which every caller needs next.
+///
+/// Base-table counterpart of [`index_key_types`], which enforces the same two
+/// limits for a secondary index's record layout.
+pub fn validate_pk_column_types(pk_cols: &[u32], col: impl Fn(u32) -> (u8, bool)) -> Result<usize, PkRule> {
+    let mut stride = 0usize;
+    for &c in pk_cols {
+        let (type_code, nullable) = col(c);
+        if !is_pk_eligible(type_code) {
+            return Err(PkRule::NotEligible { col: c, type_code });
+        }
+        if nullable {
+            return Err(PkRule::Nullable { col: c });
+        }
+        stride += wire_stride(type_code);
+    }
+    // `stride == 0` is unreachable once every column passed `is_pk_eligible`
+    // (each eligible type is ≥ 1 byte); rejected explicitly so an empty list
+    // reaching here through the typed half alone cannot pass.
+    if stride == 0 || stride > crate::MAX_PK_BYTES {
+        return Err(PkRule::StrideOutOfRange { stride });
+    }
+    Ok(stride)
+}
+
+/// Both halves of the primary-key admission rule, for the callers that hold the
+/// columns up front. Returns the validated `pk_stride`.
+pub fn validate_pk_tuple(pk_cols: &[u32], ncols: usize, col: impl Fn(u32) -> (u8, bool)) -> Result<usize, PkRule> {
+    validate_pk_indices(pk_cols, ncols)?;
+    validate_pk_column_types(pk_cols, col)
+}
+
 /// Whether a raw wire type code uses the 16-byte German-string layout. u8-based
 /// counterpart to [`TypeCode::is_german_string`] for callers holding a raw
 /// `type_code` (mirrors the free `wire_stride`/`is_pk_eligible`). Unknown codes

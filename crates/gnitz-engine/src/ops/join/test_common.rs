@@ -15,7 +15,7 @@ pub(super) use crate::test_support::{
 /// schemas are PK-leading, so the plain concatenation matches.
 pub(super) fn join_out_schema(left: &SchemaDescriptor, right: &SchemaDescriptor) -> SchemaDescriptor {
     let mut cols: Vec<SchemaColumn> = (0..left.num_columns()).map(|ci| left.columns[ci]).collect();
-    for (_, _, col) in right.payload_columns() {
+    for (_, col) in right.payload_columns() {
         cols.push(*col);
     }
     SchemaDescriptor::new(&cols, left.pk_indices())

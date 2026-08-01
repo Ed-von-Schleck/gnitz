@@ -181,7 +181,7 @@ pub(in crate::storage) fn compute_offsets(
 /// Returns the next free index (i.e. `start + num_payload_cols`).
 fn fill_payload_strides(schema: &SchemaDescriptor, strides: &mut [u8; MAX_BATCH_REGIONS], start: usize) -> usize {
     let mut idx = start;
-    for (_, _, col) in schema.payload_columns() {
+    for (_, col) in schema.payload_columns() {
         // A join carries both sides' payload columns through the intermediate
         // batch, so two wide tables can drive `idx` past the region limit. Turn
         // the would-be bare index-OOB into a named diagnostic (the correct
@@ -986,7 +986,7 @@ impl Batch {
             if !src.blob.is_empty() {
                 self.blob.reserve(src.blob.len());
             }
-            for (pi, _ci, col) in s.payload_columns() {
+            for (pi, col) in s.payload_columns() {
                 if pi >= npc {
                     break;
                 }
@@ -1441,7 +1441,7 @@ impl Batch {
 
         let schema = self.schema.expect("append_row_simple requires schema");
 
-        for (pi, _ci, col) in schema.payload_columns() {
+        for (pi, col) in schema.payload_columns() {
             let col_size = col.size() as usize;
             let is_null = gnitz_wire::null_word_get(null_word, pi);
 
@@ -1693,7 +1693,7 @@ impl Batch {
         mut blob_cache: Option<&mut BlobCache>,
     ) {
         let src_blob = src.blob();
-        for (pi, _ci, col) in schema.payload_columns() {
+        for (pi, col) in schema.payload_columns() {
             let cs = col.size() as usize;
             let is_null = gnitz_wire::null_word_get(null_word, pi);
             let cell = (!is_null).then(|| src.get_col_ptr(row, pi, cs));

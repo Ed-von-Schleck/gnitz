@@ -20,15 +20,11 @@ pub(crate) fn build_schema_from_col_defs(
     dist_prefix_len: usize,
 ) -> Result<SchemaDescriptor, String> {
     check_col_defs(col_defs)?;
-    let mut cols = [SchemaColumn::EMPTY; crate::schema::MAX_COLUMNS];
-    for (i, cd) in col_defs.iter().enumerate() {
-        cols[i] = SchemaColumn::new(cd.type_code, if cd.is_nullable { 1 } else { 0 });
-    }
-    Ok(SchemaDescriptor::new_with_dist(
-        &cols[..col_defs.len()],
-        pk_cols,
-        dist_prefix_len,
-    ))
+    let cols: Vec<SchemaColumn> = col_defs
+        .iter()
+        .map(|cd| SchemaColumn::new(cd.type_code, cd.is_nullable as u8))
+        .collect();
+    Ok(SchemaDescriptor::new_with_dist(&cols, pk_cols, dist_prefix_len))
 }
 
 impl CatalogEngine {

@@ -87,46 +87,30 @@ pub(super) fn validate_pk_cols(col_defs: &[super::types::ColumnDef], pk: &PkColL
             gnitz_wire::PK_LIST_MAX_COLS
         ));
     }
-    let cols = pk.as_slice();
-    for (j, &c) in cols.iter().enumerate() {
-        if (c as usize) >= col_defs.len() {
-            return Err("Primary Key index out of bounds".into());
-        }
+    // The rule set is `gnitz-wire`'s, shared with the SQL planner's CREATE TABLE
+    // pre-check and the client's `validate_parts`; only the wording below is the
+    // catalog's. The stride bound defends the catalog worker against a crafted
+    // SAL-replayed `TABLE_TAB` ingest whose decoded PK list packs an oversized
+    // region.
+    gnitz_wire::validate_pk_tuple(pk.as_slice(), col_defs.len(), |c| {
         let cd = &col_defs[c as usize];
-        if !gnitz_wire::is_pk_eligible(cd.type_code) {
-            return Err(format!(
-                "Primary Key must be a fixed-width integer, U128, UUID, or I128 column; \
-                 got type_code={} (String, Blob, and float columns cannot be PK)",
-                cd.type_code
-            ));
-        }
-        if cd.is_nullable {
-            return Err("Primary Key column must not be nullable".into());
-        }
-        if cols[..j].contains(&c) {
-            return Err("Primary Key has duplicate column".into());
-        }
-    }
-    // The PK region must fit MAX_PK_BYTES. Strides ≤ 16 widen to a `u128` value
-    // via `gnitz_wire::widen_pk_be`; wider compound PKs (stride > 16) route
-    // through the byte-path accessors (`get_pk_bytes` / `compare_pk_bytes`). The
-    // `PK_LIST_MAX_COLS` cap above bounds a valid PK at 64 bytes (four `U128` at
-    // the current cap of 4); MAX_PK_BYTES is the
-    // ceiling, defending the catalog worker against a crafted SAL-replayed
-    // `TABLE_TAB` ingest whose decoded PK list packs an oversized region.
-    // `pk_stride == 0` is unreachable once `is_pk_eligible` passed (every
-    // eligible type is ≥ 1 byte) but is rejected explicitly as defence in depth.
-    let pk_stride: usize = cols
-        .iter()
-        .map(|&c| gnitz_wire::wire_stride(col_defs[c as usize].type_code))
-        .sum();
-    if pk_stride == 0 || pk_stride > crate::schema::MAX_PK_BYTES {
-        return Err(format!(
-            "Primary Key total stride must be 1..={} bytes, got {pk_stride}",
+        (cd.type_code, cd.is_nullable)
+    })
+    .map(|_stride| ())
+    .map_err(|rule| match rule {
+        gnitz_wire::PkRule::IndexOutOfRange { .. } => "Primary Key index out of bounds".to_string(),
+        gnitz_wire::PkRule::NotEligible { type_code, .. } => format!(
+            "Primary Key must be a fixed-width integer, U128, UUID, or I128 column; \
+             got type_code={type_code} (String, Blob, and float columns cannot be PK)"
+        ),
+        gnitz_wire::PkRule::Nullable { .. } => "Primary Key column must not be nullable".to_string(),
+        gnitz_wire::PkRule::Duplicate { .. } => "Primary Key has duplicate column".to_string(),
+        gnitz_wire::PkRule::StrideOutOfRange { stride } => format!(
+            "Primary Key total stride must be 1..={} bytes, got {stride}",
             crate::schema::MAX_PK_BYTES
-        ));
-    }
-    Ok(())
+        ),
+        other => other.to_string(),
+    })
 }
 
 /// The two rules a relation's column records must satisfy on their own, with no

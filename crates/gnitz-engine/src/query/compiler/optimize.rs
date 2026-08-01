@@ -163,7 +163,7 @@ pub(super) fn compute_skip_nodes(loaded: &LoadedCircuit) -> HashSet<i32> {
 pub(super) fn merge_schemas_for_join(left: &SchemaDescriptor, right: &SchemaDescriptor) -> Option<SchemaDescriptor> {
     let mut b = DerivedSchema::new();
     b.push_pk_of(left)?;
-    for (_, _, c) in left.payload_columns().chain(right.payload_columns()) {
+    for (_, c) in left.payload_columns().chain(right.payload_columns()) {
         b.push(*c)?;
     }
     Some(b.finish())
@@ -264,7 +264,7 @@ pub(super) fn hashrow_output_schema(
 pub(super) fn null_extend_output_schema(in_schema: &SchemaDescriptor, type_codes: &[u8]) -> Option<SchemaDescriptor> {
     let mut b = DerivedSchema::new();
     b.push_pk_of(in_schema)?;
-    for (_, _, c) in in_schema.payload_columns() {
+    for (_, c) in in_schema.payload_columns() {
         b.push(*c)?;
     }
     for &tc in type_codes {

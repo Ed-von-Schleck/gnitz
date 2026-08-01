@@ -8,7 +8,7 @@ use std::cmp::Ordering;
 
 use proptest::prelude::*;
 
-use crate::schema::key::{compare_pk_bytes, encode_order_preserving_pk};
+use crate::schema::key::{compare_pk_bytes, encode_leading_opk};
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, Layout};
 
@@ -41,17 +41,12 @@ pub(crate) fn pk_only_schema(types: &[u8]) -> SchemaDescriptor {
 /// are passed as `v as u128` (the low `size()` little-endian bytes are the
 /// two's-complement image the encoder sign-flips).
 pub(crate) fn opk_pk(schema: &SchemaDescriptor, vals: &[u128]) -> Vec<u8> {
-    let stride = schema.pk_stride() as usize;
-    let mut le = vec![0u8; stride];
-    let mut off = 0;
-    for ((_ord, _ci, col), &v) in schema.pk_columns().zip(vals) {
-        let cs = col.size() as usize;
-        le[off..off + cs].copy_from_slice(&v.to_le_bytes()[..cs]);
-        off += cs;
-    }
-    let mut opk = vec![0u8; stride];
-    encode_order_preserving_pk(schema, &le, &mut opk);
-    opk
+    // The production leading-span encoder over every PK column: source and
+    // target type are equal here, so its promote step is the identity arm and
+    // the span is the whole PK. Encoding through it rather than re-packing the
+    // native image by hand keeps the oracle from being a second spelling of §6.
+    let cols = schema.pk_columns().map(|(_, col)| (col.type_code, *col));
+    encode_leading_opk(cols, vals).pk_bytes().to_vec()
 }
 
 /// Build a consolidated wide-PK batch from native `(c0, c1, c2, weight, payload)`

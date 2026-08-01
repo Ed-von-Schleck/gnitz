@@ -42,7 +42,7 @@ pub(super) fn reindex_hash_row(out_schema: &SchemaDescriptor, output: &mut Batch
             // single PK (which would collapse their +2 weight to +1).
             hasher.update(&[branch_id]);
             let null_word = mb.get_null_word(row);
-            for (pi, _ci, col) in out_schema.payload_columns() {
+            for (pi, col) in out_schema.payload_columns() {
                 let is_null = gnitz_wire::null_word_get(null_word, pi);
                 hasher.update(&[is_null as u8]);
                 if is_null {
@@ -747,7 +747,7 @@ mod tests {
             b.extend_pk_bytes(&zeros[..pk_stride]);
             b.extend_weight(&0i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
-            for (pi, _ci, col) in schema.payload_columns() {
+            for (pi, col) in schema.payload_columns() {
                 b.extend_col(pi, &zeros[..col.size() as usize]);
             }
             b.count += 1;
@@ -956,8 +956,8 @@ mod tests {
             // Trace side (stored _join_pk) == scatter side (scratch buffer).
             assert_eq!(out.get_pk_bytes(row), &buf[..packer.out_stride], "row {row} key bytes");
             assert_eq!(
-                crate::schema::key::partition_for_pk_bytes(out.get_pk_bytes(row)),
-                crate::schema::key::partition_for_pk_bytes(&buf[..packer.out_stride]),
+                gnitz_wire::partition_for_pk_bytes(out.get_pk_bytes(row)),
+                gnitz_wire::partition_for_pk_bytes(&buf[..packer.out_stride]),
                 "row {row} co-partition",
             );
         }
@@ -1043,9 +1043,9 @@ mod tests {
 
         // (2) CO-PARTITION teeth: producer and consumer route to the same partition
         // through the WIDE arm of partition_for_pk_bytes.
-        let p_consumer = crate::schema::key::partition_for_pk_bytes(consumer);
-        let p_producer = crate::schema::key::partition_for_pk_bytes(producer);
-        let p_oracle = crate::schema::key::partition_for_pk_bytes(oracle.as_slice());
+        let p_consumer = gnitz_wire::partition_for_pk_bytes(consumer);
+        let p_producer = gnitz_wire::partition_for_pk_bytes(producer);
+        let p_oracle = gnitz_wire::partition_for_pk_bytes(oracle.as_slice());
         assert_eq!(p_producer, p_consumer, "producer/consumer co-partition (wide)");
         assert_eq!(p_consumer, p_oracle, "trace store / ingest co-partition (wide)");
 

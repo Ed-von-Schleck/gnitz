@@ -15,9 +15,9 @@ use super::shard_reader::MappedShard;
 use super::table::{self, RecoverySource, Table};
 #[cfg(test)]
 use super::table::{FlushOutcome, FlushWork};
-#[cfg(test)]
-use crate::schema::key::{partition_for_key, partition_for_pk_bytes};
 use crate::schema::SchemaDescriptor;
+#[cfg(test)]
+use gnitz_wire::{partition_for_key, partition_for_pk_bytes};
 
 thread_local! {
     /// Reused per-partition scatter index buffers for `ingest_owned_batch`.

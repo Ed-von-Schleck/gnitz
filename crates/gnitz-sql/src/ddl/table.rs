@@ -6,8 +6,9 @@ use crate::bind::{find_unique_column, Binder};
 use crate::error::GnitzSqlError;
 use crate::types::{int_domain_fits, is_integer_type, serial_underlying, sql_type_to_typecode};
 use crate::validate::{
-    default_index_name, disambiguate_index_name, reject_duplicate_names, reject_non_key_eligible,
-    reject_unhonored_column_options, reject_unhonored_table_constraints, validate_user_index_name, validate_user_name,
+    default_index_name, disambiguate_index_name, non_key_eligible_error, reject_duplicate_names,
+    reject_non_key_eligible, reject_unhonored_column_options, reject_unhonored_table_constraints,
+    validate_user_index_name, validate_user_name,
 };
 use crate::SqlResult;
 use gnitz_core::{ColumnDef, GnitzClient, IndexMeta, InlineUniqueIndex, TypeCode};
@@ -406,49 +407,40 @@ pub(crate) fn execute_create_table(
         }
     }
 
-    // Admission rule — every base table must satisfy these conditions.
-    // The order here matches the order of error messages a user would
-    // expect to see: missing PK → count cap → type allow-list → stride.
-    if pk_indices.is_empty() {
-        return Err(GnitzSqlError::Plan(
-            "CREATE TABLE requires at least one PRIMARY KEY column".into(),
-        ));
-    }
-    if pk_indices.len() > gnitz_core::PK_LIST_MAX_COLS {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "PRIMARY KEY supports at most {} columns",
-            gnitz_core::PK_LIST_MAX_COLS
-        )));
-    }
-    // Pre-check before the DDL reaches the engine (which re-validates via
-    // `validate_pk_cols`); naming the offending column here gives a clearer
-    // error. Same eligibility rule, shared via `TypeCode::is_pk_eligible`.
-    for &i in &pk_indices {
-        let tc = cols[i as usize].type_code;
-        reject_non_key_eligible(&cols[i as usize].name, tc, "PRIMARY KEY")?;
-    }
-    // The PK region must fit MAX_PK_BYTES. Strides ≤ 16 widen to a `u128` fast
-    // key; wider compound PKs (stride > 16, e.g. three `U64`s = 24) route
-    // through the byte-path cursor/merge accessors. The 4-column cap above
-    // bounds a valid PK at 64 bytes; MAX_PK_BYTES is the ceiling. The engine
-    // re-validates the same bound in `validate_pk_cols`.
-    let pk_stride: usize = pk_indices
-        .iter()
-        .map(|&i| cols[i as usize].type_code.wire_stride())
-        .sum();
-    if pk_stride == 0 || pk_stride > gnitz_core::MAX_PK_BYTES {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "PRIMARY KEY total stride must be 1..={} bytes, got {pk_stride}",
-            gnitz_core::MAX_PK_BYTES
-        )));
-    }
-
     // PK columns keep their declared type. The null bitmap excludes the PK
-    // region, so a nullable PK has no place to carry the null — enforce
-    // non-nullable here regardless of type.
+    // region, so a nullable PK has no place to carry the null — PRIMARY KEY
+    // implies NOT NULL, so coerce before validating rather than rejecting.
     for &i in &pk_indices {
         cols[i as usize].is_nullable = false;
     }
+
+    // Admission rule — every base table must satisfy these conditions. The rule
+    // set is `gnitz-wire`'s, shared with the client's `validate_parts` and the
+    // engine catalog's `validate_pk_cols`, so this pre-check and the engine
+    // backstop cannot disagree on what a legal PK is. Only the wording is the
+    // planner's: it names the offending column, which the engine cannot.
+    gnitz_wire::validate_pk_tuple(&pk_indices, cols.len(), |c| {
+        let cd = &cols[c as usize];
+        (cd.type_code as u8, cd.is_nullable)
+    })
+    .map_err(|rule| match rule {
+        gnitz_wire::PkRule::Empty => {
+            GnitzSqlError::Plan("CREATE TABLE requires at least one PRIMARY KEY column".into())
+        }
+        gnitz_wire::PkRule::TooManyColumns { .. } => GnitzSqlError::Unsupported(format!(
+            "PRIMARY KEY supports at most {} columns",
+            gnitz_core::PK_LIST_MAX_COLS
+        )),
+        gnitz_wire::PkRule::NotEligible { col, .. } => {
+            let cd = &cols[col as usize];
+            non_key_eligible_error(&cd.name, cd.type_code, "PRIMARY KEY")
+        }
+        gnitz_wire::PkRule::StrideOutOfRange { stride } => GnitzSqlError::Unsupported(format!(
+            "PRIMARY KEY total stride must be 1..={} bytes, got {stride}",
+            gnitz_core::MAX_PK_BYTES
+        )),
+        other => GnitzSqlError::Unsupported(other.to_string()),
+    })?;
 
     // A SERIAL column must be the table's sole, single-column PRIMARY KEY. This
     // is load-bearing for the INSERT payload indexing (the single-PK closed form

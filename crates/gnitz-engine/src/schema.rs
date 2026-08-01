@@ -2,40 +2,39 @@
 //!
 //! These are shared across the storage, IPC, and query layers.
 
-use gnitz_expr::RowSource;
 use gnitz_wire::{is_fixed_int, is_signed_int};
 
 // One rule for what this module re-exports: a *schema fact* — what a column's
 // type is, how many of them there can be, how a key is shaped — comes through
 // `crate::schema::X` at every engine call site. A *byte primitive* — how a value
-// is encoded or decoded — never does; those are named `gnitz_wire::X` directly,
-// including inside this file. So `read_signed`/`read_unsigned`, the OPK and
-// German-string clusters, the `*_route_key`/`*_native_key` derivations, the
-// null-bitmap accessors and the type predicates are absent here by design,
-// while the type table and the fixed limits below are present.
+// is encoded, decoded, or hashed to a partition — never does; those are named
+// `gnitz_wire::X` directly, including inside this file.
 pub(crate) use gnitz_wire::type_code;
 pub(crate) use gnitz_wire::ReduceOutKey;
 pub(crate) use gnitz_wire::TypeCode;
-pub use gnitz_wire::MAX_COLUMNS;
-pub use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
+pub(crate) use gnitz_wire::MAX_COLUMNS;
+pub(crate) use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
 
 /// Resolved column addressing, homed in the leaf `gnitz-expr` crate so the
 /// expression evaluator (and, through it, the SQL client) shares one definition
 /// with the engine. Re-exported here because it *is* a schema fact —
-/// `SchemaDescriptor::locate` produces one — so every call site keeps naming
-/// `crate::schema::X`. `PAYLOAD_MAPPING_PK_SENTINEL` deliberately is not: its
-/// only engine reader is `payload_mapping`'s own encode/decode below, in this
-/// file.
+/// `SchemaDescriptor::locate` produces one.
 pub(crate) use gnitz_expr::ColumnLocator;
 use gnitz_expr::PAYLOAD_MAPPING_PK_SENTINEL;
 
 /// Order-preserving primary-key (OPK) primitives — every native→OPK encoder
-/// (whole PK, seek wire pair, index leading span), compare/route/pack, and the
+/// (whole PK, seek wire pair, index leading span), compare/pack, and the
 /// width-tagged `PkBuf` those encoders return. Sits below both schema and
 /// storage, and is the one import path: `storage` used to re-export the cluster
 /// so its call sites read `crate::storage::X`, which left the §1/§6 byte-order
 /// rule spelled two ways in adjacent lines of the same file.
 pub(crate) mod key;
+
+/// The precomputed per-row read/encode plan for an index's OPK leading-key span.
+/// Lives in [`key`] with the rest of the native→OPK encoders it shares its byte
+/// contract with; re-exported here because a spec is derived from a pair of
+/// schemas, so call sites keep naming `crate::schema::IndexKeySpec`.
+pub(crate) use key::IndexKeySpec;
 
 /// Build a `SchemaDescriptor` from a wire-neutral `WireSysCol` slice (the
 /// canonical system-table column arrays in `gnitz-wire`). The single builder
@@ -100,7 +99,7 @@ impl DerivedSchema {
     /// Append `schema`'s PK columns in PK-list order — the shared prologue of
     /// every builder that inherits its input's key.
     pub(crate) fn push_pk_of(&mut self, schema: &SchemaDescriptor) -> Option<()> {
-        for (_, _, c) in schema.pk_columns() {
+        for (_, c) in schema.pk_columns() {
             self.push_pk(*c)?;
         }
         Some(())
@@ -118,10 +117,10 @@ impl DerivedSchema {
 
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct SchemaColumn {
-    pub type_code: u8,
+pub(crate) struct SchemaColumn {
+    pub(crate) type_code: u8,
     size: u8,
-    pub nullable: u8,
+    pub(crate) nullable: u8,
     is_signed: u8,
 }
 
@@ -131,7 +130,7 @@ impl SchemaColumn {
     /// that padding — the one legitimate use of the undecodable type code `0` —
     /// cannot be confused with a real column, and `new` can hold every column it
     /// builds to a decodable code.
-    pub const EMPTY: SchemaColumn = Self::raw(0, 0);
+    pub(crate) const EMPTY: SchemaColumn = Self::raw(0, 0);
 
     /// A real column of type `type_code`, which must decode (see
     /// [`gnitz_wire::is_valid_type_code`] for why an unknown one is not inert).
@@ -139,7 +138,7 @@ impl SchemaColumn {
     /// the tripwire for a path that forgets to. Debug-only — the release engine
     /// must still *survive* a corrupt code, which is what the expression
     /// validator's `check_col` and the catalog's `check_col_defs` are for.
-    pub const fn new(type_code: u8, nullable: u8) -> Self {
+    pub(crate) const fn new(type_code: u8, nullable: u8) -> Self {
         debug_assert!(gnitz_wire::is_valid_type_code(type_code), "invalid column type code");
         Self::raw(type_code, nullable)
     }
@@ -157,7 +156,7 @@ impl SchemaColumn {
     /// On-disk byte width of one cell of this column. Derived from `type_code`
     /// via `SchemaColumn::new` and never written independently.
     #[inline]
-    pub const fn size(&self) -> u8 {
+    pub(crate) const fn size(&self) -> u8 {
         self.size
     }
 
@@ -201,7 +200,7 @@ const fn compute_payload_cmp(cols: &[SchemaColumn], payload_mapping: &[u8; MAX_C
 
 #[derive(Clone, Copy)]
 #[repr(C)]
-pub struct SchemaDescriptor {
+pub(crate) struct SchemaDescriptor {
     num_columns: u32,
     pk_count: u32,
     pk_indices: [u32; MAX_PK_COLUMNS],
@@ -250,9 +249,16 @@ pub struct SchemaDescriptor {
     /// Pre-computed payload comparator strategy. Derived from column types in
     /// `new()`; read by every merge/sort/join dispatch (via `with_payload_cmp!`)
     /// in place of calling `schema_is_fixedint_nonnull` at each site.
-    pub payload_cmp: PayloadCmpKind,
-    pub columns: [SchemaColumn; MAX_COLUMNS],
+    pub(crate) payload_cmp: PayloadCmpKind,
+    pub(crate) columns: [SchemaColumn; MAX_COLUMNS],
 }
+
+// `SchemaDescriptor` is `Copy` and embedded by value in ~20 structs (`Batch`
+// among them, which the VM takes and replaces several times per instruction),
+// so a field added here is paid for at every one of those copies. Pinned rather
+// than merely documented: the three fixed-capacity arrays make the cost
+// invisible at the definition.
+const _: () = assert!(std::mem::size_of::<SchemaDescriptor>() <= 424);
 
 const fn compute_mappings(num_columns: usize, pk_indices: &[u32]) -> ([u8; MAX_COLUMNS], [u8; MAX_COLUMNS]) {
     let mut payload_mapping = [PAYLOAD_MAPPING_PK_SENTINEL; MAX_COLUMNS];
@@ -284,7 +290,7 @@ impl SchemaDescriptor {
     /// produced by `Default::default()` and is structurally invalid for real
     /// use. Accepts up to `MAX_PK_COLUMNS` entries.
     #[track_caller]
-    pub const fn new(cols: &[SchemaColumn], pk_indices: &[u32]) -> Self {
+    pub(crate) const fn new(cols: &[SchemaColumn], pk_indices: &[u32]) -> Self {
         // Default distribution = the full PK: today's behavior, byte-for-byte.
         Self::new_with_dist(cols, pk_indices, pk_indices.len())
     }
@@ -299,7 +305,7 @@ impl SchemaDescriptor {
     /// every derived schema (join/map/reduce/projection output, built via `new`)
     /// gets the full-PK default and is never table-key-routed.
     #[track_caller]
-    pub const fn new_with_dist(cols: &[SchemaColumn], pk_indices: &[u32], dist_prefix_len: usize) -> Self {
+    pub(crate) const fn new_with_dist(cols: &[SchemaColumn], pk_indices: &[u32], dist_prefix_len: usize) -> Self {
         assert!(cols.len() <= MAX_COLUMNS, "new: too many columns");
         assert!(
             pk_indices.len() <= MAX_PK_COLUMNS,
@@ -397,18 +403,18 @@ impl SchemaDescriptor {
     /// distribution (`dist_prefix_len == pk_count`); the DDL layer enforces that,
     /// so this is a pure tag.
     #[inline]
-    pub const fn with_replicated(mut self, replicated: bool) -> Self {
+    pub(crate) const fn with_replicated(mut self, replicated: bool) -> Self {
         self.replicated = replicated;
         self
     }
 
-    pub const fn minimal_u64() -> Self {
+    pub(crate) const fn minimal_u64() -> Self {
         Self::new(&[SchemaColumn::new(type_code::U64, 0)], &[0])
     }
 
     /// Number of logical columns in this schema (PK + payload).
     #[inline]
-    pub const fn num_columns(&self) -> usize {
+    pub(crate) const fn num_columns(&self) -> usize {
         self.num_columns as usize
     }
 
@@ -416,7 +422,7 @@ impl SchemaDescriptor {
     /// 1 for a single-column PK, or the full sequence for a compound table PK
     /// (and the co-partition analyzers compare against this whole sequence).
     #[inline]
-    pub fn pk_indices(&self) -> &[u32] {
+    pub(crate) fn pk_indices(&self) -> &[u32] {
         &self.pk_indices[..self.pk_count as usize]
     }
 
@@ -429,7 +435,7 @@ impl SchemaDescriptor {
     /// treat a nullability-only difference as "same layout". Do not "simplify"
     /// to `self == other`: that would compare `nullable` and change elision
     /// semantics.
-    pub fn same_physical_layout(&self, other: &SchemaDescriptor) -> bool {
+    pub(crate) fn same_physical_layout(&self, other: &SchemaDescriptor) -> bool {
         if self.num_columns() != other.num_columns() || self.pk_indices() != other.pk_indices() {
             return false;
         }
@@ -441,15 +447,14 @@ impl SchemaDescriptor {
         true
     }
 
-    /// Iterate over PK columns in pk-list order. Mirror of
-    /// `payload_columns()`. Yields `(pk_ord, col_idx, &SchemaColumn)`.
+    /// Iterate over PK columns in pk-list order, yielding `(col_idx,
+    /// &SchemaColumn)`. Mirror of `payload_columns()`. The pk-list position is
+    /// the iteration index, so callers that need it use `.enumerate()`.
     #[inline]
-    pub fn pk_columns(&self) -> impl Iterator<Item = (usize, usize, &SchemaColumn)> {
+    pub(crate) fn pk_columns(&self) -> impl Iterator<Item = (usize, &SchemaColumn)> {
         self.pk_indices()
             .iter()
-            .copied()
-            .enumerate()
-            .map(move |(ord, ci)| (ord, ci as usize, &self.columns[ci as usize]))
+            .map(move |&ci| (ci as usize, &self.columns[ci as usize]))
     }
 
     /// Total bytes per row of the PK region. Precomputed in `new()`;
@@ -457,7 +462,7 @@ impl SchemaDescriptor {
     /// and the storage-layer `pk_stride` caches; callers that need
     /// `usize` for buffer arithmetic cast at the use site.
     #[inline]
-    pub const fn pk_stride(&self) -> u8 {
+    pub(crate) const fn pk_stride(&self) -> u8 {
         self.pk_stride
     }
 
@@ -465,7 +470,7 @@ impl SchemaDescriptor {
     /// `partition_for_pk` hashes); `pk_stride()` for the full-PK default. Prefer
     /// `partition_for_pk` over reading this and slicing by hand.
     #[inline]
-    pub const fn dist_stride(&self) -> u8 {
+    pub(crate) const fn dist_stride(&self) -> u8 {
         self.dist_stride
     }
 
@@ -482,8 +487,8 @@ impl SchemaDescriptor {
     /// reindexed `_join_pk` over a derived schema and call `partition_for_pk_bytes`
     /// directly (their key is the whole region, never a table prefix).
     #[inline]
-    pub fn partition_for_pk(&self, key: &[u8]) -> usize {
-        crate::schema::key::partition_for_pk_bytes(&key[..self.dist_stride() as usize])
+    pub(crate) fn partition_for_pk(&self, key: &[u8]) -> usize {
+        gnitz_wire::partition_for_pk_bytes(&key[..self.dist_stride() as usize])
     }
 
     /// Distribution prefix length `k` — leading PK columns rows are hashed by
@@ -503,7 +508,7 @@ impl SchemaDescriptor {
     /// replicated source, or a partitioned source whose join partner is
     /// replicated, skips its exchange), and the bootstrap trim exemption.
     #[inline]
-    pub const fn replicated(&self) -> bool {
+    pub(crate) const fn replicated(&self) -> bool {
         self.replicated
     }
 
@@ -525,26 +530,20 @@ impl SchemaDescriptor {
 
     /// Number of non-PK ("payload") columns.
     #[inline]
-    pub const fn num_payload_cols(&self) -> usize {
+    pub(crate) const fn num_payload_cols(&self) -> usize {
         self.num_columns as usize - self.pk_count as usize
     }
 
-    /// Iterate over the non-PK ("payload") columns.
-    ///
-    /// Yields `(payload_idx, col_idx, &SchemaColumn)` where:
-    /// - `payload_idx` is the dense 0-based index used for batch payload
-    ///   regions and null-bitmap bits;
-    /// - `col_idx` is the original logical column index in `self.columns`.
+    /// Iterate over the non-PK ("payload") columns, yielding `(payload_idx,
+    /// &SchemaColumn)` where `payload_idx` is the dense 0-based index used for
+    /// batch payload regions and null-bitmap bits. Callers needing the logical
+    /// column index resolve it with [`Self::payload_col_idx`].
     ///
     /// Walks a contiguous `0..num_payload` range with one byte load per
     /// element via `payload_to_ci` — no per-row predicate.
     #[inline]
-    pub fn payload_columns(&self) -> impl Iterator<Item = (usize, usize, &SchemaColumn)> {
-        let num_payload = self.num_payload_cols();
-        (0..num_payload).map(move |pi| {
-            let ci = self.payload_to_ci[pi] as usize;
-            (pi, ci, &self.columns[ci])
-        })
+    pub(crate) fn payload_columns(&self) -> impl Iterator<Item = (usize, &SchemaColumn)> {
+        (0..self.num_payload_cols()).map(move |pi| (pi, &self.columns[self.payload_to_ci[pi] as usize]))
     }
 
     /// Whether the schema carries a STRING/BLOB (German-string) column. Those
@@ -553,7 +552,7 @@ impl SchemaDescriptor {
     #[inline]
     pub(crate) fn has_german_string(&self) -> bool {
         self.payload_columns()
-            .any(|(_, _, col)| gnitz_wire::is_german_string(col.type_code))
+            .any(|(_, col)| gnitz_wire::is_german_string(col.type_code))
     }
 
     /// Dense payload slot (batch payload region + null-bitmap bit position) for a
@@ -572,14 +571,14 @@ impl SchemaDescriptor {
 
     /// True iff column `ci` is a PK column.
     #[inline]
-    pub fn is_pk_col(&self, ci: usize) -> bool {
+    pub(crate) fn is_pk_col(&self, ci: usize) -> bool {
         self.payload_mapping[ci] == PAYLOAD_MAPPING_PK_SENTINEL
     }
 
     /// Inverse of `payload_idx`: dense payload slot → logical column index.
     /// Caller must ensure `pi < num_payload_cols()`.
     #[inline]
-    pub fn payload_col_idx(&self, pi: usize) -> usize {
+    pub(crate) fn payload_col_idx(&self, pi: usize) -> usize {
         debug_assert!(pi < self.num_payload_cols(), "payload_col_idx: pi out of range");
         self.payload_to_ci[pi] as usize
     }
@@ -588,7 +587,7 @@ impl SchemaDescriptor {
     /// any order). Used by reduce to detect `GROUP BY pk` even when the
     /// SQL lists PK columns in an order that differs from the schema's
     /// pk-list order.
-    pub fn group_cols_eq_pk(&self, cols: &[u32]) -> bool {
+    pub(crate) fn group_cols_eq_pk(&self, cols: &[u32]) -> bool {
         let pk = self.pk_indices();
         cols.len() == pk.len() && pk.iter().all(|p| cols.contains(p))
     }
@@ -597,12 +596,11 @@ impl SchemaDescriptor {
     /// — re-derived by the engine compiler only to *validate* the planner's
     /// shipped [`ReduceOutKey`], through the same shared [`ReduceOutKey::decide`]
     /// chain the planner decided with.
-    pub fn reduce_out_key(&self, cols: &[u32]) -> ReduceOutKey {
-        let single_natural = cols.len() == 1 && {
-            let c = &self.columns[cols[0] as usize];
-            c.nullable == 0 && TypeCode::from_validated_u8(c.type_code).is_natural_reduce_key()
-        };
-        ReduceOutKey::decide(self.group_cols_eq_pk(cols), single_natural)
+    pub(crate) fn reduce_out_key(&self, cols: &[u32]) -> ReduceOutKey {
+        ReduceOutKey::for_group_cols(self.pk_indices(), cols, |c| {
+            let col = &self.columns[c as usize];
+            (col.type_code, col.nullable != 0)
+        })
     }
 
     /// True iff `cols` is **exactly** this table's distribution prefix —
@@ -624,7 +622,7 @@ impl SchemaDescriptor {
     /// instead exchanges and repartitions to the full key, reconverging with the
     /// other side. (`dist_prefix_len ≤ pk_count`, so `pk[..k]` is in range; the
     /// `cluster_by_super_prefix_join_safety` E2E test exercises this.)
-    pub fn shard_cols_match_dist_key(&self, cols: &[i32]) -> bool {
+    pub(crate) fn shard_cols_match_dist_key(&self, cols: &[i32]) -> bool {
         let k = self.dist_prefix_len() as usize;
         let pk = self.pk_indices();
         cols.len() == k && cols.iter().zip(&pk[..k]).all(|(&c, &p)| c == p as i32)
@@ -636,7 +634,7 @@ impl SchemaDescriptor {
     pub(crate) fn pk_byte_offset(&self, col_idx: usize) -> u8 {
         debug_assert!(self.is_pk_col(col_idx), "pk_byte_offset: col_idx must be a pk column");
         let mut off: u16 = 0;
-        for (_, pk_ci, c) in self.pk_columns() {
+        for (pk_ci, c) in self.pk_columns() {
             if pk_ci == col_idx {
                 return off as u8;
             }
@@ -725,204 +723,6 @@ impl gnitz_expr::SchemaFacts for SchemaDescriptor {
 
     fn col_nullable(&self, ci: usize) -> bool {
         self.columns[ci].nullable != 0
-    }
-}
-
-// The payload null-bitmap accessors (`gnitz_wire::null_word_get` /
-// `null_word_set`) are NOT re-exported here. Like the OPK and German-string
-// primitives, the bitmap is a §6 byte convention owned by `gnitz-wire` — the
-// crate whose `REG_NULL_BMP` names the region — and shared verbatim with the
-// client and the evaluator; engine call sites name `gnitz_wire::` directly.
-
-/// Precomputed read/encode plan for one index's OPK leading-key span: per
-/// indexed column, the owner-side read coordinate (PK-or-payload, resolved via
-/// `locate` — a PK source column is sliced from the packed OPK PK region, a
-/// payload column read from its dense slot) and the promoted index column it
-/// is encoded at. Built once per circuit so the row paths do no catalog
-/// reborrow, schema indexing, or allocation; `Copy`, so descriptors carrying
-/// it stay allocation-free.
-///
-/// The span is the single definition of "what key do this row's indexed
-/// columns map to", shared by every uniqueness-enforcement site (in-batch
-/// validator, backfill dedup via `batch_project_index`, broadcast-skip filter,
-/// insert-time check, pre-flight) — byte-equal ⟺ index-value equal at any
-/// width, and byte-lexicographic order is the seek/merge order.
-#[derive(Clone, Copy)]
-pub(crate) struct IndexKeySpec {
-    n: u8,
-    /// Span width in bytes — the sum of the promoted column widths, precomputed
-    /// so the per-row `key_bytes` path does no re-summation.
-    key_size: u8,
-    locators: [ColumnLocator; gnitz_wire::PK_LIST_MAX_COLS],
-    idx_cols: [SchemaColumn; gnitz_wire::PK_LIST_MAX_COLS],
-}
-
-impl IndexKeySpec {
-    /// `cols` is the circuit's source column list (owner-schema indices);
-    /// `idx_schema` supplies the promoted leading columns the span encodes at.
-    pub(crate) fn new(cols: &[u32], owner: &SchemaDescriptor, idx_schema: &SchemaDescriptor) -> Self {
-        debug_assert!(!cols.is_empty() && cols.len() <= gnitz_wire::PK_LIST_MAX_COLS);
-        let mut locators = [ColumnLocator::Pk {
-            byte_off: 0,
-            size: 0,
-            type_code: 0,
-        }; gnitz_wire::PK_LIST_MAX_COLS];
-        let mut idx_cols = [SchemaColumn::EMPTY; gnitz_wire::PK_LIST_MAX_COLS];
-        for (i, &c) in cols.iter().enumerate() {
-            locators[i] = owner.locate(c as usize);
-            idx_cols[i] = idx_schema.columns[i];
-            // Spec-invariant, so checked once per circuit rather than per column
-            // per row: `write_span` hands each source's bytes to the OPK encoder
-            // *at `idx_cols[i].type_code`*, so the index column must be exactly
-            // the source's promotion. `index_key_type` errors on STRING/BLOB, so
-            // this also subsumes "a German-string source needs a content hash,
-            // not a raw cell encode" — its 16-byte struct (a heap offset for a
-            // long string) would otherwise encode as if it were an integer. Every
-            // production caller builds `idx_schema` through `make_index_schema`,
-            // which derives it from this very function.
-            debug_assert_eq!(
-                gnitz_wire::index_key_type(locators[i].type_code()).ok(),
-                Some(idx_cols[i].type_code),
-                "IndexKeySpec: index column {i} is not the source column's promotion",
-            );
-        }
-        IndexKeySpec {
-            n: cols.len() as u8,
-            key_size: idx_schema.leading_key_size(cols.len()) as u8,
-            locators,
-            idx_cols,
-        }
-    }
-
-    /// The spec over the leading `k` columns only — the read/encode plan a
-    /// leading-prefix seek needs, derived from a full-arity baked spec instead
-    /// of rebuilding one from the schemas.
-    #[inline]
-    pub(crate) fn prefix(&self, k: usize) -> IndexKeySpec {
-        debug_assert!(k >= 1 && k <= self.n as usize);
-        IndexKeySpec {
-            n: k as u8,
-            key_size: self.idx_cols[..k].iter().map(|c| c.size()).sum(),
-            ..*self
-        }
-    }
-
-    /// The promoted index columns of the leading span, in index order.
-    #[inline]
-    fn idx_cols(&self) -> &[SchemaColumn] {
-        &self.idx_cols[..self.n as usize]
-    }
-
-    /// Span width (`idx_key_size`); see `SchemaDescriptor::leading_key_size`.
-    #[inline]
-    pub(crate) fn key_size(&self) -> usize {
-        self.key_size as usize
-    }
-
-    /// Write one row's OPK leading-key span into `dst[..key_size()]`. Returns
-    /// `false` (skip — the row is not indexed, `dst` partially written) when ANY
-    /// indexed column is NULL: SQL NULL-distinctness, a row with a NULL in any
-    /// indexed column never collides. The per-column encode is byte-identical
-    /// to the seek-side [`Self::seek_prefix`], so the in-memory key, the
-    /// projected index entry, and the seek prefix agree by construction.
-    ///
-    /// Each column encodes through `encode_pk_column_promoted`, sign-extending a
-    /// signed source from its native width before OPK-encoding at the promoted
-    /// index column: the span is order-preserving for every type (a signed source
-    /// promotes to a signed `I64`/`I128` index column whose sign-flip puts
-    /// negatives below non-negatives), and equality-correct (equal logical values
-    /// pack byte-identically regardless of source/target width). A column whose
-    /// source already matches the index type (`U128`/`UUID`, base unsigned ≤8B)
-    /// reduces to `encode_pk_column`.
-    ///
-    /// The source bytes come from the locator (`is_null` gates, `bytes` reads the
-    /// OPK PK window or the native-LE payload cell); the only thing spelled per
-    /// variant is *which encoder* consumes them — a PK source is already OPK, so
-    /// it goes through `gnitz_wire::promote_opk_column` (OPK→OPK, identity when
-    /// unpromoted), a payload source through `encode_pk_column_promoted`
-    /// (native→OPK). Those are the same two primitives `ops::reindex`'s
-    /// `ColPromoter::write_into` uses — the two must emit byte-identical keys for
-    /// one logical value, so they share the encoders rather than each spelling the
-    /// promotion.
-    pub(crate) fn write_span(&self, mb: &impl RowSource, row: usize, dst: &mut [u8]) -> bool {
-        debug_assert!(dst.len() >= self.key_size(), "write_span: dst shorter than the span");
-        let mut off = 0;
-        for (loc, col) in self.locators[..self.n as usize].iter().zip(self.idx_cols()) {
-            // PK columns are never null, so this is the payload-only NULL gate.
-            if loc.is_null(mb, row) {
-                return false;
-            }
-            let target_w = col.size() as usize; // promoted index column width
-            let out = &mut dst[off..off + target_w];
-            let src = loc.bytes(mb, row);
-            match *loc {
-                ColumnLocator::Pk { type_code, .. } => {
-                    gnitz_wire::promote_opk_column(src, type_code, col.type_code, out)
-                }
-                ColumnLocator::Payload { type_code, .. } => {
-                    gnitz_wire::encode_pk_column_promoted(src, type_code, col.type_code, out)
-                }
-            }
-            off += target_w;
-        }
-        true
-    }
-
-    /// [`Self::write_span`] plus the source-PK OPK suffix: one row's full index
-    /// entry key `[span ‖ src_pk]` in `dst[..key_size() + pk_stride]`. The single
-    /// definition of "this row's index entry", shared by the write-side
-    /// projection (`batch_project_index`) and the read-side entry-range filter
-    /// (`row_in_index_range`), so the two agree byte-for-byte by construction.
-    /// Returns `false` (row not indexed — NULL in an indexed column; `dst`
-    /// partially written) exactly as `write_span` does. Full-arity specs only:
-    /// a prefix spec would place the suffix over the uncovered columns' bytes.
-    pub(crate) fn write_entry(&self, mb: &impl RowSource, row: usize, dst: &mut [u8]) -> bool {
-        if !self.write_span(mb, row, dst) {
-            return false;
-        }
-        let pk = mb.get_pk_bytes(row);
-        dst[self.key_size()..self.key_size() + pk.len()].copy_from_slice(pk);
-        true
-    }
-
-    /// `write_span` into a caller-reused `PkBuf` — no intermediate stack
-    /// buffer, no `from_bytes` re-copy (this runs in the backfill scan and on
-    /// every insert). Maintains `PkBuf`'s "tail past `len` is zero" invariant
-    /// (zeroing only when this key is narrower than the previous one in the
-    /// reused scratch — free in the common same-circuit loop), so callers may
-    /// slice `out.bytes[..stride]` as the span zero-padded to any wider stride.
-    /// A NULL-skipped row returns `false` with `out` unchanged in meaning.
-    pub(crate) fn key_bytes(&self, mb: &impl RowSource, row: usize, out: &mut key::PkBuf) -> bool {
-        if !self.write_span(mb, row, &mut out.bytes) {
-            return false;
-        }
-        let len = self.key_size();
-        if (out.len as usize) > len {
-            out.bytes[len..out.len as usize].fill(0);
-        }
-        out.len = len as u8;
-        true
-    }
-
-    /// Seek-side counterpart of [`Self::write_span`]: OPK-encode native key
-    /// values (zero-extended, as `pk_native_key`/`payload_native_key` produce
-    /// them) into the leading-key span, returned as a [`key::PkBuf`] of exactly
-    /// [`Self::key_size`] bytes. For a leading-prefix seek, build the spec over
-    /// only the supplied columns. Encodes through the shared
-    /// [`key::encode_leading_opk`], the same per-column call `write_span` makes,
-    /// so the seek prefix matches the projected entries by construction. Bytes
-    /// past the span stay zero (the source-PK suffix is not part of it).
-    pub(crate) fn seek_prefix(&self, natives: &[u128]) -> key::PkBuf {
-        debug_assert_eq!(
-            natives.len(),
-            self.n as usize,
-            "seek_prefix: one native value per spec column"
-        );
-        let cols = self.locators[..self.n as usize]
-            .iter()
-            .zip(self.idx_cols())
-            .map(|(loc, col)| (loc.type_code(), *col));
-        key::encode_leading_opk(cols, natives)
     }
 }
 
@@ -1328,7 +1128,7 @@ mod tests {
         assert_eq!(s.columns[MAX_COLUMNS - 1].size(), 8);
 
         // payload_columns() walks non-PK indices in logical order.
-        let payload: Vec<usize> = s.payload_columns().map(|(_, ci, _)| ci).collect();
+        let payload: Vec<usize> = s.payload_columns().map(|(pi, _)| s.payload_col_idx(pi)).collect();
         assert_eq!(payload, vec![1, 2]);
         assert_eq!(s.try_payload_idx(1), Some(0));
         assert_eq!(s.try_payload_idx(2), Some(1));
@@ -1383,7 +1183,11 @@ mod tests {
             SchemaColumn::new(type_code::U128, 0),
         ];
         let s = SchemaDescriptor::new(&cols, &[1]);
-        let v: Vec<(usize, usize, u8)> = s.pk_columns().map(|(ord, ci, c)| (ord, ci, c.type_code)).collect();
+        let v: Vec<(usize, usize, u8)> = s
+            .pk_columns()
+            .enumerate()
+            .map(|(ord, (ci, c))| (ord, ci, c.type_code))
+            .collect();
         assert_eq!(v, vec![(0, 1, type_code::I64)]);
         assert_eq!(s.pk_indices()[0], 1);
     }
@@ -1445,7 +1249,11 @@ mod tests {
         ];
         let s = SchemaDescriptor::new(&cols, &[0, 1]);
         assert_eq!(s.pk_stride(), 12);
-        let v: Vec<(usize, usize, u8)> = s.pk_columns().map(|(ord, ci, c)| (ord, ci, c.type_code)).collect();
+        let v: Vec<(usize, usize, u8)> = s
+            .pk_columns()
+            .enumerate()
+            .map(|(ord, (ci, c))| (ord, ci, c.type_code))
+            .collect();
         assert_eq!(v, vec![(0, 0, type_code::U64), (1, 1, type_code::U32)]);
     }
 
@@ -1457,7 +1265,7 @@ mod tests {
         let pks: Vec<u32> = (0..MAX_PK_COLUMNS as u32).collect();
         let s = SchemaDescriptor::new(&cols, &pks);
         assert_eq!(s.pk_indices().len(), MAX_PK_COLUMNS);
-        let collected: Vec<(usize, usize)> = s.pk_columns().map(|(ord, ci, _)| (ord, ci)).collect();
+        let collected: Vec<(usize, usize)> = s.pk_columns().enumerate().map(|(ord, (ci, _))| (ord, ci)).collect();
         let expected: Vec<(usize, usize)> = (0..MAX_PK_COLUMNS).map(|k| (k, k)).collect();
         assert_eq!(collected, expected);
         assert_eq!(s.pk_stride() as usize, MAX_PK_COLUMNS * 8);

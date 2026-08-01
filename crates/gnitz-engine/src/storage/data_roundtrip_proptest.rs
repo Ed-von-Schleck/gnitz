@@ -102,7 +102,7 @@ fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128
 
         // Null bitmap: a null bit only where the column is nullable.
         let mut nw: u64 = 0;
-        for (pi, _ci, col) in schema.payload_columns() {
+        for (pi, col) in schema.payload_columns() {
             if col.nullable != 0 && rng.gen_range(2) == 0 {
                 gnitz_wire::null_word_set(&mut nw, pi, true);
             }
@@ -110,7 +110,7 @@ fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128
         batch.extend_null_bmp(&nw.to_le_bytes());
 
         // Payload columns, in payload (not schema-column) index order.
-        for (pi, _ci, col) in schema.payload_columns() {
+        for (pi, col) in schema.payload_columns() {
             let cs = col.size() as usize;
             if gnitz_wire::null_word_get(nw, pi) {
                 batch.fill_col_zero(pi, cs); // null cell; zset_of won't read it
@@ -160,7 +160,7 @@ fn row_key(batch: &Batch, schema: &SchemaDescriptor, row: usize) -> RowKey {
     let pk = batch.get_pk_bytes(row).to_vec(); // byte-addressed: any width
     let nw = batch.get_null_word(row);
     let mut vals: Vec<Option<Vec<u8>>> = Vec::with_capacity(schema.num_payload_cols());
-    for (pi, _ci, col) in schema.payload_columns() {
+    for (pi, col) in schema.payload_columns() {
         if gnitz_wire::null_word_get(nw, pi) {
             vals.push(None);
             continue;
