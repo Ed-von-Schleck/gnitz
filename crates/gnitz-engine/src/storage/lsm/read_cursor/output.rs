@@ -15,7 +15,7 @@ use super::super::columnar::with_payload_cmp;
 use super::super::merge::DirectWriter;
 use super::super::scatter::scatter_unified_sources_with_weights;
 use super::source::CursorSource;
-use super::{ReadCursor, RowComparator};
+use super::{ReadCursor, RowComparator, SourceMode};
 use gnitz_expr::RowSource;
 
 thread_local! {
@@ -153,6 +153,9 @@ impl ReadCursor {
     /// Materialize all non-zero-weight rows in merge order into an owned
     /// `Rc<Batch>`.
     pub(crate) fn materialize(mut self) -> Rc<Batch> {
+        // Deliberately `sources.len() == 1`, not `SourceMode::Single`: this arm
+        // hands out the whole source by `Rc::clone`, so it needs the stronger
+        // precondition that there is no other source to have skipped rows.
         if self.sources.len() == 1 && self.states[0].position == 0 {
             match &self.sources[0] {
                 CursorSource::Batch(rc) if rc.consolidated_verified(&self.schema) => {
@@ -181,32 +184,46 @@ impl ReadCursor {
         self.drain_to_batch(max_rows)
     }
 
-    /// Bulk-drain a single-source cursor into an Batch, bypassing
-    /// per-row iteration. Returns `None` for multi-source cursors, signaling
-    /// the caller to fall back to row-at-a-time.
+    /// Bulk-drain a cursor with exactly one live source into a Batch, bypassing
+    /// per-row iteration. Returns `None` when two or more sources can still
+    /// contribute, signaling the caller to fall back to row-at-a-time.
+    ///
+    /// Keys on `SourceMode::Single(i)`, not on `sources.len() == 1`: the other
+    /// sources have an empty `[position, count)` window, so nothing they hold can
+    /// fold against the drained rows — which is the precondition this bulk copy
+    /// actually needs.
     ///
     /// `limit == 0` means drain all remaining rows.
     pub(super) fn drain_single_source(&mut self, limit: usize) -> Option<Batch> {
-        if !self.valid || self.sources.len() != 1 {
+        let SourceMode::Single(i) = self.mode else {
+            return None;
+        };
+        if !self.valid {
             return None;
         }
-        let state = &self.states[0];
+        let state = &self.states[i];
         let start = state.position;
         let remaining = state.count - start;
         let row_count = if limit > 0 { remaining.min(limit) } else { remaining };
         let schema = &self.schema;
 
-        let batch = match &self.sources[0] {
+        let batch = match &self.sources[i] {
             CursorSource::Batch(b) => {
                 // A verbatim slice copy — neither sorts nor consolidates — so it
                 // carries the source's own flags rather than asserting them. (In
                 // practice every cursor-source batch is already consolidated; see
                 // the note in `drain_to_batch`. This helper relies on neither.)
-                let end = start + row_count;
+                //
+                // Both blob arms are available here, so the same predicate the
+                // shard arm below uses picks between them: share the source's heap
+                // verbatim, or relocate only the drained rows' strings.
                 let mut out = Batch::with_capacity(*schema, row_count.max(1));
-                out.append_batch(b, start, end);
+                if !Batch::should_relocate_blob(row_count, b.count, b.blob.len()) {
+                    out.share_blob_from(b);
+                }
+                out.append_ranges(b, &[(start, start + row_count)]);
                 // A contiguous slice of a sorted/consolidated source preserves its
-                // layout (faithful); `append_batch` downgraded `out` to `Raw` first.
+                // layout (faithful); `append_ranges` downgraded `out` to `Raw` first.
                 out.inherit_layout(b);
                 out
             }
@@ -214,7 +231,7 @@ impl ReadCursor {
         };
 
         // Advance position past the drained rows
-        self.states[0].position = start + row_count;
+        self.states[i].position = start + row_count;
         self.drive();
         Some(batch)
     }

@@ -1,7 +1,8 @@
 use super::*;
+use crate::foundation::posix_io::raise_fd_limit_for_tests;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use crate::storage::Layout;
-use crate::test_support::{make_schema_u128_i64, wide_pk_3xu64_schema};
+use crate::storage::{BatchBuilder, Layout};
+use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u128_i64, wide_pk_3xu64_schema};
 use gnitz_wire::as_le_bytes;
 
 /// `(U64 PK | I64 payload)` — stride-8, the dominant single-PK table shape. It
@@ -916,7 +917,7 @@ fn pair_equiv_multi() {
 
         let mut pair = create_read_cursor(&srcs, &[], make_schema_u128_i64());
         assert!(
-            matches!(pair.mode, SourceMode::Pair),
+            matches!(pair.mode, SourceMode::Pair(..)),
             "production must pick Pair at len 2"
         );
         let mut multi = create_cursor_force_multi(&srcs);
@@ -1891,7 +1892,7 @@ fn read_cursor_advance_to_rebuild_bench() {
 
             {
                 let mut c = create_read_cursor(&[], &single, schema);
-                assert!(matches!(c.mode, SourceMode::Single));
+                assert!(matches!(c.mode, SourceMode::Single(_)));
                 adv_assert_cursor_oracle(|| create_read_cursor(&[], &single, schema), stride, &sample);
                 let ns = adv_time_cursor_sweep(&mut c, stride, count, 128, true, tier, &mut scratch);
                 println!(
@@ -1901,7 +1902,7 @@ fn read_cursor_advance_to_rebuild_bench() {
             }
             {
                 let mut c = create_read_cursor(&[], &pair, schema);
-                assert!(matches!(c.mode, SourceMode::Pair));
+                assert!(matches!(c.mode, SourceMode::Pair(..)));
                 adv_assert_cursor_oracle(|| create_read_cursor(&[], &pair, schema), stride, &sample);
                 let ns = adv_time_cursor_sweep(&mut c, stride, count, 128, true, tier, &mut scratch);
                 println!(
@@ -2032,4 +2033,131 @@ fn count_range_raw_does_not_reposition() {
     assert_eq!(counted.valid, plain.valid);
     assert_eq!(counted.current_pk_bytes(), plain.current_pk_bytes());
     assert_eq!(scan_all(&mut counted), scan_all(&mut plain));
+}
+
+// -- Live-source mode derivation ---------------------------------------
+
+/// Four non-overlapping sources: source `i` holds PKs `i·100 + 1 ..= i·100 + 40`,
+/// payload `pk · 10`. Any key window falls inside at most a few of them, so a seek
+/// over the whole cursor empties the rest. The derivation reads only
+/// `CursorState::is_valid`, so batches exercise it exactly as shards would.
+fn four_disjoint_batches() -> Vec<Rc<Batch>> {
+    (0..4)
+        .map(|s| {
+            let rows: Vec<(u128, i64, i64)> = (1..=40u128)
+                .map(|i| {
+                    let pk = s as u128 * 100 + i;
+                    (pk, 1, pk as i64 * 10)
+                })
+                .collect();
+            make_batch(&rows)
+        })
+        .collect()
+}
+
+/// `(pk, weight, payload)` for `lo ..= hi` of the fixture above.
+fn expect_rows(lo: u64, hi: u64) -> Vec<(u64, i64, i64)> {
+    (lo..=hi).map(|pk| (pk, 1, pk as i64 * 10)).collect()
+}
+
+/// The mode tracks which sources are live, at every count the dispatch
+/// distinguishes, and never destroys a source to get there: a bounded or unbounded
+/// seek collapses `Multi` down to `Pair`/`Single`/`Empty`, while `rewind` and a
+/// backward `advance_to` re-liven what a range seek emptied. The from-scratch
+/// oracle at the end pins the landing row and its weight across the whole
+/// collapse, which the mode assertions alone do not.
+#[test]
+fn mode_follows_the_live_source_set() {
+    let schema = make_schema_u128_i64();
+    let b = four_disjoint_batches();
+    let opk = |pk: u128| pk.to_be_bytes();
+
+    let mut c = create_read_cursor(&b, &[], schema);
+    assert!(matches!(c.mode, SourceMode::Multi(_)));
+
+    c.seek_range_bytes(&opk(301), Some(&opk(311)));
+    assert!(matches!(c.mode, SourceMode::Single(3)), "range inside source 3");
+    assert_eq!(c.sources.len(), 4, "no source is destroyed");
+    assert_eq!(scan_all_with_val(&mut c), expect_rows(301, 310));
+
+    // A source a range seek emptied is only unpositioned, so a backward
+    // `advance_to` brings it back — in full, up to its clamped count.
+    c.advance_to(&opk(101));
+    assert!(matches!(c.mode, SourceMode::Multi(_)), "sources 1 and 2 are live again");
+    let rows = scan_all_with_val(&mut c);
+    assert_eq!(rows.len(), 40 + 40 + 10);
+    assert_eq!(rows.first().copied(), Some((101, 1, 1010)));
+
+    // A window spanning exactly two sources takes the Pair bypass.
+    let mut c = create_read_cursor(&b, &[], schema);
+    c.seek_range_bytes(&opk(220), Some(&opk(320)));
+    assert!(matches!(c.mode, SourceMode::Pair(2, 3)));
+    // 220..=240 from source 2, 301..=319 from source 3.
+    assert_eq!(scan_all_with_val(&mut c).len(), 21 + 19);
+
+    // The unbounded seek reaches the same collapse — a range-only derivation would
+    // not — and `rewind` from it re-livens every source.
+    let mut c = create_read_cursor(&b, &[], schema);
+    c.seek_bytes(&opk(301));
+    assert!(matches!(c.mode, SourceMode::Single(3)));
+    assert_eq!(scan_all_with_val(&mut c).len(), 40);
+    c.rewind();
+    assert!(matches!(c.mode, SourceMode::Multi(_)), "rewind re-livens every source");
+    assert_eq!(scan_all_with_val(&mut c).len(), 4 * 40);
+
+    // A window covering nothing: no rows, no drain, no panic.
+    let mut c = create_read_cursor(&b, &[], schema);
+    c.seek_range_bytes(&opk(41), Some(&opk(51)));
+    assert!(matches!(c.mode, SourceMode::Empty));
+    assert!(!c.valid);
+    assert!(c.drain_to_batch(0).is_none());
+
+    assert_advance_to_matches_seek_oracle(schema, &b, &[0, 105, 250, 305, 120, 341, 220]);
+}
+
+/// A bounded read over a multi-shard STRING partition that only one shard covers
+/// drains through the single-source bulk path, and the batch it returns carries
+/// only the range's own heap bytes — the two halves composed, at a non-zero source
+/// index so a drain writing back `states[0]` would be caught.
+#[test]
+fn bounded_string_read_carries_only_its_own_rows() {
+    raise_fd_limit_for_tests();
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_pk_u64_payload_string();
+    const PER_SHARD: u64 = 100;
+    // 40-byte strings, all spilled to the heap.
+    let text = |pk: u64| format!("{pk:0>40}");
+
+    let shards: Vec<Rc<MappedShard>> = (0..2u64)
+        .map(|s| {
+            let mut bb = BatchBuilder::new(schema);
+            for i in 0..PER_SHARD {
+                let pk = s * 10_000 + i + 1;
+                bb.begin_row(pk as u128, 1);
+                bb.put_string(&text(pk));
+                bb.end_row();
+            }
+            let cpath = std::ffi::CString::new(dir.path().join(format!("s{s}.db")).to_str().unwrap()).unwrap();
+            bb.finish()
+                .write_as_shard(&cpath, &schema, super::super::shard_file::ShardWriteOpts::default())
+                .unwrap();
+            Rc::new(MappedShard::open(&cpath, &schema, false).unwrap())
+        })
+        .collect();
+    assert_eq!(shards[1].blob_len as u64, PER_SHARD * 40);
+
+    let mut c = create_read_cursor(&[], &shards, schema);
+    c.seek_range_bytes(&10_001u64.to_be_bytes(), Some(&10_004u64.to_be_bytes()));
+    assert!(matches!(c.mode, SourceMode::Single(1)));
+
+    let batch = c.drain_to_batch(0).expect("shard 1 window");
+    assert_eq!(batch.count, 3);
+    assert_eq!(batch.blob.len(), 3 * 40, "only the drained rows' strings");
+    for i in 0..3 {
+        assert_eq!(
+            crate::test_support::read_german_string(&batch, 0, i),
+            text(10_001 + i as u64).into_bytes(),
+        );
+    }
+    assert!(!c.valid, "the window is fully drained");
 }

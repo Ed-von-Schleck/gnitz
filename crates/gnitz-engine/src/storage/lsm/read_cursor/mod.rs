@@ -80,18 +80,29 @@ impl CursorState {
 // ReadCursor
 // ---------------------------------------------------------------------------
 
-/// Dispatch on source count, replacing the previous `tree: Option<LoserTree>` +
-/// parallel `entries.len() == 1` checks. The variants are exhaustive so each call
-/// site dispatches once. `Pair` (exactly 2 sources) bypasses the loser tree with
-/// a one-compare-per-row 2-head merge read straight from `states[0]`/`states[1]`
-/// — the frequent DBSP shape (a delta against a well-compacted trace) that would
-/// otherwise pay the heap's fixed per-emit cost (`bench_merge_scan_by_k`'s
-/// k1→k2 cliff). `Pair` keeps no separate head state, so the seek/rewind paths
-/// (which only rebuild a `Multi` tree) re-drive it with no special handling.
+/// Dispatch on the source set that was live at the last absolute reposition
+/// (`mode_for`), replacing the previous `tree: Option<LoserTree>` + parallel
+/// `entries.len() == 1` checks. The variants are exhaustive so each call site
+/// dispatches once, and the ≤2-live variants carry the indices they drive — so a
+/// bypass applies whether or not the live sources are the leading ones. `Multi`
+/// carries no indices: dead sources still enter the tree, as sentinel leaves.
+///
+/// Forward progress does not re-derive the mode, so it can be pessimistic (a
+/// `Multi` whose sources have since exhausted down to one). That direction is
+/// always safe — `drive_pair_inner`'s validity checks and the tree's sentinels
+/// handle an exhausted member — so mode and liveness agreeing is not an invariant.
+///
+/// `Pair` (exactly 2 live sources) bypasses the loser tree with a
+/// one-compare-per-row 2-head merge read straight from their two states — the
+/// frequent DBSP shape (a delta against a well-compacted trace). It drops the
+/// tree's per-emit indirection and bounds checks, not comparisons: at k=2 the tree
+/// already does one compare per `replace_top` (`shard_merge_scan_bench` sweeps k).
+/// `Pair` keeps no separate head state, so the seek/rewind paths re-drive it with
+/// no special handling.
 enum SourceMode {
     Empty,
-    Single,
-    Pair,
+    Single(usize),
+    Pair(usize, usize),
     Multi(LoserTree),
 }
 
@@ -151,14 +162,33 @@ impl ReadCursor {
         with_payload_cmp!(schema, Self::build_tree_with, sources, states, schema)
     }
 
+    /// The drive mode for the currently live sources: a source whose
+    /// `[position, count)` window is empty cannot contribute a row, so with one or
+    /// two live it takes a bypass instead of a tree. Counts at most three — that is
+    /// all the dispatch distinguishes.
+    ///
+    /// Emptiness is not permanent, which is why the mode is *derived* at every
+    /// absolute reposition rather than the source set being narrowed:
+    /// `CursorState::advance_to` searches its source's full row count and is
+    /// backward-capable, so a later seek at a lower key can move a source that a
+    /// range seek emptied back inside its clamped window. Dropping the source
+    /// would discard rows it can still contribute.
+    fn mode_for(sources: &[CursorSource], states: &[CursorState], schema: &SchemaDescriptor) -> SourceMode {
+        let mut live = states
+            .iter()
+            .enumerate()
+            .filter_map(|(i, st)| st.is_valid().then_some(i));
+        match (live.next(), live.next(), live.next()) {
+            (None, _, _) => SourceMode::Empty,
+            (Some(a), None, _) => SourceMode::Single(a),
+            (Some(a), Some(b), None) => SourceMode::Pair(a, b),
+            _ => SourceMode::Multi(Self::build_tree(sources, states, schema)),
+        }
+    }
+
     fn new(sources: Vec<CursorSource>, states: Vec<CursorState>, schema: SchemaDescriptor) -> Self {
         debug_assert_eq!(sources.len(), states.len());
-        let mode = match sources.len() {
-            0 => SourceMode::Empty,
-            1 => SourceMode::Single,
-            2 => SourceMode::Pair,
-            _ => SourceMode::Multi(Self::build_tree(&sources, &states, &schema)),
-        };
+        let mode = Self::mode_for(&sources, &states, &schema);
         let mut cursor = ReadCursor {
             sources,
             states,
@@ -175,15 +205,15 @@ impl ReadCursor {
         cursor
     }
 
-    /// Rebuild the loser tree (when multi-source) after the per-source
-    /// positions have been moved, then drive to the first live row. Shared
-    /// tail of [`seek`], [`seek_bytes`], and [`rewind`]: repositioning a source
-    /// invalidates the tree's cached head comparisons, so it must be rebuilt
-    /// before the next `drive`.
+    /// Re-derive the drive mode after the per-source positions have been moved,
+    /// then drive to the first live row. Shared tail of [`seek_bytes`],
+    /// [`seek_range_bytes`], [`rewind`], and [`advance_to`]'s reposition arm:
+    /// repositioning changes which sources are live (and invalidates a tree's
+    /// cached head comparisons), so the mode must be recomputed before the next
+    /// `drive`. Nothing is destroyed — `sources` stays intact, which is what
+    /// keeps the positional `unified_sources` cache valid by construction.
     fn rebuild_and_drive(&mut self) {
-        if let SourceMode::Multi(_) = &self.mode {
-            self.mode = SourceMode::Multi(Self::build_tree(&self.sources, &self.states, &self.schema));
-        }
+        self.mode = Self::mode_for(&self.sources, &self.states, &self.schema);
         self.drive();
     }
 
@@ -541,8 +571,8 @@ impl ReadCursor {
     /// advance every head past it), so the next drive opens a fresh group.
     #[inline]
     fn pre_step_single(&mut self) {
-        if matches!(self.mode, SourceMode::Single) {
-            self.states[0].advance();
+        if let SourceMode::Single(i) = self.mode {
+            self.states[i].advance();
         }
     }
 
@@ -574,17 +604,19 @@ impl ReadCursor {
         }
     }
 
-    /// Single-source bypass: no heap, no ghost filter. `Batch` inputs are
-    /// pre-consolidated and `CursorState::advance` already calls `skip_ghosts`
-    /// for shard sources, so the state's current position is either valid
-    /// emit-ready or past-end. Routes through `commit_emitted` so every mode
-    /// materializes `current_*` in one place.
+    /// Single-live-source bypass: no heap, no ghost filter. Every production
+    /// `Batch` source is a memtable run (`upsert_sorted_batch` debug-asserts each
+    /// one consolidated) and shards are ghost-free by construction, so the state's
+    /// current position is either valid emit-ready or past-end. The other
+    /// sources — if any — have an empty `[position, count)` window and cannot
+    /// contribute a row to fold against. Routes through `commit_emitted` so
+    /// every mode materializes `current_*` in one place.
     #[inline]
-    fn drive_single(&mut self) {
-        let s = &self.states[0];
+    fn drive_single(&mut self, i: usize) {
+        let s = &self.states[i];
         let emitted = s
             .is_valid()
-            .then(|| (self.sources[0].get_weight(s.position), 0, s.position));
+            .then(|| (self.sources[i].get_weight(s.position), i, s.position));
         self.commit_emitted(emitted);
     }
 
@@ -640,8 +672,8 @@ impl ReadCursor {
     fn drive_with<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) {
         match self.mode {
             SourceMode::Empty => self.valid = false,
-            SourceMode::Single => self.drive_single(),
-            SourceMode::Pair => self.drive_pair_inner(row_cmp),
+            SourceMode::Single(i) => self.drive_single(i),
+            SourceMode::Pair(a, b) => self.drive_pair_inner(a, b, row_cmp),
             SourceMode::Multi(_) => self.drive_with_inner(row_cmp),
         }
     }
@@ -674,26 +706,26 @@ impl ReadCursor {
         self.commit_emitted(emitted);
     }
 
-    /// Two-head merge bypass for `SourceMode::Pair` — the heap-free analogue of
-    /// `drive_single`. Reads the two heads straight from `states[0]`/`states[1]`
+    /// Two-head merge bypass for `SourceMode::Pair(a, b)` — the heap-free analogue
+    /// of `drive_single`. Reads the two heads straight from `states[a]`/`states[b]`
     /// (no cached head positions, so the seek/rewind paths re-drive a Pair with no
     /// special handling), merges by one PK compare (`compare_pk_ordering`) plus the
     /// payload `row_cmp` on a PK tie, folds equal `(PK, payload)` across both heads,
     /// and skips ghost groups — committing the first live group's exemplar.
     /// Consumes the emitted group (advances both heads past it), so the next call
     /// opens the next group — the same postcondition `drive_with_inner`'s heap fold
-    /// leaves, which is why `advance` must NOT pre-step for a Pair. Monomorphized on
-    /// payload (`row_cmp`).
+    /// leaves, which is why `advance` must NOT pre-step for a Pair. `a < b`
+    /// (`mode_for` scans in index order), so the exemplar of a fully-tied
+    /// `(PK, payload)` group is `a`'s row. Monomorphized on payload (`row_cmp`).
     #[inline]
-    fn drive_pair_inner<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) {
-        debug_assert!(matches!(self.mode, SourceMode::Pair));
+    fn drive_pair_inner<RowCmp: RowComparator>(&mut self, a: usize, b: usize, row_cmp: RowCmp) {
         let schema = &self.schema;
         let sources = &self.sources;
         let states = &mut self.states;
 
         let emitted: Option<(i64, usize, usize)> = loop {
-            let v0 = states[0].is_valid();
-            let v1 = states[1].is_valid();
+            let v0 = states[a].is_valid();
+            let v1 = states[b].is_valid();
             if !v0 && !v1 {
                 break None;
             }
@@ -706,20 +738,20 @@ impl ReadCursor {
             // told us which, letting the common (distinct-PK) path skip the other
             // head's fold probe entirely.
             let (ex_src, ex_pk, other_in_group): (usize, &[u8], bool) = if !v1 {
-                (0, sources[0].get_pk_bytes(states[0].position), false)
+                (a, sources[a].get_pk_bytes(states[a].position), false)
             } else if !v0 {
-                (1, sources[1].get_pk_bytes(states[1].position), false)
+                (b, sources[b].get_pk_bytes(states[b].position), false)
             } else {
-                let p0 = sources[0].get_pk_bytes(states[0].position);
-                let p1 = sources[1].get_pk_bytes(states[1].position);
+                let p0 = sources[a].get_pk_bytes(states[a].position);
+                let p1 = sources[b].get_pk_bytes(states[b].position);
                 match compare_pk_ordering(p0, p1) {
-                    Ordering::Less => (0, p0, false),
-                    Ordering::Greater => (1, p1, false),
+                    Ordering::Less => (a, p0, false),
+                    Ordering::Greater => (b, p1, false),
                     Ordering::Equal => {
-                        match row_cmp(schema, &sources[0], states[0].position, &sources[1], states[1].position) {
-                            Ordering::Greater => (1, p1, false),
-                            Ordering::Less => (0, p0, false),
-                            Ordering::Equal => (0, p0, true), // identical (PK,payload): fold both
+                        match row_cmp(schema, &sources[a], states[a].position, &sources[b], states[b].position) {
+                            Ordering::Greater => (b, p1, false),
+                            Ordering::Less => (a, p0, false),
+                            Ordering::Equal => (a, p0, true), // identical (PK,payload): fold both
                         }
                     }
                 }
@@ -734,9 +766,10 @@ impl ReadCursor {
 
             // Fold one head's run into `net`: accumulate every remaining row equal
             // to the exemplar `(ex_pk, payload)` and advance past it. Applied to
-            // the exemplar's own source (intra-source duplicates — a memtable run
-            // is sorted but not necessarily consolidated) and, when it joined this
-            // group, to the other head.
+            // the exemplar's own source — matching what `drive_merge` does for the
+            // `Multi` path, so the two modes cannot disagree on a source carrying
+            // intra-source duplicates — and, when it joined this group, to the
+            // other head.
             let mut fold_run = |s: usize, net: &mut i64| {
                 while states[s].is_valid() {
                     let pos = states[s].position;
@@ -751,7 +784,9 @@ impl ReadCursor {
             };
             fold_run(ex_src, &mut net);
             if other_in_group {
-                fold_run(1 - ex_src, &mut net);
+                // Only the fully-tied arm sets `other_in_group`, and it picks `a`
+                // as the exemplar — so the head still to fold is always `b`.
+                fold_run(b, &mut net);
             }
             if net != 0 {
                 break Some((net, ex_src, ex_row));

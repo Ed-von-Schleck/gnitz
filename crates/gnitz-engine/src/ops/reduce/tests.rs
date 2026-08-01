@@ -7345,7 +7345,7 @@ fn sum_count_reference<'a>(
 /// integrating each epoch's output delta back into the trace (flushed once
 /// after epoch 0 when `flush_after_first`). Returns the final consolidated
 /// trace_out batch and the maximum source count any epoch's probe cursor was
-/// built from, so a caller can assert `SourceMode::Multi` (≥ 3 sources) was
+/// built from, so a caller can assert `SourceMode::Multi` (≥ 3 sources, all live at open) was
 /// exercised.
 fn run_reduce_trace_epochs(
     dir: &std::path::Path,
@@ -7610,7 +7610,7 @@ fn single_col_canonical_group_key_predicate() {
 // Many groups per epoch over ≥ 3 trace_out sources. 200 groups spanning the sign
 // flip (-100..99), six epochs each touching every group (insert / update /
 // delete). One flush after epoch 0 plus accumulating memtable runs pushes the
-// trace_out cursor to `SourceMode::Multi` (≥ 3 sources) from epoch 3 on, so the
+// trace_out cursor to `SourceMode::Multi` (≥ 3 sources, all live at open) from epoch 3 on, so the
 // multi-source gallop (`seek_forward_multi`) and the debug ascending tripwire
 // both execute across hundreds of monotone probes. Construction makes every
 // group's final aggregate identical (SUM=10, COUNT=3), so any mis-landed
@@ -7660,7 +7660,7 @@ fn reduce_monotone_probe_many_groups_multi_source() {
 
     assert!(
         max_sources >= 3,
-        "trace_out probe must reach SourceMode::Multi (≥ 3 sources); saw {max_sources}",
+        "trace_out probe must reach SourceMode::Multi (≥ 3 sources, all live at open); saw {max_sources}",
     );
     assert_eq!(
         final_batch.count,

@@ -22,6 +22,13 @@ fn next_blob_id() -> u64 {
 /// Below this, hugepage promotion is impossible (no full 2MB PMD region).
 const HUGEPAGE_THRESHOLD: usize = 2 * 1024 * 1024;
 
+/// Cost of relocating one German-string cell, in bytes of whole-heap memcpy — the
+/// unit that lets [`Batch::should_relocate_blob`] weigh the two arms with one
+/// comparison. Set from `slice_blob_relocate_bench`, which sweeps both arms over
+/// slice fraction × string width; the resulting crossovers (~3 % of a 16-byte-string
+/// source, ~7 % at 40 bytes, ~34 % at 256, ~67 % at 1024) are what this value fits.
+const RELOCATE_CELL_COST_BYTES: usize = 500;
+
 /// Maximum regions tracked in the `offsets`/`strides` arrays:
 /// 3 fixed (pk, weight, null_bmp) + up to 64 payload columns
 /// (schema max is `MAX_COLUMNS` = 65 total columns, 1 is the PK).  The blob is
@@ -1354,6 +1361,23 @@ impl Batch {
     /// the wire index range-seek — must not share, or the dropped rows' spans go
     /// over the wire; it builds the output with `append_ranges` instead, which
     /// relocates only the survivors, deduped.
+    /// Whether copying `row_count` rows out of a `src_count`-row source whose heap
+    /// is `src_blob_len` bytes should relocate the slice's own string cells rather
+    /// than carry the source's whole heap.
+    ///
+    /// The two arms cost: relocation, one cell rewrite per row plus the slice's own
+    /// share of the heap (`src_blob_len / src_count` per row); the whole-heap copy,
+    /// `src_blob_len` regardless of how few rows are kept. Expressing the per-cell
+    /// rewrite as [`RELOCATE_CELL_COST_BYTES`] of memcpy makes that one comparison.
+    ///
+    /// Only worth consulting where both arms are available — a destination that
+    /// cannot carry the source's heap verbatim (different blob identity, gathered
+    /// rather than contiguous rows, a result that is shipped) must relocate
+    /// regardless.
+    pub(crate) fn should_relocate_blob(row_count: usize, src_count: usize, src_blob_len: usize) -> bool {
+        src_count > 0 && src_blob_len > row_count.saturating_mul(RELOCATE_CELL_COST_BYTES + src_blob_len / src_count)
+    }
+
     pub fn from_ranges(src: &Batch, ranges: &[(usize, usize)], schema: &SchemaDescriptor) -> Batch {
         let rows = range_rows(ranges);
         if rows == 0 {

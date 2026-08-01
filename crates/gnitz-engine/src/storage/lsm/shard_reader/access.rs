@@ -7,7 +7,7 @@
 use std::ptr;
 
 use super::super::batch::{FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
-use super::super::merge::{ColPtr, UnifiedSource};
+use super::super::merge::{relocate_german_string_vec, BlobCacheGuard, ColPtr, UnifiedSource};
 use super::super::xor8;
 use super::{MappedShard, PackedRegion, PayloadRegion, ScalarRegion, WeightRegion};
 use crate::schema::key::PkBuf;
@@ -307,12 +307,31 @@ impl MappedShard {
 
     /// Bulk-copy a contiguous slice of rows into an Batch.
     /// Bypasses per-row cursor overhead entirely — one memcpy per column.
-    #[allow(clippy::uninit_vec)]
+    ///
+    /// Picks the blob arm via [`Batch::should_relocate_blob`]: a narrow slice off a
+    /// wide heap relocates only its own rows' strings, anything else copies the
+    /// whole region.
+    #[inline]
     pub(crate) fn slice_to_owned_batch(
         &self,
         start: usize,
         row_count: usize,
         schema: &crate::schema::SchemaDescriptor,
+    ) -> super::super::batch::Batch {
+        let relocate = super::super::batch::Batch::should_relocate_blob(row_count, self.count, self.blob_len);
+        self.slice_to_owned_batch_with(start, row_count, schema, relocate)
+    }
+
+    /// [`slice_to_owned_batch`](Self::slice_to_owned_batch) with the blob arm
+    /// passed in rather than derived, so `slice_blob_relocate_bench` can time both
+    /// on one slice.
+    #[allow(clippy::uninit_vec)]
+    pub(super) fn slice_to_owned_batch_with(
+        &self,
+        start: usize,
+        row_count: usize,
+        schema: &crate::schema::SchemaDescriptor,
+        relocate: bool,
     ) -> super::super::batch::Batch {
         use super::super::batch::{compute_offsets, strides_from_schema, Batch, Layout};
 
@@ -388,14 +407,49 @@ impl MappedShard {
         expand_scalar(&self.null_bmp, 8, &mut data[offsets[REG_NULL_BMP]..][..sz8]);
 
         for (pi, col) in schema.payload_columns() {
+            // A relocated string column is written cell-by-cell below; filling it
+            // here would only be overwritten.
+            if relocate && gnitz_wire::is_german_string(col.type_code) {
+                continue;
+            }
             let stride = col.size() as usize;
             let off = offsets[REG_PAYLOAD_START + pi];
             let sz = row_count * stride;
             expand_payload(&self.col_regions[pi], stride, &mut data[off..][..sz]);
         }
 
-        // Blob: one allocation, copy entire blob region (string offsets stay valid).
-        let blob = if self.blob_len > 0 {
+        // Blob. Relocating carries only the sliced rows' strings; the
+        // whole-region copy keeps every German-string offset valid without
+        // touching a cell.
+        let blob = if relocate {
+            debug_assert!(start + row_count <= self.count, "slice out of range");
+            let mut out = super::super::batch_pool::acquire_buf();
+            out.clear();
+            // The slice's share of the heap — an estimate, so `div_ceil` rather than
+            // a truncating quotient that would reserve nothing for a shard holding
+            // fewer heap bytes than rows.
+            out.reserve(self.blob_len.div_ceil(self.count) * row_count);
+            // Cap the dedup-map hint: a hint above `BLOB_CACHE_RECYCLE_CAP`'s
+            // capacity would make the map too large to return to the pool, so a
+            // chunked drain would malloc and free one per chunk. Entry count is
+            // bounded by *distinct* spans, which is below `row_count` anyway.
+            let mut guard = BlobCacheGuard::acquire(schema, row_count.min(4096));
+            let src_blob = self.blob_slice();
+            for (pi, col) in schema.payload_columns() {
+                if !gnitz_wire::is_german_string(col.type_code) {
+                    continue;
+                }
+                let off = offsets[REG_PAYLOAD_START + pi];
+                let dst = &mut data[off..off + row_count * 16];
+                for (i, cell) in dst.chunks_exact_mut(16).enumerate() {
+                    // Read through `get_col_ptr` so the Raw/Constant/Packed region
+                    // forms are handled the same way the bulk fill handles them.
+                    let src = self.get_col_ptr(start + i, pi, 16);
+                    cell.copy_from_slice(&relocate_german_string_vec(src, src_blob, &mut out, guard.get_mut()));
+                }
+            }
+            out
+        } else if self.blob_len > 0 {
             let src = &shard[self.blob_off..self.blob_off + self.blob_len];
             let mut buf = super::super::batch_pool::acquire_buf();
             buf.clear();

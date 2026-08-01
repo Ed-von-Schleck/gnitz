@@ -113,7 +113,7 @@ mod tests {
     use super::*;
     use crate::foundation::posix_io::raise_fd_limit_for_tests;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-    use crate::test_support::make_schema_u64_i64;
+    use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64, read_german_string};
 
     /// Build a shard via write_shard_streaming (uses encoding detection).
     fn build_test_shard(dir: &std::path::Path, rows: &[(u64, i64)]) -> String {
@@ -1189,5 +1189,146 @@ mod tests {
             Some(StorageError::ChecksumMismatch),
             "corrupted packed region caught by validate_checksums",
         );
+    }
+
+    // --- slice blob relocation ---
+
+    /// Build a `(U64 PK | STRING payload)` shard from `(pk, cell)` rows, where
+    /// each cell is an already-encoded German string over the shared `blob`.
+    /// Passing the cells in lets a caller give two rows the *same* heap span,
+    /// which a per-row `encode_german_string` never does (it appends
+    /// unconditionally). Rows must be PK-ascending.
+    fn write_string_shard(dir: &std::path::Path, name: &str, rows: &[(u64, [u8; 16])], blob: &[u8]) -> MappedShard {
+        use crate::storage::Batch;
+        let schema = make_schema_pk_u64_payload_string();
+        let mut batch = Batch::with_capacity(schema, rows.len().max(1));
+        batch.blob.extend_from_slice(blob);
+        for &(pk, cell) in rows {
+            batch.extend_pk(pk as u128);
+            batch.extend_weight(&1i64.to_le_bytes());
+            batch.extend_null_bmp(&0u64.to_le_bytes());
+            batch.extend_col(0, &cell);
+            batch.count += 1;
+        }
+        let cpath = std::ffi::CString::new(dir.join(name).to_str().unwrap()).unwrap();
+        batch
+            .write_as_shard(&cpath, &schema, ShardWriteOpts::default())
+            .unwrap();
+        MappedShard::open(&cpath, &schema, false).unwrap()
+    }
+
+    /// A `width`-byte string unique to row `i`, long enough to spill to the heap.
+    fn wide_string(i: usize, width: usize) -> Vec<u8> {
+        let mut s = format!("row-{i:08}-").into_bytes();
+        s.resize(width, b'x');
+        s
+    }
+
+    /// The blob arm, both ways on one shard. 128 rows of 64-byte strings, of which
+    /// rows 0 and 1 share a span, is a 8128-byte heap at 63 bytes/row, so
+    /// `should_relocate_blob` cuts over at 15 sliced rows. Below it the slice
+    /// carries only its own rows' bytes — once per *distinct* span, since the
+    /// relocation dedup cache keys on `(src_blob, offset, length)`. At and past it,
+    /// and for the whole shard, it copies the region verbatim. Every arm decodes
+    /// back to the original strings.
+    #[test]
+    fn slice_relocates_only_its_own_strings() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        const N: usize = 128;
+        const W: usize = 64;
+        const CUT: usize = 14;
+        let mut blob = Vec::new();
+        // Row 1 reuses row 0's cell verbatim, so the two share one heap span — which
+        // a per-row `encode_german_string` never produces (it always appends).
+        let shared = gnitz_wire::encode_german_string(&wide_string(0, W), &mut blob);
+        let mut rows: Vec<(u64, [u8; 16])> = vec![(1, shared), (2, shared)];
+        rows.extend((2..N).map(|i| {
+            (
+                i as u64 + 1,
+                gnitz_wire::encode_german_string(&wide_string(i, W), &mut blob),
+            )
+        }));
+        let schema = make_schema_pk_u64_payload_string();
+        let shard = write_string_shard(dir.path(), "reloc.db", &rows, &blob);
+        assert_eq!(shard.blob_len, (N - 1) * W, "row 1 added no bytes");
+
+        let one = shard.slice_to_owned_batch(37, 1, &schema);
+        assert_eq!(one.blob.len(), W, "a one-row slice carries one string");
+        assert_eq!(read_german_string(&one, 0, 0), wide_string(37, W));
+
+        let under = shard.slice_to_owned_batch(0, CUT, &schema);
+        assert_eq!(
+            under.blob.len(),
+            (CUT - 1) * W,
+            "relocates, and rows 0/1 share one span"
+        );
+        // Rows 0 and 1 both resolve to row 0's string, through the one copied span.
+        assert_eq!(read_german_string(&under, 0, 0), wide_string(0, W));
+        assert_eq!(read_german_string(&under, 0, 1), wide_string(0, W));
+
+        let at = shard.slice_to_owned_batch(0, CUT + 1, &schema);
+        assert_eq!(at.blob.len(), (N - 1) * W, "at the cut the whole region is copied");
+        let full = shard.slice_to_owned_batch(0, N, &schema);
+        assert_eq!(full.blob.as_slice(), shard.blob_slice(), "whole shard: verbatim");
+
+        for i in 2..CUT {
+            assert_eq!(read_german_string(&under, 0, i), wide_string(i, W), "relocated row {i}");
+            assert_eq!(read_german_string(&at, 0, i), wide_string(i, W), "whole-region row {i}");
+        }
+    }
+
+    /// The measurement `RELOCATE_CELL_COST_BYTES` is set from: whole-region memcpy
+    /// against per-cell relocation on the *same* slice, swept over slice fraction ×
+    /// string width.
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+    fn slice_blob_relocate_bench() {
+        use std::time::Instant;
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = make_schema_pk_u64_payload_string();
+        const N: usize = 20_000;
+        const ITERS: usize = 50;
+
+        let time_arm = |shard: &MappedShard, rc: usize, relocate: bool| -> f64 {
+            // One untimed pass faults in the cold mmap pages.
+            std::hint::black_box(shard.slice_to_owned_batch_with(0, rc, &schema, relocate));
+            let t = Instant::now();
+            for _ in 0..ITERS {
+                std::hint::black_box(shard.slice_to_owned_batch_with(0, rc, &schema, relocate));
+            }
+            t.elapsed().as_secs_f64() * 1e9 / ITERS as f64
+        };
+
+        for &w in &[16usize, 40, 256, 1024] {
+            let mut blob = Vec::new();
+            let rows: Vec<(u64, [u8; 16])> = (0..N)
+                .map(|i| {
+                    (
+                        i as u64 + 1,
+                        gnitz_wire::encode_german_string(&wide_string(i, w), &mut blob),
+                    )
+                })
+                .collect();
+            let shard = write_string_shard(dir.path(), &format!("bench_{w}.db"), &rows, &blob);
+            for &pct in &[
+                1usize, 2, 3, 4, 6, 8, 12, 16, 20, 25, 33, 40, 50, 60, 68, 75, 85, 90, 99,
+            ] {
+                let rc = (N * pct / 100).max(1);
+                let reloc = time_arm(&shard, rc, true);
+                let copy = time_arm(&shard, rc, false);
+                let picks = if crate::storage::Batch::should_relocate_blob(rc, shard.count, shard.blob_len) {
+                    "relocate"
+                } else {
+                    "memcpy  "
+                };
+                println!(
+                    "width={w:>5} slice={pct:>3}% picks {picks}: \
+                     relocate {reloc:9.0} ns  memcpy {copy:9.0} ns  speedup {:5.2}x",
+                    copy / reloc,
+                );
+            }
+        }
     }
 }
