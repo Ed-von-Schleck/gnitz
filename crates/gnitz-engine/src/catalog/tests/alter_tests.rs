@@ -67,7 +67,7 @@ fn rename_fires_no_cascade_and_leaves_dir_untouched() {
     let dir = temp_dir("alter_no_cascade");
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::U64)];
-    let tid = engine.create_table("public.orig", &cols, &[0], true).unwrap();
+    let tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
     let table_path = format!("{dir}/public/t_{tid}");
     assert!(Path::new(&table_path).exists());
 
@@ -106,7 +106,7 @@ fn rename_then_reopen_resolves_flushed_data() {
     {
         let mut engine = CatalogEngine::open(&dir).unwrap();
         let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::U64)];
-        tid = engine.create_table("public.orig", &cols, &[0], true).unwrap();
+        tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
         // Flush a row so only the on-disk (id-only) path can serve it after reopen.
         let schema = engine.get_schema(tid).unwrap();
         let mut bb = BatchBuilder::new(schema);
@@ -148,9 +148,7 @@ fn valid_long_name_rename_accepted() {
     let dir = temp_dir("alter_long_ok");
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![col_def("id", type_code::U64)];
-    let tid = engine
-        .create_table("public.original_long_name", &cols, &[0], true)
-        .unwrap();
+    let tid = engine.create_table("public.original_long_name", &cols, &[0]).unwrap();
     let pair = table_rename_pair(&engine, tid, "renamed_to_a_long_name");
     engine.ingest_to_family(TABLE_TAB_ID, &pair).unwrap();
     assert!(engine
@@ -166,9 +164,7 @@ fn stale_snapshot_rename_rejected_long_name() {
     let dir = temp_dir("alter_stale");
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![col_def("id", type_code::U64)];
-    let tid = engine
-        .create_table("public.original_long_name", &cols, &[0], true)
-        .unwrap();
+    let tid = engine.create_table("public.original_long_name", &cols, &[0]).unwrap();
     // The `-1` carries a stale (wrong) old name > 12 bytes that does not match the
     // live row — the CAS must reject it.
     let (sid, _live, d, pk, lsn, fl) = live_table_row(&engine, tid);
@@ -200,7 +196,7 @@ fn duplicate_live_head_rejected() {
     let dir = temp_dir("alter_dup_head");
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![col_def("id", type_code::U64)];
-    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     // A bare `+1` re-ingest of the live row → net weight 2 (a duplicate live head).
     let (sid, name, d, pk, lsn, fl) = live_table_row(&engine, tid);
     let mut bb = BatchBuilder::new(SysFamily::Table.schema());
@@ -258,7 +254,7 @@ fn stale_column_rename_rejected_and_drop_cascade_passes() {
         col_def("id", type_code::U64),
         col_def("original_column_name", type_code::U64),
     ];
-    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let col_idx: i64 = 1;
     let pk = pack_column_id(tid, col_idx) as u128;
 

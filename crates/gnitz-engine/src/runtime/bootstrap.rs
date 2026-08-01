@@ -200,8 +200,9 @@ fn swept_base_tables(catalog: &mut CatalogEngine) -> Vec<i64> {
 
 /// Per-worker post-fork user-table replay for `rank` of `num_workers`. The apply
 /// closure decodes each FLAG_PUSH group's batch and applies it through the
-/// unique-pk path (`ingest_returning_effective`, the exact call `handle_push`
-/// makes) so retractions cancel correctly, and — for every base table feeding ≥1
+/// PK-enforcement path (`ingest_returning_effective`, the exact call
+/// `handle_push` makes) so retractions cancel correctly, and — for every base
+/// table feeding ≥1
 /// view — buffers the returned effective delta into the returned map. That map
 /// seeds the worker's `pending_deltas`; the master's post-reset recovery tick
 /// sweep drains it into the views. Viewless bases ingest-and-discard (nothing to

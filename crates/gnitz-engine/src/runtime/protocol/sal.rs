@@ -177,7 +177,7 @@ pub const FLAG_GATHER: u32 = 65536;
 /// partition of `target_id` to the OPK leading-key spans of the column list
 /// packed in `seek_col_idx`, sorts them, and streams the SORTED spans back as
 /// continuation frames for the master's k-way merge (see
-/// `validate_unique_index_create_async`). Unicast-shaped like a Scan: every
+/// `validate_unique_index_create`). Unicast-shaped like a Scan: every
 /// worker gets its own req_id slot and answers with a frame train.
 pub const FLAG_UNIQUE_PREFLIGHT: u32 = 131072;
 

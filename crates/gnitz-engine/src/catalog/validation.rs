@@ -161,9 +161,9 @@ impl CatalogEngine {
     /// For each unique index on this table, checks that no positive-weight row
     /// in the batch introduces a duplicate index key.
     ///
-    /// For unique_pk tables, UPSERT rows (PK already exists) get special
-    /// handling: the old index entry will be retracted by enforce_unique_pk,
-    /// so we only reject if the NEW value collides with a DIFFERENT row's entry.
+    /// UPSERT rows (PK already exists) get special handling: the old index entry
+    /// will be retracted by enforce_unique_pk, so we only reject if the NEW value
+    /// collides with a DIFFERENT row's entry.
     pub(crate) fn validate_unique_indices(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
         let entry = self.table_entry(table_id)?;
 
@@ -174,7 +174,6 @@ impl CatalogEngine {
         }
 
         let schema = entry.schema;
-        let unique_pk = entry.unique_pk();
         let src_pk_stride = schema.pk_stride() as usize;
         // Borrows `batch` (the `&Batch` param), independent of the `&mut self`
         // cache reads below.
@@ -185,38 +184,33 @@ impl CatalogEngine {
         // pay nothing.
         let has_retractions = (0..batch.count).any(|r| batch.get_weight(r) < 0);
 
-        // PKs the batch upserts: net-positive aggregate weight. On a unique_pk
-        // table enforce_unique_pk retracts such a PK's committed row (and its old
-        // unique value) at apply, so a committed holder that is itself an upserted
-        // PK frees its value — what makes a bulk shift like `UPDATE t SET u = u + 1`
-        // valid. The net-positive rule (not "has any +1 row") matches the
-        // distributed path's `existing_pks`, so the two validators agree even on
-        // an unconsolidated batch that carries both a +1 and a -1 for one PK.
-        // Empty on non-unique_pk tables (no enforce_unique_pk), so the implicit
-        // exemption never fires there.
+        // PKs the batch upserts: net-positive aggregate weight. enforce_unique_pk
+        // retracts such a PK's committed row (and its old unique value) at apply,
+        // so a committed holder that is itself an upserted PK frees its value —
+        // what makes a bulk shift like `UPDATE t SET u = u + 1` valid. Net-positive
+        // rather than "has any +1 row" so this agrees with the distributed
+        // validator's `existing_pks` on an unconsolidated batch carrying both signs
+        // for one PK.
         //
         // Insert-only batches (the hot path) carry no `-1`, so every positive row
         // is already net-positive — skip the aggregation map entirely and collect
         // PKs directly; only a mixed-sign batch needs the net pass.
         let mut upserted_pks: FxHashSet<PkBuf> = FxHashSet::default();
-        if unique_pk {
-            if has_retractions {
-                let mut net: FxHashMap<PkBuf, i64> =
-                    FxHashMap::with_capacity_and_hasher(batch.count, Default::default());
-                for r in 0..batch.count {
-                    let w = batch.get_weight(r);
-                    if w == 0 {
-                        continue;
-                    }
-                    *net.entry(PkBuf::from_bytes(batch.get_pk_bytes(r))).or_insert(0) += w;
+        if has_retractions {
+            let mut net: FxHashMap<PkBuf, i64> = FxHashMap::with_capacity_and_hasher(batch.count, Default::default());
+            for r in 0..batch.count {
+                let w = batch.get_weight(r);
+                if w == 0 {
+                    continue;
                 }
-                upserted_pks = net.into_iter().filter(|&(_, w)| w > 0).map(|(pk, _)| pk).collect();
-            } else {
-                upserted_pks.reserve(batch.count);
-                for r in 0..batch.count {
-                    if batch.get_weight(r) > 0 {
-                        upserted_pks.insert(PkBuf::from_bytes(batch.get_pk_bytes(r)));
-                    }
+                *net.entry(PkBuf::from_bytes(batch.get_pk_bytes(r))).or_insert(0) += w;
+            }
+            upserted_pks = net.into_iter().filter(|&(_, w)| w > 0).map(|(pk, _)| pk).collect();
+        } else {
+            upserted_pks.reserve(batch.count);
+            for r in 0..batch.count {
+                if batch.get_weight(r) > 0 {
+                    upserted_pks.insert(PkBuf::from_bytes(batch.get_pk_bytes(r)));
                 }
             }
         }
@@ -286,36 +280,6 @@ impl CatalogEngine {
                     continue;
                 }
 
-                // One row at weight w is the value w times. On a non-unique_pk
-                // table that is w live instances (enforce_unique_pk collapses
-                // it to one on unique_pk tables) — the same violation as w
-                // separate +1 rows, which `seen` below rejects.
-                if !unique_pk && w > 1 {
-                    return Err(self.unique_violation_err(table_id, cols, true));
-                }
-
-                // UPSERT iff the row's PK is a net-positive PK in this batch AND
-                // already has a live base-table row. The net-positive gate (not
-                // bare committedness) matches the distributed `existing_pks`: a PK
-                // carrying both a +1 and a -1 (net ≤ 0) has an order-dependent
-                // surviving state under enforce_unique_pk, so both validators
-                // decline to treat it as an upsert. `&&` short-circuits, so the
-                // membership test runs before the committed probe and a
-                // non-upserted PK pays no seek.
-                //
-                // Both PK widths probe via `has_pk_bytes` (verbatim OPK bytes —
-                // never `get_pk`, which is OPK-widened and would double-encode a
-                // signed/compound PK, missing the existing row). This routes the
-                // last PK probe through the same distribution-aware
-                // `local_index_bytes` funnel as ingest and retraction — mandatory
-                // under prefix distribution, where the wide cursor's
-                // all-owned-partitions merge would otherwise probe a partition the
-                // row was never routed to — and replaces that merge tree with a
-                // per-row single-partition bloom + XOR8-gated shard scan.
-                let is_upsert = unique_pk
-                    && upserted_pks.contains(batch.get_pk_bytes(row))
-                    && entry.handle.has_pk_bytes(batch.get_pk_bytes(row));
-
                 if !seen.insert(keybuf) {
                     return Err(self.unique_violation_err(table_id, cols, true));
                 }
@@ -337,15 +301,22 @@ impl CatalogEngine {
 
                 // `seen` already barred two live rows sharing this value. Exempt
                 // the committed collision only when the holder releases the value
-                // in this batch: it explicitly retracts (PK, value) here, or — on
-                // a unique_pk table and only when this row is itself an upsert —
-                // the holder is also an upserted PK, so enforce_unique_pk frees
-                // the value at apply. The `upserted_pks` membership test subsumes
-                // the same-PK upsert case (the row's own PK is a positive PK).
+                // in this batch: it explicitly retracts (PK, value) here, or the
+                // holder is itself an upserted PK so enforce_unique_pk frees the
+                // value at apply. The latter applies only when *this* row is also
+                // an upsert — a fresh PK cannot ride the holder's retraction.
                 if retracted.contains(&(PkBuf::from_bytes(existing_src_pk), keybuf)) {
                     continue;
                 }
-                if is_upsert && upserted_pks.contains(existing_src_pk) {
+                // `has_pk_bytes` takes verbatim OPK bytes — never `get_pk`, which
+                // is OPK-widened and would double-encode a signed/compound PK. It
+                // is also the distribution-aware probe, so under prefix
+                // distribution it looks in the partition the row was routed to.
+                // Ordered last: only a row that actually collided pays the seek.
+                if upserted_pks.contains(existing_src_pk)
+                    && upserted_pks.contains(batch.get_pk_bytes(row))
+                    && entry.handle.has_pk_bytes(batch.get_pk_bytes(row))
+                {
                     continue;
                 }
 

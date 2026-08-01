@@ -123,7 +123,8 @@ impl CatalogEngine {
 
     // -- System ingestion entry + precheck / broadcast / dir-deletion -------
 
-    /// Ingest a batch into a table family (unique_pk + store + index projection + hooks).
+    /// Ingest a batch into a table family (PK enforcement + store + index
+    /// projection + hooks).
     /// System tables go through the [`CatalogDeltaSink::submit`] applied-delta
     /// path (precheck → ingest → hooks → broadcast-queue). User tables delegate
     /// to `DagEngine::ingest_by_ref`. This `&Batch` entry serves external/wire
@@ -238,8 +239,8 @@ impl CatalogEngine {
     ///    bytes is accepted (a raw region `memcmp` would false-reject it) while a
     ///    stale-snapshot `-1` is rejected.
     /// 2. **Per-PK net** — `live_weight + Σ batch weights` must be 0 or 1 (sys
-    ///    stores are not `unique_pk`, so nothing else stops a duplicate live head
-    ///    or a persistent negative ghost).
+    ///    stores run no `enforce_unique_pk`, so nothing else stops a duplicate
+    ///    live head or a persistent negative ghost).
     /// 3. **Pair fields** — a PK carrying both signs (a rewrite pair) may differ
     ///    from the live row only in `name` (`name_pay`); for a relation family
     ///    (`is_relation`) a rewrite pair on a system-range id is additionally

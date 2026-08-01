@@ -56,22 +56,23 @@ impl DagEngine {
     /// Ingest a batch into a table's store + index projections.
     ///
     /// Stages:
-    /// 1. unique_pk enforcement (retract existing, dedup intra-batch)
+    /// 1. PK enforcement (retract existing, dedup intra-batch)
     /// 2. store.ingest_batch
     /// 3. index projection
     pub fn ingest_to_family(&mut self, table_id: i64, batch: Batch) {
         self.ingest_returning_effective(table_id, batch);
     }
 
-    /// Ingest a borrowed batch (no clone) for the common non-unique-PK path.
-    /// For unique_pk tables, falls back to cloning + `ingest_returning_effective`.
+    /// Ingest a borrowed batch (no clone) for relations that run no PK
+    /// enforcement. A base table falls back to cloning +
+    /// `ingest_returning_effective`.
     pub fn ingest_by_ref(&mut self, table_id: i64, batch: &Batch) -> i32 {
         let entry = match self.tables.get_mut(&table_id) {
             Some(e) => e,
             None => return -1,
         };
 
-        if entry.unique_pk() {
+        if entry.kind.is_base_table() {
             self.ingest_to_family(table_id, batch.clone_batch());
             return 0;
         }
@@ -85,7 +86,7 @@ impl DagEngine {
         0
     }
 
-    /// Ingest a batch and return the effective batch (after unique_pk
+    /// Ingest a batch and return the effective batch (after PK
     /// enforcement) — what downstream views need to see. `None` means exactly
     /// "table not registered"; a storage-apply failure never returns
     /// (`ingest_store_and_indices` aborts).
@@ -99,18 +100,14 @@ impl DagEngine {
         };
 
         let schema = entry.schema;
-        let unique_pk = entry.unique_pk();
-        // unique_pk ⟹ Partitioned: every SQL-created base table is registered
-        // Partitioned; system tables (the only Borrowed handles) are never
-        // unique_pk, so a unique_pk relation always resolves to a PartitionedTable.
-        // The debug_assert turns any future stray Borrowed+unique_pk registration
-        // into a loud failure in debug; a release build passes the batch through
-        // unenforced rather than skipping enforcement on a missing partitioned store.
-        let effective_batch = if unique_pk {
+        // BaseTable ⟹ Partitioned: system tables are the only Borrowed handles,
+        // and they are SystemCatalog. The debug_assert catches a stray Borrowed
+        // base-table registration.
+        let effective_batch = if entry.kind.is_base_table() {
             match entry.handle.as_partitioned_mut() {
                 Some(ptable) => Self::enforce_unique_pk(ptable, &schema, batch),
                 None => {
-                    debug_assert!(false, "unique_pk relation {table_id} must be a PartitionedTable");
+                    debug_assert!(false, "base table {table_id} must be a PartitionedTable");
                     batch
                 }
             }
@@ -309,7 +306,7 @@ impl DagEngine {
         if batch.count == 0 {
             return batch;
         }
-        // unique_pk contract: per-PK accumulated weight ∈ {0, 1}. A pushed row
+        // Base-table contract: per-PK accumulated weight ∈ {0, 1}. A pushed row
         // at |w| > 1 is the row repeated; retract-before-insert collapses
         // repeats to one live instance (and a delete removes at most one), so
         // normalize weights to ±1 before the enforcement walk. Must run on the

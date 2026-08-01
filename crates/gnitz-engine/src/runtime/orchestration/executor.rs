@@ -56,7 +56,7 @@ use gnitz_wire::{
     FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_TABLE_ID, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
 };
 
-/// One tick request to `tick_loop_async`.
+/// One tick request to `tick_loop`.
 pub enum TickTrigger {
     /// Fire-and-forget trigger from INSERT when a tid crosses the row
     /// coalesce threshold.  Tids come from `tick_rows` / `tick_tids`.
@@ -391,7 +391,7 @@ impl ServerExecutor {
 
         reactor.spawn(committer::run(committer_rx, committer_shared));
         reactor.spawn(accept_loop(Rc::clone(&shared), accept_ctx));
-        reactor.spawn(tick_loop_async(Rc::clone(&shared), tick_rx));
+        reactor.spawn(tick_loop(Rc::clone(&shared), tick_rx));
         reactor.spawn(relay_loop(Rc::clone(&shared), relay_rx));
         reactor.spawn(watchdog(Rc::clone(&shared)));
 
@@ -691,7 +691,7 @@ async fn watchdog(shared: Rc<Shared>) {
 /// V.7 liveness: the outer loop body is wrapped so a failure in one
 /// trigger only fails that trigger, not the loop. SAL emission is
 /// further guarded by `guard_panic` inside `run_tick`.
-async fn tick_loop_async(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>) {
+async fn tick_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>) {
     let nw = unsafe { (*shared.dispatcher).num_workers() };
     let mut fut_slots: Vec<ReplyFuture> = Vec::with_capacity(nw);
     let mut ack_slots: Vec<Option<ipc::DecodedWire>> = Vec::with_capacity(nw);
@@ -1235,7 +1235,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
             return;
         }
         // Distributed validation (FK / unique indices + UPSERT).
-        if let Err(e) = MasterDispatcher::validate_all_distributed_async(
+        if let Err(e) = MasterDispatcher::validate_all_distributed(
             shared.dispatcher,
             &shared.reactor,
             &shared.sal_writer_excl,
@@ -1317,7 +1317,7 @@ async fn serve_seek(
             Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
         }
     } else {
-        match MasterDispatcher::fan_out_seek_async(
+        match MasterDispatcher::fan_out_seek(
             shared.dispatcher,
             &shared.reactor,
             &shared.sal_writer_excl,
@@ -1405,9 +1405,6 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
         if let Some(e) = push_target_error(shared, tid) {
             return Err(e);
         }
-        if !shared.cat().table_has_unique_pk(tid) {
-            return Err(format!("TXN: table {tid} is not unique_pk"));
-        }
         let catalog_schema = shared.get_schema_desc(tid);
         // The schema block is always present; validate it against the catalog
         // per family (a concurrent DDL between buffer time and commit surfaces as
@@ -1462,13 +1459,8 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
     }
 
     // 4. Distributed bundle validation (the four rules).
-    MasterDispatcher::validate_txn_distributed_async(
-        shared.dispatcher,
-        &shared.reactor,
-        &shared.sal_writer_excl,
-        &families,
-    )
-    .await?;
+    MasterDispatcher::validate_txn_distributed(shared.dispatcher, &shared.reactor, &shared.sal_writer_excl, &families)
+        .await?;
 
     // 5. Drain check immediately before the committer send. INVARIANT: there must
     //    be NO `.await` between this check and `committer_tx.send` — on the
@@ -1602,7 +1594,7 @@ async fn handle_seek_by_index(
             // (seek_pk_extra empty), at most one match on a single worker —
             // forward that worker's slot directly (1 round-trip, keeping the
             // unicast-on-cache-hit routing) instead of broadcasting.
-            match MasterDispatcher::fan_out_seek_by_index_async(
+            match MasterDispatcher::fan_out_seek_by_index(
                 shared.dispatcher,
                 &shared.reactor,
                 &shared.sal_writer_excl,
@@ -1622,7 +1614,7 @@ async fn handle_seek_by_index(
         // and merge all matches into one response (a composite unique seek
         // matches at most one row — merging one is correct). Forward the wire
         // frame verbatim (packed seek_col_idx, seek_pk + seek_pk_extra).
-        match MasterDispatcher::fan_out_seek_by_index_collect_async(
+        match MasterDispatcher::fan_out_seek_by_index_collect(
             shared.dispatcher,
             &shared.reactor,
             &shared.sal_writer_excl,
@@ -1730,7 +1722,7 @@ async fn handle_get_indices(shared: &Rc<Shared>, peer: &Peer, client_id: u64, ta
 ///
 /// MUST be called BEFORE taking the catalog read lock: the drain parks at
 /// `rx.await`, and the writer-preferring `AsyncRwLock` held across that park
-/// would block DDL writers and `tick_loop_async`'s own read lock — a three-way
+/// would block DDL writers and `tick_loop`'s own read lock — a three-way
 /// deadlock (BF-1). Under an unbounded concurrent write storm the loop can
 /// iterate for the storm's duration (each pass sees `tick_tids` non-empty); the
 /// caller's own ACKed writes are covered after pass 1. View seeks confine this
@@ -1860,7 +1852,7 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id
     // every worker, so a broadcast would concatenate W identical copies — else
     // `-1` (broadcast).
     let unicast = replicated_unicast(shared.dispatcher, target_id);
-    let result = MasterDispatcher::fan_out_scan_async(
+    let result = MasterDispatcher::fan_out_scan(
         shared.dispatcher,
         &shared.reactor,
         &shared.sal_writer_excl,
@@ -1917,7 +1909,7 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, targ
     // each of which would carry its own copy of the spec blob under the exclusive
     // SAL mutex.
     let unicast = scan_spec_route(shared.dispatcher, target_id, seek_pk_extra);
-    let result = MasterDispatcher::fan_out_scan_spec_async(
+    let result = MasterDispatcher::fan_out_scan_spec(
         shared.dispatcher,
         &shared.reactor,
         &shared.sal_writer_excl,
@@ -2268,7 +2260,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
     // bundle BEFORE reserving the zone LSN or mutating the catalog, so a
     // violation needs no rollback — it just surfaces to the client. This runs
     // before the ingest loop, so for a table created in the same bundle the owner
-    // is not yet in `dag.tables` and `validate_unique_index_create_async`
+    // is not yet in `dag.tables` and `validate_unique_index_create`
     // short-circuits to an empty set (sound: the new table is empty, and
     // hook_index_register's own owner-check still succeeds later in the loop). The
     // IDX_TAB row layout (and the IDXTAB_PAY_* payload indices) is fixed by
@@ -2283,7 +2275,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
                 if !cols.is_well_formed() {
                     continue;
                 }
-                match MasterDispatcher::validate_unique_index_create_async(
+                match MasterDispatcher::validate_unique_index_create(
                     shared.dispatcher,
                     &shared.reactor,
                     &shared.sal_writer_excl,

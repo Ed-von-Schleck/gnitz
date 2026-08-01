@@ -91,17 +91,13 @@ pub enum RelationKind {
     /// upstream sources (it has none; recovery is LSN-gated SAL replay).
     SystemCatalog,
     /// User base table: durable, partitioned, never rebuilt from upstream
-    /// sources; owns a DML-enforced PK. `unique_pk` is the enforcement flag.
-    BaseTable { unique_pk: bool },
+    /// sources; owns a DML-enforced PK, so `enforce_unique_pk` runs on every
+    /// ingest and its accumulated per-PK weight is always in {0, 1}.
+    BaseTable,
     /// Materialised view: ephemeral, partitioned, rebuilt from its sources via
     /// the compiled circuit at open and on live CREATE.
     View,
 }
-
-// Niche-optimised to the width of the `unique_pk: bool` it replaced, so
-// `TableEntry` does not grow and the ingest hot path touches no extra
-// cache line.
-const _: () = assert!(std::mem::size_of::<RelationKind>() == 1);
 
 impl RelationKind {
     /// How this relation's tail is recovered. `SalReplay` kinds load shards from
@@ -111,18 +107,18 @@ impl RelationKind {
     #[inline]
     pub fn recovery_source(self) -> RecoverySource {
         match self {
-            RelationKind::SystemCatalog | RelationKind::BaseTable { .. } => RecoverySource::SalReplay,
+            RelationKind::SystemCatalog | RelationKind::BaseTable => RecoverySource::SalReplay,
             RelationKind::View => RecoverySource::rederive_checkpointed_now(),
         }
     }
 
-    /// True iff this is a user base table (of either `unique_pk` flavor).
-    /// Gates what only base tables do: own secondary index circuits (index
+    /// True iff this is a user base table. Gates what only base tables do:
+    /// run `enforce_unique_pk` on ingest, own secondary index circuits (index
     /// projection runs only on the base-table DML paths) and tag
     /// flushed/compacted shards Pk-unique.
     #[inline]
     pub fn is_base_table(self) -> bool {
-        matches!(self, RelationKind::BaseTable { .. })
+        matches!(self, RelationKind::BaseTable)
     }
 
     /// True iff this is a materialised view. Gates the read-your-writes drain (a
@@ -147,17 +143,6 @@ pub struct TableEntry {
     pub depth: i32,
     pub directory: String,
     pub index_circuits: Vec<IndexCircuitEntry>,
-}
-
-impl TableEntry {
-    /// The kind's `unique_pk` enforcement flag — true only for a base table
-    /// created with a DML-enforced PK; false elsewhere (no `enforce_unique_pk`
-    /// runs there). `#[inline]` keeps the hot `ingest_by_ref`/
-    /// `ingest_returning_effective` path a trivial match.
-    #[inline]
-    pub fn unique_pk(&self) -> bool {
-        matches!(self.kind, RelationKind::BaseTable { unique_pk: true })
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -509,7 +494,7 @@ mod tests {
             100,
             StoreHandle::Borrowed(&mut *tbl as *mut Table),
             schema,
-            RelationKind::BaseTable { unique_pk: false },
+            RelationKind::BaseTable,
             0,
             String::new(),
         );
@@ -589,7 +574,7 @@ mod tests {
             50,
             StoreHandle::Borrowed(&mut *tbl as *mut Table),
             schema,
-            RelationKind::BaseTable { unique_pk: false },
+            RelationKind::BaseTable,
             0,
             String::new(),
         );
@@ -640,7 +625,7 @@ mod tests {
             70,
             StoreHandle::Borrowed(&mut *tbl as *mut Table),
             parent_schema,
-            RelationKind::BaseTable { unique_pk: false },
+            RelationKind::BaseTable,
             0,
             String::new(),
         );
@@ -745,7 +730,7 @@ mod tests {
         );
     }
 
-    // unique_pk contract: per-PK accumulated weight ∈ {0, 1}. A pushed row at
+    // Base-table contract: per-PK accumulated weight ∈ {0, 1}. A pushed row at
     // |w| > 1 is the row repeated; retract-before-insert collapses repeats to
     // one live instance, so the effective batch must carry unit weights —
     // otherwise a weight-2 PK row lands (two live instances the -1-normalized
@@ -1011,8 +996,10 @@ mod tests {
     }
 
     // Guard: runs the seam-armed ingest only under GNITZ_RUN_INGEST_ABORT_TEST
-    // (set by the parent). Registers a base table and ingests one row; the armed
-    // "store" seam substitutes Err for the base ingest, tripping the abort.
+    // (set by the parent). Registers a view and ingests one row; the armed
+    // "store" seam substitutes Err for the store ingest, tripping the abort.
+    // `View`, not `BaseTable`: a base table must be a `Partitioned` handle (it
+    // runs `enforce_unique_pk`), and this fixture holds a `Borrowed` one.
     #[test]
     fn ingest_apply_error_abort_internal() {
         if std::env::var("GNITZ_RUN_INGEST_ABORT_TEST").is_err() {
@@ -1027,7 +1014,7 @@ mod tests {
             70,
             StoreHandle::Borrowed(&mut *tbl as *mut Table),
             schema,
-            RelationKind::BaseTable { unique_pk: false },
+            RelationKind::View,
             0,
             String::new(),
         );

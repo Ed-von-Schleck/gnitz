@@ -40,7 +40,7 @@ fn client_with_table(target: &str) -> (GnitzClient, String, u64, Schema) {
         ColumnDef::new("a", TypeCode::I64, false),
         ColumnDef::new("b", TypeCode::I64, false),
     ];
-    client.create_table(&sn, "t", &cols, &[0], true, false, 0, &[]).unwrap();
+    client.create_table(&sn, "t", &cols, &[0], false, 0, &[]).unwrap();
     let (tid, schema) = client.resolve_table_id(&sn, "t").unwrap();
     (client, sn, tid, schema)
 }

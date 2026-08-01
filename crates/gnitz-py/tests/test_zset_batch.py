@@ -31,13 +31,13 @@ def _cleanup(client, sn, *names):
         pass
 
 
-def _make_table(client, unique_pk=True):
+def _make_table(client):
     """Create a (pk U64 PK, val I64) table. Returns (sn, tid, schema)."""
     sn = "zb" + _uid()
     client.create_schema(sn)
     cols = [ColumnDef("pk", TypeCode.U64, primary_key=True),
             ColumnDef("val", TypeCode.I64)]
-    tid = client.create_table(sn, "t", cols, unique_pk=unique_pk)
+    tid = client.create_table(sn, "t", cols)
     return sn, tid, Schema(cols)
 
 
@@ -408,23 +408,6 @@ class TestExtend:
             result = client.scan(tid)
             assert len(result) == 2
             assert {row.pk: row.val for row in result} == {1: 10, 2: 20}
-        finally:
-            _cleanup(client, sn, "t")
-
-    def test_per_row_weight_reaches_the_engine(self, client):
-        # Per-row `_weight` is a Z-Set multiplicity, so the table must be
-        # non-unique-PK for it to survive the round trip: the unique_pk
-        # contract clamps each PK's accumulated weight to {0, 1}, which would
-        # store this row at weight 1 regardless of the requested 3.
-        sn, tid, schema = _make_table(client, unique_pk=False)
-        try:
-            batch = ZSetBatch(schema)
-            batch.extend([{"pk": 1, "val": 10, "_weight": 3}])
-            client.push(tid, batch)
-            row = client.scan(tid).first()
-            assert row is not None
-            assert row.pk == 1
-            assert row.weight == 3
         finally:
             _cleanup(client, sn, "t")
 

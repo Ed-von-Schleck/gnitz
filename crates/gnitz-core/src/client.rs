@@ -904,7 +904,6 @@ impl GnitzClient {
         table_name: &str,
         columns: &[ColumnDef],
         pk_cols: &[u32],
-        unique_pk: bool,
         replicated: bool,
         dist_prefix_len: usize,
         unique_indexes: &[InlineUniqueIndex],
@@ -958,7 +957,7 @@ impl GnitzClient {
             .str_val("")
             .u64_val(pk_packed)
             .u64_val(0)
-            .u64_val(gnitz_wire::pack_table_flags(unique_pk, replicated, dist_prefix_len));
+            .u64_val(gnitz_wire::pack_table_flags(replicated, dist_prefix_len));
 
         // IDX_TAB family — every inline UNIQUE index as one multi-row batch
         // (`hook_index_register` loops over rows). Allocate ids and validate up

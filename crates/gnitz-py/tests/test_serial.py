@@ -139,7 +139,7 @@ def test_serial_two_connections_disjoint_ids(server):
     """Two connections drawing from the same table's sequence get disjoint id
     ranges — no collision, no reuse. If the durable per-range advance were not
     serialized, both would draw the same range and the second INSERT would hit a
-    unique_pk violation (or, worse, silently duplicate)."""
+    PK violation (or, worse, silently duplicate)."""
     sn = "srld" + _uid()
     with gnitz.connect(server) as c0:
         c0.create_schema(sn)

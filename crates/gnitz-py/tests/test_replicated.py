@@ -779,7 +779,7 @@ def test_replicated_union_all_and_distinct(client):
 
 def test_replicated_intersect_except(client):
     """INTERSECT / EXCEPT (DISTINCT and ALL) over two replicated tables. Each row is
-    unique per source (unique_pk), so ALL and DISTINCT coincide at weight 1 — but they
+    unique per source (PK-enforced), so ALL and DISTINCT coincide at weight 1 — but they
     compile to different clamp circuits, so both are exercised."""
     sn = "r" + _uid()
     client.create_schema(sn)

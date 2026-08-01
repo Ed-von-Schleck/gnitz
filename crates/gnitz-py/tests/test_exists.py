@@ -149,22 +149,26 @@ class TestEquiExists:
             _cleanup(client, sn, "semi", "anti", "a", "b")
 
     def test_weight_exact_over_bag_valued_outer(self, client):
-        """A weight-2 outer row (binary push) stays weight-2 in the semi output
-        even with several inner matches, and weight-2 in the anti output when
-        unmatched."""
+        """A weight-2 outer row stays weight-2 in the semi output even with
+        several inner matches, and weight-2 in the anti output when unmatched.
+        The bag-valued preserved side is a `UNION ALL` view: two base rows
+        carrying the same (k, v) sum to one weight-2 element."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
-            cols = [
-                gnitz.ColumnDef("id", gnitz.TypeCode.U64, primary_key=True),
-                gnitz.ColumnDef("k", gnitz.TypeCode.I64),
-                gnitz.ColumnDef("v", gnitz.TypeCode.I64),
-            ]
-            schema = gnitz.Schema(cols)
-            # unique_pk=False: a true bag table — upsert semantics would clamp
-            # the weight-2 row this test is about.
-            tid = client.create_table(sn, "bag", cols, unique_pk=False)
+            client.execute_sql(
+                "CREATE TABLE a1 (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE a2 (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NOT NULL)",
+                schema_name=sn,
+            )
             client.execute_sql(_CREATE_B, schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW bag AS SELECT k, v FROM a1 UNION ALL SELECT k, v FROM a2",
+                schema_name=sn,
+            )
             client.execute_sql(
                 "CREATE VIEW semi AS SELECT v FROM bag "
                 "WHERE EXISTS (SELECT 1 FROM b WHERE b.k = bag.k)",
@@ -178,9 +182,8 @@ class TestEquiExists:
             semi = client.resolve_table(sn, "semi")[0]
             anti = client.resolve_table(sn, "anti")[0]
 
-            batch = gnitz.ZSetBatch(schema)
-            batch.append(id=1, k=10, v=100, _weight=2)
-            client.push(tid, batch)
+            client.execute_sql("INSERT INTO a1 VALUES (1, 10, 100)", schema_name=sn)
+            client.execute_sql("INSERT INTO a2 VALUES (1, 10, 100)", schema_name=sn)
             assert _weights(client, anti, "v") == {100: 2}
             assert _weights(client, semi, "v") == {}
 
@@ -194,7 +197,7 @@ class TestEquiExists:
             assert _weights(client, semi, "v") == {}
             assert _weights(client, anti, "v") == {100: 2}
         finally:
-            _cleanup(client, sn, "semi", "anti", "bag", "b")
+            _cleanup(client, sn, "semi", "anti", "bag", "a1", "a2", "b")
 
     def test_null_correlation_keys_asymmetry(self, client):
         """A NULL outer key matches nothing: excluded from EXISTS, included in

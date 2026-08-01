@@ -145,7 +145,7 @@ fn test_table_tab_dup_name_leaves_clean_state() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
-    let orig_tid = engine.create_table("public.dupname", &cols, &[0], false).unwrap();
+    let orig_tid = engine.create_table("public.dupname", &cols, &[0]).unwrap();
     let init_rows = count_records(engine.sys_store_mut(SysFamily::Table));
 
     let new_tid = engine.allocate_table_id();
@@ -345,7 +345,7 @@ fn test_idx_tab_view_owner_rejected() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     engine
-        .create_table("public.base", &[col_def("id", type_code::U64)], &[0], true)
+        .create_table("public.base", &[col_def("id", type_code::U64)], &[0])
         .unwrap();
 
     // Register a view via the raw system-table path (no circuit needed — the
@@ -404,7 +404,7 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
         col_def("val", type_code::I64),
         col_def("ts", type_code::I64),
     ];
-    let tid = engine.create_table("public.idxtest", &cols, &[0], false).unwrap();
+    let tid = engine.create_table("public.idxtest", &cols, &[0]).unwrap();
     let orig_idx_id = engine.create_index("public.idxtest", &["val"], false).unwrap();
     let init_rows = count_records(engine.sys_store_mut(SysFamily::Index));
 
@@ -454,7 +454,7 @@ fn test_create_unique_index_backfill_fail_no_dir_leak() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
-    let tid = engine.create_table("public.leaktest", &cols, &[0], false).unwrap();
+    let tid = engine.create_table("public.leaktest", &cols, &[0]).unwrap();
     let schema = engine.get_schema(tid).unwrap();
 
     // Ingest two rows that share the same 'val' — unique index backfill must fail.
@@ -511,7 +511,7 @@ fn test_next_index_id_advances_on_index_register() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
-    let tid = engine.create_table("public.seqsync", &cols, &[0], false).unwrap();
+    let tid = engine.create_table("public.seqsync", &cols, &[0]).unwrap();
 
     // Register an index with an idx_id far ahead of the current counter,
     // simulating a worker receiving a broadcast for a master-allocated ID.
@@ -579,7 +579,7 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
     // Table T (in schema `owner`) with a dependent view V → dep_map[T] = [V].
     engine.create_schema("owner").unwrap();
     let tid = engine
-        .create_table("owner.t", &[col_def("id", type_code::U64)], &[0], true)
+        .create_table("owner.t", &[col_def("id", type_code::U64)], &[0])
         .unwrap();
     let vid = engine.allocate_table_id();
     engine.write_view_deps(vid, &[tid]).unwrap();
@@ -693,7 +693,7 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     // Occupy the qualified name "public.dupname".
-    engine.create_table("public.dupname", &cols, &[0], false).unwrap();
+    engine.create_table("public.dupname", &cols, &[0]).unwrap();
     let cols_before = count_records(engine.sys_store_mut(SysFamily::Column));
     let tables_before = count_records(engine.sys_store_mut(SysFamily::Table));
     // Discard any queue entries the setup left behind, exactly as `handle_ddl_txn`
@@ -757,7 +757,7 @@ fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
     engine.apply_and_enqueue_family(COL_TAB_ID, col_batch).unwrap();
 
     // REPLICATED + dist_prefix = 1: passes precheck, rejected by hook_table_register.
-    let flags = gnitz_wire::pack_table_flags(false, true, 1);
+    let flags = gnitz_wire::pack_table_flags(true, 1);
     let table_batch = build_table_tab_row_flags(&dir, new_tid, pack_pk_cols(&[0]), "hooktbl", flags);
     engine
         .precheck_family(TABLE_TAB_ID, &table_batch)

@@ -13,7 +13,7 @@ fn defer_then_drain_gated_deletions() {
     let cols = vec![col_def("id", type_code::U64)];
 
     engine.create_schema("s").unwrap();
-    let tid = engine.create_table("s.t", &cols, &[0], true).unwrap();
+    let tid = engine.create_table("s.t", &cols, &[0]).unwrap();
     let tbl_dir = format!("{dir}/s/t_{tid}");
     assert!(Path::new(&tbl_dir).exists());
 
@@ -59,14 +59,14 @@ fn drop_then_recreate_schema_survives_gated_drain() {
     let cols = vec![col_def("id", type_code::U64)];
 
     engine.create_schema("s").unwrap();
-    engine.create_table("s.t", &cols, &[0], true).unwrap();
+    engine.create_table("s.t", &cols, &[0]).unwrap();
     // DROP SCHEMA cascade queues <dir>/s/t_<old> and <dir>/s.
     engine.drop_schema("s").unwrap();
     engine.defer_pending_dir_deletions(); // DROP-success path defers removal
 
     // Recreate before any checkpoint drains the gated queue.
     engine.create_schema("s").unwrap(); // cancels the gated <dir>/s removal
-    let new_tid = engine.create_table("s.t", &cols, &[0], true).unwrap();
+    let new_tid = engine.create_table("s.t", &cols, &[0]).unwrap();
     let new_dir = format!("{dir}/s/t_{new_tid}");
     assert!(Path::new(&new_dir).exists());
 
@@ -93,7 +93,7 @@ fn gc_reclaims_orphan_table_dir() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
 
-    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let schema = engine.get_schema(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
@@ -128,7 +128,7 @@ fn gc_reclaims_orphan_view_dir() {
     let dir = temp_dir("gc_orphan_view");
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![col_def("id", type_code::U64)];
-    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let live_dir = format!("{dir}/public/t_{tid}");
 
     let ghost = format!("{}/public/view_ghost_{}", dir, 4242);
@@ -150,7 +150,7 @@ fn gc_reclaims_orphan_index_dir() {
     let dir = temp_dir("gc_orphan_index");
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
-    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let idx_id = engine.create_index("public.t", &["val"], false).unwrap();
 
     let tbl_dir = format!("{dir}/public/t_{tid}");
@@ -182,7 +182,7 @@ fn gc_leaves_live_entities_untouched() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
 
-    let t1 = engine.create_table("public.flushed", &cols, &[0], true).unwrap();
+    let t1 = engine.create_table("public.flushed", &cols, &[0]).unwrap();
     let schema = engine.get_schema(t1).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
@@ -192,10 +192,10 @@ fn gc_leaves_live_entities_untouched() {
     engine.flush_family(t1).unwrap();
     let i1 = engine.create_index("public.flushed", &["val"], false).unwrap();
 
-    let t2 = engine.create_table("public.empty", &cols, &[0], true).unwrap();
+    let t2 = engine.create_table("public.empty", &cols, &[0]).unwrap();
 
     engine.create_schema("s2").unwrap();
-    let t3 = engine.create_table("s2.t", &cols, &[0], true).unwrap();
+    let t3 = engine.create_table("s2.t", &cols, &[0]).unwrap();
 
     // Id-only directories (§4): `t_{tid}`, regardless of the table name.
     let dirs = [
@@ -230,7 +230,7 @@ fn gc_skips_non_table_shaped_entries() {
     let dir = temp_dir("gc_non_table_entries");
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![col_def("id", type_code::U64)];
-    engine.create_table("public.t", &cols, &[0], true).unwrap();
+    engine.create_table("public.t", &cols, &[0]).unwrap();
 
     let keep1 = format!("{dir}/public/notatable"); // no underscore
     let keep2 = format!("{dir}/public/foo_notanumber"); // non-numeric suffix
@@ -252,7 +252,7 @@ fn gc_is_idempotent() {
     let dir = temp_dir("gc_idempotent");
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![col_def("id", type_code::U64)];
-    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let live = format!("{dir}/public/t_{tid}");
 
     let ghost = format!("{}/public/ghost_{}", dir, tid + 5000);
@@ -320,7 +320,7 @@ fn gc_recreated_schema_survives_drain() {
     );
 
     let cols = vec![col_def("id", type_code::U64)];
-    let tid = engine.create_table("s.t", &cols, &[0], true).unwrap();
+    let tid = engine.create_table("s.t", &cols, &[0]).unwrap();
     let tbl = format!("{dir}/s/t_{tid}");
     assert!(Path::new(&tbl).exists());
 
@@ -356,7 +356,7 @@ fn replicated_table_with_a_shard(engine: &mut CatalogEngine, dir: &str, flush: b
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let rt = engine.allocate_table_id();
     engine.write_column_records(rt, OWNER_KIND_TABLE, &cols).unwrap();
-    let flags = gnitz_wire::pack_table_flags(true, true, 0);
+    let flags = gnitz_wire::pack_table_flags(true, 0);
     let batch = build_table_tab_row_flags(dir, rt, pack_pk_cols(&[0]), "rt", flags);
     engine.ingest_to_family(TABLE_TAB_ID, &batch).unwrap();
 
@@ -468,7 +468,7 @@ fn reconcile_never_touches_a_hashed_store() {
     let dir = temp_dir("reconcile_child_dirs_hashed");
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
-    let pt = engine.create_table("public.pt", &cols, &[0], true).unwrap();
+    let pt = engine.create_table("public.pt", &cols, &[0]).unwrap();
     let hashed = engine.dag.tables[&pt].directory.clone();
     for p in 0..NUM_PARTITIONS {
         assert!(Path::new(&format!("{hashed}/part_{p}")).exists());

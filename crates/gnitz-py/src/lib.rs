@@ -1702,24 +1702,22 @@ impl PyGnitzClient {
         self.call(py, |c| c.drop_schema(name))
     }
 
-    /// create_table(schema_name, table_name, columns, unique_pk=True).
+    /// create_table(schema_name, table_name, columns).
     /// `columns` may be a `Schema` or a list of `ColumnDef` — resolved through
     /// [`resolve_py_schema`], so the PK
     /// columns come from the same rule every other schema surface applies.
     /// Partitioned, default distribution; no inline UNIQUE surface.
-    #[pyo3(signature = (schema_name, table_name, columns, unique_pk = true))]
     pub fn create_table(
         &mut self,
         py: Python<'_>,
         schema_name: &str,
         table_name: &str,
         columns: Bound<'_, PyAny>,
-        unique_pk: bool,
     ) -> PyResult<u64> {
         let schema = Arc::clone(&resolve_py_schema(py, &columns)?.borrow().rust);
         let pk: Vec<u32> = schema.pk_indices().iter().map(|&i| i as u32).collect();
         self.call(py, move |c| {
-            c.create_table(schema_name, table_name, &schema.columns, &pk, unique_pk, false, 0, &[])
+            c.create_table(schema_name, table_name, &schema.columns, &pk, false, 0, &[])
         })
     }
 

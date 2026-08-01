@@ -698,7 +698,6 @@ pub unsafe extern "C" fn gnitz_drop_schema(conn: *mut GnitzConn, name: *const c_
 }
 
 /// Create a table. pk_index is read from schema->pk_index.
-/// unique_pk != 0 enables the unique-PK fast-path on the server.
 /// Returns new table ID, or 0 on error.
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_create_table(
@@ -706,7 +705,6 @@ pub unsafe extern "C" fn gnitz_create_table(
     schema_name: *const c_char,
     table_name: *const c_char,
     schema: *const GnitzSchema,
-    unique_pk: c_int,
 ) -> u64 {
     clear_error();
     let c = check_ptr_mut!(conn, 0);
@@ -719,7 +717,6 @@ pub unsafe extern "C" fn gnitz_create_table(
         // no REPLICATED or CLUSTER BY surface (those ride on SQL DDL).
         &s.0.columns,
         &pk_slice,
-        unique_pk != 0,
         false,
         0,
         // No inline UNIQUE constraint surface in the C API (those ride on SQL DDL).

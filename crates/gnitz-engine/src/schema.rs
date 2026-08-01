@@ -182,7 +182,7 @@ pub(crate) const NARROW_PK_MAX_BYTES: usize = 16;
 /// Reassemble the native seek image from the wire pair `(low, extra)` — the
 /// inverse of `PkTuple::split_wire` — and OPK-encode it via [`key::opk_key`].
 /// The shared seek-key encoder for the master partition router
-/// (`fan_out_seek_async`) and the worker SEEK handler (`seek_family`) at every
+/// (`fan_out_seek`) and the worker SEEK handler (`seek_family`) at every
 /// PK width. The seek frame carries the key as native LE column bytes (it
 /// bypasses the client's `build_pk_region`, so the bytes are not yet OPK): the
 /// low ≤16 ride in `low`, a wide PK's `16..stride` suffix in `extra` (empty for

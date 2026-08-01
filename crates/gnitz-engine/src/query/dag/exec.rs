@@ -431,8 +431,8 @@ impl DagEngine {
             if has_output {
                 dirty_views.insert(view_id);
                 if self.dep.forward.get(&view_id).is_none_or(|d| d.is_empty()) {
-                    // Terminal view: move the batch into its family (no clone for
-                    // unique_pk) — there is nothing downstream to fan onto.
+                    // Terminal view: move the batch into its family — there is
+                    // nothing downstream to fan onto.
                     self.ingest_to_family(view_id, out_delta.unwrap());
                     continue;
                 }

@@ -41,16 +41,11 @@ fn write_bounded_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid
 /// A `(id U64 PK | val I64)` base of `NBASE` rows with `val = val_of(id)`,
 /// indexed on `val`, plus a registered identity view carrying `bound`. Returns
 /// `(engine, base tid, view id)`.
-fn fixture_with(
-    name: &str,
-    bound: Option<ScanBound>,
-    unique_pk: bool,
-    val_of: impl Fn(u64) -> u64,
-) -> (CatalogEngine, i64, i64) {
+fn fixture_with(name: &str, bound: Option<ScanBound>, val_of: impl Fn(u64) -> u64) -> (CatalogEngine, i64, i64) {
     let dir = temp_dir(name);
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
-    let tid = engine.create_table("public.base", &cols, &[0], unique_pk).unwrap();
+    let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
 
     let schema = engine.get_schema(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
@@ -72,8 +67,8 @@ fn fixture_with(
 }
 
 /// [`fixture_with`] at `val = id * 10` — correlated, the default shape.
-fn fixture(name: &str, bound: Option<ScanBound>, unique_pk: bool) -> (CatalogEngine, i64, i64) {
-    fixture_with(name, bound, unique_pk, |i| i * 10)
+fn fixture(name: &str, bound: Option<ScanBound>) -> (CatalogEngine, i64, i64) {
+    fixture_with(name, bound, |i| i * 10)
 }
 
 /// [`fixture_with`] at `val = (NBASE - id) * 10` — anti-correlated with the
@@ -84,7 +79,7 @@ fn fixture(name: &str, bound: Option<ScanBound>, unique_pk: bool) -> (CatalogEng
 /// from an invalid cursor, which `val = id * 10` (strictly monotone in the PK)
 /// can never produce.
 fn anticorrelated_fixture(name: &str, bound: Option<ScanBound>) -> (CatalogEngine, i64, i64) {
-    fixture_with(name, bound, true, |i| (NBASE - i) * 10)
+    fixture_with(name, bound, |i| (NBASE - i) * 10)
 }
 
 /// A bound on index column 1 (`val`) over the half-open cut interval.
@@ -122,11 +117,7 @@ fn full_drain(engine: &mut CatalogEngine, source: i64) -> Vec<(u128, i64)> {
 fn bounded_cursor_yields_in_range_rows_across_chunks() {
     // val ∈ [500, 900) ⇒ ids 50..90: 40 of 200 rows, inside the 1/16 gate? No —
     // 40/200 = 1/5. Narrow it to ids 50..60 (10/200 = 1/20).
-    let (mut engine, tid, vid) = fixture(
-        "srccur_range",
-        Some(val_bound(Cut::Before(500), Cut::Before(600))),
-        true,
-    );
+    let (mut engine, tid, vid) = fixture("srccur_range", Some(val_bound(Cut::Before(500), Cut::Before(600))));
     let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(
         matches!(cur, SourceCursor::Bounded(_)),
@@ -153,8 +144,7 @@ fn bounded_cursor_yields_in_range_rows_across_chunks() {
 /// walk the base's last PK group (id `NBASE-1`) — exhausting the base cursor —
 /// while chunk 1's first PK sorts *below* it. This catches both a `== Less`-only
 /// seek guard (which would skip the backward re-seek and drop the group) and a
-/// `!valid`-terminates-the-loop guard (which would drop every later chunk), on
-/// the `unique_pk` table the backfill actually ships.
+/// `!valid`-terminates-the-loop guard (which would drop every later chunk).
 #[test]
 fn bounded_cursor_backward_probe_across_exhausted_chunk() {
     // val ∈ [10, 110): the 10 lowest vals ⇒ ids 190..200 (the highest ids).
@@ -184,15 +174,11 @@ fn bounded_cursor_backward_probe_across_exhausted_chunk() {
 
 /// A retracted row on a **single-source** cursor — the one shape where the full
 /// scan's verbatim single-source slice copy (no weight predicate) and the bounded
-/// gather's `current_weight > 0` gate could diverge. They agree because a
-/// `unique_pk` base accumulates every live group to exactly +1.
+/// gather's `current_weight > 0` gate could diverge. They agree because a base
+/// table accumulates every live group to exactly +1.
 #[test]
 fn bounded_and_full_agree_with_a_retracted_row_single_source() {
-    let (mut engine, tid, vid) = fixture(
-        "srccur_retract",
-        Some(val_bound(Cut::Before(500), Cut::Before(600))),
-        true,
-    );
+    let (mut engine, tid, vid) = fixture("srccur_retract", Some(val_bound(Cut::Before(500), Cut::Before(600))));
     // Retract id=55 (val=550), inside the range. No flush: one memtable run, so
     // the cursor is single-source and takes the verbatim-copy drain path.
     let schema = engine.get_schema(tid).unwrap();
@@ -221,11 +207,7 @@ fn bounded_and_full_agree_with_a_retracted_row_single_source() {
 #[test]
 fn updated_indexed_column_emits_the_row_once() {
     // Range covers val ∈ [500, 600): ids 50..60 plus whatever moves in.
-    let (mut engine, tid, vid) = fixture(
-        "srccur_update",
-        Some(val_bound(Cut::Before(500), Cut::Before(600))),
-        true,
-    );
+    let (mut engine, tid, vid) = fixture("srccur_update", Some(val_bound(Cut::Before(500), Cut::Before(600))));
     // Move id=10 from val=100 to val=555 (into the range): retract + insert.
     let schema = engine.get_schema(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
@@ -251,7 +233,7 @@ fn updated_indexed_column_emits_the_row_once() {
 #[test]
 fn range_spanning_old_and_new_indexed_value_emits_once() {
     // val ∈ [500, 600) after moving id=51 from 510 → 590 — both inside the range.
-    let (mut engine, tid, vid) = fixture("srccur_span", Some(val_bound(Cut::Before(500), Cut::Before(600))), true);
+    let (mut engine, tid, vid) = fixture("srccur_span", Some(val_bound(Cut::Before(500), Cut::Before(600))));
     let schema = engine.get_schema(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(51u128, -1);
@@ -276,7 +258,7 @@ fn range_spanning_old_and_new_indexed_value_emits_once() {
 /// exactly that key group.
 #[test]
 fn degenerate_point_range_returns_one_key_group() {
-    let (mut engine, tid, vid) = fixture("srccur_point", Some(val_bound(Cut::Before(730), Cut::After(730))), true);
+    let (mut engine, tid, vid) = fixture("srccur_point", Some(val_bound(Cut::Before(730), Cut::After(730))));
     let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(matches!(cur, SourceCursor::Bounded(_)));
     assert_eq!(drain_all(&mut cur, 64), vec![(73u128, 1)]);
@@ -292,11 +274,7 @@ fn degenerate_point_range_returns_one_key_group() {
 /// through it, and the point here is precisely that the walk does not assume so.
 #[test]
 fn orphaned_index_entry_yields_empty_not_exhaustion() {
-    let (mut engine, tid, vid) = fixture(
-        "srccur_orphan",
-        Some(val_bound(Cut::Before(500), Cut::Before(600))),
-        true,
-    );
+    let (mut engine, tid, vid) = fixture("srccur_orphan", Some(val_bound(Cut::Before(500), Cut::Before(600))));
 
     // Clone a live in-range entry's key (val=550 ⇒ id=55) and swap its source-PK
     // suffix to an id no base row carries. The index schema is all-PK, zero
@@ -352,7 +330,6 @@ fn unselective_range_falls_back_to_full_scan() {
     let (mut engine, tid, vid) = fixture(
         "srccur_wide",
         Some(val_bound(Cut::Before(0), Cut::After(i64::MAX as u128))),
-        true,
     );
     let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(
@@ -369,53 +346,11 @@ fn unselective_range_falls_back_to_full_scan() {
 /// to a full scan rather than erroring or returning nothing.
 #[test]
 fn dropped_index_falls_back_to_full_scan() {
-    let (mut engine, tid, vid) = fixture(
-        "srccur_dropped",
-        Some(val_bound(Cut::Before(500), Cut::Before(600))),
-        true,
-    );
+    let (mut engine, tid, vid) = fixture("srccur_dropped", Some(val_bound(Cut::Before(500), Cut::Before(600))));
     engine.drop_index("public__base__idx_val").unwrap();
     let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(matches!(cur, SourceCursor::Full(_)));
     assert_eq!(drain_all(&mut cur, 64).len(), NBASE as usize);
-    engine.close();
-}
-
-/// A non-`unique_pk` source takes the bounded path like any other source, and a
-/// PK group whose live index entries STRADDLE a chunk boundary is emitted exactly
-/// once per row: each chunk's gather is windowed to the entries that chunk
-/// collected, so the group is re-walked by both chunks but each row passes the
-/// window filter in only one. Chunk size 1 forces every group to straddle.
-#[test]
-fn non_unique_pk_straddling_group_matches_full_scan() {
-    let (mut engine, tid, vid) = fixture(
-        "srccur_nonuniq",
-        Some(val_bound(Cut::Before(500), Cut::Before(600))),
-        false,
-    );
-    // A second live payload under PK 55, also in range: the group's entries
-    // (550, 55) and (555, 55) land in different chunks at chunk size 1.
-    let schema = engine.get_schema(tid).unwrap();
-    let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(55u128, 1);
-    bb.put_u64(555);
-    bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
-
-    let mut cur = engine.open_source_cursor(vid, tid).unwrap();
-    assert!(
-        matches!(cur, SourceCursor::Bounded(_)),
-        "an 11/201 range on a non-unique_pk source must take the index"
-    );
-    let want: Vec<(u128, i64)> = full_drain(&mut engine, tid)
-        .into_iter()
-        .filter(|&(pk, _)| (50..60).contains(&pk))
-        .collect();
-    assert_eq!(
-        drain_all(&mut cur, 1),
-        want,
-        "each straddling-group row must be emitted exactly once, at full-scan weights"
-    );
     engine.close();
 }
 
@@ -425,11 +360,7 @@ fn non_unique_pk_straddling_group_matches_full_scan() {
 #[test]
 fn inverted_range_is_empty_not_none() {
     // start After(900) is above end Before(300): x > 900 AND x < 300.
-    let (mut engine, tid, vid) = fixture(
-        "srccur_inverted",
-        Some(val_bound(Cut::After(900), Cut::Before(300))),
-        true,
-    );
+    let (mut engine, tid, vid) = fixture("srccur_inverted", Some(val_bound(Cut::After(900), Cut::Before(300))));
     let mut cur = engine
         .open_source_cursor(vid, tid)
         .expect("an empty range is Some, never None");
@@ -443,7 +374,7 @@ fn inverted_range_is_empty_not_none() {
 /// relies on.
 #[test]
 fn unregistered_source_is_none() {
-    let (mut engine, _tid, vid) = fixture("srccur_unreg", None, true);
+    let (mut engine, _tid, vid) = fixture("srccur_unreg", None);
     assert!(engine.open_source_cursor(vid, 999_999).is_none());
     engine.close();
 }
@@ -457,7 +388,7 @@ fn unregistered_source_is_none() {
 /// here still passes, because a full scan is never *wrong*.
 #[test]
 fn cold_plan_cache_still_finds_the_bound() {
-    let (mut engine, tid, vid) = fixture("srccur_cold", Some(val_bound(Cut::Before(500), Cut::Before(600))), true);
+    let (mut engine, tid, vid) = fixture("srccur_cold", Some(val_bound(Cut::Before(500), Cut::Before(600))));
     // Exactly what a freshly-created view looks like at the moment
     // `handle_backfill` opens its source cursor.
     engine.dag.invalidate(vid);
@@ -472,7 +403,7 @@ fn cold_plan_cache_still_finds_the_bound() {
 /// An unbounded plan takes the full scan — the pre-change behaviour, unchanged.
 #[test]
 fn unbounded_plan_full_scans() {
-    let (mut engine, tid, vid) = fixture("srccur_unbounded", None, true);
+    let (mut engine, tid, vid) = fixture("srccur_unbounded", None);
     let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(matches!(cur, SourceCursor::Full(_)));
     assert_eq!(drain_all(&mut cur, 64).len(), NBASE as usize);

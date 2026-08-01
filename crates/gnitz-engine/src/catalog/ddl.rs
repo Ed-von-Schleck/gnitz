@@ -176,7 +176,6 @@ impl CatalogEngine {
         qualified_name: &str,
         col_defs: &[ColumnDef],
         pk_cols: &[u32],
-        unique_pk: bool,
     ) -> Result<i64, String> {
         let (schema_name, table_name) = parse_qualified_name(qualified_name, "public");
         validate_user_identifier(schema_name)?;
@@ -211,7 +210,7 @@ impl CatalogEngine {
         // This in-process test shortcut always builds partitioned, full-PK-distributed
         // tables (`replicated = false`, `k = 0` = default). REPLICATED and CLUSTER BY
         // routing are exercised through the catalog hook / SQL planner, not here.
-        let flags = gnitz_wire::pack_table_flags(unique_pk, false, 0);
+        let flags = gnitz_wire::pack_table_flags(false, 0);
 
         // Write columns first (table hook reads them via sys_columns)
         self.write_column_records(tid, OWNER_KIND_TABLE, col_defs)?;

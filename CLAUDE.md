@@ -85,8 +85,8 @@ weight, null word, then payload columns — not separate per-row fields. Multipl
 rows may share the same PK if their payloads differ.
 
 **PK uniqueness is not a general invariant.** The PK region is a
-sort/routing key. It is unique for base table batches (DML-enforced — every
-SQL-created table is registered `unique_pk`) and reduce output
+sort/routing key. It is unique for base table batches (every base table
+runs `enforce_unique_pk` on ingest) and reduce output
 (one row per group). It is NOT unique for
 intermediate batches: `map_reindex` overwrites the PK region with a
 join/group column value, and join output inherits the left input's PK.
@@ -231,8 +231,8 @@ exchange):
   engine body (`op_weight_clamp`), differing only in `(lo,hi) = (0, i64::MAX)`,
   self-consolidates, and natively absorbs the within-epoch `ΔA` / `Δπ_A(inner)`
   simultaneity (DBSP Prop 4.7), so **no delta-delta cross term** arises. It is
-  **weight-exact for a bag-valued preserved side** (a non-`unique_pk` table, a
-  `UNION ALL` view): clamping the *result* of subtracting the raw `m` never
+  **weight-exact for a bag-valued preserved side** (e.g. a `UNION ALL` view):
+  clamping the *result* of subtracting the raw `m` never
   over-fills — unlike the retired `A − distinct(π_A(inner))`, whose `distinct`
   clamped the *witness* to 1 and leaked a spurious weight-`w−1` null-fill on a
   matched weight-`w` row. Partition-local because the runtime join-shard scatter

@@ -2255,7 +2255,7 @@ mod tests {
                 is_hidden: false,
             },
         ];
-        let tid = engine.create_table("public.tfifo", &cols, &[0], true).unwrap();
+        let tid = engine.create_table("public.tfifo", &cols, &[0]).unwrap();
         let schema = engine.get_schema_desc(tid).unwrap();
         assert!(!schema_wire_safe(&schema), "STRING schema must be non-wire-safe");
 
@@ -2557,7 +2557,7 @@ mod tests {
                 is_hidden: false,
             },
         ];
-        let tid = engine.create_table("public.tstr", &cols, &[0], true).unwrap();
+        let tid = engine.create_table("public.tstr", &cols, &[0]).unwrap();
         let schema = engine.get_schema_desc(tid).unwrap();
         assert!(!schema_wire_safe(&schema));
 
@@ -2600,7 +2600,7 @@ mod tests {
             is_hidden: false,
         };
         let cols = vec![mk("id"), mk("a"), mk("b")];
-        let tid = engine.create_table("public.tproj", &cols, &[0], true).unwrap();
+        let tid = engine.create_table("public.tproj", &cols, &[0]).unwrap();
         let table_schema = engine.get_schema_desc(tid).unwrap();
         let projected = crate::schema::project_schema(&table_schema, &[1]);
         assert_ne!(projected.num_columns(), table_schema.num_columns());

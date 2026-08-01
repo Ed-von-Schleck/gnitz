@@ -342,7 +342,7 @@ pub(crate) async fn dispatch_scan_multi_fanout(
 /// producer (worker scan chunks, chunked seek/gather replies, unique
 /// pre-flight frames) sets `FLAG_CONTINUATION` on every frame and
 /// `FLAG_SCAN_LAST` on the terminal one. This is the single definition of
-/// that train contract, shared by every train consumer (`fan_out_scan_async`,
+/// that train contract, shared by every train consumer (`fan_out_scan`,
 /// `drain_index_scan`, the pre-flight merge).
 fn parse_train_header(slot: &W2mSlot, w: usize, what: &str) -> Result<(wire::DecodedControl, bool), String> {
     let ctrl = peek_control_block(slot.bytes()).map_err(|e| scan_decode_err(w, e))?;

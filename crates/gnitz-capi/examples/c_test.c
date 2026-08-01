@@ -67,7 +67,7 @@ int main(int argc, char **argv) {
     CHECKEQ((int)gnitz_schema_col_count(sch), 2, "col_count", conn);
 
     /* 4. Create table */
-    uint64_t tid = gnitz_create_table(conn, "ctest", "nums", sch, 1 /* unique_pk */);
+    uint64_t tid = gnitz_create_table(conn, "ctest", "nums", sch);
     CHECK(tid != 0, "gnitz_create_table", conn);
 
     /* 5. Push 10 rows: id=i (U64), val=i*10 (I64), for i=1..10 */

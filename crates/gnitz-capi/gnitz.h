@@ -99,8 +99,7 @@ int gnitz_drop_schema(GnitzConn *conn, const char *name);
 uint64_t gnitz_create_table(GnitzConn *conn,
                             const char *schema_name,
                             const char *table_name,
-                            const GnitzSchema *schema,
-                            int unique_pk);
+                            const GnitzSchema *schema);
 
 int gnitz_drop_table(GnitzConn *conn, const char *schema_name, const char *table_name);
 

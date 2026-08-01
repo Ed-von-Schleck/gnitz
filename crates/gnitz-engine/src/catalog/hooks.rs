@@ -91,7 +91,6 @@ impl CatalogEngine {
                 self.apply_index_by_name(batch)?;
                 self.apply_index_by_id(batch)?;
                 self.hook_index_register(batch)?;
-                self.apply_needs_lock(SysFamily::Index, batch)?;
             }
             SysFamily::ViewDep => {
                 self.dag.invalidate_dep_map();
@@ -244,10 +243,8 @@ impl CatalogEngine {
             .map_err(|e| format!("Failed to create '{name}': error {e} (dir={directory})"))?;
         if kind.is_base_table() {
             // Tag base-table shards as PkUnique so the read cursor can skip
-            // payload comparison on a cross-source PK tie. Every base table
-            // enables tagging regardless of its `unique_pk` flag — the
-            // flush-time checker only marks shards whose data is actually
-            // unique.
+            // payload comparison on a cross-source PK tie. The flush-time checker
+            // marks only shards whose data is actually unique.
             pt.enable_pk_unique_tagging();
         }
         Ok(pt)
@@ -275,7 +272,6 @@ impl CatalogEngine {
                 }
 
                 let (sid, name, pk, flags) = read_table_tab_row(batch, i);
-                let is_unique = gnitz_wire::table_flags_unique(flags);
                 // Distribution prefix length k (0 = default = full PK).
                 // `new_with_dist` clamps an out-of-range k, so a crafted flag
                 // cannot index out of bounds.
@@ -310,7 +306,7 @@ impl CatalogEngine {
 
                 // One kind drives the whole property bundle: durability and
                 // Pk-unique tagging.
-                let kind = RelationKind::BaseTable { unique_pk: is_unique };
+                let kind = RelationKind::BaseTable;
                 gnitz_debug!(
                     "catalog: creating table dir={} name={} tid={} parts={}",
                     directory,

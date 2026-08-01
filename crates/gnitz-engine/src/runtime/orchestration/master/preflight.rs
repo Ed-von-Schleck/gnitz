@@ -1,7 +1,7 @@
 //! Distributed PK / FK / unique-index preflight validation and violation
 //! formatting: the check types (`PipelinedCheck` / `CheckPayload` /
 //! `P1Label` / `P2Label`), the pipelined executors
-//! (`execute_pipeline_async` / `execute_gather_async` + `GatherMap` and the
+//! (`execute_pipeline` / `execute_gather` + `GatherMap` and the
 //! check-batch builders/pool), the `validate_*` pipelines, the gather/merge
 //! key streams (`PreflightKeyStream` / `PreflightAccumulator` /
 //! `merge_index_scan`), and the error renderers.
@@ -22,7 +22,7 @@ pub(super) enum CheckPayload {
     Broadcast(Batch),
     /// Pre-partitioned by the schema PK: source batch delivered via
     /// `scatter_wire_group` without materializing intermediate per-worker
-    /// `Batch`es. `execute_pipeline_async` computes the per-worker routing
+    /// `Batch`es. `execute_pipeline` computes the per-worker routing
     /// itself from `check.schema.pk_indices()` via `with_worker_indices`.
     ScatterSource { source: Batch },
 }
@@ -84,7 +84,7 @@ pub(super) enum P2Label {
     FkRestrict { child_tid: i64 },
 }
 
-/// `pk → projected committed values` result of `execute_gather_async`. Rows
+/// `pk → projected committed values` result of `execute_gather`. Rows
 /// live in one flat arena, `stride` values each, instead of one heap `Vec`
 /// per row — a large UPDATE/DELETE validation gathers tens of thousands of
 /// rows, and per-row allocations would dominate the merge.
@@ -260,7 +260,7 @@ pub(super) fn recycle_check_batch(disp: &mut MasterDispatcher, target_id: i64, b
 
 /// Take each `Batch` out of `checks` via `Option::take` (no pool round-trip for
 /// a sentinel), push it into `disp.check_batch_pool[target_id]`, and cap the
-/// pool depth. Called after `execute_pipeline_async` to recycle allocations.
+/// pool depth. Called after `execute_pipeline` to recycle allocations.
 pub(super) fn reclaim_check_batches(disp: &mut MasterDispatcher, checks: &mut [PipelinedCheck]) {
     for check in checks.iter_mut() {
         if let Some(payload) = check.payload.take() {
@@ -505,7 +505,7 @@ fn span_to_natives(span: &PkBuf, idx_cols: &[SchemaColumn]) -> [u128; gnitz_wire
 }
 
 /// Collect the distinct non-PK parent columns referenced by `target_id`'s FK
-/// children, as a projection list for `execute_gather_async`. A PK-target child
+/// children, as a projection list for `execute_gather`. A PK-target child
 /// reads its referenced value from the packed PK on the wire and needs no
 /// gather, so PK columns are excluded.
 fn collect_fk_projection(cat: &CatalogEngine, target_id: i64, source_schema: &SchemaDescriptor) -> Vec<u8> {
@@ -753,10 +753,9 @@ impl MasterDispatcher {
     // at most 2 rounds: Phase 1 is fully independent; Phase 2 depends
     // on Phase 1's UPSERT-identification result.
 
-    /// Async equivalent of `validate_all_distributed`. Identical semantics;
-    /// uses `execute_pipeline_async` + `fan_out_seek_by_index_async` so it
-    /// runs without blocking the reactor.
-    pub async fn validate_all_distributed_async(
+    /// Composes the pipelined check bursts described above into at most two
+    /// rounds, without blocking the reactor.
+    pub async fn validate_all_distributed(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
@@ -764,23 +763,24 @@ impl MasterDispatcher {
         batch: &Batch,
         mode: WireConflictMode,
     ) -> Result<(), String> {
-        let (n_fk, n_children, n_circuits, has_unique, unique_pk, source_schema) = unsafe {
+        let (n_fk, n_children, n_circuits, has_unique, source_schema) = unsafe {
             let disp = &mut *disp_ptr;
             let cat = &mut *disp.catalog;
             let n_fk = cat.fk_constraints_of(target_id).len();
             let n_children = cat.fk_children_of(target_id).len();
             let n_circuits = cat.get_index_circuit_count(target_id);
             let has_unique = cat.has_any_unique_index(target_id);
-            let unique_pk = cat.table_has_unique_pk(target_id);
             let source_schema = cat
                 .get_schema_desc(target_id)
                 .ok_or_else(|| format!("validate_all_distributed: no schema for table {target_id}"))?;
-            (n_fk, n_children, n_circuits, has_unique, unique_pk, source_schema)
+            (n_fk, n_children, n_circuits, has_unique, source_schema)
         };
 
-        let needs_pk_rejection = matches!(mode, WireConflictMode::Error) && unique_pk;
+        // Every push target is a base table, so Error mode always needs the
+        // against-store PK rejection broadcast.
+        let error_mode = matches!(mode, WireConflictMode::Error);
 
-        if n_fk == 0 && n_children == 0 && !has_unique && !needs_pk_rejection {
+        if n_fk == 0 && n_children == 0 && !has_unique && !error_mode {
             return Ok(());
         }
 
@@ -791,9 +791,9 @@ impl MasterDispatcher {
         // Net-positive PK byte spans feed the UPSERT PK-identification check
         // below; the borrowed keys never escape this synchronous prelude.
         let mut pk_keys: Vec<PkBuf> = Vec::new();
-        if has_unique || needs_pk_rejection {
+        if has_unique || error_mode {
             let net = pk_net_weight_and_dup_count(batch);
-            if needs_pk_rejection {
+            if error_mode {
                 for (&pk, &(_, pos_count)) in net.iter() {
                     if pos_count > 1 {
                         let key_str = format_pk_value_bytes(pk, &source_schema);
@@ -928,8 +928,7 @@ impl MasterDispatcher {
                 let gathered = if project.is_empty() {
                     GatherMap::default()
                 } else {
-                    Self::execute_gather_async(disp_ptr, reactor, sal_excl, target_id, removed_pks.clone(), &project)
-                        .await?
+                    Self::execute_gather(disp_ptr, reactor, sal_excl, target_id, removed_pks.clone(), &project).await?
                 };
 
                 for r in unsafe { (*(*disp_ptr).catalog).fk_children_of(target_id) } {
@@ -995,7 +994,7 @@ impl MasterDispatcher {
         }
 
         // UPSERT PK identification: which incoming PKs already exist in storage.
-        // Routing is computed inside execute_pipeline_async; here we only build
+        // Routing is computed inside execute_pipeline; here we only build
         // the check batch from the collected net-positive PK byte spans.
         let upsert_pk_batch: Option<Batch> = if pk_keys.is_empty() {
             None
@@ -1016,7 +1015,7 @@ impl MasterDispatcher {
         // ----- Phase 1 execute + interpret --------------------------------
         let mut existing_pks: FxHashSet<PkBuf> = FxHashSet::default();
         if !p1_checks.is_empty() {
-            let mut p1_results = Self::execute_pipeline_async(disp_ptr, reactor, sal_excl, &mut p1_checks).await?;
+            let mut p1_results = Self::execute_pipeline(disp_ptr, reactor, sal_excl, &mut p1_checks).await?;
             unsafe {
                 reclaim_check_batches(&mut *disp_ptr, &mut p1_checks);
             }
@@ -1054,7 +1053,7 @@ impl MasterDispatcher {
                     }
                     P1Label::UpsertPkId => {
                         existing_pks = std::mem::take(&mut p1_results[idx]);
-                        if matches!(mode, WireConflictMode::Error) && !existing_pks.is_empty() {
+                        if error_mode && !existing_pks.is_empty() {
                             let conflict_pk = existing_pks.iter().next().unwrap();
                             let (pk_names, sn, tn) =
                                 unsafe { (*disp_ptr).pk_violation_context(target_id, &source_schema) };
@@ -1108,8 +1107,7 @@ impl MasterDispatcher {
                 // Old values come from committed storage (validation is
                 // pre-commit, under the FK table locks held by the executor,
                 // so the committed parent state is static across the gather).
-                let gathered =
-                    Self::execute_gather_async(disp_ptr, reactor, sal_excl, target_id, updated, &project).await?;
+                let gathered = Self::execute_gather(disp_ptr, reactor, sal_excl, target_id, updated, &project).await?;
 
                 for r in unsafe { (*(*disp_ptr).catalog).fk_children_of(target_id) } {
                     let (child_tid, fk_col_idx, parent_col_idx) = (r.child_tid, r.fk_col_idx, r.parent_col_idx);
@@ -1170,7 +1168,7 @@ impl MasterDispatcher {
 
         // Lazily warm the unique-index filters. In the async path this
         // may trigger a scan; the scan is itself async.
-        Self::ensure_unique_filters_warm_async(disp_ptr, reactor, sal_excl, target_id).await?;
+        Self::ensure_unique_filters_warm(disp_ptr, reactor, sal_excl, target_id).await?;
 
         let mut p2_checks: Vec<PipelinedCheck> = Vec::new();
         let mut p2_labels: Vec<P2Label> = Vec::new();
@@ -1254,14 +1252,6 @@ impl MasterDispatcher {
                     continue;
                 }
 
-                // One row at weight w is the value w times. On a non-unique_pk
-                // table that is w live instances (enforce_unique_pk collapses
-                // it to one on unique_pk tables) — the same violation as w
-                // separate +1 rows, which `seen` below rejects.
-                if !unique_pk && w > 1 {
-                    return Err(unsafe { (*disp_ptr).unique_violation_err(target_id, cols, true) });
-                }
-
                 // In-batch duplicate detection runs for ALL positive-weight
                 // rows, INCLUDING UPSERTs: two rows setting the same new unique
                 // value in one transaction is a violation regardless of whether
@@ -1270,13 +1260,11 @@ impl MasterDispatcher {
                     return Err(unsafe { (*disp_ptr).unique_violation_err(target_id, cols, true) });
                 }
 
-                // UPSERT (committed PK on a unique_pk table — enforce_unique_pk
-                // retracts the old row at apply) OR a fresh insertion whose value
-                // is explicitly retracted in this batch (transfer onto a fresh PK):
-                // both need per-holder verification. On a non-unique_pk table an
-                // existing PK is NOT an upsert (no enforce_unique_pk), so it must
-                // take the broadcast path where any committed hit is a violation.
-                let is_upsert = unique_pk && existing_pks.contains(batch.get_pk_bytes(i));
+                // UPSERT (committed PK — enforce_unique_pk retracts the old row at
+                // apply) OR a fresh insertion whose value is explicitly retracted
+                // in this batch (transfer onto a fresh PK): both need per-holder
+                // verification.
+                let is_upsert = existing_pks.contains(batch.get_pk_bytes(i));
                 if is_upsert || retracted_vals.contains(&keybuf) {
                     // Carry the row's own `is_upsert`: a fresh-PK row routed here by
                     // a value in `retracted_vals` must get only the
@@ -1348,7 +1336,7 @@ impl MasterDispatcher {
             return Ok(());
         }
 
-        let p2_results = Self::execute_pipeline_async(disp_ptr, reactor, sal_excl, &mut p2_checks).await?;
+        let p2_results = Self::execute_pipeline(disp_ptr, reactor, sal_excl, &mut p2_checks).await?;
         unsafe {
             reclaim_check_batches(&mut *disp_ptr, &mut p2_checks);
         }
@@ -1421,18 +1409,13 @@ impl MasterDispatcher {
                         // `Option<PkBuf>` is the committed holder's source PK.
                         let Some(found_pk) = holder_result? else { continue };
                         // The committed holder is acceptable only if it releases
-                        // this value in this batch. Implicit release (holder is
-                        // itself an upserted PK, so enforce_unique_pk retracts its
-                        // committed row — covers a same-PK re-upsert and a bulk
-                        // shift) applies ONLY when the colliding row is also an
-                        // upsert: `is_upsert` implies `unique_pk &&
-                        // existing_pks.contains(row_pk)`. A fresh-PK row routed here
-                        // by `retracted_vals` has is_upsert=false, so it cannot ride
-                        // the holder's implicit retraction and land a second live
-                        // holder. Explicit release (holder retracts this exact
-                        // (PK, value span) pair) needs no such gate and admits a
-                        // transfer onto a fresh PK. `seen` already barred two live
-                        // rows sharing the value.
+                        // this value in this batch, either implicitly (the holder
+                        // is itself an upserted PK, so enforce_unique_pk retracts
+                        // its committed row — gated on this row also being an
+                        // upsert, since a fresh PK cannot ride that retraction) or
+                        // explicitly (the holder retracts this exact (PK, value
+                        // span) pair, which admits a transfer onto a fresh PK).
+                        // `seen` already barred two live rows sharing the value.
                         let exempt = (is_upsert && existing_pks.contains(found_pk.pk_bytes()))
                             || retracted_pairs.contains(&(found_pk, key_pk));
                         if !exempt {
@@ -1452,14 +1435,14 @@ impl MasterDispatcher {
     /// Error-mode PK existence which is cumulative in frame order. The whole
     /// transaction passes or one violation aborts it — all pre-SAL. The three
     /// rule checks reuse the plain-push distributed probe primitives
-    /// (`execute_pipeline_async`, `seek_unique_holder`, `execute_gather_async`,
-    /// `fan_out_seek_by_index_collect_async`), fed fold-derived keys instead of a
+    /// (`execute_pipeline`, `seek_unique_holder`, `execute_gather`,
+    /// `fan_out_seek_by_index_collect`), fed fold-derived keys instead of a
     /// single batch's raw rows, and — like the plain-push validator — each plans
     /// every one of its probes first and issues them as ONE pipelined burst.
     /// Committed state is stable across every probe because the caller holds the
     /// involved tables' locks and the catalog read lock through the ACK.
     /// Fire one pipelined probe burst and recycle the check batches back to the
-    /// pool. `execute_pipeline_async` already returns an empty result for an empty
+    /// pool. `execute_pipeline` already returns an empty result for an empty
     /// `checks`, so callers need no length guard. The paired reclaim is centralized
     /// here so no probe site can forget it (a leaked pooled batch).
     async fn execute_and_reclaim(
@@ -1468,12 +1451,12 @@ impl MasterDispatcher {
         sal_excl: &Rc<AsyncMutex<()>>,
         checks: &mut [PipelinedCheck],
     ) -> Result<Vec<FxHashSet<PkBuf>>, String> {
-        let results = Self::execute_pipeline_async(disp_ptr, reactor, sal_excl, checks).await?;
+        let results = Self::execute_pipeline(disp_ptr, reactor, sal_excl, checks).await?;
         unsafe { reclaim_check_batches(&mut *disp_ptr, checks) };
         Ok(results)
     }
 
-    pub async fn validate_txn_distributed_async(
+    pub async fn validate_txn_distributed(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
@@ -1945,7 +1928,7 @@ impl MasterDispatcher {
             .iter()
             .map(|&(i, v)| {
                 let plan = &plans[i];
-                Box::pin(Self::fan_out_seek_by_index_collect_async(
+                Box::pin(Self::fan_out_seek_by_index_collect(
                     disp_ptr,
                     reactor,
                     sal_excl,
@@ -1989,7 +1972,7 @@ impl MasterDispatcher {
     /// `parent_tid` for column `ref_col`: `added` are the surviving parent rows'
     /// (non-NULL) values; `retired` are the old committed values of touched PKs
     /// whose surviving state is absent or holds a different value. The old values
-    /// come from the packed PK (a PK column) or one batched `execute_gather_async`
+    /// come from the packed PK (a PK column) or one batched `execute_gather`
     /// (a non-PK referenced column). NULL values are unindexed and excluded.
     async fn parent_retired_added(
         disp_ptr: *mut MasterDispatcher,
@@ -2012,7 +1995,7 @@ impl MasterDispatcher {
                 old_of.insert(*p, pk_native_key(p.pk_bytes(), off, col_size, col_type));
             }
         } else {
-            let gathered = Self::execute_gather_async(
+            let gathered = Self::execute_gather(
                 disp_ptr,
                 reactor,
                 sal_excl,
@@ -2077,7 +2060,7 @@ impl MasterDispatcher {
     /// the backfill.
     ///
     /// An unknown table yields an empty set (nothing to validate).
-    pub async fn validate_unique_index_create_async(
+    pub async fn validate_unique_index_create(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
@@ -2103,7 +2086,7 @@ impl MasterDispatcher {
             // routes them to the always-broadcast upsert path), so every
             // `check_keys` key carries a fresh PK — hence a fresh value — and
             // "absent" is always the correct verdict.
-            if cat.table_has_unique_pk(owner_id) && owner_schema.group_cols_eq_pk(col_indices) {
+            if owner_schema.group_cols_eq_pk(col_indices) {
                 return Ok((FxHashSet::default(), false));
             }
             // Build the index schema (the circuit is not registered until this
@@ -2196,12 +2179,12 @@ impl MasterDispatcher {
 }
 
 impl MasterDispatcher {
-    /// Async version of `execute_pipeline`. Writes each check with
-    /// per-worker req_ids, signals once, and joins all replies.
+    /// Writes each check with per-worker req_ids, signals once, and joins all
+    /// replies.
     ///
     /// `sal_excl` is held only for the synchronous write + signal phase;
     /// see `dispatch_scan_fanout` for the rationale.
-    pub(super) async fn execute_pipeline_async(
+    pub(super) async fn execute_pipeline(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
@@ -2313,7 +2296,7 @@ impl MasterDispatcher {
     ///
     /// This is the `O(num_workers)`-round-trip replacement for the per-row
     /// serial single-key seek loop used by FK RESTRICT on non-PK UNIQUE
-    /// targets. It is a sibling of `execute_pipeline_async` (which returns only
+    /// targets. It is a sibling of `execute_pipeline` (which returns only
     /// existence) rather than a modification of it: the has-pk pipeline echoes
     /// the caller's payload (`filter_by_pk`), so it structurally cannot return
     /// a stored column the caller does not already hold.
@@ -2323,7 +2306,7 @@ impl MasterDispatcher {
     /// request ids and the train drain. The expected projected schema guards
     /// each train's first frame — a worker whose catalog lags a DDL would
     /// otherwise hand back rows the master mis-decodes.
-    pub(super) async fn execute_gather_async(
+    pub(super) async fn execute_gather(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,

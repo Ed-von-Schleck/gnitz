@@ -16,7 +16,7 @@ fn schema_roundtrip_catalog_preserves_pk_order() {
 
     {
         let mut engine = CatalogEngine::open(&dir).unwrap();
-        engine.create_table("public.cpk_order", &cols, &[2, 1], true).unwrap();
+        engine.create_table("public.cpk_order", &cols, &[2, 1]).unwrap();
         engine.close();
     }
     {

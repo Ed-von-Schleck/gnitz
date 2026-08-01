@@ -21,18 +21,29 @@ fn fixture(name: &str, n: u64, val_of: impl Fn(u64) -> i64) -> (CatalogEngine, i
     ingest_fixture(name, &id_val_cols(), n, 1, |bb, id| bb.put_u64(val_of(id) as u64))
 }
 
-/// An `id_val_cols` base built from explicit `(id, val, weight)` triples
-/// (non-unique PK so weighted / duplicate rows are admitted verbatim).
+/// An `id_val_cols` **view output store** built from explicit `(id, val, weight)`
+/// triples. A view runs no `enforce_unique_pk`, so weights above 1 are admitted
+/// verbatim — a base table would clamp every accumulated PK weight to 1.
+/// Returns the view id; the scan verb reads a view exactly like a base table.
 fn weighted_fixture(name: &str, rows: impl Iterator<Item = (u64, i64, i64)>) -> (CatalogEngine, i64) {
-    let (mut engine, tid) = table_fixture(name, &id_val_cols());
-    let mut bb = BatchBuilder::new(engine.get_schema(tid).unwrap());
+    let cols = id_val_cols();
+    let (mut engine, tid, _dir) = table_fixture(name, &cols);
+
+    let vid = engine.allocate_table_id();
+    write_identity_circuit(&mut engine, vid, tid, None);
+    engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
+    engine.write_view_deps(vid, &[tid]).unwrap();
+    let batch = build_view_tab_row(vid, "v_weighted", "SELECT * FROM t");
+    engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
+
+    let mut bb = BatchBuilder::new(engine.get_schema(vid).unwrap());
     for (id, val, w) in rows {
         bb.begin_row(id as u128, w);
         bb.put_u64(val as u64);
         bb.end_row();
     }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    (engine, tid)
+    engine.ingest_to_family(vid, &bb.finish()).unwrap();
+    (engine, vid)
 }
 
 /// Extract `(id, val, weight)` triples from a `(id U64 PK | val I64)` reply batch.
@@ -113,7 +124,7 @@ fn pk_set_gathers_named_keys() {
 /// there. Treating it like a hashed store would answer zero rows.
 #[test]
 fn pk_set_over_a_system_table_keeps_every_key() {
-    let (mut e, tid) = table_fixture("ss_pkset_sys", &id_val_cols());
+    let (mut e, tid, _dir) = table_fixture("ss_pkset_sys", &id_val_cols());
     let sys_schema = e.get_schema(TABLE_TAB_ID).unwrap();
     let spec = identity_spec(ReadBound::PkSet(vec![tid as u128]), vec![], 0);
     let keeper = e.scan_spec_family(TABLE_TAB_ID, &spec, &sys_schema).unwrap();

@@ -1,4 +1,4 @@
-"""E2E tests for unique_pk UPSERT/DELETE-by-PK enforcement."""
+"""E2E tests for base-table UPSERT/DELETE-by-PK enforcement."""
 
 import random
 import gnitz
@@ -8,14 +8,14 @@ def _uid():
     return str(random.randint(100000, 999999))
 
 
-def _make_table(client, unique_pk=True):
+def _make_table(client):
     """Create schema + (pk U64 PK, val I64) table. Returns (tid, schema, sn)."""
     sn = "s" + _uid()
     client.create_schema(sn)
     cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
             gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
     schema = gnitz.Schema(cols)
-    tid = client.create_table(sn, "t", cols, unique_pk=unique_pk)
+    tid = client.create_table(sn, "t", cols)
     return tid, schema, sn
 
 
@@ -24,7 +24,7 @@ def _push(client, tid, schema, rows, weight=1):
     batch = gnitz.ZSetBatch(schema)
     for pk, val in rows:
         batch.append(pk=pk, val=val, _weight=weight)
-    client.push(tid, batch)
+    return client.push(tid, batch)
 
 
 def _scan_rows(client, tid):
@@ -86,17 +86,6 @@ def test_intra_batch_overwrite(client):
     client.drop_schema(sn)
 
 
-def test_raw_table_allows_duplicates(client):
-    """unique_pk=False table accumulates weights; scan shows weight=2 after two pushes."""
-    tid, schema, sn = _make_table(client, unique_pk=False)
-    _push(client, tid, schema, [(1, 10)])
-    _push(client, tid, schema, [(1, 10)])  # accumulates to w=+2
-    rows = [(row.pk, row.val, row.weight) for row in client.scan(tid)]
-    assert rows == [(1, 10, 2)]
-    client.drop_table(sn, "t")
-    client.drop_schema(sn)
-
-
 def test_multiple_keys_independent(client):
     """Multiple distinct PKs are each handled independently."""
     tid, schema, sn = _make_table(client)
@@ -131,8 +120,8 @@ def test_delete_multiple_pks(client):
 def test_upsert_intra_batch_insert_then_delete(client):
     """Single batch: insert pk=1 then retract pk=1; scan shows empty."""
     tid, schema, sn = _make_table(client)
-    # val=0 in the retraction differs from the inserted val=10, but unique_pk
-    # tables retract by PK match regardless of payload values.
+    # val=0 in the retraction differs from the inserted val=10, but a base
+    # table retracts by PK match regardless of payload values.
     batch = gnitz.ZSetBatch(schema)
     batch.append(pk=1, val=10, _weight=1)
     batch.append(pk=1, val=0, _weight=-1)
@@ -146,8 +135,8 @@ def test_upsert_intra_batch_delete_then_insert(client):
     """Pre-insert pk=1 val=10; single batch: retract pk=1 then insert pk=1 val=99."""
     tid, schema, sn = _make_table(client)
     _push(client, tid, schema, [(1, 10)])
-    # val=0 in the retraction differs from the inserted val=10, but unique_pk
-    # tables retract by PK match regardless of payload values.
+    # val=0 in the retraction differs from the inserted val=10, but a base
+    # table retracts by PK match regardless of payload values.
     batch = gnitz.ZSetBatch(schema)
     batch.append(pk=1, val=0, _weight=-1)
     batch.append(pk=1, val=99, _weight=1)

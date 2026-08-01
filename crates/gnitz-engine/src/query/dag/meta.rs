@@ -225,7 +225,7 @@ impl DagEngine {
         while let Some(node) = stack.pop() {
             for s in self.get_source_ids(node) {
                 match self.tables.get(&s).map(|e| e.kind) {
-                    Some(RelationKind::BaseTable { .. }) => {
+                    Some(RelationKind::BaseTable) => {
                         bases.insert(s);
                     }
                     Some(RelationKind::View) if visited.insert(s) => stack.push(s),

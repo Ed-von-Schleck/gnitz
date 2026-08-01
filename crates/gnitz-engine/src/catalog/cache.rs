@@ -64,8 +64,8 @@ pub(crate) struct CatalogCacheSet {
     /// set: the table itself plus all FK parents and children, sorted ascending
     /// and deduped for deadlock-free acquisition. Recomputed by
     /// `recompute_needs_lock` on every trigger (`apply_needs_lock` fires on
-    /// both FK endpoints, IDX_TAB, and TABLE_TAB deltas), so `fk_lock_set` is
-    /// a plain borrow on the push path.
+    /// TABLE_TAB and FK-carrying COL_TAB deltas), so `fk_lock_set` is a plain
+    /// borrow on the push path.
     pub(crate) needs_lock: FxHashMap<i64, Vec<i64>>,
 }
 
@@ -368,12 +368,6 @@ impl CatalogEngine {
                     to_recompute.push(batch.get_pk(i) as i64);
                 }
             }
-            SysFamily::Index => {
-                to_recompute.reserve_exact(batch.count);
-                for i in 0..batch.count {
-                    to_recompute.push(batch.read_payload_u64(i, IDXTAB_PAY_OWNER_ID) as i64);
-                }
-            }
             SysFamily::Column => {
                 to_recompute.reserve(batch.count * 2);
                 for i in 0..batch.count {
@@ -407,11 +401,12 @@ impl CatalogEngine {
     pub(crate) fn recompute_needs_lock(&mut self, tid: i64) {
         let fk_child_count = self.caches.fk_by_child.get(&tid).map_or(0, |v| v.len());
         let fk_parent_count = self.caches.fk_by_parent.get(&tid).map_or(0, |v| v.len());
-        let (has_unique_index, unique_pk) = self.dag.tables.get(&tid).map_or((false, false), |e| {
-            (e.index_circuits.iter().any(|ic| ic.is_unique), e.unique_pk())
-        });
+        // Every base table needs the lock: its writes run `enforce_unique_pk`
+        // against the store, and only a base table can own a unique secondary
+        // index. Views and system tables need it only as an FK endpoint.
+        let is_base_table = self.dag.tables.get(&tid).is_some_and(|e| e.kind.is_base_table());
 
-        let needs = fk_child_count > 0 || fk_parent_count > 0 || has_unique_index || unique_pk;
+        let needs = fk_child_count > 0 || fk_parent_count > 0 || is_base_table;
         if needs {
             let mut tids = vec![tid];
             if let Some(constraints) = self.caches.fk_by_child.get(&tid) {

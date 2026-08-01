@@ -51,7 +51,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
-    let tid = engine.create_table("public.base", &cols, &[0], true).unwrap();
+    let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
     let schema = engine.get_schema(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     for i in 0..N as u64 {
@@ -145,7 +145,7 @@ fn index_rebuilds_across_chunk_boundary_view_defers() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
-    let tid = engine.create_table("public.base", &cols, &[0], true).unwrap();
+    let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
     let schema = engine.get_schema(tid).unwrap();
     let mut next = 0usize;
     while next < n {
@@ -228,7 +228,7 @@ fn backfill_all_indexes_rebuilds_exactly_once() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
-    let tid = engine.create_table("public.base", &cols, &[0], true).unwrap();
+    let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
     let schema = engine.get_schema(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     for i in 0..N as u64 {

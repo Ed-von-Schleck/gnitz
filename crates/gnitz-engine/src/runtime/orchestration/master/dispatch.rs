@@ -46,7 +46,7 @@ fn confined_worker(disp_ptr: *mut MasterDispatcher, target_id: i64, seek_pk_extr
     let cat = unsafe { &mut *(*disp_ptr).catalog };
     let kind = cat.dag.tables.get(&target_id)?.kind;
     match kind {
-        RelationKind::BaseTable { .. } => {}
+        RelationKind::BaseTable => {}
         RelationKind::View if !cat.dag.view_has_replicated_source(target_id) => {}
         // A single-partition view store — one unpartitioned table per worker,
         // holding whatever landed there.
@@ -210,7 +210,7 @@ impl MasterDispatcher {
     /// Write one scan group: `sal_flags = 0` and the caller's `wire_flags`
     /// (schema-version bits, plus `FLAG_SCAN_FIFO_REPLY` for a multi-scan). The
     /// worker's `scan_family` resolves and returns the relation's schema from its
-    /// own catalog. Shared by the single-scan fan-out (`fan_out_scan_async`) and
+    /// own catalog. Shared by the single-scan fan-out (`fan_out_scan`) and
     /// the multi-scan one-cut writer (`dispatch_scan_multi_fanout`).
     pub(super) fn write_one_scan_group(
         &mut self,
@@ -842,7 +842,7 @@ impl MasterDispatcher {
     // re-enter the dispatcher in the meantime. Only call from inside a
     // reactor task driven by `block_until_idle`.
 
-    pub async fn fan_out_seek_async(
+    pub async fn fan_out_seek(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
@@ -864,7 +864,7 @@ impl MasterDispatcher {
         let (opk, stride) = crate::schema::seek_opk_bytes(&schema, pk, seek_pk_extra)
             .map_err(|e| format!("seek: table {target_id}: {e}"))?;
         let worker = worker_for_partition(schema.partition_for_pk(&opk[..stride]), num_workers);
-        single_worker_async(
+        single_worker(
             disp_ptr,
             reactor,
             sal_excl,
@@ -879,7 +879,7 @@ impl MasterDispatcher {
         .await
     }
 
-    pub async fn fan_out_seek_by_index_async(
+    pub async fn fan_out_seek_by_index(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
@@ -908,7 +908,7 @@ impl MasterDispatcher {
             }
         };
         if routed >= 0 {
-            return single_worker_async(
+            return single_worker(
                 disp_ptr,
                 reactor,
                 sal_excl,
@@ -962,10 +962,10 @@ impl MasterDispatcher {
     ///
     /// A non-unique indexed value matches rows scattered across workers (the
     /// per-key routing cache is only populated for unique indexes), so unlike
-    /// `fan_out_seek_by_index_async` (which returns a single worker's slot, used
+    /// `fan_out_seek_by_index` (which returns a single worker's slot, used
     /// by the UPSERT identity check where the index is unique) this must
     /// aggregate. Returns the merged base rows, or `None` when no row matches.
-    pub async fn fan_out_seek_by_index_collect_async(
+    pub async fn fan_out_seek_by_index_collect(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
@@ -1095,8 +1095,7 @@ impl MasterDispatcher {
         let cols = col_indices.as_slice();
         if cols.len() == 1 {
             // single-column unique: unicast to the one owning worker (routing cache).
-            let slot =
-                Self::fan_out_seek_by_index_async(disp_ptr, reactor, sal_excl, target_id, cols[0], natives[0]).await?;
+            let slot = Self::fan_out_seek_by_index(disp_ptr, reactor, sal_excl, target_id, cols[0], natives[0]).await?;
             let ctrl = peek_control_block(slot.bytes()).map_err(|e| e.to_string())?;
             if ctrl.flags & FLAG_HAS_DATA == 0 {
                 return Ok(None);
@@ -1113,7 +1112,7 @@ impl MasterDispatcher {
             for (slot, &v) in extra.chunks_exact_mut(16).zip(&natives[1..cols.len()]) {
                 slot.copy_from_slice(&v.to_le_bytes());
             }
-            let batch = Self::fan_out_seek_by_index_collect_async(
+            let batch = Self::fan_out_seek_by_index_collect(
                 disp_ptr,
                 reactor,
                 sal_excl,
@@ -1140,7 +1139,7 @@ impl MasterDispatcher {
     /// Each slot is dropped (advancing `consume_cursor`) before the next
     /// continuation frame is awaited to prevent W2M ring deadlock.
     #[allow(clippy::too_many_arguments)]
-    pub async fn fan_out_scan_async(
+    pub async fn fan_out_scan(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
@@ -1173,7 +1172,7 @@ impl MasterDispatcher {
         forward_scan_slots(reactor, peer, slots, &req_ids, unicast).await
     }
 
-    /// ScanSpec (`ReadSpec`) fan-out — the exact `fan_out_scan_async` shape, but
+    /// ScanSpec (`ReadSpec`) fan-out — the exact `fan_out_scan` shape, but
     /// the group is written by `write_scan_spec_group` (carrying `FLAG_SCAN_SPEC`
     /// and the client's verbatim `seek_pk_extra` blob) and there is no schema-
     /// version negotiation: the worker's reply force-includes the client's echoed
@@ -1181,7 +1180,7 @@ impl MasterDispatcher {
     /// [`scan_spec_route`], and the reply-train forwarding + error contract are
     /// shared with the plain scan.
     #[allow(clippy::too_many_arguments)]
-    pub async fn fan_out_scan_spec_async(
+    pub async fn fan_out_scan_spec(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
@@ -1200,7 +1199,7 @@ impl MasterDispatcher {
     }
 
     /// Await + forward one already-dispatched scan relation: the await+drain
-    /// half of `fan_out_scan_async`, factored out for the multi-scan path
+    /// half of `fan_out_scan`, factored out for the multi-scan path
     /// (`handle_scan_multi`), which writes every relation's group up front under
     /// one SAL cut via `dispatch_scan_multi_fanout` and then drains each relation
     /// here, in request order. Awaits every worker's first reply frame (join_all
@@ -1575,7 +1574,7 @@ impl MasterDispatcher {
 /// Await each dispatched worker's first reply slot for a scan group: the single
 /// slot under unicast (`unicast >= 0`, keyed on `req_ids[0]`), or all `nw` in
 /// worker order under broadcast. The one owner of the unicast/broadcast await
-/// shape, shared by `dispatch_scan_fanout`, `fan_out_scan_async`, and
+/// shape, shared by `dispatch_scan_fanout`, `fan_out_scan`, and
 /// `await_and_drain_scan_relation`.
 pub(crate) async fn await_scan_slots(
     reactor: &crate::runtime::reactor::Reactor,
@@ -1594,7 +1593,7 @@ pub(crate) async fn await_scan_slots(
 /// Forward each already-awaited worker scan train to the client in ascending
 /// worker order via `drain_scan_train`. Under unicast the single slot belongs to
 /// worker `unicast`, not slot 0. `Ok(false)` on client disconnect, `Err` on a
-/// worker fault / malformed train. Shared by `fan_out_scan_async` and
+/// worker fault / malformed train. Shared by `fan_out_scan` and
 /// `await_and_drain_scan_relation`.
 async fn forward_scan_slots(
     reactor: &crate::runtime::reactor::Reactor,
@@ -1650,7 +1649,7 @@ async fn drain_scan_train(
 /// frame, and returns the raw `W2mSlot` so the caller can forward it to
 /// the client without an intermediate decode/copy.
 #[allow(clippy::too_many_arguments)]
-async fn single_worker_async(
+async fn single_worker(
     disp_ptr: *mut MasterDispatcher,
     reactor: &crate::runtime::reactor::Reactor,
     sal_excl: &Rc<AsyncMutex<()>>,

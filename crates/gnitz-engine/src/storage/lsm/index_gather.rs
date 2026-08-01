@@ -17,12 +17,10 @@ use gnitz_expr::RowSource;
 ///
 /// `lo`/`hi` are the byte bounds of exactly the entries whose PKs were collected
 /// (the caller's per-chunk window), over the identical key the write path built
-/// (`IndexKeySpec::write_entry`). Resolving by PK alone would be wrong on a
-/// non-`unique_pk` table, where one PK can carry several live payloads with
-/// different indexed values: an entry denotes (span, PK), not PK. The window
-/// filter also makes a *chunked* walk exact — a PK group whose entries straddle
-/// a chunk boundary is gathered by both chunks, but each row passes the filter
-/// only in the chunk whose window holds its entry. `hi == None` is `+∞`.
+/// (`IndexKeySpec::write_entry`). An entry denotes (span, PK), not PK, so the
+/// window filter is what makes a *chunked* walk exact: a PK group is gathered by
+/// every chunk whose window touches it, but each row passes the filter only in
+/// the chunk whose window holds its entry. `hi == None` is `+∞`.
 /// `lo.len()` IS the index PK stride — every cut key is built at exactly that
 /// width (`index_range_keys`).
 ///
@@ -53,8 +51,9 @@ fn gather_source_rows(
         pks.windows(2).all(|w| w[0] < w[1]),
         "gather_source_rows requires strictly ascending (sorted + deduped) PKs"
     );
-    // Phase 1 — candidates: every live row of each PK group. `pks.len()` sizes the
-    // common (`unique_pk`) case exactly; a multi-payload PK grows the batch.
+    // Phase 1 — candidates: every live row of each PK group. An index owner is
+    // always a base table (one live payload per PK), so `pks.len()` sizes it
+    // exactly.
     let mut cand = Batch::with_capacity(src_schema, pks.len());
     for pk in pks {
         // A `false` return means no base row at or past `pk` exists. `pks`
@@ -103,17 +102,14 @@ fn row_in_index_range(
 /// contiguous pass over the flat batch; on a miss, one range gather
 /// (`Batch::from_ranges`).
 ///
-/// On a `unique_pk` table every candidate matches (the row's own span produced
-/// the entry the walk yielded), so the scan finds no failing row and `cand` is
-/// returned verbatim — no copy, and no allocation at all. Only a real miss (a
-/// multi-payload PK group, or a NULL-gated row on a prefix seek) pays for one.
-/// The survivors of an index-key-ordered candidate batch come in long contiguous
-/// runs, so a range list is both smaller than a per-row index list and copied
-/// region-wise rather than row-by-row. The blob is *not* shared from `cand`
-/// (which is what makes this an `append_ranges` rather than `Batch::from_ranges`):
-/// this result is what the wire range-seek ships, and sharing would carry the
-/// dropped candidates' string spans over the wire. The per-cell relocate copies
-/// only the survivors' spans, deduped.
+/// A candidate normally matches — the row's own span produced the entry the walk
+/// yielded — so the scan usually finds no failing row and returns `cand`
+/// verbatim. Misses come from a NULL-gated row on a prefix seek or a row whose
+/// entry falls outside the chunk window; survivors then come in contiguous runs,
+/// which is why the copy is range-based. The blob is *not* shared from `cand`
+/// (hence `append_ranges` rather than `Batch::from_ranges`): this result is what
+/// the wire range-seek ships, and sharing would carry the dropped candidates'
+/// string spans over the wire.
 fn retain_in_index_range(
     cand: Batch,
     src_schema: SchemaDescriptor,
@@ -264,10 +260,8 @@ impl BoundedIndexCursor {
         // No re-seek between chunks: chunk N+1's first PK may sort below chunk N's
         // last, and `advance_to` is backward-capable via a binary search, so a
         // chunk boundary costs O(log N) on the first probe — not a rescan.
-        // The dedup is load-bearing: on a non-`unique_pk` table two live rows at
-        // one PK with different indexed values produce two entries sharing that
-        // PK suffix, so the collected PKs repeat — and the gather walks each PK
-        // group exactly once.
+        // The dedup gives the gather the strictly-ascending PK list its monotone
+        // sweep requires, so each PK group is walked exactly once.
         self.pks.sort_unstable();
         self.pks.dedup();
         // `Some(empty)`, not `None`: the gather returns `None` when nothing

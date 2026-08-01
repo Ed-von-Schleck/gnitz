@@ -310,7 +310,7 @@ class TestBandRightFull:
         """FULL band with a left row a.id=0 and a right row b.id=0 that match nothing:
         both produce pair-PK (0, 0) (the absent side's PK packs to the synthetic 0) but
         are TWO distinct (PK, payload) elements (the null bitmaps differ). Both must
-        survive consolidation — a join view is not unique_pk."""
+        survive consolidation — a join view has no per-PK uniqueness."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:

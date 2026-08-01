@@ -577,7 +577,6 @@ pub(crate) fn execute_create_table(
             &table_name,
             &cols,
             &pk_indices,
-            true,
             replicated,
             dist_prefix_len,
             &unique_indexes,

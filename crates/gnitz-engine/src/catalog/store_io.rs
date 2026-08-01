@@ -17,8 +17,8 @@ impl CatalogEngine {
             .ok_or_else(|| format!("Unknown table_id {table_id}"))
     }
 
-    /// Ingest a user-table batch and return the effective delta (after unique_pk
-    /// dedup).  Used by multi-worker push where the worker needs the effective
+    /// Ingest a user-table batch and return the effective delta (after PK
+    /// enforcement).  Used by multi-worker push where the worker needs the effective
     /// batch for later DAG evaluation but does NOT evaluate immediately.
     /// System tables are NOT supported (use `ingest_to_family` for those).
     pub fn ingest_returning_effective(&mut self, table_id: i64, batch: Batch) -> Result<Batch, String> {
@@ -91,9 +91,8 @@ impl CatalogEngine {
     /// nothing. `project` lists the parent column indices to return (all
     /// non-PK scalar columns); an empty `project` returns PK-only rows.
     /// Each PK resolves to its group's FIRST live row: FK dereference is by-PK
-    /// by definition, and FK validation admits a lone-PK parent without
-    /// requiring `unique_pk`, so on such an engine-API parent a multi-payload
-    /// PK dereferences to the (PK, payload)-least member.
+    /// by definition, so a multi-payload PK — which only a view output store can
+    /// carry — dereferences to the (PK, payload)-least member.
     ///
     /// Reuses one cursor across all keys (cheaper than N `seek_family` calls,
     /// each of which re-opens a cursor). Projection keeps the result scalar-

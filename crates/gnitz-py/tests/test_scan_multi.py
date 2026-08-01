@@ -27,7 +27,7 @@ def _kv_table(client, sn, name):
         gnitz.ColumnDef("val", gnitz.TypeCode.I64),
     ]
     schema = gnitz.Schema(cols)
-    tid = client.create_table(sn, name, cols, unique_pk=True)
+    tid = client.create_table(sn, name, cols)
     return tid, schema
 
 
@@ -354,7 +354,7 @@ def _text_table(client, sn, name):
         gnitz.ColumnDef("s", gnitz.TypeCode.STRING),
     ]
     schema = gnitz.Schema(cols)
-    tid = client.create_table(sn, name, cols, unique_pk=True)
+    tid = client.create_table(sn, name, cols)
     return tid, schema
 
 

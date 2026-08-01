@@ -94,7 +94,7 @@ fn setup_wide_unique(
         tid,
         StoreHandle::Borrowed(&mut *base as *mut Table),
         schema,
-        RelationKind::BaseTable { unique_pk: true },
+        RelationKind::BaseTable,
         0,
         dir.to_string(),
     );
@@ -242,7 +242,7 @@ fn wide_pk_seek_family_bytes_resolves_non_pk_col() {
         parent_tid,
         StoreHandle::Borrowed(&mut pbase as *mut Table),
         parent_schema,
-        RelationKind::BaseTable { unique_pk: true },
+        RelationKind::BaseTable,
         0,
         dir.clone(),
     );
@@ -277,7 +277,7 @@ fn seek_family_bytes_matches_seek_family_narrow() {
 
     // Plain narrow U64-PK table created through the normal path.
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
-    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let schema = engine.get_schema(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);

@@ -102,11 +102,13 @@ fn rows_spec(
     }
 }
 
-/// An empty `public.t` with `cols` (PK = column 0) in a fresh temp dir.
-fn table_fixture(name: &str, cols: &[ColumnDef]) -> (CatalogEngine, i64) {
-    let mut engine = CatalogEngine::open(&temp_dir(name)).unwrap();
-    let tid = engine.create_table("public.t", cols, &[0], false).unwrap();
-    (engine, tid)
+/// An empty `public.t` with `cols` (PK = column 0) in a fresh temp dir. Returns
+/// the dir too, so a test that inspects or removes it does not re-derive it.
+fn table_fixture(name: &str, cols: &[ColumnDef]) -> (CatalogEngine, i64, String) {
+    let dir = temp_dir(name);
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let tid = engine.create_table("public.t", cols, &[0]).unwrap();
+    (engine, tid, dir)
 }
 
 /// [`table_fixture`] ingested in `rounds` PK-interleaved passes over ids `0..n`,
@@ -122,7 +124,7 @@ fn ingest_fixture(
     rounds: u64,
     mut put_row: impl FnMut(&mut BatchBuilder, u64),
 ) -> (CatalogEngine, i64) {
-    let (mut engine, tid) = table_fixture(name, cols);
+    let (mut engine, tid, _dir) = table_fixture(name, cols);
     let schema = engine.get_schema(tid).unwrap();
     for round in 0..rounds {
         let mut bb = BatchBuilder::new(schema);

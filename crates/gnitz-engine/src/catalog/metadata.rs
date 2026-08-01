@@ -108,13 +108,6 @@ impl CatalogEngine {
             .unwrap_or(false)
     }
 
-    /// True if the table was created with `unique_pk=true`. Used by the
-    /// distributed validator to decide whether Error-mode inserts need
-    /// an against-store PK rejection broadcast.
-    pub fn table_has_unique_pk(&self, table_id: i64) -> bool {
-        self.dag.tables.get(&table_id).map(|e| e.unique_pk()).unwrap_or(false)
-    }
-
     /// Get the index schema for a specific column list's index on a table.
     pub fn get_index_schema_by_cols(&self, table_id: i64, cols: &[u32]) -> Option<SchemaDescriptor> {
         self.index_circuit_for_cols(table_id, cols).map(|ic| ic.index_schema)

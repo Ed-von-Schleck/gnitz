@@ -254,9 +254,9 @@ impl MasterDispatcher {
 
     // -----------------------------------------------------------------------
     // Pipelined distributed validation
-    /// Async version of `ensure_unique_filters_warm`. Feeds each worker's
-    /// scan reply directly into the filter(s) instead of concatenating
-    /// them into a single master-side `Batch` the way `fan_out_scan_async`
+    /// Feeds each worker's scan reply directly into the filter(s) instead of
+    /// concatenating
+    /// them into a single master-side `Batch` the way `fan_out_scan`
     /// does — on a table with tens of millions of rows the concatenation
     /// step would peak at ~2× the total scan size and risk OOM.
     ///
@@ -268,7 +268,7 @@ impl MasterDispatcher {
     /// (and forget to decrement `in_flight[w]`, stalling the W2M ring).
     /// The peak we do pay is one `DecodedWire` per worker during the
     /// processing loop, not the full concatenated batch.
-    pub(super) async fn ensure_unique_filters_warm_async(
+    pub(super) async fn ensure_unique_filters_warm(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
@@ -359,7 +359,7 @@ impl MasterDispatcher {
 
     /// Seed the `(table_id, col_idx)` filter from the CREATE-time pre-flight,
     /// captured under the catalog write lock. Marks it warm so the first
-    /// INSERT skips `ensure_unique_filters_warm_async`. `capped = true` (the
+    /// INSERT skips `ensure_unique_filters_warm`. `capped = true` (the
     /// accumulator overflowed and cleared its set whole — `seen` arrives
     /// empty) publishes a warm+capped filter: `unique_filter_all_absent` then
     /// always falls through to the broadcast — the same steady state the lazy
@@ -648,7 +648,7 @@ mod unique_filter_tests {
     }
 
     /// A capped seed publishes a warm+capped filter whose entry exists in
-    /// `unique_filters` — so `ensure_unique_filters_warm_async`'s
+    /// `unique_filters` — so `ensure_unique_filters_warm`'s
     /// `contains_key` skip applies and no key is ever proven absent.
     #[test]
     fn unique_filter_seed_capped_publishes_warm_capped_entry() {

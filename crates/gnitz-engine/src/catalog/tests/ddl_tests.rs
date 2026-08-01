@@ -77,7 +77,7 @@ fn test_ddl() {
 
     // Table creation
     let cols = vec![col_def("id", type_code::U64), col_def("name", type_code::STRING)];
-    let tid = engine.create_table("sales.orders", &cols, &[0], true).unwrap();
+    let tid = engine.create_table("sales.orders", &cols, &[0]).unwrap();
     assert!(engine.has_id(tid));
     assert_eq!(count_records(engine.sys_store_mut(SysFamily::Table)), init_tables + 1);
     assert_eq!(count_records(engine.sys_store_mut(SysFamily::Column)), init_cols + 2);
@@ -111,17 +111,17 @@ fn test_edge_cases() {
     // 1. Drop non-existent schema
     assert!(engine.drop_schema("nonexistent").is_err());
     // 2. Create table in non-existent schema
-    assert!(engine.create_table("nonexistent.tbl", &cols, &[0], true).is_err());
+    assert!(engine.create_table("nonexistent.tbl", &cols, &[0]).is_err());
     // 3. Drop non-existent table
     assert!(engine.drop_table("public.nonexistent").is_err());
     // 4. Duplicate table
-    engine.create_table("public.tbl1", &cols, &[0], true).unwrap();
-    assert!(engine.create_table("public.tbl1", &cols, &[0], true).is_err());
+    engine.create_table("public.tbl1", &cols, &[0]).unwrap();
+    assert!(engine.create_table("public.tbl1", &cols, &[0]).is_err());
 
     // 5. Drop non-empty schema cascades (PostgreSQL-style): the
     //    contained table goes first, then the schema itself.
     engine.create_schema("my_schema").unwrap();
-    engine.create_table("my_schema.tbl2", &cols, &[0], true).unwrap();
+    engine.create_table("my_schema.tbl2", &cols, &[0]).unwrap();
     engine.drop_schema("my_schema").unwrap();
     assert!(!engine.has_schema("my_schema"));
     assert!(
@@ -130,12 +130,12 @@ fn test_edge_cases() {
     );
 
     // 7. Unqualified name defaults to public
-    let _tid7 = engine.create_table("tbl3", &cols, &[0], true).unwrap();
+    let _tid7 = engine.create_table("tbl3", &cols, &[0]).unwrap();
     assert!(engine.get_by_name("public", "tbl3").is_some());
     engine.drop_table("public.tbl3").unwrap();
 
     // 8. Unqualified drop
-    engine.create_table("public.tbl4", &cols, &[0], true).unwrap();
+    engine.create_table("public.tbl4", &cols, &[0]).unwrap();
     engine.drop_table("tbl4").unwrap();
     assert!(engine.get_by_name("public", "tbl4").is_none());
 
@@ -151,20 +151,19 @@ fn test_edge_cases() {
                 fk_col_idx: 0,
                 is_hidden: false
             }],
-            &[0],
-            true
+            &[0]
         )
         .is_err());
 
     // 10. Too many columns (> MAX_COLUMNS = 65)
     let many: Vec<ColumnDef> = (0..66).map(|i| col_def(&format!("c{i}"), type_code::U64)).collect();
-    assert!(engine.create_table("public.too_many", &many, &[0], true).is_err());
+    assert!(engine.create_table("public.too_many", &many, &[0]).is_err());
 
     // 11. Drop system schema
     assert!(engine.drop_schema("_system").is_err());
 
     // 12. PK index out of bounds
-    assert!(engine.create_table("public.bad_idx", &cols, &[5], true).is_err());
+    assert!(engine.create_table("public.bad_idx", &cols, &[5]).is_err());
 
     // 13. Recreated schema gets new ID
     engine.create_schema("temp").unwrap();
@@ -176,9 +175,9 @@ fn test_edge_cases() {
     engine.drop_schema("temp").unwrap();
 
     // 14. Recreated table gets new ID
-    let tid14a = engine.create_table("public.tbl_rc", &cols, &[0], true).unwrap();
+    let tid14a = engine.create_table("public.tbl_rc", &cols, &[0]).unwrap();
     engine.drop_table("public.tbl_rc").unwrap();
-    let tid14b = engine.create_table("public.tbl_rc", &cols, &[0], true).unwrap();
+    let tid14b = engine.create_table("public.tbl_rc", &cols, &[0]).unwrap();
     assert_ne!(tid14a, tid14b);
     engine.drop_table("public.tbl_rc").unwrap();
 
@@ -188,7 +187,6 @@ fn test_edge_cases() {
             "public.u128t",
             &[col_def("uuid_pk", type_code::U128), col_def("data", type_code::STRING)],
             &[0],
-            true,
         )
         .unwrap();
     let s15 = engine.get_schema(tid15).unwrap();
@@ -198,15 +196,15 @@ fn test_edge_cases() {
     // 18. schema_is_empty
     engine.create_schema("empty_test").unwrap();
     assert!(engine.schema_is_empty("empty_test"));
-    engine.create_table("empty_test.tbl", &cols, &[0], true).unwrap();
+    engine.create_table("empty_test.tbl", &cols, &[0]).unwrap();
     assert!(!engine.schema_is_empty("empty_test"));
     engine.drop_table("empty_test.tbl").unwrap();
     assert!(engine.schema_is_empty("empty_test"));
     engine.drop_schema("empty_test").unwrap();
 
     // 19. Case sensitivity
-    engine.create_table("public.CaseTest", &cols, &[0], true).unwrap();
-    engine.create_table("public.casetest", &cols, &[0], true).unwrap();
+    engine.create_table("public.CaseTest", &cols, &[0]).unwrap();
+    engine.create_table("public.casetest", &cols, &[0]).unwrap();
     assert!(engine.get_by_name("public", "CaseTest").is_some());
     assert!(engine.get_by_name("public", "casetest").is_some());
     engine.drop_table("public.CaseTest").unwrap();
@@ -244,7 +242,7 @@ fn test_nonempty_schema_drop_rejected() {
 
     engine.create_schema("s").unwrap();
     let tid = engine
-        .create_table("s.t", &[col_def("id", type_code::U64)], &[0], true)
+        .create_table("s.t", &[col_def("id", type_code::U64)], &[0])
         .unwrap();
     let sid = engine.get_schema_id("s");
     assert!(!engine.schema_is_empty("s"), "precondition: schema has a member");
@@ -278,40 +276,6 @@ fn test_nonempty_schema_drop_rejected() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── test_unique_pk_metadata ──────────────────────────────────────────
-
-#[test]
-fn test_unique_pk_metadata() {
-    let dir = temp_dir("unique_pk_meta");
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::STRING)];
-
-    {
-        let mut engine = CatalogEngine::open(&dir).unwrap();
-        engine.create_schema("sales").unwrap();
-        // default = unique_pk=true
-        let tid1 = engine.create_table("sales.u_default", &cols, &[0], true).unwrap();
-        assert!(engine.table_has_unique_pk(tid1));
-        // explicit false
-        let tid2 = engine.create_table("sales.u_off", &cols, &[0], false).unwrap();
-        assert!(!engine.table_has_unique_pk(tid2));
-        // For restart test
-        engine.create_table("sales.u_restart", &cols, &[0], true).unwrap();
-        engine.close();
-    }
-
-    // Verify survival across restart
-    {
-        let mut engine = CatalogEngine::open(&dir).unwrap();
-        let tid_restart = engine.get_by_name("sales", "u_restart").unwrap();
-        assert!(engine.table_has_unique_pk(tid_restart));
-        let tid_off = engine.get_by_name("sales", "u_off").unwrap();
-        assert!(!engine.table_has_unique_pk(tid_off));
-        engine.close();
-    }
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
 // ── test_restart (with data + sequence recovery) ─────────────────────
 
 #[test]
@@ -323,11 +287,11 @@ fn test_restart_full() {
     {
         let mut engine = CatalogEngine::open(&dir).unwrap();
         engine.create_schema("marketing").unwrap();
-        first_tid = engine.create_table("marketing.products", &cols, &[0], true).unwrap();
+        first_tid = engine.create_table("marketing.products", &cols, &[0]).unwrap();
 
         // Dropped entities should not reappear
         engine.create_schema("trash").unwrap();
-        engine.create_table("trash.items", &cols, &[0], true).unwrap();
+        engine.create_table("trash.items", &cols, &[0]).unwrap();
         engine.drop_table("trash.items").unwrap();
         engine.drop_schema("trash").unwrap();
 
@@ -346,7 +310,7 @@ fn test_restart_full() {
         let schema = engine.get_schema(tid).unwrap();
         assert_eq!(schema.num_columns(), 2);
         // Sequence recovery: new table should get higher ID
-        let new_tid = engine.create_table("marketing.other", &cols, &[0], true).unwrap();
+        let new_tid = engine.create_table("marketing.other", &cols, &[0]).unwrap();
         assert!(
             new_tid > first_tid,
             "Allocator sequence recovery failed: {new_tid} <= {first_tid}"
@@ -369,7 +333,7 @@ fn test_restart_long_strings() {
         let mut engine = CatalogEngine::open(&dir).unwrap();
         engine.create_schema("longtest").unwrap();
         let cols = vec![col_def("id", type_code::U64), col_def(long_name, type_code::STRING)];
-        engine.create_table("longtest.tbl", &cols, &[0], true).unwrap();
+        engine.create_table("longtest.tbl", &cols, &[0]).unwrap();
         engine.close();
         drop(engine);
     }
@@ -395,13 +359,13 @@ fn test_edge_cases_extended() {
     let cols = vec![col_def("id", type_code::U64)];
 
     // #16. Multiple dots in qualified name — second part contains dot
-    assert!(engine.create_table("public.schema.tbl", &cols, &[0], true).is_err());
+    assert!(engine.create_table("public.schema.tbl", &cols, &[0]).is_err());
 
     // #17. get_by_name on non-existent returns None
     assert!(engine.get_by_name("public", "nonexistent").is_none());
 
     // #20. has_id / get_schema for valid and invalid IDs
-    let tid = engine.create_table("public.reg_test", &cols, &[0], true).unwrap();
+    let tid = engine.create_table("public.reg_test", &cols, &[0]).unwrap();
     assert!(engine.has_id(tid));
     assert!(engine.get_schema(tid).is_some());
     assert!(!engine.has_id(999999));
@@ -410,7 +374,7 @@ fn test_edge_cases_extended() {
 
     // #26. Creating a user table in _system schema should fail
     // (_system identifier starts with '_' → rejected by validate_user_identifier)
-    assert!(engine.create_table("_system.new_tbl", &cols, &[0], true).is_err());
+    assert!(engine.create_table("_system.new_tbl", &cols, &[0]).is_err());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -436,14 +400,12 @@ fn test_nullable_pk_rejected() {
         },
         col_def("name", type_code::STRING),
     ];
-    let err = engine
-        .create_table("public.bad_pk_null", &cols, &[0], true)
-        .unwrap_err();
+    let err = engine.create_table("public.bad_pk_null", &cols, &[0]).unwrap_err();
     assert!(err.contains("nullable"), "expected nullable-PK error, got: {err}");
 
     // Sanity: same shape with is_nullable=false succeeds.
     let cols_ok = vec![col_def("id", type_code::U64), col_def("name", type_code::STRING)];
-    engine.create_table("public.ok_pk", &cols_ok, &[0], true).unwrap();
+    engine.create_table("public.ok_pk", &cols_ok, &[0]).unwrap();
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -526,7 +488,7 @@ fn test_pk_change_invalidates_col_name_cache() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let cols = vec![col_def("a", type_code::U64), col_def("b", type_code::U64)];
-    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
     // Populate the col-name cache.
     let _ = engine.get_column_names(tid);
@@ -563,7 +525,7 @@ fn test_pk_change_invalidates_col_name_cache() {
     // Drop and recreate with a different PK column; the reconstructed
     // schema must reflect the new PK list.
     engine.drop_table("public.t").unwrap();
-    let tid2 = engine.create_table("public.t", &cols, &[1], true).unwrap();
+    let tid2 = engine.create_table("public.t", &cols, &[1]).unwrap();
     let schema = engine.get_schema(tid2).unwrap();
     assert_eq!(schema.pk_indices(), &[1]);
 
@@ -623,7 +585,7 @@ fn test_drop_view_removes_directory() {
 
     // A view needs a base table to reference.
     let base_cols = vec![col_def("id", type_code::U64)];
-    engine.create_table("public.base", &base_cols, &[0], true).unwrap();
+    engine.create_table("public.base", &base_cols, &[0]).unwrap();
 
     // Register a view via the raw system-table path (create_view was removed).
     // Column records must precede the VIEW_TAB row (hook invariant).
@@ -678,7 +640,7 @@ fn test_drop_view_cascades_columns_and_view_deps() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let base_tid = engine
-        .create_table("public.base", &[col_def("id", type_code::U64)], &[0], true)
+        .create_table("public.base", &[col_def("id", type_code::U64)], &[0])
         .unwrap();
 
     // Baseline: system + base-table column rows; no view-dep rows yet.
@@ -758,7 +720,7 @@ fn test_view_backfill_chunked_matches_unchunked() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("name", type_code::STRING)];
-    let tid = engine.create_table("public.base", &cols, &[0], true).unwrap();
+    let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
     let schema = engine.get_schema(tid).unwrap();
 
     // Long strings (above the inline threshold) force blob-arena relocation
@@ -823,7 +785,7 @@ fn drop_cascade_broadcasts_children_before_parents() {
 
     // Table with one (non-unique) secondary index.
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
-    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     engine.create_index("public.t", &["val"], false).unwrap();
 
     // Clear the broadcasts accumulated by create_table + create_index.
@@ -875,7 +837,7 @@ fn table_retract_applies_qname_before_id() {
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
 
     // Create, then drop, a table named `public.t`.
-    let tid1 = engine.create_table("public.t", &cols, &[0], true).unwrap();
+    let tid1 = engine.create_table("public.t", &cols, &[0]).unwrap();
     assert_eq!(engine.caches.entity_by_qname.get("public.t").copied(), Some(tid1));
     engine.drop_table("public.t").unwrap();
 
@@ -888,7 +850,7 @@ fn table_retract_applies_qname_before_id() {
 
     // Recreate under the same qualified name. A leaked stale mapping would
     // make the qname-uniqueness guard reject this create.
-    let recreate = engine.create_table("public.t", &cols, &[0], true);
+    let recreate = engine.create_table("public.t", &cols, &[0]);
     assert!(
         recreate.is_ok(),
         "recreate of a dropped same-name table must succeed; a stale qname mapping blocks it: {recreate:?}"
@@ -927,12 +889,12 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     // register it through the raw TABLE_TAB path with the flag packed in.
     let rt = engine.allocate_table_id();
     engine.write_column_records(rt, OWNER_KIND_TABLE, &cols).unwrap();
-    let flags = gnitz_wire::pack_table_flags(true, true, 0);
+    let flags = gnitz_wire::pack_table_flags(true, 0);
     let batch = build_table_tab_row_flags(&dir, rt, pack_pk_cols(&[0]), "rt", flags);
     engine.ingest_to_family(TABLE_TAB_ID, &batch).unwrap();
 
     // A partitioned base table, for the negative direction.
-    let pt = engine.create_table("public.pt", &cols, &[0], true).unwrap();
+    let pt = engine.create_table("public.pt", &cols, &[0]).unwrap();
 
     // Consumer ids allocated BEFORE their producers, on both chains.
     let r_consumer = engine.allocate_table_id();

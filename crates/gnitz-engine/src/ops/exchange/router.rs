@@ -189,6 +189,11 @@ pub(super) fn scatter_is_pk_routed(col_indices: &[u32], target_tcs: &[u8], schem
 /// join-relay scatters route by the *join* key over a derived schema and call
 /// `partition_for_pk_bytes` directly (see `op_repartition_batches_mode`) — a
 /// different hash domain with no promotion concept.
+///
+/// Weight-0 rows are dropped: they are not Z-set elements, and a client is free
+/// to send one. Filtering here rather than by rebuilding the batch keeps every
+/// index consumer — the SAL emit, the transaction fit check that sizes it, and
+/// the unique-index routing cache — reading the same row set for free.
 fn fill_worker_indices(batch: &Batch, schema: &SchemaDescriptor, num_workers: usize, out: &mut Vec<Vec<u32>>) {
     let mb = batch.as_mem_batch();
     let w_map = build_w_map(num_workers);
@@ -197,6 +202,9 @@ fn fill_worker_indices(batch: &Batch, schema: &SchemaDescriptor, num_workers: us
     }
     out[..num_workers].iter_mut().for_each(Vec::clear);
     for i in 0..batch.count {
+        if mb.get_weight(i) == 0 {
+            continue;
+        }
         let partition = schema.partition_for_pk(mb.get_pk_bytes(i));
         out[w_map[partition]].push(i as u32);
     }
@@ -219,14 +227,21 @@ where
 }
 
 /// Broadcast sibling of [`fill_worker_indices`]: fills **every** worker's slot
-/// with **all** row indices `0..batch.count` instead of PK-partitioning them.
+/// with **all** row indices instead of PK-partitioning them. Drops weight-0 rows
+/// for the same reason.
 fn fill_broadcast_indices(batch: &Batch, num_workers: usize, out: &mut Vec<Vec<u32>>) {
     if out.len() < num_workers {
         out.resize_with(num_workers, Vec::new);
     }
-    for wi in out[..num_workers].iter_mut() {
-        wi.clear();
-        wi.extend(0..batch.count as u32);
+    let mb = batch.as_mem_batch();
+    out[..num_workers].iter_mut().for_each(Vec::clear);
+    for i in 0..batch.count {
+        if mb.get_weight(i) == 0 {
+            continue;
+        }
+        for wi in out[..num_workers].iter_mut() {
+            wi.push(i as u32);
+        }
     }
 }
 

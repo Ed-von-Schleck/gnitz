@@ -14,12 +14,12 @@ def _uid():
     return str(random.randint(100000, 999999))
 
 
-def _kv_table(client, sn, name, unique_pk=True):
+def _kv_table(client, sn, name):
     """(pk U64 PK, val I64) table. Returns (tid, schema)."""
     cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
             gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
     schema = gnitz.Schema(cols)
-    tid = client.create_table(sn, name, cols, unique_pk=unique_pk)
+    tid = client.create_table(sn, name, cols)
     return tid, schema
 
 
@@ -414,19 +414,6 @@ def test_txn_unique_secondary_fold_valid_intermediate_collision_passes(client):
 # ---------------------------------------------------------------------------
 # Shape rejections
 # ---------------------------------------------------------------------------
-
-
-def test_txn_non_unique_pk_table_rejected(client):
-    """A non-unique_pk table family is rejected."""
-    sn = "x" + _uid()
-    client.create_schema(sn)
-    try:
-        tid, sch = _kv_table(client, sn, "a", unique_pk=False)
-        with pytest.raises(gnitz.GnitzError):
-            with client.transaction() as txn:
-                txn.push(tid, _batch(sch, [(1, 10)]))
-    finally:
-        client.drop_schema(sn)
 
 
 def test_txn_system_table_rejected(client):
