@@ -245,20 +245,28 @@ fn fill_broadcast_indices(batch: &Batch, num_workers: usize, out: &mut Vec<Vec<u
     }
 }
 
-/// Like [`with_worker_indices`] but a full **broadcast** rather than a
-/// PK-partitioned scatter. Used by the write path for a replicated table: the
-/// same `scatter_wire_group(... FLAG_PUSH ...)` machinery then lands the whole
-/// batch in every worker's ingest + SAL slot (inheriting the atomic zone, LSN,
-/// ACK accounting, and the committer's single `fdatasync`), so every worker
-/// holds an identical full copy. Same TLS-pool reuse and borrow contract as
-/// `with_worker_indices`.
-pub fn with_broadcast_indices<F, R>(batch: &Batch, num_workers: usize, f: F) -> R
+/// The per-worker index fill a commit uses for `schema`: a full broadcast for a
+/// replicated relation, the PK-partitioned scatter otherwise. The one spelling of
+/// the write path's shape, so the SAL fit check and the emit that follows it
+/// cannot size the same batch differently.
+///
+/// A replicated table broadcasts because the same
+/// `scatter_wire_group(... FLAG_PUSH ...)` machinery then lands the whole batch in
+/// every worker's ingest + SAL slot (inheriting the atomic zone, LSN, ACK
+/// accounting, and the committer's single `fdatasync`), so every worker holds an
+/// identical full copy. Same TLS-pool reuse and borrow contract as
+/// [`with_worker_indices`].
+pub fn with_commit_indices<F, R>(batch: &Batch, schema: &SchemaDescriptor, num_workers: usize, f: F) -> R
 where
     F: FnOnce(&[Vec<u32>]) -> R,
 {
     SCATTER_INDICES.with(|pool| {
         let mut worker_indices = pool.borrow_mut();
-        fill_broadcast_indices(batch, num_workers, &mut worker_indices);
+        if schema.replicated() {
+            fill_broadcast_indices(batch, num_workers, &mut worker_indices);
+        } else {
+            fill_worker_indices(batch, schema, num_workers, &mut worker_indices);
+        }
         f(&worker_indices[..num_workers])
     })
 }

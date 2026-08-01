@@ -4,7 +4,7 @@
 //! owned by `CatalogEngine`. There is no custom `Drop`: the `Partitioned`
 //! box is freed by the default drop glue when its registry entry is removed.
 
-use crate::storage::{Batch, PartitionedTable, ReadCursor, StorageError, Table};
+use crate::storage::{Batch, ChildAddr, PartitionedTable, ReadCursor, Routing, StorageError, Table};
 use std::cell::UnsafeCell;
 
 /// Storage handle of a registered relation. `Partitioned` owns its boxed
@@ -55,13 +55,27 @@ impl StoreHandle {
         }
     }
 
-    /// True iff this is a replicated (one-child-per-worker) partitioned store.
-    /// Borrowed system tables are never replicated stores.
-    pub fn is_replicated(&self) -> bool {
+    /// How this store routes its rows, or `None` for a borrowed system table —
+    /// one unpartitioned `Table` with no children and so no routing at all.
+    pub fn routing(&self) -> Option<Routing> {
         match self {
-            StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).is_replicated() },
-            StoreHandle::Borrowed(_) => false,
+            StoreHandle::Partitioned(cell) => Some(unsafe { (**cell.get()).routing() }),
+            StoreHandle::Borrowed(_) => None,
         }
+    }
+
+    /// True iff this is an unhashed (single rank-homed child) partitioned store.
+    /// Borrowed system tables are never unhashed stores.
+    pub fn is_unhashed(&self) -> bool {
+        self.routing().is_some_and(Routing::is_unhashed)
+    }
+
+    /// This store's children across the whole cluster at `num_workers`, empty for
+    /// a borrowed system table. See [`Routing::cluster_children`].
+    pub fn cluster_children(&self, num_workers: u32) -> impl Iterator<Item = ChildAddr<'static>> {
+        self.routing()
+            .into_iter()
+            .flat_map(move |r| r.cluster_children(num_workers))
     }
 
     /// Dispatched [`PartitionedTable::cursor_may_hold_key`]. A borrowed system

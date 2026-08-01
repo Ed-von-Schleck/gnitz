@@ -19,7 +19,7 @@ use super::{cstr, error::StorageError};
 pub enum ChildAddr<'a> {
     /// `part_{p}` — one bucket of a hashed store's 256-way tiling.
     Partition(u32),
-    /// `rep_{k}` — worker `k`'s single child of a single-partition store: a
+    /// `rep_{k}` — worker `k`'s single child of an unhashed store: a
     /// replicated base table's full copy, or a replicated-derived view's local
     /// slice. Addressed by rank rather than partition index, so it stays put
     /// when the worker count changes.
@@ -73,10 +73,10 @@ impl<'a> ChildAddr<'a> {
     /// use is residue left by a shape flip. Scratch is judged by rank either
     /// way — the next compile recreates what it needs.
     pub fn is_owned_by(&self, routing: Routing, num_workers: u32) -> bool {
-        let single_partition = matches!(routing, Routing::Replicated { .. });
+        let unhashed = matches!(routing, Routing::Unhashed { .. });
         match *self {
-            ChildAddr::Partition(_) => !single_partition,
-            ChildAddr::Local(k) => single_partition && k < num_workers,
+            ChildAddr::Partition(_) => !unhashed,
+            ChildAddr::Local(k) => unhashed && k < num_workers,
             ChildAddr::Scratch { rank, .. } => rank < num_workers,
         }
     }
@@ -93,7 +93,7 @@ fn numeric_suffix(name: &str, prefix: &str) -> Option<u32> {
     parse_u32(name.strip_prefix(prefix)?)
 }
 
-/// Give every launched rank a copy of a single-partition **base table**, by
+/// Give every launched rank a copy of an unhashed **base table**, by
 /// hard-linking rank 0's shards — worker 0's child, which is current at every
 /// worker count. A rank whose child already has a manifest is left alone, so a
 /// shrink or an unchanged restart does no work at all.
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn ownership_follows_the_live_grammar() {
-        let local = Routing::Replicated { rank: 0 };
+        let local = Routing::Unhashed { rank: 0 };
         let hashed = Routing::Hashed { start: 0, end: 256 };
         // A rank-stamped child survives iff its rank is still launched.
         assert!(ChildAddr::Local(2).is_owned_by(local, 3));

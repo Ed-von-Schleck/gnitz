@@ -18,7 +18,7 @@ pub(crate) use distinct::op_weight_clamp;
 pub(crate) use exchange::{
     op_partition_filter, op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode, RouteMode,
 };
-pub(crate) use exchange::{with_broadcast_indices, with_worker_indices, worker_for_partition};
+pub(crate) use exchange::{with_commit_indices, with_worker_indices, worker_for_partition};
 pub(crate) use index::{op_integrate_with_indexes, AviBake, AviDesc};
 // Facade for the AVI schema builder + AVI key layout, so out-of-ops callers
 // (compiler, master) reach `crate::ops::X`, not the internals.

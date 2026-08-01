@@ -319,6 +319,9 @@ impl Table {
                 false
             }
             RecoverySource::RederiveCheckpointed { committed } => {
+                // Eager, unlike the DIRLESS `Rederive` arm: creating the dir here
+                // is what makes an unusable view directory fail the compile rather
+                // than the first flush.
                 set_nocow_dir(&ensure_dir(dir)?);
                 let manifest_path = super::manifest::path(dir);
                 let cpath = super::super::cstr(manifest_path.clone())?;

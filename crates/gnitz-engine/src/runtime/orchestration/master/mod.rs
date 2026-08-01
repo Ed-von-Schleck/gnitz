@@ -13,7 +13,7 @@ use gnitz_wire::PkColList;
 use gnitz_wire::{payload_native_key, pk_native_key};
 
 use crate::ops::{
-    op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode, with_broadcast_indices,
+    op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode, with_commit_indices,
     with_worker_indices, worker_for_partition, RouteMode,
 };
 use crate::runtime::peer::Peer;

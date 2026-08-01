@@ -330,7 +330,7 @@ impl CatalogEngine {
         // silently fill empty. Hard, not `debug_assert!`: release is a supported
         // deployment, and this costs one compare per bounded backfill, not per row.
         assert!(
-            self.active_part_start != self.active_part_end,
+            self.owns_partitions(),
             "bounded source cursor in a process owning no base partitions (view {view_id}, source {source})",
         );
 

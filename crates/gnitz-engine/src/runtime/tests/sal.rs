@@ -711,10 +711,14 @@ unsafe fn assert_footprint_exact(
     broadcast: bool,
     nw: usize,
 ) {
-    use crate::ops::{with_broadcast_indices, with_worker_indices};
+    use crate::ops::with_commit_indices;
     use crate::runtime::sal::FLAG_PUSH;
     use crate::runtime::wire::build_schema_wire_block;
     use crate::storage::compute_wire_props;
+
+    // Drive the production dispatch: `broadcast` is exactly the replicated bit
+    // `with_commit_indices` routes on, and nothing in the wire encoding reads it.
+    let schema = &schema.with_replicated(broadcast);
 
     let size = 1 << 20;
     let region = SharedRegion::new(size);
@@ -749,11 +753,7 @@ unsafe fn assert_footprint_exact(
         let actual = (writer.cursor() - before) as usize;
         assert_eq!(predicted, actual, "wire_group_footprint must equal emitted bytes");
     };
-    if broadcast {
-        with_broadcast_indices(batch, nw, emit);
-    } else {
-        with_worker_indices(batch, schema, nw, emit);
-    }
+    with_commit_indices(batch, schema, nw, emit);
     for &e in &efds {
         libc::close(e);
     }

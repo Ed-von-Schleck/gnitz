@@ -208,29 +208,23 @@ impl CatalogEngine {
         name: &str,
         id: i64,
         schema: SchemaDescriptor,
-        single_partition: bool,
+        unhashed: bool,
     ) -> Result<PartitionedTable, String> {
-        // A `single_partition` relation is a `Routing::Replicated` store on every
-        // node with a non-empty active range. It is either a
-        // replicated base table (full copy on every worker) or a replicated-derived
-        // view (the local slice each worker produces from a join/reduce against a
-        // replicated source — the output is keyed by the join/group key but produced
-        // on the source side's worker, so it does NOT fit a 256-partition store
-        // trimmed to the worker's range; partition routing would silently drop every
-        // row whose key partition the worker does not own). Both cases hold their
-        // whole local dataset at one partition and read by single-source (replicated)
-        // or union-gather (locally partitioned), governed by the read path, not the
-        // store shape.
+        // An `unhashed` relation — a replicated base table, or a view over any
+        // replicated source — holds its whole local dataset in one child, because
+        // its rows are not keyed by `partition_for_pk`. A 256-partition store
+        // trimmed to the worker's range would silently drop every row whose key
+        // partition the worker does not own. How such a store is read (single-source
+        // vs union-gather) is the read path's decision, not the store shape's.
         //
         // The single child is homed at THIS process's own worker rank (see
         // `PartitionedTable::new`), so a live CREATE on each worker post-fork
-        // builds a distinct dir directly. The single-partition path must NOT fire
-        // for an empty active range (the post-fork master, `[0, 0)`): there the
-        // master builds zero child Tables and stays inert via the
-        // `tables.is_empty()` guards.
-        let active_nonempty = self.active_part_end > self.active_part_start;
-        let routing = if single_partition && active_nonempty {
-            Routing::Replicated {
+        // builds a distinct dir directly. The unhashed path must NOT fire for an
+        // empty active range (the post-fork master, `[0, 0)`): there the master
+        // builds zero child Tables and stays inert via the `tables.is_empty()`
+        // guards.
+        let routing = if unhashed && self.owns_partitions() {
+            Routing::Unhashed {
                 rank: crate::foundation::worker_ctx::worker_rank(),
             }
         } else {
@@ -526,9 +520,10 @@ impl CatalogEngine {
                 // read single-sources worker 0. Stamping it on the schema makes the
                 // property transitive — `view_row_order` registers this view after
                 // its sources, so a view over it reads the bit right here.
-                let replicated_source = |tid: &i64| self.dag.tables.get(tid).is_some_and(|e| e.schema.replicated());
-                let has_replicated_source = source_ids.iter().any(replicated_source);
-                let all_sources_replicated = !source_ids.is_empty() && source_ids.iter().all(replicated_source);
+                // The any-source half has one definition, shared with the read
+                // path's routing decision (`confined_worker`): both must see the
+                // same shape or a read routes against a store the other chose.
+                let (has_replicated_source, all_sources_replicated) = self.dag.source_replication(vid);
                 // Views are not distributed by a chosen key (§2): `0` is the
                 // full-PK default sentinel every non-CLUSTER BY caller passes.
                 let view_schema =
@@ -536,15 +531,9 @@ impl CatalogEngine {
 
                 // See hook_table_register: one kind drives the bundle.
                 let kind = RelationKind::View;
-                // A view with any replicated source is replicated-derived: its
-                // output (a join/reduce against a full copy) is keyed by the
-                // join/group key but physically produced on the source side's
-                // worker, so it does NOT fit a 256-partition store trimmed to the
-                // worker's range (partition routing would drop every output row
-                // whose key partition this worker does not own — see
-                // `build_partitioned_storage`). Build it single-partition; the
-                // read path single-sources it (all sources replicated ⇒ replicated
-                // output) or union-gathers it (mixed ⇒ locally partitioned).
+                // A view with any replicated source produces its output on the
+                // source side's worker, not the key's, so it is built unhashed —
+                // see `build_partitioned_storage`.
                 let et = self.with_staged_dir(directory.clone(), |s| {
                     s.build_partitioned_storage(kind, &directory, &name, vid, view_schema, has_replicated_source)
                 })?;
@@ -585,7 +574,7 @@ impl CatalogEngine {
                 // double-drives it.
                 if !self.ctx.in_rollback()
                     && self.ctx.is_live()
-                    && self.active_part_start != self.active_part_end
+                    && self.owns_partitions()
                     && self.dag.ensure_compiled(vid)
                     && !self.dag.view_seeds_exchange_backfill(vid)
                 {

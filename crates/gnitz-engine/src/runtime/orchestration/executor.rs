@@ -1771,7 +1771,7 @@ async fn drain_pending_ticks(shared: &Rc<Shared>) -> Result<(), String> {
 /// lock; `is_some_and` ends the `dag.tables` borrow before the caller's next
 /// await.
 fn is_view(shared: &Rc<Shared>, tid: i64) -> bool {
-    shared.cat().dag.tables.get(&tid).is_some_and(|e| e.kind.is_view())
+    shared.cat().dag.relation_is_view(tid)
 }
 
 /// Take the catalog read lock and resolve `target_id`'s kind from the same probe

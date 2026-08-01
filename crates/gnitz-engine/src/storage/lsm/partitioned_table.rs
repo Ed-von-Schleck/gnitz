@@ -1,8 +1,9 @@
 //! Partitioned table: hash-routes rows across N child Table handles.
 //!
 //! User tables hash-route across 256 partitions; replicated and
-//! replicated-derived tables hold one. The 256-bucket index is the Fibonacci
-//! `mix(pk) >> 56` (see `schema::key`), not `xxh3 & 0xFF`.
+//! replicated-derived relations are unhashed and hold one. The 256-bucket
+//! index is the Fibonacci `mix(pk) >> 56` (see `schema::key`), not
+//! `xxh3 & 0xFF`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -32,42 +33,47 @@ thread_local! {
 
 /// How a table distributes its rows across child `Table` handles, and which
 /// children this process holds. The child set is part of the routing rather
-/// than a separate range pair, so a replicated store cannot be built with
+/// than a separate range pair, so an unhashed store cannot be built with
 /// anything but its own one child.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Routing {
-    /// One child holding the whole local dataset, unhashed — a replicated base
-    /// table's full copy or a replicated-derived view's local slice — homed at
-    /// the owning worker's rank.
-    Replicated { rank: u32 },
+    /// One child holding the whole local dataset, its rows not keyed by
+    /// `partition_for_pk` at all — a replicated base table's full copy, or a
+    /// replicated-derived view's local slice — homed at the owning worker's rank.
+    Unhashed { rank: u32 },
     /// 256-way hash scatter by `mix(pk) >> 56`, over the `[start, end)` slice
     /// of the tiling this process owns.
     Hashed { start: u32, end: u32 },
 }
 
 impl Routing {
-    /// The children this store holds, in `tables` order.
-    pub fn children(self) -> impl Iterator<Item = ChildAddr<'static>> {
-        let (start, end, local) = match self {
-            Routing::Replicated { rank } => (rank, rank + 1, true),
-            Routing::Hashed { start, end } => (start, end, false),
-        };
-        (start..end).map(move |i| {
-            if local {
-                ChildAddr::Local(i)
-            } else {
-                ChildAddr::Partition(i)
-            }
-        })
+    /// True for the single rank-homed child, whose rows are not keyed by
+    /// `partition_for_pk`. The one spelling of the shape test, so a caller
+    /// holding a bare `Routing` need not re-`matches!` it.
+    pub(crate) const fn is_unhashed(self) -> bool {
+        matches!(self, Routing::Unhashed { .. })
     }
 
-    /// Index of the first child held, which `local_slot` subtracts to map a
-    /// global partition to a `tables` slot.
-    fn offset(self) -> u32 {
-        match self {
-            Routing::Replicated { rank } => rank,
-            Routing::Hashed { start, .. } => start,
-        }
+    /// The children this store holds, in `tables` order.
+    pub fn children(self) -> impl Iterator<Item = ChildAddr<'static>> {
+        let (range, addr): (std::ops::Range<u32>, fn(u32) -> ChildAddr<'static>) = match self {
+            Routing::Unhashed { rank } => (rank..rank + 1, ChildAddr::Local),
+            Routing::Hashed { start, end } => (start..end, ChildAddr::Partition),
+        };
+        range.map(addr)
+    }
+
+    /// Every child this store has across the whole cluster at `num_workers` —
+    /// one per launched rank when unhashed, all 256 partitions when hashed. The
+    /// boot resume verdict enumerates manifests through this;
+    /// [`children`](Self::children) is this process's slice of the same set.
+    pub fn cluster_children(self, num_workers: u32) -> impl Iterator<Item = ChildAddr<'static>> {
+        let (range, addr): (std::ops::Range<u32>, fn(u32) -> ChildAddr<'static>) = if self.is_unhashed() {
+            (0..num_workers, ChildAddr::Local)
+        } else {
+            (0..NUM_PARTITIONS, ChildAddr::Partition)
+        };
+        range.map(addr)
     }
 }
 
@@ -105,10 +111,10 @@ impl PartitionedTable {
         routing: Routing,
         recovery_source: RecoverySource,
     ) -> Result<Self, StorageError> {
-        // Per-child arena: a replicated store holds the whole dataset in one
+        // Per-child arena: an unhashed store holds the whole dataset in one
         // child (1 MiB); a hashed store spreads it over 256 (256 KiB each).
         let arena_size: u64 = match routing {
-            Routing::Replicated { .. } => 1 << 20,
+            Routing::Unhashed { .. } => 1 << 20,
             Routing::Hashed { .. } => 256 << 10,
         };
         table::ensure_dir(dir)?;
@@ -124,12 +130,12 @@ impl PartitionedTable {
             }
         }
 
-        // Workers share the data directory, so a single-partition store's child
+        // Workers share the data directory, so an unhashed store's child
         // is stamped with the rank that owns it (`rep_{k}`) — a fixed name would
         // have every worker flushing the same files, and a partition index would
         // move the child when the worker count changes. The master's pre-fork
         // child is rank 0; a worker that inherits it across the fork re-homes it
-        // to its own rank before any flush (`rehome_single_partition_stores`).
+        // to its own rank before any flush (`rehome_unhashed_stores`).
         let mut tables = Vec::new();
         for child in routing.children() {
             tables.push(Table::new(
@@ -165,22 +171,20 @@ impl PartitionedTable {
         }
     }
 
-    /// True for a replicated store — one child holding the whole local dataset,
+    /// True for an unhashed store — one child holding the whole local dataset,
     /// homed at this worker's rank (a replicated base table or replicated-derived
     /// view). The bootstrap trim exempts these so the child is never dropped on a
     /// worker whose partition range excludes the child's index.
-    pub(crate) fn is_replicated(&self) -> bool {
-        matches!(self.routing, Routing::Replicated { .. })
+    pub(crate) fn is_unhashed(&self) -> bool {
+        self.routing.is_unhashed()
     }
 
     /// True when [`open_cursor`](Self::open_cursor) could return `key` (full OPK
-    /// bytes) — the discard test for a broadcast key list. It mirrors that
-    /// method's clauses, so a caller never drops a key the cursor would have
-    /// found: an empty `tables` (the post-fork master) reads nothing, and a
-    /// replicated store's single child covers the whole local dataset, so it can
-    /// hold any key.
+    /// bytes) — the discard test for a broadcast key list. It asks the same
+    /// `slot_for_key` every keyed read does, so a caller never drops a key the
+    /// cursor would have found.
     pub(crate) fn cursor_may_hold_key(&self, key: &[u8]) -> bool {
-        !self.tables.is_empty() && (self.is_replicated() || self.local_index_bytes(key).is_some())
+        self.slot_for_key(key).is_some()
     }
 
     // ------------------------------------------------------------------
@@ -188,14 +192,14 @@ impl PartitionedTable {
     // ------------------------------------------------------------------
 
     /// Ingest an already-constructed Batch (owned). Moves into tables[0]
-    /// directly for the single-partition case, scatters via a borrowed
+    /// directly for the unhashed case, scatters via a borrowed
     /// `MemBatch` view otherwise.
     #[cfg(test)] // production ingest goes through ingest_returning_effective
     pub fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
         if batch.count == 0 || self.tables.is_empty() {
             return Ok(());
         }
-        if self.is_replicated() {
+        if self.is_unhashed() {
             return self.tables[0].ingest_owned_batch(batch);
         }
         self.scatter_ingest(&batch)
@@ -203,14 +207,14 @@ impl PartitionedTable {
     }
 
     /// Ingest a borrowed Batch. The scatter path copies per partition either
-    /// way; the replicated path routes to `Table::ingest_borrowed_batch`, whose
+    /// way; the unhashed path routes to `Table::ingest_borrowed_batch`, whose
     /// consolidation pass doubles as the single copy for an unconsolidated
     /// batch (see there).
     pub fn ingest_borrowed_batch(&mut self, batch: &Batch) -> Result<(), StorageError> {
         if batch.count == 0 || self.tables.is_empty() {
             return Ok(());
         }
-        if self.is_replicated() {
+        if self.is_unhashed() {
             return self.tables[0].ingest_borrowed_batch(batch);
         }
         self.scatter_ingest(batch)
@@ -235,7 +239,7 @@ impl PartitionedTable {
 
             // Route every row by the table's distribution prefix via the shared
             // `partition_for_pk` (the leading OPK bytes; the full PK for the
-            // default). Ingest, probe (`local_index_bytes`), and the write-side
+            // default). Ingest, probe (`slot_for_key`), and the write-side
             // scatter all funnel through it, so a row lands in the same partition
             // wherever it is routed.
             for i in 0..mb.count {
@@ -267,7 +271,7 @@ impl PartitionedTable {
     /// iterator extends without a throwaway per-partition `Vec`.
     fn gather_runs(tables: &[Table]) -> (Vec<Rc<Batch>>, Vec<Rc<MappedShard>>) {
         let mut snapshots: Vec<Rc<Batch>> = Vec::with_capacity(tables.iter().map(|t| t.snapshot_runs().len()).sum());
-        let mut shards: Vec<Rc<MappedShard>> = Vec::new();
+        let mut shards: Vec<Rc<MappedShard>> = Vec::with_capacity(tables.len());
         for table in tables {
             snapshots.extend(table.snapshot_runs().iter().cloned());
             snapshots.extend(table.in_memory_runs());
@@ -279,15 +283,20 @@ impl PartitionedTable {
     /// Open a read-only cursor over every partition (memtable runs + shards).
     /// Infallible, non-mutating — the recommended default. See
     /// `Table::open_cursor`.
+    ///
+    /// Child count, not routing, picks the path: `Table::open_cursor` gathers
+    /// the same three run sources `gather_runs` would, so a lone child skips
+    /// the two accumulator `Vec`s whether it is unhashed or a hashed store
+    /// trimmed to one partition.
     pub fn open_cursor(&self) -> ReadCursor {
-        if self.tables.is_empty() {
-            return read_cursor::create_read_cursor(&[], &[], self.schema);
+        match self.tables.as_slice() {
+            [] => read_cursor::create_read_cursor(&[], &[], self.schema),
+            [only] => only.open_cursor(),
+            many => {
+                let (snaps, shards) = Self::gather_runs(many);
+                read_cursor::create_read_cursor(&snaps, &shards, self.schema)
+            }
         }
-        if self.is_replicated() {
-            return self.tables[0].open_cursor();
-        }
-        let (snaps, shards) = Self::gather_runs(&self.tables);
-        read_cursor::create_read_cursor(&snaps, &shards, self.schema)
     }
 
     /// Run `compact_if_needed` on every partition. Maintenance-only; readers
@@ -323,33 +332,17 @@ impl PartitionedTable {
 
     /// Byte-keyed sibling of [`has_pk`] for wide (`pk_stride > 16`) PKs.
     pub fn has_pk_bytes(&mut self, key: &[u8]) -> bool {
-        if self.tables.is_empty() {
-            return false;
-        }
-        if self.is_replicated() {
-            return self.tables[0].has_pk_bytes(key);
-        }
-        match self.local_index_bytes(key) {
-            Some(local) => self.tables[local].has_pk_bytes(key),
-            None => false,
-        }
+        self.slot_for_key(key)
+            .is_some_and(|local| self.tables[local].has_pk_bytes(key))
     }
 
     /// Byte-keyed sibling of [`retract_pk`] for wide PKs. Returns the net
     /// weight and, when positive, the live stored row as an owned `RowRef`.
     pub fn retract_pk_bytes(&mut self, key: &[u8]) -> (i64, Option<table::RowRef>) {
-        if self.tables.is_empty() {
-            return (0, None);
+        match self.slot_for_key(key) {
+            Some(local) => self.tables[local].retract_pk_bytes(key),
+            None => (0, None),
         }
-        let local = if self.is_replicated() {
-            0
-        } else {
-            match self.local_index_bytes(key) {
-                Some(l) => l,
-                None => return (0, None),
-            }
-        };
-        self.tables[local].retract_pk_bytes(key)
     }
 
     // ------------------------------------------------------------------
@@ -365,7 +358,7 @@ impl PartitionedTable {
 
     /// Mutable access to every partition's `Table`. The checkpoint flush rounds
     /// collect partitions through this as raw `*mut Table` and drive each
-    /// through the per-`Table` two-phase flush. A replicated store holds
+    /// through the per-`Table` two-phase flush. An unhashed store holds
     /// exactly its one worker-owned partition here.
     pub fn partitions_mut(&mut self) -> &mut [Table] {
         &mut self.tables
@@ -390,13 +383,13 @@ impl PartitionedTable {
     // Partition lifecycle
     // ------------------------------------------------------------------
 
-    /// Hashed stores only — a replicated store's child belongs to its rank, not
+    /// Hashed stores only — an unhashed store's child belongs to its rank, not
     /// to a partition range, and the bootstrap trim exempts it.
     pub fn close_partitions_outside(&mut self, start: u32, end: u32) {
         assert!(start <= end, "close_partitions_outside: start ({start}) > end ({end})",);
         let old_offset = match self.routing {
             Routing::Hashed { start: s, .. } => s,
-            Routing::Replicated { .. } => panic!("close_partitions_outside on a replicated store"),
+            Routing::Unhashed { .. } => panic!("close_partitions_outside on an unhashed store"),
         };
         assert!(
             start >= old_offset,
@@ -419,7 +412,7 @@ impl PartitionedTable {
     }
 
     /// Drop every child. The routing *shape* is kept — the post-fork master
-    /// holds no children but a replicated store is still replicated.
+    /// holds no children but an unhashed store is still unhashed.
     pub fn close_all_partitions(&mut self) {
         self.tables.clear();
         if let Routing::Hashed { start, end } = &mut self.routing {
@@ -435,24 +428,31 @@ impl PartitionedTable {
     /// Maps a global partition id to this worker's local `tables` slot, or
     /// `None` when the partition is not held locally. Single source of the
     /// global→local translation for both the ingest scatter and the PK probe.
-    /// A partition below the store's offset underflows the `wrapping_sub` to a
+    /// A partition below the store's `start` underflows the `wrapping_sub` to a
     /// value past `tables.len()`, which the bound check maps to `None`.
     fn local_slot(&self, p: usize) -> Option<usize> {
-        let local = p.wrapping_sub(self.routing.offset() as usize);
+        let Routing::Hashed { start, .. } = self.routing else {
+            return None;
+        };
+        let local = p.wrapping_sub(start as usize);
         (local < self.tables.len()).then_some(local)
     }
 
-    /// Maps a full OPK PK key to this worker's local partition slot. The sole
-    /// router now that the native `u128` path routes through `opk_key` → these
-    /// bytes; `partition_for_pk_bytes` is bit-identical to `partition_for_key`
-    /// for `len <= 16`.
+    /// The `tables` slot that could hold `key` (full OPK bytes), or `None` when
+    /// this store holds none — the one dispatch behind every keyed read. An
+    /// unhashed store's single child covers the whole local dataset, so it can
+    /// hold any key; a hashed store's slot is the key's partition, when this
+    /// process owns it. An empty `tables` (the post-fork master) holds nothing.
     ///
     /// `key` is the **full** PK, but partition *selection* goes through
     /// `schema.partition_for_pk` (hashing only the distribution prefix, exactly as
     /// ingest does — see its doc) so a probe lands in the partition the row was
     /// routed to. The in-partition match then keys on the full `key`, so
     /// prefix-twins coexist in one partition, distinguished by their full PK.
-    fn local_index_bytes(&self, key: &[u8]) -> Option<usize> {
+    fn slot_for_key(&self, key: &[u8]) -> Option<usize> {
+        if self.is_unhashed() {
+            return (!self.tables.is_empty()).then_some(0);
+        }
         self.local_slot(self.schema.partition_for_pk(key))
     }
 }
@@ -613,7 +613,7 @@ mod tests {
             tdir.to_str().unwrap(),
             schema,
             100,
-            Routing::Replicated { rank: 0 },
+            Routing::Unhashed { rank: 0 },
             RecoverySource::Rederive,
         )
         .unwrap();
@@ -627,7 +627,7 @@ mod tests {
         assert!(pt.has_pk(10));
     }
 
-    /// `cursor_may_hold_key` mirrors `open_cursor`'s clauses: a replicated store
+    /// `cursor_may_hold_key` mirrors `open_cursor`'s clauses: an unhashed store
     /// can hold any key (its one child holds the whole local dataset), a hashed
     /// store exactly the keys hashing into its own partition range, and a store
     /// with no children none at all.
@@ -645,10 +645,10 @@ mod tests {
             .map(|k| crate::schema::key::opk_key(&schema, &k.to_le_bytes()))
             .collect();
 
-        let repl = build("cmhk_repl", Routing::Replicated { rank: 7 });
+        let unhashed_store = build("cmhk_unhashed", Routing::Unhashed { rank: 7 });
         assert!(
-            keys.iter().all(|k| repl.cursor_may_hold_key(k.pk_bytes())),
-            "a replicated store can hold any key, whatever rank homes it"
+            keys.iter().all(|k| unhashed_store.cursor_may_hold_key(k.pk_bytes())),
+            "an unhashed store can hold any key, whatever rank homes it"
         );
 
         // Worker 1 of 4 → partitions [64, 128).
@@ -746,7 +746,7 @@ mod tests {
     /// §4.4 regression: a `CLUSTER BY prefix` table with a compound PK. Two rows
     /// that share the distribution prefix but differ in the PK suffix
     /// ("prefix twins") must co-locate, and each must be independently findable
-    /// and retractable. The probe (`local_index_bytes`) slices to the
+    /// and retractable. The probe (`slot_for_key`) slices to the
     /// distribution prefix exactly as ingest does — without that slice the
     /// retraction probe would land in the full-key partition and miss the row
     /// (UPSERT would duplicate the PK, DELETE would be dropped). The chosen twins

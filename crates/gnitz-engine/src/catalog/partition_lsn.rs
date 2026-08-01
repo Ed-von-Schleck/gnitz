@@ -14,6 +14,13 @@ impl CatalogEngine {
         self.active_part_end = end;
     }
 
+    /// True when this process owns a non-empty slice of the base-table tiling.
+    /// The post-fork master owns none — it holds zero child `Table`s and stays
+    /// inert — so anything reading local base data must check this first.
+    pub(crate) fn owns_partitions(&self) -> bool {
+        self.active_part_start != self.active_part_end
+    }
+
     /// Close all partitions in user tables (master after fork). System tables
     /// hold Borrowed (non-partitioned) handles, so the filter is the handle.
     pub fn close_user_table_partitions(&mut self) {
@@ -24,10 +31,22 @@ impl CatalogEngine {
         }
     }
 
+    /// Panic unless this is the pre-fork master with the full active range. Both
+    /// boot passes below read each store's routing as the shape every worker will
+    /// build, which only holds here: after the fork the master keeps an unhashed
+    /// store's routing but holds no children, and reports every hashed store as an
+    /// empty range.
+    fn assert_pre_fork_full_range(&self, who: &str) {
+        assert!(
+            !crate::foundation::worker_ctx::is_worker() && self.active_part_end == NUM_PARTITIONS,
+            "{who} must run pre-fork over the full active range",
+        );
+    }
+
     /// Trim worker partitions to assigned range. System tables hold Borrowed
     /// (non-partitioned) handles, so the filter is the handle.
     ///
-    /// **Single-partition stores are exempt.** A `Routing::Replicated` store
+    /// **Unhashed stores are exempt.** A `Routing::Unhashed` store
     /// holds its whole local dataset in one rank-stamped child, inherited across
     /// the fork at child index 0. Every worker but worker 0 owns a partition
     /// range excluding 0 and would otherwise drop it here, leaving the subsequent
@@ -36,7 +55,7 @@ impl CatalogEngine {
     pub fn trim_worker_partitions(&mut self, start: u32, end: u32) {
         for entry in self.dag.tables.values() {
             if let Some(ptable) = entry.handle.as_partitioned_mut() {
-                if ptable.is_replicated() {
+                if ptable.is_unhashed() {
                     continue;
                 }
                 ptable.close_partitions_outside(start, end);
@@ -44,7 +63,7 @@ impl CatalogEngine {
         }
     }
 
-    /// Re-home every inherited single-partition store to THIS worker's own
+    /// Re-home every inherited unhashed store to THIS worker's own
     /// `rep_{rank}` dir. The pre-fork master builds a replicated base table (or
     /// replicated-derived view) at `rep_0`; workers inherit that store across the
     /// fork. Because all workers share the data directory, leaving them at `rep_0`
@@ -56,7 +75,7 @@ impl CatalogEngine {
     /// `set_active_partitions`, before the user-data replay. (The live CREATE path
     /// already builds the store at the worker's own rank, so it needs no re-home;
     /// this only repairs the recovery inherit.)
-    pub fn rehome_single_partition_stores(&mut self) -> Result<(), String> {
+    pub fn rehome_unhashed_stores(&mut self) -> Result<(), String> {
         // Worker 0's re-home target is `rep_0`, where the inherited store already
         // lives. Skip the no-op reopen.
         if crate::foundation::worker_ctx::worker_rank() == 0 {
@@ -66,7 +85,7 @@ impl CatalogEngine {
             .dag
             .tables
             .iter()
-            .filter(|(_, e)| e.handle.is_replicated())
+            .filter(|(_, e)| e.handle.is_unhashed())
             .map(|(&tid, _)| tid)
             .collect();
         for tid in tids {
@@ -76,7 +95,7 @@ impl CatalogEngine {
             };
             let pt = self
                 .build_partitioned_storage(kind, &dir, "", tid, schema, true)
-                .map_err(|e| format!("rehome single-partition store tid={tid}: {e}"))?;
+                .map_err(|e| format!("rehome unhashed store tid={tid}: {e}"))?;
             self.dag.tables.get_mut(&tid).expect("tid taken from iter").handle =
                 StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(pt)));
         }
@@ -85,7 +104,7 @@ impl CatalogEngine {
 
     /// Bring every live relation's child directories into this boot's worker
     /// count, and give every launched rank a copy of each replicated base table —
-    /// the on-disk counterpart of `rehome_single_partition_stores`, which then
+    /// the on-disk counterpart of `rehome_unhashed_stores`, which then
     /// opens what this leaves behind. Reclaiming before seeding is what lets the
     /// seed treat "has a manifest" as "current".
     ///
@@ -94,8 +113,8 @@ impl CatalogEngine {
     /// missing one has to be re-derived, never copied.
     ///
     /// Master, pre-fork, asserted: the active range is still full here, so the
-    /// stored routing is the shape every worker will build. After the fork a
-    /// replicated store's routing survives but the master holds no children, and
+    /// stored routing is the shape every worker will build. After the fork an
+    /// unhashed store's routing survives but the master holds no children, and
     /// a hashed store reports an empty range.
     ///
     /// Needs no recorded trigger: the manifest witnesses a complete child, so the
@@ -105,10 +124,7 @@ impl CatalogEngine {
     /// the recorded count unchanged, and rebooting at *that* count would skip a
     /// repair whose reclamation already ran.
     pub fn reconcile_child_dirs(&self, num_workers: u32) -> Result<(), String> {
-        assert!(
-            !crate::foundation::worker_ctx::is_worker() && self.active_part_end == NUM_PARTITIONS,
-            "reconcile_child_dirs must run pre-fork over the full active range",
-        );
+        self.assert_pre_fork_full_range("reconcile_child_dirs");
         for entry in self.dag.tables.values() {
             // System tables are `Borrowed` single `Table`s with no children.
             let Some(pt) = entry.handle.as_partitioned_mut() else {
@@ -116,7 +132,7 @@ impl CatalogEngine {
             };
             let routing = pt.routing();
             reclaim_retired_children(&entry.directory, routing, num_workers);
-            if matches!(routing, Routing::Replicated { .. }) && entry.kind.is_base_table() {
+            if routing.is_unhashed() && entry.kind.is_base_table() {
                 crate::storage::seed_missing_locals(&entry.directory, num_workers)
                     .map_err(|e| format!("seed replicated table {} copies: {e}", entry.directory))?;
             }
@@ -157,8 +173,8 @@ impl CatalogEngine {
 
         // Rebuild empty (same shape). Each child's `Table::new` erases the stale
         // shards (manifest now absent → `RederiveCheckpointed` peek `None`).
-        let replicated = matches!(routing, Routing::Replicated { .. });
-        let pt = self.build_partitioned_storage(kind, &dir, "", vid, schema, replicated)?;
+        let unhashed = matches!(routing, Routing::Unhashed { .. });
+        let pt = self.build_partitioned_storage(kind, &dir, "", vid, schema, unhashed)?;
         self.dag.tables.get_mut(&vid).expect("view present").handle =
             StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(pt)));
 
@@ -184,7 +200,7 @@ impl CatalogEngine {
     /// is read from one worker instead of gathering N identical copies. SEEK
     /// already unicasts to one worker, so it needs no equivalent check.
     pub fn relation_output_is_replicated(&self, id: i64) -> bool {
-        self.dag.tables.get(&id).is_some_and(|e| e.schema.replicated())
+        self.dag.relation_is_replicated(id)
     }
 
     /// Invalidate all cached plans.
@@ -253,23 +269,18 @@ impl CatalogEngine {
     /// orderings, including a `ScanTrace`-of-view (not a cascade dependency, so its
     /// `depth` need not sit below its reader's).
     ///
-    /// Output manifests are enumerated by **store shape**: a replicated store has
+    /// Output manifests are enumerated by **store shape**: an unhashed store has
     /// one child per launched worker, homed at that worker's rank; a hashed store
     /// spreads over all 256 partitions. The two grammars are disjoint, so a view
     /// whose shape flipped since its checkpoint finds no manifest at all and is
     /// rebuilt.
-    pub fn compute_invalid_views(&mut self, launched_workers: u32) -> FxHashSet<i64> {
+    pub fn compute_invalid_views(&self, launched_workers: u32) -> FxHashSet<i64> {
+        self.assert_pre_fork_full_range("compute_invalid_views");
         let g = crate::foundation::worker_ctx::committed_generation();
         let topo_value = crate::storage::topology_word(launched_workers);
         let topo_valid = self.recorded_topology == topo_value;
 
-        let view_ids: Vec<i64> = self
-            .dag
-            .tables
-            .iter()
-            .filter(|(_, e)| e.kind == RelationKind::View)
-            .map(|(&vid, _)| vid)
-            .collect();
+        let view_ids = self.dag.view_ids();
 
         // Phase 1: local validity (topology + every output-partition manifest at g).
         let mut invalid: FxHashSet<i64> = FxHashSet::default();
@@ -281,13 +292,8 @@ impl CatalogEngine {
                     Ok(c) => matches!(crate::storage::peek_generation(&c), Ok(Some(mg)) if mg == g),
                     Err(_) => false,
                 };
-                // The whole cluster's children, not just this process's: one per
-                // launched worker when replicated, else all 256 partitions.
-                if entry.handle.is_replicated() {
-                    (0..launched_workers).all(|k| at_g(ChildAddr::Local(k)))
-                } else {
-                    (0..NUM_PARTITIONS).all(|p| at_g(ChildAddr::Partition(p)))
-                }
+                // The whole cluster's children, not just this process's.
+                entry.handle.cluster_children(launched_workers).all(at_g)
             };
             if !local_ok {
                 invalid.insert(vid);

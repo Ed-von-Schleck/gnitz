@@ -4,7 +4,6 @@
 
 use super::index_router::index_route_key;
 use super::*;
-use crate::query::RelationKind;
 
 /// The verdict of `MasterDispatcher::txn_fit`.
 pub(crate) enum TxnFit {
@@ -38,22 +37,17 @@ pub(crate) fn scan_spec_route(disp_ptr: *mut MasterDispatcher, target_id: i64, s
 /// nothing derives its owner from the key. A relation replicated in full on every
 /// worker never reaches here — [`scan_spec_route`] unicasts it to worker 0 first.
 ///
-/// Only a hashed store is key-routable. A view's store is hashed iff no source is
-/// replicated — `build_partitioned_storage` builds the rest single-partition, so
-/// their rows are not keyed by `partition_for_pk` at all. `handle.is_replicated()`
-/// cannot answer this on the master: a relation created post-fork has an empty
-/// active partition range there and reports `Hashed` whatever it is.
+/// Only a hashed store is key-routable, and the catalog — not the master's own
+/// stores — answers whether a relation is: the master's routing depends on when
+/// the relation was built (a post-fork CREATE reports `Hashed` over the master's
+/// empty active range), so it disagrees with the workers' across a restart.
 fn confined_worker(disp_ptr: *mut MasterDispatcher, target_id: i64, seek_pk_extra: &[u8]) -> Option<usize> {
     let cat = unsafe { &mut *(*disp_ptr).catalog };
-    let kind = cat.dag.tables.get(&target_id)?.kind;
-    match kind {
-        RelationKind::BaseTable => {}
-        // A single-partition view store — one unpartitioned table per worker,
-        // holding whatever landed there.
-        RelationKind::View if cat.dag.view_has_replicated_source(target_id) => return None,
-        RelationKind::View => {}
-        // Rejected at the verb: a catalog family is served master-locally.
-        RelationKind::SystemCatalog => return None,
+    // A view with any replicated source is built unhashed, so its rows are not
+    // keyed by `partition_for_pk` at all and no key names an owner.
+    let is_view = cat.dag.tables.get(&target_id)?.kind.is_view();
+    if is_view && cat.dag.view_has_replicated_source(target_id) {
+        return None;
     }
     let (spec, _block) = gnitz_wire::unpack_scan_spec_extra(seek_pk_extra).ok()?;
     let desc = gnitz_wire::peek_pk_range(spec)?;
@@ -1411,15 +1405,9 @@ impl MasterDispatcher {
             let props = (wire_safe, wire_row_stride);
             let block_len = block.len();
             let sal = &self.sal;
-            total += if schema.replicated() {
-                with_broadcast_indices(batch, nw, |wi| {
-                    sal.wire_group_footprint(batch, wi, &schema, block_len, props)
-                })
-            } else {
-                with_worker_indices(batch, &schema, nw, |wi| {
-                    sal.wire_group_footprint(batch, wi, &schema, block_len, props)
-                })
-            };
+            total += with_commit_indices(batch, &schema, nw, |wi| {
+                sal.wire_group_footprint(batch, wi, &schema, block_len, props)
+            });
         }
         total
     }
@@ -1461,14 +1449,10 @@ impl MasterDispatcher {
                 Some((wire_safe, wire_row_stride)),
             )
         };
-        if schema.replicated() {
-            // Replicated: the whole batch lands in every worker's ingest + SAL
-            // slot, so each worker durably logs the full table and enforces
-            // uniqueness against its identical full copy.
-            with_broadcast_indices(batch, nw, scatter)
-        } else {
-            with_worker_indices(batch, &schema, nw, scatter)
-        }
+        // A replicated relation broadcasts: the whole batch lands in every
+        // worker's ingest + SAL slot, so each worker durably logs the full table
+        // and enforces uniqueness against its identical full copy.
+        with_commit_indices(batch, &schema, nw, scatter)
     }
 
     /// Write a checkpoint flush group (`FLAG_FLUSH` base round or

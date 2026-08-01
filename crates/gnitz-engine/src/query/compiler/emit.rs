@@ -115,11 +115,6 @@ pub(super) struct EmitCtx<'a> {
     pub ext_tables: &'a ExtTables,
     pub view_dir: &'a str,
     pub view_id: u64,
-    // The view's stamped `replicated` bit: every `ScanDelta` source is replicated,
-    // so the view runs correct-local on every worker. The `PartitionFilter` arm
-    // bakes its trim as a keep-all identity, and `emit_reduce` makes every worker
-    // the owner of the global-aggregate seed.
-    pub all_sources_replicated: bool,
     pub builder: ProgramBuilder,
     pub out_reg_of: HashMap<i32, i32>,
     pub reg_meta: Vec<RegisterMeta>,
@@ -133,6 +128,16 @@ pub(super) struct EmitCtx<'a> {
 }
 
 impl EmitCtx<'_> {
+    /// The view's stamped `replicated` bit — every `ScanDelta` source is
+    /// replicated, so the view runs correct-local on every worker. The
+    /// `PartitionFilter` arm bakes its trim as a keep-all identity, and
+    /// `emit_reduce` makes every worker the owner of the global-aggregate seed.
+    /// Read through `loaded` rather than cached, so the compile-time flag and the
+    /// runtime decision cannot drift apart.
+    fn replicated(&self) -> bool {
+        self.loaded.out_schema.replicated()
+    }
+
     /// Box `func`, keep it alive in `owned_funcs`, and return a raw pointer into
     /// the box. Valid for the box's lifetime — the heap `ScalarFunc` is stable
     /// across the `Vec`'s growth — which is what the VM's raw `*const ScalarFunc`
@@ -649,7 +654,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
             // away the rows this worker does not own.
             let in_reg = in_reg(&in_regs, PORT_IN, "partition-filter: missing input port")?;
             ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(ctx.reg_meta[in_reg as usize].schema);
-            let (worker_id, num_workers) = if ctx.all_sources_replicated {
+            let (worker_id, num_workers) = if ctx.replicated() {
                 (0, 1)
             } else {
                 (worker_rank(), num_workers())
@@ -884,7 +889,7 @@ pub(super) fn emit_reduce(
         })
     });
     let i_am_owner = global_ground
-        && (ctx.all_sources_replicated
+        && (ctx.replicated()
             || unsharded
             || worker_rank() as usize
                 == crate::ops::worker_for_partition(
@@ -978,19 +983,12 @@ pub(super) fn build_plan(
         reg_meta[reg as usize] = RegisterMeta::delta(*ex_schema);
     }
 
-    // The view's own `replicated` bit, stamped at registration from the same
-    // `ScanDelta` source set (`circuit.dependencies()`). Reading it here instead of
-    // re-deriving it keeps the compile-time flag and the runtime decision that
-    // short-circuits the view to the local epoch path from ever drifting apart.
-    let all_sources_replicated = loaded.out_schema.replicated();
-
     let mut ctx = EmitCtx {
         loaded,
         skip_nodes,
         ext_tables,
         view_dir,
         view_id,
-        all_sources_replicated,
         builder: ProgramBuilder::new(),
         out_reg_of,
         reg_meta,

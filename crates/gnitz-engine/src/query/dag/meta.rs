@@ -238,21 +238,54 @@ impl DagEngine {
         bases
     }
 
-    /// True iff view `view_id` has **any** replicated source — the flag
-    /// `build_partitioned_storage` routes on. Such a view is built
-    /// single-partition, so its whole local output sits in one child store and its
-    /// rows are NOT keyed by `partition_for_pk`; no key-derived routing decision
-    /// holds for it. Answered off the reverse dependency map (which records
-    /// exactly `circuit.dependencies()`), so it costs no circuit load and no
-    /// allocation. Weaker than the view's own stamped `replicated` bit, which
-    /// needs *every* source replicated.
-    pub(crate) fn view_has_replicated_source(&mut self, view_id: i64) -> bool {
+    /// True iff `id` is a registered view. The one spelling of the kind probe.
+    pub(crate) fn relation_is_view(&self, id: i64) -> bool {
+        self.tables.get(&id).is_some_and(|e| e.kind.is_view())
+    }
+
+    /// True iff `id`'s output is a full copy on every worker — the bit stamped on
+    /// its schema at registration. The one spelling of the replication probe, so
+    /// the write broadcast, the read single-sourcing, and the store shape all read
+    /// one answer.
+    pub(crate) fn relation_is_replicated(&self, id: i64) -> bool {
+        self.tables.get(&id).is_some_and(|e| e.schema.replicated())
+    }
+
+    /// Every registered view id.
+    pub(crate) fn view_ids(&self) -> Vec<i64> {
+        self.tables
+            .iter()
+            .filter(|(_, e)| e.kind.is_view())
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
+    /// `(any source replicated, every source replicated)` for view `view_id`,
+    /// off the reverse dependency map (which records exactly
+    /// `circuit.dependencies()`), so it costs no circuit load and no allocation.
+    ///
+    /// The `any` half is the flag `build_partitioned_storage` routes on: such a
+    /// view is built unhashed, so its whole local output sits in one child store
+    /// and its rows are NOT keyed by `partition_for_pk`; no key-derived routing
+    /// decision holds for it. The `all` half is the view's own stamped
+    /// `replicated` bit — strictly stronger, and false for a sourceless view.
+    /// Both come from one walk so the two can never be read off different lists.
+    pub(crate) fn source_replication(&mut self, view_id: i64) -> (bool, bool) {
         self.get_dep_map();
-        self.dep.reverse.get(&view_id).is_some_and(|sources| {
-            sources
-                .iter()
-                .any(|tid| self.tables.get(tid).is_some_and(|e| e.schema.replicated()))
-        })
+        let Some(sources) = self.dep.reverse.get(&view_id) else {
+            return (false, false);
+        };
+        let replicated = |tid: &i64| self.tables.get(tid).is_some_and(|e| e.schema.replicated());
+        (
+            sources.iter().any(replicated),
+            !sources.is_empty() && sources.iter().all(replicated),
+        )
+    }
+
+    /// True iff view `view_id` has **any** replicated source — see
+    /// [`source_replication`](Self::source_replication).
+    pub(crate) fn view_has_replicated_source(&mut self, view_id: i64) -> bool {
+        self.source_replication(view_id).0
     }
 
     // ── ViewMeta (plan-free circuit metadata) ───────────────────────────

@@ -2541,7 +2541,7 @@ mod tests {
             tdir.to_str().unwrap(),
             schema,
             100,
-            crate::storage::Routing::Replicated { rank: 0 },
+            crate::storage::Routing::Unhashed { rank: 0 },
             crate::storage::RecoverySource::Rederive,
         )
         .unwrap();

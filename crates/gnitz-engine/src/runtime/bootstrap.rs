@@ -7,7 +7,6 @@ use std::collections::{HashMap, HashSet};
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::foundation::posix_io;
-use crate::query::RelationKind;
 use crate::runtime::executor::{ServerExecutor, TlsListener};
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::sal::{
@@ -188,13 +187,7 @@ fn inject_recovery_panic(stage: &str) {
 /// sweep drains exactly these — same function, so the swept set equals the
 /// buffered set by construction (no leak, no gap).
 fn swept_base_tables(catalog: &mut CatalogEngine) -> Vec<i64> {
-    let view_ids: Vec<i64> = catalog
-        .dag
-        .tables
-        .iter()
-        .filter(|(_, e)| e.kind == RelationKind::View)
-        .map(|(&t, _)| t)
-        .collect();
+    let view_ids = catalog.dag.view_ids();
     catalog.dag.base_tables_reachable_from(view_ids)
 }
 
@@ -563,7 +556,7 @@ fn run_worker_child(
     let sal_reader = SalReader::new(ipc.sal_ptr as *const u8, w as u32, sal_mmap_size(), ipc.m2w_efds[w]);
     let w2m_writer = W2mWriter::new(ipc.w2m_ptrs[w], W2M_REGION_SIZE as u64);
 
-    // Re-home inherited single-partition (replicated / replicated-derived) stores
+    // Re-home inherited unhashed (replicated / replicated-derived) stores
     // from the pre-fork master's `rep_0` to THIS worker's own `rep_{w}` dir before
     // any flush — all workers share the data directory, so a fixed `rep_0` would
     // collide. The inherited store is empty; the pre-fork `reconcile_child_dirs`
@@ -579,8 +572,8 @@ fn run_worker_child(
     // Either failure rides the startup ACK, which fails boot before the master
     // zeroes the SAL sentinel.
     let (pending_deltas, boot_err): (HashMap<i64, Batch>, Option<String>) = match catalog
-        .rehome_single_partition_stores()
-        .map_err(|e| format!("W{w} rehome single-partition stores failed: {e}"))
+        .rehome_unhashed_stores()
+        .map_err(|e| format!("W{w} rehome unhashed stores failed: {e}"))
         .and_then(|()| worker_boot_recovery(catalog, ipc.sal_ptr as *const u8, w as u32, num_workers))
     {
         Ok(pd) => (pd, None),
@@ -675,7 +668,7 @@ fn run_server(
         // Bring the relation child directories into this boot's worker count and
         // seed any replicated base table copy it needs. Must run after SAL replay
         // (so `dag.tables` is complete and dropped subtrees are already gone) and
-        // before the fork, since each worker's `rehome_single_partition_stores`
+        // before the fork, since each worker's `rehome_unhashed_stores`
         // opens `rep_{rank}` unconditionally.
         catalog
             .reconcile_child_dirs(num_workers)

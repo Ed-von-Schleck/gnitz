@@ -6,5 +6,5 @@ mod router;
 
 pub(crate) use relay::{op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode};
 pub(crate) use router::{
-    op_partition_filter, with_broadcast_indices, with_worker_indices, worker_for_partition, RouteMode,
+    op_partition_filter, with_commit_indices, with_worker_indices, worker_for_partition, RouteMode,
 };

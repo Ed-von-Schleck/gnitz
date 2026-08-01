@@ -324,7 +324,7 @@ impl DagEngine {
         // result locally and the worker-0 scan reads it whole. Every worker
         // evaluates this identically, so they skip the same exchange rounds and the
         // collective barrier stays balanced.
-        if self.tables.get(&view_id).is_some_and(|e| e.schema.replicated()) {
+        if self.relation_is_replicated(view_id) {
             return self.execute_epoch(view_id, input, src_id);
         }
 
