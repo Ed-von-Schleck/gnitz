@@ -1,4 +1,6 @@
 import random
+import threading
+
 import pytest
 import gnitz
 
@@ -111,6 +113,133 @@ def test_scan_values_correct(client):
     assert pairs == rows_in
     client.drop_table(sn, "t")
     client.drop_schema(sn)
+
+
+# ---------------------------------------------------------------------------
+# Concurrent binary pushes to one table
+#
+# A push whose validation reads no committed state (an unconstrained base
+# table under the binary API's upsert mode) holds its table lock shared, so
+# several such pushes reach the committer together and fold into ONE merged
+# batch under one SAL zone and one fsync. Both tests below need enough
+# connections for that fold to happen at all: the committer drains only what
+# is already queued when it wakes, so two connections almost never have a
+# second request enqueued and nothing merges. Eight is comfortably past the
+# threshold, and each asserts the fold actually occurred — a push returns its
+# zone LSN, so fewer distinct LSNs than pushes means pushes shared a zone.
+# ---------------------------------------------------------------------------
+
+_CONCURRENT_CONNS = 8
+# Distinct zones as a fraction of pushes. Deliberately loose: the assertion is
+# that pushes coalesce at all, not how far they coalesce.
+_MERGE_BAR = 0.75
+
+
+def _run_threads(fn, n):
+    """Run `fn(i)` on `n` threads, join them, and re-raise the first failure."""
+    errors = []
+
+    def body(i):
+        try:
+            fn(i)
+        except Exception as e:  # noqa: BLE001 — re-raised below
+            errors.append(e)
+
+    threads = [threading.Thread(target=body, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if errors:
+        raise errors[0]
+
+
+def test_concurrent_same_pk_upserts(server):
+    """Eight connections upserting the same PK concurrently. Every push
+    succeeds, the table holds exactly one row, and its value is one of the
+    pushed ones — several same-PK rows land in one merged batch and the ingest
+    fold keeps the last in batch order."""
+    n = 40
+    with gnitz.connect(server) as setup:
+        sn, tid, schema = _setup(setup)
+    lsns = [[] for _ in range(_CONCURRENT_CONNS)]
+
+    def worker(w):
+        with gnitz.connect(server) as c:
+            for i in range(n):
+                batch = gnitz.ZSetBatch(schema)
+                batch.append(pk=1, val=w * 1000 + i)
+                lsns[w].append(c.push(tid, batch))
+
+    try:
+        _run_threads(worker, _CONCURRENT_CONNS)
+        with gnitz.connect(server) as c:
+            rows = list(c.scan(tid))
+            assert len(rows) == 1
+            assert rows[0].pk == 1
+            pushed = {w * 1000 + i for w in range(_CONCURRENT_CONNS) for i in range(n)}
+            assert rows[0].val in pushed
+        seen = [lsn for per_conn in lsns for lsn in per_conn]
+        assert len(set(seen)) <= _MERGE_BAR * len(seen), (
+            f"{len(set(seen))} zones for {len(seen)} pushes: pushes did not coalesce"
+        )
+    finally:
+        with gnitz.connect(server) as c:
+            c.drop_table(sn, "t")
+            c.drop_schema(sn)
+
+
+def test_concurrent_disjoint_pk_pushes_with_strings(server):
+    """Eight connections pushing disjoint PKs to one table, long enough that the
+    committer's pooled merge batch is reused across many merges. The STRING
+    values mix inline (<= 12 B) and heap payloads, and every one is asserted:
+    the merge relocates each German string into the destination's own blob
+    heap, and a mis-relocated pointer or a mis-reused pool entry leaves the row
+    count intact while the value is wrong."""
+    rounds, per_push = 30, 4
+    sn = "s" + _uid()
+    with gnitz.connect(server) as setup:
+        setup.create_schema(sn)
+        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                gnitz.ColumnDef("s", gnitz.TypeCode.STRING, is_nullable=False)]
+        schema = gnitz.Schema(cols)
+        tid = setup.create_table(sn, "strs", cols)
+
+    def value_of(pk):
+        # Alternates short (inline) and long (blob heap) within one batch.
+        return f"v{pk}" if pk % 2 == 0 else f"long-payload-for-row-{pk}"
+
+    def pk_of(w, r, j):
+        return (w * rounds + r) * per_push + j
+
+    lsns = [[] for _ in range(_CONCURRENT_CONNS)]
+
+    def worker(w):
+        with gnitz.connect(server) as c:
+            for r in range(rounds):
+                batch = gnitz.ZSetBatch(schema)
+                for j in range(per_push):
+                    pk = pk_of(w, r, j)
+                    batch.append(pk=pk, s=value_of(pk))
+                lsns[w].append(c.push(tid, batch))
+
+    try:
+        _run_threads(worker, _CONCURRENT_CONNS)
+        expected = {pk_of(w, r, j): value_of(pk_of(w, r, j))
+                    for w in range(_CONCURRENT_CONNS)
+                    for r in range(rounds)
+                    for j in range(per_push)}
+        with gnitz.connect(server) as c:
+            got = {row.pk: row.s for row in c.scan(tid)}
+        assert got == expected
+        seen = [lsn for per_conn in lsns for lsn in per_conn]
+        assert len(set(seen)) <= _MERGE_BAR * len(seen), (
+            f"{len(set(seen))} zones for {len(seen)} pushes: pushes did not coalesce"
+        )
+    finally:
+        with gnitz.connect(server) as c:
+            c.drop_table(sn, "strs")
+            c.drop_schema(sn)
 
 
 # ---------------------------------------------------------------------------

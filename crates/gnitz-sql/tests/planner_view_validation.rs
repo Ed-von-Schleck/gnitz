@@ -110,14 +110,17 @@ fn test_self_referencing_fk_accepted() {
         p.execute("CREATE TABLE hier (id BIGINT PRIMARY KEY, parent_id BIGINT REFERENCES hier(id))")
             .unwrap();
     }
-    let (_, s) = client.resolve_table_id(&sn, "hier").unwrap();
+    let (tid, s) = client.resolve_table_id(&sn, "hier").unwrap();
     let fk = s
         .columns
         .iter()
         .find(|c| c.name.eq_ignore_ascii_case("parent_id"))
         .unwrap();
-    // Self-reference encodes the target table id as 0 (sentinel for "same table").
-    assert_eq!(fk.fk_table_id, 0, "self-ref FK encodes same-table sentinel");
+    // The planner ships a marker (it cannot name an id allocated at create
+    // time) and the COL_TAB writer rewrites it to the owner id. `0` would be
+    // indistinguishable from "this column has no FK", which is how the
+    // constraint used to go unenforced.
+    assert_eq!(fk.fk_table_id, tid, "self-ref FK resolves to the table's own id");
 }
 
 // ── item 17: wide-join combined column count > MAX_COLUMNS ────────────

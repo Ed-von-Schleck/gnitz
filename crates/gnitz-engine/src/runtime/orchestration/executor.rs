@@ -39,7 +39,7 @@ use crate::runtime::master::{
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{
     join_into, mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either, FsyncFuture, PendingRelay, Reactor, ReadGuard,
-    ReplyFuture,
+    ReplyFuture, WriteGuard,
 };
 use crate::runtime::sal::BACKFILL_DECISION_CONTINUE;
 use crate::runtime::wire::{
@@ -135,7 +135,7 @@ pub struct Shared {
     /// emission), tick (per-tid emission), relay (FLAG_EXCHANGE_RELAY),
     /// DDL (broadcast_ddl + fsync), and all fan-out operations (seek,
     /// scan, pipeline checks, unique-filter warmup). See async-invariants.md.
-    sal_writer_excl: Rc<AsyncMutex<()>>,
+    sal_writer_excl: Rc<AsyncMutex>,
     /// Tick trigger sender; senders include INSERT (auto-trigger on
     /// threshold cross) and SCAN (explicit drain).
     tick_tx: mpsc::Sender<TickTrigger>,
@@ -146,7 +146,11 @@ pub struct Shared {
     /// Per-table row counter feeding the tick threshold.
     tick_rows: Rc<RefCell<FxHashMap<i64, usize>>>,
     tick_tids: Rc<RefCell<Vec<i64>>>,
-    table_locks: RefCell<FxHashMap<i64, Rc<AsyncMutex<()>>>>,
+    /// Per-table write serialization. A push whose validation reads committed
+    /// state (`push_reads_committed_state`) and every transaction take the write
+    /// guard; a push that reads no committed state takes the read guard, so
+    /// same-table pushes reach the committer concurrently and share one fsync.
+    table_locks: RefCell<FxHashMap<i64, Rc<AsyncRwLock>>>,
     /// Set true by the graceful-shutdown watcher before it sends the final
     /// Shutdown barrier, so `handle_message`'s push path rejects new pushes
     /// — none may commit after the final checkpoint's view flush.
@@ -156,11 +160,12 @@ pub struct Shared {
     /// and by the watchdog (a SIGTERM waits the window out).
     ddl_window: Rc<Cell<usize>>,
     /// OCC per-table commit-LSN map: `tid → zone LSN of its last committed
-    /// write this boot`. Bumped under the writer's table lock immediately after
-    /// a successful commit ACK (push arm and `push_txn_body`, `Ok` path only), and
-    /// read under the same lock by `push_txn_body`'s precondition check. A missing
-    /// entry reads as `boot_seed`. Single-threaded reactor — a plain `RefCell`,
-    /// and no borrow is ever held across an `.await`.
+    /// write this boot`. Bumped under the writer's table-lock guard immediately
+    /// after a successful commit ACK (push arm and `push_txn_body`, `Ok` path
+    /// only), and read by `push_txn_body`'s precondition check under the *write*
+    /// guard on that lock, which excludes every bumper. A missing entry reads as
+    /// `boot_seed`. Single-threaded reactor — a plain `RefCell`, and no borrow
+    /// is ever held across an `.await`.
     table_commit_lsn: RefCell<FxHashMap<i64, u64>>,
     /// The default for a `table_commit_lsn` miss (a table not written this boot),
     /// seeded to `max_table_current_lsn()` — the same value `lsn_alloc.published()`
@@ -205,14 +210,30 @@ impl Shared {
         (e.entry.block, e.version)
     }
 
-    fn table_lock(&self, tid: i64) -> Rc<AsyncMutex<()>> {
+    fn table_lock(&self, tid: i64) -> Rc<AsyncRwLock> {
         let mut locks = self.table_locks.borrow_mut();
         if let Some(l) = locks.get(&tid) {
             return Rc::clone(l);
         }
-        let l = Rc::new(AsyncMutex::new(()));
+        let l = Rc::new(AsyncRwLock::new());
         locks.insert(tid, Rc::clone(&l));
         l
+    }
+
+    /// Take the write guard on every table in `tids`, which must be sorted
+    /// ascending and deduped. Sorted acquisition prevents deadlock between
+    /// concurrent writers — a child INSERT and a parent DELETE attempt the same
+    /// ordered set — and a repeated tid would take a second guard on a lock
+    /// this task already holds and hang forever. Takes the tids owned:
+    /// `fk_lock_set` borrows the catalog, and this loop awaits, so a slice
+    /// would hold a catalog-derived reference across a suspension point during
+    /// which another task's `cat()` mints a second `&mut`.
+    async fn lock_tables_exclusive(&self, tids: Vec<i64>) -> Vec<WriteGuard> {
+        let mut guards = Vec::with_capacity(tids.len());
+        for tid in tids {
+            guards.push(self.table_lock(tid).write().await);
+        }
+        guards
     }
 
     /// OCC: record `lsn` as the last-committed-write watermark for each of `tids`,
@@ -220,10 +241,15 @@ impl Shared {
     /// `table_commit_lsn` — both commit paths (the plain-push arm and
     /// `push_txn_body`) funnel through here, so a third write path can't silently
     /// omit the bump. Call on the commit `Ok` path only.
+    ///
+    /// `max`, not overwrite: shared-guard pushes to one table resume from their
+    /// commit awaits in an order the guard does not enforce, so the watermark
+    /// must never regress — a precondition check would then false-pass.
     fn record_commit_lsn(&self, tids: impl IntoIterator<Item = i64>, lsn: u64) {
         let mut map = self.table_commit_lsn.borrow_mut();
         for tid in tids {
-            map.insert(tid, lsn);
+            let e = map.entry(tid).or_default();
+            *e = (*e).max(lsn);
         }
     }
 
@@ -330,7 +356,7 @@ impl ServerExecutor {
             tls_conn_count,
         };
 
-        let sal_writer_excl = Rc::new(AsyncMutex::new(()));
+        let sal_writer_excl = Rc::new(AsyncMutex::new());
         // Seed the zone-LSN allocator above every table's current_lsn so each
         // new zone LSN is strictly greater, keeping `ingest_to_family`'s direct
         // current_lsn assignment monotonic across restarts.
@@ -1216,14 +1242,17 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
         if push_target_rejected(shared, peer, target_id, client_id).await {
             return;
         }
-        // Acquire all FK-related table locks in ascending tid order.
-        // Sorted acquisition prevents deadlock between concurrent child
-        // INSERT and parent DELETE: both attempt the same ordered set.
-        let lock_set = shared.cat().fk_lock_set(target_id);
-        let mut _tlocks = Vec::with_capacity(lock_set.len());
-        for &tid in lock_set {
-            _tlocks.push(shared.table_lock(tid).lock().await);
-        }
+        // The validator's own predicate decides the guard: a push that reads no
+        // committed state cannot be invalidated by a concurrent one, so it may
+        // share its table's lock and reach the committer alongside other pushes
+        // to the same table, which fold into one SAL zone and one fsync. Every
+        // other push takes all FK-related table locks exclusively.
+        let _tlocks = if !shared.cat().push_reads_committed_state(target_id, mode) {
+            (Some(shared.table_lock(target_id).read().await), Vec::new())
+        } else {
+            let lock_set = shared.cat().fk_lock_set(target_id).to_vec();
+            (None, shared.lock_tables_exclusive(lock_set).await)
+        };
 
         // Local (catalog-resident) unique-index validation. Wrapped per V.4
         // so a malformed batch can't crash the server.
@@ -1268,9 +1297,10 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
         let commit_result = rx.await;
         match commit_result {
             Ok(Ok(lsn)) => {
-                // Record the commit LSN for OCC while the table lock is still
-                // held (a concurrent precondition check reads it under the same
-                // lock, so the bump lands before any conflicting txn can pass).
+                // Record the commit LSN for OCC while the table-lock guard is
+                // still held (a concurrent precondition check reads it under the
+                // write guard on the same lock, which excludes this one, so the
+                // bump lands before any conflicting txn can pass).
                 // Bump on the `Ok` path only: an `Err` reply is pre-SAL or
                 // fail-stop, so no live-visible durable change to record.
                 shared.record_commit_lsn([target_id], lsn);
@@ -1427,26 +1457,22 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
     // for the precondition-membership check and the post-commit map bump.
     let family_tids: Vec<i64> = families.iter().map(|f| f.tid).collect();
 
-    // 3. Acquire the per-table lock union ⋃ fk_lock_set(tid), sorted ascending
-    //    and DEDUPED — a repeated tid would re-lock a non-reentrant mutex the
-    //    same task already holds and hang forever.
+    // 3. Acquire the per-table lock union ⋃ fk_lock_set(tid) exclusively.
     let mut union: Vec<i64> = Vec::new();
     for fam in &families {
         union.extend_from_slice(shared.cat().fk_lock_set(fam.tid));
     }
     union.sort_unstable();
     union.dedup();
-    let mut _tlocks = Vec::with_capacity(union.len());
-    for tid in union {
-        _tlocks.push(shared.table_lock(tid).lock().await);
-    }
+    let _tlocks = shared.lock_tables_exclusive(union).await;
 
     // 3b. OCC precondition check, under the just-acquired lock union and BEFORE
     //     validation. A precondition asserts "table `tid` has not been written
     //     since `basis`". The lock union already covers every precondition tid
     //     (preconditions ⊆ families, enforced here), so no lock-set extension.
-    //     Every writer to a family table holds that same lock through its commit
-    //     ACK and bumps the map before releasing, so a passing check + this
+    //     Every writer to a family table holds some guard on that same lock
+    //     through its commit ACK and bumps the map before releasing; the write
+    //     guard held here excludes both guard kinds, so a passing check + this
     //     commit are one atomic step. Reading the map borrow ends at each
     //     statement; no borrow crosses an `.await`.
     for &(tid, basis) in &preconditions {

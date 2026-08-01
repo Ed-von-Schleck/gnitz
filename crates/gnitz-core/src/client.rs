@@ -1895,14 +1895,19 @@ fn collect_schema_member_names(batch: &ZSetBatch, schema_id: u64) -> Result<Vec<
     Ok(out)
 }
 
-/// Append one owner's `COL_TAB` column records to `a` — the single home for the
-/// COL_TAB row layout, shared by the table path (`build_col_tab_batch`) and the
-/// view-chain path (which merges every view's rows into one family batch).
 /// Append one `COL_TAB` row for column `col_idx` of `owner_id` at `weight`, with
 /// `name` (column names are case-preserved) and the rest of the payload from
 /// `cd`. The single home for the COL_TAB row layout — the create path
 /// (`append_col_rows`) and a RENAME COLUMN's `-1`/`+1` pair both write through
 /// here, so a rename's `-1` reproduces the live row byte-for-byte (§3.3 CAS).
+///
+/// The FK fields are resolved against `owner_id`/`owner_kind` instead of taken
+/// from `cd`: `SELF_FK_TABLE_ID` becomes `owner_id` (the id the planner could
+/// not name, since the same request creates the table), and a non-table owner
+/// writes no FK at all — a view's defs are clones of the projected source
+/// columns, and the constraint belongs to the base table, not to a view over
+/// it. A rename's `cd` comes from the catalog with a real id, so the
+/// byte-for-byte reproduction is unaffected.
 fn append_col_row(
     a: &mut BatchAppender<'_>,
     owner_id: u64,
@@ -1912,6 +1917,13 @@ fn append_col_row(
     cd: &ColumnDef,
     weight: i64,
 ) -> Result<(), ClientError> {
+    let (fk_table_id, fk_col_idx) = if owner_kind != OWNER_KIND_TABLE {
+        (0, 0)
+    } else if cd.fk_table_id == ColumnDef::SELF_FK_TABLE_ID {
+        (owner_id, cd.fk_col_idx)
+    } else {
+        (cd.fk_table_id, cd.fk_col_idx)
+    };
     a.add_row(pack_col_id(owner_id, col_idx)? as u128, weight)
         .u64_val(owner_id)
         .u64_val(owner_kind)
@@ -1919,8 +1931,8 @@ fn append_col_row(
         .str_val(name)
         .u64_val(cd.type_code as u64)
         .u64_val(if cd.is_nullable { 1 } else { 0 })
-        .u64_val(cd.fk_table_id)
-        .u64_val(cd.fk_col_idx)
+        .u64_val(fk_table_id)
+        .u64_val(fk_col_idx)
         .u64_val(if cd.is_serial { 1 } else { 0 })
         .u64_val(if cd.is_hidden { 1 } else { 0 });
     Ok(())

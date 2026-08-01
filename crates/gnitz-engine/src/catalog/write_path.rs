@@ -651,10 +651,9 @@ impl CatalogEngine {
                     let col_defs = self.scan_column_defs(tid, true)?;
                     validate_relation_defs("table", tid, &name, &col_defs, &pk)?;
 
-                    let first_pk = pk.as_slice()[0];
-                    let self_pk_type = col_defs[first_pk as usize].type_code;
+                    let self_pk_type = col_defs[pk.as_slice()[0] as usize].type_code;
                     for cd in col_defs.iter().filter(|cd| cd.fk_table_id != 0) {
-                        self.validate_fk_column(cd, tid, first_pk, self_pk_type)?;
+                        self.validate_fk_column(cd, tid, pk.as_slice(), self_pk_type)?;
                     }
 
                     self.precheck_qname_unique(sid, &name, tid)?;

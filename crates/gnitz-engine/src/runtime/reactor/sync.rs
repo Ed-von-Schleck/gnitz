@@ -203,22 +203,23 @@ pub mod mpsc {
 // AsyncMutex
 // ---------------------------------------------------------------------------
 
-pub struct AsyncMutex<T> {
+/// Mutual exclusion with no payload: the guard is a drop token, and what it
+/// protects lives outside. Used where one task at a time must run a critical
+/// section that awaits inside it (SAL writer, client egress).
+pub struct AsyncMutex {
     locked: Cell<bool>,
-    value: RefCell<T>,
     waiters: RefCell<VecDeque<Waker>>,
 }
 
-impl<T> AsyncMutex<T> {
-    pub fn new(v: T) -> Self {
+impl AsyncMutex {
+    pub fn new() -> Self {
         AsyncMutex {
             locked: Cell::new(false),
-            value: RefCell::new(v),
             waiters: RefCell::new(VecDeque::new()),
         }
     }
 
-    pub fn lock(self: &Rc<Self>) -> LockFuture<T> {
+    pub fn lock(self: &Rc<Self>) -> LockFuture {
         LockFuture { mutex: Rc::clone(self) }
     }
 
@@ -236,13 +237,19 @@ impl<T> AsyncMutex<T> {
     }
 }
 
-pub struct LockFuture<T> {
-    mutex: Rc<AsyncMutex<T>>,
+impl Default for AsyncMutex {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-impl<T> Future for LockFuture<T> {
-    type Output = LockGuard<T>;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<LockGuard<T>> {
+pub struct LockFuture {
+    mutex: Rc<AsyncMutex>,
+}
+
+impl Future for LockFuture {
+    type Output = LockGuard;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<LockGuard> {
         if !self.mutex.locked.get() {
             self.mutex.locked.set(true);
             return Poll::Ready(LockGuard {
@@ -254,18 +261,11 @@ impl<T> Future for LockFuture<T> {
     }
 }
 
-pub struct LockGuard<T> {
-    mutex: Rc<AsyncMutex<T>>,
+pub struct LockGuard {
+    mutex: Rc<AsyncMutex>,
 }
 
-impl<T> std::ops::Deref for LockGuard<T> {
-    type Target = RefCell<T>;
-    fn deref(&self) -> &Self::Target {
-        &self.mutex.value
-    }
-}
-
-impl<T> Drop for LockGuard<T> {
+impl Drop for LockGuard {
     fn drop(&mut self) {
         self.mutex.release();
     }
@@ -275,10 +275,10 @@ impl<T> Drop for LockGuard<T> {
 // AsyncRwLock (writer-preference)
 // ---------------------------------------------------------------------------
 //
-// `()`-valued: used as a catalog-wide barrier. Readers hold a read guard
-// during INSERT; the DDL path holds a write guard during catalog
-// mutation. Writer-preference blocks new readers as soon as a writer
-// parks, guaranteeing DDL doesn't starve.
+// Payload-free, like `AsyncMutex`: both guards are drop tokens admitting
+// entry to a critical section, and what they protect lives outside.
+// Writer-preference blocks new readers as soon as a writer parks, so a
+// writer cannot starve behind a stream of readers.
 
 struct RwLockInner {
     readers: usize,

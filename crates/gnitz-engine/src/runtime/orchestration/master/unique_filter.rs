@@ -271,7 +271,7 @@ impl MasterDispatcher {
     pub(super) async fn ensure_unique_filters_warm(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex<()>>,
+        sal_excl: &Rc<AsyncMutex>,
         table_id: i64,
     ) -> Result<(), String> {
         let (schema, missing, mut guard): (SchemaDescriptor, Vec<UniqueIndexDesc>, WarmupGuard) = unsafe {

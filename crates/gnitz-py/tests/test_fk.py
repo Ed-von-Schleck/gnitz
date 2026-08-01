@@ -5,6 +5,8 @@ Run:
 """
 import os
 import random
+import threading
+
 import pytest
 import gnitz
 
@@ -16,6 +18,28 @@ _NEEDS_MULTI = pytest.mark.skipif(
 
 def _uid():
     return str(random.randint(100000, 999999))
+
+
+def _race(*labelled_writes):
+    """Run each `(label, fn)` on its own thread, released together by a barrier,
+    and return the `(label, GnitzError)` pairs raised. Writes that contend for
+    the same FK lock set serialize, so one of a conflicting pair is rejected."""
+    errors = []
+    start = threading.Barrier(len(labelled_writes))
+
+    def run(label, fn):
+        start.wait()
+        try:
+            fn()
+        except gnitz.GnitzError as e:
+            errors.append((label, e))
+
+    threads = [threading.Thread(target=run, args=w) for w in labelled_writes]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return errors
 
 
 def _cleanup(client, sn, *tables):
@@ -514,27 +538,270 @@ class TestFkMultiChild:
             _cleanup(client, sn)
 
 
-class TestFkSelfReferenceSQL:
-    """Self-referential FK via SQL is not supported (table doesn't exist yet)."""
+_COL_TAB = 4
 
-    def test_self_referential_fk_supported(self, client):
-        # Self-referencing FKs are now resolved against the in-flight column
-        # list during CREATE TABLE (the referenced table is the one being
-        # created), so the table is created successfully rather than failing
-        # with "table not found".
+
+def _make_tree(client, sn):
+    """`CREATE SCHEMA sn; CREATE TABLE tree (id PK, parent_id -> tree.id)`.
+    Returns `(tid, schema)`."""
+    client.create_schema(sn)
+    client.execute_sql(
+        "CREATE TABLE tree ("
+        "  id BIGINT NOT NULL PRIMARY KEY,"
+        "  parent_id BIGINT REFERENCES tree(id)"
+        ")",
+        schema_name=sn,
+    )
+    return client.resolve_table(sn, "tree")
+
+
+class TestFkSelfReferenceSQL:
+    """A self-referential FK declared with CREATE TABLE is enforced in both
+    directions, on the transaction path (UPDATE/DELETE/upsert) and on the plain
+    path (blind INSERT, binary push/delete) alike."""
+
+    def test_self_referential_fk_registers_a_real_table_id(self, client):
+        """The wire boundary, which is where the constraint used to be lost.
+
+        The planner cannot name the id of the table being created, so it ships a
+        marker the COL_TAB writer rewrites to the owner id. A behavioural test
+        alone would pass again the moment some path re-introduced a sentinel,
+        because `0` is also the engine's encoding for "this column has no FK".
+        """
+        sn = "s" + _uid()
+        try:
+            tid, _ = _make_tree(client, sn)
+            assert tid > 0
+            cols = {
+                r.col_idx: r.fk_table_id
+                for r in client.scan(_COL_TAB)
+                if r.owner_id == tid
+            }
+            assert cols[0] == 0, "the PK column carries no FK"
+            assert cols[1] == tid, f"parent_id must reference tree itself, got {cols[1]}"
+        finally:
+            _cleanup(client, sn, "tree")
+
+    def test_view_over_an_fk_table_is_not_an_fk_child(self, client):
+        """A view's columns are clones of the projected source defs, so a
+        projected FK column would carry the source's `fk_table_id`. Registering
+        that as a constraint makes the view an FK child of the parent — and a
+        view has no `__fk_` index, so every parent delete then fails on a missing
+        one. The same view over a self-FK table would make the table its own
+        second, spurious child.
+        """
+        sn = "s" + _uid()
+        try:
+            tid, _ = _make_tree(client, sn)
+            client.execute_sql("INSERT INTO tree VALUES (1, NULL), (2, 1)", schema_name=sn)
+            client.execute_sql("CREATE VIEW tree_v AS SELECT id, parent_id FROM tree", schema_name=sn)
+
+            vid, _ = client.resolve_table(sn, "tree_v")
+            view_fks = [
+                r.col_idx for r in client.scan(_COL_TAB) if r.owner_id == vid and r.fk_table_id != 0
+            ]
+            assert not view_fks, f"view columns {view_fks} registered an FK"
+
+            # The real constraint still holds, and an unreferenced row deletes.
+            client.execute_sql("DELETE FROM tree WHERE id = 2", schema_name=sn)
+            assert {r.id for r in client.scan(tid)} == {1}
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("INSERT INTO tree VALUES (3, 99)", schema_name=sn)
+        finally:
+            try:
+                client.execute_sql("DROP VIEW tree_v", schema_name=sn)
+            except Exception:
+                pass
+            _cleanup(client, sn, "tree")
+
+    def test_self_fk_column_referencing_itself_rejected(self, client):
+        """A column that references the very column it is: a tautology, and its
+        auto `__fk_` index would be skipped as a PK column, leaving parent
+        deletes unvalidatable."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
-            client.execute_sql(
-                "CREATE TABLE tree ("
-                "  id BIGINT NOT NULL PRIMARY KEY,"
-                "  parent_id BIGINT REFERENCES tree(id)"
-                ")",
-                schema_name=sn,
-            )
-            assert client.resolve_table(sn, "tree")[0] > 0
+            with pytest.raises(gnitz.GnitzError, match="(?i)referenced column itself"):
+                client.execute_sql(
+                    "CREATE TABLE selfcol (id BIGINT NOT NULL PRIMARY KEY REFERENCES selfcol(id))",
+                    schema_name=sn,
+                )
+        finally:
+            _cleanup(client, sn, "selfcol")
+
+    def test_insert_absent_parent_rejected(self, client):
+        sn = "s" + _uid()
+        try:
+            _make_tree(client, sn)
+            with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+                client.execute_sql("INSERT INTO tree VALUES (3, 99)", schema_name=sn)
         finally:
             _cleanup(client, sn, "tree")
+
+    def test_push_absent_parent_rejected(self, client):
+        sn = "s" + _uid()
+        try:
+            tid, schema = _make_tree(client, sn)
+            batch = gnitz.ZSetBatch(schema)
+            batch.append(id=3, parent_id=99)
+            with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+                client.push(tid, batch)
+            assert not list(client.scan(tid))
+        finally:
+            _cleanup(client, sn, "tree")
+
+    def test_delete_referenced_parent_rejected(self, client):
+        sn = "s" + _uid()
+        try:
+            tid, _ = _make_tree(client, sn)
+            client.execute_sql("INSERT INTO tree VALUES (1, NULL)", schema_name=sn)
+            client.execute_sql("INSERT INTO tree VALUES (2, 1)", schema_name=sn)
+
+            # Transaction path: the bundle removes 1 but not the row that
+            # references it.
+            with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+                client.execute_sql("DELETE FROM tree WHERE id = 1", schema_name=sn)
+            # Plain path: the binary delete probes the committed children.
+            with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+                client.delete(tid, client.resolve_table(sn, "tree")[1], [1])
+
+            assert {r.id for r in client.scan(tid)} == {1, 2}
+        finally:
+            _cleanup(client, sn, "tree")
+
+    def test_intra_batch_parent_accepted(self, client):
+        """The ordinary way to seed a tree: the row satisfying the reference is
+        in the same batch. A committed-state probe would reject it."""
+        sn = "s" + _uid()
+        try:
+            tid, _ = _make_tree(client, sn)
+            client.execute_sql("INSERT INTO tree VALUES (1, NULL), (2, 1)", schema_name=sn)
+            # A row that is its own parent — the reference resolves against the
+            # very row supplying it.
+            client.execute_sql("INSERT INTO tree VALUES (3, 3)", schema_name=sn)
+            assert {(r.id, r.parent_id) for r in client.scan(tid)} == {
+                (1, None),
+                (2, 1),
+                (3, 3),
+            }
+        finally:
+            _cleanup(client, sn, "tree")
+
+    def test_push_removing_the_parent_it_references_rejected(self, client):
+        """One push carrying `retract(1)` and `insert(2, parent_id=1)`. Probing
+        committed state finds 1 present and lets it through, leaving a durable
+        dangling reference — so assert the table, not only the error."""
+        sn = "s" + _uid()
+        try:
+            tid, schema = _make_tree(client, sn)
+            client.execute_sql("INSERT INTO tree VALUES (1, NULL)", schema_name=sn)
+
+            batch = gnitz.ZSetBatch(schema)
+            batch.append(id=1, parent_id=None, _weight=-1)
+            batch.append(id=2, parent_id=1)
+            with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+                client.push(tid, batch)
+
+            rows = {(r.id, r.parent_id) for r in client.scan(tid)}
+            assert rows == {(1, None)}, f"the write must not have applied: {rows}"
+        finally:
+            _cleanup(client, sn, "tree")
+
+    def test_push_net_zero_removal_still_restrict_checked(self, client):
+        """`insert(1, x)` then `retract(1)` nets to weight zero, yet the apply
+        removes the committed row 1 — which row 2 references."""
+        sn = "s" + _uid()
+        try:
+            tid, schema = _make_tree(client, sn)
+            client.execute_sql("INSERT INTO tree VALUES (1, NULL), (2, 1)", schema_name=sn)
+
+            batch = gnitz.ZSetBatch(schema)
+            batch.append(id=1, parent_id=None)
+            batch.append(id=1, parent_id=None, _weight=-1)
+            with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+                client.push(tid, batch)
+
+            assert {r.id for r in client.scan(tid)} == {1, 2}
+        finally:
+            _cleanup(client, sn, "tree")
+
+    def test_delete_parent_and_child_together_accepted(self, client):
+        """The bundle path's exemption: a child removed by the same statement
+        does not block its parent's removal."""
+        sn = "s" + _uid()
+        try:
+            tid, _ = _make_tree(client, sn)
+            client.execute_sql("INSERT INTO tree VALUES (1, NULL), (2, 1)", schema_name=sn)
+            client.execute_sql("DELETE FROM tree", schema_name=sn)
+            assert not list(client.scan(tid))
+        finally:
+            _cleanup(client, sn, "tree")
+
+    def test_leaf_first_teardown_accepted(self, client):
+        sn = "s" + _uid()
+        try:
+            tid, _ = _make_tree(client, sn)
+            client.execute_sql("INSERT INTO tree VALUES (1, NULL), (2, 1)", schema_name=sn)
+            client.execute_sql("DELETE FROM tree WHERE id = 2", schema_name=sn)
+            client.execute_sql("DELETE FROM tree WHERE id = 1", schema_name=sn)
+            assert not list(client.scan(tid))
+        finally:
+            _cleanup(client, sn, "tree")
+
+    def test_drop_self_referential_table_with_rows(self, client):
+        """The drop guard skips a blocking child that is itself in the drop set,
+        and for a self-FK the child *is* the table being dropped."""
+        sn = "s" + _uid()
+        try:
+            _make_tree(client, sn)
+            client.execute_sql("INSERT INTO tree VALUES (1, NULL), (2, 1)", schema_name=sn)
+            client.execute_sql("DROP TABLE tree", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.resolve_table(sn, "tree")
+        finally:
+            _cleanup(client, sn, "tree")
+
+
+def test_self_fk_enforced_under_concurrent_push_and_delete(server):
+    """Both endpoints of the constraint are one table, so its lock set dedupes
+    to a single tid — the writer must still take that one guard exclusively.
+    Each round races inserting child `(2, parent_id=1)` against deleting `1`;
+    exactly one must be rejected, and no round may leave a child referencing an
+    absent parent."""
+    sn = "s" + _uid()
+    with gnitz.connect(server) as setup:
+        tid, schema = _make_tree(setup, sn)
+
+    try:
+        with gnitz.connect(server) as setup, gnitz.connect(server) as a, gnitz.connect(server) as b:
+            for _ in range(20):
+                # Reset to {1}, touching only what is actually there — a
+                # retraction of an absent row is not a no-op.
+                ids = {r.id for r in setup.scan(tid)}
+                if 2 in ids:
+                    setup.delete(tid, schema, [2])
+                if 1 not in ids:
+                    seed = gnitz.ZSetBatch(schema)
+                    seed.append(id=1, parent_id=None)
+                    setup.push(tid, seed)
+
+                child = gnitz.ZSetBatch(schema)
+                child.append(id=2, parent_id=1)
+                errors = _race(
+                    ("push", lambda: a.push(tid, child)),
+                    ("delete", lambda: b.delete(tid, schema, [1])),
+                )
+
+                rows = {(r.id, r.parent_id) for r in setup.scan(tid)}
+                present = {i for i, _ in rows}
+                orphans = [i for i, p in rows if p is not None and p not in present]
+                assert not orphans, f"rows {orphans} reference an absent parent"
+                assert len(errors) == 1, (
+                    f"expected exactly one of the two writes to be rejected, got {errors}"
+                )
+    finally:
+        with gnitz.connect(server) as c:
+            _cleanup(c, sn, "tree")
 
 
 # ---------------------------------------------------------------------------
@@ -946,3 +1213,64 @@ class TestFkIndexEpochInvalidation:
                 )
             finally:
                 _cleanup(c, sn, "c2", "c1", "p")
+
+
+# ---------------------------------------------------------------------------
+# FK enforcement under concurrent binary writes
+# ---------------------------------------------------------------------------
+
+
+def test_fk_enforced_under_concurrent_push_and_delete(server):
+    """A binary push and a binary delete are both conflict-mode `Update`, so the
+    only thing keeping them off the shared table lock — where they would run
+    concurrently and each miss the other's uncommitted rows — is the FK terms of
+    the validator's predicate. Both tables here carry an FK, so both writes take
+    the whole two-table lock set exclusively.
+
+    Each round races a child insert against the deletion of its parent. Exactly
+    one must be rejected, and no round may leave a child referencing an absent
+    parent.
+    """
+    sn = "s" + _uid()
+    with gnitz.connect(server) as setup:
+        setup.create_schema(sn)
+        setup.execute_sql("CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY)", schema_name=sn)
+        setup.execute_sql(
+            "CREATE TABLE child ("
+            "  cid BIGINT NOT NULL PRIMARY KEY,"
+            "  pid BIGINT NOT NULL REFERENCES parent(id)"
+            ")",
+            schema_name=sn,
+        )
+        ptid, pschema = setup.resolve_table(sn, "parent")
+        ctid, cschema = setup.resolve_table(sn, "child")
+
+    try:
+        with gnitz.connect(server) as setup, gnitz.connect(server) as a, gnitz.connect(server) as b:
+            for _ in range(20):
+                # Reset to {parent present, child absent}, touching only what is
+                # actually there — a retraction of an absent row is not a no-op.
+                children = [r.cid for r in setup.scan(ctid)]
+                if children:
+                    setup.delete(ctid, cschema, children)
+                if not [r.id for r in setup.scan(ptid)]:
+                    seed = gnitz.ZSetBatch(pschema)
+                    seed.append(id=1)
+                    setup.push(ptid, seed)
+
+                child = gnitz.ZSetBatch(cschema)
+                child.append(cid=2, pid=1)
+                errors = _race(
+                    ("push", lambda: a.push(ctid, child)),
+                    ("delete", lambda: b.delete(ptid, pschema, [1])),
+                )
+
+                parents = {r.id for r in setup.scan(ptid)}
+                orphans = [r.cid for r in setup.scan(ctid) if r.pid not in parents]
+                assert not orphans, f"child rows {orphans} reference an absent parent"
+                assert len(errors) == 1, (
+                    f"expected exactly one of the two writes to be rejected, got {errors}"
+                )
+    finally:
+        with gnitz.connect(server) as c:
+            _cleanup(c, sn, "child", "parent")

@@ -39,13 +39,16 @@ fn check_fk_type_compat(fk_col_type: TypeCode, parent_col_type: TypeCode) -> Res
 
 /// Resolve a self-referencing FK against the in-flight column list (the table
 /// is not yet registered in the catalog). The referenced column must be the
-/// table's lone PK column; returns table id 0 — the sentinel the FK
-/// registration path uses for "same table".
+/// table's lone PK column, and may not be `fk_col_idx` itself. Returns
+/// [`ColumnDef::SELF_FK_TABLE_ID`] as the table id: the planner cannot name an
+/// id that is allocated only when the table is created, so it marks the column
+/// and the `COL_TAB` writer rewrites the marker to the owner id.
 fn resolve_fk_target_inline(
     current_cols: &[ColumnDef],
     current_pk_cols: &[u32],
     ref_table: &str,
     referred_columns: &[sqlparser::ast::Ident],
+    fk_col_idx: usize,
     fk_col_type: TypeCode,
 ) -> Result<(u64, u64, TypeCode), GnitzSqlError> {
     if referred_columns.len() > 1 {
@@ -76,9 +79,21 @@ fn resolve_fk_target_inline(
         )));
     }
 
+    // A column referencing itself is a tautology every row satisfies by
+    // construction, and it has no index to validate against: the referenced
+    // column is the lone PK, so the child column would be a PK column too, and
+    // the auto-created `__fk_` index skips PK columns (the PK region already
+    // stores them). Every parent delete would then fail on a missing child
+    // index. Rejecting it keeps the self-FK column non-PK and its index present.
+    if ref_col_idx == fk_col_idx {
+        return Err(GnitzSqlError::Bind(
+            "a self-referencing FK column must not be the referenced column itself".into(),
+        ));
+    }
+
     let parent_col_type = current_cols[ref_col_idx].type_code;
     check_fk_type_compat(fk_col_type, parent_col_type)?;
-    Ok((0, ref_col_idx as u64, parent_col_type))
+    Ok((ColumnDef::SELF_FK_TABLE_ID, ref_col_idx as u64, parent_col_type))
 }
 
 /// Resolve a REFERENCES clause to (fk_table_id, ref_col_idx, parent_col_type).
@@ -92,6 +107,7 @@ fn resolve_fk_target(
     schema_name: &str,
     foreign_table: &sqlparser::ast::ObjectName,
     referred_columns: &[sqlparser::ast::Ident],
+    fk_col_idx: usize,
     fk_col_type: TypeCode,
     current_table_name: &str,
     current_cols: &[ColumnDef],
@@ -102,7 +118,14 @@ fn resolve_fk_target(
     // Self-referencing FK: the table being created is not yet in the catalog,
     // so resolve the referenced column against the in-flight column list.
     if ref_table.eq_ignore_ascii_case(current_table_name) {
-        return resolve_fk_target_inline(current_cols, current_pk_cols, &ref_table, referred_columns, fk_col_type);
+        return resolve_fk_target_inline(
+            current_cols,
+            current_pk_cols,
+            &ref_table,
+            referred_columns,
+            fk_col_idx,
+            fk_col_type,
+        );
     }
 
     // The one relation-name catalog probe outside the Binder funnels: hold the
@@ -311,6 +334,7 @@ pub(crate) fn execute_create_table(
                         schema_name,
                         foreign_table,
                         referred_columns,
+                        i,
                         cols[i].type_code,
                         &table_name,
                         &cols,
@@ -353,6 +377,7 @@ pub(crate) fn execute_create_table(
                 schema_name,
                 foreign_table,
                 referred_columns,
+                col_idx,
                 cols[col_idx].type_code,
                 &table_name,
                 &cols,
@@ -762,5 +787,71 @@ mod tests {
                 "{child:?} → {parent:?} must be rejected"
             );
         }
+    }
+
+    /// `tree (id BIGINT PK, parent_id BIGINT, tag BIGINT)` — the in-flight
+    /// column list a self-referencing FK resolves against.
+    fn tree_cols() -> Vec<ColumnDef> {
+        vec![
+            ColumnDef::new("id", TypeCode::I64, false),
+            ColumnDef::new("parent_id", TypeCode::I64, true),
+            ColumnDef::new("tag", TypeCode::I64, true),
+        ]
+    }
+
+    fn ident(name: &str) -> sqlparser::ast::Ident {
+        sqlparser::ast::Ident::new(name)
+    }
+
+    #[test]
+    fn self_fk_resolves_to_the_marker_not_a_table_id() {
+        let cols = tree_cols();
+        // `parent_id BIGINT REFERENCES tree(id)`. The table has no id yet, so
+        // the planner marks the column; `append_col_row` substitutes the owner
+        // id. `0` would collide with the engine's "no FK" encoding.
+        let (tid, ref_col, parent_type) =
+            resolve_fk_target_inline(&cols, &[0], "tree", &[ident("id")], 1, TypeCode::I64).unwrap();
+        assert_eq!(tid, ColumnDef::SELF_FK_TABLE_ID);
+        assert_ne!(tid, 0);
+        assert_eq!(ref_col, 0);
+        assert_eq!(parent_type, TypeCode::I64);
+    }
+
+    #[test]
+    fn self_fk_omitted_column_list_defaults_to_the_lone_pk() {
+        let cols = tree_cols();
+        let (tid, ref_col, _) = resolve_fk_target_inline(&cols, &[0], "tree", &[], 1, TypeCode::I64).unwrap();
+        assert_eq!(tid, ColumnDef::SELF_FK_TABLE_ID);
+        assert_eq!(ref_col, 0);
+    }
+
+    #[test]
+    fn self_fk_column_referencing_itself_rejected() {
+        let cols = tree_cols();
+        // `id BIGINT PRIMARY KEY REFERENCES tree(id)` — a tautology, and its
+        // child column would be a PK column, which the auto `__fk_` index skips.
+        let err = resolve_fk_target_inline(&cols, &[0], "tree", &[ident("id")], 0, TypeCode::I64).unwrap_err();
+        match err {
+            GnitzSqlError::Bind(m) => assert!(m.contains("must not be the referenced column itself"), "got: {m}"),
+            e => panic!("expected Bind, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn self_fk_against_non_pk_column_rejected() {
+        let cols = tree_cols();
+        let err = resolve_fk_target_inline(&cols, &[0], "tree", &[ident("tag")], 1, TypeCode::I64).unwrap_err();
+        assert!(matches!(err, GnitzSqlError::Unsupported(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn self_fk_against_compound_pk_rejected() {
+        let cols = tree_cols();
+        // Named column: it is a PK member, but not the *lone* PK.
+        let err = resolve_fk_target_inline(&cols, &[0, 1], "tree", &[ident("id")], 2, TypeCode::I64).unwrap_err();
+        assert!(matches!(err, GnitzSqlError::Unsupported(_)), "got: {err:?}");
+        // Omitted column list: there is no single default target.
+        let err = resolve_fk_target_inline(&cols, &[0, 1], "tree", &[], 2, TypeCode::I64).unwrap_err();
+        assert!(matches!(err, GnitzSqlError::Bind(_)), "got: {err:?}");
     }
 }

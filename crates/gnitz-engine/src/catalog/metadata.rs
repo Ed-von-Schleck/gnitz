@@ -188,6 +188,18 @@ impl CatalogEngine {
             .unwrap_or(&[])
     }
 
+    /// Does validating a push of `mode` to `table_id` read committed state?
+    /// When false, neither `validate_all_distributed` nor
+    /// `validate_unique_indices` reads a row, so the push may hold its table
+    /// lock shared — nothing it does can be invalidated by a concurrent write
+    /// to the same table. A new constraint kind adds its term here.
+    pub fn push_reads_committed_state(&self, table_id: i64, mode: gnitz_wire::WireConflictMode) -> bool {
+        !self.fk_constraints_of(table_id).is_empty()
+            || !self.fk_children_of(table_id).is_empty()
+            || self.has_any_unique_index(table_id)
+            || matches!(mode, gnitz_wire::WireConflictMode::Error)
+    }
+
     // -- Store handle accessors -----------------------------------------------
 
     /// Get a `&mut PartitionedTable` for a user table, or `None` if the table is

@@ -197,13 +197,12 @@ impl CatalogEngine {
         // Index the validated copy, not the raw `pk_cols` argument:
         // `validate_pk_cols` ran against `pk`, so `pk.as_slice()[0]` is
         // the value proven in-bounds and PK-eligible.
-        let first_pk = pk.as_slice()[0];
-        let self_pk_type = col_defs[first_pk as usize].type_code;
+        let self_pk_type = col_defs[pk.as_slice()[0] as usize].type_code;
 
         // Validate FK columns. Compound-parent FK resolution is out of
         // scope; single-PK behaviour is preserved via the first PK column.
         for cd in col_defs.iter().filter(|cd| cd.fk_table_id != 0) {
-            self.validate_fk_column(cd, tid, first_pk, self_pk_type)?;
+            self.validate_fk_column(cd, tid, pk.as_slice(), self_pk_type)?;
         }
 
         let directory = table_dir(&self.base_dir, schema_name, tid);

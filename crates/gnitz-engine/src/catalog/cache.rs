@@ -84,6 +84,16 @@ fn remove_where<K: Eq + std::hash::Hash, V>(map: &mut FxHashMap<K, Vec<V>>, key:
     }
 }
 
+/// Does COL_TAB row `i` declare a foreign key? An FK constrains a *base
+/// table's* column; a view's `COL_TAB` rows are clones of the projected source
+/// defs, so they carry the source's `fk_table_id` without being a constraint
+/// themselves — reading one as a child would put a view id in a base table's
+/// lock set and fail every parent DELETE on the view's missing FK index.
+fn coltab_row_declares_fk(batch: &Batch, i: usize) -> bool {
+    batch.read_payload_u64(i, COLTAB_PAY_FK_TABLE_ID) != 0
+        && batch.read_payload_u64(i, COLTAB_PAY_OWNER_KIND) as i64 == OWNER_KIND_TABLE
+}
+
 impl CatalogCacheSet {
     /// Remove the derived column caches without bumping the schema version.
     /// Use for table drop (no new schema to advertise) or as the inner step of
@@ -312,12 +322,14 @@ impl CatalogEngine {
     /// COL_TAB delta — both caches key off the same FK fields and share their
     /// lifecycle, and at boot replay the batch is the full sys_columns scan,
     /// so decoding it once matters.
+    ///
+    /// Only base-table rows carry a constraint (`coltab_row_declares_fk`).
     pub(crate) fn apply_fk_constraints(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
-            let fk_table_id = batch.read_payload_u64(i, COLTAB_PAY_FK_TABLE_ID) as i64;
-            if fk_table_id == 0 {
+            if !coltab_row_declares_fk(batch, i) {
                 continue;
             }
+            let fk_table_id = batch.read_payload_u64(i, COLTAB_PAY_FK_TABLE_ID) as i64;
 
             let weight = batch.get_weight(i);
             let owner_id = batch.read_payload_u64(i, COLTAB_PAY_OWNER_ID) as i64;
@@ -371,12 +383,13 @@ impl CatalogEngine {
             SysFamily::Column => {
                 to_recompute.reserve(batch.count * 2);
                 for i in 0..batch.count {
+                    if !coltab_row_declares_fk(batch, i) {
+                        continue;
+                    }
                     let fk_table_id = batch.read_payload_u64(i, COLTAB_PAY_FK_TABLE_ID) as i64;
-                    if fk_table_id != 0 {
-                        to_recompute.push(batch.read_payload_u64(i, COLTAB_PAY_OWNER_ID) as i64);
-                        if self.dag.tables.contains_key(&fk_table_id) {
-                            to_recompute.push(fk_table_id);
-                        }
+                    to_recompute.push(batch.read_payload_u64(i, COLTAB_PAY_OWNER_ID) as i64);
+                    if self.dag.tables.contains_key(&fk_table_id) {
+                        to_recompute.push(fk_table_id);
                     }
                 }
             }

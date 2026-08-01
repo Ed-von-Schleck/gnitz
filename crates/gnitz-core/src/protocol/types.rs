@@ -40,6 +40,16 @@ pub struct ColumnDef {
 }
 
 impl ColumnDef {
+    /// `fk_table_id` value meaning "this column references the table being
+    /// created", whose id the planner cannot name yet. `append_col_row`
+    /// rewrites it to the owner id, so no `COL_TAB` row carries it.
+    ///
+    /// `0` cannot serve, being the live "no FK" value. `u64::MAX` is
+    /// unreachable as a table id, and an escaped marker fails closed: the
+    /// engine reads the field as `i64`, so it arrives as `-1` and is rejected
+    /// as an FK against an unknown table.
+    pub const SELF_FK_TABLE_ID: u64 = u64::MAX;
+
     /// A non-FK, non-SERIAL column — the common case. Client-side schema builders
     /// (the SQL planner, the C ABI, the Python driver) synthesize columns through
     /// here; the planner's FK path assigns `fk_table_id`/`fk_col_idx` on the

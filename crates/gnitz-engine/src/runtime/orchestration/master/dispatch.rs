@@ -841,7 +841,7 @@ impl MasterDispatcher {
     pub async fn fan_out_seek(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex<()>>,
+        sal_excl: &Rc<AsyncMutex>,
         target_id: i64,
         pk: u128,
         seek_pk_extra: &[u8],
@@ -878,7 +878,7 @@ impl MasterDispatcher {
     pub async fn fan_out_seek_by_index(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex<()>>,
+        sal_excl: &Rc<AsyncMutex>,
         target_id: i64,
         col_idx: u32,
         key: u128,
@@ -964,7 +964,7 @@ impl MasterDispatcher {
     pub async fn fan_out_seek_by_index_collect(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex<()>>,
+        sal_excl: &Rc<AsyncMutex>,
         target_id: i64,
         seek_col_idx: u64,
         seek_pk: u128,
@@ -1001,7 +1001,7 @@ impl MasterDispatcher {
     async fn fan_out_index_collect_common(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex<()>>,
+        sal_excl: &Rc<AsyncMutex>,
         target_id: i64,
         sal_flag: u32,
         seek_pk: u128,
@@ -1083,7 +1083,7 @@ impl MasterDispatcher {
     pub(super) async fn seek_unique_holder(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex<()>>,
+        sal_excl: &Rc<AsyncMutex>,
         target_id: i64,
         col_indices: PkColList,
         natives: [u128; gnitz_wire::PK_LIST_MAX_COLS],
@@ -1138,7 +1138,7 @@ impl MasterDispatcher {
     pub async fn fan_out_scan(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex<()>>,
+        sal_excl: &Rc<AsyncMutex>,
         unicast: i32,
         target_id: i64,
         client_id: u64,
@@ -1183,7 +1183,7 @@ impl MasterDispatcher {
     pub async fn fan_out_scan_spec(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex<()>>,
+        sal_excl: &Rc<AsyncMutex>,
         unicast: i32,
         target_id: i64,
         client_id: u64,
@@ -1723,7 +1723,7 @@ pub(super) async fn drain_scan_train(
 async fn single_worker(
     disp_ptr: *mut MasterDispatcher,
     reactor: &crate::runtime::reactor::Reactor,
-    sal_excl: &Rc<AsyncMutex<()>>,
+    sal_excl: &Rc<AsyncMutex>,
     target_id: i64,
     flags: u32,
     worker: usize,

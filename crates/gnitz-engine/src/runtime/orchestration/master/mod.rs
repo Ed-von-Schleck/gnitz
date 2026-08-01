@@ -218,7 +218,7 @@ fn alloc_scan_req_ids_and_lease(
 pub(crate) async fn dispatch_scan_fanout<F>(
     disp_ptr: *mut MasterDispatcher,
     reactor: &crate::runtime::reactor::Reactor,
-    sal_excl: &Rc<AsyncMutex<()>>,
+    sal_excl: &Rc<AsyncMutex>,
     unicast: i32,
     submit: F,
 ) -> Result<(Vec<W2mSlot>, [u64; crate::runtime::sal::MAX_WORKERS], ScanLease), String>
@@ -283,7 +283,7 @@ pub(crate) struct MultiScanDispatch {
 pub(crate) async fn dispatch_scan_multi_fanout(
     disp_ptr: *mut MasterDispatcher,
     reactor: &crate::runtime::reactor::Reactor,
-    sal_excl: &Rc<AsyncMutex<()>>,
+    sal_excl: &Rc<AsyncMutex>,
     client_id: u64,
     relations: &[(i64, i32, u16)],
 ) -> Result<Vec<MultiScanDispatch>, String> {

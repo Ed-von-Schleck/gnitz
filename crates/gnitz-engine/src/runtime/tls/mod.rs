@@ -146,7 +146,7 @@ pub(crate) struct TlsShared {
     /// record-order invariant. Teardown never *acquires* it (lock-free
     /// `posix_io::shutdown` aborts a parked holder instead), so it can
     /// never wedge teardown.
-    send_mutex: Rc<AsyncMutex<()>>,
+    send_mutex: Rc<AsyncMutex>,
     /// Ciphertext staging buffer reused across sends (capacity retained).
     /// One buffer serves the flusher and every sender because they all
     /// serialize under `send_mutex`; it is empty whenever the mutex is
@@ -187,7 +187,7 @@ impl TlsShared {
                 closed: false,
                 pump_exited: false,
             }),
-            send_mutex: Rc::new(AsyncMutex::new(())),
+            send_mutex: Rc::new(AsyncMutex::new()),
             cipher_scratch: RefCell::new(Vec::new()),
             flush_tx,
         });

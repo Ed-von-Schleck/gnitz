@@ -111,7 +111,7 @@ pub struct Shared {
     /// SAL-writer exclusivity (III.3b). The committer holds this for
     /// the entire checkpoint + commit emission window so a concurrent
     /// tick task or DDL broadcast cannot interleave a SAL group.
-    pub sal_writer_excl: Rc<AsyncMutex<()>>,
+    pub sal_writer_excl: Rc<AsyncMutex>,
     /// Zone-LSN allocation high-water + durability watermark, shared with the
     /// executor so SCAN/SEEK responses report the same LSN commits publish.
     pub lsn_alloc: Rc<ZoneLsnAllocator>,

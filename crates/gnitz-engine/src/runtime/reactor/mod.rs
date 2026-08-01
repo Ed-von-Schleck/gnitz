@@ -74,7 +74,9 @@ pub use exchange::{ExchangeAccumulator, PendingRelay};
 pub use io::RecvBuf;
 #[cfg(test)]
 pub use sync::join2;
-pub use sync::{join_all_unpin, join_into, mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either, ReadGuard};
+pub use sync::{
+    join_all_unpin, join_into, mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either, ReadGuard, WriteGuard,
+};
 
 // ---------------------------------------------------------------------------
 // CQE user_data encoding (high 8 bits = kind, low 56 bits = id)
@@ -1626,7 +1628,7 @@ mod tests {
     fn async_mutex_serializes_access() {
         let r = make_reactor();
         let order: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
-        let mutex: Rc<AsyncMutex<u32>> = Rc::new(AsyncMutex::new(0));
+        let mutex: Rc<AsyncMutex> = Rc::new(AsyncMutex::new());
         for i in 0u32..3 {
             let m = Rc::clone(&mutex);
             let ord = Rc::clone(&order);
@@ -1648,7 +1650,7 @@ mod tests {
     #[test]
     fn sal_writer_excl_not_held_across_commit_await() {
         let r = make_reactor();
-        let mutex: Rc<AsyncMutex<()>> = Rc::new(AsyncMutex::new(()));
+        let mutex: Rc<AsyncMutex> = Rc::new(AsyncMutex::new());
         // One-shot channel used as a stand-in for "fsync CQE / worker
         // ACK": the fake committer awaits `ack_rx`; the other task
         // sends on `ack_tx` AFTER acquiring the mutex. If the committer
@@ -1698,7 +1700,7 @@ mod tests {
     fn catalog_write_lock_not_held_across_serial_fsync() {
         let r = make_reactor();
         let rwlock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::new());
-        let sal: Rc<AsyncMutex<()>> = Rc::new(AsyncMutex::new(()));
+        let sal: Rc<AsyncMutex> = Rc::new(AsyncMutex::new());
         // Stand-in for the fsync CQE: the SERIAL task awaits it AFTER dropping
         // both locks; the reader sends it after acquiring the read lock.
         let (fsync_tx, fsync_rx) = oneshot::channel::<()>();
@@ -1750,7 +1752,7 @@ mod tests {
     #[test]
     fn sal_writer_excl_not_held_across_relay_recv() {
         let r = make_reactor();
-        let mutex: Rc<AsyncMutex<()>> = Rc::new(AsyncMutex::new(()));
+        let mutex: Rc<AsyncMutex> = Rc::new(AsyncMutex::new());
         // `next_rx` stands in for the relay's `rx.recv()` — the await that
         // follows the SAL write scope.  `commit_tx` stands in for a concurrent
         // committer that must be able to acquire the SAL lock while the relay
@@ -1855,7 +1857,7 @@ mod tests {
     #[test]
     fn async_mutex_cancelled_waiter_does_not_block_remaining() {
         let r = make_reactor();
-        let mutex: Rc<AsyncMutex<()>> = Rc::new(AsyncMutex::new(()));
+        let mutex: Rc<AsyncMutex> = Rc::new(AsyncMutex::new());
         let done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
 
         // Task A: holds the mutex, yields once (letting B and C park), then releases.
@@ -2976,7 +2978,7 @@ mod tests {
     fn sal_writer_excl_serializes_tasks() {
         let r = make_reactor();
         let order: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
-        let mutex: Rc<AsyncMutex<()>> = Rc::new(AsyncMutex::new(()));
+        let mutex: Rc<AsyncMutex> = Rc::new(AsyncMutex::new());
         for i in 0u32..3 {
             let m = Rc::clone(&mutex);
             let ord = Rc::clone(&order);

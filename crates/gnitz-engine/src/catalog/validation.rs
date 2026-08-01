@@ -9,7 +9,7 @@ impl CatalogEngine {
         &self,
         col: &ColumnDef,
         self_table_id: i64,
-        self_pk_index: u32,
+        self_pk: &[u32],
         self_pk_type: u8,
     ) -> Result<(), String> {
         if col.fk_table_id == 0 {
@@ -21,9 +21,12 @@ impl CatalogEngine {
         // legal reference iff it is the parent's lone PK column, or it carries
         // its own UNIQUE index. Mirrors the production planner gate.
         let target_type = if col.fk_table_id == self_table_id {
-            // Self-referential FK: only single-PK self-reference is supported.
-            if col.fk_col_idx != self_pk_index {
-                return Err("FK must reference target PK".into());
+            // Self-referential FK: the table has no UNIQUE index yet, so the
+            // target must be its lone PK column. The downstream probe reads the
+            // referenced value out of the packed PK region, which is the whole
+            // key only when the PK is a single column.
+            if self_pk != [col.fk_col_idx] {
+                return Err("FK must reference the primary key or a UNIQUE-indexed column".into());
             }
             self_pk_type
         } else {
@@ -168,14 +171,10 @@ impl CatalogEngine {
     /// will be retracted by enforce_unique_pk, so we only reject if the NEW value
     /// collides with a DIFFERENT row's entry.
     pub(crate) fn validate_unique_indices(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
-        let entry = self.table_entry(table_id)?;
-
-        // Quick check: any unique index circuits?
-        let has_unique = entry.index_circuits.iter().any(|ic| ic.is_unique);
-        if !has_unique {
+        if !self.has_any_unique_index(table_id) {
             return Ok(());
         }
-
+        let entry = self.table_entry(table_id)?;
         let schema = entry.schema;
         let src_pk_stride = schema.pk_stride() as usize;
         // Borrows `batch` (the `&Batch` param), independent of the `&mut self`
