@@ -33,7 +33,7 @@ class TestFilterRetraction:
             vid, _ = client.resolve_table(sn, "v")
 
             client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=sn)
-            assert len([r for r in client.scan(vid) if r.weight > 0]) == 1
+            assert len(list(client.scan(vid))) == 1
 
             # Retract using the table's actual schema, not a hand-built U64 one.
             # BIGINT PKs are stored as signed I64; a U64-typed batch would encode
@@ -42,7 +42,7 @@ class TestFilterRetraction:
             batch.append(pk=1, val=100, _weight=-1)
             client.push(tid, batch)
 
-            assert len([r for r in client.scan(vid) if r.weight > 0]) == 0
+            assert len(list(client.scan(vid))) == 0
         finally:
             for sql in ["DROP VIEW v", "DROP TABLE t"]:
                 try:
@@ -67,13 +67,13 @@ class TestFilterRetraction:
             vid, _ = client.resolve_table(sn, "v")
 
             client.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
-            assert len([r for r in client.scan(vid) if r.weight > 0]) == 0
+            assert len(list(client.scan(vid))) == 0
 
             batch = gnitz.ZSetBatch(t_schema)
             batch.append(pk=1, val=10, _weight=-1)
             client.push(tid, batch)
 
-            assert len([r for r in client.scan(vid) if r.weight > 0]) == 0
+            assert len(list(client.scan(vid))) == 0
         finally:
             for sql in ["DROP VIEW v", "DROP TABLE t"]:
                 try:
@@ -115,13 +115,13 @@ class TestJoinRetraction:
 
             client.execute_sql("INSERT INTO a VALUES (1, 100)", schema_name=sn)
             client.execute_sql("INSERT INTO b VALUES (1, 999)", schema_name=sn)
-            assert len([r for r in client.scan(vid) if r.weight > 0]) == 1
+            assert len(list(client.scan(vid))) == 1
 
             batch = gnitz.ZSetBatch(a_schema)
             batch.append(pk=1, val=100, _weight=-1)
             client.push(a_tid, batch)
 
-            assert len([r for r in client.scan(vid) if r.weight > 0]) == 0
+            assert len(list(client.scan(vid))) == 0
         finally:
             for sql in ["DROP VIEW v", "DROP TABLE a", "DROP TABLE b"]:
                 try:
@@ -138,13 +138,13 @@ class TestJoinRetraction:
 
             client.execute_sql("INSERT INTO a VALUES (1, 100)", schema_name=sn)
             client.execute_sql("INSERT INTO b VALUES (1, 999)", schema_name=sn)
-            assert len([r for r in client.scan(vid) if r.weight > 0]) == 1
+            assert len(list(client.scan(vid))) == 1
 
             batch = gnitz.ZSetBatch(b_schema)
             batch.append(pk=1, label=999, _weight=-1)
             client.push(b_tid, batch)
 
-            assert len([r for r in client.scan(vid) if r.weight > 0]) == 0
+            assert len(list(client.scan(vid))) == 0
         finally:
             for sql in ["DROP VIEW v", "DROP TABLE a", "DROP TABLE b"]:
                 try:
@@ -180,8 +180,8 @@ class TestViewCascade:
 
             client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=sn)
 
-            assert len([r for r in client.scan(v1_id) if r.weight > 0]) == 1
-            assert len([r for r in client.scan(v2_id) if r.weight > 0]) == 1
+            assert len(list(client.scan(v1_id))) == 1
+            assert len(list(client.scan(v2_id))) == 1
         finally:
             for obj in ["v2", "v1", "t"]:
                 try:
@@ -211,14 +211,14 @@ class TestViewCascade:
 
             tid, t_schema = client.resolve_table(sn, "t")
             client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=sn)
-            assert len([r for r in client.scan(v1_id) if r.weight > 0]) == 1
+            assert len(list(client.scan(v1_id))) == 1
 
             batch = gnitz.ZSetBatch(t_schema)
             batch.append(pk=1, val=100, _weight=-1)
             client.push(tid, batch)
 
-            assert len([r for r in client.scan(v1_id) if r.weight > 0]) == 0
-            assert len([r for r in client.scan(v2_id) if r.weight > 0]) == 0
+            assert len(list(client.scan(v1_id))) == 0
+            assert len(list(client.scan(v2_id))) == 0
         finally:
             for obj in ["v2", "v1", "t"]:
                 try:
@@ -255,7 +255,7 @@ class TestNullThroughOperators:
             client.execute_sql("INSERT INTO t VALUES (1, 10), (2, NULL), (3, 30)",
                                schema_name=sn)
 
-            positive = [r for r in client.scan(vid) if r.weight > 0]
+            positive = list(client.scan(vid))
             assert len(positive) == 2
             pks = sorted(r.pk for r in positive)
             assert pks == [1, 3]
@@ -289,7 +289,7 @@ class TestNullThroughOperators:
             client.execute_sql("INSERT INTO a VALUES (1, NULL)", schema_name=sn)
             client.execute_sql("INSERT INTO b VALUES (1, 42)", schema_name=sn)
 
-            positive = [r for r in client.scan(vid) if r.weight > 0]
+            positive = list(client.scan(vid))
             assert len(positive) == 1
             assert positive[0]["val"] is None
         finally:
@@ -327,11 +327,11 @@ class TestNullThroughOperators:
             )
 
             # Visible layout: row[0]=grp, row[1]=agg (cnt / total).
-            count_rows = [r for r in client.scan(count_vid) if r.weight > 0]
+            count_rows = list(client.scan(count_vid))
             assert len(count_rows) == 1
             assert count_rows[0][1] == 3
 
-            sum_rows = [r for r in client.scan(sum_vid) if r.weight > 0]
+            sum_rows = list(client.scan(sum_vid))
             assert len(sum_rows) == 1
             assert sum_rows[0][1] == 30  # 10+20, null excluded
         finally:
@@ -372,7 +372,7 @@ class TestStringThroughPipeline:
             client.execute_sql("INSERT INTO left_t VALUES (1, 'Alice')", schema_name=sn)
             client.execute_sql("INSERT INTO right_t VALUES (1, 100)", schema_name=sn)
 
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             assert len(rows) == 1
         finally:
             for sql in ["DROP VIEW v", "DROP TABLE left_t", "DROP TABLE right_t"]:
@@ -415,7 +415,7 @@ class TestLargeBatch:
             client.execute_sql(f"INSERT INTO a VALUES {a_vals}", schema_name=sn)
             client.execute_sql(f"INSERT INTO b VALUES {b_vals}", schema_name=sn)
 
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             assert len(rows) == n
         finally:
             for sql in ["DROP VIEW v", "DROP TABLE a", "DROP TABLE b"]:

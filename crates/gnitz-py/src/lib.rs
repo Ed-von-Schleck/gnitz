@@ -276,18 +276,17 @@ pub struct PyRow {
 /// which measured faster than hashing the name — hence no side index to keep
 /// in step with the tuple.
 fn field_pos(fields: &Bound<'_, PyTuple>, name: &Bound<'_, PyString>) -> PyResult<Option<usize>> {
-    // `get_borrowed_item`, as the keyword-plan probes do: the owning `get_item`
-    // spends an incref/decref pair per probe on a reference that outlives
-    // nothing. The identity pass stays separate from the compare pass — fusing
-    // them would run a rich-compare on every field *before* the interned hit,
-    // which is exactly the work the identity pass exists to skip.
-    for i in 0..fields.len() {
-        if fields.get_borrowed_item(i)?.is(name) {
-            return Ok(Some(i));
-        }
+    // `as_slice` borrows the tuple's `ob_item` directly: no call and no refcount
+    // traffic per element, where an indexed read is a bounds-checked
+    // `PyTuple_GetItem` apiece. The identity pass stays separate from the
+    // compare pass — fusing them would run a rich-compare on every field
+    // *before* the interned hit, which is the work the identity pass skips.
+    let items = fields.as_slice();
+    if let Some(i) = items.iter().position(|f| f.is(name)) {
+        return Ok(Some(i));
     }
-    for i in 0..fields.len() {
-        if fields.get_borrowed_item(i)?.eq(name)? {
+    for (i, f) in items.iter().enumerate() {
+        if f.eq(name)? {
             return Ok(Some(i));
         }
     }
@@ -369,13 +368,9 @@ impl PyRow {
 
     pub fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         let fields = self.fields.bind(py);
-        let values = self.values.bind(py);
         let mut parts = Vec::with_capacity(fields.len());
-        for i in 0..fields.len() {
-            let field_obj = fields.get_item(i)?;
-            let f: &str = field_obj.extract()?;
-            let v = values.get_item(i)?;
-            parts.push(format!("{}={}", f, v.repr()?));
+        for (name, val) in fields.as_slice().iter().zip(self.values.bind(py).as_slice()) {
+            parts.push(format!("{}={}", name.extract::<&str>()?, val.repr()?));
         }
         Ok(format!("Row({}, weight={})", parts.join(", "), self.weight))
     }
@@ -395,17 +390,17 @@ impl PyRow {
     }
 
     pub fn _asdict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let fields = self.fields.bind(py);
-        let values = self.values.bind(py);
         let dict = PyDict::new(py);
-        for i in 0..fields.len() {
-            dict.set_item(fields.get_item(i)?, values.get_item(i)?)?;
+        for (name, val) in self
+            .fields
+            .bind(py)
+            .as_slice()
+            .iter()
+            .zip(self.values.bind(py).as_slice())
+        {
+            dict.set_item(name, val)?;
         }
         Ok(dict.unbind())
-    }
-
-    pub fn _tuple(&self, py: Python<'_>) -> Py<PyTuple> {
-        self.values.clone_ref(py)
     }
 }
 
@@ -464,10 +459,9 @@ pub struct PyZSetBatch {
     /// appends. Interned so a dict lookup keyed by a Python source literal or a
     /// `**kwargs` name hits on pointer identity instead of a string compare.
     col_keys: Vec<Py<PyString>>,
-    /// [`WEIGHT_KW`] interned, for `extend`'s per-row lookup.
-    weight_key: Py<PyString>,
-    /// `schema.pk_stride()`, hoisted out of the per-row append.
-    pk_stride: u8,
+    /// Reusable PK scratch for the row under construction — see
+    /// [`RowWriter::new`] for why one buffer can serve every row.
+    key_scratch: gnitz_core::PkTuple,
     /// Column index of each payload column, by dense payload index.
     payload_cols: Vec<usize>,
     /// Is [`WEIGHT_KW`] the name of a column? Then it means that column, not the
@@ -491,24 +485,30 @@ pub struct PyZSetBatch {
 struct RowWriter<'a> {
     batch: &'a mut ZSetBatch,
     schema: &'a Schema,
-    key: gnitz_core::PkTuple,
+    key: &'a mut gnitz_core::PkTuple,
     nulls: u64,
     weight: i64,
 }
 
 impl<'a> RowWriter<'a> {
-    fn new(batch: &'a mut ZSetBatch, schema: &'a Schema, pk_stride: u8, weight: i64) -> Self {
+    /// `key` is the batch's reusable PK scratch, not a fresh tuple: a `PkTuple`
+    /// carries an 80-byte inline buffer that `PkTuple::new` zeroes in full,
+    /// while a row writes and `push_tuple` reads only the leading `pk_stride`
+    /// bytes (typically 8). Reusing it is sound because every row rewrites that
+    /// whole prefix — a PK column with no supplied value is an error on both
+    /// append surfaces — so no stale byte can survive into the next row.
+    fn new(batch: &'a mut ZSetBatch, schema: &'a Schema, key: &'a mut gnitz_core::PkTuple, weight: i64) -> Self {
         RowWriter {
             batch,
             schema,
-            key: gnitz_core::PkTuple::new(pk_stride),
+            key,
             nulls: 0,
             weight,
         }
     }
 
     fn pk(&mut self, ci: usize, val: &Bound<'_, PyAny>) -> PyResult<()> {
-        write_pk_col_into(self.schema, &mut self.key, ci, val)
+        write_pk_col_into(self.schema, self.key, ci, val)
     }
 
     /// `None` — no value supplied, or an explicit `None` — writes NULL.
@@ -527,11 +527,8 @@ impl<'a> RowWriter<'a> {
         }
     }
 
-    /// `&mut self`, not `self`: taking the writer by value moves its whole
-    /// `PkTuple` (an 88-byte inline buffer) stack-to-stack on every row, for a
-    /// `push_tuple` that reads only the key's own stride.
     fn finish(&mut self) {
-        self.batch.pks.push_tuple(&self.key);
+        self.batch.pks.push_tuple(self.key);
         self.batch.weights.push(self.weight);
         self.batch.nulls.push(self.nulls);
     }
@@ -581,11 +578,11 @@ impl PyZSetBatch {
                     schema,
                     col_keys,
                     payload_cols,
-                    pk_stride,
+                    key_scratch,
                     ..
                 } = &mut *s;
                 let schema: &Schema = schema;
-                let mut row = RowWriter::new(batch, schema, *pk_stride, weight);
+                let mut row = RowWriter::new(batch, schema, key_scratch, weight);
                 for &ci in schema.pk_indices() {
                     let val = dict
                         .get_item(col_keys[ci].bind(py))?
@@ -695,11 +692,6 @@ fn variant_mismatch() -> ! {
 /// name.
 const WEIGHT_KW: &str = "_weight";
 
-/// The vectorcall flag CPython ORs into `nargs` to say the callee may borrow the
-/// caller's frame. Not part of the argument count, so it has to be masked off.
-/// pyo3-ffi only exposes it outside the limited API, so it is spelled out here.
-const PY_VECTORCALL_ARGUMENTS_OFFSET: usize = 1usize << (usize::BITS - 1);
-
 /// How many call sites one batch remembers.
 const KW_CACHE_MAX: usize = 32;
 
@@ -722,12 +714,9 @@ struct KwPlan {
 /// one read per name and — unlike a fold of the element addresses — depends on
 /// the names themselves, not on which string objects happen to carry them.
 fn kwnames_fingerprint(kwnames: &Bound<'_, PyTuple>) -> u64 {
-    let n = kwnames.len();
-    let mut fp = n as u64;
-    for i in 0..n {
-        let Ok(item) = kwnames.get_borrowed_item(i) else {
-            return fp;
-        };
+    let items = kwnames.as_slice();
+    let mut fp = items.len() as u64;
+    for item in items {
         // Only a non-str keyword can fail to hash, and `build_kw_plan` rejects
         // those; fold in the failure and let the name compare settle it.
         fp = fp.rotate_left(7) ^ (item.hash().unwrap_or(-1) as u64);
@@ -738,28 +727,17 @@ fn kwnames_fingerprint(kwnames: &Bound<'_, PyTuple>) -> u64 {
 /// Same names in the same order? Interned names settle on pointer identity; the
 /// text compare is the fallback for names that were not interned.
 fn kwnames_eq(a: &Bound<'_, PyTuple>, b: &Bound<'_, PyTuple>) -> bool {
-    let n = a.len();
-    if n != b.len() {
-        return false;
-    }
-    for i in 0..n {
-        let (Ok(x), Ok(y)) = (a.get_borrowed_item(i), b.get_borrowed_item(i)) else {
-            return false;
-        };
-        if x.as_ptr() == y.as_ptr() {
-            continue;
-        }
-        let (Ok(xs), Ok(ys)) = (x.cast::<PyString>(), y.cast::<PyString>()) else {
-            return false;
-        };
-        let (Ok(xc), Ok(yc)) = (xs.to_str(), ys.to_str()) else {
-            return false;
-        };
-        if xc != yc {
-            return false;
-        }
-    }
-    true
+    let (a, b) = (a.as_slice(), b.as_slice());
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            if x.is(y) {
+                return true;
+            }
+            let (Ok(xs), Ok(ys)) = (x.cast::<PyString>(), y.cast::<PyString>()) else {
+                return false;
+            };
+            matches!((xs.to_str(), ys.to_str()), (Ok(xc), Ok(yc)) if xc == yc)
+        })
 }
 
 /// First position in `names` holding `col`.
@@ -779,10 +757,10 @@ impl PyZSetBatch {
     fn build_kw_plan(&self, kwnames: &Bound<'_, PyTuple>) -> PyResult<KwPlan> {
         let nkw = kwnames.len();
         let mut names: Vec<Bound<'_, PyString>> = Vec::with_capacity(nkw);
-        for i in 0..nkw {
-            let item = kwnames.get_item(i)?;
+        for item in kwnames.as_slice() {
             names.push(
-                item.cast_into::<PyString>()
+                item.clone()
+                    .cast_into::<PyString>()
                     .map_err(|_| pyo3::exceptions::PyTypeError::new_err("keywords must be strings"))?,
             );
         }
@@ -889,7 +867,7 @@ impl PyZSetBatch {
                 schema,
                 payload_cols,
                 kw_cache,
-                pk_stride,
+                key_scratch,
                 ..
             } = &mut *s;
             let schema: &Schema = schema;
@@ -901,7 +879,7 @@ impl PyZSetBatch {
                     .map_err(|e| argument_extraction_error(py, WEIGHT_KW, e))?,
                 None => 1,
             };
-            let mut row = RowWriter::new(batch, schema, *pk_stride, weight);
+            let mut row = RowWriter::new(batch, schema, key_scratch, weight);
             for &(pos, ci) in &plan.pks {
                 row.pk(ci, &arg(pos))?;
             }
@@ -936,7 +914,9 @@ unsafe fn append_fastcall(
     nargs: ffi::Py_ssize_t,
     kwnames: *mut ffi::PyObject,
 ) -> PyResult<*mut ffi::PyObject> {
-    if (nargs as usize) & !PY_VECTORCALL_ARGUMENTS_OFFSET != 0 {
+    // The flag CPython ORs into `nargs` to say the callee may borrow the
+    // caller's frame is not part of the count, so mask it off.
+    if (nargs as usize) & !ffi::PY_VECTORCALL_ARGUMENTS_OFFSET != 0 {
         return Err(pyo3::exceptions::PyTypeError::new_err(
             "ZSetBatch.append() takes no positional arguments (columns are keywords)",
         ));
@@ -1025,10 +1005,9 @@ impl PyZSetBatch {
             .any(|(ci, c)| rust_schema.columns[..ci].iter().any(|e| e.name == c.name));
         let batch = ZSetBatch::new(&rust_schema);
         Ok(PyZSetBatch {
-            pk_stride: rust_schema.pk_stride() as u8,
+            key_scratch: gnitz_core::PkTuple::new(rust_schema.pk_stride() as u8),
             batch,
             col_keys,
-            weight_key: PyString::intern(py, WEIGHT_KW).unbind(),
             payload_cols,
             weight_is_column,
             shared_names,
@@ -1058,7 +1037,7 @@ impl PyZSetBatch {
                 let supplied = if s.weight_is_column {
                     None
                 } else {
-                    dict.get_item(s.weight_key.bind(py))?
+                    dict.get_item(pyo3::intern!(py, WEIGHT_KW))?
                 };
                 let (row_weight, reserved) = match supplied {
                     Some(w) => (
@@ -1220,12 +1199,13 @@ fn pk_column_to_pylist(py: Python<'_>, schema: &Schema, batch: &ZSetBatch) -> Py
 /// integer types route through [`u128_value_to_py`] so a PK renders exactly as
 /// the same column would in a payload; everything else is a fixed-width read.
 fn pk_value_to_py(py: Python<'_>, tc: TypeCode, bytes: &[u8]) -> PyResult<Py<PyAny>> {
-    match tc {
-        TypeCode::UUID | TypeCode::U128 | TypeCode::I128 => {
-            u128_value_to_py(py, u128::from_le_bytes(bytes.try_into().unwrap()), tc)
-        }
-        _ => Ok(read_fixed_le(py, tc, bytes)),
+    // `is_wide_int`, not a hand-listed set: the write path keys off the same
+    // predicate, so a newly added 16-byte type cannot fall through to the
+    // fixed-width arm on one side only.
+    if tc.is_wide_int() {
+        return u128_value_to_py(py, u128::from_le_bytes(bytes.try_into().unwrap()), tc);
     }
+    Ok(read_fixed_le(py, tc, bytes))
 }
 
 /// Read one fixed-width value as a Python object (integers as int, floats as
@@ -1490,26 +1470,6 @@ impl PyScanResult {
             Some(d) if !d.batch.is_empty() => make_row(py, d, 0, &mut Vec::with_capacity(d.present.len())),
             _ => Ok(py.None()),
         }
-    }
-
-    fn one(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let n = self.__len__();
-        if n != 1 {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Expected exactly 1 row, got {n}"
-            )));
-        }
-        self.first(py)
-    }
-
-    fn one_or_none(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let n = self.__len__();
-        if n > 1 {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Expected at most 1 row, got {n}"
-            )));
-        }
-        self.first(py)
     }
 
     fn mappings(&self, py: Python<'_>) -> PyResult<Py<PyList>> {

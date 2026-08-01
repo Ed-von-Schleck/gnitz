@@ -14,7 +14,7 @@ def _uid():
 
 
 def _live(client, tid):
-    return [r for r in client.scan(tid) if r.weight > 0]
+    return list(client.scan(tid))
 
 
 # ── Rename table ────────────────────────────────────────────────────────────

@@ -31,7 +31,7 @@ def _uid():
 
 
 def _positive(rows):
-    return [r for r in rows if r.weight > 0]
+    return list(rows)
 
 
 def _cleanup(client, sn, tables=("t",), views=("v",)):

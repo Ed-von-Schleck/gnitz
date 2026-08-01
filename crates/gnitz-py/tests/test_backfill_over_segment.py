@@ -46,22 +46,20 @@ def _cleanup(client, sn, tables=None, views=None):
 
 
 def _weights(client, sn, view, cols):
-    """row-tuple over `cols` → net weight, dropping net-zero rows."""
+    """row-tuple over `cols` → net weight."""
     vid = client.resolve_table(sn, view)[0]
     m = {}
     for r in client.scan(vid):
-        if r.weight == 0:
-            continue
         d = r._asdict()
         key = tuple(d[c] for c in cols)
         m[key] = m.get(key, 0) + r.weight
-    return {k: v for k, v in m.items() if v != 0}
+    return m
 
 
 def _has_exchange_shard(client, vid):
     """True iff any `ExchangeShard` (opcode 20) circuit node belongs to `vid`."""
     return any(
-        r.weight > 0 and r["view_id"] == vid and r["opcode"] == OPCODE_EXCHANGE_SHARD
+        r["view_id"] == vid and r["opcode"] == OPCODE_EXCHANGE_SHARD
         for r in client.scan(CIRCUIT_NODES_TAB)
     )
 

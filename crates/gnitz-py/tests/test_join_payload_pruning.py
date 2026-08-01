@@ -34,12 +34,8 @@ def _cleanup(client, sn, tables=None, views=None):
 
 
 def _rows(client, vid):
-    """Scan rows with positive net weight as (dict, weight) pairs."""
-    out = []
-    for r in client.scan(vid):
-        if r.weight > 0:
-            out.append((r._asdict(), r.weight))
-    return out
+    """Scan rows as (dict, weight) pairs."""
+    return [(r._asdict(), r.weight) for r in client.scan(vid)]
 
 
 class TestJoinPayloadPruning:

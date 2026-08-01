@@ -72,28 +72,6 @@ class TestScanResultAccessors:
         finally:
             _cleanup(client, sn, "t")
 
-    def test_one_and_one_or_none_error_semantics(self, client):
-        """Both demand at most one row; they differ only on the empty case,
-        which `TestEmptyResult` pins."""
-        sn, tid, schema = _table(client)
-        try:
-            _push(client, tid, schema, _THREE_ROWS)
-            with pytest.raises(ValueError):
-                client.scan(tid).one()
-            with pytest.raises(ValueError):
-                client.scan(tid).one_or_none()
-        finally:
-            _cleanup(client, sn, "t")
-
-        sn, tid, schema = _table(client)
-        try:
-            _push(client, tid, schema, [(7, 42)])
-            row = client.scan(tid).one()
-            assert (row.pk, row.val) == (7, 42)
-            assert client.scan(tid).one_or_none().pk == 7
-        finally:
-            _cleanup(client, sn, "t")
-
     def test_scalars_resolution_modes(self, client):
         """`col` resolves three ways — omitted is presented column 0, a name is
         a field lookup, an int is a presented position — and each way that can
@@ -159,9 +137,6 @@ class TestEmptyResult:
             assert list(result) == []
             assert result.all() == []
             assert result.first() is None
-            assert result.one_or_none() is None
-            with pytest.raises(ValueError):
-                result.one()
             assert result.mappings() == []
             assert result.scalars() == []
             assert result.schema is not None
@@ -192,7 +167,7 @@ class TestRowSemantics:
         assert list(row) == list(self._VALUES)
         assert len(row) == 3
         assert row._asdict() == dict(zip(self._FIELDS, self._VALUES))
-        assert row._tuple() == self._VALUES
+        assert tuple(row) == self._VALUES
         assert row.weight == 2
 
     def test_eq_ignores_weight(self):

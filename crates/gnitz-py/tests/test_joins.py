@@ -37,7 +37,7 @@ def _cleanup(client, sn, tables=None, views=None):
 
 
 def _scan_dicts(client, tid):
-    return [r._asdict() for r in client.scan(tid) if r.weight > 0]
+    return client.scan(tid).mappings()
 
 
 class TestJoins:
@@ -246,8 +246,7 @@ class TestJoins:
             vid = client.resolve_table(sn, "v")[0]
             # The view's pair-PK columns are hidden synthetic keys; surface them
             # with include_hidden so (r[0], r[1]) = (t1.id, t2.id).
-            pairs = {(r[0], r[1]) for r in client.scan(vid, include_hidden=True)
-                     if r.weight > 0}
+            pairs = {(r[0], r[1]) for r in client.scan(vid, include_hidden=True)}
             want = {(ai, bi) for (ai, a) in t1 for (bi, b) in t2 if a < b}
             assert pairs == want, f"range join: got {pairs}, want {want}"
         finally:

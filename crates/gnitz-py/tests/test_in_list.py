@@ -31,7 +31,7 @@ def _cleanup(client, sn, *names):
 
 def _live_vals(client, vid):
     """Set of `val` values in the live (positive-weight) view state."""
-    return {r[1] for r in client.scan(vid) if r.weight > 0}
+    return {r[1] for r in client.scan(vid)}
 
 
 # A 500-element set spanning negatives and positives — far past the old
@@ -120,7 +120,7 @@ class TestLargeInList:
             client.execute_sql(f"INSERT INTO g VALUES {rows}", schema_name=sn)
 
             # Only groups whose sum (= grp) is an even number in [0, 48] survive.
-            got = {(r[0], r[1]) for r in client.scan(vh) if r.weight > 0}
+            got = {(r[0], r[1]) for r in client.scan(vh)}
             assert got == {(i, i) for i in keep}
         finally:
             _cleanup(client, sn)

@@ -32,7 +32,7 @@ def _table(client, sn, name="t", cols="pk BIGINT NOT NULL PRIMARY KEY, val BIGIN
 
 def _scan(client, tid):
     """Sorted (pk, val) over positive-weight rows."""
-    return sorted((r.pk, r.val) for r in client.scan(tid) if r.weight > 0)
+    return sorted((r.pk, r.val) for r in client.scan(tid))
 
 
 def _sql(client, sn, *statements):
@@ -500,8 +500,8 @@ def test_fk_parent_and_child_in_one_transaction(client):
              "INSERT INTO child VALUES (10, 1)",
              "INSERT INTO parent VALUES (1)",
              "COMMIT")
-        assert sorted(r.id for r in client.scan(parent) if r.weight > 0) == [1]
-        assert sorted(r.cid for r in client.scan(child) if r.weight > 0) == [10]
+        assert sorted(r.id for r in client.scan(parent)) == [1]
+        assert sorted(r.cid for r in client.scan(child)) == [10]
     finally:
         client.drop_schema(sn)
 
@@ -523,7 +523,7 @@ def test_fk_child_referencing_parent_deleted_in_txn_fails(client):
                  "INSERT INTO child VALUES (10, 1)",  # references a parent gone post-txn
                  "COMMIT")
         # Nothing committed: parent still holds row 1.
-        assert sorted(r.id for r in client.scan(parent) if r.weight > 0) == [1]
+        assert sorted(r.id for r in client.scan(parent)) == [1]
     finally:
         client.drop_schema(sn)
 
@@ -686,7 +686,7 @@ def test_serial_ids_stamped_in_transaction(client):
         second = list(res[0]["rows"])[0].id
         assert second > first  # monotonic within the transaction
         client.execute_sql("COMMIT", schema_name=sn)
-        got = sorted((r.id, r.name) for r in client.scan(t) if r.weight > 0)
+        got = sorted((r.id, r.name) for r in client.scan(t))
         assert got == [(first, "a"), (second, "b")]
     finally:
         client.drop_schema(sn)
@@ -705,7 +705,7 @@ def test_rollback_consumes_serial_ids(client):
         res = client.execute_sql("INSERT INTO t (name) VALUES ('b') RETURNING id", schema_name=sn)
         after = list(res[0]["rows"])[0].id
         assert after > rolled
-        assert sorted((r.id, r.name) for r in client.scan(t) if r.weight > 0) == [(after, "b")]
+        assert sorted((r.id, r.name) for r in client.scan(t)) == [(after, "b")]
     finally:
         client.drop_schema(sn)
 
@@ -865,7 +865,7 @@ def test_compound_pk_transaction(client):
              "UPDATE t SET v = v + 5 WHERE a = 1 AND b = 1",       # committed, compound seek
              "DELETE FROM t WHERE a = 2 AND b = 2",                # delete the born row
              "COMMIT")
-        got = sorted((r.a, r.b, r.v) for r in client.scan(t) if r.weight > 0)
+        got = sorted((r.a, r.b, r.v) for r in client.scan(t))
         assert got == [(1, 1, 15)]
     finally:
         client.drop_schema(sn)
@@ -882,7 +882,7 @@ def test_text_payload_read_your_own_writes(client):
              "UPDATE t SET name = 'bob' WHERE pk = 1",
              "INSERT INTO t VALUES (2, 'carol')",
              "COMMIT")
-        got = sorted((r.pk, r.name) for r in client.scan(t) if r.weight > 0)
+        got = sorted((r.pk, r.name) for r in client.scan(t))
         assert got == [(1, "bob"), (2, "carol")]
     finally:
         client.drop_schema(sn)
@@ -899,7 +899,7 @@ def test_null_payload_through_transaction(client):
              "INSERT INTO t VALUES (2, NULL)",           # born, NULL payload carried
              "UPDATE t SET val = 9 WHERE pk = 1",        # committed NULL → 9
              "COMMIT")
-        got = sorted((r.pk, r.val) for r in client.scan(t) if r.weight > 0)
+        got = sorted((r.pk, r.val) for r in client.scan(t))
         assert got == [(1, 9), (2, None)]
     finally:
         client.drop_schema(sn)
@@ -1105,7 +1105,7 @@ def test_fk_parent_first_order_commits(client):
              "INSERT INTO parent VALUES (1)",
              "INSERT INTO child VALUES (10, 1)",
              "COMMIT")
-        assert sorted(r.id for r in client.scan(parent) if r.weight > 0) == [1]
-        assert sorted(r.cid for r in client.scan(child) if r.weight > 0) == [10]
+        assert sorted(r.id for r in client.scan(parent)) == [1]
+        assert sorted(r.cid for r in client.scan(child)) == [10]
     finally:
         client.drop_schema(sn)

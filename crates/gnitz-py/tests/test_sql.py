@@ -57,7 +57,7 @@ def test_create_view_under_concurrent_adhoc_reads(client, server):
                 while not ddl_done.is_set() and q_count[0] < 400:
                     res = c.execute_sql("SELECT g, COUNT(*) AS n FROM t GROUP BY g", schema_name=sn)
                     assert res[0]["type"] == "Rows"
-                    n = sum(r.n for r in res[0]["rows"] if r.weight > 0)
+                    n = sum(r.n for r in res[0]["rows"])
                     assert n == 200, f"ad-hoc read must see all 200 rows, saw {n}"
                     q_count[0] += 1
         except Exception as e:  # noqa: BLE001
@@ -295,12 +295,12 @@ class TestSqlSelect:
             self._setup_with_rows(client, sn)  # (1,10) … (5,50)
             res = client.execute_sql("SELECT * FROM t WHERE val = 30", schema_name=sn)
             assert res[0]["type"] == "Rows"
-            rows = [r for r in res[0]["rows"] if r.weight > 0]
+            rows = list(res[0]["rows"])
             assert [(r.pk, r.val) for r in rows] == [(3, 30)], f"val = 30 selects exactly row pk=3, got {rows}"
 
             # A non-equality residual routes the same way.
             res = client.execute_sql("SELECT * FROM t WHERE val > 30", schema_name=sn)
-            rows = [r for r in res[0]["rows"] if r.weight > 0]
+            rows = list(res[0]["rows"])
             assert sorted(r.pk for r in rows) == [4, 5], f"val > 30 selects pks 4,5, got {rows}"
             client.execute_sql("DROP TABLE t", schema_name=sn)
         finally:
@@ -377,7 +377,7 @@ class TestSqlSelect:
                 "SELECT s, COUNT(*) AS c FROM t GROUP BY s HAVING s = 'a'", schema_name=sn
             )
             assert res[0]["type"] == "Rows", res[0]
-            got = sorted((r.s, r.c) for r in res[0]["rows"] if r.weight > 0)
+            got = sorted((r.s, r.c) for r in res[0]["rows"])
             assert got == [("a", 1)], f"string HAVING must be served on the direct path, got {got}"
         finally:
             client.drop_schema(sn)
@@ -393,7 +393,7 @@ class TestSqlSelect:
                 "WITH x AS (SELECT * FROM t) SELECT pk FROM x WHERE val > 30", schema_name=sn
             )
             assert res[0]["type"] == "Rows"
-            pks = sorted(r.pk for r in res[0]["rows"] if r.weight > 0)
+            pks = sorted(r.pk for r in res[0]["rows"])
             assert pks == [4, 5], f"the CTE inlines to t and the WHERE filters val > 30, got {pks}"
 
             # Over a view, too.
@@ -401,7 +401,7 @@ class TestSqlSelect:
             res = client.execute_sql(
                 "WITH y AS (SELECT * FROM v_hi) SELECT pk FROM y WHERE val = 50", schema_name=sn
             )
-            pks = sorted(r.pk for r in res[0]["rows"] if r.weight > 0)
+            pks = sorted(r.pk for r in res[0]["rows"])
             assert pks == [5], f"the CTE inlines to the view and the WHERE filters val = 50, got {pks}"
         finally:
             client.drop_schema(sn)
@@ -630,7 +630,7 @@ class TestInListViewFilter:
                 "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, NULL)",
                 schema_name=sn,
             )
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             assert sorted(r.pk for r in rows) == [1, 3]
         finally:
             for sql in ["DROP VIEW v", "DROP TABLE t"]:
@@ -658,7 +658,7 @@ class TestInListViewFilter:
                 "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, NULL)",
                 schema_name=sn,
             )
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             assert sorted(r.pk for r in rows) == [2]
         finally:
             for sql in ["DROP VIEW v", "DROP TABLE t"]:
@@ -686,7 +686,7 @@ class TestInListViewFilter:
                 "INSERT INTO t VALUES (1, 'red'), (2, 'green'), (3, 'blue'), (4, NULL)",
                 schema_name=sn,
             )
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             assert sorted(r.pk for r in rows) == [1, 3]
         finally:
             for sql in ["DROP VIEW v", "DROP TABLE t"]:

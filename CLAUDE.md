@@ -9,8 +9,17 @@ gnitz is **pre-alpha** and not used in production anywhere because it has not be
 **Plans (`plans/`):**
 - Never cite a plan path/filename in code, tests, or comments.
 - Not ground truth: validate against source/tests/git; only edit the plan named for the task.
+- Validate the problem, not just the design: a claimed cost must state the input size that
+  can actually occur (trace the producer — a `MAX_` cap is a trust boundary, not a reachable
+  range) and the largest instance present in the tree.
 - Authoring: state one committed design — no history, no optional/either-or, no "follow-on/future-work" (fold in, spin out a new plan, or drop); include validated snippets; never cross-link plans (state needed facts inline); out-of-scope bugs get their own plan. When a plan is written, all decisions need to be made - no "gates" in plans are allowed.
 - Don't write memories about a specific plan (they're transient).
+
+**Comments:**
+- Say whether a comment describes current behaviour or a cost the code avoids; a
+  counterfactual read as behaviour sends the next reader down the wrong path.
+- Scope a contract to what it governs — a claim true only of its own function must not read
+  as a system invariant.
 
 GnitzDB-specific development guidelines are in the **GnitzDB Developer Guide**
 section at the end of this file.
@@ -630,18 +639,20 @@ anything the optimizer could elide.
    a *different kind* of failure would look like; a clean result on the wrong
    observable closes the case silently. A flagged-but-unverified "probably fine" is
    unverified — run the cheap disconfirming test instead of narrating the doubt.
-3. **Log first, never guess.** Rebuilds are expensive. One well-instrumented
+3. **Confirm the size before optimizing the cost.** A path that is slow only at an input
+   size nothing can produce is not slow. Bound the reachable input from its producer first.
+4. **Log first, never guess.** Rebuilds are expensive. One well-instrumented
    run reveals more than ten speculative attempts.
    - `gnitz_debug!` / `gnitz_info!` for structured logging
    - `GNITZ_LOG_LEVEL=debug` to enable debug-level messages
    - `RUST_BACKTRACE=1` for panic backtraces
-4. **Use the debug binary for crashes.** Release builds silently clamp
+5. **Use the debug binary for crashes.** Release builds silently clamp
    corrupt values.
-5. **Isolate with 1 worker first.** Pass with W=1 but fail with W=4 →
+6. **Isolate with 1 worker first.** Pass with W=1 but fail with W=4 →
    bug is in exchange/fanout, not computation.
-6. **Bisect by sub-path.** Disable the new fast-path to confirm the bug
+7. **Bisect by sub-path.** Disable the new fast-path to confirm the bug
    is in the new code.
-7. **Verify your fix is in the binary.** `make e2e` rebuilds both the
+8. **Verify your fix is in the binary.** `make e2e` rebuilds both the
    server and the Python extension before running tests.
 
 ## See also

@@ -334,7 +334,7 @@ class TestLeftJoin:
                 "INSERT INTO b VALUES (1, 10, 100, 11), (3, 30, 300, 33)",
                 schema_name=sn,
             )
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             by_key = {(r["x"], r["y"]): r["bv"] for r in rows}
             assert by_key == {(10, 100): 11, (20, 200): None, (30, 300): 33}, (
                 "matched left rows carry b.bv; the unmatched (20,200) row is NULL-filled"
@@ -343,7 +343,7 @@ class TestLeftJoin:
             # Incremental: insert the completing b-row → (20,200) becomes a real
             # match and the NULL-fill is retracted.
             client.execute_sql("INSERT INTO b VALUES (4, 20, 200, 44)", schema_name=sn)
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             by_key = {(r["x"], r["y"]): r["bv"] for r in rows}
             assert by_key == {(10, 100): 11, (20, 200): 44, (30, 300): 33}, (
                 "a later matching b-row replaces the NULL-fill with the real join row"

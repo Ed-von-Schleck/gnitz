@@ -292,7 +292,7 @@ def test_view_survives_restart():
             "INSERT INTO t VALUES (2, 100)",
             schema_name="test_persist",
         )
-        rows = {r["pk"]: r for r in conn.scan(vid2) if r.weight > 0}
+        rows = {r["pk"]: r for r in conn.scan(vid2)}
         assert 2 in rows, f"post-restart: pk=2 missing from view, got {rows}"
         assert rows[2]["neg_val"] == -100, (
             f"post-restart: expected neg_val=-100, got {rows[2]['neg_val']}"
@@ -342,7 +342,7 @@ def test_graceful_shutdown_resumes_without_backfill():
         conn = gnitz.connect(sock_path)
         vid2, _ = conn.resolve_table("gs", "v")
         conn.execute_sql("INSERT INTO t VALUES (2, 100)", schema_name="gs")
-        rows = {r["pk"]: r for r in conn.scan(vid2) if r.weight > 0}
+        rows = {r["pk"]: r for r in conn.scan(vid2)}
         assert 1 in rows and rows[1]["neg_val"] == -42, (
             f"post-restart: pre-shutdown row wrong, got {rows}"
         )
@@ -445,7 +445,7 @@ def test_nonexchange_view_retains_unflushed_data_after_restart():
         vid, _ = conn.resolve_table("nxv", "v")
         conn.execute_sql("INSERT INTO t VALUES (7, 70)", schema_name="nxv")
 
-        rows = {r["pk"]: r for r in conn.scan(vid) if r.weight > 0}
+        rows = {r["pk"]: r for r in conn.scan(vid)}
         assert rows[7]["plus1"] == 71, "pre-restart: view should reflect the insert"
 
         conn.close()
@@ -458,7 +458,7 @@ def test_nonexchange_view_retains_unflushed_data_after_restart():
         conn = gnitz.connect(sock_path)
 
         vid2, _ = conn.resolve_table("nxv", "v")
-        rows = {r["pk"]: r for r in conn.scan(vid2) if r.weight > 0}
+        rows = {r["pk"]: r for r in conn.scan(vid2)}
         assert 7 in rows, f"post-restart: pk=7 missing from view, got {rows}"
         assert rows[7]["plus1"] == 71, (
             f"post-restart: expected plus1=71, got {rows[7]['plus1']}"
@@ -558,8 +558,8 @@ def test_nested_nonexchange_views_after_restart():
         conn = gnitz.connect(sock_path)
         v1, _ = conn.resolve_table("nest", "v1")
         v2, _ = conn.resolve_table("nest", "v2")
-        r1 = {r["pk"]: r for r in conn.scan(v1) if r.weight > 0}
-        r2 = {r["pk"]: r for r in conn.scan(v2) if r.weight > 0}
+        r1 = {r["pk"]: r for r in conn.scan(v1)}
+        r2 = {r["pk"]: r for r in conn.scan(v2)}
         assert _weights_by(conn.scan(v1), "pk") == {3: 1, 4: 1}, "v1 not single-counted"
         assert _weights_by(conn.scan(v2), "pk") == {3: 1, 4: 1}, "v2 not single-counted"
         assert r1[3]["a"] == 31 and r1[4]["a"] == 41, f"v1 wrong: {r1}"
@@ -619,7 +619,7 @@ def test_nonexchange_sibling_of_exchange_view_single_counted():
         assert all(x == 1 for x in w.values()), \
             f"vn double-counted: weights {sorted(set(w.values()))}"
 
-        got_vx = {r["g"]: r["s"] for r in conn.scan(vx) if r.weight > 0}
+        got_vx = {r["g"]: r["s"] for r in conn.scan(vx)}
         assert got_vx == exp_vx, f"vx wrong: got {got_vx}, want {exp_vx}"
         conn.close()
         _stop_server(proc)
@@ -667,7 +667,7 @@ def test_nonexchange_view_over_exchange_view_after_restart():
         proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
         conn = gnitz.connect(sock_path)
         vn, _ = conn.resolve_table("nxoe", "vn")
-        got = {r["g"]: r["s1"] for r in conn.scan(vn) if r.weight > 0}
+        got = {r["g"]: r["s1"] for r in conn.scan(vn)}
         assert got == exp_vn, f"vn wrong after restart: got {got}, want {exp_vn}"
         # Each group is one row, exactly once.
         assert _weights_by(conn.scan(vn), "g") == {g: 1 for g in exp_vn}, \
@@ -756,7 +756,7 @@ def test_dml_update_survives_crash():
         # Update pk=2: retract (2,200) + insert (2,999)
         conn.execute_sql("UPDATE t SET val = 999 WHERE pk = 2", schema_name="dur")
 
-        rows_before = {r["pk"]: r["val"] for r in conn.scan(tid) if r.weight > 0}
+        rows_before = {r["pk"]: r["val"] for r in conn.scan(tid)}
         assert rows_before == {1: 100, 2: 999, 3: 300}
         conn.close()
 
@@ -764,7 +764,7 @@ def test_dml_update_survives_crash():
         conn = gnitz.connect(sock_path)
 
         tid2, _ = conn.resolve_table("dur", "t")
-        rows_after = {r["pk"]: r["val"] for r in conn.scan(tid2) if r.weight > 0}
+        rows_after = {r["pk"]: r["val"] for r in conn.scan(tid2)}
         assert rows_after == {1: 100, 2: 999, 3: 300}, (
             f"update lost after crash: {rows_after}"
         )
@@ -795,7 +795,7 @@ def test_dml_delete_survives_crash():
         )
         conn.execute_sql("DELETE FROM t WHERE pk = 2", schema_name="dur")
 
-        rows_before = {r["pk"]: r["val"] for r in conn.scan(tid) if r.weight > 0}
+        rows_before = {r["pk"]: r["val"] for r in conn.scan(tid)}
         assert rows_before == {1: 100, 3: 300}
         conn.close()
 
@@ -803,7 +803,7 @@ def test_dml_delete_survives_crash():
         conn = gnitz.connect(sock_path)
 
         tid2, _ = conn.resolve_table("dur", "t")
-        rows_after = {r["pk"]: r["val"] for r in conn.scan(tid2) if r.weight > 0}
+        rows_after = {r["pk"]: r["val"] for r in conn.scan(tid2)}
         assert rows_after == {1: 100, 3: 300}, (
             f"delete lost after crash: {rows_after}"
         )
@@ -875,7 +875,7 @@ def test_ddl_create_view_survives_crash():
 
         # Insert data so view has something before crash
         conn.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name="dur")
-        rows = [r for r in conn.scan(vid) if r.weight > 0]
+        rows = list(conn.scan(vid))
         assert len(rows) == 1 and rows[0]["inc"] == 11
         conn.close()
 
@@ -887,7 +887,7 @@ def test_ddl_create_view_survives_crash():
 
         # Insert new data — view circuit must be alive
         conn.execute_sql("INSERT INTO t VALUES (2, 20)", schema_name="dur")
-        rows = {r["pk"]: r["inc"] for r in conn.scan(vid_r) if r.weight > 0}
+        rows = {r["pk"]: r["inc"] for r in conn.scan(vid_r)}
         assert rows[2] == 21, f"view not processing after crash: {rows}"
 
         conn.close()
@@ -1016,15 +1016,15 @@ def test_interleaved_ddl_dml_survives_crash():
         assert vid1_r == vid1
 
         # All DML survived
-        t1_rows = {r["pk"]: r["val"] for r in conn.scan(tid1_r) if r.weight > 0}
+        t1_rows = {r["pk"]: r["val"] for r in conn.scan(tid1_r)}
         assert t1_rows == {1: 10, 2: 30}, f"t1 data lost: {t1_rows}"
 
-        t2_rows = {r["pk"]: r["val"] for r in conn.scan(tid2_r) if r.weight > 0}
+        t2_rows = {r["pk"]: r["val"] for r in conn.scan(tid2_r)}
         assert t2_rows == {1: 20}, f"t2 data lost: {t2_rows}"
 
         # View is functional after restart
         conn.execute_sql("INSERT INTO t1 VALUES (3, 50)", schema_name="dur")
-        v_rows = {r["pk"]: r["doubled"] for r in conn.scan(vid1_r) if r.weight > 0}
+        v_rows = {r["pk"]: r["doubled"] for r in conn.scan(vid1_r)}
         assert v_rows[3] == 100, f"view broken after crash: {v_rows}"
 
         conn.close()
@@ -1069,7 +1069,7 @@ def test_no_phantom_data_after_crash():
             "ON CONFLICT (pk) DO UPDATE SET val = EXCLUDED.val",
             schema_name="dur",
         )
-        rows = {r["pk"]: r["val"] for r in conn.scan(tid2) if r.weight > 0}
+        rows = {r["pk"]: r["val"] for r in conn.scan(tid2)}
         assert rows == {1: 111, 2: 222}, f"phantom or stale data: {rows}"
 
         conn.close()
@@ -1173,7 +1173,7 @@ def test_double_crash_recovery():
 
         tid2, _ = conn.resolve_table("dur", "t")
         assert tid2 == tid
-        rows = {r["pk"]: r["val"] for r in conn.scan(tid2) if r.weight > 0}
+        rows = {r["pk"]: r["val"] for r in conn.scan(tid2)}
         assert rows == {1: 100, 2: 200}, f"data lost after double crash: {rows}"
 
         conn.close()
@@ -1306,7 +1306,7 @@ def test_multiworker_view_survives_crash():
         # Push new data — view must process it across workers
         conn.execute_sql("INSERT INTO t VALUES (999, 1)", schema_name="dur")
         v_rows_raw = conn.scan(vid_r)
-        v_rows = {r["pk"]: r["big"] for r in v_rows_raw if r.weight > 0}
+        v_rows = {r["pk"]: r["big"] for r in v_rows_raw}
         assert v_rows.get(999) == 1001, (
             f"view broken after multi-worker crash: "
             f"v_count={len(v_rows)}, v_has_999={999 in v_rows}, vid={vid_r}"
@@ -1408,7 +1408,7 @@ def test_drop_view_survives_crash():
 
         # Base table unaffected
         tid, _ = conn.resolve_table("dur", "t")
-        rows = {r["pk"]: r["val"] for r in conn.scan(tid) if r.weight > 0}
+        rows = {r["pk"]: r["val"] for r in conn.scan(tid)}
         assert rows == {1: 10}
 
         conn.close()
@@ -1455,7 +1455,7 @@ def test_fk_constraint_survives_crash():
             "INSERT INTO child VALUES (3, 10, 99)", schema_name="dur",
         )
         ctid, _ = conn.resolve_table("dur", "child")
-        rows = {r["pk"]: r["pid"] for r in conn.scan(ctid) if r.weight > 0}
+        rows = {r["pk"]: r["pid"] for r in conn.scan(ctid)}
         assert rows == {1: 10, 3: 10}
 
         conn.close()
@@ -1488,7 +1488,7 @@ def test_multiple_upserts_same_pk_crash():
         conn.execute_sql("DELETE FROM t WHERE pk = 2", schema_name="dur")
         conn.execute_sql("INSERT INTO t VALUES (2, 20)", schema_name="dur")
 
-        rows_before = {r["pk"]: r["val"] for r in conn.scan(tid) if r.weight > 0}
+        rows_before = {r["pk"]: r["val"] for r in conn.scan(tid)}
         assert rows_before == {1: 400, 2: 20}
         conn.close()
 
@@ -1496,7 +1496,7 @@ def test_multiple_upserts_same_pk_crash():
         conn = gnitz.connect(sock_path)
 
         tid2, _ = conn.resolve_table("dur", "t")
-        rows_after = {r["pk"]: r["val"] for r in conn.scan(tid2) if r.weight > 0}
+        rows_after = {r["pk"]: r["val"] for r in conn.scan(tid2)}
         assert rows_after == {1: 400, 2: 20}, (
             f"multi-upsert data wrong after crash: {rows_after}"
         )
@@ -1539,7 +1539,7 @@ def test_nullable_columns_survive_crash():
         def snapshot(tid):
             return {
                 r["pk"]: (r["a"], r["b"], r["c"])
-                for r in conn.scan(tid) if r.weight > 0
+                for r in conn.scan(tid)
             }
 
         rows_before = snapshot(tid)
@@ -1708,14 +1708,14 @@ def test_global_aggregate_empty_source_survives_restart():
             "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total FROM t",
             schema_name="gae")
         vid, _ = conn.resolve_table("gae", "v")
-        rows = [r for r in conn.scan(vid) if r.weight > 0]
+        rows = list(conn.scan(vid))
         assert len(rows) == 1 and rows[0]["cnt"] == 0 and rows[0]["total"] is None
         conn.close()
 
         proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
         conn = gnitz.connect(sock_path)
         vid2, _ = conn.resolve_table("gae", "v")
-        rows = [r for r in conn.scan(vid2) if r.weight > 0]
+        rows = list(conn.scan(vid2))
         assert len(rows) == 1, f"post-restart: ground row must survive, got {len(rows)}"
         assert rows[0]["cnt"] == 0 and rows[0]["total"] is None
         conn.close()
@@ -1744,19 +1744,19 @@ def test_global_aggregate_emptied_then_restart():
         vid, _ = conn.resolve_table("gae2", "v")
         conn.execute_sql("INSERT INTO t VALUES (1, 5), (2, 8)", schema_name="gae2")
         conn.execute_sql("DELETE FROM t", schema_name="gae2")
-        rows = [r for r in conn.scan(vid) if r.weight > 0]
+        rows = list(conn.scan(vid))
         assert len(rows) == 1 and rows[0]["cnt"] == 0 and rows[0]["lo"] is None
         conn.close()
 
         proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
         conn = gnitz.connect(sock_path)
         vid2, _ = conn.resolve_table("gae2", "v")
-        rows = [r for r in conn.scan(vid2) if r.weight > 0]
+        rows = list(conn.scan(vid2))
         assert len(rows) == 1, f"post-restart: one ground row, got {len(rows)}"
         assert rows[0]["cnt"] == 0 and rows[0]["lo"] is None
         # And the value returns on a fresh insert after restart.
         conn.execute_sql("INSERT INTO t VALUES (3, 4)", schema_name="gae2")
-        r = [r for r in conn.scan(vid2) if r.weight > 0]
+        r = list(conn.scan(vid2))
         assert len(r) == 1 and r[0]["cnt"] == 1 and r[0]["lo"] == 4
         conn.close()
         _stop_server(proc)
@@ -1784,7 +1784,7 @@ def test_global_aggregate_worker_count_change_reseeds():
             "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total FROM t",
             schema_name="gawc")
         vid, _ = conn.resolve_table("gawc", "v")
-        rows = [r for r in conn.scan(vid) if r.weight > 0]
+        rows = list(conn.scan(vid))
         assert len(rows) == 1 and rows[0]["cnt"] == 0
         conn.close()
 
@@ -1792,7 +1792,7 @@ def test_global_aggregate_worker_count_change_reseeds():
         proc = _crash_and_restart(proc, sock_path, data_dir, workers=2)
         conn = gnitz.connect(sock_path)
         vid2, _ = conn.resolve_table("gawc", "v")
-        rows = [r for r in conn.scan(vid2) if r.weight > 0]
+        rows = list(conn.scan(vid2))
         assert len(rows) == 1, f"new V0 owner must re-seed exactly one row, got {len(rows)}"
         assert rows[0]["cnt"] == 0 and rows[0]["total"] is None
         conn.close()
@@ -1821,14 +1821,14 @@ def test_global_aggregate_replicated_survives_restart():
             "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total FROM t",
             schema_name="garep")
         vid, _ = conn.resolve_table("garep", "v")
-        rows = [r for r in conn.scan(vid) if r.weight > 0]
+        rows = list(conn.scan(vid))
         assert len(rows) == 1 and rows[0]["cnt"] == 0 and rows[0]["total"] is None
         conn.close()
 
         proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
         conn = gnitz.connect(sock_path)
         vid2, _ = conn.resolve_table("garep", "v")
-        rows = [r for r in conn.scan(vid2) if r.weight > 0]
+        rows = list(conn.scan(vid2))
         assert len(rows) == 1, f"replicated ground must survive restart, got {len(rows)}"
         assert rows[0]["cnt"] == 0 and rows[0]["total"] is None
         conn.close()
@@ -1899,7 +1899,7 @@ def test_checkpoint_cut_plus_sigkill_tail_resumes():
         # --- Resume + tail replay: view = cut + tail, all correct. ---
         conn = gnitz.connect(sock_path)
         vid, _ = conn.resolve_table("ct", "v")
-        rows = {r["pk"]: r for r in conn.scan(vid) if r.weight > 0}
+        rows = {r["pk"]: r for r in conn.scan(vid)}
         assert set(rows) == set(range(1, 11)), f"view must reflect cut + tail, got {sorted(rows)}"
         for k in range(1, 11):
             assert rows[k]["dbl"] == k * 20, f"pk={k}: expected dbl={k * 20}, got {rows[k]['dbl']}"
@@ -1958,7 +1958,7 @@ def test_recovery_reset_injection_forces_correct_rebuild():
         proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
         conn = gnitz.connect(sock_path)
         vid, _ = conn.resolve_table("ri", "v")
-        rows = {r["pk"]: r for r in conn.scan(vid) if r.weight > 0}
+        rows = {r["pk"]: r for r in conn.scan(vid)}
         assert set(rows) == set(range(1, 11)), (
             f"gen bump must force a rebuild to the complete base; got {sorted(rows)} "
             f"(a stale resume would show only 1..5)"
@@ -2028,7 +2028,7 @@ def test_replicated_join_survives_worker_count_change():
     def join_rows():
         conn = gnitz.connect(sock_path)
         vid, _ = conn.resolve_table("rj", "j")
-        rows = {r["pk"]: r["v"] for r in conn.scan(vid) if r.weight > 0}
+        rows = {r["pk"]: r["v"] for r in conn.scan(vid)}
         conn.close()
         return rows
 

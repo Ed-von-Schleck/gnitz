@@ -237,7 +237,7 @@ class TestCaseDml:
                 schema_name=sn,
             )
             tid = client.resolve_table(sn, "t")[0]
-            got = sorted((r.id, r.grade) for r in client.scan(tid) if r.weight > 0)
+            got = sorted((r.id, r.grade) for r in client.scan(tid))
             assert got == [(1, 3), (2, 2), (3, 1)]
         finally:
             _cleanup(client, sn)

@@ -32,7 +32,7 @@ def _drop_all(client, sn, tables=(), views=()):
 
 
 def _scan_positive(client, vid):
-    return [r for r in client.scan(vid) if r.weight > 0]
+    return list(client.scan(vid))
 
 
 def _scan_reduce_map(client, vid):
@@ -41,7 +41,7 @@ def _scan_reduce_map(client, vid):
     The visible layout of a GROUP BY view is [group_col, agg] whether the view
     is keyed naturally or by a (hidden) synthetic group PK.
     """
-    return {row[0]: row[1] for row in client.scan(vid) if row.weight > 0}
+    return {row[0]: row[1] for row in client.scan(vid)}
 
 
 # -----------------------------------------------------------------------
@@ -424,7 +424,7 @@ def test_grouped_max_multiworker_retract_current_max(client):
 
 def _scan_global_agg(client, vid):
     """Single positive-weight row of a global (no GROUP BY) aggregate → m."""
-    rows = [r for r in client.scan(vid) if r.weight > 0]
+    rows = list(client.scan(vid))
     assert len(rows) == 1, f"expected one global row, got {len(rows)}"
     return rows[0]["m"]
 
@@ -668,8 +668,8 @@ class TestMultiSchemaExchange:
                 sa_vid, _ = client.resolve_table(sa, "v_agg")
                 sb_vid, _ = client.resolve_table(sb, "v_agg")
 
-                sa_rows = [r for r in client.scan(sa_vid) if r.weight > 0]
-                sb_rows = [r for r in client.scan(sb_vid) if r.weight > 0]
+                sa_rows = list(client.scan(sa_vid))
+                sb_rows = list(client.scan(sb_vid))
 
                 assert len(sa_rows) > 0, "schema A agg view should have results"
                 assert len(sb_rows) > 0, "schema B agg view should have results"
@@ -767,7 +767,7 @@ class TestMultiSchemaExchange:
 
                 # Verify the deep pipeline produces results
                 vid5, _ = client.resolve_table(sb, "v5")
-                rows = [r for r in client.scan(vid5) if r.weight > 0]
+                rows = list(client.scan(vid5))
                 assert len(rows) > 0, "v5 (distinct labels) should have results"
 
             finally:

@@ -20,7 +20,7 @@ def _uid():
 
 def _scan_map(client, tid):
     """{pk: row} over the positive-weight rows."""
-    return {row.pk: row for row in client.scan(tid) if row.weight > 0}
+    return {row.pk: row for row in client.scan(tid)}
 
 
 def _cleanup(client, sn, table="t"):
@@ -123,7 +123,7 @@ def test_residual_div_mod_by_zero_filters_like_a_view(client, schema_name):
         "CREATE VIEW vw AS SELECT pk, v FROM t WHERE 100 / d > 1", schema_name=sn
     )
     view_rows = client.execute_sql("SELECT pk FROM vw", schema_name=sn)[0]["rows"]
-    view_pks = sorted(r.pk for r in view_rows if r.weight > 0)
+    view_pks = sorted(r.pk for r in view_rows)
 
     res = client.execute_sql("DELETE FROM t WHERE 100 / d > 1", schema_name=sn)
     assert res[0]["count"] == 1

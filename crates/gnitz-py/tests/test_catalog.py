@@ -19,7 +19,7 @@ def _uid():
 
 
 def _scan_positive(client, tid):
-    return [r for r in client.scan(tid) if r.weight > 0]
+    return list(client.scan(tid))
 
 
 # ===========================================================================

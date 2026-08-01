@@ -62,16 +62,14 @@ def _values(rows):
 
 
 def _scan_dicts(client, tid):
-    return [r._asdict() for r in client.scan(tid) if r.weight > 0]
+    return client.scan(tid).mappings()
 
 
 def _positive_rows(client, vid):
-    """(rows-as-dicts, weight-by-row-tuple) over a view scan, positive net only."""
+    """(rows-as-dicts, weight-by-row-tuple) over a view scan."""
     rows = []
     wmap = {}
     for r in client.scan(vid):
-        if r.weight == 0:
-            continue
         d = r._asdict()
         rows.append((d, r.weight))
         key = tuple(sorted(d.items()))

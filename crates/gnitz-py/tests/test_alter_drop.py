@@ -150,7 +150,7 @@ def test_drop_not_null_null_after_multiworker(client):
 
         # Total weight is exactly one per PK (no NULL-vs-0 consolidation error).
         tid = client.resolve_table(sn, "t")[0]
-        assert all(r.weight == 1 for r in client.scan(tid) if r.weight != 0)
+        assert all(r.weight == 1 for r in client.scan(tid))
     finally:
         client.drop_schema(sn)
 

@@ -27,7 +27,7 @@ def _cleanup(client, sn):
 
 def _rows(client, sn, view, keys):
     vid = client.resolve_table(sn, view)[0]
-    return sorted(tuple(r._asdict()[k] for k in keys) for r in client.scan(vid) if r.weight > 0)
+    return sorted(tuple(r._asdict()[k] for k in keys) for r in client.scan(vid))
 
 
 def _weights(client, sn, view, keys):

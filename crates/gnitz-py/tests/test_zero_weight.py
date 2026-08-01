@@ -30,7 +30,7 @@ def _str_cols():
 
 
 def _live(client, tid, *cols):
-    return sorted(tuple(getattr(r, c) for c in cols) for r in client.scan(tid) if r.weight > 0)
+    return sorted(tuple(getattr(r, c) for c in cols) for r in client.scan(tid))
 
 
 def _drop(client, sn):

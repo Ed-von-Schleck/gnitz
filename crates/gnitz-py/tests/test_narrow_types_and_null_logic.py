@@ -18,7 +18,7 @@ def _uid():
 
 
 def _scan_map(client, tid):
-    return {row.pk: row for row in client.scan(tid) if row.weight > 0}
+    return {row.pk: row for row in client.scan(tid)}
 
 
 def _cleanup(client, sn, *names):

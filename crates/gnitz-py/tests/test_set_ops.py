@@ -74,7 +74,7 @@ class TestSetOps:
             client.execute_sql("INSERT INTO a VALUES (1, 10), (2, 20)", schema_name=sn)
             client.execute_sql("INSERT INTO b VALUES (1, 10), (2, 20)", schema_name=sn)
 
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             total_weight = sum(r.weight for r in rows)
             assert total_weight == 4, f"expected total weight 4, got {total_weight}"
             vals = sorted(r["val"] for r in rows for _ in range(r.weight))
@@ -860,7 +860,7 @@ class TestSetOpNullability:
             client.execute_sql("INSERT INTO a VALUES (1, 10)", schema_name=sn)
             client.execute_sql("INSERT INTO b VALUES (2, NULL)", schema_name=sn)
 
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             vals = sorted((r["val"] is None, r["val"]) for r in rows)
             # One concrete 10 from the left, one NULL (not 0) from the right.
             assert (False, 10) in vals, f"left value missing: {vals}"

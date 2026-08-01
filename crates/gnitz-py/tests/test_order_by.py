@@ -222,13 +222,11 @@ class TestSortBeforeProjection:
 
 
 def _weight_bag(rows, key):
-    """{key(row) -> summed weight} over positive-weight rows — aggregates entries
-    so the bag is invariant to how a logical multiplicity is split across
-    workers/entries."""
+    """{key(row) -> summed weight} — aggregates entries so the bag is invariant
+    to how a logical multiplicity is split across workers/entries."""
     out = {}
     for r in rows:
-        if r.weight > 0:
-            out[key(r)] = out.get(key(r), 0) + r.weight
+        out[key(r)] = out.get(key(r), 0) + r.weight
     return out
 
 

@@ -30,7 +30,7 @@ def _uid():
 
 
 def _positive(rows):
-    return [r for r in rows if r.weight > 0]
+    return list(rows)
 
 
 def _rows(client, sn, q):
@@ -699,7 +699,7 @@ def test_replicated_full_copy_survives_reboot_on_every_worker(client):
         vals = ", ".join(f"({i}, {(i % 4) + 1})" for i in range(1, 41))
         c.execute_sql(f"INSERT INTO fact VALUES {vals}", schema_name="repl")
 
-        rows = [r for r in c.scan(jid) if r.weight > 0]
+        rows = list(c.scan(jid))
         assert len(rows) == 40, (
             f"join after reboot lost rows ({len(rows)}/40): the replicated dim copy "
             f"did not survive on every worker")
@@ -769,7 +769,7 @@ def test_replicated_union_all_and_distinct(client):
         assert _wmap(all_rows, "pk", "val") == {
             (1, 10): 1, (2, 20): 1, (3, 30): 2, (4, 40): 2, (5, 50): 1, (6, 60): 1,
         }
-        assert sum(r.weight for r in all_rows if r.weight > 0) == 8
+        assert sum(r.weight for r in all_rows) == 8
         assert _wmap(client.scan(v_dist), "pk", "val") == {
             (1, 10): 1, (2, 20): 1, (3, 30): 1, (4, 40): 1, (5, 50): 1, (6, 60): 1,
         }

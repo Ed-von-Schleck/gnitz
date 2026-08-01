@@ -21,7 +21,7 @@ def _uid():
 
 
 def _live(client, vid, include_hidden=False):
-    return [r for r in client.scan(vid, include_hidden=include_hidden) if r.weight > 0]
+    return list(client.scan(vid, include_hidden=include_hidden))
 
 
 def _assert_no_synthetic(rows):

@@ -35,7 +35,7 @@ def _cleanup(client, sn, tables=None, views=None):
 
 def _rows(client, sn, view):
     vid = client.resolve_table(sn, view)[0]
-    return [r._asdict() for r in client.scan(vid) if r.weight > 0]
+    return client.scan(vid).mappings()
 
 
 def _setup(client, sn):

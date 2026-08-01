@@ -44,7 +44,7 @@ def _setup(client, prefix):
 
 
 def _live_rows(client, tid):
-    return {row[0]: row[2] for row in client.scan(tid) if row.weight > 0}
+    return {row[0]: row[2] for row in client.scan(tid)}
 
 
 def _read_loop(target, tid, expected, errors, keep_going):
@@ -189,8 +189,8 @@ def test_ddl_concurrent_with_reclaim_does_not_deadlock(tiny_sal_server):
 
         v1, _ = client.resolve_table(sn, "v1")
         v2, _ = client.resolve_table(sn, "v2")
-        assert {r[0]: r[1] for r in client.scan(v1) if r.weight > 0} == {1: 10, 2: 20}
-        assert {r[0]: r[1] for r in client.scan(v2) if r.weight > 0} == {3: 30}
+        assert {r[0]: r[1] for r in client.scan(v1)} == {1: 10, 2: 20}
+        assert {r[0]: r[1] for r in client.scan(v2)} == {3: 30}
 
 
 # `drain_tick_rows_into` empties `tick_tids` BEFORE the tick runs, so a tick that
@@ -229,7 +229,7 @@ def test_failed_tick_reports_and_requeues(tick_emit_fault_server):
     deadline = time.time() + 30
     got = None
     while time.time() < deadline:
-        got = {row[0]: row[1] for row in client.scan(vid) if row.weight > 0}
+        got = {row[0]: row[1] for row in client.scan(vid)}
         if got == expected:
             break
         time.sleep(0.1)

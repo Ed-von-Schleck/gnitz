@@ -18,17 +18,22 @@ Known limitation: connect + HELLO run synchronously on the calling
 remote host blocks the loop for up to the 10 s connect timeout. Harmless
 for loopback.
 
-Pipeline (batch many pushes, one round-trip)::
+Every method submits when called and returns its future, so pipelining is
+just not awaiting yet — several operations ride one round-trip when they are
+started together and gathered::
 
-    async with conn.pipeline() as pipe:
-        pipe.push(table_id, batch1)
-        pipe.push(table_id, batch2)
-    print(pipe.results)   # [lsn1, lsn2]
+    lsns = await asyncio.gather(conn.push(table_id, batch1),
+                                conn.push(table_id, batch2))
+
+**FIFO ordering caveat:** the transport correlates replies positionally, so
+concurrent operations are safe when homogeneous (all pushes to one table, or
+all reads). Mixing pushes and reads in one in-flight group may produce
+incorrect result ordering in multi-worker mode.
 """
 
 import asyncio
 
-from gnitz._native import AsyncTransport, GnitzError  # noqa: F401
+from gnitz._native import AsyncTransport
 
 
 # Passed to the Rust I/O thread, which resolves a whole batch of futures through
@@ -84,9 +89,8 @@ class AsyncConnection:
     # Each of these submits the operation and hands back its future, rather
     # than wrapping it in a coroutine: `await conn.push(...)` reads and behaves
     # the same, but the operation reaches the I/O thread when it is called
-    # instead of when it is awaited.  That is what lets a caller fire several
-    # and gather them — the whole reason `Pipeline` reached past this class
-    # into the transport.
+    # instead of when it is awaited.  That is what lets a caller start several
+    # and `asyncio.gather` them onto one round-trip.
     def push(self, target_id, batch):
         """Push a batch to a table.  Awaits to the ingest LSN (int)."""
         return self._transport.push(target_id, batch)
@@ -118,66 +122,3 @@ class AsyncConnection:
         self._transport.close()
         return False
 
-    def pipeline(self):
-        """Return a ``Pipeline`` context manager for batching operations.
-
-        Inside the pipeline block, ``push()`` / ``scan()`` fire immediately
-        without waiting for individual responses.  All responses are collected
-        into ``pipe.results`` when the block exits.
-
-        **FIFO ordering caveat:** pipelines are safe for homogeneous batches
-        (all pushes to one table, or all reads).  Mixing pushes and reads
-        in one pipeline may produce incorrect result ordering in multi-worker
-        mode.  Use separate pipelines for different operation types.
-        """
-        return Pipeline(self)
-
-
-class Pipeline:
-    """Collect several in-flight operations and gather them on block exit.
-
-    The connection's own methods already submit on call, so this adds only the
-    bookkeeping: every operation started through the pipeline is remembered,
-    and ``pipe.results`` holds them in submission order after the ``async
-    with`` block.
-    """
-
-    __slots__ = ("_conn", "_futures", "results")
-
-    def __init__(self, conn):
-        self._conn = conn
-        self._futures = []
-        self.results = []
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, *_):
-        if self._futures:
-            if exc_type is None:
-                # Success path: raise on any failure instead of silently
-                # placing exception objects in self.results.
-                self.results = list(await asyncio.gather(*self._futures))
-            else:
-                # Failure path: drain futures without masking the user's exception.
-                await asyncio.gather(*self._futures, return_exceptions=True)
-        return False
-
-    def _track(self, fut):
-        self._futures.append(fut)
-        return fut
-
-    def push(self, target_id, batch):
-        """Queue a push.  Does not ``await`` — sends immediately."""
-        return self._track(self._conn.push(target_id, batch))
-
-    def scan(self, target_id, include_hidden=False):
-        """Queue a scan.  Does not ``await`` — sends immediately."""
-        return self._track(self._conn.scan(target_id, include_hidden))
-
-    def scan_many(self, target_ids, include_hidden=False):
-        """Queue a consistent multi-relation scan.  Does not ``await``.
-
-        Resolves to a ``list`` of ``ScanResult`` in request order.
-        """
-        return self._track(self._conn.scan_many(target_ids, include_hidden))

@@ -41,11 +41,11 @@ def _cleanup(client, sn, tables=None, views=None):
 
 def _scan_map(client, tid):
     """{pk: row} for positive-weight rows."""
-    return {r[0]: r for r in client.scan(tid) if r.weight > 0}
+    return {r[0]: r for r in client.scan(tid)}
 
 
 def _scan_dicts(client, tid):
-    return [r._asdict() for r in client.scan(tid) if r.weight > 0]
+    return client.scan(tid).mappings()
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +234,7 @@ class TestReduceSignedKeyCombinedIndex:
                 "INSERT INTO t VALUES (-5, 1, 100), (-3, 1, 50), (10, 2, 7)",
                 schema_name=sn,
             )
-            by_g = {r["g"]: r for r in client.scan(vid) if r.weight > 0}
+            by_g = {r["g"]: r for r in client.scan(vid)}
             assert (by_g[1]["lo"], by_g[1]["hi"]) == (50, 100)
             assert (by_g[2]["lo"], by_g[2]["hi"]) == (7, 7)
 
@@ -242,14 +242,14 @@ class TestReduceSignedKeyCombinedIndex:
             # g=1 (v=50 at id=-3). Recomputing g=1 reads the combined index's
             # post-delta extreme for g=1 (v=100), never touching the signed PK.
             client.execute_sql("DELETE FROM t WHERE id = -3", schema_name=sn)
-            by_g = {r["g"]: r for r in client.scan(vid) if r.weight > 0}
+            by_g = {r["g"]: r for r in client.scan(vid)}
             assert (by_g[1]["lo"], by_g[1]["hi"]) == (100, 100), (
                 f"after deleting id=-3, g=1 must recompute from id=-5 (v=100); got {by_g[1]}"
             )
 
             # Incremental insert below the current MIN at a fresh negative PK.
             client.execute_sql("INSERT INTO t VALUES (-9, 1, 25)", schema_name=sn)
-            by_g = {r["g"]: r for r in client.scan(vid) if r.weight > 0}
+            by_g = {r["g"]: r for r in client.scan(vid)}
             assert (by_g[1]["lo"], by_g[1]["hi"]) == (25, 100), (
                 f"after inserting v=25 at id=-9, g=1 MIN must drop to 25; got {by_g[1]}"
             )

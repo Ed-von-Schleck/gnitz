@@ -19,7 +19,7 @@ def test_create_drop_view(client):
     batch = gnitz.ZSetBatch(schema)
     batch.append(pk=1, val=42)
     client.push(tid, batch)
-    rows = [r for r in client.scan(vid) if r.weight > 0]
+    rows = list(client.scan(vid))
     assert len(rows) == 1
     assert rows[0].val == 42
 
@@ -83,7 +83,7 @@ def test_view_scan_propagates_inserts(client):
 
     result = client.scan(vid)
     assert len(result) == 3
-    vals = sorted(r.val for r in result if r.weight > 0)
+    vals = sorted(r.val for r in result)
     assert vals == [10, 20, 30]
 
     client.drop_view(sn, "v")

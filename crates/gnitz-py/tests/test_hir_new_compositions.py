@@ -14,7 +14,7 @@ def _uid():
 
 def _rows(client, sn, view, keys):
     vid = client.resolve_table(sn, view)[0]
-    rows = [tuple(r._asdict()[k] for k in keys) for r in client.scan(vid) if r.weight > 0]
+    rows = [tuple(r._asdict()[k] for k in keys) for r in client.scan(vid)]
     return sorted(rows)
 
 

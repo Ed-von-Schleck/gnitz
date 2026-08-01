@@ -38,14 +38,12 @@ def _returned_rows(result):
 
 
 def _view_rows(client, vid, *cols):
-    """{(col values…): net_weight} over positive-weight rows of a view."""
+    """{(col values…): net_weight} over a view's rows."""
     out = {}
     for row in client.scan(vid):
-        if row.weight == 0:
-            continue
         key = tuple(getattr(row, c) for c in cols)
         out[key] = out.get(key, 0) + row.weight
-    return {k: w for k, w in out.items() if w != 0}
+    return out
 
 
 def test_view_except_incremental(client):

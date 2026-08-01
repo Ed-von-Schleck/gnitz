@@ -26,13 +26,13 @@ def _cleanup(client, sn):
 
 def _rows(client, sn, view, keys):
     vid = client.resolve_table(sn, view)[0]
-    return sorted(tuple(r._asdict()[k] for k in keys) for r in client.scan(vid) if r.weight > 0)
+    return sorted(tuple(r._asdict()[k] for k in keys) for r in client.scan(vid))
 
 
 def _rows_ns(client, sn, view, keys):
     """Like _rows but NULL-safe in the sort (NULLs sort last) — for outer joins."""
     vid = client.resolve_table(sn, view)[0]
-    rows = [tuple(r._asdict()[k] for k in keys) for r in client.scan(vid) if r.weight > 0]
+    rows = [tuple(r._asdict()[k] for k in keys) for r in client.scan(vid)]
     return sorted(rows, key=lambda t: tuple((x is None, x) for x in t))
 
 
@@ -156,8 +156,8 @@ class TestMultiwayJoin:
             client.execute_sql("INSERT INTO a VALUES (1, 10, 1)", schema_name=sn)
             client.execute_sql("INSERT INTO b VALUES (10, 20, 2)", schema_name=sn)
             client.execute_sql("INSERT INTO c VALUES (20, 0, 3)", schema_name=sn)
-            rows = [r for r in client.scan(vid) if r.weight > 0]
-            assert [r["x"] for r in rows] == [1], [r._asdict() for r in rows]
+            rows = list(client.scan(vid))
+            assert [r["x"] for r in rows] == [1], rows.mappings()
         finally:
             _cleanup(client, sn)
 
@@ -265,13 +265,13 @@ class TestDirectMultiwayJoin:
             client.execute_sql("INSERT INTO c VALUES (500, 0, 99)", schema_name=sn)
             client.execute_sql("INSERT INTO a VALUES (1, 10, 7)", schema_name=sn)
             vid = client.resolve_table(sn, "v")[0]
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             assert len(rows) == 1
             # The synthetic key is hidden: `SELECT *` exposes only the real columns.
             assert "_join_pk" not in rows[0]._asdict()
             # include_hidden surfaces the physical schema: exactly one `_join_pk`
             # (the final segment's) — no accumulated intermediate PK.
-            raw = [r for r in client.scan(vid, include_hidden=True) if r.weight > 0]
+            raw = list(client.scan(vid, include_hidden=True))
             raw_names = list(raw[0]._asdict().keys())
             assert raw_names.count("_join_pk") == 1, raw_names
         finally:
@@ -804,13 +804,13 @@ class TestMultiwayPruning:
             client.execute_sql("INSERT INTO c VALUES (500, 0, 99)", schema_name=sn)
             client.execute_sql("INSERT INTO a VALUES (1, 10, 7)", schema_name=sn)
             vid = client.resolve_table(sn, "v")[0]
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             assert len(rows) == 1
             # The synthetic key is hidden: `SELECT *` exposes only the real columns.
             assert "_join_pk" not in rows[0]._asdict()
             # include_hidden surfaces the physical schema: one final `_join_pk`, no
             # accumulated intermediate PK (wildcard = no pruning).
-            raw = [r for r in client.scan(vid, include_hidden=True) if r.weight > 0]
+            raw = list(client.scan(vid, include_hidden=True))
             raw_names = list(raw[0]._asdict().keys())
             assert raw_names.count("_join_pk") == 1, raw_names
 
@@ -831,7 +831,7 @@ class TestMultiwayPruning:
             # Two da rows both join db(5); their full rows differ (da.id) → two distinct rows.
             client.execute_sql("INSERT INTO da VALUES (1, 5, 7), (2, 5, 7)", schema_name=sn)
             vdid = client.resolve_table(sn, "vd")[0]
-            drows = [r for r in client.scan(vdid) if r.weight > 0]
+            drows = list(client.scan(vdid))
             assert len(drows) == 2, drows
         finally:
             _cleanup(client, sn)

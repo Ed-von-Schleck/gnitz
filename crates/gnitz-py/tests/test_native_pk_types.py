@@ -48,7 +48,7 @@ def _pks_sorted(client, tid):
     Multi-worker scans concatenate per-worker batches; ordering across
     workers is not guaranteed. Sort here so callers can compare against
     the natural order expected by the test."""
-    return sorted(row[0] for row in client.scan(tid) if row.weight > 0)
+    return sorted(row[0] for row in client.scan(tid))
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +225,7 @@ class TestNativePkDml:
             tid, _ = client.resolve_table(sn, "t")
             client.execute_sql("INSERT INTO t VALUES (-1, 10), (1, 20)", schema_name=sn)
             client.execute_sql("UPDATE t SET v = 99 WHERE id = -1", schema_name=sn)
-            rows = {r[0]: r[1] for r in client.scan(tid) if r.weight > 0}
+            rows = {r[0]: r[1] for r in client.scan(tid)}
             assert rows == {-1: 99, 1: 20}
         finally:
             _cleanup(client, sn, "t")

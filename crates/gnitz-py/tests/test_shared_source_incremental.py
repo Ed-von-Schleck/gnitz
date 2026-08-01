@@ -178,13 +178,13 @@ class TestDirectSelfJoin:
             )
             client.execute_sql("INSERT INTO t VALUES (1, 100), (2, 100), (3, 200)", schema_name=sn)
             vid = client.resolve_table(sn, "j")[0]
-            got = sorted((r._asdict()["aid"], r._asdict()["bid"]) for r in client.scan(vid) if r.weight > 0)
+            got = sorted((r._asdict()["aid"], r._asdict()["bid"]) for r in client.scan(vid))
             # k=100 pairs {1,2}×{1,2}; k=200 pairs {3}×{3}.
             assert got == [(1, 1), (1, 2), (2, 1), (2, 2), (3, 3)], got
 
             # Incremental: a new k=100 row joins every existing k=100 row (both directions).
             client.execute_sql("INSERT INTO t VALUES (4, 100)", schema_name=sn)
-            got = sorted((r._asdict()["aid"], r._asdict()["bid"]) for r in client.scan(vid) if r.weight > 0)
+            got = sorted((r._asdict()["aid"], r._asdict()["bid"]) for r in client.scan(vid))
             assert (4, 1) in got and (1, 4) in got and (4, 4) in got, got
         finally:
             _cleanup(client, sn, tables=["t"], views=["j"])

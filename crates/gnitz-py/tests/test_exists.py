@@ -29,13 +29,11 @@ def _cleanup(client, sn, *names):
 
 
 def _weights(client, vid, col):
-    """{col_value: net_weight} over the view's positive-weight rows."""
+    """{col_value: net_weight} over the view's rows."""
     out = {}
     for row in client.scan(vid):
-        if row.weight == 0:
-            continue
         out[getattr(row, col)] = out.get(getattr(row, col), 0) + row.weight
-    return {k: w for k, w in out.items() if w != 0}
+    return out
 
 
 _CREATE_A = "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NOT NULL)"
@@ -317,9 +315,9 @@ class TestEquiExists:
             bd = client.resolve_table(sn, "star_bd")[0]
             client.execute_sql("INSERT INTO a VALUES (1, 10, 100), (2, 20, 200)", schema_name=sn)
             client.execute_sql("INSERT INTO b VALUES (1, 10, 50)", schema_name=sn)
-            rows = [r for r in client.scan(eq) if r.weight > 0]
+            rows = list(client.scan(eq))
             assert [(r.id, r.k, r.v, r.weight) for r in rows] == [(1, 10, 100, 1)]
-            rows = [r for r in client.scan(bd) if r.weight > 0]
+            rows = list(client.scan(bd))
             assert [(r.id, r.k, r.v, r.weight) for r in rows] == [(1, 10, 100, 1)]
         finally:
             _cleanup(client, sn, "star_eq", "star_bd", "a", "b")
@@ -544,7 +542,7 @@ def _flag_map(client, vid):
 
 def _idset(client, vid):
     """Set of ids in positive-weight rows."""
-    return sorted(r.id for r in client.scan(vid) if r.weight > 0)
+    return sorted(r.id for r in client.scan(vid))
 
 
 class TestMarkSubquery:
@@ -635,10 +633,10 @@ class TestMarkSubquery:
             )
             mk = client.resolve_table(sn, "mk")[0]
             client.execute_sql("INSERT INTO a VALUES (1, 10, 100), (2, 20, 200)", schema_name=sn)
-            got = {r.id: r.c for r in client.scan(mk) if r.weight > 0}
+            got = {r.id: r.c for r in client.scan(mk)}
             assert got == {1: 0, 2: 0}
             client.execute_sql("INSERT INTO b VALUES (1, 10, 7)", schema_name=sn)
-            got = {r.id: r.c for r in client.scan(mk) if r.weight > 0}
+            got = {r.id: r.c for r in client.scan(mk)}
             assert got == {1: 100, 2: 0}  # id=1 matched → v; id=2 unmatched → 0
         finally:
             _cleanup(client, sn, "mk", "a", "b")

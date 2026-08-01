@@ -59,7 +59,7 @@ def test_empty_push_no_desync(client):
     batch = gnitz.ZSetBatch(schema)
     batch.append(pk=2, val=20)
     assert client.push(tid, batch) > 0
-    rows = {r.pk: r.val for r in client.scan(tid) if r.weight > 0}
+    rows = {r.pk: r.val for r in client.scan(tid)}
     assert rows == {1: 10, 2: 20}
     client.drop_table(sn, "t")
     client.drop_schema(sn)
@@ -73,7 +73,7 @@ def test_delete_rows(client):
     client.push(tid, batch)
     client.delete(tid, schema, [2])
     result = client.scan(tid)
-    pks = sorted(row.pk for row in result if row.weight > 0)
+    pks = sorted(row.pk for row in result)
     assert pks == [1, 3]
     client.drop_table(sn, "t")
     client.drop_schema(sn)
@@ -126,7 +126,7 @@ _INSERT_3ROWS = "INSERT INTO t VALUES (1, 100, 10), (2, 200, 20), (3, 300, 30)"
 
 def _rows_map(client, tid):
     """Scan table and return {pk: row} dict (only positive-weight rows)."""
-    return {row.pk: row for row in client.scan(tid) if row.weight > 0}
+    return {row.pk: row for row in client.scan(tid)}
 
 
 def _drop_idx_and_table(client, sn, idx_name):
@@ -526,7 +526,7 @@ class TestStringEdgeCases:
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=1, label="")
             client.push(tid, batch)
-            rows = [r for r in client.scan(tid) if r.weight > 0]
+            rows = list(client.scan(tid))
             assert len(rows) == 1
             assert rows[0].label == ""
         finally:
@@ -542,7 +542,7 @@ class TestStringEdgeCases:
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=1, label=s12)
             client.push(tid, batch)
-            rows = [r for r in client.scan(tid) if r.weight > 0]
+            rows = list(client.scan(tid))
             assert len(rows) == 1
             assert rows[0].label == s12
         finally:
@@ -558,7 +558,7 @@ class TestStringEdgeCases:
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=1, label=long_s)
             client.push(tid, batch)
-            rows = [r for r in client.scan(tid) if r.weight > 0]
+            rows = list(client.scan(tid))
             assert len(rows) == 1
             assert rows[0].label == long_s
         finally:
@@ -572,7 +572,7 @@ class TestStringEdgeCases:
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=1, label=None)
             client.push(tid, batch)
-            rows = [r for r in client.scan(tid) if r.weight > 0]
+            rows = list(client.scan(tid))
             assert len(rows) == 1
             assert rows[0].label is None
         finally:

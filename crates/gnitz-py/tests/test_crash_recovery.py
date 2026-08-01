@@ -841,7 +841,7 @@ def test_unique_reinsert_after_restart():
         conn.execute_sql("INSERT INTO t VALUES (2, 5)", schema_name="ureinsert")
 
         tid, _ = conn.resolve_table("ureinsert", "t")
-        rows = [r for r in conn.scan(tid) if r.weight > 0]
+        rows = list(conn.scan(tid))
         assert len(rows) == 1, f"expected exactly one live row, got {rows}"
         assert rows[0]["id"] == 2 and rows[0]["u"] == 5, f"unexpected row: {rows[0]}"
         conn.close()
@@ -886,7 +886,7 @@ def test_fk_no_orphan_after_restart():
 
         # The rejected child must leave no row behind.
         cid, _ = conn.resolve_table("fkorphan", "c")
-        rows = [r for r in conn.scan(cid) if r.weight > 0]
+        rows = list(conn.scan(cid))
         assert len(rows) == 0, f"orphan child was admitted: {rows}"
         conn.close()
         _stop_server(proc)
@@ -930,7 +930,7 @@ def test_fk_restrict_update_after_restart():
         conn.execute_sql("UPDATE p SET u = 6", schema_name="fkrestrict")
 
         pid, _ = conn.resolve_table("fkrestrict", "p")
-        rows = [r for r in conn.scan(pid) if r.weight > 0]
+        rows = list(conn.scan(pid))
         assert len(rows) == 1 and rows[0]["u"] == 6, f"update did not take: {rows}"
         conn.close()
         _stop_server(proc)
@@ -981,7 +981,7 @@ def test_secondary_index_select_after_restart():
         assert seek_g7() == expected2, "index must track post-restart INSERT/DELETE"
 
         # Base multiplicity is exactly-once (no doubled weights).
-        live = [r for r in conn.scan(tid) if r.weight > 0]
+        live = list(conn.scan(tid))
         assert all(r.weight == 1 for r in live), "base weights must be exactly one"
         assert len(live) == 30, f"expected 30 live rows, got {len(live)}"
         conn.close()

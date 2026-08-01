@@ -30,7 +30,7 @@ def test_push_scan_multiworker(client):
     client.push(tid, batch)
 
     result = client.scan(tid)
-    pks = sorted(row.pk for row in result if row.weight > 0)
+    pks = sorted(row.pk for row in result)
     assert pks == list(range(1, n + 1))
 
     client.drop_table(sn, "big")
@@ -39,7 +39,7 @@ def test_push_scan_multiworker(client):
 
 def _reduce_totals(client, vid):
     """Scan a reduce view -> {group_val: agg_val} over the visible [grp, agg] layout."""
-    return {r[0]: r[1] for r in client.scan(vid) if r.weight > 0}
+    return {r[0]: r[1] for r in client.scan(vid)}
 
 
 def _drop_all(client, sn, tables=(), views=(), indices=()):
@@ -109,7 +109,7 @@ def test_zset_union_invariant(client):
 
         tid, _ = client.resolve_table(sn, "t")
         result = client.scan(tid)
-        pks = sorted(row.pk for row in result if row.weight > 0)
+        pks = sorted(row.pk for row in result)
         assert len(pks) == n, f"expected {n} rows, got {len(pks)}"
         assert pks == list(range(1, n + 1))
     finally:
@@ -180,7 +180,7 @@ def test_unique_pk_across_workers(client):
 
         tid, _ = client.resolve_table(sn, "t")
         result = client.scan(tid)
-        rows = [row for row in result if row.weight > 0]
+        rows = list(result)
         assert len(rows) == 1, f"expected 1 row after upsert, got {len(rows)}"
         assert rows[0].pk == 1
         assert rows[0].val == 200
@@ -207,7 +207,7 @@ def test_workers_ddl_create_table(client):
         client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
 
         tid, _ = client.resolve_table(sn, "t")
-        pks = sorted(r.pk for r in client.scan(tid) if r.weight > 0)
+        pks = sorted(r.pk for r in client.scan(tid))
         assert pks == list(range(1, n + 1))
     finally:
         _drop_all(client, sn, tables=["t"])
@@ -227,7 +227,7 @@ def test_workers_view_passthrough(client):
         client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)", schema_name=sn)
 
         vid, _ = client.resolve_table(sn, "v")
-        pks = sorted(r.pk for r in client.scan(vid) if r.weight > 0)
+        pks = sorted(r.pk for r in client.scan(vid))
         assert pks == [1, 2, 3]
     finally:
         _drop_all(client, sn, views=["v"], tables=["t"])
@@ -248,7 +248,7 @@ def test_workers_view_deletes(client):
         client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
 
         vid, _ = client.resolve_table(sn, "v")
-        pks = sorted(r.pk for r in client.scan(vid) if r.weight > 0)
+        pks = sorted(r.pk for r in client.scan(vid))
         assert pks == [1, 3]
     finally:
         _drop_all(client, sn, views=["v"], tables=["t"])
@@ -273,8 +273,8 @@ def test_workers_view_cascade(client):
 
         client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 50), (3, 100)", schema_name=sn)
 
-        v1_pks = sorted(r.pk for r in client.scan(v1_id) if r.weight > 0)
-        v2_pks = sorted(r.pk for r in client.scan(v2_id) if r.weight > 0)
+        v1_pks = sorted(r.pk for r in client.scan(v1_id))
+        v2_pks = sorted(r.pk for r in client.scan(v2_id))
         assert v1_pks == [2, 3]
         assert v2_pks == [2, 3]
     finally:
@@ -304,7 +304,7 @@ def test_workers_view_ddl_then_push(client):
         client.execute_sql("INSERT INTO t VALUES (2, 20), (3, 30)", schema_name=sn)
 
         vid, _ = client.resolve_table(sn, "v")
-        pks = sorted(r.pk for r in client.scan(vid) if r.weight > 0)
+        pks = sorted(r.pk for r in client.scan(vid))
         # Pre-creation row now visible via backfill
         assert pks == [1, 2, 3]
     finally:
@@ -329,8 +329,8 @@ def test_workers_view_on_view_backfill(client):
         v1_id, _ = client.resolve_table(sn, "v1")
         v2_id, _ = client.resolve_table(sn, "v2")
 
-        v1_pks = sorted(r.pk for r in client.scan(v1_id) if r.weight > 0)
-        v2_pks = sorted(r.pk for r in client.scan(v2_id) if r.weight > 0)
+        v1_pks = sorted(r.pk for r in client.scan(v1_id))
+        v2_pks = sorted(r.pk for r in client.scan(v2_id))
         assert v1_pks == [2, 3], "v1 backfill: expected [2,3] got %s" % v1_pks
         assert v2_pks == [3], "v2 backfill: expected [3] got %s" % v2_pks
     finally:
@@ -355,8 +355,8 @@ def test_workers_multiple_views_same_table(client):
         v1_id, _ = client.resolve_table(sn, "v1")
         v2_id, _ = client.resolve_table(sn, "v2")
 
-        v1_pks = sorted(r.pk for r in client.scan(v1_id) if r.weight > 0)
-        v2_pks = sorted(r.pk for r in client.scan(v2_id) if r.weight > 0)
+        v1_pks = sorted(r.pk for r in client.scan(v1_id))
+        v2_pks = sorted(r.pk for r in client.scan(v2_id))
         assert v1_pks == [2, 3]
         assert v2_pks == [3]
     finally:
@@ -381,7 +381,7 @@ def test_workers_upsert(client):
         )
 
         tid, _ = client.resolve_table(sn, "t")
-        rows = [r for r in client.scan(tid) if r.weight > 0]
+        rows = list(client.scan(tid))
         assert len(rows) == 1
         assert rows[0].pk == 1
         assert rows[0].val == 99
@@ -403,7 +403,7 @@ def test_workers_delete_by_pk(client):
         client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
 
         tid, _ = client.resolve_table(sn, "t")
-        pks = sorted(r.pk for r in client.scan(tid) if r.weight > 0)
+        pks = sorted(r.pk for r in client.scan(tid))
         assert pks == [1, 3]
     finally:
         _drop_all(client, sn, tables=["t"])
@@ -432,7 +432,7 @@ def test_workers_reduce_sum(client):
 
         vid, _ = client.resolve_table(sn, "v")
         # Visible layout: row[0]=grp, row[1]=total (the synthetic group PK is hidden).
-        rows = [r for r in client.scan(vid) if r.weight > 0]
+        rows = list(client.scan(vid))
         totals = {r[0]: r[1] for r in rows}
 
         # group 1: even PKs (2,4,...,100) — sum = 2+4+...+100 = 2550
@@ -526,7 +526,7 @@ def test_trivial_preplan_no_exchange(client):
         vid, _ = client.resolve_table(sn, "v")
         # Visible layout: row[0]=grp, row[1]=cnt (the synthetic group PK is hidden).
         rows = {r[0]: r[1]
-                for r in client.scan(vid) if r.weight > 0}
+                for r in client.scan(vid)}
         # 50 rows in each group
         assert rows[1] == 50, f"group 1 count: expected 50, got {rows.get(1)}"
         assert rows[2] == 50, f"group 2 count: expected 50, got {rows.get(2)}"
@@ -559,7 +559,7 @@ def test_copartitioned_view_no_exchange(client):
         vid, _ = client.resolve_table(sn, "v")
         # The group column `id` coincides with the source PK, so it is the view's
         # natural PK column (read by name), not a duplicated payload column.
-        rows = {r["id"]: r["total"] for r in client.scan(vid) if r.weight > 0}
+        rows = {r["id"]: r["total"] for r in client.scan(vid)}
         for i in range(1, n + 1):
             assert rows.get(i) == i * 10, \
                 f"id={i}: expected {i * 10}, got {rows.get(i)}"
@@ -599,7 +599,7 @@ def test_copartitioned_join(client):
         # Visible layout: row[0]=a.id, row[1]=a.x, row[2]=b.y (the synthetic
         # _join_pk is hidden).
         rows = client.scan(vid)
-        live_rows = [r for r in rows if r.weight > 0]
+        live_rows = list(rows)
         assert len(live_rows) == n, f"expected {n} join rows, got {len(live_rows)}"
         by_id = {r[0]: r for r in live_rows}
         for i in range(1, n + 1):
@@ -677,7 +677,7 @@ def test_workers_concurrent_push_same_table(client, server):
             assert p.exitcode == 0, f"Worker exited with code {p.exitcode}"
 
         result = client.scan(tid)
-        pks = sorted(r.pk for r in result if r.weight > 0)
+        pks = sorted(r.pk for r in result)
         assert pks == list(range(1, total + 1))
     finally:
         _drop_all(client, sn, tables=["t"])
@@ -723,7 +723,7 @@ def test_workers_concurrent_push_multi_table(client, server):
             assert p.exitcode == 0, f"Worker exited with code {p.exitcode}"
 
         for i, tid in enumerate(tids):
-            pks = sorted(r.pk for r in client.scan(tid) if r.weight > 0)
+            pks = sorted(r.pk for r in client.scan(tid))
             assert len(pks) == total_per_table, (
                 f"table t{i}: expected {total_per_table} rows, got {len(pks)}"
             )
@@ -757,7 +757,7 @@ def test_cross_table_push_scan_isolation(client):
 
         # Scan table A — all 10 rows must be present
         result_a = client.scan(tid_a)
-        pks = sorted(row.pk for row in result_a if row.weight > 0)
+        pks = sorted(row.pk for row in result_a)
         assert len(pks) == 10
     finally:
         _drop_all(client, sn, tables=["a", "b"])
@@ -781,13 +781,13 @@ def test_workers_distinct_view(client):
         # Insert enough rows to spread across workers
         vals = ", ".join(f"({i}, {i * 10})" for i in range(1, 51))
         client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
-        rows = [r for r in client.scan(vid) if r.weight > 0]
+        rows = list(client.scan(vid))
         assert len(rows) == 50, f"expected 50, got {len(rows)}"
 
         # Delete a subset and verify retraction
         client.execute_sql("DELETE FROM t WHERE pk = 10", schema_name=sn)
         client.execute_sql("DELETE FROM t WHERE pk = 25", schema_name=sn)
-        rows = [r for r in client.scan(vid) if r.weight > 0]
+        rows = list(client.scan(vid))
         assert len(rows) == 48, f"expected 48 after deletes, got {len(rows)}"
     finally:
         _drop_all(client, sn, tables=["t"], views=["v"])
@@ -846,7 +846,7 @@ def test_empty_batch_barrier(client):
         client.push(tid, batch)
 
         result = client.scan(tid)
-        pks = sorted(row.pk for row in result if row.weight > 0)
+        pks = sorted(row.pk for row in result)
         assert pks == [1]
     finally:
         _drop_all(client, sn, tables=["t"])
@@ -933,7 +933,7 @@ def test_insert_sql_with_filter_view_no_deadlock(client, server):
         )
 
         tid, _ = client.resolve_table(sn, "t")
-        rows = sorted(r.pk for r in client.scan(tid) if r.weight > 0)
+        rows = sorted(r.pk for r in client.scan(tid))
         assert len(rows) == 20 * 50
     finally:
         _drop_all(client, sn, views=["v"], tables=["t"])
@@ -994,7 +994,7 @@ def test_partition_balance_wide_u64_range(client):
         tid, _ = client.resolve_table(sn, "t")
         result = client.scan(tid)
         returned_pks = sorted(
-            ctypes.c_uint64(r.pk).value for r in result if r.weight > 0
+            ctypes.c_uint64(r.pk).value for r in result
         )
         assert returned_pks == sorted(all_pks), (
             f"expected {len(all_pks)} distinct PKs, got {len(returned_pks)}"
@@ -1034,7 +1034,7 @@ def test_push_then_insert_sql_with_view_no_deadlock(client, server):
             label="bulk push + INSERT loop with view",
         )
 
-        rows = sorted(r.pk for r in client.scan(tid) if r.weight > 0)
+        rows = sorted(r.pk for r in client.scan(tid))
         assert len(rows) == n_bulk + 50 * 100
     finally:
         _drop_all(client, sn, views=["v"], tables=["t"])
@@ -1044,7 +1044,7 @@ def _range_pks(client, sn, sql):
     """Sorted PKs from a direct-SELECT range query (positive weight only)."""
     result = client.execute_sql(sql, schema_name=sn)
     assert result[0]["type"] == "Rows"
-    return sorted(row.pk for row in result[0]["rows"] if row.weight > 0)
+    return sorted(row.pk for row in result[0]["rows"])
 
 
 @_NEEDS_MULTI
@@ -1067,7 +1067,7 @@ def test_range_scan_broadcast_merge(client):
         client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
 
         tid, _ = client.resolve_table(sn, "t")
-        ref = {row.pk: row.x for row in client.scan(tid) if row.weight > 0}
+        ref = {row.pk: row.x for row in client.scan(tid)}
 
         def reference(lo, hi, lo_incl, hi_incl):
             return sorted(pk for pk, x in ref.items()
@@ -1182,7 +1182,7 @@ def _view_pairs(client, vid):
     """The live (pair-PK) set of a range-join view: r[0] = a.pk, r[1] = b.pk.
     The pair-PK slots are hidden key columns, so `include_hidden=True` surfaces
     them at their physical positions for this positional read."""
-    return {(r[0], r[1]) for r in client.scan(vid, include_hidden=True) if r.weight > 0}
+    return {(r[0], r[1]) for r in client.scan(vid, include_hidden=True)}
 
 
 def _band_left_ref(a_rows, b_rows, pred):
@@ -1202,7 +1202,7 @@ def _band_left_ref(a_rows, b_rows, pred):
 def _band_left_rows(client, vid):
     """Live LEFT band-join view as {(aid, bid)}, bid None for a null-fill row. The
     view must project `a.id AS aid, b.id AS bid` (b.id is NULL on a null-fill)."""
-    return {(r["aid"], r["bid"]) for r in client.scan(vid) if r.weight > 0}
+    return {(r["aid"], r["bid"]) for r in client.scan(vid)}
 
 
 _RANGE_OPS = [
@@ -1540,7 +1540,7 @@ class TestRangeJoin:
             # — the reduce leaves a count-0 row, which SQL semantics drop.
             def counts():
                 return {r["aid"]: r["n"] for r in client.scan(gid)
-                        if r.weight > 0 and r["n"] > 0}
+                        if r["n"] > 0}
             # a1.x=5 < {10,20,100} → 3 matches; a2.x=50 < {100} → 1 match.
             assert counts() == {1: 3, 2: 1}
             # Delete b(12, y=100): a1 loses one (→2), a2 loses its only (→ gone).
@@ -1586,9 +1586,9 @@ class TestRangeJoin:
 
             assert _view_pairs(client, rj_id) == {(1, 1), (2, 1)}
             # GROUP BY output is [_group_pk, g, n] — read by name, not r[0].
-            gb = {r["g"]: r["n"] for r in client.scan(gb_id) if r.weight > 0}
+            gb = {r["g"]: r["n"] for r in client.scan(gb_id)}
             assert gb == {100: 2, 200: 3}, f"GROUP BY corrupted by branch routing: {gb}"
-            dv = sorted(r["g"] for r in client.scan(dv_id) if r.weight > 0)
+            dv = sorted(r["g"] for r in client.scan(dv_id))
             assert dv == [100, 200], f"DISTINCT corrupted by branch routing: {dv}"
         finally:
             _drop_all(client, sn, views=["rj", "gb", "dv"], tables=["a", "b", "c"])
@@ -1617,14 +1617,13 @@ class TestRangeJoin:
             vid, _ = client.resolve_table(sn, "v")
             # pair-PK = (a.k1, a.k2, b.k1, b.k2) at r[0..4]; payload ax=r[4], by=r[5].
             # The pair-PK slots are hidden, so include_hidden surfaces them here.
-            got = {(r[0], r[1], r[2], r[3]) for r in client.scan(vid, include_hidden=True) if r.weight > 0}
+            got = {(r[0], r[1], r[2], r[3]) for r in client.scan(vid, include_hidden=True)}
             want = {(ak1, ak2, bk1, bk2)
                     for ((ak1, ak2), ax) in a_rows for ((bk1, bk2), by) in b_rows if ax < by}
             assert got == want, "wide pair-PK routing dropped or duplicated matches"
             # The projected payload values are correct on every emitted row.
             for r in client.scan(vid, include_hidden=True):
-                if r.weight > 0:
-                    assert r[4] < r[5], f"projected ax={r[4]} must be < by={r[5]}"
+                assert r[4] < r[5], f"projected ax={r[4]} must be < by={r[5]}"
         finally:
             _drop_all(client, sn, views=["v"], tables=["a", "b"])
 
@@ -1675,7 +1674,7 @@ class TestRangeJoin:
             # Physical layout: [_pair_pk_0=a.id, _pair_pk_1=b.id, a.id, a.x, b.id, b.y].
             # The leading pair-PK slots are hidden; include_hidden reads them here.
             got = {(r[0], r[1]): (r[2], r[3], r[4], r[5])
-                   for r in client.scan(vid, include_hidden=True) if r.weight > 0}
+                   for r in client.scan(vid, include_hidden=True)}
             assert set(got.keys()) == {(1, 5), (1, 6), (2, 6)}
             # pair-PK twins (r[2]=a.id, r[4]=b.id) match the PK region; range cols hold.
             assert got[(1, 5)] == (1, 10, 5, 20)
@@ -2060,7 +2059,7 @@ class TestRangeJoin:
 
             def rowset():
                 return {(r["aid1"], r["aid2"], r["asv"], r["anote"], r["bid"])
-                        for r in client.scan(vid) if r.weight > 0}
+                        for r in client.scan(vid)}
 
             client.execute_sql("INSERT INTO b VALUES (1, 1, 100), (2, 2, 100)", schema_name=sn)
             # Phase 1 — every a matches (string + nullable note in payload).
@@ -2113,7 +2112,7 @@ class TestRangeJoin:
 
             def weighted():
                 return {(r["uk"], r["ulo"], r["bid"]): r.weight
-                        for r in client.scan(vid) if r.weight != 0}
+                        for r in client.scan(vid)}
 
             # inr matches the k=5 group only; the k=9 group has no inr row.
             client.execute_sql("INSERT INTO inr VALUES (100, 5, 50)", schema_name=sn)
@@ -2461,7 +2460,7 @@ class TestRangeJoin:
 
             def rowset():
                 return {(r["aid1"], r["aid2"], r["asv"], r["anote"], r["bid"])
-                        for r in client.scan(vid) if r.weight > 0}
+                        for r in client.scan(vid)}
 
             client.execute_sql("INSERT INTO b VALUES (1, 100)", schema_name=sn)   # MAX = 100
             # Phase 1 — every a matches (x < 100).

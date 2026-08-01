@@ -31,7 +31,7 @@ def _batch(schema, rows, weight=1):
 
 
 def _scan(client, tid):
-    return sorted((row.pk, row.val) for row in client.scan(tid) if row.weight > 0)
+    return sorted((row.pk, row.val) for row in client.scan(tid))
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +217,7 @@ def test_txn_fk_parent_child_insert_both_orders(client):
                 else:
                     txn.push(p_tid, _p_batch(p_sch, [100]))
                     txn.push(c_tid, _c_batch(c_sch, [(1, 100)]))
-            assert sorted(r.id for r in client.scan(p_tid) if r.weight > 0) == [100]
+            assert sorted(r.id for r in client.scan(p_tid)) == [100]
         finally:
             client.drop_schema(sn)
 
@@ -232,7 +232,7 @@ def test_txn_fk_child_referencing_absent_parent_fails(client):
         with pytest.raises(gnitz.GnitzError):
             with client.transaction() as txn:
                 txn.push(c_tid, _c_batch(c_sch, [(1, 999)]))
-        assert sorted(r.id for r in client.scan(c_tid) if r.weight > 0) == []
+        assert sorted(r.id for r in client.scan(c_tid)) == []
     finally:
         client.drop_schema(sn)
 
@@ -250,7 +250,7 @@ def test_txn_fk_restrict_parent_delete_with_committed_child_fails(client):
             with client.transaction() as txn:
                 txn.delete(p_tid, p_sch, [100])
         # parent still present
-        assert sorted(r.id for r in client.scan(p_tid) if r.weight > 0) == [100]
+        assert sorted(r.id for r in client.scan(p_tid)) == [100]
     finally:
         client.drop_schema(sn)
 
@@ -266,8 +266,8 @@ def test_txn_fk_restrict_parent_and_child_delete_passes(client):
         with client.transaction() as txn:
             txn.delete(c_tid, c_sch, [1])
             txn.delete(p_tid, p_sch, [100])
-        assert sorted(r.id for r in client.scan(p_tid) if r.weight > 0) == []
-        assert sorted(r.id for r in client.scan(c_tid) if r.weight > 0) == []
+        assert sorted(r.id for r in client.scan(p_tid)) == []
+        assert sorted(r.id for r in client.scan(c_tid)) == []
     finally:
         client.drop_schema(sn)
 
@@ -285,7 +285,7 @@ def test_txn_fk_restrict_parent_delete_partial_child_delete_fails(client):
             with client.transaction() as txn:
                 txn.delete(c_tid, c_sch, [1])  # only child 1, child 2 still refs 100
                 txn.delete(p_tid, p_sch, [100])
-        assert sorted(r.id for r in client.scan(p_tid) if r.weight > 0) == [100]
+        assert sorted(r.id for r in client.scan(p_tid)) == [100]
     finally:
         client.drop_schema(sn)
 
@@ -301,8 +301,8 @@ def test_txn_fk_parent_delete_reinsert_plus_child_passes(client):
             txn.delete(p_tid, p_sch, [100])
             txn.push(p_tid, _p_batch(p_sch, [100]))
             txn.push(c_tid, _c_batch(c_sch, [(1, 100)]))
-        assert sorted(r.id for r in client.scan(p_tid) if r.weight > 0) == [100]
-        assert sorted((r.id, r.pid) for r in client.scan(c_tid) if r.weight > 0) == [(1, 100)]
+        assert sorted(r.id for r in client.scan(p_tid)) == [100]
+        assert sorted((r.id, r.pid) for r in client.scan(c_tid)) == [(1, 100)]
     finally:
         client.drop_schema(sn)
 
@@ -319,8 +319,8 @@ def test_txn_fk_parent_delete_with_child_repoint_passes(client):
         with client.transaction() as txn:
             txn.delete(p_tid, p_sch, [100])
             txn.push(c_tid, _c_batch(c_sch, [(1, 200)]))  # re-point child 1 → 200
-        assert sorted(r.id for r in client.scan(p_tid) if r.weight > 0) == [200]
-        assert sorted((r.id, r.pid) for r in client.scan(c_tid) if r.weight > 0) == [(1, 200)]
+        assert sorted(r.id for r in client.scan(p_tid)) == [200]
+        assert sorted((r.id, r.pid) for r in client.scan(c_tid)) == [(1, 200)]
     finally:
         client.drop_schema(sn)
 
@@ -358,7 +358,7 @@ def test_txn_unique_secondary_in_bundle_duplicate_rejected(client):
             with client.transaction() as txn:
                 txn.push(tid, _u_batch(sch, [(1, 5)]))
                 txn.push(tid, _u_batch(sch, [(2, 5)]), "error")
-        assert sorted(r.id for r in client.scan(tid) if r.weight > 0) == []
+        assert sorted(r.id for r in client.scan(tid)) == []
     finally:
         client.drop_schema(sn)
 
@@ -374,7 +374,7 @@ def test_txn_unique_secondary_retire_then_take_passes(client):
         with client.transaction() as txn:
             txn.delete(tid, sch, [1])
             txn.push(tid, _u_batch(sch, [(2, 5)]))
-        assert sorted((r.id, r.u) for r in client.scan(tid) if r.weight > 0) == [(2, 5)]
+        assert sorted((r.id, r.u) for r in client.scan(tid)) == [(2, 5)]
     finally:
         client.drop_schema(sn)
 
@@ -390,7 +390,7 @@ def test_txn_unique_secondary_value_shift_passes(client):
         with client.transaction() as txn:
             txn.push(tid, _u_batch(sch, [(1, 5), (2, 6)]))
             txn.push(tid, _u_batch(sch, [(2, 5), (1, 7)]))
-        assert sorted((r.id, r.u) for r in client.scan(tid) if r.weight > 0) == [(1, 7), (2, 5)]
+        assert sorted((r.id, r.u) for r in client.scan(tid)) == [(1, 7), (2, 5)]
     finally:
         client.drop_schema(sn)
 
@@ -406,7 +406,7 @@ def test_txn_unique_secondary_fold_valid_intermediate_collision_passes(client):
             txn.push(tid, _u_batch(sch, [(1, 5)]))
             txn.push(tid, _u_batch(sch, [(1, 6)]))
             txn.push(tid, _u_batch(sch, [(2, 5)]))
-        assert sorted((r.id, r.u) for r in client.scan(tid) if r.weight > 0) == [(1, 6), (2, 5)]
+        assert sorted((r.id, r.u) for r in client.scan(tid)) == [(1, 6), (2, 5)]
     finally:
         client.drop_schema(sn)
 

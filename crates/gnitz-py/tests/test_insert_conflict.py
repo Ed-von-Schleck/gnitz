@@ -45,7 +45,6 @@ def _scan_rows(client, tid):
     return sorted(
         (row.pk, row.val)
         for row in client.scan(tid)
-        if row.weight > 0
     )
 
 

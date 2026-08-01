@@ -32,14 +32,14 @@ def _cleanup(client, sn, tables=None, views=None):
 
 
 def _rows(client, tid):
-    """Current net (weight > 0) rows of a table/view, as dicts."""
-    return [r._asdict() for r in client.scan(tid) if r.weight > 0]
+    """Current rows of a table/view, as dicts."""
+    return client.scan(tid).mappings()
 
 
 def _view_pairs(client, vid):
     """The (aid, bid) multiset of a residual view as a set (INNER over unique-PK
     base tables emits each pair exactly once)."""
-    return {(r["aid"], r["bid"]) for r in client.scan(vid) if r.weight > 0}
+    return {(r["aid"], r["bid"]) for r in client.scan(vid)}
 
 
 def _brute(a_rows, b_rows, pred):

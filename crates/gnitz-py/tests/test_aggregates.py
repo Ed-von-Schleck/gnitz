@@ -344,7 +344,7 @@ class TestGroupBy:
             )
 
             rows = client.scan(vid)
-            by_key = {(r["a"], r["b"]): r["lo"] for r in rows if r.weight > 0}
+            by_key = {(r["a"], r["b"]): r["lo"] for r in rows}
             assert len(by_key) == len(groups), f"expected {len(groups)} groups, got {by_key}"
             for key, lo in expected.items():
                 assert by_key[key] == lo, f"group {key}: expected MIN {lo}, got {by_key[key]}"
@@ -353,12 +353,12 @@ class TestGroupBy:
             # it: the byte-form AVI must lower the MIN and then recover the prior
             # extremum from the remaining entries of that exact (negative) group.
             client.execute_sql(f"INSERT INTO t VALUES ({pk + 1}, -5, -7, -999)", schema_name=sn)
-            by_key = {(r["a"], r["b"]): r["lo"] for r in client.scan(vid) if r.weight > 0}
+            by_key = {(r["a"], r["b"]): r["lo"] for r in client.scan(vid)}
             assert by_key[(-5, -7)] == -999, "smaller value must lower the negative group's MIN"
             assert by_key[(5, 7)] == expected[(5, 7)], "positive twin must be unaffected"
 
             client.execute_sql(f"DELETE FROM t WHERE pk = {pk + 1}", schema_name=sn)
-            by_key = {(r["a"], r["b"]): r["lo"] for r in client.scan(vid) if r.weight > 0}
+            by_key = {(r["a"], r["b"]): r["lo"] for r in client.scan(vid)}
             assert by_key[(-5, -7)] == expected[(-5, -7)], (
                 "retracting the extremum must restore the negative group's next-best MIN"
             )
@@ -402,19 +402,19 @@ class TestGroupBy:
                 f"(3, 20, 70), (4, 20, 30)",
                 schema_name=sn,
             )
-            by_g = {r["g"]: r for r in client.scan(vid) if r.weight > 0}
+            by_g = {r["g"]: r for r in client.scan(vid)}
             assert by_g[10]["lo"] == 50 and by_g[10]["hi"] == 200, by_g
             assert by_g[20]["lo"] == 30 and by_g[20]["hi"] == 70, by_g
 
             # Delete group 10's MIN holder (id=2) → MIN recomputes to 100 from the
             # combined value index's post-delta extreme for group 10.
             client.execute_sql("DELETE FROM t WHERE id = 2", schema_name=sn)
-            by_g = {r["g"]: r for r in client.scan(vid) if r.weight > 0}
+            by_g = {r["g"]: r for r in client.scan(vid)}
             assert by_g[10]["lo"] == 100 and by_g[10]["hi"] == 200, by_g
 
             # Delete group 10's MAX holder (the huge id) → MAX recomputes to 100.
             client.execute_sql(f"DELETE FROM t WHERE id = {big}", schema_name=sn)
-            by_g = {r["g"]: r for r in client.scan(vid) if r.weight > 0}
+            by_g = {r["g"]: r for r in client.scan(vid)}
             assert by_g[10]["lo"] == 100 and by_g[10]["hi"] == 100, by_g
             assert by_g[20]["lo"] == 30 and by_g[20]["hi"] == 70, by_g
 
@@ -449,7 +449,7 @@ class TestGroupBy:
                 "INSERT INTO t VALUES " + ", ".join(f"({a}, {b})" for a, b in rows),
                 schema_name=sn,
             )
-            got = {(r["a"], r["b"]): r["mb"] for r in client.scan(vid) if r.weight > 0}
+            got = {(r["a"], r["b"]): r["mb"] for r in client.scan(vid)}
             assert len(got) == len(rows), f"expected {len(rows)} groups, got {got}"
             for a, b in rows:
                 assert got[(a, b)] == b, f"MIN(b) for ({a},{b}) must round-trip to {b}, got {got[(a, b)]}"
@@ -457,7 +457,7 @@ class TestGroupBy:
             # Delete the row at a byte-swap-sensitive value: its group vanishes,
             # the others are untouched.
             client.execute_sql("DELETE FROM t WHERE a = 1 AND b = 256", schema_name=sn)
-            got = {(r["a"], r["b"]): r["mb"] for r in client.scan(vid) if r.weight > 0}
+            got = {(r["a"], r["b"]): r["mb"] for r in client.scan(vid)}
             assert (1, 256) not in got, "deleted group must vanish"
             assert got[(1, 1)] == 1 and got[(2, 65536)] == 65536, got
 
@@ -493,24 +493,24 @@ class TestGroupBy:
                 "INSERT INTO t VALUES " + ", ".join(f"({a}, {b})" for a, b in rows),
                 schema_name=sn,
             )
-            by_a = {r["a"]: r for r in client.scan(vid) if r.weight > 0}
+            by_a = {r["a"]: r for r in client.scan(vid)}
             assert by_a[100]["lo"] == 1 and by_a[100]["hi"] == 65536, by_a
             assert by_a[300]["lo"] == -5 and by_a[300]["hi"] == 10, by_a
 
             # Delete group 100's MAX holder (b=65536) → MAX falls to 256 (the
             # byte-swap twin of 1: order must survive the decode).
             client.execute_sql("DELETE FROM t WHERE a = 100 AND b = 65536", schema_name=sn)
-            by_a = {r["a"]: r for r in client.scan(vid) if r.weight > 0}
+            by_a = {r["a"]: r for r in client.scan(vid)}
             assert by_a[100]["lo"] == 1 and by_a[100]["hi"] == 256, by_a
 
             # Delete group 100's MIN holder (b=1) → MIN rises to 100.
             client.execute_sql("DELETE FROM t WHERE a = 100 AND b = 1", schema_name=sn)
-            by_a = {r["a"]: r for r in client.scan(vid) if r.weight > 0}
+            by_a = {r["a"]: r for r in client.scan(vid)}
             assert by_a[100]["lo"] == 100 and by_a[100]["hi"] == 256, by_a
 
             # Delete group 300's MIN holder (b=-5) → MIN rises to 4.
             client.execute_sql("DELETE FROM t WHERE a = 300 AND b = -5", schema_name=sn)
-            by_a = {r["a"]: r for r in client.scan(vid) if r.weight > 0}
+            by_a = {r["a"]: r for r in client.scan(vid)}
             assert by_a[300]["lo"] == 4 and by_a[300]["hi"] == 10, by_a
 
             client.execute_sql("DROP VIEW v", schema_name=sn)
@@ -686,13 +686,13 @@ class TestGroupBy:
                 "INSERT INTO t VALUES (1, 10, 5), (2, 10, NULL)",
                 schema_name=sn,
             )
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             assert len(rows) == 1
             assert abs(rows[0]["avg_amt"] - 5.0) < 0.001
 
             # Delete the only non-NULL contributor; the NULL row keeps the group.
             client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             assert len(rows) == 1, f"group must persist, got {rows}"
             assert rows[0]["category"] == 10
             assert rows[0]["avg_amt"] is None, (
@@ -736,7 +736,7 @@ class TestGroupBy:
                 "INSERT INTO t VALUES (1, 10, 5), (2, 10, NULL)",
                 schema_name=sn,
             )
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             assert len(rows) == 1
             assert rows[0]["k"] == 10
             assert rows[0]["sm"] == 5, f"SUM(5, NULL) = 5, got {rows[0]['sm']}"
@@ -745,7 +745,7 @@ class TestGroupBy:
             # Retract the last non-NULL contributor. The NULL row keeps the group
             # alive (c=1), so SUM over {NULL} must be NULL, not 0.
             client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             assert len(rows) == 1, f"group must persist via its NULL row, got {rows}"
             assert rows[0]["k"] == 10
             assert rows[0]["c"] == 1
@@ -785,7 +785,7 @@ class TestGroupBy:
                 "INSERT INTO t VALUES (1, 10, NULL), (2, 10, NULL), (3, 20, 7)",
                 schema_name=sn,
             )
-            rows = {r["k"]: r for r in client.scan(vid) if r.weight > 0}
+            rows = {r["k"]: r for r in client.scan(vid)}
             assert rows[10]["c"] == 2
             assert rows[10]["sm"] is None, (
                 f"SUM of an all-NULL group must be NULL, got {rows[10]['sm']}")
@@ -831,7 +831,7 @@ class TestGroupBy:
                 "INSERT INTO t VALUES (1, 10, NULL), (2, 10, NULL)",
                 schema_name=sn,
             )
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             assert len(rows) == 1
             assert rows[0]["k"] == 10
             assert rows[0]["c"] == 2
@@ -842,7 +842,7 @@ class TestGroupBy:
             # retracted *as NULL* to cancel tick 1 byte-for-byte; a bad retraction
             # (MIN re-emitted as 0) leaves the stale NULL row live → two rows here.
             client.execute_sql("INSERT INTO t VALUES (3, 10, 5)", schema_name=sn)
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             assert len(rows) == 1, f"stale MIN=NULL ghost not cancelled: {rows}"
             assert rows[0]["c"] == 3
             assert rows[0]["mn"] == 5, f"MIN must be 5, got {rows[0]['mn']}"
@@ -850,7 +850,7 @@ class TestGroupBy:
 
             # Tick 3: retract the only non-NULL row → MIN returns to NULL, c=2.
             client.execute_sql("DELETE FROM t WHERE pk = 3", schema_name=sn)
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             assert len(rows) == 1, f"group must persist via its NULL rows: {rows}"
             assert rows[0]["c"] == 2
             assert rows[0]["mn"] is None, (
@@ -893,13 +893,13 @@ class TestGroupBy:
                 "INSERT INTO t VALUES (1, 10, 5), (2, 10, NULL), (3, 20, NULL)",
                 schema_name=sn,
             )
-            rows = {r["k"]: r for r in client.scan(vid) if r.weight > 0}
+            rows = {r["k"]: r for r in client.scan(vid)}
             assert set(rows) == {20}, f"only the all-NULL group passes HAVING, got {set(rows)}"
             assert rows[20]["c"] == 1
 
             # Retract k=10's last non-NULL value → its SUM becomes NULL → admitted.
             client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-            rows = {r["k"]: r for r in client.scan(vid) if r.weight > 0}
+            rows = {r["k"]: r for r in client.scan(vid)}
             assert set(rows) == {10, 20}, (
                 f"k=10 enters HAVING once its SUM becomes NULL, got {set(rows)}")
             assert rows[10]["c"] == 1
@@ -940,7 +940,7 @@ class TestGroupBy:
                 "INSERT INTO t VALUES (1, 10, 5), (2, 10, -5), (3, 20, 5), (4, 20, NULL)",
                 schema_name=sn,
             )
-            rows = {r["k"]: r for r in client.scan(vid) if r.weight > 0}
+            rows = {r["k"]: r for r in client.scan(vid)}
             assert set(rows) == {10}, f"only the genuine-zero group passes, got {set(rows)}"
             assert rows[10]["c"] == 2
 
@@ -948,7 +948,7 @@ class TestGroupBy:
             # non-NULL contributor the SUM is NULL → SUM(v) = 0 is UNKNOWN → still
             # excluded. A raw (un-gated) SUM column would read 0 and wrongly admit it.
             client.execute_sql("DELETE FROM t WHERE pk = 3", schema_name=sn)
-            rows = {r["k"]: r for r in client.scan(vid) if r.weight > 0}
+            rows = {r["k"]: r for r in client.scan(vid)}
             assert set(rows) == {10}, (
                 f"a group whose SUM became NULL must not satisfy SUM(v) = 0, got {set(rows)}")
             assert rows[10]["c"] == 2
@@ -1109,7 +1109,7 @@ class TestGroupBy:
             client.execute_sql("DELETE FROM orders WHERE pk = 1", schema_name=sn)
             client.execute_sql("DELETE FROM orders WHERE pk = 2", schema_name=sn)
 
-            by_cat = {r["category"]: r["cnt"] for r in client.scan(vid) if r.weight > 0}
+            by_cat = {r["category"]: r["cnt"] for r in client.scan(vid)}
             # Category 10 is emptied → the group must VANISH (cardinality 0), not
             # survive as a cnt=0 zombie. Category 20 stays at cnt=1.
             assert 10 not in by_cat, f"emptied group must be absent, got {by_cat}"
@@ -1140,7 +1140,7 @@ class TestGroupBy:
             assert next(iter(rows))["total"] == 100
 
             client.execute_sql("DELETE FROM orders WHERE pk = 1", schema_name=sn)
-            totals = {r["category"]: r["total"] for r in client.scan(vid) if r.weight > 0}
+            totals = {r["category"]: r["total"] for r in client.scan(vid)}
             # Emptied SUM-only group must VANISH, not survive as a total=0 zombie.
             assert 10 not in totals, f"emptied group must be absent, got {totals}"
 
@@ -1149,7 +1149,7 @@ class TestGroupBy:
                 "INSERT INTO orders VALUES (1, 10, 100, 50)",
                 schema_name=sn,
             )
-            totals = {r["category"]: r["total"] for r in client.scan(vid) if r.weight > 0}
+            totals = {r["category"]: r["total"] for r in client.scan(vid)}
             assert totals[10] == 100
 
             client.execute_sql("DROP VIEW v", schema_name=sn)
@@ -1197,7 +1197,7 @@ class TestGroupBy:
                 "INSERT INTO t VALUES (1, 10, 5), (2, 20, NULL), (3, 30, 0)",
                 schema_name=sn,
             )
-            groups = {r["k"] for r in client.scan(vid) if r.weight > 0}
+            groups = {r["k"] for r in client.scan(vid)}
             assert groups == expected, (
                 f"HAVING {pred}: expected groups {expected}, got {groups} "
                 "(a NULL aggregate compared as 0?)")
@@ -1288,7 +1288,7 @@ class TestGroupByPkAndNullable:
                 "INSERT INTO orders VALUES (1, 10, 100), (2, 10, 200), (3, 20, 300)",
                 schema_name=sn,
             )
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             assert len(rows) == 3
             by_pk = {r["pk"]: r for r in rows}
             assert by_pk[1]["category"] == 10 and by_pk[1]["cnt"] == 1
@@ -1326,7 +1326,7 @@ class TestGroupByPkAndNullable:
                 f"INSERT INTO items VALUES ('{uuid_a}', 10), ('{uuid_b}', 20)",
                 schema_name=sn,
             )
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             assert len(rows) == 2
             by_pk = {r["pk"]: r for r in rows}
             assert by_pk[uuid_a]["category"] == 10 and by_pk[uuid_a]["cnt"] == 1
@@ -1361,7 +1361,7 @@ class TestGroupByPkAndNullable:
                 "INSERT INTO t VALUES (1, NULL), (2, 0), (3, NULL), (4, 7)",
                 schema_name=sn,
             )
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             # Three distinct groups: NULL, 0, 7
             assert len(rows) == 3, f"expected 3 groups, got {len(rows)}: {rows}"
             counts = {r["grp"]: r["cnt"] for r in rows}
@@ -1427,7 +1427,7 @@ class TestReducePathRegressions:
                 "INSERT INTO t VALUES (-5, 10), (-1, 20), (0, 30), (7, 40)",
                 schema_name=sn,
             )
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             by_pk = {r["pk"]: r for r in rows}
             assert set(by_pk) == {-5, -1, 0, 7}, f"signed PKs must round-trip: {sorted(by_pk)}"
             assert by_pk[-5]["category"] == 10
@@ -1463,7 +1463,7 @@ class TestReducePathRegressions:
                 "INSERT INTO t VALUES (1, 9, 1.5), (2, 9, -2.25), (3, 9, 4.0)",
                 schema_name=sn,
             )
-            row = next(r for r in client.scan(vid) if r.weight > 0)
+            row = next(r for r in client.scan(vid))
             assert abs(row["lo"] - (-2.25)) < 1e-6, f"MIN f32 corrupted: {row['lo']}"
             assert abs(row["hi"] - 4.0) < 1e-6, f"MAX f32 corrupted: {row['hi']}"
             client.execute_sql("DROP VIEW v", schema_name=sn)
@@ -1499,14 +1499,14 @@ class TestReducePathRegressions:
                 "INSERT INTO t VALUES (1, NULL, 100), (2, 0, 7), (3, NULL, 50), (4, 0, 9)",
                 schema_name=sn,
             )
-            by_grp = {r["grp"]: r for r in client.scan(vid) if r.weight > 0}
+            by_grp = {r["grp"]: r for r in client.scan(vid)}
             assert set(by_grp) == {None, 0}, f"NULL and 0 groups must stay distinct: {by_grp}"
             assert (by_grp[None]["lo"], by_grp[None]["hi"]) == (50, 100)
             assert (by_grp[0]["lo"], by_grp[0]["hi"]) == (7, 9)
 
             # Incremental update: lower the NULL group's min, raise 0's max.
             client.execute_sql("INSERT INTO t VALUES (5, NULL, 10), (6, 0, 999)", schema_name=sn)
-            by_grp = {r["grp"]: r for r in client.scan(vid) if r.weight > 0}
+            by_grp = {r["grp"]: r for r in client.scan(vid)}
             assert (by_grp[None]["lo"], by_grp[None]["hi"]) == (10, 100)
             assert (by_grp[0]["lo"], by_grp[0]["hi"]) == (7, 999)
             client.execute_sql("DROP VIEW v", schema_name=sn)
@@ -1534,7 +1534,7 @@ class TestReducePathRegressions:
                 "INSERT INTO t VALUES (1, 1, 3), (2, 1, 9), (3, 2, 7)",
                 schema_name=sn,
             )
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             groups = sorted(r["a"] for r in rows)
             assert groups == [1, 2], f"only groups with b>5 survive: {groups}"
             client.execute_sql("DROP VIEW v", schema_name=sn)
@@ -1561,7 +1561,7 @@ class TestReducePathRegressions:
                 "INSERT INTO t VALUES (1, 3), (2, 9), (3, 7)",
                 schema_name=sn,
             )
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             xs = sorted(r["x"] for r in rows)
             assert xs == [7, 9], f"only a>5 survive (aliased to x): {xs}"
             client.execute_sql("DROP VIEW v", schema_name=sn)
@@ -1589,7 +1589,7 @@ class TestReducePathRegressions:
                 "INSERT INTO t VALUES (1, 10), (2, 10), (3, 20)",
                 schema_name=sn,
             )
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             groups = sorted(r["a"] for r in rows)
             assert groups == [10], f"only groups with COUNT(*)>1 survive: {groups}"
             client.execute_sql("DROP VIEW v", schema_name=sn)
@@ -1628,7 +1628,7 @@ class TestHavingIsNullCompleteness:
             vid_notnull = client.resolve_table(sn, "v_notnull")[0]
 
             def groups(vid):
-                return {r["k"]: r.weight for r in client.scan(vid) if r.weight > 0}
+                return {r["k"]: r.weight for r in client.scan(vid)}
 
             # k=10: {5, NULL} → MIN=5; k=20: {NULL} → MIN=NULL.
             client.execute_sql(
@@ -1670,8 +1670,8 @@ class TestHavingIsNullCompleteness:
             vid_pass = client.resolve_table(sn, "v_pass")[0]
             vid_none = client.resolve_table(sn, "v_none")[0]
             client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20), (3, 20)", schema_name=sn)
-            assert {r["k"]: r.weight for r in client.scan(vid_pass) if r.weight > 0} == {10: 1, 20: 1}
-            assert [r for r in client.scan(vid_none) if r.weight > 0] == [], "IS NULL admits no group"
+            assert {r["k"]: r.weight for r in client.scan(vid_pass)} == {10: 1, 20: 1}
+            assert list(client.scan(vid_none)) == [], "IS NULL admits no group"
             client.execute_sql("DROP VIEW v_pass", schema_name=sn)
             client.execute_sql("DROP VIEW v_none", schema_name=sn)
             client.execute_sql("DROP TABLE t", schema_name=sn)
@@ -1701,10 +1701,10 @@ class TestHavingIsNullCompleteness:
             vid_notnull = client.resolve_table(sn, "v_notnull")[0]
             # Two NULL-key rows, one g=0, one g=7.
             client.execute_sql("INSERT INTO t VALUES (1, NULL), (2, NULL), (3, 0), (4, 7)", schema_name=sn)
-            null_rows = [r for r in client.scan(vid_null) if r.weight > 0]
+            null_rows = list(client.scan(vid_null))
             assert len(null_rows) == 1, "IS NULL admits exactly the NULL-key group"
             assert null_rows[0]["g"] is None and null_rows[0]["c"] == 2 and null_rows[0].weight == 1
-            nn = {r["g"]: (r["c"], r.weight) for r in client.scan(vid_notnull) if r.weight > 0}
+            nn = {r["g"]: (r["c"], r.weight) for r in client.scan(vid_notnull)}
             assert nn == {0: (1, 1), 7: (1, 1)}, "IS NOT NULL admits g=0 and g=7 (NULL != 0)"
             client.execute_sql("DROP VIEW v_null", schema_name=sn)
             client.execute_sql("DROP VIEW v_notnull", schema_name=sn)
@@ -1750,9 +1750,9 @@ class TestHavingIsNullCompleteness:
             client.execute_sql("INSERT INTO t1 VALUES (1, 100), (2, 200)", schema_name=sn)
             client.execute_sql("INSERT INTO t2 VALUES (5, 6), (5, 7)", schema_name=sn)
 
-            assert {r["pk"]: r.weight for r in client.scan(s_pass) if r.weight > 0} == {1: 1, 2: 1}
-            assert [r for r in client.scan(s_none) if r.weight > 0] == [], "IS NULL on a PK admits nothing"
-            got = {(r["a"], r["b"]): r.weight for r in client.scan(c_pass) if r.weight > 0}
+            assert {r["pk"]: r.weight for r in client.scan(s_pass)} == {1: 1, 2: 1}
+            assert list(client.scan(s_none)) == [], "IS NULL on a PK admits nothing"
+            got = {(r["a"], r["b"]): r.weight for r in client.scan(c_pass)}
             assert got == {(5, 6): 1, (5, 7): 1}, "compound-PK group col IS NOT NULL passes all"
 
             for v in ("s_pass", "s_none", "c_pass"):
@@ -1787,8 +1787,8 @@ class TestHavingIsNullCompleteness:
                 "INSERT INTO t VALUES (1, 10, 5), (2, 20, NULL), (3, 30, 2)",
                 schema_name=sn,
             )
-            assert {r["k"] for r in client.scan(vid_notnull) if r.weight > 0} == {10, 30}
-            assert {r["k"] for r in client.scan(vid_gt) if r.weight > 0} == {10}
+            assert {r["k"] for r in client.scan(vid_notnull)} == {10, 30}
+            assert {r["k"] for r in client.scan(vid_gt)} == {10}
             client.execute_sql("DROP VIEW v_notnull", schema_name=sn)
             client.execute_sql("DROP VIEW v_gt", schema_name=sn)
             client.execute_sql("DROP TABLE t", schema_name=sn)
@@ -1887,7 +1887,7 @@ class TestGroupByKeyCorrectness:
                 "INSERT INTO t VALUES " + ", ".join(rows_sql), schema_name=sn
             )
 
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             by_key = {r["s"]: (r["n"], r["total"]) for r in rows}
             assert len(by_key) == 50, (
                 f"every distinct string key must be its own group (no hash-collision "
@@ -1902,7 +1902,7 @@ class TestGroupByKeyCorrectness:
             # Retraction: DELETE one contributing row of group-key-0001 (pk=4,
             # val=11). That group's count 2→1 and sum 21→10.
             client.execute_sql("DELETE FROM t WHERE pk = 4", schema_name=sn)
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             by_key = {r["s"]: (r["n"], r["total"]) for r in rows}
             assert by_key["group-key-0001"] == (1, 10), (
                 f"after deleting one row, group must update: got {by_key['group-key-0001']}"
@@ -1952,7 +1952,7 @@ class TestGroupByKeyCorrectness:
                 "INSERT INTO t VALUES " + ", ".join(rows_sql), schema_name=sn
             )
 
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             by_key = {(r["a"], r["b"]): (r["n"], r["total"]) for r in rows}
             assert len(by_key) == 64, (
                 f"every distinct (a,b) must be its own group: got {len(by_key)}"
@@ -1964,7 +1964,7 @@ class TestGroupByKeyCorrectness:
 
             # Delete pk=1 → group (0,0) row val=0. count 2→1, sum drops by 0's val.
             client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             by_key = {(r["a"], r["b"]): (r["n"], r["total"]) for r in rows}
             assert by_key[(0, 0)] == (1, exp_sum[(0, 0)] - 0), (
                 f"after delete, group (0,0) must update: got {by_key[(0, 0)]}"
@@ -2072,7 +2072,7 @@ class TestAdaptiveMinMaxOutputType:
             client.execute_sql(
                 "INSERT INTO t VALUES " + ", ".join(rows_sql), schema_name=sn)
 
-            got = {r["k"]: (r["lo"], r["hi"]) for r in client.scan(vid) if r.weight > 0}
+            got = {r["k"]: (r["lo"], r["hi"]) for r in client.scan(vid)}
             assert got == expected, (
                 f"{label}: per-group (MIN, MAX) wrong: {got} != {expected}")
 
@@ -2122,7 +2122,7 @@ class TestAdaptiveMinMaxOutputType:
             client.execute_sql(
                 "INSERT INTO t VALUES " + ", ".join(rows_sql), schema_name=sn)
 
-            got = {r["k"]: (r["lo"], r["hi"]) for r in client.scan(vid) if r.weight > 0}
+            got = {r["k"]: (r["lo"], r["hi"]) for r in client.scan(vid)}
             for g, (lo, hi) in expected.items():
                 assert abs(got[g][0] - lo) < 1e-6, f"group {g} MIN: {got[g][0]} != {lo}"
                 assert abs(got[g][1] - hi) < 1e-6, f"group {g} MAX: {got[g][1]} != {hi}"
@@ -2131,7 +2131,7 @@ class TestAdaptiveMinMaxOutputType:
             # gather retraction read-back of the prior F64-widened MAX.
             client.execute_sql(
                 f"INSERT INTO t VALUES ({pk + 1}, 0, 99.5)", schema_name=sn)
-            got = {r["k"]: (r["lo"], r["hi"]) for r in client.scan(vid) if r.weight > 0}
+            got = {r["k"]: (r["lo"], r["hi"]) for r in client.scan(vid)}
             assert abs(got[0][1] - 99.5) < 1e-6, f"new MAX must be 99.5, got {got[0][1]}"
 
             client.execute_sql("DROP VIEW v", schema_name=sn)
@@ -2186,11 +2186,11 @@ class TestAdaptiveMinMaxOutputType:
             client.execute_sql(f"INSERT INTO t VALUES ({pk}, 2, 7)", schema_name=sn)
 
             extremum = max(vals) if is_max else min(vals)
-            got = {r["k"]: r["m"] for r in client.scan(vid) if r.weight > 0}
+            got = {r["k"]: r["m"] for r in client.scan(vid)}
             assert got[1] == extremum, f"initial {agg}: {got[1]} != {extremum}"
 
             client.execute_sql(f"DELETE FROM t WHERE pk = {drop_pk}", schema_name=sn)
-            got = {r["k"]: r["m"] for r in client.scan(vid) if r.weight > 0}
+            got = {r["k"]: r["m"] for r in client.scan(vid)}
             assert got[1] == expect_after, (
                 f"after retracting the {agg} holder, {agg} must recover "
                 f"{expect_after}, got {got[1]}")
@@ -2234,7 +2234,7 @@ class TestAdaptiveMinMaxOutputType:
                 "(10,40,1000),(11,40,0),(12,40,7)",
                 schema_name=sn,
             )
-            got = {r["k"]: r["m"] for r in client.scan(vid) if r.weight > 0}
+            got = {r["k"]: r["m"] for r in client.scan(vid)}
             assert got == {20: 1500, 30: 30000}, (
                 f"HAVING MAX(v) > 1000 wrong: {got}")
 
@@ -2554,7 +2554,7 @@ class TestAggregateQualifierRejection:
                 "INSERT INTO t VALUES (1, 10, 2), (2, 10, 4), (3, 20, 7)",
                 schema_name=sn,
             )
-            by_g = {r["g"]: r for r in client.scan(vid) if r.weight > 0}
+            by_g = {r["g"]: r for r in client.scan(vid)}
             assert by_g[10]["c_star"] == 2
             assert by_g[10]["c_x"] == 2
             assert by_g[10]["c_all"] == 2            # COUNT(ALL x) ≡ COUNT(x)
@@ -2747,7 +2747,7 @@ class TestLinearReduceGroupExistence:
             # concrete 0 (SQL guarantees COUNT is never NULL), surfaced here through
             # the client's null-bit-gated decode.
             client.execute_sql("INSERT INTO t VALUES (4, 7, NULL)", schema_name=sn)
-            g7 = [r for r in client.scan(vid) if r.weight > 0 and r["g"] == 7]
+            g7 = [r for r in client.scan(vid) if r["g"] == 7]
             assert len(g7) == 1, f"new all-NULL COUNT(a) group must appear, got {g7}"
             assert g7[0]["c"] == 0, f"COUNT(a) of all-NULL group must be 0, not NULL, got {g7[0]['c']}"
         finally:
@@ -2863,7 +2863,7 @@ class TestGlobalAggregate:
     @staticmethod
     def _one_row(client, vid):
         """The single positive-weight row of a global aggregate (asserts exactly one)."""
-        rows = [r for r in client.scan(vid) if r.weight > 0]
+        rows = list(client.scan(vid))
         assert len(rows) == 1, f"expected exactly one global row, got {len(rows)}: {rows}"
         return rows[0]
 
@@ -2949,9 +2949,9 @@ class TestGlobalAggregate:
                 schema_name=sn)
             vid = client.resolve_table(sn, "v")[0]
             # Empty source: 0 > 2 filters the ground row → zero rows.
-            assert [r for r in client.scan(vid) if r.weight > 0] == []
+            assert list(client.scan(vid)) == []
             client.execute_sql("INSERT INTO t VALUES (1, 1), (2, 1)", schema_name=sn)
-            assert [r for r in client.scan(vid) if r.weight > 0] == [], "2 not > 2"
+            assert list(client.scan(vid)) == [], "2 not > 2"
             client.execute_sql("INSERT INTO t VALUES (3, 1)", schema_name=sn)
             assert self._one_row(client, vid)["cnt"] == 3
         finally:
@@ -2970,7 +2970,7 @@ class TestGlobalAggregate:
                 "CREATE VIEW v AS SELECT COUNT(*) AS cnt FROM t HAVING COUNT(*) > 0",
                 schema_name=sn)
             vid = client.resolve_table(sn, "v")[0]
-            assert [r for r in client.scan(vid) if r.weight > 0] == []
+            assert list(client.scan(vid)) == []
         finally:
             client.drop_schema(sn)
 
@@ -3187,7 +3187,7 @@ class TestGlobalAggregate:
                 "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total FROM t",
                 schema_name=sn)
             vid = client.resolve_table(sn, "v")[0]
-            rows = [r for r in client.scan(vid) if r.weight > 0]
+            rows = list(client.scan(vid))
             assert len(rows) == 1, f"replicated empty-source ground must be ONE row, got {len(rows)}"
             assert rows[0].weight == 1, f"ground weight must be 1, got {rows[0].weight}"
             assert rows[0]["cnt"] == 0 and rows[0]["total"] is None
@@ -3211,9 +3211,9 @@ class TestGlobalAggregate:
                 "CREATE VIEW v AS SELECT pk, a * 2 AS d FROM t WHERE a > 0",
                 schema_name=sn)
             vid = client.resolve_table(sn, "v")[0]
-            assert [r for r in client.scan(vid) if r.weight > 0] == [], "no spurious row over empty source"
+            assert list(client.scan(vid)) == [], "no spurious row over empty source"
             client.execute_sql("INSERT INTO t VALUES (1, 3)", schema_name=sn)
-            rows = {r["pk"]: r["d"] for r in client.scan(vid) if r.weight > 0}
+            rows = {r["pk"]: r["d"] for r in client.scan(vid)}
             assert rows == {1: 6}
         finally:
             client.drop_schema(sn)
@@ -3270,7 +3270,7 @@ class TestGlobalAggregate:
         OPCODE_REDUCE, CIRCUIT_NODES_TAB = 9, 11
         return sum(
             1 for r in client.scan(CIRCUIT_NODES_TAB)
-            if r.weight > 0 and r["view_id"] == vid and r["opcode"] == OPCODE_REDUCE
+            if r["view_id"] == vid and r["opcode"] == OPCODE_REDUCE
         )
 
     def test_two_phase_all_linear_distributed(self, client):
@@ -3407,7 +3407,7 @@ class TestGlobalAggregate:
             vid = client.resolve_table(sn, "vw")[0]
 
             def positive_rows():
-                return [r for r in client.scan(vid) if r.weight > 0]
+                return list(client.scan(vid))
 
             assert positive_rows() == [], "SUM over a never-populated source is NULL, not 0"
 
@@ -3493,7 +3493,7 @@ class TestCombinedValueIndex:
                 "(3, 2, 10, 3, 50), (4, 2, 20, 9, 300)",
                 schema_name=sn)
 
-            by_g = {r["g"]: r for r in client.scan(vid) if r.weight > 0}
+            by_g = {r["g"]: r for r in client.scan(vid)}
             assert (by_g[10]["lo"], by_g[10]["hi"], by_g[10]["c"]) == (3, 100, 2), (
                 f"group 10 extremes must exclude group 20's rows; got {by_g[10]}")
             assert (by_g[20]["lo"], by_g[20]["hi"], by_g[20]["c"]) == (7, 300, 2), (
@@ -3503,7 +3503,7 @@ class TestCombinedValueIndex:
             # Group 10's MIN must recompute to 5 from the surviving group-10 row —
             # never pulling group 20's smaller-keyed entries.
             client.execute_sql("DELETE FROM dim WHERE did = 3", schema_name=sn)
-            by_g = {r["g"]: r for r in client.scan(vid) if r.weight > 0}
+            by_g = {r["g"]: r for r in client.scan(vid)}
             assert (by_g[10]["lo"], by_g[10]["hi"], by_g[10]["c"]) == (5, 100, 1), by_g[10]
             assert (by_g[20]["lo"], by_g[20]["hi"], by_g[20]["c"]) == (7, 300, 2), by_g[20]
         finally:
@@ -3537,7 +3537,7 @@ class TestCombinedValueIndex:
                 "FROM j GROUP BY g",
                 schema_name=sn)
             vid = client.resolve_table(sn, "agg")[0]
-            by_g = {r["g"]: r for r in client.scan(vid) if r.weight > 0}
+            by_g = {r["g"]: r for r in client.scan(vid)}
             assert (by_g[10]["lo"], by_g[10]["hi"], by_g[10]["c"]) == (3, 100, 2), by_g[10]
             assert (by_g[20]["lo"], by_g[20]["hi"], by_g[20]["c"]) == (7, 300, 2), by_g[20]
         finally:

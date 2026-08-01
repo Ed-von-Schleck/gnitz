@@ -221,7 +221,7 @@ def hg(client):
 
 
 def _keys(rows, col):
-    return sorted(getattr(r, col) for r in rows if r.weight > 0)
+    return sorted(getattr(r, col) for r in rows)
 
 
 def _reject_both(client, sn, query):
@@ -299,7 +299,7 @@ def test_having_constants_and_edges(client, hg):
     # which HAVING still filters: NULL aggregates drop it, COUNT keeps it.
     assert _parity(client, hg, "SELECT COUNT(*) AS c FROM hg WHERE pk < 0 HAVING SUM(cat) = 0") == []
     got = _parity(client, hg, "SELECT COUNT(*) AS c FROM hg WHERE pk < 0 HAVING COUNT(*) = 0")
-    assert [r.c for r in got if r.weight > 0] == [0], got
+    assert [r.c for r in got] == [0], got
     assert _parity(client, hg, "SELECT COUNT(*) AS c FROM hg WHERE pk < 0 HAVING MAX(cat) >= 0") == []
     # A bare float HAVING evaluating to -0.0: its bit pattern is nonzero, so
     # the group is KEPT (the engine filter bit-tests, it does not compare 0.0).

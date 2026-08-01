@@ -44,7 +44,7 @@ def _cleanup(client, sn, tables=None, views=None):
 
 
 def _dicts(client, tid):
-    return [r._asdict() for r in client.scan(tid) if r.weight > 0]
+    return client.scan(tid).mappings()
 
 
 # Narrow integer SQL types and a value spread that covers several workers.

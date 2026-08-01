@@ -46,7 +46,7 @@ def _setup(client):
 
 def _count_live(client, tid):
     """Net live row count of a table or view."""
-    return sum(r.weight for r in client.scan(tid) if r.weight > 0)
+    return sum(r.weight for r in client.scan(tid))
 
 
 def _filler_schema(client, table_name="filler"):
@@ -456,7 +456,7 @@ def test_low_space_relay_checkpoints_without_aborting_master(relay_lowspace_serv
                 break  # master died — assertion below reports it
             try:
                 totals = {row[0]: row[1]
-                          for row in client.scan(vid) if row.weight > 0}
+                          for row in client.scan(vid)}
             except Exception:
                 break  # connection broke (likely a dead master)
             if totals.get(1) == expected:

@@ -20,7 +20,7 @@ def _unique_schema(client, prefix: str) -> str:
 
 
 def _scan_positive(client, tid):
-    return [r for r in client.scan(tid) if r.weight > 0]
+    return list(client.scan(tid))
 
 
 # ----------------------------------------------------------------------

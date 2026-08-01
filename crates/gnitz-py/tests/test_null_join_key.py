@@ -38,7 +38,7 @@ def _cleanup(client, sn, tables=None, views=None):
 
 
 def _scan_dicts(client, tid):
-    return [r._asdict() for r in client.scan(tid) if r.weight > 0]
+    return client.scan(tid).mappings()
 
 
 class TestNullJoinKey:
@@ -170,7 +170,7 @@ class TestNullJoinKey:
             assert rows[0]["id"] == 1 and rows[0]["name"] is None
             assert rows[1]["id"] == 2 and rows[1]["name"] == "zero"
             # Each must appear with weight exactly 1 (no double-emit, no cancel).
-            full = [r for r in client.scan(vid) if r.weight != 0]
+            full = list(client.scan(vid))
             weights = {r._asdict()["id"]: r.weight for r in full}
             assert weights == {1: 1, 2: 1}, f"unexpected weights: {weights}"
         finally:
@@ -260,7 +260,7 @@ class TestNullJoinKey:
 
             # Tick 4: delete the NULL-key row → still empty, no stray weights.
             client.execute_sql("DELETE FROM l WHERE id = 1", schema_name=sn)
-            full = [r for r in client.scan(vid) if r.weight != 0]
+            full = list(client.scan(vid))
             assert len(full) == 0, f"expected no rows after delete: {full}"
         finally:
             _cleanup(client, sn, tables=["l", "r"], views=["v"])
@@ -288,18 +288,18 @@ class TestNullJoinKey:
 
             # Insert NULL-key left row → emitted once with NULL right.
             client.execute_sql("INSERT INTO l VALUES (1, NULL)", schema_name=sn)
-            rows = [r._asdict() for r in client.scan(vid) if r.weight != 0]
+            rows = client.scan(vid).mappings()
             assert len(rows) == 1 and rows[0]["name"] is None, rows
 
             # NULL → 5: bypass row retracts, match row appears.
             client.execute_sql("UPDATE l SET fk = 5 WHERE id = 1", schema_name=sn)
-            rows = [r._asdict() for r in client.scan(vid) if r.weight != 0]
+            rows = client.scan(vid).mappings()
             assert len(rows) == 1 and rows[0]["name"] == "five", rows
 
             # 5 → NULL (via delete+insert): match retracts, bypass row reappears once.
             client.execute_sql("DELETE FROM l WHERE id = 1", schema_name=sn)
             client.execute_sql("INSERT INTO l VALUES (1, NULL)", schema_name=sn)
-            rows = [r._asdict() for r in client.scan(vid) if r.weight != 0]
+            rows = client.scan(vid).mappings()
             assert len(rows) == 1 and rows[0]["name"] is None, rows
         finally:
             _cleanup(client, sn, tables=["l", "r"], views=["v"])

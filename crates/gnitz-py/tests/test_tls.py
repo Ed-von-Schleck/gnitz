@@ -5,6 +5,7 @@ These run inside the normal (AF_UNIX) suite — the TLS target is derived
 from the session server's pinned TLS port, independent of GNITZ_TRANSPORT.
 """
 
+import asyncio
 import os
 
 import pytest
@@ -88,7 +89,7 @@ class TestTlsSync:
         tls_client.push(tls_table, _batch(
             [{"pk": i, "val": i * 3} for i in range(1, n + 1)]))
         result = tls_client.scan(tls_table)
-        rows = {r.pk: r.val for r in result if r.weight > 0}
+        rows = {r.pk: r.val for r in result}
         assert len(rows) == n
         assert rows[1] == 3
         assert rows[n] == n * 3
@@ -112,14 +113,15 @@ class TestTlsAsync:
 
     @pytest.mark.asyncio
     async def test_pipelined_pushes(self, tls_aconn, tls_table):
-        async with tls_aconn.pipeline() as pipe:
-            for i in range(50):
-                pipe.push(tls_table, _batch(
-                    [{"pk": 100 * i + j, "val": j} for j in range(1, 100)]))
-        assert len(pipe.results) == 50
-        assert all(isinstance(lsn, int) for lsn in pipe.results)
+        lsns = await asyncio.gather(*[
+            tls_aconn.push(tls_table, _batch(
+                [{"pk": 100 * i + j, "val": j} for j in range(1, 100)]))
+            for i in range(50)
+        ])
+        assert len(lsns) == 50
+        assert all(isinstance(lsn, int) for lsn in lsns)
         result = await tls_aconn.scan(tls_table)
-        assert len({r.pk for r in result if r.weight > 0}) == 50 * 99
+        assert len({r.pk for r in result}) == 50 * 99
 
 
 # ── error surfaces ──────────────────────────────────────────────────────────

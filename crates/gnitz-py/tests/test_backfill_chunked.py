@@ -212,7 +212,7 @@ def test_pure_range_backfill_with_forced_sal_reclaim():
 
         with gnitz.connect(sock_path) as c:
             vid = c.resolve_table("bf", "v")[0]
-            got = sorted((r["ax"], r["by"]) for r in c.scan(vid) if r.weight > 0)
+            got = sorted((r["ax"], r["by"]) for r in c.scan(vid))
         assert got == want, "pure-range backfill under forced SAL reclaim mismatched reference"
     finally:
         if proc is not None:

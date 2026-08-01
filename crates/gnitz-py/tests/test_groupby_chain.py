@@ -28,7 +28,7 @@ def _cleanup(client, sn):
 def _rows(client, sn, view, keys):
     """Positive-weight rows as key tuples, NULL-safe sorted (NULLs last — outer joins)."""
     vid = client.resolve_table(sn, view)[0]
-    rows = [tuple(r._asdict()[k] for k in keys) for r in client.scan(vid) if r.weight > 0]
+    rows = [tuple(r._asdict()[k] for k in keys) for r in client.scan(vid)]
     return sorted(rows, key=lambda t: tuple((x is None, x) for x in t))
 
 

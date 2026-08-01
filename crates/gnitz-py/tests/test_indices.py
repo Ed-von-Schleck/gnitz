@@ -1303,7 +1303,7 @@ class TestAtomicUniqueTransfers:
                 "INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)", schema_name=sn)
             client.execute_sql("UPDATE t SET val = val + 1", schema_name=sn)
             tid, _ = client.resolve_table(sn, "t")
-            rows = sorted((r.pk, r.val) for r in client.scan(tid) if r.weight > 0)
+            rows = sorted((r.pk, r.val) for r in client.scan(tid))
             assert rows == [(1, 2), (2, 3), (3, 4)], rows
         finally:
             _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
@@ -1321,7 +1321,7 @@ class TestAtomicUniqueTransfers:
             client.execute_sql("INSERT INTO t VALUES (1, 1), (2, 2)", schema_name=sn)
             client.execute_sql("UPDATE t SET val = 3 - val", schema_name=sn)
             tid, _ = client.resolve_table(sn, "t")
-            rows = sorted((r.pk, r.val) for r in client.scan(tid) if r.weight > 0)
+            rows = sorted((r.pk, r.val) for r in client.scan(tid))
             assert rows == [(1, 2), (2, 1)], rows
         finally:
             _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
@@ -1343,7 +1343,7 @@ class TestAtomicUniqueTransfers:
             b.append(pk=1, val=5, _weight=-1)
             b.append(pk=2, val=5, _weight=1)
             client.push(tid, b)  # must succeed
-            rows = sorted((r.pk, r.val) for r in client.scan(tid) if r.weight > 0)
+            rows = sorted((r.pk, r.val) for r in client.scan(tid))
             assert rows == [(2, 5)], rows
         finally:
             _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
@@ -1633,7 +1633,7 @@ class TestUniqueIndexCreatePreflight:
                 # All workers answer a full scan: nobody is wedged on a
                 # half-drained pre-flight train.
                 tid, _ = client.resolve_table(sn, "t")
-                rows = [r for r in client.scan(tid) if r.weight > 0]
+                rows = list(client.scan(tid))
                 assert len(rows) == 33
                 # The PK short-circuit returns before any fan-out, so it
                 # succeeds even while every worker's scan path is faulted.
@@ -1659,12 +1659,12 @@ class TestUniqueIndexCreatePreflight:
             b = gnitz.ZSetBatch(schema)
             b.append(pk=1, val=10, _weight=2)
             client.push(tid, b)
-            rows = [(r.pk, r.weight) for r in client.scan(tid) if r.weight > 0]
+            rows = [(r.pk, r.weight) for r in client.scan(tid)]
             assert rows == [(1, 1)], rows
             b = gnitz.ZSetBatch(schema)
             b.append(pk=1, val=10, _weight=-1)
             client.push(tid, b)
-            assert [r for r in client.scan(tid) if r.weight > 0] == []
+            assert list(client.scan(tid)) == []
             client.execute_sql("CREATE UNIQUE INDEX ON t(pk)", schema_name=sn)
             assert _table_has_index(client, sn, "t")
         finally:
@@ -2081,7 +2081,7 @@ class TestCompositeUniqueIndex:
                 "INSERT INTO t VALUES (1, 7, 1), (2, 7, 2), (3, 7, 3)", schema_name=sn)
             client.execute_sql("UPDATE t SET b = b + 1", schema_name=sn)
             tid, _ = client.resolve_table(sn, "t")
-            rows = sorted((r.pk, r.a, r.b) for r in client.scan(tid) if r.weight > 0)
+            rows = sorted((r.pk, r.a, r.b) for r in client.scan(tid))
             assert rows == [(1, 7, 2), (2, 7, 3), (3, 7, 4)], rows
         finally:
             _drop_all(client, sn, indices=[f"{sn}__t__idx_a_b"], tables=["t"])
@@ -2094,14 +2094,14 @@ class TestCompositeUniqueIndex:
 def _result_pks(result):
     """Sorted list of PKs from a SELECT Rows result (positive weight only)."""
     assert result[0]["type"] == "Rows"
-    return sorted(row.pk for row in result[0]["rows"] if row.weight > 0)
+    return sorted(row.pk for row in result[0]["rows"])
 
 
 def _result_rows(result):
     """Sorted list of full-row value tuples (schema order, PK first) from a
     SELECT Rows result (positive weight only)."""
     assert result[0]["type"] == "Rows"
-    return sorted(tuple(row) for row in result[0]["rows"] if row.weight > 0)
+    return sorted(tuple(row) for row in result[0]["rows"])
 
 
 class TestIndexRangeSql:
@@ -2297,7 +2297,7 @@ class TestIndexCollectMerge:
 
             # Scan-and-filter reference from the full table scan.
             tid, _ = client.resolve_table(sn, "t")
-            ref = {r.pk: (r.x, r.y) for r in client.scan(tid) if r.weight > 0}
+            ref = {r.pk: (r.x, r.y) for r in client.scan(tid)}
             assert len(ref) == 200
             q = lambda s: _result_rows(client.execute_sql(s, schema_name=sn))
 
@@ -2498,7 +2498,7 @@ class TestIndexBoundPushdown:
                 "CREATE VIEW mv AS SELECT COUNT(*) AS c FROM t WHERE ind = 999",
                 schema_name=sn)
             res = client.execute_sql("SELECT * FROM mv", schema_name=sn)
-            rows = [r for r in res[0]["rows"] if r.weight > 0]
+            rows = list(res[0]["rows"])
             assert len(rows) == 1, "an empty range must still seed the ground row"
             assert rows[0][0] == 0
         finally:

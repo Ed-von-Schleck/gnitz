@@ -45,7 +45,7 @@ def _cleanup(client, sn, *table_names):
 
 def _scan_map(client, tid):
     """Return {pk: row} for all positive-weight rows."""
-    return {row.pk: row for row in client.scan(tid) if row.weight > 0}
+    return {row.pk: row for row in client.scan(tid)}
 
 
 # ---------------------------------------------------------------------------
@@ -948,7 +948,7 @@ class TestU128:
             )
             vid, _ = client.resolve_table(sn, "v")
             rows = list(client.scan(vid))
-            positive = [r for r in rows if r.weight > 0]
+            positive = list(rows)
             assert len(positive) == 1  # only v=15 passes
         finally:
             _cleanup(client, sn, "t", "v")
@@ -1107,7 +1107,7 @@ class TestUUID:
                 f"INSERT INTO t VALUES ('{self.UUID_A}', 1)", schema_name=sn
             )
             tid, _ = client.resolve_table(sn, "t")
-            rows = [r for r in client.scan(tid) if r.weight > 0]
+            rows = list(client.scan(tid))
             assert len(rows) == 1
             assert isinstance(rows[0].pk, str)
         finally:
@@ -1143,7 +1143,7 @@ class TestUUID:
             client.execute_sql(
                 f"INSERT INTO t VALUES ('{self.UUID_V7_EARLY}', 1)", schema_name=sn
             )
-            rows = [r for r in client.scan(tid) if r.weight > 0]
+            rows = list(client.scan(tid))
             pks = [r.pk for r in rows]
             assert pks == [self.UUID_V7_EARLY, self.UUID_V7_LATE]
         finally:

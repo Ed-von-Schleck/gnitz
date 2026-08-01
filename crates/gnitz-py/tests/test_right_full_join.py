@@ -21,7 +21,7 @@ def _uid():
 
 def _pos(client, vid):
     """Positive-weight rows as a list of gnitz rows."""
-    return [r for r in client.scan(vid) if r.weight > 0]
+    return list(client.scan(vid))
 
 
 def _weighted(client, vid):

@@ -39,7 +39,7 @@ def _table(client, sn, name="t"):
 
 def _scan(client, tid):
     """Sorted (pk, val) over positive-weight rows."""
-    return sorted((r.pk, r.val) for r in client.scan(tid) if r.weight > 0)
+    return sorted((r.pk, r.val) for r in client.scan(tid))
 
 
 def _retry(c, sn, sql):

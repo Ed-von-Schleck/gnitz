@@ -99,13 +99,13 @@ async def test_scan_many_async(aconn, sync):
 
         results = await aconn.scan_many([a, b])
         assert isinstance(results, list) and len(results) == 2
-        assert sorted((r.pk, r.val) for r in results[0] if r.weight > 0) == [(1, 10), (2, 20)]
-        assert sorted((r.pk, r.val) for r in results[1] if r.weight > 0) == [(5, 50)]
+        assert sorted((r.pk, r.val) for r in results[0]) == [(1, 10), (2, 20)]
+        assert sorted((r.pk, r.val) for r in results[1]) == [(5, 50)]
 
         # A one-relation async scan_many matches an async scan.
         one = await aconn.scan_many([a])
         assert len(one) == 1
-        assert sorted((r.pk, r.val) for r in one[0] if r.weight > 0) == [(1, 10), (2, 20)]
+        assert sorted((r.pk, r.val) for r in one[0]) == [(1, 10), (2, 20)]
     finally:
         sync.drop_schema(sn)
 
@@ -131,8 +131,8 @@ async def test_scan_many_malformed_list_does_not_desync(aconn, sync):
             with pytest.raises(gnitz.GnitzError):
                 await aconn.scan_many(bad)
             ok = await aconn.scan_many([a, b])
-            assert sorted((r.pk, r.val) for r in ok[0] if r.weight > 0) == [(1, 10)]
-            assert sorted((r.pk, r.val) for r in ok[1] if r.weight > 0) == [(5, 50)]
+            assert sorted((r.pk, r.val) for r in ok[0]) == [(1, 10)]
+            assert sorted((r.pk, r.val) for r in ok[1]) == [(5, 50)]
     finally:
         sync.drop_schema(sn)
 
@@ -146,7 +146,7 @@ async def test_push_many_rows(aconn, table):
     await aconn.push(tid, batch)
 
     result = await aconn.scan(tid)
-    pks = sorted(row.pk for row in result if row.weight > 0)
+    pks = sorted(row.pk for row in result)
     assert pks == list(range(1, n + 1))
 
 
@@ -188,7 +188,7 @@ async def test_upsert_via_push(aconn, table):
     await aconn.push(tid, _batch(cols, [{"pk": 1, "val": 200}]))
 
     result = await aconn.scan(tid)
-    rows = [r for r in result if r.weight > 0]
+    rows = list(result)
     assert len(rows) == 1
     assert rows[0].val == 200
 
@@ -235,20 +235,19 @@ async def test_scan_system_table(aconn):
 
 @pytest.mark.asyncio
 async def test_pipeline_empty_push_interleaved(aconn, table):
-    """Interleave an empty push among non-empty pushes in one pipeline block.
-    Every queued push gets exactly one result: the empty one is 0, the rest are
-    non-decreasing non-zero LSNs, and a post-block scan shows only the non-empty
+    """Interleave an empty push among non-empty pushes in one in-flight group.
+    Every push gets exactly one result: the empty one is 0, the rest are
+    non-decreasing non-zero LSNs, and a later scan shows only the non-empty
     rows (no frame misalignment across the batch)."""
     tid, cols, _ = table
     schema = gnitz.Schema(cols)
 
-    async with aconn.pipeline() as pipe:
-        pipe.push(tid, _batch(cols, [{"pk": 1, "val": 10}]))
-        pipe.push(tid, gnitz.ZSetBatch(schema))  # empty — the interleaved no-op
-        pipe.push(tid, _batch(cols, [{"pk": 2, "val": 20}]))
-        pipe.push(tid, _batch(cols, [{"pk": 3, "val": 30}]))
-
-    results = pipe.results
+    results = await asyncio.gather(
+        aconn.push(tid, _batch(cols, [{"pk": 1, "val": 10}])),
+        aconn.push(tid, gnitz.ZSetBatch(schema)),  # empty — the interleaved no-op
+        aconn.push(tid, _batch(cols, [{"pk": 2, "val": 20}])),
+        aconn.push(tid, _batch(cols, [{"pk": 3, "val": 30}])),
+    )
     assert len(results) == 4
     assert results[1] == 0
     nonzero = [results[0], results[2], results[3]]
@@ -256,7 +255,7 @@ async def test_pipeline_empty_push_interleaved(aconn, table):
     assert nonzero == sorted(nonzero)
 
     result = await aconn.scan(tid)
-    rows = {r.pk: r.val for r in result if r.weight > 0}
+    rows = {r.pk: r.val for r in result}
     assert rows == {1: 10, 2: 20, 3: 30}
 
 
@@ -298,7 +297,7 @@ async def test_multiple_connections(server):
 
 
 # ---------------------------------------------------------------------------
-# Pipeline
+# Pipelining — several operations in flight, gathered
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -307,14 +306,15 @@ async def test_pipeline_push(aconn, table):
     schema = gnitz.Schema(cols)
     n = 50
 
-    async with aconn.pipeline() as pipe:
-        for i in range(n):
-            batch = gnitz.ZSetBatch(schema)
-            batch.append(pk=1000 + i, val=i)
-            pipe.push(tid, batch)
+    futures = []
+    for i in range(n):
+        batch = gnitz.ZSetBatch(schema)
+        batch.append(pk=1000 + i, val=i)
+        futures.append(aconn.push(tid, batch))
+    results = await asyncio.gather(*futures)
 
-    assert len(pipe.results) == n
-    for r in pipe.results:
+    assert len(results) == n
+    for r in results:
         assert isinstance(r, int), f"expected int LSN, got {type(r)}: {r}"
 
     # Verify all rows landed
@@ -324,56 +324,45 @@ async def test_pipeline_push(aconn, table):
 
 @pytest.mark.asyncio
 async def test_pipeline_large(aconn, table):
-    """Pipeline 500 pushes — exercises natural batching in the I/O thread."""
+    """500 concurrent pushes — exercises natural batching in the I/O thread."""
     tid, cols, _ = table
     schema = gnitz.Schema(cols)
     n = 500
 
-    async with aconn.pipeline() as pipe:
-        for i in range(n):
-            batch = gnitz.ZSetBatch(schema)
-            batch.append(pk=5000 + i, val=i)
-            pipe.push(tid, batch)
+    futures = []
+    for i in range(n):
+        batch = gnitz.ZSetBatch(schema)
+        batch.append(pk=5000 + i, val=i)
+        futures.append(aconn.push(tid, batch))
+    results = await asyncio.gather(*futures)
 
-    assert len(pipe.results) == n
-    errors = [r for r in pipe.results if isinstance(r, Exception)]
-    assert errors == [], f"pipeline errors: {errors}"
+    assert len(results) == n
+    errors = [r for r in results if isinstance(r, Exception)]
+    assert errors == [], f"push errors: {errors}"
 
 
 @pytest.mark.asyncio
 async def test_pipeline_scan(aconn, table):
-    """Pipeline of scans — all return the same result."""
+    """Concurrent scans — all return the same result."""
     tid, cols, _ = table
     await aconn.push(tid, _batch(cols, [{"pk": 1, "val": 10}]))
 
-    async with aconn.pipeline() as pipe:
-        for _ in range(10):
-            pipe.scan(tid)
+    results = await asyncio.gather(*[aconn.scan(tid) for _ in range(10)])
 
-    assert len(pipe.results) == 10
-    for r in pipe.results:
+    assert len(results) == 10
+    for r in results:
         assert not isinstance(r, Exception)
 
 
 @pytest.mark.asyncio
-async def test_pipeline_empty(aconn):
-    """Empty pipeline exits cleanly."""
-    async with aconn.pipeline() as pipe:
-        pass
-    assert pipe.results == []
-
-
-@pytest.mark.asyncio
-async def test_pipeline_individual_futures(aconn, table):
-    """Futures returned by pipeline methods are independently awaitable."""
+async def test_operations_submit_on_call_not_on_await(aconn, table):
+    """Each method submits when called and hands back its future, so several can
+    be in flight before any is awaited, and each stays independently awaitable."""
     tid, cols, _ = table
-    schema = gnitz.Schema(cols)
 
-    async with aconn.pipeline() as pipe:
-        f1 = pipe.push(tid, _batch(cols, [{"pk": 1, "val": 1}]))
-        f2 = pipe.push(tid, _batch(cols, [{"pk": 2, "val": 2}]))
+    f1 = aconn.push(tid, _batch(cols, [{"pk": 1, "val": 1}]))
+    f2 = aconn.push(tid, _batch(cols, [{"pk": 2, "val": 2}]))
 
-    # After pipeline exit, futures are resolved
     assert isinstance(await f1, int)
     assert isinstance(await f2, int)
 
@@ -439,15 +428,17 @@ async def test_error_push_bad_table(aconn):
 
 
 @pytest.mark.asyncio
-async def test_error_in_pipeline(aconn, table):
-    """A failure in any pipeline operation must raise from the async-with block."""
+async def test_error_among_concurrent_pushes(aconn, table):
+    """A failure in any one of several in-flight operations must surface when
+    they are gathered — the good pushes do not swallow the bad one."""
     tid, cols, _ = table
 
     with pytest.raises(gnitz.GnitzError):
-        async with aconn.pipeline() as pipe:
-            pipe.push(tid, _batch(cols, [{"pk": 1, "val": 1}]))
-            pipe.push(0xDEAD_BEEF, _batch(cols, [{"pk": 2, "val": 2}]))  # bad table
-            pipe.push(tid, _batch(cols, [{"pk": 3, "val": 3}]))
+        await asyncio.gather(
+            aconn.push(tid, _batch(cols, [{"pk": 1, "val": 1}])),
+            aconn.push(0xDEAD_BEEF, _batch(cols, [{"pk": 2, "val": 2}])),  # bad table
+            aconn.push(tid, _batch(cols, [{"pk": 3, "val": 3}])),
+        )
 
 
 @pytest.mark.asyncio
@@ -502,13 +493,13 @@ async def test_pipelined_pushes_lsn_non_strict(aconn, table):
     schema = gnitz.Schema(cols)
     n = 50
 
-    async with aconn.pipeline() as pipe:
-        for i in range(n):
-            batch = gnitz.ZSetBatch(schema)
-            batch.append(pk=6000 + i, val=i)
-            pipe.push(tid, batch)
+    futures = []
+    for i in range(n):
+        batch = gnitz.ZSetBatch(schema)
+        batch.append(pk=6000 + i, val=i)
+        futures.append(aconn.push(tid, batch))
+    lsns = await asyncio.gather(*futures)
 
-    lsns = pipe.results
     assert len(lsns) == n
     assert min(lsns) > 0
     for i in range(1, n):

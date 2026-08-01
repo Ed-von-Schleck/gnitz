@@ -70,7 +70,7 @@ def test_serial_midcolumn_payload_indexing(client):
         # Bare positional INSERT supplies the non-SERIAL columns in schema order.
         client.execute_sql("INSERT INTO t VALUES (20, 'y')", schema_name=sn)
         tid, _ = client.resolve_table(sn, "t")
-        rows = sorted((r.id, r.a, r.b) for r in client.scan(tid) if r.weight > 0)
+        rows = sorted((r.id, r.a, r.b) for r in client.scan(tid))
         assert rows == [(1, 10, "x"), (2, 20, "y")]
     finally:
         _cleanup(client, sn, "t")
@@ -85,7 +85,7 @@ def test_serial_null_payload(client):
         client.execute_sql("INSERT INTO t (name) VALUES ('a'), (NULL), ('c')", schema_name=sn)
         tid, _ = client.resolve_table(sn, "t")
         rows = sorted(
-            (r.id, r.name) for r in client.scan(tid) if r.weight > 0
+            (r.id, r.name) for r in client.scan(tid)
         )
         assert rows == [(1, "a"), (2, None), (3, "c")]
     finally:
@@ -101,7 +101,7 @@ def test_serial_no_reuse_after_delete(client):
         client.execute_sql("DELETE FROM t WHERE id = 2", schema_name=sn)
         client.execute_sql("INSERT INTO t (name) VALUES ('c')", schema_name=sn)
         tid, _ = client.resolve_table(sn, "t")
-        ids = sorted(r.id for r in client.scan(tid) if r.weight > 0)
+        ids = sorted(r.id for r in client.scan(tid))
         assert ids == [1, 3]  # id 2 deleted and never reused
     finally:
         _cleanup(client, sn, "t")
@@ -125,7 +125,7 @@ def test_serial_recognized_cross_connection(server):
             # c2's schema for `t` comes purely from COL_TAB, not from the CREATE.
             c2.execute_sql("INSERT INTO t (name) VALUES ('a'), ('b')", schema_name=sn)
             tid, _ = c2.resolve_table(sn, "t")
-            rows = sorted((r.id, r.name) for r in c2.scan(tid) if r.weight > 0)
+            rows = sorted((r.id, r.name) for r in c2.scan(tid))
             assert rows == [(1, "a"), (2, "b")]
             # And a bare positional value is still rejected on the fresh connection.
             with pytest.raises(gnitz.GnitzError):
@@ -151,7 +151,7 @@ def test_serial_two_connections_disjoint_ids(server):
             c2.execute_sql("INSERT INTO t (name) VALUES ('b1'), ('b2')", schema_name=sn)
             c1.execute_sql("INSERT INTO t (name) VALUES ('a3')", schema_name=sn)
             tid, _ = c1.resolve_table(sn, "t")
-            ids = [r.id for r in c1.scan(tid) if r.weight > 0]
+            ids = [r.id for r in c1.scan(tid)]
             assert len(ids) == 5
             assert len(set(ids)) == 5  # all distinct across both connections
     finally:
@@ -170,7 +170,7 @@ def test_serial_assigns_contiguous_ids(client):
         client.execute_sql("CREATE TABLE t (id SERIAL PRIMARY KEY, name TEXT)", schema_name=sn)
         client.execute_sql("INSERT INTO t (name) VALUES ('a'), ('b'), ('c')", schema_name=sn)
         tid, _ = client.resolve_table(sn, "t")
-        rows = sorted(((r.id, r.name) for r in client.scan(tid) if r.weight > 0))
+        rows = sorted(((r.id, r.name) for r in client.scan(tid)))
         assert rows == [(1, "a"), (2, "b"), (3, "c")]
     finally:
         _cleanup(client, sn, "t")
@@ -185,8 +185,8 @@ def test_bigserial_and_smallserial_assign(client):
         client.execute_sql("INSERT INTO small (name) VALUES ('p'), ('q')", schema_name=sn)
         btid, _ = client.resolve_table(sn, "big")
         stid, _ = client.resolve_table(sn, "small")
-        assert sorted(r.id for r in client.scan(btid) if r.weight > 0) == [1, 2]
-        assert sorted(r.id for r in client.scan(stid) if r.weight > 0) == [1, 2]
+        assert sorted(r.id for r in client.scan(btid)) == [1, 2]
+        assert sorted(r.id for r in client.scan(stid)) == [1, 2]
     finally:
         _cleanup(client, sn, "big", "small")
 
@@ -281,7 +281,7 @@ def test_serial_aliases_end_to_end(client):
             )
             client.execute_sql(f"INSERT INTO {tname} (name) VALUES ('a'), ('b')", schema_name=sn)
             tid, _ = client.resolve_table(sn, tname)
-            assert sorted(r.id for r in client.scan(tid) if r.weight > 0) == [1, 2]
+            assert sorted(r.id for r in client.scan(tid)) == [1, 2]
     finally:
         _cleanup(client, sn, "t2", "t4", "t8")
 
@@ -371,7 +371,7 @@ def test_multiworker_scatter_all_ids_once(client):
         values = ",".join(f"('n{i}')" for i in range(200))
         client.execute_sql(f"INSERT INTO t (name) VALUES {values}", schema_name=sn)
         tid, _ = client.resolve_table(sn, "t")
-        ids = sorted(r.id for r in client.scan(tid) if r.weight > 0)
+        ids = sorted(r.id for r in client.scan(tid))
         assert ids == list(range(1, 201))
     finally:
         _cleanup(client, sn, "t")
@@ -479,7 +479,7 @@ def test_concurrent_serial_alloc_with_seeks(server):
         # A full scan agrees with the set of issued ids (gaps from partially
         # consumed per-connection range tails are permitted).
         with gnitz.connect(server) as c:
-            live = sorted(r.id for r in c.scan(tid) if r.weight > 0)
+            live = sorted(r.id for r in c.scan(tid))
         assert live == sorted(set(all_ids)), "scan disagrees with the issued ids"
     finally:
         with gnitz.connect(server) as c:
@@ -540,7 +540,7 @@ def test_restart_id_monotonicity():
             c.execute_sql("CREATE TABLE t (id SERIAL PRIMARY KEY, name TEXT)", schema_name="s")
             c.execute_sql("INSERT INTO t (name) VALUES ('a'), ('b'), ('c')", schema_name="s")
             tid, _ = c.resolve_table("s", "t")
-            before = sorted(r.id for r in c.scan(tid) if r.weight > 0)
+            before = sorted(r.id for r in c.scan(tid))
         assert before == [1, 2, 3]
 
         # Crash-restart on the SAME data dir (durable catalog + sequence survive).
@@ -555,7 +555,7 @@ def test_restart_id_monotonicity():
             # high-water.
             c.execute_sql("INSERT INTO t (name) VALUES ('d'), ('e')", schema_name="s")
             tid, _ = c.resolve_table("s", "t")
-            after = sorted(r.id for r in c.scan(tid) if r.weight > 0 and r.id not in before)
+            after = sorted(r.id for r in c.scan(tid) if r.id not in before)
         assert after, "expected new rows after restart"
         assert min(after) > max(before), f"new ids {after} must exceed pre-restart max {max(before)}"
     finally:

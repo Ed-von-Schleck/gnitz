@@ -40,11 +40,11 @@ def _batch(schema, rows):
 
 def _rows(result):
     """Sorted (pk, val) over the positive-weight rows of one scan result."""
-    return sorted((r.pk, r.val) for r in result if r.weight > 0)
+    return sorted((r.pk, r.val) for r in result)
 
 
 def _pks(result):
-    return {r.pk for r in result if r.weight > 0}
+    return {r.pk for r in result}
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +234,7 @@ def test_mixed_shapes_base_and_view(client):
 
         res = client.scan_many([t, v])
         t_count = len(_rows(res[0]))
-        v_count = next(r.c for r in res[1] if r.weight > 0)
+        v_count = next(r.c for r in res[1])
         assert t_count == 20
         assert v_count == t_count, "aggregate view agrees with the base at the same cut"
     finally:
@@ -426,7 +426,7 @@ def test_fifo_ordering_big_then_small(reply_frame_budget_server):
         c.push(dim, db)
         res = c.scan_many([big, dim])
         assert _rows(res[0]) == big_rows
-        assert sorted((r.pk, r.s) for r in res[1] if r.weight > 0) == [(i, f"name-{i}") for i in range(5)]
+        assert sorted((r.pk, r.s) for r in res[1]) == [(i, f"name-{i}") for i in range(5)]
     finally:
         c.drop_schema(sn)
 
@@ -459,9 +459,9 @@ def test_base_scan_is_fresh_with_dependent_views(client):
 
         want = sorted(range(60))
         single = client.scan(tid)
-        assert sorted(r.id for r in single if r.weight > 0) == want
+        assert sorted(r.id for r in single) == want
         multi = client.scan_many([tid])
-        assert sorted(r.id for r in multi[0] if r.weight > 0) == want
+        assert sorted(r.id for r in multi[0]) == want
         assert multi[0].lsn == single.lsn
     finally:
         client.drop_schema(sn)

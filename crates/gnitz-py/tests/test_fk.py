@@ -575,7 +575,7 @@ class TestFkMultiWorker:
                 )
             # Verify all children exist
             child_tid = client.resolve_table(sn, "child")[0]
-            rows = [r for r in client.scan(child_tid) if r.weight > 0]
+            rows = list(client.scan(child_tid))
             assert len(rows) == 15
         finally:
             _cleanup(client, sn, "child", "parent")
@@ -656,7 +656,7 @@ class TestFkMultiWorker:
                 schema_name=sn,
             )
             parent_tid = client.resolve_table(sn, "parent")[0]
-            rows = [r for r in client.scan(parent_tid) if r.weight > 0]
+            rows = list(client.scan(parent_tid))
             found = [r for r in rows if r["id"] == 3000]
             assert len(found) == 1
             assert found[0]["val"] == 999
@@ -694,7 +694,7 @@ class TestFkMultiWorker:
                 client.execute_sql(f"INSERT INTO child VALUES {vals}", schema_name=sn)
 
             child_tid = client.resolve_table(sn, "child")[0]
-            rows = [r for r in client.scan(child_tid) if r.weight > 0]
+            rows = list(client.scan(child_tid))
             assert len(rows) == n
         finally:
             _cleanup(client, sn, "child", "parent")

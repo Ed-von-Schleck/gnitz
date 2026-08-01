@@ -140,7 +140,7 @@ def test_cross_sign_u64_i64_join(client):
 
         # `_join_pk` is a hidden key slot, so `include_hidden=True` surfaces it at
         # its physical position (column 0) for this wide-PK decode tripwire.
-        rows = [r for r in client.scan(vid, include_hidden=True) if r.weight > 0]
+        rows = list(client.scan(vid, include_hidden=True))
 
         # Equality + co-partition: exactly the logically-equal pairs match.
         # customer -7 (signed) matches no unsigned order; order customer_id
@@ -214,10 +214,10 @@ def test_cross_sign_u64_i64_project_key_column(client):
             schema_name=sn,
         )
 
-        pk_rows = sorted(r["k"] for r in client.scan(vpk_id) if r.weight > 0)
+        pk_rows = sorted(r["k"] for r in client.scan(vpk_id))
         assert pk_rows == [5, 5, 100], f"projected key mismatch: {pk_rows}"
 
-        grp = {r["k"]: r["n"] for r in client.scan(vgrp_id) if r.weight > 0}
+        grp = {r["k"]: r["n"] for r in client.scan(vgrp_id)}
         assert grp == {5: 2, 100: 1}, f"GROUP BY projected key mismatch: {grp}"
     finally:
         _cleanup(client, sn, tables=["orders", "customers"], views=["v", "vpk", "vgrp"])

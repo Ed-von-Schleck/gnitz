@@ -358,14 +358,14 @@ def test_view_over_compound_pk_simple_select_accepted(client):
             "INSERT INTO src (a, b, payload) VALUES (1, 1, 100), (1, 2, 200), (2, 1, 300)",
             schema_name=sn,
         )
-        rows = [r for r in client.scan(vid) if r.weight > 0]
+        rows = list(client.scan(vid))
         assert sorted((r["a"], r["b"], r["payload"]) for r in rows) == [
             (1, 1, 100), (1, 2, 200), (2, 1, 300),
         ]
 
         # A row sharing its first PK column with another is retracted distinctly.
         client.execute_sql("DELETE FROM src WHERE a = 1 AND b = 1", schema_name=sn)
-        rows = [r for r in client.scan(vid) if r.weight > 0]
+        rows = list(client.scan(vid))
         assert sorted((r["a"], r["b"], r["payload"]) for r in rows) == [
             (1, 2, 200), (2, 1, 300),
         ]
@@ -379,7 +379,7 @@ def test_view_over_compound_pk_simple_select_accepted(client):
 
 def _group_rows(client, vid, *cols):
     """Read a view's named payload columns into a sorted list of tuples."""
-    rows = [r for r in client.scan(vid) if r.weight > 0]
+    rows = list(client.scan(vid))
     return sorted(tuple(r[c] for c in cols) for r in rows)
 
 
@@ -594,17 +594,17 @@ def test_compound_pk_union_view_e2e(client):
             "INSERT INTO t2 (a, b, val) VALUES (5, 9, 200), (7, 3, 400)",
             schema_name=sn,
         )
-        rows = [r for r in client.scan(vid) if r.weight > 0]
+        rows = list(client.scan(vid))
         assert sorted(r["val"] for r in rows) == [100, 200, 300, 400]
 
         # Retract one carrier of 200 (from t1); 200 still carried by t2 → survives.
         client.execute_sql("DELETE FROM t1 WHERE a = 1 AND b = 2", schema_name=sn)
-        rows = [r for r in client.scan(vid) if r.weight > 0]
+        rows = list(client.scan(vid))
         assert sorted(r["val"] for r in rows) == [100, 200, 300, 400]
 
         # Retract the other carrier of 200 (from t2) → 200 is fully retracted.
         client.execute_sql("DELETE FROM t2 WHERE a = 5 AND b = 9", schema_name=sn)
-        rows = [r for r in client.scan(vid) if r.weight > 0]
+        rows = list(client.scan(vid))
         assert sorted(r["val"] for r in rows) == [100, 300, 400]
     finally:
         try:
@@ -632,17 +632,17 @@ def test_compound_pk_distinct_view_e2e(client):
             "INSERT INTO t (a, b, payload) VALUES (1, 10, 7), (1, 20, 7), (2, 10, 9)",
             schema_name=sn,
         )
-        rows = [r for r in client.scan(vid) if r.weight > 0]
+        rows = list(client.scan(vid))
         assert sorted(r["payload"] for r in rows) == [7, 9]
 
         # Drop one carrier of 7 → 7 still present via (1, 20).
         client.execute_sql("DELETE FROM t WHERE a = 1 AND b = 10", schema_name=sn)
-        rows = [r for r in client.scan(vid) if r.weight > 0]
+        rows = list(client.scan(vid))
         assert sorted(r["payload"] for r in rows) == [7, 9]
 
         # Drop the last carrier of 7 → 7 retracted.
         client.execute_sql("DELETE FROM t WHERE a = 1 AND b = 20", schema_name=sn)
-        rows = [r for r in client.scan(vid) if r.weight > 0]
+        rows = list(client.scan(vid))
         assert sorted(r["payload"] for r in rows) == [9]
     finally:
         try:
@@ -809,7 +809,7 @@ def test_unique_index_on_compound_pk_column_distinct_ok(client, a_type, _dup, ro
         values = ", ".join(f"({a}, {b})" for a, b in rows)
         client.execute_sql(f"INSERT INTO src (a, b) VALUES {values}", schema_name=sn)
         tid, _ = client.resolve_table(sn, "src")
-        got = sorted((row.a, row.b) for row in client.scan(tid) if row.weight > 0)
+        got = sorted((row.a, row.b) for row in client.scan(tid))
         assert got == sorted(rows)
     finally:
         _cleanup(client, sn, "src")
@@ -965,7 +965,7 @@ def test_fk_parent_delete_with_null_referenced_value(client):
         client.execute_sql("DELETE FROM p WHERE pid = 1", schema_name=sn)
         results = client.execute_sql("SELECT * FROM p", schema_name=sn)
         rows_result = next(r for r in results if r["type"] == "Rows")
-        assert [row for row in rows_result["rows"]] == []
+        assert list(rows_result["rows"]) == []
     finally:
         _cleanup(client, sn, "p", "c")
 

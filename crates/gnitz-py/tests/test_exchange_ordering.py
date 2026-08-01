@@ -11,7 +11,7 @@ def _uid() -> str:
 
 
 def _scan_positive(client, tid):
-    return [r for r in client.scan(tid) if r.weight > 0]
+    return list(client.scan(tid))
 
 
 def test_multi_source_join_tick_consistency(client):
