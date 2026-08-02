@@ -114,6 +114,23 @@ impl DepMap {
         self.valid = true;
         &self.forward
     }
+
+    /// Transitive closure of `seeds` over one half of the map, seeds excluded.
+    /// Both directions are this one walk, so they cannot drift: `forward` reaches
+    /// a source's dependents, `reverse` reaches a view's sources, and
+    /// `get_or_rebuild` writes both halves from the same DepTab row.
+    fn closure(edges: &FxHashMap<i64, Vec<i64>>, seeds: Vec<i64>) -> FxHashSet<i64> {
+        let mut reachable: FxHashSet<i64> = FxHashSet::default();
+        let mut stack = seeds;
+        while let Some(id) = stack.pop() {
+            for &next in edges.get(&id).into_iter().flatten() {
+                if reachable.insert(next) {
+                    stack.push(next);
+                }
+            }
+        }
+        reachable
+    }
 }
 
 impl DagEngine {
@@ -143,23 +160,23 @@ impl DagEngine {
         compiler::scan_source_ids(&self.load_meta_circuit(view_id))
     }
 
-    /// Transitive dependent closure of `seeds` over the view dependency map:
-    /// every view reachable by following `source → dependents` edges, with the
-    /// seeds themselves excluded.
+    /// Every view reachable from `seeds` by following `source → dependents`
+    /// edges, with the seeds themselves excluded.
     pub(super) fn dependent_closure(&mut self, seeds: Vec<i64>) -> FxHashSet<i64> {
         self.get_dep_map();
-        let mut reachable: FxHashSet<i64> = FxHashSet::default();
-        let mut stack = seeds;
-        while let Some(id) = stack.pop() {
-            if let Some(deps) = self.dep.forward.get(&id) {
-                for &d in deps {
-                    if reachable.insert(d) {
-                        stack.push(d);
-                    }
-                }
-            }
-        }
-        reachable
+        DepMap::closure(&self.dep.forward, seeds)
+    }
+
+    /// Every relation reachable from `seeds` by following `view → sources` edges
+    /// — through view sources, down to the bases — with the seeds themselves
+    /// excluded.
+    ///
+    /// Applies no `tables` kind filter, so a source absent from `tables` is still
+    /// reported: the read-freshness test that drives this must not narrow its own
+    /// input, or a dropped source would vanish from the closure and read as fresh.
+    pub(crate) fn source_closure(&mut self, seeds: Vec<i64>) -> FxHashSet<i64> {
+        self.get_dep_map();
+        DepMap::closure(&self.dep.reverse, seeds)
     }
 
     /// The distinct ids of `view_ids` in dependency order (Kahn's algorithm over
@@ -217,30 +234,13 @@ impl DagEngine {
     /// base reachable from *all* views through `drain_tick_blocking`. Sorted for a
     /// reproducible drive order.
     pub fn base_tables_reachable_from(&mut self, seeds: Vec<i64>) -> Vec<i64> {
-        let mut bases: FxHashSet<i64> = FxHashSet::default();
-        // `visited` (seeded with the input views) collapses shared sub-graphs
-        // so each view is walked once.
-        let mut visited: FxHashSet<i64> = seeds.iter().copied().collect();
-        let mut stack = seeds;
-        while let Some(node) = stack.pop() {
-            for s in self.get_source_ids(node) {
-                match self.tables.get(&s).map(|e| e.kind) {
-                    Some(RelationKind::BaseTable) => {
-                        bases.insert(s);
-                    }
-                    Some(RelationKind::View) if visited.insert(s) => stack.push(s),
-                    _ => {} // unregistered / system source, or already-visited view
-                }
-            }
-        }
-        let mut bases: Vec<i64> = bases.into_iter().collect();
+        let mut bases: Vec<i64> = self
+            .source_closure(seeds)
+            .into_iter()
+            .filter(|s| self.tables.get(s).is_some_and(|e| e.kind.is_base_table()))
+            .collect();
         bases.sort_unstable();
         bases
-    }
-
-    /// True iff `id` is a registered view. The one spelling of the kind probe.
-    pub(crate) fn relation_is_view(&self, id: i64) -> bool {
-        self.tables.get(&id).is_some_and(|e| e.kind.is_view())
     }
 
     /// True iff `id`'s output is a full copy on every worker — the bit stamped on

@@ -396,9 +396,8 @@ async fn run_checkpoint_sequence(
     // Step 2 — DRAIN (lock released). One Drain suffices: the tick loop walks the
     // source's full dependent closure with inline exchange rounds, and pushes are
     // held so `tick_tids` cannot grow. Mirrors the SCAN drain.
-    let tids = shared.tick_tids.borrow().clone();
     let (done_tx, done_rx) = oneshot::channel::<Result<(), String>>();
-    shared.tick_tx.send(TickTrigger::Drain { tids, done: done_tx });
+    shared.tick_tx.send(TickTrigger::Drain { done: done_tx });
     let drained = await_servicing(
         done_rx,
         rx,

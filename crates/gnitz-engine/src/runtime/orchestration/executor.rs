@@ -61,15 +61,11 @@ pub enum TickTrigger {
     /// Fire-and-forget trigger from INSERT when a tid crosses the row
     /// coalesce threshold.  Tids come from `tick_rows` / `tick_tids`.
     Auto,
-    /// Explicit drain requested by SCAN: forces the listed tids to tick
-    /// even if their `tick_rows` counter is empty, then reports the tick's
-    /// verdict on `done`. A reader that waited on a failed tick must be told:
-    /// its view is stale, and reporting success would serve stale rows under
-    /// `STATUS_OK`.
-    Drain {
-        tids: Vec<i64>,
-        done: oneshot::Sender<Result<(), String>>,
-    },
+    /// Explicit drain requested by a read or by the checkpoint: tick whatever is
+    /// pending — even nothing — and report the tick's verdict on `done`. A reader
+    /// that waited on a failed tick must be told: its view is stale, and reporting
+    /// success would serve stale rows under `STATUS_OK`.
+    Drain { done: oneshot::Sender<Result<(), String>> },
     /// Pause the tick subsystem for a stop-the-world CREATE-VIEW DDL. On
     /// dequeue the tick loop signals `acked` — proving no tick is in flight
     /// (the loop is serial, so the prior tick has returned) and none will
@@ -253,10 +249,13 @@ impl Shared {
         }
     }
 
-    /// OCC: the zone LSN of `tid`'s last committed write this boot, or `boot_seed`
-    /// for a table not written this boot (which can never conflict — every live
-    /// basis is ≥ `boot_seed`). The single reader, so the miss default lives in
-    /// one place; read under the precondition check's table lock.
+    /// The zone LSN of `tid`'s last committed write this boot, or `boot_seed` for
+    /// a table not written this boot. The miss default is sound for both readers:
+    /// OCC (`push_txn_body`'s precondition check, under that table's write lock)
+    /// because every live basis is ≥ `boot_seed` — see the field; read freshness
+    /// (`read_is_fresh`) because `boot_seed` is the same `initial_lsn`
+    /// `last_tick_lsn` is seeded to, so an unwritten table compares as absorbed,
+    /// which it is — boot finishes its recovery tick sweep first.
     fn commit_lsn_of(&self, tid: i64) -> u64 {
         self.table_commit_lsn
             .borrow()
@@ -788,26 +787,12 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>) {
             }
         }
 
-        // Build the tid set: union of drained tick_rows (in INSERT order)
-        // + explicit tids from SCAN triggers. The order is load-bearing:
-        // anti-join semantics (EXCEPT, NOT IN, etc.) rely on processing
-        // ticks in the order pushes arrived. Reordering causes the b-side
-        // trace to be empty when a-side ticks (and vice versa), leaking
+        // Take the whole pending queue, in INSERT order. The order is
+        // load-bearing: anti-join semantics (EXCEPT, NOT IN, etc.) rely on
+        // processing ticks in the order pushes arrived. Reordering causes the
+        // b-side trace to be empty when a-side ticks (and vice versa), leaking
         // rows that should have cancelled.
         shared.drain_tick_rows_into(&mut tids_scratch);
-        let has_drain = triggers.iter().any(|t| matches!(t, TickTrigger::Drain { .. }));
-        if has_drain {
-            let mut seen: FxHashSet<i64> = tids_scratch.iter().copied().collect();
-            for t in &triggers {
-                if let TickTrigger::Drain { tids: v, .. } = t {
-                    for &tid in v {
-                        if seen.insert(tid) {
-                            tids_scratch.push(tid);
-                        }
-                    }
-                }
-            }
-        }
         tids_scratch.retain(|&tid| shared.cat().has_id(tid));
 
         // Run the tick. Errors are reported in logs AND handed to every Drain
@@ -840,13 +825,21 @@ async fn run_tick(
     fut_slots: &mut Vec<ReplyFuture>,
     ack_slots: &mut Vec<Option<ipc::DecodedWire>>,
 ) -> Result<(), String> {
-    if tids.is_empty() {
-        return Ok(());
-    }
     // Snapshot before any .await: a concurrent push can advance the published LSN
     // while we wait for tick ACKs, and setting last_tick_lsn to that
     // higher value would report an LSN that this tick never processed.
     let snapshot_lsn = shared.lsn_alloc.published();
+    if tids.is_empty() {
+        // Nothing pending: an earlier completed tick already took every commit
+        // published at or below the snapshot, because the committer queues a tid
+        // before it publishes that commit's zone LSN. The watermark still
+        // advances — `read_is_fresh` reads it, and a reader whose source
+        // committed between a tick's dequeue and its publish would otherwise
+        // never see its drain take effect. Skips two uncontended lock
+        // acquisitions the rest of the body would take for a no-op.
+        shared.last_tick_lsn.set(snapshot_lsn);
+        return Ok(());
+    }
 
     req_ids.clear();
     req_ids.extend((0..tids.len() * nw).map(|_| shared.reactor.alloc_request_id()));
@@ -1733,85 +1726,82 @@ async fn handle_get_indices(shared: &Rc<Shared>, peer: &Peer, client_id: u64, ta
     peer.send_buffer_or_close(buf).await;
 }
 
-/// Drain every pending view tick before a read, returning with NO catalog lock
-/// held. Views derive from source-table pushes through the DAG (IV.2), so a read
-/// must first flush any in-flight auto-tick.
+/// Drive one tick of everything pending, returning with NO catalog lock held.
+/// Views derive from source-table pushes through the DAG (IV.2), so a read of a
+/// stale view must first flush the pending — possibly in-flight — tick carrying
+/// its sources' deltas.
 ///
-/// Fast path: if `last_tick_lsn >= lsn_alloc.published()`, every published —
-/// hence every ACKed — commit is already reflected in all views, so return
-/// without a drain. Sound because `run_tick` snapshots `published()` into
-/// `last_tick_lsn` before any `.await`, atomically with the tid set it drains,
-/// while the committer bumps `tick_tids` before it publishes the zone LSN before
-/// it ACKs the push. So `last_tick_lsn >= L` ⇒ L's tid was in some completed
-/// tick's drained set ⇒ L is reflected. The test can under-report (one extra
-/// drain) but never over-report (a stale read). Cross-client causality holds:
-/// any un-ticked published commit forces `last_tick_lsn < published()`, so the
-/// full drain runs — including serializing behind an in-flight auto-tick, which
-/// has not yet advanced `last_tick_lsn`.
+/// One pass suffices for every commit the caller can have observed. A commit at
+/// zone LSN `L` is published before its ACK, so `published() >= L` by the time
+/// the drain is requested; `run_tick` snapshots `published()` at tick start,
+/// later still, and stores it in `last_tick_lsn` on success. Whatever the tid set
+/// was, the completed tick therefore leaves `last_tick_lsn >= L`.
 ///
-/// Slow path: send a `Drain` trigger unconditionally — even when `tick_tids`
-/// looks empty — and await its ack, repeating until nothing new queued during
-/// the wait (the re-check keeps a push that arrives mid-drain from slipping
-/// past; the tick loop drains the live `tick_tids` and unions each Drain
-/// trigger's snapshot on top). The tick loop processes triggers serially, so
-/// awaiting `done` serializes behind a concurrent Auto; without it a large push
-/// fires Auto asynchronously and the read could observe the view before the tick
-/// body finishes, leaving it apparently empty until the next read.
+/// The trigger is sent even when nothing looks pending: the tick loop processes
+/// triggers serially, so awaiting `done` also serializes behind a concurrent
+/// Auto. Without it a large push fires Auto asynchronously and the read could
+/// observe the view mid-tick, apparently empty until the next read.
 ///
-/// MUST be called BEFORE taking the catalog read lock: the drain parks at
-/// `rx.await`, and the writer-preferring `AsyncRwLock` held across that park
-/// would block DDL writers and `tick_loop`'s own read lock — a three-way
-/// deadlock (BF-1). Under an unbounded concurrent write storm the loop can
-/// iterate for the storm's duration (each pass sees `tick_tids` non-empty); the
-/// caller's own ACKed writes are covered after pass 1. View seeks confine this
-/// to views — base-table seeks never call it.
-/// A failed tick is reported rather than swallowed: its views are stale, and the
-/// error also stops the loop from spinning on the `tick_tids` the failure
-/// re-queued.
+/// MUST be called with NO catalog read lock held: the drain parks at `rx.await`,
+/// and the writer-preferring `AsyncRwLock` held across that park would block DDL
+/// writers and `tick_loop`'s own read lock — a three-way deadlock (BF-1).
+///
+/// A failed tick is reported rather than swallowed: its views are stale, and
+/// serving them under `STATUS_OK` would be a silent stale read.
 async fn drain_pending_ticks(shared: &Rc<Shared>) -> Result<(), String> {
-    // Fast path: views already reflect every ACKed commit (see above).
-    if shared.last_tick_lsn.get() >= shared.lsn_alloc.published() {
-        return Ok(());
-    }
-    loop {
-        let snapshot: Vec<i64> = shared.tick_tids.borrow().clone();
-        let was_empty = snapshot.is_empty();
-        let (tx, rx) = oneshot::channel::<Result<(), String>>();
-        shared.tick_tx.send(TickTrigger::Drain {
-            tids: snapshot,
-            done: tx,
-        });
-        // A cancelled receiver means the tick loop is gone; treat it as done.
-        if let Ok(Err(e)) = rx.await {
-            return Err(e);
-        }
-        if was_empty && shared.tick_tids.borrow().is_empty() {
-            break;
-        }
+    let (tx, rx) = oneshot::channel::<Result<(), String>>();
+    shared.tick_tx.send(TickTrigger::Drain { done: tx });
+    // A cancelled receiver means the tick loop is gone; treat it as done.
+    if let Ok(Err(e)) = rx.await {
+        return Err(e);
     }
     Ok(())
 }
 
-/// True iff `tid` names a view — the one thing that decides whether a pending
-/// tick can change what a read sees, since `dep.forward`'s values are view ids
-/// only. An unknown tid is not a view. The caller must hold the catalog read
-/// lock; `is_some_and` ends the `dag.tables` borrow before the caller's next
-/// await.
-fn is_view(shared: &Rc<Shared>, tid: i64) -> bool {
-    shared.cat().dag.relation_is_view(tid)
+/// True when no un-ticked commit can reach `target`: every source feeding it —
+/// transitively, through view sources — committed at or below the last completed
+/// tick's watermark, so a completed tick has absorbed all of them.
+///
+/// Soundness, for a commit `C` to base table `S ∈ source_closure(target)` at zone
+/// LSN `L` that was ACKed to a client. `record_commit_lsn` precedes that ACK on
+/// both commit paths and records a `max`, so `commit_lsn_of(S) >= L`. If the test
+/// passes then `L <= last_tick_lsn`, which some completed tick `T` took from its
+/// `published()` snapshot. The committer marks `S` in `tick_tids` before it
+/// publishes `L`, and only after the workers ACKed the write; `T`'s dequeue and
+/// its snapshot are one await-free span on the single-threaded reactor, so the
+/// mark preceded the dequeue and `S` was in `T`'s tid set. `T` therefore emitted
+/// `S`'s tick group, whose `handle_tick` took the `pending_deltas` holding `C`
+/// and fanned it along the same `dep` edges this closure mirrors.
+///
+/// Under-reporting (one extra drain) is possible and harmless: the test is stated
+/// over ACKed commits, so a commit published but whose connection task died
+/// before recording its LSN is invisible to it — and no client can have observed
+/// such a write.
+///
+/// A non-view target is vacuously fresh: `dep.reverse` is keyed by view ids only,
+/// so its closure is empty. Caller holds the catalog read lock; the whole call is
+/// synchronous, so `source_closure`'s `&mut` rebuild crosses no await.
+fn read_is_fresh(shared: &Rc<Shared>, target: i64) -> bool {
+    let ticked = shared.last_tick_lsn.get();
+    shared
+        .cat()
+        .dag
+        .source_closure(vec![target])
+        .into_iter()
+        .all(|s| shared.commit_lsn_of(s) <= ticked)
 }
 
 /// Take the catalog read lock and resolve `target_id`'s kind from the same probe
-/// that validated it, draining pending view ticks first only when the target is a
-/// view. Returns `(guard, kind)`, or `None` if the target was rejected (error
-/// already sent). The one read-lock entry point for every single-target read verb:
-/// each one routes on the returned kind rather than re-deciding the system/user
-/// split from the id.
+/// that validated it, draining pending ticks first only when the target is a view
+/// `read_is_fresh` reports stale. Returns `(guard, kind)`, or `None` if the target
+/// was rejected (error already sent). The one read-lock entry point for every
+/// single-target read verb: each one routes on the returned kind rather than
+/// re-deciding the system/user split from the id.
 ///
 /// A base table's rows AND its secondary indexes are written by the same ingest
 /// apply, which is what makes skipping the drain safe for an `IndexRange` bound
-/// too. A view drops the lock, drains with NO lock held (BF-1), then re-locks and
-/// re-resolves — a DDL may have dropped it during the drain.
+/// too. A stale view drops the lock, drains with NO lock held (BF-1), then
+/// re-locks and re-resolves — a DDL may have dropped it during the drain.
 async fn read_lock(
     shared: &Rc<Shared>,
     peer: &Peer,
@@ -1821,7 +1811,7 @@ async fn read_lock(
     {
         let g = shared.catalog_rwlock.read().await;
         let kind = resolve_read_target(shared, peer, client_id, target_id).await?;
-        if !kind.is_view() {
+        if !kind.is_view() || read_is_fresh(shared, target_id) {
             return Some((g, kind));
         }
     }
@@ -2004,14 +1994,14 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
     let tids: Vec<u64> = relations.iter().map(|(tid, _)| *tid).collect();
     gnitz_wire::validate_scan_multi_tids(&tids)?;
 
-    // Drain pending ticks once — but only if some target is a view, the same rule
-    // `read_lock` applies to a single target — and with NO catalog lock held
-    // (BF-1). The classifying lock is dropped before the drain; Phase 1 re-resolves
-    // every tid's kind under a fresh lock, so a DDL during the drain is caught
-    // there, and an unknown tid is rejected there rather than here.
+    // Drain once if any target is a stale view — the same test `read_lock` runs
+    // for a single target (a non-view is vacuously fresh) — and with NO catalog
+    // lock held (BF-1). The classifying lock is dropped before the drain; Phase 1
+    // re-resolves every tid's kind under a fresh lock, so a DDL during the drain
+    // is caught there, and an unknown tid is rejected there rather than here.
     let needs_drain = {
         let _cat = shared.catalog_rwlock.read().await;
-        tids.iter().any(|&t| is_view(shared, t as i64))
+        tids.iter().any(|&t| !read_is_fresh(shared, t as i64))
     };
     if needs_drain {
         drain_pending_ticks(shared).await?;
