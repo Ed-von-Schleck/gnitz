@@ -488,6 +488,17 @@ impl Table {
         rc
     }
 
+    /// Raw rows across this table's three read tiers — memtable runs, RAM tier,
+    /// shards — summed by arithmetic alone: no `Rc` is cloned, no merge tree is
+    /// built, nothing is repositioned. Raw, so cross-run duplicates and ghosts
+    /// are counted; that is an upper bound on what a walk would emit, which is
+    /// what the index selectivity gate compares its measured range size against.
+    pub(crate) fn estimated_rows(&self) -> usize {
+        self.memtable.snapshot_runs().iter().map(|r| r.count).sum::<usize>()
+            + self.in_memory_l0.iter().map(|r| r.batch.count).sum::<usize>()
+            + self.shard_index.total_rows()
+    }
+
     /// Borrow the current memtable runs (for PartitionedTable cursor
     /// gathering).  See `MemTable::snapshot_runs` for lifetime rules.
     pub(crate) fn snapshot_runs(&self) -> &[Rc<Batch>] {

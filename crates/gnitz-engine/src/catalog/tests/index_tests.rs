@@ -3285,12 +3285,15 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     // reorders by the full 24-byte key.
     //
     // Wide PKs are DDL-rejected for base tables, so this builds the DAG table and
-    // index circuit directly (as `wide_pk_validation.rs` does). The leading PK
-    // column is distinct per row: the base flush orders the shard by the wide PK,
-    // which the resolve's binary-search seek relies on.
+    // index circuit directly (as `wide_pk_validation.rs` does). The base is a
+    // 256-way `PartitionedTable`, the only shape an index owner takes in
+    // production — the range gather routes each collected PK to its own
+    // partition, which a borrowed single `Table` could not exercise. The leading
+    // PK column is distinct per row: the base flush orders each partition's shard
+    // by the wide PK, which the resolve's binary-search seek relies on.
     use crate::query::{DagEngine, RelationKind, StoreHandle};
     use crate::schema::{SchemaColumn, SchemaDescriptor};
-    use crate::storage::{RecoverySource, Table};
+    use crate::storage::{PartitionedTable, RecoverySource, Routing, Table};
 
     fn u64c() -> SchemaColumn {
         SchemaColumn::new(type_code::U64, 0)
@@ -3332,16 +3335,14 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
         &idx_schema,
     );
 
-    let mut base = Box::new(
-        Table::new(
-            &format!("{dir}/base"),
-            schema,
-            tid as u32,
-            256 * 1024,
-            RecoverySource::Rederive,
-        )
-        .unwrap(),
-    );
+    let mut base = PartitionedTable::new(
+        &format!("{dir}/base"),
+        schema,
+        tid as u32,
+        Routing::Hashed { start: 0, end: 256 },
+        RecoverySource::Rederive,
+    )
+    .unwrap();
     let mut idx = Table::new(
         &format!("{dir}/idx"),
         idx_schema,
@@ -3357,7 +3358,7 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
 
     engine.dag.register_table(
         tid,
-        StoreHandle::Borrowed(&mut *base as *mut Table),
+        StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(base))),
         schema,
         RelationKind::BaseTable,
         0,

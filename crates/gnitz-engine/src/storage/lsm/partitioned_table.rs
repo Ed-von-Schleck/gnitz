@@ -179,14 +179,6 @@ impl PartitionedTable {
         self.routing.is_unhashed()
     }
 
-    /// True when [`open_cursor`](Self::open_cursor) could return `key` (full OPK
-    /// bytes) — the discard test for a broadcast key list. It asks the same
-    /// `slot_for_key` every keyed read does, so a caller never drops a key the
-    /// cursor would have found.
-    pub(crate) fn cursor_may_hold_key(&self, key: &[u8]) -> bool {
-        self.slot_for_key(key).is_some()
-    }
-
     // ------------------------------------------------------------------
     // Ingest
     // ------------------------------------------------------------------
@@ -297,6 +289,26 @@ impl PartitionedTable {
                 read_cursor::create_read_cursor(&snaps, &shards, self.schema)
             }
         }
+    }
+
+    /// A cursor over ONLY the partition that could hold `key` (full OPK bytes),
+    /// or `None` when this process holds none. [`open_cursor`](Self::open_cursor)
+    /// merges every partition; for an exact key all but one of them contribute
+    /// nothing but a loser-tree leaf and a binary search per probe.
+    ///
+    /// Resolution is [`slot_for_key`](Self::slot_for_key) — the function ingest
+    /// routes through — so a probe can never miss a row the merged cursor would
+    /// have found.
+    pub(crate) fn open_cursor_for_key(&self, key: &[u8]) -> Option<ReadCursor> {
+        self.slot_for_key(key).map(|local| self.tables[local].open_cursor())
+    }
+
+    /// Raw run and shard rows across every local partition, without building a
+    /// cursor. Not equal to `open_cursor().estimated_length()`: `ReadCursor::new`
+    /// drives once at open, so the cursor's figure is one group lower — an
+    /// irrelevant difference to the ratio the selectivity gate takes.
+    pub(crate) fn estimated_rows(&self) -> usize {
+        self.tables.iter().map(Table::estimated_rows).sum()
     }
 
     /// Run `compact_if_needed` on every partition. Maintenance-only; readers
@@ -458,6 +470,52 @@ impl PartitionedTable {
 }
 
 // ---------------------------------------------------------------------------
+// PartitionProbe
+// ---------------------------------------------------------------------------
+
+/// Per-partition cursors for a multi-key read, opened on first touch and keyed
+/// by local slot. A probe reads only the partition its key hashes into, so the
+/// merge width is one partition's runs rather than the whole store's; a read
+/// that touches one key ever opens exactly one cursor.
+///
+/// Probing in globally ascending key order keeps each routed cursor's own sweep
+/// monotone, so a gather over ascending keys stays (PK, payload)-ascending for
+/// free.
+///
+/// The store is a **per-call** argument rather than a field: a probe outlives
+/// its construction call and is driven while `&mut CatalogEngine` is in use
+/// between chunks, so it cannot hold a borrow.
+pub(crate) struct PartitionProbe {
+    slots: Vec<Option<Box<ReadCursor>>>,
+}
+
+impl PartitionProbe {
+    /// One (unopened) slot per local partition of `store`.
+    pub(crate) fn new(store: &PartitionedTable) -> Self {
+        PartitionProbe {
+            slots: (0..store.tables.len()).map(|_| None).collect(),
+        }
+    }
+
+    /// The cursor over the partition holding `key` (full OPK bytes), opening it
+    /// on first touch — or `None` when this process holds no such partition,
+    /// which is exactly "the merged cursor could not have returned `key`".
+    pub(crate) fn probe<'s>(&'s mut self, store: &PartitionedTable, key: &[u8]) -> Option<&'s mut ReadCursor> {
+        // `slot_for_key` bounds `local` by the store's current child count, and
+        // `slots` was sized from that same list, which never grows.
+        let local = store.slot_for_key(key)?;
+        let slot = &mut self.slots[local];
+        Some(slot.get_or_insert_with(|| Box::new(store.tables[local].open_cursor())))
+    }
+
+    /// How many partition cursors have been opened so far.
+    #[cfg(test)]
+    pub(crate) fn open_count(&self) -> usize {
+        self.slots.iter().filter(|s| s.is_some()).count()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared test fixture
 // ---------------------------------------------------------------------------
 
@@ -603,6 +661,13 @@ mod tests {
         make_batch_raw(&make_schema_u64_i64(), rows)
     }
 
+    /// The I64 payload (logical column 1) of a positioned cursor's current row.
+    fn cursor_val(c: &ReadCursor) -> i64 {
+        let ptr = c.col_ptr(1, 8);
+        assert!(!ptr.is_null(), "payload column 1 is present on a positioned row");
+        i64::from_le_bytes(unsafe { std::slice::from_raw_parts(ptr, 8) }.try_into().unwrap())
+    }
+
     #[test]
     fn single_partition_lifecycle() {
         raise_fd_limit_for_tests();
@@ -627,47 +692,181 @@ mod tests {
         assert!(pt.has_pk(10));
     }
 
-    /// `cursor_may_hold_key` mirrors `open_cursor`'s clauses: an unhashed store
-    /// can hold any key (its one child holds the whole local dataset), a hashed
-    /// store exactly the keys hashing into its own partition range, and a store
-    /// with no children none at all.
+    /// Every keyed read routes through `slot_for_key`, so a routed cursor must
+    /// answer exactly what the merged whole-store cursor answers — over a fully
+    /// hashed store, a hashed store trimmed to a sub-range (a key outside it
+    /// yields `None`), an **unhashed** store (whose one child holds the whole
+    /// local dataset, and which resolving through `local_slot` alone would
+    /// silently report as empty), and a store with no children at all.
     #[test]
-    fn cursor_may_hold_key_mirrors_the_cursor() {
+    fn open_cursor_for_key_matches_the_merged_cursor() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
+        // Present keys 0..256 (even payload), absent probes 1000..1064.
+        let rows: Vec<(u64, i64, i64)> = (0..256u64).map(|k| (k, 1, (k * 10) as i64)).collect();
         let build = |name: &str, routing| {
             let tdir = dir.path().join(name);
-            PartitionedTable::new(tdir.to_str().unwrap(), schema, 300, routing, RecoverySource::Rederive).unwrap()
+            let mut pt =
+                PartitionedTable::new(tdir.to_str().unwrap(), schema, 300, routing, RecoverySource::Rederive).unwrap();
+            pt.ingest_owned_batch(make_batch(&rows)).unwrap();
+            pt
         };
-        // Enough distinct keys that every partition range sees both verdicts.
-        let keys: Vec<_> = (0u128..512)
+        // The whole-store answer for `key`: the live payload, or `None`.
+        let whole = |pt: &PartitionedTable, key: &[u8]| -> Option<i64> {
+            let mut c = pt.open_cursor();
+            c.seek_exact_live(key).then(|| cursor_val(&c))
+        };
+        let routed = |pt: &PartitionedTable, key: &[u8]| -> Option<i64> {
+            let mut c = pt.open_cursor_for_key(key)?;
+            c.seek_exact_live(key).then(|| cursor_val(&c))
+        };
+        let keys: Vec<_> = (0u128..256)
+            .chain(1000..1064)
             .map(|k| crate::schema::key::opk_key(&schema, &k.to_le_bytes()))
             .collect();
 
-        let unhashed_store = build("cmhk_unhashed", Routing::Unhashed { rank: 7 });
-        assert!(
-            keys.iter().all(|k| unhashed_store.cursor_may_hold_key(k.pk_bytes())),
-            "an unhashed store can hold any key, whatever rank homes it"
-        );
+        let (trim_start, trim_end) = partition_range(1, 4);
+        for (name, routing) in [
+            ("ocfk_hashed", Routing::Hashed { start: 0, end: 256 }),
+            (
+                "ocfk_trimmed",
+                Routing::Hashed {
+                    start: trim_start,
+                    end: trim_end,
+                },
+            ),
+            ("ocfk_unhashed", Routing::Unhashed { rank: 7 }),
+            ("ocfk_empty", Routing::Hashed { start: 0, end: 0 }),
+        ] {
+            let pt = build(name, routing);
+            let mut hits = 0;
+            for k in &keys {
+                let want = whole(&pt, k.pk_bytes());
+                assert_eq!(routed(&pt, k.pk_bytes()), want, "{name}: key {:?}", k.pk_bytes());
+                hits += usize::from(want.is_some());
+            }
+            match routing {
+                Routing::Hashed { start: 0, end: 0 } => assert_eq!(hits, 0, "{name}: no children hold nothing"),
+                Routing::Unhashed { .. } | Routing::Hashed { start: 0, end: 256 } => {
+                    assert_eq!(hits, rows.len(), "{name}: every ingested key is present")
+                }
+                // The trimmed slice holds its own partitions' share, never all.
+                _ => assert!(hits > 0 && hits < rows.len(), "{name}: partial slice ({hits} hits)"),
+            }
+        }
+    }
 
-        // Worker 1 of 4 → partitions [64, 128).
-        let (start, end) = partition_range(1, 4);
-        let hashed = build("cmhk_hashed", Routing::Hashed { start, end });
-        for k in &keys {
-            let p = schema.partition_for_pk(k.pk_bytes()) as u32;
-            assert_eq!(
-                hashed.cursor_may_hold_key(k.pk_bytes()),
-                p >= start && p < end,
-                "partition {p}"
-            );
+    /// `estimated_rows` counts the raw rows ingested across the local
+    /// partitions with all three tiers live at once (memtable runs, RAM tier,
+    /// shards). Asserted against the ingest count, NOT against
+    /// `open_cursor().estimated_length()`, which is one group lower (the cursor
+    /// drives once at open).
+    #[test]
+    fn estimated_rows_counts_every_tier() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("est_rows");
+        let schema = make_schema_u64_i64();
+        // One child, so all three tiers stack on the same `Table` and the sum is
+        // the whole ingest count.
+        let mut pt = PartitionedTable::new(
+            tdir.to_str().unwrap(),
+            schema,
+            860,
+            Routing::Unhashed { rank: 0 },
+            RecoverySource::Rederive,
+        )
+        .unwrap();
+        let run = |lo: u64, hi: u64| -> Vec<(u64, i64, i64)> { (lo..hi).map(|k| (k, 1, k as i64)).collect() };
+
+        // Tier 1 — shards: a flush past the (shrunk) RAM ceiling spills to disk.
+        pt.partitions_mut()[0].set_inmem_ceiling_for_test(100);
+        let shard_rows = run(0, 64);
+        pt.ingest_owned_batch(make_batch(&shard_rows)).unwrap();
+        pt.flush().unwrap();
+        assert!(!pt.tables[0].all_shard_arcs().is_empty(), "the ceiling breach spilled");
+
+        // Tier 2 — RAM tier: at the real ceiling a flush parks its run in heap.
+        pt.partitions_mut()[0].set_inmem_ceiling_for_test(1 << 20);
+        let inmem_rows = run(100, 164);
+        pt.ingest_owned_batch(make_batch(&inmem_rows)).unwrap();
+        pt.flush().unwrap();
+        assert!(pt.tables[0].in_memory_runs().count() > 0, "the flush parked a RAM run");
+
+        // Tier 3 — memtable runs.
+        let mem_rows = run(200, 264);
+        pt.ingest_owned_batch(make_batch(&mem_rows)).unwrap();
+
+        let total = shard_rows.len() + inmem_rows.len() + mem_rows.len();
+        assert_eq!(
+            pt.estimated_rows(),
+            total,
+            "every tier counted once ({total} distinct PKs ingested)"
+        );
+        assert_eq!(
+            pt.open_cursor().estimated_length(),
+            total - 1,
+            "the cursor's figure is one group lower — the gate must not read it"
+        );
+    }
+
+    /// A `PartitionProbe` returns the same rows as the whole-store cursor for
+    /// the same key sequence — including one that revisits a partition after
+    /// leaving it and one that probes backward — and opens exactly the
+    /// partitions its keys reach.
+    #[test]
+    fn partition_probe_matches_the_merged_cursor_and_opens_only_what_it_touches() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = make_schema_u64_i64();
+        let rows: Vec<(u64, i64, i64)> = (0..256u64).map(|k| (k, 1, (k * 10) as i64)).collect();
+        let opk = |k: u64| crate::schema::key::opk_key(&schema, &(k as u128).to_le_bytes());
+        let build = |name: &str, routing| {
+            let tdir = dir.path().join(name);
+            let mut pt =
+                PartitionedTable::new(tdir.to_str().unwrap(), schema, 870, routing, RecoverySource::Rederive).unwrap();
+            pt.ingest_owned_batch(make_batch(&rows)).unwrap();
+            pt
+        };
+        let pt = build("probe_hashed", Routing::Hashed { start: 0, end: 256 });
+        // Ascending, then a revisit-after-leaving and a backward sweep.
+        let sequences: [Vec<u64>; 3] = [(0..64).collect(), vec![0, 1, 200, 2, 201, 3], (0..64).rev().collect()];
+        for seq in &sequences {
+            let mut probe = PartitionProbe::new(&pt);
+            let mut whole = pt.open_cursor();
+            for &k in seq {
+                let key = opk(k);
+                let want = whole
+                    .seek_exact_live(key.pk_bytes())
+                    .then(|| cursor_val(&whole))
+                    .expect("every probed key was ingested");
+                let c = probe.probe(&pt, key.pk_bytes()).expect("all 256 partitions are local");
+                assert!(c.advance_to_exact_live(key.pk_bytes()), "routed cursor finds pk {k}");
+                assert_eq!(cursor_val(c), want, "pk {k}");
+            }
         }
 
-        let empty = build("cmhk_empty", Routing::Hashed { start: 0, end: 0 });
-        assert!(
-            keys.iter().all(|k| !empty.cursor_may_hold_key(k.pk_bytes())),
-            "no children (the post-fork master) → holds nothing"
-        );
+        // One key → one cursor; k keys spanning k partitions → k cursors.
+        let mut probe = PartitionProbe::new(&pt);
+        probe.probe(&pt, opk(7).pk_bytes()).unwrap();
+        assert_eq!(probe.open_count(), 1, "a single key opens a single partition");
+        let mut parts: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut probe = PartitionProbe::new(&pt);
+        for k in 0..32u64 {
+            let key = opk(k);
+            parts.insert(schema.partition_for_pk(key.pk_bytes()));
+            probe.probe(&pt, key.pk_bytes()).unwrap();
+        }
+        assert_eq!(probe.open_count(), parts.len(), "one cursor per distinct partition");
+
+        // A store owning nothing resolves every key to `None` and opens nothing.
+        let empty = build("probe_empty", Routing::Hashed { start: 0, end: 0 });
+        let mut probe = PartitionProbe::new(&empty);
+        for k in 0..32u64 {
+            assert!(probe.probe(&empty, opk(k).pk_bytes()).is_none());
+        }
+        assert_eq!(probe.open_count(), 0);
     }
 
     #[test]

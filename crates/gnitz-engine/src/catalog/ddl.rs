@@ -402,7 +402,9 @@ impl CatalogEngine {
             let mut touched = false;
             let mut first = true;
             loop {
-                let chunk = match handle.drain_chunk(chunk_rows) {
+                // Re-resolved per chunk: the cursor holds no borrow on the store.
+                let drained = handle.drain_chunk(self.partitioned_store(source_id), chunk_rows);
+                let chunk = match drained {
                     Some(chunk) => chunk,
                     // Source dry on the first iteration: feed one empty epoch
                     // through the same body so a global-aggregate reduce's n==0

@@ -5,14 +5,15 @@
 //! caller.
 
 use super::batch::{Batch, Layout};
+use super::partitioned_table::{PartitionProbe, PartitionedTable};
 use super::read_cursor::ReadCursor;
 use crate::schema::key::PkBuf;
 use crate::schema::{IndexKeySpec, SchemaDescriptor, MAX_PK_BYTES};
 use gnitz_expr::RowSource;
 
-/// Resolve already-collected source PKs against a base-table cursor into a
-/// result batch — every live row whose index entry key `[span ‖ src_pk]` lies in
-/// the half-open `[lo, hi)`, at its net `current_weight` (never a hardcoded 1, so
+/// Resolve already-collected source PKs against the base table into a result
+/// batch — every live row whose index entry key `[span ‖ src_pk]` lies in the
+/// half-open `[lo, hi)`, at its net `current_weight` (never a hardcoded 1, so
 /// Z-Set multiplicity is preserved) — or `None` when nothing resolves.
 ///
 /// `lo`/`hi` are the byte bounds of exactly the entries whose PKs were collected
@@ -29,18 +30,20 @@ use gnitz_expr::RowSource;
 /// write path skips a row with a NULL in ANY indexed column, so the gather must
 /// apply that same all-column gate and let `lo`/`hi` do the prefix bounding.
 ///
-/// The cursor is caller-held so a chunked walk resolves every chunk against ONE
-/// base snapshot (a per-chunk re-open would give successive chunks different
-/// snapshots: a torn read no full scan can produce).
+/// The probe is caller-held so a chunked walk resolves every chunk against ONE
+/// base snapshot per partition (a per-chunk re-open would give successive chunks
+/// different snapshots: a torn read no full scan can produce).
 ///
 /// `pks` must be **ascending** and **deduplicated** (each PK group is walked
-/// once). Ascending order makes the probes one monotone forward sweep that keeps
-/// shard pages and merge state hot; the PKs are index entries' source-PK OPK
+/// once). Ascending order makes each routed partition's probes one monotone
+/// forward sweep that keeps shard pages and merge state hot, and makes the
+/// output (PK, payload)-ascending; the PKs are index entries' source-PK OPK
 /// suffixes, whose memcmp order equals base storage order, so a byte sort *is*
 /// the seek order. Ascending **within** a chunk only — chunk N+1's first PK may
 /// sort below chunk N's last, which is why the sweep must stay backward-capable.
 fn gather_source_rows(
-    src_cursor: &mut ReadCursor,
+    probe: &mut PartitionProbe,
+    store: &PartitionedTable,
     src_schema: &SchemaDescriptor,
     pks: &[PkBuf],
     spec: &IndexKeySpec,
@@ -56,18 +59,22 @@ fn gather_source_rows(
     // exactly.
     let mut cand = Batch::with_capacity(*src_schema, pks.len());
     for pk in pks {
-        // A `false` return means no base row at or past `pk` exists. `pks`
-        // ascends within the chunk, so every remaining probe is larger and
-        // equally absent — this break is per-chunk and correct; the next chunk's
-        // (possibly backward) first probe re-enters through the seek inside
-        // `gather_pk_group`.
-        if !src_cursor.gather_pk_group(pk.pk_bytes(), |c| {
+        // `None` = a key this process holds no partition for, which is exactly
+        // the keys a whole-store cursor could not have resolved either.
+        let Some(cursor) = probe.probe(store, pk.pk_bytes()) else {
+            continue;
+        };
+        // `gather_pk_group`'s `false` ("no base row at or past `pk`") bounds only
+        // the partition it was asked, so it says nothing about the larger PKs
+        // still to come in other partitions — the sweep never breaks out of the
+        // loop on it. It is unreachable anyway for a live entry: the write path
+        // writes base before index, so a `current_weight > 0` entry's base row is
+        // present.
+        cursor.gather_pk_group(pk.pk_bytes(), |c| {
             if c.current_weight > 0 {
                 c.copy_current_row_into(&mut cand, c.current_weight);
             }
-        }) {
-            break;
-        }
+        });
     }
     if cand.count == 0 {
         return None;
@@ -158,16 +165,22 @@ fn retain_in_index_range(
 /// (`drain_chunk(usize::MAX)`) is the wire range-seek; the chunked drive is the
 /// bounded backfill scan — one mechanism under both.
 ///
-/// Holds the index cursor and the base cursor **at once**, and neither is
-/// re-opened between chunks: `open_cursor` returns an `Rc` snapshot of the
-/// store's runs held for the whole chunked backfill, so re-opening per chunk
-/// would give successive chunks different snapshots — a torn read no full scan
-/// can produce. Holding both is safe: a
-/// `ReadCursor` owns `Rc<MappedShard>` / `Rc<Batch>`, which pins the mmap rather
-/// than the file, and memtable runs are never mutated in place.
+/// Holds the index cursor and the base-side [`PartitionProbe`] **at once**, and
+/// nothing is re-opened between chunks: `open_cursor` returns an `Rc` snapshot
+/// of a partition's runs, held for the whole chunked backfill, so re-opening per
+/// chunk would give successive chunks different snapshots — a torn read no full
+/// scan can produce. Holding both is safe: a `ReadCursor` owns
+/// `Rc<MappedShard>` / `Rc<Batch>`, which pins the mmap rather than the file,
+/// and memtable runs are never mutated in place.
+///
+/// The probe opens a base partition on first touch, so a range whose keys reach
+/// one partition merges one partition's runs rather than the whole store's. That
+/// the base snapshots are taken *after* the index snapshot is the safe order for
+/// the non-atomic base-then-index write path: an entry the index cursor yields
+/// had its base row written earlier still, so no row can go missing.
 pub(crate) struct BoundedIndexCursor {
     idx: ReadCursor,
-    src: ReadCursor,
+    src: PartitionProbe,
     /// The current chunk window's inclusive lower bound — the walk's `start` at
     /// first, then each chunk's exclusive upper bound in turn.
     start: PkBuf,
@@ -179,16 +192,16 @@ pub(crate) struct BoundedIndexCursor {
 }
 
 impl BoundedIndexCursor {
-    /// Position `idx` at `start` and wrap both cursors for the walk over the
-    /// half-open range `[start, end)` (`end = None` ⇒ to the end of the index).
-    /// `spec` is the index's full-arity key spec — its `key_size()` is the
-    /// leading-key byte length (where the source-PK OPK suffix starts), and it
-    /// re-projects each candidate row's entry key for the per-chunk window
-    /// filter. `pk_capacity` pre-sizes the per-chunk PK scratch (pass the
-    /// measured range size capped at the chunk size, or 0 to grow).
+    /// Position `idx` at `start` and wrap the index cursor and the base probe
+    /// for the walk over the half-open range `[start, end)` (`end = None` ⇒ to
+    /// the end of the index). `spec` is the index's full-arity key spec — its
+    /// `key_size()` is the leading-key byte length (where the source-PK OPK
+    /// suffix starts), and it re-projects each candidate row's entry key for the
+    /// per-chunk window filter. `pk_capacity` pre-sizes the per-chunk PK scratch
+    /// (pass the measured range size capped at the chunk size, or 0 to grow).
     pub(crate) fn new(
         mut idx: ReadCursor,
-        src: ReadCursor,
+        src: PartitionProbe,
         start: PkBuf,
         end: Option<PkBuf>,
         spec: IndexKeySpec,
@@ -211,7 +224,11 @@ impl BoundedIndexCursor {
     /// The next up-to-`n` in-range rows, or `None` when the range is exhausted.
     /// A returned batch may be EMPTY (in-range index entries whose base rows are
     /// absent/retracted) — `None` strictly means "no further chunk exists".
-    pub(crate) fn drain_chunk(&mut self, n: usize) -> Option<Batch> {
+    ///
+    /// `store` is the base store the probe routes into — passed per call rather
+    /// than held, because this cursor is driven while `&mut CatalogEngine` is in
+    /// use between chunks. It must be the store `src` was built over.
+    pub(crate) fn drain_chunk(&mut self, store: &PartitionedTable, n: usize) -> Option<Batch> {
         self.pks.clear();
         let idx_key_size = self.spec.key_size();
         let src_pk_stride = self.src_schema.pk_stride() as usize;
@@ -269,6 +286,7 @@ impl BoundedIndexCursor {
         // that escape would silently truncate the view mid-range.
         let mut batch = gather_source_rows(
             &mut self.src,
+            store,
             &self.src_schema,
             &self.pks,
             &self.spec,

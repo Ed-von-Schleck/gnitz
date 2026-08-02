@@ -4,7 +4,7 @@
 //! owned by `CatalogEngine`. There is no custom `Drop`: the `Partitioned`
 //! box is freed by the default drop glue when its registry entry is removed.
 
-use crate::storage::{Batch, ChildAddr, PartitionedTable, ReadCursor, Routing, StorageError, Table};
+use crate::storage::{Batch, ChildAddr, PartitionProbe, PartitionedTable, ReadCursor, Routing, StorageError, Table};
 use std::cell::UnsafeCell;
 
 /// Storage handle of a registered relation. `Partitioned` owns its boxed
@@ -78,13 +78,15 @@ impl StoreHandle {
             .flat_map(move |r| r.cluster_children(num_workers))
     }
 
-    /// Dispatched [`PartitionedTable::cursor_may_hold_key`]. A borrowed system
-    /// table is one unpartitioned `Table` that `open_cursor` reads whole, so it
-    /// can hold any key.
-    pub fn cursor_may_hold_key(&self, key: &[u8]) -> bool {
+    /// The owned `PartitionedTable`, or `None` for a borrowed system table —
+    /// one unpartitioned `Table` with no partitions to route among. Shared, not
+    /// `&mut`: keyed reads only read through it, and callers keep this borrow
+    /// live while opening further cursors off the same `UnsafeCell`, which a
+    /// `&mut` would forbid.
+    pub fn as_partitioned(&self) -> Option<&PartitionedTable> {
         match self {
-            StoreHandle::Borrowed(_) => true,
-            StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).cursor_may_hold_key(key) },
+            StoreHandle::Borrowed(_) => None,
+            StoreHandle::Partitioned(cell) => Some(unsafe { &**cell.get() }),
         }
     }
 
@@ -116,6 +118,25 @@ impl StoreHandle {
         match self {
             StoreHandle::Borrowed(ptr) => unsafe { (**ptr).open_cursor() },
             StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).open_cursor() },
+        }
+    }
+
+    /// A cursor over only the partition that could hold `key` (full OPK bytes),
+    /// or `None` when this process holds none. A borrowed system table is one
+    /// unpartitioned `Table` with nothing to route among, so it opens whole.
+    /// See [`PartitionedTable::open_cursor_for_key`].
+    pub fn open_cursor_for_key(&self, key: &[u8]) -> Option<ReadCursor> {
+        match self {
+            StoreHandle::Borrowed(ptr) => Some(unsafe { (**ptr).open_cursor() }),
+            StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).open_cursor_for_key(key) },
+        }
+    }
+
+    /// The [`StoreProbe`] for a multi-key read over this handle.
+    pub(crate) fn open_probe(&self) -> StoreProbe {
+        match self.as_partitioned() {
+            Some(store) => StoreProbe::Routed(PartitionProbe::new(store)),
+            None => StoreProbe::Whole(Box::new(self.open_cursor())),
         }
     }
 
@@ -174,5 +195,41 @@ impl StoreHandle {
             StoreHandle::Borrowed(ptr) => unsafe { &**ptr }.current_lsn(),
             StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).min_flushed_lsn() },
         }
+    }
+}
+
+/// The read side of a multi-key lookup over a [`StoreHandle`]: a cursor per
+/// partition a key routes into (opened on first touch), or one whole cursor over
+/// a borrowed system table, which has no partitions to route among. Built by
+/// [`StoreHandle::open_probe`].
+///
+/// The whole cursor is boxed — a `ReadCursor` is ~560 bytes against the probe's
+/// `Vec` (clippy's `large_enum_variant`) — one allocation per request.
+pub(crate) enum StoreProbe {
+    Routed(PartitionProbe),
+    Whole(Box<ReadCursor>),
+}
+
+impl StoreProbe {
+    /// The cursor positioned on `key`'s live row (full OPK bytes), or `None`
+    /// when no such row is reachable — the key is absent, or this process holds
+    /// no partition for it, which a broadcast key list makes the common case.
+    /// `advance_to` is backward-capable, so any key order is correct; ascending
+    /// keys additionally keep each routed cursor's probes monotone.
+    ///
+    /// `store` is the handle's own `PartitionedTable`, passed per call because a
+    /// probe outlives its construction and cannot hold that borrow across the
+    /// `&mut CatalogEngine` uses between chunks. A `Routed` probe is only ever
+    /// built over `Some`.
+    pub(crate) fn advance_to_exact_live<'s>(
+        &'s mut self,
+        store: Option<&PartitionedTable>,
+        key: &[u8],
+    ) -> Option<&'s mut ReadCursor> {
+        let cursor = match self {
+            StoreProbe::Routed(p) => p.probe(store?, key)?,
+            StoreProbe::Whole(c) => c.as_mut(),
+        };
+        cursor.advance_to_exact_live(key).then_some(cursor)
     }
 }

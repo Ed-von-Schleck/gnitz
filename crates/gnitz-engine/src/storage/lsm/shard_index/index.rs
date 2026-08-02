@@ -101,6 +101,13 @@ impl ShardIndex {
         self.all_shard_arcs_iter().collect()
     }
 
+    /// Raw rows across every live shard, summed without touching an `Rc`. Raw:
+    /// cross-shard duplicates and ghosts are counted, so it is an upper bound on
+    /// the live rows a walk would emit — the shape the selectivity gate wants.
+    pub fn total_rows(&self) -> usize {
+        self.all_entries().map(|e| e.shard.count).sum()
+    }
+
     /// Test-only u128 oracle: OPK-encodes a **native** PK value (handling
     /// signed/compound columns) and delegates to [`find_pk_bytes`], the
     /// production path. Wide PKs cannot fit a u128.

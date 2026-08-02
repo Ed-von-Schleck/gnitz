@@ -153,6 +153,154 @@ fn pk_set_rejects_keys_colliding_after_truncation() {
     assert!(err.contains("duplicate"), "{err}");
 }
 
+/// A REPLICATED base table is an **unhashed** store: one child holding the whole
+/// local dataset, its rows not keyed by `partition_for_pk` at all. Every keyed
+/// read has to resolve through `slot_for_key`, which maps any key to that one
+/// child — routing by the key's partition id alone finds no local slot and would
+/// silently answer zero rows.
+#[test]
+fn keyed_reads_over_a_replicated_table_find_every_key() {
+    const N: u128 = 20;
+    let dir = temp_dir("ss_replicated");
+    let mut e = CatalogEngine::open(&dir).unwrap();
+    let cols = id_val_cols();
+    let tid = create_flagged_table(&mut e, &dir, "rep", &cols, &[0], gnitz_wire::pack_table_flags(true, 0));
+    assert!(
+        e.dag.tables.get(&tid).unwrap().handle.is_unhashed(),
+        "REPLICATED must build an unhashed store"
+    );
+
+    let schema = e.get_schema(tid).unwrap();
+    let mut bb = BatchBuilder::new(schema);
+    for id in 0..N {
+        bb.begin_row(id, 1);
+        bb.put_u64(id as u64 * 10);
+        bb.end_row();
+    }
+    e.ingest_to_family(tid, &bb.finish()).unwrap();
+    let want: Vec<(u128, i64, i64)> = (0..N).map(|i| (i, i as i64 * 10, 1)).collect();
+
+    // The point seek (FLAG_SEEK) and the point PK range (what `WHERE pk = k`
+    // compiles to) each find every key.
+    for (id, val, _) in &want {
+        let hit = e.seek_family(tid, *id, &[]).unwrap().0;
+        assert_eq!(
+            triples(&hit.expect("seek_family must find the row")),
+            vec![(*id, *val, 1)]
+        );
+        let point = RangeDescriptor::new(&[], Cut::Before(*id), Cut::After(*id));
+        assert_eq!(
+            run(&mut e, tid, &identity_spec(ReadBound::PkRange(point), vec![], 0)),
+            vec![(*id, *val, 1)]
+        );
+    }
+
+    // The FK dereference gather and the `pk IN (…)` set gather.
+    let pks: Vec<_> = (0..N)
+        .map(|id| crate::schema::key::opk_key(&schema, &id.to_le_bytes()))
+        .collect();
+    let gathered = e.gather_family_bytes(tid, &pks, &[1]).unwrap();
+    assert_eq!(gathered.count, N as usize, "every parent key must dereference");
+
+    let mut got = run(
+        &mut e,
+        tid,
+        &identity_spec(ReadBound::PkSet((0..N).collect()), vec![], 0),
+    );
+    got.sort();
+    assert_eq!(got, want);
+
+    e.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A `CLUSTER BY` table hashes only the leading PK column, so a range that pins
+/// it is confined to one partition and the scan opens only that one. It must
+/// still return the whole group — and a range that spans the leading column is
+/// not confinable (partition ids are `mix(pk) >> 56`, not monotone in key order)
+/// and must stay on the merged cursor and return every row.
+#[test]
+fn pk_range_over_a_clustered_table_routes_when_confined_and_spans_when_not() {
+    const NA: u64 = 4;
+    const NB: u64 = 5;
+    let dir = temp_dir("ss_clustered");
+    let mut e = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![
+        col_def("a", type_code::U64),
+        col_def("b", type_code::U64),
+        col_def("val", type_code::I64),
+    ];
+    // CLUSTER BY a: distribution prefix = the first of the two PK columns.
+    let tid = create_flagged_table(
+        &mut e,
+        &dir,
+        "clus",
+        &cols,
+        &[0, 1],
+        gnitz_wire::pack_table_flags(false, 1),
+    );
+    let schema = e.get_schema(tid).unwrap();
+    assert_eq!(schema.dist_stride(), 8, "CLUSTER BY one U64 column ⇒ an 8-byte prefix");
+
+    let mut bb = BatchBuilder::new(schema);
+    for a in 0..NA {
+        for b in 0..NB {
+            bb.begin_row_opk(&[a as u128, b as u128], 1);
+            bb.put_u64(a * 100 + b);
+            bb.end_row();
+        }
+    }
+    e.ingest_to_family(tid, &bb.finish()).unwrap();
+
+    // `(a, b, val)` triples of a reply batch, decoded off the 16-byte OPK PK.
+    let decode = |batch: &Batch| -> Vec<(u64, u64, i64)> {
+        let mut out: Vec<_> = (0..batch.count)
+            .map(|i| {
+                let pk = batch.get_pk_bytes(i);
+                (
+                    u64::from_be_bytes(pk[..8].try_into().unwrap()),
+                    u64::from_be_bytes(pk[8..].try_into().unwrap()),
+                    i64::from_le_bytes(batch.get_col_ptr(i, 0, 8).try_into().unwrap()),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    let scan = |e: &mut CatalogEngine, desc: RangeDescriptor| {
+        let spec = identity_spec(ReadBound::PkRange(desc), vec![], 0);
+        decode(&e.scan_spec_family(tid, &spec, &schema).unwrap())
+    };
+
+    // `a = 2 AND b >= 0` — a whole trailing-column range inside one `a` group,
+    // which shares the distribution prefix and so routes to one partition.
+    let confined = RangeDescriptor::new(&[2], Cut::Before(0), Cut::After(u64::MAX as u128));
+    assert!(
+        scan_spec_partition(&schema, &confined).is_some(),
+        "the fixture's confined range must be the routed shape"
+    );
+    assert_eq!(
+        scan(&mut e, confined),
+        (0..NB).map(|b| (2, b, (200 + b) as i64)).collect::<Vec<_>>(),
+        "a confined range still returns its whole group"
+    );
+
+    // `1 <= a < 3` spans two `a` groups, so it is not confinable and keeps the
+    // merged cursor.
+    let spanning = RangeDescriptor::new(&[], Cut::Before(1), Cut::Before(3));
+    assert!(scan_spec_partition(&schema, &spanning).is_none());
+    let mut want: Vec<(u64, u64, i64)> = Vec::new();
+    for a in 1..3 {
+        for b in 0..NB {
+            want.push((a, b, (a * 100 + b) as i64));
+        }
+    }
+    assert_eq!(scan(&mut e, spanning), want, "a range spanning partitions loses no row");
+
+    e.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn pk_set_missing_keys_miss_silently() {
     let (mut e, tid) = fixture("ss_pkset_miss", 5, |i| i as i64);

@@ -350,15 +350,10 @@ fn gc_recreated_schema_survives_drain() {
 // ---------------------------------------------------------------------------
 
 /// Register a REPLICATED base table with one row flushed, and return
-/// `(tid, relation_directory)`. `create_table` has no replicated argument, so
-/// the row goes through the raw TABLE_TAB path with the flag packed in.
+/// `(tid, relation_directory)`.
 fn replicated_table_with_a_shard(engine: &mut CatalogEngine, dir: &str, flush: bool) -> (i64, String) {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
-    let rt = engine.allocate_table_id();
-    engine.write_column_records(rt, OWNER_KIND_TABLE, &cols).unwrap();
-    let flags = gnitz_wire::pack_table_flags(true, 0);
-    let batch = build_table_tab_row_flags(dir, rt, pack_pk_cols(&[0]), "rt", flags);
-    engine.ingest_to_family(TABLE_TAB_ID, &batch).unwrap();
+    let rt = create_flagged_table(engine, dir, "rt", &cols, &[0], gnitz_wire::pack_table_flags(true, 0));
 
     let rel_dir = engine.dag.tables[&rt].directory.clone();
     let mut bb = BatchBuilder::new(engine.get_schema_desc(rt).unwrap());

@@ -163,6 +163,25 @@ fn build_table_tab_row_flags(dir: &str, tid: i64, raw_pk_cols: u64, table_name: 
     bb.finish()
 }
 
+/// Register a base table through the DDL hooks with an explicit packed `flags`
+/// word — the routing shapes `create_table` cannot make (it always builds a
+/// full-PK-hashed, non-replicated table): REPLICATED (an unhashed store) and
+/// CLUSTER BY (a distribution prefix shorter than the PK).
+fn create_flagged_table(
+    engine: &mut CatalogEngine,
+    dir: &str,
+    table_name: &str,
+    cols: &[ColumnDef],
+    pk_cols: &[u32],
+    flags: u64,
+) -> i64 {
+    let tid = engine.allocate_table_id();
+    engine.write_column_records(tid, OWNER_KIND_TABLE, cols).unwrap();
+    let batch = build_table_tab_row_flags(dir, tid, pack_pk_cols(pk_cols), table_name, flags);
+    engine.ingest_to_family(TABLE_TAB_ID, &batch).unwrap();
+    tid
+}
+
 /// Build the minimal identity circuit `ScanDelta(base) → Integrate` for
 /// `vid` and write its rows through the applied-delta path. The payload
 /// column layout follows `gnitz_wire::CIRCUIT_NODES_COLS` /

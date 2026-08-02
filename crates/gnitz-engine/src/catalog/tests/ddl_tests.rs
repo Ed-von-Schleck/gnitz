@@ -885,13 +885,15 @@ fn replicated_bit_is_transitive_and_survives_replay() {
 
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
 
-    // A REPLICATED base table. `create_table` has no replicated argument, so
-    // register it through the raw TABLE_TAB path with the flag packed in.
-    let rt = engine.allocate_table_id();
-    engine.write_column_records(rt, OWNER_KIND_TABLE, &cols).unwrap();
-    let flags = gnitz_wire::pack_table_flags(true, 0);
-    let batch = build_table_tab_row_flags(&dir, rt, pack_pk_cols(&[0]), "rt", flags);
-    engine.ingest_to_family(TABLE_TAB_ID, &batch).unwrap();
+    // A REPLICATED base table.
+    let rt = create_flagged_table(
+        &mut engine,
+        &dir,
+        "rt",
+        &cols,
+        &[0],
+        gnitz_wire::pack_table_flags(true, 0),
+    );
 
     // A partitioned base table, for the negative direction.
     let pt = engine.create_table("public.pt", &cols, &[0]).unwrap();

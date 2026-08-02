@@ -11,5 +11,5 @@ mod dag;
 mod vm;
 
 pub(crate) use dag::{
-    DagEngine, ExchangeCallback, IndexCircuitEntry, RelationKind, StoreHandle, SysTableRefs, TableEntry,
+    DagEngine, ExchangeCallback, IndexCircuitEntry, RelationKind, StoreHandle, StoreProbe, SysTableRefs, TableEntry,
 };

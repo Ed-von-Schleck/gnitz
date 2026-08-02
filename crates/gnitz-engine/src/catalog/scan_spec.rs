@@ -1,10 +1,14 @@
 //! Parameterized bounded read (`ReadSpec`) execution — the worker half of the
-//! ad-hoc SELECT scan. Runs **once per worker over one merged partition cursor**:
-//! open a cursor for the bound, then per chunk take the predicate's surviving
-//! row ranges and drive them into the sink — rows (projected onto the keeper,
-//! then bounded top-k / materialize) or the aggregate hash-fold (`AdhocFold`).
-//! Nothing between the source chunk and the sink is materialized. No DBSP
-//! circuit, no operator state, no exchange.
+//! ad-hoc SELECT scan. Runs **once per worker**: open a cursor for the bound,
+//! then per chunk take the predicate's surviving row ranges and drive them into
+//! the sink — rows (projected onto the keeper, then bounded top-k / materialize)
+//! or the aggregate hash-fold (`AdhocFold`). Nothing between the source chunk
+//! and the sink is materialized. No DBSP circuit, no operator state, no
+//! exchange.
+//!
+//! A bound that names its keys — a `pk IN (…)` set, or a PK range confined to
+//! one distribution prefix — reads only the partitions those keys hash into; an
+//! unconfined bound merges every local partition.
 //!
 //! The reply schema arrives as the client's raw wire block (decoded by the
 //! worker one layer up); this module takes the decoded `SchemaDescriptor`. The
@@ -19,6 +23,7 @@ use super::store_io::SourceCursor;
 use super::*;
 use crate::expr::ScalarFunc;
 use crate::ops::AdhocFold;
+use crate::query::StoreProbe;
 use crate::schema::key::{compare_pk_bytes, opk_key, PkBuf};
 use crate::schema::{ColumnLocator, TypeCode};
 use crate::storage::{cmp_col_window, compare_rows};
@@ -30,8 +35,8 @@ use gnitz_expr::{LogicalProgram, RowSource};
 const MAX_WORKER_TOPK: u64 = 65_536;
 
 impl CatalogEngine {
-    /// Execute `spec` against `target_id` on this worker's merged partition
-    /// cursor, returning one keeper batch in the `reply_schema` shape. The caller
+    /// Execute `spec` against `target_id` on this worker's partitions,
+    /// returning one keeper batch in the `reply_schema` shape. The caller
     /// (the worker dispatch arm) decoded `reply_schema` from the client's wire
     /// block and replies with no block at all; this method does the bound walk,
     /// predicate, projection, and ORDER BY / LIMIT reduction.
@@ -57,18 +62,18 @@ impl CatalogEngine {
         };
 
         let chunk_rows = self.ddl_scan_chunk_rows.max(1);
+        let group_cap = self.adhoc_group_cap;
         let mut source = self.open_scan_spec_cursor(target_id, &spec.bound, &src_schema)?;
+        let ctx = ScanSinkCtx {
+            // The routed cursors' store, re-read on every chunk (a cursor holds
+            // no borrow on it). `None` for a borrowed system table.
+            store: self.partitioned_store(target_id),
+            predicate: predicate.as_ref(),
+            chunk_rows,
+        };
 
         match &spec.sink {
-            ReadSink::Fold(agg) => run_scan_fold_sink(
-                &mut source,
-                predicate.as_ref(),
-                &src_schema,
-                reply_schema,
-                agg,
-                chunk_rows,
-                self.adhoc_group_cap,
-            ),
+            ReadSink::Fold(agg) => run_scan_fold_sink(&mut source, ctx, &src_schema, reply_schema, agg, group_cap),
             ReadSink::Rows {
                 projection,
                 order,
@@ -118,18 +123,19 @@ impl CatalogEngine {
                 };
                 Ok(run_scan_rows_sink(
                     &mut source,
-                    predicate.as_ref(),
+                    ctx,
                     projection.as_ref(),
                     reply_schema,
                     order,
                     *limit_k,
-                    chunk_rows,
                 ))
             }
         }
     }
 
-    /// Open the source cursor for `bound` over `source`'s merged partitions.
+    /// Open the source cursor for `bound` over `source` — routed to the
+    /// partitions the bound's keys reach where it names them, merged over every
+    /// local partition where it does not.
     fn open_scan_spec_cursor(
         &mut self,
         source: i64,
@@ -143,7 +149,23 @@ impl CatalogEngine {
             ReadBound::PkRange(desc) => match pk_range_keys(src_schema, desc)? {
                 None => Ok(ScanSpecCursor::Source(SourceCursor::Empty)),
                 Some((start, end)) => {
-                    let mut cursor = self.table_entry(source)?.handle.open_cursor();
+                    let handle = &self.table_entry(source)?.handle;
+                    // A range whose every key shares the distribution prefix
+                    // lives in one partition — the same test `scan_spec_partition`
+                    // uses to unicast the request. `open_cursor_for_key` resolves
+                    // through `slot_for_key`, never through the global partition
+                    // id, so an unhashed store lands on its one child; `None`
+                    // means this process holds no such partition. A range
+                    // spanning partitions keeps the merge.
+                    let confined =
+                        crate::storage::range_shares_prefix(&start, end.as_ref(), src_schema.dist_stride() as usize);
+                    let mut cursor = match confined {
+                        true => match handle.open_cursor_for_key(start.pk_bytes()) {
+                            Some(c) => c,
+                            None => return Ok(ScanSpecCursor::Source(SourceCursor::Empty)),
+                        },
+                        false => handle.open_cursor(),
+                    };
                     // `[start, end)` clamps every underlying source, so the walk
                     // is O(range): a point lookup drains exactly its group,
                     // never a boundary chunk of over-read.
@@ -221,15 +243,12 @@ impl CatalogEngine {
                         &w[0][..stride]
                     ));
                 }
-                // Drop the keys this worker's cursor provably cannot reach: the
-                // request is broadcast, so at W workers every worker would
-                // otherwise probe all N keys to answer N/W of them.
-                opk_keys.retain(|key| handle.cursor_may_hold_key(&key[..stride]));
-                if opk_keys.is_empty() {
-                    return Ok(ScanSpecCursor::Source(SourceCursor::Empty));
-                }
+                // The probe answers a key this worker cannot reach with `None` —
+                // the request is broadcast, so at W workers most of the list
+                // belongs elsewhere — and routes the rest to the one partition
+                // that can hold them instead of the whole store's merge.
                 Ok(ScanSpecCursor::PkSet(Box::new(PkSetGather {
-                    cursor: handle.open_cursor(),
+                    cursor: handle.open_probe(),
                     keys: opk_keys,
                     stride,
                     next: 0,
@@ -242,7 +261,7 @@ impl CatalogEngine {
 
 /// A `pk IN (…)` gather: one live row per key, in ascending OPK order.
 struct PkSetGather {
-    cursor: ReadCursor,
+    cursor: StoreProbe,
     /// OPK images of the keys, sorted; the leading `stride` bytes are the key.
     keys: Vec<[u8; 16]>,
     stride: usize,
@@ -254,22 +273,25 @@ struct PkSetGather {
 /// source-schema chunks of consolidated (PK, payload) groups; the sink then
 /// filters, projects, and reduces them.
 enum ScanSpecCursor {
-    /// Full merged cursor, bounded index walk, or provably-empty bound — the
-    /// shared source cursor. A PK range is a Full cursor positioned on
-    /// `[start, end)` (`seek_range_bytes`), so it exhausts exactly at the cut.
+    /// Full cursor, bounded index walk, or provably-empty bound — the shared
+    /// source cursor. A PK range is a Full cursor positioned on `[start, end)`
+    /// (`seek_range_bytes`), so it exhausts exactly at the cut; when the range is
+    /// confined to one distribution prefix that cursor spans one partition.
     Source(SourceCursor),
-    /// `pk IN (…)` gather (boxed: the cursor is ~560 bytes — one allocation per
-    /// request, never per chunk).
+    /// `pk IN (…)` gather (boxed: `SourceCursor` is three words and this holds a
+    /// key list and a schema — one allocation per request, never per chunk).
     PkSet(Box<PkSetGather>),
 }
 
 impl ScanSpecCursor {
     /// The next up-to-`max_rows` source rows, or `None` once the bound is
-    /// exhausted. A returned batch may be empty (a window of PkSet misses);
-    /// `None` strictly means "no further rows".
-    fn next_chunk(&mut self, max_rows: usize) -> Option<Batch> {
+    /// exhausted. A returned batch may be empty (a window of PkSet misses, or of
+    /// keys this worker holds no partition for); `None` strictly means "no
+    /// further rows". `store` is the scanned relation's partitioned store,
+    /// `None` for a borrowed system table.
+    fn next_chunk(&mut self, store: Option<&PartitionedTable>, max_rows: usize) -> Option<Batch> {
         match self {
-            ScanSpecCursor::Source(source) => source.drain_chunk(max_rows),
+            ScanSpecCursor::Source(source) => source.drain_chunk(store, max_rows),
             ScanSpecCursor::PkSet(g) => {
                 if g.next >= g.keys.len() {
                     return None;
@@ -277,12 +299,14 @@ impl ScanSpecCursor {
                 let cap = (g.keys.len() - g.next).min(max_rows);
                 let mut out = Batch::with_capacity(g.src_schema, cap);
                 while g.next < g.keys.len() && out.count < max_rows {
-                    let key = g.keys[g.next];
+                    let key = &g.keys[g.next][..g.stride];
                     g.next += 1;
-                    if g.cursor.advance_to_exact_live(&key[..g.stride]) {
-                        let w = g.cursor.current_weight;
+                    // `None` = absent, or a key this worker holds no partition
+                    // for — the discard the broadcast list needs.
+                    if let Some(cursor) = g.cursor.advance_to_exact_live(store, key) {
+                        let w = cursor.current_weight;
                         debug_assert!(w > 0, "advance_to_exact_live guarantees a positive weight");
-                        g.cursor.copy_current_row_into(&mut out, w);
+                        cursor.copy_current_row_into(&mut out, w);
                     }
                 }
                 // An all-miss window returns an empty batch only when the key list
@@ -293,6 +317,14 @@ impl ScanSpecCursor {
     }
 }
 
+/// The per-request context both sinks read on every chunk: the routed cursors'
+/// store, the compiled predicate, and the drain size.
+struct ScanSinkCtx<'a> {
+    store: Option<&'a PartitionedTable>,
+    predicate: Option<&'a ScalarFunc>,
+    chunk_rows: usize,
+}
+
 /// Run the fold sink over `source`: fold every surviving chunk into per-group
 /// accumulators and return the partial reduce-output rows — or `Err` when the
 /// per-worker group cap is exceeded (a resource-exhaustion abort, before any
@@ -300,20 +332,19 @@ impl ScanSpecCursor {
 /// directly.
 fn run_scan_fold_sink(
     source: &mut ScanSpecCursor,
-    predicate: Option<&ScalarFunc>,
+    ctx: ScanSinkCtx,
     src_schema: &SchemaDescriptor,
     reply_schema: &SchemaDescriptor,
     agg: &AggReadSpec,
-    chunk_rows: usize,
     group_cap: usize,
 ) -> Result<Batch, String> {
     let mut fold = AdhocFold::new(src_schema, reply_schema, agg, group_cap)?;
     let mut ranges: Vec<(usize, usize)> = Vec::new();
-    while let Some(chunk) = source.next_chunk(chunk_rows) {
+    while let Some(chunk) = source.next_chunk(ctx.store, ctx.chunk_rows) {
         if chunk.count == 0 {
             continue;
         }
-        survivor_ranges(predicate, &chunk, &mut ranges);
+        survivor_ranges(ctx.predicate, &chunk, &mut ranges);
         fold.fold_ranges(&chunk, &ranges)?;
     }
     Ok(fold.finish())
@@ -339,12 +370,11 @@ fn survivor_ranges(predicate: Option<&ScalarFunc>, chunk: &Batch, out: &mut Vec<
 /// no intermediate survivor batch and no projected batch.
 fn run_scan_rows_sink(
     source: &mut ScanSpecCursor,
-    predicate: Option<&ScalarFunc>,
+    ctx: ScanSinkCtx,
     projection: Option<&ScalarFunc>,
     reply_schema: &SchemaDescriptor,
     order: &[OrderKey],
     limit_k: u64,
-    chunk_rows: usize,
 ) -> Batch {
     // Bounded top-k: an ORDER BY with a small window. Everything else materializes
     // (an ORDER-BY early-stop would truncate in cursor order, not sort order).
@@ -356,10 +386,10 @@ fn run_scan_rows_sink(
     // row-at-a-time cursor driving, so drain full chunks instead and over-read
     // at most one chunk.
     let early_stop = order.is_empty() && limit_k > 0;
-    let drain_rows = if early_stop && predicate.is_none() {
-        (limit_k as usize).clamp(1, chunk_rows)
+    let drain_rows = if early_stop && ctx.predicate.is_none() {
+        (limit_k as usize).clamp(1, ctx.chunk_rows)
     } else {
-        chunk_rows
+        ctx.chunk_rows
     };
 
     // Pre-resolve each ORDER BY key to its reply-schema locator (the top-k shape).
@@ -378,11 +408,11 @@ fn run_scan_rows_sink(
     // Per-request scratch, reused across chunks.
     let mut ranges: Vec<(usize, usize)> = Vec::new();
 
-    while let Some(chunk) = source.next_chunk(drain_rows) {
+    while let Some(chunk) = source.next_chunk(ctx.store, drain_rows) {
         if chunk.count == 0 {
             continue;
         }
-        survivor_ranges(predicate, &chunk, &mut ranges);
+        survivor_ranges(ctx.predicate, &chunk, &mut ranges);
         // Weigh the survivors off the source — the same weights that land in the
         // keeper, read from a contiguous region rather than row-by-row off the
         // destination. `topk` needs the chunk total; `early_stop` needs the

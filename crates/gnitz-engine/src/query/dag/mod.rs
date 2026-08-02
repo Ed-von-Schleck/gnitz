@@ -20,7 +20,7 @@ mod store_handle;
 
 use meta::{DepMap, ViewMeta};
 
-pub(crate) use store_handle::StoreHandle;
+pub(crate) use store_handle::{StoreHandle, StoreProbe};
 
 // ---------------------------------------------------------------------------
 // Index circuit entry

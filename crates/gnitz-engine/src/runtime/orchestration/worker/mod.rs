@@ -1039,7 +1039,12 @@ impl WorkerProcess {
             // `None` ⇒ partition exhausted (or absent): this round is an empty
             // PAD. The master ANDs the pad bit across workers and stamps the
             // collective stop/continue/checkpoint decision back onto each relay.
-            let drained = handle.as_mut().and_then(|h| h.drain_chunk(chunk_rows));
+            // The store is re-resolved per chunk: a cursor holds no borrow on it,
+            // and the catalog is mutated between chunks.
+            let drained = match handle.as_mut() {
+                Some(h) => h.drain_chunk(self.cat().partitioned_store(source_tid), chunk_rows),
+                None => None,
+            };
             let pad = drained.is_none();
             let chunk = drained.unwrap_or_else(|| Batch::empty_with_schema(&schema));
             self.exchange.backfill_pad = Some(pad);
