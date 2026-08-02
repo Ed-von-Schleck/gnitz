@@ -75,16 +75,17 @@ pub struct MasterDispatcher {
     // Catalog pointer — reborrowed per-call because &mut self borrows conflict.
     catalog: *mut CatalogEngine,
     router: PartitionRouter,
-    /// Per-(table_id, packed_col_list) filter skipping redundant Phase 2
-    /// unique-index broadcasts. The `u64` is `pack_pk_cols(col_indices)` — the
-    /// same value stored in `IDXTAB_PAY_SOURCE_COLS` — so a composite index is
-    /// identified by its whole column list, and dropping `(a, b)` never touches a
-    /// distinct single-column filter on `a`. See the UniqueFilter comment block.
+    /// Per-(table_id, packed_col_list) filter skipping redundant unique-index
+    /// occupancy broadcasts. The `u64` is `pack_pk_cols(col_indices)` — the same
+    /// value stored in `IDXTAB_PAY_SOURCE_COLS` — so a composite index is
+    /// identified by its whole column list, and dropping `(a, b)` never touches
+    /// a distinct single-column filter on `a`. See the UniqueFilter comment
+    /// block.
     unique_filters: FxHashMap<(i64, u64), UniqueFilter>,
 
     /// Per-`target_id` pool of `Batch`es reused by `build_check_batch` for
     /// FK / unique-index validation. After the awaited pipeline returns,
-    /// each check's batch is taken via `mem::replace` and pushed back here;
+    /// `reclaim_check_batches` takes each check's batch and pushes it back here;
     /// the next check on the same target reuses it via `clear` + reload.
     /// Schema staleness (DDL between bursts) is checked at pop time.
     check_batch_pool: FxHashMap<i64, Vec<Batch>>,

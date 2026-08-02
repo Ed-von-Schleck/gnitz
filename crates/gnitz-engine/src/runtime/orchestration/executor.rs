@@ -1247,36 +1247,37 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
         // share its table's lock and reach the committer alongside other pushes
         // to the same table, which fold into one SAL zone and one fsync. Every
         // other push takes all FK-related table locks exclusively.
-        let _tlocks = if !shared.cat().push_reads_committed_state(target_id, mode) {
+        let reads_committed = shared.cat().push_reads_committed_state(target_id, mode);
+        let _tlocks = if !reads_committed {
             (Some(shared.table_lock(target_id).read().await), Vec::new())
         } else {
             let lock_set = shared.cat().fk_lock_set(target_id).to_vec();
             (None, shared.lock_tables_exclusive(lock_set).await)
         };
 
-        // Local (catalog-resident) unique-index validation. Wrapped per V.4
-        // so a malformed batch can't crash the server.
-        let cat_ptr_raw = shared.catalog;
-        if let Err(e) = guard_panic("validate", || unsafe {
-            (*cat_ptr_raw).validate_unique_indices(target_id, &batch)
-        }) {
-            send_error(peer, target_id, client_id, e.as_bytes()).await;
-            return;
-        }
-        // Distributed validation (FK / unique indices + UPSERT).
-        if let Err(e) = MasterDispatcher::validate_all_distributed(
+        // Distributed validation (PK / FK / unique indices). A plain push is a
+        // one-family bundle — the same four rules over the same fold — so the
+        // batch moves into the family for the validation and back out for the
+        // commit request. The validator itself skips a bundle no rule would
+        // read a row for.
+        let families = [TxnFamily {
+            tid: target_id,
+            mode,
+            batch,
+        }];
+        if let Err(e) = MasterDispatcher::validate_txn_distributed(
             shared.dispatcher,
             &shared.reactor,
             &shared.sal_writer_excl,
-            target_id,
-            &batch,
-            mode,
+            &families,
         )
         .await
         {
             send_error(peer, target_id, client_id, e.as_bytes()).await;
             return;
         }
+        let [family] = families;
+        let batch = family.batch;
 
         // Graceful shutdown in flight: reject so no push commits after the final
         // checkpoint's view flush. The client sees a clean error and can retry

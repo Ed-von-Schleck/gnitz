@@ -91,23 +91,12 @@ impl StoreHandle {
     }
 
     /// Dispatched `has_pk` that works for every variant. Takes a **native**
-    /// `u128`; routes via `opk_key` internally. Never feed it `get_pk`
-    /// (OPK-widened) — use [`has_pk_bytes`] for verbatim OPK bytes.
+    /// `u128`; routes via `opk_key` internally.
     #[cfg(test)] // sole caller is the test-only inline FK check (validate_fk_inline)
     pub fn has_pk(&self, key: u128) -> bool {
         match self {
             StoreHandle::Borrowed(ptr) => unsafe { (**ptr).has_pk(key) },
             StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).has_pk(key) },
-        }
-    }
-
-    /// Dispatched verbatim-OPK-bytes `has_pk` across all variants. Correct for
-    /// every PK width; takes the bytes `Batch::get_pk_bytes` produces, with no
-    /// native round-trip (and thus no double-encode for signed/compound PKs).
-    pub fn has_pk_bytes(&self, key: &[u8]) -> bool {
-        match self {
-            StoreHandle::Borrowed(ptr) => unsafe { (**ptr).has_pk_bytes(key) },
-            StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).has_pk_bytes(key) },
         }
     }
 

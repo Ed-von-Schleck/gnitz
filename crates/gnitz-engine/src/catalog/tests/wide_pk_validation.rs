@@ -1,9 +1,9 @@
-//! Single-worker catalog constraint checks for primary keys wider than 16
-//! bytes (`pk_stride > 16`). A wide PK is always compound (e.g. three U64
-//! columns = 24 bytes); the SQL planner and `create_table` both reject it at
-//! DDL time, so these tests build the DAG tables and index circuits directly,
-//! bypassing the stride gate, and drive `validate_unique_indices` /
-//! `seek_family_bytes` on the wide path.
+//! Single-worker catalog checks for primary keys wider than 16 bytes
+//! (`pk_stride > 16`). A wide PK is always compound (e.g. three U64 columns =
+//! 24 bytes). These tests seed the DAG tables and index circuits directly so a
+//! wide PK can be written with byte-level control, and drive
+//! `index_circuit_for_cols` / `seek_family_bytes` on the wide path. Unique-index
+//! enforcement over a wide PK runs distributed and is covered end-to-end.
 
 use super::*;
 use crate::query::{DagEngine, RelationKind, StoreHandle};
@@ -134,87 +134,6 @@ fn index_circuit_for_col_finds_index_and_uniqueness() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
-
-// ── UNIQUE index, wide PK ──────────────────────────────────────────────
-
-#[test]
-fn wide_unique_rejects_duplicate_value() {
-    let dir = temp_dir("wide_uidx_dup");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
-    let tid = engine.next_table_id;
-
-    // Base row: pk=(1,1,1), val=42.
-    let _base = setup_wide_unique(&mut engine, tid, &dir, &[(pk24(1, 1, 1), 42, 1)]);
-    let schema = wide_unique_schema();
-
-    // New row with a DIFFERENT wide PK but the SAME indexed value → duplicate.
-    let batch = wide_val_batch(&schema, &[(pk24(2, 2, 2), 42, 1)]);
-    let result = engine.validate_unique_indices(tid, &batch);
-    assert!(
-        result.is_err(),
-        "duplicate indexed value on a distinct wide PK must be rejected"
-    );
-    assert!(result.unwrap_err().contains("Unique index violation"));
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn wide_unique_prefix_collision_no_false_upsert() {
-    let dir = temp_dir("wide_uidx_prefix");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
-    let tid = engine.next_table_id;
-
-    // Two base rows whose wide PKs share their first 16 bytes (a,b equal) but
-    // differ past byte 16 (c differs), carrying DIFFERENT indexed values.
-    let pk_a = pk24(7, 7, 100);
-    let pk_b = pk24(7, 7, 200);
-    let _base = setup_wide_unique(&mut engine, tid, &dir, &[(pk_a, 10, 1), (pk_b, 42, 1)]);
-    let schema = wide_unique_schema();
-
-    // UPSERT row A (its PK already lives in the base table) with B's value 42.
-    // The existing index entry for 42 belongs to B, whose PK shares A's first
-    // 16 bytes. A 16-byte-truncated compare would misread B's entry as A's own
-    // and silently admit the collision; the full-bytes compare rejects it.
-    let batch = wide_val_batch(&schema, &[(pk_a, 42, 1)]);
-    let result = engine.validate_unique_indices(tid, &batch);
-    assert!(
-        result.is_err(),
-        "16-byte-prefix-colliding wide PKs must not be treated as the same row"
-    );
-    assert!(result.unwrap_err().contains("Unique index violation"));
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn wide_unique_genuine_upsert_admitted() {
-    let dir = temp_dir("wide_uidx_upsert");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
-    let tid = engine.next_table_id;
-
-    // Base row: pk=(5,6,7), val=42.
-    let pk = pk24(5, 6, 7);
-    let _base = setup_wide_unique(&mut engine, tid, &dir, &[(pk, 42, 1)]);
-    let schema = wide_unique_schema();
-
-    // Re-insert the SAME wide PK with the unchanged indexed value. The existing
-    // index entry is this very row (enforce_unique_pk will retract it), so the
-    // full-bytes source-PK compare matches and the upsert is admitted.
-    let batch = wide_val_batch(&schema, &[(pk, 42, 1)]);
-    assert!(
-        engine.validate_unique_indices(tid, &batch).is_ok(),
-        "re-inserting an existing wide PK with an unchanged value is a legal upsert",
-    );
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// (wide_fk_restrict_pk_column_target removed with the test-only
-// `validate_fk_parent_restrict`; wide-PK FK RESTRICT is covered end-to-end.)
 
 #[test]
 fn wide_pk_seek_family_bytes_resolves_non_pk_col() {

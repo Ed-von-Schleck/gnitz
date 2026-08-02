@@ -858,7 +858,7 @@ def test_empty_batch_barrier(client):
 #
 # These tests pin down a deadlock observed in the full benchmark suite during
 # `test_incremental_cost[filter]` after the SQL-standard INSERT rejection
-# commit (0eaff28). The new code path runs `validate_all_distributed` →
+# commit (0eaff28). The code path runs `validate_txn_distributed` →
 # `execute_pipeline` synchronously on every INSERT to a unique-PK table in
 # Error mode. `execute_pipeline` reads from and resets the shared w2m ring
 # cursors. When this happens while an async view-propagation tick is still
@@ -908,8 +908,8 @@ def test_insert_sql_with_filter_view_no_deadlock(client, server):
     """Repeated INSERT VALUES on a unique-PK table while a filter view is
     propagating must not deadlock the master.
 
-    Each INSERT triggers the new PK-rejection broadcast in
-    `validate_all_distributed`, which calls `execute_pipeline` and resets
+    Each INSERT triggers the PK-rejection broadcast in
+    `validate_txn_distributed`, which calls `execute_pipeline` and resets
     the w2m cursors. The view present on the table forces async tick state.
     """
     sn = "vd" + _uid()

@@ -1138,6 +1138,100 @@ class TestFkNonPkUniqueGather:
             _cleanup(client, sn, "c", "p")
 
 
+class TestFkPlainPushFoldedValidation:
+    """A plain push (binary `push`/`delete`) is validated as a one-family
+    bundle, so its FK verdicts read the same fold the apply writes: a child the
+    same push removes exempts its parent, and a referenced value the push
+    re-adds under another row never leaves."""
+
+    def test_binary_delete_of_parent_and_child_together_accepted(self, client):
+        """One `delete` removing both `(1, NULL)` and `(2, parent=1)` of a
+        self-referencing tree: the only row referencing 1 is in the same push."""
+        sn = "s" + _uid()
+        try:
+            tid, schema = _make_tree(client, sn)
+            client.execute_sql("INSERT INTO tree VALUES (1, NULL), (2, 1)", schema_name=sn)
+            client.delete(tid, schema, [1, 2])
+            assert not list(client.scan(tid))
+        finally:
+            _cleanup(client, sn, "tree")
+
+    def test_binary_delete_leaving_the_child_behind_rejected(self, client):
+        """The same push, minus the child: 2 still references 1."""
+        sn = "s" + _uid()
+        try:
+            tid, schema = _make_tree(client, sn)
+            client.execute_sql("INSERT INTO tree VALUES (1, NULL), (2, 1)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+                client.delete(tid, schema, [1])
+            assert {r.id for r in client.scan(tid)} == {1, 2}
+        finally:
+            _cleanup(client, sn, "tree")
+
+    def test_referenced_value_swapped_between_parent_rows_accepted(self, client):
+        """`p={(1,code=100),(2,code=200)}` with a child on 100; one push swaps
+        the two codes. No referenced value leaves the parent, so the reference
+        is intact at end of statement — the engine checks NO ACTION, not
+        per-row RESTRICT."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE p (pid BIGINT UNSIGNED PRIMARY KEY, "
+                "code BIGINT UNSIGNED NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE UNIQUE INDEX ON p(code)", schema_name=sn)
+            client.execute_sql(
+                "CREATE TABLE c (cid BIGINT PRIMARY KEY, "
+                "ref BIGINT UNSIGNED REFERENCES p(code))",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO p VALUES (1, 100), (2, 200)", schema_name=sn)
+            client.execute_sql("INSERT INTO c VALUES (1, 100)", schema_name=sn)
+
+            ptid, pschema = client.resolve_table(sn, "p")
+            b = gnitz.ZSetBatch(pschema)
+            b.append(pid=1, code=200)
+            b.append(pid=2, code=100)
+            client.push(ptid, b)
+            assert sorted((r.pid, r.code) for r in client.scan(ptid)) == [(1, 200), (2, 100)]
+        finally:
+            _cleanup(client, sn, "c", "p")
+
+    def test_binary_delete_retiring_a_non_pk_referenced_column(self, client):
+        """A plain push whose parent delete retires a non-PK referenced column:
+        the delete carries filler payload, so the retired `code` comes from the
+        committed row. Referenced codes block; unreferenced ones delete."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE p (pid BIGINT UNSIGNED PRIMARY KEY, "
+                "code BIGINT UNSIGNED NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE UNIQUE INDEX ON p(code)", schema_name=sn)
+            client.execute_sql(
+                "CREATE TABLE c (cid BIGINT PRIMARY KEY, "
+                "ref BIGINT UNSIGNED REFERENCES p(code))",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "INSERT INTO p VALUES (1, 100), (2, 200), (3, 300)", schema_name=sn)
+            client.execute_sql("INSERT INTO c VALUES (1, 200)", schema_name=sn)
+            ptid, pschema = client.resolve_table(sn, "p")
+
+            with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+                client.delete(ptid, pschema, [1, 2])
+            assert sorted(r.pid for r in client.scan(ptid)) == [1, 2, 3]
+
+            client.delete(ptid, pschema, [1, 3])
+            assert sorted(r.pid for r in client.scan(ptid)) == [2]
+        finally:
+            _cleanup(client, sn, "c", "p")
+
+
 class TestFkIndexEpochInvalidation:
     """FK-target validation reads a durable, per-connection cache of the
     parent's secondary-index metadata. A per-table index epoch makes that cache

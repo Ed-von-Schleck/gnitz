@@ -6,15 +6,15 @@
 use super::*;
 
 #[cfg(test)]
-use super::preflight::{build_check_batch, build_check_batch_pkbuf, format_pk_value_bytes};
+use super::preflight::{build_check_batch, build_check_batch_pk_bytes, format_pk_value_bytes};
 
 // ---------------------------------------------------------------------------
 // Master-side unique-index filter
 // ---------------------------------------------------------------------------
 //
 // For each `(table_id, unique_col_idx)` we maintain a HashSet of all
-// indexed values known to exist in the unique index. Phase 2 of
-// `validate_all_distributed` consults this filter before building a
+// indexed values known to exist in the unique index. The U-SEC rule
+// (`txn_check_unique_indices`) consults this filter before building a
 // broadcast: if every new value is definitely absent from the filter,
 // that index's broadcast is skipped entirely.
 //
@@ -199,8 +199,13 @@ impl MasterDispatcher {
     /// True if every key in `keys` is definitely absent from the filter
     /// for `(table_id, packed)`. Returns false if the filter is capped,
     /// not warm (caller is expected to warm it first), or contains any
-    /// key. On false, caller must fall through to the Phase 2 broadcast.
-    pub(super) fn unique_filter_all_absent(&self, table_id: i64, packed: u64, keys: &[PkBuf]) -> bool {
+    /// key. On false, caller must fall through to the occupancy broadcast.
+    pub(super) fn unique_filter_all_absent(
+        &self,
+        table_id: i64,
+        packed: u64,
+        mut keys: impl Iterator<Item = PkBuf>,
+    ) -> bool {
         let filter = match self.unique_filters.get(&(table_id, packed)) {
             Some(f) => f,
             None => return false,
@@ -208,7 +213,7 @@ impl MasterDispatcher {
         if !filter.warm || filter.capped {
             return false;
         }
-        keys.iter().all(|k| !filter.values.contains(k))
+        keys.all(|k| !filter.values.contains(&k))
     }
 
     /// Record every unique-index value from a successfully-flushed
@@ -536,7 +541,7 @@ mod unique_filter_tests {
         let mut opk = [0u8; 8];
         gnitz_wire::encode_pk_column(&(-5i64).to_le_bytes(), type_code::I64, &mut opk);
         let keys = [PkBuf::from_bytes(&opk)];
-        let batch = build_check_batch_pkbuf(&schema, &keys, None);
+        let batch = build_check_batch_pk_bytes(&schema, keys.iter().map(|k| k.pk_bytes()), None);
 
         // The promoted leading key is I64, so the filter span is the I64-OPK of
         // the native value (= the at-rest OPK bytes here).
@@ -620,7 +625,7 @@ mod unique_filter_tests {
         let mut disp = filter_dispatcher();
         disp.unique_filter_seed(7, 0, seed, capped);
         assert!(
-            !disp.unique_filter_all_absent(7, 0, &[span_u64(10)]),
+            !disp.unique_filter_all_absent(7, 0, [span_u64(10)].into_iter()),
             "a capped pre-flight seed must fall through to the broadcast",
         );
     }
@@ -639,11 +644,11 @@ mod unique_filter_tests {
         let mut disp = filter_dispatcher();
         disp.unique_filter_seed(7, 0, seed, capped);
         assert!(
-            disp.unique_filter_all_absent(7, 0, &[span_u64(40)]),
+            disp.unique_filter_all_absent(7, 0, [span_u64(40)].into_iter()),
             "fresh key is provably absent"
         );
         assert!(
-            !disp.unique_filter_all_absent(7, 0, &[span_u64(20)]),
+            !disp.unique_filter_all_absent(7, 0, [span_u64(20)].into_iter()),
             "seeded key falls through"
         );
     }
@@ -659,7 +664,7 @@ mod unique_filter_tests {
         assert!(filter.warm);
         assert!(filter.capped);
         assert!(filter.values.is_empty());
-        assert!(!disp.unique_filter_all_absent(7, 0, &[span_u64(12345)]));
+        assert!(!disp.unique_filter_all_absent(7, 0, [span_u64(12345)].into_iter()));
     }
 
     // -- drain_index_scan unit tests ------------------------------------------
@@ -1204,7 +1209,7 @@ mod unique_filter_tests {
             compound_pk_bytes(&[&5u32.to_be_bytes(), &1u32.to_be_bytes()]),
             compound_pk_bytes(&[&5u32.to_be_bytes(), &2u32.to_be_bytes()]),
         ];
-        let batch = build_check_batch_pkbuf(&schema, &keys, None);
+        let batch = build_check_batch_pk_bytes(&schema, keys.iter().map(|k| k.pk_bytes()), None);
         let mut filter = UniqueFilter::new();
         // Index on a U32 column promotes to a U64 (8-byte) index column.
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &test_spec(&[0], &schema));
@@ -1228,7 +1233,7 @@ mod unique_filter_tests {
             compound_pk_bytes(&[&5u32.to_be_bytes(), &11u32.to_be_bytes()]),
             compound_pk_bytes(&[&6u32.to_be_bytes(), &22u32.to_be_bytes()]),
         ];
-        let batch = build_check_batch_pkbuf(&schema, &keys, None);
+        let batch = build_check_batch_pk_bytes(&schema, keys.iter().map(|k| k.pk_bytes()), None);
         let mut filter = UniqueFilter::new();
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &test_spec(&[1], &schema));
         assert!(filter.values.contains(&span_u64(11)));

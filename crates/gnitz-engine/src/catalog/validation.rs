@@ -1,6 +1,4 @@
 use super::*;
-use crate::schema::key::PkBuf;
-use rustc_hash::{FxHashMap, FxHashSet};
 
 impl CatalogEngine {
     // -- FK column validation (pre-create) ---------------------------------
@@ -116,15 +114,13 @@ impl CatalogEngine {
             let idx_key_type = idx_ic.map(|ic| ic.index_schema.columns[0].type_code);
 
             // The child FK column may itself be a PK column, so resolve the
-            // PK-vs-payload read once per constraint. Mirrors the distributed FK
-            // gate in master.rs.
+            // PK-vs-payload read once per constraint.
             let loc = schema.locate(col_idx);
 
             // Open the parent's UNIQUE-index cursor once per constraint and reuse
             // it across rows (the non-lone-PK arm). A fresh open_cursor() per row
-            // allocates a loser-tree heap; a reused cursor re-seeks correctly,
-            // exactly as validate_unique_indices does. The lone-PK arm probes
-            // has_pk and needs no cursor.
+            // allocates a loser-tree heap; a reused cursor re-seeks correctly.
+            // The lone-PK arm probes has_pk and needs no cursor.
             let mut idx_cursor = idx_ic.map(|ic| ic.table_mut().open_cursor());
 
             for row in 0..batch.count {
@@ -158,171 +154,6 @@ impl CatalogEngine {
                         "Foreign Key violation in '{sn}.{tn}': value not found in target '{tsn}.{ttn}'"
                     ));
                 }
-            }
-        }
-        Ok(())
-    }
-
-    /// Validate unique index constraints (single-worker path).
-    /// For each unique index on this table, checks that no positive-weight row
-    /// in the batch introduces a duplicate index key.
-    ///
-    /// UPSERT rows (PK already exists) get special handling: the old index entry
-    /// will be retracted by enforce_unique_pk, so we only reject if the NEW value
-    /// collides with a DIFFERENT row's entry.
-    pub(crate) fn validate_unique_indices(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
-        if !self.has_any_unique_index(table_id) {
-            return Ok(());
-        }
-        let entry = self.table_entry(table_id)?;
-        let schema = entry.schema;
-        let src_pk_stride = schema.pk_stride() as usize;
-        // Borrows `batch` (the `&Batch` param), independent of the `&mut self`
-        // cache reads below.
-        let mb = batch.as_mem_batch();
-
-        // Any retraction in the batch? Computed once: the per-index `retracted`
-        // set is populated only when a retraction exists, so insert-only batches
-        // pay nothing.
-        let has_retractions = (0..batch.count).any(|r| batch.get_weight(r) < 0);
-
-        // PKs the batch upserts: net-positive aggregate weight. enforce_unique_pk
-        // retracts such a PK's committed row (and its old unique value) at apply,
-        // so a committed holder that is itself an upserted PK frees its value —
-        // what makes a bulk shift like `UPDATE t SET u = u + 1` valid. Net-positive
-        // rather than "has any +1 row" so this agrees with the distributed
-        // validator's `existing_pks` on an unconsolidated batch carrying both signs
-        // for one PK.
-        //
-        // Insert-only batches (the hot path) carry no `-1`, so every positive row
-        // is already net-positive — skip the aggregation map entirely and collect
-        // PKs directly; only a mixed-sign batch needs the net pass.
-        let mut upserted_pks: FxHashSet<PkBuf> = FxHashSet::default();
-        if has_retractions {
-            let mut net: FxHashMap<PkBuf, i64> = FxHashMap::with_capacity_and_hasher(batch.count, Default::default());
-            for r in 0..batch.count {
-                let w = batch.get_weight(r);
-                if w == 0 {
-                    continue;
-                }
-                *net.entry(PkBuf::from_bytes(batch.get_pk_bytes(r))).or_insert(0) += w;
-            }
-            upserted_pks = net.into_iter().filter(|&(_, w)| w > 0).map(|(pk, _)| pk).collect();
-        } else {
-            upserted_pks.reserve(batch.count);
-            for r in 0..batch.count {
-                if batch.get_weight(r) > 0 {
-                    upserted_pks.insert(PkBuf::from_bytes(batch.get_pk_bytes(r)));
-                }
-            }
-        }
-
-        // (holder source PK, leading-key span) pairs retracted in this batch
-        // over the current index's columns. Allocation reused across indices via
-        // `clear` (the key is index-specific, so the *contents* are rebuilt per
-        // index). The span replaces the old single-`u128` value so a composite
-        // `UNIQUE (a, b, …)` whose span exceeds 16 bytes is keyed without
-        // truncation.
-        let mut retracted: FxHashSet<(PkBuf, PkBuf)> = FxHashSet::default();
-
-        // Reused across indices like `retracted`; cleared per index. The OPK
-        // leading-key span identifies the indexed value for every accepted type
-        // at any width (byte-equal ⟺ value-equal). Scratch `keybuf` is the
-        // reused destination `IndexKeySpec::key_bytes` writes each row's span
-        // into — no per-row allocation.
-        let mut seen: FxHashSet<PkBuf> = FxHashSet::with_capacity_and_hasher(batch.count, Default::default());
-        let mut keybuf = PkBuf::zeroed(0);
-
-        for ic in &entry.index_circuits {
-            let Some(unique_slice) = ic.unique_cols() else { continue };
-            seen.clear();
-            // Own the column list (`PkColList` is Copy) so it outlives the
-            // `&entry` borrow when passed to the `&mut self` error formatters
-            // on the return paths below.
-            let col_list = gnitz_wire::PkColList::from_slice(unique_slice);
-            let cols = col_list.as_slice();
-
-            // Per-circuit read/encode plan, precomputed at registration. A
-            // unique index may be on a PK column (a member of a compound PK),
-            // whose value lives in the packed PK, not a payload slot — the
-            // spec's locators resolve that.
-            let spec = ic.key_spec;
-            let idx_key_size = spec.key_size();
-            let idx_table = ic.table_mut();
-            let mut cursor = idx_table.open_cursor();
-
-            // A batch may atomically move a unique value between PKs (transfer)
-            // or swap two values; the committed index still holds the old entry
-            // (validation is pre-apply), so a collision against a value retracted
-            // *by its current holder* is transient. Pairing on the holder PK —
-            // not the value alone — stops a forged `P_other/v@-1` naming a
-            // non-holder from exempting a real `P2/v@+1`. A row with a NULL in
-            // ANY indexed column is not indexed (`key_bytes` → false).
-            retracted.clear();
-            if has_retractions {
-                for row in 0..batch.count {
-                    if batch.get_weight(row) >= 0 {
-                        continue;
-                    }
-                    if !spec.key_bytes(&mb, row, &mut keybuf) {
-                        continue;
-                    }
-                    retracted.insert((PkBuf::from_bytes(batch.get_pk_bytes(row)), keybuf));
-                }
-            }
-
-            for row in 0..batch.count {
-                let w = batch.get_weight(row);
-                if w <= 0 {
-                    continue;
-                }
-                // PK columns are non-nullable; a row NULL in any indexed column
-                // is skipped (NULL-distinct).
-                if !spec.key_bytes(&mb, row, &mut keybuf) {
-                    continue;
-                }
-
-                if !seen.insert(keybuf) {
-                    return Err(self.unique_violation_err(table_id, cols, true));
-                }
-
-                // Index PK layout: leading indexed-key columns (OPK-encoded,
-                // idx_key_size bytes total) followed by the full source PK bytes —
-                // always idx_key_size + src_pk_stride wide. `keybuf` already holds
-                // the OPK composite span; prefix-match it whole.
-                if !cursor.seek_first_positive_with_prefix(keybuf.pk_bytes()) {
-                    continue;
-                }
-                let pk_bytes = cursor.current_pk_bytes();
-
-                // The committed holder's full source PK. Slice by raw bytes; at
-                // any width truncating to 16 bytes would misread two wide PKs
-                // sharing a 16-byte prefix as the same row.
-                debug_assert!(pk_bytes.len() >= idx_key_size + src_pk_stride);
-                let existing_src_pk = &pk_bytes[idx_key_size..idx_key_size + src_pk_stride];
-
-                // `seen` already barred two live rows sharing this value. Exempt
-                // the committed collision only when the holder releases the value
-                // in this batch: it explicitly retracts (PK, value) here, or the
-                // holder is itself an upserted PK so enforce_unique_pk frees the
-                // value at apply. The latter applies only when *this* row is also
-                // an upsert — a fresh PK cannot ride the holder's retraction.
-                if retracted.contains(&(PkBuf::from_bytes(existing_src_pk), keybuf)) {
-                    continue;
-                }
-                // `has_pk_bytes` takes verbatim OPK bytes — never `get_pk`, which
-                // is OPK-widened and would double-encode a signed/compound PK. It
-                // is also the distribution-aware probe, so under prefix
-                // distribution it looks in the partition the row was routed to.
-                // Ordered last: only a row that actually collided pays the seek.
-                if upserted_pks.contains(existing_src_pk)
-                    && upserted_pks.contains(batch.get_pk_bytes(row))
-                    && entry.handle.has_pk_bytes(batch.get_pk_bytes(row))
-                {
-                    continue;
-                }
-
-                return Err(self.unique_violation_err(table_id, cols, false));
             }
         }
         Ok(())

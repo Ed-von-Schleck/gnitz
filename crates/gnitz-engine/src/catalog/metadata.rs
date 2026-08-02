@@ -73,15 +73,6 @@ impl CatalogEngine {
             .unwrap_or(std::ptr::null())
     }
 
-    /// Get the SchemaDescriptor for the index circuit at position idx.
-    pub fn get_index_circuit_schema(&self, table_id: i64, idx: usize) -> Option<SchemaDescriptor> {
-        self.dag
-            .tables
-            .get(&table_id)
-            .and_then(|e| e.index_circuits.get(idx))
-            .map(|ic| ic.index_schema)
-    }
-
     /// The secondary index circuit on `col_idx` of `table_id`, if one exists.
     /// Single source of truth for "does this column have an index, and is it
     /// unique": the SEEK_BY_INDEX handler matches the `Option` once — `None`
@@ -188,11 +179,13 @@ impl CatalogEngine {
             .unwrap_or(&[])
     }
 
-    /// Does validating a push of `mode` to `table_id` read committed state?
-    /// When false, neither `validate_all_distributed` nor
-    /// `validate_unique_indices` reads a row, so the push may hold its table
-    /// lock shared — nothing it does can be invalidated by a concurrent write
-    /// to the same table. A new constraint kind adds its term here.
+    /// Does validating a write of `mode` to `table_id` read committed state?
+    /// The disjunction of the four validation rules' own gates, so when it is
+    /// false `validate_txn_distributed` finds nothing to check and skips the
+    /// write entirely; the executor reads it for the same reason plus one of
+    /// its own — such a write may hold its table lock shared, since nothing it
+    /// does can be invalidated by a concurrent write to the same table. A new
+    /// constraint kind adds its term here and to the rule that enforces it.
     pub fn push_reads_committed_state(&self, table_id: i64, mode: gnitz_wire::WireConflictMode) -> bool {
         !self.fk_constraints_of(table_id).is_empty()
             || !self.fk_children_of(table_id).is_empty()

@@ -121,9 +121,9 @@ impl CatalogEngine {
         // Resolve the fixed projection once — `(col_idx, payload_slot, size)`
         // per projected column — instead of re-deriving payload index and
         // column size per row per column inside the seek loop. The projection
-        // is master-built and excludes PK columns (`collect_fk_projection`
-        // skips `is_pk_col`; `project_schema` asserts it one frame up), so
-        // every projected column has a payload slot.
+        // is master-built and excludes PK columns (the FK rules gather only a
+        // non-PK referenced column; `project_schema` asserts it one frame up),
+        // so every projected column has a payload slot.
         let proj: Vec<(usize, usize, usize)> = project
             .iter()
             .map(|&p| {

@@ -1387,11 +1387,11 @@ class TestAtomicUniqueTransfers:
         finally:
             _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
 
-    def test_raw_forged_retraction_freed_by_upserted_holder_rejected(self, client):
-        """`{P2/7@+1, P4/6@+1, P3/6@-1}` over committed `P2/6`: P4/6 is a fresh
-        insert routed to the verify by 6 ∈ retracted_vals. The holder P2 is
-        upserted (to 7), but P4 is not an upsert (is_upsert gate) and the
-        retraction names P3, so neither exemption fires — rejected."""
+    def test_raw_forged_retraction_freed_by_upserted_holder_accepted(self, client):
+        """`{P2/7@+1, P4/6@+1, P3/6@-1}` over committed `P2/6`. The batch folds
+        to `{P2→7, P4→6}`, and 6's committed holder P2 survives holding 7 — so
+        the post-write index `{6→P4, 7→P2}` is unique and the write is valid,
+        whatever the (forged) P3 retraction names."""
         sn = _sn()
         client.create_schema(sn)
         try:
@@ -1404,12 +1404,231 @@ class TestAtomicUniqueTransfers:
             b = gnitz.ZSetBatch(schema)
             b.append(pk=2, val=7, _weight=1)   # P2 upserted off 6
             b.append(pk=4, val=6, _weight=1)   # fresh insert of 6
-            b.append(pk=3, val=6, _weight=-1)  # forged retraction names P3
+            b.append(pk=3, val=6, _weight=-1)  # retraction of an absent PK
+            client.push(tid, b)
+            rows = sorted((r.pk, r.val) for r in client.scan(tid))
+            assert rows == [(2, 7), (4, 6)], rows
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
+
+# ---------------------------------------------------------------------------
+# TestPlainPushFoldedValidation
+#
+# A plain push is validated as a one-family bundle: every rule reads the fold of
+# the batch (last op per PK), which is exactly what `enforce_unique_pk` applies
+# at ingest. So a batch whose *raw rows* look like a duplicate but whose fold is
+# unique must be accepted — and must leave exactly the folded survivor behind.
+# ---------------------------------------------------------------------------
+
+class TestPlainPushFoldedValidation:
+    def _raw_table(self, client, sn, cols=None):
+        """Raw table `t (pk U64 PK, val I64)` + a SQL unique index on `val`."""
+        cols = cols or [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                        gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+        schema = gnitz.Schema(cols)
+        tid = client.create_table(sn, "t", cols)
+        client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+        return tid, schema
+
+    def test_repeated_identical_row_in_one_batch_accepted(self, client):
+        """Case A: `{P1/10@+1, P1/10@+1}` — one live row after the fold."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            tid, schema = self._raw_table(client, sn)
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=1, val=10)
+            b.append(pk=1, val=10)
+            client.push(tid, b)
+            assert sorted((r.pk, r.val) for r in client.scan(tid)) == [(1, 10)]
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
+    def test_superseded_value_never_written_accepted(self, client):
+        """Case B: `{P1/10@+1, P1/20@+1}` over committed `P9/10`. Only 20 is
+        written, so the superseded 10 must not be probed against P9."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            tid, schema = self._raw_table(client, sn)
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=9, val=10)
+            client.push(tid, b)
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=1, val=10)
+            b.append(pk=1, val=20)
+            client.push(tid, b)
+            assert sorted((r.pk, r.val) for r in client.scan(tid)) == [(1, 20), (9, 10)]
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
+    def test_in_batch_claimant_removed_again_accepted(self, client):
+        """Case C: `{P1/10@+1, P2/10@+1, P2@-1}` — P2 is gone after the fold, so
+        only P1 claims 10."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            tid, schema = self._raw_table(client, sn)
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=1, val=10)
+            b.append(pk=2, val=10)
+            b.append(pk=2, val=10, _weight=-1)
+            client.push(tid, b)
+            assert sorted((r.pk, r.val) for r in client.scan(tid)) == [(1, 10)]
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
+    def test_fresh_pk_takes_value_vacated_by_upsert_accepted(self, client):
+        """Case D: `{P1/99@+1, P2/10@+1}` over committed `P1/10`. P2 is a fresh
+        PK, and the row that frees 10 is an upsert of a different PK."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            tid, schema = self._raw_table(client, sn)
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=1, val=10)
+            client.push(tid, b)
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=1, val=99)
+            b.append(pk=2, val=10)
+            client.push(tid, b)
+            assert sorted((r.pk, r.val) for r in client.scan(tid)) == [(1, 99), (2, 10)]
+            # The index moved with the rows: 10 is P2's now, and nothing holds 5.
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=3, val=10)
             with pytest.raises(gnitz.GnitzError):
                 client.push(tid, b)
         finally:
             _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
 
+    def test_fresh_pk_takes_value_vacated_by_filler_retraction_accepted(self, client):
+        """Case E: a retraction row carries filler payload (what `delete` ships),
+        so the freed value is not on the wire at all — the committed row's own
+        payload is what the apply retracts."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            tid, schema = self._raw_table(client, sn)
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=1, val=5)
+            client.push(tid, b)
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=1, val=0, _weight=-1)  # filler payload, as `delete` sends
+            b.append(pk=2, val=5)
+            client.push(tid, b)
+            assert sorted((r.pk, r.val) for r in client.scan(tid)) == [(2, 5)]
+            # P1's index entry went with its row: 5 is P2's alone.
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=3, val=5)
+            with pytest.raises(gnitz.GnitzError):
+                client.push(tid, b)
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
+    def test_two_survivors_claiming_one_value_rejected(self, client):
+        """The in-bundle duplicate that survives the fold is still a violation."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            tid, schema = self._raw_table(client, sn)
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=1, val=10)
+            b.append(pk=2, val=10)
+            with pytest.raises(gnitz.GnitzError):
+                client.push(tid, b)
+            assert not list(client.scan(tid))
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
+    def test_bulk_colliding_fresh_pks_rejected_without_per_row_seeks(self, client):
+        """A re-run bulk load: 2000 fresh PKs re-claiming 2000 committed values,
+        none of which the batch frees. The verdict follows from the count alone
+        (no touched PK exists committed, so nothing can be vacated), so it must
+        come back promptly rather than after one committed-holder seek per row."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            tid, schema = self._raw_table(client, sn)
+            n = 2000
+            b = gnitz.ZSetBatch(schema)
+            for i in range(n):
+                b.append(pk=i, val=i)
+            client.push(tid, b)
+
+            b = gnitz.ZSetBatch(schema)
+            for i in range(n):
+                b.append(pk=n + i, val=i)  # fresh PKs, committed values
+            with pytest.raises(gnitz.GnitzError):
+                client.push(tid, b)
+            assert len(list(client.scan(tid))) == n
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
+
+# ---------------------------------------------------------------------------
+# TestWidePkUniqueIndex
+#
+# A PK of three U64 columns is 24 bytes — past the 16 bytes a u128 can hold.
+# Every step of unique-index validation compares source PKs as whole byte
+# strings, so two PKs sharing a 16-byte prefix must stay distinct rows.
+# ---------------------------------------------------------------------------
+
+class TestWidePkUniqueIndex:
+    def _wide_table(self, client, sn):
+        client.execute_sql(
+            "CREATE TABLE t (a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL, "
+            "c BIGINT UNSIGNED NOT NULL, val BIGINT UNSIGNED NOT NULL, "
+            "PRIMARY KEY (a, b, c))",
+            schema_name=sn,
+        )
+        client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+
+    def test_duplicate_value_on_distinct_wide_pk_rejected(self, client):
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._wide_table(client, sn)
+            client.execute_sql("INSERT INTO t VALUES (1, 1, 1, 42)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("INSERT INTO t VALUES (2, 2, 2, 42)", schema_name=sn)
+            res = client.execute_sql("SELECT a, val FROM t", schema_name=sn)
+            assert sorted(tuple(r) for r in res[0]["rows"]) == [(1, 42)]
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
+    def test_prefix_colliding_wide_pks_are_distinct_rows(self, client):
+        """`(7,7,100)` and `(7,7,200)` share their first 16 bytes. Moving the
+        second row's value onto the first must be rejected: a 16-byte-truncated
+        holder compare would misread the collision as the row's own entry."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._wide_table(client, sn)
+            client.execute_sql(
+                "INSERT INTO t VALUES (7, 7, 100, 10), (7, 7, 200, 42)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql(
+                    "UPDATE t SET val = 42 WHERE a = 7 AND b = 7 AND c = 100", schema_name=sn)
+            res = client.execute_sql("SELECT c, val FROM t", schema_name=sn)
+            assert sorted(tuple(r) for r in res[0]["rows"]) == [(100, 10), (200, 42)]
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
+    def test_wide_pk_keeping_its_own_value_admitted(self, client):
+        """A row rewriting its own unchanged value collides only with its own
+        committed index entry, which the write retracts."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._wide_table(client, sn)
+            client.execute_sql("INSERT INTO t VALUES (5, 6, 7, 42)", schema_name=sn)
+            client.execute_sql(
+                "UPDATE t SET val = 42 WHERE a = 5 AND b = 6 AND c = 7", schema_name=sn)
+            res = client.execute_sql("SELECT c, val FROM t", schema_name=sn)
+            assert sorted(tuple(r) for r in res[0]["rows"]) == [(7, 42)]
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
 
 
 # ---------------------------------------------------------------------------
