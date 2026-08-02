@@ -3,6 +3,8 @@
 
 use super::*;
 
+use ipc::FRAME_CAP;
+
 // ---------------------------------------------------------------------------
 // PendingScan
 // ---------------------------------------------------------------------------
@@ -31,7 +33,7 @@ pub(super) struct PendingScan {
 ///   chunk still owes the schema block; non-zero ⇒ a pure-data continuation);
 ///   `wire_row_stride` is the constant per-row wire size, computed once at
 ///   enqueue so each chunk recomputes only the frame base. This is the only
-///   shape a plain scan or an oversized seek/gather reply produces.
+///   shape a plain scan or an oversized seek-by-index / gather reply produces.
 /// * `NonWireSafe` — a STRING/German-string (blob-bearing) result that cannot
 ///   chunk: exactly one frame via the blob-capable `encode_wire_into`. Reached
 ///   only on the multi-scan FIFO path (`force_fifo`), where even an
@@ -91,6 +93,13 @@ impl WorkerProcess {
         }
     }
 
+    /// Emit `result` as one frame, or fail if that frame would exceed
+    /// [`FRAME_CAP`] — a reply that big is unreadable, since it reaches the
+    /// client verbatim and `Connection` reads exactly one frame. Checking here
+    /// rather than at a call site keeps the bound on every single-frame reply:
+    /// `result` is unbounded on the seek path, where a view key names its whole
+    /// PK group. The error takes the worker-error path — a `STATUS_ERROR` reply,
+    /// connection intact.
     pub(super) fn send_response(
         &mut self,
         target_id: u64,
@@ -99,10 +108,15 @@ impl WorkerProcess {
         request_id: u64,
         client_id: u64,
         seek_pk: u128,
-    ) {
+    ) -> Result<(), String> {
         let (prebuilt_rc, server_version, _) = self.reply_schema_block(target_id as i64, schema);
         let prebuilt = prebuilt_rc.as_deref().map(Vec::as_slice);
         let sz = ipc::wire_size(STATUS_OK, &[], None, None, result, prebuilt, &[]);
+        if sz > FRAME_CAP {
+            return Err(format!(
+                "reply wire_size={sz} exceeds the maximum frame payload {FRAME_CAP}"
+            ));
+        }
         self.send_response_prebuilt(
             target_id,
             result,
@@ -113,6 +127,7 @@ impl WorkerProcess {
             server_version,
             sz,
         );
+        Ok(())
     }
 
     /// Encode tail of `send_response`: emit one frame with an already-resolved
@@ -172,8 +187,7 @@ impl WorkerProcess {
         seek_pk: u128,
     ) -> Result<(), String> {
         let Some(batch) = result.filter(|b| b.count > 0) else {
-            self.send_response(target_id, None, schema, request_id, client_id, seek_pk);
-            return Ok(());
+            return self.send_response(target_id, None, schema, request_id, client_id, seek_pk);
         };
         let tid_key = target_id as i64;
         let (prebuilt_rc, server_version, is_wire_safe) = self.reply_schema_block(tid_key, schema);
@@ -187,12 +201,12 @@ impl WorkerProcess {
             ipc::wire_size(STATUS_OK, &[], None, None, Some(&batch), prebuilt, &[])
         };
         // Non-wire-safe replies cannot chunk, so they single-frame up to the
-        // hard ring limit; wire-safe replies chunk past the (overridable)
-        // frame budget.
+        // hard frame cap; wire-safe replies chunk past the (overridable, and
+        // never larger) frame budget.
         let frame_cap = if is_wire_safe {
             self.reply_frame_budget
         } else {
-            w2m_ring::MAX_W2M_MSG as usize
+            FRAME_CAP
         };
         if sz <= frame_cap {
             self.send_response_prebuilt(
@@ -209,9 +223,8 @@ impl WorkerProcess {
         }
         if !is_wire_safe {
             return Err(format!(
-                "result wire_size={sz} > MAX_W2M_MSG={}; STRING-column chunking not \
-                 yet implemented — add a tighter predicate or LIMIT",
-                w2m_ring::MAX_W2M_MSG
+                "result wire_size={sz} exceeds the maximum frame payload {FRAME_CAP}; \
+                 STRING-column chunking not yet implemented — add a tighter predicate or LIMIT"
             ));
         }
         self.enqueue_stream(
@@ -229,7 +242,7 @@ impl WorkerProcess {
     /// are split across multiple frames via `pending_streams`; the first chunk
     /// is emitted at the top of the next `drain_sal` pass. For non-wire-safe
     /// (STRING-column) schemas, a single frame is sent; returns an error message
-    /// if the batch exceeds `MAX_W2M_MSG`.
+    /// if the batch exceeds [`FRAME_CAP`].
     #[allow(clippy::too_many_arguments)]
     pub(super) fn send_scan_response(
         &mut self,
@@ -253,11 +266,10 @@ impl WorkerProcess {
             // STRING-column tables: no chunking. Check size; error if too big.
             let prebuilt = prebuilt_rc.as_deref().map(Vec::as_slice);
             let wire_sz = ipc::wire_size(STATUS_OK, &[], None, None, Some(&*batch), prebuilt, &[]);
-            if wire_sz > w2m_ring::MAX_W2M_MSG as usize {
+            if wire_sz > FRAME_CAP {
                 return Err(format!(
-                    "scan: batch wire_size={wire_sz} > MAX_W2M_MSG={}; \
-                     STRING-column chunking not yet implemented",
-                    w2m_ring::MAX_W2M_MSG
+                    "scan: batch wire_size={wire_sz} exceeds the maximum frame payload \
+                     {FRAME_CAP}; STRING-column chunking not yet implemented"
                 ));
             }
             if force_fifo {
@@ -366,7 +378,7 @@ impl WorkerProcess {
     /// always `None`: a prebuilt block, present whenever a schema is emitted,
     /// supersedes it. Shared by the immediate branch of `send_scan_response` and
     /// the queued `emit_non_wire_safe_frame` (multi-scan FIFO) so the two produce
-    /// byte-identical frames. Callers enforce the `MAX_W2M_MSG` limit first.
+    /// byte-identical frames. Callers enforce the [`FRAME_CAP`] limit first.
     fn emit_non_wire_safe(
         &mut self,
         target_id: u64,

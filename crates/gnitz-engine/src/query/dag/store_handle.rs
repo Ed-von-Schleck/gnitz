@@ -200,25 +200,44 @@ pub(crate) enum StoreProbe {
 }
 
 impl StoreProbe {
-    /// The cursor positioned on `key`'s live row (full OPK bytes), or `None`
-    /// when no such row is reachable — the key is absent, or this process holds
-    /// no partition for it, which a broadcast key list makes the common case.
-    /// `advance_to` is backward-capable, so any key order is correct; ascending
-    /// keys additionally keep each routed cursor's probes monotone.
+    /// The cursor for `key`'s partition, or `None` when this process holds none
+    /// — which a broadcast key list makes the common case.
     ///
     /// `store` is the handle's own `PartitionedTable`, passed per call because a
     /// probe outlives its construction and cannot hold that borrow across the
     /// `&mut CatalogEngine` uses between chunks. A `Routed` probe is only ever
     /// built over `Some`.
+    fn cursor_for<'s>(&'s mut self, store: Option<&PartitionedTable>, key: &[u8]) -> Option<&'s mut ReadCursor> {
+        match self {
+            StoreProbe::Routed(p) => p.probe(store?, key),
+            StoreProbe::Whole(c) => Some(c.as_mut()),
+        }
+    }
+
+    /// The cursor positioned on `key`'s live row (full OPK bytes), or `None`
+    /// when no such row is reachable — the key is absent, or unreachable here.
+    /// `advance_to` is backward-capable, so any key order is correct; ascending
+    /// keys additionally keep each routed cursor's probes monotone.
+    ///
+    /// Resolves the key to at most one row, so it fits a reader whose consumer is
+    /// keyed by PK. A reader that must see every row a key names wants
+    /// [`Self::copy_live_pk_group_into`] instead.
     pub(crate) fn advance_to_exact_live<'s>(
         &'s mut self,
         store: Option<&PartitionedTable>,
         key: &[u8],
     ) -> Option<&'s mut ReadCursor> {
-        let cursor = match self {
-            StoreProbe::Routed(p) => p.probe(store?, key)?,
-            StoreProbe::Whole(c) => c.as_mut(),
-        };
+        let cursor = self.cursor_for(store, key)?;
         cursor.advance_to_exact_live(key).then_some(cursor)
+    }
+
+    /// Group-walking sibling of [`Self::advance_to_exact_live`]: append every live
+    /// row of `key`'s PK group to `out`, per the
+    /// [`ReadCursor::copy_live_pk_group_into`] contract. Appends nothing when the
+    /// key is absent or this process holds no partition for it.
+    pub(crate) fn copy_live_pk_group_into(&mut self, store: Option<&PartitionedTable>, key: &[u8], out: &mut Batch) {
+        if let Some(cursor) = self.cursor_for(store, key) {
+            cursor.copy_live_pk_group_into(key, out);
+        }
     }
 }

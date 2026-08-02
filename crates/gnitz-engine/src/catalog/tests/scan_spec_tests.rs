@@ -137,8 +137,8 @@ fn pk_set_over_a_system_table_keeps_every_key() {
 
 /// Two distinct wire keys can share one OPK image — `opk_key` truncates to
 /// `pk_stride`, so `5` and `5 + 2^64` are the same U64 PK. The decoder's
-/// schema-free view cannot see that; the gather's post-sort scan must, or
-/// `advance_to_exact_live` re-finds the row and emits it twice. The reject must
+/// schema-free view cannot see that; the gather's post-sort scan must, or the
+/// duplicate key re-walks the same PK group and emits it twice. The reject must
 /// not depend on which worker owns the key, so it runs before the gather's
 /// ownership filter — a fixture whose store owns everything cannot show that, so
 /// the assertion is on the error alone.
@@ -212,6 +212,94 @@ fn keyed_reads_over_a_replicated_table_find_every_key() {
 
     e.close();
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// A view output store runs no `enforce_unique_pk`, and a synthetic view key
+/// (`_join_pk`) is the join key — it names one row per row the join produced for
+/// it. Every keyed reader must return that whole group: the full scan is ground
+/// truth and the point PK range already walked it, so a seek or `pk IN (…)` that
+/// copies the first row alone silently answers a fraction of the key.
+///
+/// A ghost member (net weight 0 across two ingests) is dropped by all four.
+#[test]
+fn keyed_reads_over_a_view_return_the_whole_pk_group() {
+    let rows = [(7u64, 50i64, 1i64), (7, 100, 1), (7, 200, 1), (7, 300, 1), (9, 900, 1)];
+    let (mut e, vid) = weighted_fixture("ss_view_group", rows.into_iter());
+    // Retract (7, 50) in a second ingest: it folds to net zero at read time.
+    let mut bb = BatchBuilder::new(e.get_schema(vid).unwrap());
+    bb.begin_row(7, -1);
+    bb.put_u64(50);
+    bb.end_row();
+    e.ingest_to_family(vid, &bb.finish()).unwrap();
+    let want = vec![(7u128, 100i64, 1i64), (7, 200, 1), (7, 300, 1)];
+
+    let mut full = run(&mut e, vid, &identity_spec(ReadBound::None, vec![], 0));
+    full.sort();
+    assert_eq!(full, [want.clone(), vec![(9u128, 900, 1)]].concat(), "ground truth");
+
+    // The point PK range — what `WHERE pk = 7` compiles to.
+    let point = RangeDescriptor::new(&[], Cut::Before(7), Cut::After(7));
+    assert_eq!(
+        run(&mut e, vid, &identity_spec(ReadBound::PkRange(point), vec![], 0)),
+        want
+    );
+
+    // The point seek (FLAG_SEEK).
+    let hit = e.seek_family(vid, 7, &[]).unwrap().0.expect("seek must find the group");
+    assert_eq!(triples(&hit), want);
+
+    // The `pk IN (…)` set gather.
+    assert_eq!(
+        run(&mut e, vid, &identity_spec(ReadBound::PkSet(vec![7]), vec![], 0)),
+        want
+    );
+
+    // A key the store does not name stays a miss on both.
+    assert!(e.seek_family(vid, 8, &[]).unwrap().0.is_none());
+    assert_eq!(
+        run(&mut e, vid, &identity_spec(ReadBound::PkSet(vec![8]), vec![], 0)),
+        vec![]
+    );
+}
+
+/// The two keyed readers gate each row on a positive weight. That gate must be
+/// applied **per row of the group**, not as a presence test for the key: a
+/// retracted member an uncompacted source still holds sorts at the group head
+/// (payloads order within a PK), and testing the key by its head alone answers
+/// "no such row" for a key whose live rows sit right behind it.
+#[test]
+fn keyed_reads_skip_a_retracted_group_head_and_keep_the_live_rows() {
+    let rows = [(5u64, 10i64, -1i64), (5, 20, 1), (5, 30, 1)];
+    let (mut e, vid) = weighted_fixture("ss_view_head_ghost", rows.into_iter());
+    let want = vec![(5u128, 20i64, 1i64), (5, 30, 1)];
+
+    let hit = e.seek_family(vid, 5, &[]).unwrap().0.expect("seek must find the group");
+    assert_eq!(triples(&hit), want);
+    assert_eq!(
+        run(&mut e, vid, &identity_spec(ReadBound::PkSet(vec![5]), vec![], 0)),
+        want
+    );
+}
+
+/// A `PkSet` chunk tests the row budget before each key and then drains that
+/// key's whole group, so a group larger than the budget crosses it in one piece
+/// and the chunk overshoots. The sink must take that chunk whole and resume at
+/// the next key — a group cut at the budget would lose its tail.
+#[test]
+fn pk_set_drains_a_group_larger_than_the_chunk_budget() {
+    let (mut e, vid) = weighted_fixture(
+        "ss_view_chunk",
+        (0..10u64)
+            .map(|i| (1u64, i as i64, 1i64))
+            .chain(std::iter::once((2u64, 99i64, 1i64))),
+    );
+    e.ddl_scan_chunk_rows = 4;
+    let got = run(&mut e, vid, &identity_spec(ReadBound::PkSet(vec![1, 2]), vec![], 0));
+    let want: Vec<_> = (0..10i64)
+        .map(|v| (1u128, v, 1i64))
+        .chain(std::iter::once((2u128, 99, 1)))
+        .collect();
+    assert_eq!(got, want);
 }
 
 /// A `CLUSTER BY` table hashes only the leading PK column, so a range that pins

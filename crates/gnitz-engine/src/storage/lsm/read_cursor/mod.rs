@@ -369,26 +369,24 @@ impl ReadCursor {
     /// The weight gate is load-bearing, not redundant — a single-source cursor
     /// (`drive_single`) does not consolidate, so it can surface a tombstone an
     /// uncompacted source still holds; every point lookup must filter it. Folds
-    /// the `seek_bytes` + valid/exact-PK/positive-weight predicate that point
-    /// seeks (`seek_family`, `gather_family_bytes`, index resolve, the
-    /// unique-upsert probe, single-row retract) would otherwise open-code.
+    /// the `seek_bytes` + valid/exact-PK/positive-weight predicate the system-table
+    /// point lookups (liveness probe, single-row retract, the unique-upsert probe)
+    /// would otherwise open-code.
     pub fn seek_exact_live(&mut self, key: &[u8]) -> bool {
         self.seek_bytes(key);
         self.valid && self.current_pk_eq(key) && self.current_weight > 0
     }
 
-    /// Galloping forward sibling of [`seek_exact_live`]: `advance_to(key)` then
-    /// the same present/exact-PK/positive-weight gate. For an **ascending** probe
-    /// sequence (each `key` ≥ the last) the per-source search is seeded at the
-    /// live position, turning K scattered point-seeks into one monotone forward
-    /// sweep that keeps shard pages and merge state hot. Correct for any probe
-    /// order — `advance_to` is backward-capable — so an out-of-order key only
-    /// forfeits the speedup, never correctness. `key` must be exactly `pk_stride`
-    /// OPK bytes. Both an ascending resolve loop (the sorted-`&[PkBuf]` callers)
-    /// and an unordered batch sharing one cursor (`gather_family_bytes`) use this:
-    /// the former gets the full sweep, the latter still beats re-seeking from
-    /// scratch via the bounded `[0, position)` backward branch. A lone random
-    /// point lookup can keep `seek_exact_live`.
+    /// Galloping forward sibling of [`seek_exact_live`] for a probe **sequence**
+    /// sharing one cursor: `advance_to(key)` then the same
+    /// present/exact-PK/positive-weight gate. Each source's search is seeded at
+    /// its live position, so an ascending run of keys is one monotone forward
+    /// sweep that keeps shard pages and merge state hot; an unordered run still
+    /// beats re-seeking from scratch via the bounded `[0, position)` backward
+    /// branch. Correct for any probe order — `advance_to` is backward-capable —
+    /// so an out-of-order key forfeits only the speedup. `key` must be exactly
+    /// `pk_stride` OPK bytes. A lone random point lookup can keep
+    /// `seek_exact_live`.
     pub fn advance_to_exact_live(&mut self, key: &[u8]) -> bool {
         self.advance_to(key);
         self.valid && self.current_pk_eq(key) && self.current_weight > 0
@@ -466,14 +464,16 @@ impl ReadCursor {
 
     /// Group-walking sibling of [`Self::advance_to_exact_live`]: position on
     /// `key`'s PK group — seeking only when not already sitting on it — and
-    /// invoke `f` at every row of the group (the [`Self::for_each_pk_group_row`]
-    /// contract; an absent `key` walks zero rows). Returns `false` when no row
-    /// at or past `key` exists — an ascending probe sequence can stop there,
-    /// and a later backward probe (a chunk boundary) re-enters through the
-    /// seek: `advance_to` is backward-capable from any state, including an
-    /// exhausted cursor (the absolute path's bounded `[0, hint)` search), and
-    /// the `!valid ||` short-circuit keeps `current_pk_cmp_bytes` off an
-    /// unpositioned cursor.
+    /// append every **live** row of it to `out`. An absent key appends nothing.
+    /// The single keyed-read primitive for a store whose PK need not be unique:
+    /// a base table's PK names one row, but a view output store runs no
+    /// `enforce_unique_pk` and its synthetic key (`_join_pk`) names one row per
+    /// row the join produced for it.
+    ///
+    /// The `current_weight > 0` gate is per row, not a presence test for the key:
+    /// a retracted member an uncompacted source still holds sorts within its PK
+    /// by payload, so it can head the group, and rejecting the key on it would
+    /// drop the live rows behind it.
     ///
     /// Skipping the seek at `Equal` is sound because a cursor driven through
     /// seeks and this method always rests on a group's FIRST unconsumed row:
@@ -484,15 +484,15 @@ impl ReadCursor {
     /// plus tree rebuild — so the skip removes the most expensive seek shape
     /// entirely. `Greater` (a backward probe) does NOT mean the group is
     /// absent, only that an earlier consumer left the cursor ahead: it seeks.
-    pub(crate) fn gather_pk_group<F: FnMut(&ReadCursor)>(&mut self, key: &[u8], f: F) -> bool {
+    pub(crate) fn copy_live_pk_group_into(&mut self, key: &[u8], out: &mut Batch) {
         if !self.valid || self.current_pk_cmp_bytes(key) != Ordering::Equal {
             self.advance_to(key);
-            if !self.valid {
-                return false;
-            }
         }
-        self.for_each_pk_group_row(key, f);
-        true
+        self.for_each_pk_group_row(key, |c| {
+            if c.current_weight > 0 {
+                c.copy_current_row_into(out, c.current_weight);
+            }
+        });
     }
 
     /// Storage-order comparison of the current row's PK against an OPK `key`

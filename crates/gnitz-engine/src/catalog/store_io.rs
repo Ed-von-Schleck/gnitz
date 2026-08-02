@@ -77,17 +77,18 @@ impl CatalogEngine {
     }
 
     /// The seek+materialise primitive: open a cursor over the one partition `pk`
-    /// can live in, `seek_exact_live` the OPK `pk` bytes, copy the row. Correct
-    /// at any PK width. A borrowed system table is one unpartitioned `Table`
-    /// with nothing to route among, so it opens whole.
+    /// can live in and copy every live row of its PK group. Correct at any PK
+    /// width. A base table's PK is unique (`enforce_unique_pk` on ingest) so this
+    /// emits one row; a view output store enforces nothing, and a synthetic view
+    /// key (`_join_pk`) names one row per row the join produced for it — walking
+    /// the group is what makes a seek answer the same rows a point-range read of
+    /// that key does. A borrowed system table is one unpartitioned `Table` with
+    /// nothing to route among, so it opens whole.
     fn seek_entry_bytes(entry: &crate::query::TableEntry, pk: &[u8]) -> Option<Batch> {
         let mut cursor = entry.handle.open_cursor_for_key(pk)?;
-        if !cursor.seek_exact_live(pk) {
-            return None;
-        }
-        let mut batch = Batch::with_capacity(entry.schema, 1);
-        cursor.copy_current_row_into(&mut batch, cursor.current_weight);
-        Some(batch)
+        let mut batch = Batch::empty_with_schema(&entry.schema);
+        cursor.copy_live_pk_group_into(pk, &mut batch);
+        (batch.count > 0).then_some(batch)
     }
 
     /// Batched point lookup. Route each PK in `pks` (verbatim OPK bytes) to the
@@ -100,9 +101,13 @@ impl CatalogEngine {
     /// single-key `None` — so a removed PK with no committed row contributes
     /// nothing. `project` lists the parent column indices to return (all
     /// non-PK scalar columns); an empty `project` returns PK-only rows.
-    /// Each PK resolves to its group's FIRST live row: FK dereference is by-PK
-    /// by definition, so a multi-payload PK — which only a view output store can
-    /// carry — dereferences to the (PK, payload)-least member.
+    /// Each PK resolves to its group's FIRST live row, which is also its only
+    /// one: an FK parent is always a base table (`gnitz-sql` resolves
+    /// `fk_table_id` through TABLE_TAB), whose PK `enforce_unique_pk` keeps
+    /// unique. The consumer requires that — it indexes the result by PK, so a
+    /// second row of a group would overwrite the first rather than join it.
+    /// The seek and `pk IN (…)` readers, whose consumers take whole groups, walk
+    /// instead.
     ///
     /// Reuses one cursor per touched partition across all keys (cheaper than N
     /// `seek_family` calls, each of which re-opens a cursor). Projection keeps

@@ -64,17 +64,7 @@ fn gather_source_rows(
         let Some(cursor) = probe.probe(store, pk.pk_bytes()) else {
             continue;
         };
-        // `gather_pk_group`'s `false` ("no base row at or past `pk`") bounds only
-        // the partition it was asked, so it says nothing about the larger PKs
-        // still to come in other partitions — the sweep never breaks out of the
-        // loop on it. It is unreachable anyway for a live entry: the write path
-        // writes base before index, so a `current_weight > 0` entry's base row is
-        // present.
-        cursor.gather_pk_group(pk.pk_bytes(), |c| {
-            if c.current_weight > 0 {
-                c.copy_current_row_into(&mut cand, c.current_weight);
-            }
-        });
+        cursor.copy_live_pk_group_into(pk.pk_bytes(), &mut cand);
     }
     if cand.count == 0 {
         return None;

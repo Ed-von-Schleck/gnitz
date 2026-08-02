@@ -11,6 +11,15 @@ use gnitz_wire::encode_german_string;
 // Constants re-exported from gnitz_wire
 // ---------------------------------------------------------------------------
 
+/// The most one reply frame may carry on its way to a client. A worker frame is
+/// forwarded verbatim, and the client's ceiling is `min(server, client)` over the
+/// limit the HELLO ACK advertises — which is `MAX_FRAME_PAYLOAD_SERVER`. So it
+/// bounds the chunk split point, the single-frame paths that cannot chunk, and
+/// the master's merge of per-worker replies alike. `MAX_W2M_MSG` (4×) still
+/// bounds the ring itself, and is the right limit for a train the master
+/// consumes rather than forwards.
+pub(crate) const FRAME_CAP: usize = gnitz_wire::MAX_FRAME_PAYLOAD_SERVER;
+
 /// W2M-internal flag set on the last (or only) scan chunk from a worker.
 /// Not part of the public wire protocol; stripped before reaching clients.
 /// The master uses this to detect end-of-train without removing FLAG_CONTINUATION

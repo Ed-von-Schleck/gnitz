@@ -1216,8 +1216,11 @@ pub unsafe extern "C" fn gnitz_circuit_free(c: *mut GnitzCircuit) {
 // Seek (point lookup)
 // ---------------------------------------------------------------------------
 
-/// Point lookup by primary key. Returns a GnitzBatch with 0 or 1 rows via
-/// `out_batch` (caller must free with `gnitz_batch_free`).
+/// Point lookup by primary key. Returns a GnitzBatch of every live row the key
+/// names via `out_batch` (caller must free with `gnitz_batch_free`) — 0 or 1
+/// rows for a base table's unique PK, the whole group for a view key that names
+/// several. A group too large for one reply frame is an error, not a truncated
+/// answer.
 ///
 /// `pk_bytes` must point to `pk_len` bytes (`1 <= pk_len <= MAX_PK_BYTES`)
 /// containing the packed PK in compound-key order. Returns 0 on success, -1

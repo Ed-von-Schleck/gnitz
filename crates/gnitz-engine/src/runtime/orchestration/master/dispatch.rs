@@ -1028,16 +1028,17 @@ impl MasterDispatcher {
         let mut acc: Option<Batch> = None;
         let mut merged_bytes = 0usize;
         drain_index_scan(slots, &req_ids, reactor, op, &expected, |mb, frame_len| {
-            // Σ frame bytes ≥ the merged single-frame encode size (every frame
-            // re-counts its header and the first one the schema block), so this
-            // cap can never let a reply through that the client would reject
-            // (MAX_FRAME_PAYLOAD_CLIENT) — and it bounds the master's merge heap.
+            // The merge goes back out as one frame, so it is bounded by what the
+            // client will read (`FRAME_CAP`). Σ frame bytes ≥ that merged encode
+            // size — every frame re-counts its header and the first one the schema
+            // block — so capping the sum never lets an unreadable reply through,
+            // and it bounds the master's merge heap on the way.
             merged_bytes += frame_len;
-            if merged_bytes > gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT {
+            if merged_bytes > crate::runtime::wire::FRAME_CAP {
                 return Err(format!(
                     "{op}: result exceeds the {} MiB reply cap; add a tighter \
                      predicate or LIMIT",
-                    gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT >> 20
+                    crate::runtime::wire::FRAME_CAP >> 20
                 ));
             }
             let a = acc.get_or_insert_with(|| Batch::with_capacity(expected, mb.count));

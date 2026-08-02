@@ -259,7 +259,8 @@ impl CatalogEngine {
     }
 }
 
-/// A `pk IN (…)` gather: one live row per key, in ascending OPK order.
+/// A `pk IN (…)` gather: every live row of each key's PK group, in ascending
+/// OPK order.
 struct PkSetGather {
     cursor: StoreProbe,
     /// OPK images of the keys, sorted; the leading `stride` bytes are the key.
@@ -284,11 +285,14 @@ enum ScanSpecCursor {
 }
 
 impl ScanSpecCursor {
-    /// The next up-to-`max_rows` source rows, or `None` once the bound is
-    /// exhausted. A returned batch may be empty (a window of PkSet misses, or of
-    /// keys this worker holds no partition for); `None` strictly means "no
-    /// further rows". `store` is the scanned relation's partitioned store,
-    /// `None` for a borrowed system table.
+    /// The next source rows, or `None` once the bound is exhausted. A returned
+    /// batch may be empty (a window of PkSet misses, or of keys this worker holds
+    /// no partition for); `None` strictly means "no further rows". `store` is the
+    /// scanned relation's partitioned store, `None` for a borrowed system table.
+    ///
+    /// `max_rows` bounds a `Source` chunk exactly; a `PkSet` chunk tests it before
+    /// each key and then drains that key's whole group, so it can overshoot to
+    /// `max_rows - 1 + |largest group|`. Both sinks read `chunk.count`.
     fn next_chunk(&mut self, store: Option<&PartitionedTable>, max_rows: usize) -> Option<Batch> {
         match self {
             ScanSpecCursor::Source(source) => source.drain_chunk(store, max_rows),
@@ -301,13 +305,9 @@ impl ScanSpecCursor {
                 while g.next < g.keys.len() && out.count < max_rows {
                     let key = &g.keys[g.next][..g.stride];
                     g.next += 1;
-                    // `None` = absent, or a key this worker holds no partition
-                    // for — the discard the broadcast list needs.
-                    if let Some(cursor) = g.cursor.advance_to_exact_live(store, key) {
-                        let w = cursor.current_weight;
-                        debug_assert!(w > 0, "advance_to_exact_live guarantees a positive weight");
-                        cursor.copy_current_row_into(&mut out, w);
-                    }
+                    // An absent key, or one this worker holds no partition for,
+                    // copies nothing: the discard the broadcast list needs.
+                    g.cursor.copy_live_pk_group_into(store, key, &mut out);
                 }
                 // An all-miss window returns an empty batch only when the key list
                 // is exhausted; otherwise it advanced `next` and there is more.

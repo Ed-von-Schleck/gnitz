@@ -15,7 +15,6 @@ use crate::runtime::sal::{
     SalMessageKind, SalReader, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_STOP, BACKFILL_PAD_BIT, FLAG_EXCHANGE,
 };
 use crate::runtime::w2m::W2mWriter;
-use crate::runtime::w2m_ring;
 use crate::runtime::wire::{self as ipc, FLAG_CONTINUATION, FLAG_SCAN_LAST, STATUS_ERROR, STATUS_OK};
 use crate::schema::key::PkBuf;
 use crate::schema::SchemaDescriptor;
@@ -212,17 +211,17 @@ pub struct WorkerProcess {
     /// draining.
     pending_streams: VecDeque<PendingScan>,
     /// Per-frame wire budget for chunked reply trains (`send_scan_response`,
-    /// `stream_batch_response`, `emit_pending_scan_chunk`): `MAX_W2M_MSG` in
-    /// production. Debug builds may shrink it via `GNITZ_REPLY_FRAME_BUDGET`
-    /// (read once at construction) so e2e tests exercise multi-frame trains with
-    /// small tables. The master parks a full train per ring while draining
-    /// another worker, but `InFlightState` grows to track it, so the train length
-    /// an override produces is bounded only by the ring's byte capacity — there
-    /// is no per-train frame-count ceiling.
+    /// `stream_batch_response`, `emit_pending_scan_chunk`): [`ipc::FRAME_CAP`]
+    /// in production, since every chunk reaches the client as one frame. Debug
+    /// builds may shrink it via `GNITZ_REPLY_FRAME_BUDGET` (read once at
+    /// construction) so e2e tests exercise multi-frame trains with small tables;
+    /// a larger value is ignored. The master parks a full train per ring while
+    /// draining another worker, but `InFlightState` grows to track it, so the
+    /// train length an override produces is bounded only by the ring's byte
+    /// capacity — there is no per-train frame-count ceiling.
     ///
     /// This budgets only the chunk split point; single-frame paths that cannot
-    /// chunk (non-wire-safe STRING replies) check the hard `MAX_W2M_MSG` ring
-    /// limit instead.
+    /// chunk (non-wire-safe STRING replies) check `FRAME_CAP` directly.
     reply_frame_budget: usize,
     read_cursor: u64,
     expected_epoch: u32,
@@ -347,8 +346,8 @@ impl WorkerProcess {
             reply_frame_budget: REPLY_FRAME_BUDGET
                 .count()
                 .map(|n| n as usize)
-                .filter(|&n| n <= w2m_ring::MAX_W2M_MSG as usize)
-                .unwrap_or(w2m_ring::MAX_W2M_MSG as usize),
+                .filter(|&n| n <= ipc::FRAME_CAP)
+                .unwrap_or(ipc::FRAME_CAP),
             read_cursor: 0,
             expected_epoch: 1,
         }
@@ -860,6 +859,9 @@ impl WorkerProcess {
                 // narrow PKs). `seek_family` decodes it through `seek_opk_bytes`
                 // at every width — user and system tables alike, no width fork.
                 let (result, schema) = self.cat().seek_family(target_id, seek_pk, &seek_pk_extra)?;
+                // One frame, and a view key names its whole PK group — so this
+                // reply has no size bound of its own. `send_response` rejects one
+                // too large for the client rather than emitting it.
                 self.send_response(
                     target_id as u64,
                     result.as_ref(),
@@ -867,8 +869,7 @@ impl WorkerProcess {
                     request_id,
                     client_id,
                     seek_pk,
-                );
-                Ok(())
+                )
             }
 
             SalMessageKind::Scan => {
@@ -1281,7 +1282,7 @@ impl WorkerProcess {
                     request_id,
                     client_id,
                     seek_pk,
-                );
+                )?;
             }
             HasPkLookup::PrimaryKey => {
                 let schema = self
@@ -1302,7 +1303,7 @@ impl WorkerProcess {
                     request_id,
                     client_id,
                     seek_pk,
-                );
+                )?;
             }
         }
         Ok(())
@@ -1531,6 +1532,7 @@ fn unique_preflight_spill_bytes() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::w2m_ring;
     use crate::schema::SchemaDescriptor;
 
     fn test_schema() -> SchemaDescriptor {
@@ -1666,7 +1668,8 @@ mod tests {
         // Pass ReplySchema::None: send_response consults the catalog only
         // when a schema is present, and this test uses a null catalog pointer.
         // The id round-trip is the assertion of interest.
-        wp.send_response(8, None, ReplySchema::None, req_resp, 0, 0u128);
+        wp.send_response(8, None, ReplySchema::None, req_resp, 0, 0u128)
+            .unwrap();
         wp.send_error("boom", req_err);
 
         // Decode the three messages back from the ring via try_consume.
@@ -1728,7 +1731,7 @@ mod tests {
             exchange: make_handler(),
             pending_deltas: HashMap::new(),
             pending_streams: VecDeque::new(),
-            reply_frame_budget: w2m_ring::MAX_W2M_MSG as usize,
+            reply_frame_budget: ipc::FRAME_CAP,
             read_cursor: 0,
             expected_epoch: 1,
         }
@@ -2286,9 +2289,9 @@ mod tests {
     }
 
     /// STRING-column schemas are not wire-safe: send_scan_response sends them as a
-    /// single frame without chunking (and returns an error if the batch exceeds
-    /// MAX_W2M_MSG). The full error path requires a CatalogEngine + a > 256 MiB
-    /// batch; this test verifies the predicate that gates that branch.
+    /// single frame without chunking (and returns an error past `ipc::FRAME_CAP`).
+    /// The full error path requires a CatalogEngine + an oversized batch; this test
+    /// verifies the predicate that gates that branch.
     #[test]
     fn test_string_schema_not_wire_safe() {
         use crate::schema::{type_code, SchemaColumn};
@@ -2325,8 +2328,8 @@ mod tests {
         out
     }
 
-    /// A batch of `count` decodable all-zero rows — used to make wire sizes
-    /// cross MAX_W2M_MSG without writing 256 MiB.
+    /// A batch of `count` decodable all-zero rows — used to cross a wire-size
+    /// limit without writing that many real bytes.
     fn zero_batch(schema: SchemaDescriptor, count: usize) -> Batch {
         Batch::zeroed(schema, count)
     }
@@ -2463,8 +2466,12 @@ mod tests {
         let req = 0xCAFE_u64;
         let client = 7u64;
         let pk = 0xDEAD_BEEF_u128;
-        wp_ref.send_response(8, Some(&batch), ReplySchema::None, req, client, pk);
-        wp_ref.send_response(8, None, ReplySchema::None, req + 1, client, 0);
+        wp_ref
+            .send_response(8, Some(&batch), ReplySchema::None, req, client, pk)
+            .unwrap();
+        wp_ref
+            .send_response(8, None, ReplySchema::None, req + 1, client, 0)
+            .unwrap();
 
         assert!(wp_new
             .stream_batch_response(8, Some(batch.clone()), ReplySchema::None, req, client, pk)
@@ -2483,12 +2490,12 @@ mod tests {
         );
     }
 
-    /// An oversized wire-safe result (> MAX_W2M_MSG) enqueues a train instead
-    /// of hitting the ring-size assert; nothing is emitted until drain_sal.
+    /// An oversized wire-safe result enqueues a train instead of emitting a
+    /// frame past `ipc::FRAME_CAP`; nothing is emitted until drain_sal.
     #[test]
     fn test_stream_batch_response_oversized_enqueues_train() {
         let schema = test_schema(); // 32 B/row on the wire
-        let rows = (w2m_ring::MAX_W2M_MSG as usize / 32) + 4096;
+        let rows = (ipc::FRAME_CAP / 32) + 4096;
         let batch = zero_batch(schema, rows);
 
         let (region, writer) = make_ring();
@@ -2553,7 +2560,7 @@ mod tests {
         assert!(!schema_wire_safe(&schema));
 
         // 40 B/row (8 pk + 8 weight + 8 null + 16 string struct), empty blob.
-        let rows = (w2m_ring::MAX_W2M_MSG as usize / 40) + 4096;
+        let rows = (ipc::FRAME_CAP / 40) + 4096;
         let batch = zero_batch(schema, rows);
 
         let (_region, writer) = make_ring();
@@ -2614,7 +2621,7 @@ mod tests {
         );
 
         // Oversized projected reply: the queued train holds the one-off block.
-        let rows = (w2m_ring::MAX_W2M_MSG as usize / 32) + 4096;
+        let rows = (ipc::FRAME_CAP / 32) + 4096;
         let big = zero_batch(projected, rows);
         assert!(wp
             .stream_batch_response(tid as u64, Some(big), ReplySchema::OneOff(&projected), 6, 0, 0)
