@@ -4,6 +4,7 @@
 
 use super::index_router::index_route_key;
 use super::*;
+use crate::foundation::fault::Seam;
 use crate::runtime::sal::MAX_WORKERS;
 
 /// The verdict of `MasterDispatcher::txn_fit`.
@@ -72,6 +73,19 @@ fn confined_worker(disp_ptr: *mut MasterDispatcher, target_id: i64, seek_pk_extr
 /// loop re-`try_read`s every iteration and finds the reply) at a few ms instead
 /// of ~1 s, with negligible extra polling on the never-stalled paths.
 const W2M_SYNC_WAIT_MS: i32 = 10;
+
+/// `GNITZ_INJECT_RELAY_SPACE_LOW` / `GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW`:
+/// report SAL relay space as low — for the steady-state relay until the next
+/// checkpoint bumps the epoch, for the backfill on every non-stop round. Lets
+/// tests drive the SAL reclamation protocol (worker re-epoch, master
+/// `checkpoint_reset`, epoch advancing) over a small table that would never
+/// approach the 1 GiB mmap.
+static RELAY_SPACE_LOW: Seam = Seam::new("GNITZ_INJECT_RELAY_SPACE_LOW");
+static BACKFILL_RELAY_SPACE_LOW: Seam = Seam::new("GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW");
+
+/// `GNITZ_INJECT_TICK_EMIT_ERROR=<table>`: fail the named table's next tick
+/// emit, once, as a full SAL would.
+static TICK_EMIT_ERROR: Seam = Seam::new("GNITZ_INJECT_TICK_EMIT_ERROR");
 
 impl MasterDispatcher {
     pub fn new(
@@ -433,7 +447,7 @@ impl MasterDispatcher {
                         let decision = if relay.all_pad {
                             BACKFILL_DECISION_STOP
                         } else if checkpoint_allowed
-                            && (!self.sal_relay_space_ok_raw() || Self::inject_backfill_reclaim())
+                            && (!self.sal_relay_space_ok_raw() || BACKFILL_RELAY_SPACE_LOW.armed())
                         {
                             pending_reset = true;
                             BACKFILL_DECISION_CHECKPOINT
@@ -512,30 +526,9 @@ impl MasterDispatcher {
     // Exchange relay
     // -----------------------------------------------------------------------
 
-    #[cfg(debug_assertions)]
     fn seam_armed_epoch() -> &'static std::sync::atomic::AtomicU32 {
         static ARMED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
         &ARMED
-    }
-
-    /// Debug-only backfill seam: when `GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW` is
-    /// set, `collect_acks_and_relay` treats SAL space as low on every non-stop
-    /// round, forcing a per-round CHECKPOINT + reset. Lets tests exercise the SAL
-    /// reclamation protocol (worker re-epoch, master `checkpoint_reset`, epoch
-    /// advancing many times) over a small table that would otherwise never
-    /// approach the 1 GiB mmap. Release builds compile this to `false`.
-    #[cfg(debug_assertions)]
-    fn inject_backfill_reclaim() -> bool {
-        // The env var can't change mid-boot; read it once. `collect_acks_and_relay`
-        // calls this once per round, and the seam's whole purpose is to drive the
-        // round count up — so an uncached read would re-allocate per round.
-        use std::sync::OnceLock;
-        static ARMED: OnceLock<bool> = OnceLock::new();
-        *ARMED.get_or_init(|| std::env::var_os("GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW").is_some())
-    }
-    #[cfg(not(debug_assertions))]
-    fn inject_backfill_reclaim() -> bool {
-        false
     }
 
     /// Raw SAL relay-space threshold: at least 1/8 of the mmap still free.
@@ -555,29 +548,20 @@ impl MasterDispatcher {
     /// relay and deadlocking blocked workers. While the debug seam is armed,
     /// reports low until the next checkpoint bumps the SAL epoch.
     pub(crate) fn sal_has_relay_space(&self) -> bool {
-        #[cfg(debug_assertions)]
-        if Self::seam_armed_epoch().load(std::sync::atomic::Ordering::Relaxed) == self.sal.epoch() {
+        if RELAY_SPACE_LOW.armed()
+            && Self::seam_armed_epoch().load(std::sync::atomic::Ordering::Relaxed) == self.sal.epoch()
+        {
             return false;
         }
         self.sal_relay_space_ok_raw()
     }
 
-    /// relay_loop's variant: with GNITZ_INJECT_RELAY_SPACE_LOW set, the first
-    /// call arms the seam at the current epoch (one-shot: the CAS from the
-    /// u32::MAX sentinel succeeds once per process), then defers to
-    /// sal_has_relay_space() so relay_loop and the committer see the same
-    /// verdict until a checkpoint bumps the epoch and disarms it.
+    /// relay_loop's variant: the first call arms the seam at the current epoch
+    /// (one-shot: the CAS from the u32::MAX sentinel succeeds once per process),
+    /// then defers to sal_has_relay_space() so relay_loop and the committer see
+    /// the same verdict until a checkpoint bumps the epoch and disarms it.
     pub(crate) fn sal_has_relay_space_arming(&self) -> bool {
-        // Read once: this runs on every relay, and the env var cannot change
-        // mid-process.
-        #[cfg(debug_assertions)]
-        let armed = {
-            use std::sync::OnceLock;
-            static ARMED: OnceLock<bool> = OnceLock::new();
-            *ARMED.get_or_init(|| std::env::var_os("GNITZ_INJECT_RELAY_SPACE_LOW").is_some())
-        };
-        #[cfg(debug_assertions)]
-        if armed {
+        if RELAY_SPACE_LOW.armed() {
             let _ = Self::seam_armed_epoch().compare_exchange(
                 u32::MAX,
                 self.sal.epoch(),
@@ -1258,34 +1242,24 @@ impl MasterDispatcher {
     // Tick group writer (used by the async tick task in executor.rs)
     // -----------------------------------------------------------------------
 
-    /// The one-shot tick-emit latch, but only for the table
-    /// `GNITZ_INJECT_TICK_EMIT_ERROR` names; `None` when the seam is unset or
-    /// `tid` is some other table. The env is read once — it cannot change
-    /// mid-process — and is checked before the catalog lookup, so an unset seam
-    /// costs one atomic load on the push path.
-    #[cfg(debug_assertions)]
+    /// The one-shot tick-emit latch, but only for the table the seam names;
+    /// `None` when the seam is unset or `tid` is some other table. Checked before
+    /// the catalog lookup, so an unset seam costs no name resolution.
     fn injected_tick_emit_latch(&self, tid: i64) -> Option<&'static std::sync::atomic::AtomicBool> {
-        use std::sync::atomic::AtomicBool;
-        use std::sync::OnceLock;
-        static TARGET: OnceLock<Option<String>> = OnceLock::new();
-        static ARMED: AtomicBool = AtomicBool::new(false);
-
-        let name = TARGET
-            .get_or_init(|| std::env::var("GNITZ_INJECT_TICK_EMIT_ERROR").ok())
-            .as_deref()?;
+        static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let name = TICK_EMIT_ERROR.names()?;
         let (_, table) = unsafe { (*self.catalog).get_qualified_name(tid) }?;
         (table == name).then_some(&ARMED)
     }
 
-    /// Debug seam, arm half: a committed non-empty push to the named table arms
-    /// the one-shot tick-emit failure.
+    /// Arm half: a committed non-empty push to the named table arms the one-shot
+    /// tick-emit failure.
     ///
     /// Arming on a push rather than on "the next tick anywhere" is what makes the
     /// seam land where the scenario it models does: a `CREATE VIEW` drives one
     /// tick of its source to seed the view, well before any test read reaches the
     /// tick loop, so an unconditional latch would always be spent by the CREATE.
     /// That seeding push carries no rows, hence the row-count test.
-    #[cfg(debug_assertions)]
     fn arm_injected_tick_emit_error(&self, target_id: i64, rows: usize) {
         if rows > 0 {
             if let Some(armed) = self.injected_tick_emit_latch(target_id) {
@@ -1294,10 +1268,9 @@ impl MasterDispatcher {
         }
     }
 
-    /// Debug seam, fire half: fail the armed table's next `write_tick_group`
-    /// before it writes anything — what a full SAL does to a tick. One-shot, so
-    /// the follow-up read can watch the re-queued tid tick and the view converge.
-    #[cfg(debug_assertions)]
+    /// Fire half: fail the armed table's next `write_tick_group` before it writes
+    /// anything — what a full SAL does to a tick. One-shot, so the follow-up read
+    /// can watch the re-queued tid tick and the view converge.
     fn take_injected_tick_emit_error(&self, tid: i64) -> bool {
         let fires = self
             .injected_tick_emit_latch(tid)
@@ -1314,7 +1287,6 @@ impl MasterDispatcher {
     /// the corresponding req_id from `req_ids[w]`. No schema block:
     /// `handle_tick` looks the target's schema up in its own catalog.
     pub(crate) fn write_tick_group(&mut self, tid: i64, req_ids: &[u64]) -> Result<(), String> {
-        #[cfg(debug_assertions)]
         if self.take_injected_tick_emit_error(tid) {
             return Err(format!("injected tick emit error (tid={tid})"));
         }
@@ -1428,7 +1400,6 @@ impl MasterDispatcher {
         mode: WireConflictMode,
         req_ids: &[u64],
     ) -> Result<(), String> {
-        #[cfg(debug_assertions)]
         self.arm_injected_tick_emit_error(target_id, batch.count);
         let (schema, schema_block, wire_safe, wire_row_stride) = self.cached_schema_block(target_id);
         let nw = self.num_workers;

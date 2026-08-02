@@ -9,6 +9,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
+use crate::foundation::fault::Seam;
 use crate::query::ExchangeCallback;
 use crate::runtime::sal::{
     SalMessageKind, SalReader, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_STOP, BACKFILL_PAD_BIT, FLAG_EXCHANGE,
@@ -244,8 +245,16 @@ use fsync::uring_batch_fdatasync;
 /// thousands of fds at once (EMFILE).
 const FD_CHUNK_THRESHOLD: usize = 256;
 
-/// Debug-only test seam: parse env var `var` as a `usize`. Always `None` in
-/// release builds, which never read the environment.
+/// `GNITZ_INJECT_UNIQUE_PREFLIGHT_ERROR`: fail the pre-flight on every worker so
+/// tests can assert the master surfaces the fault, drains the fan-out, and
+/// leaves the catalog and unique-filter state untouched.
+static UNIQUE_PREFLIGHT_ERROR: Seam = Seam::new("GNITZ_INJECT_UNIQUE_PREFLIGHT_ERROR");
+
+/// Debug-only size knobs: shrink a worker's reply frame / pre-flight frame so a
+/// small table still exercises the multi-frame paths.
+static REPLY_FRAME_BUDGET: Seam = Seam::new("GNITZ_REPLY_FRAME_BUDGET");
+static PREFLIGHT_KEYS_PER_FRAME: Seam = Seam::new("GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME");
+
 /// Append-or-insert one base table's effective delta into a `pending_deltas`
 /// map — the single buffering shape shared by the live push path
 /// (`handle_push`) and boot SAL replay (`recover_from_sal`), which must agree
@@ -255,18 +264,6 @@ pub(crate) fn buffer_pending_delta(pending: &mut HashMap<i64, Batch>, tid: i64, 
         existing.append_batch(&delta, 0, delta.count);
     } else {
         pending.insert(tid, delta);
-    }
-}
-
-fn debug_env_usize(var: &str) -> Option<usize> {
-    #[cfg(debug_assertions)]
-    {
-        std::env::var(var).ok().and_then(|v| v.parse().ok())
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = var;
-        None
     }
 }
 
@@ -347,8 +344,10 @@ impl WorkerProcess {
             },
             pending_deltas,
             pending_streams: VecDeque::new(),
-            reply_frame_budget: debug_env_usize("GNITZ_REPLY_FRAME_BUDGET")
-                .filter(|&n| n > 0 && n <= w2m_ring::MAX_W2M_MSG as usize)
+            reply_frame_budget: REPLY_FRAME_BUDGET
+                .count()
+                .map(|n| n as usize)
+                .filter(|&n| n <= w2m_ring::MAX_W2M_MSG as usize)
                 .unwrap_or(w2m_ring::MAX_W2M_MSG as usize),
             read_cursor: 0,
             expected_epoch: 1,
@@ -1154,11 +1153,7 @@ impl WorkerProcess {
     /// (committer barrier drained, catalog write lock held), before the
     /// IDX_TAB +1 broadcast, so no concurrent INSERT can interleave.
     fn handle_unique_preflight(&mut self, owner_id: i64, col_indices: &[u32], request_id: u64) -> Result<(), String> {
-        // Crash-injection seam: fail the pre-flight on every worker so tests
-        // can assert the master surfaces the fault, drains the fan-out, and
-        // leaves the catalog and unique-filter state untouched.
-        #[cfg(debug_assertions)]
-        if std::env::var("GNITZ_INJECT_UNIQUE_PREFLIGHT_ERROR").is_ok() {
+        if UNIQUE_PREFLIGHT_ERROR.armed() {
             return Err("injected unique pre-flight fault".to_string());
         }
         let schema = self
@@ -1516,9 +1511,9 @@ const UNIQUE_PREFLIGHT_KEYS_PER_FRAME: usize = 1 << 20;
 /// with small tables; any value is safe now that `InFlightState` grows with the
 /// parked depth (see UNIQUE_PREFLIGHT_KEYS_PER_FRAME).
 fn unique_preflight_keys_per_frame() -> usize {
-    debug_env_usize("GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME")
-        .filter(|&n| n > 0)
-        .unwrap_or(UNIQUE_PREFLIGHT_KEYS_PER_FRAME)
+    PREFLIGHT_KEYS_PER_FRAME
+        .count()
+        .map_or(UNIQUE_PREFLIGHT_KEYS_PER_FRAME, |n| n as usize)
 }
 
 /// Default in-RAM key-byte budget before the pre-flight sort spills a run (128 MiB).

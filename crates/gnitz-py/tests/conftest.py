@@ -242,9 +242,9 @@ def _env_server(monkeypatch, env: dict[str, str], debug_only: bool = False):
         s.teardown()
 
 
-def _seamed_server(monkeypatch, env: dict[str, str]):
+def _seamed_server(monkeypatch, env: dict[str, str], debug_only: bool = False):
     """`_env_server`, yielding a connected client instead of `(target, proc)`."""
-    for target, _proc in _env_server(monkeypatch, env):
+    for target, _proc in _env_server(monkeypatch, env, debug_only=debug_only):
         with gnitz.connect(target) as conn:
             yield conn
 
@@ -332,11 +332,19 @@ def tick_emit_fault_server(monkeypatch):
     `tickfault` fails, reproducing what a full SAL does to a tick. Name-scoped so
     a CREATE's own ticks cannot spend it, and one-shot so the follow-up read
     observes the re-queued tid ticking and the view converging."""
-    for target, _proc in _env_server(
-        monkeypatch, {"GNITZ_INJECT_TICK_EMIT_ERROR": "tickfault"}, debug_only=True
-    ):
-        with gnitz.connect(target) as conn:
-            yield conn
+    yield from _seamed_server(
+        monkeypatch, {"GNITZ_INJECT_TICK_EMIT_ERROR": "tickfault"}, debug_only=True)
+
+
+@pytest.fixture
+def relay_hold_server(monkeypatch):
+    """Server whose FIRST steady-state exchange relay is held until a DDL asks the
+    tick loop to quiesce (GNITZ_INJECT_RELAY_HOLD_FOR_DDL), so that DDL is
+    guaranteed to arrive while every worker is parked inside its exchange wait
+    with a mid-epoch catalog. Ordering, not timing — nothing here depends on
+    machine speed."""
+    yield from _seamed_server(
+        monkeypatch, {"GNITZ_INJECT_RELAY_HOLD_FOR_DDL": "1"}, debug_only=True)
 
 
 @pytest.fixture

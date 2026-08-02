@@ -26,6 +26,7 @@
 
 use super::executor::{TickTrigger, TICK_COALESCE_ROWS};
 use super::guard_panic;
+use crate::foundation::fault::Seam;
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{first_worker_error_opt, MasterDispatcher, TxnFamily, TxnFit};
 use crate::runtime::reactor::{join_into, mpsc, oneshot, select2, AsyncMutex, Either, Reactor, ReplyFuture};
@@ -37,6 +38,10 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 const MAX_PENDING_ROWS: usize = 100_000;
+
+/// `GNITZ_INJECT_PUSH_ABORT=after_groups`: crash the master between the push
+/// groups and the commit sentinel.
+static PUSH_ABORT: Seam = Seam::new("GNITZ_INJECT_PUSH_ABORT");
 
 /// One request to the committer.
 #[allow(clippy::large_enum_variant)]
@@ -541,9 +546,11 @@ struct CommitUnit {
     /// pushes degrade gracefully per group, so they do. A transaction is emitted
     /// fail-stop under a pre-checked fit and its contract is "Err ⇒ nothing
     /// committed", so once the zone's sentinel is durable a worker error must
-    /// never turn its `Ok` into an `Err` (any real apply error already fail-stops
-    /// the worker; the only graceful one — "table not registered" — is excluded
-    /// by the catalog read lock held through the ACK).
+    /// never turn its `Ok` into an `Err`. Dropping the error instead is sound
+    /// only while no *graceful* worker push error can reach here: a real apply
+    /// error fail-stops the worker, and "table not registered" is excluded by the
+    /// DDL tick quiesce (`TickGate`) plus the catalog read lock held through the
+    /// ACK. `commit_pushes` aborts rather than trusting that in prose.
     downgrade_on_worker_err: bool,
 }
 
@@ -747,20 +754,14 @@ async fn commit_pushes(
             return;
         }
 
-        // Crash-injection seam: abort after push groups but BEFORE the
-        // commit sentinel (GNITZ_INJECT_PUSH_ABORT=after_groups). SAL
-        // recovery skips any zone whose sentinel is absent; workers that
-        // already flushed their shard files before the crash retain the
-        // data via the shard path, so this seam is useful for targeted
-        // debugging rather than asserting invisibility after restart.
-        #[cfg(debug_assertions)]
-        {
-            use std::sync::OnceLock;
-            static ARMED: OnceLock<bool> = OnceLock::new();
-            if *ARMED.get_or_init(|| std::env::var("GNITZ_INJECT_PUSH_ABORT").as_deref() == Ok("after_groups")) {
-                unsafe {
-                    libc::abort();
-                }
+        // Abort after push groups but BEFORE the commit sentinel. SAL recovery
+        // skips any zone whose sentinel is absent; workers that already flushed
+        // their shard files before the crash retain the data via the shard path,
+        // so this seam is for targeted debugging rather than asserting
+        // invisibility after restart.
+        if PUSH_ABORT.at("after_groups") {
+            unsafe {
+                libc::abort();
             }
         }
 
@@ -812,8 +813,19 @@ async fn commit_pushes(
                 }
                 let worker_err = first_worker_error_opt("commit", &ack_slots[cursor..cursor + nw]);
                 cursor += nw;
-                if unit.downgrade_on_worker_err {
-                    groups[gi].write_err = worker_err;
+                match (unit.downgrade_on_worker_err, worker_err) {
+                    (true, e) => groups[gi].write_err = e,
+                    // Discarding it would leave the transaction durable in the SAL
+                    // but missing from this worker's partition, with the client
+                    // told Ok — silent divergence. Nothing may reach here (see
+                    // `downgrade_on_worker_err`), so treat it as unrecoverable
+                    // rather than diverging quietly.
+                    (false, Some(e)) => gnitz_fatal_abort!(
+                        "worker rejected a committed transaction group (tid={}): {}",
+                        groups[gi].tid,
+                        e
+                    ),
+                    (false, None) => {}
                 }
             }
         }

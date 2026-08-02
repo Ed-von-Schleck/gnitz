@@ -16,9 +16,14 @@ use super::shard_reader::MappedShard;
 use super::table::{self, RecoverySource, Table};
 #[cfg(test)]
 use super::table::{FlushOutcome, FlushWork};
+use crate::foundation::fault::Seam;
 use crate::schema::SchemaDescriptor;
 #[cfg(test)]
 use gnitz_wire::{partition_for_key, partition_for_pk_bytes};
+
+/// `GNITZ_INJECT_TABLE_CREATE_DELAY_MS`: stall a user table's create between its
+/// directory and its partition subdirs, so a concurrent DROP races it.
+static TABLE_CREATE_DELAY: Seam = Seam::new("GNITZ_INJECT_TABLE_CREATE_DELAY_MS");
 
 thread_local! {
     /// Reused per-partition scatter index buffers for `ingest_owned_batch`.
@@ -119,13 +124,11 @@ impl PartitionedTable {
         };
         table::ensure_dir(dir)?;
 
-        // Test seam: widen the window where the table dir exists but its
-        // partition subdirs do not, so a concurrent master remove_dir_all
-        // (DROP) deterministically races this create. User tables only.
-        #[cfg(debug_assertions)]
+        // Widen the window where the table dir exists but its partition subdirs
+        // do not, so a concurrent master remove_dir_all (DROP) deterministically
+        // races this create. User tables only.
         if matches!(routing, Routing::Hashed { .. }) {
-            let ms = crate::foundation::env::env_u64("GNITZ_INJECT_TABLE_CREATE_DELAY_MS", 0);
-            if ms > 0 {
+            if let Some(ms) = TABLE_CREATE_DELAY.count() {
                 std::thread::sleep(std::time::Duration::from_millis(ms));
             }
         }

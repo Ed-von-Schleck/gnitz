@@ -22,12 +22,14 @@ use crate::storage::batch_pool::PooledSendBuf;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::guard_panic;
+use crate::foundation::fault::Seam;
 use crate::foundation::posix_io;
 use crate::runtime::tls::{ConnCountGuard, TlsShared};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::catalog::{
-    CatalogEngine, COL_TAB_ID, FIRST_USER_TABLE_ID, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS,
-    IDX_TAB_ID, SEQ_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID,
+    CatalogEngine, FIRST_USER_TABLE_ID, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB_ID,
+    SEQ_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID,
 };
 use crate::query::RelationKind;
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingTxn};
@@ -52,6 +54,19 @@ pub(crate) const TICK_COALESCE_ROWS: usize = 10_000;
 const TICK_DEADLINE_MS: u64 = 20;
 const WORKER_WATCH_MS: u64 = 100;
 
+/// `GNITZ_INJECT_DDL_PANIC=after_broadcasts`: crash the master between a DDL
+/// zone's broadcasts and its commit sentinel.
+static DDL_PANIC: Seam = Seam::new("GNITZ_INJECT_DDL_PANIC");
+
+/// `GNITZ_INJECT_RELAY_HOLD_FOR_DDL`: see `hold_relay_for_ddl`.
+static RELAY_HOLD_FOR_DDL: Seam = Seam::new("GNITZ_INJECT_RELAY_HOLD_FOR_DDL");
+
+/// Count of DDL tick-quiesce requests, bumped as each is sent. Read only by
+/// `hold_relay_for_ddl`, which needs to observe the request rather than the
+/// window it opens: the window is entered only after the tick loop acks, which
+/// this very seam is holding up.
+static DDL_QUIESCE_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
 use gnitz_wire::{
     FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_TABLE_ID, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
 };
@@ -66,22 +81,23 @@ pub enum TickTrigger {
     /// that waited on a failed tick must be told: its view is stale, and reporting
     /// success would serve stale rows under `STATUS_OK`.
     Drain { done: oneshot::Sender<Result<(), String>> },
-    /// Pause the tick subsystem for a stop-the-world CREATE-VIEW DDL. On
-    /// dequeue the tick loop signals `acked` — proving no tick is in flight
-    /// (the loop is serial, so the prior tick has returned) and none will
-    /// start — then blocks on `release` until the DDL hands the gate back.
-    /// This drains any in-flight steady-state exchange tick before the DDL
-    /// parks the reactor; see `handle_ddl_txn`.
+    /// Pause the tick subsystem for a DDL bundle. On dequeue the tick loop
+    /// signals `acked` — proving no tick is in flight (the loop is serial, so
+    /// the prior tick has returned) and none will start — then blocks on
+    /// `release` until the DDL hands the gate back. This drains any in-flight
+    /// steady-state exchange tick before the DDL broadcasts its `DdlSync`, so no
+    /// worker is mid-epoch (and thus deferring that broadcast) when the client
+    /// is ACKed; see `handle_ddl_txn`.
     Quiesce {
         acked: oneshot::Sender<()>,
         release: oneshot::Receiver<()>,
     },
 }
 
-/// The stop-the-world window a CREATE-VIEW / column-ALTER DDL runs inside: the
-/// tick loop is parked and the DDL-window depth is raised for exactly as long as
-/// the gate lives. Dropping it releases both, so the window ends on every exit
-/// path of `handle_ddl_txn` (success or early-return error).
+/// The window every DDL bundle runs inside: the tick loop is parked and the
+/// DDL-window depth is raised for exactly as long as the gate lives. Dropping it
+/// releases both, so the window ends on every exit path of `handle_ddl_txn`
+/// (success or early-return error).
 ///
 /// While the depth is non-zero no checkpoint round may run: its drain would
 /// never complete against a parked tick loop, and the DDL's own synchronous W2M
@@ -89,34 +105,46 @@ pub enum TickTrigger {
 /// park the committer forever holding `sal_writer_excl`. A depth, not a flag —
 /// `handle_ddl_txn` awaits before taking the catalog write lock, so a second DDL
 /// enters its own window while the first is still in its.
-///
-/// `None` for non-quiescing DDL: no gate taken, no depth raised.
-struct TickGate(Option<(oneshot::Sender<()>, Rc<Cell<usize>>)>);
+struct TickGate {
+    /// Dropped by the field glue right after `Drop::drop` lowers the depth. The
+    /// tick loop's `release.await` resolves `Err(Cancelled)` on that drop, which
+    /// is the release signal — no explicit send needed.
+    _release: oneshot::Sender<()>,
+    depth: Rc<Cell<usize>>,
+}
 
 impl TickGate {
     /// Park the tick loop and enter a DDL window. Returns once the loop has
     /// acked — no tick is in flight and none will start until this gate drops.
-    async fn quiescing(shared: &Rc<Shared>) -> Self {
+    async fn enter(shared: &Rc<Shared>) -> Self {
         let (acked_tx, acked_rx) = oneshot::channel::<()>();
         let (release_tx, release_rx) = oneshot::channel::<()>();
         shared.tick_tx.send(TickTrigger::Quiesce {
             acked: acked_tx,
             release: release_rx,
         });
+        DDL_QUIESCE_REQUESTS.fetch_add(1, Ordering::Relaxed);
         let _ = acked_rx.await;
-        let depth = &shared.ddl_window;
+        let depth = Rc::clone(&shared.ddl_window);
         depth.set(depth.get() + 1);
-        TickGate(Some((release_tx, Rc::clone(depth))))
+        TickGate {
+            _release: release_tx,
+            depth,
+        }
     }
 }
 
 impl Drop for TickGate {
     fn drop(&mut self) {
-        if let Some((release, depth)) = self.0.take() {
-            depth.set(depth.get() - 1);
-            let _ = release.send(());
-        }
+        self.depth.set(self.depth.get() - 1);
     }
+}
+
+/// Send a committer barrier of `kind` and wait for it to resolve.
+async fn await_barrier(shared: &Shared, kind: BarrierKind) {
+    let (tx, rx) = oneshot::channel::<()>();
+    shared.committer_tx.send(CommitRequest::Barrier { kind, done: tx });
+    let _ = rx.await;
 }
 
 /// Shared executor state held by every task.
@@ -655,12 +683,7 @@ async fn watchdog(shared: Rc<Shared>) {
             //    rounds complete. A just-pushed delta may still sit in
             //    `pending_deltas` (the tick-coalesce window not yet fired), so
             //    the drain inside the sequence is load-bearing.
-            let (tx, rx) = oneshot::channel::<()>();
-            shared.committer_tx.send(CommitRequest::Barrier {
-                kind: BarrierKind::Shutdown,
-                done: tx,
-            });
-            let _ = rx.await;
+            await_barrier(&shared, BarrierKind::Shutdown).await;
 
             // 3. Workers flush + _exit, then stop the reactor
             //    (block_until_shutdown returns and server_main exits 0). The
@@ -901,6 +924,31 @@ async fn run_tick(
 // Relay loop
 // ---------------------------------------------------------------------------
 
+/// Hold the FIRST steady-state exchange relay until a DDL has asked the tick
+/// loop to quiesce, keeping every worker parked in `do_exchange_wait` across
+/// that request. The DDL therefore reaches its catalog mutation while the
+/// workers' catalogs are mid-epoch — the race is set up by ordering, not by a
+/// sleep, so it does not depend on machine speed. One-shot: the rest of the run
+/// relays at full speed.
+///
+/// Holds no catalog lock: taking one would queue the racing DDL's write lock
+/// behind it and the window would never open.
+async fn hold_relay_for_ddl(shared: &Shared) {
+    let seen = DDL_QUIESCE_REQUESTS.load(Ordering::Relaxed);
+    // Polling keeps the seam self-contained — nothing outside it needs a handle.
+    // The bound releases the relay if no DDL ever comes, so a misarmed test fails
+    // on its own assertion instead of wedging the node.
+    for _ in 0..HOLD_RELAY_MAX_POLLS {
+        if DDL_QUIESCE_REQUESTS.load(Ordering::Relaxed) != seen {
+            return;
+        }
+        shared.reactor.timer(Instant::now() + Duration::from_millis(1)).await;
+    }
+    gnitz_warn!("relay hold seam armed but no DDL quiesce arrived; releasing the relay");
+}
+
+const HOLD_RELAY_MAX_POLLS: u32 = 10_000;
+
 /// Consume completed `PendingRelay`s from the reactor's exchange
 /// accumulator and write FLAG_EXCHANGE_RELAY groups back through the
 /// dispatcher.  Lives in its own task so the SAL write happens outside
@@ -921,6 +969,10 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
             Some(r) => r,
             None => return,
         };
+
+        if RELAY_HOLD_FOR_DDL.take_once() {
+            hold_relay_for_ddl(&shared).await;
+        }
 
         // Phase 1: CPU work + catalog read only — no SAL mutex.
         let prep = {
@@ -969,12 +1021,7 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
                 }
             }
             gnitz_warn!("SAL space low before exchange relay; triggering checkpoint");
-            let (tx, rx_done) = oneshot::channel();
-            shared.committer_tx.send(CommitRequest::Barrier {
-                kind: BarrierKind::Reclaim,
-                done: tx,
-            });
-            let _ = rx_done.await;
+            await_barrier(&shared, BarrierKind::Reclaim).await;
             reclaimed = true;
         }
     }
@@ -2205,60 +2252,33 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
 
     // A CREATE VIEW is a stop-the-world op (source drain + distributed backfill,
     // reactor parked). The VIEW_TAB family's +1 rows, if any, are the new views;
-    // a DROP-only or non-VIEW bundle yields none and keeps the plain path.
+    // they alone need the lock-held barrier and the in-loop source drain below.
     let new_view_ids: Vec<i64> = family_pks_by_sign(&families, VIEW_TAB_ID, true);
     let view_create = !new_view_ids.is_empty();
 
-    // A column ALTER (RENAME COLUMN / DROP COLUMN / DROP NOT NULL) also needs the
-    // tick Quiesce (§4): DROP NOT NULL swaps the base comparator, and a worker
-    // parked in an unrelated exchange-wait would otherwise defer this ALTER's
-    // DdlSync *after* a straggler NULL push under the stale FixedIntNonnull
-    // comparator, silently consolidating a NULL against a real 0. Discriminate
-    // bundle-locally: a COL_TAB row with weight > 0 whose owner tid is a
-    // registered base table. CREATE TABLE applies COL before TABLE (owner not yet
-    // registered → excluded); DROP TABLE cascades columns engine-side (no COL
-    // family in the client bundle → excluded); table/view RENAME carry no COL_TAB.
-    // The flag benignly over-quiesces RENAME COLUMN / DROP COLUMN (neither changes
-    // the comparator) — far simpler than prospectively decoding the new
-    // comparator, and quiescing is always safe. It can only over-quiesce, never
-    // under-quiesce a DROP NOT NULL (which always emits a weight>0 COL row on a
-    // registered base owner). Read lock-free off the single-threaded reactor,
-    // before the write lock.
-    let cat = shared.cat();
-    let column_alter = families.iter().any(|(tid, b)| {
-        *tid == COL_TAB_ID
-            && (0..b.count).any(|i| {
-                b.get_weight(i) > 0
-                    && cat
-                        .dag
-                        .tables
-                        .get(&(gnitz_wire::unpack_col_id(b.get_pk(i) as u64).0 as i64))
-                        .map(|e| e.kind.is_base_table())
-                        .unwrap_or(false)
-            })
-    });
-
-    // Drain the committer barrier BEFORE acquiring the catalog write
-    // lock. The barrier flushes user-table WAL and waits for worker ACKs (tens
-    // of ms under load); holding the write lock across that wait would block
-    // every concurrent SCAN/SEEK read for no reason — no catalog mutation
-    // happens until after the barrier returns. Quiesce the tick subsystem for a
-    // CREATE VIEW while the reactor still runs and before the write lock
-    // (run_tick/relay_loop take the read lock, so a write-lock-held quiesce would
-    // deadlock). `TickGate` releases the gate on every exit path.
+    // Drain the committer barrier BEFORE acquiring the catalog write lock. The
+    // barrier flushes user-table WAL and waits for worker ACKs (tens of ms under
+    // load); holding the write lock across that wait would block every concurrent
+    // SCAN/SEEK read for no reason — no catalog mutation happens until after the
+    // barrier returns.
     let t_ddl_start = Instant::now();
-    let (tx, rx) = oneshot::channel::<()>();
-    shared.committer_tx.send(CommitRequest::Barrier {
-        kind: BarrierKind::Ddl,
-        done: tx,
-    });
-    let _ = rx.await;
+    await_barrier(shared, BarrierKind::Ddl).await;
 
-    let _tick_gate = if view_create || column_alter {
-        TickGate::quiescing(shared).await
-    } else {
-        TickGate(None)
-    };
+    // Then quiesce the tick subsystem, while the reactor still runs and before
+    // the write lock (run_tick/relay_loop take the read lock, so a
+    // write-lock-held quiesce would deadlock). `TickGate` releases it on every
+    // exit path.
+    //
+    // Every bundle, not just the stop-the-world ones: a worker parked mid-epoch
+    // defers the broadcast DdlSync but keeps serving reads and pushes inline, so
+    // a TABLE/COL/IDX mutation ACKed in that window leaves that worker answering
+    // client traffic against a catalog the client was just told had changed.
+    //
+    // After the barrier, not concurrently with it: the checkpoint sequence sends
+    // its own Drain then Quiesce, and a DDL Quiesce queued ahead of that Drain
+    // parks the tick loop on a release this handler only sends once the barrier
+    // returns — which needs the sequence to finish.
+    let _tick_gate = TickGate::enter(shared).await;
 
     let _write = shared.catalog_rwlock.write().await;
 
@@ -2268,12 +2288,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
         // resident in pending_deltas before the in-loop source drain. The
         // committer stays idle for the rest of the handler (the write lock blocks
         // new pushes).
-        let (tx, rx) = oneshot::channel::<()>();
-        shared.committer_tx.send(CommitRequest::Barrier {
-            kind: BarrierKind::Ddl,
-            done: tx,
-        });
-        let _ = rx.await;
+        await_barrier(shared, BarrierKind::Ddl).await;
     }
 
     let cat_ptr_raw = shared.catalog;
@@ -2628,10 +2643,9 @@ fn emit_zone_to_sal(shared: &Shared, op: &'static str, drained: &[(i64, Batch)],
         for (tid, bat) in drained {
             (*disp).broadcast_ddl(*tid, bat, zone_lsn)?;
         }
-        // Crash-injection seam: abort after broadcasts but BEFORE the commit
-        // sentinel — exercises the recovery skip of a half-written zone.
-        #[cfg(debug_assertions)]
-        if std::env::var("GNITZ_INJECT_DDL_PANIC").as_deref() == Ok("after_broadcasts") {
+        // Abort after broadcasts but BEFORE the commit sentinel — exercises the
+        // recovery skip of a half-written zone.
+        if DDL_PANIC.at("after_broadcasts") {
             libc::abort();
         }
         // An empty zone has no groups for recovery to gate, so its sentinel
@@ -2672,9 +2686,11 @@ fn emit_zone_to_sal(shared: &Shared, op: &'static str, drained: &[(i64, Batch)],
 /// The full `open_ddl_zone … ingest … close_ddl_zone` lifecycle is contained in
 /// the one await-free write-lock section, so the single `ctx.ddl_zone_lsn` slot
 /// is never observed by another allocator once the write lock drops. It needs
-/// none of `handle_ddl`'s VIEW-only prelude (TickGate quiesce, committer barrier,
-/// base-table drain): a `sys_sequences` advance has no DAG evaluation and no
-/// rollback path.
+/// none of `handle_ddl_txn`'s prelude (committer barrier, tick quiesce,
+/// VIEW-only base-table drain): a `sys_sequences` advance has no DAG evaluation
+/// and no rollback path, and the row it broadcasts is one no worker reads — a
+/// worker that defers this `DdlSync` past a mid-epoch push answers every client
+/// verb identically meanwhile.
 async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64, count: i64) -> Result<i64, String> {
     let (base, zone_lsn, fsync_fut) = {
         // Lock order catalog -> SAL, matching INSERT/SEEK, so acquiring SAL under

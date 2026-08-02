@@ -3,31 +3,23 @@
 
 use super::*;
 
-/// Fault-injection seam for the push-apply / SAL-replay path; identity in
-/// release builds. In a debug build with
-/// `GNITZ_INJECT_INGEST_APPLY_ERROR=store|index`, substitutes
-/// `Err(StorageError::Io)` for the matching ingest inside
-/// `ingest_store_and_indices`, so the fail-stop abort fires deterministically
-/// without a real disk fault. No one-shot latch — the process aborts on first
-/// fire. The env is read once. Placing the seam at the dag layer keeps
-/// `storage` seam-free and fires exactly on the push-apply/replay path (VM
-/// integration bypasses it), so a seam-armed server still boots cleanly on a
-/// pushless data dir and fails only on the first INSERT apply.
+/// `GNITZ_INJECT_INGEST_APPLY_ERROR=store|index`: substitute `Err(Io)` for the
+/// matching ingest below, so the fail-stop abort fires without a real disk
+/// fault. No one-shot latch — the process aborts on first fire. Placing the seam
+/// at the dag layer keeps `storage` seam-free and fires exactly on the
+/// push-apply/replay path (VM integration bypasses it), so a seam-armed server
+/// still boots cleanly on a pushless data dir and fails only on the first INSERT
+/// apply.
+static INGEST_APPLY_ERROR: crate::foundation::fault::Seam =
+    crate::foundation::fault::Seam::new("GNITZ_INJECT_INGEST_APPLY_ERROR");
+
 fn inject_ingest_apply_error(
     which: &str,
     r: Result<(), crate::storage::StorageError>,
 ) -> Result<(), crate::storage::StorageError> {
-    #[cfg(debug_assertions)]
-    {
-        use std::sync::OnceLock;
-        static MODE: OnceLock<Option<String>> = OnceLock::new();
-        let armed = MODE.get_or_init(|| std::env::var("GNITZ_INJECT_INGEST_APPLY_ERROR").ok());
-        if armed.as_deref() == Some(which) {
-            return Err(crate::storage::StorageError::Io);
-        }
+    if INGEST_APPLY_ERROR.at(which) {
+        return Err(crate::storage::StorageError::Io);
     }
-    #[cfg(not(debug_assertions))]
-    let _ = which;
     r
 }
 

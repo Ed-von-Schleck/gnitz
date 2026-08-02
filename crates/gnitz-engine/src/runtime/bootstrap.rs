@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
+use crate::foundation::fault::Seam;
 use crate::foundation::posix_io;
 use crate::runtime::executor::{ServerExecutor, TlsListener};
 use crate::runtime::master::MasterDispatcher;
@@ -168,17 +169,20 @@ fn recover_system_tables_from_sal(sal_ptr: *const u8, catalog: &mut CatalogEngin
     Ok(())
 }
 
-/// Fault-injection seam for the boot-recovery pipeline; no-op in release
-/// builds. In a debug build with `GNITZ_INJECT_RECOVERY_PANIC=<stage>`, panics
-/// when recovery reaches the named stage, so the crash-window E2E tests can cut
-/// boot at a precise point.
+/// `GNITZ_INJECT_RECOVERY_PANIC=<stage>`: panic when recovery reaches the named
+/// stage, so the crash-window E2E tests can cut boot at a precise point.
+static RECOVERY_PANIC: Seam = Seam::new("GNITZ_INJECT_RECOVERY_PANIC");
+
+/// `GNITZ_INJECT_BOOT_FLUSH_ERROR` / `GNITZ_INJECT_SYS_FLUSH_ERROR`: fail the
+/// base-table or system-table boot flush, whose swallowed failure would destroy
+/// the replayed DDL's only durable copy at the SAL reset.
+static BOOT_FLUSH_ERROR: Seam = Seam::new("GNITZ_INJECT_BOOT_FLUSH_ERROR");
+static SYS_FLUSH_ERROR: Seam = Seam::new("GNITZ_INJECT_SYS_FLUSH_ERROR");
+
 fn inject_recovery_panic(stage: &str) {
-    #[cfg(debug_assertions)]
-    if std::env::var("GNITZ_INJECT_RECOVERY_PANIC").as_deref() == Ok(stage) {
+    if RECOVERY_PANIC.at(stage) {
         panic!("injected recovery panic at {stage}");
     }
-    #[cfg(not(debug_assertions))]
-    let _ = stage;
 }
 
 /// Base tables feeding ≥1 view, sorted for a reproducible drive order. The ONE
@@ -326,8 +330,7 @@ fn worker_boot_recovery(
             .flush_family(tid)
             .map_err(|e| format!("boot flush of table {tid} failed: {e}"))?;
     }
-    #[cfg(debug_assertions)]
-    if std::env::var("GNITZ_INJECT_BOOT_FLUSH_ERROR").is_ok() {
+    if BOOT_FLUSH_ERROR.armed() {
         return Err("injected boot flush fault".to_string());
     }
     inject_recovery_panic("bootflush");
@@ -653,8 +656,7 @@ fn run_server(
         // its only durable copy (and gc_orphan_directories would later delete
         // the now-catalog-less entities' flushed shards).
         catalog.flush_all_system_tables()?;
-        #[cfg(debug_assertions)]
-        if std::env::var("GNITZ_INJECT_SYS_FLUSH_ERROR").is_ok() {
+        if SYS_FLUSH_ERROR.armed() {
             return Err("injected system table flush fault".to_string());
         }
 
