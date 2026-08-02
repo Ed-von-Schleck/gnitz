@@ -262,7 +262,7 @@ where
 {
     SCATTER_INDICES.with(|pool| {
         let mut worker_indices = pool.borrow_mut();
-        if schema.replicated() {
+        if schema.placement().is_replicated() {
             fill_broadcast_indices(batch, num_workers, &mut worker_indices);
         } else {
             fill_worker_indices(batch, schema, num_workers, &mut worker_indices);

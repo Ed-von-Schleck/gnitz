@@ -716,9 +716,15 @@ unsafe fn assert_footprint_exact(
     use crate::runtime::wire::build_schema_wire_block;
     use crate::storage::compute_wire_props;
 
-    // Drive the production dispatch: `broadcast` is exactly the replicated bit
-    // `with_commit_indices` routes on, and nothing in the wire encoding reads it.
-    let schema = &schema.with_replicated(broadcast);
+    // Drive the production dispatch: `broadcast` is exactly the `Replicated`
+    // placement `with_commit_indices` routes on, and nothing in the wire encoding
+    // reads it.
+    let placement = if broadcast {
+        crate::schema::Placement::Replicated
+    } else {
+        crate::schema::Placement::KEYED_DEFAULT
+    };
+    let schema = &schema.with_placement(placement);
 
     let size = 1 << 20;
     let region = SharedRegion::new(size);

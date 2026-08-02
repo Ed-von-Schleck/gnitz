@@ -930,7 +930,7 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     // (replicated, depth) for a registered relation.
     let stamp = |e: &CatalogEngine, id: i64| {
         let t = e.dag.tables.get(&id).expect("registered");
-        (t.schema.replicated(), t.depth)
+        (t.schema.placement().is_replicated(), t.depth)
     };
     let assert_stamps = |e: &CatalogEngine, when: &str| {
         assert!(stamp(e, rt).0, "replicated base table ({when})");

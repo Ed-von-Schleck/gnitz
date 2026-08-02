@@ -523,14 +523,6 @@ fn test_projection_compound_pk_subset_omits_col() {
 // projection item — `SELECT a, a` returns two columns (the old silent dedup
 // returned one, a convention no other surface followed).
 
-fn select_rows(client: &mut GnitzClient, sn: &str, sql: &str) -> (gnitz_core::Schema, gnitz_core::ZSetBatch) {
-    let mut p = SqlPlanner::new(client, sn);
-    match p.execute(sql).unwrap().pop().unwrap() {
-        gnitz_sql::SqlResult::Rows { schema, batch } => (schema, batch),
-        other => panic!("expected Rows, got {other:?}"),
-    }
-}
-
 #[test]
 fn test_direct_select_qualified_alias_and_duplicate_items() {
     let srv = match ServerHandle::start() {
@@ -546,17 +538,17 @@ fn test_direct_select_qualified_alias_and_duplicate_items() {
     exec(&mut client, &sn, "INSERT INTO t (id, a) VALUES (1, 10), (2, 20)");
 
     // Qualified references resolve like bare ones.
-    let (s, b) = select_rows(&mut client, &sn, "SELECT t.id, t.a FROM t");
+    let (s, b) = read_sql(&mut client, &sn, "SELECT t.id, t.a FROM t");
     assert_eq!(visible_names(&s), vec!["id", "a"]);
     assert_eq!(b.len(), 2);
 
     // An alias renames the output column.
-    let (s, _) = select_rows(&mut client, &sn, "SELECT id, a AS x FROM t");
+    let (s, _) = read_sql(&mut client, &sn, "SELECT id, a AS x FROM t");
     assert_eq!(visible_names(&s), vec!["id", "x"]);
 
     // One output column per projection item: `a, a` yields two `a` columns
     // carrying identical data.
-    let (s, b) = select_rows(&mut client, &sn, "SELECT id, a, a FROM t");
+    let (s, b) = read_sql(&mut client, &sn, "SELECT id, a, a FROM t");
     assert_eq!(visible_names(&s), vec!["id", "a", "a"]);
     assert_eq!(b.len(), 2);
     // Physical columns: [id(hidden PK), id, a, a] — the two `a` copies are the
@@ -570,7 +562,7 @@ fn test_direct_select_qualified_alias_and_duplicate_items() {
     }
 
     // A qualified PK equality takes the point-seek path (was a hard error).
-    let (_, b) = select_rows(&mut client, &sn, "SELECT * FROM t WHERE t.id = 1");
+    let (_, b) = read_sql(&mut client, &sn, "SELECT * FROM t WHERE t.id = 1");
     assert_eq!(b.len(), 1);
 }
 

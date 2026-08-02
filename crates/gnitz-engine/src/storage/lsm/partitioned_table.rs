@@ -1,7 +1,7 @@
 //! Partitioned table: hash-routes rows across N child Table handles.
 //!
-//! User tables hash-route across 256 partitions; replicated and
-//! replicated-derived relations are unhashed and hold one. The 256-bucket
+//! A relation the catalog placed `Keyed` hash-routes across 256 partitions; one
+//! placed `Replicated` or `Local` is unhashed and holds one. The 256-bucket
 //! index is the Fibonacci `mix(pk) >> 56` (see `schema::key`), not
 //! `xxh3 & 0xFF`.
 
@@ -44,7 +44,7 @@ thread_local! {
 pub enum Routing {
     /// One child holding the whole local dataset, its rows not keyed by
     /// `partition_for_pk` at all — a replicated base table's full copy, or a
-    /// replicated-derived view's local slice — homed at the owning worker's rank.
+    /// `Local` view's slice of its own making — homed at the owning worker's rank.
     Unhashed { rank: u32 },
     /// 256-way hash scatter by `mix(pk) >> 56`, over the `[start, end)` slice
     /// of the tiling this process owns.
@@ -100,6 +100,16 @@ pub fn partition_range(worker_id: u32, num_workers: u32) -> (u32, u32) {
         (worker_id + 1) * chunk
     };
     (start, end)
+}
+
+/// Report rows the ingest scatter routed outside this store. Outlined and
+/// `#[cold]` so the format arguments do not pin the scatter loop's counters to
+/// the stack on the path that never takes it.
+#[cold]
+#[inline(never)]
+fn misrouted_rows(rows: usize, partition: usize, routing: Routing) -> StorageError {
+    gnitz_error!("storage: {rows} row(s) routed to partition {partition}, outside this store's {routing:?}");
+    StorageError::MisroutedRows
 }
 
 pub struct PartitionedTable {
@@ -245,8 +255,14 @@ impl PartitionedTable {
                 if part_indices[p].is_empty() {
                     continue;
                 }
+                // Every production producer routes to the owning worker before the
+                // ingest, so a row outside this store's own partition range means
+                // the relation is *placed* by one key and *addressed* by another.
+                // Reported rather than dropped: the ingest callers treat a storage
+                // error as committed data not applied and fail stop, where a silent
+                // drop would let the relation diverge with no error and no log line.
                 let Some(local) = self.local_slot(p) else {
-                    continue;
+                    return Err(misrouted_rows(part_indices[p].len(), p, self.routing));
                 };
                 let sub_batch = Batch::from_indexed_rows(&mb, &part_indices[p], &self.schema);
                 self.tables[local].ingest_owned_batch(sub_batch)?;
@@ -656,7 +672,7 @@ mod tests {
     use super::*;
     use crate::foundation::posix_io::raise_fd_limit_for_tests;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-    use crate::test_support::{make_batch_raw, make_schema_u64_i64, wide_pk_3xu64_schema};
+    use crate::test_support::{make_batch_raw, make_schema_u64_i64, make_wide_batch, opk_pk, wide_pk_3xu64_schema};
     use std::os::fd::AsRawFd;
 
     /// Unsorted `Raw` rows for the U64+I64 schema.
@@ -708,12 +724,25 @@ mod tests {
         let schema = make_schema_u64_i64();
         // Present keys 0..256 (even payload), absent probes 1000..1064.
         let rows: Vec<(u64, i64, i64)> = (0..256u64).map(|k| (k, 1, (k * 10) as i64)).collect();
+        let opk = |k: u64| crate::schema::key::opk_key(&schema, &(k as u128).to_le_bytes());
+        // Ingest only the rows this store addresses, through `slot_for_key` — the
+        // same dispatch the read below uses. A store handed rows it does not
+        // address rejects them (`StorageError::MisroutedRows`), so the trimmed
+        // slice is built by construction rather than by throwing rows away.
         let build = |name: &str, routing| {
             let tdir = dir.path().join(name);
             let mut pt =
                 PartitionedTable::new(tdir.to_str().unwrap(), schema, 300, routing, RecoverySource::Rederive).unwrap();
-            pt.ingest_owned_batch(make_batch(&rows)).unwrap();
-            pt
+            let owned: Vec<(u64, i64, i64)> = rows
+                .iter()
+                .copied()
+                .filter(|&(k, _, _)| pt.slot_for_key(opk(k).pk_bytes()).is_some())
+                .collect();
+            let ingested = owned.len();
+            if ingested > 0 {
+                pt.ingest_owned_batch(make_batch(&owned)).unwrap();
+            }
+            (pt, ingested)
         };
         // The whole-store answer for `key`: the live payload, or `None`.
         let whole = |pt: &PartitionedTable, key: &[u8]| -> Option<i64> {
@@ -730,33 +759,34 @@ mod tests {
             .collect();
 
         let (trim_start, trim_end) = partition_range(1, 4);
-        for (name, routing) in [
-            ("ocfk_hashed", Routing::Hashed { start: 0, end: 256 }),
+        // `want_owned`: how many of the 256 keys this shape addresses, or `None`
+        // for the trimmed slice — its share depends on the hash, but it is always
+        // a non-empty proper subset.
+        for (name, routing, want_owned) in [
+            ("ocfk_hashed", Routing::Hashed { start: 0, end: 256 }, Some(256)),
             (
                 "ocfk_trimmed",
                 Routing::Hashed {
                     start: trim_start,
                     end: trim_end,
                 },
+                None,
             ),
-            ("ocfk_unhashed", Routing::Unhashed { rank: 7 }),
-            ("ocfk_empty", Routing::Hashed { start: 0, end: 0 }),
+            ("ocfk_unhashed", Routing::Unhashed { rank: 7 }, Some(256)),
+            ("ocfk_empty", Routing::Hashed { start: 0, end: 0 }, Some(0)),
         ] {
-            let pt = build(name, routing);
+            let (pt, ingested) = build(name, routing);
+            match want_owned {
+                Some(n) => assert_eq!(ingested, n, "{name}: keys addressed"),
+                None => assert!(ingested > 0 && ingested < rows.len(), "{name}: partial slice"),
+            }
             let mut hits = 0;
             for k in &keys {
                 let want = whole(&pt, k.pk_bytes());
                 assert_eq!(routed(&pt, k.pk_bytes()), want, "{name}: key {:?}", k.pk_bytes());
                 hits += usize::from(want.is_some());
             }
-            match routing {
-                Routing::Hashed { start: 0, end: 0 } => assert_eq!(hits, 0, "{name}: no children hold nothing"),
-                Routing::Unhashed { .. } | Routing::Hashed { start: 0, end: 256 } => {
-                    assert_eq!(hits, rows.len(), "{name}: every ingested key is present")
-                }
-                // The trimmed slice holds its own partitions' share, never all.
-                _ => assert!(hits > 0 && hits < rows.len(), "{name}: partial slice ({hits} hits)"),
-            }
+            assert_eq!(hits, ingested, "{name}: every key this store addresses reads back");
         }
     }
 
@@ -960,14 +990,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("prefix_twins");
         // 2×U64 compound PK, CLUSTER BY col0 (k=1, dist_stride=8) + I64 payload.
-        let schema = SchemaDescriptor::new_with_dist(
+        let schema = SchemaDescriptor::new_with_placement(
             &[
                 SchemaColumn::new(type_code::U64, 0), // col 0 (distribution key)
                 SchemaColumn::new(type_code::U64, 0), // col 1
                 SchemaColumn::new(type_code::I64, 0), // payload
             ],
             &[0, 1],
-            1,
+            crate::schema::Placement::Keyed { prefix_len: 1 },
         );
         assert_eq!(schema.dist_stride(), 8, "CLUSTER BY one U64 column ⇒ 8-byte prefix");
         // All 256 partitions live so any prefix-routed partition exists locally.
@@ -1101,53 +1131,48 @@ mod tests {
         }
     }
 
+    /// A 24-byte compound PK routes and ingests end-to-end: the scatter loop must
+    /// hash the OPK bytes (`get_pk` would panic past `pk_stride > 16`) and every
+    /// row must reach its partition's `Table::ingest`. All 256 partitions are
+    /// live, so `scatter_ingest` addresses every row and the ingest succeeds.
     #[test]
     fn ingest_owned_batch_wide_routing() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("wide_test");
         let schema = wide_pk_3xu64_schema();
-        // Only partition 0 is live. Per-partition Table::ingest (and its
-        // memtable upsert, which still calls get_pk and is an out-of-scope
-        // boundary for wide PKs) only runs for rows routed to partition 0.
-        // We feed only PKs that route elsewhere, so this exercises the new
-        // wide *routing* loop end-to-end with no downstream Table ingest.
         let mut pt = PartitionedTable::new(
             tdir.to_str().unwrap(),
             schema,
             700,
-            Routing::Hashed { start: 0, end: 1 },
+            Routing::Hashed { start: 0, end: 256 },
             RecoverySource::Rederive,
         )
         .unwrap();
 
-        let mut batch = Batch::with_capacity(schema, 256);
-        let mut n = 0;
-        let mut k = 0u64;
-        while n < 200 {
-            // OPK bytes for the 3×U64 compound PK: each column big-endian, tightly
-            // packed (all-unsigned ⇒ OPK == plain big-endian) — the bytes the ingest
-            // path routes. Raw little-endian would scatter a 24-byte layout no
-            // production wide PK carries.
-            let mut pk = [0u8; 24];
-            pk[..8].copy_from_slice(&(k * 7 + 13).to_be_bytes());
-            pk[8..16].copy_from_slice(&(k * 31 + 5).to_be_bytes());
-            pk[16..24].copy_from_slice(&(k + 1).to_be_bytes());
-            k += 1;
-            if partition_for_pk_bytes(&pk) == 0 {
-                continue; // would hit the out-of-scope memtable boundary
-            }
-            batch.extend_pk_bytes(&pk);
-            batch.extend_weight(&1i64.to_le_bytes());
-            batch.extend_null_bmp(&0u64.to_le_bytes());
-            batch.extend_col(0, &(n as i64).to_le_bytes());
-            batch.count += 1;
-            n += 1;
+        // `c0` is strictly increasing, so the rows are OPK-sorted as
+        // `make_wide_batch` requires.
+        let rows: Vec<(u64, u64, u64, i64, i64)> = (0..200u64)
+            .map(|k| (k * 7 + 13, k * 31 + 5, k + 1, 1, k as i64))
+            .collect();
+        let pks: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|&(c0, c1, c2, _, _)| opk_pk(&schema, &[c0 as u128, c1 as u128, c2 as u128]))
+            .collect();
+        // The keys spread over many partitions, so the routing loop is the thing
+        // under test rather than one bucket's worth of it.
+        let distinct = pks
+            .iter()
+            .map(|pk| partition_for_pk_bytes(pk))
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        assert!(distinct > 64, "only {distinct} distinct partitions across 200 keys");
+
+        pt.ingest_owned_batch(make_wide_batch(&schema, &rows)).unwrap();
+        for pk in &pks {
+            let mut c = pt.open_cursor_for_key(pk).expect("every key routes to a live child");
+            assert!(c.seek_exact_live(pk), "wide key {pk:?} must survive the ingest");
         }
-        // The wide-PK routing loop must not panic (get_pk would, for
-        // pk_stride > 16). All rows route outside the single live
-        // partition, so no Table::ingest is invoked.
-        pt.ingest_owned_batch(batch).unwrap();
     }
 
     #[test]

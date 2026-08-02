@@ -656,3 +656,55 @@ def test_distinct_after_restart():
         _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_cluster_by_prefix_linear_view_after_restart():
+    """A linear view over a `CLUSTER BY` proper prefix must be re-derived to the
+    same placement at boot.
+
+    The view emits no exchange, so its rows sit on the worker owning the
+    *source's* distribution prefix and its store must address them the same way.
+    That answer is folded at registration from the source's stamped placement and
+    written to no wire format, so boot re-derives it — from the persisted circuit
+    nodes and `TABLE_TAB.flags` — while the view resumes from shards written under
+    it. A boot that re-derived the full-PK default instead would address the
+    resumed rows by a key that names a different worker, and the view would come
+    back a per-key prefix of itself.
+    """
+    tmpdir, data_dir, sock_path = _make_env("gnitz_cbprefix_")
+    try:
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("cb")
+        conn.execute_sql(
+            "CREATE TABLE t (a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL, "
+            "v BIGINT NOT NULL, PRIMARY KEY (a, b)) CLUSTER BY a",
+            schema_name="cb",
+        )
+        conn.execute_sql("CREATE VIEW mv AS SELECT a, b, v FROM t WHERE v > 0", schema_name="cb")
+        rows = [(a, b, a * 100 + b) for a in range(1, 21) for b in range(1, 6)]
+        conn.execute_sql(f"INSERT INTO t VALUES {_values(rows)}", schema_name="cb")
+
+        vid, _ = conn.resolve_table("cb", "mv")
+        before = oracle.scan_multiset(conn, vid, ["a", "b", "v"])
+        assert before == Counter({r: 1 for r in rows}), \
+            f"view incomplete before the restart: {len(before)}/{len(rows)}"
+        conn.close()
+
+        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        vid, _ = conn.resolve_table("cb", "mv")
+        after = oracle.scan_multiset(conn, vid, ["a", "b", "v"])
+        assert after == before, (
+            f"view diverged across the restart:\nbefore={len(before)} rows\nafter={len(after)} rows")
+
+        # A further insert must land in the same store the resume loaded.
+        more = [(a, 6, a * 100 + 6) for a in range(1, 21)]
+        conn.execute_sql(f"INSERT INTO t VALUES {_values(more)}", schema_name="cb")
+        grown = oracle.scan_multiset(conn, vid, ["a", "b", "v"])
+        assert grown == Counter({r: 1 for r in rows + more}), \
+            f"post-restart insert lost rows: {len(grown)}/{len(rows) + len(more)}"
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)

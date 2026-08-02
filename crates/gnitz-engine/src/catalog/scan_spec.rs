@@ -789,9 +789,10 @@ mod tests {
         );
     }
 
-    /// With `dist_prefix_len = 1` every row sharing the leading column lands in one
-    /// partition, so pinning it and ranging the trailing column is confined —
-    /// to the same partition full points on `(a, b)` reach. At the full-PK default
+    /// With a `Keyed { prefix_len: 1 }` placement every row sharing the leading
+    /// column lands in one partition, so pinning it and ranging the trailing
+    /// column is confined — to the same partition full points on `(a, b)` reach.
+    /// At the full-PK default
     /// the same bound spans partitions.
     #[test]
     fn scan_spec_partition_follows_the_distribution_prefix() {
@@ -799,7 +800,7 @@ mod tests {
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::U64, 0),
         ];
-        let prefix = SchemaDescriptor::new_with_dist(&cols, &[0, 1], 1);
+        let prefix = SchemaDescriptor::new_with_placement(&cols, &[0, 1], Placement::Keyed { prefix_len: 1 });
         // `a = 7 AND b > 3` — a whole trailing-column range inside one `a` group.
         let ranged = RangeDescriptor::new(&[7], After(3), After(u64::MAX as u128));
         let want = prefix.partition_for_pk(&opk_pk(&prefix, &[7, 0]));
@@ -812,7 +813,7 @@ mod tests {
             );
         }
 
-        let full = SchemaDescriptor::new_with_dist(&cols, &[0, 1], 2);
+        let full = SchemaDescriptor::new_with_placement(&cols, &[0, 1], Placement::Keyed { prefix_len: 2 });
         assert_eq!(
             scan_spec_partition(&full, &ranged),
             None,

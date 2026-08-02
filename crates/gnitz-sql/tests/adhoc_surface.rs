@@ -16,20 +16,11 @@
 //! `GNITZ_WORKERS=4` in the `gnitz-py` suites.
 
 use gnitz_core::{GnitzClient, Schema, ZSetBatch};
-use gnitz_sql::{GnitzSqlError, SqlPlanner, SqlResult};
+use gnitz_sql::GnitzSqlError;
 use gnitz_test_harness::ServerHandle;
 
 mod common;
 use common::*;
-
-/// Run an ad-hoc SELECT and return its (schema, batch).
-fn query(client: &mut GnitzClient, sn: &str, sql: &str) -> (Schema, ZSetBatch) {
-    let mut p = SqlPlanner::new(client, sn);
-    match p.execute(sql).unwrap().pop().unwrap() {
-        SqlResult::Rows { schema, batch } => (schema, batch),
-        _ => panic!("expected Rows from {sql:?}"),
-    }
-}
 
 /// `(value, weight)` pairs of integer column `col`, sorted — comparable across
 /// two runs regardless of emission order. Weights are kept: this is a Z-set
@@ -106,7 +97,7 @@ fn group_by_matches_view() {
     let sql = "SELECT g, COUNT(*) AS n FROM t GROUP BY g";
     exec(&mut client, &sn, &format!("CREATE VIEW v_gb AS {sql}"));
     let (vs, vb) = read_view(&mut client, &sn, "v_gb");
-    let (ts, tb) = query(&mut client, &sn, sql);
+    let (ts, tb) = read_sql(&mut client, &sn, sql);
 
     assert_eq!(
         col_weights(&ts, &tb, "g"),
@@ -127,7 +118,7 @@ fn where_on_string_column_served_and_is_correct() {
     let Some(srv) = ServerHandle::start() else { return };
     let (mut client, sn) = make_planner(&srv);
     seed(&mut client, &sn);
-    let (s, b) = query(&mut client, &sn, "SELECT id, s FROM t WHERE s = 'a'");
+    let (s, b) = read_sql(&mut client, &sn, "SELECT id, s FROM t WHERE s = 'a'");
     assert_eq!(
         col_weights(&s, &b, "id"),
         vec![(1, 1), (3, 1), (6, 1)],
@@ -141,7 +132,7 @@ fn where_on_float_column_served_and_is_correct() {
     let Some(srv) = ServerHandle::start() else { return };
     let (mut client, sn) = make_planner(&srv);
     seed(&mut client, &sn);
-    let (s, b) = query(&mut client, &sn, "SELECT id FROM t WHERE f > 2.0");
+    let (s, b) = read_sql(&mut client, &sn, "SELECT id FROM t WHERE f > 2.0");
     assert_eq!(
         col_weights(&s, &b, "id"),
         vec![(2, 1), (4, 1), (5, 1), (6, 1)],
@@ -155,7 +146,7 @@ fn pk_equality_stays_thin_and_is_correct() {
     let Some(srv) = ServerHandle::start() else { return };
     let (mut client, sn) = make_planner(&srv);
     seed(&mut client, &sn);
-    let (s, b) = query(&mut client, &sn, "SELECT id, g FROM t WHERE id = 5");
+    let (s, b) = read_sql(&mut client, &sn, "SELECT id, g FROM t WHERE id = 5");
     assert_eq!(col_weights(&s, &b, "id"), vec![(5, 1)], "one row, weight 1");
 }
 
@@ -167,7 +158,7 @@ fn non_integral_literal_against_int_column_served_and_returns_empty() {
     let Some(srv) = ServerHandle::start() else { return };
     let (mut client, sn) = make_planner(&srv);
     seed(&mut client, &sn);
-    let (s, b) = query(&mut client, &sn, "SELECT id FROM t WHERE g = 3.5");
+    let (s, b) = read_sql(&mut client, &sn, "SELECT id FROM t WHERE g = 3.5");
     assert!(
         col_weights(&s, &b, "id").is_empty(),
         "no BIGINT equals 3.5 — served as the empty set, not an error"
@@ -182,7 +173,7 @@ fn order_by_limit_offset_served() {
     let (mut client, sn) = make_planner(&srv);
     seed(&mut client, &sn);
 
-    let (s, b) = query(
+    let (s, b) = read_sql(
         &mut client,
         &sn,
         "SELECT g, COUNT(*) AS n FROM t GROUP BY g ORDER BY g DESC LIMIT 2",
@@ -191,7 +182,7 @@ fn order_by_limit_offset_served() {
     let got: Vec<i64> = (0..b.len()).map(|r| i64_at(&b, g, r)).collect();
     assert_eq!(got, vec![30, 20], "ORDER BY g DESC LIMIT 2 over a GROUP BY fold");
 
-    let (s, b) = query(
+    let (s, b) = read_sql(
         &mut client,
         &sn,
         "SELECT g, COUNT(*) AS n FROM t GROUP BY g ORDER BY g DESC LIMIT 2 OFFSET 1",
@@ -215,7 +206,7 @@ fn synthetic_key_slots_are_hidden_from_user_rows() {
         ("SELECT g, COUNT(*) AS n FROM t GROUP BY g", vec!["g", "n"]),
         ("SELECT DISTINCT g FROM t", vec!["g"]),
     ] {
-        let (s, _) = query(&mut client, &sn, sql);
+        let (s, _) = read_sql(&mut client, &sn, sql);
         assert_eq!(
             visible_names(&s),
             projected,
@@ -406,7 +397,7 @@ fn having_feature_limits_are_compiler_errors() {
     let (mut client, sn) = make_planner(&srv);
     seed(&mut client, &sn);
 
-    let (s, b) = query(
+    let (s, b) = read_sql(
         &mut client,
         &sn,
         "SELECT s, COUNT(*) AS n FROM t GROUP BY s HAVING s = 'a'",
@@ -440,7 +431,7 @@ fn passthrough_cte_over_table_served() {
     let Some(srv) = ServerHandle::start() else { return };
     let (mut client, sn) = make_planner(&srv);
     seed(&mut client, &sn);
-    let (s, b) = query(
+    let (s, b) = read_sql(
         &mut client,
         &sn,
         "WITH x AS (SELECT * FROM t) SELECT id FROM x WHERE g = 10",
@@ -463,7 +454,7 @@ fn passthrough_cte_over_view_served() {
         &sn,
         "CREATE VIEW v_ge20 AS SELECT id, g FROM t WHERE g >= 20",
     );
-    let (s, b) = query(
+    let (s, b) = read_sql(
         &mut client,
         &sn,
         "WITH x AS (SELECT * FROM v_ge20) SELECT id FROM x WHERE g = 30",
@@ -515,10 +506,10 @@ fn repeated_reads_are_stable() {
     let (mut client, sn) = make_planner(&srv);
     seed(&mut client, &sn);
     let sql = "SELECT g, COUNT(*) AS n FROM t GROUP BY g";
-    let (s0, b0) = query(&mut client, &sn, sql);
+    let (s0, b0) = read_sql(&mut client, &sn, sql);
     let first = col_weights(&s0, &b0, "n");
     for i in 0..8 {
-        let (s, b) = query(&mut client, &sn, sql);
+        let (s, b) = read_sql(&mut client, &sn, sql);
         assert_eq!(col_weights(&s, &b, "n"), first, "run {i} drifted from run 0");
     }
 }
@@ -530,11 +521,11 @@ fn reads_reflect_writes_between_runs() {
     let (mut client, sn) = make_planner(&srv);
     seed(&mut client, &sn);
     let sql = "SELECT g, COUNT(*) AS n FROM t GROUP BY g HAVING g = 10";
-    let (s, b) = query(&mut client, &sn, sql);
+    let (s, b) = read_sql(&mut client, &sn, sql);
     assert_eq!(col_weights(&s, &b, "n"), vec![(2, 1)], "g=10 starts with 2 rows");
 
     exec(&mut client, &sn, "INSERT INTO t (id, g, s, f) VALUES (7, 10, 'z', 9.5)");
-    let (s, b) = query(&mut client, &sn, sql);
+    let (s, b) = read_sql(&mut client, &sn, sql);
     assert_eq!(
         col_weights(&s, &b, "n"),
         vec![(3, 1)],

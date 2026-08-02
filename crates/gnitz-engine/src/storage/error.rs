@@ -32,6 +32,10 @@ pub enum StorageError {
     InvalidShard,
     /// CString conversion failed (path contained an interior NUL).
     InvalidPath,
+    /// An ingested row routed to a partition this store does not hold. Its
+    /// relation was placed by one key and is addressed by another; the row count
+    /// and partition are logged at the detection site.
+    MisroutedRows,
 }
 
 impl fmt::Display for StorageError {
@@ -45,6 +49,7 @@ impl fmt::Display for StorageError {
             StorageError::BufferTooSmall => "buffer too small",
             StorageError::InvalidShard => "invalid shard layout",
             StorageError::InvalidPath => "invalid path",
+            StorageError::MisroutedRows => "rows routed outside this store's partitions",
         };
         f.write_str(s)
     }

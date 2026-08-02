@@ -49,7 +49,7 @@ use std::fs;
 use std::rc::Rc;
 
 use crate::query::{DagEngine, RelationKind, StoreHandle};
-use crate::schema::{SchemaColumn, SchemaDescriptor};
+use crate::schema::{Placement, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, PartitionedTable, ReadCursor, RecoverySource, Routing, Table};
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────

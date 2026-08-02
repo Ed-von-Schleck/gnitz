@@ -41,6 +41,9 @@ pub(crate) use key::IndexKeySpec;
 /// behind every consumer of those arrays — chiefly the catalog's compile-time
 /// `SCHEMAS` statics — homed here (L1) so they can never drift. `const`: zero
 /// runtime allocation.
+///
+/// Every such family is [`Placement::Replicated`]: DDL is master-broadcast, so
+/// each worker holds an identical full copy.
 pub(crate) const fn from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_indices: &[u32]) -> SchemaDescriptor {
     let mut buf = [SchemaColumn::EMPTY; MAX_COLUMNS];
     let mut i = 0;
@@ -49,7 +52,7 @@ pub(crate) const fn from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_indices: 
         i += 1;
     }
     let (head, _) = buf.split_at(cols.len());
-    SchemaDescriptor::new(head, pk_indices)
+    SchemaDescriptor::new_with_placement(head, pk_indices, Placement::Replicated)
 }
 
 /// Accumulator for a derived schema whose PK is its leading `pk_len` columns —
@@ -198,6 +201,99 @@ const fn compute_payload_cmp(cols: &[SchemaColumn], payload_mapping: &[u8; MAX_C
     PayloadCmpKind::FixedIntNonnull
 }
 
+/// Where a relation's rows live — the one value every consumer reads, so the
+/// store shape, the read routing, and the join/reduce co-partition analyzers
+/// cannot answer differently. Stamped at registration on base tables (from
+/// `TABLE_TAB.flags`), on system catalog families, and on views (folded from the
+/// sources' own stamped placements, which is what makes the property transitive
+/// up a view chain).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Placement {
+    /// Every worker holds an identical full copy; writes broadcast, reads
+    /// single-source worker 0.
+    Replicated,
+    /// Rows live on whichever worker produced them and are **not** keyed by
+    /// `partition_for_pk` at all — a view over any source that is itself not
+    /// `Keyed` (a replicated table, or another `Local` view). The union across
+    /// workers is the relation; a read must gather every worker.
+    Local,
+    /// Hash-distributed: a row's owner is
+    /// `partition_for_pk_bytes(OPK(pk_indices()[..prefix_len]))`.
+    /// `prefix_len == pk_count` is the default (full-PK) distribution.
+    Keyed { prefix_len: u8 },
+}
+
+impl Placement {
+    /// The persisted "default distribution" sentinel: `prefix_len == 0` means
+    /// the full PK. Constructors normalize it (and any out-of-range value a
+    /// corrupt catalog flag could carry) against the schema's PK arity, so a
+    /// `Keyed` prefix read back off a descriptor is never the sentinel — it is
+    /// `pk_count` for the default and `1..pk_count` for a `CLUSTER BY` prefix.
+    pub(crate) const KEYED_DEFAULT: Placement = Placement::Keyed { prefix_len: 0 };
+
+    /// Decode a relation's placement out of a `TABLE_TAB.flags` word. The flags
+    /// cannot make the replicated/prefix combination unrepresentable
+    /// (`replicated` is a bit, `k` a byte), so the conflict is rejected here at
+    /// the catalog trust boundary rather than silently resolved in favour of one.
+    pub(crate) fn from_table_flags(flags: u64) -> Result<Placement, String> {
+        let prefix_len = gnitz_wire::table_flags_dist_prefix(flags);
+        if gnitz_wire::table_flags_replicated(flags) {
+            if prefix_len != 0 {
+                return Err(format!(
+                    "replicated and carries a non-default distribution prefix (k={prefix_len}); \
+                     these are mutually exclusive"
+                ));
+            }
+            return Ok(Placement::Replicated);
+        }
+        Ok(Placement::Keyed {
+            prefix_len: prefix_len as u8,
+        })
+    }
+
+    /// True iff a row's owning worker is derived from its key. A relation that
+    /// is not key-routed is built `Routing::Unhashed`, because a 256-partition
+    /// store trimmed to the worker's range would drop every row whose key
+    /// partition the worker does not own.
+    #[inline]
+    pub(crate) const fn is_key_routed(self) -> bool {
+        matches!(self, Placement::Keyed { .. })
+    }
+
+    /// True iff a full identical copy lives on every worker.
+    #[inline]
+    pub(crate) const fn is_replicated(self) -> bool {
+        matches!(self, Placement::Replicated)
+    }
+
+    /// The number of leading PK columns the router hashes. A relation that is
+    /// not key-routed is sliced by nothing, so it takes the full-PK width and
+    /// every `partition_for_pk` slice stays well-defined.
+    const fn dist_prefix_len(self, pk_count: usize) -> usize {
+        match self {
+            Placement::Keyed { prefix_len } => prefix_len as usize,
+            Placement::Replicated | Placement::Local => pk_count,
+        }
+    }
+
+    /// Normalize the persisted `Keyed` sentinel/out-of-range prefix against a
+    /// PK arity. Applied by every constructor, so `placement()` never returns
+    /// an unnormalized value.
+    const fn normalized(self, pk_count: usize) -> Placement {
+        match self {
+            Placement::Keyed { prefix_len } => {
+                let k = if prefix_len == 0 || prefix_len as usize > pk_count {
+                    pk_count
+                } else {
+                    prefix_len as usize
+                };
+                Placement::Keyed { prefix_len: k as u8 }
+            }
+            other => other,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub(crate) struct SchemaDescriptor {
@@ -211,29 +307,19 @@ pub(crate) struct SchemaDescriptor {
     /// cached `pk_stride: u8` fields on `MappedShard`/`DirectWriter`/
     /// `MemBatch`; today's worst case is 5 × 16 = 80, well under 255.
     pk_stride: u8,
-    /// Byte width of the **distribution prefix** — the OPK bytes of the first
-    /// `dist_prefix_len` PK columns, the leading slice every write-side
-    /// table-key router (`partition_for_pk_bytes`) hashes to pick a partition.
-    /// Summed alongside `pk_stride` in `new_with_dist`, walking the PK columns
-    /// in PK-list order, so it matches the OPK encoder's tight big-endian layout
-    /// exactly. `dist_stride == pk_stride` for the default (full-PK) distribution,
-    /// making every sliced route byte-identical to today's full-PK routing.
+    /// Byte width of the **distribution prefix** — the OPK bytes of the leading
+    /// PK columns the placement keys by, the slice every write-side table-key
+    /// router (`partition_for_pk_bytes`) hashes to pick a partition. Derived from
+    /// `placement` by walking the PK columns in PK-list order, so it matches the
+    /// OPK encoder's tight big-endian layout exactly. `dist_stride == pk_stride`
+    /// for the default (full-PK) distribution and for a non-`Keyed` placement
+    /// (whose rows no router slices at all), making every sliced route
+    /// byte-identical to full-PK routing.
     dist_stride: u8,
-    /// Distribution prefix length `k`: the number of leading PK columns rows are
-    /// hash-distributed by (`1 ≤ k ≤ pk_count`). Read by
-    /// `shard_cols_match_dist_key` to detect co-partitioned joins / local GROUP
-    /// BY. `k == pk_count` is the default (full-PK) distribution.
-    dist_prefix_len: u8,
-    /// `true` iff this relation is **replicated**: every worker holds an identical
-    /// full copy (single partition at index 0), writes broadcast, and reads
-    /// single-source. Set on a base table from `TABLE_TAB.flags` (see
-    /// `gnitz_wire::table_flags_replicated`), on every system catalog family (DDL
-    /// is master-broadcast), and on a view all of whose sources are replicated
-    /// (`hook_view_register`) — which makes the property transitive up a view
-    /// chain. Every derived/intermediate schema (join/map/reduce/projection
-    /// output, built via `new`/`new_with_dist`) is non-replicated. Mutually
-    /// exclusive with a non-default `dist_prefix_len` (DDL-enforced).
-    replicated: bool,
+    /// Where this relation's rows live — see [`Placement`]. Stamped by the
+    /// caller; every derived/intermediate schema (join/map/reduce/projection
+    /// output, built via `new`) gets the full-PK `Keyed` default.
+    placement: Placement,
     /// payload_mapping[ci] = dense payload index, or PAYLOAD_MAPPING_PK_SENTINEL:
     /// PK columns hold the sentinel, payload columns hold their dense payload
     /// slot. The sentinel is this table's *encoding* of "no payload slot" and
@@ -291,35 +377,28 @@ impl SchemaDescriptor {
     /// use. Accepts up to `MAX_PK_COLUMNS` entries.
     #[track_caller]
     pub(crate) const fn new(cols: &[SchemaColumn], pk_indices: &[u32]) -> Self {
-        // Default distribution = the full PK: today's behavior, byte-for-byte.
-        Self::new_with_dist(cols, pk_indices, pk_indices.len())
+        // Default placement = hash-distributed by the full PK.
+        Self::new_with_placement(cols, pk_indices, Placement::KEYED_DEFAULT)
     }
 
-    /// Construct a `SchemaDescriptor` whose hash-distribution key is the leading
-    /// `dist_prefix_len` PK columns (a per-table choice persisted in
-    /// `TABLE_TAB.flags`; see `gnitz_wire::pack_table_flags`). `dist_prefix_len`
-    /// is **normalized**: `0` (the persisted "default" sentinel) and any value
-    /// past `|PK|` (only reachable from a corrupted catalog flag) both clamp to
-    /// the full PK, so `dist_stride == pk_stride` and routing stays byte-identical
-    /// to the full-PK default. Only base-table schemas carry a chosen prefix;
-    /// every derived schema (join/map/reduce/projection output, built via `new`)
-    /// gets the full-PK default and is never table-key-routed.
+    /// Construct a `SchemaDescriptor` with a stamped [`Placement`] — for a base
+    /// table, the one decoded from `TABLE_TAB.flags` (see
+    /// `gnitz_wire::pack_table_flags`); for a view, the one folded from its
+    /// sources. A `Keyed` prefix is **normalized**: `0` (the persisted "default"
+    /// sentinel) and any value past `|PK|` (only reachable from a corrupted
+    /// catalog flag) both clamp to the full PK, so `dist_stride == pk_stride` and
+    /// routing stays byte-identical to the full-PK default. Every derived schema
+    /// (join/map/reduce/projection output, built via `new`) gets that default and
+    /// is never table-key-routed.
     #[track_caller]
-    pub(crate) const fn new_with_dist(cols: &[SchemaColumn], pk_indices: &[u32], dist_prefix_len: usize) -> Self {
+    pub(crate) const fn new_with_placement(cols: &[SchemaColumn], pk_indices: &[u32], placement: Placement) -> Self {
         assert!(cols.len() <= MAX_COLUMNS, "new: too many columns");
         assert!(
             pk_indices.len() <= MAX_PK_COLUMNS,
             "new: pk_indices.len() exceeds MAX_PK_COLUMNS",
         );
 
-        // 0 is the persisted default ("full PK"); a value past |PK| can only
-        // come from a corrupted catalog flag — clamp it rather than index out of
-        // bounds in the `dist_stride` sum below.
-        let dist_k = if dist_prefix_len == 0 || dist_prefix_len > pk_indices.len() {
-            pk_indices.len()
-        } else {
-            dist_prefix_len
-        };
+        let placement = placement.normalized(pk_indices.len());
 
         let mut columns = [SchemaColumn::EMPTY; MAX_COLUMNS];
         let mut i = 0;
@@ -327,6 +406,8 @@ impl SchemaDescriptor {
             columns[i] = cols[i];
             i += 1;
         }
+        let dist_k = placement.dist_prefix_len(pk_indices.len());
+
         let mut pk_arr = [0u32; MAX_PK_COLUMNS];
         let mut stride_acc: u16 = 0;
         let mut dist_stride_acc: u16 = 0;
@@ -387,10 +468,7 @@ impl SchemaDescriptor {
             pk_indices: pk_arr,
             pk_stride,
             dist_stride: dist_stride_acc as u8,
-            dist_prefix_len: dist_k as u8,
-            // Stamped by the caller via `with_replicated`; every constructor
-            // defaults it off.
-            replicated: false,
+            placement,
             payload_mapping,
             payload_to_ci,
             payload_cmp,
@@ -398,14 +476,16 @@ impl SchemaDescriptor {
         }
     }
 
-    /// Return a copy of this schema marked replicated (`true`) or partitioned
-    /// (`false`). A replicated relation must carry the default full-PK
-    /// distribution (`dist_prefix_len == pk_count`); the DDL layer enforces that,
-    /// so this is a pure tag.
-    #[inline]
-    pub(crate) const fn with_replicated(mut self, replicated: bool) -> Self {
-        self.replicated = replicated;
-        self
+    /// Rebuild this schema with a different [`Placement`]. Every production site
+    /// knows the placement before it builds the descriptor and passes it to
+    /// `new_with_placement` / `build_schema_from_col_defs`; this is for tests that
+    /// re-stamp a shared fixture. It delegates so there is one derivation of the
+    /// route, not two.
+    #[cfg(test)]
+    pub(crate) const fn with_placement(&self, placement: Placement) -> Self {
+        let (cols, _) = self.columns.split_at(self.num_columns as usize);
+        let (pk, _) = self.pk_indices.split_at(self.pk_count as usize);
+        Self::new_with_placement(cols, pk, placement)
     }
 
     pub(crate) const fn minimal_u64() -> Self {
@@ -491,25 +571,16 @@ impl SchemaDescriptor {
         gnitz_wire::partition_for_pk_bytes(&key[..self.dist_stride() as usize])
     }
 
-    /// Distribution prefix length `k` — leading PK columns rows are hashed by
-    /// (`k == pk_count` for the full-PK default). Crate-visible so the ALTER …
-    /// DROP NOT NULL descriptor rebuild (`hook_column_alter`) can carry the
-    /// routing prefix across the swap — `SchemaDescriptor::eq` ignores it, so a
-    /// rebuilt descriptor must re-apply it explicitly (§5).
+    /// Where this relation's rows live — the one value the store shape
+    /// (`build_partitioned_storage`), the write scatter (broadcast vs
+    /// partition-scatter), the read gather / seek unicast, and the join and
+    /// exchange analyzers all read, so they cannot disagree. Crate-visible so the
+    /// ALTER … DROP NOT NULL descriptor rebuild (`hook_column_alter`) can carry it
+    /// across the swap: `SchemaDescriptor::eq` ignores it, so a rebuilt
+    /// descriptor must be constructed with it again.
     #[inline]
-    pub(crate) const fn dist_prefix_len(&self) -> u8 {
-        self.dist_prefix_len
-    }
-
-    /// True iff this relation is replicated — a full copy on every worker
-    /// (single partition 0), with broadcast writes and single-source reads.
-    /// Consulted by the write scatter (broadcast vs partition-scatter), the read
-    /// gather (single-source vs union), the join co-partition analyzer (a
-    /// replicated source, or a partitioned source whose join partner is
-    /// replicated, skips its exchange), and the bootstrap trim exemption.
-    #[inline]
-    pub(crate) const fn replicated(&self) -> bool {
-        self.replicated
+    pub(crate) const fn placement(&self) -> Placement {
+        self.placement
     }
 
     /// True iff the PK is a single signed column (I8/I16/I32/I64). Its OPK
@@ -603,27 +674,31 @@ impl SchemaDescriptor {
         })
     }
 
-    /// True iff `cols` is **exactly** this table's distribution prefix —
-    /// `pk_indices()[..k]` in PK order, where `k = dist_prefix_len()`. The
-    /// co-partition contract the exchange router enforces (`fill_worker_indices`
-    /// routes by `partition_for_pk_bytes` over the leading `dist_stride` OPK bytes
-    /// in schema order): a reindex/shard key equal to the distribution prefix
-    /// means a derived operator co-partitions with this base table and its
-    /// network exchange can be skipped. For the full-PK default (`k == |PK|`) this
-    /// reduces to "shard key is exactly the source PK in order"; one component of
-    /// a compound PK — or a permuted PK — never matches. The DAG/compiler
-    /// co-partition analyzers carry shard columns as `i32`, so this takes
-    /// `&[i32]`; PK indices are small and non-negative, so the compare is exact.
+    /// True iff `cols` is **exactly** this relation's distribution prefix —
+    /// `pk_indices()[..k]` in PK order, where `k` is its `Keyed` prefix length.
+    /// A reindex/shard key equal to the distribution prefix means a derived
+    /// operator co-partitions with this relation (the exchange router hashes the
+    /// same leading `dist_stride` OPK bytes), so its network exchange can be
+    /// skipped. The DAG/compiler co-partition analyzers carry shard columns as
+    /// `i32`; PK indices are small and non-negative, so the compare is exact.
     ///
-    /// **Exact `== k`, never a super-prefix (`>= k`)**, and load-bearing: a
-    /// super-prefix gate would let the two sides of a join skip at *different*
-    /// prefix widths, hashing equal join keys to different workers so the elided
-    /// exchange silently drops matches. A side whose join-key length ≠ its own `k`
-    /// instead exchanges and repartitions to the full key, reconverging with the
-    /// other side. (`dist_prefix_len ≤ pk_count`, so `pk[..k]` is in range; the
-    /// `cluster_by_super_prefix_join_safety` E2E test exercises this.)
+    /// False for any placement that is not `Keyed`: such a relation's rows are
+    /// not placed by `partition_for_pk` at all, so no shard key names the worker
+    /// its rows are already on. (A replicated *join* source still skips its
+    /// exchange, through the replication arm of `compute_co_partitioned` — a
+    /// different fact.)
+    ///
+    /// Exact `== k`, never a super-prefix (`>= k`): a super-prefix gate would let
+    /// the two sides of a join skip at *different* prefix widths, hashing equal
+    /// join keys to different workers so the elided exchange silently drops
+    /// matches. A side whose join-key length ≠ its own `k` instead exchanges and
+    /// repartitions to the full key, reconverging with the other side. The
+    /// `cluster_by_super_prefix_join_safety` E2E test exercises this.
     pub(crate) fn shard_cols_match_dist_key(&self, cols: &[i32]) -> bool {
-        let k = self.dist_prefix_len() as usize;
+        let Placement::Keyed { prefix_len } = self.placement else {
+            return false;
+        };
+        let k = prefix_len as usize;
         let pk = self.pk_indices();
         cols.len() == k && cols.iter().zip(&pk[..k]).all(|(&c, &p)| c == p as i32)
     }
@@ -929,12 +1004,16 @@ mod tests {
         assert_eq!(non_nullable.reduce_out_key(&[0]), ReduceOutKey::PkPermutation);
     }
 
-    // ── Distribution prefix (CLUSTER BY) ────────────────────────────────────
+    // ── Placement / distribution prefix (CLUSTER BY) ────────────────────────
 
     /// 3-column compound PK `(U32, U64, U64)` + one payload, so the columns have
     /// distinct widths and a prefix stride is unambiguous.
-    fn three_col_pk_schema(dist_k: usize) -> SchemaDescriptor {
-        SchemaDescriptor::new_with_dist(
+    fn three_col_pk_schema(dist_k: u8) -> SchemaDescriptor {
+        three_col_placed(Placement::Keyed { prefix_len: dist_k })
+    }
+
+    fn three_col_placed(placement: Placement) -> SchemaDescriptor {
+        SchemaDescriptor::new_with_placement(
             &[
                 SchemaColumn::new(type_code::U32, 0), // col 0: 4 bytes
                 SchemaColumn::new(type_code::U64, 0), // col 1: 8 bytes
@@ -942,14 +1021,14 @@ mod tests {
                 SchemaColumn::new(type_code::I64, 0), // payload
             ],
             &[0, 1, 2],
-            dist_k,
+            placement,
         )
     }
 
     #[test]
     fn default_dist_is_full_pk() {
-        // `new` (no clause) and `new_with_dist(.., 0)` and `new_with_dist(.., |PK|)`
-        // all yield dist_stride == pk_stride and dist_prefix_len == pk_count.
+        // `new` (no clause), `Keyed { prefix_len: 0 }`, and `Keyed { prefix_len:
+        // |PK| }` all yield dist_stride == pk_stride and a normalized k == pk_count.
         let pk_stride = 4 + 8 + 8; // U32 + U64 + U64
         for s in [
             three_col_pk_schema(0), // 0 = persisted default sentinel
@@ -967,7 +1046,7 @@ mod tests {
         ] {
             assert_eq!(s.pk_stride() as usize, pk_stride);
             assert_eq!(s.dist_stride(), s.pk_stride(), "default: dist == full PK");
-            assert_eq!(s.dist_prefix_len(), s.pk_indices().len() as u8);
+            assert_eq!(s.placement(), Placement::Keyed { prefix_len: 3 });
         }
     }
 
@@ -975,11 +1054,11 @@ mod tests {
     fn dist_stride_sums_leading_prefix_columns() {
         // k=1 ⇒ just col 0 (U32 = 4 bytes).
         let s1 = three_col_pk_schema(1);
-        assert_eq!(s1.dist_prefix_len(), 1);
+        assert_eq!(s1.placement(), Placement::Keyed { prefix_len: 1 });
         assert_eq!(s1.dist_stride(), 4);
         // k=2 ⇒ col 0 + col 1 (U32 + U64 = 12 bytes).
         let s2 = three_col_pk_schema(2);
-        assert_eq!(s2.dist_prefix_len(), 2);
+        assert_eq!(s2.placement(), Placement::Keyed { prefix_len: 2 });
         assert_eq!(s2.dist_stride(), 12);
     }
 
@@ -988,8 +1067,19 @@ mod tests {
         // A k past |PK| (only reachable from a corrupted catalog flag) clamps to
         // the full PK rather than overflowing the prefix sum.
         let s = three_col_pk_schema(99);
-        assert_eq!(s.dist_prefix_len(), 3);
+        assert_eq!(s.placement(), Placement::Keyed { prefix_len: 3 });
         assert_eq!(s.dist_stride(), s.pk_stride());
+    }
+
+    /// A relation the router slices by nothing takes the full-PK width, so every
+    /// `partition_for_pk` slice over it stays in range.
+    #[test]
+    fn unkeyed_placement_takes_the_full_pk_width() {
+        for p in [Placement::Replicated, Placement::Local] {
+            let s = three_col_placed(p);
+            assert_eq!(s.placement(), p);
+            assert_eq!(s.dist_stride(), s.pk_stride(), "{p:?}");
+        }
     }
 
     #[test]
@@ -1016,6 +1106,20 @@ mod tests {
         assert!(k2.shard_cols_match_dist_key(&[0, 1]));
         assert!(!k2.shard_cols_match_dist_key(&[0]));
         assert!(!k2.shard_cols_match_dist_key(&[0, 1, 2]));
+    }
+
+    /// A relation whose rows are not placed by `partition_for_pk` has no shard
+    /// key that names where they already are — whatever its PK columns look
+    /// like. This is what stops a co-partition/exchange elision from firing onto
+    /// an unkeyed source.
+    #[test]
+    fn shard_cols_never_match_an_unkeyed_placement() {
+        for p in [Placement::Replicated, Placement::Local] {
+            let s = three_col_placed(p);
+            assert!(!s.shard_cols_match_dist_key(&[0, 1, 2]), "{p:?}: full PK");
+            assert!(!s.shard_cols_match_dist_key(&[0]), "{p:?}: leading column");
+            assert!(!s.shard_cols_match_dist_key(&[]), "{p:?}: empty key");
+        }
     }
 
     fn two_col_schema(col1_nullable: u8) -> SchemaDescriptor {

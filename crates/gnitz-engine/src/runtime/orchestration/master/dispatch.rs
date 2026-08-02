@@ -33,27 +33,27 @@ pub(crate) fn scan_spec_route(disp_ptr: *mut MasterDispatcher, target_id: i64, s
 }
 
 /// The one worker that can answer this read, or `None` when nothing proves one —
-/// a non-`PkRange` bound, a forged descriptor (left for the worker to reject at
-/// the trust boundary), or a range spanning partitions. An `IndexRange` bound is
-/// never confined: a secondary index is one unpartitioned table per worker, so
-/// nothing derives its owner from the key. A relation replicated in full on every
-/// worker never reaches here — [`scan_spec_route`] unicasts it to worker 0 first.
+/// a relation whose rows are not key-placed, a non-`PkRange` bound, a forged
+/// descriptor (left for the worker to reject at the trust boundary), or a range
+/// spanning partitions. An `IndexRange` bound is never confined: a secondary index
+/// is one unpartitioned table per worker, so nothing derives its owner from the
+/// key.
 ///
 /// Only a hashed store is key-routable, and the catalog — not the master's own
 /// stores — answers whether a relation is: the master's routing depends on when
 /// the relation was built (a post-fork CREATE reports `Hashed` over the master's
 /// empty active range), so it disagrees with the workers' across a restart.
 fn confined_worker(disp_ptr: *mut MasterDispatcher, target_id: i64, seek_pk_extra: &[u8]) -> Option<usize> {
-    let cat = unsafe { &mut *(*disp_ptr).catalog };
-    // A view with any replicated source is built unhashed, so its rows are not
-    // keyed by `partition_for_pk` at all and no key names an owner.
-    let is_view = cat.dag.tables.get(&target_id)?.kind.is_view();
-    if is_view && cat.dag.view_has_replicated_source(target_id) {
+    let cat = unsafe { &*(*disp_ptr).catalog };
+    let schema = cat.get_schema_desc(target_id)?;
+    // The same predicate `build_partitioned_storage` chose the store shape with:
+    // anything but `Keyed` is built unhashed, so no key names an owner and the
+    // read cannot route against a shape the registration chose differently.
+    if !schema.placement().is_key_routed() {
         return None;
     }
     let (spec, _block) = gnitz_wire::unpack_scan_spec_extra(seek_pk_extra).ok()?;
     let desc = gnitz_wire::peek_pk_range(spec)?;
-    let schema = cat.get_schema_desc(target_id)?;
     let partition = crate::catalog::scan_spec_partition(&schema, &desc)?;
     Some(worker_for_partition(partition, unsafe { (*disp_ptr).num_workers }))
 }

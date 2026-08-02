@@ -135,7 +135,7 @@ impl EmitCtx<'_> {
     /// Read through `loaded` rather than cached, so the compile-time flag and the
     /// runtime decision cannot drift apart.
     fn replicated(&self) -> bool {
-        self.loaded.out_schema.replicated()
+        self.loaded.out_schema.placement().is_replicated()
     }
 
     /// Box `func`, keep it alive in `owned_funcs`, and return a raw pointer into

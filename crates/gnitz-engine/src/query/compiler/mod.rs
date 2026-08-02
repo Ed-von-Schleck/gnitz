@@ -568,16 +568,12 @@ mod tests {
         // Two single-PK (U64) join sides; the join key is a NON-PK payload column
         // (col 1), so neither side's shard key matches its distribution prefix —
         // the only reason to skip the exchange is replication.
-        let base = || {
-            SchemaDescriptor::new(
-                &[
-                    SchemaColumn::new(type_code::U64, 0),
-                    SchemaColumn::new(type_code::I64, 0),
-                ],
-                &[0],
-            )
-        };
-        let replicated = base().with_replicated(true);
+        const COLS: [SchemaColumn; 2] = [
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ];
+        let base = || SchemaDescriptor::new(&COLS, &[0]);
+        let replicated = SchemaDescriptor::new_with_placement(&COLS, &[0], crate::schema::Placement::Replicated);
         let join_on_payload = || {
             let mut m = HashMap::new();
             m.insert(7i64, vec![(1i32, 0u8)]); // dim  shards on payload col 1

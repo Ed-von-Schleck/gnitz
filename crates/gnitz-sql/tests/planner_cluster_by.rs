@@ -14,6 +14,7 @@
 
 mod common;
 use common::*;
+use gnitz_core::GnitzClient;
 use gnitz_test_harness::ServerHandle;
 
 // ── DDL validation: CLUSTER BY must be a leading PK prefix ───────────────────
@@ -498,4 +499,405 @@ fn cluster_by_default_parity_multiworker() {
         vec![vec![1, 1, 11, 110], vec![1, 2, 12, 120]],
         "default full-PK distribution still co-partitions a full-PK join correctly",
     );
+}
+
+// ── A linear view over a proper prefix addresses its rows where it made them ──
+
+// `t(a, b, v) PRIMARY KEY (a, b) CLUSTER BY a`: 100 rows over 20 distinct `a`
+// values, 5 per group, every `v` positive.
+//
+// A linear view emits no exchange, so its rows are produced on whichever worker
+// holds the source row — `partition_for_pk(OPK(a))`'s. Building that view's
+// schema with the full-PK distribution instead addressed them by
+// `partition_for_pk(OPK(a‖b))`, and the ~3/4 of them whose two hashes name
+// different workers left through the view store's non-local ingest skip. The
+// view inherits its source's placement, so placement and addressing are one
+// value; every assertion below is a whole-multiset, weight-exact compare, since
+// "the right values are present" is what a partial store still looks like.
+
+fn create_t(client: &mut GnitzClient, sn: &str) {
+    exec(
+        client,
+        sn,
+        "CREATE TABLE t (a BIGINT UNSIGNED, b BIGINT UNSIGNED, v BIGINT NOT NULL, \
+         PRIMARY KEY (a, b)) CLUSTER BY a",
+    );
+}
+
+fn insert_t(client: &mut GnitzClient, sn: &str) {
+    insert_rows(client, sn, "t", &["a", "b", "v"], &t_expected());
+}
+
+/// `t`'s full contents as sorted `[a, b, v]` tuples.
+fn t_expected() -> Vec<Vec<i64>> {
+    let mut rows: Vec<Vec<i64>> = (1..=20i64)
+        .flat_map(|a| (1..=5i64).map(move |b| vec![a, b, a * 100 + b]))
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// Project columns `cols` (by index into `[a, b, v]`) out of `t`'s contents.
+fn t_projected(cols: &[usize]) -> Vec<Vec<i64>> {
+    let mut rows: Vec<Vec<i64>> = t_expected()
+        .iter()
+        .map(|r| cols.iter().map(|&c| r[c]).collect())
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// Every exchange-free projection shape over `t`: the plain filter, the
+/// projection that drops both PK columns (which takes `place_pk_front`'s
+/// auto-prepend arm), a view over a view, a derived table, and the CTE spelling
+/// of the same — the derived/CTE forms lower through the hidden-segment chain,
+/// a different path from a directly named view.
+fn create_linear_views(client: &mut GnitzClient, sn: &str) {
+    exec(client, sn, "CREATE VIEW mv AS SELECT a, b, v FROM t WHERE v > 0");
+    exec(client, sn, "CREATE VIEW mv_pk AS SELECT v FROM t");
+    exec(client, sn, "CREATE VIEW mv2 AS SELECT a, b FROM mv");
+    exec(
+        client,
+        sn,
+        "CREATE VIEW mvd AS SELECT a, b FROM (SELECT a, b, v FROM t WHERE v > 0) d",
+    );
+    exec(
+        client,
+        sn,
+        "CREATE VIEW mvc AS WITH x AS (SELECT a, b, v FROM t WHERE v > 0) SELECT a, b FROM x",
+    );
+}
+
+fn assert_linear_views_complete(client: &mut GnitzClient, sn: &str, when: &str) {
+    assert_eq!(
+        query_rows_weighted(client, sn, "SELECT * FROM mv", &["a", "b", "v"]),
+        at_weight_one(&t_expected()),
+        "mv holds every source row exactly once ({when})",
+    );
+    assert_eq!(
+        query_rows_weighted(client, sn, "SELECT * FROM mv_pk", &["v"]),
+        at_weight_one(&t_projected(&[2])),
+        "a projection that drops both PK columns keeps every row ({when})",
+    );
+    let ab = at_weight_one(&t_projected(&[0, 1]));
+    assert_eq!(
+        query_rows_weighted(client, sn, "SELECT * FROM mv2", &["a", "b"]),
+        ab,
+        "a view over the view inherits the same placement ({when})",
+    );
+    assert_eq!(
+        query_rows_weighted(client, sn, "SELECT * FROM mvd", &["a", "b"]),
+        ab,
+        "the derived-table form ({when})",
+    );
+    assert_eq!(
+        query_rows_weighted(client, sn, "SELECT * FROM mvc", &["a", "b"]),
+        ab,
+        "the CTE form ({when})",
+    );
+}
+
+/// Both creation orders, on one server: views created before the data
+/// materialize tick by tick, views created after it are backfilled.
+#[test]
+fn cluster_by_prefix_linear_view_multiworker() {
+    let srv = match ServerHandle::start_n(4) {
+        Some(s) => s,
+        None => return,
+    };
+    for when in ["incremental", "backfill"] {
+        let (mut client, sn) = make_planner(&srv);
+        create_t(&mut client, &sn);
+        if when == "incremental" {
+            create_linear_views(&mut client, &sn);
+            insert_t(&mut client, &sn);
+        } else {
+            insert_t(&mut client, &sn);
+            create_linear_views(&mut client, &sn);
+        }
+        assert_linear_views_complete(&mut client, &sn, when);
+    }
+}
+
+// A keyed read of such a view seeks the one worker its key names, so it answers
+// only if the row was placed there too; and a DELETE's retraction must reach the
+// same store slot the insert did, or the view keeps a ghost.
+#[test]
+fn cluster_by_prefix_linear_view_keyed_reads_and_retraction_multiworker() {
+    let srv = match ServerHandle::start_n(4) {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    create_t(&mut client, &sn);
+    exec(&mut client, &sn, "CREATE VIEW mv AS SELECT a, b, v FROM t WHERE v > 0");
+    insert_t(&mut client, &sn);
+
+    for row in t_expected() {
+        let (a, b, v) = (row[0], row[1], row[2]);
+        assert_eq!(
+            query_rows_weighted(
+                &mut client,
+                &sn,
+                &format!("SELECT * FROM mv WHERE a = {a} AND b = {b}"),
+                &["a", "b", "v"],
+            ),
+            vec![vec![a, b, v, 1]],
+            "point read of ({a}, {b})",
+        );
+    }
+    let group7: Vec<Vec<i64>> = t_expected().into_iter().filter(|r| r[0] == 7).collect();
+    assert_eq!(
+        query_rows_weighted(&mut client, &sn, "SELECT * FROM mv WHERE a = 7", &["a", "b", "v"]),
+        at_weight_one(&group7),
+        "a whole distribution-prefix group reads back complete",
+    );
+
+    assert_eq!(
+        affected(&mut client, &sn, "DELETE FROM t WHERE b >= 4"),
+        40,
+        "two of the five b values per group are deleted",
+    );
+    let base = query_rows_weighted(&mut client, &sn, "SELECT * FROM t", &["a", "b", "v"]);
+    assert_eq!(base.len(), 60, "the base keeps the surviving rows");
+    assert!(base.iter().all(|r| r[3] == 1), "base weights stay 1: {base:?}");
+    assert_eq!(
+        query_rows_weighted(&mut client, &sn, "SELECT * FROM mv", &["a", "b", "v"]),
+        base,
+        "the retraction reaches the same view slot the insert did — row for row, weight for weight",
+    );
+}
+
+// Downstream of such a view: a GROUP BY on the inherited distribution prefix, a
+// GROUP BY on a non-prefix column (the control that still exchanges), and a join
+// keyed on the prefix. All three consume the view's delta stream, so they must
+// equal a full recompute over the source.
+#[test]
+fn cluster_by_prefix_view_downstream_multiworker() {
+    let srv = match ServerHandle::start_n(4) {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    create_t(&mut client, &sn);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE u (id BIGINT UNSIGNED PRIMARY KEY, w BIGINT NOT NULL)",
+    );
+    exec(&mut client, &sn, "CREATE VIEW mv AS SELECT a, b, v FROM t WHERE v > 0");
+    // Exchange-seeding views are created before the data: a live multi-worker
+    // backfill of one is a separate, unsupported path (see the GROUP BY tests
+    // above), so they materialize incrementally tick by tick.
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW gv_a AS SELECT a AS ka, COUNT(*) AS n, SUM(v) AS s FROM mv GROUP BY a",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW gv_b AS SELECT b AS kb, COUNT(*) AS n, SUM(v) AS s FROM mv GROUP BY b",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW mj AS SELECT m.a AS ka, m.b AS kb, u.w AS w FROM mv m JOIN u ON m.a = u.id",
+    );
+
+    let u_rows: Vec<Vec<i64>> = (1..=20i64).map(|id| vec![id, id * 7]).collect();
+    insert_rows(&mut client, &sn, "u", &["id", "w"], &u_rows);
+    insert_t(&mut client, &sn);
+
+    let mut want_a: Vec<Vec<i64>> = (1..=20i64).map(|a| vec![a, 5, 5 * a * 100 + 15]).collect();
+    want_a.sort();
+    assert_eq!(
+        payload_rows(&mut client, &sn, "gv_a", &["ka", "n", "s"]),
+        want_a,
+        "GROUP BY the inherited distribution prefix aggregates every group",
+    );
+    let mut want_b: Vec<Vec<i64>> = (1..=5i64).map(|b| vec![b, 20, 210 * 100 + 20 * b]).collect();
+    want_b.sort();
+    assert_eq!(
+        payload_rows(&mut client, &sn, "gv_b", &["kb", "n", "s"]),
+        want_b,
+        "GROUP BY a non-prefix column still exchanges and stays correct",
+    );
+    let mut want_j: Vec<Vec<i64>> = t_expected().iter().map(|r| vec![r[0], r[1], r[0] * 7]).collect();
+    want_j.sort();
+    assert_eq!(
+        payload_rows(&mut client, &sn, "mj", &["ka", "kb", "w"]),
+        want_j,
+        "a join keyed on the inherited prefix matches every row",
+    );
+}
+
+// ── k = 2: the prefix a GROUP BY cannot reproduce ────────────────────────────
+
+// `CLUSTER BY a, b` on a 3-column PK. `GROUP BY a, b` folds two group columns
+// into an Xxh3 u128 unrelated to the prefix's route key, so eliding the shard —
+// which also elides the output IPC — would leave each group's aggregate on the
+// input's worker while the output store addresses it elsewhere. The base-table
+// form is the reproduction (3 of 18 groups before the elision was narrowed); the
+// view form is the regression guard, since repairing the linear view's placement
+// is exactly what makes it match `shard_cols_match_dist_key` and lets the
+// elision fire on it too.
+#[test]
+fn cluster_by_two_col_prefix_group_by_multiworker() {
+    let srv = match ServerHandle::start_n(4) {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t3 (a BIGINT UNSIGNED, b BIGINT UNSIGNED, c BIGINT UNSIGNED, \
+         v BIGINT NOT NULL, PRIMARY KEY (a, b, c)) CLUSTER BY a, b",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW v3 AS SELECT a, b, c, v FROM t3 WHERE v > 0",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW g3_base AS SELECT a AS ka, b AS kb, COUNT(*) AS n FROM t3 GROUP BY a, b",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW g3_view AS SELECT a AS ka, b AS kb, COUNT(*) AS n FROM v3 GROUP BY a, b",
+    );
+
+    // 3 × 6 × 2 = 36 rows over 18 `(a, b)` groups of 2.
+    let mut rows: Vec<Vec<i64>> = Vec::new();
+    for a in 1..=3i64 {
+        for b in 1..=6i64 {
+            for c in 1..=2i64 {
+                rows.push(vec![a, b, c, a * 10000 + b * 100 + c]);
+            }
+        }
+    }
+    rows.sort();
+    insert_rows(&mut client, &sn, "t3", &["a", "b", "c", "v"], &rows);
+
+    assert_eq!(
+        query_rows_weighted(&mut client, &sn, "SELECT * FROM v3", &["a", "b", "c", "v"]),
+        at_weight_one(&rows),
+        "a linear view over a k=2 prefix table keeps all 36 rows",
+    );
+    let mut want: Vec<Vec<i64>> = (1..=3i64)
+        .flat_map(|a| (1..=6i64).map(move |b| vec![a, b, 2]))
+        .collect();
+    want.sort();
+    for view in ["g3_base", "g3_view"] {
+        assert_eq!(
+            payload_rows(&mut client, &sn, view, &["ka", "kb", "n"]),
+            want,
+            "{view}: GROUP BY a 2-column distribution prefix returns every group",
+        );
+    }
+}
+
+// The elision arms a narrowing to `out_key != SyntheticFold` would break. A
+// single *signed* prefix column keys `SyntheticFold` (only U64/U128/UUID are
+// natural reduce keys) and is nonetheless correct, because a one-column group key
+// IS the route key. `CLUSTER BY a, b, c` on a 3-column PK is `k == |PK|`, which
+// normalizes to the full-PK default — not a prefix case at all — and keys
+// `PkPermutation`; it pins the pre-existing full-PK elision.
+#[test]
+fn cluster_by_group_by_elision_arms_multiworker() {
+    let srv = match ServerHandle::start_n(4) {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE ts (a BIGINT, b BIGINT UNSIGNED, c BIGINT UNSIGNED, v BIGINT NOT NULL, \
+         PRIMARY KEY (a, b, c)) CLUSTER BY a",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE tf (a BIGINT UNSIGNED, b BIGINT UNSIGNED, c BIGINT UNSIGNED, v BIGINT NOT NULL, \
+         PRIMARY KEY (a, b, c)) CLUSTER BY a, b, c",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW gs AS SELECT a AS ka, COUNT(*) AS n, SUM(v) AS s FROM ts GROUP BY a",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW gf AS SELECT a AS ka, b AS kb, c AS kc, COUNT(*) AS n FROM tf GROUP BY a, b, c",
+    );
+
+    // `a` straddles zero, so the OPK sign-flip is exercised rather than assumed.
+    let a_vals = [-3i64, -2, -1, 1, 2, 3];
+    let mut rows: Vec<Vec<i64>> = Vec::new();
+    for &a in &a_vals {
+        for b in 1..=3i64 {
+            for c in 1..=2i64 {
+                rows.push(vec![a, b, c, b * 10 + c]);
+            }
+        }
+    }
+    insert_rows(&mut client, &sn, "ts", &["a", "b", "c", "v"], &rows);
+    // `tf`'s `a` is unsigned, so shift the same shape above zero.
+    let f_rows: Vec<Vec<i64>> = rows.iter().map(|r| vec![r[0] + 4, r[1], r[2], r[3]]).collect();
+    insert_rows(&mut client, &sn, "tf", &["a", "b", "c", "v"], &f_rows);
+
+    let per_group_sum: i64 = (1..=3i64).flat_map(|b| (1..=2i64).map(move |c| b * 10 + c)).sum();
+    let mut want_s: Vec<Vec<i64>> = a_vals.iter().map(|&a| vec![a, 6, per_group_sum]).collect();
+    want_s.sort();
+    assert_eq!(
+        payload_rows(&mut client, &sn, "gs", &["ka", "n", "s"]),
+        want_s,
+        "a single SIGNED prefix column groups locally and returns every group",
+    );
+    let mut want_f: Vec<Vec<i64>> = rows.iter().map(|r| vec![r[0] + 4, r[1], r[2], 1]).collect();
+    want_f.sort();
+    assert_eq!(
+        payload_rows(&mut client, &sn, "gf", &["ka", "kb", "kc", "n"]),
+        want_f,
+        "GROUP BY the full PK (k == |PK|, the default) keeps its elision and every group",
+    );
+}
+
+// The shapes that were already whole: `CLUSTER BY` the entire PK, and no clause
+// at all. Both normalize to the full-PK default, so a linear view over either
+// addresses its rows exactly where it made them.
+#[test]
+fn linear_view_over_full_pk_distribution_multiworker() {
+    let srv = match ServerHandle::start_n(4) {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    for (tbl, clause) in [("cb", " CLUSTER BY a, b"), ("nc", "")] {
+        exec(
+            &mut client,
+            &sn,
+            &format!(
+                "CREATE TABLE {tbl} (a BIGINT UNSIGNED, b BIGINT UNSIGNED, v BIGINT NOT NULL, \
+                 PRIMARY KEY (a, b)){clause}"
+            ),
+        );
+        exec(
+            &mut client,
+            &sn,
+            &format!("CREATE VIEW mv_{tbl} AS SELECT a, b, v FROM {tbl} WHERE v > 0"),
+        );
+        insert_rows(&mut client, &sn, tbl, &["a", "b", "v"], &t_expected());
+        assert_eq!(
+            query_rows_weighted(&mut client, &sn, &format!("SELECT * FROM mv_{tbl}"), &["a", "b", "v"]),
+            at_weight_one(&t_expected()),
+            "{tbl}: a full-PK-distributed source's linear view keeps every row",
+        );
+    }
 }

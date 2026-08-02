@@ -10,21 +10,20 @@ use super::*;
 /// SAL can carry, and `hook_column_alter` plus the register hooks under boot
 /// replay / worker `ddl_sync` run on paths that skip the DDL precheck entirely.
 ///
-/// `dist_prefix_len` is the persisted distribution prefix length `k`
-/// (`0` = default = full PK; clamped by `new_with_dist`). The table-register
-/// path passes the decoded `k`; the view path passes the full-PK default
-/// (views are not distributed by a chosen key).
+/// `placement` is where the relation's rows live: the table-register path folds
+/// it out of `TABLE_TAB.flags`, the view path out of its sources' own stamped
+/// placements (`DagEngine::view_placement`).
 pub(crate) fn build_schema_from_col_defs(
     col_defs: &[ColumnDef],
     pk_cols: &[u32],
-    dist_prefix_len: usize,
+    placement: Placement,
 ) -> Result<SchemaDescriptor, String> {
     check_col_defs(col_defs)?;
     let cols: Vec<SchemaColumn> = col_defs
         .iter()
         .map(|cd| SchemaColumn::new(cd.type_code, cd.is_nullable as u8))
         .collect();
-    Ok(SchemaDescriptor::new_with_dist(&cols, pk_cols, dist_prefix_len))
+    Ok(SchemaDescriptor::new_with_placement(&cols, pk_cols, placement))
 }
 
 impl CatalogEngine {

@@ -6,7 +6,7 @@
 //! validation in `WildcardRewrite::for_item`.
 
 use gnitz_core::{GnitzClient, Schema};
-use gnitz_sql::{GnitzSqlError, SqlPlanner};
+use gnitz_sql::GnitzSqlError;
 use gnitz_test_harness::ServerHandle;
 
 mod common;
@@ -16,14 +16,6 @@ use common::*;
 /// modifiers only ever touch these; a hidden synthetic/PK slot is invisible.
 fn view_schema(client: &mut GnitzClient, sn: &str, view: &str) -> Schema {
     client.resolve_table_or_view_id(sn, view).unwrap().1
-}
-
-fn select_rows(client: &mut GnitzClient, sn: &str, sql: &str) -> (gnitz_core::Schema, gnitz_core::ZSetBatch) {
-    let mut p = SqlPlanner::new(client, sn);
-    match p.execute(sql).unwrap().pop().unwrap() {
-        gnitz_sql::SqlResult::Rows { schema, batch } => (schema, batch),
-        other => panic!("expected Rows, got {other:?}"),
-    }
 }
 
 // ── Single-table CREATE VIEW ─────────────────────────────────────────────────
@@ -567,7 +559,7 @@ fn test_direct_select_except() {
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
     );
     exec(&mut client, &sn, "INSERT INTO t VALUES (1, 10, 100), (2, 20, 200)");
-    let (s, b) = select_rows(&mut client, &sn, "SELECT * EXCEPT (a) FROM t");
+    let (s, b) = read_sql(&mut client, &sn, "SELECT * EXCEPT (a) FROM t");
     // The read path hidden-prepends the source PK, so check the user-visible set.
     assert_eq!(
         s.visible_columns()
@@ -592,7 +584,7 @@ fn test_direct_select_rename() {
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
     );
     exec(&mut client, &sn, "INSERT INTO t VALUES (1, 10)");
-    let (s, _) = select_rows(&mut client, &sn, "SELECT * RENAME (a AS x) FROM t");
+    let (s, _) = read_sql(&mut client, &sn, "SELECT * RENAME (a AS x) FROM t");
     assert_eq!(
         s.visible_columns()
             .map(|(_, c)| c.name.to_lowercase())

@@ -9,7 +9,7 @@ use std::rc::Rc;
 use crate::ops;
 use crate::query::compiler::{self, CompileOutput, SubPlan};
 use crate::query::vm;
-use crate::schema::SchemaDescriptor;
+use crate::schema::{Placement, SchemaDescriptor};
 use crate::storage::{Batch, PartitionedTable, ReadCursor, RecoverySource, StorageError, Table};
 use gnitz_wire::PkColList;
 

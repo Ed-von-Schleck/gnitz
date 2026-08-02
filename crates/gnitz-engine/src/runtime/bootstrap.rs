@@ -250,7 +250,7 @@ fn recover_from_sal(
             // Broadcast, not sliced: every slot holds the whole copy, so a second
             // reader would re-ingest the same rows and add their weights again. Never
             // re-sliced either — this worker needs the full copy, not a share of it.
-            let replicated = schema.replicated();
+            let replicated = schema.placement().is_replicated();
             if replicated && idx > 0 {
                 return Ok(false);
             }

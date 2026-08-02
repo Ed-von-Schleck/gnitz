@@ -243,12 +243,14 @@ impl DagEngine {
         bases
     }
 
-    /// True iff `id`'s output is a full copy on every worker — the bit stamped on
-    /// its schema at registration. The one spelling of the replication probe, so
-    /// the write broadcast, the read single-sourcing, and the store shape all read
-    /// one answer.
+    /// True iff `id`'s output is a full copy on every worker — read off the
+    /// [`Placement`] stamped on its schema at registration. The one spelling of the
+    /// replication probe, so the write broadcast, the read single-sourcing, and the
+    /// store shape all read one answer.
     pub(crate) fn relation_is_replicated(&self, id: i64) -> bool {
-        self.tables.get(&id).is_some_and(|e| e.schema.replicated())
+        self.tables
+            .get(&id)
+            .is_some_and(|e| e.schema.placement().is_replicated())
     }
 
     /// Every registered view id.
@@ -260,32 +262,65 @@ impl DagEngine {
             .collect()
     }
 
-    /// `(any source replicated, every source replicated)` for view `view_id`,
-    /// off the reverse dependency map (which records exactly
-    /// `circuit.dependencies()`), so it costs no circuit load and no allocation.
+    /// Where a view's rows live, folded from its `sources`' **stamped**
+    /// placements. `pk_arity` is the view's own declared PK column count (it is
+    /// not registered yet, so the arity cannot be read back off `self.tables`).
     ///
-    /// The `any` half is the flag `build_partitioned_storage` routes on: such a
-    /// view is built unhashed, so its whole local output sits in one child store
-    /// and its rows are NOT keyed by `partition_for_pk`; no key-derived routing
-    /// decision holds for it. The `all` half is the view's own stamped
-    /// `replicated` bit — strictly stronger, and false for a sourceless view.
-    /// Both come from one walk so the two can never be read off different lists.
-    pub(crate) fn source_replication(&mut self, view_id: i64) -> (bool, bool) {
-        self.get_dep_map();
-        let Some(sources) = self.dep.reverse.get(&view_id) else {
-            return (false, false);
+    /// Reading the sources' stamped placement rather than re-deriving "has a
+    /// replicated source" from the direct sources is what makes the property
+    /// transitive: `hook_view_register` registers a view after every view it
+    /// scans, so each source's answer is already stamped when this runs.
+    ///
+    /// The `Local` arm is deliberately conservative — a view whose source is
+    /// `Local` is `Local` even when its own exchange would re-key it. That
+    /// direction is always safe (an unhashed store holds every local row; the read
+    /// gathers all workers) and it avoids a second, subtler predicate for "does
+    /// this exchange actually run at runtime".
+    pub(crate) fn view_placement(&mut self, view_id: i64, sources: &[i64], pk_arity: usize) -> Placement {
+        // An unregistered source cannot be proven replicated or local, so it reads
+        // as the keyed default — the same answer the pre-fold `replicated` probe
+        // gave for a missing entry. A sourceless view computes nothing from
+        // anywhere and keeps that default too.
+        let placement_of = |t: &i64| {
+            self.tables
+                .get(t)
+                .map_or(Placement::KEYED_DEFAULT, |e| e.schema.placement())
         };
-        let replicated = |tid: &i64| self.tables.get(tid).is_some_and(|e| e.schema.replicated());
-        (
-            sources.iter().any(replicated),
-            !sources.is_empty() && sources.iter().all(replicated),
-        )
-    }
+        if sources.is_empty() {
+            return Placement::KEYED_DEFAULT;
+        }
+        // Every source in full on every worker ⇒ the view computes its whole
+        // result locally on every worker and the read single-sources worker 0.
+        if sources.iter().map(placement_of).all(|p| p.is_replicated()) {
+            return Placement::Replicated;
+        }
+        // Any source that is not key-routed places this view's rows on the worker
+        // that produced them, not on the one its key names.
+        if sources.iter().map(placement_of).any(|p| !p.is_key_routed()) {
+            return Placement::Local;
+        }
 
-    /// True iff view `view_id` has **any** replicated source — see
-    /// [`source_replication`](Self::source_replication).
-    pub(crate) fn view_has_replicated_source(&mut self, view_id: i64) -> bool {
-        self.source_replication(view_id).0
+        // Every source is `Keyed`. A single-source view that seeds no exchange
+        // re-emits that source's PK region verbatim, so its rows sit on the worker
+        // owning the *source's* distribution prefix and it must address them the
+        // same way. `pk_arity == |source PK|` stands in for "the view's PK region
+        // **is** the source's", which the planner's PK placement guarantees; the
+        // exchange-free linear emitter is the only shape that reaches here, since
+        // every other emits an `ExchangeShard` or a `Join` and
+        // `view_seeds_exchange_backfill` catches both.
+        //
+        // The arity test comes first: it is a map lookup, where
+        // `view_seeds_exchange_backfill` can cost a circuit-metadata load.
+        let [src] = sources else {
+            return Placement::KEYED_DEFAULT;
+        };
+        let placement = placement_of(src);
+        let n = self.tables.get(src).map_or(0, |e| e.schema.pk_indices().len());
+        if pk_arity == n && !self.view_seeds_exchange_backfill(view_id) {
+            placement
+        } else {
+            Placement::KEYED_DEFAULT
+        }
     }
 
     // ── ViewMeta (plan-free circuit metadata) ───────────────────────────

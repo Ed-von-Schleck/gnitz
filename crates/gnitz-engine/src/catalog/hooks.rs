@@ -208,14 +208,14 @@ impl CatalogEngine {
         name: &str,
         id: i64,
         schema: SchemaDescriptor,
-        unhashed: bool,
     ) -> Result<PartitionedTable, String> {
-        // An `unhashed` relation — a replicated base table, or a view over any
-        // replicated source — holds its whole local dataset in one child, because
-        // its rows are not keyed by `partition_for_pk`. A 256-partition store
-        // trimmed to the worker's range would silently drop every row whose key
-        // partition the worker does not own. How such a store is read (single-source
-        // vs union-gather) is the read path's decision, not the store shape's.
+        // A relation whose stamped placement is not `Keyed` — a replicated base
+        // table, or a view over any source that is itself not keyed — holds its
+        // whole local dataset in one child, because its rows are not placed by
+        // `partition_for_pk`. A 256-partition store trimmed to the worker's range
+        // would silently drop every row whose key partition the worker does not
+        // own. How such a store is read (single-source vs union-gather) is the
+        // read path's decision, not the store shape's.
         //
         // The single child is homed at THIS process's own worker rank (see
         // `PartitionedTable::new`), so a live CREATE on each worker post-fork
@@ -223,7 +223,7 @@ impl CatalogEngine {
         // empty active range (the post-fork master, `[0, 0)`): there the master
         // builds zero child Tables and stays inert via the `tables.is_empty()`
         // guards.
-        let routing = if unhashed && self.owns_partitions() {
+        let routing = if !schema.placement().is_key_routed() && self.owns_partitions() {
             Routing::Unhashed {
                 rank: crate::foundation::worker_ctx::worker_rank(),
             }
@@ -259,37 +259,20 @@ impl CatalogEngine {
                 }
 
                 let (sid, name, pk, flags) = read_table_tab_row(batch, i);
-                // Distribution prefix length k (0 = default = full PK).
-                // `new_with_dist` clamps an out-of-range k, so a crafted flag
-                // cannot index out of bounds.
-                let dist_prefix_len = gnitz_wire::table_flags_dist_prefix(flags);
-                // Replicated: a full copy on every worker (single partition 0).
-                // Rides on the SchemaDescriptor so the write scatter, read gather,
-                // join co-partition analyzer, and bootstrap trim all see it.
-                let is_replicated = gnitz_wire::table_flags_replicated(flags);
-
-                // REPLICATED and a non-default CLUSTER BY prefix are mutually
-                // exclusive — a hash-distribution prefix is meaningless when every
-                // worker holds the full copy. The flags word cannot make the conflict
-                // unrepresentable (`replicated` is a bit, `k` a byte), so the planner
-                // rejects it; re-check at the catalog trust boundary so a crafted or
-                // corrupt row can never build a schema that is both replicated and
-                // prefix-distributed (consumers branch on the two bits independently).
-                if is_replicated && dist_prefix_len != 0 {
-                    return Err(format!(
-                        "catalog invariant violated: table '{name}' (tid={tid}) is \
-                         REPLICATED with a non-default distribution prefix \
-                         (k={dist_prefix_len}); these are mutually exclusive.",
-                    ));
-                }
+                // The one value that answers where this table's rows live — the
+                // store shape, the write scatter, the read routing, and the
+                // co-partition analyzers all read it back off the schema.
+                // `new_with_placement` clamps an out-of-range prefix, so a crafted
+                // flag cannot index out of bounds.
+                let placement = Placement::from_table_flags(flags)
+                    .map_err(|e| format!("catalog invariant violated: table '{name}' (tid={tid}) is {e}."))?;
 
                 let col_defs = self.read_column_defs(tid);
                 validate_relation_defs("table", tid, &name, &col_defs, &pk)?;
 
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
                 let directory = table_dir(&self.base_dir, &schema_name, tid);
-                let tbl_schema = build_schema_from_col_defs(&col_defs, pk.as_slice(), dist_prefix_len)?
-                    .with_replicated(is_replicated);
+                let tbl_schema = build_schema_from_col_defs(&col_defs, pk.as_slice(), placement)?;
 
                 // One kind drives the property bundle: recovery source, and what
                 // only base tables do (PK enforcement, secondary indexes).
@@ -304,7 +287,7 @@ impl CatalogEngine {
                 // Staged so that if Stage-A fails after the table directory
                 // is created, compensate_stage_a's drain removes it.
                 let pt = self.with_staged_dir(directory.clone(), |s| {
-                    s.build_partitioned_storage(kind, &directory, &name, tid, tbl_schema, is_replicated)
+                    s.build_partitioned_storage(kind, &directory, &name, tid, tbl_schema)
                 })?;
 
                 fsync_dir(&schema_dir(&self.base_dir, &schema_name));
@@ -437,14 +420,13 @@ impl CatalogEngine {
                 continue;
             }
             let cur = entry.schema;
-            // Rebuild from the post-invalidate col defs, re-applying the routing
-            // fields `eq` ignores (replicated / dist_prefix_len). Only an
-            // is_nullable 0→1 flip changes the descriptor; when it does, publish
-            // infallibly in place (equal-region descriptor swap).
+            // Rebuild from the post-invalidate col defs, carrying the placement
+            // `eq` ignores. Only an is_nullable 0→1 flip changes the descriptor;
+            // when it does, publish infallibly in place (equal-region descriptor
+            // swap).
             let col_defs = self.read_column_defs(owner);
-            let rebuilt = build_schema_from_col_defs(&col_defs, cur.pk_indices(), cur.dist_prefix_len() as usize)
-                .map_err(|e| format!("column ALTER on table id={owner}: {e}"))?
-                .with_replicated(cur.replicated());
+            let rebuilt = build_schema_from_col_defs(&col_defs, cur.pk_indices(), cur.placement())
+                .map_err(|e| format!("column ALTER on table id={owner}: {e}"))?;
             if rebuilt != cur {
                 self.dag.swap_table_schema(owner, rebuilt);
             }
@@ -455,10 +437,10 @@ impl CatalogEngine {
     /// Row indices in the order [`hook_view_register`](Self::hook_view_register)
     /// must process them: retractions first (as `fire_hooks` hands them over),
     /// then the live rows in dependency order, since registering a view reads its
-    /// sources' `replicated` bit and `depth`. Neither order the hook actually sees
-    /// is dependency order — boot replay walks VIEW_TAB in PK order, in which a
-    /// chain's user-named view sorts *before* the hidden segments it scans (its id
-    /// is minted before the body is bound). Without this a view is replicated
+    /// sources' stamped `Placement` and `depth`. Neither order the hook actually
+    /// sees is dependency order — boot replay walks VIEW_TAB in PK order, in which
+    /// a chain's user-named view sorts *before* the hidden segments it scans (its
+    /// id is minted before the body is bound). Without this a view is replicated
     /// before a restart and partitioned after.
     fn view_row_order(&mut self, batch: &Batch) -> Vec<usize> {
         let mut rows: Vec<usize> = (0..batch.count).filter(|&i| batch.get_weight(i) <= 0).collect();
@@ -514,28 +496,19 @@ impl CatalogEngine {
                 // The circuit's `circuit_nodes` are persisted before this VIEW_TAB
                 // row, so `get_source_ids` resolves here.
                 let source_ids = self.dag.get_source_ids(vid);
-                // A view's output is replicated exactly when every source it scans
-                // is: each worker then holds every input in full and computes the
-                // whole result locally (`execute_multi_worker_step` arm 1), and the
-                // read single-sources worker 0. Stamping it on the schema makes the
-                // property transitive — `view_row_order` registers this view after
-                // its sources, so a view over it reads the bit right here.
-                // The any-source half has one definition, shared with the read
-                // path's routing decision (`confined_worker`): both must see the
-                // same shape or a read routes against a store the other chose.
-                let (has_replicated_source, all_sources_replicated) = self.dag.source_replication(vid);
-                // Views are not distributed by a chosen key (§2): `0` is the
-                // full-PK default sentinel every non-CLUSTER BY caller passes.
-                let view_schema =
-                    build_schema_from_col_defs(&col_defs, pk.as_slice(), 0)?.with_replicated(all_sources_replicated);
+                // Where this view's rows live, folded from its sources' own
+                // stamped placements. Stamping the fold is what makes the property
+                // transitive — `view_row_order` registers this view after its
+                // sources, so a view over it reads the answer right here — and
+                // reading one value is what keeps the store shape, the read
+                // routing, and the co-partition analyzers from disagreeing.
+                let placement = self.dag.view_placement(vid, &source_ids, pk.as_slice().len());
+                let view_schema = build_schema_from_col_defs(&col_defs, pk.as_slice(), placement)?;
 
                 // See hook_table_register: one kind drives the bundle.
                 let kind = RelationKind::View;
-                // A view with any replicated source produces its output on the
-                // source side's worker, not the key's, so it is built unhashed —
-                // see `build_partitioned_storage`.
                 let et = self.with_staged_dir(directory.clone(), |s| {
-                    s.build_partitioned_storage(kind, &directory, &name, vid, view_schema, has_replicated_source)
+                    s.build_partitioned_storage(kind, &directory, &name, vid, view_schema)
                 })?;
 
                 let max_depth = source_ids

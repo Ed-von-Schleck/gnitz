@@ -65,14 +65,19 @@ pub fn affected(client: &mut GnitzClient, sn: &str, sql: &str) -> usize {
     }
 }
 
-/// Read `SELECT * FROM view` and return its (schema, batch).
-pub fn read_view(client: &mut GnitzClient, sn: &str, view: &str) -> (Schema, ZSetBatch) {
+/// Execute a single row-returning statement and return its (schema, batch).
+pub fn read_sql(client: &mut GnitzClient, sn: &str, sql: &str) -> (Schema, ZSetBatch) {
     let mut p = SqlPlanner::new(client, sn);
-    let mut res = p.execute(&format!("SELECT * FROM {}", view)).unwrap();
+    let mut res = p.execute(sql).unwrap();
     match res.pop().unwrap() {
         SqlResult::Rows { schema, batch } => (schema, batch),
-        _ => panic!("expected Rows"),
+        _ => panic!("expected Rows from `{sql}`"),
     }
+}
+
+/// Read `SELECT * FROM view` and return its (schema, batch).
+pub fn read_view(client: &mut GnitzClient, sn: &str, view: &str) -> (Schema, ZSetBatch) {
+    read_sql(client, sn, &format!("SELECT * FROM {}", view))
 }
 
 /// User-visible column names, lowercased — the read path hidden-prepends the
@@ -143,17 +148,63 @@ pub fn cell_i64(schema: &Schema, batch: &ZSetBatch, ci: usize, row: usize) -> i6
     }
 }
 
+/// Project `cols` out of a result, one sorted tuple per row, optionally with the
+/// row's Z-set weight appended as a trailing element.
+fn project_sorted(schema: &Schema, batch: &ZSetBatch, cols: &[&str], with_weight: bool) -> Vec<Vec<i64>> {
+    let idxs: Vec<usize> = cols.iter().map(|c| col_idx(schema, c)).collect();
+    let mut rows: Vec<Vec<i64>> = (0..batch.len())
+        .map(|r| {
+            let mut row: Vec<i64> = idxs.iter().map(|&ci| cell_i64(schema, batch, ci, r)).collect();
+            if with_weight {
+                row.push(batch.weights[r]);
+            }
+            row
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
 /// Read a view's named (integer) columns into sorted row tuples, so a test can
 /// compare incremental view contents against an expected full recompute without
 /// decoding the OPK PK region by hand.
 pub fn payload_rows(client: &mut GnitzClient, sn: &str, view: &str, cols: &[&str]) -> Vec<Vec<i64>> {
     let (schema, batch) = read_view(client, sn, view);
-    let idxs: Vec<usize> = cols.iter().map(|c| col_idx(&schema, c)).collect();
-    let mut rows: Vec<Vec<i64>> = (0..batch.len())
-        .map(|r| idxs.iter().map(|&ci| cell_i64(&schema, &batch, ci, r)).collect())
+    project_sorted(&schema, &batch, cols, false)
+}
+
+/// [`payload_rows`] for an arbitrary row-returning statement — a point read, a
+/// filtered read, or a recompute over a base table — with each row's Z-set
+/// weight appended as a trailing element. Row presence is the weaker property: a
+/// placement bug that loses rows and a weight bug that duplicates them both read
+/// as "the right values are there".
+pub fn query_rows_weighted(client: &mut GnitzClient, sn: &str, sql: &str, cols: &[&str]) -> Vec<Vec<i64>> {
+    let (schema, batch) = read_sql(client, sn, sql);
+    project_sorted(&schema, &batch, cols, true)
+}
+
+/// The expected side of a [`query_rows_weighted`] compare when every row is
+/// present exactly once: `rows` with a trailing `1`.
+pub fn at_weight_one(rows: &[Vec<i64>]) -> Vec<Vec<i64>> {
+    let mut out: Vec<Vec<i64>> = rows.iter().map(|r| r.iter().copied().chain([1]).collect()).collect();
+    out.sort();
+    out
+}
+
+/// `INSERT INTO table (cols) VALUES …` for integer row tuples.
+pub fn insert_rows(client: &mut GnitzClient, sn: &str, table: &str, cols: &[&str], rows: &[Vec<i64>]) {
+    let vals: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            let cells: Vec<String> = r.iter().map(|v| v.to_string()).collect();
+            format!("({})", cells.join(", "))
+        })
         .collect();
-    rows.sort();
-    rows
+    exec(
+        client,
+        sn,
+        &format!("INSERT INTO {table} ({}) VALUES {}", cols.join(", "), vals.join(", ")),
+    );
 }
 
 pub fn f64_at(batch: &ZSetBatch, col: usize, row: usize) -> f64 {

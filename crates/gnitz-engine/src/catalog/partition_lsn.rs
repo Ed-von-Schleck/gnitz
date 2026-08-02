@@ -94,7 +94,7 @@ impl CatalogEngine {
                 (e.directory.clone(), e.schema, e.kind)
             };
             let pt = self
-                .build_partitioned_storage(kind, &dir, "", tid, schema, true)
+                .build_partitioned_storage(kind, &dir, "", tid, schema)
                 .map_err(|e| format!("rehome unhashed store tid={tid}: {e}"))?;
             self.dag.tables.get_mut(&tid).expect("tid taken from iter").handle =
                 StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(pt)));
@@ -130,9 +130,8 @@ impl CatalogEngine {
             let Some(pt) = entry.handle.as_partitioned_mut() else {
                 continue;
             };
-            let routing = pt.routing();
-            reclaim_retired_children(&entry.directory, routing, num_workers);
-            if routing.is_unhashed() && entry.kind.is_base_table() {
+            reclaim_retired_children(&entry.directory, pt.routing(), num_workers);
+            if entry.schema.placement().is_replicated() && entry.kind.is_base_table() {
                 crate::storage::seed_missing_locals(&entry.directory, num_workers)
                     .map_err(|e| format!("seed replicated table {} copies: {e}", entry.directory))?;
             }
@@ -171,10 +170,10 @@ impl CatalogEngine {
             let _ = std::fs::remove_file(child.manifest(&dir));
         }
 
-        // Rebuild empty (same shape). Each child's `Table::new` erases the stale
-        // shards (manifest now absent → `RederiveCheckpointed` peek `None`).
-        let unhashed = matches!(routing, Routing::Unhashed { .. });
-        let pt = self.build_partitioned_storage(kind, &dir, "", vid, schema, unhashed)?;
+        // Rebuild empty (same shape — the schema's placement is what chose the
+        // routing above). Each child's `Table::new` erases the stale shards
+        // (manifest now absent → `RederiveCheckpointed` peek `None`).
+        let pt = self.build_partitioned_storage(kind, &dir, "", vid, schema)?;
         self.dag.tables.get_mut(&vid).expect("view present").handle =
             StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(pt)));
 
@@ -194,8 +193,8 @@ impl CatalogEngine {
 
     /// True iff a read of relation `id` must be **single-sourced** because its
     /// output is replicated — a full identical copy lives on every worker. Every
-    /// relation kind carries the answer on its schema (base table from
-    /// `TABLE_TAB.flags`, system catalog always, view iff all its sources are), so
+    /// relation kind carries the answer as the `Placement` stamped on its schema
+    /// (see `DagEngine::view_placement` for how a view folds its sources'), so
     /// this is one lookup. Consulted by the scan dispatch so a replicated relation
     /// is read from one worker instead of gathering N identical copies. SEEK
     /// already unicasts to one worker, so it needs no equivalent check.

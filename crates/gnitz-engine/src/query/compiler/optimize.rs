@@ -36,9 +36,11 @@ pub(super) fn compute_co_partitioned(join_shard_map: &JoinShardMap, ext_tables: 
     //     dim copy, so no exchange is needed on either side (design §4.5). This is
     //     the case hash co-partitioning cannot serve: the fact need not be
     //     distributed by the join key, so one fact can join many replicated dims.
-    let any_replicated = join_shard_map
-        .keys()
-        .any(|tid| ext_tables.get(tid).is_some_and(|schema| schema.replicated()));
+    let any_replicated = join_shard_map.keys().any(|tid| {
+        ext_tables
+            .get(tid)
+            .is_some_and(|schema| schema.placement().is_replicated())
+    });
     let mut co_partitioned = HashSet::new();
     for (&tid, cols) in join_shard_map {
         let Some(ext_schema) = ext_tables.get(&tid) else {
@@ -84,12 +86,30 @@ pub(super) fn annotate(loaded: &LoadedCircuit, ext_tables: &ExtTables) -> (JoinS
 
 /// True iff the view's output `ExchangeShard` is a no-op (every row already on
 /// the worker owning its distribution key) and the output IPC can be skipped:
-/// the shard reads a scan — through any Filter chain — whose distribution
-/// prefix (`pk_indices[..k]`) is exactly the shard key. For a default full-PK
-/// table that is the strict full-PK case; for a `CLUSTER BY prefix` table it
-/// also lets a (possibly filtered) `GROUP BY prefix` / reduce run locally —
-/// every row for a group value already lives on one worker — since this
-/// governs every single-source `ExchangeShard` view, not just joins.
+/// the shard reads a scan — through any Filter chain — whose distribution prefix
+/// (`pk_indices[..k]`) is exactly the shard key, AND the pipeline's output
+/// reproduces that shard key as its own route key.
+///
+/// The second half is what the first does not imply. Eliding the shard also
+/// elides the output IPC (`skip_output_exchange`), so the output stays on the
+/// worker that owned the input prefix's partition — sound only if the output
+/// routes back to that same partition. That holds at the two ends of `k` and
+/// nowhere between:
+///
+/// - `k == 1`: the output key is that one column's route key, the same
+///   `widen_pk_be` value `partition_for_pk_bytes` derives from the prefix
+///   (routing is invariant under left zero-padding at `len <= 16`).
+/// - `k == |PK|`: the output re-emits the source PK verbatim.
+/// - `1 < k < |PK|`: a multi-column key streams into an Xxh3 fold whose u128 is
+///   unrelated to the prefix's, so the output lands on another worker and the
+///   addressing store loses it.
+///
+/// So a `CLUSTER BY` prefix of 2+ proper-prefix columns buys no locality for a
+/// `GROUP BY` on that prefix. Testing `k` rather than the consuming node's
+/// `ReduceOutKey` keeps this independent of which operator the shard feeds: the
+/// shard key *is* the group key (`reduce_multi` hands one column slice to both),
+/// and `ReduceOutKey` alone would be the wrong discriminator anyway — a signed or
+/// narrow single prefix column keys `SyntheticFold` and is nonetheless correct.
 pub(super) fn compute_skips_exchange(loaded: &LoadedCircuit, ext_tables: &ExtTables) -> bool {
     let Some((enid, shard_cols)) = loaded.nodes.iter().find_map(|(&nid, op)| match op {
         gnitz_wire::OpNode::ExchangeShard { shard_cols } => {
@@ -102,9 +122,10 @@ pub(super) fn compute_skips_exchange(loaded: &LoadedCircuit, ext_tables: &ExtTab
     let Some(tid) = scan_tid_through_filters(loaded, enid) else {
         return false;
     };
-    ext_tables
-        .get(&tid)
-        .is_some_and(|schema| schema.shard_cols_match_dist_key(&shard_cols))
+    ext_tables.get(&tid).is_some_and(|schema| {
+        schema.shard_cols_match_dist_key(&shard_cols)
+            && (shard_cols.len() <= 1 || shard_cols.len() == schema.pk_indices().len())
+    })
 }
 
 // ---------------------------------------------------------------------------
