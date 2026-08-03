@@ -33,9 +33,9 @@ pub(super) fn compute_co_partitioned(join_shard_map: &JoinShardMap, ext_tables: 
     //     did the work the exchange would have);
     //   * a partitioned source whose join PARTNER is replicated also skips — it
     //     stays in its own PK partitioning and `cogroup`s against the full local
-    //     dim copy, so no exchange is needed on either side (design §4.5). This is
-    //     the case hash co-partitioning cannot serve: the fact need not be
-    //     distributed by the join key, so one fact can join many replicated dims.
+    //     dim copy, so no exchange is needed on either side. This is the case
+    //     hash co-partitioning cannot serve: the fact need not be distributed by
+    //     the join key, so one fact can join many replicated dims.
     let any_replicated = join_shard_map.keys().any(|tid| {
         ext_tables
             .get(tid)

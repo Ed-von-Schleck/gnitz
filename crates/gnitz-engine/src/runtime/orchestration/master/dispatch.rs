@@ -597,10 +597,11 @@ impl MasterDispatcher {
         // 0's payload alone — the same single-sourcing the read gather applies
         // (`replicated_unicast`). Dropping the copies rather than clamping keeps
         // a genuine multiplicity in the source intact. A unary side relays under
-        // `source_id == 0`, which names no relation; that case needs no rule
-        // because a view whose sources are all replicated is itself stamped
-        // replicated and computes locally without ever reaching an exchange.
-        let n_src = if cat.dag.relation_is_replicated(source_id) {
+        // `source_id == 0`, which names no relation — the guard skips a lookup
+        // that cannot hit, and such a view needs no rule anyway: one whose
+        // sources are all replicated is itself stamped replicated and computes
+        // locally without ever reaching an exchange.
+        let n_src = if source_id > 0 && cat.dag.relation_is_replicated(source_id) {
             1
         } else {
             payloads.len()

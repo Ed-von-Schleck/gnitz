@@ -1280,3 +1280,36 @@ def test_mixed_source_view_bounded_read_returns_every_row(client):
         assert [r.amount for r in rows] == [470]
     finally:
         client.drop_schema(sn)
+
+
+def test_replicated_table_has_no_size_cap(client):
+    """A replicated table may grow far past dimension scale.
+
+    Replication is meant for small dimensions, but no row or byte cap is
+    enforced: the cost of a large replicated copy — W* ingest, W* storage, scans
+    served by a single worker — is the user's to bound, not the engine's to
+    refuse. That is a decision, not an oversight, so it is pinned here. If a cap
+    is ever introduced this fails, and the trade gets made deliberately instead
+    of by default.
+    """
+    sn = "r" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL) "
+            "WITH (replicated = true)",
+            schema_name=sn,
+        )
+        tid, schema = client.resolve_table(sn, "dim")
+        n = 50_000
+        for start in range(0, n, 10_000):
+            batch = gnitz.ZSetBatch(schema)
+            for i in range(start, start + 10_000):
+                batch.append(id=i, v=i * 7)
+            client.push(tid, batch)
+
+        rows = _rows(client, sn, "SELECT v FROM dim WHERE id = 49999")
+        assert [r.v for r in rows] == [49999 * 7]
+        assert len(client.scan(tid)) == n, "every replicated row must be readable"
+    finally:
+        client.drop_schema(sn)
