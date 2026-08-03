@@ -122,7 +122,9 @@ fn gc_reclaims_orphan_table_dir() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// An orphaned view directory (`view_<name>_<vid>` shape) is reclaimed.
+// An orphaned view directory (`view_<name>_<vid>` shape) is reclaimed, as is the
+// pre-flight compile's throwaway root left by a crash mid-compile — the reason
+// `preflight_dir` puts it under a schema dir with a numeric suffix.
 #[test]
 fn gc_reclaims_orphan_view_dir() {
     let dir = temp_dir("gc_orphan_view");
@@ -133,10 +135,16 @@ fn gc_reclaims_orphan_view_dir() {
 
     let ghost = format!("{}/public/view_ghost_{}", dir, 4242);
     std::fs::create_dir_all(&ghost).unwrap();
+    let preflight = preflight_dir(&dir, "public", 4242);
+    std::fs::create_dir_all(format!("{preflight}/scratch_x_w0")).unwrap();
 
     engine.gc_orphan_directories();
 
     assert!(!Path::new(&ghost).exists(), "orphan view dir must be reclaimed");
+    assert!(
+        !Path::new(&preflight).exists(),
+        "orphaned pre-flight root must be reclaimed: {preflight}"
+    );
     assert!(Path::new(&live_dir).exists(), "live table dir must survive");
 
     engine.close();

@@ -410,33 +410,81 @@ impl DagEngine {
         self.tables.iter().map(|(&tid, te)| (tid, te.schema)).collect()
     }
 
-    /// Compile a view by reading system tables and calling `compiler::compile_view`.
-    fn compile_view_internal(&self, view_id: i64) -> Option<CompileOutput> {
-        let entry = self.tables.get(&view_id)?;
-        let view_schema = &entry.schema;
-        let view_dir = entry.directory.clone();
+    /// Read `view_id`'s circuit out of the system tables and compile it, homing
+    /// every scratch child under `view_dir`. The directory is a parameter and not
+    /// read off the entry because the pre-flight compiles into a throwaway root.
+    fn compile_circuit(
+        &self,
+        view_id: i64,
+        view_dir: &str,
+        view_schema: &SchemaDescriptor,
+    ) -> Result<CompileOutput, compiler::CompileError> {
         let ext_tables = self.ext_tables();
-
-        let result = unsafe {
+        unsafe {
             compiler::compile_view(
                 view_id as u64,
                 self.sys.nodes,
                 self.sys.edges,
                 self.sys.node_columns,
-                &view_dir,
+                view_dir,
                 view_schema,
                 &ext_tables,
             )
-        };
+        }
+    }
 
-        match result {
+    /// Decide whether a just-registered view's circuit compiles, keeping nothing.
+    /// Called on the master inside the DDL, before the bundle reaches the SAL, so
+    /// a rejection takes the ordinary ingest failure path and reaches the client
+    /// with the view never created. The worker-side compile that follows happens
+    /// after the DDL is durable and has no channel back to the waiting client.
+    ///
+    /// `root` is a throwaway directory, removed before this returns — see
+    /// `catalog::utils::preflight_dir` for why it is not the view's own.
+    ///
+    /// The verdict is worker-independent: worker context reaches the compile only
+    /// as the scratch path component (which `root` overrides), as `PartitionFilter`
+    /// and `ReducePlan` operands baked into instructions nothing here executes, and
+    /// as the committed generation a manifest-less directory makes moot.
+    pub(crate) fn preflight_compile(&self, view_id: i64, root: &str) -> Result<(), compiler::CompileError> {
+        // `hook_view_register` ran earlier in this bundle's ingest loop, so a
+        // registered `+1` VIEW_TAB row is always in `tables`; a miss is an engine
+        // bug, surfaced as a DDL rejection rather than an unchecked compile.
+        let Some(entry) = self.tables.get(&view_id) else {
+            return Err(compiler::CompileError::Rejected("pre-flight: view is not registered"));
+        };
+        // `map(drop)` closes the plan — and the `Table`s it holds open under
+        // `root` — before the directory is removed.
+        let verdict = self.compile_circuit(view_id, root, &entry.schema).map(drop);
+        let _ = std::fs::remove_dir_all(root);
+        verdict
+    }
+
+    /// Compile a view by reading system tables and calling `compiler::compile_view`.
+    ///
+    /// `None` means only "not a registered relation". A registered view's circuit
+    /// already compiled on the master under `preflight_compile` before the CREATE
+    /// was made durable, and no DDL can change that verdict afterwards: DROP COLUMN
+    /// and DROP NOT NULL on a table with dependent views are RESTRICTed, and no DDL
+    /// widens or re-types a registered column. So a rejection here is this process
+    /// failing to build the view's operator state — out of disk or file
+    /// descriptors — or an engine bug. Both are unrecoverable: the only alternative
+    /// to aborting is serving a view that is silently and permanently empty.
+    fn compile_view_internal(&self, view_id: i64) -> Option<CompileOutput> {
+        let entry = self.tables.get(&view_id)?;
+        match self.compile_circuit(view_id, &entry.directory, &entry.schema) {
             Ok(output) => {
                 gnitz_debug!("dag: compiled view_id={}", view_id);
                 Some(output)
             }
             Err(err) => {
-                gnitz_warn!("dag: compile_view rejected view_id={}: {}", view_id, err.describe());
-                None
+                gnitz_fatal_abort!(
+                    "view_id={} compiled on the master at CREATE VIEW but not here — \
+                     its operator state cannot be built on this node (out of disk or \
+                     file descriptors?), or this is an engine bug: {}",
+                    view_id,
+                    err
+                );
             }
         }
     }

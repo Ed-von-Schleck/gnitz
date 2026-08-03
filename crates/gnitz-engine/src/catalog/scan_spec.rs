@@ -630,7 +630,7 @@ fn compile_predicate(blob: &[u8], schema: &SchemaDescriptor) -> Result<ScalarFun
     let dep = gnitz_wire::decode_expr_blob(blob).ok_or("scan_spec: corrupt predicate blob")?;
     LogicalProgram::from_wire(&dep.code, dep.num_regs, dep.result_reg, dep.const_strings)
         .and_then(|p| ScalarFunc::from_predicate(p, schema))
-        .map_err(|e| format!("scan_spec: invalid predicate program: {e:?}"))
+        .map_err(|e| format!("scan_spec: invalid predicate program: {e}"))
 }
 
 /// Decode + validate a client projection (MAP) blob and build its map
@@ -646,7 +646,7 @@ fn compile_projection(
     let dep = gnitz_wire::decode_expr_blob(blob).ok_or("scan_spec: corrupt projection blob")?;
     LogicalProgram::from_wire(&dep.code, dep.num_regs, 0, dep.const_strings)
         .and_then(|p| ScalarFunc::from_map(p, in_schema, out_schema))
-        .map_err(|e| format!("scan_spec: invalid projection program: {e:?}"))
+        .map_err(|e| format!("scan_spec: invalid projection program: {e}"))
 }
 
 #[cfg(test)]

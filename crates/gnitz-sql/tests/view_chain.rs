@@ -113,7 +113,7 @@ fn chain_backfill_dependency_order() {
     let f_vid = client.alloc_table_id().unwrap();
     let views = plan_chain(h_vid, f_vid, base_tid, "chain_h", "chain_f", &cols);
 
-    let vids = client.create_view_chain(&sn, Vec::from(views)).unwrap();
+    let vids = client.create_view_chain(&sn, Vec::from(views), None).unwrap();
     assert_eq!(vids, vec![h_vid, f_vid], "vids returned in input order");
 
     let got = payload_rows(&mut client, &sn, "chain_f", &["pk", "v"]);
@@ -139,7 +139,7 @@ fn chain_backfill_row_misordered() {
     let f_vid = client.alloc_table_id().unwrap();
     let [h, f] = plan_chain(h_vid, f_vid, base_tid, "mis_h", "mis_f", &cols);
     // Consumer (f) before producer (h) in the bundle.
-    let vids = client.create_view_chain(&sn, vec![f, h]).unwrap();
+    let vids = client.create_view_chain(&sn, vec![f, h], None).unwrap();
     assert_eq!(vids, vec![f_vid, h_vid], "vids returned in input order");
 
     let got = payload_rows(&mut client, &sn, "mis_f", &["pk", "v"]);
@@ -168,7 +168,7 @@ fn chain_backfill_row_misordered_linear() {
     let f_vid = client.alloc_table_id().unwrap();
     let [h, f] = plan_chain_with(identity_linear_circuit, h_vid, f_vid, base_tid, "lin_h", "lin_f", &cols);
     // Consumer (f) before producer (h) in the bundle.
-    client.create_view_chain(&sn, vec![f, h]).unwrap();
+    client.create_view_chain(&sn, vec![f, h], None).unwrap();
 
     let got = payload_rows(&mut client, &sn, "lin_f", &["pk", "v"]);
     assert_eq!(
@@ -196,7 +196,7 @@ fn chain_atomic_rollback_on_name_collision() {
     let f_vid = client.alloc_table_id().unwrap();
     // h has a fresh name; f collides with `taken`.
     let views = plan_chain(h_vid, f_vid, base_tid, "roll_h", "taken", &cols);
-    let res = client.create_view_chain(&sn, Vec::from(views));
+    let res = client.create_view_chain(&sn, Vec::from(views), None);
     assert!(res.is_err(), "collision must fail the bundle");
 
     // Neither segment committed — the fresh hidden segment must be absent.
@@ -226,7 +226,7 @@ fn chain_drop_cascades_hidden_members() {
     // `drop_view`'s prefix scan (`__h{f_vid}_`) matches it.
     let h_name = hidden_view_name(f_vid, 0);
     let views = plan_chain(h_vid, f_vid, base_tid, &h_name, "userview", &cols);
-    client.create_view_chain(&sn, Vec::from(views)).unwrap();
+    client.create_view_chain(&sn, Vec::from(views), None).unwrap();
 
     assert!(
         client.resolve_table_or_view_id(&sn, &h_name).is_ok(),
@@ -267,7 +267,7 @@ fn chain_drop_table_restricts_under_chain() {
     let f_vid = client.alloc_table_id().unwrap();
     let h_name = hidden_view_name(f_vid, 0);
     let views = plan_chain(h_vid, f_vid, base_tid, &h_name, "userview", &cols);
-    client.create_view_chain(&sn, Vec::from(views)).unwrap();
+    client.create_view_chain(&sn, Vec::from(views), None).unwrap();
 
     assert!(
         client.drop_table(&sn, "base").is_err(),
@@ -293,7 +293,7 @@ fn chain_drop_schema_drains_hidden_members() {
     let f_vid = client.alloc_table_id().unwrap();
     let h_name = hidden_view_name(f_vid, 0);
     let views = plan_chain(h_vid, f_vid, base_tid, &h_name, "userview", &cols);
-    client.create_view_chain(&sn, Vec::from(views)).unwrap();
+    client.create_view_chain(&sn, Vec::from(views), None).unwrap();
 
     client.drop_schema(&sn).unwrap();
     // Re-creating the schema succeeds, proving it fully drained.
@@ -323,7 +323,7 @@ fn chain_rejects_over_length() {
             pk_cols: vec![0],
         })
         .collect();
-    let res = client.create_view_chain(&sn, planned);
+    let res = client.create_view_chain(&sn, planned, None);
     assert!(res.is_err(), "over-length chain must be rejected");
     let msg = format!("{:?}", res.unwrap_err());
     assert!(msg.contains("segment"), "error names the segment limit: {msg}");

@@ -1057,6 +1057,7 @@ impl GnitzClient {
                 output_columns: output_columns.to_vec(),
                 pk_cols: pk_cols.to_vec(),
             }],
+            None,
         )?;
         Ok(vids[0])
     }
@@ -1075,7 +1076,20 @@ impl GnitzClient {
     /// `pk_cols` for each view is its physical PK column list — the leading `k`
     /// output slots (`[0]` for a synthetic-PK view, `0..k` for a compound-PK
     /// passthrough).
-    pub fn create_view_chain(&mut self, schema_name: &str, views: Vec<PlannedView>) -> Result<Vec<u64>, ClientError> {
+    ///
+    /// `replaces` names an existing view this chain supersedes — an ALTER VIEW.
+    /// Its `-1` rows (and every hidden segment it owns) join the same VIEW_TAB
+    /// batch ahead of the new chain's `+1`s, making the replacement one DDL zone:
+    /// a rejection anywhere in it leaves the old view exactly as it was. The
+    /// engine's `view_row_order` runs the retractions first and then registers
+    /// the new chain in dependency order, and its qname-collision check admits
+    /// the incumbent because this bundle retires it.
+    pub fn create_view_chain(
+        &mut self,
+        schema_name: &str,
+        views: Vec<PlannedView>,
+        replaces: Option<&str>,
+    ) -> Result<Vec<u64>, ClientError> {
         let schema_name = canon_name(schema_name);
         // Reject an over-long chain before any allocation (the self-referential
         // CTE blow-up guard).
@@ -1105,6 +1119,13 @@ impl GnitzClient {
         }
 
         let schema_id = self.lookup_schema_id(&schema_name)?;
+
+        // The outgoing view's records, resolved before any id is allocated so a
+        // missing view surfaces with no residue.
+        let retracted: Vec<ViewRecord> = match replaces {
+            Some(old) => self.view_drop_records(&schema_name, schema_id, &canon_name(old))?,
+            None => Vec::new(),
+        };
 
         // Each view's vid: its circuit's pre-allocated id, or a fresh one. A chain
         // pre-sets every id (downstream circuits reference upstream hidden views),
@@ -1143,6 +1164,12 @@ impl GnitzClient {
             let mut edges_a = BatchAppender::new(&mut edges_batch, edges_s);
             let mut ncol_a = BatchAppender::new(&mut ncol_batch, ncol_s);
             let mut view_a = BatchAppender::new(&mut view_batch, view_s);
+
+            // 0. The replaced view's retractions, full payload per record (the
+            // engine's §3.3 CAS requires each `-1` to byte-equal the live row).
+            for rec in &retracted {
+                append_view_row(&mut view_a, -1, rec);
+            }
 
             for (pv, vid) in views.into_iter().zip(vids.iter().copied()) {
                 // 1. Column records.
@@ -1227,19 +1254,7 @@ impl GnitzClient {
         let schema_name = canon_name(schema_name);
         let view_name = canon_name(view_name);
         let schema_id = self.lookup_schema_id(&schema_name)?;
-
-        let (_, view_batch, _) = self.session.scan(VIEW_TAB)?;
-        let view_batch = view_batch
-            .ok_or_else(|| ClientError::ServerError(format!("View '{schema_name}.{view_name}' not found")))?;
-        let vr = find_view_record(&view_batch, schema_id, &view_name)?
-            .ok_or_else(|| ClientError::ServerError(format!("View '{schema_name}.{view_name}' not found")))?;
-
-        // Hidden segment members this view owns. Ownership is name-encoded
-        // (hidden views are never shared across user views); the shared
-        // `hidden_view_prefix` keeps the producer (planner) and this consumer on
-        // one definition.
-        let prefix = hidden_view_prefix(vr.vid);
-        let members = collect_view_records_with_prefix(&view_batch, schema_id, &prefix)?;
+        let records = self.view_drop_records(&schema_name, schema_id, &view_name)?;
 
         // One VIEW_TAB batch: the user view's `-1` plus every hidden member's
         // `-1`, full payload reproduced per record.
@@ -1247,13 +1262,37 @@ impl GnitzClient {
         let mut vb = ZSetBatch::new(view_s);
         {
             let mut a = BatchAppender::new(&mut vb, view_s);
-            for rec in std::iter::once(&vr).chain(members.iter()) {
+            for rec in &records {
                 append_view_row(&mut a, -1, rec);
             }
         }
         self.push_ddl(&[(VIEW_TAB, view_s, vb)])?;
 
         Ok(())
+    }
+
+    /// The live VIEW_TAB records that retiring `view_name` retracts: the user
+    /// view followed by every hidden segment it owns. Ownership is name-encoded
+    /// (hidden views are never shared across user views); the shared
+    /// `hidden_view_prefix` keeps the producer (planner) and this consumer on one
+    /// definition. Each record carries the row's full payload, which is what the
+    /// engine's §3.3 CAS compares a `-1` against. DROP VIEW and the replacing
+    /// half of ALTER VIEW retract exactly this set.
+    fn view_drop_records(
+        &mut self,
+        schema_name: &str,
+        schema_id: u64,
+        view_name: &str,
+    ) -> Result<Vec<ViewRecord>, ClientError> {
+        let not_found = || ClientError::ServerError(format!("View '{schema_name}.{view_name}' not found"));
+        let (_, view_batch, _) = self.session.scan(VIEW_TAB)?;
+        let view_batch = view_batch.ok_or_else(not_found)?;
+        let vr = find_view_record(&view_batch, schema_id, view_name)?.ok_or_else(not_found)?;
+
+        let prefix = hidden_view_prefix(vr.vid);
+        let mut records = vec![vr];
+        records.extend(collect_view_records_with_prefix(&view_batch, schema_id, &prefix)?);
+        Ok(records)
     }
 
     /// Rename a table or view: a `(-1, +1)` rewrite pair on TABLE_TAB / VIEW_TAB,

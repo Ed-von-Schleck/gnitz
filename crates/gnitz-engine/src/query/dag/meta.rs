@@ -2,6 +2,11 @@
 //! metadata (`ViewMeta`) consumed by callers that must never compile — the
 //! master's exchange-relay path (compiling creates rank-stamped scratch
 //! tables) and boot-time classification, which runs before any plan exists.
+//!
+//! The one master-side compile, `DagEngine::preflight_compile`, is exempt only
+//! because it redirects the compile to a throwaway root, keeping rank 0's
+//! stamped scratch names off worker 0's real paths. Anything else the master
+//! needs still has to route through here.
 
 use super::*;
 use std::rc::Rc;

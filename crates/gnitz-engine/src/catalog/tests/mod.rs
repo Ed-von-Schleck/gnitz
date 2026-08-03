@@ -11,6 +11,7 @@ mod scan_spec_bench;
 mod scan_spec_tests;
 mod source_cursor_tests;
 mod uuid_tests;
+mod view_preflight_tests;
 mod wide_pk_validation;
 
 use super::sys_tables::*;
@@ -182,50 +183,64 @@ fn create_flagged_table(
     tid
 }
 
-/// Build the minimal identity circuit `ScanDelta(base) → Integrate` for
-/// `vid` and write its rows through the applied-delta path. The payload
-/// column layout follows `gnitz_wire::CIRCUIT_NODES_COLS` /
-/// `CIRCUIT_EDGES_COLS`; the compound PK `(view_id, sub)` is packed by
-/// `pack_view_pk`. `scan_blob` is the scan node's optional expr/param blob —
-/// a bounded-scan fixture ships its `RangeDescriptor` there.
-fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64, scan_blob: Option<&[u8]>) {
-    let nodes_schema = sys_tab_schema(CIRCUIT_NODES_TAB_ID);
-    let mut bb = BatchBuilder::new(nodes_schema);
-    // node 0: ScanDelta(base_tid)
-    bb.begin_row(pack_view_pk(vid, 0), 1);
-    bb.put_u64(0);
-    bb.put_u64(gnitz_wire::OPCODE_SCAN_DELTA);
-    bb.put_u64(base_tid as u64); // source_table
-    match scan_blob {
-        Some(b) => bb.put_blob(b),
-        None => bb.put_null(),
+/// One circuit node for `write_circuit_chain`: opcode, source table, and the
+/// optional expr/param blob.
+type CircuitNode<'a> = (u64, Option<i64>, Option<&'a [u8]>);
+
+/// Write `vid`'s circuit through the applied-delta path: one node per entry of
+/// `nodes`, chained `i → i+1` on `PORT_IN`. The payload column layout follows
+/// `gnitz_wire::CIRCUIT_NODES_COLS` / `CIRCUIT_EDGES_COLS`; the compound PK
+/// `(view_id, sub)` is packed by `pack_view_pk`.
+fn write_circuit_chain(engine: &mut CatalogEngine, vid: i64, nodes: &[CircuitNode<'_>]) {
+    let mut bb = BatchBuilder::new(sys_tab_schema(CIRCUIT_NODES_TAB_ID));
+    for (i, &(opcode, source, blob)) in nodes.iter().enumerate() {
+        bb.begin_row(pack_view_pk(vid, i as u64), 1);
+        bb.put_u64(i as u64); // node_id
+        bb.put_u64(opcode);
+        match source {
+            Some(t) => bb.put_u64(t as u64),
+            None => bb.put_null(),
+        }
+        match blob {
+            Some(b) => bb.put_blob(b),
+            None => bb.put_null(),
+        }
+        bb.end_row();
     }
-    bb.end_row();
-    // node 1: Integrate (terminal sink — moves the delta into the view store)
-    bb.begin_row(pack_view_pk(vid, 1), 1);
-    bb.put_u64(1);
-    bb.put_u64(gnitz_wire::OPCODE_INTEGRATE);
-    bb.put_null(); // source_table
-    bb.put_null(); // expr_program
-    bb.end_row();
     engine.ingest_to_family(CIRCUIT_NODES_TAB_ID, &bb.finish()).unwrap();
 
-    let edges_schema = sys_tab_schema(CIRCUIT_EDGES_TAB_ID);
-    let mut bb = BatchBuilder::new(edges_schema);
-    bb.begin_row(pack_view_pk(vid, 0), 1);
-    bb.put_u64(1); // dst_node
-    bb.put_u64(gnitz_wire::PORT_IN); // dst_port
-    bb.put_u64(0); // src_node
-    bb.end_row();
+    let mut bb = BatchBuilder::new(sys_tab_schema(CIRCUIT_EDGES_TAB_ID));
+    for src in 0..nodes.len().saturating_sub(1) as u64 {
+        bb.begin_row(pack_view_pk(vid, src), 1);
+        bb.put_u64(src + 1); // dst_node
+        bb.put_u64(gnitz_wire::PORT_IN); // dst_port
+        bb.put_u64(src); // src_node
+        bb.end_row();
+    }
     engine.ingest_to_family(CIRCUIT_EDGES_TAB_ID, &bb.finish()).unwrap();
 }
 
-/// Append one raw VIEW_TAB row. `sql` is stored verbatim; cache_directory is
-/// left empty (the register hook computes the real view directory itself and
-/// neither column is read back by the appliers). The bare `0` pk_col_idx decodes
-/// back to a single-column PK `[0]`.
-fn push_view_tab_row(bb: &mut BatchBuilder, vid: i64, view_name: &str, sql: &str) {
-    bb.begin_row(vid as u128, 1);
+/// The minimal identity circuit `ScanDelta(base) → Integrate`. `scan_blob` is
+/// the scan node's optional expr/param blob — a bounded-scan fixture ships its
+/// `RangeDescriptor` there.
+fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64, scan_blob: Option<&[u8]>) {
+    write_circuit_chain(
+        engine,
+        vid,
+        &[
+            (gnitz_wire::OPCODE_SCAN_DELTA, Some(base_tid), scan_blob),
+            (gnitz_wire::OPCODE_INTEGRATE, None, None),
+        ],
+    );
+}
+
+/// Append one raw VIEW_TAB row at `weight`. `sql` is stored verbatim;
+/// cache_directory is left empty (the register hook computes the real view
+/// directory itself and neither column is read back by the appliers). The bare
+/// `0` pk_col_idx decodes back to a single-column PK `[0]`. A `-1` reproduces
+/// exactly what a `+1` wrote, which is what the §3.3 retraction CAS compares.
+fn push_view_tab_row(bb: &mut BatchBuilder, weight: i64, vid: i64, view_name: &str, sql: &str) {
+    bb.begin_row(vid as u128, weight);
     bb.put_u64(PUBLIC_SCHEMA_ID as u64);
     bb.put_string(view_name);
     bb.put_string(sql);
@@ -239,6 +254,6 @@ fn push_view_tab_row(bb: &mut BatchBuilder, vid: i64, view_name: &str, sql: &str
 /// system-table path.
 fn build_view_tab_row(vid: i64, view_name: &str, sql: &str) -> Batch {
     let mut bb = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut bb, vid, view_name, sql);
+    push_view_tab_row(&mut bb, 1, vid, view_name, sql);
     bb.finish()
 }

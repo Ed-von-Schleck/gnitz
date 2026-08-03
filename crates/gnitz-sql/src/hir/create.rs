@@ -43,16 +43,17 @@ pub(crate) fn execute_create_view(
     let mut chain = ViewChain::new();
     let final_vid = build_query_segments(client, query, binder, &mut chain, view_name, sql_text)?;
     client
-        .create_view_chain(schema_name, chain.segments)
+        .create_view_chain(schema_name, chain.segments, None)
         .map_err(GnitzSqlError::Exec)?;
     Ok(SqlResult::ViewCreated { view_id: final_vid })
 }
 
 /// `ALTER VIEW <v> AS <query>` — drop-then-create under the same name with a
-/// FRESH vid (ids are never reused). Deliberately NOT atomic: the new plan is
-/// compiled and validated first, then two sequential DDL zones (drop old vid +
-/// hidden segments, then create the fresh chain), so a fault after the drop
-/// commits leaves no view `v` at all (reported with a re-issue-as-CREATE hint).
+/// FRESH vid (ids are never reused), as ONE DDL zone: the old vid's and its
+/// hidden segments' `-1` rows ride in the same bundle as the new chain's `+1`s.
+/// The engine compiles every new view's circuit before the bundle is durable, so
+/// a bundle that fails there — or on any other guard — leaves the old view
+/// serving its rows untouched.
 /// sqlparser's `AlterView` has no `if_exists`, so a missing view is a hard error.
 pub(crate) fn execute_alter_view(
     client: &mut GnitzClient,
@@ -81,14 +82,14 @@ pub(crate) fn execute_alter_view(
     // CREATE VIEW of the new definition.
     let sql_text = format!("CREATE VIEW {view_name} AS {query}");
 
-    // Compile + validate the new plan (fresh vids) BEFORE issuing either zone, so
-    // a compile error leaves the old view fully intact.
+    // Compile + validate the new plan (fresh vids) BEFORE issuing the zone, so a
+    // planner error leaves the old view fully intact.
     let mut chain = ViewChain::new();
     build_query_segments(client, query, binder, &mut chain, view_name.clone(), sql_text)?;
 
     // Reject self-reference: `FROM v` in the new query resolves to the still-live
-    // old vid, which would appear as a source of the new plan — dropping it in
-    // zone 1 would remove the new definition's own input. Rejected before any zone.
+    // old vid, which would appear as a source of the new plan — the bundle
+    // retracts that vid, so the new definition would lose its own input.
     if chain
         .segments
         .iter()
@@ -99,20 +100,13 @@ pub(crate) fn execute_alter_view(
         )));
     }
 
-    // Zone 1: drop the old view + its hidden segments. The engine's
-    // view-dependency guard (re-evaluated under the catalog write lock) rejects
-    // the drop if dependents exist — RESTRICT, before anything is torn down.
-    client.drop_view(schema_name, &view_name).map_err(GnitzSqlError::Exec)?;
-
-    // Zone 2: create the fresh chain under the same name. A failure here (engine/
-    // I/O fault, or a qname race — a concurrent same-name CREATE in the gap) is
-    // post-drop: the old view is durably gone, so surface a re-issue hint.
-    client.create_view_chain(schema_name, chain.segments).map_err(|e| {
-        GnitzSqlError::Plan(format!(
-            "ALTER VIEW '{schema_name}.{view_name}': the old view was dropped but installing the new \
-             definition failed ({e}); re-issue as CREATE VIEW {view_name} AS <query>"
-        ))
-    })?;
+    // One zone: the old view's retractions plus the new chain. The engine's
+    // view-dependency guard (re-evaluated under the catalog write lock) still
+    // rejects the retraction if dependents exist — RESTRICT, and nothing is torn
+    // down when it fires.
+    client
+        .create_view_chain(schema_name, chain.segments, Some(&view_name))
+        .map_err(GnitzSqlError::Exec)?;
 
     Ok(SqlResult::Altered {
         object: "view".to_string(),

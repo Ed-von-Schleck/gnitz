@@ -8,14 +8,12 @@ use crate::query::vm::{reads_reg, Instr, IntegrateAvi, ReindexOperand};
 // Expression + scalar function construction helpers
 // ---------------------------------------------------------------------------
 
-/// Log an expr-program reject and name the failed guard in the compile error.
-/// A rejected program is bad client input — a bad opcode / register / const
-/// index, or an out-of-range / PK-routed column.
+/// Name the failed guard in the compile error and carry the validator's reason
+/// with it. A rejected program is bad client input — a bad opcode / register /
+/// const index, an out-of-range or PK-routed column, or a program over the
+/// register cap — and the pre-flight renders the whole error to the client.
 fn expr_reject(what: &'static str) -> impl Fn(ExprValidateErr) -> CompileError {
-    move |e| {
-        gnitz_info!("expr program rejected ({what}): {e:?}");
-        CompileError::Rejected(what)
-    }
+    move |e| CompileError::RejectedExpr(what, e)
 }
 
 /// True iff any raw wire column index in `cols` is out of range for `schema`.
@@ -590,7 +588,14 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
         }
 
         gnitz_wire::OpNode::ExchangeShard { .. } => {
-            unreachable!("ExchangeShard is excised from build_plan's node list in compile_view")
+            // `compile_view` excises the exchange nids from the *post* phase's
+            // node list, but each side's list is the ancestors of its own
+            // exchange input with no such filter — so an exchange upstream of
+            // another exchange's input stays in that side's list and arrives
+            // here. No planner path emits that shape; the C circuit-builder API
+            // (`gnitz_circuit_shard`) can, and rejecting is what keeps it from
+            // aborting a worker.
+            return Err(CompileError::Rejected("chained exchange nodes"));
         }
 
         gnitz_wire::OpNode::PartitionFilter => {

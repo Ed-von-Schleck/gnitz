@@ -864,7 +864,7 @@ fn replicated_bit_is_transitive_and_survives_replay() {
         (r_producer, "rv"),
         (p_producer, "pv"),
     ] {
-        push_view_tab_row(&mut bb, vid, name, "SELECT id, x FROM src");
+        push_view_tab_row(&mut bb, 1, vid, name, "SELECT id, x FROM src");
     }
     engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
 

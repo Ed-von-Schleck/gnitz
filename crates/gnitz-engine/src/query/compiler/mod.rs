@@ -2,6 +2,7 @@
 //! runs annotation + optimization passes, and emits VM instructions.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 
 use crate::expr::ScalarFunc;
 use crate::foundation::worker_ctx::{num_workers, worker_rank};
@@ -33,7 +34,8 @@ const PORT_IN_B: i32 = gnitz_wire::PORT_IN_B as i32;
 const PORT_TRACE: i32 = gnitz_wire::PORT_TRACE as i32;
 
 /// Why `compile_view` failed to turn a stored view circuit into a runnable plan.
-/// The sole caller logs the variant and maps every error to `None`.
+/// Rendered by `Display` into the `CREATE VIEW` error the client receives, so
+/// every variant's text is user-facing.
 #[derive(Debug)]
 pub(crate) enum CompileError {
     /// `load_circuit` could not read the circuit's system tables.
@@ -47,21 +49,25 @@ pub(crate) enum CompileError {
     /// More than two exchange boundaries — not produced by any planner path.
     TooManyExchanges,
     /// A compile-time guard rejected the circuit; the payload names the guard,
-    /// so a rejected view's log line says *which* of the ~30 trust-boundary
-    /// checks fired instead of a bare "build failed".
+    /// so the rejection says *which* of the ~30 trust-boundary checks fired
+    /// instead of a bare "build failed".
     Rejected(&'static str),
+    /// An expression-program guard rejected the circuit: the payload names the
+    /// guard and carries the validator's own reason, so the rejection can state
+    /// *which* limit the program exceeded and not only which guard fired.
+    RejectedExpr(&'static str, ExprValidateErr),
 }
 
-impl CompileError {
-    /// The reject reason for the compile-failure log line.
-    pub(crate) fn describe(&self) -> &'static str {
+impl fmt::Display for CompileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CompileError::LoadFailed => "circuit load failed",
-            CompileError::EmptyCircuit => "circuit has no nodes",
-            CompileError::Cycle => "circuit graph has a cycle",
-            CompileError::MissingExchangeInput => "exchange node lacks an input edge",
-            CompileError::TooManyExchanges => "more than two exchange nodes",
-            CompileError::Rejected(guard) => guard,
+            CompileError::LoadFailed => f.write_str("circuit load failed"),
+            CompileError::EmptyCircuit => f.write_str("circuit has no nodes"),
+            CompileError::Cycle => f.write_str("circuit graph has a cycle"),
+            CompileError::MissingExchangeInput => f.write_str("exchange node lacks an input edge"),
+            CompileError::TooManyExchanges => f.write_str("more than two exchange nodes"),
+            CompileError::Rejected(guard) => f.write_str(guard),
+            CompileError::RejectedExpr(guard, e) => write!(f, "{guard}: {e}"),
         }
     }
 }
@@ -1358,6 +1364,59 @@ mod tests {
         assert!(
             leftover.is_empty(),
             "scratch dirs must be removed on compile failure, found: {leftover:?}",
+        );
+    }
+
+    /// `compile_view` filters the exchange nids out of the *post* phase's node
+    /// list, but a side's list is `ancestors_inclusive` of its own exchange
+    /// input with no such filter — so a shard upstream of another shard's input
+    /// lands inside that side and reaches `emit_node`. It must reject, not
+    /// panic: a panic there is a worker abort, and a worker crash takes the
+    /// cluster down. No planner path emits the shape, and the planner asserts
+    /// against it, but the C circuit-builder surface (`gnitz_circuit_shard`)
+    /// bypasses the planner entirely.
+    #[test]
+    fn chained_exchange_rejects_instead_of_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let mut nodes = HashMap::new();
+        nodes.insert(0, scan_delta(10));
+        nodes.insert(1, gnitz_wire::OpNode::ExchangeShard { shard_cols: vec![0] });
+        nodes.insert(2, gnitz_wire::OpNode::Filter(None));
+        nodes.insert(3, gnitz_wire::OpNode::ExchangeShard { shard_cols: vec![0] });
+        nodes.insert(4, gnitz_wire::OpNode::IntegrateSink);
+        let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (2, 3, PORT_IN), (3, 4, PORT_IN)];
+        let loaded = make_loaded(nodes, edges);
+        let ext: ExtTables = HashMap::from([(10, schema)]);
+
+        // The carve `compile_view` performs for the sink-nearest shard.
+        let ex_in = exchange_input_node(&loaded, 3).unwrap();
+        let set = ancestors_inclusive(&loaded, ex_in);
+        let side_ordered: Vec<i32> = loaded.ordered.iter().copied().filter(|n| set.contains(n)).collect();
+        assert!(
+            side_ordered.contains(&1),
+            "fixture must place the upstream shard inside the side's node list, got {side_ordered:?}"
+        );
+
+        let result = build_plan(
+            &loaded,
+            &no_skips(),
+            &side_ordered,
+            &ext,
+            dir.path().to_str().unwrap(),
+            1,
+            Some(ex_in),
+            &[],
+        );
+        assert!(
+            matches!(result, Err(CompileError::Rejected("chained exchange nodes"))),
+            "chained exchange must be a named rejection"
         );
     }
 

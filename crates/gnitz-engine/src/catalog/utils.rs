@@ -57,6 +57,17 @@ pub(crate) fn view_dir(base_dir: &str, schema_name: &str, vid: i64) -> String {
     format!("{base_dir}/{schema_name}/v_{vid}")
 }
 
+/// `<base_dir>/<schema_name>/_preflight_<vid>` — the throwaway root the master's
+/// CREATE VIEW pre-flight compiles into. Not the view's own directory:
+/// `child_scratch_dir` stamps the rank into each scratch child's name and the
+/// master is rank 0, so compiling in place would write worker 0's real paths.
+/// Sits under a schema dir and ends in `_<digits>` so `is_table_dir_name`
+/// classifies it, which is what lets the boot orphan sweep reclaim one left by a
+/// crash mid-compile; a root elsewhere would leak a directory per crash.
+pub(crate) fn preflight_dir(base_dir: &str, schema_name: &str, vid: i64) -> String {
+    format!("{base_dir}/{schema_name}/_preflight_{vid}")
+}
+
 /// `<owner_dir>/idx_<idx_id>` — an index's directory, nested in its owner.
 pub(crate) fn index_dir(owner_dir: &str, idx_id: i64) -> String {
     format!("{owner_dir}/idx_{idx_id}")

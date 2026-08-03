@@ -2360,6 +2360,16 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
             cat.apply_and_enqueue_family(fid, fbatch)?;
             applied_not_enqueued = None;
         }
+        // Compile every new view's circuit here, on the master, while the bundle
+        // is still undoable. VIEW_TAB has been applied, so each view is registered
+        // and every source resolves — and nothing has reached the SAL yet, so a
+        // rejection leaves through the arm below with the view uncreated.
+        // Compiling only on the workers, as the backfill does, puts the verdict
+        // after the DDL is durable, where it can be nothing but a log line and a
+        // view that returns no rows forever.
+        for &vid in &new_view_ids {
+            cat.preflight_view_compile(vid)?;
+        }
         Ok(())
     });
     if let Err(e) = ingest_res {

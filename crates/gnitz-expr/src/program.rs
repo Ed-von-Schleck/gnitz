@@ -9,6 +9,7 @@
 
 use crate::{ColumnLocator, SchemaFacts};
 use gnitz_wire::{encode_german_string, FixedInt, TypeCode};
+use std::fmt;
 // Wire opcodes (1–46) the client emits, matched as arms in `from_wire`. They are
 // `pub const … : u32` in gnitz-wire, so a plain `use` binds them for pattern use.
 use gnitz_wire::{
@@ -50,6 +51,26 @@ pub enum ExprValidateErr {
     OutputIdxOutOfRange { out: u32, num_payload_cols: usize },
     OutputSlotUnwritten { written: u64, num_payload_cols: usize },
     PredicateWithoutResultReg,
+}
+
+/// The client-facing rendering. Lives on the type so the planner's `Unsupported`
+/// and the engine's compile rejection print the same wording, and so the limit
+/// printed is the one [`LogicalProgram::from_wire`] enforces. `TooManyRegs` gets
+/// a sentence naming that limit — it is the one variant a working query can hit;
+/// the rest are internal-shape violations with no user action, rendered as
+/// `Debug`.
+impl fmt::Display for ExprValidateErr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExprValidateErr::TooManyRegs(n) => {
+                write!(
+                    f,
+                    "expression needs {n} registers; the limit is {MAX_REGS} — split the predicate"
+                )
+            }
+            other => write!(f, "{other:?}"),
+        }
+    }
 }
 
 /// What an opcode's kernel requires of a column operand — a *region* requirement

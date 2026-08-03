@@ -6,6 +6,7 @@
 //! `sys_tables.rs` / `apply_context.rs`. No second ingest entry point may
 //! skip this precheck/hooks path.
 
+use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
 use std::num::NonZeroU64;
 
@@ -197,8 +198,15 @@ impl CatalogEngine {
     /// Reject a CREATE whose qualified `schema.name` collides with an existing
     /// entity. Re-ingesting the same row (e.g. a pk-col update of `self_id`) is
     /// allowed; only a genuinely different entity under that name is rejected.
+    ///
+    /// `net_dead` is this same bundle's net-dead PKs in this same family. An
+    /// incumbent among them is not a collision: one bundle may retire an id and
+    /// register a different one under the same name — an ALTER VIEW is exactly
+    /// that. Precheck reads the caches *before* apply, so they still map the name
+    /// to the outgoing id.
+    ///
     /// Also resolves `sid`, erroring if the schema does not exist.
-    fn precheck_qname_unique(&self, sid: i64, name: &str, self_id: i64) -> Result<(), String> {
+    fn precheck_qname_unique(&self, sid: i64, name: &str, self_id: i64, net_dead: &[i64]) -> Result<(), String> {
         let schema_name = self
             .caches
             .schema_by_id
@@ -206,7 +214,7 @@ impl CatalogEngine {
             .ok_or_else(|| format!("Schema with ID {sid} does not exist"))?;
         let qualified = format!("{schema_name}.{name}");
         if let Some(&existing) = self.caches.entity_by_qname.get(&qualified) {
-            if existing != self_id {
+            if existing != self_id && !net_dead.contains(&existing) {
                 return Err(format!("Table or view already exists: {qualified}"));
             }
         }
@@ -656,7 +664,7 @@ impl CatalogEngine {
                         self.validate_fk_column(cd, tid, pk.as_slice(), self_pk_type)?;
                     }
 
-                    self.precheck_qname_unique(sid, &name, tid)?;
+                    self.precheck_qname_unique(sid, &name, tid, &net_dead)?;
                 }
                 VIEW_TAB_ID => {
                     let vid = batch.get_pk(i) as i64;
@@ -669,7 +677,7 @@ impl CatalogEngine {
                     // validator for the paths that skip precheck.
                     let col_defs = self.scan_column_defs(vid, true)?;
                     validate_relation_defs("view", vid, &name, &col_defs, &pk)?;
-                    self.precheck_qname_unique(sid, &name, vid)?;
+                    self.precheck_qname_unique(sid, &name, vid, &net_dead)?;
                 }
                 IDX_TAB_ID => {
                     let (owner_id, cols, _is_unique) = read_idx_tab_row(batch, i);
@@ -869,7 +877,7 @@ impl CatalogEngine {
 
     /// Physically remove a batch of queued directory paths. An existence guard
     /// keeps a re-queued path (drop applied, dir already gone) quiet.
-    fn remove_queued_dirs(dirs: Vec<String>) {
+    pub(super) fn remove_queued_dirs(dirs: Vec<String>) {
         for dir in dirs {
             if std::path::Path::new(&dir).exists() {
                 let _ = std::fs::remove_dir_all(&dir);
@@ -1003,11 +1011,11 @@ impl CatalogEngine {
                 }
 
                 // Defense in depth: only `<something>_<digits>` dirs — the shape
-                // of table (`<name>_<tid>`) and view (`view_<name>_<vid>`)
-                // creation — are eligible for removal. Never touch an unexpected
-                // entry. The only component that writes a directory directly
-                // under a schema dir is table/view creation, so a table-shaped
-                // name absent from `live_tables` is necessarily an orphaned drop.
+                // of table (`<name>_<tid>`), view (`view_<name>_<vid>`), and the
+                // pre-flight's throwaway root (`_preflight_<vid>`) — are eligible
+                // for removal. Never touch an unexpected entry. Those three are
+                // the only writers directly under a schema dir, so a matching
+                // name absent from `live_tables` is orphaned either way.
                 if !is_table_dir_name(&name) {
                     continue;
                 }
@@ -1028,6 +1036,18 @@ impl CatalogEngine {
         // `cancel_gated_deletion` fix guarantees no recreated same-name (live)
         // schema path survives in the queue.
         self.drain_pending_dir_deletions();
+    }
+
+    /// Compile a just-registered view's circuit and throw the result away, so a
+    /// circuit the engine cannot run is rejected while the DDL is still undoable.
+    /// The path is built here because `catalog::utils` owns every entity
+    /// directory's shape, and `query` sits below it.
+    pub(crate) fn preflight_view_compile(&self, vid: i64) -> Result<(), String> {
+        let Some((schema_name, _)) = self.caches.entity_by_id.get(&vid) else {
+            return Err(format!("pre-flight: view {vid} is not registered"));
+        };
+        let root = preflight_dir(&self.base_dir, schema_name, vid);
+        self.dag.preflight_compile(vid, &root).map_err(|e| e.to_string())
     }
 
     // -----------------------------------------------------------------------
@@ -1065,54 +1085,62 @@ impl CatalogEngine {
             return;
         }
 
-        // Derive the rollback direction from the (weight-uniform) list: a bundle
-        // is either a CREATE (all +1) or a DROP (all -1).
-        let is_create = rollback_list
-            .iter()
-            .any(|(_, b)| (0..b.count).any(|i| b.get_weight(i) > 0));
+        // Directories of entities the bundle DROPPED are queued for removal, and
+        // this rollback restores those entities — so their files must survive.
+        // (A hook that staged a directory and then failed already reclaimed it
+        // itself; see `with_staged_dir`.) What the rollback queues *below* is a
+        // different thing: residue of a creation that never committed.
+        self.discard_pending_dir_deletions();
 
-        // §3.4: each family in the rollback list must be internally homogeneous
-        // (a pure CREATE or pure DROP) OR fully paired — every negative PK also
-        // appears positively in that same family and vice versa (a rewrite pair,
-        // e.g. a rename). A rename's single COL/TABLE/VIEW family is fully paired;
-        // `is_create` (computed above on the original un-negated weights) then
-        // classifies it either way, since a pure rename pair leaves an empty
-        // `pending_dir_deletions` (§3.2's reconciling hooks no-op the whole
-        // registration), so both drain/discard are no-ops on the empty vec.
-        debug_assert!(
-            rollback_list.iter().all(|(_, b)| {
-                let neg: Vec<u128> = (0..b.count)
-                    .filter(|&i| b.get_weight(i) < 0)
-                    .map(|i| b.get_pk(i))
-                    .collect();
-                let pos: Vec<u128> = (0..b.count)
-                    .filter(|&i| b.get_weight(i) > 0)
-                    .map(|i| b.get_pk(i))
-                    .collect();
-                let homogeneous = neg.is_empty() || pos.is_empty();
-                let fully_paired = neg.iter().all(|pk| pos.contains(pk)) && pos.iter().all(|pk| neg.contains(pk));
-                homogeneous || fully_paired
-            }),
-            "compensate_stage_a assumes each rollback family is weight-homogeneous \
-             OR fully paired (a rename rewrite pair); a genuinely mixed CREATE/DROP \
-             family would misclassify the rollback direction and mishandle \
-             pending_dir_deletions"
-        );
-
-        // For CREATE rollback: dependents unregistered before dependencies — DESCENDING.
-        // For DROP rollback: dependencies restored before dependents — ASCENDING.
-        if is_create {
-            rollback_list.sort_by_key(|(tid, _)| std::cmp::Reverse(Self::catalog_topo_priority(*tid)));
-        } else {
-            rollback_list.sort_by_key(|(tid, _)| Self::catalog_topo_priority(*tid));
+        // §3.4: undo each PK by what the bundle did to *it*, not by what the
+        // bundle did overall — one family can do both. An ALTER VIEW retires the
+        // old vid and registers the new chain in a single VIEW_TAB batch, so the
+        // rollback has to tear one down and restore the other, and the two need
+        // opposite family orders.
+        //
+        // A PK carrying both signs is a rewrite pair (a rename): its net stays
+        // live, so it counts as a creation and its rows stay in ONE submit. Split
+        // across the two phases they would drop the entity's net weight to zero
+        // mid-rollback, firing the teardown hook and queueing the live entity's
+        // directory for removal.
+        let mut undo_create: Vec<(i64, Batch)> = Vec::new();
+        let mut undo_drop: Vec<(i64, Batch)> = Vec::new();
+        for (tid, batch) in rollback_list {
+            let mut net: FxHashMap<u128, i64> = FxHashMap::default();
+            for i in 0..batch.count {
+                *net.entry(batch.get_pk(i)).or_default() += batch.get_weight(i);
+            }
+            let (created, dropped): (Vec<u32>, Vec<u32>) =
+                (0..batch.count as u32).partition(|&i| net[&batch.get_pk(i as usize)] >= 0);
+            if dropped.is_empty() {
+                undo_create.push((tid, batch));
+            } else if created.is_empty() {
+                undo_drop.push((tid, batch));
+            } else {
+                let schema = sys_tab_schema(tid);
+                let mem = batch.as_mem_batch();
+                undo_create.push((tid, Batch::from_indexed_rows(&mem, &created, &schema)));
+                undo_drop.push((tid, Batch::from_indexed_rows(&mem, &dropped, &schema)));
+            }
         }
+
+        // Tear down what the bundle created — dependents before dependencies,
+        // DESCENDING…
+        undo_create.sort_by_key(|(tid, _)| std::cmp::Reverse(Self::catalog_topo_priority(*tid)));
+        // …then restore what it dropped — dependencies before dependents,
+        // ASCENDING, so a restored view finds its columns, deps, and circuit rows
+        // already back when its own VIEW_TAB row re-registers it. Creations first,
+        // so a name the bundle moved from one id to another is free again by the
+        // time the incumbent reclaims it.
+        undo_drop.sort_by_key(|(tid, _)| Self::catalog_topo_priority(*tid));
+        undo_create.append(&mut undo_drop);
 
         // Replay each with negated weight through the no-broadcast path.
         // fire_hooks still fires so caches, dag.tables, and pending_dir_deletions
         // are updated. The rollback gate in `submit` ensures any cascade that
         // calls back into `submit` also bypasses broadcasts.
         let result = self.with_rollback_compensation(|s| -> Result<(), String> {
-            for (tid, mut batch) in rollback_list {
+            for (tid, mut batch) in undo_create {
                 batch.map_weights(i64::wrapping_neg);
                 let family = SysFamily::from_id(tid).ok_or_else(|| format!("rollback: unknown system family {tid}"))?;
                 s.submit_local(family, batch)?;
@@ -1120,13 +1148,8 @@ impl CatalogEngine {
             Ok(())
         });
 
-        // For CREATE: drain cleans up any pre-staged directories from hooks.
-        // For DROP: discard keeps the entity files on disk (drop was not durable).
-        if is_create {
-            self.drain_pending_dir_deletions();
-        } else {
-            self.discard_pending_dir_deletions();
-        }
+        // Everything the rollback queued is a creation that never committed.
+        self.drain_pending_dir_deletions();
 
         result.unwrap_or_else(|e| {
             gnitz_fatal_abort!(

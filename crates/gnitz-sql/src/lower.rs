@@ -1,7 +1,7 @@
 use crate::error::GnitzSqlError;
 use crate::ir::{BinOp, BoundExpr, UnaryOp};
 use gnitz_core::{ColumnDef, ExprBuilder, Schema};
-use gnitz_expr::{Evaluator, ExprValidateErr, LogicalProgram, MAX_REGS};
+use gnitz_expr::{Evaluator, ExprValidateErr, LogicalProgram};
 
 /// An IN-list item folds to an integer constant iff it is an integer literal or
 /// the unary negation of one (`-1` binds to `UnaryOp(Neg, LitInt(1))` — sqlparser
@@ -456,17 +456,11 @@ fn to_logical(p: gnitz_core::ExprProgram) -> Result<LogicalProgram, GnitzSqlErro
     LogicalProgram::from_wire(&p.code, p.num_regs, p.result_reg, p.const_strings).map_err(expr_unsupported)
 }
 
-/// A shared-evaluator rejection as a SQL-layer `Unsupported`. `ExprValidateErr`
-/// is a diagnostic enum with no `Display`, so the fallback formats with `{:?}`;
-/// the register cap gets a message naming the limit, because it is the one
-/// narrowing a query that works today can hit.
+/// A shared-evaluator rejection as a SQL-layer `Unsupported`. The wording is
+/// `ExprValidateErr`'s own `Display`, so a query rejected here and the same
+/// program rejected by the engine's circuit compiler read identically.
 fn expr_unsupported(e: ExprValidateErr) -> GnitzSqlError {
-    match e {
-        ExprValidateErr::TooManyRegs(n) => GnitzSqlError::Unsupported(format!(
-            "expression needs {n} registers; the limit is {MAX_REGS} — split the predicate"
-        )),
-        other => GnitzSqlError::Unsupported(format!("expression cannot be compiled: {other:?}")),
-    }
+    GnitzSqlError::Unsupported(e.to_string())
 }
 
 #[cfg(test)]

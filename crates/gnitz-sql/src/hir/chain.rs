@@ -12,14 +12,16 @@ use std::rc::Rc;
 /// for a pre-allocated view id; the caller wraps them into a `PlannedView`.
 pub(crate) type EmitPieces = (Circuit, Vec<ColumnDef>, Vec<u32>);
 
-/// Structural check of every emitted circuit's exchange topology — the one
-/// backstop, since the engine hits `unreachable!` in `build_plan` on a violation
-/// rather than erroring cleanly. Phrased positionally: if any `Join` node is
-/// present every `ExchangeShard` must be sink-adjacent (the range-join output
-/// shard is the only exchange a join circuit carries, on the `shard→sink` tail);
-/// at most two `ExchangeShard`s (two only as parallel set-op sides); none
-/// downstream of another. Structural only — a wrong-*columns* cut still passes,
-/// so the weight pins are the real net.
+/// Structural check of every emitted circuit's exchange topology, catching a
+/// planner regression at the emitter rather than as a `CREATE VIEW` rejection
+/// from the engine. Wider than what the engine rejects — sink-adjacency and the
+/// two-shard cap have no engine-side counterpart. Phrased positionally: if any
+/// `Join` node is present every `ExchangeShard` must be sink-adjacent (the
+/// range-join output shard is the only exchange a join circuit carries, on the
+/// `shard→sink` tail); at most two `ExchangeShard`s (two only as parallel set-op
+/// sides); none downstream of another, directly or through intervening nodes.
+/// Structural only — a wrong-*columns* cut still passes, so the weight pins are
+/// the real net.
 ///
 /// One home, on the two paths every circuit reaches: `add_segment` (hidden
 /// segments) and the final view push (`create::build_query_segments`). No emitter
@@ -53,11 +55,23 @@ pub(crate) fn debug_assert_exchange_topology(circuit: &Circuit) {
             .filter_map(|((consumer, _port), _)| circuit.nodes.get(consumer))
             .collect()
     };
+    // Every node reachable downstream of `src`. Transitive, so an intervening
+    // Filter cannot hide one shard from another.
+    let reaches = |src: gnitz_core::NodeId| -> Vec<gnitz_core::NodeId> {
+        let (mut seen, mut stack) = (Vec::new(), vec![src]);
+        while let Some(n) = stack.pop() {
+            for ((consumer, _), producer) in &circuit.edges {
+                if *producer == n && !seen.contains(consumer) {
+                    seen.push(*consumer);
+                    stack.push(*consumer);
+                }
+            }
+        }
+        seen
+    };
     for &s in &shards {
-        // No shard directly downstream of another shard.
-        let downstream_shard = feeds(s)
-            .iter()
-            .any(|op| matches!(op, gnitz_core::OpNode::ExchangeShard { .. }));
+        // No shard anywhere downstream of another shard.
+        let downstream_shard = reaches(s).iter().any(|n| shards.contains(n));
         debug_assert!(!downstream_shard, "an ExchangeShard feeds another ExchangeShard");
         if has_join {
             // In a join circuit every shard must be sink-adjacent (the range-join

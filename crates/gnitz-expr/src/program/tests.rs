@@ -1649,6 +1649,27 @@ fn test_from_wire_rejects_unknown_opcode() {
     assert!(LogicalProgram::from_wire(&[1, 0, 0, 0], 1, 0, vec![]).is_ok());
 }
 
+// The rendering the planner's `Unsupported` and the engine's `CREATE VIEW`
+// rejection both print: one wording for both, and the register cap is the one
+// variant a working query can newly hit, so it gets a sentence naming the limit
+// rather than a struct dump.
+#[test]
+fn test_validate_err_display_names_the_register_limit() {
+    assert_eq!(
+        ExprValidateErr::TooManyRegs(66).to_string(),
+        format!(
+            "expression needs 66 registers; the limit is {} — split the predicate",
+            crate::MAX_REGS
+        )
+    );
+    // Everything else is an internal-shape violation with no user action:
+    // rendered as its Debug form.
+    assert_eq!(
+        ExprValidateErr::ColOutOfRange { col: 7, num_columns: 3 }.to_string(),
+        "ColOutOfRange { col: 7, num_columns: 3 }"
+    );
+}
+
 #[test]
 fn test_from_wire_rejects_bad_register_file() {
     // num_regs over the 64-register limit.

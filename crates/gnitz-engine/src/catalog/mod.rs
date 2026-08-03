@@ -87,8 +87,8 @@ pub(in crate::catalog) use crate::storage::{ChildAddr, NUM_PARTITIONS};
 pub(in crate::catalog) use types::{FkConstraint, FkParentRef};
 pub(in crate::catalog) use utils::{
     cursor_read_string, cursor_read_u64, ensure_dir, fsync_dir, index_dir, is_index_dir_name, is_table_dir_name,
-    make_fk_index_name, new_index_table, reclaim_retired_children, remove_stale_index_rank_dirs, retract_rows_by_view,
-    retract_rows_in_pk_range, retract_single_row, schema_dir, subdir_names, table_dir, view_dir,
+    make_fk_index_name, new_index_table, preflight_dir, reclaim_retired_children, remove_stale_index_rank_dirs,
+    retract_rows_by_view, retract_rows_in_pk_range, retract_single_row, schema_dir, subdir_names, table_dir, view_dir,
 };
 #[cfg(test)]
 pub(in crate::catalog) use utils::{make_secondary_index_name, parse_qualified_name};

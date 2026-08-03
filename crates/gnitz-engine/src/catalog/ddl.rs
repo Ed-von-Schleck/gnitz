@@ -341,13 +341,10 @@ impl CatalogEngine {
                 // negative-weight row in their sys_indices.
                 let undo = idx_tab_row(index_id, owner_id, packed_cols, &index_name, is_unique, -1);
                 self.rollback_index_registration(undo, index_id);
-                // The hook pre-staged the index directory into
-                // pending_dir_deletions before Table::new; when backfill_index
-                // fails the circuit is never registered, so the -1 retraction
-                // hook does not queue the directory and it would leak. Drain
-                // here (existence-guarded remove_dir_all; safe even if Table::new
-                // failed before creating the directory).
-                self.drain_pending_dir_deletions();
+                // The index directory is already gone: the hook staged it before
+                // `Table::new`, and `with_staged_dir` reclaims a stage whose
+                // closure failed. Nothing queued it here — the `-1` retraction
+                // hook only queues a directory whose circuit was registered.
                 return Err(e);
             }
         }

@@ -442,14 +442,10 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
 
 #[test]
 fn test_create_unique_index_backfill_fail_no_dir_leak() {
-    // Pre-fix: Table::new creates the index directory before backfill_index
-    // checks for duplicates.  When backfill_index fails, the directory is
-    // never added to pending_dir_deletions and survives.
-    //
-    // After Part 2d the directory is pre-staged in pending_dir_deletions
-    // before Table::new; the truncation only fires on success.  The test
-    // explicitly drains pending_dir_deletions after the error to simulate
-    // what compensate_stage_a does in the production executor.
+    // `Table::new` creates the index directory before backfill_index checks for
+    // duplicates, so a failed backfill would orphan it. The hook stages the
+    // directory first, and `with_staged_dir` reclaims a stage whose closure
+    // failed — no caller has to remember to drain.
     let dir = temp_dir("atomicity_idx_dir_leak");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
@@ -476,13 +472,14 @@ fn test_create_unique_index_backfill_fail_no_dir_leak() {
     let result = engine.create_index("public.leaktest", &["val"], true);
     assert!(result.is_err(), "unique index with duplicate values must fail");
 
-    // Simulate compensate_stage_a: drain pending_dir_deletions.
-    engine.drain_pending_dir_deletions();
-
-    // The index directory must be cleaned up (not orphaned on disk).
+    // Reclaimed by the failing stage itself, with no drain from the caller.
+    assert!(
+        engine.pending_dir_deletions.is_empty(),
+        "a failed stage must leave nothing queued"
+    );
     assert!(
         !std::path::Path::new(&idx_dir).exists(),
-        "index directory must not leak after failed backfill: {idx_dir} (not cleaned up before fix)"
+        "index directory must not leak after failed backfill: {idx_dir}"
     );
     assert!(
         engine
