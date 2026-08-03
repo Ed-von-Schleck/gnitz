@@ -48,8 +48,8 @@ enum ConflictPlan {
 /// committed branch returns the seek reply verbatim and drops the reply schema,
 /// so a row read back from the store is *assumed* to match — the same assumption
 /// `build_merged_row`'s carry path has always made here, not one this compilation
-/// introduces. (`mutate.rs` does not assume it: `resolve_where_rows` hands the
-/// reply schema back and the SET list compiles against that.)
+/// introduces. (`mutate.rs` assumes it too: its read is a `ReadSpec` whose reply
+/// the client itself authored, so there is no server-echoed schema to prefer.)
 enum BoundUpdateExpr {
     Existing(SetProgram),
     Excluded(SetProgram),

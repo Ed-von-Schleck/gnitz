@@ -9,19 +9,19 @@
 //!
 //! [`effective_row`] returns an **owned** row so the caller can then borrow the
 //! client mutably (seek, push) with no buffer borrow outstanding. The map-based
-//! [`buffered_keys`]/[`buffered_all`] instead borrow each buffered row **in
-//! place** (no copy); [`overlay_batch`] materializes them into the effective
-//! batch exactly once, all before the caller's next `&mut client`.
+//! [`buffered_net`] instead borrows each buffered row **in place** (no copy);
+//! [`present_rows`] materializes them exactly once, all before the caller's next
+//! `&mut client`.
 //!
 //! - [`effective_row`] — one PK: buffered op, else committed seek (INSERT's ON
 //!   CONFLICT paths).
-//! - [`buffered_keys`] / [`buffered_all`] — the net map for a known key set, or
-//!   for every PK the transaction touched (UPDATE/DELETE's seek and scan paths).
-//! - [`overlay_batch`] — apply such a map to a committed batch.
+//! - [`buffered_net`] — the net map, over a known key set or over every PK the
+//!   transaction touched (UPDATE/DELETE's key-pinned and unpinned bounds).
+//! - [`present_rows`] — that map's live rows, as a batch.
 //!
-//! Every map is **empty in autocommit**, where the overlay is the identity and
-//! costs nothing: `HashMap::new()` does not allocate, and `overlay_batch` hands
-//! the committed batch straight back.
+//! The map is **empty in autocommit**, where the overlay costs nothing:
+//! `HashMap::new()` does not allocate, and its callers short-circuit on an empty
+//! map before touching a row.
 
 use crate::error::GnitzSqlError;
 use crate::exec::batch::copy_batch_row;
@@ -61,53 +61,41 @@ pub(crate) fn effective_row(
     Ok(client.seek(tid, pk)?.1.filter(|b| !b.pks.is_empty()))
 }
 
-/// The net map restricted to `keys` — the seek access paths, whose residual does
-/// not constrain the PK, so only the seeked keys may enter the effective rows.
-pub(crate) fn buffered_keys<'a>(client: &'a GnitzClient, tid: u64, keys: &[PkTuple]) -> Net<'a> {
-    let Some(buf) = client.txn_buffer() else {
-        return Net::new();
-    };
-    keys.iter()
-        .filter_map(|pk| buf.last_op(tid, pk).map(|(b, r)| (*pk, op_of(b, r))))
-        .collect()
-}
-
-/// The net map over every PK the transaction touched in `tid` — the scan access
-/// paths, where any buffered row may satisfy the predicate.
-pub(crate) fn buffered_all<'a>(client: &'a GnitzClient, tid: u64) -> Net<'a> {
-    let Some(buf) = client.txn_buffer() else {
-        return Net::new();
-    };
-    buf.last_ops(tid).map(|(pk, b, r)| (pk, op_of(b, r))).collect()
-}
-
-/// Layer `net` over a committed batch: the committed rows the transaction did
-/// NOT touch, plus its `Present` rows. All copies under `actual` — buffered
-/// batches are layout-identical to the reply: DDL is barred in a transaction, so
-/// both carry the same full physical schema (a DROP COLUMN'd base table has a
-/// hidden slot, but it is zero-filled NOT NULL on both sides — identical bytes).
+/// The transaction's net effect on `tid`: restricted to `keys` when the access
+/// bound names an exact key set — its residual does not constrain the PK, so an
+/// unrelated buffered row must not enter the candidates — else every PK the
+/// transaction touched.
 ///
-/// An empty `net` (autocommit, or a table the transaction has not touched) is
-/// the identity: the committed batch IS the effective state, returned uncopied.
-pub(crate) fn overlay_batch(committed: Option<ZSetBatch>, net: &Net, actual: &Schema) -> ZSetBatch {
-    if net.is_empty() {
-        return committed.unwrap_or_else(|| ZSetBatch::new(actual));
+/// **Empty in autocommit**, and in any transaction that has not written `tid`.
+pub(crate) fn buffered_net<'a>(client: &'a GnitzClient, tid: u64, keys: Option<&[PkTuple]>) -> Net<'a> {
+    let Some(buf) = client.txn_buffer() else {
+        return Net::new();
+    };
+    match keys {
+        Some(keys) => keys
+            .iter()
+            .filter_map(|pk| buf.last_op(tid, pk).map(|(b, r)| (*pk, op_of(b, r))))
+            .collect(),
+        None => buf.last_ops(tid).map(|(pk, b, r)| (pk, op_of(b, r))).collect(),
     }
-    let stride = actual.pk_stride() as u8;
-    let mut eff = ZSetBatch::new(actual);
-    if let Some(b) = &committed {
-        for i in 0..b.len() {
-            if !net.contains_key(&b.pks.get_tuple(i, stride)) {
-                copy_batch_row(b, i, &mut eff, actual);
-            }
-        }
-    }
+}
+
+/// The transaction's own live rows: every `Present` op in `net`, materialized
+/// under `schema` as one batch. These are the rows no server-side walk ever saw,
+/// so they are the only ones a DML verb re-filters client-side.
+///
+/// Copies under `schema` — a buffered batch is layout-identical to it, because
+/// DDL is barred inside a transaction, so both carry the same full physical
+/// schema (a DROP COLUMN'd base table has a hidden slot, but it is zero-filled
+/// NOT NULL on both sides — identical bytes).
+pub(crate) fn present_rows(net: &Net, schema: &Schema) -> ZSetBatch {
+    let mut out = ZSetBatch::with_capacity(schema, net.len());
     for op in net.values() {
         if let Buffered::Present(batch, row) = op {
-            copy_batch_row(batch, *row, &mut eff, actual);
+            copy_batch_row(batch, *row, &mut out, schema);
         }
     }
-    eff
+    out
 }
 
 /// One buffered row's net effect, borrowing it in place: the weight sign decides.
@@ -232,25 +220,24 @@ mod tests {
     }
 
     #[test]
-    fn overlay_empty_net_returns_committed() {
+    fn present_rows_of_an_empty_net_is_empty() {
         let schema = two_col(TypeCode::I64);
-        let committed = batch(&schema, &[(1, 10, 1), (2, 20, 1)]);
-        let eff = overlay_batch(Some(committed), &Net::new(), &schema);
-        assert_eq!(rows_of(&schema, &eff), vec![(1, 10), (2, 20)]);
+        assert!(rows_of(&schema, &present_rows(&Net::new(), &schema)).is_empty());
     }
 
+    /// The live half of the net: an override and a transaction-born row are both
+    /// `Present`; a tombstone contributes nothing.
     #[test]
-    fn overlay_overrides_deletes_and_adds_born_rows() {
+    fn present_rows_keeps_overrides_and_born_rows_and_drops_tombstones() {
         let schema = two_col(TypeCode::I64);
-        let committed = batch(&schema, &[(1, 10, 1), (2, 20, 1)]);
         let tid = 7;
         let mut buf = TxnBuffer::default();
         buf.push(tid, &schema, &batch(&schema, &[(1, 99, 1)])); // override committed 1
         buf.delete(tid, &schema, PkColumn::U64s(vec![2])); // delete committed 2
         buf.push(tid, &schema, &batch(&schema, &[(5, 50, 1)])); // transaction-born
 
-        let eff = overlay_batch(Some(committed), &net_of(&buf, tid), &schema);
-        assert_eq!(rows_of(&schema, &eff), vec![(1, 99), (5, 50)]);
+        let present = present_rows(&net_of(&buf, tid), &schema);
+        assert_eq!(rows_of(&schema, &present), vec![(1, 99), (5, 50)]);
     }
 
     #[test]
@@ -260,8 +247,8 @@ mod tests {
         let mut buf = TxnBuffer::default();
         buf.push(tid, &schema, &batch(&schema, &[(1, 11, 1), (2, 22, 1)]));
 
-        // The seek paths only overlay the keys they seeked: restricting to [1]
-        // leaves pk=2's buffered row out of the effective batch.
+        // A key-pinned bound restricts the net to the keys it names: restricting
+        // to [1] leaves pk=2's buffered row out of the candidates entirely.
         let full = net_of(&buf, tid);
         let only_1: Net = [PkTuple::from_u128(8, 1)]
             .iter()
@@ -269,7 +256,6 @@ mod tests {
             .collect();
         assert_eq!(full.len(), 2);
         assert_eq!(only_1.len(), 1);
-        let eff = overlay_batch(None, &only_1, &schema);
-        assert_eq!(rows_of(&schema, &eff), vec![(1, 11)]);
+        assert_eq!(rows_of(&schema, &present_rows(&only_1, &schema)), vec![(1, 11)]);
     }
 }

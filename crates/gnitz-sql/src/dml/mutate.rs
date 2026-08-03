@@ -1,29 +1,29 @@
-//! UPDATE and DELETE: resolve the matching rows once via `resolve_where_rows`
-//! (the shared PK-seek → secondary-index → predicate-scan ladder), then write
-//! the SET batch (UPDATE) or collect the PKs to retract (DELETE). The SET-list
+//! UPDATE and DELETE: plan the WHERE once through the shared access-path ladder
+//! (`dml::plan`), read the matching rows (UPDATE) or just their keys (DELETE)
+//! back from the server, then write the SET batch or the retraction. The SET-list
 //! helpers (`classify_set_rhs`, `eval_set_program`, `resolve_set_target`) are
 //! also reused by INSERT's `ON CONFLICT DO UPDATE`.
 
-use crate::access::collect_index_seek_candidates;
 use crate::ast_util::{extract_name, extract_table_factor_name};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_column_value, check_not_null, set_target_admits, ColumnValue};
-use crate::dml::overlay::{buffered_all, buffered_keys, overlay_batch, Net};
-use crate::dml::plan::{classify_access, first_index_hit, seek_pk_multi, AccessPath};
+use crate::codec::project_schema::{build_read_projection, read_reply_shape};
+use crate::dml::overlay::{buffered_net, present_rows};
+use crate::dml::plan::{bound_and_predicate, fetch_bound, AccessPlan, ReadBudget};
 use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
 use crate::error::GnitzSqlError;
+use crate::exec::batch::copy_batch_row_owned;
 use crate::exec::residual::matching_indices;
 use crate::ir::BoundExpr;
 use crate::lower::compile_scalar_evaluator;
 use crate::SqlResult;
 use gnitz_core::null_word_set;
 use gnitz_core::{
-    retraction_batch, ColData, GnitzClient, PkColumn, PkTuple, Schema, TypeCode, ViewBuffers, WireConflictMode,
-    ZSetBatch, ZSetBatchView,
+    retraction_batch, ColData, GnitzClient, Schema, TypeCode, ViewBuffers, WireConflictMode, ZSetBatch, ZSetBatchView,
 };
 use gnitz_expr::Evaluator;
-use sqlparser::ast::{Assignment, AssignmentTarget, Expr, FromTable};
-use std::sync::Arc;
+use gnitz_wire::ReadSink;
+use sqlparser::ast::{Assignment, AssignmentTarget, FromTable};
 
 // ---------------------------------------------------------------------------
 // SET-list helpers (shared with INSERT's ON CONFLICT DO UPDATE)
@@ -192,13 +192,14 @@ where
     Ok(())
 }
 
-/// Write the SET-merged update row for every `matched` index of `current` into
-/// `dst` (each at weight +1). The assignment index is built once and reused
-/// across rows — it depends only on `assignments` and `schema`, not the row —
-/// mirroring INSERT's `client_side_merge_do_update` loop.
+/// Write the SET-merged update row for every row of `current` into `dst` (each at
+/// weight +1). `current` is the matched set outright — the server applied the
+/// whole WHERE to the committed rows and `resolve_where_rows` filtered the
+/// buffered ones. The assignment index is built once and reused across rows — it
+/// depends only on `assignments` and `schema`, not the row — mirroring INSERT's
+/// `client_side_merge_do_update` loop.
 fn write_set_rows(
     current: &ZSetBatch,
-    matched: &[usize],
     assignments: &[(usize, SetProgram)],
     schema: &Schema,
     dst: &mut ZSetBatch,
@@ -214,7 +215,7 @@ fn write_set_rows(
     // PK-region rebuild per row.
     let mut bufs = ViewBuffers::default();
     let view = bufs.view(current, schema);
-    for &row_idx in matched {
+    for row_idx in 0..current.len() {
         build_merged_row(current, row_idx, current, row_idx, schema, dst, |ci| {
             asn_by_col[ci].map(|p| eval_set_program(p, &view, row_idx))
         })?;
@@ -223,123 +224,85 @@ fn write_set_rows(
 }
 
 // ---------------------------------------------------------------------------
-// Shared WHERE-row resolution (the UPDATE/DELETE access-path ladder)
+// WHERE resolution — one read for both verbs, under the sink each one needs
 // ---------------------------------------------------------------------------
 
-/// The rows a single-table UPDATE/DELETE `WHERE` (or its absence) resolves to.
-/// `batch` is the effective state (the fetched seek/scan reply, overlaid with the
-/// open transaction's buffered writes — see `overlay`); `matched` indexes the
-/// rows that passed the residual/predicate. UPDATE writes a SET batch from
-/// `matched`; DELETE collects their PKs.
-struct ResolvedRows {
-    /// Schema returned with the fetched batch (the wire reply overrides the
-    /// catalog schema for column metadata), if any.
-    schema: Option<Arc<Schema>>,
-    /// The effective rows.
-    batch: ZSetBatch,
-    /// Indices into `batch` that passed the residual/predicate.
-    matched: Vec<usize>,
-}
-
-/// Resolve `selection` to the matching rows of `tid`, walking the shared
-/// UPDATE/DELETE access-path ladder: PK point-seek → secondary-index equality
-/// seek (first existing index wins) → predicate full scan; or a full scan of
-/// every row when there is no `WHERE`.
+/// Bind a single-table UPDATE/DELETE `WHERE` (or its absence) and plan it through
+/// the shared access-path ladder.
 ///
-/// Each arm fetches the committed rows, then overlays the open transaction's own
-/// buffered writes ([`overlay_batch`]) before the predicate derives `matched` —
-/// so a buffered payload that fails a WHERE the committed payload passed matches
-/// nothing, and a transaction-born row is discovered. **In autocommit every net
-/// map is empty, the overlay is the identity, and this is exactly the plain
-/// committed ladder.** The seek arms overlay only the keys they seeked: their
-/// residual does not constrain the PK, so an unrelated buffered row must not
-/// enter their effective batch.
-fn resolve_where_rows(
+/// Planned once per statement, ahead of the read: the plan depends only on the
+/// schema and the index list, both fixed within this statement's catalog
+/// snapshot, so an RMW retry re-reads but never re-plans. The DML verbs may chunk
+/// a long `pk IN (…)` gather across requests because their RMW driver
+/// preconditions the whole statement on the table being unwritten since the basis.
+fn plan_where<'e>(
     client: &mut GnitzClient,
     tid: u64,
     schema: &Schema,
-    selection: Option<&Expr>,
-) -> Result<ResolvedRows, GnitzSqlError> {
-    // Bind the WHERE once; classification and residuals run on the bound conjuncts.
-    let bound = selection.map(|s| bind_single_table(s, schema)).transpose()?;
-    match classify_access(bound.as_ref(), schema) {
-        AccessPath::ScanAll => {
-            let (schema_opt, committed, _) = client.scan(tid)?;
-            let net = buffered_all(client, tid);
-            resolve(schema, schema_opt, committed, &net, &[])
-        }
-        AccessPath::PkSeek { pk, residual } => {
-            let (schema_opt, committed, _) = client.seek(tid, &pk)?;
-            let net = buffered_keys(client, tid, std::slice::from_ref(&pk));
-            resolve(schema, schema_opt, committed, &net, &residual)
-        }
-        AccessPath::PkMultiSeek { pks, residual } => {
-            // `pk IN (…)`: the concatenated seek replies are the keyed rows, which
-            // `residual` then filters down to the matching ones. An absent key
-            // contributes none, so the count reports rows actually touched.
-            let committed = seek_pk_multi(client, tid, schema, &pks)?;
-            let stride = schema.pk_stride() as u8;
-            let keys: Vec<PkTuple> = pks.iter().map(|&k| PkTuple::from_u128(stride, k)).collect();
-            let net = buffered_keys(client, tid, &keys);
-            resolve(schema, None, committed, &net, &residual)
-        }
-        AccessPath::Filtered { where_expr } => {
-            let (schema_opt, committed, residual) = fetch_filtered(client, tid, schema, where_expr)?;
-            let net = buffered_all(client, tid);
-            // Committed rows already satisfy the winning index's equality prefix,
-            // so its reduced `residual` decides them — and it is the only form the
-            // residual evaluator can always handle (an indexed 128-bit equality is
-            // seekable but not evaluable). Buffered rows are unindexed, so once the
-            // transaction has touched this table every row must face the FULL
-            // predicate instead.
-            let preds: Vec<&BoundExpr> = if net.is_empty() { residual } else { vec![where_expr] };
-            resolve(schema, schema_opt, committed, &net, &preds)
-        }
-    }
+    where_expr: Option<&'e BoundExpr>,
+) -> Result<AccessPlan<'e>, GnitzSqlError> {
+    bound_and_predicate(schema, where_expr, ReadBudget::MayChunk, || client.table_indexes(tid))
 }
 
-/// The ladder's shared tail: overlay the buffered writes onto the committed
-/// batch, bind `residual` against the catalog schema, and match it per effective
-/// row. An empty residual passes every row.
-fn resolve(
-    schema: &Schema,
-    schema_opt: Option<Arc<Schema>>,
-    committed: Option<ZSetBatch>,
-    net: &Net,
-    preds: &[&BoundExpr],
-) -> Result<ResolvedRows, GnitzSqlError> {
-    let actual = schema_opt.as_deref().unwrap_or(schema);
-    let batch = overlay_batch(committed, net, actual);
-    let matched = matching_indices(preds, &batch, actual)?;
-    Ok(ResolvedRows {
-        schema: schema_opt,
-        batch,
-        matched,
-    })
+/// DELETE's read shape: the source PK columns and nothing else. `build_read_projection`
+/// over an empty SELECT list is exactly that — the PK is always prepended, and
+/// there is no payload item to follow it — so the reply carries the key region
+/// and no blob heap, and the projection program relocates nothing.
+fn pk_only_reply(schema: &Schema) -> Result<(Schema, ReadSink), GnitzSqlError> {
+    let (items, out_cols) = build_read_projection(&[], schema)?;
+    let (reply_schema, projection) = read_reply_shape(&items, out_cols, schema)?;
+    let sink = ReadSink::Rows {
+        projection,
+        order: Vec::new(),
+        limit_k: 0, // unbounded
+    };
+    Ok((reply_schema, sink))
 }
 
-/// Fetch the committed candidates for a `Filtered` WHERE: the first existing
-/// index's equality seek (with the reduced residual left over from consuming its
-/// key columns), else the full scan (residual = the whole bound predicate). The
-/// first index that exists serves the query — a hit with no matching rows is
-/// terminal, it does NOT fall through to the scan.
-type FilteredFetch<'e> = (Option<Arc<Schema>>, Option<ZSetBatch>, Vec<&'e BoundExpr>);
-
-fn fetch_filtered<'e>(
+/// The rows a single-table UPDATE/DELETE `WHERE` (or its absence) resolves to,
+/// under `reply_schema`. Every row of the result matches, so the caller writes
+/// the whole batch — UPDATE reads it under the catalog schema (an identity sink)
+/// and merges the SET list into it; DELETE reads a PK-only reply and keeps its
+/// key region.
+///
+/// **Committed reply rows are final** — the server applied `bound ∧ predicate`,
+/// which together are the whole WHERE. Only the transaction's own buffered rows,
+/// which no server-side walk ever saw, are re-filtered here. So **in autocommit
+/// the reply IS the answer**, returned wholesale with no copy and no client-side
+/// predicate compiled at all.
+fn resolve_where_matches(
     client: &mut GnitzClient,
     tid: u64,
     schema: &Schema,
-    where_expr: &'e BoundExpr,
-) -> Result<FilteredFetch<'e>, GnitzSqlError> {
-    let candidates =
-        collect_index_seek_candidates(where_expr, schema, || client.table_indexes(tid)).map_err(GnitzSqlError::Exec)?;
-    if let Some((cand, (schema_opt, batch_opt, _))) =
-        first_index_hit(candidates, |c| client.seek_by_index(tid, c.cols.as_slice(), &c.vals))?
-    {
-        return Ok((schema_opt, batch_opt, cand.residual));
+    plan: &AccessPlan<'_>,
+    sink: &ReadSink,
+    reply_schema: &Schema,
+) -> Result<ZSetBatch, GnitzSqlError> {
+    let mut committed = fetch_bound(client, tid, plan, sink, reply_schema)?;
+    let (keys, preds) = plan.buffered_scope(schema);
+    let net = buffered_net(client, tid, keys.as_deref());
+    if net.is_empty() {
+        return Ok(committed.unwrap_or_else(|| ZSetBatch::new(reply_schema)));
     }
-    let (schema_opt, batch_opt, _) = client.scan(tid)?;
-    Ok((schema_opt, batch_opt, vec![where_expr]))
+    let mut present = present_rows(&net, schema);
+    let matched = matching_indices(preds, &present, schema)?;
+
+    let n = committed.as_ref().map_or(0, ZSetBatch::len) + matched.len();
+    let mut eff = ZSetBatch::with_capacity(reply_schema, n);
+    if let Some(b) = &mut committed {
+        let stride = schema.pk_stride() as u8;
+        for i in 0..b.len() {
+            // A PK the transaction has written is decided by its buffered version
+            // below, whatever the committed row said.
+            if !net.contains_key(&b.pks.get_tuple(i, stride)) {
+                copy_batch_row_owned(b, i, &mut eff, reply_schema);
+            }
+        }
+    }
+    for i in matched {
+        copy_batch_row_owned(&mut present, i, &mut eff, reply_schema);
+    }
+    Ok(eff)
 }
 
 // ---------------------------------------------------------------------------
@@ -366,37 +329,35 @@ pub(crate) fn execute_update(
         assignments.push((col_idx, bind_single_table(&assignment.value, &schema)?));
     }
 
+    // Compile the SET list against the catalog schema — the one the RHS was bound
+    // against, and the one the rows come back under, since the identity sink
+    // replies in the source shape. Resolution bakes in payload slots, PK byte
+    // offsets, type codes and the nullability verdict.
+    //
+    // Ahead of the read, not inside it: an un-compilable RHS (`SET int_col =
+    // float_col`, a wide literal) errors deterministically, never only when at
+    // least one row matched.
+    let programs = assignments
+        .iter()
+        .map(|(ci, e)| Ok((*ci, classify_set_rhs(e, *ci, &schema)?)))
+        .collect::<Result<Vec<_>, GnitzSqlError>>()?;
+
+    let where_expr = selection.as_ref().map(|s| bind_single_table(s, &schema)).transpose()?;
+    let plan = plan_where(client, table_id, &schema, where_expr.as_ref())?;
+    let sink = ReadSink::all_rows();
+
     // Read the target rows and build the SET batch under the RMW driver: an
     // autocommit UPDATE commits it lose-update-free via a one-precondition TXN
     // frame with bounded retry; inside a transaction it buffers and records the
     // read-set. The build re-runs per retry so a conflict re-reads fresh state.
     let count = commit_rmw_or_buffer(client, &table_name, table_id, |client| {
-        let resolved = resolve_where_rows(client, table_id, &schema, selection.as_ref())?;
-        let actual_schema = resolved.schema.as_deref().unwrap_or(&*schema);
-        // Compile against the schema the rows actually carry — the reply schema,
-        // not the catalog one the RHS was bound against: resolution bakes in
-        // payload slots, PK byte offsets, type codes and the nullability verdict,
-        // so compiling against the wrong schema miscomputes silently.
-        //
-        // Unconditional, above the row-count check: an un-compilable RHS
-        // (`SET int_col = float_col`, a wide literal) then errors deterministically
-        // instead of only when at least one row matched.
-        let programs = assignments
-            .iter()
-            .map(|(ci, e)| Ok((*ci, classify_set_rhs(e, *ci, actual_schema)?)))
-            .collect::<Result<Vec<_>, GnitzSqlError>>()?;
-        let count = resolved.matched.len();
+        let matched = resolve_where_matches(client, table_id, &schema, &plan, &sink, &schema)?;
+        let count = matched.len();
         let write = if count > 0 {
-            let mut updates = ZSetBatch::new(actual_schema);
-            write_set_rows(
-                &resolved.batch,
-                &resolved.matched,
-                &programs,
-                actual_schema,
-                &mut updates,
-            )?;
+            let mut updates = ZSetBatch::with_capacity(&schema, count);
+            write_set_rows(&matched, &programs, &schema, &mut updates)?;
             Some(RmwWrite {
-                schema: actual_schema.clone(),
+                schema: (*schema).clone(),
                 batch: updates,
                 mode: WireConflictMode::Update,
             })
@@ -430,34 +391,31 @@ pub(crate) fn execute_delete(
 
     let (table_id, schema) = binder.resolve_base_table(client, &table_name)?;
 
+    let where_expr = del
+        .selection
+        .as_ref()
+        .map(|s| bind_single_table(s, &schema))
+        .transpose()?;
+    let plan = plan_where(client, table_id, &schema, where_expr.as_ref())?;
+    let (reply_schema, sink) = pk_only_reply(&schema)?;
+
     // Resolve the target PKs and build the retraction batch under the RMW driver
     // (autocommit: one-precondition TXN frame with bounded retry; in a
     // transaction: buffer + record the read-set). The build re-runs per retry.
+    //
+    // The retraction is built under the CATALOG schema, whose payload placeholders
+    // `retraction_batch` fills, so an in-transaction DELETE buffers under the same
+    // schema INSERT does (`TxnBuffer` extends a tid's later batches into the first
+    // family's schema).
     let count = commit_rmw_or_buffer(client, &table_name, table_id, |client| {
-        let resolved = resolve_where_rows(client, table_id, &schema, del.selection.as_ref())?;
-        let actual_schema = resolved.schema.as_deref().unwrap_or(&*schema);
-        let count = resolved.matched.len();
-        let write = if count > 0 {
-            let batch = resolved.batch;
-            // Whole batch matched (the common no-WHERE `DELETE FROM t`): move the
-            // PK region wholesale rather than copying it row by row.
-            let pks = if count == batch.pks.len() {
-                batch.pks
-            } else {
-                let mut out_pks = PkColumn::empty_for_schema(actual_schema);
-                for &i in &resolved.matched {
-                    out_pks.push_from(&batch.pks, i);
-                }
-                out_pks
-            };
-            Some(RmwWrite {
-                schema: actual_schema.clone(),
-                batch: retraction_batch(actual_schema, pks),
-                mode: WireConflictMode::Update,
-            })
-        } else {
-            None
-        };
+        let matched = resolve_where_matches(client, table_id, &schema, &plan, &sink, &reply_schema)?;
+        let pks = matched.pks;
+        let count = pks.len();
+        let write = (count > 0).then(|| RmwWrite {
+            schema: (*schema).clone(),
+            batch: retraction_batch(&schema, pks),
+            mode: WireConflictMode::Update,
+        });
         Ok(RmwBuild { count, write })
     })?;
     Ok(SqlResult::RowsAffected { count })
@@ -500,7 +458,7 @@ mod tests {
 
         let assignments = vec![(1usize, BoundExpr::LitInt(99))];
         let mut dst = ZSetBatch::new(&schema);
-        write_set_rows(&current, &[0], &programs(&assignments, &schema), &schema, &mut dst).unwrap();
+        write_set_rows(&current, &programs(&assignments, &schema), &schema, &mut dst).unwrap();
 
         assert_eq!(
             dst.nulls[0] & 0b1,
@@ -538,7 +496,7 @@ mod tests {
         // SET a = b  (ColRef(2) = b, which is NULL in current)
         let assignments = vec![(1usize, BoundExpr::ColRef(2))];
         let mut dst = ZSetBatch::new(&schema);
-        write_set_rows(&current, &[0], &programs(&assignments, &schema), &schema, &mut dst).unwrap();
+        write_set_rows(&current, &programs(&assignments, &schema), &schema, &mut dst).unwrap();
 
         // a's null bit (payload_idx 0 → bit 0) must now be set
         assert_ne!(dst.nulls[0] & 0b01, 0, "a must be null after SET a = NULL_col");
@@ -571,7 +529,7 @@ mod tests {
         // Only assign to a; b is untouched
         let assignments = vec![(1usize, BoundExpr::LitInt(10))];
         let mut dst = ZSetBatch::new(&schema);
-        write_set_rows(&current, &[0], &programs(&assignments, &schema), &schema, &mut dst).unwrap();
+        write_set_rows(&current, &programs(&assignments, &schema), &schema, &mut dst).unwrap();
 
         assert_eq!(dst.nulls[0] & 0b01, 0, "a must not be null (assigned non-null)");
         assert_ne!(dst.nulls[0] & 0b10, 0, "b must remain null (unassigned)");
@@ -602,7 +560,7 @@ mod tests {
 
         let assignments = vec![(2usize, BoundExpr::LitInt(99))];
         let mut dst = ZSetBatch::new(&schema);
-        write_set_rows(&current, &[0], &programs(&assignments, &schema), &schema, &mut dst).unwrap();
+        write_set_rows(&current, &programs(&assignments, &schema), &schema, &mut dst).unwrap();
 
         if let ColData::Bytes(v) = &dst.columns[1] {
             assert_eq!(v[0].as_deref(), Some(&[1u8, 2, 3][..]));
@@ -722,7 +680,7 @@ mod tests {
             Box::new(BoundExpr::LitInt(1)),
         );
         let mut dst = ZSetBatch::new(&schema);
-        write_set_rows(&current, &[0, 1], &programs(&[(1, rhs)], &schema), &schema, &mut dst).unwrap();
+        write_set_rows(&current, &programs(&[(1, rhs)], &schema), &schema, &mut dst).unwrap();
 
         assert_eq!(written_i64(&dst, 1), 6, "non-null source: b + 1");
         assert_eq!(dst.nulls[0] & 0b01, 0, "row 0's a is not null");
@@ -750,14 +708,13 @@ mod tests {
             Box::new(BoundExpr::LitInt(1)),
         );
         let mut dst = ZSetBatch::new(&schema);
-        write_set_rows(&current, &[0], &programs(&[(1, plus_one)], &schema), &schema, &mut dst).unwrap();
+        write_set_rows(&current, &programs(&[(1, plus_one)], &schema), &schema, &mut dst).unwrap();
         assert_eq!(written_i64(&dst, 1), 42);
 
         // And the bare `SET val = pk` form.
         let mut dst = ZSetBatch::new(&schema);
         write_set_rows(
             &current,
-            &[0],
             &programs(&[(1, BoundExpr::ColRef(0))], &schema),
             &schema,
             &mut dst,

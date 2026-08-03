@@ -237,7 +237,7 @@ impl CatalogEngine {
     /// descriptor pins every column with no range column left (a trust-boundary
     /// rejection). No selectivity gate and no residual — the byte-exact OPK walk
     /// yields exactly the in-range source rows, so callers needing every match
-    /// (the point/range seek, a wide-int ScanSpec bound) drive this directly.
+    /// (the point/range seek, an `exact` ScanSpec index bound) drive this directly.
     ///
     /// Preserves the write-ordering guarantee of the non-atomic base-then-index
     /// write path: the index cursor snapshots first and each base partition is
@@ -379,7 +379,7 @@ impl CatalogEngine {
     /// outcome is a PERFORMANCE choice,
     /// never a correctness one — a caller's authoritative filter (a circuit's
     /// `Filter`, a ScanSpec's residual predicate) re-imposes the range — so the
-    /// ≤8-byte-int ScanSpec bound and the circuit backfill share this one gate.
+    /// non-`exact` ScanSpec index bound and the circuit backfill share this one gate.
     ///
     /// `None` iff `source` is unregistered (byte-identical to
     /// `open_store_cursor`'s contract, which callers treat as "skip this source").

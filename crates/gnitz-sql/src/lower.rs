@@ -382,6 +382,23 @@ pub(crate) fn compile_filter_program(
     }
 }
 
+/// [`compile_filter_program`] encoded as the wire predicate blob a `ReadSpec`
+/// carries; empty for the statically-true verdict (the bound is exact).
+///
+/// The program is validated here even though nothing client-side runs it: the
+/// worker's `LogicalProgram::from_wire` applies the identical schema-free checks
+/// (register cap, opcodes, operand bounds), so doing it locally turns a
+/// round-trip `STATUS_ERROR` naming an internal enum into a plan-time
+/// `Unsupported`.
+pub(crate) fn compile_wire_predicate(pred: &BoundExpr, cols: &[ColumnDef]) -> Result<Vec<u8>, GnitzSqlError> {
+    let Some(p) = compile_filter_program(pred, cols)? else {
+        return Ok(Vec::new());
+    };
+    let blob = p.encode();
+    to_logical(p)?;
+    Ok(blob)
+}
+
 /// Compile a whole-predicate WHERE/HAVING/residual filter into the shared
 /// evaluator, resolved against the schema the rows it will run over carry.
 /// `None` is [`compile_filter_program`]'s statically-true verdict — the caller

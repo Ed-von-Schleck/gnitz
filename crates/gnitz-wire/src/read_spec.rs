@@ -17,12 +17,13 @@ use crate::range::RangeDescriptor;
 
 /// ORDER BY keys apply in sequence; a spec carries at most this many.
 pub const MAX_ORDER_KEYS: usize = 16;
-/// A `pk IN (…)` list larger than this rejects cleanly at bind time.
+/// Decode-side ceiling on one `pk IN (…)` gather. A longer list is served as
+/// several gathers or as an ordinary predicate scan, never rejected.
 pub const MAX_PK_SET_KEYS: usize = 65_536;
 /// Decode-side ceiling on a full encoded `ReadSpec` blob.
 pub const MAX_READ_SPEC_BYTES: usize = 2 << 20;
 
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 
 const BOUND_NONE: u8 = 0;
 const BOUND_PK_RANGE: u8 = 1;
@@ -114,15 +115,21 @@ pub enum ReadBound {
     /// point lookup is `n_eq = pk_count − 1` with degenerate cuts. Exact — no
     /// residual is needed for the bound itself.
     PkRange(RangeDescriptor),
-    /// Secondary-index range: the packed index column list and the descriptor.
-    /// The worker decides the walk from the range column's type: a wide-int
-    /// (U128/UUID) index — the one index-eligible family the predicate VM
-    /// cannot express, whose conjunct the SQL layer therefore strips — runs an
-    /// un-gated byte-exact `BoundedIndexCursor`; a ≤8-byte-integer index is
-    /// selectivity-gated (may fall back to a full cursor) and the conjunct
-    /// stays in the predicate. Both sides derive the split from the same
-    /// column type, so a stripped conjunct is always re-imposed by the walk.
-    IndexRange { idx_cols: u64, desc: RangeDescriptor },
+    /// Secondary-index range: the packed index column list, whether the walk
+    /// must be exact, and the descriptor.
+    ///
+    /// `exact` is the SQL layer's statement that it **stripped** the bounded
+    /// conjuncts from `predicate` — so the walk is the only thing that applies
+    /// them and must not be traded away. The worker then runs an un-gated
+    /// byte-exact `BoundedIndexCursor`. With `exact = false` the conjuncts are
+    /// still in `predicate`, so the walk is only an access optimization and the
+    /// worker may fall back to a full cursor when the range covers too much of
+    /// the table.
+    IndexRange {
+        idx_cols: u64,
+        exact: bool,
+        desc: RangeDescriptor,
+    },
     /// `pk IN (…)` for a single-column PK. Values are raw native keys widened to
     /// `u128` (`FixedInt::pack`), and must be **distinct after truncation to the
     /// PK's width** — the worker rejects the rest. Wire order is irrelevant: the
@@ -282,31 +289,39 @@ fn read_range_descriptor(r: &mut Reader) -> Result<RangeDescriptor, String> {
 impl ReadSpec {
     /// Serialise to a version-prefixed LE byte sequence (§ layout below).
     pub fn encode(&self) -> Vec<u8> {
+        Self::encode_parts(&self.bound, &self.predicate, &self.sink)
+    }
+
+    /// [`Self::encode`] over borrowed parts — the form a caller that re-sends one
+    /// spec under several bounds uses, so the predicate and sink are encoded in
+    /// place instead of cloned per request.
+    pub fn encode_parts(bound: &ReadBound, predicate: &[u8], sink: &ReadSink) -> Vec<u8> {
         // Header: version | bound_kind | sink_tag | reserved. One up-front
         // reservation covering every section (64 covers the fixed header,
         // range descriptors, and section length prefixes).
-        let sink_tag = match &self.sink {
+        let sink_tag = match sink {
             ReadSink::Rows { .. } => SINK_ROWS,
             ReadSink::Fold(_) => SINK_FOLD,
         };
         let cap = 64
-            + self.predicate.len()
-            + match &self.bound {
+            + predicate.len()
+            + match bound {
                 ReadBound::PkSet(keys) => 16 * keys.len(),
                 _ => 0,
             }
-            + match &self.sink {
+            + match sink {
                 ReadSink::Rows { projection, order, .. } => projection.len() + 4 * order.len(),
                 ReadSink::Fold(agg) => 2 * agg.group_cols.len() + 3 * agg.aggs.len(),
             };
         let mut out = Vec::with_capacity(cap);
-        out.extend_from_slice(&[VERSION, self.bound.kind(), sink_tag, 0u8]);
+        out.extend_from_slice(&[VERSION, bound.kind(), sink_tag, 0u8]);
 
-        match &self.bound {
+        match bound {
             ReadBound::None => {}
             ReadBound::PkRange(desc) => out.extend_from_slice(&desc.encode()),
-            ReadBound::IndexRange { idx_cols, desc } => {
+            ReadBound::IndexRange { idx_cols, exact, desc } => {
                 out.extend_from_slice(&idx_cols.to_le_bytes());
+                out.push(*exact as u8);
                 out.extend_from_slice(&desc.encode());
             }
             ReadBound::PkSet(keys) => {
@@ -317,9 +332,9 @@ impl ReadSpec {
             }
         }
 
-        put_bytes32(&mut out, &self.predicate);
+        put_bytes32(&mut out, predicate);
 
-        match &self.sink {
+        match sink {
             ReadSink::Rows {
                 projection,
                 order,
@@ -383,8 +398,13 @@ impl ReadSpec {
             BOUND_PK_RANGE => ReadBound::PkRange(read_range_descriptor(&mut r)?),
             BOUND_INDEX_RANGE => {
                 let idx_cols = r.u64()?;
+                let exact = match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    other => return Err(format!("read_spec: IndexRange exact flag {other} is not 0 or 1")),
+                };
                 let desc = read_range_descriptor(&mut r)?;
-                ReadBound::IndexRange { idx_cols, desc }
+                ReadBound::IndexRange { idx_cols, exact, desc }
             }
             BOUND_PK_SET => {
                 let count = r.u32()? as usize;
@@ -518,6 +538,7 @@ mod tests {
             ReadSpec {
                 bound: ReadBound::IndexRange {
                     idx_cols: 0x0000_0002_0000_0001,
+                    exact: false,
                     desc: RangeDescriptor::new(&[7], Before(1), Before(u128::MAX)),
                 },
                 predicate: vec![5, 5],
@@ -526,6 +547,17 @@ mod tests {
                     order: sample_order(),
                     limit_k: 100,
                 },
+            },
+            // The exact form: the client stripped the bounded conjuncts, so the
+            // flag must survive the round trip or the walk becomes tradeable.
+            ReadSpec {
+                bound: ReadBound::IndexRange {
+                    idx_cols: 0x0000_0000_0000_0003,
+                    exact: true,
+                    desc: RangeDescriptor::point(&[], u128::MAX),
+                },
+                predicate: vec![],
+                sink: ReadSink::all_rows(),
             },
             ReadSpec {
                 bound: ReadBound::PkSet(vec![5, 10, 3, 99]),

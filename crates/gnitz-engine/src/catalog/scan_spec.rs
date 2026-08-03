@@ -25,7 +25,7 @@ use crate::expr::ScalarFunc;
 use crate::ops::AdhocFold;
 use crate::query::StoreProbe;
 use crate::schema::key::{compare_pk_bytes, opk_key, PkBuf};
-use crate::schema::{ColumnLocator, TypeCode};
+use crate::schema::ColumnLocator;
 use crate::storage::{cmp_col_window, compare_rows};
 use gnitz_expr::{LogicalProgram, RowSource};
 
@@ -43,7 +43,7 @@ impl CatalogEngine {
     ///
     /// `Err` on a corrupt program blob, a reply schema that does not match the
     /// sink's expected shape (rows: PK-stride equality; fold: the derived
-    /// SyntheticFold layout), a missing wide-int index — every one a
+    /// SyntheticFold layout), an index an `exact` bound needs and cannot find — every one a
     /// corrupt/stale frame, surfaced as a `STATUS_ERROR` reply — or the fold's
     /// per-worker group cap (a resource-exhaustion abort).
     pub(crate) fn scan_spec_family(
@@ -173,26 +173,18 @@ impl CatalogEngine {
                     Ok(ScanSpecCursor::Source(SourceCursor::Full(Box::new(cursor))))
                 }
             },
-            ReadBound::IndexRange { idx_cols, desc } => {
+            ReadBound::IndexRange { idx_cols, exact, desc } => {
                 let cols = gnitz_wire::unpack_pk_cols(*idx_cols);
                 if !cols.is_well_formed() {
                     return Err(format!("scan_spec: malformed index column list for table {source}"));
                 }
-                // The range column's type picks the walk — the same split the SQL
-                // layer strips conjuncts by (`TypeCode::is_wide_int`, the one
-                // authority): wide → un-gated byte-exact walk, since no compiled
-                // predicate can re-impose the bound; narrow → selectivity-gated
-                // (may fall back to a full cursor), the conjunct rides the
-                // predicate.
-                let range_col = cols
-                    .as_slice()
-                    .get(desc.eq_vals().len())
-                    .map(|&c| c as usize)
-                    .filter(|&c| c < src_schema.num_columns())
-                    .ok_or_else(|| format!("scan_spec: index range column out of bounds for table {source}"))?;
-                let wide =
-                    TypeCode::try_from_u8(src_schema.columns[range_col].type_code).is_some_and(|tc| tc.is_wide_int());
-                if wide {
+                // `exact` says the SQL layer stripped the bounded conjuncts from
+                // the predicate, so this walk is the only thing applying them:
+                // run it un-gated, and fail rather than degrade if the index is
+                // gone (a full cursor would return rows nothing re-filters).
+                // Otherwise the conjuncts ride the predicate and the walk is an
+                // access optimization the selectivity gate may trade away.
+                if *exact {
                     match self.open_index_range_cursor(source, cols.as_slice(), desc, 0)? {
                         None => Ok(ScanSpecCursor::Source(SourceCursor::Empty)),
                         Some(c) => Ok(ScanSpecCursor::Source(SourceCursor::Bounded(Box::new(c)))),

@@ -139,7 +139,7 @@ fn try_col_eq_literal(expr: &BoundExpr, schema: &Schema) -> Option<(usize, u128)
 /// The keys of a bound `pk IN (literal, …)` conjunct on a single-column PK, deduped
 /// (first occurrence wins). `None` for any other conjunct. `NOT IN` binds to
 /// `UnaryOp(Not, InList)` and so never matches here; a one-key `IN` folds to `Eq` at
-/// bind and is served by [`try_extract_pk_seek_residual`] / [`try_extract_pk_range`].
+/// bind and is served by [`try_extract_pk_range`].
 fn pk_in_keys(conjunct: &BoundExpr, schema: &Schema) -> Option<Vec<u128>> {
     // Compound PK has no IN-list fast path; fall back to a full delta scan.
     if schema.pk_count() != 1 {
@@ -190,45 +190,32 @@ pub(crate) fn try_extract_pk_in<'e>(expr: &'e BoundExpr, schema: &Schema) -> Opt
     Some((keys, residual_conjuncts(&conjuncts, &[ci])))
 }
 
-/// `Some((pk_tuple, residual))` when the conjuncts of `expr` bind every PK column
-/// to a literal; `residual` holds the leftover bound conjuncts to filter against
-/// the seeked row, empty when the `WHERE` is exactly the PK equality. `None` when
-/// the PK is not fully bound.
-pub(crate) fn try_extract_pk_seek_residual<'e>(
-    expr: &'e BoundExpr,
-    schema: &Schema,
-) -> Option<(PkTuple, Vec<&'e BoundExpr>)> {
-    let mut conjuncts = Vec::new();
-    flatten_bound_conjuncts(expr, &mut conjuncts);
-
-    let stride = schema.pk_stride() as u8;
-    let mut tuple = PkTuple::new(stride);
-    let mut slot_set = [false; gnitz_core::MAX_PK_COLUMNS];
-    let mut bound = 0usize;
-    let mut residual = Vec::new();
-
-    for &cand in &conjuncts {
-        // Consume `pk_col = literal` for an as-yet-unbound PK slot into the tuple;
-        // everything else routes to the residual.
-        let mut consumed = false;
-        if let Some((col_idx, val)) = try_col_eq_literal(cand, schema) {
-            if let Some(pk_pos) = schema.pk_indices().iter().position(|&pi| pi == col_idx) {
-                if !slot_set[pk_pos] {
-                    slot_set[pk_pos] = true;
-                    bound += 1;
-                    let off = schema.pk_byte_offset(col_idx);
-                    let w = schema.columns[col_idx].type_code.wire_stride();
-                    tuple.buf[off..off + w].copy_from_slice(&val.to_le_bytes()[..w]);
-                    consumed = true;
-                }
-            }
-        }
-        if !consumed {
-            residual.push(cand);
-        }
+/// The single key a **fully-pinned** point PK descriptor names: `desc`'s equality
+/// values pin the leading PK columns and its cut value pins the next one, which
+/// must be the last. `None` for any looser descriptor — a point covering only a
+/// PK *prefix* names a key group, not a key, and admits more than one row.
+///
+/// Packs each value natively little-endian at the column's `pk_byte_offset` in
+/// `wire_stride` width, so a mixed-width compound PK lands correctly (the offset
+/// is the running sum in PK-list order). Equality keys and range cuts both pack
+/// through `FixedInt::pack`, so the tuple is byte-identical whichever conjunct
+/// spelling produced the point.
+pub(crate) fn pk_point_tuple(desc: &RangeDescriptor, schema: &Schema) -> Option<PkTuple> {
+    if !desc.is_point() || desc.eq_vals().len() + 1 != schema.pk_count() {
+        return None;
     }
-
-    (bound == schema.pk_count()).then_some((tuple, residual))
+    let mut tuple = PkTuple::new(schema.pk_stride() as u8);
+    let vals = desc
+        .eq_vals()
+        .iter()
+        .copied()
+        .chain(std::iter::once(desc.start.value()));
+    for (&col_idx, val) in schema.pk_indices().iter().zip(vals) {
+        let off = schema.pk_byte_offset(col_idx);
+        let w = schema.columns[col_idx].type_code.wire_stride();
+        tuple.buf[off..off + w].copy_from_slice(&val.to_le_bytes()[..w]);
+    }
+    Some(tuple)
 }
 
 /// An **exact-or-superset** PK range for `where_expr` plus the residual bound
@@ -503,10 +490,10 @@ fn bound_next_column(
 /// One index-servable seek candidate: the index's FULL declared column list, the
 /// covered leading key values, and the residual bound conjuncts to filter after
 /// the seek.
-pub(crate) struct IndexSeekCandidate<'e> {
-    pub(crate) cols: PkColList,
-    pub(crate) vals: Vec<u128>,
-    pub(crate) residual: Vec<&'e BoundExpr>,
+struct IndexSeekCandidate<'e> {
+    cols: PkColList,
+    vals: Vec<u128>,
+    residual: Vec<&'e BoundExpr>,
     /// Whether the index this candidate seeks is UNIQUE.
     is_unique: bool,
 }
@@ -523,7 +510,7 @@ impl IndexSeekCandidate<'_> {
 /// Every index-servable seek candidate among the conjuncts of `expr`, best first.
 /// `fetch_indexes` (one epoch-validated GET_INDICES round-trip) is called only when
 /// at least one eligible equality exists.
-pub(crate) fn collect_index_seek_candidates<'e>(
+fn collect_index_seek_candidates<'e>(
     expr: &'e BoundExpr,
     schema: &Schema,
     fetch_indexes: impl FnOnce() -> Result<Arc<Vec<IndexMeta>>, ClientError>,
@@ -866,65 +853,73 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // try_extract_pk_seek_residual — compound PK + residual carry
+    // pk_point_tuple — the exact key a fully-pinned PK point names
     // ------------------------------------------------------------------
 
-    #[test]
-    fn compound_pk_try_extract_pk_seek_full_binding() {
-        let schema = compound_schema_u64_u64();
-        let expr = bind_where("a = 1 AND b = 2", &schema);
-        let (pk, residual) = try_extract_pk_seek_residual(&expr, &schema).expect("must bind");
-        assert!(residual.is_empty());
-        assert_eq!(pk.stride, 16);
-        let mut expect = [0u8; 16];
-        expect[..8].copy_from_slice(&1u64.to_le_bytes());
-        expect[8..16].copy_from_slice(&2u64.to_le_bytes());
-        assert_eq!(pk.as_bytes(), &expect[..]);
+    /// The key a `WHERE` resolves to through the PK-range recognizer, plus that
+    /// recognizer's residual. `None` when the descriptor pins fewer than every PK
+    /// column (it then names a key group, not a key).
+    fn pk_point_of<'e>(expr: &'e BoundExpr, schema: &Schema) -> Option<(PkTuple, Vec<&'e BoundExpr>)> {
+        let (desc, residual) = try_extract_pk_range(expr, schema)?;
+        pk_point_tuple(&desc, schema).map(|t| (t, residual))
     }
 
+    /// Which WHEREs over a compound PK name a single key, and which name only a
+    /// key *group* — a group must never restrict a caller's buffered rows to one
+    /// PK. The named key packs in pk-list order however the conjuncts were
+    /// spelled, and whatever does not bind the PK rides the residual.
     #[test]
-    fn compound_pk_try_extract_pk_seek_reordered_and_tree() {
+    fn a_compound_pk_point_names_a_key_only_when_every_column_binds() {
         let schema = compound_schema_u64_u64();
-        // (b = 2) AND (a = 1) — order swapped; tuple must still pack in pk-list order.
-        let expr = bind_where("b = 2 AND a = 1", &schema);
-        let (pk, residual) = try_extract_pk_seek_residual(&expr, &schema).expect("must bind");
-        assert!(residual.is_empty());
-        let mut expect = [0u8; 16];
-        expect[..8].copy_from_slice(&1u64.to_le_bytes());
-        expect[8..16].copy_from_slice(&2u64.to_le_bytes());
-        assert_eq!(pk.as_bytes(), &expect[..]);
+        let mut key_1_2 = [0u8; 16];
+        key_1_2[..8].copy_from_slice(&1u64.to_le_bytes());
+        key_1_2[8..16].copy_from_slice(&2u64.to_le_bytes());
+
+        for (sql, want_residual) in [
+            ("a = 1 AND b = 2", 0),
+            // Order swapped; the tuple must still pack in pk-list order.
+            ("b = 2 AND a = 1", 0),
+            ("a = 1 AND b = 2 AND v = 9", 1),
+        ] {
+            let expr = bind_where(sql, &schema);
+            let (pk, residual) = pk_point_of(&expr, &schema).unwrap_or_else(|| panic!("{sql}: must bind"));
+            assert_eq!(pk.stride, 16, "{sql}");
+            assert_eq!(pk.as_bytes(), &key_1_2[..], "{sql}");
+            assert_eq!(residual.len(), want_residual, "{sql}: residual");
+        }
+
+        for sql in [
+            // A bare prefix: the worker still walks the `a = 1` group.
+            "a = 1",
+            // `a` binds, `v` is a payload conjunct → residual; the PK stays incomplete.
+            "a = 1 AND v = 9",
+            // The duplicate routes to the residual, so `b` stays unbound.
+            "a = 1 AND a = 2",
+        ] {
+            let expr = bind_where(sql, &schema);
+            assert!(try_extract_pk_range(&expr, &schema).is_some(), "{sql}: still bounds");
+            assert!(pk_point_of(&expr, &schema).is_none(), "{sql}: names no single key");
+        }
     }
 
+    /// A single-column PK: the equality and the degenerate two-sided range reach
+    /// the same `(Before(v), After(v))` cuts through `bound_next_column`, so they
+    /// name the same key byte for byte and both consume every conjunct. An open
+    /// range names no key.
     #[test]
-    fn compound_pk_try_extract_pk_seek_partial_returns_none() {
-        let schema = compound_schema_u64_u64();
-        let expr = bind_where("a = 1", &schema); // only one of two PK cols
-        assert!(try_extract_pk_seek_residual(&expr, &schema).is_none());
-    }
-
-    #[test]
-    fn compound_pk_try_extract_pk_seek_incomplete_pk_with_payload_returns_none() {
-        let schema = compound_schema_u64_u64();
-        // `a` binds, `v` is a payload conjunct → residual; PK stays incomplete → None.
-        let expr = bind_where("a = 1 AND v = 9", &schema);
-        assert!(try_extract_pk_seek_residual(&expr, &schema).is_none());
-    }
-
-    #[test]
-    fn compound_pk_try_extract_pk_seek_duplicate_binding_returns_none() {
-        let schema = compound_schema_u64_u64();
-        // (a = 1) AND (a = 2) — the second routes to the residual, `b` stays unbound → None.
-        let expr = bind_where("a = 1 AND a = 2", &schema);
-        assert!(try_extract_pk_seek_residual(&expr, &schema).is_none());
-    }
-
-    #[test]
-    fn pk_seek_residual_keeps_non_pk_conjunct() {
+    fn a_single_pk_point_is_the_same_key_however_it_is_spelled() {
         let schema = pk_schema(TypeCode::U64);
-        let expr = bind_where("id = 1 AND v = 9", &schema);
-        let (pk, residual) = try_extract_pk_seek_residual(&expr, &schema).expect("PK binds");
+        for sql in ["id = 5", "id >= 5 AND id <= 5"] {
+            let expr = bind_where(sql, &schema);
+            let (pk, residual) = pk_point_of(&expr, &schema).unwrap_or_else(|| panic!("{sql}: must bind"));
+            assert_eq!(pk.as_bytes(), &5u64.to_le_bytes()[..], "{sql}");
+            assert!(residual.is_empty(), "{sql}: every conjunct is consumed by the walk");
+        }
+        let with_payload = bind_where("id = 1 AND v = 9", &schema);
+        let (pk, residual) = pk_point_of(&with_payload, &schema).expect("PK binds");
         assert_eq!(pk.as_bytes(), &1u64.to_le_bytes()[..]);
-        assert_eq!(residual.len(), 1);
+        assert_eq!(residual.len(), 1, "the non-PK conjunct rides the residual");
+        assert!(pk_point_of(&bind_where("id > 5", &schema), &schema).is_none());
     }
 
     // ------------------------------------------------------------------
@@ -1213,7 +1208,7 @@ mod tests {
 
         // `t.id = 1` binds the full PK → point seek.
         let where_expr = bind_where("t.id = 1", &schema);
-        let (pk, residual) = try_extract_pk_seek_residual(&where_expr, &schema).expect("PK binds");
+        let (pk, residual) = pk_point_of(&where_expr, &schema).expect("PK binds");
         assert_eq!(pk.as_bytes(), &1u64.to_le_bytes()[..]);
         assert!(residual.is_empty());
 

@@ -188,3 +188,25 @@ pub(crate) fn build_read_projection(
     }
     Ok((items, out_cols))
 }
+
+/// The `(reply_schema, projection blob)` a `ReadSpec` rows sink replies under —
+/// the one definition of that shape. `items`/`out_cols` come from
+/// [`build_read_projection`] (possibly extended with hidden ORDER BY columns):
+/// slots `0..k` are the source PK, so the reply's PK columns are `0..k` and the
+/// compiled program fills the payload slots `items[k..]`.
+///
+/// A caller wanting keys only passes an empty SELECT list — the reply then
+/// carries the PK region and nothing else.
+pub(crate) fn read_reply_shape(
+    items: &[ProjItem],
+    out_cols: Vec<ColumnDef>,
+    source_schema: &Schema,
+) -> Result<(Schema, Vec<u8>), GnitzSqlError> {
+    let k = source_schema.pk_indices().len();
+    let reply_schema = Schema::from_parts(out_cols, (0..k).collect())
+        .map_err(|e| GnitzSqlError::Unsupported(format!("read-spec reply schema is invalid: {e}")))?;
+    Ok((
+        reply_schema,
+        compile_projection_map(&items[k..], source_schema)?.encode(),
+    ))
+}

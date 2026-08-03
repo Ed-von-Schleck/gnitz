@@ -5,8 +5,8 @@ use crate::lower::compile_filter_evaluator;
 use gnitz_core::{Schema, ZSetBatch};
 
 /// Indices of the rows of `batch` that pass every residual predicate, in
-/// increasing order. Serves the UPDATE/DELETE WHERE-row resolution, which needs
-/// the passing indices.
+/// increasing order. Serves the UPDATE/DELETE resolution, which re-imposes the
+/// WHERE on the transaction's own buffered rows and needs the passing indices.
 ///
 /// The conjuncts go through the shared `and_fold` and are compiled once, then
 /// driven over the whole batch by the shared evaluator — the same program a
@@ -19,21 +19,25 @@ use gnitz_core::{Schema, ZSetBatch};
 /// `Evaluator::filter` keeps `bool_bits & !null_bits` — so both (NULL, TRUE) and
 /// (NULL, FALSE) exclude.
 ///
-/// `schema` is the schema the *rows* carry (the reply schema where the seek/scan
-/// returned one), while the conjuncts were bound against the catalog schema.
-/// That split is pre-existing; compiling against `schema` is what keeps it safe,
-/// since resolution bakes in payload slots, PK byte offsets, type codes and the
-/// nullability verdict.
+/// `schema` is the schema the *rows* carry, which is what the conjuncts must be
+/// compiled against: resolution bakes in payload slots, PK byte offsets, type
+/// codes and the nullability verdict.
 pub(crate) fn matching_indices(
     preds: &[&BoundExpr],
     batch: &ZSetBatch,
     schema: &Schema,
 ) -> Result<Vec<usize>, GnitzSqlError> {
     let n = batch.pks.len();
-    // No residual → every row, before any compilation. This exempts the hottest DML
-    // shape — `AccessPath::ScanAll` (`DELETE FROM t`), which always passes `&[]` —
-    // from building a view and materializing German cells for a predicate that does
-    // not exist.
+    // Zero rows → zero matches, before any compilation. Nothing to test means the
+    // predicate need not be expressible: a transaction that buffered only
+    // tombstones must not raise `Unsupported` for a WHERE the VM cannot compile.
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    // No residual → every row, before any compilation. This exempts a bound that
+    // applies the whole WHERE by itself — a `pk IN (…)` gather, a full-PK point,
+    // no `WHERE` at all — from building a view and materializing German cells for
+    // a predicate that does not exist.
     //
     // `None` from the compile is the statically-true verdict: the binder
     // const-folds a null test on a non-nullable column, so

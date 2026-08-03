@@ -201,12 +201,11 @@ def test_compound_pk_stride_24_accepted_round_trip(client):
 
 
 # ---------------------------------------------------------------------------
-# Point lookup (FLAG_SEEK): a full-compound-PK equality SELECT binds every PK
-# column, so the planner extracts a complete PkTuple and issues a point seek
-# (`try_extract_pk_seek_residual` → `client.seek`), not a scan+filter. These pin
-# the unified width-universal seek path (`seek_opk_bytes`) end to end — routing
-# (`fan_out_seek_async` → `partition_for_pk`) and `seek_exact_live`'s exact-row
-# tie-break — at both a wide stride-24 PK and a narrow U64 PK.
+# Point lookup: a full-compound-PK equality SELECT binds every PK column, so the
+# planner lowers it to a degenerate PK range pinning every column and the worker
+# walks exactly that key's group, not a scan+filter. These pin the unified
+# width-universal key path end to end — routing (`partition_for_pk`) and the
+# exact-row tie-break — at both a wide stride-24 PK and a narrow U64 PK.
 # ---------------------------------------------------------------------------
 
 

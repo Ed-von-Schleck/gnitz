@@ -14,9 +14,6 @@
 //! pass-through CTE over one relation is inlined (`cte_passthrough`) so trivial
 //! `WITH` queries keep reading through the direct path.
 
-use crate::access::{
-    best_index_bound, pk_bound_is_preemptible, try_extract_pk_in, try_extract_pk_range, IndexRangeCandidate,
-};
 use crate::agg::{synthetic_fold_cols, GroupByLayout};
 use crate::ast_util::{
     body_is_grouped, classify_from, extract_table_factor_name, has_exists_in_subquery, has_scalar_subquery,
@@ -24,21 +21,21 @@ use crate::ast_util::{
 };
 use crate::bind::cte_passthrough;
 use crate::bind::{bind_single_table, Binder};
-use crate::codec::project_schema::{build_read_projection, compile_projection_map};
+use crate::codec::project_schema::{build_read_projection, read_reply_shape};
 use crate::dml::group_by::{analyze_group_by, bind_having_expr, resolve_set_projection, HavingCtx};
-use crate::dml::plan::{extract_limit, extract_offset};
+use crate::dml::plan::{bound_and_predicate, extract_limit, extract_offset, fetch_bound, AccessPlan, ReadBudget};
 use crate::error::GnitzSqlError;
 use crate::exec::agg_finish::{agg_finish, build_agg_out_schema, AggFinish};
 use crate::exec::order::{order_limit_passthrough, read_spec_finish, resolve_read_spec_order};
 use crate::ir::BoundExpr;
-use crate::lower::{compile_filter_evaluator, compile_filter_program};
+use crate::lower::compile_filter_evaluator;
 use crate::validate::{
     cte_select_body, non_recursive_ctes, reject_unhonored_query_clauses, reject_unhonored_select_clauses,
     HonoredClauses, HonoredQueryClauses,
 };
 use crate::SqlResult;
 use gnitz_core::{GnitzClient, ReduceOutKey, Schema, ZSetBatch, MAX_COLUMNS};
-use gnitz_wire::{AggReadItem, AggReadSpec, ReadBound, ReadSink, ReadSpec};
+use gnitz_wire::{AggReadItem, AggReadSpec, ReadSink};
 use sqlparser::ast::{Expr, LimitClause, Query, Select, SetExpr};
 
 /// The single derivation-rejection: an ad-hoc SELECT reads one relation, but this
@@ -61,97 +58,25 @@ fn empty_rows(schema: Schema) -> SqlResult {
     SqlResult::Rows { schema, batch }
 }
 
-/// WHERE → the pushed-down `ReadBound` (an access superset) plus the compiled
-/// server-side predicate re-imposing the residual conjuncts — the shared front
-/// half of both sinks. Binds the WHERE once up front, then recognizes over the
-/// bound conjuncts; a PK bound that pins no PK column yields to a point covering
-/// every column of a UNIQUE index, which admits at most one row.
-/// The predicate is: empty for `PkSet` (the gather is exact);
-/// the extractor's residual for `PkRange` and a wide-int `IndexRange` (byte-exact
-/// walks — consumed conjuncts are applied exactly and stripped); and the whole
-/// bound WHERE for `None` and a ≤8-byte-int `IndexRange` (whose selectivity gate
-/// may degrade the bound to a full cursor). A wide-int / LIKE / string-arithmetic
-/// WHERE the expression VM cannot compile is an `Unsupported`, propagated.
-fn where_bound_and_predicate(
+/// WHERE → the access plan that serves it, the shared front half of both sinks.
+/// `SELECT` reads under [`ReadBudget::OneRequest`] so the whole statement is one
+/// server-side cut; a `pk IN (…)` list past the wire's per-gather key cap then
+/// declines to an ordinary predicate scan. The plan's residual serves the DML
+/// verbs only.
+///
+/// The caller owns the bound WHERE because the plan borrows its conjuncts.
+fn plan_where<'e>(
     client: &mut GnitzClient,
     tid: u64,
     schema: &Schema,
-    where_expr: Option<&Expr>,
-) -> Result<(ReadBound, Vec<u8>), GnitzSqlError> {
-    let Some(we) = where_expr else {
-        return Ok((ReadBound::None, Vec::new()));
-    };
-    let bound_where = bind_single_table(we, schema)?;
-
-    // `pk IN (…)` → an exact gather of those keys, with the remaining conjuncts as
-    // the predicate. Keys ship deduplicated (`try_extract_pk_in`); the worker
-    // OPK-sorts before its forward sweep. A list past the wire's key cap declines to
-    // the ladder below, which serves it as an ordinary predicate scan.
-    match try_extract_pk_in(&bound_where, schema) {
-        Some((keys, residual)) if keys.len() <= gnitz_wire::MAX_PK_SET_KEYS => {
-            let predicate = compile_read_spec_predicate(&residual, schema)?;
-            return Ok((ReadBound::PkSet(keys), predicate));
-        }
-        _ => {}
-    }
-
-    // A PK equality / range → a byte-exact bounded PK walk; the residual (the WHERE
-    // minus every conjunct the walk applies exactly) is the predicate. Exactness at
-    // any PK width is what serves a wide (U128) PK range without the predicate VM.
-    // It yields only when the descriptor pins no PK column and a point covering
-    // every column of a UNIQUE index is available: that admits one row where an
-    // unpinned PK range admits the table.
-    if let Some((desc, residual)) = try_extract_pk_range(&bound_where, schema) {
-        if pk_bound_is_preemptible(&desc, &bound_where, schema) {
-            let unique_idx =
-                best_index_bound(&bound_where, schema, || client.table_indexes(tid))?.filter(|c| c.is_unique_point());
-            if let Some(c) = unique_idx {
-                match index_bound_and_predicate(c, &bound_where, schema) {
-                    Ok(r) => return Ok(r),
-                    // The index arm re-imposes more of the WHERE than the PK arm's
-                    // residual, so it can need a conjunct the VM refuses (a wide
-                    // literal, a U128 column) that the PK walk consumes
-                    // byte-exactly. Keep the PK walk instead of failing the query;
-                    // an uncompilable residual still raises below.
-                    Err(GnitzSqlError::Unsupported(_)) => {}
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-        let predicate = compile_read_spec_predicate(&residual, schema)?;
-        return Ok((ReadBound::PkRange(desc), predicate));
-    }
-
-    // The best secondary-index bound, keeping its residual.
-    if let Some(c) = best_index_bound(&bound_where, schema, || client.table_indexes(tid))? {
-        return index_bound_and_predicate(c, &bound_where, schema);
-    }
-
-    let predicate = compile_read_spec_predicate(&[&bound_where], schema)?;
-    Ok((ReadBound::None, predicate))
+    where_expr: Option<&'e BoundExpr>,
+) -> Result<AccessPlan<'e>, GnitzSqlError> {
+    bound_and_predicate(schema, where_expr, ReadBudget::OneRequest, || client.table_indexes(tid))
 }
 
-/// An index candidate → its `ReadBound` plus the predicate that re-imposes what
-/// the walk does not apply. The walk gating is the worker's own decision, derived
-/// from the range column's type (`TypeCode::is_wide_int`): a wide-int bound runs
-/// the byte-exact walk, so the candidate's residual is the predicate; a narrow
-/// bound may be gate-degraded to a full cursor, so the whole WHERE stays the
-/// predicate.
-fn index_bound_and_predicate(
-    c: IndexRangeCandidate<'_>,
-    bound_where: &BoundExpr,
-    schema: &Schema,
-) -> Result<(ReadBound, Vec<u8>), GnitzSqlError> {
-    let wide = schema.columns[c.range_col()].type_code.is_wide_int();
-    let pred_exprs: Vec<&BoundExpr> = if wide { c.residual } else { vec![bound_where] };
-    let predicate = compile_read_spec_predicate(&pred_exprs, schema)?;
-    Ok((
-        ReadBound::IndexRange {
-            idx_cols: gnitz_wire::pack_pk_cols(c.idx_cols.as_slice()),
-            desc: c.desc,
-        },
-        predicate,
-    ))
+/// Bind a single-table `WHERE` (or its absence) for [`plan_where`].
+fn bind_where(schema: &Schema, where_expr: Option<&Expr>) -> Result<Option<BoundExpr>, GnitzSqlError> {
+    where_expr.map(|we| bind_single_table(we, schema)).transpose()
 }
 
 pub(crate) fn execute_select(
@@ -329,23 +254,21 @@ fn plan_read_spec(
     offset: usize,
 ) -> Result<SqlResult, GnitzSqlError> {
     // 1–2. WHERE → bound + compiled server-side predicate.
-    let (bound, predicate) = where_bound_and_predicate(client, tid, schema, select.selection.as_ref())?;
+    let bound_where = bind_where(schema, select.selection.as_ref())?;
+    let plan = plan_where(client, tid, schema, bound_where.as_ref())?;
 
     // 3. Projection items — the source PK hidden-prepended to slots `0..k`, then
     //    every SELECT item as a payload slot in SELECT order. A qualified wildcard
     //    / subquery / other non-map projection is an `Unsupported`, propagated.
     let (mut items, mut out_cols) = build_read_projection(&select.projection, schema)?;
-    let k = schema.pk_indices().len();
 
     // 4. ORDER BY keys over the reply columns; a non-projected source column is
     //    appended as a hidden payload column (so it can still order the result).
     //    An ORDER BY expression is an `Unsupported`, propagated.
     let order = resolve_read_spec_order(&mut items, &mut out_cols, schema, query.order_by.as_ref())?;
 
-    // 5. Reply schema + projection blob (the payload slice `items[k..]`).
-    let reply_schema = Schema::from_parts(out_cols, (0..k).collect())
-        .map_err(|e| GnitzSqlError::Unsupported(format!("read-spec reply schema is invalid: {e}")))?;
-    let projection = compile_projection_map(&items[k..], schema)?.encode();
+    // 5. Reply schema + projection blob.
+    let (reply_schema, projection) = read_reply_shape(&items, out_cols, schema)?;
 
     // `LIMIT 0` short-circuits to an empty result — no request dispatched.
     if limit == Some(0) {
@@ -355,39 +278,17 @@ fn plan_read_spec(
     let limit_k = limit.map(|l| l.saturating_add(offset) as u64).unwrap_or(0);
 
     // 6. Ship the spec; the reply schema is the one we built.
-    let spec = ReadSpec {
-        bound,
-        predicate,
-        sink: ReadSink::Rows {
-            projection,
-            order,
-            limit_k,
-        },
+    let sink = ReadSink::Rows {
+        projection,
+        order: order.clone(),
+        limit_k,
     };
-    let batch = client
-        .scan_spec(tid, &spec.encode(), &reply_schema)
-        .map_err(GnitzSqlError::Exec)?;
+    let batch = fetch_bound(client, tid, &plan, &sink, &reply_schema)?;
 
     // 7. Client finish: sort the concatenation by the wire keys, window, present.
     let batch = batch.unwrap_or_else(|| ZSetBatch::new(&reply_schema));
-    let ReadSink::Rows { order, .. } = &spec.sink else {
-        unreachable!()
-    };
-    let (schema, batch) = read_spec_finish(reply_schema, batch, order, offset, limit);
+    let (schema, batch) = read_spec_finish(reply_schema, batch, &order, offset, limit);
     Ok(SqlResult::Rows { schema, batch })
-}
-
-/// AND-combine the bound residual conjuncts and compile to the wire predicate
-/// blob. Empty input or a statically-true predicate → an empty blob (the bound is
-/// exact).
-fn compile_read_spec_predicate(exprs: &[&BoundExpr], schema: &Schema) -> Result<Vec<u8>, GnitzSqlError> {
-    let Some(pred) = crate::ir::and_fold(exprs.iter().map(|e| (*e).clone())) else {
-        return Ok(Vec::new());
-    };
-    match compile_filter_program(&pred, &schema.columns)? {
-        Some(prog) => Ok(prog.encode()),
-        None => Ok(Vec::new()),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -493,7 +394,8 @@ fn execute_aggregate_select(
     // WHERE → bound + residual predicate, exactly as the plain read path (the
     // grouped view applies WHERE via the identical compiler, so a WHERE the direct
     // path cannot compile also fails the view — no works→error regression).
-    let (bound, predicate) = where_bound_and_predicate(client, tid, &schema, select.selection.as_ref())?;
+    let bound_where = bind_where(&schema, select.selection.as_ref())?;
+    let plan = plan_where(client, tid, &schema, bound_where.as_ref())?;
 
     let limit = extract_limit(query)?;
     let offset = extract_offset(query)?;
@@ -503,26 +405,20 @@ fn execute_aggregate_select(
         return Ok(empty_rows(out_schema));
     }
 
-    let spec = ReadSpec {
-        bound,
-        predicate,
-        sink: ReadSink::Fold(AggReadSpec {
-            group_cols: layout.group_col_indices.iter().map(|&c| c as u16).collect(),
-            aggs: layout
-                .agg_specs
-                .iter()
-                .map(|s| AggReadItem {
-                    op: s.op,
-                    src_col: s.col as u16,
-                })
-                .collect(),
-        }),
-    };
+    let sink = ReadSink::Fold(AggReadSpec {
+        group_cols: layout.group_col_indices.iter().map(|&c| c as u16).collect(),
+        aggs: layout
+            .agg_specs
+            .iter()
+            .map(|s| AggReadItem {
+                op: s.op,
+                src_col: s.col as u16,
+            })
+            .collect(),
+    });
     // Dispatch. A wire error (including the runtime per-worker group cap) is HARD —
     // by now the fold is mid-flight on the workers and cannot fall back.
-    let batch = client
-        .scan_spec(tid, &spec.encode(), &partial_schema)
-        .map_err(GnitzSqlError::Exec)?;
+    let batch = fetch_bound(client, tid, &plan, &sink, &partial_schema)?;
     let partial = batch.unwrap_or_else(|| ZSetBatch::new(&partial_schema));
 
     // Client finishing (combine by group value, ground row, AVG/NullfillSum,
