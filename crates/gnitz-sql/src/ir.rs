@@ -71,7 +71,7 @@ pub(crate) enum BExpr<R> {
 pub(crate) type BoundExpr = BExpr<usize>;
 
 /// Common numeric type for arithmetic and conditional blends, matching the
-/// engine's runtime register rule (`propagate_u64`): any float operand → F64;
+/// engine's runtime register rule (`reg_u64`): any float operand → F64;
 /// else any U64 operand → U64 (so the materialized column re-seeds a downstream
 /// unsigned compare); else I64. All three are 8-byte slots — a pure type-label
 /// decision (the integer arithmetic itself is bit-identical either way).
@@ -111,7 +111,7 @@ impl<R> BExpr<R> {
                         TypeCode::I64
                     }
                     // Arithmetic preserves U64 (and floats), mirroring the engine's
-                    // `propagate_u64`: a materialized `u64 + u64` column must stay
+                    // `reg_u64`: a materialized `u64 + u64` column must stay
                     // U64 so a downstream compare re-seeds the unsigned variant.
                     _ => unify_numeric(lt, rt),
                 }

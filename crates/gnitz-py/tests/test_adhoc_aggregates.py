@@ -340,6 +340,66 @@ def test_having_rejections(client, hg):
     assert _parity(client, hg, f"SELECT s FROM hg GROUP BY s HAVING s IN ({in_list(32)})") == []
 
 
+# ---------------------------------------------------------------------------
+# AVG reads its SUM accumulator at the declared type
+#
+# The client combines integer SUM partials into an i64 whose bit pattern is the
+# sum mod 2^64. A SUM over a `BIGINT UNSIGNED` source is declared U64, so past
+# 2^63 that bit pattern only reads correctly as unsigned — SUM's own render
+# reinterprets the raw bits and was always right, but AVG's divisor is the first
+# consumer to do arithmetic on the value.
+# ---------------------------------------------------------------------------
+
+
+def test_unsigned_avg_parity(client, hg):
+    """AVG over a U64 source whose group sum passes 2^63, against the view."""
+    # cat = 3 sums two 2^64-1 cells: the high bit is set, so a signed read of the
+    # accumulator renders the average negative.
+    got = _parity(client, hg, "SELECT cat, AVG(u) AS a FROM hg GROUP BY cat", approx=True)
+    # 2^64-2 has no exact f64 image; it rounds to 2^64, so the average is 2^63.
+    assert {r.cat: r.a for r in got}[3] == 9.223372036854776e18, got
+    # The same accumulator with no group columns at all.
+    got = _parity(client, hg, "SELECT AVG(u) AS a FROM hg WHERE cat = 3", approx=True)
+    assert [r.a for r in got] == [9.223372036854776e18], got
+    # HAVING and the render read one accumulator: the predicate keeps cat = 3 on
+    # a correctly-computed average, so a mis-signed render disagrees with itself.
+    got = _parity(client, hg, "SELECT cat, AVG(u) AS a FROM hg GROUP BY cat HAVING AVG(u) > 1.0", approx=True)
+    assert _keys(got, "cat") == [2, 3], got
+    # The raw-bits render is unchanged: SUM(u) still wraps to the same u64.
+    got = _parity(client, hg, "SELECT cat, SUM(u) AS t FROM hg WHERE cat = 3 GROUP BY cat")
+    assert [r.t for r in got] == [18446744073709551614], got
+
+
+def test_unsigned_avg_arithmetic_truth(client):
+    """A group of one 2^64-1 cell: the sum does not wrap, so the true average is
+    representable and can be asserted as a value rather than as view-parity."""
+    sn = "ua" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE ua (pk BIGINT NOT NULL PRIMARY KEY, cat BIGINT NOT NULL, u BIGINT UNSIGNED NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql("INSERT INTO ua VALUES (1, 1, 18446744073709551615)", schema_name=sn)
+        got = _parity(client, sn, "SELECT cat, AVG(u) AS a FROM ua GROUP BY cat", approx=True)
+        assert [r.a for r in got] == [1.8446744073709552e19], got
+    finally:
+        _cleanup(client, sn, "ua")
+
+
+def test_signed_and_null_avg_parity(client, hg):
+    """The AVG paths the unsigned read must not disturb: a signed source, an
+    all-NULL group, and the global ground row. Every non-U64 integer source
+    widens to the same signed accumulator, so one signed case covers them."""
+    _parity(client, hg, "SELECT cat, AVG(sm) AS a FROM hg GROUP BY cat", approx=True)
+    # cat = 3 has v NULL throughout, so its count is 0 and the average is NULL.
+    got = _parity(client, hg, "SELECT cat, AVG(v) AS a FROM hg GROUP BY cat", approx=True)
+    assert {r.cat: r.a for r in got}[3] is None, got
+    # No surviving partial: the synthesized global ground row averages to NULL.
+    got = _parity(client, hg, "SELECT AVG(v) AS a FROM hg WHERE cat = 99", approx=True)
+    assert [r.a for r in got] == [None], got
+
+
 def test_null_group_and_all_null_agg(client):
     sn = "ng" + _uid()
     client.create_schema(sn)

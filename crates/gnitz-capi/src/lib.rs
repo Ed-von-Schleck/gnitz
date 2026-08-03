@@ -552,8 +552,10 @@ pub unsafe extern "C" fn gnitz_batch_get_weight(batch: *const GnitzBatch, row: u
 /// Read an integer column value as i64 (works for all Fixed integer columns).
 /// Returns 0 and sets last_error on type mismatch or out-of-bounds.
 ///
-/// Dispatches on `TypeCode` so unsigned values keep their full range
-/// (a U8 of 200 returns 200, not -56).
+/// Dispatches on `TypeCode`, so a narrower-than-64-bit unsigned column keeps its
+/// full range (a U8 of 200 returns 200, not -56). A U64 column is returned as its
+/// bit pattern — a value at or above 2^63 reads negative here and needs the
+/// caller to cast to `uint64_t`.
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_batch_get_i64(batch: *const GnitzBatch, col_idx: usize, row: usize) -> i64 {
     let b = check_ptr!(batch, 0);

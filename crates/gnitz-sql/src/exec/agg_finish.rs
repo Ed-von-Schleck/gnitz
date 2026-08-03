@@ -18,9 +18,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use gnitz_core::{
-    null_word_get, null_word_set, ColData, ColumnDef, FixedInt, ReduceOutKey, Schema, TypeCode, ZSetBatch,
-};
+use gnitz_core::{null_word_get, null_word_set, ColData, ColumnDef, ReduceOutKey, Schema, TypeCode, ZSetBatch};
 use gnitz_expr::Evaluator;
 use gnitz_wire::{cmp_typed_le, AggFunc as WireAggFunc};
 
@@ -51,12 +49,14 @@ pub(crate) struct AggFinish<'a> {
 /// rule the view path's two-phase combine reduce ships to the engine), so the
 /// two combiners cannot drift.
 enum ColAcc {
-    /// `SumZero` merge (COUNT / COUNT_NON_NULL partials) — Σ w·partial. Never
-    /// NULL; the ground row renders 0.
-    Count { n: i64 },
-    /// Integer SUM (I64/U64 bit pattern) — Σ w·partial. NULL until a partial
-    /// contributes (the ground row, or an all-NULL NullfillSum group).
-    IntSum { bits: i64, seen: bool },
+    /// Integer SUM (I64/U64 bit pattern) — Σ w·partial, and the COUNT /
+    /// COUNT_NON_NULL partials too, which accumulate identically and differ only
+    /// in starting out non-NULL. `seen` is false until a partial contributes, so
+    /// an uncontributed SUM (the ground row, or an all-NULL NullfillSum group)
+    /// renders NULL. `tc` is the declared partial-column type, which is what
+    /// `sum_f64` divides at: `agg_output_type(Sum, U64)` is U64, so past 2^63 a
+    /// signed read of `bits` would be negative.
+    IntSum { bits: i64, seen: bool, tc: TypeCode },
     /// Float SUM — Σ (w as f64)·partial. Deliberately worker-count-
     /// nondeterministic: IEEE-754 addition is non-associative and the partials
     /// arrive in worker order, whereas a float-SUM *view* keeps the
@@ -77,9 +77,19 @@ enum ColAcc {
 impl ColAcc {
     fn new(spec: &AggSpec) -> ColAcc {
         match spec.op.merge_func() {
-            WireAggFunc::SumZero => ColAcc::Count { n: 0 },
+            // A count is a sum that starts out non-NULL: its partials are never
+            // null, and an uncontributed group renders 0 rather than NULL.
+            WireAggFunc::SumZero => ColAcc::IntSum {
+                bits: 0,
+                seen: true,
+                tc: spec.out_type,
+            },
             WireAggFunc::Sum if spec.out_type.is_float() => ColAcc::FloatSum { val: 0.0, seen: false },
-            WireAggFunc::Sum => ColAcc::IntSum { bits: 0, seen: false },
+            WireAggFunc::Sum => ColAcc::IntSum {
+                bits: 0,
+                seen: false,
+                tc: spec.out_type,
+            },
             WireAggFunc::Min => ColAcc::Extreme {
                 best: None,
                 is_max: false,
@@ -97,29 +107,18 @@ impl ColAcc {
     }
 }
 
-/// A combined accumulator's value, as the render and the group batch read it.
-#[derive(Clone, Copy)]
-enum Val {
-    Int(i64),
-    Float(f64),
-    Null,
+/// Pre-resolved SELECT item (computed once per query, not per group): where the
+/// value comes from, and the output cell it lands in.
+struct OutItem {
+    src: ItemSrc,
+    /// Output column index, its dense payload slot, and its type — the output
+    /// schema is immutable, so resolving these per group would repeat one answer.
+    ci: usize,
+    pi: usize,
+    tc: TypeCode,
 }
 
-impl Val {
-    /// The 8-byte register image a Fixed column stores, or `None` for SQL NULL.
-    /// Both writers below go through this, so integer and float share one
-    /// truncation rule.
-    fn bits(self) -> Option<u64> {
-        match self {
-            Val::Int(i) => Some(i as u64),
-            Val::Float(f) => Some(f.to_bits()),
-            Val::Null => None,
-        }
-    }
-}
-
-/// Pre-resolved SELECT-item source (computed once per query, not per group): a
-/// group column's partial-batch column index, or the aggregate mapping index.
+/// A group column's partial-batch column index, or the aggregate mapping index.
 enum ItemSrc {
     Group { partial_ci: usize },
     Agg { agg_idx: usize },
@@ -177,19 +176,26 @@ pub(crate) fn agg_finish(spec: &AggFinish, partial: &ZSetBatch) -> ZSetBatch {
     // 3–5. Finish + HAVING + project into the output batch. Zero groups needs no
     // guard: `filter` over a 0-row batch calls back zero times, and
     // `emit_range(0, 0)` is a no-op.
-    let item_srcs: Vec<ItemSrc> = layout
+    let out_items: Vec<OutItem> = layout
         .select_items
         .iter()
-        .map(|item| match item {
-            GroupBySelectItem::GroupCol { src_col, .. } => ItemSrc::Group {
-                partial_ci: group_col_reduce_pos(
-                    *src_col,
-                    ReduceOutKey::SyntheticFold,
-                    spec.source_schema,
-                    &layout.group_col_indices,
-                ),
+        .enumerate()
+        .map(|(si, item)| OutItem {
+            src: match item {
+                GroupBySelectItem::GroupCol { src_col, .. } => ItemSrc::Group {
+                    partial_ci: group_col_reduce_pos(
+                        *src_col,
+                        ReduceOutKey::SyntheticFold,
+                        spec.source_schema,
+                        &layout.group_col_indices,
+                    ),
+                },
+                GroupBySelectItem::Aggregate { agg_idx } => ItemSrc::Agg { agg_idx: *agg_idx },
             },
-            GroupBySelectItem::Aggregate { agg_idx } => ItemSrc::Agg { agg_idx: *agg_idx },
+            // Output column 0 is the hidden PK, so SELECT item `si` lands at `si + 1`.
+            ci: 1 + si,
+            pi: spec.out_schema.payload_idx(1 + si),
+            tc: spec.out_schema.columns[1 + si].type_code,
         })
         .collect();
     let mut out = ZSetBatch::with_capacity(spec.out_schema, reps.len());
@@ -200,7 +206,7 @@ pub(crate) fn agg_finish(spec: &AggFinish, partial: &ZSetBatch) -> ZSetBatch {
             emit_row(
                 spec,
                 partial,
-                &item_srcs,
+                &out_items,
                 &mut out,
                 reps[g],
                 &accs[g * n_aggs..(g + 1) * n_aggs],
@@ -268,7 +274,7 @@ fn fill_group_batch(spec: &AggFinish, partial: &ZSetBatch, reps: &[Option<usize>
             // a time), so this column's cells are `n_aggs` apart.
             let k = pi - n_group;
             for g in 0..n {
-                match acc_val(&accs[g * n_aggs + k]).bits() {
+                match acc_bits(&accs[g * n_aggs + k]) {
                     None => push_null_cell(&mut columns[ci], tc, &mut nulls[g], pi),
                     Some(bits) => push_fixed_bits(&mut columns[ci], bits, w),
                 }
@@ -334,8 +340,7 @@ fn combine(acc: &mut ColAcc, partial: &ZSetBatch, schema: &Schema, ci: usize, ro
         // COUNT and SUM partials are 8-byte cells (I64, or U64 whose bit
         // pattern is the true sum mod 2^64 — the same i64 accumulator the
         // engine folds).
-        ColAcc::Count { n } => *n = n.wrapping_add(w.wrapping_mul(read_i64_8(partial, ci, row))),
-        ColAcc::IntSum { bits, seen } => {
+        ColAcc::IntSum { bits, seen, .. } => {
             *bits = bits.wrapping_add(w.wrapping_mul(read_i64_8(partial, ci, row)));
             *seen = true;
         }
@@ -378,90 +383,60 @@ fn read_f64(partial: &ZSetBatch, ci: usize, row: usize) -> f64 {
 // Finishing / rendering
 // ---------------------------------------------------------------------------
 
-/// Finish one aggregate to its output value, per its mapping's shape (AVG
+/// Finish one aggregate to its output cell, per its mapping's shape (AVG
 /// divide, nullable-SUM null-gate, or the accumulator's own value).
-fn finish_agg(spec: &AggFinish, accs: &[ColAcc], agg_idx: usize) -> Val {
+fn finish_agg(spec: &AggFinish, accs: &[ColAcc], agg_idx: usize) -> Option<u64> {
     let m = &spec.layout.agg_mappings[agg_idx];
     let sum = &accs[m.specs_start];
+    if !m.shape.has_count_companion() {
+        return acc_bits(sum);
+    }
+    // AVG and nullable SUM both take their null-ness from the CountNonNull
+    // companion at `specs_start + 1` rather than from the value accumulator.
+    let cnt = acc_count(&accs[m.specs_start + 1]);
+    if cnt == 0 {
+        return None;
+    }
     match m.shape {
-        // AVG and NullfillSum carry a CountNonNull companion at specs_start + 1.
-        AggShape::Avg => {
-            let cnt = acc_count(&accs[m.specs_start + 1]);
-            if cnt == 0 {
-                Val::Null
-            } else {
-                Val::Float(acc_f64(sum) / cnt as f64)
-            }
-        }
-        // Nullable SUM: NULL iff no non-null contributor.
-        AggShape::NullfillSum => {
-            let cnt = acc_count(&accs[m.specs_start + 1]);
-            if cnt == 0 {
-                Val::Null
-            } else {
-                acc_val(sum)
-            }
-        }
-        AggShape::Direct => acc_val(sum),
+        AggShape::Avg => Some((sum_f64(sum) / cnt as f64).to_bits()),
+        AggShape::NullfillSum | AggShape::Direct => acc_bits(sum),
     }
 }
 
-/// The combined accumulator's typed value — shared by the aggregate render and
-/// the group batch the HAVING filter runs over, so the two cannot drift. NULL
-/// for an uncontributed SUM / MIN / MAX (the global ground row, or an all-NULL
-/// group); counts are always concrete.
-fn acc_val(acc: &ColAcc) -> Val {
+/// The combined accumulator's register image, or `None` for SQL NULL — shared by
+/// the aggregate render and the group batch the HAVING filter runs over, so the
+/// two cannot drift. NULL for an uncontributed SUM / MIN / MAX (the global ground
+/// row, or an all-NULL group); counts are always concrete.
+///
+/// Every aggregate column is a Fixed of width `wire_stride(tc)`, and both writers
+/// keep only that many low bytes, so an accumulator's bytes pass through
+/// unchanged — the value never has to be decoded to a number to be re-emitted.
+fn acc_bits(acc: &ColAcc) -> Option<u64> {
     match acc {
-        ColAcc::Count { n } => Val::Int(*n),
-        ColAcc::IntSum { bits, seen } => {
-            if *seen {
-                Val::Int(*bits)
-            } else {
-                Val::Null
-            }
-        }
-        ColAcc::FloatSum { val, seen } => {
-            if *seen {
-                Val::Float(*val)
-            } else {
-                Val::Null
-            }
-        }
-        ColAcc::Extreme { best, tc, .. } => match best {
-            None => Val::Null,
-            // MIN/MAX over a float source is typed F64; an integer extreme
-            // decodes at its own width (sign-extended for signed sources).
-            Some(b) => {
-                if tc.is_float() {
-                    Val::Float(f64::from_le_bytes(b[..8].try_into().unwrap()))
-                } else {
-                    let s = tc.wire_stride();
-                    Val::Int(
-                        FixedInt::from_type_code(*tc)
-                            .expect("MIN/MAX output is a ≤8-byte integer or F64")
-                            .decode_le_i64(&b[..s]),
-                    )
-                }
-            }
-        },
+        ColAcc::IntSum { bits, seen, .. } => seen.then_some(*bits as u64),
+        ColAcc::FloatSum { val, seen } => seen.then(|| val.to_bits()),
+        // `combine` zero-fills above the winning cell's `wire_stride(tc)` bytes.
+        ColAcc::Extreme { best, .. } => best.map(u64::from_le_bytes),
+    }
+}
+
+/// AVG's numerator as a number. The one place an accumulator is read as a
+/// quantity rather than as bytes, so it is also the one place signedness
+/// matters: a SUM over a U64 source is typed U64, and its i64 accumulator holds
+/// the true sum mod 2^64 — read signed, a sum past 2^63 averages negative.
+fn sum_f64(acc: &ColAcc) -> f64 {
+    match acc {
+        ColAcc::IntSum { bits, tc, .. } if tc.is_signed_int() => *bits as f64,
+        ColAcc::IntSum { bits, .. } => *bits as u64 as f64,
+        ColAcc::FloatSum { val, .. } => *val,
+        ColAcc::Extreme { .. } => unreachable!("AVG's numerator is its SUM component"),
     }
 }
 
 fn acc_count(acc: &ColAcc) -> i64 {
     match acc {
-        ColAcc::Count { n } => *n,
-        _ => unreachable!("companion CountNonNull is always a Count accumulator"),
-    }
-}
-
-fn acc_f64(acc: &ColAcc) -> f64 {
-    match acc {
-        ColAcc::IntSum { bits, .. } => *bits as f64,
-        ColAcc::FloatSum { val, .. } => *val,
-        // AVG's first spec is always AGG_SUM, so its accumulator is a sum.
-        ColAcc::Count { .. } | ColAcc::Extreme { .. } => {
-            unreachable!("AVG's SUM component is a sum accumulator")
-        }
+        ColAcc::IntSum { bits, .. } => *bits,
+        _ => unreachable!("companion CountNonNull is an integer accumulator"),
     }
 }
 
@@ -499,32 +474,29 @@ pub(crate) fn build_agg_out_schema(layout: &GroupByLayout, source_schema: &Schem
 fn emit_row(
     spec: &AggFinish,
     partial: &ZSetBatch,
-    item_srcs: &[ItemSrc],
+    out_items: &[OutItem],
     out: &mut ZSetBatch,
     rep: Option<usize>,
     accs: &[ColAcc],
 ) {
-    let out_schema = spec.out_schema;
     let out_pk = out.len() as u128;
     out.pks.push_u128(out_pk);
     out.weights.push(1);
     let mut null_word: u64 = 0;
-    for (si, src) in item_srcs.iter().enumerate() {
-        let out_ci = 1 + si; // col 0 is the hidden PK
-        let out_pi = out_schema.payload_idx(out_ci);
-        let out_tc = out_schema.columns[out_ci].type_code;
-        match src {
+    for item in out_items {
+        let col = &mut out.columns[item.ci];
+        match &item.src {
             ItemSrc::Group { partial_ci } => {
                 let rep = rep.expect("a grouped result always has a representative row");
                 if partial.is_null(spec.partial_schema, rep, *partial_ci) {
-                    push_null_cell(&mut out.columns[out_ci], out_tc, &mut null_word, out_pi);
+                    push_null_cell(col, item.tc, &mut null_word, item.pi);
                 } else {
-                    partial.columns[*partial_ci].push_row_from(rep, out_tc.wire_stride(), &mut out.columns[out_ci]);
+                    partial.columns[*partial_ci].push_row_from(rep, item.tc.wire_stride(), col);
                 }
             }
-            ItemSrc::Agg { agg_idx } => match finish_agg(spec, accs, *agg_idx).bits() {
-                None => push_null_cell(&mut out.columns[out_ci], out_tc, &mut null_word, out_pi),
-                Some(bits) => push_fixed_bits(&mut out.columns[out_ci], bits, out_tc.wire_stride()),
+            ItemSrc::Agg { agg_idx } => match finish_agg(spec, accs, *agg_idx) {
+                None => push_null_cell(col, item.tc, &mut null_word, item.pi),
+                Some(bits) => push_fixed_bits(col, bits, item.tc.wire_stride()),
             },
         }
     }
@@ -546,7 +518,8 @@ fn push_fixed_bits(col: &mut ColData, bits: u64, stride: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agg::synthetic_fold_cols;
+    use crate::agg::{synthetic_fold_cols, AggMapping};
+    use crate::ir::AggFunc;
     use crate::test_support::col_def;
     use gnitz_core::PkColumn;
 
@@ -584,6 +557,16 @@ mod tests {
     fn partial_schema(src: &Schema, specs: &[AggSpec]) -> Schema {
         Schema::from_parts(synthetic_fold_cols(src, &[1], specs, &|_| true), vec![0])
             .expect("the SyntheticFold layout is a valid client schema")
+    }
+
+    /// A combined COUNT accumulator, in the shape `ColAcc::new` builds for a
+    /// `SumZero` merge.
+    fn count_acc(n: i64) -> ColAcc {
+        ColAcc::IntSum {
+            bits: n,
+            seen: true,
+            tc: TypeCode::I64,
+        }
     }
 
     fn fixed(col: &ColData) -> &[u8] {
@@ -631,14 +614,14 @@ mod tests {
                 is_max: false,
                 tc: TypeCode::I16,
             },
-            ColAcc::Count { n: 2 },
+            count_acc(2),
             // Group 1: an all-NULL MIN group, COUNT = 1.
             ColAcc::Extreme {
                 best: None,
                 is_max: false,
                 tc: TypeCode::I16,
             },
-            ColAcc::Count { n: 1 },
+            count_acc(1),
         ];
 
         let spec = AggFinish {
@@ -701,7 +684,7 @@ mod tests {
                 is_max: false,
                 tc: TypeCode::I16,
             },
-            ColAcc::Count { n: 0 },
+            count_acc(0),
         ];
         let got = fill_group_batch(&spec, &ZSetBatch::new(&partial_s), &[None], &accs);
 
@@ -709,5 +692,75 @@ mod tests {
         // Slot 0 = MIN (NULL), slot 1 = COUNT (0, never NULL).
         assert_eq!(got.nulls, vec![0b01]);
         assert_eq!(fixed(&got.columns[2]), &0i64.to_le_bytes());
+    }
+
+    /// One AVG mapping over `[Sum, CountNonNull]` — the only layout `finish_agg`
+    /// reads, so the rest of the query can stay empty.
+    fn avg_layout() -> GroupByLayout {
+        GroupByLayout {
+            group_col_indices: vec![],
+            agg_specs: vec![],
+            agg_mappings: vec![AggMapping {
+                specs_start: 0,
+                shape: AggShape::Avg,
+                output_name: "a".to_string(),
+                output_type: TypeCode::F64,
+                output_nullable: true,
+                agg_func: AggFunc::Avg,
+                arg_col: None,
+            }],
+            select_items: vec![],
+        }
+    }
+
+    fn finish_avg(layout: &GroupByLayout, accs: &[ColAcc]) -> Option<f64> {
+        let src = source_schema();
+        let out_s = Schema::from_parts(vec![col_def("_agg_pk", TypeCode::U128, false).hidden()], vec![0]).unwrap();
+        let spec = AggFinish {
+            source_schema: &src,
+            layout,
+            partial_schema: &src,
+            out_schema: &out_s,
+            having: None,
+        };
+        finish_agg(&spec, accs, 0).map(f64::from_bits)
+    }
+
+    /// AVG divides its SUM accumulator at the accumulator's declared type. A SUM
+    /// over a `BIGINT UNSIGNED` source is typed U64, so past 2^63 its i64 bit
+    /// pattern only reads as the true sum unsigned.
+    #[test]
+    fn avg_divides_an_unsigned_sum_unsigned() {
+        let layout = avg_layout();
+        // One cell of 2^64 - 1: the accumulator holds -1, which is that sum only
+        // when read unsigned. (2^64 - 1 has no exact f64 image; it rounds to 2^64.)
+        let unsigned = ColAcc::IntSum {
+            bits: -1,
+            seen: true,
+            tc: TypeCode::U64,
+        };
+        assert_eq!(
+            finish_avg(&layout, &[unsigned, count_acc(1)]),
+            Some(1.8446744073709552e19)
+        );
+        // The same bit pattern over a signed source is genuinely -1.
+        let signed = ColAcc::IntSum {
+            bits: -1,
+            seen: true,
+            tc: TypeCode::I64,
+        };
+        assert_eq!(finish_avg(&layout, &[signed, count_acc(1)]), Some(-1.0));
+    }
+
+    /// A zero CountNonNull companion is AVG's NULL — an empty or all-NULL group.
+    #[test]
+    fn avg_nulls_on_a_zero_count_companion() {
+        let layout = avg_layout();
+        let sum = ColAcc::IntSum {
+            bits: 0,
+            seen: false,
+            tc: TypeCode::I64,
+        };
+        assert_eq!(finish_avg(&layout, &[sum, count_acc(0)]), None);
     }
 }
