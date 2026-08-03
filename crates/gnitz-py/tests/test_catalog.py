@@ -18,10 +18,6 @@ def _uid():
     return str(random.randint(100000, 999999))
 
 
-def _scan_positive(client, tid):
-    return list(client.scan(tid))
-
-
 # ===========================================================================
 # Schema DDL
 # ===========================================================================
@@ -331,7 +327,7 @@ class TestDMLEdgeCases:
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=0, val=42)
             client.push(tid, batch)
-            rows = _scan_positive(client, tid)
+            rows = list(client.scan(tid))
             assert len(rows) == 1
             assert rows[0].pk == 0
         finally:
@@ -348,7 +344,7 @@ class TestDMLEdgeCases:
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=max_u64, val=99)
             client.push(tid, batch)
-            rows = _scan_positive(client, tid)
+            rows = list(client.scan(tid))
             assert len(rows) == 1
             assert rows[0].pk == max_u64
         finally:
@@ -365,7 +361,7 @@ class TestDMLEdgeCases:
             batch.append(pk=1, val=-100)
             batch.append(pk=2, val=-(2**62))
             client.push(tid, batch)
-            vals = {r.pk: r.val for r in _scan_positive(client, tid)}
+            vals = {r.pk: r.val for r in list(client.scan(tid))}
             assert vals[1] == -100
             assert vals[2] == -(2**62)
         finally:
@@ -389,8 +385,8 @@ class TestDMLEdgeCases:
             b2 = gnitz.ZSetBatch(schema)
             b2.append(pk=1, val=200)
             client.push(tid2, b2)
-            rows1 = _scan_positive(client, tid1)
-            rows2 = _scan_positive(client, tid2)
+            rows1 = list(client.scan(tid1))
+            rows2 = list(client.scan(tid2))
             assert rows1[0].val == 100
             assert rows2[0].val == 200
         finally:
@@ -411,7 +407,7 @@ class TestDMLEdgeCases:
             for i in range(1, 1001):
                 batch.append(pk=i, val=i * 10)
             client.push(tid, batch)
-            rows = _scan_positive(client, tid)
+            rows = list(client.scan(tid))
             assert len(rows) == 1000
         finally:
             client.drop_table(sn, tn)
@@ -439,7 +435,7 @@ class TestViewLifecycle:
         vn = "v" + _uid()
         try:
             vid = client.create_view(sn, vn, tid, schema)
-            assert len(_scan_positive(client, vid)) == 0
+            assert len(list(client.scan(vid))) == 0
         finally:
             try:
                 client.drop_view(sn, vn)
@@ -463,7 +459,7 @@ class TestViewLifecycle:
             ret = gnitz.ZSetBatch(schema)
             ret.append(pk=2, val=20, _weight=-1)
             client.push(tid, ret)
-            rows = _scan_positive(client, vid)
+            rows = list(client.scan(vid))
             pks = {r.pk for r in rows}
             assert len(rows) == 2
             assert 2 not in pks
@@ -488,8 +484,8 @@ class TestViewLifecycle:
             batch.append(pk=1, val=10)
             batch.append(pk=2, val=20)
             client.push(tid, batch)
-            assert len(_scan_positive(client, vid1)) == 2
-            assert len(_scan_positive(client, vid2)) == 2
+            assert len(list(client.scan(vid1))) == 2
+            assert len(list(client.scan(vid2))) == 2
         finally:
             for vn in (vn1, vn2):
                 try:
@@ -511,8 +507,8 @@ class TestViewLifecycle:
             for pk, val in [(10, 100), (20, 200), (30, 300)]:
                 batch.append(pk=pk, val=val)
             client.push(tid, batch)
-            src  = sorted((r.pk, r.val) for r in _scan_positive(client, tid))
-            view = sorted((r.pk, r.val) for r in _scan_positive(client, vid))
+            src  = sorted((r.pk, r.val) for r in list(client.scan(tid)))
+            view = sorted((r.pk, r.val) for r in list(client.scan(vid)))
             assert src == view
         finally:
             try:
@@ -541,7 +537,7 @@ class TestViewLifecycle:
             bb = gnitz.ZSetBatch(schema)
             bb.append(pk=2, val=20)
             client.push(tid_b, bb)
-            rows = _scan_positive(client, vid)
+            rows = list(client.scan(vid))
             assert len(rows) == 1
             assert rows[0].pk == 1
         finally:
@@ -585,7 +581,7 @@ class TestViewLifecycle:
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=1, val=10)
             client.push(tid, batch)
-            assert len(_scan_positive(client, vid2)) == 1
+            assert len(list(client.scan(vid2))) == 1
         finally:
             try:
                 client.drop_view(sn, vn)
@@ -607,7 +603,7 @@ class TestViewLifecycle:
             batch.append(pk=1, val=10)
             client.push(tid, batch)
             client.drop_view(sn, vn1)
-            assert len(_scan_positive(client, vid2)) == 1
+            assert len(list(client.scan(vid2))) == 1
             with pytest.raises(gnitz.GnitzError):
                 client.scan(vid1)
         finally:
@@ -639,11 +635,11 @@ class TestViewLifecycle:
         tid, tn, cols, schema = self._setup(client, sn)
         vn = "v" + _uid()
         try:
-            before = len(_scan_positive(client, VIEW_TAB_ID))
+            before = len(list(client.scan(VIEW_TAB_ID)))
             vid = client.create_view(sn, vn, tid, schema)
-            assert len(_scan_positive(client, VIEW_TAB_ID)) == before + 1
+            assert len(list(client.scan(VIEW_TAB_ID))) == before + 1
             client.drop_view(sn, vn)
-            after = len(_scan_positive(client, VIEW_TAB_ID))
+            after = len(list(client.scan(VIEW_TAB_ID)))
             assert after == before, (
                 f"Ghost rows: expected {before}, got {after} after DROP VIEW"
             )
@@ -662,12 +658,12 @@ class TestViewLifecycle:
         client.create_schema(sn)
         tid, tn, cols, schema = self._setup(client, sn)
         try:
-            baseline = len(_scan_positive(client, VIEW_TAB_ID))
+            baseline = len(list(client.scan(VIEW_TAB_ID)))
             for i in range(10):
                 vn = f"rv{_uid()}"
                 client.create_view(sn, vn, tid, schema)
                 client.drop_view(sn, vn)
-            final = len(_scan_positive(client, VIEW_TAB_ID))
+            final = len(list(client.scan(VIEW_TAB_ID)))
             assert final == baseline, (
                 f"Row count grew: {baseline} -> {final} after 10 create+drop cycles"
             )

@@ -29,10 +29,6 @@ def _uid():
     return str(random.randint(100000, 999999))
 
 
-def _positive(rows):
-    return list(rows)
-
-
 def _rows(client, sn, q):
     res = client.execute_sql(q, schema_name=sn)[0]
     assert res["type"] == "Rows", f"expected Rows, got {res['type']}: {res}"
@@ -71,7 +67,7 @@ def test_replicated_scan_returns_one_copy(client):
             schema_name=sn,
         )
         tid = client.resolve_table(sn, "dim")[0]
-        rows = _positive(client.scan(tid))
+        rows = list(client.scan(tid))
         assert len(rows) == 5, f"expected one copy (5 rows), got {len(rows)}"
         assert sorted(r["id"] for r in rows) == [1, 2, 3, 4, 5]
         assert {r["id"]: r["name"] for r in rows} == {1: 100, 2: 200, 3: 300, 4: 400, 5: 500}
@@ -91,7 +87,7 @@ def test_replicated_seek_point_lookup(client):
         )
         client.execute_sql("INSERT INTO dim VALUES (1, 100), (2, 200), (3, 300)", schema_name=sn)
         tid = client.resolve_table(sn, "dim")[0]
-        rows = _positive(client.seek(tid, pk=2))
+        rows = list(client.seek(tid, pk=2))
         assert len(rows) == 1, f"point lookup must return one row, got {len(rows)}"
         assert rows[0]["id"] == 2 and rows[0]["name"] == 200
     finally:
@@ -122,7 +118,7 @@ def test_replicated_count_returns_single_value(client):
             "INSERT INTO dim VALUES (1, 10, 100), (2, 10, 200), (3, 20, 300)",
             schema_name=sn,
         )
-        rows = _positive(client.scan(vid))
+        rows = list(client.scan(vid))
         assert len(rows) == 2, f"expected one copy of 2 groups, got {len(rows)}"
         by_grp = {r["grp"]: r for r in rows}
         assert by_grp[10]["cnt"] == 2, f"COUNT must be single-copy (2), got {by_grp[10]['cnt']}"
@@ -143,7 +139,10 @@ def test_replicated_dim_join_fact_not_distributed_by_key(client):
     when the fact is NOT distributed by the join key (its PK is `fact_id`, the
     join key is the non-PK `dim_ref`) — the case hash co-partitioning cannot
     serve. A wrongly elided or wrongly fired exchange would drop join rows and
-    fail the multiset assertion loudly."""
+    fail the multiset assertion loudly. Also the control for the mixed-view block
+    below: a mixed equi join skips its exchange entirely (`compute_co_partitioned`
+    short-circuits on the replicated side), so it never relays, and its weights
+    must stay at 1 regardless of what the relay does."""
     sn = "r" + _uid()
     client.create_schema(sn)
     try:
@@ -171,8 +170,9 @@ def test_replicated_dim_join_fact_not_distributed_by_key(client):
         vals = ", ".join(f"({i}, {(i % 4) + 1})" for i in range(1, 41))
         client.execute_sql(f"INSERT INTO fact VALUES {vals}", schema_name=sn)
 
-        rows = _positive(client.scan(jid))
+        rows = list(client.scan(jid))
         assert len(rows) == 40, f"every fact must join its dim once; got {len(rows)}"
+        assert all(r.weight == 1 for r in rows), "every join row must weigh exactly 1"
         got = {r["fid"]: r["nm"] for r in rows}
         assert set(got) == set(range(1, 41))
         for i in range(1, 41):
@@ -214,7 +214,7 @@ def test_replicated_star_join_two_dims(client):
         vals = ", ".join(f"({i}, {(i % 2) + 1}, {((i + 1) % 2) + 1})" for i in range(1, 33))
         client.execute_sql(f"INSERT INTO fact VALUES {vals}", schema_name=sn)
 
-        rows = _positive(client.scan(jid))
+        rows = list(client.scan(jid))
         assert len(rows) == 32, f"every fact must join both dims; got {len(rows)}"
         for r in rows:
             i = r["fid"]
@@ -243,7 +243,7 @@ def test_replicated_join_replicated_single_source(client):
         client.execute_sql("INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)", schema_name=sn)
         client.execute_sql("INSERT INTO b VALUES (1, 11), (2, 22), (3, 33)", schema_name=sn)
 
-        rows = _positive(client.scan(jid))
+        rows = list(client.scan(jid))
         assert len(rows) == 3, f"replicated⋈replicated must read one copy (3 rows), got {len(rows)}"
         got = {r["id"]: (r["x"], r["y"]) for r in rows}
         assert got == {1: (10, 11), 2: (20, 22), 3: (30, 33)}
@@ -283,13 +283,13 @@ def test_replicated_delete_broadcasts(client):
         client.execute_sql("DELETE FROM dim WHERE dim_id = 3", schema_name=sn)
 
         # Single-source read: one copy, the deleted row gone.
-        drows = _positive(client.scan(tid))
+        drows = list(client.scan(tid))
         assert sorted(r["dim_id"] for r in drows) == [1, 2, 4], \
             f"deleted row must be gone, one copy; got {sorted(r['dim_id'] for r in drows)}"
 
         # Join drops exactly the facts referencing the deleted dim, on every worker.
         survivors = sorted(i for i in range(1, 41) if (i % 4) + 1 != 3)
-        jrows = _positive(client.scan(jid))
+        jrows = list(client.scan(jid))
         assert sorted(r["fid"] for r in jrows) == survivors, \
             "join must drop the deleted dim's facts on every worker"
     finally:
@@ -324,11 +324,11 @@ def test_replicated_update_broadcasts(client):
         client.execute_sql("UPDATE dim SET name = 999 WHERE dim_id = 2", schema_name=sn)
 
         # Single-source read: one copy, the updated row carries the new payload.
-        drows = {r["dim_id"]: r["name"] for r in _positive(client.scan(tid))}
+        drows = {r["dim_id"]: r["name"] for r in list(client.scan(tid))}
         assert drows == {1: 100, 2: 999, 3: 300, 4: 400}, f"updated copy diverged: {drows}"
 
         # Join reflects the new value for every fact referencing dim 2, on every worker.
-        jrows = _positive(client.scan(jid))
+        jrows = list(client.scan(jid))
         assert len(jrows) == 40, f"every fact still joins; got {len(jrows)}"
         for r in jrows:
             i = r["fid"]
@@ -365,13 +365,13 @@ def test_replicated_dim_delta_rejoins_existing_facts(client):
         client.execute_sql(f"INSERT INTO fact VALUES {vals}", schema_name=sn)
 
         early = {i for i in range(1, 41) if (i % 4) + 1 in (1, 2)}
-        rows = _positive(client.scan(jid))
+        rows = list(client.scan(jid))
         assert {r["fid"] for r in rows} == early, "only facts whose dim already exists join"
 
         # Dims 3,4 arrive late → broadcast delta re-joins the waiting facts on
         # every worker.
         client.execute_sql("INSERT INTO dim VALUES (3, 300), (4, 400)", schema_name=sn)
-        rows = _positive(client.scan(jid))
+        rows = list(client.scan(jid))
         assert len(rows) == 40, f"late dim delta must re-join all facts; got {len(rows)}"
         got = {r["fid"]: r["nm"] for r in rows}
         for i in range(1, 41):
@@ -399,7 +399,7 @@ def test_replicated_duplicate_pk_rejected(client):
         assert "duplicate key" in str(exc.value).lower()
         # The original row is intact and single-copy.
         tid = client.resolve_table(sn, "dim")[0]
-        rows = _positive(client.scan(tid))
+        rows = list(client.scan(tid))
         assert len(rows) == 1 and rows[0]["name"] == 100
     finally:
         client.drop_schema(sn)
@@ -427,7 +427,7 @@ def test_replicated_upsert_one_row(client):
         b2.append(id=1, name=200)
         client.push(tid, b2)
 
-        rows = _positive(client.scan(tid))
+        rows = list(client.scan(tid))
         assert len(rows) == 1, f"upsert must leave one row, got {len(rows)}"
         assert rows[0]["name"] == 200
     finally:
@@ -452,7 +452,7 @@ def test_fk_against_replicated_parent(client):
         client.execute_sql(
             "INSERT INTO child VALUES (100, 1), (101, 2), (102, 1)", schema_name=sn)
         cid = client.resolve_table(sn, "child")[0]
-        assert len(_positive(client.scan(cid))) == 3
+        assert len(list(client.scan(cid))) == 3
         # Orphan child: parent 99 does not exist → rejected.
         with pytest.raises(gnitz.GnitzError):
             client.execute_sql("INSERT INTO child VALUES (103, 99)", schema_name=sn)
@@ -586,7 +586,7 @@ def test_create_unique_index_on_populated_replicated_table(client):
 
         # Single-source read: one copy of every row.
         tid = client.resolve_table(sn, "dim")[0]
-        rows = _positive(client.scan(tid))
+        rows = list(client.scan(tid))
         assert sorted(r["val"] for r in rows) == [100, 200, 300, 400, 500, 600]
     finally:
         client.drop_schema(sn)
@@ -613,7 +613,7 @@ def test_create_unique_index_on_replicated_rejects_real_duplicate(client):
         # No phantom constraint: another duplicate value is still accepted.
         client.execute_sql("INSERT INTO dim VALUES (4, 42)", schema_name=sn)
         tid = client.resolve_table(sn, "dim")[0]
-        assert len(_positive(client.scan(tid))) == 4
+        assert len(list(client.scan(tid))) == 4
     finally:
         client.drop_schema(sn)
 
@@ -980,6 +980,239 @@ def test_replicated_equi_in_subquery(client):
         assert _wmap(client.scan(vin), "v") == {100: 1, 300: 1, 400: 1}
     finally:
         client.drop_schema(sn)
+
+
+# ---------------------------------------------------------------------------
+# Mixed views: ONE replicated source + ONE partitioned source
+#
+# A mixed view is stamped `Local`, so it is neither read single-sourced nor run
+# under the all-replicated local intercept: its circuit really does exchange. The
+# replicated side's delta, however, is identical on every worker, so relaying all
+# W payloads into the scatter routes each of its rows to the hash owner W times
+# and consolidation sums the byte-identical entries into one row at weight W.
+# The relay must therefore take exactly one worker's payload for a replicated
+# source, the same single-sourcing the read gather applies.
+#
+# Every case asserts per-row WEIGHTS: the row set is right under the bug, only
+# the weights are wrong, so a presence-only check passes either way.
+# ---------------------------------------------------------------------------
+
+
+def _mk_mixed(client, sn, fact_extra="val BIGINT NOT NULL", dim_extra="val BIGINT NOT NULL"):
+    """One partitioned `fact` + one replicated `dim`."""
+    client.execute_sql(
+        f"CREATE TABLE fact (pk BIGINT NOT NULL PRIMARY KEY, {fact_extra})", schema_name=sn)
+    client.execute_sql(
+        f"CREATE TABLE dim (pk BIGINT NOT NULL PRIMARY KEY, {dim_extra}) "
+        "WITH (replicated = true)", schema_name=sn)
+
+
+def test_mixed_union_all_weights(client):
+    """`fact UNION ALL dim`: the set-op side over the replicated source relays one
+    payload per worker into the output scatter. Every row weighs 1 — the dim rows
+    come out at W without the relay collapse."""
+    sn = "r" + _uid()
+    client.create_schema(sn)
+    try:
+        _mk_mixed(client, sn)
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT * FROM fact UNION ALL SELECT * FROM dim", schema_name=sn)
+        vid = client.resolve_table(sn, "v")[0]
+
+        client.execute_sql("INSERT INTO fact VALUES (1,10),(2,20)", schema_name=sn)
+        client.execute_sql("INSERT INTO dim VALUES (3,30),(4,40)", schema_name=sn)
+
+        rows = list(client.scan(vid))
+        assert _wmap(rows, "pk", "val") == {
+            (1, 10): 1, (2, 20): 1, (3, 30): 1, (4, 40): 1,
+        }
+        assert sum(r.weight for r in rows) == 4
+    finally:
+        client.drop_schema(sn)
+
+
+def test_mixed_except_all_replicated_left(client):
+    """`dim EXCEPT ALL fact` with the REPLICATED side on the left. The shared row
+    must cancel to nothing; at weight W on the left it would survive at W-1. The
+    mirror orientation cancels either way (`positive_part(1 - W) = 0`), so this
+    orientation is the one that pins the left side's weight."""
+    sn = "r" + _uid()
+    client.create_schema(sn)
+    try:
+        _mk_mixed(client, sn)
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT * FROM dim EXCEPT ALL SELECT * FROM fact", schema_name=sn)
+        vid = client.resolve_table(sn, "v")[0]
+
+        client.execute_sql("INSERT INTO dim VALUES (1,10),(2,20),(3,30)", schema_name=sn)
+        client.execute_sql("INSERT INTO fact VALUES (3,30),(4,40)", schema_name=sn)
+
+        assert _wmap(client.scan(vid), "pk", "val") == {(1, 10): 1, (2, 20): 1}
+    finally:
+        client.drop_schema(sn)
+
+
+def test_mixed_band_join_weights(client):
+    """Mixed band join (`f.k = d.k AND f.lo <= d.t`, n_eq=1). The join relays its
+    raw INPUT delta and scatters it by the eq prefix; a replicated input relayed W
+    times integrates into the trace W times, so EVERY output row — not only the
+    replicated branch's — comes out at weight W."""
+    sn = "r" + _uid()
+    client.create_schema(sn)
+    try:
+        _mk_mixed(
+            client, sn,
+            fact_extra="k BIGINT NOT NULL, lo BIGINT NOT NULL",
+            dim_extra="k BIGINT NOT NULL, t BIGINT NOT NULL")
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT fact.pk AS fid, dim.pk AS did "
+            "FROM fact JOIN dim ON fact.k = dim.k AND fact.lo <= dim.t", schema_name=sn)
+        vid = client.resolve_table(sn, "v")[0]
+
+        client.execute_sql(
+            "INSERT INTO fact VALUES (1,1,10),(2,1,50),(3,2,5),(4,3,1)", schema_name=sn)
+        client.execute_sql("INSERT INTO dim VALUES (1,1,40),(2,1,60),(3,2,100)", schema_name=sn)
+
+        # f1(lo10): d1(t40),d2(t60); f2(lo50): d2(t60); f3(k2,lo5): d3(t100);
+        # f4(k3): no dim.
+        assert _wmap(client.scan(vid), "fid", "did") == {
+            (1, 1): 1, (1, 2): 1, (2, 2): 1, (3, 3): 1,
+        }
+    finally:
+        client.drop_schema(sn)
+
+
+def test_mixed_pure_range_left_join_weights(client):
+    """Mixed pure-range LEFT join (`f.x < d.y`, n_eq=0) — the input relay's OTHER
+    destination arm (broadcast, not eq-prefix scatter), plus the null-fill pipeline.
+    Matched rows weigh 1; the null-filled rows ride the replicated threshold reduce
+    and weigh 1 either way, so they pin the fix disturbs nothing."""
+    sn = "r" + _uid()
+    client.create_schema(sn)
+    try:
+        _mk_mixed(client, sn, fact_extra="x BIGINT", dim_extra="y BIGINT NOT NULL")
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT fact.pk AS fid, dim.pk AS did "
+            "FROM fact LEFT JOIN dim ON fact.x < dim.y", schema_name=sn)
+        vid = client.resolve_table(sn, "v")[0]
+
+        client.execute_sql("INSERT INTO fact VALUES (1,10),(2,30),(3,50),(4,NULL)", schema_name=sn)
+        client.execute_sql("INSERT INTO dim VALUES (1,20),(2,40)", schema_name=sn)
+
+        # f1(10)<20,<40; f2(30)<40; f3(50) exceeds every y; f4(NULL) never matches.
+        assert _wmap(client.scan(vid), "fid", "did") == {
+            (1, 1): 1, (1, 2): 1, (2, 2): 1, (3, None): 1, (4, None): 1,
+        }
+    finally:
+        client.drop_schema(sn)
+
+
+def test_mixed_groupby_over_union_all(client):
+    """`GROUP BY` over a mixed `UNION ALL` view. The inflated weight is consumed by
+    a downstream aggregate, so it escapes into a user-visible COLUMN: COUNT(*)
+    reports W where the group holds one row."""
+    sn = "r" + _uid()
+    client.create_schema(sn)
+    try:
+        _mk_mixed(client, sn)
+        client.execute_sql(
+            "CREATE VIEW u AS SELECT * FROM fact UNION ALL SELECT * FROM dim", schema_name=sn)
+        client.execute_sql(
+            "CREATE VIEW g AS SELECT val, COUNT(*) AS cnt FROM u GROUP BY val", schema_name=sn)
+        gid = client.resolve_table(sn, "g")[0]
+
+        client.execute_sql("INSERT INTO fact VALUES (1,10),(2,20)", schema_name=sn)
+        client.execute_sql("INSERT INTO dim VALUES (3,30),(4,40)", schema_name=sn)
+
+        assert _wmap(client.scan(gid), "val", "cnt") == {
+            (10, 1): 1, (20, 1): 1, (30, 1): 1, (40, 1): 1,
+        }
+    finally:
+        client.drop_schema(sn)
+
+
+def test_mixed_union_all_over_replicated_view_keeps_multiplicity(client):
+    """A `Replicated`-stamped VIEW (`dim UNION ALL dim2`, all sources replicated)
+    union'd with the partitioned fact — the replicated property is transitive, so
+    the chained view's relay must collapse too. Its overlapping row carries weight
+    2 — the one case in this block with a genuine multiplicity above 1, so it pins
+    that the collapse drops duplicate payloads rather than clamping weights."""
+    sn = "r" + _uid()
+    client.create_schema(sn)
+    try:
+        _mk_mixed(client, sn)
+        client.execute_sql(
+            "CREATE TABLE dim2 (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL) "
+            "WITH (replicated = true)", schema_name=sn)
+        client.execute_sql(
+            "CREATE VIEW rv AS SELECT * FROM dim UNION ALL SELECT * FROM dim2", schema_name=sn)
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT * FROM fact UNION ALL SELECT * FROM rv", schema_name=sn)
+        vid = client.resolve_table(sn, "v")[0]
+
+        client.execute_sql("INSERT INTO fact VALUES (5,50)", schema_name=sn)
+        client.execute_sql("INSERT INTO dim VALUES (1,10),(2,20)", schema_name=sn)
+        client.execute_sql("INSERT INTO dim2 VALUES (2,20),(3,30)", schema_name=sn)
+
+        assert _wmap(client.scan(vid), "pk", "val") == {
+            (5, 50): 1, (1, 10): 1, (2, 20): 2, (3, 30): 1,
+        }
+    finally:
+        client.drop_schema(sn)
+
+
+def test_mixed_union_all_backfill_chunked_then_delete(tiny_ddl_chunk_server):
+    """Rows inserted BEFORE `CREATE VIEW`: the mixed union backfills through the
+    chunked distributed path, one exchange round per chunk. The 3-row chunk size
+    makes the replicated side span many rounds. The trailing DELETE covers a
+    retraction of a replicated row after a fill."""
+    c = tiny_ddl_chunk_server
+    sn = "r" + _uid()
+    c.create_schema(sn)
+    try:
+        _mk_mixed(c, sn)
+        c.execute_sql("INSERT INTO fact VALUES " + ",".join(
+            f"({i},{i * 10})" for i in range(1, 21)), schema_name=sn)
+        c.execute_sql("INSERT INTO dim VALUES " + ",".join(
+            f"({i},{i * 10})" for i in range(101, 131)), schema_name=sn)
+
+        c.execute_sql(
+            "CREATE VIEW v AS SELECT * FROM fact UNION ALL SELECT * FROM dim",
+            schema_name=sn)
+        vid = c.resolve_table(sn, "v")[0]
+
+        want = {(i, i * 10): 1 for i in list(range(1, 21)) + list(range(101, 131))}
+        assert _wmap(c.scan(vid), "pk", "val") == want
+
+        c.execute_sql("DELETE FROM dim WHERE pk = 105", schema_name=sn)
+        del want[(105, 1050)]
+        assert _wmap(c.scan(vid), "pk", "val") == want
+    finally:
+        c.drop_schema(sn)
+
+
+def test_mixed_union_all_weights_at_two_workers(two_worker_server):
+    """The same mixed union pinned to W=2. Every other case in this block runs at
+    the suite's worker count, so this is the only one that pins the result is not
+    tied to a particular W — and the only mixed case that exercises a relay at all
+    when the suite runs at W=1."""
+    c = two_worker_server
+    sn = "r" + _uid()
+    c.create_schema(sn)
+    try:
+        _mk_mixed(c, sn)
+        c.execute_sql(
+            "CREATE VIEW v AS SELECT * FROM fact UNION ALL SELECT * FROM dim",
+            schema_name=sn)
+        vid = c.resolve_table(sn, "v")[0]
+        c.execute_sql("INSERT INTO fact VALUES (1,10),(2,20)", schema_name=sn)
+        c.execute_sql("INSERT INTO dim VALUES (3,30),(4,40)", schema_name=sn)
+
+        assert _wmap(c.scan(vid), "pk", "val") == {
+            (1, 10): 1, (2, 20): 1, (3, 30): 1, (4, 40): 1,
+        }
+    finally:
+        c.drop_schema(sn)
 
 
 # ---------------------------------------------------------------------------

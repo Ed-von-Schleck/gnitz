@@ -31,10 +31,6 @@ def _drop_all(client, sn, tables=(), views=()):
     client.drop_schema(sn)
 
 
-def _scan_positive(client, vid):
-    return list(client.scan(vid))
-
-
 def _scan_reduce_map(client, vid):
     """Scan a reduce view → {group_val: agg_val} for positive-weight rows.
 
@@ -122,7 +118,7 @@ def test_except_stable_after_update(client):
         client.execute_sql("INSERT INTO b VALUES (1, 999)", schema_name=sn)
         client.execute_sql("INSERT INTO a VALUES (1, 100), (2, 200)", schema_name=sn)
 
-        rows1 = _scan_positive(client, vid)
+        rows1 = list(client.scan(vid))
         pks1 = sorted(r["pk"] for r in rows1)
         assert pks1 == [1, 2], f"before update: {pks1}"
 
@@ -131,7 +127,7 @@ def test_except_stable_after_update(client):
         # Without cursor re-seek: second row misses → pk=2 disappears.
         client.execute_sql("UPDATE a SET val = 300 WHERE pk = 2", schema_name=sn)
 
-        rows2 = _scan_positive(client, vid)
+        rows2 = list(client.scan(vid))
         pks2 = sorted(r["pk"] for r in rows2)
         assert pks2 == [1, 2], f"after update: expected [1, 2], got {pks2}"
         val2 = next(r["val"] for r in rows2 if r["pk"] == 2)
@@ -165,7 +161,7 @@ def test_intersect_stable_after_update(client):
         client.execute_sql("INSERT INTO b VALUES (1, 100), (2, 200)", schema_name=sn)
         client.execute_sql("INSERT INTO a VALUES (1, 100), (3, 300)", schema_name=sn)
 
-        rows1 = _scan_positive(client, vid)
+        rows1 = list(client.scan(vid))
         pks1 = sorted(r["pk"] for r in rows1)
         assert pks1 == [1], f"before update: {pks1}"
 
@@ -175,7 +171,7 @@ def test_intersect_stable_after_update(client):
         # INTERSECT entirely.
         client.execute_sql("UPDATE a SET val = 500 WHERE pk = 1", schema_name=sn)
 
-        rows2 = _scan_positive(client, vid)
+        rows2 = list(client.scan(vid))
         pks2 = sorted(r["pk"] for r in rows2)
         assert pks2 == [], f"after update: expected [], got {pks2}"
     finally:
@@ -216,7 +212,7 @@ def test_intersect_no_weight_inflation(client):
         a_vals = ", ".join(f"({i}, {i * 10})" for i in range(1, 31))
         client.execute_sql(f"INSERT INTO a VALUES {a_vals}", schema_name=sn)
 
-        rows = _scan_positive(client, vid)
+        rows = list(client.scan(vid))
         pks = sorted(r["pk"] for r in rows)
         assert pks == [1, 2, 3], f"expected [1,2,3], got {pks}"
     finally:
@@ -513,12 +509,12 @@ def test_except_update_non_excluded_row(client):
         client.execute_sql(
             "INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)", schema_name=sn,
         )
-        rows1 = _scan_positive(client, vid)
+        rows1 = list(client.scan(vid))
         assert sorted(r["pk"] for r in rows1) == [2, 3]
 
         # Update pk=3 (not excluded) → should stay in output with new value
         client.execute_sql("UPDATE a SET val = 999 WHERE pk = 3", schema_name=sn)
-        rows2 = _scan_positive(client, vid)
+        rows2 = list(client.scan(vid))
         pks2 = sorted(r["pk"] for r in rows2)
         assert pks2 == [2, 3], f"after update: expected [2, 3], got {pks2}"
         val3 = next(r["val"] for r in rows2 if r["pk"] == 3)
@@ -556,7 +552,7 @@ def test_except_multi_tick_exclusion(client):
         a_vals = ", ".join(f"({i}, {i * 10})" for i in range(1, 21))
         client.execute_sql(f"INSERT INTO a VALUES {a_vals}", schema_name=sn)
 
-        rows = _scan_positive(client, vid)
+        rows = list(client.scan(vid))
         pks = sorted(r["pk"] for r in rows)
         expected = sorted(range(1, 21, 2))  # odd PKs only
         assert pks == expected, f"expected {expected}, got {pks}"

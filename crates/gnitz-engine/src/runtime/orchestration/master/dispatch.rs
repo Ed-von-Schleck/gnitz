@@ -589,6 +589,24 @@ impl MasterDispatcher {
         } = relay;
 
         let cat = unsafe { &mut *self.catalog };
+        // The relay treats the per-worker payloads as disjoint slices of one
+        // delta and scatters them together. A replicated source breaks that: its
+        // delta is broadcast, so every worker returns the same rows, and
+        // scattering all W would route each row to its owner W times for
+        // `consolidate_exchanged` to sum into one row at weight W. Take worker
+        // 0's payload alone — the same single-sourcing the read gather applies
+        // (`replicated_unicast`). Dropping the copies rather than clamping keeps
+        // a genuine multiplicity in the source intact. A unary side relays under
+        // `source_id == 0`, which names no relation; that case needs no rule
+        // because a view whose sources are all replicated is itself stamped
+        // replicated and computes locally without ever reaching an exchange.
+        let n_src = if cat.relation_output_is_replicated(source_id) {
+            1
+        } else {
+            payloads.len()
+        };
+        let sources: Vec<Option<&Batch>> = payloads[..n_src].iter().map(|o| o.as_ref()).collect();
+
         // A join-shard scatter (cols from a reindex chain) must route by the
         // reindex key so a row lands on the worker that owns its `_join_pk`
         // partition; a GROUP BY / set-op exchange scatter routes by the group
@@ -597,17 +615,16 @@ impl MasterDispatcher {
         // pairs; a GROUP BY / set-op scatter carries plain shard cols (no
         // promotion). Split the pairs into a column list + a parallel target-tc
         // list for the scatter packer.
-        let (shard_cols, target_tcs, is_join): (std::rc::Rc<[i32]>, Vec<u8>, bool) = if source_id > 0 {
-            let pairs = cat.dag.get_join_shard_cols(view_id, source_id);
-            if pairs.is_empty() {
-                (cat.dag.get_shard_cols(view_id), Vec::new(), false)
-            } else {
-                let cols = pairs.iter().map(|&(c, _)| c).collect();
-                let tcs = pairs.iter().map(|&(_, t)| t).collect();
-                (cols, tcs, true)
-            }
-        } else {
-            (cat.dag.get_shard_cols(view_id), Vec::new(), false)
+        let join_pairs = (source_id > 0)
+            .then(|| cat.dag.get_join_shard_cols(view_id, source_id))
+            .filter(|p| !p.is_empty());
+        let is_join = join_pairs.is_some();
+        let (shard_cols, target_tcs): (std::rc::Rc<[i32]>, Vec<u8>) = match &join_pairs {
+            Some(pairs) => (
+                pairs.iter().map(|&(c, _)| c).collect(),
+                pairs.iter().map(|&(_, t)| t).collect(),
+            ),
+            None => (cat.dag.get_shard_cols(view_id), Vec::new()),
         };
 
         // A range-join INPUT relay (source_id > 0, is_join over a DeltaTraceRange
@@ -629,7 +646,6 @@ impl MasterDispatcher {
 
         let dest = if range_n_eq == Some(0) {
             // Pure range join: broadcast the full delta to every worker.
-            let sources: Vec<Option<&Batch>> = payloads.iter().map(|o| o.as_ref()).collect();
             RelayDest::Broadcast(Box::new(op_relay_broadcast(&sources, &schema)))
         } else {
             // Scatter. Band join (range_n_eq == Some(n_eq ≥ 1)): route by the eq
@@ -651,30 +667,13 @@ impl MasterDispatcher {
                 RouteMode::GroupKey
             };
             // Every contributing source must be consolidated to take the
-            // merge-walk scatter; a single non-consolidated source collapses the
-            // whole `Option` to `None` and falls back to the re-sorting repartition.
-            // The scatter (`op_relay_scatter_consolidated_mode`) debug-verifies each.
-            let consolidated_sources: Option<Vec<Option<&Batch>>> = payloads
-                .iter()
-                .map(|opt| match opt {
-                    None => Some(None),
-                    Some(b) if b.is_consolidated() => Some(Some(b)),
-                    Some(_) => None,
-                })
-                .collect();
-            RelayDest::PerWorker(match consolidated_sources {
-                Some(sources) => op_relay_scatter_consolidated_mode(
-                    &sources,
-                    &col_indices,
-                    route_tcs,
-                    &schema,
-                    self.num_workers,
-                    mode,
-                ),
-                None => {
-                    let sources: Vec<Option<&Batch>> = payloads.iter().map(|o| o.as_ref()).collect();
-                    op_repartition_batches_mode(&sources, &col_indices, route_tcs, &schema, self.num_workers, mode)
-                }
+            // merge-walk scatter; a single non-consolidated source falls back to
+            // the re-sorting repartition. The scatter
+            // (`op_relay_scatter_consolidated_mode`) debug-verifies each.
+            RelayDest::PerWorker(if sources.iter().flatten().all(|b| b.is_consolidated()) {
+                op_relay_scatter_consolidated_mode(&sources, &col_indices, route_tcs, &schema, self.num_workers, mode)
+            } else {
+                op_repartition_batches_mode(&sources, &col_indices, route_tcs, &schema, self.num_workers, mode)
             })
         };
 

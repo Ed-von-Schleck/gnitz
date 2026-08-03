@@ -272,6 +272,21 @@ def adhoc_group_cap_server(monkeypatch):
 
 
 @pytest.fixture
+def tiny_ddl_chunk_server(monkeypatch):
+    """Server whose CREATE VIEW backfill drains in 3-row chunks, so a small table
+    already spans many distributed backfill rounds. At the 65 536-row default a
+    test table is one chunk and pins nothing about chunk boundaries."""
+    yield from _seamed_server(monkeypatch, {"GNITZ_DDL_SCAN_CHUNK_ROWS": "3"})
+
+
+@pytest.fixture
+def two_worker_server(monkeypatch):
+    """Server pinned to exactly 2 workers, for cases whose expected values depend
+    on the worker count."""
+    yield from _seamed_server(monkeypatch, {"GNITZ_WORKERS": "2"})
+
+
+@pytest.fixture
 def unique_preflight_frame_server(monkeypatch):
     """Server whose CREATE UNIQUE INDEX pre-flight streams tiny (7-key) frames
     so a small table already produces multi-frame continuation trains per
