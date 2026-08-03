@@ -21,7 +21,7 @@ use emit::*;
 use optimize::*;
 
 pub(crate) use load::{
-    circuit_range_join_n_eq, circuit_source_bound, load_circuit, reindex_cols_through_filters,
+    circuit_range_join_n_eq, circuit_source_bound, load_circuit, output_exchange_shard, reindex_cols_through_filters,
     scan_tid_through_filters, topo_sort,
 };
 pub(crate) use optimize::compute_join_shard_map;

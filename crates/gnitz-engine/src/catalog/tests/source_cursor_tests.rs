@@ -509,9 +509,10 @@ fn dropped_index_falls_back_to_full_scan() {
     engine.close();
 }
 
-/// An inverted range is `Empty` — provably no rows — and NOT `None`, which the
-/// drivers read as "source unregistered, skip it" (losing a global aggregate's
-/// ground row).
+/// An inverted range is `Empty` — provably no rows — and NOT `None`, which
+/// `handle_backfill` treats as an unregistered source and fails stop on. An
+/// `Empty` cursor still feeds one empty epoch, which is what mints a global
+/// aggregate's ground row.
 #[test]
 fn inverted_range_is_empty_not_none() {
     // start After(900) is above end Before(300): x > 900 AND x < 300.
@@ -525,8 +526,8 @@ fn inverted_range_is_empty_not_none() {
 }
 
 /// An unregistered source is the ONLY `None` — byte-identical to
-/// `open_store_cursor`'s contract, which `backfill_view`'s `else { continue; }`
-/// relies on.
+/// `open_store_cursor`'s contract. `handle_backfill` never reaches it: it
+/// resolves the source's schema first and fails stop when that is absent.
 #[test]
 fn unregistered_source_is_none() {
     let (mut engine, _tid, vid) = fixture("srccur_unreg", None);
@@ -536,7 +537,7 @@ fn unregistered_source_is_none() {
 
 /// `open_source_cursor` must compile the plan itself before reading the bound.
 ///
-/// `handle_backfill` — the driver for every exchange view and every
+/// `handle_backfill` — the one driver for every new view and every
 /// post-recovery rebuild — reaches the cursor open BEFORE anything compiles the
 /// view. With a cold cache and no `ensure_compiled`, the bound would read back as
 /// "absent" and the motivating case would ship silently dead: every other test

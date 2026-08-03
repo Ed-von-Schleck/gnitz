@@ -67,8 +67,8 @@ fn view_chain_over_replicated_source_join_keeps_every_row_multiworker() {
     };
     let (mut client, sn) = make_planner(&srv);
     create_tables(&mut client, &sn);
-    // The join seeds an exchange backfill, so every view is created before the
-    // data and materializes incrementally tick by tick.
+    // Every view is created before the data, so each materializes incrementally
+    // tick by tick rather than through a backfill.
     exec(
         &mut client,
         &sn,

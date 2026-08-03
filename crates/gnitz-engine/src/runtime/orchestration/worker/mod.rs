@@ -996,12 +996,10 @@ impl WorkerProcess {
     /// decision is collective: each worker stamps a per-chunk pad bit onto every
     /// FLAG_EXCHANGE it issues (`do_exchange_wait`), the master ANDs them and
     /// stamps the verdict back onto each relay, and the worker records it into a
-    /// single per-chunk slot read here. A worker missing the source opens no
-    /// cursor and pads every round — the barrier still needs its report.
+    /// single per-chunk slot read here.
     ///
-    /// A source feeding NO exchange view has no barrier: no relay arrives, the
-    /// slot stays `None`, and the worker self-terminates on local drain
-    /// exhaustion.
+    /// A view that runs NO exchange has no barrier: no relay arrives, the slot
+    /// stays `None`, and the worker self-terminates on local drain exhaustion.
     ///
     /// **View-scoped.** Drives ONLY `view_id` (`backfill_view_step`), never the
     /// source's whole dependent closure: the source may already have populated
@@ -1022,21 +1020,18 @@ impl WorkerProcess {
             self.cat().invalid_views.remove(&view_id);
         }
         let chunk_rows = self.cat().ddl_scan_chunk_rows;
-        let has = self.cat().has_id(source_tid);
-        // Needed to synthesize empty pad chunks. A missing source still pads.
+        // Needed to synthesize empty pad chunks. An unregistered source is a
+        // fail-stop: DDL_SYNC applies in SAL order, so a worker that cannot see
+        // the source has diverged from the catalog.
         let schema = self
             .cat()
             .get_schema_desc(source_tid)
             .ok_or_else(|| format!("backfill: no schema for source {source_tid}"))?;
-        let mut handle = if has {
-            self.cat().open_source_cursor(view_id, source_tid)
-        } else {
-            None
-        };
+        let mut handle = self.cat().open_source_cursor(view_id, source_tid);
         let mut produced_any = false;
 
         loop {
-            // `None` ⇒ partition exhausted (or absent): this round is an empty
+            // `None` ⇒ partition exhausted: this round is an empty
             // PAD. The master ANDs the pad bit across workers and stamps the
             // collective stop/continue/checkpoint decision back onto each relay.
             // The store is re-resolved per chunk: a cursor holds no borrow on it,
@@ -1062,10 +1057,8 @@ impl WorkerProcess {
 
         // Steady-state ticks must keep passing a 0 pad bit (see do_exchange_wait).
         self.exchange.backfill_pad = None;
-        // Release the last chunk's pinned delta registers: the source→dependents
-        // closure, plus the view being backfilled. Both are cheap no-ops when
-        // there is nothing pinned.
-        self.cat().dag.clear_regfile_deltas_from_source(source_tid);
+        // Release the last chunk's pinned delta registers. This loop drives only
+        // `view_id`, so that is the one regfile it can have pinned.
         self.cat().dag.clear_view_regfile_deltas(view_id);
         // `backfill_view_step` bypasses the closure driver's per-view flush, so
         // flush the view's output trace once after the final chunk. Only when it

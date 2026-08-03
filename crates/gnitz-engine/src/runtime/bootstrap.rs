@@ -356,26 +356,18 @@ fn recovery_tick_sweep(catalog: &mut CatalogEngine, dispatcher: &mut MasterDispa
     Ok(())
 }
 
-/// Step-4: rebuild only the views the boot verdict rejected. For each invalid view
-/// in ascending depth (a source view before any dependent that reads it), issue
-/// one view-scoped `fan_out_backfill(vid, src)` per source. The worker resets that
-/// view's output partitions + operator scratch on the FIRST such command (gated on
-/// its COW-inherited `invalid_views` set), then fills — for both exchange and
-/// non-exchange views. A multi-source join iterates every source: the first fills
-/// its trace, the rest join against it. View-scoped (`vid != 0`) so a resumed
-/// sibling's loaded shards are never re-derived and double-counted.
+/// Step-4: rebuild only the views the boot verdict rejected, through the same
+/// dependency-ordered driver a live CREATE VIEW uses. The worker resets a view's
+/// output partitions + operator scratch on the FIRST backfill command it receives
+/// (gated on its COW-inherited `invalid_views` set), then fills. The driver is
+/// view-scoped, so a resumed sibling's loaded shards are never re-derived and
+/// double-counted.
 fn rebuild_invalid_views(catalog: &mut CatalogEngine, dispatcher: &mut MasterDispatcher) -> Result<(), String> {
-    let mut invalid: Vec<i64> = catalog.invalid_views.iter().copied().collect();
-    invalid.sort_by_key(|&vid| catalog.dag.tables.get(&vid).map(|e| e.depth).unwrap_or(0));
+    let invalid: Vec<i64> = catalog.invalid_views.iter().copied().collect();
     // Resume-vs-rebuild marker (asserted by the "no backfill on clean restart"
     // E2E): 0 ⇒ every view resumed from its checkpoint.
     boot_log(&format!("recovery: rebuilding {} invalid view(s)\n", invalid.len()));
-    for vid in invalid {
-        for src in catalog.dag.get_source_ids(vid) {
-            dispatcher.fan_out_backfill(vid, src)?;
-        }
-    }
-    Ok(())
+    dispatcher.backfill_views_in_depth_order(&invalid)
 }
 
 // ---------------------------------------------------------------------------

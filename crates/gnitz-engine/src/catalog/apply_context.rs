@@ -18,28 +18,21 @@ use super::CatalogEngine;
 /// call site needs the whole context by value, and a stray by-value copy
 /// could silently desync the transient sub-states.
 pub(crate) struct ApplyContext {
-    /// False while `open()` replays persisted catalog rows at boot; latched
-    /// true by `go_live()` once, after the boot shard replay. Two operations
-    /// consume a live `+1` and are live-only: `hook_cascade_fk`'s FK
-    /// auto-index creation (the boot shard replay must skip it — TABLE_TAB
-    /// replays before IDX_TAB, so `index_by_name` is still empty and an
-    /// ungated run would mint duplicate FK indices under fresh IDs alongside
-    /// the persisted IDX_TAB rows) and `promote_index_to_unique`'s duplicate
-    /// scan (skipped because the data was validated at original write time;
-    /// the uniqueness flag is still flipped, outside the gate). SAL
-    /// system-table recovery runs after `go_live()`, so both ops can fire
-    /// there, kept idempotent by the `index_by_name` skip and the per-family
-    /// LSN watermark, not the phase. `backfill_index` is likewise rebuild-at-boot
-    /// — it *must* run during replay and is gated on rollback, not on this.
-    /// `backfill_view`, by contrast, no longer runs during boot replay at all:
-    /// its non-exchange rebuild is split between the post-recovery worker pass and
-    /// the master's exchange cascade, so its inline hook is now gated live-only.
+    /// True iff this catalog row is being applied for the FIRST time, rather
+    /// than replayed from already-validated persisted state: false only while
+    /// `open()` replays boot shards, latched true once by `go_live()`.
+    ///
+    /// So it gates work that a replay must not redo — minting a row the replay
+    /// will supply anyway, or re-validating data that passed its check at
+    /// original write time. Each callsite states which of the two it is. SAL
+    /// system-table recovery runs *after* `go_live()`, so it applies live and
+    /// relies on the per-family LSN watermark for idempotence, not this flag.
     live: bool,
     /// True while `compensate_stage_a` replays compensating deltas: `submit`
     /// is redirected to the no-broadcast path and backfill/cascade re-issue
     /// is skipped, so no compensating row is re-broadcast to workers and no
-    /// side effect (backfill_index, backfill_view, cascade_retract_columns,
-    /// hook_cascade_fk) re-runs. Never nested.
+    /// side effect (backfill_index, cascade_retract_columns, hook_cascade_fk)
+    /// re-runs. Never nested.
     rollback: bool,
     /// True while an owner-drop index-retraction cascade is in flight:
     /// suppresses the IDX_TAB FK-target guard in precheck on the live

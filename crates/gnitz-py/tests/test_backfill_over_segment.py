@@ -1,16 +1,19 @@
-"""E2E: a linear final over an exchange-seeding hidden segment must backfill.
+"""E2E: a linear final over a hidden segment must backfill.
 
 A CREATE VIEW whose final (or an intermediate) circuit is **linear** — no `Join`,
-no `ExchangeShard` — but whose delta source is an in-bundle hidden segment that
-itself seeds a distributed backfill (a grouped or joined CTE / derived table)
-used to silently lose ALL pre-existing base data on the data-before-view path.
-The fix: `simple::emit_linear` detects the seeding source and appends an identity
-`ExchangeShard` on the view PK so it rides the ordered `fan_out_backfill`.
+no `ExchangeShard` — but whose delta source is an in-bundle hidden segment
+carrying one (a grouped or joined CTE / derived table) once silently lost ALL
+pre-existing base data on the data-before-view path: the view was filled inline
+at registration, from a sibling segment that was still empty. Every view is now
+populated by one dependency-ordered distributed driver, so a source segment is
+already filled when the view reading it takes its turn.
 
 Each test asserts **data-before-view == view-before-data** (weights, not just row
 presence) and that a post-create insert *adds to* the backfilled rows and a
-delete of a backfilled row retracts it weight-correctly. A negative-cost guard
-pins that a linear view over a *linear* CTE is NOT over-sharded.
+delete of a backfilled row retracts it weight-correctly. Two structural guards
+pin that ordering costs no exchange: neither a linear view over a grouped CTE nor
+one over a linear CTE carries an `ExchangeShard`, while the grouped CTE's own
+segment keeps the one its reduce needs.
 
 Run at GNITZ_WORKERS=4 (the exchange/fanout paths only engage at W>1):
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest \
@@ -96,6 +99,17 @@ def test_bfseg_linear_over_grouped_cte(client):
         assert got_d == {(1,): 1}, f"data-before-view lost backfill: {got_d}"
         assert got_d == got_v, f"backfill != steady state: {got_d} vs {got_v}"
 
+        # The ordering costs no exchange: the final is a plain filter/projection
+        # and carries none, while the grouped CTE's own segment keeps the one its
+        # reduce needs. An `ExchangeShard` here would be a cluster-wide IPC
+        # barrier on every epoch, paid solely to order the backfill.
+        vid = client.resolve_table(sn_d, "s")[0]
+        seg_vid = client.resolve_table(sn_d, f"__h{vid}_0")[0]
+        assert not _has_exchange_shard(client, vid), \
+            "a linear view over a grouped CTE must not be sharded to order its backfill"
+        assert _has_exchange_shard(client, seg_vid), \
+            "the grouped CTE segment's own reduce exchange must survive"
+
         # A post-create insert ADDS to the backfilled rows (does not replace them).
         client.execute_sql("INSERT INTO t VALUES (3, 30)", schema_name=sn_d)
         assert _weights(client, sn_d, "s", ["id"]) == {(1,): 1, (3,): 1}
@@ -154,10 +168,10 @@ def test_bfseg_linear_over_join_cte(client):
 
 
 def test_bfseg_linear_hidden_between_two_seeding(client):
-    """A linear hidden segment between two seeding segments — the
+    """A linear hidden segment between two exchanging ones — the
     `compile_hidden_body` linear-arm coverage: a grouped CTE `g`, a linear CTE
-    `l` over it (the middle segment that must itself shard), and a grouped final
-    over `l`."""
+    `l` over it (the middle segment, which shards nothing itself), and a grouped
+    final over `l`."""
     view = (
         "CREATE VIEW s AS "
         "WITH g AS (SELECT id, SUM(v) AS sv FROM t GROUP BY id), "
@@ -195,10 +209,41 @@ def test_bfseg_linear_hidden_between_two_seeding(client):
         _cleanup(client, sn_v, tables=["t"], views=["s"])
 
 
+def test_bfseg_linear_over_preexisting_grouped_view(client):
+    """A view over a grouped view created by a *separate, earlier* DDL — no
+    shared bundle, so the source is already fully populated when the second
+    CREATE runs. This is the shape the retired inline backfill served, and the
+    one driver must still return its rows."""
+    sn = "bfsegpre" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, v BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "INSERT INTO t VALUES (1, 7, 20), (2, 7, 5), (3, 9, 4)", schema_name=sn
+        )
+        client.execute_sql(
+            "CREATE VIEW g AS SELECT g, SUM(v) AS sv FROM t GROUP BY g", schema_name=sn
+        )
+        assert _weights(client, sn, "g", ["g", "sv"]) == {(7, 25): 1, (9, 4): 1}
+
+        # Separate DDL, over a source that is already full.
+        client.execute_sql("CREATE VIEW s AS SELECT g FROM g WHERE sv > 10", schema_name=sn)
+        assert _weights(client, sn, "s", ["g"]) == {(7,): 1}
+
+        # And it stays incremental over the pre-existing view.
+        client.execute_sql("INSERT INTO t VALUES (4, 9, 30)", schema_name=sn)
+        assert _weights(client, sn, "s", ["g"]) == {(7,): 1, (9,): 1}
+    finally:
+        _cleanup(client, sn, tables=["t"], views=["s", "g"])
+
+
 def test_bfseg_linear_over_linear_cte_not_oversharded(client):
     """Negative-cost guard: a linear view over a *linear* CTE compiles with NO
-    `ExchangeShard` node — the seeding gate must not over-shard a source that is
-    inline-backfilled in dependency order."""
+    `ExchangeShard` node — a filter/projection neither re-keys nor redistributes
+    its source, whatever the source is."""
     sn = "bfsegneg" + _uid()
     client.create_schema(sn)
     try:

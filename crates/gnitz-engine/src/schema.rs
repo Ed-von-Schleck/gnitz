@@ -253,8 +253,9 @@ impl Placement {
 
     /// True iff a row's owning worker is derived from its key. A relation that
     /// is not key-routed is built `Routing::Unhashed`, because a 256-partition
-    /// store trimmed to the worker's range would drop every row whose key
-    /// partition the worker does not own.
+    /// store trimmed to the worker's range cannot address a row whose key
+    /// partition the worker does not own — the ingest scatter reports
+    /// `MisroutedRows` and the write fails stop.
     #[inline]
     pub(crate) const fn is_key_routed(self) -> bool {
         matches!(self, Placement::Keyed { .. })

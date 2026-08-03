@@ -149,7 +149,7 @@ fn scan_decode_err(w: usize, e: &'static str) -> String {
 /// rows `nw` times — else `-1` (broadcast). The single owner of the
 /// replicated→single-source routing policy for `dispatch_scan_fanout` callers.
 pub(crate) fn replicated_unicast(disp_ptr: *mut MasterDispatcher, target_id: i64) -> i32 {
-    let replicated = unsafe { (*(*disp_ptr).catalog).relation_output_is_replicated(target_id) };
+    let replicated = unsafe { (*(*disp_ptr).catalog).dag.relation_is_replicated(target_id) };
     if replicated {
         0
     } else {

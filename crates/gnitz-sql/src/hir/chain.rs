@@ -108,27 +108,6 @@ impl ViewChain {
         Ok(v)
     }
 
-    /// True iff `tid` is a segment already on this chain whose circuit contains a
-    /// `Join` or `ExchangeShard` node — the client-side mirror of the engine's
-    /// `view_seeds_exchange_backfill`. A linear view whose delta source is such a
-    /// seeding segment must be routed through the ordered distributed backfill
-    /// (`linear::emit_linear` appends its identity shard), or it silently loses
-    /// all pre-existing base data: its inline hook-time backfill reads a
-    /// still-empty sibling segment. A source that is a base table, a pass-through
-    /// CTE alias, or a linear segment is fully populated (or inline-backfilled in
-    /// dependency order) at hook time, so it keeps the unsharded emit.
-    pub fn segment_seeds_backfill(&self, tid: u64) -> bool {
-        self.segments.iter().any(|s| {
-            s.circuit.view_id == tid
-                && s.circuit.nodes.values().any(|op| {
-                    matches!(
-                        op,
-                        gnitz_core::OpNode::Join(_) | gnitz_core::OpNode::ExchangeShard { .. }
-                    )
-                })
-        })
-    }
-
     /// Mint one hidden segment: allocate its view id, run `emit` with it (the
     /// emitter may push its own upstream segments first — it gets `self` back),
     /// and push the emitted pieces. Returns the segment's `(view id, schema)` plus

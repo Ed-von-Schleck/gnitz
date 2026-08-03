@@ -2,14 +2,13 @@
 //! column reorder/subset, or an expr-map when the projection derives or duplicates
 //! a PK column). `lower::lower_linear` resolves the HIR to the physical inputs
 //! (source, scan bound, folded predicate, physicalized projection) and hands them
-//! here; this module owns only the `CircuitBuilder` call sequence and the
-//! backfill-seeding shard decision.
+//! here; this module owns only the `CircuitBuilder` call sequence.
 
 use super::physical::PhysProjection;
 use super::SegInput;
 use crate::codec::project_schema::{compile_projection_map, ProjItem};
 use crate::error::GnitzSqlError;
-use crate::hir::chain::{EmitPieces, ViewChain};
+use crate::hir::chain::EmitPieces;
 use crate::ir::BoundExpr;
 use crate::lower::compile_filter_program;
 use gnitz_core::CircuitBuilder;
@@ -19,26 +18,15 @@ use gnitz_wire::ScanBound;
 /// inputs. Returns `(circuit, output_columns, pk_cols)`; the view's physical PK is
 /// the leading `k = proj.pk_arity` source-PK columns (`pk_cols == 0..k`).
 ///
-/// The seeding rule, in its one home: a plain filter/map over a *base* table is
-/// backfilled inline from committed data; but a linear view whose source is an
-/// in-bundle **exchange** segment (a hidden join/reduce, e.g. the
-/// scalar-subquery `final` over `H`) must be backfilled by the
-/// dependency-ordered `fan_out_backfill` *after* that source is filled — and the
-/// master only fans a view out when its circuit carries an exchange
-/// (`view_seeds_exchange_backfill`). For such a source
-/// (`ViewChain::segment_seeds_backfill`), a trailing identity `ExchangeShard` on
-/// the view's own PK is appended (its source already partitions by this PK, so
-/// no row moves), solely to route the view through the ordered distributed
-/// backfill.
+/// The emitted circuit carries no exchange: a filter/map neither re-keys nor
+/// redistributes its source, so every row stays on the worker that produced it.
 pub(super) fn emit_linear(
-    chain: &ViewChain,
     view_id: u64,
     src: &SegInput,
     bound: Option<ScanBound>,
     filter: Option<BoundExpr>,
     proj: &PhysProjection,
 ) -> Result<EmitPieces, GnitzSqlError> {
-    let shard = chain.segment_seeds_backfill(src.tid);
     let source_schema = &src.schema;
     let items = &proj.items;
     let k = proj.pk_arity;
@@ -103,12 +91,7 @@ pub(super) fn emit_linear(
         filtered
     };
 
-    let sink_input = if shard {
-        cb.shard(out_node, &(0..k).collect::<Vec<_>>())
-    } else {
-        out_node
-    };
-    cb.sink(sink_input);
+    cb.sink(out_node);
     let circuit = cb.build();
 
     // The view's physical PK is the leading k columns (the source PK passed

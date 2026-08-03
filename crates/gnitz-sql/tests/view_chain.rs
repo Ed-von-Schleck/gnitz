@@ -6,12 +6,15 @@
 //! the bundle mechanics and the row-order-independent backfill are exercised on
 //! their own.
 //!
-//! Each segment is a minimal `input_delta → shard → sink` identity view.
-//! The `ExchangeShard` node makes `view_seeds_exchange_backfill` true, so every
-//! segment takes the *distributed* backfill tail — the path the dependency-order
-//! sort governs. A downstream segment reads an upstream segment's store, so a
+//! Each segment is a minimal identity view, either `input_delta → shard → sink`
+//! (an exchanging one, which runs a cross-worker barrier per backfill chunk) or
+//! the shard-free `input_delta → sink`. Both take the same distributed backfill
+//! tail — there is one driver for every view — and the dependency-order sort
+//! governs it. A downstream segment reads an upstream segment's store, so a
 //! bundle whose VIEW_TAB rows are deliberately misordered (consumer before
-//! producer) still backfills correctly only if the tail re-derives the order.
+//! producer) still backfills correctly only if the tail re-derives the order;
+//! that is pinned for both segment shapes, since the shard-free one has no
+//! barrier and stops on local drain exhaustion instead.
 
 use gnitz_core::{hidden_view_name, CircuitBuilder, ColumnDef, GnitzClient, PlannedView};
 use gnitz_sql::GnitzSqlError;
@@ -20,14 +23,24 @@ use gnitz_test_harness::ServerHandle;
 mod common;
 use common::*;
 
-/// A minimal exchange-seeding identity view over `source_id`, keyed on PK col 0:
-/// `input_delta → shard([0]) → sink`. `view_id` is pre-set so a
-/// downstream segment can `ScanDelta` it.
+/// A minimal exchanging identity view over `source_id`, keyed on PK col 0:
+/// `input_delta → shard([0]) → sink`. Its backfill runs a cross-worker exchange
+/// round per chunk.
 fn identity_exchange_circuit(view_id: u64, source_id: u64) -> gnitz_core::Circuit {
     let mut cb = CircuitBuilder::new(view_id, source_id);
     let inp = cb.input_delta();
     let sh = cb.shard(inp, &[0]);
     cb.sink(sh);
+    cb.build()
+}
+
+/// A minimal shard-free identity view over `source_id`: `input_delta → sink`,
+/// the shape a plain projection/filter compiles to. Its backfill runs no
+/// exchange, so each worker terminates on its own drain exhaustion.
+fn identity_linear_circuit(view_id: u64, source_id: u64) -> gnitz_core::Circuit {
+    let mut cb = CircuitBuilder::new(view_id, source_id);
+    let inp = cb.input_delta();
+    cb.sink(inp);
     cb.build()
 }
 
@@ -54,17 +67,31 @@ fn plan_chain(
     f_name: &str,
     cols: &[ColumnDef],
 ) -> [PlannedView; 2] {
+    plan_chain_with(identity_exchange_circuit, h_vid, f_vid, base_tid, h_name, f_name, cols)
+}
+
+/// `plan_chain` with the segments' circuit shape chosen by the caller.
+/// `view_id` is pre-set so a downstream segment can `ScanDelta` it.
+fn plan_chain_with(
+    circuit_of: fn(view_id: u64, source_id: u64) -> gnitz_core::Circuit,
+    h_vid: u64,
+    f_vid: u64,
+    base_tid: u64,
+    h_name: &str,
+    f_name: &str,
+    cols: &[ColumnDef],
+) -> [PlannedView; 2] {
     let h = PlannedView {
         name: h_name.to_string(),
         sql_text: "-- hidden segment".to_string(),
-        circuit: identity_exchange_circuit(h_vid, base_tid),
+        circuit: circuit_of(h_vid, base_tid),
         output_columns: cols.to_vec(),
         pk_cols: vec![0],
     };
     let f = PlannedView {
         name: f_name.to_string(),
         sql_text: "-- final segment".to_string(),
-        circuit: identity_exchange_circuit(f_vid, h_vid),
+        circuit: circuit_of(f_vid, h_vid),
         output_columns: cols.to_vec(),
         pk_cols: vec![0],
     };
@@ -120,6 +147,34 @@ fn chain_backfill_row_misordered() {
         got,
         vec![vec![1, 10], vec![2, 20], vec![3, 30]],
         "final view backfilled from the hidden view despite reversed row order"
+    );
+}
+
+/// The same reversed bundle built from **shard-free** segments. Nothing about a
+/// linear circuit orders it: it runs no exchange, so no cross-worker barrier can
+/// hold it back and each worker stops on its own drain exhaustion. Correct output
+/// therefore rests entirely on the one driver visiting `h` before `f` in the
+/// depth order it computes — the property this pins.
+#[test]
+fn chain_backfill_row_misordered_linear() {
+    let srv = match ServerHandle::start_n(4) {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    let (base_tid, cols) = make_base(&mut client, &sn);
+
+    let h_vid = client.alloc_table_id().unwrap();
+    let f_vid = client.alloc_table_id().unwrap();
+    let [h, f] = plan_chain_with(identity_linear_circuit, h_vid, f_vid, base_tid, "lin_h", "lin_f", &cols);
+    // Consumer (f) before producer (h) in the bundle.
+    client.create_view_chain(&sn, vec![f, h]).unwrap();
+
+    let got = payload_rows(&mut client, &sn, "lin_f", &["pk", "v"]);
+    assert_eq!(
+        got,
+        vec![vec![1, 10], vec![2, 20], vec![3, 30]],
+        "a shard-free final backfilled from its shard-free source despite reversed row order"
     );
 }
 

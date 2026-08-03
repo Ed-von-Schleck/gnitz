@@ -8,9 +8,12 @@ use std::rc::Rc;
 
 /// Per-view circuit metadata derived from one `load_meta_circuit` pass.
 /// Everything a plan-free caller needs; eviction is one map `remove`.
-pub(super) struct ViewMeta {
-    /// The output `ExchangeShard`'s shard columns (empty when the view has none).
-    pub shard_cols: Rc<[i32]>,
+pub(crate) struct ViewMeta {
+    /// The sink-nearest `ExchangeShard`'s shard columns — the master relay's
+    /// routing key — and `None` when the circuit carries no `ExchangeShard` at
+    /// all. The two states are distinct: an ungrouped global aggregate shards on
+    /// `∅`, a real exchange that funnels every row onto partition 0's owner.
+    pub shard_cols: Option<Rc<[i32]>>,
     /// source table id → join/group reindex `(column, carried promotion tc)`
     /// pairs — the scatter key per source, mirroring the trace-side reindex
     /// Map slot-for-slot.
@@ -18,8 +21,6 @@ pub(super) struct ViewMeta {
     /// `Some(n_eq)` iff the view is a non-equi (range / band) join. Drives the
     /// master relay's eq-prefix scatter (`n_eq ≥ 1`) vs broadcast (`n_eq == 0`).
     pub range_join_n_eq: Option<u8>,
-    /// The circuit carries an `ExchangeShard` node.
-    pub needs_exchange: bool,
     /// The circuit carries a `Join` node.
     pub has_join: bool,
 }
@@ -28,20 +29,10 @@ impl ViewMeta {
     /// Derive the metadata from an already-loaded circuit. The body behind
     /// `view_meta`'s memo miss.
     ///
-    /// `loaded` MUST already be `topo_sort`ed: `compute_join_shard_map` walks
-    /// `loaded.outgoing`, which only `topo_sort` populates.
+    /// `loaded` MUST already be `topo_sort`ed: `compute_join_shard_map` and
+    /// `output_exchange_shard` both walk order that only `topo_sort` populates.
     pub(super) fn from_loaded(loaded: &compiler::LoadedCircuit) -> ViewMeta {
-        let shard_cols: Rc<[i32]> = loaded
-            .nodes
-            .values()
-            .find_map(|op| match op {
-                gnitz_wire::OpNode::ExchangeShard { shard_cols } => {
-                    Some(shard_cols.iter().map(|&c| c as i32).collect::<Vec<_>>())
-                }
-                _ => None,
-            })
-            .unwrap_or_default()
-            .into();
+        let shard_cols: Option<Rc<[i32]>> = compiler::output_exchange_shard(loaded).map(|(_, cols)| cols.into());
         let join_shard_map: FxHashMap<i64, Rc<[(i32, u8)]>> = compiler::compute_join_shard_map(loaded)
             .into_iter()
             .map(|(tid, cols)| (tid, cols.into()))
@@ -50,10 +41,6 @@ impl ViewMeta {
             shard_cols,
             join_shard_map,
             range_join_n_eq: compiler::circuit_range_join_n_eq(loaded),
-            needs_exchange: loaded
-                .nodes
-                .values()
-                .any(|op| matches!(op, gnitz_wire::OpNode::ExchangeShard { .. })),
             has_join: loaded
                 .nodes
                 .values()
@@ -119,7 +106,7 @@ impl DepMap {
     /// Both directions are this one walk, so they cannot drift: `forward` reaches
     /// a source's dependents, `reverse` reaches a view's sources, and
     /// `get_or_rebuild` writes both halves from the same DepTab row.
-    fn closure(edges: &FxHashMap<i64, Vec<i64>>, seeds: Vec<i64>) -> FxHashSet<i64> {
+    pub(super) fn closure(edges: &FxHashMap<i64, Vec<i64>>, seeds: Vec<i64>) -> FxHashSet<i64> {
         let mut reachable: FxHashSet<i64> = FxHashSet::default();
         let mut stack = seeds;
         while let Some(id) = stack.pop() {
@@ -146,13 +133,6 @@ impl DagEngine {
     pub fn get_source_ids(&mut self, view_id: i64) -> Vec<i64> {
         self.get_dep_map();
         self.dep.reverse.get(&view_id).cloned().unwrap_or_default()
-    }
-
-    /// Every view reachable from `seeds` by following `source → dependents`
-    /// edges, with the seeds themselves excluded.
-    pub(super) fn dependent_closure(&mut self, seeds: Vec<i64>) -> FxHashSet<i64> {
-        self.get_dep_map();
-        DepMap::closure(&self.dep.forward, seeds)
     }
 
     /// Every relation reachable from `seeds` by following `view → sources` edges
@@ -235,6 +215,11 @@ impl DagEngine {
     /// [`Placement`] stamped on its schema at registration. The one spelling of the
     /// replication probe, so the write broadcast, the read single-sourcing, and the
     /// store shape all read one answer.
+    ///
+    /// Any **gather** of a replicated relation must therefore single-source it,
+    /// taking one worker's copy instead of N identical ones — both the scan
+    /// dispatch and the exchange relay read this for that. SEEK already unicasts
+    /// to one worker, so it needs no check.
     pub(crate) fn relation_is_replicated(&self, id: i64) -> bool {
         self.tables
             .get(&id)
@@ -288,23 +273,35 @@ impl DagEngine {
             return Placement::Local;
         }
 
-        // Every source is `Keyed`. A single-source view that seeds no exchange
-        // re-emits that source's PK region verbatim, so its rows sit on the worker
-        // owning the *source's* distribution prefix and it must address them the
-        // same way. `pk_arity == |source PK|` stands in for "the view's PK region
-        // **is** the source's", which the planner's PK placement guarantees; the
-        // exchange-free linear emitter is the only shape that reaches here, since
-        // every other emits an `ExchangeShard` or a `Join` and
-        // `view_seeds_exchange_backfill` catches both.
+        // Every source is `Keyed`. A single-source view that neither shards nor
+        // joins re-emits that source's PK region verbatim, so its rows sit on the
+        // worker owning the *source's* distribution prefix and it must address
+        // them the same way. `pk_arity == |source PK|` stands in for "the view's
+        // PK region **is** the source's", which the planner's PK placement
+        // guarantees.
         //
-        // The arity test comes first: it is a map lookup, where
-        // `view_seeds_exchange_backfill` can cost a circuit-metadata load.
+        // The `has_join` term is a backstop, not a live case: a planned join has
+        // two distinct sources (the self-join guard rejects one source feeding
+        // both inputs), so the single-source destructure below already returns.
+        // It stays because an equi-join carries no `ExchangeShard` yet
+        // repartitions its inputs through the runtime join-shard scatter, so
+        // `shard_cols` alone would not catch one.
+        //
+        // The arity test comes first: it is a map lookup, where the circuit
+        // metadata can cost a load.
         let [src] = sources else {
             return Placement::KEYED_DEFAULT;
         };
-        let placement = placement_of(src);
-        let n = self.tables.get(src).map_or(0, |e| e.schema.pk_indices().len());
-        if pk_arity == n && !self.view_seeds_exchange_backfill(view_id) {
+        // One lookup for both facts, which also ends `placement_of`'s borrow of
+        // `self` before `view_meta` needs it mutably.
+        let (placement, n) = self.tables.get(src).map_or((Placement::KEYED_DEFAULT, 0), |e| {
+            (e.schema.placement(), e.schema.pk_indices().len())
+        });
+        if pk_arity != n {
+            return Placement::KEYED_DEFAULT;
+        }
+        let meta = self.view_meta(view_id);
+        if meta.shard_cols.is_none() && !meta.has_join {
             placement
         } else {
             Placement::KEYED_DEFAULT
@@ -342,7 +339,7 @@ impl DagEngine {
     /// `load_meta_circuit` pass on first touch. (The former per-property memo
     /// caches each paid their own circuit load — up to five per view — and the
     /// join-shard map an extra load per *(view, source)*.)
-    pub(super) fn view_meta(&mut self, view_id: i64) -> Rc<ViewMeta> {
+    pub(crate) fn view_meta(&mut self, view_id: i64) -> Rc<ViewMeta> {
         if let Some(m) = self.meta.get(&view_id) {
             return m.clone();
         }
@@ -359,47 +356,5 @@ impl DagEngine {
     pub(super) fn evict_meta(&mut self, id: i64) {
         self.meta.remove(&id);
         self.meta.retain(|_, m| !m.join_shard_map.contains_key(&id));
-    }
-
-    /// The view's output `ExchangeShard` shard columns (empty when none) —
-    /// the master relay's routing key.
-    pub fn get_shard_cols(&mut self, view_id: i64) -> Rc<[i32]> {
-        self.view_meta(view_id).shard_cols.clone()
-    }
-
-    /// The join scatter key for `source_id` within `view_id`: reindex
-    /// `(column, carried promotion tc)` pairs (empty when the source has no
-    /// join reindex). Called once per join source per tick on the master's
-    /// serialized exchange-relay path.
-    pub fn get_join_shard_cols(&mut self, view_id: i64, source_id: i64) -> Rc<[(i32, u8)]> {
-        self.view_meta(view_id)
-            .join_shard_map
-            .get(&source_id)
-            .cloned()
-            .unwrap_or_else(|| Rc::from([]))
-    }
-
-    /// The equality-conjunct count of a non-equi (range / band) join view, or
-    /// `None` if the view is not one. `Some` is the precise discriminator for
-    /// the master relay's input routing; the `n_eq` value picks eq-prefix
-    /// scatter (`n_eq ≥ 1`, band join) vs broadcast (`n_eq == 0`, pure range).
-    pub fn view_range_join_n_eq(&mut self, view_id: i64) -> Option<u8> {
-        self.view_meta(view_id).range_join_n_eq
-    }
-
-    /// True iff a live CREATE of this view needs the distributed backfill: the
-    /// view's circuit carries an `ExchangeShard` node (GROUP BY / reduce /
-    /// set-op / range-join all do) or any `Join` node. The `Join` arm is
-    /// load-bearing — an equi-join (`DeltaTrace`) repartitions its inputs at
-    /// runtime through the join-shard scatter and carries **no**
-    /// `ExchangeShard`, so nothing else catches it.
-    ///
-    /// `pub` for the live CREATE-VIEW path: the catalog hook gates its inline
-    /// single-process `backfill_view` on `!view_seeds_exchange_backfill` (plain
-    /// projections/filters only), and the executor drives every seeding view
-    /// through the distributed backfill (`fan_out_backfill`) instead.
-    pub fn view_seeds_exchange_backfill(&mut self, view_id: i64) -> bool {
-        let meta = self.view_meta(view_id);
-        meta.needs_exchange || meta.has_join
     }
 }

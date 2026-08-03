@@ -10,10 +10,11 @@ join) and every ordering of the source rows relative to the CREATE:
   * view-first  — CREATE VIEW then INSERT (the steady-state control)
 
 The historical bugs this guards: pending sources double-counted (projection 2x,
-equi-join up to 4x) because the inline backfill and the deferred ticks both
+equi-join up to 4x) because a catalog-layer backfill and the deferred ticks both
 drove the new view; committed sources under-counted (GROUP BY/DISTINCT/set-op
-came back empty, multi-worker equi-join a per-key prefix) because the inline
-single-process driver is the wrong one for exchange/join views. The assertions
+came back empty, multi-worker equi-join a per-key prefix) because that
+single-process driver could not shuffle. One distributed driver now populates
+every view. The assertions
 check WEIGHTS, not just row presence — several broken states have the right row
 set but doubled weights.
 
@@ -559,3 +560,48 @@ def test_vbf_nested_live_then_restart():
         _kill(proc)
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_vbf_chunked_backfill_long_strings(tiny_ddl_chunk_server):
+    """The backfill streams the source in `ddl_scan_chunk_rows`-sized chunks, so
+    a view over a populated table must equal it row-for-row whatever the chunk
+    size. Strings above the inline threshold are what make the chunking visible:
+    each chunk relocates its payload into a fresh blob arena, so a value that
+    survives within a chunk can still be lost or aliased across one.
+
+    At the 65 536-row default a test table is a single chunk and pins nothing;
+    the 3-row fixture makes 10 rows span four."""
+    c = tiny_ddl_chunk_server
+    sn = "vbfchunk" + _uid()
+    c.create_schema(sn)
+    try:
+        c.execute_sql(
+            "CREATE TABLE base (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL)",
+            schema_name=sn,
+        )
+        want = {(i, f"row_{i:02d}_" + "x" * 40) for i in range(10)}
+        c.execute_sql(
+            "INSERT INTO base VALUES "
+            + ", ".join(f"({i}, '{s}')" for i, s in sorted(want)),
+            schema_name=sn,
+        )
+
+        # Created after the data, so the whole table arrives through the chunked
+        # backfill rather than tick by tick.
+        c.execute_sql("CREATE VIEW v AS SELECT id, name FROM base", schema_name=sn)
+        vid = c.resolve_table(sn, "v")[0]
+        _assert_keys(c, vid, want, lambda d: (d["id"], d["name"]), "chunked backfill")
+
+        # Still incremental over the backfilled rows.
+        c.execute_sql(
+            "INSERT INTO base VALUES (10, '" + "row_10_" + "y" * 40 + "')",
+            schema_name=sn,
+        )
+        want.add((10, "row_10_" + "y" * 40))
+        _assert_keys(c, vid, want, lambda d: (d["id"], d["name"]), "post-backfill insert")
+
+        c.execute_sql("DELETE FROM base WHERE id = 3", schema_name=sn)
+        want = {r for r in want if r[0] != 3}
+        _assert_keys(c, vid, want, lambda d: (d["id"], d["name"]), "post-backfill delete")
+    finally:
+        _cleanup(c, sn, tables=["base"], views=["v"])

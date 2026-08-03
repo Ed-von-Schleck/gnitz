@@ -105,37 +105,14 @@ impl DagEngine {
 
     /// Release the delta batches pinned in a view's compiled-plan regfiles.
     /// The VM only clears deltas at the *start* of an epoch, so after a
-    /// backfill the full scanned source dataset and intermediate deltas stay
-    /// resident until the next evaluation. Call this after backfill to free
-    /// them immediately.
+    /// backfill the last chunk's input and intermediate deltas stay resident
+    /// until the next evaluation. Called at the end of a backfill so peak
+    /// resident memory falls back to ~O(chunk) once it drains.
     pub fn clear_view_regfile_deltas(&mut self, view_id: i64) {
         if let Some(plan) = self.cache.get_mut(&view_id) {
             for sub in plan.sub_plans_mut() {
                 sub.vm.clear_deltas();
             }
-        }
-    }
-
-    /// Distributed-backfill analogue of `backfill_view`'s post-loop
-    /// `clear_view_regfile_deltas` (catalog/ddl.rs). After a worker's
-    /// `handle_backfill(source_id)` loop, the last chunk's input + intermediate
-    /// delta registers stay pinned in the touched views' regfiles. Release them
-    /// across `source_id`'s dependent closure, so peak resident memory falls
-    /// back to ~O(chunk) once the backfill drains.
-    ///
-    /// Also carries `backfill_view`'s Ephemeral guard: every view backfilled this
-    /// way must be ephemeral, else its manifest-loaded shards would double-count
-    /// against the deltas the backfill ingests.
-    pub fn clear_regfile_deltas_from_source(&mut self, source_id: i64) {
-        for view_id in self.dependent_closure(vec![source_id]) {
-            debug_assert!(
-                self.tables
-                    .get(&view_id)
-                    .is_none_or(|e| e.kind.recovery_source() != RecoverySource::SalReplay),
-                "distributed backfill into durable relation {view_id}: \
-                 would double-count loaded shards",
-            );
-            self.clear_view_regfile_deltas(view_id);
         }
     }
 
@@ -299,6 +276,16 @@ impl DagEngine {
         if !self.tables.contains_key(&view_id) {
             return false;
         }
+        // A backfilled view must be ephemeral: a durable one loads its shards
+        // from its manifest at open, which would double-count against the deltas
+        // ingested below.
+        debug_assert!(
+            self.tables
+                .get(&view_id)
+                .is_none_or(|e| e.kind.recovery_source() != RecoverySource::SalReplay),
+            "distributed backfill into durable relation {view_id}: \
+             would double-count loaded shards",
+        );
         match self.execute_multi_worker_step(view_id, delta, source_id, exchange) {
             Some(out) if out.count > 0 => {
                 self.ingest_to_family(view_id, out);

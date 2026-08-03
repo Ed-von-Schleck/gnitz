@@ -326,7 +326,7 @@ use crate::schema::from_wire_cols;
 // Pre-computed schema statics, one per family, indexed by `SysFamily`
 // discriminant — initialised at compile time, never reconstructed. `from_wire_cols`
 // places every family `Replicated`, so a reader single-sources one copy instead of
-// gathering N (`relation_output_is_replicated`).
+// gathering N (`DagEngine::relation_is_replicated`).
 static SCHEMAS: [SchemaDescriptor; SysFamily::COUNT] = {
     let mut arr = [from_wire_cols(SYS_FAMILIES[0].cols, SYS_FAMILIES[0].pk_cols); SysFamily::COUNT];
     let mut i = 1;

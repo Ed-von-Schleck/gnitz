@@ -600,7 +600,7 @@ impl MasterDispatcher {
         // `source_id == 0`, which names no relation; that case needs no rule
         // because a view whose sources are all replicated is itself stamped
         // replicated and computes locally without ever reaching an exchange.
-        let n_src = if cat.relation_output_is_replicated(source_id) {
+        let n_src = if cat.dag.relation_is_replicated(source_id) {
             1
         } else {
             payloads.len()
@@ -615,16 +615,23 @@ impl MasterDispatcher {
         // pairs; a GROUP BY / set-op scatter carries plain shard cols (no
         // promotion). Split the pairs into a column list + a parallel target-tc
         // list for the scatter packer.
+        let meta = cat.dag.view_meta(view_id);
         let join_pairs = (source_id > 0)
-            .then(|| cat.dag.get_join_shard_cols(view_id, source_id))
+            .then(|| meta.join_shard_map.get(&source_id))
+            .flatten()
             .filter(|p| !p.is_empty());
         let is_join = join_pairs.is_some();
-        let (shard_cols, target_tcs): (std::rc::Rc<[i32]>, Vec<u8>) = match &join_pairs {
+        let (shard_cols, target_tcs): (std::rc::Rc<[i32]>, Vec<u8>) = match join_pairs {
             Some(pairs) => (
                 pairs.iter().map(|&(c, _)| c).collect(),
                 pairs.iter().map(|&(_, t)| t).collect(),
             ),
-            None => (cat.dag.get_shard_cols(view_id), Vec::new()),
+            // A view with no `ExchangeShard` shards on `∅` — every row to
+            // partition 0's owner — the same route a global aggregate takes.
+            None => (
+                meta.shard_cols.clone().unwrap_or_else(|| std::rc::Rc::from([])),
+                Vec::new(),
+            ),
         };
 
         // A range-join INPUT relay (source_id > 0, is_join over a DeltaTraceRange
@@ -638,11 +645,7 @@ impl MasterDispatcher {
         // trims to its owned slice (PartitionFilter) before integrating. The output
         // relay (source_id == 0) is NOT a join relay (is_join is false there) and
         // keeps the GroupKey scatter.
-        let range_n_eq = if is_join {
-            cat.dag.view_range_join_n_eq(view_id)
-        } else {
-            None
-        };
+        let range_n_eq = if is_join { meta.range_join_n_eq } else { None };
 
         let dest = if range_n_eq == Some(0) {
             // Pure range join: broadcast the full delta to every worker.
@@ -796,6 +799,33 @@ impl MasterDispatcher {
         let schema = self.schema_desc_for(source_id);
         self.send_broadcast(source_id, 0, FLAG_BACKFILL, Some(&schema), view_id as u128)?;
         self.collect_acks_and_relay(true)
+    }
+
+    /// Backfill every view in `view_ids`, in dependency order, from each of its
+    /// sources. The one driver that populates a view — a live CREATE VIEW bundle
+    /// and the boot rebuild of generation-invalid views both run this.
+    ///
+    /// Ascending `depth` *is* dependency order: registration stamps a view one
+    /// deeper than its deepest source, so an upstream hidden segment is filled
+    /// before a downstream view scans it.
+    ///
+    /// A multi-source equi-join iterates every source: the first fills its trace
+    /// (joining against the still-empty other trace emits nothing), and the rest
+    /// join against it. A view that runs no exchange needs no cross-worker
+    /// barrier and `fan_out_backfill` accommodates that — no relay arrives, so
+    /// each worker stops on its own drain exhaustion — which is why one driver
+    /// serves every shape.
+    pub fn backfill_views_in_depth_order(&mut self, view_ids: &[i64]) -> Result<(), String> {
+        let mut ordered: Vec<i64> = view_ids.to_vec();
+        ordered.sort_by_key(|vid| unsafe { (*self.catalog).dag.tables.get(vid).map_or(0, |e| e.depth) });
+        for vid in ordered {
+            let sources = unsafe { (*self.catalog).dag.get_source_ids(vid) };
+            for src in sources {
+                self.fan_out_backfill(vid, src)
+                    .map_err(|e| format!("view={vid} source={src}: {e}"))?;
+            }
+        }
+        Ok(())
     }
 
     /// Synchronously drain one source's pending ticks during the reactor-parked

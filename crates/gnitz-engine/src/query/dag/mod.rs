@@ -18,7 +18,8 @@ mod ingest;
 mod meta;
 mod store_handle;
 
-use meta::{DepMap, ViewMeta};
+use meta::DepMap;
+pub(crate) use meta::ViewMeta;
 
 pub(crate) use store_handle::{StoreHandle, StoreProbe};
 
@@ -508,10 +509,9 @@ mod tests {
         let mut jm: FxHashMap<i64, Rc<[(i32, u8)]>> = FxHashMap::default();
         jm.insert(src, Rc::from([]));
         Rc::new(ViewMeta {
-            shard_cols: Rc::from([]),
+            shard_cols: None,
             join_shard_map: jm,
             range_join_n_eq: None,
-            needs_exchange: true,
             has_join: false,
         })
     }
@@ -637,7 +637,11 @@ mod tests {
         assert!(dag.source_closure(vec![99]).is_empty());
         // The other direction over the same edges, so a walk that read the wrong
         // half of `DepMap` cannot pass both.
-        assert_eq!(dag.dependent_closure(vec![1]), [2i64, 3].into_iter().collect());
+        dag.get_dep_map();
+        assert_eq!(
+            DepMap::closure(&dag.dep.forward, vec![1]),
+            [2i64, 3].into_iter().collect::<rustc_hash::FxHashSet<i64>>()
+        );
     }
 
     #[test]
@@ -1068,10 +1072,10 @@ mod tests {
             "a pure-range join must be discriminated so the relay broadcasts instead of scattering"
         );
         assert_eq!(
-            meta.shard_cols.as_ref(),
-            &[1],
+            meta.shard_cols.as_deref(),
+            Some(&[1][..]),
             "the output ExchangeShard's shard cols must survive"
         );
-        assert!(meta.has_join && meta.needs_exchange);
+        assert!(meta.has_join);
     }
 }

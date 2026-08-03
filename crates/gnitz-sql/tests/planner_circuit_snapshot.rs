@@ -764,9 +764,8 @@ fn sentinel_14a_scalar_correlated() {
 // existing test_scalar_subquery.py — not captured here (expr excluded).
 const EXPECTED_14A: &str = r#"seg 0:
 #0 INTEGRATE_SINK <- (#1@0)
-#1 EXCHANGE_SHARD params:[(SHARD,0,0,0)] <- (#2@0)
-#2 MAP_EXPR <- (#3@0)
-#3 SCAN_DELTA src:seg:1
+#1 MAP_EXPR <- (#2@0)
+#2 SCAN_DELTA src:seg:1
 
 seg 1:
 #0 INTEGRATE_SINK <- (#1@0)

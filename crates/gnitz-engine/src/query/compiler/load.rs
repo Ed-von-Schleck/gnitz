@@ -230,7 +230,7 @@ pub(crate) fn topo_sort(loaded: &mut LoadedCircuit) -> Result<(), CompileError> 
 /// `compute_co_partitioned` approve a co-partition valid for one key but not the
 /// other, so collect them all. Uses `loaded.outgoing` (populated by `topo_sort`)
 /// for O(V+E) traversal instead of rescanning the flat edge list per node.
-/// Shared by `compute_join_shard_map` and `DagEngine::get_join_shard_cols`.
+/// Shared by `compute_join_shard_map` and the master relay's scatter key.
 pub(crate) fn reindex_cols_through_filters(loaded: &LoadedCircuit, scan_nid: i32) -> Vec<(i32, u8)> {
     // In a JOIN view the input scatter key is defined by the reindex that feeds the
     // trace/probe (IntegrateTrace or a join node). An input may carry OTHER reindexes
@@ -367,6 +367,26 @@ pub(crate) fn scan_tid_through_filters(loaded: &LoadedCircuit, enid: i32) -> Opt
 /// `ExchangeShard`), so keying on it would divert those views into the relay
 /// path and corrupt them. Shared by `DagEngine::view_range_join_n_eq` and its
 /// unit test.
+/// The output `ExchangeShard`'s `(node id, shard columns)` — the sink-nearest
+/// one in topo order — or `None` when the circuit carries no shard at all.
+///
+/// `loaded` MUST be `topo_sort`ed. A circuit may carry several shards (a
+/// two-sided set-op emits one per side), so picking by `nodes` hash order would
+/// return an arbitrary one; every caller wants the one whose key the output
+/// carries.
+pub(crate) fn output_exchange_shard(loaded: &LoadedCircuit) -> Option<(i32, Vec<i32>)> {
+    loaded
+        .ordered
+        .iter()
+        .rev()
+        .find_map(|&nid| match loaded.nodes.get(&nid) {
+            Some(gnitz_wire::OpNode::ExchangeShard { shard_cols }) => {
+                Some((nid, shard_cols.iter().map(|&c| c as i32).collect()))
+            }
+            _ => None,
+        })
+}
+
 pub(crate) fn circuit_range_join_n_eq(loaded: &LoadedCircuit) -> Option<u8> {
     loaded.nodes.values().find_map(|op| match op {
         gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTraceRange { n_eq, .. }) => Some(*n_eq),

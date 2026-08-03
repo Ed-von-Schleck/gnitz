@@ -26,7 +26,10 @@ pub struct ExchangeAccumulator {
 }
 
 struct ExchangeRound {
-    payloads: [Option<Batch>; MAX_WORKERS],
+    /// One slot per live worker — sized `nw`, not `MAX_WORKERS`: `Batch` is
+    /// ~1 KB, so a fixed 64-slot array would build and move ~70 KB per round to
+    /// use a handful of slots.
+    payloads: Vec<Option<Batch>>,
     count: usize,
     schema: Option<SchemaDescriptor>,
     /// AND of every worker's per-chunk backfill pad bit (`seek_col_idx &
@@ -75,7 +78,7 @@ impl ExchangeAccumulator {
         let nw = self.nw;
 
         let round = self.rounds.entry(key).or_insert_with(|| ExchangeRound {
-            payloads: [const { None }; MAX_WORKERS],
+            payloads: (0..nw).map(|_| None).collect(),
             count: 0,
             schema: None,
             all_pad: true,
@@ -103,10 +106,9 @@ impl ExchangeAccumulator {
                     return None;
                 }
             };
-            let payloads: Vec<Option<Batch>> = round.payloads.into_iter().take(nw).collect();
             Some(PendingRelay {
                 view_id: vid,
-                payloads,
+                payloads: round.payloads,
                 schema,
                 source_id,
                 all_pad: round.all_pad,

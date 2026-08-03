@@ -707,65 +707,6 @@ fn ddl_emitters_use_no_raw_handle_capability() {
     );
 }
 
-// ── test_view_backfill_chunked_matches_unchunked ──────────────────────────
-// backfill_view streams the source through drain_chunk-sized epochs; the
-// view contents must equal the base table row-for-row regardless of the
-// chunk size, including long STRING payloads (each chunk relocates its
-// strings into a fresh blob arena, so a chunked scan exercises cross-chunk
-// blob handling that a whole-table materialization never did).
-
-#[test]
-fn test_view_backfill_chunked_matches_unchunked() {
-    let dir = temp_dir("view_backfill_chunked");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
-
-    let cols = vec![col_def("id", type_code::U64), col_def("name", type_code::STRING)];
-    let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
-    let schema = engine.get_schema(tid).unwrap();
-
-    // Long strings (above the inline threshold) force blob-arena relocation
-    // in every chunk.
-    let n = 10u64;
-    let mut bb = BatchBuilder::new(schema);
-    for i in 0..n {
-        bb.begin_row(i as u128, 1);
-        bb.put_string(&format!("row_{:02}_{}", i, "x".repeat(40)));
-        bb.end_row();
-    }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
-
-    // 10 rows / chunk 3 → 4 epochs through the identity plan.
-    engine.ddl_scan_chunk_rows = 3;
-
-    let vid = engine.allocate_table_id();
-    write_identity_circuit(&mut engine, vid, tid, None);
-    engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
-    engine.write_view_deps(vid, &[tid]).unwrap();
-    let batch = build_view_tab_row(vid, "v_chunk", "SELECT * FROM base");
-    engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
-
-    fn scan_rows(engine: &CatalogEngine, id: i64) -> Vec<(u128, i64, String)> {
-        let mut c = engine.dag.tables.get(&id).unwrap().handle.open_cursor();
-        let mut rows = Vec::new();
-        while c.valid {
-            rows.push((c.current_key_narrow(), c.current_weight, cursor_read_string(&c, 1)));
-            c.advance();
-        }
-        rows
-    }
-
-    let base_rows = scan_rows(&engine, tid);
-    assert_eq!(base_rows.len() as u64, n, "base table must hold every row");
-    assert_eq!(
-        scan_rows(&engine, vid),
-        base_rows,
-        "chunked view backfill must equal the base table row-for-row"
-    );
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
 // ── drop_cascade_broadcasts_children_before_parents ──────────────────
 // fire_hooks enqueues a table retraction's cascade children (IDX/COL)
 // BEFORE the parent TABLE row: cascade_retract_indices / _columns call

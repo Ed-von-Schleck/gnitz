@@ -191,17 +191,6 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// True iff relation `id`'s output is replicated — a full identical copy
-    /// lives on every worker — so any **gather** of it must be single-sourced,
-    /// taking one worker's copy instead of N identical ones. Both the scan
-    /// dispatch and the exchange relay read it. Every relation kind carries the
-    /// answer as the `Placement` stamped on its schema (see
-    /// `DagEngine::view_placement` for how a view folds its sources'), so this is
-    /// one lookup. SEEK already unicasts to one worker, so it needs no check.
-    pub fn relation_output_is_replicated(&self, id: i64) -> bool {
-        self.dag.relation_is_replicated(id)
-    }
-
     /// Invalidate all cached plans.
     pub fn invalidate_all_plans(&mut self) {
         self.dag.invalidate_all();

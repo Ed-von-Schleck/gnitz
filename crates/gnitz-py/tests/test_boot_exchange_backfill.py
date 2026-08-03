@@ -464,11 +464,10 @@ def test_bare_two_base_join_after_restart():
 
 
 def test_range_two_base_join_after_restart():
-    """Range two-base join `r = ra JOIN rb ON ra.x < rb.y`. A range/band join
-    carries an output `ExchangeShard` node, so `view_needs_exchange` already
-    classifies it and the equi-join seed predicate (`DeltaTraceRange` is excluded)
-    never touches it. Regression guard that the `ExchangeShard` classification path
-    keeps recovering two-base joins correctly — this shape was never the bug.
+    """Range two-base join `r = ra JOIN rb ON ra.x < rb.y`. Regression guard that
+    a two-base range join still recovers correctly across a restart: its relay
+    broadcasts (no eq prefix to scatter on) where every other join shape
+    scatters.
     """
     tmpdir, data_dir, sock_path = _make_env("gnitz_rangejoin_")
     try:

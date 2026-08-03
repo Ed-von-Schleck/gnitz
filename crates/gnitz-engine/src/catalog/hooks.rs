@@ -213,9 +213,11 @@ impl CatalogEngine {
         // table, or a view over any source that is itself not keyed — holds its
         // whole local dataset in one child, because its rows are not placed by
         // `partition_for_pk`. A 256-partition store trimmed to the worker's range
-        // would silently drop every row whose key partition the worker does not
-        // own. How such a store is read (single-source vs union-gather) is the
-        // read path's decision, not the store shape's.
+        // cannot address a row whose key partition the worker does not own: the
+        // ingest scatter reports `MisroutedRows` and the write fails stop, so
+        // every such relation would be unwritable. How such a store is read
+        // (single-source vs union-gather) is the read path's decision, not the
+        // store shape's.
         //
         // The single child is homed at THIS process's own worker rank (see
         // `PartitionedTable::new`), so a live CREATE on each worker post-fork
@@ -528,31 +530,11 @@ impl CatalogEngine {
                 );
                 raise_id_counter(&mut self.next_table_id, vid);
 
-                // During DROP VIEW rollback the partition files are intact; re-pushing
-                // source rows through the circuit would double every aggregation.
-                // Boot never backfills views inline either: valid views resume from
-                // their checkpoint and the master drives the recovery tick sweep +
-                // invalid-view rebuild (see runtime/bootstrap.rs).
-                //
-                // For a live CREATE, only a PLAIN single-source view (no exchange
-                // round, no join-shard scatter) is backfilled inline here — the
-                // single-process `backfill_view` is the right driver for it. Every
-                // exchange view AND every equi-join (`view_seeds_exchange_backfill`)
-                // is left empty here and driven by the live DDL handler's
-                // distributed, view-scoped `fan_out_backfill`: the single-process
-                // driver under-fills them (an exchange view gets no shuffle; a
-                // multi-worker equi-join joins only each worker's local shard). The
-                // handler drains the new view's base sources before this runs, so
-                // the inline scan sees committed data and no deferred tick
-                // double-drives it.
-                if !self.ctx.in_rollback()
-                    && self.ctx.is_live()
-                    && self.owns_partitions()
-                    && self.dag.ensure_compiled(vid)
-                    && !self.dag.view_seeds_exchange_backfill(vid)
-                {
-                    self.backfill_view(vid);
-                }
+                // Registration leaves the view EMPTY. Filling it is the runtime
+                // layer's: `backfill_views_in_depth_order` for a live CREATE,
+                // checkpoint resume or the master's invalid-view rebuild at boot
+                // (see runtime/bootstrap.rs). Filling here would double-count
+                // against all three.
             } else if !net_live {
                 // A genuine drop (net-dead): a rename pair's `-1` is net-live, so
                 // this teardown is skipped and the view registration survives.
@@ -670,6 +652,9 @@ impl CatalogEngine {
                             cols.as_slice(),
                             idx_table_ptr,
                             &idx_schema,
+                            // Duplicates are only re-checked on a first apply;
+                            // a replayed index's data passed the check when it
+                            // was originally written.
                             is_unique && s.ctx.is_live(),
                         )?;
                     }
@@ -722,8 +707,9 @@ impl CatalogEngine {
         // — the auto-index name embeds the *current* (new) table name, so its
         // by-name dedup cannot suppress the duplicate a rename would produce for a
         // non-PK FK column. Skip any `+1` whose tid also carries a `-1` in THIS
-        // same TABLE_TAB batch (pair-exclusion derived batch-locally). Load-bearing
-        // over a master-only threaded set: this hook fires on every `is_live()`
+        // same TABLE_TAB batch (pair-exclusion derived batch-locally). Derived
+        // batch-locally rather than from a master-only threaded set: this hook
+        // fires on every `is_live()`
         // path — live apply, worker `ddl_sync`, master SAL-tail recovery — where a
         // threaded set would be absent and let a renamed FK-child mint a duplicate
         // `__fk_` index (diverging the worker catalog / a recovery duplicate).
@@ -740,6 +726,10 @@ impl CatalogEngine {
             if renamed.contains(&tid) {
                 continue;
             }
+            // Live-only: the boot shard replay restores the persisted IDX_TAB
+            // rows itself, and it replays TABLE_TAB first — so `index_by_name` is
+            // still empty here and an ungated run would mint duplicate FK indices
+            // under fresh ids alongside them.
             if self.ctx.is_live() && self.dag.tables.contains_key(&tid) {
                 self.create_fk_indices(tid)?;
             }

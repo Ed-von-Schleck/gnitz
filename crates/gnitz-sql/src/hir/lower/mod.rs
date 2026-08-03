@@ -14,9 +14,8 @@
 //!
 //! The linear path resolves the HIR to its physical inputs (source, scan bound,
 //! folded predicate, physicalized projection) and delegates to
-//! `linear::emit_linear` — one home for the emission strategy and the
-//! backfill-seeding rule; only the scan-bound extraction and the
-//! `HirExpr → BoundExpr` resolution are HIR work.
+//! `linear::emit_linear` — one home for the emission strategy; only the
+//! scan-bound extraction and the `HirExpr → BoundExpr` resolution are HIR work.
 
 pub(crate) mod exists;
 pub(crate) mod join;
@@ -189,7 +188,7 @@ fn lower_body(
                 }
                 RelExpr::Get { .. } => {
                     let src = seginput_of_get(source).expect("Get arm resolves to a SegInput");
-                    lower_linear(client, chain, &src, fpreds, items, view_id)
+                    lower_linear(client, &src, fpreds, items, view_id)
                 }
                 RelExpr::Join {
                     kind: JoinType::Semi | JoinType::Anti,
@@ -254,7 +253,7 @@ fn lower_computed_over_combine(
     let mut live: HashSet<ColId> = HashSet::new();
     collect_live_cols(items.iter().map(|i| &i.expr).chain(where_preds), &mut live);
     let seg = cut_segment(client, chain, memo, source, &live)?;
-    lower_linear(client, chain, &seg, where_preds, items, view_id)
+    lower_linear(client, &seg, where_preds, items, view_id)
 }
 
 /// A body shape the driver has no arm for. Every shape bind can produce is
@@ -418,8 +417,8 @@ fn wrap_passthrough_segment(
         unreachable!("identity_project builds a Project");
     };
     let src = seginput_of_get(get).expect("pass-through wrapper receives a Get");
-    let (wrap_vid, wrap_schema, layout) = chain.add_segment(client, |client, chain, vid| {
-        lower_linear(client, chain, &src, &[], items, vid)
+    let (wrap_vid, wrap_schema, layout) = chain.add_segment(client, |client, _chain, vid| {
+        lower_linear(client, &src, &[], items, vid)
     })?;
     Ok(SegInput {
         tid: wrap_vid,
@@ -446,7 +445,6 @@ pub(crate) fn split_filter(input: &Rc<RelExpr>) -> (&[HirExpr], &Rc<RelExpr>) {
 /// the physical inputs to `linear::emit_linear`.
 pub(crate) fn lower_linear(
     client: &mut GnitzClient,
-    chain: &mut ViewChain,
     src: &SegInput,
     filter_preds: &[HirExpr],
     proj_items: &[ProjEntry],
@@ -455,7 +453,7 @@ pub(crate) fn lower_linear(
     let folded = physical::fold_preds(filter_preds, &src.layout)?;
     let bound = extract_scan_bound(client, &folded, src.from_catalog, src.tid, &src.schema)?;
     let proj = physical::physicalize_projection(proj_items, &src.layout, &src.schema)?;
-    let pieces = linear::emit_linear(chain, view_id, src, bound, folded, &proj)?;
+    let pieces = linear::emit_linear(view_id, src, bound, folded, &proj)?;
     Ok((pieces, proj.layout))
 }
 

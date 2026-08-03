@@ -111,12 +111,7 @@ pub(super) fn annotate(loaded: &LoadedCircuit, ext_tables: &ExtTables) -> (JoinS
 /// and `ReduceOutKey` alone would be the wrong discriminator anyway — a signed or
 /// narrow single prefix column keys `SyntheticFold` and is nonetheless correct.
 pub(super) fn compute_skips_exchange(loaded: &LoadedCircuit, ext_tables: &ExtTables) -> bool {
-    let Some((enid, shard_cols)) = loaded.nodes.iter().find_map(|(&nid, op)| match op {
-        gnitz_wire::OpNode::ExchangeShard { shard_cols } => {
-            Some((nid, shard_cols.iter().map(|&c| c as i32).collect::<Vec<_>>()))
-        }
-        _ => None,
-    }) else {
+    let Some((enid, shard_cols)) = super::output_exchange_shard(loaded) else {
         return false;
     };
     let Some(tid) = scan_tid_through_filters(loaded, enid) else {

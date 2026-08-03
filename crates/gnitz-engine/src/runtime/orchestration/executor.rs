@@ -2353,8 +2353,11 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
     // Ingest the families in ascending topo order so every register/index hook
     // sees its dependencies already in the memtable. For a CREATE VIEW, drain the
     // new view's base sources once the circuit/dep families are in the memtable
-    // (so get_source_ids resolves) but before the VIEW_TAB register hook's inline
-    // backfill scans them — VIEW_TAB is the first family at or past view priority.
+    // (so get_source_ids resolves) but before VIEW_TAB registers the view — after
+    // registration the view is a dependent of those bases, so an undrained pending
+    // delta would tick it through `evaluate_dag` over rows the backfill below also
+    // scans, counting them twice. VIEW_TAB is the first family at or past view
+    // priority.
     // The between-precheck-and-apply marker holds the single family that was
     // applied but not yet enqueued (a hook/panic failure), which compensation must
     // negate; a precheck failure leaves the marker None, so no ghost -1 is written.
@@ -2447,35 +2450,15 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
         }
     }
 
-    // Order the bundle's new views by dependency before backfilling: a chain
-    // requires an upstream hidden view to be materialized before a downstream one
-    // scans it. Registration already walked the dependencies to compute `depth`
-    // (one more than the deepest source), so ascending depth is that order.
-    let mut ordered_view_ids = new_view_ids.clone();
-    ordered_view_ids.sort_by_key(|vid| unsafe { (*cat_ptr_raw).dag.tables.get(vid).map_or(0, |e| e.depth) });
-
-    // View-scoped distributed backfill for every exchange / equi-join view; plain
-    // projection/filter views were already filled inline by hook_view_register
-    // over the (now drained) committed sources. A post-fsync Err cannot be rolled
-    // back (the CREATE is durable), so abort — restart's boot backfill rebuilds it.
-    for &vid in &ordered_view_ids {
-        if unsafe { (*cat_ptr_raw).dag.view_seeds_exchange_backfill(vid) } {
-            // A multi-source equi-join iterates both sources: backfilling the
-            // first fills its trace (join against the empty other trace → no
-            // output), then the second produces the full join against it.
-            let sources = unsafe { (*cat_ptr_raw).dag.get_source_ids(vid) };
-            for src in sources {
-                if let Err(e) = guard_panic("view-backfill", || shared.disp().fan_out_backfill(vid, src)) {
-                    gnitz_fatal_abort!(
-                        "live CREATE VIEW backfill failed after the CREATE was made durable \
-                         (view={}, source={}): {}",
-                        vid,
-                        src,
-                        e
-                    );
-                }
-            }
-        }
+    // Populate every new view. A post-fsync Err cannot be rolled back (the CREATE
+    // is durable), so abort — restart's boot rebuild refills it.
+    if let Err(e) = guard_panic("view-backfill", || {
+        shared.disp().backfill_views_in_depth_order(&new_view_ids)
+    }) {
+        gnitz_fatal_abort!(
+            "live CREATE VIEW backfill failed after the CREATE was made durable: {}",
+            e
+        );
     }
 
     send_ok_response(shared, peer, 0, None, client_id, zone_lsn as u128, client_version).await;
