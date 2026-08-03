@@ -28,7 +28,7 @@ use crate::runtime::tls::{ConnCountGuard, TlsShared};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::catalog::{
-    CatalogEngine, FIRST_USER_TABLE_ID, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB_ID,
+    family_pks_by_sign, idx_tab_drops, idx_tab_unique_creates, CatalogEngine, FIRST_USER_TABLE_ID, IDX_TAB_ID,
     SEQ_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID,
 };
 use crate::query::RelationKind;
@@ -152,7 +152,6 @@ pub struct Shared {
     pub reactor: Rc<Reactor>,
     catalog: *mut CatalogEngine,
     dispatcher: Rc<MasterDispatcher>,
-    sal_fd: i32,
     committer_tx: mpsc::Sender<CommitRequest>,
     catalog_rwlock: Rc<AsyncRwLock>,
     /// SAL-writer exclusivity. Held by committer (checkpoint + commit
@@ -343,9 +342,6 @@ impl ServerExecutor {
                 return 1;
             }
         };
-        let sal_fd = dispatcher.sal_fd();
-        let num_workers = dispatcher.num_workers();
-
         reactor.attach_w2m(dispatcher.w2m_receiver());
         // After handoff, point the dispatcher at the reactor-owned receiver so
         // the reactor-parked CREATE-VIEW backfill can drive a synchronous
@@ -388,10 +384,8 @@ impl ServerExecutor {
         let committer_shared = Rc::new(committer::Shared {
             reactor: Rc::clone(&reactor),
             disp: Rc::clone(&dispatcher),
-            sal_fd,
             sal_writer_excl: Rc::clone(&sal_writer_excl),
             lsn_alloc: Rc::clone(&lsn_alloc),
-            num_workers,
             force_checkpoint: Cell::new(false),
             tick_rows: Rc::clone(&tick_rows),
             tick_tx: tick_tx.clone(),
@@ -401,7 +395,6 @@ impl ServerExecutor {
             reactor: Rc::clone(&reactor),
             catalog,
             dispatcher,
-            sal_fd,
             committer_tx,
             catalog_rwlock: Rc::new(AsyncRwLock::new()),
             sal_writer_excl: Rc::clone(&sal_writer_excl),
@@ -660,7 +653,7 @@ async fn watchdog(shared: Rc<Shared>) {
             //    so `done` resolves only after the base + drain + ephemeral
             //    rounds complete. A just-pushed delta may still sit in
             //    `pending_deltas` (the tick-coalesce window not yet fired), so
-            //    the drain inside the sequence is load-bearing.
+            //    the sequence's drain is what gets it into the views.
             await_barrier(&shared, BarrierKind::Shutdown).await;
 
             // 3. Workers flush + _exit, then stop the reactor
@@ -808,7 +801,7 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>) {
 
 /// Emit FLAG_TICK groups for every `tid` and await the per-worker ACKs.
 ///
-/// The delicate emit-and-await lock shape: req_ids allocated before any lock,
+/// The emit-and-await lock shape: req_ids allocated before any lock,
 /// `catalog_rwlock.read()` (so DDL cannot mutate schemas mid-emission) +
 /// `sal_writer_excl` covering only the contiguous emission window (III.3b), one
 /// `signal_all` inside it, both released before awaiting so other reactor work
@@ -972,7 +965,7 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
                     // synchronously in `collect_acks_and_relay`, the sole
                     // STOP/CHECKPOINT stamper), and a tick round never pads.
                     if let Err(e) = guard_panic("emit_relay", || {
-                        (*shared.disp()).emit_relay_with_decision(
+                        shared.disp().emit_relay_with_decision(
                             prep.take().expect("relay emitted once"),
                             BACKFILL_DECISION_CONTINUE,
                         )
@@ -1024,7 +1017,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
         let has_schema = (ctrl.flags & ipc::FLAG_HAS_SCHEMA) != 0;
         let has_data = (ctrl.flags & ipc::FLAG_HAS_DATA) != 0;
         let (ctrl_target_id, ctrl_client_id) = (ctrl.target_id as i64, ctrl.client_id);
-        if has_data && !has_schema {
+        let (res, err_target, err_client) = if has_data && !has_schema {
             let client_version = ipc::wire_flags_get_schema_version(ctrl.flags);
             if client_version == 0 {
                 send_error(
@@ -1046,22 +1039,22 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
                 descriptor: &catalog_schema,
                 version: server_version,
             };
-            match decode_client_wire(data, ctrl, Some(hint)) {
-                Ok(d) => d,
-                Err(e) => {
-                    let msg = format!("decode error: {e}");
-                    send_error(peer, ctrl_target_id, ctrl_client_id, msg.as_bytes()).await;
-                    return;
-                }
-            }
+            (
+                decode_client_wire(data, ctrl, Some(hint)),
+                ctrl_target_id,
+                ctrl_client_id,
+            )
         } else {
-            match decode_client_wire(data, ctrl, None) {
-                Ok(d) => d,
-                Err(e) => {
-                    let msg = format!("decode error: {e}");
-                    send_error(peer, 0, 0, msg.as_bytes()).await;
-                    return;
-                }
+            // No schema hint means the frame carried no data block, so nothing
+            // has been resolved yet — report the failure untargeted.
+            (decode_client_wire(data, ctrl, None), 0, 0)
+        };
+        match res {
+            Ok(d) => d,
+            Err(e) => {
+                let msg = format!("decode error: {e}");
+                send_error(peer, err_target, err_client, msg.as_bytes()).await;
+                return;
             }
         }
     };
@@ -1562,8 +1555,7 @@ fn decode_client_batch(slice: &[u8], schema: &SchemaDescriptor) -> Result<Batch,
 /// Returns `None` when the error reply was sent and the caller must return.
 /// The caller holds the catalog read lock.
 async fn resolve_read_target(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64) -> Option<RelationKind> {
-    // `kind` is `Copy`, so the `dag.tables` borrow ends before the await below.
-    let kind = shared.cat().dag.tables.get(&target_id).map(|e| e.kind);
+    let kind = shared.cat().dag.relation_kind(target_id);
     if kind.is_none() {
         let msg = format!("table {target_id} not found");
         send_error(peer, target_id, client_id, msg.as_bytes()).await;
@@ -1582,13 +1574,10 @@ fn validated_index_cols(
     op: &str,
 ) -> Result<gnitz_wire::PkColList, String> {
     let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
-    if let Some(schema) = shared.cat().get_schema_desc(target_id) {
-        let ok = cols.is_well_formed() && cols.as_slice().iter().all(|&c| (c as usize) < schema.num_columns());
-        if !ok {
-            return Err(format!("{op}: invalid column list for table {target_id}"));
-        }
+    match shared.cat().get_schema_desc(target_id) {
+        Some(s) if s.cols_in_range(&cols) => Ok(cols),
+        _ => Err(format!("{op}: invalid column list for table {target_id}")),
     }
-    Ok(cols)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1772,10 +1761,14 @@ async fn drain_pending_ticks(shared: &Rc<Shared>) -> Result<(), String> {
 /// before recording its LSN is invisible to it — and no client can have observed
 /// such a write.
 ///
-/// A non-view target is vacuously fresh: `dep.reverse` is keyed by view ids only,
-/// so its closure is empty. Caller holds the catalog read lock; the whole call is
-/// synchronous, so `source_closure`'s `&mut` rebuild crosses no await.
+/// A non-view target is vacuously fresh — it has no sources — and answers before
+/// the closure walk, so a base-table read never pays for one. Caller holds the
+/// catalog read lock; the whole call is synchronous, so `source_closure`'s `&mut`
+/// rebuild crosses no await.
 fn read_is_fresh(shared: &Rc<Shared>, target: i64) -> bool {
+    if !shared.cat().dag.relation_kind(target).is_some_and(|k| k.is_view()) {
+        return true;
+    }
     let ticked = shared.last_tick_lsn.get();
     shared
         .cat()
@@ -1805,7 +1798,7 @@ async fn read_lock(
     {
         let g = shared.catalog_rwlock.read().await;
         let kind = resolve_read_target(shared, peer, client_id, target_id).await?;
-        if !kind.is_view() || read_is_fresh(shared, target_id) {
+        if read_is_fresh(shared, target_id) {
             return Some((g, kind));
         }
     }
@@ -1995,7 +1988,7 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
     gnitz_wire::validate_scan_multi_tids(&tids)?;
 
     // Drain once if any target is a stale view — the same test `read_lock` runs
-    // for a single target (a non-view is vacuously fresh) — and with NO catalog
+    // for a single target — and with NO catalog
     // lock held (BF-1). The classifying lock is dropped before the drain; Phase 1
     // re-resolves every tid's kind under a fresh lock, so a DDL during the drain
     // is caught there, and an unknown tid is rejected there rather than here.
@@ -2023,7 +2016,7 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
             let tid = tid_u as i64;
             // Base tables AND views are legal; a catalog family stays on the
             // plain path, which serves it master-locally.
-            match shared.cat().dag.tables.get(&tid).map(|e| e.kind) {
+            match shared.cat().dag.relation_kind(tid) {
                 None => return Err(format!("table {tid} not found")),
                 Some(RelationKind::SystemCatalog) => return Err(format!("SCAN_MULTI: {tid} is not a user relation")),
                 Some(_) => {}
@@ -2121,35 +2114,10 @@ async fn handle_system_scan(
     }
 }
 
-/// Collect the PKs of the bundle's `tid` family whose weight matches the
-/// requested sign — the CREATE `+1` rows (`positive`) or the DROP `-1` rows —
-/// EXCLUDING any PK that carries BOTH signs in this family (a rewrite pair, e.g.
-/// a rename's `-1,+1`). A weight-homogeneous CREATE/DROP bundle has no such pair,
-/// so both call sites (`new_view_ids`, `dropped_tids`) are unchanged; a rename's
-/// paired PK is filtered from both, so a view rename triggers no backfill and a
-/// table rename's tid never enters `dropped_tids`. Derived batch-locally — the
-/// whole family (both signs of a pair) arrives as one batch on every path.
-fn family_pks_by_sign(families: &[(i64, Batch)], tid: i64, positive: bool) -> Vec<i64> {
-    families
-        .iter()
-        .find(|(t, _)| *t == tid)
-        .map(|(_, b)| {
-            let pks_of = |want_pos: bool| -> Vec<i64> {
-                (0..b.count)
-                    .filter(|&i| {
-                        if want_pos {
-                            b.get_weight(i) > 0
-                        } else {
-                            b.get_weight(i) < 0
-                        }
-                    })
-                    .map(|i| b.get_pk(i) as i64)
-                    .collect()
-            };
-            let other = pks_of(!positive);
-            pks_of(positive).into_iter().filter(|pk| !other.contains(pk)).collect()
-        })
-        .unwrap_or_default()
+/// The bundle's batch for system family `tid`, if it carries one. A DDL bundle
+/// holds at most one family per tid.
+fn bundle_family(families: &[(i64, Batch)], tid: i64) -> Option<&Batch> {
+    families.iter().find(|(t, _)| *t == tid).map(|(_, b)| b)
 }
 
 /// Resolve `tid`'s system-family schema and decode a client wal-block slice
@@ -2206,7 +2174,8 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
     // A CREATE VIEW is a stop-the-world op (source drain + distributed backfill,
     // reactor parked). The VIEW_TAB family's +1 rows, if any, are the new views;
     // they alone need the lock-held barrier and the in-loop source drain below.
-    let new_view_ids: Vec<i64> = family_pks_by_sign(&families, VIEW_TAB_ID, true);
+    let new_view_ids: Vec<i64> =
+        bundle_family(&families, VIEW_TAB_ID).map_or_else(Vec::new, |b| family_pks_by_sign(b, true));
     let view_create = !new_view_ids.is_empty();
 
     // Drain the committer barrier BEFORE acquiring the catalog write lock. The
@@ -2262,35 +2231,28 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
     // IDX_TAB row layout (and the IDXTAB_PAY_* payload indices) is fixed by
     // `create_index` and read identically by `hook_index_register`.
     let mut filter_seeds: Vec<(i64, u64, FxHashSet<crate::schema::key::PkBuf>, bool)> = Vec::new();
-    if let Some((_, idx_batch)) = families.iter().find(|(tid, _)| *tid == IDX_TAB_ID) {
-        for i in 0..idx_batch.count {
-            if idx_batch.get_weight(i) > 0 && idx_batch.read_payload_u64(i, IDXTAB_PAY_IS_UNIQUE) != 0 {
-                let owner_id = idx_batch.read_payload_u64(i, IDXTAB_PAY_OWNER_ID) as i64;
-                let packed = idx_batch.read_payload_u64(i, IDXTAB_PAY_SOURCE_COLS);
-                let cols = gnitz_wire::unpack_pk_cols(packed);
-                if !cols.is_well_formed() {
-                    continue;
-                }
-                match MasterDispatcher::validate_unique_index_create(
-                    shared.disp(),
-                    &shared.reactor,
-                    &shared.sal_writer_excl,
-                    owner_id,
-                    cols.as_slice(),
-                )
-                .await
-                {
-                    // No zone LSN reserved, no catalog mutation yet: just surface
-                    // the violation to the client. The write lock drops on return.
-                    Err(e) => {
-                        send_error(peer, 0, client_id, e.as_bytes()).await;
-                        return;
-                    }
-                    // Hold the distinct span set to seed the filter post-commit,
-                    // keyed by the packed column list (the filter-map key).
-                    Ok((seen, capped)) => filter_seeds.push((owner_id, packed, seen, capped)),
-                }
+    for (owner_id, packed, cols) in bundle_family(&families, IDX_TAB_ID)
+        .map(idx_tab_unique_creates)
+        .unwrap_or_default()
+    {
+        match MasterDispatcher::validate_unique_index_create(
+            shared.disp(),
+            &shared.reactor,
+            &shared.sal_writer_excl,
+            owner_id,
+            cols.as_slice(),
+        )
+        .await
+        {
+            // No zone LSN reserved, no catalog mutation yet: just surface
+            // the violation to the client. The write lock drops on return.
+            Err(e) => {
+                send_error(peer, 0, client_id, e.as_bytes()).await;
+                return;
             }
+            // Hold the distinct span set to seed the filter post-commit,
+            // keyed by the packed column list (the filter-map key).
+            Ok((seen, capped)) => filter_seeds.push((owner_id, packed, seen, capped)),
         }
     }
 
@@ -2312,20 +2274,10 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
     // `families`, so extract those minimal lists now instead of cloning the whole
     // TABLE_TAB / IDX_TAB batches. A bundle is one DDL, so at most one family
     // carries -1 rows; a CREATE bundle yields empty lists.
-    let dropped_tids: Vec<i64> = family_pks_by_sign(&families, TABLE_TAB_ID, false);
-    let dropped_indices: Vec<(i64, u64)> = families
-        .iter()
-        .find(|(tid, _)| *tid == IDX_TAB_ID)
-        .map(|(_, b)| {
-            (0..b.count)
-                .filter(|&i| b.get_weight(i) < 0)
-                .map(|i| {
-                    let owner_id = b.read_payload_u64(i, IDXTAB_PAY_OWNER_ID) as i64;
-                    let packed = b.read_payload_u64(i, IDXTAB_PAY_SOURCE_COLS);
-                    (owner_id, packed)
-                })
-                .collect()
-        })
+    let dropped_tids: Vec<i64> =
+        bundle_family(&families, TABLE_TAB_ID).map_or_else(Vec::new, |b| family_pks_by_sign(b, false));
+    let dropped_indices: Vec<(i64, u64)> = bundle_family(&families, IDX_TAB_ID)
+        .map(idx_tab_drops)
         .unwrap_or_default();
 
     // Ingest the families in ascending topo order so every register/index hook
@@ -2414,18 +2366,13 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
 
     // Invalidate unique-filter state for durably-dropped tables/indices so a
     // recreated table with the same ID does not inherit stale filter entries.
-    let disp_ptr_raw = shared.disp();
     for &tid in &dropped_tids {
-        {
-            (*disp_ptr_raw).unique_filter_invalidate_table(tid);
-        }
+        shared.disp().unique_filter_invalidate_table(tid);
     }
+    // Keying by the whole packed list means dropping `(a, b)` never clears a
+    // distinct single-column filter on `a`.
     for &(owner_id, packed) in &dropped_indices {
-        // Keying by the whole packed list means dropping `(a, b)` never clears a
-        // distinct single-column filter on `a`.
-        {
-            (*disp_ptr_raw).unique_filter_remove(owner_id, packed);
-        }
+        shared.disp().unique_filter_remove(owner_id, packed);
     }
 
     // Seed the unique filters from the pre-flight's distinct key sets so the first
@@ -2433,15 +2380,13 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
     // broadcast/fsync failure aborts the process before this point, so no filter
     // is published for an index that never committed.
     for (owner_id, packed, seen, capped) in filter_seeds {
-        {
-            (*disp_ptr_raw).unique_filter_seed(owner_id, packed, seen, capped);
-        }
+        shared.disp().unique_filter_seed(owner_id, packed, seen, capped);
     }
 
     // Populate every new view. A post-fsync Err cannot be rolled back (the CREATE
     // is durable), so abort — restart's boot rebuild refills it.
     if let Err(e) = guard_panic("view-backfill", || {
-        shared.disp().backfill_views_in_depth_order(&new_view_ids)
+        shared.disp().backfill_views_in_dep_order(&new_view_ids)
     }) {
         gnitz_fatal_abort!(
             "live CREATE VIEW backfill failed after the CREATE was made durable: {}",
@@ -2560,9 +2505,7 @@ async fn push_target_rejected(shared: &Shared, peer: &Peer, target_id: i64, clie
 /// `push_txn_body`, and the SERIAL range reservation — all of which address a
 /// base table by id and own their own reply path.
 fn push_target_error(shared: &Shared, target_id: i64) -> Option<String> {
-    // `kind` is `Copy`; `.map` ends the `dag.tables` borrow before the caller's
-    // awaits.
-    match shared.cat().dag.tables.get(&target_id).map(|e| e.kind) {
+    match shared.cat().dag.relation_kind(target_id) {
         None => Some(format!("table {target_id} not found")),
         Some(kind) if !kind.is_base_table() => Some(format!(
             "table {target_id} is not writable: pushes must target a base table"
@@ -2582,7 +2525,7 @@ fn emit_zone_to_sal(shared: &Shared, op: &'static str, drained: &[(i64, Batch)],
     let disp = shared.disp();
     if let Err(e) = guard_panic(op, || unsafe {
         for (tid, bat) in drained {
-            (*disp).broadcast_ddl(*tid, bat, zone_lsn)?;
+            disp.broadcast_ddl(*tid, bat, zone_lsn)?;
         }
         // Abort after broadcasts but BEFORE the commit sentinel — exercises the
         // recovery skip of a half-written zone.
@@ -2596,13 +2539,13 @@ fn emit_zone_to_sal(shared: &Shared, op: &'static str, drained: &[(i64, Batch)],
         // `apply_and_enqueue_family` drops empty batches, so a DDL bundle whose
         // families all net to empty arrives here with `drained` empty.
         if !drained.is_empty() {
-            (*disp).commit_zone(zone_lsn)?;
+            disp.commit_zone(zone_lsn)?;
         }
         Ok::<(), String>(())
     }) {
         gnitz_fatal_abort!("{} broadcast failed after in-memory catalog mutation: {}", op, e);
     }
-    shared.reactor.fsync(shared.sal_fd)
+    shared.reactor.fsync(shared.disp().sal_fd())
 }
 
 /// Durably reserve a SERIAL id range for `seq_id` and return the range base.

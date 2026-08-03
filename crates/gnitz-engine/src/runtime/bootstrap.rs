@@ -367,7 +367,7 @@ fn rebuild_invalid_views(catalog: &mut CatalogEngine, dispatcher: &MasterDispatc
     // Resume-vs-rebuild marker (asserted by the "no backfill on clean restart"
     // E2E): 0 ⇒ every view resumed from its checkpoint.
     boot_log(&format!("recovery: rebuilding {} invalid view(s)\n", invalid.len()));
-    dispatcher.backfill_views_in_depth_order(&invalid)
+    dispatcher.backfill_views_in_dep_order(&invalid)
 }
 
 // ---------------------------------------------------------------------------

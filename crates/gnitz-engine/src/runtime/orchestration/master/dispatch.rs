@@ -56,7 +56,7 @@ pub(crate) fn scan_spec_route(disp: &MasterDispatcher, target_id: i64, seek_pk_e
 /// the relation was built (a post-fork CREATE reports `Hashed` over the master's
 /// empty active range), so it disagrees with the workers' across a restart.
 fn confined_worker(disp: &MasterDispatcher, target_id: i64, seek_pk_extra: &[u8]) -> Option<usize> {
-    let cat = unsafe { &*disp.catalog };
+    let cat = disp.cat();
     let schema = cat.get_schema_desc(target_id)?;
     // The same predicate `build_partitioned_storage` chose the store shape with:
     // anything but `Keyed` is built unhashed, so no key names an owner and the
@@ -99,6 +99,11 @@ static BACKFILL_RELAY_SPACE_LOW: Seam = Seam::new("GNITZ_INJECT_BACKFILL_RELAY_S
 /// emit, once, as a full SAL would.
 static TICK_EMIT_ERROR: Seam = Seam::new("GNITZ_INJECT_TICK_EMIT_ERROR");
 
+/// The per-worker request ids a *synchronous* collect writes into its group.
+/// `collect_acks` / `collect_acks_and_relay` read the W2M rings directly and
+/// never route by req_id, so zeros are correct rather than merely unused.
+const SYNC_COLLECT_REQ_IDS: [u64; MAX_WORKERS] = [0; MAX_WORKERS];
+
 impl MasterDispatcher {
     pub fn new(
         num_workers: usize,
@@ -118,6 +123,16 @@ impl MasterDispatcher {
         }
     }
 
+    /// The catalog behind the raw pointer the dispatcher was constructed with.
+    /// Every `&self` method reaches the catalog through here, so the pointer is
+    /// dereferenced in one place. Same accessor the two sibling owners of this
+    /// pointer have (`executor::Shared::cat`, `WorkerProcess::cat`): the master
+    /// reactor is single-threaded and the catalog outlives the dispatcher.
+    #[allow(clippy::mut_from_ref)]
+    pub(super) fn cat(&self) -> &mut CatalogEngine {
+        unsafe { &mut *self.catalog }
+    }
+
     /// Boot-time SAL reset: sentinel prefix cleared, cursor 0, epoch 1 (the
     /// first live epoch — epoch 0 is the empty-slot sentinel prefix). Sole
     /// caller is `server_main` after all workers finish recovery.
@@ -134,7 +149,7 @@ impl MasterDispatcher {
     /// iteration in `scatter_wire_group`.
     pub(super) fn cached_schema_block(&self, target_id: i64) -> (SchemaDescriptor, Rc<Vec<u8>>, bool, u32) {
         let schema = self.schema_desc_for(target_id);
-        let cat = unsafe { &mut *self.catalog };
+        let cat = self.cat();
         let e = crate::runtime::wire::get_or_build_schema_wire_block(cat, target_id, &schema);
         (schema, e.entry.block, e.entry.wire_safe, e.entry.wire_row_fixed_stride)
     }
@@ -296,13 +311,9 @@ impl MasterDispatcher {
         )
     }
 
-    /// Encode batch once directly into SAL mmap, replicate to all workers.
-    /// `lsn` is supplied by the caller: a DDL zone LSN (`broadcast_ddl`), the
+    /// Replicate one dataless control slot to every worker, then signal (no
+    /// fdatasync). `lsn` is the caller's: a DDL zone LSN (`broadcast_ddl`), the
     /// checkpoint generation (FlushEph round), or 0 for command-only groups.
-    ///
-    /// Control-only broadcast: replicate one dataless slot to all workers, then
-    /// signal (no fdatasync). `lsn` is the caller's — a DDL zone LSN, the
-    /// checkpoint generation, or 0.
     ///
     /// A schema block built here carries no column names: `decode_schema_block`
     /// parses only the col_idx / type / flags regions, and the SAL never leaves
@@ -368,9 +379,8 @@ impl MasterDispatcher {
             loop {
                 match self.w2m.try_read(w) {
                     Some(decoded) => {
-                        if decoded.control.status != 0 {
-                            let msg = String::from_utf8_lossy(&decoded.control.error_msg);
-                            return Err(format!("worker {w}: {msg}"));
+                        if let Some(e) = worker_error(w, "recovery sync", &decoded.control) {
+                            return Err(e);
                         }
                         break;
                     }
@@ -462,9 +472,8 @@ impl MasterDispatcher {
                         self.emit_relay_with_decision(prep, decision)?;
                     }
                 } else {
-                    if decoded.control.status != 0 {
-                        let msg = String::from_utf8_lossy(&decoded.control.error_msg);
-                        return Err(format!("worker {w}: {msg}"));
+                    if let Some(e) = worker_error(w, "backfill relay", &decoded.control) {
+                        return Err(e);
                     }
                     pending_mask &= !(1u64 << w);
                 }
@@ -589,7 +598,7 @@ impl MasterDispatcher {
             all_pad: _,
         } = relay;
 
-        let cat = unsafe { &mut *self.catalog };
+        let cat = self.cat();
         // The relay treats the per-worker payloads as disjoint slices of one
         // delta and scatters them together. A replicated source breaks that: its
         // delta is broadcast, so every worker returns the same rows, and
@@ -725,7 +734,7 @@ impl MasterDispatcher {
         // non-backfill relay is byte-identical to before. The synchronous
         // collect reads W2M rings directly and never routes by req_id, so the
         // relay carries request_id 0 on every worker slot.
-        let req_ids = [0u64; crate::runtime::sal::MAX_WORKERS];
+        let req_ids = SYNC_COLLECT_REQ_IDS;
         self.write_data_group(
             view_id,
             FLAG_EXCHANGE_RELAY,
@@ -764,9 +773,9 @@ impl MasterDispatcher {
     /// sources. The one driver that populates a view — a live CREATE VIEW bundle
     /// and the boot rebuild of generation-invalid views both run this.
     ///
-    /// Ascending `depth` *is* dependency order: registration stamps a view one
-    /// deeper than its deepest source, so an upstream hidden segment is filled
-    /// before a downstream view scans it.
+    /// `order_by_view_deps` is the one owner of that ordering — a source view
+    /// precedes every dependent that scans it, so an upstream hidden segment is
+    /// filled before a downstream view reads it.
     ///
     /// A multi-source equi-join iterates every source: the first fills its trace
     /// (joining against the still-empty other trace emits nothing), and the rest
@@ -774,11 +783,9 @@ impl MasterDispatcher {
     /// barrier and `fan_out_backfill` accommodates that — no relay arrives, so
     /// each worker stops on its own drain exhaustion — which is why one driver
     /// serves every shape.
-    pub fn backfill_views_in_depth_order(&self, view_ids: &[i64]) -> Result<(), String> {
-        let mut ordered: Vec<i64> = view_ids.to_vec();
-        ordered.sort_by_key(|vid| unsafe { (*self.catalog).dag.tables.get(vid).map_or(0, |e| e.depth) });
-        for vid in ordered {
-            let sources = unsafe { (*self.catalog).dag.get_source_ids(vid) };
+    pub fn backfill_views_in_dep_order(&self, view_ids: &[i64]) -> Result<(), String> {
+        for vid in self.cat().dag.order_by_view_deps(view_ids) {
+            let sources = self.cat().dag.get_source_ids(vid);
             for src in sources {
                 self.fan_out_backfill(vid, src)
                     .map_err(|e| format!("view={vid} source={src}: {e}"))?;
@@ -797,18 +804,14 @@ impl MasterDispatcher {
     /// the cluster (see `collect_acks_and_relay`).
     pub(crate) fn drain_tick_blocking(&self, source_id: i64) -> Result<(), String> {
         let nw = self.num_workers;
-        // The synchronous collect reads W2M rings directly and routes neither by
-        // req_id; any value works.
-        let req_ids = [0u64; crate::runtime::sal::MAX_WORKERS];
-        self.write_tick_group(source_id, &req_ids[..nw])?;
+        self.write_tick_group(source_id, &SYNC_COLLECT_REQ_IDS[..nw])?;
         self.signal_all();
         self.collect_acks_and_relay(false)
     }
 
-    // Async fan-outs take `*mut Self` instead of `&mut self` because the
-    // exclusive borrow must end before `.await`: other reactor tasks
-    // re-enter the dispatcher in the meantime. Only call from inside a
-    // reactor task driven by `block_until_idle`.
+    // The async fan-outs below are free functions over `&MasterDispatcher`, not
+    // methods: other reactor tasks re-enter the dispatcher across their awaits,
+    // so no exclusive borrow may span one.
 
     pub async fn fan_out_seek(
         disp: &MasterDispatcher,
@@ -819,16 +822,15 @@ impl MasterDispatcher {
         seek_pk_extra: &[u8],
     ) -> Result<W2mSlot, String> {
         let num_workers = disp.num_workers;
-        let schema = unsafe {
-            (*disp.catalog)
-                .get_schema_desc(target_id)
-                .ok_or_else(|| format!("seek: table {target_id} not found"))?
-        };
+        let schema = disp
+            .cat()
+            .get_schema_desc(target_id)
+            .ok_or_else(|| format!("seek: table {target_id} not found"))?;
         // Decode the wire pair to the OPK bytes (width-universal), then route off
         // the distribution prefix via the shared `partition_for_pk`. A FLAG_SEEK
         // always carries the full PK and the prefix ⊆ the PK, so a full-PK seek
-        // pins exactly one worker — no broadcast clause. Encoding native → OPK is
-        // load-bearing: hashing the native value misroutes signed/compound PKs.
+        // pins exactly one worker — no broadcast clause. Hashing the native value
+        // instead of the OPK bytes would misroute signed and compound PKs.
         let opk = crate::schema::key::seek_opk_bytes(&schema, pk, seek_pk_extra)
             .map_err(|e| format!("seek: table {target_id}: {e}"))?;
         let worker = worker_for_partition(schema.partition_for_pk(opk.pk_bytes()), num_workers);
@@ -1059,7 +1061,7 @@ impl MasterDispatcher {
     fn injected_tick_emit_latch(&self, tid: i64) -> Option<&'static std::sync::atomic::AtomicBool> {
         static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let name = TICK_EMIT_ERROR.names()?;
-        let (_, table) = unsafe { (*self.catalog).get_qualified_name(tid) }?;
+        let (_, table) = self.cat().get_qualified_name(tid)?;
         (table == name).then_some(&ARMED)
     }
 
@@ -1161,7 +1163,7 @@ impl MasterDispatcher {
         }
         // All workers reaped: no process can race a removal. Reclaim any dirs
         // still gated (dropped entities whose gating checkpoint never arrived).
-        unsafe { &mut *self.catalog }.drain_checkpoint_gated_deletions();
+        self.cat().drain_checkpoint_gated_deletions();
     }
 
     /// Whether a transaction's family groups fit the SAL, and if not, whether a
@@ -1198,10 +1200,9 @@ impl MasterDispatcher {
         total
     }
 
-    /// Commit N push batches as a single SAL group write. Called from
-    /// the committer task. Returns (groups, req_ids, fsync_id) — the
-    /// caller awaits fsync + per-worker req_ids separately so they can
-    /// `join!` them. `lsn` is supplied by the caller.
+    /// Write one push batch as a SAL group at the caller's `lsn`, with a
+    /// per-worker request id. Called from the committer task, which signals,
+    /// closes the zone, and awaits fsync + the per-worker ACKs itself.
     pub(crate) fn write_commit_group(
         &self,
         target_id: i64,
@@ -1274,7 +1275,7 @@ impl MasterDispatcher {
     /// the SAL intact and retry on a later checkpoint (committer) or abort boot
     /// (`do_checkpoint`).
     pub(crate) fn checkpoint_post_ack(&self) -> Result<(), String> {
-        let cat = unsafe { &mut *self.catalog };
+        let cat = self.cat();
         cat.flush_all_system_tables()?;
         // Now safe: every worker ACKed the FLUSH, so all have consumed past any
         // DROP that gated a directory — hence finished the matching CREATE.
@@ -1288,7 +1289,7 @@ impl MasterDispatcher {
     /// Delegates to the catalog: durably records the seq-4 row and publishes the
     /// new value to `worker_ctx`. Returns the new generation.
     pub(crate) fn bump_checkpoint_generation(&self) -> u64 {
-        unsafe { &mut *self.catalog }.bump_checkpoint_generation()
+        self.cat().bump_checkpoint_generation()
     }
 
     /// Synchronous boot-end checkpoint (pre-reactor W2M path): record the
@@ -1299,7 +1300,7 @@ impl MasterDispatcher {
     pub(crate) fn boot_checkpoint(&self, worker_count: u32) -> Result<(), String> {
         // The topology row's durability rides the gen bump's system-table flush
         // (both are `_sequences` rows).
-        unsafe { &mut *self.catalog }.record_topology(worker_count);
+        self.cat().record_topology(worker_count);
         let gen = self.bump_checkpoint_generation();
         // Base round (FLAG_FLUSH → ACKs → flush system tables + reset).
         self.do_checkpoint()?;
@@ -1320,7 +1321,7 @@ impl MasterDispatcher {
     /// Get the schema descriptor for a target_id. Panics if the table
     /// has no schema (committer should only see tables that validated).
     pub fn schema_desc_for(&self, target_id: i64) -> SchemaDescriptor {
-        unsafe { &mut *self.catalog }
+        self.cat()
             .get_schema_desc(target_id)
             .unwrap_or_else(|| panic!("master: no schema for target_id={target_id}"))
     }

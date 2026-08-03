@@ -36,13 +36,8 @@ pub(super) fn scan_decode_err(w: usize, e: &'static str) -> String {
 /// sets `FLAG_CONTINUATION` on every frame and `FLAG_SCAN_LAST` on the last.
 pub(super) fn parse_train_header(slot: &W2mSlot, w: usize, what: &str) -> Result<(wire::DecodedControl, bool), String> {
     let ctrl = peek_control_block(slot.bytes()).map_err(|e| scan_decode_err(w, e))?;
-    if ctrl.status != 0 {
-        return Err(format!(
-            "worker {}: {}: {}",
-            w,
-            what,
-            String::from_utf8_lossy(&ctrl.error_msg)
-        ));
+    if let Some(e) = super::worker_error(w, what, &ctrl) {
+        return Err(e);
     }
     let has_more = ctrl.flags & FLAG_SCAN_LAST == 0 && ctrl.flags & FLAG_CONTINUATION != 0;
     Ok((ctrl, has_more))
@@ -264,45 +259,14 @@ pub(super) async fn drain_scan_train(
 
 #[cfg(test)]
 mod tests {
+    use super::super::fixtures::{make_row_batch, two_col_schema, u64_schema};
     use super::*;
-    use crate::schema::{type_code, SchemaColumn};
 
     // Synthetic-train pattern: anonymous-mmap W2M rings (no fork), frames
     // pre-written via W2mWriter, the drain driven by a single manual poll with
     // a noop waker. Every fixture parks all continuation frames up front, so a
     // healthy drain never returns `Pending` — a `Pending` poll IS the failure
     // signal for a phantom-continuation regression.
-
-    fn u64_schema() -> SchemaDescriptor {
-        SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0])
-    }
-
-    /// PK U64 at index 0, payload U64 at index 1.
-    fn two_col_schema() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 1),
-            ],
-            &[0],
-        )
-    }
-
-    /// rows: (pk, weight, null_word, payload_col1_value)
-    fn make_row_batch(schema: SchemaDescriptor, rows: &[(u128, i64, u64, i64)]) -> Batch {
-        let mut batch = Batch::with_capacity(schema, rows.len().max(1));
-        for &(pk, weight, null_word, payload_val) in rows {
-            let lo = [payload_val];
-            let hi = [0u64];
-            let null_ptr: *const u8 = std::ptr::null();
-            let ptrs = [null_ptr];
-            let lens = [0u32];
-            unsafe {
-                batch.append_row_simple(pk, weight, null_word, &lo, &hi, &ptrs, &lens);
-            }
-        }
-        batch
-    }
 
     struct DrainFixture {
         rings: Vec<crate::test_support::SharedRegion>,
@@ -408,9 +372,7 @@ mod tests {
             data: ipc::WireData::Whole(batch),
             ..Default::default()
         };
-        writer.send_encoded(msg.size(), req, |buf| {
-            msg.encode_ipc(buf, 0);
-        });
+        writer.send_msg(req as u64, &msg);
     }
 
     /// Poll a future exactly once with a noop waker; `None` on `Pending`.
@@ -455,9 +417,9 @@ mod tests {
     ///    status-gated), worker 0's flags-0 error frame would read as "more
     ///    coming" and the first poll would return `Pending` — caught as a
     ///    failed assert instead of an infinite hang.
-    ///  - If the drain still deferred the error (the pre-early-return shape),
-    ///    worker 1's parked continuation would be consumed — caught by the
-    ///    still-parked assert.
+    ///  - A drain that deferred the error instead of returning on it would
+    ///    consume worker 1's parked continuation — caught by the still-parked
+    ///    assert.
     #[test]
     fn drain_index_scan_errs_immediately_on_fault_frame() {
         use crate::runtime::wire::{STATUS_ERROR, STATUS_OK};

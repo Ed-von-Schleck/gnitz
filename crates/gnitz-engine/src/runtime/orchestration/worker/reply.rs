@@ -47,21 +47,6 @@ pub(super) enum PendingScanKind {
 impl WorkerProcess {
     // ── W2M response helpers ───────────────────────────────────────────
 
-    /// Encode `msg` into one W2M ring slot tagged `ring_req`. The master reactor
-    /// routes a reply by this ring prefix, not by the payload's `request_id` —
-    /// the chunked-train frames leave that field 0.
-    fn send_msg(&self, ring_req: u64, msg: WireMsg<'_>) {
-        self.send_sized(ring_req, msg, msg.size());
-    }
-
-    /// `send_msg` for a caller that already sized the message (to check it
-    /// against a frame cap); `sz` must be `msg.size()`.
-    fn send_sized(&self, ring_req: u64, msg: WireMsg<'_>, sz: usize) {
-        self.w2m_writer.send_encoded(sz, ring_req as u32, |buf| {
-            msg.encode_ipc(buf, 0);
-        });
-    }
-
     pub(super) fn send_ack(&self, target_id: u64, request_id: u64) {
         self.w2m_writer.send_status(target_id, request_id, STATUS_OK, &[]);
     }
@@ -153,7 +138,7 @@ impl WorkerProcess {
                 "reply wire_size={sz} exceeds the maximum frame payload {FRAME_CAP}"
             ));
         }
-        self.send_sized(request_id, msg, sz);
+        self.w2m_writer.send_msg_sized(request_id, &msg, sz);
         Ok(())
     }
 
@@ -196,7 +181,7 @@ impl WorkerProcess {
             FRAME_CAP
         };
         if sz <= frame_cap {
-            self.send_sized(request_id, msg, sz);
+            self.w2m_writer.send_msg_sized(request_id, &msg, sz);
             return Ok(());
         }
         if !is_wire_safe {
@@ -265,7 +250,7 @@ impl WorkerProcess {
                 });
                 return Ok(());
             }
-            self.send_sized(request_id, msg, wire_sz);
+            self.w2m_writer.send_msg_sized(request_id, &msg, wire_sz);
             return Ok(());
         }
 
@@ -287,7 +272,7 @@ impl WorkerProcess {
         // would have sent.
         let sz = msg.size();
         if !force_fifo && sz <= self.reply_frame_budget {
-            self.send_sized(request_id, msg, sz);
+            self.w2m_writer.send_msg_sized(request_id, &msg, sz);
         } else {
             self.enqueue_stream(batch, request_id, client_id, target_id, prebuilt_rc, server_version);
         }
@@ -405,9 +390,9 @@ impl WorkerProcess {
         let Some(p) = self.pending_streams.pop_front() else {
             return;
         };
-        self.send_msg(
+        self.w2m_writer.send_msg(
             p.request_id,
-            Self::non_wire_safe_msg(
+            &Self::non_wire_safe_msg(
                 p.target_id,
                 &p.batch,
                 p.client_id,
@@ -475,9 +460,9 @@ impl WorkerProcess {
             None => remaining.max(1), // per_row == 0: constant wire size, send all
         };
         let has_more = next_row + max_rows < batch.count;
-        self.send_msg(
+        self.w2m_writer.send_msg(
             request_id,
-            Self::chunk_msg(
+            &Self::chunk_msg(
                 target_id,
                 &batch,
                 client_id,
@@ -577,9 +562,7 @@ pub(crate) fn send_unique_preflight_keys(
             prebuilt_schema_block: is_first.then_some(schema_block.as_slice()),
             ..Default::default()
         };
-        w2m_writer.send_encoded(msg.size(), request_id as u32, |buf| {
-            msg.encode_ipc(buf, 0);
-        });
+        w2m_writer.send_msg(request_id, &msg);
         is_first = false;
         if is_last {
             break;

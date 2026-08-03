@@ -121,10 +121,10 @@ impl CatalogEngine {
     /// the result scalar-only — FK-referenced columns are never STRING/BLOB — so
     /// the blob arena is never touched. Works for both narrow and wide PKs: the
     /// OPK bytes are seeked verbatim, with no native→OPK re-encode.
-    pub fn gather_family_bytes(
+    pub fn gather_family_bytes<'k>(
         &mut self,
         table_id: i64,
-        pks: &[crate::schema::key::PkBuf],
+        pks: impl ExactSizeIterator<Item = &'k [u8]>,
         project: &[u8],
     ) -> Result<Batch, String> {
         let entry = self.table_entry(table_id)?;
@@ -150,7 +150,7 @@ impl CatalogEngine {
         let store = entry.handle.as_partitioned();
         let mut probe = entry.handle.open_probe();
         for pk in pks {
-            if let Some(cursor) = probe.advance_to_exact_live(store, pk.pk_bytes()) {
+            if let Some(cursor) = probe.advance_to_exact_live(store, pk) {
                 copy_cursor_cols_to_batch(cursor, &mut out, &proj);
             }
         }

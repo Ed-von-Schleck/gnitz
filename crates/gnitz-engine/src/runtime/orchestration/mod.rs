@@ -1,10 +1,9 @@
 //! L7 orchestration — the master SAL dispatcher, the worker dispatch loop, the
 //! single-threaded server executor, and the durable-commit batcher.
 //!
-//! Internal grouping, not a facade: `runtime/mod.rs` aliases these submodules so
-//! the historical `crate::runtime::<mod>` paths keep resolving across the
-//! subsystem. They name each other (and `protocol`/`reactor`) through those
-//! `crate::runtime::` paths.
+//! Internal grouping, not a facade: `runtime/mod.rs` re-aliases these submodules
+//! flat, so they name each other (and `protocol`/`reactor`) as
+//! `crate::runtime::<mod>`.
 
 pub(super) mod committer;
 pub(super) mod executor;

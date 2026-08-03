@@ -353,11 +353,12 @@ impl WorkerProcess {
     }
 
     /// Reject a column list that is malformed or names a column outside
-    /// `target_id`'s schema, before it reaches the catalog. The single gate for
-    /// every arm carrying a `pack_pk_cols` word.
+    /// `target_id`'s schema, before it reaches the catalog. The worker-side gate
+    /// for every arm carrying a `pack_pk_cols` word; the master applies the same
+    /// rule in `validated_index_cols`.
     fn validate_index_cols(&mut self, target_id: i64, cols: &gnitz_wire::PkColList, op: &str) -> Result<(), String> {
-        match self.cat().get_schema_desc(target_id).map(|s| s.num_columns()) {
-            Some(nc) if cols.is_well_formed() && cols.as_slice().iter().all(|&c| (c as usize) < nc) => Ok(()),
+        match self.cat().get_schema_desc(target_id) {
+            Some(s) if s.cols_in_range(cols) => Ok(()),
             _ => Err(format!("{op}: invalid column list for table {target_id}")),
         }
     }
@@ -727,17 +728,22 @@ impl WorkerProcess {
                 // (scatter preserves per-worker order), aiding the cursor.
                 let project: Vec<u8> = crate::runtime::sal::unpack_gather_cols(seek_col_idx).collect();
                 // The batch PK region holds verbatim OPK bytes (the master packs
-                // them via `extend_pk_bytes`), so seek them directly with
-                // `gather_family_bytes` for every PK width. Round-tripping a
-                // narrow key back through `get_pk` → `opk_key` would re-OPK-encode
-                // it (double sign-flip for signed; scrambled compound bytes),
-                // probing a key that matches no stored row. `get_pk_bytes` works
-                // for both narrow and wide PKs.
-                let pks: Vec<PkBuf> = match &batch {
-                    Some(b) => (0..b.count).map(|i| PkBuf::from_bytes(b.get_pk_bytes(i))).collect(),
-                    None => Vec::new(),
+                // them via `extend_pk_bytes`), so lend them to the seek directly,
+                // at every PK width. Round-tripping a narrow key back through
+                // `get_pk` → `opk_key` would re-OPK-encode it (double sign-flip
+                // for signed; scrambled compound bytes), probing a key that
+                // matches no stored row.
+                let result = match batch.as_ref() {
+                    Some(b) => {
+                        let keys = (0..b.count).map(|i| b.get_pk_bytes(i));
+                        self.cat().gather_family_bytes(target_id, keys, &project)?
+                    }
+                    // A worker with an empty sublist still replies — the master
+                    // joins one reply per worker.
+                    None => self
+                        .cat()
+                        .gather_family_bytes(target_id, std::iter::empty(), &project)?,
                 };
-                let result = self.cat().gather_family_bytes(target_id, &pks, &project)?;
                 // The projected reply schema is synthetic — never the
                 // table's cached block.
                 let schema = result.schema;
@@ -1198,15 +1204,14 @@ impl WorkerProcess {
             }
         };
 
-        let reply_schema = if one_off {
-            ReplySchema::OneOff(&schema)
-        } else {
-            ReplySchema::Table(&schema)
-        };
         self.send_response(
             target_id as u64,
             Some(&result),
-            reply_schema,
+            if one_off {
+                ReplySchema::OneOff(&schema)
+            } else {
+                ReplySchema::Table(&schema)
+            },
             request_id,
             client_id,
             seek_pk,

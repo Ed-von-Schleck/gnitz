@@ -216,6 +216,13 @@ impl DagEngine {
         bases
     }
 
+    /// A registered relation's kind, or `None` for an unknown id. `RelationKind`
+    /// is `Copy`, so the `tables` borrow ends with the call — callers may await
+    /// on the result.
+    pub(crate) fn relation_kind(&self, id: i64) -> Option<RelationKind> {
+        self.tables.get(&id).map(|e| e.kind)
+    }
+
     /// True iff `id`'s output is a full copy on every worker — read off the
     /// [`Placement`] stamped on its schema at registration. The one spelling of the
     /// replication probe, so the write broadcast, the read single-sourcing, and the

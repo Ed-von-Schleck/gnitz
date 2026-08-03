@@ -103,34 +103,24 @@ use unique_filter::UniqueFilter;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Return the first `worker N: <op>: <msg>` error in `decoded` (worker-index
-/// order), or `None` if every reply has status 0. Shared by every fan-out
-/// site that emits per-worker req_ids and decodes their replies in order.
-pub(crate) fn first_worker_error(op: &str, decoded: &[DecodedWire]) -> Option<String> {
-    worker_error_scan(op, decoded.iter().enumerate())
+/// Render worker `w`'s reply as an error, or `None` when it succeeded. The one
+/// place the fault contract of a worker reply is read: `status != 0` means the
+/// worker failed and `error_msg` holds its (UTF-8) text.
+pub(crate) fn worker_error(w: usize, op: &str, ctrl: &wire::DecodedControl) -> Option<String> {
+    (ctrl.status != 0).then(|| {
+        let msg = String::from_utf8_lossy(&ctrl.error_msg);
+        format!("worker {w}: {op}: {msg}")
+    })
 }
 
-/// Variant of `first_worker_error` for the `Vec<Option<DecodedWire>>` slot
-/// shape produced by `join_into`. Slots are guaranteed `Some` after the
-/// future resolves; an unfilled slot indicates a bug in the join driver.
+/// The first worker error across a fan-out's replies, in worker-index order.
+/// Slots are `Some` once `join_into`'s future resolves; a `None` is a bug in
+/// the join driver.
 pub(crate) fn first_worker_error_opt(op: &str, decoded: &[Option<DecodedWire>]) -> Option<String> {
-    worker_error_scan(
-        op,
-        decoded
-            .iter()
-            .enumerate()
-            .map(|(w, d)| (w, d.as_ref().expect("join_into left a None slot — logic bug"))),
-    )
-}
-
-fn worker_error_scan<'a>(op: &str, it: impl Iterator<Item = (usize, &'a DecodedWire)>) -> Option<String> {
-    for (w, d) in it {
-        if d.control.status != 0 {
-            let msg = String::from_utf8_lossy(&d.control.error_msg);
-            return Some(format!("worker {w}: {op}: {msg}"));
-        }
-    }
-    None
+    decoded.iter().enumerate().find_map(|(w, d)| {
+        let d = d.as_ref().expect("join_into left a None slot — logic bug");
+        worker_error(w, op, &d.control)
+    })
 }
 
 /// Which workers a scan-shaped dispatch goes to.
@@ -168,7 +158,7 @@ impl Fanout {
 /// The single owner of the replicated→single-source routing policy for
 /// `dispatch_scan_fanout` callers.
 pub(crate) fn replicated_unicast(disp: &MasterDispatcher, target_id: i64) -> Fanout {
-    if unsafe { (*disp.catalog).dag.relation_is_replicated(target_id) } {
+    if disp.cat().dag.relation_is_replicated(target_id) {
         Fanout::One(0)
     } else {
         Fanout::Broadcast
@@ -329,4 +319,54 @@ pub(crate) async fn dispatch_scan_multi_fanout(
         }
     }
     Ok(dispatches)
+}
+
+/// Fixtures shared by the `master` submodules' unit tests, so a schema or
+/// row-builder change is made once rather than in three test modules.
+#[cfg(test)]
+pub(super) mod fixtures {
+    use crate::schema::key::PkBuf;
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+    use crate::storage::Batch;
+
+    /// A single U64 PK column, no payload.
+    pub(super) fn u64_schema() -> SchemaDescriptor {
+        SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0])
+    }
+
+    /// PK U64 at index 0, payload U64 at index 1.
+    pub(super) fn two_col_schema() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 1),
+            ],
+            &[0],
+        )
+    }
+
+    /// Rows are `(pk, weight, null_word, payload_col1_value)`.
+    pub(super) fn make_row_batch(schema: SchemaDescriptor, rows: &[(u128, i64, u64, i64)]) -> Batch {
+        let mut batch = Batch::with_capacity(schema, rows.len().max(1));
+        for &(pk, weight, null_word, payload_val) in rows {
+            let lo = [payload_val];
+            let hi = [0u64];
+            let null_ptr: *const u8 = std::ptr::null();
+            let ptrs = [null_ptr];
+            let lens = [0u32];
+            unsafe {
+                batch.append_row_simple(pk, weight, null_word, &lo, &hi, &ptrs, &lens);
+            }
+        }
+        batch
+    }
+
+    /// Concatenate per-column OPK byte images into one compound PK.
+    pub(super) fn compound_pk_bytes(parts: &[&[u8]]) -> PkBuf {
+        let mut v = Vec::new();
+        for p in parts {
+            v.extend_from_slice(p);
+        }
+        PkBuf::from_bytes(&v)
+    }
 }

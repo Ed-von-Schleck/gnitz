@@ -60,8 +60,7 @@ pub(crate) fn layout_from_wire_flags(flags: u64) -> crate::storage::Layout {
     }
 }
 
-// WAL block header field offsets (matches storage/lsm/wal.rs; duplicated here to
-// avoid cross-module coupling between runtime and storage internals).
+// WAL block header field offsets, shared with storage/lsm/wal.rs.
 pub(crate) use gnitz_wire::WAL_OFF_SIZE;
 use gnitz_wire::WAL_OFF_TID;
 
@@ -655,14 +654,6 @@ pub fn decode_wire(data: &[u8]) -> Result<DecodedWire, &'static str> {
     decode_wire_impl(data, None, true)
 }
 
-/// Decode a `FLAG_DDL_TXN` frame into its per-family `(table_id, wal-block
-/// slice)` list, in send order. Walks the concatenated family blocks by header
-/// alone — `table_id` at `WAL_OFF_TID`, total size at `WAL_OFF_SIZE` — so no
-/// schema is needed here; the caller resolves each family's schema from the
-/// catalog and calls `Batch::decode_from_wal_block` on its slice. The frame is:
-/// control block, then `u32` family count, then `count` data blocks. The control
-/// block is validated (version, region count) but not returned — the caller
-/// already has the routing header from `handle_message`'s peek.
 /// Read the length-prefixed WAL block at `off` in `data`: confirm the header is
 /// present, read the block's total size (`WAL_OFF_SIZE`), confirm the block fits,
 /// and return its slice. Every framed decoder walks concatenated blocks this way
@@ -699,6 +690,14 @@ fn txn_frame_prologue(data: &[u8], min_family_bytes: usize) -> Result<(usize, us
     Ok((count, off, count.min(max_families)))
 }
 
+/// Decode a `FLAG_DDL_TXN` frame into its per-family `(table_id, wal-block
+/// slice)` list, in send order. Walks the concatenated family blocks by header
+/// alone — `table_id` at `WAL_OFF_TID`, total size at `WAL_OFF_SIZE` — so no
+/// schema is needed here; the caller resolves each family's schema from the
+/// catalog and calls `Batch::decode_from_wal_block` on its slice. The frame is:
+/// control block, then `u32` family count, then `count` data blocks. The control
+/// block is validated (version, region count) but not returned — the caller
+/// already has the routing header from `handle_message`'s peek.
 pub fn decode_ddl_txn(data: &[u8]) -> Result<Vec<(i64, &[u8])>, &'static str> {
     let (count, mut off, cap) = txn_frame_prologue(data, gnitz_wire::WAL_HEADER_SIZE)?;
     let mut families = Vec::with_capacity(cap);

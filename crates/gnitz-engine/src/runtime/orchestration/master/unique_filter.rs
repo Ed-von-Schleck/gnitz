@@ -157,7 +157,7 @@ impl MasterDispatcher {
     /// precomputed `key_spec`. Uniqueness is filtered on the LIVE flag —
     /// promotion/demotion flips it without rebuilding the spec.
     fn unique_index_descriptors(&self, table_id: i64) -> Vec<UniqueIndexDesc> {
-        unsafe { &mut *self.catalog }
+        self.cat()
             .index_circuits(table_id)
             .iter()
             .filter(|ic| ic.is_unique)
@@ -284,10 +284,12 @@ impl MasterDispatcher {
         // drop above discards any undrained frames at the ring boundary), the
         // schema guard against DDL-lagged worker replies, the zero-copy
         // `MemBatch` lifetime, and the continuation-schema-hint handling.
-        let scan_result = drain_index_scan(slots, &req_ids, reactor, "scan", &schema, |mb, _| {
-            let disp = { disp };
+        // On failure (worker crash mid-scan or cancellation) the guard is left
+        // armed, so its Drop removes the cold entries and the next validation
+        // retries warmup from scratch.
+        drain_index_scan(slots, &req_ids, reactor, "scan", &schema, |mb, _| {
+            let mut filters = disp.unique_filters.borrow_mut();
             for d in &missing {
-                let mut filters = disp.unique_filters.borrow_mut();
                 if let Some(filter) = filters.get_mut(&(table_id, d.packed)) {
                     if !filter.capped {
                         extract_into_filter(filter, mb, &d.spec);
@@ -296,29 +298,18 @@ impl MasterDispatcher {
             }
             Ok(())
         })
-        .await;
+        .await?;
 
-        // On success the filters are fully populated → mark warm so the
-        // broadcast-skip shortcut may trust them. Disarm the guard so the
-        // drop handler does not remove the now-warm entries. On failure (worker
-        // crash mid-scan or cancellation) let the guard's Drop handler remove
-        // the cold entries so the next validation retries warmup from scratch.
-        match scan_result {
-            Ok(()) => {
-                let disp = { disp };
-                for d in &missing {
-                    if let Some(f) = disp.unique_filters.borrow_mut().get_mut(&(table_id, d.packed)) {
-                        f.warm = true;
-                    }
-                }
-                guard.disarmed = true;
-                Ok(())
-            }
-            Err(e) => {
-                // Guard is not disarmed → Drop removes the cold entries.
-                Err(e)
+        // Fully populated → mark warm so the broadcast-skip shortcut may trust
+        // them, and disarm the guard so its Drop leaves them in place.
+        let mut filters = disp.unique_filters.borrow_mut();
+        for d in &missing {
+            if let Some(f) = filters.get_mut(&(table_id, d.packed)) {
+                f.warm = true;
             }
         }
+        guard.disarmed = true;
+        Ok(())
     }
 
     /// Seed the `(table_id, col_idx)` filter from the CREATE-time pre-flight,
@@ -343,13 +334,9 @@ impl MasterDispatcher {
 
 #[cfg(test)]
 mod unique_filter_tests {
+    use super::super::fixtures::{compound_pk_bytes, make_row_batch, two_col_schema, u64_schema};
     use super::*;
     use crate::schema::{type_code, SchemaColumn};
-
-    fn u64_schema() -> SchemaDescriptor {
-        // Single U64 PK column.
-        SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0])
-    }
 
     /// OPK leading-key span of a single U64 value — the form `key_bytes`
     /// produces for a U64-promoted index column (U64 OPK == big-endian). Used to
@@ -358,38 +345,11 @@ mod unique_filter_tests {
         PkBuf::from_bytes(&v.to_be_bytes())
     }
 
-    fn two_col_schema() -> SchemaDescriptor {
-        // PK U64 at index 0, payload U64 at index 1.
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 1),
-            ],
-            &[0],
-        )
-    }
-
     /// Span-extraction spec for a unique index on `cols` of `schema`, promoted
     /// via `make_index_schema` exactly as production circuit registration does.
     fn test_spec(cols: &[u32], schema: &SchemaDescriptor) -> IndexKeySpec {
         let idx_schema = crate::schema::make_index_schema(cols, schema).unwrap();
         IndexKeySpec::new(cols, schema, &idx_schema)
-    }
-
-    fn make_row_batch(schema: SchemaDescriptor, rows: &[(u128, i64, u64, i64)]) -> Batch {
-        // rows: (pk, weight, null_word, payload_col1_i64_value)
-        let mut batch = Batch::with_capacity(schema, rows.len().max(1));
-        for &(pk, weight, null_word, payload_val) in rows {
-            let lo = [payload_val];
-            let hi = [0u64];
-            let null_ptr: *const u8 = std::ptr::null();
-            let ptrs = [null_ptr];
-            let lens = [0u32];
-            unsafe {
-                batch.append_row_simple(pk, weight, null_word, &lo, &hi, &ptrs, &lens);
-            }
-        }
-        batch
     }
 
     #[test]
@@ -578,14 +538,6 @@ mod unique_filter_tests {
         assert!(filter.capped);
         assert!(filter.values.is_empty());
         assert!(!disp.unique_filter_all_absent(7, 0, [span_u64(12345)].into_iter()));
-    }
-
-    fn compound_pk_bytes(parts: &[&[u8]]) -> PkBuf {
-        let mut v = Vec::new();
-        for p in parts {
-            v.extend_from_slice(p);
-        }
-        PkBuf::from_bytes(&v)
     }
 
     #[test]

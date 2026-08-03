@@ -42,7 +42,21 @@ impl W2mWriter {
             error_msg,
             ..Default::default()
         };
-        self.send_encoded(msg.size(), request_id as u32, |buf| {
+        self.send_msg(request_id, &msg);
+    }
+
+    /// Encode `msg` into one ring slot tagged `ring_req`. The master reactor
+    /// routes a reply by that ring prefix, not by the payload's `request_id`
+    /// (chunked-train frames leave that field 0). `encode_ipc` writes no
+    /// checksum: the ring is a trusted shared mapping, unlike the SAL.
+    pub fn send_msg(&self, ring_req: u64, msg: &WireMsg<'_>) {
+        self.send_msg_sized(ring_req, msg, msg.size());
+    }
+
+    /// [`Self::send_msg`] for a caller that already sized the message (to check
+    /// it against a frame cap); `sz` must be `msg.size()`.
+    pub fn send_msg_sized(&self, ring_req: u64, msg: &WireMsg<'_>, sz: usize) {
+        self.send_encoded(sz, ring_req as u32, |buf| {
             msg.encode_ipc(buf, 0);
         });
     }

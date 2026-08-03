@@ -655,6 +655,13 @@ impl SchemaDescriptor {
         self.payload_to_ci[pi] as usize
     }
 
+    /// True iff `cols` is a well-formed column list naming only columns of this
+    /// schema. The single admission test for a wire-carried `pack_pk_cols` word,
+    /// applied on both sides of the SAL before the list reaches the catalog.
+    pub(crate) fn cols_in_range(&self, cols: &gnitz_wire::PkColList) -> bool {
+        cols.is_well_formed() && cols.as_slice().iter().all(|&c| (c as usize) < self.num_columns())
+    }
+
     /// True iff `cols` is a permutation of `pk_indices()` (same set,
     /// any order). Used by reduce to detect `GROUP BY pk` even when the
     /// SQL lists PK columns in an order that differs from the schema's

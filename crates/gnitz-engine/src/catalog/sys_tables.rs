@@ -258,6 +258,75 @@ pub(super) fn read_idx_tab_row(batch: &Batch, i: usize) -> (i64, PkColList, bool
     )
 }
 
+/// The `(owner_id, packed_source_cols, col_indices)` of every UNIQUE index this
+/// IDX_TAB family creates — positive-weight rows whose column list is
+/// well-formed. The DDL driver pre-flights each one before the bundle is made
+/// durable; `packed` is the same word the unique-filter map is keyed by.
+pub(crate) fn idx_tab_unique_creates(batch: &Batch) -> Vec<(i64, u64, PkColList)> {
+    (0..batch.count)
+        .filter(|&i| batch.get_weight(i) > 0)
+        .filter_map(|i| {
+            let (owner_id, cols, is_unique) = read_idx_tab_row(batch, i);
+            let packed = batch.read_payload_u64(i, IDXTAB_PAY_SOURCE_COLS);
+            (is_unique && cols.is_well_formed()).then_some((owner_id, packed, cols))
+        })
+        .collect()
+}
+
+/// The `(owner_id, packed_source_cols)` of every index this IDX_TAB family drops
+/// — its negative-weight rows. The DDL driver clears each pair's unique filter
+/// once the drop is durable.
+pub(crate) fn idx_tab_drops(batch: &Batch) -> Vec<(i64, u64)> {
+    (0..batch.count)
+        .filter(|&i| batch.get_weight(i) < 0)
+        .map(|i| {
+            (
+                batch.read_payload_u64(i, IDXTAB_PAY_OWNER_ID) as i64,
+                batch.read_payload_u64(i, IDXTAB_PAY_SOURCE_COLS),
+            )
+        })
+        .collect()
+}
+
+/// The PKs this family creates (`positive`) or drops, EXCLUDING any PK carrying
+/// BOTH signs — a rewrite pair, e.g. a rename's `-1,+1`. A weight-homogeneous
+/// CREATE/DROP family has no such pair; a rename's paired PK is filtered from
+/// both answers, so a view rename triggers no backfill and a table rename's tid
+/// is never treated as dropped. Batch-local: the whole family (both signs of a
+/// pair) arrives as one batch on every path.
+pub(crate) fn family_pks_by_sign(batch: &Batch, positive: bool) -> Vec<i64> {
+    // One pass records which signs each PK carries; a PK with both is a rewrite.
+    let mut signs: rustc_hash::FxHashMap<i64, (bool, bool)> = rustc_hash::FxHashMap::default();
+    let mut order: Vec<i64> = Vec::new();
+    for i in 0..batch.count {
+        let w = batch.get_weight(i);
+        if w == 0 {
+            continue;
+        }
+        let pk = batch.get_pk(i) as i64;
+        let e = signs.entry(pk).or_insert_with(|| {
+            order.push(pk);
+            (false, false)
+        });
+        if w > 0 {
+            e.0 = true;
+        } else {
+            e.1 = true;
+        }
+    }
+    order
+        .into_iter()
+        .filter(|pk| {
+            let (pos, neg) = signs[pk];
+            if positive {
+                pos && !neg
+            } else {
+                neg && !pos
+            }
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Per-family row builders — the one writing of each family's payload layout,
 // shared by the fresh-DB bootstrap self-description and the test-only DDL

@@ -40,7 +40,7 @@ impl WorkerProcess {
         let schema = batch.schema;
         // During a backfill, stamp this chunk's pad bit onto the FLAG_EXCHANGE so
         // the master can AND it across workers and decide termination. Outside a
-        // backfill (backfill_pad == None) the field stays 0, exactly as before.
+        // backfill (backfill_pad == None) the field stays 0.
         let pad_bit = if self.exchange.backfill_pad == Some(true) {
             BACKFILL_PAD_BIT
         } else {
@@ -56,9 +56,7 @@ impl WorkerProcess {
             data: ipc::WireData::Whole(Some(batch)),
             ..Default::default()
         };
-        self.w2m_writer.send_encoded(msg.size(), tick_request_id as u32, |buf| {
-            msg.encode_ipc(buf, 0);
-        });
+        self.w2m_writer.send_msg(tick_request_id, &msg);
 
         let want_key = (view_id, source_id);
         let ctx = DispatchContext::InEval { relay_wait: want_key };

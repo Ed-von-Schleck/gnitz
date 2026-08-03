@@ -199,7 +199,9 @@ fn keyed_reads_over_a_replicated_table_find_every_key() {
     let pks: Vec<_> = (0..N)
         .map(|id| crate::schema::key::opk_key(&schema, &id.to_le_bytes()))
         .collect();
-    let gathered = e.gather_family_bytes(tid, &pks, &[1]).unwrap();
+    let gathered = e
+        .gather_family_bytes(tid, pks.iter().map(|p| p.pk_bytes()), &[1])
+        .unwrap();
     assert_eq!(gathered.count, N as usize, "every parent key must dereference");
 
     let mut got = run(

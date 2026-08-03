@@ -531,7 +531,7 @@ impl CatalogEngine {
                 raise_id_counter(&mut self.next_table_id, vid);
 
                 // Registration leaves the view EMPTY. Filling it is the runtime
-                // layer's: `backfill_views_in_depth_order` for a live CREATE,
+                // layer's: `backfill_views_in_dep_order` for a live CREATE,
                 // checkpoint resume or the master's invalid-view rebuild at boot
                 // (see runtime/bootstrap.rs). Filling here would double-count
                 // against all three.

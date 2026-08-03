@@ -580,7 +580,9 @@ fn pk_fold(batch: &Batch) -> FxHashMap<&[u8], PkFold> {
 }
 
 fn schema_of(disp: &MasterDispatcher, tid: i64) -> Result<SchemaDescriptor, String> {
-    unsafe { (*disp.catalog).get_schema_desc(tid) }.ok_or_else(|| format!("no schema for table {tid}"))
+    disp.cat()
+        .get_schema_desc(tid)
+        .ok_or_else(|| format!("no schema for table {tid}"))
 }
 
 /// The verb for the RESTRICT rejection on referenced value `v`: how the bundled
@@ -602,7 +604,7 @@ fn restrict_verb(retired: &FxHashMap<u128, RetireVerb>, v: u128) -> &'static str
 /// predicate panics on the missing entry rather than silently seeing an empty
 /// fold.
 fn reads_overlay(disp: &MasterDispatcher, tid: i64) -> bool {
-    let cat = unsafe { &*disp.catalog };
+    let cat = disp.cat();
     cat.has_any_unique_index(tid) || !cat.fk_children_of(tid).is_empty() || !cat.fk_constraints_of(tid).is_empty()
 }
 
@@ -777,10 +779,8 @@ impl MasterDispatcher {
     ) -> Result<(), String> {
         // No family whose write reads committed state ⇒ every rule below would
         // find nothing to check, so the bundle (an O(rows) fold) is not built.
-        let reads_committed = unsafe {
-            let cat = &*disp.catalog;
-            families.iter().any(|f| cat.push_reads_committed_state(f.tid, f.mode))
-        };
+        let cat = disp.cat();
+        let reads_committed = families.iter().any(|f| cat.push_reads_committed_state(f.tid, f.mode));
         if !reads_committed {
             return Ok(());
         }
@@ -812,7 +812,7 @@ impl MasterDispatcher {
             // Error family: `parent_retired_added` decides which touched PKs have
             // an old referenced value from exactly this answer, and without it
             // falls back to synthesising one for every touched PK.
-            let fk_parent = unsafe { !(*disp.catalog).fk_children_of(tid).is_empty() };
+            let fk_parent = !disp.cat().fk_children_of(tid).is_empty();
             if !error_mode && !fk_parent {
                 continue;
             }
@@ -914,10 +914,8 @@ impl MasterDispatcher {
         let mut plans: Vec<UniquePlan<'a>> = Vec::new();
         let mut checks: Vec<PipelinedCheck> = Vec::new();
         for &tid in &b.order {
-            let (n_circuits, has_unique) = unsafe {
-                let cat = &*disp.catalog;
-                (cat.get_index_circuit_count(tid), cat.has_any_unique_index(tid))
-            };
+            let cat = disp.cat();
+            let (n_circuits, has_unique) = (cat.get_index_circuit_count(tid), cat.has_any_unique_index(tid));
             if !has_unique {
                 continue;
             }
@@ -932,8 +930,8 @@ impl MasterDispatcher {
                 // One circuit lookup: its column list, index schema, and the
                 // span-encode plan baked at registration. Copied out so the
                 // catalog borrow ends before the `&mut` dispatcher calls below.
-                let (col_indices, idx_schema, spec) = unsafe {
-                    let ic = &(*disp.catalog).index_circuits(tid)[ci];
+                let (col_indices, idx_schema, spec) = {
+                    let ic = &disp.cat().index_circuits(tid)[ci];
                     if ic.unique_cols().is_none() {
                         continue;
                     }
@@ -1047,8 +1045,8 @@ impl MasterDispatcher {
         let mut constraints: Vec<FkEdge> = Vec::new();
         let mut children: Vec<FkEdge> = Vec::new();
         for &tid in &b.order {
-            unsafe {
-                let cat = &*disp.catalog;
+            {
+                let cat = disp.cat();
                 constraints.extend(cat.fk_constraints_of(tid).iter().map(|c| FkEdge {
                     child_tid: tid,
                     fk_col: c.fk_col_idx,
@@ -1154,7 +1152,9 @@ impl MasterDispatcher {
             let (probe_schema, col_hint, broadcast) = if ppk.len() == 1 && ppk[0] as usize == parent_col {
                 (parent_schema, 0u64, false)
             } else {
-                let idx_schema = unsafe { (*disp.catalog).get_index_schema_by_cols(parent_tid, &[parent_col as u32]) }
+                let idx_schema = disp
+                    .cat()
+                    .get_index_schema_by_cols(parent_tid, &[parent_col as u32])
                     .ok_or_else(|| format!("FK check: no unique index on parent {parent_tid} col {parent_col}"))?;
                 (idx_schema, gnitz_wire::pack_pk_cols(&[parent_col as u32]), true)
             };
@@ -1221,7 +1221,9 @@ impl MasterDispatcher {
             if v_check.is_empty() {
                 continue;
             }
-            let idx_schema = unsafe { (*disp.catalog).get_index_schema_by_cols(child_tid, &[fk_col as u32]) }
+            let idx_schema = disp
+                .cat()
+                .get_index_schema_by_cols(child_tid, &[fk_col as u32])
                 .ok_or_else(|| format!("FK RESTRICT: no index on child {child_tid} col {fk_col}"))?;
             let src_type = b.schema(parent_tid).columns[parent_col].type_code;
             let col_hint = gnitz_wire::pack_pk_cols(&[fk_col as u32]);
@@ -1434,8 +1436,8 @@ impl MasterDispatcher {
         owner_id: i64,
         col_indices: &[u32],
     ) -> Result<(FxHashSet<PkBuf>, bool), String> {
-        let (idx_schema, packed) = unsafe {
-            let cat = &mut *disp.catalog;
+        let (idx_schema, packed) = {
+            let cat = disp.cat();
             let owner_schema = match cat.get_schema_desc(owner_id) {
                 Some(s) => s,
                 None => return Ok((FxHashSet::default(), false)),
@@ -1509,24 +1511,25 @@ impl MasterDispatcher {
     /// source of truth for their text and for the table/column name lookups.
     /// `col_indices` is an index's full column list (composite-aware).
     fn unique_violation_err(&self, target_id: i64, col_indices: &[u32], in_batch: bool) -> String {
-        unsafe { (*self.catalog).unique_violation_err(target_id, col_indices, in_batch) }
+        self.cat().unique_violation_err(target_id, col_indices, in_batch)
     }
 
     fn unique_create_dup_err(&self, owner_id: i64, col_indices: &[u32]) -> String {
-        unsafe { (*self.catalog).unique_create_dup_err(owner_id, col_indices) }
+        self.cat().unique_create_dup_err(owner_id, col_indices)
     }
 
     /// `key_str` is the already-rendered offending key (narrow or wide).
     fn pk_violation_err(&self, target_id: i64, schema: &SchemaDescriptor, key_str: &str, in_batch: bool) -> String {
-        unsafe { (*self.catalog).pk_violation_err(target_id, schema.pk_indices(), key_str, in_batch) }
+        self.cat()
+            .pk_violation_err(target_id, schema.pk_indices(), key_str, in_batch)
     }
 
     fn fk_missing_err(&self, child_tid: i64, parent_tid: i64) -> String {
-        unsafe { (*self.catalog).fk_missing_err(child_tid, parent_tid) }
+        self.cat().fk_missing_err(child_tid, parent_tid)
     }
 
     fn fk_restrict_err(&self, parent_tid: i64, child_tid: i64, verb: &str) -> String {
-        unsafe { (*self.catalog).fk_restrict_err(parent_tid, child_tid, verb) }
+        self.cat().fk_restrict_err(parent_tid, child_tid, verb)
     }
 }
 
@@ -1539,10 +1542,9 @@ impl MasterDispatcher {
     /// probe per table, one per unique secondary index). Issuing them
     /// sequentially would cost N master↔worker round trips; this writes the
     /// whole burst into SAL, signals once, then collects N responses per worker
-    /// in a single poll loop — cursor position on the W2M ring correlates each
-    /// response with its originating check, so no explicit correlation ID is
-    /// needed. Each rule therefore plans every probe it needs before issuing
-    /// any.
+    /// in a single poll loop, correlating each by the per-(check, worker)
+    /// request id it was issued under. Each rule therefore plans every probe it
+    /// needs before issuing any.
     ///
     /// `sal_excl` is held only for the synchronous write + signal phase;
     /// see `dispatch_scan_fanout` for the rationale.
@@ -1559,7 +1561,7 @@ impl MasterDispatcher {
 
         let (nw, all_req_ids): (usize, Vec<u64>) = {
             let _guard = sal_excl.lock().await;
-            let nw = disp.num_workers;
+            let nw = disp.num_workers();
             let mut rids: Vec<u64> = Vec::with_capacity(num_checks * nw);
             for _ in 0..(num_checks * nw) {
                 rids.push(reactor.alloc_request_id());
@@ -1602,7 +1604,13 @@ impl MasterDispatcher {
         let decoded_vec: Vec<DecodedWire> =
             crate::runtime::reactor::join_all_unpin(all_req_ids.iter().map(|&id| reactor.await_reply(id))).await;
 
-        if let Some(err) = first_worker_error("pipeline", &decoded_vec) {
+        // Replies are laid out check-major, so the worker index is the position
+        // within each check's block of `nw`.
+        if let Some(err) = decoded_vec
+            .iter()
+            .enumerate()
+            .find_map(|(i, d)| worker_error(i % nw, "pipeline", &d.control))
+        {
             return Err(err);
         }
         // Each set holds only the probe keys that turned out to exist committed
@@ -1664,11 +1672,10 @@ impl MasterDispatcher {
         pks.sort_unstable();
         let col_mask = pack_gather_cols(project).ok_or("gather: more than 8 projected columns")?;
 
-        let parent_schema = unsafe {
-            (&*disp.catalog)
-                .get_schema_desc(target_id)
-                .ok_or_else(|| format!("gather: no schema for table {target_id}"))?
-        };
+        let parent_schema = disp
+            .cat()
+            .get_schema_desc(target_id)
+            .ok_or_else(|| format!("gather: no schema for table {target_id}"))?;
         // The exact constructor the worker uses for its reply schema, so a
         // matching reply validates by construction.
         let expected = crate::schema::project_schema(&parent_schema, project);
@@ -1727,16 +1734,9 @@ impl MasterDispatcher {
 
 #[cfg(test)]
 mod tests {
+    use super::super::fixtures::compound_pk_bytes;
     use super::*;
     use crate::schema::{type_code, SchemaColumn};
-
-    fn compound_pk_bytes(parts: &[&[u8]]) -> PkBuf {
-        let mut v = Vec::new();
-        for p in parts {
-            v.extend_from_slice(p);
-        }
-        PkBuf::from_bytes(&v)
-    }
 
     #[test]
     fn check_batch_64_payload_cols_full_null_word() {
