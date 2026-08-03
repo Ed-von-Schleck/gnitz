@@ -739,8 +739,8 @@ pub struct SalWriter {
     ptr: *mut u8,
     fd: i32,
     mmap_size: u64,
-    write_cursor: u64,
-    epoch: u32,
+    write_cursor: std::cell::Cell<u64>,
+    epoch: std::cell::Cell<u32>,
     checkpoint_threshold: u64,
     m2w_efds: Vec<i32>,
 }
@@ -754,8 +754,8 @@ impl SalWriter {
             ptr,
             fd,
             mmap_size,
-            write_cursor: 0,
-            epoch: 0,
+            write_cursor: std::cell::Cell::new(0),
+            epoch: std::cell::Cell::new(0),
             checkpoint_threshold,
             m2w_efds,
         }
@@ -784,21 +784,21 @@ impl SalWriter {
         unsafe {
             sal_begin_group(
                 self.ptr,
-                self.write_cursor as usize,
+                self.write_cursor.get() as usize,
                 self.mmap_size as usize,
                 target_id,
                 lsn,
                 sal_flags,
-                self.epoch,
+                self.epoch.get(),
                 worker_sizes,
             )
         }
-        .ok_or_else(|| format!("SAL {what} failed (cursor={})", self.write_cursor))
+        .ok_or_else(|| format!("SAL {what} failed (cursor={})", self.write_cursor.get()))
     }
 
     /// Publish `group` and advance the write cursor past it.
-    fn finish(&mut self, group: SalGroup) {
-        self.write_cursor = unsafe { group.commit() };
+    fn finish(&self, group: SalGroup) {
+        self.write_cursor.set(unsafe { group.commit() });
     }
 
     /// Encode per-worker wire data directly into SAL mmap. Does NOT sync/signal.
@@ -817,7 +817,7 @@ impl SalWriter {
     /// back to 0 and the master's `ReplyFuture` would never resolve.
     #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     pub fn write_group_direct(
-        &mut self,
+        &self,
         target_id: u32,
         lsn: u64,
         sal_flags: u32,
@@ -959,7 +959,7 @@ impl SalWriter {
     /// inline. `wire_row_fixed_stride` is only meaningful when `wire_safe`.
     #[allow(clippy::too_many_arguments)]
     pub fn scatter_wire_group(
-        &mut self,
+        &self,
         input_batch: &Batch,
         worker_indices: &[Vec<u32>],
         schema: &SchemaDescriptor,
@@ -1093,7 +1093,7 @@ impl SalWriter {
     /// whose worker arm takes neither a schema nor a batch.
     #[allow(clippy::too_many_arguments)]
     pub fn write_broadcast_direct(
-        &mut self,
+        &self,
         target_id: u32,
         lsn: u64,
         sal_flags: u32,
@@ -1162,7 +1162,7 @@ impl SalWriter {
     /// this LSN are skipped. Every worker still sees it (the flags live in the
     /// group header, which is not per-slot) and it is inert under the worker's hot
     /// path: the FLAG_DDL_SYNC branch no-ops on a group with no batch.
-    pub fn write_commit_sentinel(&mut self, lsn: u64) -> Result<(), String> {
+    pub fn write_commit_sentinel(&self, lsn: u64) -> Result<(), String> {
         let group = self.begin("write_commit_sentinel", 0, lsn, FLAG_DDL_SYNC | FLAG_TXN_COMMIT, &[])?;
         self.finish(group);
         Ok(())
@@ -1179,12 +1179,12 @@ impl SalWriter {
     }
 
     pub fn needs_checkpoint(&self) -> bool {
-        self.write_cursor >= self.checkpoint_threshold
+        self.write_cursor.get() >= self.checkpoint_threshold
     }
 
-    pub fn checkpoint_reset(&mut self) {
-        self.epoch += 1;
-        self.write_cursor = 0;
+    pub fn checkpoint_reset(&self) {
+        self.epoch.set(self.epoch.get() + 1);
+        self.write_cursor.set(0);
         unsafe {
             atomic_store_u64(self.ptr, 0);
         }
@@ -1195,25 +1195,25 @@ impl SalWriter {
     /// to cursor 0, epoch 1 — the first live epoch; epoch 0 is the empty-slot
     /// sentinel prefix. The mmap-prefix store lives here, next to
     /// `checkpoint_reset`, so the SAL slot layout never leaks to callers.
-    pub fn boot_reset(&mut self) {
-        self.write_cursor = 0;
-        self.epoch = 1;
+    pub fn boot_reset(&self) {
+        self.write_cursor.set(0);
+        self.epoch.set(1);
         unsafe {
             atomic_store_u64(self.ptr, 0);
         }
     }
 
     #[cfg(test)]
-    pub fn reset(&mut self, cursor: u64, epoch: u32) {
-        self.write_cursor = cursor;
-        self.epoch = epoch;
+    pub fn reset(&self, cursor: u64, epoch: u32) {
+        self.write_cursor.set(cursor);
+        self.epoch.set(epoch);
     }
 
     pub fn cursor(&self) -> u64 {
-        self.write_cursor
+        self.write_cursor.get()
     }
     pub fn epoch(&self) -> u32 {
-        self.epoch
+        self.epoch.get()
     }
     pub fn mmap_size(&self) -> u64 {
         self.mmap_size

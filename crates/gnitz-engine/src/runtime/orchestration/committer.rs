@@ -111,7 +111,7 @@ struct PendingPush {
 /// Shared state between the committer task and the executor.
 pub struct Shared {
     pub reactor: Rc<Reactor>,
-    pub disp_ptr: *mut MasterDispatcher,
+    pub disp: Rc<MasterDispatcher>,
     pub sal_fd: i32,
     /// SAL-writer exclusivity (III.3b). The committer holds this for
     /// the entire checkpoint + commit emission window so a concurrent
@@ -139,9 +139,8 @@ pub struct Shared {
 }
 
 impl Shared {
-    #[allow(clippy::mut_from_ref)]
-    fn disp(&self) -> &mut MasterDispatcher {
-        unsafe { &mut *self.disp_ptr }
+    fn disp(&self) -> &MasterDispatcher {
+        &self.disp
     }
 }
 

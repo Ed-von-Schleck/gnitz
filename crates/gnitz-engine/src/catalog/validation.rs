@@ -148,11 +148,7 @@ impl CatalogEngine {
                         .seek_first_positive_with_prefix(opk.padded(ks))
                 };
                 if !found {
-                    let (sn, tn) = self.caches.entity_by_id.get(&table_id).cloned().unwrap_or_default();
-                    let (tsn, ttn) = self.caches.entity_by_id.get(&target_id).cloned().unwrap_or_default();
-                    return Err(format!(
-                        "Foreign Key violation in '{sn}.{tn}': value not found in target '{tsn}.{ttn}'"
-                    ));
+                    return Err(self.fk_missing_err(table_id, target_id));
                 }
             }
         }

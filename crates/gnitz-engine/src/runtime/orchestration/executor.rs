@@ -35,7 +35,7 @@ use crate::query::RelationKind;
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingTxn};
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{
-    dispatch_scan_multi_fanout, first_worker_error_opt, replicated_unicast, scan_spec_route, MasterDispatcher,
+    dispatch_scan_multi_fanout, first_worker_error_opt, replicated_unicast, scan_spec_route, Fanout, MasterDispatcher,
     TxnFamily,
 };
 use crate::runtime::peer::Peer;
@@ -43,7 +43,7 @@ use crate::runtime::reactor::{
     join_into, mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either, FsyncFuture, PendingRelay, Reactor, ReadGuard,
     ReplyFuture, WriteGuard,
 };
-use crate::runtime::sal::BACKFILL_DECISION_CONTINUE;
+use crate::runtime::sal::{BACKFILL_DECISION_CONTINUE, FLAG_SCAN_SPEC};
 use crate::runtime::wire::{
     self as ipc, SchemaWithVersion, FLAG_GET_INDICES, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
 };
@@ -151,7 +151,7 @@ async fn await_barrier(shared: &Shared, kind: BarrierKind) {
 pub struct Shared {
     pub reactor: Rc<Reactor>,
     catalog: *mut CatalogEngine,
-    dispatcher: *mut MasterDispatcher,
+    dispatcher: Rc<MasterDispatcher>,
     sal_fd: i32,
     committer_tx: mpsc::Sender<CommitRequest>,
     catalog_rwlock: Rc<AsyncRwLock>,
@@ -212,9 +212,8 @@ impl Shared {
     fn cat(&self) -> &mut CatalogEngine {
         unsafe { &mut *self.catalog }
     }
-    #[allow(clippy::mut_from_ref)]
-    fn disp(&self) -> &mut MasterDispatcher {
-        unsafe { &mut *self.dispatcher }
+    fn disp(&self) -> &MasterDispatcher {
+        &self.dispatcher
     }
 
     fn get_schema_desc(&self, target_id: i64) -> SchemaDescriptor {
@@ -333,7 +332,7 @@ impl ServerExecutor {
     /// global live-connection cap.
     pub fn run(
         catalog: *mut CatalogEngine,
-        dispatcher: *mut MasterDispatcher,
+        dispatcher: Rc<MasterDispatcher>,
         server_fd: i32,
         tls: Option<TlsListener>,
     ) -> i32 {
@@ -344,14 +343,13 @@ impl ServerExecutor {
                 return 1;
             }
         };
-        let sal_fd = unsafe { &*dispatcher }.sal_fd();
-        let num_workers = unsafe { &*dispatcher }.num_workers();
+        let sal_fd = dispatcher.sal_fd();
+        let num_workers = dispatcher.num_workers();
 
-        reactor.attach_w2m(unsafe { &mut *dispatcher }.take_w2m());
+        reactor.attach_w2m(dispatcher.w2m_receiver());
         // After handoff, point the dispatcher at the reactor-owned receiver so
         // the reactor-parked CREATE-VIEW backfill can drive a synchronous
         // collect (the reactor's `OnceCell` slot is stable for its lifetime).
-        unsafe { &mut *dispatcher }.set_w2m_receiver_ptr(reactor.w2m_receiver());
         reactor.attach_listener(server_fd);
         if let Some(tl) = &tls {
             reactor.attach_listener(tl.fd);
@@ -389,7 +387,7 @@ impl ServerExecutor {
 
         let committer_shared = Rc::new(committer::Shared {
             reactor: Rc::clone(&reactor),
-            disp_ptr: dispatcher,
+            disp: Rc::clone(&dispatcher),
             sal_fd,
             sal_writer_excl: Rc::clone(&sal_writer_excl),
             lsn_alloc: Rc::clone(&lsn_alloc),
@@ -720,7 +718,7 @@ async fn watchdog(shared: Rc<Shared>) {
 /// trigger only fails that trigger, not the loop. SAL emission is
 /// further guarded by `guard_panic` inside `run_tick`.
 async fn tick_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>) {
-    let nw = unsafe { (*shared.dispatcher).num_workers() };
+    let nw = shared.disp().num_workers();
     let mut fut_slots: Vec<ReplyFuture> = Vec::with_capacity(nw);
     let mut ack_slots: Vec<Option<ipc::DecodedWire>> = Vec::with_capacity(nw);
     let mut req_ids: Vec<u64> = Vec::with_capacity(nw);
@@ -849,8 +847,8 @@ async fn run_tick(
     // are also correct on `guard_panic`'s panic arm, which discards the closure's
     // return value.
     let emitted = Cell::new(0usize);
-    let emit = guard_panic("tick", || unsafe {
-        let disp = &mut *shared.dispatcher;
+    let emit = guard_panic("tick", || {
+        let disp = shared.disp();
         let mut result = Ok(());
         for (i, &tid) in tids.iter().enumerate() {
             if let Err(e) = disp.write_tick_group(tid, &req_ids[i * nw..(i + 1) * nw]) {
@@ -952,7 +950,7 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
         // Phase 1: CPU work + catalog read only — no SAL mutex.
         let prep = {
             let _cat = shared.catalog_rwlock.read().await;
-            match guard_panic("prepare_relay", || unsafe { (*shared.dispatcher).prepare_relay(relay) }) {
+            match guard_panic("prepare_relay", || shared.disp().prepare_relay(relay)) {
                 Ok(p) => p,
                 Err(e) => gnitz_fatal_abort!("prepare_relay failed: {}", e),
             }
@@ -968,13 +966,13 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
         loop {
             {
                 let _sal = shared.sal_writer_excl.lock().await;
-                if unsafe { (*shared.dispatcher).sal_has_relay_space_arming() } {
+                if shared.disp().sal_has_relay_space_arming() {
                     // Always CONTINUE: only steady-state tick exchanges reach this
                     // loop (both chunked-backfill drivers collect their relays
                     // synchronously in `collect_acks_and_relay`, the sole
                     // STOP/CHECKPOINT stamper), and a tick round never pads.
-                    if let Err(e) = guard_panic("emit_relay", || unsafe {
-                        (*shared.dispatcher).emit_relay_with_decision(
+                    if let Err(e) = guard_panic("emit_relay", || {
+                        (*shared.disp()).emit_relay_with_decision(
                             prep.take().expect("relay emitted once"),
                             BACKFILL_DECISION_CONTINUE,
                         )
@@ -1281,7 +1279,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
             batch,
         }];
         if let Err(e) = MasterDispatcher::validate_txn_distributed(
-            shared.dispatcher,
+            shared.disp(),
             &shared.reactor,
             &shared.sal_writer_excl,
             &families,
@@ -1364,7 +1362,7 @@ async fn serve_seek(
         }
     } else {
         match MasterDispatcher::fan_out_seek(
-            shared.dispatcher,
+            shared.disp(),
             &shared.reactor,
             &shared.sal_writer_excl,
             target_id,
@@ -1501,7 +1499,7 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
     }
 
     // 4. Distributed bundle validation (the four rules).
-    MasterDispatcher::validate_txn_distributed(shared.dispatcher, &shared.reactor, &shared.sal_writer_excl, &families)
+    MasterDispatcher::validate_txn_distributed(shared.disp(), &shared.reactor, &shared.sal_writer_excl, &families)
         .await?;
 
     // 5. Drain check immediately before the committer send. INVARIANT: there must
@@ -1631,7 +1629,7 @@ async fn handle_seek_by_index(
         // Forward the wire frame verbatim (packed seek_col_idx, seek_pk +
         // seek_pk_extra) to the broadcast-and-merge fan-out.
         match MasterDispatcher::fan_out_seek_by_index_collect(
-            shared.dispatcher,
+            shared.disp(),
             &shared.reactor,
             &shared.sal_writer_excl,
             target_id,
@@ -1875,16 +1873,20 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id
     // `0` (worker-0 unicast) for a replicated relation — its full copy lives on
     // every worker, so a broadcast would concatenate W identical copies — else
     // `-1` (broadcast).
-    let unicast = replicated_unicast(shared.dispatcher, target_id);
+    let unicast = replicated_unicast(shared.disp(), target_id);
+    // Embed the client's schema version in wire_flags so workers can decide
+    // whether to include the schema block in their response.
     let result = MasterDispatcher::fan_out_scan(
-        shared.dispatcher,
+        shared.disp(),
         &shared.reactor,
         &shared.sal_writer_excl,
         unicast,
         target_id,
         client_id,
         peer,
-        effective_client_version,
+        0,
+        gnitz_wire::wire_flags_set_schema_version(0, effective_client_version),
+        &[],
     )
     .await;
     finish_scan_fanout(peer, target_id, client_id, lsn, result).await;
@@ -1932,15 +1934,17 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, targ
     // A PK range confined to one partition unicasts: one SAL slot instead of W,
     // each of which would carry its own copy of the spec blob under the exclusive
     // SAL mutex.
-    let unicast = scan_spec_route(shared.dispatcher, target_id, seek_pk_extra);
-    let result = MasterDispatcher::fan_out_scan_spec(
-        shared.dispatcher,
+    let unicast = scan_spec_route(shared.disp(), target_id, seek_pk_extra);
+    let result = MasterDispatcher::fan_out_scan(
+        shared.disp(),
         &shared.reactor,
         &shared.sal_writer_excl,
         unicast,
         target_id,
         client_id,
         peer,
+        FLAG_SCAN_SPEC,
+        0,
         seek_pk_extra,
     )
     .await;
@@ -2014,7 +2018,7 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
     let (dispatches, plans) = {
         let _cat = shared.catalog_rwlock.read().await;
         let mut plans: Vec<ScanMultiRelPlan> = Vec::with_capacity(relations.len());
-        let mut fanout: Vec<(i64, i32, u16)> = Vec::with_capacity(relations.len());
+        let mut fanout: Vec<(i64, Fanout, u16)> = Vec::with_capacity(relations.len());
         for &(tid_u, client_ver) in &relations {
             let tid = tid_u as i64;
             // Base tables AND views are legal; a catalog family stays on the
@@ -2026,7 +2030,7 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
             }
             // `0` (worker-0 unicast) for a replicated relation, `-1` (broadcast)
             // otherwise — the same policy `handle_scan` applies per relation.
-            let unicast = replicated_unicast(shared.dispatcher, tid);
+            let unicast = replicated_unicast(shared.disp(), tid);
             // Capture (not emit) each relation's preliminary schema frame here so
             // Phase 2 can send it after the one-cut dispatch, in request order.
             let (prelim, effective_client_version) = negotiate_scan_schema(shared, tid, client_ver);
@@ -2034,7 +2038,7 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
             fanout.push((tid, unicast, effective_client_version));
         }
         let dispatches = dispatch_scan_multi_fanout(
-            shared.dispatcher,
+            shared.disp(),
             &shared.reactor,
             &shared.sal_writer_excl,
             client_id,
@@ -2268,7 +2272,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
                     continue;
                 }
                 match MasterDispatcher::validate_unique_index_create(
-                    shared.dispatcher,
+                    shared.disp(),
                     &shared.reactor,
                     &shared.sal_writer_excl,
                     owner_id,
@@ -2400,16 +2404,16 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
 
     // Invalidate unique-filter state for durably-dropped tables/indices so a
     // recreated table with the same ID does not inherit stale filter entries.
-    let disp_ptr_raw = shared.dispatcher;
+    let disp_ptr_raw = shared.disp();
     for &tid in &dropped_tids {
-        unsafe {
+        {
             (*disp_ptr_raw).unique_filter_invalidate_table(tid);
         }
     }
     for &(owner_id, packed) in &dropped_indices {
         // Keying by the whole packed list means dropping `(a, b)` never clears a
         // distinct single-column filter on `a`.
-        unsafe {
+        {
             (*disp_ptr_raw).unique_filter_remove(owner_id, packed);
         }
     }
@@ -2419,7 +2423,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
     // broadcast/fsync failure aborts the process before this point, so no filter
     // is published for an index that never committed.
     for (owner_id, packed, seen, capped) in filter_seeds {
-        unsafe {
+        {
             (*disp_ptr_raw).unique_filter_seed(owner_id, packed, seen, capped);
         }
     }
@@ -2570,7 +2574,7 @@ fn push_target_error(shared: &Shared, target_id: i64) -> Option<String> {
 /// mutation and would permanently diverge master/worker state — unrecoverable,
 /// so abort.
 fn emit_zone_to_sal(shared: &Shared, op: &'static str, drained: &[(i64, Batch)], zone_lsn: u64) -> FsyncFuture {
-    let disp = shared.dispatcher;
+    let disp = shared.disp();
     if let Err(e) = guard_panic(op, || unsafe {
         for (tid, bat) in drained {
             (*disp).broadcast_ddl(*tid, bat, zone_lsn)?;

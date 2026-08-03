@@ -375,7 +375,7 @@ fn test_commit_sentinel_round_trip() {
         let efd1 = posix_io::eventfd_create();
         let efd2 = posix_io::eventfd_create();
         assert!(efd1 >= 0 && efd2 >= 0);
-        let mut writer = SalWriter::new(ptr, -1, size as u64, vec![efd1, efd2]);
+        let writer = SalWriter::new(ptr, -1, size as u64, vec![efd1, efd2]);
         writer.reset(c2, 1);
         writer.write_commit_sentinel(7).unwrap();
 
@@ -418,7 +418,7 @@ fn test_commit_sentinel_zero_payload() {
         let efd3 = posix_io::eventfd_create();
         let efd4 = posix_io::eventfd_create();
         assert!(efd1 >= 0 && efd2 >= 0 && efd3 >= 0 && efd4 >= 0);
-        let mut writer = SalWriter::new(ptr, -1, size as u64, vec![efd1, efd2, efd3, efd4]);
+        let writer = SalWriter::new(ptr, -1, size as u64, vec![efd1, efd2, efd3, efd4]);
         writer.reset(0, 1);
         writer.write_commit_sentinel(123).unwrap();
 
@@ -460,7 +460,7 @@ fn test_batched_push_shares_zone_lsn() {
 
         // Closing sentinel.
         let efds: Vec<i32> = (0..nw).map(|_| posix_io::eventfd_create()).collect();
-        let mut writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
+        let writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
         writer.reset(c2, 1);
         writer.write_commit_sentinel(zone_lsn).unwrap();
 
@@ -528,7 +528,7 @@ fn test_zone_two_groups_one_sentinel() {
         for &e in &efds {
             assert!(e >= 0);
         }
-        let mut writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
+        let writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
         writer.reset(c2, 1);
         writer.write_commit_sentinel(zone_lsn).unwrap();
 
@@ -730,7 +730,7 @@ unsafe fn assert_footprint_exact(
     let region = SharedRegion::new(size);
     let ptr = region.ptr();
     let efds: Vec<i32> = (0..nw).map(|_| posix_io::eventfd_create()).collect();
-    let mut writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
+    let writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
     writer.reset(0, 1); // epoch >= 1 for sal_begin_group's debug_assert
 
     let target_id = 16u32;

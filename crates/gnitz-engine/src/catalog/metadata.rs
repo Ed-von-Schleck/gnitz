@@ -271,4 +271,42 @@ impl CatalogEngine {
         let (sn, tn, col) = self.qualified_col_names(table_id, col_indices);
         format!("cannot create unique index on '{sn}.{tn}' column '{col}': column contains duplicate values")
     }
+
+    /// Format the PK-uniqueness rejection, PG-style. `key_str` is the
+    /// already-rendered offending key. `in_batch` distinguishes two rows of one
+    /// ingest batch sharing a PK from a collision with committed data.
+    pub(crate) fn pk_violation_err(
+        &mut self,
+        table_id: i64,
+        pk_indices: &[u32],
+        key_str: &str,
+        in_batch: bool,
+    ) -> String {
+        let (sn, tn, cols) = self.qualified_col_names(table_id, pk_indices);
+        let what = if in_batch {
+            format!("Batch contains multiple rows with key ({cols})=({key_str})")
+        } else {
+            format!("Key ({cols})=({key_str}) already exists")
+        };
+        format!("duplicate key value violates unique constraint \"{sn}_{tn}_pkey\": {what}")
+    }
+
+    /// Format "an inserted child row references a value the parent does not
+    /// hold". Shared by the inline DDL-time check and the distributed pre-flight.
+    pub(crate) fn fk_missing_err(&self, child_tid: i64, parent_tid: i64) -> String {
+        let (sn, tn) = self.get_qualified_name(child_tid).unwrap_or(("?", "?"));
+        let (sn, tn) = (sn.to_string(), tn.to_string());
+        let (tsn, ttn) = self.get_qualified_name(parent_tid).unwrap_or(("?", "?"));
+        format!("Foreign Key violation in '{sn}.{tn}': value not found in target '{tsn}.{ttn}'")
+    }
+
+    /// Format "a row a child still references cannot be removed". `verb` names
+    /// what the parent write was doing: `"delete from"` when the row goes away,
+    /// `"update"` when the referenced value changes under it.
+    pub(crate) fn fk_restrict_err(&self, parent_tid: i64, child_tid: i64, verb: &str) -> String {
+        let (sn, tn) = self.get_qualified_name(parent_tid).unwrap_or(("?", "?"));
+        let (sn, tn) = (sn.to_string(), tn.to_string());
+        let (csn, ctn) = self.get_qualified_name(child_tid).unwrap_or(("?", "?"));
+        format!("Foreign Key violation: cannot {verb} '{sn}.{tn}', row still referenced by '{csn}.{ctn}'")
+    }
 }

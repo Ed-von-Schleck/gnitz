@@ -349,7 +349,7 @@ fn worker_boot_recovery(
 /// extended state-exactly (single-source-per-epoch reduces the whole-tail drive to
 /// a live batched push); invalid views are harmlessly polluted and reset+rebuilt in
 /// step-4. The transitive verdict guarantees no valid view reads an invalid one.
-fn recovery_tick_sweep(catalog: &mut CatalogEngine, dispatcher: &mut MasterDispatcher) -> Result<(), String> {
+fn recovery_tick_sweep(catalog: &mut CatalogEngine, dispatcher: &MasterDispatcher) -> Result<(), String> {
     for src in swept_base_tables(catalog) {
         dispatcher.drain_tick_blocking(src)?;
     }
@@ -362,7 +362,7 @@ fn recovery_tick_sweep(catalog: &mut CatalogEngine, dispatcher: &mut MasterDispa
 /// (gated on its COW-inherited `invalid_views` set), then fills. The driver is
 /// view-scoped, so a resumed sibling's loaded shards are never re-derived and
 /// double-counted.
-fn rebuild_invalid_views(catalog: &mut CatalogEngine, dispatcher: &mut MasterDispatcher) -> Result<(), String> {
+fn rebuild_invalid_views(catalog: &mut CatalogEngine, dispatcher: &MasterDispatcher) -> Result<(), String> {
     let invalid: Vec<i64> = catalog.invalid_views.iter().copied().collect();
     // Resume-vs-rebuild marker (asserted by the "no backfill on clean restart"
     // E2E): 0 ⇒ every view resumed from its checkpoint.
@@ -734,13 +734,13 @@ fn run_server(
     catalog.set_active_partitions(0, 0);
 
     let sal_writer = SalWriter::new(ipc.sal_ptr, ipc.sal_fd, sal_mmap_size() as u64, ipc.m2w_efds.clone());
-    let w2m_receiver = W2mReceiver::new(ipc.w2m_ptrs.clone());
+    let w2m_receiver = std::rc::Rc::new(W2mReceiver::new(ipc.w2m_ptrs.clone()));
 
     let dispatcher = MasterDispatcher::new(nw, worker_pids.clone(), catalog_ptr, sal_writer, w2m_receiver);
-    let dispatcher_ptr = Box::into_raw(Box::new(dispatcher));
+    let dispatcher_rc = std::rc::Rc::new(dispatcher);
 
     // Wait for all workers to complete recovery and signal readiness
-    let dispatcher = unsafe { &mut *dispatcher_ptr };
+    let dispatcher = &*dispatcher_rc;
     dispatcher
         .collect_acks()
         .map_err(|e| format!("Error collecting worker acks: {e}"))?;
@@ -788,7 +788,12 @@ fn run_server(
     };
     boot_log("GnitzDB ready\n");
 
-    Ok(ServerExecutor::run(catalog_ptr, dispatcher_ptr, server_fd, tls_init))
+    Ok(ServerExecutor::run(
+        catalog_ptr,
+        std::rc::Rc::clone(&dispatcher_rc),
+        server_fd,
+        tls_init,
+    ))
 }
 
 /// Build the rustls server config (minting + persisting the public dev cert
@@ -894,7 +899,7 @@ mod recovery_tests {
             cur = write_ddl_group(ptr, cur, nw, 102, 6, 1, size as u64);
             // Sentinel for lsn=6.
             let efds: Vec<i32> = (0..nw).map(|_| posix_io::eventfd_create()).collect();
-            let mut writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
+            let writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
             writer.reset(cur, 1);
             writer.write_commit_sentinel(6).unwrap();
 
@@ -925,7 +930,7 @@ mod recovery_tests {
             cur = write_ddl_group(ptr, cur, nw, 202, 9, 1, size as u64);
 
             let efds: Vec<i32> = (0..nw).map(|_| posix_io::eventfd_create()).collect();
-            let mut writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
+            let writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
             writer.reset(cur, 1);
             writer.write_commit_sentinel(9).unwrap();
 

@@ -299,16 +299,14 @@ struct ReactorShared {
     /// set is non-empty (spawned on the 0→1 transition) and drains it,
     /// re-arming every listed listener.
     accept_rearm_pending: RefCell<FxHashSet<i32>>,
-    /// SAFETY INVARIANT: `w2m` MUST be the LAST declared field. A `W2mSlot`
-    /// holds a raw `*mut InFlightState` into this `W2mReceiver`, and its `Drop`
-    /// calls `release()` through that pointer. Slots outlive their originating
-    /// stack frame in two places that drop LATER than most fields —
-    /// `scan_parked` (parked continuation frames) and `send_buffers_in_flight`
-    /// (a `SendAlive::Slot` keep-alive orphaned when its `SendFuture` is dropped
-    /// pre-CQE). Declaring `w2m` last guarantees the `W2mReceiver` outlives every
-    /// slot holder, so every teardown `release()` writes into live memory.
-    /// Moving `w2m` above any slot holder is a use-after-free at shutdown.
-    w2m: OnceCell<W2mReceiver>,
+    /// A `W2mSlot` holds a raw `*mut InFlightState` into this `W2mReceiver` and
+    /// calls `release()` through it on drop. Slots outlive their originating
+    /// stack frame in `scan_parked` (parked continuation frames) and
+    /// `send_buffers_in_flight` (a `SendAlive::Slot` keep-alive orphaned when its
+    /// `SendFuture` is dropped pre-CQE), so the receiver must outlive both. The
+    /// `MasterDispatcher` holds the other `Rc` and outlives the reactor, which
+    /// keeps the allocation alive here regardless of field order.
+    w2m: OnceCell<Rc<W2mReceiver>>,
 }
 
 /// Shared, clonable handle to the reactor. All futures created by the
@@ -454,16 +452,6 @@ impl Reactor {
         *self.inner.relay_tx.borrow_mut() = Some(tx);
     }
 
-    /// Borrow the attached `W2mReceiver`. Valid only after `attach_w2m`.
-    /// The cursors live in shared memory and every receiver method takes
-    /// `&self`, so this shared borrow is the same access shape the reactor's
-    /// own drain uses. The reactor-parked CREATE-VIEW backfill borrows it to
-    /// drive a synchronous collect while the reactor (the only other reader)
-    /// is parked deep in that same call — sole accessor for the window.
-    pub fn w2m_receiver(&self) -> &W2mReceiver {
-        self.inner.w2m.get().expect("w2m_receiver called before attach_w2m")
-    }
-
     /// Request reactor shutdown — the next `block_until_shutdown` tick
     /// exits cleanly. Also cancels the outstanding `FUTEX_WAITV` SQE
     /// (if any) so its `FutexWaitV` array storage can be dropped
@@ -597,7 +585,7 @@ impl Reactor {
     /// reactor drains all rings (the wake index is not authoritative
     /// for FutexWaitV), rebuilds the expected-values array, and
     /// re-arms.
-    pub fn attach_w2m(&self, w2m: W2mReceiver) {
+    pub fn attach_w2m(&self, w2m: Rc<W2mReceiver>) {
         let nw = w2m.num_workers();
         *self.inner.exchange_acc.borrow_mut() = ExchangeAccumulator::new(nw);
         // Allocate a zeroed boxed slice — `refresh_futex_waitv_vals`
@@ -3086,7 +3074,7 @@ mod tests {
         // registers every ReplyFuture's waker before attach drains.
         reactor.poll_nonblocking();
 
-        reactor.attach_w2m(W2mReceiver::new(vec![ptr]));
+        reactor.attach_w2m(Rc::new(W2mReceiver::new(vec![ptr])));
 
         let inner = Rc::clone(&reactor.inner);
         let received_check = Rc::clone(&received);
@@ -3193,7 +3181,7 @@ mod tests {
         }
         reactor.poll_nonblocking();
 
-        reactor.attach_w2m(W2mReceiver::new(vec![ptr]));
+        reactor.attach_w2m(Rc::new(W2mReceiver::new(vec![ptr])));
 
         let inner = Rc::clone(&reactor.inner);
         let received_check = Rc::clone(&received);
@@ -3351,7 +3339,7 @@ mod tests {
         reactor
             .inner
             .w2m
-            .set(W2mReceiver::new(vec![ptr]))
+            .set(Rc::new(W2mReceiver::new(vec![ptr])))
             .ok()
             .expect("w2m set");
         *reactor.inner.futex_waitv_storage.borrow_mut() = Some(vec![FutexWaitV::new()].into_boxed_slice());

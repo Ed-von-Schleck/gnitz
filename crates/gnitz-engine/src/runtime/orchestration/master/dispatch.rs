@@ -6,6 +6,21 @@ use super::*;
 use crate::foundation::fault::Seam;
 use crate::runtime::sal::MAX_WORKERS;
 
+/// Yields the set bit positions of a worker mask, lowest first.
+struct BitIter(u64);
+
+impl Iterator for BitIter {
+    type Item = usize;
+    fn next(&mut self) -> Option<usize> {
+        if self.0 == 0 {
+            return None;
+        }
+        let w = self.0.trailing_zeros() as usize;
+        self.0 &= self.0 - 1;
+        Some(w)
+    }
+}
+
 /// The verdict of `MasterDispatcher::txn_fit`.
 pub(crate) enum TxnFit {
     /// The zone fits the SAL's remaining space — emit it.
@@ -17,18 +32,16 @@ pub(crate) enum TxnFit {
     Terminal,
 }
 
-/// Route a ScanSpec read, as the `unicast` shape every fan-out helper speaks:
-/// `-1` broadcasts, `>= 0` writes only that worker's SAL slot.
+/// Route a ScanSpec read, as the [`Fanout`] every fan-out helper speaks.
 ///
 /// A replicated relation is a full identical copy on every worker, so worker 0
 /// answers it alone; otherwise the read goes to the single worker owning its PK
 /// range when [`confined_worker`] can prove one, and is broadcast when it cannot.
-pub(crate) fn scan_spec_route(disp_ptr: *mut MasterDispatcher, target_id: i64, seek_pk_extra: &[u8]) -> i32 {
-    let replicated = replicated_unicast(disp_ptr, target_id);
-    if replicated >= 0 {
-        return replicated;
+pub(crate) fn scan_spec_route(disp: &MasterDispatcher, target_id: i64, seek_pk_extra: &[u8]) -> Fanout {
+    match replicated_unicast(disp, target_id) {
+        Fanout::One(w) => Fanout::One(w),
+        Fanout::Broadcast => confined_worker(disp, target_id, seek_pk_extra).map_or(Fanout::Broadcast, Fanout::One),
     }
-    confined_worker(disp_ptr, target_id, seek_pk_extra).map_or(-1, |w| w as i32)
 }
 
 /// The one worker that can answer this read, or `None` when nothing proves one —
@@ -42,8 +55,8 @@ pub(crate) fn scan_spec_route(disp_ptr: *mut MasterDispatcher, target_id: i64, s
 /// stores — answers whether a relation is: the master's routing depends on when
 /// the relation was built (a post-fork CREATE reports `Hashed` over the master's
 /// empty active range), so it disagrees with the workers' across a restart.
-fn confined_worker(disp_ptr: *mut MasterDispatcher, target_id: i64, seek_pk_extra: &[u8]) -> Option<usize> {
-    let cat = unsafe { &*(*disp_ptr).catalog };
+fn confined_worker(disp: &MasterDispatcher, target_id: i64, seek_pk_extra: &[u8]) -> Option<usize> {
+    let cat = unsafe { &*disp.catalog };
     let schema = cat.get_schema_desc(target_id)?;
     // The same predicate `build_partitioned_storage` chose the store shape with:
     // anything but `Keyed` is built unhashed, so no key names an owner and the
@@ -54,7 +67,7 @@ fn confined_worker(disp_ptr: *mut MasterDispatcher, target_id: i64, seek_pk_extr
     let (spec, _block) = gnitz_wire::unpack_scan_spec_extra(seek_pk_extra).ok()?;
     let desc = gnitz_wire::peek_pk_range(spec)?;
     let partition = crate::catalog::scan_spec_partition(&schema, &desc)?;
-    Some(worker_for_partition(partition, unsafe { (*disp_ptr).num_workers }))
+    Some(worker_for_partition(partition, disp.num_workers))
 }
 
 /// Timeout for the synchronous `W2mReceiver::wait_for` fallback in the two
@@ -92,24 +105,23 @@ impl MasterDispatcher {
         worker_pids: Vec<i32>,
         catalog: *mut CatalogEngine,
         sal: SalWriter,
-        w2m: W2mReceiver,
+        w2m: Rc<W2mReceiver>,
     ) -> Self {
         MasterDispatcher {
             num_workers,
-            worker_pids,
+            worker_pids: RefCell::new(worker_pids),
             sal,
-            w2m: Some(w2m),
-            w2m_ptr: std::ptr::null(),
+            w2m,
             catalog,
-            unique_filters: FxHashMap::default(),
-            check_batch_pool: FxHashMap::default(),
+            unique_filters: RefCell::new(FxHashMap::default()),
+            check_batch_pool: RefCell::new(FxHashMap::default()),
         }
     }
 
     /// Boot-time SAL reset: sentinel prefix cleared, cursor 0, epoch 1 (the
     /// first live epoch — epoch 0 is the empty-slot sentinel prefix). Sole
     /// caller is `server_main` after all workers finish recovery.
-    pub fn reset_sal(&mut self) {
+    pub fn reset_sal(&self) {
         self.sal.boot_reset();
     }
 
@@ -120,15 +132,15 @@ impl MasterDispatcher {
     /// the table. Used by SAL write paths (commit/tick/broadcast) to skip
     /// per-call `build_schema_wire_block` allocations and per-column
     /// iteration in `scatter_wire_group`.
-    pub(super) fn cached_schema_block(&mut self, target_id: i64) -> (SchemaDescriptor, Rc<Vec<u8>>, bool, u32) {
+    pub(super) fn cached_schema_block(&self, target_id: i64) -> (SchemaDescriptor, Rc<Vec<u8>>, bool, u32) {
         let schema = self.schema_desc_for(target_id);
         let cat = unsafe { &mut *self.catalog };
         let e = crate::runtime::wire::get_or_build_schema_wire_block(cat, target_id, &schema);
         (schema, e.entry.block, e.entry.wire_safe, e.entry.wire_row_fixed_stride)
     }
 
-    pub(super) fn pool_pop_batch(&mut self, id: i64) -> Option<Batch> {
-        self.check_batch_pool.get_mut(&id).and_then(|v| v.pop())
+    pub(super) fn pool_pop_batch(&self, slot: super::preflight::PoolSlot) -> Option<Batch> {
+        self.check_batch_pool.borrow_mut().get_mut(&slot).and_then(|v| v.pop())
     }
 
     // -----------------------------------------------------------------------
@@ -138,7 +150,7 @@ impl MasterDispatcher {
     /// Write one command group with per-worker request ids: no rows and no
     /// schema block, so each worker's slot is a bare control block. Every
     /// command verb's worker arm resolves the schema it needs from its own
-    /// catalog, so the block was dead weight in a slot it dominated.
+    /// catalog, so no block is sent.
     ///
     /// `seek_pk`/`seek_col_idx` carry the verb's two scalar operands and
     /// `seek_pk_extra` its verbatim payload. `lsn` is 0 for every verb — a lost
@@ -146,7 +158,7 @@ impl MasterDispatcher {
     /// FlushEph's lsn IS the checkpoint generation.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn write_command_group(
-        &mut self,
+        &self,
         target_id: i64,
         lsn: u64,
         sal_flags: u32,
@@ -154,7 +166,7 @@ impl MasterDispatcher {
         seek_pk: u128,
         seek_col_idx: u64,
         req_ids: &[u64],
-        unicast_worker: i32,
+        unicast_worker: Fanout,
         client_id: u64,
         seek_pk_extra: &[u8],
     ) -> Result<(), String> {
@@ -169,7 +181,7 @@ impl MasterDispatcher {
             seek_pk,
             seek_col_idx,
             req_ids,
-            unicast_worker,
+            unicast_worker.sal_slot(),
             client_id,
             None,
             seek_pk_extra,
@@ -188,7 +200,7 @@ impl MasterDispatcher {
     /// master→worker SAL.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn write_data_group(
-        &mut self,
+        &self,
         target_id: i64,
         sal_flags: u32,
         worker_batches: &[Option<&Batch>],
@@ -208,60 +220,73 @@ impl MasterDispatcher {
             seek_pk,
             seek_col_idx,
             req_ids,
-            -1,
+            Fanout::Broadcast.sal_slot(),
             0,
             None,
             &[],
         )
     }
 
-    /// Write one scan group: `sal_flags = 0` and the caller's `wire_flags`
-    /// (schema-version bits, plus `FLAG_SCAN_FIFO_REPLY` for a multi-scan). The
-    /// worker's `scan_family` resolves and returns the relation's schema from its
-    /// own catalog. Shared by the single-scan fan-out (`fan_out_scan`) and
-    /// the multi-scan one-cut writer (`dispatch_scan_multi_fanout`).
-    pub(super) fn write_one_scan_group(
-        &mut self,
+    /// Write one group whose rows are PK-partitioned across the workers: each
+    /// worker's slot carries only the rows it stores. The scatter sibling of
+    /// `write_data_group`, and the only shape the probe/gather paths need — the
+    /// durable commit scatter (`write_commit_group`) carries a schema block and
+    /// wire props of its own, so it calls `scatter_wire_group` directly.
+    pub(super) fn write_scatter_group(
+        &self,
+        batch: &Batch,
+        schema: &SchemaDescriptor,
         target_id: i64,
-        wire_flags: u64,
+        sal_flags: u32,
+        seek_col_idx: u64,
         req_ids: &[u64],
-        unicast_worker: i32,
-        client_id: u64,
     ) -> Result<(), String> {
-        self.write_command_group(
-            target_id,
-            0,
-            0,
-            wire_flags,
-            0,
-            0,
-            req_ids,
-            unicast_worker,
-            client_id,
-            &[],
-        )
+        // No reentrancy: the closure has no `.await`, so the SCATTER_INDICES
+        // borrow is released before the next caller needs it.
+        with_worker_indices(batch, schema, self.num_workers, |worker_indices| {
+            self.sal.scatter_wire_group(
+                batch,
+                worker_indices,
+                schema,
+                target_id as u32,
+                0,
+                sal_flags,
+                0,
+                seek_col_idx,
+                req_ids,
+                None,
+                None,
+            )
+        })
     }
 
-    /// Write one ScanSpec (`ReadSpec`) group: the plain-scan shape plus the
-    /// `FLAG_SCAN_SPEC` SAL dispatch flag and the client's bundled spec +
-    /// reply-schema blob forwarded **verbatim** in `seek_pk_extra`. The master
-    /// reads only the bound header out of the spec, to route (`confined_worker`);
-    /// the worker is the sole `ReadSpec`/OPK decoder and the only reader of the
-    /// reply-schema half. `wire_flags = 0`: the reply carries no schema block, so
-    /// there is no schema version to negotiate.
-    pub(super) fn write_scan_spec_group(
-        &mut self,
+    /// Write one scan group. The worker's `scan_family` resolves and returns the
+    /// relation's schema from its own catalog, so the group carries no rows and
+    /// no schema block.
+    ///
+    /// A plain scan passes `sal_flags = 0` and the schema-version bits in
+    /// `wire_flags` (plus `FLAG_SCAN_FIFO_REPLY` for a multi-scan). A ScanSpec
+    /// (`ReadSpec`) read passes `FLAG_SCAN_SPEC` and the client's bundled spec +
+    /// reply-schema blob **verbatim** in `seek_pk_extra`, with `wire_flags = 0`:
+    /// its reply carries no schema block, so there is no version to negotiate.
+    /// The master reads only the bound header out of the spec, to route
+    /// (`confined_worker`); the worker is the sole `ReadSpec`/OPK decoder.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn write_scan_group(
+        &self,
         target_id: i64,
+        sal_flags: u32,
+        wire_flags: u64,
         req_ids: &[u64],
-        unicast_worker: i32,
+        unicast_worker: Fanout,
         client_id: u64,
         seek_pk_extra: &[u8],
     ) -> Result<(), String> {
         self.write_command_group(
             target_id,
             0,
-            FLAG_SCAN_SPEC,
-            0,
+            sal_flags,
+            wire_flags,
             0,
             0,
             req_ids,
@@ -283,7 +308,7 @@ impl MasterDispatcher {
     /// parses only the col_idx / type / flags regions, and the SAL never leaves
     /// the master→worker path.
     fn send_broadcast(
-        &mut self,
+        &self,
         target_id: i64,
         lsn: u64,
         flags: u32,
@@ -299,7 +324,7 @@ impl MasterDispatcher {
     pub(crate) fn signal_all(&self) {
         self.sal.signal_all();
     }
-    pub(crate) fn signal_one(&self, worker: usize) {
+    pub(super) fn signal_one(&self, worker: usize) {
         self.sal.signal_one(worker);
     }
 
@@ -307,29 +332,12 @@ impl MasterDispatcher {
         self.sal.sal_fd()
     }
 
-    /// Transfer ownership of the W2M receiver to the reactor.
-    /// Called once by the executor after bootstrap; panics if called twice.
-    pub fn take_w2m(&mut self) -> W2mReceiver {
-        self.w2m.take().expect("take_w2m called twice")
-    }
-
-    /// Record a pointer to the reactor-owned receiver (a stable `OnceCell` slot
-    /// for the reactor's lifetime). After this, `w2m()` resolves through the
-    /// pointer, keeping the synchronous collect helpers usable by the
-    /// reactor-parked stop-the-world CREATE-VIEW backfill — the sole post-handoff
-    /// reader, running while the reactor (the only other reader) is parked in
-    /// that same call. Called once by the executor right after `take_w2m`.
-    pub fn set_w2m_receiver_ptr(&mut self, p: *const W2mReceiver) {
-        self.w2m_ptr = p;
-    }
-
-    fn w2m(&self) -> &W2mReceiver {
-        // After handoff the receiver lives in the reactor; borrow it via the
-        // recorded pointer. Before handoff (boot) the dispatcher owns it.
-        if !self.w2m_ptr.is_null() {
-            return unsafe { &*self.w2m_ptr };
-        }
-        self.w2m.as_ref().expect("W2mReceiver already handed off to reactor")
+    /// A handle on the W2M receiver for the reactor, which reads the same rings.
+    /// Both sides hold a clone: the dispatcher's synchronous collect helpers stay
+    /// usable during the reactor-parked stop-the-world CREATE-VIEW backfill,
+    /// where the reactor (the only other reader) is parked inside that call.
+    pub fn w2m_receiver(&self) -> Rc<W2mReceiver> {
+        Rc::clone(&self.w2m)
     }
 
     /// Liveness gate for the pre-reactor bootstrap wait loops. A crashed worker
@@ -340,7 +348,7 @@ impl MasterDispatcher {
     /// recovery sync", "during backfill relay"). On these paths workers stay
     /// alive after acking, so a reaped worker has not published the awaited
     /// frame — no ack is lost.
-    fn fail_if_worker_dead(&mut self, context: &str) -> Result<(), String> {
+    fn fail_if_worker_dead(&self, context: &str) -> Result<(), String> {
         let dead = self.check_workers();
         if dead >= 0 {
             return Err(format!("worker {dead} exited {context}"));
@@ -348,14 +356,17 @@ impl MasterDispatcher {
         Ok(())
     }
 
-    /// Wait for one ACK from each worker. Bootstrap-only: runs before the
-    /// reactor is up, so we drive each worker's ring via
-    /// `W2mReceiver::wait_for` (sync FUTEX_WAIT on `reader_seq`). The
-    /// tail-chasing ring self-maintains — no reset needed.
-    pub fn collect_acks(&mut self) -> Result<(), String> {
+    /// Wait for one ACK from each worker, driving each ring synchronously via
+    /// `W2mReceiver::wait_for` (FUTEX_WAIT on `reader_seq`). The tail-chasing
+    /// ring self-maintains — no reset needed.
+    ///
+    /// Two callers, matching `collect_acks_and_relay`: boot, before the reactor
+    /// is up, and the reactor-parked stop-the-world CREATE VIEW window (a
+    /// backfill whose `maybe_checkpoint` fires reaches this post-handoff).
+    pub fn collect_acks(&self) -> Result<(), String> {
         for w in 0..self.num_workers {
             loop {
-                match self.w2m().try_read(w) {
+                match self.w2m.try_read(w) {
                     Some(decoded) => {
                         if decoded.control.status != 0 {
                             let msg = String::from_utf8_lossy(&decoded.control.error_msg);
@@ -365,7 +376,7 @@ impl MasterDispatcher {
                     }
                     None => {
                         self.fail_if_worker_dead("before completing recovery sync")?;
-                        let _ = self.w2m().wait_for(w, W2M_SYNC_WAIT_MS);
+                        let _ = self.w2m.wait_for(w, W2M_SYNC_WAIT_MS);
                     }
                 }
             }
@@ -385,35 +396,30 @@ impl MasterDispatcher {
     /// - **Live CREATE VIEW**, the reactor-parked stop-the-world DDL window:
     ///   `handle_ddl_txn` holds the catalog write lock (so the async
     ///   `relay_loop`, which would take the read lock, cannot run and cannot
-    ///   deadlock) and drives the backfill/drain inline. `w2m()` resolves
-    ///   through the reactor's receiver there (see `set_w2m_receiver_ptr`).
+    ///   deadlock) and drives the backfill/drain inline.
     ///
     /// `checkpoint_allowed`: a backfill may stamp CHECKPOINT to reclaim SAL
     /// space mid-stream (workers re-epoch inline). A drain TICK must NOT —
     /// it carries no backfill pad, so a CHECKPOINT would advance the master
     /// epoch while workers stay on the old one and wedge the cluster; pass
     /// `false` to force CONTINUE.
-    #[allow(clippy::needless_range_loop)]
-    fn collect_acks_and_relay(&mut self, checkpoint_allowed: bool) -> Result<(), String> {
+    fn collect_acks_and_relay(&self, checkpoint_allowed: bool) -> Result<(), String> {
         let nw = self.num_workers;
-        let mut collected = vec![false; nw];
-        let mut remaining = nw;
+        // One bit per worker still owing its ACK; `MAX_WORKERS` is 64.
+        let mut pending_mask: u64 = if nw == 64 { u64::MAX } else { (1u64 << nw) - 1 };
         let mut acc = crate::runtime::reactor::ExchangeAccumulator::new(nw);
         // Armed when a round is stamped CHECKPOINT; the actual SAL reset is
         // deferred to the next round barrier (see the decision block below).
         let mut pending_reset = false;
 
-        while remaining > 0 {
-            // One full pass over all workers per iteration. If a pass
-            // makes no progress, we wait_for on the first still-active
-            // worker. Exchange replies from any worker may trigger
-            // further SAL writes + replies, so we loop broadly.
+        while pending_mask != 0 {
+            // One full pass over the still-pending workers per iteration. If a
+            // pass makes no progress, wait on all of them. Exchange replies from
+            // any worker may trigger further SAL writes + replies, so we loop
+            // broadly.
             let mut progressed = false;
-            for w in 0..nw {
-                if collected[w] {
-                    continue;
-                }
-                let Some(decoded) = self.w2m().try_read(w) else {
+            for w in BitIter(pending_mask) {
+                let Some(decoded) = self.w2m.try_read(w) else {
                     continue;
                 };
                 progressed = true;
@@ -460,25 +466,22 @@ impl MasterDispatcher {
                         let msg = String::from_utf8_lossy(&decoded.control.error_msg);
                         return Err(format!("worker {w}: {msg}"));
                     }
-                    collected[w] = true;
-                    remaining -= 1;
+                    pending_mask &= !(1u64 << w);
                 }
             }
             if !progressed {
                 self.fail_if_worker_dead("during backfill relay")?;
-                // Wait on ALL still-active workers at once: any could be the next to
-                // publish, and a single-word wait would miss a wake on a different
-                // worker's reader_seq.
-                let mut pending = [0usize; crate::runtime::sal::MAX_WORKERS];
+                // Wait on ALL still-pending workers at once: any could be the next
+                // to publish, and a single-word wait would miss a wake on a
+                // different worker's reader_seq.
+                let mut pending = [0usize; MAX_WORKERS];
                 let mut np = 0;
-                for w in 0..nw {
-                    if !collected[w] {
-                        pending[np] = w;
-                        np += 1;
-                    }
+                for w in BitIter(pending_mask) {
+                    pending[np] = w;
+                    np += 1;
                 }
                 if np > 0 {
-                    let _ = self.w2m().wait_any(&pending[..np], W2M_SYNC_WAIT_MS);
+                    let _ = self.w2m.wait_any(&pending[..np], W2M_SYNC_WAIT_MS);
                 }
             }
         }
@@ -498,14 +501,14 @@ impl MasterDispatcher {
     /// DDL paths must NOT call this — a concurrent FLAG_FLUSH races the
     /// committer's own and orphans SAL writes straddling `sal.checkpoint_reset`.
     /// See async-invariants.md §III.3a.
-    pub(crate) fn maybe_checkpoint(&mut self) -> Result<(), String> {
+    fn maybe_checkpoint(&self) -> Result<(), String> {
         if !self.sal.needs_checkpoint() {
             return Ok(());
         }
         self.do_checkpoint()
     }
 
-    fn do_checkpoint(&mut self) -> Result<(), String> {
+    fn do_checkpoint(&self) -> Result<(), String> {
         self.sync_flush_round(0, FLAG_FLUSH)?;
         self.checkpoint_post_ack()
     }
@@ -514,7 +517,7 @@ impl MasterDispatcher {
     /// group, await every worker's ACK. The caller runs the matching reset.
     /// A `FLAG_FLUSH_EPH` round's `lsn` IS the checkpoint generation (workers
     /// latch it via `set_committed_generation`); the base round passes 0.
-    fn sync_flush_round(&mut self, lsn: u64, flags: u32) -> Result<(), String> {
+    fn sync_flush_round(&self, lsn: u64, flags: u32) -> Result<(), String> {
         // No schema block: `handle_flush_all` takes neither a schema nor a batch.
         self.send_broadcast(0, lsn, flags, None, 0)?;
         self.collect_acks()
@@ -575,7 +578,7 @@ impl MasterDispatcher {
     /// collects column names. No SAL write yet — `relay_loop` runs this
     /// without `sal_writer_excl` so the lock covers only the synchronous
     /// SAL write in `emit_relay_with_decision`.
-    pub(crate) fn prepare_relay(&mut self, relay: PendingRelay) -> Result<RelayPrepared, String> {
+    pub(crate) fn prepare_relay(&self, relay: PendingRelay) -> Result<RelayPrepared, String> {
         // `all_pad` is the backfill stop signal, read by the caller before
         // `prepare_relay`; the relay scatter itself does not depend on it.
         let PendingRelay {
@@ -697,7 +700,7 @@ impl MasterDispatcher {
     /// stamper (it terminates a backfill's chunked exchange on an all-pad round);
     /// the reactor's `relay_loop` serves only steady-state tick exchanges and
     /// always passes CONTINUE.
-    pub(crate) fn emit_relay_with_decision(&mut self, prep: RelayPrepared, decision: u64) -> Result<(), String> {
+    pub(crate) fn emit_relay_with_decision(&self, prep: RelayPrepared, decision: u64) -> Result<(), String> {
         let RelayPrepared {
             view_id,
             source_id,
@@ -750,7 +753,7 @@ impl MasterDispatcher {
     /// collect loop may further CHECKPOINT mid-stream. Both are safe on the
     /// SAL-exclusive, no-concurrent-relay paths this runs on (boot; the
     /// reactor-parked DDL window).
-    pub fn fan_out_backfill(&mut self, view_id: i64, source_id: i64) -> Result<(), String> {
+    pub fn fan_out_backfill(&self, view_id: i64, source_id: i64) -> Result<(), String> {
         self.maybe_checkpoint()?;
         let schema = self.schema_desc_for(source_id);
         self.send_broadcast(source_id, 0, FLAG_BACKFILL, Some(&schema), view_id as u128)?;
@@ -771,7 +774,7 @@ impl MasterDispatcher {
     /// barrier and `fan_out_backfill` accommodates that — no relay arrives, so
     /// each worker stops on its own drain exhaustion — which is why one driver
     /// serves every shape.
-    pub fn backfill_views_in_depth_order(&mut self, view_ids: &[i64]) -> Result<(), String> {
+    pub fn backfill_views_in_depth_order(&self, view_ids: &[i64]) -> Result<(), String> {
         let mut ordered: Vec<i64> = view_ids.to_vec();
         ordered.sort_by_key(|vid| unsafe { (*self.catalog).dag.tables.get(vid).map_or(0, |e| e.depth) });
         for vid in ordered {
@@ -792,7 +795,7 @@ impl MasterDispatcher {
     /// races this. Checkpointing is forced off: a tick carries no backfill pad,
     /// so a CHECKPOINT verdict would advance only the master's epoch and wedge
     /// the cluster (see `collect_acks_and_relay`).
-    pub(crate) fn drain_tick_blocking(&mut self, source_id: i64) -> Result<(), String> {
+    pub(crate) fn drain_tick_blocking(&self, source_id: i64) -> Result<(), String> {
         let nw = self.num_workers;
         // The synchronous collect reads W2M rings directly and routes neither by
         // req_id; any value works.
@@ -808,16 +811,16 @@ impl MasterDispatcher {
     // reactor task driven by `block_until_idle`.
 
     pub async fn fan_out_seek(
-        disp_ptr: *mut MasterDispatcher,
+        disp: &MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex>,
         target_id: i64,
         pk: u128,
         seek_pk_extra: &[u8],
     ) -> Result<W2mSlot, String> {
-        let num_workers = unsafe { (*disp_ptr).num_workers };
+        let num_workers = disp.num_workers;
         let schema = unsafe {
-            (*(*disp_ptr).catalog)
+            (*disp.catalog)
                 .get_schema_desc(target_id)
                 .ok_or_else(|| format!("seek: table {target_id} not found"))?
         };
@@ -829,19 +832,21 @@ impl MasterDispatcher {
         let opk = crate::schema::key::seek_opk_bytes(&schema, pk, seek_pk_extra)
             .map_err(|e| format!("seek: table {target_id}: {e}"))?;
         let worker = worker_for_partition(schema.partition_for_pk(opk.pk_bytes()), num_workers);
-        single_worker(
-            disp_ptr,
+        let (mut slots, _req_ids, _lease) = dispatch_scan_fanout(
+            disp,
             reactor,
             sal_excl,
-            target_id,
-            FLAG_SEEK,
-            worker,
-            pk,
-            0,
-            "seek",
-            seek_pk_extra,
+            Fanout::One(worker),
+            |disp, req_ids, unicast| {
+                disp.write_command_group(target_id, 0, FLAG_SEEK, 0, pk, 0, req_ids, unicast, 0, seek_pk_extra)
+            },
         )
-        .await
+        .await?;
+        let slot = slots.pop().expect("unicast fan-out returns one slot");
+        // A point seek's reply must fit one frame; a train would be forwarded
+        // truncated, so reject it rather than silently drop the remainder.
+        expect_single_frame(&slot, worker, "seek")?;
+        Ok(slot)
     }
 
     /// Index lookup: fan one frame out to ALL workers and MERGE every matching
@@ -862,7 +867,7 @@ impl MasterDispatcher {
     /// the gate before every train is consumed (or the drain errors and the
     /// lease drop discards the rest) risks a discarded late frame.
     pub async fn fan_out_seek_by_index_collect(
-        disp_ptr: *mut MasterDispatcher,
+        disp: &MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex>,
         target_id: i64,
@@ -879,10 +884,10 @@ impl MasterDispatcher {
         // each matching row `nw` times (weights copied verbatim, no consolidation),
         // handing the client `nw` duplicates of every row. Hashed owners keep
         // the fan-out (matches scatter by PK).
-        let unicast = replicated_unicast(disp_ptr, target_id);
+        let unicast = replicated_unicast(disp, target_id);
         let mut expected: Option<SchemaDescriptor> = None;
         let (slots, req_ids, _lease) =
-            dispatch_scan_fanout(disp_ptr, reactor, sal_excl, unicast, |disp, req_ids, unicast| {
+            dispatch_scan_fanout(disp, reactor, sal_excl, unicast, |disp, req_ids, unicast| {
                 // The schema is the master's own reply guard, not something the
                 // group carries: the worker's `seek_by_index` arm resolves its
                 // own from its own catalog.
@@ -928,77 +933,61 @@ impl MasterDispatcher {
         Ok(acc)
     }
 
-    /// Fan out a SCAN — to all workers (`unicast == -1`), or to ONE worker
-    /// for a **replicated** relation, whose full copy lives on every worker
-    /// (an all-worker fan-out would concatenate W identical copies; worker 0
-    /// always exists, replicated tables are exempt from the bootstrap trim,
-    /// so it holds the full copy at partition 0). Forwards every response
-    /// frame directly to the client (including continuation chunks) and
-    /// returns `Ok(true)` when all drained trains finish. Returns
-    /// `Ok(false)` if the client disconnects mid-stream; `Err` on a worker
-    /// error.
+    /// Fan out a SCAN — to all workers (`unicast == -1`), or to ONE worker for a
+    /// **replicated** relation, whose full copy lives on every worker (an
+    /// all-worker fan-out would concatenate W identical copies; worker 0 always
+    /// exists and replicated tables are exempt from the bootstrap trim, so it
+    /// holds the full copy at partition 0). Forwards every response frame
+    /// directly to the client, continuation chunks included, and returns
+    /// `Ok(true)` when all drained trains finish, `Ok(false)` if the client
+    /// disconnects mid-stream, `Err` on a worker error.
     ///
-    /// Each slot is dropped (advancing `consume_cursor`) before the next
-    /// continuation frame is awaited to prevent W2M ring deadlock.
+    /// `sal_flags`/`wire_flags`/`seek_pk_extra` select the read shape, as
+    /// `write_scan_group` documents: a plain scan passes the client's schema
+    /// version in `wire_flags` so workers can decide whether to include a schema
+    /// block; a ScanSpec read passes `FLAG_SCAN_SPEC` and the client's verbatim
+    /// spec blob, and negotiates no version (its reply carries no schema block —
+    /// the client decodes against the schema it authored). `unicast` comes from
+    /// [`replicated_unicast`] or [`scan_spec_route`].
+    ///
+    /// `forward_scan_slots` returns on the FIRST worker fault, decode error, or
+    /// client disconnect: `_lease` drops on return and `route_scan_slot` discards
+    /// every undrained frame at the ring boundary, advancing `consume_cursor`, so
+    /// a still-streaming worker cannot wedge in `send_encoded` — draining the
+    /// doomed trains would be pure waste. The client may already have received
+    /// earlier workers' data frames when the fault surfaces, so the STATUS_ERROR
+    /// frame `send_error` emits can arrive mid-stream:
+    /// `Connection::drain_reply_train` (gnitz-core), the one reply reassembler,
+    /// returns on the first STATUS_ERROR and discards the batch it had
+    /// accumulated, so no partial rows surface.
     #[allow(clippy::too_many_arguments)]
     pub async fn fan_out_scan(
-        disp_ptr: *mut MasterDispatcher,
+        disp: &MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex>,
-        unicast: i32,
+        unicast: Fanout,
         target_id: i64,
         client_id: u64,
         peer: &Peer,
-        client_version: u16,
-    ) -> Result<bool, String> {
-        // `_lease` held across the entire continuation drain: every worker
-        // streams a multi-frame train, and a cancelled drain (client
-        // disconnect) must keep the ids active until the lease drops so the
-        // gate discards — not parks — late frames.
-        let (slots, req_ids, _lease) =
-            dispatch_scan_fanout(disp_ptr, reactor, sal_excl, unicast, |disp, req_ids, unicast| {
-                // Embed client_version in wire_flags bits 24-39 so workers can
-                // decide whether to include the schema block in their response.
-                let wire_flags = gnitz_wire::wire_flags_set_schema_version(0, client_version);
-                disp.write_one_scan_group(target_id, wire_flags, req_ids, unicast, client_id)
-            })
-            .await?;
-
-        // `forward_scan_slots` returns on the FIRST worker fault, decode error,
-        // or client disconnect: `_lease` drops on return and `route_scan_slot`
-        // discards every undrained frame at the ring boundary, advancing
-        // `consume_cursor`, so a still-streaming worker cannot wedge in
-        // `send_encoded` — draining the doomed trains would be pure waste. The
-        // client may already have received earlier workers' data frames when the
-        // fault surfaces, so the STATUS_ERROR frame `send_error` emits can arrive
-        // mid-stream: `Connection::drain_reply_train` (gnitz-core), the one reply
-        // reassembler, returns on the first STATUS_ERROR and discards the batch
-        // it had accumulated, so no partial rows surface.
-        forward_scan_slots(reactor, peer, slots, &req_ids, unicast).await
-    }
-
-    /// ScanSpec (`ReadSpec`) fan-out — the exact `fan_out_scan` shape, but
-    /// the group is written by `write_scan_spec_group` (carrying `FLAG_SCAN_SPEC`
-    /// and the client's verbatim `seek_pk_extra` blob) and there is no schema-
-    /// version negotiation: the reply carries no schema block at all — the client
-    /// decodes against the schema it authored — so no per-worker version is
-    /// threaded. `unicast` comes from
-    /// [`scan_spec_route`], and the reply-train forwarding + error contract are
-    /// shared with the plain scan.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn fan_out_scan_spec(
-        disp_ptr: *mut MasterDispatcher,
-        reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex>,
-        unicast: i32,
-        target_id: i64,
-        client_id: u64,
-        peer: &Peer,
+        sal_flags: u32,
+        wire_flags: u64,
         seek_pk_extra: &[u8],
     ) -> Result<bool, String> {
+        // `_lease` held across the entire continuation drain: every worker
+        // streams a multi-frame train, and a cancelled drain (client disconnect)
+        // must keep the ids active until the lease drops so the gate discards —
+        // not parks — late frames.
         let (slots, req_ids, _lease) =
-            dispatch_scan_fanout(disp_ptr, reactor, sal_excl, unicast, |disp, req_ids, unicast| {
-                disp.write_scan_spec_group(target_id, req_ids, unicast, client_id, seek_pk_extra)
+            dispatch_scan_fanout(disp, reactor, sal_excl, unicast, |disp, req_ids, unicast| {
+                disp.write_scan_group(
+                    target_id,
+                    sal_flags,
+                    wire_flags,
+                    req_ids,
+                    unicast,
+                    client_id,
+                    seek_pk_extra,
+                )
             })
             .await?;
         forward_scan_slots(reactor, peer, slots, &req_ids, unicast).await
@@ -1022,7 +1011,7 @@ impl MasterDispatcher {
     pub(crate) async fn await_and_drain_scan_relation(
         reactor: &crate::runtime::reactor::Reactor,
         peer: &Peer,
-        unicast: i32,
+        unicast: Fanout,
         req_ids: &[u64],
         nw: usize,
     ) -> Result<bool, String> {
@@ -1033,7 +1022,7 @@ impl MasterDispatcher {
     /// Broadcast a DDL batch to every worker. `lsn` is the caller's zone
     /// LSN — one LSN across all broadcasts of a DDL so recovery can group
     /// them as an atomic zone.
-    pub fn broadcast_ddl(&mut self, target_id: i64, batch: &Batch, lsn: u64) -> Result<(), String> {
+    pub fn broadcast_ddl(&self, target_id: i64, batch: &Batch, lsn: u64) -> Result<(), String> {
         let (schema, schema_block, _safe, _stride) = self.cached_schema_block(target_id);
         self.sal.write_broadcast_direct(
             target_id as u32,
@@ -1054,7 +1043,7 @@ impl MasterDispatcher {
     /// and signal workers. All preceding groups at this LSN belong to
     /// the zone; recovery applies them only when this sentinel reaches
     /// disk before the crash.
-    pub fn commit_zone(&mut self, lsn: u64) -> Result<(), String> {
+    pub fn commit_zone(&self, lsn: u64) -> Result<(), String> {
         self.sal.write_commit_sentinel(lsn)?;
         self.signal_all();
         Ok(())
@@ -1108,18 +1097,18 @@ impl MasterDispatcher {
     /// followed by a single `signal_all` (IV.6). Per-worker slots each carry
     /// the corresponding req_id from `req_ids[w]`. No schema block:
     /// `handle_tick` looks the target's schema up in its own catalog.
-    pub(crate) fn write_tick_group(&mut self, tid: i64, req_ids: &[u64]) -> Result<(), String> {
+    pub(crate) fn write_tick_group(&self, tid: i64, req_ids: &[u64]) -> Result<(), String> {
         if self.take_injected_tick_emit_error(tid) {
             return Err(format!("injected tick emit error (tid={tid})"));
         }
-        self.write_command_group(tid, 0, FLAG_TICK, 0, 0, 0, req_ids, -1, 0, &[])
+        self.write_command_group(tid, 0, FLAG_TICK, 0, 0, 0, req_ids, Fanout::Broadcast, 0, &[])
     }
 
     // -----------------------------------------------------------------------
     // Lifecycle
     // -----------------------------------------------------------------------
 
-    pub fn check_workers(&mut self) -> i32 {
+    pub fn check_workers(&self) -> i32 {
         // Probe each worker by its own pid, not `waitpid(-1)`. A per-pid
         // `waitpid` returns ECHILD — a detected death — even if the zombie was
         // reaped elsewhere, whereas `waitpid(-1)` returns 0 ("some child is
@@ -1127,7 +1116,7 @@ impl MasterDispatcher {
         // would go blind the moment a SIGCHLD/signalfd reaper or SA_NOCLDWAIT is
         // ever added. It also names the exact dead worker for the error/log.
         for w in 0..self.num_workers {
-            let pid = self.worker_pids[w];
+            let pid = self.worker_pids.borrow()[w];
             if pid <= 0 {
                 continue;
             }
@@ -1135,7 +1124,7 @@ impl MasterDispatcher {
             loop {
                 let rpid = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
                 if rpid > 0 {
-                    self.worker_pids[w] = 0; // reaped — never waitpid it again
+                    self.worker_pids.borrow_mut()[w] = 0; // reaped — never waitpid it again
                     return w as i32;
                 }
                 if rpid == 0 {
@@ -1147,7 +1136,7 @@ impl MasterDispatcher {
                     continue; // signal, not death — retry
                 }
                 if err == libc::ECHILD {
-                    self.worker_pids[w] = 0; // already gone
+                    self.worker_pids.borrow_mut()[w] = 0; // already gone
                     return w as i32;
                 }
                 break; // unexpected errno: treat as alive
@@ -1158,11 +1147,11 @@ impl MasterDispatcher {
 
     /// Broadcast `FLAG_SHUTDOWN` (each worker flushes + `_exit`s) and reap the
     /// worker processes.
-    pub fn shutdown_workers(&mut self) {
+    pub fn shutdown_workers(&self) {
         // No schema block: the worker's `Shutdown` arm takes no arguments.
         let _ = self.send_broadcast(0, 0, FLAG_SHUTDOWN, None, 0);
         for w in 0..self.num_workers {
-            let pid = self.worker_pids[w];
+            let pid = self.worker_pids.borrow()[w];
             if pid > 0 {
                 let mut status: i32 = 0;
                 unsafe {
@@ -1178,7 +1167,7 @@ impl MasterDispatcher {
     /// Whether a transaction's family groups fit the SAL, and if not, whether a
     /// checkpoint could make them fit. The committer's whole space question in
     /// one call — it never sees the cursor or the capacity rule itself.
-    pub(crate) fn txn_fit(&mut self, families: &[(i64, &Batch)]) -> TxnFit {
+    pub(crate) fn txn_fit(&self, families: &[(i64, &Batch)]) -> TxnFit {
         let footprint = self.txn_zone_footprint(families);
         let capacity = self.sal.effective_capacity();
         if footprint > capacity {
@@ -1194,7 +1183,7 @@ impl MasterDispatcher {
     /// over families of each family group's `wire_group_footprint`, partitioned
     /// the way `write_commit_group` will emit it (broadcast for a replicated
     /// schema, else PK-partitioned).
-    fn txn_zone_footprint(&mut self, families: &[(i64, &Batch)]) -> usize {
+    fn txn_zone_footprint(&self, families: &[(i64, &Batch)]) -> usize {
         let nw = self.num_workers;
         let mut total = 0usize;
         for &(tid, batch) in families {
@@ -1214,7 +1203,7 @@ impl MasterDispatcher {
     /// caller awaits fsync + per-worker req_ids separately so they can
     /// `join!` them. `lsn` is supplied by the caller.
     pub(crate) fn write_commit_group(
-        &mut self,
+        &self,
         target_id: i64,
         lsn: u64,
         batch: &Batch,
@@ -1259,8 +1248,8 @@ impl MasterDispatcher {
     /// Every worker gets a bare control block: `handle_flush_all` takes neither a
     /// schema nor a batch, and reads the generation from
     /// `worker_ctx::committed_generation()`.
-    pub(crate) fn write_checkpoint_group(&mut self, lsn: u64, flags: u32, req_ids: &[u64]) -> Result<(), String> {
-        self.write_command_group(0, lsn, flags, 0, 0, 0, req_ids, -1, 0, &[])
+    pub(crate) fn write_checkpoint_group(&self, lsn: u64, flags: u32, req_ids: &[u64]) -> Result<(), String> {
+        self.write_command_group(0, lsn, flags, 0, 0, 0, req_ids, Fanout::Broadcast, 0, &[])
     }
 
     /// Post-ACK checkpoint cleanup: flush system tables before resetting
@@ -1284,7 +1273,7 @@ impl MasterDispatcher {
     /// hazard the boot path guards via `flush_all_system_tables`. Callers leave
     /// the SAL intact and retry on a later checkpoint (committer) or abort boot
     /// (`do_checkpoint`).
-    pub(crate) fn checkpoint_post_ack(&mut self) -> Result<(), String> {
+    pub(crate) fn checkpoint_post_ack(&self) -> Result<(), String> {
         let cat = unsafe { &mut *self.catalog };
         cat.flush_all_system_tables()?;
         // Now safe: every worker ACKed the FLUSH, so all have consumed past any
@@ -1298,7 +1287,7 @@ impl MasterDispatcher {
     /// Bump the committed checkpoint generation (step 0 of the sequence).
     /// Delegates to the catalog: durably records the seq-4 row and publishes the
     /// new value to `worker_ctx`. Returns the new generation.
-    pub(crate) fn bump_checkpoint_generation(&mut self) -> u64 {
+    pub(crate) fn bump_checkpoint_generation(&self) -> u64 {
         unsafe { &mut *self.catalog }.bump_checkpoint_generation()
     }
 
@@ -1307,7 +1296,7 @@ impl MasterDispatcher {
     /// flush rounds. No drain — recovery already drained everything and no pushes
     /// are admitted yet (the socket is not open), so `pending_deltas` is empty.
     /// Freshly backfilled views are durably checkpointed before the socket opens.
-    pub(crate) fn boot_checkpoint(&mut self, worker_count: u32) -> Result<(), String> {
+    pub(crate) fn boot_checkpoint(&self, worker_count: u32) -> Result<(), String> {
         // The topology row's durability rides the gen bump's system-table flush
         // (both are `_sequences` rows).
         unsafe { &mut *self.catalog }.record_topology(worker_count);
@@ -1330,40 +1319,25 @@ impl MasterDispatcher {
 
     /// Get the schema descriptor for a target_id. Panics if the table
     /// has no schema (committer should only see tables that validated).
-    pub fn schema_desc_for(&mut self, target_id: i64) -> SchemaDescriptor {
+    pub fn schema_desc_for(&self, target_id: i64) -> SchemaDescriptor {
         unsafe { &mut *self.catalog }
             .get_schema_desc(target_id)
             .unwrap_or_else(|| panic!("master: no schema for target_id={target_id}"))
     }
-
-    pub(super) fn get_col_name(&mut self, target_id: i64, col_idx: usize) -> String {
-        let cat = unsafe { &mut *self.catalog };
-        cat.get_column_names(target_id)
-            .get(col_idx)
-            .cloned()
-            .unwrap_or_else(|| "?".to_string())
-    }
-
-    pub(super) fn get_qualified_name_owned(&mut self, table_id: i64) -> (String, String) {
-        let cat = unsafe { &mut *self.catalog };
-        cat.get_qualified_name(table_id)
-            .map(|(s, t)| (s.to_string(), t.to_string()))
-            .unwrap_or_default()
-    }
 }
 
 /// Await each dispatched worker's first reply slot for a scan group: the single
-/// slot under unicast (`unicast >= 0`, keyed on `req_ids[0]`), or all `nw` in
-/// worker order under broadcast. The one owner of the unicast/broadcast await
+/// slot under `Fanout::One` (keyed on `req_ids[0]`), or all `nw` in worker
+/// order under `Fanout::Broadcast`. The one owner of the unicast/broadcast await
 /// shape, shared by `dispatch_scan_fanout`, `fan_out_scan`, and
 /// `await_and_drain_scan_relation`.
 pub(crate) async fn await_scan_slots(
     reactor: &crate::runtime::reactor::Reactor,
-    unicast: i32,
+    unicast: Fanout,
     req_ids: &[u64],
     nw: usize,
 ) -> Vec<W2mSlot> {
-    if unicast >= 0 {
+    if unicast != Fanout::Broadcast {
         vec![reactor.await_scan_slot(req_ids[0] as u32).await]
     } else {
         crate::runtime::reactor::join_all_unpin(req_ids[..nw].iter().map(|&id| reactor.await_scan_slot(id as u32)))
@@ -1371,184 +1345,9 @@ pub(crate) async fn await_scan_slots(
     }
 }
 
-/// Ceiling on the coalesced head buffer, bounding the copy a scan pays to save
-/// its per-frame `OP_SEND`/`OP_TIMEOUT`/`OP_ASYNC_CANCEL` triples.
-///
-/// `fanout_coalesced_egress_bench` (reactor tests) sweeps the tradeoff: the win
-/// grows with worker count and shrinks with total size, reaching break-even
-/// around 128 KiB at two workers but still large there at eight. 32 KiB sits
-/// well inside the winning region at every worker count, so raise it from that
-/// bench rather than from first principles.
-const COALESCE_MAX_BYTES: usize = 32 * 1024;
-
-/// One awaited scan-train head, classified.
-#[derive(Clone, Copy, Default)]
-pub(super) struct TrainHead {
-    /// The frame carries rows or a schema block. A frame with neither holds
-    /// nothing the client can observe and nothing a later frame could decode
-    /// against, so it is dropped rather than forwarded — on a selective
-    /// broadcast read that is W−1 of the W trains.
-    pub(super) observable: bool,
-    /// The worker's train continues past this frame.
-    has_more: bool,
-}
-
-/// Parse and classify one scan-train frame. The single definition of which
-/// frames reach the client, shared by the fan-out's coalescing decision and by
-/// the per-worker drain.
-pub(super) fn classify_head(slot: &W2mSlot, worker: usize) -> Result<TrainHead, String> {
-    let (ctrl, has_more) = parse_train_header(slot, worker, "scan")?;
-    Ok(TrainHead {
-        observable: ctrl.flags & (FLAG_HAS_DATA | FLAG_HAS_SCHEMA) != 0,
-        has_more,
-    })
-}
-
-/// Forward each already-awaited worker scan train to the client in ascending
-/// worker order. Under unicast the single slot belongs to worker `unicast`, not
-/// slot 0. `Ok(false)` on client disconnect, `Err` on a worker fault /
-/// malformed train. Shared by `fan_out_scan` and
-/// `await_and_drain_scan_relation`.
-///
-/// When every train is a single frame and the heads together stay under
-/// [`COALESCE_MAX_BYTES`], they are concatenated into one pooled buffer and
-/// leave in one egress operation instead of W. Each frame carries its own
-/// `[len | payload]` prefix inside the ring mapping, so the concatenation is a
-/// valid wire stream with nothing synthesized between frames. Anything else
-/// falls back to [`drain_scan_train`] per worker.
-pub(super) async fn forward_scan_slots(
-    reactor: &crate::runtime::reactor::Reactor,
-    peer: &Peer,
-    slots: Vec<W2mSlot>,
-    req_ids: &[u64],
-    unicast: i32,
-) -> Result<bool, String> {
-    let worker_of = |i: usize| if unicast >= 0 { unicast as usize } else { i };
-    // Classify every head before sending anything: whether they can leave as one
-    // buffer is not known until every train has been seen. Both arms then run
-    // off these, so no head is parsed twice. `slots.len()` is the worker count,
-    // which `await_scan_slots` caps at MAX_WORKERS.
-    let mut heads = [TrainHead::default(); MAX_WORKERS];
-    let mut observable = 0usize;
-    let mut total = 0usize;
-    let mut any_tail = false;
-    for (i, slot) in slots.iter().enumerate() {
-        heads[i] = classify_head(slot, worker_of(i))?;
-        any_tail |= heads[i].has_more;
-        if heads[i].observable {
-            observable += 1;
-            total += slot.frame_bytes().len();
-        }
-    }
-    if any_tail || observable < 2 || total > COALESCE_MAX_BYTES {
-        // Coalescing a multi-frame train would land its continuations behind the
-        // next worker's head, reordering the client's rows. Below two frames
-        // there is no kernel op to save.
-        for (i, slot) in slots.into_iter().enumerate() {
-            if !drain_scan_train(reactor, peer, slot, heads[i], req_ids[i] as u32, worker_of(i)).await? {
-                return Ok(false);
-            }
-        }
-        return Ok(true);
-    }
-    // Every train is one frame, so the heads in worker order ARE the whole
-    // reply, in exactly the order the per-worker drain would have produced.
-    let mut buf = crate::storage::batch_pool::acquire_buf();
-    buf.reserve(total);
-    for (i, slot) in slots.iter().enumerate() {
-        if heads[i].observable {
-            buf.extend_from_slice(slot.frame_bytes());
-        }
-    }
-    // The copy is synchronous, so every ring slot is released before the SQE
-    // exists — a client that stalls this send cannot pin a slot and fill the
-    // worker's W2M ring.
-    drop(slots);
-    Ok(peer.send_buffer(crate::storage::batch_pool::PooledSendBuf(buf)).await >= 0)
-}
-
-/// Forward one worker's SCAN continuation train to the client: send each frame
-/// to `peer` (dropping it before awaiting the next, per the W2M ring contract)
-/// and loop until the train header reports no more frames. `slot` is the first,
-/// already-awaited frame and `head` its classification. Returns `Ok(false)` if
-/// the client disconnects mid-stream and `Err` on a malformed train header.
-///
-/// An unobservable frame is dropped here rather than at the next reassignment:
-/// that releases the slot at the ring now, so a worker parked on a full ring is
-/// not held across the await below. A fault frame never gets here —
-/// `parse_train_header` returns `Err` on a non-zero status — and the train's
-/// terminal frame is master-authored, so the client still sees the train end.
-///
-/// The send is deadline-guarded inside `send_slot`: a client that stops draining
-/// this zero-copy slot is evicted, rc goes negative, and the caller drops the
-/// `ScanLease`, discarding the rest of the train and advancing consume_cursor so
-/// the worker unblocks.
-pub(super) async fn drain_scan_train(
-    reactor: &crate::runtime::reactor::Reactor,
-    peer: &Peer,
-    mut slot: W2mSlot,
-    mut head: TrainHead,
-    req_id: u32,
-    worker: usize,
-) -> Result<bool, String> {
-    loop {
-        if !head.observable {
-            drop(slot);
-        } else if peer.send_slot(slot).await < 0 {
-            return Ok(false);
-        }
-        if !head.has_more {
-            break;
-        }
-        slot = reactor.await_scan_slot(req_id).await;
-        head = classify_head(&slot, worker)?;
-    }
-    Ok(true)
-}
-
-/// Common body for every single-worker async fan-out. Submits the SAL
-/// message (unicast, via `dispatch_scan_fanout`), awaits the one reply
-/// frame, and returns the raw `W2mSlot` so the caller can forward it to
-/// the client without an intermediate decode/copy.
-#[allow(clippy::too_many_arguments)]
-async fn single_worker(
-    disp_ptr: *mut MasterDispatcher,
-    reactor: &crate::runtime::reactor::Reactor,
-    sal_excl: &Rc<AsyncMutex>,
-    target_id: i64,
-    flags: u32,
-    worker: usize,
-    seek_pk: u128,
-    seek_col_idx: u64,
-    op_name: &'static str,
-    seek_pk_extra: &[u8],
-) -> Result<W2mSlot, String> {
-    let (mut slots, _req_ids, _lease) =
-        dispatch_scan_fanout(disp_ptr, reactor, sal_excl, worker as i32, |disp, req_ids, unicast| {
-            disp.write_command_group(
-                target_id,
-                0,
-                flags,
-                0,
-                seek_pk,
-                seek_col_idx,
-                req_ids,
-                unicast,
-                0,
-                seek_pk_extra,
-            )
-        })
-        .await?;
-    let slot = slots.pop().expect("unicast fan-out returns one slot");
-    expect_single_frame(&slot, worker, op_name)?;
-    Ok(slot)
-}
-
 #[cfg(test)]
 mod worker_liveness_tests {
     use super::*;
-    use crate::runtime::sal::SalWriter;
-    use crate::runtime::w2m::W2mReceiver;
     use crate::runtime::w2m_ring;
     use crate::test_support::SharedRegion;
 
@@ -1573,7 +1372,7 @@ mod worker_liveness_tests {
             worker_pids,
             std::ptr::null_mut(),
             SalWriter::new(std::ptr::null_mut(), -1, 0, Vec::new()),
-            W2mReceiver::new(rings.iter().map(|r| r.ptr()).collect()),
+            Rc::new(W2mReceiver::new(rings.iter().map(|r| r.ptr()).collect())),
         );
         (disp, rings)
     }
@@ -1603,9 +1402,13 @@ mod worker_liveness_tests {
                 libc::_exit(0);
             }
         }
-        let (mut disp, _rings) = probe_dispatcher(vec![pid]);
+        let (disp, _rings) = probe_dispatcher(vec![pid]);
         assert_eq!(disp.check_workers(), -1, "a live worker must not be reported dead");
-        assert_eq!(disp.worker_pids[0], pid, "a live worker's pid must be retained");
+        assert_eq!(
+            disp.worker_pids.borrow()[0],
+            pid,
+            "a live worker's pid must be retained"
+        );
         unsafe {
             libc::kill(pid, libc::SIGKILL);
             let mut status = 0;
@@ -1624,7 +1427,7 @@ mod worker_liveness_tests {
         if pid == 0 {
             unsafe { libc::_exit(0) };
         }
-        let (mut disp, _rings) = probe_dispatcher(vec![pid]);
+        let (disp, _rings) = probe_dispatcher(vec![pid]);
         // Bounded poll until the zombie is reaped by the probe (the child exits
         // near-instantly). The bound keeps a regression from hanging the suite.
         let mut detected = -1;
@@ -1636,7 +1439,7 @@ mod worker_liveness_tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert_eq!(detected, 0, "the exited worker must be detected dead");
-        assert_eq!(disp.worker_pids[0], 0, "a reaped pid must be zeroed");
+        assert_eq!(disp.worker_pids.borrow()[0], 0, "a reaped pid must be zeroed");
         assert_eq!(disp.check_workers(), -1, "a zeroed worker must not be re-reported");
         drop(disp);
     }
@@ -1647,7 +1450,7 @@ mod worker_liveness_tests {
         // the park arm, whose liveness probe must surface the dead worker as a
         // clean error instead of looping on `wait_for` forever.
         let dead = spawn_and_reap_dead();
-        let (mut disp, _rings) = probe_dispatcher(vec![dead]);
+        let (disp, _rings) = probe_dispatcher(vec![dead]);
         let err = disp.collect_acks().expect_err("a dead worker must fail ack collection");
         assert!(err.contains("worker 0"), "error names the dead worker: {err}");
         assert!(
@@ -1663,7 +1466,7 @@ mod worker_liveness_tests {
         // ring and reaches the !progressed arm, whose probe must surface the
         // dead worker.
         let dead = spawn_and_reap_dead();
-        let (mut disp, _rings) = probe_dispatcher(vec![dead]);
+        let (disp, _rings) = probe_dispatcher(vec![dead]);
         let err = disp
             .collect_acks_and_relay(true)
             .expect_err("a dead worker must fail the backfill relay");
@@ -1723,10 +1526,16 @@ mod checkpoint_finalize_tests {
             let sal_region = SharedRegion::new(SAL_SIZE);
             let sal_writer = SalWriter::new(sal_region.ptr(), -1, SAL_SIZE as u64, Vec::new());
             let catalog_ptr = &mut engine as *mut CatalogEngine;
-            let mut disp = MasterDispatcher::new(0, Vec::new(), catalog_ptr, sal_writer, W2mReceiver::new(Vec::new()));
+            let disp = MasterDispatcher::new(
+                0,
+                Vec::new(),
+                catalog_ptr,
+                sal_writer,
+                Rc::new(W2mReceiver::new(Vec::new())),
+            );
 
             // The finalizer under guard: must durably flush sys_sequences before the
-            // reset. (Pre-fix, the ephemeral round called a bare-reset variant.)
+            // reset.
             disp.checkpoint_post_ack().unwrap();
             drop(disp);
 

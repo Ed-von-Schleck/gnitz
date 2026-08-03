@@ -2,6 +2,7 @@
 //! via the shared append-only log (SAL) and collects responses via per-worker
 //! W2M regions. Eventfds provide cross-process signaling.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -20,7 +21,7 @@ use crate::runtime::reactor::{AsyncMutex, PendingRelay, ScanLease};
 use crate::runtime::sal::{
     pack_gather_cols, unique_preflight_wire_schema, SalWriter, BACKFILL_DECISION_CHECKPOINT,
     BACKFILL_DECISION_CONTINUE, BACKFILL_DECISION_STOP, FLAG_BACKFILL, FLAG_DDL_SYNC, FLAG_EXCHANGE,
-    FLAG_EXCHANGE_RELAY, FLAG_FLUSH, FLAG_FLUSH_EPH, FLAG_GATHER, FLAG_HAS_PK, FLAG_PUSH, FLAG_SCAN_SPEC, FLAG_SEEK,
+    FLAG_EXCHANGE_RELAY, FLAG_FLUSH, FLAG_FLUSH_EPH, FLAG_GATHER, FLAG_HAS_PK, FLAG_PUSH, FLAG_SEEK,
     FLAG_SEEK_BY_INDEX, FLAG_SHUTDOWN, FLAG_TICK, FLAG_UNIQUE_PREFLIGHT,
 };
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
@@ -61,15 +62,12 @@ pub(crate) enum RelayDest {
 
 pub struct MasterDispatcher {
     num_workers: usize,
-    worker_pids: Vec<i32>,
+    worker_pids: RefCell<Vec<i32>>,
     sal: SalWriter,
-    w2m: Option<W2mReceiver>,
-    /// Set after `take_w2m` hands the receiver to the reactor: a pointer to the
-    /// reactor's stable `OnceCell` slot so `w2m()` keeps working for the one
-    /// post-handoff caller — the reactor-parked stop-the-world CREATE-VIEW
-    /// backfill. Null during boot (the receiver lives in `w2m` then). See
-    /// `set_w2m_receiver_ptr` / `w2m`.
-    w2m_ptr: *const W2mReceiver,
+    /// Shared with the reactor, which is the other reader. Every `W2mReceiver`
+    /// method takes `&self` (its cursors live in the shared-memory rings), so
+    /// both hold a clone rather than handing ownership across.
+    w2m: Rc<W2mReceiver>,
     // Catalog pointer — reborrowed per-call because &mut self borrows conflict.
     catalog: *mut CatalogEngine,
     /// Per-(table_id, packed_col_list) filter skipping redundant unique-index
@@ -78,27 +76,27 @@ pub struct MasterDispatcher {
     /// identified by its whole column list, and dropping `(a, b)` never touches
     /// a distinct single-column filter on `a`. See the UniqueFilter comment
     /// block.
-    unique_filters: FxHashMap<(i64, u64), UniqueFilter>,
+    unique_filters: RefCell<FxHashMap<(i64, u64), UniqueFilter>>,
 
-    /// Per-`target_id` pool of `Batch`es reused by `build_check_batch` for
-    /// FK / unique-index validation. After the awaited pipeline returns,
-    /// `reclaim_check_batches` takes each check's batch and pushes it back here;
-    /// the next check on the same target reuses it via `clear` + reload.
-    /// Schema staleness (DDL between bursts) is checked at pop time.
-    check_batch_pool: FxHashMap<i64, Vec<Batch>>,
+    /// Pool of `Batch`es reused by the check builders for FK / unique-index
+    /// validation, keyed per probe target and key columns (see
+    /// `PipelinedCheck::pool_slot`). After the awaited pipeline returns,
+    /// `reclaim_check_batches` pushes each check's batch back here; the next
+    /// probe on the same slot reuses it via `clear` + reload. Schema staleness
+    /// (DDL between bursts) is still checked at pop time.
+    check_batch_pool: RefCell<FxHashMap<preflight::PoolSlot, Vec<Batch>>>,
 }
-
-// Safety: MasterDispatcher is single-threaded (master process event loop).
-unsafe impl Send for MasterDispatcher {}
 
 mod dispatch;
 mod preflight;
+mod train;
 mod unique_filter;
 
 pub(crate) use dispatch::{scan_spec_route, TxnFit};
 #[cfg(test)]
 pub(crate) use preflight::PreflightAccumulator;
 pub(crate) use preflight::TxnFamily;
+use train::{drain_index_scan, expect_single_frame, forward_scan_slots, parse_train_header, scan_decode_err};
 use unique_filter::UniqueFilter;
 
 // ---------------------------------------------------------------------------
@@ -135,30 +133,53 @@ fn worker_error_scan<'a>(op: &str, it: impl Iterator<Item = (usize, &'a DecodedW
     None
 }
 
-fn scan_decode_err(w: usize, e: &'static str) -> String {
-    format!("scan: worker {w}: decode error: {e}")
+/// Which workers a scan-shaped dispatch goes to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fanout {
+    /// Every worker; each answers for the partitions it owns.
+    Broadcast,
+    /// This worker alone.
+    One(usize),
 }
 
-/// Fan-out shape for a scan-shaped dispatch over `target_id`: `0`
-/// (single-source worker 0) when the relation is REPLICATED — every worker
-/// holds an identical full copy, so a broadcast would stream/merge the same
-/// rows `nw` times — else `-1` (broadcast). The single owner of the
-/// replicated→single-source routing policy for `dispatch_scan_fanout` callers.
-pub(crate) fn replicated_unicast(disp_ptr: *mut MasterDispatcher, target_id: i64) -> i32 {
-    let replicated = unsafe { (*(*disp_ptr).catalog).dag.relation_is_replicated(target_id) };
-    if replicated {
-        0
+impl Fanout {
+    /// The SAL group's slot selector: `-1` writes every worker's slot, `>= 0`
+    /// only that one's. The single conversion to the wire-side encoding.
+    fn sal_slot(self) -> i32 {
+        match self {
+            Fanout::Broadcast => -1,
+            Fanout::One(w) => w as i32,
+        }
+    }
+
+    /// The worker that produced reply `i`. Under `One` every reply is that
+    /// worker's, so the index does not name it.
+    fn worker_of(self, i: usize) -> usize {
+        match self {
+            Fanout::Broadcast => i,
+            Fanout::One(w) => w,
+        }
+    }
+}
+
+/// Fan-out shape for a scan-shaped dispatch over `target_id`: worker 0 alone
+/// when the relation is REPLICATED — every worker holds an identical full copy,
+/// so a broadcast would stream/merge the same rows `nw` times — else broadcast.
+/// The single owner of the replicated→single-source routing policy for
+/// `dispatch_scan_fanout` callers.
+pub(crate) fn replicated_unicast(disp: &MasterDispatcher, target_id: i64) -> Fanout {
+    if unsafe { (*disp.catalog).dag.relation_is_replicated(target_id) } {
+        Fanout::One(0)
     } else {
-        -1
+        Fanout::Broadcast
     }
 }
 
 /// Allocate a scan group's per-worker request ids and register them into a
 /// fresh `ScanLease`, the setup both `dispatch_scan_fanout` and
-/// `dispatch_scan_multi_fanout` need before their SAL write. `unicast >= 0`
-/// (single-source) allocates ONE id mirrored across the array — only that
-/// worker's slot is written and replies; `unicast < 0` (broadcast) allocates
-/// `nw` distinct ids. The lease is registered BEFORE any await, so a cancelled
+/// `dispatch_scan_multi_fanout` need before their SAL write. `Fanout::One`
+/// allocates ONE id mirrored across the array — only that worker's slot is
+/// written and replies; `Fanout::Broadcast` allocates `nw` distinct ids. The lease is registered BEFORE any await, so a cancelled
 /// drain still deregisters the ids and `route_scan_slot` discards late frames.
 /// The returned lease MUST be bound to a named local held to the end of the
 /// caller's drain scope (never a bare `_`, which would drop it immediately and
@@ -166,12 +187,12 @@ pub(crate) fn replicated_unicast(disp_ptr: *mut MasterDispatcher, target_id: i64
 fn alloc_scan_req_ids_and_lease(
     reactor: &crate::runtime::reactor::Reactor,
     nw: usize,
-    unicast: i32,
+    unicast: Fanout,
 ) -> ([u64; crate::runtime::sal::MAX_WORKERS], ScanLease) {
     let mut req_ids = [0u64; crate::runtime::sal::MAX_WORKERS];
-    if unicast >= 0 {
-        // Single-source: one id mirrored across every slot; only worker
-        // `unicast`'s slot is written and replies, so the lease holds that one id.
+    if unicast != Fanout::Broadcast {
+        // Single-source: one id mirrored across every slot; only that worker's
+        // slot is written and replies, so the lease holds that one id.
         let id = reactor.alloc_scan_request_id();
         req_ids[..nw].fill(id);
         (req_ids, reactor.scan_lease(&[id as u32]))
@@ -192,20 +213,18 @@ fn alloc_scan_req_ids_and_lease(
 /// without an intermediate decode/copy.
 ///
 /// `unicast` selects the shape and is also passed to `submit` so the group
-/// write's unicast argument can never diverge from it:
-/// - `< 0` (broadcast): allocate `nw` distinct per-worker scan request ids,
-///   signal every worker, and await every slot in worker order — the returned
-///   `Vec` holds `nw` slots. The shape a full fan-out or a PK-scatter needs.
-/// - `>= 0` (single-source, the worker index): allocate ONE scan request id
-///   mirrored across the whole `req_ids` array (`write_group_direct` keys
-///   replies by worker slot, and under unicast only that worker's slot is
-///   written and replies — all on this id), signal only worker `unicast`, and
-///   await its single slot — the returned `Vec` holds one slot. Used for a
-///   REPLICATED relation (see `replicated_unicast`) and the single-worker
-///   seek paths. The downstream drains
-///   (`drain_index_scan` / `merge_index_scan`) are count-agnostic — they
-///   iterate `slots.len()` — so a length-1 `Vec` merges exactly that worker's
-///   stream.
+/// write's routing can never diverge from it:
+/// - `Broadcast`: allocate `nw` distinct per-worker scan request ids, signal
+///   every worker, and await every slot in worker order — the returned `Vec`
+///   holds `nw` slots. The shape a full fan-out or a PK-scatter needs.
+/// - `One(w)`: allocate ONE scan request id mirrored across the whole `req_ids`
+///   array (`write_group_direct` keys replies by worker slot, and only `w`'s
+///   slot is written and replies — all on this id), signal only `w`, and await
+///   its single slot — the returned `Vec` holds one slot. Used for a REPLICATED
+///   relation (see `replicated_unicast`) and the single-worker seek paths. The
+///   downstream drains (`drain_index_scan` / `merge_index_scan`) are
+///   count-agnostic — they iterate `slots.len()` — so a length-1 `Vec` merges
+///   exactly that worker's stream.
 ///
 /// `sal_excl` is held only for the synchronous write + signal phase and
 /// released before awaiting replies. This serialises the SAL write against
@@ -213,29 +232,24 @@ fn alloc_scan_req_ids_and_lease(
 /// could write with the old epoch during the checkpoint window, workers
 /// would skip it, and the caller would hang waiting for an ACK.
 pub(crate) async fn dispatch_scan_fanout<F>(
-    disp_ptr: *mut MasterDispatcher,
+    disp: &MasterDispatcher,
     reactor: &crate::runtime::reactor::Reactor,
     sal_excl: &Rc<AsyncMutex>,
-    unicast: i32,
+    unicast: Fanout,
     submit: F,
 ) -> Result<(Vec<W2mSlot>, [u64; crate::runtime::sal::MAX_WORKERS], ScanLease), String>
 where
-    F: FnOnce(&mut MasterDispatcher, &[u64], i32) -> Result<(), String>,
+    F: FnOnce(&MasterDispatcher, &[u64], Fanout) -> Result<(), String>,
 {
-    let nw = unsafe { (*disp_ptr).num_workers };
-    let single = unicast >= 0;
+    let nw = disp.num_workers;
     let (req_ids, lease) = alloc_scan_req_ids_and_lease(reactor, nw, unicast);
 
     {
         let _guard = sal_excl.lock().await;
-        unsafe {
-            let disp = &mut *disp_ptr;
-            submit(disp, &req_ids[..nw], unicast)?;
-            if single {
-                disp.signal_one(unicast as usize);
-            } else {
-                disp.signal_all();
-            }
+        submit(disp, &req_ids[..nw], unicast)?;
+        match unicast {
+            Fanout::One(w) => disp.signal_one(w),
+            Fanout::Broadcast => disp.signal_all(),
         }
     }
     let slots = dispatch::await_scan_slots(reactor, unicast, &req_ids, nw).await;
@@ -243,15 +257,15 @@ where
 }
 
 /// One relation's dispatch handle from `dispatch_scan_multi_fanout`: its
-/// per-worker request ids, its unicast routing (`>= 0` = single worker index,
-/// `-1` = broadcast), and the live `ScanLease` keeping those ids registered
+/// per-worker request ids, its routing, and the live `ScanLease` keeping those
+/// ids registered
 /// until the master finishes draining the relation. The caller holds every
 /// dispatch (hence every lease) for the whole of the sequential drain; dropping
 /// them deregisters the ids and discards any queued/future frames, cancelling
 /// the multi-scan on client death.
 pub(crate) struct MultiScanDispatch {
     pub(crate) req_ids: [u64; crate::runtime::sal::MAX_WORKERS],
-    pub(crate) unicast: i32,
+    pub(crate) unicast: Fanout,
     // Held only for its RAII effect (the `_` name silences the never-read lint);
     // its drop deregisters the relation's scan ids.
     _lease: ScanLease,
@@ -272,19 +286,19 @@ pub(crate) struct MultiScanDispatch {
 /// `FLAG_SCAN_FIFO_REPLY` contract). Every group carries that flag so workers
 /// queue the reply in request order.
 ///
-/// `relations` gives, per relation in request order, `(tid, unicast,
+/// `relations` gives, per relation in request order, `(tid, routing,
 /// effective_client_version)`; returns one `MultiScanDispatch` per relation in
 /// the same order. Each relation's ids are registered into their own lease
 /// BEFORE the lock (and before any await), so a cancelled drain still
 /// deregisters them and `route_scan_slot` discards late frames.
 pub(crate) async fn dispatch_scan_multi_fanout(
-    disp_ptr: *mut MasterDispatcher,
+    disp: &MasterDispatcher,
     reactor: &crate::runtime::reactor::Reactor,
     sal_excl: &Rc<AsyncMutex>,
     client_id: u64,
-    relations: &[(i64, i32, u16)],
+    relations: &[(i64, Fanout, u16)],
 ) -> Result<Vec<MultiScanDispatch>, String> {
-    let nw = unsafe { (*disp_ptr).num_workers };
+    let nw = disp.num_workers;
     // Allocate ids + register every relation's lease BEFORE the lock (no await
     // between here and the write). A broadcast relation gets one id per worker;
     // a unicast one gets a single id mirrored across the array (only its
@@ -305,138 +319,14 @@ pub(crate) async fn dispatch_scan_multi_fanout(
     // releases at block end, before the caller's first await.
     {
         let _guard = sal_excl.lock().await;
-        unsafe {
-            let disp = &mut *disp_ptr;
+        {
             for (&(tid, unicast, eff_ver), d) in relations.iter().zip(&dispatches) {
                 let wire_flags =
                     gnitz_wire::wire_flags_set_schema_version(0, eff_ver) | gnitz_wire::FLAG_SCAN_FIFO_REPLY;
-                disp.write_one_scan_group(tid, wire_flags, &d.req_ids[..nw], unicast, client_id)?;
+                disp.write_scan_group(tid, 0, wire_flags, &d.req_ids[..nw], unicast, client_id, &[])?;
             }
             disp.signal_all();
         }
     }
     Ok(dispatches)
-}
-
-/// Parse one frame header of worker `w`'s continuation train. Returns the
-/// control block plus whether more frames follow, or `Err` (prefixed with
-/// `what`) on a fault frame or a corrupt header. Every caller holds the
-/// `ScanLease` from `dispatch_scan_fanout`, so propagating the `Err` is the
-/// whole disposal story: the lease drop discards the undrained remainder at
-/// the ring boundary.
-///
-/// A corrupt header yields no frame structure to follow, and a fault frame is
-/// terminal by contract — `send_error` reports it as a single frame with
-/// `status = STATUS_ERROR` and flags `0` (no `FLAG_SCAN_LAST`), and the
-/// worker emits nothing more for the request. The error therefore MUST stop
-/// the drain: keying `has_more` off `FLAG_SCAN_LAST` alone would read the
-/// fault frame's `0` flags as "more coming" and block forever in
-/// `await_scan_slot` on a frame that never arrives.
-///
-/// A healthy frame WITHOUT `FLAG_CONTINUATION` is a length-1 train: the
-/// single-frame `send_response` reply shape carries no train flags at all, so
-/// "no continuation flag" must read as terminal. Every multi-frame train
-/// producer (worker scan chunks, chunked seek/gather replies, unique
-/// pre-flight frames) sets `FLAG_CONTINUATION` on every frame and
-/// `FLAG_SCAN_LAST` on the terminal one. This is the single definition of
-/// that train contract, shared by every train consumer (`fan_out_scan`,
-/// `drain_index_scan`, the pre-flight merge).
-fn parse_train_header(slot: &W2mSlot, w: usize, what: &str) -> Result<(wire::DecodedControl, bool), String> {
-    let ctrl = peek_control_block(slot.bytes()).map_err(|e| scan_decode_err(w, e))?;
-    if ctrl.status != 0 {
-        return Err(format!(
-            "worker {}: {}: {}",
-            w,
-            what,
-            String::from_utf8_lossy(&ctrl.error_msg)
-        ));
-    }
-    let has_more = ctrl.flags & FLAG_SCAN_LAST == 0 && ctrl.flags & FLAG_CONTINUATION != 0;
-    Ok((ctrl, has_more))
-}
-
-/// Enforce the single-frame reply contract on `slot`: a fault frame or corrupt
-/// header errors like `parse_train_header`, and ANY `FLAG_CONTINUATION` frame
-/// — including a length-1 train's terminal `FLAG_SCAN_LAST` frame — is
-/// rejected. The slot is forwarded verbatim as a complete reply, so a chunked
-/// train would be truncated to its first frame with the remainder silently
-/// discarded by the lease drop. Callers only route requests whose replies fit
-/// one frame (e.g. a unique point seek); a train means that invariant broke
-/// (e.g. a shrunken GNITZ_REPLY_FRAME_BUDGET) — fail loudly instead.
-fn expect_single_frame(slot: &W2mSlot, w: usize, what: &str) -> Result<wire::DecodedControl, String> {
-    let (ctrl, _) = parse_train_header(slot, w, what)?;
-    if ctrl.flags & FLAG_CONTINUATION != 0 {
-        return Err(format!(
-            "worker {w}: {what}: unexpected chunked reply on a single-frame path"
-        ));
-    }
-    Ok(ctrl)
-}
-
-/// Fan-out reply-train drain shared by the unique-filter warmup and the
-/// collect paths (index seek/range merge, gather). Invokes `on_batch` with the
-/// zero-copy `MemBatch` and the raw frame byte length of every non-empty
-/// frame, in worker order.
-///
-/// Returns on the FIRST error — worker fault, corrupt/undecodable frame,
-/// schema mismatch, or an `Err` from `on_batch` — without draining the
-/// remaining trains. All callers hold the `ScanLease` from
-/// `dispatch_scan_fanout`; when the early `Err` unwinds it, the lease drop
-/// (`reactor/mod.rs`) frees every parked slot and `route_scan_slot` discards
-/// all later frames at the ring boundary, advancing `consume_cursor` — a
-/// still-streaming worker cannot wedge in `send_encoded`, so decoding the
-/// doomed remainder would be pure waste.
-///
-/// `expected` is validated against each train's first schema-bearing frame.
-/// Worker reply schemas can lag the master's during DDL
-/// races (`run_tick` releases the catalog read lock before awaiting ACKs; a
-/// worker inside `do_exchange_wait` defers `DdlSync` but serves seeks inline;
-/// seek handlers take no catalog lock at all), and the batch append helpers do
-/// not validate shape — an unguarded mismatch is memory-unsafe garbage handed
-/// onward under the master's schema block.
-///
-/// Continuation frames carry no schema; the schema + version saved from the
-/// first frame is reused as a decode hint. The zero-copy `MemBatch` borrows
-/// from `slot.bytes()`, so the slot is dropped only after `on_batch` returns.
-async fn drain_index_scan(
-    slots: Vec<W2mSlot>,
-    req_ids: &[u64; crate::runtime::sal::MAX_WORKERS],
-    reactor: &crate::runtime::reactor::Reactor,
-    what: &str,
-    expected: &SchemaDescriptor,
-    mut on_batch: impl FnMut(&crate::storage::MemBatch<'_>, usize) -> Result<(), String>,
-) -> Result<(), String> {
-    for (w, mut slot) in slots.into_iter().enumerate() {
-        let mut saved_schema: Option<(SchemaDescriptor, u16)> = None;
-        loop {
-            let (ctrl, has_more) = parse_train_header(&slot, w, what)?;
-            let server_version = gnitz_wire::wire_flags_get_schema_version(ctrl.flags);
-            let frame_len = slot.bytes().len();
-            let schema_hint = saved_schema.as_ref().map(|(s, v)| SchemaWithVersion {
-                descriptor: s,
-                version: *v,
-            });
-            let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(slot.bytes(), ctrl, schema_hint)
-                .map_err(|e| scan_decode_err(w, e))?;
-            if saved_schema.is_none() {
-                if let Some(ref s) = zc.schema {
-                    crate::schema::validate_schema_match(s, expected)
-                        .map_err(|e| format!("worker {w}: {what}: {e}"))?;
-                    saved_schema = Some((*s, server_version));
-                }
-            }
-            if let Some(ref mb) = zc.data_batch {
-                if mb.count > 0 {
-                    on_batch(mb, frame_len)?;
-                }
-            }
-            drop(zc); // borrows slot
-            drop(slot);
-            if !has_more {
-                break;
-            }
-            slot = reactor.await_scan_slot(req_ids[w] as u32).await;
-        }
-    }
-    Ok(())
 }
