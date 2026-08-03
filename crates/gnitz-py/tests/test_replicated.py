@@ -7,19 +7,11 @@ partitioned fact runs locally on every worker with no exchange on either side.
 Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_replicated.py -v --tb=short
 """
-import os
 import random
-import shutil
-import signal
-import subprocess
-import tempfile
-import time
 
 import pytest
 import gnitz
-from _serverproc import server_preexec
-
-_NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))
+from _serverproc import NUM_WORKERS as _NUM_WORKERS
 _NEEDS_MULTI = pytest.mark.skipif(
     _NUM_WORKERS < 2, reason="replication only matters with GNITZ_WORKERS >= 2"
 )
@@ -622,71 +614,28 @@ def test_create_unique_index_on_replicated_rejects_real_duplicate(client):
 # Recovery: the full copy survives a reboot on EVERY worker
 # ---------------------------------------------------------------------------
 
-def _server_binary():
-    return os.environ.get(
-        "GNITZ_SERVER_BIN",
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../gnitz-server")),
-    )
-
-
-def _start(data_dir, sock_path, workers):
-    binary = _server_binary()
-    if not os.path.isfile(binary):
-        pytest.skip(f"Server binary not found: {binary}")
-    proc = subprocess.Popen(
-        [binary, data_dir, sock_path, f"--workers={workers}"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        start_new_session=True, preexec_fn=server_preexec,
-    )
-    deadline = time.time() + 10.0
-    while time.time() < deadline:
-        if os.path.exists(sock_path):
-            return proc
-        time.sleep(0.05)
-    proc.kill(); proc.communicate()
-    raise RuntimeError("server did not start")
-
-
-def _stop(proc):
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    proc.wait()
-
-
 @_NEEDS_MULTI
-def test_replicated_full_copy_survives_reboot_on_every_worker(client):
+def test_replicated_full_copy_survives_reboot_on_every_worker(own_server):
     """After a reboot under W=4 the replicated copy must live on EVERY worker,
     not just worker 0 (the `trim_worker_partitions` regression would drop it on
     every worker whose range excludes partition 0). The probe is a join created
     AFTER the reboot against a partitioned fact spread across all workers: a
     fact whose worker lost the dim copy would produce no join row, so a missing
     copy on any worker shows up as missing join rows."""
-    workers = max(2, _NUM_WORKERS)
-    tmpdir = tempfile.mkdtemp(dir=os.path.expanduser("~/git/gnitz/tmp"), prefix="gnitz_repl_")
-    data_dir = os.path.join(tmpdir, "data")
-    sock = os.path.join(tmpdir, "gnitz.sock")
-    proc = None
-    try:
-        # Phase 1: create + populate the replicated dim, then crash.
-        proc = _start(data_dir, sock, workers)
-        c = gnitz.connect(sock)
+    sock = own_server.sock_path
+    # Phase 1: create + populate the replicated dim, then crash.
+    own_server.start(workers=max(2, _NUM_WORKERS))
+    with gnitz.connect(sock) as c:
         c.create_schema("repl")
         c.execute_sql(
             "CREATE TABLE dim (dim_id BIGINT NOT NULL PRIMARY KEY, name BIGINT NOT NULL) "
             "WITH (replicated = true)", schema_name="repl")
         c.execute_sql(
             "INSERT INTO dim VALUES (1, 100), (2, 200), (3, 300), (4, 400)", schema_name="repl")
-        c.close()
 
-        # Phase 2: reboot (SIGKILL + restart on the same data dir).
-        _stop(proc)
-        if os.path.exists(sock):
-            os.unlink(sock)
-        proc = _start(data_dir, sock, workers)
-        c = gnitz.connect(sock)
-
+    # Phase 2: reboot (SIGKILL + restart on the same data dir).
+    own_server.restart()
+    with gnitz.connect(sock) as c:
         # The dim is replayed; build a fresh fact + join AFTER the reboot so the
         # join probes the dim copy on whichever worker each fact lands on.
         c.execute_sql(
@@ -706,11 +655,6 @@ def test_replicated_full_copy_survives_reboot_on_every_worker(client):
         got = {r["fid"]: r["nm"] for r in rows}
         for i in range(1, 41):
             assert got[i] == ((i % 4) + 1) * 100
-        c.close()
-    finally:
-        if proc is not None:
-            _stop(proc)
-        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

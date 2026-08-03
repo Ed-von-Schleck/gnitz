@@ -517,15 +517,26 @@ For temporary logging: `gnitz_debug!` / `gnitz_info!` macros. Remove before comm
 
 ### Where test logs go
 
-Server stderr (master process): always written to `~/git/gnitz/tmp/server_debug.log`.
-Pytest's `-s` flag does NOT capture this — it lives on disk regardless of
-pytest's stdout/stderr capture mode.
+Python E2E scratch lives in the gitignored `<repo>/tmp`, under pytest's
+`pytest-of-<user>/pytest-<N>/`. A green run deletes the whole thing at the end;
+a run with **any** failure keeps every failed test's data dir for post-mortem,
+and one such run-generation survives into the next (a SIGKILLed run's for three
+days). `make clean` reclaims them. The logs below sit in `<repo>/tmp` at a
+stable path instead, so they outlive the run.
 
-Worker logs: workers write to `<data_dir>/worker_<N>.log` inside the per-test
-tmpdir. The conftest copies them to `~/git/gnitz/tmp/last_worker_N.log` on
-session teardown — those are the canonical post-mortem files.
+Server stderr of the shared session server: always written to
+`<repo>/tmp/server_debug.log`. Pytest's `-s` flag does NOT capture this — it
+lives on disk regardless of pytest's stdout/stderr capture mode.
 
-Live tail (during a long-running test): `tail -f ~/git/gnitz/tmp/gnitz_data_*/data/worker_*.log`
+A test that starts its own server (the `own_server` fixture) gets a private log
+next to its data dir, `<data_dir>.log`, holding both stdout and stderr of every
+boot that test ran.
+
+Worker logs: workers write to `<data_dir>/worker_<N>.log`. The conftest copies
+the session server's to `<repo>/tmp/last_worker_N.log` on session teardown.
+
+Live tail (during a long-running test):
+`tail -f tmp/pytest-of-*/pytest-*/*/data/worker_*.log`
 
 Pre-existing logs from the previous session are overwritten on the next test
 run, so save copies before re-running if you need them.
@@ -545,7 +556,7 @@ run, so save copies before re-running if you need them.
 5. **Use the debug binary** (the default `make server` output). Release
    builds clamp corrupt values silently and hide the real failure mode.
 6. **Test logs survive the session**, code state does NOT — if you want
-   to attach a log to a bug report, copy it out of `~/git/gnitz/tmp/`
+   to attach a log to a bug report, copy it out of `<repo>/tmp/`
    before the next test run overwrites it.
 
 ## SAL durability contract

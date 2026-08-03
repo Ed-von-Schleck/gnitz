@@ -97,11 +97,11 @@ clean: ## Remove built binaries + per-run scratch data (keeps post-mortem logs)
 	@echo "Removing server binaries and per-run scratch data..."
 	@rm -f gnitz-server gnitz-server-release gnitz-server-profiling
 	rm -f crates/gnitz-py/python/gnitz/_native*.so
-	@rm -rf ~/git/gnitz/tmp/gnitz_*
+	@rm -rf tmp/pytest-of-* tmp/bench_*
 
 distclean: clean ## clean + cargo target cache + post-mortem logs
 	cd crates && cargo clean
-	@rm -f ~/git/gnitz/tmp/*.log
+	@rm -f tmp/*.log
 
 # ---------------------------------------------------------------------------
 # Benchmarks — SQL-level performance suite (release server + release planner)

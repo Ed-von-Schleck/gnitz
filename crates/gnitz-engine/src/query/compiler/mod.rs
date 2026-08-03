@@ -808,22 +808,14 @@ mod tests {
         // agg's None is attributable solely to the guard.
         use crate::schema::ReduceOutKey;
         use gnitz_wire::{AggFunc, OpNode};
-        let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
-        std::fs::create_dir_all(&base).unwrap();
-
-        let compiles = |agg_tc: u8, tag: &str| -> bool {
-            let view_dir = format!("{base}/minmax_guard_{tag}_{}", std::process::id());
-            let _ = std::fs::remove_dir_all(&view_dir);
-            std::fs::create_dir_all(&view_dir).unwrap();
+        let compiles = |agg_tc: u8| -> bool {
             // col 0: U64 PK + group key; col 1: the MAX aggregate column.
             let in_schema = SchemaDescriptor::new(
                 &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(agg_tc, 0)],
                 &[0],
             );
-            let mut nodes = HashMap::new();
-            nodes.insert(0, scan_delta(10));
-            nodes.insert(
-                1,
+            compiles_mid_node(
+                in_schema,
                 OpNode::Reduce {
                     group_cols: vec![0],
                     agg: vec![(AggFunc::Max, 1)],
@@ -831,23 +823,15 @@ mod tests {
                     // group_cols = [0] = the single U64 PK ⇒ PkPermutation.
                     out_key: ReduceOutKey::PkPermutation,
                 },
-            );
-            nodes.insert(2, OpNode::IntegrateSink);
-            let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN)];
-            let loaded = make_loaded(nodes, edges);
-            let ext: ExtTables = HashMap::from([(10, in_schema)]);
-            let ordered = loaded.ordered.clone();
-            let some = build_plan(&loaded, &no_skips(), &ordered, &ext, &view_dir, 1, Some(2), &[]).is_ok();
-            let _ = std::fs::remove_dir_all(&view_dir);
-            some
+            )
         };
 
         assert!(
-            compiles(type_code::I64, "i64"),
+            compiles(type_code::I64),
             "control: MAX over an order-encodable I64 column must compile"
         );
         assert!(
-            !compiles(type_code::STRING, "str"),
+            !compiles(type_code::STRING),
             "MAX over a non-order-encodable STRING column must fail the compile (engine guard)"
         );
     }
@@ -861,17 +845,9 @@ mod tests {
     fn reduce_out_key_validation_rejects_mismatch() {
         use crate::schema::ReduceOutKey;
         use gnitz_wire::{AggFunc, OpNode};
-        let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
-        std::fs::create_dir_all(&base).unwrap();
-
-        let compiles = |in_schema: SchemaDescriptor, group: Vec<u16>, out_key: ReduceOutKey, tag: &str| -> bool {
-            let view_dir = format!("{base}/outkey_{tag}_{:?}_{}", out_key, std::process::id());
-            let _ = std::fs::remove_dir_all(&view_dir);
-            std::fs::create_dir_all(&view_dir).unwrap();
-            let mut nodes = HashMap::new();
-            nodes.insert(0, scan_delta(10));
-            nodes.insert(
-                1,
+        let compiles = |in_schema: SchemaDescriptor, group: Vec<u16>, out_key: ReduceOutKey| -> bool {
+            compiles_mid_node(
+                in_schema,
                 OpNode::Reduce {
                     group_cols: group,
                     // A linear COUNT keeps the MIN/MAX-eligibility guard out of the
@@ -880,15 +856,7 @@ mod tests {
                     global_ground: false,
                     out_key,
                 },
-            );
-            nodes.insert(2, OpNode::IntegrateSink);
-            let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN)];
-            let loaded = make_loaded(nodes, edges);
-            let ext: ExtTables = HashMap::from([(10, in_schema)]);
-            let ordered = loaded.ordered.clone();
-            let some = build_plan(&loaded, &no_skips(), &ordered, &ext, &view_dir, 1, Some(2), &[]).is_ok();
-            let _ = std::fs::remove_dir_all(&view_dir);
-            some
+            )
         };
 
         // (schema, group cols, the ONE kind the schema warrants, tag).
@@ -927,7 +895,7 @@ mod tests {
         ];
         for (schema, group, correct, tag) in cases {
             for kind in all_kinds {
-                let ok = compiles(schema, group.clone(), kind, tag);
+                let ok = compiles(schema, group.clone(), kind);
                 assert_eq!(
                     ok,
                     kind == correct,
@@ -956,11 +924,8 @@ mod tests {
         // ScanDelta(wide) --port0--> Join(DT) <--port1-- IntegrateTrace(wide)
         // Join(DT) --> IntegrateSink.
         let schema = wide_pk_schema();
-        let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
-        std::fs::create_dir_all(&base).unwrap();
-        let view_dir = format!("{}/wide_pk_join_{}", base, std::process::id());
-        let _ = std::fs::remove_dir_all(&view_dir);
-        std::fs::create_dir_all(&view_dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let view_dir = dir.path().to_str().unwrap();
 
         let mut nodes = HashMap::new();
         nodes.insert(0, scan_delta(10));
@@ -972,10 +937,10 @@ mod tests {
         let loaded = make_loaded(nodes, edges);
         let ext: ExtTables = HashMap::from([(10, schema), (20, schema)]);
         let ordered = loaded.ordered.clone();
-        let result = build_plan(&loaded, &no_skips(), &ordered, &ext, &view_dir, 1, Some(2), &[]);
-        let _ = std::fs::remove_dir_all(&view_dir);
+        // The plan owns scratch dirs under `dir`, so it must drop first: build it
+        // inside the assert rather than binding it past `dir`'s scope.
         assert!(
-            result.is_ok(),
+            build_plan(&loaded, &no_skips(), &ordered, &ext, view_dir, 1, Some(2), &[]).is_ok(),
             "wide-PK Join(DeltaTrace) must compile after byte-API port"
         );
     }
@@ -1344,19 +1309,17 @@ mod tests {
 
     #[test]
     fn test_build_plan_cleans_scratch_dirs_on_failure() {
-        // ScanDelta → IntegrateTrace → IntegrateSink. IntegrateTrace creates a
-        // scratch dir. An invalid view_dir causes IntegrateTrace to fail the
-        // compile. Scratch dirs created before the failure must be removed so
-        // probing unsupported queries can't leak inodes.
+        // ScanDelta → IntegrateTrace → Map → IntegrateSink, with the Map
+        // projecting an out-of-bounds column so it fails the compile. The
+        // IntegrateTrace before it has already created its scratch dir under
+        // `view_dir`; `ScratchGuard`'s drop must remove it, so probing
+        // unsupported queries can't leak inodes.
         //
-        // Failure is triggered via an invalid view_dir (nonexistent path), not
-        // via a wide-PK rejection (the compiler no longer rejects wide PKs after
-        // the byte-API port).
-        let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
-        std::fs::create_dir_all(&base).unwrap();
-        let view_dir = format!("{}/scratch_cleanup_test_{}", base, std::process::id());
-        let _ = std::fs::remove_dir_all(&view_dir);
-        std::fs::create_dir_all(&view_dir).unwrap();
+        // The failing node must come *after* a node that creates scratch,
+        // otherwise there is nothing for the cleanup to remove and the
+        // assertion below holds vacuously.
+        let dir = tempfile::tempdir().unwrap();
+        let view_dir = dir.path();
 
         let schema = SchemaDescriptor::new(
             &[
@@ -1365,36 +1328,33 @@ mod tests {
             ],
             &[0],
         );
-        // ScanDelta → IntegrateTrace → IntegrateSink. Using an invalid sub-path
-        // for the trace table so create_child_table fails the compile.
         let mut nodes = HashMap::new();
         nodes.insert(0, scan_delta(10));
         nodes.insert(1, gnitz_wire::OpNode::IntegrateTrace);
-        nodes.insert(2, gnitz_wire::OpNode::IntegrateSink);
-        let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN)];
+        nodes.insert(2, gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Projection(vec![200])));
+        nodes.insert(3, gnitz_wire::OpNode::IntegrateSink);
+        let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (2, 3, PORT_IN)];
         let loaded = make_loaded(nodes, edges);
         let ext: ExtTables = HashMap::from([(10, schema)]);
         let ordered = loaded.ordered.clone();
-        // /nonexistent_path forces create_child_table to fail.
         let result = build_plan(
             &loaded,
             &no_skips(),
             &ordered,
             &ext,
-            "/nonexistent_gnitz_scratch_cleanup_test_path",
+            view_dir.to_str().unwrap(),
             1,
-            Some(2),
+            Some(3),
             &[],
         );
-        assert!(result.is_err(), "IntegrateTrace failure must fail the compile");
+        assert!(result.is_err(), "out-of-bounds projection must fail the compile");
 
-        let leftover: Vec<String> = std::fs::read_dir(&view_dir)
+        let leftover: Vec<String> = std::fs::read_dir(view_dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.starts_with("scratch_"))
             .collect();
-        let _ = std::fs::remove_dir_all(&view_dir);
         assert!(
             leftover.is_empty(),
             "scratch dirs must be removed on compile failure, found: {leftover:?}",
@@ -1407,22 +1367,16 @@ mod tests {
         crate::schema::from_wire_cols(cols, gnitz_wire::CIRCUIT_FAMILY_PK)
     }
 
-    fn load_circuit_test_dir(tag: &str) -> String {
-        let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
-        std::fs::create_dir_all(&base).unwrap();
-        let dir = format!("{}/load_circuit_{}_{}", base, tag, std::process::id());
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn test_load_circuit_aborts_on_undecodable_node() {
         // A single CircuitNodes row with an opcode decode_op_node rejects (item
         // 16). Previously the node was silently skipped; load_circuit must now
         // return None rather than emit a partial circuit.
         use crate::storage::BatchBuilder;
-        let dir = load_circuit_test_dir("baddecode");
+        // The `TempDir` guard must outlive the `Table`s built below it: each
+        // one's `ShardIndex` holds the path.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_str().unwrap();
         let nodes_schema = wire_sys_schema(gnitz_wire::CIRCUIT_NODES_COLS);
         let edges_schema = wire_sys_schema(gnitz_wire::CIRCUIT_EDGES_COLS);
         let cols_schema = wire_sys_schema(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS);
@@ -1476,7 +1430,6 @@ mod tests {
             view_id,
             SchemaDescriptor::default(),
         );
-        let _ = std::fs::remove_dir_all(&dir);
         assert!(result.is_none(), "an undecodable node must abort load_circuit");
     }
 
@@ -1485,7 +1438,10 @@ mod tests {
         // Two valid nodes plus an edge whose dst (node 7) does not exist (item
         // 28). load_circuit must return None rather than create a phantom node.
         use crate::storage::BatchBuilder;
-        let dir = load_circuit_test_dir("orphanedge");
+        // The `TempDir` guard must outlive the `Table`s built below it: each
+        // one's `ShardIndex` holds the path.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_str().unwrap();
         let nodes_schema = wire_sys_schema(gnitz_wire::CIRCUIT_NODES_COLS);
         let edges_schema = wire_sys_schema(gnitz_wire::CIRCUIT_EDGES_COLS);
         let cols_schema = wire_sys_schema(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS);
@@ -1556,7 +1512,6 @@ mod tests {
             view_id,
             SchemaDescriptor::default(),
         );
-        let _ = std::fs::remove_dir_all(&dir);
         assert!(
             result.is_none(),
             "an edge to a non-existent node must abort load_circuit"
@@ -1602,12 +1557,9 @@ mod tests {
     // build's `None` are both attributable solely to that field.
 
     /// Build `ScanDelta(10) → mid → IntegrateSink` and report whether it compiles.
-    fn compiles_mid_node(in_schema: SchemaDescriptor, mid: gnitz_wire::OpNode, tag: &str) -> bool {
-        let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
-        std::fs::create_dir_all(&base).unwrap();
-        let view_dir = format!("{base}/pb_{tag}_{}", std::process::id());
-        let _ = std::fs::remove_dir_all(&view_dir);
-        std::fs::create_dir_all(&view_dir).unwrap();
+    fn compiles_mid_node(in_schema: SchemaDescriptor, mid: gnitz_wire::OpNode) -> bool {
+        let dir = tempfile::tempdir().unwrap();
+        let view_dir = dir.path().to_str().unwrap();
         let mut nodes = HashMap::new();
         nodes.insert(0, scan_delta(10));
         nodes.insert(1, mid);
@@ -1616,9 +1568,7 @@ mod tests {
         let loaded = make_loaded(nodes, edges);
         let ext: ExtTables = HashMap::from([(10, in_schema)]);
         let ordered = loaded.ordered.clone();
-        let some = build_plan(&loaded, &no_skips(), &ordered, &ext, &view_dir, 1, Some(2), &[]).is_ok();
-        let _ = std::fs::remove_dir_all(&view_dir);
-        some
+        build_plan(&loaded, &no_skips(), &ordered, &ext, view_dir, 1, Some(2), &[]).is_ok()
     }
 
     #[test]
@@ -1631,8 +1581,8 @@ mod tests {
             global_ground: false,
             out_key: ReduceOutKey::PkPermutation,
         };
-        assert!(compiles_mid_node(two_col_schema(), reduce(vec![0]), "grp_ok"));
-        assert!(!compiles_mid_node(two_col_schema(), reduce(vec![200]), "grp_oob"));
+        assert!(compiles_mid_node(two_col_schema(), reduce(vec![0])));
+        assert!(!compiles_mid_node(two_col_schema(), reduce(vec![200])));
     }
 
     #[test]
@@ -1645,8 +1595,8 @@ mod tests {
             global_ground: false,
             out_key: ReduceOutKey::PkPermutation,
         };
-        assert!(compiles_mid_node(two_col_schema(), reduce(1), "aggcol_ok"));
-        assert!(!compiles_mid_node(two_col_schema(), reduce(200), "aggcol_oob"));
+        assert!(compiles_mid_node(two_col_schema(), reduce(1)));
+        assert!(!compiles_mid_node(two_col_schema(), reduce(200)));
     }
 
     #[test]
@@ -1667,23 +1617,23 @@ mod tests {
             out_key: ReduceOutKey::PkPermutation,
         };
         // Control: SUM over an order-encodable I64 column compiles.
-        assert!(compiles_mid_node(schema(type_code::I64), reduce.clone(), "sum_i64"));
+        assert!(compiles_mid_node(schema(type_code::I64), reduce.clone()));
         // SUM over a 16-byte column would abort in `SumWiden::classify`.
-        assert!(!compiles_mid_node(schema(type_code::U128), reduce.clone(), "sum_u128"));
+        assert!(!compiles_mid_node(schema(type_code::U128), reduce.clone()));
         // SUM over a STRING column would silently mis-sum.
-        assert!(!compiles_mid_node(schema(type_code::STRING), reduce, "sum_str"));
+        assert!(!compiles_mid_node(schema(type_code::STRING), reduce));
     }
 
     #[test]
     fn test_projection_col_out_of_bounds_rejected() {
         use gnitz_wire::{MapKind, OpNode};
         let proj = |cols: Vec<u16>| OpNode::Map(MapKind::Projection(cols));
-        assert!(compiles_mid_node(two_col_schema(), proj(vec![1]), "proj_ok"));
-        assert!(!compiles_mid_node(two_col_schema(), proj(vec![200]), "proj_oob"));
+        assert!(compiles_mid_node(two_col_schema(), proj(vec![1])));
+        assert!(!compiles_mid_node(two_col_schema(), proj(vec![200])));
         // A PK source: `build_map_output_schema` drops it while `copy_cols`
         // numbers destinations densely, so the copy addresses a slot that does
         // not exist — `from_map` would index past the fixed `[_; 65]`.
-        assert!(!compiles_mid_node(two_col_schema(), proj(vec![0]), "proj_pk"));
+        assert!(!compiles_mid_node(two_col_schema(), proj(vec![0])));
         // `oob_cols` bounds each index but not the list length, and duplicates
         // are legal, so a long list overruns `build_map_output_schema`'s array.
         // Exactly MAX_COLUMNS payload sources already overflow — the schema also
@@ -1691,7 +1641,6 @@ mod tests {
         assert!(!compiles_mid_node(
             two_col_schema(),
             proj(vec![1; crate::schema::MAX_COLUMNS]),
-            "proj_len",
         ));
     }
 
@@ -1741,7 +1690,6 @@ mod tests {
             OpNode::NullExtend {
                 type_codes: vec![type_code::I64],
             },
-            "nx_ok",
         ));
         // MAX_COLUMNS type_codes overflow the fixed `[_; 65]` schema array (guard 4).
         assert!(!compiles_mid_node(
@@ -1749,7 +1697,6 @@ mod tests {
             OpNode::NullExtend {
                 type_codes: vec![type_code::I64; crate::schema::MAX_COLUMNS],
             },
-            "nx_len",
         ));
         // (An undecodable type code is rejected at the wire decode boundary,
         // where the two sibling type-code lists are also validated.)
@@ -1768,7 +1715,6 @@ mod tests {
             OpNode::NullExtend {
                 type_codes: vec![type_code::I64, type_code::I64],
             },
-            "nx_merge",
         ));
     }
 
@@ -1829,11 +1775,8 @@ mod tests {
     fn test_destructive_fanout_legit_ordering_compiles() {
         // Distinct id 2 > Filter id 1, so the destructive op is scheduled LAST:
         // the assert must NOT fire and the circuit compiles end to end.
-        let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
-        std::fs::create_dir_all(&base).unwrap();
-        let view_dir = format!("{}/dtor_legit_{}", base, std::process::id());
-        let _ = std::fs::remove_dir_all(&view_dir);
-        std::fs::create_dir_all(&view_dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let view_dir = dir.path().to_str().unwrap();
 
         let loaded = make_dtor_fanout(2, 1);
         // Precondition: the destructive Distinct really is scheduled after its co-reader.
@@ -1842,10 +1785,10 @@ mod tests {
 
         let ext: ExtTables = HashMap::from([(10, two_col_schema())]);
         let ordered = loaded.ordered.clone();
-        let result = build_plan(&loaded, &no_skips(), &ordered, &ext, &view_dir, 1, Some(3), &[]);
-        let _ = std::fs::remove_dir_all(&view_dir);
+        // The plan owns scratch dirs under `dir`, so it must drop first: build it
+        // inside the assert rather than binding it past `dir`'s scope.
         assert!(
-            result.is_ok(),
+            build_plan(&loaded, &no_skips(), &ordered, &ext, view_dir, 1, Some(3), &[]).is_ok(),
             "legitimate destructive fan-out must compile without tripping the ordering assert"
         );
     }
@@ -1871,11 +1814,8 @@ mod tests {
         // the guard rejects. But opt_distinct has elided the Distinct (it is in
         // skip_nodes): it aliases ScanDelta's register and emits no destructive op,
         // so the guard must NOT reject it.
-        let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
-        std::fs::create_dir_all(&base).unwrap();
-        let view_dir = format!("{}/dtor_skip_{}", base, std::process::id());
-        let _ = std::fs::remove_dir_all(&view_dir);
-        std::fs::create_dir_all(&view_dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let view_dir = dir.path().to_str().unwrap();
 
         let loaded = make_dtor_fanout(1, 2);
         let mut skips = no_skips();
@@ -1883,10 +1823,10 @@ mod tests {
 
         let ext: ExtTables = HashMap::from([(10, two_col_schema())]);
         let ordered = loaded.ordered.clone();
-        let result = build_plan(&loaded, &skips, &ordered, &ext, &view_dir, 1, Some(3), &[]);
-        let _ = std::fs::remove_dir_all(&view_dir);
+        // The plan owns scratch dirs under `dir`, so it must drop first: build it
+        // inside the assert rather than binding it past `dir`'s scope.
         assert!(
-            result.is_ok(),
+            build_plan(&loaded, &skips, &ordered, &ext, view_dir, 1, Some(3), &[]).is_ok(),
             "a skipped (optimized-out) Distinct does not run destructively; \
              the guard must not reject it"
         );

@@ -9,17 +9,12 @@ Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_serial.py -v
 """
 
-import os
 import random
-import signal
-import subprocess
-import tempfile
 import threading
-import time
 
 import pytest
 import gnitz
-from _serverproc import server_preexec, HANG_TIMEOUT, START_TIMEOUT
+from _serverproc import HANG_TIMEOUT, START_TIMEOUT
 
 
 def _uid():
@@ -491,74 +486,29 @@ def test_concurrent_serial_alloc_with_seeks(server):
 # ---------------------------------------------------------------------------
 
 
-def _server_binary():
-    binary = os.environ.get(
-        "GNITZ_SERVER_BIN",
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../gnitz-server")),
-    )
-    if not os.path.isfile(binary):
-        pytest.skip(f"Server binary not found: {binary}")
-    return binary
-
-
-def _start(data_dir, sock_path, workers):
-    cmd = [_server_binary(), data_dir, sock_path, f"--workers={workers}"]
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        start_new_session=True, preexec_fn=server_preexec,
-    )
-    deadline = time.time() + 10.0
-    while time.time() < deadline:
-        if os.path.exists(sock_path):
-            return proc
-        time.sleep(0.05)
-    proc.kill()
-    proc.wait()
-    raise RuntimeError("server did not start")
-
-
-def _stop(proc):
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    proc.wait()
-
-
-def test_restart_id_monotonicity():
+def test_restart_id_monotonicity(own_server):
     """A committed id is never re-issued: after a crash-restart on the same data
     dir, every new id exceeds every id committed before the restart (gaps from a
     discarded range tail are permitted)."""
-    workers = int(os.environ.get("GNITZ_WORKERS", "4"))
-    tmp = tempfile.mkdtemp(dir=os.path.expanduser("~/git/gnitz/tmp"), prefix="gnitz_serial_")
-    data_dir = os.path.join(tmp, "data")
-    sock = os.path.join(tmp, "gnitz.sock")
-    proc = _start(data_dir, sock, workers)
-    try:
-        with gnitz.connect(sock) as c:
-            c.create_schema("s")
-            c.execute_sql("CREATE TABLE t (id SERIAL PRIMARY KEY, name TEXT)", schema_name="s")
-            c.execute_sql("INSERT INTO t (name) VALUES ('a'), ('b'), ('c')", schema_name="s")
-            tid, _ = c.resolve_table("s", "t")
-            before = sorted(r.id for r in c.scan(tid))
-        assert before == [1, 2, 3]
+    sock = own_server.sock_path
+    own_server.start()
+    with gnitz.connect(sock) as c:
+        c.create_schema("s")
+        c.execute_sql("CREATE TABLE t (id SERIAL PRIMARY KEY, name TEXT)", schema_name="s")
+        c.execute_sql("INSERT INTO t (name) VALUES ('a'), ('b'), ('c')", schema_name="s")
+        tid, _ = c.resolve_table("s", "t")
+        before = sorted(r.id for r in c.scan(tid))
+    assert before == [1, 2, 3]
 
-        # Crash-restart on the SAME data dir (durable catalog + sequence survive).
-        _stop(proc)
-        if os.path.exists(sock):
-            os.unlink(sock)
-        proc = _start(data_dir, sock, workers)
+    # Crash-restart on the SAME data dir (durable catalog + sequence survive).
+    own_server.restart()
 
-        with gnitz.connect(sock) as c:
-            # A fresh connection re-fetches the schema (is_serial round-trips
-            # through COL_TAB) and continues drawing ids above the durable
-            # high-water.
-            c.execute_sql("INSERT INTO t (name) VALUES ('d'), ('e')", schema_name="s")
-            tid, _ = c.resolve_table("s", "t")
-            after = sorted(r.id for r in c.scan(tid) if r.id not in before)
-        assert after, "expected new rows after restart"
-        assert min(after) > max(before), f"new ids {after} must exceed pre-restart max {max(before)}"
-    finally:
-        _stop(proc)
-        import shutil
-        shutil.rmtree(tmp, ignore_errors=True)
+    with gnitz.connect(sock) as c:
+        # A fresh connection re-fetches the schema (is_serial round-trips
+        # through COL_TAB) and continues drawing ids above the durable
+        # high-water.
+        c.execute_sql("INSERT INTO t (name) VALUES ('d'), ('e')", schema_name="s")
+        tid, _ = c.resolve_table("s", "t")
+        after = sorted(r.id for r in c.scan(tid) if r.id not in before)
+    assert after, "expected new rows after restart"
+    assert min(after) > max(before), f"new ids {after} must exceed pre-restart max {max(before)}"

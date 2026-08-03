@@ -14,17 +14,12 @@ import threading
 import time
 import pytest
 import gnitz
-from _serverproc import tiny_checkpoint_server, HANG_TIMEOUT, START_TIMEOUT
+from _serverproc import HANG_TIMEOUT, START_TIMEOUT
 
 # Hang ceilings for the concurrent push/scan/seek/insert tests below — see the
 # rationale on the shared constants in _serverproc.py.
-
-
-@pytest.fixture
-def checkpoint_server():
-    """Function-scoped server with a tiny SAL checkpoint threshold."""
-    with tiny_checkpoint_server("gnitz_checkpoint_") as (sock_path, _data_dir):
-        yield sock_path
+# `checkpoint_server` (the tiny-threshold server these tests run against) is a
+# conftest fixture.
 
 
 @pytest.fixture

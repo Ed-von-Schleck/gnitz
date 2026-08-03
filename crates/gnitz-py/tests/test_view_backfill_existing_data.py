@@ -22,19 +22,12 @@ Run at GNITZ_WORKERS 1 and 4 (the exchange/fanout paths only engage at W>1):
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest \
         tests/test_view_backfill_existing_data.py -v --tb=short
 """
-import os
-import signal
-import subprocess
-import tempfile
 import threading
 import time
 import random
 
 import pytest
 import gnitz
-from _serverproc import server_preexec
-
-_NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))
 
 
 def _uid():
@@ -441,125 +434,71 @@ def test_vbf_inflight_exchange_no_wedge(client, server):
 # ── dedicated-server variants (checkpoint window, restart) ──────────────────────
 
 
-def _spawn(data_dir, sock_path, extra_env=None):
-    binary = os.environ.get(
-        "GNITZ_SERVER_BIN",
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../gnitz-server")),
-    )
-    if not os.path.isfile(binary):
-        pytest.skip(f"Server binary not found: {binary}")
-    cmd = [binary, data_dir, sock_path]
-    if _NUM_WORKERS:
-        cmd += [f"--workers={_NUM_WORKERS}"]
-    env = os.environ.copy()
-    if extra_env:
-        env.update(extra_env)
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        start_new_session=True, env=env, preexec_fn=server_preexec,
-    )
-    for _ in range(100):
-        if os.path.exists(sock_path):
-            break
-        time.sleep(0.1)
-    else:
-        proc.kill()
-        proc.communicate()
-        raise RuntimeError("Server did not start")
-    return proc
-
-
-def _kill(proc):
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    proc.wait()
-
-
-def test_vbf_checkpoint_in_window_group_by():
+def test_vbf_checkpoint_in_window_group_by(own_server):
     """Insert enough to cross a low SAL checkpoint threshold (draining
     pending_deltas), THEN CREATE an exchange GROUP BY view. The committed store
     is the only driver — a flushed-snapshot under-count or a checkpoint-strands-
     exchange regression both surface as a wrong/empty result. Assert weight 1."""
-    tmp = tempfile.mkdtemp(dir=os.path.expanduser("~/git/gnitz/tmp"), prefix="gnitz_vbfckpt_")
-    data_dir = os.path.join(tmp, "data")
-    sock = os.path.join(tmp, "gnitz.sock")
-    env = {"GNITZ_CHECKPOINT_BYTES": "65536"}
-    proc = _spawn(data_dir, sock, extra_env=env)
-    try:
-        conn = gnitz.connect(sock)
-        conn.create_schema("ck")
-        conn.execute_sql(
-            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, n BIGINT NOT NULL)",
-            schema_name="ck",
-        )
-        N = 4000
-        chunk = 1000
-        for base in range(0, N, chunk):
-            rows = [(i, i % 10, i) for i in range(base, min(base + chunk, N))]
-            conn.execute_sql(f"INSERT INTO t VALUES {_values(rows)}", schema_name="ck")
-        conn.execute_sql("CREATE VIEW v AS SELECT g, COUNT(*) AS c FROM t GROUP BY g", schema_name="ck")
-        vid, _ = conn.resolve_table("ck", "v")
-        exp = {}
-        for i in range(N):
-            exp[i % 10] = exp.get(i % 10, 0) + 1
-        _assert_keys(conn, vid, set(exp.items()), lambda d: (d["g"], d["c"]), "checkpoint-window group-by")
-        conn.close()
-    finally:
-        _kill(proc)
-        import shutil
-        shutil.rmtree(tmp, ignore_errors=True)
+    sock = own_server.sock_path
+    own_server.start(extra_env={"GNITZ_CHECKPOINT_BYTES": "65536"})
+    conn = gnitz.connect(sock)
+    conn.create_schema("ck")
+    conn.execute_sql(
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, n BIGINT NOT NULL)",
+        schema_name="ck",
+    )
+    N = 4000
+    chunk = 1000
+    for base in range(0, N, chunk):
+        rows = [(i, i % 10, i) for i in range(base, min(base + chunk, N))]
+        conn.execute_sql(f"INSERT INTO t VALUES {_values(rows)}", schema_name="ck")
+    conn.execute_sql("CREATE VIEW v AS SELECT g, COUNT(*) AS c FROM t GROUP BY g", schema_name="ck")
+    vid, _ = conn.resolve_table("ck", "v")
+    exp = {}
+    for i in range(N):
+        exp[i % 10] = exp.get(i % 10, 0) + 1
+    _assert_keys(conn, vid, set(exp.items()), lambda d: (d["g"], d["c"]), "checkpoint-window group-by")
+    conn.close()
 
 
-def test_vbf_nested_live_then_restart():
+def test_vbf_nested_live_then_restart(own_server):
     """`g` over an already-created exchange view `v`, both created live after
     data. Assert live correctness, then crash-restart and assert `g` equals
     brute force — catching any boot nested double-count."""
-    tmp = tempfile.mkdtemp(dir=os.path.expanduser("~/git/gnitz/tmp"), prefix="gnitz_vbfnest_")
-    data_dir = os.path.join(tmp, "data")
-    sock = os.path.join(tmp, "gnitz.sock")
-    proc = _spawn(data_dir, sock)
-    try:
-        conn = gnitz.connect(sock)
-        conn.create_schema("ne")
-        conn.execute_sql(
-            "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL, val BIGINT NOT NULL)",
-            schema_name="ne",
-        )
-        rows = [(i, i % 4, (i % 4) + 1) for i in range(40)]  # distinct per-group sums
-        conn.execute_sql(f"INSERT INTO a VALUES {_values(rows)}", schema_name="ne")
-        # Commit the rows before either view exists.
-        aid, _ = conn.resolve_table("ne", "a")
-        list(conn.scan(aid))
-        # v (GROUP BY over a), then g (GROUP BY over v) — both live, over data.
-        conn.execute_sql("CREATE VIEW v AS SELECT grp, SUM(val) AS s FROM a GROUP BY grp", schema_name="ne")
-        conn.execute_sql("CREATE VIEW g AS SELECT s, COUNT(*) AS c FROM v GROUP BY s", schema_name="ne")
+    sock = own_server.sock_path
+    own_server.start()
+    conn = gnitz.connect(sock)
+    conn.create_schema("ne")
+    conn.execute_sql(
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL, val BIGINT NOT NULL)",
+        schema_name="ne",
+    )
+    rows = [(i, i % 4, (i % 4) + 1) for i in range(40)]  # distinct per-group sums
+    conn.execute_sql(f"INSERT INTO a VALUES {_values(rows)}", schema_name="ne")
+    # Commit the rows before either view exists.
+    aid, _ = conn.resolve_table("ne", "a")
+    list(conn.scan(aid))
+    # v (GROUP BY over a), then g (GROUP BY over v) — both live, over data.
+    conn.execute_sql("CREATE VIEW v AS SELECT grp, SUM(val) AS s FROM a GROUP BY grp", schema_name="ne")
+    conn.execute_sql("CREATE VIEW g AS SELECT s, COUNT(*) AS c FROM v GROUP BY s", schema_name="ne")
 
-        v_sums = {}
-        for (_, grp, val) in rows:
-            v_sums[grp] = v_sums.get(grp, 0) + val
-        exp_g = {}
-        for s in v_sums.values():
-            exp_g[s] = exp_g.get(s, 0) + 1
+    v_sums = {}
+    for (_, grp, val) in rows:
+        v_sums[grp] = v_sums.get(grp, 0) + val
+    exp_g = {}
+    for s in v_sums.values():
+        exp_g[s] = exp_g.get(s, 0) + 1
 
-        gid, _ = conn.resolve_table("ne", "g")
-        _assert_keys(conn, gid, set(exp_g.items()), lambda d: (d["s"], d["c"]), "nested live g")
-        conn.close()
+    gid, _ = conn.resolve_table("ne", "g")
+    _assert_keys(conn, gid, set(exp_g.items()), lambda d: (d["s"], d["c"]), "nested live g")
+    conn.close()
 
-        # Crash-restart: boot backfill must rebuild g exactly, no double-count.
-        _kill(proc)
-        if os.path.exists(sock):
-            os.unlink(sock)
-        proc = _spawn(data_dir, sock)
-        conn = gnitz.connect(sock)
-        gid, _ = conn.resolve_table("ne", "g")
-        _assert_keys(conn, gid, set(exp_g.items()), lambda d: (d["s"], d["c"]), "nested g after restart")
-        conn.close()
-    finally:
-        _kill(proc)
-        import shutil
-        shutil.rmtree(tmp, ignore_errors=True)
+    # Crash-restart: boot backfill must rebuild g exactly, no double-count.
+    own_server.restart()
+    conn = gnitz.connect(sock)
+    gid, _ = conn.resolve_table("ne", "g")
+    _assert_keys(conn, gid, set(exp_g.items()), lambda d: (d["s"], d["c"]), "nested g after restart")
+    conn.close()
 
 
 def test_vbf_chunked_backfill_long_strings(tiny_ddl_chunk_server):

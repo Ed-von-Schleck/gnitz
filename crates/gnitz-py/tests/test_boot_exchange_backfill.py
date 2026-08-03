@@ -12,73 +12,11 @@ range-join controls. Run at GNITZ_WORKERS=4 (the exchange/fanout paths only
 engage with multiple workers).
 """
 
-import os
-import subprocess
-import tempfile
-import time
-import shutil
-import signal
 from collections import Counter
 
 import pytest
 import gnitz
 import _oracle as oracle
-from _serverproc import server_preexec
-
-_NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))
-
-
-def _start_server(data_dir, sock_path, workers=None, extra_env=None):
-    binary = os.environ.get(
-        "GNITZ_SERVER_BIN",
-        os.path.abspath(os.path.join(os.path.dirname(__file__),
-                                     "../../../gnitz-server")),
-    )
-    if not os.path.isfile(binary):
-        pytest.skip(f"Server binary not found: {binary}")
-    cmd = [binary, data_dir, sock_path]
-    if workers:
-        cmd += [f"--workers={workers}"]
-    env = None
-    if extra_env:
-        env = os.environ.copy()
-        env.update(extra_env)
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        start_new_session=True, env=env, preexec_fn=server_preexec,
-    )
-    for _ in range(100):
-        if os.path.exists(sock_path):
-            break
-        time.sleep(0.1)
-    else:
-        proc.kill()
-        proc.communicate()
-        raise RuntimeError("Server did not start")
-    return proc
-
-
-def _stop_server(proc):
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    proc.wait()
-
-
-def _crash_and_restart(proc, sock_path, data_dir, workers=None, extra_env=None):
-    """SIGKILL the whole process group, clean up the socket, restart."""
-    _stop_server(proc)
-    if os.path.exists(sock_path):
-        os.unlink(sock_path)
-    return _start_server(data_dir, sock_path, workers=workers, extra_env=extra_env)
-
-
-def _make_env(prefix):
-    tmpdir = tempfile.mkdtemp(
-        dir=os.path.expanduser("~/git/gnitz/tmp"), prefix=prefix,
-    )
-    return tmpdir, os.path.join(tmpdir, "data"), os.path.join(tmpdir, "gnitz.sock")
 
 
 def _values(rows):
@@ -98,56 +36,52 @@ def _by(rows, key):
     return out
 
 
-def test_f1_shared_base_exchange_views_not_doubled():
+def test_f1_shared_base_exchange_views_not_doubled(own_server):
     """F1: a base table feeding several exchange views must be driven once.
 
     `vx1` and `vx2` both group `t`; the old loop drove `t` once per view, so each
     view's aggregates came back exactly doubled. With the dedup they are driven
     once and the sums survive unchanged.
     """
-    tmpdir, data_dir, sock_path = _make_env("gnitz_f1_")
-    try:
-        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
-        conn = gnitz.connect(sock_path)
-        conn.create_schema("f1")
-        conn.execute_sql(
-            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
-            "g BIGINT NOT NULL, val BIGINT NOT NULL)",
-            schema_name="f1",
-        )
-        conn.execute_sql(
-            "CREATE VIEW vx1 AS SELECT g, SUM(val) AS s FROM t GROUP BY g",
-            schema_name="f1",
-        )
-        conn.execute_sql(
-            "CREATE VIEW vx2 AS SELECT g, SUM(pk) AS s FROM t GROUP BY g",
-            schema_name="f1",
-        )
-        rows = [(pk, pk % 6, pk + 1) for pk in range(60)]
-        conn.execute_sql(f"INSERT INTO t VALUES {_values(rows)}", schema_name="f1")
+    sock_path = own_server.sock_path
+    own_server.start()
+    conn = gnitz.connect(sock_path)
+    conn.create_schema("f1")
+    conn.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+        "g BIGINT NOT NULL, val BIGINT NOT NULL)",
+        schema_name="f1",
+    )
+    conn.execute_sql(
+        "CREATE VIEW vx1 AS SELECT g, SUM(val) AS s FROM t GROUP BY g",
+        schema_name="f1",
+    )
+    conn.execute_sql(
+        "CREATE VIEW vx2 AS SELECT g, SUM(pk) AS s FROM t GROUP BY g",
+        schema_name="f1",
+    )
+    rows = [(pk, pk % 6, pk + 1) for pk in range(60)]
+    conn.execute_sql(f"INSERT INTO t VALUES {_values(rows)}", schema_name="f1")
 
-        exp_vx1, exp_vx2 = {}, {}
-        for pk, g, val in rows:
-            exp_vx1[g] = exp_vx1.get(g, 0) + val
-            exp_vx2[g] = exp_vx2.get(g, 0) + pk
+    exp_vx1, exp_vx2 = {}, {}
+    for pk, g, val in rows:
+        exp_vx1[g] = exp_vx1.get(g, 0) + val
+        exp_vx2[g] = exp_vx2.get(g, 0) + pk
 
-        vx1, _ = conn.resolve_table("f1", "vx1")
-        vx2, _ = conn.resolve_table("f1", "vx2")
-        assert {g: r["s"] for g, r in _by(conn.scan(vx1), "g").items()} == exp_vx1
-        conn.close()
+    vx1, _ = conn.resolve_table("f1", "vx1")
+    vx2, _ = conn.resolve_table("f1", "vx2")
+    assert {g: r["s"] for g, r in _by(conn.scan(vx1), "g").items()} == exp_vx1
+    conn.close()
 
-        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
-        conn = gnitz.connect(sock_path)
-        vx1, _ = conn.resolve_table("f1", "vx1")
-        vx2, _ = conn.resolve_table("f1", "vx2")
-        got1 = {g: r["s"] for g, r in _by(conn.scan(vx1), "g").items()}
-        got2 = {g: r["s"] for g, r in _by(conn.scan(vx2), "g").items()}
-        assert got1 == exp_vx1, f"vx1 doubled? got {got1}, want {exp_vx1}"
-        assert got2 == exp_vx2, f"vx2 doubled? got {got2}, want {exp_vx2}"
-        conn.close()
-        _stop_server(proc)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    own_server.restart()
+    conn = gnitz.connect(sock_path)
+    vx1, _ = conn.resolve_table("f1", "vx1")
+    vx2, _ = conn.resolve_table("f1", "vx2")
+    got1 = {g: r["s"] for g, r in _by(conn.scan(vx1), "g").items()}
+    got2 = {g: r["s"] for g, r in _by(conn.scan(vx2), "g").items()}
+    assert got1 == exp_vx1, f"vx1 doubled? got {got1}, want {exp_vx1}"
+    assert got2 == exp_vx2, f"vx2 doubled? got {got2}, want {exp_vx2}"
+    conn.close()
 
 
 def _build_f2(conn, schema, extra_views=False):
@@ -182,47 +116,43 @@ def _build_f2(conn, schema, extra_views=False):
 
 
 @pytest.mark.parametrize("extra_views", [False, True], ids=["plain", "perturbed"])
-def test_f2_nested_exchange_over_exchange(extra_views):
+def test_f2_nested_exchange_over_exchange(extra_views, own_server):
     """F2: an exchange view nested over another exchange view must not be filled
     twice. Driving the base alone fills the whole chain transitively; the old
     loop additionally drove the intermediate view as a source, double-filling the
     top view in a hashmap-order-dependent way. Asserted with and without decoy
     views that perturb that order.
     """
-    tmpdir, data_dir, sock_path = _make_env("gnitz_f2_")
-    try:
-        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
-        conn = gnitz.connect(sock_path)
-        _build_f2(conn, "f2", extra_views=extra_views)
-        # grp in {0,1}; pick vals so the two groups have DISTINCT sums (so g has
-        # two singleton groups) — a doubling of v's sums would move them.
-        rows = [(pk, pk % 2, (pk % 2) + 1) for pk in range(20)]
-        conn.execute_sql(f"INSERT INTO a VALUES {_values(rows)}", schema_name="f2")
+    sock_path = own_server.sock_path
+    own_server.start()
+    conn = gnitz.connect(sock_path)
+    _build_f2(conn, "f2", extra_views=extra_views)
+    # grp in {0,1}; pick vals so the two groups have DISTINCT sums (so g has
+    # two singleton groups) — a doubling of v's sums would move them.
+    rows = [(pk, pk % 2, (pk % 2) + 1) for pk in range(20)]
+    conn.execute_sql(f"INSERT INTO a VALUES {_values(rows)}", schema_name="f2")
 
-        v_sums = {}
-        for pk, grp, val in rows:
-            v_sums[grp] = v_sums.get(grp, 0) + val
-        exp_g = {}
-        for s in v_sums.values():
-            exp_g[s] = exp_g.get(s, 0) + 1
+    v_sums = {}
+    for pk, grp, val in rows:
+        v_sums[grp] = v_sums.get(grp, 0) + val
+    exp_g = {}
+    for s in v_sums.values():
+        exp_g[s] = exp_g.get(s, 0) + 1
 
-        conn.close()
-        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
-        conn = gnitz.connect(sock_path)
+    conn.close()
+    own_server.restart()
+    conn = gnitz.connect(sock_path)
 
-        vid, _ = conn.resolve_table("f2", "v")
-        gid, _ = conn.resolve_table("f2", "g")
-        got_v = {grp: r["s"] for grp, r in _by(conn.scan(vid), "grp").items()}
-        got_g = {s: r["c"] for s, r in _by(conn.scan(gid), "s").items()}
-        assert got_v == v_sums, f"v doubled? got {got_v}, want {v_sums}"
-        assert got_g == exp_g, f"g double-filled? got {got_g}, want {exp_g}"
-        conn.close()
-        _stop_server(proc)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    vid, _ = conn.resolve_table("f2", "v")
+    gid, _ = conn.resolve_table("f2", "g")
+    got_v = {grp: r["s"] for grp, r in _by(conn.scan(vid), "grp").items()}
+    got_g = {s: r["c"] for s, r in _by(conn.scan(gid), "s").items()}
+    assert got_v == v_sums, f"v doubled? got {got_v}, want {v_sums}"
+    assert got_g == exp_g, f"g double-filled? got {got_g}, want {exp_g}"
+    conn.close()
 
 
-def test_exchange_over_nonexchange_after_restart():
+def test_exchange_over_nonexchange_after_restart(own_server):
     """`x` (exchange) over `n` (non-exchange projection) over base `a`.
 
     The dedup drives the transitive base `a`, whose single drive fills both `n`
@@ -231,56 +161,51 @@ def test_exchange_over_nonexchange_after_restart():
     correct. Base data is flushed so a regressed inline open-time backfill would
     have double-filled `n`.
     """
-    tmpdir, data_dir, sock_path = _make_env("gnitz_xovern_")
-    env = {"GNITZ_CHECKPOINT_BYTES": "1024"}
-    try:
-        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS, extra_env=env)
-        conn = gnitz.connect(sock_path)
-        conn.create_schema("xn")
-        conn.execute_sql(
-            "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-            schema_name="xn",
-        )
-        conn.execute_sql(
-            "CREATE VIEW n AS SELECT pk, val + 1 AS p1 FROM a",
-            schema_name="xn",
-        )
-        conn.execute_sql(
-            "CREATE VIEW x AS SELECT p1, COUNT(*) AS c FROM n GROUP BY p1",
-            schema_name="xn",
-        )
-        # val in {0..4}; p1 = val+1 in {1..5}; counts per p1 known.
-        rows = [(pk, pk % 5) for pk in range(100)]
-        conn.execute_sql(f"INSERT INTO a VALUES {_values(rows)}", schema_name="xn")
+    sock_path = own_server.sock_path
+    own_server.start(extra_env={"GNITZ_CHECKPOINT_BYTES": "1024"})
+    conn = gnitz.connect(sock_path)
+    conn.create_schema("xn")
+    conn.execute_sql(
+        "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+        schema_name="xn",
+    )
+    conn.execute_sql(
+        "CREATE VIEW n AS SELECT pk, val + 1 AS p1 FROM a",
+        schema_name="xn",
+    )
+    conn.execute_sql(
+        "CREATE VIEW x AS SELECT p1, COUNT(*) AS c FROM n GROUP BY p1",
+        schema_name="xn",
+    )
+    # val in {0..4}; p1 = val+1 in {1..5}; counts per p1 known.
+    rows = [(pk, pk % 5) for pk in range(100)]
+    conn.execute_sql(f"INSERT INTO a VALUES {_values(rows)}", schema_name="xn")
 
-        exp_x = {}
-        for pk, val in rows:
-            exp_x[val + 1] = exp_x.get(val + 1, 0) + 1
+    exp_x = {}
+    for pk, val in rows:
+        exp_x[val + 1] = exp_x.get(val + 1, 0) + 1
 
-        conn.close()
-        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS, extra_env=env)
-        conn = gnitz.connect(sock_path)
+    conn.close()
+    own_server.restart()
+    conn = gnitz.connect(sock_path)
 
-        nid, _ = conn.resolve_table("xn", "n")
-        xid, _ = conn.resolve_table("xn", "x")
+    nid, _ = conn.resolve_table("xn", "n")
+    xid, _ = conn.resolve_table("xn", "x")
 
-        # n: every base row projected once, weight exactly 1 (not double-filled).
-        n_weight = {}
-        for r in conn.scan(nid):
-            n_weight[r["pk"]] = n_weight.get(r["pk"], 0) + r.weight
-        assert len(n_weight) == len(rows), f"n missing rows: {len(n_weight)}/{len(rows)}"
-        assert all(w == 1 for w in n_weight.values()), \
-            f"n double-counted: weights {sorted(set(n_weight.values()))}"
+    # n: every base row projected once, weight exactly 1 (not double-filled).
+    n_weight = {}
+    for r in conn.scan(nid):
+        n_weight[r["pk"]] = n_weight.get(r["pk"], 0) + r.weight
+    assert len(n_weight) == len(rows), f"n missing rows: {len(n_weight)}/{len(rows)}"
+    assert all(w == 1 for w in n_weight.values()), \
+        f"n double-counted: weights {sorted(set(n_weight.values()))}"
 
-        got_x = {p1: r["c"] for p1, r in _by(conn.scan(xid), "p1").items()}
-        assert got_x == exp_x, f"x wrong after restart: got {got_x}, want {exp_x}"
-        conn.close()
-        _stop_server(proc)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    got_x = {p1: r["c"] for p1, r in _by(conn.scan(xid), "p1").items()}
+    assert got_x == exp_x, f"x wrong after restart: got {got_x}, want {exp_x}"
+    conn.close()
 
 
-def test_join_sharing_a_base_after_restart():
+def test_join_sharing_a_base_after_restart(own_server):
     """Two joins sharing a base: `x = a JOIN b`, `y = a JOIN c`. The shared base
     `a` must be driven once; the old loop drove it once per listing view, duplicating
     every join output row. Assert both joins match a brute-force join with weight 1.
@@ -290,74 +215,70 @@ def test_join_sharing_a_base_after_restart():
     the boot re-derivation entirely and both came back a deterministic per-key
     prefix at W>1 (e.g. 9 of 30). Recovery must fill both joins completely.
     """
-    tmpdir, data_dir, sock_path = _make_env("gnitz_joinshare_")
-    try:
-        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
-        conn = gnitz.connect(sock_path)
-        conn.create_schema("js")
-        conn.execute_sql(
-            "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, av BIGINT NOT NULL)",
-            schema_name="js",
-        )
-        conn.execute_sql(
-            "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, bv BIGINT NOT NULL)",
-            schema_name="js",
-        )
-        conn.execute_sql(
-            "CREATE TABLE c (id BIGINT NOT NULL PRIMARY KEY, cv BIGINT NOT NULL)",
-            schema_name="js",
-        )
-        conn.execute_sql(
-            "CREATE VIEW x AS SELECT a.id AS aid, a.av AS av, b.bv AS bv "
-            "FROM a JOIN b ON a.k = b.id",
-            schema_name="js",
-        )
-        conn.execute_sql(
-            "CREATE VIEW y AS SELECT a.id AS aid, a.av AS av, c.cv AS cv "
-            "FROM a JOIN c ON a.k = c.id",
-            schema_name="js",
-        )
-        a_rows = [(i, i % 5, i * 10) for i in range(30)]  # k in {0..4}
-        bc_rows = [(k, k * 100) for k in range(5)]
-        conn.execute_sql(f"INSERT INTO a VALUES {_values(a_rows)}", schema_name="js")
-        conn.execute_sql(f"INSERT INTO b VALUES {_values(bc_rows)}", schema_name="js")
-        conn.execute_sql(f"INSERT INTO c VALUES {_values(bc_rows)}", schema_name="js")
+    sock_path = own_server.sock_path
+    own_server.start()
+    conn = gnitz.connect(sock_path)
+    conn.create_schema("js")
+    conn.execute_sql(
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, av BIGINT NOT NULL)",
+        schema_name="js",
+    )
+    conn.execute_sql(
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, bv BIGINT NOT NULL)",
+        schema_name="js",
+    )
+    conn.execute_sql(
+        "CREATE TABLE c (id BIGINT NOT NULL PRIMARY KEY, cv BIGINT NOT NULL)",
+        schema_name="js",
+    )
+    conn.execute_sql(
+        "CREATE VIEW x AS SELECT a.id AS aid, a.av AS av, b.bv AS bv "
+        "FROM a JOIN b ON a.k = b.id",
+        schema_name="js",
+    )
+    conn.execute_sql(
+        "CREATE VIEW y AS SELECT a.id AS aid, a.av AS av, c.cv AS cv "
+        "FROM a JOIN c ON a.k = c.id",
+        schema_name="js",
+    )
+    a_rows = [(i, i % 5, i * 10) for i in range(30)]  # k in {0..4}
+    bc_rows = [(k, k * 100) for k in range(5)]
+    conn.execute_sql(f"INSERT INTO a VALUES {_values(a_rows)}", schema_name="js")
+    conn.execute_sql(f"INSERT INTO b VALUES {_values(bc_rows)}", schema_name="js")
+    conn.execute_sql(f"INSERT INTO c VALUES {_values(bc_rows)}", schema_name="js")
 
-        bmap = {k: v for k, v in bc_rows}
-        exp_x = {(aid, av, bmap[k]) for (aid, k, av) in a_rows}
-        exp_y = exp_x  # b and c hold the same rows
+    bmap = {k: v for k, v in bc_rows}
+    exp_x = {(aid, av, bmap[k]) for (aid, k, av) in a_rows}
+    exp_y = exp_x  # b and c hold the same rows
 
-        conn.close()
-        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
-        conn = gnitz.connect(sock_path)
+    conn.close()
+    own_server.restart()
+    conn = gnitz.connect(sock_path)
 
-        xid, _ = conn.resolve_table("js", "x")
-        yid, _ = conn.resolve_table("js", "y")
+    xid, _ = conn.resolve_table("js", "x")
+    yid, _ = conn.resolve_table("js", "y")
 
-        # x: (aid, av, bv); y: (aid, av, cv) — same value tuples by construction.
-        x_w = {}
-        for r in conn.scan(xid):
-            key = (r["aid"], r["av"], r["bv"])
-            x_w[key] = x_w.get(key, 0) + r.weight
-        assert all(w == 1 for w in x_w.values()), f"x duplicated: {x_w}"
-        got_x = set(x_w.keys())
+    # x: (aid, av, bv); y: (aid, av, cv) — same value tuples by construction.
+    x_w = {}
+    for r in conn.scan(xid):
+        key = (r["aid"], r["av"], r["bv"])
+        x_w[key] = x_w.get(key, 0) + r.weight
+    assert all(w == 1 for w in x_w.values()), f"x duplicated: {x_w}"
+    got_x = set(x_w.keys())
 
-        y_w = {}
-        for r in conn.scan(yid):
-            key = (r["aid"], r["av"], r["cv"])
-            y_w[key] = y_w.get(key, 0) + r.weight
-        assert all(w == 1 for w in y_w.values()), f"y duplicated: {y_w}"
-        got_y = set(y_w.keys())
+    y_w = {}
+    for r in conn.scan(yid):
+        key = (r["aid"], r["av"], r["cv"])
+        y_w[key] = y_w.get(key, 0) + r.weight
+    assert all(w == 1 for w in y_w.values()), f"y duplicated: {y_w}"
+    got_y = set(y_w.keys())
 
-        assert got_x == exp_x, f"x wrong: got {got_x} want {exp_x}"
-        assert got_y == exp_y, f"y wrong: got {got_y} want {exp_y}"
-        conn.close()
-        _stop_server(proc)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    assert got_x == exp_x, f"x wrong: got {got_x} want {exp_x}"
+    assert got_y == exp_y, f"y wrong: got {got_y} want {exp_y}"
+    conn.close()
 
 
-def test_diamond_single_counted_after_restart():
+def test_diamond_single_counted_after_restart(own_server):
     """Diamond: `x` reaches base `a` by two paths — directly (`a JOIN v1`) and
     through `v1` (a GROUP BY over `a`). The dedup yields the single base `a`;
     within one drive_dag `x` is evaluated once per incoming edge — correct
@@ -365,50 +286,46 @@ def test_diamond_single_counted_after_restart():
     `x` (and `v1` as `x`'s source), tripling `x`. Assert `x` matches brute force,
     weight 1.
     """
-    tmpdir, data_dir, sock_path = _make_env("gnitz_diamond_")
-    try:
-        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
-        conn = gnitz.connect(sock_path)
-        conn.create_schema("dia")
-        conn.execute_sql(
-            "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, val BIGINT NOT NULL)",
-            schema_name="dia",
-        )
-        conn.execute_sql(
-            "CREATE VIEW v1 AS SELECT g, SUM(val) AS s FROM a GROUP BY g",
-            schema_name="dia",
-        )
-        conn.execute_sql(
-            "CREATE VIEW x AS SELECT a.id AS id, a.g AS g, v1.s AS s "
-            "FROM a JOIN v1 ON a.g = v1.g",
-            schema_name="dia",
-        )
-        a_rows = [(i, i % 4, i + 1) for i in range(40)]  # g in {0..3}
-        conn.execute_sql(f"INSERT INTO a VALUES {_values(a_rows)}", schema_name="dia")
+    sock_path = own_server.sock_path
+    own_server.start()
+    conn = gnitz.connect(sock_path)
+    conn.create_schema("dia")
+    conn.execute_sql(
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, val BIGINT NOT NULL)",
+        schema_name="dia",
+    )
+    conn.execute_sql(
+        "CREATE VIEW v1 AS SELECT g, SUM(val) AS s FROM a GROUP BY g",
+        schema_name="dia",
+    )
+    conn.execute_sql(
+        "CREATE VIEW x AS SELECT a.id AS id, a.g AS g, v1.s AS s "
+        "FROM a JOIN v1 ON a.g = v1.g",
+        schema_name="dia",
+    )
+    a_rows = [(i, i % 4, i + 1) for i in range(40)]  # g in {0..3}
+    conn.execute_sql(f"INSERT INTO a VALUES {_values(a_rows)}", schema_name="dia")
 
-        gsum = {}
-        for (i, g, val) in a_rows:
-            gsum[g] = gsum.get(g, 0) + val
-        exp_x = {(i, g, gsum[g]) for (i, g, val) in a_rows}
+    gsum = {}
+    for (i, g, val) in a_rows:
+        gsum[g] = gsum.get(g, 0) + val
+    exp_x = {(i, g, gsum[g]) for (i, g, val) in a_rows}
 
-        conn.close()
-        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
-        conn = gnitz.connect(sock_path)
+    conn.close()
+    own_server.restart()
+    conn = gnitz.connect(sock_path)
 
-        xid, _ = conn.resolve_table("dia", "x")
-        x_w = {}
-        for r in conn.scan(xid):
-            key = (r["id"], r["g"], r["s"])
-            x_w[key] = x_w.get(key, 0) + r.weight
-        assert all(w == 1 for w in x_w.values()), f"x duplicated: {sorted(x_w.items())}"
-        assert set(x_w.keys()) == exp_x, f"x wrong: got {set(x_w.keys())} want {exp_x}"
-        conn.close()
-        _stop_server(proc)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    xid, _ = conn.resolve_table("dia", "x")
+    x_w = {}
+    for r in conn.scan(xid):
+        key = (r["id"], r["g"], r["s"])
+        x_w[key] = x_w.get(key, 0) + r.weight
+    assert all(w == 1 for w in x_w.values()), f"x duplicated: {sorted(x_w.items())}"
+    assert set(x_w.keys()) == exp_x, f"x wrong: got {set(x_w.keys())} want {exp_x}"
+    conn.close()
 
 
-def test_bare_two_base_join_after_restart():
+def test_bare_two_base_join_after_restart(own_server):
     """Bare two-base equi-join `x = a JOIN b`, the minimal repro. Neither base
     roots any other exchange view, so the `ExchangeShard`-only classifier returned
     an empty base set and the boot backfill drove nothing for `x` — it came back a
@@ -419,98 +336,90 @@ def test_bare_two_base_join_after_restart():
     concern. Asserts restart-equivalence (set-equality vs. brute force, weight 1),
     never the W-dependent surviving subset.
     """
-    tmpdir, data_dir, sock_path = _make_env("gnitz_barejoin_")
-    try:
-        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
-        conn = gnitz.connect(sock_path)
-        conn.create_schema("bj")
-        conn.execute_sql(
-            "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, av BIGINT NOT NULL)",
-            schema_name="bj",
-        )
-        conn.execute_sql(
-            "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, bv BIGINT NOT NULL)",
-            schema_name="bj",
-        )
-        conn.execute_sql(
-            "CREATE VIEW x AS SELECT a.id AS aid, a.av AS av, b.bv AS bv "
-            "FROM a JOIN b ON a.k = b.id",
-            schema_name="bj",
-        )
-        a_rows = [(i, i % 5, i * 10) for i in range(30)]  # k in {0..4}, every row matches
-        b_rows = [(k, k * 100) for k in range(5)]
-        conn.execute_sql(f"INSERT INTO a VALUES {_values(a_rows)}", schema_name="bj")
-        conn.execute_sql(f"INSERT INTO b VALUES {_values(b_rows)}", schema_name="bj")
+    sock_path = own_server.sock_path
+    own_server.start()
+    conn = gnitz.connect(sock_path)
+    conn.create_schema("bj")
+    conn.execute_sql(
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, av BIGINT NOT NULL)",
+        schema_name="bj",
+    )
+    conn.execute_sql(
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, bv BIGINT NOT NULL)",
+        schema_name="bj",
+    )
+    conn.execute_sql(
+        "CREATE VIEW x AS SELECT a.id AS aid, a.av AS av, b.bv AS bv "
+        "FROM a JOIN b ON a.k = b.id",
+        schema_name="bj",
+    )
+    a_rows = [(i, i % 5, i * 10) for i in range(30)]  # k in {0..4}, every row matches
+    b_rows = [(k, k * 100) for k in range(5)]
+    conn.execute_sql(f"INSERT INTO a VALUES {_values(a_rows)}", schema_name="bj")
+    conn.execute_sql(f"INSERT INTO b VALUES {_values(b_rows)}", schema_name="bj")
 
-        bmap = {bid: bv for bid, bv in b_rows}
-        exp_x = {(aid, av, bmap[k]) for (aid, k, av) in a_rows}
+    bmap = {bid: bv for bid, bv in b_rows}
+    exp_x = {(aid, av, bmap[k]) for (aid, k, av) in a_rows}
 
-        conn.close()
-        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
-        conn = gnitz.connect(sock_path)
+    conn.close()
+    own_server.restart()
+    conn = gnitz.connect(sock_path)
 
-        xid, _ = conn.resolve_table("bj", "x")
-        x_w = {}
-        for r in conn.scan(xid):
-            key = (r["aid"], r["av"], r["bv"])
-            x_w[key] = x_w.get(key, 0) + r.weight
-        assert all(w == 1 for w in x_w.values()), f"x duplicated: {x_w}"
-        assert set(x_w.keys()) == exp_x, \
-            f"x under-filled: got {len(x_w)} of {len(exp_x)} rows"
-        conn.close()
-        _stop_server(proc)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    xid, _ = conn.resolve_table("bj", "x")
+    x_w = {}
+    for r in conn.scan(xid):
+        key = (r["aid"], r["av"], r["bv"])
+        x_w[key] = x_w.get(key, 0) + r.weight
+    assert all(w == 1 for w in x_w.values()), f"x duplicated: {x_w}"
+    assert set(x_w.keys()) == exp_x, \
+        f"x under-filled: got {len(x_w)} of {len(exp_x)} rows"
+    conn.close()
 
 
-def test_range_two_base_join_after_restart():
+def test_range_two_base_join_after_restart(own_server):
     """Range two-base join `r = ra JOIN rb ON ra.x < rb.y`. Regression guard that
     a two-base range join still recovers correctly across a restart: its relay
     broadcasts (no eq prefix to scatter on) where every other join shape
     scatters.
     """
-    tmpdir, data_dir, sock_path = _make_env("gnitz_rangejoin_")
-    try:
-        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
-        conn = gnitz.connect(sock_path)
-        conn.create_schema("rj")
-        conn.execute_sql(
-            "CREATE TABLE ra (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
-            schema_name="rj",
-        )
-        conn.execute_sql(
-            "CREATE TABLE rb (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)",
-            schema_name="rj",
-        )
-        conn.execute_sql(
-            "CREATE VIEW r AS SELECT ra.x AS x, rb.y AS y FROM ra JOIN rb ON ra.x < rb.y",
-            schema_name="rj",
-        )
-        ra_rows = [(i, i) for i in range(10)]   # (id, x)
-        rb_rows = [(j, j) for j in range(10)]   # (id, y)
-        conn.execute_sql(f"INSERT INTO ra VALUES {_values(ra_rows)}", schema_name="rj")
-        conn.execute_sql(f"INSERT INTO rb VALUES {_values(rb_rows)}", schema_name="rj")
+    sock_path = own_server.sock_path
+    own_server.start()
+    conn = gnitz.connect(sock_path)
+    conn.create_schema("rj")
+    conn.execute_sql(
+        "CREATE TABLE ra (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
+        schema_name="rj",
+    )
+    conn.execute_sql(
+        "CREATE TABLE rb (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)",
+        schema_name="rj",
+    )
+    conn.execute_sql(
+        "CREATE VIEW r AS SELECT ra.x AS x, rb.y AS y FROM ra JOIN rb ON ra.x < rb.y",
+        schema_name="rj",
+    )
+    ra_rows = [(i, i) for i in range(10)]   # (id, x)
+    rb_rows = [(j, j) for j in range(10)]   # (id, y)
+    conn.execute_sql(f"INSERT INTO ra VALUES {_values(ra_rows)}", schema_name="rj")
+    conn.execute_sql(f"INSERT INTO rb VALUES {_values(rb_rows)}", schema_name="rj")
 
-        # The view's pair-PK columns (r[0], r[1]) = (ra.id, rb.id).
-        exp_pairs = {(ai, bi) for (ai, ax) in ra_rows for (bi, by) in rb_rows if ax < by}
-        assert exp_pairs, "range join data must produce some matches"
+    # The view's pair-PK columns (r[0], r[1]) = (ra.id, rb.id).
+    exp_pairs = {(ai, bi) for (ai, ax) in ra_rows for (bi, by) in rb_rows if ax < by}
+    assert exp_pairs, "range join data must produce some matches"
 
-        conn.close()
-        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
-        conn = gnitz.connect(sock_path)
+    conn.close()
+    own_server.restart()
+    conn = gnitz.connect(sock_path)
 
-        rid, _ = conn.resolve_table("rj", "r")
-        p_w = {}
-        for row in conn.scan(rid):
-            key = (row[0], row[1])
-            p_w[key] = p_w.get(key, 0) + row.weight
-        assert all(w == 1 for w in p_w.values()), f"range join duplicated: {p_w}"
-        assert set(p_w.keys()) == exp_pairs, \
-            f"range join wrong after restart: got {len(p_w)} of {len(exp_pairs)} pairs"
-        conn.close()
-        _stop_server(proc)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    rid, _ = conn.resolve_table("rj", "r")
+    p_w = {}
+    for row in conn.scan(rid):
+        key = (row[0], row[1])
+        p_w[key] = p_w.get(key, 0) + row.weight
+    assert all(w == 1 for w in p_w.values()), f"range join duplicated: {p_w}"
+    assert set(p_w.keys()) == exp_pairs, \
+        f"range join wrong after restart: got {len(p_w)} of {len(exp_pairs)} pairs"
+    conn.close()
 
 
 # ── rebuild-equivalence for shapes the existing suites don't restart ────────────
@@ -526,138 +435,125 @@ def test_range_two_base_join_after_restart():
 # aggregates here are all bit-stable across rebuild, so every column is compared.
 
 
-def test_group_by_min_max_avg_after_restart():
+def test_group_by_min_max_avg_after_restart(own_server):
     """GROUP BY MIN/MAX/AVG must rebuild identically across a crash restart —
     absent from both backfill suites, which restart only SUM/COUNT. A pre-restart
     DELETE removes a group's MIN holder so the live trace carries a MIN-retraction
     recompute before the snapshot. Integer AVG is part of the multiset and compared
     by value (SUM and COUNT are exact integers, AVG one deterministic division)."""
-    tmpdir, data_dir, sock_path = _make_env("gnitz_gbmma_")
-    try:
-        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
-        conn = gnitz.connect(sock_path)
-        conn.create_schema("mm")
-        conn.execute_sql(
-            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, a BIGINT NOT NULL)",
-            schema_name="mm",
-        )
-        conn.execute_sql(
-            "CREATE VIEW v AS SELECT g, MIN(a) AS lo, MAX(a) AS hi, AVG(a) AS av, "
-            "COUNT(*) AS c FROM t GROUP BY g",
-            schema_name="mm",
-        )
-        # 6 groups, ~10 rows each, spread `a` values so MIN/MAX/AVG are non-trivial
-        # and several AVGs are non-integral (exercising the f64 division).
-        rows = [(pk, pk % 6, (pk * 7) % 50) for pk in range(60)]
-        conn.execute_sql(f"INSERT INTO t VALUES {_values(rows)}", schema_name="mm")
-        # Delete group 0's MIN holder (pk=0, a=0) → live MIN(g=0) recomputes.
-        conn.execute_sql("DELETE FROM t WHERE pk = 0", schema_name="mm")
+    sock_path = own_server.sock_path
+    own_server.start()
+    conn = gnitz.connect(sock_path)
+    conn.create_schema("mm")
+    conn.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, a BIGINT NOT NULL)",
+        schema_name="mm",
+    )
+    conn.execute_sql(
+        "CREATE VIEW v AS SELECT g, MIN(a) AS lo, MAX(a) AS hi, AVG(a) AS av, "
+        "COUNT(*) AS c FROM t GROUP BY g",
+        schema_name="mm",
+    )
+    # 6 groups, ~10 rows each, spread `a` values so MIN/MAX/AVG are non-trivial
+    # and several AVGs are non-integral (exercising the f64 division).
+    rows = [(pk, pk % 6, (pk * 7) % 50) for pk in range(60)]
+    conn.execute_sql(f"INSERT INTO t VALUES {_values(rows)}", schema_name="mm")
+    # Delete group 0's MIN holder (pk=0, a=0) → live MIN(g=0) recomputes.
+    conn.execute_sql("DELETE FROM t WHERE pk = 0", schema_name="mm")
 
-        vid, _ = conn.resolve_table("mm", "v")
-        project = ["g", "lo", "hi", "av", "c"]
-        before = oracle.scan_multiset(conn, vid, project)
-        assert before, "MIN/MAX/AVG view must be non-empty before restart"
-        conn.close()
+    vid, _ = conn.resolve_table("mm", "v")
+    project = ["g", "lo", "hi", "av", "c"]
+    before = oracle.scan_multiset(conn, vid, project)
+    assert before, "MIN/MAX/AVG view must be non-empty before restart"
+    conn.close()
 
-        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
-        conn = gnitz.connect(sock_path)
-        vid, _ = conn.resolve_table("mm", "v")
-        after = oracle.scan_multiset(conn, vid, project)
-        assert after == before, (
-            f"MIN/MAX/AVG view diverged across rebuild:\nbefore={before}\nafter={after}")
-        conn.close()
-        _stop_server(proc)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    own_server.restart()
+    conn = gnitz.connect(sock_path)
+    vid, _ = conn.resolve_table("mm", "v")
+    after = oracle.scan_multiset(conn, vid, project)
+    assert after == before, (
+        f"MIN/MAX/AVG view diverged across rebuild:\nbefore={before}\nafter={after}")
+    conn.close()
 
 
 @pytest.mark.parametrize("op", ["UNION ALL", "UNION", "INTERSECT", "EXCEPT"])
-def test_set_op_after_restart(op):
+def test_set_op_after_restart(op, own_server):
     """Each set-op must rebuild identically across a crash restart. UNION ALL's
     weight-2 overlaps, the deduplicating ops' boundary state, and EXCEPT/INTERSECT
     distinct/positive_part integrals all run through the boot backfill here — the
     existing vbf suite covers only UNION, and only via the live-create path. A
     pre-restart DELETE from `b` exercises the difference/intersection state before
     the snapshot."""
-    tag = "".join(ch for ch in op.lower() if ch.isalpha())
-    tmpdir, data_dir, sock_path = _make_env(f"gnitz_so_{tag}_")
-    try:
-        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
-        conn = gnitz.connect(sock_path)
-        conn.create_schema("so")
-        conn.execute_sql(
-            "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name="so")
-        conn.execute_sql(
-            "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name="so")
-        conn.execute_sql(
-            f"CREATE VIEW v AS SELECT val FROM a {op} SELECT val FROM b", schema_name="so")
-        # a.val in {0..19} (each twice), b.val in {10..29} (each twice): overlapping
-        # ranges so dedup / difference / intersection are all non-trivial, and
-        # duplicate vals within a side give UNION ALL weight > 1.
-        conn.execute_sql(
-            f"INSERT INTO a VALUES {_values([(i, i % 20) for i in range(40)])}", schema_name="so")
-        conn.execute_sql(
-            f"INSERT INTO b VALUES {_values([(i, (i % 20) + 10) for i in range(40)])}", schema_name="so")
-        # Remove both carriers of b.val=15 → 15 leaves b (re-enters EXCEPT, leaves
-        # INTERSECT) while staying in a.
-        conn.execute_sql("DELETE FROM b WHERE pk IN (5, 25)", schema_name="so")
+    sock_path = own_server.sock_path
+    own_server.start()
+    conn = gnitz.connect(sock_path)
+    conn.create_schema("so")
+    conn.execute_sql(
+        "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name="so")
+    conn.execute_sql(
+        "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name="so")
+    conn.execute_sql(
+        f"CREATE VIEW v AS SELECT val FROM a {op} SELECT val FROM b", schema_name="so")
+    # a.val in {0..19} (each twice), b.val in {10..29} (each twice): overlapping
+    # ranges so dedup / difference / intersection are all non-trivial, and
+    # duplicate vals within a side give UNION ALL weight > 1.
+    conn.execute_sql(
+        f"INSERT INTO a VALUES {_values([(i, i % 20) for i in range(40)])}", schema_name="so")
+    conn.execute_sql(
+        f"INSERT INTO b VALUES {_values([(i, (i % 20) + 10) for i in range(40)])}", schema_name="so")
+    # Remove both carriers of b.val=15 → 15 leaves b (re-enters EXCEPT, leaves
+    # INTERSECT) while staying in a.
+    conn.execute_sql("DELETE FROM b WHERE pk IN (5, 25)", schema_name="so")
 
-        vid, _ = conn.resolve_table("so", "v")
-        before = oracle.scan_multiset(conn, vid, ["val"])
-        assert before, f"{op} view must be non-empty before restart"
-        conn.close()
+    vid, _ = conn.resolve_table("so", "v")
+    before = oracle.scan_multiset(conn, vid, ["val"])
+    assert before, f"{op} view must be non-empty before restart"
+    conn.close()
 
-        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
-        conn = gnitz.connect(sock_path)
-        vid, _ = conn.resolve_table("so", "v")
-        after = oracle.scan_multiset(conn, vid, ["val"])
-        assert after == before, (
-            f"{op} view diverged across rebuild:\nbefore={before}\nafter={after}")
-        conn.close()
-        _stop_server(proc)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    own_server.restart()
+    conn = gnitz.connect(sock_path)
+    vid, _ = conn.resolve_table("so", "v")
+    after = oracle.scan_multiset(conn, vid, ["val"])
+    assert after == before, (
+        f"{op} view diverged across rebuild:\nbefore={before}\nafter={after}")
+    conn.close()
 
 
-def test_distinct_after_restart():
+def test_distinct_after_restart(own_server):
     """SELECT DISTINCT must rebuild identically across a crash restart. The vbf
     suite covers DISTINCT only via live-create-over-data; this pins the boot
     rebuild path for the non-linear distinct operator. Many rows share each value
     (real dedup), and a pre-restart DELETE leaves every surviving value with at
     least one carrier so the snapshot is a stable deduplicated set."""
-    tmpdir, data_dir, sock_path = _make_env("gnitz_distinct_")
-    try:
-        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
-        conn = gnitz.connect(sock_path)
-        conn.create_schema("di")
-        conn.execute_sql(
-            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL)", schema_name="di")
-        conn.execute_sql("CREATE VIEW v AS SELECT DISTINCT g FROM t", schema_name="di")
-        # g = pk % 7 → 7 distinct values, each carried by ~9 rows.
-        rows = [(pk, pk % 7) for pk in range(60)]
-        conn.execute_sql(f"INSERT INTO t VALUES {_values(rows)}", schema_name="di")
-        # Drop one carrier of g=0 (pk=0) — g=0 keeps carriers pk=7,14,... so every
-        # distinct value still survives.
-        conn.execute_sql("DELETE FROM t WHERE pk = 0", schema_name="di")
+    sock_path = own_server.sock_path
+    own_server.start()
+    conn = gnitz.connect(sock_path)
+    conn.create_schema("di")
+    conn.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL)", schema_name="di")
+    conn.execute_sql("CREATE VIEW v AS SELECT DISTINCT g FROM t", schema_name="di")
+    # g = pk % 7 → 7 distinct values, each carried by ~9 rows.
+    rows = [(pk, pk % 7) for pk in range(60)]
+    conn.execute_sql(f"INSERT INTO t VALUES {_values(rows)}", schema_name="di")
+    # Drop one carrier of g=0 (pk=0) — g=0 keeps carriers pk=7,14,... so every
+    # distinct value still survives.
+    conn.execute_sql("DELETE FROM t WHERE pk = 0", schema_name="di")
 
-        vid, _ = conn.resolve_table("di", "v")
-        before = oracle.scan_multiset(conn, vid, ["g"])
-        assert before == Counter({(g,): 1 for g in range(7)}), f"unexpected pre-restart set: {before}"
-        conn.close()
+    vid, _ = conn.resolve_table("di", "v")
+    before = oracle.scan_multiset(conn, vid, ["g"])
+    assert before == Counter({(g,): 1 for g in range(7)}), f"unexpected pre-restart set: {before}"
+    conn.close()
 
-        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
-        conn = gnitz.connect(sock_path)
-        vid, _ = conn.resolve_table("di", "v")
-        after = oracle.scan_multiset(conn, vid, ["g"])
-        assert after == before, (
-            f"DISTINCT view diverged across rebuild:\nbefore={before}\nafter={after}")
-        conn.close()
-        _stop_server(proc)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    own_server.restart()
+    conn = gnitz.connect(sock_path)
+    vid, _ = conn.resolve_table("di", "v")
+    after = oracle.scan_multiset(conn, vid, ["g"])
+    assert after == before, (
+        f"DISTINCT view diverged across rebuild:\nbefore={before}\nafter={after}")
+    conn.close()
 
 
-def test_cluster_by_prefix_linear_view_after_restart():
+def test_cluster_by_prefix_linear_view_after_restart(own_server):
     """A linear view over a `CLUSTER BY` proper prefix must be re-derived to the
     same placement at boot.
 
@@ -670,40 +566,36 @@ def test_cluster_by_prefix_linear_view_after_restart():
     resumed rows by a key that names a different worker, and the view would come
     back a per-key prefix of itself.
     """
-    tmpdir, data_dir, sock_path = _make_env("gnitz_cbprefix_")
-    try:
-        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
-        conn = gnitz.connect(sock_path)
-        conn.create_schema("cb")
-        conn.execute_sql(
-            "CREATE TABLE t (a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL, "
-            "v BIGINT NOT NULL, PRIMARY KEY (a, b)) CLUSTER BY a",
-            schema_name="cb",
-        )
-        conn.execute_sql("CREATE VIEW mv AS SELECT a, b, v FROM t WHERE v > 0", schema_name="cb")
-        rows = [(a, b, a * 100 + b) for a in range(1, 21) for b in range(1, 6)]
-        conn.execute_sql(f"INSERT INTO t VALUES {_values(rows)}", schema_name="cb")
+    sock_path = own_server.sock_path
+    own_server.start()
+    conn = gnitz.connect(sock_path)
+    conn.create_schema("cb")
+    conn.execute_sql(
+        "CREATE TABLE t (a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL, "
+        "v BIGINT NOT NULL, PRIMARY KEY (a, b)) CLUSTER BY a",
+        schema_name="cb",
+    )
+    conn.execute_sql("CREATE VIEW mv AS SELECT a, b, v FROM t WHERE v > 0", schema_name="cb")
+    rows = [(a, b, a * 100 + b) for a in range(1, 21) for b in range(1, 6)]
+    conn.execute_sql(f"INSERT INTO t VALUES {_values(rows)}", schema_name="cb")
 
-        vid, _ = conn.resolve_table("cb", "mv")
-        before = oracle.scan_multiset(conn, vid, ["a", "b", "v"])
-        assert before == Counter({r: 1 for r in rows}), \
-            f"view incomplete before the restart: {len(before)}/{len(rows)}"
-        conn.close()
+    vid, _ = conn.resolve_table("cb", "mv")
+    before = oracle.scan_multiset(conn, vid, ["a", "b", "v"])
+    assert before == Counter({r: 1 for r in rows}), \
+        f"view incomplete before the restart: {len(before)}/{len(rows)}"
+    conn.close()
 
-        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
-        conn = gnitz.connect(sock_path)
-        vid, _ = conn.resolve_table("cb", "mv")
-        after = oracle.scan_multiset(conn, vid, ["a", "b", "v"])
-        assert after == before, (
-            f"view diverged across the restart:\nbefore={len(before)} rows\nafter={len(after)} rows")
+    own_server.restart()
+    conn = gnitz.connect(sock_path)
+    vid, _ = conn.resolve_table("cb", "mv")
+    after = oracle.scan_multiset(conn, vid, ["a", "b", "v"])
+    assert after == before, (
+        f"view diverged across the restart:\nbefore={len(before)} rows\nafter={len(after)} rows")
 
-        # A further insert must land in the same store the resume loaded.
-        more = [(a, 6, a * 100 + 6) for a in range(1, 21)]
-        conn.execute_sql(f"INSERT INTO t VALUES {_values(more)}", schema_name="cb")
-        grown = oracle.scan_multiset(conn, vid, ["a", "b", "v"])
-        assert grown == Counter({r: 1 for r in rows + more}), \
-            f"post-restart insert lost rows: {len(grown)}/{len(rows) + len(more)}"
-        conn.close()
-        _stop_server(proc)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    # A further insert must land in the same store the resume loaded.
+    more = [(a, 6, a * 100 + 6) for a in range(1, 21)]
+    conn.execute_sql(f"INSERT INTO t VALUES {_values(more)}", schema_name="cb")
+    grown = oracle.scan_multiset(conn, vid, ["a", "b", "v"])
+    assert grown == Counter({r: 1 for r in rows + more}), \
+        f"post-restart insert lost rows: {len(grown)}/{len(rows) + len(more)}"
+    conn.close()

@@ -21,6 +21,12 @@ dev = [
 
 [tool.pytest.ini_options]
 xfail_strict = true
+# A server data dir holds a fallocated SAL, so the defaults (keep 3 sessions,
+# keep every test's dir) are unaffordable. "failed" makes the tmp_path teardown
+# drop a passing test's dir at end of test, which is what bounds a green run's
+# peak; a failing test keeps its dir, which is what makes a red run debuggable.
+tmp_path_retention_count  = 1
+tmp_path_retention_policy = "failed"
 
 [tool.maturin]
 features       = ["pyo3/extension-module"]

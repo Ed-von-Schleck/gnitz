@@ -146,34 +146,28 @@ class TestTlsErrors:
         with pytest.raises(Exception):
             gnitz.connect(f"tls://127.0.0.1:{port}?insecure")
 
-    def test_restart_surfaces_clear_error_then_reconnects(self):
+    def test_restart_surfaces_clear_error_then_reconnects(self, restartable_server):
         # Dedicated server (not the session one — a restart wipes the
         # catalog) with its own pinned TLS port.
-        from conftest import _Server, _server_binary
-
-        srv = _Server(_server_binary())
+        srv = restartable_server
+        target = srv.tls_target
+        conn = gnitz.connect(target)
         try:
-            srv.start()
-            target = srv.tls_target
-            conn = gnitz.connect(target)
             sn = "s" + _uid()
             conn.create_schema(sn)
             tid = conn.create_table(sn, "t", COLS)
             conn.push(tid, _batch([{"pk": 1, "val": 1}]))
 
             srv.restart()
-            try:
-                # The stale connection fails with a clear error, not a hang.
-                with pytest.raises(Exception):
-                    conn.scan(tid)
-                # The same target (pinned port) accepts a fresh connection.
-                with gnitz.connect(target) as fresh:
-                    sn2 = "s" + _uid()
-                    fresh.create_schema(sn2)
-                    tid2 = fresh.create_table(sn2, "t", COLS)
-                    fresh.push(tid2, _batch([{"pk": 2, "val": 2}]))
-                    assert len(fresh.scan(tid2)) == 1
-            finally:
-                conn.close()
+            # The stale connection fails with a clear error, not a hang.
+            with pytest.raises(Exception):
+                conn.scan(tid)
+            # The same target (pinned port) accepts a fresh connection.
+            with gnitz.connect(target) as fresh:
+                sn2 = "s" + _uid()
+                fresh.create_schema(sn2)
+                tid2 = fresh.create_table(sn2, "t", COLS)
+                fresh.push(tid2, _batch([{"pk": 2, "val": 2}]))
+                assert len(fresh.scan(tid2)) == 1
         finally:
-            srv.teardown()
+            conn.close()
