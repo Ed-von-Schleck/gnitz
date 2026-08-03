@@ -510,11 +510,7 @@ mod tests {
     use crate::foundation::posix_io::raise_fd_limit_for_tests;
 
     fn dag_test_dir(name: &str) -> String {
-        std::env::temp_dir()
-            .join(format!("gnitz_dag_test_{name}"))
-            .to_str()
-            .unwrap()
-            .to_owned()
+        crate::test_support::scratch_dir("dag", name)
     }
 
     fn make_test_table(name: &str) -> Box<Table> {

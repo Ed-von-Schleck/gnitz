@@ -2471,35 +2471,30 @@ fn encode_response_buffer(
     seek_pk: u128,
     flags: u64,
 ) -> PooledSendBuf {
-    let sz = ipc::wire_size(status, error_msg, None, None, result, prebuilt_schema, &[]);
+    let msg = ipc::WireMsg {
+        target_id: target_id as u64,
+        client_id,
+        flags,
+        seek_pk,
+        status,
+        error_msg,
+        data: ipc::WireData::Whole(result),
+        prebuilt_schema_block: prebuilt_schema,
+        ..Default::default()
+    };
+    let sz = msg.size();
     let total = 4 + sz;
     let mut inner = crate::storage::batch_pool::acquire_buf();
     inner.reserve(total.max(8192));
-    // SAFETY: encode_wire_into_ipc writes every byte [0, sz). The 4-byte frame
-    // header is written immediately below. wal::encode zeros inter-region padding
-    // (Step 1), so no byte is left uninitialised regardless of column type.
+    // SAFETY: `encode_ipc` writes every byte [0, sz). The 4-byte frame header is
+    // written immediately below. wal::encode zeros inter-region padding (Step 1),
+    // so no byte is left uninitialised regardless of column type.
     #[allow(clippy::uninit_vec)]
     unsafe {
         inner.set_len(total);
     }
     inner[0..4].copy_from_slice(&(sz as u32).to_le_bytes());
-    let written = ipc::encode_wire_into_ipc(
-        &mut inner[4..total],
-        0,
-        target_id as u64,
-        client_id,
-        flags,
-        seek_pk,
-        0,
-        0,
-        status,
-        error_msg,
-        None,
-        None,
-        result,
-        prebuilt_schema,
-        &[],
-    );
+    let written = msg.encode_ipc(&mut inner[4..total], 0);
     debug_assert_eq!(written, sz);
     inner.truncate(4 + written);
     PooledSendBuf(inner)

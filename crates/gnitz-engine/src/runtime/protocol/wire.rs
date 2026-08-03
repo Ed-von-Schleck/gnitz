@@ -296,249 +296,14 @@ fn schema_block_wire_size(
     crate::storage::wire_block_size(&META_SCHEMA_DESC, ncols, schema_blob)
 }
 
-#[inline]
-fn should_include_schema(
-    schema: Option<&SchemaDescriptor>,
-    prebuilt: Option<&[u8]>,
-    has_data: bool,
-    status: u32,
-) -> bool {
-    (schema.is_some() || prebuilt.is_some()) && (has_data || status == STATUS_OK)
-}
+// ---------------------------------------------------------------------------
+// WireMsg
+// ---------------------------------------------------------------------------
 
-/// Compute total encoded wire size without allocating.
-///
-/// `prebuilt_schema_block`: when `Some`, use its length as the schema block
-/// size instead of computing it from `schema` / `col_names`. Pass the result
-/// of [`build_schema_wire_block`] here to avoid the `schema_wal_block_size`
-/// calculation on hot paths.
-pub fn wire_size(
-    status: u32,
-    error_msg: &[u8],
-    schema: Option<&SchemaDescriptor>,
-    col_names: Option<&[&[u8]]>,
-    data_batch: Option<&Batch>,
-    prebuilt_schema_block: Option<&[u8]>,
-    seek_pk_extra: &[u8],
-) -> usize {
-    let has_data = data_batch.map(|b| b.count > 0).unwrap_or(false);
-    let has_schema = should_include_schema(schema, prebuilt_schema_block, has_data, status);
-
-    let mut total = gnitz_wire::control::ctrl_block_size(error_msg.len(), seek_pk_extra.len());
-
-    if has_schema {
-        total += schema_block_wire_size(schema, col_names, prebuilt_schema_block);
-    }
-
-    if has_data {
-        total += data_batch.unwrap().wire_byte_size();
-    }
-    total
-}
-
-/// Encode a full IPC wire message. Returns heap-allocated Vec<u8>.
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_wire(
-    target_id: u64,
-    client_id: u64,
-    flags: u64,
-    seek_pk: u128,
-    seek_col_idx: u64,
-    request_id: u64,
-    status: u32,
-    error_msg: &[u8],
-    schema: Option<&SchemaDescriptor>,
-    col_names: Option<&[&[u8]]>,
-    data_batch: Option<&Batch>,
-) -> Vec<u8> {
-    let sz = wire_size(status, error_msg, schema, col_names, data_batch, None, &[]);
-    let mut buf = vec![0u8; sz];
-    encode_wire_into(
-        &mut buf,
-        0,
-        target_id,
-        client_id,
-        flags,
-        seek_pk,
-        seek_col_idx,
-        request_id,
-        status,
-        error_msg,
-        schema,
-        col_names,
-        data_batch,
-        None,
-        &[],
-    );
-    buf
-}
-
-/// Encode a full IPC wire message into a caller-provided buffer.
-/// Returns bytes written. Panics if the buffer is too small.
-///
-/// `prebuilt_schema_block`: when `Some`, the bytes are copied directly into the
-/// schema block slot rather than calling `schema_to_batch` + `encode_to_wire`,
-/// eliminating the `Batch` heap allocation on the hot SEEK/SCAN path. The
-/// caller must have computed the buffer size using `wire_size` with the same
-/// prebuilt slice.
-#[allow(clippy::too_many_arguments)]
-pub fn encode_wire_into(
-    out: &mut [u8],
-    offset: usize,
-    target_id: u64,
-    client_id: u64,
-    flags: u64,
-    seek_pk: u128,
-    seek_col_idx: u64,
-    request_id: u64,
-    status: u32,
-    error_msg: &[u8],
-    schema: Option<&SchemaDescriptor>,
-    col_names: Option<&[&[u8]]>,
-    data_batch: Option<&Batch>,
-    prebuilt_schema_block: Option<&[u8]>,
-    seek_pk_extra: &[u8],
-) -> usize {
-    encode_wire_into_impl(
-        out,
-        offset,
-        target_id,
-        client_id,
-        flags,
-        seek_pk,
-        seek_col_idx,
-        request_id,
-        status,
-        error_msg,
-        schema,
-        col_names,
-        WireData::Whole(data_batch),
-        prebuilt_schema_block,
-        seek_pk_extra,
-        true,
-    )
-}
-
-/// Like `encode_wire_into` but skips WAL block checksums.  Use for trusted
-/// intra-process IPC (W2M ring) where integrity is guaranteed by the OS
-/// shared-memory mapping.
-#[allow(clippy::too_many_arguments)]
-pub fn encode_wire_into_ipc(
-    out: &mut [u8],
-    offset: usize,
-    target_id: u64,
-    client_id: u64,
-    flags: u64,
-    seek_pk: u128,
-    seek_col_idx: u64,
-    request_id: u64,
-    status: u32,
-    error_msg: &[u8],
-    schema: Option<&SchemaDescriptor>,
-    col_names: Option<&[&[u8]]>,
-    data_batch: Option<&Batch>,
-    prebuilt_schema_block: Option<&[u8]>,
-    seek_pk_extra: &[u8],
-) -> usize {
-    encode_wire_into_impl(
-        out,
-        offset,
-        target_id,
-        client_id,
-        flags,
-        seek_pk,
-        seek_col_idx,
-        request_id,
-        status,
-        error_msg,
-        schema,
-        col_names,
-        WireData::Whole(data_batch),
-        prebuilt_schema_block,
-        seek_pk_extra,
-        false,
-    )
-}
-
-/// Compute total encoded wire size for `count` rows of `data_batch`.
-///
-/// Pass `schema`/`prebuilt_schema_block` for the first chunk of a multi-chunk
-/// SCAN; pass `None` for both on continuation chunks (no schema block).
-/// Only valid for wire-safe schemas (no German-string (STRING or BLOB) columns).
-pub fn wire_size_range(
-    status: u32,
-    error_msg: &[u8],
-    schema: Option<&SchemaDescriptor>,
-    col_names: Option<&[&[u8]]>,
-    data_batch: &Batch,
-    count: usize,
-    prebuilt_schema_block: Option<&[u8]>,
-) -> usize {
-    let has_data = count > 0;
-    let has_schema = should_include_schema(schema, prebuilt_schema_block, has_data, status);
-
-    let mut total = gnitz_wire::control::ctrl_block_size(error_msg.len(), 0);
-
-    if has_schema {
-        total += schema_block_wire_size(schema, col_names, prebuilt_schema_block);
-    }
-
-    if has_data {
-        total += data_batch.wire_byte_size_range(count);
-    }
-    total
-}
-
-/// Encode a wire message that carries only rows `[start_row, start_row+count)`
-/// from `data_batch`. No checksums (IPC fast path). For the first chunk pass
-/// `schema`/`prebuilt_schema_block`; pass `None` for both on continuations.
-/// The `sorted`/`consolidated` flags are propagated from `data_batch`. The
-/// payload's `request_id` is always 0 — reply routing rides the W2M slot's
-/// ring prefix, never this field.
-#[allow(clippy::too_many_arguments)]
-pub fn encode_wire_into_range(
-    out: &mut [u8],
-    offset: usize,
-    target_id: u64,
-    client_id: u64,
-    flags: u64,
-    status: u32,
-    schema: Option<&SchemaDescriptor>,
-    data_batch: &Batch,
-    start_row: usize,
-    count: usize,
-    prebuilt_schema_block: Option<&[u8]>,
-) -> usize {
-    encode_wire_into_impl(
-        out,
-        offset,
-        target_id,
-        client_id,
-        flags,
-        0u128,
-        0,
-        0,
-        status,
-        &[],
-        schema,
-        None,
-        WireData::Range {
-            batch: data_batch,
-            start_row,
-            count,
-        },
-        prebuilt_schema_block,
-        &[],
-        false,
-    )
-}
-
-/// The data payload of one encoded wire message: a whole (optional) batch, or
-/// a row range of one — the only axis on which the full and range encoders
-/// differ, folded into one body so the flag assembly, ctrl-block emit, and
-/// schema-block emit cannot drift.
-enum WireData<'a> {
+/// The data payload of one wire message: a whole (optional) batch, or a row
+/// range of one — the only axis on which the two encode shapes differ.
+#[derive(Clone, Copy)]
+pub enum WireData<'a> {
     Whole(Option<&'a Batch>),
     Range {
         batch: &'a Batch,
@@ -547,7 +312,13 @@ enum WireData<'a> {
     },
 }
 
-impl WireData<'_> {
+impl Default for WireData<'_> {
+    fn default() -> Self {
+        WireData::Whole(None)
+    }
+}
+
+impl<'a> WireData<'a> {
     fn row_count(&self) -> usize {
         match *self {
             WireData::Whole(b) => b.map(|b| b.count).unwrap_or(0),
@@ -555,93 +326,150 @@ impl WireData<'_> {
         }
     }
 
-    fn layout_batch(&self) -> Option<&Batch> {
+    fn layout_batch(&self) -> Option<&'a Batch> {
         match *self {
             WireData::Whole(b) => b,
             WireData::Range { batch, .. } => Some(batch),
         }
     }
-}
 
-#[allow(clippy::too_many_arguments)]
-fn encode_wire_into_impl(
-    out: &mut [u8],
-    offset: usize,
-    target_id: u64,
-    client_id: u64,
-    flags: u64,
-    seek_pk: u128,
-    seek_col_idx: u64,
-    request_id: u64,
-    status: u32,
-    error_msg: &[u8],
-    schema: Option<&SchemaDescriptor>,
-    col_names: Option<&[&[u8]]>,
-    data: WireData<'_>,
-    prebuilt_schema_block: Option<&[u8]>,
-    seek_pk_extra: &[u8],
-    checksum: bool,
-) -> usize {
-    let has_data = data.row_count() > 0;
-    let has_schema = should_include_schema(schema, prebuilt_schema_block, has_data, status);
-
-    let mut wire_flags = flags;
-    if has_schema {
-        wire_flags |= FLAG_HAS_SCHEMA;
-    }
-    if has_data {
-        wire_flags |= FLAG_HAS_DATA;
-        // Maps `b.layout()` with no re-verify: a non-`Raw` tag was certified
-        // (debug-verified) at its producer, so the shipped claim is
-        // verified-by-construction.
-        wire_flags |= layout_to_wire_flags(data.layout_batch().unwrap().layout());
-    }
-
-    let written = encode_ctrl_block_direct(
-        out,
-        offset,
-        target_id,
-        client_id,
-        wire_flags,
-        seek_pk,
-        seek_col_idx,
-        request_id,
-        status,
-        error_msg,
-        seek_pk_extra,
-        checksum,
-    );
-    let mut pos = offset + written;
-
-    if has_schema {
-        if let Some(prebuilt) = prebuilt_schema_block {
-            // Fast path: prebuilt bytes already hold the encoded schema block.
-            // Copy directly — skips Batch allocation and encode_to_wire overhead.
-            let end = pos + prebuilt.len();
-            out[pos..end].copy_from_slice(prebuilt);
-            pos = end;
-        } else {
-            let eff_schema = schema.unwrap();
-            let names = col_names.unwrap_or(&[]);
-            let schema_batch = schema_to_batch(eff_schema, names, 0);
-            let written = schema_batch.encode_to_wire(target_id as u32, out, pos, checksum);
-            pos += written;
+    fn wire_byte_size(&self) -> usize {
+        match *self {
+            WireData::Whole(b) => b.map(|b| b.wire_byte_size()).unwrap_or(0),
+            WireData::Range { batch, count, .. } => batch.wire_byte_size_range(count),
         }
     }
+}
 
-    if has_data {
-        let written = match data {
-            WireData::Whole(b) => b.unwrap().encode_to_wire(target_id as u32, out, pos, checksum),
-            WireData::Range {
-                batch,
-                start_row,
-                count,
-            } => batch.encode_range_to_wire(start_row, count, target_id as u32, out, pos, checksum),
-        };
-        pos += written;
+/// One IPC/WAL wire message. Build it once, then [`size`](WireMsg::size) it and
+/// encode it: both read the same value, so the byte count a caller reserves and
+/// the bytes the encoder writes cannot disagree.
+///
+/// Every field defaults to zero/absent (`status` default 0 is `STATUS_OK`), so a
+/// caller names only what it sends:
+///
+/// ```ignore
+/// let msg = ipc::WireMsg { request_id, status: STATUS_ERROR, error_msg: msg, ..Default::default() };
+/// writer.send_encoded(msg.size(), request_id as u32, |buf| { msg.encode_ipc(buf, 0); });
+/// ```
+#[derive(Clone, Copy, Default)]
+pub struct WireMsg<'a> {
+    pub target_id: u64,
+    pub client_id: u64,
+    pub flags: u64,
+    pub seek_pk: u128,
+    pub seek_col_idx: u64,
+    pub request_id: u64,
+    pub status: u32,
+    pub error_msg: &'a [u8],
+    pub schema: Option<&'a SchemaDescriptor>,
+    pub col_names: Option<&'a [&'a [u8]]>,
+    pub data: WireData<'a>,
+    /// When `Some`, these bytes *are* the schema block: they are copied in
+    /// verbatim instead of encoding `schema`, and their length sizes the block.
+    /// Skips the `Batch` allocation `schema` would cost on the hot SEEK/SCAN path.
+    pub prebuilt_schema_block: Option<&'a [u8]>,
+    pub seek_pk_extra: &'a [u8],
+}
+
+impl<'a> WireMsg<'a> {
+    fn has_data(&self) -> bool {
+        self.data.row_count() > 0
     }
 
-    pos - offset
+    fn has_schema(&self) -> bool {
+        (self.schema.is_some() || self.prebuilt_schema_block.is_some()) && (self.has_data() || self.status == STATUS_OK)
+    }
+
+    /// Total encoded size, without allocating.
+    pub fn size(&self) -> usize {
+        let mut total = gnitz_wire::control::ctrl_block_size(self.error_msg.len(), self.seek_pk_extra.len());
+        if self.has_schema() {
+            total += schema_block_wire_size(self.schema, self.col_names, self.prebuilt_schema_block);
+        }
+        if self.has_data() {
+            total += self.data.wire_byte_size();
+        }
+        total
+    }
+
+    /// Encode into `out[offset..]` with WAL block checksums, for the durable and
+    /// cross-process paths (WAL, SAL). Returns bytes written; panics if `out` is
+    /// too small for [`size`](WireMsg::size).
+    pub fn encode(&self, out: &mut [u8], offset: usize) -> usize {
+        self.encode_impl(out, offset, true)
+    }
+
+    /// Encode without checksums, for trusted intra-process IPC (the W2M ring,
+    /// client egress) where the shared mapping already guarantees integrity.
+    pub fn encode_ipc(&self, out: &mut [u8], offset: usize) -> usize {
+        self.encode_impl(out, offset, false)
+    }
+
+    /// Encode into a fresh `Vec` sized by [`size`](WireMsg::size).
+    #[cfg(test)]
+    pub(crate) fn encode_to_vec(&self) -> Vec<u8> {
+        let mut buf = vec![0u8; self.size()];
+        self.encode(&mut buf, 0);
+        buf
+    }
+
+    fn encode_impl(&self, out: &mut [u8], offset: usize, checksum: bool) -> usize {
+        let has_data = self.has_data();
+        let has_schema = self.has_schema();
+
+        let mut wire_flags = self.flags;
+        if has_schema {
+            wire_flags |= FLAG_HAS_SCHEMA;
+        }
+        if has_data {
+            wire_flags |= FLAG_HAS_DATA;
+            // Maps `b.layout()` with no re-verify: a non-`Raw` tag was certified
+            // (debug-verified) at its producer, so the shipped claim is
+            // verified-by-construction.
+            wire_flags |= layout_to_wire_flags(self.data.layout_batch().unwrap().layout());
+        }
+
+        let written = encode_ctrl_block_direct(
+            out,
+            offset,
+            self.target_id,
+            self.client_id,
+            wire_flags,
+            self.seek_pk,
+            self.seek_col_idx,
+            self.request_id,
+            self.status,
+            self.error_msg,
+            self.seek_pk_extra,
+            checksum,
+        );
+        let mut pos = offset + written;
+
+        if has_schema {
+            if let Some(prebuilt) = self.prebuilt_schema_block {
+                let end = pos + prebuilt.len();
+                out[pos..end].copy_from_slice(prebuilt);
+                pos = end;
+            } else {
+                let schema_batch = schema_to_batch(self.schema.unwrap(), self.col_names.unwrap_or(&[]), 0);
+                pos += schema_batch.encode_to_wire(self.target_id as u32, out, pos, checksum);
+            }
+        }
+
+        if has_data {
+            pos += match self.data {
+                WireData::Whole(b) => b.unwrap().encode_to_wire(self.target_id as u32, out, pos, checksum),
+                WireData::Range {
+                    batch,
+                    start_row,
+                    count,
+                } => batch.encode_range_to_wire(start_row, count, self.target_id as u32, out, pos, checksum),
+            };
+        }
+
+        pos - offset
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1595,19 +1423,14 @@ mod tests {
         batch.certify_layout(Layout::Consolidated, &schema);
 
         let col_names = [b"pk".as_slice(), b"v".as_slice()];
-        let wire = encode_wire(
-            7,
-            0,
-            0,
-            0,
-            0,
-            0,
-            STATUS_OK,
-            b"",
-            Some(&schema),
-            Some(&col_names),
-            Some(&batch),
-        );
+        let wire = WireMsg {
+            target_id: 7,
+            schema: Some(&schema),
+            col_names: Some(&col_names),
+            data: WireData::Whole(Some(&batch)),
+            ..Default::default()
+        }
+        .encode_to_vec();
 
         let mut decoded = decode_wire(&wire).expect("decode");
         {

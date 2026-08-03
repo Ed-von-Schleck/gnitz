@@ -1490,14 +1490,7 @@ mod checkpoint_finalize_tests {
     const SAL_SIZE: usize = 4096;
 
     fn finalize_temp_dir(name: &str) -> String {
-        crate::foundation::posix_io::raise_fd_limit_for_tests();
-        let path = std::env::temp_dir()
-            .join(format!("gnitz_checkpoint_finalize_test_{name}"))
-            .to_str()
-            .unwrap()
-            .to_owned();
-        let _ = std::fs::remove_dir_all(&path);
-        path
+        crate::test_support::scratch_dir("checkpoint_finalize", name)
     }
 
     /// The checkpoint finalizer must flush system tables before resetting the SAL:

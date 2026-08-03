@@ -33,7 +33,7 @@ const GROUPS: u64 = 1_000;
 
 /// The error a non-chunkable reply past the frame cap raises. Pinned verbatim:
 /// it is what distinguishes "the read failed" from "the read was slow".
-const CHUNKING_ERR: &str = "chunking not yet implemented";
+const CHUNKING_ERR: &str = "cannot be chunked";
 
 fn err_text<T: std::fmt::Debug>(r: Result<T, impl std::fmt::Debug>) -> String {
     match r {

@@ -593,14 +593,7 @@ fn run_worker_child(
     let wtag = format!("W{w}");
     crate::foundation::log::init(log_level, wtag.as_bytes());
 
-    let mut worker = WorkerProcess::new(
-        w as u32,
-        master_pid,
-        catalog_ptr,
-        sal_reader,
-        w2m_writer,
-        pending_deltas,
-    );
+    let mut worker = WorkerProcess::new(master_pid, catalog_ptr, sal_reader, w2m_writer, pending_deltas);
     let rc = worker.run(boot_err);
 
     unsafe {

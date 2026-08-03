@@ -273,17 +273,12 @@ impl Session {
         // Embed the cached schema version so the server can omit the schema
         // block on a warm-cache hit (matching push/scan).
         let flags = self.versioned_flags(table_id, FLAG_SEEK_BY_INDEX);
-        // Pack the K = key_vals.len() native values as 16-byte LE slots into a
-        // PkTuple (stride K×16 ≤ 64 ≤ MAX_PK_BYTES); send_message's split_wire
-        // routes slot 0 → seek_pk and slots 1..K → seek_pk_extra. K=1 is
-        // byte-identical to the legacy single-value frame. seek_col_idx carries
-        // pack_pk_cols(col_indices). Arity is validated upstream in
-        // GnitzClient::seek_by_index (the one choke point for every binding).
-        let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
-        for (i, &v) in key_vals.iter().enumerate() {
-            buf[i * 16..i * 16 + 16].copy_from_slice(&v.to_le_bytes());
-        }
-        let pk = PkTuple::from_bytes(&buf[..key_vals.len() * 16]);
+        // `send_message`'s `split_wire` routes slot 0 → seek_pk and slots 1..K →
+        // seek_pk_extra, where the worker reassembles them with
+        // `unpack_index_key_slots`. Arity is validated upstream in
+        // `GnitzClient::seek_by_index` (the one choke point for every binding).
+        let (buf, len) = gnitz_wire::pack_index_key_slots(key_vals);
+        let pk = PkTuple::from_bytes(&buf[..len]);
         let seek_col_idx = gnitz_wire::pack_pk_cols(col_indices);
         send_message(
             &mut self.transport,

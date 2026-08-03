@@ -98,7 +98,7 @@ impl RecoverySource {
 // ---------------------------------------------------------------------------
 
 /// Outcome of `Table::flush_prepare`.
-pub enum FlushOutcome {
+pub(in crate::storage) enum FlushOutcome {
     /// Nothing left to publish: a `Rederive` table folded into the RAM tier
     /// (no file I/O), or a `SalReplay` table whose memtable and RAM tier are
     /// net-empty with no unpublished spills and no compaction pending (the
@@ -119,7 +119,7 @@ pub enum FlushOutcome {
 /// before commit unlinks only the manifest `.tmp` (via `PreparedManifest`'s own
 /// `Drop`); the shard — already at its final name and registered in the index —
 /// is an unreferenced orphan reclaimed by `gc_orphans` at the next open.
-pub struct FlushWork {
+pub(in crate::storage) struct FlushWork {
     sync_paths: Vec<CString>,
     manifest: PreparedManifest,
 }
@@ -128,14 +128,14 @@ impl FlushWork {
     /// Full paths the barrier must fdatasync (each opened O_RDONLY) before the
     /// manifest rename — the files this publish makes reachable that are not yet
     /// durable.
-    pub fn sync_paths(&self) -> &[CString] {
+    pub(in crate::storage) fn sync_paths(&self) -> &[CString] {
         &self.sync_paths
     }
 
     /// The staged manifest `.tmp`'s fd, open from `prepare_file` until
     /// `flush_commit` consumes the work (it closes when the `PreparedManifest`
     /// drops after the rename).
-    pub fn manifest_fd(&self) -> libc::c_int {
+    pub(in crate::storage) fn manifest_fd(&self) -> libc::c_int {
         self.manifest.fd()
     }
 }
@@ -739,7 +739,7 @@ impl Table {
     /// per family, the synchronous `flush()` inline), immediately after
     /// `run_compact` for `Rederive` tables. Best-effort — a still-present file
     /// is retried on the next drain.
-    pub(crate) fn drain_deletions(&mut self) {
+    pub(in crate::storage) fn drain_deletions(&mut self) {
         self.shard_index.try_cleanup();
     }
 }

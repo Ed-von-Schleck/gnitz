@@ -25,6 +25,13 @@ impl CatalogEngine {
         self.dag.tables.get(&table_id).and_then(|e| e.handle.as_partitioned())
     }
 
+    /// The next up-to-`max_rows` rows of `source` from `cursor`. Re-resolves the
+    /// scanned relation's store per chunk, which a `SourceCursor` cannot hold a
+    /// borrow on across the `&mut CatalogEngine` uses between chunks.
+    pub fn drain_source_chunk(&self, cursor: &mut SourceCursor, source: i64, max_rows: usize) -> Option<Batch> {
+        cursor.drain_chunk(self.partitioned_store(source), max_rows)
+    }
+
     /// Ingest a user-table batch and return the effective delta (after PK
     /// enforcement).  Used by multi-worker push where the worker needs the effective
     /// batch for later DAG evaluation but does NOT evaluate immediately.

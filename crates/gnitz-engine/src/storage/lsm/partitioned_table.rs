@@ -371,11 +371,13 @@ impl PartitionedTable {
     // Broadcast operations
     // ------------------------------------------------------------------
 
+    /// Publish every partition through the shared barrier, so an N-partition
+    /// family batches its fdatasyncs instead of paying them serially.
     pub fn flush(&mut self) -> Result<(), StorageError> {
-        for table in &mut self.tables {
-            table.flush()?;
-        }
-        Ok(())
+        super::flush_barrier::flush_barrier(
+            self.tables.iter_mut().map(|t| t as *mut Table),
+            super::flush_barrier::FlushRound::Base,
+        )
     }
 
     /// Mutable access to every partition's `Table`. The checkpoint flush rounds

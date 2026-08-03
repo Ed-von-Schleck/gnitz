@@ -292,6 +292,26 @@ pub(crate) fn assert_test_aborts_134(internal_test: &str, envs: &[(&str, &str)])
 /// huge reservation stays cheap). `MAP_SHARED` so a `fork()`ed child sees
 /// the same pages (a child that `_exit`s never runs drops, so only the
 /// parent unmaps).
+/// A scratch directory for a test that needs a real on-disk tree, wiped at the
+/// start of the run so the previous same-user run self-cleans. `scope` names the
+/// subsystem, `name` the test.
+///
+/// The path is namespaced by `$USER` (pid if unset): `/tmp` is shared and
+/// sticky, so a directory left by a *different* user occupies the bare path
+/// forever — the start-of-test `remove_dir_all` cannot delete it (sticky bit)
+/// and `CatalogEngine::open` then fails EACCES creating subdirs under it.
+pub(crate) fn scratch_dir(scope: &str, name: &str) -> String {
+    crate::foundation::posix_io::raise_fd_limit_for_tests();
+    let owner = std::env::var("USER").unwrap_or_else(|_| std::process::id().to_string());
+    let path = std::env::temp_dir()
+        .join(format!("gnitz_{scope}_test_{owner}_{name}"))
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let _ = std::fs::remove_dir_all(&path);
+    path
+}
+
 pub(crate) struct SharedRegion {
     ptr: *mut u8,
     size: usize,

@@ -518,6 +518,62 @@ pub fn unpack_pk_cols(packed: u64) -> PkColList {
     PkColList { cols, len: n }
 }
 
+/// Width of one `seek_by_index` key slot on the wire: a native `u128`, LE.
+pub const INDEX_KEY_SLOT: usize = 16;
+
+/// Pack K native index-key values into the `PkTuple` a `seek_by_index` request
+/// carries — one 16-byte LE slot each, which `split_wire` then routes as slot 0
+/// → `seek_pk` and slots 1..K → `seek_pk_extra`. A prefix seek supplies K < the
+/// index's arity. Returns the packed bytes; `K * INDEX_KEY_SLOT <= MAX_PK_BYTES`
+/// bounds K at 4, the same ceiling as [`PK_LIST_MAX_COLS`].
+pub fn pack_index_key_slots(key_vals: &[u128]) -> ([u8; MAX_PK_BYTES], usize) {
+    assert!(
+        (1..=PK_LIST_MAX_COLS).contains(&key_vals.len()),
+        "pack_index_key_slots: count {} out of range 1..={PK_LIST_MAX_COLS}",
+        key_vals.len(),
+    );
+    let mut buf = [0u8; MAX_PK_BYTES];
+    for (i, &v) in key_vals.iter().enumerate() {
+        buf[i * INDEX_KEY_SLOT..(i + 1) * INDEX_KEY_SLOT].copy_from_slice(&v.to_le_bytes());
+    }
+    (buf, key_vals.len() * INDEX_KEY_SLOT)
+}
+
+/// Recover the K key values a `seek_by_index` request packed, from the wire pair
+/// `seek_pk` (slot 0) + `seek_pk_extra` (slots 1..K). Validates at the trust
+/// boundary: a misaligned `extra` or a K beyond `arity` is rejected rather than
+/// silently dropping trailing bytes or over-reading the index.
+pub fn unpack_index_key_slots(seek_pk: u128, extra: &[u8], arity: usize) -> Result<PkKeyVals, String> {
+    if !extra.len().is_multiple_of(INDEX_KEY_SLOT) {
+        return Err(format!(
+            "seek_by_index: key tail of {} bytes is not a multiple of {INDEX_KEY_SLOT}",
+            extra.len()
+        ));
+    }
+    let len = 1 + extra.len() / INDEX_KEY_SLOT;
+    if len > arity.min(PK_LIST_MAX_COLS) {
+        return Err(format!("seek_by_index: {len} key values exceed index arity {arity}"));
+    }
+    let mut vals = [0u128; PK_LIST_MAX_COLS];
+    vals[0] = seek_pk;
+    for (i, slot) in extra.chunks_exact(INDEX_KEY_SLOT).enumerate() {
+        vals[i + 1] = u128::from_le_bytes(slot.try_into().expect("chunks_exact yields 16 bytes"));
+    }
+    Ok(PkKeyVals { vals, len })
+}
+
+/// The K native key values of a `seek_by_index` request, inline.
+pub struct PkKeyVals {
+    vals: [u128; PK_LIST_MAX_COLS],
+    len: usize,
+}
+
+impl PkKeyVals {
+    pub fn as_slice(&self) -> &[u128] {
+        &self.vals[..self.len]
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TABLE_TAB.flags layout — the single source of truth shared by the gnitz-core
 // writer and the gnitz-engine reader, so the bit packing cannot drift.
@@ -638,6 +694,41 @@ mod tests {
             pack_table_flags(true, 2) & 0xFF & !TABLE_FLAG_REPLICATED,
             0,
             "reserved bits are free"
+        );
+    }
+
+    /// The two halves of the `seek_by_index` key wire format are inverses at
+    /// every arity, including a prefix seek that supplies fewer values than the
+    /// index has columns.
+    #[test]
+    fn index_key_slots_roundtrip() {
+        let all: [u128; PK_LIST_MAX_COLS] = [1, u128::MAX, 1 << 100, 0];
+        for k in 1..=PK_LIST_MAX_COLS {
+            let vals = &all[..k];
+            let (buf, len) = pack_index_key_slots(vals);
+            assert_eq!(len, k * INDEX_KEY_SLOT);
+            // `split_wire` routes slot 0 to seek_pk and the rest to the tail.
+            let seek_pk = u128::from_le_bytes(buf[..INDEX_KEY_SLOT].try_into().unwrap());
+            let extra = &buf[INDEX_KEY_SLOT..len];
+            let back = unpack_index_key_slots(seek_pk, extra, PK_LIST_MAX_COLS).expect("well-formed");
+            assert_eq!(back.as_slice(), vals, "arity {k}");
+            // A prefix seek is accepted; more values than the arity is not.
+            assert!(unpack_index_key_slots(seek_pk, extra, k).is_ok());
+            if k > 1 {
+                assert!(unpack_index_key_slots(seek_pk, extra, k - 1).is_err(), "over-arity");
+            }
+        }
+    }
+
+    /// A tail that is not a whole number of slots is rejected rather than
+    /// silently dropping its trailing bytes.
+    #[test]
+    fn index_key_slots_reject_a_misaligned_tail() {
+        assert!(unpack_index_key_slots(7, &[0u8; 15], PK_LIST_MAX_COLS).is_err());
+        assert!(unpack_index_key_slots(7, &[0u8; 17], PK_LIST_MAX_COLS).is_err());
+        assert!(
+            unpack_index_key_slots(7, &[], PK_LIST_MAX_COLS).is_ok(),
+            "K=1 has no tail"
         );
     }
 }

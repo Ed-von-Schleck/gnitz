@@ -19,42 +19,17 @@ use super::super::manifest::PreparedManifest;
 use super::super::memtable;
 use super::super::shard_file;
 use super::{FlushOutcome, FlushWork, InMemRun, RecoverySource, Table, INMEM_CEILING, INMEM_COMPACT_THRESHOLD};
-use crate::foundation::posix_io::{fdatasync_eintr, fsync_eintr, open_owned};
+use crate::foundation::posix_io::open_owned;
 
 impl Table {
-    /// Synchronous flush. `Rederive` tables fold into the RAM tier;
-    /// `SalReplay` tables fold memtable + L0 into one shard written at its final
-    /// name (unsynced), fdatasync every unsynced file by path + the manifest
-    /// `.tmp`, rename the manifest, fsync the dir, then drain deferred cleanup.
-    /// The sole synchronous fsync entry point — used by manual FLUSH and the
-    /// system-table checkpoint (which never reach the worker-barrier drain).
+    /// Synchronous flush of this one table through the shared barrier:
+    /// `Rederive` tables fold into the RAM tier and publish nothing; a
+    /// `SalReplay` table folds memtable + L0 into one shard, syncs it and the
+    /// staged manifest, renames the manifest into place, fsyncs the directory,
+    /// and drains its deferred compaction cleanup. Used by manual FLUSH and the
+    /// system-table checkpoint, which never reach the worker's checkpoint round.
     pub fn flush(&mut self) -> Result<(), StorageError> {
-        match self.flush_prepare()? {
-            FlushOutcome::Done => Ok(()),
-            FlushOutcome::Pending(work) => {
-                // Sweep: fdatasync every unpublished/unsynced file by path (prior
-                // spills + this barrier's folded shard) before the manifest rename.
-                for p in work.sync_paths() {
-                    let fd = open_owned(p, libc::O_RDONLY).ok_or(StorageError::Io)?;
-                    if fdatasync_eintr(fd.as_raw_fd()).is_err() {
-                        return Err(StorageError::Io);
-                    }
-                }
-                if fdatasync_eintr(work.manifest_fd()).is_err() {
-                    return Err(StorageError::Io);
-                }
-                // fsync the per-flush dir fd; it is not held for the table's life.
-                let dirfd = self.flush_commit(work)?;
-                if fsync_eintr(dirfd.as_raw_fd()).is_err() {
-                    return Err(StorageError::Io);
-                }
-                // Deferred compaction cleanup: the manifest now references the
-                // compacted index durably, so superseded inputs are safe to
-                // unlink. (The worker barrier drains user families instead.)
-                self.drain_deletions();
-                Ok(())
-            }
-        }
+        super::super::flush_barrier::flush_barrier([self as *mut Table], super::super::flush_barrier::FlushRound::Base)
     }
 
     /// Open the partition directory fd on demand (`O_RDONLY|O_DIRECTORY`).
@@ -153,7 +128,7 @@ impl Table {
     /// `persist_l0_run` — the same commit point the spill path uses. The
     /// barrier's by-path sweep fdatasyncs every unsynced file; `flush_commit`
     /// renames the manifest alone.
-    pub fn flush_prepare(&mut self) -> Result<FlushOutcome, StorageError> {
+    pub(in crate::storage) fn flush_prepare(&mut self) -> Result<FlushOutcome, StorageError> {
         if self.recovery_source != RecoverySource::SalReplay {
             self.flush_to_ram()?;
             return Ok(FlushOutcome::Done);
@@ -216,7 +191,10 @@ impl Table {
     /// whole (valid) view every restart — resume would never trigger. An empty
     /// partition publishes a zero-entry manifest at generation `g`; an unchanged
     /// partition re-stamps its existing shards at `g`.
-    pub fn flush_prepare_ephemeral(&mut self, generation: u64) -> Result<FlushOutcome, StorageError> {
+    pub(in crate::storage) fn flush_prepare_ephemeral(
+        &mut self,
+        generation: u64,
+    ) -> Result<FlushOutcome, StorageError> {
         self.prepare_persist(true, generation)
     }
 
@@ -288,7 +266,7 @@ impl Table {
     /// the manifest rename. On a rename failure the `.tmp` is unlinked by
     /// `PreparedManifest`'s Drop and the shard survives as an orphan (GC'd next
     /// open); every fd is released through its `OwnedFd` on every path.
-    pub(crate) fn flush_commit(&mut self, work: FlushWork) -> Result<OwnedFd, StorageError> {
+    pub(in crate::storage) fn flush_commit(&mut self, work: FlushWork) -> Result<OwnedFd, StorageError> {
         work.manifest.commit()?;
 
         // The files in `unsynced` were fdatasync'd by the barrier sweep and are

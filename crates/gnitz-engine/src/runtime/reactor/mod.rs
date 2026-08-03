@@ -3009,7 +3009,6 @@ mod tests {
         use crate::runtime::reactor::{join_all_unpin, select2, Either};
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use crate::runtime::w2m_ring;
-        use crate::runtime::wire as ipc;
         use crate::runtime::wire::STATUS_OK;
         use std::time::Duration;
 
@@ -3031,27 +3030,8 @@ mod tests {
             // any of them under the resulting drain-refresh-arm
             // race pressure.
             let writer = W2mWriter::new(ptr, CAPACITY as u64);
-            let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None, &[]);
             for req_id in 1..=N_MESSAGES {
-                writer.send_encoded(sz, req_id as u32, |buf| {
-                    ipc::encode_wire_into(
-                        buf,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0u128,
-                        0,
-                        req_id,
-                        STATUS_OK,
-                        &[],
-                        None,
-                        None,
-                        None,
-                        None,
-                        &[],
-                    );
-                });
+                writer.send_status(0, req_id, STATUS_OK, &[]);
             }
             unsafe {
                 libc::_exit(0);
@@ -3124,7 +3104,6 @@ mod tests {
         use crate::runtime::reactor::{join_all_unpin, select2, Either};
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use crate::runtime::w2m_ring;
-        use crate::runtime::wire as ipc;
         use crate::runtime::wire::STATUS_OK;
         use std::time::Duration;
 
@@ -3142,27 +3121,8 @@ mod tests {
         assert!(pid >= 0);
         if pid == 0 {
             let writer = W2mWriter::new(ptr, CAPACITY as u64);
-            let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None, &[]);
             for req_id in 1..=N_MESSAGES {
-                writer.send_encoded(sz, req_id as u32, |buf| {
-                    ipc::encode_wire_into(
-                        buf,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0u128,
-                        0,
-                        req_id,
-                        STATUS_OK,
-                        &[],
-                        None,
-                        None,
-                        None,
-                        None,
-                        &[],
-                    );
-                });
+                writer.send_status(0, req_id, STATUS_OK, &[]);
             }
             unsafe {
                 libc::_exit(0);
@@ -3248,7 +3208,6 @@ mod tests {
     fn refresh_publishes_flag_before_snapshotting_reader_seq() {
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use crate::runtime::w2m_ring::{self, W2mRingHeader, FLAG_MASTER_PARKED};
-        use crate::runtime::wire as ipc;
         use crate::runtime::wire::STATUS_OK;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
@@ -3301,26 +3260,7 @@ mod tests {
             // Flag observed: publish one frame. send_encoded commits the
             // write_cursor (Release) then bumps reader_seq.
             let writer = W2mWriter::new(region, CAPACITY as u64);
-            let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None, &[]);
-            writer.send_encoded(sz, 1u32, |buf| {
-                ipc::encode_wire_into(
-                    buf,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0u128,
-                    0,
-                    1u64,
-                    STATUS_OK,
-                    &[],
-                    None,
-                    None,
-                    None,
-                    None,
-                    &[],
-                );
-            });
+            writer.send_status(0, 1u64, STATUS_OK, &[]);
             helper_published_thread.store(true, Ordering::Release);
         });
 
@@ -3776,7 +3716,7 @@ mod tests {
     ) {
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use crate::runtime::w2m_ring;
-        use crate::runtime::wire::{self as ipc, STATUS_OK};
+        use crate::runtime::wire as ipc;
 
         const CAPACITY: usize = 4096;
         let region = crate::test_support::SharedRegion::new(CAPACITY);
@@ -3785,25 +3725,9 @@ mod tests {
 
         let writer = W2mWriter::new(ptr, CAPACITY as u64);
         let receiver = W2mReceiver::new(vec![ptr]);
-        let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None, &[]);
-        writer.send_encoded(sz, req_id, |buf| {
-            ipc::encode_wire_into(
-                buf,
-                0,
-                0,
-                0,
-                0,
-                0u128,
-                0,
-                0,
-                STATUS_OK,
-                &[],
-                None,
-                None,
-                None,
-                None,
-                &[],
-            );
+        let msg = ipc::WireMsg::default();
+        writer.send_encoded(msg.size(), req_id, |buf| {
+            msg.encode_ipc(buf, 0);
         });
         let slot = receiver.try_read_slot(0).expect("scan slot");
         (slot, receiver, region)
@@ -3907,7 +3831,7 @@ mod tests {
     ) -> (crate::runtime::w2m::W2mReceiver, crate::test_support::SharedRegion) {
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use crate::runtime::w2m_ring;
-        use crate::runtime::wire::{self as ipc, STATUS_OK};
+        use crate::runtime::wire as ipc;
 
         const CAPACITY: usize = 64 * 1024;
         let region = crate::test_support::SharedRegion::new(CAPACITY);
@@ -3916,27 +3840,14 @@ mod tests {
 
         let writer = W2mWriter::new(ptr, CAPACITY as u64);
         let receiver = W2mReceiver::new(vec![ptr]);
-        let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None, &[]);
         for i in 0..n {
             let wire_req = 100u64 + i as u64;
-            writer.send_encoded(sz, internal_req_id, |buf| {
-                ipc::encode_wire_into(
-                    buf,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0u128,
-                    0,
-                    wire_req,
-                    STATUS_OK,
-                    &[],
-                    None,
-                    None,
-                    None,
-                    None,
-                    &[],
-                );
+            let msg = ipc::WireMsg {
+                request_id: wire_req,
+                ..Default::default()
+            };
+            writer.send_encoded(msg.size(), internal_req_id, |buf| {
+                msg.encode_ipc(buf, 0);
             });
         }
         (receiver, region)
@@ -4085,7 +3996,7 @@ mod tests {
     fn dropped_scan_lease_unblocks_streaming_writer() {
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use crate::runtime::w2m_ring::{self, W2M_HEADER_SIZE};
-        use crate::runtime::wire::{self as ipc, STATUS_OK};
+        use crate::runtime::wire as ipc;
         use gnitz_wire::align8;
         use std::sync::atomic::Ordering;
         use std::time::{Duration, Instant};
@@ -4093,8 +4004,7 @@ mod tests {
         const TOTAL: usize = 8;
 
         // Ring sized for exactly 2 small frames.
-        let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None, &[]);
-        let msg_total = 8 + align8(sz) as u64;
+        let msg_total = 8 + align8(ipc::WireMsg::default().size()) as u64;
         let capacity = W2M_HEADER_SIZE as u64 + 2 * msg_total + 8;
         let region = crate::test_support::SharedRegion::new(capacity as usize);
         let ptr = region.ptr();
@@ -4108,24 +4018,9 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
             for _ in 0..TOTAL {
-                writer.send_encoded(sz, req_id, |buf| {
-                    ipc::encode_wire_into(
-                        buf,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0u128,
-                        0,
-                        0,
-                        STATUS_OK,
-                        &[],
-                        None,
-                        None,
-                        None,
-                        None,
-                        &[],
-                    );
+                let msg = ipc::WireMsg::default();
+                writer.send_encoded(msg.size(), req_id, |buf| {
+                    msg.encode_ipc(buf, 0);
                 });
             }
             let _ = done_tx.send(());

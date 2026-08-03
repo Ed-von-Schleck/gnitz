@@ -3,7 +3,7 @@
 
 use super::*;
 
-use ipc::FRAME_CAP;
+use ipc::{WireData, WireMsg, FRAME_CAP};
 
 // ---------------------------------------------------------------------------
 // PendingScan
@@ -27,18 +27,18 @@ pub(super) struct PendingScan {
 
 /// The two emission shapes of a `PendingScan`:
 ///
-/// * `WireSafe` — a fixed-width columnar train (empty blob region) emitted via
-///   `encode_wire_into_range`, chunked across frames when it exceeds
+/// * `WireSafe` — a fixed-width columnar train (empty blob region) emitted as a
+///   [`WireData::Range`], chunked across frames when it exceeds
 ///   `reply_frame_budget`. `next_row` tracks emission progress (`0` ⇒ the first
 ///   chunk still owes the schema block; non-zero ⇒ a pure-data continuation);
 ///   `wire_row_stride` is the constant per-row wire size, computed once at
 ///   enqueue so each chunk recomputes only the frame base. This is the only
 ///   shape a plain scan or an oversized seek-by-index / gather reply produces.
 /// * `NonWireSafe` — a STRING/German-string (blob-bearing) result that cannot
-///   chunk: exactly one frame via the blob-capable `encode_wire_into`. Reached
-///   only on the multi-scan FIFO path (`force_fifo`), where even an
-///   immediate-emit-eligible reply must queue so ring order equals request
-///   order; the plain scan path still emits such a reply inline.
+///   chunk: exactly one whole-batch frame. Reached only on the multi-scan FIFO
+///   path (`force_fifo`), where even an immediate-emit-eligible reply must queue
+///   so ring order equals request order; the plain scan path still emits such a
+///   reply inline.
 pub(super) enum PendingScanKind {
     WireSafe { next_row: usize, wire_row_stride: usize },
     NonWireSafe,
@@ -47,27 +47,28 @@ pub(super) enum PendingScanKind {
 impl WorkerProcess {
     // ── W2M response helpers ───────────────────────────────────────────
 
-    pub(super) fn send_ack(&self, target_id: u64, request_id: u64) {
-        let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None, &[]);
-        self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
-            ipc::encode_wire_into_ipc(
-                buf,
-                0,
-                target_id,
-                0,
-                0,
-                0u128,
-                0,
-                request_id,
-                STATUS_OK,
-                &[],
-                None,
-                None,
-                None,
-                None,
-                &[],
-            );
+    /// Encode `msg` into one W2M ring slot tagged `ring_req`. The master reactor
+    /// routes a reply by this ring prefix, not by the payload's `request_id` —
+    /// the chunked-train frames leave that field 0.
+    fn send_msg(&self, ring_req: u64, msg: WireMsg<'_>) {
+        self.send_sized(ring_req, msg, msg.size());
+    }
+
+    /// `send_msg` for a caller that already sized the message (to check it
+    /// against a frame cap); `sz` must be `msg.size()`.
+    fn send_sized(&self, ring_req: u64, msg: WireMsg<'_>, sz: usize) {
+        self.w2m_writer.send_encoded(sz, ring_req as u32, |buf| {
+            msg.encode_ipc(buf, 0);
         });
+    }
+
+    pub(super) fn send_ack(&self, target_id: u64, request_id: u64) {
+        self.w2m_writer.send_status(target_id, request_id, STATUS_OK, &[]);
+    }
+
+    pub(super) fn send_error(&self, error_msg: &str, request_id: u64) {
+        self.w2m_writer
+            .send_status(0, request_id, STATUS_ERROR, error_msg.as_bytes());
     }
 
     /// Reply schema wire block: the table's cached block for `Table`, a
@@ -81,15 +82,42 @@ impl WorkerProcess {
     fn reply_schema_block(&mut self, tid_key: i64, schema: ReplySchema<'_>) -> (Option<Rc<Vec<u8>>>, u16, bool) {
         match schema {
             ReplySchema::None => (None, 0, true),
+            // Version 0: the block is a projected/synthetic schema, so the
+            // table's version does not describe it — reporting the table's would
+            // let a version-suppression path drop a block the reader still needs.
             ReplySchema::OneOff(s) => {
                 let block = Rc::new(ipc::build_schema_wire_block(s, &[], 0, tid_key as u32));
-                (Some(block), self.cat().get_schema_version(tid_key), schema_wire_safe(s))
+                (Some(block), 0, schema_wire_safe(s))
             }
             ReplySchema::Table(s) => {
                 let e = ipc::get_or_build_schema_wire_block(self.cat(), tid_key, s);
                 (Some(e.entry.block), e.version, e.entry.wire_safe)
             }
             ReplySchema::ClientAuthored(s) => (None, 0, schema_wire_safe(s)),
+        }
+    }
+
+    /// The single-frame reply message shape shared by `send_response` and
+    /// `stream_batch_response`: the whole batch, the resolved schema block, and
+    /// the schema version echoed in the wire flags.
+    fn whole_batch_msg<'a>(
+        target_id: u64,
+        result: Option<&'a Batch>,
+        request_id: u64,
+        client_id: u64,
+        seek_pk: u128,
+        prebuilt: Option<&'a [u8]>,
+        server_version: u16,
+    ) -> WireMsg<'a> {
+        WireMsg {
+            target_id,
+            client_id,
+            flags: gnitz_wire::wire_flags_set_schema_version(0, server_version),
+            seek_pk,
+            request_id,
+            data: WireData::Whole(result),
+            prebuilt_schema_block: prebuilt,
+            ..Default::default()
         }
     }
 
@@ -110,64 +138,23 @@ impl WorkerProcess {
         seek_pk: u128,
     ) -> Result<(), String> {
         let (prebuilt_rc, server_version, _) = self.reply_schema_block(target_id as i64, schema);
-        let prebuilt = prebuilt_rc.as_deref().map(Vec::as_slice);
-        let sz = ipc::wire_size(STATUS_OK, &[], None, None, result, prebuilt, &[]);
-        if sz > FRAME_CAP {
-            return Err(format!(
-                "reply wire_size={sz} exceeds the maximum frame payload {FRAME_CAP}"
-            ));
-        }
-        self.send_response_prebuilt(
+        let msg = Self::whole_batch_msg(
             target_id,
             result,
             request_id,
             client_id,
             seek_pk,
-            prebuilt,
+            prebuilt_rc.as_deref().map(Vec::as_slice),
             server_version,
-            sz,
         );
+        let sz = msg.size();
+        if sz > FRAME_CAP {
+            return Err(format!(
+                "reply wire_size={sz} exceeds the maximum frame payload {FRAME_CAP}"
+            ));
+        }
+        self.send_sized(request_id, msg, sz);
         Ok(())
-    }
-
-    /// Encode tail of `send_response`: emit one frame with an already-resolved
-    /// schema block. `prebuilt`/`server_version` must come from
-    /// `reply_schema_block` for this `schema`, and `sz` must be the frame's
-    /// wire size for these exact arguments — split out so a caller that
-    /// already resolved the block and size (the `stream_batch_response`
-    /// single-frame fast path) does not compute either twice.
-    #[allow(clippy::too_many_arguments)]
-    fn send_response_prebuilt(
-        &mut self,
-        target_id: u64,
-        result: Option<&Batch>,
-        request_id: u64,
-        client_id: u64,
-        seek_pk: u128,
-        prebuilt: Option<&[u8]>,
-        server_version: u16,
-        sz: usize,
-    ) {
-        let flags = gnitz_wire::wire_flags_set_schema_version(0, server_version);
-        self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
-            ipc::encode_wire_into(
-                buf,
-                0,
-                target_id,
-                client_id,
-                flags,
-                seek_pk,
-                0,
-                request_id,
-                STATUS_OK,
-                &[],
-                None,
-                None,
-                result,
-                prebuilt,
-                &[],
-            );
-        });
     }
 
     /// Reply with `result`, chunking through `pending_streams` when it exceeds
@@ -189,17 +176,17 @@ impl WorkerProcess {
         let Some(batch) = result.filter(|b| b.count > 0) else {
             return self.send_response(target_id, None, schema, request_id, client_id, seek_pk);
         };
-        let tid_key = target_id as i64;
-        let (prebuilt_rc, server_version, is_wire_safe) = self.reply_schema_block(tid_key, schema);
-        let prebuilt = prebuilt_rc.as_deref().map(Vec::as_slice);
-        // For a full-range wire-safe batch the blob region is empty and every
-        // region is `count · stride`, so wire_size_range(count) equals the
-        // wire_size the single-frame path below would compute.
-        let sz = if is_wire_safe {
-            ipc::wire_size_range(STATUS_OK, &[], None, None, &batch, batch.count, prebuilt)
-        } else {
-            ipc::wire_size(STATUS_OK, &[], None, None, Some(&batch), prebuilt, &[])
-        };
+        let (prebuilt_rc, server_version, is_wire_safe) = self.reply_schema_block(target_id as i64, schema);
+        let msg = Self::whole_batch_msg(
+            target_id,
+            Some(&batch),
+            request_id,
+            client_id,
+            seek_pk,
+            prebuilt_rc.as_deref().map(Vec::as_slice),
+            server_version,
+        );
+        let sz = msg.size();
         // Non-wire-safe replies cannot chunk, so they single-frame up to the
         // hard frame cap; wire-safe replies chunk past the (overridable, and
         // never larger) frame budget.
@@ -209,23 +196,11 @@ impl WorkerProcess {
             FRAME_CAP
         };
         if sz <= frame_cap {
-            self.send_response_prebuilt(
-                target_id,
-                Some(&batch),
-                request_id,
-                client_id,
-                seek_pk,
-                prebuilt,
-                server_version,
-                sz,
-            );
+            self.send_sized(request_id, msg, sz);
             return Ok(());
         }
         if !is_wire_safe {
-            return Err(format!(
-                "result wire_size={sz} exceeds the maximum frame payload {FRAME_CAP}; \
-                 STRING-column chunking not yet implemented — add a tighter predicate or LIMIT"
-            ));
+            return Err(oversized_string_reply(sz));
         }
         self.enqueue_stream(
             Rc::new(batch),
@@ -254,30 +229,31 @@ impl WorkerProcess {
         client_version: u16,
         force_fifo: bool,
     ) -> Result<(), String> {
-        let tid_key = target_id as i64;
-        // Obtain prebuilt schema block + server version. include_schema controls
-        // whether the first frame carries a schema block; server_version is always
-        // embedded in wire_flags so the client can cache/verify.
-        let (block_rc, server_version, is_wire_safe) = self.reply_schema_block(tid_key, schema);
+        // `include_schema` controls whether the first frame carries a schema
+        // block; `server_version` is always embedded in the wire flags so the
+        // client can cache/verify.
+        let (block_rc, server_version, is_wire_safe) = self.reply_schema_block(target_id as i64, schema);
         let prebuilt_rc = block_rc.filter(|_| gnitz_wire::wire_should_include_schema(client_version, server_version));
-        let schema_version_flags = gnitz_wire::wire_flags_set_schema_version(0, server_version);
 
         if !is_wire_safe {
             // STRING-column tables: no chunking. Check size; error if too big.
-            let prebuilt = prebuilt_rc.as_deref().map(Vec::as_slice);
-            let wire_sz = ipc::wire_size(STATUS_OK, &[], None, None, Some(&*batch), prebuilt, &[]);
+            let msg = Self::non_wire_safe_msg(
+                target_id,
+                &batch,
+                client_id,
+                prebuilt_rc.as_deref().map(Vec::as_slice),
+                server_version,
+            );
+            let wire_sz = msg.size();
             if wire_sz > FRAME_CAP {
-                return Err(format!(
-                    "scan: batch wire_size={wire_sz} exceeds the maximum frame payload \
-                     {FRAME_CAP}; STRING-column chunking not yet implemented"
-                ));
+                return Err(oversized_string_reply(wire_sz));
             }
             if force_fifo {
                 // Multi-scan: queue the single blob frame so this relation
                 // reaches the ring in request order (the FIFO reply contract).
                 // The oversize reject above stays at enqueue time —
                 // `emit_pending_scan_chunk` is infallible, so only the encode is
-                // deferred; the emit recomputes `wire_sz` identically.
+                // deferred; the emit rebuilds an identical message.
                 self.pending_streams.push_back(PendingScan {
                     batch,
                     request_id,
@@ -289,39 +265,32 @@ impl WorkerProcess {
                 });
                 return Ok(());
             }
-            self.emit_non_wire_safe(target_id, &batch, request_id, client_id, prebuilt, server_version);
+            self.send_sized(request_id, msg, wire_sz);
             return Ok(());
         }
 
-        // Wire-safe path: range encoder supports chunking.
-        let total_rows = batch.count;
-        let total_sz = {
-            let prebuilt = prebuilt_rc.as_deref().map(Vec::as_slice);
-            ipc::wire_size_range(STATUS_OK, &[], None, None, &batch, total_rows, prebuilt)
-        };
-
-        if !force_fifo && total_sz <= self.reply_frame_budget {
-            // Single-frame response: FLAG_CONTINUATION keeps the client reading
-            // (terminal frame signals scan end); FLAG_SCAN_LAST tells master this
-            // worker's chunk train is done. Skipped under `force_fifo`: a
-            // multi-scan queues even a one-frame reply so ring order equals
-            // request order.
-            let prebuilt = prebuilt_rc.as_deref().map(Vec::as_slice);
-            let flags = schema_version_flags | FLAG_CONTINUATION | FLAG_SCAN_LAST;
-            self.w2m_writer.send_encoded(total_sz, request_id as u32, |buf| {
-                ipc::encode_wire_into_range(
-                    buf, 0, target_id, client_id, flags, STATUS_OK, None, &batch, 0, total_rows, prebuilt,
-                );
-            });
+        // Wire-safe path: the range encoder supports chunking.
+        // FLAG_CONTINUATION keeps the client reading (a terminal frame signals
+        // scan end); FLAG_SCAN_LAST tells the master this worker's train is done.
+        let msg = Self::chunk_msg(
+            target_id,
+            &batch,
+            client_id,
+            0,
+            batch.count,
+            prebuilt_rc.as_deref().map(Vec::as_slice),
+            server_version,
+            true,
+        );
+        // `force_fifo` queues even a one-frame reply so ring order equals
+        // request order; its lone chunk is the same ≤budget frame this branch
+        // would have sent.
+        let sz = msg.size();
+        if !force_fifo && sz <= self.reply_frame_budget {
+            self.send_sized(request_id, msg, sz);
         } else {
-            // Enqueue the train; its first chunk is emitted on the next
-            // drain_sal pass, after any earlier queued train fully drains. This
-            // covers both a genuinely multi-chunk reply and the `force_fifo`
-            // single-frame case — a one-chunk train whose lone chunk is the same
-            // ≤budget frame the immediate path would send.
             self.enqueue_stream(batch, request_id, client_id, target_id, prebuilt_rc, server_version);
         }
-
         Ok(())
     }
 
@@ -340,8 +309,8 @@ impl WorkerProcess {
     ) {
         // Per-row wire stride, computed once for the train (wire-safe schemas
         // only reach here, so the stride is constant across chunks).
-        let wire_row_stride = ipc::wire_size_range(STATUS_OK, &[], None, None, &batch, 1, None)
-            - ipc::wire_size_range(STATUS_OK, &[], None, None, &batch, 0, None);
+        let row_span = |rows| Self::chunk_msg(target_id, &batch, client_id, 0, rows, None, server_version, true).size();
+        let wire_row_stride = row_span(1) - row_span(0);
         self.pending_streams.push_back(PendingScan {
             batch,
             request_id,
@@ -372,61 +341,79 @@ impl WorkerProcess {
         }
     }
 
-    /// Emit one non-wire-safe (STRING/blob) scan reply as a single terminal
-    /// frame (`FLAG_CONTINUATION | FLAG_SCAN_LAST`, schema block iff `prebuilt`
-    /// is `Some`) via the blob-capable `encode_wire_into`. The descriptor is
-    /// always `None`: a prebuilt block, present whenever a schema is emitted,
-    /// supersedes it. Shared by the immediate branch of `send_scan_response` and
-    /// the queued `emit_non_wire_safe_frame` (multi-scan FIFO) so the two produce
-    /// byte-identical frames. Callers enforce the [`FRAME_CAP`] limit first.
-    fn emit_non_wire_safe(
-        &mut self,
+    /// The one-frame message a non-wire-safe (STRING/blob) scan reply produces:
+    /// the whole batch, terminal train flags, and the schema block iff
+    /// `prebuilt` is `Some`. Shared by the immediate branch of
+    /// `send_scan_response` and the queued `emit_non_wire_safe_frame`
+    /// (multi-scan FIFO) so the two produce byte-identical frames.
+    fn non_wire_safe_msg<'a>(
         target_id: u64,
-        batch: &Batch,
-        request_id: u64,
+        batch: &'a Batch,
         client_id: u64,
-        prebuilt: Option<&[u8]>,
+        prebuilt: Option<&'a [u8]>,
         server_version: u16,
-    ) {
-        let flags = gnitz_wire::wire_flags_set_schema_version(FLAG_CONTINUATION | FLAG_SCAN_LAST, server_version);
-        let wire_sz = ipc::wire_size(STATUS_OK, &[], None, None, Some(batch), prebuilt, &[]);
-        self.w2m_writer.send_encoded(wire_sz, request_id as u32, |buf| {
-            ipc::encode_wire_into(
-                buf,
-                0,
-                target_id,
-                client_id,
-                flags,
-                0u128,
-                0,
-                0,
-                STATUS_OK,
-                &[],
-                None,
-                None,
-                Some(batch),
-                prebuilt,
-                &[],
-            );
-        });
+    ) -> WireMsg<'a> {
+        WireMsg {
+            target_id,
+            client_id,
+            flags: gnitz_wire::wire_flags_set_schema_version(FLAG_CONTINUATION | FLAG_SCAN_LAST, server_version),
+            data: WireData::Whole(Some(batch)),
+            prebuilt_schema_block: prebuilt,
+            ..Default::default()
+        }
+    }
+
+    /// One columnar chunk of a wire-safe reply train: rows
+    /// `[start_row, start_row + count)`, the schema block iff `prebuilt` is
+    /// `Some`, and FLAG_SCAN_LAST iff `is_last`. FLAG_CONTINUATION is always set
+    /// so the client's "stop on no FLAG_CONTINUATION" loop still terminates on
+    /// the frame after the last one. The payload `request_id` stays 0: reply
+    /// routing rides the W2M slot's ring prefix.
+    #[allow(clippy::too_many_arguments)]
+    fn chunk_msg<'a>(
+        target_id: u64,
+        batch: &'a Batch,
+        client_id: u64,
+        start_row: usize,
+        count: usize,
+        prebuilt: Option<&'a [u8]>,
+        server_version: u16,
+        is_last: bool,
+    ) -> WireMsg<'a> {
+        WireMsg {
+            target_id,
+            client_id,
+            flags: gnitz_wire::wire_flags_set_schema_version(
+                FLAG_CONTINUATION | if is_last { FLAG_SCAN_LAST } else { 0 },
+                server_version,
+            ),
+            data: WireData::Range {
+                batch,
+                start_row,
+                count,
+            },
+            prebuilt_schema_block: prebuilt,
+            ..Default::default()
+        }
     }
 
     /// Emit the single blob frame of a `NonWireSafe` front train and pop it. The
-    /// oversize reject already fired at enqueue, so `emit_non_wire_safe`'s
-    /// internal sizing call here is pure.
+    /// oversize reject already fired at enqueue.
     fn emit_non_wire_safe_frame(&mut self) {
         // This train always emits exactly one frame and always pops, so pop it
-        // up front and move its fields straight into the emit — no clone needed.
+        // up front and borrow its fields straight into the emit — no clone needed.
         let Some(p) = self.pending_streams.pop_front() else {
             return;
         };
-        self.emit_non_wire_safe(
-            p.target_id,
-            &p.batch,
+        self.send_msg(
             p.request_id,
-            p.client_id,
-            p.prebuilt_schema.as_deref().map(Vec::as_slice),
-            p.server_version,
+            Self::non_wire_safe_msg(
+                p.target_id,
+                &p.batch,
+                p.client_id,
+                p.prebuilt_schema.as_deref().map(Vec::as_slice),
+                p.server_version,
+            ),
         );
     }
 
@@ -460,11 +447,8 @@ impl WorkerProcess {
             )
         };
 
-        let is_first = next_row == 0;
-        // prebuilt_opt drives the schema block: Some on the first chunk when the
-        // client needs the schema, None on continuations and schema-suppressed frames.
-        // encode_wire_into_range uses the prebuilt bytes directly; no schema arg needed.
-        let prebuilt_opt: Option<&[u8]> = if is_first {
+        // The schema block rides the first chunk only; continuations are pure data.
+        let prebuilt: Option<&[u8]> = if next_row == 0 {
             prebuilt_schema.as_deref().map(Vec::as_slice)
         } else {
             None
@@ -475,38 +459,35 @@ impl WorkerProcess {
         // constant per-row stride (stored at enqueue), so wire size is linear
         // in count and only the frame base (schema block on the first chunk)
         // needs recomputing per chunk.
-        let sz_0 = ipc::wire_size_range(STATUS_OK, &[], None, None, &batch, 0, prebuilt_opt);
-        let usable = budget.saturating_sub(sz_0);
-        let max_rows = match usable.checked_div(per_row) {
+        let base = Self::chunk_msg(
+            target_id,
+            &batch,
+            client_id,
+            next_row,
+            0,
+            prebuilt,
+            server_version,
+            false,
+        )
+        .size();
+        let max_rows = match budget.saturating_sub(base).checked_div(per_row) {
             Some(rows) => rows.max(1).min(remaining),
             None => remaining.max(1), // per_row == 0: constant wire size, send all
         };
         let has_more = next_row + max_rows < batch.count;
-        // FLAG_CONTINUATION is always set on worker scan frames so the client's
-        // loop termination ("stop on no FLAG_CONTINUATION") still works.
-        // FLAG_SCAN_LAST is the W2M-internal signal that this is the last chunk.
-        // server_version is always embedded so the master decode path can verify.
-        let flags: u64 = gnitz_wire::wire_flags_set_schema_version(
-            FLAG_CONTINUATION | if !has_more { FLAG_SCAN_LAST } else { 0 },
-            server_version,
-        );
-        // wire_size_range is linear in count for wire-safe schemas.
-        let sz = sz_0 + per_row * max_rows;
-        self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
-            ipc::encode_wire_into_range(
-                buf,
-                0,
+        self.send_msg(
+            request_id,
+            Self::chunk_msg(
                 target_id,
-                client_id,
-                flags,
-                STATUS_OK,
-                None,
                 &batch,
+                client_id,
                 next_row,
                 max_rows,
-                prebuilt_opt,
-            );
-        });
+                prebuilt,
+                server_version,
+                !has_more,
+            ),
+        );
 
         if has_more {
             match self.pending_streams.front_mut().map(|p| &mut p.kind) {
@@ -517,30 +498,15 @@ impl WorkerProcess {
             self.pending_streams.pop_front();
         }
     }
+}
 
-    pub(super) fn send_error(&self, error_msg: &str, request_id: u64) {
-        let msg = error_msg.as_bytes();
-        let sz = ipc::wire_size(STATUS_ERROR, msg, None, None, None, None, &[]);
-        self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
-            ipc::encode_wire_into_ipc(
-                buf,
-                0,
-                0,
-                0,
-                0,
-                0u128,
-                0,
-                request_id,
-                STATUS_ERROR,
-                msg,
-                None,
-                None,
-                None,
-                None,
-                &[],
-            );
-        });
-    }
+/// A blob-bearing (STRING/German-string) reply cannot be split across frames, so
+/// one too large for a single frame has no way out.
+fn oversized_string_reply(sz: usize) -> String {
+    format!(
+        "reply wire_size={sz} exceeds the maximum frame payload {FRAME_CAP}; a STRING-column \
+         result cannot be chunked — add a tighter predicate or a LIMIT"
+    )
 }
 
 /// Stream the sorted OPK leading-key spans lent by `keys` to the master as a
@@ -598,25 +564,21 @@ pub(crate) fn send_unique_preflight_keys(
         }
         let is_last = keys.remaining() == 0;
         // Schema block only on the first frame; continuations decode against
-        // the master's saved schema hint (synthetic schema version is 0, so
-        // no wire_flags_set_schema_version is needed).
-        let prebuilt: Option<&[u8]> = if is_first { Some(&schema_block) } else { None };
-        let flags = FLAG_CONTINUATION | if is_last { FLAG_SCAN_LAST } else { 0 };
-        let sz = ipc::wire_size_range(STATUS_OK, &[], None, None, &chunk, chunk.count, prebuilt);
-        w2m_writer.send_encoded(sz, request_id as u32, |buf| {
-            ipc::encode_wire_into_range(
-                buf,
-                0,
-                target_id,
-                0,
-                flags,
-                STATUS_OK,
-                None,
-                &chunk,
-                0,
-                chunk.count,
-                prebuilt,
-            );
+        // the master's saved schema hint (the synthetic schema's version is 0,
+        // so no version needs embedding in the flags).
+        let msg = WireMsg {
+            target_id,
+            flags: FLAG_CONTINUATION | if is_last { FLAG_SCAN_LAST } else { 0 },
+            data: WireData::Range {
+                batch: &chunk,
+                start_row: 0,
+                count: chunk.count,
+            },
+            prebuilt_schema_block: is_first.then_some(schema_block.as_slice()),
+            ..Default::default()
+        };
+        w2m_writer.send_encoded(msg.size(), request_id as u32, |buf| {
+            msg.encode_ipc(buf, 0);
         });
         is_first = false;
         if is_last {

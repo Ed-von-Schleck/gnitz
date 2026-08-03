@@ -16,6 +16,7 @@
 
 // Re-exported from storage/mod.rs.
 pub(super) mod child_dir;
+pub(super) mod flush_barrier;
 pub(super) mod index_gather;
 pub(super) mod manifest;
 pub(super) mod partitioned_table;

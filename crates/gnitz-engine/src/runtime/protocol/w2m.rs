@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::foundation::posix_io;
 use crate::runtime::w2m_ring::{self, TryReserve, W2mRingHeader, FLAG_MASTER_PARKED, FLAG_WRITER_PARKED};
-use crate::runtime::wire::{decode_wire_ipc, DecodedWire};
+use crate::runtime::wire::{decode_wire_ipc, DecodedWire, WireMsg};
 
 // `wait_any` builds a `futex_waitv` word list of at most `num_workers` entries,
 // and `num_workers <= MAX_WORKERS`. Pin `MAX_WORKERS <= MAX_FUTEX_WAITV` here —
@@ -30,6 +30,21 @@ impl W2mWriter {
             "W2mWriter region_size must match ring header capacity",
         );
         W2mWriter { region_ptr }
+    }
+
+    /// Send a bare control frame: a status and optional error text, no schema
+    /// and no rows. Every ACK and error reply on the ring has this shape.
+    pub fn send_status(&self, target_id: u64, request_id: u64, status: u32, error_msg: &[u8]) {
+        let msg = WireMsg {
+            target_id,
+            request_id,
+            status,
+            error_msg,
+            ..Default::default()
+        };
+        self.send_encoded(msg.size(), request_id as u32, |buf| {
+            msg.encode_ipc(buf, 0);
+        });
     }
 
     /// Encode wire data into the W2M ring. Blocks on `writer_seq` if full.

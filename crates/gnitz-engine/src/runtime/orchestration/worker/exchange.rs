@@ -46,64 +46,45 @@ impl WorkerProcess {
         } else {
             0
         };
-        let sz = ipc::wire_size(STATUS_OK, &[], schema.as_ref(), None, Some(batch), None, &[]);
-        self.w2m_writer.send_encoded(sz, tick_request_id as u32, |buf| {
-            ipc::encode_wire_into_ipc(
-                buf,
-                0,
-                view_id as u64,
-                0,
-                FLAG_EXCHANGE as u64,
-                source_id as u128,
-                pad_bit,
-                tick_request_id,
-                STATUS_OK,
-                &[],
-                schema.as_ref(),
-                None,
-                Some(batch),
-                None,
-                &[],
-            );
+        let msg = ipc::WireMsg {
+            target_id: view_id as u64,
+            flags: FLAG_EXCHANGE as u64,
+            seek_pk: source_id as u128,
+            seek_col_idx: pad_bit,
+            request_id: tick_request_id,
+            schema: schema.as_ref(),
+            data: ipc::WireData::Whole(Some(batch)),
+            ..Default::default()
+        };
+        self.w2m_writer.send_encoded(msg.size(), tick_request_id as u32, |buf| {
+            msg.encode_ipc(buf, 0);
         });
 
-        let master_pid = self.master_pid;
         let want_key = (view_id, source_id);
-        let ctx = DispatchContext::InEval {
-            relay_wait: want_key,
-            schema,
-        };
+        let ctx = DispatchContext::InEval { relay_wait: want_key };
+
+        // A relay parked by an earlier, differently-keyed wait satisfies this one
+        // without touching the SAL. Only checked here: once the drain loop below
+        // starts, a matching relay short-circuits out of `dispatch` instead.
+        if let Some((b, decision)) = self.exchange.pending_relays.remove(&want_key) {
+            self.consume_backfill_decision(decision);
+            return b;
+        }
 
         loop {
-            if let Some((b, decision)) = self.exchange.pending_relays.remove(&want_key) {
-                self.consume_backfill_decision(decision);
-                return b;
-            }
-
             self.sal_reader.wait(30000);
 
-            // If the master died (killed or gnitz_fatal_abort) while we
-            // were waiting, exit like the main run loop does.
-            if master_pid != 0 && unsafe { libc::getppid() } != master_pid {
-                unsafe {
-                    libc::_exit(0);
-                }
+            // The main run loop flushes before exiting; this path cannot — the
+            // DAG evaluation up the stack holds a live `&mut` to the engine that
+            // `handle_flush_all` would alias. Nothing is lost: the master's death
+            // aborts the cluster, and recovery replays the SAL tail.
+            if self.master_is_gone() {
+                unsafe { libc::_exit(0) }
             }
 
-            loop {
-                if let Some((b, decision)) = self.exchange.pending_relays.remove(&want_key) {
-                    self.consume_backfill_decision(decision);
-                    return b;
-                }
-
-                let (kind, target_id, wire) = match self.next_sal_message() {
-                    Some(v) => v,
-                    None => break, // no more entries — back to outer wait
-                };
-
-                match self.dispatch(ctx, kind, target_id, wire) {
-                    DispatchOutcome::Continue => {}
-                    DispatchOutcome::RelayMatched(batch) => return batch,
+            while let Some((kind, target_id, wire)) = self.next_sal_message() {
+                if let Some(batch) = self.dispatch(ctx, kind, target_id, wire) {
+                    return batch;
                 }
             }
         }

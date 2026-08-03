@@ -5,7 +5,6 @@
 //! per-worker W2M shared region.
 
 use std::collections::{HashMap, VecDeque};
-use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
@@ -18,8 +17,8 @@ use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::{self as ipc, FLAG_CONTINUATION, FLAG_SCAN_LAST, STATUS_ERROR, STATUS_OK};
 use crate::schema::key::PkBuf;
 use crate::schema::SchemaDescriptor;
+use crate::storage::{flush_barrier, BlobCacheGuard, FlushRound, Table};
 use crate::storage::{schema_wire_safe, Batch};
-use crate::storage::{BlobCacheGuard, FlushOutcome, FlushWork, StorageError, Table};
 
 // ---------------------------------------------------------------------------
 // WorkerExchangeHandler
@@ -44,8 +43,10 @@ enum HasPkLookup {
 
 impl HasPkLookup {
     /// A zero column-list word → PrimaryKey. Otherwise the word carries
-    /// `pack_pk_cols(col_indices)` whose packed flag (bit 63) is always set, so a
-    /// real index check is never 0 and never collides with the PK sentinel.
+    /// `pack_pk_cols(col_indices)`, whose packed flag (bit 63) is always set, so
+    /// a real index check is never 0 and never collides with the PK sentinel.
+    /// The column list is validated against the table's schema by
+    /// `validate_index_cols` at the dispatch arm.
     fn from_wire(seek_col_idx: u64) -> Self {
         match gnitz_wire::pk_cols_word(seek_col_idx) {
             0 => HasPkLookup::PrimaryKey,
@@ -87,7 +88,7 @@ enum BackfillRound {
 }
 
 // ---------------------------------------------------------------------------
-// DispatchContext + DispatchOutcome
+// DispatchContext
 //
 // `dispatch` is the single source of truth for the inline-vs-defer matrix
 // (see the doc above `WorkerProcess::dispatch`). The context tells the
@@ -97,7 +98,6 @@ enum BackfillRound {
 // two call sites.
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy)]
 enum DispatchContext {
     /// The worker is draining the SAL from its main run loop — no DAG
@@ -110,24 +110,8 @@ enum DispatchContext {
     ///
     /// Maintenance (`Tick`) and `DdlSync` defer — running them inline would
     /// re-enter or alias the live evaluation — while live point reads/writes stay
-    /// inline so ingestion never stalls. `schema` fabricates an empty relay
-    /// payload for a header-only relay.
-    InEval {
-        relay_wait: (i64, i64),
-        schema: Option<SchemaDescriptor>,
-    },
-}
-
-/// Result of a single `dispatch` call. Shutdown is not an outcome: every
-/// shutdown path `_exit`s inline (`shutdown` / `fatal_shutdown` return `!`).
-#[allow(clippy::large_enum_variant)]
-enum DispatchOutcome {
-    /// The dispatcher handled the message; the caller should keep
-    /// draining the SAL.
-    Continue,
-    /// `InsideExchangeWait` saw the relay it was waiting for; return
-    /// this batch to the DAG.
-    RelayMatched(Batch),
+    /// inline so ingestion never stalls.
+    InEval { relay_wait: (i64, i64) },
 }
 
 struct WorkerExchangeHandler {
@@ -184,7 +168,6 @@ impl<'a> ExchangeCallback for WorkerExchangeCtx<'a> {
 // ---------------------------------------------------------------------------
 
 pub struct WorkerProcess {
-    worker_id: u32,
     master_pid: i32,
     catalog: *mut CatalogEngine,
     sal_reader: SalReader,
@@ -233,26 +216,15 @@ pub struct WorkerProcess {
     /// This budgets only the chunk split point; single-frame paths that cannot
     /// chunk (non-wire-safe STRING replies) check `FRAME_CAP` directly.
     reply_frame_budget: usize,
-    read_cursor: u64,
-    expected_epoch: u32,
 }
 
 mod exchange;
-mod fsync;
 mod reply;
 
 pub(crate) use reply::send_unique_preflight_keys;
 use reply::PendingScan;
 #[cfg(test)]
 use reply::PendingScanKind;
-
-use fsync::uring_batch_fdatasync;
-
-/// Concurrent-fd budget for the barrier flush. Bounds both the per-table
-/// accumulation before a `flush_tables_chunk` and the sub-chunk size the chunk opens
-/// its by-path fdatasync sweep in — so a 256-partition family never opens
-/// thousands of fds at once (EMFILE).
-const FD_CHUNK_THRESHOLD: usize = 256;
 
 /// `GNITZ_INJECT_UNIQUE_PREFLIGHT_ERROR`: fail the pre-flight on every worker so
 /// tests can assert the master surfaces the fault, drains the fan-out, and
@@ -317,13 +289,13 @@ enum Resolved {
 /// correct for every PK width. `resolve` receives the row's raw OPK PK bytes and
 /// a scratch key it may write the answer into.
 fn filter_by_pk_bytes(
-    batch: &Option<Batch>,
+    batch: Option<&Batch>,
     schema: SchemaDescriptor,
-    n: usize,
     mut resolve: impl FnMut(&[u8], &mut PkBuf) -> Resolved,
 ) -> Batch {
+    let n = batch.map_or(0, |b| b.count);
     let mut result = Batch::with_capacity(schema, n);
-    if let Some(ref b) = batch {
+    if let Some(b) = batch {
         let mut blob_cache = BlobCacheGuard::acquire(&schema, n);
         let mut scratch = PkBuf::zeroed(0);
         for i in 0..n {
@@ -341,7 +313,6 @@ fn filter_by_pk_bytes(
 
 impl WorkerProcess {
     pub fn new(
-        worker_id: u32,
         master_pid: i32,
         catalog: *mut CatalogEngine,
         sal_reader: SalReader,
@@ -356,7 +327,6 @@ impl WorkerProcess {
         // catalog work — see `server_main`, not here: boot-compiled plans
         // would otherwise carry rank 0 / num_workers 1.
         WorkerProcess {
-            worker_id,
             master_pid,
             catalog,
             sal_reader,
@@ -375,8 +345,6 @@ impl WorkerProcess {
                 .map(|n| n as usize)
                 .filter(|&n| n <= ipc::FRAME_CAP)
                 .unwrap_or(ipc::FRAME_CAP),
-            read_cursor: 0,
-            expected_epoch: 1,
         }
     }
 
@@ -384,19 +352,12 @@ impl WorkerProcess {
         unsafe { &mut *self.catalog }
     }
 
-    /// Decode `seek_col_idx` — `pack_pk_cols(col_indices)`, whose packed flag
-    /// (bit 63) is always set, so a real index seek is never 0 — and validate
-    /// every column against the table's schema before touching the catalog.
-    /// Used by the SeekByIndex arm.
-    fn validated_index_cols(
-        &mut self,
-        target_id: i64,
-        seek_col_idx: u64,
-        op: &str,
-    ) -> Result<gnitz_wire::PkColList, String> {
-        let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
+    /// Reject a column list that is malformed or names a column outside
+    /// `target_id`'s schema, before it reaches the catalog. The single gate for
+    /// every arm carrying a `pack_pk_cols` word.
+    fn validate_index_cols(&mut self, target_id: i64, cols: &gnitz_wire::PkColList, op: &str) -> Result<(), String> {
         match self.cat().get_schema_desc(target_id).map(|s| s.num_columns()) {
-            Some(nc) if cols.is_well_formed() && cols.as_slice().iter().all(|&c| (c as usize) < nc) => Ok(cols),
+            Some(nc) if cols.is_well_formed() && cols.as_slice().iter().all(|&c| (c as usize) < nc) => Ok(()),
             _ => Err(format!("{op}: invalid column list for table {target_id}")),
         }
     }
@@ -421,8 +382,7 @@ impl WorkerProcess {
             if self.pending_streams.is_empty() {
                 let ready = self.sal_reader.wait(1000);
                 if ready == 0 {
-                    let ppid = unsafe { libc::getppid() };
-                    if ppid != self.master_pid {
+                    if self.master_is_gone() {
                         self.shutdown();
                     }
                     continue;
@@ -447,22 +407,16 @@ impl WorkerProcess {
             self.emit_pending_scan_chunk();
         }
         while let Some((kind, target_id, wire)) = self.next_sal_message() {
-            match self.dispatch(DispatchContext::TopLevel, kind, target_id, wire) {
-                DispatchOutcome::Continue => {
-                    // Replay ticks deferred during any exchange wait now that the
-                    // outer tick's ACK has been sent. Pushes are handled inline in
-                    // `do_exchange_wait` (safe because user-table push only
-                    // appends to `pending_deltas`) so we don't defer them.
-                    if !self.exchange.deferred_ticks.is_empty() {
-                        self.replay_deferred_ticks();
-                    }
-                }
-                DispatchOutcome::RelayMatched(_) => {
-                    // RelayMatched is only produced inside `do_exchange_wait`;
-                    // the top-level dispatcher classifies ExchangeRelay as a
-                    // protocol bug and never emits this outcome.
-                    debug_assert!(false, "RelayMatched at top-level drain_sal");
-                }
+            // Only an exchange wait can match a relay; the top-level dispatcher
+            // classifies ExchangeRelay as a protocol bug and returns nothing.
+            let matched = self.dispatch(DispatchContext::TopLevel, kind, target_id, wire);
+            debug_assert!(matched.is_none(), "relay matched at top-level drain_sal");
+            // Replay ticks deferred during any exchange wait now that the outer
+            // tick's ACK has been sent. Pushes are handled inline in
+            // `do_exchange_wait` (safe because a user-table push only appends to
+            // `pending_deltas`), so they are never deferred.
+            if !self.exchange.deferred_ticks.is_empty() {
+                self.replay_deferred_ticks();
             }
         }
     }
@@ -482,81 +436,41 @@ impl WorkerProcess {
         }
     }
 
-    /// Drain one SAL group, advancing `read_cursor` only on a clean read.
-    ///
-    /// `expected_epoch` is re-read on each call: a FLAG_FLUSH dispatched
-    /// inline bumps it, and a stale snapshot would cause every
-    /// post-checkpoint message to fail the prefix epoch gate forever
-    /// (spinning at an unchanged cursor). The cursor is advanced *only* on
-    /// a successful epoch match — a post-epoch group remains parked at the
-    /// cursor until the cursor is reset by checkpoint. The gate lives in
-    /// the reader (`try_read` checks the group's atomically-published
-    /// `(epoch | size)` prefix before touching header bytes), so a stale
-    /// group being overwritten in place by the master is never parsed.
+    /// The next SAL group to dispatch. The single SAL-read choke point — both
+    /// the top-level loop and the inside-exchange-wait loop funnel through here.
     fn next_sal_message(&mut self) -> Option<(SalMessageKind, i64, Option<&'static [u8]>)> {
-        if self.read_cursor + 8 >= self.sal_reader.mmap_size() {
-            return None;
-        }
-        let (msg, new_cursor) = self.sal_reader.try_read(self.read_cursor, Some(self.expected_epoch))?;
-        self.read_cursor = new_cursor;
+        let msg = self.sal_reader.next()?;
         // The ephemeral flush round carries the checkpoint generation in the
         // group header's `lsn` field. Latch it into `worker_ctx` before dispatch
         // so `manifest_header` stamps every view manifest this round publishes
-        // with it. This is the single SAL-read choke point — both the top-level
-        // loop and the inside-exchange-wait loop funnel through here — so the
-        // stamp is set correctly in either context.
+        // with it.
         if msg.kind == SalMessageKind::FlushEph {
             crate::foundation::worker_ctx::set_committed_generation(msg.lsn);
         }
         Some((msg.kind, msg.target_id as i64, msg.wire_data))
     }
 
-    /// The single source of truth for the inline-vs-defer matrix.
-    /// Match exhaustiveness (`match (ctx, kind)`) means a new
-    /// `SalMessageKind` variant cannot be added without explicitly
-    /// deciding its behavior in both contexts. The walk-the-matrix
-    /// test (`tests::test_dispatch_matrix_*`) makes the *behavioral*
-    /// spec for each non-trivial cell explicit.
+    /// The single source of truth for the inline-vs-defer matrix. Match
+    /// exhaustiveness (`match (ctx, kind)`) means a new `SalMessageKind` variant
+    /// cannot be added without explicitly deciding its behavior in both
+    /// contexts; the walk-the-matrix tests pin the non-trivial cells.
     ///
-    /// (`InEval` = blocked in an exchange wait; only the `ExchangeRelay` cell
-    /// consults `relay_wait` — every other cell treats `InEval` uniformly.)
+    /// Nearly every kind runs inline in both contexts. Only four cells differ,
+    /// and each is here because getting it wrong broke something:
     ///
-    /// | Kind              | TopLevel               | InEval                                 |
-    /// |-------------------|------------------------|----------------------------------------|
-    /// | Shutdown          | inline                 | inline                                 |
-    /// | Flush             | inline (resets cursor) | inline (same)                          |
-    /// | FlushEph          | inline                 | inline                                 |
-    /// | DdlSync           | apply via cat().ddl_sync | defer to exchange.deferred            |
-    /// | ExchangeRelay     | (unreachable, warn)    | match relay_wait OR park in pending_relays |
-    /// | Backfill          | inline                 | inline                                 |
-    /// | HasPk             | inline                 | inline                                 |
-    /// | Gather            | inline                 | inline                                 |
-    /// | UniquePreflight   | inline                 | inline                                 |
-    /// | Push              | inline (must)          | inline (must — sal_writer_excl deadlock) |
-    /// | Tick              | inline + replay defer  | defer to exchange.deferred_ticks       |
-    /// | SeekByIndex       | inline                 | inline                                 |
-    /// | Seek              | inline                 | inline                                 |
-    /// | ScanSpec          | inline                 | inline                                 |
-    /// | Scan              | inline                 | inline                                 |
-    ///
-    /// Reasons for the non-trivial rules (each cites the bug or
-    /// invariant that fixing the rule violates):
-    ///
-    /// * **Tick defer inside exchange.** An inline tick eval would
+    /// * **Tick defers inside an evaluation.** An inline tick eval would
     ///   re-enter `view_id` with a different source and produce
     ///   schema-mismatched relays. Defer + replay after the outer
     ///   tick's ACK so the master observes ACKs in SAL arrival order.
-    ///   See `WorkerExchangeHandler::deferred_ticks` and the SAL
-    ///   exchange-interleaving fix (a later tick re-entering an
-    ///   in-flight view exposed the original bug).
+    ///   See `WorkerExchangeHandler::deferred_ticks`.
     ///
-    /// * **DdlSync defer inside exchange.** Applying a catalog mutation
+    /// * **DdlSync defers inside an evaluation.** Applying a catalog mutation
     ///   inline would race in-flight DAG eval and create schema
     ///   inconsistency across nested exchanges. Stage the batch in
     ///   `exchange.deferred` and apply it after the DAG returns
     ///   (`dispatch_deferred`).
     ///
-    /// * **Push inline (mandatory in both contexts).** The master
+    /// * **Push stays inline in both contexts.** The master
     ///   committer holds `sal_writer_excl` for the entire push group's
     ///   write+signal+fsync window while awaiting the push ACK; the
     ///   relay_loop needs the same mutex to publish this exchange's
@@ -576,10 +490,10 @@ impl WorkerProcess {
         kind: SalMessageKind,
         target_id: i64,
         wire: Option<&'static [u8]>,
-    ) -> DispatchOutcome {
+    ) -> Option<Batch> {
         // Unicast kinds without a per-worker payload aren't for us.
         if wire.is_none() && !kind.is_broadcast() {
-            return DispatchOutcome::Continue;
+            return None;
         }
 
         match (ctx, kind) {
@@ -595,7 +509,7 @@ impl WorkerProcess {
                     .map(|c| c.request_id)
                     .unwrap_or(0);
                 self.exchange.deferred_ticks.push(DeferredTick { target_id, req_id });
-                DispatchOutcome::Continue
+                None
             }
 
             // ── DdlSync (catalog mutation): apply at top-level; defer inside —
@@ -616,20 +530,16 @@ impl WorkerProcess {
                         }
                     }
                 }
-                DispatchOutcome::Continue
+                None
             }
 
             // ── ExchangeRelay: unreachable at top-level; inside an evaluation,
             //    deliver it to a matching relay wait or park it.
             (DispatchContext::TopLevel, SalMessageKind::ExchangeRelay) => {
-                gnitz_warn!(
-                    "W{} unexpected ExchangeRelay at top-level dispatch tid={}",
-                    self.worker_id,
-                    target_id,
-                );
-                DispatchOutcome::Continue
+                gnitz_warn!("unexpected ExchangeRelay at top-level dispatch tid={}", target_id);
+                None
             }
-            (DispatchContext::InEval { relay_wait, schema }, SalMessageKind::ExchangeRelay) => {
+            (DispatchContext::InEval { relay_wait }, SalMessageKind::ExchangeRelay) => {
                 // source_id is echoed back via seek_pk; the backfill round
                 // decision rides in seek_col_idx. A decode failure here (WAL-block
                 // checksum mismatch / truncation) must NOT silently default to
@@ -649,12 +559,13 @@ impl WorkerProcess {
                 };
                 let relay_source_id = decoded.control.seek_pk as i64;
                 let relay_decision = decoded.control.seek_col_idx;
-                // Header-only relay (decode succeeded, no data_batch): a schema'd
-                // empty batch is the correct payload — this fallback now only
-                // applies when the decode itself succeeded.
-                let relay_batch = decoded.data_batch.unwrap_or_else(|| {
-                    let empty_schema = schema.unwrap_or_default();
-                    Batch::empty_with_schema(&empty_schema)
+                // Header-only relay: the master stamps a schema block onto every
+                // slot of a relay group, so an empty batch built from the relayed
+                // schema is the correct payload. A schema-less relay would leave
+                // no way to build it without silently guessing the shape.
+                let relay_batch = decoded.data_batch.unwrap_or_else(|| match decoded.schema {
+                    Some(s) => Batch::empty_with_schema(&s),
+                    None => self.fatal_shutdown(&format!("ExchangeRelay for tid={target_id} carries no schema")),
                 });
                 let relay_key = (target_id, relay_source_id);
                 // Delivered only to the wait blocked on exactly this relay.
@@ -662,7 +573,7 @@ impl WorkerProcess {
                     // Consumed for the active wait: act on the decision (record
                     // the slot, apply any inline checkpoint) before returning.
                     self.consume_backfill_decision(relay_decision);
-                    return DispatchOutcome::RelayMatched(relay_batch);
+                    return Some(relay_batch);
                 }
                 // Not the relay we're blocked on: park it (with its decision) for
                 // a later wait. During backfill the cluster runs in lockstep and
@@ -671,7 +582,7 @@ impl WorkerProcess {
                 self.exchange
                     .pending_relays
                     .insert(relay_key, (relay_batch, relay_decision));
-                DispatchOutcome::Continue
+                None
             }
 
             // ── All others: identical inline behavior in both contexts ─
@@ -699,8 +610,18 @@ impl WorkerProcess {
         kind: SalMessageKind,
         target_id: i64,
         wire: Option<&'static [u8]>,
-    ) -> DispatchOutcome {
-        let decoded = wire.and_then(|data| ipc::decode_wire(data).ok());
+    ) -> Option<Batch> {
+        // A frame that fails to decode is fail-stop, not a silent no-op: the
+        // dropped message would diverge this worker from the master (the same
+        // reasoning the deferred-DdlSync and ExchangeRelay decode paths use), and
+        // a dropped Push would be ACKed as a successful ingest.
+        let decoded = match wire {
+            None => None,
+            Some(data) => match ipc::decode_wire(data) {
+                Ok(d) => Some(d),
+                Err(e) => self.fatal_shutdown(&format!("failed to decode {kind:?} for tid={target_id}: {e}")),
+            },
+        };
         let request_id = decoded.as_ref().map(|d| d.control.request_id).unwrap_or(0);
         if let Err(msg) = self.dispatch_inner(kind, target_id, decoded, request_id) {
             self.send_error(&msg, request_id);
@@ -711,7 +632,7 @@ impl WorkerProcess {
                 self.fatal_shutdown(&format!("DdlSync application failed for tid={target_id}: {msg}"));
             }
         }
-        DispatchOutcome::Continue
+        None
     }
 
     fn dispatch_inner(
@@ -742,11 +663,9 @@ impl WorkerProcess {
             SalMessageKind::Shutdown => self.shutdown(),
 
             SalMessageKind::Flush => {
-                self.advance_read_epoch();
-                match self.handle_flush_all() {
-                    Ok(()) => self.send_ack(0, request_id),
-                    Err(msg) => self.send_error(&msg, request_id),
-                }
+                self.sal_reader.checkpoint_reset();
+                self.handle_flush_all()?;
+                self.send_ack(0, request_id);
                 Ok(())
             }
 
@@ -754,11 +673,9 @@ impl WorkerProcess {
             // tables and output stores, stamped with the checkpoint generation
             // already latched into `worker_ctx` at the classify site.
             SalMessageKind::FlushEph => {
-                self.advance_read_epoch();
-                match self.handle_flush_all_ephemeral() {
-                    Ok(()) => self.send_ack(0, request_id),
-                    Err(msg) => self.send_error(&msg, request_id),
-                }
+                self.sal_reader.checkpoint_reset();
+                self.handle_flush_all_ephemeral()?;
+                self.send_ack(0, request_id);
                 Ok(())
             }
 
@@ -780,7 +697,7 @@ impl WorkerProcess {
                         // conflict with the `pending_deltas` field borrow.
                         let cat = unsafe { &*self.catalog };
                         self.pending_deltas.retain(|tid, _| cat.has_id(*tid));
-                        gnitz_debug!("W{} ddl_sync tid={}", self.worker_id, target_id);
+                        gnitz_debug!("ddl_sync tid={}", target_id);
                     }
                 }
                 Ok(())
@@ -796,8 +713,10 @@ impl WorkerProcess {
 
             SalMessageKind::HasPk => {
                 let lookup = HasPkLookup::from_wire(seek_col_idx);
-                self.handle_has_pk(target_id, batch, lookup, request_id, client_id, seek_pk)?;
-                Ok(())
+                if let HasPkLookup::SecondaryIndex { cols, .. } = &lookup {
+                    self.validate_index_cols(target_id, cols, "has_pk")?;
+                }
+                self.handle_has_pk(target_id, batch, lookup, request_id, client_id, seek_pk)
             }
 
             SalMessageKind::Gather => {
@@ -849,27 +768,11 @@ impl WorkerProcess {
             }
 
             SalMessageKind::SeekByIndex => {
-                let cols = self.validated_index_cols(target_id, seek_col_idx, "seek_by_index")?;
-                // Reassemble the K native values: slot 0 in seek_pk, slots 1..K in
-                // seek_pk_extra. A prefix seek supplies K < cols.len() values. Each
-                // extra slot is exactly 16 bytes; reject a misaligned payload at
-                // the trust boundary rather than silently dropping trailing bytes.
-                if !seek_pk_extra.len().is_multiple_of(16) {
-                    return Err("seek_by_index: seek_pk_extra length is not a multiple of 16".to_string());
-                }
-                let k = 1 + seek_pk_extra.len() / 16;
-                if k > cols.as_slice().len() {
-                    return Err(format!(
-                        "seek_by_index: {k} key values exceed index arity {}",
-                        cols.as_slice().len()
-                    ));
-                }
-                let mut natives = [0u128; gnitz_wire::PK_LIST_MAX_COLS];
-                natives[0] = seek_pk;
-                for i in 1..k {
-                    natives[i] = u128::from_le_bytes(seek_pk_extra[(i - 1) * 16..i * 16].try_into().unwrap());
-                }
-                let (result, schema) = self.cat().seek_by_index(target_id, cols.as_slice(), &natives[..k])?;
+                let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
+                self.validate_index_cols(target_id, &cols, "seek_by_index")?;
+                // A prefix seek supplies fewer values than the index's arity.
+                let keys = gnitz_wire::unpack_index_key_slots(seek_pk, &seek_pk_extra, cols.as_slice().len())?;
+                let (result, schema) = self.cat().seek_by_index(target_id, cols.as_slice(), keys.as_slice())?;
                 self.stream_batch_response(
                     target_id as u64,
                     result,
@@ -947,26 +850,14 @@ impl WorkerProcess {
                 // k-way merge. An error here surfaces as the terminal fault frame
                 // the master's merge expects (send_error in run_via_dispatch_inner).
                 let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
-                if !cols.is_well_formed() {
-                    return Err(format!("unique pre-flight: invalid column list for table {target_id}"));
-                }
+                self.validate_index_cols(target_id, &cols, "unique pre-flight")?;
                 self.handle_unique_preflight(target_id, cols.as_slice(), request_id)?;
                 Ok(())
             }
 
-            // ExchangeRelay only ever arrives while the worker is blocked
-            // inside `do_exchange_wait`; that loop consumes it directly
-            // and never returns through `dispatch_inner`. Reaching
-            // dispatch_inner is a master-side bug.
-            SalMessageKind::ExchangeRelay => {
-                gnitz_warn!(
-                    "W{} unexpected {:?} at top-level dispatch_inner tid={}",
-                    self.worker_id,
-                    kind,
-                    target_id,
-                );
-                Ok(())
-            }
+            // `dispatch` consumes ExchangeRelay itself in both contexts and
+            // never routes it here.
+            SalMessageKind::ExchangeRelay => unreachable!("ExchangeRelay never reaches dispatch_inner"),
         }
     }
 
@@ -984,14 +875,11 @@ impl WorkerProcess {
             // Master never sends FLAG_PUSH for system tables; system-table
             // changes arrive via FLAG_DDL_SYNC → ddl_sync. Reaching here
             // means a protocol invariant was violated.
-            return Err(format!(
-                "W{}: FLAG_PUSH for system table_id={}; expected DDL_SYNC",
-                self.worker_id, target_id
-            ));
+            return Err(format!("FLAG_PUSH for system table_id={target_id}; expected DDL_SYNC"));
         }
         let effective = self.cat().ingest_returning_effective(target_id, batch)?;
         buffer_pending_delta(&mut self.pending_deltas, target_id, effective);
-        gnitz_debug!("W{} push tid={} rows={}", self.worker_id, target_id, row_count);
+        gnitz_debug!("push tid={} rows={}", target_id, row_count);
         Ok(())
     }
 
@@ -1058,15 +946,12 @@ impl WorkerProcess {
         let mut produced_any = false;
 
         loop {
-            // `None` ⇒ partition exhausted: this round is an empty
-            // PAD. The master ANDs the pad bit across workers and stamps the
-            // collective stop/continue/checkpoint decision back onto each relay.
-            // The store is re-resolved per chunk: a cursor holds no borrow on it,
-            // and the catalog is mutated between chunks.
-            let drained = match handle.as_mut() {
-                Some(h) => h.drain_chunk(self.cat().partitioned_store(source_tid), chunk_rows),
-                None => None,
-            };
+            // `None` ⇒ partition exhausted: this round is an empty PAD. The
+            // master ANDs the pad bit across workers and stamps the collective
+            // stop/continue/checkpoint decision back onto each relay.
+            let drained = handle
+                .as_mut()
+                .and_then(|h| self.cat().drain_source_chunk(h, source_tid, chunk_rows));
             let pad = drained.is_none();
             let chunk = drained.unwrap_or_else(|| Batch::empty_with_schema(&schema));
             self.exchange.backfill_pad = Some(pad);
@@ -1117,15 +1002,6 @@ impl WorkerProcess {
         produced
     }
 
-    /// Reset the SAL read side — rewind the read cursor and advance the expected
-    /// epoch — mirroring the master's `sal.checkpoint_reset` on the read side.
-    /// Shared by the FLAG_FLUSH dispatch arm and the inline backfill checkpoint
-    /// in `consume_backfill_decision`.
-    fn advance_read_epoch(&mut self) {
-        self.read_cursor = 0;
-        self.expected_epoch += 1;
-    }
-
     /// Act on the backfill decision a master stamped onto a relay's
     /// `seek_col_idx`, the moment that relay is consumed for its matching wait.
     /// No-op outside a backfill (steady-state relays carry CONTINUE == 0 and
@@ -1143,7 +1019,7 @@ impl WorkerProcess {
         // FLAG_EXCHANGE report, which a flush ACK would be misread as a
         // terminal ACK that retires the worker.
         if decision == BACKFILL_DECISION_CHECKPOINT {
-            self.advance_read_epoch();
+            self.sal_reader.checkpoint_reset();
         }
         self.exchange.backfill_signal = Some(if decision == BACKFILL_DECISION_STOP {
             BackfillRound::Stop
@@ -1253,9 +1129,9 @@ impl WorkerProcess {
         client_id: u64,
         seek_pk: u128,
     ) -> Result<(), String> {
-        let n = batch.as_ref().map(|b| b.count).unwrap_or(0);
-
-        match lookup {
+        // Each arm resolves the probe and names the schema its reply carries;
+        // the single exit below frames both the same way.
+        let (result, schema, one_off) = match lookup {
             HasPkLookup::SecondaryIndex { cols, want_holder } => {
                 let index_handle = self.cat().get_index_store_handle(target_id, cols.as_slice());
                 if index_handle.is_null() {
@@ -1267,22 +1143,17 @@ impl WorkerProcess {
                 }
                 // The check target is the unique INDEX table, whose schema is
                 // `(indexed_col, src_pk…)` — NOT the owner table's schema.
-                // `idx_key_size` and the PK-byte interpretation below are taken
-                // from this schema, so an owner-table fallback would compute the
-                // wrong prefix width. The broadcast always carries the index
-                // schema today, so the fallback is currently unreachable, but
-                // `get_index_schema_by_cols` keeps it type-correct.
+                // `idx_key_size` and the PK-byte reads below come from it, so an
+                // owner-table schema would compute the wrong prefix width.
                 let schema = batch
                     .as_ref()
                     .and_then(|b| b.schema)
                     .or_else(|| self.cat().get_index_schema_by_cols(target_id, cols.as_slice()))
                     .ok_or_else(|| format!("no index schema for tid={} cols={:?}", target_id, cols.as_slice()))?;
-                // Index layout: PK = (indexed-key field, src_pk_cols). The
-                // check-batch carries the promoted indexed value in the low
-                // bytes of its PK. Any positive-weight match means the value
-                // is already in the index. `open_cursor` avoids letting a
-                // compaction Io/InvalidShard failure silently turn a present
-                // key into "absent".
+                // Index layout: PK = (indexed-key field, src_pk_cols). Any
+                // positive-weight match means the value is already in the index.
+                // `open_cursor` keeps a compaction Io/InvalidShard failure from
+                // silently turning a present key into "absent".
                 let table = unsafe { &*index_handle };
                 let mut cursor = table.open_cursor();
                 // The check batch's PK is the OPK index composite
@@ -1291,7 +1162,7 @@ impl WorkerProcess {
                 // whole leading span — OPK puts the distinguishing bytes last, so
                 // a source-width prefix would match only the zero high bytes.
                 let idx_key_size = schema.leading_key_size(cols.as_slice().len());
-                let result = filter_by_pk_bytes(&batch, schema, n, |pkb, holder| {
+                let result = filter_by_pk_bytes(batch.as_ref(), schema, |pkb, holder| {
                     if !cursor.seek_first_positive_with_prefix(&pkb[..idx_key_size]) {
                         return Resolved::Absent;
                     }
@@ -1305,14 +1176,7 @@ impl WorkerProcess {
                     Resolved::Scratch
                 });
                 // The index schema is not table `target_id`'s own — one-off block.
-                self.send_response(
-                    target_id as u64,
-                    Some(&result),
-                    ReplySchema::OneOff(&schema),
-                    request_id,
-                    client_id,
-                    seek_pk,
-                )?;
+                (result, schema, true)
             }
             HasPkLookup::PrimaryKey => {
                 let schema = self
@@ -1320,27 +1184,33 @@ impl WorkerProcess {
                     .get_schema_desc(target_id)
                     .ok_or_else(|| format!("no schema for tid={target_id}"))?;
                 let mut ptable = self.cat().get_ptable_handle(target_id);
-                // Route on verbatim OPK bytes for every PK width. The old narrow
-                // arm fed `get_pk` (OPK-widened) to `has_pk(u128)`, which
-                // re-OPK-encodes it — a double sign-flip that misses signed PKs.
-                let result = filter_by_pk_bytes(&batch, schema, n, |pkb, _| {
+                // Route on verbatim OPK bytes for every PK width: feeding `get_pk`
+                // (OPK-widened) to `has_pk(u128)` would re-OPK-encode it, a double
+                // sign-flip that misses signed PKs.
+                let result = filter_by_pk_bytes(batch.as_ref(), schema, |pkb, _| {
                     if ptable.as_mut().is_some_and(|pt| pt.has_pk_bytes(pkb)) {
                         Resolved::ProbeKey
                     } else {
                         Resolved::Absent
                     }
                 });
-                self.send_response(
-                    target_id as u64,
-                    Some(&result),
-                    ReplySchema::Table(&schema),
-                    request_id,
-                    client_id,
-                    seek_pk,
-                )?;
+                (result, schema, false)
             }
-        }
-        Ok(())
+        };
+
+        let reply_schema = if one_off {
+            ReplySchema::OneOff(&schema)
+        } else {
+            ReplySchema::Table(&schema)
+        };
+        self.send_response(
+            target_id as u64,
+            Some(&result),
+            reply_schema,
+            request_id,
+            client_id,
+            seek_pk,
+        )
     }
 
     /// Base checkpoint round: flush every user relation's partitions + index
@@ -1354,9 +1224,8 @@ impl WorkerProcess {
         // by the next auto-tick or the scan barrier. Live entries drain on the
         // next tick (bounded by the 10k-row auto-tick); a dropped table's entry is
         // GC'd in the DdlSync arm (retain(has_id)).
-        let dag = self.cat().get_dag_ptr();
-        let tables = unsafe { &mut *dag }.collect_base_flush_tables();
-        self.flush_tables(&tables, Table::flush_prepare)
+        let tables = self.cat().dag.collect_base_flush_tables();
+        flush_barrier(tables, FlushRound::Base).map_err(|e| format!("base flush: {e}"))
     }
 
     /// Ephemeral checkpoint round: force-persist every view's operator-trace
@@ -1365,134 +1234,15 @@ impl WorkerProcess {
     /// the flush-ordering invariant (any output@G ⟹ that view's own traces
     /// durable@G) and batch better than per-view interleaving.
     fn handle_flush_all_ephemeral(&mut self) -> Result<(), String> {
-        let dag = self.cat().get_dag_ptr();
-        let (traces, outputs) = unsafe { &mut *dag }.collect_ephemeral_flush_tables();
+        let (traces, outputs) = self.cat().dag.collect_ephemeral_flush_tables();
         // Stamp every manifest with the generation latched at the classify site
         // (`set_committed_generation` on the FlushEph message).
         let generation = crate::foundation::worker_ctx::committed_generation();
-        self.flush_tables(&traces, |t| t.flush_prepare_ephemeral(generation))?; // Pass 1: all traces fully durable FIRST
-        self.flush_tables(&outputs, |t| t.flush_prepare_ephemeral(generation)) // Pass 2: all output stores
-    }
-
-    /// The flush body shared by the base round and each ephemeral pass; only
-    /// the table collection and the prepare fn differ between the two. Prepares
-    /// each table (skipping `Empty`/`DoneInline`), batch-fdatasyncs the
-    /// manifest and unsynced fds in `FD_CHUNK_THRESHOLD` chunks, commits each
-    /// manifest rename with deduped dir fsyncs, then drains each published
-    /// table's deferred compaction deletions post-publish.
-    ///
-    /// SAFETY: the pointers come from the DAG collectors and are valid for this
-    /// synchronous handler (single-threaded worker, no reactor yield, so the
-    /// table set is frozen for the flush).
-    fn flush_tables(
-        &mut self,
-        tables: &[*mut Table],
-        prepare: impl Fn(&mut Table) -> Result<FlushOutcome, StorageError>,
-    ) -> Result<(), String> {
-        if tables.is_empty() {
-            return Ok(());
-        }
-        // One dir fd per unique (dev, ino), so a shared directory is fsynced
-        // once — deduped at insertion in `flush_tables_chunk` (a duplicate's
-        // `OwnedFd` closes immediately).
-        let mut dir_fds: HashMap<(u64, u64), OwnedFd> = HashMap::new();
-        let mut ring = io_uring::IoUring::new(256).map_err(|e| format!("io_uring::new failed: {e}"))?;
-
-        let mut pending: Vec<(*mut Table, FlushWork)> = Vec::new();
-        let mut pending_fds = 0usize;
-        // Tables that published a manifest this round — drained (deferred
-        // compaction deletions) after every dir fsync completes, so a crash
-        // between publish and drain loads the cut manifest over intact files.
-        let mut flushed: Vec<*mut Table> = Vec::new();
-
-        for &t in tables {
-            let outcome = prepare(unsafe { &mut *t }).map_err(|e| format!("flush_prepare: {e}"))?;
-            let work = match outcome {
-                FlushOutcome::Done => continue,
-                FlushOutcome::Pending(w) => w,
-            };
-            // Each work opens one fd per unsynced file (the by-path sweep) plus
-            // the manifest .tmp fd.
-            pending_fds += work.sync_paths().len() + 1;
-            pending.push((t, work));
-            if pending_fds >= FD_CHUNK_THRESHOLD {
-                self.flush_tables_chunk(&mut ring, &mut pending, &mut dir_fds, &mut flushed)?;
-                pending_fds = 0;
-            }
-        }
-        self.flush_tables_chunk(&mut ring, &mut pending, &mut dir_fds, &mut flushed)?;
-
-        // The dir fds are per-flush (opened in `flush_commit`). `dir_fds` drops
-        // at scope end on every path (success or `?`), closing all of them —
-        // nothing leaks even under a persistent disk error.
-        for fd in dir_fds.values() {
-            if let Err(e) = crate::foundation::posix_io::fsync_eintr(fd.as_raw_fd()) {
-                return Err(format!("dir fsync failed: {e}"));
-            }
-        }
-
-        // Every published manifest is durable now; drain deferred compaction
-        // deletions. Strictly after the dir fsyncs and only on the all-chunks-
-        // succeeded path (any chunk `?` short-circuits above, before any drain),
-        // so a superseded input is never unlinked while the manifest still
-        // referencing it is unpublished.
-        for t in flushed {
-            unsafe { &mut *t }.drain_deletions();
-        }
-        Ok(())
-    }
-
-    /// One FD-bounded chunk of `flush_tables`: batch-fdatasync the manifest
-    /// `.tmp` fds, sweep + fdatasync the unsynced files by path in sub-chunks,
-    /// then commit each table's manifest rename collecting deduped dir fds.
-    fn flush_tables_chunk(
-        &mut self,
-        ring: &mut io_uring::IoUring,
-        pending: &mut Vec<(*mut Table, FlushWork)>,
-        dir_fds: &mut HashMap<(u64, u64), OwnedFd>,
-        flushed: &mut Vec<*mut Table>,
-    ) -> Result<(), String> {
-        if pending.is_empty() {
-            return Ok(());
-        }
-
-        let manifest_fds: Vec<libc::c_int> = pending.iter().map(|(_, w)| w.manifest_fd()).collect();
-        uring_batch_fdatasync(ring, &manifest_fds)?;
-
-        // Sweep: open every unsynced file O_RDONLY and fdatasync it by path, in
-        // sub-chunks of FD_CHUNK_THRESHOLD so a large table set never holds
-        // thousands of fds open at once. Each sub-chunk's `OwnedFd`s close
-        // before the next.
-        let paths: Vec<&std::ffi::CStr> = pending
-            .iter()
-            .flat_map(|(_, w)| w.sync_paths().iter().map(|c| c.as_c_str()))
-            .collect();
-        for sub in paths.chunks(FD_CHUNK_THRESHOLD) {
-            let owned: Vec<OwnedFd> = sub
-                .iter()
-                .map(|p| {
-                    crate::foundation::posix_io::open_owned(p, libc::O_RDONLY)
-                        .ok_or_else(|| "open for sweep".to_string())
-                })
-                .collect::<Result<_, _>>()?;
-            let raw: Vec<libc::c_int> = owned.iter().map(|f| f.as_raw_fd()).collect();
-            uring_batch_fdatasync(ring, &raw)?;
-            // owned drops here → fds closed before the next sub-chunk
-        }
-
-        for (t, work) in pending.drain(..) {
-            let dirfd = unsafe { &mut *t }
-                .flush_commit(work)
-                .map_err(|e| format!("flush_commit: {e}"))?;
-            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-            if unsafe { libc::fstat(dirfd.as_raw_fd(), &mut stat) } < 0 {
-                let err = std::io::Error::last_os_error();
-                return Err(format!("fstat: {err}"));
-            }
-            dir_fds.entry((stat.st_dev, stat.st_ino)).or_insert(dirfd);
-            flushed.push(t);
-        }
-        Ok(())
+        let pass = |tables: Vec<*mut Table>, what: &str| {
+            flush_barrier(tables, FlushRound::Ephemeral(generation)).map_err(|e| format!("ephemeral {what} flush: {e}"))
+        };
+        pass(traces, "trace")?; // Pass 1: all traces fully durable FIRST
+        pass(outputs, "output") // Pass 2: all output stores
     }
 
     /// Run multi-worker DAG evaluation with the exchange context.
@@ -1511,6 +1261,13 @@ impl WorkerProcess {
         self.dispatch_deferred();
     }
 
+    /// Whether the master process has exited (killed, or `gnitz_fatal_abort`).
+    /// The fallback to `PR_SET_PDEATHSIG`; `master_pid == 0` in unit tests, which
+    /// have no master to outlive.
+    fn master_is_gone(&self) -> bool {
+        self.master_pid != 0 && unsafe { libc::getppid() } != self.master_pid
+    }
+
     fn shutdown(&mut self) -> ! {
         let _ = self.handle_flush_all();
         unsafe { libc::_exit(0) }
@@ -1519,7 +1276,7 @@ impl WorkerProcess {
     /// Unrecoverable worker fault: log, flush, `_exit`. The master's
     /// watchdog turns the dead worker into a cluster abort.
     fn fatal_shutdown(&mut self, msg: &str) -> ! {
-        gnitz_warn!("W{} FATAL: {}. Shutting down.", self.worker_id, msg);
+        gnitz_warn!("FATAL: {}. Shutting down.", msg);
         self.shutdown()
     }
 }
@@ -1580,6 +1337,17 @@ mod tests {
         )
     }
 
+    /// A one-row batch of `schema` with the given PK and payload value.
+    fn one_row_batch(schema: &SchemaDescriptor, pk: u128, v: u64) -> Batch {
+        let mut b = Batch::with_capacity(*schema, 1);
+        b.extend_pk(pk);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &v.to_le_bytes());
+        b.count = 1;
+        b
+    }
+
     fn make_handler() -> WorkerExchangeHandler {
         WorkerExchangeHandler {
             deferred: Vec::<DeferredDdl>::new(),
@@ -1590,86 +1358,19 @@ mod tests {
         }
     }
 
+    /// `buffer_pending_delta` appends into an existing entry rather than
+    /// replacing it — the shape the live push path and boot SAL replay share.
     #[test]
     fn test_pending_deltas_accumulation() {
         let schema = test_schema();
         let mut pending: HashMap<i64, Batch> = HashMap::new();
 
-        let mut b1 = Batch::with_capacity(schema, 1);
-        b1.extend_pk(1u128);
-        b1.extend_weight(&1i64.to_le_bytes());
-        b1.extend_null_bmp(&0u64.to_le_bytes());
-        b1.extend_col(0, &10u64.to_le_bytes());
-        b1.count = 1;
-
-        let mut b2 = Batch::with_capacity(schema, 1);
-        b2.extend_pk(2u128);
-        b2.extend_weight(&1i64.to_le_bytes());
-        b2.extend_null_bmp(&0u64.to_le_bytes());
-        b2.extend_col(0, &20u64.to_le_bytes());
-        b2.count = 1;
-
-        // First insert
-        pending.insert(100, b1);
-        // Accumulate
-        if let Some(existing) = pending.get_mut(&100) {
-            existing.append_batch(&b2, 0, b2.count);
-        }
-        assert_eq!(pending[&100].count, 2);
-    }
-
-    // -- pending_relays tests ------------------------------------------------
-
-    /// Relays arriving for a different (view_id, source_id) while an outer
-    /// exchange waits are parked in `pending_relays`; the next nested wait
-    /// to ask for that exact pair pulls them from the queue instead of
-    /// re-reading the SAL.
-    #[test]
-    fn test_pending_relays_queue_and_drain() {
-        let mut h = make_handler();
-        let schema = test_schema();
-        let mut batch_b = Batch::empty_with_schema(&schema);
-        batch_b.count = 7;
-        let mut batch_c = Batch::empty_with_schema(&schema);
-        batch_c.count = 9;
-        h.pending_relays.insert((200, 0), (batch_b, 0));
-        h.pending_relays.insert((300, 0), (batch_c, 0));
-
-        // Nested wait for view 200 finds its relay without touching the SAL.
-        let (b, _) = h.pending_relays.remove(&(200, 0)).expect("view 200 relay queued");
-        assert_eq!(b.count, 7);
-        assert!(!h.pending_relays.contains_key(&(200, 0)));
-        // Unrelated view 300 remains parked for its own wait.
-        assert!(h.pending_relays.contains_key(&(300, 0)));
-    }
-
-    /// Two exchange rounds for the *same* view_id but different
-    /// source_ids (typical for a join view with multiple input tables)
-    /// must stash independently. Keying by view_id alone was the
-    /// root-cause bug — a relay for source A satisfied a wait for
-    /// source B.
-    #[test]
-    fn test_pending_relays_keyed_by_view_and_source() {
-        let mut h = make_handler();
-        let schema = test_schema();
-        let mut batch_a = Batch::empty_with_schema(&schema);
-        batch_a.count = 3;
-        let mut batch_b = Batch::empty_with_schema(&schema);
-        batch_b.count = 11;
-
-        // Same view_id=100, different source_ids 10 and 20.
-        h.pending_relays.insert((100, 10), (batch_a, 0));
-        h.pending_relays.insert((100, 20), (batch_b, 0));
-
-        // Retrieving one does NOT retrieve the other.
-        let (a, _) = h.pending_relays.remove(&(100, 10)).expect("(100,10) queued");
-        assert_eq!(a.count, 3);
-        assert!(
-            h.pending_relays.contains_key(&(100, 20)),
-            "retrieving (100,10) must leave (100,20) in place"
-        );
-        let (b, _) = h.pending_relays.remove(&(100, 20)).expect("(100,20) queued");
-        assert_eq!(b.count, 11);
+        buffer_pending_delta(&mut pending, 100, one_row_batch(&schema, 1, 10));
+        assert_eq!(pending[&100].count, 1);
+        buffer_pending_delta(&mut pending, 100, one_row_batch(&schema, 2, 20));
+        assert_eq!(pending[&100].count, 2, "a second delta appends to the same table");
+        buffer_pending_delta(&mut pending, 200, one_row_batch(&schema, 3, 30));
+        assert_eq!(pending[&200].count, 1, "a different table gets its own entry");
     }
 
     /// Stage 0 wire-protocol contract: every reply helper (`send_ack`,
@@ -1758,7 +1459,6 @@ mod tests {
     /// `pending_streams`, `reply_frame_budget`) is assigned after construction.
     fn make_test_worker(catalog: *mut CatalogEngine, writer: W2mWriter) -> WorkerProcess {
         WorkerProcess {
-            worker_id: 0,
             master_pid: 0,
             catalog,
             sal_reader: unsafe { std::mem::zeroed() },
@@ -1767,8 +1467,6 @@ mod tests {
             pending_deltas: HashMap::new(),
             pending_streams: VecDeque::new(),
             reply_frame_budget: ipc::FRAME_CAP,
-            read_cursor: 0,
-            expected_epoch: 1,
         }
     }
 
@@ -1789,13 +1487,9 @@ mod tests {
     #[test]
     fn test_dispatch_matrix_tick_defers_inside_exchange() {
         let mut wp = make_worker_for_matrix();
-        let ctx = DispatchContext::InEval {
-            relay_wait: (100, 5),
-            schema: Some(test_schema()),
-        };
+        let ctx = DispatchContext::InEval { relay_wait: (100, 5) };
         assert!(wp.exchange.deferred_ticks.is_empty());
-        let outcome = wp.dispatch(ctx, SalMessageKind::Tick, 999, None);
-        assert!(matches!(outcome, DispatchOutcome::Continue));
+        assert!(wp.dispatch(ctx, SalMessageKind::Tick, 999, None).is_none());
         assert_eq!(wp.exchange.deferred_ticks.len(), 1);
         assert_eq!(
             wp.exchange.deferred_ticks[0].target_id, 999,
@@ -1810,26 +1504,27 @@ mod tests {
     /// the worker (mirrors the DdlSync decode arm) rather than defaulting to an
     /// empty batch, so tests can no longer feed `&[]`.
     fn encode_relay_frame(target_id: u64, source_id: u128, schema: &SchemaDescriptor) -> &'static [u8] {
-        let sz = ipc::wire_size(STATUS_OK, &[], Some(schema), None, None, None, &[]);
-        let mut buf = vec![0u8; sz];
-        ipc::encode_wire_into(
-            &mut buf,
-            0,
+        // No data batch — a header-only relay. `seek_pk` echoes the source_id the
+        // waiter matches on; `seek_col_idx` 0 is BACKFILL_DECISION_CONTINUE.
+        let msg = ipc::WireMsg {
             target_id,
-            0,         // client_id
-            0,         // flags — the dispatch arm is chosen by kind, not wire flags
-            source_id, // seek_pk — echoed source_id the waiter matches on
-            0,         // seek_col_idx — BACKFILL_DECISION_CONTINUE
-            0,         // request_id
-            STATUS_OK,
-            &[],          // error_msg
-            Some(schema), // schema
-            None,         // col_names
-            None,         // data_batch — header-only relay
-            None,         // prebuilt_schema_block
-            &[],          // seek_pk_extra
-        );
-        Box::leak(buf.into_boxed_slice())
+            seek_pk: source_id,
+            schema: Some(schema),
+            ..Default::default()
+        };
+        Box::leak(msg.encode_to_vec().into_boxed_slice())
+    }
+
+    /// Encode a wire frame carrying `batch` under `schema`. Leaked to `'static`
+    /// for `dispatch`, which takes its payload from the SAL mapping.
+    fn encode_data_frame(target_id: u64, schema: &SchemaDescriptor, batch: &Batch) -> &'static [u8] {
+        let msg = ipc::WireMsg {
+            target_id,
+            schema: Some(schema),
+            data: ipc::WireData::Whole(Some(batch)),
+            ..Default::default()
+        };
+        Box::leak(msg.encode_to_vec().into_boxed_slice())
     }
 
     /// ExchangeRelay inside an exchange wait whose `(view_id, source_id)`
@@ -1840,26 +1535,24 @@ mod tests {
         let mut wp = make_worker_for_matrix();
         let schema = test_schema();
         let want_key = (100, 0);
-        let ctx = DispatchContext::InEval {
-            relay_wait: want_key,
-            schema: Some(schema),
-        };
+        let ctx = DispatchContext::InEval { relay_wait: want_key };
 
         // Mismatched view (target_id=200 ≠ want 100): parked under (200, 0).
         let frame = encode_relay_frame(200, 0, &schema);
-        let outcome = wp.dispatch(ctx, SalMessageKind::ExchangeRelay, 200, Some(frame));
-        assert!(matches!(outcome, DispatchOutcome::Continue));
+        assert!(wp
+            .dispatch(ctx, SalMessageKind::ExchangeRelay, 200, Some(frame))
+            .is_none());
         assert!(
             wp.exchange.pending_relays.contains_key(&(200, 0)),
             "non-matching relay must be parked in pending_relays"
         );
 
-        // Matching key (target_id=100, source_id=0 == want_key): RelayMatched.
+        // Matching key (target_id=100, source_id=0 == want_key): returns the batch.
         let frame = encode_relay_frame(100, 0, &schema);
-        let outcome = wp.dispatch(ctx, SalMessageKind::ExchangeRelay, 100, Some(frame));
         assert!(
-            matches!(outcome, DispatchOutcome::RelayMatched(_)),
-            "key-matching relay must short-circuit with RelayMatched"
+            wp.dispatch(ctx, SalMessageKind::ExchangeRelay, 100, Some(frame))
+                .is_some(),
+            "a key-matching relay must short-circuit out of dispatch with its batch"
         );
     }
 
@@ -1870,110 +1563,55 @@ mod tests {
     fn test_dispatch_matrix_exchange_relay_top_level_warns_and_continues() {
         let mut wp = make_worker_for_matrix();
         let empty: &'static [u8] = &[];
-        let outcome = wp.dispatch(
-            DispatchContext::TopLevel,
-            SalMessageKind::ExchangeRelay,
-            100,
-            Some(empty),
-        );
-        assert!(matches!(outcome, DispatchOutcome::Continue));
+        assert!(wp
+            .dispatch(
+                DispatchContext::TopLevel,
+                SalMessageKind::ExchangeRelay,
+                100,
+                Some(empty)
+            )
+            .is_none());
         assert!(
             wp.exchange.pending_relays.is_empty(),
             "TopLevel must NOT park relays — they belong to do_exchange_wait"
         );
     }
 
-    /// Walk every `SalMessageKind` and assert a *behavior contract*
-    /// for the InsideExchangeWait context. Kinds that defer must NOT
-    /// touch the catalog; kinds that go inline through `dispatch_inner`
-    /// are not exercised here (they need a real catalog) — the contract
-    /// here is that the *defer* decisions are correctly wired.
-    ///
-    /// Adding a new variant to `SalMessageKind` and forgetting to slot
-    /// it into `dispatch`'s `match (ctx, kind)` is already a compile
-    /// error (exhaustiveness). This test catches the next-most-likely
-    /// regression: routing a should-defer kind to the inline path.
+    /// DdlSync inside an exchange wait MUST stage its batch in
+    /// `exchange.deferred` rather than applying it: an inline catalog mutation
+    /// races the in-flight DAG evaluation. (Adding a `SalMessageKind` without
+    /// deciding both of its cells is already a compile error — `dispatch`
+    /// matches exhaustively on `(ctx, kind)` — so what needs a test is the
+    /// defer decision itself.)
     #[test]
-    fn test_dispatch_matrix_walk_kinds_defer_decisions() {
-        // Every SalMessageKind, in classification priority order.
-        const ALL_KINDS: [SalMessageKind; 15] = [
-            SalMessageKind::Shutdown,
-            SalMessageKind::Flush,
-            SalMessageKind::FlushEph,
-            SalMessageKind::DdlSync,
-            SalMessageKind::ExchangeRelay,
-            SalMessageKind::Backfill,
-            SalMessageKind::HasPk,
-            SalMessageKind::Gather,
-            SalMessageKind::UniquePreflight,
-            SalMessageKind::Push,
-            SalMessageKind::Tick,
-            SalMessageKind::SeekByIndex,
-            SalMessageKind::Seek,
-            SalMessageKind::ScanSpec,
-            SalMessageKind::Scan,
-        ];
-        // Kinds the InEval context MUST defer.
-        let must_defer = [SalMessageKind::Tick, SalMessageKind::DdlSync];
-        // ExchangeRelay is its own special case (RelayMatched / park).
-        // The rest go through dispatch_inner inline.
+    fn test_dispatch_matrix_ddl_sync_defers_inside_exchange() {
+        let mut wp = make_worker_for_matrix();
+        let schema = test_schema();
+        let ctx = DispatchContext::InEval { relay_wait: (0, 0) };
 
-        for kind in ALL_KINDS {
-            if !must_defer.contains(&kind) {
-                continue;
-            }
-
-            let mut wp = make_worker_for_matrix();
-            let ctx = DispatchContext::InEval {
-                relay_wait: (0, 0),
-                schema: Some(test_schema()),
-            };
-
-            let before_ctrl = wp.exchange.deferred_ticks.len();
-            let before_ddl = wp.exchange.deferred.len();
-            let _ = wp.dispatch(ctx, kind, 42, None);
-            let after_ctrl = wp.exchange.deferred_ticks.len();
-            let after_ddl = wp.exchange.deferred.len();
-
-            match kind {
-                SalMessageKind::Tick => {
-                    assert_eq!(
-                        after_ctrl,
-                        before_ctrl + 1,
-                        "Tick must defer to deferred_ticks inside exchange wait"
-                    );
-                    assert_eq!(after_ddl, before_ddl, "Tick must NOT touch the deferred (DDL) queue");
-                }
-                SalMessageKind::DdlSync => {
-                    // DdlSync requires a decodable wire to actually defer
-                    // (the deferred batch is taken from decoded.data_batch).
-                    // With wire=None the dispatch arm is reached and runs
-                    // its (trivially empty) effect: this test asserts that
-                    // it returns Continue and doesn't panic, and that the
-                    // deferred queue did not gain a synthetic entry
-                    // (None wire ⇒ no data_batch ⇒ no push).
-                    assert_eq!(
-                        after_ddl, before_ddl,
-                        "DdlSync with no wire data must not synthesize a deferred entry"
-                    );
-                }
-                _ => unreachable!(),
-            }
-        }
+        let frame = encode_data_frame(42, &schema, &one_row_batch(&schema, 1, 10));
+        assert!(wp.dispatch(ctx, SalMessageKind::DdlSync, 42, Some(frame)).is_none());
+        assert_eq!(
+            wp.exchange.deferred.len(),
+            1,
+            "DdlSync must stage its batch, not apply it"
+        );
+        assert_eq!(wp.exchange.deferred[0].target_id, 42);
+        assert!(
+            wp.exchange.deferred_ticks.is_empty(),
+            "DdlSync must not touch the deferred-tick queue"
+        );
     }
 
     // -- next_sal_message invariant tests -------------------------------------
 
-    /// Drive `next_sal_message` against a hand-built SAL with mixed-epoch
-    /// entries. The invariant:
+    /// The SAL read gate, driven through `next_sal_message`:
     ///
-    /// 1. A successful read advances `read_cursor`.
-    /// 2. An epoch mismatch returns `None` and leaves `read_cursor`
-    ///    untouched, so a future epoch bump (via FLAG_FLUSH inline
-    ///    handling) will pick the same group up.
-    /// 3. The expected_epoch is re-read on every call — bumping it
-    ///    between calls flips a previously-rejected group into a
-    ///    consumable one without rewinding the cursor.
+    /// 1. Groups in the expected epoch are consumed in order.
+    /// 2. A group from a *later* epoch is rejected and stays parked — repeatedly,
+    ///    so the cursor did not advance past it.
+    /// 3. `checkpoint_reset` rewinds to cursor 0 in the next epoch, which is
+    ///    exactly where the master writes after its own reset.
     #[test]
     fn test_next_sal_message_epoch_gating() {
         use crate::runtime::sal::{sal_write_group, SalReader, FLAG_DDL_SYNC, FLAG_PUSH};
@@ -1985,59 +1623,41 @@ mod tests {
         // Single worker; each group puts a one-byte payload at slot 0.
         let payload = [0u8; 1];
         let payloads: [&[u8]; 1] = [&payload];
+        let write = |cursor, target, lsn, flags, epoch| {
+            unsafe { sal_write_group(sal_ptr, cursor, target, lsn, flags, epoch, SAL_SIZE as u64, &payloads) }
+                .expect("group fits")
+        };
 
-        // Group 1: epoch=1, FLAG_PUSH, target=42
-        let c1 = unsafe { sal_write_group(sal_ptr, 0, 42, 100, FLAG_PUSH, 1, SAL_SIZE as u64, &payloads) }
-            .expect("group fits");
-        // Group 2: epoch=1, FLAG_DDL_SYNC, target=43
-        let c2 = unsafe { sal_write_group(sal_ptr, c1, 43, 101, FLAG_DDL_SYNC, 1, SAL_SIZE as u64, &payloads) }
-            .expect("group fits");
-        // Group 3: epoch=2 — must be skipped while expected_epoch==1.
-        unsafe { sal_write_group(sal_ptr, c2, 44, 102, FLAG_PUSH, 2, SAL_SIZE as u64, &payloads) }.expect("group fits");
+        let c1 = write(0, 42, 100, FLAG_PUSH, 1);
+        let c2 = write(c1, 43, 101, FLAG_DDL_SYNC, 1);
+        // A group from the next epoch, ahead of the reader.
+        write(c2, 44, 102, FLAG_PUSH, 2);
 
         let mut wp = make_test_worker(std::ptr::null_mut(), unsafe { std::mem::zeroed() });
         wp.sal_reader = SalReader::new(sal_ptr as *const u8, 0, SAL_SIZE, -1);
 
-        // First call: epoch 1 group 1 — consumed.
-        let cursor_before = wp.read_cursor;
-        let (kind, target_id, _wire) = wp.next_sal_message().expect("group 1");
-        assert_eq!(kind, SalMessageKind::Push);
-        assert_eq!(target_id, 42);
-        assert!(wp.read_cursor > cursor_before, "cursor must advance on success");
-
-        // Second call: epoch 1 group 2 — consumed.
-        let cursor_before = wp.read_cursor;
-        let (kind, target_id, _wire) = wp.next_sal_message().expect("group 2");
-        assert_eq!(kind, SalMessageKind::DdlSync);
-        assert_eq!(target_id, 43);
-        assert!(wp.read_cursor > cursor_before);
-
-        // Third call: epoch 2 group 3 — REJECTED while expected_epoch==1.
-        // Must return None and leave the cursor untouched.
-        let cursor_at_epoch_fence = wp.read_cursor;
-        assert!(
-            wp.next_sal_message().is_none(),
-            "epoch-mismatched group must be rejected"
+        assert_eq!(
+            wp.next_sal_message().map(|(k, t, _)| (k, t)),
+            Some((SalMessageKind::Push, 42))
         );
         assert_eq!(
-            wp.read_cursor, cursor_at_epoch_fence,
-            "cursor must NOT advance on epoch mismatch (group remains parked)"
+            wp.next_sal_message().map(|(k, t, _)| (k, t)),
+            Some((SalMessageKind::DdlSync, 43))
         );
 
-        // Bumping expected_epoch makes the same group consumable on the
-        // next call — this is the load-bearing invariant cited by the
-        // doc comment in `next_sal_message`. (Cursor was unchanged, so
-        // we re-read the same group.)
-        wp.expected_epoch = 2;
-        let (kind, target_id, _wire) = wp
-            .next_sal_message()
-            .expect("group 3 should be consumable after epoch bump");
-        assert_eq!(kind, SalMessageKind::Push);
-        assert_eq!(target_id, 44);
-        assert!(wp.read_cursor > cursor_at_epoch_fence);
+        // The epoch-2 group parks: rejected now, and still rejected on a retry —
+        // the cursor did not slip past it.
+        assert!(wp.next_sal_message().is_none(), "an epoch-ahead group must park");
+        assert!(wp.next_sal_message().is_none(), "and stay parked");
 
-        // No more groups.
-        assert!(wp.next_sal_message().is_none());
+        // After the reset the reader is at cursor 0 in epoch 2, where the master
+        // writes its first post-checkpoint group.
+        write(0, 77, 103, FLAG_PUSH, 2);
+        wp.sal_reader.checkpoint_reset();
+        assert_eq!(
+            wp.next_sal_message().map(|(k, t, _)| (k, t)),
+            Some((SalMessageKind::Push, 77))
+        );
     }
 
     // -- pending stream chunking tests -----------------------------------------------
@@ -2072,8 +1692,21 @@ mod tests {
 
     /// Per-row wire stride for a test batch, matching `enqueue_stream`.
     fn row_stride(batch: &Batch) -> usize {
-        ipc::wire_size_range(STATUS_OK, &[], None, None, batch, 1, None)
-            - ipc::wire_size_range(STATUS_OK, &[], None, None, batch, 0, None)
+        range_size(batch, 1, None) - range_size(batch, 0, None)
+    }
+
+    /// Wire size of a `count`-row range of `batch`, with an optional schema block.
+    fn range_size(batch: &Batch, count: usize, prebuilt: Option<&[u8]>) -> usize {
+        ipc::WireMsg {
+            data: ipc::WireData::Range {
+                batch,
+                start_row: 0,
+                count,
+            },
+            prebuilt_schema_block: prebuilt,
+            ..Default::default()
+        }
+        .size()
     }
 
     /// First (and only) PendingScan chunk — next_row == 0, so the prebuilt schema
@@ -2393,8 +2026,8 @@ mod tests {
 
         // Budget: first chunk (with A's schema block) carries ~4 rows, so
         // train A spans at least two frames.
-        let sz_0 = ipc::wire_size_range(STATUS_OK, &[], None, None, &batch_a, 0, Some(block_a.as_slice()));
-        let sz_1 = ipc::wire_size_range(STATUS_OK, &[], None, None, &batch_a, 1, Some(block_a.as_slice()));
+        let sz_0 = range_size(&batch_a, 0, Some(block_a.as_slice()));
+        let sz_1 = range_size(&batch_a, 1, Some(block_a.as_slice()));
         let budget = sz_0 + (sz_1 - sz_0) * 4;
 
         let (region, writer) = make_ring();
@@ -2553,14 +2186,7 @@ mod tests {
     }
 
     fn worker_temp_dir(name: &str) -> String {
-        crate::foundation::posix_io::raise_fd_limit_for_tests();
-        let path = std::env::temp_dir()
-            .join(format!("gnitz_worker_test_{name}"))
-            .to_str()
-            .unwrap()
-            .to_owned();
-        let _ = std::fs::remove_dir_all(&path);
-        path
+        crate::test_support::scratch_dir("worker", name)
     }
 
     /// An oversized non-wire-safe (STRING) result returns the clean error —
@@ -2603,10 +2229,7 @@ mod tests {
         let err = wp
             .stream_batch_response(tid as u64, Some(batch), ReplySchema::Table(&schema), 5, 0, 0)
             .expect_err("oversized STRING result must surface the clean error");
-        assert!(
-            err.contains("STRING-column chunking"),
-            "error names the limitation: {err}"
-        );
+        assert!(err.contains("cannot be chunked"), "error names the limitation: {err}");
         assert!(wp.pending_streams.is_empty(), "non-wire-safe results never enqueue");
 
         engine.close();

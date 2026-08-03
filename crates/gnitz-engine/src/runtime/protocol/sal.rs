@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::foundation::posix_io;
 use crate::foundation::posix_io::{read_u32_raw, read_u64_raw, write_u32_raw, write_u64_raw};
 use crate::runtime::wire::{
-    build_schema_wire_block, encode_ctrl_block_direct, encode_wire_into, layout_to_wire_flags, wire_size,
+    build_schema_wire_block, encode_ctrl_block_direct, layout_to_wire_flags, WireData, WireMsg,
     CTRL_BLOCK_SIZE_NO_BLOB, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, STATUS_OK,
 };
 use crate::schema::SchemaDescriptor;
@@ -851,45 +851,36 @@ impl SalWriter {
              without FLAG_HAS_SCHEMA",
         );
 
+        // One message per worker slot — the slot's size and its bytes come from
+        // the same value, so they cannot disagree.
+        let msg_for = |w: usize| WireMsg {
+            target_id: target_id as u64,
+            client_id,
+            flags: wire_flags,
+            seek_pk,
+            seek_col_idx,
+            request_id: req_ids[w],
+            schema,
+            col_names: col_names_opt,
+            data: WireData::Whole(worker_batches.get(w).and_then(|opt| *opt)),
+            prebuilt_schema_block,
+            seek_pk_extra,
+            ..Default::default()
+        };
+
         let mut worker_sizes = [0u32; MAX_WORKERS];
         for w in 0..nw {
             if unicast_worker >= 0 && w != unicast_worker as usize {
                 continue;
             }
-            let data_batch = worker_batches.get(w).and_then(|opt| opt.as_ref());
-            worker_sizes[w] = wire_size(
-                STATUS_OK,
-                b"",
-                schema,
-                col_names_opt,
-                data_batch.copied(),
-                prebuilt_schema_block,
-                seek_pk_extra,
-            ) as u32;
+            worker_sizes[w] = msg_for(w).size() as u32;
         }
 
         let group = self.begin("write_group_direct", target_id, lsn, sal_flags, &worker_sizes[..nw])?;
 
         unsafe {
             group.for_each_slot(&worker_sizes[..nw], |w, slot| {
-                let data_batch = worker_batches.get(w).and_then(|opt| opt.as_ref());
-                let written = encode_wire_into(
-                    slot,
-                    0,
-                    target_id as u64,
-                    client_id,
-                    wire_flags,
-                    seek_pk,
-                    seek_col_idx,
-                    req_ids[w],
-                    STATUS_OK,
-                    b"",
-                    schema,
-                    col_names_opt,
-                    data_batch.copied(),
-                    prebuilt_schema_block,
-                    seek_pk_extra,
-                );
+                let written = msg_for(w).encode(slot, 0);
                 debug_assert_eq!(written, slot.len());
             });
         }
@@ -1114,7 +1105,16 @@ impl SalWriter {
              without FLAG_HAS_SCHEMA",
         );
 
-        let wsz = wire_size(STATUS_OK, b"", schema, col_names_opt, batch, prebuilt_schema_block, &[]) as u32;
+        let msg = WireMsg {
+            target_id: target_id as u64,
+            seek_pk,
+            schema,
+            col_names: col_names_opt,
+            data: WireData::Whole(batch),
+            prebuilt_schema_block,
+            ..Default::default()
+        };
+        let wsz = msg.size() as u32;
         let mut worker_sizes = [0u32; MAX_WORKERS];
         worker_sizes[..nw].fill(wsz);
 
@@ -1124,23 +1124,7 @@ impl SalWriter {
             let wsz = wsz as usize;
             let slot0_off = group.hdr_size;
             let slot0 = unsafe { std::slice::from_raw_parts_mut(group.data_ptr(slot0_off), wsz) };
-            let written = encode_wire_into(
-                slot0,
-                0,
-                target_id as u64,
-                0,
-                0,
-                seek_pk,
-                0,
-                0,
-                STATUS_OK,
-                b"",
-                schema,
-                col_names_opt,
-                batch,
-                prebuilt_schema_block,
-                &[],
-            );
+            let written = msg.encode(slot0, 0);
             debug_assert_eq!(written, wsz);
             let mut off = slot0_off + align8(wsz);
             for _ in 1..nw {
@@ -1242,6 +1226,12 @@ pub struct SalReader {
     worker_id: u32,
     mmap_size: u64,
     m2w_efd: i32,
+    /// The live drain's position and epoch — the read-side mirror of
+    /// `SalWriter`'s `write_cursor` / `epoch`, so no caller does SAL address
+    /// arithmetic. Only `next` and `checkpoint_reset` touch them; the stateless
+    /// `try_read` recovery walks drive their own offset.
+    read_cursor: std::cell::Cell<u64>,
+    expected_epoch: std::cell::Cell<u32>,
 }
 
 unsafe impl Send for SalReader {}
@@ -1253,7 +1243,34 @@ impl SalReader {
             worker_id,
             mmap_size: mmap_size as u64,
             m2w_efd,
+            read_cursor: std::cell::Cell::new(0),
+            // Epoch 0 is the empty-slot sentinel prefix; 1 is the first live one.
+            expected_epoch: std::cell::Cell::new(1),
         }
+    }
+
+    /// The next group for this worker, advancing the cursor only on a clean
+    /// read. A group whose prefix epoch is ahead of `expected_epoch` stays
+    /// parked at the cursor until [`checkpoint_reset`](Self::checkpoint_reset)
+    /// catches up — the gate lives in `try_read`, which checks the atomically
+    /// published `(epoch | size)` prefix before touching any header byte, so a
+    /// stale group being overwritten in place by the master is never parsed.
+    pub fn next(&self) -> Option<SalMessage<'static>> {
+        if self.read_cursor.get() + 8 >= self.mmap_size {
+            return None;
+        }
+        let (msg, new_cursor) = self.try_read(self.read_cursor.get(), Some(self.expected_epoch.get()))?;
+        self.read_cursor.set(new_cursor);
+        Some(msg)
+    }
+
+    /// Rewind to the start of the next epoch, mirroring the writer's
+    /// `SalWriter::checkpoint_reset` on the read side. Groups the master writes
+    /// post-reset (at `write_cursor == 0`, in the bumped epoch) are then
+    /// accepted, and any pre-reset group parks.
+    pub fn checkpoint_reset(&self) {
+        self.read_cursor.set(0);
+        self.expected_epoch.set(self.expected_epoch.get() + 1);
     }
 
     /// The SAL mmap size this reader was opened with — not necessarily the

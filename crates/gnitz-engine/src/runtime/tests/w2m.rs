@@ -1,6 +1,6 @@
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
 use crate::runtime::w2m_ring;
-use crate::runtime::wire::{encode_wire_into, wire_size, STATUS_OK};
+use crate::runtime::wire::STATUS_OK;
 use crate::test_support::SharedRegion;
 
 #[test]
@@ -22,27 +22,8 @@ fn test_w2m_concurrent_publish_consume_ordered() {
     let done_w = Arc::clone(&done);
     let writer_thread = std::thread::spawn(move || {
         let writer = W2mWriter::new(region_addr as *mut u8, CAP as u64);
-        let sz = wire_size(STATUS_OK, b"", None, None, None, None, &[]);
         for req_id in 1..=N {
-            writer.send_encoded(sz, req_id as u32, |buf| {
-                encode_wire_into(
-                    buf,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0u128,
-                    0,
-                    req_id,
-                    STATUS_OK,
-                    b"",
-                    None,
-                    None,
-                    None,
-                    None,
-                    &[],
-                );
-            });
+            writer.send_status(0, req_id, STATUS_OK, b"");
         }
         done_w.store(true, Ordering::Release);
     });
@@ -94,27 +75,8 @@ fn test_w2m_concurrent_large_messages_ordered() {
     let pad_w = pad.clone();
     let writer_thread = std::thread::spawn(move || {
         let writer = W2mWriter::new(region_addr as *mut u8, CAP as u64);
-        let sz = wire_size(STATUS_OK, &pad_w, None, None, None, None, &[]);
         for req_id in 1..=N {
-            writer.send_encoded(sz, req_id as u32, |buf| {
-                encode_wire_into(
-                    buf,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0u128,
-                    0,
-                    req_id,
-                    STATUS_OK,
-                    &pad_w,
-                    None,
-                    None,
-                    None,
-                    None,
-                    &[],
-                );
-            });
+            writer.send_status(0, req_id, STATUS_OK, &pad_w);
         }
         done_w.store(true, Ordering::Release);
     });
@@ -185,26 +147,7 @@ fn test_w2m_control_only_reply_has_no_backing() {
     }
 
     let writer = W2mWriter::new(ptr, CAP as u64);
-    let sz = wire_size(STATUS_OK, b"", None, None, None, None, &[]);
-    writer.send_encoded(sz, 42, |buf| {
-        encode_wire_into(
-            buf,
-            0,
-            0,
-            0,
-            0,
-            0u128,
-            0,
-            42,
-            STATUS_OK,
-            b"",
-            None,
-            None,
-            None,
-            None,
-            &[],
-        );
-    });
+    writer.send_status(0, 42, STATUS_OK, b"");
 
     let receiver = W2mReceiver::new(vec![ptr]);
     let decoded = receiver.try_read(0).expect("ACK must decode");

@@ -399,25 +399,17 @@ mod tests {
         batch: Option<&Batch>,
     ) {
         use crate::runtime::wire::{self as ipc};
-        let sz = ipc::wire_size(status, error_msg, schema, None, batch, None, &[]);
-        writer.send_encoded(sz, req, |buf| {
-            ipc::encode_wire_into_ipc(
-                buf,
-                0,
-                1,
-                0,
-                flags,
-                0u128,
-                0,
-                0,
-                status,
-                error_msg,
-                schema,
-                None,
-                batch,
-                None,
-                &[],
-            );
+        let msg = ipc::WireMsg {
+            target_id: 1,
+            flags,
+            status,
+            error_msg,
+            schema,
+            data: ipc::WireData::Whole(batch),
+            ..Default::default()
+        };
+        writer.send_encoded(msg.size(), req, |buf| {
+            msg.encode_ipc(buf, 0);
         });
     }
 
