@@ -34,9 +34,10 @@ pub(super) enum CheckPayload {
 }
 
 /// A single distributed has-pk check queued for pipelined execution
-/// (always dispatched under FLAG_HAS_PK). `col_hint` is
-/// `pack_pk_cols(&[col])` for an index check (the packed flag at bit 63 is
-/// always set, so it never collides with the PK sentinel) or 0 for a PK check.
+/// (always dispatched under FLAG_HAS_PK). `col_hint` is the worker's
+/// `seek_col_idx`: `pack_pk_cols(&[col…])` for an index check (the packed flag
+/// at bit 63 is always set, so it never collides with the PK sentinel) or 0 for
+/// a PK check, optionally OR'd with `HAS_PK_WANT_HOLDER`.
 pub(super) struct PipelinedCheck {
     pub(super) target_id: i64,
     pub(super) col_hint: u64,
@@ -453,24 +454,6 @@ async fn merge_index_scan(
     Ok(acc)
 }
 
-/// Decode an OPK leading-key span back to its native per-column values — the
-/// inverse of `IndexKeySpec::write_span`, so the master stays the OPK *decoder*
-/// and the worker the sole OPK *encoder*. `idx_cols` are the span's promoted
-/// index columns; trailing array slots stay zero.
-fn span_to_natives(span: &PkBuf, idx_cols: &[SchemaColumn]) -> [u128; gnitz_wire::PK_LIST_MAX_COLS] {
-    let mut natives = [0u128; gnitz_wire::PK_LIST_MAX_COLS];
-    let mut off = 0;
-    for (native, col) in natives.iter_mut().zip(idx_cols) {
-        let sz = col.size() as usize;
-        // `pk_native_key` *is* "decode this OPK column window to its native
-        // zero-extended u128" — the same rule the FK/index key space uses
-        // everywhere else, so the decode is not respelled here.
-        *native = pk_native_key(span.pk_bytes(), off, sz, col.type_code);
-        off += sz;
-    }
-    natives
-}
-
 /// Cap on the distinct referenced values one write may fetch committed children
 /// for (Rule F2). Beyond it the write is rejected, keeping a delete-heavy one
 /// from turning validation into an unbounded master-side materialization under
@@ -739,21 +722,17 @@ struct FkProbePlan {
     values: Vec<u128>,
 }
 
-/// One planned unique-secondary-index check: the circuit's columns and index
-/// schema, the key encoder, and the `(span, surviving holder PK)` claims to
-/// verify against the committed occupancy the pipelined probe returns.
+/// One planned unique-secondary-index check: the circuit's columns, the key
+/// encoder (whose `key_size()` splits each reply entry into `[span ‖ holder]`),
+/// and the `(span, surviving claimant PK)` pairs to verify against the
+/// `[span ‖ committed holder PK]` entries the pipelined probe returns.
 struct UniquePlan<'a> {
     tid: i64,
     col_indices: PkColList,
-    idx_schema: SchemaDescriptor,
     spec: IndexKeySpec,
-    stride: usize,
-    /// The distinct surviving spans and who claims each. Holder PKs borrow the
+    /// The distinct surviving spans and who claims each. Claimant PKs borrow the
     /// family batch's PK region, like the overlay keys.
     by_span: FxHashMap<PkBuf, &'a [u8]>,
-    /// Upper bound on the committed spans this bundle can free on this table,
-    /// or `None` when no bound was resolved.
-    vacatable: Option<usize>,
 }
 
 /// Encode a native value `v` (from a column of type `src_type`) into the OPK
@@ -807,7 +786,7 @@ impl MasterDispatcher {
         }
         let bundle = TxnBundle::new(disp_ptr, families)?;
         let committed = Self::txn_check_pk(disp_ptr, reactor, sal_excl, &bundle).await?;
-        Self::txn_check_unique_indices(disp_ptr, reactor, sal_excl, &bundle, &committed).await?;
+        Self::txn_check_unique_indices(disp_ptr, reactor, sal_excl, &bundle).await?;
         Self::txn_check_foreign_keys(disp_ptr, reactor, sal_excl, &bundle, &committed).await
     }
 
@@ -817,10 +796,9 @@ impl MasterDispatcher {
     /// family checked against the running prefix fold before being folded into
     /// it.
     ///
-    /// Returns each probed table's committed PK set, which U-SEC reads: a
-    /// touched PK that exists committed is the only thing that can vacate a
-    /// committed index span, so the set bounds how many occupied spans the
-    /// bundle can possibly free.
+    /// Returns each probed table's committed PK set, which `parent_retired_added`
+    /// reads: only a touched PK that exists committed has an old referenced value
+    /// to retire.
     async fn txn_check_pk(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
@@ -831,20 +809,22 @@ impl MasterDispatcher {
         let mut checks: Vec<PipelinedCheck> = Vec::new();
         for &tid in &b.order {
             let error_mode = b.families_of(tid).any(|f| matches!(f.mode, WireConflictMode::Error));
-            // A unique index makes the probe worth issuing even without an Error
-            // family: U-SEC reads the same answer, and one `ScatterSource` burst
-            // replaces a committed-holder seek per colliding row.
-            let has_unique = unsafe { (*(*disp_ptr).catalog).has_any_unique_index(tid) };
-            if !error_mode && !has_unique {
+            // A bundled FK parent makes the probe worth issuing even without an
+            // Error family: `parent_retired_added` decides which touched PKs have
+            // an old referenced value from exactly this answer, and without it
+            // falls back to synthesising one for every touched PK.
+            let fk_parent = unsafe { !(*(*disp_ptr).catalog).fk_children_of(tid).is_empty() };
+            if !error_mode && !fk_parent {
                 continue;
             }
             // Candidate PKs to probe committed, borrowed from the family batches'
-            // PK regions. For U-SEC that is every touched PK — a deleted one
-            // vacates its span just as an overwritten one does. For Error mode
-            // alone it is the PKs an Error family inserts positively (a superset
-            // of each family's net-positive set); with none, no Error family can
-            // carry a net-positive PK, so the whole table's walk is vacuous.
-            let keys: Vec<&[u8]> = if has_unique {
+            // PK regions. For an FK parent that is every touched PK — a deleted one
+            // retires its referenced value just as an overwritten one does. For
+            // Error mode alone it is the PKs an Error family inserts positively (a
+            // superset of each family's net-positive set); with none, no Error
+            // family can carry a net-positive PK, so the whole table's walk is
+            // vacuous.
+            let keys: Vec<&[u8]> = if fk_parent {
                 b.overlay(tid).keys().copied().collect()
             } else {
                 let mut candidate: FxHashSet<&[u8]> = FxHashSet::default();
@@ -922,19 +902,21 @@ impl MasterDispatcher {
 
     /// Rule U-SEC: unique secondary indexes, post-transaction. Every
     /// (table, unique circuit)'s surviving spans are planned up front and their
-    /// committed-occupancy probes issued in one burst; the per-span committed-
-    /// holder seeks then fan out concurrently rather than one round trip each.
+    /// committed-occupancy probes issued in ONE burst — the only round trip the
+    /// rule takes. The probe runs under `HAS_PK_WANT_HOLDER`, so each occupied
+    /// span comes back as `[span ‖ committed holder PK]`: the answer that decides
+    /// the verdict is read out of the same reply that established the span is
+    /// occupied, from the same per-worker index store, with no interval in which
+    /// it could go stale.
     ///
-    /// Two things keep that fan-out off the hot path: a warm unique filter
-    /// elides the whole plan for a provably-absent span set (the steady state of
-    /// a fresh-key insert stream), and U-PK's committed-PK sets bound how many
-    /// occupied spans the bundle could free.
+    /// A warm unique filter keeps even that burst off the hot path, eliding the
+    /// whole plan for a provably-absent span set (the steady state of a fresh-key
+    /// insert stream).
     async fn txn_check_unique_indices<'a>(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex>,
         b: &TxnBundle<'a>,
-        committed_pks: &FxHashMap<i64, FxHashSet<PkBuf>>,
     ) -> Result<(), String> {
         let mut plans: Vec<UniquePlan<'a>> = Vec::new();
         let mut checks: Vec<PipelinedCheck> = Vec::new();
@@ -943,7 +925,7 @@ impl MasterDispatcher {
                 let cat = &*(*disp_ptr).catalog;
                 (cat.get_index_circuit_count(tid), cat.has_any_unique_index(tid))
             };
-            if n_circuits == 0 || !has_unique {
+            if !has_unique {
                 continue;
             }
             if b.surviving(tid).next().is_none() {
@@ -953,13 +935,6 @@ impl MasterDispatcher {
             // elides the whole broadcast below. The warm-up is one O(table)
             // scan fan-out per (table, index) per process.
             Self::ensure_unique_filters_warm(disp_ptr, reactor, sal_excl, tid).await?;
-            // Bound on the committed spans this bundle can free on this table:
-            // only a touched PK that exists committed can vacate one, and it
-            // vacates at most one per index. `None` when U-PK probed no committed
-            // set for this table, leaving no bound. Resolved on the first circuit
-            // that actually probes, so a fully elided table never walks the
-            // overlay for it.
-            let mut vacatable: Option<Option<usize>> = None;
             for ci in 0..n_circuits {
                 // One circuit lookup: its column list, index schema, and the
                 // span-encode plan baked at registration. Copied out so the
@@ -999,91 +974,62 @@ impl MasterDispatcher {
                 if unsafe { (*disp_ptr).unique_filter_all_absent(tid, packed, by_span.keys().copied()) } {
                     continue;
                 }
-                let vacatable = *vacatable.get_or_insert_with(|| {
-                    committed_pks
-                        .get(&tid)
-                        .map(|c| b.overlay(tid).keys().filter(|&&pk| c.contains(pk)).count())
-                });
                 let pooled = unsafe { (*disp_ptr).pool_pop_batch(tid) };
                 let chk = build_check_batch_with(&idx_schema, by_span.keys(), pooled, |bat, k| {
                     bat.extend_pk_bytes(k.padded(stride))
                 });
                 checks.push(PipelinedCheck {
                     target_id: tid,
-                    col_hint: packed,
+                    // The reply must name the committed holder of each occupied
+                    // span, not echo the probe key back.
+                    col_hint: packed | gnitz_wire::HAS_PK_WANT_HOLDER,
                     payload: Some(CheckPayload::Broadcast(chk)),
                     schema: idx_schema,
                 });
                 plans.push(UniquePlan {
                     tid,
                     col_indices,
-                    idx_schema,
                     spec,
-                    stride,
                     by_span,
-                    vacatable,
                 });
             }
         }
         let results = Self::execute_and_reclaim(disp_ptr, reactor, sal_excl, &mut checks).await?;
 
-        // Every occupied surviving span needs its committed holder. Fan the seeks
-        // out across all plans before collecting, so they overlap on the wire
-        // instead of costing one round trip each.
-        let mut pending: Vec<(usize, PkBuf, &[u8])> = Vec::new();
-        let mut futs = Vec::new();
-        for (pi, plan) in plans.iter().enumerate() {
-            let occupied = &results[pi];
-            let idx_cols = &plan.idx_schema.columns[..plan.col_indices.as_slice().len()];
-            let mut hits = 0usize;
-            for (span, holder_pk) in &plan.by_span {
-                if !occupied.contains(span.padded(plan.stride)) {
+        // Each reply entry is an occupied span plus the committed row holding it,
+        // `[span ‖ holder PK]`, split back apart by index layout alone.
+        //
+        // A span held on two different workers contributes two entries and each
+        // holder is verified on its own; the `FxHashSet` collapses a replicated
+        // owner's `W` identical answers to one.
+        let mut hspan = PkBuf::zeroed(0);
+        for (plan, occupied) in plans.iter().zip(&results) {
+            for entry in occupied {
+                let (span, holder) = plan.spec.split_entry(entry.pk_bytes());
+                // Every entry answers a span this plan probed, so the claimer is
+                // always present.
+                let Some(&claimer) = plan.by_span.get(span) else {
+                    continue;
+                };
+                // The holder IS the surviving row claiming the span — nothing to
+                // vacate.
+                if holder == claimer {
                     continue;
                 }
-                // Each occupied span needs a distinct committed row to vacate it,
-                // and only a touched-and-committed PK can. More occupied spans
-                // than that means one of them keeps its holder — a violation,
-                // decided without seeking any of them. This is what stops a bulk
-                // load of colliding fresh rows from costing one seek per row.
-                hits += 1;
-                if plan.vacatable.is_some_and(|v| hits > v) {
+                // Otherwise the bundle must retire it: the holder's surviving state
+                // is absent, or it no longer holds this span.
+                let retired = match b.overlay(plan.tid).get(holder) {
+                    None => false,
+                    Some(FoldOp::Deleted) => true,
+                    Some(FoldOp::Inserted(hf, hr)) => {
+                        !plan.spec.key_bytes(b.mem(*hf), *hr as usize, &mut hspan) || hspan.pk_bytes() != span
+                    }
+                };
+                if !retired {
                     return Err(unsafe {
                         (*disp_ptr).unique_violation_err(plan.tid, plan.col_indices.as_slice(), false)
                     });
                 }
-                pending.push((pi, *span, holder_pk));
-                // async fn futures are !Unpin; box-pin for join_all_unpin.
-                futs.push(Box::pin(Self::seek_unique_holder(
-                    disp_ptr,
-                    reactor,
-                    sal_excl,
-                    plan.tid,
-                    plan.col_indices,
-                    span_to_natives(span, idx_cols),
-                )));
-            }
-        }
-        let holders = crate::runtime::reactor::join_all_unpin(futs).await;
-
-        // A committed holder is acceptable only if the bundle retires it: either
-        // it is the surviving row that claims the span, or its own surviving state
-        // is absent / no longer holds that span.
-        for ((pi, span, holder_pk), holder_result) in pending.into_iter().zip(holders) {
-            let Some(h) = holder_result? else { continue };
-            if h.pk_bytes() == holder_pk {
-                continue;
-            }
-            let plan = &plans[pi];
-            let retired = match b.overlay(plan.tid).get(h.pk_bytes()) {
-                None => false,
-                Some(FoldOp::Deleted) => true,
-                Some(FoldOp::Inserted(hf, hr)) => {
-                    let mut hspan = PkBuf::zeroed(0);
-                    !plan.spec.key_bytes(b.mem(*hf), *hr as usize, &mut hspan) || hspan != span
-                }
-            };
-            if !retired {
-                return Err(unsafe { (*disp_ptr).unique_violation_err(plan.tid, plan.col_indices.as_slice(), false) });
             }
         }
         Ok(())
@@ -1141,9 +1087,8 @@ impl MasterDispatcher {
         needed.sort_unstable();
         needed.dedup();
         // Fan the per-parent gathers out concurrently — they run under the full
-        // lock union, so overlapping their reply waits (as the U-SEC holder seeks
-        // and F2 exemption fetches already do) beats one sequential round trip
-        // per parent column.
+        // lock union, so overlapping their reply waits (as the F2 exemption
+        // fetches already do) beats one sequential round trip per parent column.
         let futs: Vec<_> = needed
             .iter()
             .map(|&(ptid, pcol)| {
@@ -1738,10 +1683,11 @@ impl MasterDispatcher {
     ///
     /// This is the `O(num_workers)`-round-trip replacement for the per-row
     /// serial single-key seek loop used by FK RESTRICT on non-PK UNIQUE
-    /// targets. It is a sibling of `execute_pipeline` (which returns only
-    /// existence) rather than a modification of it: the has-pk pipeline echoes
-    /// the caller's payload (`filter_by_pk`), so it structurally cannot return
-    /// a stored column the caller does not already hold.
+    /// targets. It is a sibling of `execute_pipeline` rather than a modification
+    /// of it: the has-pk pipeline answers one key per matched probe row — the
+    /// probe key echoed back, or under `HAS_PK_WANT_HOLDER` the matched index
+    /// entry — so it can name the row that matched but never project its
+    /// columns, which is what a gather is for.
     ///
     /// Replies arrive as reply trains (an oversized gather reply chunks; a
     /// single-frame reply is a length-1 train), so the fan-out uses scan

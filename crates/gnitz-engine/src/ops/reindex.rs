@@ -348,7 +348,7 @@ mod tests {
         /// Promote every row of `output` from `batch`, hoisting the per-batch kind
         /// dispatch out of the row loop. Every arm emits sign-aware OPK bytes
         /// right-aligned into `output.pk_stride()`, so the synthetic reindex key is
-        /// byte-identical to how `extract_col_key`, `partition_for_pk_bytes`, and
+        /// byte-identical to how `ColumnLocator::route_key`, `partition_for_pk_bytes`, and
         /// storage encode the same value. Production goes through `ReindexPacker`
         /// (which generalises this to N columns); the arity-1 byte-identity test
         /// asserts `ReindexPacker` matches this oracle.
@@ -362,7 +362,7 @@ mod tests {
             match self.kind {
                 // Source PK column is already OPK at rest — copy it verbatim,
                 // right-aligned with left zero-pad. widen_pk_be of the result
-                // equals extract_col_key's `widen_pk_be(get_pk_bytes[col])`, so
+                // equals `route_key`'s `widen_pk_be(get_pk_bytes[col])`, so
                 // routing agrees.
                 PromoteKind::Col(ColumnLocator::Pk { byte_off, size, .. }) => {
                     let (off, cs) = (byte_off as usize, size as usize);
@@ -386,7 +386,7 @@ mod tests {
                             }
                         }
                         // Payload integer: OPK-encode the native value (sign-flipped
-                        // for signed), matching extract_col_key's payload arm.
+                        // for signed), matching `route_key`'s payload arm.
                         _ => {
                             // Loop-invariant scratch: `encode_pk_column` fully overwrites
                             // the `[16 - cs..]` slice each row; the zero prefix persists.
@@ -639,7 +639,7 @@ mod tests {
     #[test]
     fn test_pk_promoter_signed_opk_encoding() {
         // Reindex on a signed I64 PAYLOAD column (Narrow arm). The synthetic key
-        // must be the sign-aware OPK image (matching extract_col_key's payload
+        // must be the sign-aware OPK image (matching `route_key`'s payload
         // encoding), NOT the raw unsigned value — for -3 the OPK leading byte is
         // 0x7F, not 0xFF. This is the assertion the old unsigned-only test could
         // not make.
@@ -700,7 +700,7 @@ mod tests {
                 vals[row],
             );
             // widen_pk_be of the synthetic bytes equals the sign-aware routing key
-            // (what extract_col_key returns for this value).
+            // (what `ColumnLocator::route_key` returns for this value).
             let expect = gnitz_wire::payload_route_key(&vals[row].to_le_bytes(), 0, 8, type_code::I64);
             assert_eq!(out_pk.get_pk(row), expect, "row {row}: routing key mismatch");
         }

@@ -852,7 +852,7 @@ class TestIndexIntegrity:
     def test_unique_upsert_intra_batch_duplicate_new_value(self, client):
         """Two UPSERT rows (both existing PKs) set the same NEW unique value in
         one batch. The new value is absent from committed storage, so the
-        per-row holder seek never fires; only the in-batch duplicate check can
+        occupancy probe answers "free"; only the in-batch duplicate check can
         catch it. Must raise — otherwise the unique index is silently corrupted
         with two rows holding the same value."""
         sn = _sn()
@@ -1541,11 +1541,11 @@ class TestPlainPushFoldedValidation:
         finally:
             _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
 
-    def test_bulk_colliding_fresh_pks_rejected_without_per_row_seeks(self, client):
+    def test_bulk_colliding_fresh_pks_rejected(self, client):
         """A re-run bulk load: 2000 fresh PKs re-claiming 2000 committed values,
-        none of which the batch frees. The verdict follows from the count alone
-        (no touched PK exists committed, so nothing can be vacated), so it must
-        come back promptly rather than after one committed-holder seek per row."""
+        none of which the batch frees. Every span comes back occupied by a holder
+        the bundle does not retire, so the whole push must be rejected — and one
+        occupancy probe decides all 2000."""
         sn = _sn()
         client.create_schema(sn)
         try:
@@ -2286,8 +2286,8 @@ class TestCompositeUniqueIndex:
     def test_composite_bulk_shift_accepted(self, client):
         """UPDATE t SET b = b + 1 over a dense (a, b) sequence under a composite
         UNIQUE (a, b) ships same-PK upserts whose new composite value is held by
-        the previous (also-upserted) row — exercising the upsert verify's
-        decode-span -> native composite holder seek. Must succeed."""
+        the previous (also-upserted) row — every occupied span resolves to a
+        holder the same bundle retires. Must succeed."""
         sn = _sn()
         client.create_schema(sn)
         try:
@@ -2723,3 +2723,243 @@ class TestIndexBoundPushdown:
         finally:
             _drop_all(client, sn, views=["mv"],
                       indices=[f"{sn}__t__idx_ind"], tables=["t"])
+
+
+# ---------------------------------------------------------------------------
+# TestUniqueHolderFromProbe — the committed holder of an occupied index span is
+# read out of the same occupancy reply that established the span is occupied.
+#
+# These pin the observable contract: an index seek and an UPDATE/DELETE by unique
+# value each name exactly the holder, and the unique constraint holds. The shapes
+# are the ones where a holder answered from anywhere but the index store could
+# name the wrong row — a NULL indexed cell sharing the all-zero key image of a
+# real value, and a value that moves to another PK while no index exists to
+# observe it. Every setup creates the index BEFORE the rows, since only writes
+# made while the index exists feed it.
+#
+# The holder's PK is swept over two values so the cases do not all land on one
+# worker; which worker owns a PK is the engine's business, not something the test
+# mirrors.
+# ---------------------------------------------------------------------------
+
+_HOLDER_PKS = (7, 999983)
+
+# The PK a value moves to during the drop-index window. Outside _HOLDER_PKS, so
+# "moves to a different PK" is true for every sweep value.
+_MOVED_PK = 31337
+
+# NULL-valued rows spread over a PK range wide enough to reach every worker.
+_NULL_PK_LO, _NULL_PK_HI = 10_000, 10_048
+
+# `(column type, the value whose order-preserving image is all-zero for it, that
+# value's unsigned native image)`. The last is what the seek API takes: its key
+# values are `u128`, the zero-extended cell the engine reads out of a row, so a
+# signed column's negative value arrives as its two's-complement image.
+_ZERO_IMAGE_COLUMNS = [
+    ("BIGINT UNSIGNED", 0, 0),
+    ("INT", -2147483648, 1 << 31),
+]
+
+
+class TestUniqueHolderFromProbe:
+    def _setup(self, client, sn, col_type):
+        client.execute_sql(
+            f"CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a {col_type})",
+            schema_name=sn,
+        )
+
+    def _fill_nulls(self, client, sn):
+        """One multi-row INSERT of NULL-valued rows."""
+        _insert_rows(client, sn, [(pk, "NULL") for pk in range(_NULL_PK_LO, _NULL_PK_HI)])
+
+    def _holders_of(self, client, sn, value):
+        """Committed PKs whose `a` equals `value`, read by a full scan (a SELECT
+        by the indexed column would itself be the thing under test)."""
+        res = client.execute_sql("SELECT pk, a FROM t", schema_name=sn)
+        assert res[0]["type"] == "Rows"
+        return sorted(r.pk for r in res[0]["rows"] if r.a == value)
+
+    def _seek_pk(self, client, tid, value):
+        """PKs a direct single-column index seek returns for `value`."""
+        res = client.seek_by_index(tid, [1], [value])
+        if res.schema is None:
+            return []
+        return sorted(res.pks[i] for i in range(len(res.pks)) if res.weights[i] > 0)
+
+    # -- A NULL indexed cell must not claim the all-zero key image -------------
+
+    @pytest.mark.parametrize("col_type,value,seek_key", _ZERO_IMAGE_COLUMNS)
+    @pytest.mark.parametrize("holder_pk", _HOLDER_PKS)
+    def test_index_seek_finds_the_zero_image_holder_among_nulls(
+            self, client, col_type, value, seek_key, holder_pk):
+        """`value` is the one whose order-preserving image is all-zero for this
+        column type — the image a NULL indexed cell would fold onto if anything
+        keyed by it treated NULL as a value. The index is NULL-distinct (a NULL
+        row has no entry at all), so a direct seek for `value` must return the
+        holder however many NULL rows were written after it."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn, col_type)
+            client.execute_sql("CREATE UNIQUE INDEX ON t(a)", schema_name=sn)
+            tid, _ = client.resolve_table(sn, "t")
+            client.execute_sql(
+                f"INSERT INTO t VALUES ({holder_pk}, {value})", schema_name=sn)
+            self._fill_nulls(client, sn)
+
+            assert self._seek_pk(client, tid, seek_key) == [holder_pk]
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_a"], tables=["t"])
+
+    @pytest.mark.parametrize("col_type,value",
+                             [(c, v) for c, v, _ in _ZERO_IMAGE_COLUMNS])
+    @pytest.mark.parametrize("holder_pk", _HOLDER_PKS)
+    def test_update_delete_by_unique_value_with_null_rows(
+            self, client, col_type, value, holder_pk):
+        """The same all-zero-image value, reached through SQL instead of a direct
+        seek: with NULL rows committed alongside the holder, UPDATE and then
+        DELETE by that value must each affect exactly the holder's one row."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn, col_type)
+            client.execute_sql("CREATE UNIQUE INDEX ON t(a)", schema_name=sn)
+            client.execute_sql(
+                f"INSERT INTO t VALUES ({holder_pk}, {value})", schema_name=sn)
+            self._fill_nulls(client, sn)
+
+            res = client.execute_sql(
+                f"UPDATE t SET a = {value} WHERE a = {value}", schema_name=sn)
+            assert res[0]["type"] == "RowsAffected"
+            assert res[0]["count"] == 1
+
+            res = client.execute_sql(f"DELETE FROM t WHERE a = {value}", schema_name=sn)
+            assert res[0]["type"] == "RowsAffected"
+            assert res[0]["count"] == 1
+            assert self._holders_of(client, sn, value) == []
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_a"], tables=["t"])
+
+    @pytest.mark.parametrize("holder_pk", _HOLDER_PKS)
+    def test_unique_constraint_holds_with_null_rows(self, client, holder_pk):
+        """Under the same NULL poisoning, a bundle that moves a second committed
+        row's value AND claims the holder's value for a fresh PK must be
+        rejected — the second row is what makes the bundle touch a committed PK,
+        so the check reaches the holder rather than stopping at the claim."""
+        sn = _sn()
+        client.create_schema(sn)
+        other, fresh = _NULL_PK_HI + 1, _NULL_PK_HI + 2
+        try:
+            self._setup(client, sn, "BIGINT UNSIGNED")
+            client.execute_sql("CREATE UNIQUE INDEX ON t(a)", schema_name=sn)
+            client.execute_sql(f"INSERT INTO t VALUES ({holder_pk}, 0)", schema_name=sn)
+            client.execute_sql(f"INSERT INTO t VALUES ({other}, 77)", schema_name=sn)
+            self._fill_nulls(client, sn)
+
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql(
+                    f"INSERT INTO t VALUES ({other}, 88), ({fresh}, 0)"
+                    " ON CONFLICT (pk) DO UPDATE SET a = EXCLUDED.a",
+                    schema_name=sn)
+            assert self._holders_of(client, sn, 0) == [holder_pk]
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_a"], tables=["t"])
+
+    # -- A value that moved while no index existed ----------------------------
+
+    @pytest.mark.parametrize("holder_pk", _HOLDER_PKS)
+    def test_value_moved_across_the_drop_index_window(self, client, holder_pk):
+        """The value is deleted and re-inserted under a different PK while no
+        index exists at all. Nothing rewrites the moved row through the index
+        before the re-create, so both a direct seek and a bundle claiming the
+        value must name the NEW holder, not the pre-DROP one."""
+        sn = _sn()
+        client.create_schema(sn)
+        other, fresh = 555, 556
+        try:
+            self._setup(client, sn, "BIGINT NOT NULL")
+            # Both rows are written WHILE the index exists, then it is dropped:
+            # the window below writes with no index in the catalog at all.
+            client.execute_sql("CREATE UNIQUE INDEX ON t(a)", schema_name=sn)
+            tid, _ = client.resolve_table(sn, "t")
+            client.execute_sql(f"INSERT INTO t VALUES ({holder_pk}, 7)", schema_name=sn)
+            client.execute_sql(f"INSERT INTO t VALUES ({other}, 77)", schema_name=sn)
+            client.execute_sql(f"DROP INDEX {sn}__t__idx_a", schema_name=sn)
+
+            client.execute_sql(f"DELETE FROM t WHERE pk = {holder_pk}", schema_name=sn)
+            client.execute_sql(f"INSERT INTO t VALUES ({_MOVED_PK}, 7)", schema_name=sn)
+            client.execute_sql("CREATE UNIQUE INDEX ON t(a)", schema_name=sn)
+
+            assert self._seek_pk(client, tid, 7) == [_MOVED_PK]
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql(
+                    f"INSERT INTO t VALUES ({other}, 88), ({fresh}, 7)"
+                    " ON CONFLICT (pk) DO UPDATE SET a = EXCLUDED.a",
+                    schema_name=sn)
+            assert self._holders_of(client, sn, 7) == [_MOVED_PK]
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_a"], tables=["t"])
+
+    # -- The two shapes the reply split newly carries -------------------------
+
+    def test_composite_unique_holder_split(self, client):
+        """A composite span is wider than one column, so the `[span ‖ holder PK]`
+        split must land at the whole span's width. The bundle touches a second
+        committed PK, so the check resolves a holder rather than stopping at the
+        claim."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY,"
+                " a BIGINT NOT NULL, b BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql("CREATE UNIQUE INDEX ON t(a, b)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, 1, 1)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (2, 2, 2)", schema_name=sn)
+
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql(
+                    "INSERT INTO t VALUES (2, 3, 3), (999983, 1, 1)"
+                    " ON CONFLICT (pk) DO UPDATE SET a = EXCLUDED.a, b = EXCLUDED.b",
+                    schema_name=sn)
+            res = client.execute_sql("SELECT pk, a, b FROM t", schema_name=sn)
+            assert sorted(r.pk for r in res[0]["rows"] if (r.a, r.b) == (1, 1)) == [1]
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_a_b"], tables=["t"])
+
+    def test_replicated_owner_holder_is_deduped_and_decisive(self, client):
+        """Every worker holds a replicated table's whole index, so every worker
+        answers for the same span. The `W` identical answers must collapse to one
+        holder, and that holder must decide the verdict: the same bundle shape is
+        rejected when the holder keeps the value and accepted when it releases it
+        in the same bundle."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)"
+                " WITH (replicated = true)", schema_name=sn)
+            client.execute_sql("CREATE UNIQUE INDEX ON t(a)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, 42)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (2, 77)", schema_name=sn)
+
+            # pk=1 keeps 42 -> the fresh claim collides.
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql(
+                    "INSERT INTO t VALUES (2, 88), (999983, 42)"
+                    " ON CONFLICT (pk) DO UPDATE SET a = EXCLUDED.a",
+                    schema_name=sn)
+            res = client.execute_sql("SELECT pk, a FROM t", schema_name=sn)
+            assert sorted(r.pk for r in res[0]["rows"] if r.a == 42) == [1]
+
+            # Same bundle, but the holder releases 42 in it -> accepted.
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 99), (999983, 42)"
+                " ON CONFLICT (pk) DO UPDATE SET a = EXCLUDED.a",
+                schema_name=sn)
+            res = client.execute_sql("SELECT pk, a FROM t", schema_name=sn)
+            rows = {r.pk: r.a for r in res[0]["rows"]}
+            assert rows[1] == 99 and rows[999983] == 42
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_a"], tables=["t"])

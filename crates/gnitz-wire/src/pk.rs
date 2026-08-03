@@ -299,7 +299,7 @@ pub fn partition_for_key(pk: u128) -> usize {
 /// OPK bytes are big-endian, so [`widen_pk_be`] right-aligns them to recover the
 /// native unsigned value (sign-flipped for signed) and the result is
 /// `partition_for_key(widen_pk_be(bytes))` by construction. This is the
-/// invariant the join router relies on: `extract_col_key` (both PK and
+/// invariant the join router relies on: `ColumnLocator::route_key` (both PK and
 /// OPK-encoded payload paths) also funnels through `widen_pk_be`, so the two
 /// sides of a distributed join agree. For wide regions it takes the top 8 bits
 /// of xxh3 of the OPK bytes directly (uniformly distributed already).

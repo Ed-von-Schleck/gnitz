@@ -7,8 +7,7 @@ use std::rc::Rc;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::catalog::CatalogEngine;
-use crate::schema::SchemaDescriptor;
-use crate::schema::{IndexKeySpec, SchemaColumn};
+use crate::schema::{IndexKeySpec, SchemaDescriptor};
 use gnitz_wire::PkColList;
 use gnitz_wire::{payload_native_key, pk_native_key};
 
@@ -32,7 +31,6 @@ use crate::runtime::wire::{
 use crate::schema::key::PkBuf;
 use crate::storage::Batch;
 use gnitz_wire::wire_flags_set_conflict_mode;
-use index_router::PartitionRouter;
 
 // ---------------------------------------------------------------------------
 // RelayPrepared — output of prepare_relay, input of emit_relay_with_decision
@@ -74,7 +72,6 @@ pub struct MasterDispatcher {
     w2m_ptr: *const W2mReceiver,
     // Catalog pointer — reborrowed per-call because &mut self borrows conflict.
     catalog: *mut CatalogEngine,
-    router: PartitionRouter,
     /// Per-(table_id, packed_col_list) filter skipping redundant unique-index
     /// occupancy broadcasts. The `u64` is `pack_pk_cols(col_indices)` — the same
     /// value stored in `IDXTAB_PAY_SOURCE_COLS` — so a composite index is
@@ -95,7 +92,6 @@ pub struct MasterDispatcher {
 unsafe impl Send for MasterDispatcher {}
 
 mod dispatch;
-mod index_router;
 mod preflight;
 mod unique_filter;
 

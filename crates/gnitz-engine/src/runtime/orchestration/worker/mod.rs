@@ -29,20 +29,30 @@ use crate::storage::{BlobCacheGuard, FlushOutcome, FlushWork, StorageError, Tabl
 enum HasPkLookup {
     /// Check the table's primary-key store.
     PrimaryKey,
-    /// Check a unique secondary index on the carried column list (single- or
-    /// multi-column; a composite index is located by its exact list).
-    UniqueIndex(gnitz_wire::PkColList),
+    /// Check a secondary index on the carried column list (single- or
+    /// multi-column; a composite index is located by its exact list). Unique and
+    /// non-unique alike — rule F2 probes a child's FK auto-index, which is never
+    /// unique.
+    SecondaryIndex {
+        cols: gnitz_wire::PkColList,
+        /// Answer each match with the matched STORED entry key
+        /// (`[span ‖ holder PK]`) instead of echoing the probe key — see
+        /// `HAS_PK_WANT_HOLDER`.
+        want_holder: bool,
+    },
 }
 
 impl HasPkLookup {
-    /// `seek_col_idx == 0` → PrimaryKey. Otherwise `seek_col_idx` carries
+    /// A zero column-list word → PrimaryKey. Otherwise the word carries
     /// `pack_pk_cols(col_indices)` whose packed flag (bit 63) is always set, so a
     /// real index check is never 0 and never collides with the PK sentinel.
     fn from_wire(seek_col_idx: u64) -> Self {
-        if seek_col_idx == 0 {
-            HasPkLookup::PrimaryKey
-        } else {
-            HasPkLookup::UniqueIndex(gnitz_wire::unpack_pk_cols(seek_col_idx))
+        match gnitz_wire::pk_cols_word(seek_col_idx) {
+            0 => HasPkLookup::PrimaryKey,
+            cols_word => HasPkLookup::SecondaryIndex {
+                cols: gnitz_wire::unpack_pk_cols(cols_word),
+                want_holder: seek_col_idx & gnitz_wire::HAS_PK_WANT_HOLDER != 0,
+            },
         }
     }
 }
@@ -290,23 +300,40 @@ enum ReplySchema<'a> {
     ClientAuthored(&'a SchemaDescriptor),
 }
 
-/// Filter a check-batch to the rows whose PK `exists` accepts, copying each
-/// matched row into the result. Keys on verbatim OPK bytes, correct for every
-/// PK width. `exists` receives the row's raw OPK PK bytes.
+/// What one probe row resolved to. The reply key is named by the variant rather
+/// than inferred from the scratch buffer's length, so both arms below read as
+/// what they answer with.
+enum Resolved {
+    /// No match — the row is dropped.
+    Absent,
+    /// Matched; answer with the probe key itself (a pure existence check).
+    ProbeKey,
+    /// Matched; answer with the key the closure wrote into its scratch.
+    Scratch,
+}
+
+/// Filter a check-batch to the rows `resolve` matches, copying each matched row
+/// into the result under the key `resolve` names. Keys on verbatim OPK bytes,
+/// correct for every PK width. `resolve` receives the row's raw OPK PK bytes and
+/// a scratch key it may write the answer into.
 fn filter_by_pk_bytes(
     batch: &Option<Batch>,
     schema: SchemaDescriptor,
     n: usize,
-    mut exists: impl FnMut(&[u8]) -> bool,
+    mut resolve: impl FnMut(&[u8], &mut PkBuf) -> Resolved,
 ) -> Batch {
     let mut result = Batch::with_capacity(schema, n);
     if let Some(ref b) = batch {
         let mut blob_cache = BlobCacheGuard::acquire(&schema, n);
+        let mut scratch = PkBuf::zeroed(0);
         for i in 0..n {
             let pkb = b.get_pk_bytes(i);
-            if exists(pkb) {
-                result.append_row_from_source_bytes(pkb, 1, b, i, blob_cache.get_mut());
-            }
+            let key = match resolve(pkb, &mut scratch) {
+                Resolved::Absent => continue,
+                Resolved::ProbeKey => pkb,
+                Resolved::Scratch => scratch.pk_bytes(),
+            };
+            result.append_row_from_source_bytes(key, 1, b, i, blob_cache.get_mut());
         }
     }
     result
@@ -1229,11 +1256,11 @@ impl WorkerProcess {
         let n = batch.as_ref().map(|b| b.count).unwrap_or(0);
 
         match lookup {
-            HasPkLookup::UniqueIndex(cols) => {
+            HasPkLookup::SecondaryIndex { cols, want_holder } => {
                 let index_handle = self.cat().get_index_store_handle(target_id, cols.as_slice());
                 if index_handle.is_null() {
                     return Err(format!(
-                        "No unique index on columns {:?} for table {}",
+                        "No index on columns {:?} for table {}",
                         cols.as_slice(),
                         target_id
                     ));
@@ -1264,8 +1291,18 @@ impl WorkerProcess {
                 // whole leading span — OPK puts the distinguishing bytes last, so
                 // a source-width prefix would match only the zero high bytes.
                 let idx_key_size = schema.leading_key_size(cols.as_slice().len());
-                let result = filter_by_pk_bytes(&batch, schema, n, |pkb| {
-                    cursor.seek_first_positive_with_prefix(&pkb[..idx_key_size])
+                let result = filter_by_pk_bytes(&batch, schema, n, |pkb, holder| {
+                    if !cursor.seek_first_positive_with_prefix(&pkb[..idx_key_size]) {
+                        return Resolved::Absent;
+                    }
+                    if !want_holder {
+                        return Resolved::ProbeKey;
+                    }
+                    // `[span ‖ holder PK]` verbatim: `IndexKeySpec::write_entry`
+                    // wrote the source PK at `idx_key_size`, so the caller splits
+                    // it back out without decoding anything.
+                    holder.set_from(cursor.current_pk_bytes());
+                    Resolved::Scratch
                 });
                 // The index schema is not table `target_id`'s own — one-off block.
                 self.send_response(
@@ -1286,8 +1323,12 @@ impl WorkerProcess {
                 // Route on verbatim OPK bytes for every PK width. The old narrow
                 // arm fed `get_pk` (OPK-widened) to `has_pk(u128)`, which
                 // re-OPK-encodes it — a double sign-flip that misses signed PKs.
-                let result = filter_by_pk_bytes(&batch, schema, n, |pkb| {
-                    ptable.as_mut().is_some_and(|pt| pt.has_pk_bytes(pkb))
+                let result = filter_by_pk_bytes(&batch, schema, n, |pkb, _| {
+                    if ptable.as_mut().is_some_and(|pt| pt.has_pk_bytes(pkb)) {
+                        Resolved::ProbeKey
+                    } else {
+                        Resolved::Absent
+                    }
                 });
                 self.send_response(
                     target_id as u64,
@@ -1685,28 +1726,29 @@ mod tests {
         assert!(matches!(HasPkLookup::from_wire(0), HasPkLookup::PrimaryKey));
     }
 
+    /// `seek_col_idx` carries `pack_pk_cols(cols)` — the packed flag (bit 63) is
+    /// always set, so it is never 0 and never collides with the PK sentinel —
+    /// optionally OR'd with the holder directive on bit 62, which must survive
+    /// the round trip without disturbing the column list.
     #[test]
-    fn from_wire_packed_single_col_is_unique_index() {
-        // seek_col_idx carries pack_pk_cols(&[col]); the packed flag (bit 63) is
-        // always set, so it is never 0 and decodes back to the column list.
-        for col in [0u32, 1, 5, 63] {
-            let packed = gnitz_wire::pack_pk_cols(&[col]);
-            match HasPkLookup::from_wire(packed) {
-                HasPkLookup::UniqueIndex(cols) => assert_eq!(cols.as_slice(), [col]),
-                HasPkLookup::PrimaryKey => panic!("packed list must decode to UniqueIndex"),
+    fn from_wire_decodes_the_column_list_with_and_without_the_holder_directive() {
+        for cols in [&[0u32][..], &[3][..], &[63][..], &[1, 4][..], &[0, 2, 5, 7][..]] {
+            let packed = gnitz_wire::pack_pk_cols(cols);
+            assert_ne!(packed, 0);
+            for want in [false, true] {
+                let word = packed | if want { gnitz_wire::HAS_PK_WANT_HOLDER } else { 0 };
+                match HasPkLookup::from_wire(word) {
+                    HasPkLookup::SecondaryIndex {
+                        cols: decoded,
+                        want_holder,
+                    } => {
+                        assert_eq!(decoded.as_slice(), cols);
+                        assert_eq!(want_holder, want);
+                    }
+                    HasPkLookup::PrimaryKey => panic!("packed list must decode to SecondaryIndex"),
+                }
             }
         }
-    }
-
-    #[test]
-    fn from_wire_packed_is_never_primary_key() {
-        // A packed single-column list always sets the flag bit, so it never
-        // collides with the PK sentinel (0).
-        assert!(gnitz_wire::pack_pk_cols(&[0]) != 0);
-        assert!(matches!(
-            HasPkLookup::from_wire(gnitz_wire::pack_pk_cols(&[0])),
-            HasPkLookup::UniqueIndex(_)
-        ));
     }
 
     // -- Walk-the-matrix dispatch tests ---------------------------------------

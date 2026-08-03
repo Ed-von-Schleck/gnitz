@@ -155,8 +155,8 @@ impl ColumnLocator {
     }
 
     /// Canonical sign-aware *routing* key for the value in `row` — the form
-    /// `partition_for_pk_bytes` and the index routing cache compare on, and the
-    /// routing counterpart to [`Self::native_key`]. A PK column widens its OPK
+    /// `partition_for_pk_bytes` compares on, and the routing counterpart to
+    /// [`Self::native_key`]. A PK column widens its OPK
     /// bytes; a payload column OPK-encodes then widens, so equal logical values
     /// route to the same partition whether stored as a PK or a payload column.
     /// Callers must `is_null`-gate first. STRING/BLOB have no order-preserving

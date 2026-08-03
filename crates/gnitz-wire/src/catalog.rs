@@ -302,6 +302,8 @@ pub const MAX_PK_BYTES: usize = MAX_PK_COLUMNS * 16;
 //     for system tables.
 //   * Packed list (flag bit set):
 //        bit 63        : PK_LIST_PACKED_FLAG
+//        bit 62        : reserved — HAS_PK_WANT_HOLDER, when the word is a
+//                        FLAG_HAS_PK `seek_col_idx` rather than a catalog cell
 //        bits [0..4)   : decoded count (1..=PK_LIST_MAX_COLS valid; larger
 //                        counts are reserved for tests / malformed payloads)
 //        bits [4+7i..) : i-th column index, 7 bits each
@@ -334,7 +336,7 @@ const _: () = assert!(
     "PK_LIST_MAX_COLS overflows the 4-bit packed count field"
 );
 const _: () = assert!(
-    4 + 7 * PK_LIST_MAX_COLS <= 63, // column fields clear the flag bit
+    4 + 7 * PK_LIST_MAX_COLS <= 62, // column fields clear bits 62 and 63
     "PK_LIST_MAX_COLS overflows the packed u64 column region"
 );
 const _: () = assert!(
@@ -343,6 +345,24 @@ const _: () = assert!(
 );
 
 pub const PK_LIST_PACKED_FLAG: u64 = 1 << 63;
+
+/// Directive bit riding the FLAG_HAS_PK `seek_col_idx` word next to the packed
+/// column list: the worker's secondary-index arm answers each matched probe with
+/// the **stored** index entry key `[span ‖ holder PK]` instead of echoing the
+/// probe key, so the caller learns which committed row holds the span without a
+/// second round trip. It rides the column-list word rather than `wire_flags` so
+/// the dispatch arms that forward the list forward the directive with it.
+/// [`pk_cols_word`] masks it off; the guard above keeps bit 62 clear of every
+/// packed field, so that mask recovers the column list exactly.
+pub const HAS_PK_WANT_HOLDER: u64 = 1 << 62;
+
+/// The packed column list carried in a `seek_col_idx`, with the directive bits
+/// that ride alongside it stripped. The one place that knows which bits are not
+/// part of the list, so a decoder never has to spell the mask itself.
+#[inline]
+pub fn pk_cols_word(seek_col_idx: u64) -> u64 {
+    seek_col_idx & !HAS_PK_WANT_HOLDER
+}
 
 /// Decoded PK column list — backing storage sized to `PK_LIST_MAX_COLS`
 /// entries. `decoded_count()` returns the raw decoded count from the wire

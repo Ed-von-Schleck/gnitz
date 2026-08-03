@@ -47,8 +47,8 @@ impl CatalogEngine {
     }
 
     /// Get index circuit info at index: (col_indices, is_unique). Production
-    /// consumers go through `unique_index_circuit_cols` / `index_circuit_for_cols`;
-    /// only the catalog tests enumerate raw circuit info.
+    /// consumers go through `index_circuits` / `index_circuit_for_cols`; only
+    /// the catalog tests enumerate raw circuit info.
     #[cfg(test)]
     pub(crate) fn get_index_circuit_info(&self, table_id: i64, idx: usize) -> Option<(PkColList, bool)> {
         let entry = self.dag.tables.get(&table_id)?;
@@ -56,31 +56,19 @@ impl CatalogEngine {
         Some((ic.col_indices, ic.is_unique))
     }
 
-    /// The source column list of the unique circuit at position `idx`, `None`
-    /// when the circuit is missing or non-unique. The unique-enforcement
-    /// machinery (routing cache, filters, has_pk pre-checks) iterates circuits
-    /// through this single accessor — see `IndexCircuitEntry::unique_cols`. The
-    /// slice has length ≥ 1 (composite UNIQUE yields the full ordered list).
-    pub fn unique_index_circuit_cols(&self, table_id: i64, idx: usize) -> Option<&[u32]> {
-        self.dag.tables.get(&table_id)?.index_circuits.get(idx)?.unique_cols()
-    }
-
     /// Get index store handle for an exact column list (for worker has_pk via
-    /// a unique index, single- or multi-column).
+    /// a secondary index, single- or multi-column, unique or not).
     pub(crate) fn get_index_store_handle(&self, table_id: i64, cols: &[u32]) -> *const Table {
         self.index_circuit_for_cols(table_id, cols)
             .map(|ic| ic.table_mut() as *const Table)
             .unwrap_or(std::ptr::null())
     }
 
-    /// The secondary index circuit on `col_idx` of `table_id`, if one exists.
-    /// Single source of truth for "does this column have an index, and is it
-    /// unique": the SEEK_BY_INDEX handler matches the `Option` once — `None`
-    /// answers STATUS_NO_INDEX (so the SQL planner falls back to a scan or a
-    /// CREATE INDEX hint without a prior catalog probe), `Some(ic)` routes by
-    /// `ic.is_unique` (unicast a unique match to one worker, broadcast-and-merge
-    /// a non-unique one). Returning the entry means callers scan the circuit
-    /// list once and cannot ask whether a non-existent index is unique.
+    /// The secondary index circuit on `cols` of `table_id`, if one exists.
+    /// Single source of truth for "does this column list have an index": the
+    /// SEEK_BY_INDEX handler matches the `Option` once — `None` answers
+    /// STATUS_NO_INDEX (so the SQL planner falls back to a scan or a CREATE INDEX
+    /// hint without a prior catalog probe), `Some` broadcasts the seek.
     pub fn index_circuit_for_cols(&self, table_id: i64, cols: &[u32]) -> Option<&crate::query::IndexCircuitEntry> {
         self.dag
             .tables

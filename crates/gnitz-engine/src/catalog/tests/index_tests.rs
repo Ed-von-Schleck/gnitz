@@ -1932,6 +1932,9 @@ fn write_span_matches_the_oracle_on_compound_null_and_entry_shapes() {
 
     let mb = b.as_mem_batch();
     let stride = src.pk_stride() as usize;
+    // The width `IndexKeySpec::split_entry` splits a stored entry at: the index
+    // stride is exactly span + source PK, so the two halves are the whole entry.
+    assert_eq!(idx.pk_stride() as usize, spec.key_size() + stride);
     for row in 0..b.count {
         let mut got = [0u8; MAX_PK_BYTES];
         let g = spec.write_span(&mb, row, &mut got);

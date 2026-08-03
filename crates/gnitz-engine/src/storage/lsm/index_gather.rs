@@ -220,8 +220,6 @@ impl BoundedIndexCursor {
     /// use between chunks. It must be the store `src` was built over.
     pub(crate) fn drain_chunk(&mut self, store: &PartitionedTable, n: usize) -> Option<Batch> {
         self.pks.clear();
-        let idx_key_size = self.spec.key_size();
-        let src_pk_stride = self.src_schema.pk_stride() as usize;
         while !self.done && self.idx.valid && self.pks.len() < n {
             let cur = self.idx.current_pk_bytes();
             if self.end.as_ref().is_some_and(|e| cur >= e.pk_bytes()) {
@@ -233,8 +231,7 @@ impl BoundedIndexCursor {
             // entry and inserts the new one, so a range spanning both values sees
             // the old key at net weight 0 and collects the source PK exactly once.
             if self.idx.current_weight > 0 {
-                self.pks
-                    .push(PkBuf::from_bytes(&cur[idx_key_size..idx_key_size + src_pk_stride]));
+                self.pks.push(PkBuf::from_bytes(self.spec.split_entry(cur).1));
             }
             self.idx.advance();
         }

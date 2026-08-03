@@ -62,9 +62,9 @@ impl IndexCircuitEntry {
         unsafe { &mut *self.index_table.get() }
     }
 
-    /// The source column list of a unique circuit, `None` for a non-unique one.
-    /// The single accessor for the unique-enforcement machinery (filters,
-    /// routing cache, has_pk pre-checks). The returned slice has length ≥ 1: a
+    /// The source column list of a unique circuit, `None` for a non-unique one
+    /// — the accessor DDL validation reads a unique circuit's columns through.
+    /// The returned slice has length ≥ 1: a
     /// single-column unique index yields a 1-element list, a composite
     /// `UNIQUE (a, b, …)` the full ordered list. Order is significant (it drives
     /// the leading-key span encoding and prefix seeks).

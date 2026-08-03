@@ -1576,7 +1576,7 @@ async fn resolve_read_target(shared: &Rc<Shared>, peer: &Peer, client_id: u64, t
 /// Decode `seek_col_idx` (`pack_pk_cols(col_indices)` — the packed flag at bit
 /// 63 is always set, so the old `col_idx as usize >= num_columns` guard would
 /// always trip) and validate the full list against the table's schema before
-/// classifying. Shared by the SEEK_BY_INDEX and SEEK_BY_INDEX_RANGE handlers.
+/// classifying. Used by the SEEK_BY_INDEX handler.
 fn validated_index_cols(
     shared: &Rc<Shared>,
     target_id: i64,
@@ -1613,49 +1613,23 @@ async fn handle_seek_by_index(
                 return;
             }
         };
-        // Single catalog scan classifies the column list (exact list match). The
-        // uniqueness flag is copied out immediately (`Option<bool>`), so no
-        // catalog borrow is held across the await in the no-index arm.
-        let is_unique = match shared
+        // Single catalog scan (exact list match) answers "is there an index for
+        // this column list"; the borrow ends with the condition, so none is held
+        // across the await below.
+        if shared
             .cat()
             .index_circuit_for_cols(target_id, cols.as_slice())
-            .map(|ic| ic.is_unique)
+            .is_none()
         {
-            Some(u) => u,
-            None => {
-                // No secondary index for this column list: a dedicated
-                // control-only status, caught here with zero worker dispatch, so
-                // the SQL planner falls back to a scan or a CREATE INDEX hint
-                // without a prior catalog probe.
-                send_control_only(peer, target_id, client_id, STATUS_NO_INDEX).await;
-                return;
-            }
-        };
-        if is_unique && cols.as_slice().len() == 1 {
-            // Single-column unique index: the seek supplies exactly one value
-            // (seek_pk_extra empty), at most one match on a single worker —
-            // forward that worker's slot directly (1 round-trip, keeping the
-            // unicast-on-cache-hit routing) instead of broadcasting.
-            match MasterDispatcher::fan_out_seek_by_index(
-                shared.dispatcher,
-                &shared.reactor,
-                &shared.sal_writer_excl,
-                target_id,
-                cols.as_slice()[0],
-                seek_pk,
-            )
-            .await
-            {
-                Ok(slot) => peer.send_slot_or_close(slot).await,
-                Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
-            }
+            // No secondary index for this column list: a dedicated control-only
+            // status, caught here with zero worker dispatch, so the SQL planner
+            // falls back to a scan or a CREATE INDEX hint without a prior catalog
+            // probe.
+            send_control_only(peer, target_id, client_id, STATUS_NO_INDEX).await;
             return;
         }
-        // Composite unique (no composite routing cache) OR non-unique (any
-        // arity): the matching rows are scattered across workers, so broadcast
-        // and merge all matches into one response (a composite unique seek
-        // matches at most one row — merging one is correct). Forward the wire
-        // frame verbatim (packed seek_col_idx, seek_pk + seek_pk_extra).
+        // Forward the wire frame verbatim (packed seek_col_idx, seek_pk +
+        // seek_pk_extra) to the broadcast-and-merge fan-out.
         match MasterDispatcher::fan_out_seek_by_index_collect(
             shared.dispatcher,
             &shared.reactor,

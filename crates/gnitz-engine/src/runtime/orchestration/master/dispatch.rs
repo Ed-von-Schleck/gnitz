@@ -2,7 +2,6 @@
 //! writes, worker signalling + ack collection, relay emit, the fan-out family
 //! (seek / scan / index / gather), checkpointing, and the scan-fanout helpers.
 
-use super::index_router::index_route_key;
 use super::*;
 use crate::foundation::fault::Seam;
 use crate::runtime::sal::MAX_WORKERS;
@@ -102,7 +101,6 @@ impl MasterDispatcher {
             w2m: Some(w2m),
             w2m_ptr: std::ptr::null(),
             catalog,
-            router: PartitionRouter::new(),
             unique_filters: FxHashMap::default(),
             check_batch_pool: FxHashMap::default(),
         }
@@ -738,49 +736,6 @@ impl MasterDispatcher {
         Ok(())
     }
 
-    fn record_index_routing(
-        &mut self,
-        target_id: i64,
-        schema: &SchemaDescriptor,
-        source_batch: &Batch,
-        worker_indices: &[Vec<u32>],
-    ) {
-        let cat = unsafe { &mut *self.catalog };
-        let n_idx = cat.get_index_circuit_count(target_id);
-        if n_idx == 0 {
-            return;
-        }
-
-        for ci in 0..n_idx {
-            // The routing cache is keyed (table, col, u128); only SINGLE-COLUMN
-            // unique circuits populate it. A composite unique seek
-            // broadcasts-and-merges instead — widening the cache's unbounded
-            // per-distinct-value map to composite `PkBuf` keys would grow every
-            // entry ~5× for the dominant single-column population — so its
-            // routing is never recorded.
-            let col_idx = match cat.unique_index_circuit_cols(target_id, ci) {
-                Some(c) if c.len() == 1 => c[0],
-                _ => continue,
-            };
-            // `col_idx` is a registered single-column unique index, so it is always
-            // an integer/U128/UUID column: `index_key_type` rejects STRING/BLOB (and
-            // floats) as secondary-index columns at registration, so no string-keyed
-            // circuit reaches here to record.
-            for (w, wi) in worker_indices[..self.num_workers].iter().enumerate() {
-                if !wi.is_empty() {
-                    self.router.record_routing_from_source(
-                        source_batch,
-                        wi,
-                        schema,
-                        target_id as u32,
-                        col_idx,
-                        w as u32,
-                    );
-                }
-            }
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Fan-out operations
     // -----------------------------------------------------------------------
@@ -889,92 +844,23 @@ impl MasterDispatcher {
         .await
     }
 
-    pub async fn fan_out_seek_by_index(
-        disp_ptr: *mut MasterDispatcher,
-        reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex>,
-        target_id: i64,
-        col_idx: u32,
-        key: u128,
-    ) -> Result<W2mSlot, String> {
-        // A REPLICATED owner holds an identical full copy on every worker, so
-        // worker 0 always answers a single-column unique seek — skip the routing
-        // cache and its broadcast-on-miss fallback (which would fire `nw`
-        // identical B-tree seeks and forward one slot). Otherwise probe the
-        // routing cache. It is keyed by the OPK-widened `extract_col_key` image,
-        // but `key` is the native seek value: transform it into the stored
-        // representation before probing — a raw native query always misses for
-        // signed integers (and could spuriously hit a different value's
-        // OPK-widened key).
-        let routed = if replicated_unicast(disp_ptr, target_id) >= 0 {
-            0
-        } else {
-            unsafe {
-                let schema = (*(*disp_ptr).catalog).get_schema_desc(target_id);
-                match schema.and_then(|s| index_route_key(&s, col_idx, key)) {
-                    Some(rk) => (*disp_ptr).router.worker_for_index_key(target_id as u32, col_idx, rk),
-                    None => -1,
-                }
-            }
-        };
-        if routed >= 0 {
-            return single_worker(
-                disp_ptr,
-                reactor,
-                sal_excl,
-                target_id,
-                FLAG_SEEK_BY_INDEX,
-                routed as usize,
-                key,
-                col_idx as u64,
-                "seek_by_index",
-                &[],
-            )
-            .await;
-        }
-
-        // Cache miss: broadcast to all workers with per-worker req_ids and
-        // forward the slot whose worker found a row (or slot 0 if none).
-        // `_lease` keeps the scan active across the single-frame inspection
-        // below; its workers also stream, so dropping it early would let the
-        // gate discard a late frame.
-        let (mut slots, _req_ids, _lease) =
-            dispatch_scan_fanout(disp_ptr, reactor, sal_excl, -1, |disp, req_ids, unicast| {
-                disp.write_command_group(
-                    target_id,
-                    0,
-                    FLAG_SEEK_BY_INDEX,
-                    0,
-                    key,
-                    col_idx as u64,
-                    req_ids,
-                    unicast,
-                    0,
-                    &[],
-                )
-            })
-            .await?;
-
-        let mut data_idx = None;
-        for (w, slot) in slots.iter().enumerate() {
-            // Inspect-and-forward exactly one slot per worker: a unique
-            // single-column seek returns at most one row per worker.
-            let ctrl = expect_single_frame(slot, w, "seek_by_index")?;
-            if ctrl.flags & FLAG_HAS_DATA != 0 {
-                data_idx = Some(w);
-            }
-        }
-        Ok(slots.swap_remove(data_idx.unwrap_or(0)))
-    }
-
-    /// SELECT-path index lookup: broadcast to ALL workers and MERGE every
-    /// matching base row into one batch.
+    /// Index lookup: fan one frame out to ALL workers and MERGE every matching
+    /// base row into one batch via the train drain (an oversized worker reply
+    /// arrives as a chunked train; a single-frame reply is a length-1 train).
+    /// Returns the merged base rows, or `None` when no row matches.
     ///
-    /// A non-unique indexed value matches rows scattered across workers (the
-    /// per-key routing cache is only populated for unique indexes), so unlike
-    /// `fan_out_seek_by_index` (which returns a single worker's slot, used
-    /// by the UPSERT identity check where the index is unique) this must
-    /// aggregate. Returns the merged base rows, or `None` when no row matches.
+    /// The sole index-seek fan-out — a secondary index is one unpartitioned
+    /// table per worker, so nothing derives the owning worker from an indexed
+    /// value and every arity, unique or not, must ask all of them. A unique
+    /// index matches at most one row, so merging one is correct.
+    ///
+    /// The master forwards the client's wire payload verbatim — it never
+    /// decodes seek_pk_extra into u128s and re-encodes them (the worker is
+    /// the sole OPK encoder). seek_col_idx carries pack_pk_cols(col_indices),
+    /// already validated by the caller.
+    /// `_lease` held across the full drain: its workers stream, so releasing
+    /// the gate before every train is consumed (or the drain errors and the
+    /// lease drop discards the rest) risks a discarded late frame.
     pub async fn fan_out_seek_by_index_collect(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
@@ -984,45 +870,7 @@ impl MasterDispatcher {
         seek_pk: u128,
         seek_pk_extra: &[u8],
     ) -> Result<Option<Batch>, String> {
-        Self::fan_out_index_collect_common(
-            disp_ptr,
-            reactor,
-            sal_excl,
-            target_id,
-            FLAG_SEEK_BY_INDEX,
-            seek_pk,
-            seek_col_idx,
-            seek_pk_extra,
-            "seek_by_index",
-        )
-        .await
-    }
-
-    /// Shared skeleton of the broadcast-and-merge index seek:
-    /// fan one frame out to ALL workers under `sal_flag` and merge every
-    /// worker's matching base rows into one batch via the train drain
-    /// (an oversized worker reply arrives as a chunked train; a single-frame
-    /// reply is a length-1 train).
-    ///
-    /// The master forwards the client's wire payload verbatim — it never
-    /// decodes seek_pk_extra into u128s and re-encodes them (the worker is
-    /// the sole OPK encoder). seek_col_idx carries pack_pk_cols(col_indices),
-    /// already validated by the caller.
-    /// `_lease` held across the full drain: its workers stream, so releasing
-    /// the gate before every train is consumed (or the drain errors and the
-    /// lease drop discards the rest) risks a discarded late frame.
-    #[allow(clippy::too_many_arguments)]
-    async fn fan_out_index_collect_common(
-        disp_ptr: *mut MasterDispatcher,
-        reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex>,
-        target_id: i64,
-        sal_flag: u32,
-        seek_pk: u128,
-        seek_col_idx: u64,
-        seek_pk_extra: &[u8],
-        op: &str,
-    ) -> Result<Option<Batch>, String> {
+        const OP: &str = "seek_by_index";
         // `expected` is captured inside the fan-out closure so the reply
         // guard is definitionally the schema the request was built from; a
         // separate pre-fanout catalog read could diverge across the
@@ -1042,7 +890,7 @@ impl MasterDispatcher {
                 disp.write_command_group(
                     target_id,
                     0,
-                    sal_flag,
+                    FLAG_SEEK_BY_INDEX,
                     0,
                     seek_pk,
                     seek_col_idx,
@@ -1057,7 +905,7 @@ impl MasterDispatcher {
 
         let mut acc: Option<Batch> = None;
         let mut merged_bytes = 0usize;
-        drain_index_scan(slots, &req_ids, reactor, op, &expected, |mb, frame_len| {
+        drain_index_scan(slots, &req_ids, reactor, OP, &expected, |mb, frame_len| {
             // The merge goes back out as one frame, so it is bounded by what the
             // client will read (`FRAME_CAP`). Σ frame bytes ≥ that merged encode
             // size — every frame re-counts its header and the first one the schema
@@ -1066,7 +914,7 @@ impl MasterDispatcher {
             merged_bytes += frame_len;
             if merged_bytes > crate::runtime::wire::FRAME_CAP {
                 return Err(format!(
-                    "{op}: result exceeds the {} MiB reply cap; add a tighter \
+                    "{OP}: result exceeds the {} MiB reply cap; add a tighter \
                      predicate or LIMIT",
                     crate::runtime::wire::FRAME_CAP >> 20
                 ));
@@ -1078,63 +926,6 @@ impl MasterDispatcher {
         .await?;
         // The sink runs only for non-empty frames, so `Some` implies rows.
         Ok(acc)
-    }
-
-    /// Resolve the committed holder of a unique index value: seek the index by
-    /// the value's native per-column keys and return the holder's source PK (or
-    /// `None`). Used by the UPSERT verify, which must confirm a colliding
-    /// committed value is held by the same row (or a row releasing it in this
-    /// batch); the caller decodes the OPK span to `natives` via
-    /// `span_to_natives`.
-    ///
-    /// Arity gates the routing: a single-column unique seek keeps the unicast
-    /// routing-cache fast path (the common same-PK upsert whose value is
-    /// unchanged lands here, so it is hot); a composite unique seek
-    /// broadcasts-and-merges (the routing cache stays single-column — see
-    /// `record_index_routing`), with the trailing native values riding
-    /// `seek_pk_extra` as 16-byte LE slots, the exact wire form the worker's
-    /// SeekByIndex handler reassembles. A unique index yields at most one
-    /// holder, so merging one row is correct.
-    pub(super) async fn seek_unique_holder(
-        disp_ptr: *mut MasterDispatcher,
-        reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex>,
-        target_id: i64,
-        col_indices: PkColList,
-        natives: [u128; gnitz_wire::PK_LIST_MAX_COLS],
-    ) -> Result<Option<PkBuf>, String> {
-        let cols = col_indices.as_slice();
-        if cols.len() == 1 {
-            // single-column unique: unicast to the one owning worker (routing cache).
-            let slot = Self::fan_out_seek_by_index(disp_ptr, reactor, sal_excl, target_id, cols[0], natives[0]).await?;
-            let ctrl = peek_control_block(slot.bytes()).map_err(|e| e.to_string())?;
-            if ctrl.flags & FLAG_HAS_DATA == 0 {
-                return Ok(None);
-            }
-            let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(slot.bytes(), ctrl, None).map_err(|e| e.to_string())?;
-            Ok(zc
-                .data_batch
-                .filter(|b| b.count > 0)
-                .map(|b| PkBuf::from_bytes(b.get_pk_bytes(0))))
-        } else {
-            // composite unique: broadcast-and-merge. natives[0] → seek_pk;
-            // natives[1..] → 16-byte LE slots in seek_pk_extra.
-            let mut extra = [0u8; (gnitz_wire::PK_LIST_MAX_COLS - 1) * 16];
-            for (slot, &v) in extra.chunks_exact_mut(16).zip(&natives[1..cols.len()]) {
-                slot.copy_from_slice(&v.to_le_bytes());
-            }
-            let batch = Self::fan_out_seek_by_index_collect(
-                disp_ptr,
-                reactor,
-                sal_excl,
-                target_id,
-                gnitz_wire::pack_pk_cols(cols),
-                natives[0],
-                &extra[..(cols.len() - 1) * 16],
-            )
-            .await?;
-            Ok(batch.map(|b| PkBuf::from_bytes(b.get_pk_bytes(0))))
-        }
     }
 
     /// Fan out a SCAN — to all workers (`unicast == -1`), or to ONE worker
@@ -1402,8 +1193,7 @@ impl MasterDispatcher {
     /// The exact SAL footprint (bytes) of a transaction's family groups — the sum
     /// over families of each family group's `wire_group_footprint`, partitioned
     /// the way `write_commit_group` will emit it (broadcast for a replicated
-    /// schema, else PK-partitioned). Side-effect-free: it skips
-    /// `record_index_routing`, which belongs only to real emission.
+    /// schema, else PK-partitioned).
     fn txn_zone_footprint(&mut self, families: &[(i64, &Batch)]) -> usize {
         let nw = self.num_workers;
         let mut total = 0usize;
@@ -1440,7 +1230,6 @@ impl MasterDispatcher {
         // call site keeps the atomic-zone framing, LSN, ACK accounting, and the
         // committer's single `fdatasync` shared between them.
         let scatter = |worker_indices: &[Vec<u32>]| {
-            self.record_index_routing(target_id, &schema, batch, worker_indices);
             self.sal.scatter_wire_group(
                 batch,
                 worker_indices,

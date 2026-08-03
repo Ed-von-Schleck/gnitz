@@ -191,9 +191,8 @@ pub(super) fn scatter_is_pk_routed(col_indices: &[u32], target_tcs: &[u8], schem
 /// different hash domain with no promotion concept.
 ///
 /// Weight-0 rows are dropped: they are not Z-set elements, and a client is free
-/// to send one. Filtering here rather than by rebuilding the batch keeps every
-/// index consumer — the SAL emit, the transaction fit check that sizes it, and
-/// the unique-index routing cache — reading the same row set for free.
+/// to send one. Filtering here rather than by rebuilding the batch means every
+/// consumer of these indices reads the same row set for free.
 fn fill_worker_indices(batch: &Batch, schema: &SchemaDescriptor, num_workers: usize, out: &mut Vec<Vec<u32>>) {
     let mb = batch.as_mem_batch();
     let w_map = build_w_map(num_workers);

@@ -433,6 +433,17 @@ impl PkBuf {
         }
     }
 
+    /// In-place [`Self::from_bytes`]: overwrite this key with `src`. Reuses the
+    /// buffer instead of re-zeroing and re-copying the whole `MAX_PK_BYTES`
+    /// array, and keeps the zero tail (`set_len` clears whatever a wider
+    /// previous key left behind).
+    #[inline]
+    pub(crate) fn set_from(&mut self, src: &[u8]) {
+        debug_assert!(src.len() <= MAX_PK_BYTES);
+        self.bytes[..src.len()].copy_from_slice(src);
+        self.set_len(src.len());
+    }
+
     /// `&self.bytes[..len]` — the OPK bytes of this bound. After the
     /// OPK-at-rest flip all PK comparison and range logic operates on these
     /// raw order-preserving bytes (`compare_pk_bytes` / `pack_pk_be`), so this
@@ -609,6 +620,16 @@ impl IndexKeySpec {
         let pk = mb.get_pk_bytes(row);
         dst[self.key_size()..self.key_size() + pk.len()].copy_from_slice(pk);
         true
+    }
+
+    /// Split a stored index entry back into `(span, source PK)` — the read-side
+    /// inverse of [`Self::write_entry`], which put the PK at `key_size()`. The
+    /// split is exact by layout (an index schema is the promoted indexed columns
+    /// followed by the source PK columns, so its stride is `key_size() +
+    /// src_pk_stride`), so nothing is decoded.
+    pub(crate) fn split_entry<'a>(&self, entry: &'a [u8]) -> (&'a [u8], &'a [u8]) {
+        debug_assert!(entry.len() > self.key_size(), "index entry shorter than its span");
+        entry.split_at(self.key_size())
     }
 
     /// `write_span` into a caller-reused `PkBuf` — no intermediate stack
