@@ -330,7 +330,6 @@ fn opcode_name(op: u64) -> &'static str {
         gnitz_wire::OPCODE_MAP_PROJ => "MAP_PROJ",
         gnitz_wire::OPCODE_MAP_EXPR => "MAP_EXPR",
         gnitz_wire::OPCODE_MAP_HASH_ROW => "MAP_HASH_ROW",
-        gnitz_wire::OPCODE_SCAN_TRACE_TABLE => "SCAN_TRACE_TABLE",
         gnitz_wire::OPCODE_JOIN_DELTA_TRACE_RANGE => "JOIN_DELTA_TRACE_RANGE",
         gnitz_wire::OPCODE_PARTITION_FILTER => "PARTITION_FILTER",
         gnitz_wire::OPCODE_POSITIVE_PART => "POSITIVE_PART",
@@ -500,10 +499,10 @@ pub fn canonical_circuit_dump(client: &mut GnitzClient, final_vid: u64, base_tab
             let vid = circuit_row_vid(&b, i);
             let nid = circuit_u64(&b, 2, i);
             let opcode = circuit_u64(&b, 3, i);
-            // Only `Scan*` leaves (opcodes 11 / 31) carry a source_table
-            // (`encode_op_node`); reading col 4 solely for them sidesteps the
+            // Only the `ScanDelta` leaf (opcode 11) carries a source_table
+            // (`encode_op_node`); reading col 4 solely for it sidesteps the
             // nullable-column read entirely.
-            let src = if opcode == gnitz_wire::OPCODE_SCAN_DELTA || opcode == gnitz_wire::OPCODE_SCAN_TRACE_TABLE {
+            let src = if opcode == gnitz_wire::OPCODE_SCAN_DELTA {
                 Some(circuit_u64(&b, 4, i))
             } else {
                 None

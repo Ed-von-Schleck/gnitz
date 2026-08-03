@@ -258,22 +258,20 @@ impl CatalogEngine {
     ///     committed checkpoint generation — `worker_ctx::committed_generation()`,
     ///     the in-memory recovered `G`, NOT the recovery-start-bumped durable
     ///     `G+1` — matching what `Table::new`'s conditional load peeks; and
-    ///   * every VIEW it scans (ScanDelta cascade dep OR ScanTrace static
-    ///     `ext_trace` read) is itself valid — else it could read a rebuilt
+    ///   * every VIEW it scans is itself valid — else it could read a rebuilt
     ///     sibling's freshly-emptied output store.
     ///
     /// Two phases. Phase 1 decides each view's **local** validity (topology +
     /// output manifests). Phase 2 propagates invalidity to any view scanning an
-    /// invalid source, iterating to a fixpoint — robust to arbitrary source
-    /// orderings, including a `ScanTrace`-of-view (not a cascade dependency, so its
-    /// `depth` need not sit below its reader's).
+    /// invalid source, walking the views in dependency order so one pass reaches
+    /// the whole cascade.
     ///
     /// Output manifests are enumerated by **store shape**: an unhashed store has
     /// one child per launched worker, homed at that worker's rank; a hashed store
     /// spreads over all 256 partitions. The two grammars are disjoint, so a view
     /// whose shape flipped since its checkpoint finds no manifest at all and is
     /// rebuilt.
-    pub fn compute_invalid_views(&self, launched_workers: u32) -> FxHashSet<i64> {
+    pub fn compute_invalid_views(&mut self, launched_workers: u32) -> FxHashSet<i64> {
         self.assert_pre_fork_full_range("compute_invalid_views");
         let g = crate::foundation::worker_ctx::committed_generation();
         let topo_value = crate::storage::topology_word(launched_workers);
@@ -300,30 +298,17 @@ impl CatalogEngine {
         }
         if invalid.is_empty() {
             // Clean same-topology restart: nothing to propagate, skip the
-            // meta-circuit loads below.
+            // dependency-map reads below.
             return invalid;
         }
 
         // Phase 2: propagate invalidity to any still-valid view that scans an
-        // invalid source (ScanDelta or ScanTrace). Base sources never enter
-        // `invalid`, so they pass. Fixpoint over the (finite) view set; each
-        // view's scan sources are loaded once up front (`all_scan_source_ids`
-        // reads the meta circuit off the system tables).
-        let scan_sources: Vec<(i64, Vec<i64>)> = view_ids
-            .iter()
-            .filter(|vid| !invalid.contains(vid))
-            .map(|&vid| (vid, self.dag.all_scan_source_ids(vid)))
-            .collect();
-        loop {
-            let mut changed = false;
-            for (vid, sources) in &scan_sources {
-                if !invalid.contains(vid) && sources.iter().any(|s| invalid.contains(s)) {
-                    invalid.insert(*vid);
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
+        // invalid source. Base sources never enter `invalid`, so they pass. A
+        // source view precedes every view scanning it in `order_by_view_deps`,
+        // so a single pass carries invalidity down the whole chain.
+        for vid in self.dag.order_by_view_deps(&view_ids) {
+            if !invalid.contains(&vid) && self.dag.get_source_ids(vid).iter().any(|s| invalid.contains(s)) {
+                invalid.insert(vid);
             }
         }
         invalid

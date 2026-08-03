@@ -586,8 +586,8 @@ never re-derived from the base. A full rebuild from base
 per-view verdict (`compute_invalid_views`, master pre-fork) resumes a view iff
 the recorded topology matches the launched `(worker_count, STATE_FORMAT)`, every one of its
 output-partition manifests is at the committed generation, and every view it
-scans (ScanDelta cascade dep or ScanTrace `ext_trace`) is itself valid; else it
-is reset (on the workers) and rebuilt. Recovery is **non-windowed**: the
+scans (its `ScanDelta` cascade deps) is itself valid; else it is reset (on the
+workers) and rebuilt. Recovery is **non-windowed**: the
 un-checkpointed SAL tail is replayed once and applied by one master-driven tick
 sweep on a freshly-reset SAL, so peak recovery RAM is ~(effective tail)/W per
 worker (≈1.5 GiB only at W=1). A **recovery-start generation bump** (durably

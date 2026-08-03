@@ -2,7 +2,7 @@
 //! compiled shape runs through, and the DAG evaluation driver.
 
 use super::*;
-use crate::query::compiler::{ExtCursorScratch, PlanShape};
+use crate::query::compiler::PlanShape;
 
 pub(super) struct PendingEntry {
     pub depth: i32,
@@ -55,7 +55,7 @@ impl DagEngine {
         }
         let plan = self.cache.get_mut(&view_id).unwrap();
         match &mut plan.shape {
-            PlanShape::Single(sub) => Self::execute_sub_plan(view_id, sub, &self.tables, input, src_id),
+            PlanShape::Single(sub) => Self::execute_sub_plan(sub, input, src_id),
             PlanShape::Exchanged { sides, post } => {
                 // A unary side takes every delta; a set-op side takes it iff it
                 // scans the delta's source (`a UNION a` — both sides scan one
@@ -78,7 +78,7 @@ impl DagEngine {
                         } else {
                             input.as_ref().unwrap().clone_batch()
                         };
-                        let mut pre = Self::execute_sub_plan(view_id, &mut side.plan, &self.tables, delta, src_id)
+                        let mut pre = Self::execute_sub_plan(&mut side.plan, delta, src_id)
                             .unwrap_or_else(|| Batch::empty_with_schema(&schema));
                         // Label with the side's pre-exchange output schema for
                         // the wire encode (never the view's combine-widened
@@ -98,7 +98,7 @@ impl DagEngine {
                     post.vm.clear_deltas();
                     return None;
                 }
-                Self::execute_sub_plan_multi(view_id, post, &self.tables, seeds)
+                Self::execute_sub_plan_multi(post, seeds)
             }
         }
     }
@@ -139,46 +139,19 @@ impl DagEngine {
         }
     }
 
-    /// Execute one sub-pipeline epoch, seeding one register per input. Takes
-    /// the sub-plan by mutable reference (to reach the VM's regfile and
-    /// owned-cursor state) and the engine's table map by shared reference (for
-    /// external-trace cursor construction); both come from different fields of
-    /// `DagEngine`, so callers hold them as independent borrows.
-    fn execute_sub_plan_multi(
-        view_id: i64,
-        sub: &mut SubPlan,
-        tables: &FxHashMap<i64, TableEntry>,
-        inputs: impl IntoIterator<Item = (u16, Batch)>,
-    ) -> Option<Batch> {
-        let SubPlan {
-            vm,
-            out_reg,
-            ext_trace_regs,
-            ext_cursors,
-            ..
-        } = sub;
-        Self::fill_ext_cursors(tables, ext_trace_regs, vm.program.reg_meta.len(), ext_cursors);
+    /// Execute one sub-pipeline epoch, seeding one register per input. Takes the
+    /// sub-plan by mutable reference, to reach the VM's regfile and owned-cursor
+    /// state.
+    fn execute_sub_plan_multi(sub: &mut SubPlan, inputs: impl IntoIterator<Item = (u16, Batch)>) -> Option<Batch> {
+        let SubPlan { vm, out_reg, .. } = sub;
         vm.refresh_owned_cursors();
-        let r = vm::execute_epoch_multi(&vm.program, &mut vm.regfile, inputs, *out_reg, &ext_cursors.ptrs);
-        // Drop the external cursors at epoch end (buffer capacity is retained):
-        // holding them across ticks would pin memtable snapshots and shard
-        // mmaps of the scanned base tables. The registers' cursor pointers are
-        // rebound from fresh handles at the next epoch's start, before any deref.
-        ext_cursors.cursors.clear();
-        ext_cursors.ptrs.clear();
-        Self::vm_epoch_result(view_id, r)
+        vm::execute_epoch_multi(&vm.program, &mut vm.regfile, inputs, *out_reg)
     }
 
     /// Single-input sub-pipeline epoch. `source_id > 0` selects the input
     /// register from the sub-plan's `source_reg_map`; pass `0` when the
     /// sub-plan has a single unambiguous input.
-    fn execute_sub_plan(
-        view_id: i64,
-        sub: &mut SubPlan,
-        tables: &FxHashMap<i64, TableEntry>,
-        input: Batch,
-        source_id: i64,
-    ) -> Option<Batch> {
+    fn execute_sub_plan(sub: &mut SubPlan, input: Batch, source_id: i64) -> Option<Batch> {
         // Empty placeholder epoch (multi-worker lockstep fans one to every
         // dependent edge every tick): unless the program can emit from an
         // empty input, skip the whole VM pass — cursor refresh + compaction
@@ -193,40 +166,7 @@ impl DagEngine {
         } else {
             sub.in_reg
         };
-        Self::execute_sub_plan_multi(view_id, sub, tables, std::iter::once((in_reg, input)))
-    }
-
-    /// Fill the reusable ext-cursor buffers: one fresh cursor per external
-    /// trace register, its raw pointer indexed by register ID in `ptrs`.
-    fn fill_ext_cursors(
-        tables: &FxHashMap<i64, TableEntry>,
-        ext_trace_regs: &[(u16, i64)],
-        num_regs: usize,
-        scratch: &mut ExtCursorScratch,
-    ) {
-        debug_assert!(scratch.ptrs.is_empty() && scratch.cursors.is_empty());
-        scratch.ptrs.resize(num_regs, std::ptr::null_mut());
-        for &(reg_id, table_id) in ext_trace_regs {
-            if let Some(entry) = tables.get(&table_id) {
-                // External-trace reads are the operator-state read path:
-                // compact first so L0 on intermediate/trace tables stays
-                // bounded (no background compactor yet). A compaction Err
-                // leaves the shard index unchanged; the cursor still opens
-                // on a consistent snapshot.
-                let _ = entry.handle.compact_if_needed();
-                scratch.cursors.push(Box::new(entry.handle.open_cursor()));
-                if (reg_id as usize) < num_regs {
-                    // Derive the raw pointer AFTER the move, from the box's
-                    // stable heap address inside the scratch. Deriving it from
-                    // a local Box and then moving the box would invalidate it
-                    // under Stacked/Tree Borrows. The ReadCursor heap
-                    // allocation is stable across later Vec growth, so the
-                    // pointer remains valid.
-                    let p = scratch.cursors.last_mut().unwrap().as_mut() as *mut ReadCursor;
-                    scratch.ptrs[reg_id as usize] = p;
-                }
-            }
-        }
+        Self::execute_sub_plan_multi(sub, std::iter::once((in_reg, input)))
     }
 
     /// Sort+weight-merge a post-exchange batch for the post phase's merge-walk
@@ -242,33 +182,6 @@ impl DagEngine {
     /// Sorted/Consolidated claim folds or passes through.
     fn consolidate_exchanged(batch: Batch, schema: &SchemaDescriptor) -> Batch {
         batch.into_consolidated(schema)
-    }
-
-    /// Normalize a VM epoch result into the DAG's `Option<Batch>` convention:
-    /// a positive-count batch, or `None` for an empty epoch.
-    ///
-    /// A VM `Err` is an unrecoverable internal-invariant violation — every
-    /// `VmError` means a Reduce trace cursor the compiler promised is unbound,
-    /// i.e. the compiled circuit is malformed. Every VM operator is otherwise
-    /// infallible, so there is no data- or query-level fault to surface.
-    /// Continuing would drop the delta and permanently desync the view's
-    /// integral (and in multi-worker, a skipped exchange round deadlocks the
-    /// cluster), so we fail stop. In multi-worker the master's `watchdog` reaps
-    /// the exited worker and tears the tick down; single-worker exits the
-    /// process. If a recoverable (data/query-level) VM error is ever
-    /// introduced, it must be a distinct variant routed to transaction-level
-    /// failure — never funneled here.
-    pub(super) fn vm_epoch_result(view_id: i64, r: Result<Option<Batch>, vm::VmError>) -> Option<Batch> {
-        match r {
-            Ok(Some(batch)) if batch.count > 0 => Some(batch),
-            Ok(_) => None,
-            Err(e @ (vm::VmError::TraceOutCursorUnbound | vm::VmError::TraceInCursorUnbound)) => gnitz_fatal_abort!(
-                "dag: VM execution error {:?} for view_id={} — malformed circuit, \
-                 cannot continue without producing inconsistent view state",
-                e,
-                view_id,
-            ),
-        }
     }
 
     /// Stamp a delta headed for the exchange wire with its source table's schema

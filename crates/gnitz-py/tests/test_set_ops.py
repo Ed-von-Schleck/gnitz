@@ -198,8 +198,14 @@ class TestSetOps:
         finally:
             client.drop_schema(sn)
 
-    def test_except_basic(self, client):
-        """EXCEPT view excludes rows whose PK is present in the right table."""
+    @pytest.mark.parametrize("b_first", [True, False])
+    def test_except_basic(self, client, b_first):
+        """EXCEPT view excludes rows whose PK is present in the right table.
+
+        Both insertion orders must give the same view: with ``b_first=False``
+        ΔA is processed against an empty b-side trace, and the row that later
+        arrives in b must still cancel it.
+        """
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -210,15 +216,10 @@ class TestSetOps:
             )
             vid = client.resolve_table(sn, "v")[0]
 
-            # Insert b FIRST so I(B) is populated when ΔA arrives
-            client.execute_sql(
-                "INSERT INTO b VALUES (2, 20)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)",
-                schema_name=sn,
-            )
+            insert_a = ("INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)", sn)
+            insert_b = ("INSERT INTO b VALUES (2, 20)", sn)
+            for sql, schema in ([insert_b, insert_a] if b_first else [insert_a, insert_b]):
+                client.execute_sql(sql, schema_name=schema)
 
             rows = client.scan(vid)
             vals = sorted(r["val"] for r in rows)

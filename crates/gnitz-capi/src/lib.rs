@@ -1076,12 +1076,6 @@ pub unsafe extern "C" fn gnitz_circuit_input_delta(cb: *mut GnitzCircuitBuilder)
     check_ptr_mut!(cb, 0).0.input_delta()
 }
 
-/// Add a trace-scan node for the given table. Returns node ID, or 0 on error.
-#[no_mangle]
-pub unsafe extern "C" fn gnitz_circuit_trace_scan(cb: *mut GnitzCircuitBuilder, table_id: u64) -> u64 {
-    check_ptr_mut!(cb, 0).0.trace_scan(table_id)
-}
-
 /// Add a filter node. expr may be NULL (emits PARAM_FUNC_ID=0 only).
 /// If non-NULL, CONSUMES expr — do not free it afterwards.
 /// Returns node ID, or 0 on error.
@@ -1137,12 +1131,6 @@ pub unsafe extern "C" fn gnitz_circuit_union(cb: *mut GnitzCircuitBuilder, a: u6
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_circuit_distinct(cb: *mut GnitzCircuitBuilder, input: u64) -> u64 {
     check_ptr_mut!(cb, 0).0.distinct(input)
-}
-
-/// Join: delta→port 0, internal trace_scan(trace_table_id)→port 1.
-#[no_mangle]
-pub unsafe extern "C" fn gnitz_circuit_join(cb: *mut GnitzCircuitBuilder, delta: u64, trace_table_id: u64) -> u64 {
-    check_ptr_mut!(cb, 0).0.join(delta, trace_table_id)
 }
 
 /// Reduce with automatic shard insertion.

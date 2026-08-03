@@ -330,15 +330,6 @@ impl PartitionedTable {
         self.tables.iter().map(Table::estimated_rows).sum()
     }
 
-    /// Run `compact_if_needed` on every partition. Maintenance-only; readers
-    /// that want an up-to-date L1 call this before `open_cursor`.
-    pub fn compact_if_needed(&mut self) -> Result<(), StorageError> {
-        for table in &mut self.tables {
-            table.compact_if_needed()?;
-        }
-        Ok(())
-    }
-
     // ------------------------------------------------------------------
     // PK lookups
     // ------------------------------------------------------------------
@@ -1301,8 +1292,7 @@ mod tests {
         }
     }
 
-    /// The compact-then-open read path (operator-state / `ScanTrace`) must
-    /// surface each partition's `in_memory_l0`, not just `open_cursor`.
+    /// `open_cursor` must surface each partition's `in_memory_l0`.
     /// Fails pre-fix (multi-partition branch dropped `in_memory_runs`).
     #[test]
     fn compacted_open_cursor_gathers_in_memory_runs() {
@@ -1325,7 +1315,6 @@ mod tests {
         // Flush all partitions into in_memory_l0; memtables now empty.
         assert!(prepare_all(&mut pt).is_empty());
 
-        pt.compact_if_needed().unwrap();
         let batch = pt.open_cursor().materialize();
         let mut seen = std::collections::HashSet::new();
         for i in 0..batch.count {

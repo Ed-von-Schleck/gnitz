@@ -35,9 +35,7 @@ pub struct CircuitRows {
 
 impl Circuit {
     /// Tables this view reads cascading deltas from — every `ScanDelta`
-    /// node's `source_table`, deduped. `ScanTrace` table_ids are
-    /// deliberately excluded (they're read-only lookups; updating them
-    /// must NOT trigger view recalculation).
+    /// node's `source_table`, deduped.
     pub fn dependencies(&self) -> Vec<TableId> {
         // A view's dependency set is 1–4 entries; a linear `Vec::contains` dedup
         // is alloc-free and beats a HashSet at this n (same small-n convention as
@@ -145,8 +143,7 @@ impl CircuitBuilder {
     }
 
     /// Primary delta input. Carries the `primary_source_id` set at builder
-    /// construction. Replaces the legacy "SCAN_TRACE with source=0 +
-    /// dependency lookup" trick.
+    /// construction.
     pub fn input_delta(&mut self) -> NodeId {
         self.input_delta_bounded(None)
     }
@@ -161,12 +158,6 @@ impl CircuitBuilder {
             source: self.primary_source_id,
             bound,
         })
-    }
-
-    /// Read-only trace source for a join trace port. Never participates in
-    /// cascade — its table_id is excluded from `dependencies()`.
-    pub fn trace_scan(&mut self, table_id: u64) -> NodeId {
-        self.alloc_node(OpNode::ScanTrace(table_id))
     }
 
     /// Tagged secondary delta input for multi-input views (e.g. equijoin).
@@ -305,15 +296,6 @@ impl CircuitBuilder {
         self.connect(delta, nid, gnitz_wire::PORT_IN_A);
         self.connect(trace_node, nid, gnitz_wire::PORT_TRACE);
         nid
-    }
-
-    fn binary_join_scan(&mut self, op: OpNode, delta: NodeId, trace_table_id: u64) -> NodeId {
-        let trace = self.trace_scan(trace_table_id);
-        self.binary_join(op, delta, trace)
-    }
-
-    pub fn join(&mut self, delta: NodeId, trace_table_id: u64) -> NodeId {
-        self.binary_join_scan(OpNode::Join(JoinKind::DeltaTrace), delta, trace_table_id)
     }
 
     pub fn join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
@@ -604,7 +586,8 @@ mod tests {
         for rel in [RangeRel::Lt, RangeRel::Le, RangeRel::Gt, RangeRel::Ge] {
             let mut cb = CircuitBuilder::new(1, 100);
             let a = cb.input_delta_tagged(100);
-            let trace = cb.trace_scan(200);
+            let b = cb.input_delta_tagged(200);
+            let trace = cb.integrate_trace(b);
             let join = cb.join_with_trace_range_node(a, trace, 0, rel);
             cb.sink(join);
             let decoded = Circuit::from_rows(1, cb.build().into_rows()).expect("from_rows");

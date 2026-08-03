@@ -157,34 +157,6 @@ pub(crate) fn load_circuit(
     })
 }
 
-/// The distinct scan-source table ids of a loaded circuit: every `ScanDelta`
-/// source and every `ScanTrace` target — the boot invalid-view verdict's
-/// transitive check needs both.
-///
-/// Nodes are walked in ascending node-id order, NOT `loaded.nodes` iteration
-/// order: `nodes` is a `HashMap`, so iterating it directly would return the
-/// sources in a per-process-random sequence. Node ids are assigned by the
-/// client's circuit builder in construction order, so ascending id tracks the
-/// circuit's own build order, and the walk needs no `topo_sort` precondition
-/// (unlike reading `loaded.ordered`, which is empty until one runs — a silent
-/// "no sources" footgun).
-pub(crate) fn scan_source_ids(loaded: &LoadedCircuit) -> Vec<i64> {
-    let mut nids: Vec<i32> = loaded.nodes.keys().copied().collect();
-    nids.sort_unstable();
-    let mut out: Vec<i64> = Vec::new();
-    for nid in nids {
-        let t = match loaded.nodes.get(&nid) {
-            Some(gnitz_wire::OpNode::ScanDelta { source, .. }) => *source as i64,
-            Some(gnitz_wire::OpNode::ScanTrace(t)) => *t as i64,
-            _ => continue,
-        };
-        if !out.contains(&t) {
-            out.push(t);
-        }
-    }
-    out
-}
-
 // ---------------------------------------------------------------------------
 // Topological sort (Kahn's algorithm)
 // ---------------------------------------------------------------------------
@@ -350,11 +322,11 @@ pub(crate) fn reindex_cols_through_filters(loaded: &LoadedCircuit, scan_nid: i32
     seqs.into_iter().flatten().collect()
 }
 
-/// Walk back from an `ExchangeShard` (`enid`) through `Filter` nodes to the source
-/// scan (`ScanDelta` for SQL planner views, `ScanTrace` for Python API joins),
-/// returning its table id — or `None` on a fan-in (≠ 1 incoming edge) or any
-/// non-`Filter`, non-scan node. `Filter` is the only operator transparent to the
-/// shard key: row-selective, never re-keys the PK region, never moves a row
+/// Walk back from an `ExchangeShard` (`enid`) through `Filter` nodes to the
+/// source `ScanDelta`, returning its table id — or `None` on a fan-in (≠ 1
+/// incoming edge) or any non-`Filter`, non-scan node. `Filter` is the only
+/// operator transparent to the shard key: row-selective, never re-keys the PK
+/// region, never moves a row
 /// off-worker; Map/Reduce/Distinct/join change the key or its distribution, and a
 /// `PartitionFilter` (range-join broadcast input) is not a `Filter` either. The
 /// backward dual of `reindex_cols_through_filters`, reading the same `loaded.incoming`
@@ -374,9 +346,7 @@ pub(crate) fn scan_tid_through_filters(loaded: &LoadedCircuit, enid: i32) -> Opt
         }
         let src_nid = ins[0].0;
         match loaded.nodes.get(&src_nid) {
-            Some(gnitz_wire::OpNode::ScanDelta { source: t, .. }) | Some(gnitz_wire::OpNode::ScanTrace(t)) => {
-                return Some(*t as i64)
-            }
+            Some(gnitz_wire::OpNode::ScanDelta { source: t, .. }) => return Some(*t as i64),
             Some(gnitz_wire::OpNode::Filter(_)) => cur = src_nid,
             _ => return None,
         }

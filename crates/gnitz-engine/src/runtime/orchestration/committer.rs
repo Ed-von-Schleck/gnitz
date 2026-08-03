@@ -129,7 +129,6 @@ pub struct Shared {
     /// server where `sal_needs_checkpoint()` would stay false.
     pub force_checkpoint: Cell<bool>,
     pub tick_rows: Rc<RefCell<FxHashMap<i64, usize>>>,
-    pub tick_tids: Rc<RefCell<Vec<i64>>>,
     /// Tick-trigger sender: fires the auto-tick after large commits, and drives
     /// the checkpoint sequence's drain (`Drain`) and quiesce (`Quiesce`)
     /// between its base and ephemeral rounds.
@@ -400,7 +399,7 @@ async fn run_checkpoint_sequence(
 
     // Step 2 — DRAIN (lock released). One Drain suffices: the tick loop walks the
     // source's full dependent closure with inline exchange rounds, and pushes are
-    // held so `tick_tids` cannot grow. Mirrors the SCAN drain.
+    // held so `tick_rows` cannot grow. Mirrors the SCAN drain.
     let (done_tx, done_rx) = oneshot::channel::<Result<(), String>>();
     shared.tick_tx.send(TickTrigger::Drain { done: done_tx });
     let drained = await_servicing(
@@ -851,14 +850,9 @@ async fn commit_pushes(
         // the LSN publish is deferred but tick batching can proceed.
         {
             let mut tr = shared.tick_rows.borrow_mut();
-            let mut tids = shared.tick_tids.borrow_mut();
             for g in &groups {
                 if g.write_err.is_none() {
-                    let entry = tr.entry(g.tid).or_insert(0);
-                    if *entry == 0 {
-                        tids.push(g.tid);
-                    }
-                    *entry += g.merged.as_ref().expect("merged set in Phase A").count;
+                    *tr.entry(g.tid).or_insert(0) += g.merged.as_ref().expect("merged set in Phase A").count;
                 }
             }
         }

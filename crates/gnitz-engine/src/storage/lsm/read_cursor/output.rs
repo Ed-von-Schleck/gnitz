@@ -118,8 +118,8 @@ impl ReadCursor {
     /// Drain up to `limit` net rows in merge order into an owned `Batch`
     /// (sorted + consolidated). `limit == 0` means unbounded. Returns `None`
     /// once the cursor is exhausted / nothing drained. Single owner of the
-    /// drain → scatter → flag pipeline shared by `materialize`, `drain_chunk`,
-    /// and `op_scan_trace`.
+    /// drain → scatter → flag pipeline shared by `materialize` and
+    /// `drain_chunk`.
     pub(crate) fn drain_to_batch(&mut self, limit: usize) -> Option<Batch> {
         if !self.valid {
             return None;

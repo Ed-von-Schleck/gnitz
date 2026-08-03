@@ -13,10 +13,7 @@ use crate::storage::{Batch, ReadCursor};
 /// Storage failure while integrating a tick's delta into an owned table: the
 /// view/history state has diverged from its durable inputs and there is no
 /// sound continue (dropping the delta permanently desyncs the integral).
-/// Mirrors `dag::vm_epoch_result`'s fail-stop; recovery is restart + SAL replay.
-/// Funneling these through a new `vm_epoch_result` error code was rejected —
-/// that abort's message is reserved for malformed-circuit codes and would
-/// mislead debugging.
+/// Recovery is restart + SAL replay.
 fn fatal_on_tick_ingest_err(op: &str, table_idx: i32, r: Result<(), crate::storage::StorageError>) {
     if let Err(e) = r {
         crate::gnitz_fatal_abort!(
@@ -36,8 +33,7 @@ fn fatal_on_tick_ingest_err(op: &str, table_idx: i32, r: Result<(), crate::stora
 /// The input_batch is moved into `input_reg`.  After execution, the output
 /// batch (if any) is extracted from `output_reg` and returned.
 ///
-/// Returns `Ok(Some(batch))` if output was produced, `Ok(None)` if empty,
-/// or `Err(rc)` on error.
+/// Returns the output batch, or `None` when the epoch produced nothing.
 #[cfg(test)]
 pub(crate) fn execute_epoch(
     program: &Program,
@@ -45,15 +41,8 @@ pub(crate) fn execute_epoch(
     input_batch: Batch,
     input_reg: u16,
     output_reg: u16,
-    cursor_handles: &[*mut ReadCursor],
-) -> Result<Option<Batch>, VmError> {
-    execute_epoch_multi(
-        program,
-        regfile,
-        std::iter::once((input_reg, input_batch)),
-        output_reg,
-        cursor_handles,
-    )
+) -> Option<Batch> {
+    execute_epoch_multi(program, regfile, std::iter::once((input_reg, input_batch)), output_reg)
 }
 
 /// Execute one epoch, seeding several input registers before the dispatch loop.
@@ -69,19 +58,19 @@ pub(crate) fn execute_epoch_multi(
     regfile: &mut RegisterFile,
     inputs: impl IntoIterator<Item = (u16, Batch)>,
     output_reg: u16,
-    cursor_handles: &[*mut ReadCursor],
-) -> Result<Option<Batch>, VmError> {
+) -> Option<Batch> {
     gnitz_debug!(
         "vm: execute_epoch output_reg={} instrs={}",
         output_reg,
         program.instructions.len()
     );
 
-    // 1. Clear delta batches (cursor refresh already done by caller)
+    // 1. Clear delta batches. Every trace register is backed by one of the
+    // plan's owned tables, and `VmHandle::refresh_owned_cursors` has already
+    // pointed it at a fresh cursor.
     regfile.clear_deltas(&program.reg_meta);
 
-    // 2. Bind cursors and seed input batches
-    regfile.bind_cursors(&program.reg_meta, cursor_handles);
+    // 2. Seed input batches
     for (input_reg, input_batch) in inputs {
         if input_batch.count > 0 {
             // Only assert when the batch is non-empty: an empty batch is a
@@ -131,14 +120,18 @@ pub(crate) fn execute_epoch_multi(
             unsafe { &mut *regs.add($i as usize) }
         }};
     }
+    // Every trace register names its backing table in `reg_meta`, and
+    // `refresh_owned_cursors` opens a cursor on each one before dispatch, so a
+    // null here is a VM bug rather than a state the circuit can reach.
     macro_rules! cursor_mut {
         ($i:expr) => {{
             let r = reg_mut!($i);
-            if r.cursor_ptr.is_null() {
-                None
-            } else {
-                Some(unsafe { &mut *r.cursor_ptr })
-            }
+            assert!(
+                !r.cursor_ptr.is_null(),
+                "register {} has no trace cursor; refresh_owned_cursors must run before dispatch",
+                $i
+            );
+            unsafe { &mut *r.cursor_ptr }
         }};
     }
 
@@ -146,14 +139,6 @@ pub(crate) fn execute_epoch_multi(
     for instr in &program.instructions {
         match instr {
             Instr::Halt => break,
-
-            Instr::ScanTrace { trace_reg, out_reg } => {
-                let schema = &program.reg_meta[*trace_reg as usize].schema;
-                if let Some(cursor) = cursor_mut!(*trace_reg) {
-                    let result = ops::op_scan_trace(cursor, schema);
-                    reg_mut!(*out_reg).batch = result;
-                }
-            }
 
             Instr::Filter {
                 in_reg,
@@ -229,7 +214,7 @@ pub(crate) fn execute_epoch_multi(
                 lo,
                 hi,
             } => {
-                let cursor = cursor_mut!(*hist_reg).expect("weight-clamp: history cursor unbound");
+                let cursor = cursor_mut!(*hist_reg);
                 let schema = &program.reg_meta[*in_reg as usize].schema;
                 let delta = reg_mut!(*in_reg).batch.take();
                 let (output, consolidated) = ops::op_weight_clamp(delta, cursor, schema, *lo, *hi);
@@ -249,16 +234,10 @@ pub(crate) fn execute_epoch_multi(
                 let left_schema = &program.reg_meta[*delta_reg as usize].schema;
                 let right_schema = &program.reg_meta[*trace_reg as usize].schema;
                 let out_schema = &program.reg_meta[*out_reg as usize].schema;
-                if let Some(cursor) = cursor_mut!(*trace_reg) {
-                    let result = ops::op_join_delta_trace(
-                        &reg!(*delta_reg).batch,
-                        cursor,
-                        left_schema,
-                        right_schema,
-                        out_schema,
-                    );
-                    reg_mut!(*out_reg).batch = result;
-                }
+                let cursor = cursor_mut!(*trace_reg);
+                let result =
+                    ops::op_join_delta_trace(&reg!(*delta_reg).batch, cursor, left_schema, right_schema, out_schema);
+                reg_mut!(*out_reg).batch = result;
             }
 
             Instr::JoinDTRange {
@@ -271,20 +250,17 @@ pub(crate) fn execute_epoch_multi(
                 let left_schema = &program.reg_meta[*delta_reg as usize].schema;
                 let right_schema = &program.reg_meta[*trace_reg as usize].schema;
                 let out_schema = &program.reg_meta[*out_reg as usize].schema;
-                if let Some(cursor) = cursor_mut!(*trace_reg) {
-                    let result = ops::op_join_delta_trace_range(
-                        &reg!(*delta_reg).batch,
-                        cursor,
-                        left_schema,
-                        right_schema,
-                        out_schema,
-                        *n_eq as usize,
-                        *rel,
-                    );
-                    reg_mut!(*out_reg).batch = result;
-                }
-                // Absent trace ⟹ empty arrangement on the other side ⟹ no matches;
-                // out_reg keeps whatever it held (an empty batch), like JoinDT.
+                let cursor = cursor_mut!(*trace_reg);
+                let result = ops::op_join_delta_trace_range(
+                    &reg!(*delta_reg).batch,
+                    cursor,
+                    left_schema,
+                    right_schema,
+                    out_schema,
+                    *n_eq as usize,
+                    *rel,
+                );
+                reg_mut!(*out_reg).batch = result;
             }
 
             Instr::PartitionFilter {
@@ -342,26 +318,14 @@ pub(crate) fn execute_epoch_multi(
             } => {
                 let plan = &program.reduce_plans[*plan_idx as usize];
 
-                // trace_in cursor (from register file)
-                let ti_cursor_ptr: *mut ReadCursor = if let Some(tr) = trace_in_reg {
-                    let ptr = cursor_mut!(*tr)
-                        .map(|c| c as *mut ReadCursor)
-                        .unwrap_or(std::ptr::null_mut());
-                    if ptr.is_null() {
-                        return Err(VmError::TraceInCursorUnbound);
-                    }
-                    ptr
-                } else {
-                    std::ptr::null_mut()
+                // trace_in cursor (from register file) — present only for a
+                // non-linear aggregate, which needs the input history to
+                // recompute an extreme on retraction.
+                let ti_opt: Option<&mut ReadCursor> = match trace_in_reg {
+                    Some(tr) => Some(cursor_mut!(*tr)),
+                    None => None,
                 };
-
-                // trace_out cursor (from register file)
-                let to_cursor_ptr: *mut ReadCursor = cursor_mut!(*trace_out_reg)
-                    .map(|c| c as *mut ReadCursor)
-                    .unwrap_or(std::ptr::null_mut());
-                if to_cursor_ptr.is_null() {
-                    return Err(VmError::TraceOutCursorUnbound);
-                }
+                let to_cursor = cursor_mut!(*trace_out_reg);
 
                 // Combined AVI cursor — created fresh from the value-index table
                 // (not a register). Must be created AFTER INTEGRATE populates the
@@ -377,27 +341,15 @@ pub(crate) fn execute_epoch_multi(
                 };
 
                 gnitz_debug!(
-                    "vm: REDUCE in_count={} trace_in={} trace_out=ok avi={} aggs={}",
+                    "vm: REDUCE in_count={} trace_in={} avi={} aggs={}",
                     reg!(*in_reg).batch.count,
-                    !ti_cursor_ptr.is_null(),
+                    ti_opt.is_some(),
                     avi_cursor_handle.is_some(),
                     plan.agg_descs.len()
                 );
 
-                let ti_opt: Option<&mut ReadCursor> = if !ti_cursor_ptr.is_null() {
-                    Some(unsafe { &mut *ti_cursor_ptr })
-                } else {
-                    None
-                };
                 let avi_opt: Option<&mut ReadCursor> = avi_cursor_handle.as_deref_mut();
-
-                let raw_out = ops::op_reduce(
-                    &reg!(*in_reg).batch,
-                    ti_opt,
-                    unsafe { &mut *to_cursor_ptr },
-                    avi_opt,
-                    plan,
-                );
+                let raw_out = ops::op_reduce(&reg!(*in_reg).batch, ti_opt, to_cursor, avi_opt, plan);
 
                 // Drop temporary cursor handle (returned to pool)
                 drop(avi_cursor_handle);
@@ -411,12 +363,7 @@ pub(crate) fn execute_epoch_multi(
 
     // 4. Extract output
     let out = &mut regfile.registers[output_reg as usize];
-    if out.batch.count > 0 {
-        let result = out.batch.take();
-        Ok(Some(result))
-    } else {
-        Ok(None)
-    }
+    (out.batch.count > 0).then(|| out.batch.take())
 }
 
 #[cfg(test)]

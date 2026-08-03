@@ -26,8 +26,6 @@ pub const OPCODE_MAP_PROJ: u64 = 26;
 pub const OPCODE_MAP_EXPR: u64 = 27;
 /// MAP sub-variant: copy all columns to payload, set PK = hash of full row.
 pub const OPCODE_MAP_HASH_ROW: u64 = 29;
-/// Read-only trace source for join trace ports; never participates in cascade.
-pub const OPCODE_SCAN_TRACE_TABLE: u64 = 31;
 /// Non-equi (range) join: symmetric delta-trace join whose probe is an ordered
 /// half-open range walk over the trace instead of an equal-key seek.
 pub const OPCODE_JOIN_DELTA_TRACE_RANGE: u64 = 32;
@@ -420,8 +418,6 @@ pub enum OpNode {
         source: TableId,
         bound: Option<ScanBound>,
     },
-    /// `OPCODE_SCAN_TRACE_TABLE = 31`. Read-only trace source for join trace ports.
-    ScanTrace(TableId),
     /// `OPCODE_FILTER = 1`. Optional expression predicate blob.
     Filter(Option<Vec<u8>>),
     Map(MapKind),
@@ -564,7 +560,6 @@ pub fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
             (OPCODE_SCAN_DELTA, Some(source), Some(b.desc.encode())),
             encode_col_list(NODE_COL_KIND_SCAN_BOUND, b.idx_cols.as_slice().iter().copied()),
         ),
-        OpNode::ScanTrace(tid) => ((OPCODE_SCAN_TRACE_TABLE, Some(tid), None), Vec::new()),
         OpNode::Filter(blob) => ((OPCODE_FILTER, None, blob), Vec::new()),
         OpNode::Map(MapKind::Projection(cols)) => {
             ((OPCODE_MAP_PROJ, None, None), encode_col_list(NODE_COL_KIND_PROJ, cols))
@@ -689,10 +684,6 @@ pub fn decode_op_node(
                 )
                 .map(|(idx_cols, desc)| ScanBound { idx_cols, desc });
             OpNode::ScanDelta { source, bound }
-        }
-        OPCODE_SCAN_TRACE_TABLE => {
-            let tid = src_tab.ok_or_else(|| "SCAN_TRACE missing source_table".to_string())?;
-            OpNode::ScanTrace(tid)
         }
         OPCODE_FILTER => OpNode::Filter(expr_blob),
         OPCODE_MAP_PROJ => OpNode::Map(MapKind::Projection(collect_cols(NODE_COL_KIND_PROJ))),
@@ -971,9 +962,6 @@ mod tests {
     #[test]
     fn decode_rejects_scan_missing_source_table() {
         assert!(decode_op_node(OPCODE_SCAN_DELTA, None, None, &[])
-            .unwrap_err()
-            .contains("source_table"));
-        assert!(decode_op_node(OPCODE_SCAN_TRACE_TABLE, None, None, &[])
             .unwrap_err()
             .contains("source_table"));
     }

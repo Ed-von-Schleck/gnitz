@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::expr::ScalarFunc;
 use crate::foundation::worker_ctx::{num_workers, worker_rank};
 use crate::ops::{build_reduce_output_schema, AggDescriptor};
-use crate::query::vm::{Instr, ProgramBuilder, RegisterMeta, VmHandle};
+use crate::query::vm::{ProgramBuilder, RegisterMeta, VmHandle};
 use crate::schema::{type_code, DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{ReadCursor, RecoverySource, Table};
 use gnitz_expr::{ExprValidateErr, LogicalProgram};
@@ -21,7 +21,7 @@ use emit::*;
 use optimize::*;
 
 pub(crate) use load::{
-    circuit_range_join_n_eq, circuit_source_bound, load_circuit, reindex_cols_through_filters, scan_source_ids,
+    circuit_range_join_n_eq, circuit_source_bound, load_circuit, reindex_cols_through_filters,
     scan_tid_through_filters, topo_sort,
 };
 pub(crate) use optimize::compute_join_shard_map;
@@ -109,8 +109,8 @@ pub(crate) type ExtTables = HashMap<i64, SchemaDescriptor>;
 // CompileOutput — typed compilation result
 // ---------------------------------------------------------------------------
 
-/// A compiled sub-pipeline: the VM program, its register layout, its
-/// source-to-input-register map, and any external trace registers it reads.
+/// A compiled sub-pipeline: the VM program, its register layout, and its
+/// source-to-input-register map.
 /// Used for: (a) the pre-exchange phase of every view, (b) each side of a
 /// binary set-op, and (c) the post-combine phase (single- and two-exchange
 /// views). All three are structurally identical; the difference is only which
@@ -120,31 +120,14 @@ pub(crate) struct SubPlan {
     pub in_reg: u16,
     pub out_reg: u16,
     /// True iff the program can emit output from an empty input epoch: it
-    /// carries a `ScanTrace` (reads a trace regardless of the delta) or a
-    /// global-ground `Reduce` — the empty pad round is the ONLY place the
-    /// SQL-required ground row over an empty/fully-retracted source is minted
-    /// (`op_reduce`'s `n == 0` branch). Every other opcode is inert on an
+    /// carries a global-ground `Reduce` — the empty pad round is the ONLY place
+    /// the SQL-required ground row over an empty/fully-retracted source is
+    /// minted (`op_reduce`'s `n == 0` branch). Every other opcode is inert on an
     /// empty input, so an empty epoch skips the VM machinery entirely.
     pub can_emit_on_empty: bool,
     /// Maps a source table id to the input register that receives its delta.
     /// Empty for the post-combine phase (which has no source-level routing).
     pub source_reg_map: HashMap<i64, u16>,
-    pub ext_trace_regs: Vec<(u16, i64)>,
-    /// Reusable per-epoch external-cursor buffers (see `ExtCursorScratch`).
-    pub ext_cursors: ExtCursorScratch,
-}
-
-/// Reusable per-epoch external-cursor buffers — capacity-only reuse. The
-/// cursors themselves are dropped at each epoch's end: holding them across
-/// ticks would pin memtable snapshots (`Rc<Batch>`) and shard mmaps of
-/// external base tables for the plan's lifetime.
-#[derive(Default)]
-pub(crate) struct ExtCursorScratch {
-    pub ptrs: Vec<*mut ReadCursor>,
-    /// The `Box` is load-bearing: `ptrs` holds raw pointers into these boxes,
-    /// stable across the `Vec`'s growth.
-    #[allow(clippy::vec_box)]
-    pub cursors: Vec<Box<ReadCursor>>,
 }
 
 /// One exchanged side of a [`PlanShape::Exchanged`] plan: a sub-pipeline whose
@@ -231,8 +214,8 @@ pub(super) struct PlanBuildResult {
     vm: Box<VmHandle>,
     in_reg: i32,
     out_reg: i32,
-    ext_trace_regs: Vec<(u16, i64)>,
     source_reg_map: HashMap<i64, i32>,
+    can_emit_on_empty: bool,
     // (exchange-input node id → seed register) for each exchange input this plan
     // was built with. Lets `compile_view` wire each side's relayed batch to the
     // correct post-phase register.
@@ -249,22 +232,15 @@ impl PlanBuildResult {
     /// (`build_plan` bounds `reg_meta` below `u16::MAX`, so the casts are exact).
     fn into_sub_plan(mut self) -> SubPlan {
         self.scratch.defuse();
-        let can_emit_on_empty = self.vm.program.instructions.iter().any(|i| match i {
-            Instr::ScanTrace { .. } => true,
-            Instr::Reduce { plan_idx, .. } => self.vm.program.reduce_plans[*plan_idx as usize].global_ground,
-            _ => false,
-        });
         SubPlan {
             in_reg: self.in_reg as u16,
             out_reg: self.out_reg as u16,
-            can_emit_on_empty,
+            can_emit_on_empty: self.can_emit_on_empty,
             source_reg_map: self
                 .source_reg_map
                 .iter()
                 .map(|(&tid, &reg)| (tid, reg as u16))
                 .collect(),
-            ext_trace_regs: self.ext_trace_regs,
-            ext_cursors: ExtCursorScratch::default(),
             vm: self.vm,
         }
     }
@@ -977,19 +953,27 @@ mod tests {
     #[test]
     fn test_build_plan_wide_pk_join_accepted() {
         // After byte-API port: wide-PK Join(DeltaTrace) must compile successfully.
-        // ScanDelta(wide) --port0--> Join(DT) <--port1-- ScanTrace(wide)
+        // ScanDelta(wide) --port0--> Join(DT) <--port1-- IntegrateTrace(wide)
         // Join(DT) --> IntegrateSink.
         let schema = wide_pk_schema();
+        let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
+        std::fs::create_dir_all(&base).unwrap();
+        let view_dir = format!("{}/wide_pk_join_{}", base, std::process::id());
+        let _ = std::fs::remove_dir_all(&view_dir);
+        std::fs::create_dir_all(&view_dir).unwrap();
+
         let mut nodes = HashMap::new();
         nodes.insert(0, scan_delta(10));
-        nodes.insert(1, gnitz_wire::OpNode::ScanTrace(20));
+        nodes.insert(1, scan_delta(20));
         nodes.insert(2, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
         nodes.insert(3, gnitz_wire::OpNode::IntegrateSink);
-        let edges = vec![(0, 2, PORT_IN_A), (1, 2, PORT_TRACE), (2, 3, PORT_IN)];
+        nodes.insert(4, gnitz_wire::OpNode::IntegrateTrace);
+        let edges = vec![(0, 2, PORT_IN_A), (1, 4, PORT_IN), (4, 2, PORT_TRACE), (2, 3, PORT_IN)];
         let loaded = make_loaded(nodes, edges);
         let ext: ExtTables = HashMap::from([(10, schema), (20, schema)]);
         let ordered = loaded.ordered.clone();
-        let result = build_plan(&loaded, &no_skips(), &ordered, &ext, "", 1, Some(2), &[]);
+        let result = build_plan(&loaded, &no_skips(), &ordered, &ext, &view_dir, 1, Some(2), &[]);
+        let _ = std::fs::remove_dir_all(&view_dir);
         assert!(
             result.is_ok(),
             "wide-PK Join(DeltaTrace) must compile after byte-API port"
@@ -1811,36 +1795,6 @@ mod tests {
         HashSet::new()
     }
 
-    /// `scan_source_ids` returns the deduped source set of a 2-way join circuit
-    /// — `ScanTrace` targets included — and is DETERMINISTIC. `loaded.nodes` is
-    /// a `HashMap`, so a naive `values()` walk would return the sources in a
-    /// per-process-random order; the ascending-node-id walk pins it.
-    #[test]
-    fn scan_source_ids_dedups_gates_scan_trace_and_is_deterministic() {
-        let build = || {
-            let mut nodes: HashMap<i32, gnitz_wire::OpNode> = HashMap::new();
-            // Two sources, one of them scanned twice (dedup), plus a ScanTrace.
-            nodes.insert(0, scan_delta(20));
-            nodes.insert(1, scan_delta(10));
-            nodes.insert(2, scan_delta(20));
-            nodes.insert(3, gnitz_wire::OpNode::ScanTrace(30));
-            nodes.insert(4, gnitz_wire::OpNode::IntegrateSink);
-            make_loaded(nodes, vec![])
-        };
-
-        let got = scan_source_ids(&build());
-        assert_eq!(
-            got,
-            vec![20, 10, 30],
-            "ScanDelta sources then the ScanTrace target, ascending node-id order, deduped"
-        );
-        // Determinism: re-deriving from an identically-shaped circuit must not
-        // depend on HashMap iteration order.
-        for _ in 0..16 {
-            assert_eq!(scan_source_ids(&build()), got, "the order must be stable");
-        }
-    }
-
     // ── §5: destructive-register ordering invariant ─────────────────────────
     //
     // Union/Distinct/PositivePart empty their input register in place.
@@ -1938,261 +1892,9 @@ mod tests {
         );
     }
 
-    // ── ScanTrace join-trace-side: no add_scan_trace when feeding port=1 ──
-
-    /// A ScanTrace node feeding a Join via PORT_TRACE must not emit add_scan_trace
-    /// or allocate an extra delta register.
-    #[test]
-    fn test_scan_trace_join_trace_side_no_extra_reg() {
-        // Circuit: ScanDelta(10) --port0--> Join(DT)(2)
-        //          ScanTrace(20) --port1--> Join(DT)(2)
-        //          Join(2) --port0--> IntegrateSink(3)
-        let schema = two_col_schema();
-        let mut nodes = HashMap::new();
-        nodes.insert(0, scan_delta(10));
-        nodes.insert(1, gnitz_wire::OpNode::ScanTrace(20));
-        nodes.insert(2, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
-        nodes.insert(3, gnitz_wire::OpNode::IntegrateSink);
-        let edges = vec![
-            (0, 2, PORT_IN_A),  // delta side
-            (1, 2, PORT_TRACE), // trace side — must NOT emit add_scan_trace
-            (2, 3, PORT_IN),
-        ];
-        let loaded = make_loaded(nodes, edges);
-
-        let ext: ExtTables = HashMap::from([(10, schema), (20, schema)]);
-        let ordered = loaded.ordered.clone();
-        let result = build_plan(
-            &loaded,
-            &no_skips(),
-            &ordered,
-            &ext,
-            "",
-            1,
-            Some(2), // bypass out_schema mismatch check; sink_reg already set by IntegrateSink
-            &[],
-        );
-        let plan = result.expect("build_plan must succeed for this circuit");
-
-        // The trace-side ScanTrace (node 1) uses reg_id as the trace register;
-        // no extra delta register is allocated for it.  The minimum register
-        // count is: one per node (4) + zero extras from ScanTrace on trace side.
-        // (There are no Distinct/Reduce nodes adding extras.)
-        assert!(
-            plan.vm.program.reg_meta.len() == 4,
-            "expected exactly 4 regs (one per node, no extra for trace-side ScanTrace), got {}",
-            plan.vm.program.reg_meta.len()
-        );
-    }
-
-    /// A ScanTrace node that does NOT feed a join's TRACE port must still emit
-    /// add_scan_trace and allocate an extra delta register.
-    #[test]
-    fn test_scan_trace_non_join_side_emits_scan_trace() {
-        // Circuit: ScanDelta(10) --port0--> Union(2)
-        //          ScanTrace(20) --port1--> Union(2)   [port=1 but Union ≠ Join → NOT join-trace-side]
-        //          Union(2) --port0--> IntegrateSink(3)
-        //
-        // ScanDelta provides input_delta_reg_id via source_reg_map.
-        // ScanTrace feeds Union on PORT_IN_B (=1), but Union is not a Join,
-        // so is_join_trace_side = false →
-        // add_scan_trace is emitted and one extra delta register is allocated.
-        let schema = two_col_schema();
-        let mut nodes = HashMap::new();
-        nodes.insert(0, scan_delta(10));
-        nodes.insert(1, gnitz_wire::OpNode::ScanTrace(20));
-        nodes.insert(2, gnitz_wire::OpNode::Union);
-        nodes.insert(3, gnitz_wire::OpNode::IntegrateSink);
-        let edges = vec![
-            (0, 2, PORT_IN_A), // ScanDelta → Union left
-            (1, 2, PORT_IN_B), // ScanTrace → Union right (port=1, not a join)
-            (2, 3, PORT_IN),
-        ];
-
-        let loaded = make_loaded(nodes, edges);
-        let ext: ExtTables = HashMap::from([(10, schema), (20, schema)]);
-        let ordered = loaded.ordered.clone();
-        let result = build_plan(
-            &loaded,
-            &no_skips(),
-            &ordered,
-            &ext,
-            "",
-            1,
-            Some(2), // bypass out_schema mismatch check
-            &[],
-        );
-        let plan = result.expect("build_plan must succeed");
-
-        // 4 nodes → base regs 0-3, plus 1 extra delta reg for ScanTrace.
-        assert!(
-            plan.vm.program.reg_meta.len() == 5,
-            "expected 5 regs (4 base + 1 extra delta for non-join-side ScanTrace), got {}",
-            plan.vm.program.reg_meta.len()
-        );
-    }
-
-    // ── §3: Join must be emitted before the Integrate that writes the trace ──
-    //
-    // Within an epoch a DeltaTrace join reads `z⁻¹(I(B))` — the trace state
-    // BEFORE this epoch's delta is integrated. That old-state guarantee is
-    // enforced purely by compiled instruction order: the JoinDT instruction must
-    // appear before any Integrate instruction that writes a trace this epoch.
-    // build_plan emits in topological order, and the `Join → Integrate*` edge
-    // makes the join a strict predecessor — but nothing else asserts it, so a
-    // future reordering of the emit loop could silently invert it and feed the
-    // join post-delta state. Pin the program-order relation.
-
-    /// Index of the first `Instr` matching `pred` in a built program.
-    fn first_instr_pos(plan: &PlanBuildResult, pred: impl Fn(&crate::query::vm::Instr) -> bool) -> usize {
-        plan.vm
-            .program
-            .instructions
-            .iter()
-            .position(pred)
-            .expect("program must contain the expected instruction")
-    }
-
-    #[test]
-    fn test_join_emitted_before_integrate_sink() {
-        // ScanDelta(10) --PORT_IN_A--> Join(DeltaTrace)(2) --PORT_IN--> IntegrateSink(3)
-        // ScanTrace(20) --PORT_TRACE-> Join(DeltaTrace)(2)
-        // IntegrateSink emits no instruction — it only resolves the sink
-        // register — so the compiled program is the JoinDT alone.
-        let schema = two_col_schema();
-        let mut nodes = HashMap::new();
-        nodes.insert(0, scan_delta(10));
-        nodes.insert(1, gnitz_wire::OpNode::ScanTrace(20));
-        nodes.insert(2, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
-        nodes.insert(3, gnitz_wire::OpNode::IntegrateSink);
-        let edges = vec![
-            (0, 2, PORT_IN_A),  // delta side
-            (1, 2, PORT_TRACE), // trace side
-            (2, 3, PORT_IN),    // join feeds the sink
-        ];
-        let loaded = make_loaded(nodes, edges);
-
-        let ext: ExtTables = HashMap::from([(10, schema), (20, schema)]);
-        let ordered = loaded.ordered.clone();
-        let plan = build_plan(
-            &loaded,
-            &no_skips(),
-            &ordered,
-            &ext,
-            "",
-            1,
-            Some(2), // bypass out_schema mismatch; sink_reg set by IntegrateSink
-            &[],
-        )
-        .expect("build_plan must succeed for the ScanDelta→Join(DT)←ScanTrace→sink circuit");
-
-        // Exactly one JoinDT and NO Integrate: the IntegrateSink node emits no
-        // instruction (the sink register's batch is what the epoch extracts),
-        // so the only ordering constraint left is that the join runs at all.
-        let n_join = plan
-            .vm
-            .program
-            .instructions
-            .iter()
-            .filter(|i| matches!(i, crate::query::vm::Instr::JoinDT { .. }))
-            .count();
-        let n_int = plan
-            .vm
-            .program
-            .instructions
-            .iter()
-            .filter(|i| matches!(i, crate::query::vm::Instr::Integrate { .. }))
-            .count();
-        assert_eq!(n_join, 1, "expected exactly one JoinDT instruction, got {n_join}");
-        assert_eq!(n_int, 0, "the sink Integrate emits no instruction, got {n_int}");
-
-        // The sink resolves to the join's output register.
-        let jpos = first_instr_pos(&plan, |i| matches!(i, crate::query::vm::Instr::JoinDT { .. }));
-        match &plan.vm.program.instructions[jpos] {
-            crate::query::vm::Instr::JoinDT { out_reg, .. } => {
-                assert_eq!(
-                    *out_reg as i32, plan.out_reg,
-                    "sink register must resolve to the join's output register",
-                );
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    #[test]
-    fn test_join_emitted_before_integrate_trace() {
-        // Shared-source / chained-trace shape: the join's output is itself fed into
-        // an IntegrateTrace (a downstream operator's z⁻¹ history) AND the view sink.
-        //
-        // ScanDelta(10) --PORT_IN_A--> Join(DeltaTrace)(2) ─┬─PORT_IN─► IntegrateTrace(3)
-        // ScanTrace(20) --PORT_TRACE-> Join(DeltaTrace)(2)  └─PORT_IN─► IntegrateSink(4)
-        //
-        // The IntegrateTrace node is a strict topological successor of the join,
-        // so its JoinDT instruction must precede the Integrate instruction.
-        // (IntegrateTrace writes a real trace table; IntegrateSink emits no
-        // instruction — it only resolves the sink register.)
-        let schema = two_col_schema();
-        let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
-        std::fs::create_dir_all(&base).unwrap();
-        let view_dir = format!("{}/join_before_int_trace_{}", base, std::process::id());
-        let _ = std::fs::remove_dir_all(&view_dir);
-        std::fs::create_dir_all(&view_dir).unwrap();
-
-        let mut nodes = HashMap::new();
-        nodes.insert(0, scan_delta(10));
-        nodes.insert(1, gnitz_wire::OpNode::ScanTrace(20));
-        nodes.insert(2, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
-        nodes.insert(3, gnitz_wire::OpNode::IntegrateTrace);
-        nodes.insert(4, gnitz_wire::OpNode::IntegrateSink);
-        let edges = vec![
-            (0, 2, PORT_IN_A),  // delta side
-            (1, 2, PORT_TRACE), // trace side
-            (2, 3, PORT_IN),    // join feeds an IntegrateTrace (downstream z⁻¹ history)
-            (2, 4, PORT_IN),    // join also feeds the view sink
-        ];
-        let loaded = make_loaded(nodes, edges);
-
-        let ext: ExtTables = HashMap::from([(10, schema), (20, schema)]);
-        let ordered = loaded.ordered.clone();
-        let result = build_plan(
-            &loaded,
-            &no_skips(),
-            &ordered,
-            &ext,
-            &view_dir,
-            1,
-            Some(2), // bypass out_schema mismatch; sink_reg set by IntegrateSink
-            &[],
-        );
-        let _ = std::fs::remove_dir_all(&view_dir);
-        let plan = result.expect("build_plan must succeed for the join→IntegrateTrace+sink circuit");
-
-        // One Integrate instruction is emitted (the trace; the sink emits none);
-        // the JoinDT must precede it.
-        let n_int = plan
-            .vm
-            .program
-            .instructions
-            .iter()
-            .filter(|i| matches!(i, crate::query::vm::Instr::Integrate { .. }))
-            .count();
-        assert_eq!(n_int, 1, "expected one Integrate instruction (the trace), got {n_int}");
-
-        let jpos = first_instr_pos(&plan, |i| matches!(i, crate::query::vm::Instr::JoinDT { .. }));
-        let first_ipos = first_instr_pos(&plan, |i| matches!(i, crate::query::vm::Instr::Integrate { .. }));
-        assert!(
-            jpos < first_ipos,
-            "JoinDT (program pos {jpos}) must be emitted before the first Integrate \
-             (program pos {first_ipos}): the join reads z⁻¹(I) — trace state before \
-             this epoch's delta is integrated into any trace — and instruction order \
-             is what enforces it",
-        );
-    }
-
     // ── compute_join_shard_map covers ScanDelta (SQL-planner join pattern) ──
 
-    /// compute_join_shard_map must find ScanDelta → Map(reindex) chains, not
-    /// just ScanTrace sources.
+    /// compute_join_shard_map must find ScanDelta → Map(reindex) chains.
     #[test]
     fn test_compute_join_shard_map_scan_delta() {
         use gnitz_wire::{MapKind, OpNode};
@@ -2330,7 +2032,7 @@ mod tests {
         // A range join: a Join(DeltaTraceRange) node makes it Some, carrying n_eq.
         let mut rj = HashMap::new();
         rj.insert(0, scan_delta(7));
-        rj.insert(1, OpNode::ScanTrace(8));
+        rj.insert(1, OpNode::IntegrateTrace);
         rj.insert(
             2,
             OpNode::Join(JoinKind::DeltaTraceRange {
@@ -2339,7 +2041,8 @@ mod tests {
             }),
         );
         rj.insert(3, OpNode::IntegrateSink);
-        let rj_edges = vec![(0, 2, PORT_IN_A), (1, 2, PORT_TRACE), (2, 3, PORT_IN)];
+        rj.insert(4, scan_delta(8));
+        let rj_edges = vec![(0, 2, PORT_IN_A), (4, 1, PORT_IN), (1, 2, PORT_TRACE), (2, 3, PORT_IN)];
         let rj_loaded = make_loaded(rj, rj_edges);
         assert_eq!(
             circuit_range_join_n_eq(&rj_loaded),
@@ -2622,15 +2325,15 @@ mod tests {
         );
     }
 
-    /// Pure ScanTrace sources (Python-API joins) must also appear in the map.
+    /// A source whose path to the join carries no reindex Map stays out of the map.
     #[test]
-    fn test_compute_join_shard_map_scan_trace_unchanged() {
+    fn test_compute_join_shard_map_unreindexed_trace_side_absent() {
         use gnitz_wire::{MapKind, OpNode};
 
         let dummy_blob = dummy_expr_blob();
         let mut nodes = HashMap::new();
         nodes.insert(0, scan_delta(10));
-        nodes.insert(1, OpNode::ScanTrace(20));
+        nodes.insert(1, scan_delta(20));
         nodes.insert(
             2,
             OpNode::Map(MapKind::Expression {
@@ -2641,9 +2344,11 @@ mod tests {
         );
         nodes.insert(3, OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
         nodes.insert(4, OpNode::IntegrateSink);
+        nodes.insert(5, OpNode::IntegrateTrace);
         let edges = vec![
             (0, 2, PORT_IN),    // ScanDelta → reindex Map
-            (1, 3, PORT_TRACE), // ScanTrace → join trace port (no reindex)
+            (1, 5, PORT_IN),    // ScanDelta(20) → IntegrateTrace (no reindex)
+            (5, 3, PORT_TRACE), // trace → join trace port
             (2, 3, PORT_IN_A),
             (3, 4, PORT_IN),
         ];
@@ -2657,10 +2362,10 @@ mod tests {
             vec![(2, 0)],
             "ScanDelta source must be in join_shard_map"
         );
-        // ScanTrace(20) has no downstream reindex Map — must NOT appear.
+        // Source 20 has no downstream reindex Map — must NOT appear.
         assert!(
             !map.contains_key(&20),
-            "ScanTrace-only source with no reindex Map must not be in join_shard_map"
+            "a source with no reindex Map must not be in join_shard_map"
         );
     }
 
@@ -2673,7 +2378,7 @@ mod tests {
 
     /// A bare `ScanDelta → ExchangeShard` (the no-`WHERE` case) resolves to the source
     /// tid; `ScanDelta → Filter → ExchangeShard` (filtered `GROUP BY prefix`) does too,
-    /// as do a chain of Filters and a `ScanTrace` source.
+    /// as does a chain of Filters.
     #[test]
     fn test_scan_tid_through_filters_filter_chain() {
         use gnitz_wire::OpNode;
@@ -2702,9 +2407,9 @@ mod tests {
             "one Filter between scan and shard is transparent to the shard key"
         );
 
-        // ScanTrace(8) → Filter → Filter → ExchangeShard.
+        // ScanDelta(8) → Filter → Filter → ExchangeShard.
         let mut nodes = HashMap::new();
-        nodes.insert(0, OpNode::ScanTrace(8));
+        nodes.insert(0, scan_delta(8));
         nodes.insert(1, OpNode::Filter(Some(dummy_blob.clone())));
         nodes.insert(2, OpNode::Filter(Some(dummy_blob)));
         nodes.insert(3, OpNode::ExchangeShard { shard_cols: vec![0] });
@@ -2712,7 +2417,7 @@ mod tests {
         assert_eq!(
             scan_tid_through_filters(&loaded, 3),
             Some(8),
-            "a chain of Filters is transparent, and ScanTrace sources resolve too"
+            "a chain of Filters is transparent to the shard key"
         );
     }
 

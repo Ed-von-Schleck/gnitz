@@ -139,15 +139,6 @@ impl StoreHandle {
         }
     }
 
-    /// Dispatched `compact_if_needed` across all variants. Maintenance-only;
-    /// readers that want an up-to-date L1 call this before `open_cursor`.
-    pub fn compact_if_needed(&self) -> Result<(), StorageError> {
-        match self {
-            StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.compact_if_needed(),
-            StoreHandle::Partitioned(cell) => unsafe { &mut *cell.get() }.compact_if_needed(),
-        }
-    }
-
     /// Dispatched durable ingest of a borrowed `Batch` — the single-copy path
     /// for callers that keep reading the batch (see
     /// `Table::ingest_borrowed_batch`).

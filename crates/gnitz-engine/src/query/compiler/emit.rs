@@ -107,7 +107,7 @@ impl Drop for ScratchGuard {
 /// instruction builder, register metadata, and the owned resources the finished
 /// VM will keep alive. Owned by `build_plan` and threaded to the emit arms as
 /// one `&mut` instead of a dozen parallel parameters.
-/// The `Box`es are load-bearing (raw-pointer stability across `Vec` growth).
+/// The `Box`es keep the raw pointers into them valid across the `Vec`s' growth.
 #[allow(clippy::vec_box)]
 pub(super) struct EmitCtx<'a> {
     pub loaded: &'a LoadedCircuit,
@@ -120,10 +120,12 @@ pub(super) struct EmitCtx<'a> {
     pub reg_meta: Vec<RegisterMeta>,
     pub owned_tables: Vec<Box<Table>>,
     pub owned_funcs: Vec<Box<ScalarFunc>>,
-    pub owned_trace_regs: Vec<(u16, usize)>,
-    pub ext_trace_regs: Vec<(u16, i64)>,
     pub source_reg_map: HashMap<i64, i32>,
     pub sink_reg_id: i32,
+    /// Set by `emit_reduce` when it emits a global-ground aggregate — the one
+    /// operator that produces output from an empty input epoch. See
+    /// `SubPlan::can_emit_on_empty`.
+    pub can_emit_on_empty: bool,
     pub scratch: ScratchGuard,
 }
 
@@ -141,7 +143,7 @@ impl EmitCtx<'_> {
     /// Box `func`, keep it alive in `owned_funcs`, and return a raw pointer into
     /// the box. Valid for the box's lifetime — the heap `ScalarFunc` is stable
     /// across the `Vec`'s growth — which is what the VM's raw `*const ScalarFunc`
-    /// handles rely on. The `Box` is load-bearing (pointer stability).
+    /// handles rely on.
     fn push_func(&mut self, func: ScalarFunc) -> *const ScalarFunc {
         self.owned_funcs.push(Box::new(func));
         &**self.owned_funcs.last().unwrap() as *const ScalarFunc
@@ -199,9 +201,9 @@ impl EmitCtx<'_> {
     }
 
     /// Create a child table, keep it alive in `owned_tables`, and return a raw
-    /// pointer into the box. When `trace_reg` is given, register it as an owned
-    /// trace register backed by the new table (`refresh_owned_cursors` opens a
-    /// cursor on it each epoch).
+    /// pointer into the box. When `trace_reg` is given, mark it a trace register
+    /// backed by the new table (`refresh_owned_cursors` opens a cursor on it
+    /// each epoch).
     fn add_owned_trace_table(
         &mut self,
         child_name: &str,
@@ -213,8 +215,10 @@ impl EmitCtx<'_> {
         self.owned_tables.push(Box::new(t));
         let ptr = &*self.owned_tables[idx] as *const Table as *mut Table;
         if let Some(reg) = trace_reg {
-            self.reg_meta[reg as usize] = RegisterMeta::trace(schema);
-            self.owned_trace_regs.push((reg as u16, idx));
+            // Each node contributes at most three owned tables and `build_plan`
+            // already bounds the node count well below `u16::MAX / 3`.
+            debug_assert!(idx <= u16::MAX as usize);
+            self.reg_meta[reg as usize] = RegisterMeta::trace(schema, idx as u16);
         }
         Ok(ptr)
     }
@@ -241,27 +245,6 @@ impl EmitCtx<'_> {
 // Instruction emission — per-node handler
 // ---------------------------------------------------------------------------
 
-/// The one edge shape that makes a `ScanTrace` skippable: feeding a Join's
-/// PORT_TRACE. Shared by the skip decision and the mixed-consumer assert below
-/// so the two can never drift.
-fn is_trace_port_edge(loaded: &LoadedCircuit, dst: i32, port: i32) -> bool {
-    port == PORT_TRACE && matches!(loaded.nodes.get(&dst), Some(gnitz_wire::OpNode::Join(_)))
-}
-
-pub(super) fn is_join_trace_side(loaded: &LoadedCircuit, nid: i32) -> bool {
-    // `.all()` (not `.any()`): a ScanTrace node feeding a join on PORT_TRACE
-    // skips its delta-register allocation, leaving no `out_reg_of` entry. If the
-    // SAME node also feeds a normal-port consumer (Filter/Map/Union on PORT_IN),
-    // an `.any()` test would still skip, and the normal consumer's `in_regs`
-    // lookup would miss — reading unrelated payload. The skip is only safe when
-    // EVERY outgoing edge is a join trace side.
-    loaded
-        .outgoing
-        .get(&nid)
-        .map(|outs| !outs.is_empty() && outs.iter().all(|&(dst, port)| is_trace_port_edge(loaded, dst, port)))
-        .unwrap_or(false)
-}
-
 /// The resolved input register of `port`, or the named compile rejection: a
 /// missing input edge would otherwise silently fall back to reading node-0's
 /// register — the wrong-results failure class every other emit guard exists to
@@ -284,39 +267,6 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
             let schema = ext_schema(ctx.ext_tables, *tid as i64, "scan-delta: unknown source table")?;
             ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(schema);
             ctx.source_reg_map.insert(*tid as i64, reg_id);
-        }
-
-        gnitz_wire::OpNode::ScanTrace(tid) => {
-            let schema = ext_schema(ctx.ext_tables, *tid as i64, "scan-trace: unknown source table")?;
-            ctx.reg_meta[reg_id as usize] = RegisterMeta::trace(schema);
-            ctx.ext_trace_regs.push((reg_id as u16, *tid as i64));
-
-            if !is_join_trace_side(loaded, nid) {
-                // Overwriting out_reg_of below points this node at the
-                // cursorless delta register. out_reg_of holds one register
-                // per node, so a consumer reading this node's PORT_TRACE
-                // would resolve to that single delta register and read an
-                // empty trace — silently emitting empty output. Routing both
-                // would require emitting two output registers for the node.
-                // The graph builder emits trace and delta scans as separate
-                // nodes, so a ScanTrace never has both a PORT_TRACE join
-                // consumer and a non-join consumer; assert it rather than
-                // corrupt results if that ever changes.
-                assert!(
-                    loaded
-                        .outgoing
-                        .get(&nid)
-                        .is_none_or(|outs| { !outs.iter().any(|&(dst, port)| is_trace_port_edge(loaded, dst, port)) }),
-                    "ScanTrace node {nid} has mixed consumers: a PORT_TRACE join consumer would \
-                     misroute to the cursorless delta register"
-                );
-                let out_delta_id = ctx.push_delta_reg(schema);
-                ctx.out_reg_of.insert(nid, out_delta_id);
-                ctx.builder.push(Instr::ScanTrace {
-                    trace_reg: reg_id as u16,
-                    out_reg: out_delta_id as u16,
-                });
-            }
         }
 
         gnitz_wire::OpNode::Filter(blob) => {
@@ -740,6 +690,7 @@ pub(super) fn emit_reduce(
             "reduce: global_ground with a non-empty group set",
         ));
     }
+    ctx.can_emit_on_empty |= global_ground;
     if agg.iter().any(|&(_, c)| c as usize >= in_reg_schema.num_columns()) {
         return Err(CompileError::Rejected("reduce: aggregate column out of range"));
     }
@@ -965,7 +916,7 @@ pub(super) fn build_plan(
 
     // Register ids are u16 instruction fields. `reg_meta` is sized to the base
     // register per node plus the exchange seeds here; the emitters push the extras
-    // on demand — ScanTrace/Distinct push 1, Reduce up to 2
+    // on demand — Distinct pushes 1, Reduce up to 2
     // (raw_delta + trace-in). Each node pushes at most 2, so reserving
     // `next_reg + 2 * ordered.len()` holds the whole program in a single
     // allocation, and that same bound — rejected here before the emit loop creates
@@ -994,10 +945,9 @@ pub(super) fn build_plan(
         reg_meta,
         owned_tables: Vec::new(),
         owned_funcs: Vec::new(),
-        owned_trace_regs: Vec::new(),
-        ext_trace_regs: Vec::new(),
         source_reg_map: HashMap::new(),
         sink_reg_id: -1,
+        can_emit_on_empty: false,
         scratch: ScratchGuard::new(),
     };
 
@@ -1087,20 +1037,19 @@ pub(super) fn build_plan(
         reg_meta,
         owned_tables,
         owned_funcs,
-        owned_trace_regs,
-        ext_trace_regs,
         source_reg_map,
+        can_emit_on_empty,
         scratch,
         ..
     } = ctx;
-    let vm = builder.build_with_owned(reg_meta, owned_tables, owned_funcs, owned_trace_regs);
+    let vm = builder.build_with_owned(reg_meta, owned_tables, owned_funcs);
 
     Ok(PlanBuildResult {
         vm,
         in_reg: input_delta_reg_id,
         out_reg: sink_reg,
-        ext_trace_regs,
         source_reg_map,
+        can_emit_on_empty,
         exchange_input_regs,
         scratch,
     })

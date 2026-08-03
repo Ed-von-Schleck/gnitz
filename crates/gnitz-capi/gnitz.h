@@ -174,8 +174,6 @@ GnitzCircuitBuilder *gnitz_circuit_new(uint64_t view_id, uint64_t primary_source
 
 uint64_t gnitz_circuit_input_delta(GnitzCircuitBuilder *cb);
 
-uint64_t gnitz_circuit_trace_scan(GnitzCircuitBuilder *cb, uint64_t table_id);
-
 uint64_t gnitz_circuit_filter(GnitzCircuitBuilder *cb, uint64_t input, GnitzExprProgram *expr);
 
 uint64_t gnitz_circuit_map(GnitzCircuitBuilder *cb,
@@ -188,8 +186,6 @@ uint64_t gnitz_circuit_negate(GnitzCircuitBuilder *cb, uint64_t input);
 uint64_t gnitz_circuit_union(GnitzCircuitBuilder *cb, uint64_t a, uint64_t b);
 
 uint64_t gnitz_circuit_distinct(GnitzCircuitBuilder *cb, uint64_t input);
-
-uint64_t gnitz_circuit_join(GnitzCircuitBuilder *cb, uint64_t delta, uint64_t trace_table_id);
 
 uint64_t gnitz_circuit_reduce(GnitzCircuitBuilder *cb,
                               uint64_t input,

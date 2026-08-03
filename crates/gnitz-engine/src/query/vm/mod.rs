@@ -16,26 +16,9 @@ pub(crate) use exec::execute_epoch_multi;
 // Instruction set
 // ---------------------------------------------------------------------------
 
-/// Unrecoverable VM epoch failure: a Reduce trace cursor the compiler promised
-/// is unbound, i.e. the compiled circuit is malformed. Consumed exhaustively by
-/// `dag`'s `vm_epoch_result`, which fail-stops — a future *recoverable*
-/// (data/query-level) VM error must be a new variant routed to
-/// transaction-level failure there, never funneled into the abort.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VmError {
-    /// A Reduce's `trace_out_reg` has no bound cursor.
-    TraceOutCursorUnbound,
-    /// A Reduce's `trace_in_reg` is set but has no bound cursor.
-    TraceInCursorUnbound,
-}
-
 /// One VM instruction with all operator-specific data pre-resolved.
 pub(crate) enum Instr {
     Halt,
-    ScanTrace {
-        trace_reg: u16,
-        out_reg: u16,
-    },
     Filter {
         in_reg: u16,
         out_reg: u16,
@@ -138,7 +121,7 @@ pub(crate) fn reads_reg(instr: &Instr, r: u16) -> bool {
         | Instr::Reduce { in_reg, .. } => *in_reg == r,
         Instr::Union { in_a, in_b, .. } => *in_a == r || *in_b == r,
         Instr::JoinDT { delta_reg, .. } | Instr::JoinDTRange { delta_reg, .. } => *delta_reg == r,
-        Instr::ScanTrace { .. } | Instr::Halt => false,
+        Instr::Halt => false,
     }
 }
 
@@ -170,10 +153,9 @@ pub(crate) struct IntegrateAvi {
 pub(crate) struct VmHandle {
     pub program: Program,
     pub regfile: RegisterFile,
-    /// Cursor handles for owned trace registers, kept alive across the epoch.
-    /// Indexed in parallel with `owned_trace_regs`. Cursor destructors
-    /// dereference the `Table` they were opened against, so this MUST drop
-    /// before `owned_tables`.
+    /// Cursor handles for the trace registers, kept alive across the epoch.
+    /// Indexed in parallel with `trace_regs`. Cursor destructors dereference the
+    /// `Table` they were opened against, so this MUST drop before `owned_tables`.
     owned_cursor_handles: Vec<Option<Box<ReadCursor>>>,
     /// Child tables created during compilation (history, reduce-in, AVI).
     /// `program.tables` may point into these.  Dropped AFTER `program`.
@@ -183,9 +165,10 @@ pub(crate) struct VmHandle {
     /// `program.funcs` may point into these.  Dropped AFTER `program`.
     #[allow(dead_code)]
     pub owned_funcs: Vec<Box<ScalarFunc>>,
-    /// Trace registers backed by owned tables: `(reg_id, index into owned_tables)`.
-    /// `execute_epoch` creates cursors from these before dispatch.
-    pub owned_trace_regs: Vec<(u16, usize)>,
+    /// `(reg_id, index into owned_tables)` for every trace register, derived
+    /// once from `program.reg_meta` so the per-epoch refresh walks only the
+    /// trace registers instead of the whole register file.
+    trace_regs: Vec<(u16, usize)>,
 }
 
 // Compile-time proof that `program` precedes all owned resource vecs, so
@@ -197,24 +180,21 @@ const _: () =
     assert!(std::mem::offset_of!(VmHandle, owned_cursor_handles) < std::mem::offset_of!(VmHandle, owned_tables));
 
 impl VmHandle {
-    /// Compact owned tables and create fresh cursors for owned trace registers.
-    /// Must be called before `execute_epoch` for compiler-produced plans.
+    /// Compact owned tables and create fresh cursors for the trace registers.
+    /// Must be called before `execute_epoch`: the dispatch loop dereferences
+    /// every trace register's cursor without a null check.
     /// The cursor handles are stored in `owned_cursor_handles` and their
     /// raw pointers bound into the register file.
     pub fn refresh_owned_cursors(&mut self) {
-        gnitz_debug!(
-            "vm: refresh_owned_cursors, {} owned trace regs",
-            self.owned_trace_regs.len()
-        );
+        gnitz_debug!("vm: refresh_owned_cursors, {} trace regs", self.trace_regs.len());
         // Drop previous cursors before creating new ones (releases shard refs
         // etc.), then size the slot storage back to full length.
         self.null_owned_cursors();
-        self.owned_cursor_handles
-            .resize_with(self.owned_trace_regs.len(), || None);
-        for (slot, &(reg_id, table_idx)) in self.owned_trace_regs.iter().enumerate() {
+        self.owned_cursor_handles.resize_with(self.trace_regs.len(), || None);
+        for (slot, &(reg_id, table_idx)) in self.trace_regs.iter().enumerate() {
             // SAFETY: table_idx is valid (set during compilation). We need &mut
-            // to the table, but we also hold &self.owned_trace_regs. This is safe
-            // because owned_trace_regs is not modified here, and the table is
+            // to the table, but we also hold &self.trace_regs. This is safe
+            // because trace_regs is not modified here, and the table is
             // accessed through owned_tables which is a separate field.
             let table: &mut Table = unsafe { &mut *(&mut *self.owned_tables[table_idx] as *mut Table) };
             // Operator-state read path: compact first so L0 on owned trace
@@ -246,12 +226,12 @@ impl VmHandle {
     /// keep their own `Rc<Batch>` / shard `Arc` clones (a fold produces a
     /// stale-not-dangling snapshot) and the next epoch calls
     /// `refresh_owned_cursors` before any deref — but nulling here keeps the
-    /// flush's safety local and obvious. Only `owned_trace_regs` are handled
+    /// flush's safety local and obvious. Only `trace_regs` are handled
     /// (`_int_`/`_hist_`/`_reduce_`/`_reduce_in_`, all cross-epoch); the epoch-local
     /// `_avidx_` cursor is created and dropped inside the `Reduce` instruction.
     pub fn null_owned_cursors(&mut self) {
         self.owned_cursor_handles.clear(); // drops every held cursor
-        for &(reg_id, _table_idx) in &self.owned_trace_regs {
+        for &(reg_id, _table_idx) in &self.trace_regs {
             self.regfile.registers[reg_id as usize].cursor_ptr = std::ptr::null_mut();
         }
     }
@@ -261,38 +241,28 @@ impl VmHandle {
 // Program
 // ---------------------------------------------------------------------------
 
-/// Register kind: delta (transient) or trace (persistent cursor + table).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RegisterKind {
-    Delta,
-    Trace,
-}
-
 /// Per-register metadata.
 #[derive(Clone, Copy)]
 pub(crate) struct RegisterMeta {
     pub schema: SchemaDescriptor,
-    pub kind: RegisterKind,
-    /// Trace register backed by one of the plan's OWNED tables — its cursor is
-    /// set by `refresh_owned_cursors` and `bind_cursors` must leave it alone.
-    /// Baked by `build_with_owned` from `owned_trace_regs`, so the per-epoch
-    /// bind does no per-register list scan.
-    pub is_owned: bool,
+    /// A trace register's backing table, as an index into
+    /// `VmHandle::owned_tables`; `None` for a delta register. Naming the table
+    /// here rather than in a side list is what lets `refresh_owned_cursors`
+    /// guarantee every trace register holds a live cursor at dispatch.
+    pub owned_table: Option<u16>,
 }
 
 impl RegisterMeta {
     pub const fn delta(schema: SchemaDescriptor) -> Self {
         Self {
             schema,
-            kind: RegisterKind::Delta,
-            is_owned: false,
+            owned_table: None,
         }
     }
-    pub const fn trace(schema: SchemaDescriptor) -> Self {
+    pub const fn trace(schema: SchemaDescriptor, owned_table: u16) -> Self {
         Self {
             schema,
-            kind: RegisterKind::Trace,
-            is_owned: false,
+            owned_table: Some(owned_table),
         }
     }
 }
@@ -358,32 +328,10 @@ impl RegisterFile {
         RegisterFile { registers }
     }
 
-    /// Bind cursor handles into trace registers.
-    /// Each non-null handle is borrowed for the duration of the epoch.
-    /// Owned trace registers (`meta.is_owned`, already set by
-    /// `refresh_owned_cursors`) are skipped entirely. External trace registers
-    /// are always written from `handles` — stale pointers from prior epochs are
-    /// never preserved.
-    pub fn bind_cursors(&mut self, metas: &[RegisterMeta], handles: &[*mut ReadCursor]) {
-        for (i, (reg, meta)) in self.registers.iter_mut().zip(metas).enumerate() {
-            if meta.kind == RegisterKind::Trace {
-                if meta.is_owned {
-                    // Cursor was set by refresh_owned_cursors; leave it alone.
-                } else if i < handles.len() && !handles[i].is_null() {
-                    reg.cursor_ptr = handles[i];
-                } else {
-                    reg.cursor_ptr = std::ptr::null_mut();
-                }
-            } else {
-                reg.cursor_ptr = std::ptr::null_mut();
-            }
-        }
-    }
-
     /// Clear delta batches without refreshing cursors.
     pub fn clear_deltas(&mut self, metas: &[RegisterMeta]) {
         for (reg, meta) in self.registers.iter_mut().zip(metas) {
-            if meta.kind == RegisterKind::Delta && meta.schema.num_columns() > 0 {
+            if meta.owned_table.is_none() && meta.schema.num_columns() > 0 {
                 reg.batch.clear();
             }
         }
@@ -422,7 +370,7 @@ mod tests {
         trace_batch.extend_col(0, &20i64.to_le_bytes());
         trace_batch.count += 1;
 
-        let metas = [RegisterMeta::delta(schema), RegisterMeta::trace(schema)];
+        let metas = [RegisterMeta::delta(schema), RegisterMeta::trace(schema, 0)];
         let mut rf = RegisterFile {
             registers: vec![
                 Register {
@@ -442,6 +390,24 @@ mod tests {
     }
 
     // ── Test helpers ─────────────────────────────────────────────────────
+
+    /// A boxed table under `dir`, plus a raw pointer to it — the shape
+    /// `build_with_owned` takes for a trace register's backing store. Boxing is
+    /// what keeps the pointer valid once the table moves into `owned_tables`.
+    fn owned_table(dir: &std::path::Path, name: &str, schema: SchemaDescriptor) -> (Box<Table>, *mut Table) {
+        let mut t = Box::new(
+            Table::new(
+                dir.join(name).to_str().unwrap(),
+                schema,
+                0,
+                1 << 20,
+                crate::storage::RecoverySource::Rederive,
+            )
+            .unwrap(),
+        );
+        let ptr = &mut *t as *mut Table;
+        (t, ptr)
+    }
 
     /// A plain integrate of `in_reg` into `table` (no AVI) — the shape every
     /// test integrate uses.
@@ -586,10 +552,7 @@ mod tests {
 
         let reg_meta = [RegisterMeta::delta(schema); 3];
         let vm = builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 3];
-        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 2, &cursors)
-            .unwrap()
-            .unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 2).unwrap();
 
         let rows = extract_rows(&result);
         assert_eq!(rows.len(), 2);
@@ -622,8 +585,7 @@ mod tests {
 
         let reg_meta = [RegisterMeta::delta(schema); 3];
         let vm = builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 3];
-        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1, &cursors).unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1);
 
         assert!(result.is_none());
     }
@@ -645,8 +607,7 @@ mod tests {
 
         let reg_meta = [RegisterMeta::delta(schema); 3];
         let vm = builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 3];
-        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1, &cursors).unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1);
 
         assert!(result.is_none());
     }
@@ -670,16 +631,8 @@ mod tests {
 
         let reg_meta = [RegisterMeta::delta(schema); 3];
         let vm = builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 3];
-        let result = execute_epoch_multi(
-            &vm.program,
-            &mut { vm.regfile },
-            [(0u16, input), (2u16, input_b)],
-            1,
-            &cursors,
-        )
-        .unwrap()
-        .unwrap();
+        let result =
+            execute_epoch_multi(&vm.program, &mut { vm.regfile }, [(0u16, input), (2u16, input_b)], 1).unwrap();
 
         assert_eq!(result.count, 3);
     }
@@ -700,10 +653,7 @@ mod tests {
         let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 3, 20)]);
         let reg_meta = [RegisterMeta::delta(schema); 2];
         let vm = builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 2];
-        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1, &cursors)
-            .unwrap()
-            .unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1).unwrap();
         let rows = extract_rows(&result);
         assert_eq!(
             rows,
@@ -730,10 +680,7 @@ mod tests {
 
         let reg_meta = [RegisterMeta::delta(schema); 3];
         let vm = builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 3];
-        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1, &cursors)
-            .unwrap()
-            .unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1).unwrap();
 
         let rows = extract_rows(&result);
         assert_eq!(rows.len(), 2);
@@ -757,20 +704,15 @@ mod tests {
 
         let reg_meta = [RegisterMeta::delta(schema); 3];
         let mut vm = *builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 3];
 
         // Tick 1
         let input1 = make_batch(schema, &[(1u128, 1, 10)]);
-        let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 1, &cursors)
-            .unwrap()
-            .unwrap();
+        let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 1).unwrap();
         assert_eq!(r1.count, 1);
 
         // Tick 2 with different data
         let input2 = make_batch(schema, &[(2u128, 1, 20), (3u128, 1, 30)]);
-        let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 1, &cursors)
-            .unwrap()
-            .unwrap();
+        let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 1).unwrap();
         // Should have exactly 2 rows from tick 2, not 3 (no bleed from tick 1)
         assert_eq!(r2.count, 2);
         let rows = extract_rows(&r2);
@@ -805,10 +747,7 @@ mod tests {
 
         let reg_meta = [RegisterMeta::delta(in_schema), RegisterMeta::delta(out_schema)];
         let vm = builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 2];
-        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1, &cursors)
-            .unwrap()
-            .unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1).unwrap();
 
         let rows = extract_rows(&result);
         assert_eq!(rows.len(), 2);
@@ -828,18 +767,7 @@ mod tests {
         let schema = schema_1i64();
 
         let dir = tempfile::tempdir().unwrap();
-        let tdir = dir.path().join("dist_test");
-        let mut table = Table::new(
-            tdir.to_str().unwrap(),
-            schema,
-            0,
-            1 << 20,
-            crate::storage::RecoverySource::Rederive,
-        )
-        .unwrap();
-
-        let table_ptr = &mut table as *mut Table;
-
+        let (table, table_ptr) = owned_table(dir.path(), "dist_test", schema);
         let mut builder = ProgramBuilder::new();
         // reg 0 = input delta, reg 1 = history trace, reg 2 = output delta
         let hist_table_idx = builder.table_idx(table_ptr) as u16;
@@ -855,58 +783,38 @@ mod tests {
 
         let reg_meta = [
             RegisterMeta::delta(schema),
-            RegisterMeta::trace(schema),
+            RegisterMeta::trace(schema, 0),
             RegisterMeta::delta(schema),
         ];
 
-        let mut vm = *builder.build(&reg_meta);
+        // The history register is backed by the plan's owned table, so each tick
+        // opens its cursor through `refresh_owned_cursors` — the production path.
+        let mut vm = *builder.build_with_owned(reg_meta.to_vec(), vec![table], Vec::new());
 
         // Tick 1: insert pk=1 with weight +3 → distinct output should be +1
         let input1 = make_batch(schema, &[(1u128, 3, 42)]);
-        // Need to create a cursor for the history register
-        let cursor1 = table.open_cursor();
-        let ch1 = Box::into_raw(Box::new(cursor1));
-        let cursors1 = vec![std::ptr::null_mut(), ch1, std::ptr::null_mut()];
-
-        let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2, &cursors1)
-            .unwrap()
-            .unwrap();
+        vm.refresh_owned_cursors();
+        let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2).unwrap();
 
         let rows1 = extract_rows(&r1);
         assert_eq!(rows1.len(), 1);
         assert_eq!(rows1[0], (1, 1, 42)); // clamped to +1
 
-        unsafe {
-            drop(Box::from_raw(ch1));
-        }
-
         // Tick 2: delta w=-1, integral before tick = +3, after = +2 (still positive).
         // No boundary crossing → output should be empty.
-        let cursor2 = table.open_cursor();
-        let ch2 = Box::into_raw(Box::new(cursor2));
-        let cursors2 = vec![std::ptr::null_mut(), ch2, std::ptr::null_mut()];
         let input2 = make_batch(schema, &[(1u128, -1, 42)]);
-        let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 2, &cursors2).unwrap();
+        vm.refresh_owned_cursors();
+        let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 2);
         assert!(r2.is_none(), "no boundary crossing: output should be empty");
-        unsafe {
-            drop(Box::from_raw(ch2));
-        }
 
         // Tick 3: delta w=-2, integral before tick = +2, after = 0 (non-positive).
         // Positive→non-positive boundary crossed → retraction: output pk=1 w=-1.
-        let cursor3 = table.open_cursor();
-        let ch3 = Box::into_raw(Box::new(cursor3));
-        let cursors3 = vec![std::ptr::null_mut(), ch3, std::ptr::null_mut()];
         let input3 = make_batch(schema, &[(1u128, -2, 42)]);
-        let r3 = execute_epoch(&vm.program, &mut vm.regfile, input3, 0, 2, &cursors3)
-            .unwrap()
-            .unwrap();
+        vm.refresh_owned_cursors();
+        let r3 = execute_epoch(&vm.program, &mut vm.regfile, input3, 0, 2).unwrap();
         let rows3 = extract_rows(&r3);
         assert_eq!(rows3.len(), 1);
         assert_eq!(rows3[0], (1, -1, 42)); // retraction
-        unsafe {
-            drop(Box::from_raw(ch3));
-        }
     }
 
     #[test]
@@ -920,22 +828,10 @@ mod tests {
         let join_schema = make_schema(&[type_code::I64, type_code::I64]);
 
         let dir = tempfile::tempdir().unwrap();
-        let tdir = dir.path().join("join_test");
-        let mut table = Table::new(
-            tdir.to_str().unwrap(),
-            right_schema,
-            0,
-            1 << 20,
-            crate::storage::RecoverySource::Rederive,
-        )
-        .unwrap();
-
+        let (mut table, _) = owned_table(dir.path(), "join_test", right_schema);
         // Ingest trace data
         let trace_batch = make_batch(right_schema, &[(10u128, 1, 200)]);
         table.ingest_owned_batch(trace_batch).unwrap();
-
-        let cursor = table.open_cursor();
-        let ch = Box::into_raw(Box::new(cursor));
 
         let mut builder = ProgramBuilder::new();
         // reg 0 = left delta, reg 1 = right trace, reg 2 = output
@@ -948,17 +844,15 @@ mod tests {
 
         let reg_meta = [
             RegisterMeta::delta(left_schema),
-            RegisterMeta::trace(right_schema),
+            RegisterMeta::trace(right_schema, 0),
             RegisterMeta::delta(join_schema),
         ];
 
-        let mut vm = *builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(), ch, std::ptr::null_mut()];
+        let mut vm = *builder.build_with_owned(reg_meta.to_vec(), vec![table], Vec::new());
+        vm.refresh_owned_cursors();
 
         let input = make_batch(left_schema, &[(10u128, 1, 100)]);
-        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2, &cursors)
-            .unwrap()
-            .unwrap();
+        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2).unwrap();
 
         assert_eq!(result.count, 1);
         // Weight should be product: 1*1 = 1
@@ -969,10 +863,6 @@ mod tests {
         let c1 = i64::from_le_bytes(result.col_data(1)[0..8].try_into().unwrap());
         assert_eq!(c0, 100);
         assert_eq!(c1, 200);
-
-        unsafe {
-            drop(Box::from_raw(ch));
-        }
     }
 
     #[test]
@@ -983,22 +873,10 @@ mod tests {
         let join_schema = make_schema(&[type_code::I64, type_code::I64]);
 
         let dir = tempfile::tempdir().unwrap();
-        let tdir = dir.path().join("join_multi_test");
-        let mut table = Table::new(
-            tdir.to_str().unwrap(),
-            right_schema,
-            0,
-            1 << 20,
-            crate::storage::RecoverySource::Rederive,
-        )
-        .unwrap();
-
+        let (mut table, _) = owned_table(dir.path(), "join_multi_test", right_schema);
         // Ingest 3 trace rows with same PK but different payloads
         let trace_batch = make_batch(right_schema, &[(10u128, 1, 100), (10u128, 1, 200), (10u128, 1, 300)]);
         table.ingest_owned_batch(trace_batch).unwrap();
-
-        let cursor = table.open_cursor();
-        let ch = Box::into_raw(Box::new(cursor));
 
         let mut builder = ProgramBuilder::new();
         builder.push(Instr::JoinDT {
@@ -1010,16 +888,14 @@ mod tests {
 
         let reg_meta = [
             RegisterMeta::delta(left_schema),
-            RegisterMeta::trace(right_schema),
+            RegisterMeta::trace(right_schema, 0),
             RegisterMeta::delta(join_schema),
         ];
-        let mut vm = *builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(), ch, std::ptr::null_mut()];
+        let mut vm = *builder.build_with_owned(reg_meta.to_vec(), vec![table], Vec::new());
+        vm.refresh_owned_cursors();
 
         let input = make_batch(left_schema, &[(10u128, 2, 50)]); // weight=2
-        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2, &cursors)
-            .unwrap()
-            .unwrap();
+        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2).unwrap();
 
         // Should produce 3 output rows (1 delta × 3 trace)
         assert_eq!(result.count, 3);
@@ -1027,10 +903,6 @@ mod tests {
         for i in 0..3 {
             let w = i64::from_le_bytes(result.weight_data()[i * 8..(i + 1) * 8].try_into().unwrap());
             assert_eq!(w, 2);
-        }
-
-        unsafe {
-            drop(Box::from_raw(ch));
         }
     }
 
@@ -1085,10 +957,7 @@ mod tests {
 
         let reg_meta = [RegisterMeta::delta(schema); 3];
         let vm = builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 3];
-        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1, &cursors)
-            .unwrap()
-            .unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1).unwrap();
 
         let rows = extract_rows(&result);
         assert_eq!(rows.len(), 1);
@@ -1110,31 +979,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         // trace_out table
-        let tout_dir = dir.path().join("tr_out");
-        let mut trace_out_table = Table::new(
-            tout_dir.to_str().unwrap(),
-            out_schema,
-            0,
-            1 << 20,
-            crate::storage::RecoverySource::Rederive,
-        )
-        .unwrap();
-
-        let trace_out_ptr = &mut trace_out_table as *mut Table;
-
+        let (trace_out_table, trace_out_ptr) = owned_table(dir.path(), "tr_out", out_schema);
         // trace_in table (for non-linear agg, but SUM is linear — still test the path)
-        let tin_dir = dir.path().join("tr_in");
-        let mut trace_in_table = Table::new(
-            tin_dir.to_str().unwrap(),
-            in_schema,
-            0,
-            1 << 20,
-            crate::storage::RecoverySource::Rederive,
-        )
-        .unwrap();
-
-        let trace_in_ptr = &mut trace_in_table as *mut Table;
-
+        let (trace_in_table, trace_in_ptr) = owned_table(dir.path(), "tr_in", in_schema);
         // Agg descriptors: SUM of payload col 1 (schema col 2), plus the trailing
         // Count cardinality companion every all-linear reduce carries.
         let agg_descs = [
@@ -1190,13 +1037,14 @@ mod tests {
 
         let reg_meta = [
             RegisterMeta::delta(in_schema),
-            RegisterMeta::trace(out_schema),
+            RegisterMeta::trace(out_schema, 0),
             RegisterMeta::delta(out_schema),
-            RegisterMeta::trace(in_schema),
+            RegisterMeta::trace(in_schema, 1),
             RegisterMeta::delta(in_schema),
         ];
 
-        let mut vm = *builder.build(&reg_meta);
+        // reg 1 = trace_out (owned table 0), reg 3 = trace_in (owned table 1)
+        let mut vm = *builder.build_with_owned(reg_meta.to_vec(), vec![trace_out_table, trace_in_table], Vec::new());
 
         // Tick 1: Insert group=1 with values 10, 20
         let input1 = make_batch_2col(
@@ -1207,129 +1055,13 @@ mod tests {
             ],
         );
 
-        // Create cursors for trace registers
-        let tr_out_cursor = trace_out_table.open_cursor();
-        let tr_out_ch = Box::into_raw(Box::new(tr_out_cursor));
-        let tr_in_cursor = trace_in_table.open_cursor();
-        let tr_in_ch = Box::into_raw(Box::new(tr_in_cursor));
-
-        let cursors1 = vec![
-            std::ptr::null_mut(), // reg 0: delta
-            tr_out_ch,            // reg 1: trace_out
-            std::ptr::null_mut(), // reg 2: delta
-            tr_in_ch,             // reg 3: trace_in
-            std::ptr::null_mut(), // reg 4
-        ];
-
-        let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2, &cursors1)
-            .unwrap()
-            .unwrap();
+        vm.refresh_owned_cursors();
+        let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2).unwrap();
 
         // SUM of group=1: 10+20 = 30. Output should be one row with sum=30.
         assert_eq!(r1.count, 1, "one group → one output row");
         let sum_val = i64::from_le_bytes(r1.col_data(1)[0..8].try_into().unwrap());
         assert_eq!(sum_val, 30, "SUM(10+20) must be 30");
-
-        // Cleanup
-        unsafe {
-            drop(Box::from_raw(tr_out_ch));
-        }
-        unsafe {
-            drop(Box::from_raw(tr_in_ch));
-        }
-    }
-
-    // Item 41: a non-linear aggregate (MIN) requires trace_in to recompute on
-    // retraction. If the trace_in cursor cannot be opened (null) while
-    // trace_in_reg >= 0, the VM must abort with Err(-11) rather than silently
-    // producing wrong aggregates.
-    #[test]
-    fn test_reduce_trace_in_null_cursor_aborts() {
-        let in_schema = make_schema(&[type_code::I64, type_code::I64]);
-        let out_schema = make_schema(&[type_code::I64, type_code::I64]);
-        let agg_descs = [AggDescriptor {
-            col_idx: 2,
-            agg_op: AggFunc::Min,
-            col_type_code: TypeCode::I64,
-        }];
-        let group_cols = [1u32];
-
-        let mut builder = ProgramBuilder::new();
-        push_reduce(
-            &mut builder,
-            0,
-            Some(3),
-            1,
-            2,
-            &agg_descs,
-            &group_cols,
-            in_schema,
-            out_schema,
-            in_schema.reduce_out_key(&group_cols),
-        );
-        builder.push(Instr::Halt);
-
-        let reg_meta = [
-            RegisterMeta::delta(in_schema),
-            RegisterMeta::trace(out_schema),
-            RegisterMeta::delta(out_schema),
-            RegisterMeta::trace(in_schema),
-        ];
-        let mut vm = *builder.build(&reg_meta);
-
-        let input = make_batch_2col(in_schema, &[(1u128, 1, 1, 10)]);
-        // All cursors null ⟹ trace_in cursor is null with trace_in_reg >= 0.
-        let cursors = vec![std::ptr::null_mut(); 4];
-        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2, &cursors);
-        assert!(
-            matches!(result, Err(VmError::TraceInCursorUnbound)),
-            "null trace_in cursor must abort Reduce with TraceInCursorUnbound",
-        );
-    }
-
-    // Item 41 (companion): trace_out_reg always checked; if its cursor is null
-    // the VM must return Err(-10). Disable trace_in (pass -1) so Err(-11) is
-    // not reached first.
-    #[test]
-    fn test_reduce_trace_out_null_cursor_aborts() {
-        let in_schema = make_schema(&[type_code::I64, type_code::I64]);
-        let out_schema = make_schema(&[type_code::I64, type_code::I64]);
-        let agg_descs = [AggDescriptor {
-            col_idx: 2,
-            agg_op: AggFunc::Sum,
-            col_type_code: TypeCode::I64,
-        }];
-        let group_cols = [1u32];
-
-        let mut builder = ProgramBuilder::new();
-        push_reduce(
-            &mut builder,
-            0,
-            None,
-            1,
-            2,
-            &agg_descs,
-            &group_cols,
-            in_schema,
-            out_schema,
-            in_schema.reduce_out_key(&group_cols),
-        );
-        builder.push(Instr::Halt);
-
-        let reg_meta = [
-            RegisterMeta::delta(in_schema),
-            RegisterMeta::trace(out_schema),
-            RegisterMeta::delta(out_schema),
-        ];
-        let mut vm = *builder.build(&reg_meta);
-
-        let input = make_batch_2col(in_schema, &[(1u128, 1, 1, 10)]);
-        let cursors = vec![std::ptr::null_mut(); 3];
-        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2, &cursors);
-        assert!(
-            matches!(result, Err(VmError::TraceOutCursorUnbound)),
-            "null trace_out cursor must abort Reduce with TraceOutCursorUnbound",
-        );
     }
 
     #[test]
@@ -1432,10 +1164,7 @@ mod tests {
 
         let reg_meta = [RegisterMeta::delta(schema); 2];
         let vm = builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 2];
-        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1, &cursors)
-            .unwrap()
-            .unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1).unwrap();
 
         let rows = extract_rows(&result);
         assert_eq!(rows.len(), 3, "filter col1>25 should keep 3 rows (30,40,50)");
@@ -1462,29 +1191,8 @@ mod tests {
         ]);
 
         let dir = tempfile::tempdir().unwrap();
-
-        let tout_dir = dir.path().join("ma_tr_out");
-        let mut trace_out_table = Table::new(
-            tout_dir.to_str().unwrap(),
-            out_schema,
-            0,
-            1 << 20,
-            crate::storage::RecoverySource::Rederive,
-        )
-        .unwrap();
-        let trace_out_ptr = &mut trace_out_table as *mut Table;
-
-        let tin_dir = dir.path().join("ma_tr_in");
-        let mut trace_in_table = Table::new(
-            tin_dir.to_str().unwrap(),
-            in_schema,
-            0,
-            1 << 20,
-            crate::storage::RecoverySource::Rederive,
-        )
-        .unwrap();
-        let trace_in_ptr = &mut trace_in_table as *mut Table;
-
+        let (trace_out_table, trace_out_ptr) = owned_table(dir.path(), "ma_tr_out", out_schema);
+        let (trace_in_table, trace_in_ptr) = owned_table(dir.path(), "ma_tr_in", in_schema);
         // Two agg descriptors: COUNT(col=1) and SUM(col=1)
         let agg_descs = [
             AggDescriptor {
@@ -1522,32 +1230,18 @@ mod tests {
 
         let reg_meta = [
             RegisterMeta::delta(in_schema),
-            RegisterMeta::trace(out_schema),
+            RegisterMeta::trace(out_schema, 0),
             RegisterMeta::delta(out_schema),
-            RegisterMeta::trace(in_schema),
+            RegisterMeta::trace(in_schema, 1),
             RegisterMeta::delta(in_schema),
         ];
-        let mut vm = *builder.build(&reg_meta);
+        let mut vm = *builder.build_with_owned(reg_meta.to_vec(), vec![trace_out_table, trace_in_table], Vec::new());
 
         // Input: 3 rows all with pk=1, vals 10, 20, 30
         let input = make_batch(in_schema, &[(1u128, 1, 10), (1u128, 1, 20), (1u128, 1, 30)]);
 
-        let tr_out_cursor = trace_out_table.open_cursor();
-        let tr_out_ch = Box::into_raw(Box::new(tr_out_cursor));
-        let tr_in_cursor = trace_in_table.open_cursor();
-        let tr_in_ch = Box::into_raw(Box::new(tr_in_cursor));
-
-        let cursors = vec![
-            std::ptr::null_mut(),
-            tr_out_ch,
-            std::ptr::null_mut(),
-            tr_in_ch,
-            std::ptr::null_mut(),
-        ];
-
-        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2, &cursors)
-            .unwrap()
-            .unwrap();
+        vm.refresh_owned_cursors();
+        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2).unwrap();
 
         // Should produce 1 row: pk=1, count=3, sum=60
         assert_eq!(result.count, 1, "multi-agg should produce 1 group");
@@ -1555,13 +1249,6 @@ mod tests {
         let sum_val = i64::from_le_bytes(result.col_data(1)[0..8].try_into().unwrap());
         assert_eq!(count_val, 3, "COUNT should be 3");
         assert_eq!(sum_val, 60, "SUM should be 60");
-
-        unsafe {
-            drop(Box::from_raw(tr_out_ch));
-        }
-        unsafe {
-            drop(Box::from_raw(tr_in_ch));
-        }
     }
 
     /// Proper SUM test: use agg_op=2 (AGG_SUM) and verify the actual aggregate
@@ -1573,29 +1260,8 @@ mod tests {
         let out_schema = make_schema(&[type_code::I64, type_code::I64]);
 
         let dir = tempfile::tempdir().unwrap();
-
-        let tout_dir = dir.path().join("sv_tr_out");
-        let mut trace_out_table = Table::new(
-            tout_dir.to_str().unwrap(),
-            out_schema,
-            0,
-            1 << 20,
-            crate::storage::RecoverySource::Rederive,
-        )
-        .unwrap();
-        let trace_out_ptr = &mut trace_out_table as *mut Table;
-
-        let tin_dir = dir.path().join("sv_tr_in");
-        let mut trace_in_table = Table::new(
-            tin_dir.to_str().unwrap(),
-            in_schema,
-            0,
-            1 << 20,
-            crate::storage::RecoverySource::Rederive,
-        )
-        .unwrap();
-        let trace_in_ptr = &mut trace_in_table as *mut Table;
-
+        let (trace_out_table, trace_out_ptr) = owned_table(dir.path(), "sv_tr_out", out_schema);
+        let (trace_in_table, trace_in_ptr) = owned_table(dir.path(), "sv_tr_in", in_schema);
         // SUM of col 1 (agg_op=2 = AGG_SUM, not AGG_COUNT) plus the trailing Count
         // cardinality companion every all-linear reduce carries.
         let agg_descs = [
@@ -1632,91 +1298,21 @@ mod tests {
 
         let reg_meta = [
             RegisterMeta::delta(in_schema),
-            RegisterMeta::trace(out_schema),
-            RegisterMeta::trace(in_schema),
+            RegisterMeta::trace(out_schema, 0),
+            RegisterMeta::trace(in_schema, 1),
             RegisterMeta::delta(out_schema),
         ];
-        let mut vm = *builder.build(&reg_meta);
+        // reg 1 = trace_out (owned table 0), reg 2 = trace_in (owned table 1)
+        let mut vm = *builder.build_with_owned(reg_meta.to_vec(), vec![trace_out_table, trace_in_table], Vec::new());
 
         // Three rows all in the same group (same pk), values 10, 20, 30 → SUM=60
         let input = make_batch(in_schema, &[(1u128, 1, 10), (1u128, 1, 20), (1u128, 1, 30)]);
 
-        let tr_out_ch = Box::into_raw(Box::new(trace_out_table.open_cursor()));
-        let tr_in_ch = Box::into_raw(Box::new(trace_in_table.open_cursor()));
-        let cursors = vec![std::ptr::null_mut(), tr_out_ch, tr_in_ch, std::ptr::null_mut()];
-
-        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 3, &cursors)
-            .unwrap()
-            .expect("SUM reduce must produce output");
+        vm.refresh_owned_cursors();
+        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 3).expect("SUM reduce must produce output");
 
         assert_eq!(result.count, 1, "one group → one output row");
         let sum_val = i64::from_le_bytes(result.col_data(0)[0..8].try_into().unwrap());
         assert_eq!(sum_val, 60, "SUM(10+20+30) must be 60");
-
-        unsafe {
-            drop(Box::from_raw(tr_out_ch));
-        }
-        unsafe {
-            drop(Box::from_raw(tr_in_ch));
-        }
-    }
-
-    // ── Fix regression: stale external cursor in bind_cursors ─────────────
-
-    #[test]
-    fn test_bind_cursors_clears_stale_external_cursor() {
-        // An external trace register that supplies a cursor in epoch N must NOT
-        // retain a dangling pointer in epoch N+1 if the caller passes null.
-        // bind_cursors must unconditionally null out external trace registers
-        // when no handle is provided.
-        let schema = schema_1i64();
-
-        let dir = tempfile::tempdir().unwrap();
-        let tdir = dir.path().join("stale_cursor_test");
-        let table = Table::new(
-            tdir.to_str().unwrap(),
-            schema,
-            0,
-            1 << 20,
-            crate::storage::RecoverySource::Rederive,
-        )
-        .unwrap();
-
-        // reg 0 = input delta (kind 0), reg 1 = external trace (kind 1), reg 2 = output delta
-        let mut builder = ProgramBuilder::new();
-        builder.push(Instr::JoinDT {
-            delta_reg: 0,
-            trace_reg: 1,
-            out_reg: 2,
-        });
-        builder.push(Instr::Halt);
-
-        let reg_meta = [
-            RegisterMeta::delta(schema),
-            RegisterMeta::trace(schema),
-            RegisterMeta::delta(make_schema(&[type_code::I64, type_code::I64])),
-        ];
-        let mut vm = *builder.build(&reg_meta);
-
-        // Epoch 1: supply a real cursor for reg 1.
-        let cursor1 = table.open_cursor();
-        let ch1 = Box::into_raw(Box::new(cursor1));
-        let cursors1 = vec![std::ptr::null_mut(), ch1, std::ptr::null_mut()];
-        execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[]), 0, 2, &cursors1).unwrap();
-        unsafe { drop(Box::from_raw(ch1)) };
-        // ch1 is now freed; reg 1's cursor_ptr would be dangling if not cleared.
-
-        // Epoch 2: pass null for the external trace register.
-        // bind_cursors must write null, not preserve the freed pointer.
-        let cursors2 = vec![std::ptr::null_mut(); 3];
-        execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[]), 0, 2, &cursors2).unwrap();
-
-        // If the stale pointer were preserved, reading reg 1's cursor_ptr inside
-        // execute_epoch would be UB / crash. Reaching here means it was correctly
-        // cleared to null.
-        assert!(
-            vm.regfile.registers[1].cursor_ptr.is_null(),
-            "external trace register must be null after epoch with null handle"
-        );
     }
 }

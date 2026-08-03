@@ -74,7 +74,7 @@ use gnitz_wire::{
 /// One tick request to `tick_loop`.
 pub enum TickTrigger {
     /// Fire-and-forget trigger from INSERT when a tid crosses the row
-    /// coalesce threshold.  Tids come from `tick_rows` / `tick_tids`.
+    /// coalesce threshold.  Tids come from `tick_rows`.
     Auto,
     /// Explicit drain requested by a read or by the checkpoint: tick whatever is
     /// pending — even nothing — and report the tick's verdict on `done`. A reader
@@ -167,9 +167,11 @@ pub struct Shared {
     /// committer so SCAN/SEEK handlers report the same LSN it assigns.
     lsn_alloc: Rc<ZoneLsnAllocator>,
     last_tick_lsn: Rc<Cell<u64>>,
-    /// Per-table row counter feeding the tick threshold.
+    /// Tables with a pending delta, each with the row count feeding the tick
+    /// threshold. `run_tick` writes one `FLAG_TICK` group per tid inside one
+    /// `sal_writer_excl` window before awaiting any ACK, so the order the map
+    /// yields them in only changes the order the workers see the groups in.
     tick_rows: Rc<RefCell<FxHashMap<i64, usize>>>,
-    tick_tids: Rc<RefCell<Vec<i64>>>,
     /// Per-table write serialization. A push whose validation reads committed
     /// state (`push_reads_committed_state`) and every transaction take the write
     /// guard; a push that reads no committed state takes the read guard, so
@@ -298,42 +300,23 @@ impl Shared {
         self.tick_rows.borrow().values().any(|&rows| rows >= TICK_COALESCE_ROWS)
     }
 
-    /// Drain `tick_rows` and `tick_tids` into `out`, retaining `out`'s
-    /// capacity. Stable insertion order is preserved (anti-join semantics
-    /// require that the b-side trace runs after a-side ticks). The caller's
-    /// scratch buffer is reused across ticks instead of allocating a fresh
-    /// `Vec` per drain.
+    /// Drain the pending tids into `out`, retaining `out`'s capacity — the
+    /// caller's scratch buffer is reused across ticks instead of allocating a
+    /// fresh `Vec` per drain.
     fn drain_tick_rows_into(&self, out: &mut Vec<i64>) {
         out.clear();
-        let mut tids = self.tick_tids.borrow_mut();
-        out.extend(tids.drain(..));
-        self.tick_rows.borrow_mut().clear();
+        out.extend(self.tick_rows.borrow_mut().drain().map(|(tid, _)| tid));
     }
 
     /// Put `tids` back after a tick failed to emit them, so their deltas are
-    /// ticked again instead of stranded. Restores both halves of what
-    /// `drain_tick_rows_into` emptied, with a non-zero count: the committer
-    /// queues a tid on the `*entry == 0` transition, so a restored tid left at 0
-    /// would be queued a second time by the next push and emitted twice. The
-    /// true count is gone; 1 only understates the coalesce threshold, which
-    /// honours the window instead of skipping it. Restored tids go ahead of
-    /// anything queued while the failed tick ran, in their original relative
-    /// order — `drain_tick_rows_into` preserves insertion order because
-    /// anti-join semantics need the a-side first.
+    /// ticked again instead of stranded. Their true row counts are gone; 1 only
+    /// understates the coalesce threshold, which honours the window instead of
+    /// skipping it. A tid a mid-tick push already re-queued keeps that push's
+    /// real count.
     fn requeue_tick_tids(&self, tids: &[i64]) {
-        if tids.is_empty() {
-            return;
-        }
         let mut rows = self.tick_rows.borrow_mut();
-        let mut queue = self.tick_tids.borrow_mut();
-        // A tid a mid-tick push already re-queued moves back to its original
-        // position rather than staying behind the ones being restored. Both
-        // operands are bounded by the tables with pending deltas, and the failed
-        // tick just drained the queue, so this normally scans nothing.
-        queue.retain(|t| !tids.contains(t));
-        queue.splice(0..0, tids.iter().copied());
         for &tid in tids {
-            rows.insert(tid, 1);
+            rows.entry(tid).or_insert(1);
         }
     }
 }
@@ -391,7 +374,6 @@ impl ServerExecutor {
         let lsn_alloc = Rc::new(ZoneLsnAllocator::new(initial_lsn));
         let last_tick_lsn = Rc::new(Cell::new(initial_lsn));
         let tick_rows: Rc<RefCell<FxHashMap<i64, usize>>> = Rc::new(RefCell::new(FxHashMap::default()));
-        let tick_tids: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
 
         let (committer_tx, committer_rx) = mpsc::unbounded::<CommitRequest>();
         let (tick_tx, tick_rx) = mpsc::unbounded::<TickTrigger>();
@@ -414,7 +396,6 @@ impl ServerExecutor {
             num_workers,
             force_checkpoint: Cell::new(false),
             tick_rows: Rc::clone(&tick_rows),
-            tick_tids: Rc::clone(&tick_tids),
             tick_tx: tick_tx.clone(),
             ddl_window: Rc::clone(&ddl_window),
         });
@@ -430,7 +411,6 @@ impl ServerExecutor {
             lsn_alloc: Rc::clone(&lsn_alloc),
             last_tick_lsn: Rc::clone(&last_tick_lsn),
             tick_rows: Rc::clone(&tick_rows),
-            tick_tids: Rc::clone(&tick_tids),
             table_locks: RefCell::new(FxHashMap::default()),
             draining: Rc::clone(&draining),
             ddl_window: Rc::clone(&ddl_window),
@@ -810,11 +790,6 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>) {
             }
         }
 
-        // Take the whole pending queue, in INSERT order. The order is
-        // load-bearing: anti-join semantics (EXCEPT, NOT IN, etc.) rely on
-        // processing ticks in the order pushes arrived. Reordering causes the
-        // b-side trace to be empty when a-side ticks (and vice versa), leaking
-        // rows that should have cancelled.
         shared.drain_tick_rows_into(&mut tids_scratch);
         tids_scratch.retain(|&tid| shared.cat().has_id(tid));
 
@@ -1813,7 +1788,7 @@ async fn drain_pending_ticks(shared: &Rc<Shared>) -> Result<(), String> {
 /// LSN `L` that was ACKed to a client. `record_commit_lsn` precedes that ACK on
 /// both commit paths and records a `max`, so `commit_lsn_of(S) >= L`. If the test
 /// passes then `L <= last_tick_lsn`, which some completed tick `T` took from its
-/// `published()` snapshot. The committer marks `S` in `tick_tids` before it
+/// `published()` snapshot. The committer marks `S` in `tick_rows` before it
 /// publishes `L`, and only after the workers ACKed the write; `T`'s dequeue and
 /// its snapshot are one await-free span on the single-threaded reactor, so the
 /// mark preceded the dequeue and `S` was in `T`'s tid set. `T` therefore emitted

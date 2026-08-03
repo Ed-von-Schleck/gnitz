@@ -148,18 +148,6 @@ impl DagEngine {
         self.dep.reverse.get(&view_id).cloned().unwrap_or_default()
     }
 
-    /// Every relation this view's circuit scans — both `ScanDelta` (cascade
-    /// dependencies, also returned by `get_source_ids`) AND `ScanTrace` (static
-    /// `ext_trace` reads, e.g. the Python circuit-builder's `join(delta, trace)`,
-    /// which are deliberately NOT cascade dependencies and so absent from
-    /// `get_source_ids`). Deduped. The boot invalid-view verdict's transitive
-    /// check needs the ScanTrace targets too: a resumed view that ext_trace-reads
-    /// a *rebuilt* source view's output store would otherwise be missed by a
-    /// dependency-only walk.
-    pub fn all_scan_source_ids(&self, view_id: i64) -> Vec<i64> {
-        compiler::scan_source_ids(&self.load_meta_circuit(view_id))
-    }
-
     /// Every view reachable from `seeds` by following `source → dependents`
     /// edges, with the seeds themselves excluded.
     pub(super) fn dependent_closure(&mut self, seeds: Vec<i64>) -> FxHashSet<i64> {

@@ -10,7 +10,7 @@ use crate::ops;
 use crate::query::compiler::{self, CompileOutput, SubPlan};
 use crate::query::vm;
 use crate::schema::{Placement, SchemaDescriptor};
-use crate::storage::{Batch, PartitionedTable, ReadCursor, RecoverySource, StorageError, Table};
+use crate::storage::{Batch, PartitionedTable, RecoverySource, StorageError, Table};
 use gnitz_wire::PkColList;
 
 mod exec;
@@ -958,29 +958,6 @@ mod tests {
         let eff = DagEngine::enforce_unique_pk(&mut pt, &schema, b);
         pt.ingest_owned_batch(eff).unwrap();
         assert!(pt.has_pk_bytes(&pk24(7, 8, 9)), "K2 survives +1,-1,+1 at net +1");
-    }
-
-    // vm_epoch_result must gnitz_fatal_abort! (→ _exit(134)) on Err.
-    #[test]
-    fn test_vm_epoch_result_abort_exit_status() {
-        crate::test_support::assert_test_aborts_134(
-            "test_vm_epoch_result_abort_internal",
-            &[("GNITZ_RUN_ABORT_TEST", "1")],
-        );
-    }
-
-    // Guard: runs only when GNITZ_RUN_ABORT_TEST=1 (set by the parent test above).
-    // Constructs an Err(TraceOutCursorUnbound) result and passes it to
-    // vm_epoch_result, which must call gnitz_fatal_abort!. The parent asserts
-    // exit code 134.
-    #[test]
-    fn test_vm_epoch_result_abort_internal() {
-        if std::env::var("GNITZ_RUN_ABORT_TEST").is_err() {
-            return;
-        }
-        let r: Result<Option<Batch>, vm::VmError> = Err(vm::VmError::TraceOutCursorUnbound);
-        DagEngine::vm_epoch_result(42, r);
-        unreachable!("vm_epoch_result must not return on Err");
     }
 
     /// `StoreHandle::Partitioned` must dispatch `recovery_lsn` → the table's

@@ -113,7 +113,7 @@ impl ProgramBuilder {
     /// Used by test code — production code uses `build_with_owned`.
     #[cfg(test)]
     pub(crate) fn build(self, reg_meta: &[RegisterMeta]) -> Box<VmHandle> {
-        self.build_with_owned(reg_meta.to_vec(), Vec::new(), Vec::new(), Vec::new())
+        self.build_with_owned(reg_meta.to_vec(), Vec::new(), Vec::new())
     }
 
     /// Consume the builder, producing a VmHandle that owns the child tables and
@@ -121,17 +121,18 @@ impl ProgramBuilder {
     #[allow(clippy::vec_box)]
     pub fn build_with_owned(
         self,
-        mut reg_meta: Vec<RegisterMeta>,
+        reg_meta: Vec<RegisterMeta>,
         owned_tables: Vec<Box<Table>>,
         owned_funcs: Vec<Box<ScalarFunc>>,
-        owned_trace_regs: Vec<(u16, usize)>,
     ) -> Box<VmHandle> {
-        // Bake ownership into the metas so the per-epoch `bind_cursors` does no
-        // per-register scan of the owned list.
-        for &(reg_id, _) in &owned_trace_regs {
-            reg_meta[reg_id as usize].is_owned = true;
-        }
         let regfile = RegisterFile::new(&reg_meta);
+        // The trace registers name their own backing tables, so the refresh list
+        // is read off the metas rather than tracked alongside them.
+        let trace_regs: Vec<(u16, usize)> = reg_meta
+            .iter()
+            .enumerate()
+            .filter_map(|(reg, m)| m.owned_table.map(|t| (reg as u16, t as usize)))
+            .collect();
 
         let program = Program {
             instructions: self.instructions,
@@ -144,14 +145,13 @@ impl ProgramBuilder {
             avi_bakes: self.avi_bakes,
         };
 
-        let num_owned = owned_trace_regs.len();
         Box::new(VmHandle {
             program,
             regfile,
             owned_tables,
             owned_funcs,
-            owned_trace_regs,
-            owned_cursor_handles: Vec::with_capacity(num_owned),
+            owned_cursor_handles: Vec::with_capacity(trace_regs.len()),
+            trace_regs,
         })
     }
 }
