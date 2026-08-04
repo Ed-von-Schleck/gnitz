@@ -144,6 +144,21 @@ pub struct TableEntry {
     pub index_circuits: Vec<IndexCircuitEntry>,
 }
 
+impl TableEntry {
+    /// The index circuit covering exactly `cols`, if one exists. The circuit
+    /// list is deduped by ordered column list, so at most one entry matches —
+    /// this is the one place that match is spelled.
+    pub fn index_circuit_on(&self, cols: &[u32]) -> Option<&IndexCircuitEntry> {
+        self.index_circuits.iter().find(|ic| ic.col_indices.as_slice() == cols)
+    }
+
+    pub fn index_circuit_on_mut(&mut self, cols: &[u32]) -> Option<&mut IndexCircuitEntry> {
+        self.index_circuits
+            .iter_mut()
+            .find(|ic| ic.col_indices.as_slice() == cols)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // System table references
 // ---------------------------------------------------------------------------
@@ -289,11 +304,7 @@ impl DagEngine {
     /// Sound: pointer consumers (`get_index_store_handle`, cursors) are fetched
     /// per request, and the swap runs before the worker serves anything.
     pub fn replace_index_table(&mut self, table_id: i64, col_indices: &[u32], t: Box<Table>) -> Option<*mut Table> {
-        let entry = self.tables.get_mut(&table_id)?;
-        let ic = entry
-            .index_circuits
-            .iter_mut()
-            .find(|ic| ic.col_indices.as_slice() == col_indices)?;
+        let ic = self.tables.get_mut(&table_id)?.index_circuit_on_mut(col_indices)?;
         ic.index_table = UnsafeCell::new(t);
         Some(ic.table_mut() as *mut Table)
     }
@@ -305,14 +316,12 @@ impl DagEngine {
     /// (`false`) is used by the DROP INDEX retraction path when the UNIQUE index
     /// is dropped but another index (e.g. an FK auto-index) still covers it.
     pub fn set_index_circuit_uniqueness(&mut self, table_id: i64, col_indices: &[u32], is_unique: bool) {
-        if let Some(entry) = self.tables.get_mut(&table_id) {
-            if let Some(ic) = entry
-                .index_circuits
-                .iter_mut()
-                .find(|ic| ic.col_indices.as_slice() == col_indices)
-            {
-                ic.is_unique = is_unique;
-            }
+        if let Some(ic) = self
+            .tables
+            .get_mut(&table_id)
+            .and_then(|e| e.index_circuit_on_mut(col_indices))
+        {
+            ic.is_unique = is_unique;
         }
     }
 
@@ -1077,7 +1086,7 @@ mod tests {
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&0u64.to_le_bytes());
         batch.count += 1;
-        dag.ingest_to_family(70, batch);
+        dag.ingest_relation(70, batch);
         unreachable!("ingest_store_and_indices must abort when the seam is armed");
     }
 

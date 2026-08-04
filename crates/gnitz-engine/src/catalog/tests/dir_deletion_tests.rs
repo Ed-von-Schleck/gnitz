@@ -94,7 +94,7 @@ fn gc_reclaims_orphan_table_dir() {
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
 
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.get_schema(tid).unwrap();
+    let schema = engine.get_schema_desc(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
     bb.put_u64(10);
@@ -191,7 +191,7 @@ fn gc_leaves_live_entities_untouched() {
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
 
     let t1 = engine.create_table("public.flushed", &cols, &[0]).unwrap();
-    let schema = engine.get_schema(t1).unwrap();
+    let schema = engine.get_schema_desc(t1).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
     bb.put_u64(7);

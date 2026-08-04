@@ -38,6 +38,43 @@ fn col_def(name: &str, type_code: u8) -> ColumnDef {
     }
 }
 
+// Arbitrary fixed 128-bit values for UUID columns; distinct from each other,
+// the actual bit pattern is irrelevant. `UUID_A` is the value a parent stores
+// and a valid child references, `UUID_B` a value no parent holds.
+const UUID_A: u128 = 0x0000_0000_0000_AAAA_0000_0000_0000_BBBB;
+const UUID_B: u128 = 0x0000_0000_0000_BEEF_0000_0000_0000_DEAD;
+
+/// A plain non-nullable UUID column.
+fn uuid_def(name: &str) -> ColumnDef {
+    col_def(name, type_code::UUID)
+}
+
+/// A U64 column carrying an FK onto `(parent_tid, parent_col)`.
+fn fk_col_def(name: &str, parent_tid: i64, parent_col: u32) -> ColumnDef {
+    ColumnDef {
+        fk_table_id: parent_tid,
+        fk_col_idx: parent_col,
+        ..col_def(name, type_code::U64)
+    }
+}
+
+/// A non-nullable U64 schema column — the building block of the compound-PK
+/// fixtures below.
+fn u64c() -> crate::schema::SchemaColumn {
+    crate::schema::SchemaColumn::new(type_code::U64, 0)
+}
+
+/// The OPK image of a three-column U64 compound PK (`pk_stride` = 24, wide).
+/// Unsigned columns encode big-endian per column, which is what the wide-PK
+/// write path stores and what the FK RESTRICT check decodes.
+fn pk24(a: u64, b: u64, c: u64) -> [u8; 24] {
+    let mut p = [0u8; 24];
+    p[0..8].copy_from_slice(&a.to_be_bytes());
+    p[8..16].copy_from_slice(&b.to_be_bytes());
+    p[16..24].copy_from_slice(&c.to_be_bytes());
+    p
+}
+
 fn count_records(table: &mut Table) -> usize {
     let mut count = 0;
     let mut c = table.open_cursor();
@@ -112,7 +149,7 @@ fn ingest_fixture(
     mut put_row: impl FnMut(&mut BatchBuilder, u64),
 ) -> (CatalogEngine, i64) {
     let (mut engine, tid, _dir) = table_fixture(name, cols);
-    let schema = engine.get_schema(tid).unwrap();
+    let schema = engine.get_schema_desc(tid).unwrap();
     for round in 0..rounds {
         let mut bb = BatchBuilder::new(schema);
         let mut id = round;

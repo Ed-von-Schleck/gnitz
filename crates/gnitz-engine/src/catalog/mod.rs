@@ -53,19 +53,20 @@ use crate::schema::{Placement, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, PartitionedTable, ReadCursor, RecoverySource, Routing, Table};
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
+// The DDL_TXN driver's bundle decoders: it resolves each family once, carries
+// the value, and reads back what the bundle created or dropped.
 pub(crate) use sys_tables::{family_pks_by_sign, idx_tab_drops, idx_tab_unique_creates};
-pub(crate) use sys_tables::{COL_TAB_ID, IDX_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID};
-pub(crate) use sys_tables::{FIRST_USER_TABLE_ID, SEQ_TAB_ID};
+pub(crate) use sys_tables::{SysFamily, FIRST_USER_TABLE_ID, SEQ_TAB_ID};
+pub(crate) use types::{ColumnDef, FkEdge};
+// The reply path's cached schema wire block.
+pub(crate) use cache::SchemaWireEntry;
+// The master's ScanSpec confinement test.
+pub(crate) use scan_spec::scan_spec_partition;
 // The fixed system-table schema for a family tid. The production DDL decode
 // reaches it through the `CatalogEngine::sys_family_schema` instance method
 // (preserving the layering); the crate-wide handle exists for the cross-crate
 // wire roundtrip test, which decodes a client-encoded bundle against it.
-pub(crate) use cache::SchemaWireEntry;
-pub(crate) use metadata::CachedSchemaWire;
-// The master's ScanSpec confinement test.
-pub(crate) use scan_spec::scan_spec_partition;
 pub(crate) use sys_tables::sys_tab_schema;
-pub(crate) use types::ColumnDef;
 
 // Import everything from sys_tables for internal use.
 use registry::build_schema_from_col_defs;
@@ -80,15 +81,14 @@ pub(in crate::catalog) use cache::CatalogCacheSet;
 pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
 pub(in crate::catalog) use gnitz_wire::FK_INDEX_INFIX;
 pub(in crate::catalog) use registry::raise_id_counter;
-pub(in crate::catalog) use sys_tables::SysFamily;
 pub(in crate::catalog) use sys_tables::{PUBLIC_SCHEMA_ID, SYSTEM_SCHEMA_ID};
 // Partition layout is owned by storage; the catalog only consumes it.
 pub(in crate::catalog) use crate::storage::{ChildAddr, NUM_PARTITIONS};
-pub(in crate::catalog) use types::{FkConstraint, FkParentRef};
 pub(in crate::catalog) use utils::{
     cursor_read_string, cursor_read_u64, ensure_dir, fsync_dir, index_dir, is_index_dir_name, is_table_dir_name,
-    make_fk_index_name, new_index_table, preflight_dir, reclaim_retired_children, remove_stale_index_rank_dirs,
-    retract_rows_by_view, retract_rows_in_pk_range, retract_single_row, schema_dir, subdir_names, table_dir, view_dir,
+    make_fk_index_name, new_index_table, preflight_dir, reclaim_retired_children, relation_dir,
+    remove_stale_index_rank_dirs, retract_key_range, retract_single_row, schema_dir, subdir_names, sys_catalog_dir,
+    sys_family_dir, sys_opk,
 };
 #[cfg(test)]
 pub(in crate::catalog) use utils::{make_secondary_index_name, parse_qualified_name};
@@ -107,7 +107,7 @@ pub struct CatalogEngine {
     pub(crate) dag: DagEngine,
     pub(crate) base_dir: String,
 
-    // --- Unified cache set (replaces 11 ad-hoc HashMaps) ---
+    /// Every derived lookup the catalog maintains from system-table deltas.
     pub(crate) caches: CatalogCacheSet,
 
     // --- Sequence counters ---

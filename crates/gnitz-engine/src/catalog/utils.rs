@@ -45,16 +45,26 @@ pub(crate) fn schema_dir(base_dir: &str, schema_name: &str) -> String {
     format!("{base_dir}/{schema_name}")
 }
 
-/// `<base_dir>/<schema_name>/t_<tid>` — a table's directory. Id-only (no
-/// embedded name), so a RENAME never changes the path and never orphans data.
-pub(crate) fn table_dir(base_dir: &str, schema_name: &str, tid: i64) -> String {
-    format!("{base_dir}/{schema_name}/t_{tid}")
+/// `<base_dir>/_system_catalog` — the system catalog root. Not a user schema
+/// directory, so the boot orphan sweep (which scans only registered schema
+/// names) never reaches it.
+pub(crate) fn sys_catalog_dir(base_dir: &str) -> String {
+    format!("{base_dir}/{SYS_CATALOG_DIRNAME}")
 }
 
-/// `<base_dir>/<schema_name>/v_<vid>` — a view's directory. Id-only (no embedded
-/// name), so a RENAME never changes the path and never orphans data.
-pub(crate) fn view_dir(base_dir: &str, schema_name: &str, vid: i64) -> String {
-    format!("{base_dir}/{schema_name}/v_{vid}")
+/// `<base_dir>/_system_catalog/<family_name>` — one system family's store
+/// directory. The same string reaches the store and the family's `TABLE_TAB`
+/// self-description row, so both are built here.
+pub(crate) fn sys_family_dir(base_dir: &str, family_name: &str) -> String {
+    format!("{}/{family_name}", sys_catalog_dir(base_dir))
+}
+
+/// `<base_dir>/<schema_name>/t_<tid>` for a table, `.../v_<vid>` for a view.
+/// Id-only (no embedded name), so a RENAME never changes the path and never
+/// orphans data.
+pub(crate) fn relation_dir(base_dir: &str, schema_name: &str, kind: RelationKind, id: i64) -> String {
+    let tag = if kind.is_view() { 'v' } else { 't' };
+    format!("{base_dir}/{schema_name}/{tag}_{id}")
 }
 
 /// `<base_dir>/<schema_name>/_preflight_<vid>` — the throwaway root the master's
@@ -94,8 +104,8 @@ pub(crate) fn index_table_dir(idx_dir: &str) -> String {
 /// Open this process's copy of an ephemeral secondary-index table under
 /// `idx_dir` (homed by `index_table_dir`). The one recipe for the live CREATE
 /// INDEX hook and the worker-boot rebuild: the arena size and
-/// `RecoverySource::Rederive` (load-bearing — a durable source would
-/// double-count its loaded shards on the next open) must never diverge.
+/// `RecoverySource::Rederive` must never diverge — a durable source would
+/// double-count its loaded shards on the next open.
 pub(crate) fn new_index_table(idx_dir: &str, index_id: i64, idx_schema: SchemaDescriptor) -> Result<Table, String> {
     let table_dir = index_table_dir(idx_dir);
     // An index dir is a catalog-owned LAYOUT node — staged into
@@ -165,6 +175,10 @@ fn has_numeric_id(s: &str) -> bool {
 /// Immediate sub-directory names of `path`. Empty if `path` is missing or
 /// unreadable — both mean "nothing to scan" for the orphan sweep. Non-directory
 /// entries are skipped.
+///
+/// Materialized rather than streamed: every caller unlinks entries from the
+/// directory it is walking, and `readdir` may skip entries when the directory
+/// is modified mid-iteration.
 pub(crate) fn subdir_names(path: &str) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(path) else {
         return Vec::new();
@@ -196,15 +210,10 @@ pub(crate) fn cursor_read_string(cursor: &ReadCursor, logical_col: usize) -> Str
 // ---------------------------------------------------------------------------
 
 pub(crate) fn ensure_dir(path: &str) -> Result<(), String> {
-    // Reject any embedded NUL bytes (should never happen with clean paths)
-    if path.contains('\0') {
-        return Err(format!("Path contains NUL byte: {path:?}"));
-    }
-    match fs::create_dir_all(path) {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(format!("Failed to create directory '{path}': {e}")),
-    }
+    // `create_dir_all` already succeeds on an existing directory; the only
+    // `AlreadyExists` it reports is a non-directory blocking the path, which is
+    // a genuine failure.
+    fs::create_dir_all(path).map_err(|e| format!("Failed to create directory '{path}': {e}"))
 }
 
 pub(crate) fn fsync_dir(path: &str) {
@@ -217,34 +226,17 @@ pub(crate) fn fsync_dir(path: &str) {
 // Copy/retract helpers
 // ---------------------------------------------------------------------------
 
-/// Seek a system table by PK, copy the matching row with weight=-1.
-/// Returns a single-row retraction batch (or empty batch if PK not found).
-pub(crate) fn retract_single_row(table: &Table, schema: &SchemaDescriptor, pk: u128) -> Batch {
-    let mut batch = Batch::with_capacity(*schema, 1);
-    let mut cursor = table.open_cursor();
-    // OPK-encode the native PK; correct for single-column and compound system PKs.
-    let opk = crate::schema::key::opk_key(schema, &pk.to_le_bytes());
-    if cursor.seek_exact_live(opk.pk_bytes()) {
-        cursor.copy_current_row_into(&mut batch, -1);
-    }
-    batch
-}
-
-/// Scan `[start, pk_end)` and emit a weight=-1 batch of every positive-weight
-/// row in the range. Used for U64-PK system tables where rows belonging to one
-/// owner share a packed PK prefix (e.g. `sys_columns` keyed by
-/// `pack_column_id(owner, col)`).
-pub(crate) fn retract_rows_in_pk_range(table: &Table, schema: &SchemaDescriptor, start: u128, pk_end: u128) -> Batch {
+/// Emit a weight=−1 batch of every live row of `table` in the OPK key range
+/// `[start, end)` (`end` `None` = unbounded above). The one retraction
+/// primitive: the callers differ only in the bounds they encode — a single PK's
+/// point range, one owner's packed-column band, or one view's `(view_id, sub)`
+/// prefix — all produced through `schema::key`, so no call site re-derives the
+/// OPK layout.
+pub(crate) fn retract_key_range(table: &Table, schema: &SchemaDescriptor, start: &[u8], end: Option<&[u8]>) -> Batch {
     let mut batch = Batch::with_capacity(*schema, 8);
     let mut cursor = table.open_cursor();
-    // U64-PK system table: OPK == big-endian; the native-value range
-    // comparisons below (`current_key_narrow()`/`get_pk` vs `pk_end`) stay valid.
-    cursor.seek_bytes(&(start as u64).to_be_bytes());
-
+    cursor.seek_range_bytes(start, end);
     while cursor.valid {
-        if cursor.current_key_narrow() >= pk_end {
-            break;
-        }
         if cursor.current_weight > 0 {
             cursor.copy_current_row_into(&mut batch, -1);
         }
@@ -253,18 +245,20 @@ pub(crate) fn retract_rows_in_pk_range(table: &Table, schema: &SchemaDescriptor,
     batch
 }
 
-/// Scan all positive-weight rows for `view_id` and emit each as a retraction
-/// (weight=-1). The circuit/dep catalog tables use a compound `(view_id, sub)`
-/// PK, so all of a view's rows share the `view_id` byte prefix and are
-/// contiguous in compound-PK sort order — `compare_pk_bytes` reproduces the
-/// `(view_id, sub)` ordering natively (no `(pk_hi, pk_lo)` u128 exploit).
-pub(crate) fn retract_rows_by_view(table: &Table, schema: &SchemaDescriptor, view_id: u64) -> Batch {
-    let mut batch = Batch::with_capacity(*schema, 8);
-    // The (view_id, sub) PK is OPK-at-rest; the leading view_id column (U64) is
-    // big-endian, so the prefix must be OPK (BE), not native LE.
-    let prefix = view_id.to_be_bytes();
-    table
-        .open_cursor()
-        .for_each_positive_with_prefix(&prefix, |cursor| cursor.copy_current_row_into(&mut batch, -1));
+/// The OPK image of a native system-table PK. `pk` is the packed native value
+/// (`u128` covers every system family: a single U64 id, or a compound
+/// `(view_id, sub)` written `(vid << 64) | sub`).
+pub(crate) fn sys_opk(schema: &SchemaDescriptor, pk: u128) -> crate::schema::key::PkBuf {
+    crate::schema::key::opk_key(schema, &pk.to_le_bytes())
+}
+
+/// Retract the single live row at `pk`, or return an empty batch when the PK is
+/// absent or already retracted.
+pub(crate) fn retract_single_row(table: &Table, schema: &SchemaDescriptor, pk: u128) -> Batch {
+    let mut batch = Batch::with_capacity(*schema, 1);
+    let mut cursor = table.open_cursor();
+    if cursor.seek_exact_live(sys_opk(schema, pk).pk_bytes()) {
+        cursor.copy_current_row_into(&mut batch, -1);
+    }
     batch
 }

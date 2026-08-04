@@ -135,7 +135,8 @@ impl CatalogEngine {
 
     /// Open the source cursor for `bound` over `source` — routed to the
     /// partitions the bound's keys reach where it names them, merged over every
-    /// local partition where it does not.
+    /// local partition where it does not. Each arm owns its own trust-boundary
+    /// rejections; see the per-bound openers below.
     fn open_scan_spec_cursor(
         &mut self,
         source: i64,
@@ -146,111 +147,128 @@ impl CatalogEngine {
             ReadBound::None => Ok(ScanSpecCursor::Source(SourceCursor::Full(Box::new(
                 self.table_entry(source)?.handle.open_cursor(),
             )))),
-            ReadBound::PkRange(desc) => match pk_range_keys(src_schema, desc)? {
-                None => Ok(ScanSpecCursor::Source(SourceCursor::Empty)),
-                Some((start, end)) => {
-                    let handle = &self.table_entry(source)?.handle;
-                    // A range whose every key shares the distribution prefix
-                    // lives in one partition — the same test `scan_spec_partition`
-                    // uses to unicast the request. `open_cursor_for_key` resolves
-                    // through `slot_for_key`, never through the global partition
-                    // id, so an unhashed store lands on its one child; `None`
-                    // means this process holds no such partition. A range
-                    // spanning partitions keeps the merge.
-                    let confined = crate::schema::key::range_shares_prefix(
-                        &start,
-                        end.as_ref(),
-                        src_schema.dist_stride() as usize,
-                    );
-                    let mut cursor = match confined {
-                        true => match handle.open_cursor_for_key(start.pk_bytes()) {
-                            Some(c) => c,
-                            None => return Ok(ScanSpecCursor::Source(SourceCursor::Empty)),
-                        },
-                        false => handle.open_cursor(),
-                    };
-                    // `[start, end)` clamps every underlying source, so the walk
-                    // is O(range): a point lookup drains exactly its group,
-                    // never a boundary chunk of over-read.
-                    cursor.seek_range_bytes(start.pk_bytes(), end.as_ref().map(|e| e.pk_bytes()));
-                    Ok(ScanSpecCursor::Source(SourceCursor::Full(Box::new(cursor))))
-                }
-            },
+            ReadBound::PkRange(desc) => self.open_pk_range_cursor(source, desc, src_schema),
             ReadBound::IndexRange { idx_cols, exact, desc } => {
-                let cols = gnitz_wire::unpack_pk_cols(*idx_cols);
-                if !cols.is_well_formed() {
-                    return Err(format!("scan_spec: malformed index column list for table {source}"));
-                }
-                // `exact` says the SQL layer stripped the bounded conjuncts from
-                // the predicate, so this walk is the only thing applying them:
-                // run it un-gated, and fail rather than degrade if the index is
-                // gone (a full cursor would return rows nothing re-filters).
-                // Otherwise the conjuncts ride the predicate and the walk is an
-                // access optimization the selectivity gate may trade away.
-                if *exact {
-                    match self.open_index_range_cursor(source, cols.as_slice(), desc, 0)? {
-                        None => Ok(ScanSpecCursor::Source(SourceCursor::Empty)),
-                        Some(c) => Ok(ScanSpecCursor::Source(SourceCursor::Bounded(Box::new(c)))),
-                    }
-                } else {
-                    match self.open_bounded_source(source, cols.as_slice(), desc) {
-                        None => Err(format!("scan_spec: source table {source} unregistered")),
-                        Some(sc) => Ok(ScanSpecCursor::Source(sc)),
-                    }
-                }
+                self.open_index_bound_cursor(source, *idx_cols, *exact, desc)
             }
-            ReadBound::PkSet(keys) => {
-                // Trust boundary: the decoder cannot know the PK arity, so the
-                // schema check lands here — a hard reject, matching every other
-                // malformed-frame condition (release builds must not clamp).
-                if src_schema.pk_indices().len() != 1 {
-                    return Err(format!(
-                        "scan_spec: PkSet gather requires a single-column PK (table {source})"
-                    ));
-                }
-                let handle = &self.table_entry(source)?.handle;
-                let stride = src_schema.pk_stride() as usize;
-                // Encode each native key to its OPK image and sort byte-wise:
-                // OPK order IS typed PK order, so the gather below is one
-                // monotone forward sweep regardless of wire key order. A single
-                // PK column is at most 16 bytes, so the images are flat
-                // fixed-size arrays (zero tail bytes never affect the order).
-                let mut opk_keys: Vec<[u8; 16]> = keys
-                    .iter()
-                    .map(|&k| {
-                        let opk = opk_key(src_schema, &k.to_le_bytes());
-                        debug_assert_eq!(opk.len as usize, stride);
-                        let mut key = [0u8; 16];
-                        key[..stride].copy_from_slice(opk.pk_bytes());
-                        key
-                    })
-                    .collect();
-                opk_keys.sort_unstable();
-                // Trust boundary, second half: two distinct wire keys can share one
-                // OPK image (`opk_key` truncates to `pk_stride`, so `5` and
-                // `5 + 2^64` are the same U64 PK), which the decoder's schema-free
-                // view cannot see. The sort makes such a pair adjacent; left in, it
-                // would emit its row twice. Checked before the ownership filter so
-                // every worker returns the same verdict.
-                if let Some(w) = opk_keys.windows(2).find(|w| w[0] == w[1]) {
-                    return Err(format!(
-                        "scan_spec: PkSet duplicate key {:?} (table {source})",
-                        &w[0][..stride]
-                    ));
-                }
-                // The probe answers a key this worker cannot reach with `None` —
-                // the request is broadcast, so at W workers most of the list
-                // belongs elsewhere — and routes the rest to the one partition
-                // that can hold them instead of the whole store's merge.
-                Ok(ScanSpecCursor::PkSet(Box::new(PkSetGather {
-                    cursor: handle.open_probe(),
-                    keys: opk_keys,
-                    stride,
-                    next: 0,
-                    src_schema: *src_schema,
-                })))
-            }
+            ReadBound::PkSet(keys) => self.open_pk_set_gather(source, keys, src_schema),
         }
+    }
+
+    /// A base-PK range walk, clamped to `[start, end)` so it is O(range): a
+    /// point lookup drains exactly its group, never a boundary chunk of
+    /// over-read.
+    ///
+    /// A range whose every key shares the distribution prefix lives in one
+    /// partition — the same test `scan_spec_partition` uses to unicast the
+    /// request. `open_cursor_for_key` resolves through `slot_for_key`, never
+    /// through the global partition id, so an unhashed store lands on its one
+    /// child and `None` means this process holds no such partition. A range
+    /// spanning partitions keeps the merge.
+    fn open_pk_range_cursor(
+        &mut self,
+        source: i64,
+        desc: &RangeDescriptor,
+        src_schema: &SchemaDescriptor,
+    ) -> Result<ScanSpecCursor, String> {
+        let Some((start, end)) = pk_range_keys(src_schema, desc)? else {
+            return Ok(ScanSpecCursor::Source(SourceCursor::Empty));
+        };
+        let handle = &self.table_entry(source)?.handle;
+        let confined = crate::schema::key::range_shares_prefix(&start, end.as_ref(), src_schema.dist_stride() as usize);
+        let mut cursor = if confined {
+            match handle.open_cursor_for_key(start.pk_bytes()) {
+                Some(c) => c,
+                None => return Ok(ScanSpecCursor::Source(SourceCursor::Empty)),
+            }
+        } else {
+            handle.open_cursor()
+        };
+        cursor.seek_range_bytes(start.pk_bytes(), end.as_ref().map(|e| e.pk_bytes()));
+        Ok(ScanSpecCursor::Source(SourceCursor::Full(Box::new(cursor))))
+    }
+
+    /// A secondary-index range walk. `exact` says the SQL layer stripped the
+    /// bounded conjuncts from the predicate, so this walk is the only thing
+    /// applying them: run it un-gated, and fail rather than degrade if the index
+    /// is gone (a full cursor would return rows nothing re-filters). Otherwise
+    /// the conjuncts ride the predicate and the walk is an access optimization
+    /// the selectivity gate may trade away.
+    fn open_index_bound_cursor(
+        &mut self,
+        source: i64,
+        idx_cols: u64,
+        exact: bool,
+        desc: &RangeDescriptor,
+    ) -> Result<ScanSpecCursor, String> {
+        let cols = gnitz_wire::unpack_pk_cols(idx_cols);
+        if !cols.is_well_formed() {
+            return Err(format!("scan_spec: malformed index column list for table {source}"));
+        }
+        if exact {
+            Ok(match self.open_index_range_cursor(source, cols.as_slice(), desc, 0)? {
+                None => ScanSpecCursor::Source(SourceCursor::Empty),
+                Some(c) => ScanSpecCursor::Source(SourceCursor::Bounded(Box::new(c))),
+            })
+        } else {
+            self.open_bounded_source(source, cols.as_slice(), desc)
+                .map(ScanSpecCursor::Source)
+                .ok_or_else(|| format!("scan_spec: source table {source} unregistered"))
+        }
+    }
+
+    /// A `pk IN (…)` gather. Two trust-boundary rejections land here because the
+    /// decoder has no schema: the PK must be a single column, and no two wire
+    /// keys may share an OPK image (`opk_key` truncates to `pk_stride`, so `5`
+    /// and `5 + 2^64` are the same U64 PK — left in, the pair would emit its row
+    /// twice). Both are hard rejects; release builds must not clamp.
+    fn open_pk_set_gather(
+        &mut self,
+        source: i64,
+        keys: &[u128],
+        src_schema: &SchemaDescriptor,
+    ) -> Result<ScanSpecCursor, String> {
+        if src_schema.pk_indices().len() != 1 {
+            return Err(format!(
+                "scan_spec: PkSet gather requires a single-column PK (table {source})"
+            ));
+        }
+        let handle = &self.table_entry(source)?.handle;
+        let stride = src_schema.pk_stride() as usize;
+        // OPK order IS typed PK order, so sorting the images byte-wise makes the
+        // gather one monotone forward sweep regardless of wire key order. A
+        // single PK column is at most 16 bytes, so the images are flat
+        // fixed-size arrays (zero tail bytes never affect the order).
+        let mut opk_keys: Vec<[u8; 16]> = keys
+            .iter()
+            .map(|&k| {
+                let opk = opk_key(src_schema, &k.to_le_bytes());
+                debug_assert_eq!(opk.len as usize, stride);
+                let mut key = [0u8; 16];
+                key[..stride].copy_from_slice(opk.pk_bytes());
+                key
+            })
+            .collect();
+        opk_keys.sort_unstable();
+        // The sort makes a colliding pair adjacent. Checked before the ownership
+        // filter so every worker returns the same verdict.
+        if let Some(w) = opk_keys.windows(2).find(|w| w[0] == w[1]) {
+            return Err(format!(
+                "scan_spec: PkSet duplicate key {:?} (table {source})",
+                &w[0][..stride]
+            ));
+        }
+        // The probe answers a key this worker cannot reach with `None` — the
+        // request is broadcast, so at W workers most of the list belongs
+        // elsewhere — and routes the rest to the one partition that can hold
+        // them instead of the whole store's merge.
+        Ok(ScanSpecCursor::PkSet(Box::new(PkSetGather {
+            cursor: handle.open_probe(),
+            keys: opk_keys,
+            stride,
+            next: 0,
+            src_schema: *src_schema,
+        })))
     }
 }
 
@@ -584,31 +602,23 @@ fn scan_spec_cmp(
 /// mainline — `WHERE pk > 5` and the full-PK point lookup — where `After`
 /// increments the whole key with carry ripple and there is no zero pad.
 fn pk_range_keys(schema: &SchemaDescriptor, range: &RangeDescriptor) -> Result<Option<(PkBuf, Option<PkBuf>)>, String> {
-    let eq_natives = range.eq_vals();
-    let n_eq = eq_natives.len();
-    let pk_col_count = schema.pk_indices().len();
-    if n_eq >= pk_col_count {
-        return Err(format!(
-            "pk range: n_eq {n_eq} has no range column within PK arity {pk_col_count}"
-        ));
-    }
-    // The group prefix of a cut value: OPK-encode the first `n_eq + 1` PK
-    // columns (equality values then the cut value), leaving the trailing
-    // columns raw-zero — the minimum OPK for any type, so `group(v)` IS
-    // `pad(group(v))`.
-    Ok(crate::schema::key::range_keys_from_cuts(
+    crate::schema::key::eq_prefix_range_keys(
         range,
+        schema.pk_indices().len(),
         schema.pk_stride() as usize,
-        |v| {
-            let mut natives = [0u128; gnitz_wire::PK_LIST_MAX_COLS];
-            natives[..n_eq].copy_from_slice(eq_natives);
-            natives[n_eq] = v;
+        "pk range",
+        |natives| {
             // Source and target column are the same here (no index promotion),
-            // so the shared encoder's promote step is its identity arm.
-            let cols = schema.pk_columns().take(n_eq + 1).map(|(_, col)| (col.type_code, *col));
-            crate::schema::key::encode_leading_opk(cols, &natives[..=n_eq])
+            // so the shared encoder's promote step is its identity arm. The
+            // trailing PK columns stay raw-zero — the minimum OPK for any type,
+            // so `group(v)` IS `pad(group(v))`.
+            let cols = schema
+                .pk_columns()
+                .take(natives.len())
+                .map(|(_, col)| (col.type_code, *col));
+            crate::schema::key::encode_leading_opk(cols, natives)
         },
-    ))
+    )
 }
 
 /// The one partition every row matching `range` can live in, or `None` when the

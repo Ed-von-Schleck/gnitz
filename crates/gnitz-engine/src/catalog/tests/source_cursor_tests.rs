@@ -47,7 +47,7 @@ fn fixture_with(name: &str, bound: Option<ScanBound>, val_of: impl Fn(u64) -> u6
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
 
-    let schema = engine.get_schema(tid).unwrap();
+    let schema = engine.get_schema_desc(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     for i in 0..NBASE {
         bb.begin_row(i as u128, 1);
@@ -180,7 +180,7 @@ fn bounded_drain_is_chunk_size_invariant_and_ascending() {
 #[test]
 fn absent_pk_mid_chunk_does_not_truncate_the_gather() {
     let (mut engine, tid, vid) = fixture("srccur_midchunk", Some(val_bound(Cut::Before(500), Cut::Before(600))));
-    let schema = engine.get_schema(tid).unwrap();
+    let schema = engine.get_schema_desc(tid).unwrap();
     let part = |id: u64| {
         let opk = crate::schema::key::opk_key(&schema, &(id as u128).to_le_bytes());
         schema.partition_for_pk(opk.pk_bytes())
@@ -262,7 +262,7 @@ fn selectivity_gate_flips_at_one_sixteenth_of_the_base() {
 #[test]
 fn range_over_unowned_partitions_resolves_nothing() {
     let (mut engine, tid, _vid) = fixture("srccur_unowned", None);
-    let schema = engine.get_schema(tid).unwrap();
+    let schema = engine.get_schema_desc(tid).unwrap();
     let part = |id: u64| {
         let opk = crate::schema::key::opk_key(&schema, &(id as u128).to_le_bytes());
         schema.partition_for_pk(opk.pk_bytes())
@@ -336,7 +336,7 @@ fn bounded_and_full_agree_with_a_retracted_row_single_source() {
     let (mut engine, tid, vid) = fixture("srccur_retract", Some(val_bound(Cut::Before(500), Cut::Before(600))));
     // Retract id=55 (val=550), inside the range. No flush: one memtable run, so
     // the cursor is single-source and takes the verbatim-copy drain path.
-    let schema = engine.get_schema(tid).unwrap();
+    let schema = engine.get_schema_desc(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(55u128, -1);
     bb.put_u64(550);
@@ -364,7 +364,7 @@ fn updated_indexed_column_emits_the_row_once() {
     // Range covers val ∈ [500, 600): ids 50..60 plus whatever moves in.
     let (mut engine, tid, vid) = fixture("srccur_update", Some(val_bound(Cut::Before(500), Cut::Before(600))));
     // Move id=10 from val=100 to val=555 (into the range): retract + insert.
-    let schema = engine.get_schema(tid).unwrap();
+    let schema = engine.get_schema_desc(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(10u128, -1);
     bb.put_u64(100);
@@ -389,7 +389,7 @@ fn updated_indexed_column_emits_the_row_once() {
 fn range_spanning_old_and_new_indexed_value_emits_once() {
     // val ∈ [500, 600) after moving id=51 from 510 → 590 — both inside the range.
     let (mut engine, tid, vid) = fixture("srccur_span", Some(val_bound(Cut::Before(500), Cut::Before(600))));
-    let schema = engine.get_schema(tid).unwrap();
+    let schema = engine.get_schema_desc(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(51u128, -1);
     bb.put_u64(510);

@@ -189,7 +189,7 @@ fn test_edge_cases() {
             &[0],
         )
         .unwrap();
-    let s15 = engine.get_schema(tid15).unwrap();
+    let s15 = engine.get_schema_desc(tid15).unwrap();
     assert_eq!(s15.columns[0].type_code, type_code::U128);
     engine.drop_table("public.u128t").unwrap();
 
@@ -229,7 +229,7 @@ fn test_edge_cases() {
 // coverage runs through the wire path in the Python E2E suite.
 
 // ── test_nonempty_schema_drop_rejected ───────────────────────────────────
-// The engine-side guard in precheck_sys_ingest rejects a raw SCHEMA_TAB -1 on a
+// The engine-side guard in precheck_family rejects a raw SCHEMA_TAB -1 on a
 // non-empty schema BEFORE any WAL write, so a member is never orphaned. Both the
 // production client cascade and the #[cfg(test)] engine cascade empty a schema
 // first, so this bare guard is reachable only by a direct retraction — driven
@@ -307,7 +307,7 @@ fn test_restart_full() {
         assert!(engine.get_by_name("trash", "items").is_none());
         // Schema layout rebuilt correctly
         let tid = engine.get_by_name("marketing", "products").unwrap();
-        let schema = engine.get_schema(tid).unwrap();
+        let schema = engine.get_schema_desc(tid).unwrap();
         assert_eq!(schema.num_columns(), 2);
         // Sequence recovery: new table should get higher ID
         let new_tid = engine.create_table("marketing.other", &cols, &[0]).unwrap();
@@ -367,9 +367,9 @@ fn test_edge_cases_extended() {
     // #20. has_id / get_schema for valid and invalid IDs
     let tid = engine.create_table("public.reg_test", &cols, &[0]).unwrap();
     assert!(engine.has_id(tid));
-    assert!(engine.get_schema(tid).is_some());
+    assert!(engine.get_schema_desc(tid).is_some());
     assert!(!engine.has_id(999999));
-    assert!(engine.get_schema(999999).is_none());
+    assert!(engine.get_schema_desc(999999).is_none());
     engine.drop_table("public.reg_test").unwrap();
 
     // #26. Creating a user table in _system schema should fail
@@ -491,8 +491,8 @@ fn test_pk_change_invalidates_col_name_cache() {
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
     // Populate the col-name cache.
-    let _ = engine.get_column_names(tid);
-    assert!(engine.caches.col_names.contains_key(&tid));
+    let _ = engine.read_column_defs(tid);
+    assert!(engine.caches.col_defs.contains_key(&tid));
 
     // Drive `apply_pk_col_of` directly (like `test_apply_pk_col_of_round_trips_..`):
     // a bare `+1` re-ingest of an already-live TABLE_TAB row is a duplicate live
@@ -501,7 +501,7 @@ fn test_pk_change_invalidates_col_name_cache() {
     // path. Invalidation is observed through the schema version.
     let ingest_pk = |engine: &mut CatalogEngine, raw_pk_cols: u64| {
         let batch = build_table_tab_row(&dir, tid, raw_pk_cols, "t");
-        engine.apply_pk_col_of(TABTAB_PAY_PK_COL_IDX, &batch).unwrap();
+        engine.apply_pk_col_of(SysFamily::Table, &batch).unwrap();
     };
 
     let v0 = engine.caches.get_schema_version(tid);
@@ -526,7 +526,7 @@ fn test_pk_change_invalidates_col_name_cache() {
     // schema must reflect the new PK list.
     engine.drop_table("public.t").unwrap();
     let tid2 = engine.create_table("public.t", &cols, &[1]).unwrap();
-    let schema = engine.get_schema(tid2).unwrap();
+    let schema = engine.get_schema_desc(tid2).unwrap();
     assert_eq!(schema.pk_indices(), &[1]);
 
     engine.close();
@@ -545,7 +545,7 @@ fn test_apply_pk_col_of_round_trips_compound_list() {
     // Single-column PK: cache entry equals PkColList::single(idx).
     let single_tid: i64 = 9001;
     let batch_single = build_table_tab_row(&dir, single_tid, pack_pk_cols(&[2]), "t");
-    engine.apply_pk_col_of(TABTAB_PAY_PK_COL_IDX, &batch_single).unwrap();
+    engine.apply_pk_col_of(SysFamily::Table, &batch_single).unwrap();
     assert_eq!(
         engine.caches.pk_col_of.get(&single_tid).copied(),
         Some(PkColList::single(2)),
@@ -555,7 +555,7 @@ fn test_apply_pk_col_of_round_trips_compound_list() {
     for (tid_offset, pk_cols) in [(0i64, vec![0u32, 1]), (1, vec![0u32, 3, 5]), (2, vec![1u32, 2, 7, 11])] {
         let tid: i64 = 9100 + tid_offset;
         let batch = build_table_tab_row(&dir, tid, pack_pk_cols(&pk_cols), "t");
-        engine.apply_pk_col_of(TABTAB_PAY_PK_COL_IDX, &batch).unwrap();
+        engine.apply_pk_col_of(SysFamily::Table, &batch).unwrap();
         let stored = engine
             .caches
             .pk_col_of
@@ -760,7 +760,7 @@ fn drop_cascade_broadcasts_children_before_parents() {
 
 // ── table_retract_applies_qname_before_id ────────────────────────────
 // Within apply_entity_caches' retract arm, the qname is removed BEFORE the
-// entity_by_id entry. That order is load-bearing: the qualified name is
+// entity_by_id entry. That order matters: the qualified name is
 // reconstructed from entity_by_id (still present) to remove the
 // entity_by_qname entry. Reverse the two and the -1 reads an
 // already-removed entity_by_id, leaks a stale entity_by_qname[qn] → old

@@ -102,47 +102,49 @@ pub fn build_schema_wire_block(
     block
 }
 
-/// Convert a slice of owned column-name bytes to a stack-allocated `[&[u8]; MAX_COLUMNS]`,
+/// Convert a slice of column names to a stack-allocated `[&[u8]; MAX_COLUMNS]`,
 /// capped at MAX_COLUMNS. Returns the filled array and the fill count.
-pub(crate) fn col_names_as_refs(names: &[Vec<u8>]) -> ([&[u8]; crate::schema::MAX_COLUMNS], usize) {
+pub(crate) fn col_names_as_refs<S: AsRef<[u8]>>(names: &[S]) -> ([&[u8]; crate::schema::MAX_COLUMNS], usize) {
     let mut refs = [&[][..]; crate::schema::MAX_COLUMNS];
     let n = names.len().min(crate::schema::MAX_COLUMNS);
     for (i, name) in names.iter().take(n).enumerate() {
-        refs[i] = name;
+        refs[i] = name.as_ref();
     }
     (refs, n)
 }
 
 /// Get-or-build the cached schema wire block for `tid`, returning the full
 /// cache entry (block, version, wire_safe, stride). On a miss the block is
-/// built from the catalog's column names + hidden mask and stored; it is
-/// invalidated alongside col_names whenever DDL modifies the table. The
-/// caller supplies the resolved `schema` — the call sites differ only in
-/// what they do when the table has no schema (panic / minimal fallback /
-/// one-off block), which stays with them.
+/// built from the catalog's column defs and stored; it is invalidated
+/// alongside them whenever DDL modifies the table. The caller supplies the
+/// resolved `schema` — the call sites differ only in what they do when the
+/// table has no schema (panic / minimal fallback / one-off block), which stays
+/// with them.
 pub(crate) fn get_or_build_schema_wire_block(
     cat: &mut crate::catalog::CatalogEngine,
     tid: i64,
     schema: &SchemaDescriptor,
-) -> crate::catalog::CachedSchemaWire {
+) -> crate::catalog::SchemaWireEntry {
     if let Some(cached) = cat.get_cached_schema_wire_block(tid) {
         return cached;
     }
-    let col_names = cat.get_col_names_bytes(tid);
-    let hidden = cat.get_col_hidden_mask(tid);
-    let (name_refs, n) = col_names_as_refs(&col_names);
+    let defs = cat.read_column_defs(tid);
+    let hidden = defs
+        .iter()
+        .enumerate()
+        .fold(0u128, |m, (i, cd)| m | ((cd.is_hidden as u128) << i));
+    let names: Vec<&str> = defs.iter().map(|cd| cd.name.as_str()).collect();
+    let (name_refs, n) = col_names_as_refs(&names);
     let block = Rc::new(build_schema_wire_block(schema, &name_refs[..n], hidden, tid as u32));
     let (wire_safe, wire_row_fixed_stride) = crate::storage::compute_wire_props(schema);
     let entry = crate::catalog::SchemaWireEntry {
         block,
+        version: cat.get_schema_version(tid),
         wire_safe,
         wire_row_fixed_stride,
     };
     cat.set_schema_wire_block(tid, entry.clone());
-    crate::catalog::CachedSchemaWire {
-        entry,
-        version: cat.get_schema_version(tid),
-    }
+    entry
 }
 
 /// `hidden_mask`: bit N set ⇔ column N is a hidden key slot (COL_TAB

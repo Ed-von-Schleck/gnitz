@@ -11,8 +11,8 @@ use crate::storage::{Batch, BatchBuilder};
 // Constants
 // ---------------------------------------------------------------------------
 
-pub(crate) const SYSTEM_SCHEMA_ID: i64 = 1;
-pub(crate) const PUBLIC_SCHEMA_ID: i64 = 2;
+pub(super) const SYSTEM_SCHEMA_ID: i64 = 1;
+pub(super) const PUBLIC_SCHEMA_ID: i64 = 2;
 pub(super) const FIRST_USER_SCHEMA_ID: i64 = gnitz_wire::FIRST_USER_SCHEMA_ID as i64;
 
 pub(super) const OWNER_KIND_TABLE: i64 = gnitz_wire::OWNER_KIND_TABLE as i64;
@@ -21,14 +21,14 @@ pub(super) const OWNER_KIND_TABLE: i64 = gnitz_wire::OWNER_KIND_TABLE as i64;
 #[cfg(test)]
 pub(super) const OWNER_KIND_VIEW: i64 = gnitz_wire::OWNER_KIND_VIEW as i64;
 
-pub(crate) const SEQ_ID_SCHEMAS: i64 = 1;
-pub(crate) const SEQ_ID_TABLES: i64 = 2;
-pub(crate) const SEQ_ID_INDICES: i64 = 3;
+pub(super) const SEQ_ID_SCHEMAS: i64 = 1;
+pub(super) const SEQ_ID_TABLES: i64 = 2;
+pub(super) const SEQ_ID_INDICES: i64 = 3;
 /// Committed checkpoint generation (monotonic). Falls in the ignored 4..16 gap
 /// of `observe_user_sequence`, so a fresh DB writing no row defaults it to 0.
-pub(crate) const SEQ_ID_CHECKPOINT_GEN: i64 = 4;
+pub(super) const SEQ_ID_CHECKPOINT_GEN: i64 = 4;
 /// Cluster topology: `(worker_count as u64) << 32 | STATE_FORMAT as u64`.
-pub(crate) const SEQ_ID_TOPOLOGY: i64 = 5;
+pub(super) const SEQ_ID_TOPOLOGY: i64 = 5;
 
 pub(crate) const FIRST_USER_TABLE_ID: i64 = gnitz_wire::FIRST_USER_TABLE_ID as i64;
 pub(super) const FIRST_USER_INDEX_ID: i64 = 1;
@@ -46,27 +46,25 @@ pub(super) const FIRST_USER_INDEX_ID: i64 = 1;
 /// `target_id` parameters is a convenience width over that u32. `1<<31` is a safe
 /// tripwire far short of any narrowing: an id there round-trips every one of them
 /// exactly.
-pub(crate) const RELATION_ID_CEILING: i64 = 1 << 31;
+pub(super) const RELATION_ID_CEILING: i64 = 1 << 31;
 
 pub(super) const SYS_CATALOG_DIRNAME: &str = "_system_catalog";
 
 pub(super) const SCHEMA_TAB_ID: i64 = gnitz_wire::SCHEMA_TAB as i64;
-pub(crate) const TABLE_TAB_ID: i64 = gnitz_wire::TABLE_TAB as i64;
-pub(crate) const VIEW_TAB_ID: i64 = gnitz_wire::VIEW_TAB as i64;
-pub(crate) const COL_TAB_ID: i64 = gnitz_wire::COL_TAB as i64;
-pub(crate) const IDX_TAB_ID: i64 = gnitz_wire::IDX_TAB as i64;
+pub(super) const TABLE_TAB_ID: i64 = gnitz_wire::TABLE_TAB as i64;
+pub(super) const VIEW_TAB_ID: i64 = gnitz_wire::VIEW_TAB as i64;
+pub(super) const COL_TAB_ID: i64 = gnitz_wire::COL_TAB as i64;
+pub(super) const IDX_TAB_ID: i64 = gnitz_wire::IDX_TAB as i64;
 pub(super) const DEP_TAB_ID: i64 = gnitz_wire::DEP_TAB as i64;
 pub(crate) const SEQ_TAB_ID: i64 = gnitz_wire::SEQ_TAB as i64;
 pub(super) const CIRCUIT_NODES_TAB_ID: i64 = gnitz_wire::CIRCUIT_NODES_TAB as i64;
 pub(super) const CIRCUIT_EDGES_TAB_ID: i64 = gnitz_wire::CIRCUIT_EDGES_TAB as i64;
 pub(super) const CIRCUIT_NODE_COLUMNS_TAB_ID: i64 = gnitz_wire::CIRCUIT_NODE_COLUMNS_TAB as i64;
 
-// PK list encoding lives in gnitz-wire so the client and engine cannot
-// drift on the on-disk format. Re-export under the historical paths so
-// existing `pub(super)` callers in this crate keep working unchanged.
-// Production code spells the packers `gnitz_wire::…` (or reaches them via
-// the row decoders below); the unqualified names are used only by tests,
-// so their re-exports are test-scoped and deny-warnings polices them.
+// PK list encoding lives in gnitz-wire so the client and engine cannot drift
+// on the on-disk format. Production code spells the packers `gnitz_wire::…` (or
+// reaches them via the row decoders below); the unqualified names are used only
+// by tests, so their re-exports are test-scoped.
 pub(super) use gnitz_wire::unpack_pk_cols;
 pub(crate) use gnitz_wire::PkColList;
 #[cfg(test)]
@@ -181,9 +179,9 @@ pub(super) const TABTAB_PAY_FLAGS: usize = pay_index_in(gnitz_wire::TABLE_TAB_CO
 
 pub(super) const VIEWTAB_PAY_SCHEMA_ID: usize = pay_index_in(gnitz_wire::VIEW_TAB_COLS, "schema_id");
 pub(super) const VIEWTAB_PAY_NAME: usize = pay_index_in(gnitz_wire::VIEW_TAB_COLS, "name");
-pub(crate) const VIEWTAB_PAY_PK_COL_IDX: usize = pay_index_in(gnitz_wire::VIEW_TAB_COLS, "pk_col_idx");
+pub(super) const VIEWTAB_PAY_PK_COL_IDX: usize = pay_index_in(gnitz_wire::VIEW_TAB_COLS, "pk_col_idx");
 
-// `apply_entity_caches` / `apply_schema_of` decode TABLE_TAB and VIEW_TAB
+// `apply_entity_caches` / `apply_schema_members` decode TABLE_TAB and VIEW_TAB
 // batches through one code path (reading the TABTAB_PAY_* positions); the two
 // families must agree on the leading `(schema_id, name)` payload prefix.
 const _: () = {
@@ -211,10 +209,10 @@ pub(super) const IDXTAB_COL_OWNER_ID: usize = col_index_in(gnitz_wire::IDX_TAB_C
 // indexes alike); decoded via `unpack_pk_cols`.
 pub(super) const IDXTAB_COL_SOURCE_COLS: usize = col_index_in(gnitz_wire::IDX_TAB_COLS, "source_col_idx");
 pub(super) const IDXTAB_COL_IS_UNIQUE: usize = col_index_in(gnitz_wire::IDX_TAB_COLS, "is_unique");
-pub(crate) const IDXTAB_PAY_OWNER_ID: usize = pay_index_in(gnitz_wire::IDX_TAB_COLS, "owner_id");
-pub(crate) const IDXTAB_PAY_SOURCE_COLS: usize = pay_index_in(gnitz_wire::IDX_TAB_COLS, "source_col_idx");
-pub(crate) const IDXTAB_PAY_NAME: usize = pay_index_in(gnitz_wire::IDX_TAB_COLS, "name");
-pub(crate) const IDXTAB_PAY_IS_UNIQUE: usize = pay_index_in(gnitz_wire::IDX_TAB_COLS, "is_unique");
+pub(super) const IDXTAB_PAY_OWNER_ID: usize = pay_index_in(gnitz_wire::IDX_TAB_COLS, "owner_id");
+pub(super) const IDXTAB_PAY_SOURCE_COLS: usize = pay_index_in(gnitz_wire::IDX_TAB_COLS, "source_col_idx");
+pub(super) const IDXTAB_PAY_NAME: usize = pay_index_in(gnitz_wire::IDX_TAB_COLS, "name");
+pub(super) const IDXTAB_PAY_IS_UNIQUE: usize = pay_index_in(gnitz_wire::IDX_TAB_COLS, "is_unique");
 
 pub(super) const SEQTAB_COL_VALUE: usize = col_index_in(gnitz_wire::SEQ_TAB_COLS, "next_val");
 pub(super) const SEQTAB_PAY_VALUE: usize = pay_index_in(gnitz_wire::SEQ_TAB_COLS, "next_val");
@@ -258,6 +256,16 @@ pub(super) fn read_idx_tab_row(batch: &Batch, i: usize) -> (i64, PkColList, bool
     )
 }
 
+/// Cursor sibling of [`read_idx_tab_row`]: `(owner_id, source_cols, is_unique)`
+/// of the row a cursor is positioned on.
+pub(super) fn read_idx_tab_cursor_row(cursor: &crate::storage::ReadCursor) -> (i64, PkColList, bool) {
+    (
+        super::cursor_read_u64(cursor, IDXTAB_COL_OWNER_ID) as i64,
+        unpack_pk_cols(super::cursor_read_u64(cursor, IDXTAB_COL_SOURCE_COLS)),
+        super::cursor_read_u64(cursor, IDXTAB_COL_IS_UNIQUE) != 0,
+    )
+}
+
 /// The `(owner_id, packed_source_cols, col_indices)` of every UNIQUE index this
 /// IDX_TAB family creates — positive-weight rows whose column list is
 /// well-formed. The DDL driver pre-flights each one before the bundle is made
@@ -288,6 +296,65 @@ pub(crate) fn idx_tab_drops(batch: &Batch) -> Vec<(i64, u64)> {
         .collect()
 }
 
+/// What one delta does to one PK: where its `-1` and `+1` rows are, and the
+/// summed weight. A PK carrying both signs is a **rewrite pair** (a rename) —
+/// the shape §3.1/§3.2 key on. This is the one decoding of that shape; every
+/// precheck guard and pair-sensitive hook reads it instead of rescanning.
+pub(super) struct PkSignature {
+    pub(super) pk: u128,
+    /// First row index carrying this PK; its OPK bytes address the live row.
+    pub(super) row: usize,
+    /// First `-1` / `+1` row index for this PK.
+    pub(super) neg: Option<usize>,
+    pub(super) pos: Option<usize>,
+    /// A sign occurs on more than one row (never legitimate for COL_TAB).
+    pub(super) repeats_a_sign: bool,
+    pub(super) sum: i64,
+}
+
+impl PkSignature {
+    /// A rewrite pair — both signs on one PK, whose net stays live.
+    pub(super) fn is_pair(&self) -> bool {
+        self.neg.is_some() && self.pos.is_some()
+    }
+}
+
+/// One [`PkSignature`] per distinct PK, in first-appearance order. Zero-weight
+/// rows are skipped. Quadratic in the batch, which is bounded by one DDL bundle
+/// (`MAX_COLUMNS` rows for COL_TAB, a handful of relations otherwise).
+pub(super) fn pk_signatures(batch: &Batch) -> Vec<PkSignature> {
+    let mut sigs: Vec<PkSignature> = Vec::new();
+    for i in 0..batch.count {
+        let pk = batch.get_pk(i);
+        let w = batch.get_weight(i);
+        if w == 0 {
+            continue;
+        }
+        let sig = match sigs.iter_mut().find(|s| s.pk == pk) {
+            Some(s) => s,
+            None => {
+                sigs.push(PkSignature {
+                    pk,
+                    row: i,
+                    neg: None,
+                    pos: None,
+                    repeats_a_sign: false,
+                    sum: 0,
+                });
+                sigs.last_mut().expect("just pushed")
+            }
+        };
+        sig.sum += w;
+        // Keep the FIRST row of each sign; a later one only sets the flag.
+        match (w < 0, if w < 0 { sig.neg } else { sig.pos }) {
+            (_, Some(_)) => sig.repeats_a_sign = true,
+            (true, None) => sig.neg = Some(i),
+            (false, None) => sig.pos = Some(i),
+        }
+    }
+    sigs
+}
+
 /// The PKs this family creates (`positive`) or drops, EXCLUDING any PK carrying
 /// BOTH signs — a rewrite pair, e.g. a rename's `-1,+1`. A weight-homogeneous
 /// CREATE/DROP family has no such pair; a rename's paired PK is filtered from
@@ -295,35 +362,10 @@ pub(crate) fn idx_tab_drops(batch: &Batch) -> Vec<(i64, u64)> {
 /// is never treated as dropped. Batch-local: the whole family (both signs of a
 /// pair) arrives as one batch on every path.
 pub(crate) fn family_pks_by_sign(batch: &Batch, positive: bool) -> Vec<i64> {
-    // One pass records which signs each PK carries; a PK with both is a rewrite.
-    let mut signs: rustc_hash::FxHashMap<i64, (bool, bool)> = rustc_hash::FxHashMap::default();
-    let mut order: Vec<i64> = Vec::new();
-    for i in 0..batch.count {
-        let w = batch.get_weight(i);
-        if w == 0 {
-            continue;
-        }
-        let pk = batch.get_pk(i) as i64;
-        let e = signs.entry(pk).or_insert_with(|| {
-            order.push(pk);
-            (false, false)
-        });
-        if w > 0 {
-            e.0 = true;
-        } else {
-            e.1 = true;
-        }
-    }
-    order
+    pk_signatures(batch)
         .into_iter()
-        .filter(|pk| {
-            let (pos, neg) = signs[pk];
-            if positive {
-                pos && !neg
-            } else {
-                neg && !pos
-            }
-        })
+        .filter(|s| !s.is_pair() && if positive { s.pos.is_some() } else { s.neg.is_some() })
+        .map(|s| s.pk as i64)
         .collect()
 }
 
@@ -610,6 +652,12 @@ impl SysFamily {
     #[inline]
     pub(crate) fn schema(self) -> SchemaDescriptor {
         SCHEMAS[self.index()]
+    }
+
+    /// Topological creation priority (see [`SysFamilyInfo::topo_priority`]).
+    #[inline]
+    pub(crate) fn topo_priority(self) -> u8 {
+        self.info().topo_priority
     }
 
     /// Inverse of [`Self::id`]; `None` for any id that is not a system family.

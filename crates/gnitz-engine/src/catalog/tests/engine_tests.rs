@@ -12,7 +12,7 @@ fn test_enforce_unique_pk() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.get_schema(tid).unwrap();
+    let schema = engine.get_schema_desc(tid).unwrap();
 
     let make_row = |pk: u64, val: u64, w: i64| -> Batch {
         let mut bb = BatchBuilder::new(schema);
@@ -349,7 +349,7 @@ fn test_ingest_scan_seek_family() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.get_schema(tid).unwrap();
+    let schema = engine.get_schema_desc(tid).unwrap();
 
     // Ingest via CatalogEngine (user table path)
     let mut bb = BatchBuilder::new(schema);
@@ -424,7 +424,7 @@ fn test_ingest_pk_enforced_partitioned() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.get_schema(tid).unwrap();
+    let schema = engine.get_schema_desc(tid).unwrap();
 
     // Insert row with PK=1, val=100
     let mut bb = BatchBuilder::new(schema);
@@ -573,13 +573,13 @@ fn test_fk_index_metadata_queries() {
 
     // FK count
     assert!(!engine.fk_constraints_of(child_tid).is_empty());
-    let target_id = engine.fk_constraints_of(child_tid)[0].target_table_id;
+    let target_id = engine.fk_constraints_of(child_tid)[0].parent_tid;
     assert_eq!(target_id, tid);
 
     // Create an explicit index
     let _iid = engine.create_index("public.parent", &["val"], false).unwrap();
 
-    assert!(engine.get_index_circuit_count(tid) > 0);
+    assert!(!engine.index_circuits(tid).is_empty());
     let (ic_cols, _is_unique) = engine.get_index_circuit_info(tid, 0).unwrap();
     assert_eq!(ic_cols.as_slice(), [1]); // val is column 1
 
@@ -616,7 +616,7 @@ fn test_iter_user_table_ids_and_lsn() {
 // ── Column name caching test ─────────────────────────────────────
 
 #[test]
-fn test_get_column_names_cached() {
+fn test_column_defs_cached() {
     let dir = temp_dir("catalog_colnames");
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![
@@ -647,12 +647,13 @@ fn test_get_column_names_cached() {
     ];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
-    let names1 = engine.get_column_names(tid);
-    assert_eq!(*names1, vec!["pk", "alpha", "beta"]);
+    let names =
+        |e: &mut CatalogEngine| -> Vec<String> { e.read_column_defs(tid).iter().map(|cd| cd.name.clone()).collect() };
+    assert_eq!(names(&mut engine), vec!["pk", "alpha", "beta"]);
 
     // Second call should hit cache
-    let names2 = engine.get_column_names(tid);
-    assert_eq!(*names2, vec!["pk", "alpha", "beta"]);
+    assert!(engine.caches.col_defs.contains_key(&tid));
+    assert_eq!(names(&mut engine), vec!["pk", "alpha", "beta"]);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

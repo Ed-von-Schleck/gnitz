@@ -83,9 +83,9 @@ impl CatalogEngine {
         let mb = batch.as_mem_batch();
 
         for constraint in constraints {
-            let col_idx = constraint.fk_col_idx;
-            let target_id = constraint.target_table_id;
-            let target_col_idx = constraint.target_col_idx;
+            let col_idx = constraint.fk_col;
+            let target_id = constraint.parent_tid;
+            let target_col_idx = constraint.parent_col;
 
             let target_entry = self
                 .dag

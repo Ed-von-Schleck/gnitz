@@ -1,11 +1,5 @@
 use super::*;
 
-// Arbitrary fixed 128-bit values for UUID columns; UUID_A is the value the
-// parent stores and a valid child references, UUID_B is a distinct value used
-// to trigger an FK violation.
-const UUID_A: u128 = 0x0000_0000_0000_AAAA_0000_0000_0000_BBBB;
-const UUID_B: u128 = 0x0000_0000_0000_BEEF_0000_0000_0000_DEAD;
-
 // ── test_fk_lock_set ─────────────────────────────────────────────────
 
 #[test]
@@ -102,16 +96,16 @@ fn test_fk_referential_integrity() {
     let child_tid = engine.create_table("public.children", &child_cols, &[0]).unwrap();
 
     // Insert valid parent
-    let parent_schema = engine.get_schema(parent_tid).unwrap();
+    let parent_schema = engine.get_schema_desc(parent_tid).unwrap();
     let mut pbb = BatchBuilder::new(parent_schema);
     pbb.begin_row(10u128, 1);
     pbb.end_row();
     let pbatch = pbb.finish();
-    engine.dag.ingest_to_family(parent_tid, pbatch);
+    engine.dag.ingest_relation(parent_tid, pbatch);
     let _ = engine.dag.flush(parent_tid);
 
     // Insert valid child (FK=10 exists in parent)
-    let child_schema = engine.get_schema(child_tid).unwrap();
+    let child_schema = engine.get_schema_desc(child_tid).unwrap();
     let mut cbb = BatchBuilder::new(child_schema);
     cbb.begin_row(1u128, 1);
     cbb.put_u64(10); // valid FK
@@ -155,7 +149,7 @@ fn test_fk_nullability_and_retractions() {
     let child_tid = engine.create_table("public.c", &child_cols, &[0]).unwrap();
 
     // NULL FK should be allowed even if parent is empty
-    let child_schema = engine.get_schema(child_tid).unwrap();
+    let child_schema = engine.get_schema_desc(child_tid).unwrap();
     let mut bb = BatchBuilder::new(child_schema);
     bb.begin_row(1u128, 1);
     bb.put_null();
@@ -274,15 +268,15 @@ fn test_fk_self_reference() {
     // `fk_constraints_of`, the delete-restrict rule through `fk_children_of`.
     let as_child = engine.fk_constraints_of(emp_tid);
     assert_eq!(as_child.len(), 1);
-    assert_eq!(as_child[0].fk_col_idx, 1);
-    assert_eq!(as_child[0].target_table_id, emp_tid);
-    assert_eq!(as_child[0].target_col_idx, 0);
+    assert_eq!(as_child[0].fk_col, 1);
+    assert_eq!(as_child[0].parent_tid, emp_tid);
+    assert_eq!(as_child[0].parent_col, 0);
 
     let as_parent = engine.fk_children_of(emp_tid);
     assert_eq!(as_parent.len(), 1);
     assert_eq!(as_parent[0].child_tid, emp_tid);
-    assert_eq!(as_parent[0].fk_col_idx, 1);
-    assert_eq!(as_parent[0].parent_col_idx, 0);
+    assert_eq!(as_parent[0].fk_col, 1);
+    assert_eq!(as_parent[0].parent_col, 0);
 
     // Both endpoints are the same table, so the lock set dedupes to one tid —
     // a writer takes exactly one guard, not the same guard twice.
@@ -499,15 +493,15 @@ fn test_fk_u128() {
     let child_tid = engine.create_table("public.uchildren", &child_cols, &[0]).unwrap();
 
     // Insert parent with U128 PK (lo=0xBBBB, hi=0xAAAA)
-    let parent_schema = engine.get_schema(parent_tid).unwrap();
+    let parent_schema = engine.get_schema_desc(parent_tid).unwrap();
     let mut pbb = BatchBuilder::new(parent_schema);
     pbb.begin_row(UUID_A, 1);
     pbb.end_row();
-    engine.dag.ingest_to_family(parent_tid, pbb.finish());
+    engine.dag.ingest_relation(parent_tid, pbb.finish());
     let _ = engine.dag.flush(parent_tid);
 
     // Valid child FK (matches parent)
-    let child_schema = engine.get_schema(child_tid).unwrap();
+    let child_schema = engine.get_schema_desc(child_tid).unwrap();
     let mut cbb = BatchBuilder::new(child_schema);
     cbb.begin_row(1u128, 1);
     cbb.put_u128(UUID_A);
@@ -552,14 +546,14 @@ fn test_fk_inline_child_pk_column_is_fk() {
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
     // Insert a parent row with pid = 10.
-    let parent_schema = engine.get_schema(parent_tid).unwrap();
+    let parent_schema = engine.get_schema_desc(parent_tid).unwrap();
     let mut pbb = BatchBuilder::new(parent_schema);
     pbb.begin_row(10u128, 1);
     pbb.end_row();
-    engine.dag.ingest_to_family(parent_tid, pbb.finish());
+    engine.dag.ingest_relation(parent_tid, pbb.finish());
     let _ = engine.dag.flush(parent_tid);
 
-    let child_schema = engine.get_schema(child_tid).unwrap();
+    let child_schema = engine.get_schema_desc(child_tid).unwrap();
 
     // Present parent key: child PK = 10 references the existing parent row.
     let mut ok = BatchBuilder::new(child_schema);

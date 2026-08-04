@@ -76,7 +76,7 @@ impl WorkerProcess {
             }
             ReplySchema::Table(s) => {
                 let e = ipc::get_or_build_schema_wire_block(self.cat(), tid_key, s);
-                (Some(e.entry.block), e.version, e.entry.wire_safe)
+                (Some(e.block), e.version, e.wire_safe)
             }
             ReplySchema::ClientAuthored(s) => (None, 0, schema_wire_safe(s)),
         }

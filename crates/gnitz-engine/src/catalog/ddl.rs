@@ -104,27 +104,21 @@ impl CatalogEngine {
     /// and tables second (to handle FK chains).
     #[cfg(test)]
     fn collect_schema_members(&mut self, sid: i64) -> (Vec<String>, Vec<String>) {
-        let view_ids: Vec<i64> = self
+        let members: Vec<i64> = self
             .caches
-            .views_by_schema
+            .members_by_schema
             .get(&sid)
             .map(|s| s.iter().copied().collect())
             .unwrap_or_default();
-        let table_ids: Vec<i64> = self
-            .caches
-            .tables_by_schema
-            .get(&sid)
-            .map(|s| s.iter().copied().collect())
-            .unwrap_or_default();
-        let views = view_ids
-            .iter()
-            .filter_map(|&id| self.caches.entity_by_id.get(&id).map(|(sn, en)| format!("{sn}.{en}")))
-            .collect();
-        let tables = table_ids
-            .iter()
-            .filter_map(|&id| self.caches.entity_by_id.get(&id).map(|(sn, en)| format!("{sn}.{en}")))
-            .collect();
-        (views, tables)
+        let (view_ids, table_ids): (Vec<i64>, Vec<i64>) = members
+            .into_iter()
+            .partition(|id| self.dag.tables.get(id).is_some_and(|e| e.kind.is_view()));
+        let qname = |ids: Vec<i64>| -> Vec<String> {
+            ids.iter()
+                .filter_map(|id| self.caches.entity_by_id.get(id).map(|(sn, en)| format!("{sn}.{en}")))
+                .collect()
+        };
+        (qname(view_ids), qname(table_ids))
     }
 
     /// Repeatedly attempt to drop each target; on dependency-related
@@ -205,7 +199,7 @@ impl CatalogEngine {
             self.validate_fk_column(cd, tid, pk.as_slice(), self_pk_type)?;
         }
 
-        let directory = table_dir(&self.base_dir, schema_name, tid);
+        let directory = relation_dir(&self.base_dir, schema_name, RelationKind::BaseTable, tid);
         // This in-process test shortcut always builds partitioned, full-PK-distributed
         // tables (`replicated = false`, `k = 0` = default). REPLICATED and CLUSTER BY
         // routing are exercised through the catalog hook / SQL planner, not here.
@@ -362,7 +356,7 @@ impl CatalogEngine {
             .get(index_name)
             .ok_or_else(|| format!("Index does not exist: {index_name}"))?;
 
-        // precheck_sys_ingest enforces the FK-target uniqueness guard on the -1;
+        // precheck_family enforces the FK-target uniqueness guard on the -1;
         // the cascade (circuit demotion/deletion) is the applier's reaction in
         // hook_index_register.
         self.submit_retraction(SysFamily::Index, idx_id as u128)

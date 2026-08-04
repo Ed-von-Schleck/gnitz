@@ -45,13 +45,16 @@ struct UniquePkRowState {
 impl DagEngine {
     // ── Ingestion ───────────────────────────────────────────────────────
 
-    /// Ingest a batch into a table's store + index projections.
+    /// Ingest a batch into a relation's store + index projections, discarding
+    /// the effective delta. Named apart from `CatalogEngine::ingest_to_family`
+    /// (which routes a *system* family through the precheck/hooks path) — the
+    /// two are different operations that were one keystroke apart.
     ///
     /// Stages:
     /// 1. PK enforcement (retract existing, dedup intra-batch)
     /// 2. store.ingest_batch
     /// 3. index projection
-    pub fn ingest_to_family(&mut self, table_id: i64, batch: Batch) {
+    pub fn ingest_relation(&mut self, table_id: i64, batch: Batch) {
         self.ingest_returning_effective(table_id, batch);
     }
 
@@ -65,7 +68,7 @@ impl DagEngine {
         };
 
         if entry.kind.is_base_table() {
-            self.ingest_to_family(table_id, batch.clone_batch());
+            self.ingest_relation(table_id, batch.clone_batch());
             return 0;
         }
 

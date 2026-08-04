@@ -88,32 +88,15 @@ impl CatalogEngine {
 
     /// Column definitions for `owner_id`, cached until the next COL_TAB delta
     /// (`invalidate_col_names` fires on every path — live, replay, ddl_sync,
-    /// rollback). One COL_TAB scan also fills the three derived views
-    /// (`col_names`, `col_names_bytes`, `col_hidden`).
+    /// rollback). Returns an `Rc` snapshot: callers routinely touch the catalog
+    /// while holding it, so a borrow would not do. Uses the infallible
+    /// non-checking scan — the contiguity-checking form stays a direct storage
+    /// scan at its precheck call sites.
     pub(crate) fn read_column_defs(&mut self, owner_id: i64) -> Rc<Vec<ColumnDef>> {
         if let Some(defs) = self.caches.col_defs.get(&owner_id) {
             return defs.clone();
         }
-        self.fill_column_caches(owner_id)
-    }
-
-    /// Scan COL_TAB once for `owner_id` and fill the column-def cache plus its
-    /// three derived views. Uses the infallible non-checking scan — the
-    /// contiguity-checking form stays a direct storage scan at its precheck
-    /// call sites.
-    pub(crate) fn fill_column_caches(&mut self, owner_id: i64) -> Rc<Vec<ColumnDef>> {
         let defs = Rc::new(self.scan_column_defs(owner_id, false).unwrap());
-        let mut hidden: u128 = 0;
-        for (i, cd) in defs.iter().enumerate() {
-            if cd.is_hidden {
-                hidden |= 1 << i;
-            }
-        }
-        let names: Vec<String> = defs.iter().map(|cd| cd.name.clone()).collect();
-        let bytes: Vec<Vec<u8>> = names.iter().map(|n| n.as_bytes().to_vec()).collect();
-        self.caches.col_hidden.insert(owner_id, hidden);
-        self.caches.col_names.insert(owner_id, Rc::new(names));
-        self.caches.col_names_bytes.insert(owner_id, Rc::new(bytes));
         self.caches.col_defs.insert(owner_id, defs.clone());
         defs
     }
@@ -126,11 +109,6 @@ impl CatalogEngine {
 
     // The following registry getters are exercised only by the catalog tests;
     // production code reads the caches/DAG entries directly.
-    #[cfg(test)]
-    pub(crate) fn get_schema(&self, table_id: i64) -> Option<SchemaDescriptor> {
-        self.dag.tables.get(&table_id).map(|e| e.schema)
-    }
-
     #[cfg(test)]
     pub(crate) fn get_schema_name_by_id(&self, schema_id: i64) -> &str {
         self.caches
@@ -150,15 +128,13 @@ impl CatalogEngine {
         self.caches.schema_by_name.get(name).copied().unwrap_or(-1)
     }
 
-    /// Number of live member relations (tables + views) in schema `sid`.
-    /// Reads the per-schema caches `apply_schema_of` maintains in production
-    /// (`tables_by_schema` / `views_by_schema`), each of which drops its set once
-    /// it empties — so this returns 0 exactly when no member remains. The
-    /// engine-side non-empty-schema DROP guard (`precheck_sys_ingest`) and the
-    /// `#[cfg(test)]` `schema_is_empty` share this one probe.
+    /// Number of live member relations (tables + views) in schema `sid`. Reads
+    /// the `members_by_schema` cache `apply_schema_members` maintains, which
+    /// drops its set once it empties — so this returns 0 exactly when no member
+    /// remains. The engine-side non-empty-schema DROP guard (`precheck_family`)
+    /// and the `#[cfg(test)]` `schema_is_empty` share this one probe.
     pub(crate) fn schema_member_count(&self, sid: i64) -> usize {
-        self.caches.tables_by_schema.get(&sid).map_or(0, |s| s.len())
-            + self.caches.views_by_schema.get(&sid).map_or(0, |s| s.len())
+        self.caches.members_by_schema.get(&sid).map_or(0, |s| s.len())
     }
 
     #[cfg(test)]
@@ -215,6 +191,13 @@ impl CatalogEngine {
             .entity_by_id
             .get(&table_id)
             .map(|(s, t)| (s.as_str(), t.as_str()))
+    }
+
+    /// The qualified `(schema, name)` of `table_id`, or `("?", "?")` when the
+    /// catalog has no entry — the one fallback every constraint-violation
+    /// message renders.
+    pub(crate) fn qualified_name_or_unknown(&self, table_id: i64) -> (&str, &str) {
+        self.get_qualified_name(table_id).unwrap_or(("?", "?"))
     }
 
     #[cfg(test)]

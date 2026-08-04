@@ -157,7 +157,7 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
     push_view_tab_row(&mut bb, 1, new_vid, "vw", "SELECT id, v FROM base");
     let collide = bb.finish();
     assert!(
-        engine.precheck_family(VIEW_TAB_ID, &collide).is_err(),
+        engine.precheck_family(SysFamily::View, &collide).is_err(),
         "a second live view under one name must still be rejected"
     );
 
@@ -169,7 +169,7 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
     push_view_tab_row(&mut bb, 1, new_vid, "vw", "SELECT id, v FROM base");
     let replace = bb.finish();
     engine
-        .precheck_family(VIEW_TAB_ID, &replace)
+        .precheck_family(SysFamily::View, &replace)
         .expect("a bundle that retires the incumbent may reuse its name");
 
     engine.close();

@@ -166,9 +166,7 @@ impl CatalogEngine {
     ) -> Result<(&crate::query::TableEntry, &crate::query::IndexCircuitEntry), String> {
         let entry = self.table_entry(table_id)?;
         let ic = entry
-            .index_circuits
-            .iter()
-            .find(|ic| ic.col_indices.as_slice() == cols)
+            .index_circuit_on(cols)
             .ok_or_else(|| format!("No index on cols {cols:?} for table {table_id}"))?;
         Ok((entry, ic))
     }
@@ -486,15 +484,12 @@ impl SourceCursor {
 }
 
 /// The half-open OPK key range `[start, end)` for `range` over `ic`'s index, each
-/// key exactly `ic.index_schema.pk_stride()` bytes. The cut → key mapping and the
-/// provably-empty verdicts are the shared `range_keys_from_cuts` (§ its doc);
-/// this function contributes only the index-specific group-prefix encoder and
-/// the arity guard.
+/// key exactly `ic.index_schema.pk_stride()` bytes — [`eq_prefix_range_keys`]
+/// with the index-specific group-prefix encoder.
 ///
-/// `Ok(None)` = provably empty (a `+∞` saturated start, or an inverted range like
-/// `x > 5 AND x < 3` the planner does not pre-reject). `Err` = the descriptor pins
-/// `n_eq` columns with no range column left within the index's arity — a trust
-/// boundary the `pub` seek path must reject and a backfill bound merely degrades on.
+/// The prefix is encoded through the circuit's baked spec, the same path the
+/// write side uses (`write_span` / `batch_project_index`), so the two are
+/// byte-identical by construction.
 ///
 /// Correctness rests on the OPK ordering invariant: the index PK region is
 /// `[promoted leading-key OPK ‖ source-PK OPK]` and memcmp order on those bytes
@@ -506,38 +501,16 @@ fn index_range_keys(
     ic: &crate::query::IndexCircuitEntry,
     range: &gnitz_wire::RangeDescriptor,
 ) -> Result<Option<(crate::schema::key::PkBuf, Option<crate::schema::key::PkBuf>)>, String> {
-    let cols = ic.col_indices.as_slice();
-    // Precondition: the range column sits right after the equality prefix, so
-    // `n_eq + 1` leading columns must exist. Guard *before* the `natives[..=n_eq]` /
-    // `leading_key_size(n_eq + 1)` indexing below would panic. (Written
-    // `n_eq >= len`, never a `+ 1` that could overflow on an adversarial length.)
-    // It also keeps `prefix_len < idx_pk_stride` strict, so `pad` always extends
-    // the group key.
-    let eq_natives = range.eq_vals();
-    let n_eq = eq_natives.len();
-    if n_eq >= cols.len() {
-        return Err(format!(
-            "index range: n_eq {n_eq} has no range column within index arity {} on cols {cols:?}",
-            cols.len()
-        ));
-    }
-
-    let idx_pk_stride = ic.index_schema.pk_stride() as usize; // leading + source PK
-
-    // The group prefix of a cut value is the full (n_eq + 1)-column leading key,
-    // encoded through the circuit's baked spec — the same path the write side
-    // uses (`write_span`/`batch_project_index` — byte-identical by construction).
-    // `seek_prefix` returns it as a `PkBuf` whose zero tail makes `group(v)` IS
-    // `pad(group(v))`.
-    let mut natives = [0u128; gnitz_wire::PK_LIST_MAX_COLS];
-    natives[..n_eq].copy_from_slice(eq_natives);
-    Ok(crate::schema::key::range_keys_from_cuts(range, idx_pk_stride, |v| {
-        natives[n_eq] = v;
-        ic.key_spec.seek_prefix(&natives[..=n_eq])
-    }))
+    crate::schema::key::eq_prefix_range_keys(
+        range,
+        ic.col_indices.as_slice().len(),
+        ic.index_schema.pk_stride() as usize, // leading + source PK
+        "index range",
+        |natives| ic.key_spec.seek_prefix(natives),
+    )
 }
 
-/// Projecting sibling of `copy_cursor_row_with_weight`: append the cursor's
+/// Projecting sibling of `ReadCursor::copy_current_row_into`: append the cursor's
 /// current row to `out` (which has the `project_schema` layout) with weight 1,
 /// copying only the columns in `proj` — the caller-resolved
 /// `(col_idx, payload_slot, size)` triple per projected column. The projected

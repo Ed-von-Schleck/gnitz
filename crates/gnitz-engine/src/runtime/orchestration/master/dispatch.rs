@@ -151,7 +151,7 @@ impl MasterDispatcher {
         let schema = self.schema_desc_for(target_id);
         let cat = self.cat();
         let e = crate::runtime::wire::get_or_build_schema_wire_block(cat, target_id, &schema);
-        (schema, e.entry.block, e.entry.wire_safe, e.entry.wire_row_fixed_stride)
+        (schema, e.block, e.wire_safe, e.wire_row_fixed_stride)
     }
 
     pub(super) fn pool_pop_batch(&self, slot: super::preflight::PoolSlot) -> Option<Batch> {

@@ -53,7 +53,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
-    let schema = engine.get_schema(tid).unwrap();
+    let schema = engine.get_schema_desc(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     for i in 0..N as u64 {
         bb.begin_row(i as u128, 1);
@@ -150,7 +150,7 @@ fn index_rebuilds_across_chunk_boundary() {
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
-    let schema = engine.get_schema(tid).unwrap();
+    let schema = engine.get_schema_desc(tid).unwrap();
     let mut next = 0usize;
     while next < n {
         let mut bb = BatchBuilder::new(schema);
@@ -209,7 +209,7 @@ fn backfill_all_indexes_rebuilds_exactly_once() {
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
-    let schema = engine.get_schema(tid).unwrap();
+    let schema = engine.get_schema_desc(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     for i in 0..N as u64 {
         bb.begin_row(i as u128, 1);

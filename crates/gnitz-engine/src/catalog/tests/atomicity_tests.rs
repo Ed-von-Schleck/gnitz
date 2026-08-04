@@ -48,11 +48,9 @@ fn write_col_at_index(engine: &mut CatalogEngine, owner_id: i64, col_idx: i64, c
 // ---------------------------------------------------------------------------
 // Part 1 — precheck-before-mutate tests
 //
-// Each test is RED until precheck_sys_ingest is extended to cover positive-
-// weight (CREATE) rows for TABLE_TAB, VIEW_TAB, and IDX_TAB.  Before that
-// extension the hook fires *after* the sys-table ingest and the cache appliers,
-// so a hook failure leaves orphaned rows in the memtable and dirty cache
-// entries.  After the extension, precheck rejects before any mutation.
+// `precheck_family` runs before any mutation, so a rejected positive-weight
+// (CREATE) row for TABLE_TAB, VIEW_TAB, or IDX_TAB leaves no orphaned memtable
+// row and no dirty cache entry behind.
 // ---------------------------------------------------------------------------
 
 // ── Part 1: TABLE_TAB, no column records ─────────────────────────────────────
@@ -451,7 +449,7 @@ fn test_create_unique_index_backfill_fail_no_dir_leak() {
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.leaktest", &cols, &[0]).unwrap();
-    let schema = engine.get_schema(tid).unwrap();
+    let schema = engine.get_schema_desc(tid).unwrap();
 
     // Ingest two rows that share the same 'val' — unique index backfill must fail.
     let mut bb = BatchBuilder::new(schema);
@@ -461,7 +459,7 @@ fn test_create_unique_index_backfill_fail_no_dir_leak() {
     bb.begin_row(2u128, 1);
     bb.put_u64(42u64);
     bb.end_row();
-    engine.dag.ingest_to_family(tid, bb.finish());
+    engine.dag.ingest_relation(tid, bb.finish());
     let _ = engine.dag.flush(tid);
 
     // Capture the expected index directory before create_index allocates the id.
@@ -644,7 +642,7 @@ fn precheck_rejects_relation_id_at_or_above_ceiling() {
     ] {
         let table_batch = build_table_tab_row(&dir, tid, pack_pk_cols(&[0]), "banded");
         let err = engine
-            .precheck_family(TABLE_TAB_ID, &table_batch)
+            .precheck_family(SysFamily::Table, &table_batch)
             .expect_err(&format!("TABLE_TAB id at/above the ceiling must be rejected ({label})"));
         assert!(
             err.contains("relation-id ceiling"),
@@ -653,7 +651,7 @@ fn precheck_rejects_relation_id_at_or_above_ceiling() {
 
         let view_batch = build_view_tab_row(tid, "bandedview", "SELECT 1");
         let err = engine
-            .precheck_family(VIEW_TAB_ID, &view_batch)
+            .precheck_family(SysFamily::View, &view_batch)
             .expect_err(&format!("VIEW_TAB id at/above the ceiling must be rejected ({label})"));
         assert!(
             err.contains("relation-id ceiling"),
@@ -670,7 +668,7 @@ fn precheck_rejects_relation_id_at_or_above_ceiling() {
         "just_below",
     );
     let err = engine
-        .precheck_family(TABLE_TAB_ID, &ok_batch)
+        .precheck_family(SysFamily::Table, &ok_batch)
         .err()
         .unwrap_or_default();
     assert!(
@@ -701,14 +699,14 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
     let new_tid = engine.allocate_table_id();
     // Ascending topo: COL_TAB(1) applied + enqueued first.
     let col_batch = engine.build_col_batch(new_tid, OWNER_KIND_TABLE, &cols, 1);
-    engine.precheck_family(COL_TAB_ID, &col_batch).unwrap();
-    engine.apply_and_enqueue_family(COL_TAB_ID, col_batch).unwrap();
+    engine.precheck_family(SysFamily::Column, &col_batch).unwrap();
+    engine.apply_and_enqueue_family(SysFamily::Column, col_batch).unwrap();
 
     // TABLE_TAB(6): precheck fails (duplicate name), so the handler's loop never
     // applies it and its marker stays None. Compensation reconstructs nothing.
     let table_batch = build_table_tab_row(&dir, new_tid, pack_pk_cols(&[0]), "dupname");
     assert!(
-        engine.precheck_family(TABLE_TAB_ID, &table_batch).is_err(),
+        engine.precheck_family(SysFamily::Table, &table_batch).is_err(),
         "duplicate-name TABLE_TAB must fail precheck"
     );
     engine.compensate_stage_a(None);
@@ -750,18 +748,18 @@ fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
 
     let new_tid = engine.allocate_table_id();
     let col_batch = engine.build_col_batch(new_tid, OWNER_KIND_TABLE, &cols, 1);
-    engine.precheck_family(COL_TAB_ID, &col_batch).unwrap();
-    engine.apply_and_enqueue_family(COL_TAB_ID, col_batch).unwrap();
+    engine.precheck_family(SysFamily::Column, &col_batch).unwrap();
+    engine.apply_and_enqueue_family(SysFamily::Column, col_batch).unwrap();
 
     // REPLICATED + dist_prefix = 1: passes precheck, rejected by hook_table_register.
     let flags = gnitz_wire::pack_table_flags(true, 1);
     let table_batch = build_table_tab_row_flags(&dir, new_tid, pack_pk_cols(&[0]), "hooktbl", flags);
     engine
-        .precheck_family(TABLE_TAB_ID, &table_batch)
+        .precheck_family(SysFamily::Table, &table_batch)
         .expect("replicated + dist_prefix passes precheck (it is a hook-layer check)");
     // Marker set BEFORE apply; apply fails in the hook, so it stays Some.
     let mut marker: Option<(i64, Batch)> = Some((TABLE_TAB_ID, table_batch.clone()));
-    let applied = engine.apply_and_enqueue_family(TABLE_TAB_ID, table_batch);
+    let applied = engine.apply_and_enqueue_family(SysFamily::Table, table_batch);
     assert!(
         applied.is_err(),
         "hook_table_register must reject a REPLICATED table with a distribution prefix"

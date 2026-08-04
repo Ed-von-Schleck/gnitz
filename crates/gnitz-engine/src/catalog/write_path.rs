@@ -1,5 +1,5 @@
 //! Catalog write-path spine — the single ingest/apply pipeline every
-//! system-table mutation flows through: `submit` → `precheck_sys_ingest`
+//! system-table mutation flows through: `submit` → `precheck_family`
 //! → `apply_local` → `fire_hooks`, plus the broadcast queue, the
 //! directory-deletion queues, and Stage-A (DDL rollback) compensation.
 //! `fire_hooks` lives in `hooks.rs`; `SysFamily` / `ApplyContext` in
@@ -45,8 +45,8 @@ impl CatalogDeltaSink for CatalogEngine {
         // `submit` is the composition of the two steps the DDL_TXN handler drives
         // separately per bundle family: precheck (no mutation) then
         // apply-and-enqueue. Cascade callers (hooks) keep the atomic composition.
-        self.precheck_family(family.id(), &batch)?;
-        self.apply_and_enqueue_family(family.id(), batch)
+        self.precheck_family(family, &batch)?;
+        self.apply_and_enqueue_family(family, batch)
     }
 
     fn submit_local(&mut self, family: SysFamily, mut batch: Batch) -> Result<(), String> {
@@ -58,6 +58,12 @@ impl CatalogDeltaSink for CatalogEngine {
         self.apply_local(family, &mut batch, None)
         // Deliberately no push to pending_broadcasts.
     }
+}
+
+/// Topological creation priority for a `pending_broadcasts` tid; 99 (the
+/// order-neutral default) for a non-family id.
+fn sys_topo_priority(tid: i64) -> u8 {
+    SysFamily::from_id(tid).map_or(99, SysFamily::topo_priority)
 }
 
 impl CatalogEngine {
@@ -81,11 +87,6 @@ impl CatalogEngine {
         &mut *self.sys_stores[family.index()]
     }
 
-    /// Map a system table ID to a reference. Returns None for unknown IDs.
-    pub(crate) fn sys_table(&self, table_id: i64) -> Option<&Table> {
-        SysFamily::from_id(table_id).map(|f| self.sys_store(f))
-    }
-
     pub(crate) fn sys_table_mut(&mut self, table_id: i64) -> Option<&mut Table> {
         SysFamily::from_id(table_id).map(|f| &mut *self.sys_stores[f.index()])
     }
@@ -106,9 +107,7 @@ impl CatalogEngine {
         pin_lsn: Option<NonZeroU64>,
     ) -> Result<(), String> {
         let id = family.id();
-        let table = self
-            .sys_table_mut(id)
-            .expect("SysFamily::id() maps to a known sys table");
+        let table = self.sys_store_mut(family);
         // Live DDL's one sound non-fatal exit: a failure here is pre-broadcast
         // (nothing durable, nothing broadcast, client not ACKed), so Stage-A
         // compensation can unwind it. Propagate rather than abort.
@@ -118,7 +117,7 @@ impl CatalogEngine {
         if let Some(lsn) = pin_lsn {
             table.pin_lsn(lsn);
         }
-        batch.set_schema(sys_tab_schema(id));
+        batch.set_schema(family.schema());
         self.fire_hooks(family, batch)
     }
 
@@ -152,21 +151,12 @@ impl CatalogEngine {
     /// happens after hooks so nested cascade pushes land first and the executor
     /// broadcasts children → parent; empty batches are dropped so worker-side
     /// no-op cascades don't accumulate unread entries.
-    pub(crate) fn apply_and_enqueue_family(&mut self, table_id: i64, mut batch: Batch) -> Result<(), String> {
-        let family = SysFamily::from_id(table_id).ok_or_else(|| format!("Unknown system family {table_id}"))?;
+    pub(crate) fn apply_and_enqueue_family(&mut self, family: SysFamily, mut batch: Batch) -> Result<(), String> {
         self.apply_local(family, &mut batch, self.ctx.ddl_zone_lsn())?;
         if batch.count > 0 {
-            self.pending_broadcasts.push((table_id, batch));
+            self.pending_broadcasts.push((family.id(), batch));
         }
         Ok(())
-    }
-
-    /// The schema descriptor for a system-family `tid`, or `None` if `tid` is not
-    /// a system family. Unlike `get_schema_desc`, this never panics on an unknown
-    /// id in the system range, so the `DDL_TXN` decoder can reject a bogus family
-    /// tid before decoding its wal-block slice into a `Batch`.
-    pub(crate) fn sys_family_schema(&self, tid: i64) -> Option<SchemaDescriptor> {
-        SysFamily::from_id(tid).map(|f| sys_tab_schema(f.id()))
     }
 
     /// Emit the single retraction delta for `pk` in `family`: seek the live row,
@@ -182,13 +172,8 @@ impl CatalogEngine {
     /// production retractions arrive as wire deltas.
     #[cfg(test)]
     pub(crate) fn submit_retraction(&mut self, family: SysFamily, pk: u128) -> Result<(), String> {
-        let schema = sys_tab_schema(family.id());
-        let batch = {
-            let table = self
-                .sys_table(family.id())
-                .expect("SysFamily::id() maps to a known sys table");
-            retract_single_row(table, &schema, pk)
-        };
+        let schema = family.schema();
+        let batch = retract_single_row(self.sys_store(family), &schema, pk);
         if batch.count == 0 {
             return Err("Entity does not exist in catalog".into());
         }
@@ -232,14 +217,14 @@ impl CatalogEngine {
             return None;
         }
         let w = cursor.current_weight;
-        let mut b = Batch::with_capacity(sys_tab_schema(family.id()), 1);
+        let mut b = Batch::with_capacity(family.schema(), 1);
         cursor.copy_current_row_into(&mut b, w);
         Some((b, w))
     }
 
     /// §3.3(A): the post-image retraction contract for a rewrite-pair-capable
-    /// family (TABLE_TAB / VIEW_TAB / COL_TAB). For every distinct PK the batch
-    /// touches:
+    /// family (TABLE_TAB / VIEW_TAB / COL_TAB), per distinct PK:
+    ///
     /// 1. **CAS** — every `-1` row must content-equal the current live row (you
     ///    may only retract the element that exists). Via the generic
     ///    `compare_rows`, which routes STRING/BLOB (`name`/`sql_definition`)
@@ -249,10 +234,54 @@ impl CatalogEngine {
     /// 2. **Per-PK net** — `live_weight + Σ batch weights` must be 0 or 1 (sys
     ///    stores run no `enforce_unique_pk`, so nothing else stops a duplicate
     ///    live head or a persistent negative ghost).
-    /// 3. **Pair fields** — a PK carrying both signs (a rewrite pair) may differ
-    ///    from the live row only in `name` (`name_pay`); for a relation family
-    ///    (`is_relation`) a rewrite pair on a system-range id is additionally
-    ///    rejected.
+    ///
+    /// `noun` names the row kind in the messages. Returns the live row (for the
+    /// caller's pair-field comparison) and the net weight; the per-family guards
+    /// on top of this live in `precheck_relation_family` /
+    /// `precheck_column_family`.
+    fn check_cas_and_net(
+        &self,
+        family: SysFamily,
+        batch: &Batch,
+        sig: &PkSignature,
+        noun: &str,
+    ) -> Result<(Option<Batch>, i64), String> {
+        let live = self.seek_live_sys_row(family, batch.get_pk_bytes(sig.row));
+
+        if sig.neg.is_some() {
+            let Some((lb, _)) = live.as_ref() else {
+                return Err(format!(
+                    "catalog changed concurrently: retracting a {noun} that no longer exists"
+                ));
+            };
+            let schema = family.schema();
+            for j in 0..batch.count {
+                if batch.get_pk(j) == sig.pk
+                    && batch.get_weight(j) < 0
+                    && compare_rows(&schema, lb, 0, batch, j) != Ordering::Equal
+                {
+                    return Err(format!(
+                        "catalog changed concurrently: the retracted {noun} differs from the current one"
+                    ));
+                }
+            }
+        }
+
+        let net = live.as_ref().map_or(0, |(_, w)| *w) + sig.sum;
+        if !(0..=1).contains(&net) {
+            return Err(format!(
+                "system-catalog write would leave {noun} {} at net weight {net} (expected 0 or 1)",
+                sig.pk
+            ));
+        }
+        Ok((live.map(|(b, _)| b), net))
+    }
+
+    /// §3.3: the TABLE_TAB / VIEW_TAB precheck — the shared CAS + net contract
+    /// plus the two relation-only guards: a rewrite pair on a system-range id is
+    /// rejected, and a pair's `+1` may differ from the live row only in `name`
+    /// (`name_pay`). `compare_rows_except` routes STRING/BLOB through each
+    /// side's own blob heap, so a name > 12 bytes is compared by content.
     ///
     /// Returns the PKs whose net is dead (`≤ 0`) — the genuine drops — so the
     /// relation drop guards re-key on net-liveness (a rename's net-live `-1` is
@@ -262,83 +291,25 @@ impl CatalogEngine {
         family: SysFamily,
         batch: &Batch,
         name_pay: usize,
-        is_relation: bool,
     ) -> Result<Vec<i64>, String> {
-        let schema = sys_tab_schema(family.id());
+        let schema = family.schema();
         let mut net_dead: Vec<i64> = Vec::new();
-        let mut seen: Vec<u128> = Vec::new();
-        for i in 0..batch.count {
-            let pk = batch.get_pk(i);
-            if seen.contains(&pk) {
-                continue;
-            }
-            seen.push(pk);
-
-            // Per-PK batch signature (the batch is a handful of rows).
-            let mut batch_sum = 0i64;
-            let (mut has_neg, mut has_pos) = (false, false);
-            for j in 0..batch.count {
-                if batch.get_pk(j) != pk {
-                    continue;
-                }
-                let w = batch.get_weight(j);
-                batch_sum += w;
-                has_neg |= w < 0;
-                has_pos |= w > 0;
-            }
-
-            // (0) System-range rewrite guard (§3.3(B), relation families only):
-            // a rewrite pair (both signs) on a system-range id is rejected up
-            // front — before the CAS, so it fires regardless of whether a live
-            // row exists. Closes the pre-existing gap that no precheck guarded
-            // system-range payload ids.
-            if is_relation && has_neg && has_pos && (pk as i64) < FIRST_USER_TABLE_ID {
+        for sig in pk_signatures(batch) {
+            // A rewrite pair on a system-range id is rejected up front — before
+            // the CAS, so it fires regardless of whether a live row exists.
+            if sig.is_pair() && (sig.pk as i64) < FIRST_USER_TABLE_ID {
                 return Err(format!(
-                    "cannot ALTER a system relation (id {pk} < {FIRST_USER_TABLE_ID})"
+                    "cannot ALTER a system relation (id {} < {FIRST_USER_TABLE_ID})",
+                    sig.pk
                 ));
             }
 
-            let live = self.seek_live_sys_row(family, batch.get_pk_bytes(i));
-            let live_weight = live.as_ref().map_or(0, |(_, w)| *w);
-            let live_batch: Option<&Batch> = live.as_ref().map(|(b, _)| b);
+            let (live, net) = self.check_cas_and_net(family, batch, &sig, "system-catalog row")?;
 
-            // (1) CAS: every -1 row must content-equal the live row.
-            if has_neg {
-                let Some(lb) = live_batch else {
-                    return Err(
-                        "catalog changed concurrently: retracting a system-catalog row that no longer exists".into(),
-                    );
-                };
+            if sig.is_pair() {
+                let lb = live.as_ref().expect("a pair's -1 CAS already required a live row");
                 for j in 0..batch.count {
-                    if batch.get_pk(j) == pk
-                        && batch.get_weight(j) < 0
-                        && compare_rows(&schema, lb, 0, batch, j) != Ordering::Equal
-                    {
-                        return Err(
-                            "catalog changed concurrently: the retracted system-catalog row differs from the current one"
-                                .into(),
-                        );
-                    }
-                }
-            }
-
-            // (2) Per-PK net ∈ {0, 1}.
-            let net = live_weight + batch_sum;
-            if !(0..=1).contains(&net) {
-                return Err(format!(
-                    "system-catalog write would leave PK {pk} at net weight {net} (expected 0 or 1)"
-                ));
-            }
-
-            // (3) Pair fields: a rewrite pair's `+1` may differ from the live row
-            // only in `name` (the CAS above already required a live row).
-            // `compare_rows_except` routes STRING/BLOB through each side's own
-            // blob heap, so a name > 12 bytes is compared by content, never a
-            // raw region `memcmp`.
-            if has_neg && has_pos {
-                let lb = live_batch.expect("a pair's -1 CAS already required a live row");
-                for j in 0..batch.count {
-                    if batch.get_pk(j) == pk
+                    if batch.get_pk(j) == sig.pk
                         && batch.get_weight(j) > 0
                         && compare_rows_except(&schema, lb, 0, batch, j, 1 << name_pay) != Ordering::Equal
                     {
@@ -348,7 +319,7 @@ impl CatalogEngine {
             }
 
             if net <= 0 {
-                net_dead.push(pk as i64);
+                net_dead.push(sig.pk as i64);
             }
         }
         Ok(net_dead)
@@ -367,44 +338,30 @@ impl CatalogEngine {
     ///   `{name, is_hidden, is_nullable}` must match, and `is_hidden` /
     ///   `is_nullable` may change only `0→1` (forward path; compensation replays
     ///   `1→0` through `submit_local`, which bypasses precheck).
-    /// - **Transition-scoped guards** (load-bearing — a blanket guard would regress
-    ///   RENAME): a `name`-only pair (RENAME COLUMN) is always accepted; an
-    ///   `is_hidden 0→1` (DROP COLUMN) or `is_nullable 0→1` (DROP NOT NULL) pair
-    ///   requires the owner to be a registered user base table (not a view, not
-    ///   system-range) with **no dependent views**, and the column not to be a PK
-    ///   column.
+    /// - **Transition-scoped guards** — scoped to the transition rather than
+    ///   blanket, which would reject RENAME: a `name`-only pair (RENAME COLUMN)
+    ///   is always accepted; an `is_hidden 0→1` (DROP COLUMN) or
+    ///   `is_nullable 0→1` (DROP NOT NULL) pair requires the owner to be a
+    ///   registered user base table (not a view, not system-range) with **no
+    ///   dependent views**, and the column not to be a PK column.
     /// - **Unpaired `-1`** on a registered owner is rejected (physical column
     ///   removal does not exist); **unpaired `+1`** is rejected (no column-append
     ///   feature). An unregistered owner is a live CREATE TABLE COL append (the
     ///   owner table registers later in the bundle), so `+1`-only rows pass.
     fn precheck_column_family(&mut self, batch: &Batch) -> Result<(), String> {
-        let schema = sys_tab_schema(COL_TAB_ID);
+        let schema = SysFamily::Column.schema();
         // The payload fields a rewrite pair may change; everything else must match.
         let pair_mask: u64 = (1 << COLTAB_PAY_NAME) | (1 << COLTAB_PAY_IS_HIDDEN) | (1 << COLTAB_PAY_IS_NULLABLE);
-        let mut seen: Vec<u128> = Vec::new();
-        for i in 0..batch.count {
-            let pk = batch.get_pk(i);
-            if seen.contains(&pk) {
-                continue;
-            }
-            seen.push(pk);
+        for sig in pk_signatures(batch) {
+            let pk = sig.pk;
             let owner_id = gnitz_wire::unpack_col_id(pk as u64).0 as i64;
 
-            // Per-PK batch signature + the -1/+1 row indices for the pair check.
-            let mut batch_sum = 0i64;
-            let (mut neg_j, mut pos_j): (Option<usize>, Option<usize>) = (None, None);
-            for j in 0..batch.count {
-                if batch.get_pk(j) != pk || batch.get_weight(j) == 0 {
-                    continue;
-                }
-                let w = batch.get_weight(j);
-                batch_sum += w;
-                let slot = if w < 0 { &mut neg_j } else { &mut pos_j };
-                if slot.replace(j).is_some() {
-                    return Err(format!(
-                        "system-catalog write carries multiple same-sign rows for column {pk}"
-                    ));
-                }
+            // A live ALTER is exactly one rewrite pair; nothing legitimate
+            // repeats a sign on one column PK.
+            if sig.repeats_a_sign {
+                return Err(format!(
+                    "system-catalog write carries multiple same-sign rows for column {pk}"
+                ));
             }
 
             // Unregistered owner: a live CREATE TABLE applies COL before TABLE, so
@@ -416,7 +373,7 @@ impl CatalogEngine {
                 .get(&owner_id)
                 .map(|e| (e.kind.is_base_table(), e.schema))
             else {
-                if neg_j.is_some() {
+                if sig.neg.is_some() {
                     return Err(format!(
                         "catalog changed concurrently: retracting a column of unregistered owner {owner_id}"
                     ));
@@ -424,31 +381,9 @@ impl CatalogEngine {
                 continue;
             };
 
-            // (1) CAS: the `-1` must byte-equal the live row.
-            let live = self.seek_live_sys_row(SysFamily::Column, batch.get_pk_bytes(i));
-            if let Some(nj) = neg_j {
-                let Some((lb, _)) = live.as_ref() else {
-                    return Err(
-                        "catalog changed concurrently: retracting a system-catalog column that no longer exists".into(),
-                    );
-                };
-                if compare_rows(&schema, lb, 0, batch, nj) != Ordering::Equal {
-                    return Err(
-                        "catalog changed concurrently: the retracted column row differs from the current one".into(),
-                    );
-                }
-            }
+            self.check_cas_and_net(SysFamily::Column, batch, &sig, "system-catalog column")?;
 
-            // (2) Per-PK net ∈ {0,1}.
-            let live_weight = live.as_ref().map_or(0, |(_, w)| *w);
-            let net = live_weight + batch_sum;
-            if !(0..=1).contains(&net) {
-                return Err(format!(
-                    "system-catalog write would leave column {pk} at net weight {net} (expected 0 or 1)"
-                ));
-            }
-
-            match (neg_j, pos_j) {
+            match (sig.neg, sig.pos) {
                 (Some(nj), Some(pj)) => {
                     // (3) Pair-field delta: every payload field outside
                     // {name, is_hidden, is_nullable} must match (null- and
@@ -518,7 +453,7 @@ impl CatalogEngine {
     /// Visit every positive-weight `sys_indices` row whose owner and **exact
     /// column list** match `(owner_id, cols)`, invoking `f(index_id, is_unique)`
     /// for each. Centralises the IDX_TAB cursor walk shared by the DROP INDEX
-    /// uniqueness checks (the drop-time FK guard in `precheck_sys_ingest` and the
+    /// uniqueness checks (the drop-time FK guard in `precheck_family` and the
     /// post-retraction circuit demotion in `hook_index_register`). The persisted
     /// `source_cols` field is the packed `u64` (flag bit 63 set for the packed
     /// form), so decode it via `unpack_pk_cols` and compare ordered lists — a
@@ -528,12 +463,9 @@ impl CatalogEngine {
         let mut cursor = self.sys_store(SysFamily::Index).open_cursor();
         while cursor.valid {
             if cursor.current_weight > 0 {
-                let row_owner = cursor_read_u64(&cursor, IDXTAB_COL_OWNER_ID) as i64;
-                let row_cols = gnitz_wire::unpack_pk_cols(cursor_read_u64(&cursor, IDXTAB_COL_SOURCE_COLS));
+                let (row_owner, row_cols, is_uniq) = read_idx_tab_cursor_row(&cursor);
                 if row_owner == owner_id && row_cols.as_slice() == cols {
-                    let row_id = cursor.current_key_narrow() as u64 as i64;
-                    let is_uniq = cursor_read_u64(&cursor, IDXTAB_COL_IS_UNIQUE) != 0;
-                    f(row_id, is_uniq);
+                    f(cursor.current_key_narrow() as u64 as i64, is_uniq);
                 }
             }
             cursor.advance();
@@ -581,22 +513,14 @@ impl CatalogEngine {
     /// the `DDL_TXN` handler, which prechecks a family, sets its rollback
     /// marker, then applies it — leaving the marker `None` iff the precheck
     /// failed (so a precheck rejection reconstructs no ghost row on rollback).
-    pub(crate) fn precheck_family(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
-        // Exhaustive over `SysFamily` (like `fire_hooks`): a newly-added family
-        // must decide here whether it carries precheck guards.
-        let family = match SysFamily::from_id(table_id) {
-            Some(f) => f,
-            None => return Ok(()),
-        };
-        // §3.3(A): the retraction contract (CAS + per-PK net + pair-fields) runs
-        // for every rewrite-pair-capable family and yields the net-dead PKs.
-        // COL_TAB runs ONLY this layer (a column record has no relation guards);
-        // TABLE/VIEW run it, then the relation guards below re-key their drop
-        // checks on the net-dead set. SCHEMA/INDEX carry no rewrite pair, so they
-        // keep the raw weight<0 drop set (already net-dead) and skip the contract.
-        let net_dead: Vec<i64> = match family {
-            SysFamily::Table => self.precheck_retraction_contract(family, batch, TABTAB_PAY_NAME, true)?,
-            SysFamily::View => self.precheck_retraction_contract(family, batch, VIEWTAB_PAY_NAME, true)?,
+    ///
+    /// Exhaustive over `SysFamily` (like `fire_hooks`): a newly-added family
+    /// must decide here whether it carries precheck guards, rather than falling
+    /// into a silent `_` arm.
+    pub(crate) fn precheck_family(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
+        match family {
+            SysFamily::Schema => self.precheck_schema_family(batch),
+            SysFamily::Table | SysFamily::View => self.precheck_relation_family(family, batch),
             SysFamily::Column => {
                 // Whole-table COL retractions during a DROP TABLE/VIEW cascade run
                 // while the owner is still registered and are unpaired `-1`s, which
@@ -604,264 +528,252 @@ impl CatalogEngine {
                 if self.ctx.in_cascade_drop() {
                     return Ok(());
                 }
-                self.precheck_column_family(batch)?;
-                return Ok(());
+                self.precheck_column_family(batch)
             }
-            SysFamily::Schema | SysFamily::Index => Vec::new(),
+            SysFamily::Index => self.precheck_index_family(batch),
             SysFamily::ViewDep
             | SysFamily::Sequence
             | SysFamily::CircuitNodes
             | SysFamily::CircuitEdges
-            | SysFamily::CircuitNodeColumns => return Ok(()),
-        };
+            | SysFamily::CircuitNodeColumns => Ok(()),
+        }
+    }
 
-        // -- Positive-weight (CREATE) checks ----------------------------------
+    /// SCHEMA_TAB: a CREATE must not collide with a live schema name, and a DROP
+    /// must find the schema empty.
+    ///
+    /// The empty-schema guard is the engine-side, caller-agnostic half of the
+    /// DROP SCHEMA member cascade — it runs before any WAL write, so a rejected
+    /// non-empty drop queues no dir deletion and retracts no rows, converting a
+    /// silent member-orphan into a loud error. Both cascading callers drop every
+    /// member as prior, separate submissions, so by the time the schema row
+    /// reaches here its member set is empty and the guard passes. No cascade
+    /// exemption is needed (unlike IDX_TAB): a SCHEMA_TAB `-1` is never
+    /// submitted from inside an engine cascade.
+    ///
+    /// Schema ids share an i64 space with relation ids, so a schema drop must
+    /// NOT be probed against the relation-keyed dep map — the member count is
+    /// the whole guard.
+    fn precheck_schema_family(&mut self, batch: &Batch) -> Result<(), String> {
+        for i in 0..batch.count {
+            if batch.get_weight(i) > 0 {
+                let name = batch.read_payload_string(i, SCHEMATAB_PAY_NAME);
+                if self.caches.schema_by_name.contains_key(&name) {
+                    return Err(format!("Schema already exists: {name}"));
+                }
+            } else {
+                let n = self.schema_member_count(batch.get_pk(i) as i64);
+                if n > 0 {
+                    return Err(format!("Schema not empty: {n} relation(s) remain; drop them first"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// TABLE_TAB / VIEW_TAB: the §3.3(A) retraction contract, then the CREATE
+    /// guards (relation-id ceiling, column-record admissibility, FK column
+    /// types, qualified-name uniqueness) and the DROP guards (FK children, view
+    /// dependents).
+    ///
+    /// §3.3(B): the drop guards key on PKs whose bundle net is DEAD, not raw
+    /// `weight < 0` — so a rename pair's net-live `-1` is never rejected as
+    /// "referenced by FK" / "View dependency".
+    fn precheck_relation_family(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
+        let is_table = family == SysFamily::Table;
+        let name_pay = if is_table { TABTAB_PAY_NAME } else { VIEWTAB_PAY_NAME };
+        let kind = if is_table { "table" } else { "view" };
+        let net_dead = self.precheck_retraction_contract(family, batch, name_pay)?;
+
         for i in 0..batch.count {
             if batch.get_weight(i) <= 0 {
                 continue;
             }
+            let id = batch.get_pk(i) as i64;
 
-            // Enforce the durable relation-id ceiling here — the one place an id
+            // The relation-id ceiling is enforced here — the one place an id
             // ENTERS the `dag.tables` namespace before any mutation. Guarding
-            // `allocate_table_id` alone would not cover it: the register hooks take
-            // the id straight off the ingested row and `raise_id_counter` it, and
-            // the id is caller-chosen (a client may preset `circuit.view_id`), so a
-            // crafted CREATE VIEW could otherwise register a durable view at or
-            // above the ceiling — a conservative tripwire held safely short of the
-            // u32 physical contract every id narrows to (see `RELATION_ID_CEILING`).
-            // TABLE_TAB / VIEW_TAB are the only families whose PK is a
-            // `dag.tables` id (index ids are a disjoint namespace —
-            // `next_index_id`/`SEQ_ID_INDICES` — and index tables live in
-            // `entry.index_circuits`, not `dag.tables`).
-            if matches!(table_id, TABLE_TAB_ID | VIEW_TAB_ID) {
-                let id = batch.get_pk(i) as i64;
-                let ceiling = sys_tables::RELATION_ID_CEILING;
-                if id >= ceiling {
-                    return Err(format!(
-                        "relation id {id} is at or above the relation-id ceiling ({ceiling})"
-                    ));
+            // `allocate_table_id` alone would not cover it: the register hooks
+            // take the id straight off the ingested row and `raise_id_counter`
+            // it, and the id is caller-chosen (a client may preset
+            // `circuit.view_id`), so a crafted CREATE VIEW could otherwise
+            // register a durable view at or above the ceiling. TABLE_TAB /
+            // VIEW_TAB are the only families whose PK is a `dag.tables` id.
+            let ceiling = sys_tables::RELATION_ID_CEILING;
+            if id >= ceiling {
+                return Err(format!(
+                    "relation id {id} is at or above the relation-id ceiling ({ceiling})"
+                ));
+            }
+
+            // Reject any gap/duplicate in the column-index sequence, which would
+            // mismap columns downstream. Rejecting here — before the appliers
+            // mutate the caches — leaves clean state on a failed DDL; the
+            // register hooks re-run the same validator for the paths that skip
+            // precheck (boot replay, worker ddl_sync).
+            let col_defs = self.scan_column_defs(id, true)?;
+            let (sid, name, pk) = if is_table {
+                let (sid, name, pk, _flags) = read_table_tab_row(batch, i);
+                (sid, name, pk)
+            } else {
+                read_view_tab_row(batch, i)
+            };
+            validate_relation_defs(kind, id, &name, &col_defs, &pk)?;
+
+            if is_table {
+                let self_pk_type = col_defs[pk.as_slice()[0] as usize].type_code;
+                for cd in col_defs.iter().filter(|cd| cd.fk_table_id != 0) {
+                    self.validate_fk_column(cd, id, pk.as_slice(), self_pk_type)?;
                 }
             }
 
-            match table_id {
-                SCHEMA_TAB_ID => {
-                    let name = batch.read_payload_string(i, SCHEMATAB_PAY_NAME);
-                    if self.caches.schema_by_name.contains_key(&name) {
-                        return Err(format!("Schema already exists: {name}"));
-                    }
-                }
-                TABLE_TAB_ID => {
-                    let tid = batch.get_pk(i) as i64;
-                    let (sid, name, pk, _flags) = read_table_tab_row(batch, i);
-
-                    // Collect ColumnDefs, rejecting any gap/duplicate in the
-                    // column-index sequence (would mismap columns downstream).
-                    let col_defs = self.scan_column_defs(tid, true)?;
-                    validate_relation_defs("table", tid, &name, &col_defs, &pk)?;
-
-                    let self_pk_type = col_defs[pk.as_slice()[0] as usize].type_code;
-                    for cd in col_defs.iter().filter(|cd| cd.fk_table_id != 0) {
-                        self.validate_fk_column(cd, tid, pk.as_slice(), self_pk_type)?;
-                    }
-
-                    self.precheck_qname_unique(sid, &name, tid, &net_dead)?;
-                }
-                VIEW_TAB_ID => {
-                    let vid = batch.get_pk(i) as i64;
-                    let (sid, name, pk) = read_view_tab_row(batch, i);
-
-                    // Reject any gap/duplicate in the column-index sequence.
-                    // Rejecting here — before apply_entity_caches mutates the
-                    // caches — leaves clean state on a failed DDL, mirroring the
-                    // TABLE_TAB arm; hook_view_register re-runs the same
-                    // validator for the paths that skip precheck.
-                    let col_defs = self.scan_column_defs(vid, true)?;
-                    validate_relation_defs("view", vid, &name, &col_defs, &pk)?;
-                    self.precheck_qname_unique(sid, &name, vid, &net_dead)?;
-                }
-                IDX_TAB_ID => {
-                    let (owner_id, cols, _is_unique) = read_idx_tab_row(batch, i);
-                    let index_name = batch.read_payload_string(i, IDXTAB_PAY_NAME);
-                    let entry = self.validate_index_registration(owner_id, &cols)?;
-
-                    // Bounds, per-column eligibility (STRING/BLOB/float), and
-                    // arity/stride limits, identical to what registration will
-                    // enforce — only the table-name context is added here.
-                    make_index_schema(cols.as_slice(), &entry.schema).map_err(|e| {
-                        format!(
-                            "{} for table '{}' (tid={})",
-                            e,
-                            self.caches
-                                .entity_by_id
-                                .get(&owner_id)
-                                .map(|(_, n)| n.as_str())
-                                .unwrap_or("?"),
-                            owner_id
-                        )
-                    })?;
-
-                    let idx_id = batch.get_pk(i) as i64;
-                    if let Some(&existing) = self.caches.index_by_name.get(&index_name) {
-                        if existing != idx_id {
-                            return Err(format!("Index already exists: {index_name}"));
-                        }
-                    }
-                }
-                _ => {}
-            }
+            self.precheck_qname_unique(sid, &name, id, &net_dead)?;
         }
 
-        // -- Negative-weight (DROP) checks ------------------------------------
-        // §3.3(B): re-key the drop integrity guards on PKs whose bundle net is
-        // DEAD, not raw weight<0 — so a rename pair's net-live `-1` is excluded
-        // and never rejected as "referenced by FK" / "View dependency". For
-        // TABLE/VIEW that is the contract's `net_dead`; SCHEMA/INDEX carry no
-        // rewrite pair, so raw weight<0 is already net-dead.
-        let mut drop_ids: Vec<i64> = match family {
-            SysFamily::Table | SysFamily::View => net_dead,
-            _ => (0..batch.count)
-                .filter(|&i| batch.get_weight(i) < 0)
-                .map(|i| batch.get_pk(i) as i64)
-                .collect(),
-        };
+        let mut drop_ids = net_dead;
         if drop_ids.is_empty() {
             return Ok(());
         }
         drop_ids.sort_unstable();
         drop_ids.dedup();
 
-        // First DROP arm: reject a SCHEMA_TAB -1 on a non-empty schema. This is
-        // the engine-side, caller-agnostic half of the DROP SCHEMA member
-        // cascade — it runs before any WAL write, so a rejected non-empty drop
-        // queues no dir deletion and retracts no rows, converting the silent
-        // member-orphan into a loud error. The production client cascade
-        // (`GnitzClient::drop_schema`) and the `#[cfg(test)]` engine cascade both
-        // drop every member as prior, separate submissions, so by the time the
-        // schema row reaches here its member caches for that sid are empty and
-        // the guard passes. No cascade exemption is needed (unlike the IDX_TAB
-        // guard below): a SCHEMA_TAB -1 is never submitted from inside an engine
-        // cascade.
-        if table_id == SCHEMA_TAB_ID {
-            for &sid in &drop_ids {
-                let n = self.schema_member_count(sid);
-                if n > 0 {
-                    return Err(format!("Schema not empty: {n} relation(s) remain; drop them first"));
-                }
-            }
-            return Ok(());
-        }
-
-        // A UNIQUE index referenced by a FK, and any internal `__fk_` index the
-        // RESTRICT seek depends on, are load-bearing — block their drop. A
-        // DROP TABLE cascade legitimately retracts the owner's own indices, so
-        // it is exempt (the table drop already passed its own precheck).
-        if table_id == IDX_TAB_ID {
-            if self.ctx.in_cascade_drop() {
-                return Ok(());
-            }
-            for &idx_id in &drop_ids {
-                if let Some(name) = self.caches.index_by_id.get(&idx_id) {
-                    if name.contains(FK_INDEX_INFIX) {
-                        return Err("Integrity violation: cannot drop an internal FK index".into());
-                    }
-                }
-                let (owner_id, cols) = {
-                    let mut cursor = self.sys_store(SysFamily::Index).open_cursor();
-                    // sys_indices has a single U64 PK; OPK == big-endian.
-                    cursor.seek_bytes(&(idx_id as u64).to_be_bytes());
-                    if !cursor.valid || cursor.current_key_narrow() as u64 != idx_id as u64 {
-                        continue;
-                    }
-                    (
-                        cursor_read_u64(&cursor, IDXTAB_COL_OWNER_ID) as i64,
-                        gnitz_wire::unpack_pk_cols(cursor_read_u64(&cursor, IDXTAB_COL_SOURCE_COLS)),
-                    )
-                };
-                // FK backing is single-column: a composite index never satisfies
-                // a single-column FK/uniqueness requirement, so dropping
-                // one is never blocked by the FK-target guard.
-                if cols.as_slice().len() != 1 {
-                    continue;
-                }
-                let src_col = cols.as_slice()[0] as usize;
-                if self
-                    .fk_children_of(owner_id)
-                    .iter()
-                    .any(|r| r.parent_col_idx == src_col)
-                {
-                    // The FK target column must retain uniqueness for FK child
-                    // inserts to validate. The drop is allowed when uniqueness is
-                    // structurally preserved: the column is the lone PK (the PK
-                    // itself guarantees uniqueness), or another unique secondary
-                    // index survives the drop.
-                    let is_lone_pk = self.dag.tables.get(&owner_id).is_some_and(|e| {
-                        let pk = e.schema.pk_indices();
-                        pk.len() == 1 && pk[0] as usize == src_col
-                    });
-                    if !is_lone_pk {
-                        // Scan sys_indices (pre-drop: the rows being dropped are
-                        // still present) for any other unique index on this column
-                        // that would survive (exclude every id in this drop batch).
-                        let mut unique_remains = false;
-                        self.for_each_index_on_cols(owner_id, &[src_col as u32], |row_id, is_uniq| {
-                            if is_uniq && drop_ids.binary_search(&row_id).is_err() {
-                                unique_remains = true;
-                            }
-                        });
-                        if !unique_remains {
-                            let (sn, tn) = self.caches.entity_by_id.get(&owner_id).cloned().unwrap_or_default();
-                            return Err(format!(
-                                "Integrity violation: index on '{sn}.{tn}' is referenced by a \
-                                 foreign key and no unique index would remain on the column"
-                            ));
-                        }
-                    }
-                }
-            }
-            return Ok(());
-        }
-
-        if table_id == TABLE_TAB_ID {
+        if is_table {
             for &tid in &drop_ids {
                 // A FK child being co-dropped in this same batch is
                 // self-resolving — only a child *outside* the batch blocks the
-                // drop. Mirrors the view-dependency binary_search filter below.
+                // drop. Mirrors the view-dependency filter below.
                 let blocking = self
                     .fk_children_of(tid)
                     .iter()
                     .find(|r| drop_ids.binary_search(&r.child_tid).is_err());
                 if let Some(r) = blocking {
-                    let (sn, tn) = self.caches.entity_by_id.get(&r.child_tid).cloned().unwrap_or_default();
+                    let (sn, tn) = self.qualified_name_or_unknown(r.child_tid);
                     return Err(format!("Integrity violation: table referenced by '{sn}.{tn}'"));
                 }
             }
         }
 
-        // The view-dependency guard applies only to TABLE/VIEW drops, never to a
-        // SCHEMA_TAB drop. A schema drop is gated separately by the member-count
-        // arm at the top of this section (which returns before reaching here); it
-        // must not be dep-probed, because schema ids (allocated from
-        // FIRST_USER_SCHEMA_ID = 3) share an i64 space with table ids (from
-        // FIRST_USER_TABLE_ID = 16) — as both counters climb, a schema id
-        // eventually equals an earlier table id, so probing the table-keyed
-        // dep_map with a schema id would spuriously match an unrelated table's
-        // dependents.
-        if table_id == TABLE_TAB_ID || table_id == VIEW_TAB_ID {
-            let dep_map = self.dag.get_dep_map();
-            for &id in &drop_ids {
-                if let Some(dependents) = dep_map.get(&id) {
-                    // A dependent that is itself being dropped in this same
-                    // batch is self-resolving — only an *outside* dependent
-                    // blocks the drop. drop_ids is sorted+deduped above, so
-                    // binary_search is O(N log M) vs the O(N·M) of `contains`.
-                    let still_active = dependents
-                        .iter()
-                        .any(|&dep_id| drop_ids.binary_search(&dep_id).is_err());
-                    if still_active {
-                        let (sn, tn) = self.caches.entity_by_id.get(&id).cloned().unwrap_or_default();
-                        return Err(format!("View dependency: entity '{sn}.{tn}'"));
-                    }
+        let dep_map = self.dag.get_dep_map();
+        for &id in &drop_ids {
+            if let Some(dependents) = dep_map.get(&id) {
+                // A dependent that is itself being dropped in this same batch is
+                // self-resolving — only an *outside* dependent blocks the drop.
+                // drop_ids is sorted+deduped, so binary_search is O(N log M)
+                // vs the O(N·M) of `contains`.
+                let still_active = dependents
+                    .iter()
+                    .any(|&dep_id| drop_ids.binary_search(&dep_id).is_err());
+                if still_active {
+                    let (sn, tn) = self.qualified_name_or_unknown(id);
+                    return Err(format!("View dependency: entity '{sn}.{tn}'"));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// IDX_TAB: a CREATE must name a base-table owner with an admissible column
+    /// list and a free index name; a DROP must not strip the uniqueness an FK
+    /// depends on.
+    ///
+    /// IDX_TAB carries no rewrite pair, so raw `weight < 0` is already net-dead.
+    fn precheck_index_family(&mut self, batch: &Batch) -> Result<(), String> {
+        for i in 0..batch.count {
+            if batch.get_weight(i) <= 0 {
+                continue;
+            }
+            let (owner_id, cols, _is_unique) = read_idx_tab_row(batch, i);
+            let index_name = batch.read_payload_string(i, IDXTAB_PAY_NAME);
+            let entry = self.validate_index_registration(owner_id, &cols)?;
+
+            // Bounds, per-column eligibility (STRING/BLOB/float), and
+            // arity/stride limits, identical to what registration will enforce —
+            // only the table-name context is added here.
+            make_index_schema(cols.as_slice(), &entry.schema).map_err(|e| {
+                format!(
+                    "{e} for table '{}' (tid={owner_id})",
+                    self.qualified_name_or_unknown(owner_id).1
+                )
+            })?;
+
+            let idx_id = batch.get_pk(i) as i64;
+            if let Some(&existing) = self.caches.index_by_name.get(&index_name) {
+                if existing != idx_id {
+                    return Err(format!("Index already exists: {index_name}"));
+                }
+            }
+        }
+
+        // A DROP TABLE cascade legitimately retracts the owner's own indices, so
+        // it is exempt (the table drop already passed its own precheck).
+        if self.ctx.in_cascade_drop() {
+            return Ok(());
+        }
+        let mut drop_ids: Vec<i64> = (0..batch.count)
+            .filter(|&i| batch.get_weight(i) < 0)
+            .map(|i| batch.get_pk(i) as i64)
+            .collect();
+        if drop_ids.is_empty() {
+            return Ok(());
+        }
+        drop_ids.sort_unstable();
+        drop_ids.dedup();
+
+        let schema = SysFamily::Index.schema();
+        for &idx_id in &drop_ids {
+            // An internal `__fk_` index backs the RESTRICT seek; dropping one
+            // would silently disarm FK enforcement.
+            if self
+                .caches
+                .index_by_id
+                .get(&idx_id)
+                .is_some_and(|n| n.contains(FK_INDEX_INFIX))
+            {
+                return Err("Integrity violation: cannot drop an internal FK index".into());
+            }
+            let (owner_id, cols) = {
+                let mut cursor = self.sys_store(SysFamily::Index).open_cursor();
+                if !cursor.seek_exact_live(sys_opk(&schema, idx_id as u128).pk_bytes()) {
+                    continue;
+                }
+                let (owner_id, cols, _) = read_idx_tab_cursor_row(&cursor);
+                (owner_id, cols)
+            };
+            // FK backing is single-column: a composite index never satisfies a
+            // single-column FK/uniqueness requirement, so dropping one is never
+            // blocked by the FK-target guard.
+            if cols.as_slice().len() != 1 {
+                continue;
+            }
+            let src_col = cols.as_slice()[0] as usize;
+            if !self.fk_children_of(owner_id).iter().any(|r| r.parent_col == src_col) {
+                continue;
+            }
+            // The FK target column must retain uniqueness for FK child inserts
+            // to validate. The drop is allowed when uniqueness is structurally
+            // preserved: the column is the lone PK, or another unique secondary
+            // index survives the drop.
+            let is_lone_pk = self.dag.tables.get(&owner_id).is_some_and(|e| {
+                let pk = e.schema.pk_indices();
+                pk.len() == 1 && pk[0] as usize == src_col
+            });
+            if is_lone_pk {
+                continue;
+            }
+            // Scan sys_indices (pre-drop: the rows being dropped are still
+            // present) for another unique index on this column that survives.
+            let mut unique_remains = false;
+            self.for_each_index_on_cols(owner_id, &[src_col as u32], |row_id, is_uniq| {
+                if is_uniq && drop_ids.binary_search(&row_id).is_err() {
+                    unique_remains = true;
+                }
+            });
+            if !unique_remains {
+                let (sn, tn) = self.qualified_name_or_unknown(owner_id);
+                return Err(format!(
+                    "Integrity violation: index on '{sn}.{tn}' is referenced by a \
+                     foreign key and no unique index would remain on the column"
+                ));
             }
         }
         Ok(())
@@ -1011,11 +923,11 @@ impl CatalogEngine {
                 }
 
                 // Defense in depth: only `<something>_<digits>` dirs — the shape
-                // of table (`<name>_<tid>`), view (`view_<name>_<vid>`), and the
-                // pre-flight's throwaway root (`_preflight_<vid>`) — are eligible
-                // for removal. Never touch an unexpected entry. Those three are
-                // the only writers directly under a schema dir, so a matching
-                // name absent from `live_tables` is orphaned either way.
+                // of table (`t_<tid>`), view (`v_<vid>`), and the pre-flight's
+                // throwaway root (`_preflight_<vid>`) — are eligible for removal.
+                // Never touch an unexpected entry. Those three are the only
+                // writers directly under a schema dir, so a matching name absent
+                // from `live_tables` is orphaned either way.
                 if !is_table_dir_name(&name) {
                     continue;
                 }
@@ -1053,12 +965,6 @@ impl CatalogEngine {
     // -----------------------------------------------------------------------
     // Stage-A compensation (DDL rollback)
     // -----------------------------------------------------------------------
-
-    /// Topological creation priority for the catalog family order (see
-    /// `SysFamilyInfo::topo_priority`); 99 for a non-family tid.
-    pub(crate) fn catalog_topo_priority(tid: i64) -> u8 {
-        SysFamily::from_id(tid).map_or(99, |f| f.info().topo_priority)
-    }
 
     /// Compensate a failed `DDL_TXN` bundle: undo every in-memory mutation that
     /// was applied before the failure so the catalog is exactly as it was, in
@@ -1126,13 +1032,13 @@ impl CatalogEngine {
 
         // Tear down what the bundle created — dependents before dependencies,
         // DESCENDING…
-        undo_create.sort_by_key(|(tid, _)| std::cmp::Reverse(Self::catalog_topo_priority(*tid)));
+        undo_create.sort_by_key(|(tid, _)| std::cmp::Reverse(sys_topo_priority(*tid)));
         // …then restore what it dropped — dependencies before dependents,
         // ASCENDING, so a restored view finds its columns, deps, and circuit rows
         // already back when its own VIEW_TAB row re-registers it. Creations first,
         // so a name the bundle moved from one id to another is free again by the
         // time the incumbent reclaims it.
-        undo_drop.sort_by_key(|(tid, _)| Self::catalog_topo_priority(*tid));
+        undo_drop.sort_by_key(|(tid, _)| sys_topo_priority(*tid));
         undo_create.append(&mut undo_drop);
 
         // Replay each with negated weight through the no-broadcast path.

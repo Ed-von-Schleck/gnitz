@@ -4,21 +4,11 @@
 
 use super::*;
 
-/// The cached schema wire data (block + derived wire properties, see
-/// [`crate::catalog::cache::SchemaWireEntry`]) paired with the table's current
-/// schema version. Returned by `get_cached_schema_wire_block`; the entry and
-/// version share the same invalidation lifecycle (DDL on the owning table
-/// drops the entry and bumps the version together).
-pub struct CachedSchemaWire {
-    pub entry: crate::catalog::cache::SchemaWireEntry,
-    pub version: u16,
-}
-
 impl CatalogEngine {
     // -- FK / index metadata queries (for distributed validation) -------------
 
-    /// All FK constraints on child table `table_id` (empty when none).
-    pub(crate) fn fk_constraints_of(&self, table_id: i64) -> &[FkConstraint] {
+    /// All FK edges where `table_id` is the child (empty when none).
+    pub(crate) fn fk_constraints_of(&self, table_id: i64) -> &[FkEdge] {
         self.caches
             .fk_by_child
             .get(&table_id)
@@ -35,15 +25,6 @@ impl CatalogEngine {
             .get(&table_id)
             .map(|e| e.index_circuits.as_slice())
             .unwrap_or(&[])
-    }
-
-    /// Number of index circuits on a table.
-    pub fn get_index_circuit_count(&self, table_id: i64) -> usize {
-        self.dag
-            .tables
-            .get(&table_id)
-            .map(|e| e.index_circuits.len())
-            .unwrap_or(0)
     }
 
     /// Get index circuit info at index: (col_indices, is_unique). Production
@@ -64,27 +45,19 @@ impl CatalogEngine {
             .unwrap_or(std::ptr::null())
     }
 
-    /// The secondary index circuit on `cols` of `table_id`, if one exists.
-    /// Single source of truth for "does this column list have an index": the
+    /// The secondary index circuit on `cols` of `table_id`, if one exists. The
     /// SEEK_BY_INDEX handler matches the `Option` once — `None` answers
     /// STATUS_NO_INDEX (so the SQL planner falls back to a scan or a CREATE INDEX
     /// hint without a prior catalog probe), `Some` broadcasts the seek.
     pub fn index_circuit_for_cols(&self, table_id: i64, cols: &[u32]) -> Option<&crate::query::IndexCircuitEntry> {
-        self.dag
-            .tables
-            .get(&table_id)
-            .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_indices.as_slice() == cols))
+        self.dag.tables.get(&table_id)?.index_circuit_on(cols)
     }
 
     /// True if the table has at least one unique secondary index circuit.
     /// Used to decide whether distributed unique-index validation is needed.
     /// Non-unique circuits (e.g. FK indices) do not count.
     pub fn has_any_unique_index(&self, table_id: i64) -> bool {
-        self.dag
-            .tables
-            .get(&table_id)
-            .map(|e| e.index_circuits.iter().any(|ic| ic.is_unique))
-            .unwrap_or(false)
+        self.index_circuits(table_id).iter().any(|ic| ic.is_unique)
     }
 
     /// Get the index schema for a specific column list's index on a table.
@@ -92,47 +65,10 @@ impl CatalogEngine {
         self.index_circuit_for_cols(table_id, cols).map(|ic| ic.index_schema)
     }
 
-    /// Get column names for a table/view. Cached after first lookup; the same
-    /// COL_TAB read fills the column-def and hidden-column-bitmask caches.
-    /// Returns an `Rc` snapshot — callers routinely touch the catalog while
-    /// holding it, so a borrow would not do.
-    pub fn get_column_names(&mut self, table_id: i64) -> Rc<Vec<String>> {
-        if let Some(names) = self.caches.col_names.get(&table_id) {
-            return names.clone();
-        }
-        self.fill_column_caches(table_id);
-        self.caches.col_names.get(&table_id).expect("just filled").clone()
-    }
-
-    /// Hidden-column bitmask for a table/view (bit N ⇔ column N is a hidden key
-    /// slot). Shares the COL_TAB read and invalidation with `get_column_names`.
-    pub fn get_col_hidden_mask(&mut self, table_id: i64) -> u128 {
-        if let Some(&mask) = self.caches.col_hidden.get(&table_id) {
-            return mask;
-        }
-        self.fill_column_caches(table_id);
-        self.caches.col_hidden.get(&table_id).copied().unwrap_or(0)
-    }
-
-    /// Get column names as byte vectors. Backed by the column caches; lazy-populated.
-    pub fn get_col_names_bytes(&mut self, table_id: i64) -> Rc<Vec<Vec<u8>>> {
-        if let Some(bytes) = self.caches.col_names_bytes.get(&table_id) {
-            return bytes.clone();
-        }
-        self.fill_column_caches(table_id);
-        self.caches.col_names_bytes.get(&table_id).expect("just filled").clone()
-    }
-
-    /// Return the cached schema wire entry (block + derived wire properties)
-    /// with the current schema version for `table_id`, or `None` if the block
-    /// isn't yet cached. Wire props are paired with the block so they share
-    /// invalidation.
-    pub fn get_cached_schema_wire_block(&self, table_id: i64) -> Option<CachedSchemaWire> {
-        let entry = self.caches.schema_wire_cache.get(&table_id)?;
-        Some(CachedSchemaWire {
-            entry: entry.clone(),
-            version: self.caches.get_schema_version(table_id),
-        })
+    /// Return the cached schema wire entry (block, version, and derived wire
+    /// properties) for `table_id`, or `None` if the block isn't yet cached.
+    pub fn get_cached_schema_wire_block(&self, table_id: i64) -> Option<SchemaWireEntry> {
+        self.caches.schema_wire_cache.get(&table_id).cloned()
     }
 
     /// Return the current schema version for `table_id` (1 if unknown).
@@ -148,7 +84,7 @@ impl CatalogEngine {
     /// Store an encoded schema wire block in the cache, along with its
     /// derived wire properties. Written together so the invalidation in
     /// `clear_col_cache_no_bump` keeps them consistent.
-    pub fn set_schema_wire_block(&mut self, table_id: i64, entry: crate::catalog::cache::SchemaWireEntry) {
+    pub fn set_schema_wire_block(&mut self, table_id: i64, entry: SchemaWireEntry) {
         self.caches.schema_wire_cache.insert(table_id, entry);
     }
 
@@ -221,8 +157,8 @@ impl CatalogEngine {
 
     // -- FK constraint queries ---------------------------------------------
 
-    /// Returns all child tables that have FK constraints targeting `parent_id`.
-    pub(crate) fn fk_children_of(&self, parent_id: i64) -> &[FkParentRef] {
+    /// All FK edges where `parent_id` is the parent (empty when none).
+    pub(crate) fn fk_children_of(&self, parent_id: i64) -> &[FkEdge] {
         self.caches
             .fk_by_parent
             .get(&parent_id)
@@ -233,19 +169,17 @@ impl CatalogEngine {
     /// `(schema, table, columns)` names for `(table_id, col_indices)`, each
     /// falling back to `"?"` when the catalog has no entry. The `columns` field
     /// joins every named column with `, ` (a composite `UNIQUE (a, b)` renders
-    /// `"a, b"`; a single-column index renders identically to before). The
-    /// fallback is defensive: the entity always exists on the
-    /// constraint-violation paths that format these names. `get_column_names`
-    /// returns an owned `Vec`, so it does not borrow-conflict with the later
-    /// `get_qualified_name`.
+    /// `"a, b"`). The fallback is defensive: the entity always exists on the
+    /// constraint-violation paths that format these names. The defs are an `Rc`
+    /// snapshot, so they do not borrow-conflict with the later name lookup.
     fn qualified_col_names(&mut self, table_id: i64, col_indices: &[u32]) -> (String, String, String) {
-        let names = self.get_column_names(table_id);
+        let defs = self.read_column_defs(table_id);
         let col = col_indices
             .iter()
-            .map(|&ci| names.get(ci as usize).cloned().unwrap_or_else(|| "?".to_string()))
+            .map(|&ci| defs.get(ci as usize).map_or("?", |d| d.name.as_str()))
             .collect::<Vec<_>>()
             .join(", ");
-        let (sn, tn) = self.get_qualified_name(table_id).unwrap_or(("?", "?"));
+        let (sn, tn) = self.qualified_name_or_unknown(table_id);
         (sn.to_string(), tn.to_string(), col)
     }
 
@@ -294,9 +228,8 @@ impl CatalogEngine {
     /// Format "an inserted child row references a value the parent does not
     /// hold". Shared by the inline DDL-time check and the distributed pre-flight.
     pub(crate) fn fk_missing_err(&self, child_tid: i64, parent_tid: i64) -> String {
-        let (sn, tn) = self.get_qualified_name(child_tid).unwrap_or(("?", "?"));
-        let (sn, tn) = (sn.to_string(), tn.to_string());
-        let (tsn, ttn) = self.get_qualified_name(parent_tid).unwrap_or(("?", "?"));
+        let (sn, tn) = self.qualified_name_or_unknown(child_tid);
+        let (tsn, ttn) = self.qualified_name_or_unknown(parent_tid);
         format!("Foreign Key violation in '{sn}.{tn}': value not found in target '{tsn}.{ttn}'")
     }
 
@@ -304,9 +237,8 @@ impl CatalogEngine {
     /// what the parent write was doing: `"delete from"` when the row goes away,
     /// `"update"` when the referenced value changes under it.
     pub(crate) fn fk_restrict_err(&self, parent_tid: i64, child_tid: i64, verb: &str) -> String {
-        let (sn, tn) = self.get_qualified_name(parent_tid).unwrap_or(("?", "?"));
-        let (sn, tn) = (sn.to_string(), tn.to_string());
-        let (csn, ctn) = self.get_qualified_name(child_tid).unwrap_or(("?", "?"));
+        let (sn, tn) = self.qualified_name_or_unknown(parent_tid);
+        let (csn, ctn) = self.qualified_name_or_unknown(child_tid);
         format!("Foreign Key violation: cannot {verb} '{sn}.{tn}', row still referenced by '{csn}.{ctn}'")
     }
 }

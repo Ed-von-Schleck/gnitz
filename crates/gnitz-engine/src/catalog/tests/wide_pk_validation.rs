@@ -8,27 +8,12 @@
 use super::*;
 use crate::query::{DagEngine, RelationKind, StoreHandle};
 use crate::schema::make_index_schema;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, RecoverySource, Table};
-
-fn u64c() -> SchemaColumn {
-    SchemaColumn::new(type_code::U64, 0)
-}
 
 /// `pk_stride` = 24 (wide): three U64 PK columns + one U64 payload `val`.
 fn wide_unique_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(&[u64c(), u64c(), u64c(), u64c()], &[0, 1, 2])
-}
-
-fn pk24(a: u64, b: u64, c: u64) -> [u8; 24] {
-    // Compound PK of unsigned U64 columns: OPK == big-endian per column, which
-    // is what the wide-PK write path stores and what the FK RESTRICT check
-    // decodes (pk_native_key) when resolving a referenced PK column.
-    let mut p = [0u8; 24];
-    p[0..8].copy_from_slice(&a.to_be_bytes());
-    p[8..16].copy_from_slice(&b.to_be_bytes());
-    p[16..24].copy_from_slice(&c.to_be_bytes());
-    p
 }
 
 /// Build a batch for `wide_unique_schema`: rows of (pk, val, weight).
@@ -197,7 +182,7 @@ fn seek_family_bytes_matches_seek_family_narrow() {
     // Plain narrow U64-PK table created through the normal path.
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.get_schema(tid).unwrap();
+    let schema = engine.get_schema_desc(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
     for i in 1..=3u64 {
@@ -205,7 +190,7 @@ fn seek_family_bytes_matches_seek_family_narrow() {
         bb.put_u64(i * 10);
         bb.end_row();
     }
-    engine.dag.ingest_to_family(tid, bb.finish());
+    engine.dag.ingest_relation(tid, bb.finish());
     let _ = engine.dag.flush(tid);
 
     // Retract key 2 so it is present-but-dead.
@@ -213,7 +198,7 @@ fn seek_family_bytes_matches_seek_family_narrow() {
     del.begin_row(2u128, -1);
     del.put_u64(20);
     del.end_row();
-    engine.dag.ingest_to_family(tid, del.finish());
+    engine.dag.ingest_relation(tid, del.finish());
     let _ = engine.dag.flush(tid);
 
     // Present (1, 3), retracted (2), and absent (99) must agree across forms.

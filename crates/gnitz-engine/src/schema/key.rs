@@ -747,6 +747,39 @@ pub(crate) fn range_keys_from_cuts(
     Some((start, end))
 }
 
+/// [`range_keys_from_cuts`] for a range whose leading `range.eq_vals()` columns
+/// are equality-pinned and whose next column is cut-bounded — the shape both the
+/// base-PK and the secondary-index walks take. `encode_leading` OPK-encodes the
+/// first `n_eq + 1` column values into their group prefix; `arity` is the key's
+/// column count and `stride` its full byte width.
+///
+/// `Ok(None)` = provably empty. `Err` = the descriptor pins every column with no
+/// range column left within `arity` — a trust-boundary rejection the `pub` seek
+/// paths surface and a backfill bound merely degrades on. Guarding here also
+/// keeps `prefix_len < stride` strict, so the pad always extends the group key.
+/// `what` names the key space in that message.
+pub(crate) fn eq_prefix_range_keys(
+    range: &RangeDescriptor,
+    arity: usize,
+    stride: usize,
+    what: &str,
+    encode_leading: impl Fn(&[u128]) -> PkBuf,
+) -> Result<Option<(PkBuf, Option<PkBuf>)>, String> {
+    let eq_natives = range.eq_vals();
+    let n_eq = eq_natives.len();
+    // Written `n_eq >= arity`, never a `+ 1` that could overflow on an
+    // adversarial length.
+    if n_eq >= arity {
+        return Err(format!("{what}: n_eq {n_eq} has no range column within arity {arity}"));
+    }
+    let mut natives = [0u128; gnitz_wire::PK_LIST_MAX_COLS];
+    natives[..n_eq].copy_from_slice(eq_natives);
+    Ok(range_keys_from_cuts(range, stride, |v| {
+        natives[n_eq] = v;
+        encode_leading(&natives[..=n_eq])
+    }))
+}
+
 /// True when every key in a half-open `[start, end)` range from
 /// [`range_keys_from_cuts`] shares its leading `prefix` bytes. Since OPK order IS
 /// byte order, it is enough that the range's first and last keys agree there.

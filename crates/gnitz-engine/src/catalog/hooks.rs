@@ -3,14 +3,24 @@ use super::*;
 use crate::schema::make_index_schema;
 use rustc_hash::FxHashMap;
 
+/// What `register_relation` needs to build and register one relation: the
+/// values decoded off its TABLE_TAB / VIEW_TAB row, plus the placement and
+/// depth its own family derives.
+struct RelationRegistration<'a> {
+    kind: RelationKind,
+    id: i64,
+    schema_id: i64,
+    name: &'a str,
+    pk: &'a PkColList,
+    placement: Placement,
+    depth: i32,
+}
+
 impl CatalogEngine {
     // -- Hook processing ---------------------------------------------------
     //
-    // Dispatch is a static per-system-table sequence. The order of calls is
-    // the dependency order; previous revisions stored this order in a system
-    // table (`sys_catalog_caches`) and rebuilt the schedule from PK sort
-    // order at startup, which produced a silent divergence between fresh
-    // install and recovery (see git history).
+    // Dispatch is a static per-system-table sequence, and the order of calls
+    // is the dependency order.
     //
     // Two categories of handler are dispatched from here:
     //
@@ -36,7 +46,7 @@ impl CatalogEngine {
     // Where this is enforced:
     //   * Live DDL: every catalog write arrives as one `FLAG_DDL_TXN` bundle,
     //     and the server ingest loop (`handle_ddl_txn`) applies the bundle's
-    //     families in ascending `catalog_topo_priority` order under one zone —
+    //     families in ascending `SysFamily::topo_priority` order under one zone —
     //     COL_TAB(1) before the TABLE_TAB(6)/VIEW_TAB(7) register hook that reads
     //     it. The client send order is irrelevant; the server sorts.
     //   * Wire: the SAL is a single FIFO; worker `FLAG_DDL_SYNC` dispatch
@@ -54,7 +64,7 @@ impl CatalogEngine {
         // copy); only a mixed-sign bundle (a rename pair) is reordered into a
         // private copy — the received `batch` (broadcast to workers, negated on
         // rollback) is left untouched.
-        let reordered = Self::sign_partition_batch(batch, &sys_tab_schema(family.id()));
+        let reordered = Self::sign_partition_batch(batch, &family.schema());
         let batch = reordered.as_ref().unwrap_or(batch);
         // Exhaustive over `SysFamily`: a newly-added family is a compile error
         // here, not a silently-skipped `_` arm. The no-op families
@@ -66,16 +76,16 @@ impl CatalogEngine {
             }
             SysFamily::Table => {
                 self.apply_entity_caches(batch)?;
-                self.apply_schema_of(SysFamily::Table, batch)?;
-                self.apply_pk_col_of(TABTAB_PAY_PK_COL_IDX, batch)?;
+                self.apply_schema_members(batch)?;
+                self.apply_pk_col_of(SysFamily::Table, batch)?;
                 self.hook_table_register(batch)?;
                 self.apply_needs_lock(SysFamily::Table, batch)?;
                 self.hook_cascade_fk(batch)?;
             }
             SysFamily::View => {
                 self.apply_entity_caches(batch)?;
-                self.apply_schema_of(SysFamily::View, batch)?;
-                self.apply_pk_col_of(VIEWTAB_PAY_PK_COL_IDX, batch)?;
+                self.apply_schema_members(batch)?;
+                self.apply_pk_col_of(SysFamily::View, batch)?;
                 self.hook_view_register(batch)?;
             }
             SysFamily::Column => {
@@ -88,8 +98,7 @@ impl CatalogEngine {
                 self.hook_column_alter(batch)?;
             }
             SysFamily::Index => {
-                self.apply_index_by_name(batch)?;
-                self.apply_index_by_id(batch)?;
+                self.apply_index_caches(batch)?;
                 self.hook_index_register(batch)?;
             }
             SysFamily::ViewDep => {
@@ -239,6 +248,75 @@ impl CatalogEngine {
             .map_err(|e| format!("Failed to create '{name}': error {e} (dir={directory})"))
     }
 
+    /// Build a relation's store and enter it in the registry — the shared `+1`
+    /// half of [`hook_table_register`](Self::hook_table_register) and
+    /// [`hook_view_register`](Self::hook_view_register). Only `placement` and
+    /// `depth` differ between the two, and each caller derives its own: a table
+    /// folds placement out of `TABLE_TAB.flags` at depth 0, a view folds it out
+    /// of its sources' stamped placements at one past their deepest.
+    fn register_relation(&mut self, reg: RelationRegistration<'_>) -> Result<(), String> {
+        let RelationRegistration {
+            kind,
+            id,
+            schema_id,
+            name,
+            pk,
+            placement,
+            depth,
+        } = reg;
+        let kind_str = if kind.is_view() { "view" } else { "table" };
+        let col_defs = self.read_column_defs(id);
+        validate_relation_defs(kind_str, id, name, &col_defs, pk)?;
+
+        let schema_name = self.caches.schema_by_id.get(&schema_id).cloned().unwrap_or_default();
+        let directory = relation_dir(&self.base_dir, &schema_name, kind, id);
+        let schema = build_schema_from_col_defs(&col_defs, pk.as_slice(), placement)?;
+        gnitz_debug!(
+            "catalog: creating {} dir={} name={} id={} parts={}",
+            kind_str,
+            directory,
+            name,
+            id,
+            NUM_PARTITIONS
+        );
+        // Staged so that if Stage-A fails after the directory is created,
+        // compensate_stage_a's drain removes it.
+        let pt = self.with_staged_dir(directory.clone(), |s| {
+            s.build_partitioned_storage(kind, &directory, name, id, schema)
+        })?;
+
+        fsync_dir(&schema_dir(&self.base_dir, &schema_name));
+        self.dag.register_table(
+            id,
+            StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(pt))),
+            schema,
+            kind,
+            depth,
+            directory,
+        );
+        raise_id_counter(&mut self.next_table_id, id);
+        Ok(())
+    }
+
+    /// Tear a relation out of the registry — the shared net-dead `-1` half of
+    /// the two register hooks. `cascade` retracts the dependent system rows the
+    /// relation owns (indices/columns for a table, circuit/deps/columns for a
+    /// view) and runs before the unregister, while the entry is still resolvable.
+    ///
+    /// The version counters are purged AFTER the cascade: its own
+    /// `apply_index_caches` / `invalidate_col_names` bumps would otherwise
+    /// `or_insert` them straight back.
+    fn drop_relation(&mut self, id: i64, cascade: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), String> {
+        let Some(directory) = self.dag.tables.get(&id).map(|e| e.directory.clone()) else {
+            return Ok(());
+        };
+        cascade(self)?;
+        self.dag.unregister_table(id);
+        self.pending_dir_deletions.push(directory);
+        self.caches.purge_table_versions(id);
+        Ok(())
+    }
+
     fn hook_table_register(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
@@ -268,86 +346,56 @@ impl CatalogEngine {
                 // flag cannot index out of bounds.
                 let placement = Placement::from_table_flags(flags)
                     .map_err(|e| format!("catalog invariant violated: table '{name}' (tid={tid}) is {e}."))?;
-
-                let col_defs = self.read_column_defs(tid);
-                validate_relation_defs("table", tid, &name, &col_defs, &pk)?;
-
-                let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
-                let directory = table_dir(&self.base_dir, &schema_name, tid);
-                let tbl_schema = build_schema_from_col_defs(&col_defs, pk.as_slice(), placement)?;
-
-                // One kind drives the property bundle: recovery source, and what
-                // only base tables do (PK enforcement, secondary indexes).
-                let kind = RelationKind::BaseTable;
-                gnitz_debug!(
-                    "catalog: creating table dir={} name={} tid={} parts={}",
-                    directory,
-                    name,
-                    tid,
-                    NUM_PARTITIONS
-                );
-                // Staged so that if Stage-A fails after the table directory
-                // is created, compensate_stage_a's drain removes it.
-                let pt = self.with_staged_dir(directory.clone(), |s| {
-                    s.build_partitioned_storage(kind, &directory, &name, tid, tbl_schema)
+                self.register_relation(RelationRegistration {
+                    kind: RelationKind::BaseTable,
+                    id: tid,
+                    schema_id: sid,
+                    name: &name,
+                    pk: &pk,
+                    placement,
+                    depth: 0,
                 })?;
-
-                fsync_dir(&schema_dir(&self.base_dir, &schema_name));
-                self.dag.register_table(
-                    tid,
-                    StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(pt))),
-                    tbl_schema,
-                    kind,
-                    0,
-                    directory,
-                );
-                raise_id_counter(&mut self.next_table_id, tid);
             } else if !net_live {
                 // A genuine drop (net-dead): run the teardown cascade. A rename
                 // pair's `-1` is net-live, so this branch is skipped and the
                 // registration survives untouched.
-                if let Some(directory) = self.dag.tables.get(&tid).map(|e| e.directory.clone()) {
-                    // Safe to cascade unconditionally: precheck_sys_ingest rejects
+                self.drop_relation(tid, |s| {
+                    // Safe to cascade unconditionally: `precheck_family` rejects
                     // FK/view-dep-blocked drops before the -1 row reaches the WAL.
-                    // cascade_retract_indices cleans up any in-transaction FK indices
-                    // (those were never broadcast and must be physically removed).
-                    // During rollback the rollback gate in `CatalogDeltaSink::submit`
-                    // ensures these writes bypass pending_broadcasts.
-                    self.cascade_retract_indices(tid)?;
-                    // Under atomic CREATE the COL_TAB rows are applied via the enqueuing
-                    // path, so they are in compensation's drained set and negated
-                    // directly. CREATE rollback replays descending topo, so this
-                    // TABLE_TAB(6) -1 fires its DROP-branch cascade BEFORE the drained
-                    // COL_TAB(1) -1: an unguarded cascade_retract_columns would retract
-                    // the columns, then the drained -1 would retract them again → a net
-                    // -1 ghost. Skip it during rollback so compensation's direct negate
-                    // is the sole retractor. (The unguarded cascade_retract_indices above
-                    // is the dual: FK auto-indices use submit_local — never enqueued — so
-                    // the cascade is their only retractor and must run.)
-                    if !self.ctx.in_rollback() {
-                        self.cascade_retract_columns(tid)?;
+                    // This also cleans up any in-transaction FK indices (never
+                    // broadcast, so they must be physically removed). During
+                    // rollback the gate in `CatalogDeltaSink::submit` keeps these
+                    // writes out of pending_broadcasts.
+                    s.cascade_retract_indices(tid)?;
+                    // Under atomic CREATE the COL_TAB rows are applied via the
+                    // enqueuing path, so they are in compensation's drained set and
+                    // negated directly. CREATE rollback replays descending topo, so
+                    // this TABLE_TAB(6) -1 fires its cascade BEFORE the drained
+                    // COL_TAB(1) -1: an unguarded cascade_retract_columns would
+                    // retract the columns, then the drained -1 would retract them
+                    // again → a net -1 ghost. Skip it during rollback so
+                    // compensation's direct negate is the sole retractor. (The
+                    // unguarded cascade_retract_indices above is the dual: FK
+                    // auto-indices use submit_local — never enqueued — so the
+                    // cascade is their only retractor and must run.)
+                    if !s.ctx.in_rollback() {
+                        s.cascade_retract_columns(tid)?;
                     }
-                    self.dag.unregister_table(tid);
-                    self.pending_dir_deletions.push(directory);
-                    // Purge both per-table version counters AFTER the cascade above:
-                    // cascade_retract_indices' apply_index_by_id bump and (on the
-                    // non-rollback path) cascade_retract_columns' invalidate_col_names
-                    // bump would otherwise `or_insert` them straight back.
-                    self.caches.purge_table_versions(tid);
-                }
+                    Ok(())
+                })?;
             }
         }
         Ok(())
     }
 
     fn cascade_retract_indices(&mut self, owner_id: i64) -> Result<(), String> {
-        // Clone the idx_id list before any mutation so ingest_to_family → apply_index_by_id
+        // Clone the idx_id list before any mutation so submit → apply_index_caches
         // can safely remove entries from indices_by_owner as each retraction fires.
         let idx_ids: Vec<i64> = match self.caches.indices_by_owner.get(&owner_id) {
             Some(ids) if !ids.is_empty() => ids.clone(),
             _ => return Ok(()),
         };
-        let schema = sys_tab_schema(IDX_TAB_ID);
+        let schema = SysFamily::Index.schema();
         // These retractions are part of the owner's drop, not a standalone
         // DROP INDEX, so the IDX_TAB integrity guard must not block them.
         self.with_cascade_drop(|s| {
@@ -362,12 +410,16 @@ impl CatalogEngine {
     }
 
     fn cascade_retract_columns(&mut self, owner_id: i64) -> Result<(), String> {
-        let schema = sys_tab_schema(COL_TAB_ID);
-        let batch = retract_rows_in_pk_range(
+        let schema = SysFamily::Column.schema();
+        // COL_TAB is keyed `pack_column_id(owner, col)`, so one owner's records
+        // are the key band `[pack(owner, 0), pack(owner + 1, 0))`.
+        let start = sys_opk(&schema, pack_column_id(owner_id, 0) as u128);
+        let end = sys_opk(&schema, pack_column_id(owner_id + 1, 0) as u128);
+        let batch = retract_key_range(
             self.sys_store(SysFamily::Column),
             &schema,
-            pack_column_id(owner_id, 0) as u128,
-            pack_column_id(owner_id + 1, 0) as u128,
+            start.pk_bytes(),
+            Some(end.pk_bytes()),
         );
         // These whole-table COL retractions are part of the owner's drop and run
         // while the owner is still registered (before `unregister_table`), so the
@@ -401,15 +453,8 @@ impl CatalogEngine {
     fn hook_column_alter(&mut self, batch: &Batch) -> Result<(), String> {
         // Distinct owner tids with a `-1`/`+1` pair (COL_TAB PK = pack_col_id).
         let mut owners: Vec<i64> = Vec::new();
-        for i in 0..batch.count {
-            if batch.get_weight(i) >= 0 {
-                continue;
-            }
-            let pk = batch.get_pk(i);
-            if !(0..batch.count).any(|j| batch.get_weight(j) > 0 && batch.get_pk(j) == pk) {
-                continue;
-            }
-            let owner = gnitz_wire::unpack_col_id(pk as u64).0 as i64;
+        for sig in pk_signatures(batch).iter().filter(|s| s.is_pair()) {
+            let owner = gnitz_wire::unpack_col_id(sig.pk as u64).0 as i64;
             if !owners.contains(&owner) {
                 owners.push(owner);
             }
@@ -490,11 +535,6 @@ impl CatalogEngine {
                 // prepends the k source PK columns, so SELECT * over a wide
                 // compound-PK table can cross MAX_COLUMNS.
                 let (sid, name, pk) = read_view_tab_row(batch, i);
-                let col_defs = self.read_column_defs(vid);
-                validate_relation_defs("view", vid, &name, &col_defs, &pk)?;
-
-                let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
-                let directory = view_dir(&self.base_dir, &schema_name, vid);
                 // The circuit's `circuit_nodes` are persisted before this VIEW_TAB
                 // row, so `get_source_ids` resolves here.
                 let source_ids = self.dag.get_source_ids(vid);
@@ -505,30 +545,21 @@ impl CatalogEngine {
                 // reading one value is what keeps the store shape, the read
                 // routing, and the co-partition analyzers from disagreeing.
                 let placement = self.dag.view_placement(vid, &source_ids, pk.as_slice().len());
-                let view_schema = build_schema_from_col_defs(&col_defs, pk.as_slice(), placement)?;
-
-                // See hook_table_register: one kind drives the bundle.
-                let kind = RelationKind::View;
-                let et = self.with_staged_dir(directory.clone(), |s| {
-                    s.build_partitioned_storage(kind, &directory, &name, vid, view_schema)
-                })?;
-
-                let max_depth = source_ids
+                let depth = source_ids
                     .iter()
                     .filter_map(|id| self.dag.tables.get(id))
                     .map(|e| e.depth + 1)
                     .max()
                     .unwrap_or(0);
-
-                self.dag.register_table(
-                    vid,
-                    StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(et))),
-                    view_schema,
-                    kind,
-                    max_depth,
-                    directory,
-                );
-                raise_id_counter(&mut self.next_table_id, vid);
+                self.register_relation(RelationRegistration {
+                    kind: RelationKind::View,
+                    id: vid,
+                    schema_id: sid,
+                    name: &name,
+                    pk: &pk,
+                    placement,
+                    depth,
+                })?;
 
                 // Registration leaves the view EMPTY. Filling it is the runtime
                 // layer's: `backfill_views_in_dep_order` for a live CREATE,
@@ -538,45 +569,42 @@ impl CatalogEngine {
             } else if !net_live {
                 // A genuine drop (net-dead): a rename pair's `-1` is net-live, so
                 // this teardown is skipped and the view registration survives.
-                if let Some(directory) = self.dag.tables.get(&vid).map(|e| e.directory.clone()) {
-                    // Under atomic CREATE the circuit/dep/COL_TAB rows are applied via
-                    // the enqueuing path, so they are in compensation's drained set and
-                    // negated directly. CREATE rollback replays descending topo, so this
-                    // VIEW_TAB(7) -1 fires its DROP-branch cascade BEFORE the drained
-                    // circuit(3–5)/DEP(2)/COL(1) -1s: an unguarded cascade would retract
-                    // them, then the drained -1s would retract them again → a net -1
-                    // ghost. Skip it during rollback so compensation's direct negate is
-                    // the sole retractor.
-                    if !self.ctx.in_rollback() {
-                        self.cascade_retract_circuit_and_deps(vid)?;
-                        self.cascade_retract_columns(vid)?;
+                self.drop_relation(vid, |s| {
+                    // Under atomic CREATE the circuit/dep/COL_TAB rows are applied
+                    // via the enqueuing path, so they are in compensation's drained
+                    // set and negated directly. CREATE rollback replays descending
+                    // topo, so this VIEW_TAB(7) -1 fires its cascade BEFORE the
+                    // drained circuit(3–5)/DEP(2)/COL(1) -1s: an unguarded cascade
+                    // would retract them, then the drained -1s would retract them
+                    // again → a net -1 ghost. Skip it during rollback so
+                    // compensation's direct negate is the sole retractor.
+                    if !s.ctx.in_rollback() {
+                        s.cascade_retract_circuit_and_deps(vid)?;
+                        s.cascade_retract_columns(vid)?;
                     }
-                    self.dag.unregister_table(vid);
-                    self.pending_dir_deletions.push(directory);
-                    // See hook_table_register: purge post-cascade so the cascade's
-                    // own counter bumps can't re-create a dropped view's entries.
-                    // In rollback cascade_retract_columns is skipped (schema_version
-                    // not re-created) but the tail purge cleans both either way.
-                    self.caches.purge_table_versions(vid);
-                }
+                    Ok(())
+                })?;
             }
         }
         Ok(())
     }
 
     fn cascade_retract_circuit_and_deps(&mut self, vid: i64) -> Result<(), String> {
-        let view_id = vid as u64;
         for family in [
             SysFamily::CircuitNodes,
             SysFamily::CircuitEdges,
             SysFamily::CircuitNodeColumns,
             SysFamily::ViewDep,
         ] {
-            let schema = sys_tab_schema(family.id());
-            let batch = {
-                let table = self.sys_table(family.id()).unwrap();
-                retract_rows_by_view(table, &schema, view_id)
-            };
+            let schema = family.schema();
+            // These families use the compound PK `(view_id, sub)`, so one view's
+            // rows are the key band `[(vid, 0), (vid + 1, 0))`. `sys_opk` takes
+            // the native value in pk-list column order, so `view_id` (column 0)
+            // occupies the LOW u128 half — the byte-order dual of the
+            // `(vid << 64) | sub` image `Batch::extend_pk` writes.
+            let start = sys_opk(&schema, vid as u64 as u128);
+            let end = sys_opk(&schema, vid as u64 as u128 + 1);
+            let batch = retract_key_range(self.sys_store(family), &schema, start.pk_bytes(), Some(end.pk_bytes()));
             if batch.count > 0 {
                 self.submit(family, batch)?;
             }
@@ -600,7 +628,7 @@ impl CatalogEngine {
                 raise_id_counter(&mut self.next_index_id, idx_id);
 
                 // Boot replay and worker ddl_sync reach this hook without
-                // precheck_sys_ingest, so re-run the shared registration guards
+                // precheck_family, so re-run the shared registration guards
                 // here (see `validate_index_registration`). Resolve the owner
                 // entry once for everything below.
                 let entry = self.validate_index_registration(owner_id, &cols)?;
@@ -613,11 +641,7 @@ impl CatalogEngine {
                 // is order-independent (the circuit is unique iff ANY index on the
                 // column list is unique), so replay reconstructs an identical
                 // result regardless of index_id ordering.
-                let incumbent_unique = entry
-                    .index_circuits
-                    .iter()
-                    .find(|ic| ic.col_indices.as_slice() == cols.as_slice())
-                    .map(|ic| ic.is_unique);
+                let incumbent_unique = entry.index_circuit_on(cols.as_slice()).map(|ic| ic.is_unique);
                 if let Some(was_unique) = incumbent_unique {
                     if is_unique && !was_unique {
                         self.promote_index_to_unique(owner_id, cols.as_slice())?;
@@ -678,9 +702,7 @@ impl CatalogEngine {
                     self.dag
                         .set_index_circuit_uniqueness(owner_id, cols.as_slice(), remains_unique);
                 } else if let Some((owner_dir, creating_idx_id)) = self.dag.tables.get(&owner_id).and_then(|e| {
-                    e.index_circuits
-                        .iter()
-                        .find(|ic| ic.col_indices.as_slice() == cols.as_slice())
+                    e.index_circuit_on(cols.as_slice())
                         .map(|ic| (e.directory.clone(), ic.index_id))
                 }) {
                     // No index remains on the column list — drop the circuit. Use
@@ -703,29 +725,14 @@ impl CatalogEngine {
         if self.ctx.in_rollback() {
             return Ok(());
         }
-        // §3.2: a rename pair's `+1` must NOT re-mint this table's FK auto-indices
-        // — the auto-index name embeds the *current* (new) table name, so its
-        // by-name dedup cannot suppress the duplicate a rename would produce for a
-        // non-PK FK column. Skip any `+1` whose tid also carries a `-1` in THIS
-        // same TABLE_TAB batch (pair-exclusion derived batch-locally). Derived
-        // batch-locally rather than from a master-only threaded set: this hook
-        // fires on every `is_live()`
-        // path — live apply, worker `ddl_sync`, master SAL-tail recovery — where a
-        // threaded set would be absent and let a renamed FK-child mint a duplicate
-        // `__fk_` index (diverging the worker catalog / a recovery duplicate).
-        let renamed: Vec<i64> = (0..batch.count)
-            .filter(|&i| batch.get_weight(i) < 0)
-            .map(|i| batch.get_pk(i) as i64)
-            .collect();
-        for i in 0..batch.count {
-            let weight = batch.get_weight(i);
-            if weight <= 0 {
-                continue;
-            }
-            let tid = batch.get_pk(i) as i64;
-            if renamed.contains(&tid) {
-                continue;
-            }
+        // §3.2: a rename pair's `+1` must NOT re-mint this table's FK
+        // auto-indices — the auto-index name embeds the *current* (new) table
+        // name, so its by-name dedup cannot suppress the duplicate a rename
+        // would produce for a non-PK FK column. `family_pks_by_sign` excludes
+        // exactly those paired tids. It reads the batch alone rather than a
+        // master-threaded set, because this hook also fires on worker `ddl_sync`
+        // and master SAL-tail recovery, where such a set would be absent.
+        for tid in family_pks_by_sign(batch, true) {
             // Live-only: the boot shard replay restores the persisted IDX_TAB
             // rows itself, and it replays TABLE_TAB first — so `index_by_name` is
             // still empty here and an ungated run would mint duplicate FK indices

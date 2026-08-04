@@ -36,7 +36,7 @@ fn weighted_fixture(name: &str, rows: impl Iterator<Item = (u64, i64, i64)>) -> 
     let batch = build_view_tab_row(vid, "v_weighted", "SELECT * FROM t");
     engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
 
-    let mut bb = BatchBuilder::new(engine.get_schema(vid).unwrap());
+    let mut bb = BatchBuilder::new(engine.get_schema_desc(vid).unwrap());
     for (id, val, w) in rows {
         bb.begin_row(id as u128, w);
         bb.put_u64(val as u64);
@@ -66,7 +66,7 @@ fn identity_spec(bound: ReadBound, order: Vec<OrderKey>, limit_k: u64) -> ReadSp
 }
 
 fn run(engine: &mut CatalogEngine, tid: i64, spec: &ReadSpec) -> Vec<(u128, i64, i64)> {
-    let reply_schema = engine.get_schema(tid).unwrap();
+    let reply_schema = engine.get_schema_desc(tid).unwrap();
     let keeper = engine.scan_spec_family(tid, spec, &reply_schema).unwrap();
     triples(&keeper)
 }
@@ -125,7 +125,7 @@ fn pk_set_gathers_named_keys() {
 #[test]
 fn pk_set_over_a_system_table_keeps_every_key() {
     let (mut e, tid, _dir) = table_fixture("ss_pkset_sys", &id_val_cols());
-    let sys_schema = e.get_schema(TABLE_TAB_ID).unwrap();
+    let sys_schema = e.get_schema_desc(TABLE_TAB_ID).unwrap();
     let spec = identity_spec(ReadBound::PkSet(vec![tid as u128]), vec![], 0);
     let keeper = e.scan_spec_family(TABLE_TAB_ID, &spec, &sys_schema).unwrap();
     assert_eq!(
@@ -146,7 +146,7 @@ fn pk_set_over_a_system_table_keeps_every_key() {
 fn pk_set_rejects_keys_colliding_after_truncation() {
     let (mut e, tid) = fixture("ss_pkset_trunc", 10, |i| i as i64);
     let spec = identity_spec(ReadBound::PkSet(vec![5, 5 + (1u128 << 64)]), vec![], 0);
-    let reply_schema = e.get_schema(tid).unwrap();
+    let reply_schema = e.get_schema_desc(tid).unwrap();
     let Err(err) = e.scan_spec_family(tid, &spec, &reply_schema) else {
         panic!("colliding PkSet keys must be rejected, not gathered twice");
     };
@@ -170,7 +170,7 @@ fn keyed_reads_over_a_replicated_table_find_every_key() {
         "REPLICATED must build an unhashed store"
     );
 
-    let schema = e.get_schema(tid).unwrap();
+    let schema = e.get_schema_desc(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     for id in 0..N {
         bb.begin_row(id, 1);
@@ -228,7 +228,7 @@ fn keyed_reads_over_a_view_return_the_whole_pk_group() {
     let rows = [(7u64, 50i64, 1i64), (7, 100, 1), (7, 200, 1), (7, 300, 1), (9, 900, 1)];
     let (mut e, vid) = weighted_fixture("ss_view_group", rows.into_iter());
     // Retract (7, 50) in a second ingest: it folds to net zero at read time.
-    let mut bb = BatchBuilder::new(e.get_schema(vid).unwrap());
+    let mut bb = BatchBuilder::new(e.get_schema_desc(vid).unwrap());
     bb.begin_row(7, -1);
     bb.put_u64(50);
     bb.end_row();
@@ -329,7 +329,7 @@ fn pk_range_over_a_clustered_table_routes_when_confined_and_spans_when_not() {
         &[0, 1],
         gnitz_wire::pack_table_flags(false, 1),
     );
-    let schema = e.get_schema(tid).unwrap();
+    let schema = e.get_schema_desc(tid).unwrap();
     assert_eq!(schema.dist_stride(), 8, "CLUSTER BY one U64 column ⇒ an 8-byte prefix");
 
     let mut bb = BatchBuilder::new(schema);
@@ -417,7 +417,7 @@ fn order_key_column_out_of_range_is_rejected() {
         }],
         0,
     );
-    let reply_schema = e.get_schema(tid).unwrap();
+    let reply_schema = e.get_schema_desc(tid).unwrap();
     assert!(e.scan_spec_family(tid, &spec, &reply_schema).is_err());
 }
 
@@ -516,7 +516,7 @@ fn gather_of_64_payload_columns_covers_every_slot() {
     });
     // Identity-order gather of every payload column: src col k+1 → out slot k.
     let copies: Vec<(u32, u32)> = (0..P as u32).map(|k| (k + 1, k)).collect();
-    let reply = e.get_schema(tid).unwrap();
+    let reply = e.get_schema_desc(tid).unwrap();
     let spec = rows_spec(vec![], proj_blob(&copies), vec![], 0);
     let got = e.scan_spec_family(tid, &spec, &reply).unwrap();
     assert_eq!(got.count, 40);
@@ -734,7 +734,7 @@ fn gather_top_k_keeps_boundary_row_whole() {
     let (mut e, tid) = weighted_fixture("ss_gather_topk", (0..40u64).map(|id| (id, id as i64, 3i64)));
     e.ddl_scan_chunk_rows = 8;
     // Reply: id U64 PK | val I64 — a gather of the single payload column.
-    let reply = e.get_schema(tid).unwrap();
+    let reply = e.get_schema_desc(tid).unwrap();
     let order = vec![OrderKey {
         col: 1,
         desc: false,
@@ -761,7 +761,7 @@ fn gather_limit_cuts_the_range_list_mid_chunk() {
     let (mut e, tid) = proj_fixture("ss_gather_earlystop", &cols, 500, 256, |bb, id| {
         bb.put_u64(id % 2);
     });
-    let reply = e.get_schema(tid).unwrap();
+    let reply = e.get_schema_desc(tid).unwrap();
     let spec = rows_spec(pred_lt_blob(1, 1), proj_blob(&[(1, 0)]), vec![], 5);
     let got = e.scan_spec_family(tid, &spec, &reply).unwrap();
     let total: i64 = (0..got.count).map(|r| got.get_weight(r)).sum();

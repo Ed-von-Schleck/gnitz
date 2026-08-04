@@ -14,6 +14,7 @@
 use super::*;
 
 use super::unique_filter::{UniqueFilter, UNIQUE_FILTER_CAP};
+use crate::catalog::FkEdge;
 use crate::storage::MemBatch;
 
 // ---------------------------------------------------------------------------
@@ -501,17 +502,6 @@ type ParentDelta = (FxHashMap<u128, RetireVerb>, FxHashSet<u128>);
 /// by rules F1 and F2, which both turn on it.
 type ParentDeltas = FxHashMap<(i64, usize), ParentDelta>;
 
-/// One FK constraint, in the same field order however it was collected. The two
-/// column positions are easy to transpose, so they are named rather than left
-/// as a bare tuple.
-#[derive(Clone, Copy)]
-struct FkEdge {
-    child_tid: i64,
-    fk_col: usize,
-    parent_tid: i64,
-    parent_col: usize,
-}
-
 impl FkEdge {
     /// The `ParentDeltas` key this edge's referenced value lives under.
     fn delta_key(&self) -> (i64, usize) {
@@ -869,7 +859,7 @@ impl MasterDispatcher {
                     for (&pk, f) in &pk_fold(batch) {
                         let key_str = || format_pk_value_bytes(pk, &schema);
                         if f.dups > 1 {
-                            return Err(disp.pk_violation_err(tid, &schema, &key_str(), true));
+                            return Err(disp.cat().pk_violation_err(tid, schema.pk_indices(), &key_str(), true));
                         }
                         if f.net <= 0 {
                             continue;
@@ -880,7 +870,7 @@ impl MasterDispatcher {
                             None => committed.contains(pk),
                         };
                         if exists {
-                            return Err(disp.pk_violation_err(tid, &schema, &key_str(), false));
+                            return Err(disp.cat().pk_violation_err(tid, schema.pk_indices(), &key_str(), false));
                         }
                     }
                 }
@@ -915,7 +905,7 @@ impl MasterDispatcher {
         let mut checks: Vec<PipelinedCheck> = Vec::new();
         for &tid in &b.order {
             let cat = disp.cat();
-            let (n_circuits, has_unique) = (cat.get_index_circuit_count(tid), cat.has_any_unique_index(tid));
+            let (n_circuits, has_unique) = (cat.index_circuits(tid).len(), cat.has_any_unique_index(tid));
             if !has_unique {
                 continue;
             }
@@ -950,7 +940,7 @@ impl MasterDispatcher {
                         continue; // NULL in an indexed column ⇒ unindexed
                     }
                     if by_span.insert(keybuf, pk).is_some() {
-                        return Err(disp.unique_violation_err(tid, cols, true));
+                        return Err(disp.cat().unique_violation_err(tid, cols, true));
                     }
                 }
                 if by_span.is_empty() {
@@ -1018,7 +1008,9 @@ impl MasterDispatcher {
                     }
                 };
                 if !retired {
-                    return Err(disp.unique_violation_err(plan.tid, plan.col_indices.as_slice(), false));
+                    return Err(disp
+                        .cat()
+                        .unique_violation_err(plan.tid, plan.col_indices.as_slice(), false));
                 }
             }
         }
@@ -1045,21 +1037,9 @@ impl MasterDispatcher {
         let mut constraints: Vec<FkEdge> = Vec::new();
         let mut children: Vec<FkEdge> = Vec::new();
         for &tid in &b.order {
-            {
-                let cat = disp.cat();
-                constraints.extend(cat.fk_constraints_of(tid).iter().map(|c| FkEdge {
-                    child_tid: tid,
-                    fk_col: c.fk_col_idx,
-                    parent_tid: c.target_table_id,
-                    parent_col: c.target_col_idx,
-                }));
-                children.extend(cat.fk_children_of(tid).iter().map(|r| FkEdge {
-                    child_tid: r.child_tid,
-                    fk_col: r.fk_col_idx,
-                    parent_tid: tid,
-                    parent_col: r.parent_col_idx,
-                }));
-            }
+            let cat = disp.cat();
+            constraints.extend(cat.fk_constraints_of(tid).iter().copied());
+            children.extend(cat.fk_children_of(tid).iter().copied());
         }
         if constraints.is_empty() && children.is_empty() {
             return Ok(());
@@ -1189,7 +1169,7 @@ impl MasterDispatcher {
                 if (in_committed && !retired.contains_key(v)) || added.contains(v) {
                     continue;
                 }
-                return Err(disp.fk_missing_err(plan.edge.child_tid, plan.edge.parent_tid));
+                return Err(disp.cat().fk_missing_err(plan.edge.child_tid, plan.edge.parent_tid));
             }
         }
         Ok(())
@@ -1258,7 +1238,9 @@ impl MasterDispatcher {
                     // Untouched committed children exist and no bundled child
                     // family can exempt them.
                     let verb = restrict_verb(&deltas[&plan.edge.delta_key()].0, *v);
-                    return Err(disp.fk_restrict_err(plan.edge.parent_tid, plan.edge.child_tid, verb));
+                    return Err(disp
+                        .cat()
+                        .fk_restrict_err(plan.edge.parent_tid, plan.edge.child_tid, verb));
                 }
                 fetches.push((i, *v));
             }
@@ -1312,7 +1294,9 @@ impl MasterDispatcher {
                 };
                 if still_refs {
                     let verb = restrict_verb(&deltas[&plan.edge.delta_key()].0, v);
-                    return Err(disp.fk_restrict_err(plan.edge.parent_tid, plan.edge.child_tid, verb));
+                    return Err(disp
+                        .cat()
+                        .fk_restrict_err(plan.edge.parent_tid, plan.edge.child_tid, verb));
                 }
             }
         }
@@ -1502,34 +1486,9 @@ impl MasterDispatcher {
 
         let merged = merge_index_scan(slots, &req_ids, reactor, &frame_schema).await?;
         if merged.duplicate {
-            return Err(disp.unique_create_dup_err(owner_id, col_indices));
+            return Err(disp.cat().unique_create_dup_err(owner_id, col_indices));
         }
         Ok(merged.into_seed())
-    }
-
-    /// The constraint-violation messages all live in the catalog, the single
-    /// source of truth for their text and for the table/column name lookups.
-    /// `col_indices` is an index's full column list (composite-aware).
-    fn unique_violation_err(&self, target_id: i64, col_indices: &[u32], in_batch: bool) -> String {
-        self.cat().unique_violation_err(target_id, col_indices, in_batch)
-    }
-
-    fn unique_create_dup_err(&self, owner_id: i64, col_indices: &[u32]) -> String {
-        self.cat().unique_create_dup_err(owner_id, col_indices)
-    }
-
-    /// `key_str` is the already-rendered offending key (narrow or wide).
-    fn pk_violation_err(&self, target_id: i64, schema: &SchemaDescriptor, key_str: &str, in_batch: bool) -> String {
-        self.cat()
-            .pk_violation_err(target_id, schema.pk_indices(), key_str, in_batch)
-    }
-
-    fn fk_missing_err(&self, child_tid: i64, parent_tid: i64) -> String {
-        self.cat().fk_missing_err(child_tid, parent_tid)
-    }
-
-    fn fk_restrict_err(&self, parent_tid: i64, child_tid: i64, verb: &str) -> String {
-        self.cat().fk_restrict_err(parent_tid, child_tid, verb)
     }
 }
 

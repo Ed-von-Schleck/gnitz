@@ -288,7 +288,7 @@ impl DagEngine {
         );
         match self.execute_multi_worker_step(view_id, delta, source_id, exchange) {
             Some(out) if out.count > 0 => {
-                self.ingest_to_family(view_id, out);
+                self.ingest_relation(view_id, out);
                 true
             }
             _ => false,
@@ -333,7 +333,7 @@ impl DagEngine {
                 if self.dep.forward.get(&view_id).is_none_or(|d| d.is_empty()) {
                     // Terminal view: move the batch into its family — there is
                     // nothing downstream to fan onto.
-                    self.ingest_to_family(view_id, out_delta.unwrap());
+                    self.ingest_relation(view_id, out_delta.unwrap());
                     continue;
                 }
                 self.ingest_by_ref(view_id, out_delta.as_ref().unwrap());

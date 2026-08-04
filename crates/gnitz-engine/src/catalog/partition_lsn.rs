@@ -200,21 +200,14 @@ impl CatalogEngine {
     /// from `collect_all_flushed_lsns`; this single-table form is test-only.
     #[cfg(test)]
     pub(crate) fn get_max_flushed_lsn(&self, table_id: i64) -> u64 {
-        if table_id > 0 && table_id < FIRST_USER_TABLE_ID {
-            return self.sys_table_current_lsn(table_id);
+        if let Some(family) = SysFamily::from_id(table_id) {
+            return self.sys_store(family).current_lsn();
         }
         let entry = match self.dag.tables.get(&table_id) {
             Some(e) => e,
             None => return 0,
         };
         entry.handle.current_lsn()
-    }
-
-    /// Read `current_lsn` from a system table by id. Returns 0 for unknown
-    /// ids.
-    #[cfg(test)]
-    fn sys_table_current_lsn(&self, table_id: i64) -> u64 {
-        self.sys_table(table_id).map_or(0, |t| t.current_lsn())
     }
 
     /// Build a map of every known table id → max flushed LSN, covering

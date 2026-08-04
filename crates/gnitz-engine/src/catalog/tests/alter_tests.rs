@@ -108,7 +108,7 @@ fn rename_then_reopen_resolves_flushed_data() {
         let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::U64)];
         tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
         // Flush a row so only the on-disk (id-only) path can serve it after reopen.
-        let schema = engine.get_schema(tid).unwrap();
+        let schema = engine.get_schema_desc(tid).unwrap();
         let mut bb = BatchBuilder::new(schema);
         bb.begin_row(7u128, 1);
         bb.put_u64(70);
@@ -235,7 +235,7 @@ fn system_range_rewrite_rejected() {
         bb.put_u64(0);
         bb.end_row();
     }
-    let err = engine.precheck_family(TABLE_TAB_ID, &bb.finish()).unwrap_err();
+    let err = engine.precheck_family(SysFamily::Table, &bb.finish()).unwrap_err();
     assert!(
         err.contains("system relation"),
         "a rewrite on a system-range id must be rejected: {err}"
@@ -275,7 +275,7 @@ fn stale_column_rename_rejected_and_drop_cascade_passes() {
         bb.put_u64(0); // is_hidden
         bb.end_row();
     }
-    let err = engine.precheck_family(COL_TAB_ID, &bb.finish()).unwrap_err();
+    let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();
     assert!(
         err.contains("catalog changed concurrently"),
         "a stale column rename must be rejected by the Column precheck arm: {err}"

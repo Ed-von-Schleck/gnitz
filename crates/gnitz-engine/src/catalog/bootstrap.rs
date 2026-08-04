@@ -9,15 +9,14 @@ impl CatalogEngine {
     pub fn open(base_dir: &str) -> Result<Self, String> {
         ensure_dir(base_dir)?;
 
-        let sys_dir = format!("{base_dir}/{SYS_CATALOG_DIRNAME}");
-        ensure_dir(&sys_dir)?;
+        ensure_dir(&sys_catalog_dir(base_dir))?;
 
         // Create system tables (single-partition; durability derived from the
         // kind they are later registered under).
         let mut stores = Vec::with_capacity(SysFamily::COUNT);
         for info in &SYS_FAMILIES {
             let table = Table::new(
-                &format!("{}/{}", sys_dir, info.name),
+                &sys_family_dir(base_dir, info.name),
                 sys_tab_schema(info.id),
                 info.id as u32,
                 SYS_TABLE_ARENA,
@@ -97,8 +96,6 @@ impl CatalogEngine {
     // -- Bootstrap (fresh database) ----------------------------------------
 
     fn bootstrap_system_tables(&mut self) -> Result<(), String> {
-        let sys_dir = format!("{}/{}", self.base_dir, SYS_CATALOG_DIRNAME);
-
         // 1. Core schema records
         {
             let mut bb = BatchBuilder::new(SysFamily::Schema.schema());
@@ -120,7 +117,7 @@ impl CatalogEngine {
         {
             let mut bb = BatchBuilder::new(SysFamily::Table.schema());
             for info in &SYS_FAMILIES {
-                let dir = format!("{}/{}", sys_dir, info.name);
+                let dir = sys_family_dir(&self.base_dir, info.name);
                 push_table_tab_row(&mut bb, info.id, SYSTEM_SCHEMA_ID, info.name, &dir, 0, 0);
             }
             let batch = bb.finish();
@@ -176,14 +173,9 @@ impl CatalogEngine {
                 .map_err(|e| format!("bootstrap: sys_sequences ingest failed: {e}"))?;
         }
 
-        // Flush the foundational metadata to disk. Deliberately partial: only
-        // the four families bootstrap wrote above.
-        let _ = self.sys_store_mut(SysFamily::Schema).flush();
-        let _ = self.sys_store_mut(SysFamily::Table).flush();
-        let _ = self.sys_store_mut(SysFamily::Column).flush();
-        let _ = self.sys_store_mut(SysFamily::Sequence).flush();
-
-        Ok(())
+        // Publish the foundational metadata. The families bootstrap did not
+        // write are empty and cost nothing to include.
+        self.flush_all_system_tables()
     }
 
     // -- Recover sequence counters from sys_sequences ----------------------
@@ -220,19 +212,17 @@ impl CatalogEngine {
     // -- Register system table families ------------------------------------
 
     fn register_system_table_families(&mut self) {
-        let sys_dir = format!("{}/{}", self.base_dir, SYS_CATALOG_DIRNAME);
-
         self.caches.schema_by_name.insert("_system".into(), SYSTEM_SCHEMA_ID);
         self.caches.schema_by_id.insert(SYSTEM_SCHEMA_ID, "_system".into());
 
+        let base_dir = self.base_dir.clone();
         for (info, store) in SYS_FAMILIES.iter().zip(self.sys_stores.iter_mut()) {
-            let dir = format!("{}/{}", sys_dir, info.name);
+            let dir = sys_family_dir(&base_dir, info.name);
             let qualified = format!("_system.{}", info.name);
             self.caches.entity_by_qname.insert(qualified, info.id);
             self.caches
                 .entity_by_id
                 .insert(info.id, ("_system".into(), info.name.into()));
-            self.caches.schema_of.insert(info.id, SYSTEM_SCHEMA_ID);
             self.caches.pk_col_of.insert(info.id, PkColList::single(0));
             self.dag.register_table(
                 info.id,
@@ -263,7 +253,7 @@ impl CatalogEngine {
     fn replay_catalog(&mut self) -> Result<(), String> {
         // Only these five families need hook-driven replay — Circuit* and
         // sys_sequences are loaded directly by other open-time paths — and
-        // their ORDER is load-bearing (see the hooks.rs dispatch doc).
+        // their ORDER is the dependency order (see the hooks.rs dispatch doc).
         self.replay_system_table(SysFamily::Schema)?;
         self.replay_system_table(SysFamily::Table)?;
         self.replay_system_table(SysFamily::View)?;
@@ -287,14 +277,13 @@ impl CatalogEngine {
     /// path can abort before the SAL — the only durable copy of replayed DDL —
     /// is reset.
     pub fn flush_all_system_tables(&mut self) -> Result<(), String> {
-        for (info, table) in SYS_FAMILIES.iter().zip(self.sys_stores.iter_mut()) {
-            // System tables are `SalReplay`, so `flush()` folds memtable + L0
-            // and writes a durable shard synchronously.
-            table
-                .flush()
-                .map_err(|e| format!("boot flush of system table {} failed: {}", info.id, e))?;
-        }
-        Ok(())
+        // One barrier over the whole set, not ten: the round batches every dirty
+        // family's manifest, data and directory syncs into three submissions and
+        // builds at most one io_uring. System tables are `SalReplay`, so each
+        // folds memtable + L0 into a durable shard; a clean family costs nothing.
+        let tables = self.sys_stores.iter_mut().map(|b| &mut **b as *mut Table);
+        crate::storage::flush_barrier(tables, crate::storage::FlushRound::Base)
+            .map_err(|e| format!("boot flush of the system catalog failed: {e:?}"))
     }
 
     /// Graceful close for tests; the server never closes the catalog (it

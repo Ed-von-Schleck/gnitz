@@ -92,7 +92,7 @@ fn i64_reply(n_payload: usize) -> SchemaDescriptor {
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn scan_spec_sinks_bench() {
     let (mut e, tid) = numeric_fixture("ss_bench", NUMERIC_ROWS);
-    let src = e.get_schema(tid).unwrap();
+    let src = e.get_schema_desc(tid).unwrap();
     let n = NUMERIC_ROWS;
     // `c0 < 50` → contiguous 50-row runs; `cf < 1` → single-row ranges.
     let (contiguous, fragmented) = (pred_lt_blob(1, 50), pred_lt_blob(2, 1));
