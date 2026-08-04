@@ -157,8 +157,11 @@ impl CatalogEngine {
                     // id, so an unhashed store lands on its one child; `None`
                     // means this process holds no such partition. A range
                     // spanning partitions keeps the merge.
-                    let confined =
-                        crate::storage::range_shares_prefix(&start, end.as_ref(), src_schema.dist_stride() as usize);
+                    let confined = crate::schema::key::range_shares_prefix(
+                        &start,
+                        end.as_ref(),
+                        src_schema.dist_stride() as usize,
+                    );
                     let mut cursor = match confined {
                         true => match handle.open_cursor_for_key(start.pk_bytes()) {
                             Some(c) => c,
@@ -483,7 +486,7 @@ fn topk_keep(
         }
     }
     (
-        Batch::from_indexed_rows(&keeper.as_mem_batch(), &perm[..cut], reply_schema),
+        Batch::from_indexed_rows(&keeper.as_mem_batch(), &perm[..cut], &[], reply_schema),
         acc,
     )
 }
@@ -593,7 +596,7 @@ fn pk_range_keys(schema: &SchemaDescriptor, range: &RangeDescriptor) -> Result<O
     // columns (equality values then the cut value), leaving the trailing
     // columns raw-zero — the minimum OPK for any type, so `group(v)` IS
     // `pad(group(v))`.
-    Ok(crate::storage::range_keys_from_cuts(
+    Ok(crate::schema::key::range_keys_from_cuts(
         range,
         schema.pk_stride() as usize,
         |v| {
@@ -619,7 +622,7 @@ fn pk_range_keys(schema: &SchemaDescriptor, range: &RangeDescriptor) -> Result<O
 /// the single hash of `start` speak for all of it.
 pub(crate) fn scan_spec_partition(schema: &SchemaDescriptor, range: &RangeDescriptor) -> Option<usize> {
     let (start, end) = pk_range_keys(schema, range).ok().flatten()?;
-    crate::storage::range_shares_prefix(&start, end.as_ref(), schema.dist_stride() as usize)
+    crate::schema::key::range_shares_prefix(&start, end.as_ref(), schema.dist_stride() as usize)
         .then(|| schema.partition_for_pk(start.pk_bytes()))
 }
 

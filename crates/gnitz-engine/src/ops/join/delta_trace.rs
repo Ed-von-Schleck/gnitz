@@ -49,7 +49,9 @@ pub fn op_join_delta_trace(
     }
 
     let delta_mb = consolidated.as_mem_batch();
-    let mut output = Batch::empty_with_schema(out_schema);
+    // Seed at the delta size: exact for a 1:1 key match and a reasonable floor
+    // otherwise. Growing from empty re-copies the whole output about twice over.
+    let mut output = Batch::with_capacity(*out_schema, n);
 
     cogroup_intersection(consolidated, cursor, |key, range, m| {
         m.for_each_pk_group_row(key, |c| {

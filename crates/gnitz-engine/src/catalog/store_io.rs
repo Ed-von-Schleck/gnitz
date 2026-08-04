@@ -531,7 +531,7 @@ fn index_range_keys(
     // `pad(group(v))`.
     let mut natives = [0u128; gnitz_wire::PK_LIST_MAX_COLS];
     natives[..n_eq].copy_from_slice(eq_natives);
-    Ok(crate::storage::range_keys_from_cuts(range, idx_pk_stride, |v| {
+    Ok(crate::schema::key::range_keys_from_cuts(range, idx_pk_stride, |v| {
         natives[n_eq] = v;
         ic.key_spec.seek_prefix(&natives[..=n_eq])
     }))

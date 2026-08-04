@@ -8,7 +8,8 @@ use crate::schema::key::{compare_pk_ordering, pack_pk_be};
 use crate::schema::SchemaDescriptor;
 use crate::storage::{scatter_multi_source, write_to_batch, Batch, Layout, MemBatch};
 
-use super::router::{build_w_map, RouteMode, ScatterKey};
+use super::router::{RouteMode, ScatterKey};
+use gnitz_wire::build_w_map;
 // Reached only from the `#[cfg(test)]` co-partition tests; production relay
 // paths build their own worker-row scratch (`WORKER_ROWS`), route through one
 // hoisted `ScatterKey`, and settle PK ties with the canonical
@@ -16,9 +17,9 @@ use super::router::{build_w_map, RouteMode, ScatterKey};
 #[cfg(test)]
 use super::super::reindex::ReindexPacker;
 #[cfg(test)]
-use super::router::worker_for_partition;
-#[cfg(test)]
 use crate::schema::key::compare_pk_bytes;
+#[cfg(test)]
+use gnitz_wire::worker_for_partition;
 #[cfg(test)]
 use gnitz_wire::{partition_for_key, partition_for_pk_bytes};
 
@@ -125,8 +126,9 @@ pub(crate) fn op_repartition_batches_mode(
         // PK-routed, single-source repartition preserves source order and
         // distinctness per worker (a PK group never splits across workers, so a
         // worker's sub-batch is an in-order subset of one sorted source).
-        // Multi-source scatter is per-source-concatenated — not globally sorted
-        // — so it propagates nothing, and non-PK routing destroys PK order.
+        // Multi-source scatter is per-source-concatenated — not globally sorted —
+        // so it propagates nothing. Non-PK routing is excluded because a PK group
+        // can then split across workers, costing per-worker distinctness.
         if is_pk_routing {
             let mut contributing = sources.iter().filter_map(|s| *s).filter(|b| b.count > 0);
             if let (Some(src), None) = (contributing.next(), contributing.next()) {

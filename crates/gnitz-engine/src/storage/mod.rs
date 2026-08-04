@@ -14,7 +14,7 @@ mod lsm;
 // `crate::storage::batch_pool` paths resolve without touching the moved bodies.
 mod repr;
 pub(crate) use repr::batch_pool;
-use repr::{batch, batch_wire, columnar, merge, range_key, scatter};
+use repr::{batch, batch_wire, columnar, merge, scatter};
 
 #[cfg(test)]
 mod data_roundtrip_proptest;
@@ -58,7 +58,6 @@ pub(crate) use lsm::read_cursor::REWIND_CALLS;
 pub(crate) use lsm::read_cursor::{DrainGuard, ReadCursor, DDL_SCAN_CHUNK_ROWS};
 pub(crate) use lsm::spill::{KeyProducer, SpillSort};
 pub(crate) use merge::{relocate_german_string_vec, BlobCache, BlobCacheGuard, DirectWriter, RowComparator};
-pub(crate) use range_key::{range_cut_points, range_keys_from_cuts, range_shares_prefix};
 
 /// Convert a path string to a `CString`, mapping an interior NUL to
 /// `InvalidPath` — the one conversion every storage path takes.

@@ -5,7 +5,7 @@
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, MemBatch, ReadCursor};
 
-use super::super::util::merge_null_words;
+use gnitz_wire::merge_null_words;
 
 /// Write one composite join output row: [left_PK, left_payload..., right_payload...].
 ///

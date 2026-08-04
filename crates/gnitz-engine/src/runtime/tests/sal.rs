@@ -711,7 +711,7 @@ unsafe fn assert_footprint_exact(
     broadcast: bool,
     nw: usize,
 ) {
-    use crate::ops::with_commit_indices;
+    use crate::runtime::master::scatter::with_commit_indices;
     use crate::runtime::sal::FLAG_PUSH;
     use crate::runtime::wire::build_schema_wire_block;
     use crate::storage::compute_wire_props;

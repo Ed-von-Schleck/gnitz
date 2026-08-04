@@ -2,6 +2,8 @@
 //! via the shared append-only log (SAL) and collects responses via per-worker
 //! W2M regions. Eventfds provide cross-process signaling.
 
+pub(crate) mod scatter;
+
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -12,10 +14,7 @@ use crate::schema::{IndexKeySpec, SchemaDescriptor};
 use gnitz_wire::PkColList;
 use gnitz_wire::{payload_native_key, pk_native_key};
 
-use crate::ops::{
-    op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode, with_commit_indices,
-    with_worker_indices, worker_for_partition, RouteMode,
-};
+use crate::ops::{op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode, RouteMode};
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{AsyncMutex, PendingRelay, ScanLease};
 use crate::runtime::sal::{
@@ -32,6 +31,8 @@ use crate::runtime::wire::{
 use crate::schema::key::PkBuf;
 use crate::storage::Batch;
 use gnitz_wire::wire_flags_set_conflict_mode;
+use gnitz_wire::worker_for_partition;
+use scatter::{with_commit_indices, with_worker_indices};
 
 // ---------------------------------------------------------------------------
 // RelayPrepared — output of prepare_relay, input of emit_relay_with_decision

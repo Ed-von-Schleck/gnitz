@@ -3306,6 +3306,14 @@ fn test_reduce_min_group_by_pk_retracts_extreme() {
 // the trace-scan fallback (avi = None).
 // -----------------------------------------------------------------------
 
+/// Write one AVI group-key column into `dst`, exactly as the production
+/// `avi_key_packer` does: the column's **OPK** image at its declared width. The
+/// AVI schema declares each group column a PK column, so its region holds
+/// order-preserving big-endian bytes (sign-flipped when signed), not native LE.
+fn avi_gcol(dst: &mut [u8], native_le: &[u8], tc: u8) {
+    gnitz_wire::encode_pk_column(native_le, tc, dst);
+}
+
 #[test]
 fn avi_two_groups_distinct_byte_form_keys() {
     use super::super::util::encode_ordered;
@@ -3357,9 +3365,9 @@ fn avi_two_groups_distinct_byte_form_keys() {
         let mut b = Batch::with_capacity(avi_schema, 2);
         for (a, bb, min) in [(1u32, 1u32, 10i64), (2, 2, 20)] {
             let mut key = [0u8; 17];
-            key[0..4].copy_from_slice(&a.to_le_bytes());
-            key[4..8].copy_from_slice(&bb.to_le_bytes());
-            let av = encode_ordered(&min.to_le_bytes(), type_code::I64, false);
+            avi_gcol(&mut key[0..4], &a.to_le_bytes(), type_code::U32);
+            avi_gcol(&mut key[4..8], &bb.to_le_bytes(), type_code::U32);
+            let av = encode_ordered(&min.to_le_bytes(), TypeCode::I64, false);
             key[8] = 0; // ordinal 0 (single MIN aggregate)
             key[9..17].copy_from_slice(&av.to_be_bytes());
             b.extend_pk_bytes(&key);
@@ -3466,8 +3474,8 @@ fn avi_retraction_returns_next_extremum() {
         let mut b = Batch::with_capacity(avi_schema, 2);
         for min in [10i64, 20] {
             let mut key = [0u8; 13];
-            key[0..4].copy_from_slice(&1u32.to_le_bytes());
-            let av = encode_ordered(&min.to_le_bytes(), type_code::I64, false);
+            avi_gcol(&mut key[0..4], &1u32.to_le_bytes(), type_code::U32);
+            let av = encode_ordered(&min.to_le_bytes(), TypeCode::I64, false);
             key[4] = 0; // ordinal 0 (single MIN aggregate)
             key[5..13].copy_from_slice(&av.to_be_bytes());
             b.extend_pk_bytes(&key);
@@ -3584,8 +3592,8 @@ fn avi_non_power_of_two_stride_drives_cursor() {
         let avi_batch = {
             let mut b = Batch::with_capacity(avi_schema, 1);
             let mut key = vec![0u8; stride];
-            key[..gsize].copy_from_slice(&gval.to_le_bytes()[..gsize]);
-            let av = encode_ordered(&42i64.to_le_bytes(), type_code::I64, false);
+            avi_gcol(&mut key[..gsize], &gval.to_le_bytes()[..gsize], gtc);
+            let av = encode_ordered(&42i64.to_le_bytes(), TypeCode::I64, false);
             key[gsize] = 0; // ordinal
             key[gsize + 1..gsize + 9].copy_from_slice(&av.to_be_bytes());
             b.extend_pk_bytes(&key);
@@ -3966,9 +3974,9 @@ fn avi_multi_col_retraction_returns_next_extremum() {
         let mut b = Batch::with_capacity(avi_schema, 2);
         let put = |b: &mut Batch, a: u32, bb: u32, min: i64| {
             let mut key = [0u8; 17];
-            key[0..4].copy_from_slice(&a.to_le_bytes());
-            key[4..8].copy_from_slice(&bb.to_le_bytes());
-            let av = encode_ordered(&min.to_le_bytes(), type_code::I64, false);
+            avi_gcol(&mut key[0..4], &a.to_le_bytes(), type_code::U32);
+            avi_gcol(&mut key[4..8], &bb.to_le_bytes(), type_code::U32);
+            let av = encode_ordered(&min.to_le_bytes(), TypeCode::I64, false);
             key[8] = 0; // ordinal 0 (single MIN aggregate)
             key[9..17].copy_from_slice(&av.to_be_bytes());
             b.extend_pk_bytes(&key);
@@ -4108,18 +4116,17 @@ fn avi_wide_two_u64_groups_match_reference() {
             .iter()
             .map(|(&(a, b), &m)| {
                 let mut key = [0u8; 25];
-                key[0..8].copy_from_slice(&a.to_le_bytes());
-                key[8..16].copy_from_slice(&b.to_le_bytes());
-                let av = encode_ordered(&m.to_le_bytes(), type_code::I64, false);
+                avi_gcol(&mut key[0..8], &a.to_le_bytes(), type_code::U64);
+                avi_gcol(&mut key[8..16], &b.to_le_bytes(), type_code::U64);
+                let av = encode_ordered(&m.to_le_bytes(), TypeCode::I64, false);
                 key[16] = 0; // ordinal 0 (single MIN aggregate)
                 key[17..25].copy_from_slice(&av.to_be_bytes());
                 key
             })
             .collect();
-        // Production's ingest sorts the AVI by memcmp of the composite key
-        // (the group prefix is point-probed, never numeric-range-scanned), so
-        // the hand-built fixture must be in byte order — not numeric (a, b)
-        // order, which diverges from memcmp under little-endian storage.
+        // Production's ingest sorts the AVI by memcmp of the composite key, so
+        // the fixture must be in byte order. The group prefix is OPK, so for
+        // these unsigned columns that coincides with numeric (a, b) order.
         keys.sort();
         let mut bt = Batch::with_capacity(avi_schema, keys.len());
         for key in &keys {
@@ -4239,8 +4246,8 @@ fn avi_wide_single_u128_group_distinct() {
         // sorted ascending by g (both share high bytes; g1 < g2 by low byte).
         for &(g, m) in &groups {
             let mut key = [0u8; 25];
-            key[0..16].copy_from_slice(&g.to_le_bytes());
-            let av = encode_ordered(&m.to_le_bytes(), type_code::I64, false);
+            avi_gcol(&mut key[0..16], &g.to_le_bytes(), type_code::U128);
+            let av = encode_ordered(&m.to_le_bytes(), TypeCode::I64, false);
             key[16] = 0; // ordinal 0 (single MIN aggregate)
             key[17..25].copy_from_slice(&av.to_be_bytes());
             b.extend_pk_bytes(&key);
@@ -4339,19 +4346,18 @@ fn avi_wide_mixed_signed_unsigned_key() {
         b
     };
 
-    // AVI rows in memcmp (compare_pk_bytes) order of the composite key. The
-    // group prefix is point-probed, never numeric-range-scanned, so a signed
-    // column stored little-endian sorts by bytes, not by signed value — which
-    // is what production's ingest produces.
+    // AVI rows in memcmp (compare_pk_bytes) order of the composite key — what
+    // production's ingest produces. The group prefix is OPK, so the signed
+    // column's byte order is its signed order.
     let avi_batch = {
         let mut b = Batch::with_capacity(avi_schema, 3);
         let mut keys: Vec<[u8; 25]> = groups
             .iter()
             .map(|&(a, bb, m)| {
                 let mut key = [0u8; 25];
-                key[0..8].copy_from_slice(&a.to_le_bytes());
-                key[8..16].copy_from_slice(&bb.to_le_bytes());
-                let av = encode_ordered(&m.to_le_bytes(), type_code::I64, false);
+                avi_gcol(&mut key[0..8], &a.to_le_bytes(), type_code::I64);
+                avi_gcol(&mut key[8..16], &bb.to_le_bytes(), type_code::U64);
+                let av = encode_ordered(&m.to_le_bytes(), TypeCode::I64, false);
                 key[16] = 0; // ordinal 0 (single MIN aggregate)
                 key[17..25].copy_from_slice(&av.to_be_bytes());
                 key
@@ -4463,10 +4469,10 @@ fn avi_wide_prefix_collision_distinct_groups() {
         // sorted by (a,b,c): (1,2,3) before (1,2,4).
         for &(a, bb, c, m) in &groups {
             let mut key = [0u8; 33];
-            key[0..8].copy_from_slice(&a.to_le_bytes());
-            key[8..16].copy_from_slice(&bb.to_le_bytes());
-            key[16..24].copy_from_slice(&c.to_le_bytes());
-            let av = encode_ordered(&m.to_le_bytes(), type_code::I64, false);
+            avi_gcol(&mut key[0..8], &a.to_le_bytes(), type_code::U64);
+            avi_gcol(&mut key[8..16], &bb.to_le_bytes(), type_code::U64);
+            avi_gcol(&mut key[16..24], &c.to_le_bytes(), type_code::U64);
+            let av = encode_ordered(&m.to_le_bytes(), TypeCode::I64, false);
             key[24] = 0; // ordinal 0 (single MIN aggregate)
             key[25..33].copy_from_slice(&av.to_be_bytes());
             b.extend_pk_bytes(&key);
@@ -4566,9 +4572,9 @@ fn avi_wide_retraction_returns_next_extremum() {
         let mut b = Batch::with_capacity(avi_schema, 3);
         let put = |b: &mut Batch, a: u64, bb: u64, m: i64| {
             let mut key = [0u8; 25];
-            key[0..8].copy_from_slice(&a.to_le_bytes());
-            key[8..16].copy_from_slice(&bb.to_le_bytes());
-            let av = encode_ordered(&m.to_le_bytes(), type_code::I64, false);
+            avi_gcol(&mut key[0..8], &a.to_le_bytes(), type_code::U64);
+            avi_gcol(&mut key[8..16], &bb.to_le_bytes(), type_code::U64);
+            let av = encode_ordered(&m.to_le_bytes(), TypeCode::I64, false);
             key[16] = 0; // ordinal 0 (single MIN aggregate)
             key[17..25].copy_from_slice(&av.to_be_bytes());
             b.extend_pk_bytes(&key);
@@ -4731,11 +4737,12 @@ fn avi_read_extreme(
 
     let mut ch = avi_t.open_cursor();
     let mut gk = [0u8; crate::schema::MAX_PK_BYTES];
-    bake.extractor.gather(&deltas[0].as_mem_batch(), 0, &mut gk);
-    gk[bake.extractor.stride] = 0; // ordinal 0 (single aggregate)
+    bake.key_packer
+        .pack_into(&mut gk[..bake.key_packer.out_stride], &deltas[0].as_mem_batch(), 0);
+    gk[bake.key_packer.out_stride] = 0; // ordinal 0 (single aggregate)
     let mut acc = Accumulator::new(&agg, in_schema.locate(col_idx as usize));
     assert!(
-        apply_agg_from_value_index(&mut ch, &gk[..bake.extractor.stride + 1], for_max, &mut acc),
+        apply_agg_from_value_index(&mut ch, &gk[..bake.key_packer.out_stride + 1], for_max, &mut acc),
         "AVI seek must find the probed group",
     );
     acc.get_value_bits() as i64
@@ -4881,8 +4888,8 @@ fn avi_full_path_pk_source_unsigned_high_byte() {
 fn avi_f32_seed_promotes_to_f64_bits() {
     use super::super::util::{decode_ordered, encode_ordered};
     for v in [1.5f32, -2.25, 0.0, 1.0e30] {
-        let enc = encode_ordered(&v.to_le_bytes(), type_code::F32, false);
-        let bits = decode_ordered(enc, TypeCode::F32, false);
+        let enc = encode_ordered(&v.to_le_bytes(), TypeCode::F32, false);
+        let bits = decode_ordered(enc, TypeCode::F32);
         assert_eq!(
             bits,
             f64::to_bits(v as f64),
@@ -6249,7 +6256,7 @@ fn global_lone_min_avi_empty_prefix() {
     assert_eq!(avi_schema.pk_stride(), 9, "0 group + 1 ordinal + 8 av");
     let avi_with = |min: i64| {
         let mut b = Batch::with_capacity(avi_schema, 1);
-        let av = encode_ordered(&min.to_le_bytes(), type_code::I64, false);
+        let av = encode_ordered(&min.to_le_bytes(), TypeCode::I64, false);
         let mut key = [0u8; 9];
         key[0] = 0; // ordinal 0 (single MIN, empty group prefix)
         key[1..9].copy_from_slice(&av.to_be_bytes());

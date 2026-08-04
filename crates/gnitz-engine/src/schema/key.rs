@@ -4,8 +4,8 @@
 //! they encode a PK region — a whole one, a seek key reassembled from its wire
 //! pair, or an index's leading-column span — to its order-preserving big-endian
 //! image, compare two such images with a raw `memcmp`, pack a narrow region
-//! into a sort key, and carry a width-tagged PK
-//! byte buffer. None of them reaches up into storage — the dependency runs
+//! into a sort key, carry a width-tagged PK byte buffer, and derive the
+//! half-open key range a `RangeDescriptor`'s cut pair denotes. None of them reaches up into storage — the dependency runs
 //! `storage → schema::key`, the legitimate downward direction. This module is
 //! the one import path: every caller, storage included, names
 //! `crate::schema::key::X`, and every native→OPK encoder lives here so the
@@ -14,7 +14,7 @@
 use std::cmp::Ordering;
 
 use gnitz_expr::RowSource;
-use gnitz_wire::NARROW_PK_MAX_BYTES;
+use gnitz_wire::{Cut, RangeDescriptor, NARROW_PK_MAX_BYTES};
 
 use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES};
 
@@ -677,6 +677,97 @@ impl IndexKeySpec {
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Byte successor / predecessor and cut → key-range derivation
+// ---------------------------------------------------------------------------
+
+/// Fixed-width byte-string successor: `p + 1` with carry, in place. Returns
+/// `false` when `p` is all-`0xFF` (or empty) — no successor exists at this width
+/// (carry-out), which a caller reads as `+∞` (scan to the table end, or a
+/// provably-empty start).
+pub(crate) fn increment_key_in_place(p: &mut [u8]) -> bool {
+    for b in p.iter_mut().rev() {
+        *b = b.wrapping_add(1);
+        if *b != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Fixed-width byte-string predecessor: `p - 1` with borrow, in place — the
+/// mirror of [`increment_key_in_place`]. An all-zero `p` borrows out and wraps to
+/// all-`0xFF`; the sole caller never passes one.
+fn decrement_key_in_place(p: &mut [u8]) {
+    for b in p.iter_mut().rev() {
+        *b = b.wrapping_sub(1);
+        if *b != 0xFF {
+            return;
+        }
+    }
+}
+
+/// Map `range`'s cut pair to its half-open `[start, end)` OPK key range over a
+/// `stride`-byte key space. `encode(v)` returns the OPK group prefix for cut
+/// value `v` — a `PkBuf` whose `len` is the prefix width, so by `PkBuf`'s own
+/// zero-tail invariant `group(v)` IS `pad(group(v))` (the minimum full key of
+/// the group). Each cut then maps uniformly:
+///
+/// | cut         | byte key                                                |
+/// |-------------|---------------------------------------------------------|
+/// | `Before(v)` | `pad(group(v))` — below every duplicate of `v`          |
+/// | `After(v)`  | `pad(succ(group(v)))` — above every duplicate of `v`;   |
+/// |             | `succ` overflow ⇒ no key space above the group (`+∞`)   |
+///
+/// `None` = provably empty: a `+∞` start (`After` on a saturated group), or
+/// `start ≥ end` (an inverted / zero-width interval the planner does not
+/// pre-reject). `end == None` inside `Some` means "scan to the table end".
+/// SQL bound semantics (inclusivity, unboundedness, out-of-range saturation)
+/// are resolved to cuts in the planner; none reach this layer.
+pub(crate) fn range_keys_from_cuts(
+    range: &RangeDescriptor,
+    stride: usize,
+    mut encode: impl FnMut(u128) -> PkBuf,
+) -> Option<(PkBuf, Option<PkBuf>)> {
+    let mut cut_key = |c: Cut| -> Option<PkBuf> {
+        let mut k = encode(c.value());
+        let prefix_len = k.len as usize;
+        // The carry may ripple into the equality prefix — exactly the first key
+        // of the next equality group; overflow means no key space above it.
+        if matches!(c, Cut::After(_)) && !increment_key_in_place(&mut k.bytes[..prefix_len]) {
+            return None;
+        }
+        Some(k.widened(stride))
+    };
+    let start = cut_key(range.start)?;
+    let end = cut_key(range.end);
+    if end.as_ref().is_some_and(|e| start.pk_bytes() >= e.pk_bytes()) {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// True when every key in a half-open `[start, end)` range from
+/// [`range_keys_from_cuts`] shares its leading `prefix` bytes. Since OPK order IS
+/// byte order, it is enough that the range's first and last keys agree there.
+///
+/// The last key is `end - 1`, undoing the `After` successor (and any carry ripple)
+/// the cut derivation applied — `Some(end)` only ever comes back with
+/// `start < end`, so the decrement cannot borrow out. `end == None` means the end
+/// cut carried out and the range runs to the table end, whose last key is
+/// all-`0xFF`.
+pub(crate) fn range_shares_prefix(start: &PkBuf, end: Option<&PkBuf>, prefix: usize) -> bool {
+    let last = match end {
+        Some(e) => {
+            let mut l = *e;
+            decrement_key_in_place(&mut l.bytes[..l.len as usize]);
+            l
+        }
+        None => PkBuf::from_bytes(&[0xFFu8; MAX_PK_BYTES][..start.len as usize]),
+    };
+    start.pk_bytes()[..prefix] == last.pk_bytes()[..prefix]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1084,6 +1175,72 @@ mod tests {
         // Raw &[u8] lookup via Borrow<[u8]> — no PkBuf construction.
         assert!(set.contains(&123u64.to_le_bytes()[..]));
         assert!(!set.contains(&124u64.to_le_bytes()[..]));
+    }
+
+    // --- increment_key_in_place -------------------------------------------
+
+    #[test]
+    fn succ_increments_low_byte() {
+        let mut k = [0x00, 0x00, 0x05];
+        assert!(increment_key_in_place(&mut k));
+        assert_eq!(k, [0x00, 0x00, 0x06]);
+    }
+
+    #[test]
+    fn succ_ripples_carry() {
+        let mut k = [0x00, 0x00, 0xFF];
+        assert!(increment_key_in_place(&mut k));
+        assert_eq!(k, [0x00, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn succ_carries_out_on_all_ff() {
+        let mut k = [0xFF, 0xFF];
+        assert!(!increment_key_in_place(&mut k));
+        assert_eq!(k, [0x00, 0x00]);
+    }
+
+    #[test]
+    fn succ_empty_carries_out() {
+        let mut k: [u8; 0] = [];
+        assert!(!increment_key_in_place(&mut k));
+    }
+
+    // --- range_shares_prefix ----------------------------------------------
+
+    fn buf(bytes: &[u8]) -> PkBuf {
+        PkBuf::from_bytes(bytes)
+    }
+
+    /// The last key is `end - 1`, so a range ending exactly at the next group's
+    /// first key still shares the prefix — one past that does not.
+    #[test]
+    fn shares_prefix_stops_at_the_group_boundary() {
+        let start = buf(&[0x07, 0x00]);
+        assert!(
+            range_shares_prefix(&start, Some(&buf(&[0x07, 0x01])), 1),
+            "one key wide"
+        );
+        assert!(
+            range_shares_prefix(&start, Some(&buf(&[0x08, 0x00])), 1),
+            "the whole group"
+        );
+        assert!(
+            !range_shares_prefix(&start, Some(&buf(&[0x08, 0x01])), 1),
+            "one key past"
+        );
+        // A borrow chain out of the trailing byte still lands in the group.
+        assert!(range_shares_prefix(&buf(&[0x07, 0x05]), Some(&buf(&[0x08, 0x00])), 1));
+    }
+
+    /// `end == None` runs to the table end (all-`0xFF`), which only the topmost
+    /// group shares a prefix with — that is what confines a maximal-value point.
+    #[test]
+    fn shares_prefix_handles_an_unbounded_end() {
+        assert!(range_shares_prefix(&buf(&[0xFF, 0xFF]), None, 1));
+        assert!(!range_shares_prefix(&buf(&[0x07, 0x00]), None, 1));
+        // A zero-width distribution prefix is shared by everything.
+        assert!(range_shares_prefix(&buf(&[0x07, 0x00]), None, 0));
     }
 
     #[test]

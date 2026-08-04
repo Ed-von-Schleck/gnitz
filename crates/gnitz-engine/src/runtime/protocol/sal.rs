@@ -925,7 +925,7 @@ impl SalWriter {
                 let slot = if wi.is_empty() {
                     CTRL_BLOCK_SIZE_NO_BLOB + schema_block_len
                 } else {
-                    let sub = Batch::from_indexed_rows(&mb, wi, schema);
+                    let sub = Batch::from_indexed_rows(&mb, wi, &[], schema);
                     CTRL_BLOCK_SIZE_NO_BLOB + schema_block_len + sub.wire_byte_size()
                 };
                 total += align8(slot);
@@ -981,7 +981,7 @@ impl SalWriter {
                 .iter()
                 .map(|indices| {
                     if !indices.is_empty() {
-                        Batch::from_indexed_rows(&mb, indices, schema)
+                        Batch::from_indexed_rows(&mb, indices, &[], schema)
                     } else {
                         Batch::empty_with_schema(schema)
                     }

@@ -281,6 +281,11 @@ pub fn promote_opk_column(src_opk: &[u8], src_tc: u8, target_tc: u8, dst: &mut [
 /// ordered and hashed as raw bytes.
 pub const NARROW_PK_MAX_BYTES: usize = 16;
 
+/// Number of partition buckets a routing hash spreads over. Both
+/// [`partition_for_key`] and [`partition_for_pk_bytes`] take the top 8 bits of
+/// their hash, so every partition index is in `0..PARTITION_COUNT`.
+pub const PARTITION_COUNT: usize = 256;
+
 /// Route a native PK value to a partition.
 ///
 /// Multiplicative hash: two Fibonacci multipliers XOR'd together. ~4
@@ -310,6 +315,26 @@ pub fn partition_for_pk_bytes(bytes: &[u8]) -> usize {
     } else {
         (crate::checksum(bytes) >> 56) as usize
     }
+}
+
+/// Which worker owns `partition`. The second half of the routing function:
+/// [`partition_for_key`] maps a row to one of [`PARTITION_COUNT`] buckets, this
+/// maps a bucket to a worker by contiguous chunks.
+#[inline]
+pub fn worker_for_partition(partition: usize, num_workers: usize) -> usize {
+    let chunk = PARTITION_COUNT / num_workers;
+    (partition / chunk).min(num_workers - 1)
+}
+
+/// [`worker_for_partition`] for every partition, hoisting the division out of a
+/// per-row routing loop.
+#[inline]
+pub fn build_w_map(num_workers: usize) -> [usize; PARTITION_COUNT] {
+    let mut map = [0usize; PARTITION_COUNT];
+    for (p, item) in map.iter_mut().enumerate() {
+        *item = worker_for_partition(p, num_workers);
+    }
+    map
 }
 
 // Two distinct key spaces derive a `u128` from a column. They coincide for

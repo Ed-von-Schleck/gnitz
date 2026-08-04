@@ -1119,8 +1119,8 @@ impl CatalogEngine {
             } else {
                 let schema = sys_tab_schema(tid);
                 let mem = batch.as_mem_batch();
-                undo_create.push((tid, Batch::from_indexed_rows(&mem, &created, &schema)));
-                undo_drop.push((tid, Batch::from_indexed_rows(&mem, &dropped, &schema)));
+                undo_create.push((tid, Batch::from_indexed_rows(&mem, &created, &[], &schema)));
+                undo_drop.push((tid, Batch::from_indexed_rows(&mem, &dropped, &[], &schema)));
             }
         }
 

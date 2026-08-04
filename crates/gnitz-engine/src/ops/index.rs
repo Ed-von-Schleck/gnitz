@@ -5,7 +5,7 @@ use crate::schema::{type_code, ColumnLocator, DerivedSchema, SchemaColumn, Schem
 use crate::storage::Batch;
 use gnitz_wire::AggFunc;
 
-use super::util::GroupKeyExtractor;
+use super::reindex::ReindexPacker;
 
 // ---------------------------------------------------------------------------
 // Public descriptor types
@@ -22,21 +22,22 @@ use super::util::GroupKeyExtractor;
 /// `for_max`/type the same way the reduce read side does, so the two cannot
 /// drift.
 pub struct AviBake {
-    pub(crate) extractor: GroupKeyExtractor,
+    /// Packs a row's group columns into the AVI key's leading OPK prefix. The
+    /// same packer that stamps a reindexed `_join_pk`, so the prefix is the OPK
+    /// image `AviBake::schema` declares — one byte comparison orders it.
+    pub(crate) key_packer: ReindexPacker,
     pub(crate) schema: SchemaDescriptor,
-    pub(crate) aggs: Vec<AggDescriptor>,
-    /// Parallel to `aggs`: each aggregate column's location in the reduce's
-    /// input schema.
-    pub(crate) agg_locs: Vec<ColumnLocator>,
+    /// Each value-indexed aggregate paired with its column's location in the
+    /// reduce's input schema. Entry `j` is written under ordinal `j`.
+    pub(crate) aggs: Vec<(AggDescriptor, ColumnLocator)>,
 }
 
 impl AviBake {
     pub(crate) fn new(src: &SchemaDescriptor, group_by_cols: &[u32], aggs: &[AggDescriptor]) -> Self {
         AviBake {
-            extractor: GroupKeyExtractor::new(src, group_by_cols),
+            key_packer: avi_key_packer(src, group_by_cols),
             schema: make_avi_schema(src, group_by_cols),
-            aggs: aggs.to_vec(),
-            agg_locs: aggs.iter().map(|d| src.locate(d.col_idx as usize)).collect(),
+            aggs: aggs.iter().map(|d| (*d, src.locate(d.col_idx as usize))).collect(),
         }
     }
 }
@@ -85,6 +86,19 @@ pub(crate) fn make_avi_schema(src: &SchemaDescriptor, group_by_cols: &[u32]) -> 
     b.finish()
 }
 
+/// The packer that fills an AVI key's group prefix. Each column carries its own
+/// source type as the promotion target, so a slot is the plain OPK image of the
+/// column at the width [`make_avi_schema`] declares for it. `avi_group_key_eligible`
+/// has already excluded nullable and non-PK-eligible group columns, so every slot
+/// reads a present, fixed-width value.
+pub(crate) fn avi_key_packer(src: &SchemaDescriptor, group_by_cols: &[u32]) -> ReindexPacker {
+    let tcs: Vec<u8> = group_by_cols
+        .iter()
+        .map(|&c| src.columns[c as usize].type_code)
+        .collect();
+    ReindexPacker::new(src, group_by_cols, &tcs)
+}
+
 // ---------------------------------------------------------------------------
 // op_integrate_with_indexes
 // ---------------------------------------------------------------------------
@@ -126,14 +140,14 @@ pub fn op_integrate_with_indexes(
         // raises it. Capacity is one entry per (row × value-indexed aggregate).
         let mut avi_batch = Batch::with_capacity(bake.schema, batch.count * num_aggs);
 
-        let extractor = &bake.extractor;
-        let n = extractor.stride;
+        let packer = &bake.key_packer;
+        let n = packer.out_stride;
         let mut key = [0u8; crate::schema::MAX_PK_BYTES];
         let mut pk_scratch = [0u8; 16];
         for row in 0..batch.count {
             let weight = mb.get_weight(row);
-            extractor.gather(&mb, row, &mut key);
-            for (j, (d, loc)) in bake.aggs.iter().zip(&bake.agg_locs).enumerate() {
+            packer.pack_into(&mut key[..n], &mb, row);
+            for (j, (d, loc)) in bake.aggs.iter().enumerate() {
                 // PK is never null; a NULL payload aggregate is skipped for this
                 // ordinal (the seek then misses → MIN/MAX renders NULL).
                 if loc.is_null(&mb, row) {
@@ -149,7 +163,7 @@ pub fn op_integrate_with_indexes(
                 // through the same accessor).
                 let av_u64 = super::util::encode_ordered(
                     loc.native_le_bytes(&mb, row, &mut pk_scratch),
-                    d.col_type_code as u8,
+                    d.col_type_code,
                     d.agg_op == AggFunc::Max,
                 );
                 // Serialise the order-encoded value big-endian: the index orders
@@ -184,7 +198,7 @@ mod avi_encode_tests {
     use crate::storage::Batch;
 
     fn decode_i32(enc: u64, for_max: bool) -> i32 {
-        decode_ordered(enc, TypeCode::I32, for_max) as i32
+        decode_ordered(if for_max { !enc } else { enc }, TypeCode::I32) as i32
     }
 
     // A signed aggregate (PK or payload) must encode order-preservingly so the
@@ -194,7 +208,7 @@ mod avi_encode_tests {
         let vals: [i32; 5] = [i32::MIN, -100, -1, 0, 1_000_000];
         let enc: Vec<u64> = vals
             .iter()
-            .map(|v| encode_ordered(&v.to_le_bytes(), type_code::I32, false))
+            .map(|v| encode_ordered(&v.to_le_bytes(), TypeCode::I32, false))
             .collect();
         for w in enc.windows(2) {
             assert!(w[0] < w[1], "ascending i32 must encode to ascending u64");
@@ -207,8 +221,8 @@ mod avi_encode_tests {
     // for_max inverts the order so the ascending walk yields MAX first.
     #[test]
     fn for_max_inverts_order() {
-        let lo = encode_ordered(&(-5i32).to_le_bytes(), type_code::I32, true);
-        let hi = encode_ordered(&100i32.to_le_bytes(), type_code::I32, true);
+        let lo = encode_ordered(&(-5i32).to_le_bytes(), TypeCode::I32, true);
+        let hi = encode_ordered(&100i32.to_le_bytes(), TypeCode::I32, true);
         assert!(lo > hi, "for_max: larger value must encode smaller");
         assert_eq!(decode_i32(hi, true), 100);
     }
@@ -218,7 +232,7 @@ mod avi_encode_tests {
         let vals: [f32; 4] = [-2.5, -0.5, 0.5, 2.5];
         let enc: Vec<u64> = vals
             .iter()
-            .map(|v| encode_ordered(&v.to_bits().to_le_bytes(), type_code::F32, false))
+            .map(|v| encode_ordered(&v.to_bits().to_le_bytes(), TypeCode::F32, false))
             .collect();
         for w in enc.windows(2) {
             assert!(w[0] < w[1], "ascending f32 must encode to ascending u64");
@@ -228,7 +242,7 @@ mod avi_encode_tests {
     #[test]
     fn unsigned_encoding_is_raw_value() {
         let v: u32 = 0xABCD_1234;
-        let enc = encode_ordered(&v.to_le_bytes(), type_code::U32, false);
+        let enc = encode_ordered(&v.to_le_bytes(), TypeCode::U32, false);
         assert_eq!(enc, v as u64);
     }
 
@@ -273,7 +287,7 @@ mod avi_encode_tests {
         // The AVI value image exactly as `op_integrate_with_indexes` builds it.
         let encode_at = |loc: &crate::schema::ColumnLocator, row: usize, for_max: bool| {
             let mut scratch = [0u8; 16];
-            encode_ordered(loc.native_le_bytes(&mb, row, &mut scratch), tc as u8, for_max)
+            encode_ordered(loc.native_le_bytes(&mb, row, &mut scratch), tc, for_max)
         };
         let loc_pk = schema.locate(1);
         let loc_pl = schema.locate(2);
@@ -303,7 +317,7 @@ mod avi_encode_tests {
                 // (sign-extended for signed, zero-extended for unsigned).
                 let expected = if signed { (v as i64) as u64 } else { v as u64 };
                 assert_eq!(
-                    decode_ordered(enc_pk, tc, for_max),
+                    decode_ordered(if for_max { !enc_pk } else { enc_pk }, tc),
                     expected,
                     "round-trip through decode_ordered (v={v}, for_max={for_max})",
                 );

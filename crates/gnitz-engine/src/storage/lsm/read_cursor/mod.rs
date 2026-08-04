@@ -797,7 +797,7 @@ impl ReadCursor {
     }
 
     /// Approximate the number of rows remaining in this cursor (upper bound).
-    /// Used by the adaptive-swap heuristic in join operators.
+    #[cfg(test)]
     pub fn estimated_length(&self) -> usize {
         self.states.iter().map(|s| s.count.saturating_sub(s.position)).sum()
     }

@@ -276,7 +276,7 @@ non-positive per `distinct`: weight > 0 → 1, else 0).
 weight -1, new at +1.
 - **SUM, COUNT are linear:** `Agg(A+B) = Agg(A) + Agg(B)`, so
   `new = old + delta_contribution`. No history replay; consolidation of
-  input delta skippable (`reduce.py` fast path, lines 460–465).
+  the input delta is skippable.
 - **MIN, MAX are non-linear:** retraction of current min/max requires
   the next value from history. Uses optional AggValueIndex for
   O(log N + 1) lookup instead of full trace scan.
@@ -329,9 +329,9 @@ Merges N sorted batches via min-heap (tournament tree) ordered by
 > `merge_batches` iterates each batch linearly via `MemBatchCursor`.
 > If a batch is unsorted, the cursor produces entries out of order,
 > the heap delivers non-adjacent duplicates, and the pending-group
-> algorithm silently produces wrong weights. The Rust
-> `Table::upsert_and_maybe_flush` defensively re-sorts batches
-> as a safety net.
+> algorithm silently produces wrong weights. `Table::ingest_owned_batch`
+> runs every batch through `into_consolidated`, which short-circuits on a
+> batch already certified `Consolidated`.
 
 > **The heap MUST use payload-aware comparison.** PK-only ordering
 > interleaves rows with same PK but different payloads across cursors,
@@ -358,9 +358,8 @@ columns in schema order, skipping pk_index:
 **F64/F32 NaN:** all row-comparison helpers use `f64::total_cmp` /
 `f32::total_cmp`, which imposes a strict total order on IEEE-754 values
 (including NaN bit-pattern ordering). This applies to `compare_rows` on
-the canonical merge path as well as the non-merge sort helpers
-(`compare_cursor_payload_to_batch_row` in `ops/util.rs` and
-`compare_by_group_cols` in `ops/reduce.rs`). Transitivity holds for all
+the canonical merge path as well as the non-merge sort helper
+`compare_by_group_cols` (`ops/reduce/sort.rs`). Transitivity holds for all
 inputs, including NaN.
 
 ## 6. The Region Convention

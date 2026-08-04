@@ -263,8 +263,8 @@ fn recover_from_sal(
                 // what the master would have written to this rank's slot: same
                 // distribution-prefix hash, same partition→worker map.
                 let mb = batch.as_mem_batch();
-                crate::ops::with_worker_indices(&batch, &schema, num_workers as usize, |wi| {
-                    Batch::from_indexed_rows(&mb, &wi[rank as usize], &schema)
+                crate::runtime::master::scatter::with_worker_indices(&batch, &schema, num_workers as usize, |wi| {
+                    Batch::from_indexed_rows(&mb, &wi[rank as usize], &[], &schema)
                 })
             } else {
                 batch

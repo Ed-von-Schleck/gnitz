@@ -1,7 +1,7 @@
 //! DBSP distinct operator.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{compare_rows, scatter_copy, write_to_batch, Batch, Layout, ReadCursor};
+use crate::storage::{compare_rows, Batch, Layout, ReadCursor};
 
 use super::cogroup::cogroup_left;
 
@@ -85,15 +85,7 @@ pub fn op_weight_clamp(
     });
 
     // 3. Scatter-copy emitting rows
-    if emit_indices.is_empty() {
-        return (Batch::empty_with_schema(schema), consolidated);
-    }
-
-    let mb = consolidated.as_mem_batch();
-    let blob_cap = mb.blob.len().max(1);
-    let mut output = write_to_batch(schema, emit_indices.len(), blob_cap, |writer| {
-        scatter_copy(&mb, &emit_indices, &emit_weights, writer);
-    });
+    let mut output = Batch::from_indexed_rows(&consolidated.as_mem_batch(), &emit_indices, &emit_weights, schema);
     // Emitting rows are scattered in consolidated-delta order (ascending indices),
     // one per transitioning element ⇒ (PK, payload)-sorted and ghost-free.
     output.certify_layout(Layout::Consolidated, schema);
@@ -254,7 +246,7 @@ mod tests {
         b
     }
 
-    // Regression tests for compare_cursor_payload_to_batch_row with sub-64-bit
+    // Regression tests for the payload comparator with sub-64-bit
     // integer payload columns. Previously panicked on try_into().unwrap() because
     // the slice had fewer than 8 bytes.
 

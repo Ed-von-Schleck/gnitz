@@ -133,7 +133,7 @@ impl CatalogEngine {
         let mut indices: Vec<u32> = Vec::with_capacity(batch.count);
         indices.extend((0..batch.count).filter(|&i| batch.get_weight(i) < 0).map(|i| i as u32));
         indices.extend((0..batch.count).filter(|&i| batch.get_weight(i) > 0).map(|i| i as u32));
-        Some(Batch::from_indexed_rows(&batch.as_mem_batch(), &indices, schema))
+        Some(Batch::from_indexed_rows(&batch.as_mem_batch(), &indices, &[], schema))
     }
 
     /// Whether `pk_bytes` (the OPK key) names a *net-live* row in `family`'s

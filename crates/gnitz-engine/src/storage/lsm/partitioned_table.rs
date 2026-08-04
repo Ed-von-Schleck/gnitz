@@ -264,7 +264,7 @@ impl PartitionedTable {
                 let Some(local) = self.local_slot(p) else {
                     return Err(misrouted_rows(part_indices[p].len(), p, self.routing));
                 };
-                let sub_batch = Batch::from_indexed_rows(&mb, &part_indices[p], &self.schema);
+                let sub_batch = Batch::from_indexed_rows(&mb, &part_indices[p], &[], &self.schema);
                 self.tables[local].ingest_owned_batch(sub_batch)?;
             }
             Ok(())

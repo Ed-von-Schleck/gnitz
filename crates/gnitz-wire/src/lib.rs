@@ -196,6 +196,32 @@ pub fn null_word_set(word: &mut u64, pi: usize, is_null: bool) {
     }
 }
 
+/// Null word with the low `npc` payload bits set — "all `npc` payload columns
+/// are null". `npc` reaches the row-major cap of 64 only when a schema has
+/// exactly 64 payload columns; `1u64 << 64` would panic in debug builds, so
+/// that boundary returns all-ones directly.
+#[inline]
+pub fn all_payload_null_mask(npc: usize) -> u64 {
+    if npc < 64 {
+        (1u64 << npc) - 1
+    } else {
+        u64::MAX
+    }
+}
+
+/// Concatenate two rows' null words for an output row laid out as
+/// `[left payload..., right payload...]`. The right bits shift up by `left_npc`.
+/// `left_npc` reaches 64 only when the right side has no payload columns, in
+/// which case `right` is 0 and the dropped shift is a no-op.
+#[inline]
+pub fn merge_null_words(left: u64, right: u64, left_npc: usize) -> u64 {
+    if left_npc < 64 {
+        left | (right << left_npc)
+    } else {
+        left
+    }
+}
+
 // `write_u32_le` has only in-crate callers (the WAL framer and the control-block
 // encoder), so it stays crate-internal rather than widening the public surface
 // with a dead export.

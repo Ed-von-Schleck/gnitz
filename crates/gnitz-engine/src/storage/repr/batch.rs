@@ -1220,15 +1220,72 @@ impl Batch {
         total
     }
 
-    /// Scatter-copy selected rows from a MemBatch into a new Batch.
-    pub fn from_indexed_rows(batch: &MemBatch, indices: &[u32], schema: &SchemaDescriptor) -> Self {
+    /// Scatter-copy selected rows from a MemBatch into a new Batch. An empty
+    /// `weights` keeps each source row's own weight; otherwise `weights[i]` is
+    /// written for `indices[i]` (and a zero one drops the row) — `scatter_copy`'s
+    /// contract.
+    pub fn from_indexed_rows(batch: &MemBatch, indices: &[u32], weights: &[i64], schema: &SchemaDescriptor) -> Self {
         if indices.is_empty() {
             return Self::empty_with_schema(schema);
         }
         let blob_cap = batch.blob.len().max(1);
         write_to_batch(schema, indices.len(), blob_cap, |writer| {
-            super::scatter::scatter_copy(batch, indices, &[], writer);
+            super::scatter::scatter_copy(batch, indices, weights, writer);
         })
+    }
+
+    /// Copy every row into `out_schema`, which must extend this batch's schema
+    /// with extra trailing payload columns, filling those columns with NULL.
+    /// The PK region, weights and existing payload columns carry over verbatim,
+    /// so the layout does too.
+    ///
+    /// `out_schema` must share this batch's PK stride and have at least as many
+    /// payload columns; the caller states the input schema because a `Batch`
+    /// carries only its region strides.
+    pub fn widened_with_null_tail(&self, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> Self {
+        debug_assert_eq!(out_schema.pk_stride(), in_schema.pk_stride());
+        let in_npc = in_schema.num_payload_cols();
+        let out_npc = out_schema.num_payload_cols();
+        debug_assert!(out_npc >= in_npc);
+        let n = self.count;
+        if n == 0 {
+            return Self::empty_with_schema(out_schema);
+        }
+
+        let mut output = Self::with_capacity(*out_schema, n);
+        output.count = n;
+
+        // Share the input heap so long (> 12 byte) STRING/BLOB values, whose
+        // 16-byte structs are copied verbatim below, still resolve. Sharing an
+        // empty blob is a no-op, so no emptiness guard.
+        if in_schema.has_german_string() {
+            output.share_blob_from(self);
+        }
+
+        output.pk_data_mut().copy_from_slice(self.pk_data());
+        output.weight_data_mut().copy_from_slice(self.weight_data());
+        for (pi, col) in in_schema.payload_columns() {
+            let stride = col.size() as usize;
+            output
+                .col_data_mut(pi)
+                .copy_from_slice(&self.col_data(pi)[..n * stride]);
+        }
+
+        // A NULL cell is zero — the invariant `DirectWriter::write_row` and
+        // `BatchBuilder::put_null` uphold actively. Zeroing just the appended
+        // columns keeps every counted row fully written without provisioning the
+        // whole arena zeroed (see `Batch::with_capacity`).
+        for pi in in_npc..out_npc {
+            output.col_data_mut(pi).fill(0);
+        }
+        let tail_null_bits = gnitz_wire::all_payload_null_mask(out_npc - in_npc);
+        for row in 0..n {
+            let out_null = gnitz_wire::merge_null_words(self.get_null_word(row), tail_null_bits, in_npc);
+            output.set_null_word(row, out_null);
+        }
+
+        output.inherit_layout(self);
+        output
     }
 
     /// Clone all buffers into a new independent Batch.

@@ -6,7 +6,7 @@
 //! arity and width. `ReindexPacker` / `german_string_promote_key` are per-row;
 //! they stay `#[inline]` and monomorphic so producer and consumer keys agree.
 
-use crate::foundation::xxh;
+use crate::foundation::xxh::{self, RowHasher};
 use crate::schema::{ColumnLocator, SchemaDescriptor};
 use crate::storage::{Batch, MemBatch};
 
@@ -26,45 +26,56 @@ use crate::storage::{Batch, MemBatch};
 /// same element and silently coalesce in DISTINCT/EXCEPT/INTERSECT. This is an
 /// accepted tradeoff for the synthetic-PK set-op path, not a checked error.
 pub(super) fn reindex_hash_row(out_schema: &SchemaDescriptor, output: &mut Batch, branch_id: u8) {
-    use xxhash_rust::xxh3::Xxh3Default;
     let n = output.count;
-    let mut pks: Vec<u128> = Vec::with_capacity(n);
-    {
-        let mb = output.as_mem_batch();
-        // ~280-byte stack-allocated streaming hasher; `reset()` between rows
-        // costs only a handful of word stores, and fixed-width columns are fed
-        // straight from the column slot with no intermediate copy.
-        let mut hasher = Xxh3Default::new();
-        for row in 0..n {
-            hasher.reset();
-            // Branch discriminator: distinguishes identical payloads arriving on
-            // the left vs right side of a UNION ALL so they do not collide to a
-            // single PK (which would collapse their +2 weight to +1).
-            hasher.update(&[branch_id]);
-            let null_word = mb.get_null_word(row);
-            for (pi, col) in out_schema.payload_columns() {
-                let is_null = gnitz_wire::null_word_get(null_word, pi);
-                hasher.update(&[is_null as u8]);
-                if is_null {
-                    continue;
+    debug_assert!(
+        out_schema.pk_stride() as usize <= 16,
+        "reindex_hash_row: synthetic key stride {} > 16",
+        out_schema.pk_stride()
+    );
+    // Hashing borrows the batch immutably and the write-back needs it mutably, so
+    // the two cannot interleave per row. Buffering a chunk of keys on the stack
+    // keeps both passes in cache and costs no allocation, whatever `n` is.
+    const CHUNK: usize = 256;
+    let mut keys = [0u128; CHUNK];
+    let mut start = 0;
+    while start < n {
+        let end = (start + CHUNK).min(n);
+        {
+            let mb = output.as_mem_batch();
+            // ~280-byte stack-allocated streaming hasher; `reset()` between rows
+            // costs only a handful of word stores, and fixed-width columns are fed
+            // straight from the column slot with no intermediate copy.
+            let mut hasher = RowHasher::new();
+            for row in start..end {
+                hasher.reset();
+                // Branch discriminator: distinguishes identical payloads arriving
+                // on the left vs right side of a UNION ALL so they do not collide
+                // to a single PK (which would collapse their +2 weight to +1).
+                hasher.update(&[branch_id]);
+                let null_word = mb.get_null_word(row);
+                for (pi, col) in out_schema.payload_columns() {
+                    let is_null = gnitz_wire::null_word_get(null_word, pi);
+                    hasher.update(&[is_null as u8]);
+                    if is_null {
+                        continue;
+                    }
+                    if gnitz_wire::is_german_string(col.type_code) {
+                        let sb = mb.get_col_ptr(row, pi, 16);
+                        super::util::hash_german_string_content(&mut hasher, sb, mb.blob);
+                    } else {
+                        let cs = col.size() as usize;
+                        hasher.update(mb.get_col_ptr(row, pi, cs));
+                    }
                 }
-                if gnitz_wire::is_german_string(col.type_code) {
-                    let sb = mb.get_col_ptr(row, pi, 16);
-                    super::util::hash_german_string_content(&mut hasher, sb, mb.blob);
-                } else {
-                    let cs = col.size() as usize;
-                    hasher.update(mb.get_col_ptr(row, pi, cs));
-                }
+                keys[row - start] = hasher.digest128();
             }
-            pks.push(hasher.digest128());
         }
-    }
-    let stride = out_schema.pk_stride() as usize;
-    debug_assert!(stride <= 16, "reindex_hash_row: synthetic key stride {stride} > 16");
-    for (row, pk) in pks.iter().enumerate() {
-        // Synthetic U128 (unsigned): OPK == big-endian, which `set_pk_at` writes
-        // right-aligned into the stride (and debug-checks fits in it).
-        output.set_pk_at(row, *pk);
+        for row in start..end {
+            // Synthetic U128 (unsigned): OPK == big-endian, which `set_pk_at`
+            // writes right-aligned into the stride (and debug-checks fits in it).
+            output.set_pk_at(row, keys[row - start]);
+        }
+        start = end;
     }
 }
 
@@ -200,12 +211,11 @@ impl ColPromoter {
 /// drives both `op_map` (which writes the synthetic `_join_pk` at emission) and
 /// the exchange scatter (which routes the raw delta by the same key), so the
 /// reindexed trace side and the delta scatter side co-partition byte-for-byte at
-/// every key arity and width. At arity 1 the output is byte-identical to the
-/// retained `#[cfg(test)] PkPromoter::promote_into` oracle.
-pub(super) struct ReindexPacker {
+/// every key arity and width.
+pub(crate) struct ReindexPacker {
     cols: [ColPromoter; crate::schema::MAX_PK_COLUMNS], // first `num_cols` valid
     num_cols: usize,
-    pub(super) out_stride: usize,
+    pub(crate) out_stride: usize,
 }
 
 impl ReindexPacker {
@@ -214,7 +224,7 @@ impl ReindexPacker {
     /// for Pk/Narrow ints, 16 for floats/Wide/String) — exactly the widths
     /// `reindex_output_schema` lays out. Offsets are the running sum (tightly
     /// packed, no inter-column padding, matching `Schema::pk_stride()`).
-    pub(super) fn new(schema: &SchemaDescriptor, reindex_cols: &[u32], target_tcs: &[u8]) -> Self {
+    pub(crate) fn new(schema: &SchemaDescriptor, reindex_cols: &[u32], target_tcs: &[u8]) -> Self {
         // Hard `assert!` (not `debug_assert!`): the scatter-side construction
         // (exchange.rs) is not covered by `emit_node`'s compile-time guard, so
         // these bounds must hold in release too. Each runs once per packer (out
@@ -275,7 +285,7 @@ impl ReindexPacker {
 
     /// Pack the full `_join_pk` (out_stride OPK bytes) for `row` into `dst`.
     #[inline]
-    pub(super) fn pack_into(&self, dst: &mut [u8], batch: &MemBatch, row: usize) {
+    pub(crate) fn pack_into(&self, dst: &mut [u8], batch: &MemBatch, row: usize) {
         for cp in &self.cols[..self.num_cols] {
             cp.write_into(&mut dst[cp.out_off..cp.out_off + cp.out_size], batch, row);
         }

@@ -6,13 +6,14 @@
 
 use crate::schema::{type_code, ColumnLocator, DerivedSchema, ReduceOutKey, SchemaColumn, SchemaDescriptor, TypeCode};
 
-use super::super::util::{GroupKeyCols, GroupKeyExtractor};
+use super::super::reindex::ReindexPacker;
+use super::super::util::GroupKeyCols;
 use super::agg::AggDescriptor;
 use super::sort::packed_sort_spec;
 use gnitz_wire::AggFunc;
 
-/// The single shared typing rule (`gnitz_wire::agg_output_type`), taking the
-/// typed `TypeCode` its engine callers hold rather than a raw code.
+/// The shared typing rule (`gnitz_wire::agg_output_type`), taking the typed
+/// `TypeCode` its engine callers hold rather than a raw code.
 pub(crate) const fn agg_output_type(agg_op: AggFunc, col_type_code: TypeCode) -> u8 {
     gnitz_wire::agg_output_type(agg_op, col_type_code as u8)
 }
@@ -108,7 +109,7 @@ pub struct ReducePlan {
     pub(super) agg_locs: Vec<ColumnLocator>,
     /// AVI group-key gatherer for the combined-index read path; `Some` iff the
     /// instruction carries a value-index table.
-    pub(super) avi_extractor: Option<GroupKeyExtractor>,
+    pub(super) avi_key_packer: Option<ReindexPacker>,
     /// Baked group-key hasher for the non-linear no-index fallback's
     /// per-trace-row routing; `Some` exactly on that path.
     pub(super) fallback_keys: Option<GroupKeyCols>,
@@ -117,14 +118,9 @@ pub struct ReducePlan {
     /// First aggregate column's logical index (aggregates are the trailing
     /// output columns, so this holds at any PK arity).
     pub(crate) cbase: usize,
-    /// Group-exemplar output columns, in payload order: a verbatim copy of the
-    /// input group column read through its pre-resolved locator (whose type code
-    /// and width are the emit dispatch and copy width). These are the *leading*
-    /// payload columns and the aggregates the trailing ones, so exemplar `j` sits
-    /// at payload index `j` and aggregate `k` at `exemplar_locs.len() + k`. Empty
-    /// unless the output key is `SyntheticFold` — either natural key spells the
-    /// group value into the PK region itself.
-    pub(super) exemplar_locs: Vec<ColumnLocator>,
+    /// Whether the output key is `ReduceOutKey::SyntheticFold` — the only shape
+    /// that carries group-exemplar payload columns (see [`Self::exemplar_locs`]).
+    pub(super) synthetic_key: bool,
 }
 
 impl ReducePlan {
@@ -159,8 +155,9 @@ impl ReducePlan {
                 .any(|d| d.agg_op.uses_value_index() && !d.col_type_code.is_float());
 
         // A group exists iff its net cardinality (row weight) is positive; the
-        // unique NULL-blind COUNT carries that signal. All three disjuncts are
-        // load-bearing — see the emission gate in `op_reduce`.
+        // unique NULL-blind COUNT carries that signal. The disjunction spells the
+        // planner shapes that promise a companion COUNT (see the field doc); any
+        // other shape falls back to the touched-ness test in `op_reduce`.
         let cardinality_idx: Option<u8> = (all_linear || !group_by_cols.is_empty() || global_ground)
             .then(|| agg_descs.iter().position(|d| d.agg_op == AggFunc::Count))
             .flatten()
@@ -176,7 +173,7 @@ impl ReducePlan {
             .iter()
             .map(|d| input_schema.locate(d.col_idx as usize))
             .collect();
-        let avi_extractor = has_avi.then(|| GroupKeyExtractor::new(input_schema, group_by_cols));
+        let avi_key_packer = has_avi.then(|| super::super::index::avi_key_packer(input_schema, group_by_cols));
         let fallback_keys =
             (!all_linear && !has_avi && !group_by_pk).then(|| GroupKeyCols::new(input_schema, group_by_cols));
 
@@ -189,14 +186,10 @@ impl ReducePlan {
         // synthetic-fold output has exactly one per group column, in order, ahead
         // of the trailing aggregates. The assertion pins that layout — it is what
         // makes the emitters positional (exemplar `j` at payload index `j`,
-        // aggregate `k` at `exemplar_locs.len() + k`) with no per-column role tag.
-        let exemplar_locs: Vec<ColumnLocator> = if use_natural_pk {
-            Vec::new()
-        } else {
-            group_by_cols.iter().map(|&c| input_schema.locate(c as usize)).collect()
-        };
+        // aggregate `k` at `exemplar_locs().len() + k`) with no per-column role tag.
+        let num_exemplars = if use_natural_pk { 0 } else { group_by_cols.len() };
         assert_eq!(
-            exemplar_locs.len() + num_aggs,
+            num_exemplars + num_aggs,
             output_schema.num_payload_cols(),
             "reduce output schema must be [key columns…, group exemplars…, aggregates…]",
         );
@@ -240,11 +233,29 @@ impl ReducePlan {
             sort_descs,
             packed_sort,
             agg_locs,
-            avi_extractor,
+            avi_key_packer,
             fallback_keys,
             agg_col_widths,
             cbase,
-            exemplar_locs,
+            synthetic_key: !use_natural_pk,
+        }
+    }
+
+    /// Group-exemplar output columns, in payload order: a verbatim copy of the
+    /// input group column read through its pre-resolved locator (whose type code
+    /// and width are the emit dispatch and copy width). These are the *leading*
+    /// payload columns and the aggregates the trailing ones, so exemplar `j` sits
+    /// at payload index `j` and aggregate `k` at `exemplar_locs().len() + k`.
+    /// Empty unless the output key is `SyntheticFold` — either natural key spells
+    /// the group value into the PK region itself. Otherwise these are exactly the
+    /// group-column locators `sort_descs` already holds: `SyntheticFold` is not
+    /// `PkPermutation`, so that field is the same non-empty `locate(group_cols)`.
+    #[inline]
+    pub(super) fn exemplar_locs(&self) -> &[ColumnLocator] {
+        if self.synthetic_key {
+            &self.sort_descs
+        } else {
+            &[]
         }
     }
 }

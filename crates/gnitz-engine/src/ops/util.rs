@@ -1,96 +1,10 @@
 //! Shared helpers used by ≥2 sub-modules.
 
-use xxhash_rust::xxh3::Xxh3Default;
+use crate::foundation::xxh::RowHasher;
 
-use crate::schema::{type_code, ColumnLocator, SchemaDescriptor, TypeCode};
+use crate::schema::{ColumnLocator, SchemaDescriptor, TypeCode};
 use crate::storage::ReadCursor;
 use gnitz_expr::RowSource;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Merge a right-side null bitmap into a left-side bitmap for a composite output
-/// row laid out as `[left payload..., right payload...]`. The right bits shift
-/// up by `left_npc` (the left payload-column count). `right << 64` panics in
-/// debug builds; `left_npc` reaches 64 only when the right side has no payload
-/// columns, in which case `right` is 0 and the shift is a no-op.
-#[inline]
-pub(super) fn merge_null_words(left: u64, right: u64, left_npc: usize) -> u64 {
-    if left_npc < 64 {
-        left | (right << left_npc)
-    } else {
-        left
-    }
-}
-
-/// Null-bitmap word with the low `npc` payload bits set — i.e. "all `npc`
-/// payload columns are null". `npc` reaches the row-major cap of 64 only when a
-/// schema has exactly 64 payload columns; `1u64 << 64` is UB / debug-panics, so
-/// that boundary returns all-ones directly.
-#[inline]
-pub(crate) fn all_payload_null_mask(npc: usize) -> u64 {
-    if npc < 64 {
-        (1u64 << npc) - 1
-    } else {
-        u64::MAX
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Raw index/group column extractors
-// ---------------------------------------------------------------------------
-
-/// Precomputed gatherer for the byte-form AVI composite group key. Resolves
-/// each group column's layout once — baked into the reduce plan (read side)
-/// and the compiled program (`Program::avi_bakes`, write side); `gather`
-/// then concatenates raw bytes per row. Callers must have passed
-/// `query::compiler::avi_group_key_eligible` (fixed-width, non-nullable
-/// columns), so it never sees STRING/BLOB or a NULL.
-pub(crate) struct GroupKeyExtractor {
-    /// One [`ColumnLocator`] per group column, rather than a destructured twin:
-    /// `bytes` resolves the PK-vs-payload read in one match, which is what the
-    /// per-row loop needed, and a 4-byte `Copy` value keeps the vector dense.
-    cols: Vec<ColumnLocator>,
-    /// Total group-key width in bytes (the group stride).
-    pub(super) stride: usize,
-}
-
-impl GroupKeyExtractor {
-    pub(crate) fn new(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> Self {
-        let mut cols = Vec::with_capacity(group_by_cols.len());
-        let mut stride = 0;
-        for &c in group_by_cols {
-            let ci = c as usize;
-            // gather() reads each column's raw bytes unconditionally; a nullable
-            // column would let a NULL row's stale slot bytes form a phantom key.
-            // avi_group_key_eligible already excludes nullable/STRING/BLOB/float
-            // columns, but the constructor runs once per operator (not per row),
-            // so a hard assert here is free insurance against a future gate
-            // change silently corrupting group keys.
-            assert_eq!(
-                schema.columns[ci].nullable, 0,
-                "GroupKeyExtractor: group columns must be non-nullable",
-            );
-            let loc = schema.locate(ci);
-            stride += loc.size();
-            cols.push(loc);
-        }
-        Self { cols, stride }
-    }
-
-    /// Concatenate the group columns' raw little-endian bytes into `out` (which
-    /// must be at least `self.stride` long), in `group_by_cols` order.
-    #[inline]
-    pub(super) fn gather(&self, mb: &impl RowSource, row: usize, out: &mut [u8]) {
-        let mut off = 0;
-        for loc in &self.cols {
-            let src = loc.bytes(mb, row);
-            out[off..off + src.len()].copy_from_slice(src);
-            off += src.len();
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Order-preserving aggregate-value codec (AVI keys)
@@ -154,17 +68,20 @@ pub(super) fn ieee_order_bits_f32_reverse(encoded: u64) -> u32 {
 /// identically to the same value in a payload column. `for_max` inverts
 /// the order so the cursor's ascending walk yields the maximum first. Width is
 /// ≤ 8 (F32 is 4); U128/UUID/String/Blob are excluded upstream by
-/// `agg_value_idx_eligible`, so the fallback arm is unreachable.
+/// `agg_value_idx_eligible`.
 #[inline]
-pub(super) fn encode_ordered(bytes: &[u8], col_type_code: u8, for_max: bool) -> u64 {
+pub(super) fn encode_ordered(bytes: &[u8], col_type_code: TypeCode, for_max: bool) -> u64 {
     let val = match col_type_code {
-        type_code::F32 => ieee_order_bits_f32(u32::from_le_bytes(bytes[..4].try_into().unwrap())),
-        type_code::F64 => ieee_order_bits(u64::from_le_bytes(bytes[..8].try_into().unwrap())),
-        type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64 => gnitz_wire::read_unsigned_exact(bytes),
-        type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64 => {
+        TypeCode::F32 => ieee_order_bits_f32(u32::from_le_bytes(bytes[..4].try_into().unwrap())),
+        TypeCode::F64 => ieee_order_bits(u64::from_le_bytes(bytes[..8].try_into().unwrap())),
+        TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 => gnitz_wire::read_unsigned_exact(bytes),
+        TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
             (gnitz_wire::read_signed_exact(bytes) as u64).wrapping_add(1u64 << 63)
         }
-        other => unreachable!("AVI agg type {other} is not order-encodable (gated by agg_value_idx_eligible)"),
+        TypeCode::String | TypeCode::Blob | TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => unreachable!(
+            "AVI agg type {col_type_code:?} is not order-encodable (compile-rejected by \
+             agg_value_idx_eligible)"
+        ),
     };
     if for_max {
         !val
@@ -173,12 +90,12 @@ pub(super) fn encode_ordered(bytes: &[u8], col_type_code: u8, for_max: bool) -> 
     }
 }
 
-/// Inverse of [`encode_ordered`]: recover the original value's raw little-endian
-/// bits (IEEE bits for floats, two's-complement for signed, the value itself for
-/// unsigned) from its order-preserving u64 key.
+/// Inverse of [`encode_ordered`] at `for_max == false`: recover the original
+/// value's raw little-endian bits (IEEE bits for floats, two's-complement for
+/// signed, the value itself for unsigned). A `for_max` key is un-inverted by its
+/// reader before it gets here.
 #[inline]
-pub(super) fn decode_ordered(encoded: u64, col_type_code: TypeCode, for_max: bool) -> u64 {
-    let e = if for_max { !encoded } else { encoded };
+pub(super) fn decode_ordered(e: u64, col_type_code: TypeCode) -> u64 {
     match col_type_code {
         TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => (e as i64).wrapping_sub(1i64 << 63) as u64,
         TypeCode::F64 => ieee_order_bits_reverse(e),
@@ -208,7 +125,7 @@ pub(super) fn decode_ordered(encoded: u64, col_type_code: TypeCode, for_max: boo
 /// row-identity hash (`reindex_hash_row`); the two MUST agree byte-for-byte so a
 /// string key routes to — and dedups against — the partition it belongs to.
 #[inline]
-pub(super) fn hash_german_string_content(hasher: &mut Xxh3Default, struct_bytes: &[u8], blob: &[u8]) {
+pub(super) fn hash_german_string_content(hasher: &mut RowHasher, struct_bytes: &[u8], blob: &[u8]) {
     let content = gnitz_wire::german_string_content(struct_bytes, blob);
     hasher.update(&(content.len() as u32).to_le_bytes());
     hasher.update(content);
@@ -227,7 +144,7 @@ pub(super) fn hash_german_string_content(hasher: &mut Xxh3Default, struct_bytes:
 /// so every site agrees byte-for-byte with no embedded literal.
 #[inline]
 pub(crate) fn global_group_key() -> u128 {
-    Xxh3Default::new().digest128()
+    RowHasher::new().digest128()
 }
 
 /// Whether the group key of `group_by_cols` can be emitted through the
@@ -264,7 +181,7 @@ pub(super) fn single_col_canonical_group_key(schema: &SchemaDescriptor, group_by
 /// groups in the non-linear REDUCE fallback (wrong MIN/MAX).
 #[inline]
 fn hash_group_col<R: RowSource>(
-    hasher: &mut Xxh3Default,
+    hasher: &mut RowHasher,
     src: &R,
     row: usize,
     null_word: u64,
@@ -287,8 +204,10 @@ fn hash_group_col<R: RowSource>(
             hasher.update(&[1u8]); // non-null marker
             if gnitz_wire::is_german_string(type_code) {
                 // STRING and BLOB both hash length-prefixed content via the shared
-                // helper (matching reindex_hash_row); load-bearing for BLOB grouping
-                // keys, not only STRING. `size` is already 16 for them.
+                // helper (matching reindex_hash_row). BLOB takes this path too: it
+                // shares the 16-byte German-string struct, so hashing the struct
+                // instead of the content would key on a heap pointer. `size` is
+                // already 16 for both.
                 hash_german_string_content(hasher, src.get_col_ptr(row, slot as usize, size as usize), src.blob());
             } else {
                 // Canonical (sign-flipped/widened) value: a payload FK hashes like
@@ -331,10 +250,10 @@ pub(super) fn extract_group_key<R: RowSource>(
     // (a, b) ≠ (b, a) and (NULL, v) ≠ (v, NULL) without an explicit index byte,
     // and STRING content is length-prefixed so "ab"+"c" can't alias "a"+"bc".
     let null_word = src.get_null_word(row);
-    // Function-local streaming hasher: `Xxh3Default::new()` only copies the
+    // Function-local streaming hasher: `RowHasher::new()` only copies the
     // initial accumulator (the 256-byte buffer is `MaybeUninit`), so it is as
     // cheap as `reset()` — no thread-local or per-row reuse needed.
-    let mut hasher = Xxh3Default::new();
+    let mut hasher = RowHasher::new();
     for &c_idx_u32 in group_by_cols {
         let c_idx = c_idx_u32 as usize;
         hash_group_col(
@@ -382,7 +301,7 @@ impl GroupKeyCols {
             return self.cols[0].0.route_key(src, row);
         }
         let null_word = src.get_null_word(row);
-        let mut hasher = Xxh3Default::new();
+        let mut hasher = RowHasher::new();
         for &(loc, nullable) in &self.cols {
             hash_group_col(&mut hasher, src, row, null_word, loc, nullable);
         }

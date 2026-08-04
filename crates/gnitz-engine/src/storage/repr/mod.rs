@@ -2,8 +2,8 @@
 //! that work directly on it: region layout (`batch`), wire/shard serialization
 //! (`batch_wire`), TLS buffer recycling (`batch_pool`), the columnar comparators
 //! (`columnar`), sort-merge consolidation (`merge`), exchange repartition
-//! (`scatter`), the fused k-way merge kernel (`heap`), range-key helpers
-//! (`range_key`), the PK-probe filters (`bloom`, `xor8`), and the pure byte
+//! (`scatter`), the fused k-way merge kernel (`heap`), the PK-probe filters
+//! (`bloom`, `xor8`), and the pure byte
 //! codecs of the on-disk formats: the shard image (`shard_file`) and the
 //! shard-format constants (`layout`). The low-level WAL-block framer lives in
 //! `gnitz_wire::wal` (the one definition client and engine share); `batch_wire`
@@ -23,7 +23,6 @@ pub(super) mod columnar;
 pub(super) mod heap;
 pub(super) mod layout;
 pub(super) mod merge;
-pub(super) mod range_key;
 pub(super) mod scatter;
 pub(super) mod shard_file;
 pub(super) mod xor8;

@@ -1,37 +1,12 @@
-//! Exchange partition routing: `worker_for_partition`, `with_*_indices`,
-//! `RouteMode`, `scatter_is_pk_routed`, and the per-row routing-key helpers.
-
-use std::cell::RefCell;
+//! Exchange partition routing: `RouteMode`, `ScatterKey`, `scatter_is_pk_routed`,
+//! and the per-row routing-key helpers.
 
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, MemBatch};
-use gnitz_wire::{partition_for_key, partition_for_pk_bytes};
+use gnitz_wire::{build_w_map, partition_for_key, partition_for_pk_bytes};
 
 use super::super::reindex::ReindexPacker;
 use super::super::util::GroupKeyCols;
-
-// Thread-local pool: reuse Vec<Vec<u32>> index scratch across calls so
-// steady-state repartition/scatter ops allocate nothing for routing tables.
-thread_local! {
-    pub(super) static SCATTER_INDICES: RefCell<Vec<Vec<u32>>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Build a 256-entry partition→worker lookup table, hoisting the division out
-/// of the per-row loop. `partition_for_key` always returns values in 0..=255.
-#[inline]
-pub(super) fn build_w_map(num_workers: usize) -> [usize; 256] {
-    let mut map = [0usize; 256];
-    for (p, item) in map.iter_mut().enumerate() {
-        *item = worker_for_partition(p, num_workers);
-    }
-    map
-}
-
-#[inline]
-pub fn worker_for_partition(partition: usize, num_workers: usize) -> usize {
-    let chunk = 256 / num_workers;
-    (partition / chunk).min(num_workers - 1)
-}
 
 /// Keep only the rows this worker owns, by packed-PK partition — the trace-side
 /// counterpart of the **pure** range-join broadcast input relay. A pure range
@@ -65,7 +40,7 @@ pub(crate) fn op_partition_filter(batch: &Batch, schema: &SchemaDescriptor, work
             indices.push(i as u32);
         }
     }
-    let mut out = Batch::from_indexed_rows(&mb, &indices, schema);
+    let mut out = Batch::from_indexed_rows(&mb, &indices, &[], schema);
     // Filtering keeps the ascending row order and (PK, payload) distinctness of
     // the input, so the layout carries through unchanged (faithful propagate).
     out.inherit_layout(batch);
@@ -159,115 +134,20 @@ impl ScatterKey {
     }
 }
 
-/// Whether any key slot carries a cross-width promotion target (`tc != 0`). A
-/// promoted key packs at the wider `T` (via `ScatterKey::Packed`), so it must
-/// NOT take the native-PK fast-path (`scatter_is_pk_routed`).
-#[inline]
-pub(super) fn key_is_promoted(target_tcs: &[u8]) -> bool {
-    target_tcs.iter().any(|&tc| tc != 0)
-}
-
 /// One home for the relay-scatter "route by native PK bytes" gate: strict
 /// sequence equality with the schema's PK list (set equality would route a
 /// permuted compound PK differently from `partition_for_pk_bytes`, which
-/// hashes OPK bytes in schema order) AND no cross-width promotion (a promoted
-/// key packs at the wider `T`; its narrow source PK bytes must not route
-/// natively). Consulted once, in `ScatterKey::new`, so the relay scatter paths
-/// cannot drift.
+/// hashes OPK bytes in schema order) AND no cross-width promotion — a promoted
+/// key (`tc != 0`) packs at the wider `T` via `ScatterKey::Packed`, so its
+/// narrow source PK bytes must not route natively. Consulted once, in
+/// `ScatterKey::new`, so the relay scatter paths cannot drift.
 ///
-/// Deliberately NOT used by `fill_worker_indices`: the write-path scatter
-/// routes by the table's distribution prefix (`schema.partition_for_pk`), a
-/// different hash domain with no promotion concept.
+/// Deliberately NOT used by the write-path fan-out, which routes by the table's
+/// distribution prefix (`schema.partition_for_pk`) — a different hash domain
+/// with no promotion concept.
 #[inline]
 pub(super) fn scatter_is_pk_routed(col_indices: &[u32], target_tcs: &[u8], schema: &SchemaDescriptor) -> bool {
-    col_indices == schema.pk_indices() && !key_is_promoted(target_tcs)
-}
-
-/// Write-side table-key scatter fill: `partition_for_pk` hashes the table's
-/// **distribution prefix**, exactly as `PartitionedTable` ingest/probe do, so a
-/// row's DML scatter lands on the worker that owns its partition. The
-/// join-relay scatters route by the *join* key over a derived schema and call
-/// `partition_for_pk_bytes` directly (see `op_repartition_batches_mode`) — a
-/// different hash domain with no promotion concept.
-///
-/// Weight-0 rows are dropped: they are not Z-set elements, and a client is free
-/// to send one. Filtering here rather than by rebuilding the batch means every
-/// consumer of these indices reads the same row set for free.
-fn fill_worker_indices(batch: &Batch, schema: &SchemaDescriptor, num_workers: usize, out: &mut Vec<Vec<u32>>) {
-    let mb = batch.as_mem_batch();
-    let w_map = build_w_map(num_workers);
-    if out.len() < num_workers {
-        out.resize_with(num_workers, Vec::new);
-    }
-    out[..num_workers].iter_mut().for_each(Vec::clear);
-    for i in 0..batch.count {
-        if mb.get_weight(i) == 0 {
-            continue;
-        }
-        let partition = schema.partition_for_pk(mb.get_pk_bytes(i));
-        out[w_map[partition]].push(i as u32);
-    }
-}
-
-/// Compute per-worker row indices (by the table's distribution prefix, see
-/// [`fill_worker_indices`]) into the TLS pool and call `f` with a borrowed view.
-///
-/// `f` must not call `with_worker_indices` — the `SCATTER_INDICES` `RefCell` is
-/// already mutably borrowed.
-pub fn with_worker_indices<F, R>(batch: &Batch, schema: &SchemaDescriptor, num_workers: usize, f: F) -> R
-where
-    F: FnOnce(&[Vec<u32>]) -> R,
-{
-    SCATTER_INDICES.with(|pool| {
-        let mut worker_indices = pool.borrow_mut();
-        fill_worker_indices(batch, schema, num_workers, &mut worker_indices);
-        f(&worker_indices[..num_workers])
-    })
-}
-
-/// Broadcast sibling of [`fill_worker_indices`]: fills **every** worker's slot
-/// with **all** row indices instead of PK-partitioning them. Drops weight-0 rows
-/// for the same reason.
-fn fill_broadcast_indices(batch: &Batch, num_workers: usize, out: &mut Vec<Vec<u32>>) {
-    if out.len() < num_workers {
-        out.resize_with(num_workers, Vec::new);
-    }
-    let mb = batch.as_mem_batch();
-    out[..num_workers].iter_mut().for_each(Vec::clear);
-    for i in 0..batch.count {
-        if mb.get_weight(i) == 0 {
-            continue;
-        }
-        for wi in out[..num_workers].iter_mut() {
-            wi.push(i as u32);
-        }
-    }
-}
-
-/// The per-worker index fill a commit uses for `schema`: a full broadcast for a
-/// replicated relation, the PK-partitioned scatter otherwise. The one spelling of
-/// the write path's shape, so the SAL fit check and the emit that follows it
-/// cannot size the same batch differently.
-///
-/// A replicated table broadcasts because the same
-/// `scatter_wire_group(... FLAG_PUSH ...)` machinery then lands the whole batch in
-/// every worker's ingest + SAL slot (inheriting the atomic zone, LSN, ACK
-/// accounting, and the committer's single `fdatasync`), so every worker holds an
-/// identical full copy. Same TLS-pool reuse and borrow contract as
-/// [`with_worker_indices`].
-pub fn with_commit_indices<F, R>(batch: &Batch, schema: &SchemaDescriptor, num_workers: usize, f: F) -> R
-where
-    F: FnOnce(&[Vec<u32>]) -> R,
-{
-    SCATTER_INDICES.with(|pool| {
-        let mut worker_indices = pool.borrow_mut();
-        if schema.placement().is_replicated() {
-            fill_broadcast_indices(batch, num_workers, &mut worker_indices);
-        } else {
-            fill_worker_indices(batch, schema, num_workers, &mut worker_indices);
-        }
-        f(&worker_indices[..num_workers])
-    })
+    col_indices == schema.pk_indices() && target_tcs.iter().all(|&tc| tc == 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -296,7 +176,7 @@ mod tests {
             total_kept += out.count;
             for r in 0..out.count {
                 let pk = out.get_pk_bytes(r);
-                let owner = worker_for_partition(partition_for_pk_bytes(pk), num_workers as usize);
+                let owner = gnitz_wire::worker_for_partition(partition_for_pk_bytes(pk), num_workers as usize);
                 assert_eq!(owner as u32, wid, "row routed to wrong worker");
             }
         }
@@ -464,123 +344,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    // ── Master/worker routing symmetry over compound PKs ────────────────
-    //
-    // `with_worker_indices` (the master-side scatter, keyed by the table's
-    // distribution prefix `schema.partition_for_pk`) and
-    // `partition_for_pk_bytes` + `worker_for_partition` (the worker-side
-    // route) must agree on every row, or a pushed row lands on a worker that
-    // never owns its partition. (These schemas' distribution prefix is the
-    // whole PK, so the two hash domains coincide here by construction.)
-
-    fn u64_pk_col() -> SchemaColumn {
-        SchemaColumn::new(type_code::U64, 0)
-    }
-    fn u32_pk_col() -> SchemaColumn {
-        SchemaColumn::new(type_code::U32, 0)
-    }
-    fn i64_payload_col() -> SchemaColumn {
-        SchemaColumn::new(type_code::I64, 0)
-    }
-
-    fn make_batch_with_raw_pks(schema: &SchemaDescriptor, raw_pks: &[[u8; 16]]) -> Batch {
-        let mut b = Batch::with_capacity(*schema, raw_pks.len().max(1));
-        for pk in raw_pks {
-            b.extend_pk_bytes(pk);
-            b.extend_weight(&1i64.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &0i64.to_le_bytes());
-            b.count += 1;
-        }
-        b
-    }
-
-    #[test]
-    fn routing_symmetry_master_worker() {
-        use gnitz_wire::partition_for_pk_bytes;
-
-        let schema = SchemaDescriptor::new(&[u64_pk_col(), u64_pk_col(), i64_payload_col()], &[0, 1]);
-        let raw_pks: Vec<[u8; 16]> = (0u64..100)
-            .map(|i| {
-                let mut pk = [0u8; 16];
-                pk[..8].copy_from_slice(&i.wrapping_mul(13).wrapping_add(7).to_le_bytes());
-                pk[8..16].copy_from_slice(&i.wrapping_mul(97).wrapping_add(11).to_le_bytes());
-                pk
-            })
-            .collect();
-        let batch = make_batch_with_raw_pks(&schema, &raw_pks);
-        let num_workers = 4;
-
-        let mut master_workers = vec![0usize; batch.count];
-        with_worker_indices(&batch, &schema, num_workers, |worker_indices| {
-            for (w, row_indices) in worker_indices.iter().enumerate() {
-                for &row_idx in row_indices {
-                    master_workers[row_idx as usize] = w;
-                }
-            }
-        });
-
-        let worker_workers: Vec<usize> = (0..batch.count)
-            .map(|i| {
-                let p = partition_for_pk_bytes(batch.as_mem_batch().get_pk_bytes(i));
-                worker_for_partition(p, num_workers)
-            })
-            .collect();
-
-        assert_eq!(
-            master_workers, worker_workers,
-            "master and worker routing diverged for compound U64 PK",
-        );
-    }
-
-    #[test]
-    fn routing_symmetry_four_u32() {
-        use gnitz_wire::partition_for_pk_bytes;
-
-        let schema = SchemaDescriptor::new(
-            &[
-                u32_pk_col(),
-                u32_pk_col(),
-                u32_pk_col(),
-                u32_pk_col(),
-                i64_payload_col(),
-            ],
-            &[0, 1, 2, 3],
-        );
-        let raw_pks: Vec<[u8; 16]> = (0u32..100)
-            .map(|i| {
-                let mut pk = [0u8; 16];
-                pk[0..4].copy_from_slice(&i.to_le_bytes());
-                pk[4..8].copy_from_slice(&i.wrapping_mul(13).wrapping_add(7).to_le_bytes());
-                pk[8..12].copy_from_slice(&i.wrapping_mul(97).wrapping_add(11).to_le_bytes());
-                pk[12..16].copy_from_slice(&i.wrapping_mul(31).wrapping_add(3).to_le_bytes());
-                pk
-            })
-            .collect();
-        let b = make_batch_with_raw_pks(&schema, &raw_pks);
-        let num_workers = 4;
-
-        let mut master_workers = vec![0usize; b.count];
-        with_worker_indices(&b, &schema, num_workers, |worker_indices| {
-            for (w, row_indices) in worker_indices.iter().enumerate() {
-                for &row_idx in row_indices {
-                    master_workers[row_idx as usize] = w;
-                }
-            }
-        });
-
-        let worker_workers: Vec<usize> = (0..b.count)
-            .map(|i| {
-                let p = partition_for_pk_bytes(b.as_mem_batch().get_pk_bytes(i));
-                worker_for_partition(p, num_workers)
-            })
-            .collect();
-
-        assert_eq!(
-            master_workers, worker_workers,
-            "master and worker routing diverged for compound 4xU32 PK",
-        );
     }
 }

@@ -541,7 +541,7 @@ pub fn op_reduce(
             // still-positioned trace cursor into the accumulators.
             fold_old_aggs(&mut accs, trace_out_cursor, agg_descs, agg_col_widths, cbase);
         } else if !all_linear {
-            if let (Some(ref mut avi_c), Some(extractor)) = (&mut avi, &plan.avi_extractor) {
+            if let (Some(ref mut avi_c), Some(packer)) = (&mut avi, &plan.avi_key_packer) {
                 // Combined-index path. Fold the linear companions (SUM / the
                 // cardinality COUNT) off the still-positioned trace_out cursor —
                 // `new = old + Σdelta` — into their accumulators (a no-op for a new
@@ -558,8 +558,8 @@ pub fn op_reduce(
                 // aggregate's position in non-linear-descriptor order, matching the
                 // index's write side.
                 let mut gk = [0u8; crate::schema::MAX_PK_BYTES];
-                extractor.gather(&mb, group_start_idx, &mut gk);
-                let gstride = extractor.stride;
+                let gstride = packer.out_stride;
+                packer.pack_into(&mut gk[..gstride], &mb, group_start_idx);
                 // Ordinal `j` is the position among the value-indexed aggregates
                 // in descriptor order — selected by the same `uses_value_index`
                 // predicate, in the same order, the index write side used, so the

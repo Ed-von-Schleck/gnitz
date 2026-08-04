@@ -57,7 +57,7 @@ fn emit_agg_cols(output: &mut Batch, accs: &[Accumulator], plan: &ReducePlan, pi
 /// Emit one reduce output row — the +1 new-value row. Retractions are not built
 /// here; they are byte-copied from the stored row via `copy_current_row_into`.
 /// The output schema is `[key…, group exemplars…, aggregates…]`, so the two
-/// payload loops are positional against the plan's `exemplar_locs`.
+/// payload loops are positional against the plan's `exemplar_locs()`.
 pub(super) fn emit_reduce_row(
     output: &mut Batch,
     // The source row the group-exemplar columns copy from.
@@ -71,7 +71,7 @@ pub(super) fn emit_reduce_row(
     begin_row(output, out_pk_bytes);
     let mut null_word: u64 = 0;
 
-    for (out_pi, loc) in plan.exemplar_locs.iter().enumerate() {
+    for (out_pi, loc) in plan.exemplar_locs().iter().enumerate() {
         match *loc {
             ColumnLocator::Pk { .. } => {
                 // PK lives in the OPK region; decode the addressed column back to
@@ -92,7 +92,7 @@ pub(super) fn emit_reduce_row(
             }
         }
     }
-    emit_agg_cols(output, accs, plan, plan.exemplar_locs.len(), &mut null_word);
+    emit_agg_cols(output, accs, plan, plan.exemplar_locs().len(), &mut null_word);
 
     finish_row(output, null_word);
 }
@@ -112,13 +112,13 @@ pub(super) fn emit_reduce_row(
 /// `!trace_out_has_V0` guard in `n==0`).
 pub(super) fn emit_global_ground(raw_output: &mut Batch, out_pk_bytes: &[u8], plan: &ReducePlan) {
     // A global-aggregate output schema is `[_group_pk, aggs…]`: group-less, so
-    // `exemplar_locs` is empty and the whole payload is aggregates. That is why
+    // `exemplar_locs()` is empty and the whole payload is aggregates. That is why
     // this path emits the aggregate columns *directly* rather than through
     // `emit_reduce_row` — with no exemplar column there is no source row to
     // supply, so the empty-delta seed (which has no input batch at all) is
     // structurally unable to read one.
     debug_assert!(
-        plan.exemplar_locs.is_empty(),
+        plan.exemplar_locs().is_empty(),
         "global_ground output schema must have zero group-exemplar columns",
     );
 

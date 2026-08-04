@@ -41,7 +41,3 @@ pub(super) fn wide_pk_bytes(schema: &SchemaDescriptor, c0: u64, c1: u64, c2: u64
     tmp.extend_pk_opk(schema, &[c0 as u128, c1 as u128, c2 as u128]);
     tmp.get_pk_bytes(0).to_vec()
 }
-
-// -----------------------------------------------------------------------
-// Wide-PK inner-join multiset-delta tests
-// -----------------------------------------------------------------------

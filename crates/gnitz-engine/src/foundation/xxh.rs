@@ -11,6 +11,12 @@ pub fn hash_u128(pk: u128) -> u64 {
     xxh3_64(&pk.to_le_bytes())
 }
 
+/// Streaming XXH3-128 hasher — the one entry point for a digest built from
+/// several pieces (a row's columns, a group key's columns). Row and group
+/// identity hash to 128 bits for the same reason [`checksum_128`] does: a
+/// 64-bit birthday bound would silently coalesce distinct rows.
+pub use xxhash_rust::xxh3::Xxh3Default as RowHasher;
+
 /// XXH3-128 over arbitrary bytes (no seed). Full 128-bit image — use where a
 /// 64-bit birthday bound is too low, e.g. a string content join key (a 64-bit
 /// hash widened to 128 bits has a ~2^32-row collision window that would silently

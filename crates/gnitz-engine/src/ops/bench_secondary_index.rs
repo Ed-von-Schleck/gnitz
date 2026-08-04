@@ -6,7 +6,7 @@
 //! ```
 //!
 //! Lives inside `ops` (not the crate root) so it can call the real internal
-//! key-composition helpers (`GroupKeyExtractor`, `encode_ordered`) and decompose
+//! key-composition helpers (`avi_key_packer`, `encode_ordered`) and decompose
 //! the per-row population cost into four cleanly-attributed layers:
 //!
 //!   compose : build the index key into a stack buffer, discard
@@ -21,8 +21,9 @@
 
 use std::time::{Duration, Instant};
 
+use super::index::avi_key_packer;
 use super::index::{make_avi_schema, op_integrate_with_indexes, AviBake, AviDesc};
-use super::util::{encode_ordered, GroupKeyExtractor, AVI_AV_BYTES};
+use super::util::{encode_ordered, AVI_AV_BYTES};
 use super::AggDescriptor;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
 use crate::storage::{Batch, RecoverySource, Table};
@@ -146,17 +147,17 @@ fn secondary_index_bench_avi_decomposition() {
     let input = build_input(&schema);
     let mb = input.as_mem_batch();
     let tmp = tempfile::tempdir().unwrap();
-    let extractor = GroupKeyExtractor::new(&schema, &group_by_cols);
-    let n = extractor.stride;
+    let packer = avi_key_packer(&schema, &group_by_cols);
+    let n = packer.out_stride;
     let avi_pi = schema
         .try_payload_idx(2)
         .expect("AVI agg col is a payload column by construction");
-    let tc = type_code::I64;
+    let tc = TypeCode::I64;
 
     // Combined AVI key = group_key_bytes ++ ordinal(1) ++ av_encoded(8). Single
     // aggregate here, so ordinal 0.
     let avi_key = |key: &mut [u8], row: usize| -> usize {
-        extractor.gather(&mb, row, key);
+        packer.pack_into(&mut key[..n], &mb, row);
         key[n] = 0; // ordinal
         let av_bytes = mb.get_col_ptr(row, avi_pi, 8);
         let av = encode_ordered(av_bytes, tc, false);

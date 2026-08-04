@@ -43,6 +43,9 @@ pub(super) struct Accumulator {
     tc: TypeCode,
     /// What one row does to the slot, resolved from `(agg_op, tc)` at `new`.
     kind: StepKind,
+    /// `agg_op.is_linear()`, resolved at `new` for the same reason [`StepKind`]
+    /// is: the group walk reads it once per row per aggregate.
+    linear: bool,
     has_value: bool,
 }
 
@@ -50,10 +53,7 @@ pub(super) struct Accumulator {
 /// construction so the per-row body dispatches on a discriminant instead of
 /// re-deriving the answer from `agg_op` and `tc`.
 ///
-/// This matters beyond tidiness: at `opt-level=0` a derived `PartialEq` on
-/// `AggFunc` is a real **call**, so the pre-resolved form removes two out-of-line
-/// comparisons per row per aggregate from the debug binary the E2E suite runs.
-/// Resolving it in `new` also makes the construction one exhaustive `match` over
+/// Resolving it in `new` makes the construction one exhaustive `match` over
 /// `AggFunc` — a new opcode cannot reach the row path unclassified — and moves
 /// SUM's non-numeric rejection from a per-row unwrap to a once-per-epoch one.
 #[derive(Clone, Copy)]
@@ -127,6 +127,7 @@ impl Accumulator {
             loc,
             tc,
             kind,
+            linear: desc.agg_op.is_linear(),
         }
     }
 
@@ -136,7 +137,7 @@ impl Accumulator {
     }
 
     pub(super) fn is_linear(&self) -> bool {
-        self.agg_op.is_linear()
+        self.linear
     }
 
     /// Delegates to [`AggFunc::empty_renders_zero`] (the agg-op rationale lives
@@ -163,7 +164,7 @@ impl Accumulator {
         // MIN/MAX hold the MIN-oriented order-preserving encoding; decode back to
         // native value bits for emit. Linear aggregates store the value verbatim.
         if self.agg_op.uses_value_index() {
-            super::super::util::decode_ordered(self.acc as u64, self.tc, false)
+            super::super::util::decode_ordered(self.acc as u64, self.tc)
         } else {
             self.acc as u64
         }
@@ -287,7 +288,7 @@ impl Accumulator {
             StepKind::Extreme { .. } => {
                 let mut scratch = [0u8; 16];
                 let bytes = self.loc.native_le_bytes(mb, row, &mut scratch);
-                let enc = super::super::util::encode_ordered(bytes, self.tc as u8, false);
+                let enc = super::super::util::encode_ordered(bytes, self.tc, false);
                 if first || self.extreme_replaces(enc) {
                     self.acc = enc as i64;
                 }
@@ -419,7 +420,7 @@ pub(super) fn read_old_minmax_encoded(cursor: &ReadCursor, c_idx: usize, cw: usi
         return None;
     }
     let bytes = cursor.col_bytes(c_idx, cw)?;
-    Some(super::super::util::encode_ordered(bytes, src_tc as u8, false))
+    Some(super::super::util::encode_ordered(bytes, src_tc, false))
 }
 
 // ---------------------------------------------------------------------------

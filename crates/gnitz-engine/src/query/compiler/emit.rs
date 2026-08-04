@@ -608,12 +608,19 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
             // at `num_workers <= 1`, integrating the full input instead of trimming
             // away the rows this worker does not own.
             let in_reg = in_reg(&in_regs, PORT_IN, "partition-filter: missing input port")?;
-            ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(ctx.reg_meta[in_reg as usize].schema);
             let (worker_id, num_workers) = if ctx.replicated() {
                 (0, 1)
             } else {
                 (worker_rank(), num_workers())
             };
+            if num_workers <= 1 {
+                // One worker owns every partition, so the filter is the identity —
+                // and executing it would clone the whole delta each epoch. Alias
+                // the input register instead, as an absent WHERE does.
+                ctx.out_reg_of.insert(nid, in_reg);
+                return Ok(());
+            }
+            ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(ctx.reg_meta[in_reg as usize].schema);
             ctx.builder.push(Instr::PartitionFilter {
                 in_reg: in_reg as u16,
                 out_reg: reg_id as u16,
@@ -802,11 +809,11 @@ pub(super) fn emit_reduce(
             .collect();
         let avi_child = format!("_avidx_{}_{nid}", ctx.view_id);
         let avi_schema = crate::ops::make_avi_schema(&in_reg_schema, &gcols_u32);
-        // A failed AVI table create degrades to the no-index reduce path rather
-        // than failing the compile (tolerated since the index is derivable).
-        if let Ok(ptr) = ctx.add_owned_trace_table(&avi_child, avi_schema, None) {
-            avi_table_ptr = ptr;
-        }
+        // Not optional: `use_avi` was decided above and suppressed the `_reduce_in`
+        // trace table, so a swallowed failure would leave the non-linear reduce with
+        // neither an index nor a history to replay — MIN/MAX computed from the delta
+        // alone, with the old row still retracted.
+        avi_table_ptr = ctx.add_owned_trace_table(&avi_child, avi_schema, None)?;
     }
 
     // The combined index integrates BEFORE the reduce reads it, so a prefix seek
@@ -848,7 +855,7 @@ pub(super) fn emit_reduce(
         && (ctx.replicated()
             || unsharded
             || worker_rank() as usize
-                == crate::ops::worker_for_partition(
+                == gnitz_wire::worker_for_partition(
                     gnitz_wire::partition_for_key(crate::ops::global_group_key()),
                     num_workers() as usize,
                 ));

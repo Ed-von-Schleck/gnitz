@@ -232,74 +232,22 @@ where
     output
 }
 
-/// Null-extend: copy input batch and append N null-filled payload columns.
+/// Null-extend: copy the input batch and append NULL-filled payload columns.
 /// Used by the LEFT JOIN null-fill to extend the unmatched preserved rows
 /// (ν = positive_part(A − π_A(inner))) with NULL right columns. The output
 /// schema is the compiler-built register schema (`reg_meta`) — the single home
 /// for the merged shape; the appended column count is derived from it.
 /// (Combined-width overflow is compile-rejected at emit, so no runtime guard.)
+///
+/// Appending NULL columns is a pure widening of the batch's region layout, so the
+/// copy itself is `Batch::widened_with_null_tail`; the Z-set content is unchanged.
 pub fn op_null_extend(batch: &Batch, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> Batch {
-    debug_assert_eq!(
-        out_schema.pk_stride(),
-        in_schema.pk_stride(),
-        "op_null_extend: output PK region must mirror the input's",
+    let output = batch.widened_with_null_tail(in_schema, out_schema);
+    gnitz_debug!(
+        "op_null_extend: in={} right_npc={}",
+        batch.count,
+        out_schema.num_payload_cols() - in_schema.num_payload_cols()
     );
-    let in_npc = in_schema.num_payload_cols();
-    debug_assert!(
-        out_schema.num_payload_cols() >= in_npc,
-        "op_null_extend: output schema narrower than input",
-    );
-    let right_npc = out_schema.num_payload_cols() - in_npc;
-    let n = batch.count;
-
-    if n == 0 {
-        return Batch::empty_with_schema(out_schema);
-    }
-
-    let mut output = Batch::with_capacity(*out_schema, n);
-    output.count = n;
-
-    // Propagate the input blob so long (> 12 byte) STRING/BLOB values whose
-    // 16-byte structs are copied verbatim below still resolve against the
-    // shared heap. Without this they would point into an empty blob. No
-    // `!batch.blob.is_empty()` guard, same as `op_filter`: sharing an empty
-    // blob is a no-op and all-short-string batches are still correct.
-    if in_schema.has_german_string() {
-        output.share_blob_from(batch);
-    }
-
-    // Copy system columns
-    output.pk_data_mut().copy_from_slice(batch.pk_data());
-    output.weight_data_mut().copy_from_slice(batch.weight_data());
-
-    // Copy input payload columns
-    for (pi, col) in in_schema.payload_columns() {
-        let stride = col.size() as usize;
-        output
-            .col_data_mut(pi)
-            .copy_from_slice(&batch.col_data(pi)[..n * stride]);
-    }
-
-    // The appended right-side cells are NULL, and a NULL cell is zero — the same
-    // invariant `DirectWriter::write_row` and `BatchBuilder::put_null` uphold
-    // actively. Zero them here rather than provisioning the whole arena zeroed:
-    // this touches only the right columns, and it keeps every counted row fully
-    // written (see `Batch::with_capacity`).
-    for pi in in_npc..out_schema.num_payload_cols() {
-        output.col_data_mut(pi).fill(0);
-    }
-
-    // Set null bits for all appended right-side columns
-    let right_null_bits = super::util::all_payload_null_mask(right_npc);
-    for row in 0..n {
-        let out_null = super::util::merge_null_words(batch.get_null_word(row), right_null_bits, in_npc);
-        output.set_null_word(row, out_null);
-    }
-
-    // Null-extending appends columns without touching PK order or weights, so the
-    // output carries exactly the input's layout (faithful propagate, no re-verify).
-    output.inherit_layout(batch);
-    gnitz_debug!("op_null_extend: in={} right_npc={}", n, right_npc);
     output
 }
 
