@@ -599,32 +599,38 @@ pub(crate) fn eval_batch<B: BatchView>(
     // `un_op!`). `body` returns `(value, failed)`; the value is always defined,
     // so a failed row never leaves uninitialised bits behind.
     //
-    // The failure bits are accumulated in a register-resident word and merged
-    // with the operand's null word once per 64 rows, the shape
-    // `fill_null_bits_mask` uses — one store per word, and no per-row aliasing
-    // between the value writes and the mask.
+    // The failure flags are collected a byte per row and packed into the null
+    // word in a second pass. Folding the packing into the value loop — the
+    // `div_like!` shape, `mask[i / 64] |= bit << (i % 64)` — makes every
+    // iteration read-modify-write the same mask word, which serialises the loop:
+    // measured on this kernel it is the difference between a fully scalar loop
+    // and a vectorised one, for ~2x the instruction count.
     macro_rules! unary_null_like {
         ($a:expr, $d:expr, |$x:ident| $body:expr) => {{
             let ai = $a as usize;
             let base_a = ai * MORSEL;
             let base_d = $d * MORSEL;
-            let nulls = !scratch.no_nulls;
-            let (base_null_a, base_null_d) = (ai * NULL_WORDS_PER_REG, $d * NULL_WORDS_PER_REG);
-            for w in 0..m.div_ceil(64) {
-                let lo = w * 64;
-                let hi = (lo + 64).min(m);
-                let mut bad = 0u64;
-                for i in lo..hi {
-                    let $x = scratch.regs[base_a + i];
-                    let (val, failed): (i64, bool) = $body;
-                    scratch.regs[base_d + i] = val;
-                    bad |= (failed as u64) << (i - lo);
-                }
-                // `no_nulls` keeps the null buffers at capacity 0, so the merge
-                // must stay behind the flag even though every caller of this
-                // macro is classified null-producing.
-                if nulls {
-                    scratch.null_bits[base_null_d + w] = scratch.null_bits[base_null_a + w] | bad;
+            let mut bad = [0u8; MORSEL];
+            for i in 0..m {
+                let $x = scratch.regs[base_a + i];
+                let (val, failed): (i64, bool) = $body;
+                scratch.regs[base_d + i] = val;
+                bad[i] = failed as u8;
+            }
+            null_copy1(scratch, $d, ai, m);
+            // Unreachable when `no_nulls`: all three callers are classified
+            // null-producing by `is_strictly_non_nullable`, so the scratch always
+            // has null words here. The guard keeps the macro total anyway.
+            if !scratch.no_nulls {
+                let base_null_d = $d * NULL_WORDS_PER_REG;
+                for w in 0..m.div_ceil(64) {
+                    let base = w * 64;
+                    let n = core::cmp::min(64, m - base);
+                    let mut word = 0u64;
+                    for j in 0..n {
+                        word |= (bad[base + j] as u64) << j;
+                    }
+                    scratch.null_bits[base_null_d + w] |= word;
                 }
             }
             maybe_pack_bool_bits(scratch, &mo, $d);
@@ -633,46 +639,48 @@ pub(crate) fn eval_batch<B: BatchView>(
 
     // Null-skipping 2-ary extremum. `null_or2`'s `a|b` rule is exactly wrong here
     // (the result is null only when BOTH operands are), so this cannot use
-    // `bin_op!`. `pick` returns true when `a` wins on value.
-    //
-    // The value loop compares unconditionally and stays branch-free; the rows
-    // where exactly one operand is NULL are the exception, so they are bit-
-    // scanned out of the null words afterwards and overwritten — the same
-    // compare-then-fix-up shape `eval_str_cmp` and `zero_null_rows` use. Doing
-    // the null test per row inside the loop instead costs about twice the
-    // instructions and blocks vectorisation.
+    // `bin_op!`. `pick` returns true when `a` wins on value; the null-skip is
+    // resolved from the two null words before it is consulted.
     macro_rules! minmax2 {
         ($a:expr, $b:expr, $d:expr, |$x:ident, $y:ident| $pick:expr) => {{
             let ai = $a as usize;
             let bi = $b as usize;
-            {
+            let words = m.div_ceil(64);
+            if scratch.no_nulls {
                 let ([ra, rb], rd) = scratch.regs_split([ai, bi], $d, m);
                 for i in 0..m {
                     let $x = ra[i];
                     let $y = rb[i];
                     rd[i] = if $pick { $x } else { $y };
                 }
-            }
-            if !scratch.no_nulls {
-                let EvalScratch { regs, null_bits, .. } = scratch;
-                let (base_a, base_b, base_d) = (
-                    ai * NULL_WORDS_PER_REG,
-                    bi * NULL_WORDS_PER_REG,
-                    $d * NULL_WORDS_PER_REG,
-                );
-                for w in 0..m.div_ceil(64) {
-                    let (wa, wb) = (null_bits[base_a + w], null_bits[base_b + w]);
-                    // A NULL operand yields the other one, so only the rows where
-                    // exactly one side is NULL need their value replaced.
-                    for (mask, src) in [(wa & !wb, bi), (wb & !wa, ai)] {
-                        let mut rest = mask;
-                        while rest != 0 {
-                            let i = w * 64 + rest.trailing_zeros() as usize;
-                            regs[$d * MORSEL + i] = regs[src * MORSEL + i];
-                            rest &= rest - 1;
-                        }
+            } else {
+                let base_a = ai * NULL_WORDS_PER_REG;
+                let base_b = bi * NULL_WORDS_PER_REG;
+                let mut na = [0u64; NULL_WORDS_PER_REG];
+                let mut nb = [0u64; NULL_WORDS_PER_REG];
+                na[..words].copy_from_slice(&scratch.null_bits[base_a..base_a + words]);
+                nb[..words].copy_from_slice(&scratch.null_bits[base_b..base_b + words]);
+                {
+                    let ([ra, rb], rd) = scratch.regs_split([ai, bi], $d, m);
+                    for i in 0..m {
+                        let $x = ra[i];
+                        let $y = rb[i];
+                        let a_null = (na[i / 64] >> (i % 64)) & 1 != 0;
+                        let b_null = (nb[i / 64] >> (i % 64)) & 1 != 0;
+                        rd[i] = if a_null {
+                            $y
+                        } else if b_null {
+                            $x
+                        } else if $pick {
+                            $x
+                        } else {
+                            $y
+                        };
                     }
-                    null_bits[base_d + w] = wa & wb;
+                }
+                let base_d = $d * NULL_WORDS_PER_REG;
+                for w in 0..words {
+                    scratch.null_bits[base_d + w] = na[w] & nb[w];
                 }
             }
             maybe_pack_bool_bits(scratch, &mo, $d);
@@ -836,8 +844,9 @@ pub(crate) fn eval_batch<B: BatchView>(
                     FloatUnaryOp::Trunc => un_op!(a, d, |x| encode_f64(decode_f64(x).trunc())),
                 }
             }
-            // Testing the ROUNDED value rather than `|x| > f32::MAX` keeps the
-            // doubles just above f32::MAX that round back down to it finite.
+            // A finite source whose rounded result is not finite overflowed f32's
+            // range. Testing the ROUNDED value (not `|x| > f32::MAX`) keeps the
+            // 2^28-1 doubles just above f32::MAX that round down to it.
             Instr::FloatToF32 { dst, a } => unary_null_like!(a, dst as usize, |x| {
                 let f = decode_f64(x);
                 let v32 = f as f32;

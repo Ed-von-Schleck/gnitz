@@ -18,12 +18,20 @@ PERF_DWARF ?=
 T          ?=                                # cargo test name filter
 K          ?=                                # pytest -k expression
 
+# The instruction set every build targets. Canonical copy lives in
+# crates/.cargo/config.toml; it is restated here because Cargo's RUSTFLAGS
+# environment variable REPLACES the config's rustflags rather than appending, so
+# any recipe that sets RUSTFLAGS must carry this or it profiles a binary built
+# against a different instruction set than the one `make release-server` ships.
+# For a machine-specific build use `make bench-native`, which exports RUSTFLAGS.
+TARGET_CPU ?= x86-64-v3
+
 .PHONY: all help \
         test rust-engine-test fmt fmt-check clippy check verify \
         server release-server pyext pyext-release e2e e2e-tls e2e-release release-test \
         clean distclean \
         bench bench-full bench-features bench-txn bench-sweep bench-sweep-dwarf \
-        bench-perf bench-perf-dwarf bench-profile profiling-server profiling-server-dwarf
+        bench-perf bench-perf-dwarf bench-native bench-profile profiling-server profiling-server-dwarf
 
 all: test
 
@@ -132,13 +140,26 @@ bench-perf: FULL    = 1
 bench-perf: PERF    = 1
 bench-perf: bench ## Full + perf record + perf stat
 
+# Builds for THIS machine only — the binary may SIGILL anywhere else, and its
+# numbers are not comparable with a default-built run. For answering "what does
+# this box leave on the table", not for committing a decision.
+#
+# Exported rather than passed per-recipe: a target-specific variable reaches the
+# prerequisites too, so `release-server` and `pyext-release` pick it up without
+# either of them having to know about RUSTFLAGS. Setting it in the environment
+# is also what overrides crates/.cargo/config.toml.
+bench-native: export RUSTFLAGS = -C target-cpu=native
+bench-native: WORKERS = 4
+bench-native: FULL    = 1
+bench-native: bench ## Full benchmark built for the host CPU (non-portable binary)
+
 bench-perf-dwarf: WORKERS = 4
 bench-perf-dwarf: FULL       = 1
 bench-perf-dwarf: PERF_DWARF = 1
 bench-perf-dwarf: bench ## Full + perf with DWARF call graphs
 
 profiling-server: ## Build frame-pointer release server -> ./gnitz-server-profiling (accurate perf call graphs)
-	cd crates && RUSTFLAGS="-C force-frame-pointers=yes" CARGO_TARGET_DIR=target/profiling \
+	cd crates && RUSTFLAGS="-C target-cpu=$(TARGET_CPU) -C force-frame-pointers=yes" CARGO_TARGET_DIR=target/profiling \
 		cargo build --release -p gnitz-engine --bin gnitz-server
 	cp crates/target/profiling/release/gnitz-server gnitz-server-profiling
 
@@ -148,7 +169,7 @@ bench-profile: profiling-server pyext-release ## Profile incremental view mainte
 	cd crates/gnitz-py && uv run python ../../benchmarks/report.py
 
 profiling-server-dwarf: ## Build release server with DWARF unwind tables + line info -> ./gnitz-server-profiling-dwarf
-	cd crates && RUSTFLAGS="-C force-unwind-tables=yes -C debuginfo=1" CARGO_TARGET_DIR=target/profiling-dwarf \
+	cd crates && RUSTFLAGS="-C target-cpu=$(TARGET_CPU) -C force-unwind-tables=yes -C debuginfo=1" CARGO_TARGET_DIR=target/profiling-dwarf \
 		cargo build --release -p gnitz-engine --bin gnitz-server
 	cp crates/target/profiling-dwarf/release/gnitz-server gnitz-server-profiling-dwarf
 

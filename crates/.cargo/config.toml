@@ -1,0 +1,19 @@
+# The columnar kernels (`eval_batch`'s morsel loops, `repr::scatter`,
+# `repr::merge`) carry no explicit SIMD — their vector width is whatever LLVM
+# auto-vectorises to, and rustc's default `x86-64` baseline caps that at SSE2's
+# 128 bits. `x86-64-v3` (AVX2) doubles it, and adds TZCNT/LZCNT for the null-word
+# bit scans. The v3 floor is Haswell (2013) / Zen 1 (2017), which is no
+# constraint for a Linux-only engine that already requires an io_uring kernel.
+#
+# `v4` is deliberately not used: AVX-512 is fused off on recent Intel consumer
+# parts, so it makes the hardware floor erratic rather than simply higher.
+#
+# Scoped to the target triple rather than `[build]` so build scripts and
+# proc macros, which are compiled for the host, keep the default baseline.
+#
+# Keep in sync with `TARGET_CPU` in the Makefile: Cargo's `RUSTFLAGS`
+# environment variable REPLACES these flags instead of appending to them, so a
+# recipe that sets `RUSTFLAGS` has to restate the flag or it silently builds
+# against a different instruction set than `make release-server` does.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
