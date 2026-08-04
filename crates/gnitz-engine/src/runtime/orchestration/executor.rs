@@ -668,7 +668,7 @@ async fn watchdog(shared: Rc<Shared>) {
         let crashed = shared.disp().check_workers();
         if crashed >= 0 {
             let base_dir = shared.cat().base_dir.clone();
-            eprintln!("Worker {crashed} crashed (log: {base_dir}/worker_{crashed}.log), shutting down",);
+            gnitz_error!("Worker {crashed} crashed (log: {base_dir}/worker_{crashed}.log), shutting down");
             shared.disp().shutdown_workers();
             shared.reactor.request_shutdown();
             return;
@@ -2127,8 +2127,7 @@ fn bundle_family(families: &[(SysFamily, Batch)], family: SysFamily) -> Option<&
 /// range. Used by the DDL_TXN bundle decode.
 fn decode_sys_family(tid: i64, slice: &[u8]) -> Result<(SysFamily, Batch), String> {
     let family = SysFamily::from_id(tid).ok_or_else(|| format!("{tid} is not a system family"))?;
-    let batch = decode_client_batch(slice, &family.schema())
-        .map_err(|e| format!("family {tid} decode error: {e}"))?;
+    let batch = decode_client_batch(slice, &family.schema()).map_err(|e| format!("family {tid} decode error: {e}"))?;
     Ok((family, batch))
 }
 

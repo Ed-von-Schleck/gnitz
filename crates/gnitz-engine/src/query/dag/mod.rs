@@ -1051,21 +1051,18 @@ mod tests {
     fn test_ingest_apply_error_abort_exit_status() {
         crate::test_support::assert_test_aborts_134(
             "ingest_apply_error_abort_internal",
-            &[
-                ("GNITZ_RUN_INGEST_ABORT_TEST", "1"),
-                ("GNITZ_INJECT_INGEST_APPLY_ERROR", "store"),
-            ],
+            &[("GNITZ_INJECT_INGEST_APPLY_ERROR", "store")],
         );
     }
 
-    // Guard: runs the seam-armed ingest only under GNITZ_RUN_INGEST_ABORT_TEST
-    // (set by the parent). Registers a view and ingests one row; the armed
-    // "store" seam substitutes Err for the store ingest, tripping the abort.
-    // `View`, not `BaseTable`: a base table must be a `Partitioned` handle (it
-    // runs `enforce_unique_pk`), and this fixture holds a `Borrowed` one.
+    // Runs only in the re-exec'd abort child. Registers a view and ingests one
+    // row; the armed "store" seam substitutes Err for the store ingest,
+    // tripping the abort. `View`, not `BaseTable`: a base table must be a
+    // `Partitioned` handle (it runs `enforce_unique_pk`), and this fixture
+    // holds a `Borrowed` one.
     #[test]
     fn ingest_apply_error_abort_internal() {
-        if std::env::var("GNITZ_RUN_INGEST_ABORT_TEST").is_err() {
+        if !crate::test_support::in_abort_child() {
             return;
         }
         let mut dag = DagEngine::new();

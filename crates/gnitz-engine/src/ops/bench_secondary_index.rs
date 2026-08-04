@@ -38,10 +38,7 @@ const ITERS: usize = 40;
 /// the production-representative path, where small arenas (index tables use
 /// 256 KiB–1 MiB) flush shards to disk mid-population.
 fn arena() -> u64 {
-    match std::env::var("GNITZ_BENCH_ARENA_KB") {
-        Ok(kb) => kb.parse::<u64>().expect("GNITZ_BENCH_ARENA_KB must be an integer") * 1024,
-        Err(_) => 1 << 30,
-    }
+    crate::foundation::env::env_u64("GNITZ_BENCH_ARENA_KB", 1 << 20) * 1024
 }
 
 /// Source schema: U64 pk (col 0) | U32 grp (col 1) | I64 val (col 2).

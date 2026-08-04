@@ -263,15 +263,25 @@ pub(crate) fn arb_pk_type() -> impl Strategy<Value = u8> {
     arb_type_code().prop_filter("type code must be PK-eligible", |&tc| gnitz_wire::is_pk_eligible(tc))
 }
 
+/// Set by [`assert_test_aborts_134`] on the child it spawns; the abort-body
+/// test guards on [`in_abort_child`] so a normal sweep skips it.
+const ABORT_CHILD_VAR: &str = "GNITZ_RUN_ABORT_TEST";
+
+/// True only inside the re-exec'd child of [`assert_test_aborts_134`].
+pub(crate) fn in_abort_child() -> bool {
+    std::env::var(ABORT_CHILD_VAR).is_ok()
+}
+
 /// Re-run the current test binary filtered to `internal_test` (with `envs`
 /// set) and assert the child `gnitz_fatal_abort!`s — `_exit(134)` is a normal
 /// (non-signal) exit on Linux, so `code() == Some(134)`. A direct in-process
 /// call would terminate the test runner; a clean subprocess also avoids any
-/// multi-threaded fork hazard. The internal test must guard on one of the
-/// `envs` vars so a normal test sweep skips it.
+/// multi-threaded fork hazard. `internal_test` must return early unless
+/// [`in_abort_child`], so a normal test sweep skips its abort.
 pub(crate) fn assert_test_aborts_134(internal_test: &str, envs: &[(&str, &str)]) {
     let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
     cmd.arg(internal_test);
+    cmd.env(ABORT_CHILD_VAR, "1");
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -287,11 +297,6 @@ pub(crate) fn assert_test_aborts_134(internal_test: &str, envs: &[(&str, &str)])
 // SharedRegion — anonymous shared-memory test region
 // ---------------------------------------------------------------------------
 
-/// Anonymous `MAP_SHARED` region for IPC-shaped tests; unmapped on drop.
-/// Pages are kernel-zeroed and lazily populated (no explicit memset, so a
-/// huge reservation stays cheap). `MAP_SHARED` so a `fork()`ed child sees
-/// the same pages (a child that `_exit`s never runs drops, so only the
-/// parent unmaps).
 /// A scratch directory for a test that needs a real on-disk tree, wiped at the
 /// start of the run so the previous same-user run self-cleans. `scope` names the
 /// subsystem, `name` the test.
@@ -312,6 +317,11 @@ pub(crate) fn scratch_dir(scope: &str, name: &str) -> String {
     path
 }
 
+/// Anonymous `MAP_SHARED` region for IPC-shaped tests; unmapped on drop.
+/// Pages are kernel-zeroed and lazily populated (no explicit memset, so a
+/// huge reservation stays cheap). `MAP_SHARED` so a `fork()`ed child sees
+/// the same pages (a child that `_exit`s never runs drops, so only the
+/// parent unmaps).
 pub(crate) struct SharedRegion {
     ptr: *mut u8,
     size: usize,

@@ -5,10 +5,12 @@
 //!   with EINTR/partial-write handling, fdatasync/fsync, fallocate, ftruncate,
 //!   O_TMPFILE, NOCOW, madvise, `map_shared_sized`, the Unix server socket,
 //!   fd-limit, `Mmap`.
-//! - **IPC tier** — raw return codes, kept deliberately: eventfd, futex,
-//!   memfd. Their callers inspect errno (EAGAIN/ETIMEDOUT), re-read rings
-//!   rather than trust returns, and manage fd lifecycles manually across
-//!   `fork()`; `io::Result`/`OwnedFd` would fight that.
+//! - **IPC tier** — eventfd, futex, memfd. `eventfd_wait` and the `futex_*`
+//!   calls keep their raw return codes: their callers inspect errno
+//!   (EAGAIN/ETIMEDOUT) and re-read the rings rather than trust the return.
+//!   `eventfd_create`/`memfd_create` return a raw fd because their callers hold
+//!   the descriptor across `fork()` and close it by hand, which an `OwnedFd`
+//!   would fight.
 
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::atomic::AtomicU32;
@@ -19,17 +21,14 @@ use libc::c_int;
 // File-I/O tier
 // ---------------------------------------------------------------------------
 
-/// Write all bytes to `fd`, handling partial writes and EINTR.
-pub(crate) fn write_all_fd(fd: c_int, data: &[u8]) -> std::io::Result<()> {
-    let mut written: usize = 0;
-    while written < data.len() {
-        let ret = unsafe {
-            libc::write(
-                fd,
-                data[written..].as_ptr() as *const libc::c_void,
-                data.len() - written,
-            )
-        };
+/// Drive `syscall(ptr, len)` until all of `data` is written, retrying EINTR.
+/// `syscall` takes the remaining slice's start and length and returns the raw
+/// libc return value; the `done` running total is passed so a positional
+/// variant can derive its offset.
+fn write_all_with(data: &[u8], mut syscall: impl FnMut(*const u8, usize, usize) -> isize) -> std::io::Result<()> {
+    let mut done: usize = 0;
+    while done < data.len() {
+        let ret = unsafe { syscall(data.as_ptr().add(done), data.len() - done, done) };
         if ret < 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
@@ -43,36 +42,24 @@ pub(crate) fn write_all_fd(fd: c_int, data: &[u8]) -> std::io::Result<()> {
             // would spin forever at 100% CPU. Treat it as an error.
             return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
         }
-        written += ret as usize;
+        done += ret as usize;
     }
     Ok(())
 }
 
+/// Write all bytes to `fd`, handling partial writes and EINTR.
+pub(crate) fn write_all_fd(fd: c_int, data: &[u8]) -> std::io::Result<()> {
+    write_all_with(data, |p, len, _| unsafe {
+        libc::write(fd, p as *const libc::c_void, len)
+    })
+}
+
 /// pwrite all bytes to `fd` at `offset`, handling short writes and EINTR —
 /// the positional twin of [`write_all_fd`].
-pub(crate) fn pwrite_all_fd(fd: c_int, buf: &[u8], mut offset: libc::off_t) -> std::io::Result<()> {
-    let mut remaining = buf.len();
-    let mut p = buf.as_ptr();
-    while remaining > 0 {
-        let written = unsafe { libc::pwrite(fd, p as *const libc::c_void, remaining, offset) };
-        if written < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(err);
-        }
-        if written == 0 {
-            // POSIX guarantees regular files never return 0 for a non-zero
-            // count, but some device types can — without this guard the loop
-            // would spin forever at 100% CPU. Treat it as an error.
-            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
-        }
-        remaining -= written as usize;
-        p = unsafe { p.add(written as usize) };
-        offset += written as libc::off_t;
-    }
-    Ok(())
+pub(crate) fn pwrite_all_fd(fd: c_int, buf: &[u8], offset: libc::off_t) -> std::io::Result<()> {
+    write_all_with(buf, |p, len, done| unsafe {
+        libc::pwrite(fd, p as *const libc::c_void, len, offset + done as libc::off_t)
+    })
 }
 
 /// Read up to `buf.len()` bytes from `fd`, handling EINTR. Returns the number
@@ -275,20 +262,13 @@ pub fn server_create(path: &str) -> std::io::Result<OwnedFd> {
 /// on `fd` errors out promptly (`ECONNRESET`/`EPIPE`) and its CQE fires. Used
 /// to evict a client that has stopped draining a zero-copy ring-slot egress,
 /// releasing the held W2M slot once the send completes. Retries on `EINTR`;
-/// tolerates `ENOTCONN` (peer already gone). Returns 0 on success (or
-/// `ENOTCONN`), -1 on any other error. Does NOT close the fd — the caller still
-/// reaps it through the normal close path.
-pub fn shutdown(fd: i32) -> i32 {
-    loop {
-        let rc = unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
-        if rc >= 0 {
-            return 0;
-        }
-        let err = std::io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(libc::EINTR) => continue,
-            Some(libc::ENOTCONN) => return 0,
-            _ => return -1,
+/// a peer that is already gone (`ENOTCONN`) is the goal state, not an error.
+/// Does NOT close the fd — the caller still reaps it through the normal close
+/// path.
+pub fn shutdown(fd: i32) {
+    while unsafe { libc::shutdown(fd, libc::SHUT_RDWR) } < 0 {
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return;
         }
     }
 }
@@ -431,10 +411,8 @@ pub fn raise_fd_limit(target: u64) {
 /// literal `"max"` (no limit). This is the technique the JVM and Go use to
 /// avoid the sysconf-reports-host-RAM pitfall inside a container.
 ///
-/// Cached in a `OnceLock` (read once — the value is process-lifetime
-/// invariant and the sole caller, the master reactor, has no fork-time
-/// divergence to worry about). Returns 0 only if every source fails, which
-/// callers clamp up to a floor.
+/// Cached in a `OnceLock`: the value is invariant for the process's lifetime.
+/// Returns 0 only if every source fails, which callers clamp up to a floor.
 pub fn available_memory_bytes() -> usize {
     use std::sync::OnceLock;
     static CACHED: OnceLock<usize> = OnceLock::new();
@@ -551,18 +529,17 @@ pub fn eventfd_create() -> i32 {
     unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) }
 }
 
-/// Signal an eventfd (increment counter by 1). Returns 0 on success, -1 on error.
-pub fn eventfd_signal(efd: i32) -> i32 {
+/// Signal an eventfd (increment counter by 1), retrying EINTR. A failure needs
+/// no reporting: the counter is a wake hint whose loss the reader recovers from
+/// by re-reading its ring, so no caller inspects the outcome.
+pub fn eventfd_signal(efd: i32) {
     let v: u64 = 1;
     loop {
         let n = unsafe { libc::write(efd, &v as *const u64 as *const libc::c_void, 8) };
-        if n == 8 {
-            return 0;
-        }
         if n < 0 && errno() == libc::EINTR {
             continue;
         }
-        return -1;
+        return;
     }
 }
 
@@ -709,8 +686,6 @@ pub fn futex_waitv_u32(ptrs: &[*const AtomicU32], expected: &[u32], timeout_ms: 
         }
         &ts
     };
-    // libc 0.2.186 exposes `SYS_futex_waitv` per-arch (449 on x86_64/aarch64),
-    // matching how `futex_wait_u32` uses `libc::SYS_futex`.
     unsafe {
         libc::syscall(
             libc::SYS_futex_waitv,
@@ -765,19 +740,14 @@ pub fn map_shared_sized(fd: c_int, size: usize, how: Backing) -> std::io::Result
     Ok(ptr as *mut u8)
 }
 
-/// Raise RLIMIT_NOFILE soft limit to the hard limit.
-/// Called once per process via `std::sync::Once`; safe to invoke from any test.
+/// Raise RLIMIT_NOFILE soft limit to the hard limit (`raise_fd_limit` clamps
+/// the target down to it). Called once per process via `std::sync::Once`; safe
+/// to invoke from any test.
 #[cfg(test)]
 pub(crate) fn raise_fd_limit_for_tests() {
     use std::sync::Once;
     static INIT: Once = Once::new();
-    INIT.call_once(|| unsafe {
-        let mut rlim: libc::rlimit = std::mem::zeroed();
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 && rlim.rlim_cur < rlim.rlim_max {
-            rlim.rlim_cur = rlim.rlim_max;
-            libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
-        }
-    });
+    INIT.call_once(|| raise_fd_limit(u64::MAX));
 }
 
 // ---------------------------------------------------------------------------
@@ -923,7 +893,7 @@ mod tests {
         let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
         assert_eq!(rc, 0, "socketpair failed");
         let (a, b) = (fds[0], fds[1]);
-        assert_eq!(shutdown(a), 0, "shutdown on connected socket must succeed");
+        shutdown(a);
         let buf = [0u8; 4];
         let n = unsafe { libc::send(a, buf.as_ptr() as *const libc::c_void, buf.len(), libc::MSG_NOSIGNAL) };
         assert!(n < 0, "send after SHUT_RDWR must fail, got {n}");
@@ -958,11 +928,11 @@ mod tests {
 
     #[test]
     fn test_shutdown_tolerates_enotconn() {
-        // An unconnected socket → shutdown returns ENOTCONN, which the wrapper
-        // maps to success (0): evicting an already-gone peer is not an error.
+        // An unconnected socket → shutdown fails with ENOTCONN; the wrapper
+        // swallows it, since evicting an already-gone peer is not an error.
         let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
         assert!(fd >= 0, "socket() failed");
-        assert_eq!(shutdown(fd), 0, "ENOTCONN must be tolerated as success");
+        shutdown(fd);
         unsafe {
             libc::close(fd);
         }
@@ -997,7 +967,7 @@ mod tests {
     fn test_eventfd_signal_wait() {
         let fd = eventfd_create();
         assert!(fd >= 0);
-        assert_eq!(eventfd_signal(fd), 0);
+        eventfd_signal(fd);
         let r = eventfd_wait(fd, 1000);
         assert!(r > 0, "expected >0, got {r}");
         unsafe {
@@ -1016,27 +986,15 @@ mod tests {
         }
     }
 
+    /// The M2W wake contract: a forked child's store through a `MAP_SHARED`
+    /// region is visible to the parent once its eventfd signal arrives.
     #[test]
     fn test_cross_process_atomic() {
         use std::sync::atomic::{AtomicU64, Ordering};
 
-        // Create shared mmap region
-        let fd = unsafe { libc::memfd_create(c"test".as_ptr(), 0) };
+        let fd = memfd_create(b"test");
         assert!(fd >= 0);
-        unsafe {
-            libc::ftruncate(fd, 4096);
-        }
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                4096,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
-        assert_ne!(ptr, libc::MAP_FAILED);
+        let ptr = map_shared_sized(fd, 4096, Backing::Sized).unwrap() as *mut libc::c_void;
 
         let efd = eventfd_create();
         assert!(efd >= 0);
@@ -1244,22 +1202,13 @@ mod tests {
     }
 
     #[test]
-    fn test_memfd_create_and_ftruncate() {
-        let fd = memfd_create(b"test_memfd");
-        assert!(fd >= 0, "memfd_create failed: {fd}");
-        ftruncate(fd, 4096).unwrap();
-        assert_eq!(fd_size(fd).unwrap(), 4096);
-        unsafe {
-            libc::close(fd);
-        }
-    }
-
-    #[test]
     fn test_map_shared_sized() {
+        // `Backing::Sized` grows the memfd via ftruncate before mapping, so the
+        // store below lands on a real page instead of raising SIGBUS.
         let fd = memfd_create(b"test_mmap");
         assert!(fd >= 0);
         let ptr = map_shared_sized(fd, 8192, Backing::Sized).unwrap();
-        // Write and read back
+        assert_eq!(fd_size(fd).unwrap(), 8192);
         unsafe {
             *ptr = 42;
             assert_eq!(*ptr, 42);

@@ -374,17 +374,14 @@ mod fail_stop_tests {
     // A storage error while integrating a tick delta must _exit(134).
     #[test]
     fn test_fatal_on_tick_ingest_err_exit_status() {
-        crate::test_support::assert_test_aborts_134(
-            "fatal_on_tick_ingest_err_internal",
-            &[("GNITZ_RUN_TICK_ABORT_TEST", "1")],
-        );
+        crate::test_support::assert_test_aborts_134("fatal_on_tick_ingest_err_internal", &[]);
     }
 
-    // Guard: runs the abort only under GNITZ_RUN_TICK_ABORT_TEST (set by the
-    // parent). A returning call would fail the `unreachable!`.
+    // Runs only in the re-exec'd abort child. A returning call would fail the
+    // `unreachable!`.
     #[test]
     fn fatal_on_tick_ingest_err_internal() {
-        if std::env::var("GNITZ_RUN_TICK_ABORT_TEST").is_err() {
+        if !crate::test_support::in_abort_child() {
             return;
         }
         fatal_on_tick_ingest_err("integrate", 7, Err(StorageError::Io));

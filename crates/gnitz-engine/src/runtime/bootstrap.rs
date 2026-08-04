@@ -532,6 +532,10 @@ fn run_worker_child(
         }
     }
 
+    // Re-tag logging as this worker before any boot work, so every line the
+    // recovery below emits carries `W{w}` rather than the inherited master tag.
+    crate::foundation::log::init(log_level, format!("W{w}").as_bytes());
+
     // Close M2W eventfds of OTHER workers (W2M uses futex, no fd).
     for (j, &efd) in ipc.m2w_efds.iter().enumerate() {
         if j != w {
@@ -574,7 +578,7 @@ fn run_worker_child(
         Ok(pd) => (pd, None),
         Err(e) => {
             // stderr is redirected to worker_N.log above.
-            eprintln!("{e}");
+            gnitz_error!("{e}");
             (HashMap::new(), Some(e))
         }
     };
@@ -588,10 +592,6 @@ fn run_worker_child(
         part_start,
         part_end,
     ));
-
-    // Re-init logging with worker tag
-    let wtag = format!("W{w}");
-    crate::foundation::log::init(log_level, wtag.as_bytes());
 
     let mut worker = WorkerProcess::new(master_pid, catalog_ptr, sal_reader, w2m_writer, pending_deltas);
     let rc = worker.run(boot_err);

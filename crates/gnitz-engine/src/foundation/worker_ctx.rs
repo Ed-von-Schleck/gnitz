@@ -10,10 +10,8 @@
 /// worker's ephemeral shard isolated so siblings don't clobber each other.
 ///
 /// These scratch tables flush in-memory (`in_memory_l0`), so the rank only
-/// matters when a table *spills* past `INMEM_CEILING` (which writes shard
-/// files into the shared tree) and at construction-time `erase_stale_shards`.
-/// Retained for those paths; a future change that removed spill entirely could
-/// revisit it.
+/// matters when a table *spills* past `INMEM_CEILING` (which writes shard files
+/// into the shared tree) and at construction-time `erase_stale_shards`.
 static WORKER_RANK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Sibling of `WORKER_RANK`: the worker count baked into this process's compiled
@@ -81,8 +79,14 @@ pub(crate) fn worker_rank() -> u32 {
 
 /// The committed checkpoint generation this process last latched — the value
 /// the ephemeral flush round stamps into manifests and `RederiveCheckpointed`
-/// opens gate on. Storage never reads this directly; the catalog/runtime
-/// callers pass it down as data.
+/// opens gate on.
+///
+/// Read here rather than off the catalog because the two deliberately diverge
+/// during recovery: `recovery_start_generation_bump` advances the catalog's
+/// `committed_generation` to `G+1` while leaving this at the recovered `G`, so
+/// the resume load and the boot verdict keep comparing manifests against `G`.
+/// A reader that wants that stable value must take it from here; one that wants
+/// the next generation to publish must take it from the catalog.
 pub(crate) fn committed_generation() -> u64 {
     COMMITTED_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
 }
