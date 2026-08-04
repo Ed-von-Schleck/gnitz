@@ -1228,7 +1228,13 @@ impl Batch {
         if indices.is_empty() {
             return Self::empty_with_schema(schema);
         }
-        let blob_cap = batch.blob.len().max(1);
+        // Reserve this slice's row-proportional share of the source blob heap,
+        // not the whole heap per target: an N-way split (the 64-or-more partition
+        // scatter on every ingest) would otherwise ask for N × the bytes it can
+        // possibly write, evicting pooled buffers and mallocing fresh above the
+        // recycle cap. `blob_cap` is only a reserve hint — `DirectWriter` grows
+        // it on demand — so an under-estimate costs at most one realloc.
+        let blob_cap = (batch.blob.len() * indices.len() / batch.count.max(1)).max(1);
         write_to_batch(schema, indices.len(), blob_cap, |writer| {
             super::scatter::scatter_copy(batch, indices, weights, writer);
         })
@@ -1830,18 +1836,7 @@ impl Batch {
             self.layout = Layout::Consolidated;
             return self;
         }
-        let already_sorted = self.sorted_verified(schema);
-        let mb = self.as_mem_batch();
-        let blob_cap = mb.blob.len().max(1);
-        let mut result = write_to_batch(schema, self.count, blob_cap, |writer| {
-            if already_sorted {
-                merge::fold_sorted(&mb, schema, writer);
-            } else {
-                merge::sort_and_consolidate(&mb, schema, writer);
-            }
-        });
-        result.certify_layout(Layout::Consolidated, schema);
-        result
+        Self::consolidate_into_new(&self, schema)
     }
 
     /// Consolidate a borrowed batch if needed. Returns `None` when the batch is
@@ -1854,9 +1849,14 @@ impl Batch {
     /// let c: &Batch = cs.as_ref().unwrap_or(delta);
     /// ```
     pub fn consolidate_if_needed(batch: &Batch, schema: &SchemaDescriptor) -> Option<Batch> {
-        if batch.consolidated_verified(schema) {
-            return None;
-        }
+        (!batch.consolidated_verified(schema)).then(|| Self::consolidate_into_new(batch, schema))
+    }
+
+    /// Sort (if needed) and weight-fold `batch` into a fresh certified batch —
+    /// the consolidation slow path both entry points above share, so the two can
+    /// never diverge on how the output arena is provisioned or which merge kernel
+    /// runs.
+    fn consolidate_into_new(batch: &Batch, schema: &SchemaDescriptor) -> Batch {
         let already_sorted = batch.sorted_verified(schema);
         let mb = batch.as_mem_batch();
         let blob_cap = mb.blob.len().max(1);
@@ -1868,7 +1868,7 @@ impl Batch {
             }
         });
         result.certify_layout(Layout::Consolidated, schema);
-        Some(result)
+        result
     }
 
     #[cfg(test)]
@@ -2645,7 +2645,7 @@ mod tests {
         let mut dst = Batch::with_capacity(schema, 1);
         // PK region is OPK (big-endian) at rest; the lookup key must match.
         let pk_bytes = pk_val.to_be_bytes();
-        dst.append_row_from_source_bytes(&pk_bytes, -1, &found_row, 0, None);
+        dst.append_row_from_source_bytes(&pk_bytes, -1, &found_row.run, found_row.row, None);
         assert_eq!(dst.count, 1);
         assert_eq!(dst.get_pk_bytes(0), &pk_bytes);
         assert_eq!(dst.get_pk(0), pk_val as u128);
@@ -2868,5 +2868,384 @@ mod tests {
         assert_eq!(b.layout(), Layout::Raw);
         assert!(b.is_sorted(), "empty batch is structurally sorted");
         assert!(b.is_consolidated(), "empty batch is structurally consolidated");
+    }
+
+    // ── Tests relocated from the former memtable module: these exercise
+    // `Batch` and the batch pool, not any LSM tier. ──────────────────────
+
+    fn make_schema_cols(cols: &[(u8, u8)], pk_index: u32) -> SchemaDescriptor {
+        let mut columns = [SchemaColumn::EMPTY; crate::schema::MAX_COLUMNS];
+        for (i, &(tc, nullable)) in cols.iter().enumerate() {
+            columns[i] = SchemaColumn::new(tc, nullable);
+        }
+        SchemaDescriptor::new(&columns[..cols.len()], &[pk_index])
+    }
+
+    #[test]
+    fn owned_batch_roundtrip() {
+        let schema = crate::test_support::make_schema_u64_i64();
+        let batch = crate::test_support::make_batch(&schema, &[(10, 1, 100), (20, 1, 200)]);
+        assert_eq!(batch.count, 2);
+        assert_eq!(batch.get_pk(0), 10);
+        assert_eq!(batch.get_pk(1), 20);
+
+        let mb = batch.as_mem_batch();
+        assert_eq!(mb.count, 2);
+        assert_eq!(mb.get_pk(0), 10);
+        assert_eq!(mb.get_weight(1), 1);
+    }
+
+    #[test]
+    fn batch_append_batch() {
+        let schema = crate::test_support::make_schema_u64_i64();
+        let src = crate::test_support::make_batch(&schema, &[(10, 1, 100), (20, 1, 200), (30, 1, 300)]);
+        let mut dst = Batch::with_capacity(schema, 8);
+
+        dst.append_batch(&src, 0, 3);
+        assert_eq!(dst.count, 3);
+        assert_eq!(dst.get_pk(0), 10);
+        assert_eq!(dst.get_pk(2), 30);
+        assert_eq!(dst.get_weight(1), 1);
+
+        dst.clear();
+        dst.append_batch(&src, 1, 2);
+        assert_eq!(dst.count, 1);
+        assert_eq!(dst.get_pk(0), 20);
+    }
+
+    #[test]
+    fn batch_append_batch_negated() {
+        let schema = crate::test_support::make_schema_u64_i64();
+        let src = crate::test_support::make_batch(&schema, &[(10, 1, 100), (20, 2, 200)]);
+        let mut dst = Batch::with_capacity(schema, 8);
+
+        dst.append_batch_negated(&src, 0, 2);
+        assert_eq!(dst.count, 2);
+        assert_eq!(dst.get_weight(0), -1);
+        assert_eq!(dst.get_weight(1), -2);
+        assert_eq!(dst.get_pk(0), 10);
+    }
+
+    /// Regression: bulk append into an `empty_with_schema()` batch must not spin
+    /// when n far exceeds its initial (zero) capacity.
+    #[test]
+    fn batch_append_batch_from_empty_exceeds_initial_capacity() {
+        let schema = crate::test_support::make_schema_u64_i64();
+        let rows: Vec<(u64, i64, i64)> = (1u64..=200).map(|i| (i, 1i64, (i * 10) as i64)).collect();
+        let src = crate::test_support::make_batch(&schema, &rows);
+
+        let mut dst = Batch::empty_with_schema(&schema);
+        dst.append_batch(&src, 0, src.count);
+
+        assert_eq!(dst.count, 200);
+        for i in 0..200usize {
+            assert_eq!(dst.get_pk(i), (i + 1) as u128);
+        }
+    }
+
+    #[test]
+    fn batch_region_access() {
+        let schema = crate::test_support::make_schema_u64_i64();
+        let batch = crate::test_support::make_batch(&schema, &[(10, 1, 100)]);
+
+        // 2 columns: PK (U64) + payload (I64) — regions pk(0), weight(1),
+        // null(2), col0(3), blob(4).
+        assert_eq!(batch.num_regions_total(), 5);
+        assert_eq!(batch.region_size(0), 8);
+        assert_eq!(batch.region_size(3), 8);
+        assert!(!batch.region_slice(0).is_empty());
+    }
+
+    #[test]
+    fn batch_clear() {
+        let schema = crate::test_support::make_schema_u64_i64();
+        let mut batch = crate::test_support::make_batch(&schema, &[(10, 1, 100)]);
+        assert_eq!(batch.count, 1);
+
+        batch.clear();
+        assert_eq!(batch.count, 0);
+        assert!(batch.is_sorted());
+        assert!(batch.is_consolidated());
+    }
+
+    #[test]
+    fn test_append_row_simple_nullable_string() {
+        let schema = make_schema_cols(&[(type_code::U64, 0), (type_code::STRING, 1)], 0);
+        let mut batch = Batch::with_capacity(schema, 4);
+
+        let s = b"not null";
+        let lo = [0i64]; // not used for STRING
+        let hi = [0u64];
+        let ptrs = [s.as_ptr()];
+        let lens = [s.len() as u32];
+        unsafe {
+            batch.append_row_simple(1, 1, 0, &lo, &hi, &ptrs, &lens);
+        }
+
+        // Row 1: null string (null_word bit 0 set).
+        let null_ptr: *const u8 = std::ptr::null();
+        unsafe {
+            batch.append_row_simple(2, 1, 1, &[0i64], &[0u64], &[null_ptr], &[0u32]);
+        }
+
+        assert_eq!(batch.count, 2);
+        assert_eq!(crate::test_support::read_german_string(&batch, 0, 0), b"not null");
+        assert_eq!(batch.get_null_word(0) & 1, 0);
+        assert_eq!(batch.get_null_word(1) & 1, 1);
+        let raw = batch.get_col_ptr(1, 0, 16);
+        assert!(raw.iter().all(|&b| b == 0), "null cell is zeroed");
+    }
+
+    #[test]
+    fn test_append_row_simple_multi_string() {
+        let schema = make_schema_cols(
+            &[(type_code::U64, 0), (type_code::STRING, 0), (type_code::STRING, 0)],
+            0,
+        );
+        let mut batch = Batch::with_capacity(schema, 4);
+
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"Alice", b"short"),
+            (b"Bob has a long name!", b"Also quite a long description"),
+            (b"", b"nonempty"),
+            (b"mix", b"another long one for blob storage"),
+        ];
+
+        for (pk, (name, desc)) in cases.iter().enumerate() {
+            let ptrs = [name.as_ptr(), desc.as_ptr()];
+            let lens = [name.len() as u32, desc.len() as u32];
+            unsafe {
+                batch.append_row_simple(pk as u128, 1, 0, &[0i64, 0], &[0u64, 0], &ptrs, &lens);
+            }
+        }
+
+        assert_eq!(batch.count, 4);
+        for (i, (name, desc)) in cases.iter().enumerate() {
+            assert_eq!(
+                crate::test_support::read_german_string(&batch, 0, i),
+                *name,
+                "row {i} name mismatch"
+            );
+            assert_eq!(
+                crate::test_support::read_german_string(&batch, 1, i),
+                *desc,
+                "row {i} desc mismatch"
+            );
+        }
+    }
+
+    // 3.14 / 2.718 are test-fixture values exercising f32/f64 round-trip, not
+    // approximations of PI/E.
+    #[test]
+    #[allow(clippy::approx_constant)]
+    fn test_append_row_simple_all_types() {
+        // U64 pk, then one of each remaining type at payload index 0..=11.
+        let schema = make_schema_cols(
+            &[
+                (type_code::U64, 0),    // pk
+                (type_code::U8, 0),     // pi 0
+                (type_code::I8, 0),     // pi 1
+                (type_code::U16, 0),    // pi 2
+                (type_code::I16, 0),    // pi 3
+                (type_code::U32, 0),    // pi 4
+                (type_code::I32, 0),    // pi 5
+                (type_code::F32, 0),    // pi 6
+                (type_code::U64, 0),    // pi 7
+                (type_code::I64, 0),    // pi 8
+                (type_code::F64, 0),    // pi 9
+                (type_code::STRING, 0), // pi 10
+                (type_code::U128, 0),   // pi 11
+            ],
+            0,
+        );
+        let mut batch = Batch::with_capacity(schema, 1);
+
+        let n = 12;
+        let mut lo = vec![0i64; n];
+        let mut hi = vec![0u64; n];
+        let mut ptrs = vec![std::ptr::null::<u8>(); n];
+        let mut lens = vec![0u32; n];
+
+        lo[0] = 42;
+        lo[1] = -7;
+        lo[2] = 1000;
+        lo[3] = -500;
+        lo[4] = 70000;
+        lo[5] = -12345;
+        // Floats travel as f64 bit patterns (the float2longlong convention).
+        lo[6] = f64::to_bits(3.14f64) as i64;
+        lo[7] = 0x1234_5678_9ABC_DEF0u64 as i64;
+        lo[8] = -99999;
+        lo[9] = f64::to_bits(2.718281828f64) as i64;
+        let s = b"hello world!";
+        ptrs[10] = s.as_ptr();
+        lens[10] = s.len() as u32;
+        lo[11] = 0xDEADBEEFu64 as i64;
+        hi[11] = 0xCAFEBABE;
+
+        unsafe {
+            batch.append_row_simple(100, 1, 0, &lo, &hi, &ptrs, &lens);
+        }
+
+        assert_eq!(batch.count, 1);
+        assert_eq!(batch.get_col_ptr(0, 0, 1), &[42]);
+        assert_eq!(batch.get_col_ptr(0, 1, 1), &[(-7i8) as u8]);
+        assert_eq!(batch.get_col_ptr(0, 2, 2), &1000u16.to_le_bytes());
+        assert_eq!(batch.get_col_ptr(0, 3, 2), &(-500i16).to_le_bytes());
+        assert_eq!(batch.get_col_ptr(0, 4, 4), &70000u32.to_le_bytes());
+        assert_eq!(batch.get_col_ptr(0, 5, 4), &(-12345i32).to_le_bytes());
+        let f32_val = f32::from_le_bytes(batch.get_col_ptr(0, 6, 4).try_into().unwrap());
+        assert!((f32_val - 3.14f32).abs() < 1e-5, "f32: {f32_val}");
+        assert_eq!(batch.get_col_ptr(0, 7, 8), &0x1234_5678_9ABC_DEF0u64.to_le_bytes());
+        assert_eq!(batch.get_col_ptr(0, 8, 8), &(-99999i64).to_le_bytes());
+        let f64_val = f64::from_le_bytes(batch.get_col_ptr(0, 9, 8).try_into().unwrap());
+        assert!((f64_val - 2.718281828).abs() < 1e-9, "f64: {f64_val}");
+        assert_eq!(crate::test_support::read_german_string(&batch, 10, 0), b"hello world!");
+        let u128_bytes = batch.get_col_ptr(0, 11, 16);
+        assert_eq!(u64::from_le_bytes(u128_bytes[0..8].try_into().unwrap()), 0xDEADBEEF);
+        assert_eq!(u64::from_le_bytes(u128_bytes[8..16].try_into().unwrap()), 0xCAFEBABE);
+    }
+
+    /// An I128 payload column (a cross-sign `_join_pk` surfaced into a payload
+    /// slot) round-trips through the lo/hi split in `append_row_simple`.
+    #[test]
+    fn test_append_row_simple_i128_payload() {
+        let schema = make_schema_cols(&[(type_code::U64, 0), (type_code::I128, 0)], 0);
+        let mut batch = Batch::with_capacity(schema, 1);
+        // A negative value with bits in both halves (bit 127 set). The I128 is
+        // the only payload column, so lo/hi are indexed at pi = 0.
+        let v: i128 = -0x0123_4567_89AB_CDEF_1122_3344_5566_7788;
+        let bits = v as u128;
+        unsafe {
+            batch.append_row_simple(
+                7,
+                1,
+                0,
+                &[(bits as u64) as i64],
+                &[(bits >> 64) as u64],
+                &[std::ptr::null::<u8>()],
+                &[0u32],
+            );
+        }
+        assert_eq!(batch.count, 1);
+        let got = i128::from_le_bytes(batch.get_col_ptr(0, 0, 16).try_into().unwrap());
+        assert_eq!(got, v, "I128 payload must round-trip through the lo/hi split");
+    }
+
+    /// `append_row` substitutes an empty string when the declared length would
+    /// read past the end of `blob_src`. Matches the string relocator, and keeps
+    /// malformed wire data from emitting unrelated bytes from the blob start.
+    #[test]
+    fn test_append_row_blob_length_header() {
+        let schema = make_schema_cols(&[(type_code::U64, 0), (type_code::STRING, 0)], 0);
+        let mut batch = Batch::with_capacity(schema, 1);
+
+        // German String with length=20 but only 5 blob bytes available.
+        let mut gs_struct = [0u8; 16];
+        gs_struct[0..4].copy_from_slice(&20u32.to_le_bytes()); // declared length
+        gs_struct[4..8].copy_from_slice(&0u32.to_le_bytes()); // prefix bytes
+        gs_struct[8..16].copy_from_slice(&0u64.to_le_bytes()); // blob offset
+
+        unsafe {
+            batch.append_row(1, 1, 0, &[gs_struct.as_ptr()], &[16u32], b"hello");
+        }
+
+        // Empty-string fallback: not the declared 20, not a truncated 5.
+        let stored_len = u32::from_le_bytes(batch.get_col_ptr(0, 0, 16)[0..4].try_into().unwrap());
+        assert_eq!(stored_len, 0, "malformed long-string should fall back to empty");
+        assert!(batch.blob.is_empty(), "no bytes copied into the blob arena");
+    }
+
+    /// `append_row_from_source` must not panic on an out-of-range blob offset.
+    #[test]
+    fn test_append_row_from_source_corrupted_blob() {
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::STRING, 0),
+            ],
+            &[0],
+        );
+
+        let mut src = Batch::with_capacity(schema, 1);
+        // German string: length=20, prefix="ABCD", offset=9999 (out of bounds).
+        let mut str_struct = [0u8; 16];
+        str_struct[0..4].copy_from_slice(&20u32.to_le_bytes());
+        str_struct[4..8].copy_from_slice(b"ABCD");
+        str_struct[8..16].copy_from_slice(&9999u64.to_le_bytes());
+
+        src.ensure_row_capacity();
+        src.extend_pk(42u128);
+        src.extend_weight(&1i64.to_le_bytes());
+        src.extend_null_bmp(&0u64.to_le_bytes());
+        src.extend_col(0, &str_struct);
+        src.blob = vec![0u8; 10];
+        src.count = 1;
+
+        let mut dst = Batch::with_capacity(schema, 1);
+        let mut blob_cache = crate::storage::BlobCache::default();
+        dst.append_row_from_source(42u128, 1, &src, 0, Some(&mut blob_cache));
+
+        assert_eq!(dst.count, 1);
+        let out_len = u32::from_le_bytes(dst.col_data(0)[0..4].try_into().unwrap());
+        assert_eq!(out_len, 0, "corrupted blob reference should produce zero-length string");
+    }
+
+    #[test]
+    fn drop_recycles_buffers() {
+        use crate::storage::batch_pool::{acquire_buf, recycle_buf};
+        while acquire_buf().capacity() > 0 {}
+
+        let schema = crate::test_support::make_schema_u64_i64();
+        let batch = crate::test_support::make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
+        let data_cap = batch.data_capacity();
+        assert!(data_cap > 0);
+        drop(batch);
+
+        let mut found = false;
+        let mut drained = Vec::new();
+        loop {
+            let buf = acquire_buf();
+            if buf.capacity() == 0 {
+                break;
+            }
+            found |= buf.capacity() >= data_cap;
+            drained.push(buf);
+        }
+        assert!(found, "pool should contain the recycled data buffer");
+        for buf in drained {
+            recycle_buf(buf);
+        }
+    }
+
+    #[test]
+    fn clone_drops_independently() {
+        use crate::storage::batch_pool::acquire_buf;
+        while acquire_buf().capacity() > 0 {}
+
+        let schema = crate::test_support::make_schema_u64_i64();
+        let batch = crate::test_support::make_batch(&schema, &[(1, 1, 10)]);
+        let cloned = batch.clone();
+        drop(batch);
+        drop(cloned);
+
+        // Two batches, each with a data + blob buffer; some may be zero-cap.
+        let mut count = 0;
+        while acquire_buf().capacity() > 0 {
+            count += 1;
+        }
+        assert!(count >= 2, "expected at least 2 recycled buffers, got {count}");
+    }
+
+    #[test]
+    fn empty_batch_drop_is_noop() {
+        use crate::storage::batch_pool::acquire_buf;
+        while acquire_buf().capacity() > 0 {}
+
+        let batch = Batch::placeholder();
+        assert_eq!(batch.data_capacity(), 0);
+        drop(batch);
+
+        assert_eq!(acquire_buf().capacity(), 0, "empty batch should not pollute pool");
     }
 }

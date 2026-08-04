@@ -7377,7 +7377,7 @@ fn run_reduce_trace_epochs(
     for (i, d) in epochs.iter().enumerate() {
         // Sources the cursor for THIS epoch's probe sees: memtable runs + folded
         // in-memory runs + shard files (each becomes one CursorSource).
-        let sources = trace.snapshot_runs().len() + trace.in_memory_runs().count() + trace.all_shard_arcs().len();
+        let sources = trace.runs().count();
         max_sources = max_sources.max(sources);
         let out = {
             let mut ch = trace.open_cursor();

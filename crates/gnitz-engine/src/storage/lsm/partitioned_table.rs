@@ -6,16 +6,18 @@
 //! `xxh3 & 0xFF`.
 
 use std::cell::RefCell;
-use std::rc::Rc;
 
 use super::batch::Batch;
 use super::child_dir::ChildAddr;
 use super::error::StorageError;
 use super::read_cursor::{self, ReadCursor};
-use super::shard_reader::MappedShard;
+use super::run::StoredRow;
 use super::table::{self, RecoverySource, Table};
 #[cfg(test)]
-use super::table::{FlushOutcome, FlushWork};
+use super::{
+    flush_barrier::FlushRound,
+    table::{FlushOutcome, FlushWork},
+};
 use crate::foundation::fault::Seam;
 use crate::schema::SchemaDescriptor;
 #[cfg(test)]
@@ -137,7 +139,7 @@ impl PartitionedTable {
         // Widen the window where the table dir exists but its partition subdirs
         // do not, so a concurrent master remove_dir_all (DROP) deterministically
         // races this create. User tables only.
-        if matches!(routing, Routing::Hashed { .. }) {
+        if !routing.is_unhashed() {
             if let Some(ms) = TABLE_CREATE_DELAY.count() {
                 std::thread::sleep(std::time::Duration::from_millis(ms));
             }
@@ -225,22 +227,24 @@ impl PartitionedTable {
         self.scatter_ingest(batch)
     }
 
-    #[allow(clippy::needless_range_loop)]
     fn scatter_ingest(&mut self, batch: &Batch) -> Result<(), StorageError> {
         let mb = batch.as_mem_batch();
-        let np = NUM_PARTITIONS as usize;
+        // Buckets are keyed by **local slot**, not by global partition: this
+        // worker owns `NUM_PARTITIONS / workers` of the 256-way tiling, so a
+        // 256-entry scratch would clear and rescan mostly-empty buckets on every
+        // ingest — including a single-row INSERT.
+        let n_local = self.tables.len();
 
-        // Thread-local per-partition index pool, mirroring exchange.rs's
-        // SCATTER_INDICES / WORKER_ROWS: clears (retaining capacity) per call
-        // rather than allocating 256 vecs every ingest. The borrow is held
-        // across the inner single-`Table` ingests, which never re-enter this
-        // function (no nested PARTITION_INDICES borrow).
+        // Thread-local index pool, mirroring exchange.rs's SCATTER_INDICES /
+        // WORKER_ROWS: clears (retaining capacity) per call rather than
+        // reallocating. The borrow is held across the inner single-`Table`
+        // ingests, which never re-enter this function.
         PARTITION_INDICES.with(|pool| {
-            let mut part_indices = pool.borrow_mut();
-            if part_indices.len() < np {
-                part_indices.resize_with(np, Vec::new);
+            let mut buckets = pool.borrow_mut();
+            if buckets.len() < n_local {
+                buckets.resize_with(n_local, Vec::new);
             }
-            part_indices[..np].iter_mut().for_each(Vec::clear);
+            buckets[..n_local].iter_mut().for_each(Vec::clear);
 
             // Route every row by the table's distribution prefix via the shared
             // `partition_for_pk` (the leading OPK bytes; the full PK for the
@@ -248,23 +252,28 @@ impl PartitionedTable {
             // scatter all funnel through it, so a row lands in the same partition
             // wherever it is routed.
             for i in 0..mb.count {
-                part_indices[self.schema.partition_for_pk(mb.get_pk_bytes(i))].push(i as u32);
+                let p = self.schema.partition_for_pk(mb.get_pk_bytes(i));
+                // Every production producer routes to the owning worker before
+                // the ingest, so a row outside this store's own partition range
+                // means the relation is *placed* by one key and *addressed* by
+                // another. Reported rather than dropped: the ingest callers treat
+                // a storage error as committed data not applied and fail stop,
+                // where a silent drop would let the relation diverge with no
+                // error and no log line.
+                let Some(local) = self.local_slot(p) else {
+                    let rows = (0..mb.count)
+                        .filter(|&j| self.schema.partition_for_pk(mb.get_pk_bytes(j)) == p)
+                        .count();
+                    return Err(misrouted_rows(rows, p, self.routing));
+                };
+                buckets[local].push(i as u32);
             }
 
-            for p in 0..np {
-                if part_indices[p].is_empty() {
+            for (local, rows) in buckets[..n_local].iter().enumerate() {
+                if rows.is_empty() {
                     continue;
                 }
-                // Every production producer routes to the owning worker before the
-                // ingest, so a row outside this store's own partition range means
-                // the relation is *placed* by one key and *addressed* by another.
-                // Reported rather than dropped: the ingest callers treat a storage
-                // error as committed data not applied and fail stop, where a silent
-                // drop would let the relation diverge with no error and no log line.
-                let Some(local) = self.local_slot(p) else {
-                    return Err(misrouted_rows(part_indices[p].len(), p, self.routing));
-                };
-                let sub_batch = Batch::from_indexed_rows(&mb, &part_indices[p], &[], &self.schema);
+                let sub_batch = Batch::from_indexed_rows(&mb, rows, &[], &self.schema);
                 self.tables[local].ingest_owned_batch(sub_batch)?;
             }
             Ok(())
@@ -275,39 +284,10 @@ impl PartitionedTable {
     // Cursor
     // ------------------------------------------------------------------
 
-    /// Gather every live partition's read sources — memtable `snapshot_runs`,
-    /// RAM-tier `in_memory_runs`, and `all_shard_arcs_iter` — into one
-    /// (snapshots, shards) pair for `create_read_cursor`. The snapshot
-    /// accumulator is pre-seeded with the known memtable-run count; the shard
-    /// iterator extends without a throwaway per-partition `Vec`.
-    fn gather_runs(tables: &[Table]) -> (Vec<Rc<Batch>>, Vec<Rc<MappedShard>>) {
-        let mut snapshots: Vec<Rc<Batch>> = Vec::with_capacity(tables.iter().map(|t| t.snapshot_runs().len()).sum());
-        let mut shards: Vec<Rc<MappedShard>> = Vec::with_capacity(tables.len());
-        for table in tables {
-            snapshots.extend(table.snapshot_runs().iter().cloned());
-            snapshots.extend(table.in_memory_runs());
-            shards.extend(table.all_shard_arcs_iter());
-        }
-        (snapshots, shards)
-    }
-
-    /// Open a read-only cursor over every partition (memtable runs + shards).
-    /// Infallible, non-mutating — the recommended default. See
-    /// `Table::open_cursor`.
-    ///
-    /// Child count, not routing, picks the path: `Table::open_cursor` gathers
-    /// the same three run sources `gather_runs` would, so a lone child skips
-    /// the two accumulator `Vec`s whether it is unhashed or a hashed store
-    /// trimmed to one partition.
+    /// Open a read-only cursor over every partition's runs. Infallible,
+    /// non-mutating — the recommended default. See `Table::open_cursor`.
     pub fn open_cursor(&self) -> ReadCursor {
-        match self.tables.as_slice() {
-            [] => read_cursor::create_read_cursor(&[], &[], self.schema),
-            [only] => only.open_cursor(),
-            many => {
-                let (snaps, shards) = Self::gather_runs(many);
-                read_cursor::create_read_cursor(&snaps, &shards, self.schema)
-            }
-        }
+        read_cursor::from_runs(self.tables.iter().flat_map(Table::runs), self.schema)
     }
 
     /// A cursor over ONLY the partition that could hold `key` (full OPK bytes),
@@ -347,7 +327,7 @@ impl PartitionedTable {
     }
 
     #[cfg(test)] // no production caller after the §4 DML/UPSERT byte-path fixes
-    pub fn retract_pk(&mut self, key: u128) -> (i64, Option<table::RowRef>) {
+    pub fn retract_pk(&mut self, key: u128) -> (i64, Option<StoredRow>) {
         let opk = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
         self.retract_pk_bytes(opk.pk_bytes())
     }
@@ -360,7 +340,7 @@ impl PartitionedTable {
 
     /// Byte-keyed sibling of [`retract_pk`] for wide PKs. Returns the net
     /// weight and, when positive, the live stored row as an owned `RowRef`.
-    pub fn retract_pk_bytes(&mut self, key: &[u8]) -> (i64, Option<table::RowRef>) {
+    pub fn retract_pk_bytes(&mut self, key: &[u8]) -> (i64, Option<StoredRow>) {
         match self.slot_for_key(key) {
             Some(local) => self.tables[local].retract_pk_bytes(key),
             None => (0, None),
@@ -666,7 +646,6 @@ mod tests {
     use crate::foundation::posix_io::raise_fd_limit_for_tests;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::{make_batch_raw, make_schema_u64_i64, make_wide_batch, opk_pk, wide_pk_3xu64_schema};
-    use std::os::fd::AsRawFd;
 
     /// Unsorted `Raw` rows for the U64+I64 schema.
     fn make_batch(rows: &[(u64, i64, i64)]) -> Batch {
@@ -818,7 +797,7 @@ mod tests {
         let inmem_rows = run(100, 164);
         pt.ingest_owned_batch(make_batch(&inmem_rows)).unwrap();
         pt.flush().unwrap();
-        assert!(pt.tables[0].in_memory_runs().count() > 0, "the flush parked a RAM run");
+        assert!(pt.tables[0].ram_run_count() > 0, "the flush parked a RAM run");
 
         // Tier 3 — memtable runs.
         let mem_rows = run(200, 264);
@@ -1050,8 +1029,12 @@ mod tests {
         // payload — not the other twin's. Under the §4.4 bug (probe not sliced to
         // the prefix) it would route by the full key to a different partition and
         // miss the row entirely.
-        let read_found_val = |fr: &table::RowRef| {
-            i64::from_le_bytes(gnitz_expr::RowSource::get_col_ptr(fr, 0, 0, 8).try_into().unwrap())
+        let read_found_val = |fr: &StoredRow| {
+            i64::from_le_bytes(
+                gnitz_expr::RowSource::get_col_ptr(&fr.run, fr.row, 0, 8)
+                    .try_into()
+                    .unwrap(),
+            )
         };
         let (wa, fa) = pt.retract_pk_bytes(&twin_a);
         assert_eq!(wa, 1, "twin A found in its prefix-partition");
@@ -1215,7 +1198,7 @@ mod tests {
     fn prepare_all(pt: &mut PartitionedTable) -> Vec<(usize, FlushWork)> {
         let mut works = Vec::new();
         for (i, t) in pt.partitions_mut().iter_mut().enumerate() {
-            match t.flush_prepare().unwrap() {
+            match t.flush_prepare(FlushRound::Base).unwrap() {
                 FlushOutcome::Done => {}
                 FlushOutcome::Pending(w) => works.push((i, w)),
             }
@@ -1294,7 +1277,7 @@ mod tests {
         }
     }
 
-    /// `open_cursor` must surface each partition's `in_memory_l0`.
+    /// `open_cursor` must surface each partition's the RAM tier.
     /// Fails pre-fix (multi-partition branch dropped `in_memory_runs`).
     #[test]
     fn compacted_open_cursor_gathers_in_memory_runs() {
@@ -1314,7 +1297,7 @@ mod tests {
         let rows: Vec<(u64, i64, i64)> = (0..50).map(|i| (i * 7 + 3, 1, (i * 10) as i64)).collect();
         pt.ingest_owned_batch(make_batch(&rows)).unwrap();
 
-        // Flush all partitions into in_memory_l0; memtables now empty.
+        // Flush all partitions into the RAM tier; memtables now empty.
         assert!(prepare_all(&mut pt).is_empty());
 
         let batch = pt.open_cursor().materialize();
@@ -1461,9 +1444,9 @@ mod tests {
             let rows: Vec<(u64, i64, i64)> = (0..16).map(|i| (round * 100 + i, 1, i as i64)).collect();
             pt.ingest_owned_batch(make_batch(&rows)).unwrap();
             for (idx, w) in prepare_all(&mut pt) {
-                let fd = pt.partitions_mut()[idx].flush_commit(w).unwrap();
-                let _ = crate::foundation::posix_io::fsync_eintr(fd.as_raw_fd());
-                // fd closes here, as it does in the worker sweep.
+                // The dir fd the worker sweep would fsync through the barrier
+                // ring; here only its release matters, so it just drops.
+                drop(pt.partitions_mut()[idx].flush_commit(w).unwrap());
             }
             assert_eq!(
                 count_partition_dir_fds(root),

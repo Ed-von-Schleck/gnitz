@@ -1,4 +1,4 @@
-//! Storage subsystem: WAL, shards, MemTable, merge, cursors, and tables.
+//! Storage subsystem: WAL, shards, run sets, merge, cursors, and tables.
 //!
 //! Only the items listed under "Public API" are part of the official surface.
 //! Engine code imports from `crate::storage::{Type, fn}`.

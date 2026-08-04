@@ -1755,7 +1755,7 @@ fn adv_time_cursor_stationary(c: &mut ReadCursor, tier: Tier, scratch: &mut [u8]
 
 /// Bench 1 — leaf `gallop_opk` in isolation (no cursor, no loser tree): call
 /// `Batch`/`MappedShard::advance_to` directly. Reproduces the leaf gallop work the
-/// profile splits across `CursorSource::advance_to` self-time (8.77%) and
+/// profile splits across `Run::advance_to` self-time (8.77%) and
 /// `lower_bound_by` (2.04%), plus — cold — the scattered `get_pk_bytes` mmap-load
 /// latency that dominates it. Both the RAM (`Batch`) and mmap (`Shard`) tiers,
 /// monotone (position-seeded skip) and point-lookup (`hint = 0`) drivers.

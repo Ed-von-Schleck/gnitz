@@ -73,7 +73,7 @@ impl<'a> ChildAddr<'a> {
     /// use is residue left by a shape flip. Scratch is judged by rank either
     /// way — the next compile recreates what it needs.
     pub fn is_owned_by(&self, routing: Routing, num_workers: u32) -> bool {
-        let unhashed = matches!(routing, Routing::Unhashed { .. });
+        let unhashed = routing.is_unhashed();
         match *self {
             ChildAddr::Partition(_) => !unhashed,
             ChildAddr::Local(k) => unhashed && k < num_workers,

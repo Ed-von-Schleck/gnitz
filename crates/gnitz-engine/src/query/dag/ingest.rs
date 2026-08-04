@@ -204,7 +204,7 @@ impl DagEngine {
     /// tables. System tables (`StoreHandle::Borrowed`) are skipped — workers
     /// never barrier-flush their inherited `_sys` copies. `SalReplay` partitions
     /// publish (`Pending`); rederived partitions and index tables fold to RAM
-    /// (`DoneInline`), which the generic flush loop consumes.
+    /// (`FlushOutcome::Done`), which the generic flush loop consumes.
     ///
     /// Same `*mut Table` validity argument as `collect_ephemeral_flush_tables`
     /// below.
@@ -333,7 +333,7 @@ impl DagEngine {
                 if let Some(stored_row) = stored_row {
                     // The located stored row is an owned `ColumnarSource` view;
                     // copy it in at weight -1 via the canonical source-append.
-                    effective.append_row_from_source_bytes(pkb, -1, &stored_row, 0, None);
+                    effective.append_row_from_source_bytes(pkb, -1, &stored_row.run, stored_row.row, None);
                 }
             }
 

@@ -1,7 +1,7 @@
 //! Storage-layer data round-trip property tests.
 //!
 //! The schema codec has its own round-trip proptest; this is the analogous
-//! coverage for the **data** layer — the path from `Batch` → `MemTable` →
+//! coverage for the **data** layer — the path from `Batch` → run set →
 //! shard file → `MappedShard` / `ReadCursor`. Every existing storage unit test
 //! fixes one concrete schema (almost always `(U64 PK)` or `(U64 PK, I64)`) and
 //! exercises one code path; PK-width and PK-arity assumptions hard-coded across
@@ -242,7 +242,7 @@ proptest! {
             prop_assert_eq!(&expected, &zset_of(&owned, &schema));
         } else {
             // A sub-ceiling ephemeral flush writes no shard; rows live in
-            // in_memory_l0 and are served by full_scan (asserted above).
+            // the RAM tier and are served by full_scan (asserted above).
             prop_assert!(shards.is_empty());
         }
     }

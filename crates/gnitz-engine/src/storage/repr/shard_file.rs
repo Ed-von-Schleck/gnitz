@@ -1,7 +1,7 @@
 //! Shard file image building and atomic writing.
 //!
-//! Shared by the compaction path (`compact.rs`) and the memtable flush path
-//! (`memtable.rs`).
+//! Shared by the compaction path (`lsm::compact`) and the RAM-tier spill /
+//! checkpoint path (`lsm::table::flush`).
 
 use std::ffi::CStr;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -12,7 +12,7 @@ use super::super::error::StorageError;
 use super::batch::{strides_from_schema, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::layout::*;
 use super::xor8;
-use crate::foundation::posix_io::{fdatasync_eintr, fsync_eintr};
+use crate::foundation::posix_io::fdatasync_eintr;
 use crate::foundation::xxh;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::{
@@ -322,9 +322,9 @@ fn build_xor8_from_pk_region(pk_bytes: &[u8], stride: usize) -> Option<Xor8> {
 /// Per-call policy for the shard writers ([`write_shard_streaming`] /
 /// `Batch::write_as_shard`).
 ///
-/// `durable` fdatasyncs the file and its directory around the finalizing
-/// rename — spills and barrier folds pass `false` (the barrier's by-path sweep
-/// fdatasyncs them), compaction outputs pass `true`.
+/// `durable` fdatasyncs the file before the finalizing rename — spills and
+/// barrier folds pass `false` (the barrier's by-path sweep fdatasyncs them and
+/// then fsyncs the table directory), compaction outputs pass `true`.
 /// `pack_ints` enables FoR (`ENCODING_FOR`) on eligible integer payload
 /// regions — set only by compaction; L0 spill/checkpoint writers stay raw.
 #[derive(Clone, Copy, Default)]
@@ -366,13 +366,12 @@ pub fn write_shard_streaming(
             libc::unlinkat(dirfd, tmp_name.as_ptr(), 0);
             return Err(StorageError::Io);
         }
-        // Flush the directory inode so the renamed entry survives a power loss
-        // (fdatasync on the file alone does not flush the parent directory).
-        if opts.durable {
-            // Ignore EINTR-retried fsync errors on directory fds (best-effort).
-            let _ = fsync_eintr(dirfd);
-        }
     }
+    // The renamed directory entry is made durable by the flush barrier, which
+    // fsyncs the table directory through a real `O_DIRECTORY` fd after its
+    // renames. This writer cannot do it: `Batch::write_as_shard` — the only
+    // caller that passes `durable` — addresses the file by path from `AT_FDCWD`,
+    // which is not a directory fd to fsync.
     Ok(())
 }
 
@@ -397,7 +396,7 @@ fn write_shard_streaming_inner(
     let (strides, nr) = strides_from_schema(schema);
     let nr = nr as usize;
     debug_assert_eq!(num_regions, nr + 1, "region count must be 3 + num_payload_cols + 1");
-    // Shards are ghost-free by construction: flush persists the memtable's
+    // Shards are ghost-free by construction: flush persists the run set's
     // consolidated net-state run and compaction's merge drops net-zero groups.
     debug_assert!(
         !(0..n).any(|i| read_i64_le(regions[REG_WEIGHT], i * 8) == 0),

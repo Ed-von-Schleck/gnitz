@@ -13,8 +13,8 @@ use std::rc::Rc;
 use super::super::batch::{write_to_batch, Batch, Layout};
 use super::super::columnar::with_payload_cmp;
 use super::super::merge::DirectWriter;
+use super::super::run::Run;
 use super::super::scatter::scatter_unified_sources_with_weights;
-use super::source::CursorSource;
 use super::{ReadCursor, RowComparator, SourceMode};
 use gnitz_expr::RowSource;
 
@@ -91,7 +91,7 @@ impl ReadCursor {
     /// break order/folding).
     ///
     /// This is `Batch::append_row_from_source_bytes` applied at the cursor's
-    /// current position: `CursorSource` implements `ColumnarSource`, so the shared
+    /// current position: `Run` implements `ColumnarSource`, so the shared
     /// appender does the weight/null/payload write (German-string blob relocation
     /// included) with no hand-rolled per-column loop here. The byte-form PK is
     /// correct at every width.
@@ -158,11 +158,11 @@ impl ReadCursor {
         // precondition that there is no other source to have skipped rows.
         if self.sources.len() == 1 && self.states[0].position == 0 {
             match &self.sources[0] {
-                CursorSource::Batch(rc) if rc.consolidated_verified(&self.schema) => {
+                Run::Mem(rc) if rc.consolidated_verified(&self.schema) => {
                     return Rc::clone(rc);
                 }
-                CursorSource::Batch(_) => {}
-                CursorSource::Shard(rc) => {
+                Run::Mem(_) => {}
+                Run::Shard(rc) => {
                     return Rc::new(rc.to_owned_batch(&self.schema));
                 }
             }
@@ -208,7 +208,7 @@ impl ReadCursor {
         let schema = &self.schema;
 
         let batch = match &self.sources[i] {
-            CursorSource::Batch(b) => {
+            Run::Mem(b) => {
                 // A verbatim slice copy — neither sorts nor consolidates — so it
                 // carries the source's own flags rather than asserting them. (In
                 // practice every cursor-source batch is already consolidated; see
@@ -227,7 +227,7 @@ impl ReadCursor {
                 out.inherit_layout(b);
                 out
             }
-            CursorSource::Shard(s) => s.slice_to_owned_batch(start, row_count, schema),
+            Run::Shard(s) => s.slice_to_owned_batch(start, row_count, schema),
         };
 
         // Advance position past the drained rows

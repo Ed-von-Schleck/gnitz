@@ -137,7 +137,7 @@ pub fn serialize(
     write_u64_le(out_buf, OFF_GENERATION, header.generation);
 
     // Write entries field-by-field (symmetric with parse; immune to padding changes).
-    for (i, e) in entries.iter().enumerate().take(count) {
+    for (i, e) in entries.iter().enumerate() {
         let off = HEADER_SIZE + i * ENTRY_SIZE;
         write_u64_le(out_buf, off + OFF_MAX_LSN, e.max_lsn);
         out_buf[off + OFF_FILENAME..off + OFF_FILENAME + 128].copy_from_slice(&e.filename);
@@ -294,26 +294,6 @@ pub fn prepare_file(
     })
 }
 
-/// Read one `u64` field at `off` from a manifest file's validated header.
-///
-/// Returns `Ok(None)` when the file cannot be opened (does not exist yet),
-/// `Ok(Some(v))` when the header parses, or `Err(_)` on any other failure.
-fn peek_header_u64(path: &std::ffi::CStr, off: usize) -> Result<Option<u64>, StorageError> {
-    let Some(fd) = open_owned(path, libc::O_RDONLY) else {
-        return Ok(None);
-    };
-    let mut hdr = [0u8; HEADER_SIZE];
-    let n = crate::foundation::posix_io::read_all_fd(fd.as_raw_fd(), &mut hdr).unwrap_or(0);
-    if n < HEADER_SIZE {
-        return Err(StorageError::Truncated);
-    }
-    let magic = read_u64_le(&hdr, 0);
-    if magic != MAGIC {
-        return Err(StorageError::InvalidMagic);
-    }
-    Ok(Some(read_u64_le(&hdr, off)))
-}
-
 /// Basename of a table's manifest inside its own directory. The one spelling —
 /// every producer, peeker and unlinker goes through `path`/`tmp_path`.
 pub const MANIFEST_FILE: &str = "manifest.bin";
@@ -328,13 +308,25 @@ pub fn tmp_path(dir: &str) -> String {
     format!("{}.tmp", path(dir))
 }
 
-/// Read just the checkpoint generation from a manifest file header. `Ok(None)`
-/// when the file does not exist yet. Used by the conditional view-state reload:
-/// a `RederiveCheckpointed` table loads its shards only when its manifest
+/// Read just the checkpoint generation from a manifest file's validated header.
+/// `Ok(None)` when the file does not exist yet, `Err(_)` when it is truncated or
+/// not a manifest. Used by the conditional view-state reload: a
+/// `RederiveCheckpointed` table loads its shards only when its manifest
 /// generation equals the committed checkpoint generation, and erases them
 /// otherwise.
 pub fn peek_generation(path: &std::ffi::CStr) -> Result<Option<u64>, StorageError> {
-    peek_header_u64(path, OFF_GENERATION)
+    let Some(fd) = open_owned(path, libc::O_RDONLY) else {
+        return Ok(None);
+    };
+    let mut hdr = [0u8; HEADER_SIZE];
+    let n = crate::foundation::posix_io::read_all_fd(fd.as_raw_fd(), &mut hdr).unwrap_or(0);
+    if n < HEADER_SIZE {
+        return Err(StorageError::Truncated);
+    }
+    if read_u64_le(&hdr, 0) != MAGIC {
+        return Err(StorageError::InvalidMagic);
+    }
+    Ok(Some(read_u64_le(&hdr, OFF_GENERATION)))
 }
 
 // ---------------------------------------------------------------------------

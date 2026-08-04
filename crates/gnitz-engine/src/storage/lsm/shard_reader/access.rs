@@ -3,7 +3,9 @@
 
 use std::ptr;
 
-use super::super::batch::{FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+use super::super::batch::{
+    acquire_arena, Fill, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
+};
 use super::super::merge::{relocate_german_string_vec, BlobCacheGuard, ColPtr, UnifiedSource};
 use super::super::xor8;
 use super::{MappedShard, PackedRegion, PayloadRegion, RegionView, WeightRegion};
@@ -237,11 +239,11 @@ impl MappedShard {
         let nr = num_regions_u8 as usize; // 4 + npc
         let (offsets, total_size) = compute_offsets(&strides, nr, row_count);
 
-        // One allocation for all fixed-stride columnar data.
-        let mut data = super::super::batch_pool::acquire_buf();
-        data.clear();
-        data.reserve(total_size);
-        unsafe { data.set_len(total_size) };
+        // One allocation for all fixed-stride columnar data. Materializing a
+        // whole shard is among the largest single allocations the engine makes,
+        // so it goes through the shared arena path for its hugepage bypass (and
+        // its undersized-buffer eviction and debug poison).
+        let mut data = acquire_arena(total_size, Fill::Uninit);
 
         // Write each region directly into its final slice — no intermediate
         // buffers. The Raw/Constant fill is shared by both expanders; only the
@@ -321,12 +323,10 @@ impl MappedShard {
         // touching a cell.
         let blob = if relocate {
             debug_assert!(start + row_count <= self.count, "slice out of range");
-            let mut out = super::super::batch_pool::acquire_buf();
-            out.clear();
             // The slice's share of the heap — an estimate, so `div_ceil` rather than
             // a truncating quotient that would reserve nothing for a shard holding
             // fewer heap bytes than rows.
-            out.reserve(self.blob_len.div_ceil(self.count) * row_count);
+            let mut out = acquire_arena(self.blob_len.div_ceil(self.count) * row_count, Fill::Reserve);
             // Cap the dedup-map hint: a hint above `BLOB_CACHE_RECYCLE_CAP`'s
             // capacity would make the map too large to return to the pool, so a
             // chunked drain would malloc and free one per chunk. Entry count is
@@ -349,10 +349,7 @@ impl MappedShard {
             out
         } else if self.blob_len > 0 {
             let src = &shard[self.blob_off..self.blob_off + self.blob_len];
-            let mut buf = super::super::batch_pool::acquire_buf();
-            buf.clear();
-            buf.reserve(self.blob_len);
-            unsafe { buf.set_len(self.blob_len) };
+            let mut buf = acquire_arena(self.blob_len, Fill::Uninit);
             buf.copy_from_slice(src);
             buf
         } else {

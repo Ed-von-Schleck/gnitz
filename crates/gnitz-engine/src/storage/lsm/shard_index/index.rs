@@ -97,6 +97,7 @@ impl ShardIndex {
         self.all_entries().map(|e| Rc::clone(&e.shard))
     }
 
+    #[cfg(test)]
     pub fn all_shard_arcs(&self) -> Vec<Rc<MappedShard>> {
         self.all_shard_arcs_iter().collect()
     }

@@ -225,7 +225,7 @@ impl CatalogEngine {
         // the opener is a provably-empty range (a `+∞` start, or an inverted /
         // zero-width interval); the `.filter` maps the cursor's `Some(empty)`
         // ("in-range entries, none resolved") back to this API's `None`.
-        let Some(mut cur) = self.open_index_range_cursor(table_id, col_indices, range, 0)? else {
+        let Some(mut cur) = self.open_index_range_cursor(table_id, col_indices, range)? else {
             return Ok((None, src_schema));
         };
         // Resolved again rather than threaded out of the opener: the cursor holds
@@ -247,8 +247,7 @@ impl CatalogEngine {
     /// Preserves the write-ordering guarantee of the non-atomic base-then-index
     /// write path: the index cursor snapshots first and each base partition is
     /// opened later, so every entry the walk yields already had its base row
-    /// written. `pk_capacity` pre-sizes the per-chunk PK scratch (the measured
-    /// range size capped at the chunk size, or 0 to grow).
+    /// written.
     ///
     /// Only user base tables own index circuits, so a resolved index implies a
     /// partitioned base; the `Err` is a registry corruption, not a shape
@@ -258,7 +257,6 @@ impl CatalogEngine {
         table_id: i64,
         col_indices: &[u32],
         range: &gnitz_wire::RangeDescriptor,
-        pk_capacity: usize,
     ) -> Result<Option<BoundedIndexCursor>, String> {
         let (entry, ic) = self.table_and_index(table_id, col_indices)?;
         let src_schema = entry.schema;
@@ -276,7 +274,8 @@ impl CatalogEngine {
             end,
             ic.key_spec,
             src_schema,
-            pk_capacity,
+            // No measured range size on this path; the PK scratch grows.
+            0,
         )))
     }
 
@@ -303,7 +302,7 @@ impl CatalogEngine {
     /// Worker DDL sync: apply a master-broadcast system-table delta. Workers
     /// update their registry from these; durability is master-side (fsynced
     /// SAL + the master's own system-table flush). The worker's inherited copy
-    /// lives in RAM (memtable + `in_memory_l0`) and is never flushed by the
+    /// lives in RAM (memtable + the RAM tier) and is never flushed by the
     /// worker — only the master writes `_sys/` shards.
     ///
     /// Delegates to `apply_local` — the one ingest tail every path shares —

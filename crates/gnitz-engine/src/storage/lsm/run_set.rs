@@ -1,0 +1,435 @@
+//! `RunSet` — a set of in-heap sorted runs with a PK bloom and a fold trigger.
+//!
+//! Both RAM tiers of a [`Table`](super::table::Table) are this: the memtable
+//! accepts ingest batches and folds them into one run at 3/4 of its arena; the
+//! RAM tier accepts those folded runs and spills to a shard past its ceiling.
+//! Same runs, same fold, same probe — only the byte trigger and where the folded
+//! run goes differ, and those live in `Table` as policy.
+
+use std::cell::OnceCell;
+use std::rc::Rc;
+
+use super::batch::{write_to_batch, Batch, Layout};
+use super::bloom::BloomFilter;
+use super::merge::{self, SortedMemBatch};
+use crate::schema::key::pack_pk_be;
+use crate::schema::SchemaDescriptor;
+
+/// Runs to accumulate before folding them into one. Bounds the cost of cursor
+/// builds and PK probes, and cancels weight-cancelled rows early.
+///
+/// Measured by e2e ingest sweep: 125k rows/s at 4, 143k at 16, 133k at 32 — a
+/// smaller value folds too eagerly, a larger one leaves too many runs for the
+/// merge and the probe to walk.
+pub(super) const FOLD_THRESHOLD: usize = 16;
+
+/// Rough bytes per row, used to size the bloom from a byte budget.
+const EST_BYTES_PER_ROW: usize = 40;
+
+pub(super) struct RunSet {
+    runs: Vec<Rc<Batch>>,
+    /// PK bloom over every live run, built **lazily on the first probe** and
+    /// maintained on later pushes. A set is written far more often than it is
+    /// point-probed — view and operator-trace tables never probe at all — so
+    /// hashing every ingested row up front would be pure overhead for the bulk
+    /// of ingest volume. Base tables probe once per DML row, so they build once
+    /// per fold window and amortize. Dropped on every fold and rebuilt on the
+    /// next probe, which also clears the stale hashes of weight-cancelled rows.
+    ///
+    /// A worker owns its partition single-threaded, so `OnceCell` needs no
+    /// synchronization.
+    bloom: OnceCell<BloomFilter>,
+    /// Heap budget: [`is_full`](Self::is_full) reports crossing it, and the
+    /// bloom's key capacity is derived from it. What crossing it *means* — fold
+    /// into the next tier, or spill to a shard — is `Table`'s policy.
+    budget: usize,
+    bytes: usize,
+}
+
+impl RunSet {
+    pub(super) fn new(budget: usize) -> Self {
+        RunSet {
+            runs: Vec::with_capacity(FOLD_THRESHOLD),
+            bloom: OnceCell::new(),
+            budget,
+            bytes: 0,
+        }
+    }
+
+    /// Append a run, folding the set when it gets crowded. Empty runs are never
+    /// stored, so `is_empty()` is exactly "no rows".
+    ///
+    /// The run must be consolidated — every consumer (the fold's N-way merge,
+    /// the PK probe's binary search) reads it as sorted and ghost-free. Producers
+    /// certify it via `into_consolidated`; the flag is re-checked against the
+    /// data here in debug builds, so a run that lies about its layout is caught
+    /// at the boundary rather than silently mis-merged.
+    pub(super) fn push(&mut self, run: Rc<Batch>, schema: &SchemaDescriptor) {
+        debug_assert!(
+            run.consolidated_verified(schema),
+            "RunSet::push requires a consolidated run",
+        );
+        if run.count == 0 {
+            return;
+        }
+        // Maintain the bloom only once built (first probe); an unprobed set pays
+        // nothing.
+        if let Some(bloom) = self.bloom.get_mut() {
+            bloom_add_batch(bloom, &run);
+        }
+        self.bytes += run.total_bytes();
+        self.runs.push(run);
+        if self.runs.len() >= FOLD_THRESHOLD {
+            self.fold(schema);
+        }
+    }
+
+    pub(super) fn runs(&self) -> &[Rc<Batch>] {
+        &self.runs
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.runs.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(super) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The set has outgrown its heap budget and must be drained by its owner.
+    pub(super) fn is_full(&self) -> bool {
+        self.bytes > self.budget
+    }
+
+    /// Shrink the budget so tests can drive the drain path without ingesting
+    /// megabytes.
+    #[cfg(test)]
+    pub(super) fn set_budget(&mut self, budget: usize) {
+        self.budget = budget;
+    }
+
+    pub(super) fn row_count(&self) -> usize {
+        self.runs.iter().map(|r| r.count).sum()
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.runs.clear();
+        self.bytes = 0;
+        self.bloom.take();
+    }
+
+    /// Fold every run into one consolidated run, dropping net-zero
+    /// (PK, payload) rows. The bloom is dropped rather than rebuilt: the next
+    /// probe rebuilds it from the survivors alone, so a set that is folded and
+    /// then flushed without being probed never pays for the rebuild at all.
+    pub(super) fn fold(&mut self, schema: &SchemaDescriptor) {
+        if self.runs.len() <= 1 {
+            return;
+        }
+        let sorted: Vec<SortedMemBatch> = self
+            .runs
+            .iter()
+            .map(|r| r.as_sorted_mem_batch(schema).expect("runs are always sorted"))
+            .collect();
+        let merged = consolidate_batches(&sorted, schema);
+        drop(sorted); // borrows self.runs; release before the mutable reborrow
+        self.runs.clear();
+        self.bloom.take();
+        self.bytes = merged.total_bytes();
+        if merged.count > 0 {
+            self.runs.push(Rc::new(merged));
+        } else {
+            self.bytes = 0;
+        }
+    }
+
+    /// Fold to a single run and return it, **retained** — a consumer whose write
+    /// fails leaves the data intact for retry, and clears the set itself once the
+    /// run is safely elsewhere. `None` when the set is empty or fully cancelled.
+    pub(super) fn fold_to_single(&mut self, schema: &SchemaDescriptor) -> Option<Rc<Batch>> {
+        self.fold(schema);
+        self.runs.first().map(Rc::clone)
+    }
+
+    /// Bloom probe for a PK by its OPK bytes, keyed identically to the insert
+    /// side, so it never produces a false negative at any PK width. The first
+    /// probe builds the filter from all live runs.
+    pub(super) fn may_contain(&self, opk_key: &[u8]) -> bool {
+        let bloom = self.bloom.get_or_init(|| {
+            // Sized to the budget's row capacity, NOT to the row count at first
+            // probe — a filter sized to first-probe contents would over-saturate
+            // as later pushes add incrementally.
+            let mut bloom = BloomFilter::new((self.budget / EST_BYTES_PER_ROW).max(16) as u32);
+            for run in &self.runs {
+                bloom_add_batch(&mut bloom, run);
+            }
+            bloom
+        });
+        bloom.may_contain(pack_pk_be(opk_key))
+    }
+}
+
+/// Insert every row's PK into `bloom`, keyed by its leading ≤16 OPK bytes via
+/// `pack_pk_be` — the same derivation the probe side packs with, which is what
+/// keeps signed PKs consistent (their sign-flipped `get_pk` value would not be).
+/// Wide PKs (`pk_stride > 16`) hash their prefix: add and probe pack identically,
+/// so there is no false negative; two wide PKs sharing a 16-byte prefix collide
+/// to one slot, a false positive the run scan resolves.
+fn bloom_add_batch(bloom: &mut BloomFilter, batch: &Batch) {
+    for i in 0..batch.count {
+        bloom.add(pack_pk_be(batch.get_pk_bytes(i)));
+    }
+}
+
+/// Merge N sorted MemBatch views into a single consolidated Batch.
+fn consolidate_batches(batches: &[SortedMemBatch], schema: &SchemaDescriptor) -> Batch {
+    if batches.is_empty() {
+        return Batch::empty_with_schema(schema);
+    }
+
+    let total_blob: usize = batches.iter().map(|b| b.blob.len()).sum();
+
+    // Consolidate and count survivors first, so the output arena — whose
+    // zero-fill and allocation dominate the flush provision cost — is sized to
+    // the post-cancellation row count, not the Σ-input upper bound. Aggregation
+    // trace folds cancel heavily (retract + insert per re-aggregated group), so
+    // `survivors.len()` is routinely a fraction of the input row count. The blob
+    // bound stays `total_blob` (survivors' blobs are a subset; blob is reserved,
+    // not zeroed, so an over-estimate costs nothing).
+    let survivors = merge::merge_survivors(batches, schema);
+    if survivors.is_empty() {
+        return Batch::empty_with_schema(schema);
+    }
+    let mut result = write_to_batch(schema, survivors.len(), total_blob, |writer| {
+        merge::scatter_survivors(batches, schema, &survivors, writer);
+    });
+    result.certify_layout(Layout::Consolidated, schema);
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{make_batch, make_schema_u64_i64};
+
+    fn push(set: &mut RunSet, schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) {
+        set.push(Rc::new(make_batch(schema, rows)), schema);
+    }
+
+    #[test]
+    fn fold_sums_weights_and_drops_ghosts() {
+        let schema = make_schema_u64_i64();
+        let mut set = RunSet::new(1 << 20);
+        assert!(set.is_empty());
+
+        push(&mut set, &schema, &[(10, 1, 100), (30, 1, 300)]);
+        push(&mut set, &schema, &[(20, 1, 200), (30, -1, 300)]);
+        assert_eq!(set.len(), 2);
+
+        let folded = set.fold_to_single(&schema).expect("survivors remain");
+        assert_eq!(folded.count, 2, "PK 30 cancels to a ghost");
+        assert_eq!(folded.get_pk(0), 10);
+        assert_eq!(folded.get_pk(1), 20);
+    }
+
+    /// A single run folds by handing back the run itself — no rewrite.
+    #[test]
+    fn fold_to_single_is_identity_for_one_run() {
+        let schema = make_schema_u64_i64();
+        let mut set = RunSet::new(1 << 20);
+        push(&mut set, &schema, &[(10, 1, 100), (20, 1, 200)]);
+        let original = Rc::clone(&set.runs()[0]);
+
+        let folded = set.fold_to_single(&schema).expect("one run");
+        assert!(Rc::ptr_eq(&folded, &original), "singleton fold must not rewrite");
+    }
+
+    #[test]
+    fn empty_and_fully_cancelled_sets_fold_to_none() {
+        let schema = make_schema_u64_i64();
+        let mut set = RunSet::new(1 << 20);
+        assert!(set.fold_to_single(&schema).is_none(), "empty set");
+
+        push(&mut set, &schema, &[(1, 1, 10)]);
+        push(&mut set, &schema, &[(1, -1, 10)]);
+        assert!(set.fold_to_single(&schema).is_none(), "fully cancelled set");
+        assert!(set.is_empty());
+        assert_eq!(set.bytes(), 0, "byte total tracks the fold");
+    }
+
+    /// Pushing past the threshold folds inline, so the run count never exceeds it.
+    #[test]
+    fn push_folds_at_the_threshold() {
+        let schema = make_schema_u64_i64();
+        let mut set = RunSet::new(1 << 20);
+        for i in 0..FOLD_THRESHOLD as u64 - 1 {
+            push(&mut set, &schema, &[(i + 1, 1, (i + 1) as i64 * 100)]);
+        }
+        assert_eq!(set.len(), FOLD_THRESHOLD - 1, "below the threshold: no fold");
+
+        push(&mut set, &schema, &[(FOLD_THRESHOLD as u64, 1, 1600)]);
+        assert_eq!(set.len(), 1, "the threshold push folds");
+        assert_eq!(set.row_count(), FOLD_THRESHOLD);
+    }
+
+    #[test]
+    fn empty_runs_are_never_stored() {
+        let schema = make_schema_u64_i64();
+        let mut set = RunSet::new(1 << 20);
+        set.push(Rc::new(make_batch(&schema, &[])), &schema);
+        assert!(set.is_empty());
+    }
+
+    /// The bloom answers for every live PK, is maintained across pushes once
+    /// built, and survives a fold (rebuilt lazily from the survivors).
+    #[test]
+    fn bloom_covers_live_rows_across_push_and_fold() {
+        let schema = make_schema_u64_i64();
+        let mut set = RunSet::new(1 << 20);
+        push(&mut set, &schema, &[(10, 1, 100), (20, 1, 200)]);
+
+        assert!(set.may_contain(&10u64.to_be_bytes()), "first probe builds the filter");
+        assert!(set.may_contain(&20u64.to_be_bytes()));
+
+        // Maintained incrementally once built.
+        push(&mut set, &schema, &[(30, 1, 300)]);
+        assert!(set.may_contain(&30u64.to_be_bytes()));
+
+        set.fold(&schema);
+        for pk in [10u64, 20, 30] {
+            assert!(set.may_contain(&pk.to_be_bytes()), "PK {pk} after fold");
+        }
+    }
+
+    /// A run handed out by `runs()` stays readable after the set is cleared —
+    /// the cursor-lifetime contract.
+    #[test]
+    fn handed_out_runs_survive_clear() {
+        let schema = make_schema_u64_i64();
+        let mut set = RunSet::new(1 << 20);
+        push(&mut set, &schema, &[(10, 1, 100)]);
+        let held = Rc::clone(&set.runs()[0]);
+
+        set.clear();
+        assert!(set.is_empty());
+        assert_eq!(held.count, 1);
+        assert_eq!(held.get_pk(0), 10);
+    }
+
+    /// A 2-row batch with descending PKs — not `(PK, payload)`-sorted.
+    fn desc_two_row_batch(schema: &SchemaDescriptor) -> Batch {
+        let mut b = Batch::with_capacity(*schema, 2);
+        for &(pk, val) in &[(20u128, 200i64), (10, 100)] {
+            b.extend_pk(pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b
+    }
+
+    /// A run that lies about being consolidated is rejected on the way in.
+    /// `set_layout_unchecked` stamps the tag without inspecting the data, so the
+    /// descending batch is built without complaint — but `push`, which skips a
+    /// re-fold on the strength of that tag, verifies it and panics. In production
+    /// the ingress strip clears the layout, so such a run never reaches a set.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "flagged consolidated")]
+    fn lying_consolidated_run_is_rejected() {
+        let schema = make_schema_u64_i64();
+        let mut set = RunSet::new(1 << 20);
+
+        let mut bad = desc_two_row_batch(&schema);
+        bad.set_layout_unchecked(Layout::Consolidated);
+        set.push(Rc::new(bad), &schema);
+    }
+
+    /// The same unsorted rows with the flags stripped (as the ingress strip
+    /// leaves every client batch) sort+consolidate and push without complaint.
+    #[test]
+    fn cleared_flags_unsorted_run_consolidates_ok() {
+        let schema = make_schema_u64_i64();
+        let mut set = RunSet::new(1 << 20);
+        push(&mut set, &schema, &[(5, 1, 50)]);
+
+        let clean = desc_two_row_batch(&schema);
+        set.push(Rc::new(clean.into_consolidated(&schema)), &schema);
+
+        let folded = set.fold_to_single(&schema).expect("three rows survive");
+        assert_eq!(folded.count, 3);
+        assert_eq!(folded.get_pk(0), 5);
+        assert_eq!(folded.get_pk(1), 10);
+        assert_eq!(folded.get_pk(2), 20);
+    }
+
+    /// Reduce-output shape: insertion + retraction across ticks, where each tick
+    /// retracts the previous aggregate and inserts the new one. Only the last
+    /// tick's aggregate may survive the fold.
+    #[test]
+    fn reduce_output_folds_to_the_latest_aggregate() {
+        use crate::schema::{type_code, SchemaColumn};
+
+        // U128 PK + I64 group_val + I64 agg_val.
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let make = |rows: &[(u128, i64, i64, i64)]| {
+            let mut b = Batch::with_capacity(schema, rows.len().max(1));
+            for &(pk, w, gv, av) in rows {
+                b.extend_pk(pk);
+                b.extend_weight(&w.to_le_bytes());
+                b.extend_null_bmp(&0u64.to_le_bytes());
+                b.extend_col(0, &gv.to_le_bytes());
+                b.extend_col(1, &av.to_le_bytes());
+                b.count += 1;
+            }
+            b.certify_layout(Layout::Sorted, &schema);
+            Rc::new(b.into_consolidated(&schema))
+        };
+
+        let mut set = RunSet::new(1 << 20);
+        set.push(make(&[(0, 1, 0, 5000)]), &schema);
+        set.push(make(&[(0, -1, 0, 5000), (0, 1, 0, 10000)]), &schema);
+        set.push(make(&[(0, -1, 0, 10000), (0, 1, 0, 15000)]), &schema);
+
+        let folded = set.fold_to_single(&schema).expect("the latest aggregate survives");
+        assert_eq!(folded.count, 1, "only the latest aggregate remains");
+        assert_eq!(folded.get_pk(0), 0);
+        assert_eq!(folded.get_weight(0), 1);
+        let agg = i64::from_le_bytes(folded.get_col_ptr(0, 1, 8).try_into().unwrap());
+        assert_eq!(agg, 15000);
+    }
+
+    #[test]
+    fn byte_total_tracks_pushes_and_folds() {
+        let schema = make_schema_u64_i64();
+        let mut set = RunSet::new(1 << 20);
+        assert_eq!(set.bytes(), 0);
+        push(&mut set, &schema, &[(1, 1, 10)]);
+        let one = set.bytes();
+        assert!(one > 0);
+        push(&mut set, &schema, &[(2, 1, 20)]);
+        assert_eq!(set.bytes(), 2 * one, "pushes accumulate");
+
+        set.fold(&schema);
+        assert_eq!(
+            set.bytes(),
+            set.runs()[0].total_bytes(),
+            "fold re-derives from the merged run"
+        );
+    }
+}

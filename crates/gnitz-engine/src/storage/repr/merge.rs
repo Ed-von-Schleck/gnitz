@@ -1,4 +1,4 @@
-//! In-memory N-way merge for MemTable consolidation.
+//! In-memory N-way merge for run-set consolidation.
 //!
 //! Operates on flat columnar buffers: pk[u128 LE], weight[i64],
 //! null_bitmap[u64], payload columns, blob arena.
@@ -771,7 +771,7 @@ fn run_merge_body<S, RowCmp>(
 }
 
 // ---------------------------------------------------------------------------
-// merge_batches: the flush-path entry point (MemTable run consolidation)
+// merge_batches: the flush-path entry point (run-set consolidation)
 // ---------------------------------------------------------------------------
 
 /// Phase 1 of the flush/compaction merge: run the [`run_merge`] N-way
@@ -1327,7 +1327,7 @@ mod tests {
         b
     }
 
-    /// One `compact_in_memory` unit of work at its real skewed run shape: the
+    /// One RAM-tier fold unit of work at its real skewed run shape: the
     /// full `consolidate_batches` composition (`write_to_batch` arena +
     /// `run_merge` + `scatter_unified_sources_with_weights`) over **1 big run +
     /// 4 small runs**. Existing merge benches use balanced K=4 only; this is the

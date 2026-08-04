@@ -206,7 +206,7 @@ impl CatalogEngine {
             return Err(format!("scan_spec: malformed index column list for table {source}"));
         }
         if exact {
-            Ok(match self.open_index_range_cursor(source, cols.as_slice(), desc, 0)? {
+            Ok(match self.open_index_range_cursor(source, cols.as_slice(), desc)? {
                 None => ScanSpecCursor::Source(SourceCursor::Empty),
                 Some(c) => ScanSpecCursor::Source(SourceCursor::Bounded(Box::new(c))),
             })

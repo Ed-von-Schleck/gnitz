@@ -49,10 +49,6 @@ impl BloomFilter {
         }
         true
     }
-
-    pub fn reset(&mut self) {
-        self.bits.fill(0);
-    }
 }
 
 #[cfg(test)]
@@ -84,22 +80,6 @@ mod tests {
         }
         // 10 bits/key, 7 probes → theoretical ~0.8%. Allow up to 5%.
         assert!(fp < 50, "FPR too high: {fp}/1000");
-    }
-
-    #[test]
-    fn reset_clears() {
-        let mut bf = BloomFilter::new(10);
-        for i in 0u64..10 {
-            bf.add(i as u128);
-        }
-        bf.reset();
-        let mut found = 0u32;
-        for i in 0u64..10 {
-            if bf.may_contain(i as u128) {
-                found += 1;
-            }
-        }
-        assert_eq!(found, 0, "reset didn't clear all bits");
     }
 
     #[test]
@@ -145,32 +125,5 @@ mod tests {
             }
         }
         assert!(fp < 10, "too many false positives for low-bit keys: {fp}/100");
-    }
-
-    #[test]
-    fn reset_then_readd() {
-        let mut bf = BloomFilter::new(10);
-        for i in 0u64..10 {
-            bf.add(i as u128);
-        }
-        bf.reset();
-        // Re-add a different set after reset.
-        for i in 100u64..110 {
-            bf.add(i as u128);
-        }
-        for i in 100u64..110 {
-            assert!(
-                bf.may_contain(i as u128),
-                "false negative after reset+readd for key {i}"
-            );
-        }
-        // Original keys must not reliably appear (zero bits, near-zero FPR expected).
-        let mut fp = 0u32;
-        for i in 0u64..10 {
-            if bf.may_contain(i as u128) {
-                fp += 1;
-            }
-        }
-        assert!(fp < 5, "old keys still present after reset: {fp}/10");
     }
 }

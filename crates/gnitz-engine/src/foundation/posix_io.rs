@@ -118,11 +118,6 @@ pub(crate) fn fdatasync_eintr(fd: c_int) -> std::io::Result<()> {
     retry_eintr(|| unsafe { libc::fdatasync(fd) })
 }
 
-/// `fsync` with EINTR retry. Returns the OS error on any other failure.
-pub(crate) fn fsync_eintr(fd: c_int) -> std::io::Result<()> {
-    retry_eintr(|| unsafe { libc::fsync(fd) })
-}
-
 /// Pre-allocate blocks for fd.
 pub fn fallocate(fd: c_int, length: i64) -> std::io::Result<()> {
     retry_eintr(|| unsafe { libc::fallocate(fd, 0, 0, length as libc::off_t) })

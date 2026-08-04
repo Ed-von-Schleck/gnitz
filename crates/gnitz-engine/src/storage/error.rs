@@ -1,7 +1,7 @@
 //! Domain-specific error type for the storage subsystem.
 //!
 //! Replaces the historical `Result<_, i32>` / negative-i32 sentinel pattern
-//! that several modules (wal, manifest, shard_file, shard_reader, memtable,
+//! that several modules (wal, manifest, shard_file, shard_reader, run_set,
 //! table, partitioned_table, shard_index, compact) used to share —
 //! sometimes with overlapping `-1`/`-2`/`-3` meanings.
 //!

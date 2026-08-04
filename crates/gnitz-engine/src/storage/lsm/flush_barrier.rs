@@ -31,10 +31,13 @@ pub enum FlushRound {
 }
 
 impl FlushRound {
-    fn prepare(self, t: &mut Table) -> Result<FlushOutcome, StorageError> {
+    /// The generation to stamp a published manifest with. `None` on the base
+    /// round, which publishes no generation — only `RederiveCheckpointed` opens
+    /// read one back.
+    pub(super) fn generation(self) -> Option<u64> {
         match self {
-            FlushRound::Base => t.flush_prepare(),
-            FlushRound::Ephemeral(generation) => t.flush_prepare_ephemeral(generation),
+            FlushRound::Base => None,
+            FlushRound::Ephemeral(g) => Some(g),
         }
     }
 }
@@ -54,7 +57,7 @@ pub fn flush_barrier(tables: impl IntoIterator<Item = *mut Table>, round: FlushR
     let mut flushed: Vec<*mut Table> = Vec::new();
 
     for t in tables {
-        let work = match round.prepare(unsafe { &mut *t })? {
+        let work = match unsafe { &mut *t }.flush_prepare(round)? {
             FlushOutcome::Done => continue,
             FlushOutcome::Pending(w) => w,
         };

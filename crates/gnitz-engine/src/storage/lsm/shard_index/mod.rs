@@ -6,28 +6,17 @@
 //! range/cstring helpers, the level constants, and the constructor live here so
 //! both sub-modules read the (private) fields and helpers directly.
 
-use std::cmp::Ordering;
 use std::ffi::CString;
 use std::rc::Rc;
 
 use super::error::StorageError;
 use super::shard_reader::MappedShard;
 use crate::schema::key::PkBuf;
-use crate::schema::key::{compare_pk_bytes, pk_bytes_eq};
+use crate::schema::key::{pk_bytes_eq, pk_in_range};
 use crate::schema::SchemaDescriptor;
 
 mod index;
 mod persist;
-
-/// PK range check over OPK bytes: `min <= key <= max`. All three operands are
-/// order-preserving big-endian, so this is a raw `memcmp` at every PK width — no
-/// schema. `&[u8]` key so the `sort_by`/probe closures never copy the 81-byte
-/// `PkBuf` by value.
-#[inline]
-fn pk_in_range(min: &PkBuf, max: &PkBuf, key: &[u8]) -> bool {
-    compare_pk_bytes(min.pk_bytes(), key) != Ordering::Greater
-        && compare_pk_bytes(key, max.pk_bytes()) != Ordering::Greater
-}
 
 /// Serialized level bound: level numbers run 0 (L0) ..= `FLSM_LEVELS`, and
 /// `load_manifest` rejects anything at or above `MAX_LEVELS`.
@@ -86,7 +75,7 @@ impl ShardEntry {
         if self.is_empty() {
             return None;
         }
-        if !pk_in_range(&self.pk_min, &self.pk_max, key) {
+        if !pk_in_range(self.pk_min.pk_bytes(), self.pk_max.pk_bytes(), key) {
             return None;
         }
         if !self.shard.xor8_may_contain(xor8_key) {
@@ -1082,15 +1071,15 @@ mod tests {
         let above = opk2(3, 0); // (3,0): col0 > 2
 
         assert!(
-            pk_in_range(&min, &max, &inside),
+            pk_in_range(min.pk_bytes(), max.pk_bytes(), &inside),
             "key inside the true compound range must not be pruned",
         );
         assert!(
-            !pk_in_range(&min, &max, &below),
+            !pk_in_range(min.pk_bytes(), max.pk_bytes(), &below),
             "key below the true compound range must be pruned",
         );
         assert!(
-            !pk_in_range(&min, &max, &above),
+            !pk_in_range(min.pk_bytes(), max.pk_bytes(), &above),
             "key above the true compound range must be pruned",
         );
 

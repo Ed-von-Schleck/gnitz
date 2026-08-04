@@ -1,15 +1,16 @@
 //! End-to-end microbenchmark for the RAM-tier per-tick flush policy: the
-//! composition of `fold_memtable_into_l0` (memtable consolidation + per-run
-//! bloom), `compact_in_memory` (window re-merge + re-materialize + re-bloom)
-//! and `spill_in_memory_to_disk`, driven at the production trigger thresholds.
+//! composition of `fold_memtable_into_l0` (memtable consolidation), the RAM
+//! tier's own fold at `FOLD_THRESHOLD` (window re-merge + re-materialize) and
+//! `spill_in_memory_to_disk`, driven at the production trigger thresholds.
 //!
 //! This is the bench a compaction-policy change must move, and the one whose
 //! `perf` profile must reproduce the e2e worker hot-symbol shape. As a child
 //! module of `table` it reaches `Table`'s ingest/flush API and the
-//! `INMEM_COMPACT_THRESHOLD` const directly.
+//! `FOLD_THRESHOLD` const directly.
 
 use super::super::batch::Batch;
-use super::{RecoverySource, Table, INMEM_COMPACT_THRESHOLD};
+use super::super::run_set::FOLD_THRESHOLD;
+use super::{RecoverySource, Table};
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 
 /// The view-output-store shape of `v_rev`: one hidden U64 group key + two
@@ -148,18 +149,18 @@ fn flush_cadence_amplification_bench() {
         let t = Instant::now();
         for batch in ticks {
             // Sampled before the fold; +1 accounts for the incoming fold's run.
-            let runs_before = table.in_memory_runs().count();
+            let runs_before = table.ram_run_count();
             table.ingest_owned_batch(batch).unwrap();
             table.flush().unwrap(); // Rederive → flush_prepare → flush_to_ram
-            if runs_before + 1 > INMEM_COMPACT_THRESHOLD {
-                merged_out += table.in_memory_runs().map(|b| b.count).sum::<usize>();
+            if runs_before + 1 > FOLD_THRESHOLD {
+                merged_out += table.ram_row_count();
             }
         }
         let secs = t.elapsed().as_secs_f64();
 
         assert!(merged_out > 0, "{label}: compaction never fired");
         assert!(
-            table.in_memory_runs().count() <= INMEM_COMPACT_THRESHOLD,
+            table.ram_run_count() <= FOLD_THRESHOLD,
             "{label}: RAM-tier run bound violated",
         );
         black_box(merged_out);

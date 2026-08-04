@@ -6,6 +6,7 @@
 use std::cell::OnceCell;
 use std::cmp::Ordering;
 use std::ptr;
+#[cfg(test)]
 use std::rc::Rc;
 
 use super::batch::Batch;
@@ -13,16 +14,16 @@ use super::columnar::with_payload_cmp;
 use super::columnar::ColumnarSource;
 use super::heap::{drive_merge, HeapNode, LoserTree};
 use super::merge::{self, UnifiedSource};
+#[cfg(test)]
 use super::shard_reader::MappedShard;
 use crate::schema::key::{compare_pk_ordering, pk_bytes_eq};
 use crate::schema::SchemaDescriptor;
 
 mod output;
-mod source;
 
+use super::run::Run;
 use gnitz_expr::RowSource;
 pub(crate) use output::DrainGuard;
-use source::CursorSource;
 
 #[cfg(test)]
 thread_local! {
@@ -44,8 +45,9 @@ pub(crate) const DDL_SCAN_CHUNK_ROWS: usize = 65_536;
 
 struct CursorState {
     position: usize,
-    /// Cached so `is_valid()` and `estimated_length()` work on
-    /// `&[CursorState]` alone, without a parallel borrow of `&[CursorSource]`.
+    /// The source's row count, or the upper bound a range seek clamped it to
+    /// (`seek_range_bytes`). Cached here so validity and the range clamp read
+    /// `&[CursorState]` alone, without a parallel borrow of `&[Run]`.
     count: usize,
 }
 
@@ -63,7 +65,7 @@ impl CursorState {
 
     /// Seek to the first row whose OPK bytes are `>= key`. `key` must be exactly
     /// `pk_stride` OPK bytes.
-    fn seek_bytes(&mut self, src: &CursorSource, key: &[u8]) {
+    fn seek_bytes(&mut self, src: &Run, key: &[u8]) {
         self.position = src.find_lower_bound_bytes(key);
     }
 
@@ -71,7 +73,7 @@ impl CursorState {
     /// seeded at the live `position`. Forward-only and position-owned, so a
     /// stale or non-monotone hint is unrepresentable — equals `seek_bytes`'s
     /// landing index for any key, only cheaper when the boundary moves forward.
-    fn advance_to(&mut self, src: &CursorSource, key: &[u8]) {
+    fn advance_to(&mut self, src: &Run, key: &[u8]) {
         self.position = src.advance_to(key, self.position);
     }
 }
@@ -107,7 +109,7 @@ enum SourceMode {
 }
 
 pub struct ReadCursor {
-    sources: Vec<CursorSource>,
+    sources: Vec<Run>,
     states: Vec<CursorState>,
     /// Many cursor consumers (point lookups, seeks) never call
     /// `scatter_drained_into`; build on first use.
@@ -125,8 +127,8 @@ pub struct ReadCursor {
 /// The comparator the `_with` variants are monomorphized over — the same
 /// [`merge::RowComparator`] the flush/compaction kernel uses, at this cursor's
 /// source type.
-trait RowComparator: merge::RowComparator<CursorSource> {}
-impl<F: merge::RowComparator<CursorSource>> RowComparator for F {}
+trait RowComparator: merge::RowComparator<Run> {}
+impl<F: merge::RowComparator<Run>> RowComparator for F {}
 
 impl ReadCursor {
     /// Build a ReadCursor from owned in-memory batches (no shards) — a test-only
@@ -147,7 +149,7 @@ impl ReadCursor {
     /// built.
     #[inline]
     fn build_tree_with<RowCmp: RowComparator>(
-        sources: &[CursorSource],
+        sources: &[Run],
         states: &[CursorState],
         schema: &SchemaDescriptor,
         row_cmp: RowCmp,
@@ -156,7 +158,7 @@ impl ReadCursor {
         LoserTree::build(sources.len(), init, merge::merge_less(schema, sources, row_cmp))
     }
 
-    fn build_tree(sources: &[CursorSource], states: &[CursorState], schema: &SchemaDescriptor) -> LoserTree {
+    fn build_tree(sources: &[Run], states: &[CursorState], schema: &SchemaDescriptor) -> LoserTree {
         // `with_payload_cmp!` selects the payload comparator; the PK axis is
         // `compare_pk_ordering` (no stride dispatch).
         with_payload_cmp!(schema, Self::build_tree_with, sources, states, schema)
@@ -173,7 +175,7 @@ impl ReadCursor {
     /// backward-capable, so a later seek at a lower key can move a source that a
     /// range seek emptied back inside its clamped window. Dropping the source
     /// would discard rows it can still contribute.
-    fn mode_for(sources: &[CursorSource], states: &[CursorState], schema: &SchemaDescriptor) -> SourceMode {
+    fn mode_for(sources: &[Run], states: &[CursorState], schema: &SchemaDescriptor) -> SourceMode {
         let mut live = states
             .iter()
             .enumerate()
@@ -186,7 +188,7 @@ impl ReadCursor {
         }
     }
 
-    fn new(sources: Vec<CursorSource>, states: Vec<CursorState>, schema: SchemaDescriptor) -> Self {
+    fn new(sources: Vec<Run>, states: Vec<CursorState>, schema: SchemaDescriptor) -> Self {
         debug_assert_eq!(sources.len(), states.len());
         let mode = Self::mode_for(&sources, &states, &schema);
         let mut cursor = ReadCursor {
@@ -341,7 +343,7 @@ impl ReadCursor {
     /// `compare_pk_ordering`.
     fn seek_phase(
         heap: &mut LoserTree,
-        sources: &[CursorSource],
+        sources: &[Run],
         states: &mut [CursorState],
         key: &[u8],
         less: &impl Fn(&HeapNode, &HeapNode) -> bool,
@@ -402,7 +404,7 @@ impl ReadCursor {
     /// kernels (`compare_rows`, group-key extraction, row copies). Resolves the
     /// (entry, row) pair once per row; the returned source is the current row's
     /// **own** entry, so its blob arena backs the row's German strings. The
-    /// opaque `impl RowSource` keeps `CursorSource` private to lsm; every use is
+    /// opaque `impl RowSource` keeps `Run` private to lsm; every use is
     /// monomorphic. The bound is `RowSource`, not `ColumnarSource`: a cursor's
     /// weight comes off the cursor (`current_weight`), never off the positioned
     /// source. Callers must gate on `valid` first.
@@ -605,8 +607,8 @@ impl ReadCursor {
     }
 
     /// Single-live-source bypass: no heap, no ghost filter. Every production
-    /// `Batch` source is a memtable run (`upsert_sorted_batch` debug-asserts each
-    /// one consolidated) and shards are ghost-free by construction, so the state's
+    /// `Batch` source is a run set's run (`RunSet::push` debug-asserts each one
+    /// consolidated) and shards are ghost-free by construction, so the state's
     /// current position is either valid emit-ready or past-end. The other
     /// sources — if any — have an empty `[position, count)` window and cannot
     /// contribute a row to fold against. Routes through `commit_emitted` so
@@ -629,7 +631,7 @@ impl ReadCursor {
     #[inline]
     fn drive_inner<L, SP, EQ>(
         heap: &mut LoserTree,
-        sources: &[CursorSource],
+        sources: &[Run],
         states: &mut [CursorState],
         less: L,
         same_pk: SP,
@@ -841,31 +843,30 @@ impl ReadCursor {
     /// Returning only `pk_lo` for a 16-byte PK would silently truncate the
     /// high half regardless of backing source.
     pub fn col_ptr(&self, col_idx: usize, col_size: usize) -> *const u8 {
-        if !self.valid {
-            return ptr::null();
-        }
-        // A PK column has no payload slot, which is the null result.
-        let Some(payload_idx) = self.schema.try_payload_idx(col_idx) else {
-            return ptr::null();
-        };
-        let src = &self.sources[self.current_entry_idx];
-        gnitz_expr::RowSource::get_col_ptr(src, self.current_row, payload_idx, col_size).as_ptr()
+        self.col_bytes(col_idx, col_size).map_or(ptr::null(), <[u8]>::as_ptr)
     }
 
     /// Raw bytes of logical column `col` (length `size`) for the current row, or
-    /// `None` when the column pointer is null — invalid cursor, PK column, or an
-    /// out-of-range/absent column. Centralizes the `col_ptr` + `from_raw_parts`
-    /// unsafe read shared by the reduce operator's column reads.
+    /// `None` for an invalid cursor, a PK column, or an out-of-range/absent
+    /// column. The primitive the pointer form above is derived from — the source
+    /// accessor already returns a bounds-carrying slice, so nothing here has to
+    /// rebuild one from a raw pointer.
     ///
-    /// Does NOT consult the null bitmap: a NULL *value* still yields `Some` bytes
-    /// (`col_ptr` never reads the null word), so callers needing NULL semantics
-    /// check `col_is_null` / the null word first.
+    /// Does NOT consult the null bitmap: a NULL *value* still yields `Some` bytes,
+    /// so callers needing NULL semantics check `col_is_null` / the null word first.
     pub(crate) fn col_bytes(&self, col: usize, size: usize) -> Option<&[u8]> {
-        let ptr = self.col_ptr(col, size);
-        if ptr.is_null() {
+        if !self.valid {
             return None;
         }
-        Some(unsafe { std::slice::from_raw_parts(ptr, size) })
+        // A PK column has no payload slot, which is the `None` result.
+        let payload_idx = self.schema.try_payload_idx(col)?;
+        let src = &self.sources[self.current_entry_idx];
+        Some(gnitz_expr::RowSource::get_col_ptr(
+            src,
+            self.current_row,
+            payload_idx,
+            size,
+        ))
     }
 
     /// Blob arena slice (bounds-carrying) for the current row's source.
@@ -888,23 +889,20 @@ impl ReadCursor {
         }
     }
 
-    /// Read a fixed 8-byte little-endian integer at logical column `col` of the current
-    /// row. Every system/circuit column read this way is 8-byte; the `debug_assert`
-    /// catches schema drift in dev. A null column pointer (invalid cursor, PK, or
-    /// out-of-range column — `col_ptr` never consults the null bitmap, so a NULL *value*
-    /// still yields a valid pointer) degrades to 0 rather than dereferencing null, the
-    /// same degrade-don't-abort contract as `read_german_bytes`.
+    /// Read a fixed 8-byte little-endian integer at logical column `col` of the
+    /// current row. Every system/circuit column read this way is 8-byte; the
+    /// `debug_assert` catches schema drift in dev. An absent column (invalid
+    /// cursor, PK, or out of range — the null bitmap is not consulted, so a NULL
+    /// *value* still reads its bytes) degrades to 0, the same
+    /// degrade-don't-abort contract as `read_german_bytes`.
     pub(crate) fn read_i64(&self, col: usize) -> i64 {
         debug_assert_eq!(
             self.schema.columns[col].size() as usize,
             8,
             "read_i64: column not 8-byte"
         );
-        let ptr = self.col_ptr(col, 8);
-        if ptr.is_null() {
-            return 0;
-        }
-        i64::from_le_bytes(unsafe { *(ptr as *const [u8; 8]) })
+        self.col_bytes(col, 8)
+            .map_or(0, |b| i64::from_le_bytes(b.try_into().unwrap()))
     }
 
     /// True iff logical column `col` is NULL in the current row. PK columns are never
@@ -917,36 +915,37 @@ impl ReadCursor {
     }
 }
 
-/// Build a ReadCursor from in-memory batches + shard Rcs.
-///
-/// Both inputs are passed by `Rc`, so the cursor owns its data and has no
-/// borrow lifetime — see the `CursorSource` doc comment.
+/// Build a ReadCursor over `runs`, skipping empty ones. Each `Run` owns its
+/// backing via `Rc`, so the cursor has no borrow lifetime and callers hand it a
+/// lazy iterator rather than materializing a slice per tier.
+pub(crate) fn from_runs(runs: impl IntoIterator<Item = Run>, schema: SchemaDescriptor) -> ReadCursor {
+    let mut sources = Vec::new();
+    let mut states = Vec::new();
+    for run in runs {
+        let count = run.count();
+        if count > 0 {
+            sources.push(run);
+            states.push(CursorState { position: 0, count });
+        }
+    }
+    ReadCursor::new(sources, states, schema)
+}
+
+/// Test-only shorthand for [`from_runs`] over a batch slice and a shard slice.
+#[cfg(test)]
 pub(crate) fn create_read_cursor(
     batches: &[Rc<Batch>],
     shard_arcs: &[Rc<MappedShard>],
     schema: SchemaDescriptor,
 ) -> ReadCursor {
-    let cap = batches.len() + shard_arcs.len();
-    let mut sources = Vec::with_capacity(cap);
-    let mut states = Vec::with_capacity(cap);
-
-    for batch in batches {
-        if batch.count > 0 {
-            let count = batch.count;
-            sources.push(CursorSource::Batch(Rc::clone(batch)));
-            states.push(CursorState { position: 0, count });
-        }
-    }
-
-    for shard in shard_arcs {
-        if shard.count > 0 {
-            let count = shard.count;
-            sources.push(CursorSource::Shard(Rc::clone(shard)));
-            states.push(CursorState { position: 0, count });
-        }
-    }
-
-    ReadCursor::new(sources, states, schema)
+    from_runs(
+        batches
+            .iter()
+            .cloned()
+            .map(Run::Mem)
+            .chain(shard_arcs.iter().cloned().map(Run::Shard)),
+        schema,
+    )
 }
 
 // ---------------------------------------------------------------------------
