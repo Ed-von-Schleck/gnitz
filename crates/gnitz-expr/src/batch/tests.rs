@@ -7,9 +7,10 @@ use gnitz_wire::type_code;
 
 use super::{eval_batch, EvalScratch, MORSEL, NULL_WORDS_PER_REG};
 use crate::eval::read_reg_row0;
+use crate::program::IntUnaryOp;
 use crate::test_support::{
-    filter_prog, float_to_bits, make_int_row, make_int_view, make_n_col_view, scalar_prog, schema_pk_ints, TestSchema,
-    TestView,
+    bits_to_float, filter_prog, float_to_bits, make_int_row, make_int_view, make_n_col_view, scalar_prog,
+    schema_pk_ints, TestSchema, TestView,
 };
 use crate::{CmpOp, LogicalInstr, ResolvedProgram};
 
@@ -217,7 +218,11 @@ fn golden_int_neg_null_source_single_row() {
     let mb = make_int_row(&schema, &[0], 1);
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::IntNeg { dst: 1, a: 0 },
+        LogicalInstr::IntUnary {
+            op: IntUnaryOp::Neg,
+            dst: 1,
+            a: 0,
+        },
     ];
     let prog = resolved(&schema, instrs, 2, 1);
     let mut scratch = EvalScratch::default();
@@ -646,4 +651,301 @@ fn and_chain_skip_bench() {
         prog_off.chain_trigger_mask = 0;
         bench_chain(label, &prog_on, &prog_off, mb, N);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Numeric scalar functions and numeric CAST
+// ---------------------------------------------------------------------------
+
+use crate::program::FloatUnaryOp;
+
+/// Run a one-operand program over `n` rows of a single nullable I64 column,
+/// returning `(value, is_null)` per row. `mk` builds the instruction under test
+/// from `(dst, a)`; the operand register is loaded from column 1.
+fn run_unary_rows(vals: &[i64], nulls: &[bool], mk: impl Fn(u16, u16) -> LogicalInstr) -> Vec<(i64, bool)> {
+    let schema = schema_pk_ints(1, true);
+    let n = vals.len();
+    let view = make_n_col_view(&schema, n, |row, _| vals[row], |row, _| nulls[row]);
+    let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 1 }, mk(1, 0)];
+    let prog = resolved(&schema, instrs, 2, 1);
+    let mut scratch = EvalScratch::default();
+    scratch.ensure_capacity(&prog, n);
+    eval_batch(&prog, &view, 0, n, &mut scratch);
+    (0..n)
+        .map(|i| {
+            let v = scratch.regs[1 * MORSEL + i];
+            let null = (scratch.null_bits[1 * NULL_WORDS_PER_REG + i / 64] >> (i % 64)) & 1 != 0;
+            (v, null)
+        })
+        .collect()
+}
+
+/// Two-operand form of [`run_unary_rows`] over two nullable I64 columns.
+fn run_binary_rows(
+    a: &[i64],
+    b: &[i64],
+    a_null: &[bool],
+    b_null: &[bool],
+    mk: impl Fn(u16, u16, u16) -> LogicalInstr,
+) -> Vec<(i64, bool)> {
+    let schema = schema_pk_ints(2, true);
+    let n = a.len();
+    let view = make_n_col_view(
+        &schema,
+        n,
+        |row, col| if col == 0 { a[row] } else { b[row] },
+        |row, col| if col == 0 { a_null[row] } else { b_null[row] },
+    );
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadColInt { dst: 1, col: 2 },
+        mk(2, 0, 1),
+    ];
+    let prog = resolved(&schema, instrs, 3, 2);
+    let mut scratch = EvalScratch::default();
+    scratch.ensure_capacity(&prog, n);
+    eval_batch(&prog, &view, 0, n, &mut scratch);
+    (0..n)
+        .map(|i| {
+            let v = scratch.regs[2 * MORSEL + i];
+            let null = (scratch.null_bits[2 * NULL_WORDS_PER_REG + i / 64] >> (i % 64)) & 1 != 0;
+            (v, null)
+        })
+        .collect()
+}
+
+fn fu(op: FloatUnaryOp) -> impl Fn(u16, u16) -> LogicalInstr {
+    move |dst, a| LogicalInstr::FloatUnary { op, dst, a }
+}
+
+#[test]
+fn int_abs_wraps_at_min_and_propagates_null() {
+    let vals = [5i64, -5, 0, i64::MIN, 7];
+    let nulls = [false, false, false, false, true];
+    let out = run_unary_rows(&vals, &nulls, |dst, a| LogicalInstr::IntUnary {
+        op: IntUnaryOp::Abs,
+        dst,
+        a,
+    });
+    assert_eq!(out[0], (5, false));
+    assert_eq!(out[1], (5, false));
+    assert_eq!(out[2], (0, false));
+    // Rule 3: same-width, so it wraps rather than producing NULL.
+    assert_eq!(out[3], (i64::MIN, false));
+    assert!(out[4].1, "NULL in, NULL out");
+}
+
+#[test]
+fn float_unary_ops_match_ieee() {
+    let vals: Vec<i64> = [-0.0f64, 2.5, 3.5, -2.5, -1.7, f64::NAN]
+        .iter()
+        .map(|&f| float_to_bits(f))
+        .collect();
+    let nulls = vec![false; vals.len()];
+    let get = |out: &Vec<(i64, bool)>, i: usize| bits_to_float(out[i].0);
+
+    let abs = run_unary_rows(&vals, &nulls, fu(FloatUnaryOp::Abs));
+    assert!(get(&abs, 0).is_sign_positive(), "abs(-0.0) is +0.0");
+    assert!(get(&abs, 4) == 1.7);
+    assert!(get(&abs, 5).is_nan(), "abs(NaN) is NaN");
+
+    let round = run_unary_rows(&vals, &nulls, fu(FloatUnaryOp::Round));
+    assert_eq!(get(&round, 1), 2.0, "round_ties_even(2.5) = 2");
+    assert_eq!(get(&round, 2), 4.0, "round_ties_even(3.5) = 4");
+    assert_eq!(get(&round, 3), -2.0, "round_ties_even(-2.5) = -2");
+
+    let floor = run_unary_rows(&vals, &nulls, fu(FloatUnaryOp::Floor));
+    assert_eq!(get(&floor, 4), -2.0);
+    let ceil = run_unary_rows(&vals, &nulls, fu(FloatUnaryOp::Ceil));
+    assert_eq!(get(&ceil, 4), -1.0);
+    let trunc = run_unary_rows(&vals, &nulls, fu(FloatUnaryOp::Trunc));
+    assert_eq!(get(&trunc, 4), -1.0, "trunc is toward zero");
+}
+
+#[test]
+fn float_to_f32_nulls_only_on_finite_overflow() {
+    let vals: Vec<i64> = [0.1f64, 1e300, 1e-300, f64::INFINITY, f64::NAN, f32::MAX as f64]
+        .iter()
+        .map(|&f| float_to_bits(f))
+        .collect();
+    let nulls = vec![false; vals.len()];
+    let out = run_unary_rows(&vals, &nulls, |dst, a| LogicalInstr::FloatToF32 { dst, a });
+    let get = |i: usize| bits_to_float(out[i].0);
+
+    assert_eq!(get(0), 0.1f32 as f64, "rounded through f32 precision");
+    assert!(out[1].1, "finite value beyond f32 range is NULL");
+    assert_eq!(get(2), 0.0, "underflow flushes to zero, not NULL");
+    assert!(!out[2].1);
+    assert!(get(3).is_infinite() && !out[3].1, "inf passes through");
+    assert!(get(4).is_nan() && !out[4].1, "NaN passes through");
+    assert_eq!(get(5), f32::MAX as f64, "f32::MAX itself is not overflow");
+    assert!(!out[5].1);
+
+    // The values just above f32::MAX that round DOWN to it must not be NULLed.
+    let just_over = f32::MAX as f64 + 2.0f64.powi(102);
+    let v = vec![float_to_bits(just_over)];
+    let out = run_unary_rows(&v, &[false], |dst, a| LogicalInstr::FloatToF32 { dst, a });
+    assert!(!out[0].1, "rounds down to f32::MAX, so not an overflow");
+    assert_eq!(bits_to_float(out[0].0), f32::MAX as f64);
+}
+
+#[test]
+fn int_cast_range_checks_per_target_and_source_signedness() {
+    let vals = [200i64, -1, 127, 128, i64::MIN];
+    let nulls = vec![false; vals.len()];
+
+    // Signed source -> I8: only -128..=127 survive.
+    let out = run_unary_rows(&vals, &nulls, |dst, a| LogicalInstr::IntCast {
+        dst,
+        a,
+        tc: type_code::I8 as u32,
+    });
+    assert!(out[0].1, "200 out of I8");
+    assert_eq!(out[1], (-1, false));
+    assert_eq!(out[2], (127, false));
+    assert!(out[3].1, "128 out of I8");
+    assert!(out[4].1);
+
+    // Signed source -> U64: the check degenerates to "not negative".
+    let out = run_unary_rows(&vals, &nulls, |dst, a| LogicalInstr::IntCast {
+        dst,
+        a,
+        tc: type_code::U64 as u32,
+    });
+    assert_eq!(out[0], (200, false));
+    assert!(out[1].1, "-1 has no U64 image");
+    assert!(out[4].1);
+
+    // Unsigned source -> I64: values >= 2^63 fail. The U64 taint comes from a
+    // U64 column load, which is what makes `src_signed` false.
+    let schema = TestSchema::new(&[(type_code::U64, false), (type_code::U64, true)], &[0]);
+    let n = 2;
+    let big = i64::MIN; // bit pattern 2^63
+    let view = make_n_col_view(&schema, n, |row, _| if row == 0 { 5 } else { big }, |_, _| false);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::IntCast {
+            dst: 1,
+            a: 0,
+            tc: type_code::I64 as u32,
+        },
+    ];
+    let prog = resolved(&schema, instrs, 2, 1);
+    let mut scratch = EvalScratch::default();
+    scratch.ensure_capacity(&prog, n);
+    eval_batch(&prog, &view, 0, n, &mut scratch);
+    assert_eq!(scratch.regs[1 * MORSEL], 5);
+    assert!((scratch.null_bits[1 * NULL_WORDS_PER_REG] & 1) == 0, "5 fits I64");
+    assert!(
+        (scratch.null_bits[1 * NULL_WORDS_PER_REG] >> 1) & 1 != 0,
+        "2^63 read as u64 exceeds I64"
+    );
+}
+
+#[test]
+fn float_to_int_truncates_and_bounds_exclusively() {
+    let vals: Vec<i64> = [
+        2.7f64,
+        -2.7,
+        f64::NAN,
+        f64::INFINITY,
+        1e300,
+        9223372036854775808.0, // 2^63 exactly: out of I64
+        9223372036854775000.0, // < 2^63: in range
+    ]
+    .iter()
+    .map(|&f| float_to_bits(f))
+    .collect();
+    let nulls = vec![false; vals.len()];
+    let out = run_unary_rows(&vals, &nulls, |dst, a| LogicalInstr::FloatToInt {
+        dst,
+        a,
+        tc: type_code::I64 as u32,
+    });
+    assert_eq!(out[0], (2, false), "truncate toward zero");
+    assert_eq!(out[1], (-2, false), "truncate toward zero");
+    assert!(out[2].1, "NaN fails every comparison");
+    assert!(out[3].1);
+    assert!(out[4].1);
+    assert!(out[5].1, "2^63 is excluded by the half-open upper bound");
+    assert!(!out[6].1);
+
+    // Narrow target: the same exclusive rule admits exactly -128..=127.
+    let vals: Vec<i64> = [127.9f64, 128.0, -128.0, -128.9]
+        .iter()
+        .map(|&f| float_to_bits(f))
+        .collect();
+    let out = run_unary_rows(&vals, &[false; 4], |dst, a| LogicalInstr::FloatToInt {
+        dst,
+        a,
+        tc: type_code::I8 as u32,
+    });
+    assert_eq!(out[0], (127, false));
+    assert!(out[1].1);
+    assert_eq!(out[2], (-128, false));
+    assert_eq!(out[3], (-128, false), "-128.9 truncates toward zero to -128, in range");
+}
+
+#[test]
+fn minmax2_skips_nulls_and_is_null_only_when_both_are() {
+    let a = [1i64, 5, 9, 0, 0];
+    let b = [2i64, 3, 0, 7, 0];
+    let an = [false, false, false, true, true];
+    let bn = [false, false, true, false, true];
+
+    let max = run_binary_rows(&a, &b, &an, &bn, |dst, a, b| LogicalInstr::IntMinMax2 {
+        dst,
+        a,
+        b,
+        is_max: true,
+    });
+    assert_eq!(max[0], (2, false));
+    assert_eq!(max[1], (5, false));
+    assert_eq!(max[2], (9, false), "b NULL -> a");
+    assert_eq!(max[3], (7, false), "a NULL -> b");
+    assert!(max[4].1, "both NULL -> NULL");
+
+    let min = run_binary_rows(&a, &b, &an, &bn, |dst, a, b| LogicalInstr::IntMinMax2 {
+        dst,
+        a,
+        b,
+        is_max: false,
+    });
+    assert_eq!(min[0], (1, false));
+    assert_eq!(min[2], (9, false), "b NULL -> a, regardless of value");
+    assert!(min[4].1);
+}
+
+#[test]
+fn float_minmax2_uses_total_cmp_order() {
+    let f = float_to_bits;
+    let a = [f(5.0), f(5.0), f(-0.0), f(f64::INFINITY)];
+    let b = [f(f64::NAN), f(2.0), f(0.0), f(f64::NAN)];
+    let no = [false; 4];
+
+    let max = run_binary_rows(&a, &b, &no, &no, |dst, a, b| LogicalInstr::FloatMinMax2 {
+        dst,
+        a,
+        b,
+        is_max: true,
+    });
+    assert!(bits_to_float(max[0].0).is_nan(), "NaN is the total-order max");
+    assert_eq!(bits_to_float(max[1].0), 5.0);
+    assert!(
+        bits_to_float(max[2].0).is_sign_positive(),
+        "+0.0 beats -0.0 under total_cmp"
+    );
+    assert!(bits_to_float(max[3].0).is_nan(), "NaN outranks +inf");
+
+    let min = run_binary_rows(&a, &b, &no, &no, |dst, a, b| LogicalInstr::FloatMinMax2 {
+        dst,
+        a,
+        b,
+        is_max: false,
+    });
+    assert_eq!(bits_to_float(min[0].0), 5.0, "NaN loses MIN");
+    assert!(
+        bits_to_float(min[2].0).is_sign_negative(),
+        "-0.0 wins MIN under total_cmp"
+    );
 }

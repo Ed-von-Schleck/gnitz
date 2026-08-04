@@ -285,11 +285,11 @@ def test_having_constants_and_edges(client, hg):
     empty source, and -0.0 truthiness — each with a positive control, so a
     "drops everything" implementation cannot pass."""
     # A statically-true HAVING folds away; 0 compiles to a real LoadConst that
-    # drops every group. (A bare `HAVING NULL` never reaches either compiler —
-    # the binder rejects a bare NULL literal, identically on both paths.)
+    # drops every group, and NULL is UNKNOWN — never truthy — so it drops every
+    # group too.
     assert _keys(_rows(client, hg, "SELECT cat FROM hg GROUP BY cat HAVING 1"), "cat") == [1, 2, 3]
     assert _rows(client, hg, "SELECT cat FROM hg GROUP BY cat HAVING 0") == []
-    _reject_both(client, hg, "SELECT cat FROM hg GROUP BY cat HAVING NULL")
+    assert _parity(client, hg, "SELECT cat FROM hg GROUP BY cat HAVING NULL") == []
     # Every group dropped, and its control.
     assert _parity(client, hg, "SELECT cat FROM hg GROUP BY cat HAVING COUNT(*) > 99") == []
     assert _keys(_parity(client, hg, "SELECT cat FROM hg GROUP BY cat HAVING COUNT(*) > 0"), "cat") == [1, 2, 3]

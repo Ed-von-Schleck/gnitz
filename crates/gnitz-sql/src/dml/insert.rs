@@ -376,6 +376,8 @@ fn bind_do_update_rhs(expr: &Expr, target: usize, schema: &Schema) -> Result<Bou
 fn expr_contains_excluded(expr: &Expr) -> bool {
     match expr {
         Expr::CompoundIdentifier(parts) => parts.len() == 2 && parts[0].value.eq_ignore_ascii_case("EXCLUDED"),
+        // An unrecognised node answers `true`, so an EXCLUDED reference the
+        // binder would reach can never hide from the guard.
         _ => crate::ast_util::expr_operands(expr)
             .into_iter()
             .any(expr_contains_excluded),
@@ -658,6 +660,12 @@ mod tests {
             "val BETWEEN EXCLUDED.a AND 10",
             "val IN (1, EXCLUDED.a)",
             "EXCLUDED.a IS NULL",
+            "CAST(EXCLUDED.a AS BIGINT)",
+            "EXCLUDED.a::BIGINT",
+            "CEIL(EXCLUDED.a)",
+            "FLOOR(EXCLUDED.a)",
+            "ABS(EXCLUDED.a)",
+            "GREATEST(val, EXCLUDED.a)",
         ] {
             assert!(expr_contains_excluded(&parse(src)), "must detect EXCLUDED in {src}");
         }

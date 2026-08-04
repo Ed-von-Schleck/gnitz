@@ -15,8 +15,10 @@ use std::fmt;
 use gnitz_wire::{
     EXPR_BOOL_AND, EXPR_BOOL_NOT, EXPR_BOOL_OR, EXPR_CMP_EQ, EXPR_CMP_GE, EXPR_CMP_GT, EXPR_CMP_LE, EXPR_CMP_LT,
     EXPR_CMP_NE, EXPR_COPY_COL, EXPR_EMIT, EXPR_FCMP_EQ, EXPR_FCMP_GE, EXPR_FCMP_GT, EXPR_FCMP_LE, EXPR_FCMP_LT,
-    EXPR_FCMP_NE, EXPR_FLOAT_ADD, EXPR_FLOAT_DIV, EXPR_FLOAT_MUL, EXPR_FLOAT_NEG, EXPR_FLOAT_SUB, EXPR_INT_ADD,
-    EXPR_INT_DIV, EXPR_INT_IN_SET, EXPR_INT_MOD, EXPR_INT_MUL, EXPR_INT_NEG, EXPR_INT_SUB, EXPR_INT_TO_FLOAT,
+    EXPR_FCMP_NE, EXPR_FLOAT_ABS, EXPR_FLOAT_ADD, EXPR_FLOAT_CEIL, EXPR_FLOAT_DIV, EXPR_FLOAT_FLOOR, EXPR_FLOAT_MAX2,
+    EXPR_FLOAT_MIN2, EXPR_FLOAT_MUL, EXPR_FLOAT_NEG, EXPR_FLOAT_ROUND, EXPR_FLOAT_SUB, EXPR_FLOAT_TO_F32,
+    EXPR_FLOAT_TO_INT, EXPR_FLOAT_TRUNC, EXPR_INT_ABS, EXPR_INT_ADD, EXPR_INT_CAST, EXPR_INT_DIV, EXPR_INT_IN_SET,
+    EXPR_INT_MAX2, EXPR_INT_MIN2, EXPR_INT_MOD, EXPR_INT_MUL, EXPR_INT_NEG, EXPR_INT_SUB, EXPR_INT_TO_FLOAT,
     EXPR_IS_NOT_NULL, EXPR_IS_NULL, EXPR_LOAD_COL_FLOAT, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST, EXPR_LOAD_NULL,
     EXPR_SELECT, EXPR_STR_COL_EQ_COL, EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LE_COL, EXPR_STR_COL_LE_CONST,
     EXPR_STR_COL_LT_COL, EXPR_STR_COL_LT_CONST,
@@ -51,6 +53,7 @@ pub enum ExprValidateErr {
     OutputIdxOutOfRange { out: u32, num_payload_cols: usize },
     OutputSlotUnwritten { written: u64, num_payload_cols: usize },
     PredicateWithoutResultReg,
+    BadCastTarget { tc: u32 },
 }
 
 /// The client-facing rendering. Lives on the type so the planner's `Unsupported`
@@ -115,6 +118,27 @@ pub enum CmpOp {
     Le,
 }
 
+/// Pure float unary transform: its operand's IEEE result, propagating the
+/// operand's null bit and producing no NULL of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloatUnaryOp {
+    Neg,
+    Abs,
+    Floor,
+    Ceil,
+    Round,
+    Trunc,
+}
+
+/// Pure integer unary transform: same width in, same width out (both are
+/// `wrapping_*`, so `-i64::MIN` and `ABS(i64::MIN)` are `i64::MIN`), and the
+/// operand's U64 tracking carries to the result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntUnaryOp {
+    Neg,
+    Abs,
+}
+
 /// German-string comparison operator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StrOp {
@@ -168,10 +192,6 @@ pub enum LogicalInstr {
         a: u16,
         b: u16,
     },
-    IntNeg {
-        dst: u16,
-        a: u16,
-    },
     FloatAdd {
         dst: u16,
         a: u16,
@@ -192,10 +212,6 @@ pub enum LogicalInstr {
         a: u16,
         b: u16,
     },
-    FloatNeg {
-        dst: u16,
-        a: u16,
-    },
     Cmp {
         op: CmpOp,
         dst: u16,
@@ -211,6 +227,43 @@ pub enum LogicalInstr {
     IntToFloat {
         dst: u16,
         a: u16,
+    },
+    FloatUnary {
+        op: FloatUnaryOp,
+        dst: u16,
+        a: u16,
+    },
+    IntUnary {
+        op: IntUnaryOp,
+        dst: u16,
+        a: u16,
+    },
+    /// `tc` is the raw wire word here; `validate` narrows it to a fixed-int code.
+    FloatToInt {
+        dst: u16,
+        a: u16,
+        tc: u32,
+    },
+    IntCast {
+        dst: u16,
+        a: u16,
+        tc: u32,
+    },
+    FloatToF32 {
+        dst: u16,
+        a: u16,
+    },
+    IntMinMax2 {
+        dst: u16,
+        a: u16,
+        b: u16,
+        is_max: bool,
+    },
+    FloatMinMax2 {
+        dst: u16,
+        a: u16,
+        b: u16,
+        is_max: bool,
     },
     /// SQL CASE blend: `dst` takes `a`'s value + null bit where `cond` is
     /// non-NULL and truthy, else `b`'s. Carries a value, never a boolean.
@@ -373,18 +426,50 @@ pub(crate) enum Instr {
         a: u16,
         b: u16,
     },
-    IntNeg {
-        dst: u16,
-        a: u16,
-    },
-    FloatNeg {
-        dst: u16,
-        a: u16,
-    },
     IntToFloat {
         dst: u16,
         a: u16,
         signed: bool,
+    },
+    FloatUnary {
+        op: FloatUnaryOp,
+        dst: u16,
+        a: u16,
+    },
+    IntUnary {
+        op: IntUnaryOp,
+        dst: u16,
+        a: u16,
+    },
+    /// `fi` is the validated fixed-int target `resolve_program` narrowed the
+    /// wire type code to, so the kernel's bounds lookup is total.
+    FloatToInt {
+        dst: u16,
+        a: u16,
+        fi: FixedInt,
+    },
+    IntCast {
+        dst: u16,
+        a: u16,
+        fi: FixedInt,
+        src_signed: bool,
+    },
+    FloatToF32 {
+        dst: u16,
+        a: u16,
+    },
+    IntMinMax2 {
+        dst: u16,
+        a: u16,
+        b: u16,
+        is_max: bool,
+        signed: bool,
+    },
+    FloatMinMax2 {
+        dst: u16,
+        a: u16,
+        b: u16,
+        is_max: bool,
     },
     /// SQL CASE blend (resolved): identical to the logical form — blends raw i64
     /// bit patterns, so no `signed` flag is needed (the branch producers already
@@ -542,6 +627,8 @@ impl LogicalProgram {
             // instruction's dst/a/b so the per-opcode arms below stay one-liners.
             let cmp = |op| LogicalInstr::Cmp { op, dst, a, b };
             let fcmp = |op| LogicalInstr::FCmp { op, dst, a, b };
+            let fu = |op| LogicalInstr::FloatUnary { op, dst, a };
+            let iu = |op| LogicalInstr::IntUnary { op, dst, a };
             instrs.push(match op {
                 EXPR_LOAD_COL_INT => LogicalInstr::LoadColInt { dst, col: q[2] },
                 EXPR_LOAD_COL_FLOAT => LogicalInstr::LoadColFloat { dst, col: q[2] },
@@ -554,12 +641,12 @@ impl LogicalProgram {
                 EXPR_INT_MUL => LogicalInstr::IntMul { dst, a, b },
                 EXPR_INT_DIV => LogicalInstr::IntDiv { dst, a, b },
                 EXPR_INT_MOD => LogicalInstr::IntMod { dst, a, b },
-                EXPR_INT_NEG => LogicalInstr::IntNeg { dst, a },
+                EXPR_INT_NEG => iu(IntUnaryOp::Neg),
                 EXPR_FLOAT_ADD => LogicalInstr::FloatAdd { dst, a, b },
                 EXPR_FLOAT_SUB => LogicalInstr::FloatSub { dst, a, b },
                 EXPR_FLOAT_MUL => LogicalInstr::FloatMul { dst, a, b },
                 EXPR_FLOAT_DIV => LogicalInstr::FloatDiv { dst, a, b },
-                EXPR_FLOAT_NEG => LogicalInstr::FloatNeg { dst, a },
+                EXPR_FLOAT_NEG => fu(FloatUnaryOp::Neg),
                 EXPR_CMP_EQ => cmp(CmpOp::Eq),
                 EXPR_CMP_NE => cmp(CmpOp::Ne),
                 EXPR_CMP_GT => cmp(CmpOp::Gt),
@@ -579,6 +666,41 @@ impl LogicalProgram {
                 EXPR_IS_NOT_NULL => LogicalInstr::IsNotNull { dst, col: q[2] },
                 EXPR_EMIT => LogicalInstr::Emit { src: a, out: q[3] },
                 EXPR_INT_TO_FLOAT => LogicalInstr::IntToFloat { dst, a },
+                EXPR_INT_ABS => iu(IntUnaryOp::Abs),
+                EXPR_FLOAT_ABS => fu(FloatUnaryOp::Abs),
+                EXPR_FLOAT_FLOOR => fu(FloatUnaryOp::Floor),
+                EXPR_FLOAT_CEIL => fu(FloatUnaryOp::Ceil),
+                EXPR_FLOAT_ROUND => fu(FloatUnaryOp::Round),
+                EXPR_FLOAT_TRUNC => fu(FloatUnaryOp::Trunc),
+                EXPR_FLOAT_TO_F32 => LogicalInstr::FloatToF32 { dst, a },
+                // The full u32 rides through: a forged high-bit word must reach
+                // `validate`, not be silently truncated into a valid type code.
+                EXPR_FLOAT_TO_INT => LogicalInstr::FloatToInt { dst, a, tc: q[3] },
+                EXPR_INT_CAST => LogicalInstr::IntCast { dst, a, tc: q[3] },
+                EXPR_INT_MAX2 => LogicalInstr::IntMinMax2 {
+                    dst,
+                    a,
+                    b,
+                    is_max: true,
+                },
+                EXPR_INT_MIN2 => LogicalInstr::IntMinMax2 {
+                    dst,
+                    a,
+                    b,
+                    is_max: false,
+                },
+                EXPR_FLOAT_MAX2 => LogicalInstr::FloatMinMax2 {
+                    dst,
+                    a,
+                    b,
+                    is_max: true,
+                },
+                EXPR_FLOAT_MIN2 => LogicalInstr::FloatMinMax2 {
+                    dst,
+                    a,
+                    b,
+                    is_max: false,
+                },
                 EXPR_SELECT => {
                     let (sa, sb) = gnitz_wire::decode_select_operands(q[3]);
                     LogicalInstr::Select {
@@ -765,15 +887,10 @@ impl LogicalProgram {
                     instrs.push(I::IntMod { dst, a, b, signed: !u });
                     reg_u64[dst as usize] = u;
                 }
-                L::IntNeg { dst, a } => {
-                    instrs.push(I::IntNeg { dst, a });
-                    reg_u64[dst as usize] = reg_u64[a as usize];
-                }
                 L::FloatAdd { dst, a, b } => instrs.push(I::FloatAdd { dst, a, b }),
                 L::FloatSub { dst, a, b } => instrs.push(I::FloatSub { dst, a, b }),
                 L::FloatMul { dst, a, b } => instrs.push(I::FloatMul { dst, a, b }),
                 L::FloatDiv { dst, a, b } => instrs.push(I::FloatDiv { dst, a, b }),
-                L::FloatNeg { dst, a } => instrs.push(I::FloatNeg { dst, a }),
                 L::Cmp { op, dst, a, b } => {
                     // EQ/NE are bit-identical signed/unsigned; ordered compares
                     // pick the unsigned form when either operand is U64.
@@ -782,6 +899,54 @@ impl LogicalProgram {
                     reg_u64[dst as usize] = false;
                 }
                 L::FCmp { op, dst, a, b } => instrs.push(I::FCmp { op, dst, a, b }),
+                L::FloatUnary { op, dst, a } => {
+                    instrs.push(I::FloatUnary { op, dst, a });
+                    reg_u64[dst as usize] = false;
+                }
+                // A pure int transform keeps the operand's width and signedness,
+                // so the U64 tracking carries straight through.
+                L::IntUnary { op, dst, a } => {
+                    instrs.push(I::IntUnary { op, dst, a });
+                    reg_u64[dst as usize] = reg_u64[a as usize];
+                }
+                L::FloatToF32 { dst, a } => {
+                    instrs.push(I::FloatToF32 { dst, a });
+                    reg_u64[dst as usize] = false;
+                }
+                // Total on a validated program, the `LoadColInt` shape above:
+                // `validate` gates both opcodes' target word through
+                // `gnitz_wire::is_fixed_int` — the same eight codes
+                // `from_type_code` answers `Some` for.
+                L::FloatToInt { dst, a, tc } => {
+                    let fi = validated_cast_target(tc);
+                    instrs.push(I::FloatToInt { dst, a, fi });
+                    reg_u64[dst as usize] = fi == FixedInt::U64;
+                }
+                L::IntCast { dst, a, tc } => {
+                    let fi = validated_cast_target(tc);
+                    instrs.push(I::IntCast {
+                        dst,
+                        a,
+                        fi,
+                        src_signed: !reg_u64[a as usize],
+                    });
+                    reg_u64[dst as usize] = fi == FixedInt::U64;
+                }
+                L::IntMinMax2 { dst, a, b, is_max } => {
+                    let u = reg_u64[a as usize] || reg_u64[b as usize];
+                    instrs.push(I::IntMinMax2 {
+                        dst,
+                        a,
+                        b,
+                        is_max,
+                        signed: !u,
+                    });
+                    reg_u64[dst as usize] = u;
+                }
+                L::FloatMinMax2 { dst, a, b, is_max } => {
+                    instrs.push(I::FloatMinMax2 { dst, a, b, is_max });
+                    reg_u64[dst as usize] = false;
+                }
                 L::IntToFloat { dst, a } => {
                     let signed = !reg_u64[a as usize];
                     instrs.push(I::IntToFloat { dst, a, signed });
@@ -977,7 +1142,9 @@ impl LogicalProgram {
                 | L::Cmp { dst, a, b, .. }
                 | L::FCmp { dst, a, b, .. }
                 | L::BoolAnd { dst, a, b }
-                | L::BoolOr { dst, a, b } => {
+                | L::BoolOr { dst, a, b }
+                | L::IntMinMax2 { dst, a, b, .. }
+                | L::FloatMinMax2 { dst, a, b, .. } => {
                     check_reg(dst, num_regs)?;
                     check_reg(a, num_regs)?;
                     check_reg(b, num_regs)?;
@@ -996,9 +1163,23 @@ impl LogicalProgram {
                     }
                 }
                 // Unary register readers that write dst.
-                L::IntNeg { dst, a } | L::FloatNeg { dst, a } | L::IntToFloat { dst, a } | L::BoolNot { dst, a } => {
+                L::IntUnary { dst, a, .. }
+                | L::IntToFloat { dst, a }
+                | L::BoolNot { dst, a }
+                | L::FloatUnary { dst, a, .. }
+                | L::FloatToF32 { dst, a } => {
                     check_reg(dst, num_regs)?;
                     check_reg(a, num_regs)?;
+                }
+                // The cast target rides the `a2` word; a forged code must not
+                // reach eval, where it would index a bounds table that has no
+                // arm for it.
+                L::FloatToInt { dst, a, tc } | L::IntCast { dst, a, tc } => {
+                    check_reg(dst, num_regs)?;
+                    check_reg(a, num_regs)?;
+                    if tc > u8::MAX as u32 || !gnitz_wire::is_fixed_int(tc as u8) {
+                        return Err(E::BadCastTarget { tc });
+                    }
                 }
                 // EMIT reads a source register and writes an output payload slot.
                 L::Emit { src, out } => {
@@ -1097,6 +1278,14 @@ fn check_reg(r: u16, num_regs: u32) -> Result<(), ExprValidateErr> {
     } else {
         Err(ExprValidateErr::RegOutOfRange { reg: r, num_regs })
     }
+}
+
+/// The cast opcodes' raw target word as the fixed-int it names. Total on a
+/// validated program: `validate` rejects any word `gnitz_wire::is_fixed_int`
+/// does not accept, which is exactly the eight codes `from_type_code` answers
+/// `Some` for.
+fn validated_cast_target(tc: u32) -> FixedInt {
+    FixedInt::from_type_code(TypeCode::from_validated_u8(tc as u8)).expect("validated cast names a fixed-int target")
 }
 
 /// The one column-operand check: range, then payload-ness, then the type class
@@ -1386,8 +1575,16 @@ fn classify_registers(instrs: &[Instr], result_reg: u32, is_filter: bool) -> Reg
                 read!(bool_input, a);
             }
             // Unary register readers (non-bool).
-            IntNeg { a, .. } | FloatNeg { a, .. } | IntToFloat { a, .. } => {
+            IntUnary { a, .. }
+            | IntToFloat { a, .. }
+            | FloatUnary { a, .. }
+            | FloatToInt { a, .. }
+            | IntCast { a, .. }
+            | FloatToF32 { a, .. } => {
                 read!(non_bool_read, a);
+            }
+            IntMinMax2 { a, b, .. } | FloatMinMax2 { a, b, .. } => {
+                read!(non_bool_read, a, b);
             }
             // Ternary select: `cond` is read as a boolean (its producer must
             // pack `bool_bits`), `a`/`b` as values. `dst` carries a value, so
@@ -1436,8 +1633,10 @@ fn is_strictly_non_nullable(instrs: &[Instr], schema: &dyn SchemaFacts) -> bool 
     };
     for instr in instrs {
         match *instr {
-                // Division/modulo produce NULL on a zero divisor.
+                // Division/modulo produce NULL on a zero divisor; the three
+                // narrowing casts produce NULL on an out-of-range value.
                 IntDiv { .. } | IntMod { .. } | FloatDiv { .. } => return false,
+                FloatToInt { .. } | IntCast { .. } | FloatToF32 { .. } => return false,
                 // IS_NULL / IS_NOT_NULL read the batch null bits.
                 IsNull { .. } | IsNotNull { .. } => return false,
                 // LoadNull manufactures a NULL for every row — forces the nullable path.
@@ -1451,7 +1650,14 @@ fn is_strictly_non_nullable(instrs: &[Instr], schema: &dyn SchemaFacts) -> bool 
                 StrColCol { pi_a, pi_b, .. } if nullable_payload(pi_a) || nullable_payload(pi_b) => return false,
                 // Exhaustive remainder (no `_` wildcard): a future null-producing
                 // variant must be classified here, not silently treated as safe.
-                LoadPayloadInt { .. }
+                // FloatUnary/IntUnary propagate their operand's null bit; MinMax2
+                // outputs null only when both operands are, which the operand
+                // columns' own nullability already accounts for.
+                FloatUnary { .. }
+                | IntUnary { .. }
+                | IntMinMax2 { .. }
+                | FloatMinMax2 { .. }
+                | LoadPayloadInt { .. }
                 | LoadPayloadFloat { .. }
                 | StrColConst { .. }
                 | StrColCol { .. }
@@ -1460,11 +1666,9 @@ fn is_strictly_non_nullable(instrs: &[Instr], schema: &dyn SchemaFacts) -> bool 
                 | IntAdd { .. }
                 | IntSub { .. }
                 | IntMul { .. }
-                | IntNeg { .. }
                 | FloatAdd { .. }
                 | FloatSub { .. }
                 | FloatMul { .. }
-                | FloatNeg { .. }
                 | Cmp { .. }
                 | FCmp { .. }
                 // Set membership introduces no NULL beyond its input register; a

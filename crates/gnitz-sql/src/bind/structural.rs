@@ -1,10 +1,12 @@
 use super::resolve::find_unique_column;
 use crate::agg::reject_min_max_unorderable;
-use crate::ast_util::{classify_agg_call, fn_name_is, function_positional_args, single_relation_col_name};
+use crate::ast_util::{classify_agg_call, function_positional_args, single_fn_name, single_relation_col_name};
+use crate::codec::pk_codec::{extract_sql_literal, SqlLiteral};
 use crate::error::GnitzSqlError;
-use crate::ir::{AggFunc, BExpr, BinOp, BoundExpr, UnaryOp};
+use crate::ir::{AggFunc, BExpr, BinOp, BoundExpr, NumFunc, UnaryOp};
+use crate::types::{has_register_image, sql_type_to_typecode};
 use gnitz_core::{ColumnDef, Schema};
-use sqlparser::ast::{BinaryOperator, CaseWhen, Expr, Function, UnaryOperator, Value};
+use sqlparser::ast::{BinaryOperator, CaseWhen, CeilFloorKind, DateTimeField, Expr, Function, UnaryOperator, Value};
 
 /// Bind an expression against a single-relation schema (WHERE, projections,
 /// set-op branches, DML). The structural recursion lives in `bind_structural`;
@@ -66,14 +68,48 @@ pub(crate) fn unsupported_subquery(e: &Expr) -> GnitzSqlError {
 pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L) -> Result<BExpr<R>, GnitzSqlError> {
     match expr {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => leaf.bind_column(expr),
-        // COALESCE / NULLIF are structural desugars into CASE, intercepted before
-        // the leaf's `bind_function` so all three leaf impls stay untouched. Every
-        // other name falls through to the leaf (aggregates, or a context rejection).
-        Expr::Function(f) if fn_name_is(f, "coalesce") => {
-            bind_coalesce(&function_positional_args(f, "COALESCE")?, leaf)
+        // The context-independent names (the CASE desugars and the numeric scalar
+        // functions) bind here, above the leaf, so all three leaf impls stay
+        // untouched. Every other name falls through to the leaf — aggregates, or a
+        // context rejection.
+        Expr::Function(f) => match scalar_call(f) {
+            Some((name, call)) => bind_scalar_call(name, call, f, leaf),
+            None => leaf.bind_function(f),
+        },
+        // CEIL/FLOOR are keyword-dispatched by sqlparser into their own AST nodes
+        // and never arrive as `Expr::Function` (CEILING, which is not, does).
+        Expr::Ceil { expr: e, field } => bind_ceil_floor(NumFunc::Ceil, "CEIL", e, field, leaf),
+        Expr::Floor { expr: e, field } => bind_ceil_floor(NumFunc::Floor, "FLOOR", e, field, leaf),
+        Expr::Cast {
+            // Every kind is the same operation here: a failed cast is a NULL, which
+            // is exactly what TRY_CAST/SAFE_CAST are documented to mean, so the
+            // explicit spellings are accepted rather than rejected. Destructuring
+            // the rest exhaustively is what keeps a qualifier from being dropped.
+            kind: _,
+            expr: e,
+            data_type,
+            array,
+            format,
+        } => {
+            if *array {
+                return Err(GnitzSqlError::Unsupported(
+                    "CAST to an ARRAY type is not supported".into(),
+                ));
+            }
+            if format.is_some() {
+                return Err(GnitzSqlError::Unsupported("CAST … FORMAT is not supported".into()));
+            }
+            let to = sql_type_to_typecode(data_type)?;
+            // The register file holds an 8-byte image, so the 16-byte types and
+            // the German strings are not cast targets.
+            if !has_register_image(to) {
+                return Err(GnitzSqlError::Unsupported(format!("CAST to {to:?} is not supported")));
+            }
+            Ok(BExpr::Cast {
+                expr: Box::new(bind_structural(e, leaf)?),
+                to,
+            })
         }
-        Expr::Function(f) if fn_name_is(f, "nullif") => bind_nullif(&function_positional_args(f, "NULLIF")?, leaf),
-        Expr::Function(f) => leaf.bind_function(f),
         Expr::IsNull(i) => leaf.bind_null_test(i, true),
         Expr::IsNotNull(i) => leaf.bind_null_test(i, false),
         Expr::Nested(i) => bind_structural(i, leaf),
@@ -193,6 +229,151 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
     }
 }
 
+/// What a structurally-bound function name binds to.
+#[derive(Clone, Copy)]
+enum Call {
+    Coalesce,
+    Nullif,
+    /// A unary numeric transform over its single argument.
+    Unary(NumFunc),
+    Round,
+    Mod,
+    /// GREATEST (`true`) / LEAST (`false`).
+    MinMax(bool),
+}
+
+/// The function names `bind_structural` binds above the leaf, keyed by their SQL
+/// spelling (which also names the call in its arity errors). Matched
+/// case-insensitively. The one name→call map, like `AGG_NAMES` is for the
+/// aggregates: a name added here reaches every binding context at once.
+const SCALAR_CALLS: [(&str, Call); 9] = [
+    ("COALESCE", Call::Coalesce),
+    ("NULLIF", Call::Nullif),
+    ("ABS", Call::Unary(NumFunc::Abs)),
+    ("CEILING", Call::Unary(NumFunc::Ceil)),
+    ("TRUNC", Call::Unary(NumFunc::Trunc)),
+    ("ROUND", Call::Round),
+    ("MOD", Call::Mod),
+    ("GREATEST", Call::MinMax(true)),
+    ("LEAST", Call::MinMax(false)),
+];
+
+fn scalar_call(f: &Function) -> Option<(&'static str, Call)> {
+    let n = single_fn_name(f)?;
+    SCALAR_CALLS
+        .iter()
+        .find(|(name, _)| n.eq_ignore_ascii_case(name))
+        .copied()
+}
+
+/// The one arity-error shape for every structurally-bound call, matching what
+/// `classify_agg_call` already reports for the aggregates.
+fn wrong_arity(name: &str, want: &str) -> GnitzSqlError {
+    GnitzSqlError::Unsupported(format!("{name}: requires {want}"))
+}
+
+/// Bind one of the [`SCALAR_CALLS`]. Arguments come through
+/// `function_positional_args`, so every call inherits the shared qualifier
+/// rejection (FILTER/OVER/DISTINCT/…) that COALESCE already applied.
+fn bind_scalar_call<R: Clone, L: LeafBinder<R>>(
+    name: &str,
+    call: Call,
+    f: &Function,
+    leaf: &L,
+) -> Result<BExpr<R>, GnitzSqlError> {
+    let args = function_positional_args(f, name)?;
+    match call {
+        Call::Coalesce => bind_coalesce(&args, leaf),
+        Call::Nullif => bind_nullif(&args, leaf),
+        Call::Unary(nf) => {
+            let [arg] = args.as_slice() else {
+                return Err(wrong_arity(name, "exactly one argument"));
+            };
+            Ok(BExpr::Func {
+                f: nf,
+                arg: Box::new(bind_structural(arg, leaf)?),
+            })
+        }
+        Call::Round => bind_round(&args, leaf),
+        // `MOD` is the `%` operator: the `IntMod` opcode is total, substituting a
+        // safe divisor and masking the row NULL when the divisor is zero.
+        Call::Mod => {
+            let [a, b] = args.as_slice() else {
+                return Err(wrong_arity(name, "exactly two arguments"));
+            };
+            Ok(BExpr::BinOp(
+                Box::new(bind_structural(a, leaf)?),
+                BinOp::Mod,
+                Box::new(bind_structural(b, leaf)?),
+            ))
+        }
+        // NULL skipping is the MAX2/MIN2 opcode's, so no argument needs a
+        // null-test rewrite and a computed argument is as good as a column.
+        Call::MinMax(is_max) => {
+            if args.is_empty() {
+                return Err(wrong_arity(name, "at least one argument"));
+            }
+            Ok(BExpr::MinMaxN {
+                is_max,
+                args: args
+                    .iter()
+                    .map(|a| bind_structural(a, leaf))
+                    .collect::<Result<Vec<_>, _>>()?,
+            })
+        }
+    }
+}
+
+/// `ROUND(x)` / `ROUND(x, n)`. The scale rides the IR node rather than being
+/// desugared here: which form `ROUND(x, n)` takes depends on the argument's
+/// type, and the binder is schema-free.
+fn bind_round<R: Clone, L: LeafBinder<R>>(args: &[&Expr], leaf: &L) -> Result<BExpr<R>, GnitzSqlError> {
+    let (arg, n) = match args {
+        [x] => (*x, 0),
+        [x, n] => (*x, round_scale(n)?),
+        _ => return Err(wrong_arity("ROUND", "one or two arguments")),
+    };
+    Ok(BExpr::Func {
+        f: NumFunc::Round(n),
+        arg: Box::new(bind_structural(arg, leaf)?),
+    })
+}
+
+/// The `n` of `ROUND(x, n)`: an integer literal, optionally signed, in
+/// `-15..=15`. f64 carries ~15–17 significant decimal digits, so a wider scale
+/// has no digits left to round at.
+fn round_scale(e: &Expr) -> Result<i8, GnitzSqlError> {
+    let bad = || GnitzSqlError::Bind("ROUND: scale must be an integer literal in -15..=15".to_string());
+    let Some(SqlLiteral::Number(mag, neg)) = extract_sql_literal(e) else {
+        return Err(bad());
+    };
+    // Parsing as an integer is what rejects a fractional scale.
+    let mag: i64 = mag.parse().map_err(|_| bad())?;
+    let n = if neg { -mag } else { mag };
+    i8::try_from(n).ok().filter(|n| (-15..=15).contains(n)).ok_or_else(bad)
+}
+
+/// `CEIL(x)` / `FLOOR(x)`. Only the bare-call parse binds: `CEIL(x TO DAY)` and
+/// `CEIL(x, 2)` carry a field this plan's opcode has no place for, so they are
+/// rejected rather than having the field dropped.
+fn bind_ceil_floor<R: Clone, L: LeafBinder<R>>(
+    f: NumFunc,
+    name: &str,
+    e: &Expr,
+    field: &CeilFloorKind,
+    leaf: &L,
+) -> Result<BExpr<R>, GnitzSqlError> {
+    if !matches!(field, CeilFloorKind::DateTimeField(DateTimeField::NoDateTime)) {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "{name}: only the plain {name}(x) form is supported"
+        )));
+    }
+    Ok(BExpr::Func {
+        f,
+        arg: Box::new(bind_structural(e, leaf)?),
+    })
+}
+
 /// sqlparser binary op → `BinOp` (the single, complete map).
 fn map_binop(op: &BinaryOperator) -> Result<BinOp, GnitzSqlError> {
     Ok(match op {
@@ -217,10 +398,15 @@ fn map_binop(op: &BinaryOperator) -> Result<BinOp, GnitzSqlError> {
     })
 }
 
-/// Number/string literal → `BExpr`. Leaf-free (no `ColRef` produced), so it is
-/// generic over `R` without a `Clone` bound.
+/// SQL literal → `BExpr`. Leaf-free (no `ColRef` produced), so it is generic
+/// over `R` without a `Clone` bound.
 fn bind_literal<R>(v: &Value) -> Result<BExpr<R>, GnitzSqlError> {
     match v {
+        // NULL is an ordinary value here: it lowers to `LOAD_NULL`, types as
+        // `unify_numeric`'s neutral element, and every consumer of the bound IR
+        // already has a `LitNull` arm. Only `bind_null_test`, which must resolve
+        // a column, still rejects it.
+        Value::Null => Ok(BExpr::LitNull),
         Value::Number(n, _) => {
             if let Ok(i) = n.parse::<i64>() {
                 Ok(BExpr::LitInt(i))
@@ -283,9 +469,7 @@ fn bind_coalesce<R: Clone, L: LeafBinder<R>>(args: &[&Expr], leaf: &L) -> Result
 /// literal-operand pitfall.
 fn bind_nullif<R: Clone, L: LeafBinder<R>>(args: &[&Expr], leaf: &L) -> Result<BExpr<R>, GnitzSqlError> {
     let [a, b] = args else {
-        return Err(GnitzSqlError::Unsupported(
-            "NULLIF: requires exactly two arguments".into(),
-        ));
+        return Err(wrong_arity("NULLIF", "exactly two arguments"));
     };
     let a_bound = bind_structural(a, leaf)?;
     let cond = BExpr::BinOp(
@@ -818,5 +1002,202 @@ mod tests {
                 "expected {src} to bind"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Numeric scalar functions and numeric CAST
+    // -----------------------------------------------------------------------
+
+    fn bind_num(src: &str) -> Result<BoundExpr, GnitzSqlError> {
+        bind_single_table(&parse(src), &schema_with_val(TypeCode::I64))
+    }
+
+    fn assert_bind_err(r: Result<BoundExpr, GnitzSqlError>, want_substr: &str) {
+        match r.unwrap_err() {
+            GnitzSqlError::Bind(msg) => assert!(
+                msg.contains(want_substr),
+                "got Bind({msg:?}), expected to contain {want_substr:?}"
+            ),
+            e => panic!("expected Bind, got {e:?}"),
+        }
+    }
+
+    /// Every unary numeric name binds to its `NumFunc`. `CEIL`/`FLOOR` arrive as
+    /// their own AST nodes and `CEILING` as a plain call — all three must land on
+    /// the same two IR nodes.
+    #[test]
+    fn unary_numeric_functions_bind_to_their_numfunc() {
+        for (src, want) in [
+            ("ABS(c)", NumFunc::Abs),
+            ("abs(c)", NumFunc::Abs),
+            ("CEIL(c)", NumFunc::Ceil),
+            ("CEILING(c)", NumFunc::Ceil),
+            ("FLOOR(c)", NumFunc::Floor),
+            ("TRUNC(c)", NumFunc::Trunc),
+            ("ROUND(c)", NumFunc::Round(0)),
+        ] {
+            match bind_num(src).unwrap() {
+                BoundExpr::Func { f, arg } => {
+                    assert_eq!(f, want, "{src}");
+                    assert!(matches!(*arg, BoundExpr::ColRef(1)), "{src}");
+                }
+                other => panic!("{src}: expected Func, got {other:?}"),
+            }
+        }
+        assert_unsupported(bind_num("ABS(c, 1)"), "exactly one argument");
+        assert_unsupported(bind_num("TRUNC(c, 2)"), "exactly one argument");
+    }
+
+    /// `CEIL(x TO DAY)` and `CEIL(x, 2)` parse into the same node with a
+    /// non-empty field; dropping it would silently compute plain `CEIL(x)`.
+    #[test]
+    fn ceil_floor_reject_the_field_carrying_forms() {
+        assert_unsupported(bind_num("CEIL(c TO DAY)"), "CEIL");
+        assert_unsupported(bind_num("FLOOR(c TO DAY)"), "FLOOR");
+        assert_unsupported(bind_num("CEIL(c, 2)"), "CEIL");
+    }
+
+    #[test]
+    fn round_scale_must_be_a_small_integer_literal() {
+        for (src, want) in [("ROUND(c, 2)", 2i8), ("ROUND(c, -2)", -2), ("ROUND(c, +15)", 15)] {
+            match bind_num(src).unwrap() {
+                BoundExpr::Func {
+                    f: NumFunc::Round(n), ..
+                } => assert_eq!(n, want, "{src}"),
+                other => panic!("{src}: expected Round, got {other:?}"),
+            }
+        }
+        for src in ["ROUND(c, 16)", "ROUND(c, -16)", "ROUND(c, 2.5)", "ROUND(c, c)"] {
+            assert_bind_err(bind_num(src), "scale must be an integer literal");
+        }
+        assert_unsupported(bind_num("ROUND(c, 1, 2)"), "one or two arguments");
+    }
+
+    /// MOD is a pure desugar onto `%`, so it inherits `IntMod`'s total semantics
+    /// (zero divisor NULLs the row) with no opcode of its own.
+    #[test]
+    fn mod_desugars_to_the_modulo_binop() {
+        match bind_num("MOD(c, 2)").unwrap() {
+            BoundExpr::BinOp(l, BinOp::Mod, r) => {
+                assert!(matches!(*l, BoundExpr::ColRef(1)));
+                assert!(matches!(*r, BoundExpr::LitInt(2)));
+            }
+            other => panic!("expected BinOp(Mod), got {other:?}"),
+        }
+        assert_unsupported(bind_num("MOD(c)"), "exactly two arguments");
+    }
+
+    /// GREATEST/LEAST keep every argument as written — no literal or column
+    /// restriction, and no null-test rewrite: NULL skipping is the opcode's.
+    #[test]
+    fn greatest_least_bind_n_ary_with_computed_args() {
+        match bind_num("GREATEST(c, c + 1, -1, NULL)").unwrap() {
+            BoundExpr::MinMaxN { is_max, args } => {
+                assert!(is_max);
+                assert_eq!(args.len(), 4);
+                assert!(matches!(args[1], BoundExpr::BinOp(_, BinOp::Add, _)));
+                assert!(matches!(args[2], BoundExpr::UnaryOp(UnaryOp::Neg, _)));
+                assert!(matches!(args[3], BoundExpr::LitNull));
+            }
+            other => panic!("expected MinMaxN, got {other:?}"),
+        }
+        assert!(matches!(
+            bind_num("LEAST(c)").unwrap(),
+            BoundExpr::MinMaxN { is_max: false, .. }
+        ));
+    }
+
+    /// The `NULL` literal is an ordinary value, not a GREATEST/LEAST special
+    /// case: it binds wherever a literal does. `IS [NOT] NULL` still needs a
+    /// column, so it keeps rejecting one.
+    #[test]
+    fn null_literal_binds_wherever_a_literal_does() {
+        for src in [
+            "NULL",
+            "CASE WHEN c > 0 THEN 1 ELSE NULL END",
+            "CASE WHEN c > 0 THEN NULL ELSE 1 END",
+            "GREATEST(c, NULL)",
+            "COALESCE(NULL, c)",
+            "CAST(NULL AS BIGINT)",
+            "ABS(NULL)",
+        ] {
+            assert!(bind_num(src).is_ok(), "expected {src} to bind");
+        }
+        assert!(matches!(bind_num("NULL").unwrap(), BoundExpr::LitNull));
+        // COALESCE folds a leading NULL away rather than making it the result.
+        assert!(matches!(bind_num("COALESCE(NULL, c)").unwrap(), BoundExpr::ColRef(1)));
+        assert!(bind_num("NULL IS NULL").is_err());
+    }
+
+    /// All four cast kinds mean the same thing here — a failed cast is a NULL,
+    /// which is what TRY_CAST/SAFE_CAST are documented to do.
+    #[test]
+    fn every_cast_kind_binds_to_one_node() {
+        for src in [
+            "CAST(c AS BIGINT)",
+            "c::BIGINT",
+            "TRY_CAST(c AS BIGINT)",
+            "SAFE_CAST(c AS BIGINT)",
+        ] {
+            match bind_num(src).unwrap() {
+                BoundExpr::Cast { expr, to } => {
+                    assert_eq!(to, TypeCode::I64, "{src}");
+                    assert!(matches!(*expr, BoundExpr::ColRef(1)), "{src}");
+                }
+                other => panic!("{src}: expected Cast, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn cast_accepts_every_numeric_target_and_rejects_the_rest() {
+        for (src, want) in [
+            ("CAST(c AS TINYINT)", TypeCode::I8),
+            ("CAST(c AS SMALLINT)", TypeCode::I16),
+            ("CAST(c AS INT)", TypeCode::I32),
+            ("CAST(c AS TINYINT UNSIGNED)", TypeCode::U8),
+            ("CAST(c AS INT UNSIGNED)", TypeCode::U32),
+            ("CAST(c AS BIGINT UNSIGNED)", TypeCode::U64),
+            ("CAST(c AS FLOAT)", TypeCode::F32),
+            ("CAST(c AS DOUBLE)", TypeCode::F64),
+            ("CAST(c AS REAL)", TypeCode::F64),
+        ] {
+            match bind_num(src).unwrap() {
+                BoundExpr::Cast { to, .. } => assert_eq!(to, want, "{src}"),
+                other => panic!("{src}: expected Cast, got {other:?}"),
+            }
+        }
+        // Non-numeric targets: a numeric register has no image for any of them.
+        for src in ["CAST(c AS TEXT)", "CAST(c AS UUID)", "CAST(c AS DECIMAL(38,0))"] {
+            assert_unsupported(bind_num(src), "is not supported");
+        }
+        // BOOLEAN has no gnitz type at all, so it rejects one level earlier.
+        assert!(bind_num("CAST(c AS BOOLEAN)").is_err());
+        assert_unsupported(bind_num("CAST(c AS INT ARRAY)"), "ARRAY");
+    }
+
+    /// The scalar wrapper is consumed above the leaf, so its aggregate argument
+    /// still resolves through the leaf on the recursion.
+    #[test]
+    fn scalar_functions_wrap_an_aggregate_argument() {
+        let s = schema_with_val(TypeCode::I64);
+        for src in ["ABS(SUM(c))", "CAST(SUM(c) AS INT)", "GREATEST(SUM(c), COUNT(*))"] {
+            assert!(bind_single_table(&parse(src), &s).is_ok(), "expected {src} to bind");
+        }
+        match bind_single_table(&parse("ABS(SUM(c))"), &s).unwrap() {
+            BoundExpr::Func { f: NumFunc::Abs, arg } => {
+                assert!(matches!(*arg, BoundExpr::AggCall { func: AggFunc::Sum, .. }))
+            }
+            other => panic!("expected Func(Abs, AggCall), got {other:?}"),
+        }
+    }
+
+    /// The shared qualifier inventory applies to the new names too — a dropped
+    /// `FILTER`/`OVER`/`DISTINCT` would compute the plain call.
+    #[test]
+    fn scalar_functions_reject_call_qualifiers() {
+        assert_unsupported(bind_num("ABS(DISTINCT c)"), "DISTINCT");
+        assert_unsupported(bind_num("ABS(c) OVER ()"), "OVER");
+        assert_unsupported(bind_num("GREATEST(c) FILTER (WHERE c > 0)"), "FILTER");
     }
 }

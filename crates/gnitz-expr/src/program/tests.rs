@@ -5,6 +5,7 @@
 use gnitz_wire::type_code;
 
 use super::{classify_registers, RegisterRoles};
+use crate::program::IntUnaryOp;
 use crate::test_support::{
     bits_to_float, filter_prog, float_to_bits, make_int_view, make_string_view, scalar_prog, schema_pk_ints,
     schema_pk_strings, TestSchema, TestView,
@@ -125,7 +126,11 @@ fn test_int_arithmetic() {
     // NEG: -10
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::IntNeg { dst: 1, a: 0 },
+        LogicalInstr::IntUnary {
+            op: IntUnaryOp::Neg,
+            dst: 1,
+            a: 0,
+        },
     ];
     let prog = scalar_prog(&schema, instrs, 2, 1, vec![]);
     let (val, _) = prog.eval_row(&mb, 0);
@@ -1632,18 +1637,16 @@ fn wire_err(r: Result<LogicalProgram, ExprValidateErr>) -> ExprValidateErr {
 
 #[test]
 fn test_from_wire_rejects_unknown_opcode() {
-    // Valid opcodes are 1..=46; 0, 37/38/39, and every >= 47 are holes.
-    assert_eq!(
-        wire_err(LogicalProgram::from_wire(&[47, 0, 0, 0], 1, 0, vec![])),
-        ExprValidateErr::UnknownOpcode(47)
-    );
+    // 0 and u32::MAX are holes permanently. Deliberately NOT "one past the
+    // current maximum": that couples the test to every opcode addition while
+    // adding no coverage a new opcode's own decode test does not already give.
     assert_eq!(
         wire_err(LogicalProgram::from_wire(&[0, 0, 0, 0], 1, 0, vec![])),
         ExprValidateErr::UnknownOpcode(0)
     );
     assert_eq!(
-        wire_err(LogicalProgram::from_wire(&[37, 0, 0, 0], 1, 0, vec![])),
-        ExprValidateErr::UnknownOpcode(37)
+        wire_err(LogicalProgram::from_wire(&[u32::MAX, 0, 0, 0], 1, 0, vec![])),
+        ExprValidateErr::UnknownOpcode(u32::MAX)
     );
     // A valid opcode lowers (control): LOAD_COL_INT dst0 col0.
     assert!(LogicalProgram::from_wire(&[1, 0, 0, 0], 1, 0, vec![]).is_ok());
@@ -2241,4 +2244,253 @@ fn classifier_pure_conjunction_filter() {
     // r2 and r4 are read by BOOL_AND; r5 (result_reg) is force-marked a bool
     // input so the filter's nullable word merge always finds it packed.
     assert_eq!(bool_input, (1 << 2) | (1 << 4) | (1 << 5));
+}
+
+// ---------------------------------------------------------------------------
+// Numeric scalar functions and numeric CAST: validation and the resolve-time
+// analyses (U64 tracking, nullability classification).
+// ---------------------------------------------------------------------------
+
+/// The cast target rides the `a2` word, so a forged blob can put anything
+/// there. It must be rejected before eval, where it would index a bounds table
+/// that has no arm for it.
+#[test]
+fn test_validate_rejects_a_forged_cast_target() {
+    for op in [gnitz_wire::EXPR_INT_CAST, gnitz_wire::EXPR_FLOAT_TO_INT] {
+        for tc in [
+            0u32,
+            type_code::STRING as u32,
+            type_code::U128 as u32,
+            type_code::F64 as u32,
+            255,
+            // A `>= 255` word must not be truncated into a valid code on the
+            // way in: the full u32 has to reach `validate`, or these would
+            // pass as I64.
+            0x100u32 | type_code::I64 as u32,
+            0x1_0000u32 | type_code::I64 as u32,
+        ] {
+            let code = [gnitz_wire::EXPR_LOAD_COL_INT, 0, 1, 0, op, 1, 0, tc];
+            assert_eq!(
+                wire_err(LogicalProgram::from_wire(&code, 2, 1, vec![])),
+                ExprValidateErr::BadCastTarget { tc },
+                "op {op} tc {tc}"
+            );
+        }
+        // Control: every fixed-int target is accepted.
+        for tc in [
+            type_code::I8,
+            type_code::U8,
+            type_code::I16,
+            type_code::U16,
+            type_code::I32,
+            type_code::U32,
+            type_code::I64,
+            type_code::U64,
+        ] {
+            let code = [gnitz_wire::EXPR_LOAD_COL_INT, 0, 1, 0, op, 1, 0, tc as u32];
+            assert!(
+                LogicalProgram::from_wire(&code, 2, 1, vec![]).is_ok(),
+                "op {op} tc {tc} must be accepted"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_validate_bounds_checks_the_new_register_operands() {
+    let unary = [
+        gnitz_wire::EXPR_INT_ABS,
+        gnitz_wire::EXPR_FLOAT_ABS,
+        gnitz_wire::EXPR_FLOAT_FLOOR,
+        gnitz_wire::EXPR_FLOAT_CEIL,
+        gnitz_wire::EXPR_FLOAT_ROUND,
+        gnitz_wire::EXPR_FLOAT_TRUNC,
+        gnitz_wire::EXPR_FLOAT_TO_F32,
+    ];
+    for op in unary {
+        // dst out of range, then operand out of range.
+        assert!(matches!(
+            wire_err(LogicalProgram::from_wire(&[op, 9, 0, 0], 2, 0, vec![])),
+            ExprValidateErr::RegOutOfRange { .. }
+        ));
+        assert!(matches!(
+            wire_err(LogicalProgram::from_wire(&[op, 0, 9, 0], 2, 0, vec![])),
+            ExprValidateErr::RegOutOfRange { .. }
+        ));
+    }
+    for op in [
+        gnitz_wire::EXPR_INT_MAX2,
+        gnitz_wire::EXPR_INT_MIN2,
+        gnitz_wire::EXPR_FLOAT_MAX2,
+        gnitz_wire::EXPR_FLOAT_MIN2,
+    ] {
+        assert!(matches!(
+            wire_err(LogicalProgram::from_wire(&[op, 0, 1, 9], 2, 0, vec![])),
+            ExprValidateErr::RegOutOfRange { .. }
+        ));
+        // The binary ops are SSA anti-aliased: dst may not be an operand.
+        assert!(
+            LogicalProgram::from_wire(&[op, 0, 0, 1], 2, 0, vec![]).is_err(),
+            "op {op}: dst == a must be rejected"
+        );
+    }
+}
+
+/// The three casts manufacture NULL out of a non-NULL input, so a program
+/// carrying one can never take the `no_nulls` fast path; the pure transforms
+/// only propagate and must not disturb it.
+#[test]
+fn test_no_nulls_classification_of_the_new_opcodes() {
+    let nonnull = TestSchema::new(&[(type_code::U64, false), (type_code::I64, false)], &[0]);
+    let with = |instr: LogicalInstr| {
+        let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 1 }, instr];
+        scalar_prog(&nonnull, instrs, 2, 1, vec![]).prog.no_nulls
+    };
+    for instr in [
+        LogicalInstr::IntUnary {
+            op: IntUnaryOp::Abs,
+            dst: 1,
+            a: 0,
+        },
+        LogicalInstr::FloatUnary {
+            op: super::FloatUnaryOp::Round,
+            dst: 1,
+            a: 0,
+        },
+        LogicalInstr::IntMinMax2 {
+            dst: 1,
+            a: 0,
+            b: 0,
+            is_max: true,
+        },
+    ] {
+        assert!(with(instr), "a propagating transform keeps no_nulls");
+    }
+    for instr in [
+        LogicalInstr::FloatToF32 { dst: 1, a: 0 },
+        LogicalInstr::IntCast {
+            dst: 1,
+            a: 0,
+            tc: type_code::I8 as u32,
+        },
+        LogicalInstr::FloatToInt {
+            dst: 1,
+            a: 0,
+            tc: type_code::I8 as u32,
+        },
+    ] {
+        assert!(!with(instr), "a narrowing cast manufactures NULL");
+    }
+}
+
+/// `IntMinMax2` picks its compare domain from the U64 tracking of BOTH
+/// operands, and re-taints its own dst — which is what makes the lowering's
+/// fold-head rotation sufficient to fix the domain for a whole n-ary fold.
+#[test]
+fn test_min_max2_compare_domain_and_u64_propagation() {
+    // pk(U64), col1 = U64, col2 = I64.
+    let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::U64, type_code::I64]);
+    let signed_of = |a_col: u32, b_col: u32| {
+        let instrs = vec![
+            LogicalInstr::LoadColInt { dst: 0, col: a_col },
+            LogicalInstr::LoadColInt { dst: 1, col: b_col },
+            LogicalInstr::IntMinMax2 {
+                dst: 2,
+                a: 0,
+                b: 1,
+                is_max: true,
+            },
+            // A second fold against the signed column reads dst's taint.
+            LogicalInstr::LoadColInt { dst: 3, col: 2 },
+            LogicalInstr::IntMinMax2 {
+                dst: 4,
+                a: 2,
+                b: 3,
+                is_max: true,
+            },
+        ];
+        let prog = scalar_prog(&schema, instrs, 5, 4, vec![]);
+        prog.prog
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                Instr::IntMinMax2 { signed, .. } => Some(*signed),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    // Both signed: signed compare throughout.
+    assert_eq!(signed_of(2, 2), vec![true, true]);
+    // Either operand U64-tracked makes the fold unsigned, and the taint is
+    // sticky, so the follow-on fold against a signed column stays unsigned.
+    assert_eq!(signed_of(1, 2), vec![false, false]);
+    assert_eq!(signed_of(2, 1), vec![false, false]);
+}
+
+/// An emitted `INT_CAST` re-seeds the U64 tracking from its TARGET, which is
+/// what lets `CAST(x AS BIGINT UNSIGNED)` drive a downstream unsigned compare.
+#[test]
+fn test_int_cast_reseeds_u64_tracking_from_its_target() {
+    // pk(U64), col1 = I64 (signed-tracked), col2 = U64.
+    let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::I64, type_code::U64]);
+    let cmp_signed_after = |tc: u8, src_col: u32| {
+        let instrs = vec![
+            LogicalInstr::LoadColInt { dst: 0, col: src_col },
+            LogicalInstr::IntCast {
+                dst: 1,
+                a: 0,
+                tc: tc as u32,
+            },
+            LogicalInstr::LoadConst { dst: 2, val: 0 },
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 3,
+                a: 1,
+                b: 2,
+            },
+        ];
+        let prog = scalar_prog(&schema, instrs, 4, 3, vec![]);
+        prog.prog
+            .instrs
+            .iter()
+            .find_map(|i| match i {
+                Instr::Cmp { signed, .. } => Some(*signed),
+                _ => None,
+            })
+            .expect("the compare survives")
+    };
+    assert!(!cmp_signed_after(type_code::U64, 1), "U64 target taints the dst");
+    assert!(
+        cmp_signed_after(type_code::I64, 2),
+        "a signed target clears a U64 source's taint"
+    );
+    assert!(cmp_signed_after(type_code::I32, 1));
+}
+
+/// `src_signed` is resolved from the OPERAND's tracking, not from the target —
+/// it is what decides whether the range check reads the register as i64 or u64.
+#[test]
+fn test_int_cast_records_the_source_signedness() {
+    let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::I64, type_code::U64]);
+    let src_signed_of = |src_col: u32| {
+        let instrs = vec![
+            LogicalInstr::LoadColInt { dst: 0, col: src_col },
+            LogicalInstr::IntCast {
+                dst: 1,
+                a: 0,
+                tc: type_code::I8 as u32,
+            },
+        ];
+        let prog = scalar_prog(&schema, instrs, 2, 1, vec![]);
+        prog.prog
+            .instrs
+            .iter()
+            .find_map(|i| match i {
+                Instr::IntCast { src_signed, .. } => Some(*src_signed),
+                _ => None,
+            })
+            .expect("the cast survives")
+    };
+    assert!(src_signed_of(1), "an I64 column is a signed source");
+    assert!(!src_signed_of(2), "a U64 column is an unsigned source");
 }

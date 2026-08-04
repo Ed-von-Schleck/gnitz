@@ -1,11 +1,13 @@
 use gnitz_wire::{
-    EXPR_BOOL_AND, EXPR_BOOL_NOT, EXPR_BOOL_OR, EXPR_CMP_EQ, EXPR_CMP_GE, EXPR_CMP_GT, EXPR_CMP_LE, EXPR_CMP_LT,
-    EXPR_CMP_NE, EXPR_COPY_COL, EXPR_EMIT, EXPR_FCMP_EQ, EXPR_FCMP_GE, EXPR_FCMP_GT, EXPR_FCMP_LE, EXPR_FCMP_LT,
-    EXPR_FCMP_NE, EXPR_FLOAT_ADD, EXPR_FLOAT_DIV, EXPR_FLOAT_MUL, EXPR_FLOAT_NEG, EXPR_FLOAT_SUB, EXPR_INT_ADD,
-    EXPR_INT_DIV, EXPR_INT_IN_SET, EXPR_INT_MOD, EXPR_INT_MUL, EXPR_INT_NEG, EXPR_INT_SUB, EXPR_INT_TO_FLOAT,
-    EXPR_IS_NOT_NULL, EXPR_IS_NULL, EXPR_LOAD_COL_FLOAT, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST, EXPR_LOAD_NULL,
-    EXPR_SELECT, EXPR_STR_COL_EQ_COL, EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LE_COL, EXPR_STR_COL_LE_CONST,
-    EXPR_STR_COL_LT_COL, EXPR_STR_COL_LT_CONST,
+    TypeCode, EXPR_BOOL_AND, EXPR_BOOL_NOT, EXPR_BOOL_OR, EXPR_CMP_EQ, EXPR_CMP_GE, EXPR_CMP_GT, EXPR_CMP_LE,
+    EXPR_CMP_LT, EXPR_CMP_NE, EXPR_COPY_COL, EXPR_EMIT, EXPR_FCMP_EQ, EXPR_FCMP_GE, EXPR_FCMP_GT, EXPR_FCMP_LE,
+    EXPR_FCMP_LT, EXPR_FCMP_NE, EXPR_FLOAT_ABS, EXPR_FLOAT_ADD, EXPR_FLOAT_CEIL, EXPR_FLOAT_DIV, EXPR_FLOAT_FLOOR,
+    EXPR_FLOAT_MAX2, EXPR_FLOAT_MIN2, EXPR_FLOAT_MUL, EXPR_FLOAT_NEG, EXPR_FLOAT_ROUND, EXPR_FLOAT_SUB,
+    EXPR_FLOAT_TO_F32, EXPR_FLOAT_TO_INT, EXPR_FLOAT_TRUNC, EXPR_INT_ABS, EXPR_INT_ADD, EXPR_INT_CAST, EXPR_INT_DIV,
+    EXPR_INT_IN_SET, EXPR_INT_MAX2, EXPR_INT_MIN2, EXPR_INT_MOD, EXPR_INT_MUL, EXPR_INT_NEG, EXPR_INT_SUB,
+    EXPR_INT_TO_FLOAT, EXPR_IS_NOT_NULL, EXPR_IS_NULL, EXPR_LOAD_COL_FLOAT, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST,
+    EXPR_LOAD_NULL, EXPR_SELECT, EXPR_STR_COL_EQ_COL, EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LE_COL,
+    EXPR_STR_COL_LE_CONST, EXPR_STR_COL_LT_COL, EXPR_STR_COL_LT_CONST,
 };
 
 /// A compiled expression program: a flat list of 4-word instructions
@@ -217,6 +219,48 @@ impl ExprBuilder {
 
     pub fn int_to_float(&mut self, src: u32) -> u32 {
         self.unary_op(EXPR_INT_TO_FLOAT, src)
+    }
+
+    // --- Numeric scalar functions ---
+
+    pub fn int_abs(&mut self, src: u32) -> u32 {
+        self.unary_op(EXPR_INT_ABS, src)
+    }
+    pub fn float_abs(&mut self, src: u32) -> u32 {
+        self.unary_op(EXPR_FLOAT_ABS, src)
+    }
+    pub fn float_floor(&mut self, src: u32) -> u32 {
+        self.unary_op(EXPR_FLOAT_FLOOR, src)
+    }
+    pub fn float_ceil(&mut self, src: u32) -> u32 {
+        self.unary_op(EXPR_FLOAT_CEIL, src)
+    }
+    pub fn float_round(&mut self, src: u32) -> u32 {
+        self.unary_op(EXPR_FLOAT_ROUND, src)
+    }
+    pub fn float_trunc(&mut self, src: u32) -> u32 {
+        self.unary_op(EXPR_FLOAT_TRUNC, src)
+    }
+    pub fn float_to_f32(&mut self, src: u32) -> u32 {
+        self.unary_op(EXPR_FLOAT_TO_F32, src)
+    }
+    pub fn int_cast(&mut self, src: u32, to: TypeCode) -> u32 {
+        self.binary_op(EXPR_INT_CAST, src, to as u32)
+    }
+    pub fn float_to_int(&mut self, src: u32, to: TypeCode) -> u32 {
+        self.binary_op(EXPR_FLOAT_TO_INT, src, to as u32)
+    }
+    pub fn int_max2(&mut self, a: u32, b: u32) -> u32 {
+        self.binary_op(EXPR_INT_MAX2, a, b)
+    }
+    pub fn int_min2(&mut self, a: u32, b: u32) -> u32 {
+        self.binary_op(EXPR_INT_MIN2, a, b)
+    }
+    pub fn float_max2(&mut self, a: u32, b: u32) -> u32 {
+        self.binary_op(EXPR_FLOAT_MAX2, a, b)
+    }
+    pub fn float_min2(&mut self, a: u32, b: u32) -> u32 {
+        self.binary_op(EXPR_FLOAT_MIN2, a, b)
     }
 
     // --- Conditional ---

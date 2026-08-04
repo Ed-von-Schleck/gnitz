@@ -65,12 +65,6 @@ pub(crate) fn single_fn_name(f: &sqlparser::ast::Function) -> Option<&str> {
     }
 }
 
-/// Case-insensitive match on an unqualified single-part function name — no
-/// allocation, unlike `f.name.to_string()`.
-pub(crate) fn fn_name_is(f: &sqlparser::ast::Function, name: &str) -> bool {
-    single_fn_name(f).is_some_and(|n| n.eq_ignore_ascii_case(name))
-}
-
 /// The one SQL-name ↔ aggregate map, read in both directions by
 /// [`agg_func_from_name`] and [`agg_func_name`]. `CountNonNull` is absent: it is
 /// not a spelling a user writes, but the `COUNT(x)` argument shape the binder
@@ -262,11 +256,13 @@ pub(crate) fn reject_computed_grouped_item() -> GnitzSqlError {
 
 /// The direct operand subexpressions of `e` — the node set the structural
 /// binder recurses through (binary/unary ops, parens, BETWEEN, IS [NOT] NULL,
-/// IN lists) plus function-call arguments. Subquery nodes contribute no
-/// operands: no walker may silently descend into a subquery. The single
-/// definition behind the crate's expression walkers (`expr_has_aggregate`,
-/// HAVING aggregate collection, EXISTS correlation side-counting), so a node
-/// added to the binder's vocabulary reaches them all at once.
+/// IN lists, CEIL/FLOOR/CAST) plus function-call arguments. Subquery nodes
+/// contribute no operands: no walker may silently descend into a subquery. The
+/// single definition behind the crate's expression walkers
+/// (`expr_has_aggregate`, HAVING aggregate collection, EXISTS correlation
+/// side-counting, the `EXCLUDED` guard), so a node added to the binder's
+/// vocabulary reaches them all at once — and one added to the binder but *not*
+/// here stays invisible to every walker, which is why the two move together.
 pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Expr> {
     use sqlparser::ast::{CaseWhen, Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
     match e {
@@ -275,6 +271,9 @@ pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Ex
             vec![expr]
         }
         Expr::Between { expr, low, high, .. } => vec![expr, low, high],
+        // CEIL/FLOOR/CAST reach the binder as their own AST nodes rather than as
+        // function calls, so their operand needs naming here explicitly.
+        Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } | Expr::Cast { expr, .. } => vec![expr],
         Expr::InList { expr, list, .. } => std::iter::once(expr.as_ref()).chain(list).collect(),
         // CASE operands: the optional operand, every WHEN condition + result, and
         // the optional ELSE — the node set `bind_structural`'s Case arm recurses
@@ -818,4 +817,52 @@ pub(crate) fn is_bare_wildcard_projection(projection: &[SelectItem]) -> bool {
     projection
         .iter()
         .all(|p| matches!(p, SelectItem::Wildcard(o) if !wildcard_options_present(o)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    fn parse(src: &str) -> sqlparser::ast::Expr {
+        Parser::new(&GenericDialect {})
+            .try_with_sql(src)
+            .unwrap()
+            .parse_expr()
+            .unwrap()
+    }
+
+    /// CEIL/FLOOR/CAST reach the binder as dedicated AST nodes rather than as
+    /// function calls, so [`expr_operands`] has to name their operand. Falling
+    /// into the wildcard would make each of these look aggregate-free and route
+    /// the query to the scalar path.
+    #[test]
+    fn expr_operands_reaches_through_the_dedicated_nodes() {
+        for src in [
+            "CAST(SUM(x) AS INT)",
+            "SUM(x)::INT",
+            "TRY_CAST(SUM(x) AS INT)",
+            "CEIL(SUM(x))",
+            "FLOOR(SUM(x))",
+            "ABS(CAST(SUM(x) AS INT))",
+        ] {
+            assert!(expr_has_aggregate(&parse(src)), "{src}");
+            let mut seen = 0usize;
+            for_each_agg_call::<()>(&parse(src), &mut |_| {
+                seen += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(seen, 1, "{src}: the aggregate must be collected exactly once");
+        }
+    }
+
+    /// Same walker, the subquery consumers: a subquery under a CAST must still
+    /// route the view to the subquery-bearing builder.
+    #[test]
+    fn expr_operands_exposes_a_subquery_under_a_cast() {
+        assert!(expr_has_scalar_subquery(&parse("CAST((SELECT 1) AS INT)")));
+        assert!(expr_has_exists_in(&parse("CAST(x AS INT) IN (SELECT y FROM t)")));
+    }
 }

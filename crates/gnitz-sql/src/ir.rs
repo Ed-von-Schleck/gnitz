@@ -63,6 +63,30 @@ pub(crate) enum BExpr<R> {
         inner: Box<BExpr<R>>,
         items: Vec<BExpr<R>>,
     },
+    Func {
+        f: NumFunc,
+        arg: Box<BExpr<R>>,
+    },
+    MinMaxN {
+        is_max: bool,
+        args: Vec<BExpr<R>>,
+    },
+    Cast {
+        expr: Box<BExpr<R>>,
+        to: TypeCode,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NumFunc {
+    Abs,
+    Floor,
+    Ceil,
+    Trunc,
+    /// `ROUND(x, n)`, with `ROUND(x)` as `Round(0)`. The scale rides the node so
+    /// lowering, which knows the argument's type, can fold the integer case
+    /// instead of the binder committing to float arithmetic it cannot type.
+    Round(i8),
 }
 
 /// The runtime bound-expression IR: [`BExpr`] with its leaf reference resolved to
@@ -145,6 +169,19 @@ impl<R> BExpr<R> {
             }
             // The membership test is a boolean, like the comparison `BinOp` arm.
             BExpr::InList { .. } => TypeCode::I64,
+            // Every transform is the identity on an integer register and its own
+            // IEEE result on a float one — i.e. the argument's register image.
+            // Only a negative ROUND scale forces the f64 lift on an integer.
+            BExpr::Func { f, arg } => match f {
+                NumFunc::Round(n) if *n < 0 => TypeCode::F64,
+                _ => arg.infer_type_with(leaf_ty).register_image(),
+            },
+            // Seeded with `unify_numeric`'s neutral element, so a one-argument
+            // list types as its own register image and an empty one as I64.
+            BExpr::MinMaxN { args, .. } => args
+                .iter()
+                .fold(TypeCode::I64, |ty, a| unify_numeric(ty, a.infer_type_with(leaf_ty))),
+            BExpr::Cast { to, .. } => *to,
         }
     }
 }
@@ -166,6 +203,18 @@ impl<R> BExpr<R> {
             BExpr::LitNull => BExpr::LitNull,
             BExpr::BinOp(l, op, r) => BExpr::BinOp(Box::new(l.try_map_refs(f)?), *op, Box::new(r.try_map_refs(f)?)),
             BExpr::UnaryOp(op, inner) => BExpr::UnaryOp(*op, Box::new(inner.try_map_refs(f)?)),
+            BExpr::Func { f: nf, arg } => BExpr::Func {
+                f: *nf,
+                arg: Box::new(arg.try_map_refs(f)?),
+            },
+            BExpr::MinMaxN { is_max, args } => BExpr::MinMaxN {
+                is_max: *is_max,
+                args: args.iter().map(|a| a.try_map_refs(f)).collect::<Result<Vec<_>, _>>()?,
+            },
+            BExpr::Cast { expr, to } => BExpr::Cast {
+                expr: Box::new(expr.try_map_refs(f)?),
+                to: *to,
+            },
             BExpr::AggCall { func, arg } => BExpr::AggCall {
                 func: *func,
                 arg: arg.as_deref().map(|a| a.try_map_refs(f)).transpose()?.map(Box::new),
@@ -197,6 +246,21 @@ impl<R> BExpr<R> {
         on_null: &impl Fn(&R, bool) -> Result<BExpr<R>, E>,
     ) -> Result<BExpr<R>, E> {
         Ok(match self {
+            BExpr::Func { f, arg } => BExpr::Func {
+                f: *f,
+                arg: Box::new(arg.try_expand_leaves(on_col, on_null)?),
+            },
+            BExpr::MinMaxN { is_max, args } => BExpr::MinMaxN {
+                is_max: *is_max,
+                args: args
+                    .iter()
+                    .map(|a| a.try_expand_leaves(on_col, on_null))
+                    .collect::<Result<Vec<_>, _>>()?,
+            },
+            BExpr::Cast { expr, to } => BExpr::Cast {
+                expr: Box::new(expr.try_expand_leaves(on_col, on_null)?),
+                to: *to,
+            },
             BExpr::ColRef(r) => on_col(r)?,
             BExpr::IsNull(r) => on_null(r, true)?,
             BExpr::IsNotNull(r) => on_null(r, false)?,
@@ -256,6 +320,9 @@ impl<R> BExpr<R> {
                 r.for_each_ref(f);
             }
             BExpr::UnaryOp(_, inner) => inner.for_each_ref(f),
+            BExpr::Func { arg, .. } => arg.for_each_ref(f),
+            BExpr::MinMaxN { args, .. } => args.iter().for_each(|a| a.for_each_ref(f)),
+            BExpr::Cast { expr, .. } => expr.for_each_ref(f),
             BExpr::AggCall { arg, .. } => {
                 if let Some(a) = arg {
                     a.for_each_ref(f);

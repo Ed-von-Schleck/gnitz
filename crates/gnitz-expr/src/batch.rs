@@ -7,8 +7,29 @@
 
 use std::cmp::Ordering;
 
+use crate::program::{FloatUnaryOp, IntUnaryOp};
 use crate::{BatchView, CmpOp, Instr, ResolvedProgram, StrOp, PAYLOAD_MAPPING_PK_SENTINEL};
 use gnitz_wire::{compare_german_strings, null_word_get, read_u64_le, FixedInt};
+
+/// Integer-cast bounds for the target type: the signed-source window `[lo, hi]`
+/// and the unsigned-source ceiling `hi_u`. Only U64 needs the two to differ —
+/// its `hi` is clamped to `i64::MAX` because the signed test runs in i64.
+#[inline]
+fn int_cast_bounds(fi: FixedInt) -> (i64, i64, u64) {
+    let (lo, hi) = fi.range();
+    (lo as i64, hi.min(i64::MAX as i128) as i64, hi as u64)
+}
+
+/// Float→int bounds as an f64 half-open window `[lo, hi)`. The upper bound is
+/// exclusive at every width: after `trunc` the value is integral, so `t < 2^k`
+/// is exactly `t <= 2^k - 1` — and it avoids naming `2^63-1`/`2^64-1`, neither
+/// of which is representable in f64. Both bounds are then powers of two, so
+/// the f64 conversion is exact.
+#[inline]
+fn float_to_int_bounds(fi: FixedInt) -> (f64, f64) {
+    let (lo, hi) = fi.range();
+    (lo as f64, (hi + 1) as f64)
+}
 
 pub(crate) const MORSEL: usize = 256;
 pub(crate) const NULL_WORDS_PER_REG: usize = MORSEL / 64; // 4
@@ -572,6 +593,92 @@ pub(crate) fn eval_batch<B: BatchView>(
         }};
     }
 
+    // Unary counterpart of `div_like!`: compute every row unconditionally, then
+    // mark the failures NULL. Indexed rather than via `regs_split` — `validate`
+    // anti-aliases only the binary opcodes, so a unary `dst == a` is legal (see
+    // `un_op!`). `body` returns `(value, failed)`; the value is always defined,
+    // so a failed row never leaves uninitialised bits behind.
+    //
+    // The failure bits are accumulated in a register-resident word and merged
+    // with the operand's null word once per 64 rows, the shape
+    // `fill_null_bits_mask` uses — one store per word, and no per-row aliasing
+    // between the value writes and the mask.
+    macro_rules! unary_null_like {
+        ($a:expr, $d:expr, |$x:ident| $body:expr) => {{
+            let ai = $a as usize;
+            let base_a = ai * MORSEL;
+            let base_d = $d * MORSEL;
+            let nulls = !scratch.no_nulls;
+            let (base_null_a, base_null_d) = (ai * NULL_WORDS_PER_REG, $d * NULL_WORDS_PER_REG);
+            for w in 0..m.div_ceil(64) {
+                let lo = w * 64;
+                let hi = (lo + 64).min(m);
+                let mut bad = 0u64;
+                for i in lo..hi {
+                    let $x = scratch.regs[base_a + i];
+                    let (val, failed): (i64, bool) = $body;
+                    scratch.regs[base_d + i] = val;
+                    bad |= (failed as u64) << (i - lo);
+                }
+                // `no_nulls` keeps the null buffers at capacity 0, so the merge
+                // must stay behind the flag even though every caller of this
+                // macro is classified null-producing.
+                if nulls {
+                    scratch.null_bits[base_null_d + w] = scratch.null_bits[base_null_a + w] | bad;
+                }
+            }
+            maybe_pack_bool_bits(scratch, &mo, $d);
+        }};
+    }
+
+    // Null-skipping 2-ary extremum. `null_or2`'s `a|b` rule is exactly wrong here
+    // (the result is null only when BOTH operands are), so this cannot use
+    // `bin_op!`. `pick` returns true when `a` wins on value.
+    //
+    // The value loop compares unconditionally and stays branch-free; the rows
+    // where exactly one operand is NULL are the exception, so they are bit-
+    // scanned out of the null words afterwards and overwritten — the same
+    // compare-then-fix-up shape `eval_str_cmp` and `zero_null_rows` use. Doing
+    // the null test per row inside the loop instead costs about twice the
+    // instructions and blocks vectorisation.
+    macro_rules! minmax2 {
+        ($a:expr, $b:expr, $d:expr, |$x:ident, $y:ident| $pick:expr) => {{
+            let ai = $a as usize;
+            let bi = $b as usize;
+            {
+                let ([ra, rb], rd) = scratch.regs_split([ai, bi], $d, m);
+                for i in 0..m {
+                    let $x = ra[i];
+                    let $y = rb[i];
+                    rd[i] = if $pick { $x } else { $y };
+                }
+            }
+            if !scratch.no_nulls {
+                let EvalScratch { regs, null_bits, .. } = scratch;
+                let (base_a, base_b, base_d) = (
+                    ai * NULL_WORDS_PER_REG,
+                    bi * NULL_WORDS_PER_REG,
+                    $d * NULL_WORDS_PER_REG,
+                );
+                for w in 0..m.div_ceil(64) {
+                    let (wa, wb) = (null_bits[base_a + w], null_bits[base_b + w]);
+                    // A NULL operand yields the other one, so only the rows where
+                    // exactly one side is NULL need their value replaced.
+                    for (mask, src) in [(wa & !wb, bi), (wb & !wa, ai)] {
+                        let mut rest = mask;
+                        while rest != 0 {
+                            let i = w * 64 + rest.trailing_zeros() as usize;
+                            regs[$d * MORSEL + i] = regs[src * MORSEL + i];
+                            rest &= rest - 1;
+                        }
+                    }
+                    null_bits[base_d + w] = wa & wb;
+                }
+            }
+            maybe_pack_bool_bits(scratch, &mo, $d);
+        }};
+    }
+
     // Dispatch a German-string compare on its operator, hoisting the three-way
     // branch out of the row loop: each arm instantiates `eval_str_cmp` with its
     // own `Ordering` predicate.
@@ -709,7 +816,87 @@ pub(crate) fn eval_batch<B: BatchView>(
             // correct for dividends >= 2^63. Zero divisor marks NULL.
             Instr::IntDiv { dst, a, b, signed } => divmod!(a, b, dst as usize, signed, wrapping_div),
             Instr::IntMod { dst, a, b, signed } => divmod!(a, b, dst as usize, signed, wrapping_rem),
-            Instr::IntNeg { dst, a } => un_op!(a, dst as usize, |x| x.wrapping_neg()),
+            // The operator match is OUTSIDE the row loop, so each arm expands to
+            // its own monomorphic, branch-free loop (the `Instr::Cmp` pattern).
+            Instr::IntUnary { op, dst, a } => {
+                let d = dst as usize;
+                match op {
+                    IntUnaryOp::Neg => un_op!(a, d, |x| x.wrapping_neg()),
+                    IntUnaryOp::Abs => un_op!(a, d, |x| x.wrapping_abs()),
+                }
+            }
+            Instr::FloatUnary { op, dst, a } => {
+                let d = dst as usize;
+                match op {
+                    FloatUnaryOp::Neg => un_op!(a, d, |x| encode_f64(-decode_f64(x))),
+                    FloatUnaryOp::Abs => un_op!(a, d, |x| encode_f64(decode_f64(x).abs())),
+                    FloatUnaryOp::Floor => un_op!(a, d, |x| encode_f64(decode_f64(x).floor())),
+                    FloatUnaryOp::Ceil => un_op!(a, d, |x| encode_f64(decode_f64(x).ceil())),
+                    FloatUnaryOp::Round => un_op!(a, d, |x| encode_f64(decode_f64(x).round_ties_even())),
+                    FloatUnaryOp::Trunc => un_op!(a, d, |x| encode_f64(decode_f64(x).trunc())),
+                }
+            }
+            // Testing the ROUNDED value rather than `|x| > f32::MAX` keeps the
+            // doubles just above f32::MAX that round back down to it finite.
+            Instr::FloatToF32 { dst, a } => unary_null_like!(a, dst as usize, |x| {
+                let f = decode_f64(x);
+                let v32 = f as f32;
+                (encode_f64(v32 as f64), f.is_finite() && v32.is_infinite())
+            }),
+            Instr::IntCast { dst, a, fi, src_signed } => {
+                let d = dst as usize;
+                let (lo, hi, hi_u) = int_cast_bounds(fi);
+                if src_signed {
+                    unary_null_like!(a, d, |x| (x, x < lo || x > hi))
+                } else {
+                    unary_null_like!(a, d, |x| (x, (x as u64) > hi_u))
+                }
+            }
+            // Truncate toward zero, then range-check in f64: NaN fails every
+            // comparison and so fails the check, as ±inf and out-of-range do.
+            Instr::FloatToInt { dst, a, fi } => {
+                let d = dst as usize;
+                let (flo, fhi) = float_to_int_bounds(fi);
+                if fi == FixedInt::U64 {
+                    unary_null_like!(a, d, |x| {
+                        let t = decode_f64(x).trunc();
+                        let ok = t >= flo && t < fhi;
+                        (if ok { t as u64 as i64 } else { 0 }, !ok)
+                    })
+                } else {
+                    unary_null_like!(a, d, |x| {
+                        let t = decode_f64(x).trunc();
+                        let ok = t >= flo && t < fhi;
+                        (if ok { t as i64 } else { 0 }, !ok)
+                    })
+                }
+            }
+            Instr::IntMinMax2 {
+                dst,
+                a,
+                b,
+                is_max,
+                signed,
+            } => {
+                let d = dst as usize;
+                match (is_max, signed) {
+                    (true, true) => minmax2!(a, b, d, |x, y| x > y),
+                    (false, true) => minmax2!(a, b, d, |x, y| x < y),
+                    (true, false) => minmax2!(a, b, d, |x, y| (x as u64) > (y as u64)),
+                    (false, false) => minmax2!(a, b, d, |x, y| (x as u64) < (y as u64)),
+                }
+            }
+            // `total_cmp` and nothing else: -0.0 and +0.0 are `==`-equal but
+            // total_cmp-distinct, so an `==`-based pick would let operand order
+            // decide which bit pattern survives.
+            Instr::FloatMinMax2 { dst, a, b, is_max } => {
+                let d = dst as usize;
+                if is_max {
+                    minmax2!(a, b, d, |x, y| decode_f64(x).total_cmp(&decode_f64(y)).is_gt())
+                } else {
+                    minmax2!(a, b, d, |x, y| decode_f64(x).total_cmp(&decode_f64(y)).is_lt())
+                }
+            }
 
             // ----------------------------------------------------------------
             // Integer set membership (col IN (…) as one opcode)
@@ -719,7 +906,7 @@ pub(crate) fn eval_batch<B: BatchView>(
             // them). `LoadPayloadInt` writes every row's register
             // (NULL rows too, tracked in `null_bits`), so the search reads a real
             // i64 for all rows and the NULL-row result is masked by `null_copy1`
-            // — exactly how `IntNeg` handles a NULL row.
+            // — exactly how the int negate handles a NULL row.
             Instr::IntInSet {
                 dst,
                 value_reg,
@@ -748,7 +935,6 @@ pub(crate) fn eval_batch<B: BatchView>(
                 let fb_safe = if is_zero { 1.0 } else { fb };
                 (encode_f64(fa / fb_safe), is_zero)
             }),
-            Instr::FloatNeg { dst, a } => un_op!(a, dst as usize, |x| encode_f64(-decode_f64(x))),
 
             // ----------------------------------------------------------------
             // Integer comparisons

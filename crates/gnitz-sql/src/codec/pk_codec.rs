@@ -101,12 +101,14 @@ pub(crate) fn extract_sql_literal(expr: &Expr) -> Option<SqlLiteral<'_>> {
             Value::SingleQuotedString(s) => Some(SqlLiteral::Str(s)),
             _ => None,
         },
+        // `+5` and `-5`: sqlparser lexes the sign as a separate unary operator,
+        // so a signed literal is never a bare `Value::Number`.
         Expr::UnaryOp {
-            op: UnaryOperator::Minus,
+            op: op @ (UnaryOperator::Minus | UnaryOperator::Plus),
             expr,
         } => match expr.as_ref() {
             Expr::Value(vws) => match &vws.value {
-                Value::Number(n, _) => Some(SqlLiteral::Number(n, true)),
+                Value::Number(n, _) => Some(SqlLiteral::Number(n, matches!(op, UnaryOperator::Minus))),
                 _ => None,
             },
             _ => None,

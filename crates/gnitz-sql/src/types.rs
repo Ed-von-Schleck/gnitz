@@ -80,12 +80,14 @@ pub(crate) fn is_integer_type(tc: TypeCode) -> bool {
     )
 }
 
-/// Whether MIN/MAX has a correct accumulator path for this column type. Wide
-/// integer-ish types (U128/UUID/I128) have no i64 slot, and STRING/BLOB have no
-/// usable ordering in the i64 comparator (the integer widening reads the
-/// descriptor prefix as a garbage signed int). Everything else — narrow and 64-bit ints,
-/// and floats — orders correctly.
-pub(crate) fn is_min_max_orderable(tc: TypeCode) -> bool {
+/// Whether a value of this type fits the expression VM's 8-byte register image.
+/// Wide integer-ish types (U128/UUID/I128) have no i64 slot, and STRING/BLOB
+/// hold a 16-byte descriptor whose integer widening reads the prefix as a
+/// garbage signed int. Everything else — narrow and 64-bit ints, and floats —
+/// has a register image and so can be compared, cast, or accumulated there.
+/// The one home for that rule: MIN/MAX (aggregate and scalar) and the CAST
+/// target check all query it.
+pub(crate) fn has_register_image(tc: TypeCode) -> bool {
     !tc.is_wide_int() && !tc.is_german_string()
 }
 

@@ -65,6 +65,44 @@ pub const EXPR_STR_COL_LE_COL: u32 = 45;
 /// a const-pool index (full u32, like `EXPR_STR_COL_*_CONST`), not a register.
 pub const EXPR_INT_IN_SET: u32 = 46;
 
+// Numeric scalar functions and numeric CAST. Codes 37-39 fill the gap the string
+// compares left after LOAD_NULL; the rest continue past INT_IN_SET, keeping the
+// space dense.
+
+/// `[EXPR_INT_ABS, dst, a, 0]` — `wrapping_abs` on the i64 register, so
+/// `ABS(i64::MIN)` is `i64::MIN`. Same width in, same width out: no NULL.
+pub const EXPR_INT_ABS: u32 = 37;
+/// Pure float unary transforms: `[op, dst, a, 0]`. Each is its operand's IEEE
+/// result and produces no NULL of its own. ROUND is `round_ties_even`.
+pub const EXPR_FLOAT_ABS: u32 = 38;
+pub const EXPR_FLOAT_FLOOR: u32 = 39;
+pub const EXPR_FLOAT_CEIL: u32 = 47;
+pub const EXPR_FLOAT_ROUND: u32 = 48;
+pub const EXPR_FLOAT_TRUNC: u32 = 49;
+/// Truncate-toward-zero float→int cast with a target range check:
+/// `[EXPR_FLOAT_TO_INT, dst, a, target_tc]`. NaN, ±∞ and an out-of-range
+/// truncated value all produce NULL. `target_tc` is a `TypeCode` discriminant
+/// riding the `a2` word, not a register — the same one-word-payload convention
+/// `EXPR_INT_IN_SET` uses for its pool index.
+pub const EXPR_FLOAT_TO_INT: u32 = 50;
+/// Integer domain cast: `[EXPR_INT_CAST, dst, a, target_tc]`. The register bits
+/// pass through unchanged when the value is in the target's domain and the row
+/// is NULLed otherwise; the source is read as signed or unsigned according to
+/// the resolve-time U64 tracking of `a`. `target_tc` as for `EXPR_FLOAT_TO_INT`.
+pub const EXPR_INT_CAST: u32 = 51;
+/// Round through f32 precision: `[EXPR_FLOAT_TO_F32, dst, a, 0]`. NULL iff the
+/// source is finite and the rounded result is not. NaN and ±∞ pass through
+/// (both representable); underflow to ±0 passes through.
+pub const EXPR_FLOAT_TO_F32: u32 = 52;
+/// Null-skipping 2-ary extremum: `[op, dst, a, b]`. A NULL operand yields the
+/// other operand; the result is NULL only when both are. The integer pair
+/// compares signed or unsigned per the U64 tracking of either operand; the
+/// float pair compares by `f64::total_cmp`, never `==` or `partial_cmp`.
+pub const EXPR_INT_MAX2: u32 = 53;
+pub const EXPR_INT_MIN2: u32 = 54;
+pub const EXPR_FLOAT_MAX2: u32 = 55;
+pub const EXPR_FLOAT_MIN2: u32 = 56;
+
 // ---------------------------------------------------------------------------
 // Blob framing constants and operand packing
 // ---------------------------------------------------------------------------
