@@ -30,7 +30,10 @@ struct ExchangeRound {
     /// ~1 KB, so a fixed 64-slot array would build and move ~70 KB per round to
     /// use a handful of slots.
     payloads: Vec<Option<Batch>>,
-    count: usize,
+    /// Bit `w` set once worker `w` has reported. A bitmask rather than a
+    /// counter (`nw <= MAX_WORKERS == 64`) so a worker reporting twice cannot
+    /// complete the round while another worker's slot is still empty.
+    reported: u64,
     schema: Option<SchemaDescriptor>,
     /// AND of every worker's per-chunk backfill pad bit (`seek_col_idx &
     /// BACKFILL_PAD_BIT`). Starts `true`; a single non-pad worker clears it.
@@ -79,7 +82,7 @@ impl ExchangeAccumulator {
 
         let round = self.rounds.entry(key).or_insert_with(|| ExchangeRound {
             payloads: (0..nw).map(|_| None).collect(),
-            count: 0,
+            reported: 0,
             schema: None,
             all_pad: true,
         });
@@ -91,9 +94,9 @@ impl ExchangeAccumulator {
         // AND this worker's per-chunk backfill pad bit. 0 for steady-state
         // exchanges, which clears all_pad harmlessly (the reactor ignores it).
         round.all_pad &= (decoded.control.seek_col_idx & BACKFILL_PAD_BIT) != 0;
-        round.count += 1;
+        round.reported |= 1 << w;
 
-        if round.count == nw {
+        if round.reported.count_ones() as usize == nw {
             let round = self.rounds.remove(&key).unwrap();
             let schema = match round.schema {
                 Some(s) => s,
@@ -129,16 +132,10 @@ mod tests {
     fn make_wire(view_id: i64, source_id: i64, with_schema: bool) -> DecodedWire {
         DecodedWire {
             control: DecodedControl {
-                status: 0,
-                client_id: 0,
                 target_id: view_id as u64,
                 flags: FLAG_EXCHANGE as u64,
                 seek_pk: source_id as u128,
-                seek_col_idx: 0,
-                request_id: 0,
-                error_msg: Vec::new(),
-                seek_pk_extra: Vec::new(),
-                block_size: 0,
+                ..Default::default()
             },
             schema: if with_schema {
                 Some(SchemaDescriptor::minimal_u64())

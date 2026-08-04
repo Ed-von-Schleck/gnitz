@@ -69,32 +69,73 @@ pub(crate) async fn guard_client_egress<F: Future<Output = i32>>(
     }
 }
 
-impl Reactor {
-    /// Allocate a per-send id distinct from reply / fsync id space. Also
-    /// allocates `recv_raw` op ids (shared counter, disjoint park maps —
-    /// no collisions either way).
-    pub(super) fn alloc_send_id(&self) -> u64 {
-        let id = self.inner.next_send_id.get();
-        let next = match id.checked_add(1) {
-            Some(n) if n != u64::MAX => n,
-            _ => 1,
-        };
-        self.inner.next_send_id.set(next);
-        id
-    }
+/// Arm (or re-arm) `listener`'s multishot accept. The listener fd rides the
+/// udata id, so its completions route back to it without reactor state.
+fn arm_accept(ring: &mut IoUringRing, listener: i32) {
+    ring.prep_accept(listener, udata(KIND_ACCEPT, listener as u32 as u64));
+}
 
+/// Arm a recv into `[ptr, ptr+len)` on `fd`. The fd rides the udata id, so the
+/// completion routes back to this connection. Not flushed eagerly: the SQE
+/// ships with the runloop's own submit at the end of the same tick — one fewer
+/// io_uring_enter per inbound chunk, and the awaiting task cannot run before
+/// then anyway.
+fn arm_recv(ring: &mut IoUringRing, conn: &mut io::Conn, fd: i32, ptr: *mut u8, len: u32) {
+    ring.prep_recv(fd, ptr, len, udata(KIND_RECV, fd as u32 as u64));
+    conn.recv_armed = true;
+}
+
+impl Reactor {
     /// Attach a listen socket fd and arm its multishot-accept SQE. Callable
     /// once per listener (AF_UNIX + optional TLS); the listener fd rides the
     /// SQE's udata `id` field so each accepted connection resolves as
     /// `(conn_fd, listener_fd)`.
     pub fn attach_listener(&self, listener_fd: i32) {
         let mut ring = self.inner.ring.borrow_mut();
-        ring.prep_accept(listener_fd, udata(KIND_ACCEPT, listener_fd as u32 as u64));
+        arm_accept(&mut ring, listener_fd);
         if let Err(e) = ring.submit_and_wait_timeout(0, 0) {
             crate::gnitz_fatal_abort!(
                 "reactor: accept SQE flush failed (errno={}) — no connections can be accepted",
                 e,
             );
+        }
+    }
+
+    /// Route an accept completion: queue the accepted fd for the accept loop
+    /// and, when the multishot SQE has been cancelled, re-arm the listener.
+    pub(super) fn handle_accept_cqe(&self, listener: i32, res: i32, flags: u32) {
+        if res >= 0 {
+            self.inner.accept_queue.borrow_mut().push_back((res, listener));
+            if let Some(w) = self.inner.accept_waker.borrow_mut().take() {
+                w.wake();
+            }
+        }
+        if flags & CQE_F_MORE != 0 {
+            return;
+        }
+        if res != -libc::EMFILE && res != -libc::ENFILE {
+            arm_accept(&mut self.inner.ring.borrow_mut(), listener);
+            return;
+        }
+        // Out of fds: back off ~50 ms so reap_closing_conns can free some
+        // first. Exhaustion is global, so both listeners' accepts can cancel in
+        // the same window — the pending set records every one and a single
+        // backoff task, spawned on the 0→1 transition, re-arms them all.
+        let first = {
+            let mut pending = self.inner.accept_rearm_pending.borrow_mut();
+            pending.insert(listener) && pending.len() == 1
+        };
+        if first {
+            let inner = Rc::clone(&self.inner);
+            self.spawn(async move {
+                let deadline = Instant::now() + std::time::Duration::from_millis(50);
+                TimerFuture::new(deadline, Rc::clone(&inner)).await;
+                let pending: Vec<i32> = inner.accept_rearm_pending.borrow_mut().drain().collect();
+                let mut ring = inner.ring.borrow_mut();
+                for lfd in pending {
+                    arm_accept(&mut ring, lfd);
+                }
+            });
         }
     }
 
@@ -113,7 +154,7 @@ impl Reactor {
     /// fd path's `RecvState` machinery cannot run here; the pump deframes
     /// the decrypted plaintext itself.
     pub fn recv_raw(&self, fd: i32, mut buf: Vec<u8>) -> RawRecvFuture {
-        let id = self.alloc_send_id();
+        let id = self.inner.alloc_op_id();
         // No eager flush: like the fd path's steady-state recv re-arm, the
         // queued SQE ships with the runloop's own submit when the caller
         // parks — same tick, one fewer io_uring_enter per inbound chunk.
@@ -121,9 +162,9 @@ impl Reactor {
             .ring
             .borrow_mut()
             .prep_recv(fd, buf.as_mut_ptr(), buf.len() as u32, udata(KIND_RAW_RECV, id));
+        self.inner.raw_recvs.open(id, Some(buf));
         RawRecvFuture {
             id,
-            buf: Some(buf),
             inner: Rc::clone(&self.inner),
         }
     }
@@ -134,7 +175,7 @@ impl Reactor {
     /// would deep-copy the ciphertext once per chunk.
     pub async fn send_raw(&self, fd: i32, cipher: Rc<Vec<u8>>) -> i32 {
         let (ptr, len) = (cipher.as_ptr(), cipher.len());
-        self.send_buf_inner(fd, ptr, len, SendAlive::RcVec(cipher)).await
+        self.send_buf_inner(fd, ptr, len, cipher).await
     }
 
     /// Charge and allocate one inbound frame payload buffer against the
@@ -181,35 +222,21 @@ impl Reactor {
 
     /// Initial arm of a recv SQE on a new connection fd.
     pub fn register_conn(&self, fd: i32) {
-        // Clear any stale close-sentinel from a prior incarnation of
-        // this fd number (kernel may reuse fds after close).
-        self.inner.recv_closed.borrow_mut().remove(&fd);
-        // Stray pending_recv entries at this point mean the previous
-        // incarnation of this fd closed without `reap_closing_conns`
-        // freeing its payload buffers — a bug. Assert in debug; in
-        // release, free the buffers so we don't leak.
-        let stale = self.inner.pending_recv.borrow_mut().remove(&fd);
-        if let Some(stale) = stale {
-            if !stale.is_empty() {
-                crate::gnitz_fatal_abort!(
-                    "reactor: register_conn: {} stale pending_recv entries for fd={} — \
-                     reap_closing_conns did not run before fd was reused; \
-                     freeing would be a use-after-free if any SQEs are still in flight",
-                    stale.len(),
-                    fd,
-                );
-            }
-        }
         let mut conns = self.inner.conns.borrow_mut();
-        conns.insert(fd, Box::new(io::Conn::new()));
-        let conn = conns.get_mut(&fd).unwrap();
-        let hdr_ptr = conn.recv_state.hdr_buf_ptr();
-        {
-            let mut ring = self.inner.ring.borrow_mut();
-            ring.prep_recv(fd, hdr_ptr, 4, udata(KIND_RECV, fd as u32 as u64));
-            ring.flush_sqes("recv");
+        // The kernel reuses fd numbers after close, but only `reap_closing_conns`
+        // closes an fd and it removes the `Conn` in the same step. A live entry
+        // here means the number was reused while SQEs may still point into the
+        // old connection's buffers.
+        if conns.contains_key(&fd) {
+            crate::gnitz_fatal_abort!(
+                "reactor: register_conn: fd={} is already registered — it was reused \
+                 before reap_closing_conns retired the previous connection",
+                fd,
+            );
         }
-        conn.recv_armed = true;
+        let conn = conns.entry(fd).or_insert_with(|| Box::new(io::Conn::new()));
+        let hdr_ptr = conn.recv_state.hdr_buf_ptr();
+        arm_recv(&mut self.inner.ring.borrow_mut(), conn, fd, hdr_ptr, 4);
     }
 
     /// Future resolving to the next complete message on `fd` as an owned
@@ -234,13 +261,7 @@ impl Reactor {
     pub async fn send_buffer(&self, fd: i32, buf: crate::storage::batch_pool::PooledSendBuf) -> i32 {
         let len = buf.0.len();
         let ptr = buf.0.as_ptr();
-        guard_client_egress(
-            self,
-            fd,
-            "egress",
-            self.send_buf_inner(fd, ptr, len, SendAlive::Pooled(Rc::new(buf))),
-        )
-        .await
+        guard_client_egress(self, fd, "egress", self.send_buf_inner(fd, ptr, len, Rc::new(buf))).await
     }
 
     /// Send the frame bytes of a W2M ring slot directly, without copying,
@@ -262,7 +283,7 @@ impl Reactor {
             self,
             fd,
             "ring-slot egress",
-            self.send_buf_inner(fd, ptr, len, SendAlive::Slot(Rc::new(slot))),
+            self.send_buf_inner(fd, ptr, len, Rc::new(slot)),
         )
         .await
     }
@@ -272,21 +293,22 @@ impl Reactor {
         let mut sent: usize = 0;
         let mut final_rc: i32 = 0;
         while sent < len {
-            let send_id = self.alloc_send_id();
+            let send_id = self.inner.alloc_op_id();
             if let Some(conn) = self.inner.conns.borrow_mut().get_mut(&fd) {
                 conn.send_inflight += 1;
             }
-            self.inner.send_fd_for_id.borrow_mut().insert(send_id, fd);
             let cur_ptr = unsafe { ptr.add(sent) };
             let remaining = (len - sent) as u32;
-            {
-                let mut ring = self.inner.ring.borrow_mut();
-                ring.prep_send(fd, cur_ptr, remaining, udata(KIND_SEND, send_id));
-                ring.flush_sqes("send");
-            }
+            // No eager flush: the SQE ships with the runloop's own submit at the
+            // end of this tick, and this task parks on the CQE until then either
+            // way — one fewer io_uring_enter per chunk.
+            self.inner
+                .ring
+                .borrow_mut()
+                .prep_send(fd, cur_ptr, remaining, udata(KIND_SEND, send_id));
+            self.inner.sends.open(send_id, Some((fd, Rc::clone(&alive))));
             let rc = SendFuture {
                 send_id,
-                _alive: Some(alive.clone()),
                 inner: Rc::clone(&self.inner),
             }
             .await;
@@ -317,17 +339,14 @@ impl Reactor {
     }
 
     /// Mark `conn`/`fd` closing and wake any parked recv waiter (so its
-    /// `recv().await` resolves to `None`). Borrows only the sibling
-    /// `RefCell`s — never `conns` — so it composes with a caller that holds a
-    /// live `conns` borrow and the `&mut Conn` it hands in. Omits the trailing
-    /// `return`, so each caller keeps its own control flow: leaving
-    /// `recv_armed` false means `reap_closing_conns` fires as soon as
-    /// `send_inflight` reaches 0, dropping the whole `pending_recv` backlog.
+    /// `recv().await` resolves to `None`). Leaving `recv_armed` false means
+    /// `reap_closing_conns` fires as soon as `send_inflight` reaches 0,
+    /// dropping the whole delivery backlog.
     fn begin_recv_close(&self, conn: &mut io::Conn, fd: i32) {
         conn.closing = true;
+        conn.recv_closed = true;
         self.inner.closing_fds.borrow_mut().insert(fd);
-        self.inner.recv_closed.borrow_mut().insert(fd);
-        if let Some(w) = self.inner.recv_waiters.borrow_mut().remove(&fd) {
+        if let Some(w) = conn.recv_waiter.take() {
             w.wake();
         }
     }
@@ -348,11 +367,7 @@ impl Reactor {
         match conn.recv_state.advance(res as usize) {
             io::RecvAdvance::NeedMore => {
                 let (buf, len) = conn.recv_state.remaining();
-                self.inner
-                    .ring
-                    .borrow_mut()
-                    .prep_recv(fd, buf, len, udata(KIND_RECV, fd as u32 as u64));
-                conn.recv_armed = true;
+                arm_recv(&mut self.inner.ring.borrow_mut(), conn, fd, buf, len);
             }
             io::RecvAdvance::HeaderDone => {
                 let plen = conn.recv_state.payload_len();
@@ -376,33 +391,20 @@ impl Reactor {
                 };
                 let pbuf = rbuf.ptr;
                 conn.recv_state.start_payload(rbuf);
-                self.inner
-                    .ring
-                    .borrow_mut()
-                    .prep_recv(fd, pbuf, plen as u32, udata(KIND_RECV, fd as u32 as u64));
-                conn.recv_armed = true;
+                arm_recv(&mut self.inner.ring.borrow_mut(), conn, fd, pbuf, plen as u32);
             }
             io::RecvAdvance::MessageDone => {
                 // The charged `RecvBuf` moves from the recv state machine into
                 // the delivery queue; its accounting rides along untouched.
                 let rbuf = conn.recv_state.take_message();
-                self.inner
-                    .pending_recv
-                    .borrow_mut()
-                    .entry(fd)
-                    .or_default()
-                    .push_back(rbuf);
-                // Arm next header recv immediately so the kernel can keep
+                conn.pending.push_back(rbuf);
+                // Arm the next header recv immediately so the kernel can keep
                 // draining the client's send buffer. Per-session FIFO is
-                // preserved by the `VecDeque` order — the handler still
-                // consumes messages in arrival order.
+                // preserved by the queue order — the handler still consumes
+                // messages in arrival order.
                 let hdr = conn.recv_state.hdr_buf_ptr();
-                self.inner
-                    .ring
-                    .borrow_mut()
-                    .prep_recv(fd, hdr, 4, udata(KIND_RECV, fd as u32 as u64));
-                conn.recv_armed = true;
-                if let Some(w) = self.inner.recv_waiters.borrow_mut().remove(&fd) {
+                arm_recv(&mut self.inner.ring.borrow_mut(), conn, fd, hdr, 4);
+                if let Some(w) = conn.recv_waiter.take() {
                     w.wake();
                 }
             }
@@ -425,24 +427,24 @@ impl Reactor {
         // non-empty reap (rare — the `is_empty` gate above).
         let closing: Vec<i32> = self.inner.closing_fds.borrow().iter().copied().collect();
         for &fd in &closing {
-            let ready = {
-                let conns = self.inner.conns.borrow();
+            // Dropping the `Conn` frees every undrained `RecvBuf` — the
+            // in-flight payload and the delivery queue alike — and each one's
+            // `Drop` refunds its charge, so a reaped connection never leaks the
+            // accounting upward.
+            let retired = {
+                let mut conns = self.inner.conns.borrow_mut();
                 match conns.get(&fd) {
-                    Some(conn) => !conn.has_outstanding(),
-                    None => true,
+                    Some(conn) if conn.has_outstanding() => false,
+                    _ => {
+                        conns.remove(&fd);
+                        true
+                    }
                 }
             };
-            if !ready {
+            if !retired {
                 continue;
             }
             self.inner.closing_fds.borrow_mut().remove(&fd);
-            // Dropping the `Conn` (with its in-flight `recv_state` payload) and
-            // the `pending_recv` queue frees every undrained `RecvBuf`; each
-            // one's `Drop` refunds its charge to the global counter, so a reaped
-            // connection's buffers never leak the accounting upward.
-            self.inner.conns.borrow_mut().remove(&fd);
-            self.inner.recv_waiters.borrow_mut().remove(&fd);
-            self.inner.pending_recv.borrow_mut().remove(&fd);
             unsafe {
                 libc::close(fd);
             }

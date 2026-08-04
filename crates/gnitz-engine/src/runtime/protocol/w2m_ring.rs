@@ -66,6 +66,60 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::foundation::posix_io::{read_u64_raw, write_u64_raw};
 use gnitz_wire::align8;
 
+/// Order witness for [`W2mRingHeader::arm_master_park`], whose store order is
+/// what keeps the lost-wake window closed. Each call stamps its two sub-steps;
+/// [`park_order::step`] reads back 2 only when the flag publish preceded the
+/// `reader_seq` snapshot. An armed probe additionally lets a test hold the
+/// unread-data check until a helper thread's publish is globally visible,
+/// making that outcome deterministic instead of racy.
+#[cfg(test)]
+pub(crate) mod park_order {
+    use std::cell::{Cell, RefCell};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    thread_local! {
+        static STEP: Cell<u8> = const { Cell::new(0) };
+        static HELPER_PUBLISHED: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn begin() {
+        STEP.with(|s| s.set(0));
+    }
+
+    pub(crate) fn flag_published() {
+        STEP.with(|s| s.set(1));
+    }
+
+    pub(crate) fn reader_seq_snapshotted() {
+        STEP.with(|s| {
+            if s.get() == 1 {
+                s.set(2);
+            }
+        });
+    }
+
+    /// 2 iff the last `arm_master_park` published the flag before snapshotting.
+    pub(crate) fn step() -> u8 {
+        STEP.with(|s| s.get())
+    }
+
+    /// Block until an armed probe's helper thread reports it has published.
+    pub(crate) fn await_helper_publish() {
+        let flag = HELPER_PUBLISHED.with(|h| h.borrow().clone());
+        if let Some(flag) = flag {
+            while !flag.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    /// Arm (`Some`) or disarm (`None`) the publish barrier on this thread.
+    pub(crate) fn set_publish_barrier(flag: Option<Arc<AtomicBool>>) {
+        HELPER_PUBLISHED.with(|h| *h.borrow_mut() = flag);
+    }
+}
+
 /// Fixed header size at the start of every W2M mmap region.
 pub const W2M_HEADER_SIZE: usize = 128;
 
@@ -237,8 +291,16 @@ impl W2mRingHeader {
     /// or checking unread data before the snapshot, opens a lost-wake window.
     #[inline]
     pub fn arm_master_park(&self) -> (u32, bool) {
+        #[cfg(test)]
+        park_order::begin();
         self.waiter_flags().fetch_or(FLAG_MASTER_PARKED, Ordering::AcqRel);
+        #[cfg(test)]
+        park_order::flag_published();
         let expected = self.reader_seq().load(Ordering::Acquire);
+        #[cfg(test)]
+        park_order::reader_seq_snapshotted();
+        #[cfg(test)]
+        park_order::await_helper_publish();
         // `write_cursor` is peer-written (the worker publishes it) and must stay
         // `Acquire`; `read_cursor` is master-owned, so reading back our own last
         // advance is a `Relaxed` load.

@@ -13,7 +13,7 @@ a counter > 0 fires the next arm immediately.
 
 **SQE buffer lifetime** — memory referenced by an in-flight SQE must
 outlive the CQE. Cancelled futures must transfer ownership to the reactor
-(`SendFuture::Drop` → `send_buffers_in_flight`). The reactor's
+(`SendFuture::Drop` abandons its park slot, which owns the buffer). The reactor's
 `FUTEX_WAITV` SQE holds a pointer into the boxed `[FutexWaitV]` array
 owned by `futex_waitv_storage`; `request_shutdown` must `AsyncCancel`
 the SQE and await the cancellation CQE before dropping the storage.
@@ -175,7 +175,7 @@ client; workers have no ACK path for DDL.
 
 **Commit visibility vs. durability** — `signal_all` is pipelined before
 fsync; concurrent SCANs can observe in-flight rows. `done` fires only after
-`join2(fsync_fut, reply_futs)` — the inserting client sees `Ok(lsn)` only
+joining `fsync_fut` with `reply_futs` — the inserting client sees `Ok(lsn)` only
 after fsync. Never send `done` before fsync.
 
 ---

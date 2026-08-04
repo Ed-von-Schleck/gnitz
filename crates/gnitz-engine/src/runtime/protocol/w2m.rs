@@ -254,8 +254,8 @@ pub struct W2mSlot {
     /// Valid for the slot's lifetime: `rings` is built once in
     /// `W2mReceiver::new` and never re-pushed, so the `UnsafeCell`'s address is
     /// stable; W2mReceiver outlives all slots (its field is declared last in
-    /// `ReactorShared` so it drops after every slot holder — `scan_parked` and
-    /// `send_buffers_in_flight`); and the master thread is the sole accessor.
+    /// `ReactorShared` so it drops after every slot holder — the scan routes and
+    /// the send park slots); and the master thread is the sole accessor.
     state: *mut InFlightState,
 }
 

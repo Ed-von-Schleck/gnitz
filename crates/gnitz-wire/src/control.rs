@@ -251,6 +251,7 @@ pub fn encode_ctrl_block(
 }
 
 /// Decoded control fields from a wire message.
+#[derive(Default)]
 pub struct DecodedControl {
     pub status: u32,
     pub client_id: u64,

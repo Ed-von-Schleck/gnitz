@@ -183,7 +183,7 @@ pub struct WorkerProcess {
     /// Trains drain strictly FIFO — the front train finishes before the next
     /// starts. Do NOT interleave streams round-robin: the master drains one
     /// request's train at a time, so an interleaved second train's frames
-    /// would sit parked in `scan_parked` holding un-released ring slots;
+    /// would sit parked in the master's scan queue holding un-released ring slots;
     /// `consume_cursor` (released in ring order, `w2m.rs`) could then never
     /// pass them, the ring fills, the worker blocks in `send_encoded`, and the
     /// cluster deadlocks. FIFO is deadlock-free: every fan-out writes its

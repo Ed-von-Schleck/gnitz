@@ -4,7 +4,9 @@
 //! the reactor's single io_uring owns the client ring in Stage 4.
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::rc::Rc;
+use std::task::Waker;
 
 /// Pre-handshake limit applied to every newly registered connection.
 /// Equals the HELLO payload size in bytes; any first frame larger than
@@ -16,8 +18,8 @@ pub(crate) const HELLO_PRE_HANDSHAKE_LEN: usize = gnitz_wire::HELLO_PAYLOAD_LEN 
 /// `resolve_inbound_cap`). The floor guarantees even a tiny memory budget
 /// admits at least one max-size frame; the ceiling caps the default on a
 /// large box where a quarter of RAM would be an excessive inbound reserve.
-pub(crate) const INBOUND_CAP_FLOOR: usize = 64 << 20; // 64 MiB
-pub(crate) const INBOUND_CAP_CEIL: usize = 4usize << 30; // 4 GiB
+pub(super) const INBOUND_CAP_FLOOR: usize = 64 << 20; // 64 MiB
+pub(super) const INBOUND_CAP_CEIL: usize = 4usize << 30; // 4 GiB
 
 /// Accounted memory weight of one inbound payload buffer of `len` bytes.
 #[inline]
@@ -69,7 +71,7 @@ impl Drop for RecvBuf {
     }
 }
 
-pub(super) enum RecvPhase {
+enum RecvPhase {
     Header { pos: usize },
     Payload { buf: RecvBuf, pos: usize },
 }
@@ -82,8 +84,8 @@ pub(crate) enum RecvAdvance {
 }
 
 pub(crate) struct RecvState {
-    pub(super) hdr_buf: [u8; 4],
-    pub(super) phase: RecvPhase,
+    hdr_buf: [u8; 4],
+    phase: RecvPhase,
 }
 
 impl RecvState {
@@ -101,8 +103,7 @@ impl RecvState {
                 if *pos < 4 {
                     return RecvAdvance::NeedMore;
                 }
-                let payload_len = u32::from_le_bytes(self.hdr_buf) as usize;
-                if payload_len == 0 {
+                if u32::from_le_bytes(self.hdr_buf) == 0 {
                     return RecvAdvance::Disconnect;
                 }
                 RecvAdvance::HeaderDone
@@ -149,6 +150,13 @@ impl RecvState {
         self.hdr_buf.as_mut_ptr()
     }
 
+    /// Seed the 4-byte length header as if it had just been received, so a
+    /// payload-phase test can start there.
+    #[cfg(test)]
+    pub(crate) fn seed_header(&mut self, payload_len: u32) {
+        self.hdr_buf = payload_len.to_le_bytes();
+    }
+
     pub(super) fn free_payload(&mut self) {
         // Resetting to Header drops any in-flight `RecvBuf`, whose `Drop` frees
         // the allocation and refunds its charge to the global counter.
@@ -158,10 +166,25 @@ impl RecvState {
     }
 }
 
+/// Everything the reactor knows about one client fd. Removing a `Conn` frees
+/// every buffer that fd charged to the inbound counter and is also the verdict
+/// `recv()` reads as "peer gone", so no per-fd state outlives the connection
+/// into a later incarnation of the same fd number.
 pub(super) struct Conn {
     pub(super) recv_state: RecvState,
     pub(super) recv_armed: bool,
     pub(super) closing: bool,
+    /// Set when a recv CQE arrived with res <= 0 or the connection was
+    /// forcibly closed; a subsequent `recv()` resolves to `None`.
+    pub(super) recv_closed: bool,
+    /// Complete messages awaiting pickup by `recv().await`. A queue, not a
+    /// single slot: with one slot a pipelined client deadlocks once the kernel
+    /// socket buffer fills, since the handler drains one message at a time
+    /// while the kernel blocks the client's send.
+    pub(super) pending: VecDeque<RecvBuf>,
+    /// The one task awaiting a message on this fd. Per-connection FIFO means
+    /// there is never more than one.
+    pub(super) recv_waiter: Option<Waker>,
     pub(super) send_inflight: usize,
     /// Per-connection ceiling on incoming frame payload size. Initialised
     /// to `HELLO_PRE_HANDSHAKE_LEN` (HELLO payload size) so a peer sending
@@ -177,6 +200,9 @@ impl Conn {
             recv_state: RecvState::new(),
             recv_armed: false,
             closing: false,
+            recv_closed: false,
+            pending: VecDeque::new(),
+            recv_waiter: None,
             send_inflight: 0,
             max_payload_len: HELLO_PRE_HANDSHAKE_LEN,
         }

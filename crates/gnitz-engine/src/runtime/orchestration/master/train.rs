@@ -336,10 +336,10 @@ mod tests {
         }
 
         fn teardown(self, lease: ScanLease) {
-            // Drop the lease before the rings: its Drop purges scan_parked,
+            // Drop the lease before the rings: its Drop purges the scan's
             // which would drop any still-queued W2mSlot borrowing the
             // soon-to-be-unmapped region. The Reactor goes next, for the same
-            // reason — it owns `scan_parked`, and a slot dropped after the
+            // reason — it owns the queued frames, and a slot dropped after the
             // unmap writes `consume_cursor` into freed memory. The Peer holds
             // an owning `Rc<Reactor>`, so it must go before the Reactor.
             drop(lease);

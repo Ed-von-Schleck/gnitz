@@ -1,5 +1,11 @@
 //! Reactor IO futures: Timer / Reply / ScanSlot (+ ScanLease) / Fsync /
 //! Accept / Recv / Send — each driven by a CQE waking its registered waker.
+//!
+//! Everything that waits on a single CQE-delivered result goes through
+//! [`super::park::ParkMap`], so `poll` and `Drop` are one line each; only the
+//! op-specific submit and teardown live here.
+
+use std::any::Any;
 
 use super::*;
 
@@ -33,41 +39,35 @@ impl Future for TimerFuture {
         if now >= self.deadline {
             return Poll::Ready(());
         }
-        if let Some(id) = self.timer_id {
-            // Re-poll: update the waker in case it changed.
-            if let Some(entry) = self.inner.timer_wakers.borrow_mut().get_mut(&id) {
-                *entry = cx.waker().clone();
+        let id = match self.timer_id {
+            Some(id) => id,
+            None => {
+                // First poll: submit the io_uring Timeout SQE. It is flushed to
+                // the kernel by tick's submit at the end of the same tick.
+                let id = self.inner.alloc_op_id();
+                let ns = self.deadline.duration_since(now).as_nanos() as u64;
+                self.inner.ring.borrow_mut().prep_timeout(ns, udata(KIND_TIMEOUT, id));
+                self.inner.timers.open(id, None);
+                self.timer_id = Some(id);
+                id
             }
-        } else {
-            // First poll: submit the io_uring Timeout SQE and register the
-            // waker. The SQE is flushed to the kernel by tick's
-            // submit_and_wait_timeout call at the end of the same tick.
-            let id = self.inner.next_timer_id.get();
-            self.inner.next_timer_id.set(id.wrapping_add(1));
-            let ns = self.deadline.duration_since(now).as_nanos() as u64;
-            self.inner.ring.borrow_mut().prep_timeout(ns, udata(KIND_TIMEOUT, id));
-            self.inner.timer_wakers.borrow_mut().insert(id, cx.waker().clone());
-            self.timer_id = Some(id);
-        }
-        Poll::Pending
+        };
+        self.inner.timers.poll(id, cx).map(|_| ())
     }
 }
 
 impl Drop for TimerFuture {
     fn drop(&mut self) {
-        if let Some(id) = self.timer_id {
-            // Remove the waker entry so the racing CQE (fire or -ECANCELED)
-            // finds nothing to wake and is silently discarded.
-            self.inner.timer_wakers.borrow_mut().remove(&id);
-            // Reclaim the kernel timer promptly instead of letting it run to
-            // its deadline: deadline guards (e.g. the per-frame send-slot
-            // eviction timer) drop their timer on every happy-path completion,
-            // and without the cancel each one would leave an armed Timeout,
-            // its waker entry, and its Timespec box behind for the full
-            // window. The cancel's own CQE lands on the no-op
-            // KIND_CANCEL_SINK; the Timeout's CQE (-ECANCELED) lands
-            // on KIND_TIMEOUT, whose handler finds no waker entry and only
-            // releases the Timespec.
+        let Some(id) = self.timer_id else { return };
+        // Reclaim the kernel timer promptly instead of letting it run to its
+        // deadline: deadline guards (e.g. the per-frame send-slot eviction
+        // timer) drop their timer on every happy-path completion, and without
+        // the cancel each one would leave an armed Timeout and its Timespec box
+        // behind for the full window. The cancel's own CQE lands on the no-op
+        // KIND_CANCEL_SINK; the Timeout's own (-ECANCELED) lands on
+        // KIND_TIMEOUT, which finds an abandoned slot and only releases the
+        // Timespec.
+        if self.inner.timers.abandon(id) {
             self.inner
                 .ring
                 .borrow_mut()
@@ -84,30 +84,33 @@ pub struct ReplyFuture {
 impl Future for ReplyFuture {
     type Output = DecodedWire;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<DecodedWire> {
-        if let Some(decoded) = self.inner.parked_replies.borrow_mut().remove(&self.req_id) {
-            return Poll::Ready(decoded);
-        }
-        self.inner
-            .reply_wakers
-            .borrow_mut()
-            .insert(self.req_id, cx.waker().clone());
-        Poll::Pending
+        self.inner.replies.poll(self.req_id, cx).map(|(v, _)| v)
     }
 }
 
 impl Drop for ReplyFuture {
     fn drop(&mut self) {
-        // select2 contract: a dropped awaiter must leave no registered state.
-        // Without this, a reply arriving after the drop finds a stale waker and
-        // is parked forever in parked_replies. On normal completion route_reply
-        // has already removed the waker and poll removed the parked reply, so
-        // Drop finds nothing — two absent-key removes, a few ns on a map already
-        // cache-hot from the same poll. (route_reply parks a reply only when a
-        // waker is registered, so withdrawing the waker is sufficient here — no
-        // tombstone, unlike fsync/send.)
-        self.inner.reply_wakers.borrow_mut().remove(&self.req_id);
-        self.inner.parked_replies.borrow_mut().remove(&self.req_id);
+        // select2 contract: a dropped awaiter leaves no registered state, so a
+        // reply arriving afterwards is discarded rather than parked forever.
+        // Closed, not abandoned: a worker that dies mid-request never sends the
+        // reply that would retire an abandoned slot.
+        self.inner.replies.close(self.req_id);
     }
+}
+
+/// One scan request id's routing state: the frames a worker has streamed ahead
+/// and the awaiter parked on them. Its presence in `ReactorShared::scans` is
+/// what marks the scan live — a frame for an unlisted id belongs to an
+/// abandoned scan and is dropped at the ring boundary.
+#[derive(Default)]
+pub(super) struct ScanRoute {
+    /// A *queue*, not a single slot: a worker streams continuation frames ahead
+    /// while the master drains a different worker serially, so a single value
+    /// would drop all but the last. Each queued `W2mSlot` holds its ring slot
+    /// until dropped, so the worker blocks in `send_encoded` once the ring
+    /// fills — depth is bounded by ring capacity.
+    pub(super) queue: VecDeque<W2mSlot>,
+    pub(super) waker: Option<Waker>,
 }
 
 pub(super) struct ScanSlotFuture {
@@ -118,44 +121,38 @@ pub(super) struct ScanSlotFuture {
 impl Future for ScanSlotFuture {
     type Output = W2mSlot;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<W2mSlot> {
-        {
-            let mut parked = self.inner.scan_parked.borrow_mut();
-            if let Some(q) = parked.get_mut(&self.req_id) {
-                if let Some(slot) = q.pop_front() {
-                    if q.is_empty() {
-                        parked.remove(&self.req_id);
-                    }
-                    return Poll::Ready(slot);
-                }
+        let mut scans = self.inner.scans.borrow_mut();
+        let Some(route) = scans.get_mut(&self.req_id) else {
+            // The lease is gone; no further frame will ever be routed here.
+            return Poll::Pending;
+        };
+        match route.queue.pop_front() {
+            Some(slot) => Poll::Ready(slot),
+            None => {
+                route.waker = Some(cx.waker().clone());
+                Poll::Pending
             }
         }
-        self.inner
-            .scan_wakers
-            .borrow_mut()
-            .insert(self.req_id, cx.waker().clone());
-        Poll::Pending
     }
 }
 
 impl Drop for ScanSlotFuture {
     fn drop(&mut self) {
-        // Only the waker: the ScanLease owns scan_parked for this req_id.
-        // Removing the parked queue here would discard the still-queued
-        // continuation frames a *resolved* future legitimately leaves behind
-        // (between continuation frames there is no live ScanSlotFuture to run a
-        // Drop, so the lease is the only scope that reliably spans the whole
-        // operation).
-        self.inner.scan_wakers.borrow_mut().remove(&self.req_id);
+        // Only the waker: the ScanLease owns the queue for this req_id. Clearing
+        // it here would discard the continuation frames a *resolved* future
+        // legitimately leaves behind (between frames there is no live
+        // ScanSlotFuture, so the lease is the only scope spanning the operation).
+        if let Some(route) = self.inner.scans.borrow_mut().get_mut(&self.req_id) {
+            route.waker = None;
+        }
     }
 }
 
-/// RAII guard owning the active-scan + parked-queue lifecycle of a whole scan
-/// operation. Registers its req_ids in `active_scans` on construction; on drop
-/// deregisters them and purges any waker / queued frames they left (dropping a
-/// queued `W2mSlot` advances `consume_cursor`, freeing ring space). Ids are
-/// stored inline (at most `MAX_WORKERS` per fan-out), mirroring the
-/// `[u64; MAX_WORKERS]` `req_ids` arrays in `dispatch_scan_fanout` — no
-/// per-scan heap allocation.
+/// RAII guard owning the routing state of a whole scan operation. Registers its
+/// req_ids on construction; on drop deregisters them, which drops any frames
+/// they queued (dropping a `W2mSlot` advances `consume_cursor`, freeing ring
+/// space) so `route_scan_slot` discards the scan's later frames. Ids are stored
+/// inline (at most `MAX_WORKERS` per fan-out) — no per-scan heap allocation.
 pub(crate) struct ScanLease {
     inner: Rc<ReactorShared>,
     ids: [u32; MAX_WORKERS],
@@ -165,7 +162,12 @@ pub(crate) struct ScanLease {
 impl ScanLease {
     pub(super) fn new(inner: Rc<ReactorShared>, ids: &[u32]) -> Self {
         debug_assert!(ids.len() <= MAX_WORKERS);
-        inner.active_scans.borrow_mut().extend(ids.iter().copied());
+        {
+            let mut scans = inner.scans.borrow_mut();
+            for &id in ids {
+                scans.insert(id, ScanRoute::default());
+            }
+        }
         let mut buf = [0u32; MAX_WORKERS];
         buf[..ids.len()].copy_from_slice(ids);
         ScanLease {
@@ -178,14 +180,9 @@ impl ScanLease {
 
 impl Drop for ScanLease {
     fn drop(&mut self) {
-        let mut active = self.inner.active_scans.borrow_mut();
-        let mut wakers = self.inner.scan_wakers.borrow_mut();
-        let mut parked = self.inner.scan_parked.borrow_mut();
+        let mut scans = self.inner.scans.borrow_mut();
         for &id in &self.ids[..self.len as usize] {
-            active.remove(&id);
-            wakers.remove(&id);
-            parked.remove(&id); // drops the whole VecDeque → every W2mSlot
-                                // drop advances consume_cursor
+            scans.remove(&id);
         }
     }
 }
@@ -196,48 +193,19 @@ impl Drop for ScanLease {
 
 pub struct FsyncFuture {
     pub(super) id: u64,
-    /// Set once `poll` resolves `Ready`. Lets `Drop` skip the cancellation
-    /// tombstone on the success path: `poll` already removed the parked result,
-    /// so the absent-result check in `Drop` cannot distinguish "resolved" from
-    /// "CQE still pending". Without this flag every successful fsync would
-    /// tombstone an id whose CQE was already consumed — an unbounded
-    /// `cancelled_fsyncs` leak, one entry per commit. `SendFuture` reuses its
-    /// `_alive` keep-alive for the same purpose; `FsyncFuture` has no such field.
-    pub(super) completed: bool,
     pub(super) inner: Rc<ReactorShared>,
 }
 
 impl Future for FsyncFuture {
     type Output = i32;
-    // `mut self` so the ready arm can set `completed`; FsyncFuture is Unpin
-    // (plain fields, no PhantomPinned/pin_project), so DerefMut through the Pin
-    // is sound — the same shape SendFuture::poll already uses.
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<i32> {
-        let parked = self.inner.parked_fsync_results.borrow_mut().remove(&self.id);
-        if let Some(rc) = parked {
-            self.completed = true;
-            return Poll::Ready(rc);
-        }
-        self.inner.fsync_wakers.borrow_mut().insert(self.id, cx.waker().clone());
-        Poll::Pending
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<i32> {
+        self.inner.fsyncs.poll(self.id, cx).map(|(rc, _)| rc)
     }
 }
 
 impl Drop for FsyncFuture {
     fn drop(&mut self) {
-        // Resolved: poll already delivered the result and the CQE was consumed —
-        // no waker left (the handler removed it when it woke), nothing to reclaim.
-        if self.completed {
-            return;
-        }
-        self.inner.fsync_wakers.borrow_mut().remove(&self.id);
-        // CQE arrived after the last poll but before this drop: reclaim it.
-        if self.inner.parked_fsync_results.borrow_mut().remove(&self.id).is_some() {
-            return;
-        }
-        // CQE still pending: tombstone so the late KIND_FSYNC handler drops its
-        // result instead of leaking it (the handler parks unconditionally).
-        self.inner.cancelled_fsyncs.borrow_mut().insert(self.id);
+        self.inner.fsyncs.abandon(self.id);
     }
 }
 
@@ -258,11 +226,10 @@ impl Future for AcceptFuture {
 
 impl Drop for AcceptFuture {
     fn drop(&mut self) {
-        // Waker hygiene only: accept_waker is a single Option<Waker> rewritten
-        // by the next poll and take()n by the KIND_ACCEPT handler, and there is
-        // at most one live AcceptFuture (the eternal accept_loop). Purely
-        // defensive today — the accept loop is never cancelled — but completes
-        // the park-state enumeration for a future timeout/select2 over accept().
+        // accept_waker is a single Option rewritten by the next poll and taken
+        // by the KIND_ACCEPT handler, and there is at most one live
+        // AcceptFuture (the eternal accept loop) — withdrawing it just keeps
+        // the family's park state complete.
         self.inner.accept_waker.borrow_mut().take();
     }
 }
@@ -275,159 +242,98 @@ pub struct RecvFuture {
 impl Future for RecvFuture {
     type Output = Option<io::RecvBuf>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let taken = {
-            let mut map = self.inner.pending_recv.borrow_mut();
-            map.get_mut(&self.fd).and_then(|q| q.pop_front())
+        let mut conns = self.inner.conns.borrow_mut();
+        // No connection means the peer is gone and its state has been reaped —
+        // the same verdict as an explicit close.
+        let Some(conn) = conns.get_mut(&self.fd) else {
+            return Poll::Ready(None);
         };
-        if let Some(buf) = taken {
+        if let Some(buf) = conn.pending.pop_front() {
             // Ownership of the charged `RecvBuf` passes to the caller; its
             // `Drop` refunds the global inbound-byte counter once the caller is
-            // done with it, so the buffer stays accounted for its full residency.
+            // done, so the buffer stays accounted for its full residency.
             return Poll::Ready(Some(buf));
         }
-        if self.inner.recv_closed.borrow().contains(&self.fd) {
+        if conn.recv_closed {
             return Poll::Ready(None);
         }
-        self.inner.recv_waiters.borrow_mut().insert(self.fd, cx.waker().clone());
+        conn.recv_waiter = Some(cx.waker().clone());
         Poll::Pending
     }
 }
 
 impl Drop for RecvFuture {
     fn drop(&mut self) {
-        // Waker hygiene only: recv_waiters holds at most one waker per fd (the
-        // single read loop for this connection), and no per-awaiter result is
-        // parked behind its back. Runs in normal operation — a recv loop ends on
-        // every client disconnect — so withdrawing the waker closes the family.
-        self.inner.recv_waiters.borrow_mut().remove(&self.fd);
-    }
-}
-
-pub(super) enum SendAlive {
-    Pooled(Rc<crate::storage::batch_pool::PooledSendBuf>),
-    Slot(Rc<W2mSlot>),
-    /// TLS ciphertext (`Reactor::send_raw`). `Rc`-wrapped so the per-chunk
-    /// keep-alive clone in `send_buf_inner` stays O(1) — an owned `Vec`
-    /// would deep-copy the whole buffer once per partial-write chunk.
-    RcVec(Rc<Vec<u8>>),
-}
-
-// Manual impl (not derived): the variant fields exist purely to keep the
-// kernel-visible buffers alive, and the explicit match is their one read —
-// a derived Clone is ignored by dead-code analysis and would flag them.
-impl Clone for SendAlive {
-    fn clone(&self) -> Self {
-        match self {
-            SendAlive::Pooled(rc) => SendAlive::Pooled(Rc::clone(rc)),
-            SendAlive::Slot(rc) => SendAlive::Slot(Rc::clone(rc)),
-            SendAlive::RcVec(rc) => SendAlive::RcVec(Rc::clone(rc)),
+        if let Some(conn) = self.inner.conns.borrow_mut().get_mut(&self.fd) {
+            conn.recv_waiter = None;
         }
     }
 }
 
+/// Keeps a send's kernel-visible buffer alive until its CQE. Type-erased: the
+/// three payloads (a pooled buffer, a W2M ring slot, TLS ciphertext) are only
+/// ever held, never inspected, and `Rc` keeps the per-chunk clone in
+/// `send_buf_inner` O(1) — an owned buffer would deep-copy once per partial
+/// write.
+pub(super) type SendAlive = Rc<dyn Any>;
+
+/// What a send op carries until its CQE: its target fd, whose in-flight count
+/// the completion handler decrements, and the buffer keep-alive, which exists
+/// only to be dropped once the kernel is done with the pointer.
+pub(super) type SendCarry = (i32, SendAlive);
+
 pub struct SendFuture {
     pub(super) send_id: u64,
-    pub(super) _alive: Option<SendAlive>,
     pub(super) inner: Rc<ReactorShared>,
 }
 
 impl Future for SendFuture {
     type Output = i32;
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<i32> {
-        let parked = self.inner.parked_send_results.borrow_mut().remove(&self.send_id);
-        if let Some(rc) = parked {
-            self._alive.take();
-            return Poll::Ready(rc);
-        }
-        let send_id = self.send_id;
-        self.inner.send_wakers.borrow_mut().insert(send_id, cx.waker().clone());
-        Poll::Pending
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<i32> {
+        self.inner.sends.poll(self.send_id, cx).map(|(rc, _)| rc)
     }
 }
 
 impl Drop for SendFuture {
     fn drop(&mut self) {
-        // CQE already parked a result (and the handler already freed the
-        // buffer): reclaim the orphaned result, nothing else to do.
-        if self
-            .inner
-            .parked_send_results
-            .borrow_mut()
-            .remove(&self.send_id)
-            .is_some()
-        {
-            self._alive.take();
-            return;
-        }
-        // CQE still pending: keep the buffer alive for the kernel, withdraw the
-        // waker, and tombstone so the late KIND_SEND handler drops its result.
-        // (`_alive` is None on the resolved path — poll take()s it — so this arm
-        // never fires after a successful send, keeping cancelled_sends bounded.)
-        if let Some(alive) = self._alive.take() {
-            self.inner
-                .send_buffers_in_flight
-                .borrow_mut()
-                .insert(self.send_id, alive);
-            self.inner.send_wakers.borrow_mut().remove(&self.send_id);
-            self.inner.cancelled_sends.borrow_mut().insert(self.send_id);
-        }
+        // Abandoning keeps the buffer alive for the kernel (it is carried by
+        // the slot, not by this future) and tells the late CQE to discard its
+        // result.
+        self.inner.sends.abandon(self.send_id);
     }
 }
 
-/// One-shot raw recv (`Reactor::recv_raw`): owns the caller's buffer while
-/// the kernel writes into it; resolves to `(buffer, byte_count)` so the
-/// caller reuses one allocation forever. Cancellation mirrors `SendFuture`
-/// (not `TimerFuture`, which parks no buffer): because this future both
-/// parks a result and owns memory the kernel is writing into, its `Drop`
-/// moves the in-flight `Vec` into `raw_recv_buffers_in_flight` so a late
-/// kernel write lands in live memory — the buffer's presence there is also
-/// what tells the late `KIND_RAW_RECV` handler to discard the orphaned
-/// result. It also submits an `AsyncCancel` (like `TimerFuture`) so an
-/// idle connection's parked recv is reclaimed promptly rather than at
-/// socket death.
+/// One-shot raw recv (`Reactor::recv_raw`): the kernel writes into the caller's
+/// buffer, which the park slot carries so a late write always lands in live
+/// memory, and which comes back with the result so the caller reuses one
+/// allocation forever.
 pub struct RawRecvFuture {
     pub(super) id: u64,
-    /// `Some` until resolved. The `Vec`'s heap allocation is what the SQE
-    /// points at; moving the future moves only the (ptr, len, cap) triple.
-    pub(super) buf: Option<Vec<u8>>,
     pub(super) inner: Rc<ReactorShared>,
 }
 
 impl Future for RawRecvFuture {
     type Output = (Vec<u8>, i32);
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let parked = self.inner.parked_raw_recv.borrow_mut().remove(&self.id);
-        if let Some(res) = parked {
-            let buf = self.buf.take().expect("RawRecvFuture polled after completion");
-            return Poll::Ready((buf, res));
-        }
-        let id = self.id;
-        self.inner.raw_recv_wakers.borrow_mut().insert(id, cx.waker().clone());
-        Poll::Pending
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.inner
+            .raw_recvs
+            .poll(self.id, cx)
+            .map(|(rc, buf)| (buf.expect("raw recv slot lost its buffer"), rc))
     }
 }
 
 impl Drop for RawRecvFuture {
     fn drop(&mut self) {
-        // Resolved: poll took the buffer and consumed the parked result.
-        let Some(buf) = self.buf.take() else { return };
-        self.inner.raw_recv_wakers.borrow_mut().remove(&self.id);
-        // CQE arrived after the last poll but before this drop: the kernel
-        // is done with the buffer — reclaim the orphaned result and let the
-        // buffer drop normally.
-        if self.inner.parked_raw_recv.borrow_mut().remove(&self.id).is_some() {
-            return;
+        // Still in flight: ask the kernel to cancel promptly rather than
+        // leaving an idle connection's recv parked until socket death. The
+        // buffer stays alive in the slot until the -ECANCELED CQE retires it.
+        if self.inner.raw_recvs.abandon(self.id) {
+            self.inner
+                .ring
+                .borrow_mut()
+                .prep_async_cancel(udata(KIND_RAW_RECV, self.id), udata(KIND_CANCEL_SINK, 0));
         }
-        // CQE still pending: park the buffer where the late kernel write
-        // stays valid (doubling as the orphan marker for the late CQE), and
-        // ask the kernel to cancel the recv promptly (its -ECANCELED CQE
-        // frees the parked buffer).
-        self.inner.raw_recv_buffers_in_flight.borrow_mut().insert(self.id, buf);
-        self.inner
-            .ring
-            .borrow_mut()
-            .prep_async_cancel(udata(KIND_RAW_RECV, self.id), udata(KIND_CANCEL_SINK, 0));
     }
 }
 
-// (oneshot, mpsc, AsyncMutex, AsyncRwLock, join2, join_all, select2 live in sync.rs)
+// (oneshot, mpsc, AsyncMutex, AsyncRwLock, join_all, select2 live in sync.rs)

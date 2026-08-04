@@ -13,15 +13,14 @@
 //!   raw pointer set in `Reactor::new`. This eliminates the per-wake
 //!   `Arc::fetch_add/sub` and `Mutex::lock` round-trips that an
 //!   `Arc<Mutex<VecDeque>>` design would impose.
-//! - Timers are `io_uring Timeout` SQEs. `TimerFuture::poll` submits a
-//!   `prep_timeout` SQE on first poll; the resulting CQE wakes the
-//!   registered waker. A cancelled timer's CQE is silently discarded by
-//!   `dispatch_cqe`. `IoUringRing::timer_specs` keys each `Box<Timespec>`
-//!   by the SQE's `user_data` and drops it when the matching CQE is
-//!   drained, so the map size is bounded by in-flight timers.
+//! - Everything that awaits a single completion — timer, W2M reply, fsync,
+//!   send, raw recv — parks in a [`park::ParkMap`]. An entry exists exactly
+//!   while its op is outstanding, so a late CQE can tell "deliver this" from
+//!   "the awaiter is gone" without a per-family tombstone set.
 //! - CQE `user_data` packs an 8-bit kind tag in the high byte and a
-//!   56-bit id in the low bits, where id is a request/timer/send id (not
-//!   an fd). Safe from collisions because the reactor owns its own ring.
+//!   56-bit id in the low bits, where id is a request/op id (not an fd,
+//!   except for accept and recv, which route on the fd itself). Safe from
+//!   collisions because the reactor owns its own ring.
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::VecDeque;
@@ -39,15 +38,14 @@ use self::uring::{Cqe, IoUringRing, CQE_F_MORE};
 use crate::foundation::posix_io::FUTEX2_SIZE_U32;
 use crate::runtime::sal::MAX_WORKERS;
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
-use crate::runtime::w2m_ring::FLAG_MASTER_PARKED;
 use crate::runtime::wire::{self, DecodedWire, FLAG_EXCHANGE};
 
 /// High bit of `internal_req_id` (u32) marks scan-allocated request IDs.
 /// Regular IDs stay in [1, MAX_REGULAR_REQ_ID] (bit 31 clear).
 /// Scan IDs stay in [SCAN_REQ_ID_BASE, 0xFFFFFFFE] (bit 31 set).
-/// Detection in `drain_w2m_for_worker` is a single bitwise AND — zero
-/// HashMap overhead on the push/seek hot path.
-pub(crate) const SCAN_REQ_ID_FLAG: u32 = 1 << 31;
+/// Detection in `drain_w2m_for_worker` is a single bitwise AND, so a scan
+/// frame is intercepted before it is decoded.
+const SCAN_REQ_ID_FLAG: u32 = 1 << 31;
 const MAX_REGULAR_REQ_ID: u64 = (SCAN_REQ_ID_FLAG - 1) as u64; // 0x7FFFFFFF
 const SCAN_REQ_ID_BASE: u32 = SCAN_REQ_ID_FLAG | 1; // 0x80000001
 
@@ -57,6 +55,7 @@ mod conn;
 mod exchange;
 mod futures;
 pub mod io;
+mod park;
 mod runloop;
 pub mod sync;
 mod uring;
@@ -65,15 +64,12 @@ mod uring;
 use conn::client_send_timeout;
 pub(crate) use conn::guard_client_egress;
 
-#[cfg(test)]
-use futures::SendFuture;
 pub(crate) use futures::{FsyncFuture, ReplyFuture, ScanLease};
-use futures::{ScanSlotFuture, SendAlive, TimerFuture};
+use futures::{ScanRoute, ScanSlotFuture, SendCarry, TimerFuture};
+use park::ParkMap;
 
 pub use exchange::{ExchangeAccumulator, PendingRelay};
 pub use io::RecvBuf;
-#[cfg(test)]
-pub use sync::join2;
 pub use sync::{
     join_all_unpin, join_into, mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either, ReadGuard, WriteGuard,
 };
@@ -82,41 +78,46 @@ pub use sync::{
 // CQE user_data encoding (high 8 bits = kind, low 56 bits = id)
 // ---------------------------------------------------------------------------
 
-pub const KIND_TIMEOUT: u64 = 2;
-pub const KIND_FSYNC: u64 = 3;
-pub const KIND_FUTEX_WAITV: u64 = 4;
-pub const KIND_ACCEPT: u64 = 5;
-pub const KIND_RECV: u64 = 6;
-pub const KIND_SEND: u64 = 7;
-pub const KIND_FUTEX_CANCEL: u64 = 8;
-/// CQE tag for the `AsyncCancel` a dropped `TimerFuture` or `RawRecvFuture`
-/// submits against its target SQE, so the cancelled op's kernel state is
-/// reclaimed promptly. The dispatch arm is a pure no-op sink — the
-/// cancellation's *effect* is the target op's own `-ECANCELED` CQE under
-/// its own kind (`KIND_TIMEOUT` / `KIND_RAW_RECV`).
-pub const KIND_CANCEL_SINK: u64 = 9;
+const KIND_TIMEOUT: u64 = 2;
+const KIND_FSYNC: u64 = 3;
+const KIND_FUTEX_WAITV: u64 = 4;
+const KIND_ACCEPT: u64 = 5;
+const KIND_RECV: u64 = 6;
+const KIND_SEND: u64 = 7;
+/// CQE tag for an `AsyncCancel` submitted against another SQE, so the
+/// cancelled op's kernel state is reclaimed promptly. The dispatch arm is a
+/// pure no-op sink — the cancellation's *effect* is the target op's own
+/// `-ECANCELED` CQE under its own kind.
+const KIND_CANCEL_SINK: u64 = 9;
 /// One-shot raw recv into a caller-owned buffer (`Reactor::recv_raw`) — the
 /// TLS read pump's undeframed byte source. Deliberately NOT `KIND_RECV`:
 /// that handler silently drops CQEs for fds absent from `conns`, and TLS
 /// fds never call `register_conn`.
-pub const KIND_RAW_RECV: u64 = 10;
+const KIND_RAW_RECV: u64 = 10;
 
 const KIND_SHIFT: u64 = 56;
 const ID_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
 
 #[inline]
-pub const fn udata(kind: u64, id: u64) -> u64 {
+const fn udata(kind: u64, id: u64) -> u64 {
     (kind << KIND_SHIFT) | (id & ID_MASK)
 }
 
 #[inline]
-pub const fn udata_kind(u: u64) -> u64 {
+const fn udata_kind(u: u64) -> u64 {
     u >> KIND_SHIFT
 }
 
 #[inline]
-pub const fn udata_id(u: u64) -> u64 {
+const fn udata_id(u: u64) -> u64 {
     u & ID_MASK
+}
+
+/// Take the next id from `cell`, wrapping back to `base` past `max`.
+fn bump_id(cell: &Cell<u64>, base: u64, max: u64) -> u64 {
+    let id = cell.get();
+    cell.set(if id >= max { base } else { id + 1 });
+    id
 }
 
 // ---------------------------------------------------------------------------
@@ -133,12 +134,11 @@ struct ReactorShared {
     /// fields in declaration order; dropping `ring` closes the io_uring fd,
     /// whose kernel-side teardown cancels all in-flight SQEs and drops the
     /// kernel's references to userspace buffers. Only then is it safe to free
-    /// the buffers those SQEs pointed at — `send_buffers_in_flight`, `conns`,
-    /// and the raw-recv maps (`raw_recv_buffers_in_flight`, `parked_raw_recv`).
-    /// Moving `ring` below any of them is a use-after-free at shutdown.
-    /// The raw-recv maps must additionally sit BELOW `tasks`: a
+    /// the buffers those SQEs pointed at — the `sends` / `raw_recvs` park
+    /// slots and `conns`. Moving `ring` below any of them is a use-after-free
+    /// at shutdown. `raw_recvs` must additionally sit BELOW `tasks`: a
     /// `RawRecvFuture::Drop` running during `tasks`'s own field-drop touches
-    /// them, so they must still be alive then.
+    /// it, so it must still be alive then.
     ring: RefCell<IoUringRing>,
     /// Live tasks keyed by a monotonically-increasing id. HashMap (not
     /// `slab::Slab`) because same-key reinsertion is load-bearing: a
@@ -153,21 +153,15 @@ struct ReactorShared {
     /// Dedup in `RunQueue::push` collapses N wakes for the same task
     /// into a single poll per tick.
     run_queue: RefCell<RunQueue>,
-    /// Reply wakers keyed by request_id; populated by `await_reply`.
-    reply_wakers: RefCell<FxHashMap<u64, Waker>>,
-    parked_replies: RefCell<FxHashMap<u64, DecodedWire>>,
-    /// Fsync wakers + parked results. An async fsync registers its waker
-    /// here; when the CQE arrives the result is parked and the waker
-    /// fires.
-    fsync_wakers: RefCell<FxHashMap<u64, Waker>>,
-    parked_fsync_results: RefCell<FxHashMap<u64, i32>>,
-    /// Fsync ids whose `FsyncFuture` was dropped before the CQE arrived.
-    /// The `KIND_FSYNC` handler parks its result unconditionally, so the
-    /// post-drop CQE would otherwise re-park an `i32` no future collects.
-    /// `Drop` records the id here; the handler consults it and drops the
-    /// late result instead. Empty on the steady-state path (cancellation
-    /// is rare), so the handler's `is_empty()` check skips the hash.
-    cancelled_fsyncs: RefCell<FxHashSet<u64>>,
+    /// Scratch buffer `tick` swaps the run queue into, so wakes issued during a
+    /// poll schedule for the next tick instead of re-entering this one. Kept
+    /// here (rather than rebuilt per tick) to reuse the one allocation.
+    tick_scratch: Cell<Vec<usize>>,
+    /// W2M replies keyed by request_id; opened by `await_reply`, delivered by
+    /// `route_reply`.
+    replies: ParkMap<DecodedWire>,
+    /// In-flight fdatasyncs; the CQE result is the fdatasync return code.
+    fsyncs: ParkMap<i32>,
     /// Pointer-stable storage for the reactor's persistent
     /// `FUTEX_WAITV` SQE. The kernel dereferences this array
     /// asynchronously, so it must outlive the SQE. A single SQE covers
@@ -176,29 +170,28 @@ struct ReactorShared {
     /// `request_shutdown` and awaiting the `-ECANCELED` CQE.
     futex_waitv_storage: RefCell<Option<Box<[FutexWaitV]>>>,
     /// True while an outstanding `FUTEX_WAITV` SQE exists whose
-    /// `FutexWaitV` array lives in `futex_waitv_storage`. Dropping the
-    /// storage without clearing this flag is a use-after-free hazard.
+    /// `FutexWaitV` array lives in `futex_waitv_storage`. Cleared when that
+    /// SQE's CQE is drained, which is also when the kernel releases its
+    /// reference to the array — so this false is what makes freeing the
+    /// storage safe.
     futex_waitv_armed: Cell<bool>,
-    /// Signal from `request_shutdown` → `dispatch_cqe` that the
-    /// cancellation CQE for the FUTEX_WAITV SQE has arrived and the
-    /// storage can be dropped.
-    futex_waitv_cancelled: Cell<bool>,
-    /// Per-timer wakers keyed by timer_id: the waker to fire when the
-    /// io_uring Timeout CQE arrives. A TimerFuture dropped before the CQE
-    /// removes its entry, so the late CQE finds nothing to wake.
-    timer_wakers: RefCell<FxHashMap<u64, Waker>>,
-    next_timer_id: Cell<u64>,
-    #[cfg(test)]
-    injected_cqes: RefCell<VecDeque<Cqe>>,
+    /// In-flight io_uring Timeout ops. A `TimerFuture` dropped before the CQE
+    /// abandons its slot, so the late CQE has nothing to wake.
+    timers: ParkMap<()>,
+    /// W2M request ids the workers echo back. Kept separate from `next_op_id`
+    /// because the protocol constrains their range (see `alloc_request_id`).
     next_request_id: Cell<u64>,
     next_scan_req_id: Cell<u32>,
-    next_send_id: Cell<u64>,
-    /// Per-fd connection state (recv decoder + send queue). Boxed so the
-    /// inline hdr buffer address survives HashMap resizes — io_uring SQEs
-    /// capture the pointer.
+    /// Ids for purely local kernel ops (timer / fsync / send / raw recv). They
+    /// share a counter because each family has its own park map and its own
+    /// `KIND_*` tag, so equal ids never collide.
+    next_op_id: Cell<u64>,
+    /// Per-fd connection state: recv decoder, delivery queue and send
+    /// accounting. Boxed so the inline hdr buffer address survives HashMap
+    /// resizes — io_uring SQEs capture the pointer.
     conns: RefCell<FxHashMap<i32, Box<io::Conn>>>,
     /// Global running total of `frame_weight` over every live inbound
-    /// `RecvBuf` — in-flight (`recv_state`), queued (`pending_recv`), and any
+    /// `RecvBuf` — in-flight (`recv_state`), queued for delivery, and any
     /// handed to a consumer that has not dropped it yet. The OOM guard:
     /// `HeaderDone` refuses (and closes the connection) any allocation that
     /// would push this past `global_cap`. `RecvBuf::new` charges it and
@@ -216,54 +209,16 @@ struct ReactorShared {
     /// loop can route AF_UNIX vs TLS connections without reactor state.
     accept_queue: RefCell<VecDeque<(i32, i32)>>,
     accept_waker: RefCell<Option<Waker>>,
-    /// Recv waiters per fd: set when a task has called `recv(fd)` and is
-    /// awaiting a complete message. Only one waiter per fd — per-connection
-    /// FIFO is a correctness requirement (I2).
-    recv_waiters: RefCell<FxHashMap<i32, Waker>>,
-    /// Completed recv messages awaiting pickup by a `recv().await` call.
-    /// A VecDeque per fd — multiple messages can queue if the handler
-    /// is slow. Load-bearing for TCP flow control: with a single slot,
-    /// pipelined clients deadlock once the kernel socket buffer fills
-    /// (we can only drain messages one-at-a-time from the handler,
-    /// while the kernel blocks the client's send).
-    pending_recv: RefCell<FxHashMap<i32, std::collections::VecDeque<io::RecvBuf>>>,
-    /// Closed-fd sentinel: set to true when a recv CQE arrived with
-    /// res<=0 or the connection was forcibly closed. A subsequent
-    /// `recv()` returns `None`.
-    recv_closed: RefCell<FxHashSet<i32>>,
-    /// Send wakers keyed by send_id. `(send_id → fd)` lives separately
-    /// so the CQE handler can decrement `Conn::send_inflight` even when
-    /// no waker has been installed yet.
-    send_wakers: RefCell<FxHashMap<u64, Waker>>,
-    send_fd_for_id: RefCell<FxHashMap<u64, i32>>,
-    /// Keep-alives stashed here outlive their owning `SendFuture` when it is
-    /// dropped before the CQE arrives. The CQE handler removes the entry.
-    send_buffers_in_flight: RefCell<FxHashMap<u64, SendAlive>>,
-    /// Send results parked before their waker was installed (same pattern
-    /// as parked_replies / parked_fsync_results).
-    parked_send_results: RefCell<FxHashMap<u64, i32>>,
-    /// Send ids whose `SendFuture` was dropped before the CQE arrived.
-    /// `KIND_SEND` parks its result unconditionally, so `Drop` tombstones
-    /// the id here (after handing off the buffer keep-alive) and the
-    /// handler drops the late result. Kept separate from `cancelled_fsyncs`
-    /// because send ids (`alloc_send_id`) and fsync ids (`alloc_request_id`)
-    /// come from different counters — a shared set would let a cancelled
-    /// send id wrongly tombstone a live fsync of the same numeric value.
-    cancelled_sends: RefCell<FxHashSet<u64>>,
-    /// Raw-recv (`Reactor::recv_raw`) park state, keyed by the shared
-    /// send-id counter. Declared below `ring` AND below `tasks` (see the
-    /// drop-order SAFETY INVARIANT on `ring`): a `RawRecvFuture::Drop`
-    /// firing during `tasks`'s field-drop must still find these alive.
-    raw_recv_wakers: RefCell<FxHashMap<u64, Waker>>,
-    /// Raw-recv results (byte count / errno) parked before the waker
-    /// re-polled, same pattern as `parked_send_results`.
-    parked_raw_recv: RefCell<FxHashMap<u64, i32>>,
-    /// Recv buffers whose `RawRecvFuture` was dropped before the CQE: the
-    /// kernel may still write into them, so `Drop` parks the `Vec` here and
-    /// the late `KIND_RAW_RECV` CQE frees it. An entry here is also the
-    /// orphan marker (the tombstone `cancelled_sends` needs separately):
-    /// buffer present ⇔ the future is gone ⇔ the result is discarded.
-    raw_recv_buffers_in_flight: RefCell<FxHashMap<u64, Vec<u8>>>,
+    /// In-flight client sends. The slot carries the buffer keep-alive and the
+    /// target fd, so the CQE handler settles a send whose awaiter has already
+    /// been dropped without any side table.
+    sends: ParkMap<i32, SendCarry>,
+    /// In-flight raw recvs (`Reactor::recv_raw`). The slot carries the caller's
+    /// buffer, so a late kernel write always lands in live memory. Declared
+    /// below `ring` AND below `tasks` (see the drop-order SAFETY INVARIANT on
+    /// `ring`): a `RawRecvFuture::Drop` firing during `tasks`'s field-drop must
+    /// still find it alive.
+    raw_recvs: ParkMap<i32, Vec<u8>>,
     /// Shutdown flag. `block_until_shutdown` polls until this is set.
     shutdown: Cell<bool>,
     /// FLAG_EXCHANGE accumulator: when route_reply sees an exchange wire,
@@ -272,22 +227,9 @@ struct ReactorShared {
     /// dispatches it to the relay task via `relay_tx`.
     exchange_acc: RefCell<ExchangeAccumulator>,
     relay_tx: RefCell<Option<mpsc::Sender<PendingRelay>>>,
-    /// Scan-slot wakers keyed by `internal_req_id` (u32). Populated by
-    /// `await_scan_slot` futures; drained by `route_scan_slot`.
-    scan_wakers: RefCell<FxHashMap<u32, Waker>>,
-    /// Scan slots parked between `route_scan_slot` and the awaiting
-    /// `ScanSlotFuture::poll`. A *queue* per `req_id`: a worker streams
-    /// continuation frames ahead while the master drains a different
-    /// worker serially, so a single-value slot would drop (and lose) all
-    /// but the last frame. Each queued `W2mSlot` still holds its ring slot
-    /// until dropped, so the worker blocks in `send_encoded` once the ring
-    /// fills — queue depth is bounded by ring capacity.
-    scan_parked: RefCell<FxHashMap<u32, VecDeque<W2mSlot>>>,
-    /// Scan request_ids with a live consumer (a held `ScanLease`). A frame
-    /// whose req_id is absent belongs to an abandoned scan and is dropped
-    /// (freeing ring space) by `route_scan_slot` rather than parked — so a
-    /// cancelled scan's still-streaming worker never wedges on a full ring.
-    active_scans: RefCell<FxHashSet<u32>>,
+    /// Scan routing state keyed by `internal_req_id`, one entry per live
+    /// `ScanLease`-held id (see [`ScanRoute`]).
+    scans: RefCell<FxHashMap<u32, ScanRoute>>,
     /// Fds that have been marked closing via `close_fd`. `reap_closing_conns`
     /// iterates only this set (O(closing)) rather than all connections (O(all)).
     closing_fds: RefCell<FxHashSet<i32>>,
@@ -301,12 +243,23 @@ struct ReactorShared {
     accept_rearm_pending: RefCell<FxHashSet<i32>>,
     /// A `W2mSlot` holds a raw `*mut InFlightState` into this `W2mReceiver` and
     /// calls `release()` through it on drop. Slots outlive their originating
-    /// stack frame in `scan_parked` (parked continuation frames) and
-    /// `send_buffers_in_flight` (a `SendAlive::Slot` keep-alive orphaned when its
-    /// `SendFuture` is dropped pre-CQE), so the receiver must outlive both. The
+    /// stack frame in `scans` (queued continuation frames) and in a `sends`
+    /// slot's keep-alive, so the receiver must outlive both. The
     /// `MasterDispatcher` holds the other `Rc` and outlives the reactor, which
     /// keeps the allocation alive here regardless of field order.
     w2m: OnceCell<Rc<W2mReceiver>>,
+}
+
+impl ReactorShared {
+    /// Next id for a local kernel op (timer / fsync / send / raw recv). Wraps
+    /// within `ID_MASK` so packing it into a CQE's `user_data` is lossless.
+    fn alloc_op_id(&self) -> u64 {
+        bump_id(&self.next_op_id, 1, ID_MASK)
+    }
+
+    fn num_workers(&self) -> usize {
+        self.w2m.get().expect("w2m not attached").num_workers()
+    }
 }
 
 /// Shared, clonable handle to the reactor. All futures created by the
@@ -327,46 +280,38 @@ pub struct Reactor {
 /// full probe io_uring cycle only runs on the first `Reactor::new`.
 /// This matters for the test suite, which creates many reactors.
 fn probe_futex_waitv_support() {
-    use std::sync::Once;
-    static PROBED: Once = Once::new();
-    PROBED.call_once(probe_futex_waitv_support_inner);
-}
-
-fn probe_futex_waitv_support_inner() {
-    use io_uring::{opcode, IoUring};
     use std::sync::atomic::AtomicU32;
+    use std::sync::Once;
 
-    let atomic = Box::new(AtomicU32::new(42));
-    let futexv: Box<[FutexWaitV; 1]> = Box::new([FutexWaitV::new()
-        .val(0)
-        .uaddr(&*atomic as *const AtomicU32 as u64)
-        .flags(FUTEX2_SIZE_U32)]);
+    static PROBED: Once = Once::new();
+    PROBED.call_once(|| {
+        let atomic = Box::new(AtomicU32::new(42));
+        let futexv: Box<[FutexWaitV; 1]> = Box::new([FutexWaitV::new()
+            .val(0)
+            .uaddr(&*atomic as *const AtomicU32 as u64)
+            .flags(FUTEX2_SIZE_U32)]);
 
-    let mut ring = match IoUring::new(8) {
-        Ok(r) => r,
-        Err(e) => crate::gnitz_fatal_abort!("reactor: probe io_uring init failed: {}", e,),
-    };
-    let entry = opcode::FutexWaitV::new(futexv.as_ptr(), 1).build().user_data(0xFEEDu64);
-    if unsafe { ring.submission().push(&entry) }.is_err() {
-        crate::gnitz_fatal_abort!("reactor: probe SQE push failed");
-    }
-    if let Err(e) = ring.submitter().submit_and_wait(1) {
-        crate::gnitz_fatal_abort!("reactor: probe submit_and_wait failed: {}", e);
-    }
-    let cqe = match ring.completion().next() {
-        Some(c) => c,
-        None => crate::gnitz_fatal_abort!("reactor: probe produced no CQE"),
-    };
-    let res = cqe.result();
-    if res == -libc::ENOSYS || res == -libc::EINVAL {
-        crate::gnitz_fatal_abort!(
-            "reactor: io_uring IORING_OP_FUTEX_WAITV not supported (res={}); \
-             Linux 6.7+ required for the W2M tail-chasing-ring transport.",
-            res,
-        );
-    }
-    drop(futexv);
-    drop(atomic);
+        let mut ring = match IoUringRing::new(8) {
+            Ok(r) => r,
+            Err(e) => crate::gnitz_fatal_abort!("reactor: probe io_uring init failed: {}", e,),
+        };
+        // SAFETY: `futexv` and `atomic` outlive the CQE drained below.
+        unsafe { ring.prep_futex_waitv(futexv.as_ptr(), 1, 0xFEED) };
+        if let Err(e) = ring.submit_and_wait_timeout(1, -1) {
+            crate::gnitz_fatal_abort!("reactor: probe submit_and_wait failed (errno={})", e);
+        }
+        let mut out = [Cqe::default(); 1];
+        if ring.drain_cqes(&mut out) != 1 {
+            crate::gnitz_fatal_abort!("reactor: probe produced no CQE");
+        }
+        if out[0].res == -libc::ENOSYS || out[0].res == -libc::EINVAL {
+            crate::gnitz_fatal_abort!(
+                "reactor: io_uring IORING_OP_FUTEX_WAITV not supported (res={}); \
+                 Linux 6.7+ required for the W2M tail-chasing-ring transport.",
+                out[0].res,
+            );
+        }
+    });
 }
 
 /// Resolve the global inbound-memory ceiling once at startup.
@@ -394,45 +339,28 @@ impl Reactor {
             tasks: RefCell::new(FxHashMap::default()),
             next_task_key: Cell::new(0),
             run_queue: RefCell::new(RunQueue::new()),
-            reply_wakers: RefCell::new(FxHashMap::with_capacity_and_hasher(32, Default::default())),
-            parked_replies: RefCell::new(FxHashMap::with_capacity_and_hasher(32, Default::default())),
-            fsync_wakers: RefCell::new(FxHashMap::default()),
-            parked_fsync_results: RefCell::new(FxHashMap::default()),
-            cancelled_fsyncs: RefCell::new(FxHashSet::default()),
+            tick_scratch: Cell::new(Vec::with_capacity(16)),
+            replies: ParkMap::default(),
+            fsyncs: ParkMap::default(),
             w2m: OnceCell::new(),
             futex_waitv_storage: RefCell::new(None),
             futex_waitv_armed: Cell::new(false),
-            futex_waitv_cancelled: Cell::new(false),
-            timer_wakers: RefCell::new(FxHashMap::default()),
-            next_timer_id: Cell::new(0),
-            #[cfg(test)]
-            injected_cqes: RefCell::new(VecDeque::new()),
+            timers: ParkMap::default(),
             next_request_id: Cell::new(1),
             next_scan_req_id: Cell::new(SCAN_REQ_ID_BASE),
-            next_send_id: Cell::new(1),
+            next_op_id: Cell::new(1),
             conns: RefCell::new(FxHashMap::default()),
             total_inbound_bytes: Rc::new(Cell::new(0)),
             global_cap: Cell::new(resolve_inbound_cap()),
             accept_queue: RefCell::new(VecDeque::new()),
             accept_waker: RefCell::new(None),
-            recv_waiters: RefCell::new(FxHashMap::default()),
-            pending_recv: RefCell::new(FxHashMap::default()),
-            recv_closed: RefCell::new(FxHashSet::default()),
-            send_wakers: RefCell::new(FxHashMap::default()),
-            send_fd_for_id: RefCell::new(FxHashMap::default()),
-            send_buffers_in_flight: RefCell::new(FxHashMap::default()),
-            parked_send_results: RefCell::new(FxHashMap::default()),
-            cancelled_sends: RefCell::new(FxHashSet::default()),
-            raw_recv_wakers: RefCell::new(FxHashMap::default()),
-            parked_raw_recv: RefCell::new(FxHashMap::default()),
-            raw_recv_buffers_in_flight: RefCell::new(FxHashMap::default()),
+            sends: ParkMap::default(),
+            raw_recvs: ParkMap::default(),
             shutdown: Cell::new(false),
             exchange_acc: RefCell::new(ExchangeAccumulator::new(0)),
             relay_tx: RefCell::new(None),
             closing_fds: RefCell::new(FxHashSet::default()),
-            scan_wakers: RefCell::new(FxHashMap::default()),
-            scan_parked: RefCell::new(FxHashMap::default()),
-            active_scans: RefCell::new(FxHashSet::default()),
+            scans: RefCell::new(FxHashMap::default()),
             accept_rearm_pending: RefCell::new(FxHashSet::default()),
         });
         // Publish the run-queue pointer for the waker vtable. ReactorShared
@@ -467,50 +395,35 @@ impl Reactor {
         }
     }
 
-    /// If a `FUTEX_WAITV` SQE is armed, submit an `AsyncCancel` against
-    /// it and drive the ring until the `futex_waitv_cancelled` flag
-    /// flips. Without this, dropping the reactor's `FutexWaitV` array
-    /// while the SQE still holds a pointer into it is a UAF in the
-    /// kernel.
+    /// If a `FUTEX_WAITV` SQE is armed, submit an `AsyncCancel` against it and
+    /// drive the ring until its CQE is drained — which is when the kernel
+    /// releases its reference to the `FutexWaitV` array, and so when freeing
+    /// that array becomes safe. The `AsyncCancel`'s own CQE points at nothing
+    /// and lands on the no-op `KIND_CANCEL_SINK`.
     ///
-    /// If the cancel CQE does not arrive within 2 s we abort instead of
-    /// freeing the storage: the kernel still holds a pointer into it
-    /// and freeing now would be a use-after-free. A 2 s wait for an
-    /// `AsyncCancel` + `FutexWaitV` pair is already pathological, so
-    /// aborting is strictly safer than the previous behavior of
-    /// silently dropping armed storage.
+    /// If the CQE does not arrive within 2 s we abort rather than free storage
+    /// the kernel still points at. A 2 s wait here is already pathological.
     fn cancel_futex_waitv_and_wait(&self) {
         if !self.inner.futex_waitv_armed.get() {
             return;
         }
-        let target = udata(KIND_FUTEX_WAITV, 0);
-        let cancel_udata = udata(KIND_FUTEX_CANCEL, 0);
         {
             let mut ring = self.inner.ring.borrow_mut();
-            ring.prep_async_cancel(target, cancel_udata);
+            ring.prep_async_cancel(udata(KIND_FUTEX_WAITV, 0), udata(KIND_CANCEL_SINK, 0));
             let _ = ring.submit_and_wait_timeout(0, 0);
         }
-        // Pump the ring until both the cancelled FUTEX_WAITV CQE (which
-        // clears `futex_waitv_armed`) and the cancel-CQE (which sets
-        // `futex_waitv_cancelled`) have been drained.
         let deadline = Instant::now() + std::time::Duration::from_millis(2000);
-        while (self.inner.futex_waitv_armed.get() || !self.inner.futex_waitv_cancelled.get())
-            && Instant::now() < deadline
-        {
+        while self.inner.futex_waitv_armed.get() && Instant::now() < deadline {
             self.drain_cqes_into_wakers();
-            // Re-check before blocking: drain may have received both CQEs in
-            // one pass, making the 100 ms wait unnecessary.
-            if !self.inner.futex_waitv_armed.get() && self.inner.futex_waitv_cancelled.get() {
+            if !self.inner.futex_waitv_armed.get() {
                 break;
             }
             let _ = self.inner.ring.borrow_mut().submit_and_wait_timeout(1, 100);
         }
-        if self.inner.futex_waitv_armed.get() || !self.inner.futex_waitv_cancelled.get() {
+        if self.inner.futex_waitv_armed.get() {
             crate::gnitz_fatal_abort!(
-                "reactor: FUTEX_WAITV cancel did not complete within 2s \
-                 (armed={}, cancelled={}) — freeing storage now would be a UAF",
-                self.inner.futex_waitv_armed.get(),
-                self.inner.futex_waitv_cancelled.get(),
+                "reactor: FUTEX_WAITV cancel did not complete within 2s — \
+                 freeing storage now would be a UAF"
             );
         }
         // Safe to drop now: no in-flight SQE references the storage.
@@ -521,13 +434,7 @@ impl Reactor {
     /// so `drain_w2m_for_worker` can distinguish these from scan IDs by
     /// a single bitwise AND without a HashMap lookup.
     pub fn alloc_request_id(&self) -> u64 {
-        let id = self.inner.next_request_id.get();
-        let next = match id.checked_add(1) {
-            Some(n) if n <= MAX_REGULAR_REQ_ID => n,
-            _ => 1,
-        };
-        self.inner.next_request_id.set(next);
-        id
+        bump_id(&self.inner.next_request_id, 1, MAX_REGULAR_REQ_ID)
     }
 
     /// Allocate a scan request_id (bit 31 set). The hot-path check in
@@ -552,7 +459,12 @@ impl Reactor {
     /// Future that resolves to the decoded W2M reply for `req_id`.
     /// Returns the concrete `ReplyFuture` so callers can declare a
     /// `Vec<ReplyFuture>` scratch buffer that lives across reactor calls.
+    ///
+    /// The reply becomes routable here, not at `alloc_request_id`: a reply that
+    /// arrives before this call has nowhere to land and is dropped with a
+    /// warning, so callers must build their futures before awaiting anything.
     pub fn await_reply(&self, req_id: u64) -> ReplyFuture {
+        self.inner.replies.open(req_id, None);
         ReplyFuture {
             req_id,
             inner: Rc::clone(&self.inner),
@@ -571,7 +483,7 @@ impl Reactor {
     }
 
     /// Create a `ScanLease` that registers `ids` as active scans for its
-    /// lifetime. Membership in `active_scans` must span the whole scan
+    /// lifetime. The scan's routing state must span the whole scan
     /// operation regardless of which `.await` a cancellation lands on, so the
     /// lease must be bound to a named local held to end of scope. On drop the
     /// lease deregisters its ids and purges any waker / queued frames they
@@ -596,7 +508,14 @@ impl Reactor {
             panic!("attach_w2m called twice");
         }
         *self.inner.futex_waitv_storage.borrow_mut() = Some(boxed);
-        self.drain_refresh_and_arm(nw);
+        self.drain_refresh_and_arm();
+    }
+
+    /// Drain every worker's ring.
+    fn drain_all_w2m(&self) {
+        for w in 0..self.inner.num_workers() {
+            self.drain_w2m_for_worker(w);
+        }
     }
 
     /// The lost-wake protocol in one place: drain every ring, refresh the
@@ -606,61 +525,34 @@ impl Reactor {
     /// would block on a wake that already happened — the classic lost-wake
     /// race. Used by `attach_w2m` (catches messages published between init
     /// and attach) and by the KIND_FUTEX_WAITV CQE handler on every wake.
-    fn drain_refresh_and_arm(&self, nw: usize) {
+    fn drain_refresh_and_arm(&self) {
         loop {
-            for w in 0..nw {
-                self.drain_w2m_for_worker(w);
-            }
+            self.drain_all_w2m();
             if !self.refresh_futex_waitv_vals() {
                 break;
             }
         }
-        self.arm_futex_waitv();
-    }
-
-    /// (Re-)submit a `FUTEX_WAITV` SQE referencing the heap-owned
-    /// `FutexWaitV` array in `futex_waitv_storage`. Called by
-    /// `attach_w2m` on startup and by the `KIND_FUTEX_WAITV` dispatch
-    /// handler on every CQE.
-    fn arm_futex_waitv(&self) {
+        // (Re-)submit the SQE against the heap-owned `FutexWaitV` array.
         let storage = self.inner.futex_waitv_storage.borrow();
         let Some(boxed) = storage.as_ref() else {
             return;
         };
-        let nr = boxed.len() as u32;
-        let ptr = boxed.as_ptr();
-        let udata_val = udata(KIND_FUTEX_WAITV, 0);
         {
             let mut ring = self.inner.ring.borrow_mut();
             unsafe {
-                ring.prep_futex_waitv(ptr, nr, udata_val);
+                ring.prep_futex_waitv(boxed.as_ptr(), boxed.len() as u32, udata(KIND_FUTEX_WAITV, 0));
             }
             ring.flush_sqes("FUTEX_WAITV");
         }
         self.inner.futex_waitv_armed.set(true);
     }
 
-    /// Publish `MASTER_PARKED` on every ring, then snapshot each
-    /// `reader_seq` for the `FutexWaitV` entry. Returns `true` if any
-    /// ring has unread data (`read_cursor != write_cursor`), meaning
-    /// the caller must drain before arming — otherwise the expected
-    /// values would already match current reader_seq and the SQE
-    /// would block waiting for a wake that already happened (classic
-    /// lost-wake race).
+    /// Arm the master-park protocol on every ring and snapshot each
+    /// `reader_seq` into its `FutexWaitV` entry. Returns `true` if any ring has
+    /// unread data, meaning the caller must drain before arming — otherwise the
+    /// SQE would block waiting for a wake that already happened.
     ///
-    /// Store order is load-bearing: setting `FLAG_MASTER_PARKED`
-    /// BEFORE loading `reader_seq` ensures that any worker that
-    /// advances `reader_seq` AFTER our fetch_or is guaranteed to
-    /// observe the flag and issue `FUTEX_WAKE`. Workers that advanced
-    /// BEFORE our fetch_or are caught by the post-snapshot
-    /// `write_cursor != read_cursor` check.
-    ///
-    /// This is the same protocol as the sync `W2mRingHeader::arm_master_park`
-    /// (used by `wait_for`/`wait_any`), inlined here rather than shared: this
-    /// async variant must interleave the `#[cfg(test)]` order-witness hooks
-    /// between the sub-steps, skips the no-op RMW once the flag is set (the
-    /// reactor never clears it after attach), and writes an io_uring
-    /// `FutexWaitV` instead of returning a snapshot.
+    /// `W2mRingHeader::arm_master_park` owns the store ordering this depends on.
     fn refresh_futex_waitv_vals(&self) -> bool {
         let mut storage = self.inner.futex_waitv_storage.borrow_mut();
         let Some(boxed) = storage.as_mut() else {
@@ -672,89 +564,31 @@ impl Reactor {
         let mut pending = false;
         for (w, entry) in boxed.iter_mut().enumerate() {
             let hdr = unsafe { w2m.header(w) };
-            // Publish park intent FIRST (AcqRel — the flag must be
-            // globally visible before we read reader_seq). Once the
-            // reactor has attached, no path clears `FLAG_MASTER_PARKED`
-            // (`W2mReceiver::wait_for` does, but it is bootstrap-only
-            // and runs before `attach_w2m`), so after the first
-            // iteration the bit is already set: load first and skip the
-            // RMW when it's a no-op.
-            let flags_now = hdr.waiter_flags().load(std::sync::atomic::Ordering::Acquire);
-            if flags_now & FLAG_MASTER_PARKED == 0 {
-                hdr.waiter_flags()
-                    .fetch_or(FLAG_MASTER_PARKED, std::sync::atomic::Ordering::AcqRel);
-            }
-            // Order witness (test-only): records that the flag publish
-            // precedes the reader_seq snapshot. Swapping these two
-            // operations flips the recorded order — see the
-            // `refresh_publishes_flag_before_snapshotting_reader_seq` pin.
-            #[cfg(test)]
-            test_refresh_hooks::record_flag_published();
-            // Now snapshot expected reader_seq. Any worker store that
-            // happens-before this load MUST have been preceded by a
-            // write_cursor Release store, so the post-loop
-            // `write_cursor != read_cursor` check below catches it.
-            #[cfg(test)]
-            test_refresh_hooks::record_reader_seq_snapshot();
-            let expected = hdr.reader_seq().load(std::sync::atomic::Ordering::Acquire);
-            let uaddr = hdr.reader_seq() as *const std::sync::atomic::AtomicU32 as u64;
+            let (expected, has_unread) = hdr.arm_master_park();
             *entry = FutexWaitV::new()
                 .val(expected as u64)
-                .uaddr(uaddr)
+                .uaddr(hdr.reader_seq() as *const std::sync::atomic::AtomicU32 as u64)
                 .flags(FUTEX2_SIZE_U32);
-            // Test-only barrier: block until the helper thread has
-            // published (so its write_cursor Release is globally visible
-            // before the unread-data check below), making the `wc != rc`
-            // outcome deterministic instead of racy.
-            #[cfg(test)]
-            test_refresh_hooks::await_helper_publish();
-            // Unread-data check: if write_cursor has advanced past
-            // read_cursor, a publish is pending that we haven't
-            // drained. Signal the caller to drain before arming.
-            // `write_cursor` is peer-written (the worker publishes it) and stays
-            // `Acquire`; `read_cursor` is master-owned, so reading back our own
-            // last advance is `Relaxed`.
-            let wc = hdr.write_cursor().load(std::sync::atomic::Ordering::Acquire);
-            let rc = hdr.read_cursor().load(std::sync::atomic::Ordering::Relaxed);
-            if wc != rc {
-                pending = true;
-            }
+            pending |= has_unread;
         }
         pending
     }
 
-    /// Submit an fdatasync on `fd`. The SQE is immediately flushed to the
-    /// kernel so the fsync can overlap with subsequent CPU work — this is
-    /// load-bearing for the `pre_write_pushes` Phase-A / tick-evaluation
-    /// overlap.
-    fn submit_fsync(&self, fd: i32) -> u64 {
-        let id = self.alloc_request_id();
+    /// Submit an fdatasync and await its completion. Returns the CQE `res`
+    /// (0 on success, negative errno on failure). The SQE is flushed to the
+    /// kernel immediately so the fsync can overlap with subsequent CPU work —
+    /// the `pre_write_pushes` Phase-A / tick-evaluation overlap depends on it.
+    pub fn fsync(&self, fd: i32) -> FsyncFuture {
+        let id = self.inner.alloc_op_id();
         {
             let mut ring = self.inner.ring.borrow_mut();
             ring.prep_fsync(fd, udata(KIND_FSYNC, id));
             ring.flush_sqes("fsync");
         }
-        id
-    }
-
-    /// Submit an fdatasync and await its completion. Returns the CQE `res`
-    /// (0 on success, negative errno on failure).
-    pub fn fsync(&self, fd: i32) -> FsyncFuture {
-        let id = self.submit_fsync(fd);
+        self.inner.fsyncs.open(id, None);
         FsyncFuture {
             id,
-            completed: false,
             inner: Rc::clone(&self.inner),
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn block_on_fsync(&self, id: u64) -> i32 {
-        loop {
-            if let Some(rc) = self.inner.parked_fsync_results.borrow_mut().remove(&id) {
-                return rc;
-            }
-            self.tick(true);
         }
     }
 
@@ -768,7 +602,7 @@ impl Reactor {
 
     /// Drive the reactor until the task slab is empty. Blocks.
     #[cfg(test)]
-    pub(super) fn block_until_idle(&self) {
+    fn block_until_idle(&self) {
         while !self.inner.tasks.borrow().is_empty() {
             self.tick(true);
         }
@@ -776,14 +610,8 @@ impl Reactor {
 
     /// True while at least one task is alive in the slab.
     #[cfg(test)]
-    pub(super) fn has_pending_tasks(&self) -> bool {
+    fn has_pending_tasks(&self) -> bool {
         !self.inner.tasks.borrow().is_empty()
-    }
-
-    /// Drive ready tasks and process CQEs without blocking.
-    #[cfg(test)]
-    pub(super) fn poll_nonblocking(&self) {
-        self.tick(false);
     }
 
     fn dispatch_cqe(&self, cqe: Cqe) {
@@ -792,12 +620,10 @@ impl Reactor {
         match kind {
             KIND_TIMEOUT => {
                 // The kernel is done with the Timeout's Timespec once its CQE
-                // has been drained — recycle it. A cancelled timer's Drop
-                // already removed its waker entry, so the CQE is a no-op wake.
+                // has been drained — recycle it. A cancelled timer's slot is
+                // already abandoned, so the CQE is a no-op wake.
                 self.inner.ring.borrow_mut().release_timer_spec(cqe.user_data);
-                if let Some(w) = self.inner.timer_wakers.borrow_mut().remove(&id) {
-                    w.wake();
-                }
+                self.inner.timers.complete(id, ());
             }
             KIND_FUTEX_WAITV => {
                 // Wake index is not authoritative for FUTEX_WAITV: the
@@ -806,133 +632,31 @@ impl Reactor {
                 // before re-arming.
                 self.inner.futex_waitv_armed.set(false);
                 if !self.inner.shutdown.get() {
-                    let nw = self
-                        .inner
-                        .w2m
-                        .get()
-                        .expect("KIND_FUTEX_WAITV fired but w2m not attached")
-                        .num_workers();
-                    self.drain_refresh_and_arm(nw);
+                    self.drain_refresh_and_arm();
                 }
-            }
-            KIND_FUTEX_CANCEL => {
-                // The AsyncCancel CQE itself arrives here. The
-                // cancellation of the FUTEX_WAITV SQE delivers a
-                // separate CQE under KIND_FUTEX_WAITV with
-                // `res = -ECANCELED`, which we detect via the
-                // `futex_waitv_armed` flag flipping false above.
-                // Record completion so shutdown can drop storage.
-                self.inner.futex_waitv_cancelled.set(true);
             }
             KIND_FSYNC => {
-                // Gate only the result-park on the tombstone. The set is empty
-                // on the steady-state path (cancellation is rare), so the
-                // `is_empty` check short-circuits before `remove` (and its hash)
-                // on every normal completion.
-                let cancelled = {
-                    let mut c = self.inner.cancelled_fsyncs.borrow_mut();
-                    !c.is_empty() && c.remove(&id)
-                };
-                if cancelled {
-                    // Awaiter dropped before the CQE; nothing to deliver.
-                } else {
-                    self.inner.parked_fsync_results.borrow_mut().insert(id, cqe.res);
-                    if let Some(w) = self.inner.fsync_wakers.borrow_mut().remove(&id) {
-                        w.wake();
-                    }
-                }
+                self.inner.fsyncs.complete(id, cqe.res);
             }
-            KIND_ACCEPT => {
-                // The listener fd rides the SQE's udata id — the accepted-fd
-                // path routes on it and the re-arm targets it specifically.
-                let listener = id as i32;
-                if cqe.res >= 0 {
-                    self.inner.accept_queue.borrow_mut().push_back((cqe.res, listener));
-                    if let Some(w) = self.inner.accept_waker.borrow_mut().take() {
-                        w.wake();
-                    }
-                }
-                if cqe.flags & CQE_F_MORE == 0 && listener >= 0 {
-                    // Multishot cancelled — re-arm, but back off ~50ms on fd
-                    // exhaustion so reap_closing_conns can free FDs first.
-                    // fd exhaustion is global: both listeners' accepts can
-                    // cancel in the same window, so the pending set records
-                    // every cancelled listener and the single backoff timer
-                    // re-arms them all.
-                    if cqe.res == -libc::EMFILE || cqe.res == -libc::ENFILE {
-                        // One backoff task runs while the pending set is
-                        // non-empty: spawn only on the 0→1 transition.
-                        let first = {
-                            let mut pending = self.inner.accept_rearm_pending.borrow_mut();
-                            pending.insert(listener) && pending.len() == 1
-                        };
-                        if first {
-                            let inner = Rc::clone(&self.inner);
-                            self.spawn(async move {
-                                let deadline = Instant::now() + std::time::Duration::from_millis(50);
-                                TimerFuture::new(deadline, Rc::clone(&inner)).await;
-                                let pending: Vec<i32> = inner.accept_rearm_pending.borrow_mut().drain().collect();
-                                let mut ring = inner.ring.borrow_mut();
-                                for lfd in pending {
-                                    ring.prep_accept(lfd, udata(KIND_ACCEPT, lfd as u32 as u64));
-                                }
-                            });
-                        }
-                    } else {
-                        self.inner
-                            .ring
-                            .borrow_mut()
-                            .prep_accept(listener, udata(KIND_ACCEPT, listener as u32 as u64));
-                    }
-                }
-            }
-            KIND_RECV => {
-                let fd = id as i32;
-                self.handle_recv_cqe(fd, cqe.res);
-            }
+            KIND_ACCEPT => self.handle_accept_cqe(id as i32, cqe.res, cqe.flags),
+            KIND_RECV => self.handle_recv_cqe(id as i32, cqe.res),
             KIND_SEND => {
-                // Buffer / inflight / fd cleanup is unconditional — the kernel
-                // is done with the pointer regardless of whether the awaiter is
-                // still alive.
-                let fd = self.inner.send_fd_for_id.borrow_mut().remove(&id);
-                if let Some(fd) = fd {
+                // The kernel is done with the buffer regardless of whether the
+                // awaiter is still alive, so the fd's in-flight count drops
+                // either way; `complete` then frees or parks the slot.
+                self.inner.sends.with_carry(id, |&(fd, _)| {
                     if let Some(conn) = self.inner.conns.borrow_mut().get_mut(&fd) {
                         conn.send_inflight = conn.send_inflight.saturating_sub(1);
                     }
-                }
-                self.inner.send_buffers_in_flight.borrow_mut().remove(&id);
-                // Only the result-park is gated. KIND_SEND fires per client
-                // reply / push chunk — the hottest CQE path — so the `is_empty`
-                // check skips the hash on every uncancelled send.
-                let cancelled = {
-                    let mut c = self.inner.cancelled_sends.borrow_mut();
-                    !c.is_empty() && c.remove(&id)
-                };
-                if cancelled {
-                    // Awaiter dropped before the CQE; buffer freed above, drop the result.
-                } else {
-                    self.inner.parked_send_results.borrow_mut().insert(id, cqe.res);
-                    if let Some(w) = self.inner.send_wakers.borrow_mut().remove(&id) {
-                        w.wake();
-                    }
-                }
+                });
+                self.inner.sends.complete(id, cqe.res);
             }
             KIND_RAW_RECV => {
-                // An orphaned buffer is present exactly when the future was
-                // dropped pre-CQE: the kernel is done with the pointer now,
-                // so freeing it is safe — and its presence doubles as the
-                // "discard the result" marker.
-                if self.inner.raw_recv_buffers_in_flight.borrow_mut().remove(&id).is_none() {
-                    self.inner.parked_raw_recv.borrow_mut().insert(id, cqe.res);
-                    if let Some(w) = self.inner.raw_recv_wakers.borrow_mut().remove(&id) {
-                        w.wake();
-                    }
-                }
+                self.inner.raw_recvs.complete(id, cqe.res);
             }
             KIND_CANCEL_SINK => {
-                // The AsyncCancel's own CQE. The cancellation's *effect*
-                // arrives separately as the target op's -ECANCELED under its
-                // own kind (same split as the FUTEX_WAITV cancel pair).
+                // An AsyncCancel's own CQE. The cancellation's *effect* arrives
+                // separately as the target op's -ECANCELED under its own kind.
             }
             _ => {}
         }
@@ -960,31 +684,25 @@ impl Reactor {
                 continue;
             }
             let ctrl = wire::peek_control_block(slot.bytes()).expect("W2M control block corrupt — ring corrupt");
+            let prefix = slot.internal_req_id;
             let decoded = self.decode_slot_owned(slot, ctrl);
-            self.route_reply(w, decoded);
+            self.route_reply(w, prefix, decoded);
         }
     }
 
     fn route_scan_slot(&self, slot: W2mSlot) {
-        let req_id = slot.internal_req_id;
-        if !self.inner.active_scans.borrow().contains(&req_id) {
-            // Abandoned scan (no live ScanLease): dropping `slot` advances
-            // consume_cursor so the still-streaming worker never wedges on a
-            // full ring.
-            return; // slot dropped here
-        }
-        // Queue, never overwrite: a worker streams continuation frames ahead
-        // while the master drains a different worker serially; a single-value
-        // slot would drop (and lose) all but the last.
-        let mut parked = self.inner.scan_parked.borrow_mut();
-        let q = parked.entry(req_id).or_default();
-        // One req_id maps to exactly one worker (`dispatch_scan_fanout` allocates
-        // a distinct id per worker), so every queued frame is one of that
-        // worker's parked, un-dropped W2M slots. Depth is bounded by how many
-        // frames fit in one ring by bytes — `InFlightState`'s queue grows to
-        // match, so there is no fixed ceiling to assert against.
-        q.push_back(slot);
-        if let Some(waker) = self.inner.scan_wakers.borrow_mut().remove(&req_id) {
+        let waker = {
+            let mut scans = self.inner.scans.borrow_mut();
+            let Some(route) = scans.get_mut(&slot.internal_req_id) else {
+                // Abandoned scan (no live ScanLease): dropping `slot` advances
+                // consume_cursor so the still-streaming worker never wedges on
+                // a full ring.
+                return; // slot dropped here
+            };
+            route.queue.push_back(slot);
+            route.waker.take()
+        };
+        if let Some(waker) = waker {
             waker.wake();
         }
     }
@@ -1024,8 +742,15 @@ impl Reactor {
     /// exchange round completes, the resulting `PendingRelay` is
     /// dispatched on `relay_tx`. See async-invariants.md §III.3b.
     ///
+    /// Routes on `prefix` — the ring slot's `internal_req_id` — which is the
+    /// key `send_msg` documents as the reply's identity. The payload's
+    /// `request_id` agrees with it for every reply that reaches here, but a
+    /// producer is only obliged to set the prefix: the chunked-train frames
+    /// leave the payload field 0, and they stay correct here if a future reply
+    /// helper is built from one of them.
+    ///
     /// Unrouted replies are logged and dropped.
-    fn route_reply(&self, w: usize, decoded: DecodedWire) {
+    fn route_reply(&self, w: usize, prefix: u32, decoded: DecodedWire) {
         if decoded.control.flags & FLAG_EXCHANGE != 0 {
             let pending = self.inner.exchange_acc.borrow_mut().process(w, decoded);
             if let Some(relay) = pending {
@@ -1041,52 +766,41 @@ impl Reactor {
             return;
         }
 
-        let req_id = decoded.control.request_id;
-        let waker = self.inner.reply_wakers.borrow_mut().remove(&req_id);
-        match waker {
-            Some(waker) => {
-                self.inner.parked_replies.borrow_mut().insert(req_id, decoded);
-                waker.wake();
-            }
-            None => {
-                crate::gnitz_warn!("reactor: unrouted W2M reply worker={} req_id={}", w, req_id,);
-            }
+        debug_assert_eq!(
+            prefix as u64, decoded.control.request_id,
+            "W2M reply prefix disagrees with its payload request_id"
+        );
+        let req_id = prefix as u64;
+        if !self.inner.replies.complete(req_id, decoded) {
+            crate::gnitz_warn!("reactor: unrouted W2M reply worker={} req_id={}", w, req_id,);
         }
     }
 
-    /// Test-only: inject a synthetic CQE tagged with `kind` and `id`,
-    /// with `rc` as the CQE `res`. Dispatched on the next `tick` (or via
-    /// `drain_injected_cqes`).
+    /// Test-only: dispatch a synthetic CQE tagged with `kind` and `id`, with
+    /// `rc` as the CQE `res`.
     #[cfg(test)]
-    pub(super) fn inject_cqe(&self, kind: u64, id: u64, rc: i32) {
-        self.inner.injected_cqes.borrow_mut().push_back(Cqe {
+    fn inject_cqe(&self, kind: u64, id: u64, rc: i32) {
+        self.dispatch_cqe(Cqe {
             user_data: udata(kind, id),
             res: rc,
             flags: 0,
         });
     }
 
-    /// Test-only: park a synthetic `DecodedWire` for `req_id` and wake
-    /// any matching awaiter.
-    #[cfg(test)]
-    pub(super) fn inject_parked_reply(&self, req_id: u64, decoded: DecodedWire) {
-        self.inner.parked_replies.borrow_mut().insert(req_id, decoded);
-        if let Some(waker) = self.inner.reply_wakers.borrow_mut().remove(&req_id) {
-            waker.wake();
-        }
-    }
-
     /// Test-only: size the exchange accumulator so `route_reply` can
     /// be driven directly.
     #[cfg(test)]
-    pub(super) fn test_init_state(&self, num_workers: usize) {
+    fn test_init_state(&self, num_workers: usize) {
         *self.inner.exchange_acc.borrow_mut() = ExchangeAccumulator::new(num_workers);
     }
 
-    /// Test-only: drive `route_reply` with a synthetic decoded wire.
+    /// Test-only: drive `route_reply` with a synthetic decoded wire, standing in
+    /// for the ring prefix the way every real producer sets it — equal to the
+    /// payload's `request_id`.
     #[cfg(test)]
-    pub(super) fn test_route_reply(&self, w: usize, decoded: DecodedWire) {
-        self.route_reply(w, decoded)
+    fn test_route_reply(&self, w: usize, decoded: DecodedWire) {
+        let prefix = decoded.control.request_id as u32;
+        self.route_reply(w, prefix, decoded)
     }
 
     /// Test-only: drive `route_scan_slot` with a real slot.
@@ -1096,7 +810,7 @@ impl Reactor {
     }
 
     #[cfg(test)]
-    pub(super) fn task_count(&self) -> usize {
+    fn task_count(&self) -> usize {
         self.inner.tasks.borrow().len()
     }
 
@@ -1158,11 +872,6 @@ thread_local! {
     /// at any time (so this pointer is never overwritten while live).
     static REACTOR_RUN_QUEUE: Cell<*const RefCell<RunQueue>> =
         const { Cell::new(ptr::null()) };
-
-    /// Reused scratch buffer for `tick`'s run-queue drain. Allocated once
-    /// (capacity 16, covers normal-concurrency cases) and swapped in/out
-    /// every tick to avoid per-tick `Vec::from_iter`.
-    static TICK_SCRATCH: Cell<Vec<usize>> = Cell::new(Vec::with_capacity(16));
 }
 
 impl Drop for Reactor {
@@ -1209,108 +918,9 @@ unsafe fn waker_drop(_data: *const ()) {}
 
 const WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, waker_wake, waker_wake_by_ref, waker_drop);
 
-pub(super) fn make_waker(key: usize) -> Waker {
+fn make_waker(key: usize) -> Waker {
     let raw = RawWaker::new(key as *const (), &WAKER_VTABLE);
     unsafe { Waker::from_raw(raw) }
-}
-
-/// Test-only instrumentation for `refresh_futex_waitv_vals`. The pin
-/// `refresh_publishes_flag_before_snapshotting_reader_seq` arms a probe
-/// on the reactor thread, then `refresh_futex_waitv_vals` stamps a
-/// monotonically increasing sequence at the flag-publish site and again
-/// at the reader_seq-snapshot site. The pin asserts the flag stamp is
-/// strictly smaller (published first); reordering the two operations
-/// flips the stamps. The probe also exposes a publish-barrier so the pin
-/// can deterministically force a worker publish to be visible before the
-/// unread-data check.
-#[cfg(test)]
-pub(crate) mod test_refresh_hooks {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-    use std::sync::Arc;
-
-    /// Shared state between the reactor thread (which runs the refresh)
-    /// and the test's helper thread (which publishes into the ring).
-    pub(crate) struct RefreshProbe {
-        /// Monotonic stamp source; each `record_*` claims the next value.
-        seq: AtomicU32,
-        /// Stamp captured at the `fetch_or(FLAG_MASTER_PARKED)` site.
-        pub(crate) flag_seq: AtomicU32,
-        /// Stamp captured at the `reader_seq` snapshot site.
-        pub(crate) snap_seq: AtomicU32,
-        /// Set by the helper thread after it has published into the ring.
-        /// The refresh barrier spins on this so the publish's
-        /// `write_cursor` Release is visible before the unread-data check.
-        pub(crate) helper_published: Arc<AtomicBool>,
-        /// When true, `await_helper_publish` spins until `helper_published`.
-        wait_for_publish: bool,
-    }
-
-    impl RefreshProbe {
-        pub(crate) fn new(helper_published: Arc<AtomicBool>, wait_for_publish: bool) -> Self {
-            RefreshProbe {
-                seq: AtomicU32::new(1),
-                flag_seq: AtomicU32::new(0),
-                snap_seq: AtomicU32::new(0),
-                helper_published,
-                wait_for_publish,
-            }
-        }
-        fn stamp(&self) -> u32 {
-            self.seq.fetch_add(1, Ordering::SeqCst)
-        }
-    }
-
-    thread_local! {
-        static PROBE: RefCell<Option<Rc<RefreshProbe>>> = const { RefCell::new(None) };
-    }
-
-    /// Arm the probe on the current (reactor) thread. Returns the handle
-    /// so the test can read the stamps after the refresh runs.
-    pub(crate) fn arm(probe: Rc<RefreshProbe>) {
-        PROBE.with(|p| *p.borrow_mut() = Some(probe));
-    }
-
-    /// Disarm; subsequent refreshes are uninstrumented.
-    pub(crate) fn disarm() {
-        PROBE.with(|p| *p.borrow_mut() = None);
-    }
-
-    /// Stamp the flag-publish site (`fetch_or(FLAG_MASTER_PARKED)`).
-    pub(crate) fn record_flag_published() {
-        PROBE.with(|p| {
-            if let Some(probe) = p.borrow().as_ref() {
-                let s = probe.stamp();
-                probe.flag_seq.store(s, Ordering::SeqCst);
-            }
-        });
-    }
-
-    /// Stamp the reader_seq-snapshot site.
-    pub(crate) fn record_reader_seq_snapshot() {
-        PROBE.with(|p| {
-            if let Some(probe) = p.borrow().as_ref() {
-                let s = probe.stamp();
-                probe.snap_seq.store(s, Ordering::SeqCst);
-            }
-        });
-    }
-
-    /// Block until the helper thread reports it has published (only when
-    /// the probe was armed with `wait_for_publish`).
-    pub(crate) fn await_helper_publish() {
-        let flag = PROBE.with(|p| {
-            p.borrow()
-                .as_ref()
-                .and_then(|probe| probe.wait_for_publish.then(|| Arc::clone(&probe.helper_published)))
-        });
-        if let Some(flag) = flag {
-            while !flag.load(Ordering::Acquire) {
-                std::hint::spin_loop();
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1319,7 +929,9 @@ pub(crate) mod test_refresh_hooks {
 
 #[cfg(test)]
 mod tests {
+    use super::futures::{SendAlive, SendFuture};
     use super::*;
+    use crate::runtime::w2m_ring::park_order;
     use crate::schema::SchemaDescriptor;
     use std::cell::Cell as StdCell;
     use std::time::Duration;
@@ -1354,10 +966,12 @@ mod tests {
         let r = make_reactor();
         let counter: Rc<StdCell<u32>> = Rc::new(StdCell::new(0));
         let c2 = Rc::clone(&counter);
-        r.block_on(async move {
+        r.spawn(async move {
             c2.set(c2.get() + 1);
         });
+        r.block_until_idle();
         assert_eq!(counter.get(), 1);
+        assert_eq!(r.task_count(), 0, "a finished task must leave the slab");
     }
 
     /// Timer fires after a short deadline.
@@ -1418,7 +1032,7 @@ mod tests {
         let got: Rc<StdCell<u64>> = Rc::new(StdCell::new(0));
         let got2 = Rc::clone(&got);
         let reply_fut = r.await_reply(7);
-        r.inject_parked_reply(7, synthetic_decoded_wire(7));
+        r.test_route_reply(0, synthetic_decoded_wire(7));
         r.block_on(async move {
             got2.set(reply_fut.await.control.request_id);
         });
@@ -1430,7 +1044,9 @@ mod tests {
     #[test]
     fn reply_waker_no_spurious() {
         let r = make_reactor();
-        r.inject_parked_reply(8, synthetic_decoded_wire(8));
+        // A reply nobody awaits is dropped; the point is that it must not
+        // resolve the req_id=7 awaiter below.
+        r.test_route_reply(0, synthetic_decoded_wire(8));
         let resolved: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
         let r2 = Rc::clone(&resolved);
         let timer_inner = Rc::clone(&r.inner);
@@ -1442,8 +1058,8 @@ mod tests {
         assert!(!resolved.get(), "reply for req_id=8 must not wake req_id=7 awaiter");
     }
 
-    /// `alloc_request_id` returns strictly increasing values, skipping
-    /// the reserved sentinels (0 and u64::MAX).
+    /// `alloc_request_id` returns strictly increasing values in
+    /// `[1, MAX_REGULAR_REQ_ID]`, so bit 31 (the scan marker) stays clear.
     #[test]
     fn alloc_request_id_monotonic() {
         let r = make_reactor();
@@ -1451,8 +1067,7 @@ mod tests {
         for _ in 0..1000 {
             let id = r.alloc_request_id();
             assert!(id > last);
-            assert_ne!(id, 0);
-            assert_ne!(id, u64::MAX);
+            assert!((1..=MAX_REGULAR_REQ_ID).contains(&id));
             last = id;
         }
     }
@@ -1469,9 +1084,10 @@ mod tests {
             polls: polls2,
             polled: 0,
         });
-        // Doubly waking polls itself N times before completing; the
-        // exact value isn't load-bearing, just that we eventually finish.
-        assert!(polls.get() >= 1);
+        // Three Pending polls (each waking twice) plus the Ready one. Without
+        // RunQueue::push's dedup the double wake would poll twice per tick and
+        // the count would be higher.
+        assert_eq!(polls.get(), 4, "N wakes before a tick must collapse to one poll");
     }
 
     /// Spawned task that panics during poll must propagate — no silent
@@ -1519,14 +1135,14 @@ mod tests {
         assert!(q.contains(&123));
     }
 
-    /// `poll_nonblocking` returns promptly with no work to do — no syscall
+    /// A non-blocking tick returns promptly with no work to do — no syscall
     /// other than the no-op submit. Bound: under 100ms (very generous;
     /// failure indicates accidental blocking in the no-work path).
     #[test]
-    fn poll_nonblocking_returns_promptly() {
+    fn nonblocking_tick_returns_promptly() {
         let r = make_reactor();
         let start = Instant::now();
-        r.poll_nonblocking();
+        r.tick(false);
         assert!(start.elapsed() < Duration::from_millis(100));
     }
 
@@ -1622,12 +1238,16 @@ mod tests {
             let ord = Rc::clone(&order);
             r.spawn(async move {
                 let g = m.lock().await;
+                let len = ord.borrow().len();
                 ord.borrow_mut().push(i);
+                // Fail loudly if another task entered the section while this
+                // one held the lock.
+                assert_eq!(ord.borrow().len(), len + 1);
                 drop(g);
             });
         }
         r.block_until_idle();
-        assert_eq!(*order.borrow(), vec![0, 1, 2], "tasks must serialize");
+        assert_eq!(*order.borrow(), vec![0, 1, 2], "tasks must serialize, in lock order");
     }
 
     /// Structural regression: a task that acquires the SAL writer mutex,
@@ -1926,20 +1546,6 @@ mod tests {
     }
 
     #[test]
-    fn join2_waits_for_both() {
-        let r = make_reactor();
-        let out: Rc<StdCell<(u32, u32)>> = Rc::new(StdCell::new((0, 0)));
-        let out2 = Rc::clone(&out);
-        r.block_on(async move {
-            let a = async { 3u32 };
-            let b = async { 4u32 };
-            let (x, y) = join2(a, b).await;
-            out2.set((x, y));
-        });
-        assert_eq!(out.get(), (3, 4));
-    }
-
-    #[test]
     fn fsync_future_roundtrip() {
         let r = make_reactor();
         let fd = crate::foundation::posix_io::memfd_create(b"reactor_fsync_future");
@@ -2025,22 +1631,13 @@ mod tests {
         .await
     }
 
-    /// Build a minimal `DecodedWire` for tests — only `request_id` is
-    /// load-bearing; every other field is zeroed / empty.
+    /// Build a minimal `DecodedWire` for tests — only `request_id` matters.
     fn synthetic_decoded_wire(req_id: u64) -> DecodedWire {
         use crate::runtime::wire::DecodedControl;
         DecodedWire {
             control: DecodedControl {
-                status: 0,
-                client_id: 0,
-                target_id: 0,
-                flags: 0,
-                seek_pk: 0,
-                seek_col_idx: 0,
                 request_id: req_id,
-                error_msg: Vec::new(),
-                seek_pk_extra: Vec::new(),
-                block_size: 0,
+                ..Default::default()
             },
             schema: None,
             data_batch: None,
@@ -2058,43 +1655,44 @@ mod tests {
             let _ = reply.await;
             done2.set(true);
         });
-        r.inject_parked_reply(99, synthetic_decoded_wire(99));
+        r.test_route_reply(0, synthetic_decoded_wire(99));
         r.block_until_idle();
         assert!(done.get());
         assert_eq!(r.task_count(), 0);
     }
 
-    /// Routed reply: pops the waker, parks the wire for the awaiter.
+    /// Routed reply: wakes the parked awaiter and resolves it.
     /// No `in_flight` accounting — the tail-chasing ring self-maintains.
     #[test]
     fn route_reply_routes_to_registered_waker() {
         let r = make_reactor();
         r.test_init_state(2);
 
+        let mut fut = std::pin::pin!(r.await_reply(42));
         let waker = make_waker(0);
-        r.inner.reply_wakers.borrow_mut().insert(42, waker);
+        let mut cx = Context::from_waker(&waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
 
         r.test_route_reply(1, synthetic_decoded_wire(42));
 
-        assert!(r.inner.parked_replies.borrow().contains_key(&42));
-        assert!(!r.inner.reply_wakers.borrow().contains_key(&42));
+        assert!(
+            r.inner.run_queue.borrow().queue.contains(&0),
+            "a routed reply must wake its awaiter"
+        );
+        assert!(fut.as_mut().poll(&mut cx).is_ready());
     }
 
-    /// Unrouted reply (no waker): logged and dropped. Must not
-    /// contaminate `parked_replies` — stale entries would keep
-    /// non-dead memory alive indefinitely.
+    /// Unrouted reply (nobody awaiting): logged and dropped. Must not leave a
+    /// slot behind — stale entries would keep non-dead memory alive.
     #[test]
     fn route_reply_unrouted_is_logged_and_dropped() {
         let r = make_reactor();
         r.test_init_state(1);
-        // No waker registered for req_id=7.
+        // Nobody called await_reply(7).
 
         r.test_route_reply(0, synthetic_decoded_wire(7));
 
-        assert!(
-            r.inner.parked_replies.borrow().is_empty(),
-            "unrouted replies must not leak into parked_replies"
-        );
+        assert_eq!(r.inner.replies.len(), 0, "unrouted replies must not leak a park slot");
     }
 
     /// Dispatching a KIND_FSYNC CQE parks the CQE `res` verbatim under
@@ -2104,30 +1702,25 @@ mod tests {
     fn fsync_dispatch_parks_rc_verbatim() {
         let r = make_reactor();
         for rc in [0, -5] {
+            r.inner.fsyncs.open(42, None);
             r.inject_cqe(KIND_FSYNC, 42, rc);
-            r.drain_injected_cqes();
-            let parked = r.inner.parked_fsync_results.borrow_mut().remove(&42);
-            assert_eq!(parked, Some(rc));
+            assert_eq!(r.inner.fsyncs.take_result(42), Some(rc));
         }
     }
 
     /// End-to-end with a real io_uring: submit fdatasync on a memfd,
     /// block until complete, expect rc=0.  Also asserts
-    /// `parked_fsync_results` is drained afterwards (catches leaks).
+    /// the fsync park map is drained afterwards (catches leaks).
     #[test]
     fn fsync_real_memfd_roundtrip() {
         let r = make_reactor();
         let fd = crate::foundation::posix_io::memfd_create(b"reactor_fsync_ok");
-        let id = r.submit_fsync(fd);
-        let rc = r.block_on_fsync(id);
+        let rc = r.block_on(r.fsync(fd));
         unsafe {
             libc::close(fd);
         }
         assert_eq!(rc, 0, "fdatasync on a fresh memfd should succeed");
-        assert!(
-            r.inner.parked_fsync_results.borrow().is_empty(),
-            "block_on_fsync must remove the parked result"
-        );
+        assert_eq!(r.inner.fsyncs.len(), 0, "a resolved fsync must retire its slot");
     }
 
     /// Submitting fdatasync on an fd that is not in the process's fd
@@ -2141,19 +1734,19 @@ mod tests {
     #[test]
     fn fsync_real_bad_fd_returns_negative() {
         let r = make_reactor();
-        let id = r.submit_fsync(i32::MAX);
-        let rc = r.block_on_fsync(id);
+        let rc = r.block_on(r.fsync(i32::MAX));
         assert!(rc < 0, "fdatasync on a bogus fd must return rc<0, got {rc}");
     }
 
-    /// `submit_fsync` flushes the SQE to the kernel before returning.
+    /// `fsync` flushes the SQE to the kernel before returning.
     /// Without the eager submit the CQE would only arrive on the next
     /// `tick`, defeating the Phase-A / tick-evaluation overlap.
     #[test]
     fn fsync_submit_flushes_sqe_before_returning() {
         let r = make_reactor();
         let fd = crate::foundation::posix_io::memfd_create(b"reactor_fsync_flush");
-        let id = r.submit_fsync(fd);
+        let fut = r.fsync(fd);
+        let id = fut.id;
 
         // Spin briefly (no further ticks driven from outside) until the
         // CQE either arrives in the ring or we time out.  The kernel
@@ -2163,7 +1756,7 @@ mod tests {
         let mut got: Option<i32> = None;
         while Instant::now() < deadline {
             r.drain_cqes_into_wakers();
-            if let Some(rc) = r.inner.parked_fsync_results.borrow_mut().remove(&id) {
+            if let Some(rc) = r.inner.fsyncs.take_result(id) {
                 got = Some(rc);
                 break;
             }
@@ -2175,7 +1768,7 @@ mod tests {
             got,
             Some(0),
             "fsync CQE must be available without driving another tick — \
-             submit_fsync should flush the SQE eagerly"
+             Reactor::fsync should flush the SQE eagerly"
         );
     }
 
@@ -2193,158 +1786,119 @@ mod tests {
     #[test]
     fn send_cqe_parks_rc_and_wakes_waker() {
         let r = make_reactor();
+        r.inner.sends.open(55, None);
+        let mut fut = std::pin::pin!(SendFuture {
+            send_id: 55,
+            inner: Rc::clone(&r.inner),
+        });
         let waker = make_waker(11);
-        r.inner.send_wakers.borrow_mut().insert(55, waker);
+        let mut cx = Context::from_waker(&waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
 
         r.inject_cqe(KIND_SEND, 55, 1234);
-        r.drain_injected_cqes();
 
-        let parked = r.inner.parked_send_results.borrow_mut().remove(&55);
-        assert_eq!(
-            parked,
-            Some(1234),
-            "KIND_SEND must park the CQE rc verbatim so SendFuture sees it"
-        );
         assert!(
-            !r.inner.send_wakers.borrow().contains_key(&55),
-            "KIND_SEND must consume the waker entry"
+            r.inner.run_queue.borrow().queue.contains(&11),
+            "KIND_SEND must wake the send future"
         );
-        let q: Vec<usize> = r.inner.run_queue.borrow().queue.to_vec();
-        assert!(q.contains(&11), "KIND_SEND must wake the send future");
+        assert_eq!(
+            fut.as_mut().poll(&mut cx),
+            Poll::Ready(1234),
+            "KIND_SEND must deliver the CQE rc verbatim"
+        );
+        assert_eq!(r.inner.sends.len(), 0, "a resolved send must retire its slot");
     }
 
     #[test]
-    fn send_cqe_removes_parked_buffer_and_decrements_conn_inflight() {
+    fn send_cqe_decrements_conn_inflight_and_releases_the_buffer() {
         let r = make_reactor();
-        // Pre-populate an in-flight buffer and a conn with send_inflight=1.
-        r.inner.send_buffers_in_flight.borrow_mut().insert(
-            77,
-            SendAlive::Pooled(Rc::new(crate::storage::batch_pool::PooledSendBuf(vec![0u8; 16]))),
-        );
-        r.inner.send_fd_for_id.borrow_mut().insert(77, 42);
+        let alive: SendAlive = Rc::new(crate::storage::batch_pool::PooledSendBuf(vec![0u8; 16]));
+        r.inner.sends.open(77, Some((42, Rc::clone(&alive))));
         r.inner.conns.borrow_mut().insert(42, Box::new(io::Conn::new()));
-        if let Some(c) = r.inner.conns.borrow_mut().get_mut(&42) {
-            c.send_inflight = 1;
-        }
+        r.inner.conns.borrow_mut().get_mut(&42).unwrap().send_inflight = 1;
 
         r.inject_cqe(KIND_SEND, 77, 16);
-        r.drain_injected_cqes();
 
-        assert!(
-            !r.inner.send_buffers_in_flight.borrow().contains_key(&77),
-            "KIND_SEND must drop the parked buffer — leaks linearly with \
-             the number of cancelled SendFutures otherwise"
-        );
-        assert!(
-            !r.inner.send_fd_for_id.borrow().contains_key(&77),
-            "KIND_SEND must clear send_fd_for_id so the fd entry does not \
-             grow unboundedly"
-        );
         let inflight = r.inner.conns.borrow().get(&42).unwrap().send_inflight;
         assert_eq!(
             inflight, 0,
             "KIND_SEND must decrement conn.send_inflight (gates close_fd)"
         );
+        // The keep-alive rides the slot until the awaiter collects the result;
+        // once it does, the last reference goes with it.
+        assert_eq!(Rc::strong_count(&alive), 2, "slot still holds the buffer");
+        let waker = make_waker(0);
+        let mut fut = std::pin::pin!(SendFuture {
+            send_id: 77,
+            inner: Rc::clone(&r.inner),
+        });
+        assert_eq!(fut.as_mut().poll(&mut Context::from_waker(&waker)), Poll::Ready(16));
+        assert_eq!(Rc::strong_count(&alive), 1, "collecting the result frees the buffer");
     }
 
-    /// A dropped SendFuture with an in-flight SQE MUST hand the buffer
-    /// off to the reactor so the kernel doesn't dereference freed
-    /// memory when the CQE eventually arrives.  This is
-    /// `II.2 io_uring SQE buffer lifetime` made concrete.
+    /// A dropped SendFuture with an in-flight SQE must leave the buffer alive
+    /// for the kernel — the park slot holds it — and let the late CQE free it.
+    /// This is `II.2 io_uring SQE buffer lifetime` made concrete.
     #[test]
-    fn send_future_drop_parks_buffer_rc() {
+    fn dropped_send_future_keeps_buffer_alive_until_its_cqe() {
         let r = make_reactor();
-        let buf = vec![0xAB_u8; 64];
-        {
-            // Build and drop a SendFuture without it ever becoming Ready.
-            let _fut = SendFuture {
-                send_id: 88,
-                _alive: Some(SendAlive::Pooled(Rc::new(crate::storage::batch_pool::PooledSendBuf(
-                    buf.clone(),
-                )))),
-                inner: Rc::clone(&r.inner),
-            };
-        }
-        let parked = r.inner.send_buffers_in_flight.borrow();
-        let stored = parked.get(&88).expect("drop must park keep-alive");
-        let SendAlive::Pooled(stored_rc) = stored else {
-            panic!("expected Pooled variant")
-        };
-        assert_eq!(stored_rc.0.as_slice(), &buf[..]);
+        let alive: SendAlive = Rc::new(crate::storage::batch_pool::PooledSendBuf(vec![0xAB_u8; 64]));
+        r.inner.sends.open(88, Some((42, Rc::clone(&alive))));
+        drop(SendFuture {
+            send_id: 88,
+            inner: Rc::clone(&r.inner),
+        });
+
+        assert!(r.inner.sends.is_abandoned(88), "drop must abandon the slot");
+        assert_eq!(
+            Rc::strong_count(&alive),
+            2,
+            "the kernel may still read the buffer — it must outlive the future"
+        );
+
+        r.inject_cqe(KIND_SEND, 88, 64);
+        assert_eq!(r.inner.sends.len(), 0, "the late CQE must retire the abandoned slot");
+        assert_eq!(Rc::strong_count(&alive), 1, "and free the buffer");
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // Per-fd state lifecycle (`register_conn` / `recv_closed` /
-    // `pending_recv`).  III.4 in async-invariants.md.
+    // Per-fd state lifecycle. Every bit of it lives in the `Conn`, so
+    // retiring a connection retires all of it at once.
     //
-    // Regression guard: a kernel-reused fd number carrying the
-    // previous incarnation's `recv_closed = true` flag caused the new
-    // connection to see immediate EOF on its first recv.
+    // Regression guard: a kernel-reused fd number carrying the previous
+    // incarnation's closed flag made the new connection see immediate EOF.
     // ─────────────────────────────────────────────────────────────────
 
-    /// Simulate fd reuse: mark fd=99 as closed, then register a new
-    /// connection on the same fd.  The stale `recv_closed` sentinel
-    /// MUST be cleared — otherwise `recv(99).await` on the new conn
-    /// returns `None` immediately and the connection is dead on arrival.
+    /// A reaped connection leaves nothing behind for the next incarnation of
+    /// the same fd number: registering again starts open, with no backlog.
+    /// Otherwise `recv().await` on the new connection returns `None` at once
+    /// and the connection is dead on arrival.
     #[test]
-    fn register_conn_clears_stale_recv_closed_sentinel() {
+    fn reaped_conn_leaves_no_state_for_the_next_connection() {
         let r = make_reactor();
-        // Pretend fd=99's previous incarnation closed.
-        r.inner.recv_closed.borrow_mut().insert(99);
-        // Work around: register_conn submits a RECV SQE on the fd, which
-        // would fail with EBADF if fd=99 isn't open. We skirt that by
-        // opening a pipe and using the read end (a valid fd that won't
-        // spuriously produce data during the test).
+        let (read_end, write_end) = unsafe { pipe_pair() };
+        r.register_conn(read_end);
+        // Peer EOF: closes the connection and queues it for reaping.
+        r.handle_recv_cqe(read_end, 0);
+        assert!(r.inner.conns.borrow().get(&read_end).unwrap().recv_closed);
+        r.reap_closing_conns();
+        assert!(
+            r.inner.conns.borrow().is_empty(),
+            "reaping must retire the whole Conn, closing its fd"
+        );
+
+        // The kernel is now free to hand that number back out.
+        let (next_read, next_write) = unsafe { pipe_pair() };
+        r.register_conn(next_read);
+        let conns = r.inner.conns.borrow();
+        let conn = conns.get(&next_read).expect("registered");
+        assert!(!conn.recv_closed, "a fresh connection must not inherit phantom EOF");
+        assert!(conn.pending.is_empty(), "nor a stale delivery backlog");
+        drop(conns);
         unsafe {
-            let mut fds = [0i32; 2];
-            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
-            let (read_end, write_end) = (fds[0], fds[1]);
-            // Prime recv_closed under the pipe fd number.
-            r.inner.recv_closed.borrow_mut().insert(read_end);
-
-            r.register_conn(read_end);
-
-            assert!(
-                !r.inner.recv_closed.borrow().contains(&read_end),
-                "register_conn must clear stale recv_closed so a new \
-                 connection on a reused fd doesn't see phantom EOF"
-            );
-            assert!(r.inner.conns.borrow().contains_key(&read_end));
-
-            libc::close(read_end);
             libc::close(write_end);
-        }
-    }
-
-    /// `register_conn` installs a fresh, empty `pending_recv` queue.
-    /// If stale entries survive the reset, messages from the old
-    /// incarnation would be delivered to the new handler.
-    #[test]
-    fn register_conn_clears_stale_pending_recv() {
-        let r = make_reactor();
-        unsafe {
-            let mut fds = [0i32; 2];
-            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
-            let (read_end, write_end) = (fds[0], fds[1]);
-            // Seed pending_recv with an empty queue (the hot path — a
-            // full queue with non-empty buffers would also trip
-            // debug_assert, which we can't catch cleanly in a test).
-            r.inner
-                .pending_recv
-                .borrow_mut()
-                .insert(read_end, std::collections::VecDeque::new());
-
-            r.register_conn(read_end);
-
-            let pr = r.inner.pending_recv.borrow();
-            assert!(
-                pr.get(&read_end).map(|q| q.is_empty()).unwrap_or(true),
-                "register_conn must leave pending_recv empty for the \
-                 new incarnation, even if an entry existed"
-            );
-
-            libc::close(read_end);
-            libc::close(write_end);
+            libc::close(next_read);
+            libc::close(next_write);
         }
     }
 
@@ -2580,16 +2134,6 @@ mod tests {
         v
     }
 
-    /// Blocking `libc::write` of every byte of `bytes` to `fd`.
-    unsafe fn write_all(fd: i32, bytes: &[u8]) {
-        let mut off = 0usize;
-        while off < bytes.len() {
-            let n = libc::write(fd, bytes[off..].as_ptr() as *const libc::c_void, bytes.len() - off);
-            assert!(n > 0, "write returned {n}");
-            off += n as usize;
-        }
-    }
-
     /// AF_UNIX SOCK_STREAM pair. Returns `(server_read_fd, client_write_fd)`:
     /// the reactor `register_conn`s the first and recvs from it; the test
     /// `write_all`s framed bytes into the second.
@@ -2598,6 +2142,15 @@ mod tests {
         let rc = libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr());
         assert_eq!(rc, 0, "socketpair");
         (fds[1], fds[0])
+    }
+
+    /// `(read_end, write_end)` of a fresh pipe. Tests that need a real,
+    /// owned fd number — `reap_closing_conns` calls `libc::close` on what it
+    /// reaps, so a magic number would race a parallel test that owns it.
+    unsafe fn pipe_pair() -> (i32, i32) {
+        let mut fds = [0i32; 2];
+        assert_eq!(libc::pipe(fds.as_mut_ptr()), 0, "pipe");
+        (fds[0], fds[1])
     }
 
     /// Poll a fresh `recv(fd)` future exactly once, returning its result:
@@ -2617,7 +2170,7 @@ mod tests {
     /// soon as `cond` holds after a tick (and `false` if it never does).
     fn poll_until(r: &Reactor, max: usize, mut cond: impl FnMut() -> bool) -> bool {
         (0..max).any(|_| {
-            r.poll_nonblocking();
+            r.tick(false);
             cond()
         })
     }
@@ -2640,7 +2193,7 @@ mod tests {
             for _ in 0..3 {
                 wire.extend_from_slice(&framed(&payload));
             }
-            write_all(write_fd, &wire);
+            crate::foundation::posix_io::write_all_fd(write_fd, &wire).expect("write");
 
             let reaped = poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&read_fd));
             assert!(reaped, "cap-trip connection was never reaped");
@@ -2676,12 +2229,16 @@ mod tests {
             let mut hdr_and_part = Vec::new();
             hdr_and_part.extend_from_slice(&10_000u32.to_le_bytes());
             hdr_and_part.extend_from_slice(&[0x11u8; 100]);
-            write_all(write_fd, &hdr_and_part);
+            crate::foundation::posix_io::write_all_fd(write_fd, &hdr_and_part).expect("write");
 
             let counted = poll_until(&r, 10_000, || r.inner.total_inbound_bytes.get() == 10_000);
             assert!(counted, "in-flight buffer was not accounted");
             assert!(
-                r.inner.pending_recv.borrow().get(&read_fd).is_none_or(|q| q.is_empty()),
+                r.inner
+                    .conns
+                    .borrow()
+                    .get(&read_fd)
+                    .is_none_or(|c| c.pending.is_empty()),
                 "no frame should have completed from a partial payload"
             );
 
@@ -2689,7 +2246,7 @@ mod tests {
             let (read_fd2, write_fd2) = stream_pair();
             r.register_conn(read_fd2);
             r.set_max_payload_len(read_fd2, 1 << 20);
-            write_all(write_fd2, &framed(&[0x22u8; 100]));
+            crate::foundation::posix_io::write_all_fd(write_fd2, &framed(&[0x22u8; 100])).expect("write");
 
             let refused = poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&read_fd2));
             assert!(refused, "over-cap second connection was not closed");
@@ -2722,7 +2279,7 @@ mod tests {
             for _ in 0..10 {
                 wire.extend_from_slice(&framed(&payload));
             }
-            unsafe { write_all(write_fd, &wire) };
+            crate::foundation::posix_io::write_all_fd(write_fd, &wire).expect("write");
             let r2 = Rc::clone(&r);
             r.block_on(async move {
                 for _ in 0..10 {
@@ -2761,7 +2318,7 @@ mod tests {
             for _ in 0..65 {
                 wire.extend_from_slice(&framed(&[0xCD]));
             }
-            write_all(write_fd, &wire);
+            crate::foundation::posix_io::write_all_fd(write_fd, &wire).expect("write");
 
             let reaped = poll_until(&r, 20_000, || !r.inner.conns.borrow().contains_key(&read_fd));
             assert!(reaped, "tiny-frame flood must trip the cap via the frame_weight floor");
@@ -2791,16 +2348,11 @@ mod tests {
         use crate::runtime::wire::DecodedControl;
         DecodedWire {
             control: DecodedControl {
-                status: 0,
-                client_id: 0,
                 target_id: view_id as u64,
                 flags: FLAG_EXCHANGE,
                 seek_pk: source_id as u128,
-                seek_col_idx: 0,
                 request_id: req_id,
-                error_msg: Vec::new(),
-                seek_pk_extra: Vec::new(),
-                block_size: 0,
+                ..Default::default()
             },
             schema: Some(SchemaDescriptor::minimal_u64()),
             data_batch: None,
@@ -2814,19 +2366,21 @@ mod tests {
     fn route_reply_flag_exchange_does_not_wake() {
         let r = make_reactor();
         r.test_init_state(2);
+        let mut fut = std::pin::pin!(r.await_reply(42));
         let waker = make_waker(0);
-        r.inner.reply_wakers.borrow_mut().insert(42, waker);
+        let mut cx = Context::from_waker(&waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
 
         let exch = synthetic_exchange_wire(/*view_id*/ 100, /*req_id*/ 42);
         r.test_route_reply(0, exch);
 
         assert!(
-            r.inner.reply_wakers.borrow().contains_key(&42),
-            "FLAG_EXCHANGE must NOT consume the tick waker"
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "FLAG_EXCHANGE must NOT resolve the tick's await_reply"
         );
         assert!(
-            r.inner.parked_replies.borrow().is_empty(),
-            "FLAG_EXCHANGE must NOT park the wire for await_reply"
+            r.inner.replies.has_waker(42),
+            "FLAG_EXCHANGE must leave the tick waker parked"
         );
     }
 
@@ -2840,10 +2394,8 @@ mod tests {
         r.attach_relay_tx(tx);
         r.test_init_state(2);
 
-        let w0 = make_waker(0);
-        let w1 = make_waker(1);
-        r.inner.reply_wakers.borrow_mut().insert(10, w0);
-        r.inner.reply_wakers.borrow_mut().insert(11, w1);
+        let ack10 = r.await_reply(10);
+        let ack11 = r.await_reply(11);
 
         r.test_route_reply(0, synthetic_exchange_wire(99, 10));
         assert!(
@@ -2854,12 +2406,14 @@ mod tests {
         let relay = rx.try_recv().expect("complete view must produce a relay");
         assert_eq!(relay.view_id, 99);
         assert_eq!(relay.payloads.len(), 2);
-        // Final ACKs (no FLAG_EXCHANGE) for the same req_ids wake
-        // their tick wakers and park the wires.
+        // Final ACKs (no FLAG_EXCHANGE) for the same req_ids resolve the
+        // awaiters the exchange frames deliberately left parked.
         r.test_route_reply(0, synthetic_decoded_wire(10));
         r.test_route_reply(1, synthetic_decoded_wire(11));
-        assert!(r.inner.parked_replies.borrow().contains_key(&10));
-        assert!(r.inner.parked_replies.borrow().contains_key(&11));
+        let waker = make_waker(0);
+        let mut cx = Context::from_waker(&waker);
+        assert!(std::pin::pin!(ack10).as_mut().poll(&mut cx).is_ready());
+        assert!(std::pin::pin!(ack11).as_mut().poll(&mut cx).is_ready());
     }
 
     /// A view with multiple input sources (e.g. join of two tables)
@@ -2878,12 +2432,9 @@ mod tests {
         r.test_init_state(4);
         *r.inner.exchange_acc.borrow_mut() = ExchangeAccumulator::new(4);
 
-        // Register one reply waker per worker to satisfy route_reply's
-        // parked-waker pre-flight check.
-        for w in 0..4 {
-            let waker = make_waker(w);
-            r.inner.reply_wakers.borrow_mut().insert(100 + w as u64, waker);
-        }
+        // One open reply slot per worker, so the final ACKs have somewhere
+        // to land — route_reply drops a reply nobody awaits.
+        let _acks: Vec<ReplyFuture> = (0..4).map(|w| r.await_reply(100 + w as u64)).collect();
 
         // Interleave two rounds for the same view_id=100:
         //   round A: (view_id=100, source_id=10), workers 0..4
@@ -2947,7 +2498,7 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
         let pinned = Pin::new(&mut tf);
         let _ = pinned.poll(&mut cx);
-        assert_eq!(r.inner.timer_wakers.borrow().len(), 1);
+        assert_eq!(r.inner.timers.len(), 1);
         drop(tf);
         // Drive ticks past the deadline; the cancelled CQE must be
         // discarded without waking key=999.
@@ -2959,53 +2510,24 @@ mod tests {
         assert!(!q.contains(&999), "cancelled timer must not wake its original waker");
     }
 
-    /// AsyncMutex serialises tasks: even when several tasks race on
-    /// `lock().await` only one runs the critical section at a time.
-    /// Mirrors sal_writer_excl's role for III.3b.
-    #[test]
-    fn sal_writer_excl_serializes_tasks() {
-        let r = make_reactor();
-        let order: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
-        let mutex: Rc<AsyncMutex> = Rc::new(AsyncMutex::new());
-        for i in 0u32..3 {
-            let m = Rc::clone(&mutex);
-            let ord = Rc::clone(&order);
-            r.spawn(async move {
-                let g = m.lock().await;
-                let len = ord.borrow().len();
-                ord.borrow_mut().push(i);
-                // Fail loudly if any other task entered the section while
-                // this one held the lock.
-                assert_eq!(ord.borrow().len(), len + 1);
-                drop(g);
-            });
-        }
-        r.block_until_idle();
-        assert_eq!(order.borrow().len(), 3);
-    }
-
-    /// Cross-process stress: a forked child publishes thousands of
-    /// messages into a shared W2M ring while the parent drains them
-    /// through the reactor's `FUTEX_WAITV` + `W2mReceiver` pipeline.
+    /// Cross-process stress: a forked child publishes `n_messages` into a
+    /// shared W2M ring while the parent drains them through the reactor's
+    /// `FUTEX_WAITV` + `W2mReceiver` pipeline.
     ///
     /// Regression guard for two distinct hazards:
-    /// 1. The lost-wake race in `refresh_futex_waitv_vals`: at this
-    ///    scale the master takes many `refresh → arm` cycles, each a
-    ///    potential lost-wake window. A missed wake hangs the test
-    ///    (caught by the reactor-timer guard).
-    /// 2. The writer-crosses-reader data-loss bug in the SKIP-wrap
-    ///    path: capacity is small enough (64 KiB) and message count
-    ///    high enough (500 × ~280 B ≈ 140 KiB) to force multiple
-    ///    SKIP-wraps. Truncated or out-of-order delivery fails the
-    ///    `ids` assertion.
+    /// 1. The lost-wake race in `refresh_futex_waitv_vals`: at this scale the
+    ///    master takes many `refresh → arm` cycles, each a potential lost-wake
+    ///    window. A missed wake hangs the test (caught by the timer guard).
+    /// 2. The writer-crosses-reader data-loss bug in the SKIP-wrap path:
+    ///    capacity is small enough (64 KiB) and the message count high enough
+    ///    (500 × ~280 B ≈ 140 KiB) to force multiple SKIP-wraps. Truncated or
+    ///    out-of-order delivery fails the `ids` assertion.
     ///
-    /// Waker-install ordering is load-bearing: the reply futures
-    /// must register their wakers BEFORE `attach_w2m` runs its
-    /// initial drain, otherwise replies drained during attach are
-    /// logged as "unrouted" and dropped. The `poll_nonblocking`
-    /// between `spawn` and `attach_w2m` exists for this reason.
-    #[test]
-    fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
+    /// Waker-install ordering matters: the reply futures must register their
+    /// wakers BEFORE `attach_w2m` runs its initial drain, or replies drained
+    /// during attach are logged as "unrouted" and dropped. That is what the
+    /// `tick(false)` between `spawn` and `attach_w2m` is for.
+    fn w2m_cross_process_stress(n_messages: u64, timeout_secs: u64) {
         use crate::runtime::reactor::{join_all_unpin, select2, Either};
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use crate::runtime::w2m_ring;
@@ -3013,8 +2535,6 @@ mod tests {
         use std::time::Duration;
 
         const CAPACITY: usize = 64 * 1024;
-        const N_MESSAGES: u64 = 500;
-        const TIMEOUT_SECS: u64 = 30;
 
         let region = crate::test_support::SharedRegion::new(CAPACITY);
         let ptr = region.ptr();
@@ -3030,7 +2550,7 @@ mod tests {
             // any of them under the resulting drain-refresh-arm
             // race pressure.
             let writer = W2mWriter::new(ptr, CAPACITY as u64);
-            for req_id in 1..=N_MESSAGES {
+            for req_id in 1..=n_messages {
                 writer.send_status(0, req_id, STATUS_OK, &[]);
             }
             unsafe {
@@ -3042,7 +2562,7 @@ mod tests {
         let reactor = Reactor::new(16).expect("reactor");
 
         let received: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
-        let reply_futs: Vec<_> = (1..=N_MESSAGES).map(|i| reactor.await_reply(i)).collect();
+        let reply_futs: Vec<_> = (1..=n_messages).map(|i| reactor.await_reply(i)).collect();
         {
             let received = Rc::clone(&received);
             reactor.spawn(async move {
@@ -3052,14 +2572,14 @@ mod tests {
         }
         // One tick polls the spawned task, which walks join_all_unpin and
         // registers every ReplyFuture's waker before attach drains.
-        reactor.poll_nonblocking();
+        reactor.tick(false);
 
         reactor.attach_w2m(Rc::new(W2mReceiver::new(vec![ptr])));
 
         let inner = Rc::clone(&reactor.inner);
         let received_check = Rc::clone(&received);
         let outcome = reactor.block_on(async move {
-            let timeout = TimerFuture::new(Instant::now() + Duration::from_secs(TIMEOUT_SECS), inner);
+            let timeout = TimerFuture::new(Instant::now() + Duration::from_secs(timeout_secs), inner);
             let watch = async move {
                 while received_check.borrow().is_empty() {
                     YieldOnce::new().await;
@@ -3075,14 +2595,14 @@ mod tests {
                 "reactor stalled with {} replies received after {}s — \
                  lost-wake symptom",
                 received.borrow().len(),
-                TIMEOUT_SECS,
+                timeout_secs,
             );
         }
 
         let mut ids = received.borrow().clone();
-        assert_eq!(ids.len(), N_MESSAGES as usize);
+        assert_eq!(ids.len(), n_messages as usize);
         ids.sort();
-        let expected: Vec<u64> = (1..=N_MESSAGES).collect();
+        let expected: Vec<u64> = (1..=n_messages).collect();
         assert_eq!(ids, expected, "every published req_id must round-trip");
 
         let mut status: i32 = 0;
@@ -3094,89 +2614,17 @@ mod tests {
         reactor.request_shutdown();
     }
 
-    /// High-volume variant of the W2M cross-process stress: 5 000
-    /// messages through a 64 KiB ring forces dozens of SKIP-wraps and
-    /// many writer-park/wake cycles. Catches any flake in the wake
-    /// protocol or virtual-cursor accounting that only manifests at
-    /// scale.
+    #[test]
+    fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
+        w2m_cross_process_stress(500, 30);
+    }
+
+    /// The same run at 10x the volume: 5 000 messages through a 64 KiB ring
+    /// forces dozens of SKIP-wraps and many writer-park/wake cycles, catching
+    /// wake-protocol or virtual-cursor flakes that only appear at scale.
     #[test]
     fn w2m_cross_process_stress_high_volume() {
-        use crate::runtime::reactor::{join_all_unpin, select2, Either};
-        use crate::runtime::w2m::{W2mReceiver, W2mWriter};
-        use crate::runtime::w2m_ring;
-        use crate::runtime::wire::STATUS_OK;
-        use std::time::Duration;
-
-        const CAPACITY: usize = 64 * 1024;
-        const N_MESSAGES: u64 = 5_000;
-        const TIMEOUT_SECS: u64 = 60;
-
-        let region = crate::test_support::SharedRegion::new(CAPACITY);
-        let ptr = region.ptr();
-        unsafe {
-            w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
-        }
-
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0);
-        if pid == 0 {
-            let writer = W2mWriter::new(ptr, CAPACITY as u64);
-            for req_id in 1..=N_MESSAGES {
-                writer.send_status(0, req_id, STATUS_OK, &[]);
-            }
-            unsafe {
-                libc::_exit(0);
-            }
-        }
-
-        let reactor = Reactor::new(16).expect("reactor");
-        let received: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
-        let reply_futs: Vec<_> = (1..=N_MESSAGES).map(|i| reactor.await_reply(i)).collect();
-        {
-            let received = Rc::clone(&received);
-            reactor.spawn(async move {
-                let replies = join_all_unpin(reply_futs).await;
-                *received.borrow_mut() = replies.into_iter().map(|r| r.control.request_id).collect();
-            });
-        }
-        reactor.poll_nonblocking();
-
-        reactor.attach_w2m(Rc::new(W2mReceiver::new(vec![ptr])));
-
-        let inner = Rc::clone(&reactor.inner);
-        let received_check = Rc::clone(&received);
-        let outcome = reactor.block_on(async move {
-            let timeout = TimerFuture::new(Instant::now() + Duration::from_secs(TIMEOUT_SECS), inner);
-            let watch = async move {
-                while received_check.borrow().is_empty() {
-                    YieldOnce::new().await;
-                }
-            };
-            select2(watch, timeout).await
-        });
-        if let Either::B(()) = outcome {
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-            }
-            panic!(
-                "reactor stalled with {} replies after {}s",
-                received.borrow().len(),
-                TIMEOUT_SECS,
-            );
-        }
-
-        let mut ids = received.borrow().clone();
-        assert_eq!(ids.len(), N_MESSAGES as usize);
-        ids.sort();
-        let expected: Vec<u64> = (1..=N_MESSAGES).collect();
-        assert_eq!(ids, expected);
-
-        let mut status: i32 = 0;
-        unsafe {
-            libc::waitpid(pid, &mut status, 0);
-        }
-
-        reactor.request_shutdown();
+        w2m_cross_process_stress(5_000, 60);
     }
 
     /// Lost-wake guard for `refresh_futex_waitv_vals` (cluster C6).
@@ -3223,15 +2671,10 @@ mod tests {
             w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
         }
 
-        // Arm the order-witness probe on this (reactor) thread. The
-        // `wait_for_publish` barrier makes the helper's publish visible to
-        // the refresh's `wc != rc` check deterministically.
+        // Arm the publish barrier on this (reactor) thread, so the helper's
+        // publish is visible to the refresh's `wc != rc` check deterministically.
         let helper_published = Arc::new(AtomicBool::new(false));
-        let probe = Rc::new(test_refresh_hooks::RefreshProbe::new(
-            Arc::clone(&helper_published),
-            /* wait_for_publish */ true,
-        ));
-        test_refresh_hooks::arm(Rc::clone(&probe));
+        park_order::set_publish_barrier(Some(Arc::clone(&helper_published)));
 
         // Helper thread: spin until FLAG_MASTER_PARKED is GLOBALLY visible
         // (Acquire), then publish exactly one message. If the flag became
@@ -3290,7 +2733,7 @@ mod tests {
         let pending = reactor.refresh_futex_waitv_vals();
 
         helper.join().expect("helper thread panicked");
-        test_refresh_hooks::disarm();
+        park_order::set_publish_barrier(None);
 
         // The helper did publish (it observed the flag). If it timed out
         // without seeing the flag, that itself is a lost-wake symptom.
@@ -3308,17 +2751,14 @@ mod tests {
              the caller would arm a doomed wait (lost wake)",
         );
 
-        // (2) Order witness: the flag publish was stamped strictly before
-        // the reader_seq snapshot. This is the load-bearing teeth — it is
-        // what distinguishes correct ordering from the masked reorder.
-        let flag_seq = probe.flag_seq.load(Ordering::SeqCst);
-        let snap_seq = probe.snap_seq.load(Ordering::SeqCst);
-        assert!(flag_seq != 0 && snap_seq != 0, "probe stamps not recorded");
-        assert!(
-            flag_seq < snap_seq,
-            "FLAG_MASTER_PARKED must be published (stamp {flag_seq}) BEFORE \
-             reader_seq is snapshotted (stamp {snap_seq}); reordering them \
-             opens the lost-wake window",
+        // (2) Order witness: the flag publish ran before the reader_seq
+        // snapshot. This is what distinguishes correct ordering from the
+        // masked reorder — assertion (1) holds under both.
+        assert_eq!(
+            park_order::step(),
+            2,
+            "FLAG_MASTER_PARKED must be published BEFORE reader_seq is \
+             snapshotted; reordering them opens the lost-wake window",
         );
     }
 
@@ -3333,29 +2773,22 @@ mod tests {
         r.inner.conns.borrow_mut().insert(55, Box::new(io::Conn::new()));
 
         r.inject_cqe(KIND_RECV, 55, -1);
-        r.drain_injected_cqes();
 
         assert!(
             r.inner.closing_fds.borrow().contains(&55),
             "res<=0 recv CQE must insert fd into closing_fds"
         );
         assert!(
-            r.inner.recv_closed.borrow().contains(&55),
-            "res<=0 recv CQE must set recv_closed sentinel"
+            r.inner.conns.borrow().get(&55).unwrap().recv_closed,
+            "res<=0 recv CQE must mark the connection closed"
         );
     }
 
     #[test]
     fn reap_closing_conns_removes_idle_closing_fd() {
-        // `reap_closing_conns` calls `libc::close(fd)` on every reaped fd.
-        // Use real pipe ends so the close lands on something we own —
-        // a magic-number fd would race with parallel test threads that
-        // had been allocated the same fd by the kernel.
         let r = make_reactor();
         unsafe {
-            let mut fds = [0i32; 2];
-            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
-            let (read_end, write_end) = (fds[0], fds[1]);
+            let (read_end, write_end) = pipe_pair();
 
             let mut conn = Box::new(io::Conn::new());
             conn.closing = true;
@@ -3425,7 +2858,7 @@ mod tests {
     #[test]
     fn recv_state_payload_accumulates_then_message_done() {
         let mut rs = io::RecvState::new();
-        rs.hdr_buf = 8u32.to_le_bytes();
+        rs.seed_header(8);
         assert!(matches!(rs.advance(4), io::RecvAdvance::HeaderDone));
 
         let buf = unsafe { libc::malloc(8) as *mut u8 };
@@ -3560,44 +2993,36 @@ mod tests {
     // KIND_ACCEPT CQE dispatch.
     // ─────────────────────────────────────────────────────────────────
 
-    /// udata id that decodes to listener fd -1 (`id as i32`), so the
-    /// CQE_F_MORE==0 re-arm path is guarded off in tests that inject
-    /// accept CQEs without a real listener.
-    const NO_LISTENER: u64 = 0xFFFF_FFFF;
-
-    #[test]
-    fn dispatch_accept_queues_fd_and_listener_when_res_non_negative() {
-        let r = make_reactor();
-        // flags=0 → CQE_F_MORE not set → re-arm attempted; listener=-1 guards it.
-        r.inject_cqe(KIND_ACCEPT, NO_LISTENER, 7);
-        r.drain_injected_cqes();
-        let q: Vec<(i32, i32)> = r.inner.accept_queue.borrow().iter().copied().collect();
-        assert_eq!(
-            q,
-            vec![(7, -1)],
-            "KIND_ACCEPT res>=0 must push (conn_fd, listener_fd) to accept_queue"
-        );
+    /// A real fd to stand in for a listener, so the `CQE_F_MORE == 0` re-arm
+    /// these tests trigger targets something the kernel will accept.
+    fn fake_listener() -> i32 {
+        unsafe { pipe_pair().0 }
     }
 
     #[test]
-    fn dispatch_accept_routes_listener_fd_from_udata() {
+    fn dispatch_accept_queues_the_connection_and_its_listener() {
         let r = make_reactor();
-        // A second listener's fd rides the udata id and must round-trip
-        // into the queued pair — the accept loop's unix-vs-tls routing key.
-        r.inject_cqe(KIND_ACCEPT, 33, 9);
-        r.drain_injected_cqes();
+        // The listener fd rides the udata id and must round-trip into the
+        // queued pair — it is the accept loop's unix-vs-tls routing key.
+        let listener = fake_listener();
+        r.inject_cqe(KIND_ACCEPT, listener as u64, 9);
         let q: Vec<(i32, i32)> = r.inner.accept_queue.borrow().iter().copied().collect();
-        assert_eq!(q, vec![(9, 33)], "listener fd must round-trip through the udata id");
+        assert_eq!(
+            q,
+            vec![(9, listener)],
+            "KIND_ACCEPT res>=0 must queue (conn_fd, listener_fd)"
+        );
+        unsafe { libc::close(listener) };
     }
 
     #[test]
     fn dispatch_accept_wakes_waiter_when_present() {
         let r = make_reactor();
+        let listener = fake_listener();
         let waker = make_waker(42);
         *r.inner.accept_waker.borrow_mut() = Some(waker);
 
-        r.inject_cqe(KIND_ACCEPT, NO_LISTENER, 5);
-        r.drain_injected_cqes();
+        r.inject_cqe(KIND_ACCEPT, listener as u64, 5);
 
         let q: Vec<usize> = r.inner.run_queue.borrow().queue.clone();
         assert!(q.contains(&42), "KIND_ACCEPT must wake the registered accept_waker");
@@ -3605,17 +3030,19 @@ mod tests {
             r.inner.accept_waker.borrow().is_none(),
             "KIND_ACCEPT must consume (take) the accept_waker"
         );
+        unsafe { libc::close(listener) };
     }
 
     #[test]
     fn dispatch_accept_ignores_error_result() {
         let r = make_reactor();
-        r.inject_cqe(KIND_ACCEPT, NO_LISTENER, -libc::ECONNABORTED);
-        r.drain_injected_cqes();
+        let listener = fake_listener();
+        r.inject_cqe(KIND_ACCEPT, listener as u64, -libc::ECONNABORTED);
         assert!(
             r.inner.accept_queue.borrow().is_empty(),
             "KIND_ACCEPT with res<0 must not push to accept_queue"
         );
+        unsafe { libc::close(listener) };
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -3714,21 +3141,7 @@ mod tests {
         crate::runtime::w2m::W2mReceiver,
         crate::test_support::SharedRegion,
     ) {
-        use crate::runtime::w2m::{W2mReceiver, W2mWriter};
-        use crate::runtime::w2m_ring;
-        use crate::runtime::wire as ipc;
-
-        const CAPACITY: usize = 4096;
-        let region = crate::test_support::SharedRegion::new(CAPACITY);
-        let ptr = region.ptr();
-        w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
-
-        let writer = W2mWriter::new(ptr, CAPACITY as u64);
-        let receiver = W2mReceiver::new(vec![ptr]);
-        let msg = ipc::WireMsg::default();
-        writer.send_encoded(msg.size(), req_id, |buf| {
-            msg.encode_ipc(buf, 0);
-        });
+        let (receiver, region) = make_scan_ring(req_id, 1);
         let slot = receiver.try_read_slot(0).expect("scan slot");
         (slot, receiver, region)
     }
@@ -3746,20 +3159,24 @@ mod tests {
         r.test_route_scan_slot(slot);
 
         assert!(
-            r.inner.scan_parked.borrow().contains_key(&req_id),
+            r.inner.scans.borrow().contains_key(&req_id),
             "slot must be queued when no waker is registered for an active scan"
         );
         assert_eq!(
-            r.inner.scan_parked.borrow().get(&req_id).map(|q| q.len()),
+            r.inner.scans.borrow().get(&req_id).map(|s| s.queue.len()),
             Some(1),
             "exactly one frame queued"
         );
         assert!(
-            r.inner.scan_wakers.borrow().is_empty(),
+            r.inner.scans.borrow().values().all(|s| s.waker.is_none()),
             "no waker should have been inserted"
         );
 
-        r.inner.scan_parked.borrow_mut().remove(&req_id); // drop slot, advance consume_cursor
+        r.inner
+            .scans
+            .borrow_mut()
+            .get_mut(&req_id)
+            .map(|s| std::mem::take(&mut s.queue)); // drop slot, advance consume_cursor
     }
 
     #[test]
@@ -3801,15 +3218,15 @@ mod tests {
             delivered2.set(true);
         });
 
-        r.poll_nonblocking(); // poll task → Poll::Pending, waker registered
+        r.tick(false); // poll task → Poll::Pending, waker registered
         assert!(
-            r.inner.scan_wakers.borrow().contains_key(&req_id),
+            r.inner.scans.borrow()[&req_id].waker.is_some(),
             "waker must be registered after first poll"
         );
         assert!(!delivered.get(), "must not be delivered yet");
 
         r.test_route_scan_slot(slot); // park + wake
-        r.poll_nonblocking(); // task woken → Poll::Ready
+        r.tick(false); // task woken → Poll::Ready
 
         assert!(delivered.get(), "slot must be delivered after route_scan_slot");
     }
@@ -3855,7 +3272,7 @@ mod tests {
 
     /// Failure mode 4: concurrently-streamed continuation frames for one
     /// req_id must be queued in arrival order, not overwritten (the old
-    /// single-value `scan_parked` dropped all but the last).
+    /// a single-value slot dropped all but the last).
     #[test]
     fn scan_queue_retains_continuation_frames_in_order() {
         let r = make_reactor();
@@ -3869,7 +3286,7 @@ mod tests {
         r.test_route_scan_slot(s0);
         r.test_route_scan_slot(s1);
         assert_eq!(
-            r.inner.scan_parked.borrow().get(&req_id).map(|q| q.len()),
+            r.inner.scans.borrow().get(&req_id).map(|s| s.queue.len()),
             Some(2),
             "both frames must be queued, not overwritten"
         );
@@ -3887,7 +3304,7 @@ mod tests {
             "queued continuation frames must be returned in arrival order"
         );
         assert!(
-            r.inner.scan_parked.borrow().is_empty(),
+            r.inner.scans.borrow().values().all(|s| s.queue.is_empty()),
             "queue emptied after both frames consumed"
         );
 
@@ -3912,7 +3329,7 @@ mod tests {
             r.test_route_scan_slot(s);
         }
         assert_eq!(
-            r.inner.scan_parked.borrow().get(&req_id).map(|q| q.len()),
+            r.inner.scans.borrow().get(&req_id).map(|s| s.queue.len()),
             Some(N),
             "all {N} frames queued past the legacy 64 ceiling — none dropped or aborted"
         );
@@ -3923,7 +3340,10 @@ mod tests {
             assert_eq!(rid, 100 + i as u64, "frame {i} delivered in arrival order");
             drop(f);
         }
-        assert!(r.inner.scan_parked.borrow().is_empty(), "queue emptied after drain");
+        assert!(
+            r.inner.scans.borrow().values().all(|s| s.queue.is_empty()),
+            "queue emptied after drain"
+        );
 
         drop(_lease);
         drop(recv);
@@ -3941,19 +3361,19 @@ mod tests {
 
         let s0 = recv.try_read_slot(0).expect("frame 0");
         r.test_route_scan_slot(s0); // queued (active)
-        assert!(r.inner.scan_parked.borrow().contains_key(&req_id));
+        assert!(r.inner.scans.borrow().contains_key(&req_id));
 
         let cc_before = unsafe { recv.header(0) }.consume_cursor().load(Ordering::Acquire);
         drop(lease); // purge parked queue → drop queued slot → advance consume_cursor
         assert!(
-            r.inner.scan_parked.borrow().is_empty(),
+            r.inner.scans.borrow().values().all(|s| s.queue.is_empty()),
             "lease drop purges parked queue"
         );
-        assert!(r.inner.scan_wakers.borrow().is_empty(), "lease drop purges wakers");
         assert!(
-            r.inner.active_scans.borrow().is_empty(),
-            "lease drop deregisters active scan"
+            r.inner.scans.borrow().values().all(|s| s.waker.is_none()),
+            "lease drop purges wakers"
         );
+        assert!(r.inner.scans.borrow().is_empty(), "lease drop deregisters active scan");
         let cc_after = unsafe { recv.header(0) }.consume_cursor().load(Ordering::Acquire);
         assert!(cc_after > cc_before, "dropped queued slot must advance consume_cursor");
 
@@ -3975,7 +3395,7 @@ mod tests {
         let cc_before = unsafe { recv.header(0) }.consume_cursor().load(Ordering::Acquire);
         r.test_route_scan_slot(s0); // dropped here (inactive)
         assert!(
-            r.inner.scan_parked.borrow().is_empty(),
+            r.inner.scans.borrow().values().all(|s| s.queue.is_empty()),
             "abandoned-scan frame must be discarded, not parked"
         );
         let cc_after = unsafe { recv.header(0) }.consume_cursor().load(Ordering::Acquire);
@@ -4073,14 +3493,16 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // Cancel-safe park-state futures (Fixes A, C, D, E).
+    // Cancellation. Abandoning a park slot is the one mechanism behind
+    // all of these: the slot's presence is the op's liveness, so a late
+    // completion can always tell "deliver" from "the awaiter is gone".
     // ─────────────────────────────────────────────────────────────────
 
-    /// Fix A: a dropped `ReplyFuture` must withdraw its waker so a late reply
-    /// hits route_reply's `None` arm (logged + dropped) instead of being parked
-    /// behind a dead waker forever.
+    /// A dropped `ReplyFuture` abandons its slot, so a late reply hits
+    /// route_reply's unrouted arm (logged + dropped) instead of parking behind
+    /// a dead waker forever.
     #[test]
-    fn dropped_reply_future_leaves_no_stale_waker() {
+    fn dropped_reply_future_discards_a_late_reply() {
         let r = make_reactor();
         let req_id = 4242u64;
         {
@@ -4088,26 +3510,19 @@ mod tests {
             let w = make_waker(1);
             let mut cx = Context::from_waker(&w);
             assert!(fut.as_mut().poll(&mut cx).is_pending(), "no reply parked yet");
-            assert!(
-                r.inner.reply_wakers.borrow().contains_key(&req_id),
-                "poll must register the reply waker"
-            );
-        } // fut dropped → Drop withdraws the waker
-        assert!(
-            !r.inner.reply_wakers.borrow().contains_key(&req_id),
-            "drop must withdraw the reply waker"
-        );
+            assert!(r.inner.replies.has_waker(req_id), "poll must register the waker");
+        } // fut dropped → slot abandoned
+        assert!(!r.inner.replies.is_open(req_id), "drop must retire the slot");
 
-        // A reply arriving after the drop hits the None arm and is dropped.
         r.test_route_reply(0, synthetic_decoded_wire(req_id));
-        assert!(
-            !r.inner.parked_replies.borrow().contains_key(&req_id),
-            "late reply for a dropped future must not be parked"
+        assert_eq!(
+            r.inner.replies.len(),
+            0,
+            "a late reply for a dropped future must not be parked"
         );
-        assert!(r.inner.reply_wakers.borrow().is_empty());
     }
 
-    /// Fix E: a dropped `AcceptFuture` must clear `accept_waker`.
+    /// A dropped `AcceptFuture` must clear `accept_waker`.
     #[test]
     fn dropped_accept_future_leaves_no_stale_waker() {
         let r = make_reactor();
@@ -4121,55 +3536,40 @@ mod tests {
         assert!(r.inner.accept_waker.borrow().is_none(), "drop must clear accept_waker");
     }
 
-    /// Fix C: a `FsyncFuture` dropped while pending must tombstone its id so the
-    /// late KIND_FSYNC handler drops the result instead of leaking an i32.
+    /// A `FsyncFuture` dropped while pending leaves its slot abandoned, so the
+    /// late KIND_FSYNC retires it instead of leaking a result nobody collects.
     #[test]
-    fn dropped_fsync_future_tombstones_late_cqe() {
+    fn dropped_fsync_future_discards_a_late_cqe() {
         let r = make_reactor();
         let id = 7001u64;
+        r.inner.fsyncs.open(id, None);
         {
             let mut fut = Box::pin(FsyncFuture {
                 id,
-                completed: false,
                 inner: Rc::clone(&r.inner),
             });
             let w = make_waker(1);
             let mut cx = Context::from_waker(&w);
             assert!(fut.as_mut().poll(&mut cx).is_pending(), "no result yet");
-            assert!(r.inner.fsync_wakers.borrow().contains_key(&id));
-        } // drop while pending → tombstone
-        assert!(
-            r.inner.cancelled_fsyncs.borrow().contains(&id),
-            "drop while pending must tombstone the id"
-        );
-        assert!(
-            !r.inner.fsync_wakers.borrow().contains_key(&id),
-            "drop must withdraw the waker"
-        );
+            assert!(r.inner.fsyncs.has_waker(id));
+        } // drop while pending → abandoned
+        assert!(r.inner.fsyncs.is_abandoned(id), "drop while pending must abandon");
+        assert!(!r.inner.fsyncs.has_waker(id), "drop must withdraw the waker");
 
-        // Late CQE: handler consumes the tombstone, parks nothing.
         r.inject_cqe(KIND_FSYNC, id, 0);
-        r.drain_injected_cqes();
-        assert!(
-            r.inner.parked_fsync_results.borrow().is_empty(),
-            "cancelled fsync's late result must not be parked"
-        );
-        assert!(r.inner.fsync_wakers.borrow().is_empty());
-        assert!(
-            r.inner.cancelled_fsyncs.borrow().is_empty(),
-            "the late CQE must consume the tombstone"
-        );
+        assert_eq!(r.inner.fsyncs.len(), 0, "the late CQE must retire the slot");
     }
 
-    /// Fix C: a CQE arriving before the drop is reclaimed by `Drop`, with no
-    /// tombstone left behind.
+    /// A CQE arriving before the drop is reclaimed by `Drop`, leaving nothing
+    /// behind — the case that made a hand-rolled tombstone set grow one entry
+    /// per durable commit.
     #[test]
-    fn dropped_fsync_future_reclaims_parked_result() {
+    fn dropped_fsync_future_reclaims_an_already_parked_result() {
         let r = make_reactor();
         let id = 7002u64;
+        r.inner.fsyncs.open(id, None);
         let mut fut = Box::pin(FsyncFuture {
             id,
-            completed: false,
             inner: Rc::clone(&r.inner),
         });
         let w = make_waker(1);
@@ -4177,101 +3577,28 @@ mod tests {
         assert!(fut.as_mut().poll(&mut cx).is_pending());
 
         r.inject_cqe(KIND_FSYNC, id, 0); // result parked before the drop
-        r.drain_injected_cqes();
-        assert!(r.inner.parked_fsync_results.borrow().contains_key(&id));
 
-        drop(fut); // not resolved → Drop reclaims the orphaned parked result
-        assert!(
-            r.inner.parked_fsync_results.borrow().is_empty(),
-            "drop must reclaim the orphaned parked result"
-        );
-        assert!(
-            r.inner.cancelled_fsyncs.borrow().is_empty(),
-            "no tombstone when the result was already parked"
-        );
+        drop(fut);
+        assert_eq!(r.inner.fsyncs.len(), 0, "drop must reclaim the orphaned result");
     }
 
-    /// Fix C regression guard: the success path must NOT tombstone — otherwise
-    /// `cancelled_fsyncs` would grow once per durable commit.
+    /// The success path leaves nothing behind either: `poll` retires the slot,
+    /// so `Drop` finds nothing to abandon.
     #[test]
-    fn resolved_fsync_future_adds_no_tombstone() {
+    fn resolved_fsync_future_leaves_no_slot() {
         let r = make_reactor();
         let id = 7003u64;
+        r.inner.fsyncs.open(id, None);
         let mut fut = Box::pin(FsyncFuture {
             id,
-            completed: false,
             inner: Rc::clone(&r.inner),
         });
         let w = make_waker(1);
         let mut cx = Context::from_waker(&w);
 
         r.inject_cqe(KIND_FSYNC, id, 0); // park result, then resolve from it
-        r.drain_injected_cqes();
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(rc) => assert_eq!(rc, 0),
-            Poll::Pending => panic!("must resolve from the parked result"),
-        }
-        drop(fut); // completed=true → Drop is a no-op
-        assert!(
-            r.inner.cancelled_fsyncs.borrow().is_empty(),
-            "success path must not tombstone — else cancelled_fsyncs leaks per commit"
-        );
-    }
-
-    /// Fix D: a `SendFuture` dropped while pending must park its buffer
-    /// keep-alive, withdraw its waker, and tombstone its id so the late
-    /// KIND_SEND handler frees the buffer and drops the result.
-    #[test]
-    fn dropped_send_future_tombstones_late_cqe() {
-        let r = make_reactor();
-        let send_id = 8001u64;
-        let fd = 42i32;
-        r.inner.conns.borrow_mut().insert(fd, Box::new(io::Conn::new()));
-        r.inner.conns.borrow_mut().get_mut(&fd).unwrap().send_inflight = 1;
-        r.inner.send_fd_for_id.borrow_mut().insert(send_id, fd);
-        r.inner.send_wakers.borrow_mut().insert(send_id, make_waker(1));
-        {
-            let _fut = SendFuture {
-                send_id,
-                _alive: Some(SendAlive::Pooled(Rc::new(crate::storage::batch_pool::PooledSendBuf(
-                    vec![0u8; 16],
-                )))),
-                inner: Rc::clone(&r.inner),
-            };
-        } // drop while pending → buffer parked, waker withdrawn, tombstone set
-        assert!(
-            r.inner.send_buffers_in_flight.borrow().contains_key(&send_id),
-            "drop must park the buffer keep-alive"
-        );
-        assert!(
-            r.inner.cancelled_sends.borrow().contains(&send_id),
-            "drop while pending must tombstone the send id"
-        );
-        assert!(
-            !r.inner.send_wakers.borrow().contains_key(&send_id),
-            "drop must withdraw the send waker"
-        );
-
-        // Late CQE: buffer + inflight cleanup unconditional, result dropped.
-        r.inject_cqe(KIND_SEND, send_id, 16);
-        r.drain_injected_cqes();
-        assert!(
-            r.inner.parked_send_results.borrow().is_empty(),
-            "cancelled send's late result must not be parked"
-        );
-        assert!(
-            r.inner.send_buffers_in_flight.borrow().is_empty(),
-            "handler must free the parked buffer"
-        );
-        assert!(r.inner.send_wakers.borrow().is_empty());
-        assert!(
-            r.inner.cancelled_sends.borrow().is_empty(),
-            "the late CQE must consume the tombstone"
-        );
-        assert_eq!(
-            r.inner.conns.borrow().get(&fd).unwrap().send_inflight,
-            0,
-            "handler must decrement send_inflight"
-        );
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(0));
+        drop(fut);
+        assert_eq!(r.inner.fsyncs.len(), 0);
     }
 }

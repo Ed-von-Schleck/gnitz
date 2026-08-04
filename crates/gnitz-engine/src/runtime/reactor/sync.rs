@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, RefMut};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
@@ -225,11 +225,9 @@ impl AsyncMutex {
 
     fn release(&self) {
         self.locked.set(false);
-        // Wake all waiters, not just one. A cancelled LockFuture leaves a
-        // stale waker in the queue; popping exactly one risks consuming
-        // that stale entry and permanently blocking every live waiter.
-        // On a single-threaded executor the thundering-herd cost is free:
-        // only the first task to poll acquires the lock; the rest re-park.
+        // Wake all waiters, not just one — same reason as `pass_baton`: a
+        // cancelled LockFuture can leave a stale waker in the queue, and
+        // popping exactly one risks handing the lock to it forever.
         let waiters = std::mem::take(&mut *self.waiters.borrow_mut());
         for w in waiters {
             w.wake();
@@ -320,38 +318,40 @@ impl AsyncRwLock {
         let mut s = self.inner.borrow_mut();
         s.readers -= 1;
         if s.readers == 0 && s.writers_waiting > 0 {
-            // Wake all queued write waiters. A single pop risks handing the
-            // baton to a stale waker from a cancelled WriteFuture, leaving
-            // every live write waiter permanently blocked.
-            let writers = std::mem::take(&mut s.write_waiters);
-            drop(s);
-            for w in writers {
-                w.wake();
-            }
+            wake_all(std::mem::take(&mut s.write_waiters), s);
         }
     }
 
     fn release_write(&self) {
         let mut s = self.inner.borrow_mut();
         s.has_writer = false;
-        // Writer-preference: wake all queued writers before any readers.
-        // A single pop risks handing the baton to a stale waker from a
-        // cancelled WriteFuture, leaving every live write waiter blocked.
-        let writers = std::mem::take(&mut s.write_waiters);
-        if !writers.is_empty() {
-            drop(s);
-            for w in writers {
-                w.wake();
-            }
-            return;
-        }
-        // No queued writer — wake all parked readers.
-        let readers = std::mem::take(&mut s.read_waiters);
-        drop(s);
-        for w in readers {
-            w.wake();
-        }
+        pass_baton(s);
     }
+}
+
+/// Drop the lock-state borrow, then wake. Waking re-enters the reactor's run
+/// queue and may drive a poll that borrows this state again, so the borrow must
+/// be gone first.
+fn wake_all(wakers: VecDeque<Waker>, state: RefMut<'_, RwLockInner>) {
+    drop(state);
+    for w in wakers {
+        w.wake();
+    }
+}
+
+/// Hand the lock on to whoever is next: queued writers first (writer
+/// preference), readers only when none remain. Wakes *all* candidates rather
+/// than one — a cancelled future can leave a stale waker in the queue, and
+/// handing the baton to that one alone would block every live waiter forever.
+/// On a single-threaded executor the thundering herd is free: the first task to
+/// poll acquires and the rest re-park.
+fn pass_baton(mut state: RefMut<'_, RwLockInner>) {
+    let writers = std::mem::take(&mut state.write_waiters);
+    if !writers.is_empty() {
+        return wake_all(writers, state);
+    }
+    let readers = std::mem::take(&mut state.read_waiters);
+    wake_all(readers, state);
 }
 
 impl Default for AsyncRwLock {
@@ -397,68 +397,44 @@ pub struct WriteFuture {
 impl Future for WriteFuture {
     type Output = WriteGuard;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<WriteGuard> {
-        let was_parked = self.parked;
+        // `lock` is a local clone, so borrowing through it does not alias
+        // `self` — the parked bookkeeping needs no dance around the borrow.
         let lock = Rc::clone(&self.lock);
         let mut s = lock.inner.borrow_mut();
         if !s.has_writer && s.readers == 0 {
             s.has_writer = true;
-            if was_parked {
+            if self.parked {
                 s.writers_waiting -= 1;
-                drop(s);
                 self.parked = false;
             }
-            return Poll::Ready(WriteGuard {
-                lock: Rc::clone(&self.lock),
-            });
+            return Poll::Ready(WriteGuard { lock: Rc::clone(&lock) });
         }
-        if !was_parked {
+        if !self.parked {
             s.writers_waiting += 1;
-            drop(s);
             self.parked = true;
-            push_unique_waker(&mut lock.inner.borrow_mut().write_waiters, cx.waker());
-        } else {
-            push_unique_waker(&mut s.write_waiters, cx.waker());
         }
+        push_unique_waker(&mut s.write_waiters, cx.waker());
         Poll::Pending
     }
 }
 
 impl Drop for WriteFuture {
     fn drop(&mut self) {
-        if self.parked {
-            let mut s = self.lock.inner.borrow_mut();
-            s.writers_waiting -= 1;
-            if s.has_writer {
-                // Another writer holds the lock; it passes the baton on release.
-                return;
-            }
-            if s.readers == 0 {
-                // Lock is completely free. Pass the baton: wake any remaining
-                // write waiters (some may be stale from prior cancellations;
-                // stale wakes are harmless, live ones will acquire), and fall
-                // through to read waiters only when no write waiters remain.
-                let writers = std::mem::take(&mut s.write_waiters);
-                if !writers.is_empty() {
-                    drop(s);
-                    for w in writers {
-                        w.wake();
-                    }
-                    return;
-                }
-                let readers = std::mem::take(&mut s.read_waiters);
-                drop(s);
-                for w in readers {
-                    w.wake();
-                }
-            } else if s.writers_waiting == 0 {
-                // Readers hold the lock; this was the last live write waiter.
-                // Readers blocked by `writers_waiting > 0` can now enter.
-                let readers = std::mem::take(&mut s.read_waiters);
-                drop(s);
-                for w in readers {
-                    w.wake();
-                }
-            }
+        if !self.parked {
+            return;
+        }
+        let mut s = self.lock.inner.borrow_mut();
+        s.writers_waiting -= 1;
+        if s.has_writer {
+            // Another writer holds the lock; it passes the baton on release.
+            return;
+        }
+        if s.readers == 0 {
+            pass_baton(s);
+        } else if s.writers_waiting == 0 {
+            // Readers hold the lock and this was the last live write waiter, so
+            // readers blocked by `writers_waiting > 0` can now enter.
+            wake_all(std::mem::take(&mut s.read_waiters), s);
         }
     }
 }
@@ -474,38 +450,8 @@ impl Drop for WriteGuard {
 }
 
 // ---------------------------------------------------------------------------
-// join2 / join_all
+// join_all
 // ---------------------------------------------------------------------------
-
-#[cfg(test)]
-pub async fn join2<A, B>(a: A, b: B) -> (A::Output, B::Output)
-where
-    A: Future,
-    B: Future,
-{
-    let mut a = Box::pin(a);
-    let mut b = Box::pin(b);
-    let mut a_out: Option<A::Output> = None;
-    let mut b_out: Option<B::Output> = None;
-    std::future::poll_fn(move |cx| {
-        if a_out.is_none() {
-            if let Poll::Ready(v) = a.as_mut().poll(cx) {
-                a_out = Some(v);
-            }
-        }
-        if b_out.is_none() {
-            if let Poll::Ready(v) = b.as_mut().poll(cx) {
-                b_out = Some(v);
-            }
-        }
-        if a_out.is_some() && b_out.is_some() {
-            Poll::Ready((a_out.take().unwrap(), b_out.take().unwrap()))
-        } else {
-            Poll::Pending
-        }
-    })
-    .await
-}
 
 /// Future driving `futs` to completion, writing values in input order
 /// into `out`. Both buffers are caller-supplied; no internal allocation

@@ -71,33 +71,23 @@ impl Reactor {
         // Cost: one try_consume call per worker per tick — just two Acquire
         // loads that return None when the ring is empty.
         if self.inner.futex_waitv_armed.get() {
-            let nw = self
-                .inner
-                .w2m
-                .get()
-                .expect("futex_waitv_armed=true but w2m not attached")
-                .num_workers();
-            for w in 0..nw {
-                self.drain_w2m_for_worker(w);
-            }
+            self.drain_all_w2m();
         }
 
         // 1. CQEs (no syscall — reads memory-mapped CQ).
         self.drain_cqes_into_wakers();
-        #[cfg(test)]
-        self.drain_injected_cqes();
         self.reap_closing_conns();
 
-        // 2. Drain the run queue. Swap into a thread-local scratch buffer
-        // so wakes during poll schedule for the *next* tick rather than
-        // re-entering this one. `Cell::take` releases any borrow before
-        // poll_task runs so waker_wake can push freely.
-        let mut buf = TICK_SCRATCH.with(|c| c.take());
+        // 2. Drain the run queue. Swap into the scratch buffer so wakes during
+        // poll schedule for the *next* tick rather than re-entering this one.
+        // `Cell::take` releases any borrow before poll_task runs so waker_wake
+        // can push freely.
+        let mut buf = self.inner.tick_scratch.take();
         self.inner.run_queue.borrow_mut().swap_into(&mut buf);
         for key in buf.drain(..) {
             self.poll_task(key);
         }
-        TICK_SCRATCH.with(|c| c.set(buf));
+        self.inner.tick_scratch.set(buf);
 
         // 3. Submit pending SQEs and optionally block until the next event.
         // Skip blocking when there is nothing to drive (slab empty) or when
@@ -146,17 +136,6 @@ impl Reactor {
             }
             for cqe in &buf[..n] {
                 self.dispatch_cqe(*cqe);
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn drain_injected_cqes(&self) {
-        loop {
-            let cqe = self.inner.injected_cqes.borrow_mut().pop_front();
-            match cqe {
-                Some(c) => self.dispatch_cqe(c),
-                None => break,
             }
         }
     }
