@@ -12,7 +12,7 @@ use std::rc::Rc;
 use super::batch::{write_to_batch, Batch, Layout};
 use super::bloom::BloomFilter;
 use super::merge::{self, SortedMemBatch};
-use crate::schema::key::pack_pk_be;
+use super::xor8;
 use crate::schema::SchemaDescriptor;
 
 /// Runs to accumulate before folding them into one. Bounds the cost of cursor
@@ -172,19 +172,16 @@ impl RunSet {
             }
             bloom
         });
-        bloom.may_contain(pack_pk_be(opk_key))
+        bloom.may_contain(xor8::probe_key(opk_key))
     }
 }
 
-/// Insert every row's PK into `bloom`, keyed by its leading ≤16 OPK bytes via
-/// `pack_pk_be` — the same derivation the probe side packs with, which is what
-/// keeps signed PKs consistent (their sign-flipped `get_pk` value would not be).
-/// Wide PKs (`pk_stride > 16`) hash their prefix: add and probe pack identically,
-/// so there is no false negative; two wide PKs sharing a 16-byte prefix collide
-/// to one slot, a false positive the run scan resolves.
+/// Insert every row's PK into `bloom`, keyed by [`xor8::probe_key`] — the same
+/// derivation the shard filter and this set's probe side use, so one PK maps to
+/// one key everywhere and no width or signedness produces a false negative.
 fn bloom_add_batch(bloom: &mut BloomFilter, batch: &Batch) {
     for i in 0..batch.count {
-        bloom.add(pack_pk_be(batch.get_pk_bytes(i)));
+        bloom.add(xor8::probe_key(batch.get_pk_bytes(i)));
     }
 }
 

@@ -67,10 +67,10 @@ pub(crate) fn pk_bytes_eq(a: &[u8], b: &[u8]) -> bool {
     compare_pk_ordering(a, b) == Ordering::Equal
 }
 
-/// `min <= key <= max` over OPK bytes. Every sorted row block — a memtable run,
-/// a RAM-tier run, a shard — gates its binary search on this first, so a key
-/// outside the block's bounds costs two `memcmp`s instead of a `log n` walk over
-/// cold cache lines.
+/// `min <= key <= max` over OPK bytes. The exact-match probes gate on this
+/// before searching, so a key outside a block's bounds costs two `memcmp`s
+/// instead of a `log n` walk over cold cache lines. The cursor's lower-bound
+/// seeks do not: they need a landing position on a miss, not a verdict.
 #[inline]
 pub(crate) fn pk_in_range(min: &[u8], max: &[u8], key: &[u8]) -> bool {
     compare_pk_bytes(min, key) != Ordering::Greater && compare_pk_bytes(key, max) != Ordering::Greater

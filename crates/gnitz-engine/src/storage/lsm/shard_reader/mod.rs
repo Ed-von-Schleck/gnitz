@@ -510,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn to_owned_batch_roundtrip() {
+    fn whole_shard_slice_roundtrip() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows: Vec<(u64, i64)> = (1..=10).map(|i| (i, i as i64 * 100)).collect();
@@ -519,7 +519,7 @@ mod tests {
         let cpath = std::ffi::CString::new(path).unwrap();
 
         let shard = MappedShard::open(&cpath, &schema, false).unwrap();
-        let batch = shard.to_owned_batch(&schema);
+        let batch = shard.slice_to_owned_batch(0, shard.count, &schema);
 
         assert_eq!(batch.count, 10);
         assert!(batch.is_sorted());
@@ -534,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn to_owned_batch_constant_regions() {
+    fn whole_shard_slice_constant_regions() {
         // All weights = 1 (Constant), all null = 0 (Constant), all vals = 42 (Constant)
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
@@ -547,7 +547,7 @@ mod tests {
         let cpath = std::ffi::CString::new(path).unwrap();
 
         let shard = MappedShard::open(&cpath, &schema, false).unwrap();
-        let batch = shard.to_owned_batch(&schema);
+        let batch = shard.slice_to_owned_batch(0, shard.count, &schema);
 
         assert_eq!(batch.count, n as usize);
         for i in 0..n as usize {
@@ -558,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn to_owned_batch_two_value_weight() {
+    fn whole_shard_slice_two_value_weight() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let n = 16usize;
@@ -570,7 +570,7 @@ mod tests {
         let cpath = std::ffi::CString::new(path).unwrap();
 
         let shard = MappedShard::open(&cpath, &schema, false).unwrap();
-        let batch = shard.to_owned_batch(&schema);
+        let batch = shard.slice_to_owned_batch(0, shard.count, &schema);
 
         assert_eq!(batch.count, n);
         for i in 0..n {
@@ -926,12 +926,12 @@ mod tests {
 
         // Surface 3 (slice_to_owned_batch / to_owned_batch): byte-identical
         // payload region against the control.
-        let pb = packed.to_owned_batch(&schema);
-        let rb = raw.to_owned_batch(&schema);
+        let pb = packed.slice_to_owned_batch(0, packed.count, &schema);
+        let rb = raw.slice_to_owned_batch(0, raw.count, &schema);
         let pbytes = pb.regions()[REG_PAYLOAD_START];
         let rbytes = rb.regions()[REG_PAYLOAD_START];
         assert_eq!(pbytes.len(), rbytes.len());
-        assert_eq!(pbytes, rbytes, "to_owned_batch payload region byte-identical");
+        assert_eq!(pbytes, rbytes, "whole-shard slice payload region byte-identical");
 
         // Surface 4 (to_unified): read the payload ColPtr per row.
         let pu = packed.to_unified(&schema);

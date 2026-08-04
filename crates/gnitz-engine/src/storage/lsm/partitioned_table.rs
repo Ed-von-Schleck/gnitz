@@ -654,9 +654,10 @@ mod tests {
 
     /// The I64 payload (logical column 1) of a positioned cursor's current row.
     fn cursor_val(c: &ReadCursor) -> i64 {
-        let ptr = c.col_ptr(1, 8);
-        assert!(!ptr.is_null(), "payload column 1 is present on a positioned row");
-        i64::from_le_bytes(unsafe { std::slice::from_raw_parts(ptr, 8) }.try_into().unwrap())
+        let cell = c
+            .col_bytes(1, 8)
+            .expect("payload column 1 is present on a positioned row");
+        i64::from_le_bytes(cell.try_into().unwrap())
     }
 
     #[test]
@@ -719,11 +720,11 @@ mod tests {
         // The whole-store answer for `key`: the live payload, or `None`.
         let whole = |pt: &PartitionedTable, key: &[u8]| -> Option<i64> {
             let mut c = pt.open_cursor();
-            c.seek_exact_live(key).then(|| cursor_val(&c))
+            c.advance_to_exact_live(key).then(|| cursor_val(&c))
         };
         let routed = |pt: &PartitionedTable, key: &[u8]| -> Option<i64> {
             let mut c = pt.open_cursor_for_key(key)?;
-            c.seek_exact_live(key).then(|| cursor_val(&c))
+            c.advance_to_exact_live(key).then(|| cursor_val(&c))
         };
         let keys: Vec<_> = (0u128..256)
             .chain(1000..1064)
@@ -843,7 +844,7 @@ mod tests {
             for &k in seq {
                 let key = opk(k);
                 let want = whole
-                    .seek_exact_live(key.pk_bytes())
+                    .advance_to_exact_live(key.pk_bytes())
                     .then(|| cursor_val(&whole))
                     .expect("every probed key was ingested");
                 let c = probe.probe(&pt, key.pk_bytes()).expect("all 256 partitions are local");
@@ -1147,7 +1148,7 @@ mod tests {
         pt.ingest_owned_batch(make_wide_batch(&schema, &rows)).unwrap();
         for pk in &pks {
             let mut c = pt.open_cursor_for_key(pk).expect("every key routes to a live child");
-            assert!(c.seek_exact_live(pk), "wide key {pk:?} must survive the ingest");
+            assert!(c.advance_to_exact_live(pk), "wide key {pk:?} must survive the ingest");
         }
     }
 

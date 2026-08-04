@@ -19,7 +19,7 @@
 //! * `hook_*` — side-effectful handlers that create directories, allocate store
 //!   partitions, register DAG entries, or backfill derived state. Storage is
 //!   applied before hooks fire, so the register/cascade hooks reconcile against
-//!   the row's *net* live state (`seek_exact_live`) rather than its own sign — a
+//!   the row's *net* live state (`advance_to_exact_live`) rather than its own sign — a
 //!   rename pair (net-live before and after) fires neither teardown nor
 //!   re-registration, in any row order, on every application path.
 //!
@@ -100,6 +100,10 @@ pub(crate) use crate::storage::BatchBuilder;
 // ---------------------------------------------------------------------------
 // CatalogEngine
 // ---------------------------------------------------------------------------
+
+/// Rows per `drain_chunk` call on a DDL scan (index/view backfill, unique
+/// pre-flight). Bounds peak backfill memory at O(chunk × row_width).
+pub(crate) const DDL_SCAN_CHUNK_ROWS: usize = 65_536;
 
 /// The catalog engine wraps DagEngine and manages the entity registry,
 /// system tables, DDL operations, and hook processing.
@@ -186,10 +190,10 @@ pub struct CatalogEngine {
     pub(crate) ctx: ApplyContext,
 
     /// Rows per `drain_chunk` call in DDL backfills and the unique pre-flight
-    /// scan. Defaults to `DDL_SCAN_CHUNK_ROWS`; lives on the engine (not a
-    /// parameter) because the backfills are invoked from hooks, which tests
-    /// can only reach through `submit` — they shrink this field instead to
-    /// exercise chunk boundaries.
+    /// scan. Defaults to [`DDL_SCAN_CHUNK_ROWS`]; lives on the engine rather
+    /// than being a parameter because the backfills are invoked from hooks,
+    /// which tests can only reach through `submit` — they shrink this field
+    /// instead to exercise chunk boundaries.
     pub(crate) ddl_scan_chunk_rows: usize,
 
     /// Per-worker distinct-group cap for the ad-hoc aggregate fold

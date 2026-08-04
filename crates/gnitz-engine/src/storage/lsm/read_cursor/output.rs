@@ -120,7 +120,7 @@ impl ReadCursor {
     /// once the cursor is exhausted / nothing drained. Single owner of the
     /// drain → scatter → flag pipeline shared by `materialize` and
     /// `drain_chunk`.
-    pub(crate) fn drain_to_batch(&mut self, limit: usize) -> Option<Batch> {
+    pub(super) fn drain_to_batch(&mut self, limit: usize) -> Option<Batch> {
         if !self.valid {
             return None;
         }
@@ -153,17 +153,17 @@ impl ReadCursor {
     /// Materialize all non-zero-weight rows in merge order into an owned
     /// `Rc<Batch>`.
     pub(crate) fn materialize(mut self) -> Rc<Batch> {
-        // Deliberately `sources.len() == 1`, not `SourceMode::Single`: this arm
-        // hands out the whole source by `Rc::clone`, so it needs the stronger
-        // precondition that there is no other source to have skipped rows.
-        if self.sources.len() == 1 && self.states[0].position == 0 {
-            match &self.sources[0] {
-                Run::Mem(rc) if rc.consolidated_verified(&self.schema) => {
+        // Sharing the backing `Rc` requires the whole source: no second source to
+        // have skipped rows, nothing consumed at the front, and no range seek
+        // clamping the back.
+        if self.sources.len() == 1
+            && self.valid
+            && self.current_row == 0
+            && self.states[0].count == self.sources[0].count()
+        {
+            if let Run::Mem(rc) = &self.sources[0] {
+                if rc.consolidated_verified(&self.schema) {
                     return Rc::clone(rc);
-                }
-                Run::Mem(_) => {}
-                Run::Shard(rc) => {
-                    return Rc::new(rc.to_owned_batch(&self.schema));
                 }
             }
         }
@@ -201,9 +201,10 @@ impl ReadCursor {
         if !self.valid {
             return None;
         }
-        let state = &self.states[i];
-        let start = state.position;
-        let remaining = state.count - start;
+        // The undrained window starts at the committed row: the drive that
+        // emitted it already stepped `position` past it.
+        let start = self.current_row;
+        let remaining = self.states[i].count - start;
         let row_count = if limit > 0 { remaining.min(limit) } else { remaining };
         let schema = &self.schema;
 
@@ -243,30 +244,15 @@ impl ReadCursor {
         self.sources.iter().map(|s| s.blob().len()).sum()
     }
 
-    /// Current row's `(entry_idx, row, weight)`. Unlike `push_current_row`, applies
-    /// no validity / zero-weight filter — a caller scanning under a `valid` guard
-    /// tags each row with an external group id and filters weight itself.
+    /// Current row's `(entry_idx, row, weight)` — the coordinate
+    /// `scatter_drained_into` resolves. Applies no validity or zero-weight
+    /// filter; the caller scans under a `valid` guard and filters itself.
     pub(crate) fn current_row_loc(&self) -> (u32, u32, i64) {
         (
             self.current_entry_idx as u32,
             self.current_row as u32,
             self.current_weight,
         )
-    }
-
-    /// Append the cursor's current `(entry_idx, row, weight)` to `buf` if the
-    /// row is valid and has non-zero weight. Companion to `drain_sorted_into`
-    /// for callers whose termination condition is custom (group-bounded or
-    /// predicate-filtered).
-    pub(crate) fn push_current_row(&self, buf: &mut Vec<(u32, u32, i64)>) {
-        if !self.valid {
-            return;
-        }
-        let w = self.current_weight;
-        if w == 0 {
-            return;
-        }
-        buf.push((self.current_entry_idx as u32, self.current_row as u32, w));
     }
 
     /// Walk the merge order and fill `out` with `(entry_idx, row_idx, weight)`
@@ -303,7 +289,7 @@ impl ReadCursor {
                 out.push((self.current_entry_idx as u32, self.current_row as u32, w));
                 count += 1;
             }
-            self.advance_with(row_cmp);
+            self.drive_with(row_cmp);
         }
     }
 

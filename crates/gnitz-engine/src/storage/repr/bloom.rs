@@ -1,7 +1,15 @@
-use crate::foundation::xxh;
-
 const BITS_PER_KEY: usize = 10;
 const NUM_PROBES: usize = 7;
+
+/// The bit positions `key` probes. `key` is already a well-mixed 64-bit
+/// fingerprint (`xor8::probe_key`), so no further hashing happens here; the two
+/// derived hashes are the standard double-hashing pair.
+#[inline]
+fn probes(key: u64, num_bits: u64) -> impl Iterator<Item = u64> {
+    let h2 = (key >> 32) | 1;
+    let mask = num_bits - 1;
+    (0..NUM_PROBES as u64).map(move |i| key.wrapping_add(i.wrapping_mul(h2)) & mask)
+}
 
 pub(crate) struct BloomFilter {
     bits: Vec<u8>,
@@ -24,45 +32,37 @@ impl BloomFilter {
     }
 
     #[inline]
-    pub fn add(&mut self, key: u128) {
-        let h = xxh::hash_u128(key);
-        let h1 = h;
-        let h2 = (h >> 32) | 1;
-        let mask = self.num_bits - 1;
-        for i in 0..NUM_PROBES as u64 {
-            let pos = h1.wrapping_add(i.wrapping_mul(h2)) & mask;
+    pub fn add(&mut self, key: u64) {
+        for pos in probes(key, self.num_bits) {
             self.bits[(pos >> 3) as usize] |= 1u8 << (pos & 7);
         }
     }
 
     #[inline]
-    pub fn may_contain(&self, key: u128) -> bool {
-        let h = xxh::hash_u128(key);
-        let h1 = h;
-        let h2 = (h >> 32) | 1;
-        let mask = self.num_bits - 1;
-        for i in 0..NUM_PROBES as u64 {
-            let pos = h1.wrapping_add(i.wrapping_mul(h2)) & mask;
-            if self.bits[(pos >> 3) as usize] & (1u8 << (pos & 7)) == 0 {
-                return false;
-            }
-        }
-        true
+    pub fn may_contain(&self, key: u64) -> bool {
+        probes(key, self.num_bits).all(|pos| self.bits[(pos >> 3) as usize] & (1u8 << (pos & 7)) != 0)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::repr::xor8::probe_key;
+
+    /// Keys are derived exactly as production derives them — from a PK's OPK
+    /// bytes — so these exercise the real fingerprint, not raw counters.
+    fn key(i: u64) -> u64 {
+        probe_key(&i.to_be_bytes())
+    }
 
     #[test]
     fn no_false_negatives() {
         let mut bf = BloomFilter::new(100);
         for i in 0u64..100 {
-            bf.add(i as u128);
+            bf.add(key(i));
         }
         for i in 0u64..100 {
-            assert!(bf.may_contain(i as u128), "false negative for key {i}");
+            assert!(bf.may_contain(key(i)), "false negative for key {i}");
         }
     }
 
@@ -70,11 +70,11 @@ mod tests {
     fn false_positive_rate() {
         let mut bf = BloomFilter::new(1000);
         for i in 0u64..1000 {
-            bf.add(i as u128);
+            bf.add(key(i));
         }
         let mut fp = 0u32;
         for i in 10_000u64..11_000 {
-            if bf.may_contain(i as u128) {
+            if bf.may_contain(key(i)) {
                 fp += 1;
             }
         }
@@ -87,43 +87,52 @@ mod tests {
         let bf = BloomFilter::new(100);
         let mut fp = 0u32;
         for i in 0u64..100 {
-            if bf.may_contain(i as u128) {
+            if bf.may_contain(key(i)) {
                 fp += 1;
             }
         }
         assert_eq!(fp, 0);
     }
 
-    // All existing tests use `i as u128` with small i, so upper 64 bits are
-    // always zero.  Verify the filter works for keys with significant upper bits
-    // — hash_u128 encodes both halves, so this exercises a different hash path.
+    /// Wide PKs (`> 16` OPK bytes) that share a 16-byte prefix must still be
+    /// distinct keys, and each must be found.
     #[test]
-    fn no_false_negatives_high_bits() {
-        let base: u128 = 0xDEAD_BEEF_0000_0000_0000_0000u128;
+    fn wide_pks_sharing_a_prefix_are_distinct_keys() {
+        let wide = |tail: u64| {
+            let mut k = [0u8; 24];
+            k[..16].copy_from_slice(&0xABCD_1234_5678_9ABCu64.to_be_bytes().repeat(2));
+            k[16..].copy_from_slice(&tail.to_be_bytes());
+            k
+        };
         let mut bf = BloomFilter::new(100);
         for i in 0u64..100 {
-            bf.add(base | i as u128);
+            bf.add(probe_key(&wide(i)));
         }
         for i in 0u64..100 {
-            assert!(bf.may_contain(base | i as u128), "false negative for high-bit key {i}");
+            assert!(bf.may_contain(probe_key(&wide(i))), "false negative for wide key {i}");
         }
+        let distinct: std::collections::HashSet<u64> = (0u64..100).map(|i| probe_key(&wide(i))).collect();
+        assert_eq!(
+            distinct.len(),
+            100,
+            "a shared 16-byte prefix must not collapse the keys"
+        );
     }
 
-    // Keys differing only in upper bits must not collide with lower-bit-only keys.
+    /// PKs differing only in their high bytes must not collide with PKs that
+    /// differ only in their low bytes.
     #[test]
-    fn high_bit_keys_distinct_from_low_bit_keys() {
+    fn high_byte_keys_distinct_from_low_byte_keys() {
         let mut bf = BloomFilter::new(200);
-        let hi_base: u128 = 0x0102_0304_0000_0000_0000_0000u128;
         for i in 0u64..100 {
-            bf.add(hi_base | i as u128);
+            bf.add(key(i << 40));
         }
-        // Keys with only low bits set were never added; FPR should be low.
         let mut fp = 0u32;
         for i in 0u64..100 {
-            if bf.may_contain(i as u128) {
+            if bf.may_contain(key(i)) {
                 fp += 1;
             }
         }
-        assert!(fp < 10, "too many false positives for low-bit keys: {fp}/100");
+        assert!(fp < 10, "too many false positives for low-byte keys: {fp}/100");
     }
 }

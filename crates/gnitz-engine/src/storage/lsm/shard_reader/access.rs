@@ -364,11 +364,6 @@ impl MappedShard {
         batch
     }
 
-    /// Bulk-copy all rows into an Batch.
-    pub(crate) fn to_owned_batch(&self, schema: &crate::schema::SchemaDescriptor) -> super::super::batch::Batch {
-        self.slice_to_owned_batch(0, self.count, schema)
-    }
-
     /// Derive a `UnifiedSource` view over this shard: each `ScalarRegion` becomes
     /// a `(base, stride)` `ColPtr` into the shard's mmap, with `Constant` regions
     /// mapped to `stride == 0` so `base.add(ri * stride) == base` reads the same

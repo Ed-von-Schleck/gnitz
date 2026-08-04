@@ -143,7 +143,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
 
 #[test]
 fn index_rebuilds_across_chunk_boundary() {
-    let n: usize = crate::storage::DDL_SCAN_CHUNK_ROWS + 3;
+    let n: usize = crate::catalog::DDL_SCAN_CHUNK_ROWS + 3;
     let dir = temp_dir("reopen_rebuild_chunked");
 
     let mut engine = CatalogEngine::open(&dir).unwrap();

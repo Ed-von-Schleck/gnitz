@@ -55,7 +55,7 @@ pub(crate) use lsm::partitioned_table::partial_flush_lsn_fixture;
 pub(crate) use lsm::partitioned_table::PartitionProbe;
 #[cfg(test)]
 pub(crate) use lsm::read_cursor::REWIND_CALLS;
-pub(crate) use lsm::read_cursor::{DrainGuard, ReadCursor, DDL_SCAN_CHUNK_ROWS};
+pub(crate) use lsm::read_cursor::{DrainGuard, ReadCursor};
 pub(crate) use lsm::spill::{KeyProducer, SpillSort};
 pub(crate) use merge::{relocate_german_string_vec, BlobCache, BlobCacheGuard, DirectWriter, RowComparator};
 

@@ -249,6 +249,9 @@ pub fn op_reduce(
     // Hoist replay batch outside the group loop: reuse the allocation across groups
     // rather than allocating and dropping once per group (can be 100k+ times per epoch).
     let mut replay = (!all_linear && avi.is_none()).then(|| Batch::with_capacity(*input_schema, 32));
+    // Same reasoning for the replay branch's trace-row scratch: one guard for the
+    // whole epoch, cleared per group, rather than a thread-local round-trip each.
+    let mut trace_rows = DrainGuard::new();
 
     // Single-scan trace gather for the non-linear, non-PK, no-index fallback.
     // Replaces the per-group full-trace rescan (O(groups × trace)) with one
@@ -517,14 +520,10 @@ pub fn op_reduce(
         let capped = (idx - group_start_pos) > SKIP_TRACK_CAP;
 
         // Retraction: read old value from trace_out, keyed by the group's output
-        // PK (`out_pk_bytes`). A monotone visit order gallops with `advance_to`
-        // seeded at the live position; a hashed group key's order need not match
-        // trace_out storage order, so it keeps the absolute `seek_bytes`.
-        if monotone_out_pk {
-            trace_out_cursor.advance_to(out_pk_bytes);
-        } else {
-            trace_out_cursor.seek_bytes(out_pk_bytes);
-        }
+        // PK (`out_pk_bytes`). `advance_to` seeds each source's search at its live
+        // position, so a monotone visit order sweeps forward; a hashed group key
+        // visits out of order, which costs the skip but not correctness.
+        trace_out_cursor.advance_to(out_pk_bytes);
         let has_old = trace_out_cursor.valid && trace_out_cursor.current_pk_eq(out_pk_bytes);
 
         if has_old {
@@ -607,7 +606,7 @@ pub fn op_reduce(
                 let delta_indices: &[u32] =
                     &sorted_indices.as_deref().expect("replay path materializes the order")[group_start_pos..idx];
 
-                let mut trace_rows = DrainGuard::new();
+                trace_rows.clear();
 
                 if let Some(ti_cursor) = trace_in.as_deref_mut() {
                     if group_by_pk {
@@ -616,7 +615,9 @@ pub fn op_reduce(
                         // galloping `advance_to`.
                         ti_cursor.advance_to(group_pk_bytes);
                         ti_cursor.for_each_pk_group_row(group_pk_bytes, |c| {
-                            c.push_current_row(&mut trace_rows);
+                            if c.current_weight != 0 {
+                                trace_rows.push(c.current_row_loc());
+                            }
                         });
                     } else {
                         // The pre-pass clustered this group's trace rows; this

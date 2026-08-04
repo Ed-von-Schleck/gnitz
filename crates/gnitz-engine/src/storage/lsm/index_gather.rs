@@ -175,7 +175,6 @@ pub(crate) struct BoundedIndexCursor {
     /// first, then each chunk's exclusive upper bound in turn.
     start: PkBuf,
     end: Option<PkBuf>,
-    done: bool,
     pks: Vec<PkBuf>,
     spec: IndexKeySpec,
     src_schema: SchemaDescriptor,
@@ -198,13 +197,12 @@ impl BoundedIndexCursor {
         src_schema: SchemaDescriptor,
         pk_capacity: usize,
     ) -> Self {
-        idx.seek_bytes(start.pk_bytes());
+        idx.seek_range_bytes(start.pk_bytes(), end.as_ref().map(PkBuf::pk_bytes));
         BoundedIndexCursor {
             idx,
             src,
             start,
             end,
-            done: false,
             pks: Vec::with_capacity(pk_capacity),
             spec,
             src_schema,
@@ -220,25 +218,20 @@ impl BoundedIndexCursor {
     /// use between chunks. It must be the store `src` was built over.
     pub(crate) fn drain_chunk(&mut self, store: &PartitionedTable, n: usize) -> Option<Batch> {
         self.pks.clear();
-        while !self.done && self.idx.valid && self.pks.len() < n {
-            let cur = self.idx.current_pk_bytes();
-            if self.end.as_ref().is_some_and(|e| cur >= e.pk_bytes()) {
-                self.done = true;
-                break;
-            }
+        // `new` clamped the cursor at `end`, so exhaustion IS the range bound.
+        while self.idx.valid && self.pks.len() < n {
             // The gate is `> 0` on the CONSOLIDATED merge group, not a per-entry
             // presence test: an UPDATE of an indexed column retracts the old index
             // entry and inserts the new one, so a range spanning both values sees
             // the old key at net weight 0 and collects the source PK exactly once.
             if self.idx.current_weight > 0 {
+                let cur = self.idx.current_pk_bytes();
                 self.pks.push(PkBuf::from_bytes(self.spec.split_entry(cur).1));
             }
             self.idx.advance();
         }
         // The walk's verdict, never the gather's: the loop exits with `pks` empty
-        // only when the index cursor is past `end` or invalid (every other
-        // iteration either pushes or steps over a non-positive entry). Monotone —
-        // `done` never clears — so a `None` is final.
+        // only once the index cursor is exhausted, so a `None` here is final.
         if self.pks.is_empty() {
             return None;
         }
@@ -249,12 +242,7 @@ impl BoundedIndexCursor {
         // each chunk to exactly the entries it collected makes each row pass the
         // filter in the one chunk that collected its entry — chunked and
         // unchunked drains yield identical multisets by construction.
-        let hi: Option<PkBuf> = if self.idx.valid
-            && self
-                .end
-                .as_ref()
-                .is_none_or(|e| self.idx.current_pk_bytes() < e.pk_bytes())
-        {
+        let hi: Option<PkBuf> = if self.idx.valid {
             Some(PkBuf::from_bytes(self.idx.current_pk_bytes()))
         } else {
             self.end

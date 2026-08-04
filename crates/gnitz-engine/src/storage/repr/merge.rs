@@ -474,15 +474,26 @@ impl<'a> ColumnarSource for MemBatch<'a> {
 /// ghost-free by construction (shards are verified at open; `SortedMemBatch`
 /// runs are consolidated), so advancing is a bare `position + 1` and
 /// `drive_merge`'s net-weight fold drops any cross-source zero.
-struct PosCursor {
-    position: usize,
-    count: usize,
+///
+/// `count` is the walk's upper bound, which need not be the source's row count:
+/// a read cursor's range seek clamps it to the range's exclusive end so the walk
+/// simply exhausts at the cut.
+pub(crate) struct PosCursor {
+    pub(crate) position: usize,
+    pub(crate) count: usize,
 }
 
 impl PosCursor {
     #[inline]
-    fn is_valid(&self) -> bool {
+    pub(crate) fn is_valid(&self) -> bool {
         self.position < self.count
+    }
+
+    /// Step past the current row. Callers advance only a position they have
+    /// established is valid (the merge drivers advance the heap root).
+    #[inline]
+    pub(crate) fn advance(&mut self) {
+        self.position += 1;
     }
 }
 
@@ -757,7 +768,7 @@ fn run_merge_body<S, RowCmp>(
         less,
         |src| {
             // Advance (sources are ghost-free) and report validity.
-            cursors[src].position += 1;
+            cursors[src].advance();
             cursors[src].is_valid().then(|| cursors[src].position as u32)
         },
         same_pk,

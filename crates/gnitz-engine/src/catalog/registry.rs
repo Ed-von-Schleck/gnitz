@@ -51,17 +51,15 @@ impl CatalogEngine {
         let start_pk = pack_column_id(owner_id, 0);
         let end_pk = pack_column_id(owner_id + 1, 0);
         let mut cursor = self.sys_store(SysFamily::Column).open_cursor();
-        // sys_columns has a single U64 PK; OPK == big-endian.
-        cursor.seek_bytes(&start_pk.to_be_bytes());
+        // sys_columns has a single U64 PK; OPK == big-endian. The range clamp
+        // exhausts the cursor at `end_pk`, so the walk needs no bound test.
+        cursor.seek_range_bytes(&start_pk.to_be_bytes(), Some(&end_pk.to_be_bytes()));
 
         let mut defs = Vec::new();
         let mut expected: i64 = 0;
         while cursor.valid {
-            let pk = cursor.current_key_narrow() as u64;
-            if pk >= end_pk {
-                break;
-            }
             if cursor.current_weight > 0 {
+                let pk = cursor.current_key_narrow() as u64;
                 if check_contiguity {
                     let actual = gnitz_wire::unpack_col_id(pk).1 as i64;
                     if actual != expected {

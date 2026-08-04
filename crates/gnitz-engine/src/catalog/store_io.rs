@@ -532,12 +532,9 @@ fn copy_cursor_cols_to_batch(cursor: &ReadCursor, out: &mut Batch, proj: &[(usiz
         if gnitz_wire::null_word_get(src_null, pi) {
             gnitz_wire::null_word_set(&mut proj_null, k, true);
         }
-        let ptr = cursor.col_ptr(ci, col_size);
-        if !ptr.is_null() {
-            let data = unsafe { std::slice::from_raw_parts(ptr, col_size) };
-            out.extend_col(k, data);
-        } else {
-            out.fill_col_zero(k, col_size);
+        match cursor.col_bytes(ci, col_size) {
+            Some(data) => out.extend_col(k, data),
+            None => out.fill_col_zero(k, col_size),
         }
     }
     out.extend_null_bmp(&proj_null.to_le_bytes());

@@ -10,7 +10,7 @@
 //! A single proptest that iterates over `(type codes, PK arity, payload shape,
 //! column interleaving)` instead of fixing them sweeps every PK-width arm
 //! (narrow `≤ 16`, non-power-of-two narrow `6/10/12`, wide `> 16`), both read
-//! paths (the `full_scan` byte-merge cursor and the direct `to_owned_batch`
+//! paths (the `full_scan` byte-merge cursor and the direct `slice_to_owned_batch`
 //! shard decode), and the non-prefix `payload_mapping` renumbering in one place.
 
 use std::collections::HashMap;
@@ -238,7 +238,7 @@ proptest! {
             // A durable flush synchronously commits exactly one on-disk shard.
             prop_assert_eq!(shards.len(), 1);
             // Direct shard decode: on-disk region layout + wide-PK Raw guard.
-            let owned = shards[0].to_owned_batch(&schema);
+            let owned = shards[0].slice_to_owned_batch(0, shards[0].count, &schema);
             prop_assert_eq!(&expected, &zset_of(&owned, &schema));
         } else {
             // A sub-ceiling ephemeral flush writes no shard; rows live in

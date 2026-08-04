@@ -257,7 +257,7 @@ pub(crate) fn sys_opk(schema: &SchemaDescriptor, pk: u128) -> crate::schema::key
 pub(crate) fn retract_single_row(table: &Table, schema: &SchemaDescriptor, pk: u128) -> Batch {
     let mut batch = Batch::with_capacity(*schema, 1);
     let mut cursor = table.open_cursor();
-    if cursor.seek_exact_live(sys_opk(schema, pk).pk_bytes()) {
+    if cursor.advance_to_exact_live(sys_opk(schema, pk).pk_bytes()) {
         cursor.copy_current_row_into(&mut batch, -1);
     }
     batch

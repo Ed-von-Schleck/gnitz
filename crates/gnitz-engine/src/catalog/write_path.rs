@@ -213,7 +213,7 @@ impl CatalogEngine {
     /// needs the row materialized into a `Batch` before `compare_rows`.
     fn seek_live_sys_row(&self, family: SysFamily, pk_bytes: &[u8]) -> Option<(Batch, i64)> {
         let mut cursor = self.sys_store(family).open_cursor();
-        if !cursor.seek_exact_live(pk_bytes) {
+        if !cursor.advance_to_exact_live(pk_bytes) {
             return None;
         }
         let w = cursor.current_weight;
@@ -733,7 +733,7 @@ impl CatalogEngine {
             }
             let (owner_id, cols) = {
                 let mut cursor = self.sys_store(SysFamily::Index).open_cursor();
-                if !cursor.seek_exact_live(sys_opk(&schema, idx_id as u128).pk_bytes()) {
+                if !cursor.advance_to_exact_live(sys_opk(&schema, idx_id as u128).pk_bytes()) {
                     continue;
                 }
                 let (owner_id, cols, _) = read_idx_tab_cursor_row(&cursor);

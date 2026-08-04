@@ -53,39 +53,63 @@ pub(crate) struct LoserTree {
     /// `n.next_power_of_two().max(1)` and never resizes after build, so
     /// the walk-up arithmetic uses it directly as `n_pad`.
     tree: Vec<HeapNode>,
+    /// Subtree champions, scratch for [`rebuild`](Self::rebuild). Retained
+    /// rather than allocated per rebuild: a read cursor re-runs the tournament
+    /// on every absolute reposition, always at the same `n`.
+    winners: Vec<HeapNode>,
+    /// Source count the tournament was built for; `tree`/`winners` are sized
+    /// from it and neither resizes.
+    n: usize,
 }
 
 impl LoserTree {
-    /// Bottom-up tournament build. O(n) compares, with a transient
-    /// `winners` array of `2 * n_pad` HeapNodes that is dropped before
-    /// return. Build cost is one-time and ≪1µs at typical k.
-    ///
-    /// A pure sequential walk-up build (no auxiliary array) is tempting
-    /// for code-sharing with the hot path, but it cannot distinguish
-    /// "sentinel cur travelling up because the padding leaf produced
-    /// nothing" from "sentinel cur travelling up because a real source
-    /// just became a placeholder lower in the tree": both look identical
-    /// to the walk yet require opposite handling at higher internal
-    /// nodes. The bottom-up scheme makes the subtree-winner explicit
-    /// and avoids the ambiguity.
+    /// Buffers for a tournament over `n` sources, with every leaf a sentinel —
+    /// an empty tree until [`rebuild`](Self::rebuild) plays it.
+    pub fn empty(n: usize) -> Self {
+        // `source_idx`/`row` are `u32`. Sources `< u32::MAX` (the sentinel) and
+        // rows-per-source `< 2^32` — fail loudly if a caller ever violates it.
+        debug_assert!(n < u32::MAX as usize, "loser tree: source count must be < u32::MAX");
+        let n_pad = n.next_power_of_two().max(1);
+        Self {
+            tree: vec![SENTINEL_NODE; n_pad],
+            winners: vec![SENTINEL_NODE; 2 * n_pad],
+            n,
+        }
+    }
+
+    /// Allocate a tournament over `n` sources and play it. Callers that
+    /// re-tournament the same sources (a read cursor, on every reposition) build
+    /// once and then call [`rebuild`](Self::rebuild), which reuses both buffers.
     pub fn build(
         n: usize,
         init_fn: impl Fn(usize) -> Option<u32>,
         less: impl Fn(&HeapNode, &HeapNode) -> bool,
     ) -> Self {
-        // `source_idx`/`row` are `u32`. Sources `< u32::MAX` (the sentinel) and
-        // rows-per-source `< 2^32` — fail loudly if a caller ever violates it.
-        debug_assert!(n < u32::MAX as usize, "loser tree: source count must be < u32::MAX");
-        let n_pad = n.next_power_of_two().max(1);
-        let mut tree = vec![SENTINEL_NODE; n_pad];
+        let mut this = Self::empty(n);
+        this.rebuild(init_fn, less);
+        this
+    }
 
-        // winners[idx] holds the current champion of the subtree rooted
-        // at `idx`. Leaves live at indices `n_pad..2*n_pad`; for `i < n`
-        // with a live row, leaf `n_pad + i` carries the source's `(i, row)`.
-        let mut winners = vec![SENTINEL_NODE; 2 * n_pad];
-        for i in 0..n {
+    /// Re-play the tournament over the same `n` sources at their current rows,
+    /// reusing both buffers. O(n) compares, no allocation.
+    ///
+    /// A pure sequential walk-up rebuild (no auxiliary array) is tempting for
+    /// code-sharing with the hot path, but it cannot distinguish "sentinel cur
+    /// travelling up because the padding leaf produced nothing" from "sentinel
+    /// cur travelling up because a real source just became a placeholder lower
+    /// in the tree": both look identical to the walk yet require opposite
+    /// handling at higher internal nodes. The bottom-up scheme makes the
+    /// subtree-winner explicit and avoids the ambiguity.
+    pub fn rebuild(&mut self, init_fn: impl Fn(usize) -> Option<u32>, less: impl Fn(&HeapNode, &HeapNode) -> bool) {
+        let n_pad = self.tree.len();
+        // winners[idx] holds the current champion of the subtree rooted at
+        // `idx`. Leaves live at `n_pad..2*n_pad`; for `i < n` with a live row,
+        // leaf `n_pad + i` carries the source's `(i, row)`. Only the leaves need
+        // clearing — every internal slot is written by the match loop below.
+        self.winners[n_pad..].fill(SENTINEL_NODE);
+        for i in 0..self.n {
             if let Some(row) = init_fn(i) {
-                winners[n_pad + i] = HeapNode {
+                self.winners[n_pad + i] = HeapNode {
                     source_idx: i as u32,
                     row,
                 };
@@ -96,8 +120,8 @@ impl LoserTree {
         // subtree winners. Loser → tree[idx]; winner → winners[idx],
         // propagated up to the next match.
         for idx in (1..n_pad).rev() {
-            let a = winners[2 * idx];
-            let b = winners[2 * idx + 1];
+            let a = self.winners[2 * idx];
+            let b = self.winners[2 * idx + 1];
             let (winner, loser) = match (a.source_idx == SENTINEL, b.source_idx == SENTINEL) {
                 (true, _) => (b, a),
                 (_, true) => (a, b),
@@ -109,14 +133,13 @@ impl LoserTree {
                     }
                 }
             };
-            winners[idx] = winner;
-            tree[idx] = loser;
+            self.winners[idx] = winner;
+            self.tree[idx] = loser;
         }
 
         // For n_pad == 1 (n ∈ {0, 1}), the loop above is empty and
         // winners[1] is the leaf value (or sentinel for n=0).
-        tree[0] = winners[1];
-        Self { tree }
+        self.tree[0] = self.winners[1];
     }
 
     #[inline]
@@ -138,8 +161,10 @@ impl LoserTree {
     /// which (in two of three callsites) indexes `cursors[cur.source_idx]`
     /// and panics on `usize::MAX`.
     ///
-    /// `inline(always)` so the closure flattens into the public-API
-    /// callers; a hot path with one cmp per level cannot afford a call.
+    /// `inline(always)` so this flattens into the public-API callers, which run
+    /// one comparison per tournament level. (The comparator itself is a separate
+    /// question — `merge_less`'s body is large enough that LLVM leaves it
+    /// out-of-line.)
     #[inline(always)]
     fn walk_up(&mut self, mut cur: HeapNode, mut idx: usize, less: &impl Fn(&HeapNode, &HeapNode) -> bool) -> HeapNode {
         while idx > 0 {

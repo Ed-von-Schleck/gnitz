@@ -33,7 +33,7 @@ impl CatalogEngine {
     //   * `hook_*`   — side-effectful handlers that build directories, allocate
     //     partitions, register DAG entries, or backfill derived state. Storage
     //     is applied before hooks fire, so the register/cascade hooks gate on
-    //     the row's *net* live state (`seek_exact_live`) rather than its own
+    //     the row's *net* live state (`advance_to_exact_live`) rather than its own
     //     sign: a rename pair (net-live before and after) fires no teardown and
     //     no re-registration, in any row order, on every application path.
     //
@@ -154,7 +154,7 @@ impl CatalogEngine {
     /// at boot replay (where a rename pair has folded to net `+1`, no `-1`
     /// surviving) and to a multi-op recovery batch on one id.
     fn sys_pk_is_live(&self, family: SysFamily, pk_bytes: &[u8]) -> bool {
-        self.sys_store(family).open_cursor().seek_exact_live(pk_bytes)
+        self.sys_store(family).open_cursor().advance_to_exact_live(pk_bytes)
     }
 
     /// Fold a `sys_sequences` advance into the in-memory `user_sequences` map.
