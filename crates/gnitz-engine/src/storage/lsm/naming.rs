@@ -17,7 +17,15 @@ pub(super) fn spill_shard_name(table_id: u32, lsn: u64) -> String {
 /// finalizing rename from clobbering a live shard. Collision-free against the
 /// flat grammar: a spill name has no `_L` segment.
 pub(super) fn compact_shard_name(table_id: u32, compact_seq: u64, level_num: usize, guard_key: u128) -> String {
-    format!("shard_{table_id}_{compact_seq}_L{level_num}_G{guard_key}.db")
+    let name = format!("shard_{table_id}_{compact_seq}_L{level_num}_G{guard_key}.db");
+    // The grammar's worst case (~84 bytes) is well inside the manifest's 128-byte
+    // filename field, which is the binding limit — a basename that overflows it
+    // reloads as an unopenable shard.
+    debug_assert!(
+        name.len() < 128,
+        "compaction basename overflows the manifest field: {name}"
+    );
+    name
 }
 
 /// Remove every one of `table_id`'s shard files in `dir` whose basename is not

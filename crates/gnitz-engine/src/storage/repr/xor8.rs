@@ -4,7 +4,10 @@ use xorf::{Filter, Xor8};
 const MAGIC: &[u8; 4] = b"GXF1";
 const HEADER_SIZE: usize = 4 + 8 + 4 + 4; // magic + seed + block_length + fp_count
 
-/// Derive the XOR8 membership fingerprint for one PK's OPK byte region.
+/// The XOR8 filter key for one PK's OPK byte region — the single derivation both
+/// the build side (`build_xor8_from_pk_region`) and the probe side
+/// (`ShardEntry::probe_pk_bytes`) call, so a probe key is always identical to the
+/// one inserted at build time.
 ///
 /// Narrow keys (`≤ 16` OPK bytes) right-align their order-preserving big-endian
 /// bytes into a `u128` via `widen_pk_be`; wide keys (`> 16` bytes — a compound
@@ -12,22 +15,17 @@ const HEADER_SIZE: usize = 4 + 8 + 4 + 4; // magic + seed + block_length + fp_co
 /// filter is keyed by the full logical PK, so this keeps the entire entropy —
 /// it is deliberately *not* `partition_for_pk_bytes`, which reduces the same two
 /// hashes to a top-8-bit bucket index.
-///
-/// This is the single derivation the build side ([`build`], via
-/// `build_xor8_from_pk_region`) and the probe side (`ShardEntry::probe_pk_bytes`)
-/// both call, so a probe fingerprint is always byte-identical to the one
-/// inserted at build time.
 #[inline]
-pub(crate) fn fingerprint(opk: &[u8]) -> u128 {
-    if opk.len() > 16 {
+pub(crate) fn probe_key(opk: &[u8]) -> u64 {
+    let fingerprint = if opk.len() > 16 {
         xxh::checksum(opk) as u128
     } else {
         gnitz_wire::widen_pk_be(opk, opk.len())
-    }
+    };
+    xxh::hash_u128(fingerprint)
 }
 
-/// Build an Xor8 filter from `hash_u128(fingerprint)` keys (the derivation the
-/// probe side [`may_contain`] applies). Returns None if the input is empty.
+/// Build an Xor8 filter from [`probe_key`] keys. Returns None if the input is empty.
 ///
 /// The XOR filter's hypergraph peeling fails (hang/panic) on duplicate keys,
 /// so the keys are sorted and deduplicated first — this also collapses
@@ -42,10 +40,9 @@ pub(crate) fn build(mut keys: Vec<u64>) -> Option<Xor8> {
     Some(Xor8::from(keys.as_slice()))
 }
 
-/// Check if a key may be present in the filter.
-pub(crate) fn may_contain(filter: &Xor8, key: u128) -> bool {
-    let h = xxh::hash_u128(key);
-    filter.contains(&h)
+/// Check whether a [`probe_key`] may be present in the filter.
+pub(crate) fn may_contain(filter: &Xor8, probe_key: u64) -> bool {
+    filter.contains(&probe_key)
 }
 
 /// Serialize an Xor8 filter to bytes.
@@ -102,10 +99,14 @@ pub(crate) fn serialized_size(filter: &Xor8) -> usize {
 mod tests {
     use super::*;
 
-    /// Test-side wrapper matching the production derivation: hash each u128
-    /// fingerprint and build from the hashed keys.
+    /// Drives the raw-fingerprint half of the key derivation directly;
+    /// `probe_key` covers the OPK-bytes half.
+    fn key_u128(k: u128) -> u64 {
+        xxh::hash_u128(k)
+    }
+
     fn build_u128(pks: &[u128]) -> Option<Xor8> {
-        build(pks.iter().map(|&k| xxh::hash_u128(k)).collect())
+        build(pks.iter().copied().map(key_u128).collect())
     }
 
     #[test]
@@ -113,7 +114,7 @@ mod tests {
         let pks: Vec<u128> = (0u128..1000).collect();
         let filter = build_u128(&pks).unwrap();
         for &pk in &pks {
-            assert!(may_contain(&filter, pk), "false negative for key {pk}");
+            assert!(may_contain(&filter, key_u128(pk)), "false negative for key {pk}");
         }
     }
 
@@ -123,7 +124,7 @@ mod tests {
         let filter = build_u128(&pks).unwrap();
         let mut fp = 0u32;
         for i in 10_000u128..20_000 {
-            if may_contain(&filter, i) {
+            if may_contain(&filter, key_u128(i)) {
                 fp += 1;
             }
         }
@@ -134,8 +135,8 @@ mod tests {
     #[test]
     fn small_set() {
         let filter = build_u128(&[100u128, 200]).unwrap();
-        assert!(may_contain(&filter, 100));
-        assert!(may_contain(&filter, 200));
+        assert!(may_contain(&filter, key_u128(100)));
+        assert!(may_contain(&filter, key_u128(200)));
     }
 
     #[test]
@@ -152,7 +153,7 @@ mod tests {
 
         for &pk in &pks {
             assert!(
-                may_contain(&restored, pk),
+                may_contain(&restored, key_u128(pk)),
                 "roundtrip false negative for key {pk:#034x}",
             );
         }
@@ -212,7 +213,7 @@ mod tests {
         let pks: [u128; 5] = [0, 1, u64::MAX as u128, (u64::MAX as u128) + 1, u128::MAX];
         let filter = build_u128(&pks).unwrap();
         for &pk in &pks {
-            assert!(may_contain(&filter, pk), "false negative for pk {pk:#034x}");
+            assert!(may_contain(&filter, key_u128(pk)), "false negative for pk {pk:#034x}");
         }
     }
 }

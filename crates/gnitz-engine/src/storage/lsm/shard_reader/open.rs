@@ -4,11 +4,13 @@
 
 use std::ffi::CStr;
 
-use super::super::super::repr::batch::{strides_from_schema, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+use super::super::batch::{
+    strides_from_schema, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
+};
 use super::super::error::StorageError;
 use super::super::layout::*;
 use super::super::xor8;
-use super::{MappedShard, Mmap, PackedRegion, PayloadRegion, ScalarRegion, WeightRegion};
+use super::{MappedShard, Mmap, PackedRegion, PayloadRegion, RegionView, WeightRegion};
 use crate::foundation::xxh;
 use gnitz_wire::{read_i64_le, read_u64_le};
 
@@ -38,7 +40,6 @@ impl MappedShard {
         let count = read_u64_le(data, OFF_ROW_COUNT) as usize;
         let dir_off = read_u64_le(data, OFF_DIR_OFFSET) as usize;
 
-        let num_cols = schema.num_columns();
         let pk_stride = schema.pk_stride();
         // Writer↔reader region-layout contract, shared with
         // `write_shard_streaming`: `strides` holds each fixed-width region's
@@ -96,127 +97,86 @@ impl MappedShard {
             }
         }
 
-        // Validate Raw region sizes up front: to_unified
-        // read `count × stride` bytes and must not overrun.
-        for (i, e) in entries.iter().take(nr).enumerate() {
-            if e.encoding == ENCODING_RAW && e.size < count * strides[i] as usize {
+        // Normalize a fixed-width region to its `(offset, stride)` view, with the
+        // size check that lets every accessor read `stride`-wide elements without
+        // re-validating: Raw must carry `count` of them, Constant exactly one
+        // (`stride == 0` then makes every row read that one). Only the weight
+        // region may be TwoValue, so a forged TwoValue here is rejected at this
+        // decode site instead of being asserted-against at every accessor.
+        let direct_region = |e: &DirEntry, elem_width: usize| -> Result<RegionView, StorageError> {
+            let (stride, needed) = match e.encoding {
+                ENCODING_RAW => (elem_width, count * elem_width),
+                ENCODING_CONSTANT => (0, elem_width.min(count * elem_width)),
+                _ => return Err(StorageError::InvalidShard),
+            };
+            if e.size < needed {
                 return Err(StorageError::InvalidShard);
             }
-        }
-
-        // Decode each region. Only the weight region may use the TwoValue
-        // encoding, so a forged TwoValue on a scalar region (pk / null_bmp /
-        // payload) is rejected at its decode site (`build_scalar_region`)
-        // instead of being asserted-against at every per-row accessor.
-        let read_const_value = |e: &DirEntry| -> [u8; 16] {
-            let mut value = [0u8; 16];
-            if e.size > 0 {
-                let copy_len = e.size.min(16);
-                value[..copy_len].copy_from_slice(&data[e.offset..e.offset + copy_len]);
-            }
-            value
+            Ok(RegionView {
+                offset: e.offset,
+                stride,
+            })
         };
-        let build_scalar_region = |e: &DirEntry| -> Result<ScalarRegion, StorageError> {
-            match e.encoding {
-                ENCODING_RAW => Ok(ScalarRegion::Raw {
+        // Payload columns are the sole `ENCODING_FOR`-eligible role, and only for
+        // fixed-int types — the FoR codec widens whole integer cells, so a forged
+        // FoR byte on a STRING or float column would drive `decode_for_region`
+        // past its `bw < 8` contract. `elem_width` is the region's per-element
+        // width (which also bounds `bw` for a FoR region).
+        let build_payload_region =
+            |e: &DirEntry, elem_width: usize, type_code: u8| -> Result<PayloadRegion, StorageError> {
+                if e.encoding != ENCODING_FOR {
+                    return direct_region(e, elem_width).map(PayloadRegion::Direct);
+                }
+                if !gnitz_wire::is_fixed_int(type_code) {
+                    return Err(StorageError::InvalidShard);
+                }
+                // Decoder panic / OOB surface — these three checks make
+                // `decode_for_region` pure arithmetic over in-bounds slices:
+                // (1) count > 0 guards the divisor (the writer never emits an
+                // empty FoR region — n == 0 short-circuits to Raw of size 0);
+                // (2) size >= 8 guards the `size − 8` subtraction against a
+                // truncated entry; (3) an exact `size == 8 + count·bw` with
+                // `1 <= bw < elem_width` rejects trailing / short bytes.
+                if count == 0 || e.size < 8 {
+                    return Err(StorageError::InvalidShard);
+                }
+                let bw = (e.size - 8) / count;
+                if bw < 1 || bw >= elem_width || e.size != 8 + count * bw {
+                    return Err(StorageError::InvalidShard);
+                }
+                Ok(PayloadRegion::Packed(PackedRegion {
                     offset: e.offset,
                     size: e.size,
-                }),
-                ENCODING_CONSTANT => Ok(ScalarRegion::Constant {
-                    value: read_const_value(e),
-                    offset: e.offset,
-                }),
-                _ => Err(StorageError::InvalidShard),
-            }
-        };
-        // Payload columns are the sole `ENCODING_FOR`-eligible role; every other
-        // encoding decodes exactly as a pk / null scalar region. `stride` is the
-        // region's per-element width (validates `bw < stride` for a FoR region).
-        let build_payload_region = |e: &DirEntry, stride: usize| -> Result<PayloadRegion, StorageError> {
-            if e.encoding != ENCODING_FOR {
-                return build_scalar_region(e).map(PayloadRegion::Scalar);
-            }
-            // Decoder panic / OOB surface — these three checks make
-            // `decode_for_region` pure arithmetic over in-bounds slices:
-            // (1) count > 0 guards the divisor (the writer never emits an
-            // empty FoR region — n == 0 short-circuits to Raw of size 0);
-            // (2) size >= 8 guards the `size − 8` subtraction against a
-            // truncated entry; (3) an exact `size == 8 + count·bw` with
-            // `1 <= bw < stride` rejects trailing / short bytes.
-            if count == 0 || e.size < 8 {
-                return Err(StorageError::InvalidShard);
-            }
-            let bw = (e.size - 8) / count;
-            if bw < 1 || bw >= stride || e.size != 8 + count * bw {
-                return Err(StorageError::InvalidShard);
-            }
-            Ok(PayloadRegion::Packed(PackedRegion {
-                offset: e.offset,
-                size: e.size,
-                elem_width: stride,
-                decoded: std::cell::OnceCell::new(),
-            }))
-        };
-        let build_weight_region = |e: &DirEntry| -> Result<WeightRegion, StorageError> {
-            match e.encoding {
-                ENCODING_CONSTANT => Ok(WeightRegion::Constant {
-                    value: read_const_value(e),
-                }),
-                ENCODING_TWO_VALUE => {
-                    let expected_bitvec = count.div_ceil(8);
-                    if e.size < 16 + expected_bitvec {
-                        return Err(StorageError::InvalidShard);
-                    }
-                    Ok(WeightRegion::TwoValue {
-                        value_a: read_i64_le(data, e.offset),
-                        value_b: read_i64_le(data, e.offset + 8),
-                        bitvec_off: e.offset + 16,
-                    })
-                }
-                ENCODING_RAW => Ok(WeightRegion::Raw { offset: e.offset }),
-                // The weight region's legal set is Raw/Constant/TwoValue; anything
-                // else (e.g. a forged ENCODING_FOR) is rejected.
-                _ => Err(StorageError::InvalidShard),
-            }
-        };
-
-        let pk = build_scalar_region(&entries[REG_PK])?;
-        let weight = build_weight_region(&entries[REG_WEIGHT])?;
-        let null_bmp = build_scalar_region(&entries[REG_NULL_BMP])?;
-
-        // Wide PK must be Raw: a Constant region holds only a 16-byte `value`,
-        // so `get_pk_bytes` would slice `&value[..stride]` out of bounds. The
-        // writer never emits Constant for a wide PK (wide strides stay Raw by
-        // construction), so this is defense-in-depth against a corrupt or
-        // forged file.
-        if pk_stride as usize > gnitz_wire::NARROW_PK_MAX_BYTES && !matches!(pk, ScalarRegion::Raw { .. }) {
-            return Err(StorageError::InvalidShard);
-        }
-
-        // Shards are ghost-free by construction: flush persists the memtable's
-        // consolidated net-state run and compaction's merge drops net-zero
-        // groups, so no writer ever emits a weight-0 row. Debug builds verify
-        // (the normal open path skips checksums, so this doubles as a cheap
-        // bit-rot canary on the weight region).
-        #[cfg(debug_assertions)]
-        {
-            let ghost = match &weight {
-                WeightRegion::Raw { offset, .. } => (0..count).any(|i| read_i64_le(data, offset + i * 8) == 0),
-                WeightRegion::Constant { value } => {
-                    count > 0 && i64::from_le_bytes(value[..8].try_into().unwrap()) == 0
-                }
-                WeightRegion::TwoValue { value_a, value_b, .. } => *value_a == 0 || *value_b == 0,
+                    elem_width,
+                    decoded: std::cell::OnceCell::new(),
+                }))
             };
-            debug_assert!(!ghost, "shard contains weight-0 rows; every writer consolidates");
-        }
+        let build_weight_region = |e: &DirEntry| -> Result<WeightRegion, StorageError> {
+            if e.encoding == ENCODING_TWO_VALUE {
+                if e.size < 16 + count.div_ceil(8) {
+                    return Err(StorageError::InvalidShard);
+                }
+                return Ok(WeightRegion::TwoValue {
+                    value_a: read_i64_le(data, e.offset),
+                    value_b: read_i64_le(data, e.offset + 8),
+                    bitvec_off: e.offset + 16,
+                });
+            }
+            direct_region(e, FIXED_REGION_BYTES).map(WeightRegion::Direct)
+        };
+
+        let pk = direct_region(&entries[REG_PK], pk_stride as usize)?;
+        let weight = build_weight_region(&entries[REG_WEIGHT])?;
+        let null_bmp = direct_region(&entries[REG_NULL_BMP], FIXED_REGION_BYTES)?;
 
         let mut col_regions = Vec::with_capacity(nr - REG_PAYLOAD_START);
-        let mut reg_idx = REG_PAYLOAD_START;
-        for ci in 0..num_cols {
-            if !schema.is_pk_col(ci) {
-                col_regions.push(build_payload_region(&entries[reg_idx], strides[reg_idx] as usize)?);
-                reg_idx += 1;
-            }
+        for (pi, col) in schema.payload_columns() {
+            let reg_idx = REG_PAYLOAD_START + pi;
+            col_regions.push(build_payload_region(
+                &entries[reg_idx],
+                strides[reg_idx] as usize,
+                col.type_code,
+            )?);
         }
 
         // The blob region is always Raw; reject any other (forged) encoding.

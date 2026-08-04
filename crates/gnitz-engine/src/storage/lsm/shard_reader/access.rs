@@ -1,47 +1,33 @@
-//! Hot per-row accessors for [`MappedShard`]: the self-describing
-//! [`ScalarRegion`] / [`WeightRegion`] reads (`get_pk_bytes`, `get_weight`, `get_null_word`,
-//! `get_col_ptr`, …), the XOR8 probe, the OPK binary-search helpers, and the
-//! bulk `*_owned_batch` materializers. All `#[inline]`; the comparators read
-//! every stride/offset straight off the mapped regions.
+//! Per-row accessors for [`MappedShard`] — the region reads, the XOR8 probe and
+//! the OPK binary searches — plus the bulk `*_owned_batch` materializers.
 
 use std::ptr;
 
 use super::super::batch::{FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::super::merge::{relocate_german_string_vec, BlobCacheGuard, ColPtr, UnifiedSource};
 use super::super::xor8;
-use super::{MappedShard, PackedRegion, PayloadRegion, ScalarRegion, WeightRegion};
+use super::{MappedShard, PackedRegion, PayloadRegion, RegionView, WeightRegion};
 use crate::schema::key::PkBuf;
 use crate::schema::{SchemaDescriptor, MAX_COLUMNS};
 use gnitz_wire::{read_i64_le, read_u64_le};
 
-impl ScalarRegion {
-    /// This region as a uniform `(base, stride)` [`ColPtr`]: `Raw` points into
-    /// `data_ptr` at its mmap offset with the given `stride`; `Constant` points
-    /// at its inline value with `stride: 0`, so `base.add(i*stride) == base`
-    /// reads the same bytes for every row with no per-row branch. The one
-    /// Raw/Constant→`ColPtr` conversion behind `pk_col_ptr` and `to_unified`.
+impl RegionView {
+    /// This region as a [`ColPtr`]. A constant region already carries
+    /// `stride == 0`, so `base.add(i * stride) == base` reads the same element
+    /// for every row with no per-row branch.
     #[inline]
-    fn to_col_ptr(&self, data_ptr: *const u8, stride: usize) -> ColPtr {
-        match self {
-            ScalarRegion::Raw { offset, .. } => ColPtr {
-                base: unsafe { data_ptr.add(*offset) },
-                stride,
-            },
-            ScalarRegion::Constant { value, .. } => ColPtr {
-                base: value.as_ptr(),
-                stride: 0,
-            },
+    fn to_col_ptr(self, data_ptr: *const u8) -> ColPtr {
+        ColPtr {
+            base: unsafe { data_ptr.add(self.offset) },
+            stride: self.stride,
         }
     }
 }
 
 impl MappedShard {
-    /// `#[inline(always)]`: every accessor below funnels through this one-liner,
-    /// and at `opt-level=0` the plain hint is a no-op — so leaving it on the hint
-    /// doubles the frame count of a shard cell read in the debug binary the E2E
-    /// suite runs. (The multi-arm accessors themselves deliberately keep the
-    /// plain hint; inlining a 3-arm match with a formatted `debug_assert!` into
-    /// every call site is not obviously a win.)
+    /// `inline(always)` rather than the plain hint: every accessor below funnels
+    /// through this, and the plain hint is a no-op at `opt-level=0` — the debug
+    /// binary the E2E suite runs would pay a frame per shard cell read.
     #[inline(always)]
     pub(crate) fn data(&self) -> &[u8] {
         self.mmap.as_slice()
@@ -65,36 +51,19 @@ impl MappedShard {
             .as_bytes()
     }
 
-    // The value accessor: production reads PK regions as raw OPK bytes
-    // (`get_pk_bytes`); only tests recover the native value via `get_pk`.
+    // Production reads PK regions as raw OPK bytes (`get_pk_bytes`); only tests
+    // need the native value back.
     #[cfg(test)]
     #[inline(always)]
     pub(crate) fn get_pk(&self, row: usize) -> u128 {
-        let stride = self.pk_stride as usize;
-        let data = self.data();
-        match &self.pk {
-            ScalarRegion::Raw { offset, .. } => {
-                let src = &data[offset + row * stride..offset + row * stride + stride];
-                gnitz_wire::widen_pk_be(src, stride)
-            }
-            // The Constant region stores the OPK bytes left-aligned at
-            // `value[..stride]`. `widen_pk_be` right-aligns the active bytes,
-            // recovering the native unsigned value (sign-flipped for signed).
-            ScalarRegion::Constant { value, .. } => gnitz_wire::widen_pk_be(&value[..stride], stride),
-        }
+        let width = self.pk_stride as usize;
+        gnitz_wire::widen_pk_be(self.get_pk_bytes(row), width)
     }
 
     #[inline]
     pub fn get_pk_bytes(&self, row: usize) -> &[u8] {
-        let stride = self.pk_stride as usize;
-        let data = self.data();
-        match &self.pk {
-            ScalarRegion::Raw { offset, .. } => &data[offset + row * stride..offset + row * stride + stride],
-            // value is [u8; 16]; stride <= 16 is guaranteed by the constructor.
-            // When ScalarRegion::Constant is widened to hold larger values,
-            // this arm must be updated alongside it.
-            ScalarRegion::Constant { value, .. } => &value[..stride],
-        }
+        let width = self.pk_stride as usize;
+        &self.data()[self.pk.row_off(row)..][..width]
     }
 
     /// `(pk_min, pk_max)` OPK bounds for this shard, in `self.pk_stride`-wide
@@ -117,8 +86,7 @@ impl MappedShard {
     #[inline]
     pub fn get_weight(&self, row: usize) -> i64 {
         match &self.weight {
-            WeightRegion::Raw { offset, .. } => read_i64_le(self.data(), offset + row * 8),
-            WeightRegion::Constant { value } => i64::from_le_bytes(value[..8].try_into().unwrap()),
+            WeightRegion::Direct(v) => read_i64_le(self.data(), v.row_off(row)),
             WeightRegion::TwoValue {
                 value_a,
                 value_b,
@@ -136,95 +104,16 @@ impl MappedShard {
 
     #[inline]
     pub fn get_null_word(&self, row: usize) -> u64 {
-        match &self.null_bmp {
-            ScalarRegion::Raw { offset, .. } => read_u64_le(self.data(), offset + row * 8),
-            ScalarRegion::Constant { value, .. } => u64::from_le_bytes(value[..8].try_into().unwrap()),
-        }
+        read_u64_le(self.data(), self.null_bmp.row_off(row))
     }
 
     #[inline]
     pub fn get_col_ptr(&self, row: usize, payload_col_idx: usize, col_size: usize) -> &[u8] {
         match &self.col_regions[payload_col_idx] {
-            PayloadRegion::Scalar(ScalarRegion::Raw { offset, size }) => {
-                let start = offset + row * col_size;
-                // Region size >= count * stride is validated once at open; the
-                // safe slice below still bounds-checks against the mmap.
-                debug_assert!(
-                    start + col_size <= offset + size,
-                    "get_col_ptr out of bounds: row={} payload_col={} col_size={} region_end={}",
-                    row,
-                    payload_col_idx,
-                    col_size,
-                    offset + size,
-                );
-                &self.data()[start..start + col_size]
-            }
-            PayloadRegion::Scalar(ScalarRegion::Constant { value, .. }) => &value[..col_size],
+            PayloadRegion::Direct(v) => &self.data()[v.row_off(row)..][..col_size],
             // `col_size == elem_width`; the decoded image serves the same
-            // `row * col_size` slice the Raw arm would.
-            PayloadRegion::Packed(p) => {
-                let start = row * col_size;
-                &self.packed_bytes(p)[start..start + col_size]
-            }
-        }
-    }
-
-    /// Get a raw pointer to a column value, indexed by *logical* column index
-    /// against `schema` (the shard's own schema — `SchemaDescriptor` already
-    /// caches the logical→payload mapping, so the shard carries none).
-    /// For the PK column, returns a pointer into the pk region (16 bytes).
-    /// Returns null for out-of-range column indices.
-    #[inline]
-    pub fn col_ptr_by_logical(
-        &self,
-        row: usize,
-        col_idx: usize,
-        col_size: usize,
-        schema: &crate::schema::SchemaDescriptor,
-    ) -> *const u8 {
-        if col_idx >= schema.num_columns() {
-            return ptr::null();
-        }
-        let base = self.mmap.as_ptr();
-        let Some(payload_idx) = schema.try_payload_idx(col_idx) else {
-            // PK column (pk_stride bytes)
-            match &self.pk {
-                ScalarRegion::Raw { offset, .. } => {
-                    let stride = self.pk_stride as usize;
-                    let off = offset + row * stride;
-                    if off + stride > self.mmap.len() {
-                        return ptr::null();
-                    }
-                    return unsafe { base.add(off) };
-                }
-                ScalarRegion::Constant { offset, .. } => {
-                    return unsafe { base.add(*offset) };
-                }
-            }
-        };
-        if payload_idx >= self.col_regions.len() {
-            return ptr::null();
-        }
-        match &self.col_regions[payload_idx] {
-            PayloadRegion::Scalar(ScalarRegion::Raw { offset, size }) => {
-                let off = offset + row * col_size;
-                if off + col_size > offset + size {
-                    return ptr::null();
-                }
-                unsafe { base.add(off) }
-            }
-            PayloadRegion::Scalar(ScalarRegion::Constant { offset, .. }) => unsafe { base.add(*offset) },
-            // Point into the decoded image (col_size == elem_width). The address
-            // is stable for the shard's lifetime, matching the mmap-pointer
-            // contract of the Raw/Constant arms.
-            PayloadRegion::Packed(p) => {
-                let bytes = self.packed_bytes(p);
-                let off = row * col_size;
-                if off + col_size > bytes.len() {
-                    return ptr::null();
-                }
-                unsafe { bytes.as_ptr().add(off) }
-            }
+            // `row * col_size` slice a direct region would.
+            PayloadRegion::Packed(p) => &self.packed_bytes(p)[row * col_size..][..col_size],
         }
     }
 
@@ -233,13 +122,17 @@ impl MappedShard {
         &self.data()[self.blob_off..self.blob_off + self.blob_len]
     }
 
-    pub fn has_xor8(&self) -> bool {
+    /// Test-only: distinguishes "no filter" from "filter admits it", which
+    /// [`xor8_may_contain`](Self::xor8_may_contain) deliberately cannot.
+    #[cfg(test)]
+    pub(crate) fn has_xor8(&self) -> bool {
         self.xor8_filter.is_some()
     }
 
-    pub fn xor8_may_contain(&self, key: u128) -> bool {
+    /// A shard carrying no filter admits every key.
+    pub fn xor8_may_contain(&self, probe_key: u64) -> bool {
         match &self.xor8_filter {
-            Some(filter) => xor8::may_contain(filter, key),
+            Some(filter) => xor8::may_contain(filter, probe_key),
             None => true,
         }
     }
@@ -262,20 +155,18 @@ impl MappedShard {
         lo
     }
 
-    /// The PK region as a uniform [`ColPtr`] view — the single addressing source
-    /// for the OPK seeks below (via [`ColPtr::row`]) and `to_unified`'s PK
-    /// column. The `Constant` arm's `stride: 0` lets the seek closures read every
-    /// probe through one branchless accessor, hoisting the Raw/Constant match out
-    /// of the search loop. The base aliases `self`; keep `self` alive while the
-    /// view is read (the seek closures run synchronously within the call).
+    /// The PK region as a [`ColPtr`] view — the addressing source for the OPK
+    /// seeks below (via [`ColPtr::row`]) and `to_unified`'s PK column. The base
+    /// aliases `self`; keep `self` alive while the view is read (the seek
+    /// closures run synchronously within the call).
     #[inline]
     fn pk_col_ptr(&self) -> ColPtr {
-        self.pk.to_col_ptr(self.data().as_ptr(), self.pk_stride as usize)
+        self.pk.to_col_ptr(self.data().as_ptr())
     }
 
-    /// First row whose OPK bytes are `>= key`. After the OPK-at-rest flip this
-    /// is a raw `memcmp` binary search — correct at every PK width with no
-    /// schema dependency. `key` must be exactly `pk_stride` OPK bytes.
+    /// First row whose OPK bytes are `>= key`. A raw `memcmp` binary search —
+    /// correct at every PK width with no schema dependency. `key` must be
+    /// exactly `pk_stride` OPK bytes.
     pub fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
         let stride = self.pk_stride as usize;
         let cp = self.pk_col_ptr();
@@ -355,21 +246,25 @@ impl MappedShard {
         // Write each region directly into its final slice — no intermediate
         // buffers. The Raw/Constant fill is shared by both expanders; only the
         // weight region can carry the TwoValue bitvec form.
-        let copy_raw = |offset: usize, stride: usize, dst: &mut [u8]| {
-            let begin = offset + start * stride;
-            dst.copy_from_slice(&shard[begin..begin + row_count * stride]);
+        let copy_raw = |begin: usize, width: usize, dst: &mut [u8]| {
+            dst.copy_from_slice(&shard[begin..begin + row_count * width]);
         };
-        let fill_const = |value: &[u8; 16], stride: usize, dst: &mut [u8]| {
-            for chunk in dst.chunks_exact_mut(stride) {
-                chunk.copy_from_slice(&value[..stride]);
+        let fill_const = |value: &[u8], dst: &mut [u8]| {
+            for chunk in dst.chunks_exact_mut(value.len()) {
+                chunk.copy_from_slice(value);
             }
         };
-        let expand_scalar = |region: &ScalarRegion, stride: usize, dst: &mut [u8]| match region {
-            ScalarRegion::Raw { offset, .. } => copy_raw(*offset, stride, dst),
-            ScalarRegion::Constant { value, .. } => fill_const(value, stride, dst),
+        // A constant region carries `stride == 0`, so it fills `dst` from its one
+        // element; anything else is a contiguous copy.
+        let expand_view = |v: &RegionView, width: usize, dst: &mut [u8]| {
+            if v.stride == 0 {
+                fill_const(&shard[v.offset..v.offset + width], dst)
+            } else {
+                copy_raw(v.row_off(start), width, dst)
+            }
         };
         let expand_payload = |region: &PayloadRegion, stride: usize, dst: &mut [u8]| match region {
-            PayloadRegion::Scalar(s) => expand_scalar(s, stride, dst),
+            PayloadRegion::Direct(v) => expand_view(v, stride, dst),
             // Payload strides equal `elem_width`, so the decoded image is
             // `count · stride` long.
             PayloadRegion::Packed(p) => {
@@ -378,8 +273,7 @@ impl MappedShard {
             }
         };
         let expand_weight = |region: &WeightRegion, dst: &mut [u8]| match region {
-            WeightRegion::Raw { offset, .. } => copy_raw(*offset, 8, dst),
-            WeightRegion::Constant { value } => fill_const(value, 8, dst),
+            WeightRegion::Direct(v) => expand_view(v, FIXED_REGION_BYTES, dst),
             WeightRegion::TwoValue {
                 value_a,
                 value_b,
@@ -398,13 +292,17 @@ impl MappedShard {
 
         let pk_stride = self.pk_stride as usize;
         let sz8 = row_count * 8;
-        expand_scalar(
+        expand_view(
             &self.pk,
             pk_stride,
             &mut data[offsets[REG_PK]..][..row_count * pk_stride],
         );
         expand_weight(&self.weight, &mut data[offsets[REG_WEIGHT]..][..sz8]);
-        expand_scalar(&self.null_bmp, 8, &mut data[offsets[REG_NULL_BMP]..][..sz8]);
+        expand_view(
+            &self.null_bmp,
+            FIXED_REGION_BYTES,
+            &mut data[offsets[REG_NULL_BMP]..][..sz8],
+        );
 
         for (pi, col) in schema.payload_columns() {
             // A relocated string column is written cell-by-cell below; filling it
@@ -487,8 +385,8 @@ impl MappedShard {
     pub(crate) fn to_unified(&self, schema: &SchemaDescriptor) -> UnifiedSource {
         let data_ptr = self.data().as_ptr();
 
-        let pk = self.pk.to_col_ptr(data_ptr, self.pk_stride as usize);
-        let null_bmp = self.null_bmp.to_col_ptr(data_ptr, FIXED_REGION_BYTES);
+        let pk = self.pk.to_col_ptr(data_ptr);
+        let null_bmp = self.null_bmp.to_col_ptr(data_ptr);
 
         let mut cols = [ColPtr {
             base: ptr::null(),
@@ -497,7 +395,7 @@ impl MappedShard {
         for (pi, col) in schema.payload_columns() {
             let cs = col.size() as usize;
             cols[pi] = match &self.col_regions[pi] {
-                PayloadRegion::Scalar(s) => s.to_col_ptr(data_ptr, cs),
+                PayloadRegion::Direct(v) => v.to_col_ptr(data_ptr),
                 // Decoded image (`cs == elem_width`), stable for the shard's
                 // lifetime; the caller already keeps `self` alive for the view.
                 PayloadRegion::Packed(p) => ColPtr {

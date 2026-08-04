@@ -1978,7 +1978,7 @@ mod tests {
             assert_eq!(shards.len(), 1, "barrier folds memtable + L0 into one shard");
             assert!(shards[0].has_xor8(), "barrier shard must carry the XOR8 filter");
             assert!(
-                shards[0].xor8_may_contain(100),
+                shards[0].xor8_may_contain(super::super::xor8::probe_key(&100u64.to_be_bytes())),
                 "XOR8 must contain a folded memtable PK"
             );
         }

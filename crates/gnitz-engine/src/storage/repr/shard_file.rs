@@ -222,7 +222,6 @@ fn encode_for_region(data: &[u8], stride: usize, signed: bool, n: usize) -> Opti
 /// `Box<[u64]>` so the bytes are 8-aligned (payload accessors hand out
 /// naturally-aligned pointers) and the address is stable for the owner's
 /// lifetime.
-#[derive(Clone)]
 pub(crate) struct DecodedRegion {
     words: Box<[u64]>,
     byte_len: usize,
@@ -306,7 +305,7 @@ fn build_xor8_from_pk_region(pk_bytes: &[u8], stride: usize) -> Option<Xor8> {
     // identity) are adjacent — skipping chunks byte-equal to their predecessor
     // is an O(n) pre-shrink that keeps `build`'s sort at d distinct keys
     // instead of n rows on duplicate-PK trace shards (MIN/MAX AggValueIndex).
-    // `xor8::fingerprint` owns the narrow/wide derivation the probe side must
+    // `xor8::probe_key` owns the narrow/wide derivation the probe side must
     // match exactly.
     let mut keys: Vec<u64> = Vec::with_capacity(pk_bytes.len() / stride);
     let mut prev: Option<&[u8]> = None;
@@ -315,7 +314,7 @@ fn build_xor8_from_pk_region(pk_bytes: &[u8], stride: usize) -> Option<Xor8> {
             continue;
         }
         prev = Some(chunk);
-        keys.push(xxh::hash_u128(xor8::fingerprint(chunk)));
+        keys.push(xor8::probe_key(chunk));
     }
     xor8::build(keys)
 }
@@ -398,6 +397,12 @@ fn write_shard_streaming_inner(
     let (strides, nr) = strides_from_schema(schema);
     let nr = nr as usize;
     debug_assert_eq!(num_regions, nr + 1, "region count must be 3 + num_payload_cols + 1");
+    // Shards are ghost-free by construction: flush persists the memtable's
+    // consolidated net-state run and compaction's merge drops net-zero groups.
+    debug_assert!(
+        !(0..n).any(|i| read_i64_le(regions[REG_WEIGHT], i * 8) == 0),
+        "shard writer got weight-0 rows; every producer consolidates first",
+    );
 
     // --- Phase 1: detect encodings and compute actual sizes ---
     let mut encodings: Vec<RegionEncoding> = Vec::with_capacity(num_regions);
@@ -659,9 +664,9 @@ mod tests {
         assert_eq!(shard.get_weight(1), 1);
         assert_eq!(shard.get_weight(2), 1);
         assert!(shard.has_xor8());
-        assert!(shard.xor8_may_contain(10));
-        assert!(shard.xor8_may_contain(20));
-        assert!(shard.xor8_may_contain(30));
+        assert!(shard.xor8_may_contain(xor8::probe_key(&10u64.to_be_bytes())));
+        assert!(shard.xor8_may_contain(xor8::probe_key(&20u64.to_be_bytes())));
+        assert!(shard.xor8_may_contain(xor8::probe_key(&30u64.to_be_bytes())));
     }
 
     #[test]
@@ -705,7 +710,10 @@ mod tests {
         }
         assert!(shard.has_xor8());
         for &pk in &pks {
-            assert!(shard.xor8_may_contain(pk as u128), "XOR8 must contain PK {pk}");
+            assert!(
+                shard.xor8_may_contain(xor8::probe_key(&pk.to_be_bytes())),
+                "XOR8 must contain PK {pk}"
+            );
         }
     }
 
@@ -914,7 +922,7 @@ mod tests {
         let f = build_xor8_from_pk_region(&pk_bytes, stride).expect("wide compound region must build a filter");
         for row in &rows {
             assert!(
-                xor8::may_contain(&f, crate::foundation::xxh::checksum(row) as u128),
+                xor8::may_contain(&f, xor8::probe_key(row)),
                 "no false negative for wide-region row"
             );
         }
@@ -932,7 +940,7 @@ mod tests {
             // Builder fingerprint for stride <= 16 is widen_pk_be(OPK bytes);
             // the probe must derive the same value.
             assert!(
-                xor8::may_contain(&f, gnitz_wire::widen_pk_be(row, stride)),
+                xor8::may_contain(&f, xor8::probe_key(row)),
                 "no false negative for narrow-compound row"
             );
         }
@@ -945,7 +953,7 @@ mod tests {
         let b64: Vec<u8> = pks64.iter().flat_map(|p| p.to_be_bytes()).collect();
         let f64 = build_xor8_from_pk_region(&b64, 8).expect("8-byte region must build a filter");
         for p in &pks64 {
-            assert!(xor8::may_contain(&f64, *p as u128));
+            assert!(xor8::may_contain(&f64, xor8::probe_key(&p.to_be_bytes())));
         }
 
         let pks128: Vec<u128> = vec![1, 1 << 64, u128::MAX, 12345];
@@ -953,7 +961,7 @@ mod tests {
         let b128: Vec<u8> = pks128.iter().flat_map(|p| p.to_be_bytes()).collect();
         let f128 = build_xor8_from_pk_region(&b128, 16).expect("16-byte region must build a filter");
         for p in &pks128 {
-            assert!(xor8::may_contain(&f128, *p));
+            assert!(xor8::may_contain(&f128, xor8::probe_key(&p.to_be_bytes())));
         }
     }
 }

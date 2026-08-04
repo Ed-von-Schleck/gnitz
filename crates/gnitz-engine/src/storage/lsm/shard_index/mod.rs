@@ -12,7 +12,6 @@ use std::rc::Rc;
 
 use super::error::StorageError;
 use super::shard_reader::MappedShard;
-use super::xor8;
 use crate::schema::key::PkBuf;
 use crate::schema::key::{compare_pk_bytes, pk_bytes_eq};
 use crate::schema::SchemaDescriptor;
@@ -20,17 +19,21 @@ use crate::schema::SchemaDescriptor;
 mod index;
 mod persist;
 
-/// PK range check over OPK bytes: `min <= key <= max`. After the OPK-at-rest
-/// flip the stored `pk_min`/`pk_max` and `key` are all order-preserving big-
-/// endian, so this is a raw `memcmp` at every PK width — no schema. `&[u8]` key
-/// so the `sort_by`/probe closures never copy the 81-byte `PkBuf` by value.
+/// PK range check over OPK bytes: `min <= key <= max`. All three operands are
+/// order-preserving big-endian, so this is a raw `memcmp` at every PK width — no
+/// schema. `&[u8]` key so the `sort_by`/probe closures never copy the 81-byte
+/// `PkBuf` by value.
 #[inline]
 fn pk_in_range(min: &PkBuf, max: &PkBuf, key: &[u8]) -> bool {
     compare_pk_bytes(min.pk_bytes(), key) != Ordering::Greater
         && compare_pk_bytes(key, max.pk_bytes()) != Ordering::Greater
 }
 
+/// Serialized level bound: level numbers run 0 (L0) ..= `FLSM_LEVELS`, and
+/// `load_manifest` rejects anything at or above `MAX_LEVELS`.
 const MAX_LEVELS: usize = 3;
+/// Guarded levels below L0 — L1 and L2.
+const FLSM_LEVELS: usize = MAX_LEVELS - 1;
 const L0_COMPACT_THRESHOLD: usize = 4;
 const GUARD_FILE_THRESHOLD: usize = 4;
 const LMAX_FILE_THRESHOLD: usize = 1;
@@ -49,11 +52,9 @@ pub struct ShardEntry {
 }
 
 impl ShardEntry {
-    // Derived from shard.count, never serialized. An empty shard must
-    // fail every range check; the old "min > max" (u128::MAX, 0)
-    // sentinel only worked for unsigned byte-lex and breaks under
-    // compare_pk_bytes for signed columns, so probe/sort short-circuit
-    // on this instead.
+    // An empty shard must fail every range check. A min > max sentinel cannot
+    // express that under `compare_pk_bytes` (it holds only for unsigned
+    // byte-lex), so probe/sort short-circuit on the row count instead.
     #[inline]
     fn is_empty(&self) -> bool {
         self.shard.count == 0
@@ -79,18 +80,16 @@ impl ShardEntry {
     }
 
     /// Probe this shard for a PK by its OPK `key` bytes (exactly `pk_stride`
-    /// wide). Universal across all PK widths after the OPK-at-rest flip: range
-    /// check, XOR8 fingerprint, and the binary search are all raw byte ops. The
-    /// `xor8::fingerprint` call is the same derivation the build side
-    /// (`build_xor8_from_pk_region`) used, so the probe matches what was inserted.
-    fn probe_pk_bytes(&self, key: &[u8]) -> Option<(Rc<MappedShard>, usize)> {
+    /// wide). `xor8_key` is `xor8::probe_key(key)` — the caller hoists it because
+    /// it is the same value for every shard in one sweep.
+    fn probe_pk_bytes(&self, key: &[u8], xor8_key: u64) -> Option<(Rc<MappedShard>, usize)> {
         if self.is_empty() {
             return None;
         }
         if !pk_in_range(&self.pk_min, &self.pk_max, key) {
             return None;
         }
-        if self.shard.has_xor8() && !self.shard.xor8_may_contain(xor8::fingerprint(key)) {
+        if !self.shard.xor8_may_contain(xor8_key) {
             return None;
         }
         let idx = self.shard.find_lower_bound_bytes(key);
@@ -129,24 +128,12 @@ impl FLSMLevel {
         (!self.guards.is_empty()).then(|| super::guard_slot(&self.guards, key, |g| g.guard_key))
     }
 
-    fn find_guards_for_range(&self, range_min: u128, range_max: u128) -> Vec<usize> {
+    /// The guards overlapping `[range_min, range_max]`. Guards partition the key
+    /// line, so the overlap is always a contiguous run — callers may `drain` it.
+    fn find_guards_for_range(&self, range_min: u128, range_max: u128) -> std::ops::Range<usize> {
         let start = self.find_guard_idx(range_min).unwrap_or(0);
-        let mut result = Vec::new();
-        for i in start..self.guards.len() {
-            let gk = self.guards[i].guard_key;
-            if gk > range_max {
-                break;
-            }
-            let next_gk = if i + 1 < self.guards.len() {
-                self.guards[i + 1].guard_key
-            } else {
-                u128::MAX
-            };
-            if next_gk > range_min {
-                result.push(i);
-            }
-        }
-        result
+        let end = self.guards.partition_point(|g| g.guard_key <= range_max);
+        start..end.max(start)
     }
 
     fn total_file_count(&self) -> usize {
@@ -214,6 +201,12 @@ mod tests {
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::make_schema_u64_i64;
     use gnitz_wire::as_le_bytes;
+
+    /// Derives the filter key the way the production sweep does, so no assertion
+    /// hand-spells a second version of it.
+    fn probe(e: &ShardEntry, key: &[u8]) -> Option<(Rc<MappedShard>, usize)> {
+        e.probe_pk_bytes(key, super::super::xor8::probe_key(key))
+    }
 
     /// Synthetic 2-column compound PK schema: (U64, U64) PK + I64
     /// payload. 16-byte PK region, but the column-aware comparison
@@ -566,29 +559,23 @@ mod tests {
         }
 
         // Range entirely within guard 0
-        let r = level.find_guards_for_range(10, 50);
-        assert_eq!(r, vec![0]);
+        assert_eq!(level.find_guards_for_range(10, 50), 0..1);
 
         // Range spanning guards 1 and 2
-        let r = level.find_guards_for_range(100, 250);
-        assert_eq!(r, vec![1, 2]);
+        assert_eq!(level.find_guards_for_range(100, 250), 1..3);
 
         // Range spanning all guards
-        let r = level.find_guards_for_range(0, 999);
-        assert_eq!(r, vec![0, 1, 2, 3]);
+        assert_eq!(level.find_guards_for_range(0, 999), 0..4);
 
         // Point query at exact guard boundary
-        let r = level.find_guards_for_range(200, 200);
-        assert_eq!(r, vec![2]);
+        assert_eq!(level.find_guards_for_range(200, 200), 2..3);
 
         // Range below all guards still hits guard 0 (partition_point - 1)
-        let r = level.find_guards_for_range(0, 0);
-        assert_eq!(r, vec![0]);
+        assert_eq!(level.find_guards_for_range(0, 0), 0..1);
 
         // No guards at all
         let empty = FLSMLevel::new();
-        let r = empty.find_guards_for_range(0, 100);
-        assert!(r.is_empty());
+        assert!(empty.find_guards_for_range(0, 100).is_empty());
     }
 
     #[test]
@@ -680,26 +667,17 @@ mod tests {
         assert_eq!(idx.max_lsn(), 200);
     }
 
+    /// A compaction that cannot write its output leaves L0 exactly as it was, so
+    /// the next trigger retries against intact inputs.
     #[test]
-    fn test_run_compact_fails_on_long_path_l0_intact() {
+    fn test_run_compact_failure_leaves_l0_intact() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
 
-        // Build an output dir long enough that output filenames exceed 255 bytes.
-        // Filename overhead: "/shard_42_N_L1_GN.db" ≈ 20 bytes, so out_dir >= 236 bytes.
-        // A 240-char subdir is within NAME_MAX (255) and guarantees the total overflows.
-        let long_subdir = "a".repeat(240);
-        let long_out_dir = dir.path().join(&long_subdir);
-        std::fs::create_dir_all(&long_out_dir).unwrap();
-        let long_out_str = long_out_dir.to_str().unwrap();
-        assert!(
-            long_out_str.len() >= 236,
-            "test setup: out_dir too short ({})",
-            long_out_str.len()
-        );
-
-        let mut idx = ShardIndex::new(42, long_out_str, schema);
+        // Output dir that does not exist: the finalizing write fails.
+        let missing_out_dir = dir.path().join("no_such_dir");
+        let mut idx = ShardIndex::new(42, missing_out_dir.to_str().unwrap(), schema);
 
         // Add L0_COMPACT_THRESHOLD + 1 shards (triggers compaction).
         let mut all_pks = Vec::new();
@@ -714,9 +692,8 @@ mod tests {
         let l0_before = idx.l0.len();
 
         let result = idx.run_compact();
-        assert!(result.is_err(), "expected Err when output path exceeds 255 bytes");
+        assert!(result.is_err(), "expected Err when the output shard cannot be written");
 
-        // L0 must be unchanged — atomicity fix ensures this.
         assert_eq!(idx.l0.len(), l0_before, "L0 must not be modified on failure");
 
         // A failed run_compact leaves l0 intact, so should_compact still holds.
@@ -730,9 +707,9 @@ mod tests {
         }
     }
 
-    /// Bug 1: When L1 guard at key=100 is vertically compacted into L2 that has
-    /// a guard at key=200, the routing must cover keys below 200 (the source
-    /// range's lower bound). Without the fix, keys 100-199 become unfindable.
+    /// An L1 guard at key=100 folded into an L2 that starts at key=200 must
+    /// route the keys below 200 — the source range's lower bound — or 100..199
+    /// become unfindable.
     #[test]
     fn test_compact_guard_vertical_routing_gap() {
         raise_fd_limit_for_tests();
@@ -1019,8 +996,7 @@ mod tests {
         assert!(!stray.exists(), "stray shard must be removed when index is empty");
     }
 
-    /// Single-PK regression: probe_pk range gate and L0 sort order are
-    /// identical to the pre-PkBuf u128 logic (golden values).
+    /// Golden values for the single-PK probe range gate and the L0 sort order.
     #[test]
     fn test_single_pk_probe_and_sort_golden() {
         raise_fd_limit_for_tests();
@@ -1034,13 +1010,10 @@ mod tests {
 
         // Range gate: in-range key passes (and resolves), out-of-range
         // key is pruned. OPK for a U64 PK is the value's big-endian bytes.
-        assert!(e_lo.probe_pk_bytes(&10u64.to_be_bytes()).is_some());
-        assert!(e_lo.probe_pk_bytes(&20u64.to_be_bytes()).is_some());
-        assert!(
-            e_lo.probe_pk_bytes(&25u64.to_be_bytes()).is_none(),
-            "25 outside [10,20]"
-        );
-        assert!(e_hi.probe_pk_bytes(&5u64.to_be_bytes()).is_none(), "5 below [30,40]");
+        assert!(probe(&e_lo, &10u64.to_be_bytes()).is_some());
+        assert!(probe(&e_lo, &20u64.to_be_bytes()).is_some());
+        assert!(probe(&e_lo, &25u64.to_be_bytes()).is_none(), "25 outside [10,20]");
+        assert!(probe(&e_hi, &5u64.to_be_bytes()).is_none(), "5 below [30,40]");
 
         // L0 sort orders by pk_min, empty entries last (golden order).
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -1071,8 +1044,8 @@ mod tests {
         let p = write_test_shard(dir.path(), "e_single.db", &[], &[]);
         let e = ShardEntry::open(&p, &single, 0).unwrap();
         assert!(e.is_empty());
-        assert!(e.probe_pk_bytes(&0u64.to_be_bytes()).is_none());
-        assert!(e.probe_pk_bytes(&u64::MAX.to_be_bytes()).is_none());
+        assert!(probe(&e, &0u64.to_be_bytes()).is_none());
+        assert!(probe(&e, &u64::MAX.to_be_bytes()).is_none());
 
         let compound = compound_schema();
         let pc = write_compound_shard(dir.path(), "e_compound.db", &[], &[]);
@@ -1080,7 +1053,7 @@ mod tests {
         assert!(ec.is_empty());
         assert_eq!(ec.pk_min.len, compound.pk_stride());
         // Short-circuits before the stride assert / pk_in_range.
-        assert!(ec.probe_pk_bytes(&opk2(1, 1)).is_none());
+        assert!(probe(&ec, &opk2(1, 1)).is_none());
     }
 
     /// Compound range-prune correctness: pk_min is numerically greater
@@ -1130,7 +1103,7 @@ mod tests {
         assert_eq!(entry.pk_min.pk_bytes(), &opk2(1, 5));
         assert_eq!(entry.pk_max.pk_bytes(), &opk2(2, 3));
         assert!(
-            entry.probe_pk_bytes(&opk2(3, 0)).is_none(),
+            probe(&entry, &opk2(3, 0)).is_none(),
             "out-of-range compound key must be pruned by probe_pk_bytes",
         );
     }

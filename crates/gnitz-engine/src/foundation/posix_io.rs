@@ -491,11 +491,6 @@ impl Mmap {
     }
 
     #[inline]
-    pub(crate) fn as_ptr(&self) -> *const u8 {
-        self.ptr
-    }
-
-    #[inline]
     pub(crate) fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
